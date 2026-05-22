@@ -111,8 +111,8 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("没有接收到任何文件，批次已取消。")
         return
 
-    await update.message.reply_text(
-        f"📦 正在处理 {len(channel_msg_ids)} 个文件，请稍候..."
+    sent_msg = await update.message.reply_text(
+        f"📦 {len(channel_msg_ids)} 个文件已接收，正在生成文件码..."
     )
 
     type_str = json.dumps(file_types)
@@ -128,6 +128,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
             "batch_file_meta": batch_file_meta_str,
+            "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.utcnow().isoformat(),
             "processed": 0,
         })
@@ -137,10 +138,6 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         metrics.record_error("upload_bot")
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
-
-    await update.message.reply_text(
-        f"📦 {len(channel_msg_ids)} 个文件已接收，文件码将通过解码机器人发送给您。"
-    )
 
     metrics.upload_count += 1
     metrics.record_processed("upload_bot")
@@ -292,6 +289,10 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     batch_ids_str = ",".join(str(mid) for mid in all_mids)
     batch_file_meta_str = json.dumps(all_meta)
 
+    sent_msg = await context.bot.send_message(
+        chat_id=user_id, text="文件已接收，正在生成文件码..."
+    )
+
     try:
         pending_col = get_pending_uploads_col()
         await pending_col.insert_one({
@@ -301,6 +302,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
             "batch_file_meta": batch_file_meta_str,
+            "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.utcnow().isoformat(),
             "processed": 0,
         })
@@ -314,11 +316,6 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             pass
         return
 
-    try:
-        await context.bot.send_message(chat_id=user_id, text="文件已接收，文件码将通过解码机器人发送给您。")
-    except Exception:
-        pass
-
     metrics.upload_count += 1
     metrics.record_processed("upload_bot")
 
@@ -326,8 +323,6 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 async def _process_upload(
     user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, file_types: dict
 ):
-    await update.message.reply_text("文件已接收，正在处理...")
-
     try:
         forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
         channel_msg_id = forwarded.message_id
@@ -336,6 +331,8 @@ async def _process_upload(
         metrics.record_error("upload_bot")
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
+
+    sent_msg = await update.message.reply_text("文件已接收，正在生成文件码...")
 
     type_str = json.dumps(file_types)
 
@@ -348,6 +345,7 @@ async def _process_upload(
             "file_types": type_str,
             "batch_msg_ids": "",
             "batch_file_meta": "",
+            "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.utcnow().isoformat(),
             "processed": 0,
         })
@@ -358,8 +356,6 @@ async def _process_upload(
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
 
-    await update.message.reply_text("文件已接收，文件码将通过解码机器人发送给您。")
-
     metrics.upload_count += 1
     metrics.record_processed("upload_bot")
 
@@ -367,6 +363,38 @@ async def _process_upload(
 async def _init():
     from database import init_db
     await init_db()
+
+
+async def _poll_code_sent(app: Application):
+    from database.session import get_pending_uploads_col
+    pending_col = get_pending_uploads_col()
+    edited_ids = set()
+
+    while True:
+        try:
+            rows = await pending_col.find(
+                {"processed": 1},
+                sort=("id", -1),
+                limit=20,
+            )
+            for row in rows:
+                row_id = row.get("id")
+                uploader_id = row.get("uploader_id")
+                status_msg_id = row.get("status_msg_id")
+                if not status_msg_id or row_id in edited_ids:
+                    continue
+                try:
+                    await app.bot.edit_message_text(
+                        chat_id=uploader_id,
+                        message_id=status_msg_id,
+                        text="✅ 文件码已发送",
+                    )
+                    edited_ids.add(row_id)
+                except Exception:
+                    edited_ids.add(row_id)
+        except Exception as e:
+            logger.error(f"_poll_code_sent 异常: {e}")
+        await asyncio.sleep(2)
 
 
 def run():
@@ -402,6 +430,7 @@ def run():
             await asyncio.sleep(30)
 
     loop.create_task(health_ping())
+    loop.create_task(_poll_code_sent(app))
     app.run_polling()
 
 

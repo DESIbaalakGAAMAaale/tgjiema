@@ -58,6 +58,7 @@ DDL_STATEMENTS = [
         file_types TEXT,
         batch_msg_ids TEXT,
         batch_file_meta TEXT,
+        status_msg_id BIGINT,
         created_at TEXT,
         processed INTEGER DEFAULT 0
     )""",
@@ -81,6 +82,7 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS batch_msg_ids TEXT",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS batch_file_meta TEXT",
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS batch_file_meta TEXT",
+    "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS status_msg_id BIGINT",
     "ALTER TABLE IF EXISTS send_queue ADD COLUMN IF NOT EXISTS task_type TEXT DEFAULT 'single'",
     "ALTER TABLE IF EXISTS send_queue ADD COLUMN IF NOT EXISTS channel_msg_ids TEXT",
     "ALTER TABLE IF EXISTS send_queue ADD COLUMN IF NOT EXISTS batch_file_meta TEXT",
@@ -146,7 +148,7 @@ def _row_to_dict(record) -> dict:
             "requester_id", "source_channel_id", "request_count", "id",
             "daily_decode_quota", "quota_used_today", "uploader_id",
             "external_decode_quota", "external_used_today", "target_user_id",
-            "channel_id", "message_id", "cnt",
+            "channel_id", "message_id", "cnt", "status_msg_id",
         ):
             result[col] = int(val) if val is not None else 0
         elif col in ("can_upload", "is_banned"):
