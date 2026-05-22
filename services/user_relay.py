@@ -22,10 +22,15 @@ class UserRelay:
         self._relay_api_hash: str = ""
         self._relay_phone: str = ""
         self._pending_cleanup = None
+        self._relay_user_id = None
 
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set()
+
+    @property
+    def relay_user_id(self) -> int | None:
+        return self._relay_user_id
 
     def set_pending_cleanup(self, callback):
         self._pending_cleanup = callback
@@ -130,7 +135,8 @@ class UserRelay:
                 return
 
         me = await self._client.get_me()
-        logger.info(f"[UserRelay] 已登录: {me.first_name} (@{me.username})")
+        self._relay_user_id = me.id
+        logger.info(f"[UserRelay] 已登录: {me.first_name} (@{me.username}), id={me.id}")
 
         try:
             self._decoder_bot_entity = await self._client.get_entity(
@@ -286,6 +292,20 @@ class UserRelay:
                     except Exception as e:
                         logger.error(
                             f"[UserRelay] 缓存到存储频道失败: {e}"
+                        )
+
+                if not forwarded_to_user and code and self._decoder_bot_entity:
+                    try:
+                        await self._client.send_message(
+                            self._decoder_bot_entity,
+                            f"RELAY_DELIVER:{user_id}:{code}",
+                        )
+                        logger.info(
+                            f"[UserRelay] 已通知解码机器人代发给用户 {user_id}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[UserRelay] 通知解码机器人失败: {e}"
                         )
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:

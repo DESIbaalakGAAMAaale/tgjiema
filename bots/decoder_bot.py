@@ -90,6 +90,68 @@ async def _cache_external_file(
         logger.error(f"[_cache_external_file] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
 
+async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    if not text.startswith("RELAY_DELIVER:"):
+        return
+    if not user_relay.relay_user_id or update.effective_user.id != user_relay.relay_user_id:
+        return
+    parts = text.split(":", 2)
+    if len(parts) != 3:
+        return
+    try:
+        target_user_id = int(parts[1])
+    except ValueError:
+        return
+    code = parts[2]
+
+    logger.info(
+        f"[handle_relay_delivery] 中继代发: 用户 {target_user_id}, 码 {code}"
+    )
+
+    files_col = get_file_records_col()
+    record = await files_col.find_one({"file_code": code})
+    if not record:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"您请求的文件码 {code} 已处理，请重新发送该码获取文件。",
+        )
+        return
+
+    selected_channel = channel_selector.select_channel(
+        preferred_channel_id=record.get("primary_channel_id")
+    )
+    msg_ids_raw = record.get("batch_msg_ids") or ""
+    if not isinstance(msg_ids_raw, str):
+        msg_ids_raw = str(msg_ids_raw)
+    msg_ids = [int(mid) for mid in msg_ids_raw.split(",") if mid.strip().isdigit()]
+    if not msg_ids:
+        msg_ids = [record.get("primary_channel_msg_id")]
+
+    if len(msg_ids) > 1:
+        await enqueue_batch_send_task(
+            target_user_id=target_user_id,
+            channel_id=selected_channel,
+            channel_msg_ids=msg_ids,
+            batch_file_meta=record.get("batch_file_meta", ""),
+            file_code=code,
+            page=1,
+        )
+    else:
+        await enqueue_send_task(
+            target_user_id=target_user_id,
+            channel_id=selected_channel,
+            message_id=msg_ids[0],
+            file_code=code,
+        )
+
+    await context.bot.send_message(
+        chat_id=target_user_id,
+        text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
+    )
+    logger.info(f"[handle_relay_delivery] 已入队发送: 用户 {target_user_id}, 码 {code}")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_force_join(update, context):
@@ -555,6 +617,10 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = update.message.text or ""
+
+        if text.startswith("RELAY_DELIVER:"):
+            await handle_relay_delivery(update, context)
+            return
 
         if is_valid_code_format(text.strip()):
             await handle_code(update, context)
