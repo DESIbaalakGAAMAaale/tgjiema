@@ -232,17 +232,24 @@ class UserRelay:
                         logger.error(f"[UserRelay] 转发到解码机器人失败: {e}")
 
             forwarded_to_user = False
+            user_entity = None
             try:
-                user_entity = await self._client.get_input_entity(PeerUser(user_id))
+                user_entity = await self._client.get_entity(PeerUser(user_id))
                 await self._client.forward_messages(user_entity, event.message)
                 logger.info(f"[UserRelay] 已转发给原始用户 {user_id}")
                 forwarded_to_user = True
             except Exception as e:
                 if self._is_forward_restricted_error(e):
                     logger.warning(f"[UserRelay] 转发受限，改用下载重传到用户 {user_id}")
-                    forwarded_to_user = await self._relay_via_download(
-                        event.message, user_entity, f"用户 {user_id}"
-                    )
+                    if user_entity is None:
+                        try:
+                            user_entity = await self._client.get_entity(PeerUser(user_id))
+                        except Exception as e2:
+                            logger.error(f"[UserRelay] 无法获取用户实体 {user_id}: {e2}")
+                    if user_entity is not None:
+                        forwarded_to_user = await self._relay_via_download(
+                            event.message, user_entity, f"用户 {user_id}"
+                        )
                 else:
                     logger.error(f"[UserRelay] 转发给用户 {user_id} 失败: {e}")
 
@@ -258,7 +265,7 @@ class UserRelay:
                 except Exception as e:
                     logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
 
-            del self._pending[bot_username]
+            self._pending.pop(bot_username, None)
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:

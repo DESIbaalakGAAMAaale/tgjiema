@@ -248,6 +248,8 @@ class BackupBot:
             msg_ids.append(primary)
         batch_str = record.get("batch_msg_ids", "") or ""
         if batch_str:
+            if not isinstance(batch_str, str):
+                batch_str = str(batch_str)
             for mid in batch_str.split(","):
                 mid = mid.strip()
                 if mid.isdigit():
