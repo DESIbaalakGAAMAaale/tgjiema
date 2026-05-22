@@ -20,6 +20,14 @@ async def backup_all_tables() -> dict:
 
 
 async def run_db_backup():
+    if not settings.DB_BACKUP_ENABLED:
+        logger.info("数据库备份未启用（DB_BACKUP_ENABLED=false），跳过启动")
+        return
+
+    if not settings.R2_ACCOUNT_ID or not settings.R2_ACCESS_KEY_ID or not settings.R2_SECRET_ACCESS_KEY:
+        logger.warning("R2 凭证未配置，数据库备份跳过")
+        return
+
     from database import init_db
     await init_db()
 
@@ -43,9 +51,7 @@ async def run_db_backup():
             await r2_storage.upload(key, content, "application/json")
             logger.info(f"D1 数据库已备份到 R2: {key} ({len(content)} 字节)")
 
-            keys = []
             for table in data["tables"]:
-                keys.append(f"db_backup/latest_{table}.json")
                 t_content = json.dumps(
                     data["tables"][table], default=str, ensure_ascii=False
                 ).encode("utf-8")

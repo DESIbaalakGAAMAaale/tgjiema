@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     R2_ENDPOINT: Optional[str] = None
 
     DB_BACKUP_INTERVAL_MINUTES: int = 60
+    DB_BACKUP_ENABLED: bool = True
 
     ADMIN_WEB_PORT: int = 8080
     ADMIN_WEB_HOST: str = "127.0.0.1"

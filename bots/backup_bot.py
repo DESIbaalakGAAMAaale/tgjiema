@@ -91,8 +91,10 @@ def _init_sync():
 
 
 def run_backup_1():
-    _init_sync()
     token = settings.BACKUP_BOT_1_TOKEN
+    if not token:
+        return
+    _init_sync()
     bot = BackupBot(token, "backup_bot_1", settings.BACKUP_CHANNELS_GROUP_1)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -100,8 +102,10 @@ def run_backup_1():
 
 
 def run_backup_2():
-    _init_sync()
     token = settings.BACKUP_BOT_2_TOKEN
+    if not token:
+        return
+    _init_sync()
     bot = BackupBot(token, "backup_bot_2", settings.BACKUP_CHANNELS_GROUP_2)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -109,8 +113,10 @@ def run_backup_2():
 
 
 def run_backup_3():
-    _init_sync()
     token = settings.BACKUP_BOT_3_TOKEN
+    if not token:
+        return
+    _init_sync()
     bot = BackupBot(token, "backup_bot_3", settings.BACKUP_CHANNELS_GROUP_3)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
