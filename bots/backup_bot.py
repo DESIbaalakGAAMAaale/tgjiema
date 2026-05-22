@@ -67,8 +67,61 @@ class BackupBot:
                 logger.info(f"[{self.name}] 检测到新增备份频道: {added}，触发全量同步")
                 self._full_sync_done = False
                 self._sync_offset = 0
+                self._last_synced_id = 0
+                self._max_seen_id = 0
+                self._quick_cursor = 0
+                await self._save_sync_state()
             if removed:
                 logger.info(f"[{self.name}] 检测到移除备份频道: {removed}")
+
+    async def _load_sync_state(self):
+        from database.session import get_config
+
+        try:
+            done = await get_config(f"backup_{self.name}_full_sync_done")
+            self._full_sync_done = (done == "1")
+        except Exception:
+            pass
+
+        try:
+            cursor = await get_config(f"backup_{self.name}_last_synced_id")
+            self._last_synced_id = int(cursor) if cursor else 0
+            self._max_seen_id = self._last_synced_id
+        except Exception:
+            pass
+
+        try:
+            qcursor = await get_config(f"backup_{self.name}_quick_cursor")
+            self._quick_cursor = int(qcursor) if qcursor else 0
+        except Exception:
+            pass
+
+        if self._full_sync_done:
+            logger.info(
+                f"[{self.name}] 从数据库恢复同步状态: 增量模式, 游标={self._last_synced_id}, "
+                f"quick_cursor={self._quick_cursor}"
+            )
+        else:
+            logger.info(f"[{self.name}] 将执行全量同步")
+
+    async def _save_sync_state(self):
+        from database.session import set_config
+
+        try:
+            await set_config(
+                f"backup_{self.name}_full_sync_done",
+                "1" if self._full_sync_done else "0",
+            )
+            await set_config(
+                f"backup_{self.name}_last_synced_id",
+                str(self._last_synced_id),
+            )
+            await set_config(
+                f"backup_{self.name}_quick_cursor",
+                str(self._quick_cursor),
+            )
+        except Exception as e:
+            logger.warning(f"[{self.name}] 保存同步状态失败: {e}")
 
     async def run(self):
         from database import init_db
@@ -78,6 +131,8 @@ class BackupBot:
         if not token:
             logger.warning(f"[{self.name}] 未配置 Token，跳过启动")
             return
+
+        await self._load_sync_state()
 
         logger.info(f"启动备份机器人 {self.name}，目标频道: {self.backup_channels}")
         bot = Bot(token=token)
@@ -229,6 +284,8 @@ class BackupBot:
             self._full_sync_done = True
             self._last_synced_id = self._max_seen_id
             self._sync_offset = 0
+            self._quick_cursor = self._max_seen_id
+            await self._save_sync_state()
             logger.info(f"[{self.name}] ✅ 全量备份完成，进入增量模式，游标={self._last_synced_id}")
             return
 
@@ -257,6 +314,7 @@ class BackupBot:
                 mid = record.get("primary_channel_msg_id", 0)
                 if mid > self._quick_cursor:
                     self._quick_cursor = mid
+            await self._save_sync_state()
         else:
             records = await col.find(
                 {"status": "active", "primary_channel_msg_id": {"$gte": self._quick_cursor + 1}},
@@ -269,6 +327,7 @@ class BackupBot:
                 mid = record.get("primary_channel_msg_id", 0)
                 if mid > self._quick_cursor:
                     self._quick_cursor = mid
+            await self._save_sync_state()
 
     async def _delta_sync(self, bot: Bot, col):
         records = await col.find(
@@ -283,6 +342,7 @@ class BackupBot:
             mid = record.get("primary_channel_msg_id", 0)
             if mid > self._last_synced_id:
                 self._last_synced_id = mid
+        await self._save_sync_state()
 
 
 def run_backup_1():
