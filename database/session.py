@@ -147,7 +147,10 @@ def _row_to_dict(columns: list[str], row: list) -> dict:
             if val is None or val == "":
                 result[col] = {}
             else:
-                result[col] = json.loads(val)
+                try:
+                    result[col] = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    result[col] = {}
         elif col in (
             "created_at", "updated_at", "create_time", "request_time",
             "expire_time", "quota_date", "external_quota_date",
