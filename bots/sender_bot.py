@@ -169,7 +169,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages)
             pass
         return
 
-    if total_pages > 1:
+    if total_pages > 1 and page < total_pages:
         keyboard = _build_pagination_keyboard(file_code, page, total_pages)
         total_files = len(file_meta_list)
         sent_msg = await bot.send_message(
@@ -232,6 +232,10 @@ async def pagination_callback(update: Update, context):
         context.bot, query.message.chat_id, file_code,
         file_meta_list, page=page, total_pages=total_pages,
     )
+
+    if page >= total_pages:
+        _pagination_states.pop(file_code, None)
+
     await query.answer()
 
 
