@@ -107,6 +107,7 @@ class CockroachDBClient:
             self._url,
             min_size=2,
             max_size=10,
+            statement_cache_size=0,
         )
         for sql in DDL_STATEMENTS:
             await self.execute(sql)

@@ -1,7 +1,6 @@
 import asyncio
 from loguru import logger
 from telegram import Bot
-from telegram.ext import Application
 from config import settings
 from database import get_file_records_col
 from utils.monitor import metrics
@@ -15,9 +14,11 @@ class BackupBot:
         self._last_processed_msg_id = 0
 
     async def run(self):
+        from database import init_db
+        await init_db()
+
         logger.info(f"启动备份机器人 {self.name}，目标频道: {self.backup_channels}")
-        app = Application.builder().token(self.token).build()
-        bot = app.bot
+        bot = Bot(token=self.token)
         metrics.ping_bot(self.name)
 
         async def health_ping():
@@ -82,19 +83,10 @@ class BackupBot:
         self._last_processed_msg_id = msg_id
 
 
-def _init_sync():
-    async def _do():
-        from database import init_db
-        await init_db()
-    import asyncio as _asyncio
-    _asyncio.get_event_loop().run_until_complete(_do())
-
-
 def run_backup_1():
     token = settings.BACKUP_BOT_1_TOKEN
     if not token:
         return
-    _init_sync()
     bot = BackupBot(token, "backup_bot_1", settings.BACKUP_CHANNELS_GROUP_1)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -105,7 +97,6 @@ def run_backup_2():
     token = settings.BACKUP_BOT_2_TOKEN
     if not token:
         return
-    _init_sync()
     bot = BackupBot(token, "backup_bot_2", settings.BACKUP_CHANNELS_GROUP_2)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -116,7 +107,6 @@ def run_backup_3():
     token = settings.BACKUP_BOT_3_TOKEN
     if not token:
         return
-    _init_sync()
     bot = BackupBot(token, "backup_bot_3", settings.BACKUP_CHANNELS_GROUP_3)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
