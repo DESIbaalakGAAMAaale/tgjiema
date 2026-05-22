@@ -61,18 +61,23 @@ async def _cache_external_file(
             file_types={},
         )
         await files_col.insert_one(record)
-        logger.info(f"外部码已缓存到本地: {code}")
+        logger.info(f"[_cache_external_file] 外部码已缓存到本地: {code}")
     except Exception as e:
-        logger.error(f"缓存外部码失败 {code}: {e}")
+        logger.error(f"[_cache_external_file] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await get_or_create_user(
-        user.id,
-        username=user.username,
-        first_name=user.first_name,
-    )
+    try:
+        await get_or_create_user(
+            user.id,
+            username=user.username,
+            first_name=user.first_name,
+        )
+    except Exception as e:
+        logger.error(f"[start] 创建用户失败 (user={user.id}): {e}")
+        await update.message.reply_text("系统繁忙，请稍后重试。")
+        return
     await update.message.reply_text(
         "欢迎使用文件解码机器人！\n\n"
         "发送文件码即可获取对应文件。\n"
@@ -103,7 +108,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db_user = await get_or_create_user(user.id)
+    try:
+        db_user = await get_or_create_user(user.id)
+    except Exception as e:
+        logger.error(f"[status] 获取用户信息失败 (user={user.id}): {e}")
+        await update.message.reply_text("系统繁忙，无法获取用户信息，请稍后重试。")
+        return
     level_map = {
         "free": "免费用户",
         "basic": "基础会员",
@@ -191,21 +201,47 @@ async def handle_internal_new_file(update: Update, context: ContextTypes.DEFAULT
             if v.isdigit():
                 file_types[k.strip()] = int(v)
 
-    file_code = await generate_unique_code(file_types)
-
-    files_col = get_file_records_col()
-    record = make_file_record(
-        file_code=file_code,
-        uploader_id=uploader_id,
-        primary_channel_id=channel_id,
-        primary_channel_msg_id=message_id,
-        file_types=file_types,
-    )
-    await files_col.insert_one(record)
+    try:
+        file_code = await generate_unique_code(file_types)
+    except Exception as e:
+        logger.error(f"[handle_internal_new_file] 生成文件码失败 (uploader={uploader_id}): {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=uploader_id,
+                text="文件处理失败，请稍后重试或联系管理员。",
+            )
+        except Exception:
+            pass
+        return
 
     try:
+        files_col = get_file_records_col()
+        record = make_file_record(
+            file_code=file_code,
+            uploader_id=uploader_id,
+            primary_channel_id=channel_id,
+            primary_channel_msg_id=message_id,
+            file_types=file_types,
+        )
+        await files_col.insert_one(record)
+    except Exception as e:
+        logger.error(f"[handle_internal_new_file] 数据库写入失败 (uploader={uploader_id}, code={file_code}): {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=uploader_id,
+                text="文件处理失败，请稍后重试或联系管理员。",
+            )
+        except Exception:
+            pass
+        return
+
+    try:
+        type_map = {
+            "photo": "张图片", "video": "个视频", "document": "个文档",
+            "audio": "个音频", "animation": "个动画",
+        }
         type_desc = " ".join(
-            f"{v}{{'photo':'张图片','video':'个视频','document':'个文档','audio':'个音频','animation':'个动画'}.get(k,k)}"
+            f"{v}{type_map.get(k, k)}"
             for k, v in sorted(file_types.items())
         )
         await context.bot.send_message(
@@ -215,9 +251,9 @@ async def handle_internal_new_file(update: Update, context: ContextTypes.DEFAULT
             f"有效期：永久有效\n"
             f"您可将其分享给他人，对方通过向我发送此码即可获取文件。",
         )
-        logger.info(f"文件码已发送给用户 {uploader_id}: {file_code}")
+        logger.info(f"[handle_internal_new_file] 文件码已发送给用户 {uploader_id}: {file_code}")
     except Exception as e:
-        logger.error(f"向用户 {uploader_id} 发送文件码失败: {e}")
+        logger.error(f"[handle_internal_new_file] 向用户 {uploader_id} 发送文件码失败 (code={file_code}): {e}")
 
     metrics.decode_count += 1
     metrics.record_processed("decoder_bot")
@@ -258,21 +294,29 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preferred_channel_id=file_record.get("primary_channel_id")
     )
 
-    logs_col = get_decode_logs_col()
-    log_doc = make_decode_log(
-        file_code=text,
-        requester_id=user.id,
-        status="queued",
-        source_channel_id=selected_channel,
-    )
-    await logs_col.insert_one(log_doc)
+    try:
+        logs_col = get_decode_logs_col()
+        log_doc = make_decode_log(
+            file_code=text,
+            requester_id=user.id,
+            status="queued",
+            source_channel_id=selected_channel,
+        )
+        await logs_col.insert_one(log_doc)
+    except Exception as e:
+        logger.error(f"[handle_code] 解码日志写入失败 (user={user.id}, code={text}): {e}")
 
-    await enqueue_send_task(
-        target_user_id=user.id,
-        channel_id=selected_channel,
-        message_id=file_record.get("primary_channel_msg_id"),
-        file_code=text,
-    )
+    try:
+        await enqueue_send_task(
+            target_user_id=user.id,
+            channel_id=selected_channel,
+            message_id=file_record.get("primary_channel_msg_id"),
+            file_code=text,
+        )
+    except Exception as e:
+        logger.error(f"[handle_code] 入队发送任务失败 (user={user.id}, code={text}): {e}")
+        await update.message.reply_text("系统繁忙，文件发送请求失败，请稍后重试。")
+        return
 
     remaining_info = ""
     if result.remaining_quota >= 0:
@@ -284,7 +328,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     metrics.decode_count += 1
     metrics.record_processed("decoder_bot")
-    logger.info(f"用户 {user.id} 请求文件码 {text}，频道 {selected_channel}")
+    logger.info(f"[handle_code] 用户 {user.id} 请求文件码 {text}，频道 {selected_channel}")
 
 
 async def handle_external_code(
@@ -295,7 +339,7 @@ async def handle_external_code(
     result,
 ):
     bot_username = result.external_bot_username
-    logger.info(f"用户 {user_id} 请求外部码 {code}，目标机器人 @{bot_username}")
+    logger.info(f"[handle_external_code] 用户 {user_id} 请求外部码 {code}，目标机器人 @{bot_username}")
 
     try:
         await context.bot.send_message(
@@ -303,7 +347,7 @@ async def handle_external_code(
             text=code,
         )
     except Exception as e:
-        logger.error(f"发送外部码到 @{bot_username} 失败: {e}")
+        logger.error(f"[handle_external_code] 发送外部码到 @{bot_username} 失败 (user={user_id}, code={code}): {e}")
         await update.message.reply_text(
             f"无法联系目标机器人 @{bot_username}，请确认码是否正确或稍后重试。"
         )
@@ -338,7 +382,7 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
         return
 
     logger.info(
-        f"收到外部机器人 @{bot_username} 的文件响应，转发给用户 {target_user_id}，码 {code}"
+        f"[handle_external_file_response] 收到外部机器人 @{bot_username} 的文件响应，转发给用户 {target_user_id}，码 {code}"
     )
 
     media_group_id = update.message.media_group_id
@@ -347,9 +391,9 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
 
     try:
         await update.message.forward(chat_id=target_user_id)
-        logger.info(f"外部文件转发成功: 用户 {target_user_id}")
+        logger.info(f"[handle_external_file_response] 外部文件转发成功: 用户 {target_user_id}, 码 {code}")
     except Exception as e:
-        logger.error(f"转发外部文件给用户 {target_user_id} 失败: {e}")
+        logger.error(f"[handle_external_file_response] 转发外部文件给用户 {target_user_id} 失败 (code={code}): {e}")
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
@@ -362,9 +406,9 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
     try:
         forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
         await _cache_external_file(context, code, forwarded.message_id)
-        logger.info(f"外部码 {code} 的文件已缓存到本地频道 {MAIN_CHANNEL_ID}")
+        logger.info(f"[handle_external_file_response] 外部码 {code} 的文件已缓存到本地频道 {MAIN_CHANNEL_ID}")
     except Exception as e:
-        logger.error(f"缓存外部文件到本地频道失败: {e}")
+        logger.error(f"[handle_external_file_response] 缓存外部文件到本地频道失败 (code={code}): {e}")
 
 
 async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -375,12 +419,20 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 await update.message.forward(chat_id=user_id)
             except Exception as e:
-                logger.error(f"转发外部媒体组文件给用户 {user_id} 失败: {e}")
+                logger.error(f"[handle_external_media] 转发外部媒体组文件给用户 {user_id} 失败 (code={code}): {e}")
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text="外部文件转发失败，请稍后重试或联系管理员。",
+                    )
+                except Exception:
+                    pass
+                return
             try:
                 forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
                 await _cache_external_file(context, code, forwarded.message_id)
             except Exception as e:
-                logger.error(f"缓存外部媒体组文件到本地频道失败: {e}")
+                logger.error(f"[handle_external_media] 缓存外部媒体组文件到本地频道失败 (code={code}): {e}")
             return
 
     bot_username = update.effective_chat.username
@@ -392,32 +444,46 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     logger.info(
-        f"收到外部机器人 @{bot_username} 的媒体响应，转发给用户 {target_user_id}，码 {code}"
+        f"[handle_external_media] 收到外部机器人 @{bot_username} 的媒体响应，转发给用户 {target_user_id}，码 {code}"
     )
 
     try:
         await update.message.forward(chat_id=target_user_id)
     except Exception as e:
-        logger.error(f"转发外部媒体给用户 {target_user_id} 失败: {e}")
+        logger.error(f"[handle_external_media] 转发外部媒体给用户 {target_user_id} 失败 (code={code}): {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text="外部文件转发失败，请稍后重试或联系管理员。",
+            )
+        except Exception:
+            pass
         return
 
     try:
         forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
         await _cache_external_file(context, code, forwarded.message_id)
     except Exception as e:
-        logger.error(f"缓存外部媒体文件到本地频道失败: {e}")
+        logger.error(f"[handle_external_media] 缓存外部媒体文件到本地频道失败 (code={code}): {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
+    try:
+        text = update.message.text or ""
 
-    if text.startswith("NEW_FILE"):
-        await handle_internal_new_file(update, context)
-        return
+        if text.startswith("NEW_FILE"):
+            await handle_internal_new_file(update, context)
+            return
 
-    if is_valid_code_format(text.strip()):
-        await handle_code(update, context)
-        return
+        if is_valid_code_format(text.strip()):
+            await handle_code(update, context)
+            return
+    except Exception as e:
+        logger.error(f"[handle_message] 处理消息异常 (user={update.effective_user.id if update.effective_user else 'unknown'}): {e}")
+        try:
+            await update.message.reply_text("处理请求时发生错误，请稍后重试。")
+        except Exception:
+            pass
 
 
 def run():
@@ -442,10 +508,13 @@ def run():
     )
 
     async def _route_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.message.media_group_id:
-            await handle_external_media(update, context)
-        else:
-            await handle_external_file_response(update, context)
+        try:
+            if update.message.media_group_id:
+                await handle_external_media(update, context)
+            else:
+                await handle_external_file_response(update, context)
+        except Exception as e:
+            logger.error(f"[_route_media] 处理媒体消息异常: {e}")
 
     app.add_handler(MessageHandler(media_filter, _route_media))
 

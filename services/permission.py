@@ -86,25 +86,40 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     quota_date = _parse_date(user.get("quota_date"))
     external_quota_date = _parse_date(user.get("external_quota_date"))
 
+    reset_set = {}
+
     if quota_date is None or quota_date != today:
+        reset_set["quota_used_today"] = 0
+        reset_set["quota_date"] = datetime.datetime.utcnow().isoformat()
         user["quota_used_today"] = 0
-        user["quota_date"] = datetime.datetime.utcnow().isoformat()
+        user["quota_date"] = reset_set["quota_date"]
         if membership_level == "free":
+            reset_set["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
             user["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
         elif membership_level == "basic":
+            reset_set["daily_decode_quota"] = settings.BASIC_DAILY_QUOTA
             user["daily_decode_quota"] = settings.BASIC_DAILY_QUOTA
         elif membership_level == "premium":
+            reset_set["daily_decode_quota"] = settings.PREMIUM_DAILY_QUOTA
             user["daily_decode_quota"] = settings.PREMIUM_DAILY_QUOTA
 
     if external_quota_date is None or external_quota_date != today:
+        reset_set["external_used_today"] = 0
+        reset_set["external_quota_date"] = datetime.datetime.utcnow().isoformat()
         user["external_used_today"] = 0
-        user["external_quota_date"] = datetime.datetime.utcnow().isoformat()
+        user["external_quota_date"] = reset_set["external_quota_date"]
         if membership_level == "free":
+            reset_set["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
             user["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
         elif membership_level == "basic":
+            reset_set["external_decode_quota"] = settings.BASIC_EXTERNAL_DAILY_QUOTA
             user["external_decode_quota"] = settings.BASIC_EXTERNAL_DAILY_QUOTA
         elif membership_level == "premium":
+            reset_set["external_decode_quota"] = settings.PREMIUM_EXTERNAL_DAILY_QUOTA
             user["external_decode_quota"] = settings.PREMIUM_EXTERNAL_DAILY_QUOTA
+
+    if reset_set:
+        await users_col.update_one({"user_id": user_id}, {"$set": reset_set})
 
     quota = user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA)
     used = user.get("quota_used_today", 0)

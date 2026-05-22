@@ -1,6 +1,5 @@
 import asyncio
 from collections import defaultdict
-from typing import Dict
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -15,7 +14,7 @@ TOKEN = settings.BOT_TOKENS.get("UPLOAD_BOT", "")
 DECODER_BOT_CHAT_ID = settings.DECODER_BOT_CHAT_ID
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
 
-_pending_media_groups: Dict[str, dict] = {}
+_pending_media_groups: dict[str, dict] = {}
 
 
 def _detect_file_type(update: Update) -> str:
@@ -93,7 +92,7 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if group["timer"]:
         group["timer"].cancel()
 
-    group["timer"] = asyncio.get_event_loop().call_later(
+    group["timer"] = asyncio.get_running_loop().call_later(
         1.5, lambda: asyncio.ensure_future(_flush_media_group(media_group_id, context))
     )
 
