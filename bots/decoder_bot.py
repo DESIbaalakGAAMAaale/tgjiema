@@ -40,6 +40,9 @@ def _dequeue_external(bot_username: str) -> tuple[int, str]:
     return None, None
 
 
+user_relay.set_pending_cleanup(lambda bot_username: _dequeue_external(bot_username))
+
+
 _external_media_groups: dict[str, tuple[int, str]] = {}
 
 

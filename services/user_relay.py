@@ -20,10 +20,14 @@ class UserRelay:
         self._relay_api_id: int = 0
         self._relay_api_hash: str = ""
         self._relay_phone: str = ""
+        self._pending_cleanup = None
 
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set()
+
+    def set_pending_cleanup(self, callback):
+        self._pending_cleanup = callback
 
     async def _report_status(self, status: str):
         try:
@@ -265,6 +269,8 @@ class UserRelay:
                 except Exception as e:
                     logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
 
+            if self._pending_cleanup:
+                self._pending_cleanup(bot_username)
             self._pending.pop(bot_username, None)
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
