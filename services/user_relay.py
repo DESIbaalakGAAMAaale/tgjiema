@@ -3,6 +3,7 @@ from pathlib import Path
 
 from loguru import logger
 from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import PeerChannel
 
 from config import settings
@@ -21,6 +22,25 @@ class UserRelay:
     def is_ready(self) -> bool:
         return self._ready.is_set()
 
+    async def _wait_for_admin_code(self) -> str | None:
+        from database.session import get_config, set_config
+
+        await set_config("relay_auth_pending", "1")
+        logger.info("[UserRelay] 验证码已发送到 Telegram，等待管理员通过管理机器人提交...")
+
+        for i in range(100):
+            await asyncio.sleep(3)
+            code = await get_config("relay_auth_code")
+            if code and code.strip():
+                await set_config("relay_auth_pending", "0")
+                await set_config("relay_auth_code", "")
+                logger.info("[UserRelay] 已收到管理员提交的验证码")
+                return code.strip()
+
+        await set_config("relay_auth_pending", "0")
+        logger.error("[UserRelay] 等待验证码超时（5分钟）")
+        return None
+
     async def start(self):
         if not settings.RELAY_API_ID or not settings.RELAY_API_HASH or not settings.RELAY_PHONE:
             logger.warning("[UserRelay] 未配置 RELAY_API_ID/HASH/PHONE，跳过中继")
@@ -32,7 +52,34 @@ class UserRelay:
             settings.RELAY_API_HASH,
         )
 
-        await self._client.start(phone=settings.RELAY_PHONE)
+        await self._client.connect()
+
+        if not await self._client.is_user_authorized():
+            await self._client.send_code_request(settings.RELAY_PHONE)
+            logger.info("[UserRelay] 验证码已发送到 Telegram 账号")
+
+            code = settings.RELAY_CODE.strip() if settings.RELAY_CODE else None
+            if not code:
+                logger.info("[UserRelay] 环境变量 RELAY_CODE 未设置，等待管理员通过管理机器人提交...")
+                code = await self._wait_for_admin_code()
+
+            if not code:
+                logger.error("[UserRelay] 无法获取验证码，登录失败")
+                await self._client.disconnect()
+                return
+
+            try:
+                await self._client.sign_in(settings.RELAY_PHONE, code)
+            except SessionPasswordNeededError:
+                logger.error(
+                    "[UserRelay] 该账号开启了二步验证，暂不支持。请关闭二步验证或使用无二步验证的账号。"
+                )
+                await self._client.disconnect()
+                return
+            except Exception as e:
+                logger.error(f"[UserRelay] 登录失败: {e}")
+                await self._client.disconnect()
+                return
 
         me = await self._client.get_me()
         logger.info(f"[UserRelay] 已登录: {me.first_name} (@{me.username})")

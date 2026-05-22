@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     RELAY_API_ID: int = 0
     RELAY_API_HASH: str = ""
     RELAY_PHONE: str = ""
+    RELAY_CODE: str = ""
 
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""

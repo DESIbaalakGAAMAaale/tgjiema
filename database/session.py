@@ -451,3 +451,20 @@ async def delete_backup_bot_token(bot_num: int):
             {"config_key": f"backup_bot_{bot_num}_token"},
             {"$set": {"config_value": "", "updated_at": ""}},
         )
+
+
+async def get_config(key: str) -> str | None:
+    return await _get_config(key)
+
+
+async def set_config(key: str, value: str):
+    await _set_config(key, value)
+
+
+async def delete_config(key: str):
+    existing = await _backup_config_col.find_one({"config_key": key})
+    if existing:
+        await _backup_config_col.update_one(
+            {"config_key": key},
+            {"$set": {"config_value": "", "updated_at": ""}},
+        )

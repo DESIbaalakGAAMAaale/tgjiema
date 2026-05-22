@@ -15,6 +15,7 @@ from database import (
     get_users_col, get_file_records_col, get_decode_logs_col,
     get_backup_channels, set_backup_channels,
     get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
+    get_config, set_config,
 )
 from database.models import make_user
 from utils.monitor import metrics
@@ -71,6 +72,8 @@ async def _get_status_text() -> str:
     active_files = await files_col.count_documents({"status": "active"})
     today = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     today_decodes = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
+    relay_pending = await get_config("relay_auth_pending")
+    relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
     msg = (
         f"📊 系统概览\n\n"
         f"👤 总用户数：{total_users}\n"
@@ -81,6 +84,7 @@ async def _get_status_text() -> str:
         f"📤 发送失败：{metrics.send_fail_count}\n"
         f"💾 备份成功：{metrics.backup_count}\n"
         f"❌ 备份失败：{metrics.backup_fail_count}\n"
+        f"\n🔐 用户中继：{relay_status}\n"
         f"\n🤖 机器人状态：\n"
     )
     for name, health in metrics.bots.items():
@@ -180,6 +184,20 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
     return msg
 
 
+async def _get_relay_status_text() -> str:
+    pending = await get_config("relay_auth_pending")
+    msg = "🔐 用户中继状态\n\n"
+    if pending == "1":
+        msg += "⏳ 状态：等待验证码\n"
+        msg += "Telegram 已发送验证码到中继账号，请通过下方按钮或 /relay_code 提交。\n\n"
+        msg += "用法：/relay_code <验证码>"
+    else:
+        msg += "✅ 状态：未在等待验证码\n"
+        msg += "如果解码机器人重启后无法登录，可手动提交验证码：\n"
+        msg += "/relay_code <验证码>"
+    return msg
+
+
 BACK_BTN = [[InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]]
 
 
@@ -193,6 +211,7 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("📺 备份频道", callback_data="menu:backup_chan")],
             [InlineKeyboardButton("🤖 备份机器人", callback_data="menu:backup_bot"),
              InlineKeyboardButton("📋 解码日志", callback_data="action:logs")],
+            [InlineKeyboardButton("🔐 用户中继", callback_data="menu:relay")],
         ]
         return text, InlineKeyboardMarkup(kb)
 
@@ -257,6 +276,19 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
             [InlineKeyboardButton("➕ 新增机器人", callback_data="usage:add_bot"),
              InlineKeyboardButton("➖ 删除机器人", callback_data="usage:remove_bot")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "relay":
+        text = (
+            "🔐 用户中继管理\n\n"
+            "当解码机器人需要登录 Telegram 用户账号时，\n"
+            "验证码会发送到中继账号的 Telegram 客户端。\n"
+            "在此提交验证码即可完成登录。\n\n"
+            "/relay_code <验证码> — 提交验证码"
+        )
+        kb = [
+            [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -355,6 +387,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "示例：/remove_backup_bot 2\n\n"
             "⚠️ 该备份机器人将在下次重启后不再启动"
         )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:relay_status":
+        text = await _get_relay_status_text()
         await query.edit_message_text(text, reply_markup=back_kb)
 
 
@@ -865,6 +901,28 @@ async def remove_backup_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@_auth_required
+async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：/relay_code <验证码>\n\n"
+            "用于解码机器人登录 Telegram 用户账号时提交验证码。\n"
+            "验证码会发送到中继账号的 Telegram 客户端。"
+        )
+        return
+    code = args[0].strip()
+    if not code.isdigit() or len(code) != 5:
+        await update.message.reply_text("❌ 验证码格式不正确，应为 5 位数字")
+        return
+
+    await set_config("relay_auth_code", code)
+    await update.message.reply_text(
+        f"✅ 验证码 `{code}` 已提交\n"
+        f"解码机器人将在几秒内自动获取并使用。"
+    )
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -903,6 +961,7 @@ def run():
     app.add_handler(CommandHandler("remove_channel", remove_channel))
     app.add_handler(CommandHandler("add_backup_bot", add_backup_bot))
     app.add_handler(CommandHandler("remove_backup_bot", remove_backup_bot))
+    app.add_handler(CommandHandler("relay_code", relay_code))
     app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:)"))
 
