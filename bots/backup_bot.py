@@ -11,7 +11,7 @@ class BackupBot:
         self.token = bot_token
         self.name = name
         self.backup_channels = backup_channels
-        self._last_processed_msg_id = 0
+        self._processed_ids: set[str] = set()
 
     async def run(self):
         from database import init_db
@@ -37,50 +37,96 @@ class BackupBot:
 
         await asyncio.gather(backup_loop(), health_ping())
 
+    def _collect_msg_ids(self, record: dict) -> list[int]:
+        msg_ids = []
+        primary = record.get("primary_channel_msg_id")
+        if primary:
+            msg_ids.append(primary)
+        batch_str = record.get("batch_msg_ids", "") or ""
+        if batch_str:
+            for mid in batch_str.split(","):
+                mid = mid.strip()
+                if mid.isdigit():
+                    msg_ids.append(int(mid))
+        return list(dict.fromkeys(msg_ids))
+
     async def _scan_and_backup(self, bot: Bot):
         col = get_file_records_col()
-        latest_list = await col.find(sort=("primary_channel_msg_id", -1), limit=1)
-        latest = latest_list[0] if latest_list else None
-        if latest is None:
+        records = await col.find(
+            {"status": "active"},
+            sort=("primary_channel_msg_id", -1),
+            limit=50,
+        )
+        if not records:
             return
 
-        msg_id = latest.get("primary_channel_msg_id", 0)
-        if msg_id <= self._last_processed_msg_id:
-            return
-
-        source_channel = latest.get("primary_channel_id")
-        file_code = latest.get("file_code")
-
-        existing_backups = latest.get("backup_channel_msg_ids") or []
-        if isinstance(existing_backups, str):
-            existing_backups = []
-
-        for target_channel in self.backup_channels:
-            already_done = any(
-                b.get("channel_id") == target_channel for b in existing_backups
-            )
-            if already_done:
+        for record in records:
+            file_code = record.get("file_code")
+            if not file_code:
                 continue
-            try:
-                await bot.copy_message(
-                    chat_id=target_channel,
-                    from_chat_id=source_channel,
-                    message_id=msg_id,
-                )
-                entry = {"channel_id": target_channel, "backup_bot": self.name}
-                existing_backups.append(entry)
-                await col.update_one(
-                    {"file_code": file_code},
-                    {"$set": {"backup_channel_msg_ids": existing_backups}},
-                )
-                logger.info(f"[{self.name}] 文件 {file_code} 已转发到频道 {target_channel}")
-                metrics.backup_count += 1
-                metrics.record_processed(self.name)
-            except Exception as e:
-                logger.error(f"[{self.name}] 转发 {file_code} 到频道 {target_channel} 失败: {e}")
-                metrics.backup_fail_count += 1
 
-        self._last_processed_msg_id = msg_id
+            source_channel = record.get("primary_channel_id")
+            msg_ids = self._collect_msg_ids(record)
+
+            existing_backups = record.get("backup_channel_msg_ids") or []
+            if isinstance(existing_backups, str):
+                existing_backups = []
+
+            updated = False
+            for target_channel in self.backup_channels:
+                backup_entry = None
+                for b in existing_backups:
+                    if b.get("channel_id") == target_channel:
+                        backup_entry = b
+                        break
+
+                backed_mids = set(backup_entry.get("backed_msg_ids", [])) if backup_entry else set()
+                missing = [mid for mid in msg_ids if mid not in backed_mids]
+                if not missing:
+                    continue
+
+                for mid in missing:
+                    try:
+                        await bot.copy_message(
+                            chat_id=target_channel,
+                            from_chat_id=source_channel,
+                            message_id=mid,
+                        )
+                        backed_mids.add(mid)
+                        logger.info(
+                            f"[{self.name}] 消息 {mid} (码 {file_code}) 已备份到频道 {target_channel}"
+                        )
+                        metrics.backup_count += 1
+                    except Exception as e:
+                        logger.error(
+                            f"[{self.name}] 备份消息 {mid} 到频道 {target_channel} 失败: {e}"
+                        )
+                        metrics.backup_fail_count += 1
+
+                if backup_entry:
+                    backup_entry["backed_msg_ids"] = sorted(backed_mids)
+                    backup_entry["backup_bot"] = self.name
+                else:
+                    existing_backups.append({
+                        "channel_id": target_channel,
+                        "backup_bot": self.name,
+                        "backed_msg_ids": sorted(backed_mids),
+                    })
+                updated = True
+
+            if updated:
+                try:
+                    await col.update_one(
+                        {"file_code": file_code},
+                        {"$set": {"backup_channel_msg_ids": existing_backups}},
+                    )
+                    metrics.record_processed(self.name)
+                except Exception as e:
+                    logger.error(f"[{self.name}] 更新备份记录 {file_code} 失败: {e}")
+
+        if len(self._processed_ids) > 2000:
+            self._processed_ids.clear()
+        self._processed_ids.add(self.name)
 
 
 def run_backup_1():

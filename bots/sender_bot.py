@@ -9,6 +9,7 @@ from loguru import logger
 
 from config import settings
 from services.queue_manager import dequeue_send_task
+from database import get_file_records_col
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
 
@@ -73,26 +74,64 @@ async def _process_single_task(bot, task):
         f"发送文件: 用户 {task.target_user_id}, "
         f"频道 {task.channel_id}, 消息 {task.message_id}"
     )
-    try:
-        await bot.copy_message(
-            chat_id=task.target_user_id,
-            from_chat_id=task.channel_id,
-            message_id=task.message_id,
-        )
+    success = await _try_copy(bot, task.target_user_id, task.channel_id, task.message_id)
+    if success:
         logger.info(f"文件发送成功: 用户 {task.target_user_id}, 码 {task.file_code}")
         metrics.send_success_count += 1
         metrics.record_processed("sender_bot")
-    except Exception as e:
-        logger.error(f"文件发送失败: {e}")
-        metrics.send_fail_count += 1
-        metrics.record_error("sender_bot")
-        try:
-            await bot.send_message(
-                chat_id=task.target_user_id,
-                text="文件发送失败，请稍后重试或联系管理员。",
-            )
-        except Exception:
-            pass
+        return
+
+    success = await _try_fallback_copy(bot, task)
+    if success:
+        logger.info(f"文件通过备用频道发送成功: 用户 {task.target_user_id}, 码 {task.file_code}")
+        metrics.send_success_count += 1
+        metrics.record_processed("sender_bot")
+        return
+
+    logger.error(f"文件发送失败（所有频道均不可用）: 码 {task.file_code}")
+    metrics.send_fail_count += 1
+    metrics.record_error("sender_bot")
+    try:
+        await bot.send_message(
+            chat_id=task.target_user_id,
+            text="文件发送失败，请稍后重试或联系管理员。",
+        )
+    except Exception:
+        pass
+
+
+async def _try_copy(bot, chat_id, from_chat_id, message_id) -> bool:
+    try:
+        await bot.copy_message(
+            chat_id=chat_id,
+            from_chat_id=from_chat_id,
+            message_id=message_id,
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def _try_fallback_copy(bot, task) -> bool:
+    if not task.file_code:
+        return False
+    col = get_file_records_col()
+    record = await col.find_one({"file_code": task.file_code})
+    if not record:
+        return False
+    backup_info = record.get("backup_channel_msg_ids") or []
+    if isinstance(backup_info, str):
+        return False
+
+    for entry in backup_info:
+        channel_id = entry.get("channel_id")
+        msg_ids = entry.get("backed_msg_ids") or entry.get("msg_ids") or []
+        if not msg_ids:
+            continue
+        msg_id = msg_ids[0]
+        if await _try_copy(bot, task.target_user_id, channel_id, msg_id):
+            return True
+    return False
 
 
 async def _process_batch_task(bot, task):
@@ -129,15 +168,30 @@ async def _process_batch_task(bot, task):
 
 async def _fallback_single_send(bot, task):
     for mid in task.channel_msg_ids:
-        try:
-            await bot.copy_message(
-                chat_id=task.target_user_id,
-                from_chat_id=task.channel_id,
-                message_id=mid,
-            )
+        if await _try_copy(bot, task.target_user_id, task.channel_id, mid):
             metrics.send_success_count += 1
-        except Exception as e:
-            logger.error(f"批量回退单发失败 (mid={mid}): {e}")
+            continue
+        backup_record = None
+        if task.file_code:
+            col = get_file_records_col()
+            backup_record = await col.find_one({"file_code": task.file_code})
+        if backup_record:
+            backup_info = backup_record.get("backup_channel_msg_ids") or []
+            if not isinstance(backup_info, str):
+                for entry in backup_info:
+                    ch_id = entry.get("channel_id")
+                    bk_mids = entry.get("backed_msg_ids") or entry.get("msg_ids") or []
+                    if not bk_mids:
+                        continue
+                    if await _try_copy(bot, task.target_user_id, ch_id, bk_mids[0]):
+                        metrics.send_success_count += 1
+                        break
+                else:
+                    metrics.send_fail_count += 1
+                    continue
+            else:
+                metrics.send_fail_count += 1
+        else:
             metrics.send_fail_count += 1
     metrics.record_processed("sender_bot")
 
