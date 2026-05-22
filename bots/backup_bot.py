@@ -140,6 +140,7 @@ class BackupBot:
             records = await col.find(
                 {"backup_channel_msg_ids": {"$ne": "", "$ne": None}},
                 limit=50,
+                sort=("primary_channel_msg_id", -1),
             )
             verified = False
             for record in records:
