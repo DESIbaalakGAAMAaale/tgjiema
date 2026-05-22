@@ -216,6 +216,7 @@ async def _process_pending_uploads(app: Application):
                         primary_channel_id=channel_id,
                         primary_channel_msg_id=message_id,
                         file_types=file_types,
+                        batch_msg_ids=batch_msg_ids_str,
                     )
                     await files_col.insert_one(record)
                 except Exception as e:
@@ -307,13 +308,21 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[handle_code] 解码日志写入失败 (user={user.id}, code={text}): {e}")
 
+    batch_ids_str = file_record.get("batch_msg_ids") or ""
+    msg_ids = []
+    if batch_ids_str:
+        msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
+    if not msg_ids:
+        msg_ids = [file_record.get("primary_channel_msg_id")]
+
     try:
-        await enqueue_send_task(
-            target_user_id=user.id,
-            channel_id=selected_channel,
-            message_id=file_record.get("primary_channel_msg_id"),
-            file_code=text,
-        )
+        for mid in msg_ids:
+            await enqueue_send_task(
+                target_user_id=user.id,
+                channel_id=selected_channel,
+                message_id=mid,
+                file_code=text,
+            )
     except Exception as e:
         logger.error(f"[handle_code] 入队发送任务失败 (user={user.id}, code={text}): {e}")
         await update.message.reply_text("系统繁忙，文件发送请求失败，请稍后重试。")

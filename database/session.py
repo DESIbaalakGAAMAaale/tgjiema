@@ -28,6 +28,7 @@ DDL_STATEMENTS = [
         primary_channel_msg_id INTEGER,
         file_types TEXT,
         backup_channel_msg_ids TEXT,
+        batch_msg_ids TEXT,
         status TEXT DEFAULT 'active',
         request_count INTEGER DEFAULT 0,
         create_time TEXT,
@@ -97,6 +98,10 @@ class D1Client:
         self._http = httpx.AsyncClient(timeout=30)
         for sql in DDL_STATEMENTS:
             await self.execute(sql)
+        try:
+            await self.execute("ALTER TABLE file_records ADD COLUMN batch_msg_ids TEXT")
+        except Exception:
+            pass
 
     async def close(self):
         if self._http:
@@ -153,14 +158,14 @@ def _row_to_dict(columns: list[str], row: list) -> dict:
             result[col] = int(val) if val is not None else 0
         elif col in ("can_upload", "is_banned"):
             result[col] = bool(val)
-        elif col in ("file_types", "backup_channel_msg_ids"):
+        elif col in ("file_types", "backup_channel_msg_ids", "batch_msg_ids"):
             if val is None or val == "":
-                result[col] = {}
+                result[col] = ""
             else:
                 try:
                     result[col] = json.loads(val)
                 except (json.JSONDecodeError, TypeError):
-                    result[col] = {}
+                    result[col] = val
         elif col in (
             "created_at", "updated_at", "create_time", "request_time",
             "expire_time", "quota_date", "external_quota_date",

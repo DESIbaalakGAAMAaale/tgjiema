@@ -50,6 +50,7 @@ def make_file_record(
     backup_channel_msg_ids: list = None,
     status: str = "active",
     request_count: int = 0,
+    batch_msg_ids: str = "",
 ):
     from datetime import datetime
 
@@ -61,6 +62,7 @@ def make_file_record(
         "primary_channel_msg_id": primary_channel_msg_id,
         "file_types": file_types,
         "backup_channel_msg_ids": backup_channel_msg_ids or [],
+        "batch_msg_ids": batch_msg_ids,
         "status": status,
         "request_count": request_count,
         "create_time": now,

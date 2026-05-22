@@ -55,7 +55,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["batch"] = {
         "file_types": defaultdict(int),
-        "file_infos": [],
+        "pinned_msg_ids": [],
     }
     await update.message.reply_text(
         "📦 已进入批次上传模式，请发送文件。\n"
@@ -80,28 +80,15 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_types = dict(batch["file_types"])
-    file_infos = batch["file_infos"]
+    channel_msg_ids = batch["pinned_msg_ids"]
 
-    if not file_infos:
+    if not channel_msg_ids:
         await update.message.reply_text("没有接收到任何文件，批次已取消。")
         return
 
     await update.message.reply_text(
-        f"📦 正在处理 {len(file_infos)} 个文件，请稍候..."
+        f"📦 正在处理 {len(channel_msg_ids)} 个文件，请稍候..."
     )
-
-    channel_msg_ids = []
-    for info in file_infos:
-        try:
-            forwarded = await info["update"].message.copy(chat_id=MAIN_CHANNEL_ID)
-            channel_msg_ids.append(forwarded.message_id)
-        except Exception as e:
-            logger.error(f"批次上传转发文件到存储频道失败: {e}")
-
-    if not channel_msg_ids:
-        metrics.record_error("upload_bot")
-        await update.message.reply_text("文件处理失败，请稍后重试。")
-        return
 
     type_str = json.dumps(file_types)
     batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
@@ -125,7 +112,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"📦 {len(file_infos)} 个文件已接收，正在生成文件码..."
+        f"📦 {len(channel_msg_ids)} 个文件已接收，正在生成文件码..."
     )
 
     metrics.upload_count += 1
@@ -167,7 +154,11 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     else:
         batch["file_types"][file_type] += 1
-        batch["file_infos"].append({"update": update})
+        try:
+            forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+            batch["pinned_msg_ids"].append(forwarded.message_id)
+        except Exception as e:
+            logger.error(f"批次上传复制文件到存储频道失败: {e}")
         await update.message.reply_text(f"✅ 已接收：{file_type}")
 
 
@@ -176,14 +167,21 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
     if grp is None:
         return
     file_types = grp["file_types"]
-    first = grp["updates"][0]
     for k, v in file_types.items():
         batch["file_types"][k] += v
-    batch["file_infos"].append({"update": first})
+    copied = 0
+    for up in grp["updates"]:
+        try:
+            forwarded = await up.message.copy(chat_id=MAIN_CHANNEL_ID)
+            batch["pinned_msg_ids"].append(forwarded.message_id)
+            copied += 1
+        except Exception as e:
+            logger.error(f"批次媒体组复制文件到存储频道失败: {e}")
+    first = grp["updates"][0]
     type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items()))
     await context.bot.send_message(
         chat_id=first.effective_chat.id,
-        text=f"✅ 已接收媒体组：{type_desc}",
+        text=f"✅ 已接收媒体组：{type_desc}（{copied}个文件）",
     )
 
 
@@ -244,7 +242,52 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     file_types = dict(group["file_types"])
     first_update = group["updates"][0]
 
-    await _process_upload(user_id, first_update, context, file_types)
+    all_mids = []
+    for up in group["updates"]:
+        try:
+            forwarded = await up.message.copy(chat_id=MAIN_CHANNEL_ID)
+            all_mids.append(forwarded.message_id)
+        except Exception as e:
+            logger.error(f"媒体组复制文件到存储频道失败: {e}")
+    if not all_mids:
+        metrics.record_error("upload_bot")
+        try:
+            await context.bot.send_message(chat_id=user_id, text="文件处理失败，请稍后重试。")
+        except Exception:
+            pass
+        return
+
+    type_str = json.dumps(file_types)
+    batch_ids_str = ",".join(str(mid) for mid in all_mids)
+
+    try:
+        pending_col = get_pending_uploads_col()
+        await pending_col.insert_one({
+            "uploader_id": user_id,
+            "primary_channel_id": MAIN_CHANNEL_ID,
+            "primary_channel_msg_id": all_mids[0],
+            "file_types": type_str,
+            "batch_msg_ids": batch_ids_str,
+            "created_at": datetime.datetime.utcnow().isoformat(),
+            "processed": 0,
+        })
+        logger.info(f"媒体组文件写入pending_uploads: user={user_id}, types={file_types}")
+    except Exception as e:
+        logger.error(f"写入pending_uploads失败: {e}")
+        metrics.record_error("upload_bot")
+        try:
+            await context.bot.send_message(chat_id=user_id, text="文件处理失败，请稍后重试。")
+        except Exception:
+            pass
+        return
+
+    try:
+        await context.bot.send_message(chat_id=user_id, text="文件已接收，正在生成文件码...")
+    except Exception:
+        pass
+
+    metrics.upload_count += 1
+    metrics.record_processed("upload_bot")
 
 
 async def _process_upload(
