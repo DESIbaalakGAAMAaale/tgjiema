@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 from collections import defaultdict
 
 from telegram import Update
@@ -102,7 +103,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
 
-    type_str = ",".join(f"{k}:{v}" for k, v in sorted(file_types.items()))
+    type_str = json.dumps(file_types)
     batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
 
     try:
@@ -260,7 +261,7 @@ async def _process_upload(
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
 
-    type_str = ",".join(f"{k}:{v}" for k, v in sorted(file_types.items()))
+    type_str = json.dumps(file_types)
 
     try:
         pending_col = get_pending_uploads_col()
