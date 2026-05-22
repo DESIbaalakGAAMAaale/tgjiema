@@ -31,7 +31,7 @@ def run_backup_bot_2():
     run_backup_2()
 
 
-def run_backup_3():
+def run_backup_bot_3():
     from bots.backup_bot import run_backup_3
     run_backup_3()
 
