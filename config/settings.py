@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
     DECODER_BOT_CHAT_ID: int = 0
 
+    BACKUP_CHANNELS_GROUP_1: List[int] = []
+    BACKUP_CHANNELS_GROUP_2: List[int] = []
+    BACKUP_CHANNELS_GROUP_3: List[int] = []
+
     D1_ACCOUNT_ID: str = ""
     D1_DATABASE_ID: str = ""
     D1_API_TOKEN: str = ""
@@ -26,6 +30,8 @@ class Settings(BaseSettings):
     R2_SECRET_ACCESS_KEY: str = ""
     R2_BUCKET_NAME: str = "tgjiema-backup"
     R2_ENDPOINT: Optional[str] = None
+
+    DB_BACKUP_INTERVAL_MINUTES: int = 60
 
     ADMIN_WEB_PORT: int = 8080
     ADMIN_WEB_HOST: str = "127.0.0.1"
@@ -55,7 +61,21 @@ class Settings(BaseSettings):
         def parse_env_var(cls, field_name: str, raw_val: str):
             if field_name == "BOT_TOKENS":
                 return json.loads(raw_val)
+            if field_name in (
+                "BACKUP_CHANNELS_GROUP_1",
+                "BACKUP_CHANNELS_GROUP_2",
+                "BACKUP_CHANNELS_GROUP_3",
+            ):
+                return json.loads(raw_val)
             return raw_val
+
+    @property
+    def ALL_BACKUP_CHANNELS(self) -> List[int]:
+        return (
+            self.BACKUP_CHANNELS_GROUP_1
+            + self.BACKUP_CHANNELS_GROUP_2
+            + self.BACKUP_CHANNELS_GROUP_3
+        )
 
 
 settings = Settings()

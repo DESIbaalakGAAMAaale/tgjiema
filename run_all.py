@@ -47,6 +47,12 @@ def run_admin():
     )
 
 
+def run_db_backup():
+    import asyncio
+    from services.db_backup import run_db_backup as _run
+    asyncio.run(_run())
+
+
 BOT_RUNNERS = {
     "upload": run_upload_bot,
     "decoder": run_decoder_bot,
@@ -55,6 +61,7 @@ BOT_RUNNERS = {
     "backup2": run_backup_bot_2,
     "backup3": run_backup_bot_3,
     "admin": run_admin,
+    "db_backup": run_db_backup,
 }
 
 
