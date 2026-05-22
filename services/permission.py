@@ -49,8 +49,6 @@ async def check_upload_permission(user_id: int) -> bool:
         return False
     if user.get("is_banned"):
         return False
-    if user.get("membership_level") == "free":
-        return False
     return True
 
 

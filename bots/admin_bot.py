@@ -232,7 +232,7 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     if level == "free":
         update_doc["$set"]["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
-        update_doc["$set"]["can_upload"] = False
+        update_doc["$set"]["can_upload"] = True
         update_doc["$set"]["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
         update_doc["$set"]["external_used_today"] = 0
     elif level == "basic":

@@ -189,6 +189,7 @@ async def handle_internal_new_file(update: Update, context: ContextTypes.DEFAULT
     channel_id = int(data.get("channel_id", 0))
     message_id = int(data.get("message_id", 0))
     file_types_str = data.get("file_types", "")
+    batch_msg_ids_str = data.get("batch_msg_ids", "")
 
     if not uploader_id or not channel_id or not message_id:
         logger.error(f"无效的内部消息: {text}")
@@ -200,6 +201,10 @@ async def handle_internal_new_file(update: Update, context: ContextTypes.DEFAULT
             k, _, v = item.partition(":")
             if v.isdigit():
                 file_types[k.strip()] = int(v)
+
+    batch_msg_ids = []
+    if batch_msg_ids_str:
+        batch_msg_ids = [int(mid) for mid in batch_msg_ids_str.split(",") if mid.strip().isdigit()]
 
     try:
         file_code = await generate_unique_code(file_types)

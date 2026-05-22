@@ -14,7 +14,7 @@ def make_user(
     daily_decode_quota: int = 3,
     quota_used_today: int = 0,
     quota_date: str = None,
-    can_upload: bool = False,
+    can_upload: bool = True,
     external_decode_quota: int = 0,
     external_used_today: int = 0,
     external_quota_date: str = None,

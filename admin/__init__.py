@@ -132,7 +132,7 @@ async def update_membership(
     }
     if level == "free":
         update["$set"]["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
-        update["$set"]["can_upload"] = False
+        update["$set"]["can_upload"] = True
         update["$set"]["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
         update["$set"]["external_used_today"] = 0
     elif level == "basic":
