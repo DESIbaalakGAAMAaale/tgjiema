@@ -185,19 +185,14 @@ async def _process_pending_uploads(app: Application):
                 uploader_id = row.get("uploader_id")
                 channel_id = row.get("primary_channel_id")
                 message_id = row.get("primary_channel_msg_id")
-                file_types_str = row.get("file_types", "")
+                file_types = row.get("file_types", {})
+                if not isinstance(file_types, dict):
+                    file_types = {}
                 batch_msg_ids_str = row.get("batch_msg_ids", "")
 
                 if not uploader_id or not channel_id or not message_id:
                     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
                     continue
-
-                file_types = {}
-                if file_types_str:
-                    for item in file_types_str.split(","):
-                        k, _, v = item.partition(":")
-                        if k and v.isdigit():
-                            file_types[k.strip()] = int(v)
 
                 try:
                     file_code = await generate_unique_code(file_types)

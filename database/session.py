@@ -144,7 +144,10 @@ def _row_to_dict(columns: list[str], row: list) -> dict:
         elif col in ("can_upload", "is_banned"):
             result[col] = bool(val)
         elif col in ("file_types", "backup_channel_msg_ids"):
-            result[col] = json.loads(val) if isinstance(val, str) else (val or {})
+            if val is None or val == "":
+                result[col] = {}
+            else:
+                result[col] = json.loads(val)
         elif col in (
             "created_at", "updated_at", "create_time", "request_time",
             "expire_time", "quota_date", "external_quota_date",
