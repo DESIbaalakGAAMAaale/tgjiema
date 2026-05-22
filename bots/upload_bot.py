@@ -147,7 +147,14 @@ async def _process_upload(
     metrics.record_processed("upload_bot")
 
 
+async def _init():
+    from database import init_db
+    await init_db()
+
+
 def run():
+    import asyncio as _asyncio
+    _asyncio.get_event_loop().run_until_complete(_init())
     logger.info("启动上传机器人...")
     app = Application.builder().token(TOKEN).build()
 
