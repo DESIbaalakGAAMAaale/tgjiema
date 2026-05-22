@@ -31,9 +31,14 @@ def run_backup_bot_2():
     run_backup_2()
 
 
-def run_backup_bot_3():
+def run_backup_3():
     from bots.backup_bot import run_backup_3
     run_backup_3()
+
+
+def run_admin_bot():
+    from bots.admin_bot import run
+    run()
 
 
 def run_admin():
@@ -60,6 +65,7 @@ BOT_RUNNERS = {
     "backup1": run_backup_bot_1,
     "backup2": run_backup_bot_2,
     "backup3": run_backup_bot_3,
+    "admin_bot": run_admin_bot,
     "admin": run_admin,
     "db_backup": run_db_backup,
 }

@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     BACKUP_BOT_1_TOKEN: str = ""
     BACKUP_BOT_2_TOKEN: str = ""
     BACKUP_BOT_3_TOKEN: str = ""
+    ADMIN_BOT_TOKEN: str = ""
+    ADMIN_TELEGRAM_ID: int = 0
 
     MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
     DECODER_BOT_CHAT_ID: int = 0
