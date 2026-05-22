@@ -23,6 +23,13 @@ class Settings(BaseSettings):
 
     COCKROACHDB_URL: str = ""
 
+    FORCE_JOIN_CHANNEL_ID: int = 0
+    FORCE_JOIN_CHANNEL_LINK: str = ""
+
+    UPLOAD_BOT_USERNAME: str = ""
+    DECODER_BOT_USERNAME: str = ""
+    SENDER_BOT_USERNAME: str = ""
+
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""

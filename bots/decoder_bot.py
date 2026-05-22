@@ -20,6 +20,7 @@ from services.queue_manager import enqueue_send_task, enqueue_batch_send_task
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.channel_selector import channel_selector
 from utils.monitor import metrics
+from utils.force_join import check_force_join, three_bot_reminder
 
 TOKEN = settings.DECODER_BOT_TOKEN
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
@@ -69,6 +70,8 @@ async def _cache_external_file(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not await check_force_join(update, context):
+        return
     try:
         await get_or_create_user(
             user.id,
@@ -84,10 +87,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "发送文件码即可获取对应文件。\n"
         "发送 /status 查看您的会员状态和今日剩余解码次数。\n"
         "发送 /help 查看帮助信息。"
+        + three_bot_reminder()
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
     await update.message.reply_text(
         "文件解码机器人 使用帮助\n\n"
         "1. 获取文件：直接发送文件码即可获取文件。\n"
@@ -109,6 +115,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not await check_force_join(update, context):
+        return
     try:
         db_user = await get_or_create_user(user.id)
     except Exception as e:
@@ -265,6 +273,8 @@ async def _process_pending_uploads(app: Application):
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not await check_force_join(update, context):
+        return
     text = update.message.text.strip()
 
     if not is_valid_code_format(text):

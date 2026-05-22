@@ -4,12 +4,13 @@ import json
 from telegram import Update
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio, InputMediaAnimation
-from telegram.ext import Application, CallbackQueryHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 from loguru import logger
 
 from config import settings
 from services.queue_manager import dequeue_send_task
 from utils.monitor import metrics
+from utils.force_join import check_force_join, three_bot_reminder
 
 TOKEN = settings.SENDER_BOT_TOKEN
 
@@ -182,7 +183,18 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages)
             state["last_pagination_msg_id"] = sent_msg.message_id
 
 
-async def pagination_callback(update: Update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
+    await update.message.reply_text(
+        "欢迎使用文件发送机器人！\n\n"
+        "此机器人用于接收解码后的文件，无需手动操作。\n"
+        "当您通过解码机器人获取文件码后，文件会自动发送给您。"
+        + three_bot_reminder()
+    )
+
+
+async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
 
@@ -192,6 +204,9 @@ async def pagination_callback(update: Update, context):
 
     if not data.startswith("pg|"):
         await query.answer()
+        return
+
+    if not await check_force_join(update, context):
         return
 
     parts = data.split("|")
@@ -255,6 +270,7 @@ def run():
     app = Application.builder().token(TOKEN).build()
     bot = app.bot
 
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(pagination_callback))
 
     metrics.ping_bot("sender_bot")

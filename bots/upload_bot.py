@@ -12,6 +12,7 @@ from database import get_pending_uploads_col
 from services.permission import check_upload_permission
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
+from utils.force_join import check_force_join, three_bot_reminder
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
@@ -53,6 +54,8 @@ def _extract_file_meta(update: Update) -> dict:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
     await update.message.reply_text(
         "欢迎使用上传机器人。\n\n"
         "📤 **单次上传**：直接发送文件，立即生成文件码\n\n"
@@ -61,11 +64,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  发送多个文件...\n"
         "  /end_upload - 结束批次，生成文件码\n\n"
         "所有用户（含免费用户）均可上传文件。"
+        + three_bot_reminder()
     )
 
 
 async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not await check_force_join(update, context):
+        return
     if not await check_upload_permission(user.id):
         await update.message.reply_text("您被禁止使用上传功能。")
         return
@@ -83,6 +89,8 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
     if "batch" in context.user_data:
         del context.user_data["batch"]
         await update.message.reply_text("批次上传已取消。")
@@ -92,6 +100,8 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if not await check_force_join(update, context):
+        return
     batch = context.user_data.pop("batch", None)
     if batch is None:
         await update.message.reply_text("当前没有进行中的批次上传，请先使用 /start_upload 开始。")
@@ -144,6 +154,8 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
     if "batch" in context.user_data:
         await _collect_batch_file(update, context)
         return
