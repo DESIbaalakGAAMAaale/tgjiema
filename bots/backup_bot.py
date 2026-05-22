@@ -1,4 +1,5 @@
 import asyncio
+import json
 from loguru import logger
 from telegram import Bot
 from config import settings
@@ -123,15 +124,60 @@ class BackupBot:
         except Exception as e:
             logger.warning(f"[{self.name}] 保存同步状态失败: {e}")
 
-    async def _check_empty_channels(self) -> list[int]:
+    async def _check_empty_channels(self, bot: Bot) -> list[int]:
         col = get_file_records_col()
         empty = []
         for channel_id in self.backup_channels:
-            record = await col.find_one(
-                {"backup_channel_msg_ids": {"$elemMatch": {"channel_id": channel_id}}}
-            )
-            if not record:
+            try:
+                await bot.get_chat(channel_id)
+            except Exception as e:
+                logger.warning(
+                    f"[{self.name}] 无法访问备份频道 {channel_id}: {e}，标记为空"
+                )
                 empty.append(channel_id)
+                continue
+
+            records = await col.find(
+                {"backup_channel_msg_ids": {"$ne": "", "$ne": None}},
+                limit=50,
+            )
+            verified = False
+            for record in records:
+                backups = record.get("backup_channel_msg_ids") or []
+                if isinstance(backups, str):
+                    try:
+                        backups = json.loads(backups)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                if not isinstance(backups, list):
+                    continue
+                sample_msg_id = None
+                for b in backups:
+                    if isinstance(b, dict) and b.get("channel_id") == channel_id:
+                        mids = b.get("backed_msg_ids", [])
+                        if mids:
+                            sample_msg_id = mids[0]
+                            break
+                if not sample_msg_id:
+                    continue
+                try:
+                    sent = await bot.copy_message(
+                        chat_id=channel_id,
+                        from_chat_id=channel_id,
+                        message_id=sample_msg_id,
+                    )
+                    await bot.delete_message(channel_id, sent.message_id)
+                    verified = True
+                    break
+                except Exception:
+                    continue
+
+            if not verified:
+                logger.info(
+                    f"[{self.name}] 频道 {channel_id} 中未检测到已备份的消息，标记为空"
+                )
+                empty.append(channel_id)
+
         return empty
 
     async def run(self):
@@ -145,7 +191,7 @@ class BackupBot:
 
         await self._load_sync_state()
 
-        empty_channels = await self._check_empty_channels()
+        empty_channels = await self._check_empty_channels(bot)
         if empty_channels:
             logger.info(
                 f"[{self.name}] 检测到以下备份频道为空，触发全量同步: {empty_channels}"

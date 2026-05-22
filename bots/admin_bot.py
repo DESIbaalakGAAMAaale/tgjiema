@@ -286,13 +286,15 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         text = (
             "🤖 备份机器人管理\n\n"
             "/add_backup_bot <编号> <Token> [频道ID...] — 配置Token及频道\n"
-            "/remove_backup_bot <编号> — 删除备份机器人\n\n"
+            "/remove_backup_bot <编号> — 删除备份机器人\n"
+            "/backup_reset <backup_bot_N> — 重置备份状态(清空频道后使用)\n\n"
             "⚠️ 修改 Token 后需重启对应备份机器人才生效"
         )
         kb = [
             [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
             [InlineKeyboardButton("➕ 新增机器人", callback_data="usage:add_bot"),
              InlineKeyboardButton("➖ 删除机器人", callback_data="usage:remove_bot")],
+            [InlineKeyboardButton("🔄 重置备份", callback_data="usage:reset_backup")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -443,6 +445,19 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/relay_code <验证码>\n\n"
             "示例：/relay_code 123456\n\n"
             "解码机器人在后台轮询等待，提交后几秒内自动完成登录。"
+        )
+
+    elif data == "usage:reset_backup":
+        text = (
+            "🔄 重置备份状态\n\n"
+            "当手动清空了备份频道后，需要重置备份机器人的同步状态\n"
+            "以触发全量重新备份。\n\n"
+            "命令：/backup_reset <backup_bot_N>\n\n"
+            "示例：/backup_reset backup_bot_1\n\n"
+            "该命令会：\n"
+            "1. 清零备份机器人的游标状态\n"
+            "2. 清除所有文件记录中该频道的旧备份信息\n"
+            "3. 备份机器人重启后执行全量备份"
         )
         await query.edit_message_text(text, reply_markup=back_kb)
 
@@ -1020,6 +1035,65 @@ async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+@_auth_required
+async def backup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：/backup_reset <backup_bot_1|backup_bot_2|backup_bot_3>\n\n"
+            "重置备份机器人的同步状态，下次重启后将执行全量备份。\n"
+            "适用于：手动清空了备份频道后，强制重新备份所有文件。"
+        )
+        return
+
+    bot_name = args[0].strip()
+    if bot_name not in ("backup_bot_1", "backup_bot_2", "backup_bot_3"):
+        await update.message.reply_text(
+            "❌ 无效的备份机器人名称，请使用 backup_bot_1、backup_bot_2 或 backup_bot_3"
+        )
+        return
+
+    files_col = get_file_records_col()
+    await set_config(f"backup_{bot_name}_full_sync_done", "0")
+    await set_config(f"backup_{bot_name}_last_synced_id", "0")
+    await set_config(f"backup_{bot_name}_quick_cursor", "0")
+
+    channels = await get_backup_channels(int(bot_name[-1]))
+    cleared_count = 0
+    if channels:
+        records = await files_col.find(
+            {"backup_channel_msg_ids": {"$ne": "", "$ne": None}},
+            limit=500,
+        )
+        for record in records:
+            backups = record.get("backup_channel_msg_ids") or []
+            if isinstance(backups, str):
+                try:
+                    import json
+                    backups = json.loads(backups)
+                except Exception:
+                    continue
+            if not isinstance(backups, list):
+                continue
+            new_backups = [
+                b for b in backups
+                if isinstance(b, dict) and b.get("channel_id") not in channels
+            ]
+            if len(new_backups) != len(backups):
+                await files_col.update_one(
+                    {"file_code": record["file_code"]},
+                    {"$set": {"backup_channel_msg_ids": new_backups}},
+                )
+                cleared_count += 1
+
+    await update.message.reply_text(
+        f"✅ 已重置 {bot_name} 的备份状态\n"
+        f"• 同步状态已清零\n"
+        f"• 清理了 {cleared_count} 条文件记录中的旧备份信息\n\n"
+        f"⚠️ 备份机器人重启后将执行全量备份到频道 {channels}"
+    )
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -1061,6 +1135,7 @@ def run():
     app.add_handler(CommandHandler("relay_code", relay_code))
     app.add_handler(CommandHandler("relay_set_api", relay_set_api))
     app.add_handler(CommandHandler("relay_pending", relay_pending))
+    app.add_handler(CommandHandler("backup_reset", backup_reset))
     app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:)"))
 

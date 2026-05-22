@@ -4,7 +4,7 @@ from pathlib import Path
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.types import PeerChannel
+from telethon.tl.types import PeerChannel, PeerUser
 
 from config import settings
 
@@ -171,7 +171,8 @@ class UserRelay:
                     return
 
             try:
-                await event.message.forward_to(user_id)
+                user_entity = await self._client.get_input_entity(PeerUser(user_id))
+                await self._client.forward_messages(user_entity, event.message)
                 logger.info(f"[UserRelay] 已转发给原始用户 {user_id}")
             except Exception as e:
                 logger.error(f"[UserRelay] 转发给用户 {user_id} 失败: {e}")

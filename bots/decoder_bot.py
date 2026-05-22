@@ -56,15 +56,33 @@ async def _cache_external_file(
 ):
     try:
         files_col = get_file_records_col()
-        record = make_file_record(
-            file_code=code,
-            uploader_id=0,
-            primary_channel_id=MAIN_CHANNEL_ID,
-            primary_channel_msg_id=message_id,
-            file_types={},
-        )
-        await files_col.insert_one(record)
-        logger.info(f"[_cache_external_file] 外部码已缓存到本地: {code}")
+        existing = await files_col.find_one({"file_code": code})
+        if existing:
+            batch = existing.get("batch_msg_ids", "") or ""
+            batch_ids = [str(mid) for mid in batch.split(",") if mid.strip()] if isinstance(batch, str) else batch
+            if isinstance(batch_ids, list):
+                batch_ids = [str(x) for x in batch_ids]
+            else:
+                batch_ids = []
+            if str(message_id) not in batch_ids:
+                batch_ids.append(str(message_id))
+            await files_col.update_one(
+                {"file_code": code},
+                {"$set": {"batch_msg_ids": ",".join(batch_ids)}},
+            )
+            logger.info(
+                f"[_cache_external_file] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}"
+            )
+        else:
+            record = make_file_record(
+                file_code=code,
+                uploader_id=0,
+                primary_channel_id=MAIN_CHANNEL_ID,
+                primary_channel_msg_id=message_id,
+                file_types={},
+            )
+            await files_col.insert_one(record)
+            logger.info(f"[_cache_external_file] 外部码已缓存到本地: {code}")
     except Exception as e:
         logger.error(f"[_cache_external_file] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
