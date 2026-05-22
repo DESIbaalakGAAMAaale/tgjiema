@@ -58,8 +58,6 @@ async def _init():
 
 
 def run():
-    import asyncio as _asyncio
-    _asyncio.get_event_loop().run_until_complete(_init())
     logger.info("启动文件发送机器人...")
     app = Application.builder().token(TOKEN).build()
     bot = app.bot
@@ -72,6 +70,7 @@ def run():
             await asyncio.sleep(30)
 
     async def main():
+        await _init()
         await asyncio.gather(
             process_queue(bot),
             health_ping(),

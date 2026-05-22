@@ -293,7 +293,11 @@ async def _init():
 
 def run():
     import asyncio as _asyncio
-    _asyncio.get_event_loop().run_until_complete(_init())
+
+    loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(loop)
+    loop.run_until_complete(_init())
+
     logger.info("启动上传机器人...")
     app = Application.builder().token(TOKEN).build()
 
@@ -319,10 +323,6 @@ def run():
             metrics.ping_bot("upload_bot")
             await asyncio.sleep(30)
 
-    import asyncio as _asyncio
-
-    loop = _asyncio.new_event_loop()
-    _asyncio.set_event_loop(loop)
     loop.create_task(health_ping())
     app.run_polling()
 
