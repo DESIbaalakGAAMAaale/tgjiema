@@ -45,9 +45,20 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_users_first_name ON users(first_name)",
     "CREATE INDEX IF NOT EXISTS idx_file_records_status ON file_records(status)",
     "CREATE INDEX IF NOT EXISTS idx_file_records_uploader ON file_records(uploader_id)",
-    "CREATE INDEX IF NOT EXISTS idx_decode_logs_file_code ON decode_logs(file_code)",
+    """CREATE INDEX IF NOT EXISTS idx_decode_logs_file_code ON decode_logs(file_code)""",
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_requester ON decode_logs(requester_id)",
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_request_time ON decode_logs(request_time)",
+    """CREATE TABLE IF NOT EXISTS pending_uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uploader_id INTEGER,
+        primary_channel_id INTEGER,
+        primary_channel_msg_id INTEGER,
+        file_types TEXT,
+        batch_msg_ids TEXT,
+        created_at TEXT,
+        processed INTEGER DEFAULT 0
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_pending_uploads_unprocessed ON pending_uploads(processed)",
 ]
 
 
@@ -328,6 +339,7 @@ class D1Collection:
 _users_col = D1Collection("users")
 _file_records_col = D1Collection("file_records")
 _decode_logs_col = D1Collection("decode_logs")
+_pending_uploads_col = D1Collection("pending_uploads")
 
 
 def get_users_col() -> D1Collection:
@@ -340,3 +352,7 @@ def get_file_records_col() -> D1Collection:
 
 def get_decode_logs_col() -> D1Collection:
     return _decode_logs_col
+
+
+def get_pending_uploads_col() -> D1Collection:
+    return _pending_uploads_col

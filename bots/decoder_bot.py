@@ -10,6 +10,7 @@ from config import settings
 from database import (
     get_file_records_col,
     get_decode_logs_col,
+    get_pending_uploads_col,
     make_file_record,
     make_decode_log,
 )
@@ -173,95 +174,95 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_internal_new_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if not text.startswith("NEW_FILE"):
-        return
-
-    lines = text.strip().split("\n")
-    data = {}
-    for line in lines[1:]:
-        if ":" in line:
-            key, _, value = line.partition(":")
-            data[key.strip()] = value.strip()
-
-    uploader_id = int(data.get("uploader_id", 0))
-    channel_id = int(data.get("channel_id", 0))
-    message_id = int(data.get("message_id", 0))
-    file_types_str = data.get("file_types", "")
-    batch_msg_ids_str = data.get("batch_msg_ids", "")
-
-    if not uploader_id or not channel_id or not message_id:
-        logger.error(f"无效的内部消息: {text}")
-        return
-
-    file_types = {}
-    if file_types_str:
-        for item in file_types_str.split(","):
-            k, _, v = item.partition(":")
-            if v.isdigit():
-                file_types[k.strip()] = int(v)
-
-    batch_msg_ids = []
-    if batch_msg_ids_str:
-        batch_msg_ids = [int(mid) for mid in batch_msg_ids_str.split(",") if mid.strip().isdigit()]
-
-    try:
-        file_code = await generate_unique_code(file_types)
-    except Exception as e:
-        logger.error(f"[handle_internal_new_file] 生成文件码失败 (uploader={uploader_id}): {e}")
+async def _process_pending_uploads(app: Application):
+    while True:
         try:
-            await context.bot.send_message(
-                chat_id=uploader_id,
-                text="文件处理失败，请稍后重试或联系管理员。",
-            )
-        except Exception:
-            pass
-        return
+            pending_col = get_pending_uploads_col()
+            rows = await pending_col.find({"processed": 0}, limit=5)
 
-    try:
-        files_col = get_file_records_col()
-        record = make_file_record(
-            file_code=file_code,
-            uploader_id=uploader_id,
-            primary_channel_id=channel_id,
-            primary_channel_msg_id=message_id,
-            file_types=file_types,
-        )
-        await files_col.insert_one(record)
-    except Exception as e:
-        logger.error(f"[handle_internal_new_file] 数据库写入失败 (uploader={uploader_id}, code={file_code}): {e}")
-        try:
-            await context.bot.send_message(
-                chat_id=uploader_id,
-                text="文件处理失败，请稍后重试或联系管理员。",
-            )
-        except Exception:
-            pass
-        return
+            for row in rows:
+                pend_id = row.get("id")
+                uploader_id = row.get("uploader_id")
+                channel_id = row.get("primary_channel_id")
+                message_id = row.get("primary_channel_msg_id")
+                file_types_str = row.get("file_types", "")
+                batch_msg_ids_str = row.get("batch_msg_ids", "")
 
-    try:
-        type_map = {
-            "photo": "张图片", "video": "个视频", "document": "个文档",
-            "audio": "个音频", "animation": "个动画",
-        }
-        type_desc = " ".join(
-            f"{v}{type_map.get(k, k)}"
-            for k, v in sorted(file_types.items())
-        )
-        await context.bot.send_message(
-            chat_id=uploader_id,
-            text=f"您的文件码已生成：{file_code}\n"
-            f"文件内容：{type_desc}\n"
-            f"有效期：永久有效\n"
-            f"您可将其分享给他人，对方通过向我发送此码即可获取文件。",
-        )
-        logger.info(f"[handle_internal_new_file] 文件码已发送给用户 {uploader_id}: {file_code}")
-    except Exception as e:
-        logger.error(f"[handle_internal_new_file] 向用户 {uploader_id} 发送文件码失败 (code={file_code}): {e}")
+                if not uploader_id or not channel_id or not message_id:
+                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                    continue
 
-    metrics.decode_count += 1
-    metrics.record_processed("decoder_bot")
+                file_types = {}
+                if file_types_str:
+                    for item in file_types_str.split(","):
+                        k, _, v = item.partition(":")
+                        if k and v.isdigit():
+                            file_types[k.strip()] = int(v)
+
+                try:
+                    file_code = await generate_unique_code(file_types)
+                except Exception as e:
+                    logger.error(f"[poll] 生成文件码失败 (uploader={uploader_id}): {e}")
+                    try:
+                        await app.bot.send_message(
+                            chat_id=uploader_id,
+                            text="文件处理失败，请稍后重试或联系管理员。",
+                        )
+                    except Exception:
+                        pass
+                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                    continue
+
+                try:
+                    files_col = get_file_records_col()
+                    record = make_file_record(
+                        file_code=file_code,
+                        uploader_id=uploader_id,
+                        primary_channel_id=channel_id,
+                        primary_channel_msg_id=message_id,
+                        file_types=file_types,
+                    )
+                    await files_col.insert_one(record)
+                except Exception as e:
+                    logger.error(f"[poll] 数据库写入失败 (uploader={uploader_id}, code={file_code}): {e}")
+                    try:
+                        await app.bot.send_message(
+                            chat_id=uploader_id,
+                            text="文件处理失败，请稍后重试或联系管理员。",
+                        )
+                    except Exception:
+                        pass
+                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                    continue
+
+                try:
+                    type_map = {
+                        "photo": "张图片", "video": "个视频", "document": "个文档",
+                        "audio": "个音频", "animation": "个动画",
+                    }
+                    type_desc = " ".join(
+                        f"{v}{type_map.get(k, k)}"
+                        for k, v in sorted(file_types.items())
+                    ) if file_types else "文件"
+                    await app.bot.send_message(
+                        chat_id=uploader_id,
+                        text=f"您的文件码已生成：{file_code}\n"
+                             f"文件内容：{type_desc}\n"
+                             f"有效期：永久有效\n"
+                             f"您可将其分享给他人，对方通过向我发送此码即可获取文件。",
+                    )
+                    logger.info(f"[poll] 文件码已发送给用户 {uploader_id}: {file_code}")
+                except Exception as e:
+                    logger.error(f"[poll] 向用户 {uploader_id} 发送文件码失败 (code={file_code}): {e}")
+
+                await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                metrics.decode_count += 1
+                metrics.record_processed("decoder_bot")
+
+        except Exception as e:
+            logger.error(f"[poll] pending_uploads 轮询异常: {e}")
+
+        await asyncio.sleep(2)
 
 
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,10 +477,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = update.message.text or ""
 
-        if text.startswith("NEW_FILE"):
-            await handle_internal_new_file(update, context)
-            return
-
         if is_valid_code_format(text.strip()):
             await handle_code(update, context)
             return
@@ -542,6 +539,7 @@ def run():
     loop = _asyncio.new_event_loop()
     _asyncio.set_event_loop(loop)
     loop.create_task(health_ping())
+    loop.create_task(_process_pending_uploads(app))
     app.run_polling()
 
 

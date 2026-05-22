@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 from collections import defaultdict
 
 from telegram import Update
@@ -6,12 +7,12 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from loguru import logger
 
 from config import settings
+from database import get_pending_uploads_col
 from services.permission import check_upload_permission
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
-DECODER_BOT_CHAT_ID = settings.DECODER_BOT_CHAT_ID
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
 
 _pending_media_groups: dict[str, dict] = {}
@@ -102,25 +103,29 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     type_str = ",".join(f"{k}:{v}" for k, v in sorted(file_types.items()))
+    batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
 
     try:
-        internal_msg = (
-            f"NEW_FILE\n"
-            f"uploader_id:{user.id}\n"
-            f"channel_id:{MAIN_CHANNEL_ID}\n"
-            f"message_id:{channel_msg_ids[0]}\n"
-            f"file_types:{type_str}\n"
-            f"batch_msg_ids:{','.join(str(mid) for mid in channel_msg_ids)}"
-        )
-        await context.bot.send_message(
-            chat_id=DECODER_BOT_CHAT_ID, text=internal_msg
-        )
-        logger.info(f"批次文件码请求已发送: user={user.id}, types={file_types}")
+        pending_col = get_pending_uploads_col()
+        await pending_col.insert_one({
+            "uploader_id": user.id,
+            "primary_channel_id": MAIN_CHANNEL_ID,
+            "primary_channel_msg_id": channel_msg_ids[0],
+            "file_types": type_str,
+            "batch_msg_ids": batch_ids_str,
+            "created_at": datetime.datetime.utcnow().isoformat(),
+            "processed": 0,
+        })
+        logger.info(f"批次文件写入pending_uploads: user={user.id}, types={file_types}")
     except Exception as e:
-        logger.error(f"通知解码机器人失败: {e}")
+        logger.error(f"写入pending_uploads失败: {e}")
         metrics.record_error("upload_bot")
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
+
+    await update.message.reply_text(
+        f"📦 {len(file_infos)} 个文件已接收，正在生成文件码..."
+    )
 
     metrics.upload_count += 1
     metrics.record_processed("upload_bot")
@@ -258,22 +263,24 @@ async def _process_upload(
     type_str = ",".join(f"{k}:{v}" for k, v in sorted(file_types.items()))
 
     try:
-        internal_msg = (
-            f"NEW_FILE\n"
-            f"uploader_id:{user_id}\n"
-            f"channel_id:{MAIN_CHANNEL_ID}\n"
-            f"message_id:{channel_msg_id}\n"
-            f"file_types:{type_str}"
-        )
-        await context.bot.send_message(
-            chat_id=DECODER_BOT_CHAT_ID, text=internal_msg
-        )
-        logger.info(f"上传文件通知已发送: user={user_id}, types={file_types}")
+        pending_col = get_pending_uploads_col()
+        await pending_col.insert_one({
+            "uploader_id": user_id,
+            "primary_channel_id": MAIN_CHANNEL_ID,
+            "primary_channel_msg_id": channel_msg_id,
+            "file_types": type_str,
+            "batch_msg_ids": "",
+            "created_at": datetime.datetime.utcnow().isoformat(),
+            "processed": 0,
+        })
+        logger.info(f"文件写入pending_uploads: user={user_id}, types={file_types}")
     except Exception as e:
-        logger.error(f"通知解码机器人失败: {e}")
+        logger.error(f"写入pending_uploads失败: {e}")
         metrics.record_error("upload_bot")
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
+
+    await update.message.reply_text("文件已接收，正在生成文件码...")
 
     metrics.upload_count += 1
     metrics.record_processed("upload_bot")
