@@ -61,7 +61,7 @@ class BackupBot:
             if already_done:
                 continue
             try:
-                await bot.forward_message(
+                await bot.copy_message(
                     chat_id=target_channel,
                     from_chat_id=source_channel,
                     message_id=msg_id,

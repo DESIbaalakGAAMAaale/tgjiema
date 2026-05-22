@@ -391,7 +391,7 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
         _track_external_media_group(media_group_id, target_user_id, code)
 
     try:
-        await update.message.forward(chat_id=target_user_id)
+        await update.message.copy(chat_id=target_user_id)
         logger.info(f"[handle_external_file_response] 外部文件转发成功: 用户 {target_user_id}, 码 {code}")
     except Exception as e:
         logger.error(f"[handle_external_file_response] 转发外部文件给用户 {target_user_id} 失败 (code={code}): {e}")
@@ -418,7 +418,7 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
         user_id, code = _get_external_media_group_user(media_group_id)
         if user_id:
             try:
-                await update.message.forward(chat_id=user_id)
+                await update.message.copy(chat_id=user_id)
             except Exception as e:
                 logger.error(f"[handle_external_media] 转发外部媒体组文件给用户 {user_id} 失败 (code={code}): {e}")
                 try:
@@ -449,7 +449,7 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     try:
-        await update.message.forward(chat_id=target_user_id)
+        await update.message.copy(chat_id=target_user_id)
     except Exception as e:
         logger.error(f"[handle_external_media] 转发外部媒体给用户 {target_user_id} 失败 (code={code}): {e}")
         try:

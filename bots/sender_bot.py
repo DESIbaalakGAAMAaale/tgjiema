@@ -25,7 +25,7 @@ async def process_queue(bot: Bot):
             )
 
             try:
-                await bot.forward_message(
+                await bot.copy_message(
                     chat_id=task.target_user_id,
                     from_chat_id=task.channel_id,
                     message_id=task.message_id,

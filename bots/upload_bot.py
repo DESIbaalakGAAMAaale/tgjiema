@@ -93,7 +93,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_msg_ids = []
     for info in file_infos:
         try:
-            forwarded = await info["update"].message.forward(chat_id=MAIN_CHANNEL_ID)
+            forwarded = await info["update"].message.copy(chat_id=MAIN_CHANNEL_ID)
             channel_msg_ids.append(forwarded.message_id)
         except Exception as e:
             logger.error(f"批次上传转发文件到存储频道失败: {e}")
@@ -253,7 +253,7 @@ async def _process_upload(
     await update.message.reply_text("文件已接收，正在处理...")
 
     try:
-        forwarded = await update.message.forward(chat_id=MAIN_CHANNEL_ID)
+        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
         channel_msg_id = forwarded.message_id
     except Exception as e:
         logger.error(f"转发文件到存储频道失败: {e}")
