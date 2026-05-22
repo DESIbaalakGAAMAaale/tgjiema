@@ -2,7 +2,7 @@ import datetime
 import re
 
 from loguru import logger
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -12,6 +12,7 @@ from telegram.ext import (
 
 from config import settings
 from database import get_users_col, get_file_records_col, get_decode_logs_col
+from database.models import make_user
 from utils.monitor import metrics
 
 TOKEN = settings.ADMIN_BOT_TOKEN
@@ -46,6 +47,15 @@ def _quota_display(val: int) -> str:
     if val == -1:
         return "不限"
     return str(val)
+
+
+async def _ensure_user(user_id: int) -> dict:
+    users_col = get_users_col()
+    user = await users_col.find_one({"user_id": user_id})
+    if user is None:
+        user = make_user(user_id=user_id)
+        await users_col.insert_one(user)
+    return user
 
 
 @_auth_required
@@ -133,10 +143,7 @@ async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await users_col.find_one({"user_id": user_id})
-    if user is None:
-        await update.message.reply_text(f"❌ 用户 {user_id} 不存在")
-        return
+    user = await _ensure_user(user_id)
 
     level = user.get("membership_level", "free")
     msg = (
@@ -219,10 +226,7 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await users_col.find_one({"user_id": user_id})
-    if user is None:
-        await update.message.reply_text(f"❌ 用户 {user_id} 不存在")
-        return
+    user = await _ensure_user(user_id)
 
     update_doc = {
         "$set": {
@@ -263,10 +267,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await users_col.find_one({"user_id": user_id})
-    if user is None:
-        await update.message.reply_text(f"❌ 用户 {user_id} 不存在")
-        return
+    user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"is_banned": True, "updated_at": datetime.datetime.utcnow().isoformat()}},
@@ -287,10 +288,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await users_col.find_one({"user_id": user_id})
-    if user is None:
-        await update.message.reply_text(f"❌ 用户 {user_id} 不存在")
-        return
+    user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"is_banned": False, "updated_at": datetime.datetime.utcnow().isoformat()}},
@@ -312,10 +310,7 @@ async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await users_col.find_one({"user_id": user_id})
-    if user is None:
-        await update.message.reply_text(f"❌ 用户 {user_id} 不存在")
-        return
+    user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.utcnow().isoformat()}},
@@ -337,10 +332,7 @@ async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     users_col = get_users_col()
-    user = await users_col.find_one({"user_id": user_id})
-    if user is None:
-        await update.message.reply_text(f"❌ 用户 {user_id} 不存在")
-        return
+    user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.utcnow().isoformat()}},
