@@ -97,6 +97,13 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("当前没有进行中的批次上传，请先使用 /start_upload 开始。")
         return
 
+    pending_mgids = list(_pending_media_groups.keys())
+    for mgid in pending_mgids:
+        grp = _pending_media_groups.get(mgid)
+        if grp and grp.get("timer"):
+            grp["timer"].cancel()
+        await _flush_batch_media_group(mgid, context, batch)
+
     file_types = dict(batch["file_types"])
     channel_msg_ids = batch["pinned_msg_ids"]
 
@@ -132,7 +139,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"📦 {len(channel_msg_ids)} 个文件已接收，正在生成文件码..."
+        f"📦 {len(channel_msg_ids)} 个文件已接收，文件码将通过解码机器人发送给您。"
     )
 
     metrics.upload_count += 1
@@ -308,7 +315,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         return
 
     try:
-        await context.bot.send_message(chat_id=user_id, text="文件已接收，正在生成文件码...")
+        await context.bot.send_message(chat_id=user_id, text="文件已接收，文件码将通过解码机器人发送给您。")
     except Exception:
         pass
 
@@ -351,7 +358,7 @@ async def _process_upload(
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
 
-    await update.message.reply_text("文件已接收，正在生成文件码...")
+    await update.message.reply_text("文件已接收，文件码将通过解码机器人发送给您。")
 
     metrics.upload_count += 1
     metrics.record_processed("upload_bot")
