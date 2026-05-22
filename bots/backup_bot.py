@@ -16,6 +16,7 @@ class BackupBot:
         self._last_synced_id: int = 0
         self._max_seen_id: int = 0
         self._quick_cursor: int = 0
+        self._inaccessible_sources: set[int] = set()
 
     async def _load_config(self):
         from config import settings as _s
@@ -82,19 +83,34 @@ class BackupBot:
         bot = Bot(token=token)
         metrics.ping_bot(self.name)
 
+        source_channel = settings.MAIN_STORAGE_CHANNEL_ID
+        try:
+            await bot.get_chat(source_channel)
+            logger.info(f"[{self.name}] 已确认可访问主存储频道 {source_channel}")
+        except Exception as e:
+            logger.error(
+                f"[{self.name}] ⚠️ 无法访问主存储频道 {source_channel}: {e}\n"
+                f"请将 @{self.name} 添加为频道 {source_channel} 的成员，否则无法备份任何消息！"
+            )
+
         async def health_ping():
             while True:
                 metrics.ping_bot(self.name)
                 await asyncio.sleep(30)
 
         async def backup_loop():
+            cycle = 0
             while True:
                 try:
                     await self._refresh_channels()
+                    if cycle % 12 == 0 and self._inaccessible_sources:
+                        self._inaccessible_sources.clear()
+                        logger.info(f"[{self.name}] 重新尝试访问之前失败的源频道")
                     await self._scan_and_backup(bot)
                 except Exception as e:
                     logger.error(f"[{self.name}] 备份异常: {e}")
                     metrics.record_error(self.name)
+                cycle += 1
                 await asyncio.sleep(5)
 
         await asyncio.gather(backup_loop(), health_ping())
@@ -118,6 +134,9 @@ class BackupBot:
             return False
 
         source_channel = record.get("primary_channel_id")
+        if source_channel in self._inaccessible_sources:
+            return False
+
         msg_ids = self._collect_msg_ids(record)
 
         existing_backups = record.get("backup_channel_msg_ids") or []
@@ -145,14 +164,24 @@ class BackupBot:
                         message_id=mid,
                     )
                     backed_mids.add(mid)
+                    self._inaccessible_sources.discard(source_channel)
                     logger.info(
                         f"[{self.name}] 消息 {mid} (码 {file_code}) 已备份到频道 {target_channel}"
                     )
                     metrics.backup_count += 1
                 except Exception as e:
-                    logger.error(
-                        f"[{self.name}] 备份消息 {mid} 到频道 {target_channel} 失败: {e}"
-                    )
+                    err_msg = str(e)
+                    if "Message to copy not found" in err_msg or "message to forward not found" in err_msg.lower():
+                        if source_channel not in self._inaccessible_sources:
+                            self._inaccessible_sources.add(source_channel)
+                            logger.error(
+                                f"[{self.name}] 无法访问源频道 {source_channel}，跳过后续该频道的备份\n"
+                                f"  请将 @{self.name} 添加为频道 {source_channel} 的成员后重试"
+                            )
+                    else:
+                        logger.error(
+                            f"[{self.name}] 备份消息 {mid} 到频道 {target_channel} 失败: {e}"
+                        )
                     metrics.backup_fail_count += 1
 
             if backup_entry:
