@@ -468,3 +468,27 @@ async def delete_config(key: str):
             {"config_key": key},
             {"$set": {"config_value": "", "updated_at": ""}},
         )
+
+
+async def get_relay_config() -> dict:
+    api_id = await _get_config("relay_api_id")
+    api_hash = await _get_config("relay_api_hash")
+    phone = await _get_config("relay_phone")
+    return {
+        "api_id": int(api_id) if api_id else 0,
+        "api_hash": api_hash or "",
+        "phone": phone or "",
+    }
+
+
+async def set_relay_config(api_id: int, api_hash: str, phone: str):
+    if api_id:
+        await _set_config("relay_api_id", str(api_id))
+    if api_hash:
+        await _set_config("relay_api_hash", api_hash)
+    if phone:
+        await _set_config("relay_phone", phone)
+
+
+async def get_relay_status() -> str:
+    return await _get_config("relay_status") or "offline"

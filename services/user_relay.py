@@ -17,15 +17,26 @@ class UserRelay:
         self._pending: dict[str, int] = {}
         self._session_path = str(Path(__file__).parent.parent / "relay_session")
         self._ready = asyncio.Event()
+        self._relay_api_id: int = 0
+        self._relay_api_hash: str = ""
+        self._relay_phone: str = ""
 
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set()
 
+    async def _report_status(self, status: str):
+        try:
+            from database.session import set_config
+            await set_config("relay_status", status)
+        except Exception:
+            pass
+
     async def _wait_for_admin_code(self) -> str | None:
         from database.session import get_config, set_config
 
         await set_config("relay_auth_pending", "1")
+        await self._report_status("pending_auth")
         logger.info("[UserRelay] 验证码已发送到 Telegram，等待管理员通过管理机器人提交...")
 
         for i in range(100):
@@ -41,21 +52,50 @@ class UserRelay:
         logger.error("[UserRelay] 等待验证码超时（5分钟）")
         return None
 
+    async def _load_config(self):
+        api_id = settings.RELAY_API_ID or 0
+        api_hash = settings.RELAY_API_HASH or ""
+        phone = settings.RELAY_PHONE or ""
+
+        if not api_id or not api_hash or not phone:
+            try:
+                from database.session import get_relay_config
+                db_config = await get_relay_config()
+                if db_config.get("api_id"):
+                    api_id = db_config["api_id"]
+                if db_config.get("api_hash"):
+                    api_hash = db_config["api_hash"]
+                if db_config.get("phone"):
+                    phone = db_config["phone"]
+                if api_id and api_hash and phone:
+                    logger.info("[UserRelay] 使用数据库中配置的中继账号")
+            except Exception as e:
+                logger.warning(f"[UserRelay] 读取 DB 中继配置失败: {e}")
+
+        self._relay_api_id = api_id
+        self._relay_api_hash = api_hash
+        self._relay_phone = phone
+
     async def start(self):
-        if not settings.RELAY_API_ID or not settings.RELAY_API_HASH or not settings.RELAY_PHONE:
-            logger.warning("[UserRelay] 未配置 RELAY_API_ID/HASH/PHONE，跳过中继")
+        await self._load_config()
+
+        if not self._relay_api_id or not self._relay_api_hash or not self._relay_phone:
+            logger.warning("[UserRelay] 未配置中继账号 (API_ID/HASH/PHONE)，跳过中继")
+            await self._report_status("offline")
             return
+
+        await self._report_status("connecting")
 
         self._client = TelegramClient(
             self._session_path,
-            settings.RELAY_API_ID,
-            settings.RELAY_API_HASH,
+            self._relay_api_id,
+            self._relay_api_hash,
         )
 
         await self._client.connect()
 
         if not await self._client.is_user_authorized():
-            await self._client.send_code_request(settings.RELAY_PHONE)
+            await self._client.send_code_request(self._relay_phone)
             logger.info("[UserRelay] 验证码已发送到 Telegram 账号")
 
             code = settings.RELAY_CODE.strip() if settings.RELAY_CODE else None
@@ -65,19 +105,22 @@ class UserRelay:
 
             if not code:
                 logger.error("[UserRelay] 无法获取验证码，登录失败")
+                await self._report_status("offline")
                 await self._client.disconnect()
                 return
 
             try:
-                await self._client.sign_in(settings.RELAY_PHONE, code)
+                await self._client.sign_in(self._relay_phone, code)
             except SessionPasswordNeededError:
                 logger.error(
                     "[UserRelay] 该账号开启了二步验证，暂不支持。请关闭二步验证或使用无二步验证的账号。"
                 )
+                await self._report_status("offline")
                 await self._client.disconnect()
                 return
             except Exception as e:
                 logger.error(f"[UserRelay] 登录失败: {e}")
+                await self._report_status("offline")
                 await self._client.disconnect()
                 return
 
@@ -98,6 +141,7 @@ class UserRelay:
 
         self._register_handlers()
         self._ready.set()
+        await self._report_status("online")
         logger.info(f"[UserRelay] 中继已就绪")
 
     def _register_handlers(self):
@@ -151,6 +195,7 @@ class UserRelay:
     async def stop(self):
         if self._client:
             await self._client.disconnect()
+            await self._report_status("offline")
             logger.info("[UserRelay] 已断开连接")
 
 

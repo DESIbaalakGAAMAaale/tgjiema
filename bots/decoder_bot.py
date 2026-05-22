@@ -547,7 +547,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _init():
     from database import init_db
     await init_db()
-    await user_relay.start()
 
 
 def run():
@@ -597,6 +596,7 @@ def run():
 
     loop.create_task(health_ping())
     loop.create_task(_process_pending_uploads(app))
+    loop.create_task(user_relay.start())
     app.run_polling()
 
 

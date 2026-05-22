@@ -16,6 +16,7 @@ from database import (
     get_backup_channels, set_backup_channels,
     get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
     get_config, set_config,
+    get_relay_config, set_relay_config, get_relay_status,
 )
 from database.models import make_user
 from utils.monitor import metrics
@@ -186,15 +187,31 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
 
 async def _get_relay_status_text() -> str:
     pending = await get_config("relay_auth_pending")
+    status = await get_relay_status()
+    config = await get_relay_config()
+
+    status_labels = {
+        "online": "✅ 在线",
+        "connecting": "🔄 连接中",
+        "pending_auth": "⏳ 等待验证码",
+        "offline": "❌ 离线",
+    }
+
     msg = "🔐 用户中继状态\n\n"
-    if pending == "1":
-        msg += "⏳ 状态：等待验证码\n"
-        msg += "Telegram 已发送验证码到中继账号，请通过下方按钮或 /relay_code 提交。\n\n"
-        msg += "用法：/relay_code <验证码>"
+    msg += f"状态：{status_labels.get(status, status)}\n"
+
+    if config.get("api_id"):
+        phone = config.get("phone", "")
+        masked_phone = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+        msg += f"账号：{masked_phone}\n"
+        msg += f"API_ID：{config['api_id']}\n"
     else:
-        msg += "✅ 状态：未在等待验证码\n"
-        msg += "如果解码机器人重启后无法登录，可手动提交验证码：\n"
-        msg += "/relay_code <验证码>"
+        msg += "⚠️ 未配置中继账号\n"
+        msg += "请使用下方按钮配置 API_ID / API_HASH / 手机号\n"
+
+    if pending == "1":
+        msg += "\n⚠️ 正在等待验证码，请通过 /relay_code 提交"
+
     return msg
 
 
@@ -282,13 +299,16 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
     if menu_id == "relay":
         text = (
             "🔐 用户中继管理\n\n"
-            "当解码机器人需要登录 Telegram 用户账号时，\n"
-            "验证码会发送到中继账号的 Telegram 客户端。\n"
-            "在此提交验证码即可完成登录。\n\n"
-            "/relay_code <验证码> — 提交验证码"
+            "中继账号用于突破 bot-to-bot 私聊限制，\n"
+            "使解码机器人可以向其他机器人发送外部码。\n\n"
+            "/relay_code <验证码> — 提交登录验证码\n"
+            "/relay_set_api <api_id> <api_hash> <手机号> — 配置账号\n"
+            "/relay_pending — 查看是否有待处理的验证码"
         )
         kb = [
             [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status")],
+            [InlineKeyboardButton("⚙️ 配置说明", callback_data="usage:relay_config"),
+             InlineKeyboardButton("🔑 验证码说明", callback_data="usage:relay_code")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -391,6 +411,37 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "action:relay_status":
         text = await _get_relay_status_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "usage:relay_config":
+        text = (
+            "⚙️ 配置中继账号\n\n"
+            "中继需要一个真实的 Telegram 用户账号。\n"
+            "按以下步骤获取 API 凭据：\n\n"
+            "1. 访问 https://my.telegram.org\n"
+            "2. 登录你的 Telegram 账号\n"
+            "3. 进入 API Development Tools\n"
+            "4. 创建应用，获取 api_id 和 api_hash\n\n"
+            "配置命令：\n"
+            "/relay_set_api <api_id> <api_hash> <手机号>\n\n"
+            "示例：\n"
+            "/relay_set_api 12345 abc123def456 +8613800138000\n\n"
+            "⚠️ api_id 是数字，api_hash 是字符串\n"
+            "⚠️ 手机号需包含国家区号，如 +86\n"
+            "⚠️ 配置后解码机器人下次重启时生效"
+        )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "usage:relay_code":
+        text = (
+            "🔑 提交验证码\n\n"
+            "当中继账号需要登录验证时，Telegram 会发送验证码\n"
+            "到该账号的 Telegram 客户端。\n\n"
+            "在此提交验证码即可完成登录：\n"
+            "/relay_code <5位数字>\n\n"
+            "示例：/relay_code 12345\n\n"
+            "解码机器人在后台轮询等待，提交后几秒内自动完成登录。"
+        )
         await query.edit_message_text(text, reply_markup=back_kb)
 
 
@@ -923,6 +974,50 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@_auth_required
+async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "用法：/relay_set_api <api_id> <api_hash> <手机号>\n\n"
+            "示例：/relay_set_api 12345 abc123def456 +8613800138000"
+        )
+        return
+    try:
+        api_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ api_id 必须是数字")
+        return
+    api_hash = args[1].strip()
+    phone = args[2].strip()
+
+    await set_relay_config(api_id, api_hash, phone)
+    await update.message.reply_text(
+        f"✅ 中继账号已配置\n"
+        f"API_ID：{api_id}\n"
+        f"手机号：{phone[:3]}****{phone[-2:] if len(phone) > 5 else ''}\n\n"
+        f"⚠️ 配置已保存到数据库，解码机器人下次重启时生效。\n"
+        f"⚠️ 请确保该账号未开启二步验证。"
+    )
+
+
+@_auth_required
+async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending = await get_config("relay_auth_pending")
+    if pending == "1":
+        await update.message.reply_text(
+            "⏳ 中继正在等待验证码\n\n"
+            "Telegram 已发送验证码到中继账号，请查看并提交：\n"
+            "/relay_code <验证码>"
+        )
+    else:
+        await update.message.reply_text(
+            "✅ 中继当前不需要验证码\n\n"
+            "如果解码机器人在等待验证码但此处显示不需要，\n"
+            "可能是状态同步延迟，请稍后重试或查看状态面板。"
+        )
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -962,7 +1057,9 @@ def run():
     app.add_handler(CommandHandler("add_backup_bot", add_backup_bot))
     app.add_handler(CommandHandler("remove_backup_bot", remove_backup_bot))
     app.add_handler(CommandHandler("relay_code", relay_code))
+    app.add_handler(CommandHandler("relay_set_api", relay_set_api))
+    app.add_handler(CommandHandler("relay_pending", relay_pending))
     app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:)"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:)"))
 
     app.run_polling()

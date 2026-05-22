@@ -15,4 +15,5 @@ from .session import (
     get_backup_channels, set_backup_channels, get_all_backup_channels,
     get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
     get_config, set_config, delete_config,
+    get_relay_config, set_relay_config, get_relay_status,
 )
