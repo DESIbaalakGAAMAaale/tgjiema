@@ -1,4 +1,5 @@
 import asyncio
+import tempfile
 from pathlib import Path
 
 from loguru import logger
@@ -182,10 +183,6 @@ class UserRelay:
         except Exception as e:
             logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
-    def _is_forward_restricted_error(self, error: Exception) -> bool:
-        msg = str(error).lower()
-        return "protected" in msg or "forward" in msg
-
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
@@ -209,49 +206,87 @@ class UserRelay:
                 self._pending_cleanup(bot_username)
             self._pending.pop(bot_username, None)
 
-            data = await self._client.download_media(event.message, file=bytes)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                file_path = await self._client.download_media(
+                    event.message, file=tmpdir
+                )
 
-            forwarded_to_decoder = False
-            if self._decoder_bot_entity:
-                try:
-                    await self._client.forward_messages(
-                        self._decoder_bot_entity, event.message
-                    )
-                    logger.info(f"[UserRelay] 已转发到解码机器人")
-                    forwarded_to_decoder = True
-                except Exception as e:
-                    if self._is_forward_restricted_error(e) and data:
-                        logger.warning(f"[UserRelay] 转发受限，改用下载重传到解码机器人")
+                forwarded_to_user = False
+                if file_path:
+                    try:
                         caption = getattr(event.message, "message", None) or ""
                         await self._client.send_file(
-                            self._decoder_bot_entity, data, caption=caption
+                            user_id, file_path, caption=caption
                         )
-                        forwarded_to_decoder = True
-                        logger.info(f"[UserRelay] 已通过下载重传方式发送到解码机器人")
+                        forwarded_to_user = True
+                        logger.info(
+                            f"[UserRelay] 已通过下载重传方式发送给用户 {user_id}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[UserRelay] 发送给用户 {user_id} 失败: {e}"
+                        )
+                else:
+                    text = getattr(event.message, "message", None) or ""
+                    if text:
+                        try:
+                            await self._client.send_message(user_id, text)
+                            forwarded_to_user = True
+                            logger.info(
+                                f"[UserRelay] 已转发文本消息给用户 {user_id}"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[UserRelay] 转发文本给用户 {user_id} 失败: {e}"
+                            )
+
+                forwarded_to_decoder = False
+                if self._decoder_bot_entity:
+                    if file_path:
+                        try:
+                            caption = getattr(event.message, "message", None) or ""
+                            await self._client.send_file(
+                                self._decoder_bot_entity, file_path, caption=caption
+                            )
+                            forwarded_to_decoder = True
+                            logger.info(
+                                "[UserRelay] 已通过下载重传方式发送到解码机器人"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[UserRelay] 发送到解码机器人失败: {e}"
+                            )
                     else:
-                        logger.error(f"[UserRelay] 转发到解码机器人失败: {e}")
+                        text = getattr(event.message, "message", None) or ""
+                        try:
+                            if text:
+                                await self._client.send_message(
+                                    self._decoder_bot_entity, text
+                                )
+                            else:
+                                await self._client.forward_messages(
+                                    self._decoder_bot_entity, event.message
+                                )
+                            forwarded_to_decoder = True
+                            logger.info("[UserRelay] 已转发文本到解码机器人")
+                        except Exception as e:
+                            logger.error(
+                                f"[UserRelay] 转发到解码机器人失败: {e}"
+                            )
 
-            forwarded_to_user = False
-            if data:
-                try:
-                    caption = getattr(event.message, "message", None) or ""
-                    await self._client.send_file(user_id, data, caption=caption)
-                    forwarded_to_user = True
-                    logger.info(f"[UserRelay] 已通过下载重传方式发送给用户 {user_id}")
-                except Exception as e:
-                    logger.error(f"[UserRelay] 发送给用户 {user_id} 失败: {e}")
-            else:
-                forwarded_to_user = True
-
-            if code and (forwarded_to_user or forwarded_to_decoder) and data and self._storage_channel_entity:
-                try:
-                    storage_msg = await self._client.send_file(
-                        self._storage_channel_entity, data
-                    )
-                    await self._cache_file_record(code, storage_msg.id)
-                    logger.info(f"[UserRelay] 外部码 {code} 的文件已缓存到存储频道")
-                except Exception as e:
-                    logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
+                if code and (forwarded_to_user or forwarded_to_decoder) and file_path and self._storage_channel_entity:
+                    try:
+                        storage_msg = await self._client.send_file(
+                            self._storage_channel_entity, file_path
+                        )
+                        await self._cache_file_record(code, storage_msg.id)
+                        logger.info(
+                            f"[UserRelay] 外部码 {code} 的文件已缓存到存储频道"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[UserRelay] 缓存到存储频道失败: {e}"
+                        )
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:
