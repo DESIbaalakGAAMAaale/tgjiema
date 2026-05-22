@@ -21,6 +21,7 @@ from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.channel_selector import channel_selector
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
+from services.user_relay import user_relay
 
 TOKEN = settings.DECODER_BOT_TOKEN
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
@@ -364,6 +365,22 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[handle_code] 用户 {user.id} 请求文件码 {text}，频道 {selected_channel}")
 
 
+def _resolve_bot_username(update: Update) -> str | None:
+    if update.effective_chat and update.effective_chat.username:
+        return update.effective_chat.username
+
+    msg = update.message
+    if msg and msg.forward_origin and hasattr(msg.forward_origin, "sender_user"):
+        sender = msg.forward_origin.sender_user
+        if sender and sender.username:
+            return sender.username
+
+    if msg and hasattr(msg, "forward_from") and msg.forward_from:
+        return msg.forward_from.username
+
+    return None
+
+
 async def handle_external_code(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -374,20 +391,6 @@ async def handle_external_code(
     bot_username = result.external_bot_username
     logger.info(f"[handle_external_code] 用户 {user_id} 请求外部码 {code}，目标机器人 @{bot_username}")
 
-    try:
-        await context.bot.send_message(
-            chat_id=f"@{bot_username}",
-            text=code,
-        )
-    except Exception as e:
-        logger.error(f"[handle_external_code] 发送外部码到 @{bot_username} 失败 (user={user_id}, code={code}): {e}")
-        await update.message.reply_text(
-            f"无法联系目标机器人 @{bot_username}，请确认码是否正确或稍后重试。"
-        )
-        return
-
-    _enqueue_external(bot_username, user_id, code)
-
     remaining_info = ""
     parts = []
     if result.remaining_quota >= 0:
@@ -397,16 +400,42 @@ async def handle_external_code(
     if parts:
         remaining_info = " | ".join(parts)
 
-    await update.message.reply_text(
-        f"已向 @{bot_username} 查询文件，请稍候查收。\n{remaining_info}"
-    )
+    if user_relay.is_ready:
+        ok = await user_relay.send_external_code(bot_username, code, user_id)
+        if ok:
+            _enqueue_external(bot_username, user_id, code)
+            await update.message.reply_text(
+                f"已向 @{bot_username} 查询文件，请稍候查收。\n{remaining_info}"
+            )
+            metrics.decode_count += 1
+            metrics.record_processed("decoder_bot")
+            return
 
-    metrics.decode_count += 1
-    metrics.record_processed("decoder_bot")
+    try:
+        await context.bot.send_message(
+            chat_id=f"@{bot_username}",
+            text=code,
+        )
+        _enqueue_external(bot_username, user_id, code)
+        await update.message.reply_text(
+            f"已向 @{bot_username} 查询文件，请稍候查收。\n{remaining_info}"
+        )
+        metrics.decode_count += 1
+        metrics.record_processed("decoder_bot")
+        return
+    except Exception as e:
+        logger.warning(
+            f"[handle_external_code] 无法发送到 @{bot_username} "
+            f"(user={user_id}, code={code}): {e}"
+        )
+
+    await update.message.reply_text(
+        "外部码解码功能暂不可用，请联系管理员配置用户中继。"
+    )
 
 
 async def handle_external_file_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_username = update.effective_chat.username
+    bot_username = _resolve_bot_username(update)
     if not bot_username:
         return
 
@@ -468,7 +497,7 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
                 logger.error(f"[handle_external_media] 缓存外部媒体组文件到本地频道失败 (code={code}): {e}")
             return
 
-    bot_username = update.effective_chat.username
+    bot_username = _resolve_bot_username(update)
     if not bot_username:
         return
 
@@ -518,6 +547,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _init():
     from database import init_db
     await init_db()
+    await user_relay.start()
 
 
 def run():

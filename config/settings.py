@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     DECODER_BOT_USERNAME: str = ""
     SENDER_BOT_USERNAME: str = ""
 
+    RELAY_API_ID: int = 0
+    RELAY_API_HASH: str = ""
+    RELAY_PHONE: str = ""
+
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""

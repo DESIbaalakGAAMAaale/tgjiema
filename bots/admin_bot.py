@@ -2,7 +2,7 @@ import datetime
 import re
 
 from loguru import logger
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,7 +11,11 @@ from telegram.ext import (
 )
 
 from config import settings
-from database import get_users_col, get_file_records_col, get_decode_logs_col
+from database import (
+    get_users_col, get_file_records_col, get_decode_logs_col,
+    get_backup_channels, set_backup_channels,
+    get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
+)
 from database.models import make_user
 from utils.monitor import metrics
 
@@ -58,43 +62,15 @@ async def _ensure_user(user_id: int) -> dict:
     return user
 
 
-@_auth_required
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 管理员机器人已启动\n\n"
-        "可用命令：\n\n"
-        "📊 系统状态\n"
-        "  /status - 系统概览\n"
-        "  /health - 机器人运行状态\n\n"
-        "👤 用户管理\n"
-        "  /user <id> - 查看用户详情\n"
-        "  /users [关键词] [页码] - 用户列表\n"
-        "  /set_level <id> <等级> - 设置会员等级 (free/basic/premium)\n"
-        "  /ban <id> - 封禁用户\n"
-        "  /unban <id> - 解封用户\n"
-        "  /set_quota <id> <数量> - 设置每日解码配额\n"
-        "  /set_external_quota <id> <数量> - 设置外部码配额\n\n"
-        "📁 文件管理\n"
-        "  /file <code> - 查看文件详情\n"
-        "  /files [搜索] [页码] - 文件列表\n"
-        "  /delete_file <code> - 删除文件\n\n"
-        "📋 日志\n"
-        "  /logs [页码] - 解码日志"
-    )
-
-
-@_auth_required
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _get_status_text() -> str:
     users_col = get_users_col()
     files_col = get_file_records_col()
     logs_col = get_decode_logs_col()
-
     total_users = await users_col.count_documents({})
     total_files = await files_col.count_documents({})
     active_files = await files_col.count_documents({"status": "active"})
     today = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     today_decodes = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
-
     msg = (
         f"📊 系统概览\n\n"
         f"👤 总用户数：{total_users}\n"
@@ -107,16 +83,13 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ 备份失败：{metrics.backup_fail_count}\n"
         f"\n🤖 机器人状态：\n"
     )
-
     for name, health in metrics.bots.items():
         status_icon = "✅" if health.is_running else "❌"
         msg += f"  {status_icon} {name}: {health.total_processed}次/ {health.total_errors}次错误\n"
+    return msg
 
-    await update.message.reply_text(msg)
 
-
-@_auth_required
-async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _get_health_text() -> str:
     msg = "🤖 机器人健康状态\n\n"
     for name, health in metrics.bots.items():
         status_icon = "✅" if health.is_running else "❌"
@@ -127,7 +100,278 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  处理次数：{health.total_processed}\n"
             f"  错误次数：{health.total_errors}\n"
         )
-    await update.message.reply_text(msg)
+    return msg
+
+
+async def _get_channels_text() -> str:
+    tokens = await get_backup_bot_tokens()
+    msg = "📺 备份机器人 & 频道配置\n\n"
+    for i in (1, 2, 3):
+        tk = tokens.get(str(i), "")
+        channels = await get_backup_channels(i)
+        if tk:
+            masked = tk[:8] + "..." + tk[-4:] if len(tk) > 15 else "***"
+            msg += f"🤖 backup_bot_{i}: {masked}\n"
+        else:
+            msg += f"🤖 backup_bot_{i}: (未配置Token)\n"
+        if channels:
+            msg += f"   频道 ({len(channels)}个):\n"
+            for ch in channels:
+                msg += f"     • {ch}\n"
+        else:
+            msg += f"   频道: (空)\n"
+        msg += "\n"
+    msg += "/add_channel <频道ID> — 新增频道后选择机器人\n"
+    msg += "/remove_channel <机器人编号> <频道ID> — 删除备份频道\n"
+    msg += "/add_backup_bot <编号> <Token> [频道ID...] — 配置Token及频道\n"
+    msg += "/remove_backup_bot <编号> — 删除备份机器人\n"
+    msg += "\n⚠️ 修改 Token 后需重启对应备份机器人才生效"
+    return msg
+
+
+async def _get_logs_page_text(page: int = 1) -> str:
+    per_page = 15
+    logs_col = get_decode_logs_col()
+    total = await logs_col.count_documents({})
+    skip = (page - 1) * per_page
+    logs_data = await logs_col.find(sort=("request_time", -1), skip=skip, limit=per_page)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    msg = f"📋 解码日志 (第{page}/{total_pages}页)\n\n"
+    for log in logs_data:
+        status_icon = "✅" if log.get("status") == "success" else "⏳" if log.get("status") == "queued" else "❌"
+        fc = (log.get("file_code") or "")[:30]
+        requester = log.get("requester_id", "?")
+        t = _format_datetime(log.get("request_time"))
+        msg += f"{status_icon} [{t}] {fc} - 用户{requester}\n"
+    if total_pages > 1:
+        msg += f"\n使用 /logs {page+1} 查看下一页"
+    return msg
+
+
+async def _get_users_page_text(search: str = "", page: int = 1) -> str:
+    per_page = 10
+    users_col = get_users_col()
+    query = {}
+    if search:
+        if search.isdigit():
+            query["user_id"] = int(search)
+        else:
+            query["$or"] = [
+                {"username": {"$regex": search, "$options": "i"}},
+                {"first_name": {"$regex": search, "$options": "i"}},
+            ]
+    total = await users_col.count_documents(query)
+    skip = (page - 1) * per_page
+    users = await users_col.find(query, sort=("created_at", -1), skip=skip, limit=per_page)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    msg = f"👤 用户列表 (第{page}/{total_pages}页，共{total}人)\n"
+    if search:
+        msg += f"🔍 搜索：{search}\n"
+    msg += "\n"
+    for u in users:
+        level_icon = {"free": "🆓", "basic": "🥇", "premium": "👑"}.get(u.get("membership_level", "free"), "🆓")
+        ban_icon = "🔒" if u.get("is_banned") else ""
+        name = u.get("username") or u.get("first_name") or f"ID:{u.get('user_id')}"
+        msg += f"{level_icon}{ban_icon} {u.get('user_id')} - @{name}\n"
+    if total_pages > 1 and search:
+        msg += f"\n使用 /users {search} {page+1} 查看下一页"
+    elif total_pages > 1:
+        msg += f"\n使用 /users {page+1} 查看下一页"
+    return msg
+
+
+BACK_BTN = [[InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]]
+
+
+def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    if menu_id == "main":
+        text = "🤖 管理员面板 — 点击按钮操作"
+        kb = [
+            [InlineKeyboardButton("📊 系统状态", callback_data="menu:sys"),
+             InlineKeyboardButton("👤 用户管理", callback_data="menu:user")],
+            [InlineKeyboardButton("📁 文件管理", callback_data="menu:file"),
+             InlineKeyboardButton("📺 备份频道", callback_data="menu:backup_chan")],
+            [InlineKeyboardButton("🤖 备份机器人", callback_data="menu:backup_bot"),
+             InlineKeyboardButton("📋 解码日志", callback_data="action:logs")],
+        ]
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "sys":
+        text = "📊 系统状态"
+        kb = [
+            [InlineKeyboardButton("📈 系统概览", callback_data="action:status"),
+             InlineKeyboardButton("❤️ 健康状态", callback_data="action:health")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "user":
+        text = (
+            "👤 用户管理\n\n"
+            "用法参考：\n"
+            "/user <id> — 查看用户详情\n"
+            "/set_level <id> <等级> — 设置会员等级\n"
+            "/ban <id> / /unban <id> — 封禁/解封\n"
+            "/set_quota <id> <数量> — 解码配额\n"
+            "/set_external_quota <id> <数量> — 外部码配额"
+        )
+        kb = [
+            [InlineKeyboardButton("📋 用户列表", callback_data="action:users")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "file":
+        text = (
+            "📁 文件管理\n\n"
+            "用法参考：\n"
+            "/file <code> — 查看文件详情\n"
+            "/files [搜索] [页码] — 文件列表\n"
+            "/delete_file <code> — 删除文件"
+        )
+        kb = [
+            [InlineKeyboardButton("📂 文件列表", callback_data="action:files")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "backup_chan":
+        text = (
+            "📺 备份频道管理\n\n"
+            "/add_channel <频道ID> — 新增频道后选择机器人\n"
+            "/add_channel <编号> <频道ID> — 直接指定机器人\n"
+            "/remove_channel <编号> <频道ID> — 删除备份频道"
+        )
+        kb = [
+            [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
+            [InlineKeyboardButton("➕ 新增频道", callback_data="usage:add_chan"),
+             InlineKeyboardButton("➖ 删除频道", callback_data="usage:remove_chan")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "backup_bot":
+        text = (
+            "🤖 备份机器人管理\n\n"
+            "/add_backup_bot <编号> <Token> [频道ID...] — 配置Token及频道\n"
+            "/remove_backup_bot <编号> — 删除备份机器人\n\n"
+            "⚠️ 修改 Token 后需重启对应备份机器人才生效"
+        )
+        kb = [
+            [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
+            [InlineKeyboardButton("➕ 新增机器人", callback_data="usage:add_bot"),
+             InlineKeyboardButton("➖ 删除机器人", callback_data="usage:remove_bot")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    return _build_menu("main")
+
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    user = update.effective_user
+    if not user or user.id != AUTHORIZED_USER_ID:
+        await query.answer("⛔ 无权限", show_alert=True)
+        return
+
+    back_kb = InlineKeyboardMarkup(BACK_BTN)
+
+    if data.startswith("menu:"):
+        menu_id = data.split(":", 1)[1]
+        text, markup = _build_menu(menu_id)
+        await query.edit_message_text(text, reply_markup=markup)
+        return
+
+    if data == "action:status":
+        text = await _get_status_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:health":
+        text = await _get_health_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:channels":
+        text = await _get_channels_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:logs":
+        text = await _get_logs_page_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:users":
+        text = await _get_users_page_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:files":
+        files_col = get_file_records_col()
+        total = await files_col.count_documents({})
+        files = await files_col.find(sort=("create_time", -1), limit=10)
+        total_pages = max(1, (total + 10 - 1) // 10)
+        text = f"📁 文件列表 (第1/{total_pages}页，共{total}个)\n\n"
+        for f in files:
+            status_icon = "✅" if f.get("status") == "active" else "🗑️"
+            fc = f.get("file_code", "N/A")
+            uploader = f.get("uploader_id", "?")
+            text += f"{status_icon} {fc} (上传者:{uploader})\n"
+        if total_pages > 1:
+            text += f"\n使用 /files 2 查看下一页"
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "usage:add_chan":
+        text = (
+            "➕ 新增备份频道\n\n"
+            "方式一：只输入频道ID，再选择由哪个机器人负责\n"
+            "  /add_channel -100111222333\n\n"
+            "方式二：直接指定机器人编号\n"
+            "  /add_channel 2 -100111222333"
+        )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "usage:remove_chan":
+        text = (
+            "➖ 删除备份频道\n\n"
+            "请先通过 /channels 确认频道所属的机器人编号\n"
+            "然后输入：\n"
+            "  /remove_channel <机器人编号> <频道ID>\n\n"
+            "示例：/remove_channel 1 -100111222333"
+        )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "usage:add_bot":
+        text = (
+            "➕ 新增备份机器人\n\n"
+            "格式：/add_backup_bot <编号> <BotToken> [频道ID ...]\n\n"
+            "示例（仅配Token）：\n"
+            "  /add_backup_bot 1 8012345678:AAbbcc...\n\n"
+            "示例（同时配频道）：\n"
+            "  /add_backup_bot 1 8012345678:AAbbcc... -100111 -100222\n\n"
+            "⚠️ 配置后需重启对应备份机器人才生效"
+        )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "usage:remove_bot":
+        text = (
+            "➖ 删除备份机器人\n\n"
+            "格式：/remove_backup_bot <编号>\n\n"
+            "示例：/remove_backup_bot 2\n\n"
+            "⚠️ 该备份机器人将在下次重启后不再启动"
+        )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+
+@_auth_required
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, markup = _build_menu("main")
+    await update.message.reply_text(text, reply_markup=markup)
+
+
+@_auth_required
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await _get_status_text())
+
+
+@_auth_required
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await _get_health_text())
 
 
 @_auth_required
@@ -174,39 +418,7 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = int(arg)
         else:
             search = arg
-
-    per_page = 10
-    users_col = get_users_col()
-    query = {}
-    if search:
-        if search.isdigit():
-            query["user_id"] = int(search)
-        else:
-            query["$or"] = [
-                {"username": {"$regex": search, "$options": "i"}},
-                {"first_name": {"$regex": search, "$options": "i"}},
-            ]
-
-    total = await users_col.count_documents(query)
-    skip = (page - 1) * per_page
-    users = await users_col.find(query, sort=("created_at", -1), skip=skip, limit=per_page)
-    total_pages = max(1, (total + per_page - 1) // per_page)
-
-    msg = f"👤 用户列表 (第{page}/{total_pages}页，共{total}人)\n"
-    if search:
-        msg += f"🔍 搜索：{search}\n"
-    msg += "\n"
-
-    for u in users:
-        level_icon = {"free": "🆓", "basic": "🥇", "premium": "👑"}.get(u.get("membership_level", "free"), "🆓")
-        ban_icon = "🔒" if u.get("is_banned") else ""
-        name = u.get("username") or u.get("first_name") or f"ID:{u.get('user_id')}"
-        msg += f"{level_icon}{ban_icon} {u.get('user_id')} - @{name}\n"
-
-    if total_pages > 1:
-        msg += f"\n使用 /users {search} {page+1} 查看下一页" if not search else f"\n使用 /users {search} {page+1} 查看下一页"
-
-    await update.message.reply_text(msg)
+    await update.message.reply_text(await _get_users_page_text(search, page))
 
 
 @_auth_required
@@ -447,26 +659,210 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = 1
     if args and args[0].isdigit():
         page = int(args[0])
+    await update.message.reply_text(await _get_logs_page_text(page))
 
-    per_page = 15
-    logs_col = get_decode_logs_col()
-    total = await logs_col.count_documents({})
-    skip = (page - 1) * per_page
-    logs_data = await logs_col.find(sort=("request_time", -1), skip=skip, limit=per_page)
-    total_pages = max(1, (total + per_page - 1) // per_page)
 
-    msg = f"📋 解码日志 (第{page}/{total_pages}页)\n\n"
-    for log in logs_data:
-        status_icon = "✅" if log.get("status") == "success" else "⏳" if log.get("status") == "queued" else "❌"
-        fc = (log.get("file_code") or "")[:30]
-        requester = log.get("requester_id", "?")
-        t = _format_datetime(log.get("request_time"))
-        msg += f"{status_icon} [{t}] {fc} - 用户{requester}\n"
+@_auth_required
+async def channels_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(await _get_channels_text())
 
-    if total_pages > 1:
-        msg += f"\n使用 /logs {page+1} 查看下一页"
 
-    await update.message.reply_text(msg)
+@_auth_required
+async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：\n"
+            "  /add_channel <频道ID> — 添加频道后选择机器人\n"
+            "  /add_channel <机器人编号> <频道ID> — 直接指定机器人"
+        )
+        return
+
+    if len(args) == 1:
+        try:
+            channel_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字")
+            return
+
+        all_channels = await get_backup_channels(1) + await get_backup_channels(2) + await get_backup_channels(3)
+        if channel_id in all_channels:
+            await update.message.reply_text(f"⚠️ 频道 {channel_id} 已被其他机器人管理，请 /channels 查看")
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton(f"🤖 backup_bot_1", callback_data=f"assign_chan:1:{channel_id}"),
+                InlineKeyboardButton(f"🤖 backup_bot_2", callback_data=f"assign_chan:2:{channel_id}"),
+            ],
+            [
+                InlineKeyboardButton(f"🤖 backup_bot_3", callback_data=f"assign_chan:3:{channel_id}"),
+            ],
+        ]
+        await update.message.reply_text(
+            f"📺 频道 {channel_id}\n请选择由哪个备份机器人负责：",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    try:
+        bot_num = int(args[0])
+        channel_id = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ 机器人编号和频道ID必须是数字")
+        return
+    if bot_num not in (1, 2, 3):
+        await update.message.reply_text("❌ 机器人编号必须是 1、2 或 3")
+        return
+
+    channels = await get_backup_channels(bot_num)
+    if channel_id in channels:
+        await update.message.reply_text(f"⚠️ 频道 {channel_id} 已在 backup_bot_{bot_num} 中")
+        return
+
+    channels.append(channel_id)
+    await set_backup_channels(bot_num, channels)
+
+    tokens = await get_backup_bot_tokens()
+    restart_hint = ""
+    if str(bot_num) not in tokens:
+        restart_hint = "\n\n⚠️ 该机器人尚未配置 Token，请使用 /add_backup_bot 配置后重启"
+
+    await update.message.reply_text(
+        f"✅ 频道 {channel_id} 已添加到 backup_bot_{bot_num}\n"
+        f"当前 backup_bot_{bot_num} 频道: {channels}\n"
+        f"备份机器人每 5 秒自动检测频道变化，新增频道将触发全量同步{restart_hint}"
+    )
+
+
+@_auth_required
+async def assign_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("assign_chan:"):
+        return
+
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+
+    bot_num = int(parts[1])
+    channel_id = int(parts[2])
+
+    channels = await get_backup_channels(bot_num)
+    if channel_id in channels:
+        await query.edit_message_text(f"⚠️ 频道 {channel_id} 已在 backup_bot_{bot_num} 中")
+        return
+
+    channels.append(channel_id)
+    await set_backup_channels(bot_num, channels)
+
+    tokens = await get_backup_bot_tokens()
+    restart_hint = ""
+    if str(bot_num) not in tokens:
+        restart_hint = "\n\n⚠️ 该机器人尚未配置 Token，请使用 /add_backup_bot 配置后重启"
+
+    await query.edit_message_text(
+        f"✅ 频道 {channel_id} → backup_bot_{bot_num}\n"
+        f"频道列表: {channels}\n"
+        f"新增频道将触发全量同步{restart_hint}"
+    )
+
+
+@_auth_required
+async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("用法：/remove_channel <机器人编号(1/2/3)> <频道ID>")
+        return
+    try:
+        bot_num = int(args[0])
+        channel_id = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ 机器人编号和频道ID必须是数字")
+        return
+    if bot_num not in (1, 2, 3):
+        await update.message.reply_text("❌ 机器人编号必须是 1、2 或 3")
+        return
+
+    channels = await get_backup_channels(bot_num)
+    if channel_id not in channels:
+        await update.message.reply_text(f"⚠️ 频道 {channel_id} 不在 backup_bot_{bot_num} 中")
+        return
+
+    channels.remove(channel_id)
+    await set_backup_channels(bot_num, channels)
+
+    await update.message.reply_text(
+        f"✅ 频道 {channel_id} 已从 backup_bot_{bot_num} 中移除\n"
+        f"当前 backup_bot_{bot_num} 频道: {channels or '(空)'}\n"
+        f"备份机器人将在下个周期自动停止向此频道备份"
+    )
+
+
+@_auth_required
+async def add_backup_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "用法：/add_backup_bot <编号(1/2/3)> <BotToken> [频道ID ...]\n"
+            "示例：/add_backup_bot 1 12345:abc -100111 -100222"
+        )
+        return
+    try:
+        bot_num = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 编号必须是数字 1、2 或 3")
+        return
+    if bot_num not in (1, 2, 3):
+        await update.message.reply_text("❌ 编号必须是 1、2 或 3")
+        return
+
+    token = args[1].strip()
+    await set_backup_bot_token(bot_num, token)
+
+    extra_info = ""
+    if len(args) > 2:
+        channel_ids = []
+        for a in args[2:]:
+            try:
+                channel_ids.append(int(a))
+            except ValueError:
+                pass
+        if channel_ids:
+            await set_backup_channels(bot_num, channel_ids)
+            extra_info = f"\n频道已配置: {channel_ids}"
+
+    masked = token[:8] + "..." + token[-4:] if len(token) > 15 else "***"
+    await update.message.reply_text(
+        f"✅ 备份机器人 {bot_num} Token 已保存到数据库 ({masked}){extra_info}\n"
+        f"⚠️ 需要重启 backup_bot_{bot_num} 进程才能生效\n"
+        f"重启命令: python run_all.py backup{bot_num}"
+    )
+
+
+@_auth_required
+async def remove_backup_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("用法：/remove_backup_bot <编号(1/2/3)>")
+        return
+    try:
+        bot_num = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 编号必须是数字 1、2 或 3")
+        return
+    if bot_num not in (1, 2, 3):
+        await update.message.reply_text("❌ 编号必须是 1、2 或 3")
+        return
+
+    await delete_backup_bot_token(bot_num)
+    await update.message.reply_text(
+        f"✅ 备份机器人 {bot_num} Token 已从数据库删除\n"
+        f"⚠️ 该备份机器人将在下次重启后不再启动"
+    )
 
 
 async def _init():
@@ -502,5 +898,12 @@ def run():
     app.add_handler(CommandHandler("files", files_list))
     app.add_handler(CommandHandler("delete_file", delete_file))
     app.add_handler(CommandHandler("logs", logs))
+    app.add_handler(CommandHandler("channels", channels_list))
+    app.add_handler(CommandHandler("add_channel", add_channel))
+    app.add_handler(CommandHandler("remove_channel", remove_channel))
+    app.add_handler(CommandHandler("add_backup_bot", add_backup_bot))
+    app.add_handler(CommandHandler("remove_backup_bot", remove_backup_bot))
+    app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:)"))
 
     app.run_polling()

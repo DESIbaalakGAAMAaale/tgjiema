@@ -76,6 +76,11 @@ DDL_STATEMENTS = [
         processed INTEGER DEFAULT 0
     )""",
     "CREATE INDEX IF NOT EXISTS idx_send_queue_unprocessed ON send_queue(processed)",
+    """CREATE TABLE IF NOT EXISTS backup_config (
+        config_key TEXT PRIMARY KEY,
+        config_value TEXT,
+        updated_at TEXT
+    )""",
 ]
 
 MIGRATION_STATEMENTS = [
@@ -357,6 +362,7 @@ _file_records_col = D1Collection("file_records")
 _decode_logs_col = D1Collection("decode_logs")
 _pending_uploads_col = D1Collection("pending_uploads")
 _send_queue_col = D1Collection("send_queue")
+_backup_config_col = D1Collection("backup_config")
 
 
 def get_users_col() -> D1Collection:
@@ -377,3 +383,71 @@ def get_pending_uploads_col() -> D1Collection:
 
 def get_send_queue_col() -> D1Collection:
     return _send_queue_col
+
+
+def get_backup_config_col() -> D1Collection:
+    return _backup_config_col
+
+
+async def _get_config(key: str) -> Optional[str]:
+    row = await _backup_config_col.find_one({"config_key": key})
+    return row.get("config_value") if row else None
+
+
+async def _set_config(key: str, value: str):
+    import datetime as _dt
+    existing = await _backup_config_col.find_one({"config_key": key})
+    if existing:
+        await _backup_config_col.update_one(
+            {"config_key": key},
+            {"$set": {"config_value": value, "updated_at": _dt.datetime.utcnow().isoformat()}},
+        )
+    else:
+        await _backup_config_col.insert_one({
+            "config_key": key,
+            "config_value": value,
+            "updated_at": _dt.datetime.utcnow().isoformat(),
+        })
+
+
+async def get_backup_channels(group: int) -> list[int]:
+    val = await _get_config(f"backup_channels_{group}")
+    if val is None:
+        return []
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+async def set_backup_channels(group: int, channels: list[int]):
+    await _set_config(f"backup_channels_{group}", json.dumps(channels))
+
+
+async def get_all_backup_channels() -> list[int]:
+    result = []
+    for g in (1, 2, 3):
+        result.extend(await get_backup_channels(g))
+    return result
+
+
+async def get_backup_bot_tokens() -> dict[str, str]:
+    tokens = {}
+    for i in (1, 2, 3):
+        val = await _get_config(f"backup_bot_{i}_token")
+        if val:
+            tokens[str(i)] = val
+    return tokens
+
+
+async def set_backup_bot_token(bot_num: int, token: str):
+    await _set_config(f"backup_bot_{bot_num}_token", token)
+
+
+async def delete_backup_bot_token(bot_num: int):
+    existing = await _backup_config_col.find_one({"config_key": f"backup_bot_{bot_num}_token"})
+    if existing:
+        await _backup_config_col.update_one(
+            {"config_key": f"backup_bot_{bot_num}_token"},
+            {"$set": {"config_value": "", "updated_at": ""}},
+        )
