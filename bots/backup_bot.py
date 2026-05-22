@@ -191,6 +191,8 @@ class BackupBot:
 
         await self._load_sync_state()
 
+        bot = Bot(token=token)
+
         empty_channels = await self._check_empty_channels(bot)
         if empty_channels:
             logger.info(
@@ -204,7 +206,6 @@ class BackupBot:
             await self._save_sync_state()
 
         logger.info(f"启动备份机器人 {self.name}，目标频道: {self.backup_channels}")
-        bot = Bot(token=token)
         metrics.ping_bot(self.name)
 
         source_channel = settings.MAIN_STORAGE_CHANNEL_ID
