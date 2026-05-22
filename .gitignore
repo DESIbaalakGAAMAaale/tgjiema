@@ -1,0 +1,28 @@
+# 环境变量（含敏感信息）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 日志
+logs/
+
+# 数据库
+*.db
+
+# IDE
+.vscode/
+.idea/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 系统文件
+.DS_Store
+Thumbs.db
