@@ -59,6 +59,16 @@ DDL_STATEMENTS = [
         processed INTEGER DEFAULT 0
     )""",
     "CREATE INDEX IF NOT EXISTS idx_pending_uploads_unprocessed ON pending_uploads(processed)",
+    """CREATE TABLE IF NOT EXISTS send_queue (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_user_id INTEGER,
+        channel_id INTEGER,
+        message_id INTEGER,
+        file_code TEXT,
+        created_at TEXT,
+        processed INTEGER DEFAULT 0
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_send_queue_unprocessed ON send_queue(processed)",
 ]
 
 
@@ -346,6 +356,7 @@ _users_col = D1Collection("users")
 _file_records_col = D1Collection("file_records")
 _decode_logs_col = D1Collection("decode_logs")
 _pending_uploads_col = D1Collection("pending_uploads")
+_send_queue_col = D1Collection("send_queue")
 
 
 def get_users_col() -> D1Collection:
@@ -362,3 +373,7 @@ def get_decode_logs_col() -> D1Collection:
 
 def get_pending_uploads_col() -> D1Collection:
     return _pending_uploads_col
+
+
+def get_send_queue_col() -> D1Collection:
+    return _send_queue_col
