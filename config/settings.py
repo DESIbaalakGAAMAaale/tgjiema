@@ -76,5 +76,9 @@ class Settings(BaseSettings):
             + self.BACKUP_CHANNELS_GROUP_3
         )
 
+    @property
+    def ALL_STORAGE_CHANNELS(self) -> List[int]:
+        return [self.MAIN_STORAGE_CHANNEL_ID] + self.ALL_BACKUP_CHANNELS
+
 
 settings = Settings()
