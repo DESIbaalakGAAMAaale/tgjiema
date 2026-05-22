@@ -577,6 +577,8 @@ def run():
     )
 
     async def _route_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message is None:
+            return
         try:
             if update.message.media_group_id:
                 await handle_external_media(update, context)
