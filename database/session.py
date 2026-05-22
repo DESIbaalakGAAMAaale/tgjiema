@@ -177,11 +177,13 @@ def _row_to_dict(record) -> dict:
     return result
 
 
-def _safe_str(val: Any) -> str:
+def _safe_str(val: Any):
     if val is None:
         return None
     if isinstance(val, bool):
-        return "1" if val else "0"
+        return 1 if val else 0
+    if isinstance(val, int):
+        return val
     if isinstance(val, (list, dict)):
         return json.dumps(val, default=str)
     if isinstance(val, datetime):
