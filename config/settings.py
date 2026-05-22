@@ -1,5 +1,5 @@
 import json
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from pydantic_settings import BaseSettings
 
@@ -21,8 +21,8 @@ class Settings(BaseSettings):
     BACKUP_CHANNELS_GROUP_2: List[int] = []
     BACKUP_CHANNELS_GROUP_3: List[int] = []
 
-    MONGODB_URI: str = "mongodb://localhost:27017"
-    MONGODB_DB_NAME: str = "tgjiema"
+    REDIS_URL: str = "rediss://127.0.0.1:6379"
+    REDIS_SSL_SNI: Optional[str] = None
 
     ADMIN_WEB_PORT: int = 8080
     ADMIN_WEB_HOST: str = "127.0.0.1"

@@ -42,9 +42,8 @@ class BackupBot:
 
     async def _scan_and_backup(self, bot: Bot):
         col = get_file_records_col()
-        cursor = col.find().sort("primary_channel_msg_id", -1).limit(1)
-        latest = await cursor.to_list(length=1)
-        latest = latest[0] if latest else None
+        latest_list = await col.find(sort=("primary_channel_msg_id", -1), limit=1)
+        latest = latest_list[0] if latest_list else None
 
         if latest is None:
             return

@@ -94,8 +94,7 @@ async def users_page(
 
     total = await users_col.count_documents(query)
     skip = (page - 1) * per_page
-    cursor = users_col.find(query).sort("created_at", -1).skip(skip).limit(per_page)
-    users = await cursor.to_list(length=per_page)
+    users = await users_col.find(query, sort=("created_at", -1), skip=skip, limit=per_page)
 
     return templates.TemplateResponse(
         "users.html",
@@ -184,8 +183,7 @@ async def files_page(
 
     total = await files_col.count_documents(query)
     skip = (page - 1) * per_page
-    cursor = files_col.find(query).sort("create_time", -1).skip(skip).limit(per_page)
-    files = await cursor.to_list(length=per_page)
+    files = await files_col.find(query, sort=("create_time", -1), skip=skip, limit=per_page)
 
     return templates.TemplateResponse(
         "files.html",
@@ -224,8 +222,7 @@ async def logs_page(
 
     total = await logs_col.count_documents({})
     skip = (page - 1) * per_page
-    cursor = logs_col.find().sort("request_time", -1).skip(skip).limit(per_page)
-    logs = await cursor.to_list(length=per_page)
+    logs = await logs_col.find(sort=("request_time", -1), skip=skip, limit=per_page)
 
     return templates.TemplateResponse(
         "logs.html",

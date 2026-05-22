@@ -1,11 +1,9 @@
 import multiprocessing
-import asyncio
 import sys
 import time
 
 from loguru import logger
 from config import settings
-from database import init_db, close_db
 
 
 def run_upload_bot():
@@ -60,11 +58,6 @@ BOT_RUNNERS = {
 }
 
 
-async def _init_resources():
-    await init_db()
-    logger.info("MongoDB 数据库连接初始化完成")
-
-
 def main():
     logger.add(
         "logs/tgjiema_{time}.log",
@@ -72,8 +65,6 @@ def main():
         retention="7 days",
         level=settings.LOG_LEVEL,
     )
-
-    asyncio.run(_init_resources())
 
     args = sys.argv[1:]
     if not args:
@@ -97,7 +88,6 @@ def main():
                 p.terminate()
             for p in processes:
                 p.join(timeout=5)
-            asyncio.run(close_db())
             logger.info("所有进程已关闭")
     else:
         processes = []
@@ -122,7 +112,6 @@ def main():
                 p.terminate()
             for p in processes:
                 p.join(timeout=5)
-            asyncio.run(close_db())
             logger.info("所有进程已关闭")
 
 
