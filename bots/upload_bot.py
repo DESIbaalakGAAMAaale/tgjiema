@@ -10,7 +10,7 @@ from services.permission import check_upload_permission
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 
-TOKEN = settings.BOT_TOKENS.get("UPLOAD_BOT", "")
+TOKEN = settings.UPLOAD_BOT_TOKEN
 DECODER_BOT_CHAT_ID = settings.DECODER_BOT_CHAT_ID
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
 

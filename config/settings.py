@@ -1,18 +1,16 @@
 import json
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    BOT_TOKENS: Dict[str, str] = {
-        "UPLOAD_BOT": "",
-        "DECODER_BOT": "",
-        "SENDER_BOT": "",
-        "BACKUP_BOT_1": "",
-        "BACKUP_BOT_2": "",
-        "BACKUP_BOT_3": "",
-    }
+    UPLOAD_BOT_TOKEN: str = ""
+    DECODER_BOT_TOKEN: str = ""
+    SENDER_BOT_TOKEN: str = ""
+    BACKUP_BOT_1_TOKEN: str = ""
+    BACKUP_BOT_2_TOKEN: str = ""
+    BACKUP_BOT_3_TOKEN: str = ""
 
     MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
     DECODER_BOT_CHAT_ID: int = 0
@@ -59,8 +57,6 @@ class Settings(BaseSettings):
 
         @classmethod
         def parse_env_var(cls, field_name: str, raw_val: str):
-            if field_name == "BOT_TOKENS":
-                return json.loads(raw_val)
             if field_name in (
                 "BACKUP_CHANNELS_GROUP_1",
                 "BACKUP_CHANNELS_GROUP_2",

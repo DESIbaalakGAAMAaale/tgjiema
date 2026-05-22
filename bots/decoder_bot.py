@@ -20,7 +20,7 @@ from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.channel_selector import channel_selector
 from utils.monitor import metrics
 
-TOKEN = settings.BOT_TOKENS.get("DECODER_BOT", "")
+TOKEN = settings.DECODER_BOT_TOKEN
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
 
 _pending_external: dict[str, deque[tuple[int, str]]] = defaultdict(deque)

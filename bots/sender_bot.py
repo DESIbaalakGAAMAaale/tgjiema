@@ -8,7 +8,7 @@ from config import settings
 from services.queue_manager import dequeue_send_task
 from utils.monitor import metrics
 
-TOKEN = settings.BOT_TOKENS.get("SENDER_BOT", "")
+TOKEN = settings.SENDER_BOT_TOKEN
 
 
 async def process_queue(bot: Bot):
