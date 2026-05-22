@@ -340,6 +340,8 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[handle_code] 解码日志写入失败 (user={user.id}, code={text}): {e}")
 
     batch_ids_str = file_record.get("batch_msg_ids") or ""
+    if not isinstance(batch_ids_str, str):
+        batch_ids_str = str(batch_ids_str)
     msg_ids = []
     if batch_ids_str:
         msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]

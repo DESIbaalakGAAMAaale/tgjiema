@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from loguru import logger
 from telegram import Bot
 from config import settings
@@ -299,6 +300,12 @@ class BackupBot:
                     metrics.backup_count += 1
                 except Exception as e:
                     err_msg = str(e)
+                    flood_match = re.search(r'Flood control exceeded\. Retry in (\d+) seconds', err_msg, re.IGNORECASE)
+                    if flood_match:
+                        wait = int(flood_match.group(1)) + 2
+                        logger.warning(f"[{self.name}] 触发 Flood 控制，等待 {wait} 秒后重试")
+                        await asyncio.sleep(wait)
+                        continue
                     if "Message to copy not found" in err_msg or "message to forward not found" in err_msg.lower():
                         if source_channel not in self._inaccessible_sources:
                             self._inaccessible_sources.add(source_channel)
