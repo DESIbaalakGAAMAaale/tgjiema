@@ -301,7 +301,9 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             "🔐 用户中继管理\n\n"
             "中继账号用于突破 bot-to-bot 私聊限制，\n"
             "使解码机器人可以向其他机器人发送外部码。\n\n"
-            "/relay_code <验证码> — 提交登录验证码\n"
+            "验证码会发送到该账号已登录的 Telegram 客户端，\n"
+            "而非手机短信。\n\n"
+            "/relay_code <验证码> — 提交登录验证码（6位）\n"
             "/relay_set_api <api_id> <api_hash> <手机号> — 配置账号\n"
             "/relay_pending — 查看是否有待处理的验证码"
         )
@@ -435,11 +437,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "usage:relay_code":
         text = (
             "🔑 提交验证码\n\n"
-            "当中继账号需要登录验证时，Telegram 会发送验证码\n"
-            "到该账号的 Telegram 客户端。\n\n"
+            "当中继账号需要登录验证时，Telegram 会发送 6 位验证码\n"
+            "到该账号已登录的 Telegram 客户端（非短信）。\n\n"
             "在此提交验证码即可完成登录：\n"
-            "/relay_code <5位数字>\n\n"
-            "示例：/relay_code 12345\n\n"
+            "/relay_code <验证码>\n\n"
+            "示例：/relay_code 123456\n\n"
             "解码机器人在后台轮询等待，提交后几秒内自动完成登录。"
         )
         await query.edit_message_text(text, reply_markup=back_kb)
@@ -959,12 +961,12 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "用法：/relay_code <验证码>\n\n"
             "用于解码机器人登录 Telegram 用户账号时提交验证码。\n"
-            "验证码会发送到中继账号的 Telegram 客户端。"
+            "验证码（6位）会发送到该账号已登录的 Telegram 客户端。"
         )
         return
     code = args[0].strip()
-    if not code.isdigit() or len(code) != 5:
-        await update.message.reply_text("❌ 验证码格式不正确，应为 5 位数字")
+    if not code.isdigit() or len(code) not in (5, 6):
+        await update.message.reply_text("❌ 验证码格式不正确，应为 5-6 位数字")
         return
 
     await set_config("relay_auth_code", code)
@@ -1007,8 +1009,8 @@ async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending == "1":
         await update.message.reply_text(
             "⏳ 中继正在等待验证码\n\n"
-            "Telegram 已发送验证码到中继账号，请查看并提交：\n"
-            "/relay_code <验证码>"
+            "Telegram 已发送 6 位验证码到中继账号的已登录客户端，\n"
+            "请查看并提交：/relay_code <验证码>"
         )
     else:
         await update.message.reply_text(

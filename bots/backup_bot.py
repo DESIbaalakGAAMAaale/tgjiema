@@ -123,6 +123,17 @@ class BackupBot:
         except Exception as e:
             logger.warning(f"[{self.name}] 保存同步状态失败: {e}")
 
+    async def _check_empty_channels(self) -> list[int]:
+        col = get_file_records_col()
+        empty = []
+        for channel_id in self.backup_channels:
+            record = await col.find_one(
+                {"backup_channel_msg_ids": {"$elemMatch": {"channel_id": channel_id}}}
+            )
+            if not record:
+                empty.append(channel_id)
+        return empty
+
     async def run(self):
         from database import init_db
         await init_db()
@@ -133,6 +144,18 @@ class BackupBot:
             return
 
         await self._load_sync_state()
+
+        empty_channels = await self._check_empty_channels()
+        if empty_channels:
+            logger.info(
+                f"[{self.name}] 检测到以下备份频道为空，触发全量同步: {empty_channels}"
+            )
+            self._full_sync_done = False
+            self._sync_offset = 0
+            self._last_synced_id = 0
+            self._max_seen_id = 0
+            self._quick_cursor = 0
+            await self._save_sync_state()
 
         logger.info(f"启动备份机器人 {self.name}，目标频道: {self.backup_channels}")
         bot = Bot(token=token)
