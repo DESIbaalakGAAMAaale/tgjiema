@@ -35,6 +35,23 @@ def _detect_file_type(update: Update) -> str:
     return "document"
 
 
+def _extract_file_meta(update: Update) -> dict:
+    msg = update.message
+    if msg.photo:
+        return {"type": "photo", "file_id": msg.photo[-1].file_id}
+    if msg.video:
+        return {"type": "video", "file_id": msg.video.file_id}
+    if msg.document:
+        return {"type": "document", "file_id": msg.document.file_id}
+    if msg.audio:
+        return {"type": "audio", "file_id": msg.audio.file_id}
+    if msg.voice:
+        return {"type": "audio", "file_id": msg.voice.file_id}
+    if msg.animation:
+        return {"type": "animation", "file_id": msg.animation.file_id}
+    return {"type": "document", "file_id": ""}
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "欢迎使用上传机器人。\n\n"
@@ -56,6 +73,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["batch"] = {
         "file_types": defaultdict(int),
         "pinned_msg_ids": [],
+        "files_meta": [],
     }
     await update.message.reply_text(
         "📦 已进入批次上传模式，请发送文件。\n"
@@ -92,6 +110,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     type_str = json.dumps(file_types)
     batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
+    batch_file_meta_str = json.dumps(batch["files_meta"])
 
     try:
         pending_col = get_pending_uploads_col()
@@ -101,6 +120,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "primary_channel_msg_id": channel_msg_ids[0],
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
+            "batch_file_meta": batch_file_meta_str,
             "created_at": datetime.datetime.utcnow().isoformat(),
             "processed": 0,
         })
@@ -154,6 +174,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     else:
         batch["file_types"][file_type] += 1
+        batch["files_meta"].append(_extract_file_meta(update))
         try:
             forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
             batch["pinned_msg_ids"].append(forwarded.message_id)
@@ -174,6 +195,7 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
         try:
             forwarded = await up.message.copy(chat_id=MAIN_CHANNEL_ID)
             batch["pinned_msg_ids"].append(forwarded.message_id)
+            batch["files_meta"].append(_extract_file_meta(up))
             copied += 1
         except Exception as e:
             logger.error(f"批次媒体组复制文件到存储频道失败: {e}")
@@ -243,10 +265,12 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     first_update = group["updates"][0]
 
     all_mids = []
+    all_meta = []
     for up in group["updates"]:
         try:
             forwarded = await up.message.copy(chat_id=MAIN_CHANNEL_ID)
             all_mids.append(forwarded.message_id)
+            all_meta.append(_extract_file_meta(up))
         except Exception as e:
             logger.error(f"媒体组复制文件到存储频道失败: {e}")
     if not all_mids:
@@ -259,6 +283,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     type_str = json.dumps(file_types)
     batch_ids_str = ",".join(str(mid) for mid in all_mids)
+    batch_file_meta_str = json.dumps(all_meta)
 
     try:
         pending_col = get_pending_uploads_col()
@@ -268,6 +293,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             "primary_channel_msg_id": all_mids[0],
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
+            "batch_file_meta": batch_file_meta_str,
             "created_at": datetime.datetime.utcnow().isoformat(),
             "processed": 0,
         })
@@ -314,6 +340,7 @@ async def _process_upload(
             "primary_channel_msg_id": channel_msg_id,
             "file_types": type_str,
             "batch_msg_ids": "",
+            "batch_file_meta": "",
             "created_at": datetime.datetime.utcnow().isoformat(),
             "processed": 0,
         })

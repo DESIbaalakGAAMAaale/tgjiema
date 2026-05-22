@@ -16,7 +16,7 @@ from database import (
 )
 from services.code_generator import generate_unique_code, is_valid_code_format
 from services.permission import check_decode_permission, get_or_create_user
-from services.queue_manager import enqueue_send_task
+from services.queue_manager import enqueue_send_task, enqueue_batch_send_task
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.channel_selector import channel_selector
 from utils.monitor import metrics
@@ -189,6 +189,7 @@ async def _process_pending_uploads(app: Application):
                 if not isinstance(file_types, dict):
                     file_types = {}
                 batch_msg_ids_str = row.get("batch_msg_ids", "")
+                batch_file_meta_str = row.get("batch_file_meta", "")
 
                 if not uploader_id or not channel_id or not message_id:
                     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
@@ -217,6 +218,7 @@ async def _process_pending_uploads(app: Application):
                         primary_channel_msg_id=message_id,
                         file_types=file_types,
                         batch_msg_ids=batch_msg_ids_str,
+                        batch_file_meta=batch_file_meta_str,
                     )
                     await files_col.insert_one(record)
                 except Exception as e:
@@ -315,12 +317,23 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg_ids:
         msg_ids = [file_record.get("primary_channel_msg_id")]
 
+    batch_file_meta_str = file_record.get("batch_file_meta") or ""
+
     try:
-        for mid in msg_ids:
+        if len(msg_ids) > 1:
+            await enqueue_batch_send_task(
+                target_user_id=user.id,
+                channel_id=selected_channel,
+                channel_msg_ids=msg_ids,
+                batch_file_meta=batch_file_meta_str,
+                file_code=text,
+                page=1,
+            )
+        else:
             await enqueue_send_task(
                 target_user_id=user.id,
                 channel_id=selected_channel,
-                message_id=mid,
+                message_id=msg_ids[0],
                 file_code=text,
             )
     except Exception as e:

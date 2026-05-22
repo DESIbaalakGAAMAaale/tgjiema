@@ -21,9 +21,7 @@ class Settings(BaseSettings):
     BACKUP_CHANNELS_GROUP_2: List[int] = []
     BACKUP_CHANNELS_GROUP_3: List[int] = []
 
-    D1_ACCOUNT_ID: str = ""
-    D1_DATABASE_ID: str = ""
-    D1_API_TOKEN: str = ""
+    COCKROACHDB_URL: str = ""
 
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
