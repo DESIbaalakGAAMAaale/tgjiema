@@ -156,14 +156,17 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
             logger.warning(f"[handle_relay_delivery] copy 消息 {msg_ids[0]} 失败: {e}")
 
     if not direct_ok:
-        await enqueue_batch_send_task(
-            target_user_id=target_user_id,
-            channel_id=selected_channel,
-            channel_msg_ids=msg_ids,
-            batch_file_meta=record.get("batch_file_meta", ""),
-            file_code=code,
-            page=1,
-        )
+        if user_relay.is_ready:
+            await user_relay.deliver_cached(target_user_id, code)
+        else:
+            await enqueue_batch_send_task(
+                target_user_id=target_user_id,
+                channel_id=selected_channel,
+                channel_msg_ids=msg_ids,
+                batch_file_meta=record.get("batch_file_meta", ""),
+                file_code=code,
+                page=1,
+            )
 
     await context.bot.send_message(
         chat_id=target_user_id,
@@ -466,7 +469,9 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         if not direct_ok:
-            if len(msg_ids) > 1:
+            if user_relay.is_ready:
+                await user_relay.deliver_cached(user.id, text)
+            elif len(msg_ids) > 1:
                 await enqueue_batch_send_task(
                     target_user_id=user.id,
                     channel_id=selected_channel,

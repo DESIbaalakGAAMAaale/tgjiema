@@ -375,6 +375,75 @@ class UserRelay:
             logger.error(f"[UserRelay] 向 @{bot_username} 发送失败: {e}")
             return False
 
+    async def deliver_cached(self, user_id: int, code: str):
+        if not self._client or not self._storage_channel_entity:
+            logger.warning(f"[UserRelay] 无法交付缓存: 客户端或存储频道未就绪")
+            return
+
+        try:
+            from database import get_file_records_col
+            col = get_file_records_col()
+            record = await col.find_one({"file_code": code})
+            if not record:
+                logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无记录")
+                return
+
+            msg_ids_raw = record.get("batch_msg_ids") or ""
+            if not isinstance(msg_ids_raw, str):
+                msg_ids_raw = str(msg_ids_raw)
+            msg_ids = []
+            if msg_ids_raw:
+                msg_ids = [int(m) for m in msg_ids_raw.split(",") if m.strip().isdigit()]
+            if not msg_ids:
+                primary = record.get("primary_channel_msg_id")
+                if primary:
+                    msg_ids = [primary]
+            if not msg_ids:
+                return
+
+            logger.info(f"[UserRelay] 缓存交付: 码 {code}, {len(msg_ids)} 条, 目标用户 {user_id}")
+
+            for msg_id in msg_ids:
+                msgs = await self._client.get_messages(
+                    self._storage_channel_entity, ids=msg_id
+                )
+                msg = msgs[0] if isinstance(msgs, list) else msgs
+                if not msg:
+                    logger.warning(f"[UserRelay] 缓存交付: 存储频道中未找到 msg_id={msg_id}")
+                    continue
+
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    file_path = await self._client.download_media(msg, file=tmpdir)
+                    if not file_path:
+                        text = getattr(msg, "message", None) or ""
+                        if text and self._decoder_bot_entity:
+                            await self._client.send_message(self._decoder_bot_entity, text)
+                        continue
+
+                    caption = getattr(msg, "message", None) or ""
+                    is_video = getattr(msg, "video", None) is not None
+                    send_kwargs = {"caption": caption}
+                    if is_video:
+                        send_kwargs["video"] = True
+
+                    if self._decoder_bot_entity:
+                        try:
+                            await self._client.send_file(
+                                self._decoder_bot_entity, file_path, **send_kwargs
+                            )
+                        except Exception as e:
+                            logger.error(f"[UserRelay] 缓存交付发送到解码机器人失败: {e}")
+
+            if self._decoder_bot_entity:
+                await self._client.send_message(
+                    self._decoder_bot_entity,
+                    f"RELAY_DELIVER:{user_id}:{code}",
+                )
+                logger.info(f"[UserRelay] 缓存交付: 已通知解码机器人代发给用户 {user_id}")
+
+        except Exception as e:
+            logger.error(f"[UserRelay] 缓存交付失败 (code={code}, user={user_id}): {e}")
+
     async def stop(self):
         if self._client:
             await self._client.disconnect()
