@@ -213,11 +213,12 @@ class BackupBot:
         source_channel = settings.MAIN_STORAGE_CHANNEL_ID
         try:
             await bot.get_chat(source_channel)
-            logger.info(f"[{self.name}] 已确认可访问主存储频道 {source_channel}")
+            logger.info(f"[{self.name}] 已确认可查看主存储频道 {source_channel}")
         except Exception as e:
+            self._inaccessible_sources.add(source_channel)
             logger.error(
                 f"[{self.name}] ⚠️ 无法访问主存储频道 {source_channel}: {e}\n"
-                f"请将 @{self.name} 添加为频道 {source_channel} 的成员，否则无法备份任何消息！"
+                f"请将 @{self.name} 添加为频道 {source_channel} 的成员后重试"
             )
 
         async def health_ping():
@@ -309,10 +310,17 @@ class BackupBot:
                     if "Message to copy not found" in err_msg or "message to forward not found" in err_msg.lower():
                         if source_channel not in self._inaccessible_sources:
                             self._inaccessible_sources.add(source_channel)
-                            logger.error(
-                                f"[{self.name}] 无法访问源频道 {source_channel}，跳过后续该频道的备份\n"
-                                f"  请将 @{self.name} 添加为频道 {source_channel} 的成员后重试"
-                            )
+                            try:
+                                await bot.get_chat(source_channel)
+                                logger.error(
+                                    f"[{self.name}] 主存储频道 {source_channel} 可查看但无法拷贝消息\n"
+                                    f"  请将 @{self.name} 设为频道 {source_channel} 的管理员（需开启\"拷贝消息\"权限）"
+                                )
+                            except Exception:
+                                logger.error(
+                                    f"[{self.name}] 无法访问源频道 {source_channel}，跳过后续该频道的备份\n"
+                                    f"  请将 @{self.name} 添加为频道 {source_channel} 的成员后重试"
+                                )
                     else:
                         logger.error(
                             f"[{self.name}] 备份消息 {mid} 到频道 {target_channel} 失败: {e}"
