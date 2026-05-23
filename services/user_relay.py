@@ -204,7 +204,7 @@ class UserRelay:
                 entry = self._media_group_pending[media_group_id]
                 entry["events"].append(event)
                 logger.info(
-                    f"[UserRelay] 媒体组 {media_group_id} 暂存第 {len(entry['events'])} 条消息"
+                    f"[UserRelay] 媒体组 {media_group_id} 暂存第 {len(entry['events'])} 条"
                 )
                 return
 
@@ -218,7 +218,7 @@ class UserRelay:
             code = pending.get("code", "")
 
             logger.info(
-                f"[UserRelay] 收到 @{bot_username} 的响应 (user={user_id}, code={code})"
+                f"[UserRelay] 收到 @{bot_username} 响应 (user={user_id}, code={code})"
             )
 
             if self._pending_cleanup:
@@ -233,74 +233,70 @@ class UserRelay:
                 asyncio.create_task(
                     self._flush_media_group(media_group_id, user_id, code)
                 )
-                logger.info(
-                    f"[UserRelay] 媒体组 {media_group_id} 开始收集，暂不处理"
-                )
+                logger.info(f"[UserRelay] 媒体组 {media_group_id} 开始收集")
                 return
 
-            await self._process_single_file(event, user_id, code)
+            await self._relay_and_cache(event.message, user_id, code)
 
-    async def _flush_media_group(self, media_group_id, user_id: int, code: str):
-        await asyncio.sleep(5)
-        entry = self._media_group_pending.pop(media_group_id, None)
-        if not entry:
-            return
-        events = entry["events"]
-        logger.info(
-            f"[UserRelay] 媒体组 {media_group_id} 收集完毕，共 {len(events)} 条，开始处理"
-        )
+    async def _relay_and_cache(self, msg, user_id: int, code: str) -> bool:
+        """Try forward to storage + user. Return True if user got it."""
+        forwarded_to_user = False
 
-        forwarded_any = False
-        for event in events:
-            msg_id = await self._process_single_file(
-                event, user_id, code
-            )
-            if msg_id:
-                await self._cache_file_record(code, msg_id)
+        storage_msg_ids = await self._forward_to_storage([msg], code)
 
-        first_event = events[0]
+        if storage_msg_ids:
+            try:
+                await self._client.forward_messages(PeerUser(user_id), msg)
+                forwarded_to_user = True
+                logger.info(f"[UserRelay] 已直接转发给用户 {user_id}")
+            except Exception as e:
+                logger.info(f"[UserRelay] 无法直接转发给用户 {user_id}: {e}")
+
+        if not forwarded_to_user:
+            storage_msg_ids = storage_msg_ids or await self._forward_to_storage([msg], code)
+            if storage_msg_ids and code and self._decoder_bot_entity:
+                self._schedule_relay_deliver(user_id, code)
+
+        return forwarded_to_user
+
+    async def _forward_to_storage(self, messages: list, code: str) -> list[int] | None:
+        if not code or not self._storage_channel_entity:
+            return None
         try:
-            await self._client.forward_messages(PeerUser(user_id), first_event.message)
-            forwarded_any = True
-            logger.info(f"[UserRelay] 已直接转发首条给用户 {user_id}")
+            fwd_msgs = await self._client.forward_messages(
+                self._storage_channel_entity, messages
+            )
+            if not isinstance(fwd_msgs, list):
+                fwd_msgs = [fwd_msgs]
+            for m in fwd_msgs:
+                await self._cache_file_record(code, m.id)
+            logger.info(
+                f"[UserRelay] 已转发 {len(fwd_msgs)} 条到存储频道并缓存"
+            )
+            return [m.id for m in fwd_msgs]
         except Exception as e:
-            logger.info(f"[UserRelay] 无法直接转发给用户 {user_id}: {e}")
+            logger.warning(f"[UserRelay] 转发到存储频道失败: {e}")
+            ids = []
+            for msg in messages:
+                mid = await self._download_and_cache(msg, code)
+                if mid:
+                    ids.append(mid)
+            return ids if ids else None
 
-        if not forwarded_any and code and self._decoder_bot_entity:
-            async def _deliver():
-                await asyncio.sleep(2)
-                try:
-                    await self._client.send_message(
-                        self._decoder_bot_entity,
-                        f"RELAY_DELIVER:{user_id}:{code}",
-                    )
-                    logger.info(f"[UserRelay] 已通知解码机器人代发给用户 {user_id}")
-                except Exception as e:
-                    logger.error(f"[UserRelay] 通知解码机器人失败: {e}")
-            asyncio.create_task(_deliver())
-
-    async def _process_single_file(
-        self, event, user_id: int, code: str,
-    ) -> int | None:
-        is_video = getattr(event.message, "video", None) is not None
-        storage_msg_id = None
-
+    async def _download_and_cache(self, msg, code: str) -> int | None:
+        is_video = getattr(msg, "video", None) is not None
         with tempfile.TemporaryDirectory() as tmpdir:
-            file_path = await self._client.download_media(event.message, file=tmpdir)
-
+            file_path = await self._client.download_media(msg, file=tmpdir)
             if not file_path:
-                text = getattr(event.message, "message", None) or ""
+                text = getattr(msg, "message", None) or ""
                 if text and self._decoder_bot_entity:
                     try:
-                        await self._client.send_message(
-                            self._decoder_bot_entity, text
-                        )
+                        await self._client.send_message(self._decoder_bot_entity, text)
                     except Exception as e:
                         logger.error(f"[UserRelay] 转发文本到解码机器人失败: {e}")
                 return None
 
-            caption = getattr(event.message, "message", None) or ""
-            send_kwargs = {"caption": caption}
+            send_kwargs = {"caption": getattr(msg, "message", None) or ""}
             if is_video:
                 send_kwargs["video"] = True
 
@@ -317,11 +313,53 @@ class UserRelay:
                     storage_msg = await self._client.send_file(
                         self._storage_channel_entity, file_path
                     )
-                    storage_msg_id = storage_msg.id
+                    await self._cache_file_record(code, storage_msg.id)
+                    return storage_msg.id
                 except Exception as e:
                     logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
+        return None
 
-        return storage_msg_id
+    def _schedule_relay_deliver(self, user_id: int, code: str):
+        async def _deliver():
+            await asyncio.sleep(2)
+            try:
+                await self._client.send_message(
+                    self._decoder_bot_entity,
+                    f"RELAY_DELIVER:{user_id}:{code}",
+                )
+                logger.info(f"[UserRelay] 已通知解码机器人代发给用户 {user_id}")
+            except Exception as e:
+                logger.error(f"[UserRelay] 通知解码机器人失败: {e}")
+
+        asyncio.create_task(_deliver())
+
+    async def _flush_media_group(self, media_group_id, user_id: int, code: str):
+        await asyncio.sleep(5)
+        entry = self._media_group_pending.pop(media_group_id, None)
+        if not entry:
+            return
+
+        events = entry["events"]
+        messages = [e.message for e in events]
+        logger.info(
+            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events)} 条，开始整体转发"
+        )
+
+        storage_ids = await self._forward_to_storage(messages, code)
+
+        forwarded_to_user = False
+        try:
+            await self._client.forward_messages(PeerUser(user_id), messages)
+            forwarded_to_user = True
+            logger.info(f"[UserRelay] 媒体组已直接转发给用户 {user_id}")
+        except Exception as e:
+            logger.info(f"[UserRelay] 媒体组无法直接转发给用户 {user_id}: {e}")
+
+        if not forwarded_to_user:
+            if not storage_ids:
+                storage_ids = await self._forward_to_storage(messages, code)
+            if storage_ids and code and self._decoder_bot_entity:
+                self._schedule_relay_deliver(user_id, code)
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:

@@ -128,7 +128,21 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     if not msg_ids:
         msg_ids = [record.get("primary_channel_msg_id")]
 
-    if len(msg_ids) > 1:
+    copy_ok = False
+    for mid in msg_ids:
+        try:
+            await context.bot.copy_message(
+                chat_id=target_user_id,
+                from_chat_id=selected_channel,
+                message_id=mid,
+            )
+            copy_ok = True
+        except Exception as e:
+            logger.warning(f"[handle_relay_delivery] copy 消息 {mid} 失败: {e}")
+            copy_ok = False
+            break
+
+    if not copy_ok:
         await enqueue_batch_send_task(
             target_user_id=target_user_id,
             channel_id=selected_channel,
@@ -136,13 +150,6 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
             batch_file_meta=record.get("batch_file_meta", ""),
             file_code=code,
             page=1,
-        )
-    else:
-        await enqueue_send_task(
-            target_user_id=target_user_id,
-            channel_id=selected_channel,
-            message_id=msg_ids[0],
-            file_code=code,
         )
 
     await context.bot.send_message(
@@ -416,22 +423,39 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch_file_meta_str = file_record.get("batch_file_meta") or ""
 
     try:
-        if len(msg_ids) > 1:
-            await enqueue_batch_send_task(
-                target_user_id=user.id,
-                channel_id=selected_channel,
-                channel_msg_ids=msg_ids,
-                batch_file_meta=batch_file_meta_str,
-                file_code=text,
-                page=1,
-            )
-        else:
-            await enqueue_send_task(
-                target_user_id=user.id,
-                channel_id=selected_channel,
-                message_id=msg_ids[0],
-                file_code=text,
-            )
+        copy_ok = False
+        for mid in msg_ids:
+            try:
+                await context.bot.copy_message(
+                    chat_id=user.id,
+                    from_chat_id=selected_channel,
+                    message_id=mid,
+                )
+                copy_ok = True
+            except Exception as copy_err:
+                logger.warning(
+                    f"[handle_code] 直接 copy 消息 {mid} 失败 (user={user.id}): {copy_err}"
+                )
+                copy_ok = False
+                break
+
+        if not copy_ok:
+            if len(msg_ids) > 1:
+                await enqueue_batch_send_task(
+                    target_user_id=user.id,
+                    channel_id=selected_channel,
+                    channel_msg_ids=msg_ids,
+                    batch_file_meta=batch_file_meta_str,
+                    file_code=text,
+                    page=1,
+                )
+            else:
+                await enqueue_send_task(
+                    target_user_id=user.id,
+                    channel_id=selected_channel,
+                    message_id=msg_ids[0],
+                    file_code=text,
+                )
     except Exception as e:
         logger.error(f"[handle_code] 入队发送任务失败 (user={user.id}, code={text}): {e}")
         await update.message.reply_text("系统繁忙，文件发送请求失败，请稍后重试。")
