@@ -490,7 +490,9 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not direct_ok:
             if user_relay.is_ready:
-                await user_relay.deliver_cached(user.id, text)
+                delivered = await user_relay.deliver_cached(user.id, text)
+                if not delivered:
+                    return
             elif len(msg_ids) > 1:
                 await enqueue_batch_send_task(
                     target_user_id=user.id,

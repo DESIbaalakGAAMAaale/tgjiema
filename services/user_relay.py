@@ -398,10 +398,10 @@ class UserRelay:
             logger.error(f"[UserRelay] 向 @{bot_username} 发送失败: {e}")
             return False
 
-    async def deliver_cached(self, user_id: int, code: str):
+    async def deliver_cached(self, user_id: int, code: str) -> bool:
         if not self._client:
             logger.warning(f"[UserRelay] 无法交付缓存: 客户端未就绪")
-            return
+            return False
 
         try:
             from database import get_file_records_col
@@ -409,7 +409,7 @@ class UserRelay:
             record = await col.find_one({"file_code": code})
             if not record:
                 logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无记录")
-                return
+                return False
 
             file_ids_str = record.get("file_ids", "") or ""
             if not isinstance(file_ids_str, str):
@@ -432,7 +432,7 @@ class UserRelay:
                         f"RELAY_DELIVER:{user_id}:{code}",
                     )
                     logger.info(f"[UserRelay] 已通知解码机器人代发给用户 {user_id}")
-                return
+                return True
 
             logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无 file_id，尝试从存储频道获取")
             ok = await self._deliver_via_storage_channel(user_id, code, record)
@@ -449,9 +449,11 @@ class UserRelay:
                     logger.info(
                         f"[UserRelay] 已通知解码机器人: 码 {code} 需重新请求"
                     )
+            return ok
 
         except Exception as e:
             logger.error(f"[UserRelay] 缓存交付失败 (code={code}, user={user_id}): {e}")
+            return False
 
     async def _deliver_via_storage_channel(self, user_id: int, code: str, record: dict) -> bool:
         if not self._storage_channel_entity:

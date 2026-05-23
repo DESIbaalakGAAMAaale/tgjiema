@@ -275,6 +275,21 @@ class D1Collection:
         await self._execute(sql, all_params)
         return UpdateResult(1)
 
+    async def delete_one(self, query: dict) -> bool:
+        params = []
+        where_parts = []
+        for k, v in query.items():
+            if isinstance(v, dict):
+                continue
+            where_parts.append(f"{k} = ${len(params) + 1}")
+            params.append(v)
+        sql = f"DELETE FROM {self.table}"
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+        sql += " LIMIT 1"
+        await self._execute(sql, params)
+        return True
+
     async def count_documents(self, query: dict) -> int:
         params = []
         where_parts = []
