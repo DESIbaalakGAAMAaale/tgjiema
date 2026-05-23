@@ -507,6 +507,30 @@ class UserRelay:
 
         return any_success
 
+    async def backup_to_channel(self, source_channel_id: int, msg_ids: list[int], target_channel_id: int) -> bool:
+        if not self._client:
+            return False
+        try:
+            source = PeerChannel(source_channel_id)
+            target = PeerChannel(target_channel_id)
+            msgs = []
+            for mid in msg_ids:
+                result = await self._client.get_messages(source, ids=mid)
+                m = result[0] if isinstance(result, list) else result
+                if m:
+                    msgs.append(m)
+            if not msgs:
+                logger.warning(f"[UserRelay] backup_to_channel: 源频道未找到任何有效消息")
+                return False
+            await self._client.forward_messages(target, msgs)
+            logger.info(
+                f"[UserRelay] backup_to_channel: 已转发 {len(msgs)} 条到 {target_channel_id}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[UserRelay] backup_to_channel 失败: {e}")
+            return False
+
     async def stop(self):
         if self._client:
             await self._client.disconnect()
