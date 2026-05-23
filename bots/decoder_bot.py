@@ -128,21 +128,34 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     if not msg_ids:
         msg_ids = [record.get("primary_channel_msg_id")]
 
-    copy_ok = False
-    for mid in msg_ids:
+    direct_ok = False
+    if len(msg_ids) > 1:
+        try:
+            await context.bot.forward_messages(
+                chat_id=target_user_id,
+                from_chat_id=selected_channel,
+                message_ids=msg_ids,
+            )
+            direct_ok = True
+            logger.info(
+                f"[handle_relay_delivery] 媒体组 {len(msg_ids)} 条已批量转发给用户 {target_user_id}"
+            )
+        except Exception as fwd_err:
+            logger.warning(
+                f"[handle_relay_delivery] 批量转发 {len(msg_ids)} 条失败: {fwd_err}"
+            )
+    else:
         try:
             await context.bot.copy_message(
                 chat_id=target_user_id,
                 from_chat_id=selected_channel,
-                message_id=mid,
+                message_id=msg_ids[0],
             )
-            copy_ok = True
+            direct_ok = True
         except Exception as e:
-            logger.warning(f"[handle_relay_delivery] copy 消息 {mid} 失败: {e}")
-            copy_ok = False
-            break
+            logger.warning(f"[handle_relay_delivery] copy 消息 {msg_ids[0]} 失败: {e}")
 
-    if not copy_ok:
+    if not direct_ok:
         await enqueue_batch_send_task(
             target_user_id=target_user_id,
             channel_id=selected_channel,
@@ -423,23 +436,36 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch_file_meta_str = file_record.get("batch_file_meta") or ""
 
     try:
-        copy_ok = False
-        for mid in msg_ids:
+        direct_ok = False
+        if len(msg_ids) > 1:
+            try:
+                await context.bot.forward_messages(
+                    chat_id=user.id,
+                    from_chat_id=selected_channel,
+                    message_ids=msg_ids,
+                )
+                direct_ok = True
+                logger.info(
+                    f"[handle_code] 媒体组 {len(msg_ids)} 条已批量转发给用户 {user.id}"
+                )
+            except Exception as fwd_err:
+                logger.warning(
+                    f"[handle_code] 批量转发 {len(msg_ids)} 条失败 (user={user.id}): {fwd_err}"
+                )
+        else:
             try:
                 await context.bot.copy_message(
                     chat_id=user.id,
                     from_chat_id=selected_channel,
-                    message_id=mid,
+                    message_id=msg_ids[0],
                 )
-                copy_ok = True
+                direct_ok = True
             except Exception as copy_err:
                 logger.warning(
-                    f"[handle_code] 直接 copy 消息 {mid} 失败 (user={user.id}): {copy_err}"
+                    f"[handle_code] copy 消息 {msg_ids[0]} 失败 (user={user.id}): {copy_err}"
                 )
-                copy_ok = False
-                break
 
-        if not copy_ok:
+        if not direct_ok:
             if len(msg_ids) > 1:
                 await enqueue_batch_send_task(
                     target_user_id=user.id,
