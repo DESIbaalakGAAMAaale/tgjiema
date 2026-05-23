@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.types import PeerChannel, PeerUser
+from telethon.tl.types import PeerChannel
 from telethon.utils import pack_bot_file_id
 
 from config import settings
@@ -24,7 +24,7 @@ class UserRelay:
         self._relay_phone: str = ""
         self._pending_cleanup = None
         self._relay_user_id = None
-        self._media_group_pending: dict[str, dict] = {}
+        self._recent_responses: dict[str, dict] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -212,22 +212,32 @@ class UserRelay:
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
+            now_ts = asyncio.get_event_loop().time()
+            expired = [k for k, v in list(self._recent_responses.items()) if v.get("_expires", 0) < now_ts]
+            for k in expired:
+                self._recent_responses.pop(k, None)
+
             sender = await event.get_sender()
             if not sender or not hasattr(sender, "bot") or not sender.bot:
                 return
 
             bot_username = sender.username
-
-            media_group_id = getattr(event.message, "media_group_id", None)
-            if media_group_id and media_group_id in self._media_group_pending:
-                entry = self._media_group_pending[media_group_id]
-                entry["events"].append(event)
-                logger.info(
-                    f"[UserRelay] 媒体组 {media_group_id} 暂存第 {len(entry['events'])} 条"
-                )
+            if not bot_username:
                 return
 
-            if not bot_username or bot_username not in self._pending:
+            recent = self._recent_responses.get(bot_username)
+            if recent:
+                user_id = recent["user_id"]
+                code = recent.get("code", "")
+                media_group_id = getattr(event.message, "media_group_id", None)
+                if media_group_id and media_group_id == recent.get("media_group_id"):
+                    logger.info(
+                        f"[UserRelay] 媒体组后续消息 @{bot_username} (user={user_id}, code={code})"
+                    )
+                    await self._process_single(event.message, user_id, code)
+                    return
+
+            if bot_username not in self._pending:
                 return
 
             pending = self._pending.pop(bot_username, None)
@@ -243,86 +253,33 @@ class UserRelay:
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
 
+            media_group_id = getattr(event.message, "media_group_id", None)
             if media_group_id:
-                self._media_group_pending[media_group_id] = {
+                self._recent_responses[bot_username] = {
                     "user_id": user_id,
                     "code": code,
-                    "events": [event],
+                    "media_group_id": media_group_id,
+                    "_expires": now() + 30,
                 }
-                asyncio.create_task(
-                    self._flush_media_group(media_group_id, user_id, code)
+                logger.info(
+                    f"[UserRelay] 媒体组 {media_group_id} 第一条，注册 30s 窗口"
                 )
-                logger.info(f"[UserRelay] 媒体组 {media_group_id} 开始收集")
-                return
 
-            await self._relay_and_cache(event.message, user_id, code)
+            await self._process_single(event.message, user_id, code)
 
-    async def _relay_and_cache(self, msg, user_id: int, code: str) -> bool:
-        """Try forward to storage + user. Return True if user got it."""
-        forwarded_to_user = False
-
-        storage_msg_ids = await self._forward_to_storage([msg], code, user_id)
-
-        if storage_msg_ids:
-            try:
-                await self._client.forward_messages(PeerUser(user_id), msg)
-                forwarded_to_user = True
-                logger.info(f"[UserRelay] 已直接转发给用户 {user_id}")
-            except Exception as e:
-                logger.info(f"[UserRelay] 无法直接转发给用户 {user_id}: {e}")
-
-        if not forwarded_to_user:
-            storage_msg_ids = storage_msg_ids or await self._forward_to_storage([msg], code, user_id)
-            if storage_msg_ids and code and self._decoder_bot_entity:
-                self._schedule_relay_deliver(user_id, code)
-
-        return forwarded_to_user
-
-    async def _forward_to_storage(self, messages: list, code: str, user_id: int = 0) -> list[int] | None:
-        if not code or not self._storage_channel_entity:
-            return None
-        try:
-            fwd_msgs = await self._client.forward_messages(
-                self._storage_channel_entity, messages
-            )
-            if not isinstance(fwd_msgs, list):
-                fwd_msgs = [fwd_msgs]
-            for i, m in enumerate(fwd_msgs):
-                fid = self._extract_file_id(messages[i] if i < len(messages) else m)
-                await self._cache_file_record(code, m.id, file_id=fid)
-            logger.info(
-                f"[UserRelay] 已转发 {len(fwd_msgs)} 条到存储频道并缓存 (含 file_id)"
-            )
-            return [m.id for m in fwd_msgs]
-        except Exception as e:
-            logger.warning(f"[UserRelay] 转发到存储频道失败: {e}")
-            ids = []
-            for msg in messages:
-                mid = await self._download_and_cache(msg, code, user_id)
-                if mid:
-                    ids.append(mid)
-                    fid = self._extract_file_id(msg)
-                    if fid:
-                        await self._cache_file_record(code, mid, file_id=fid)
-            return ids if ids else None
-
-    async def _download_and_cache(self, msg, code: str, user_id: int = 0) -> int | None:
+    async def _process_single(self, msg, user_id: int, code: str):
+        """Download file, send to decoder_bot via Telethon, cache to storage.
+        decoder_bot receives RELAY_FILE and forwards to user via Bot API."""
         is_video = getattr(msg, "video", None) is not None
+
         with tempfile.TemporaryDirectory() as tmpdir:
             file_path = await self._client.download_media(msg, file=tmpdir)
             if not file_path:
-                text = getattr(msg, "message", None) or ""
-                if text and self._decoder_bot_entity:
-                    try:
-                        await self._client.send_message(self._decoder_bot_entity, text)
-                    except Exception as e:
-                        logger.error(f"[UserRelay] 转发文本到解码机器人失败: {e}")
-                return None
+                logger.warning(f"[UserRelay] 下载媒体失败 (user={user_id}, code={code})")
+                return
 
             orig_caption = getattr(msg, "message", None) or ""
-            relay_caption = orig_caption
-            if user_id and self._decoder_bot_entity:
-                relay_caption = f"RELAY_FILE:{user_id}:{code}\n\n{orig_caption}"
+            relay_caption = f"RELAY_FILE:{user_id}:{code}\n\n{orig_caption}"
             send_kwargs = {"caption": relay_caption}
             if is_video:
                 send_kwargs["video"] = True
@@ -332,61 +289,24 @@ class UserRelay:
                     await self._client.send_file(
                         self._decoder_bot_entity, file_path, **send_kwargs
                     )
+                    logger.info(
+                        f"[UserRelay] 已通过 RELAY_FILE 发送给解码机器人 (user={user_id}, code={code})"
+                    )
                 except Exception as e:
-                    logger.error(f"[UserRelay] 发送到解码机器人失败: {e}")
+                    logger.error(f"[UserRelay] 发送 RELAY_FILE 到解码机器人失败: {e}")
 
             if code and self._storage_channel_entity:
                 try:
                     storage_msg = await self._client.send_file(
                         self._storage_channel_entity, file_path
                     )
-                    await self._cache_file_record(code, storage_msg.id)
-                    return storage_msg.id
+                    fid = self._extract_file_id(msg)
+                    await self._cache_file_record(code, storage_msg.id, file_id=fid)
+                    logger.info(
+                        f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
+                    )
                 except Exception as e:
                     logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
-        return None
-
-    def _schedule_relay_deliver(self, user_id: int, code: str):
-        async def _deliver():
-            await asyncio.sleep(2)
-            try:
-                await self._client.send_message(
-                    self._decoder_bot_entity,
-                    f"RELAY_DELIVER:{user_id}:{code}",
-                )
-                logger.info(f"[UserRelay] 已通知解码机器人代发给用户 {user_id}")
-            except Exception as e:
-                logger.error(f"[UserRelay] 通知解码机器人失败: {e}")
-
-        asyncio.create_task(_deliver())
-
-    async def _flush_media_group(self, media_group_id, user_id: int, code: str):
-        await asyncio.sleep(5)
-        entry = self._media_group_pending.pop(media_group_id, None)
-        if not entry:
-            return
-
-        events = entry["events"]
-        messages = [e.message for e in events]
-        logger.info(
-            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events)} 条，开始整体转发"
-        )
-
-        storage_ids = await self._forward_to_storage(messages, code, user_id)
-
-        forwarded_to_user = False
-        try:
-            await self._client.forward_messages(PeerUser(user_id), messages)
-            forwarded_to_user = True
-            logger.info(f"[UserRelay] 媒体组已直接转发给用户 {user_id}")
-        except Exception as e:
-            logger.info(f"[UserRelay] 媒体组无法直接转发给用户 {user_id}: {e}")
-
-        if not forwarded_to_user:
-            if not storage_ids:
-                storage_ids = await self._forward_to_storage(messages, code, user_id)
-            if storage_ids and code and self._decoder_bot_entity:
-                self._schedule_relay_deliver(user_id, code)
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:
