@@ -29,14 +29,5 @@ class ChannelSelector:
             return settings.ALL_BACKUP_CHANNELS[idx]
         return settings.MAIN_STORAGE_CHANNEL_ID
 
-    def rotate_pools(self):
-        backup_count = len(settings.ALL_BACKUP_CHANNELS)
-        if backup_count == 0:
-            return
-        hot_count = max(1, backup_count // 2)
-        all_indices = list(range(backup_count))
-        self._hot_backup_indices = set(random.sample(all_indices, hot_count))
-        self._cold_backup_indices = set(all_indices) - self._hot_backup_indices
-
 
 channel_selector = ChannelSelector()

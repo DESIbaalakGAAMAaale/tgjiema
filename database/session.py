@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import asyncpg
+from loguru import logger
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -119,8 +120,8 @@ class CockroachDBClient:
         for sql in MIGRATION_STATEMENTS:
             try:
                 await self.execute(sql)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[DB] 迁移 SQL 执行失败 (可忽略): {e}")
 
     async def close(self):
         if self._pool:
@@ -218,6 +219,22 @@ class D1Collection:
         where_parts = []
         for k, v in query.items():
             if isinstance(v, dict):
+                for op, val in v.items():
+                    if op == "$gte":
+                        where_parts.append(f"{k} >= ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$lte":
+                        where_parts.append(f"{k} <= ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$gt":
+                        where_parts.append(f"{k} > ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$lt":
+                        where_parts.append(f"{k} < ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$ne":
+                        where_parts.append(f"{k} != ${len(params) + 1}")
+                        params.append(val)
                 continue
             where_parts.append(f"{k} = ${len(params) + 1}")
             params.append(v)

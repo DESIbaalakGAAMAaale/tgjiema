@@ -16,7 +16,7 @@ class UserRelay:
         self._client: TelegramClient | None = None
         self._decoder_bot_entity = None
         self._storage_channel_entity = None
-        self._pending: dict[str, dict] = {}
+        self._bot_exchange: dict[str, dict] = {}
         self._session_path = str(Path(__file__).parent.parent / "relay_session")
         self._ready = asyncio.Event()
         self._relay_api_id: int = 0
@@ -24,7 +24,6 @@ class UserRelay:
         self._relay_phone: str = ""
         self._pending_cleanup = None
         self._relay_user_id = None
-        self._recent_responses: dict[str, dict] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -213,9 +212,9 @@ class UserRelay:
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
             now_ts = asyncio.get_event_loop().time()
-            expired = [k for k, v in list(self._recent_responses.items()) if v.get("_expires", 0) < now_ts]
+            expired = [k for k, v in list(self._bot_exchange.items()) if v.get("_expires", 0) < now_ts]
             for k in expired:
-                self._recent_responses.pop(k, None)
+                self._bot_exchange.pop(k, None)
 
             sender = await event.get_sender()
             if not sender or not hasattr(sender, "bot") or not sender.bot:
@@ -225,47 +224,22 @@ class UserRelay:
             if not bot_username:
                 return
 
-            recent = self._recent_responses.get(bot_username)
-            if recent:
-                user_id = recent["user_id"]
-                code = recent.get("code", "")
-                media_group_id = getattr(event.message, "media_group_id", None)
-                if media_group_id and media_group_id == recent.get("media_group_id"):
-                    logger.info(
-                        f"[UserRelay] 媒体组后续消息 @{bot_username} (user={user_id}, code={code})"
-                    )
-                    await self._process_single(event.message, user_id, code)
-                    return
-
-            if bot_username not in self._pending:
+            exchange = self._bot_exchange.get(bot_username)
+            if not exchange:
                 return
 
-            pending = self._pending.pop(bot_username, None)
-            if not pending:
-                return
-            user_id = pending["user_id"]
-            code = pending.get("code", "")
+            user_id = exchange["user_id"]
+            code = exchange.get("code", "")
+            exchange["_expires"] = now_ts + 60
 
             logger.info(
                 f"[UserRelay] 收到 @{bot_username} 响应 (user={user_id}, code={code})"
             )
 
+            await self._process_single(event.message, user_id, code)
+
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
-
-            media_group_id = getattr(event.message, "media_group_id", None)
-            if media_group_id:
-                self._recent_responses[bot_username] = {
-                    "user_id": user_id,
-                    "code": code,
-                    "media_group_id": media_group_id,
-                    "_expires": now_ts + 30,
-                }
-                logger.info(
-                    f"[UserRelay] 媒体组 {media_group_id} 第一条，注册 30s 窗口"
-                )
-
-            await self._process_single(event.message, user_id, code)
 
     async def _process_single(self, msg, user_id: int, code: str):
         """Download file, send to decoder_bot via Telethon, cache to storage.
@@ -315,7 +289,10 @@ class UserRelay:
         try:
             entity = await self._client.get_entity(bot_username)
             await self._client.send_message(entity, code)
-            self._pending[bot_username] = {"user_id": user_id, "code": code}
+            self._bot_exchange[bot_username] = {
+                "user_id": user_id, "code": code,
+                "_expires": asyncio.get_event_loop().time() + 120,
+            }
             logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，等待响应 (user={user_id}, code={code})")
             return True
         except Exception as e:
