@@ -261,7 +261,7 @@ class UserRelay:
         """Try forward to storage + user. Return True if user got it."""
         forwarded_to_user = False
 
-        storage_msg_ids = await self._forward_to_storage([msg], code)
+        storage_msg_ids = await self._forward_to_storage([msg], code, user_id)
 
         if storage_msg_ids:
             try:
@@ -272,13 +272,13 @@ class UserRelay:
                 logger.info(f"[UserRelay] 无法直接转发给用户 {user_id}: {e}")
 
         if not forwarded_to_user:
-            storage_msg_ids = storage_msg_ids or await self._forward_to_storage([msg], code)
+            storage_msg_ids = storage_msg_ids or await self._forward_to_storage([msg], code, user_id)
             if storage_msg_ids and code and self._decoder_bot_entity:
                 self._schedule_relay_deliver(user_id, code)
 
         return forwarded_to_user
 
-    async def _forward_to_storage(self, messages: list, code: str) -> list[int] | None:
+    async def _forward_to_storage(self, messages: list, code: str, user_id: int = 0) -> list[int] | None:
         if not code or not self._storage_channel_entity:
             return None
         try:
@@ -298,7 +298,7 @@ class UserRelay:
             logger.warning(f"[UserRelay] 转发到存储频道失败: {e}")
             ids = []
             for msg in messages:
-                mid = await self._download_and_cache(msg, code)
+                mid = await self._download_and_cache(msg, code, user_id)
                 if mid:
                     ids.append(mid)
                     fid = self._extract_file_id(msg)
@@ -306,7 +306,7 @@ class UserRelay:
                         await self._cache_file_record(code, mid, file_id=fid)
             return ids if ids else None
 
-    async def _download_and_cache(self, msg, code: str) -> int | None:
+    async def _download_and_cache(self, msg, code: str, user_id: int = 0) -> int | None:
         is_video = getattr(msg, "video", None) is not None
         with tempfile.TemporaryDirectory() as tmpdir:
             file_path = await self._client.download_media(msg, file=tmpdir)
@@ -319,7 +319,11 @@ class UserRelay:
                         logger.error(f"[UserRelay] 转发文本到解码机器人失败: {e}")
                 return None
 
-            send_kwargs = {"caption": getattr(msg, "message", None) or ""}
+            orig_caption = getattr(msg, "message", None) or ""
+            relay_caption = orig_caption
+            if user_id and self._decoder_bot_entity:
+                relay_caption = f"RELAY_FILE:{user_id}:{code}\n\n{orig_caption}"
+            send_kwargs = {"caption": relay_caption}
             if is_video:
                 send_kwargs["video"] = True
 
@@ -368,7 +372,7 @@ class UserRelay:
             f"[UserRelay] 媒体组 {media_group_id} 共 {len(events)} 条，开始整体转发"
         )
 
-        storage_ids = await self._forward_to_storage(messages, code)
+        storage_ids = await self._forward_to_storage(messages, code, user_id)
 
         forwarded_to_user = False
         try:
@@ -380,7 +384,7 @@ class UserRelay:
 
         if not forwarded_to_user:
             if not storage_ids:
-                storage_ids = await self._forward_to_storage(messages, code)
+                storage_ids = await self._forward_to_storage(messages, code, user_id)
             if storage_ids and code and self._decoder_bot_entity:
                 self._schedule_relay_deliver(user_id, code)
 

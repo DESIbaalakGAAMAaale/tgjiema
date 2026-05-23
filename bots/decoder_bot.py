@@ -693,6 +693,36 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        caption = (update.message.caption or "").strip()
+        if (caption.startswith("RELAY_FILE:")
+                and user_relay.relay_user_id
+                and update.effective_user
+                and update.effective_user.id == user_relay.relay_user_id):
+            parts = caption.split(":", 3)
+            if len(parts) >= 3:
+                try:
+                    target_user_id = int(parts[1])
+                except ValueError:
+                    target_user_id = 0
+                relay_code = parts[2].split("\n")[0]
+                if target_user_id:
+                    try:
+                        await context.bot.forward_message(
+                            chat_id=target_user_id,
+                            from_chat_id=update.effective_chat.id,
+                            message_id=update.message.message_id,
+                        )
+                        logger.info(
+                            f"[RELAY_FILE] 已转发文件给用户 {target_user_id} (code={relay_code})"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[RELAY_FILE] 转发给用户 {target_user_id} 失败: {e}"
+                        )
+                else:
+                    logger.warning(f"[RELAY_FILE] 无效的 user_id: {parts[1]}")
+            return
+
         text = update.message.text or ""
 
         if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:")):
