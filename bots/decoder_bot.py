@@ -407,6 +407,12 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if result.is_external:
+        if user_relay.is_ready and user_relay.relay_user_id:
+            from utils.code_decoder import is_likely_bot_api_file_id
+            if is_likely_bot_api_file_id(text):
+                await user_relay.deliver_cached(user.id, text)
+                await update.message.reply_text("正在发送文件，请稍候...")
+                return
         await handle_external_code(update, context, user.id, text, result)
         return
 

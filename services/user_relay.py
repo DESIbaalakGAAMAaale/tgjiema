@@ -6,6 +6,7 @@ from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 from telethon.tl.types import PeerChannel, PeerUser
+from telethon.utils import pack_bot_file_id
 
 from config import settings
 
@@ -157,7 +158,7 @@ class UserRelay:
         logger.info(f"[UserRelay] 中继已就绪")
 
 
-    async def _cache_file_record(self, code: str, message_id: int):
+    async def _cache_file_record(self, code: str, message_id: int, file_id: str = ""):
         try:
             from database import get_file_records_col, make_file_record
             from config import settings as _s
@@ -172,10 +173,18 @@ class UserRelay:
                     batch_ids = [str(x) for x in batch] if isinstance(batch, list) else []
                 if str(message_id) not in batch_ids:
                     batch_ids.append(str(message_id))
-                await files_col.update_one(
-                    {"file_code": code},
-                    {"$set": {"batch_msg_ids": ",".join(batch_ids)}},
-                )
+
+                fids = existing.get("file_ids", "") or ""
+                if not isinstance(fids, str):
+                    fids = str(fids)
+                fid_list = [f for f in fids.split(",") if f.strip()]
+                if file_id and file_id not in fid_list:
+                    fid_list.append(file_id)
+
+                update = {"$set": {"batch_msg_ids": ",".join(batch_ids)}}
+                if file_id:
+                    update["$set"]["file_ids"] = ",".join(fid_list)
+                await files_col.update_one({"file_code": code}, update)
                 logger.info(f"[UserRelay] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}")
             else:
                 record = make_file_record(
@@ -185,10 +194,20 @@ class UserRelay:
                     primary_channel_msg_id=message_id,
                     file_types={},
                 )
+                if file_id:
+                    record["file_ids"] = file_id
                 await files_col.insert_one(record)
                 logger.info(f"[UserRelay] 外部码 {code} 已缓存到本地存储")
         except Exception as e:
             logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
+
+    def _extract_file_id(self, msg) -> str:
+        if not msg or not msg.media:
+            return ""
+        try:
+            return pack_bot_file_id(msg.media) or ""
+        except Exception:
+            return ""
 
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
@@ -268,10 +287,11 @@ class UserRelay:
             )
             if not isinstance(fwd_msgs, list):
                 fwd_msgs = [fwd_msgs]
-            for m in fwd_msgs:
-                await self._cache_file_record(code, m.id)
+            for i, m in enumerate(fwd_msgs):
+                fid = self._extract_file_id(messages[i] if i < len(messages) else m)
+                await self._cache_file_record(code, m.id, file_id=fid)
             logger.info(
-                f"[UserRelay] 已转发 {len(fwd_msgs)} 条到存储频道并缓存"
+                f"[UserRelay] 已转发 {len(fwd_msgs)} 条到存储频道并缓存 (含 file_id)"
             )
             return [m.id for m in fwd_msgs]
         except Exception as e:
@@ -281,6 +301,9 @@ class UserRelay:
                 mid = await self._download_and_cache(msg, code)
                 if mid:
                     ids.append(mid)
+                    fid = self._extract_file_id(msg)
+                    if fid:
+                        await self._cache_file_record(code, mid, file_id=fid)
             return ids if ids else None
 
     async def _download_and_cache(self, msg, code: str) -> int | None:
@@ -376,8 +399,8 @@ class UserRelay:
             return False
 
     async def deliver_cached(self, user_id: int, code: str):
-        if not self._client or not self._storage_channel_entity:
-            logger.warning(f"[UserRelay] 无法交付缓存: 客户端或存储频道未就绪")
+        if not self._client:
+            logger.warning(f"[UserRelay] 无法交付缓存: 客户端未就绪")
             return
 
         try:
@@ -388,51 +411,28 @@ class UserRelay:
                 logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无记录")
                 return
 
-            msg_ids_raw = record.get("batch_msg_ids") or ""
-            if not isinstance(msg_ids_raw, str):
-                msg_ids_raw = str(msg_ids_raw)
-            msg_ids = []
-            if msg_ids_raw:
-                msg_ids = [int(m) for m in msg_ids_raw.split(",") if m.strip().isdigit()]
-            if not msg_ids:
-                primary = record.get("primary_channel_msg_id")
-                if primary:
-                    msg_ids = [primary]
-            if not msg_ids:
+            file_ids_str = record.get("file_ids", "") or ""
+            if not isinstance(file_ids_str, str):
+                file_ids_str = str(file_ids_str)
+            file_ids = [f.strip() for f in file_ids_str.split(",") if f.strip()]
+
+            if not file_ids:
+                logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无 file_id，回退到存储频道下载")
+                await self._deliver_via_storage_channel(user_id, code, record)
                 return
 
-            logger.info(f"[UserRelay] 缓存交付: 码 {code}, {len(msg_ids)} 条, 目标用户 {user_id}")
+            logger.info(
+                f"[UserRelay] 缓存交付: 码 {code}, {len(file_ids)} 条 file_id, 目标用户 {user_id}"
+            )
 
-            for msg_id in msg_ids:
-                msgs = await self._client.get_messages(
-                    self._storage_channel_entity, ids=msg_id
-                )
-                msg = msgs[0] if isinstance(msgs, list) else msgs
-                if not msg:
-                    logger.warning(f"[UserRelay] 缓存交付: 存储频道中未找到 msg_id={msg_id}")
-                    continue
-
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    file_path = await self._client.download_media(msg, file=tmpdir)
-                    if not file_path:
-                        text = getattr(msg, "message", None) or ""
-                        if text and self._decoder_bot_entity:
-                            await self._client.send_message(self._decoder_bot_entity, text)
-                        continue
-
-                    caption = getattr(msg, "message", None) or ""
-                    is_video = getattr(msg, "video", None) is not None
-                    send_kwargs = {"caption": caption}
-                    if is_video:
-                        send_kwargs["video"] = True
-
-                    if self._decoder_bot_entity:
-                        try:
-                            await self._client.send_file(
-                                self._decoder_bot_entity, file_path, **send_kwargs
-                            )
-                        except Exception as e:
-                            logger.error(f"[UserRelay] 缓存交付发送到解码机器人失败: {e}")
+            if self._decoder_bot_entity:
+                for fid in file_ids:
+                    try:
+                        await self._client.send_file(self._decoder_bot_entity, fid)
+                    except Exception as e:
+                        logger.error(
+                            f"[UserRelay] 缓存交付发送 file_id 到解码机器人失败: {e}"
+                        )
 
             if self._decoder_bot_entity:
                 await self._client.send_message(
@@ -443,6 +443,55 @@ class UserRelay:
 
         except Exception as e:
             logger.error(f"[UserRelay] 缓存交付失败 (code={code}, user={user_id}): {e}")
+
+    async def _deliver_via_storage_channel(self, user_id: int, code: str, record: dict):
+        if not self._storage_channel_entity:
+            return
+        msg_ids_raw = record.get("batch_msg_ids") or ""
+        if not isinstance(msg_ids_raw, str):
+            msg_ids_raw = str(msg_ids_raw)
+        msg_ids = []
+        if msg_ids_raw:
+            msg_ids = [int(m) for m in msg_ids_raw.split(",") if m.strip().isdigit()]
+        if not msg_ids:
+            primary = record.get("primary_channel_msg_id")
+            if primary:
+                msg_ids = [primary]
+        if not msg_ids:
+            return
+
+        for msg_id in msg_ids:
+            msgs = await self._client.get_messages(
+                self._storage_channel_entity, ids=msg_id
+            )
+            msg = msgs[0] if isinstance(msgs, list) else msgs
+            if not msg:
+                continue
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                file_path = await self._client.download_media(msg, file=tmpdir)
+                if not file_path:
+                    continue
+
+                caption = getattr(msg, "message", None) or ""
+                is_video = getattr(msg, "video", None) is not None
+                send_kwargs = {"caption": caption}
+                if is_video:
+                    send_kwargs["video"] = True
+
+                if self._decoder_bot_entity:
+                    try:
+                        await self._client.send_file(
+                            self._decoder_bot_entity, file_path, **send_kwargs
+                        )
+                    except Exception as e:
+                        logger.error(f"[UserRelay] 存储频道回退发送失败: {e}")
+
+        if self._decoder_bot_entity:
+            await self._client.send_message(
+                self._decoder_bot_entity,
+                f"RELAY_DELIVER:{user_id}:{code}",
+            )
 
     async def stop(self):
         if self._client:
