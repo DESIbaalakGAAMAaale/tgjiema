@@ -358,103 +358,20 @@ class UserRelay:
                     logger.info(f"[UserRelay] 已通知解码机器人代发给用户 {user_id}")
                 return True
 
-            logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无 file_id，尝试从存储频道获取")
-            ok = await self._deliver_via_storage_channel(user_id, code, record)
-            if not ok:
-                logger.warning(
-                    f"[UserRelay] 缓存交付: 码 {code} 存储频道记录已过期，清除记录"
+            logger.warning(
+                f"[UserRelay] 缓存交付: 码 {code} 无 file_id，记录已过期，清除并通知重新请求"
+            )
+            await col.delete_one({"file_code": code})
+            if self._decoder_bot_entity:
+                await self._client.send_message(
+                    self._decoder_bot_entity,
+                    f"RELAY_RENEW:{user_id}:{code}",
                 )
-                await col.delete_one({"file_code": code})
-                if self._decoder_bot_entity:
-                    await self._client.send_message(
-                        self._decoder_bot_entity,
-                        f"RELAY_RENEW:{user_id}:{code}",
-                    )
-                    logger.info(
-                        f"[UserRelay] 已通知解码机器人: 码 {code} 需重新请求"
-                    )
-            return ok
+                logger.info(f"[UserRelay] 已通知解码机器人: 码 {code} 需重新请求")
+            return False
 
         except Exception as e:
             logger.error(f"[UserRelay] 缓存交付失败 (code={code}, user={user_id}): {e}")
-            return False
-
-    async def _deliver_via_storage_channel(self, user_id: int, code: str, record: dict) -> bool:
-        if not self._storage_channel_entity:
-            return False
-        msg_ids_raw = record.get("batch_msg_ids") or ""
-        if not isinstance(msg_ids_raw, str):
-            msg_ids_raw = str(msg_ids_raw)
-        msg_ids = []
-        if msg_ids_raw:
-            msg_ids = [int(m) for m in msg_ids_raw.split(",") if m.strip().isdigit()]
-        if not msg_ids:
-            primary = record.get("primary_channel_msg_id")
-            if primary:
-                msg_ids = [primary]
-        if not msg_ids:
-            return False
-
-        any_success = False
-        for msg_id in msg_ids:
-            msgs = await self._client.get_messages(
-                self._storage_channel_entity, ids=msg_id
-            )
-            msg = msgs[0] if isinstance(msgs, list) else msgs
-            if not msg:
-                logger.warning(f"[UserRelay] 存储频道中未找到 msg_id={msg_id}")
-                continue
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                file_path = await self._client.download_media(msg, file=tmpdir)
-                if not file_path:
-                    continue
-
-                caption = getattr(msg, "message", None) or ""
-                is_video = getattr(msg, "video", None) is not None
-                send_kwargs = {"caption": caption}
-                if is_video:
-                    send_kwargs["video"] = True
-
-                if self._decoder_bot_entity:
-                    try:
-                        await self._client.send_file(
-                            self._decoder_bot_entity, file_path, **send_kwargs
-                        )
-                        any_success = True
-                    except Exception as e:
-                        logger.error(f"[UserRelay] 存储频道回退发送失败: {e}")
-
-        if any_success and self._decoder_bot_entity:
-            await self._client.send_message(
-                self._decoder_bot_entity,
-                f"RELAY_DELIVER:{user_id}:{code}",
-            )
-
-        return any_success
-
-    async def backup_to_channel(self, source_channel_id: int, msg_ids: list[int], target_channel_id: int) -> bool:
-        if not self._client:
-            return False
-        try:
-            source = PeerChannel(source_channel_id)
-            target = PeerChannel(target_channel_id)
-            msgs = []
-            for mid in msg_ids:
-                result = await self._client.get_messages(source, ids=mid)
-                m = result[0] if isinstance(result, list) else result
-                if m:
-                    msgs.append(m)
-            if not msgs:
-                logger.warning(f"[UserRelay] backup_to_channel: 源频道未找到任何有效消息")
-                return False
-            await self._client.forward_messages(target, msgs)
-            logger.info(
-                f"[UserRelay] backup_to_channel: 已转发 {len(msgs)} 条到 {target_channel_id}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"[UserRelay] backup_to_channel 失败: {e}")
             return False
 
     async def stop(self):

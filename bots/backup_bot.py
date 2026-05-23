@@ -92,13 +92,10 @@ class BackupBot:
         await self._load_cursor()
         logger.info(f"[{self.name}] 启动，游标={self._cursor}，目标频道: {self.backup_channels}")
 
-        from services.user_relay import user_relay
-        has_relay = user_relay.is_ready
-
         async def backup_loop():
             while True:
                 try:
-                    await self._scan_and_backup(bot, has_relay)
+                    await self._scan_and_backup(bot)
                 except Exception as e:
                     logger.error(f"[{self.name}] 备份异常: {e}")
                     metrics.record_error(self.name)
@@ -111,7 +108,7 @@ class BackupBot:
 
         await asyncio.gather(backup_loop(), health_ping())
 
-    async def _scan_and_backup(self, bot: Bot, has_relay: bool):
+    async def _scan_and_backup(self, bot: Bot):
         col = get_file_records_col()
 
         records = await col.find(
@@ -123,7 +120,7 @@ class BackupBot:
 
         for record in records:
             try:
-                await self._backup_record(bot, col, record, has_relay)
+                await self._backup_record(bot, col, record)
             except Exception as e:
                 logger.error(f"[{self.name}] 备份记录异常 (code={record.get('file_code')}): {e}")
                 continue
@@ -133,7 +130,7 @@ class BackupBot:
 
         await self._save_cursor()
 
-    async def _backup_record(self, bot: Bot, col, record: dict, has_relay: bool) -> bool:
+    async def _backup_record(self, bot: Bot, col, record: dict) -> bool:
         file_code = record.get("file_code")
         source_channel = record.get("primary_channel_id")
         if not file_code or not source_channel:
@@ -162,18 +159,6 @@ class BackupBot:
             missing = [mid for mid in msg_ids if mid not in backed_mids]
             if not missing:
                 continue
-
-            if has_relay:
-                from services.user_relay import user_relay
-                ok = await user_relay.backup_to_channel(source_channel, missing, target_channel)
-                if ok:
-                    backed_mids.update(missing)
-                    logger.info(
-                        f"[{self.name}] 消息 {missing} (码 {file_code}) 已通过中继备份到频道 {target_channel}"
-                    )
-                    metrics.backup_count += 1
-                    updated = True
-                    continue
 
             for mid in missing:
                 try:
