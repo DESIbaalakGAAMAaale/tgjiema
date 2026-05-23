@@ -308,37 +308,16 @@ class BackupBot:
                         await asyncio.sleep(wait)
                         continue
                     if "Message to copy not found" in err_msg or "message to forward not found" in err_msg.lower():
-                        if source_channel not in self._inaccessible_sources:
-                            logger.debug(f"[{self.name}] copy_message 失败, 原始错误: {err_msg}")
-                            try:
-                                await bot.forward_message(
-                                    chat_id=target_channel,
-                                    from_chat_id=source_channel,
-                                    message_id=mid,
-                                )
-                                backed_mids.add(mid)
-                                self._inaccessible_sources.discard(source_channel)
-                                logger.info(
-                                    f"[{self.name}] 消息 {mid} (码 {file_code}) 通过 forward 已备份到频道 {target_channel}"
-                                )
-                                metrics.backup_count += 1
-                                continue
-                            except Exception as e2:
-                                err2_msg = str(e2)
-                                logger.debug(f"[{self.name}] forward_message 也失败: {err2_msg}")
-                            self._inaccessible_sources.add(source_channel)
-                            try:
-                                await bot.get_chat(source_channel)
-                                logger.error(
-                                    f"[{self.name}] 主存储频道 {source_channel} 可查看但无法拷贝/转发消息\n"
-                                    f"  原始错误: {err_msg}\n"
-                                    f"  请检查频道设置 → 权限 → 是否开启了「限制保存内容」，需关闭此选项才能拷贝消息"
-                                )
-                            except Exception:
-                                logger.error(
-                                    f"[{self.name}] 无法访问源频道 {source_channel}，跳过后续该频道的备份\n"
-                                    f"  原始错误: {err_msg}"
-                                )
+                        logger.warning(
+                            f"[{self.name}] 消息 {mid} 在频道 {source_channel} 中未找到 "
+                            f"(码 {file_code})，跳过该消息"
+                        )
+                    elif "CHANNEL_INVALID" in err_msg or "chat not found" in err_msg.lower():
+                        self._inaccessible_sources.add(source_channel)
+                        logger.error(
+                            f"[{self.name}] 无法访问源频道 {source_channel}，跳过后续该频道的备份\n"
+                            f"  原始错误: {err_msg}"
+                        )
                     else:
                         logger.error(
                             f"[{self.name}] 备份消息 {mid} 到频道 {target_channel} 失败: {err_msg}"
