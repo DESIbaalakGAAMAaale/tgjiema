@@ -327,18 +327,22 @@ class UserRelay:
                             )
 
         if first_in_group and not forwarded_to_user and code and self._decoder_bot_entity:
-            try:
-                await self._client.send_message(
-                    self._decoder_bot_entity,
-                    f"RELAY_DELIVER:{user_id}:{code}",
-                )
-                logger.info(
-                    f"[UserRelay] 已通知解码机器人代发给用户 {user_id}"
-                )
-            except Exception as e:
-                logger.error(
-                    f"[UserRelay] 通知解码机器人失败: {e}"
-                )
+            async def _delayed_deliver():
+                if media_group_id:
+                    await asyncio.sleep(5)
+                try:
+                    await self._client.send_message(
+                        self._decoder_bot_entity,
+                        f"RELAY_DELIVER:{user_id}:{code}",
+                    )
+                    logger.info(
+                        f"[UserRelay] 已通知解码机器人代发给用户 {user_id}"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[UserRelay] 通知解码机器人失败: {e}"
+                    )
+            asyncio.create_task(_delayed_deliver())
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:
