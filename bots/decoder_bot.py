@@ -92,10 +92,12 @@ async def _cache_external_file(
 
 async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    if not text.startswith("RELAY_DELIVER:"):
+    if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:")):
         return
     if not user_relay.relay_user_id or update.effective_user.id != user_relay.relay_user_id:
         return
+
+    is_renew = text.startswith("RELAY_RENEW:")
     parts = text.split(":", 2)
     if len(parts) != 3:
         return
@@ -104,6 +106,16 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     except ValueError:
         return
     code = parts[2]
+
+    if is_renew:
+        logger.info(
+            f"[handle_relay_delivery] 记录已过期，通知用户重新请求: {code}"
+        )
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"文件码 {code} 的缓存已过期，请重新发送该码以获取最新文件。",
+        )
+        return
 
     logger.info(
         f"[handle_relay_delivery] 中继代发: 用户 {target_user_id}, 码 {code}"
@@ -128,7 +140,6 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     if not msg_ids:
         msg_ids = [record.get("primary_channel_msg_id")]
 
-    direct_ok = False
     if len(msg_ids) > 1:
         try:
             await context.bot.forward_messages(
@@ -136,10 +147,14 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
                 from_chat_id=selected_channel,
                 message_ids=msg_ids,
             )
-            direct_ok = True
             logger.info(
                 f"[handle_relay_delivery] 媒体组 {len(msg_ids)} 条已批量转发给用户 {target_user_id}"
             )
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
+            )
+            return
         except Exception as fwd_err:
             logger.warning(
                 f"[handle_relay_delivery] 批量转发 {len(msg_ids)} 条失败: {fwd_err}"
@@ -151,23 +166,22 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
                 from_chat_id=selected_channel,
                 message_id=msg_ids[0],
             )
-            direct_ok = True
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
+            )
+            return
         except Exception as e:
             logger.warning(f"[handle_relay_delivery] copy 消息 {msg_ids[0]} 失败: {e}")
 
-    if not direct_ok:
-        if user_relay.is_ready:
-            await user_relay.deliver_cached(target_user_id, code)
-        else:
-            await enqueue_batch_send_task(
-                target_user_id=target_user_id,
-                channel_id=selected_channel,
-                channel_msg_ids=msg_ids,
-                batch_file_meta=record.get("batch_file_meta", ""),
-                file_code=code,
-                page=1,
-            )
-
+    await enqueue_batch_send_task(
+        target_user_id=target_user_id,
+        channel_id=selected_channel,
+        channel_msg_ids=msg_ids,
+        batch_file_meta=record.get("batch_file_meta", ""),
+        file_code=code,
+        page=1,
+    )
     await context.bot.send_message(
         chat_id=target_user_id,
         text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
@@ -679,7 +693,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = update.message.text or ""
 
-        if text.startswith("RELAY_DELIVER:"):
+        if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:")):
             await handle_relay_delivery(update, context)
             return
 

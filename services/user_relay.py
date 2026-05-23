@@ -416,37 +416,46 @@ class UserRelay:
                 file_ids_str = str(file_ids_str)
             file_ids = [f.strip() for f in file_ids_str.split(",") if f.strip()]
 
-            if not file_ids:
-                logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无 file_id，回退到存储频道下载")
-                await self._deliver_via_storage_channel(user_id, code, record)
+            if file_ids:
+                logger.info(
+                    f"[UserRelay] 缓存交付: 码 {code}, {len(file_ids)} 条 file_id, 目标用户 {user_id}"
+                )
+                if self._decoder_bot_entity:
+                    for fid in file_ids:
+                        try:
+                            await self._client.send_file(self._decoder_bot_entity, fid)
+                        except Exception as e:
+                            logger.error(f"[UserRelay] 发送 file_id 到解码机器人失败: {e}")
+                if self._decoder_bot_entity:
+                    await self._client.send_message(
+                        self._decoder_bot_entity,
+                        f"RELAY_DELIVER:{user_id}:{code}",
+                    )
+                    logger.info(f"[UserRelay] 已通知解码机器人代发给用户 {user_id}")
                 return
 
-            logger.info(
-                f"[UserRelay] 缓存交付: 码 {code}, {len(file_ids)} 条 file_id, 目标用户 {user_id}"
-            )
-
-            if self._decoder_bot_entity:
-                for fid in file_ids:
-                    try:
-                        await self._client.send_file(self._decoder_bot_entity, fid)
-                    except Exception as e:
-                        logger.error(
-                            f"[UserRelay] 缓存交付发送 file_id 到解码机器人失败: {e}"
-                        )
-
-            if self._decoder_bot_entity:
-                await self._client.send_message(
-                    self._decoder_bot_entity,
-                    f"RELAY_DELIVER:{user_id}:{code}",
+            logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无 file_id，尝试从存储频道获取")
+            ok = await self._deliver_via_storage_channel(user_id, code, record)
+            if not ok:
+                logger.warning(
+                    f"[UserRelay] 缓存交付: 码 {code} 存储频道记录已过期，清除记录"
                 )
-                logger.info(f"[UserRelay] 缓存交付: 已通知解码机器人代发给用户 {user_id}")
+                await col.delete_one({"file_code": code})
+                if self._decoder_bot_entity:
+                    await self._client.send_message(
+                        self._decoder_bot_entity,
+                        f"RELAY_RENEW:{user_id}:{code}",
+                    )
+                    logger.info(
+                        f"[UserRelay] 已通知解码机器人: 码 {code} 需重新请求"
+                    )
 
         except Exception as e:
             logger.error(f"[UserRelay] 缓存交付失败 (code={code}, user={user_id}): {e}")
 
-    async def _deliver_via_storage_channel(self, user_id: int, code: str, record: dict):
+    async def _deliver_via_storage_channel(self, user_id: int, code: str, record: dict) -> bool:
         if not self._storage_channel_entity:
-            return
+            return False
         msg_ids_raw = record.get("batch_msg_ids") or ""
         if not isinstance(msg_ids_raw, str):
             msg_ids_raw = str(msg_ids_raw)
@@ -458,14 +467,16 @@ class UserRelay:
             if primary:
                 msg_ids = [primary]
         if not msg_ids:
-            return
+            return False
 
+        any_success = False
         for msg_id in msg_ids:
             msgs = await self._client.get_messages(
                 self._storage_channel_entity, ids=msg_id
             )
             msg = msgs[0] if isinstance(msgs, list) else msgs
             if not msg:
+                logger.warning(f"[UserRelay] 存储频道中未找到 msg_id={msg_id}")
                 continue
 
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -484,14 +495,17 @@ class UserRelay:
                         await self._client.send_file(
                             self._decoder_bot_entity, file_path, **send_kwargs
                         )
+                        any_success = True
                     except Exception as e:
                         logger.error(f"[UserRelay] 存储频道回退发送失败: {e}")
 
-        if self._decoder_bot_entity:
+        if any_success and self._decoder_bot_entity:
             await self._client.send_message(
                 self._decoder_bot_entity,
                 f"RELAY_DELIVER:{user_id}:{code}",
             )
+
+        return any_success
 
     async def stop(self):
         if self._client:
