@@ -244,7 +244,7 @@ class UserRelay:
             self._media_group_pending[media_group_id] = {
                 "user_id": user_id,
                 "code": code,
-                "_expires": asyncio.get_event_loop().time() + 6,
+                "_expires": asyncio.get_event_loop().time() + 90,
             }
 
         forwarded_to_user = False
@@ -261,19 +261,6 @@ class UserRelay:
                 send_kwargs = {"caption": caption}
                 if is_video:
                     send_kwargs["video"] = True
-
-                try:
-                    await self._client.send_file(
-                        user_id, file_path, **send_kwargs
-                    )
-                    forwarded_to_user = True
-                    logger.info(
-                        f"[UserRelay] 已通过下载重传方式发送给用户 {user_id}"
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"[UserRelay] 发送给用户 {user_id} 失败: {e}"
-                    )
 
                 if self._decoder_bot_entity:
                     try:
@@ -302,34 +289,33 @@ class UserRelay:
                         )
             else:
                 text = getattr(event.message, "message", None) or ""
-                if text:
+                if text and self._decoder_bot_entity:
                     try:
-                        await self._client.send_message(user_id, text)
-                        forwarded_to_user = True
-                        logger.info(
-                            f"[UserRelay] 已转发文本消息给用户 {user_id}"
+                        await self._client.send_message(
+                            self._decoder_bot_entity, text
                         )
+                        forwarded_to_decoder = True
+                        logger.info("[UserRelay] 已转发文本到解码机器人")
                     except Exception as e:
                         logger.error(
-                            f"[UserRelay] 转发文本给用户 {user_id} 失败: {e}"
+                            f"[UserRelay] 转发文本到解码机器人失败: {e}"
                         )
 
-                    if self._decoder_bot_entity:
-                        try:
-                            await self._client.send_message(
-                                self._decoder_bot_entity, text
-                            )
-                            forwarded_to_decoder = True
-                            logger.info("[UserRelay] 已转发文本到解码机器人")
-                        except Exception as e:
-                            logger.error(
-                                f"[UserRelay] 转发文本到解码机器人失败: {e}"
-                            )
+        try:
+            await self._client.forward_messages(PeerUser(user_id), event.message)
+            forwarded_to_user = True
+            logger.info(
+                f"[UserRelay] 已直接转发给用户 {user_id}"
+            )
+        except Exception as e:
+            logger.info(
+                f"[UserRelay] 无法直接转发给用户 {user_id}: {e}，将通知解码机器人代发"
+            )
 
         if first_in_group and not forwarded_to_user and code and self._decoder_bot_entity:
             async def _delayed_deliver():
                 if media_group_id:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(6)
                 try:
                     await self._client.send_message(
                         self._decoder_bot_entity,
