@@ -259,7 +259,7 @@ class UserRelay:
                     "user_id": user_id,
                     "code": code,
                     "media_group_id": media_group_id,
-                    "_expires": now() + 30,
+                    "_expires": now_ts + 30,
                 }
                 logger.info(
                     f"[UserRelay] 媒体组 {media_group_id} 第一条，注册 30s 窗口"
