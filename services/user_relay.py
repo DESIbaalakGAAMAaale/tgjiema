@@ -191,7 +191,7 @@ class UserRelay:
             logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
     def _register_handlers(self):
-        @self._client.on(events.NewMessage(incoming=True, concurrent=True))
+        @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
             now = asyncio.get_event_loop().time()
             expired = [k for k, v in self._media_group_pending.items() if v.get("_expires", 0) < now]
@@ -327,8 +327,6 @@ class UserRelay:
                             )
 
         if first_in_group and not forwarded_to_user and code and self._decoder_bot_entity:
-            if media_group_id:
-                await asyncio.sleep(4)
             try:
                 await self._client.send_message(
                     self._decoder_bot_entity,
