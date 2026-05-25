@@ -516,26 +516,30 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         if not direct_ok:
+            delivered = False
             if user_relay.is_ready:
                 delivered = await user_relay.deliver_cached(user.id, text)
-                if not delivered:
-                    return
-            elif len(msg_ids) > 1:
-                await enqueue_batch_send_task(
-                    target_user_id=user.id,
-                    channel_id=selected_channel,
-                    channel_msg_ids=msg_ids,
-                    batch_file_meta=batch_file_meta_str,
-                    file_code=text,
-                    page=1,
-                )
-            else:
-                await enqueue_send_task(
-                    target_user_id=user.id,
-                    channel_id=selected_channel,
-                    message_id=msg_ids[0],
-                    file_code=text,
-                )
+                if delivered:
+                    logger.info(f"[handle_code] 已通过中继交付文件给用户 {user.id} (code={text})")
+                else:
+                    logger.warning(f"[handle_code] 中继交付失败，尝试队列发送 (user={user.id}, code={text})")
+            if not delivered:
+                if len(msg_ids) > 1:
+                    await enqueue_batch_send_task(
+                        target_user_id=user.id,
+                        channel_id=selected_channel,
+                        channel_msg_ids=msg_ids,
+                        batch_file_meta=batch_file_meta_str,
+                        file_code=text,
+                        page=1,
+                    )
+                else:
+                    await enqueue_send_task(
+                        target_user_id=user.id,
+                        channel_id=selected_channel,
+                        message_id=msg_ids[0],
+                        file_code=text,
+                    )
     except Exception as e:
         logger.error(f"[handle_code] 入队发送任务失败 (user={user.id}, code={text}): {e}")
         await update.message.reply_text("系统繁忙，文件发送请求失败，请稍后重试。")
@@ -737,15 +741,24 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
     relay_code = parts[2].split("\n")[0]
     if not target_user_id:
         return False
+    orig_caption = parts[2].split("\n\n", 1)[1] if "\n\n" in parts[2] else ""
     try:
-        await context.bot.forward_message(
+        await context.bot.copy_message(
             chat_id=target_user_id,
             from_chat_id=update.effective_chat.id,
             message_id=update.message.message_id,
+            caption=orig_caption or None,
         )
-        logger.info(f"[RELAY_FILE] 已转发文件给用户 {target_user_id} (code={relay_code})")
+        logger.info(f"[RELAY_FILE] 已发送文件给用户 {target_user_id} (code={relay_code})")
     except Exception as e:
-        logger.error(f"[RELAY_FILE] 转发给用户 {target_user_id} 失败: {e}")
+        logger.error(f"[RELAY_FILE] 发送文件给用户 {target_user_id} 失败: {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"您请求的文件码 {relay_code} 发送失败，请稍后重试或联系管理员。",
+            )
+        except Exception:
+            pass
     return True
 
 
