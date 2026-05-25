@@ -1,4 +1,6 @@
 import multiprocessing
+import os
+import signal
 import sys
 import time
 
@@ -71,6 +73,23 @@ BOT_RUNNERS = {
 }
 
 
+def _shutdown(processes):
+    logger.info("正在优雅关闭进程...")
+    for p in processes:
+        if p.is_alive():
+            try:
+                os.kill(p.pid, signal.SIGINT)
+            except Exception:
+                p.terminate()
+    for p in processes:
+        p.join(timeout=5)
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=2)
+    logger.info("所有进程已关闭")
+
+
 def main():
     logger.add(
         "logs/tgjiema_{time}.log",
@@ -83,49 +102,31 @@ def main():
     if not args:
         args = ["all"]
 
-    if "all" in args:
-        processes = []
-        for name, runner in BOT_RUNNERS.items():
-            p = multiprocessing.Process(target=runner, name=name, daemon=True)
-            p.start()
-            processes.append(p)
-            logger.info(f"启动 {name} (PID: {p.pid})")
-            time.sleep(1)
+    processes = []
 
-        try:
-            for p in processes:
-                p.join()
-        except KeyboardInterrupt:
-            logger.info("收到中断信号，正在关闭...")
-            for p in processes:
-                p.terminate()
-            for p in processes:
-                p.join(timeout=5)
-            logger.info("所有进程已关闭")
+    def _start(name, runner):
+        p = multiprocessing.Process(target=runner, name=name, daemon=True)
+        p.start()
+        logger.info(f"启动 {name} (PID: {p.pid})")
+        processes.append(p)
+
+    if "all" in args:
+        for name, runner in BOT_RUNNERS.items():
+            _start(name, runner)
+            time.sleep(1)
     else:
-        processes = []
         for arg in args:
             if arg in BOT_RUNNERS:
-                p = multiprocessing.Process(
-                    target=BOT_RUNNERS[arg], name=arg, daemon=True
-                )
-                p.start()
-                processes.append(p)
-                logger.info(f"启动 {arg} (PID: {p.pid})")
+                _start(arg, BOT_RUNNERS[arg])
                 time.sleep(1)
             else:
                 logger.warning(f"未知的组件: {arg}")
 
-        try:
-            for p in processes:
-                p.join()
-        except KeyboardInterrupt:
-            logger.info("收到中断信号，正在关闭...")
-            for p in processes:
-                p.terminate()
-            for p in processes:
-                p.join(timeout=5)
-            logger.info("所有进程已关闭")
+    try:
+        for p in processes:
+            p.join()
+    except KeyboardInterrupt:
+        _shutdown(processes)
 
 
 if __name__ == "__main__":
