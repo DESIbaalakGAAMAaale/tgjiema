@@ -5,7 +5,7 @@ from pathlib import Path
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.types import PeerChannel
+from telethon.tl.types import (DocumentAttributeVideo, PeerChannel)
 from telethon.utils import pack_bot_file_id
 
 from config import settings
@@ -46,15 +46,29 @@ class UserRelay:
         if getattr(msg, "video", None):
             kwargs["video"] = True
             kwargs["supports_streaming"] = True
+            v = msg.video
+            kwargs["attributes"] = [
+                DocumentAttributeVideo(
+                    duration=v.duration,
+                    w=v.w,
+                    h=v.h,
+                    supports_streaming=True,
+                )
+            ]
         elif getattr(msg, "voice", None):
             kwargs["voice_note"] = True
-        elif getattr(msg, "photo", None):
-            pass
-        elif getattr(msg, "audio", None):
-            pass
         elif getattr(msg, "gif", None):
             kwargs["video"] = True
             kwargs["supports_streaming"] = True
+            g = msg.gif
+            kwargs["attributes"] = [
+                DocumentAttributeVideo(
+                    duration=g.duration,
+                    w=g.w,
+                    h=g.h,
+                    supports_streaming=True,
+                )
+            ]
         return kwargs
 
     @property

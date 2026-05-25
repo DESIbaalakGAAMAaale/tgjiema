@@ -128,11 +128,14 @@ async def _flush_media_group_buffer(media_group_id: str):
 
             batch_ids_str = record.get("batch_msg_ids") or ""
             msg_ids = []
-            if batch_ids_str:
-                msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
             primary_mid = record.get("primary_channel_msg_id")
-            if not msg_ids and primary_mid:
-                msg_ids = [primary_mid]
+            if primary_mid:
+                msg_ids.append(primary_mid)
+            if batch_ids_str:
+                for mid in batch_ids_str.split(","):
+                    mid_str = mid.strip()
+                    if mid_str.isdigit() and int(mid_str) not in msg_ids:
+                        msg_ids.append(int(mid_str))
 
             if not msg_ids:
                 logger.warning(f"[_flush_media_group_buffer] 中继媒体组: 无消息ID (code={code})")
@@ -837,11 +840,14 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
 
         batch_ids_str = record.get("batch_msg_ids") or ""
         msg_ids = []
-        if batch_ids_str:
-            msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
         primary_mid = record.get("primary_channel_msg_id")
-        if not msg_ids and primary_mid:
-            msg_ids = [primary_mid]
+        if primary_mid:
+            msg_ids.append(primary_mid)
+        if batch_ids_str:
+            for mid in batch_ids_str.split(","):
+                mid_str = mid.strip()
+                if mid_str.isdigit() and int(mid_str) not in msg_ids:
+                    msg_ids.append(int(mid_str))
 
         if not msg_ids:
             logger.warning(f"[RELAY_FILE] 文件记录无消息ID: {code_part}")
@@ -853,8 +859,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         batch_file_meta = []
         if file_ids_str:
             fid_list = [f for f in file_ids_str.split(",") if f.strip()]
-            msg_count = len(msg_ids)
-            for i in range(msg_count):
+            for i in range(len(msg_ids)):
                 fid = fid_list[i] if i < len(fid_list) else ""
                 batch_file_meta.append({"file_id": fid, "type": "document"})
 
