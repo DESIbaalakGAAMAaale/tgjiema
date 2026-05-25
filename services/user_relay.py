@@ -17,6 +17,7 @@ class UserRelay:
         self._decoder_bot_entity = None
         self._storage_channel_entity = None
         self._bot_exchange: dict[str, dict] = {}
+        self._media_buffers: dict[str, dict] = {}
         self._session_path = str(Path(__file__).parent.parent / "relay_session")
         self._ready = asyncio.Event()
         self._relay_api_id: int = 0
@@ -232,17 +233,107 @@ class UserRelay:
             code = exchange.get("code", "")
             exchange["_expires"] = now_ts + 60
 
-            logger.info(
-                f"[UserRelay] 收到 @{bot_username} 响应 (user={user_id}, code={code})"
-            )
+            media_group_id = getattr(event.message, "media_group_id", None)
+            if media_group_id:
+                buf = self._media_buffers.get(media_group_id)
+                if buf:
+                    buf["events"].append(event)
+                    buf["_expires"] = now_ts + 5
+                    logger.info(
+                        f"[UserRelay] 媒体组 {media_group_id} 收集第 {len(buf['events'])} 条"
+                    )
+                    return
+
+                self._media_buffers[media_group_id] = {
+                    "events": [event],
+                    "user_id": user_id,
+                    "code": code,
+                    "bot_username": bot_username,
+                    "_expires": now_ts + 5,
+                }
+                logger.info(
+                    f"[UserRelay] 媒体组 {media_group_id} 开始收集"
+                )
+                asyncio.create_task(
+                    self._flush_media_group(media_group_id, user_id, code, bot_username)
+                )
+                return
 
             await self._process_single(event.message, user_id, code)
-
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
 
+    async def _flush_media_group(self, media_group_id: str, user_id: int, code: str, bot_username: str):
+        await asyncio.sleep(3)
+
+        now_ts = asyncio.get_event_loop().time()
+        while True:
+            buf = self._media_buffers.get(media_group_id)
+            if not buf:
+                return
+            if buf["_expires"] > now_ts:
+                await asyncio.sleep(1)
+                now_ts = asyncio.get_event_loop().time()
+                continue
+            break
+
+        buf = self._media_buffers.pop(media_group_id, None)
+        if not buf:
+            return
+
+        events = buf["events"]
+        logger.info(
+            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events)} 条，开始下载"
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_paths = []
+            captions = []
+            for ev in events:
+                msg = ev.message
+                fp = await self._client.download_media(msg, file=tmpdir)
+                if fp:
+                    file_paths.append(fp)
+                    orig = getattr(msg, "message", None) or ""
+                    captions.append(f"RELAY_FILE:{user_id}:{code}\n\n{orig}")
+
+            if not file_paths:
+                logger.warning(f"[UserRelay] 媒体组 {media_group_id} 无有效文件")
+                return
+
+            if self._decoder_bot_entity:
+                try:
+                    await self._client.send_file(
+                        self._decoder_bot_entity, file_paths,
+                        caption=captions,
+                    )
+                    logger.info(
+                        f"[UserRelay] 媒体组 {len(file_paths)} 条已发送到解码机器人"
+                    )
+                except Exception as e:
+                    logger.error(f"[UserRelay] 媒体组发送到解码机器人失败: {e}")
+
+            if code and self._storage_channel_entity:
+                try:
+                    storage_msgs = await self._client.send_file(
+                        self._storage_channel_entity, file_paths
+                    )
+                    if not isinstance(storage_msgs, list):
+                        storage_msgs = [storage_msgs]
+                    for sm in storage_msgs:
+                        cache_fid = self._extract_file_id(sm)
+                        await self._cache_file_record(code, sm.id, file_id=cache_fid)
+                    logger.info(
+                        f"[UserRelay] 媒体组 {len(storage_msgs)} 条已缓存到存储频道"
+                    )
+                except Exception as e:
+                    logger.error(f"[UserRelay] 媒体组缓存到存储频道失败: {e}")
+
+        if self._pending_cleanup:
+            self._pending_cleanup(bot_username)
+
     async def _process_single(self, msg, user_id: int, code: str):
-        """Download media and re-upload — required for protected chats."""
+        """Download and re-upload a single non-group file."""
         if not msg or not msg.media:
             logger.warning(f"[UserRelay] 无媒体内容 (user={user_id}, code={code})")
             return
