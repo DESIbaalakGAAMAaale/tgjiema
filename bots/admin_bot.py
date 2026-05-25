@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import re
 
@@ -215,6 +216,79 @@ async def _get_relay_status_text() -> str:
     return msg
 
 
+async def _get_configs_text() -> str:
+    cfg_keys = [
+        ("storage_channel_id", "📺 主存储频道"),
+        ("decoder_chat_id", "🤖 解码机器人对话"),
+        ("file_code_prefix", "📝 文件码前缀"),
+        ("force_join_channel_id", "🔒 强制加群频道"),
+        ("force_join_link", "🔗 加群链接"),
+        ("upload_bot_username", "📤 上传机器人"),
+        ("decoder_bot_username", "🔓 解码机器人"),
+        ("sender_bot_username", "📨 发送机器人"),
+    ]
+
+    quota_keys = [
+        ("quota_default_free", "🆓 免费用户日配额"),
+        ("quota_external_free", "🆓 免费外部码配额"),
+        ("quota_default_basic", "🥇 基础会员日配额"),
+        ("quota_external_basic", "🥇 基础外部码配额"),
+        ("quota_default_premium", "👑 高级会员日配额"),
+        ("quota_external_premium", "👑 高级外部码配额"),
+    ]
+
+    r2_keys = [
+        ("r2_account_id", "☁️ R2 账号ID"),
+        ("r2_access_key", "🔑 R2 Access Key"),
+        ("r2_secret_key", "🔒 R2 Secret Key"),
+        ("r2_bucket", "🪣 R2 桶名"),
+        ("r2_endpoint", "🔗 R2 Endpoint"),
+    ]
+
+    backup_keys = [
+        ("db_backup_interval", "💾 DB备份间隔(分钟)"),
+        ("db_backup_enabled", "💾 DB备份"),
+    ]
+
+    msg = "⚙️ 系统配置\n\n"
+
+    msg += "📌 基础配置\n"
+    for key, label in cfg_keys:
+        val = await get_config(key)
+        if not val:
+            val = settings.get_config_default(key)
+        display = val if val else "❌ 未配置"
+        msg += f"  {label}：{display}\n"
+
+    msg += "\n🎫 默认配额\n"
+    for key, label in quota_keys:
+        val = await get_config(key)
+        if not val:
+            val = settings.get_config_default(key)
+        try:
+            display = _quota_display(int(val)) if val else "未配置"
+        except (ValueError, TypeError):
+            display = str(val) if val else "未配置"
+        msg += f"  {label}：{display}\n"
+
+    r2_keys_to_check = ["r2_account_id", "r2_access_key", "r2_secret_key"]
+    r2_vals = await asyncio.gather(*(get_config(k) for k in r2_keys_to_check))
+    r2_configured = any(v for v in r2_vals if v)
+    msg += f"\n☁️ R2 备份：{'✅ 已配置' if r2_configured else '❌ 未配置'}\n"
+
+    for key, label in backup_keys:
+        val = await get_config(key)
+        if not val:
+            val = settings.get_config_default(key)
+        display = val if val else "未配置"
+        if key == "db_backup_enabled":
+            display = "✅ 开启" if display.lower() in ("true", "1", "on") else "❌ 关闭"
+        msg += f"  {label}：{display}\n"
+
+    msg += "\n使用 /set_* 命令修改配置，或点击菜单按钮操作。"
+    return msg
+
+
 BACK_BTN = [[InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]]
 
 
@@ -228,7 +302,8 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("📺 备份频道", callback_data="menu:backup_chan")],
             [InlineKeyboardButton("🤖 备份机器人", callback_data="menu:backup_bot"),
              InlineKeyboardButton("📋 解码日志", callback_data="action:logs")],
-            [InlineKeyboardButton("🔐 用户中继", callback_data="menu:relay")],
+            [InlineKeyboardButton("🔐 用户中继", callback_data="menu:relay"),
+             InlineKeyboardButton("⚙️ 系统配置", callback_data="menu:config")],
         ]
         return text, InlineKeyboardMarkup(kb)
 
@@ -313,6 +388,28 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status")],
             [InlineKeyboardButton("⚙️ 配置说明", callback_data="usage:relay_config"),
              InlineKeyboardButton("🔑 验证码说明", callback_data="usage:relay_code")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "config":
+        text = (
+            "⚙️ 系统配置\n\n"
+            "📌 基础配置\n"
+            "/set_storage_channel <ID> — 设置主存储频道\n"
+            "/set_decoder_chat <ID> — 设置解码机器人对话\n"
+            "/set_file_prefix <前缀> — 设置文件码前缀\n"
+            "/set_force_join <频道ID> [链接] — 设置强制加群\n\n"
+            "🤖 机器人用户名\n"
+            "/set_username <upload|decoder|sender> <@用户名> — 设置\n\n"
+            "🎫 默认配额\n"
+            "/set_quota_default <free|basic|premium> <数量> [外部码] — 设置\n\n"
+            "💾 数据备份\n"
+            "/set_r2 <账号ID> <密钥> <私钥> [桶名] — R2 配置\n"
+            "/set_db_backup <间隔分钟> <开/关> — DB 自动备份\n\n"
+            "📋 查看全部：/settings"
+        )
+        kb = [
+            [InlineKeyboardButton("📋 查看配置", callback_data="action:settings")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -415,6 +512,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "action:relay_status":
         text = await _get_relay_status_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:settings":
+        text = await _get_configs_text()
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "usage:relay_config":
@@ -1094,6 +1195,154 @@ async def backup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── 系统配置管理 ────────────────────────────────────────────────
+
+
+@_auth_required
+async def settings_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _get_configs_text()
+    await update.message.reply_text(text)
+
+
+@_auth_required
+async def set_storage_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("用法：/set_storage_channel <频道ID>")
+        return
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 频道ID必须是数字")
+        return
+    await set_config("storage_channel_id", str(channel_id))
+    await update.message.reply_text(f"✅ 主存储频道已设为 {channel_id}\n⚠️ 需重启所有机器人后生效")
+
+
+@_auth_required
+async def set_decoder_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("用法：/set_decoder_chat <ChatID>")
+        return
+    try:
+        chat_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ ChatID必须是数字")
+        return
+    await set_config("decoder_chat_id", str(chat_id))
+    await update.message.reply_text(f"✅ 解码机器人对话已设为 {chat_id}")
+
+
+@_auth_required
+async def set_file_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("用法：/set_file_prefix <前缀>\n当前：/settings 查看")
+        return
+    prefix = args[0].strip()
+    await set_config("file_code_prefix", prefix)
+    await update.message.reply_text(f"✅ 文件码前缀已设为 {prefix}\n⚠️ 需重启 upload_bot 后生效")
+
+
+@_auth_required
+async def set_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("用法：/set_force_join <频道ID> [加群链接]")
+        return
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 频道ID必须是数字")
+        return
+    await set_config("force_join_channel_id", str(channel_id))
+    link = args[1] if len(args) > 1 else ""
+    if link:
+        await set_config("force_join_link", link)
+    await update.message.reply_text(f"✅ 强制加群频道已设为 {channel_id}\n" + (f"🔗 链接：{link}" if link else ""))
+
+
+@_auth_required
+async def set_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("用法：/set_username <upload|decoder|sender> <@用户名>")
+        return
+    bot_role = args[0].lower()
+    username = args[1].lstrip("@")
+    key_map = {"upload": "upload_bot_username", "decoder": "decoder_bot_username", "sender": "sender_bot_username"}
+    key = key_map.get(bot_role)
+    if not key:
+        await update.message.reply_text("❌ 角色必须是 upload、decoder 或 sender")
+        return
+    await set_config(key, username)
+    await update.message.reply_text(f"✅ {bot_role} 机器人用户名已设为 @{username}")
+
+
+@_auth_required
+async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("用法：/set_quota_default <free|basic|premium> <日配额> [外部码日配额]")
+        return
+    level = args[0].lower()
+    if level not in ("free", "basic", "premium"):
+        await update.message.reply_text("❌ 等级必须是 free、basic 或 premium")
+        return
+    try:
+        quota = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ 配额必须是数字（-1 表示不限）")
+        return
+    await set_config(f"quota_default_{level}", str(quota))
+    msg = f"✅ {level} 日配额已设为 {_quota_display(quota)}"
+
+    if len(args) >= 3:
+        try:
+            ext_quota = int(args[2])
+        except ValueError:
+            ext_quota = quota
+        await set_config(f"quota_external_{level}", str(ext_quota))
+        msg += f"，外部码配额 {_quota_display(ext_quota)}"
+
+    msg += "\n⚠️ 已有用户的配额不受影响"
+    await update.message.reply_text(msg)
+
+
+@_auth_required
+async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text("用法：/set_r2 <账号ID> <AccessKey> <SecretKey> [桶名]")
+        return
+    await set_config("r2_account_id", args[0])
+    await set_config("r2_access_key", args[1])
+    await set_config("r2_secret_key", args[2])
+    if len(args) >= 4:
+        await set_config("r2_bucket", args[3])
+    await update.message.reply_text("✅ R2 配置已保存\n⚠️ 需重启服务后生效")
+
+
+@_auth_required
+async def set_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text("用法：/set_db_backup <间隔分钟> <开/关>")
+        return
+    try:
+        interval = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 间隔必须是数字（分钟）")
+        return
+    enabled = args[1].lower() in ("开", "1", "true", "yes", "on")
+    await set_config("db_backup_interval", str(interval))
+    await set_config("db_backup_enabled", "true" if enabled else "false")
+    await update.message.reply_text(
+        f"✅ 数据库备份：间隔 {interval} 分钟，状态：{'开启' if enabled else '关闭'}"
+    )
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -1136,6 +1385,15 @@ def run():
     app.add_handler(CommandHandler("relay_set_api", relay_set_api))
     app.add_handler(CommandHandler("relay_pending", relay_pending))
     app.add_handler(CommandHandler("backup_reset", backup_reset))
+    app.add_handler(CommandHandler("settings", settings_view))
+    app.add_handler(CommandHandler("set_storage_channel", set_storage_channel))
+    app.add_handler(CommandHandler("set_decoder_chat", set_decoder_chat))
+    app.add_handler(CommandHandler("set_file_prefix", set_file_prefix))
+    app.add_handler(CommandHandler("set_force_join", set_force_join))
+    app.add_handler(CommandHandler("set_username", set_username))
+    app.add_handler(CommandHandler("set_quota_default", set_quota_default))
+    app.add_handler(CommandHandler("set_r2", set_r2))
+    app.add_handler(CommandHandler("set_db_backup", set_db_backup))
     app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:)"))
 

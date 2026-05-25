@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     RATE_LIMIT_GLOBAL_PER_SECOND: int = 30
     RATE_LIMIT_PER_USER_PER_MINUTE: int = 10
 
-    LOG_LEVEL: str = "INFO"
+    LOG_LEVEL: str = "DEBUG"
 
     FILE_CODE_PREFIX: str = "tgwenjian"
 
@@ -89,6 +89,33 @@ class Settings(BaseSettings):
     @property
     def ALL_STORAGE_CHANNELS(self) -> List[int]:
         return [self.MAIN_STORAGE_CHANNEL_ID] + self.ALL_BACKUP_CHANNELS
+
+    @staticmethod
+    def get_config_default(key: str) -> str:
+        defaults = {
+            "storage_channel_id": "",
+            "decoder_chat_id": "",
+            "file_code_prefix": "tgwenjian",
+            "force_join_channel_id": "",
+            "force_join_link": "",
+            "upload_bot_username": "",
+            "decoder_bot_username": "",
+            "sender_bot_username": "",
+            "quota_default_free": "3",
+            "quota_default_basic": "20",
+            "quota_default_premium": "-1",
+            "quota_external_free": "0",
+            "quota_external_basic": "-1",
+            "quota_external_premium": "-1",
+            "r2_account_id": "",
+            "r2_access_key": "",
+            "r2_secret_key": "",
+            "r2_bucket": "tgjiema-backup",
+            "r2_endpoint": "",
+            "db_backup_interval": "60",
+            "db_backup_enabled": "true",
+        }
+        return defaults.get(key, "")
 
 
 settings = Settings()
