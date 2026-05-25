@@ -1,4 +1,5 @@
 import asyncio
+import tempfile
 from pathlib import Path
 
 from loguru import logger
@@ -241,7 +242,7 @@ class UserRelay:
                 self._pending_cleanup(bot_username)
 
     async def _process_single(self, msg, user_id: int, code: str):
-        """Relay MTProto media directly — no file_id conversion, no download."""
+        """Download media and re-upload — required for protected chats."""
         if not msg or not msg.media:
             logger.warning(f"[UserRelay] 无媒体内容 (user={user_id}, code={code})")
             return
@@ -253,29 +254,35 @@ class UserRelay:
         if is_video:
             send_kwargs["video"] = True
 
-        if self._decoder_bot_entity:
-            try:
-                await self._client.send_file(
-                    self._decoder_bot_entity, msg.media, **send_kwargs
-                )
-                logger.info(
-                    f"[UserRelay] 已 MTProto 直发到解码机器人 (user={user_id}, code={code})"
-                )
-            except Exception as e:
-                logger.error(f"[UserRelay] 发送到解码机器人失败: {e}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = await self._client.download_media(msg, file=tmpdir)
+            if not file_path:
+                logger.warning(f"[UserRelay] 下载媒体失败 (user={user_id}, code={code})")
+                return
 
-        if code and self._storage_channel_entity:
-            try:
-                storage_msg = await self._client.send_file(
-                    self._storage_channel_entity, msg.media
-                )
-                cache_fid = self._extract_file_id(storage_msg)
-                await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
-                logger.info(
-                    f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
-                )
-            except Exception as e:
-                logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
+            if self._decoder_bot_entity:
+                try:
+                    await self._client.send_file(
+                        self._decoder_bot_entity, file_path, **send_kwargs
+                    )
+                    logger.info(
+                        f"[UserRelay] 已发送到解码机器人 (user={user_id}, code={code})"
+                    )
+                except Exception as e:
+                    logger.error(f"[UserRelay] 发送到解码机器人失败: {e}")
+
+            if code and self._storage_channel_entity:
+                try:
+                    storage_msg = await self._client.send_file(
+                        self._storage_channel_entity, file_path
+                    )
+                    cache_fid = self._extract_file_id(storage_msg)
+                    await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
+                    logger.info(
+                        f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
+                    )
+                except Exception as e:
+                    logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:
