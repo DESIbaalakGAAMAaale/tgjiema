@@ -26,6 +26,37 @@ class UserRelay:
         self._pending_cleanup = None
         self._relay_user_id = None
 
+    @staticmethod
+    def _detect_media_type(msg) -> str:
+        if getattr(msg, "photo", None):
+            return "photo"
+        if getattr(msg, "video", None):
+            return "video"
+        if getattr(msg, "voice", None):
+            return "voice"
+        if getattr(msg, "audio", None):
+            return "audio"
+        if getattr(msg, "gif", None):
+            return "gif"
+        return "document"
+
+    @staticmethod
+    def _build_send_kwargs(msg, caption: str) -> dict:
+        kwargs = {"caption": caption}
+        if getattr(msg, "video", None):
+            kwargs["video"] = True
+            kwargs["supports_streaming"] = True
+        elif getattr(msg, "voice", None):
+            kwargs["voice_note"] = True
+        elif getattr(msg, "photo", None):
+            pass
+        elif getattr(msg, "audio", None):
+            pass
+        elif getattr(msg, "gif", None):
+            kwargs["video"] = True
+            kwargs["supports_streaming"] = True
+        return kwargs
+
     @property
     def is_ready(self) -> bool:
         return self._ready.is_set()
@@ -289,6 +320,7 @@ class UserRelay:
         with tempfile.TemporaryDirectory() as tmpdir:
             file_paths = []
             captions = []
+            all_type_kwargs = []
             for ev in events:
                 msg = ev.message
                 fp = await self._client.download_media(msg, file=tmpdir)
@@ -296,6 +328,7 @@ class UserRelay:
                     file_paths.append(fp)
                     orig = getattr(msg, "message", None) or ""
                     captions.append(f"RELAY_FILE:{user_id}:{code}\n\n{orig}")
+                    all_type_kwargs.append(self._build_send_kwargs(msg, ""))
 
             if not file_paths:
                 logger.warning(f"[UserRelay] 媒体组 {media_group_id} 无有效文件")
@@ -314,36 +347,31 @@ class UserRelay:
                     logger.error(f"[UserRelay] 媒体组发送到解码机器人失败: {e}")
 
             if code and self._storage_channel_entity:
-                try:
-                    storage_msgs = await self._client.send_file(
-                        self._storage_channel_entity, file_paths
-                    )
-                    if not isinstance(storage_msgs, list):
-                        storage_msgs = [storage_msgs]
-                    for sm in storage_msgs:
-                        cache_fid = self._extract_file_id(sm)
-                        await self._cache_file_record(code, sm.id, file_id=cache_fid)
-                    logger.info(
-                        f"[UserRelay] 媒体组 {len(storage_msgs)} 条已缓存到存储频道"
-                    )
-                except Exception as e:
-                    logger.error(f"[UserRelay] 媒体组缓存到存储频道失败: {e}")
+                for idx, fp in enumerate(file_paths):
+                    try:
+                        storage_kw = all_type_kwargs[idx] if idx < len(all_type_kwargs) else {}
+                        storage_msg = await self._client.send_file(
+                            self._storage_channel_entity, fp, **storage_kw
+                        )
+                        cache_fid = self._extract_file_id(storage_msg)
+                        await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
+                    except Exception as e:
+                        logger.error(f"[UserRelay] 媒体组第 {idx+1} 条缓存失败: {e}")
+                logger.info(
+                    f"[UserRelay] 媒体组 {len(file_paths)} 条已缓存到存储频道"
+                )
 
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)
 
     async def _process_single(self, msg, user_id: int, code: str):
-        """Download and re-upload a single non-group file."""
         if not msg or not msg.media:
             logger.warning(f"[UserRelay] 无媒体内容 (user={user_id}, code={code})")
             return
 
         orig_caption = getattr(msg, "message", None) or ""
         relay_caption = f"RELAY_FILE:{user_id}:{code}\n\n{orig_caption}"
-        is_video = getattr(msg, "video", None) is not None
-        send_kwargs = {"caption": relay_caption}
-        if is_video:
-            send_kwargs["video"] = True
+        send_kwargs = self._build_send_kwargs(msg, relay_caption)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             file_path = await self._client.download_media(msg, file=tmpdir)
@@ -364,8 +392,9 @@ class UserRelay:
 
             if code and self._storage_channel_entity:
                 try:
+                    storage_send_kwargs = self._build_send_kwargs(msg, "")
                     storage_msg = await self._client.send_file(
-                        self._storage_channel_entity, file_path
+                        self._storage_channel_entity, file_path, **storage_send_kwargs
                     )
                     cache_fid = self._extract_file_id(storage_msg)
                     await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
