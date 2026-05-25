@@ -1403,7 +1403,7 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from database.session import CockroachDBClient
 
     client = CockroachDBClient()
-    await client.ensure_connected()
+    await client.configure(settings.COCKROACHDB_URL)
 
     cleared = []
     for table in _FACTORY_RESET_TABLES:
