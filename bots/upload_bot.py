@@ -122,7 +122,8 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     sent_msg = await update.message.reply_text(
-        f"📦 {len(channel_msg_ids)} 个文件已接收，正在生成文件码..."
+        f"📦 {len(channel_msg_ids)} 个文件已接收，"
+        f"文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给您"
     )
 
     type_str = json.dumps(file_types)
@@ -302,7 +303,8 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     batch_file_meta_str = json.dumps(all_meta)
 
     sent_msg = await context.bot.send_message(
-        chat_id=user_id, text="文件已接收，正在生成文件码..."
+        chat_id=user_id,
+        text=f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给您"
     )
 
     try:
@@ -344,7 +346,9 @@ async def _process_upload(
         await update.message.reply_text("文件处理失败，请稍后重试。")
         return
 
-    sent_msg = await update.message.reply_text("文件已接收，正在生成文件码...")
+    sent_msg = await update.message.reply_text(
+        f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给您"
+    )
 
     type_str = json.dumps(file_types)
 
@@ -399,7 +403,7 @@ async def _poll_code_sent(app: Application):
                     await app.bot.edit_message_text(
                         chat_id=uploader_id,
                         message_id=status_msg_id,
-                        text="✅ 文件码已发送",
+                        text=f"✅ 文件码已由 @{settings.DECODER_BOT_USERNAME} 生成，请前往获取",
                     )
                     edited_ids.add(row_id)
                 except Exception:

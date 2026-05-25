@@ -377,7 +377,8 @@ async def _process_pending_uploads(app: Application):
                         text=f"您的文件码已生成：{file_code}\n"
                              f"文件内容：{type_desc}\n"
                              f"有效期：永久有效\n"
-                             f"您可将其分享给他人，对方通过向我发送此码即可获取文件。",
+                             f"发送此码给 @{settings.DECODER_BOT_USERNAME} 即可获取文件，"
+                             f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给您。",
                     )
                     logger.info(f"[poll] 文件码已发送给用户 {uploader_id}: {file_code}")
                 except Exception as e:
@@ -487,7 +488,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining_info = f"今日剩余解码次数：{result.remaining_quota}"
 
     await update.message.reply_text(
-        f"文件发送请求已接受，请查收。\n{remaining_info}"
+        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给您，请查收。\n{remaining_info}"
     )
 
     metrics.decode_count += 1
@@ -535,7 +536,7 @@ async def handle_external_code(
         if ok:
             _enqueue_external(bot_username, user_id, code)
             await update.message.reply_text(
-                f"已向 @{bot_username} 查询文件，请稍候查收。\n{remaining_info}"
+                f"正在查询外部文件码，请稍候查收。\n{remaining_info}"
             )
             metrics.decode_count += 1
             metrics.record_processed("decoder_bot")
@@ -548,7 +549,7 @@ async def handle_external_code(
         )
         _enqueue_external(bot_username, user_id, code)
         await update.message.reply_text(
-            f"已向 @{bot_username} 查询文件，请稍候查收。\n{remaining_info}"
+            f"正在查询外部文件码，请稍候查收。\n{remaining_info}"
         )
         metrics.decode_count += 1
         metrics.record_processed("decoder_bot")
