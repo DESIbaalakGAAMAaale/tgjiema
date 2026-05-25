@@ -22,7 +22,7 @@ def make_user(
 ):
     from datetime import datetime, timezone
 
-    now = datetime.now(timezone.UTC)
+    now = datetime.now(timezone.utc)
     return {
         "user_id": user_id,
         "username": username,
@@ -55,7 +55,7 @@ def make_file_record(
 ):
     from datetime import datetime, timezone
 
-    now = datetime.now(timezone.UTC)
+    now = datetime.now(timezone.utc)
     return {
         "file_code": file_code,
         "uploader_id": uploader_id,
@@ -83,7 +83,7 @@ def make_decode_log(
     return {
         "file_code": file_code,
         "requester_id": requester_id,
-        "request_time": datetime.now(timezone.UTC),
+        "request_time": datetime.now(timezone.utc),
         "status": status,
         "source_channel_id": source_channel_id,
     }

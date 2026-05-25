@@ -432,13 +432,13 @@ async def _set_config(key: str, value: str):
     if existing:
         await _backup_config_col.update_one(
             {"config_key": key},
-            {"$set": {"config_value": value, "updated_at": _dt.datetime.now(_dt.timezone.UTC).isoformat()}},
+            {"$set": {"config_value": value, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}},
         )
     else:
         await _backup_config_col.insert_one({
             "config_key": key,
             "config_value": value,
-            "updated_at": _dt.datetime.now(_dt.timezone.UTC).isoformat(),
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         })
 
 
