@@ -1343,6 +1343,107 @@ async def set_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── 工厂重置 ────────────────────────────────────────────────────
+
+
+_FACTORY_RESET_TABLES = [
+    "file_records", "decode_logs", "pending_uploads",
+    "send_queue", "users", "app_config", "backup_config",
+]
+
+
+@_auth_required
+async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+
+    if not args:
+        await update.message.reply_text(
+            "⚠️️ ️ 危险的工厂重置！\n\n"
+            "此操作将清空以下所有数据：\n"
+            "• 📦 file_records（文件记录）\n"
+            "• 📋 decode_logs（解码日志）\n"
+            "• 📤 pending_uploads（上传队列）\n"
+            "• 📨 send_queue（发送队列）\n"
+            "• 👤 users（用户数据）\n"
+            "• ⚙️ app_config（系统配置）\n"
+            "• 🤖 backup_config（备份配置）\n\n"
+            "频道中的消息不会被删除，但备份状态会重置，全量备份将被重新触发。\n\n"
+            "🔴 如果您确认，请发送：\n"
+            "/factory_reset confirm\n\n"
+            "🔴 最终确认请发送：\n"
+            "/factory_reset confirm I_UNDERSTAND"
+        )
+        return
+
+    if args[0] != "confirm":
+        await update.message.reply_text("❌ 请先使用 /factory_reset 查看说明")
+        return
+
+    if len(args) < 2 or args[1] != "I_UNDERSTAND":
+        await update.message.reply_text(
+            "⚠️ 二次确认\n\n"
+            "发送以下命令执行最终重置：\n"
+            "/factory_reset confirm I_UNDERSTAND\n\n"
+            "此操作不可撤销！所有用户数据、文件码、配置将被永久清空。\n"
+            "频道消息需要手动删除。"
+        )
+        return
+
+    msg = await update.message.reply_text("🔄 正在执行工厂重置...")
+
+    from database.session import CockroachDBClient
+
+    client = CockroachDBClient()
+    await client.ensure_connected()
+
+    cleared = []
+    for table in _FACTORY_RESET_TABLES:
+        try:
+            sql = f"DELETE FROM {table}"
+            await client.execute(sql)
+            cleared.append(table)
+        except Exception as e:
+            logger.warning(f"[factory_reset] 清空 {table} 失败: {e}")
+
+    for prefix in ("backup_backup_bot_1_cursor", "backup_backup_bot_2_cursor", "backup_backup_bot_3_cursor"):
+        try:
+            await client.execute("DELETE FROM app_config WHERE config_key = $1", [prefix])
+        except Exception:
+            pass
+
+    await msg.edit_text(
+        "✅ 工厂重置完成！\n\n"
+        f"已清空 {len(cleared)} 张表：{', '.join(cleared)}\n"
+        "已重置备份游标\n\n"
+        "⚠️ 存储频道的消息不会被自动删除。\n"
+        "如需清空存储频道，请手动执行：\n"
+        "  /purge_channel <频道ID>\n\n"
+        "🔄 请重启所有机器人以使配置生效。"
+    )
+
+
+@_auth_required
+async def purge_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("用法：/purge_channel <频道ID>")
+        return
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 频道ID必须是数字")
+        return
+
+    await update.message.reply_text(
+        f"⚠️ Telegram Bot API 不支持批量删除频道消息。\n\n"
+        f"请手动处理频道 {channel_id}：\n"
+        f"1. 打开频道管理界面\n"
+        f"2. 删除所有消息\n"
+        f"3. 或直接创建一个新的测试频道\n\n"
+        f"完成后使用 /set_storage_channel <新频道ID> 重新配置。"
+    )
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -1394,6 +1495,8 @@ def run():
     app.add_handler(CommandHandler("set_quota_default", set_quota_default))
     app.add_handler(CommandHandler("set_r2", set_r2))
     app.add_handler(CommandHandler("set_db_backup", set_db_backup))
+    app.add_handler(CommandHandler("factory_reset", factory_reset))
+    app.add_handler(CommandHandler("purge_channel", purge_channel))
     app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:)"))
 
