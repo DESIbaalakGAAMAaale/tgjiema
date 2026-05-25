@@ -220,6 +220,42 @@ async def _get_relay_status_text() -> str:
     return msg
 
 
+_CONFIG_SETTINGS_MAP = {
+    "storage_channel_id": "MAIN_STORAGE_CHANNEL_ID",
+    "decoder_chat_id": "DECODER_BOT_CHAT_ID",
+    "file_code_prefix": "FILE_CODE_PREFIX",
+    "force_join_channel_id": "FORCE_JOIN_CHANNEL_ID",
+    "force_join_link": "FORCE_JOIN_CHANNEL_LINK",
+    "upload_bot_username": "UPLOAD_BOT_USERNAME",
+    "decoder_bot_username": "DECODER_BOT_USERNAME",
+    "sender_bot_username": "SENDER_BOT_USERNAME",
+    "quota_default_free": "FREE_DAILY_QUOTA",
+    "quota_external_free": "FREE_EXTERNAL_DAILY_QUOTA",
+    "quota_default_basic": "BASIC_DAILY_QUOTA",
+    "quota_external_basic": "BASIC_EXTERNAL_DAILY_QUOTA",
+    "quota_default_premium": "PREMIUM_DAILY_QUOTA",
+    "quota_external_premium": "PREMIUM_EXTERNAL_DAILY_QUOTA",
+    "r2_account_id": "R2_ACCOUNT_ID",
+    "r2_access_key": "R2_ACCESS_KEY_ID",
+    "r2_secret_key": "R2_SECRET_ACCESS_KEY",
+    "r2_bucket": "R2_BUCKET_NAME",
+    "r2_endpoint": "R2_ENDPOINT",
+    "db_backup_interval": "DB_BACKUP_INTERVAL_MINUTES",
+    "db_backup_enabled": "DB_BACKUP_ENABLED",
+}
+
+
+def _config_fallback(key: str) -> str:
+    attr_name = _CONFIG_SETTINGS_MAP.get(key)
+    if attr_name:
+        val = getattr(settings, attr_name, None)
+        if val is not None:
+            str_val = str(val)
+            if str_val and str_val not in ("0", "-1000000000000"):
+                return str_val
+    return settings.get_config_default(key)
+
+
 async def _get_configs_text() -> str:
     cfg_keys = [
         ("storage_channel_id", "📺 主存储频道"),
@@ -260,7 +296,7 @@ async def _get_configs_text() -> str:
     for key, label in cfg_keys:
         val = await get_config(key)
         if not val:
-            val = settings.get_config_default(key)
+            val = _config_fallback(key)
         display = val if val else "❌ 未配置"
         msg += f"  {label}：{display}\n"
 
@@ -268,7 +304,7 @@ async def _get_configs_text() -> str:
     for key, label in quota_keys:
         val = await get_config(key)
         if not val:
-            val = settings.get_config_default(key)
+            val = _config_fallback(key)
         try:
             display = _quota_display(int(val)) if val else "未配置"
         except (ValueError, TypeError):
@@ -278,12 +314,15 @@ async def _get_configs_text() -> str:
     r2_keys_to_check = ["r2_account_id", "r2_access_key", "r2_secret_key"]
     r2_vals = await asyncio.gather(*(get_config(k) for k in r2_keys_to_check))
     r2_configured = any(v for v in r2_vals if v)
+    if not r2_configured:
+        r2_check = lambda k: _config_fallback(k) != settings.get_config_default(k)
+        r2_configured = any(r2_check(k) for k in r2_keys_to_check)
     msg += f"\n☁️ R2 备份：{'✅ 已配置' if r2_configured else '❌ 未配置'}\n"
 
     for key, label in backup_keys:
         val = await get_config(key)
         if not val:
-            val = settings.get_config_default(key)
+            val = _config_fallback(key)
         display = val if val else "未配置"
         if key == "db_backup_enabled":
             display = "✅ 开启" if display.lower() in ("true", "1", "on") else "❌ 关闭"
