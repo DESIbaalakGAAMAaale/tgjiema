@@ -582,11 +582,13 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
     if media_group_id:
         _track_external_media_group(media_group_id, target_user_id, code)
 
+    forwarded = None
     try:
-        await update.message.copy(chat_id=target_user_id)
-        logger.info(f"[handle_external_file_response] 外部文件转发成功: 用户 {target_user_id}, 码 {code}")
+        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+        await _cache_external_file(context, code, forwarded.message_id)
+        logger.info(f"[handle_external_file_response] 外部码 {code} 的文件已缓存到本地频道 {MAIN_CHANNEL_ID}")
     except Exception as e:
-        logger.error(f"[handle_external_file_response] 转发外部文件给用户 {target_user_id} 失败 (code={code}): {e}")
+        logger.error(f"[handle_external_file_response] 缓存外部文件到本地频道失败 (code={code}): {e}")
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
@@ -597,11 +599,15 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
         return
 
     try:
-        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
-        await _cache_external_file(context, code, forwarded.message_id)
-        logger.info(f"[handle_external_file_response] 外部码 {code} 的文件已缓存到本地频道 {MAIN_CHANNEL_ID}")
+        await enqueue_send_task(
+            target_user_id=target_user_id,
+            channel_id=MAIN_CHANNEL_ID,
+            message_id=forwarded.message_id,
+            file_code=code,
+        )
+        logger.info(f"[handle_external_file_response] 外部文件已入队 sender_bot: 用户 {target_user_id}, 码 {code}")
     except Exception as e:
-        logger.error(f"[handle_external_file_response] 缓存外部文件到本地频道失败 (code={code}): {e}")
+        logger.error(f"[handle_external_file_response] 入队发送失败 (code={code}): {e}")
 
 
 async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -609,10 +615,12 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
     if media_group_id:
         user_id, code = _get_external_media_group_user(media_group_id)
         if user_id:
+            forwarded = None
             try:
-                await update.message.copy(chat_id=user_id)
+                forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+                await _cache_external_file(context, code, forwarded.message_id)
             except Exception as e:
-                logger.error(f"[handle_external_media] 转发外部媒体组文件给用户 {user_id} 失败 (code={code}): {e}")
+                logger.error(f"[handle_external_media] 缓存外部媒体组文件到本地频道失败 (code={code}): {e}")
                 try:
                     await context.bot.send_message(
                         chat_id=user_id,
@@ -621,11 +629,16 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
                 except Exception:
                     pass
                 return
-            try:
-                forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
-                await _cache_external_file(context, code, forwarded.message_id)
-            except Exception as e:
-                logger.error(f"[handle_external_media] 缓存外部媒体组文件到本地频道失败 (code={code}): {e}")
+            if forwarded:
+                try:
+                    await enqueue_send_task(
+                        target_user_id=user_id,
+                        channel_id=MAIN_CHANNEL_ID,
+                        message_id=forwarded.message_id,
+                        file_code=code,
+                    )
+                except Exception as e:
+                    logger.error(f"[handle_external_media] 入队发送失败 (code={code}): {e}")
             return
 
     bot_username = _resolve_bot_username(update)
@@ -640,10 +653,12 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
         f"[handle_external_media] 收到外部机器人 @{bot_username} 的媒体响应，转发给用户 {target_user_id}，码 {code}"
     )
 
+    forwarded = None
     try:
-        await update.message.copy(chat_id=target_user_id)
+        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+        await _cache_external_file(context, code, forwarded.message_id)
     except Exception as e:
-        logger.error(f"[handle_external_media] 转发外部媒体给用户 {target_user_id} 失败 (code={code}): {e}")
+        logger.error(f"[handle_external_media] 缓存外部媒体文件到本地频道失败 (code={code}): {e}")
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
@@ -654,10 +669,14 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     try:
-        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
-        await _cache_external_file(context, code, forwarded.message_id)
+        await enqueue_send_task(
+            target_user_id=target_user_id,
+            channel_id=MAIN_CHANNEL_ID,
+            message_id=forwarded.message_id,
+            file_code=code,
+        )
     except Exception as e:
-        logger.error(f"[handle_external_media] 缓存外部媒体文件到本地频道失败 (code={code}): {e}")
+        logger.error(f"[handle_external_media] 入队发送失败 (code={code}): {e}")
 
 
 async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -681,15 +700,21 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         return False
     orig_caption = parts[2].split("\n\n", 1)[1] if "\n\n" in parts[2] else ""
     try:
-        await context.bot.copy_message(
-            chat_id=target_user_id,
+        forwarded = await context.bot.copy_message(
+            chat_id=MAIN_CHANNEL_ID,
             from_chat_id=update.effective_chat.id,
             message_id=update.message.message_id,
             caption=orig_caption or None,
         )
-        logger.info(f"[RELAY_FILE] 已发送文件给用户 {target_user_id} (code={relay_code})")
+        await enqueue_send_task(
+            target_user_id=target_user_id,
+            channel_id=MAIN_CHANNEL_ID,
+            message_id=forwarded.message_id,
+            file_code=relay_code,
+        )
+        logger.info(f"[RELAY_FILE] 已入队 sender_bot: 用户 {target_user_id} (code={relay_code})")
     except Exception as e:
-        logger.error(f"[RELAY_FILE] 发送文件给用户 {target_user_id} 失败: {e}")
+        logger.error(f"[RELAY_FILE] 处理中继文件失败 (user={target_user_id}, code={relay_code}): {e}")
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
