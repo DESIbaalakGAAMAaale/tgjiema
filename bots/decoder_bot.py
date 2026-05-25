@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 import time
 from collections import defaultdict, deque
 
@@ -81,8 +82,99 @@ def _cleanup_media_groups():
         _external_media_groups.pop(k, None)
 
 
+_MEDIA_GROUP_BUFFER_WAIT = 3
+_media_group_buffer: dict[str, dict] = {}
+
+
+def _extract_media_info(msg):
+    if msg.photo:
+        return msg.photo[-1].file_id, "photo"
+    if msg.video:
+        return msg.video.file_id, "video"
+    if msg.audio:
+        return msg.audio.file_id, "audio"
+    if msg.voice:
+        return msg.voice.file_id, "voice"
+    if msg.animation:
+        return msg.animation.file_id, "animation"
+    if msg.document:
+        return msg.document.file_id, "document"
+    return None, "document"
+
+
+async def _flush_media_group_buffer(media_group_id: str):
+    await asyncio.sleep(_MEDIA_GROUP_BUFFER_WAIT)
+    entry = _media_group_buffer.pop(media_group_id, None)
+    if not entry:
+        return
+
+    bot = entry["bot"]
+    msgs = entry["msgs"]
+    user_id = entry["user_id"]
+    code = entry["code"]
+    source = entry.get("source", "external")
+
+    if not msgs:
+        return
+
+    channel_msg_ids = []
+    batch_file_meta = []
+
+    for chat_id, msg_id, orig_caption in msgs:
+        try:
+            copy_kwargs: dict = {
+                "chat_id": MAIN_CHANNEL_ID,
+                "from_chat_id": chat_id,
+                "message_id": msg_id,
+            }
+            if source == "relay" and orig_caption.startswith("RELAY_FILE:"):
+                clean_caption = orig_caption.split("\n\n", 1)[1] if "\n\n" in orig_caption else ""
+                copy_kwargs["caption"] = clean_caption or None
+
+            forwarded = await bot.copy_message(**copy_kwargs)
+            channel_msg_ids.append(forwarded.message_id)
+
+            fid, ftype = _extract_media_info(forwarded)
+            batch_file_meta.append({
+                "file_id": fid,
+                "type": ftype,
+            })
+
+            if code:
+                await _cache_external_file(None, code, forwarded.message_id)
+
+        except Exception as e:
+            logger.error(f"[_flush_media_group_buffer] copy消息失败 (mg_id={media_group_id}): {e}")
+
+    if not channel_msg_ids:
+        logger.warning(f"[_flush_media_group_buffer] 无有效消息 (mg_id={media_group_id})")
+        return
+
+    try:
+        await enqueue_batch_send_task(
+            target_user_id=user_id,
+            channel_id=MAIN_CHANNEL_ID,
+            channel_msg_ids=channel_msg_ids,
+            batch_file_meta=json.dumps(batch_file_meta),
+            file_code=code,
+        )
+        logger.info(
+            f"[_flush_media_group_buffer] 媒体组已入队: user={user_id}, code={code}, "
+            f"{len(channel_msg_ids)} 个文件"
+        )
+    except Exception as e:
+        logger.error(f"[_flush_media_group_buffer] 入队失败: {e}")
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="外部文件发送失败，请稍后重试或联系管理员。",
+            )
+        except Exception:
+            pass
+
+
 async def _cache_external_file(
-    context: ContextTypes.DEFAULT_TYPE, code: str, message_id: int
+    context, code: str, message_id: int
 ):
     try:
         files_col = get_file_records_col()
@@ -578,10 +670,6 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
         f"[handle_external_file_response] 收到外部机器人 @{bot_username} 的文件响应，转发给用户 {target_user_id}，码 {code}"
     )
 
-    media_group_id = update.message.media_group_id
-    if media_group_id:
-        _track_external_media_group(media_group_id, target_user_id, code)
-
     forwarded = None
     try:
         forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
@@ -611,36 +699,6 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
 
 
 async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    media_group_id = update.message.media_group_id
-    if media_group_id:
-        user_id, code = _get_external_media_group_user(media_group_id)
-        if user_id:
-            forwarded = None
-            try:
-                forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
-                await _cache_external_file(context, code, forwarded.message_id)
-            except Exception as e:
-                logger.error(f"[handle_external_media] 缓存外部媒体组文件到本地频道失败 (code={code}): {e}")
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text="外部文件转发失败，请稍后重试或联系管理员。",
-                    )
-                except Exception:
-                    pass
-                return
-            if forwarded:
-                try:
-                    await enqueue_send_task(
-                        target_user_id=user_id,
-                        channel_id=MAIN_CHANNEL_ID,
-                        message_id=forwarded.message_id,
-                        file_code=code,
-                    )
-                except Exception as e:
-                    logger.error(f"[handle_external_media] 入队发送失败 (code={code}): {e}")
-            return
-
     bot_username = _resolve_bot_username(update)
     if not bot_username:
         return
@@ -780,12 +838,52 @@ def run():
         if update.message is None:
             return
         try:
+            mg_id = update.message.media_group_id
+            if mg_id:
+                caption = (update.message.caption or "").strip()
+
+                if mg_id not in _media_group_buffer:
+                    user_id = None
+                    code = None
+                    source = None
+
+                    if caption.startswith("RELAY_FILE:"):
+                        source = "relay"
+                        parts = caption.split(":", 3)
+                        if len(parts) >= 3:
+                            try:
+                                user_id = int(parts[1])
+                            except ValueError:
+                                pass
+                            code = parts[2].split("\n")[0]
+                    else:
+                        source = "external"
+                        bot_username = _resolve_bot_username(update)
+                        if bot_username:
+                            user_id, code = _dequeue_external(bot_username)
+
+                    if not user_id or not code:
+                        logger.warning(f"[_route_media] 无法确定媒体组用户/码 (mg_id={mg_id})")
+                        return
+
+                    timer = asyncio.create_task(_flush_media_group_buffer(mg_id))
+                    _media_group_buffer[mg_id] = {
+                        "source": source,
+                        "bot": context.bot,
+                        "msgs": [],
+                        "user_id": user_id,
+                        "code": code,
+                        "timer": timer,
+                    }
+
+                _media_group_buffer[mg_id]["msgs"].append(
+                    (update.message.chat_id, update.message.message_id, caption)
+                )
+                return
+
             if await _handle_relay_file_media(update, context):
                 return
-            if update.message.media_group_id:
-                await handle_external_media(update, context)
-            else:
-                await handle_external_file_response(update, context)
+            await handle_external_file_response(update, context)
         except Exception as e:
             logger.error(f"[_route_media] 处理媒体消息异常: {e}")
 

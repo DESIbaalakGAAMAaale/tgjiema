@@ -27,7 +27,7 @@ def _build_input_media(meta: dict):
         return InputMediaPhoto(media=fid)
     elif mtype == "video":
         return InputMediaVideo(media=fid)
-    elif mtype == "audio":
+    elif mtype in ("audio", "voice"):
         return InputMediaAudio(media=fid)
     elif mtype == "animation":
         return InputMediaAnimation(media=fid)
