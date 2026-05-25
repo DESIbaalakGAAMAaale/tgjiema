@@ -241,11 +241,9 @@ class UserRelay:
                 self._pending_cleanup(bot_username)
 
     async def _process_single(self, msg, user_id: int, code: str):
-        """Extract file_id and relay directly — no download needed."""
-        file_id = self._extract_file_id(msg)
-
-        if not file_id:
-            logger.warning(f"[UserRelay] 无法提取 file_id，无法处理 (user={user_id}, code={code})")
+        """Relay MTProto media directly — no file_id conversion, no download."""
+        if not msg or not msg.media:
+            logger.warning(f"[UserRelay] 无媒体内容 (user={user_id}, code={code})")
             return
 
         orig_caption = getattr(msg, "message", None) or ""
@@ -258,20 +256,21 @@ class UserRelay:
         if self._decoder_bot_entity:
             try:
                 await self._client.send_file(
-                    self._decoder_bot_entity, file_id, **send_kwargs
+                    self._decoder_bot_entity, msg.media, **send_kwargs
                 )
                 logger.info(
-                    f"[UserRelay] 已 file_id 直发送到解码机器人 (user={user_id}, code={code})"
+                    f"[UserRelay] 已 MTProto 直发到解码机器人 (user={user_id}, code={code})"
                 )
             except Exception as e:
-                logger.error(f"[UserRelay] 发送 file_id 到解码机器人失败: {e}")
+                logger.error(f"[UserRelay] 发送到解码机器人失败: {e}")
 
         if code and self._storage_channel_entity:
             try:
                 storage_msg = await self._client.send_file(
-                    self._storage_channel_entity, file_id
+                    self._storage_channel_entity, msg.media
                 )
-                await self._cache_file_record(code, storage_msg.id, file_id=file_id)
+                cache_fid = self._extract_file_id(storage_msg)
+                await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
                 logger.info(
                     f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
                 )
