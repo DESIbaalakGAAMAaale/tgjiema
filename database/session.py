@@ -31,6 +31,7 @@ DDL_STATEMENTS = [
         backup_channel_msg_ids TEXT,
         batch_msg_ids TEXT,
         batch_file_meta TEXT,
+        file_ids TEXT,
         status TEXT DEFAULT 'active',
         request_count INTEGER DEFAULT 0,
         create_time TEXT,
@@ -87,6 +88,7 @@ DDL_STATEMENTS = [
 MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS batch_msg_ids TEXT",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS batch_file_meta TEXT",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS file_ids TEXT",
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS batch_file_meta TEXT",
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS status_msg_id BIGINT",
     "ALTER TABLE IF EXISTS send_queue ADD COLUMN IF NOT EXISTS task_type TEXT DEFAULT 'single'",
