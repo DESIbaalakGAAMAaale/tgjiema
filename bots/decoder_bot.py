@@ -168,47 +168,21 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         msg_ids = [record.get("primary_channel_msg_id")]
 
     if len(msg_ids) > 1:
-        try:
-            await context.bot.forward_messages(
-                chat_id=target_user_id,
-                from_chat_id=selected_channel,
-                message_ids=msg_ids,
-            )
-            logger.info(
-                f"[handle_relay_delivery] 媒体组 {len(msg_ids)} 条已批量转发给用户 {target_user_id}"
-            )
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
-            )
-            return
-        except Exception as fwd_err:
-            logger.warning(
-                f"[handle_relay_delivery] 批量转发 {len(msg_ids)} 条失败: {fwd_err}"
-            )
+        await enqueue_batch_send_task(
+            target_user_id=target_user_id,
+            channel_id=selected_channel,
+            channel_msg_ids=msg_ids,
+            batch_file_meta=record.get("batch_file_meta", ""),
+            file_code=code,
+            page=1,
+        )
     else:
-        try:
-            await context.bot.copy_message(
-                chat_id=target_user_id,
-                from_chat_id=selected_channel,
-                message_id=msg_ids[0],
-            )
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
-            )
-            return
-        except Exception as e:
-            logger.warning(f"[handle_relay_delivery] copy 消息 {msg_ids[0]} 失败: {e}")
-
-    await enqueue_batch_send_task(
-        target_user_id=target_user_id,
-        channel_id=selected_channel,
-        channel_msg_ids=msg_ids,
-        batch_file_meta=record.get("batch_file_meta", ""),
-        file_code=code,
-        page=1,
-    )
+        await enqueue_send_task(
+            target_user_id=target_user_id,
+            channel_id=selected_channel,
+            message_id=msg_ids[0],
+            file_code=code,
+        )
     await context.bot.send_message(
         chat_id=target_user_id,
         text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
@@ -486,60 +460,23 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch_file_meta_str = file_record.get("batch_file_meta") or ""
 
     try:
-        direct_ok = False
         if len(msg_ids) > 1:
-            try:
-                await context.bot.forward_messages(
-                    chat_id=user.id,
-                    from_chat_id=selected_channel,
-                    message_ids=msg_ids,
-                )
-                direct_ok = True
-                logger.info(
-                    f"[handle_code] 媒体组 {len(msg_ids)} 条已批量转发给用户 {user.id}"
-                )
-            except Exception as fwd_err:
-                logger.warning(
-                    f"[handle_code] 批量转发 {len(msg_ids)} 条失败 (user={user.id}): {fwd_err}"
-                )
+            await enqueue_batch_send_task(
+                target_user_id=user.id,
+                channel_id=selected_channel,
+                channel_msg_ids=msg_ids,
+                batch_file_meta=batch_file_meta_str,
+                file_code=text,
+                page=1,
+            )
         else:
-            try:
-                await context.bot.copy_message(
-                    chat_id=user.id,
-                    from_chat_id=selected_channel,
-                    message_id=msg_ids[0],
-                )
-                direct_ok = True
-            except Exception as copy_err:
-                logger.warning(
-                    f"[handle_code] copy 消息 {msg_ids[0]} 失败 (user={user.id}): {copy_err}"
-                )
-
-        if not direct_ok:
-            delivered = False
-            if user_relay.is_ready:
-                delivered = await user_relay.deliver_cached(user.id, text)
-                if delivered:
-                    logger.info(f"[handle_code] 已通过中继交付文件给用户 {user.id} (code={text})")
-                else:
-                    logger.warning(f"[handle_code] 中继交付失败，尝试队列发送 (user={user.id}, code={text})")
-            if not delivered:
-                if len(msg_ids) > 1:
-                    await enqueue_batch_send_task(
-                        target_user_id=user.id,
-                        channel_id=selected_channel,
-                        channel_msg_ids=msg_ids,
-                        batch_file_meta=batch_file_meta_str,
-                        file_code=text,
-                        page=1,
-                    )
-                else:
-                    await enqueue_send_task(
-                        target_user_id=user.id,
-                        channel_id=selected_channel,
-                        message_id=msg_ids[0],
-                        file_code=text,
-                    )
+            await enqueue_send_task(
+                target_user_id=user.id,
+                channel_id=selected_channel,
+                message_id=msg_ids[0],
+                file_code=text,
+            )
+        logger.info(f"[handle_code] 已入队发送任务 (user={user.id}, code={text}, channel={selected_channel})")
     except Exception as e:
         logger.error(f"[handle_code] 入队发送任务失败 (user={user.id}, code={text}): {e}")
         await update.message.reply_text("系统繁忙，文件发送请求失败，请稍后重试。")
