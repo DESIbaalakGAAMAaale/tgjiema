@@ -16,7 +16,7 @@ async def enqueue_send_task(
         "task_type": "single",
         "channel_msg_ids": "",
         "batch_file_meta": "",
-        "created_at": datetime.datetime.utcnow().isoformat(),
+        "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "processed": 0,
     })
 
@@ -38,7 +38,7 @@ async def enqueue_batch_send_task(
         "task_type": "batch",
         "channel_msg_ids": json.dumps(channel_msg_ids),
         "batch_file_meta": batch_file_meta,
-        "created_at": datetime.datetime.utcnow().isoformat(),
+        "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "processed": 0,
     })
 

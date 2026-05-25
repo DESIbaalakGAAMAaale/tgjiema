@@ -40,7 +40,11 @@ def _auth_required(func):
 def _format_datetime(dt) -> str:
     if dt is None:
         return "N/A"
-    if isinstance(dt, datetime.datetime):
+    if isinstance(dt, (datetime.datetime, float)):
+        if isinstance(dt, float):
+            if dt == 0:
+                return "N/A"
+            dt = datetime.datetime.fromtimestamp(dt, tz=datetime.UTC)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(dt, str):
         try:
@@ -72,7 +76,7 @@ async def _get_status_text() -> str:
     total_users = await users_col.count_documents({})
     total_files = await files_col.count_documents({})
     active_files = await files_col.count_documents({"status": "active"})
-    today = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     today_decodes = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
     relay_pending = await get_config("relay_auth_pending")
     relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
@@ -648,7 +652,7 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_doc = {
         "$set": {
             "membership_level": level,
-            "updated_at": datetime.datetime.utcnow().isoformat(),
+            "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
         }
     }
     if level == "free":
@@ -687,7 +691,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"is_banned": True, "updated_at": datetime.datetime.utcnow().isoformat()}},
+        {"$set": {"is_banned": True, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
     )
     await update.message.reply_text(f"✅ 用户 {user_id} 已封禁")
 
@@ -708,7 +712,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"is_banned": False, "updated_at": datetime.datetime.utcnow().isoformat()}},
+        {"$set": {"is_banned": False, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
     )
     await update.message.reply_text(f"✅ 用户 {user_id} 已解封")
 
@@ -730,7 +734,7 @@ async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.utcnow().isoformat()}},
+        {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
     )
     await update.message.reply_text(f"✅ 用户 {user_id} 每日解码配额已设为 {_quota_display(quota)}")
 
@@ -752,7 +756,7 @@ async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.utcnow().isoformat()}},
+        {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
     )
     await update.message.reply_text(f"✅ 用户 {user_id} 外部码配额已设为 {_quota_display(quota)}")
 
@@ -1115,7 +1119,8 @@ async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"API_ID：{api_id}\n"
         f"手机号：{phone[:3]}****{phone[-2:] if len(phone) > 5 else ''}\n\n"
         f"⚠️ 配置已保存到数据库，解码机器人下次重启时生效。\n"
-        f"⚠️ 请确保该账号未开启二步验证。"
+        f"⚠️ 请确保该账号未开启二步验证。\n"
+        f"🔐 建议在配置完成后立即删除本聊天记录中的密钥信息。"
     )
 
 
@@ -1321,7 +1326,11 @@ async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_config("r2_secret_key", args[2])
     if len(args) >= 4:
         await set_config("r2_bucket", args[3])
-    await update.message.reply_text("✅ R2 配置已保存\n⚠️ 需重启服务后生效")
+    await update.message.reply_text(
+        "✅ R2 配置已保存\n"
+        "⚠️ 需重启服务后生效\n"
+        "🔐 建议在配置完成后立即删除本聊天记录中的密钥信息。"
+    )
 
 
 @_auth_required

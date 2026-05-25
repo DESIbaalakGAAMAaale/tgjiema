@@ -20,9 +20,9 @@ def make_user(
     external_quota_date: str = None,
     is_banned: bool = False,
 ):
-    from datetime import datetime
+    from datetime import datetime, timezone
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.UTC)
     return {
         "user_id": user_id,
         "username": username,
@@ -53,9 +53,9 @@ def make_file_record(
     batch_msg_ids: str = "",
     batch_file_meta: str = "",
 ):
-    from datetime import datetime
+    from datetime import datetime, timezone
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.UTC)
     return {
         "file_code": file_code,
         "uploader_id": uploader_id,
@@ -78,12 +78,12 @@ def make_decode_log(
     status: str = "queued",
     source_channel_id: int = None,
 ):
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     return {
         "file_code": file_code,
         "requester_id": requester_id,
-        "request_time": datetime.utcnow(),
+        "request_time": datetime.now(timezone.UTC),
         "status": status,
         "source_channel_id": source_channel_id,
     }

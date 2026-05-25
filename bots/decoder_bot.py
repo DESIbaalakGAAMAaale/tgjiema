@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import time
 from collections import defaultdict, deque
 
 from telegram import Update
@@ -26,32 +27,58 @@ from services.user_relay import user_relay
 TOKEN = settings.DECODER_BOT_TOKEN
 MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
 
-_pending_external: dict[str, deque[tuple[int, str]]] = defaultdict(deque)
+_pending_external: dict[str, deque[tuple[int, str, float]]] = defaultdict(deque)
+_PENDING_TTL = 300
 
 
 def _enqueue_external(bot_username: str, user_id: int, code: str):
-    _pending_external[bot_username].append((user_id, code))
+    _pending_external[bot_username].append((user_id, code, time.time()))
 
 
 def _dequeue_external(bot_username: str) -> tuple[int, str]:
     q = _pending_external.get(bot_username)
-    if q:
-        return q.popleft()
+    while q:
+        entry = q.popleft()
+        if time.time() - entry[2] < _PENDING_TTL:
+            return entry[0], entry[1]
     return None, None
+
+
+def _cleanup_stale_pending():
+    now = time.time()
+    stale = []
+    for bot, q in _pending_external.items():
+        while q and now - q[0][2] >= _PENDING_TTL:
+            q.popleft()
+        if not q:
+            stale.append(bot)
+    for bot in stale:
+        del _pending_external[bot]
 
 
 user_relay.set_pending_cleanup(lambda bot_username: _dequeue_external(bot_username))
 
 
-_external_media_groups: dict[str, tuple[int, str]] = {}
+_external_media_groups: dict[str, tuple[int, str, float]] = {}
+_MEDIA_GROUP_TTL = 300
 
 
 def _track_external_media_group(media_group_id: str, user_id: int, code: str):
-    _external_media_groups[media_group_id] = (user_id, code)
+    _external_media_groups[media_group_id] = (user_id, code, time.time())
 
 
 def _get_external_media_group_user(media_group_id: str) -> tuple[int, str]:
-    return _external_media_groups.pop(media_group_id, (None, None))
+    entry = _external_media_groups.pop(media_group_id, None)
+    if entry and time.time() - entry[2] < _MEDIA_GROUP_TTL:
+        return entry[0], entry[1]
+    return None, None
+
+
+def _cleanup_media_groups():
+    now = time.time()
+    stale = [k for k, v in _external_media_groups.items() if now - v[2] >= _MEDIA_GROUP_TTL]
+    for k in stale:
+        _external_media_groups.pop(k, None)
 
 
 async def _cache_external_file(
@@ -251,7 +278,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     level_name = level_map.get(db_user.get("membership_level"), "未知")
 
-    today = datetime.datetime.utcnow().date()
+    today = datetime.datetime.now(datetime.UTC).date()
     quota_date_str = db_user.get("quota_date")
     quota_date = None
     if quota_date_str:
@@ -792,8 +819,15 @@ def run():
             metrics.ping_bot("decoder_bot")
             await asyncio.sleep(30)
 
+    async def cleanup_loop():
+        while True:
+            _cleanup_stale_pending()
+            _cleanup_media_groups()
+            await asyncio.sleep(60)
+
     loop.create_task(health_ping())
     loop.create_task(_process_pending_uploads(app))
+    loop.create_task(cleanup_loop())
     loop.create_task(user_relay.start())
     app.run_polling()
 

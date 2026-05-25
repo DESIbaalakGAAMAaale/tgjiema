@@ -139,7 +139,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "batch_msg_ids": batch_ids_str,
             "batch_file_meta": batch_file_meta_str,
             "status_msg_id": sent_msg.message_id,
-            "created_at": datetime.datetime.utcnow().isoformat(),
+            "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "processed": 0,
         })
         logger.info(f"批次文件写入pending_uploads: user={user.id}, types={file_types}")
@@ -315,7 +315,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             "batch_msg_ids": batch_ids_str,
             "batch_file_meta": batch_file_meta_str,
             "status_msg_id": sent_msg.message_id,
-            "created_at": datetime.datetime.utcnow().isoformat(),
+            "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "processed": 0,
         })
         logger.info(f"媒体组文件写入pending_uploads: user={user_id}, types={file_types}")
@@ -358,7 +358,7 @@ async def _process_upload(
             "batch_msg_ids": "",
             "batch_file_meta": "",
             "status_msg_id": sent_msg.message_id,
-            "created_at": datetime.datetime.utcnow().isoformat(),
+            "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "processed": 0,
         })
         logger.info(f"文件写入pending_uploads: user={user_id}, types={file_types}")

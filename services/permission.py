@@ -71,7 +71,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         if not bot_username:
             return DecodeResult(allowed=False, reason="无效的文件码格式，无法识别目标机器人。")
 
-    today = datetime.datetime.utcnow().date()
+    today = datetime.datetime.now(datetime.UTC).date()
 
     def _parse_date(val) -> Optional[datetime.date]:
         if val:
@@ -88,7 +88,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
 
     if quota_date is None or quota_date != today:
         reset_set["quota_used_today"] = 0
-        reset_set["quota_date"] = datetime.datetime.utcnow().isoformat()
+        reset_set["quota_date"] = datetime.datetime.now(datetime.UTC).isoformat()
         user["quota_used_today"] = 0
         user["quota_date"] = reset_set["quota_date"]
         if membership_level == "free":
@@ -103,7 +103,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
 
     if external_quota_date is None or external_quota_date != today:
         reset_set["external_used_today"] = 0
-        reset_set["external_quota_date"] = datetime.datetime.utcnow().isoformat()
+        reset_set["external_quota_date"] = datetime.datetime.now(datetime.UTC).isoformat()
         user["external_used_today"] = 0
         user["external_quota_date"] = reset_set["external_quota_date"]
         if membership_level == "free":

@@ -41,7 +41,7 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
     total_files = await files_col.count_documents({})
     active_files = await files_col.count_documents({"status": "active"})
 
-    today = datetime.datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     today_decodes = await logs_col.count_documents({"request_time": {"$gte": today}})
 
     bot_statuses = []
@@ -127,7 +127,7 @@ async def update_membership(
     update = {
         "$set": {
             "membership_level": level,
-            "updated_at": datetime.datetime.utcnow(),
+            "updated_at": datetime.datetime.now(datetime.UTC),
         }
     }
     if level == "free":
@@ -159,7 +159,7 @@ async def toggle_ban(user_id: int, admin=Depends(verify_admin)):
     new_ban = not user.get("is_banned", False)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.utcnow()}},
+        {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.now(datetime.UTC)}},
     )
     return RedirectResponse(url="/users", status_code=303)
 

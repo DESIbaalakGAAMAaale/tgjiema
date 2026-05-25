@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 
@@ -16,7 +16,7 @@ async def backup_all_tables() -> dict:
         for table in tables:
             records = await conn.fetch(f"SELECT * FROM {table}")
             results[table] = [dict(r) for r in records]
-    data = {"backup_time": datetime.utcnow().isoformat(), "tables": results}
+    data = {"backup_time": datetime.now(timezone.UTC).isoformat(), "tables": results}
     return data
 
 
@@ -45,7 +45,7 @@ async def run_db_backup():
 
     while True:
         try:
-            timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.now(timezone.UTC).strftime("%Y%m%d_%H%M%S")
             key = f"db_backup/db_backup_{timestamp}.json"
             data = await backup_all_tables()
             content = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")

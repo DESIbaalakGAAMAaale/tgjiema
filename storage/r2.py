@@ -41,7 +41,7 @@ class R2Storage:
               payload_hash: str = "UNSIGNED-PAYLOAD") -> dict:
         service = "s3"
         region = "auto"
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
 

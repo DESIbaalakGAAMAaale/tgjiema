@@ -3,6 +3,7 @@ import secrets
 import string
 
 from database import get_file_records_col
+from config import settings
 
 CODE_ALPHABET = string.ascii_lowercase + string.digits
 FILE_TYPE_LABELS = {"photo": "p", "video": "v", "document": "d", "audio": "a", "animation": "g"}
@@ -15,8 +16,6 @@ def _generate_random_part(length: int = 12) -> str:
 
 
 def build_file_code(file_types: dict) -> str:
-    from config import settings
-
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_random_part(12)
     type_parts = []
@@ -29,8 +28,6 @@ def build_file_code(file_types: dict) -> str:
 
 
 def is_valid_code_format(code: str) -> bool:
-    from config import settings
-
     if code.startswith(settings.FILE_CODE_PREFIX):
         return True
     return bool(_BOT_PATTERN.match(code))
