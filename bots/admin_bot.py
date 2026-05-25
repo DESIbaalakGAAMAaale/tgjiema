@@ -1357,7 +1357,7 @@ async def set_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 _FACTORY_RESET_TABLES = [
     "file_records", "decode_logs", "pending_uploads",
-    "send_queue", "users", "app_config", "backup_config",
+    "send_queue", "users", "backup_config",
 ]
 
 
@@ -1374,8 +1374,7 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 📤 pending_uploads（上传队列）\n"
             "• 📨 send_queue（发送队列）\n"
             "• 👤 users（用户数据）\n"
-            "• ⚙️ app_config（系统配置）\n"
-            "• 🤖 backup_config（备份配置）\n\n"
+            "• ⚙️ backup_config（系统配置与备份配置）\n\n"
             "频道中的消息不会被删除，但备份状态会重置，全量备份将被重新触发。\n\n"
             "🔴 如果您确认，请发送：\n"
             "/factory_reset confirm\n\n"
