@@ -117,6 +117,68 @@ async def _flush_media_group_buffer(media_group_id: str):
     if not msgs:
         return
 
+    if source == "relay":
+        await asyncio.sleep(2)
+        try:
+            files_col = get_file_records_col()
+            record = await files_col.find_one({"file_code": code})
+            if not record:
+                logger.warning(f"[_flush_media_group_buffer] 中继媒体组: DB无记录 (code={code})")
+                return
+
+            batch_ids_str = record.get("batch_msg_ids") or ""
+            msg_ids = []
+            if batch_ids_str:
+                msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
+            primary_mid = record.get("primary_channel_msg_id")
+            if not msg_ids and primary_mid:
+                msg_ids = [primary_mid]
+
+            if not msg_ids:
+                logger.warning(f"[_flush_media_group_buffer] 中继媒体组: 无消息ID (code={code})")
+                return
+
+            storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
+            file_ids_str = record.get("file_ids") or ""
+            batch_file_meta = []
+            if file_ids_str:
+                fid_list = [f for f in file_ids_str.split(",") if f.strip()]
+                for i, mid in enumerate(msg_ids):
+                    fid = fid_list[i] if i < len(fid_list) else ""
+                    batch_file_meta.append({"file_id": fid, "type": "document"})
+
+            if len(msg_ids) > 1 and batch_file_meta:
+                await enqueue_batch_send_task(
+                    target_user_id=user_id,
+                    channel_id=storage_channel,
+                    channel_msg_ids=msg_ids,
+                    batch_file_meta=json.dumps(batch_file_meta),
+                    file_code=code,
+                )
+            else:
+                for mid in msg_ids:
+                    await enqueue_send_task(
+                        target_user_id=user_id,
+                        channel_id=storage_channel,
+                        message_id=mid,
+                        file_code=code,
+                    )
+
+            logger.info(
+                f"[_flush_media_group_buffer] 中继媒体组已入队: user={user_id}, code={code}, "
+                f"{len(msg_ids)} 个文件"
+            )
+        except Exception as e:
+            logger.error(f"[_flush_media_group_buffer] 中继媒体组处理失败 (code={code}): {e}")
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text="外部文件发送失败，请稍后重试或联系管理员。",
+                )
+            except Exception:
+                pass
+        return
+
     channel_msg_ids = []
     batch_file_meta = []
 
@@ -127,9 +189,6 @@ async def _flush_media_group_buffer(media_group_id: str):
                 "from_chat_id": chat_id,
                 "message_id": msg_id,
             }
-            if source == "relay" and orig_caption.startswith("RELAY_FILE:"):
-                clean_caption = orig_caption.split("\n\n", 1)[1] if "\n\n" in orig_caption else ""
-                copy_kwargs["caption"] = clean_caption or None
 
             forwarded = await bot.copy_message(**copy_kwargs)
             channel_msg_ids.append(forwarded.message_id)
@@ -159,7 +218,7 @@ async def _flush_media_group_buffer(media_group_id: str):
             file_code=code,
         )
         logger.info(
-            f"[_flush_media_group_buffer] 媒体组已入队: user={user_id}, code={code}, "
+            f"[_flush_media_group_buffer] 外部媒体组已入队: user={user_id}, code={code}, "
             f"{len(channel_msg_ids)} 个文件"
         )
     except Exception as e:
@@ -745,38 +804,84 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         return False
     if update.effective_user.id != user_relay.relay_user_id:
         return False
-    parts = caption.split(":", 3)
-    if len(parts) < 3:
+
+    rest = caption[len("RELAY_FILE:"):]
+    user_end = rest.find(":")
+    if user_end == -1:
         return False
     try:
-        target_user_id = int(parts[1])
+        target_user_id = int(rest[:user_end])
     except ValueError:
-        logger.warning(f"[RELAY_FILE] 无效的 user_id: {parts[1]}")
+        logger.warning(f"[RELAY_FILE] 无效的 user_id: {rest[:user_end]}")
         return False
-    relay_code = parts[2].split("\n")[0]
-    if not target_user_id:
+    after_user = rest[user_end + 1:]
+    code_part = after_user.split("\n\n", 1)[0].strip()
+    orig_caption = after_user.split("\n\n", 1)[1] if "\n\n" in after_user else ""
+
+    if not target_user_id or not code_part:
         return False
-    orig_caption = parts[2].split("\n\n", 1)[1] if "\n\n" in parts[2] else ""
+
     try:
-        forwarded = await context.bot.copy_message(
-            chat_id=MAIN_CHANNEL_ID,
-            from_chat_id=update.effective_chat.id,
-            message_id=update.message.message_id,
-            caption=orig_caption or None,
-        )
-        await enqueue_send_task(
-            target_user_id=target_user_id,
-            channel_id=MAIN_CHANNEL_ID,
-            message_id=forwarded.message_id,
-            file_code=relay_code,
-        )
-        logger.info(f"[RELAY_FILE] 已入队 sender_bot: 用户 {target_user_id} (code={relay_code})")
+        files_col = get_file_records_col()
+        record = await files_col.find_one({"file_code": code_part})
+        if not record:
+            logger.warning(f"[RELAY_FILE] 数据库中未找到文件记录: {code_part}")
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"您请求的文件码 {code_part} 发送失败，请稍后重试或联系管理员。",
+                )
+            except Exception:
+                pass
+            return True
+
+        batch_ids_str = record.get("batch_msg_ids") or ""
+        msg_ids = []
+        if batch_ids_str:
+            msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
+        primary_mid = record.get("primary_channel_msg_id")
+        if not msg_ids and primary_mid:
+            msg_ids = [primary_mid]
+
+        if not msg_ids:
+            logger.warning(f"[RELAY_FILE] 文件记录无消息ID: {code_part}")
+            return True
+
+        storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
+
+        file_ids_str = record.get("file_ids") or ""
+        batch_file_meta = []
+        if file_ids_str:
+            fid_list = [f for f in file_ids_str.split(",") if f.strip()]
+            msg_count = len(msg_ids)
+            for i in range(msg_count):
+                fid = fid_list[i] if i < len(fid_list) else ""
+                batch_file_meta.append({"file_id": fid, "type": "document"})
+
+        if len(msg_ids) > 1 and batch_file_meta:
+            await enqueue_batch_send_task(
+                target_user_id=target_user_id,
+                channel_id=storage_channel,
+                channel_msg_ids=msg_ids,
+                batch_file_meta=json.dumps(batch_file_meta),
+                file_code=code_part,
+            )
+        else:
+            for mid in msg_ids:
+                await enqueue_send_task(
+                    target_user_id=target_user_id,
+                    channel_id=storage_channel,
+                    message_id=mid,
+                    file_code=code_part,
+                )
+
+        logger.info(f"[RELAY_FILE] 已入队 sender_bot: 用户 {target_user_id} (code={code_part})")
     except Exception as e:
-        logger.error(f"[RELAY_FILE] 处理中继文件失败 (user={target_user_id}, code={relay_code}): {e}")
+        logger.error(f"[RELAY_FILE] 处理中继文件失败 (user={target_user_id}, code={code_part}): {e}")
         try:
             await context.bot.send_message(
                 chat_id=target_user_id,
-                text=f"您请求的文件码 {relay_code} 发送失败，请稍后重试或联系管理员。",
+                text=f"您请求的文件码 {code_part} 发送失败，请稍后重试或联系管理员。",
             )
         except Exception:
             pass
