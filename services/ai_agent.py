@@ -164,10 +164,10 @@ class AIAgent:
         ctx = self._build_context(exchange_data)
         logger.info(f"[AI Agent] 发送决策请求, context length={len(ctx)}")
 
-        max_retries = 3
+        max_retries = 2
         for attempt in range(max_retries):
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
                     resp = await client.post(
                         f"{self._api_base}/chat/completions",
                         headers={
@@ -186,13 +186,8 @@ class AIAgent:
                     )
 
                     if resp.status_code == 429:
-                        retry_after = 5 * (2 ** attempt)
-                        logger.warning(
-                            f"[AI Agent] 429 限流，第{attempt+1}/{max_retries}次重试，"
-                            f"等待 {retry_after}s"
-                        )
-                        await asyncio.sleep(retry_after)
-                        continue
+                        logger.warning("[AI Agent] 429 限流，直接回退到内置决策")
+                        return self._fallback_decision(exchange_data)
 
                     if resp.status_code >= 400:
                         body = resp.text[:500]
@@ -227,12 +222,11 @@ class AIAgent:
                 raise
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait = 3 * (2 ** attempt)
                     logger.warning(
                         f"[AI Agent] 调用失败 ({type(e).__name__})，"
-                        f"第{attempt+1}/{max_retries}次重试，等待 {wait}s"
+                        f"第{attempt+1}/{max_retries}次重试"
                     )
-                    await asyncio.sleep(wait)
+                    await asyncio.sleep(3)
                 else:
                     logger.error(f"[AI Agent] 调用失败，回退到默认行为: {type(e).__name__}: {e}")
                     return self._fallback_decision(exchange_data)

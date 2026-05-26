@@ -1025,7 +1025,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = update.message.text or ""
 
-        if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:")):
+        if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
             await handle_relay_delivery(update, context)
             return
 
