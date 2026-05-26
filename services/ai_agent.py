@@ -7,50 +7,18 @@ from loguru import logger
 
 from config import settings
 
-_SYSTEM_PROMPT = """你是一个 Telegram 机器人交互分析器。你的任务是分析外部 Telegram 机器人对文件码请求的回复，然后给出明确的下一步操作指令。
+_SYSTEM_PROMPT = """分析 Telegram 机器人回复，判断下一步操作。返回 JSON:
+{"action":"click_button|wait|finish|error","target_button_row":int|null,"target_button_col":int|null,"target_button_text":"str|null","reason":"str","wait_seconds":int|null}
 
-## 背景
-用户通过我们的系统向第三方 Telegram 机器人发送了一个文件码。现在第三方机器人回复了一些消息，你需要分析这些回复并决定下一步该做什么。
+规则:
+- 翻页按钮: "next"/"下一页"/">>"/"▶"/"→"等方向性按钮, 或无文字按钮靠右侧位置推断
+- 数字页码"1 2 3 4": 点击下一个数字
+- 纯图标无文字按钮: 最右侧通常是下一页
+- 第N/N页或翻页按钮消失: finish
+- 错误消息"未找到"/"已过期": error
+- 消息未收齐: wait
 
-## 你的能力
-1. 检测是否有翻页按钮（内联键盘）。翻页按钮可能以各种形式出现：纯文字、emoji、纯图标（无文字）。你需要根据按钮位置和上下文推断其含义。
-2. 判断媒体组是否完整，是否需要等待更多消息。
-3. 判断当前状态：是否所有文件已返回、是否有错误提示需要处理。
-
-## 输出格式
-你必须严格返回以下 JSON 格式，不要包含任何其他内容：
-
-```json
-{
-  "action": "click_button | wait | finish | error",
-  "target_button_row": 数字或null,
-  "target_button_col": 数字或null,
-  "target_button_text": "按钮文字或null",
-  "reason": "你的判断理由，简短说明",
-  "wait_seconds": 数字或null
-}
-```
-
-## action 含义
-- **click_button**: 发现了翻页按钮，需要点击它来获取更多内容
-- **wait**: 没有更多操作，但可能还有消息在路上，建议等待
-- **finish**: 所有文件已接收完毕，可以结束本次交互
-- **error**: 对方返回了错误消息，无法获取文件
-
-## 判断规则
-- 如果键盘有">>"、"next"、"下一页"、"下一頁"、向右箭头、▶ 等方向性按钮，那是翻页按钮
-- 如果按钮没有文字（纯图标），根据它在键盘中的位置判断：通常右侧/最后的按钮是"下一页"，左侧的是"上一页"
-- 如果当前页的媒体组已经完整发送，且还有下一页按钮，点击按钮获取下一页
-- 如果消息包含"没有找到"、"文件不存在"、"已过期"、"not found" 等错误信息，返回 error
-- 如果所有页面已获取完毕（翻页按钮消失），返回 finish
-- 如果消息刚到达不久（还有更多媒体组在路上），返回 wait
-
-## 按钮数据结构
-按钮以 `row:col:data:text` 格式描述，例如：
-- `0:0::下一页 ▶` — 第0行第0列，无callback_data，文字"下一页 ▶"
-- `0:2::` — 第0行第2列，无文字（纯图标按钮）
-- `1:0:SOMEDATA:确认` — 第1行第0列，callback_data为"SOMEDATA"，文字"确认"
-"""
+按钮格式: row:col:data:text"""
 
 
 def _parse_json_from_response(text: str) -> dict:
@@ -236,25 +204,82 @@ class AIAgent:
     def _fallback_decision(self, exchange_data: dict) -> dict:
         msg_events = exchange_data.get("events", [])
         if not msg_events:
-            return {"action": "finish", "target_button_row": None, "target_button_col": None, "target_button_text": None, "reason": "无消息，直接结束", "wait_seconds": None}
+            return {"action": "finish", "target_button_row": None, "target_button_col": None, "target_button_text": None, "reason": "回退: 无消息", "wait_seconds": None}
+
+        _NEXT_KW = ("next", "下一页", "下一頁", "\u2192", "\u25b6", "\u27a1", ">>", "\u00bb")
 
         for ev in msg_events:
             msg = ev.message
-            if msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows:
-                for row_idx, row in enumerate(msg.reply_markup.rows):
-                    for col_idx, btn in enumerate(row.buttons):
-                        text = (getattr(btn, "text", None) or "").lower().strip()
-                        if any(kw in text for kw in ("next", "下一页", "下一頁", "\u2192", "\u25b6", "\u27a1")):
+            if not (msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows):
+                continue
+
+            rows = msg.reply_markup.rows
+
+            # Phase 1: text-based "next" detection
+            for row_idx, row in enumerate(rows):
+                for col_idx, btn in enumerate(row.buttons):
+                    text = (getattr(btn, "text", None) or "").lower().strip()
+                    if any(kw in text for kw in _NEXT_KW):
+                        return {
+                            "action": "click_button",
+                            "target_button_row": row_idx,
+                            "target_button_col": col_idx,
+                            "target_button_text": getattr(btn, "text", None) or "",
+                            "reason": "回退: 检测到下一页按钮",
+                            "wait_seconds": None,
+                        }
+
+            # Phase 2: number pagination
+            for row_idx, row in enumerate(rows):
+                btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
+                digits = [t for t in btn_texts if t.isdigit()]
+                if len(digits) >= 3:
+                    # All-digit row: "1 2 3 4 5" → click "2"
+                    sorted_digits = sorted(digits, key=int)
+                    if "2" in btn_texts:
+                        col_idx = btn_texts.index("2")
+                        return {
+                            "action": "click_button",
+                            "target_button_row": row_idx,
+                            "target_button_col": col_idx,
+                            "target_button_text": "2",
+                            "reason": "回退: 数字页码，点击第2页",
+                            "wait_seconds": None,
+                        }
+                    # Click the second smallest
+                    if len(sorted_digits) >= 2:
+                        second = sorted_digits[1]
+                        if second in btn_texts:
+                            col_idx = btn_texts.index(second)
                             return {
                                 "action": "click_button",
                                 "target_button_row": row_idx,
                                 "target_button_col": col_idx,
-                                "target_button_text": getattr(btn, "text", None) or "",
-                                "reason": "回退模式: 检测到下一页按钮",
+                                "target_button_text": second,
+                                "reason": f"回退: 数字页码，点击第{second}页",
                                 "wait_seconds": None,
                             }
 
-        return {"action": "finish", "target_button_row": None, "target_button_col": None, "target_button_text": None, "reason": "回退模式: 无翻页按钮", "wait_seconds": None}
+            # Phase 3: icon-only — click rightmost button with callback_data
+            for row_idx in range(len(rows) - 1, -1, -1):
+                row = rows[row_idx]
+                if not row.buttons:
+                    continue
+                btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
+                all_empty = all(not t for t in btn_texts)
+                if all_empty:
+                    last_btn = row.buttons[-1]
+                    if getattr(last_btn, "data", None):
+                        return {
+                            "action": "click_button",
+                            "target_button_row": row_idx,
+                            "target_button_col": len(row.buttons) - 1,
+                            "target_button_text": "",
+                            "reason": "回退: 纯图标，点击最右侧按钮",
+                            "wait_seconds": None,
+                        }
+
+        return {"action": "finish", "target_button_row": None, "target_button_col": None, "target_button_text": None, "reason": "回退: 无翻页按钮", "wait_seconds": None}
 
 
 ai_agent = AIAgent()
