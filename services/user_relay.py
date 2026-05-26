@@ -9,6 +9,11 @@ from telethon.tl.types import (DocumentAttributeVideo, PeerChannel)
 from telethon.utils import pack_bot_file_id
 
 from config import settings
+from services.ai_agent import ai_agent
+
+
+_SETTLE_WAIT = 2.5
+_MAX_AI_LOOP = 10
 
 
 class UserRelay:
@@ -197,11 +202,11 @@ class UserRelay:
         except Exception:
             self._storage_channel_entity = None
 
+        ai_agent.configure()
         self._register_handlers()
         self._ready.set()
         await self._report_status("online")
-        logger.info(f"[UserRelay] 中继已就绪")
-
+        logger.info(f"[UserRelay] 中继已就绪 (AI决策: {'启用' if ai_agent.enabled else '未启用'})")
 
     async def _cache_file_record(self, code: str, message_id: int, file_id: str = ""):
         try:
@@ -260,7 +265,9 @@ class UserRelay:
             now_ts = asyncio.get_event_loop().time()
             expired = [k for k, v in list(self._bot_exchange.items()) if v.get("_expires", 0) < now_ts]
             for k in expired:
-                self._bot_exchange.pop(k, None)
+                old = self._bot_exchange.pop(k, None)
+                if old and old.get("_settle_task") and not old["_settle_task"].done():
+                    old["_settle_task"].cancel()
 
             sender = await event.get_sender()
             if not sender or not hasattr(sender, "bot") or not sender.bot:
@@ -274,9 +281,10 @@ class UserRelay:
             if not exchange:
                 return
 
-            user_id = exchange["user_id"]
-            code = exchange.get("code", "")
-            exchange["_expires"] = now_ts + 60
+            exchange["_expires"] = now_ts + 120
+
+            if event.message.reply_markup:
+                exchange["_keyboard_msg"] = event.message
 
             media_group_id = getattr(event.message, "media_group_id", None)
             if media_group_id:
@@ -291,8 +299,6 @@ class UserRelay:
 
                 self._media_buffers[media_group_id] = {
                     "events": [event],
-                    "user_id": user_id,
-                    "code": code,
                     "bot_username": bot_username,
                     "_expires": now_ts + 5,
                 }
@@ -300,15 +306,22 @@ class UserRelay:
                     f"[UserRelay] 媒体组 {media_group_id} 开始收集"
                 )
                 asyncio.create_task(
-                    self._flush_media_group(media_group_id, user_id, code, bot_username)
+                    self._flush_media_group_buffer(media_group_id, bot_username)
                 )
                 return
 
-            await self._process_single(event.message, user_id, code)
-            if self._pending_cleanup:
-                self._pending_cleanup(bot_username)
+            exchange.setdefault("events", []).append(event)
+            self._restart_settle(exchange, bot_username)
 
-    async def _flush_media_group(self, media_group_id: str, user_id: int, code: str, bot_username: str):
+    def _restart_settle(self, exchange: dict, bot_username: str):
+        old = exchange.get("_settle_task")
+        if old and not old.done():
+            old.cancel()
+        exchange["_settle_task"] = asyncio.create_task(
+            self._ai_message_loop(bot_username)
+        )
+
+    async def _flush_media_group_buffer(self, media_group_id: str, bot_username: str):
         await asyncio.sleep(3)
 
         now_ts = asyncio.get_event_loop().time()
@@ -317,7 +330,7 @@ class UserRelay:
             if not buf:
                 return
             if buf["_expires"] > now_ts:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 now_ts = asyncio.get_event_loop().time()
                 continue
             break
@@ -326,16 +339,164 @@ class UserRelay:
         if not buf:
             return
 
-        events = buf["events"]
+        exchange = self._bot_exchange.get(bot_username)
+        if not exchange:
+            logger.warning(f"[UserRelay] 媒体组 {media_group_id} 无对应 exchange")
+            return
+
+        events_list = buf["events"]
         logger.info(
-            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events)} 条，开始下载"
+            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events_list)} 条，已收集到队列"
         )
+
+        exchange.setdefault("events", []).extend(events_list)
+        self._restart_settle(exchange, bot_username)
+
+    async def _ai_message_loop(self, bot_username: str):
+        await asyncio.sleep(_SETTLE_WAIT)
+
+        exchange = self._bot_exchange.get(bot_username)
+        if not exchange:
+            return
+
+        if exchange.get("_ai_running"):
+            return
+
+        exchange["_ai_running"] = True
+
+        loop_count = 0
+        try:
+            while loop_count < _MAX_AI_LOOP:
+                loop_count += 1
+
+                if bot_username not in self._bot_exchange:
+                    logger.warning(f"[UserRelay] AI循环: exchange 已被清理 (bot={bot_username})")
+                    break
+
+                exchange = self._bot_exchange[bot_username]
+                exchange["_expires"] = asyncio.get_event_loop().time() + 120
+
+                decision = await ai_agent.decide({
+                    "bot_username": bot_username,
+                    "events": exchange.get("events", []),
+                })
+
+                action = decision.get("action", "finish")
+                reason = decision.get("reason", "")
+                logger.info(
+                    f"[UserRelay] AI决策 #{loop_count}: action={action}, reason={reason}"
+                )
+
+                if action == "finish":
+                    await self._process_all_collected(bot_username)
+                    break
+                elif action == "error":
+                    exchange = self._bot_exchange.get(bot_username)
+                    if exchange:
+                        user_id = exchange.get("user_id", 0)
+                        code = exchange.get("code", "")
+                        try:
+                            await self._client.send_message(
+                                self._decoder_bot_entity,
+                                f"RELAY_ERROR:{user_id}:{code}:{reason}",
+                            )
+                        except Exception as e:
+                            logger.error(f"[UserRelay] 发送错误通知失败: {e}")
+                    await self._cleanup_exchange(bot_username)
+                    break
+                elif action == "wait":
+                    wait_s = decision.get("wait_seconds", 5)
+                    if not isinstance(wait_s, (int, float)) or wait_s <= 0:
+                        wait_s = 5
+                    logger.info(f"[UserRelay] AI要求等待 {wait_s}s")
+                    await asyncio.sleep(wait_s)
+                    continue
+                elif action == "click_button":
+                    row = decision.get("target_button_row")
+                    col = decision.get("target_button_col")
+                    if row is None or col is None:
+                        logger.warning("[UserRelay] AI要求点击按钮但未指定 row/col")
+                        continue
+
+                    clicked = await self._click_button(bot_username, row, col)
+                    if not clicked:
+                        await self._cleanup_exchange(bot_username)
+                        break
+
+                    await asyncio.sleep(4)
+                    continue
+                else:
+                    logger.warning(f"[UserRelay] AI返回未知 action: {action}")
+                    await self._process_all_collected(bot_username)
+                    break
+
+        except asyncio.CancelledError:
+            logger.debug(f"[UserRelay] AI循环被取消 (bot={bot_username})")
+        except Exception as e:
+            logger.error(f"[UserRelay] AI循环异常 (bot={bot_username}): {e}")
+            await self._process_all_collected(bot_username)
+        finally:
+            if bot_username in self._bot_exchange:
+                self._bot_exchange[bot_username]["_ai_running"] = False
+
+    async def _click_button(self, bot_username: str, row: int, col: int) -> bool:
+        exchange = self._bot_exchange.get(bot_username)
+        if not exchange:
+            return False
+
+        keyboard_msg = exchange.get("_keyboard_msg")
+        if not keyboard_msg or not keyboard_msg.reply_markup:
+            logger.warning(f"[UserRelay] 无可用键盘消息 (bot={bot_username})")
+            return False
+
+        reply_markup = keyboard_msg.reply_markup
+        if not hasattr(reply_markup, "rows"):
+            return False
+
+        try:
+            target_row = reply_markup.rows[row]
+            target_btn = target_row.buttons[col]
+        except (IndexError, AttributeError):
+            logger.warning(f"[UserRelay] 按钮位置无效: row={row}, col={col}")
+            return False
+
+        exchange.pop("_keyboard_msg", None)
+        try:
+            await keyboard_msg.click(data=target_btn.data)
+            btn_text = getattr(target_btn, "text", "") or "(无文字/图标按钮)"
+            logger.info(f"[UserRelay] 已点击按钮 [{row},{col}] {btn_text}")
+            return True
+        except Exception as e:
+            logger.error(f"[UserRelay] 点击按钮失败 [{row},{col}]: {e}")
+            return False
+
+    async def _process_all_collected(self, bot_username: str):
+        exchange = self._bot_exchange.pop(bot_username, None)
+        if not exchange:
+            return
+
+        user_id = exchange.get("user_id")
+        code = exchange.get("code")
+        all_events = exchange.get("events", [])
+
+        logger.info(
+            f"[UserRelay] 处理全部已收集文件: user={user_id}, code={code}, "
+            f"events={len(all_events)}"
+        )
+
+        if not all_events:
+            if self._pending_cleanup:
+                self._pending_cleanup(bot_username)
+            return
+
+        all_storage_msg_ids = []
+        all_storage_file_ids = []
 
         with tempfile.TemporaryDirectory() as tmpdir:
             file_paths = []
             captions = []
             all_type_kwargs = []
-            for ev in events:
+            for ev in all_events:
                 msg = ev.message
                 fp = await self._client.download_media(msg, file=tmpdir)
                 if fp:
@@ -345,20 +506,10 @@ class UserRelay:
                     all_type_kwargs.append(self._build_send_kwargs(msg, ""))
 
             if not file_paths:
-                logger.warning(f"[UserRelay] 媒体组 {media_group_id} 无有效文件")
+                logger.warning(f"[UserRelay] 无有效文件 (code={code})")
+                if self._pending_cleanup:
+                    self._pending_cleanup(bot_username)
                 return
-
-            if self._decoder_bot_entity:
-                try:
-                    await self._client.send_file(
-                        self._decoder_bot_entity, file_paths,
-                        caption=captions,
-                    )
-                    logger.info(
-                        f"[UserRelay] 媒体组 {len(file_paths)} 条已发送到解码机器人"
-                    )
-                except Exception as e:
-                    logger.error(f"[UserRelay] 媒体组发送到解码机器人失败: {e}")
 
             if code and self._storage_channel_entity:
                 for idx, fp in enumerate(file_paths):
@@ -369,54 +520,42 @@ class UserRelay:
                         )
                         cache_fid = self._extract_file_id(storage_msg)
                         await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
+                        all_storage_msg_ids.append(str(storage_msg.id))
+                        all_storage_file_ids.append(cache_fid or "")
                     except Exception as e:
-                        logger.error(f"[UserRelay] 媒体组第 {idx+1} 条缓存失败: {e}")
+                        logger.error(f"[UserRelay] 第 {idx+1} 条缓存失败: {e}")
                 logger.info(
-                    f"[UserRelay] 媒体组 {len(file_paths)} 条已缓存到存储频道"
+                    f"[UserRelay] {len(file_paths)} 条已缓存到存储频道 (code={code})"
                 )
 
-        if self._pending_cleanup:
-            self._pending_cleanup(bot_username)
-
-    async def _process_single(self, msg, user_id: int, code: str):
-        if not msg or not msg.media:
-            logger.warning(f"[UserRelay] 无媒体内容 (user={user_id}, code={code})")
-            return
-
-        orig_caption = getattr(msg, "message", None) or ""
-        relay_caption = f"RELAY_FILE:{user_id}:{code}\n\n{orig_caption}"
-        send_kwargs = self._build_send_kwargs(msg, relay_caption)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            file_path = await self._client.download_media(msg, file=tmpdir)
-            if not file_path:
-                logger.warning(f"[UserRelay] 下载媒体失败 (user={user_id}, code={code})")
-                return
+            if all_storage_msg_ids:
+                storage_ids_str = ",".join(all_storage_msg_ids)
+                for i in range(len(captions)):
+                    header = f"RELAY_FILE:{user_id}:{code}\nSTORAGE_IDS:{storage_ids_str}"
+                    orig_part = captions[i].split("\n\n", 1)[1] if "\n\n" in captions[i] else ""
+                    captions[i] = f"{header}\n\n{orig_part}"
 
             if self._decoder_bot_entity:
                 try:
                     await self._client.send_file(
-                        self._decoder_bot_entity, file_path, **send_kwargs
+                        self._decoder_bot_entity, file_paths,
+                        caption=captions,
                     )
                     logger.info(
-                        f"[UserRelay] 已发送到解码机器人 (user={user_id}, code={code})"
+                        f"[UserRelay] {len(file_paths)} 条已批量发送到解码机器人 (code={code})"
                     )
                 except Exception as e:
-                    logger.error(f"[UserRelay] 发送到解码机器人失败: {e}")
+                    logger.error(f"[UserRelay] 发送到解码机器人失败 (code={code}): {e}")
 
-            if code and self._storage_channel_entity:
-                try:
-                    storage_send_kwargs = self._build_send_kwargs(msg, "")
-                    storage_msg = await self._client.send_file(
-                        self._storage_channel_entity, file_path, **storage_send_kwargs
-                    )
-                    cache_fid = self._extract_file_id(storage_msg)
-                    await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
-                    logger.info(
-                        f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
-                    )
-                except Exception as e:
-                    logger.error(f"[UserRelay] 缓存到存储频道失败: {e}")
+        if self._pending_cleanup:
+            self._pending_cleanup(bot_username)
+
+    async def _cleanup_exchange(self, bot_username: str):
+        exchange = self._bot_exchange.pop(bot_username, None)
+        if exchange and exchange.get("_settle_task") and not exchange["_settle_task"].done():
+            exchange["_settle_task"].cancel()
+        if self._pending_cleanup:
+            self._pending_cleanup(bot_username)
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:
@@ -425,11 +564,17 @@ class UserRelay:
         try:
             entity = await self._client.get_entity(bot_username)
             await self._client.send_message(entity, code)
+            now = asyncio.get_event_loop().time()
             self._bot_exchange[bot_username] = {
-                "user_id": user_id, "code": code,
-                "_expires": asyncio.get_event_loop().time() + 120,
+                "user_id": user_id,
+                "code": code,
+                "events": [],
+                "_expires": now + 120,
+                "_settle_task": None,
+                "_ai_running": False,
+                "_keyboard_msg": None,
             }
-            logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，等待响应 (user={user_id}, code={code})")
+            logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，AI驱动等待响应 (user={user_id}, code={code})")
             return True
         except Exception as e:
             logger.error(f"[UserRelay] 向 @{bot_username} 发送失败: {e}")

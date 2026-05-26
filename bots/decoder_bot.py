@@ -86,6 +86,15 @@ _MEDIA_GROUP_BUFFER_WAIT = 3
 _media_group_buffer: dict[str, dict] = {}
 
 
+def _parse_storage_ids_from_caption(caption: str) -> list[int]:
+    header = caption.split("\n\n", 1)[0] if caption else ""
+    for line in header.split("\n"):
+        if line.startswith("STORAGE_IDS:"):
+            ids_str = line[len("STORAGE_IDS:"):]
+            return [int(x) for x in ids_str.split(",") if x.strip().isdigit()]
+    return []
+
+
 def _extract_media_info(msg):
     if msg.photo:
         return msg.photo[-1].file_id, "photo"
@@ -120,56 +129,67 @@ async def _flush_media_group_buffer(media_group_id: str):
     if source == "relay":
         await asyncio.sleep(2)
         try:
+            storage_ids = set()
+            for _, _, cap in msgs:
+                ids = _parse_storage_ids_from_caption(cap)
+                storage_ids.update(ids)
+            storage_ids = sorted(storage_ids)
+
+            if not storage_ids:
+                logger.warning(f"[_flush_media_group_buffer] 中继媒体组: 无STORAGE_IDS (code={code})")
+                return
+
             files_col = get_file_records_col()
             record = await files_col.find_one({"file_code": code})
             if not record:
                 logger.warning(f"[_flush_media_group_buffer] 中继媒体组: DB无记录 (code={code})")
                 return
 
-            batch_ids_str = record.get("batch_msg_ids") or ""
-            msg_ids = []
-            primary_mid = record.get("primary_channel_msg_id")
-            if primary_mid:
-                msg_ids.append(primary_mid)
-            if batch_ids_str:
-                for mid in batch_ids_str.split(","):
-                    mid_str = mid.strip()
-                    if mid_str.isdigit() and int(mid_str) not in msg_ids:
-                        msg_ids.append(int(mid_str))
-
-            if not msg_ids:
-                logger.warning(f"[_flush_media_group_buffer] 中继媒体组: 无消息ID (code={code})")
-                return
-
             storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
             file_ids_str = record.get("file_ids") or ""
-            batch_file_meta = []
-            if file_ids_str:
-                fid_list = [f for f in file_ids_str.split(",") if f.strip()]
-                for i, mid in enumerate(msg_ids):
-                    fid = fid_list[i] if i < len(fid_list) else ""
-                    batch_file_meta.append({"file_id": fid, "type": "document"})
+            all_file_ids = [f for f in file_ids_str.split(",") if f.strip()] if file_ids_str else []
 
-            if len(msg_ids) > 1 and batch_file_meta:
+            batch_all_ids = record.get("batch_msg_ids") or ""
+            all_msg_ids = []
+            primary_mid = record.get("primary_channel_msg_id")
+            if primary_mid:
+                all_msg_ids.append(str(primary_mid))
+            if batch_all_ids:
+                for mid in batch_all_ids.split(","):
+                    m = mid.strip()
+                    if m and m not in all_msg_ids:
+                        all_msg_ids.append(m)
+
+            msg_id_to_file_id = {}
+            for i, mid_str in enumerate(all_msg_ids):
+                msg_id_to_file_id[mid_str] = all_file_ids[i] if i < len(all_file_ids) else ""
+
+            batch_file_meta = []
+            for sid in storage_ids:
+                sid_str = str(sid)
+                fid = msg_id_to_file_id.get(sid_str, "")
+                batch_file_meta.append({"file_id": fid, "type": "document"})
+
+            if len(storage_ids) > 1 and any(m.get("file_id") for m in batch_file_meta):
                 await enqueue_batch_send_task(
                     target_user_id=user_id,
                     channel_id=storage_channel,
-                    channel_msg_ids=msg_ids,
+                    channel_msg_ids=list(storage_ids),
                     batch_file_meta=json.dumps(batch_file_meta),
                     file_code=code,
                 )
             else:
-                for mid in msg_ids:
+                for sid in storage_ids:
                     await enqueue_send_task(
                         target_user_id=user_id,
                         channel_id=storage_channel,
-                        message_id=mid,
+                        message_id=sid,
                         file_code=code,
                     )
 
             logger.info(
                 f"[_flush_media_group_buffer] 中继媒体组已入队: user={user_id}, code={code}, "
-                f"{len(msg_ids)} 个文件"
+                f"{len(storage_ids)} 个文件"
             )
         except Exception as e:
             logger.error(f"[_flush_media_group_buffer] 中继媒体组处理失败 (code={code}): {e}")
@@ -273,12 +293,13 @@ async def _cache_external_file(
 
 async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:")):
+    if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:")):
         return
     if not user_relay.relay_user_id or update.effective_user.id != user_relay.relay_user_id:
         return
 
     is_renew = text.startswith("RELAY_RENEW:")
+    is_error = text.startswith("RELAY_ERROR:")
     parts = text.split(":", 2)
     if len(parts) != 3:
         return
@@ -287,6 +308,17 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     except ValueError:
         return
     code = parts[2]
+
+    if is_error:
+        reason = code.split(":", 1)[0] if ":" in code else ""
+        logger.info(
+            f"[handle_relay_delivery] 外部机器人返回错误: code={code}, reason={reason}"
+        )
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text="外部文件码查询失败，该码可能已失效或暂时不可用，请稍后重试。",
+        )
+        return
 
     if is_renew:
         logger.info(
@@ -825,6 +857,12 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         return False
 
     try:
+        storage_ids = _parse_storage_ids_from_caption(caption)
+
+        if not storage_ids:
+            logger.warning(f"[RELAY_FILE] 无可用的 STORAGE_IDS (code={code_part})")
+            return True
+
         files_col = get_file_records_col()
         record = await files_col.find_one({"file_code": code_part})
         if not record:
@@ -838,45 +876,46 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
                 pass
             return True
 
-        batch_ids_str = record.get("batch_msg_ids") or ""
-        msg_ids = []
-        primary_mid = record.get("primary_channel_msg_id")
-        if primary_mid:
-            msg_ids.append(primary_mid)
-        if batch_ids_str:
-            for mid in batch_ids_str.split(","):
-                mid_str = mid.strip()
-                if mid_str.isdigit() and int(mid_str) not in msg_ids:
-                    msg_ids.append(int(mid_str))
-
-        if not msg_ids:
-            logger.warning(f"[RELAY_FILE] 文件记录无消息ID: {code_part}")
-            return True
-
         storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
 
         file_ids_str = record.get("file_ids") or ""
-        batch_file_meta = []
-        if file_ids_str:
-            fid_list = [f for f in file_ids_str.split(",") if f.strip()]
-            for i in range(len(msg_ids)):
-                fid = fid_list[i] if i < len(fid_list) else ""
-                batch_file_meta.append({"file_id": fid, "type": "document"})
+        all_file_ids = [f for f in file_ids_str.split(",") if f.strip()] if file_ids_str else []
 
-        if len(msg_ids) > 1 and batch_file_meta:
+        batch_all_ids = record.get("batch_msg_ids") or ""
+        all_msg_ids = []
+        primary_mid = record.get("primary_channel_msg_id")
+        if primary_mid:
+            all_msg_ids.append(str(primary_mid))
+        if batch_all_ids:
+            for mid in batch_all_ids.split(","):
+                m = mid.strip()
+                if m and m not in all_msg_ids:
+                    all_msg_ids.append(m)
+
+        msg_id_to_file_id = {}
+        for i, mid_str in enumerate(all_msg_ids):
+            msg_id_to_file_id[mid_str] = all_file_ids[i] if i < len(all_file_ids) else ""
+
+        batch_file_meta = []
+        for sid in storage_ids:
+            sid_str = str(sid)
+            fid = msg_id_to_file_id.get(sid_str, "")
+            batch_file_meta.append({"file_id": fid, "type": "document"})
+
+        if len(storage_ids) > 1 and any(m.get("file_id") for m in batch_file_meta):
             await enqueue_batch_send_task(
                 target_user_id=target_user_id,
                 channel_id=storage_channel,
-                channel_msg_ids=msg_ids,
+                channel_msg_ids=list(storage_ids),
                 batch_file_meta=json.dumps(batch_file_meta),
                 file_code=code_part,
             )
         else:
-            for mid in msg_ids:
+            for sid in storage_ids:
                 await enqueue_send_task(
                     target_user_id=target_user_id,
                     channel_id=storage_channel,
-                    message_id=mid,
+                    message_id=sid,
                     file_code=code_part,
                 )
 
@@ -897,7 +936,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = update.message.text or ""
 
-        if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:")):
+        if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:")):
             await handle_relay_delivery(update, context)
             return
 
