@@ -497,13 +497,14 @@ class UserRelay:
                 f"[UserRelay] 目标机器人 @{bot_username} 未返回任何文件 "
                 f"(user={user_id}, code={code})"
             )
-            try:
-                await self._client.send_message(
-                    user_id,
-                    f"@{bot_username} 未返回任何文件，该码可能已失效，请稍后重试。",
-                )
-            except Exception as e:
-                logger.error(f"[UserRelay] 通知用户失败: {e}")
+            if self._decoder_bot_entity:
+                try:
+                    await self._client.send_message(
+                        self._decoder_bot_entity,
+                        f"RELAY_ERROR:{user_id}:{code}:目标机器人未返回任何文件",
+                    )
+                except Exception as e:
+                    logger.error(f"[UserRelay] 通知解码机器人失败: {e}")
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
             return
