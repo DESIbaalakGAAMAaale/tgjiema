@@ -402,6 +402,8 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if is_batch:
+        if "\n" in code:
+            code = code.split("\n")[0].strip()
         storage_ids = _parse_storage_ids_from_caption(text)
         logger.info(
             f"[handle_relay_delivery] RELAY_BATCH: user={target_user_id}, code={code}, "

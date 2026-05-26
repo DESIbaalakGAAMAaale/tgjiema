@@ -157,6 +157,10 @@ class AIAgent:
                         logger.warning("[AI Agent] 429 限流，直接回退到内置决策")
                         return self._fallback_decision(exchange_data)
 
+                    if resp.status_code == 402:
+                        logger.warning("[AI Agent] 402 无余额，直接回退到内置决策")
+                        return self._fallback_decision(exchange_data)
+
                     if resp.status_code >= 400:
                         body = resp.text[:500]
                         logger.error(
