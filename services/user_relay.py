@@ -260,7 +260,7 @@ class UserRelay:
             if not sender or not hasattr(sender, "bot") or not sender.bot:
                 return
 
-            bot_username = sender.username
+            bot_username = (sender.username or "").lower()
             if not bot_username:
                 return
 
@@ -722,7 +722,7 @@ class UserRelay:
             )
             await self._client.send_message(entity, code)
             now = asyncio.get_event_loop().time()
-            self._bot_exchange[bot_username] = {
+            self._bot_exchange[bot_username.lower()] = {
                 "user_id": user_id,
                 "code": code,
                 "events": [],
