@@ -406,6 +406,13 @@ class UserRelay:
                     await self._cleanup_exchange(bot_username)
                     break
                 elif action == "wait":
+                    if not exchange.get("events"):
+                        logger.info(
+                            "[UserRelay] AI要求等待但无任何消息到达，直接结束 "
+                            f"(bot={bot_username})"
+                        )
+                        await self._process_all_collected(bot_username)
+                        break
                     wait_s = decision.get("wait_seconds", 5)
                     if not isinstance(wait_s, (int, float)) or wait_s <= 0:
                         wait_s = 5
