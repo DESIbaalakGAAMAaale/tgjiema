@@ -87,8 +87,9 @@ _media_group_buffer: dict[str, dict] = {}
 
 
 def _parse_storage_ids_from_caption(caption: str) -> list[int]:
-    header = caption.split("\n\n", 1)[0] if caption else ""
-    for line in header.split("\n"):
+    if not caption:
+        return []
+    for line in caption.split("\n"):
         if line.startswith("STORAGE_IDS:"):
             ids_str = line[len("STORAGE_IDS:"):]
             return [int(x) for x in ids_str.split(",") if x.strip().isdigit()]
@@ -105,10 +106,28 @@ async def _enqueue_storage_ids(
         return
 
     storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
-    file_ids_str = record.get("file_ids") or ""
+
+    meta_raw = record.get("batch_file_meta") or ""
+    try:
+        stored_meta = (
+            json.loads(meta_raw)
+            if isinstance(meta_raw, str) and meta_raw
+            else (meta_raw if isinstance(meta_raw, list) else [])
+        )
+    except (json.JSONDecodeError, TypeError):
+        stored_meta = []
+    if not isinstance(stored_meta, list):
+        stored_meta = []
+
+    meta_by_msg_id: dict[str, dict] = {}
+    for entry in stored_meta:
+        if isinstance(entry, dict) and entry.get("msg_id") is not None:
+            meta_by_msg_id[str(entry["msg_id"])] = entry
+
+    file_ids_str = str(record.get("file_ids") or "")
     all_file_ids = [f for f in file_ids_str.split(",") if f.strip()] if file_ids_str else []
 
-    batch_all_ids = record.get("batch_msg_ids") or ""
+    batch_all_ids = str(record.get("batch_msg_ids") or "")
     all_msg_ids = []
     primary_mid = record.get("primary_channel_msg_id")
     if primary_mid:
@@ -126,8 +145,15 @@ async def _enqueue_storage_ids(
     batch_file_meta = []
     for sid in storage_ids:
         sid_str = str(sid)
-        fid = msg_id_to_file_id.get(sid_str, "")
-        batch_file_meta.append({"file_id": fid, "type": "document"})
+        stored_entry = meta_by_msg_id.get(sid_str)
+        if stored_entry:
+            batch_file_meta.append({
+                "file_id": stored_entry.get("file_id", ""),
+                "type": stored_entry.get("type", "document"),
+            })
+        else:
+            fid = msg_id_to_file_id.get(sid_str, "")
+            batch_file_meta.append({"file_id": fid, "type": "document"})
 
     if len(storage_ids) > 1 and any(m.get("file_id") for m in batch_file_meta):
         await enqueue_batch_send_task(

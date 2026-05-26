@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 from loguru import logger
@@ -162,7 +163,7 @@ class UserRelay:
         await self._report_status("online")
         logger.info("[UserRelay] 中继已就绪")
 
-    async def _cache_file_record(self, code: str, message_id: int, file_id: str = ""):
+    async def _cache_file_record(self, code: str, message_id: int, file_id: str = "", media_type: str = "document"):
         lock = self._cache_locks.setdefault(code, asyncio.Lock())
         async with lock:
             try:
@@ -190,6 +191,35 @@ class UserRelay:
                     update = {"$set": {"batch_msg_ids": ",".join(batch_ids)}}
                     if file_id:
                         update["$set"]["file_ids"] = ",".join(fid_list)
+
+                    meta_raw = existing.get("batch_file_meta") or ""
+                    try:
+                        meta_list = (
+                            json.loads(meta_raw)
+                            if isinstance(meta_raw, str) and meta_raw
+                            else (meta_raw if isinstance(meta_raw, list) else [])
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        meta_list = []
+                    if not isinstance(meta_list, list):
+                        meta_list = []
+
+                    found = False
+                    mid_str = str(message_id)
+                    for entry in meta_list:
+                        if isinstance(entry, dict) and str(entry.get("msg_id", "")) == mid_str:
+                            entry["file_id"] = file_id or entry.get("file_id", "")
+                            entry["type"] = media_type
+                            found = True
+                            break
+                    if not found:
+                        meta_list.append({
+                            "msg_id": mid_str,
+                            "file_id": file_id,
+                            "type": media_type,
+                        })
+                    update["$set"]["batch_file_meta"] = json.dumps(meta_list)
+
                     await files_col.update_one({"file_code": code}, update)
                     logger.info(f"[UserRelay] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}")
                 else:
@@ -202,6 +232,11 @@ class UserRelay:
                     )
                     if file_id:
                         record["file_ids"] = file_id
+                        record["batch_file_meta"] = json.dumps([{
+                            "msg_id": str(message_id),
+                            "file_id": file_id,
+                            "type": media_type,
+                        }])
                     await files_col.insert_one(record)
                     logger.info(f"[UserRelay] 外部码 {code} 已缓存到本地存储")
             except Exception as e:
@@ -223,12 +258,40 @@ class UserRelay:
                 self._storage_channel_entity, msg.media
             )
             cache_fid = self._extract_file_id(storage_msg)
-            await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
+            media_type = self._detect_media_type(msg)
+            await self._cache_file_record(
+                code, storage_msg.id, file_id=cache_fid, media_type=media_type,
+            )
             logger.info(
                 f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
             )
         except Exception as e:
             logger.error(f"[UserRelay] 缓存到存储频道失败 (code={code}): {e}")
+
+    @staticmethod
+    def _detect_media_type(msg) -> str:
+        if hasattr(msg, "photo") and msg.photo:
+            return "photo"
+        if hasattr(msg, "video") and msg.video:
+            return "video"
+        if hasattr(msg, "audio") and msg.audio:
+            return "audio"
+        if hasattr(msg, "voice") and msg.voice:
+            return "audio"
+        if hasattr(msg, "animation") and msg.animation:
+            return "animation"
+        if hasattr(msg, "gif") and msg.gif:
+            return "animation"
+        if hasattr(msg, "sticker") and msg.sticker:
+            return "sticker"
+        if hasattr(msg, "document") and msg.document:
+            mime = getattr(msg.document, "mime_type", "") or ""
+            if "video" in mime:
+                return "video"
+            if "audio" in mime:
+                return "audio"
+            return "document"
+        return "document"
 
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
@@ -605,11 +668,38 @@ class UserRelay:
             return False
 
         exchange.pop("_keyboard_msg", None)
+
         try:
-            await keyboard_msg.click(data=target_btn.data)
-            btn_text = getattr(target_btn, "text", "") or "(无文字/图标按钮)"
-            logger.info(f"[UserRelay] 已点击按钮 [{row},{col}] {btn_text}")
-            return True
+            if hasattr(target_btn, "data") and target_btn.data:
+                await keyboard_msg.click(data=target_btn.data)
+                btn_text = getattr(target_btn, "text", "") or "(无文字/图标按钮)"
+                logger.info(f"[UserRelay] 已点击按钮 [{row},{col}] {btn_text}")
+                return True
+
+            if hasattr(target_btn, "url") and target_btn.url:
+                url = str(target_btn.url)
+                btn_text = getattr(target_btn, "text", "") or "(URL按钮)"
+                logger.info(f"[UserRelay] 检测到 URL 按钮 [{row},{col}] {btn_text}, url={url}")
+                if "t.me/" in url or "telegram.me/" in url:
+                    from urllib.parse import urlparse, parse_qs
+                    parsed = urlparse(url)
+                    params = parse_qs(parsed.query)
+                    start_param = params.get("start", [None])[0]
+                    if start_param:
+                        entity = await self._client.get_entity(
+                            parsed.path.strip("/")
+                        )
+                        await self._client.send_message(entity, f"/start {start_param}")
+                        logger.info(f"[UserRelay] 已通过 deep link 翻页: /start {start_param}")
+                        return True
+                logger.warning(f"[UserRelay] URL 按钮无法点击 (非 t.me 链接): {url}")
+                return False
+
+            btn_text = getattr(target_btn, "text", "") or "(未知类型)"
+            logger.warning(
+                f"[UserRelay] 按钮 [{row},{col}] 类型不支持: {type(target_btn).__name__}"
+            )
+            return False
         except Exception as e:
             logger.error(f"[UserRelay] 点击按钮失败 [{row},{col}]: {e}")
             return False
@@ -733,7 +823,7 @@ class UserRelay:
                 "_last_clicked_number": None,
             }
             self._restart_settle(
-                self._bot_exchange[bot_username], bot_username,
+                self._bot_exchange[bot_username.lower()], bot_username.lower(),
                 settle_wait=_INITIAL_SETTLE_WAIT,
             )
             logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，等待响应 (user={user_id}, code={code})")
