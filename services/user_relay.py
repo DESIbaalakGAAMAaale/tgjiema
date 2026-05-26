@@ -12,7 +12,7 @@ from config import settings
 from services.ai_agent import ai_agent
 
 
-_SETTLE_WAIT = 2.5
+_SETTLE_WAIT = 5
 _MAX_AI_LOOP = 10
 
 
@@ -543,13 +543,13 @@ class UserRelay:
         try:
             files_col = get_file_records_col()
             record = None
-            for retry in range(4):
+            for retry in range(6):
                 if retry > 0:
                     await asyncio.sleep(2)
                 record = await files_col.find_one({"file_code": code})
                 if record:
                     break
-                if retry < 3:
+                if retry < 5:
                     logger.info(
                         f"[UserRelay] DB 暂无记录 (code={code})，等待后台缓存 "
                         f"(第{retry+1}次重试)"
