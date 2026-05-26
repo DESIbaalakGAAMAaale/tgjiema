@@ -54,9 +54,9 @@ class UserRelay:
             v = msg.video
             kwargs["attributes"] = [
                 DocumentAttributeVideo(
-                    duration=v.duration,
-                    w=v.w,
-                    h=v.h,
+                    duration=getattr(v, "duration", 0) or 0,
+                    w=getattr(v, "w", 0) or 0,
+                    h=getattr(v, "h", 0) or 0,
                     supports_streaming=True,
                 )
             ]
@@ -68,9 +68,9 @@ class UserRelay:
             g = msg.gif
             kwargs["attributes"] = [
                 DocumentAttributeVideo(
-                    duration=g.duration,
-                    w=g.w,
-                    h=g.h,
+                    duration=getattr(g, "duration", 0) or 0,
+                    w=getattr(g, "w", 0) or 0,
+                    h=getattr(g, "h", 0) or 0,
                     supports_streaming=True,
                 )
             ]

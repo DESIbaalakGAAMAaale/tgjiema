@@ -80,6 +80,8 @@ class AIAgent:
 
     def configure(self):
         self._api_base = (settings.AI_API_BASE_URL or "").strip().rstrip("/")
+        if self._api_base.endswith("/chat/completions"):
+            self._api_base = self._api_base[:-len("/chat/completions")]
         self._api_key = (settings.AI_API_KEY or "").strip()
         self._model = (settings.AI_MODEL or "gpt-4o-mini").strip()
         self._enabled = bool(self._api_base and self._api_key)
