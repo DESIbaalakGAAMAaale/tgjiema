@@ -31,6 +31,8 @@ class UserRelay:
         self._pending_cleanup = None
         self._relay_user_id = None
         self._cache_locks: dict[str, asyncio.Lock] = {}
+        self._pending_cache_counts: dict[str, int] = {}
+        self._pending_cache_events: dict[str, asyncio.Event] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -253,6 +255,7 @@ class UserRelay:
     async def _download_and_cache_one(self, msg, user_id: int, code: str):
         if not getattr(msg, "media", None):
             return
+        self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
         try:
             storage_msg = await self._client.send_file(
                 self._storage_channel_entity, msg.media
@@ -267,6 +270,13 @@ class UserRelay:
             )
         except Exception as e:
             logger.error(f"[UserRelay] 缓存到存储频道失败 (code={code}): {e}")
+        finally:
+            current = self._pending_cache_counts.get(code, 0)
+            self._pending_cache_counts[code] = max(0, current - 1)
+            if self._pending_cache_counts[code] == 0:
+                ev = self._pending_cache_events.get(code)
+                if ev:
+                    ev.set()
 
     @staticmethod
     def _detect_media_type(msg) -> str:
@@ -422,6 +432,23 @@ class UserRelay:
         exchange.setdefault("events", []).extend(events_list)
         self._restart_settle(exchange, bot_username)
 
+    async def _wait_all_cached(self, bot_username: str, timeout: float = 60):
+        exchange = self._bot_exchange.get(bot_username)
+        if not exchange:
+            return
+        code = exchange.get("code", "")
+        pending = self._pending_cache_counts.get(code, 0)
+        if pending <= 0:
+            return
+        ev = self._pending_cache_events.setdefault(code, asyncio.Event())
+        ev.clear()
+        logger.info(f"[UserRelay] 等待 {pending} 个缓存操作完成 (code={code})")
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+            logger.info(f"[UserRelay] 缓存操作全部完成 (code={code})")
+        except asyncio.TimeoutError:
+            logger.warning(f"[UserRelay] 等待缓存操作超时 (code={code}), 剩余 {self._pending_cache_counts.get(code, '?')}")
+
     async def _message_loop(self, bot_username: str, settle_wait: float = _SETTLE_WAIT):
         task = asyncio.current_task()
         if task:
@@ -438,82 +465,57 @@ class UserRelay:
             return
 
         exchange["_ai_running"] = True
+        loop_count = exchange.get("_loop_count", 0) + 1
+        exchange["_loop_count"] = loop_count
 
-        loop_count = 0
         try:
-            while loop_count < _MAX_PAGE_LOOP:
-                loop_count += 1
+            if loop_count > _MAX_PAGE_LOOP:
+                logger.warning(f"[UserRelay] 翻页循环超过最大次数 ({_MAX_PAGE_LOOP})")
+                await self._process_all_collected(bot_username)
+                return
 
-                if bot_username not in self._bot_exchange:
-                    logger.warning(f"[UserRelay] 翻页循环: exchange 已被清理 (bot={bot_username})")
-                    break
+            exchange["_expires"] = asyncio.get_event_loop().time() + 120
 
-                exchange = self._bot_exchange[bot_username]
-                exchange["_expires"] = asyncio.get_event_loop().time() + 120
-                version_before = exchange.get("_msg_version", 0)
+            decision = self._make_decision(exchange)
+            action = decision.get("action", "finish")
+            reason = decision.get("reason", "")
+            logger.info(f"[UserRelay] 翻页决策 #{loop_count}: action={action}, reason={reason}")
 
-                decision = self._make_decision(exchange)
-
-                if bot_username not in self._bot_exchange:
-                    break
-                exchange = self._bot_exchange[bot_username]
-                version_after = exchange.get("_msg_version", 0)
-
-                if version_after != version_before:
-                    logger.info(
-                        f"[UserRelay] 新消息到达 (v{version_before}→v{version_after})，"
-                        f"重新评估"
-                    )
-                    continue
-
-                action = decision.get("action", "finish")
-                reason = decision.get("reason", "")
-                logger.info(
-                    f"[UserRelay] 翻页决策 #{loop_count}: action={action}, reason={reason}"
-                )
-
-                if action == "finish":
+            if action == "finish":
+                await self._process_all_collected(bot_username)
+            elif action == "error":
+                exchange_data = self._bot_exchange.get(bot_username)
+                if exchange_data:
+                    user_id = exchange_data.get("user_id", 0)
+                    code = exchange_data.get("code", "")
+                    try:
+                        await self._client.send_message(
+                            self._decoder_bot_entity,
+                            f"RELAY_ERROR:{user_id}:{code}:{reason}",
+                        )
+                    except Exception as e:
+                        logger.error(f"[UserRelay] 发送错误通知失败: {e}")
+                await self._cleanup_exchange(bot_username)
+            elif action == "click_button":
+                row = decision.get("target_button_row")
+                col = decision.get("target_button_col")
+                btn_text = decision.get("target_button_text", "")
+                if row is None or col is None:
+                    logger.warning("[UserRelay] 决策要求点击按钮但未指定 row/col")
                     await self._process_all_collected(bot_username)
-                    break
-                elif action == "error":
-                    exchange_data = self._bot_exchange.get(bot_username)
-                    if exchange_data:
-                        user_id = exchange_data.get("user_id", 0)
-                        code = exchange_data.get("code", "")
-                        try:
-                            await self._client.send_message(
-                                self._decoder_bot_entity,
-                                f"RELAY_ERROR:{user_id}:{code}:{reason}",
-                            )
-                        except Exception as e:
-                            logger.error(f"[UserRelay] 发送错误通知失败: {e}")
-                    await self._cleanup_exchange(bot_username)
-                    break
-                elif action == "click_button":
-                    row = decision.get("target_button_row")
-                    col = decision.get("target_button_col")
-                    btn_text = decision.get("target_button_text", "")
-                    if row is None or col is None:
-                        logger.warning("[UserRelay] 决策要求点击按钮但未指定 row/col")
-                        await self._process_all_collected(bot_username)
-                        break
-
-                    logger.info(
-                        f"[UserRelay] 点击翻页按钮 [{row},{col}] \"{btn_text}\""
-                    )
+                else:
+                    logger.info(f'[UserRelay] 点击翻页按钮 [{row},{col}] "{btn_text}"')
                     clicked = await self._click_button(bot_username, row, col)
                     if not clicked:
                         logger.info("[UserRelay] 翻页按钮点击失败（可能已是最后一页）")
                         await self._process_all_collected(bot_username)
-                        break
-
-                    exchange.setdefault("_clicked_buttons", set()).add((row, col))
-                    await asyncio.sleep(4)
-                    continue
-                else:
-                    logger.warning(f"[UserRelay] 未知 action: {action}")
-                    await self._process_all_collected(bot_username)
-                    break
+                    else:
+                        exchange.setdefault("_clicked_buttons", set()).add((row, col))
+                        await self._wait_all_cached(bot_username)
+                        self._restart_settle(exchange, bot_username)
+            else:
+                logger.warning(f"[UserRelay] 未知 action: {action}")
+                await self._process_all_collected(bot_username)
 
         except asyncio.CancelledError:
             logger.debug(f"[UserRelay] 翻页循环被取消 (bot={bot_username})")
@@ -759,6 +761,7 @@ class UserRelay:
 
         from database import get_file_records_col
         try:
+            await self._wait_all_cached(bot_username, timeout=60)
             lock = self._cache_locks.get(code)
             if lock:
                 async with lock:
@@ -825,8 +828,13 @@ class UserRelay:
 
     async def _cleanup_exchange(self, bot_username: str):
         exchange = self._bot_exchange.pop(bot_username, None)
-        if exchange and exchange.get("_settle_task") and not exchange["_settle_task"].done():
-            exchange["_settle_task"].cancel()
+        if exchange:
+            code = exchange.get("code", "")
+            if code:
+                self._pending_cache_counts.pop(code, None)
+                self._pending_cache_events.pop(code, None)
+            if exchange.get("_settle_task") and not exchange["_settle_task"].done():
+                exchange["_settle_task"].cancel()
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)
 
