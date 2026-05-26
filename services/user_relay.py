@@ -470,7 +470,7 @@ class UserRelay:
 
                     clicked = await self._click_button(bot_username, row, col)
                     if not clicked:
-                        await self._cleanup_exchange(bot_username)
+                        await self._process_all_collected(bot_username)
                         break
 
                     await asyncio.sleep(4)

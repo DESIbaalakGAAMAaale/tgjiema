@@ -194,6 +194,12 @@ class AIAgent:
                         await asyncio.sleep(retry_after)
                         continue
 
+                    if resp.status_code >= 400:
+                        body = resp.text[:500]
+                        logger.error(
+                            f"[AI Agent] HTTP {resp.status_code}: {body}"
+                        )
+
                     resp.raise_for_status()
                     data = resp.json()
                     logger.debug(f"[AI Agent] 完整响应: {json.dumps(data, ensure_ascii=False)[:1000]}")
