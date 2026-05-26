@@ -29,6 +29,7 @@ class UserRelay:
         self._relay_phone: str = ""
         self._pending_cleanup = None
         self._relay_user_id = None
+        self._cache_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -163,47 +164,49 @@ class UserRelay:
         logger.info(f"[UserRelay] 中继已就绪 (AI决策: {'启用' if ai_agent.enabled else '未启用'})")
 
     async def _cache_file_record(self, code: str, message_id: int, file_id: str = ""):
-        try:
-            from database import get_file_records_col, make_file_record
-            from config import settings as _s
+        lock = self._cache_locks.setdefault(code, asyncio.Lock())
+        async with lock:
+            try:
+                from database import get_file_records_col, make_file_record
+                from config import settings as _s
 
-            files_col = get_file_records_col()
-            existing = await files_col.find_one({"file_code": code})
-            if existing:
-                batch = existing.get("batch_msg_ids", "") or ""
-                if isinstance(batch, str):
-                    batch_ids = [mid for mid in batch.split(",") if mid.strip()]
+                files_col = get_file_records_col()
+                existing = await files_col.find_one({"file_code": code})
+                if existing:
+                    batch = existing.get("batch_msg_ids", "") or ""
+                    if isinstance(batch, str):
+                        batch_ids = [mid for mid in batch.split(",") if mid.strip()]
+                    else:
+                        batch_ids = [str(x) for x in batch] if isinstance(batch, list) else []
+                    if str(message_id) not in batch_ids:
+                        batch_ids.append(str(message_id))
+
+                    fids = existing.get("file_ids", "") or ""
+                    if not isinstance(fids, str):
+                        fids = str(fids)
+                    fid_list = [f for f in fids.split(",") if f.strip()]
+                    if file_id and file_id not in fid_list:
+                        fid_list.append(file_id)
+
+                    update = {"$set": {"batch_msg_ids": ",".join(batch_ids)}}
+                    if file_id:
+                        update["$set"]["file_ids"] = ",".join(fid_list)
+                    await files_col.update_one({"file_code": code}, update)
+                    logger.info(f"[UserRelay] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}")
                 else:
-                    batch_ids = [str(x) for x in batch] if isinstance(batch, list) else []
-                if str(message_id) not in batch_ids:
-                    batch_ids.append(str(message_id))
-
-                fids = existing.get("file_ids", "") or ""
-                if not isinstance(fids, str):
-                    fids = str(fids)
-                fid_list = [f for f in fids.split(",") if f.strip()]
-                if file_id and file_id not in fid_list:
-                    fid_list.append(file_id)
-
-                update = {"$set": {"batch_msg_ids": ",".join(batch_ids)}}
-                if file_id:
-                    update["$set"]["file_ids"] = ",".join(fid_list)
-                await files_col.update_one({"file_code": code}, update)
-                logger.info(f"[UserRelay] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}")
-            else:
-                record = make_file_record(
-                    file_code=code,
-                    uploader_id=0,
-                    primary_channel_id=_s.MAIN_STORAGE_CHANNEL_ID,
-                    primary_channel_msg_id=message_id,
-                    file_types={},
-                )
-                if file_id:
-                    record["file_ids"] = file_id
-                await files_col.insert_one(record)
-                logger.info(f"[UserRelay] 外部码 {code} 已缓存到本地存储")
-        except Exception as e:
-            logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
+                    record = make_file_record(
+                        file_code=code,
+                        uploader_id=0,
+                        primary_channel_id=_s.MAIN_STORAGE_CHANNEL_ID,
+                        primary_channel_msg_id=message_id,
+                        file_types={},
+                    )
+                    if file_id:
+                        record["file_ids"] = file_id
+                    await files_col.insert_one(record)
+                    logger.info(f"[UserRelay] 外部码 {code} 已缓存到本地存储")
+            except Exception as e:
+                logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
     def _extract_file_id(self, msg) -> str:
         if not msg or not msg.media:
