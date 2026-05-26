@@ -824,14 +824,20 @@ async def handle_external_code(
         metrics.record_processed("decoder_bot")
         return
     except Exception as e:
+        err_msg = str(e)
         logger.warning(
             f"[handle_external_code] 无法发送到 @{bot_username} "
-            f"(user={user_id}, code={code}): {e}"
+            f"(user={user_id}, code={code}): {err_msg}"
         )
-
-    await update.message.reply_text(
-        "外部码解码功能暂不可用，请联系管理员配置用户中继。"
-    )
+        if "chat not found" in err_msg.lower() or "nobody is using" in err_msg.lower():
+            await update.message.reply_text(
+                f"机器人 @{bot_username} 未找到，请检查文件码中的机器人用户名是否正确。"
+            )
+        else:
+            await update.message.reply_text(
+                "外部码解码功能暂不可用，请联系管理员配置用户中继。"
+            )
+        return
 
 
 async def handle_external_file_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
