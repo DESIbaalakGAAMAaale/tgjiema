@@ -592,7 +592,7 @@ class UserRelay:
 
                     target_str = str(target_num)
                     for col_idx, t in enumerate(btn_texts):
-                        if t == target_str:
+                        if t == target_str or (t.isdigit() and int(t) == target_num):
                             exchange["_last_clicked_number"] = target_num
                             return {
                                 "action": "click_button",
@@ -737,6 +737,10 @@ class UserRelay:
 
         from database import get_file_records_col
         try:
+            lock = self._cache_locks.get(code)
+            if lock:
+                async with lock:
+                    pass
             files_col = get_file_records_col()
             record = None
             for retry in range(6):
