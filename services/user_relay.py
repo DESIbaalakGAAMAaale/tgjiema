@@ -712,7 +712,7 @@ class UserRelay:
                 self._bot_exchange[bot_username], bot_username,
                 settle_wait=_INITIAL_SETTLE_WAIT,
             )
-            logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，AI驱动等待响应 (user={user_id}, code={code})")
+            logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，等待响应 (user={user_id}, code={code})")
             return True
         except Exception as e:
             logger.error(f"[UserRelay] 向 @{bot_username} 发送失败: {e}")
