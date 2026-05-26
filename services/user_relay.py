@@ -241,6 +241,22 @@ class UserRelay:
                     old["_settle_task"].cancel()
 
             sender = await event.get_sender()
+
+            if self._bot_exchange:
+                sender_info = ""
+                try:
+                    sid = getattr(sender, "id", "?")
+                    sun = getattr(sender, "username", None) or ""
+                    sbot = getattr(sender, "bot", False)
+                    sender_info = f"id={sid}, username=@{sun}, is_bot={sbot}"
+                except Exception:
+                    sender_info = "unknown"
+                logger.info(
+                    f"[UserRelay] 收到消息: sender({sender_info}), "
+                    f"has_media={bool(getattr(event.message, 'media', None))}, "
+                    f"active_exchanges={list(self._bot_exchange.keys())}"
+                )
+
             if not sender or not hasattr(sender, "bot") or not sender.bot:
                 return
 
@@ -250,6 +266,9 @@ class UserRelay:
 
             exchange = self._bot_exchange.get(bot_username)
             if not exchange:
+                logger.info(
+                    f"[UserRelay] 来自 @{bot_username} 的消息无对应 exchange，忽略"
+                )
                 return
 
             exchange["_expires"] = now_ts + 120
@@ -696,6 +715,11 @@ class UserRelay:
 
         try:
             entity = await self._client.get_entity(bot_username)
+            logger.info(
+                f"[UserRelay] 目标实体: {type(entity).__name__}, "
+                f"id={getattr(entity, 'id', '?')}, "
+                f"username=@{getattr(entity, 'username', '?')}"
+            )
             await self._client.send_message(entity, code)
             now = asyncio.get_event_loop().time()
             self._bot_exchange[bot_username] = {
