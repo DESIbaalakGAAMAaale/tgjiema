@@ -163,48 +163,72 @@ class AIAgent:
         ctx = self._build_context(exchange_data)
         logger.info(f"[AI Agent] 发送决策请求, context length={len(ctx)}")
 
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
-                resp = await client.post(
-                    f"{self._api_base}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self._api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self._model,
-                        "messages": [
-                            {"role": "system", "content": _SYSTEM_PROMPT},
-                            {"role": "user", "content": ctx},
-                        ],
-                        "temperature": 0.0,
-                        "max_tokens": 300,
-                    },
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                logger.debug(f"[AI Agent] 完整响应: {json.dumps(data, ensure_ascii=False)[:1000]}")
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
+                    resp = await client.post(
+                        f"{self._api_base}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self._api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self._model,
+                            "messages": [
+                                {"role": "system", "content": _SYSTEM_PROMPT},
+                                {"role": "user", "content": ctx},
+                            ],
+                            "temperature": 0.1,
+                            "max_tokens": 300,
+                        },
+                    )
 
-                ai_text = ""
-                choices = data.get("choices", [])
-                if choices:
-                    msg = choices[0].get("message") or {}
-                    ai_text = msg.get("content") or ""
+                    if resp.status_code == 429:
+                        retry_after = 5 * (2 ** attempt)
+                        logger.warning(
+                            f"[AI Agent] 429 限流，第{attempt+1}/{max_retries}次重试，"
+                            f"等待 {retry_after}s"
+                        )
+                        await asyncio.sleep(retry_after)
+                        continue
+
+                    resp.raise_for_status()
+                    data = resp.json()
+                    logger.debug(f"[AI Agent] 完整响应: {json.dumps(data, ensure_ascii=False)[:1000]}")
+
+                    ai_text = ""
+                    choices = data.get("choices", [])
+                    if choices:
+                        msg = choices[0].get("message") or {}
+                        ai_text = msg.get("content") or ""
+                        if not ai_text:
+                            ai_text = choices[0].get("text") or ""
                     if not ai_text:
-                        ai_text = choices[0].get("text") or ""
-                if not ai_text:
-                    logger.error(f"[AI Agent] AI 返回空内容, 原始: {json.dumps(data, ensure_ascii=False)[:500]}")
+                        logger.error(f"[AI Agent] AI 返回空内容, 原始: {json.dumps(data, ensure_ascii=False)[:500]}")
+                        return self._fallback_decision(exchange_data)
+
+                    logger.info(f"[AI Agent] AI 回复: {ai_text[:200]}")
+
+                    decision = _parse_json_from_response(ai_text)
+                    logger.info(f"[AI Agent] 决策: action={decision.get('action')}, reason={decision.get('reason')}")
+                    return decision
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 3 * (2 ** attempt)
+                    logger.warning(
+                        f"[AI Agent] 调用失败 ({type(e).__name__})，"
+                        f"第{attempt+1}/{max_retries}次重试，等待 {wait}s"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"[AI Agent] 调用失败，回退到默认行为: {type(e).__name__}: {e}")
                     return self._fallback_decision(exchange_data)
 
-                logger.info(f"[AI Agent] AI 回复: {ai_text[:200]}")
-
-                decision = _parse_json_from_response(ai_text)
-                logger.info(f"[AI Agent] 决策: action={decision.get('action')}, reason={decision.get('reason')}")
-                return decision
-
-        except Exception as e:
-            logger.error(f"[AI Agent] 调用失败，回退到默认行为: {type(e).__name__}: {e}")
-            return self._fallback_decision(exchange_data)
+        return self._fallback_decision(exchange_data)
 
     def _fallback_decision(self, exchange_data: dict) -> dict:
         msg_events = exchange_data.get("events", [])

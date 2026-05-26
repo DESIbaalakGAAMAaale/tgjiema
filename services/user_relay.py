@@ -260,6 +260,8 @@ class UserRelay:
             return ""
 
     async def _download_and_cache_one(self, msg, user_id: int, code: str):
+        if not getattr(msg, "media", None):
+            return
         with tempfile.TemporaryDirectory() as tmpdir:
             fp = await self._client.download_media(msg, file=tmpdir)
             if not fp:
@@ -335,9 +337,13 @@ class UserRelay:
             self._restart_settle(exchange, bot_username)
 
     def _restart_settle(self, exchange: dict, bot_username: str):
+        exchange["_msg_version"] = exchange.get("_msg_version", 0) + 1
         old = exchange.get("_settle_task")
         if old and not old.done():
-            old.cancel()
+            if old.get_name() == "settle_sleeping":
+                old.cancel()
+            else:
+                return
         exchange["_settle_task"] = asyncio.create_task(
             self._ai_message_loop(bot_username)
         )
@@ -379,7 +385,12 @@ class UserRelay:
         self._restart_settle(exchange, bot_username)
 
     async def _ai_message_loop(self, bot_username: str):
+        task = asyncio.current_task()
+        if task:
+            task.set_name("settle_sleeping")
         await asyncio.sleep(_SETTLE_WAIT)
+        if task:
+            task.set_name("")
 
         exchange = self._bot_exchange.get(bot_username)
         if not exchange:
@@ -401,11 +412,24 @@ class UserRelay:
 
                 exchange = self._bot_exchange[bot_username]
                 exchange["_expires"] = asyncio.get_event_loop().time() + 120
+                version_before = exchange.get("_msg_version", 0)
 
                 decision = await ai_agent.decide({
                     "bot_username": bot_username,
                     "events": exchange.get("events", []),
                 })
+
+                if bot_username not in self._bot_exchange:
+                    break
+                exchange = self._bot_exchange[bot_username]
+                version_after = exchange.get("_msg_version", 0)
+
+                if version_after != version_before:
+                    logger.info(
+                        f"[UserRelay] 新消息到达 (v{version_before}→v{version_after})，"
+                        f"重新评估"
+                    )
+                    continue
 
                 action = decision.get("action", "finish")
                 reason = decision.get("reason", "")
