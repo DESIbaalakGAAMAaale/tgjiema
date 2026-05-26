@@ -668,6 +668,13 @@ class UserRelay:
 
         keyboard_msg = exchange.get("_keyboard_msg")
         if not keyboard_msg or not keyboard_msg.reply_markup:
+            for ev in reversed(exchange.get("events", [])):
+                msg = ev.message
+                if msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows:
+                    keyboard_msg = msg
+                    exchange["_keyboard_msg"] = msg
+                    break
+        if not keyboard_msg or not keyboard_msg.reply_markup:
             logger.warning(f"[UserRelay] 无可用键盘消息 (bot={bot_username})")
             return False
 
@@ -778,6 +785,11 @@ class UserRelay:
             batch_ids_str = record.get("batch_msg_ids") or ""
             if not isinstance(batch_ids_str, str):
                 batch_ids_str = str(batch_ids_str)
+            logger.info(
+                f"[UserRelay] DB记录 (code={code}): primary_mid={record.get('primary_channel_msg_id')}, "
+                f"batch_ids_str={batch_ids_str}, "
+                f"batch_file_meta_len={len(json.loads(record.get('batch_file_meta') or '[]') if isinstance(record.get('batch_file_meta'), str) else [])}"
+            )
             msg_ids = []
             primary_mid = record.get("primary_channel_msg_id")
             if primary_mid:
