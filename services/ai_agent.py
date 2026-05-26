@@ -180,7 +180,7 @@ class AIAgent:
                                 {"role": "user", "content": ctx},
                             ],
                             "temperature": 0.1,
-                            "max_tokens": 300,
+                            "max_tokens": 800,
                         },
                     )
 
@@ -204,6 +204,8 @@ class AIAgent:
                         ai_text = msg.get("content") or ""
                         if not ai_text:
                             ai_text = choices[0].get("text") or ""
+                        if not ai_text:
+                            ai_text = msg.get("reasoning") or ""
                     if not ai_text:
                         logger.error(f"[AI Agent] AI 返回空内容, 原始: {json.dumps(data, ensure_ascii=False)[:500]}")
                         return self._fallback_decision(exchange_data)

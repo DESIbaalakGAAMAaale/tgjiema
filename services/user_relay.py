@@ -542,9 +542,20 @@ class UserRelay:
         from database import get_file_records_col
         try:
             files_col = get_file_records_col()
-            record = await files_col.find_one({"file_code": code})
+            record = None
+            for retry in range(4):
+                if retry > 0:
+                    await asyncio.sleep(2)
+                record = await files_col.find_one({"file_code": code})
+                if record:
+                    break
+                if retry < 3:
+                    logger.info(
+                        f"[UserRelay] DB 暂无记录 (code={code})，等待后台缓存 "
+                        f"(第{retry+1}次重试)"
+                    )
             if not record:
-                logger.warning(f"[UserRelay] DB 无记录 (code={code})")
+                logger.warning(f"[UserRelay] DB 始终无记录 (code={code})")
                 if self._pending_cleanup:
                     self._pending_cleanup(bot_username)
                 return
