@@ -8,12 +8,11 @@ from telethon.tl.types import PeerChannel
 from telethon.utils import pack_bot_file_id
 
 from config import settings
-from services.ai_agent import ai_agent
 
 
 _SETTLE_WAIT = 5
 _INITIAL_SETTLE_WAIT = 20
-_MAX_AI_LOOP = 10
+_MAX_PAGE_LOOP = 20
 
 
 class UserRelay:
@@ -158,11 +157,10 @@ class UserRelay:
         except Exception:
             self._storage_channel_entity = None
 
-        ai_agent.configure()
         self._register_handlers()
         self._ready.set()
         await self._report_status("online")
-        logger.info(f"[UserRelay] 中继已就绪 (AI决策: {'启用' if ai_agent.enabled else '未启用'})")
+        logger.info("[UserRelay] 中继已就绪")
 
     async def _cache_file_record(self, code: str, message_id: int, file_id: str = ""):
         lock = self._cache_locks.setdefault(code, asyncio.Lock())
@@ -296,7 +294,7 @@ class UserRelay:
             else:
                 return
         exchange["_settle_task"] = asyncio.create_task(
-            self._ai_message_loop(bot_username, settle_wait)
+            self._message_loop(bot_username, settle_wait)
         )
 
     async def _flush_media_group_buffer(self, media_group_id: str, bot_username: str):
@@ -335,7 +333,7 @@ class UserRelay:
         exchange.setdefault("events", []).extend(events_list)
         self._restart_settle(exchange, bot_username)
 
-    async def _ai_message_loop(self, bot_username: str, settle_wait: float = _SETTLE_WAIT):
+    async def _message_loop(self, bot_username: str, settle_wait: float = _SETTLE_WAIT):
         task = asyncio.current_task()
         if task:
             task.set_name("settle_sleeping")
@@ -354,21 +352,18 @@ class UserRelay:
 
         loop_count = 0
         try:
-            while loop_count < _MAX_AI_LOOP:
+            while loop_count < _MAX_PAGE_LOOP:
                 loop_count += 1
 
                 if bot_username not in self._bot_exchange:
-                    logger.warning(f"[UserRelay] AI循环: exchange 已被清理 (bot={bot_username})")
+                    logger.warning(f"[UserRelay] 翻页循环: exchange 已被清理 (bot={bot_username})")
                     break
 
                 exchange = self._bot_exchange[bot_username]
                 exchange["_expires"] = asyncio.get_event_loop().time() + 120
                 version_before = exchange.get("_msg_version", 0)
 
-                decision = await ai_agent.decide({
-                    "bot_username": bot_username,
-                    "events": exchange.get("events", []),
-                })
+                decision = self._make_decision(exchange)
 
                 if bot_username not in self._bot_exchange:
                     break
@@ -385,17 +380,17 @@ class UserRelay:
                 action = decision.get("action", "finish")
                 reason = decision.get("reason", "")
                 logger.info(
-                    f"[UserRelay] AI决策 #{loop_count}: action={action}, reason={reason}"
+                    f"[UserRelay] 翻页决策 #{loop_count}: action={action}, reason={reason}"
                 )
 
                 if action == "finish":
                     await self._process_all_collected(bot_username)
                     break
                 elif action == "error":
-                    exchange = self._bot_exchange.get(bot_username)
-                    if exchange:
-                        user_id = exchange.get("user_id", 0)
-                        code = exchange.get("code", "")
+                    exchange_data = self._bot_exchange.get(bot_username)
+                    if exchange_data:
+                        user_id = exchange_data.get("user_id", 0)
+                        code = exchange_data.get("code", "")
                         try:
                             await self._client.send_message(
                                 self._decoder_bot_entity,
@@ -405,47 +400,169 @@ class UserRelay:
                             logger.error(f"[UserRelay] 发送错误通知失败: {e}")
                     await self._cleanup_exchange(bot_username)
                     break
-                elif action == "wait":
-                    if not exchange.get("events"):
-                        logger.info(
-                            "[UserRelay] AI要求等待但无任何消息到达，直接结束 "
-                            f"(bot={bot_username})"
-                        )
-                        await self._process_all_collected(bot_username)
-                        break
-                    wait_s = decision.get("wait_seconds", 5)
-                    if not isinstance(wait_s, (int, float)) or wait_s <= 0:
-                        wait_s = 5
-                    logger.info(f"[UserRelay] AI要求等待 {wait_s}s")
-                    await asyncio.sleep(wait_s)
-                    continue
                 elif action == "click_button":
                     row = decision.get("target_button_row")
                     col = decision.get("target_button_col")
+                    btn_text = decision.get("target_button_text", "")
                     if row is None or col is None:
-                        logger.warning("[UserRelay] AI要求点击按钮但未指定 row/col")
-                        continue
+                        logger.warning("[UserRelay] 决策要求点击按钮但未指定 row/col")
+                        await self._process_all_collected(bot_username)
+                        break
 
+                    logger.info(
+                        f"[UserRelay] 点击翻页按钮 [{row},{col}] \"{btn_text}\""
+                    )
                     clicked = await self._click_button(bot_username, row, col)
                     if not clicked:
+                        logger.info("[UserRelay] 翻页按钮点击失败（可能已是最后一页）")
                         await self._process_all_collected(bot_username)
                         break
 
                     await asyncio.sleep(4)
                     continue
                 else:
-                    logger.warning(f"[UserRelay] AI返回未知 action: {action}")
+                    logger.warning(f"[UserRelay] 未知 action: {action}")
                     await self._process_all_collected(bot_username)
                     break
 
         except asyncio.CancelledError:
-            logger.debug(f"[UserRelay] AI循环被取消 (bot={bot_username})")
+            logger.debug(f"[UserRelay] 翻页循环被取消 (bot={bot_username})")
         except Exception as e:
-            logger.error(f"[UserRelay] AI循环异常 (bot={bot_username}): {e}")
+            logger.error(f"[UserRelay] 翻页循环异常 (bot={bot_username}): {e}")
             await self._process_all_collected(bot_username)
         finally:
             if bot_username in self._bot_exchange:
                 self._bot_exchange[bot_username]["_ai_running"] = False
+
+    def _make_decision(self, exchange: dict) -> dict:
+        _NEXT_KW = (
+            "next", "\u4e0b\u4e00\u9875", "\u4e0b\u4e00\u9801",
+            "\u4e0b\u4e00\u7ec4",
+            "\u2192", "\u25b6", "\u27a1", ">>", "\u00bb",
+        )
+        _ERROR_KW = (
+            "\u672a\u627e\u5230", "\u5df2\u8fc7\u671f", "\u5df2\u5931\u6548",
+            "\u4e0d\u5b58\u5728", "not found", "expired", "invalid",
+        )
+        _FINISH_KW = {"finish", "done", "\u5b8c\u6210", "\u7ed3\u675f"}
+
+        msg_events = exchange.get("events", [])
+        if not msg_events:
+            return {
+                "action": "finish", "target_button_row": None,
+                "target_button_col": None, "target_button_text": None,
+                "reason": "\u65e0\u6d88\u606f", "wait_seconds": None,
+            }
+
+        for ev in msg_events:
+            msg = ev.message
+            text = (getattr(msg, "message", None) or "").lower()
+            for ek in _ERROR_KW:
+                if ek in text:
+                    return {
+                        "action": "error", "target_button_row": None,
+                        "target_button_col": None, "target_button_text": None,
+                        "reason": f"\u68c0\u6d4b\u5230\u9519\u8bef\u5173\u952e\u8bcd: {ek}",
+                        "wait_seconds": None,
+                    }
+
+        for ev in msg_events:
+            msg = ev.message
+            if not (msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows):
+                continue
+
+            rows = msg.reply_markup.rows
+
+            # Phase 1: text-based next detection
+            for row_idx, row in enumerate(rows):
+                for col_idx, btn in enumerate(row.buttons):
+                    btn_text = (getattr(btn, "text", None) or "").lower().strip()
+                    if any(kw in btn_text for kw in _NEXT_KW):
+                        return {
+                            "action": "click_button",
+                            "target_button_row": row_idx,
+                            "target_button_col": col_idx,
+                            "target_button_text": getattr(btn, "text", None) or "",
+                            "reason": f"\u68c0\u6d4b\u5230\u7ffb\u9875\u6309\u94ae: {btn_text}",
+                            "wait_seconds": None,
+                        }
+
+            # Phase 2: number pagination
+            for row_idx, row in enumerate(rows):
+                btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
+                digits_with_idx = [(i, t) for i, t in enumerate(btn_texts) if t.isdigit()]
+                if len(digits_with_idx) >= 3:
+                    all_digits = sorted([int(t) for _, t in digits_with_idx])
+                    last_clicked = exchange.get("_last_clicked_number")
+
+                    if last_clicked is None:
+                        target_num = 2 if 2 in all_digits else all_digits[1]
+                    else:
+                        next_num = last_clicked + 1
+                        if next_num > all_digits[-1]:
+                            return {
+                                "action": "finish", "target_button_row": None,
+                                "target_button_col": None, "target_button_text": None,
+                                "reason": f"\u6570\u5b57\u7ffb\u9875\u5df2\u5230\u6700\u540e\u4e00\u9875 ({all_digits[-1]})",
+                                "wait_seconds": None,
+                            }
+                        target_num = next_num
+
+                    target_str = str(target_num)
+                    for col_idx, t in enumerate(btn_texts):
+                        if t == target_str:
+                            exchange["_last_clicked_number"] = target_num
+                            return {
+                                "action": "click_button",
+                                "target_button_row": row_idx,
+                                "target_button_col": col_idx,
+                                "target_button_text": target_str,
+                                "reason": f"\u6570\u5b57\u7ffb\u9875\uff0c\u70b9\u51fb\u7b2c{target_str}\u9875",
+                                "wait_seconds": None,
+                            }
+                    break
+
+            # Phase 3: icon-only — click rightmost button with callback_data
+            for row_idx in range(len(rows) - 1, -1, -1):
+                row = rows[row_idx]
+                if not row.buttons:
+                    continue
+                btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
+                all_empty = all(not t for t in btn_texts)
+                if all_empty:
+                    last_btn = row.buttons[-1]
+                    if getattr(last_btn, "data", None):
+                        return {
+                            "action": "click_button",
+                            "target_button_row": row_idx,
+                            "target_button_col": len(row.buttons) - 1,
+                            "target_button_text": "",
+                            "reason": "\u7eaf\u56fe\u6807\uff0c\u70b9\u51fb\u6700\u53f3\u4fa7\u6309\u94ae",
+                            "wait_seconds": None,
+                        }
+
+            # Phase 4: any remaining callback button as potential next
+            for row_idx, row in enumerate(rows):
+                for col_idx, btn in enumerate(row.buttons):
+                    if getattr(btn, "data", None):
+                        btn_text = (getattr(btn, "text", None) or "").strip().lower()
+                        if any(kw in btn_text for kw in _FINISH_KW):
+                            continue
+                        return {
+                            "action": "click_button",
+                            "target_button_row": row_idx,
+                            "target_button_col": col_idx,
+                            "target_button_text": getattr(btn, "text", None) or "",
+                            "reason": f"\u5c1d\u8bd5\u70b9\u51fb\u5269\u4f59\u6309\u94ae: {btn_text}",
+                            "wait_seconds": None,
+                        }
+
+        return {
+            "action": "finish", "target_button_row": None,
+            "target_button_col": None, "target_button_text": None,
+            "reason": "\u65e0\u7ffb\u9875\u6309\u94ae\uff0c\u7ed3\u675f\u6536\u96c6",
+            "wait_seconds": None,
+        }
 
     async def _click_button(self, bot_username: str, row: int, col: int) -> bool:
         exchange = self._bot_exchange.get(bot_username)
@@ -589,6 +706,7 @@ class UserRelay:
                 "_settle_task": None,
                 "_ai_running": False,
                 "_keyboard_msg": None,
+                "_last_clicked_number": None,
             }
             self._restart_settle(
                 self._bot_exchange[bot_username], bot_username,

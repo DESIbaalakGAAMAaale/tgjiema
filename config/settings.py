@@ -35,10 +35,6 @@ class Settings(BaseSettings):
     RELAY_PHONE: str = ""
     RELAY_CODE: str = ""
 
-    AI_API_BASE_URL: str = ""
-    AI_API_KEY: str = ""
-    AI_MODEL: str = "gpt-4o-mini"
-
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""
