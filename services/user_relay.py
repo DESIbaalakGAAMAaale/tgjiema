@@ -12,6 +12,7 @@ from services.ai_agent import ai_agent
 
 
 _SETTLE_WAIT = 5
+_INITIAL_SETTLE_WAIT = 20
 _MAX_AI_LOOP = 10
 
 
@@ -286,7 +287,7 @@ class UserRelay:
             await self._download_and_cache_one(event.message, exchange.get("user_id"), exchange.get("code"))
             self._restart_settle(exchange, bot_username)
 
-    def _restart_settle(self, exchange: dict, bot_username: str):
+    def _restart_settle(self, exchange: dict, bot_username: str, settle_wait: float = _SETTLE_WAIT):
         exchange["_msg_version"] = exchange.get("_msg_version", 0) + 1
         old = exchange.get("_settle_task")
         if old and not old.done():
@@ -295,7 +296,7 @@ class UserRelay:
             else:
                 return
         exchange["_settle_task"] = asyncio.create_task(
-            self._ai_message_loop(bot_username)
+            self._ai_message_loop(bot_username, settle_wait)
         )
 
     async def _flush_media_group_buffer(self, media_group_id: str, bot_username: str):
@@ -334,11 +335,11 @@ class UserRelay:
         exchange.setdefault("events", []).extend(events_list)
         self._restart_settle(exchange, bot_username)
 
-    async def _ai_message_loop(self, bot_username: str):
+    async def _ai_message_loop(self, bot_username: str, settle_wait: float = _SETTLE_WAIT):
         task = asyncio.current_task()
         if task:
             task.set_name("settle_sleeping")
-        await asyncio.sleep(_SETTLE_WAIT)
+        await asyncio.sleep(settle_wait)
         if task:
             task.set_name("")
 
@@ -485,6 +486,17 @@ class UserRelay:
         )
 
         if not all_events:
+            logger.warning(
+                f"[UserRelay] 目标机器人 @{bot_username} 未返回任何文件 "
+                f"(user={user_id}, code={code})"
+            )
+            try:
+                await self._client.send_message(
+                    user_id,
+                    f"@{bot_username} 未返回任何文件，该码可能已失效，请稍后重试。",
+                )
+            except Exception as e:
+                logger.error(f"[UserRelay] 通知用户失败: {e}")
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
             return
@@ -570,6 +582,10 @@ class UserRelay:
                 "_ai_running": False,
                 "_keyboard_msg": None,
             }
+            self._restart_settle(
+                self._bot_exchange[bot_username], bot_username,
+                settle_wait=_INITIAL_SETTLE_WAIT,
+            )
             logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，AI驱动等待响应 (user={user_id}, code={code})")
             return True
         except Exception as e:
