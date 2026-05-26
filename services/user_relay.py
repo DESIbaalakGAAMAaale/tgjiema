@@ -259,6 +259,26 @@ class UserRelay:
         except Exception:
             return ""
 
+    async def _download_and_cache_one(self, msg, user_id: int, code: str):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fp = await self._client.download_media(msg, file=tmpdir)
+            if not fp:
+                logger.warning(f"[UserRelay] 下载媒体失败 (code={code})")
+                return
+
+            send_kwargs = self._build_send_kwargs(msg, "")
+            try:
+                storage_msg = await self._client.send_file(
+                    self._storage_channel_entity, fp, **send_kwargs
+                )
+                cache_fid = self._extract_file_id(storage_msg)
+                await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
+                logger.info(
+                    f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
+                )
+            except Exception as e:
+                logger.error(f"[UserRelay] 缓存到存储频道失败 (code={code}): {e}")
+
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
@@ -311,6 +331,7 @@ class UserRelay:
                 return
 
             exchange.setdefault("events", []).append(event)
+            await self._download_and_cache_one(event.message, exchange.get("user_id"), exchange.get("code"))
             self._restart_settle(exchange, bot_username)
 
     def _restart_settle(self, exchange: dict, bot_username: str):
@@ -345,9 +366,14 @@ class UserRelay:
             return
 
         events_list = buf["events"]
+        user_id = exchange.get("user_id")
+        code = exchange.get("code")
         logger.info(
-            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events_list)} 条，已收集到队列"
+            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events_list)} 条，开始缓存到存储频道"
         )
+
+        for ev in events_list:
+            await self._download_and_cache_one(ev.message, user_id, code)
 
         exchange.setdefault("events", []).extend(events_list)
         self._restart_settle(exchange, bot_username)
@@ -489,63 +515,48 @@ class UserRelay:
                 self._pending_cleanup(bot_username)
             return
 
-        all_storage_msg_ids = []
-        all_storage_file_ids = []
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            file_paths = []
-            captions = []
-            all_type_kwargs = []
-            for ev in all_events:
-                msg = ev.message
-                fp = await self._client.download_media(msg, file=tmpdir)
-                if fp:
-                    file_paths.append(fp)
-                    orig = getattr(msg, "message", None) or ""
-                    captions.append(f"RELAY_FILE:{user_id}:{code}\n\n{orig}")
-                    all_type_kwargs.append(self._build_send_kwargs(msg, ""))
-
-            if not file_paths:
-                logger.warning(f"[UserRelay] 无有效文件 (code={code})")
+        from database import get_file_records_col
+        try:
+            files_col = get_file_records_col()
+            record = await files_col.find_one({"file_code": code})
+            if not record:
+                logger.warning(f"[UserRelay] DB 无记录 (code={code})")
                 if self._pending_cleanup:
                     self._pending_cleanup(bot_username)
                 return
 
-            if code and self._storage_channel_entity:
-                for idx, fp in enumerate(file_paths):
-                    try:
-                        storage_kw = all_type_kwargs[idx] if idx < len(all_type_kwargs) else {}
-                        storage_msg = await self._client.send_file(
-                            self._storage_channel_entity, fp, **storage_kw
-                        )
-                        cache_fid = self._extract_file_id(storage_msg)
-                        await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
-                        all_storage_msg_ids.append(str(storage_msg.id))
-                        all_storage_file_ids.append(cache_fid or "")
-                    except Exception as e:
-                        logger.error(f"[UserRelay] 第 {idx+1} 条缓存失败: {e}")
-                logger.info(
-                    f"[UserRelay] {len(file_paths)} 条已缓存到存储频道 (code={code})"
-                )
+            batch_ids_str = record.get("batch_msg_ids") or ""
+            if not isinstance(batch_ids_str, str):
+                batch_ids_str = str(batch_ids_str)
+            msg_ids = []
+            primary_mid = record.get("primary_channel_msg_id")
+            if primary_mid:
+                msg_ids.append(str(primary_mid))
+            for mid in batch_ids_str.split(","):
+                m = mid.strip()
+                if m and m not in msg_ids:
+                    msg_ids.append(m)
 
-            if all_storage_msg_ids:
-                storage_ids_str = ",".join(all_storage_msg_ids)
-                for i in range(len(captions)):
-                    header = f"RELAY_FILE:{user_id}:{code}\nSTORAGE_IDS:{storage_ids_str}"
-                    orig_part = captions[i].split("\n\n", 1)[1] if "\n\n" in captions[i] else ""
-                    captions[i] = f"{header}\n\n{orig_part}"
+            if not msg_ids:
+                logger.warning(f"[UserRelay] 无存储 msg_id (code={code})")
+                if self._pending_cleanup:
+                    self._pending_cleanup(bot_username)
+                return
+
+            storage_ids_str = ",".join(msg_ids)
 
             if self._decoder_bot_entity:
-                try:
-                    await self._client.send_file(
-                        self._decoder_bot_entity, file_paths,
-                        caption=captions,
-                    )
-                    logger.info(
-                        f"[UserRelay] {len(file_paths)} 条已批量发送到解码机器人 (code={code})"
-                    )
-                except Exception as e:
-                    logger.error(f"[UserRelay] 发送到解码机器人失败 (code={code}): {e}")
+                await self._client.send_message(
+                    self._decoder_bot_entity,
+                    f"RELAY_BATCH:{user_id}:{code}\nSTORAGE_IDS:{storage_ids_str}",
+                )
+                logger.info(
+                    f"[UserRelay] 已通知解码机器人: user={user_id}, code={code}, "
+                    f"{len(msg_ids)} 个缓存文件"
+                )
+
+        except Exception as e:
+            logger.error(f"[UserRelay] 处理收集文件失败 (code={code}): {e}")
 
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)

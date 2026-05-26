@@ -164,7 +164,7 @@ class AIAgent:
         logger.info(f"[AI Agent] 发送决策请求, context length={len(ctx)}")
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60)) as client:
                 resp = await client.post(
                     f"{self._api_base}/chat/completions",
                     headers={
@@ -203,7 +203,7 @@ class AIAgent:
                 return decision
 
         except Exception as e:
-            logger.error(f"[AI Agent] 调用失败，回退到默认行为: {e}")
+            logger.error(f"[AI Agent] 调用失败，回退到默认行为: {type(e).__name__}: {e}")
             return self._fallback_decision(exchange_data)
 
     def _fallback_decision(self, exchange_data: dict) -> dict:

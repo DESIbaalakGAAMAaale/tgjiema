@@ -95,6 +95,76 @@ def _parse_storage_ids_from_caption(caption: str) -> list[int]:
     return []
 
 
+async def _enqueue_storage_ids(
+    user_id: int, code: str, storage_ids: list[int], context=None
+):
+    files_col = get_file_records_col()
+    record = await files_col.find_one({"file_code": code})
+    if not record:
+        logger.warning(f"[_enqueue_storage_ids] DB 无记录 (code={code})")
+        return
+
+    storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
+    file_ids_str = record.get("file_ids") or ""
+    all_file_ids = [f for f in file_ids_str.split(",") if f.strip()] if file_ids_str else []
+
+    batch_all_ids = record.get("batch_msg_ids") or ""
+    all_msg_ids = []
+    primary_mid = record.get("primary_channel_msg_id")
+    if primary_mid:
+        all_msg_ids.append(str(primary_mid))
+    if batch_all_ids:
+        for mid in batch_all_ids.split(","):
+            m = mid.strip()
+            if m and m not in all_msg_ids:
+                all_msg_ids.append(m)
+
+    msg_id_to_file_id = {}
+    for i, mid_str in enumerate(all_msg_ids):
+        msg_id_to_file_id[mid_str] = all_file_ids[i] if i < len(all_file_ids) else ""
+
+    batch_file_meta = []
+    for sid in storage_ids:
+        sid_str = str(sid)
+        fid = msg_id_to_file_id.get(sid_str, "")
+        batch_file_meta.append({"file_id": fid, "type": "document"})
+
+    if len(storage_ids) > 1 and any(m.get("file_id") for m in batch_file_meta):
+        await enqueue_batch_send_task(
+            target_user_id=user_id,
+            channel_id=storage_channel,
+            channel_msg_ids=list(storage_ids),
+            batch_file_meta=json.dumps(batch_file_meta),
+            file_code=code,
+        )
+    else:
+        for sid in storage_ids:
+            await enqueue_send_task(
+                target_user_id=user_id,
+                channel_id=storage_channel,
+                message_id=sid,
+                file_code=code,
+            )
+
+    logger.info(
+        f"[_enqueue_storage_ids] 已入队: user={user_id}, code={code}, "
+        f"{len(storage_ids)} 个文件"
+    )
+
+    if context:
+        from services.code_generator import extract_bot_username
+        target_bot_username = extract_bot_username(code) or ""
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"解码完成！文件已由 @{settings.SENDER_BOT_USERNAME} 发送给您，请前往查收。"
+                ),
+            )
+        except Exception:
+            pass
+
+
 def _extract_media_info(msg):
     if msg.photo:
         return msg.photo[-1].file_id, "photo"
@@ -293,13 +363,14 @@ async def _cache_external_file(
 
 async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:")):
+    if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
         return
     if not user_relay.relay_user_id or update.effective_user.id != user_relay.relay_user_id:
         return
 
     is_renew = text.startswith("RELAY_RENEW:")
     is_error = text.startswith("RELAY_ERROR:")
+    is_batch = text.startswith("RELAY_BATCH:")
     parts = text.split(":", 2)
     if len(parts) != 3:
         return
@@ -328,6 +399,18 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id=target_user_id,
             text=f"文件码 {code} 的缓存已过期，请重新发送该码以获取最新文件。",
         )
+        return
+
+    if is_batch:
+        storage_ids = _parse_storage_ids_from_caption(text)
+        logger.info(
+            f"[handle_relay_delivery] RELAY_BATCH: user={target_user_id}, code={code}, "
+            f"storage_ids={storage_ids}"
+        )
+        if not storage_ids:
+            return
+
+        await _enqueue_storage_ids(target_user_id, code, storage_ids, context)
         return
 
     logger.info(
