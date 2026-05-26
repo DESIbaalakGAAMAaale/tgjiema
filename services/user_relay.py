@@ -1,11 +1,10 @@
 import asyncio
-import tempfile
 from pathlib import Path
 
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
-from telethon.tl.types import (DocumentAttributeVideo, PeerChannel)
+from telethon.tl.types import PeerChannel
 from telethon.utils import pack_bot_file_id
 
 from config import settings
@@ -30,51 +29,6 @@ class UserRelay:
         self._relay_phone: str = ""
         self._pending_cleanup = None
         self._relay_user_id = None
-
-    @staticmethod
-    def _detect_media_type(msg) -> str:
-        if getattr(msg, "photo", None):
-            return "photo"
-        if getattr(msg, "video", None):
-            return "video"
-        if getattr(msg, "voice", None):
-            return "voice"
-        if getattr(msg, "audio", None):
-            return "audio"
-        if getattr(msg, "gif", None):
-            return "gif"
-        return "document"
-
-    @staticmethod
-    def _build_send_kwargs(msg, caption: str) -> dict:
-        kwargs = {"caption": caption}
-        if getattr(msg, "video", None):
-            kwargs["video"] = True
-            kwargs["supports_streaming"] = True
-            v = msg.video
-            kwargs["attributes"] = [
-                DocumentAttributeVideo(
-                    duration=getattr(v, "duration", 0) or 0,
-                    w=getattr(v, "w", 0) or 0,
-                    h=getattr(v, "h", 0) or 0,
-                    supports_streaming=True,
-                )
-            ]
-        elif getattr(msg, "voice", None):
-            kwargs["voice_note"] = True
-        elif getattr(msg, "gif", None):
-            kwargs["video"] = True
-            kwargs["supports_streaming"] = True
-            g = msg.gif
-            kwargs["attributes"] = [
-                DocumentAttributeVideo(
-                    duration=getattr(g, "duration", 0) or 0,
-                    w=getattr(g, "w", 0) or 0,
-                    h=getattr(g, "h", 0) or 0,
-                    supports_streaming=True,
-                )
-            ]
-        return kwargs
 
     @property
     def is_ready(self) -> bool:
@@ -262,24 +216,17 @@ class UserRelay:
     async def _download_and_cache_one(self, msg, user_id: int, code: str):
         if not getattr(msg, "media", None):
             return
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fp = await self._client.download_media(msg, file=tmpdir)
-            if not fp:
-                logger.warning(f"[UserRelay] 下载媒体失败 (code={code})")
-                return
-
-            send_kwargs = self._build_send_kwargs(msg, "")
-            try:
-                storage_msg = await self._client.send_file(
-                    self._storage_channel_entity, fp, **send_kwargs
-                )
-                cache_fid = self._extract_file_id(storage_msg)
-                await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
-                logger.info(
-                    f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
-                )
-            except Exception as e:
-                logger.error(f"[UserRelay] 缓存到存储频道失败 (code={code}): {e}")
+        try:
+            storage_msg = await self._client.send_file(
+                self._storage_channel_entity, msg.media
+            )
+            cache_fid = self._extract_file_id(storage_msg)
+            await self._cache_file_record(code, storage_msg.id, file_id=cache_fid)
+            logger.info(
+                f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
+            )
+        except Exception as e:
+            logger.error(f"[UserRelay] 缓存到存储频道失败 (code={code}): {e}")
 
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
