@@ -293,6 +293,13 @@ class UserRelay:
             return "document"
         return "document"
 
+    @staticmethod
+    def _extract_number(text: str) -> int | None:
+        digits = "".join(ch for ch in text if ch.isdigit())
+        if digits:
+            return int(digits)
+        return None
+
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
@@ -500,6 +507,7 @@ class UserRelay:
                         await self._process_all_collected(bot_username)
                         break
 
+                    exchange.setdefault("_clicked_buttons", set()).add((row, col))
                     await asyncio.sleep(4)
                     continue
                 else:
@@ -572,9 +580,13 @@ class UserRelay:
             # Phase 2: number pagination
             for row_idx, row in enumerate(rows):
                 btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
-                digits_with_idx = [(i, t) for i, t in enumerate(btn_texts) if t.isdigit()]
-                if len(digits_with_idx) >= 3:
-                    all_digits = sorted([int(t) for _, t in digits_with_idx])
+                numbers = []
+                for col_idx, t in enumerate(btn_texts):
+                    n = self._extract_number(t)
+                    if n is not None:
+                        numbers.append((col_idx, t, n))
+                if len(numbers) >= 3:
+                    all_digits = sorted([n for _, _, n in numbers])
                     last_clicked = exchange.get("_last_clicked_number")
 
                     if last_clicked is None:
@@ -591,15 +603,15 @@ class UserRelay:
                         target_num = next_num
 
                     target_str = str(target_num)
-                    for col_idx, t in enumerate(btn_texts):
-                        if t == target_str or (t.isdigit() and int(t) == target_num):
+                    for col_idx, t, n in numbers:
+                        if n == target_num:
                             exchange["_last_clicked_number"] = target_num
                             return {
                                 "action": "click_button",
                                 "target_button_row": row_idx,
                                 "target_button_col": col_idx,
-                                "target_button_text": target_str,
-                                "reason": f"\u6570\u5b57\u7ffb\u9875\uff0c\u70b9\u51fb\u7b2c{target_str}\u9875",
+                                "target_button_text": t,
+                                "reason": f"\u6570\u5b57\u7ffb\u9875\uff0c\u70b9\u51fb\u7b2c{target_num}\u9875 (\u6309\u94ae\u6587\u672c: {t})",
                                 "wait_seconds": None,
                             }
                     break
@@ -624,11 +636,14 @@ class UserRelay:
                         }
 
             # Phase 4: any remaining callback button as potential next
+            clicked = exchange.get("_clicked_buttons") or set()
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
                     if getattr(btn, "data", None):
                         btn_text = (getattr(btn, "text", None) or "").strip().lower()
                         if any(kw in btn_text for kw in _FINISH_KW):
+                            continue
+                        if (row_idx, col_idx) in clicked:
                             continue
                         return {
                             "action": "click_button",
@@ -825,6 +840,7 @@ class UserRelay:
                 "_ai_running": False,
                 "_keyboard_msg": None,
                 "_last_clicked_number": None,
+                "_clicked_buttons": set(),
             }
             self._restart_settle(
                 self._bot_exchange[bot_username.lower()], bot_username.lower(),
