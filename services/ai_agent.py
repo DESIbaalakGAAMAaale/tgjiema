@@ -183,7 +183,19 @@ class AIAgent:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-                ai_text = data["choices"][0]["message"]["content"]
+                logger.debug(f"[AI Agent] 完整响应: {json.dumps(data, ensure_ascii=False)[:1000]}")
+
+                ai_text = ""
+                choices = data.get("choices", [])
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    ai_text = msg.get("content") or ""
+                    if not ai_text:
+                        ai_text = choices[0].get("text") or ""
+                if not ai_text:
+                    logger.error(f"[AI Agent] AI 返回空内容, 原始: {json.dumps(data, ensure_ascii=False)[:500]}")
+                    return self._fallback_decision(exchange_data)
+
                 logger.info(f"[AI Agent] AI 回复: {ai_text[:200]}")
 
                 decision = _parse_json_from_response(ai_text)
