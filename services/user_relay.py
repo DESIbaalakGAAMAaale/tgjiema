@@ -247,7 +247,16 @@ class UserRelay:
         if not msg or not msg.media:
             return ""
         try:
-            return pack_bot_file_id(msg.media) or ""
+            media = msg.media
+            from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
+
+            if isinstance(media, MessageMediaPhoto):
+                inner = media.photo
+                return pack_bot_file_id(inner) or ""
+            elif isinstance(media, MessageMediaDocument):
+                inner = media.document
+                return pack_bot_file_id(inner) or ""
+            return pack_bot_file_id(media) or ""
         except Exception:
             return ""
 
