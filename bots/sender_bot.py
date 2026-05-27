@@ -35,22 +35,6 @@ def _build_input_media(meta: dict):
         return InputMediaDocument(media=fid)
 
 
-def _extract_file_id_from_msg(message):
-    if message.photo:
-        return message.photo[-1].file_id, "photo"
-    elif message.video:
-        return message.video.file_id, "video"
-    elif message.audio:
-        return message.audio.file_id, "audio"
-    elif message.voice:
-        return message.voice.file_id, "voice"
-    elif message.animation:
-        return message.animation.file_id, "animation"
-    elif message.document:
-        return message.document.file_id, "document"
-    return "", "document"
-
-
 def _build_pagination_keyboard(file_code: str, current_page: int, total_pages: int):
     buttons = []
     if current_page > 1:
@@ -218,27 +202,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     end = start + PAGE_SIZE
     page_items = file_meta_list[start:end]
 
-    temp_msg_ids = []
-    input_media = []
-
-    can_derive = storage_channel_id and all("msg_id" in meta for meta in page_items)
-
-    if can_derive:
-        for meta in page_items:
-            try:
-                copied = await bot.copy_message(
-                    chat_id=storage_channel_id,
-                    from_chat_id=storage_channel_id,
-                    message_id=int(meta["msg_id"]),
-                )
-                temp_msg_ids.append(copied.message_id)
-                fid, mtype = _extract_file_id_from_msg(copied)
-                input_media.append(_build_input_media({"file_id": fid, "type": mtype}))
-            except Exception as e:
-                logger.error(f"复制消息获取file_id失败: msg_id={meta.get('msg_id')}, {e}")
-    else:
-        input_media = [_build_input_media(meta) for meta in page_items]
-
+    input_media = [_build_input_media(meta) for meta in page_items]
     try:
         await bot.send_media_group(chat_id=chat_id, media=input_media)
         logger.info(
@@ -258,12 +222,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             )
         except Exception:
             pass
-    finally:
-        for mid in temp_msg_ids:
-            try:
-                await bot.delete_message(chat_id=storage_channel_id, message_id=mid)
-            except Exception:
-                pass
+        return
 
     if total_pages > 1 and page < total_pages:
         keyboard = _build_pagination_keyboard(file_code, page, total_pages)
