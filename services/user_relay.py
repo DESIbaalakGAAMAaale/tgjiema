@@ -252,10 +252,18 @@ class UserRelay:
         except Exception:
             return ""
 
+    def _decrement_cache_counter(self, code: str):
+        current = self._pending_cache_counts.get(code, 0)
+        self._pending_cache_counts[code] = max(0, current - 1)
+        if self._pending_cache_counts[code] == 0:
+            ev = self._pending_cache_events.get(code)
+            if ev:
+                ev.set()
+
     async def _download_and_cache_one(self, msg, user_id: int, code: str):
         if not getattr(msg, "media", None):
+            self._decrement_cache_counter(code)
             return
-        self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
         try:
             storage_msg = await self._client.send_file(
                 self._storage_channel_entity, msg.media
@@ -271,12 +279,7 @@ class UserRelay:
         except Exception as e:
             logger.error(f"[UserRelay] 缓存到存储频道失败 (code={code}): {e}")
         finally:
-            current = self._pending_cache_counts.get(code, 0)
-            self._pending_cache_counts[code] = max(0, current - 1)
-            if self._pending_cache_counts[code] == 0:
-                ev = self._pending_cache_events.get(code)
-                if ev:
-                    ev.set()
+            self._decrement_cache_counter(code)
 
     @staticmethod
     def _detect_media_type(msg) -> str:
@@ -381,6 +384,7 @@ class UserRelay:
                 return
 
             exchange.setdefault("events", []).append(event)
+            self._pending_cache_counts[exchange.get("code")] = self._pending_cache_counts.get(exchange.get("code"), 0) + 1
             await self._download_and_cache_one(event.message, exchange.get("user_id"), exchange.get("code"))
             self._restart_settle(exchange, bot_username)
 
@@ -444,6 +448,9 @@ class UserRelay:
         )
 
         for ev in events_list:
+            self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
+
+        for ev in events_list:
             await self._download_and_cache_one(ev.message, user_id, code)
 
         exchange.setdefault("events", []).extend(events_list)
@@ -459,6 +466,8 @@ class UserRelay:
             return
         ev = self._pending_cache_events.setdefault(code, asyncio.Event())
         ev.clear()
+        if self._pending_cache_counts.get(code, 0) <= 0:
+            return
         logger.info(f"[UserRelay] 等待 {pending} 个缓存操作完成 (code={code})")
         try:
             await asyncio.wait_for(ev.wait(), timeout=timeout)
