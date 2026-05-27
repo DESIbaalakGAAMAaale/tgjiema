@@ -83,6 +83,18 @@ DDL_STATEMENTS = [
         config_value TEXT,
         updated_at TEXT
     )""",
+    """CREATE TABLE IF NOT EXISTS code_bot_mapping (
+        code TEXT PRIMARY KEY,
+        bot_username TEXT NOT NULL,
+        created_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS message_backups (
+        main_msg_id BIGINT,
+        backup_channel_id BIGINT,
+        backed_msg_id BIGINT,
+        backed_at TEXT,
+        PRIMARY KEY (main_msg_id, backup_channel_id)
+    )""",
 ]
 
 MIGRATION_STATEMENTS = [
@@ -399,6 +411,8 @@ _decode_logs_col = D1Collection("decode_logs")
 _pending_uploads_col = D1Collection("pending_uploads")
 _send_queue_col = D1Collection("send_queue")
 _backup_config_col = D1Collection("backup_config")
+_code_bot_mapping_col = D1Collection("code_bot_mapping")
+_message_backups_col = D1Collection("message_backups")
 
 
 def get_users_col() -> D1Collection:
@@ -423,6 +437,32 @@ def get_send_queue_col() -> D1Collection:
 
 def get_backup_config_col() -> D1Collection:
     return _backup_config_col
+
+
+def get_code_bot_mapping_col() -> D1Collection:
+    return _code_bot_mapping_col
+
+
+async def save_code_bot_mapping(code: str, bot_username: str):
+    col = get_code_bot_mapping_col()
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    existing = await col.find_one({"code": code})
+    if existing:
+        await col.update_one(
+            {"code": code},
+            {"$set": {"bot_username": bot_username, "created_at": now}},
+        )
+    else:
+        await col.insert_one({"code": code, "bot_username": bot_username, "created_at": now})
+
+
+async def get_bot_for_code(code: str) -> str:
+    col = get_code_bot_mapping_col()
+    row = await col.find_one({"code": code})
+    if row:
+        return row.get("bot_username", "")
+    return ""
 
 
 async def _get_config(key: str) -> Optional[str]:
@@ -528,3 +568,41 @@ async def set_relay_config(api_id: int, api_hash: str, phone: str):
 
 async def get_relay_status() -> str:
     return await _get_config("relay_status") or "offline"
+
+
+def get_message_backups_col() -> D1Collection:
+    return _message_backups_col
+
+
+async def save_message_backup(main_msg_id: int, backup_channel_id: int, backed_msg_id: int):
+    import datetime as _dt
+    col = get_message_backups_col()
+    existing = await col.find_one({
+        "main_msg_id": main_msg_id,
+        "backup_channel_id": backup_channel_id,
+    })
+    if existing:
+        await col.update_one(
+            {"main_msg_id": main_msg_id, "backup_channel_id": backup_channel_id},
+            {"$set": {
+                "backed_msg_id": backed_msg_id,
+                "backed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            }},
+        )
+    else:
+        await col.insert_one({
+            "main_msg_id": main_msg_id,
+            "backup_channel_id": backup_channel_id,
+            "backed_msg_id": backed_msg_id,
+            "backed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        })
+
+
+async def get_message_backups(main_msg_id: int) -> list[dict]:
+    col = get_message_backups_col()
+    return await col.find({"main_msg_id": main_msg_id})
+
+
+async def get_all_message_backups() -> list[dict]:
+    col = get_message_backups_col()
+    return await col.find({})

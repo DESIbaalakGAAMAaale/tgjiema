@@ -9,6 +9,7 @@ CODE_ALPHABET = string.ascii_lowercase + string.digits
 FILE_TYPE_LABELS = {"photo": "p", "video": "v", "document": "d", "audio": "a", "animation": "g"}
 
 _BOT_PATTERN = re.compile(r"^[a-zA-Z0-9_]+bot", re.IGNORECASE)
+_BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
 
 
 def _generate_random_part(length: int = 12) -> str:
@@ -38,6 +39,62 @@ def extract_bot_username(code: str) -> str:
     if match:
         return match.group(0)
     return ""
+
+
+def extract_code_and_bot_from_message(text: str) -> tuple[str, str]:
+    """从消息文本中提取文件码和目标解码器 bot 用户名。
+
+    处理码头不含 bot 名称但消息内含有解码器标识的情况，例如：
+    - "utheigh1231gg1f4     解码器ccmarkbot" → ("utheigh1231gg1f4", "ccmarkbot")
+    - "utheigh1231gg1f4\\n@ccmarkbot"        → ("utheigh1231gg1f4", "ccmarkbot")
+    - "@ccmarkbot utheigh1231gg1f4"           → ("utheigh1231gg1f4", "ccmarkbot")
+
+    Returns:
+        (code, bot_username) 提取成功；否则 ("", "")
+    """
+    text = text.strip()
+    if not text:
+        return "", ""
+
+    bot = extract_bot_username(text)
+    if bot:
+        return text, bot
+
+    normalized = re.sub(r'@([a-zA-Z0-9_]+bot)', r'\1', text, flags=re.IGNORECASE)
+
+    all_bots = list(set(_BOT_USERNAME_IN_MESSAGE.findall(normalized)))
+    if not all_bots:
+        return "", ""
+
+    bot_username = all_bots[0]
+
+    lines = normalized.split("\n")
+    code_candidates = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        has_bot = any(bot in line for bot in all_bots)
+        if not has_bot:
+            code_candidates.append(line)
+
+    if code_candidates:
+        code = code_candidates[0]
+        if code:
+            return code, bot_username
+
+    code = normalized
+    for b in all_bots:
+        code = code.replace(b, "")
+    for indicator in ("解码器", "解码", "解码Bot:", "解码bot:", "解码器:"):
+        code = code.replace(indicator, "")
+    code = code.replace("@", "")
+    code = code.strip(":：\t\n\r -_")
+    code = re.sub(r'[\u4e00-\u9fff]+', '', code).strip()
+
+    if code:
+        return code, bot_username
+    return "", ""
 
 
 def parse_file_types_from_code(code: str) -> dict:

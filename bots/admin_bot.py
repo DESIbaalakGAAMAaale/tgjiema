@@ -21,6 +21,7 @@ from database import (
 )
 from database.models import make_user
 from utils.monitor import metrics
+from utils.storage_channel import get_active_storage_channel_id, set_active_storage_channel_id, invalidate_cache
 
 TOKEN = settings.ADMIN_BOT_TOKEN
 AUTHORIZED_USER_ID = settings.ADMIN_TELEGRAM_ID
@@ -80,6 +81,7 @@ async def _get_status_text() -> str:
     today_decodes = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
     relay_pending = await get_config("relay_auth_pending")
     relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
+    active_channel = await get_active_storage_channel_id()
     msg = (
         f"📊 系统概览\n\n"
         f"👤 总用户数：{total_users}\n"
@@ -90,6 +92,7 @@ async def _get_status_text() -> str:
         f"📤 发送失败：{metrics.send_fail_count}\n"
         f"💾 备份成功：{metrics.backup_count}\n"
         f"❌ 备份失败：{metrics.backup_fail_count}\n"
+        f"\n📺 当前主存储频道：{active_channel}\n"
         f"\n🔐 用户中继：{relay_status}\n"
         f"\n🤖 机器人状态：\n"
     )
@@ -115,7 +118,10 @@ async def _get_health_text() -> str:
 
 async def _get_channels_text() -> str:
     tokens = await get_backup_bot_tokens()
-    msg = "📺 备份机器人 & 频道配置\n\n"
+    active_channel = await get_active_storage_channel_id()
+    msg = f"📺 主存储频道 & 备份配置\n\n"
+    msg += f"📌 当前主存储频道：{active_channel}\n"
+    msg += f"  通过 /promote_channel <频道ID> 可将备份频道切换为主频道\n\n"
     for i in (1, 2, 3):
         tk = tokens.get(str(i), "")
         channels = await get_backup_channels(i)
@@ -388,10 +394,11 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
 
     if menu_id == "backup_chan":
         text = (
-            "📺 备份频道管理\n\n"
+            "📺 主存储频道 & 备份管理\n\n"
             "/add_channel <频道ID> — 新增频道后选择机器人\n"
             "/add_channel <编号> <频道ID> — 直接指定机器人\n"
-            "/remove_channel <编号> <频道ID> — 删除备份频道"
+            "/remove_channel <编号> <频道ID> — 删除备份频道\n"
+            "/promote_channel <频道ID> — 将备份频道切换为主频道"
         )
         kb = [
             [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
@@ -1239,6 +1246,59 @@ async def backup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@_auth_required
+async def promote_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：/promote_channel <频道ID>\n\n"
+            "将指定的备份频道提升为新的主存储频道。\n"
+            "所有机器人将立即切换到新频道，无需重启。\n"
+            "原主频道将不再接收新文件上传，但已有文件的备份记录仍有效。"
+        )
+        return
+    try:
+        new_channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 频道ID必须是数字")
+        return
+
+    all_backups = list(settings.ALL_BACKUP_CHANNELS)
+    if not all_backups:
+        await update.message.reply_text("❌ 没有任何备份频道可提升")
+        return
+
+    if new_channel_id not in all_backups:
+        await update.message.reply_text(
+            f"❌ 频道 {new_channel_id} 不在备份频道列表中。\n"
+            f"当前备份频道: {all_backups}\n"
+            f"请先用 /channels 确认备份频道配置。"
+        )
+        return
+
+    old_channel = await get_active_storage_channel_id()
+    if new_channel_id == old_channel:
+        await update.message.reply_text(f"⚠️ 频道 {new_channel_id} 已经是当前主频道")
+        return
+
+    success = await set_active_storage_channel_id(new_channel_id)
+    if not success:
+        await update.message.reply_text("❌ 切换主存储频道失败，请检查数据库连接。")
+        return
+
+    invalidate_cache()
+    await update.message.reply_text(
+        f"✅ 主存储频道已切换！\n\n"
+        f"旧主频道：{old_channel}\n"
+        f"新主频道：{new_channel_id}\n\n"
+        f"📤 upload_bot 将上传新文件到新频道\n"
+        f"🤖 backup_bot 将实时监控新频道的新消息\n"
+        f"📨 sender_bot 发送时优先使用新频道\n\n"
+        f"⚠️ 旧频道中已存在的文件仍可通过 sender_bot 的备用频道机制获取\n"
+        f"⚠️ 建议将原主频道添加为备份频道")
+    )
+
+
 # ─── 系统配置管理 ────────────────────────────────────────────────
 
 
@@ -1534,6 +1594,7 @@ def run():
     app.add_handler(CommandHandler("relay_set_api", relay_set_api))
     app.add_handler(CommandHandler("relay_pending", relay_pending))
     app.add_handler(CommandHandler("backup_reset", backup_reset))
+    app.add_handler(CommandHandler("promote_channel", promote_channel))
     app.add_handler(CommandHandler("settings", settings_view))
     app.add_handler(CommandHandler("set_storage_channel", set_storage_channel))
     app.add_handler(CommandHandler("set_decoder_chat", set_decoder_chat))

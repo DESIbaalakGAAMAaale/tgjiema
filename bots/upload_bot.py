@@ -13,9 +13,9 @@ from services.permission import check_upload_permission
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
+from utils.storage_channel import get_active_storage_channel_id
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
-MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
 
 _pending_media_groups: dict[str, dict] = {}
 
@@ -134,7 +134,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending_col = get_pending_uploads_col()
         await pending_col.insert_one({
             "uploader_id": user.id,
-            "primary_channel_id": MAIN_CHANNEL_ID,
+            "primary_channel_id": await get_active_storage_channel_id(),
             "primary_channel_msg_id": channel_msg_ids[0],
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
@@ -193,7 +193,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         batch["file_types"][file_type] += 1
         batch["files_meta"].append(_extract_file_meta(update))
         try:
-            forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+            forwarded = await update.message.copy(chat_id=await get_active_storage_channel_id())
             batch["pinned_msg_ids"].append(forwarded.message_id)
         except Exception as e:
             logger.error(f"批次上传复制文件到存储频道失败: {e}")
@@ -210,7 +210,7 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
     copied = 0
     for up in grp["updates"]:
         try:
-            forwarded = await up.message.copy(chat_id=MAIN_CHANNEL_ID)
+            forwarded = await up.message.copy(chat_id=await get_active_storage_channel_id())
             batch["pinned_msg_ids"].append(forwarded.message_id)
             batch["files_meta"].append(_extract_file_meta(up))
             copied += 1
@@ -285,7 +285,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     all_meta = []
     for up in group["updates"]:
         try:
-            forwarded = await up.message.copy(chat_id=MAIN_CHANNEL_ID)
+            forwarded = await up.message.copy(chat_id=await get_active_storage_channel_id())
             all_mids.append(forwarded.message_id)
             all_meta.append(_extract_file_meta(up))
         except Exception as e:
@@ -311,7 +311,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         pending_col = get_pending_uploads_col()
         await pending_col.insert_one({
             "uploader_id": user_id,
-            "primary_channel_id": MAIN_CHANNEL_ID,
+            "primary_channel_id": await get_active_storage_channel_id(),
             "primary_channel_msg_id": all_mids[0],
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
@@ -337,8 +337,9 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 async def _process_upload(
     user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, file_types: dict
 ):
+    main_channel = await get_active_storage_channel_id()
     try:
-        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+        forwarded = await update.message.copy(chat_id=main_channel)
         channel_msg_id = forwarded.message_id
     except Exception as e:
         logger.error(f"转发文件到存储频道失败: {e}")
@@ -356,7 +357,7 @@ async def _process_upload(
         pending_col = get_pending_uploads_col()
         await pending_col.insert_one({
             "uploader_id": user_id,
-            "primary_channel_id": MAIN_CHANNEL_ID,
+            "primary_channel_id": main_channel,
             "primary_channel_msg_id": channel_msg_id,
             "file_types": type_str,
             "batch_msg_ids": "",

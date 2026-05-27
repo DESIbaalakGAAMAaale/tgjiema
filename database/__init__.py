@@ -16,4 +16,6 @@ from .session import (
     get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
     get_config, set_config, delete_config,
     get_relay_config, set_relay_config, get_relay_status,
+    get_code_bot_mapping_col, save_code_bot_mapping, get_bot_for_code,
+    get_message_backups_col, save_message_backup, get_message_backups, get_all_message_backups,
 )

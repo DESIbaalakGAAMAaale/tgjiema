@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import json
+import re
 import time
 from collections import defaultdict, deque
 
@@ -15,8 +16,10 @@ from database import (
     get_pending_uploads_col,
     make_file_record,
     make_decode_log,
+    save_code_bot_mapping,
+    get_bot_for_code,
 )
-from services.code_generator import generate_unique_code, is_valid_code_format
+from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
 from services.queue_manager import enqueue_send_task, enqueue_batch_send_task
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
@@ -24,9 +27,9 @@ from utils.channel_selector import channel_selector
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
 from services.user_relay import user_relay
+from utils.storage_channel import get_active_storage_channel_id
 
 TOKEN = settings.DECODER_BOT_TOKEN
-MAIN_CHANNEL_ID = settings.MAIN_STORAGE_CHANNEL_ID
 
 _pending_external: dict[str, deque[tuple[int, str, float]]] = defaultdict(deque)
 _PENDING_TTL = 300
@@ -105,7 +108,7 @@ async def _enqueue_storage_ids(
         logger.warning(f"[_enqueue_storage_ids] DB 无记录 (code={code})")
         return
 
-    storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
+    storage_channel = record.get("primary_channel_id") or await get_active_storage_channel_id()
 
     meta_raw = record.get("batch_file_meta") or ""
     try:
@@ -143,7 +146,7 @@ async def _enqueue_storage_ids(
         msg_id_to_file_id[mid_str] = all_file_ids[i] if i < len(all_file_ids) else ""
 
     batch_file_meta = []
-    storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
+    storage_channel = record.get("primary_channel_id") or await get_active_storage_channel_id()
     for sid in storage_ids:
         sid_str = str(sid)
         stored_entry = meta_by_msg_id.get(sid_str)
@@ -243,7 +246,7 @@ async def _flush_media_group_buffer(media_group_id: str):
                 logger.warning(f"[_flush_media_group_buffer] 中继媒体组: DB无记录 (code={code})")
                 return
 
-            storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
+            storage_channel = record.get("primary_channel_id") or await get_active_storage_channel_id()
             file_ids_str = record.get("file_ids") or ""
             all_file_ids = [f for f in file_ids_str.split(",") if f.strip()] if file_ids_str else []
 
@@ -303,10 +306,12 @@ async def _flush_media_group_buffer(media_group_id: str):
     channel_msg_ids = []
     batch_file_meta = []
 
+    active_channel = await get_active_storage_channel_id()
+
     for chat_id, msg_id, orig_caption in msgs:
         try:
             copy_kwargs: dict = {
-                "chat_id": MAIN_CHANNEL_ID,
+                "chat_id": active_channel,
                 "from_chat_id": chat_id,
                 "message_id": msg_id,
             }
@@ -333,7 +338,7 @@ async def _flush_media_group_buffer(media_group_id: str):
     try:
         await enqueue_batch_send_task(
             target_user_id=user_id,
-            channel_id=MAIN_CHANNEL_ID,
+            channel_id=active_channel,
             channel_msg_ids=channel_msg_ids,
             batch_file_meta=json.dumps(batch_file_meta),
             file_code=code,
@@ -377,7 +382,7 @@ async def _cache_external_file(
             record = make_file_record(
                 file_code=code,
                 uploader_id=0,
-                primary_channel_id=MAIN_CHANNEL_ID,
+                primary_channel_id=await get_active_storage_channel_id(),
                 primary_channel_msg_id=message_id,
                 file_types={},
             )
@@ -454,7 +459,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    selected_channel = channel_selector.select_channel(
+    selected_channel = await channel_selector.select_channel(
         preferred_channel_id=record.get("primary_channel_id")
     )
     msg_ids_raw = record.get("batch_msg_ids") or ""
@@ -730,7 +735,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     file_record = result.file_record
-    selected_channel = channel_selector.select_channel(
+    selected_channel = await channel_selector.select_channel(
         preferred_channel_id=file_record.get("primary_channel_id")
     )
 
@@ -817,6 +822,13 @@ async def handle_external_code(
     result,
 ):
     bot_username = result.external_bot_username
+
+    original_code = context.user_data.pop("_original_external_code", None)
+    if original_code:
+        code = original_code
+        bot_username = context.user_data.pop("_extracted_bot", bot_username)
+        asyncio.ensure_future(save_code_bot_mapping(code, bot_username))
+
     logger.info(f"[handle_external_code] 用户 {user_id} 请求外部码 {code}，目标机器人 @{bot_username}")
 
     remaining_info = ""
@@ -882,10 +894,11 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
     )
 
     forwarded = None
+    active_channel = await get_active_storage_channel_id()
     try:
-        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+        forwarded = await update.message.copy(chat_id=active_channel)
         await _cache_external_file(context, code, forwarded.message_id)
-        logger.info(f"[handle_external_file_response] 外部码 {code} 的文件已缓存到本地频道 {MAIN_CHANNEL_ID}")
+        logger.info(f"[handle_external_file_response] 外部码 {code} 的文件已缓存到本地频道 {active_channel}")
     except Exception as e:
         logger.error(f"[handle_external_file_response] 缓存外部文件到本地频道失败 (code={code}): {e}")
         try:
@@ -900,7 +913,7 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
     try:
         await enqueue_send_task(
             target_user_id=target_user_id,
-            channel_id=MAIN_CHANNEL_ID,
+            channel_id=active_channel,
             message_id=forwarded.message_id,
             file_code=code,
         )
@@ -923,8 +936,9 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     forwarded = None
+    active_channel = await get_active_storage_channel_id()
     try:
-        forwarded = await update.message.copy(chat_id=MAIN_CHANNEL_ID)
+        forwarded = await update.message.copy(chat_id=active_channel)
         await _cache_external_file(context, code, forwarded.message_id)
     except Exception as e:
         logger.error(f"[handle_external_media] 缓存外部媒体文件到本地频道失败 (code={code}): {e}")
@@ -940,7 +954,7 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await enqueue_send_task(
             target_user_id=target_user_id,
-            channel_id=MAIN_CHANNEL_ID,
+            channel_id=active_channel,
             message_id=forwarded.message_id,
             file_code=code,
         )
@@ -993,7 +1007,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
                 pass
             return True
 
-        storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
+        storage_channel = record.get("primary_channel_id") or await get_active_storage_channel_id()
 
         file_ids_str = record.get("file_ids") or ""
         all_file_ids = [f for f in file_ids_str.split(",") if f.strip()] if file_ids_str else []
@@ -1060,6 +1074,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_valid_code_format(text.strip()):
             await handle_code(update, context)
             return
+
+        code, bot_username = extract_code_and_bot_from_message(text)
+        if code and bot_username:
+            context.user_data["_original_external_code"] = code
+            context.user_data["_extracted_bot"] = bot_username
+            object.__setattr__(update.message, "text", f"{bot_username}:{code}")
+            await handle_code(update, context)
+            return
+
+        clean_text = text.strip()
+        if clean_text and len(clean_text) >= 4 and not re.search(r'[\u4e00-\u9fff]', clean_text):
+            known_bot = await get_bot_for_code(clean_text)
+            if known_bot:
+                logger.info(f"[handle_message] 命中无头码缓存: code={clean_text}, bot={known_bot}")
+                context.user_data["_original_external_code"] = clean_text
+                context.user_data["_extracted_bot"] = known_bot
+                object.__setattr__(update.message, "text", f"{known_bot}:{clean_text}")
+                await handle_code(update, context)
+                return
     except Exception as e:
         logger.error(f"[handle_message] 处理消息异常 (user={update.effective_user.id if update.effective_user else 'unknown'}): {e}")
         try:
