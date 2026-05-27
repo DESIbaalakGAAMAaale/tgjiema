@@ -13,7 +13,7 @@ from config import settings
 
 _SETTLE_WAIT = 5
 _INITIAL_SETTLE_WAIT = 20
-_MAX_PAGE_LOOP = 20
+_MAX_PAGE_LOOP = 100
 
 
 class UserRelay:
@@ -691,12 +691,7 @@ class UserRelay:
                     else:
                         next_num = last_clicked + 1
                         if next_num > all_digits[-1]:
-                            return {
-                                "action": "finish", "target_button_row": None,
-                                "target_button_col": None, "target_button_text": None,
-                                "reason": f"\u6570\u5b57\u7ffb\u9875\u5df2\u5230\u6700\u540e\u4e00\u9875 ({all_digits[-1]})",
-                                "wait_seconds": None,
-                            }
+                            break
                         target_num = next_num
 
                     target_str = str(target_num)
