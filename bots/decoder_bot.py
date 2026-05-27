@@ -361,11 +361,9 @@ async def _cache_external_file(
         existing = await files_col.find_one({"file_code": code})
         if existing:
             batch = existing.get("batch_msg_ids", "") or ""
-            batch_ids = [str(mid) for mid in batch.split(",") if mid.strip()] if isinstance(batch, str) else batch
-            if isinstance(batch_ids, list):
-                batch_ids = [str(x) for x in batch_ids]
-            else:
-                batch_ids = []
+            if not isinstance(batch, str):
+                batch = str(batch)
+            batch_ids = [mid for mid in batch.split(",") if mid.strip()]
             if str(message_id) not in batch_ids:
                 batch_ids.append(str(message_id))
             await files_col.update_one(

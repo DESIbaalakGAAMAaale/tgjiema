@@ -176,10 +176,9 @@ class UserRelay:
                 existing = await files_col.find_one({"file_code": code})
                 if existing:
                     batch = existing.get("batch_msg_ids", "") or ""
-                    if isinstance(batch, str):
-                        batch_ids = [mid for mid in batch.split(",") if mid.strip()]
-                    else:
-                        batch_ids = [str(x) for x in batch] if isinstance(batch, list) else []
+                    if not isinstance(batch, str):
+                        batch = str(batch)
+                    batch_ids = [mid for mid in batch.split(",") if mid.strip()]
                     if str(message_id) not in batch_ids:
                         batch_ids.append(str(message_id))
 
@@ -841,10 +840,20 @@ class UserRelay:
             batch_ids_str = record.get("batch_msg_ids") or ""
             if not isinstance(batch_ids_str, str):
                 batch_ids_str = str(batch_ids_str)
+            bfm = record.get("batch_file_meta", "")
+            if isinstance(bfm, list):
+                bfm_len = len(bfm)
+            elif isinstance(bfm, str) and bfm:
+                try:
+                    bfm_len = len(json.loads(bfm))
+                except (json.JSONDecodeError, TypeError):
+                    bfm_len = 0
+            else:
+                bfm_len = 0
             logger.info(
                 f"[UserRelay] DB记录 (code={code}): primary_mid={record.get('primary_channel_msg_id')}, "
                 f"batch_ids_str={batch_ids_str}, "
-                f"batch_file_meta_len={len(json.loads(record.get('batch_file_meta') or '[]') if isinstance(record.get('batch_file_meta'), str) else [])}"
+                f"batch_file_meta_len={bfm_len}"
             )
             msg_ids = []
             primary_mid = record.get("primary_channel_msg_id")

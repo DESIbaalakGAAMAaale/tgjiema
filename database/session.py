@@ -162,7 +162,7 @@ def _row_to_dict(record) -> dict:
             result[col] = int(val) if val is not None else 0
         elif col in ("can_upload", "is_banned"):
             result[col] = bool(val)
-        elif col in ("file_types", "backup_channel_msg_ids", "batch_msg_ids", "batch_file_meta"):
+        elif col in ("file_types", "backup_channel_msg_ids", "batch_file_meta"):
             if val is None or val == "":
                 result[col] = ""
             else:
@@ -170,6 +170,8 @@ def _row_to_dict(record) -> dict:
                     result[col] = json.loads(val)
                 except (json.JSONDecodeError, TypeError):
                     result[col] = val
+        elif col == "batch_msg_ids":
+            result[col] = str(val) if val else ""
         elif col in (
             "created_at", "updated_at", "create_time", "request_time",
             "expire_time", "quota_date", "external_quota_date",
