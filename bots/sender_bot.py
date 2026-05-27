@@ -36,19 +36,52 @@ def _build_input_media(meta: dict):
 
 
 def _build_pagination_keyboard(file_code: str, current_page: int, total_pages: int):
-    buttons = []
+    keyboard = []
+
+    nav_row = []
     if current_page > 1:
-        buttons.append(InlineKeyboardButton(
-            "<< 上一页", callback_data=f"pg|{file_code}|{current_page - 1}"
+        nav_row.append(InlineKeyboardButton(
+            "⏮ 首页", callback_data=f"pg|{file_code}|1"
         ))
-    buttons.append(InlineKeyboardButton(
-        f"{current_page}/{total_pages}", callback_data="noop"
+        nav_row.append(InlineKeyboardButton(
+            "◀ 上页", callback_data=f"pg|{file_code}|{current_page - 1}"
+        ))
+    nav_row.append(InlineKeyboardButton(
+        f"第{current_page}/{total_pages}页", callback_data="noop"
     ))
     if current_page < total_pages:
-        buttons.append(InlineKeyboardButton(
-            "下一页 >>", callback_data=f"pg|{file_code}|{current_page + 1}"
+        nav_row.append(InlineKeyboardButton(
+            "下页 ▶", callback_data=f"pg|{file_code}|{current_page + 1}"
         ))
-    return InlineKeyboardMarkup([buttons])
+        nav_row.append(InlineKeyboardButton(
+            "末页 ⏭", callback_data=f"pg|{file_code}|{total_pages}"
+        ))
+    keyboard.append(nav_row)
+
+    if total_pages > 1:
+        page_row = _build_page_number_buttons(file_code, current_page, total_pages)
+        if page_row:
+            keyboard.append(page_row)
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_page_number_buttons(file_code: str, current_page: int, total_pages: int):
+    WINDOW_SIZE = 8
+    window = min(WINDOW_SIZE, total_pages)
+    start = max(1, min(current_page - window // 2, total_pages - window + 1))
+
+    buttons = []
+    for p in range(start, start + window):
+        if p == current_page:
+            buttons.append(InlineKeyboardButton(
+                f"● {p}", callback_data="noop"
+            ))
+        else:
+            buttons.append(InlineKeyboardButton(
+                str(p), callback_data=f"pg|{file_code}|{p}"
+            ))
+    return buttons
 
 
 async def process_queue(bot):
