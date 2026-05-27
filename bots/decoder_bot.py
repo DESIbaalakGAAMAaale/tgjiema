@@ -143,17 +143,19 @@ async def _enqueue_storage_ids(
         msg_id_to_file_id[mid_str] = all_file_ids[i] if i < len(all_file_ids) else ""
 
     batch_file_meta = []
+    storage_channel = record.get("primary_channel_id", MAIN_CHANNEL_ID)
     for sid in storage_ids:
         sid_str = str(sid)
         stored_entry = meta_by_msg_id.get(sid_str)
         if stored_entry:
             batch_file_meta.append({
+                "msg_id": str(sid),
                 "file_id": stored_entry.get("file_id", ""),
                 "type": stored_entry.get("type", "document"),
             })
         else:
             fid = msg_id_to_file_id.get(sid_str, "")
-            batch_file_meta.append({"file_id": fid, "type": "document"})
+            batch_file_meta.append({"msg_id": str(sid), "file_id": fid, "type": "document"})
 
     if len(storage_ids) > 1 and any(m.get("file_id") for m in batch_file_meta):
         await enqueue_batch_send_task(

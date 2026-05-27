@@ -155,7 +155,7 @@ async def _process_batch_task(bot, task):
         return
 
     total_pages = (len(file_meta_list) + PAGE_SIZE - 1) // PAGE_SIZE
-    await _send_page(bot, task.target_user_id, task.file_code, file_meta_list, page=1, total_pages=total_pages)
+    await _send_page(bot, task.target_user_id, task.file_code, file_meta_list, page=1, total_pages=total_pages, storage_channel_id=task.channel_id)
 
     if total_pages > 1:
         _pagination_states[task.file_code] = {
@@ -163,6 +163,7 @@ async def _process_batch_task(bot, task):
             "batch_file_meta": file_meta_list,
             "total_pages": total_pages,
             "chat_id": task.target_user_id,
+            "storage_channel_id": task.channel_id,
         }
 
 
@@ -196,33 +197,59 @@ async def _fallback_single_send(bot, task):
     metrics.record_processed("sender_bot")
 
 
-async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages):
+async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None):
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
     page_items = file_meta_list[start:end]
 
-    input_media = [_build_input_media(meta) for meta in page_items]
-
-    try:
-        await bot.send_media_group(chat_id=chat_id, media=input_media)
-        logger.info(
-            f"媒体组发送成功: chat={chat_id}, 码 {file_code}, "
-            f"第 {page}/{total_pages} 页, {len(page_items)} 个文件"
-        )
-        metrics.send_success_count += 1
-        metrics.record_processed("sender_bot")
-    except Exception as e:
-        logger.error(f"媒体组发送失败: {e}")
-        metrics.send_fail_count += 1
-        metrics.record_error("sender_bot")
+    if storage_channel_id:
+        msg_ids = [int(meta["msg_id"]) for meta in page_items]
         try:
-            await bot.send_message(
+            await bot.copy_messages(
                 chat_id=chat_id,
-                text="文件发送失败，请稍后重试或联系管理员。",
+                from_chat_id=storage_channel_id,
+                message_ids=msg_ids,
             )
-        except Exception:
-            pass
-        return
+            logger.info(
+                f"媒体组发送成功(复制): chat={chat_id}, 码 {file_code}, "
+                f"第 {page}/{total_pages} 页, {len(msg_ids)} 个文件"
+            )
+            metrics.send_success_count += 1
+            metrics.record_processed("sender_bot")
+        except Exception as e:
+            logger.error(f"媒体组发送失败: {e}")
+            metrics.send_fail_count += 1
+            metrics.record_error("sender_bot")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="文件发送失败，请稍后重试或联系管理员。",
+                )
+            except Exception:
+                pass
+            return
+    else:
+        input_media = [_build_input_media(meta) for meta in page_items]
+        try:
+            await bot.send_media_group(chat_id=chat_id, media=input_media)
+            logger.info(
+                f"媒体组发送成功: chat={chat_id}, 码 {file_code}, "
+                f"第 {page}/{total_pages} 页, {len(page_items)} 个文件"
+            )
+            metrics.send_success_count += 1
+            metrics.record_processed("sender_bot")
+        except Exception as e:
+            logger.error(f"媒体组发送失败: {e}")
+            metrics.send_fail_count += 1
+            metrics.record_error("sender_bot")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="文件发送失败，请稍后重试或联系管理员。",
+                )
+            except Exception:
+                pass
+            return
 
     if total_pages > 1 and page < total_pages:
         keyboard = _build_pagination_keyboard(file_code, page, total_pages)
@@ -300,6 +327,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _send_page(
         context.bot, query.message.chat_id, file_code,
         file_meta_list, page=page, total_pages=total_pages,
+        storage_channel_id=state.get("storage_channel_id"),
     )
 
     if page >= total_pages:
