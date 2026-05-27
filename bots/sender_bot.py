@@ -203,7 +203,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     page_items = file_meta_list[start:end]
 
     if storage_channel_id and all("msg_id" in meta for meta in page_items):
-        msg_ids = [int(meta["msg_id"]) for meta in page_items]
+        msg_ids = sorted(int(meta["msg_id"]) for meta in page_items)
         try:
             await bot.copy_messages(
                 chat_id=chat_id,
