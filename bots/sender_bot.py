@@ -35,6 +35,22 @@ def _build_input_media(meta: dict):
         return InputMediaDocument(media=fid)
 
 
+def _extract_file_id_from_msg(message):
+    if message.photo:
+        return message.photo[-1].file_id, "photo"
+    elif message.video:
+        return message.video.file_id, "video"
+    elif message.audio:
+        return message.audio.file_id, "audio"
+    elif message.voice:
+        return message.voice.file_id, "voice"
+    elif message.animation:
+        return message.animation.file_id, "animation"
+    elif message.document:
+        return message.document.file_id, "document"
+    return "", "document"
+
+
 def _build_pagination_keyboard(file_code: str, current_page: int, total_pages: int):
     buttons = []
     if current_page > 1:
@@ -202,54 +218,52 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     end = start + PAGE_SIZE
     page_items = file_meta_list[start:end]
 
-    if storage_channel_id and all("msg_id" in meta for meta in page_items):
-        msg_ids = sorted(int(meta["msg_id"]) for meta in page_items)
-        try:
-            await bot.copy_messages(
-                chat_id=chat_id,
-                from_chat_id=storage_channel_id,
-                message_ids=msg_ids,
-            )
-            logger.info(
-                f"媒体组发送成功(复制): chat={chat_id}, 码 {file_code}, "
-                f"第 {page}/{total_pages} 页, {len(msg_ids)} 个文件"
-            )
-            metrics.send_success_count += 1
-            metrics.record_processed("sender_bot")
-        except Exception as e:
-            logger.error(f"媒体组发送失败(复制): {e}")
-            metrics.send_fail_count += 1
-            metrics.record_error("sender_bot")
+    temp_msg_ids = []
+    input_media = []
+
+    can_derive = storage_channel_id and all("msg_id" in meta for meta in page_items)
+
+    if can_derive:
+        for meta in page_items:
             try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="文件发送失败，请稍后重试或联系管理员。",
+                copied = await bot.copy_message(
+                    chat_id=storage_channel_id,
+                    from_chat_id=storage_channel_id,
+                    message_id=int(meta["msg_id"]),
                 )
-            except Exception:
-                pass
-            return
+                temp_msg_ids.append(copied.message_id)
+                fid, mtype = _extract_file_id_from_msg(copied)
+                input_media.append(_build_input_media({"file_id": fid, "type": mtype}))
+            except Exception as e:
+                logger.error(f"复制消息获取file_id失败: msg_id={meta.get('msg_id')}, {e}")
     else:
         input_media = [_build_input_media(meta) for meta in page_items]
+
+    try:
+        await bot.send_media_group(chat_id=chat_id, media=input_media)
+        logger.info(
+            f"媒体组发送成功: chat={chat_id}, 码 {file_code}, "
+            f"第 {page}/{total_pages} 页, {len(input_media)} 个文件"
+        )
+        metrics.send_success_count += 1
+        metrics.record_processed("sender_bot")
+    except Exception as e:
+        logger.error(f"媒体组发送失败: {e}")
+        metrics.send_fail_count += 1
+        metrics.record_error("sender_bot")
         try:
-            await bot.send_media_group(chat_id=chat_id, media=input_media)
-            logger.info(
-                f"媒体组发送成功: chat={chat_id}, 码 {file_code}, "
-                f"第 {page}/{total_pages} 页, {len(page_items)} 个文件"
+            await bot.send_message(
+                chat_id=chat_id,
+                text="文件发送失败，请稍后重试或联系管理员。",
             )
-            metrics.send_success_count += 1
-            metrics.record_processed("sender_bot")
-        except Exception as e:
-            logger.error(f"媒体组发送失败: {e}")
-            metrics.send_fail_count += 1
-            metrics.record_error("sender_bot")
+        except Exception:
+            pass
+    finally:
+        for mid in temp_msg_ids:
             try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text="文件发送失败，请稍后重试或联系管理员。",
-                )
+                await bot.delete_message(chat_id=storage_channel_id, message_id=mid)
             except Exception:
                 pass
-            return
 
     if total_pages > 1 and page < total_pages:
         keyboard = _build_pagination_keyboard(file_code, page, total_pages)
