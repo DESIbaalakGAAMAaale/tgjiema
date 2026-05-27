@@ -155,7 +155,6 @@ async def _process_batch_task(bot, task):
         return
 
     total_pages = (len(file_meta_list) + PAGE_SIZE - 1) // PAGE_SIZE
-    await _send_page(bot, task.target_user_id, task.file_code, file_meta_list, page=1, total_pages=total_pages, storage_channel_id=task.channel_id)
 
     if total_pages > 1:
         _pagination_states[task.file_code] = {
@@ -165,6 +164,8 @@ async def _process_batch_task(bot, task):
             "chat_id": task.target_user_id,
             "storage_channel_id": task.channel_id,
         }
+
+    await _send_page(bot, task.target_user_id, task.file_code, file_meta_list, page=1, total_pages=total_pages, storage_channel_id=task.channel_id)
 
 
 async def _fallback_single_send(bot, task):
