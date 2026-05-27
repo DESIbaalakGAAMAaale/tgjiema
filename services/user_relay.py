@@ -221,6 +221,13 @@ class UserRelay:
                         })
                     update["$set"]["batch_file_meta"] = json.dumps(meta_list)
 
+                    healed = await self._self_heal_file_ids(code, meta_list)
+                    if healed > 0:
+                        update["$set"]["batch_file_meta"] = json.dumps(meta_list)
+                        fids_list = [e.get("file_id", "") for e in meta_list
+                                     if isinstance(e, dict) and e.get("file_id")]
+                        update["$set"]["file_ids"] = ",".join(fids_list)
+
                     await files_col.update_one({"file_code": code}, update)
                     logger.info(f"[UserRelay] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}")
                 else:
@@ -259,6 +266,33 @@ class UserRelay:
             return pack_bot_file_id(media) or ""
         except Exception:
             return ""
+
+    async def _self_heal_file_ids(self, code: str, meta_list: list) -> int:
+        fixed_count = 0
+        for entry in meta_list:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("file_id"):
+                continue
+            msg_id = entry.get("msg_id")
+            if not msg_id:
+                continue
+            if not self._client or not self._storage_channel_entity:
+                break
+            try:
+                old_msg = await self._client.get_messages(
+                    self._storage_channel_entity, ids=int(msg_id)
+                )
+                if old_msg:
+                    fid = self._extract_file_id(old_msg)
+                    if fid:
+                        entry["file_id"] = fid
+                        fixed_count += 1
+            except Exception:
+                pass
+        if fixed_count > 0:
+            logger.info(f"[UserRelay] 自修复: 码 {code} 共修复 {fixed_count} 个空 file_id")
+        return fixed_count
 
     def _decrement_cache_counter(self, code: str):
         current = self._pending_cache_counts.get(code, 0)
@@ -864,6 +898,32 @@ class UserRelay:
                 f"batch_ids_str={batch_ids_str}, "
                 f"batch_file_meta_len={bfm_len}"
             )
+
+            bfm_parsed = None
+            if isinstance(bfm, list):
+                bfm_parsed = bfm
+            elif isinstance(bfm, str) and bfm:
+                try:
+                    bfm_parsed = json.loads(bfm)
+                except (json.JSONDecodeError, TypeError):
+                    bfm_parsed = []
+
+            if bfm_parsed and isinstance(bfm_parsed, list):
+                healed = await self._self_heal_file_ids(code, bfm_parsed)
+                if healed > 0:
+                    fids_update = {}
+                    fids_list = [e.get("file_id", "") for e in bfm_parsed
+                                 if isinstance(e, dict) and e.get("file_id")]
+                    fids_update["file_ids"] = ",".join(fids_list)
+                    fids_update["batch_file_meta"] = json.dumps(bfm_parsed)
+                    await files_col.update_one(
+                        {"file_code": code}, {"$set": fids_update}
+                    )
+                    logger.info(
+                        f"[UserRelay] 自修复已保存: code={code}, "
+                        f"修复了 {healed} 个 file_id"
+                    )
+
             msg_ids = []
             primary_mid = record.get("primary_channel_msg_id")
             if primary_mid:
