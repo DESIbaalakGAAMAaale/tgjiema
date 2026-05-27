@@ -13,7 +13,6 @@ from config import settings
 
 _SETTLE_WAIT = 5
 _INITIAL_SETTLE_WAIT = 20
-_MAX_PAGE_LOOP = 100
 
 
 class UserRelay:
@@ -534,10 +533,9 @@ class UserRelay:
 
         exchange["_ai_running"] = True
 
-        loop_count = 0
+        stale_clicks = 0
         try:
-            while loop_count < _MAX_PAGE_LOOP:
-                loop_count += 1
+            while True:
 
                 if bot_username not in self._bot_exchange:
                     logger.warning(f"[UserRelay] 翻页循环: exchange 已被清理 (bot={bot_username})")
@@ -563,7 +561,7 @@ class UserRelay:
                 action = decision.get("action", "finish")
                 reason = decision.get("reason", "")
                 logger.info(
-                    f"[UserRelay] 翻页决策 #{loop_count}: action={action}, reason={reason}"
+                    f"[UserRelay] 翻页决策: action={action}, reason={reason}"
                 )
 
                 if action == "finish":
@@ -592,8 +590,10 @@ class UserRelay:
                         await self._process_all_collected(bot_username)
                         break
 
+                    events_before = len(exchange.get("events", []))
+
                     logger.info(
-                        f'[UserRelay] 点击翻页按钮 [{row},{col}] "{btn_text}"'
+                        f'[UserRelay] 点击翻页按钮 [{row},{col}] "{btn_text}" (events={events_before})'
                     )
                     clicked = await self._click_button(bot_username, row, col)
                     if not clicked:
@@ -606,6 +606,21 @@ class UserRelay:
                         exchange.setdefault("_clicked_buttons", set()).add((row, col))
                     await asyncio.sleep(4)
                     await self._wait_all_cached(bot_username)
+
+                    exchange = self._bot_exchange.get(bot_username)
+                    if exchange:
+                        events_after = len(exchange.get("events", []))
+                        if events_after > events_before:
+                            stale_clicks = 0
+                        else:
+                            stale_clicks += 1
+                            logger.info(
+                                f"[UserRelay] 翻页无新增消息 (stale_clicks={stale_clicks}/3)"
+                            )
+                            if stale_clicks >= 3:
+                                logger.info("[UserRelay] 连续翻页无新消息，结束收集")
+                                await self._process_all_collected(bot_username)
+                                break
                     continue
                 else:
                     logger.warning(f"[UserRelay] 未知 action: {action}")
