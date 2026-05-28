@@ -396,8 +396,6 @@ class D1Collection:
         if sort and len(sort) >= 2:
             direction = "DESC" if sort[1] < 0 else "ASC"
             sql += f" ORDER BY {sort[0]} {direction}"
-        else:
-            sql += " ORDER BY id DESC"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         if skip:
