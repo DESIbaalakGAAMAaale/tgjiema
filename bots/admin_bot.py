@@ -1295,7 +1295,7 @@ async def promote_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🤖 backup_bot 将实时监控新频道的新消息\n"
         f"📨 sender_bot 发送时优先使用新频道\n\n"
         f"⚠️ 旧频道中已存在的文件仍可通过 sender_bot 的备用频道机制获取\n"
-        f"⚠️ 建议将原主频道添加为备份频道")
+        f"⚠️ 建议将原主频道添加为备份频道"
     )
 
 
