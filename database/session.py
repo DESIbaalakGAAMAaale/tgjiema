@@ -127,8 +127,8 @@ class CockroachDBClient:
     async def connect(self):
         self._pool = await asyncpg.create_pool(
             self._url,
-            min_size=2,
-            max_size=10,
+            min_size=5,
+            max_size=30,
             statement_cache_size=0,
         )
         for sql in DDL_STATEMENTS:
