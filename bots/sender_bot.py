@@ -85,12 +85,17 @@ def _build_page_number_buttons(file_code: str, current_page: int, total_pages: i
 
 
 async def process_queue(bot):
+    idle_count = 0
     while True:
         try:
             task = await dequeue_send_task()
             if task is None:
-                await asyncio.sleep(0.5)
+                idle_count += 1
+                sleep_time = min(0.05 * (1.6 ** min(idle_count, 8)), 5.0)
+                await asyncio.sleep(sleep_time)
                 continue
+
+            idle_count = 0
 
             if task.task_type == "batch" and task.channel_msg_ids and task.batch_file_meta:
                 await _process_batch_task(bot, task)

@@ -3,6 +3,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 from database import get_users_col, get_file_records_col, make_user
+from database import get_user_cached, update_user_and_invalidate
+from database import get_file_record_cached, update_file_record_and_invalidate
 from config import settings
 from services.code_generator import extract_bot_username
 
@@ -56,7 +58,8 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     users_col = get_users_col()
     files_col = get_file_records_col()
 
-    user = await users_col.find_one({"user_id": user_id})
+    # 使用缓存查询用户
+    user = await get_user_cached(user_id)
     if user is None:
         return DecodeResult(allowed=False, reason="用户未注册")
 
@@ -117,7 +120,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
             user["external_decode_quota"] = settings.PREMIUM_EXTERNAL_DAILY_QUOTA
 
     if reset_set:
-        await users_col.update_one({"user_id": user_id}, {"$set": reset_set})
+        await update_user_and_invalidate(user_id, {"$set": reset_set})
 
     quota = user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA)
     used = user.get("quota_used_today", 0)
@@ -142,18 +145,13 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
                 reason=f"今日非本系统码解码次数已用完（{external_quota}次），请明天再试",
             )
 
-    file_record = await files_col.find_one({"file_code": file_code})
+    # 使用缓存查询文件记录
+    file_record = await get_file_record_cached(file_code)
     if file_record is not None and file_record.get("status") == "active":
-        await users_col.update_one(
-            {"user_id": user_id}, {"$inc": {"quota_used_today": 1}}
-        )
+        await update_user_and_invalidate(user_id, {"$inc": {"quota_used_today": 1}})
         if not is_system_code(file_code):
-            await users_col.update_one(
-                {"user_id": user_id}, {"$inc": {"external_used_today": 1}}
-            )
-        await files_col.update_one(
-            {"file_code": file_code}, {"$inc": {"request_count": 1}}
-        )
+            await update_user_and_invalidate(user_id, {"$inc": {"external_used_today": 1}})
+        await update_file_record_and_invalidate(file_code, {"$inc": {"request_count": 1}})
         remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
         remaining_ext = -1
         if not is_system_code(file_code):
@@ -168,9 +166,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         )
 
     if not is_system_code(file_code):
-        await users_col.update_one(
-            {"user_id": user_id}, {"$inc": {"quota_used_today": 1, "external_used_today": 1}}
-        )
+        await update_user_and_invalidate(user_id, {"$inc": {"quota_used_today": 1, "external_used_today": 1}})
         remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
         remaining_ext = -1
         ext_q = user.get("external_decode_quota", 0)

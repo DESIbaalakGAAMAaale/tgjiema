@@ -52,6 +52,8 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_file_code ON decode_logs(file_code)",
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_requester ON decode_logs(requester_id)",
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_request_time ON decode_logs(request_time)",
+    "CREATE INDEX IF NOT EXISTS idx_file_records_msg_id ON file_records(primary_channel_msg_id)",
+    "CREATE INDEX IF NOT EXISTS idx_send_queue_processed_created ON send_queue(processed, created_at)",
     """CREATE TABLE IF NOT EXISTS pending_uploads (
         id SERIAL PRIMARY KEY,
         uploader_id BIGINT,
@@ -604,3 +606,76 @@ async def get_message_backups(main_msg_id: int) -> list[dict]:
 async def get_all_message_backups() -> list[dict]:
     col = get_message_backups_col()
     return await col.find({})
+
+
+# ─── 缓存查询层 ──────────────────────────────────────────────────
+from .cache import get_user_cache, get_file_record_cache, get_config_cache
+
+
+async def get_user_cached(user_id: int) -> Optional[dict]:
+    cache = get_user_cache()
+    cache_key = f"user:{user_id}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    col = get_users_col()
+    user = await col.find_one({"user_id": user_id})
+
+    if user:
+        cache.set(cache_key, user)
+
+    return user
+
+
+async def update_user_and_invalidate(user_id: int, update: dict):
+    col = get_users_col()
+    await col.update_one({"user_id": user_id}, update)
+
+    cache = get_user_cache()
+    cache.invalidate(f"user:{user_id}")
+
+
+async def get_file_record_cached(file_code: str) -> Optional[dict]:
+    cache = get_file_record_cache()
+    cache_key = f"file:{file_code}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    col = get_file_records_col()
+    record = await col.find_one({"file_code": file_code})
+
+    if record:
+        cache.set(cache_key, record)
+
+    return record
+
+
+async def update_file_record_and_invalidate(file_code: str, update: dict):
+    col = get_file_records_col()
+    await col.update_one({"file_code": file_code}, update)
+
+    cache = get_file_record_cache()
+    cache.invalidate(f"file:{file_code}")
+
+
+async def get_config_cached(key: str) -> Optional[str]:
+    cache = get_config_cache()
+    cache_key = f"config:{key}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    val = await _get_config(key)
+    cache.set(cache_key, val)
+    return val
+
+
+async def set_config_and_invalidate(key: str, value: str):
+    await _set_config(key, value)
+    cache = get_config_cache()
+    cache.invalidate(f"config:{key}")

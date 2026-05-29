@@ -45,12 +45,22 @@ async def enqueue_batch_send_task(
 
 async def dequeue_send_task():
     col = get_send_queue_col()
-    rows = await col.find({"processed": 0}, limit=1)
+    rows = await col.find(
+        {"processed": 0},
+        sort=("created_at", 1),
+        limit=1,
+    )
     if not rows:
         return None
     row = rows[0]
     pk = row.get("id")
-    await col.update_one({"id": pk}, {"$set": {"processed": 1}})
+
+    result = await col.update_one(
+        {"id": pk, "processed": 0},
+        {"$set": {"processed": 1}},
+    )
+    if result.matched_count == 0:
+        return None
 
     task_type = row.get("task_type", "single")
 
