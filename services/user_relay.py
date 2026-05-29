@@ -4,7 +4,7 @@ from pathlib import Path
 
 from loguru import logger
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from telethon.tl.types import PeerChannel
 from telethon.utils import pack_bot_file_id
 
@@ -354,6 +354,25 @@ class UserRelay:
             return int(digits)
         return None
 
+    @staticmethod
+    def _extract_wait_seconds(msg) -> int:
+        import re
+        text = (getattr(msg, "message", None) or "").lower()
+        patterns = [
+            r"(\d+)\s*秒",
+            r"(\d+)\s*seconds?",
+            r"(\d+)\s*secs?",
+            r"wait\s*(\d+)",
+            r"等\s*(\d+)",
+            r"稍等\s*(\d+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                sec = int(m.group(1))
+                return max(sec, 1)
+        return 5
+
     def _register_handlers(self):
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
@@ -581,7 +600,33 @@ class UserRelay:
                             logger.error(f"[UserRelay] 发送错误通知失败: {e}")
                     await self._cleanup_exchange(bot_username)
                     break
+                elif action == "wait":
+                    wait_sec = decision.get("wait_seconds", 5)
+                    logger.info(
+                        f"[UserRelay] 遵守翻页速度限制，等待 {wait_sec} 秒 "
+                        f"(bot={bot_username})"
+                    )
+                    exchange = self._bot_exchange.get(bot_username)
+                    if exchange:
+                        exchange["_last_click_time"] = (
+                            asyncio.get_event_loop().time() + wait_sec
+                        )
+                    await asyncio.sleep(wait_sec)
+                    continue
                 elif action == "click_button":
+                    exchange = self._bot_exchange.get(bot_username)
+                    if exchange:
+                        min_interval = exchange.get("_min_click_interval", 0)
+                        last_click = exchange.get("_last_click_time", 0)
+                        now = asyncio.get_event_loop().time()
+                        remaining = (last_click + min_interval) - now
+                        if remaining > 0:
+                            logger.info(
+                                f"[UserRelay] 翻页速度限制，等待剩余 {remaining:.1f} 秒 "
+                                f"(bot={bot_username}, min_interval={min_interval}s)"
+                            )
+                            await asyncio.sleep(remaining)
+                    exchange = self._bot_exchange.get(bot_username)
                     row = decision.get("target_button_row")
                     col = decision.get("target_button_col")
                     btn_text = decision.get("target_button_text", "")
@@ -604,6 +649,7 @@ class UserRelay:
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
                         exchange.setdefault("_clicked_buttons", set()).add((row, col))
+                        exchange["_last_click_time"] = asyncio.get_event_loop().time()
                     await asyncio.sleep(4)
                     await self._wait_all_cached(bot_username)
 
@@ -646,6 +692,13 @@ class UserRelay:
             "\u672a\u627e\u5230", "\u5df2\u8fc7\u671f", "\u5df2\u5931\u6548",
             "\u4e0d\u5b58\u5728", "not found", "expired", "invalid",
         )
+        _RATE_LIMIT_KW = (
+            "\u8bf7\u7a0d\u540e", "\u8bf7\u7b49\u5f85", "\u7a0d\u540e\u518d\u8bd5",
+            "\u901f\u5ea6\u592a\u5feb", "\u7ffb\u9875\u592a\u5feb", "\u64cd\u4f5c\u592a\u5feb",
+            "\u9891\u7e41", "\u8bf7\u6162\u4e00\u70b9", "\u6162\u4e00\u70b9",
+            "too fast", "wait", "slow down", "rate limit",
+            "\u8bf7\u52ff\u8fc7\u5feb",
+        )
         _FINISH_KW = {"finish", "done", "\u5b8c\u6210", "\u7ed3\u675f"}
 
         msg_events = exchange.get("events", [])
@@ -666,6 +719,24 @@ class UserRelay:
                         "target_button_col": None, "target_button_text": None,
                         "reason": f"\u68c0\u6d4b\u5230\u9519\u8bef\u5173\u952e\u8bcd: {ek}",
                         "wait_seconds": None,
+                    }
+
+        for ev in msg_events:
+            msg = ev.message
+            text = (getattr(msg, "message", None) or "").lower()
+            for rk in _RATE_LIMIT_KW:
+                if rk in text:
+                    wait_sec = self._extract_wait_seconds(msg)
+                    exchange["_min_click_interval"] = max(
+                        exchange.get("_min_click_interval", 0), wait_sec
+                    )
+                    return {
+                        "action": "wait",
+                        "target_button_row": None,
+                        "target_button_col": None,
+                        "target_button_text": None,
+                        "reason": f"\u68c0\u6d4b\u5230\u7ffb\u9875\u901f\u5ea6\u9650\u5236: {rk}, \u7b49\u5f85{wait_sec}\u79d2",
+                        "wait_seconds": wait_sec,
                     }
 
         for ev in msg_events:
@@ -829,6 +900,30 @@ class UserRelay:
                 f"[UserRelay] 按钮 [{row},{col}] 类型不支持: {type(target_btn).__name__}"
             )
             return False
+        except FloodWaitError as e:
+            wait_seconds = e.seconds
+            logger.warning(
+                f"[UserRelay] 触发 FloodWait，需要等待 {wait_seconds} 秒 "
+                f"(bot={bot_username})"
+            )
+            exchange["_min_click_interval"] = max(
+                exchange.get("_min_click_interval", 0), wait_seconds
+            )
+            await asyncio.sleep(wait_seconds)
+            try:
+                if hasattr(target_btn, "data") and target_btn.data:
+                    await keyboard_msg.click(data=target_btn.data)
+                    btn_text = getattr(target_btn, "text", "") or "(无文字/图标按钮)"
+                    logger.info(
+                        f"[UserRelay] FloodWait 后重试成功 [{row},{col}] {btn_text}"
+                    )
+                    return True
+                return False
+            except Exception as retry_e:
+                logger.error(
+                    f"[UserRelay] FloodWait 后重试点击失败 [{row},{col}]: {retry_e}"
+                )
+                return False
         except Exception as e:
             logger.error(f"[UserRelay] 点击按钮失败 [{row},{col}]: {e}")
             return False
@@ -1002,6 +1097,8 @@ class UserRelay:
                 "_keyboard_msg": None,
                 "_last_clicked_number": None,
                 "_clicked_buttons": set(),
+                "_min_click_interval": 0,
+                "_last_click_time": 0,
             }
             self._restart_settle(
                 self._bot_exchange[bot_username.lower()], bot_username.lower(),
