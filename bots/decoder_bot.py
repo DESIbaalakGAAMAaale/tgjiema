@@ -677,9 +677,9 @@ async def _process_pending_uploads(app: Application):
                     await app.bot.send_message(
                         chat_id=uploader_id,
                         text=f"✅ 文件码：{file_code}\n\n"
-                             f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
-                             f"🔍 输入文件码 @{settings.DECODER_BOT_USERNAME}\n"
-                             f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
+                             f"📤 发送文件 → @{settings.UPLOAD_BOT_USERNAME}\n"
+                             f"🔍 输入文件码 → @{settings.DECODER_BOT_USERNAME}\n"
+                             f"📥 收取文件 → @{settings.SENDER_BOT_USERNAME}",
                     )
                     logger.info(f"[poll] 文件码已发送给用户 {uploader_id}: {file_code}")
                 except Exception as e:
