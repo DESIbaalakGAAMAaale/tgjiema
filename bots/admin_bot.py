@@ -472,14 +472,11 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             "🗺️ 文件码前缀路由\n\n"
             "当第三方机器人迁移后，可通过此功能将特定前缀的文件码\n"
             "路由到指定的新机器人解码。\n\n"
-            "用法：\n"
-            "/add_code_route <前缀> <bot用户名>\n"
-            "  示例：/add_code_route qqfile qqfile_bot\n"
-            "  所有以 qqfile 开头的文件码 → @qqfile_bot 解码\n\n"
-            "/remove_code_route <前缀> — 删除路由\n"
-            "/code_routes — 查看所有路由"
+            "点击下方按钮开始操作："
         )
         kb = [
+            [InlineKeyboardButton("➕ 新增路由", callback_data="interactive:add_code_route"),
+             InlineKeyboardButton("➖ 删除路由", callback_data="interactive:remove_code_route")],
             [InlineKeyboardButton("📋 查看路由表", callback_data="action:code_routes")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
@@ -489,13 +486,11 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             "⏱️ Bot 解码间隔限流\n\n"
             "某些机器人限制每个文件码之间的解码间隔时间。\n"
             "设置后，系统会自动等待满足间隔再发送下一个请求。\n\n"
-            "用法：\n"
-            "/set_bot_interval <bot用户名> <秒数>\n"
-            "  示例：/set_bot_interval qqfile_bot 3\n\n"
-            "/remove_bot_interval <bot用户名> — 删除限流\n"
-            "/bot_intervals — 查看所有限流配置"
+            "点击下方按钮开始操作："
         )
         kb = [
+            [InlineKeyboardButton("➕ 新增限流", callback_data="interactive:set_bot_interval"),
+             InlineKeyboardButton("➖ 删除限流", callback_data="interactive:remove_bot_interval")],
             [InlineKeyboardButton("📋 查看限流配置", callback_data="action:bot_intervals")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
@@ -668,6 +663,54 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for bot in sorted(intervals.keys()):
                 text += f"  • @{bot} → {intervals[bot]} 秒\n"
         await query.edit_message_text(text, reply_markup=back_kb)
+
+    # ─── 交互式操作入口 ──────────────────────────────────────────
+    elif data == "interactive:add_code_route":
+        context.user_data.pop("conv_state", None)
+        context.user_data.pop("conv_data", None)
+        await _conv_start(
+            update, context, "add_code_route:prefix",
+            "🗺️ 新增文件码前缀路由\n\n"
+            "请输入文件码前缀（例如：qqfile）：\n\n"
+            "❌ 如需取消，请点击下方按钮。"
+        )
+
+    elif data == "interactive:remove_code_route":
+        context.user_data.pop("conv_state", None)
+        context.user_data.pop("conv_data", None)
+        await _conv_start(
+            update, context, "remove_code_route:prefix",
+            "🗺️ 删除文件码前缀路由\n\n"
+            "请输入要删除的路由前缀（例如：qqfile）：\n\n"
+            "❌ 如需取消，请点击下方按钮。"
+        )
+
+    elif data == "interactive:set_bot_interval":
+        context.user_data.pop("conv_state", None)
+        context.user_data.pop("conv_data", None)
+        await _conv_start(
+            update, context, "set_bot_interval:bot",
+            "⏱️ 新增 Bot 解码间隔限流\n\n"
+            "请输入目标机器人用户名（不需要 @，例如：qqfile_bot）：\n\n"
+            "❌ 如需取消，请点击下方按钮。"
+        )
+
+    elif data == "interactive:remove_bot_interval":
+        context.user_data.pop("conv_state", None)
+        context.user_data.pop("conv_data", None)
+        await _conv_start(
+            update, context, "remove_bot_interval:bot",
+            "⏱️ 删除 Bot 解码间隔限流\n\n"
+            "请输入要删除限流的机器人用户名（例如：qqfile_bot）：\n\n"
+            "❌ 如需取消，请点击下方按钮。"
+        )
+
+    elif data == "conv:cancel":
+        _conv_end(context)
+        await query.edit_message_text(
+            "❌ 操作已取消。",
+            reply_markup=back_kb,
+        )
 
 
 @_auth_required
@@ -1726,6 +1769,122 @@ async def list_bot_intervals(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(msg)
 
 
+@_auth_required
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("conv_state"):
+        _conv_end(context)
+        await update.message.reply_text("❌ 操作已取消。")
+    else:
+        await update.message.reply_text("当前没有正在进行的操作。")
+
+
+# ─── 交互式对话系统 ──────────────────────────────────────────────
+
+_CONV_CANCEL_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton("❌ 取消操作", callback_data="conv:cancel")],
+])
+
+
+async def _conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
+    context.user_data["conv_state"] = state
+    query = update.callback_query
+    await query.edit_message_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+
+
+async def _conv_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
+    context.user_data["conv_state"] = state
+    await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+
+
+def _conv_end(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("conv_state", None)
+    context.user_data.pop("conv_data", None)
+
+
+@_auth_required
+async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("conv_state")
+    if not state:
+        return
+
+    text = update.message.text.strip()
+
+    # ─── 添加文件码前缀路由 ──────────────────────────────────────
+    if state == "add_code_route:prefix":
+        context.user_data["conv_data"] = {"prefix": text.lower()}
+        context.user_data["conv_state"] = "add_code_route:bot"
+        await update.message.reply_text(
+            f"✅ 前缀已记录：`{text.lower()}`\n\n"
+            f"请输入目标机器人用户名（不需要 @）：",
+            reply_markup=_CONV_CANCEL_KEYBOARD,
+        )
+        return
+
+    if state == "add_code_route:bot":
+        data = context.user_data.get("conv_data", {})
+        prefix = data.get("prefix", "")
+        bot_username = text.strip().lower().lstrip("@")
+        await set_code_bot_route(prefix, bot_username)
+        _conv_end(context)
+        await update.message.reply_text(
+            f"✅ 文件码路由已设置\n"
+            f"  前缀：`{prefix}`\n"
+            f"  目标机器人：@{bot_username}\n\n"
+            f"以 `{prefix}` 开头的文件码将通过 @{bot_username} 解码。"
+        )
+        return
+
+    # ─── 删除文件码前缀路由 ─────────────────────────────────────
+    if state == "remove_code_route:prefix":
+        prefix = text.strip().lower()
+        await delete_code_bot_route(prefix)
+        _conv_end(context)
+        await update.message.reply_text(f"✅ 文件码前缀路由已删除：`{prefix}`")
+        return
+
+    # ─── 设置 Bot 解码间隔 ───────────────────────────────────────
+    if state == "set_bot_interval:bot":
+        context.user_data["conv_data"] = {"bot": text.strip().lower().lstrip("@")}
+        context.user_data["conv_state"] = "set_bot_interval:seconds"
+        await update.message.reply_text(
+            f"✅ Bot 已记录：@{text.strip().lower().lstrip('@')}\n\n"
+            f"请输入解码间隔秒数（输入 0 取消限制）：",
+            reply_markup=_CONV_CANCEL_KEYBOARD,
+        )
+        return
+
+    if state == "set_bot_interval:seconds":
+        data = context.user_data.get("conv_data", {})
+        bot_username = data.get("bot", "")
+        try:
+            interval = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ 请输入有效的数字（秒数），例如：3")
+            return
+        if interval < 0:
+            await update.message.reply_text("❌ 间隔秒数不能为负数，请重新输入：")
+            return
+        await set_bot_decode_interval(bot_username, interval)
+        _conv_end(context)
+        if interval == 0:
+            await update.message.reply_text(f"✅ 已取消 @{bot_username} 的解码间隔限制")
+        else:
+            await update.message.reply_text(f"✅ @{bot_username} 的解码间隔已设为 {interval} 秒")
+        return
+
+    # ─── 删除 Bot 解码间隔 ─────────────────────────────────────
+    if state == "remove_bot_interval:bot":
+        bot_username = text.strip().lower().lstrip("@")
+        await delete_bot_decode_interval(bot_username)
+        _conv_end(context)
+        await update.message.reply_text(f"✅ 已删除 @{bot_username} 的解码间隔配置")
+        return
+
+    # 未知状态 → 清理
+    _conv_end(context)
+    await update.message.reply_text("⏳ 对话已超时，请重新点击按钮开始操作。")
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -1786,7 +1945,9 @@ def run():
     app.add_handler(CommandHandler("set_bot_interval", set_bot_interval))
     app.add_handler(CommandHandler("remove_bot_interval", remove_bot_interval))
     app.add_handler(CommandHandler("bot_intervals", list_bot_intervals))
+    app.add_handler(CommandHandler("cancel", cancel_conversation))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
     app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:)"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:)"))
 
     app.run_polling()
