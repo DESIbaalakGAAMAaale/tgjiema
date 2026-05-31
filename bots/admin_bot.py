@@ -18,6 +18,8 @@ from database import (
     get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
     get_config, set_config,
     get_relay_config, set_relay_config, get_relay_status,
+    get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
+    get_all_bot_decode_intervals, set_bot_decode_interval, delete_bot_decode_interval,
 )
 from database.models import make_user
 from utils.monitor import metrics
@@ -353,6 +355,8 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("📋 解码日志", callback_data="action:logs")],
             [InlineKeyboardButton("🔐 用户中继", callback_data="menu:relay"),
              InlineKeyboardButton("⚙️ 系统配置", callback_data="menu:config")],
+            [InlineKeyboardButton("🗺️ 文件码路由", callback_data="menu:code_route"),
+             InlineKeyboardButton("⏱️ Bot限流", callback_data="menu:bot_limit")],
         ]
         return text, InlineKeyboardMarkup(kb)
 
@@ -460,6 +464,39 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         )
         kb = [
             [InlineKeyboardButton("📋 查看配置", callback_data="action:settings")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "code_route":
+        text = (
+            "🗺️ 文件码前缀路由\n\n"
+            "当第三方机器人迁移后，可通过此功能将特定前缀的文件码\n"
+            "路由到指定的新机器人解码。\n\n"
+            "用法：\n"
+            "/add_code_route <前缀> <bot用户名>\n"
+            "  示例：/add_code_route qqfile qqfile_bot\n"
+            "  所有以 qqfile 开头的文件码 → @qqfile_bot 解码\n\n"
+            "/remove_code_route <前缀> — 删除路由\n"
+            "/code_routes — 查看所有路由"
+        )
+        kb = [
+            [InlineKeyboardButton("📋 查看路由表", callback_data="action:code_routes")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "bot_limit":
+        text = (
+            "⏱️ Bot 解码间隔限流\n\n"
+            "某些机器人限制每个文件码之间的解码间隔时间。\n"
+            "设置后，系统会自动等待满足间隔再发送下一个请求。\n\n"
+            "用法：\n"
+            "/set_bot_interval <bot用户名> <秒数>\n"
+            "  示例：/set_bot_interval qqfile_bot 3\n\n"
+            "/remove_bot_interval <bot用户名> — 删除限流\n"
+            "/bot_intervals — 查看所有限流配置"
+        )
+        kb = [
+            [InlineKeyboardButton("📋 查看限流配置", callback_data="action:bot_intervals")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -610,6 +647,26 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2. 清除所有文件记录中该频道的旧备份信息\n"
             "3. 备份机器人重启后执行全量备份"
         )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:code_routes":
+        routes = await get_all_code_bot_routes()
+        if not routes:
+            text = "📭 尚未配置文件码前缀路由。"
+        else:
+            text = "🗺️ 文件码前缀路由表\n\n"
+            for prefix in sorted(routes.keys()):
+                text += f"  • `{prefix}` → @{routes[prefix]}\n"
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:bot_intervals":
+        intervals = await get_all_bot_decode_intervals()
+        if not intervals:
+            text = "📭 尚未配置 Bot 解码间隔。"
+        else:
+            text = "⏱️ Bot 解码间隔配置\n\n"
+            for bot in sorted(intervals.keys()):
+                text += f"  • @{bot} → {intervals[bot]} 秒\n"
         await query.edit_message_text(text, reply_markup=back_kb)
 
 
@@ -1552,6 +1609,123 @@ async def purge_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ─── 文件码前缀路由管理 ──────────────────────────────────────────
+
+
+@_auth_required
+async def add_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "用法：/add_code_route <前缀> <机器人用户名>\n\n"
+            "设置文件码前缀对应的解码机器人。\n"
+            "当文件码以指定前缀开头时，中继将路由到该机器人解码。\n\n"
+            "示例：\n"
+            "/add_code_route qqfile qqfile_bot\n"
+            "/add_code_route tgwenjian mydecoder_bot"
+        )
+        return
+    prefix = args[0].strip().lower()
+    bot_username = args[1].strip().lower().lstrip("@")
+    await set_code_bot_route(prefix, bot_username)
+    await update.message.reply_text(
+        f"✅ 文件码路由已设置\n"
+        f"  前缀：{prefix}\n"
+        f"  目标机器人：@{bot_username}\n\n"
+        f"以 `{prefix}` 开头的文件码将通过 @{bot_username} 解码。"
+    )
+
+
+@_auth_required
+async def remove_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：/remove_code_route <前缀>\n\n"
+            "删除文件码前缀路由配置。\n"
+            "删除后该前缀的文件码将恢复原有解码规则。\n\n"
+            "示例：/remove_code_route qqfile"
+        )
+        return
+    prefix = args[0].strip().lower()
+    await delete_code_bot_route(prefix)
+    await update.message.reply_text(f"✅ 文件码前缀路由已删除：{prefix}")
+
+
+@_auth_required
+async def list_code_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    routes = await get_all_code_bot_routes()
+    if not routes:
+        await update.message.reply_text("📭 尚未配置任何文件码前缀路由。\n\n使用 /add_code_route 添加。")
+        return
+    msg = "🗺️ 文件码前缀路由表\n\n"
+    for prefix in sorted(routes.keys()):
+        msg += f"  • `{prefix}` → @{routes[prefix]}\n"
+    msg += "\n使用 /remove_code_route <前缀> 删除。"
+    await update.message.reply_text(msg)
+
+
+# ─── Bot 解码间隔限流管理 ────────────────────────────────────────
+
+
+@_auth_required
+async def set_bot_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "用法：/set_bot_interval <机器人用户名> <间隔秒数>\n\n"
+            "设置向指定机器人发送解码请求的最小间隔时间。\n"
+            "某些机器人限制每个文件码之间的解码间隔，此设置可自动等待。\n\n"
+            "示例：\n"
+            "/set_bot_interval qqfile_bot 3\n"
+            "/set_bot_interval tgfile_bot 5\n\n"
+            "设为 0 表示不限间隔。"
+        )
+        return
+    bot_username = args[0].strip().lower().lstrip("@")
+    try:
+        interval = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ 间隔秒数必须是数字")
+        return
+    if interval < 0:
+        await update.message.reply_text("❌ 间隔秒数不能为负数")
+        return
+    await set_bot_decode_interval(bot_username, interval)
+    if interval == 0:
+        await update.message.reply_text(f"✅ 已取消 @{bot_username} 的解码间隔限制")
+    else:
+        await update.message.reply_text(f"✅ @{bot_username} 的解码间隔已设为 {interval} 秒")
+
+
+@_auth_required
+async def remove_bot_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：/remove_bot_interval <机器人用户名>\n\n"
+            "删除指定机器人的解码间隔配置。\n\n"
+            "示例：/remove_bot_interval qqfile_bot"
+        )
+        return
+    bot_username = args[0].strip().lower().lstrip("@")
+    await delete_bot_decode_interval(bot_username)
+    await update.message.reply_text(f"✅ 已删除 @{bot_username} 的解码间隔配置")
+
+
+@_auth_required
+async def list_bot_intervals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    intervals = await get_all_bot_decode_intervals()
+    if not intervals:
+        await update.message.reply_text("📭 尚未配置任何 bot 解码间隔。\n\n使用 /set_bot_interval 添加。")
+        return
+    msg = "⏱️ Bot 解码间隔配置\n\n"
+    for bot in sorted(intervals.keys()):
+        msg += f"  • @{bot} → {intervals[bot]} 秒\n"
+    msg += "\n使用 /remove_bot_interval <bot> 删除。"
+    await update.message.reply_text(msg)
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -1606,6 +1780,12 @@ def run():
     app.add_handler(CommandHandler("set_db_backup", set_db_backup))
     app.add_handler(CommandHandler("factory_reset", factory_reset))
     app.add_handler(CommandHandler("purge_channel", purge_channel))
+    app.add_handler(CommandHandler("add_code_route", add_code_route))
+    app.add_handler(CommandHandler("remove_code_route", remove_code_route))
+    app.add_handler(CommandHandler("code_routes", list_code_routes))
+    app.add_handler(CommandHandler("set_bot_interval", set_bot_interval))
+    app.add_handler(CommandHandler("remove_bot_interval", remove_bot_interval))
+    app.add_handler(CommandHandler("bot_intervals", list_bot_intervals))
     app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:)"))
 

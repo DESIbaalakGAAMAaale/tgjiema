@@ -570,6 +570,92 @@ async def get_relay_status() -> str:
     return await _get_config("relay_status") or "offline"
 
 
+# ─── 文件码前缀 → Bot 路由 ──────────────────────────────────────
+
+
+async def set_code_bot_route(prefix: str, bot_username: str):
+    await _set_config(f"code_bot_route:{prefix}", bot_username)
+
+
+async def get_code_bot_route(prefix: str) -> str | None:
+    return await _get_config(f"code_bot_route:{prefix}")
+
+
+async def delete_code_bot_route(prefix: str):
+    existing = await _backup_config_col.find_one({"config_key": f"code_bot_route:{prefix}"})
+    if existing:
+        await _backup_config_col.update_one(
+            {"config_key": f"code_bot_route:{prefix}"},
+            {"$set": {"config_value": "", "updated_at": ""}},
+        )
+
+
+async def get_all_code_bot_routes() -> dict[str, str]:
+    col = _backup_config_col
+    rows = await col.find({})
+    result = {}
+    for row in rows:
+        key = row.get("config_key", "")
+        val = row.get("config_value", "")
+        if key.startswith("code_bot_route:") and val:
+            prefix = key[len("code_bot_route:"):]
+            result[prefix] = val
+    return result
+
+
+async def resolve_bot_for_code(code: str, default_bot: str) -> str:
+    """根据文件码前缀匹配配置的路由，无匹配则返回 default_bot。"""
+    col = _backup_config_col
+    rows = await col.find({})
+    best_prefix = ""
+    best_bot = ""
+    for row in rows:
+        key = row.get("config_key", "")
+        if not key.startswith("code_bot_route:"):
+            continue
+        prefix = key[len("code_bot_route:"):]
+        if code.startswith(prefix) and len(prefix) > len(best_prefix):
+            best_prefix = prefix
+            best_bot = row.get("config_value", "")
+    return best_bot or default_bot
+
+
+# ─── Bot 解码间隔限流 ────────────────────────────────────────────
+
+
+async def set_bot_decode_interval(bot_username: str, interval_seconds: int):
+    await _set_config(f"bot_decode_interval:{bot_username}", str(interval_seconds))
+
+
+async def get_bot_decode_interval(bot_username: str) -> int:
+    val = await _get_config(f"bot_decode_interval:{bot_username}")
+    if val and val.isdigit():
+        return int(val)
+    return 0
+
+
+async def delete_bot_decode_interval(bot_username: str):
+    existing = await _backup_config_col.find_one({"config_key": f"bot_decode_interval:{bot_username}"})
+    if existing:
+        await _backup_config_col.update_one(
+            {"config_key": f"bot_decode_interval:{bot_username}"},
+            {"$set": {"config_value": "", "updated_at": ""}},
+        )
+
+
+async def get_all_bot_decode_intervals() -> dict[str, int]:
+    col = _backup_config_col
+    rows = await col.find({})
+    result = {}
+    for row in rows:
+        key = row.get("config_key", "")
+        val = row.get("config_value", "")
+        if key.startswith("bot_decode_interval:") and val and val.isdigit():
+            bot = key[len("bot_decode_interval:"):]
+            result[bot] = int(val)
+    return result
+
+
 def get_message_backups_col() -> D1Collection:
     return _message_backups_col
 

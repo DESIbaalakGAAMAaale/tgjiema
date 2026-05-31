@@ -18,6 +18,8 @@ from database import (
     make_decode_log,
     save_code_bot_mapping,
     get_bot_for_code,
+    resolve_bot_for_code,
+    get_bot_decode_interval,
 )
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
@@ -65,6 +67,21 @@ user_relay.set_pending_cleanup(lambda bot_username: _dequeue_external(bot_userna
 
 _external_media_groups: dict[str, tuple[int, str, float]] = {}
 _MEDIA_GROUP_TTL = 300
+
+_bot_last_request: dict[str, float] = {}
+
+
+async def _wait_bot_interval(bot_username: str):
+    interval = await get_bot_decode_interval(bot_username)
+    if interval <= 0:
+        return
+    last = _bot_last_request.get(bot_username, 0)
+    elapsed = time.time() - last
+    if elapsed < interval:
+        wait = interval - elapsed
+        logger.debug(f"[_wait_bot_interval] @{bot_username} 需等待 {wait:.1f} 秒")
+        await asyncio.sleep(wait)
+    _bot_last_request[bot_username] = time.time()
 
 
 def _track_external_media_group(media_group_id: str, user_id: int, code: str):
@@ -827,6 +844,16 @@ async def handle_external_code(
         code = original_code
         bot_username = context.user_data.pop("_extracted_bot", bot_username)
         asyncio.ensure_future(save_code_bot_mapping(code, bot_username))
+
+    actual_bot = await resolve_bot_for_code(code, bot_username)
+    if actual_bot != bot_username:
+        logger.info(
+            f"[handle_external_code] 代码前缀路由覆盖: {code} "
+            f"原 @{bot_username} → @{actual_bot}"
+        )
+        bot_username = actual_bot
+
+    await _wait_bot_interval(bot_username)
 
     logger.info(f"[handle_external_code] 用户 {user_id} 请求外部码 {code}，目标机器人 @{bot_username}")
 
