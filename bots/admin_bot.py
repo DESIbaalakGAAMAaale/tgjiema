@@ -369,101 +369,72 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "user":
-        text = (
-            "👤 用户管理\n\n"
-            "用法参考：\n"
-            "/user <id> — 查看用户详情\n"
-            "/set_level <id> <等级> — 设置会员等级\n"
-            "/ban <id> / /unban <id> — 封禁/解封\n"
-            "/set_quota <id> <数量> — 解码配额\n"
-            "/set_external_quota <id> <数量> — 外部码配额"
-        )
+        text = "👤 用户管理 — 点击按钮操作"
         kb = [
-            [InlineKeyboardButton("📋 用户列表", callback_data="action:users")],
+            [InlineKeyboardButton("📋 用户列表", callback_data="action:users"),
+             InlineKeyboardButton("👤 查询用户", callback_data="interactive:user_detail")],
+            [InlineKeyboardButton("🏅 设置等级", callback_data="interactive:set_level"),
+             InlineKeyboardButton("🔒 封禁用户", callback_data="interactive:ban")],
+            [InlineKeyboardButton("🔓 解封用户", callback_data="interactive:unban"),
+             InlineKeyboardButton("📤 解码配额", callback_data="interactive:set_quota")],
+            [InlineKeyboardButton("🌐 外部码配额", callback_data="interactive:set_external_quota")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "file":
-        text = (
-            "📁 文件管理\n\n"
-            "用法参考：\n"
-            "/file <code> — 查看文件详情\n"
-            "/files [搜索] [页码] — 文件列表\n"
-            "/delete_file <code> — 删除文件"
-        )
+        text = "📁 文件管理 — 点击按钮操作"
         kb = [
-            [InlineKeyboardButton("📂 文件列表", callback_data="action:files")],
+            [InlineKeyboardButton("📂 文件列表", callback_data="action:files"),
+             InlineKeyboardButton("🔍 查询文件", callback_data="interactive:file_detail")],
+            [InlineKeyboardButton("🗑️ 删除文件", callback_data="interactive:delete_file")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "backup_chan":
-        text = (
-            "📺 主存储频道 & 备份管理\n\n"
-            "/add_channel <频道ID> — 新增频道后选择机器人\n"
-            "/add_channel <编号> <频道ID> — 直接指定机器人\n"
-            "/remove_channel <编号> <频道ID> — 删除备份频道\n"
-            "/promote_channel <频道ID> — 将备份频道切换为主频道"
-        )
+        text = "📺 主存储频道 & 备份管理 — 点击按钮操作"
         kb = [
             [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
-            [InlineKeyboardButton("➕ 新增频道", callback_data="usage:add_chan"),
-             InlineKeyboardButton("➖ 删除频道", callback_data="usage:remove_chan")],
+            [InlineKeyboardButton("➕ 新增频道", callback_data="interactive:add_channel"),
+             InlineKeyboardButton("➖ 删除频道", callback_data="interactive:remove_channel")],
+            [InlineKeyboardButton("⬆️ 提升主频道", callback_data="interactive:promote_channel")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "backup_bot":
         text = (
-            "🤖 备份机器人管理\n\n"
-            "/add_backup_bot <编号> <Token> [频道ID...] — 配置Token及频道\n"
-            "/remove_backup_bot <编号> — 删除备份机器人\n"
-            "/backup_reset <backup_bot_N> — 重置备份状态(清空频道后使用)\n\n"
+            "🤖 备份机器人管理 — 点击按钮操作\n\n"
             "⚠️ 修改 Token 后需重启对应备份机器人才生效"
         )
         kb = [
-            [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
-            [InlineKeyboardButton("➕ 新增机器人", callback_data="usage:add_bot"),
-             InlineKeyboardButton("➖ 删除机器人", callback_data="usage:remove_bot")],
-            [InlineKeyboardButton("🔄 重置备份", callback_data="usage:reset_backup")],
+            [InlineKeyboardButton("📺 查看配置", callback_data="action:channels"),
+             InlineKeyboardButton("➕ 新增机器人", callback_data="interactive:add_backup_bot")],
+            [InlineKeyboardButton("➖ 删除机器人", callback_data="interactive:remove_backup_bot"),
+             InlineKeyboardButton("🔄 重置备份", callback_data="interactive:backup_reset")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "relay":
-        text = (
-            "🔐 用户中继管理\n\n"
-            "中继账号用于突破 bot-to-bot 私聊限制，\n"
-            "使解码机器人可以向其他机器人发送外部码。\n\n"
-            "验证码会发送到该账号已登录的 Telegram 客户端，\n"
-            "而非手机短信。\n\n"
-            "/relay_code <验证码> — 提交登录验证码（6位）\n"
-            "/relay_set_api <api_id> <api_hash> <手机号> — 配置账号\n"
-            "/relay_pending — 查看是否有待处理的验证码"
-        )
+        text = "🔐 用户中继管理 — 点击按钮操作"
         kb = [
-            [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status")],
-            [InlineKeyboardButton("⚙️ 配置说明", callback_data="usage:relay_config"),
-             InlineKeyboardButton("🔑 验证码说明", callback_data="usage:relay_code")],
+            [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status"),
+             InlineKeyboardButton("⚙️ 配置账号", callback_data="interactive:relay_set_api")],
+            [InlineKeyboardButton("🔑 提交验证码", callback_data="interactive:relay_code"),
+             InlineKeyboardButton("📋 查看待处理", callback_data="action:relay_pending")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "config":
-        text = (
-            "⚙️ 系统配置\n\n"
-            "📌 基础配置\n"
-            "/set_storage_channel <ID> — 设置主存储频道\n"
-            "/set_decoder_chat <ID> — 设置解码机器人对话\n"
-            "/set_file_prefix <前缀> — 设置文件码前缀\n"
-            "/set_force_join <频道ID> [链接] — 设置强制加群\n\n"
-            "🤖 机器人用户名\n"
-            "/set_username <upload|decoder|sender> <@用户名> — 设置\n\n"
-            "🎫 默认配额\n"
-            "/set_quota_default <free|basic|premium> <数量> [外部码] — 设置\n\n"
-            "💾 数据备份\n"
-            "/set_r2 <账号ID> <密钥> <私钥> [桶名] — R2 配置\n"
-            "/set_db_backup <间隔分钟> <开/关> — DB 自动备份\n\n"
-            "📋 查看全部：/settings"
-        )
+        text = "⚙️ 系统配置 — 点击按钮操作"
         kb = [
-            [InlineKeyboardButton("📋 查看配置", callback_data="action:settings")],
+            [InlineKeyboardButton("📋 查看全部配置", callback_data="action:settings")],
+            [InlineKeyboardButton("📺 主存储频道", callback_data="interactive:set_storage_channel"),
+             InlineKeyboardButton("🤖 解码对话", callback_data="interactive:set_decoder_chat")],
+            [InlineKeyboardButton("📝 文件码前缀", callback_data="interactive:set_file_prefix"),
+             InlineKeyboardButton("🔒 强制加群", callback_data="interactive:set_force_join")],
+            [InlineKeyboardButton("👤 机器人用户名", callback_data="interactive:set_username"),
+             InlineKeyboardButton("🎫 默认配额", callback_data="interactive:set_quota_default")],
+            [InlineKeyboardButton("☁️ R2备份配置", callback_data="interactive:set_r2"),
+             InlineKeyboardButton("💾 DB自动备份", callback_data="interactive:set_db_backup")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -551,85 +522,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"\n使用 /files 2 查看下一页"
         await query.edit_message_text(text, reply_markup=back_kb)
 
-    elif data == "usage:add_chan":
-        text = (
-            "➕ 新增备份频道\n\n"
-            "方式一：只输入频道ID，再选择由哪个机器人负责\n"
-            "  /add_channel -100111222333\n\n"
-            "方式二：直接指定机器人编号\n"
-            "  /add_channel 2 -100111222333"
-        )
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "usage:remove_chan":
-        text = (
-            "➖ 删除备份频道\n\n"
-            "请先通过 /channels 确认频道所属的机器人编号\n"
-            "然后输入：\n"
-            "  /remove_channel <机器人编号> <频道ID>\n\n"
-            "示例：/remove_channel 1 -100111222333"
-        )
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "usage:add_bot":
-        text = (
-            "➕ 新增备份机器人\n\n"
-            "格式：/add_backup_bot <编号> <BotToken> [频道ID ...]\n\n"
-            "示例（仅配Token）：\n"
-            "  /add_backup_bot 1 8012345678:AAbbcc...\n\n"
-            "示例（同时配频道）：\n"
-            "  /add_backup_bot 1 8012345678:AAbbcc... -100111 -100222\n\n"
-            "⚠️ 配置后需重启对应备份机器人才生效"
-        )
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "usage:remove_bot":
-        text = (
-            "➖ 删除备份机器人\n\n"
-            "格式：/remove_backup_bot <编号>\n\n"
-            "示例：/remove_backup_bot 2\n\n"
-            "⚠️ 该备份机器人将在下次重启后不再启动"
-        )
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "action:relay_status":
-        text = await _get_relay_status_text()
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "action:settings":
-        text = await _get_configs_text()
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "usage:relay_config":
-        text = (
-            "⚙️ 配置中继账号\n\n"
-            "中继需要一个真实的 Telegram 用户账号。\n"
-            "按以下步骤获取 API 凭据：\n\n"
-            "1. 访问 https://my.telegram.org\n"
-            "2. 登录你的 Telegram 账号\n"
-            "3. 进入 API Development Tools\n"
-            "4. 创建应用，获取 api_id 和 api_hash\n\n"
-            "配置命令：\n"
-            "/relay_set_api <api_id> <api_hash> <手机号>\n\n"
-            "示例：\n"
-            "/relay_set_api 12345 abc123def456 +8613800138000\n\n"
-            "⚠️ api_id 是数字，api_hash 是字符串\n"
-            "⚠️ 手机号需包含国家区号，如 +86\n"
-            "⚠️ 配置后解码机器人下次重启时生效"
-        )
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "usage:relay_code":
-        text = (
-            "🔑 提交验证码\n\n"
-            "当中继账号需要登录验证时，Telegram 会发送 6 位验证码\n"
-            "到该账号已登录的 Telegram 客户端（非短信）。\n\n"
-            "在此提交验证码即可完成登录：\n"
-            "/relay_code <验证码>\n\n"
-            "示例：/relay_code 123456\n\n"
-            "解码机器人在后台轮询等待，提交后几秒内自动完成登录。"
-        )
-
     elif data == "usage:reset_backup":
         text = (
             "🔄 重置备份状态\n\n"
@@ -642,6 +534,23 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "2. 清除所有文件记录中该频道的旧备份信息\n"
             "3. 备份机器人重启后执行全量备份"
         )
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:relay_status":
+        text = await _get_relay_status_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:relay_pending":
+        from database import get_config as _get_cfg
+        pending = await _get_cfg("relay_auth_pending")
+        if pending == "1":
+            text = "⏳ 中继正在等待验证码\n\nTelegram 已发送 6 位验证码到中继账号的已登录客户端，请查看并使用 /relay_code 提交。"
+        else:
+            text = "✅ 中继当前不需要验证码。"
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:settings":
+        text = await _get_configs_text()
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:code_routes":
@@ -665,50 +574,182 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=back_kb)
 
     # ─── 交互式操作入口 ──────────────────────────────────────────
-    elif data == "interactive:add_code_route":
+    elif data.startswith("interactive:"):
         context.user_data.pop("conv_state", None)
         context.user_data.pop("conv_data", None)
-        await _conv_start(
-            update, context, "add_code_route:prefix",
-            "🗺️ 新增文件码前缀路由\n\n"
-            "请输入文件码前缀（例如：qqfile）：\n\n"
-            "❌ 如需取消，请点击下方按钮。"
-        )
+        action = data[len("interactive:"):]
 
-    elif data == "interactive:remove_code_route":
-        context.user_data.pop("conv_state", None)
-        context.user_data.pop("conv_data", None)
-        await _conv_start(
-            update, context, "remove_code_route:prefix",
-            "🗺️ 删除文件码前缀路由\n\n"
-            "请输入要删除的路由前缀（例如：qqfile）：\n\n"
-            "❌ 如需取消，请点击下方按钮。"
-        )
+        prompts = {
+            # 文件码路由
+            "add_code_route": (
+                "add_code_route:prefix",
+                "🗺️ 新增文件码前缀路由\n\n请输入文件码前缀（例如：qqfile）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "remove_code_route": (
+                "remove_code_route:prefix",
+                "🗺️ 删除文件码前缀路由\n\n请输入要删除的路由前缀（例如：qqfile）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # Bot限流
+            "set_bot_interval": (
+                "set_bot_interval:bot",
+                "⏱️ 新增 Bot 解码间隔限流\n\n请输入目标机器人用户名（不需要 @，例如：qqfile_bot）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "remove_bot_interval": (
+                "remove_bot_interval:bot",
+                "⏱️ 删除 Bot 解码间隔限流\n\n请输入要删除限流的机器人用户名（例如：qqfile_bot）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 用户管理
+            "user_detail": (
+                "user_detail:id",
+                "👤 查询用户\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_level": (
+                "set_level:user_id",
+                "🏅 设置会员等级\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "ban": (
+                "ban:user_id",
+                "🔒 封禁用户\n\n请输入要封禁的用户ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "unban": (
+                "unban:user_id",
+                "🔓 解封用户\n\n请输入要解封的用户ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_quota": (
+                "set_quota:user_id",
+                "📤 设置解码配额\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_external_quota": (
+                "set_external_quota:user_id",
+                "🌐 设置外部码配额\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 文件管理
+            "file_detail": (
+                "file_detail:code",
+                "🔍 查询文件\n\n请输入文件码：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "delete_file": (
+                "delete_file:code",
+                "🗑️ 删除文件\n\n请输入要删除的文件码：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 频道管理
+            "add_channel": (
+                "add_channel:id",
+                "📺 新增备份频道\n\n请输入频道ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "remove_channel": (
+                "remove_channel:bot_num",
+                "➖ 删除备份频道\n\n请输入频道所属的机器人编号（1/2/3）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "promote_channel": (
+                "promote_channel:id",
+                "⬆️ 提升主频道\n\n请输入要提升为主频道的频道ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 备份机器人
+            "add_backup_bot": (
+                "add_backup_bot:bot_num",
+                "🤖 新增备份机器人\n\n请输入机器人编号（1/2/3）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "remove_backup_bot": (
+                "remove_backup_bot:bot_num",
+                "➖ 删除备份机器人\n\n请输入要删除的机器人编号（1/2/3）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "backup_reset": (
+                "backup_reset:bot_name",
+                "🔄 重置备份状态\n\n请输入备份机器人名称（backup_bot_1 / backup_bot_2 / backup_bot_3）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 中继
+            "relay_code": (
+                "relay_code:code",
+                "🔑 提交验证码\n\n请输入 Telegram 发送的 6 位验证码：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "relay_set_api": (
+                "relay_set_api:api_id",
+                "⚙️ 配置中继账号\n\n第一步：请输入 API_ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 系统配置
+            "set_storage_channel": (
+                "set_storage_channel:id",
+                "📺 设置主存储频道\n\n请输入频道ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_decoder_chat": (
+                "set_decoder_chat:id",
+                "🤖 设置解码机器人对话\n\n请输入 ChatID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_file_prefix": (
+                "set_file_prefix:prefix",
+                "📝 设置文件码前缀\n\n请输入新的文件码前缀（例如：tgwenjian）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_force_join": (
+                "set_force_join:channel_id",
+                "🔒 设置强制加群频道\n\n请输入频道ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_username": (
+                "set_username:role",
+                "👤 设置机器人用户名\n\n请输入角色（upload / decoder / sender）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_quota_default": (
+                "set_quota_default:level",
+                "🎫 设置默认配额\n\n请输入会员等级（free / basic / premium）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_r2": (
+                "set_r2:account_id",
+                "☁️ 配置 R2 备份\n\n第一步：请输入 R2 账号ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_db_backup": (
+                "set_db_backup:interval",
+                "💾 配置 DB 自动备份\n\n请输入备份间隔（分钟）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+        }
 
-    elif data == "interactive:set_bot_interval":
-        context.user_data.pop("conv_state", None)
-        context.user_data.pop("conv_data", None)
-        await _conv_start(
-            update, context, "set_bot_interval:bot",
-            "⏱️ 新增 Bot 解码间隔限流\n\n"
-            "请输入目标机器人用户名（不需要 @，例如：qqfile_bot）：\n\n"
-            "❌ 如需取消，请点击下方按钮。"
-        )
-
-    elif data == "interactive:remove_bot_interval":
-        context.user_data.pop("conv_state", None)
-        context.user_data.pop("conv_data", None)
-        await _conv_start(
-            update, context, "remove_bot_interval:bot",
-            "⏱️ 删除 Bot 解码间隔限流\n\n"
-            "请输入要删除限流的机器人用户名（例如：qqfile_bot）：\n\n"
-            "❌ 如需取消，请点击下方按钮。"
-        )
+        entry = prompts.get(action)
+        if entry:
+            state, prompt = entry
+            await _conv_start(update, context, state, prompt)
+        else:
+            await query.edit_message_text(f"❌ 未知操作：{action}", reply_markup=back_kb)
 
     elif data == "conv:cancel":
         _conv_end(context)
         await query.edit_message_text(
             "❌ 操作已取消。",
+            reply_markup=back_kb,
+        )
+
+    elif data.startswith("conv_sel_bot:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            _, channel_id_str, bot_num_str = parts
+            try:
+                channel_id = int(channel_id_str)
+                bot_num = int(bot_num_str)
+            except ValueError:
+                await query.edit_message_text("❌ 参数错误", reply_markup=back_kb)
+                return
+        else:
+            await query.edit_message_text("❌ 参数错误", reply_markup=back_kb)
+            return
+
+        channels = await get_backup_channels(bot_num)
+        if channel_id in channels:
+            await query.edit_message_text(
+                f"⚠️ 频道 {channel_id} 已在 Bot {bot_num} 的备份列表中。",
+                reply_markup=back_kb,
+            )
+            _conv_end(context)
+            return
+
+        channels.append(channel_id)
+        await set_backup_channels(bot_num, channels)
+
+        all_chan = await get_all_backup_channels()
+        if channel_id not in all_chan:
+            from config import settings as _settings
+            _settings.ALL_BACKUP_CHANNELS = list(set(all_chan + [channel_id]))
+
+        _conv_end(context)
+        await query.edit_message_text(
+            f"✅ 已添加频道 {channel_id} 到 Bot {bot_num} 的备份列表。",
             reply_markup=back_kb,
         )
 
@@ -1808,81 +1849,559 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     text = update.message.text.strip()
+    data = context.user_data.get("conv_data", {})
 
-    # ─── 添加文件码前缀路由 ──────────────────────────────────────
+    # ─── Helper: execute and end ─────────────────────────────────
+    async def _end(msg: str):
+        _conv_end(context)
+        await update.message.reply_text(msg)
+
+    async def _ask(next_state: str, prompt: str, extra_data: dict | None = None):
+        if extra_data:
+            context.user_data["conv_data"].update(extra_data)
+        context.user_data["conv_state"] = next_state
+        await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+
+    # ─── 文件码前缀路由 ──────────────────────────────────────────
     if state == "add_code_route:prefix":
-        context.user_data["conv_data"] = {"prefix": text.lower()}
-        context.user_data["conv_state"] = "add_code_route:bot"
-        await update.message.reply_text(
-            f"✅ 前缀已记录：`{text.lower()}`\n\n"
-            f"请输入目标机器人用户名（不需要 @）：",
-            reply_markup=_CONV_CANCEL_KEYBOARD,
-        )
-        return
+        await _ask("add_code_route:bot",
+                    f"✅ 前缀已记录：`{text.lower()}`\n\n请输入目标机器人用户名（不需要 @）：",
+                    {"prefix": text.lower()})
 
-    if state == "add_code_route:bot":
-        data = context.user_data.get("conv_data", {})
-        prefix = data.get("prefix", "")
-        bot_username = text.strip().lower().lstrip("@")
-        await set_code_bot_route(prefix, bot_username)
-        _conv_end(context)
-        await update.message.reply_text(
-            f"✅ 文件码路由已设置\n"
-            f"  前缀：`{prefix}`\n"
-            f"  目标机器人：@{bot_username}\n\n"
-            f"以 `{prefix}` 开头的文件码将通过 @{bot_username} 解码。"
-        )
-        return
+    elif state == "add_code_route:bot":
+        bot_username = text.lstrip("@").lower()
+        await set_code_bot_route(data["prefix"], bot_username)
+        await _end(f"✅ 文件码路由已设置\n  前缀：`{data['prefix']}`\n  目标机器人：@{bot_username}")
 
-    # ─── 删除文件码前缀路由 ─────────────────────────────────────
-    if state == "remove_code_route:prefix":
-        prefix = text.strip().lower()
+    elif state == "remove_code_route:prefix":
+        prefix = text.lower()
         await delete_code_bot_route(prefix)
-        _conv_end(context)
-        await update.message.reply_text(f"✅ 文件码前缀路由已删除：`{prefix}`")
-        return
+        await _end(f"✅ 文件码前缀路由已删除：`{prefix}`")
 
-    # ─── 设置 Bot 解码间隔 ───────────────────────────────────────
-    if state == "set_bot_interval:bot":
-        context.user_data["conv_data"] = {"bot": text.strip().lower().lstrip("@")}
-        context.user_data["conv_state"] = "set_bot_interval:seconds"
-        await update.message.reply_text(
-            f"✅ Bot 已记录：@{text.strip().lower().lstrip('@')}\n\n"
-            f"请输入解码间隔秒数（输入 0 取消限制）：",
-            reply_markup=_CONV_CANCEL_KEYBOARD,
-        )
-        return
+    # ─── Bot 解码间隔 ────────────────────────────────────────────
+    elif state == "set_bot_interval:bot":
+        await _ask("set_bot_interval:seconds",
+                    f"✅ Bot 已记录：@{text.lstrip('@')}\n\n请输入解码间隔秒数（输入 0 取消限制）：",
+                    {"bot": text.lstrip("@").lower()})
 
-    if state == "set_bot_interval:seconds":
-        data = context.user_data.get("conv_data", {})
-        bot_username = data.get("bot", "")
+    elif state == "set_bot_interval:seconds":
         try:
-            interval = int(text.strip())
+            interval = int(text)
         except ValueError:
             await update.message.reply_text("❌ 请输入有效的数字（秒数），例如：3")
             return
         if interval < 0:
             await update.message.reply_text("❌ 间隔秒数不能为负数，请重新输入：")
             return
-        await set_bot_decode_interval(bot_username, interval)
-        _conv_end(context)
-        if interval == 0:
-            await update.message.reply_text(f"✅ 已取消 @{bot_username} 的解码间隔限制")
-        else:
-            await update.message.reply_text(f"✅ @{bot_username} 的解码间隔已设为 {interval} 秒")
-        return
+        await set_bot_decode_interval(data["bot"], interval)
+        msg = f"✅ 已取消 @{data['bot']} 的解码间隔限制" if interval == 0 else f"✅ @{data['bot']} 的解码间隔已设为 {interval} 秒"
+        await _end(msg)
 
-    # ─── 删除 Bot 解码间隔 ─────────────────────────────────────
-    if state == "remove_bot_interval:bot":
-        bot_username = text.strip().lower().lstrip("@")
-        await delete_bot_decode_interval(bot_username)
-        _conv_end(context)
-        await update.message.reply_text(f"✅ 已删除 @{bot_username} 的解码间隔配置")
-        return
+    elif state == "remove_bot_interval:bot":
+        await delete_bot_decode_interval(text.lstrip("@").lower())
+        await _end(f"✅ 已删除 @{text.lstrip('@')} 的解码间隔配置")
+
+    # ─── 用户管理 ────────────────────────────────────────────────
+    elif state == "user_detail:id":
+        try:
+            user_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字，请重新输入：")
+            return
+        users_col = get_users_col()
+        user = await _ensure_user(user_id)
+        level = user.get("membership_level", "free")
+        await _end(
+            f"👤 用户详情\n\n"
+            f"🆔 ID：{user.get('user_id')}\n"
+            f"📝 用户名：@{user.get('username') or 'N/A'}\n"
+            f"👤 昵称：{user.get('first_name') or 'N/A'}\n"
+            f"🏅 会员等级：{MEMBERSHIP_LEVELS.get(level, level)}\n"
+            f"🔒 是否封禁：{'是 ❌' if user.get('is_banned') else '否 ✅'}\n"
+            f"📤 允许上传：{'是 ✅' if user.get('can_upload') else '否 ❌'}\n"
+            f"📅 解码配额：{_quota_display(user.get('daily_decode_quota'))}/天\n"
+            f"📊 今日已用：{user.get('quota_used_today', 0)}次\n"
+            f"🌐 外部码配额：{_quota_display(user.get('external_decode_quota'))}/天\n"
+            f"🌐 外部已用：{user.get('external_used_today', 0)}次\n"
+            f"📅 注册时间：{_format_datetime(user.get('created_at'))}\n"
+            f"🔄 更新时间：{_format_datetime(user.get('updated_at'))}"
+        )
+
+    elif state == "set_level:user_id":
+        try:
+            int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字，请重新输入：")
+            return
+        await _ask("set_level:level",
+                    f"✅ 用户已记录：{text}\n\n请输入会员等级（free / basic / premium）：",
+                    {"user_id": int(text)})
+
+    elif state == "set_level:level":
+        level = text.lower()
+        if level not in MEMBERSHIP_LEVELS:
+            await update.message.reply_text("❌ 等级必须是 free、basic 或 premium，请重新输入：")
+            return
+        user_id = data["user_id"]
+        users_col = get_users_col()
+        await _ensure_user(user_id)
+        update_doc = {"$set": {"membership_level": level, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}}
+        if level == "free":
+            update_doc["$set"]["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
+            update_doc["$set"]["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
+            update_doc["$set"]["can_upload"] = True
+        elif level == "basic":
+            update_doc["$set"]["daily_decode_quota"] = settings.BASIC_DAILY_QUOTA
+            update_doc["$set"]["external_decode_quota"] = settings.BASIC_EXTERNAL_DAILY_QUOTA
+            update_doc["$set"]["can_upload"] = True
+        elif level == "premium":
+            update_doc["$set"]["daily_decode_quota"] = settings.PREMIUM_DAILY_QUOTA
+            update_doc["$set"]["external_decode_quota"] = settings.PREMIUM_EXTERNAL_DAILY_QUOTA
+            update_doc["$set"]["can_upload"] = True
+        await users_col.update_one({"user_id": user_id}, update_doc)
+        await _end(f"✅ 用户 {user_id} 已设置为 {MEMBERSHIP_LEVELS[level]}")
+
+    elif state == "ban:user_id":
+        try:
+            user_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字，请重新输入：")
+            return
+        users_col = get_users_col()
+        await _ensure_user(user_id)
+        await users_col.update_one({"user_id": user_id}, {"$set": {"is_banned": True, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}})
+        await _end(f"✅ 用户 {user_id} 已封禁")
+
+    elif state == "unban:user_id":
+        try:
+            user_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字，请重新输入：")
+            return
+        users_col = get_users_col()
+        await _ensure_user(user_id)
+        await users_col.update_one({"user_id": user_id}, {"$set": {"is_banned": False, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}})
+        await _end(f"✅ 用户 {user_id} 已解封")
+
+    elif state == "set_quota:user_id":
+        try:
+            int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字，请重新输入：")
+            return
+        await _ask("set_quota:quota",
+                    f"✅ 用户已记录：{text}\n\n请输入每日解码配额（-1 为不限，0 为禁止）：",
+                    {"user_id": int(text)})
+
+    elif state == "set_quota:quota":
+        try:
+            quota = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 配额必须是数字，请重新输入（-1 为不限）：")
+            return
+        users_col = get_users_col()
+        await _ensure_user(data["user_id"])
+        await users_col.update_one({"user_id": data["user_id"]}, {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}})
+        await _end(f"✅ 用户 {data['user_id']} 每日解码配额已设为 {_quota_display(quota)}")
+
+    elif state == "set_external_quota:user_id":
+        try:
+            int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字，请重新输入：")
+            return
+        await _ask("set_external_quota:quota",
+                    f"✅ 用户已记录：{text}\n\n请输入外部码配额（-1 不限，0 禁止）：",
+                    {"user_id": int(text)})
+
+    elif state == "set_external_quota:quota":
+        try:
+            quota = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 配额必须是数字，请重新输入（-1 不限，0 禁止）：")
+            return
+        users_col = get_users_col()
+        await _ensure_user(data["user_id"])
+        await users_col.update_one({"user_id": data["user_id"]}, {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}})
+        await _end(f"✅ 用户 {data['user_id']} 外部码配额已设为 {_quota_display(quota)}")
+
+    # ─── 文件管理 ────────────────────────────────────────────────
+    elif state == "file_detail:code":
+        file_code = text.strip()
+        files_col = get_file_records_col()
+        record = await files_col.find_one({"file_code": file_code})
+        if record is None:
+            await _end(f"❌ 文件码 {file_code} 不存在")
+            return
+        file_types = record.get("file_types", {})
+        if isinstance(file_types, str):
+            import json
+            file_types = json.loads(file_types) if file_types else {}
+        type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items())) if file_types else "外部缓存文件"
+        backups = record.get("backup_channel_msg_ids", [])
+        if isinstance(backups, str):
+            import json
+            backups = json.loads(backups) if backups else []
+        await _end(
+            f"📁 文件详情\n\n"
+            f"🔑 文件码：{file_code}\n"
+            f"👤 上传者：{record.get('uploader_id')}\n"
+            f"📦 文件类型：{type_desc}\n"
+            f"📊 状态：{record.get('status', 'active')}\n"
+            f"📈 请求次数：{record.get('request_count', 0)}\n"
+            f"📅 创建时间：{_format_datetime(record.get('create_time'))}\n"
+            f"📺 主频道：{record.get('primary_channel_id')}\n"
+            f"🔄 备份数：{len(backups)}个频道"
+        )
+
+    elif state == "delete_file:code":
+        file_code = text.strip()
+        files_col = get_file_records_col()
+        result = await files_col.update_one({"file_code": file_code}, {"$set": {"status": "deleted"}})
+        if result.matched_count == 0:
+            await _end(f"❌ 文件码 {file_code} 不存在")
+        else:
+            await _end(f"✅ 文件 {file_code} 已删除")
+
+    # ─── 频道管理 ────────────────────────────────────────────────
+    elif state == "add_channel:id":
+        try:
+            channel_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
+            return
+        context.user_data["conv_data"]["channel_id"] = channel_id
+        context.user_data["conv_state"] = "add_channel:select_bot"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 Bot 1", callback_data=f"conv_sel_bot:{channel_id}:1"),
+             InlineKeyboardButton("🤖 Bot 2", callback_data=f"conv_sel_bot:{channel_id}:2"),
+             InlineKeyboardButton("🤖 Bot 3", callback_data=f"conv_sel_bot:{channel_id}:3")],
+            [InlineKeyboardButton("❌ 取消", callback_data="conv:cancel")],
+        ])
+        await update.message.reply_text(
+            f"✅ 频道已记录：{channel_id}\n\n请选择该频道由哪个备份机器人负责：",
+            reply_markup=kb,
+        )
+
+    elif state == "remove_channel:bot_num":
+        try:
+            bot_num = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 编号必须是数字（1/2/3），请重新输入：")
+            return
+        if bot_num not in (1, 2, 3):
+            await update.message.reply_text("❌ 编号只能是 1、2 或 3，请重新输入：")
+            return
+        await _ask("remove_channel:channel_id",
+                    f"✅ 机器人已选择：Bot {bot_num}\n\n请输入要删除的频道ID：",
+                    {"bot_num": bot_num})
+
+    elif state == "remove_channel:channel_id":
+        try:
+            channel_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
+            return
+        channels = await get_backup_channels(data["bot_num"])
+        if channel_id not in channels:
+            await _end(f"❌ 频道 {channel_id} 不在 Bot {data['bot_num']} 的备份列表中")
+            return
+        channels = [c for c in channels if c != channel_id]
+        await set_backup_channels(data["bot_num"], channels)
+        await _end(f"✅ 已从 Bot {data['bot_num']} 删除备份频道 {channel_id}")
+
+    elif state == "promote_channel:id":
+        try:
+            new_channel_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
+            return
+        all_backups = list(settings.ALL_BACKUP_CHANNELS)
+        if not all_backups:
+            await _end("❌ 没有任何备份频道可提升")
+            return
+        if new_channel_id not in all_backups:
+            await _end(f"❌ 频道 {new_channel_id} 不在备份频道列表中。\n当前备份频道: {all_backups}")
+            return
+        old_channel = await get_active_storage_channel_id()
+        if new_channel_id == old_channel:
+            await _end(f"⚠️ 频道 {new_channel_id} 已经是当前主频道")
+            return
+        success = await set_active_storage_channel_id(new_channel_id)
+        if not success:
+            await _end("❌ 切换主存储频道失败，请检查数据库连接。")
+            return
+        invalidate_cache()
+        await _end(
+            f"✅ 主存储频道已切换！\n\n"
+            f"旧主频道：{old_channel}\n"
+            f"新主频道：{new_channel_id}\n\n"
+            f"📤 upload_bot 将上传新文件到新频道\n"
+            f"🤖 backup_bot 将实时监控新频道的新消息\n"
+            f"📨 sender_bot 发送时优先使用新频道"
+        )
+
+    # ─── 备份机器人 ──────────────────────────────────────────────
+    elif state == "add_backup_bot:bot_num":
+        try:
+            bot_num = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 编号必须是数字（1/2/3），请重新输入：")
+            return
+        if bot_num not in (1, 2, 3):
+            await update.message.reply_text("❌ 编号只能是 1、2 或 3，请重新输入：")
+            return
+        await _ask("add_backup_bot:token",
+                    f"✅ 编号已记录：Bot {bot_num}\n\n请输入 Bot Token（一串字符）：\n\n也可附带频道ID，格式：\n<Token> <频道ID1> <频道ID2>...",
+                    {"bot_num": bot_num})
+
+    elif state == "add_backup_bot:token":
+        parts = text.split()
+        token = parts[0].strip()
+        await set_backup_bot_token(data["bot_num"], token)
+        extra_info = ""
+        if len(parts) > 1:
+            channel_ids = []
+            for a in parts[1:]:
+                try:
+                    channel_ids.append(int(a))
+                except ValueError:
+                    pass
+            if channel_ids:
+                await set_backup_channels(data["bot_num"], channel_ids)
+                extra_info = f"\n频道已配置: {channel_ids}"
+        masked = token[:8] + "..." + token[-4:] if len(token) > 15 else "***"
+        await _end(
+            f"✅ 备份机器人 {data['bot_num']} Token 已保存 ({masked}){extra_info}\n"
+            f"⚠️ 需要重启 backup_bot_{data['bot_num']} 进程才能生效"
+        )
+
+    elif state == "remove_backup_bot:bot_num":
+        try:
+            bot_num = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 编号必须是数字（1/2/3），请重新输入：")
+            return
+        if bot_num not in (1, 2, 3):
+            await update.message.reply_text("❌ 编号只能是 1、2 或 3，请重新输入：")
+            return
+        await delete_backup_bot_token(bot_num)
+        await _end(f"✅ 已删除备份机器人 {bot_num} 配置\n⚠️ 重启后该备份机器人将不再启动")
+
+    elif state == "backup_reset:bot_name":
+        bot_name = text.strip()
+        if bot_name not in ("backup_bot_1", "backup_bot_2", "backup_bot_3"):
+            await update.message.reply_text("❌ 请输入 backup_bot_1、backup_bot_2 或 backup_bot_3：")
+            return
+        files_col = get_file_records_col()
+        await set_config(f"backup_{bot_name}_full_sync_done", "0")
+        await set_config(f"backup_{bot_name}_last_synced_id", "0")
+        await set_config(f"backup_{bot_name}_quick_cursor", "0")
+        channels = await get_backup_channels(int(bot_name[-1]))
+        cleared_count = 0
+        if channels:
+            records = await files_col.find({"backup_channel_msg_ids": {"$ne": "", "$ne": None}}, limit=500)
+            for record in records:
+                backups = record.get("backup_channel_msg_ids") or []
+                if isinstance(backups, str):
+                    try:
+                        import json
+                        backups = json.loads(backups)
+                    except Exception:
+                        continue
+                if not isinstance(backups, list):
+                    continue
+                new_backups = [b for b in backups if isinstance(b, dict) and b.get("channel_id") not in channels]
+                if len(new_backups) != len(backups):
+                    await files_col.update_one({"file_code": record["file_code"]}, {"$set": {"backup_channel_msg_ids": new_backups}})
+                    cleared_count += 1
+        await _end(
+            f"✅ 已重置 {bot_name} 的备份状态\n"
+            f"• 同步状态已清零\n"
+            f"• 清理了 {cleared_count} 条文件记录中的旧备份信息\n"
+            f"⚠️ 备份机器人重启后将执行全量备份到频道 {channels}"
+        )
+
+    # ─── 中继 ────────────────────────────────────────────────────
+    elif state == "relay_code:code":
+        code = text.strip()
+        from services.user_relay import user_relay
+        ok = await user_relay.submit_code(code)
+        if ok:
+            await _end("✅ 验证码已提交，正在尝试登录...")
+        else:
+            await _end("❌ 验证码提交失败，请检查验证码是否正确，或中继是否正在等待验证码。")
+
+    elif state == "relay_set_api:api_id":
+        try:
+            int(text)
+        except ValueError:
+            await update.message.reply_text("❌ API_ID 必须是数字，请重新输入：")
+            return
+        await _ask("relay_set_api:api_hash",
+                    f"✅ API_ID 已记录：{text}\n\n第二步：请输入 API_HASH：",
+                    {"api_id": text.strip()})
+
+    elif state == "relay_set_api:api_hash":
+        await _ask("relay_set_api:phone",
+                    f"✅ API_HASH 已记录：{text}\n\n第三步：请输入手机号（含区号，如 +8613800138000）：",
+                    {"api_hash": text.strip()})
+
+    elif state == "relay_set_api:phone":
+        from services.user_relay import user_relay
+        phone = text.strip()
+        ok = await user_relay.set_api(data["api_id"], data["api_hash"], phone)
+        if ok:
+            await _end(
+                f"✅ 中继账号配置已保存\n"
+                f"  API_ID: {data['api_id']}\n"
+                f"  API_HASH: {data['api_hash'][:8]}...\n"
+                f"  手机号: {phone}\n\n"
+                f"解码机器人重启后将自动登录。"
+            )
+        else:
+            await _end("❌ 配置保存失败，请检查参数是否正确。")
+
+    # ─── 系统配置 ────────────────────────────────────────────────
+    elif state == "set_storage_channel:id":
+        try:
+            channel_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
+            return
+        await set_config("storage_channel_id", str(channel_id))
+        await _end(f"✅ 主存储频道已设为 {channel_id}\n⚠️ 需重启所有机器人后生效")
+
+    elif state == "set_decoder_chat:id":
+        try:
+            chat_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ ChatID必须是数字，请重新输入：")
+            return
+        await set_config("decoder_chat_id", str(chat_id))
+        await _end(f"✅ 解码机器人对话已设为 {chat_id}")
+
+    elif state == "set_file_prefix:prefix":
+        prefix = text.strip()
+        await set_config("file_code_prefix", prefix)
+        await _end(f"✅ 文件码前缀已设为 {prefix}\n⚠️ 需重启 upload_bot 后生效")
+
+    elif state == "set_force_join:channel_id":
+        try:
+            int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
+            return
+        await _ask("set_force_join:link",
+                    f"✅ 频道已记录：{text}\n\n请输入加群链接（如无可直接发送 0 跳过）：",
+                    {"channel_id": int(text)})
+
+    elif state == "set_force_join:link":
+        link = text.strip()
+        if link == "0":
+            link = ""
+        await set_config("force_join_channel_id", str(data["channel_id"]))
+        if link:
+            await set_config("force_join_link", link)
+        await _end(f"✅ 强制加群频道已设为 {data['channel_id']}" + (f"\n🔗 链接：{link}" if link else ""))
+
+    elif state == "set_username:role":
+        role = text.lower()
+        if role not in ("upload", "decoder", "sender"):
+            await update.message.reply_text("❌ 角色必须是 upload、decoder 或 sender，请重新输入：")
+            return
+        await _ask("set_username:name",
+                    f"✅ 角色已记录：{role}\n\n请输入 @用户名（不需要 @）：",
+                    {"role": role})
+
+    elif state == "set_username:name":
+        key_map = {"upload": "upload_bot_username", "decoder": "decoder_bot_username", "sender": "sender_bot_username"}
+        key = key_map.get(data["role"])
+        username = text.lstrip("@")
+        await set_config(key, username)
+        await _end(f"✅ {data['role']} 机器人用户名已设为 @{username}")
+
+    elif state == "set_quota_default:level":
+        level = text.lower()
+        if level not in ("free", "basic", "premium"):
+            await update.message.reply_text("❌ 等级必须是 free、basic 或 premium，请重新输入：")
+            return
+        await _ask("set_quota_default:quota",
+                    f"✅ 等级已记录：{level}\n\n请输入每日默认解码配额（-1 为不限）：",
+                    {"level": level})
+
+    elif state == "set_quota_default:quota":
+        try:
+            quota = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 配额必须是数字（-1 表示不限），请重新输入：")
+            return
+        await set_config(f"quota_default_{data['level']}", str(quota))
+        await _ask("set_quota_default:ext_quota",
+                    f"✅ 解码配额已记录：{_quota_display(quota)}\n\n请输入外部码默认配额（-1 不限，0 禁止，直接发送 0 跳过）：",
+                    {"quota": quota})
+
+    elif state == "set_quota_default:ext_quota":
+        try:
+            ext_quota = int(text)
+        except ValueError:
+            ext_quota = 0
+        if ext_quota > 0:
+            await set_config(f"quota_external_{data['level']}", str(ext_quota))
+        msg = f"✅ {data['level']} 日配额已设为 {_quota_display(data['quota'])}"
+        if ext_quota > 0:
+            msg += f"，外部码配额 {_quota_display(ext_quota)}"
+        await _end(msg)
+
+    elif state == "set_r2:account_id":
+        await _ask("set_r2:access_key",
+                    f"✅ 账号ID已记录：{text}\n\n第二步：请输入 R2 Access Key ID：",
+                    {"account_id": text.strip()})
+
+    elif state == "set_r2:access_key":
+        await _ask("set_r2:secret_key",
+                    f"✅ Access Key 已记录：{text[:8]}...\n\n第三步：请输入 R2 Secret Access Key：",
+                    {"access_key": text.strip()})
+
+    elif state == "set_r2:secret_key":
+        await _ask("set_r2:bucket",
+                    f"✅ Secret Key 已记录：{text[:8]}...\n\n第四步：请输入桶名（Bucket Name，直接发送 0 跳过）：",
+                    {"secret_key": text.strip()})
+
+    elif state == "set_r2:bucket":
+        bucket = text.strip()
+        if bucket == "0":
+            bucket = ""
+        await set_config("r2_account_id", data["account_id"])
+        await set_config("r2_access_key_id", data["access_key"])
+        await set_config("r2_secret_access_key", data["secret_key"])
+        if bucket:
+            await set_config("r2_bucket", bucket)
+        await _end(f"✅ R2 备份配置已保存\n  Bucket: {bucket or '(默认)'}\n⚠️ 需重启后生效")
+
+    elif state == "set_db_backup:interval":
+        try:
+            interval = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 间隔分钟数必须是数字，请重新输入：")
+            return
+        await _ask("set_db_backup:enabled",
+                    f"✅ 间隔已记录：{interval} 分钟\n\n请输入开关状态（on / off）：",
+                    {"interval": interval})
+
+    elif state == "set_db_backup:enabled":
+        on_off = text.strip().lower()
+        if on_off not in ("on", "off"):
+            await update.message.reply_text("❌ 请输入 on 或 off：")
+            return
+        await set_config("db_backup_interval_minutes", str(data["interval"]))
+        await set_config("db_backup_enabled", "1" if on_off == "on" else "0")
+        await _end(f"✅ DB 自动备份已{'开启' if on_off == 'on' else '关闭'}，间隔 {data['interval']} 分钟")
 
     # 未知状态 → 清理
-    _conv_end(context)
-    await update.message.reply_text("⏳ 对话已超时，请重新点击按钮开始操作。")
+    else:
+        _conv_end(context)
+        await update.message.reply_text("⏳ 对话已超时，请重新点击按钮开始操作。")
 
 
 async def _init():
