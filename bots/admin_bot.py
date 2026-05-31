@@ -28,6 +28,7 @@ from utils.storage_channel import get_active_storage_channel_id, set_active_stor
 TOKEN = settings.ADMIN_BOT_TOKEN
 AUTHORIZED_USER_ID = settings.ADMIN_TELEGRAM_ID
 MEMBERSHIP_LEVELS = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
+LEVEL_ALIAS = {"1": "free", "2": "basic", "3": "premium", "free": "free", "basic": "basic", "premium": "premium"}
 
 
 def _auth_required(func):
@@ -690,7 +691,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             "set_quota_default": (
                 "set_quota_default:level",
-                "🎫 设置默认配额\n\n请输入会员等级（free / basic / premium）：\n\n❌ 如需取消请点击下方按钮。"
+                "🎫 设置默认配额\n\n请输入会员等级（1=免费 / 2=基础 / 3=高级）：\n\n❌ 如需取消请点击下方按钮。"
             ),
             "set_r2": (
                 "set_r2:account_id",
@@ -821,17 +822,16 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text("用法：/set_level <用户ID> <free|basic|premium>")
+        await update.message.reply_text("用法：/set_level <用户ID> <1|2|3>")
         return
     try:
         user_id = int(args[0])
     except ValueError:
         await update.message.reply_text("❌ 用户ID必须是数字")
         return
-    level = args[1].lower()
-    if level not in MEMBERSHIP_LEVELS:
-        await update.message.reply_text("❌ 等级必须是 free、basic 或 premium")
-        return
+    level = LEVEL_ALIAS.get(args[1].lower())
+    if not level:
+        await update.message.reply_text("❌ 等级：1=免费 2=基础 3=高级")
 
     users_col = get_users_col()
     user = await _ensure_user(user_id)
@@ -1529,11 +1529,11 @@ async def set_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("用法：/set_quota_default <free|basic|premium> <日配额> [外部码日配额]")
+        await update.message.reply_text("用法：/set_quota_default <1|2|3> <日配额> [外部码日配额]")
         return
-    level = args[0].lower()
-    if level not in ("free", "basic", "premium"):
-        await update.message.reply_text("❌ 等级必须是 free、basic 或 premium")
+    level = LEVEL_ALIAS.get(args[0].lower())
+    if not level:
+        await update.message.reply_text("❌ 等级：1=免费 2=基础 3=高级")
         return
     try:
         quota = int(args[1])
@@ -1934,13 +1934,13 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ 用户ID必须是数字，请重新输入：")
             return
         await _ask("set_level:level",
-                    f"✅ 用户已记录：{text}\n\n请输入会员等级（free / basic / premium）：",
+                    f"✅ 用户已记录：{text}\n\n请输入会员等级（1=免费 / 2=基础 / 3=高级）：",
                     {"user_id": int(text)})
 
     elif state == "set_level:level":
-        level = text.lower()
-        if level not in MEMBERSHIP_LEVELS:
-            await update.message.reply_text("❌ 等级必须是 free、basic 或 premium，请重新输入：")
+        level = LEVEL_ALIAS.get(text.strip())
+        if not level:
+            await update.message.reply_text("❌ 请输入 1（免费）、2（基础）或 3（高级）：")
             return
         user_id = data["user_id"]
         users_col = get_users_col()
@@ -2322,12 +2322,12 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _end(f"✅ {data['role']} 机器人用户名已设为 @{username}")
 
     elif state == "set_quota_default:level":
-        level = text.lower()
-        if level not in ("free", "basic", "premium"):
-            await update.message.reply_text("❌ 等级必须是 free、basic 或 premium，请重新输入：")
+        level = LEVEL_ALIAS.get(text.strip())
+        if not level:
+            await update.message.reply_text("❌ 请输入 1（免费）、2（基础）或 3（高级）：")
             return
         await _ask("set_quota_default:quota",
-                    f"✅ 等级已记录：{level}\n\n请输入每日默认解码配额（-1 为不限）：",
+                    f"✅ 等级已记录：{text}\n\n请输入每日默认解码配额（-1 为不限）：",
                     {"level": level})
 
     elif state == "set_quota_default:quota":
