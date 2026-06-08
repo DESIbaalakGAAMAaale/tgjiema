@@ -97,6 +97,57 @@ DDL_STATEMENTS = [
         backed_at TEXT,
         PRIMARY KEY (main_msg_id, backup_channel_id)
     )""",
+    # ─── 环形冗余架构新表 ──────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS cells (
+        slot_id TEXT PRIMARY KEY,
+        channel_id BIGINT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'shadow1',
+        next_active_chat_id BIGINT,
+        prev_slot_id TEXT,
+        is_r100 INTEGER DEFAULT 0,
+        last_heartbeat TEXT,
+        degrade_count INTEGER DEFAULT 0,
+        created_at TEXT,
+        updated_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS codes (
+        code TEXT PRIMARY KEY,
+        file_record_code TEXT,
+        uploader_id BIGINT,
+        file_types TEXT,
+        batch_msg_ids TEXT,
+        batch_file_meta TEXT,
+        primary_channel_id BIGINT,
+        status TEXT DEFAULT 'active',
+        created_at TEXT,
+        expire_time TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS jobs (
+        id SERIAL PRIMARY KEY,
+        code TEXT NOT NULL,
+        target_user_id BIGINT NOT NULL,
+        storage_channel_id BIGINT,
+        storage_msg_ids TEXT,
+        batch_file_meta TEXT,
+        task_type TEXT DEFAULT 'single',
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        dispatched_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS rotate_log (
+        id SERIAL PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        from_slot_id TEXT,
+        to_slot_id TEXT,
+        from_status TEXT,
+        to_status TEXT,
+        reason TEXT,
+        triggered_by TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_cells_channel ON cells(channel_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cells_status ON cells(status)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_rotate_log_timestamp ON rotate_log(timestamp)",
 ]
 
 MIGRATION_STATEMENTS = [
@@ -413,6 +464,10 @@ _send_queue_col = D1Collection("send_queue")
 _backup_config_col = D1Collection("backup_config")
 _code_bot_mapping_col = D1Collection("code_bot_mapping")
 _message_backups_col = D1Collection("message_backups")
+_cells_col = D1Collection("cells")
+_codes_col = D1Collection("codes")
+_jobs_col = D1Collection("jobs")
+_rotate_log_col = D1Collection("rotate_log")
 
 
 def get_users_col() -> D1Collection:
@@ -765,3 +820,196 @@ async def set_config_and_invalidate(key: str, value: str):
     await _set_config(key, value)
     cache = get_config_cache()
     cache.invalidate(f"config:{key}")
+
+
+# ─── 环形冗余架构 新表操作 ──────────────────────────────────────
+
+
+def get_cells_col() -> D1Collection:
+    return _cells_col
+
+
+def get_codes_col() -> D1Collection:
+    return _codes_col
+
+
+def get_jobs_col() -> D1Collection:
+    return _jobs_col
+
+
+def get_rotate_log_col() -> D1Collection:
+    return _rotate_log_col
+
+
+async def get_active_cells() -> list[dict]:
+    """获取所有状态为 active 的槽位，按环形 next_active_chat_id 排序。"""
+    col = get_cells_col()
+    cells = await col.find({"status": "active"})
+    # 尝试按环形顺序排列
+    if len(cells) <= 1:
+        return cells
+    # 按 next_active_chat_id 构成环
+    channel_map = {c["channel_id"]: c for c in cells}
+    ordered = []
+    visited = set()
+    if cells:
+        current = cells[0]
+        while current["channel_id"] not in visited:
+            visited.add(current["channel_id"])
+            ordered.append(current)
+            nxt = current.get("next_active_chat_id")
+            if nxt and nxt in channel_map:
+                current = channel_map[nxt]
+            else:
+                # 加入未访问的剩余 cell
+                for c in cells:
+                    if c["channel_id"] not in visited:
+                        ordered.append(c)
+                break
+    return ordered
+
+
+async def get_next_active_cell(current_channel_id: int) -> dict | None:
+    """获取环形中 current 的下一个 active 槽位。"""
+    col = get_cells_col()
+    current = await col.find_one({"channel_id": current_channel_id, "status": "active"})
+    if not current:
+        return None
+    nxt_id = current.get("next_active_chat_id")
+    if nxt_id:
+        return await col.find_one({"channel_id": nxt_id, "status": "active"})
+    # 回环：取第一个 active
+    cells = await col.find({"status": "active"}, sort=("created_at", 1), limit=1)
+    return cells[0] if cells else None
+
+
+async def get_active_or_shadow_cell(channel_id: int) -> dict | None:
+    """获取指定 channel 的 cell 记录（任意 status）。"""
+    col = get_cells_col()
+    return await col.find_one({"channel_id": channel_id})
+
+
+async def set_cell_status(slot_id: str, new_status: str):
+    """更新 cell 状态。"""
+    import datetime as _dt
+    col = get_cells_col()
+    await col.update_one(
+        {"slot_id": slot_id},
+        {"$set": {
+            "status": new_status,
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        }},
+    )
+
+
+async def update_cell_heartbeat(slot_id: str):
+    """更新 cell 心跳时间。"""
+    import datetime as _dt
+    col = get_cells_col()
+    await col.update_one(
+        {"slot_id": slot_id},
+        {"$set": {"last_heartbeat": _dt.datetime.now(_dt.timezone.utc).isoformat()}},
+    )
+
+
+async def enqueue_job(
+    code: str,
+    target_user_id: int,
+    storage_channel_id: int,
+    storage_msg_ids: list[int],
+    batch_file_meta: str = "",
+    task_type: str = "single",
+):
+    """向 jobs 表写入派工任务。"""
+    import datetime as _dt
+    import json as _json
+    col = get_jobs_col()
+    await col.insert_one({
+        "code": code,
+        "target_user_id": target_user_id,
+        "storage_channel_id": storage_channel_id,
+        "storage_msg_ids": _json.dumps(storage_msg_ids),
+        "batch_file_meta": batch_file_meta,
+        "task_type": task_type,
+        "status": "pending",
+        "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    })
+
+
+async def dequeue_job():
+    """从 jobs 表取出一个待派工任务（原子操作）。"""
+    col = get_jobs_col()
+    rows = await col.find(
+        {"status": "pending"},
+        sort=("created_at", 1),
+        limit=1,
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    pk = row.get("id")
+    result = await col.update_one(
+        {"id": pk, "status": "pending"},
+        {"$set": {"status": "dispatched"}},
+    )
+    if result.matched_count == 0:
+        return None
+    import json as _json
+    storage_msg_ids = []
+    raw = row.get("storage_msg_ids", "")
+    if raw:
+        try:
+            storage_msg_ids = _json.loads(raw) if isinstance(raw, str) else raw
+        except (_json.JSONDecodeError, TypeError):
+            storage_msg_ids = []
+    return JobResult(
+        job_id=pk,
+        code=row["code"],
+        target_user_id=row["target_user_id"],
+        storage_channel_id=row.get("storage_channel_id", 0),
+        storage_msg_ids=storage_msg_ids,
+        batch_file_meta=row.get("batch_file_meta", ""),
+        task_type=row.get("task_type", "single"),
+    )
+
+
+class JobResult:
+    def __init__(
+        self,
+        job_id: int,
+        code: str,
+        target_user_id: int,
+        storage_channel_id: int,
+        storage_msg_ids: list[int],
+        batch_file_meta: str,
+        task_type: str = "single",
+    ):
+        self.job_id = job_id
+        self.code = code
+        self.target_user_id = target_user_id
+        self.storage_channel_id = storage_channel_id
+        self.storage_msg_ids = storage_msg_ids or []
+        self.batch_file_meta = batch_file_meta
+        self.task_type = task_type
+
+
+async def log_rotate(
+    from_slot_id: str,
+    to_slot_id: str,
+    from_status: str,
+    to_status: str,
+    reason: str,
+    triggered_by: str = "mon",
+):
+    """写降级审计日志。"""
+    import datetime as _dt
+    col = get_rotate_log_col()
+    await col.insert_one({
+        "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "from_slot_id": from_slot_id,
+        "to_slot_id": to_slot_id,
+        "from_status": from_status,
+        "to_status": to_status,
+        "reason": reason,
+        "triggered_by": triggered_by,
+    })

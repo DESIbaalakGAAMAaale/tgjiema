@@ -1,0 +1,297 @@
+# 环形冗余拓扑配置
+# 15 个 A 槽 (active) + 30 个 S 槽 (shadow1/shadow2)
+# 每个 Active 对应 2 个 Shadow，构成 (A, S1, S2) 三元组
+
+slots:
+  # ─── 组 1 ───
+  - slot_id: "a1"
+    channel_id: -1000000000001
+    status: "active"
+    next_active_chat_id: -1000000000002
+    prev_slot_id: "s1b"
+
+  - slot_id: "s1a"
+    channel_id: -1000000000011
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a1"
+
+  - slot_id: "s1b"
+    channel_id: -1000000000012
+    status: "shadow2"
+    next_active_chat_id: -1000000000001
+    prev_slot_id: "s1a"
+
+  # ─── 组 2 ───
+  - slot_id: "a2"
+    channel_id: -1000000000002
+    status: "active"
+    next_active_chat_id: -1000000000003
+    prev_slot_id: "s2b"
+
+  - slot_id: "s2a"
+    channel_id: -1000000000021
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a2"
+
+  - slot_id: "s2b"
+    channel_id: -1000000000022
+    status: "shadow2"
+    next_active_chat_id: -1000000000002
+    prev_slot_id: "s2a"
+
+  # ─── 组 3 ───
+  - slot_id: "a3"
+    channel_id: -1000000000003
+    status: "active"
+    next_active_chat_id: -1000000000004
+    prev_slot_id: "s3b"
+
+  - slot_id: "s3a"
+    channel_id: -1000000000031
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a3"
+
+  - slot_id: "s3b"
+    channel_id: -1000000000032
+    status: "shadow2"
+    next_active_chat_id: -1000000000003
+    prev_slot_id: "s3a"
+
+  # ─── 组 4 ───
+  - slot_id: "a4"
+    channel_id: -1000000000004
+    status: "active"
+    next_active_chat_id: -1000000000005
+    prev_slot_id: "s4b"
+
+  - slot_id: "s4a"
+    channel_id: -1000000000041
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a4"
+
+  - slot_id: "s4b"
+    channel_id: -1000000000042
+    status: "shadow2"
+    next_active_chat_id: -1000000000004
+    prev_slot_id: "s4a"
+
+  # ─── 组 5 ───
+  - slot_id: "a5"
+    channel_id: -1000000000005
+    status: "active"
+    next_active_chat_id: -1000000000006
+    prev_slot_id: "s5b"
+
+  - slot_id: "s5a"
+    channel_id: -1000000000051
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a5"
+
+  - slot_id: "s5b"
+    channel_id: -1000000000052
+    status: "shadow2"
+    next_active_chat_id: -1000000000005
+    prev_slot_id: "s5a"
+
+  # ─── 组 6 ───
+  - slot_id: "a6"
+    channel_id: -1000000000006
+    status: "active"
+    next_active_chat_id: -1000000000007
+    prev_slot_id: "s6b"
+
+  - slot_id: "s6a"
+    channel_id: -1000000000061
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a6"
+
+  - slot_id: "s6b"
+    channel_id: -1000000000062
+    status: "shadow2"
+    next_active_chat_id: -1000000000006
+    prev_slot_id: "s6a"
+
+  # ─── 组 7 ───
+  - slot_id: "a7"
+    channel_id: -1000000000007
+    status: "active"
+    next_active_chat_id: -1000000000008
+    prev_slot_id: "s7b"
+
+  - slot_id: "s7a"
+    channel_id: -1000000000071
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a7"
+
+  - slot_id: "s7b"
+    channel_id: -1000000000072
+    status: "shadow2"
+    next_active_chat_id: -1000000000007
+    prev_slot_id: "s7a"
+
+  # ─── 组 8 ───
+  - slot_id: "a8"
+    channel_id: -1000000000008
+    status: "active"
+    next_active_chat_id: -1000000000009
+    prev_slot_id: "s8b"
+
+  - slot_id: "s8a"
+    channel_id: -1000000000081
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a8"
+
+  - slot_id: "s8b"
+    channel_id: -1000000000082
+    status: "shadow2"
+    next_active_chat_id: -1000000000008
+    prev_slot_id: "s8a"
+
+  # ─── 组 9 ───
+  - slot_id: "a9"
+    channel_id: -1000000000009
+    status: "active"
+    next_active_chat_id: -1000000000010
+    prev_slot_id: "s9b"
+
+  - slot_id: "s9a"
+    channel_id: -1000000000091
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a9"
+
+  - slot_id: "s9b"
+    channel_id: -1000000000092
+    status: "shadow2"
+    next_active_chat_id: -1000000000009
+    prev_slot_id: "s9a"
+
+  # ─── 组 10 ───
+  - slot_id: "a10"
+    channel_id: -1000000000010
+    status: "active"
+    next_active_chat_id: -1000000000011
+    prev_slot_id: "s10b"
+
+  - slot_id: "s10a"
+    channel_id: -1000000000101
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a10"
+
+  - slot_id: "s10b"
+    channel_id: -1000000000102
+    status: "shadow2"
+    next_active_chat_id: -1000000000010
+    prev_slot_id: "s10a"
+
+  # ─── 组 11 ───
+  - slot_id: "a11"
+    channel_id: -1000000000011
+    status: "active"
+    next_active_chat_id: -1000000000012
+    prev_slot_id: "s11b"
+
+  - slot_id: "s11a"
+    channel_id: -1000000000111
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a11"
+
+  - slot_id: "s11b"
+    channel_id: -1000000000112
+    status: "shadow2"
+    next_active_chat_id: -1000000000011
+    prev_slot_id: "s11a"
+
+  # ─── 组 12 ───
+  - slot_id: "a12"
+    channel_id: -1000000000012
+    status: "active"
+    next_active_chat_id: -1000000000013
+    prev_slot_id: "s12b"
+
+  - slot_id: "s12a"
+    channel_id: -1000000000121
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a12"
+
+  - slot_id: "s12b"
+    channel_id: -1000000000122
+    status: "shadow2"
+    next_active_chat_id: -1000000000012
+    prev_slot_id: "s12a"
+
+  # ─── 组 13 ───
+  - slot_id: "a13"
+    channel_id: -1000000000013
+    status: "active"
+    next_active_chat_id: -1000000000014
+    prev_slot_id: "s13b"
+
+  - slot_id: "s13a"
+    channel_id: -1000000000131
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a13"
+
+  - slot_id: "s13b"
+    channel_id: -1000000000132
+    status: "shadow2"
+    next_active_chat_id: -1000000000013
+    prev_slot_id: "s13a"
+
+  # ─── 组 14 ───
+  - slot_id: "a14"
+    channel_id: -1000000000014
+    status: "active"
+    next_active_chat_id: -1000000000015
+    prev_slot_id: "s14b"
+
+  - slot_id: "s14a"
+    channel_id: -1000000000141
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a14"
+
+  - slot_id: "s14b"
+    channel_id: -1000000000142
+    status: "shadow2"
+    next_active_chat_id: -1000000000014
+    prev_slot_id: "s14a"
+
+  # ─── 组 15 (R100) ───
+  - slot_id: "a15"
+    channel_id: -1000000000015
+    status: "r100"
+    next_active_chat_id: -1000000000001
+    prev_slot_id: "s15b"
+    is_r100: true
+
+  - slot_id: "s15a"
+    channel_id: -1000000000151
+    status: "shadow1"
+    next_active_chat_id: null
+    prev_slot_id: "a15"
+
+  - slot_id: "s15b"
+    channel_id: -1000000000152
+    status: "shadow2"
+    next_active_chat_id: -1000000000015
+    prev_slot_id: "s15a"
+
+# Mon 监控配置
+mon:
+  heartbeat_interval: 30       # 心跳间隔（秒）
+  heartbeat_timeout: 90        # 超时阈值（秒）
+  degrade_cooldown: 300        # 降级冷却时间（秒）
+  r100_managed: false          # R100 由 Mon 自动管理？false=仅手动

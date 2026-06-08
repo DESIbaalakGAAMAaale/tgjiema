@@ -87,3 +87,102 @@ def make_decode_log(
         "status": status,
         "source_channel_id": source_channel_id,
     }
+
+
+# ─── 环形冗余架构 新模型 ──────────────────────────────────────
+
+CELL_STATUSES = ("active", "shadow1", "shadow2", "r100", "lost")
+
+
+def make_cell(
+    slot_id: str,
+    channel_id: int,
+    status: str = "shadow1",
+    next_active_chat_id: int = None,
+    prev_slot_id: str = None,
+    is_r100: bool = False,
+):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return {
+        "slot_id": slot_id,
+        "channel_id": channel_id,
+        "status": status,
+        "next_active_chat_id": next_active_chat_id,
+        "prev_slot_id": prev_slot_id,
+        "is_r100": 1 if is_r100 else 0,
+        "last_heartbeat": now.isoformat(),
+        "degrade_count": 0,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+
+
+def make_code_entry(
+    code: str,
+    uploader_id: int,
+    file_types: dict = None,
+    batch_msg_ids: str = "",
+    batch_file_meta: str = "",
+    primary_channel_id: int = 0,
+):
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    import json as _json
+    return {
+        "code": code,
+        "file_record_code": code,
+        "uploader_id": uploader_id,
+        "file_types": _json.dumps(file_types) if file_types else "{}",
+        "batch_msg_ids": batch_msg_ids,
+        "batch_file_meta": batch_file_meta,
+        "primary_channel_id": primary_channel_id,
+        "status": "active",
+        "created_at": now.isoformat(),
+    }
+
+
+def make_job(
+    code: str,
+    target_user_id: int,
+    storage_channel_id: int,
+    storage_msg_ids: list[int],
+    batch_file_meta: str = "",
+    task_type: str = "single",
+):
+    from datetime import datetime, timezone
+    import json as _json
+
+    return {
+        "code": code,
+        "target_user_id": target_user_id,
+        "storage_channel_id": storage_channel_id,
+        "storage_msg_ids": _json.dumps(storage_msg_ids),
+        "batch_file_meta": batch_file_meta,
+        "task_type": task_type,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def make_rotate_log(
+    from_slot_id: str,
+    to_slot_id: str,
+    from_status: str,
+    to_status: str,
+    reason: str,
+    triggered_by: str = "mon",
+):
+    from datetime import datetime, timezone
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "from_slot_id": from_slot_id,
+        "to_slot_id": to_slot_id,
+        "from_status": from_status,
+        "to_status": to_status,
+        "reason": reason,
+        "triggered_by": triggered_by,
+    }

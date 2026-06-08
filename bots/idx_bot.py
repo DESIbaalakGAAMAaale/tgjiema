@@ -1,0 +1,956 @@
+"""Idx Bot — 解码机器人（环形冗余架构版）
+职责：生成文件码 + 解码（内部/外部）→ 写 jobs 派工表
+与原来的 decoder_bot 功能一致，区别是解码后调用 enqueue_job() 而非 queue_manager。
+"""
+
+import asyncio
+import datetime
+import json
+import re
+import time
+from collections import defaultdict, deque
+
+from telegram import Update
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from loguru import logger
+
+from config import settings
+from database import (
+    get_file_records_col,
+    get_decode_logs_col,
+    get_pending_uploads_col,
+    get_codes_col,
+    make_file_record,
+    make_decode_log,
+    make_code_entry,
+    save_code_bot_mapping,
+    get_bot_for_code,
+    resolve_bot_for_code,
+    get_bot_decode_interval,
+    get_active_cells,
+    enqueue_job,
+)
+from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
+from services.permission import check_decode_permission, get_or_create_user
+from utils.rate_limiter import global_rate_limiter, user_rate_limiter
+from utils.monitor import metrics
+from utils.force_join import check_force_join, three_bot_reminder
+from services.user_relay import user_relay
+
+TOKEN = settings.DECODER_BOT_TOKEN
+
+_pending_external: dict[str, deque[tuple[int, str, float]]] = defaultdict(deque)
+_PENDING_TTL = 300
+
+
+def _enqueue_external(bot_username: str, user_id: int, code: str):
+    _pending_external[bot_username].append((user_id, code, time.time()))
+
+
+def _dequeue_external(bot_username: str) -> tuple[int, str]:
+    q = _pending_external.get(bot_username)
+    while q:
+        entry = q.popleft()
+        if time.time() - entry[2] < _PENDING_TTL:
+            return entry[0], entry[1]
+    return None, None
+
+
+def _cleanup_stale_pending():
+    now = time.time()
+    stale = []
+    for bot, q in _pending_external.items():
+        while q and now - q[0][2] >= _PENDING_TTL:
+            q.popleft()
+        if not q:
+            stale.append(bot)
+    for bot in stale:
+        del _pending_external[bot]
+
+
+user_relay.set_pending_cleanup(lambda bot_username: _dequeue_external(bot_username))
+
+_external_media_groups: dict[str, tuple[int, str, float]] = {}
+_MEDIA_GROUP_TTL = 300
+_bot_last_request: dict[str, float] = {}
+
+
+async def _wait_bot_interval(bot_username: str):
+    interval = await get_bot_decode_interval(bot_username)
+    if interval <= 0:
+        return
+    last = _bot_last_request.get(bot_username, 0)
+    elapsed = time.time() - last
+    if elapsed < interval:
+        await asyncio.sleep(interval - elapsed)
+    _bot_last_request[bot_username] = time.time()
+
+
+def _track_external_media_group(media_group_id: str, user_id: int, code: str):
+    _external_media_groups[media_group_id] = (user_id, code, time.time())
+
+
+def _get_external_media_group_user(media_group_id: str) -> tuple[int, str]:
+    entry = _external_media_groups.pop(media_group_id, None)
+    if entry and time.time() - entry[2] < _MEDIA_GROUP_TTL:
+        return entry[0], entry[1]
+    return None, None
+
+
+def _cleanup_media_groups():
+    now = time.time()
+    stale = [k for k, v in _external_media_groups.items() if now - v[2] >= _MEDIA_GROUP_TTL]
+    for k in stale:
+        _external_media_groups.pop(k, None)
+
+
+_MEDIA_GROUP_BUFFER_WAIT = 3
+_media_group_buffer: dict[str, dict] = {}
+
+
+def _parse_storage_ids_from_caption(caption: str) -> list[int]:
+    if not caption:
+        return []
+    for line in caption.split("\n"):
+        if line.startswith("STORAGE_IDS:"):
+            return [int(x) for x in line[len("STORAGE_IDS:"):].split(",") if x.strip().isdigit()]
+    return []
+
+
+# ─── 通道选择：从 cells 表获取 active 槽位 ───
+
+async def _get_storage_channel() -> int:
+    """获取当前活跃存储频道（取第一个 active 槽位）。"""
+    try:
+        cells = await get_active_cells()
+        if cells:
+            return cells[0]["channel_id"]
+    except Exception:
+        pass
+    return settings.STORAGE_CHANNEL_ID
+
+
+# ─── 入队新方式：写 jobs 表 ───
+
+async def _dispatch_to_dsp(
+    target_user_id: int,
+    code: str,
+    storage_channel_id: int,
+    msg_ids: list[int],
+    batch_file_meta: str = "",
+):
+    """将解码结果写入 jobs 表，由 Dsp Bot 轮询发送。"""
+    try:
+        await enqueue_job(
+            code=code,
+            target_user_id=target_user_id,
+            storage_channel_id=storage_channel_id,
+            storage_msg_ids=msg_ids,
+            batch_file_meta=batch_file_meta,
+            task_type="batch" if len(msg_ids) > 1 else "single",
+        )
+        logger.info(
+            f"[Idx] 已写 jobs 表: user={target_user_id}, code={code}, "
+            f"{len(msg_ids)} 个文件"
+        )
+    except Exception as e:
+        logger.error(f"[Idx] 写入 jobs 失败 (user={target_user_id}, code={code}): {e}")
+        raise
+
+
+def _extract_media_info(msg):
+    if msg.photo:
+        return msg.photo[-1].file_id, "photo"
+    if msg.video:
+        return msg.video.file_id, "video"
+    if msg.audio:
+        return msg.audio.file_id, "audio"
+    if msg.voice:
+        return msg.voice.file_id, "voice"
+    if msg.animation:
+        return msg.animation.file_id, "animation"
+    if msg.document:
+        return msg.document.file_id, "document"
+    return None, "document"
+
+
+async def _flush_media_group_buffer(media_group_id: str):
+    await asyncio.sleep(_MEDIA_GROUP_BUFFER_WAIT)
+    entry = _media_group_buffer.pop(media_group_id, None)
+    if not entry:
+        return
+
+    bot = entry["bot"]
+    msgs = entry["msgs"]
+    user_id = entry["user_id"]
+    code = entry["code"]
+    source = entry.get("source", "external")
+
+    if not msgs:
+        return
+
+    if source == "relay":
+        await asyncio.sleep(2)
+        try:
+            storage_ids = set()
+            for _, _, cap in msgs:
+                ids = _parse_storage_ids_from_caption(cap)
+                storage_ids.update(ids)
+            storage_ids = sorted(storage_ids)
+
+            if not storage_ids:
+                logger.warning(f"[Idx] 中继媒体组: 无STORAGE_IDS (code={code})")
+                return
+
+            files_col = get_file_records_col()
+            record = await files_col.find_one({"file_code": code})
+            if not record:
+                logger.warning(f"[Idx] 中继媒体组: DB无记录 (code={code})")
+                return
+
+            storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
+            await _dispatch_to_dsp(user_id, code, storage_channel, list(storage_ids))
+
+        except Exception as e:
+            logger.error(f"[Idx] 中继媒体组处理失败 (code={code}): {e}")
+            try:
+                await bot.send_message(chat_id=user_id, text="外部文件发送失败，请稍后重试或联系管理员。")
+            except Exception:
+                pass
+        return
+
+    channel_msg_ids = []
+    batch_file_meta = []
+    active_channel = await _get_storage_channel()
+
+    for chat_id, msg_id, orig_caption in msgs:
+        try:
+            forwarded = await bot.copy_message(
+                chat_id=active_channel,
+                from_chat_id=chat_id,
+                message_id=msg_id,
+            )
+            channel_msg_ids.append(forwarded.message_id)
+            fid, ftype = _extract_media_info(forwarded)
+            batch_file_meta.append({"file_id": fid, "type": ftype})
+            if code:
+                await _cache_external_file(code, forwarded.message_id)
+        except Exception as e:
+            logger.error(f"[Idx] copy消息失败 (mg_id={media_group_id}): {e}")
+
+    if not channel_msg_ids:
+        return
+
+    try:
+        await _dispatch_to_dsp(
+            user_id, code, active_channel,
+            channel_msg_ids, json.dumps(batch_file_meta),
+        )
+        logger.info(f"[Idx] 外部媒体组已写 jobs: user={user_id}, code={code}, {len(channel_msg_ids)} 个")
+    except Exception as e:
+        logger.error(f"[Idx] 入队失败: {e}")
+        try:
+            await bot.send_message(chat_id=user_id, text="外部文件发送失败，请稍后重试或联系管理员。")
+        except Exception:
+            pass
+
+
+async def _cache_external_file(code: str, message_id: int):
+    try:
+        files_col = get_file_records_col()
+        existing = await files_col.find_one({"file_code": code})
+        if existing:
+            batch = existing.get("batch_msg_ids", "") or ""
+            if not isinstance(batch, str):
+                batch = str(batch)
+            batch_ids = [mid for mid in batch.split(",") if mid.strip()]
+            if str(message_id) not in batch_ids:
+                batch_ids.append(str(message_id))
+            await files_col.update_one(
+                {"file_code": code},
+                {"$set": {"batch_msg_ids": ",".join(batch_ids)}},
+            )
+        else:
+            record = make_file_record(
+                file_code=code,
+                uploader_id=0,
+                primary_channel_id=await _get_storage_channel(),
+                primary_channel_msg_id=message_id,
+                file_types={},
+            )
+            await files_col.insert_one(record)
+            logger.info(f"[Idx] 外部码已缓存到本地: {code}")
+    except Exception as e:
+        logger.error(f"[Idx] 缓存外部码失败 (code={code}): {e}")
+
+
+# ─── 中继处理 ───
+
+async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text or ""
+    if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
+        return
+    if not user_relay.relay_user_id or update.effective_user.id != user_relay.relay_user_id:
+        return
+
+    is_renew = text.startswith("RELAY_RENEW:")
+    is_error = text.startswith("RELAY_ERROR:")
+    is_batch = text.startswith("RELAY_BATCH:")
+    parts = text.split(":", 2)
+    if len(parts) != 3:
+        return
+    try:
+        target_user_id = int(parts[1])
+    except ValueError:
+        return
+    code = parts[2]
+
+    if is_error:
+        logger.info(f"[Idx] 外部机器人返回错误: code={code}")
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text="外部文件码查询失败，该码可能已失效或暂时不可用，请稍后重试。",
+        )
+        return
+
+    if is_renew:
+        logger.info(f"[Idx] 记录已过期: {code}")
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"文件码 {code} 的缓存已过期，请重新发送该码以获取最新文件。",
+        )
+        return
+
+    if is_batch:
+        if "\n" in code:
+            code = code.split("\n")[0].strip()
+        storage_ids = _parse_storage_ids_from_caption(text)
+        logger.info(f"[Idx] RELAY_BATCH: user={target_user_id}, code={code}, storage_ids={storage_ids}")
+        if not storage_ids:
+            return
+
+        files_col = get_file_records_col()
+        record = await files_col.find_one({"file_code": code})
+        if not record:
+            return
+
+        storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
+        await _dispatch_to_dsp(target_user_id, code, storage_channel, list(storage_ids))
+
+        if context:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
+                )
+            except Exception:
+                pass
+        return
+
+    logger.info(f"[Idx] 中继代发: user {target_user_id}, code {code}")
+
+    files_col = get_file_records_col()
+    record = await files_col.find_one({"file_code": code})
+    if not record:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"您请求的文件码 {code} 已处理，请重新发送该码获取文件。",
+        )
+        return
+
+    storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
+    msg_ids_raw = record.get("batch_msg_ids") or ""
+    if not isinstance(msg_ids_raw, str):
+        msg_ids_raw = str(msg_ids_raw)
+    msg_ids = [int(mid) for mid in msg_ids_raw.split(",") if mid.strip().isdigit()]
+    if not msg_ids:
+        msg_ids = [record.get("primary_channel_msg_id")]
+
+    await _dispatch_to_dsp(target_user_id, code, storage_channel, msg_ids, record.get("batch_file_meta", ""))
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
+        )
+    except Exception:
+        pass
+
+
+# ─── 命令处理 ───
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await check_force_join(update, context):
+        return
+    try:
+        await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
+    except Exception as e:
+        logger.error(f"[Idx][start] 创建用户失败 (user={user.id}): {e}")
+        await update.message.reply_text("系统繁忙，请稍后重试。")
+        return
+    await update.message.reply_text(
+        "欢迎使用文件解码机器人！\n\n"
+        "发送文件码即可获取对应文件。\n"
+        "发送 /status 查看您的会员状态和今日剩余解码次数。\n"
+        "发送 /help 查看帮助信息。"
+        + three_bot_reminder()
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
+    await update.message.reply_text(
+        "文件解码机器人 使用帮助\n\n"
+        "1. 获取文件：直接发送文件码即可获取文件。\n"
+        "2. 上传文件：请使用上传机器人发送文件，上传后会自动收到文件码。\n"
+        "3. 分享文件：将文件码分享给其他用户，对方发送给我即可获取文件。\n\n"
+        "会员权益：\n"
+        f"- 免费用户：每日解码 {settings.FREE_DAILY_QUOTA} 次，仅限本系统文件码\n"
+        f"- 基础会员：每日解码 {settings.BASIC_DAILY_QUOTA} 次，可上传，可解码非本系统文件码\n"
+        f"- 高级会员：无限解码，可上传，可解码非本系统文件码\n\n"
+        "文件码格式说明：\n"
+        "码的开头即对应机器人的用户名（Telegram 机器人必须以 bot 结尾）。\n"
+        f"本系统码如：{settings.FILE_CODE_PREFIX}_a1b2c3d4e5f6_3p_2v_1d\n"
+        "外部码如：QQfile2_bot:qq10ad1e0200_6V\n"
+        "系统会根据 _bot 自动识别目标机器人并路由解码。\n\n"
+        "文件码永久有效，不会过期。\n\n"
+        "如有问题请联系管理员。"
+    )
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await check_force_join(update, context):
+        return
+    try:
+        db_user = await get_or_create_user(user.id)
+    except Exception as e:
+        logger.error(f"[Idx][status] 获取用户信息失败: {e}")
+        await update.message.reply_text("系统繁忙，无法获取用户信息，请稍后重试。")
+        return
+    level_map = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
+    level_name = level_map.get(db_user.get("membership_level"), "未知")
+
+    today = datetime.datetime.now(datetime.UTC).date()
+    quota_date_str = db_user.get("quota_date")
+    quota_date = None
+    if quota_date_str:
+        try:
+            quota_date = datetime.datetime.fromisoformat(quota_date_str).date()
+        except (ValueError, TypeError):
+            pass
+
+    total = db_user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA)
+    used = db_user.get("quota_used_today", 0) if quota_date == today else 0
+
+    if db_user.get("membership_level") == "premium":
+        quota_str = "无限"
+    else:
+        quota_str = f"{max(0, total - used)}/{total}"
+
+    ext_quota = db_user.get("external_decode_quota", 0)
+    ext_date_str = db_user.get("external_quota_date")
+    ext_date = None
+    if ext_date_str:
+        try:
+            ext_date = datetime.datetime.fromisoformat(ext_date_str).date()
+        except (ValueError, TypeError):
+            pass
+    ext_used = db_user.get("external_used_today", 0) if ext_date == today else 0
+
+    if ext_quota == -1:
+        ext_str = "不限"
+    elif ext_quota == 0:
+        ext_str = "无权限"
+    else:
+        ext_str = f"{max(0, ext_quota - ext_used)}/{ext_quota}"
+
+    await update.message.reply_text(
+        f"用户状态\n"
+        f"会员等级：{level_name}\n"
+        f"今日剩余解码次数：{quota_str}\n"
+        f"上传权限：{'有' if db_user.get('can_upload') else '无'}\n"
+        f"外部码解码配额：{ext_str}"
+    )
+
+
+# ─── pending_uploads 轮询（生成文件码） ───
+
+async def _process_pending_uploads(app: Application):
+    while True:
+        try:
+            pending_col = get_pending_uploads_col()
+            rows = await pending_col.find({"processed": 0}, limit=5)
+
+            for row in rows:
+                pend_id = row.get("id")
+                uploader_id = row.get("uploader_id")
+                channel_id = row.get("primary_channel_id")
+                message_id = row.get("primary_channel_msg_id")
+                file_types = row.get("file_types", {})
+                if not isinstance(file_types, dict):
+                    file_types = {}
+                batch_msg_ids_str = row.get("batch_msg_ids", "")
+                batch_file_meta_str = row.get("batch_file_meta", "")
+
+                if not uploader_id or not channel_id or not message_id:
+                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                    continue
+
+                try:
+                    file_code = await generate_unique_code(file_types)
+                except Exception as e:
+                    logger.error(f"[Idx][poll] 生成文件码失败 (uploader={uploader_id}): {e}")
+                    try:
+                        await app.bot.send_message(
+                            chat_id=uploader_id,
+                            text="文件处理失败，请稍后重试或联系管理员。",
+                        )
+                    except Exception:
+                        pass
+                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                    continue
+
+                # 写入 file_records
+                try:
+                    files_col = get_file_records_col()
+                    record = make_file_record(
+                        file_code=file_code,
+                        uploader_id=uploader_id,
+                        primary_channel_id=channel_id,
+                        primary_channel_msg_id=message_id,
+                        file_types=file_types,
+                        batch_msg_ids=batch_msg_ids_str,
+                        batch_file_meta=batch_file_meta_str,
+                    )
+                    await files_col.insert_one(record)
+                except Exception as e:
+                    logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
+                    try:
+                        await app.bot.send_message(
+                            chat_id=uploader_id, text="文件处理失败，请稍后重试。"
+                        )
+                    except Exception:
+                        pass
+                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                    continue
+
+                # 写入 codes 表（新增）
+                try:
+                    codes_col = get_codes_col()
+                    ce = make_code_entry(
+                        code=file_code,
+                        uploader_id=uploader_id,
+                        file_types=file_types,
+                        batch_msg_ids=batch_msg_ids_str,
+                        batch_file_meta=batch_file_meta_str,
+                        primary_channel_id=channel_id,
+                    )
+                    await codes_col.insert_one(ce)
+                except Exception as e:
+                    logger.error(f"[Idx][poll] codes表写入失败 (code={file_code}): {e}")
+
+                # 通知上传者
+                try:
+                    type_map = {
+                        "photo": "张图片", "video": "个视频", "document": "个文档",
+                        "audio": "个音频", "animation": "个动画",
+                    }
+                    type_desc = " ".join(
+                        f"{v}{type_map.get(k, k)}"
+                        for k, v in sorted(file_types.items())
+                    ) if file_types else "文件"
+                    await app.bot.send_message(
+                        chat_id=uploader_id,
+                        text=f"✅ 文件码：{file_code}\n\n"
+                             f"📤 发送文件 → @{settings.UPLOAD_BOT_USERNAME}\n"
+                             f"🔍 输入文件码 → @{settings.DECODER_BOT_USERNAME}\n"
+                             f"📥 收取文件 → @{settings.SENDER_BOT_USERNAME}",
+                    )
+                    logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
+                except Exception as e:
+                    logger.error(f"[Idx][poll] 发送文件码失败 (code={file_code}): {e}")
+
+                await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+                metrics.decode_count += 1
+                metrics.record_processed("idx_bot")
+
+        except Exception as e:
+            logger.error(f"[Idx][poll] pending_uploads 轮询异常: {e}")
+
+        await asyncio.sleep(2)
+
+
+# ─── 内部码解码 ───
+
+async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await check_force_join(update, context):
+        return
+    text = update.message.text.strip()
+
+    if not is_valid_code_format(text):
+        return
+
+    if not global_rate_limiter.acquire():
+        await update.message.reply_text("系统繁忙，请稍后重试。")
+        return
+    if not user_rate_limiter.acquire(user.id):
+        await update.message.reply_text("操作过于频繁，请稍后重试。")
+        return
+
+    await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
+
+    result = await check_decode_permission(user.id, text)
+
+    if not result.allowed:
+        await update.message.reply_text(result.reason)
+        return
+
+    if result.is_external:
+        if user_relay.is_ready and user_relay.relay_user_id:
+            from utils.code_decoder import is_likely_bot_api_file_id
+            if is_likely_bot_api_file_id(text):
+                await user_relay.deliver_cached(user.id, text)
+                await update.message.reply_text("正在发送文件，请稍候...")
+                return
+        await handle_external_code(update, context, user.id, text, result)
+        return
+
+    file_record = result.file_record
+    storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
+
+    try:
+        logs_col = get_decode_logs_col()
+        log_doc = make_decode_log(file_code=text, requester_id=user.id, status="queued")
+        await logs_col.insert_one(log_doc)
+    except Exception as e:
+        logger.error(f"[Idx][handle_code] 解码日志写入失败: {e}")
+
+    batch_ids_str = file_record.get("batch_msg_ids") or ""
+    if not isinstance(batch_ids_str, str):
+        batch_ids_str = str(batch_ids_str)
+    msg_ids = []
+    if batch_ids_str:
+        msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
+    if not msg_ids:
+        msg_ids = [file_record.get("primary_channel_msg_id")]
+
+    batch_file_meta_str = file_record.get("batch_file_meta") or ""
+
+    try:
+        await _dispatch_to_dsp(user.id, text, storage_channel, msg_ids, batch_file_meta_str)
+    except Exception as e:
+        logger.error(f"[Idx][handle_code] 写 jobs 失败 (user={user.id}, code={text}): {e}")
+        await update.message.reply_text("系统繁忙，文件发送请求失败，请稍后重试。")
+        return
+
+    remaining_info = ""
+    if result.remaining_quota >= 0:
+        remaining_info = f"今日剩余解码次数：{result.remaining_quota}"
+
+    await update.message.reply_text(
+        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给您，请查收。\n{remaining_info}"
+    )
+
+    metrics.decode_count += 1
+    metrics.record_processed("idx_bot")
+    logger.info(f"[Idx][handle_code] 用户 {user.id} 请求文件码 {text}")
+
+
+# ─── 外部码处理 ───
+
+def _resolve_bot_username(update: Update) -> str | None:
+    if update.effective_chat and update.effective_chat.username:
+        return update.effective_chat.username
+    msg = update.message
+    if msg and msg.forward_origin and hasattr(msg.forward_origin, "sender_user"):
+        sender = msg.forward_origin.sender_user
+        if sender and sender.username:
+            return sender.username
+    if msg and hasattr(msg, "forward_from") and msg.forward_from:
+        return msg.forward_from.username
+    return None
+
+
+async def handle_external_code(update, context, user_id, code, result):
+    bot_username = result.external_bot_username
+
+    original_code = context.user_data.pop("_original_external_code", None)
+    if original_code:
+        code = original_code
+        bot_username = context.user_data.pop("_extracted_bot", bot_username)
+        asyncio.ensure_future(save_code_bot_mapping(code, bot_username))
+
+    actual_bot = await resolve_bot_for_code(code, bot_username)
+    if actual_bot != bot_username:
+        logger.info(f"[Idx][external] 路由覆盖: {code} @{bot_username}→@{actual_bot}")
+        bot_username = actual_bot
+
+    await _wait_bot_interval(bot_username)
+
+    remaining_info = ""
+    parts = []
+    if result.remaining_quota >= 0:
+        parts.append(f"总解码剩余：{result.remaining_quota}")
+    if result.remaining_external_quota >= 0:
+        parts.append(f"外部码剩余：{result.remaining_external_quota}")
+    remaining_info = " | ".join(parts)
+
+    if user_relay.is_ready:
+        ok = await user_relay.send_external_code(bot_username, code, user_id)
+        if ok:
+            _enqueue_external(bot_username, user_id, code)
+            await update.message.reply_text(f"正在查询外部文件码，请稍候查收。\n{remaining_info}")
+            metrics.decode_count += 1
+            metrics.record_processed("idx_bot")
+            return
+
+    try:
+        await context.bot.send_message(chat_id=f"@{bot_username}", text=code)
+        _enqueue_external(bot_username, user_id, code)
+        await update.message.reply_text(f"正在查询外部文件码，请稍候查收。\n{remaining_info}")
+        metrics.decode_count += 1
+        metrics.record_processed("idx_bot")
+    except Exception as e:
+        err_msg = str(e)
+        logger.warning(f"[Idx][external] 无法发送到 @{bot_username}: {err_msg}")
+        if "chat not found" in err_msg.lower() or "nobody is using" in err_msg.lower():
+            await update.message.reply_text(
+                f"机器人 @{bot_username} 未找到，请检查文件码中的机器人用户名是否正确。"
+            )
+        else:
+            await update.message.reply_text("外部码解码功能暂不可用，请联系管理员配置用户中继。")
+
+
+async def handle_external_file_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_username = _resolve_bot_username(update)
+    if not bot_username:
+        return
+    target_user_id, code = _dequeue_external(bot_username)
+    if target_user_id is None:
+        return
+
+    active_channel = await _get_storage_channel()
+    try:
+        forwarded = await update.message.copy(chat_id=active_channel)
+        await _cache_external_file(code, forwarded.message_id)
+    except Exception as e:
+        logger.error(f"[Idx][ext_resp] 缓存失败 (code={code}): {e}")
+        return
+
+    try:
+        await _dispatch_to_dsp(target_user_id, code, active_channel, [forwarded.message_id])
+    except Exception as e:
+        logger.error(f"[Idx][ext_resp] 入队失败 (code={code}): {e}")
+
+
+async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot_username = _resolve_bot_username(update)
+    if not bot_username:
+        return
+    target_user_id, code = _dequeue_external(bot_username)
+    if target_user_id is None:
+        return
+
+    active_channel = await _get_storage_channel()
+    try:
+        forwarded = await update.message.copy(chat_id=active_channel)
+        await _cache_external_file(code, forwarded.message_id)
+    except Exception as e:
+        logger.error(f"[Idx][ext_media] 缓存失败 (code={code}): {e}")
+        return
+
+    try:
+        await _dispatch_to_dsp(target_user_id, code, active_channel, [forwarded.message_id])
+    except Exception as e:
+        logger.error(f"[Idx][ext_media] 入队失败 (code={code}): {e}")
+
+
+async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    caption = (update.message.caption or "").strip()
+    if not caption.startswith("RELAY_FILE:"):
+        return False
+    if not user_relay.relay_user_id or not update.effective_user:
+        return False
+    if update.effective_user.id != user_relay.relay_user_id:
+        return False
+
+    rest = caption[len("RELAY_FILE:"):]
+    user_end = rest.find(":")
+    if user_end == -1:
+        return False
+    try:
+        target_user_id = int(rest[:user_end])
+    except ValueError:
+        return False
+    code_part = rest[user_end + 1:].split("\n\n", 1)[0].strip()
+
+    try:
+        storage_ids = _parse_storage_ids_from_caption(caption)
+        if not storage_ids:
+            return True
+
+        files_col = get_file_records_col()
+        record = await files_col.find_one({"file_code": code_part})
+        if not record:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text=f"您请求的文件码 {code_part} 发送失败，请稍后重试。",
+                )
+            except Exception:
+                pass
+            return True
+
+        storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
+        await _dispatch_to_dsp(target_user_id, code_part, storage_channel, list(storage_ids))
+
+        logger.info(f"[Idx][relay_file] 已写 jobs: user {target_user_id}, code={code_part}")
+    except Exception as e:
+        logger.error(f"[Idx][relay_file] 处理失败 (code={code_part}): {e}")
+        try:
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=f"您请求的文件码 {code_part} 发送失败，请稍后重试。",
+            )
+        except Exception:
+            pass
+    return True
+
+
+# ─── 消息路由 ───
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = update.message.text or ""
+
+        if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
+            await handle_relay_delivery(update, context)
+            return
+
+        if is_valid_code_format(text.strip()):
+            await handle_code(update, context)
+            return
+
+        code, bot_username = extract_code_and_bot_from_message(text)
+        if code and bot_username:
+            context.user_data["_original_external_code"] = code
+            context.user_data["_extracted_bot"] = bot_username
+            object.__setattr__(update.message, "text", f"{bot_username}:{code}")
+            await handle_code(update, context)
+            return
+
+        clean_text = text.strip()
+        if clean_text and len(clean_text) >= 4 and not re.search(r'[\u4e00-\u9fff]', clean_text):
+            known_bot = await get_bot_for_code(clean_text)
+            if known_bot:
+                logger.info(f"[Idx] 命中无头码缓存: code={clean_text}, bot={known_bot}")
+                context.user_data["_original_external_code"] = clean_text
+                context.user_data["_extracted_bot"] = known_bot
+                object.__setattr__(update.message, "text", f"{known_bot}:{clean_text}")
+                await handle_code(update, context)
+                return
+    except Exception as e:
+        logger.error(f"[Idx][handle_message] 异常: {e}")
+        try:
+            await update.message.reply_text("处理请求时发生错误，请稍后重试。")
+        except Exception:
+            pass
+
+
+# ─── 运行 ───
+
+async def _init():
+    from database import init_db
+    await init_db()
+
+
+def run():
+    import asyncio as _asyncio
+
+    loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(loop)
+    loop.run_until_complete(_init())
+
+    logger.info("[Idx] 启动解码机器人 (Idx Bot)...")
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    media_filter = (
+        filters.Document.ALL | filters.VIDEO | filters.PHOTO
+        | filters.AUDIO | filters.VOICE | filters.ANIMATION
+    )
+
+    async def _route_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.message is None:
+            return
+        try:
+            mg_id = update.message.media_group_id
+            if mg_id:
+                caption = (update.message.caption or "").strip()
+                if mg_id not in _media_group_buffer:
+                    user_id = None
+                    code = None
+                    source = None
+                    if caption.startswith("RELAY_FILE:"):
+                        source = "relay"
+                        parts = caption.split(":", 3)
+                        if len(parts) >= 3:
+                            try:
+                                user_id = int(parts[1])
+                            except ValueError:
+                                pass
+                            code = parts[2].split("\n")[0]
+                    else:
+                        source = "external"
+                        bot_username = _resolve_bot_username(update)
+                        if bot_username:
+                            user_id, code = _dequeue_external(bot_username)
+                    if not user_id or not code:
+                        return
+                    timer = asyncio.create_task(_flush_media_group_buffer(mg_id))
+                    _media_group_buffer[mg_id] = {
+                        "source": source, "bot": context.bot, "msgs": [],
+                        "user_id": user_id, "code": code, "timer": timer,
+                    }
+                _media_group_buffer[mg_id]["msgs"].append(
+                    (update.message.chat_id, update.message.message_id, caption)
+                )
+                return
+            if await _handle_relay_file_media(update, context):
+                return
+            await handle_external_file_response(update, context)
+        except Exception as e:
+            logger.error(f"[Idx][_route_media] 异常: {e}")
+
+    app.add_handler(MessageHandler(media_filter, _route_media))
+
+    metrics.ping_bot("idx_bot")
+
+    async def health_ping():
+        while True:
+            metrics.ping_bot("idx_bot")
+            await asyncio.sleep(30)
+
+    async def cleanup_loop():
+        while True:
+            _cleanup_stale_pending()
+            _cleanup_media_groups()
+            await asyncio.sleep(60)
+
+    loop.create_task(health_ping())
+    loop.create_task(_process_pending_uploads(app))
+    loop.create_task(cleanup_loop())
+    loop.create_task(user_relay.start())
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    run()

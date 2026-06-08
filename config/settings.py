@@ -12,10 +12,12 @@ class Settings(BaseSettings):
     BACKUP_BOT_2_TOKEN: str = ""
     BACKUP_BOT_3_TOKEN: str = ""
     ADMIN_BOT_TOKEN: str = ""
+    MON_BOT_TOKEN: str = ""
     ADMIN_TELEGRAM_ID: int = 0
 
     MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
     DECODER_BOT_CHAT_ID: int = 0
+    MON_CHECK_INTERVAL: int = 60
 
     BACKUP_CHANNELS_GROUP_1: List[int] = []
     BACKUP_CHANNELS_GROUP_2: List[int] = []
@@ -89,6 +91,10 @@ class Settings(BaseSettings):
     @property
     def ALL_STORAGE_CHANNELS(self) -> List[int]:
         return [self.MAIN_STORAGE_CHANNEL_ID] + self.ALL_BACKUP_CHANNELS
+
+    @property
+    def STORAGE_CHANNEL_ID(self) -> int:
+        return self.MAIN_STORAGE_CHANNEL_ID
 
     @staticmethod
     def get_config_default(key: str) -> str:
