@@ -79,7 +79,7 @@ async def process_queue(bot):
             job = await dequeue_job()
             if job is None:
                 idle_count += 1
-                sleep_time = min(0.05 * (1.6 ** min(idle_count, 8)), 5.0)
+                sleep_time = min(0.05 * (1.6 ** min(idle_count, 12)), 10.0)
                 await asyncio.sleep(sleep_time)
                 continue
 
@@ -349,6 +349,8 @@ def run():
 
     loop.create_task(health_ping())
     loop.create_task(process_queue(bot))
+    from database.cache import dump_cache_to_disk_loop
+    loop.create_task(dump_cache_to_disk_loop())
     app.run_polling()
 
 

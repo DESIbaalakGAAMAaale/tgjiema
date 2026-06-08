@@ -148,6 +148,16 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_cells_status ON cells(status)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_rotate_log_timestamp ON rotate_log(timestamp)",
+    # ─── 外部码映射表（采集器写入，idx_bot 查询） ─────────────────
+    """CREATE TABLE IF NOT EXISTS external_code_mapping (
+        external_code TEXT PRIMARY KEY,
+        system_code TEXT NOT NULL,
+        bot_username TEXT,
+        created_at TEXT,
+        updated_at TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_system ON external_code_mapping(system_code)",
+    "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_bot ON external_code_mapping(bot_username)",
 ]
 
 MIGRATION_STATEMENTS = [
@@ -182,6 +192,15 @@ class CockroachDBClient:
             max_size=30,
             statement_cache_size=0,
         )
+
+        # ─── SQLite 缓存备份：初始化并恢复内存缓存 ───
+        from .cache_store import get_cache_store
+        from .cache import load_cache_from_disk
+
+        store = get_cache_store()
+        await store.init()
+        await load_cache_from_disk()
+
         for sql in DDL_STATEMENTS:
             await self.execute(sql)
         for sql in MIGRATION_STATEMENTS:
@@ -468,6 +487,7 @@ _cells_col = D1Collection("cells")
 _codes_col = D1Collection("codes")
 _jobs_col = D1Collection("jobs")
 _rotate_log_col = D1Collection("rotate_log")
+_external_code_mapping_col = D1Collection("external_code_mapping")
 
 
 def get_users_col() -> D1Collection:
@@ -751,6 +771,52 @@ async def get_all_message_backups() -> list[dict]:
 
 # ─── 缓存查询层 ──────────────────────────────────────────────────
 from .cache import get_user_cache, get_file_record_cache, get_config_cache
+
+
+# ─── 外部码映射查询 ────────────────────────────────────────────
+
+def get_external_code_mapping_col() -> D1Collection:
+    return _external_code_mapping_col
+
+
+async def get_system_code_for_external(external_code: str) -> str | None:
+    """查询外部码对应的系统码，命中则 idx_bot 可直接走本地解码流程。"""
+    try:
+        row = await _external_code_mapping_col.find_one({"external_code": external_code})
+        if row:
+            return row.get("system_code")
+    except Exception as e:
+        logger.warning(f"[DB] get_system_code_for_external failed ({external_code}): {e}")
+    return None
+
+
+async def set_external_code_mapping(
+    external_code: str,
+    system_code: str,
+    bot_username: str = "",
+) -> bool:
+    """写入外部码→系统码映射（由采集器调用）。"""
+    import datetime as _dt
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    try:
+        existing = await _external_code_mapping_col.find_one({"external_code": external_code})
+        if existing:
+            await _external_code_mapping_col.update_one(
+                {"external_code": external_code},
+                {"$set": {"system_code": system_code, "bot_username": bot_username, "updated_at": now}},
+            )
+        else:
+            await _external_code_mapping_col.insert_one({
+                "external_code": external_code,
+                "system_code": system_code,
+                "bot_username": bot_username,
+                "created_at": now,
+                "updated_at": now,
+            })
+        return True
+    except Exception as e:
+        logger.error(f"[DB] set_external_code_mapping failed ({external_code}): {e}")
+        return False
 
 
 async def get_user_cached(user_id: int) -> Optional[dict]:

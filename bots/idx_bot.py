@@ -29,6 +29,7 @@ from database import (
     get_bot_decode_interval,
     get_active_cells,
     enqueue_job,
+    get_system_code_for_external,
 )
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
@@ -479,10 +480,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── pending_uploads 轮询（生成文件码） ───
 
 async def _process_pending_uploads(app: Application):
+    idle_count = 0
     while True:
         try:
             pending_col = get_pending_uploads_col()
             rows = await pending_col.find({"processed": 0}, limit=5)
+
+            if not rows:
+                idle_count += 1
+                sleep_time = min(0.1 * (1.5 ** min(idle_count, 12)), 10.0)
+                await asyncio.sleep(sleep_time)
+                continue
+
+            idle_count = 0
 
             for row in rows:
                 pend_id = row.get("id")
@@ -579,8 +589,8 @@ async def _process_pending_uploads(app: Application):
 
         except Exception as e:
             logger.error(f"[Idx][poll] pending_uploads 轮询异常: {e}")
-
-        await asyncio.sleep(2)
+            idle_count += 1
+            await asyncio.sleep(min(2 * idle_count, 10))
 
 
 # ─── 内部码解码 ───
@@ -683,6 +693,38 @@ async def handle_external_code(update, context, user_id, code, result):
         code = original_code
         bot_username = context.user_data.pop("_extracted_bot", bot_username)
         asyncio.ensure_future(save_code_bot_mapping(code, bot_username))
+
+    # ── ★ 检查外部码映射：如果有系统码映射，直接走本地解码流程 ★ ──
+    system_code = await get_system_code_for_external(code)
+    if system_code:
+        logger.info(f"[Idx][external] 外部码 {code} 命中映射 → 系统码 {system_code}")
+        files_col = get_file_records_col()
+        file_record = await files_col.find_one({"file_code": system_code})
+        if file_record:
+            storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
+            batch_ids_str = file_record.get("batch_msg_ids") or ""
+            if not isinstance(batch_ids_str, str):
+                batch_ids_str = str(batch_ids_str)
+            msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
+            if not msg_ids:
+                msg_ids = [file_record.get("primary_channel_msg_id")]
+
+            batch_file_meta_str = file_record.get("batch_file_meta") or ""
+            try:
+                await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str)
+                await update.message.reply_text(
+                    f"文件码 {code} 已缓存，正在发送，请查收。\n"
+                    f"(系统码: {system_code})"
+                )
+                metrics.decode_count += 1
+                metrics.record_processed("idx_bot")
+                return
+            except Exception as e:
+                logger.error(f"[Idx][external] 映射调度失败 (ext={code}, sys={system_code}): {e}")
+                await update.message.reply_text("外部文件码发送失败，请稍后重试。")
+                return
+        else:
+            logger.warning(f"[Idx][external] 映射的系统码 {system_code} 无 file_record，回退到外部查询")
 
     actual_bot = await resolve_bot_for_code(code, bot_username)
     if actual_bot != bot_username:
@@ -949,6 +991,8 @@ def run():
     loop.create_task(_process_pending_uploads(app))
     loop.create_task(cleanup_loop())
     loop.create_task(user_relay.start())
+    from database.cache import dump_cache_to_disk_loop
+    loop.create_task(dump_cache_to_disk_loop())
     app.run_polling()
 
 
