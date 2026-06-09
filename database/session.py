@@ -1003,23 +1003,22 @@ async def enqueue_job(
 
 
 async def dequeue_job():
-    """从 jobs 表取出一个待派工任务（原子操作）。"""
+    """从 jobs 表取出一个待派工任务（原子操作：CTE + UPDATE ... RETURNING *，一次 DB 往返）。"""
     col = get_jobs_col()
-    rows = await col.find(
-        {"status": "pending"},
-        sort=("created_at", 1),
-        limit=1,
-    )
+    rows = await col._query("""
+        WITH next AS (
+            SELECT id FROM jobs
+            WHERE status = 'pending'
+            ORDER BY created_at
+            LIMIT 1
+        )
+        UPDATE jobs SET status = 'dispatched'
+        WHERE id = (SELECT id FROM next)
+        RETURNING *
+    """)
     if not rows:
         return None
     row = rows[0]
-    pk = row.get("id")
-    result = await col.update_one(
-        {"id": pk, "status": "pending"},
-        {"$set": {"status": "dispatched"}},
-    )
-    if result.matched_count == 0:
-        return None
     import json as _json
     storage_msg_ids = []
     raw = row.get("storage_msg_ids", "")
@@ -1029,7 +1028,7 @@ async def dequeue_job():
         except (_json.JSONDecodeError, TypeError):
             storage_msg_ids = []
     return JobResult(
-        job_id=pk,
+        job_id=row["id"],
         code=row["code"],
         target_user_id=row["target_user_id"],
         storage_channel_id=row.get("storage_channel_id", 0),
@@ -1079,3 +1078,46 @@ async def log_rotate(
         "reason": reason,
         "triggered_by": triggered_by,
     })
+
+
+async def cleanup_old_records():
+    """每天凌晨 3 点批量清理 30 天前的 decode_logs + jobs（批量 DELETE，低 RU 消耗）。"""
+    import asyncio as _asyncio
+    import time as _time
+    import string as _string
+
+    while True:
+        await _asyncio.sleep(3600)
+        now = _time.localtime()
+        if now.tm_hour != 3:
+            continue
+
+        cutoff_iso = datetime.fromtimestamp(_time.time() - 86400 * 30).isoformat()
+        tables = [
+            (get_decode_logs_col(), "request_time"),
+            (get_jobs_col(),        "created_at"),
+        ]
+        total_deleted = 0
+        max_per_table = 100_000  # 单次清理上限保护
+
+        for col, time_col in tables:
+            deleted = 0
+            while deleted < max_per_table:
+                try:
+                    rows = await col._query(
+                        f"DELETE FROM {col.table} WHERE {time_col} < $1 LIMIT 5000 RETURNING 1",
+                        [cutoff_iso],
+                    )
+                    if not rows:
+                        break
+                    deleted += len(rows)
+                except Exception as e:
+                    logger.warning(f"[cleanup] {col.table} 删除失败: {e}")
+                    break
+            if deleted > 0:
+                total_deleted += deleted
+                logger.info(f"[cleanup] {col.table} 已清理 {deleted} 条旧记录")
+
+        if total_deleted > 0:
+            logger.info(f"[cleanup] 本次共清理 {total_deleted} 条")
+        await _asyncio.sleep(3600)  # 清理后等一小时再进入下一轮

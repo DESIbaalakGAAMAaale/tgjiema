@@ -993,6 +993,8 @@ def run():
     loop.create_task(user_relay.start())
     from database.cache import dump_cache_to_disk_loop
     loop.create_task(dump_cache_to_disk_loop())
+    from database import cleanup_old_records
+    loop.create_task(cleanup_old_records())
     app.run_polling()
 
 
