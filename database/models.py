@@ -113,6 +113,7 @@ def make_cell(
         "prev_slot_id": prev_slot_id,
         "is_r100": 1 if is_r100 else 0,
         "last_heartbeat": now.isoformat(),
+        "last_synced_msg_id": 0,
         "degrade_count": 0,
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),

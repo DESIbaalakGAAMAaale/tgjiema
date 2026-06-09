@@ -181,3 +181,87 @@ class MonScheduler:
             except Exception:
                 pass
         return count
+
+    async def replicate_all_active_to_shadows(self, bot_instance) -> int:
+        """核心功能：将每个 Active A 槽的新消息复制到对应的 Shadow1/Shadow2。
+
+        这是 Mon 的「写入」职责——替代原 backup_bot 的文件备份功能。
+        返回复制的消息总数。
+        """
+        col = get_cells_col()
+        all_cells = await col.find({})
+        groups = self._group_slots(all_cells)
+        total_copied = 0
+
+        for _group_key, (a_slot, s1_slot, s2_slot) in groups.items():
+            if not a_slot or a_slot["status"] != "active":
+                continue
+
+            last_cursor = a_slot.get("last_synced_msg_id") or 0
+            new_messages = await self._fetch_new_messages(
+                bot_instance, a_slot["channel_id"], last_cursor
+            )
+            if not new_messages:
+                continue
+
+            # 复制到 shadow1
+            if s1_slot:
+                copied_1 = await self._copy_messages(
+                    bot_instance, a_slot["channel_id"],
+                    s1_slot["channel_id"], new_messages,
+                )
+                total_copied += copied_1
+
+            # 复制到 shadow2
+            if s2_slot:
+                copied_2 = await self._copy_messages(
+                    bot_instance, a_slot["channel_id"],
+                    s2_slot["channel_id"], new_messages,
+                )
+                total_copied += copied_2
+
+            # 更新游标
+            latest_id = max(msg.message_id for msg in new_messages if msg)
+            await col.update_one(
+                {"slot_id": a_slot["slot_id"]},
+                {"$set": {"last_synced_msg_id": latest_id}},
+            )
+
+        return total_copied
+
+    async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
+        """获取频道中最后游标之后的新消息（媒体文件）。"""
+        msgs = []
+        try:
+            # 从最新消息开始往回拉，直到遇到 last_cursor
+            async for msg in bot_instance.iter_messages(channel_id, limit=50):
+                if msg.message_id <= last_cursor:
+                    break
+                if self._is_media_message(msg):
+                    msgs.append(msg)
+        except Exception:
+            pass
+        return list(reversed(msgs))  # 按时间正序
+
+    @staticmethod
+    def _is_media_message(msg) -> bool:
+        return any([
+            msg.photo, msg.video, msg.document,
+            msg.audio, msg.voice, msg.animation,
+        ])
+
+    @staticmethod
+    async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list) -> int:
+        """批量复制消息到目标频道。返回成功复制数。"""
+        copied = 0
+        for msg in messages:
+            try:
+                await bot_instance.copy_message(
+                    chat_id=to_channel,
+                    from_chat_id=from_channel,
+                    message_id=msg.message_id,
+                )
+                copied += 1
+            except Exception:
+                pass
+        return copied

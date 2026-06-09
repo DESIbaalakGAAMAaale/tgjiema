@@ -1,6 +1,6 @@
 """Mon 监控机器人
-职责：频道健康监控 + 自动降级调度
-与 admin_bot 完全分离，admin 负责管理配置，mon 负责运行时监控。
+职责：频道健康监控 + 文件同步写入 Shadow 频道 + 自动降级调度
+与 admin_bot 完全分离，admin 负责管理配置，mon 负责运行时监控和文件冗余。
 """
 
 import asyncio
@@ -41,14 +41,19 @@ class MonBot:
                 ok = await self.scheduler.heartbeat_all(self.bot)
                 logger.info(f"[Mon] 心跳: {ok} 个槽位正常")
 
-                # 2. 降级检查
+                # 2. 核心写入：将 Active 槽位新文件同步到 Shadow 频道
+                copied = await self.scheduler.replicate_all_active_to_shadows(self.bot)
+                if copied > 0:
+                    logger.info(f"[Mon] 文件同步: 复制了 {copied} 条消息到 Shadow 频道")
+
+                # 3. 降级检查
                 alerts = await self.scheduler.run_degrade_check()
                 if alerts:
                     for msg in alerts:
                         logger.warning(msg)
                         metrics.increment("mon.degrade")
 
-                # 3. 报告当前拓扑状态
+                # 4. 报告当前拓扑状态
                 await self._report_status()
 
             except Exception as e:

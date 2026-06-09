@@ -106,6 +106,7 @@ DDL_STATEMENTS = [
         prev_slot_id TEXT,
         is_r100 INTEGER DEFAULT 0,
         last_heartbeat TEXT,
+        last_synced_msg_id BIGINT DEFAULT 0,
         degrade_count INTEGER DEFAULT 0,
         created_at TEXT,
         updated_at TEXT
