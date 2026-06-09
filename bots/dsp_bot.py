@@ -1,5 +1,5 @@
 """Dsp Bot — 发送机器人（环形冗余架构版）
-职责：从 jobs 表轮询任务 → 从环形 cells 获取存储频道 → 媒体组发送给用户
+职责：从 jobs 表轮询任务 → 通过 delivery_resolver 解析最佳频道 → 媒体组发送给用户
 替代原 sender_bot，数据源从 send_queue 改为 jobs 表。
 """
 
@@ -13,7 +13,8 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from loguru import logger
 
 from config import settings
-from database import dequeue_job, get_file_records_col, get_active_or_shadow_cell
+from database import dequeue_job, get_file_records_col
+from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
 
@@ -105,18 +106,19 @@ async def _process_single_job(bot, job):
         metrics.send_fail_count += 1
         return
 
-    # 尝试主频道
-    success = await _try_copy(bot, job.target_user_id, job.storage_channel_id, msg_id)
+    # 使用 delivery_resolver 解析频道 + 降级
+    resolved = await resolve_delivery_channel(job.storage_channel_id)
+    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id)
+
+    if not success:
+        # 环形降级：沿环找下一个可用频道
+        from storage.delivery_resolver import resolve_delivery_channel as _resolve
+        next_resolved = await _resolve(resolved.channel_id)
+        if next_resolved.channel_id != resolved.channel_id:
+            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id)
+
     if success:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码 {job.code}")
-        metrics.send_success_count += 1
-        metrics.record_processed("dsp_bot")
-        return
-
-    # 环形降级：从 cells 表找当前频道的 shadow 槽位
-    success = await _try_cell_fallback(bot, job, msg_id)
-    if success:
-        logger.info(f"[Dsp] 降级发送成功: 用户 {job.target_user_id}, 码 {job.code}")
         metrics.send_success_count += 1
         metrics.record_processed("dsp_bot")
         return
@@ -130,39 +132,10 @@ async def _process_single_job(bot, job):
         pass
 
 
-async def _try_cell_fallback(bot, job, msg_id: int) -> bool:
-    """环形降级：遍历 cells 表找同组的 shadow 槽位。"""
-    cell = await get_active_or_shadow_cell(job.storage_channel_id)
-    if not cell:
-        return False
-    slot_id = cell.get("slot_id", "")
-    if not slot_id:
-        return False
-
-    # 尝试同组的 shadow 槽位
-    group_prefix = ''.join(c for c in slot_id if c.isdigit())
-    if not group_prefix:
-        return False
-
-    from database import get_cells_col
-    col = get_cells_col()
-    shadows = await col.find({
-        "status": {"$in": ["shadow1", "shadow2"]},
-        "slot_id": {"$regex": f"[as]{group_prefix}[ab]?"},
-    })
-
-    for s_cell in shadows:
-        if await _try_copy(bot, job.target_user_id, s_cell["channel_id"], msg_id):
-            return True
-    return False
-
-
-async def _try_copy(bot, chat_id, from_chat_id, message_id) -> bool:
-    try:
-        await bot.copy_message(chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id)
-        return True
-    except Exception:
-        return False
+async def _try_deliver_to_user(bot, chat_id, from_channel, msg_id) -> bool:
+    """尝试从指定频道复制消息给用户（在 delivery_resolver 中定义的轻量版，避免循环导入）。"""
+    from storage.delivery_resolver import try_deliver as _td
+    return await _td(bot, chat_id, from_channel, msg_id)
 
 
 async def _process_batch_job(bot, job):
@@ -205,10 +178,8 @@ async def _process_batch_job(bot, job):
 
 async def _fallback_single_send(bot, job):
     for mid in job.storage_msg_ids:
-        if await _try_copy(bot, job.target_user_id, job.storage_channel_id, mid):
-            metrics.send_success_count += 1
-            continue
-        if await _try_cell_fallback(bot, job, mid):
+        resolved = await resolve_delivery_channel(job.storage_channel_id)
+        if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid):
             metrics.send_success_count += 1
         else:
             metrics.send_fail_count += 1

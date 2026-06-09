@@ -27,6 +27,7 @@ class MonBot:
         self.bot = Bot(token=TOKEN)
         self.scheduler = MonScheduler()
         self._running = False
+        self._cycle_count = 0
 
     async def start(self):
         """启动 Mon 主循环。"""
@@ -46,14 +47,29 @@ class MonBot:
                 if copied > 0:
                     logger.info(f"[Mon] 文件同步: 复制了 {copied} 条消息到 Shadow 频道")
 
-                # 3. 降级检查
+                # 3. 智能替补：新频道自动补齐存量文件
+                filled = await self.scheduler.auto_fill_new_channels(self.bot)
+                if filled > 0:
+                    logger.info(f"[Mon] 智能替补: 补齐 {filled} 条消息到新频道")
+
+                # 4. 降级检查
                 alerts = await self.scheduler.run_degrade_check()
                 if alerts:
                     for msg in alerts:
                         logger.warning(msg)
                         metrics.increment("mon.degrade")
 
-                # 4. 报告当前拓扑状态
+                # 5. 定期拓扑校验（每 10 轮一次）
+                self._cycle_count += 1
+                if self._cycle_count % 10 == 0:
+                    issues = await self.scheduler.validate_topology()
+                    if issues:
+                        for issue in issues:
+                            logger.warning(issue)
+                    else:
+                        logger.info("[Mon] 拓扑校验: 健康")
+
+                # 6. 报告当前拓扑状态
                 await self._report_status()
 
             except Exception as e:
