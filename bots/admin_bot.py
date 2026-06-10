@@ -83,7 +83,18 @@ async def _get_status_text() -> str:
     today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     today_decodes = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
     relay_pending = await get_config("relay_auth_pending")
-    relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
+    try:
+        from services.relay_pool import relay_pool
+        if not relay_pool._initialized:
+            await relay_pool.init()
+        pool_status = await relay_pool.get_pool_status()
+        if pool_status:
+            ready = sum(1 for p in pool_status if p["is_ready"])
+            relay_status = f"✅ 账号池 {ready}/{len(pool_status)} 就绪"
+        else:
+            relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
+    except Exception:
+        relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
     active_channel = await get_active_storage_channel_id()
     msg = (
         f"📊 系统概览\n\n"
@@ -200,28 +211,32 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
 
 
 async def _get_relay_status_text() -> str:
+    from services.relay_pool import relay_pool
     pending = await get_config("relay_auth_pending")
     status = await get_relay_status()
-    config = await get_relay_config()
 
-    status_labels = {
-        "online": "✅ 在线",
-        "connecting": "🔄 连接中",
-        "pending_auth": "⏳ 等待验证码",
-        "offline": "❌ 离线",
-    }
+    if not relay_pool._initialized:
+        try:
+            await relay_pool.init()
+        except Exception:
+            pass
 
-    msg = "🔐 用户中继状态\n\n"
-    msg += f"状态：{status_labels.get(status, status)}\n"
-
-    if config.get("api_id"):
-        phone = config.get("phone", "")
-        masked_phone = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
-        msg += f"账号：{masked_phone}\n"
-        msg += f"API_ID：{config['api_id']}\n"
+    msg = "� 中继账号池状态\n\n"
+    pool_status = await relay_pool.get_pool_status()
+    if not pool_status:
+        msg += "⚠️ 无中继账号\n"
+        msg += "请使用下方按钮配置中继账号\n"
     else:
-        msg += "⚠️ 未配置中继账号\n"
-        msg += "请使用下方按钮配置 API_ID / API_HASH / 手机号\n"
+        msg += f"账号池: {len(pool_status)} 个账号\n\n"
+        for i, ps in enumerate(pool_status, 1):
+            ready = "✅" if ps["is_ready"] else "❌"
+            busy = "🔴" if ps["is_busy"] else "⚪"
+            phone = ps["phone"]
+            masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+            msg += f"{i}. {ready}{busy} {masked}\n"
+            msg += f"   今日请求: {ps['today_requests']}, 累计: {ps['total_requests']}, 平均: {ps['avg_wait_ms']:.0f}ms\n"
+        ready_count = sum(1 for p in pool_status if p["is_ready"])
+        msg += f"\n就绪: {ready_count}/{len(pool_status)}"
 
     if pending == "1":
         msg += "\n⚠️ 正在等待验证码，请通过 /relay_code 提交"
@@ -1329,6 +1344,97 @@ async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @_auth_required
+async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出所有中继账号及使用统计"""
+    from services.relay_pool import relay_pool
+    if not relay_pool._initialized:
+        try:
+            await relay_pool.init()
+        except Exception:
+            pass
+    pool_status = await relay_pool.get_pool_status()
+    if not pool_status:
+        await update.message.reply_text(
+            "⚠️ 中继账号池为空\n"
+            "请使用 /relay_add 添加中继账号，或通过管理面板配置。"
+        )
+        return
+    msg = f"🔐 中继账号池 ({len(pool_status)} 个账号)\n\n"
+    for i, ps in enumerate(pool_status, 1):
+        ready = "✅" if ps["is_ready"] else "❌"
+        busy = "🔴忙" if ps["is_busy"] else "⚪空闲"
+        phone = ps["phone"]
+        masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+        msg += f"{i}. {ready}{busy} {masked}\n"
+        msg += f"   今日: {ps['today_requests']} | 累计: {ps['total_requests']} | 平均: {ps['avg_wait_ms']:.0f}ms\n\n"
+    await update.message.reply_text(msg)
+
+
+@_auth_required
+async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """添加中继账号（命令行方式）"""
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "用法：/relay_add <api_id> <api_hash> <手机号>\n\n"
+            "示例：/relay_add 12345 abc123def456 +8613800138000\n\n"
+            "添加后需要提交验证码完成登录，或直接在管理面板中配置。"
+        )
+        return
+    try:
+        api_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ api_id 必须是数字")
+        return
+    api_hash = args[1].strip()
+    phone = args[2].strip()
+
+    from services.relay_pool import relay_pool
+    try:
+        instance = await relay_pool.add_account(api_id, api_hash, phone)
+        masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+        await update.message.reply_text(
+            f"✅ 中继账号已添加到池中\n"
+            f"  API_ID: {api_id}\n"
+            f"  API_HASH: {api_hash[:8]}...\n"
+            f"  手机号: {masked}\n\n"
+            f"解码机器人将自动检测新账号并连接。\n"
+            f"如需要登录验证码，请使用 /relay_code 提交。"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ 添加失败: {e}")
+
+
+@_auth_required
+async def relay_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """移除中继账号"""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：/relay_remove <手机号>\n\n"
+            "示例：/relay_remove +8613800138000"
+        )
+        return
+    phone = args[0].strip()
+
+    from services.relay_pool import relay_pool
+    removed = await relay_pool.remove_account(phone)
+    if removed:
+        await update.message.reply_text(f"✅ 已移除中继账号: {phone}")
+    else:
+        await update.message.reply_text(f"❌ 未找到该手机号的中继账号: {phone}")
+
+
+@_auth_required
+async def relay_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """重置使用统计"""
+    from database.relay_db import get_relay_db
+    db = await get_relay_db()
+    await db.reset_usage()
+    await update.message.reply_text("✅ 中继账号使用统计已重置")
+
+
+@_auth_required
 async def backup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
@@ -2225,12 +2331,10 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # ─── 中继 ────────────────────────────────────────────────────
     elif state == "relay_code:code":
         code = text.strip()
-        from services.user_relay import user_relay
-        ok = await user_relay.submit_code(code)
-        if ok:
-            await _end("✅ 验证码已提交，正在尝试登录...")
-        else:
-            await _end("❌ 验证码提交失败，请检查验证码是否正确，或中继是否正在等待验证码。")
+        # 验证码写入 DB，由 idx_bot 的 relay_instance 自动读取
+        await set_config("relay_auth_code", code)
+        await set_config("relay_auth_pending", "1")
+        await _end(f"✅ 验证码 `{code}` 已提交\n中继实例将在几秒内自动获取并使用。")
 
     elif state == "relay_set_api:api_id":
         try:
@@ -2248,19 +2352,23 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                     {"api_hash": text.strip()})
 
     elif state == "relay_set_api:phone":
-        from services.user_relay import user_relay
+        from services.relay_pool import relay_pool
         phone = text.strip()
-        ok = await user_relay.set_api(data["api_id"], data["api_hash"], phone)
-        if ok:
+        api_id = int(data["api_id"])
+        api_hash = data["api_hash"]
+        instance = await relay_pool.add_account(api_id, api_hash, phone)
+        # 开始登录
+        try:
+            await instance.login_with_credentials(api_id, api_hash, phone)
             await _end(
-                f"✅ 中继账号配置已保存\n"
-                f"  API_ID: {data['api_id']}\n"
-                f"  API_HASH: {data['api_hash'][:8]}...\n"
+                f"✅ 中继账号已添加并登录成功\n"
+                f"  API_ID: {api_id}\n"
+                f"  API_HASH: {api_hash[:8]}...\n"
                 f"  手机号: {phone}\n\n"
-                f"解码机器人重启后将自动登录。"
+                f"该账号已加入账号池，可立即使用。"
             )
-        else:
-            await _end("❌ 配置保存失败，请检查参数是否正确。")
+        except RuntimeError as e:
+            await _end(f"❌ 登录失败: {e}")
 
     # ─── 系统配置 ────────────────────────────────────────────────
     elif state == "set_storage_channel:id":
@@ -2445,6 +2553,10 @@ def run():
     app.add_handler(CommandHandler("relay_code", relay_code))
     app.add_handler(CommandHandler("relay_set_api", relay_set_api))
     app.add_handler(CommandHandler("relay_pending", relay_pending))
+    app.add_handler(CommandHandler("relay_list", relay_list))
+    app.add_handler(CommandHandler("relay_add", relay_add))
+    app.add_handler(CommandHandler("relay_remove", relay_remove))
+    app.add_handler(CommandHandler("relay_reset_stats", relay_reset_stats))
     app.add_handler(CommandHandler("backup_reset", backup_reset))
     app.add_handler(CommandHandler("promote_channel", promote_channel))
     app.add_handler(CommandHandler("settings", settings_view))

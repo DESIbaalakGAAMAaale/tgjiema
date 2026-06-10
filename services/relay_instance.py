@@ -1,3 +1,8 @@
+"""单个中继账号实例 — 独立 Telethon 客户端
+- 每个账号独立 TelegramClient + session 文件
+- 支持并发处理解码任务
+- session 文件持久化，VPS 重启后自动恢复
+"""
 import asyncio
 import json
 from pathlib import Path
@@ -10,25 +15,34 @@ from telethon.utils import pack_bot_file_id
 
 from config import settings
 
-
 _SETTLE_WAIT = 5
 _INITIAL_SETTLE_WAIT = 20
 
 
-class UserRelay:
-    def __init__(self):
+class RelayInstance:
+    """单个中继账号实例"""
+
+    def __init__(self, account_id: int, api_id: int, api_hash: str, phone: str):
+        self.account_id = account_id
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.phone = phone
         self._client: TelegramClient | None = None
         self._decoder_bot_entity = None
         self._storage_channel_entity = None
+        # bot_username -> exchange info
         self._bot_exchange: dict[str, dict] = {}
         self._media_buffers: dict[str, dict] = {}
-        self._session_path = str(Path(__file__).parent.parent / "relay_session")
+        self._session_path = str(
+            Path(__file__).parent.parent / "data" / f"relay_session_{phone}"
+        )
         self._ready = asyncio.Event()
-        self._relay_api_id: int = 0
-        self._relay_api_hash: str = ""
-        self._relay_phone: str = ""
         self._pending_cleanup = None
         self._relay_user_id = None
+        # 并发控制
+        self.is_busy = False
+        self._lock = asyncio.Lock()
+        # 缓存锁
         self._cache_locks: dict[str, asyncio.Lock] = {}
         self._pending_cache_counts: dict[str, int] = {}
         self._pending_cache_events: dict[str, asyncio.Event] = {}
@@ -56,7 +70,7 @@ class UserRelay:
 
         await set_config("relay_auth_pending", "1")
         await self._report_status("pending_auth")
-        logger.info("[UserRelay] 验证码已发送到 Telegram，等待管理员通过管理机器人提交...")
+        logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram，等待管理员通过管理机器人提交...")
 
         for i in range(100):
             await asyncio.sleep(3)
@@ -64,95 +78,75 @@ class UserRelay:
             if code and code.strip():
                 await set_config("relay_auth_pending", "0")
                 await set_config("relay_auth_code", "")
-                logger.info("[UserRelay] 已收到管理员提交的验证码")
+                logger.info(f"[RelayInstance:{self.phone}] 已收到管理员提交的验证码")
                 return code.strip()
 
         await set_config("relay_auth_pending", "0")
-        logger.error("[UserRelay] 等待验证码超时（5分钟）")
+        logger.error(f"[RelayInstance:{self.phone}] 等待验证码超时（5分钟）")
         return None
 
-    async def _load_config(self):
-        api_id = settings.RELAY_API_ID or 0
-        api_hash = settings.RELAY_API_HASH or ""
-        phone = settings.RELAY_PHONE or ""
-
-        if not api_id or not api_hash or not phone:
-            try:
-                from database.session import get_relay_config
-                db_config = await get_relay_config()
-                if db_config.get("api_id"):
-                    api_id = db_config["api_id"]
-                if db_config.get("api_hash"):
-                    api_hash = db_config["api_hash"]
-                if db_config.get("phone"):
-                    phone = db_config["phone"]
-                if api_id and api_hash and phone:
-                    logger.info("[UserRelay] 使用数据库中配置的中继账号")
-            except Exception as e:
-                logger.warning(f"[UserRelay] 读取 DB 中继配置失败: {e}")
-
-        self._relay_api_id = api_id
-        self._relay_api_hash = api_hash
-        self._relay_phone = phone
-
     async def start(self):
-        await self._load_config()
-
-        if not self._relay_api_id or not self._relay_api_hash or not self._relay_phone:
-            logger.warning("[UserRelay] 未配置中继账号 (API_ID/HASH/PHONE)，跳过中继")
-            await self._report_status("offline")
-            return
-
         await self._report_status("connecting")
 
         self._client = TelegramClient(
             self._session_path,
-            self._relay_api_id,
-            self._relay_api_hash,
+            self.api_id,
+            self.api_hash,
         )
 
         await self._client.connect()
 
         if not await self._client.is_user_authorized():
-            await self._client.send_code_request(self._relay_phone)
-            logger.info("[UserRelay] 验证码已发送到 Telegram 账号")
+            await self._client.send_code_request(self.phone)
+            logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram 账号")
 
-            code = settings.RELAY_CODE.strip() if settings.RELAY_CODE else None
+            code = ""
+            if settings.RELAY_CODES:
+                codes = [c.strip() for c in settings.RELAY_CODES.split(",") if c.strip()]
+                idx = 0
+                try:
+                    phones = [p.strip() for p in settings.RELAY_PHONES.split(",") if p.strip()]
+                    idx = phones.index(self.phone) if self.phone in phones else 0
+                except (ValueError, AttributeError):
+                    idx = 0
+                if idx < len(codes):
+                    code = codes[idx]
+
             if not code:
-                logger.info("[UserRelay] 环境变量 RELAY_CODE 未设置，等待管理员通过管理机器人提交...")
+                logger.info(f"[RelayInstance:{self.phone}] 验证码未设置，等待管理员提交...")
                 code = await self._wait_for_admin_code()
 
             if not code:
-                logger.error("[UserRelay] 无法获取验证码，登录失败")
+                logger.error(f"[RelayInstance:{self.phone}] 无法获取验证码，登录失败")
                 await self._report_status("offline")
                 await self._client.disconnect()
                 return
 
             try:
-                await self._client.sign_in(self._relay_phone, code)
+                await self._client.sign_in(phone, code)
             except SessionPasswordNeededError:
                 logger.error(
-                    "[UserRelay] 该账号开启了二步验证，暂不支持。请关闭二步验证或使用无二步验证的账号。"
+                    f"[RelayInstance:{self.phone}] 该账号开启了二步验证，暂不支持"
                 )
                 await self._report_status("offline")
                 await self._client.disconnect()
                 return
             except Exception as e:
-                logger.error(f"[UserRelay] 登录失败: {e}")
+                logger.error(f"[RelayInstance:{self.phone}] 登录失败: {e}")
                 await self._report_status("offline")
                 await self._client.disconnect()
                 return
 
         me = await self._client.get_me()
         self._relay_user_id = me.id
-        logger.info(f"[UserRelay] 已登录: {me.first_name} (@{me.username}), id={me.id}")
+        logger.info(f"[RelayInstance:{self.phone}] 已登录: {me.first_name} (@{me.username}), id={me.id}")
 
         try:
             self._decoder_bot_entity = await self._client.get_entity(
                 settings.DECODER_BOT_USERNAME
             )
         except Exception as e:
-            logger.warning(f"[UserRelay] 无法获取解码机器人 @{settings.DECODER_BOT_USERNAME}: {e}")
+            logger.warning(f"[RelayInstance:{self.phone}] 无法获取解码机器人 @{settings.DECODER_BOT_USERNAME}: {e}")
 
         try:
             self._storage_channel_entity = PeerChannel(settings.MAIN_STORAGE_CHANNEL_ID)
@@ -162,7 +156,86 @@ class UserRelay:
         self._register_handlers()
         self._ready.set()
         await self._report_status("online")
-        logger.info("[UserRelay] 中继已就绪")
+        logger.info(f"[RelayInstance:{self.phone}] 中继已就绪")
+
+    async def login_with_credentials(self, api_id: int, api_hash: str, phone: str):
+        """使用指定凭证登录（用于动态添加账号）"""
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.phone = phone
+
+        if not self._client or self._client.is_connected():
+            self._client = TelegramClient(self._session_path, api_id, api_hash)
+            await self._client.connect()
+        else:
+            self._client.api_id = api_id
+            self._client.api_hash = api_hash
+
+        if not await self._client.is_user_authorized():
+            await self._client.send_code_request(phone)
+            code = await self._wait_for_admin_code()
+            if not code:
+                raise RuntimeError("验证码获取失败")
+            try:
+                await self._client.sign_in(phone, code)
+            except SessionPasswordNeededError:
+                raise RuntimeError("账号开启二步验证，暂不支持")
+
+        me = await self._client.get_me()
+        self._relay_user_id = me.id
+        self._decoder_bot_entity = await self._client.get_entity(settings.DECODER_BOT_USERNAME)
+        self._storage_channel_entity = PeerChannel(settings.MAIN_STORAGE_CHANNEL_ID)
+        self._register_handlers()
+        self._ready.set()
+        logger.info(f"[RelayInstance:{self.phone}] 动态添加并登录成功: {me.username}")
+
+    async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
+        """发送外部码解码请求"""
+        if not self._client:
+            return False
+        async with self._lock:
+            if self.is_busy:
+                logger.warning(f"[RelayInstance:{self.phone}] 账号正忙，拒绝新请求")
+                return False
+            self.is_busy = True
+        try:
+            return await self._do_send_external_code(bot_username, code, user_id)
+        finally:
+            self.is_busy = False
+
+    async def _do_send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
+        try:
+            entity = await self._client.get_entity(bot_username)
+            logger.info(
+                f"[RelayInstance:{self.phone}] 目标实体: {type(entity).__name__}, "
+                f"id={getattr(entity, 'id', '?')}, username=@{getattr(entity, 'username', '?')}"
+            )
+            await self._client.send_message(entity, code)
+            now = asyncio.get_event_loop().time()
+            self._bot_exchange[bot_username.lower()] = {
+                "user_id": user_id,
+                "code": code,
+                "events": [],
+                "_expires": now + 120,
+                "_settle_task": None,
+                "_ai_running": False,
+                "_keyboard_msg": None,
+                "_last_clicked_number": None,
+                "_clicked_buttons": set(),
+                "_min_click_interval": 0,
+                "_last_click_time": 0,
+            }
+            self._restart_settle(
+                self._bot_exchange[bot_username.lower()], bot_username.lower(),
+                settle_wait=_INITIAL_SETTLE_WAIT,
+            )
+            logger.info(f"[RelayInstance:{self.phone}] 已向 @{bot_username} 发送外部码 (user={user_id}, code={code})")
+            return True
+        except Exception as e:
+            logger.error(f"[RelayInstance:{self.phone}] 向 @{bot_username} 发送失败: {e}")
+            return False
+
+    # ── Internal relay logic (copied from UserRelay) ──
 
     async def _cache_file_record(self, code: str, message_id: int, file_id: str = "", media_type: str = "document"):
         lock = self._cache_locks.setdefault(code, asyncio.Lock())
@@ -228,7 +301,7 @@ class UserRelay:
                         update["$set"]["file_ids"] = ",".join(fids_list)
 
                     await files_col.update_one({"file_code": code}, update)
-                    logger.info(f"[UserRelay] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}")
+                    logger.info(f"[RelayInstance:{self.phone}] 外部码 {code} 追加 msg_id={message_id}")
                 else:
                     record = make_file_record(
                         file_code=code,
@@ -245,9 +318,9 @@ class UserRelay:
                             "type": media_type,
                         }])
                     await files_col.insert_one(record)
-                    logger.info(f"[UserRelay] 外部码 {code} 已缓存到本地存储")
+                    logger.info(f"[RelayInstance:{self.phone}] 外部码 {code} 已缓存到本地存储")
             except Exception as e:
-                logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
+                logger.error(f"[RelayInstance:{self.phone}] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
     def _extract_file_id(self, msg) -> str:
         if not msg or not msg.media:
@@ -255,7 +328,6 @@ class UserRelay:
         try:
             media = msg.media
             from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
-
             if isinstance(media, MessageMediaPhoto):
                 inner = media.photo
                 return pack_bot_file_id(inner) or ""
@@ -289,8 +361,6 @@ class UserRelay:
                         fixed_count += 1
             except Exception:
                 pass
-        if fixed_count > 0:
-            logger.info(f"[UserRelay] 自修复: 码 {code} 共修复 {fixed_count} 个空 file_id")
         return fixed_count
 
     def _decrement_cache_counter(self, code: str):
@@ -314,11 +384,8 @@ class UserRelay:
             await self._cache_file_record(
                 code, storage_msg.id, file_id=cache_fid, media_type=media_type,
             )
-            logger.info(
-                f"[UserRelay] 已缓存到存储频道 (code={code}, msg_id={storage_msg.id})"
-            )
         except Exception as e:
-            logger.error(f"[UserRelay] 缓存到存储频道失败 (code={code}): {e}")
+            logger.error(f"[RelayInstance:{self.phone}] 缓存到存储频道失败 (code={code}): {e}")
         finally:
             self._decrement_cache_counter(code)
 
@@ -334,10 +401,6 @@ class UserRelay:
             return "audio"
         if hasattr(msg, "animation") and msg.animation:
             return "animation"
-        if hasattr(msg, "gif") and msg.gif:
-            return "animation"
-        if hasattr(msg, "sticker") and msg.sticker:
-            return "sticker"
         if hasattr(msg, "document") and msg.document:
             mime = getattr(msg.document, "mime_type", "") or ""
             if "video" in mime:
@@ -359,18 +422,13 @@ class UserRelay:
         import re
         text = (getattr(msg, "message", None) or "").lower()
         patterns = [
-            r"(\d+)\s*秒",
-            r"(\d+)\s*seconds?",
-            r"(\d+)\s*secs?",
-            r"wait\s*(\d+)",
-            r"等\s*(\d+)",
-            r"稍等\s*(\d+)",
+            r"(\d+)\s*秒", r"(\d+)\s*seconds?", r"(\d+)\s*secs?",
+            r"wait\s*(\d+)", r"等\s*(\d+)", r"稍等\s*(\d+)",
         ]
         for pat in patterns:
             m = re.search(pat, text)
             if m:
-                sec = int(m.group(1))
-                return max(sec, 1)
+                return max(int(m.group(1)), 1)
         return 5
 
     def _register_handlers(self):
@@ -384,7 +442,6 @@ class UserRelay:
                     old["_settle_task"].cancel()
 
             sender = await event.get_sender()
-
             if self._bot_exchange:
                 sender_info = ""
                 try:
@@ -395,7 +452,7 @@ class UserRelay:
                 except Exception:
                     sender_info = "unknown"
                 logger.info(
-                    f"[UserRelay] 收到消息: sender({sender_info}), "
+                    f"[RelayInstance:{self.phone}] 收到消息: sender({sender_info}), "
                     f"has_media={bool(getattr(event.message, 'media', None))}, "
                     f"active_exchanges={list(self._bot_exchange.keys())}"
                 )
@@ -409,9 +466,6 @@ class UserRelay:
 
             exchange = self._bot_exchange.get(bot_username)
             if not exchange:
-                logger.info(
-                    f"[UserRelay] 来自 @{bot_username} 的消息无对应 exchange，忽略"
-                )
                 return
 
             exchange["_expires"] = now_ts + 120
@@ -425,27 +479,22 @@ class UserRelay:
                 if buf:
                     buf["events"].append(event)
                     buf["_expires"] = now_ts + 5
-                    logger.info(
-                        f"[UserRelay] 媒体组 {media_group_id} 收集第 {len(buf['events'])} 条"
-                    )
                     return
-
                 self._media_buffers[media_group_id] = {
                     "events": [event],
                     "bot_username": bot_username,
                     "_expires": now_ts + 5,
                 }
-                logger.info(
-                    f"[UserRelay] 媒体组 {media_group_id} 开始收集"
-                )
                 asyncio.create_task(
                     self._flush_media_group_buffer(media_group_id, bot_username)
                 )
                 return
 
             exchange.setdefault("events", []).append(event)
-            self._pending_cache_counts[exchange.get("code")] = self._pending_cache_counts.get(exchange.get("code"), 0) + 1
-            await self._download_and_cache_one(event.message, exchange.get("user_id"), exchange.get("code"))
+            code = exchange.get("code")
+            if code:
+                self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
+                await self._download_and_cache_one(event.message, exchange.get("user_id"), code)
             self._restart_settle(exchange, bot_username)
 
         @self._client.on(events.MessageEdited(incoming=True))
@@ -463,7 +512,6 @@ class UserRelay:
                 return
             exchange["_keyboard_msg"] = event.message
             exchange["_msg_version"] = exchange.get("_msg_version", 0) + 1
-            logger.info(f"[UserRelay] 捕获键盘编辑 (bot=@{bot_username})")
 
     def _restart_settle(self, exchange: dict, bot_username: str, settle_wait: float = _SETTLE_WAIT):
         exchange["_msg_version"] = exchange.get("_msg_version", 0) + 1
@@ -479,7 +527,6 @@ class UserRelay:
 
     async def _flush_media_group_buffer(self, media_group_id: str, bot_username: str):
         await asyncio.sleep(3)
-
         now_ts = asyncio.get_event_loop().time()
         while True:
             buf = self._media_buffers.get(media_group_id)
@@ -490,29 +537,20 @@ class UserRelay:
                 now_ts = asyncio.get_event_loop().time()
                 continue
             break
-
         buf = self._media_buffers.pop(media_group_id, None)
         if not buf:
             return
-
         exchange = self._bot_exchange.get(bot_username)
         if not exchange:
-            logger.warning(f"[UserRelay] 媒体组 {media_group_id} 无对应 exchange")
             return
-
         events_list = buf["events"]
         user_id = exchange.get("user_id")
         code = exchange.get("code")
-        logger.info(
-            f"[UserRelay] 媒体组 {media_group_id} 共 {len(events_list)} 条，开始缓存到存储频道"
-        )
-
         for ev in events_list:
-            self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
-
+            if code:
+                self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
         for ev in events_list:
             await self._download_and_cache_one(ev.message, user_id, code)
-
         exchange.setdefault("events", []).extend(events_list)
         self._restart_settle(exchange, bot_username)
 
@@ -528,12 +566,10 @@ class UserRelay:
         ev.clear()
         if self._pending_cache_counts.get(code, 0) <= 0:
             return
-        logger.info(f"[UserRelay] 等待 {pending} 个缓存操作完成 (code={code})")
         try:
             await asyncio.wait_for(ev.wait(), timeout=timeout)
-            logger.info(f"[UserRelay] 缓存操作全部完成 (code={code})")
         except asyncio.TimeoutError:
-            logger.warning(f"[UserRelay] 等待缓存操作超时 (code={code}), 剩余 {self._pending_cache_counts.get(code, '?')}")
+            pass
 
     async def _message_loop(self, bot_username: str, settle_wait: float = _SETTLE_WAIT):
         task = asyncio.current_task()
@@ -542,47 +578,29 @@ class UserRelay:
         await asyncio.sleep(settle_wait)
         if task:
             task.set_name("")
-
         exchange = self._bot_exchange.get(bot_username)
         if not exchange:
             return
-
         if exchange.get("_ai_running"):
             return
-
         exchange["_ai_running"] = True
-
         stale_clicks = 0
         try:
             while True:
-
                 if bot_username not in self._bot_exchange:
-                    logger.warning(f"[UserRelay] 翻页循环: exchange 已被清理 (bot={bot_username})")
                     break
-
                 exchange = self._bot_exchange[bot_username]
                 exchange["_expires"] = asyncio.get_event_loop().time() + 120
                 version_before = exchange.get("_msg_version", 0)
-
                 decision = self._make_decision(exchange)
-
                 if bot_username not in self._bot_exchange:
                     break
                 exchange = self._bot_exchange[bot_username]
                 version_after = exchange.get("_msg_version", 0)
-
                 if version_after != version_before:
-                    logger.info(
-                        f"[UserRelay] 新消息到达 (v{version_before}→v{version_after})，重新评估"
-                    )
                     continue
-
                 action = decision.get("action", "finish")
                 reason = decision.get("reason", "")
-                logger.info(
-                    f"[UserRelay] 翻页决策: action={action}, reason={reason}"
-                )
-
                 if action == "finish":
                     await self._process_all_collected(bot_username)
                     break
@@ -596,21 +614,15 @@ class UserRelay:
                                 self._decoder_bot_entity,
                                 f"RELAY_ERROR:{user_id}:{code}:{reason}",
                             )
-                        except Exception as e:
-                            logger.error(f"[UserRelay] 发送错误通知失败: {e}")
+                        except Exception:
+                            pass
                     await self._cleanup_exchange(bot_username)
                     break
                 elif action == "wait":
                     wait_sec = decision.get("wait_seconds", 5)
-                    logger.info(
-                        f"[UserRelay] 遵守翻页速度限制，等待 {wait_sec} 秒 "
-                        f"(bot={bot_username})"
-                    )
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
-                        exchange["_last_click_time"] = (
-                            asyncio.get_event_loop().time() + wait_sec
-                        )
+                        exchange["_last_click_time"] = asyncio.get_event_loop().time() + wait_sec
                     await asyncio.sleep(wait_sec)
                     continue
                 elif action == "click_button":
@@ -621,38 +633,24 @@ class UserRelay:
                         now = asyncio.get_event_loop().time()
                         remaining = (last_click + min_interval) - now
                         if remaining > 0:
-                            logger.info(
-                                f"[UserRelay] 翻页速度限制，等待剩余 {remaining:.1f} 秒 "
-                                f"(bot={bot_username}, min_interval={min_interval}s)"
-                            )
                             await asyncio.sleep(remaining)
                     exchange = self._bot_exchange.get(bot_username)
                     row = decision.get("target_button_row")
                     col = decision.get("target_button_col")
-                    btn_text = decision.get("target_button_text", "")
                     if row is None or col is None:
-                        logger.warning("[UserRelay] 决策要求点击按钮但未指定 row/col")
                         await self._process_all_collected(bot_username)
                         break
-
                     events_before = len(exchange.get("events", []))
-
-                    logger.info(
-                        f'[UserRelay] 点击翻页按钮 [{row},{col}] "{btn_text}" (events={events_before})'
-                    )
                     clicked = await self._click_button(bot_username, row, col)
                     if not clicked:
-                        logger.info("[UserRelay] 翻页按钮点击失败（可能已是最后一页）")
                         await self._process_all_collected(bot_username)
                         break
-
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
                         exchange.setdefault("_clicked_buttons", set()).add((row, col))
                         exchange["_last_click_time"] = asyncio.get_event_loop().time()
                     await asyncio.sleep(4)
                     await self._wait_all_cached(bot_username)
-
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
                         events_after = len(exchange.get("events", []))
@@ -660,66 +658,45 @@ class UserRelay:
                             stale_clicks = 0
                         else:
                             stale_clicks += 1
-                            logger.info(
-                                f"[UserRelay] 翻页无新增消息 (stale_clicks={stale_clicks}/3)"
-                            )
                             if stale_clicks >= 3:
-                                logger.info("[UserRelay] 连续翻页无新消息，结束收集")
                                 await self._process_all_collected(bot_username)
                                 break
                     continue
                 else:
-                    logger.warning(f"[UserRelay] 未知 action: {action}")
                     await self._process_all_collected(bot_username)
                     break
-
         except asyncio.CancelledError:
-            logger.debug(f"[UserRelay] 翻页循环被取消 (bot={bot_username})")
+            pass
         except Exception as e:
-            logger.error(f"[UserRelay] 翻页循环异常 (bot={bot_username}): {e}")
+            logger.error(f"[RelayInstance:{self.phone}] 翻页循环异常: {e}")
             await self._process_all_collected(bot_username)
         finally:
             if bot_username in self._bot_exchange:
                 self._bot_exchange[bot_username]["_ai_running"] = False
 
     def _make_decision(self, exchange: dict) -> dict:
-        _NEXT_KW = (
-            "next", "\u4e0b\u4e00\u9875", "\u4e0b\u4e00\u9801",
-            "\u4e0b\u4e00\u7ec4",
-            "\u2192", "\u25b6", "\u27a1", ">>", "\u00bb",
-        )
-        _ERROR_KW = (
-            "\u672a\u627e\u5230", "\u5df2\u8fc7\u671f", "\u5df2\u5931\u6548",
-            "\u4e0d\u5b58\u5728", "not found", "expired", "invalid",
-        )
-        _RATE_LIMIT_KW = (
-            "\u8bf7\u7a0d\u540e", "\u8bf7\u7b49\u5f85", "\u7a0d\u540e\u518d\u8bd5",
-            "\u901f\u5ea6\u592a\u5feb", "\u7ffb\u9875\u592a\u5feb", "\u64cd\u4f5c\u592a\u5feb",
-            "\u9891\u7e41", "\u8bf7\u6162\u4e00\u70b9", "\u6162\u4e00\u70b9",
-            "too fast", "wait", "slow down", "rate limit",
-            "\u8bf7\u52ff\u8fc7\u5feb",
-        )
+        _NEXT_KW = ("next", "\u4e0b\u4e00\u9875", "\u4e0b\u4e00\u9801", "\u4e0b\u4e00\u7ec4",
+                     "\u2192", "\u25b6", "\u27a1", ">>", "\u00bb")
+        _ERROR_KW = ("\u672a\u627e\u5230", "\u5df2\u8fc7\u671f", "\u5df2\u5931\u6548",
+                     "\u4e0d\u5b58\u5728", "not found", "expired", "invalid")
+        _RATE_LIMIT_KW = ("\u8bf7\u7a0d\u540e", "\u8bf7\u7b49\u5f85", "\u7a0d\u540e\u518d\u8bd5",
+                         "\u901f\u5ea6\u592a\u5feb", "\u7ffb\u9875\u592a\u5feb", "\u64cd\u4f5c\u592a\u5feb",
+                         "\u9891\u7e41", "\u8bf7\u6162\u4e00\u70b9", "\u6162\u4e00\u70b9",
+                         "too fast", "wait", "slow down", "rate limit", "\u8bf7\u52ff\u8fc7\u5feb")
         _FINISH_KW = {"finish", "done", "\u5b8c\u6210", "\u7ed3\u675f"}
 
         msg_events = exchange.get("events", [])
         if not msg_events:
-            return {
-                "action": "finish", "target_button_row": None,
-                "target_button_col": None, "target_button_text": None,
-                "reason": "\u65e0\u6d88\u606f", "wait_seconds": None,
-            }
+            return {"action": "finish", "target_button_row": None, "target_button_col": None,
+                    "target_button_text": None, "reason": "\u65e0\u6d88\u606f", "wait_seconds": None}
 
         for ev in msg_events:
-            msg = ev.message
-            text = (getattr(msg, "message", None) or "").lower()
+            text = (getattr(ev.message, "message", None) or "").lower()
             for ek in _ERROR_KW:
                 if ek in text:
-                    return {
-                        "action": "error", "target_button_row": None,
-                        "target_button_col": None, "target_button_text": None,
-                        "reason": f"\u68c0\u6d4b\u5230\u9519\u8bef\u5173\u952e\u8bcd: {ek}",
-                        "wait_seconds": None,
-                    }
+                    return {"action": "error", "target_button_row": None, "target_button_col": None,
+                            "target_button_text": None, "reason": f"\u68c0\u6d4b\u5230\u9519\u8bef: {ek}",
+                            "wait_seconds": None}
 
         for ev in msg_events:
             msg = ev.message
@@ -727,40 +704,26 @@ class UserRelay:
             for rk in _RATE_LIMIT_KW:
                 if rk in text:
                     wait_sec = self._extract_wait_seconds(msg)
-                    exchange["_min_click_interval"] = max(
-                        exchange.get("_min_click_interval", 0), wait_sec
-                    )
-                    return {
-                        "action": "wait",
-                        "target_button_row": None,
-                        "target_button_col": None,
-                        "target_button_text": None,
-                        "reason": f"\u68c0\u6d4b\u5230\u7ffb\u9875\u901f\u5ea6\u9650\u5236: {rk}, \u7b49\u5f85{wait_sec}\u79d2",
-                        "wait_seconds": wait_sec,
-                    }
+                    exchange["_min_click_interval"] = max(exchange.get("_min_click_interval", 0), wait_sec)
+                    return {"action": "wait", "target_button_row": None, "target_button_col": None,
+                            "target_button_text": None,
+                            "reason": f"\u68c0\u6d4b\u5230\u9650\u5236: {rk}",
+                            "wait_seconds": wait_sec}
 
         for ev in msg_events:
             msg = ev.message
             if not (msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows):
                 continue
-
             rows = msg.reply_markup.rows
-
-            # Phase 1: text-based next detection
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
                     btn_text = (getattr(btn, "text", None) or "").lower().strip()
                     if any(kw in btn_text for kw in _NEXT_KW):
-                        return {
-                            "action": "click_button",
-                            "target_button_row": row_idx,
-                            "target_button_col": col_idx,
-                            "target_button_text": getattr(btn, "text", None) or "",
-                            "reason": f"\u68c0\u6d4b\u5230\u7ffb\u9875\u6309\u94ae: {btn_text}",
-                            "wait_seconds": None,
-                        }
-
-            # Phase 2: number pagination
+                        return {"action": "click_button", "target_button_row": row_idx,
+                                "target_button_col": col_idx,
+                                "target_button_text": getattr(btn, "text", None) or "",
+                                "reason": f"\u68c0\u6d4b\u5230\u7ffb\u9875\u6309\u94ae: {btn_text}",
+                                "wait_seconds": None}
             for row_idx, row in enumerate(rows):
                 btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
                 numbers = []
@@ -771,7 +734,6 @@ class UserRelay:
                 if len(numbers) >= 3:
                     all_digits = sorted([n for _, _, n in numbers])
                     last_clicked = exchange.get("_last_clicked_number")
-
                     if last_clicked is None:
                         target_num = 2 if 2 in all_digits else all_digits[1]
                     else:
@@ -779,41 +741,25 @@ class UserRelay:
                         if next_num > all_digits[-1]:
                             break
                         target_num = next_num
-
-                    target_str = str(target_num)
                     for col_idx, t, n in numbers:
                         if n == target_num:
                             exchange["_last_clicked_number"] = target_num
-                            return {
-                                "action": "click_button",
-                                "target_button_row": row_idx,
-                                "target_button_col": col_idx,
-                                "target_button_text": t,
-                                "reason": f"\u6570\u5b57\u7ffb\u9875\uff0c\u70b9\u51fb\u7b2c{target_num}\u9875 (\u6309\u94ae\u6587\u672c: {t})",
-                                "wait_seconds": None,
-                            }
+                            return {"action": "click_button", "target_button_row": row_idx,
+                                    "target_button_col": col_idx, "target_button_text": t,
+                                    "reason": f"\u6570\u5b57\u7ffb\u9875\u7b2c{target_num}\u9875",
+                                    "wait_seconds": None}
                     break
-
-            # Phase 3: icon-only — click rightmost button with callback_data
             for row_idx in range(len(rows) - 1, -1, -1):
                 row = rows[row_idx]
                 if not row.buttons:
                     continue
                 btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
-                all_empty = all(not t for t in btn_texts)
-                if all_empty:
+                if all(not t for t in btn_texts):
                     last_btn = row.buttons[-1]
                     if getattr(last_btn, "data", None):
-                        return {
-                            "action": "click_button",
-                            "target_button_row": row_idx,
-                            "target_button_col": len(row.buttons) - 1,
-                            "target_button_text": "",
-                            "reason": "\u7eaf\u56fe\u6807\uff0c\u70b9\u51fb\u6700\u53f3\u4fa7\u6309\u94ae",
-                            "wait_seconds": None,
-                        }
-
-            # Phase 4: any remaining callback button as potential next
+                        return {"action": "click_button", "target_button_row": row_idx,
+                                "target_button_col": len(row.buttons) - 1, "target_button_text": "",
+                                "reason": "\u7eaf\u56fe\u6807", "wait_seconds": None}
             clicked = exchange.get("_clicked_buttons") or set()
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
@@ -823,27 +769,19 @@ class UserRelay:
                             continue
                         if (row_idx, col_idx) in clicked:
                             continue
-                        return {
-                            "action": "click_button",
-                            "target_button_row": row_idx,
-                            "target_button_col": col_idx,
-                            "target_button_text": getattr(btn, "text", None) or "",
-                            "reason": f"\u5c1d\u8bd5\u70b9\u51fb\u5269\u4f59\u6309\u94ae: {btn_text}",
-                            "wait_seconds": None,
-                        }
-
-        return {
-            "action": "finish", "target_button_row": None,
-            "target_button_col": None, "target_button_text": None,
-            "reason": "\u65e0\u7ffb\u9875\u6309\u94ae\uff0c\u7ed3\u675f\u6536\u96c6",
-            "wait_seconds": None,
-        }
+                        return {"action": "click_button", "target_button_row": row_idx,
+                                "target_button_col": col_idx,
+                                "target_button_text": getattr(btn, "text", None) or "",
+                                "reason": f"\u5c1d\u8bd5\u70b9\u51fb: {btn_text}",
+                                "wait_seconds": None}
+        return {"action": "finish", "target_button_row": None, "target_button_col": None,
+                "target_button_text": None, "reason": "\u65e0\u7ffb\u9875\u6309\u94ae",
+                "wait_seconds": None}
 
     async def _click_button(self, bot_username: str, row: int, col: int) -> bool:
         exchange = self._bot_exchange.get(bot_username)
         if not exchange:
             return False
-
         keyboard_msg = exchange.get("_keyboard_msg")
         if not keyboard_msg or not keyboard_msg.reply_markup:
             for ev in reversed(exchange.get("events", [])):
@@ -853,112 +791,64 @@ class UserRelay:
                     exchange["_keyboard_msg"] = msg
                     break
         if not keyboard_msg or not keyboard_msg.reply_markup:
-            logger.warning(f"[UserRelay] 无可用键盘消息 (bot={bot_username})")
             return False
-
         reply_markup = keyboard_msg.reply_markup
         if not hasattr(reply_markup, "rows"):
             return False
-
         try:
             target_row = reply_markup.rows[row]
             target_btn = target_row.buttons[col]
         except (IndexError, AttributeError):
-            logger.warning(f"[UserRelay] 按钮位置无效: row={row}, col={col}")
             return False
-
         exchange.pop("_keyboard_msg", None)
-
         try:
             if hasattr(target_btn, "data") and target_btn.data:
                 await keyboard_msg.click(data=target_btn.data)
-                btn_text = getattr(target_btn, "text", "") or "(无文字/图标按钮)"
-                logger.info(f"[UserRelay] 已点击按钮 [{row},{col}] {btn_text}")
                 return True
-
             if hasattr(target_btn, "url") and target_btn.url:
                 url = str(target_btn.url)
-                btn_text = getattr(target_btn, "text", "") or "(URL按钮)"
-                logger.info(f"[UserRelay] 检测到 URL 按钮 [{row},{col}] {btn_text}, url={url}")
                 if "t.me/" in url or "telegram.me/" in url:
                     from urllib.parse import urlparse, parse_qs
                     parsed = urlparse(url)
                     params = parse_qs(parsed.query)
                     start_param = params.get("start", [None])[0]
                     if start_param:
-                        entity = await self._client.get_entity(
-                            parsed.path.strip("/")
-                        )
+                        entity = await self._client.get_entity(parsed.path.strip("/"))
                         await self._client.send_message(entity, f"/start {start_param}")
-                        logger.info(f"[UserRelay] 已通过 deep link 翻页: /start {start_param}")
                         return True
-                logger.warning(f"[UserRelay] URL 按钮无法点击 (非 t.me 链接): {url}")
                 return False
-
-            btn_text = getattr(target_btn, "text", "") or "(未知类型)"
-            logger.warning(
-                f"[UserRelay] 按钮 [{row},{col}] 类型不支持: {type(target_btn).__name__}"
-            )
             return False
         except FloodWaitError as e:
-            wait_seconds = e.seconds
-            logger.warning(
-                f"[UserRelay] 触发 FloodWait，需要等待 {wait_seconds} 秒 "
-                f"(bot={bot_username})"
-            )
-            exchange["_min_click_interval"] = max(
-                exchange.get("_min_click_interval", 0), wait_seconds
-            )
-            await asyncio.sleep(wait_seconds)
+            await asyncio.sleep(e.seconds)
             try:
                 if hasattr(target_btn, "data") and target_btn.data:
                     await keyboard_msg.click(data=target_btn.data)
-                    btn_text = getattr(target_btn, "text", "") or "(无文字/图标按钮)"
-                    logger.info(
-                        f"[UserRelay] FloodWait 后重试成功 [{row},{col}] {btn_text}"
-                    )
                     return True
-                return False
-            except Exception as retry_e:
-                logger.error(
-                    f"[UserRelay] FloodWait 后重试点击失败 [{row},{col}]: {retry_e}"
-                )
-                return False
-        except Exception as e:
-            logger.error(f"[UserRelay] 点击按钮失败 [{row},{col}]: {e}")
+            except Exception:
+                pass
+            return False
+        except Exception:
             return False
 
     async def _process_all_collected(self, bot_username: str):
         exchange = self._bot_exchange.pop(bot_username, None)
         if not exchange:
             return
-
         user_id = exchange.get("user_id")
         code = exchange.get("code")
         all_events = exchange.get("events", [])
-
-        logger.info(
-            f"[UserRelay] 处理全部已收集文件: user={user_id}, code={code}, "
-            f"events={len(all_events)}"
-        )
-
         if not all_events:
-            logger.warning(
-                f"[UserRelay] 目标机器人 @{bot_username} 未返回任何文件 "
-                f"(user={user_id}, code={code})"
-            )
             if self._decoder_bot_entity:
                 try:
                     await self._client.send_message(
                         self._decoder_bot_entity,
                         f"RELAY_ERROR:{user_id}:{code}:目标机器人未返回任何文件",
                     )
-                except Exception as e:
-                    logger.error(f"[UserRelay] 通知解码机器人失败: {e}")
+                except Exception:
+                    pass
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
             return
-
         from database import get_file_records_col
         try:
             await self._wait_all_cached(bot_username, timeout=60)
@@ -974,61 +864,13 @@ class UserRelay:
                 record = await files_col.find_one({"file_code": code})
                 if record:
                     break
-                if retry < 5:
-                    logger.info(
-                        f"[UserRelay] DB 暂无记录 (code={code})，等待后台缓存 "
-                        f"(第{retry+1}次重试)"
-                    )
             if not record:
-                logger.warning(f"[UserRelay] DB 始终无记录 (code={code})")
                 if self._pending_cleanup:
                     self._pending_cleanup(bot_username)
                 return
-
             batch_ids_str = record.get("batch_msg_ids") or ""
             if not isinstance(batch_ids_str, str):
                 batch_ids_str = str(batch_ids_str)
-            bfm = record.get("batch_file_meta", "")
-            if isinstance(bfm, list):
-                bfm_len = len(bfm)
-            elif isinstance(bfm, str) and bfm:
-                try:
-                    bfm_len = len(json.loads(bfm))
-                except (json.JSONDecodeError, TypeError):
-                    bfm_len = 0
-            else:
-                bfm_len = 0
-            logger.info(
-                f"[UserRelay] DB记录 (code={code}): primary_mid={record.get('primary_channel_msg_id')}, "
-                f"batch_ids_str={batch_ids_str}, "
-                f"batch_file_meta_len={bfm_len}"
-            )
-
-            bfm_parsed = None
-            if isinstance(bfm, list):
-                bfm_parsed = bfm
-            elif isinstance(bfm, str) and bfm:
-                try:
-                    bfm_parsed = json.loads(bfm)
-                except (json.JSONDecodeError, TypeError):
-                    bfm_parsed = []
-
-            if bfm_parsed and isinstance(bfm_parsed, list):
-                healed = await self._self_heal_file_ids(code, bfm_parsed)
-                if healed > 0:
-                    fids_update = {}
-                    fids_list = [e.get("file_id", "") for e in bfm_parsed
-                                 if isinstance(e, dict) and e.get("file_id")]
-                    fids_update["file_ids"] = ",".join(fids_list)
-                    fids_update["batch_file_meta"] = json.dumps(bfm_parsed)
-                    await files_col.update_one(
-                        {"file_code": code}, {"$set": fids_update}
-                    )
-                    logger.info(
-                        f"[UserRelay] 自修复已保存: code={code}, "
-                        f"修复了 {healed} 个 file_id"
-                    )
-
             msg_ids = []
             primary_mid = record.get("primary_channel_msg_id")
             if primary_mid:
@@ -1037,28 +879,18 @@ class UserRelay:
                 m = mid.strip()
                 if m and m not in msg_ids:
                     msg_ids.append(m)
-
             if not msg_ids:
-                logger.warning(f"[UserRelay] 无存储 msg_id (code={code})")
                 if self._pending_cleanup:
                     self._pending_cleanup(bot_username)
                 return
-
             storage_ids_str = ",".join(msg_ids)
-
             if self._decoder_bot_entity:
                 await self._client.send_message(
                     self._decoder_bot_entity,
                     f"RELAY_BATCH:{user_id}:{code}\nSTORAGE_IDS:{storage_ids_str}",
                 )
-                logger.info(
-                    f"[UserRelay] 已通知解码机器人: user={user_id}, code={code}, "
-                    f"{len(msg_ids)} 个缓存文件"
-                )
-
         except Exception as e:
-            logger.error(f"[UserRelay] 处理收集文件失败 (code={code}): {e}")
-
+            logger.error(f"[RelayInstance:{self.phone}] 处理收集文件失败 (code={code}): {e}")
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)
 
@@ -1074,129 +906,43 @@ class UserRelay:
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)
 
-    async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
-        if not self._client:
-            return False
-
-        try:
-            entity = await self._client.get_entity(bot_username)
-            logger.info(
-                f"[UserRelay] 目标实体: {type(entity).__name__}, "
-                f"id={getattr(entity, 'id', '?')}, "
-                f"username=@{getattr(entity, 'username', '?')}"
-            )
-            await self._client.send_message(entity, code)
-            now = asyncio.get_event_loop().time()
-            self._bot_exchange[bot_username.lower()] = {
-                "user_id": user_id,
-                "code": code,
-                "events": [],
-                "_expires": now + 120,
-                "_settle_task": None,
-                "_ai_running": False,
-                "_keyboard_msg": None,
-                "_last_clicked_number": None,
-                "_clicked_buttons": set(),
-                "_min_click_interval": 0,
-                "_last_click_time": 0,
-            }
-            self._restart_settle(
-                self._bot_exchange[bot_username.lower()], bot_username.lower(),
-                settle_wait=_INITIAL_SETTLE_WAIT,
-            )
-            logger.info(f"[UserRelay] 已向 @{bot_username} 发送外部码，等待响应 (user={user_id}, code={code})")
-            return True
-        except Exception as e:
-            logger.error(f"[UserRelay] 向 @{bot_username} 发送失败: {e}")
-            return False
-
     async def deliver_cached(self, user_id: int, code: str) -> bool:
         if not self._client:
-            logger.warning(f"[UserRelay] 无法交付缓存: 客户端未就绪")
             return False
-
         try:
             from database import get_file_records_col
             col = get_file_records_col()
             record = await col.find_one({"file_code": code})
             if not record:
-                logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无记录")
                 return False
-
             file_ids_str = record.get("file_ids", "") or ""
             if not isinstance(file_ids_str, str):
                 file_ids_str = str(file_ids_str)
             file_ids = [f.strip() for f in file_ids_str.split(",") if f.strip()]
-
             if file_ids:
-                logger.info(
-                    f"[UserRelay] 缓存交付: 码 {code}, {len(file_ids)} 条 file_id, 目标用户 {user_id}"
-                )
                 if self._decoder_bot_entity:
                     for fid in file_ids:
                         try:
                             await self._client.send_file(self._decoder_bot_entity, fid)
-                        except Exception as e:
-                            logger.error(f"[UserRelay] 发送 file_id 到解码机器人失败: {e}")
-                if self._decoder_bot_entity:
+                        except Exception:
+                            pass
                     await self._client.send_message(
                         self._decoder_bot_entity,
                         f"RELAY_DELIVER:{user_id}:{code}",
                     )
-                    logger.info(f"[UserRelay] 已通知解码机器人代发给用户 {user_id}")
                 return True
-
-            logger.warning(
-                f"[UserRelay] 缓存交付: 码 {code} 无 file_id，记录已过期，清除并通知重新请求"
-            )
+            # expired
             await col.delete_one({"file_code": code})
             if self._decoder_bot_entity:
                 await self._client.send_message(
                     self._decoder_bot_entity,
                     f"RELAY_RENEW:{user_id}:{code}",
                 )
-                logger.info(f"[UserRelay] 已通知解码机器人: 码 {code} 需重新请求")
             return False
-
         except Exception as e:
-            logger.error(f"[UserRelay] 缓存交付失败 (code={code}, user={user_id}): {e}")
+            logger.error(f"[RelayInstance:{self.phone}] 缓存交付失败 (code={code}): {e}")
             return False
 
-    async def stop(self):
+    async def shutdown(self):
         if self._client:
             await self._client.disconnect()
-            await self._report_status("offline")
-            logger.info("[UserRelay] 已断开连接")
-
-
-# ─── 向后兼容 ──────────────────────────────────────────────────────
-# decoder_bot.py 仍使用此单例，自动委托给 relay_pool 中的第一个就绪实例
-
-user_relay = UserRelay()
-
-# 动态属性代理：让旧代码能正常工作
-@property
-def _is_ready_prop(self) -> bool:
-    from services.relay_pool import relay_pool
-    if relay_pool.instances:
-        return any(i.is_ready for i in relay_pool.instances)
-    return False
-
-
-@property
-def _relay_user_id_prop(self) -> int | None:
-    from services.relay_pool import relay_pool
-    for i in relay_pool.instances:
-        if i.is_ready:
-            return i.relay_user_id
-    return None
-
-
-def _set_pending_cleanup_proxy(self, callback):
-    # 旧代码调此方法，但 relay_pool 不需要
-    pass
-
-
-user_relay.is_ready = _is_ready_prop.fget  # type: ignore
-user_relay.relay_user_id = _relay_user_id_prop.fget  # type: ignore
-user_relay.set_pending_cleanup = _set_pending_cleanup_proxy  # type: ignore

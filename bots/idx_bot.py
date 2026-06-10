@@ -33,10 +33,10 @@ from database import (
 )
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
+from services.relay_pool import relay_pool
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
-from services.user_relay import user_relay
 
 TOKEN = settings.DECODER_BOT_TOKEN
 
@@ -69,7 +69,8 @@ def _cleanup_stale_pending():
         del _pending_external[bot]
 
 
-user_relay.set_pending_cleanup(lambda bot_username: _dequeue_external(bot_username))
+def _relay_pending_cleanup(bot_username: str):
+    _dequeue_external(bot_username)
 
 _external_media_groups: dict[str, tuple[int, str, float]] = {}
 _MEDIA_GROUP_TTL = 300
@@ -290,8 +291,6 @@ async def _cache_external_file(code: str, message_id: int):
 async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
-        return
-    if not user_relay.relay_user_id or update.effective_user.id != user_relay.relay_user_id:
         return
 
     is_renew = text.startswith("RELAY_RENEW:")
@@ -620,12 +619,14 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if result.is_external:
-        if user_relay.is_ready and user_relay.relay_user_id:
-            from utils.code_decoder import is_likely_bot_api_file_id
-            if is_likely_bot_api_file_id(text):
-                await user_relay.deliver_cached(user.id, text)
-                await update.message.reply_text("正在发送文件，请稍候...")
-                return
+        from utils.code_decoder import is_likely_bot_api_file_id
+        if is_likely_bot_api_file_id(text) and relay_pool.instances:
+            # 选择任意一个就绪的实例来交付缓存
+            for inst in relay_pool.instances:
+                if inst.is_ready:
+                    await inst.deliver_cached(user.id, text)
+                    await update.message.reply_text("正在发送文件，请稍候...")
+                    return
         await handle_external_code(update, context, user.id, text, result)
         return
 
@@ -741,9 +742,20 @@ async def handle_external_code(update, context, user_id, code, result):
         parts.append(f"外部码剩余：{result.remaining_external_quota}")
     remaining_info = " | ".join(parts)
 
-    if user_relay.is_ready:
-        ok = await user_relay.send_external_code(bot_username, code, user_id)
+    # 从账号池获取最优中继账号
+    account = None
+    for inst in relay_pool.instances:
+        if inst.is_ready:
+            account = inst
+            break
+
+    if account:
+        import time as _time
+        start = _time.time()
+        ok = await account.send_external_code(bot_username, code, user_id)
+        duration_ms = int((_time.time() - start) * 1000)
         if ok:
+            await relay_pool.release_account(account, duration_ms)
             _enqueue_external(bot_username, user_id, code)
             await update.message.reply_text(f"正在查询外部文件码，请稍候查收。\n{remaining_info}")
             metrics.decode_count += 1
@@ -814,10 +826,6 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
 async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caption = (update.message.caption or "").strip()
     if not caption.startswith("RELAY_FILE:"):
-        return False
-    if not user_relay.relay_user_id or not update.effective_user:
-        return False
-    if update.effective_user.id != user_relay.relay_user_id:
         return False
 
     rest = caption[len("RELAY_FILE:"):]
@@ -990,7 +998,7 @@ def run():
     loop.create_task(health_ping())
     loop.create_task(_process_pending_uploads(app))
     loop.create_task(cleanup_loop())
-    loop.create_task(user_relay.start())
+    loop.create_task(relay_pool.start_all())
     from database.cache import dump_cache_to_disk_loop
     loop.create_task(dump_cache_to_disk_loop())
     from database import cleanup_old_records
