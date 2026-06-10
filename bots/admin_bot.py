@@ -17,7 +17,7 @@ from database import (
     get_backup_channels, set_backup_channels,
     get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
     get_config, set_config,
-    get_relay_config, set_relay_config, get_relay_status,
+    get_relay_config, set_relay_config,
     get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
     get_all_bot_decode_intervals, set_bot_decode_interval, delete_bot_decode_interval,
 )
@@ -213,7 +213,6 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
 async def _get_relay_status_text() -> str:
     from services.relay_pool import relay_pool
     pending = await get_config("relay_auth_pending")
-    status = await get_relay_status()
 
     if not relay_pool._initialized:
         try:

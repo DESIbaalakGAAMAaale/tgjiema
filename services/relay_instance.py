@@ -101,16 +101,8 @@ class RelayInstance:
             logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram 账号")
 
             code = ""
-            if settings.RELAY_CODES:
-                codes = [c.strip() for c in settings.RELAY_CODES.split(",") if c.strip()]
-                idx = 0
-                try:
-                    phones = [p.strip() for p in settings.RELAY_PHONES.split(",") if p.strip()]
-                    idx = phones.index(self.phone) if self.phone in phones else 0
-                except (ValueError, AttributeError):
-                    idx = 0
-                if idx < len(codes):
-                    code = codes[idx]
+            if settings.RELAY_CODE:
+                code = settings.RELAY_CODE.strip()
 
             if not code:
                 logger.info(f"[RelayInstance:{self.phone}] 验证码未设置，等待管理员提交...")
@@ -123,7 +115,7 @@ class RelayInstance:
                 return
 
             try:
-                await self._client.sign_in(phone, code)
+                await self._client.sign_in(self.phone, code)
             except SessionPasswordNeededError:
                 logger.error(
                     f"[RelayInstance:{self.phone}] 该账号开启了二步验证，暂不支持"
@@ -164,7 +156,7 @@ class RelayInstance:
         self.api_hash = api_hash
         self.phone = phone
 
-        if not self._client or self._client.is_connected():
+        if not self._client or not self._client.is_connected():
             self._client = TelegramClient(self._session_path, api_id, api_hash)
             await self._client.connect()
         else:
@@ -177,7 +169,7 @@ class RelayInstance:
             if not code:
                 raise RuntimeError("验证码获取失败")
             try:
-                await self._client.sign_in(phone, code)
+                await self._client.sign_in(self.phone, code)
             except SessionPasswordNeededError:
                 raise RuntimeError("账号开启二步验证，暂不支持")
 

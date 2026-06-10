@@ -45,49 +45,21 @@ class RelayPool:
     async def _init_from_settings(self):
         """从 .env 配置初始化（兼容旧单账号模式）"""
         from config import settings
-        ids = [s.strip() for s in settings.RELAY_API_IDS.split(",") if s.strip()]
-        hashes = [s.strip() for s in settings.RELAY_API_HASHES.split(",") if s.strip()]
-        phones = [s.strip() for s in settings.RELAY_PHONES.split(",") if s.strip()]
+        api_id = settings.RELAY_API_ID
+        api_hash = settings.RELAY_API_HASH
+        phone = settings.RELAY_PHONE
 
-        # 如果配置了多账号，先检查本地是否已有
-        if len(phones) > 1:
+        if api_id and api_hash and phone:
             db = await get_relay_db()
-            existing = await db.get_all_accounts()
-            existing_phones = {a["phone"] for a in existing}
-            new_phones = [p for p in phones if p not in existing_phones]
-            for i, phone in enumerate(new_phones):
-                api_id = int(ids[i]) if i < len(ids) else 0
-                api_hash = hashes[i] if i < len(hashes) else ""
-                if api_id and api_hash:
-                    await db.add_account(api_id, api_hash, phone)
-                    logger.info(f"[RelayPool] 新增中继账号: {phone}")
-            # 重新加载
-            accounts = await db.get_active_accounts()
-            for acct in accounts:
-                instance = RelayInstance(
-                    account_id=acct["id"],
-                    api_id=acct["api_id"],
-                    api_hash=acct["api_hash"],
-                    phone=acct["phone"],
-                )
-                self.instances.append(instance)
-            logger.info(f"[RelayPool] 从配置加载 {len(self.instances)} 个中继账号")
-        elif phones:
-            # 单账号兼容模式
-            api_id = int(ids[0]) if ids else 0
-            api_hash = hashes[0] if hashes else ""
-            phone = phones[0]
-            if api_id and api_hash and phone:
-                db = await get_relay_db()
-                db_row = await db.add_account(api_id, api_hash, phone)
-                instance = RelayInstance(
-                    account_id=db_row,
-                    api_id=api_id,
-                    api_hash=api_hash,
-                    phone=phone,
-                )
-                self.instances.append(instance)
-                logger.info(f"[RelayPool] 单账号兼容模式: {phone}")
+            db_row = await db.add_account(api_id, api_hash, phone)
+            instance = RelayInstance(
+                account_id=db_row,
+                api_id=api_id,
+                api_hash=api_hash,
+                phone=phone,
+            )
+            self.instances.append(instance)
+            logger.info(f"[RelayPool] 单账号兼容模式: {phone}")
 
         self._initialized = True
 
@@ -140,7 +112,7 @@ class RelayPool:
         chosen = scores[0][1]
         logger.debug(
             f"[RelayPool] 选择账号 {chosen.phone} (score={scores[0][0]:.2f}, "
-            f"today_req={scores[0][0]}, avg_wait={chosen.account_id})"
+            f"today_req={today_req}, avg_wait={avg_wait})"
         )
         return chosen
 

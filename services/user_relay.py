@@ -35,14 +35,21 @@ class UserRelay:
 
     @property
     def is_ready(self) -> bool:
+        from services.relay_pool import relay_pool
+        if relay_pool.instances:
+            return any(i.is_ready for i in relay_pool.instances)
         return self._ready.is_set()
 
     @property
     def relay_user_id(self) -> int | None:
+        from services.relay_pool import relay_pool
+        for i in relay_pool.instances:
+            if i.is_ready:
+                return i.relay_user_id
         return self._relay_user_id
 
     def set_pending_cleanup(self, callback):
-        self._pending_cleanup = callback
+        pass
 
     async def _report_status(self, status: str):
         try:
@@ -1173,30 +1180,3 @@ class UserRelay:
 # decoder_bot.py 仍使用此单例，自动委托给 relay_pool 中的第一个就绪实例
 
 user_relay = UserRelay()
-
-# 动态属性代理：让旧代码能正常工作
-@property
-def _is_ready_prop(self) -> bool:
-    from services.relay_pool import relay_pool
-    if relay_pool.instances:
-        return any(i.is_ready for i in relay_pool.instances)
-    return False
-
-
-@property
-def _relay_user_id_prop(self) -> int | None:
-    from services.relay_pool import relay_pool
-    for i in relay_pool.instances:
-        if i.is_ready:
-            return i.relay_user_id
-    return None
-
-
-def _set_pending_cleanup_proxy(self, callback):
-    # 旧代码调此方法，但 relay_pool 不需要
-    pass
-
-
-user_relay.is_ready = _is_ready_prop.fget  # type: ignore
-user_relay.relay_user_id = _relay_user_id_prop.fget  # type: ignore
-user_relay.set_pending_cleanup = _set_pending_cleanup_proxy  # type: ignore
