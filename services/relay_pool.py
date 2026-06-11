@@ -110,9 +110,12 @@ class RelayPool:
         # 按 score 升序排列，选最低的
         scores.sort(key=lambda x: x[0])
         chosen = scores[0][1]
+        # 从 scores[0] 提取被选中账号的统计数据
+        chosen_score, chosen_usage = scores[0]
         logger.debug(
-            f"[RelayPool] 选择账号 {chosen.phone} (score={scores[0][0]:.2f}, "
-            f"today_req={today_req}, avg_wait={avg_wait})"
+            f"[RelayPool] 选择账号 {chosen.phone} "
+            f"(today_req={chosen_usage['today_requests']}, "
+            f"avg_wait={chosen_usage['avg_wait_ms']:.0f}ms)"
         )
         return chosen
 

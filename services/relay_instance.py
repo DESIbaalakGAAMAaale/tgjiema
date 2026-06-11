@@ -393,6 +393,10 @@ class RelayInstance:
             return "audio"
         if hasattr(msg, "animation") and msg.animation:
             return "animation"
+        if hasattr(msg, "gif") and msg.gif:
+            return "animation"
+        if hasattr(msg, "sticker") and msg.sticker:
+            return "sticker"
         if hasattr(msg, "document") and msg.document:
             mime = getattr(msg.document, "mime_type", "") or ""
             if "video" in mime:

@@ -220,7 +220,7 @@ async def _get_relay_status_text() -> str:
         except Exception:
             pass
 
-    msg = "� 中继账号池状态\n\n"
+    msg = "🔐 中继账号池状态\n\n"
     pool_status = await relay_pool.get_pool_status()
     if not pool_status:
         msg += "⚠️ 无中继账号\n"
