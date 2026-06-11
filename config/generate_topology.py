@@ -1,11 +1,13 @@
-"""拓扑生成器 — 从 config/groups.yaml 自动生成 config/topology.yaml
+"""拓扑生成器 — 跨账号交替换位分组
 
-新设计：
-- 用户只需提供账号 + 频道列表
-- 每 3 个频道自动编为一组 (Active, Shadow1, Shadow2)
-- 环形链表指针完全自动计算
+配对策略（2 个账号）:
+  奇数组: Active(账号1) + Shadow1(账号2) + Shadow2(账号2)
+  偶数组: Active(账号2) + Shadow1(账号1) + Shadow2(账号1)
 
-用法：
+确保每组 Active 和 Shadow 分布在不同的 Telegram 账号上，
+任何一个账号被封，另一账号的 Shadow 可以无缝顶上。
+
+用法:
     python config/generate_topology.py
 """
 
@@ -30,44 +32,123 @@ def generate(groups_path: str = None, output_path: str = None):
         print("[错误] groups.yaml 中没有配置任何账号")
         sys.exit(1)
 
-    # ── 扁平化：按账号顺序，每 3 个频道为一组 ──
-    groups = []  # [(group_id, active_ch, shadow1_ch, shadow2_ch, is_r100)]
-    group_idx = 0
+    # ── 收集各账号频道 ──
+    account_pools = []
+    for acct in accounts:
+        chs = acct.get("channels", [])
+        account_pools.append({
+            "name": acct.get("name", "未知"),
+            "channels": list(chs),
+            "cursor": 0,
+        })
 
-    for account in accounts:
-        channels = account.get("channels", [])
-        account_name = account.get("name", "未知账号")
+    total_channels = sum(len(p["channels"]) for p in account_pools)
 
-        if len(channels) % 3 != 0:
-            print(f"[警告] {account_name}: 频道数 ({len(channels)}) 不是 3 的倍数，")
-            print(f"        末尾 {len(channels) % 3} 个频道将被忽略")
+    if len(account_pools) == 1:
+        _generate_single_account(account_pools, cfg, output_path)
+        return
 
-        for i in range(0, len(channels) - 2, 3):
-            group_idx += 1
+    if len(account_pools) != 2:
+        print(f"[错误] 当前仅支持 2 个账号的跨账号配对，检测到 {len(account_pools)} 个")
+        sys.exit(1)
+
+    master = account_pools[0]
+    slave = account_pools[1]
+
+    if len(master["channels"]) != len(slave["channels"]):
+        print(f"[错误] 两个账号频道数必须相同: {master['name']}={len(master['channels'])}, {slave['name']}={len(slave['channels'])}")
+        sys.exit(1)
+
+    ch_count = len(master["channels"])
+    if ch_count % 3 != 0:
+        print(f"[错误] 每个账号频道数必须是 3 的倍数，当前: {ch_count}")
+        sys.exit(1)
+
+    group_count = total_channels // 3
+    mi = 0  # master channel index
+    si = 0  # slave channel index
+
+    groups = []  # [{id, account, active, shadow1, shadow2, r100}]
+
+    for g in range(1, group_count + 1):
+        if g % 2 == 1:
+            # 奇数组: Active 来自 master, Shadow 来自 slave
+            a = master["channels"][mi]
+            s1 = slave["channels"][si]
+            s2 = slave["channels"][si + 1]
+            mi += 1
+            si += 2
             groups.append({
-                "id": group_idx,
-                "account": account_name,
-                "active": channels[i],
-                "shadow1": channels[i + 1],
-                "shadow2": channels[i + 2],
+                "id": g,
+                "account": f"{master['name']}(A) / {slave['name']}(S)",
+                "active": a,
+                "shadow1": s1,
+                "shadow2": s2,
+                "r100": False,
+            })
+        else:
+            # 偶数组: Active 来自 slave, Shadow 来自 master
+            a = slave["channels"][si]
+            s1 = master["channels"][mi]
+            s2 = master["channels"][mi + 1]
+            si += 1
+            mi += 2
+            groups.append({
+                "id": g,
+                "account": f"{slave['name']}(A) / {master['name']}(S)",
+                "active": a,
+                "shadow1": s1,
+                "shadow2": s2,
                 "r100": False,
             })
 
-    if not groups:
-        print("[错误] 未生成任何拓扑组，请检查频道配置")
-        sys.exit(1)
-
-    # ── R100: 最后一组或指定组 ──
+    # ── R100: 最后一组 ──
     mon_cfg = cfg.get("mon", {})
     r100_group = mon_cfg.get("r100_group", -1)
     if r100_group == -1:
-        r100_group = len(groups)
-    if 1 <= r100_group <= len(groups):
+        r100_group = group_count
+    if 1 <= r100_group <= group_count:
         groups[r100_group - 1]["r100"] = True
 
     # ── 生成槽位 ──
+    _write_topology(accounts, groups, mon_cfg, output_path)
+
+
+def _generate_single_account(account_pools, cfg, output_path):
+    """单账号模式：简单顺序分组，无跨账号冗余。"""
+    pool = account_pools[0]
+    chs = pool["channels"]
+    if len(chs) % 3 != 0:
+        print(f"[错误] 频道数必须是 3 的倍数，当前: {len(chs)}")
+        sys.exit(1)
+
+    group_count = len(chs) // 3
+    groups = []
+    for g in range(group_count):
+        off = g * 3
+        groups.append({
+            "id": g + 1,
+            "account": pool["name"],
+            "active": chs[off],
+            "shadow1": chs[off + 1],
+            "shadow2": chs[off + 2],
+            "r100": False,
+        })
+
+    mon_cfg = cfg.get("mon", {})
+    r100_group = mon_cfg.get("r100_group", -1)
+    if r100_group == -1:
+        r100_group = group_count
+    if 1 <= r100_group <= group_count:
+        groups[r100_group - 1]["r100"] = True
+
+    _write_topology([pool], groups, mon_cfg, output_path)
+
+
+def _write_topology(accounts, groups, mon_cfg, output_path):
+    """将分组信息写入 topology.yaml。"""
     slots = []
-    active_channel_ids = []  # [(slot_id, channel_id)]
+    active_channel_ids = []
 
     for g in groups:
         gn = g["id"]
@@ -78,7 +159,6 @@ def generate(groups_path: str = None, output_path: str = None):
         s2id = f"s{gn}b"
         a_status = "r100" if is_r100 else "active"
 
-        # shadow2 → 同组 active
         s2_entry = {
             "slot_id": s2id,
             "channel_id": g["shadow2"],
@@ -89,7 +169,6 @@ def generate(groups_path: str = None, output_path: str = None):
         if is_r100:
             s2_entry["is_r100"] = True
 
-        # shadow1
         s1_entry = {
             "slot_id": s1id,
             "channel_id": g["shadow1"],
@@ -98,7 +177,6 @@ def generate(groups_path: str = None, output_path: str = None):
             "prev_slot_id": aid,
         }
 
-        # active（next 待填充—指向下一组 active）
         a_entry = {
             "slot_id": aid,
             "channel_id": g["active"],
@@ -126,6 +204,7 @@ def generate(groups_path: str = None, output_path: str = None):
         "# 环形冗余拓扑配置（自动生成，请勿手动编辑）",
         f"# 源文件: config/groups.yaml",
         f"# 共 {len(accounts)} 个账号，{len(groups)} 组，{len(slots)} 个槽位",
+        f"# 配对策略: 奇数组 Active(账号1)/Shadow(账号2), 偶数组反之",
         "#",
         "slots:",
     ]
@@ -154,6 +233,7 @@ def generate(groups_path: str = None, output_path: str = None):
 
     lines.append("# Mon 监控配置")
     lines.append("mon:")
+    lines.append(f"  active_count: {mon_cfg.get('active_count', 3)}")
     lines.append(f"  heartbeat_interval: {mon_cfg.get('heartbeat_interval', 30)}")
     lines.append(f"  heartbeat_timeout: {mon_cfg.get('heartbeat_timeout', 90)}")
     lines.append(f"  degrade_cooldown: {mon_cfg.get('degrade_cooldown', 300)}")
@@ -162,7 +242,9 @@ def generate(groups_path: str = None, output_path: str = None):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
+    # ── 汇总 ──
     print(f"[生成] {len(accounts)} 个账号 → {len(groups)} 组 → {len(slots)} 个槽位")
+    print(f"[策略] 跨账号交替换位: 每组 Active/Shadow 在不同账号上")
     print(f"[输出] {output_path}")
     print(f"[下一步] python admin/seed_topology.py --yes")
 

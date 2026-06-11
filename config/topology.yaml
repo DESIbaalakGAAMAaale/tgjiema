@@ -1,126 +1,128 @@
 # 环形冗余拓扑配置（自动生成，请勿手动编辑）
 # 源文件: config/groups.yaml
 # 共 2 个账号，6 组，18 个槽位
+# 配对策略: 奇数组 Active(账号1)/Shadow(账号2), 偶数组反之
 #
 slots:
-  # ─── 组 1 — 账号1 ───
+  # ─── 组 1 — 账号1(A) / 账号2(S) ───
   - slot_id: "a1"
     channel_id: -1000000000001
     status: "active"
-    next_active_chat_id: -1000000000002
+    next_active_chat_id: -1000000000012
     prev_slot_id: "s1b"
 
   - slot_id: "s1a"
-    channel_id: -1000000000011
+    channel_id: -1000000000010
     status: "shadow1"
     next_active_chat_id: null
     prev_slot_id: "a1"
 
   - slot_id: "s1b"
-    channel_id: -1000000000012
+    channel_id: -1000000000011
     status: "shadow2"
     next_active_chat_id: -1000000000001
     prev_slot_id: "s1a"
 
-  # ─── 组 2 — 账号1 ───
+  # ─── 组 2 — 账号2(A) / 账号1(S) ───
   - slot_id: "a2"
-    channel_id: -1000000000002
+    channel_id: -1000000000012
     status: "active"
-    next_active_chat_id: -1000000000003
+    next_active_chat_id: -1000000000004
     prev_slot_id: "s2b"
 
   - slot_id: "s2a"
-    channel_id: -1000000000021
+    channel_id: -1000000000002
     status: "shadow1"
     next_active_chat_id: null
     prev_slot_id: "a2"
 
   - slot_id: "s2b"
-    channel_id: -1000000000022
+    channel_id: -1000000000003
     status: "shadow2"
-    next_active_chat_id: -1000000000002
+    next_active_chat_id: -1000000000012
     prev_slot_id: "s2a"
 
-  # ─── 组 3 — 账号1 ───
+  # ─── 组 3 — 账号1(A) / 账号2(S) ───
   - slot_id: "a3"
-    channel_id: -1000000000003
+    channel_id: -1000000000004
     status: "active"
-    next_active_chat_id: -1000000000004
+    next_active_chat_id: -1000000000015
     prev_slot_id: "s3b"
 
   - slot_id: "s3a"
-    channel_id: -1000000000031
+    channel_id: -1000000000013
     status: "shadow1"
     next_active_chat_id: null
     prev_slot_id: "a3"
 
   - slot_id: "s3b"
-    channel_id: -1000000000032
+    channel_id: -1000000000014
     status: "shadow2"
-    next_active_chat_id: -1000000000003
+    next_active_chat_id: -1000000000004
     prev_slot_id: "s3a"
 
-  # ─── 组 4 — 账号2 ───
+  # ─── 组 4 — 账号2(A) / 账号1(S) ───
   - slot_id: "a4"
-    channel_id: -1000000000004
+    channel_id: -1000000000015
     status: "active"
-    next_active_chat_id: -1000000000005
+    next_active_chat_id: -1000000000007
     prev_slot_id: "s4b"
 
   - slot_id: "s4a"
-    channel_id: -1000000000041
+    channel_id: -1000000000005
     status: "shadow1"
     next_active_chat_id: null
     prev_slot_id: "a4"
 
   - slot_id: "s4b"
-    channel_id: -1000000000042
+    channel_id: -1000000000006
     status: "shadow2"
-    next_active_chat_id: -1000000000004
+    next_active_chat_id: -1000000000015
     prev_slot_id: "s4a"
 
-  # ─── 组 5 — 账号2 ───
+  # ─── 组 5 — 账号1(A) / 账号2(S) ───
   - slot_id: "a5"
-    channel_id: -1000000000005
+    channel_id: -1000000000007
     status: "active"
-    next_active_chat_id: -1000000000006
+    next_active_chat_id: -1000000000018
     prev_slot_id: "s5b"
 
   - slot_id: "s5a"
-    channel_id: -1000000000051
+    channel_id: -1000000000016
     status: "shadow1"
     next_active_chat_id: null
     prev_slot_id: "a5"
 
   - slot_id: "s5b"
-    channel_id: -1000000000052
+    channel_id: -1000000000017
     status: "shadow2"
-    next_active_chat_id: -1000000000005
+    next_active_chat_id: -1000000000007
     prev_slot_id: "s5a"
 
-  # ─── 组 6 — 账号2 (R100) ───
+  # ─── 组 6 — 账号2(A) / 账号1(S) (R100) ───
   - slot_id: "a6"
-    channel_id: -1000000000006
+    channel_id: -1000000000018
     status: "r100"
     next_active_chat_id: -1000000000001
     prev_slot_id: "s6b"
     is_r100: true
 
   - slot_id: "s6a"
-    channel_id: -1000000000061
+    channel_id: -1000000000008
     status: "shadow1"
     next_active_chat_id: null
     prev_slot_id: "a6"
 
   - slot_id: "s6b"
-    channel_id: -1000000000062
+    channel_id: -1000000000009
     status: "shadow2"
-    next_active_chat_id: -1000000000006
+    next_active_chat_id: -1000000000018
     prev_slot_id: "s6a"
     is_r100: true
 
 # Mon 监控配置
 mon:
+  active_count: 3
   heartbeat_interval: 30
   heartbeat_timeout: 90
   degrade_cooldown: 300
