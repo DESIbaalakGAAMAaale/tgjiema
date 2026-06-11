@@ -12,6 +12,8 @@ from .models import (
     make_code_entry,
     make_job,
     make_rotate_log,
+    make_spare_channel,
+    make_rotation_config,
 )
 from .session import (
     init_db, close_db,
@@ -34,4 +36,7 @@ from .session import (
     log_rotate,
     get_external_code_mapping_col, get_system_code_for_external, set_external_code_mapping,
     cleanup_old_records,
+    get_spare_pool_col, add_spare_channel, get_spare_for_account, get_any_spare,
+    consume_spare, release_spare, remove_spare, list_spare_pool,
+    get_rotation_config_col, get_rotation_config, set_rotation_config,
 )

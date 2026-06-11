@@ -18,6 +18,8 @@ from database import (
     get_relay_config, set_relay_config,
     get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
     get_all_bot_decode_intervals, set_bot_decode_interval, delete_bot_decode_interval,
+    add_spare_channel, remove_spare_channel, list_spare_pool,
+    get_rotation_config, set_rotation_config,
 )
 from database.models import make_user
 from utils.monitor import metrics
@@ -138,30 +140,65 @@ async def _get_topology_text() -> str:
 
     msg = f"🔗 环形冗余拓扑\n\n"
     msg += f"📌 当前主频道: {active_channel}\n"
-    msg += f"📊 总槽位数: {len(cells)}\n\n"
+    msg += f"📊 总槽位数: {len(cells)}\n"
+
+    # 统计
+    active_count = len([c for c in cells if c.get("status") == "active"])
+    lost_count = len([c for c in cells if c.get("status") == "lost"])
+    shadow_count = len([c for c in cells if c.get("status") in ("shadow1", "shadow2")])
+    r100_count = len([c for c in cells if c.get("status") == "r100"])
+    msg += f"  🟢活跃: {active_count} | 🟡Shadow: {shadow_count} | 🔴R100: {r100_count}"
+    if lost_count:
+        msg += f" | ⚫失联: {lost_count}"
+    msg += "\n\n"
 
     if cells:
         by_group = {}
         for c in cells:
             sid = c.get("slot_id", "")
             # 从 slot_id 提取组号，如 a1 → 1, s2a → 2
-            import re
             m = re.match(r'[as](\d+)', sid)
             if m:
                 gn = int(m.group(1))
                 by_group.setdefault(gn, []).append(c)
 
+        # 按账号汇总
+        by_account = {}
+        for c in cells:
+            acc = c.get("account_name") or "未标注"
+            if acc not in ("?", ""):
+                by_account.setdefault(acc, []).append(c)
+
+        if len(by_account) > 1:
+            msg += "👤 账号分布:\n"
+            for acc, acc_cells in sorted(by_account.items()):
+                a_count = len([c for c in acc_cells if c.get("status") == "active"])
+                msg += f"  {acc}: {len(acc_cells)}个频道 (活跃: {a_count})\n"
+            msg += "\n"
+
         for gn in sorted(by_group.keys()):
             group = by_group[gn]
-            status_icons = {"active": "🟢", "r100": "🔴", "shadow1": "🟡", "shadow2": "🟠"}
+            status_icons = {"active": "🟢", "r100": "🔴", "shadow1": "🟡", "shadow2": "🟠", "lost": "⚫"}
             parts = []
             for c in group:
                 st = c.get("status", "?")
                 icon = status_icons.get(st, "⚪")
+                acc = c.get("account_name", "")
+                fc = c.get("file_count") or 0
                 parts.append(f"{icon}{c.get('slot_id')}: {c.get('channel_id')}")
             msg += f"  组{gn}: {' | '.join(parts)}\n"
     else:
         msg += "  (未加载拓扑，请运行 seed_topology.py)\n"
+
+    # 轮转配置
+    try:
+        from database import get_rotation_config
+        aws = await get_rotation_config("rotation_active_window_size") or "3"
+        fps = await get_rotation_config("rotation_files_per_slot") or "500"
+        tps = await get_rotation_config("rotation_time_per_slot") or "3600"
+        msg += f"\n⏳ 轮转配置: {aws}活态 | {fps}文件 | {tps}秒"
+    except Exception:
+        pass
 
     return msg
 
@@ -377,6 +414,9 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("⚙️ 系统配置", callback_data="menu:config")],
             [InlineKeyboardButton("🗺️ 文件码路由", callback_data="menu:code_route"),
              InlineKeyboardButton("⏱️ Bot限流", callback_data="menu:bot_limit")],
+            [InlineKeyboardButton("🔗 环形拓扑", callback_data="menu:topology"),
+             InlineKeyboardButton("🔄 备用池", callback_data="menu:spare")],
+            [InlineKeyboardButton("⏳ 轮转配置", callback_data="menu:rotation")],
         ]
         return text, InlineKeyboardMarkup(kb)
 
@@ -460,6 +500,30 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             [InlineKeyboardButton("➕ 新增限流", callback_data="interactive:set_bot_interval"),
              InlineKeyboardButton("➖ 删除限流", callback_data="interactive:remove_bot_interval")],
             [InlineKeyboardButton("📋 查看限流配置", callback_data="action:bot_intervals")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "topology":
+        text = "🔗 环形冗余拓扑 — 点击查看"
+        kb = [
+            [InlineKeyboardButton("📋 查看拓扑", callback_data="action:topology")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "spare":
+        text = "🔄 备用池管理\n\n管理备用频道池，封禁后自动补充空缺。"
+        kb = [
+            [InlineKeyboardButton("➕ 添加备用频道", callback_data="interactive:spare_add"),
+             InlineKeyboardButton("➖ 移除备用频道", callback_data="interactive:spare_remove")],
+            [InlineKeyboardButton("📋 查看备用池", callback_data="action:spare_list")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "rotation":
+        text = "⏳ 轮转配置管理\n\n设置活跃频道轮转参数（文件数/时间）。"
+        kb = [
+            [InlineKeyboardButton("📋 查看配置", callback_data="action:rotation_view"),
+             InlineKeyboardButton("⚙️ 修改参数", callback_data="interactive:rotation_set")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -554,6 +618,38 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "⏱️ Bot 解码间隔配置\n\n"
             for bot in sorted(intervals.keys()):
                 text += f"  • @{bot} → {intervals[bot]} 秒\n"
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:topology":
+        text = await _get_topology_text()
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:spare_list":
+        spares = await list_spare_pool()
+        if not spares:
+            text = "📭 备用池为空\n\n使用 /spare_add 添加备用频道。"
+        else:
+            text = "🔄 备用池频道列表\n\n"
+            for s in spares:
+                used = "🔴已用" if s.get("is_used") else "🟢可用"
+                acc = s.get("account_name") or "通用"
+                text += f"  {used} {s['channel_id']} — {acc}\n"
+            text += f"\n共 {len(spares)} 个备用频道"
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:rotation_view":
+        keys = [
+            ("rotation_active_window_size", "active_window_size", "活跃窗口大小"),
+            ("rotation_files_per_slot", "files_per_slot", "每频道文件数"),
+            ("rotation_time_per_slot", "time_per_slot", "每频道时间(秒)"),
+        ]
+        text = "🔄 轮转配置\n\n"
+        for db_key, fallback_key, label in keys:
+            val = await get_rotation_config(db_key)
+            if val is None:
+                val = str(getattr(settings, f"ROTATION_{fallback_key.upper()}", "—"))
+            text += f"  {label}: {val}\n"
+        text += "\n使用 /rotation_set 修改配置"
         await query.edit_message_text(text, reply_markup=back_kb)
 
     # ─── 交互式操作入口 ──────────────────────────────────────────
@@ -656,6 +752,24 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "set_db_backup": (
                 "set_db_backup:interval",
                 "💾 配置 DB 自动备份\n\n请输入备份间隔（分钟）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 备用池
+            "spare_add": (
+                "spare_add:channel_id",
+                "🔄 添加备用频道\n\n请输入频道ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "spare_remove": (
+                "spare_remove:channel_id",
+                "🔄 移除备用频道\n\n请输入要移除的频道ID：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            # 轮转配置
+            "rotation_set": (
+                "rotation_set:key",
+                "⏳ 设置轮转参数\n\n请选择参数：\n"
+                "  active_window_size — 活跃窗口大小（每组几个活跃频道）\n"
+                "  files_per_slot — 每频道文件数后切换\n"
+                "  time_per_slot — 每频道活跃时间（秒）后切换\n\n"
+                "请输入参数名：\n\n❌ 如需取消请点击下方按钮。"
             ),
         }
 
@@ -1498,6 +1612,130 @@ async def list_bot_intervals(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(msg)
 
 
+# ─── 备用池管理 ──────────────────────────────────────────────────
+
+@_auth_required
+async def spare_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法：/spare_add <频道ID> [账号名]\n\n"
+            "添加备用频道到备用池。\n"
+            "• 指定账号名：该频道封禁后优先补充同账号频道的空缺\n"
+            "• 不指定账号名：作为通用备用池频道，补充任意空缺\n\n"
+            "示例：\n"
+            "/spare_add -1001234567890\n"
+            "/spare_add -1001234567890 账号1"
+        )
+        return
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 频道ID必须是数字")
+        return
+    account_name = args[1] if len(args) > 1 else None
+    await add_spare_channel(channel_id, account_name)
+    acc_info = f" (账号: {account_name})" if account_name else " (通用备用池)"
+    await update.message.reply_text(f"✅ 备用频道已添加\n  频道ID: {channel_id}{acc_info}")
+
+
+@_auth_required
+async def spare_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args:
+        await update.message.reply_text("用法：/spare_remove <频道ID>")
+        return
+    try:
+        channel_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 频道ID必须是数字")
+        return
+    await remove_spare(channel_id)
+    await update.message.reply_text(f"✅ 已从备用池移除频道: {channel_id}")
+
+
+@_auth_required
+async def spare_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    spares = await list_spare_pool()
+    if not spares:
+        await update.message.reply_text("📭 备用池为空\n\n使用 /spare_add 添加备用频道。")
+        return
+    msg = "🔄 备用池频道列表\n\n"
+    for s in spares:
+        used = "🔴已用" if s.get("is_used") else "🟢可用"
+        acc = s.get("account_name") or "通用"
+        msg += f"  {used} {s['channel_id']} — {acc}\n"
+    msg += f"\n共 {len(spares)} 个备用频道\n使用 /spare_add 添加 | /spare_remove 删除"
+    await update.message.reply_text(msg)
+
+
+# ─── 轮转配置管理 ──────────────────────────────────────────────
+
+@_auth_required
+async def rotation_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "用法：/rotation_set <参数名> <值>\n\n"
+            "可配置参数：\n"
+            "• active_window_size — 活跃窗口大小（每组几个活跃频道，默认 3）\n"
+            "• files_per_slot — 每个频道接收文件数后切换（默认 500）\n"
+            "• time_per_slot — 每个频道活跃时间（秒）后切换（默认 3600）\n\n"
+            "示例：\n"
+            "/rotation_set files_per_slot 200\n"
+            "/rotation_set time_per_slot 1800\n"
+            "/rotation_set active_window_size 5"
+        )
+        return
+    key = args[0].strip()
+    value = args[1].strip()
+    valid_keys = {"active_window_size", "files_per_slot", "time_per_slot"}
+    if key not in valid_keys:
+        await update.message.reply_text(f"❌ 无效参数: {key}\n有效参数: {', '.join(sorted(valid_keys))}")
+        return
+    try:
+        int(value)
+    except ValueError:
+        await update.message.reply_text("❌ 值必须是数字")
+        return
+    db_key = f"rotation_{key}"
+    await set_rotation_config(db_key, value)
+    label_map = {
+        "active_window_size": "活跃窗口大小",
+        "files_per_slot": "每频道文件数",
+        "time_per_slot": "每频道时间(秒)",
+    }
+    await update.message.reply_text(
+        f"✅ 轮转配置已更新\n  {label_map.get(key, key)}: {value}\n\n"
+        f"Mon Bot 将在下一轮自动加载新配置。"
+    )
+
+
+@_auth_required
+async def rotation_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keys = [
+        ("rotation_active_window_size", "active_window_size", "活跃窗口大小"),
+        ("rotation_files_per_slot", "files_per_slot", "每频道文件数"),
+        ("rotation_time_per_slot", "time_per_slot", "每频道时间(秒)"),
+    ]
+    msg = "🔄 轮转配置\n\n"
+    for db_key, fallback_key, label in keys:
+        val = await get_rotation_config(db_key)
+        if val is None:
+            val = str(getattr(settings, f"ROTATION_{fallback_key.upper()}", "—"))
+        msg += f"  {label}: {val}\n"
+    msg += "\n使用 /rotation_set 修改配置"
+    await update.message.reply_text(msg)
+
+
+# ─── 拓扑查看 ──────────────────────────────────────────────────
+
+@_auth_required
+async def topology(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _get_topology_text()
+    await update.message.reply_text(text)
+
+
 @_auth_required
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("conv_state"):
@@ -1929,6 +2167,70 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await set_config("db_backup_enabled", "1" if on_off == "on" else "0")
         await _end(f"✅ DB 自动备份已{'开启' if on_off == 'on' else '关闭'}，间隔 {data['interval']} 分钟")
 
+    # ─── 备用池 ────────────────────────────────────────────────
+    elif state == "spare_add:channel_id":
+        try:
+            channel_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
+            return
+        await _ask("spare_add:account_name",
+                    f"✅ 频道ID已记录：{channel_id}\n\n请输入账号名（不填则作为通用备用池，直接发送 0 跳过）：",
+                    {"channel_id": channel_id})
+
+    elif state == "spare_add:account_name":
+        account_name = text.strip()
+        if account_name == "0":
+            account_name = None
+        await add_spare_channel(data["channel_id"], account_name)
+        acc_info = f" (账号: {account_name})" if account_name else " (通用备用池)"
+        await _end(f"✅ 备用频道已添加\n  频道ID: {data['channel_id']}{acc_info}")
+
+    elif state == "spare_remove:channel_id":
+        try:
+            channel_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
+            return
+        await remove_spare(channel_id)
+        await _end(f"✅ 已从备用池移除频道: {channel_id}")
+
+    # ─── 轮转配置 ──────────────────────────────────────────────
+    elif state == "rotation_set:key":
+        key = text.strip().lower()
+        valid_keys = {"active_window_size", "files_per_slot", "time_per_slot"}
+        if key not in valid_keys:
+            await update.message.reply_text(
+                f"❌ 无效参数: {key}\n有效参数: {', '.join(sorted(valid_keys))}\n请重新输入："
+            )
+            return
+        labels = {
+            "active_window_size": "活跃窗口大小（每组几个活跃频道）",
+            "files_per_slot": "每频道文件数",
+            "time_per_slot": "每频道活跃时间（秒）",
+        }
+        await _ask("rotation_set:value",
+                    f"✅ 参数已选择：{key} ({labels[key]})\n\n请输入值（数字）：",
+                    {"rotation_key": key})
+
+    elif state == "rotation_set:value":
+        try:
+            int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 值必须是数字，请重新输入：")
+            return
+        db_key = f"rotation_{data['rotation_key']}"
+        await set_rotation_config(db_key, text)
+        label_map = {
+            "active_window_size": "活跃窗口大小",
+            "files_per_slot": "每频道文件数",
+            "time_per_slot": "每频道时间(秒)",
+        }
+        await _end(
+            f"✅ 轮转配置已更新\n  {label_map.get(data['rotation_key'], data['rotation_key'])}: {text}\n\n"
+            f"Mon Bot 将在下一轮自动加载新配置。"
+        )
+
     # 未知状态 → 清理
     else:
         _conv_end(context)
@@ -1992,6 +2294,12 @@ def run():
     app.add_handler(CommandHandler("set_bot_interval", set_bot_interval))
     app.add_handler(CommandHandler("remove_bot_interval", remove_bot_interval))
     app.add_handler(CommandHandler("bot_intervals", list_bot_intervals))
+    app.add_handler(CommandHandler("spare_add", spare_add))
+    app.add_handler(CommandHandler("spare_remove", spare_remove))
+    app.add_handler(CommandHandler("spare_list", spare_list))
+    app.add_handler(CommandHandler("rotation_set", rotation_set))
+    app.add_handler(CommandHandler("rotation_view", rotation_view))
+    app.add_handler(CommandHandler("topology", topology))
     app.add_handler(CommandHandler("cancel", cancel_conversation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:)"))

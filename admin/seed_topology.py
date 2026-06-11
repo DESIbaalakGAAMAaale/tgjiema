@@ -1,5 +1,6 @@
 """拓扑初始化脚本
 将 config/groups.yaml 的槽位配置自动生成 topology.yaml 并写入数据库 cells 表。
+同时初始化备用池和轮转配置表。
 仅在全新部署或拓扑重建时使用。
 
 用法：
@@ -17,6 +18,7 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import init_db, close_db, get_cells_col, make_cell
+from database import set_rotation_config, add_spare_channel
 
 
 async def seed(dry_run: bool = False, force: bool = False):
@@ -85,6 +87,7 @@ async def seed(dry_run: bool = False, force: bool = False):
             "status": slot["status"],
             "next_active_chat_id": slot.get("next_active_chat_id"),
             "prev_slot_id": slot.get("prev_slot_id"),
+            "account_name": slot.get("account_name", ""),
             "is_r100": 1 if slot.get("is_r100") else 0,
         }
 
@@ -100,6 +103,7 @@ async def seed(dry_run: bool = False, force: bool = False):
                 next_active_chat_id=slot.get("next_active_chat_id"),
                 prev_slot_id=slot.get("prev_slot_id"),
                 is_r100=slot.get("is_r100", False),
+                account_name=slot.get("account_name", ""),
             )
             await col.insert_one(cell)
             added += 1
@@ -107,6 +111,20 @@ async def seed(dry_run: bool = False, force: bool = False):
 
     await close_db()
     print(f"\n完成: 新增 {added} 个, 更新 {updated} 个")
+
+    # ── 步骤4：初始化轮转配置（如果不存在） ──
+    await init_db()
+    mon_cfg = config.get("mon", {})
+    defaults = {
+        "active_window_size": str(mon_cfg.get("active_window_size", 3)),
+        "rotation_files_per_slot": str(mon_cfg.get("rotation_files_per_slot", 500)),
+        "rotation_time_per_slot": str(mon_cfg.get("rotation_time_per_slot", 3600)),
+    }
+    for key, val in defaults.items():
+        await set_rotation_config(key, val)
+    print(f"轮转配置已初始化: {defaults}")
+    await close_db()
+
     print("下一步: python run_all.py")
 
 
@@ -114,3 +132,10 @@ if __name__ == "__main__":
     dry = "--dry-run" in sys.argv
     yes = "--yes" in sys.argv
     asyncio.run(seed(dry_run=dry, force=yes))
+
+
+async def auto_seed():
+    """自动初始化拓扑（启动时静默调用，不交互）。"""
+    print("[seed] 自动初始化拓扑...")
+    await seed(dry_run=False, force=True)
+    print("[seed] 拓扑初始化完成")

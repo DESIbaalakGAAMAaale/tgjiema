@@ -1,5 +1,5 @@
 """Up Bot — 上传机器人（环形冗余架构版）
-职责：预铺 A 槽 + 接收用户文件 → 转发到当前 Active A 槽
+职责：接收用户文件 → 轮转分发到活跃窗口内的 3 个 A 槽（round-robin）
 """
 
 import asyncio
@@ -22,6 +22,7 @@ TOKEN = settings.UPLOAD_BOT_TOKEN
 
 _pending_media_groups: dict[str, dict] = {}
 _active_a_slots: list[dict] = []
+_active_slot_index: int = 0
 
 
 async def _refresh_active_slots():
@@ -35,13 +36,18 @@ async def _refresh_active_slots():
 
 
 async def _get_upload_target_channel() -> int:
-    """选择上传目标频道：取第一个 active 槽位。"""
+    """选择上传目标频道：在活跃频道间轮转（round-robin）。"""
+    global _active_slot_index
     if not _active_a_slots:
         await _refresh_active_slots()
-    if _active_a_slots:
-        return _active_a_slots[0]["channel_id"]
-    # 兜底：使用 settings 中的默认存储频道
-    return settings.STORAGE_CHANNEL_ID
+    if not _active_a_slots:
+        return settings.STORAGE_CHANNEL_ID
+    # 轮转：每次取下一个活跃频道
+    idx = _active_slot_index % len(_active_a_slots)
+    _active_slot_index += 1
+    channel_id = _active_a_slots[idx]["channel_id"]
+    logger.debug(f"[Up] 轮转分发 → 频道 {channel_id} (index={idx}/{len(_active_a_slots)})")
+    return channel_id
 
 
 # ─── 以下逻辑与原来基本相同，仅 channel 选择改为环形槽位 ───
@@ -437,12 +443,8 @@ async def _init():
     await _refresh_active_slots()
 
 
-def run():
-    import asyncio as _asyncio
-
-    loop = _asyncio.new_event_loop()
-    _asyncio.set_event_loop(loop)
-    loop.run_until_complete(_init())
+async def _async_main():
+    await _init()
 
     logger.info(f"[Up] 启动上传机器人 (Up Bot)...")
     app = Application.builder().token(TOKEN).build()
@@ -474,10 +476,27 @@ def run():
             await _refresh_active_slots()
             await asyncio.sleep(60)
 
+    loop = asyncio.get_running_loop()
     loop.create_task(health_ping())
     loop.create_task(slot_refresh_loop())
     loop.create_task(_poll_code_sent(app))
-    app.run_polling()
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        try:
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await app.updater.stop()
+            await app.stop()
+
+
+def run():
+    """启动 Up Bot（使用 asyncio.run 标准模式）。"""
+    asyncio.run(_async_main())
 
 
 if __name__ == "__main__":

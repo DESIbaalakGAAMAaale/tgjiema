@@ -742,12 +742,8 @@ async def handle_external_code(update, context, user_id, code, result):
         parts.append(f"外部码剩余：{result.remaining_external_quota}")
     remaining_info = " | ".join(parts)
 
-    # 从账号池获取最优中继账号
-    account = None
-    for inst in relay_pool.instances:
-        if inst.is_ready:
-            account = inst
-            break
+    # 从账号池获取最优中继账号（负载均衡）
+    account = await relay_pool.get_best_account()
 
     if account:
         import time as _time
@@ -874,41 +870,34 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
 # ─── 消息路由 ───
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        text = update.message.text or ""
+    text = update.message.text or ""
 
-        if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
-            await handle_relay_delivery(update, context)
-            return
+    if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
+        await handle_relay_delivery(update, context)
+        return
 
-        if is_valid_code_format(text.strip()):
+    if is_valid_code_format(text.strip()):
+        await handle_code(update, context)
+        return
+
+    code, bot_username = extract_code_and_bot_from_message(text)
+    if code and bot_username:
+        context.user_data["_original_external_code"] = code
+        context.user_data["_extracted_bot"] = bot_username
+        object.__setattr__(update.message, "text", f"{bot_username}:{code}")
+        await handle_code(update, context)
+        return
+
+    clean_text = text.strip()
+    if clean_text and len(clean_text) >= 4 and not re.search(r'[\u4e00-\u9fff]', clean_text):
+        known_bot = await get_bot_for_code(clean_text)
+        if known_bot:
+            logger.info(f"[Idx] 命中无头码缓存: code={clean_text}, bot={known_bot}")
+            context.user_data["_original_external_code"] = clean_text
+            context.user_data["_extracted_bot"] = known_bot
+            object.__setattr__(update.message, "text", f"{known_bot}:{clean_text}")
             await handle_code(update, context)
             return
-
-        code, bot_username = extract_code_and_bot_from_message(text)
-        if code and bot_username:
-            context.user_data["_original_external_code"] = code
-            context.user_data["_extracted_bot"] = bot_username
-            object.__setattr__(update.message, "text", f"{bot_username}:{code}")
-            await handle_code(update, context)
-            return
-
-        clean_text = text.strip()
-        if clean_text and len(clean_text) >= 4 and not re.search(r'[\u4e00-\u9fff]', clean_text):
-            known_bot = await get_bot_for_code(clean_text)
-            if known_bot:
-                logger.info(f"[Idx] 命中无头码缓存: code={clean_text}, bot={known_bot}")
-                context.user_data["_original_external_code"] = clean_text
-                context.user_data["_extracted_bot"] = known_bot
-                object.__setattr__(update.message, "text", f"{known_bot}:{clean_text}")
-                await handle_code(update, context)
-                return
-    except Exception as e:
-        logger.error(f"[Idx][handle_message] 异常: {e}")
-        try:
-            await update.message.reply_text("处理请求时发生错误，请稍后重试。")
-        except Exception:
-            pass
 
 
 # ─── 运行 ───
@@ -918,12 +907,8 @@ async def _init():
     await init_db()
 
 
-def run():
-    import asyncio as _asyncio
-
-    loop = _asyncio.new_event_loop()
-    _asyncio.set_event_loop(loop)
-    loop.run_until_complete(_init())
+async def _async_main():
+    await _init()
 
     logger.info("[Idx] 启动解码机器人 (Idx Bot)...")
     app = Application.builder().token(TOKEN).build()
@@ -995,6 +980,7 @@ def run():
             _cleanup_media_groups()
             await asyncio.sleep(60)
 
+    loop = asyncio.get_running_loop()
     loop.create_task(health_ping())
     loop.create_task(_process_pending_uploads(app))
     loop.create_task(cleanup_loop())
@@ -1003,7 +989,24 @@ def run():
     loop.create_task(dump_cache_to_disk_loop())
     from database import cleanup_old_records
     loop.create_task(cleanup_old_records())
-    app.run_polling()
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        # 等待停止信号
+        try:
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await app.updater.stop()
+            await app.stop()
+
+
+def run():
+    """启动 Idx Bot（使用 asyncio.run 标准模式）。"""
+    asyncio.run(_async_main())
 
 
 if __name__ == "__main__":

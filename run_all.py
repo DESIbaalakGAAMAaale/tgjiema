@@ -1,6 +1,7 @@
 """环形冗余架构 v2 运行入口
 启动 5 个主进程：up / idx / dsp / mon / admin_bot
 + admin web + db_backup
+启动时自动初始化拓扑（无需手动运行 seed_topology.py）
 """
 
 import multiprocessing
@@ -84,6 +85,16 @@ def _shutdown(processes):
     logger.info("所有进程已关闭")
 
 
+def _auto_seed():
+    """启动前自动初始化拓扑（静默，不交互）。"""
+    try:
+        import asyncio
+        from admin.seed_topology import auto_seed
+        asyncio.run(auto_seed())
+    except Exception as e:
+        logger.warning(f"[seed] 自动拓扑初始化失败（可能已有数据）: {e}")
+
+
 def main():
     logger.add(
         "logs/tgjiema_{time}.log",
@@ -91,6 +102,9 @@ def main():
         retention="7 days",
         level=settings.LOG_LEVEL,
     )
+
+    # ── 启动前自动初始化拓扑 ──
+    _auto_seed()
 
     args = sys.argv[1:]
     if not args:

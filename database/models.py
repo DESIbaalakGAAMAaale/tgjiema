@@ -101,6 +101,7 @@ def make_cell(
     next_active_chat_id: int = None,
     prev_slot_id: str = None,
     is_r100: bool = False,
+    account_name: str = "",
 ):
     from datetime import datetime, timezone
 
@@ -111,10 +112,13 @@ def make_cell(
         "status": status,
         "next_active_chat_id": next_active_chat_id,
         "prev_slot_id": prev_slot_id,
+        "account_name": account_name,
         "is_r100": 1 if is_r100 else 0,
         "last_heartbeat": now.isoformat(),
         "last_synced_msg_id": 0,
         "degrade_count": 0,
+        "file_count": 0,
+        "rotation_started_at": now.isoformat(),
         "created_at": now.isoformat(),
         "updated_at": now.isoformat(),
     }
@@ -186,4 +190,31 @@ def make_rotate_log(
         "to_status": to_status,
         "reason": reason,
         "triggered_by": triggered_by,
+    }
+
+
+# ─── 备用池 + 轮转配置 ──────────────────────────────────────────
+
+def make_spare_channel(
+    channel_id: int,
+    account_name: str = None,
+    is_used: bool = False,
+):
+    from datetime import datetime, timezone
+
+    return {
+        "channel_id": channel_id,
+        "account_name": account_name,
+        "is_used": 1 if is_used else 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def make_rotation_config(key: str, value: str):
+    from datetime import datetime, timezone
+
+    return {
+        "config_key": key,
+        "config_value": value,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }

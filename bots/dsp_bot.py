@@ -297,12 +297,8 @@ async def _init():
     await init_db()
 
 
-def run():
-    import asyncio as _asyncio
-
-    loop = _asyncio.new_event_loop()
-    _asyncio.set_event_loop(loop)
-    loop.run_until_complete(_init())
+async def _async_main():
+    await _init()
 
     logger.info("[Dsp] 启动发送机器人 (Dsp Bot)...")
     app = Application.builder().token(TOKEN).build()
@@ -318,11 +314,28 @@ def run():
             metrics.ping_bot("dsp_bot")
             await asyncio.sleep(30)
 
+    loop = asyncio.get_running_loop()
     loop.create_task(health_ping())
     loop.create_task(process_queue(bot))
     from database.cache import dump_cache_to_disk_loop
     loop.create_task(dump_cache_to_disk_loop())
-    app.run_polling()
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        try:
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await app.updater.stop()
+            await app.stop()
+
+
+def run():
+    """启动 Dsp Bot（使用 asyncio.run 标准模式）。"""
+    asyncio.run(_async_main())
 
 
 if __name__ == "__main__":

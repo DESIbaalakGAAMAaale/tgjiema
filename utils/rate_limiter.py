@@ -22,9 +22,17 @@ class UserRateLimiter:
     def __init__(self, max_calls_per_minute: int = None):
         self.max_calls = max_calls_per_minute or settings.RATE_LIMIT_PER_USER_PER_MINUTE
         self._users: dict[int, list[float]] = defaultdict(list)
+        self._acquire_count = 0
 
     def acquire(self, user_id: int) -> bool:
         now = time.monotonic()
+        # 每 1000 次调用清理一次已过期的用户条目，防止内存泄漏
+        self._acquire_count += 1
+        if self._acquire_count % 1000 == 0:
+            stale = [uid for uid, calls in self._users.items()
+                     if not calls or now - calls[-1] >= 3600]
+            for uid in stale:
+                del self._users[uid]
         self._users[user_id] = [
             t for t in self._users[user_id] if now - t < 60
         ]

@@ -104,10 +104,13 @@ DDL_STATEMENTS = [
         status TEXT NOT NULL DEFAULT 'shadow1',
         next_active_chat_id BIGINT,
         prev_slot_id TEXT,
+        account_name TEXT DEFAULT '',
         is_r100 INTEGER DEFAULT 0,
         last_heartbeat TEXT,
         last_synced_msg_id BIGINT DEFAULT 0,
         degrade_count INTEGER DEFAULT 0,
+        file_count INTEGER DEFAULT 0,
+        rotation_started_at TEXT,
         created_at TEXT,
         updated_at TEXT
     )""",
@@ -149,6 +152,20 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_cells_status ON cells(status)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_rotate_log_timestamp ON rotate_log(timestamp)",
+    # ─── 备用池 + 轮转配置 ──────────────────────────────────────────
+    """CREATE TABLE IF NOT EXISTS spare_pool (
+        channel_id BIGINT PRIMARY KEY,
+        account_name TEXT,
+        is_used INTEGER DEFAULT 0,
+        created_at TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_spare_pool_account ON spare_pool(account_name)",
+    "CREATE INDEX IF NOT EXISTS idx_spare_pool_used ON spare_pool(is_used)",
+    """CREATE TABLE IF NOT EXISTS rotation_config (
+        config_key TEXT PRIMARY KEY,
+        config_value TEXT,
+        updated_at TEXT
+    )""",
     # ─── 外部码映射表（采集器写入，idx_bot 查询） ─────────────────
     """CREATE TABLE IF NOT EXISTS external_code_mapping (
         external_code TEXT PRIMARY KEY,
@@ -488,6 +505,8 @@ _cells_col = D1Collection("cells")
 _codes_col = D1Collection("codes")
 _jobs_col = D1Collection("jobs")
 _rotate_log_col = D1Collection("rotate_log")
+_spare_pool_col = D1Collection("spare_pool")
+_rotation_config_col = D1Collection("rotation_config")
 _external_code_mapping_col = D1Collection("external_code_mapping")
 
 
@@ -906,6 +925,110 @@ def get_jobs_col() -> D1Collection:
 
 def get_rotate_log_col() -> D1Collection:
     return _rotate_log_col
+
+
+def get_spare_pool_col() -> D1Collection:
+    return _spare_pool_col
+
+
+def get_rotation_config_col() -> D1Collection:
+    return _rotation_config_col
+
+
+# ─── 备用池操作 ──────────────────────────────────────────────────
+
+async def add_spare_channel(channel_id: int, account_name: str = None) -> bool:
+    """添加备用频道到备用池。"""
+    import datetime as _dt
+    col = get_spare_pool_col()
+    existing = await col.find_one({"channel_id": channel_id})
+    if existing:
+        await col.update_one(
+            {"channel_id": channel_id},
+            {"$set": {"account_name": account_name, "is_used": 0}},
+        )
+    else:
+        await col.insert_one({
+            "channel_id": channel_id,
+            "account_name": account_name,
+            "is_used": 0,
+            "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        })
+    return True
+
+
+async def get_spare_for_account(account_name: str) -> dict | None:
+    """获取指定账号的未使用备用频道（优先同账号）。"""
+    col = get_spare_pool_col()
+    # 优先匹配同账号
+    spare = await col.find_one({"account_name": account_name, "is_used": 0})
+    if spare:
+        return spare
+    return None
+
+
+async def get_any_spare() -> dict | None:
+    """获取任意未使用的备用频道（无账号归属）。"""
+    col = get_spare_pool_col()
+    # 优先无归属的备用池频道
+    spare = await col.find_one({"account_name": None, "is_used": 0})
+    if not spare:
+        spare = await col.find_one({"is_used": 0})
+    return spare
+
+
+async def consume_spare(channel_id: int) -> bool:
+    """标记备用频道为已使用。"""
+    col = get_spare_pool_col()
+    await col.update_one({"channel_id": channel_id}, {"$set": {"is_used": 1}})
+    return True
+
+
+async def release_spare(channel_id: int) -> bool:
+    """释放备用频道回池（标记为未使用）。"""
+    col = get_spare_pool_col()
+    await col.update_one({"channel_id": channel_id}, {"$set": {"is_used": 0}})
+    return True
+
+
+async def remove_spare(channel_id: int) -> bool:
+    """从备用池中删除频道。"""
+    col = get_spare_pool_col()
+    await col.delete_one({"channel_id": channel_id})
+    return True
+
+
+async def list_spare_pool() -> list[dict]:
+    """列出所有备用池频道。"""
+    col = get_spare_pool_col()
+    return await col.find({}, sort=("account_name", 1))
+
+
+# ─── 轮转配置操作 ──────────────────────────────────────────────
+
+async def get_rotation_config(key: str) -> str | None:
+    """读取轮转配置。"""
+    col = get_rotation_config_col()
+    row = await col.find_one({"config_key": key})
+    return row.get("config_value") if row else None
+
+
+async def set_rotation_config(key: str, value: str):
+    """写入轮转配置。"""
+    import datetime as _dt
+    col = get_rotation_config_col()
+    existing = await col.find_one({"config_key": key})
+    if existing:
+        await col.update_one(
+            {"config_key": key},
+            {"$set": {"config_value": value, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}},
+        )
+    else:
+        await col.insert_one({
+            "config_key": key,
+            "config_value": value,
+            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        })
 
 
 async def get_active_cells() -> list[dict]:

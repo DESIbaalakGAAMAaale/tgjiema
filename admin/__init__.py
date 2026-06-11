@@ -18,6 +18,8 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="管理员账号未配置，请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD")
     correct_username = secrets.compare_digest(
         credentials.username.encode("utf8"),
         settings.ADMIN_USERNAME.encode("utf8"),

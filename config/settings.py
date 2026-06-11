@@ -17,6 +17,26 @@ class Settings(BaseSettings):
     DECODER_BOT_CHAT_ID: int = 0
     MON_CHECK_INTERVAL: int = 60
 
+    # ── 轮转参数（可在 .env 或管理员 Bot 运行时覆盖） ──
+    ROTATION_ACTIVE_WINDOW_SIZE: int = 3       # 同一时刻活跃频道数
+    ROTATION_FILES_PER_SLOT: int = 500         # 每槽位文件数上限
+    ROTATION_TIME_PER_SLOT: int = 3600         # 每槽位最多使用时间（秒）
+
+    # ── 账号频道配置（部署时在 .env 中填写，无需编辑 groups.yaml） ──
+    # 5 个账号 × 9 频道 = 45 频道 = 15 组
+    # 格式: ACCOUNT_N_NAME=账号名, ACCOUNT_N_CHANNELS=频道ID,频道ID,...
+    ACCOUNT_1_NAME: str = ""
+    ACCOUNT_1_CHANNELS: str = ""
+    ACCOUNT_2_NAME: str = ""
+    ACCOUNT_2_CHANNELS: str = ""
+    ACCOUNT_3_NAME: str = ""
+    ACCOUNT_3_CHANNELS: str = ""
+    ACCOUNT_4_NAME: str = ""
+    ACCOUNT_4_CHANNELS: str = ""
+    ACCOUNT_5_NAME: str = ""
+    ACCOUNT_5_CHANNELS: str = ""
+    R100_CHANNEL: int = 0               # R100 兜底频道（不参与环形调度）
+
     COCKROACHDB_URL: str = ""
 
     FORCE_JOIN_CHANNEL_ID: int = 0
@@ -42,8 +62,8 @@ class Settings(BaseSettings):
 
     ADMIN_WEB_PORT: int = 8080
     ADMIN_WEB_HOST: str = "127.0.0.1"
-    ADMIN_USERNAME: str = "admin"
-    ADMIN_PASSWORD: str = "admin123"
+    ADMIN_USERNAME: str = ""
+    ADMIN_PASSWORD: str = ""
 
     FREE_DAILY_QUOTA: int = 3
     BASIC_DAILY_QUOTA: int = 20
@@ -67,6 +87,38 @@ class Settings(BaseSettings):
     @property
     def STORAGE_CHANNEL_ID(self) -> int:
         return self.MAIN_STORAGE_CHANNEL_ID
+
+    def get_accounts_config(self) -> dict:
+        """从 .env 配置中解析账号频道配置。
+        返回格式与 groups.yaml 兼容：
+        {
+            "accounts": [{"name": "账号1", "channels": [-1001, -1002, ...]}, ...],
+            "r100": {"channel": -1009999, "fallback": []}
+        }
+        """
+        accounts = []
+        for i in range(1, 6):
+            name = getattr(self, f"ACCOUNT_{i}_NAME", "")
+            channels_str = getattr(self, f"ACCOUNT_{i}_CHANNELS", "")
+            if not name or not channels_str:
+                continue
+            channels = []
+            for ch in channels_str.split(","):
+                ch = ch.strip()
+                if ch:
+                    try:
+                        channels.append(int(ch))
+                    except ValueError:
+                        pass
+            if channels:
+                accounts.append({"name": name, "channels": channels})
+
+        r100_ch = self.R100_CHANNEL if self.R100_CHANNEL != 0 else None
+
+        return {
+            "accounts": accounts,
+            "r100": {"channel": r100_ch, "fallback": []},
+        }
 
     @staticmethod
     def get_config_default(key: str) -> str:
