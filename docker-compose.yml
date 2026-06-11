@@ -1,0 +1,30 @@
+# TG文件解码器 — Docker Compose 一键部署
+# 环形冗余 v2 架构（up / idx / dsp / mon / admin_bot）
+#
+# 部署步骤:
+#   1. 创建 .env 文件（从 .env.example 复制并填写）
+#   2. 编辑 config/groups.yaml（填写 15 组的 channel_id）
+#   3. docker-compose up -d --build
+#   4. docker-compose exec app python admin/seed_topology.py --yes
+
+services:
+  app:
+    build: .
+    container_name: tgjiema
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data        # SQLite relay_pool.db 持久化
+      - ./logs:/app/logs        # 日志持久化
+      - ./config:/app/config    # 配置文件挂载（方便修改）
+    # 可选：单独启动某个组件
+    # command: python run_all.py up idx dsp mon admin_bot
+    command: python run_all.py
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "7"

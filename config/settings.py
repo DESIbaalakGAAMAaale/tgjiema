@@ -5,12 +5,10 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # ── 环形冗余 v2 架构：5 个 Bot Token ──
     UPLOAD_BOT_TOKEN: str = ""
     DECODER_BOT_TOKEN: str = ""
     SENDER_BOT_TOKEN: str = ""
-    BACKUP_BOT_1_TOKEN: str = ""
-    BACKUP_BOT_2_TOKEN: str = ""
-    BACKUP_BOT_3_TOKEN: str = ""
     ADMIN_BOT_TOKEN: str = ""
     MON_BOT_TOKEN: str = ""
     ADMIN_TELEGRAM_ID: int = 0
@@ -18,10 +16,6 @@ class Settings(BaseSettings):
     MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
     DECODER_BOT_CHAT_ID: int = 0
     MON_CHECK_INTERVAL: int = 60
-
-    BACKUP_CHANNELS_GROUP_1: List[int] = []
-    BACKUP_CHANNELS_GROUP_2: List[int] = []
-    BACKUP_CHANNELS_GROUP_3: List[int] = []
 
     COCKROACHDB_URL: str = ""
 
@@ -69,28 +63,6 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-
-        @classmethod
-        def parse_env_var(cls, field_name: str, raw_val: str):
-            if field_name in (
-                "BACKUP_CHANNELS_GROUP_1",
-                "BACKUP_CHANNELS_GROUP_2",
-                "BACKUP_CHANNELS_GROUP_3",
-            ):
-                return json.loads(raw_val)
-            return raw_val
-
-    @property
-    def ALL_BACKUP_CHANNELS(self) -> List[int]:
-        return (
-            self.BACKUP_CHANNELS_GROUP_1
-            + self.BACKUP_CHANNELS_GROUP_2
-            + self.BACKUP_CHANNELS_GROUP_3
-        )
-
-    @property
-    def ALL_STORAGE_CHANNELS(self) -> List[int]:
-        return [self.MAIN_STORAGE_CHANNEL_ID] + self.ALL_BACKUP_CHANNELS
 
     @property
     def STORAGE_CHANNEL_ID(self) -> int:

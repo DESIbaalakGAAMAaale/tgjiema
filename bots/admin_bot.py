@@ -14,8 +14,6 @@ from telegram.ext import (
 from config import settings
 from database import (
     get_users_col, get_file_records_col, get_decode_logs_col,
-    get_backup_channels, set_backup_channels,
-    get_backup_bot_tokens, set_backup_bot_token, delete_backup_bot_token,
     get_config, set_config,
     get_relay_config, set_relay_config,
     get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
@@ -23,7 +21,7 @@ from database import (
 )
 from database.models import make_user
 from utils.monitor import metrics
-from utils.storage_channel import get_active_storage_channel_id, set_active_storage_channel_id, invalidate_cache
+from utils.storage_channel import get_active_storage_channel_id
 
 TOKEN = settings.ADMIN_BOT_TOKEN
 AUTHORIZED_USER_ID = settings.ADMIN_TELEGRAM_ID
@@ -104,8 +102,6 @@ async def _get_status_text() -> str:
         f"🔄 今日解码：{today_decodes}\n"
         f"📤 发送成功：{metrics.send_success_count}\n"
         f"📤 发送失败：{metrics.send_fail_count}\n"
-        f"💾 备份成功：{metrics.backup_count}\n"
-        f"❌ 备份失败：{metrics.backup_fail_count}\n"
         f"\n📺 当前主存储频道：{active_channel}\n"
         f"\n🔐 用户中继：{relay_status}\n"
         f"\n🤖 机器人状态：\n"
@@ -130,32 +126,43 @@ async def _get_health_text() -> str:
     return msg
 
 
-async def _get_channels_text() -> str:
-    tokens = await get_backup_bot_tokens()
+async def _get_topology_text() -> str:
+    """显示环形冗余拓扑状态。"""
     active_channel = await get_active_storage_channel_id()
-    msg = f"📺 主存储频道 & 备份配置\n\n"
-    msg += f"📌 当前主存储频道：{active_channel}\n"
-    msg += f"  通过 /promote_channel <频道ID> 可将备份频道切换为主频道\n\n"
-    for i in (1, 2, 3):
-        tk = tokens.get(str(i), "")
-        channels = await get_backup_channels(i)
-        if tk:
-            masked = tk[:8] + "..." + tk[-4:] if len(tk) > 15 else "***"
-            msg += f"🤖 backup_bot_{i}: {masked}\n"
-        else:
-            msg += f"🤖 backup_bot_{i}: (未配置Token)\n"
-        if channels:
-            msg += f"   频道 ({len(channels)}个):\n"
-            for ch in channels:
-                msg += f"     • {ch}\n"
-        else:
-            msg += f"   频道: (空)\n"
-        msg += "\n"
-    msg += "/add_channel <频道ID> — 新增频道后选择机器人\n"
-    msg += "/remove_channel <机器人编号> <频道ID> — 删除备份频道\n"
-    msg += "/add_backup_bot <编号> <Token> [频道ID...] — 配置Token及频道\n"
-    msg += "/remove_backup_bot <编号> — 删除备份机器人\n"
-    msg += "\n⚠️ 修改 Token 后需重启对应备份机器人才生效"
+    try:
+        from database import get_cells_col
+        col = get_cells_col()
+        cells = await col.find({}, sort=("slot_id", 1))
+    except Exception:
+        cells = []
+
+    msg = f"🔗 环形冗余拓扑\n\n"
+    msg += f"📌 当前主频道: {active_channel}\n"
+    msg += f"📊 总槽位数: {len(cells)}\n\n"
+
+    if cells:
+        by_group = {}
+        for c in cells:
+            sid = c.get("slot_id", "")
+            # 从 slot_id 提取组号，如 a1 → 1, s2a → 2
+            import re
+            m = re.match(r'[as](\d+)', sid)
+            if m:
+                gn = int(m.group(1))
+                by_group.setdefault(gn, []).append(c)
+
+        for gn in sorted(by_group.keys()):
+            group = by_group[gn]
+            status_icons = {"active": "🟢", "r100": "🔴", "shadow1": "🟡", "shadow2": "🟠"}
+            parts = []
+            for c in group:
+                st = c.get("status", "?")
+                icon = status_icons.get(st, "⚪")
+                parts.append(f"{icon}{c.get('slot_id')}: {c.get('channel_id')}")
+            msg += f"  组{gn}: {' | '.join(parts)}\n"
+    else:
+        msg += "  (未加载拓扑，请运行 seed_topology.py)\n"
+
     return msg
 
 
@@ -365,9 +372,7 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             [InlineKeyboardButton("📊 系统状态", callback_data="menu:sys"),
              InlineKeyboardButton("👤 用户管理", callback_data="menu:user")],
             [InlineKeyboardButton("📁 文件管理", callback_data="menu:file"),
-             InlineKeyboardButton("📺 备份频道", callback_data="menu:backup_chan")],
-            [InlineKeyboardButton("🤖 备份机器人", callback_data="menu:backup_bot"),
-             InlineKeyboardButton("📋 解码日志", callback_data="action:logs")],
+             InlineKeyboardButton(" 解码日志", callback_data="action:logs")],
             [InlineKeyboardButton("🔐 用户中继", callback_data="menu:relay"),
              InlineKeyboardButton("⚙️ 系统配置", callback_data="menu:config")],
             [InlineKeyboardButton("🗺️ 文件码路由", callback_data="menu:code_route"),
@@ -402,29 +407,6 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
             [InlineKeyboardButton("📂 文件列表", callback_data="action:files"),
              InlineKeyboardButton("🔍 查询文件", callback_data="interactive:file_detail")],
             [InlineKeyboardButton("🗑️ 删除文件", callback_data="interactive:delete_file")],
-        ] + BACK_BTN
-        return text, InlineKeyboardMarkup(kb)
-
-    if menu_id == "backup_chan":
-        text = "📺 主存储频道 & 备份管理 — 点击按钮操作"
-        kb = [
-            [InlineKeyboardButton("📺 查看配置", callback_data="action:channels")],
-            [InlineKeyboardButton("➕ 新增频道", callback_data="interactive:add_channel"),
-             InlineKeyboardButton("➖ 删除频道", callback_data="interactive:remove_channel")],
-            [InlineKeyboardButton("⬆️ 提升主频道", callback_data="interactive:promote_channel")],
-        ] + BACK_BTN
-        return text, InlineKeyboardMarkup(kb)
-
-    if menu_id == "backup_bot":
-        text = (
-            "🤖 备份机器人管理 — 点击按钮操作\n\n"
-            "⚠️ 修改 Token 后需重启对应备份机器人才生效"
-        )
-        kb = [
-            [InlineKeyboardButton("📺 查看配置", callback_data="action:channels"),
-             InlineKeyboardButton("➕ 新增机器人", callback_data="interactive:add_backup_bot")],
-            [InlineKeyboardButton("➖ 删除机器人", callback_data="interactive:remove_backup_bot"),
-             InlineKeyboardButton("🔄 重置备份", callback_data="interactive:backup_reset")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -511,7 +493,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:channels":
-        text = await _get_channels_text()
+        text = await _get_topology_text()
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:logs":
@@ -535,20 +517,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"{status_icon} {fc} (上传者:{uploader})\n"
         if total_pages > 1:
             text += f"\n使用 /files 2 查看下一页"
-        await query.edit_message_text(text, reply_markup=back_kb)
-
-    elif data == "usage:reset_backup":
-        text = (
-            "🔄 重置备份状态\n\n"
-            "当手动清空了备份频道后，需要重置备份机器人的同步状态\n"
-            "以触发全量重新备份。\n\n"
-            "命令：/backup_reset <backup_bot_N>\n\n"
-            "示例：/backup_reset backup_bot_1\n\n"
-            "该命令会：\n"
-            "1. 清零备份机器人的游标状态\n"
-            "2. 清除所有文件记录中该频道的旧备份信息\n"
-            "3. 备份机器人重启后执行全量备份"
-        )
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:relay_status":
@@ -647,32 +615,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "delete_file:code",
                 "🗑️ 删除文件\n\n请输入要删除的文件码：\n\n❌ 如需取消请点击下方按钮。"
             ),
-            # 频道管理
-            "add_channel": (
-                "add_channel:id",
-                "📺 新增备份频道\n\n请输入频道ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
-            ),
-            "remove_channel": (
-                "remove_channel:bot_num",
-                "➖ 删除备份频道\n\n请输入频道所属的机器人编号（1/2/3）：\n\n❌ 如需取消请点击下方按钮。"
-            ),
-            "promote_channel": (
-                "promote_channel:id",
-                "⬆️ 提升主频道\n\n请输入要提升为主频道的频道ID：\n\n❌ 如需取消请点击下方按钮。"
-            ),
-            # 备份机器人
-            "add_backup_bot": (
-                "add_backup_bot:bot_num",
-                "🤖 新增备份机器人\n\n请输入机器人编号（1/2/3）：\n\n❌ 如需取消请点击下方按钮。"
-            ),
-            "remove_backup_bot": (
-                "remove_backup_bot:bot_num",
-                "➖ 删除备份机器人\n\n请输入要删除的机器人编号（1/2/3）：\n\n❌ 如需取消请点击下方按钮。"
-            ),
-            "backup_reset": (
-                "backup_reset:bot_name",
-                "🔄 重置备份状态\n\n请输入备份机器人名称（backup_bot_1 / backup_bot_2 / backup_bot_3）：\n\n❌ 如需取消请点击下方按钮。"
-            ),
             # 中继
             "relay_code": (
                 "relay_code:code",
@@ -728,43 +670,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _conv_end(context)
         await query.edit_message_text(
             "❌ 操作已取消。",
-            reply_markup=back_kb,
-        )
-
-    elif data.startswith("conv_sel_bot:"):
-        parts = data.split(":")
-        if len(parts) == 3:
-            _, channel_id_str, bot_num_str = parts
-            try:
-                channel_id = int(channel_id_str)
-                bot_num = int(bot_num_str)
-            except ValueError:
-                await query.edit_message_text("❌ 参数错误", reply_markup=back_kb)
-                return
-        else:
-            await query.edit_message_text("❌ 参数错误", reply_markup=back_kb)
-            return
-
-        channels = await get_backup_channels(bot_num)
-        if channel_id in channels:
-            await query.edit_message_text(
-                f"⚠️ 频道 {channel_id} 已在 Bot {bot_num} 的备份列表中。",
-                reply_markup=back_kb,
-            )
-            _conv_end(context)
-            return
-
-        channels.append(channel_id)
-        await set_backup_channels(bot_num, channels)
-
-        all_chan = await get_all_backup_channels()
-        if channel_id not in all_chan:
-            from config import settings as _settings
-            _settings.ALL_BACKUP_CHANNELS = list(set(all_chan + [channel_id]))
-
-        _conv_end(context)
-        await query.edit_message_text(
-            f"✅ 已添加频道 {channel_id} 到 Bot {bot_num} 的备份列表。",
             reply_markup=back_kb,
         )
 
@@ -1073,209 +978,6 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @_auth_required
-async def channels_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(await _get_channels_text())
-
-
-@_auth_required
-async def add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "用法：\n"
-            "  /add_channel <频道ID> — 添加频道后选择机器人\n"
-            "  /add_channel <机器人编号> <频道ID> — 直接指定机器人"
-        )
-        return
-
-    if len(args) == 1:
-        try:
-            channel_id = int(args[0])
-        except ValueError:
-            await update.message.reply_text("❌ 频道ID必须是数字")
-            return
-
-        all_channels = await get_backup_channels(1) + await get_backup_channels(2) + await get_backup_channels(3)
-        if channel_id in all_channels:
-            await update.message.reply_text(f"⚠️ 频道 {channel_id} 已被其他机器人管理，请 /channels 查看")
-            return
-
-        keyboard = [
-            [
-                InlineKeyboardButton(f"🤖 backup_bot_1", callback_data=f"assign_chan:1:{channel_id}"),
-                InlineKeyboardButton(f"🤖 backup_bot_2", callback_data=f"assign_chan:2:{channel_id}"),
-            ],
-            [
-                InlineKeyboardButton(f"🤖 backup_bot_3", callback_data=f"assign_chan:3:{channel_id}"),
-            ],
-        ]
-        await update.message.reply_text(
-            f"📺 频道 {channel_id}\n请选择由哪个备份机器人负责：",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
-
-    try:
-        bot_num = int(args[0])
-        channel_id = int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ 机器人编号和频道ID必须是数字")
-        return
-    if bot_num not in (1, 2, 3):
-        await update.message.reply_text("❌ 机器人编号必须是 1、2 或 3")
-        return
-
-    channels = await get_backup_channels(bot_num)
-    if channel_id in channels:
-        await update.message.reply_text(f"⚠️ 频道 {channel_id} 已在 backup_bot_{bot_num} 中")
-        return
-
-    channels.append(channel_id)
-    await set_backup_channels(bot_num, channels)
-
-    tokens = await get_backup_bot_tokens()
-    restart_hint = ""
-    if str(bot_num) not in tokens:
-        restart_hint = "\n\n⚠️ 该机器人尚未配置 Token，请使用 /add_backup_bot 配置后重启"
-
-    await update.message.reply_text(
-        f"✅ 频道 {channel_id} 已添加到 backup_bot_{bot_num}\n"
-        f"当前 backup_bot_{bot_num} 频道: {channels}\n"
-        f"备份机器人每 5 秒自动检测频道变化，新增频道将触发全量同步{restart_hint}"
-    )
-
-
-@_auth_required
-async def assign_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    data = query.data
-    if not data.startswith("assign_chan:"):
-        return
-
-    parts = data.split(":")
-    if len(parts) != 3:
-        return
-
-    bot_num = int(parts[1])
-    channel_id = int(parts[2])
-
-    channels = await get_backup_channels(bot_num)
-    if channel_id in channels:
-        await query.edit_message_text(f"⚠️ 频道 {channel_id} 已在 backup_bot_{bot_num} 中")
-        return
-
-    channels.append(channel_id)
-    await set_backup_channels(bot_num, channels)
-
-    tokens = await get_backup_bot_tokens()
-    restart_hint = ""
-    if str(bot_num) not in tokens:
-        restart_hint = "\n\n⚠️ 该机器人尚未配置 Token，请使用 /add_backup_bot 配置后重启"
-
-    await query.edit_message_text(
-        f"✅ 频道 {channel_id} → backup_bot_{bot_num}\n"
-        f"频道列表: {channels}\n"
-        f"新增频道将触发全量同步{restart_hint}"
-    )
-
-
-@_auth_required
-async def remove_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("用法：/remove_channel <机器人编号(1/2/3)> <频道ID>")
-        return
-    try:
-        bot_num = int(args[0])
-        channel_id = int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ 机器人编号和频道ID必须是数字")
-        return
-    if bot_num not in (1, 2, 3):
-        await update.message.reply_text("❌ 机器人编号必须是 1、2 或 3")
-        return
-
-    channels = await get_backup_channels(bot_num)
-    if channel_id not in channels:
-        await update.message.reply_text(f"⚠️ 频道 {channel_id} 不在 backup_bot_{bot_num} 中")
-        return
-
-    channels.remove(channel_id)
-    await set_backup_channels(bot_num, channels)
-
-    await update.message.reply_text(
-        f"✅ 频道 {channel_id} 已从 backup_bot_{bot_num} 中移除\n"
-        f"当前 backup_bot_{bot_num} 频道: {channels or '(空)'}\n"
-        f"备份机器人将在下个周期自动停止向此频道备份"
-    )
-
-
-@_auth_required
-async def add_backup_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "用法：/add_backup_bot <编号(1/2/3)> <BotToken> [频道ID ...]\n"
-            "示例：/add_backup_bot 1 12345:abc -100111 -100222"
-        )
-        return
-    try:
-        bot_num = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ 编号必须是数字 1、2 或 3")
-        return
-    if bot_num not in (1, 2, 3):
-        await update.message.reply_text("❌ 编号必须是 1、2 或 3")
-        return
-
-    token = args[1].strip()
-    await set_backup_bot_token(bot_num, token)
-
-    extra_info = ""
-    if len(args) > 2:
-        channel_ids = []
-        for a in args[2:]:
-            try:
-                channel_ids.append(int(a))
-            except ValueError:
-                pass
-        if channel_ids:
-            await set_backup_channels(bot_num, channel_ids)
-            extra_info = f"\n频道已配置: {channel_ids}"
-
-    masked = token[:8] + "..." + token[-4:] if len(token) > 15 else "***"
-    await update.message.reply_text(
-        f"✅ 备份机器人 {bot_num} Token 已保存到数据库 ({masked}){extra_info}\n"
-        f"⚠️ 需要重启 backup_bot_{bot_num} 进程才能生效\n"
-        f"重启命令: python run_all.py backup{bot_num}"
-    )
-
-
-@_auth_required
-async def remove_backup_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("用法：/remove_backup_bot <编号(1/2/3)>")
-        return
-    try:
-        bot_num = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ 编号必须是数字 1、2 或 3")
-        return
-    if bot_num not in (1, 2, 3):
-        await update.message.reply_text("❌ 编号必须是 1、2 或 3")
-        return
-
-    await delete_backup_bot_token(bot_num)
-    await update.message.reply_text(
-        f"✅ 备份机器人 {bot_num} Token 已从数据库删除\n"
-        f"⚠️ 该备份机器人将在下次重启后不再启动"
-    )
-
-
-@_auth_required
 async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
@@ -1431,118 +1133,6 @@ async def relay_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = await get_relay_db()
     await db.reset_usage()
     await update.message.reply_text("✅ 中继账号使用统计已重置")
-
-
-@_auth_required
-async def backup_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "用法：/backup_reset <backup_bot_1|backup_bot_2|backup_bot_3>\n\n"
-            "重置备份机器人的同步状态，下次重启后将执行全量备份。\n"
-            "适用于：手动清空了备份频道后，强制重新备份所有文件。"
-        )
-        return
-
-    bot_name = args[0].strip()
-    if bot_name not in ("backup_bot_1", "backup_bot_2", "backup_bot_3"):
-        await update.message.reply_text(
-            "❌ 无效的备份机器人名称，请使用 backup_bot_1、backup_bot_2 或 backup_bot_3"
-        )
-        return
-
-    files_col = get_file_records_col()
-    await set_config(f"backup_{bot_name}_full_sync_done", "0")
-    await set_config(f"backup_{bot_name}_last_synced_id", "0")
-    await set_config(f"backup_{bot_name}_quick_cursor", "0")
-
-    channels = await get_backup_channels(int(bot_name[-1]))
-    cleared_count = 0
-    if channels:
-        records = await files_col.find(
-            {"backup_channel_msg_ids": {"$ne": "", "$ne": None}},
-            limit=500,
-        )
-        for record in records:
-            backups = record.get("backup_channel_msg_ids") or []
-            if isinstance(backups, str):
-                try:
-                    import json
-                    backups = json.loads(backups)
-                except Exception:
-                    continue
-            if not isinstance(backups, list):
-                continue
-            new_backups = [
-                b for b in backups
-                if isinstance(b, dict) and b.get("channel_id") not in channels
-            ]
-            if len(new_backups) != len(backups):
-                await files_col.update_one(
-                    {"file_code": record["file_code"]},
-                    {"$set": {"backup_channel_msg_ids": new_backups}},
-                )
-                cleared_count += 1
-
-    await update.message.reply_text(
-        f"✅ 已重置 {bot_name} 的备份状态\n"
-        f"• 同步状态已清零\n"
-        f"• 清理了 {cleared_count} 条文件记录中的旧备份信息\n\n"
-        f"⚠️ 备份机器人重启后将执行全量备份到频道 {channels}"
-    )
-
-
-@_auth_required
-async def promote_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text(
-            "用法：/promote_channel <频道ID>\n\n"
-            "将指定的备份频道提升为新的主存储频道。\n"
-            "所有机器人将立即切换到新频道，无需重启。\n"
-            "原主频道将不再接收新文件上传，但已有文件的备份记录仍有效。"
-        )
-        return
-    try:
-        new_channel_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ 频道ID必须是数字")
-        return
-
-    all_backups = list(settings.ALL_BACKUP_CHANNELS)
-    if not all_backups:
-        await update.message.reply_text("❌ 没有任何备份频道可提升")
-        return
-
-    if new_channel_id not in all_backups:
-        await update.message.reply_text(
-            f"❌ 频道 {new_channel_id} 不在备份频道列表中。\n"
-            f"当前备份频道: {all_backups}\n"
-            f"请先用 /channels 确认备份频道配置。"
-        )
-        return
-
-    old_channel = await get_active_storage_channel_id()
-    if new_channel_id == old_channel:
-        await update.message.reply_text(f"⚠️ 频道 {new_channel_id} 已经是当前主频道")
-        return
-
-    success = await set_active_storage_channel_id(new_channel_id)
-    if not success:
-        await update.message.reply_text("❌ 切换主存储频道失败，请检查数据库连接。")
-        return
-
-    invalidate_cache()
-    await update.message.reply_text(
-        f"✅ 主存储频道已切换！\n\n"
-        f"旧主频道：{old_channel}\n"
-        f"新主频道：{new_channel_id}\n\n"
-        f"📤 upload_bot 将上传新文件到新频道\n"
-        f"🤖 backup_bot 将实时监控新频道的新消息\n"
-        f"📨 sender_bot 发送时优先使用新频道\n\n"
-        f"⚠️ 旧频道中已存在的文件仍可通过 sender_bot 的备用频道机制获取\n"
-        f"⚠️ 建议将原主频道添加为备份频道"
-    )
 
 
 # ─── 系统配置管理 ────────────────────────────────────────────────
@@ -1759,16 +1349,9 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"[factory_reset] 清空 {table} 失败: {e}")
 
-    for prefix in ("backup_backup_bot_1_cursor", "backup_backup_bot_2_cursor", "backup_backup_bot_3_cursor"):
-        try:
-            await client.execute("DELETE FROM app_config WHERE config_key = $1", [prefix])
-        except Exception:
-            pass
-
     await msg.edit_text(
         "✅ 工厂重置完成！\n\n"
-        f"已清空 {len(cleared)} 张表：{', '.join(cleared)}\n"
-        "已重置备份游标\n\n"
+        f"已清空 {len(cleared)} 张表：{', '.join(cleared)}\n\n"
         "⚠️ 存储频道的消息不会被自动删除。\n"
         "如需清空存储频道，请手动执行：\n"
         "  /purge_channel <频道ID>\n\n"
@@ -2168,165 +1751,6 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await _end(f"✅ 文件 {file_code} 已删除")
 
-    # ─── 频道管理 ────────────────────────────────────────────────
-    elif state == "add_channel:id":
-        try:
-            channel_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
-            return
-        context.user_data["conv_data"]["channel_id"] = channel_id
-        context.user_data["conv_state"] = "add_channel:select_bot"
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🤖 Bot 1", callback_data=f"conv_sel_bot:{channel_id}:1"),
-             InlineKeyboardButton("🤖 Bot 2", callback_data=f"conv_sel_bot:{channel_id}:2"),
-             InlineKeyboardButton("🤖 Bot 3", callback_data=f"conv_sel_bot:{channel_id}:3")],
-            [InlineKeyboardButton("❌ 取消", callback_data="conv:cancel")],
-        ])
-        await update.message.reply_text(
-            f"✅ 频道已记录：{channel_id}\n\n请选择该频道由哪个备份机器人负责：",
-            reply_markup=kb,
-        )
-
-    elif state == "remove_channel:bot_num":
-        try:
-            bot_num = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 编号必须是数字（1/2/3），请重新输入：")
-            return
-        if bot_num not in (1, 2, 3):
-            await update.message.reply_text("❌ 编号只能是 1、2 或 3，请重新输入：")
-            return
-        await _ask("remove_channel:channel_id",
-                    f"✅ 机器人已选择：Bot {bot_num}\n\n请输入要删除的频道ID：",
-                    {"bot_num": bot_num})
-
-    elif state == "remove_channel:channel_id":
-        try:
-            channel_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
-            return
-        channels = await get_backup_channels(data["bot_num"])
-        if channel_id not in channels:
-            await _end(f"❌ 频道 {channel_id} 不在 Bot {data['bot_num']} 的备份列表中")
-            return
-        channels = [c for c in channels if c != channel_id]
-        await set_backup_channels(data["bot_num"], channels)
-        await _end(f"✅ 已从 Bot {data['bot_num']} 删除备份频道 {channel_id}")
-
-    elif state == "promote_channel:id":
-        try:
-            new_channel_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 频道ID必须是数字，请重新输入：")
-            return
-        all_backups = list(settings.ALL_BACKUP_CHANNELS)
-        if not all_backups:
-            await _end("❌ 没有任何备份频道可提升")
-            return
-        if new_channel_id not in all_backups:
-            await _end(f"❌ 频道 {new_channel_id} 不在备份频道列表中。\n当前备份频道: {all_backups}")
-            return
-        old_channel = await get_active_storage_channel_id()
-        if new_channel_id == old_channel:
-            await _end(f"⚠️ 频道 {new_channel_id} 已经是当前主频道")
-            return
-        success = await set_active_storage_channel_id(new_channel_id)
-        if not success:
-            await _end("❌ 切换主存储频道失败，请检查数据库连接。")
-            return
-        invalidate_cache()
-        await _end(
-            f"✅ 主存储频道已切换！\n\n"
-            f"旧主频道：{old_channel}\n"
-            f"新主频道：{new_channel_id}\n\n"
-            f"📤 upload_bot 将上传新文件到新频道\n"
-            f"🤖 backup_bot 将实时监控新频道的新消息\n"
-            f"📨 sender_bot 发送时优先使用新频道"
-        )
-
-    # ─── 备份机器人 ──────────────────────────────────────────────
-    elif state == "add_backup_bot:bot_num":
-        try:
-            bot_num = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 编号必须是数字（1/2/3），请重新输入：")
-            return
-        if bot_num not in (1, 2, 3):
-            await update.message.reply_text("❌ 编号只能是 1、2 或 3，请重新输入：")
-            return
-        await _ask("add_backup_bot:token",
-                    f"✅ 编号已记录：Bot {bot_num}\n\n请输入 Bot Token（一串字符）：\n\n也可附带频道ID，格式：\n<Token> <频道ID1> <频道ID2>...",
-                    {"bot_num": bot_num})
-
-    elif state == "add_backup_bot:token":
-        parts = text.split()
-        token = parts[0].strip()
-        await set_backup_bot_token(data["bot_num"], token)
-        extra_info = ""
-        if len(parts) > 1:
-            channel_ids = []
-            for a in parts[1:]:
-                try:
-                    channel_ids.append(int(a))
-                except ValueError:
-                    pass
-            if channel_ids:
-                await set_backup_channels(data["bot_num"], channel_ids)
-                extra_info = f"\n频道已配置: {channel_ids}"
-        masked = token[:8] + "..." + token[-4:] if len(token) > 15 else "***"
-        await _end(
-            f"✅ 备份机器人 {data['bot_num']} Token 已保存 ({masked}){extra_info}\n"
-            f"⚠️ 需要重启 backup_bot_{data['bot_num']} 进程才能生效"
-        )
-
-    elif state == "remove_backup_bot:bot_num":
-        try:
-            bot_num = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 编号必须是数字（1/2/3），请重新输入：")
-            return
-        if bot_num not in (1, 2, 3):
-            await update.message.reply_text("❌ 编号只能是 1、2 或 3，请重新输入：")
-            return
-        await delete_backup_bot_token(bot_num)
-        await _end(f"✅ 已删除备份机器人 {bot_num} 配置\n⚠️ 重启后该备份机器人将不再启动")
-
-    elif state == "backup_reset:bot_name":
-        bot_name = text.strip()
-        if bot_name not in ("backup_bot_1", "backup_bot_2", "backup_bot_3"):
-            await update.message.reply_text("❌ 请输入 backup_bot_1、backup_bot_2 或 backup_bot_3：")
-            return
-        files_col = get_file_records_col()
-        await set_config(f"backup_{bot_name}_full_sync_done", "0")
-        await set_config(f"backup_{bot_name}_last_synced_id", "0")
-        await set_config(f"backup_{bot_name}_quick_cursor", "0")
-        channels = await get_backup_channels(int(bot_name[-1]))
-        cleared_count = 0
-        if channels:
-            records = await files_col.find({"backup_channel_msg_ids": {"$ne": "", "$ne": None}}, limit=500)
-            for record in records:
-                backups = record.get("backup_channel_msg_ids") or []
-                if isinstance(backups, str):
-                    try:
-                        import json
-                        backups = json.loads(backups)
-                    except Exception:
-                        continue
-                if not isinstance(backups, list):
-                    continue
-                new_backups = [b for b in backups if isinstance(b, dict) and b.get("channel_id") not in channels]
-                if len(new_backups) != len(backups):
-                    await files_col.update_one({"file_code": record["file_code"]}, {"$set": {"backup_channel_msg_ids": new_backups}})
-                    cleared_count += 1
-        await _end(
-            f"✅ 已重置 {bot_name} 的备份状态\n"
-            f"• 同步状态已清零\n"
-            f"• 清理了 {cleared_count} 条文件记录中的旧备份信息\n"
-            f"⚠️ 备份机器人重启后将执行全量备份到频道 {channels}"
-        )
-
     # ─── 中继 ────────────────────────────────────────────────────
     elif state == "relay_code:code":
         code = text.strip()
@@ -2544,11 +1968,6 @@ def run():
     app.add_handler(CommandHandler("files", files_list))
     app.add_handler(CommandHandler("delete_file", delete_file))
     app.add_handler(CommandHandler("logs", logs))
-    app.add_handler(CommandHandler("channels", channels_list))
-    app.add_handler(CommandHandler("add_channel", add_channel))
-    app.add_handler(CommandHandler("remove_channel", remove_channel))
-    app.add_handler(CommandHandler("add_backup_bot", add_backup_bot))
-    app.add_handler(CommandHandler("remove_backup_bot", remove_backup_bot))
     app.add_handler(CommandHandler("relay_code", relay_code))
     app.add_handler(CommandHandler("relay_set_api", relay_set_api))
     app.add_handler(CommandHandler("relay_pending", relay_pending))
@@ -2556,8 +1975,6 @@ def run():
     app.add_handler(CommandHandler("relay_add", relay_add))
     app.add_handler(CommandHandler("relay_remove", relay_remove))
     app.add_handler(CommandHandler("relay_reset_stats", relay_reset_stats))
-    app.add_handler(CommandHandler("backup_reset", backup_reset))
-    app.add_handler(CommandHandler("promote_channel", promote_channel))
     app.add_handler(CommandHandler("settings", settings_view))
     app.add_handler(CommandHandler("set_storage_channel", set_storage_channel))
     app.add_handler(CommandHandler("set_decoder_chat", set_decoder_chat))
@@ -2577,7 +1994,6 @@ def run():
     app.add_handler(CommandHandler("bot_intervals", list_bot_intervals))
     app.add_handler(CommandHandler("cancel", cancel_conversation))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
-    app.add_handler(CallbackQueryHandler(assign_channel_callback, pattern=r"^assign_chan:"))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:)"))
 
     app.run_polling()

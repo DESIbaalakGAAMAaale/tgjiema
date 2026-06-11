@@ -23,6 +23,13 @@
 - 新增 4 张表：cells（环形拓扑）、codes（取件码索引）、jobs（派工队列）、rotate_log（降级审计）
 - 保留原有表不变
 
+## 部署流程
+- 拓扑配置编辑 **config/groups.yaml**（只需填每组的 3 个 channel_id，共 45 行）
+- 运行 `python config/generate_topology.py` 自动生成 topology.yaml（环形指针自动计算）
+- 运行 `python admin/seed_topology.py` 写入数据库 cells 表
+- Docker 部署：`docker-compose up -d --build`
+- 一键部署：`.\deploy.ps1`
+
 ## Git 提交规则
 - 每次完成代码修改后，**自动执行 git 提交和推送**到 GitHub，不需要用户提醒
 - 提交前先 `git status` 查看变更，再用 `git diff --stat` 了解改了什么
