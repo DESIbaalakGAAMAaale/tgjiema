@@ -113,11 +113,13 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "file_types": defaultdict(int),
         "pinned_msg_ids": [],
         "files_meta": [],
+        "note": "",
     }
     await update.message.reply_text(
         "📦 已进入批次上传模式，请发送文件。\n"
         "发送 /end_upload 结束并生成文件码。\n"
-        "发送 /cancel_upload 取消本次上传。"
+        "发送 /cancel_upload 取消本次上传。\n\n"
+        "💬 可选：使用 /note 文字 为本次批次添加备注。"
     )
 
 
@@ -129,6 +131,22 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("批次上传已取消。")
     else:
         await update.message.reply_text("当前没有进行中的批次上传。")
+
+
+async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """设置批次上传备注。"""
+    if not await check_force_join(update, context):
+        return
+    batch = context.user_data.get("batch")
+    if batch is None:
+        await update.message.reply_text("当前没有进行中的批次上传，请先使用 /start_upload 开始。")
+        return
+    note_text = " ".join(context.args) if context.args else ""
+    if not note_text:
+        await update.message.reply_text("用法：/note 备注内容\n例如：/note 这是张三的文件")
+        return
+    batch["note"] = note_text
+    await update.message.reply_text(f"✅ 备注已设置：{note_text}")
 
 
 async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,6 +189,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
             "batch_file_meta": batch_file_meta_str,
+            "note": batch.get("note", ""),
             "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "processed": 0,
@@ -333,6 +352,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     type_str = json.dumps(file_types)
     batch_ids_str = ",".join(str(mid) for mid in all_mids)
     batch_file_meta_str = json.dumps(all_meta)
+    note = group["updates"][0].message.caption or ""
 
     sent_msg = await context.bot.send_message(
         chat_id=user_id,
@@ -348,6 +368,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             "file_types": type_str,
             "batch_msg_ids": batch_ids_str,
             "batch_file_meta": batch_file_meta_str,
+            "note": note,
             "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "processed": 0,
@@ -384,6 +405,7 @@ async def _process_upload(
     )
 
     type_str = json.dumps(file_types)
+    note = update.message.caption or ""
 
     try:
         pending_col = get_pending_uploads_col()
@@ -394,6 +416,7 @@ async def _process_upload(
             "file_types": type_str,
             "batch_msg_ids": "",
             "batch_file_meta": "",
+            "note": note,
             "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "processed": 0,
@@ -453,6 +476,7 @@ async def _async_main():
     app.add_handler(CommandHandler("start_upload", start_upload))
     app.add_handler(CommandHandler("end_upload", end_upload))
     app.add_handler(CommandHandler("cancel_upload", cancel_upload))
+    app.add_handler(CommandHandler("note", note_command))
 
     media_filter = (
         filters.Document.ALL

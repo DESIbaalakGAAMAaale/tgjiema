@@ -52,6 +52,7 @@ def make_file_record(
     request_count: int = 0,
     batch_msg_ids: str = "",
     batch_file_meta: str = "",
+    note: str = "",
 ):
     from datetime import datetime, timezone
 
@@ -65,6 +66,7 @@ def make_file_record(
         "backup_channel_msg_ids": backup_channel_msg_ids or [],
         "batch_msg_ids": batch_msg_ids,
         "batch_file_meta": batch_file_meta,
+        "note": note,
         "status": status,
         "request_count": request_count,
         "create_time": now,
@@ -131,6 +133,7 @@ def make_code_entry(
     batch_msg_ids: str = "",
     batch_file_meta: str = "",
     primary_channel_id: int = 0,
+    note: str = "",
 ):
     from datetime import datetime, timezone
 
@@ -144,6 +147,7 @@ def make_code_entry(
         "batch_msg_ids": batch_msg_ids,
         "batch_file_meta": batch_file_meta,
         "primary_channel_id": primary_channel_id,
+        "note": note,
         "status": "active",
         "created_at": now.isoformat(),
     }

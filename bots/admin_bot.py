@@ -1017,6 +1017,9 @@ async def file_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📺 主频道：{record.get('primary_channel_id')}\n"
         f"🔄 备份数：{len(backups)}个频道\n"
     )
+    note = record.get("note", "")
+    if note:
+        msg += f"📝 备注：{note}\n"
     await update.message.reply_text(msg)
 
 
@@ -1978,6 +1981,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"📅 创建时间：{_format_datetime(record.get('create_time'))}\n"
             f"📺 主频道：{record.get('primary_channel_id')}\n"
             f"🔄 备份数：{len(backups)}个频道"
+            + (f"\n📝 备注：{record.get('note', '')}" if record.get("note", "") else "")
         )
 
     elif state == "delete_file:code":

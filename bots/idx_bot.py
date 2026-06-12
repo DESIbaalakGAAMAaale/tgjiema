@@ -503,6 +503,7 @@ async def _process_pending_uploads(app: Application):
                     file_types = {}
                 batch_msg_ids_str = row.get("batch_msg_ids", "")
                 batch_file_meta_str = row.get("batch_file_meta", "")
+                note = row.get("note", "")
 
                 if not uploader_id or not channel_id or not message_id:
                     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
@@ -533,6 +534,7 @@ async def _process_pending_uploads(app: Application):
                         file_types=file_types,
                         batch_msg_ids=batch_msg_ids_str,
                         batch_file_meta=batch_file_meta_str,
+                        note=note,
                     )
                     await files_col.insert_one(record)
                 except Exception as e:
@@ -556,6 +558,7 @@ async def _process_pending_uploads(app: Application):
                         batch_msg_ids=batch_msg_ids_str,
                         batch_file_meta=batch_file_meta_str,
                         primary_channel_id=channel_id,
+                        note=note,
                     )
                     await codes_col.insert_one(ce)
                 except Exception as e:
@@ -571,9 +574,11 @@ async def _process_pending_uploads(app: Application):
                         f"{v}{type_map.get(k, k)}"
                         for k, v in sorted(file_types.items())
                     ) if file_types else "文件"
+                    note_line = f"\n📝 备注：{note}\n" if note else ""
                     await app.bot.send_message(
                         chat_id=uploader_id,
                         text=f"✅ 文件码：{file_code}\n\n"
+                             f"{note_line}"
                              f"📤 发送文件 → @{settings.UPLOAD_BOT_USERNAME}\n"
                              f"🔍 输入文件码 → @{settings.DECODER_BOT_USERNAME}\n"
                              f"📥 收取文件 → @{settings.SENDER_BOT_USERNAME}",
