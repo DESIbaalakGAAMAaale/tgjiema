@@ -16,7 +16,9 @@ from config import settings
 from database import dequeue_job, get_file_records_col
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.monitor import metrics
+from utils.rate_limiter import global_rate_limiter
 from utils.force_join import check_force_join, three_bot_reminder
+from utils.flood_waiter import safe_send_message, safe_send_media_group, safe_reply_text
 
 TOKEN = settings.SENDER_BOT_TOKEN
 PAGE_SIZE = 10
@@ -80,11 +82,16 @@ async def process_queue(bot):
             job = await dequeue_job()
             if job is None:
                 idle_count += 1
-                sleep_time = min(0.05 * (1.6 ** min(idle_count, 12)), 10.0)
+                sleep_time = min(2.0 * (1.6 ** min(idle_count, 12)), 10.0)
                 await asyncio.sleep(sleep_time)
                 continue
 
             idle_count = 0
+
+            # 全局限流：确保不超过 30 msg/sec
+            if not global_rate_limiter.acquire():
+                await asyncio.sleep(0.1)
+                continue
 
             if job.task_type == "batch" and job.storage_msg_ids and job.batch_file_meta:
                 await _process_batch_job(bot, job)
@@ -106,16 +113,26 @@ async def _process_single_job(bot, job):
         metrics.send_fail_count += 1
         return
 
+    # 读取 protect_content 设置
+    protect_content = False
+    try:
+        files_col = get_file_records_col()
+        record = await files_col.find_one({"file_code": job.code})
+        if record:
+            protect_content = record.get("protect_content", False)
+    except Exception as e:
+        logger.warning(f"[Dsp] 读取 protect_content 失败 (code={job.code}): {e}")
+
     # 使用 delivery_resolver 解析频道 + 降级
     resolved = await resolve_delivery_channel(job.storage_channel_id)
-    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id)
+    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content)
 
     if not success:
         # 环形降级：沿环找下一个可用频道
         from storage.delivery_resolver import resolve_delivery_channel as _resolve
         next_resolved = await _resolve(resolved.channel_id)
         if next_resolved.channel_id != resolved.channel_id:
-            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id)
+            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content)
 
     if success:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码 {job.code}")
@@ -127,7 +144,7 @@ async def _process_single_job(bot, job):
     metrics.send_fail_count += 1
     metrics.record_error("dsp_bot")
     try:
-        await bot.send_message(chat_id=job.target_user_id, text="文件发送失败，请稍后重试或联系管理员。")
+        await safe_send_message(bot, chat_id=job.target_user_id, text="文件发送失败，请稍后重试或联系管理员。")
     except Exception:
         pass
 
@@ -177,12 +194,23 @@ async def _process_batch_job(bot, job):
 
 
 async def _fallback_single_send(bot, job):
-    for mid in job.storage_msg_ids:
+    protect_content = False
+    try:
+        files_col = get_file_records_col()
+        record = await files_col.find_one({"file_code": job.code})
+        if record:
+            protect_content = record.get("protect_content", False)
+    except Exception:
+        pass
+    for i, mid in enumerate(job.storage_msg_ids):
         resolved = await resolve_delivery_channel(job.storage_channel_id)
-        if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid):
+        if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content):
             metrics.send_success_count += 1
         else:
             metrics.send_fail_count += 1
+        # 每条消息之间间隔 0.15s，避免同频道/同用户超限
+        if i < len(job.storage_msg_ids) - 1:
+            await asyncio.sleep(0.15)
     metrics.record_processed("dsp_bot")
 
 
@@ -193,7 +221,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
 
     input_media = [_build_input_media(meta) for meta in page_items]
     try:
-        await bot.send_media_group(chat_id=chat_id, media=input_media)
+        await safe_send_media_group(bot, chat_id=chat_id, media=input_media)
         logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码 {file_code}, 第{page}/{total_pages}页, {len(input_media)}个")
         metrics.send_success_count += 1
         metrics.record_processed("dsp_bot")
@@ -202,7 +230,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         metrics.send_fail_count += 1
         metrics.record_error("dsp_bot")
         try:
-            await bot.send_message(chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员。")
+            await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员。")
         except Exception:
             pass
         return
@@ -210,14 +238,16 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     if total_pages > 1 and page < total_pages:
         keyboard = _build_pagination_keyboard(file_code, page, total_pages)
         total_files = len(file_meta_list)
-        sent_msg = await bot.send_message(
-            chat_id=chat_id,
+        sent_msg = await safe_send_message(
+            bot, chat_id=chat_id,
             text=f"第 {page}/{total_pages} 页（共 {total_files} 个文件）",
             reply_markup=keyboard,
         )
         state = _pagination_states.get(file_code)
         if state:
             state["last_pagination_msg_id"] = sent_msg.message_id
+        # 翻页提示之间间隔 0.3s，避免用户聊天被消息淹没
+        await asyncio.sleep(0.3)
 
 
 # ─── 命令处理 ───
@@ -225,7 +255,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
-    await update.message.reply_text(
+    await safe_reply_text(update.message,
         "欢迎使用文件发送机器人！\n\n"
         "此机器人用于接收解码后的文件，无需手动操作。\n"
         "当您通过解码机器人获取文件码后，文件会自动发送给您。"

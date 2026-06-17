@@ -37,6 +37,7 @@ from services.relay_pool import relay_pool
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
+from utils.flood_waiter import safe_send_message, safe_reply_text
 
 TOKEN = settings.DECODER_BOT_TOKEN
 
@@ -121,8 +122,29 @@ def _parse_storage_ids_from_caption(caption: str) -> list[int]:
 
 # ─── 通道选择：从 cells 表获取 active 槽位 ───
 
+# ─── 活跃频道本地缓存（避免每次解码都查 cells 表） ───
+_active_channels_cache: list[dict] = []
+_active_channels_index = 0
+
+
+async def _refresh_active_channels():
+    """每 60 秒刷新一次活跃频道缓存（与 Up Bot 对齐）。"""
+    global _active_channels_cache, _active_channels_index
+    try:
+        _active_channels_cache = await get_active_cells()
+        _active_channels_index = 0
+    except Exception:
+        pass
+
+
 async def _get_storage_channel() -> int:
-    """获取当前活跃存储频道（取第一个 active 槽位）。"""
+    """获取当前活跃存储频道（从本地缓存，60 秒刷新一次）。"""
+    global _active_channels_index
+    if _active_channels_cache:
+        idx = _active_channels_index % len(_active_channels_cache)
+        _active_channels_index += 1
+        return _active_channels_cache[idx]["channel_id"]
+    # 缓存未就绪，回退到 DB 查询
     try:
         cells = await get_active_cells()
         if cells:
@@ -216,74 +238,15 @@ async def _flush_media_group_buffer(media_group_id: str):
         except Exception as e:
             logger.error(f"[Idx] 中继媒体组处理失败 (code={code}): {e}")
             try:
-                await bot.send_message(chat_id=user_id, text="外部文件发送失败，请稍后重试或联系管理员。")
+                await safe_send_message(bot, chat_id=user_id, text="外部文件发送失败，请稍后重试或联系管理员。")
             except Exception:
                 pass
         return
 
-    channel_msg_ids = []
-    batch_file_meta = []
-    active_channel = await _get_storage_channel()
-
-    for chat_id, msg_id, orig_caption in msgs:
-        try:
-            forwarded = await bot.copy_message(
-                chat_id=active_channel,
-                from_chat_id=chat_id,
-                message_id=msg_id,
-            )
-            channel_msg_ids.append(forwarded.message_id)
-            fid, ftype = _extract_media_info(forwarded)
-            batch_file_meta.append({"file_id": fid, "type": ftype})
-            if code:
-                await _cache_external_file(code, forwarded.message_id)
-        except Exception as e:
-            logger.error(f"[Idx] copy消息失败 (mg_id={media_group_id}): {e}")
-
-    if not channel_msg_ids:
-        return
-
-    try:
-        await _dispatch_to_dsp(
-            user_id, code, active_channel,
-            channel_msg_ids, json.dumps(batch_file_meta),
-        )
-        logger.info(f"[Idx] 外部媒体组已写 jobs: user={user_id}, code={code}, {len(channel_msg_ids)} 个")
-    except Exception as e:
-        logger.error(f"[Idx] 入队失败: {e}")
-        try:
-            await bot.send_message(chat_id=user_id, text="外部文件发送失败，请稍后重试或联系管理员。")
-        except Exception:
-            pass
-
-
-async def _cache_external_file(code: str, message_id: int):
-    try:
-        files_col = get_file_records_col()
-        existing = await files_col.find_one({"file_code": code})
-        if existing:
-            batch = existing.get("batch_msg_ids", "") or ""
-            if not isinstance(batch, str):
-                batch = str(batch)
-            batch_ids = [mid for mid in batch.split(",") if mid.strip()]
-            if str(message_id) not in batch_ids:
-                batch_ids.append(str(message_id))
-            await files_col.update_one(
-                {"file_code": code},
-                {"$set": {"batch_msg_ids": ",".join(batch_ids)}},
-            )
-        else:
-            record = make_file_record(
-                file_code=code,
-                uploader_id=0,
-                primary_channel_id=await _get_storage_channel(),
-                primary_channel_msg_id=message_id,
-                file_types={},
-            )
-            await files_col.insert_one(record)
-            logger.info(f"[Idx] 外部码已缓存到本地: {code}")
-    except Exception as e:
-        logger.error(f"[Idx] 缓存外部码失败 (code={code}): {e}")
+    # 外部媒体组：bot 间不可达，仅记录日志
+    # 外部码解码走中继系统（真实 Telegram 账号），中继账号上传到存储频道后发 RELAY_BATCH 通知
+    logger.warning(f"[Idx][mg_buf] 外部媒体组无法直接处理（bot 间无权限），code={code}, {len(msgs)}条消息")
+    return
 
 
 # ─── 中继处理 ───
@@ -307,18 +270,12 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
 
     if is_error:
         logger.info(f"[Idx] 外部机器人返回错误: code={code}")
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text="外部文件码查询失败，该码可能已失效或暂时不可用，请稍后重试。",
-        )
+        await safe_send_message(context.bot, chat_id=target_user_id, text="外部文件码查询失败，该码可能已失效或暂时不可用，请稍后重试。")
         return
 
     if is_renew:
         logger.info(f"[Idx] 记录已过期: {code}")
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"文件码 {code} 的缓存已过期，请重新发送该码以获取最新文件。",
-        )
+        await safe_send_message(context.bot, chat_id=target_user_id, text=f"文件码 {code} 的缓存已过期，请重新发送该码以获取最新文件。")
         return
 
     if is_batch:
@@ -339,10 +296,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
 
         if context:
             try:
-                await context.bot.send_message(
-                    chat_id=target_user_id,
-                    text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
-                )
+                await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。")
             except Exception:
                 pass
         return
@@ -352,10 +306,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     files_col = get_file_records_col()
     record = await files_col.find_one({"file_code": code})
     if not record:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"您请求的文件码 {code} 已处理，请重新发送该码获取文件。",
-        )
+        await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件码 {code} 已处理，请重新发送该码获取文件。")
         return
 
     storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
@@ -369,10 +320,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     await _dispatch_to_dsp(target_user_id, code, storage_channel, msg_ids, record.get("batch_file_meta", ""))
 
     try:
-        await context.bot.send_message(
-            chat_id=target_user_id,
-            text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。",
-        )
+        await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件码 {code} 已就绪，正在发送，请查收。")
     except Exception:
         pass
 
@@ -387,9 +335,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
     except Exception as e:
         logger.error(f"[Idx][start] 创建用户失败 (user={user.id}): {e}")
-        await update.message.reply_text("系统繁忙，请稍后重试。")
+        await safe_reply_text(update.message, "系统繁忙，请稍后重试。")
         return
-    await update.message.reply_text(
+    await safe_reply_text(update.message,
         "欢迎使用文件解码机器人！\n\n"
         "发送文件码即可获取对应文件。\n"
         "发送 /status 查看您的会员状态和今日剩余解码次数。\n"
@@ -401,7 +349,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
-    await update.message.reply_text(
+    await safe_reply_text(update.message,
         "文件解码机器人 使用帮助\n\n"
         "1. 获取文件：直接发送文件码即可获取文件。\n"
         "2. 上传文件：请使用上传机器人发送文件，上传后会自动收到文件码。\n"
@@ -428,7 +376,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_user = await get_or_create_user(user.id)
     except Exception as e:
         logger.error(f"[Idx][status] 获取用户信息失败: {e}")
-        await update.message.reply_text("系统繁忙，无法获取用户信息，请稍后重试。")
+        await safe_reply_text(update.message, "系统繁忙，无法获取用户信息，请稍后重试。")
         return
     level_map = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
     level_name = level_map.get(db_user.get("membership_level"), "未知")
@@ -467,7 +415,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         ext_str = f"{max(0, ext_quota - ext_used)}/{ext_quota}"
 
-    await update.message.reply_text(
+    await safe_reply_text(update.message,
         f"用户状态\n"
         f"会员等级：{level_name}\n"
         f"今日剩余解码次数：{quota_str}\n"
@@ -479,19 +427,23 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── pending_uploads 轮询（生成文件码） ───
 
 async def _process_pending_uploads(app: Application):
-    idle_count = 0
+    """处理 pending_uploads：先查本地 SQLite 通知（零 RU），有信号才查 CRDB。"""
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+
     while True:
         try:
+            # 无事发生：查本地 SQLite，零 RU
+            if not await store.has_new_upload():
+                await asyncio.sleep(30)
+                continue
+
             pending_col = get_pending_uploads_col()
             rows = await pending_col.find({"processed": 0}, limit=5)
 
             if not rows:
-                idle_count += 1
-                sleep_time = min(0.1 * (1.5 ** min(idle_count, 12)), 10.0)
-                await asyncio.sleep(sleep_time)
+                await asyncio.sleep(1)
                 continue
-
-            idle_count = 0
 
             for row in rows:
                 pend_id = row.get("id")
@@ -504,6 +456,8 @@ async def _process_pending_uploads(app: Application):
                 batch_msg_ids_str = row.get("batch_msg_ids", "")
                 batch_file_meta_str = row.get("batch_file_meta", "")
                 note = row.get("note", "")
+                protect_content = row.get("protect_content", settings.DEFAULT_PROTECT_CONTENT)
+                file_ttl_days = row.get("file_ttl_days", settings.DEFAULT_FILE_TTL_DAYS)
 
                 if not uploader_id or not channel_id or not message_id:
                     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
@@ -514,10 +468,7 @@ async def _process_pending_uploads(app: Application):
                 except Exception as e:
                     logger.error(f"[Idx][poll] 生成文件码失败 (uploader={uploader_id}): {e}")
                     try:
-                        await app.bot.send_message(
-                            chat_id=uploader_id,
-                            text="文件处理失败，请稍后重试或联系管理员。",
-                        )
+                        await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试或联系管理员。")
                     except Exception:
                         pass
                     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
@@ -535,14 +486,14 @@ async def _process_pending_uploads(app: Application):
                         batch_msg_ids=batch_msg_ids_str,
                         batch_file_meta=batch_file_meta_str,
                         note=note,
+                        protect_content=protect_content,
+                        file_ttl_days=file_ttl_days,
                     )
                     await files_col.insert_one(record)
                 except Exception as e:
                     logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
                     try:
-                        await app.bot.send_message(
-                            chat_id=uploader_id, text="文件处理失败，请稍后重试。"
-                        )
+                        await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试。")
                     except Exception:
                         pass
                     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
@@ -564,6 +515,23 @@ async def _process_pending_uploads(app: Application):
                 except Exception as e:
                     logger.error(f"[Idx][poll] codes表写入失败 (code={file_code}): {e}")
 
+                # ── 外部文件：写入外部码映射 ──
+                ext_code = None
+                if note:
+                    try:
+                        note_parsed = json.loads(note)
+                        if isinstance(note_parsed, dict) and note_parsed.get("type") == "external":
+                            ext_code = note_parsed.get("code", "")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if ext_code:
+                    try:
+                        from database import set_external_code_mapping
+                        await set_external_code_mapping(ext_code, file_code, bot_username="")
+                        logger.info(f"[Idx][poll] 外部码映射已写入: {ext_code} → {file_code}")
+                    except Exception as e:
+                        logger.error(f"[Idx][poll] 外部码映射写入失败 (code={ext_code}): {e}")
+
                 # 通知上传者
                 try:
                     type_map = {
@@ -574,16 +542,18 @@ async def _process_pending_uploads(app: Application):
                         f"{v}{type_map.get(k, k)}"
                         for k, v in sorted(file_types.items())
                     ) if file_types else "文件"
-                    note_line = f"\n📝 备注：{note}\n" if note else ""
-                    await app.bot.send_message(
-                        chat_id=uploader_id,
-                        text=f"✅ 文件码：{file_code}\n\n"
-                             f"{note_line}"
-                             f"📤 发送文件 → @{settings.UPLOAD_BOT_USERNAME}\n"
-                             f"🔍 输入文件码 → @{settings.DECODER_BOT_USERNAME}\n"
-                             f"📥 收取文件 → @{settings.SENDER_BOT_USERNAME}",
-                    )
-                    logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
+                    if ext_code:
+                        await safe_send_message(app.bot, chat_id=uploader_id, text=f"✅ 外部文件码 {ext_code} 已就绪，请重新发送文件码即可查收。")
+                        logger.info(f"[Idx][poll] 外部码已就绪: {ext_code} → {file_code}")
+                    else:
+                        note_line = f"\n📝 备注：{note}\n" if note else ""
+                        await safe_send_message(app.bot, chat_id=uploader_id, text=f"✅ 文件码：{file_code}\n\n"
+                                 f"{note_line}"
+                                 f"📤 发送文件 → @{settings.UPLOAD_BOT_USERNAME}\n"
+                                 f"🔍 输入文件码 → @{settings.DECODER_BOT_USERNAME}\n"
+                                 f"📥 收取文件 → @{settings.SENDER_BOT_USERNAME}",
+                        )
+                        logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
                 except Exception as e:
                     logger.error(f"[Idx][poll] 发送文件码失败 (code={file_code}): {e}")
 
@@ -593,8 +563,7 @@ async def _process_pending_uploads(app: Application):
 
         except Exception as e:
             logger.error(f"[Idx][poll] pending_uploads 轮询异常: {e}")
-            idle_count += 1
-            await asyncio.sleep(min(2 * idle_count, 10))
+            await asyncio.sleep(5)
 
 
 # ─── 内部码解码 ───
@@ -609,10 +578,10 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not global_rate_limiter.acquire():
-        await update.message.reply_text("系统繁忙，请稍后重试。")
+        await safe_reply_text(update.message, "系统繁忙，请稍后重试。")
         return
     if not user_rate_limiter.acquire(user.id):
-        await update.message.reply_text("操作过于频繁，请稍后重试。")
+        await safe_reply_text(update.message, "操作过于频繁，请稍后重试。")
         return
 
     await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
@@ -620,7 +589,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = await check_decode_permission(user.id, text)
 
     if not result.allowed:
-        await update.message.reply_text(result.reason)
+        await safe_reply_text(update.message, result.reason)
         return
 
     if result.is_external:
@@ -630,7 +599,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for inst in relay_pool.instances:
                 if inst.is_ready:
                     await inst.deliver_cached(user.id, text)
-                    await update.message.reply_text("正在发送文件，请稍候...")
+                    await safe_reply_text(update.message, "正在发送文件，请稍候...")
                     return
         await handle_external_code(update, context, user.id, text, result)
         return
@@ -660,16 +629,14 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _dispatch_to_dsp(user.id, text, storage_channel, msg_ids, batch_file_meta_str)
     except Exception as e:
         logger.error(f"[Idx][handle_code] 写 jobs 失败 (user={user.id}, code={text}): {e}")
-        await update.message.reply_text("系统繁忙，文件发送请求失败，请稍后重试。")
+        await safe_reply_text(update.message, "系统繁忙，文件发送请求失败，请稍后重试。")
         return
 
     remaining_info = ""
     if result.remaining_quota >= 0:
         remaining_info = f"今日剩余解码次数：{result.remaining_quota}"
 
-    await update.message.reply_text(
-        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给您，请查收。\n{remaining_info}"
-    )
+    await safe_reply_text(update.message, f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给您，请查收。\n{remaining_info}")
 
     metrics.decode_count += 1
     metrics.record_processed("idx_bot")
@@ -718,7 +685,7 @@ async def handle_external_code(update, context, user_id, code, result):
             batch_file_meta_str = file_record.get("batch_file_meta") or ""
             try:
                 await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str)
-                await update.message.reply_text(
+                await safe_reply_text(update.message,
                     f"文件码 {code} 已缓存，正在发送，请查收。\n"
                     f"(系统码: {system_code})"
                 )
@@ -727,7 +694,7 @@ async def handle_external_code(update, context, user_id, code, result):
                 return
             except Exception as e:
                 logger.error(f"[Idx][external] 映射调度失败 (ext={code}, sys={system_code}): {e}")
-                await update.message.reply_text("外部文件码发送失败，请稍后重试。")
+                await safe_reply_text(update.message, "外部文件码发送失败，请稍后重试。")
                 return
         else:
             logger.warning(f"[Idx][external] 映射的系统码 {system_code} 无 file_record，回退到外部查询")
@@ -758,26 +725,26 @@ async def handle_external_code(update, context, user_id, code, result):
         if ok:
             await relay_pool.release_account(account, duration_ms)
             _enqueue_external(bot_username, user_id, code)
-            await update.message.reply_text(f"正在查询外部文件码，请稍候查收。\n{remaining_info}")
+            await safe_reply_text(update.message, f"正在查询外部文件码，请稍候查收。\n{remaining_info}")
             metrics.decode_count += 1
             metrics.record_processed("idx_bot")
             return
 
     try:
-        await context.bot.send_message(chat_id=f"@{bot_username}", text=code)
+        await safe_send_message(context.bot, chat_id=bot_username, text=code)
         _enqueue_external(bot_username, user_id, code)
-        await update.message.reply_text(f"正在查询外部文件码，请稍候查收。\n{remaining_info}")
+        await safe_reply_text(update.message, f"正在查询外部文件码，请稍候查收。\n{remaining_info}")
         metrics.decode_count += 1
         metrics.record_processed("idx_bot")
     except Exception as e:
         err_msg = str(e)
         logger.warning(f"[Idx][external] 无法发送到 @{bot_username}: {err_msg}")
         if "chat not found" in err_msg.lower() or "nobody is using" in err_msg.lower():
-            await update.message.reply_text(
+            await safe_reply_text(update.message,
                 f"机器人 @{bot_username} 未找到，请检查文件码中的机器人用户名是否正确。"
             )
         else:
-            await update.message.reply_text("外部码解码功能暂不可用，请联系管理员配置用户中继。")
+            await safe_reply_text(update.message, "外部码解码功能暂不可用，请联系管理员配置用户中继。")
 
 
 async def handle_external_file_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -788,18 +755,10 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
     if target_user_id is None:
         return
 
-    active_channel = await _get_storage_channel()
-    try:
-        forwarded = await update.message.copy(chat_id=active_channel)
-        await _cache_external_file(code, forwarded.message_id)
-    except Exception as e:
-        logger.error(f"[Idx][ext_resp] 缓存失败 (code={code}): {e}")
-        return
-
-    try:
-        await _dispatch_to_dsp(target_user_id, code, active_channel, [forwarded.message_id])
-    except Exception as e:
-        logger.error(f"[Idx][ext_resp] 入队失败 (code={code}): {e}")
+    # 边缘情况：第三方 bot 直接向 Idx Bot 回复文件
+    # Telegram 不允许 bot 间直接交互，此路径实际不可用
+    # 外部码解码走中继系统（真实 Telegram 账号），中继完成后再上游通知 Idx Bot
+    logger.warning(f"[Idx][ext_resp] 收到外部文件但无法处理（bot 间无权限），code={code}, from=@{bot_username}")
 
 
 async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -810,18 +769,7 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
     if target_user_id is None:
         return
 
-    active_channel = await _get_storage_channel()
-    try:
-        forwarded = await update.message.copy(chat_id=active_channel)
-        await _cache_external_file(code, forwarded.message_id)
-    except Exception as e:
-        logger.error(f"[Idx][ext_media] 缓存失败 (code={code}): {e}")
-        return
-
-    try:
-        await _dispatch_to_dsp(target_user_id, code, active_channel, [forwarded.message_id])
-    except Exception as e:
-        logger.error(f"[Idx][ext_media] 入队失败 (code={code}): {e}")
+    logger.warning(f"[Idx][ext_media] 收到外部媒体但无法处理（bot 间无权限），code={code}, from=@{bot_username}")
 
 
 async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -848,10 +796,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         record = await files_col.find_one({"file_code": code_part})
         if not record:
             try:
-                await context.bot.send_message(
-                    chat_id=target_user_id,
-                    text=f"您请求的文件码 {code_part} 发送失败，请稍后重试。",
-                )
+                await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件码 {code_part} 发送失败，请稍后重试。")
             except Exception:
                 pass
             return True
@@ -863,10 +808,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         logger.error(f"[Idx][relay_file] 处理失败 (code={code_part}): {e}")
         try:
-            await context.bot.send_message(
-                chat_id=target_user_id,
-                text=f"您请求的文件码 {code_part} 发送失败，请稍后重试。",
-            )
+            await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件码 {code_part} 发送失败，请稍后重试。")
         except Exception:
             pass
     return True
@@ -994,6 +936,14 @@ async def _async_main():
     loop.create_task(dump_cache_to_disk_loop())
     from database import cleanup_old_records
     loop.create_task(cleanup_old_records())
+
+    # 活跃频道缓存：启动时立即刷新，此后每 60 秒
+    await _refresh_active_channels()
+    async def _channel_refresh_loop():
+        while True:
+            await asyncio.sleep(60)
+            await _refresh_active_channels()
+    loop.create_task(_channel_refresh_loop())
 
     async with app:
         await app.start()

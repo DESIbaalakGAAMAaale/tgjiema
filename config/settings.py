@@ -80,6 +80,10 @@ class Settings(BaseSettings):
 
     FILE_CODE_PREFIX: str = "tgwenjian"
 
+    # ── 上传选项默认值 ──
+    DEFAULT_PROTECT_CONTENT: bool = False
+    DEFAULT_FILE_TTL_DAYS: int = 0  # 0=永久有效
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

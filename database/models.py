@@ -53,10 +53,16 @@ def make_file_record(
     batch_msg_ids: str = "",
     batch_file_meta: str = "",
     note: str = "",
+    protect_content: bool = False,
+    file_ttl_days: int = 0,
 ):
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
+    expire_time = None
+    if file_ttl_days and file_ttl_days > 0:
+        from datetime import timedelta
+        expire_time = now + timedelta(days=file_ttl_days)
     return {
         "file_code": file_code,
         "uploader_id": uploader_id,
@@ -70,7 +76,8 @@ def make_file_record(
         "status": status,
         "request_count": request_count,
         "create_time": now,
-        "expire_time": None,
+        "expire_time": expire_time,
+        "protect_content": protect_content,
     }
 
 

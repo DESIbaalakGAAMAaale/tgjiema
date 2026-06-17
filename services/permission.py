@@ -148,6 +148,19 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     # 使用缓存查询文件记录
     file_record = await get_file_record_cached(file_code)
     if file_record is not None and file_record.get("status") == "active":
+        # 检查文件码是否过期
+        expire_time = file_record.get("expire_time")
+        if expire_time is not None:
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            expire_dt = expire_time
+            if isinstance(expire_time, str):
+                try:
+                    expire_dt = datetime.fromisoformat(expire_time)
+                except (ValueError, TypeError):
+                    pass
+            if expire_dt < now:
+                return DecodeResult(allowed=False, reason="该文件码已过期")
         await update_user_and_invalidate(user_id, {"$inc": {"quota_used_today": 1}})
         if not is_system_code(file_code):
             await update_user_and_invalidate(user_id, {"$inc": {"external_used_today": 1}})

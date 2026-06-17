@@ -2,12 +2,14 @@
 给定一个取件任务，按环形顺序解析最佳存储频道。
 如果首选频道不可达，自动降级到 Shadow1→Shadow2→下一环。
 """
+import asyncio
 from database import (
     get_active_or_shadow_cell,
     get_next_active_cell,
     get_cells_col,
 )
 from utils.flood_waiter import safe_copy_message
+from utils.per_channel_limiter import acquire_channel_limit
 
 
 class DeliveryChannel:
@@ -94,10 +96,15 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
     return DeliveryChannel(channel_id, "unknown", "fallback")
 
 
-async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int) -> bool:
-    """尝试从指定频道发送一条消息给用户（带 Flood Wait 退避）。成功返回 True。"""
+async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False) -> bool:
+    """尝试从指定频道发送一条消息给用户（带 Flood Wait 退避 + 频道限流）。成功返回 True。"""
+    # 频道限流：检查是否超过 15 msg/min
+    wait = acquire_channel_limit(from_channel_id)
+    if wait > 0:
+        await asyncio.sleep(wait)
+
     try:
-        await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id)
+        await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id, protect_content=protect_content)
         return True
     except Exception:
         return False
@@ -109,6 +116,7 @@ async def deliver_with_fallback(
     primary_channel_id: int,
     message_ids: list[int],
     max_attempts: int = 3,
+    protect_content: bool = False,
 ) -> int:
     """带降级的批量发送。逐个消息尝试，失败时换频道。
 
@@ -129,10 +137,14 @@ async def deliver_with_fallback(
                 current_channel = next_resolved.channel_id
                 tried_channels.add(current_channel)
 
-            ok = await try_deliver(bot_instance, target_user_id, current_channel, msg_id)
+            ok = await try_deliver(bot_instance, target_user_id, current_channel, msg_id, protect_content=protect_content)
             if ok:
                 success_count += 1
                 tried_channels.add(current_channel)
                 break
+
+            # 同一条消息重试前短暂等待
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(0.15)
 
     return success_count

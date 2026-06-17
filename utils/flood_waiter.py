@@ -22,12 +22,15 @@ def reset_backoff():
     _consecutive_floods = 0
 
 
-async def api_call_with_backoff(coro, description: str = "") -> object:
-    """执行一个 Telegram API 协程，自动处理 Flood Wait。
+async def api_call_with_backoff(coro_factory, description: str = "") -> object:
+    """执行一个 Telegram API 调用，自动处理 Flood Wait。
+
+    注意：coro_factory 是一个返回协程的工厂函数，每次重试都会创建新的协程。
+    这是因为协程只能 await 一次，复用已消耗的协程会导致 RuntimeError。
 
     用法：
         result = await api_call_with_backoff(
-            bot.copy_message(chat_id=..., from_chat_id=..., message_id=...),
+            lambda: bot.copy_message(chat_id=..., from_chat_id=..., message_id=...),
             "copy_message",
         )
     """
@@ -43,6 +46,7 @@ async def api_call_with_backoff(coro, description: str = "") -> object:
             await asyncio.sleep(wait)
 
         try:
+            coro = coro_factory()
             result = await coro
             # 成功后重置退避
             if attempt > 0:
@@ -82,7 +86,7 @@ def with_flood_backoff(description: str = ""):
             @functools.wraps(func)
             async def wrapper(*args, **kwargs):
                 return await api_call_with_backoff(
-                    func(*args, **kwargs),
+                    lambda *a=args, **kw=kwargs: func(*a, **kw),
                     description or func.__name__,
                 )
             return wrapper
@@ -90,13 +94,11 @@ def with_flood_backoff(description: str = ""):
     return decorator
 
 
-async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: int) -> object:
+async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: int, **kwargs) -> object:
     """安全复制消息（自动退避）。"""
     return await api_call_with_backoff(
-        bot.copy_message(
-            chat_id=chat_id,
-            from_chat_id=from_chat_id,
-            message_id=message_id,
+        lambda c=chat_id, f=from_chat_id, m=message_id, kw=kwargs: bot.copy_message(
+            chat_id=c, from_chat_id=f, message_id=m, **kw
         ),
         f"copy_message({from_chat_id}→{chat_id}, msg={message_id})",
     )
@@ -105,15 +107,25 @@ async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: in
 async def safe_send_message(bot, chat_id: int, text: str, **kwargs) -> object:
     """安全发送文本消息（自动退避）。"""
     return await api_call_with_backoff(
-        bot.send_message(chat_id=chat_id, text=text, **kwargs),
+        lambda t=text, **kw=kwargs: bot.send_message(chat_id=chat_id, text=t, **kw),
         f"send_message({chat_id})",
+    )
+
+
+async def safe_reply_text(message, text: str, **kwargs) -> object:
+    """安全回复消息（自动退避），替代 update.message.reply_text()。"""
+    from telegram import Message
+    chat_id = message.chat_id if isinstance(message, Message) else message.chat.id
+    return await api_call_with_backoff(
+        lambda t=text, **kw=kwargs: message.reply_text(text=t, **kw),
+        f"reply_text({chat_id})",
     )
 
 
 async def safe_send_media_group(bot, chat_id: int, media: list, **kwargs) -> object:
     """安全发送媒体组（自动退避）。"""
     return await api_call_with_backoff(
-        bot.send_media_group(chat_id=chat_id, media=media, **kwargs),
+        lambda m=media, **kw=kwargs: bot.send_media_group(chat_id=chat_id, media=m, **kw),
         f"send_media_group({chat_id}, {len(media)} items)",
     )
 
