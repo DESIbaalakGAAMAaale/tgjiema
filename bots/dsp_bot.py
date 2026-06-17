@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+from typing import Any
 
 from telegram import Update
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,15 +14,19 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from loguru import logger
 
 from config import settings
-from database import dequeue_job, get_file_records_col
+from database import dequeue_job, get_file_records_col, reenqueue_job
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.monitor import metrics
-from utils.rate_limiter import global_rate_limiter
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import safe_send_message, safe_send_media_group, safe_reply_text
 
 TOKEN = settings.SENDER_BOT_TOKEN
 PAGE_SIZE = 10
+
+# ─── 多 worker 并发控制 ───
+# 最大并发发送数（留 5 个余量给 copy_message 等其他 API 调用）
+_SEND_CONCURRENCY = 25
+_send_semaphore = asyncio.Semaphore(_SEND_CONCURRENCY)
 
 _pagination_states: dict[str, dict] = {}
 
@@ -72,10 +77,23 @@ def _build_page_number_buttons(file_code: str, current_page: int, total_pages: i
     return buttons
 
 
-# ─── 核心：从 jobs 表拉取任务 ───
+# ─── 核心：多 worker 并发处理 jobs 表 ───
 
 async def process_queue(bot):
-    """不断从 jobs 表拉取待派工任务，发送给用户。"""
+    """启动多个 worker 并发处理 jobs 队列。"""
+    workers = []
+    num_workers = min(4, _SEND_CONCURRENCY)  # 最多 4 个 worker
+    logger.info(f"[Dsp] 启动 {num_workers} 个 worker，并发上限 {_SEND_CONCURRENCY}")
+    for i in range(num_workers):
+        w = asyncio.create_task(_dsp_worker(bot, i))
+        workers.append(w)
+
+    for w in workers:
+        await w
+
+
+async def _dsp_worker(bot: Any, worker_id: int):
+    """单个 worker 循环拉取任务。"""
     idle_count = 0
     while True:
         try:
@@ -88,18 +106,27 @@ async def process_queue(bot):
 
             idle_count = 0
 
-            # 全局限流：确保不超过 30 msg/sec
-            if not global_rate_limiter.acquire():
-                await asyncio.sleep(0.1)
+            # 等待 semaphore（最多 10 秒）
+            acquired = await asyncio.wait_for(
+                _send_semaphore.acquire(), timeout=10.0
+            )
+            if not acquired:
+                # 等超时，重新入队
+                await reenqueue_job(job.job_id)
+                logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时，重新入队 job={job.job_id}")
+                await asyncio.sleep(1)
                 continue
 
-            if job.task_type == "batch" and job.storage_msg_ids and job.batch_file_meta:
-                await _process_batch_job(bot, job)
-            else:
-                await _process_single_job(bot, job)
+            try:
+                if job.task_type == "batch" and job.storage_msg_ids and job.batch_file_meta:
+                    await _process_batch_job(bot, job)
+                else:
+                    await _process_single_job(bot, job)
+            finally:
+                _send_semaphore.release()
 
         except Exception as e:
-            logger.error(f"[Dsp] 队列处理异常: {e}")
+            logger.error(f"[Dsp-{worker_id}] 队列处理异常: {e}")
             await asyncio.sleep(1)
 
 

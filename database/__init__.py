@@ -32,7 +32,7 @@ from .session import (
     delete_bot_decode_interval, get_all_bot_decode_intervals,
     get_active_cells, get_next_active_cell, get_active_or_shadow_cell,
     set_cell_status, update_cell_heartbeat,
-    enqueue_job, dequeue_job, JobResult,
+    enqueue_job, dequeue_job, reenqueue_job, JobResult,
     log_rotate,
     get_external_code_mapping_col, get_system_code_for_external, set_external_code_mapping,
     cleanup_old_records,

@@ -188,6 +188,9 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS send_queue ADD COLUMN IF NOT EXISTS channel_msg_ids TEXT",
     "ALTER TABLE IF EXISTS send_queue ADD COLUMN IF NOT EXISTS batch_file_meta TEXT",
     "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
+    # ─── CRDB 行级 TTL：零 RU 自动清理，替代 Python cleanup ───
+    "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''7 days''', ttl_job_cron = '@hourly')",
+    "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''7 days''', ttl_job_cron = '@hourly')",
 ]
 
 
@@ -1163,6 +1166,17 @@ async def dequeue_job():
     )
 
 
+async def reenqueue_job(job_id: int) -> bool:
+    """将一个 dispatched 的 job 重新标记为 pending（用于 semaphore 等待超时）。"""
+    col = get_jobs_col()
+    result = await col._query("""
+        UPDATE jobs SET status = 'pending'
+        WHERE id = $1 AND status = 'dispatched'
+        RETURNING id
+    """, job_id)
+    return len(result) > 0
+
+
 class JobResult:
     def __init__(
         self,
@@ -1206,10 +1220,10 @@ async def log_rotate(
 
 
 async def cleanup_old_records():
-    """每天凌晨 3 点批量清理 30 天前的 decode_logs + jobs（批量 DELETE，低 RU 消耗）。"""
+    """每天凌晨 3 点批量清理 7 天前的 decode_logs + jobs。
+    CRDB 行级 TTL 已启用（零 RU 自动清理），此函数作为补充兜底。"""
     import asyncio as _asyncio
     import time as _time
-    import string as _string
 
     while True:
         await _asyncio.sleep(3600)
@@ -1217,13 +1231,13 @@ async def cleanup_old_records():
         if now.tm_hour != 3:
             continue
 
-        cutoff_iso = datetime.fromtimestamp(_time.time() - 86400 * 30).isoformat()
+        cutoff_iso = datetime.fromtimestamp(_time.time() - 86400 * 7).isoformat()
         tables = [
             (get_decode_logs_col(), "request_time"),
             (get_jobs_col(),        "created_at"),
         ]
         total_deleted = 0
-        max_per_table = 100_000  # 单次清理上限保护
+        max_per_table = 100_000
 
         for col, time_col in tables:
             deleted = 0
@@ -1245,4 +1259,4 @@ async def cleanup_old_records():
 
         if total_deleted > 0:
             logger.info(f"[cleanup] 本次共清理 {total_deleted} 条")
-        await _asyncio.sleep(3600)  # 清理后等一小时再进入下一轮
+        await _asyncio.sleep(3600)
