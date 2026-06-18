@@ -43,8 +43,8 @@ class QueryCache:
         self.cache.clear()
 
 
-_user_cache = QueryCache(max_size=10000, ttl_seconds=5184000)       # 60天
-_file_record_cache = QueryCache(max_size=10000, ttl_seconds=5184000) # 60天
+_user_cache = QueryCache(max_size=1000, ttl_seconds=10800)           # 1000条/3小时
+_file_record_cache = QueryCache(max_size=1000, ttl_seconds=604800)  # 1000条/7天（解码热门）
 _config_cache = QueryCache(max_size=100, ttl_seconds=600)            # 10分钟
 
 
@@ -58,6 +58,48 @@ def get_file_record_cache() -> QueryCache:
 
 def get_config_cache() -> QueryCache:
     return _config_cache
+
+
+# ─── codes 表缓存（取件码创建后不变，7天 TTL） ────────────
+
+_code_cache = QueryCache(max_size=5000, ttl_seconds=604800)  # 5000条/7天
+
+
+def get_code_cache() -> QueryCache:
+    return _code_cache
+
+
+# ─── request_count 本地累积：批量写 CRDB ──────────────────
+
+_request_count_buffer: dict[str, int] = {}
+_request_count_lock = asyncio.Lock()
+_REQUEST_COUNT_FLUSH_INTERVAL = 60  # 每 60 秒 flush 一次
+
+
+async def incr_request_count(file_code: str):
+    """本地累积 request_count，避免每次解码写一次 CRDB。"""
+    async with _request_count_lock:
+        _request_count_buffer[file_code] = _request_count_buffer.get(file_code, 0) + 1
+
+
+async def _flush_request_count_loop():
+    """后台任务：每 60 秒批量 flush request_count 到 CRDB。"""
+    from loguru import logger
+    from .session import update_file_record_and_invalidate as _update
+
+    while True:
+        await asyncio.sleep(_REQUEST_COUNT_FLUSH_INTERVAL)
+        try:
+            async with _request_count_lock:
+                if not _request_count_buffer:
+                    continue
+                batch = _request_count_buffer.copy()
+                _request_count_buffer.clear()
+            for code, count in batch.items():
+                await _update(code, {"$inc": {"request_count": count}})
+            logger.debug(f"[request_count] flushed {len(batch)} codes, {sum(batch.values())} counts")
+        except Exception as e:
+            logger.error(f"[request_count] flush failed: {e}")
 
 
 # ─── SQLite 持久化备份 ──────────────────────────────────────────
@@ -96,7 +138,7 @@ async def dump_cache_to_disk_loop():
 
 
 async def load_cache_from_disk():
-    """启动时从 SQLite 恢复到本进程内存缓存"""
+    """启动时从 SQLite 恢复到本进程内存缓存（只恢复最热的 N 条到 L1）"""
     from loguru import logger
     from .cache_store import get_cache_store
 
@@ -104,17 +146,27 @@ async def load_cache_from_disk():
     try:
         records = await store.load()
         loaded = 0
+        max_user = _user_cache.max_size
+        max_file = _file_record_cache.max_size
+        max_config = _config_cache.max_size
         for key, data in records:
-            if key.startswith("user:") and len(_user_cache.cache) < _user_cache.max_size:
+            if key.startswith("user:"):
+                if len(_user_cache.cache) >= max_user:
+                    continue
                 _user_cache.cache[key] = {"data": data, "ts": time.time()}
                 loaded += 1
-            elif key.startswith("file:") and len(_file_record_cache.cache) < _file_record_cache.max_size:
+            elif key.startswith("file:"):
+                if len(_file_record_cache.cache) >= max_file:
+                    continue
                 _file_record_cache.cache[key] = {"data": data, "ts": time.time()}
                 loaded += 1
-            elif key.startswith("config:") and len(_config_cache.cache) < _config_cache.max_size:
+            elif key.startswith("config:"):
+                if len(_config_cache.cache) >= max_config:
+                    continue
                 _config_cache.cache[key] = {"data": data, "ts": time.time()}
                 loaded += 1
-        logger.info(f"[cache_store] 从 SQLite 恢复 {loaded} 条缓存到内存")
+        logger.info(f"[cache_store] 从 SQLite 恢复 {loaded} 条最近缓存到 L1")
+        logger.info(f"    用户缓存: {len(_user_cache.cache)}条, 文件缓存: {len(_file_record_cache.cache)}条")
     except Exception as e:
         logger.warning(f"[cache_store] 加载失败（回退纯内存模式）: {e}")
 

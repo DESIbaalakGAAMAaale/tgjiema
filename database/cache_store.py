@@ -71,11 +71,11 @@ class CacheStore:
             await self._db.commit()
 
     async def load(self) -> list[tuple[str, dict]]:
-        """返回所有缓存记录 [(key, data), ...]"""
+        """返回所有缓存记录 [(key, data), ...]，按时间戳降序（最新的在前）"""
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
-            "SELECT key, value FROM cache_backup"
+            "SELECT key, value FROM cache_backup ORDER BY ts DESC"
         )
         result = []
         for key, val_json in rows:
@@ -84,6 +84,34 @@ class CacheStore:
             except (json.JSONDecodeError, TypeError):
                 pass
         return result
+
+    async def get(self, key: str) -> Optional[dict]:
+        """单条读取：从 SQLite 缓存中读取指定 key 的数据"""
+        if not self._db:
+            return None
+        row = await self._db.execute_fetchall(
+            "SELECT value FROM cache_backup WHERE key = ?", (key,)
+        )
+        if row:
+            try:
+                return json.loads(row[0][0])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return None
+
+    async def set(self, key: str, data: dict):
+        """单条写入：直接写入 SQLite（写穿透时使用）"""
+        if not self._db:
+            return
+        try:
+            val = json.dumps(data, default=str).decode()
+            await self._db.execute(
+                "INSERT OR REPLACE INTO cache_backup (key, value, ts) VALUES (?, ?, ?)",
+                (key, val, time.time()),
+            )
+            await self._db.commit()
+        except (TypeError, ValueError):
+            pass
 
     async def cleanup(self, max_age_days: int = 30):
         """清理超过 N 天的旧缓存"""

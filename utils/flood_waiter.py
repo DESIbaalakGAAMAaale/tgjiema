@@ -141,6 +141,59 @@ async def safe_send_media_group(bot, chat_id: int, media: list, bot_id: int = 0,
     )
 
 
+# ─── file_id 直发函数（避开 copy_message 的频道限速） ──
+
+
+async def safe_send_photo(bot, chat_id: int, photo: str, bot_id: int = 0, **kwargs):
+    """安全发送照片（自动退避）。"""
+    _cid, _fid, _kw = chat_id, photo, kwargs
+    return await api_call_with_backoff(
+        lambda: bot.send_photo(chat_id=_cid, photo=_fid, **_kw),
+        f"send_photo({chat_id})",
+        bot_id=bot_id,
+    )
+
+
+async def safe_send_video(bot, chat_id: int, video: str, bot_id: int = 0, **kwargs):
+    """安全发送视频（自动退避）。"""
+    _cid, _fid, _kw = chat_id, video, kwargs
+    return await api_call_with_backoff(
+        lambda: bot.send_video(chat_id=_cid, video=_fid, **_kw),
+        f"send_video({chat_id})",
+        bot_id=bot_id,
+    )
+
+
+async def safe_send_audio(bot, chat_id: int, audio: str, bot_id: int = 0, **kwargs):
+    """安全发送音频（自动退避）。"""
+    _cid, _fid, _kw = chat_id, audio, kwargs
+    return await api_call_with_backoff(
+        lambda: bot.send_audio(chat_id=_cid, audio=_fid, **_kw),
+        f"send_audio({chat_id})",
+        bot_id=bot_id,
+    )
+
+
+async def safe_send_animation(bot, chat_id: int, animation: str, bot_id: int = 0, **kwargs):
+    """安全发送动画（自动退避）。"""
+    _cid, _fid, _kw = chat_id, animation, kwargs
+    return await api_call_with_backoff(
+        lambda: bot.send_animation(chat_id=_cid, animation=_fid, **_kw),
+        f"send_animation({chat_id})",
+        bot_id=bot_id,
+    )
+
+
+async def safe_send_document(bot, chat_id: int, document: str, bot_id: int = 0, **kwargs):
+    """安全发送文件（自动退避）。"""
+    _cid, _fid, _kw = chat_id, document, kwargs
+    return await api_call_with_backoff(
+        lambda: bot.send_document(chat_id=_cid, document=_fid, **_kw),
+        f"send_document({chat_id})",
+        bot_id=bot_id,
+    )
+
+
 # ─── 退避状态监控 ───
 
 def is_in_backoff(bot_id: int = 0) -> bool:

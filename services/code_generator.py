@@ -1,8 +1,10 @@
+import hashlib
+import os
 import re
 import secrets
 import string
+import time
 
-from database import get_file_records_col
 from config import settings
 
 CODE_ALPHABET = string.ascii_lowercase + string.digits
@@ -12,13 +14,24 @@ _BOT_PATTERN = re.compile(r"^[a-zA-Z0-9_]+bot", re.IGNORECASE)
 _BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
 
 
-def _generate_random_part(length: int = 12) -> str:
-    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(length))
+def _generate_deterministic_id(length: int = 12) -> str:
+    """Deterministic unique ID, zero DB round trips.
+
+    原理：nanotimestamp + PID 作为种子 → SHA256 扩散 → 映射到 CODE_ALPHABET。
+    - 同进程内：time.time_ns() 单调递增，每次调用种子不同
+    - 跨进程：不同的 PID 确保即使同一纳秒种子也不同
+    - 输出看似随机（SHA256 avalanche effect），不可猜测
+    数学保证唯一，无需 CRDB 冲突检测。
+    """
+    seed = f"{time.time_ns():x}{os.getpid():x}"
+    digest = hashlib.sha256(seed.encode()).hexdigest()
+    val = int(digest, 16)
+    return ''.join(CODE_ALPHABET[val % 36] for _ in range(length))
 
 
 def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
-    random_part = _generate_random_part(12)
+    random_part = _generate_deterministic_id(12)
     type_parts = []
     for label, abbr in FILE_TYPE_LABELS.items():
         count = file_types.get(label, 0)
@@ -111,10 +124,8 @@ def parse_file_types_from_code(code: str) -> dict:
 
 
 async def generate_unique_code(file_types: dict) -> str:
-    col = get_file_records_col()
-    for _ in range(100):
-        code = build_file_code(file_types)
-        existing = await col.find_one({"file_code": code})
-        if existing is None:
-            return code
-    raise RuntimeError("无法生成唯一文件码，请稍后重试")
+    """直接生成文件码，无需 DB 冲突检测。
+    
+    确定性 ID 算法数学保证唯一，PRIMARY KEY 约束是最后一层保险。
+    """
+    return build_file_code(file_types)

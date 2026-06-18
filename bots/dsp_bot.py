@@ -22,7 +22,16 @@ from database import dequeue_jobs, get_file_records_col, reenqueue_job, mark_job
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.monitor import metrics
 from utils.force_join import check_force_join, three_bot_reminder
-from utils.flood_waiter import safe_send_message, safe_send_media_group, safe_reply_text
+from utils.flood_waiter import (
+    safe_send_message,
+    safe_send_media_group,
+    safe_send_photo,
+    safe_send_video,
+    safe_send_audio,
+    safe_send_animation,
+    safe_send_document,
+    safe_reply_text,
+)
 
 TOKEN = settings.SENDER_BOT_TOKEN
 PAGE_SIZE = settings.PAGE_SIZE
@@ -216,11 +225,8 @@ async def _dsp_worker(bot: Any, worker_id: int):
 
             send_ok = False
             try:
-                if job.task_type == "media_group":
-                    success_count = await _send_media_group(bot, job.target_user_id, job.storage_channel_id, job.storage_msg_ids)
-                    send_ok = True
-                elif job.task_type == "batch":
-                    success_count = await _send_batch(bot, job.target_user_id, job.storage_channel_id, job.storage_msg_ids, job.batch_file_meta)
+                if job.task_type == "batch":
+                    await _process_batch_job(bot, job)
                     send_ok = True
                 else:
                     send_ok = await _process_single_job(bot, job)
@@ -247,6 +253,51 @@ async def _dsp_worker(bot: Any, worker_id: int):
             await asyncio.sleep(1)
 
 
+async def _send_file_direct(bot, job) -> bool:
+    """直接用 file_id 向用户发文件，不走 copy_message（避开频道限速）。
+
+    返回 True 表示成功，False 表示回退到 copy_message。
+    """
+    meta_raw = getattr(job, "batch_file_meta", None)
+    if not meta_raw:
+        return False
+    if isinstance(meta_raw, list):
+        file_meta = meta_raw[0]
+    else:
+        try:
+            parsed = json.loads(meta_raw)
+            if isinstance(parsed, list):
+                file_meta = parsed[0]
+            else:
+                file_meta = parsed
+        except (json.JSONDecodeError, TypeError, IndexError):
+            return False
+
+    fid = file_meta.get("file_id", "")
+    mtype = file_meta.get("type", "document")
+    if not fid:
+        return False
+
+    protect_content = getattr(job, "protect_content", False)
+    kwargs = {"chat_id": job.target_user_id, "protect_content": protect_content}
+
+    try:
+        if mtype == "photo":
+            await safe_send_photo(bot, photo=fid, **kwargs)
+        elif mtype == "video":
+            await safe_send_video(bot, video=fid, **kwargs)
+        elif mtype in ("audio", "voice"):
+            await safe_send_audio(bot, audio=fid, **kwargs)
+        elif mtype == "animation":
+            await safe_send_animation(bot, animation=fid, **kwargs)
+        else:
+            await safe_send_document(bot, document=fid, **kwargs)
+        logger.info(f"[Dsp] file_id 直发成功: 用户 {job.target_user_id}, 码 {job.code}")
+        return True
+    except Exception:
+        return False
+
+
 async def _process_single_job(bot, job):
     logger.info(
         f"[Dsp] 发送文件: 用户 {job.target_user_id}, "
@@ -260,7 +311,13 @@ async def _process_single_job(bot, job):
     # protect_content 已从 jobs 表直接获取，无需再查 file_records
     protect_content = getattr(job, "protect_content", False)
 
-    # 使用 delivery_resolver 解析频道 + 降级
+    # ── 优先走 file_id 直发（避开 copy_message 的频道限速） ──
+    if await _send_file_direct(bot, job):
+        metrics.send_success_count += 1
+        metrics.record_processed("dsp_bot")
+        return True
+
+    # ── 直发失败，回退到 copy_message ──
     resolved = await resolve_delivery_channel(job.storage_channel_id)
     success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content)
 

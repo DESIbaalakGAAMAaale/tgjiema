@@ -178,7 +178,8 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
             if expire_dt < now:
                 return DecodeResult(allowed=False, reason="该文件码已过期")
         _increment_local_quota(user_id)
-        await update_file_record_and_invalidate(file_code, {"$inc": {"request_count": 1}})
+        from database.cache import incr_request_count
+        await incr_request_count(file_code)
         remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
         remaining_ext = -1
         if not is_system_code(file_code):

@@ -540,6 +540,9 @@ async def _process_pending_uploads(app: Application):
                         note=note,
                     )
                     await codes_col.insert_one(ce)
+                    # 同时写入 code_cache，后续解码查缓存即可
+                    from database.cache import get_code_cache
+                    get_code_cache().set(f"code:{file_code}", ce)
                 except Exception as e:
                     logger.error(f"[Idx][poll] codes表写入失败 (code={file_code}): {e}")
 
@@ -639,10 +642,17 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_external_code(update, context, user.id, text, result)
         return
 
-    # 检查取件码是否过期（codes 表）
+    # 检查取件码是否过期（codes 表，走缓存）
     try:
-        codes_col = get_codes_col()
-        code_entry = await codes_col.find_one({"code": text})
+        from database.cache import get_code_cache
+        code_cache = get_code_cache()
+        cache_key = f"code:{text}"
+        code_entry = code_cache.get(cache_key)
+        if code_entry is None:
+            codes_col = get_codes_col()
+            code_entry = await codes_col.find_one({"code": text})
+            if code_entry:
+                code_cache.set(cache_key, code_entry)
         if code_entry:
             expire_time = code_entry.get("expire_time")
             if expire_time:
@@ -995,6 +1005,9 @@ async def _async_main():
     # Decode Logs 缓冲 flush 后台任务
     from database.cache import _flush_decode_log_buffer_loop
     create_safe_task(_flush_decode_log_buffer_loop(), name="flush-decode-logs")
+    # request_count 批量 flush 后台任务
+    from database.cache import _flush_request_count_loop
+    create_safe_task(_flush_request_count_loop(), name="flush-request-count")
     # Quota 同步后台任务
     create_safe_task(_quota_sync_loop(), name="quota-sync")
     # Active Channels 刷新后台任务

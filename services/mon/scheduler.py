@@ -47,6 +47,9 @@ class MonScheduler:
         self.heartbeat_timeout = cfg["heartbeat_timeout"]
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
+        # ─── last_synced_msg_id 本地缓存：每 10 次同步写一次 CRDB ───
+        self._cursor_cache: dict[str, int] = {}
+        self._replicate_count = 0
 
     async def run_degrade_check(self, all_cells: list[dict]) -> list[str]:
         """执行一轮降级检查，返回日志描述列表。
@@ -213,15 +216,17 @@ class MonScheduler:
         Args:
             all_cells: 由调用方统一查询传入。
         """
+        self._replicate_count += 1
         groups = self._group_slots(all_cells)
         total_copied = 0
-        col = get_cells_col()
 
         for _group_key, (a_slot, s1_slot, s2_slot) in groups.items():
             if not a_slot or a_slot["status"] != "active":
                 continue
 
-            last_cursor = a_slot.get("last_synced_msg_id") or 0
+            # 读游标：优先用本地缓存，避免依赖 CRDB 数据
+            slot_id = a_slot["slot_id"]
+            last_cursor = self._cursor_cache.get(slot_id) or a_slot.get("last_synced_msg_id") or 0
             new_messages = await self._fetch_new_messages(
                 bot_instance, a_slot["channel_id"], last_cursor
             )
@@ -244,14 +249,29 @@ class MonScheduler:
                 )
                 total_copied += copied_2
 
-            # 更新游标
+            # 更新游标：本地缓存 + 定期 flush CRDB
             latest_id = max(msg.message_id for msg in new_messages if msg)
-            await col.update_one(
-                {"slot_id": a_slot["slot_id"]},
-                {"$set": {"last_synced_msg_id": latest_id}},
-            )
+            self._cursor_cache[slot_id] = latest_id
+
+        # 每 10 次同步批量 flush 游标到 CRDB
+        if self._replicate_count % 10 == 0:
+            await self._flush_cursor_cache()
 
         return total_copied
+
+    async def _flush_cursor_cache(self):
+        """批量 flush 本地缓存的游标到 CRDB。"""
+        if not self._cursor_cache:
+            return
+        col = get_cells_col()
+        for slot_id, cursor in self._cursor_cache.items():
+            try:
+                await col.update_one(
+                    {"slot_id": slot_id},
+                    {"$set": {"last_synced_msg_id": cursor}},
+                )
+            except Exception:
+                pass  # 下次同步自动重试
 
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
         """获取频道中最后游标之后的新消息（媒体文件）。"""

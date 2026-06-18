@@ -1002,15 +1002,26 @@ async def get_user_cached(user_id: int) -> Optional[dict]:
     cache = get_user_cache()
     cache_key = f"user:{user_id}"
 
+    # L1: 内存缓存
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
+    # L2: SQLite 兜底（避免穿 CRDB）
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    cached = await store.get(cache_key)
+    if cached is not None:
+        cache.set(cache_key, cached)  # promote 到 L1
+        return cached
+
+    # CRDB
     col = get_users_col()
     user = await col.find_one({"user_id": user_id})
 
     if user:
         cache.set(cache_key, user)
+        await store.set(cache_key, user)  # 写穿透到 L2
 
     return user
 
@@ -1027,15 +1038,26 @@ async def get_file_record_cached(file_code: str) -> Optional[dict]:
     cache = get_file_record_cache()
     cache_key = f"file:{file_code}"
 
+    # L1: 内存缓存
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
+    # L2: SQLite 兜底
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    cached = await store.get(cache_key)
+    if cached is not None:
+        cache.set(cache_key, cached)
+        return cached
+
+    # CRDB
     col = get_file_records_col()
     record = await col.find_one({"file_code": file_code})
 
     if record:
         cache.set(cache_key, record)
+        await store.set(cache_key, record)
 
     return record
 
@@ -1052,12 +1074,23 @@ async def get_config_cached(key: str) -> Optional[str]:
     cache = get_config_cache()
     cache_key = f"config:{key}"
 
+    # L1: 内存缓存
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
+    # L2: SQLite 兜底
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    cached = await store.get(cache_key)
+    if cached is not None:
+        cache.set(cache_key, cached)
+        return cached
+
+    # CRDB
     val = await _get_config(key)
     cache.set(cache_key, val)
+    await store.set(cache_key, val)
     return val
 
 

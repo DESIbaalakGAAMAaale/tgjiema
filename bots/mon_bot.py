@@ -10,6 +10,7 @@
 
 import asyncio
 import datetime as _dt
+import time
 
 from loguru import logger
 from telegram import Bot
@@ -69,6 +70,31 @@ class MonBot:
         # ─── 心跳本地缓存：减少 CRDB 写入 ───
         # slot_id → True（上次心跳成功）/ False（上次心跳失败）
         self._cell_healthy: dict[str, bool] = {}
+        # ─── cells 全量缓存：一次查询，多轮复用 ───
+        self._cells_cache: list[dict] | None = None
+        self._cells_cache_ts: float = 0
+
+    async def _get_cells(self) -> list[dict]:
+        """获取全量 cells，带进程内缓存。
+
+        缓存策略：
+        - 正常周期：复用缓存（0 CRDB 查询）
+        - 每 5 周期：强制重载一次（兜底其他进程写入）
+        - 写入 cells 后（轮转/降级/封禁）：主动失效
+        """
+        now = time.time()
+        if self._cycle_count % 5 == 0:
+            self._cells_cache = None
+        if self._cells_cache and (now - self._cells_cache_ts) < 120:
+            return self._cells_cache
+        col = get_cells_col()
+        self._cells_cache = await col.find({})
+        self._cells_cache_ts = now
+        return self._cells_cache
+
+    def _invalidate_cells_cache(self):
+        """写入 cells 后调用，下次循环自动重载。"""
+        self._cells_cache = None
 
     async def _reload_rotation_config(self):
         """从 DB rotation_config 表重新读取轮转参数（30 个周期一次）。"""
@@ -242,7 +268,7 @@ class MonBot:
                     pass
 
         if not should_rotate:
-            return
+            return False
 
         # ── 执行轮转：将当前窗口全部标记为 shadow1（休眠），推进窗口 ──
         # 使用 CRDB 事务保证原子性：所有 update 要么全部成功，要么全部回滚
@@ -309,6 +335,7 @@ class MonBot:
             f"触发条件: 文件数/时间达到阈值\n"
             f"当前参数: {files_per_slot}文件 / {time_per_slot}秒 / {window_size}活态"
         )
+        return True
 
     async def start(self):
         """启动 Mon 主循环。"""
@@ -323,14 +350,15 @@ class MonBot:
                 # 0. 重新加载轮转配置（每 30 周期一次）
                 await self._reload_rotation_config()
 
-                # ── 一次查询 cells 表，所有方法复用（减少 3 次 DB 查询） ──
-                col = get_cells_col()
-                all_cells = await col.find({})
+                # ── 一次查询 cells 表（走缓存），所有方法复用 ──
+                all_cells = await self._get_cells()
 
                 # 1. 对所有 active + shadow 槽位发心跳（同时检测封禁）
                 ok_count, ban_count = await self._heartbeat_with_ban_detection(all_cells)
                 if ok_count > 0:
                     logger.info(f"[Mon] 心跳: {ok_count} 正常, {ban_count} 封禁")
+                if ban_count > 0:
+                    self._invalidate_cells_cache()  # 封禁替换写了 cells，下次循环重载
 
                 # 2. 核心写入：将 Active 槽位新文件同步到 Shadow 频道
                 copied = await self.scheduler.replicate_all_active_to_shadows(self.bot, all_cells)
@@ -351,9 +379,12 @@ class MonBot:
                         # 降级告警通知管理员
                         if "[DEGRADE]" in msg:
                             await self._notify_admin(f"⚠️ {msg}")
+                    self._invalidate_cells_cache()  # 降级改了 cells status，失效缓存
 
                 # 5. 活跃频道轮转检查
-                await self._check_rotation(all_cells)
+                rotated = await self._check_rotation(all_cells)
+                if rotated:
+                    self._invalidate_cells_cache()  # 轮转改了 cells status，失效缓存
 
                 # 6. 定期拓扑校验（每 10 轮一次）
                 self._cycle_count += 1

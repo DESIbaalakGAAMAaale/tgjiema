@@ -425,7 +425,7 @@ async def _process_upload(
             "primary_channel_msg_id": channel_msg_id,
             "file_types": type_str,
             "batch_msg_ids": "",
-            "batch_file_meta": "",
+            "batch_file_meta": json.dumps([extract_file_meta(update)]).decode(),
             "note": note,
             "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
