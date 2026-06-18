@@ -99,6 +99,27 @@ class R2Storage:
         resp.raise_for_status()
         return resp.content
 
+    async def list_objects(self, prefix: str = "", max_keys: int = 1000) -> list[dict]:
+        """列出 R2 存储桶中指定前缀的对象。返回 [{"key": ..., "size": ..., "last_modified": ...}, ...]"""
+        import xml.etree.ElementTree as ET
+        url = f"{self.base_url}?list-type=2&prefix={prefix}"
+        headers = self._sign("GET", f"?list-type=2&prefix={prefix}")
+        resp = await self._http.get(url, headers=headers)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+        ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+        result = []
+        for contents in root.findall("s3:Contents", ns):
+            key = contents.find("s3:Key", ns)
+            size = contents.find("s3:Size", ns)
+            modified = contents.find("s3:LastModified", ns)
+            result.append({
+                "key": key.text if key is not None else "",
+                "size": int(size.text) if size is not None and size.text else 0,
+                "last_modified": modified.text if modified is not None else "",
+            })
+        return result
+
     async def delete(self, key: str):
         url = f"{self.base_url}/{key}"
         headers = self._sign("DELETE", key)

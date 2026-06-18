@@ -5,7 +5,10 @@
 
 import asyncio
 import datetime
-import json
+try:
+    import orjson as json
+except ImportError:
+    import json
 import re
 import time
 from collections import defaultdict, deque
@@ -30,19 +33,58 @@ from database import (
     get_active_cells,
     enqueue_job,
     get_system_code_for_external,
+    set_code_expiry,
 )
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
 from services.relay_pool import relay_pool
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
+from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import safe_send_message, safe_reply_text
+from utils.file_utils import extract_media_info
 
 TOKEN = settings.DECODER_BOT_TOKEN
 
 _pending_external: dict[str, deque[tuple[int, str, float]]] = defaultdict(deque)
-_PENDING_TTL = 300
+_PENDING_TTL = settings.PENDING_TTL
+
+# ─── Quota 本地计数 + 定时同步（减少 CRDB RU 消耗）─────────────
+_local_quota_counts: dict[int, int] = {}  # {user_id: 累计解码次数}
+_QUOTA_SYNC_INTERVAL = settings.QUOTA_SYNC_INTERVAL  # 秒
+
+
+def _increment_local_quota(user_id: int):
+    """本地累加配额计数，不写 CRDB"""
+    _local_quota_counts[user_id] = _local_quota_counts.get(user_id, 0) + 1
+
+
+async def _sync_quota_to_db():
+    """批量同步配额到 CRDB"""
+    if not _local_quota_counts:
+        return
+    from database import _client
+    for user_id, count in list(_local_quota_counts.items()):
+        if count > 0:
+            try:
+                await _client.execute(
+                    "UPDATE users SET quota_used_today = quota_used_today + $1 WHERE user_id = $2",
+                    [count, user_id],
+                )
+            except Exception as e:
+                logger.error(f"[Quota] sync failed for user {user_id}: {e}")
+    _local_quota_counts.clear()
+
+
+async def _quota_sync_loop():
+    """后台任务：每 60 秒同步配额到 CRDB"""
+    while True:
+        await asyncio.sleep(_QUOTA_SYNC_INTERVAL)
+        try:
+            await _sync_quota_to_db()
+        except Exception as e:
+            logger.error(f"[Quota] sync loop error: {e}")
 
 
 def _enqueue_external(bot_username: str, user_id: int, code: str):
@@ -74,7 +116,7 @@ def _relay_pending_cleanup(bot_username: str):
     _dequeue_external(bot_username)
 
 _external_media_groups: dict[str, tuple[int, str, float]] = {}
-_MEDIA_GROUP_TTL = 300
+_MEDIA_GROUP_TTL = settings.EXTERNAL_MEDIA_GROUP_TTL
 _bot_last_request: dict[str, float] = {}
 
 
@@ -107,7 +149,7 @@ def _cleanup_media_groups():
         _external_media_groups.pop(k, None)
 
 
-_MEDIA_GROUP_BUFFER_WAIT = 3
+_MEDIA_GROUP_BUFFER_WAIT = settings.MEDIA_GROUP_BUFFER_WAIT
 _media_group_buffer: dict[str, dict] = {}
 
 
@@ -162,6 +204,7 @@ async def _dispatch_to_dsp(
     storage_channel_id: int,
     msg_ids: list[int],
     batch_file_meta: str = "",
+    protect_content: bool = False,
 ):
     """将解码结果写入 jobs 表，由 Dsp Bot 轮询发送。"""
     try:
@@ -172,6 +215,7 @@ async def _dispatch_to_dsp(
             storage_msg_ids=msg_ids,
             batch_file_meta=batch_file_meta,
             task_type="batch" if len(msg_ids) > 1 else "single",
+            protect_content=protect_content,
         )
         logger.info(
             f"[Idx] 已写 jobs 表: user={target_user_id}, code={code}, "
@@ -180,22 +224,6 @@ async def _dispatch_to_dsp(
     except Exception as e:
         logger.error(f"[Idx] 写入 jobs 失败 (user={target_user_id}, code={code}): {e}")
         raise
-
-
-def _extract_media_info(msg):
-    if msg.photo:
-        return msg.photo[-1].file_id, "photo"
-    if msg.video:
-        return msg.video.file_id, "video"
-    if msg.audio:
-        return msg.audio.file_id, "audio"
-    if msg.voice:
-        return msg.voice.file_id, "voice"
-    if msg.animation:
-        return msg.animation.file_id, "animation"
-    if msg.document:
-        return msg.document.file_id, "document"
-    return None, "document"
 
 
 async def _flush_media_group_buffer(media_group_id: str):
@@ -515,6 +543,13 @@ async def _process_pending_uploads(app: Application):
                 except Exception as e:
                     logger.error(f"[Idx][poll] codes表写入失败 (code={file_code}): {e}")
 
+                # 设置取件码过期时间（默认 60 天）
+                try:
+                    expire_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=settings.DEFAULT_FILE_TTL_DAYS or 60)
+                    await set_code_expiry(file_code, expire_dt.isoformat())
+                except Exception as e:
+                    logger.error(f"[Idx][poll] 设置取件码过期时间失败 (code={file_code}): {e}")
+
                 # ── 外部文件：写入外部码映射 ──
                 ext_code = None
                 if note:
@@ -604,15 +639,36 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_external_code(update, context, user.id, text, result)
         return
 
+    # 检查取件码是否过期（codes 表）
+    try:
+        codes_col = get_codes_col()
+        code_entry = await codes_col.find_one({"code": text})
+        if code_entry:
+            expire_time = code_entry.get("expire_time")
+            if expire_time:
+                if isinstance(expire_time, str):
+                    try:
+                        expire_dt = datetime.datetime.fromisoformat(expire_time)
+                    except (ValueError, TypeError):
+                        expire_dt = None
+                else:
+                    expire_dt = expire_time
+                if expire_dt and expire_dt < datetime.datetime.now(datetime.UTC):
+                    await safe_reply_text(update.message, "文件码已过期，请重新上传获取新码。")
+                    return
+    except Exception as e:
+        logger.warning(f"[Idx][handle_code] codes 表查询失败 (code={text}): {e}")
+
     file_record = result.file_record
     storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
 
     try:
-        logs_col = get_decode_logs_col()
+        # 写入本地 SQLite 缓冲表（零 RU），后台每 6 小时 flush 到 CRDB
+        from database.cache_store import get_decode_log_buffer
         log_doc = make_decode_log(file_code=text, requester_id=user.id, status="queued")
-        await logs_col.insert_one(log_doc)
+        await get_decode_log_buffer().insert(log_doc)
     except Exception as e:
-        logger.error(f"[Idx][handle_code] 解码日志写入失败: {e}")
+        logger.error(f"[Idx][handle_code] 解码日志缓冲写入失败: {e}")
 
     batch_ids_str = file_record.get("batch_msg_ids") or ""
     if not isinstance(batch_ids_str, str):
@@ -624,9 +680,10 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_ids = [file_record.get("primary_channel_msg_id")]
 
     batch_file_meta_str = file_record.get("batch_file_meta") or ""
+    protect_content = file_record.get("protect_content", False)
 
     try:
-        await _dispatch_to_dsp(user.id, text, storage_channel, msg_ids, batch_file_meta_str)
+        await _dispatch_to_dsp(user.id, text, storage_channel, msg_ids, batch_file_meta_str, protect_content)
     except Exception as e:
         logger.error(f"[Idx][handle_code] 写 jobs 失败 (user={user.id}, code={text}): {e}")
         await safe_reply_text(update.message, "系统繁忙，文件发送请求失败，请稍后重试。")
@@ -683,8 +740,9 @@ async def handle_external_code(update, context, user_id, code, result):
                 msg_ids = [file_record.get("primary_channel_msg_id")]
 
             batch_file_meta_str = file_record.get("batch_file_meta") or ""
+            protect_content = file_record.get("protect_content", False)
             try:
-                await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str)
+                await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str, protect_content)
                 await safe_reply_text(update.message,
                     f"文件码 {code} 已缓存，正在发送，请查收。\n"
                     f"(系统码: {system_code})"
@@ -897,7 +955,7 @@ async def _async_main():
                             user_id, code = _dequeue_external(bot_username)
                     if not user_id or not code:
                         return
-                    timer = asyncio.create_task(_flush_media_group_buffer(mg_id))
+                    timer = create_safe_task(_flush_media_group_buffer(mg_id), name=f"flush-mg-{mg_id}")
                     _media_group_buffer[mg_id] = {
                         "source": source, "bot": context.bot, "msgs": [],
                         "user_id": user_id, "code": code, "timer": timer,
@@ -928,22 +986,23 @@ async def _async_main():
             await asyncio.sleep(60)
 
     loop = asyncio.get_running_loop()
-    loop.create_task(health_ping())
-    loop.create_task(_process_pending_uploads(app))
-    loop.create_task(cleanup_loop())
-    loop.create_task(relay_pool.start_all())
+    create_safe_task(health_ping(), name="health-ping")
+    create_safe_task(_process_pending_uploads(app), name="process-pending")
+    create_safe_task(cleanup_loop(), name="cleanup")
+    create_safe_task(relay_pool.start_all(), name="relay-start")
     from database.cache import dump_cache_to_disk_loop
-    loop.create_task(dump_cache_to_disk_loop())
-    from database import cleanup_old_records
-    loop.create_task(cleanup_old_records())
-
-    # 活跃频道缓存：启动时立即刷新，此后每 60 秒
-    await _refresh_active_channels()
+    create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")
+    # Decode Logs 缓冲 flush 后台任务
+    from database.cache import _flush_decode_log_buffer_loop
+    create_safe_task(_flush_decode_log_buffer_loop(), name="flush-decode-logs")
+    # Quota 同步后台任务
+    create_safe_task(_quota_sync_loop(), name="quota-sync")
+    # Active Channels 刷新后台任务
     async def _channel_refresh_loop():
         while True:
             await asyncio.sleep(60)
             await _refresh_active_channels()
-    loop.create_task(_channel_refresh_loop())
+    create_safe_task(_channel_refresh_loop(), name="channel-refresh")
 
     async with app:
         await app.start()
@@ -955,6 +1014,8 @@ async def _async_main():
         except asyncio.CancelledError:
             pass
         finally:
+            # 关闭前同步配额到 CRDB
+            await _sync_quota_to_db()
             await app.updater.stop()
             await app.stop()
 

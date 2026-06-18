@@ -3,6 +3,8 @@
 如果首选频道不可达，自动降级到 Shadow1→Shadow2→下一环。
 """
 import asyncio
+import time
+from loguru import logger
 from database import (
     get_active_or_shadow_cell,
     get_next_active_cell,
@@ -10,6 +12,11 @@ from database import (
 )
 from utils.flood_waiter import safe_copy_message
 from utils.per_channel_limiter import acquire_channel_limit
+
+# 模块级缓存：避免每次 resolve_delivery_channel() 都查询 CRDB
+_cell_cache: dict[int, dict] = {}
+_cell_cache_ts: float = 0
+_CELL_CACHE_TTL: float = 60.0
 
 
 class DeliveryChannel:
@@ -33,7 +40,17 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
     3. 如果是 shadow 或 lost，沿环形找下一个 active 或 shadow1
     4. 最多尝试 3 层降级，防止无限环
     """
-    cell = await get_active_or_shadow_cell(primary_channel_id)
+    # 先查本地缓存，避免每次调用都查询 CRDB
+    now = time.monotonic()
+    if now - _cell_cache_ts < _CELL_CACHE_TTL:
+        cell = _cell_cache.get(primary_channel_id)
+    else:
+        cell = None  # 缓存过期，强制重新查询
+
+    if cell is None:
+        cell = await get_active_or_shadow_cell(primary_channel_id)
+        _cell_cache[primary_channel_id] = cell
+        _cell_cache_ts = time.monotonic()
 
     if cell is None:
         # 该频道不在 cells 表中，直接返回原频道
@@ -99,14 +116,15 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
 async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False) -> bool:
     """尝试从指定频道发送一条消息给用户（带 Flood Wait 退避 + 频道限流）。成功返回 True。"""
     # 频道限流：检查是否超过 15 msg/min
-    wait = acquire_channel_limit(from_channel_id)
+    wait = await acquire_channel_limit(from_channel_id)
     if wait > 0:
         await asyncio.sleep(wait)
 
     try:
         await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id, protect_content=protect_content)
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={message_id}): {e}")
         return False
 
 

@@ -3,7 +3,10 @@
 - 运行时后台定期 dump -> 下次重启有最新的热数据
 - WAL 模式支持多进程并发写入
 """
-import json
+try:
+    import orjson as json
+except ImportError:
+    import json
 import time
 import aiosqlite
 from pathlib import Path
@@ -28,7 +31,26 @@ class CacheStore:
                 ts     REAL NOT NULL
             )"""
         )
+        # ─── 跨进程通知表：Up Bot 写入 → Idx Bot 感知 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS pending_notify (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts     REAL NOT NULL
+            )"""
+        )
+        # ─── Dsp Bot 通知表：Idx Bot 写入 → Dsp Bot 感知 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS dsp_notify (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts     REAL NOT NULL
+            )"""
+        )
+        # ─── Decode Logs 缓冲表 ───
+        for sql in DDL_BUFFER_TABLES:
+            await self._db.execute(sql)
         await self._db.commit()
+        # 注入 db 连接给 DecodeLogBuffer
+        _decode_log_buffer.set_db(self._db)
         logger.info(f"[CacheStore] 初始化完成: {DB_PATH}")
 
     async def dump(self, cache_entries: list[tuple[str, dict, float]]):
@@ -38,7 +60,7 @@ class CacheStore:
         rows = []
         for k, v, ts in cache_entries:
             try:
-                rows.append((k, json.dumps(v, default=str), ts))
+                rows.append((k, json.dumps(v, default=str).decode(), ts))
             except (TypeError, ValueError):
                 continue
         if rows:
@@ -73,14 +95,116 @@ class CacheStore:
         )
         await self._db.commit()
 
+    # ─── 跨进程通知：Up Bot 写入 → Idx Bot 感知 ───
+
+    async def notify_new_upload(self):
+        """Up Bot 写入 pending_uploads 后调用，通知 Idx Bot 有新任务。"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT INTO pending_notify (ts) VALUES (?)", (time.time(),)
+        )
+        await self._db.commit()
+
+    async def has_new_upload(self) -> bool:
+        """Idx Bot 检查是否有未处理的上传通知。有则返回 True 并原子清空。
+        
+        使用 DELETE ... RETURNING 实现原子出队，避免 SELECT + DELETE 竞态。
+        """
+        if not self._db:
+            return True  # 连接未就绪，回退到直接查 CRDB
+        row = await self._db.execute_fetchall(
+            "DELETE FROM pending_notify WHERE id = (SELECT id FROM pending_notify LIMIT 1) RETURNING id"
+        )
+        return bool(row)
+
+    # ─── Dsp Bot 通知：Idx Bot 写入 → Dsp Bot 感知 ───
+
+    async def notify_dsp_new_job(self):
+        """Idx Bot 写 jobs 表后调用，通知 Dsp Bot 有新任务。"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT INTO dsp_notify (ts) VALUES (?)", (time.time(),)
+        )
+        await self._db.commit()
+
+    async def has_new_dsp_job(self) -> bool:
+        """Dsp Bot 检查是否有未处理的新 jobs。有则返回 True 并原子清空。
+        
+        使用 DELETE ... RETURNING 实现原子出队，避免 SELECT + DELETE 竞态。
+        """
+        if not self._db:
+            return True  # 连接未就绪，回退到直接查 CRDB
+        row = await self._db.execute_fetchall(
+            "DELETE FROM dsp_notify WHERE id = (SELECT id FROM dsp_notify LIMIT 1) RETURNING id"
+        )
+        return bool(row)
+
     async def close(self):
         if self._db:
             await self._db.close()
             self._db = None
 
 
+# ─── Decode Logs 缓冲表 ──────────────────────────────────────
+
+DDL_BUFFER_TABLES = [
+    """CREATE TABLE IF NOT EXISTS decode_log_buffer (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_code TEXT,
+        requester_id BIGINT,
+        request_time TEXT,
+        status TEXT DEFAULT 'queued',
+        source_channel_id BIGINT,
+        buffered_at REAL
+    )""",
+]
+
+
+class DecodeLogBuffer:
+    """Decode Logs 本地缓冲，定时批量 flush 到 CRDB
+    
+    注意：缓冲表 DDL 由 CacheStore.init() 统一创建，此处无需重复。
+    """
+
+    def __init__(self):
+        self._db = None
+
+    def set_db(self, db):
+        """由 CacheStore 注入数据库连接。"""
+        self._db = db
+
+    async def insert(self, entry: dict):
+        """写入本地缓冲表（零 RU）"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT INTO decode_log_buffer "
+            "(file_code, requester_id, request_time, status, source_channel_id, buffered_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                entry["file_code"],
+                entry["requester_id"],
+                entry.get("request_time"),
+                entry.get("status", "queued"),
+                entry.get("source_channel_id"),
+                time.time(),
+            ),
+        )
+        await self._db.commit()
+
+    async def close(self):
+        pass
+
+
 _store = CacheStore()
+_decode_log_buffer = DecodeLogBuffer()
 
 
 def get_cache_store() -> CacheStore:
     return _store
+
+
+def get_decode_log_buffer() -> DecodeLogBuffer:
+    return _decode_log_buffer

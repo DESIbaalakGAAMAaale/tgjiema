@@ -53,8 +53,8 @@ def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
                 result[key] = int(val)
 
         asyncio.get_event_loop().run_until_complete(close_db())
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[警告] 无法从 DB 读取轮转配置，使用默认值: {e}")
 
     # .env 兜底（优先级高于 groups.yaml 默认值）
     if hasattr(_settings, "ROTATION_ACTIVE_WINDOW_SIZE"):
@@ -124,6 +124,28 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     group_count = (account_count * ch_per_account) // 3
 
     print(f"[校验] {account_count} 个账号 × {ch_per_account} 频道 = {account_count * ch_per_account} 总频道 → {group_count} 组")
+
+    # ── 频道 ID 重复检测 ──
+    all_ids = []
+    for a in accounts:
+        all_ids.extend(a.get("channels", []))
+    if r100_cfg.get("channel"):
+        all_ids.append(r100_cfg["channel"])
+    for fb in (r100_cfg.get("fallback") or []):
+        all_ids.append(fb)
+
+    if len(all_ids) != len(set(all_ids)):
+        from collections import Counter
+        dupes = [ch for ch, cnt in Counter(all_ids).items() if cnt > 1]
+        print(f"[错误] 检测到重复频道 ID: {dupes}")
+        for ch in dupes:
+            owners = [a.get("name", "?") for a in accounts if ch in a.get("channels", [])]
+            if r100_cfg.get("channel") == ch:
+                owners.append("R100")
+            if ch in (r100_cfg.get("fallback") or []):
+                owners.append("R100-fallback")
+            print(f"  {ch} 出现在: {owners}")
+        sys.exit(1)
 
     # ── 为每个账号建立频道池 + 游标 ──
     pools = []

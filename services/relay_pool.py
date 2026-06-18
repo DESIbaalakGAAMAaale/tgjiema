@@ -87,8 +87,10 @@ class RelayPool:
         if not self.instances:
             return None
         db = await get_relay_db()
+        async with self._lock:
+            instances_snapshot = list(self.instances)
         scores = []
-        for instance in self.instances:
+        for instance in instances_snapshot:
             usage = await db.get_usage(instance.account_id)
             # avg_wait_ms 越小越好 -> 用倒数
             avg_wait = max(usage["avg_wait_ms"], 1)
@@ -148,7 +150,8 @@ class RelayPool:
             api_hash=api_hash,
             phone=phone,
         )
-        self.instances.append(instance)
+        async with self._lock:
+            self.instances.append(instance)
         logger.info(f"[RelayPool] 动态添加中继账号: {phone}")
         return instance
 
@@ -157,7 +160,8 @@ class RelayPool:
         db = await get_relay_db()
         removed = await db.remove_account(phone)
         if removed:
-            self.instances = [i for i in self.instances if i.phone != phone]
+            async with self._lock:
+                self.instances = [i for i in self.instances if i.phone != phone]
             logger.info(f"[RelayPool] 移除中继账号: {phone}")
         return removed
 
@@ -165,7 +169,9 @@ class RelayPool:
         """获取账号池状态"""
         db = await get_relay_db()
         status = []
-        for instance in self.instances:
+        async with self._lock:
+            instances_snapshot = list(self.instances)
+        for instance in instances_snapshot:
             usage = await db.get_usage(instance.account_id)
             status.append({
                 "phone": instance.phone,
@@ -180,9 +186,10 @@ class RelayPool:
         return status
 
     async def shutdown(self):
-        """关闭所有实例"""
-        for instance in self.instances:
-            await instance.shutdown()
+        """关闭所有实例（并发关闭）"""
+        async with self._lock:
+            instances = list(self.instances)
+        await asyncio.gather(*(i.shutdown() for i in instances), return_exceptions=True)
         logger.info("[RelayPool] 所有中继账号已关闭")
 
 

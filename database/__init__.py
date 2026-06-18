@@ -17,6 +17,7 @@ from .models import (
 )
 from .session import (
     init_db, close_db,
+    _client,
     get_users_col, get_file_records_col, get_decode_logs_col,
     get_pending_uploads_col, get_send_queue_col, get_backup_config_col,
     get_cells_col, get_codes_col, get_jobs_col, get_rotate_log_col,
@@ -32,9 +33,9 @@ from .session import (
     delete_bot_decode_interval, get_all_bot_decode_intervals,
     get_active_cells, get_next_active_cell, get_active_or_shadow_cell,
     set_cell_status, update_cell_heartbeat,
-    enqueue_job, dequeue_job, reenqueue_job, JobResult,
+    enqueue_job, dequeue_jobs, dequeue_job, reenqueue_job, JobResult, mark_job_dead,
     log_rotate,
-    get_external_code_mapping_col, get_system_code_for_external, set_external_code_mapping,
+    get_external_code_mapping_col, get_system_code_for_external, set_external_code_mapping, set_code_expiry,
     cleanup_old_records,
     get_spare_pool_col, add_spare_channel, get_spare_for_account, get_any_spare,
     consume_spare, release_spare, remove_spare, list_spare_pool,

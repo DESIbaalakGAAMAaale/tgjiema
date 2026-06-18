@@ -1,4 +1,5 @@
 import datetime
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -7,6 +8,21 @@ from database import get_user_cached, update_user_and_invalidate
 from database import get_file_record_cached, update_file_record_and_invalidate
 from config import settings
 from services.code_generator import extract_bot_username
+
+# ─── Quota 本地计数（跨进程共享，通过环境变量传递）─────────────
+# 每个 Idx Bot 进程用不同计数器，PID 作为命名空间
+_PID = os.getpid()
+_local_quota_counts: dict[int, int] = {}
+
+
+def _increment_local_quota(user_id: int):
+    """本地累加配额计数，不写 CRDB（由 idx_bot 后台同步）"""
+    _local_quota_counts[user_id] = _local_quota_counts.get(user_id, 0) + 1
+
+
+def _get_local_quota_counts() -> dict[int, int]:
+    """导出计数器供 idx_bot 同步到 CRDB"""
+    return dict(_local_quota_counts)
 
 
 @dataclass
@@ -161,9 +177,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
                     pass
             if expire_dt < now:
                 return DecodeResult(allowed=False, reason="该文件码已过期")
-        await update_user_and_invalidate(user_id, {"$inc": {"quota_used_today": 1}})
-        if not is_system_code(file_code):
-            await update_user_and_invalidate(user_id, {"$inc": {"external_used_today": 1}})
+        _increment_local_quota(user_id)
         await update_file_record_and_invalidate(file_code, {"$inc": {"request_count": 1}})
         remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
         remaining_ext = -1
@@ -179,7 +193,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         )
 
     if not is_system_code(file_code):
-        await update_user_and_invalidate(user_id, {"$inc": {"quota_used_today": 1, "external_used_today": 1}})
+        _increment_local_quota(user_id)  # 外部码：quota + external 合并为一次计数
         remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
         remaining_ext = -1
         ext_q = user.get("external_decode_quota", 0)

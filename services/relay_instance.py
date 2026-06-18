@@ -29,6 +29,7 @@ class RelayInstance:
         self.phone = phone
         self._client: TelegramClient | None = None
         self._decoder_bot_entity = None
+        self._up_bot_entity = None
         self._storage_channel_entity = None
         # bot_username -> exchange info
         self._bot_exchange: dict[str, dict] = {}
@@ -141,6 +142,13 @@ class RelayInstance:
             logger.warning(f"[RelayInstance:{self.phone}] 无法获取解码机器人 @{settings.DECODER_BOT_USERNAME}: {e}")
 
         try:
+            self._up_bot_entity = await self._client.get_entity(
+                settings.UPLOAD_BOT_USERNAME
+            )
+        except Exception as e:
+            logger.warning(f"[RelayInstance:{self.phone}] 无法获取上传机器人 @{settings.UPLOAD_BOT_USERNAME}: {e}")
+
+        try:
             self._storage_channel_entity = PeerChannel(settings.MAIN_STORAGE_CHANNEL_ID)
         except Exception:
             self._storage_channel_entity = None
@@ -202,6 +210,14 @@ class RelayInstance:
                 f"[RelayInstance:{self.phone}] 目标实体: {type(entity).__name__}, "
                 f"id={getattr(entity, 'id', '?')}, username=@{getattr(entity, 'username', '?')}"
             )
+            # 检查 bot 是否已被占用（并发保护）
+            key = bot_username.lower()
+            if key in self._bot_exchange:
+                logger.warning(
+                    f"[RelayInstance:{self.phone}] bot @{bot_username} 正被占用，"
+                    f"拒绝新请求 (user={user_id}, code={code})"
+                )
+                return False
             await self._client.send_message(entity, code)
             now = asyncio.get_event_loop().time()
             self._bot_exchange[bot_username.lower()] = {
@@ -368,16 +384,16 @@ class RelayInstance:
             self._decrement_cache_counter(code)
             return
         try:
-            storage_msg = await self._client.send_file(
-                self._storage_channel_entity, msg.media
-            )
-            cache_fid = self._extract_file_id(storage_msg)
-            media_type = self._detect_media_type(msg)
-            await self._cache_file_record(
-                code, storage_msg.id, file_id=cache_fid, media_type=media_type,
-            )
+            if self._up_bot_entity:
+                # 发送到 Up Bot，带 EXTERNAL_RELAY 标记统一上传到存储频道
+                caption = f"EXTERNAL_RELAY:{user_id}:{code}"
+                await self._client.send_file(
+                    self._up_bot_entity, msg.media, caption=caption
+                )
+            else:
+                logger.warning(f"[RelayInstance:{self.phone}] Up Bot 不可用，跳过文件 (code={code})")
         except Exception as e:
-            logger.error(f"[RelayInstance:{self.phone}] 缓存到存储频道失败 (code={code}): {e}")
+            logger.error(f"[RelayInstance:{self.phone}] 发送到 Up Bot 失败 (code={code}): {e}")
         finally:
             self._decrement_cache_counter(code)
 
@@ -832,6 +848,9 @@ class RelayInstance:
             return
         user_id = exchange.get("user_id")
         code = exchange.get("code")
+        # 清理对应的缓存锁，防止无限增长
+        if code:
+            self._cache_locks.pop(code, None)
         all_events = exchange.get("events", [])
         if not all_events:
             if self._decoder_bot_entity:
@@ -845,48 +864,17 @@ class RelayInstance:
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
             return
-        from database import get_file_records_col
+        # 所有文件已发送到 Up Bot，发送 EXTERNAL_DONE 信号触发批量写入
         try:
             await self._wait_all_cached(bot_username, timeout=60)
-            lock = self._cache_locks.get(code)
-            if lock:
-                async with lock:
-                    pass
-            files_col = get_file_records_col()
-            record = None
-            for retry in range(6):
-                if retry > 0:
-                    await asyncio.sleep(2)
-                record = await files_col.find_one({"file_code": code})
-                if record:
-                    break
-            if not record:
-                if self._pending_cleanup:
-                    self._pending_cleanup(bot_username)
-                return
-            batch_ids_str = record.get("batch_msg_ids") or ""
-            if not isinstance(batch_ids_str, str):
-                batch_ids_str = str(batch_ids_str)
-            msg_ids = []
-            primary_mid = record.get("primary_channel_msg_id")
-            if primary_mid:
-                msg_ids.append(str(primary_mid))
-            for mid in batch_ids_str.split(","):
-                m = mid.strip()
-                if m and m not in msg_ids:
-                    msg_ids.append(m)
-            if not msg_ids:
-                if self._pending_cleanup:
-                    self._pending_cleanup(bot_username)
-                return
-            storage_ids_str = ",".join(msg_ids)
-            if self._decoder_bot_entity:
+            if self._up_bot_entity:
                 await self._client.send_message(
-                    self._decoder_bot_entity,
-                    f"RELAY_BATCH:{user_id}:{code}\nSTORAGE_IDS:{storage_ids_str}",
+                    self._up_bot_entity,
+                    f"EXTERNAL_DONE:{user_id}:{code}",
                 )
+                logger.info(f"[RelayInstance:{self.phone}] 已通知 Up Bot 完成外部文件收集: code={code}")
         except Exception as e:
-            logger.error(f"[RelayInstance:{self.phone}] 处理收集文件失败 (code={code}): {e}")
+            logger.error(f"[RelayInstance:{self.phone}] 通知 Up Bot 失败 (code={code}): {e}")
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)
 
@@ -897,6 +885,7 @@ class RelayInstance:
             if code:
                 self._pending_cache_counts.pop(code, None)
                 self._pending_cache_events.pop(code, None)
+                self._cache_locks.pop(code, None)
             if exchange.get("_settle_task") and not exchange["_settle_task"].done():
                 exchange["_settle_task"].cancel()
         if self._pending_cleanup:

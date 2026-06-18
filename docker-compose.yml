@@ -23,6 +23,17 @@ services:
     # 可选：单独启动某个组件
     # command: python run_all.py up idx dsp mon admin_bot
     command: python run_all.py
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f run_all.py > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     logging:
       driver: "json-file"
       options:

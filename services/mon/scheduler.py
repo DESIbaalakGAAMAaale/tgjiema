@@ -10,8 +10,10 @@ from database import (
     get_cells_col,
     set_cell_status, update_cell_heartbeat,
     log_rotate,
+    _client,
 )
 from utils.flood_waiter import safe_copy_message, reset_backoff
+from utils.file_utils import is_media_message
 
 
 def _load_mon_config():
@@ -46,10 +48,12 @@ class MonScheduler:
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
 
-    async def run_degrade_check(self) -> list[str]:
-        """执行一轮降级检查，返回日志描述列表。"""
-        col = get_cells_col()
-        all_cells = await col.find({})
+    async def run_degrade_check(self, all_cells: list[dict]) -> list[str]:
+        """执行一轮降级检查，返回日志描述列表。
+
+        Args:
+            all_cells: 由调用方统一查询传入，避免重复 DB 查询。
+        """
         alerts = []
         now = _dt.datetime.now(_dt.timezone.utc)
 
@@ -72,6 +76,18 @@ class MonScheduler:
 
             if elapsed <= self.heartbeat_timeout:
                 continue
+
+            # ── 降级冷却时间分级（防抖动）—— 根据 degrade_count 递增 ──
+            degrade_count = a_slot.get("degrade_count", 0)
+            if degrade_count == 0:
+                cooldown = self.degrade_cooldown  # 默认 300s
+            elif degrade_count == 1:
+                cooldown = 600
+            else:  # >= 2
+                cooldown = 1200
+
+            if elapsed < cooldown:
+                continue  # 冷却中，跳过本次降级
 
             if is_r100 and not self.r100_managed:
                 alerts.append(
@@ -121,50 +137,55 @@ class MonScheduler:
     async def _degrade_group(
         self, a_slot: dict, s1_slot: dict, s2_slot: dict, elapsed: float
     ):
-        """执行降级：active→lost, shadow1→active, shadow2→shadow1"""
+        """执行降级：active→lost, shadow1→active, shadow2→shadow1
+        
+        使用 CRDB 事务保证原子性：所有状态变更要么全部成功，要么全部回滚。
+        """
         now = _dt.datetime.now(_dt.timezone.utc)
-        col = get_cells_col()
+        now_iso = now.isoformat()
 
-        # active → lost
-        await set_cell_status(a_slot["slot_id"], "lost")
-        await log_rotate(
-            a_slot["slot_id"], s1_slot["slot_id"] if s1_slot else "none",
-            "active", "lost",
-            f"heartbeat timeout {elapsed:.0f}s", "mon",
-        )
-
-        # shadow1 → active
-        if s1_slot:
-            new_next = a_slot.get("next_active_chat_id")
-            await set_cell_status(s1_slot["slot_id"], "active")
-            await col.update_one(
-                {"slot_id": s1_slot["slot_id"]},
-                {"$set": {
-                    "next_active_chat_id": new_next,
-                    "last_heartbeat": now.isoformat(),
-                    "degrade_count": a_slot.get("degrade_count", 0) + 1,
-                }},
+        async with _client.transaction() as conn:
+            # active → lost
+            await conn.execute(
+                "UPDATE cells SET status = $1 WHERE slot_id = $2",
+                "lost", a_slot["slot_id"],
             )
-            prev_id = a_slot.get("prev_slot_id")
-            if prev_id:
-                await col.update_one(
-                    {"slot_id": prev_id},
-                    {"$set": {"next_active_chat_id": new_next}},
+            await log_rotate(
+                a_slot["slot_id"], s1_slot["slot_id"] if s1_slot else "none",
+                "active", "lost",
+                f"heartbeat timeout {elapsed:.0f}s", "mon",
+            )
+
+            # shadow1 → active
+            if s1_slot:
+                new_next = a_slot.get("next_active_chat_id")
+                await conn.execute(
+                    "UPDATE cells SET status = $1, next_active_chat_id = $2, last_heartbeat = $3, degrade_count = $4 WHERE slot_id = $5",
+                    "active", new_next, now_iso, a_slot.get("degrade_count", 0) + 1, s1_slot["slot_id"],
                 )
-            await log_rotate(
-                s1_slot["slot_id"], s1_slot["slot_id"],
-                "shadow1", "active",
-                f"promoted after {a_slot['slot_id']} timeout", "mon",
-            )
+                prev_id = a_slot.get("prev_slot_id")
+                if prev_id:
+                    await conn.execute(
+                        "UPDATE cells SET next_active_chat_id = $1 WHERE slot_id = $2",
+                        new_next, prev_id,
+                    )
+                await log_rotate(
+                    s1_slot["slot_id"], s1_slot["slot_id"],
+                    "shadow1", "active",
+                    f"promoted after {a_slot['slot_id']} timeout", "mon",
+                )
 
-        # shadow2 → shadow1
-        if s2_slot:
-            await set_cell_status(s2_slot["slot_id"], "shadow1")
-            await log_rotate(
-                s2_slot["slot_id"], s2_slot["slot_id"],
-                "shadow2", "shadow1",
-                f"cascade after {a_slot['slot_id']} timeout", "mon",
-            )
+            # shadow2 → shadow1
+            if s2_slot:
+                await conn.execute(
+                    "UPDATE cells SET status = $1 WHERE slot_id = $2",
+                    "shadow1", s2_slot["slot_id"],
+                )
+                await log_rotate(
+                    s2_slot["slot_id"], s2_slot["slot_id"],
+                    "shadow2", "shadow1",
+                    f"cascade after {a_slot['slot_id']} timeout", "mon",
+                )
 
     async def heartbeat_all(self, bot_instance) -> int:
         """对 active/shadow 槽位发心跳（频道拉一条消息验证可达性）。
@@ -179,20 +200,22 @@ class MonScheduler:
                 if msgs and len(msgs) > 0:
                     await update_cell_heartbeat(cell["slot_id"])
                     count += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[Mon][健康检查] 频道 {cell.get('channel_id')} 心跳失败: {e}")
         return count
 
-    async def replicate_all_active_to_shadows(self, bot_instance) -> int:
+    async def replicate_all_active_to_shadows(self, bot_instance, all_cells: list[dict]) -> int:
         """核心功能：将每个 Active A 槽的新消息复制到对应的 Shadow1/Shadow2。
 
         这是 Mon 的「写入」职责——替代原 backup_bot 的文件备份功能。
         返回复制的消息总数。
+
+        Args:
+            all_cells: 由调用方统一查询传入。
         """
-        col = get_cells_col()
-        all_cells = await col.find({})
         groups = self._group_slots(all_cells)
         total_copied = 0
+        col = get_cells_col()
 
         for _group_key, (a_slot, s1_slot, s2_slot) in groups.items():
             if not a_slot or a_slot["status"] != "active":
@@ -238,22 +261,37 @@ class MonScheduler:
             async for msg in bot_instance.iter_messages(channel_id, limit=50):
                 if msg.message_id <= last_cursor:
                     break
-                if self._is_media_message(msg):
+                if is_media_message(msg):
                     msgs.append(msg)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[Mon][复制] 获取频道 {channel_id} 消息失败: {e}")
         return list(reversed(msgs))  # 按时间正序
 
     @staticmethod
-    def _is_media_message(msg) -> bool:
-        return any([
-            msg.photo, msg.video, msg.document,
-            msg.audio, msg.voice, msg.animation,
-        ])
-
-    @staticmethod
     async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list) -> int:
-        """批量复制消息到目标频道（带 Flood Wait 自动退避）。返回成功复制数。"""
+        """批量复制消息到目标频道（带 Flood Wait 自动退避）。返回成功复制数。
+
+        优先使用 Bot API 7.0+ 的 copy_messages 批量接口，
+        不支持时回退到逐条 copy_message。
+        """
+        if not messages:
+            return 0
+
+        # 尝试批量 API（Bot API 7.0+）
+        if hasattr(bot_instance, 'copy_messages'):
+            try:
+                msg_ids = [msg.message_id for msg in messages]
+                await bot_instance.copy_messages(
+                    chat_id=to_channel,
+                    from_chat_id=from_channel,
+                    message_ids=msg_ids,
+                )
+                reset_backoff()
+                return len(msg_ids)
+            except Exception as e:
+                logger.warning(f"[Mon][复制] 批量复制消息失败 (ch={from_channel})，回退逐条: {e}")
+
+        # 逐条复制（旧版 API 或批量失败）
         copied = 0
         for msg in messages:
             try:
@@ -261,21 +299,22 @@ class MonScheduler:
                     bot_instance, to_channel, from_channel, msg.message_id,
                 )
                 copied += 1
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[Mon][复制] 逐条复制失败 (ch={from_channel}, msg={msg.message_id}): {e}")
         if copied > 0:
             reset_backoff()
         return copied
 
-    async def auto_fill_new_channels(self, bot_instance) -> int:
+    async def auto_fill_new_channels(self, bot_instance, all_cells: list[dict]) -> int:
         """智能替补：检测新频道（last_synced_msg_id=0 且消息数 < Active），
         从对应的 Active 槽位补齐所有存量文件。
 
         「新频道只拉 Mon，系统自动补齐」—— 元宝方案核心设计。
         返回补齐的消息总数。
+
+        Args:
+            all_cells: 由调用方统一查询传入。
         """
-        col = get_cells_col()
-        all_cells = await col.find({})
         groups = self._group_slots(all_cells)
         total_filled = 0
 
@@ -332,10 +371,11 @@ class MonScheduler:
         try:
             count = 0
             async for msg in bot_instance.iter_messages(channel_id, limit=20):
-                if MonScheduler._is_media_message(msg):
+                if is_media_message(msg):
                     count += 1
             return count <= threshold
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[Mon][检查] 频道 {channel_id} 消息计数失败: {e}")
             return False
 
     @staticmethod
@@ -344,13 +384,13 @@ class MonScheduler:
         msgs = []
         try:
             async for msg in bot_instance.iter_messages(channel_id, limit=limit):
-                if MonScheduler._is_media_message(msg):
+                if is_media_message(msg):
                     msgs.append(msg)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[Mon][获取] 频道 {channel_id} 获取媒体消息失败: {e}")
         return list(reversed(msgs))
 
-    async def validate_topology(self) -> list[str]:
+    async def validate_topology(self, all_cells: list[dict]) -> list[str]:
         """定期拓扑校验：检测环形链表是否断裂。
 
         检查项：
@@ -360,10 +400,11 @@ class MonScheduler:
         4. 每组 (a, s1, s2) 三元组完整
 
         返回问题描述列表，空列表表示健康。
+
+        Args:
+            all_cells: 由调用方统一查询传入。
         """
         issues = []
-        col = get_cells_col()
-        all_cells = await col.find({})
         active_cells = [c for c in all_cells if c["status"] == "active"]
 
         if not active_cells:

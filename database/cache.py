@@ -1,4 +1,5 @@
 import time
+import asyncio
 from collections import OrderedDict
 from typing import Optional, Any
 
@@ -42,9 +43,9 @@ class QueryCache:
         self.cache.clear()
 
 
-_user_cache = QueryCache(max_size=5000, ttl_seconds=300)
-_file_record_cache = QueryCache(max_size=5000, ttl_seconds=3600)
-_config_cache = QueryCache(max_size=100, ttl_seconds=60)
+_user_cache = QueryCache(max_size=10000, ttl_seconds=5184000)       # 60天
+_file_record_cache = QueryCache(max_size=10000, ttl_seconds=5184000) # 60天
+_config_cache = QueryCache(max_size=100, ttl_seconds=600)            # 10分钟
 
 
 def get_user_cache() -> QueryCache:
@@ -116,3 +117,58 @@ async def load_cache_from_disk():
         logger.info(f"[cache_store] 从 SQLite 恢复 {loaded} 条缓存到内存")
     except Exception as e:
         logger.warning(f"[cache_store] 加载失败（回退纯内存模式）: {e}")
+
+
+# ─── Decode Logs 缓冲：定时 flush ──────────────────
+# 策略：30 分钟兜底 + Bot 关闭时强制 flush
+
+_DECODE_LOG_FLUSH_INTERVAL = 30 * 60  # 30 分钟
+
+
+async def _flush_decode_log_buffer_loop():
+    """后台任务：混合策略 flush decode_logs 到 CRDB"""
+    from loguru import logger
+    from .session import get_decode_logs_col
+    decode_logs_col = get_decode_logs_col()
+    from .cache_store import get_decode_log_buffer
+
+    while True:
+        await asyncio.sleep(_DECODE_LOG_FLUSH_INTERVAL)
+        try:
+            buf = get_decode_log_buffer()
+            rows = await buf._db.execute_fetchall(
+                "SELECT id, file_code, requester_id, request_time, status, source_channel_id "
+                "FROM decode_log_buffer ORDER BY id LIMIT 500"
+            )
+            if rows:
+                # 分批写入，每批 200 条
+                batch_size = 200
+                for i in range(0, len(rows), batch_size):
+                    batch = rows[i:i + batch_size]
+                    await decode_logs_col.insert_many([
+                        {
+                            "file_code": r[1],
+                            "requester_id": r[2],
+                            "request_time": r[3],
+                            "status": r[4],
+                            "source_channel_id": r[5],
+                        }
+                        for r in batch
+                    ])
+                # 清空已 flush 的记录
+                ids = [r[0] for r in rows]
+                await buf._db.execute(
+                    "DELETE FROM decode_log_buffer WHERE id IN ({})".format(",".join(str(i) for i in ids))
+                )
+                await buf._db.commit()
+                logger.info(f"[DecodeLog] flushed {len(rows)} logs to CRDB")
+                # 递增本地计数器
+                try:
+                    from bots.admin_bot.menus import _status_counters
+                    _status_counters["today_decodes"] = _status_counters.get("today_decodes", 0) + len(rows)
+                except Exception:
+                    pass
+            else:
+                logger.debug("[DecodeLog] flush: no new logs")
+        except Exception as e:
+            logger.error(f"[DecodeLog] flush failed: {e}")

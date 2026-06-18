@@ -90,6 +90,7 @@
                         <td>
                             {% if file.get('status') == 'active' %}
                             <form method="post" action="/files/{{ file.get('file_code', '') }}/delete" style="display:inline;">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                                 <button type="submit" class="btn btn-danger" onclick="return confirm('确定要删除此文件吗？')">删除</button>
                             </form>
                             {% endif %}

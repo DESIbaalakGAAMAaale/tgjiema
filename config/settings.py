@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     RELAY_API_HASH: str = ""
     RELAY_PHONE: str = ""
     RELAY_CODE: str = ""
+    RELAY_ENCRYPTION_KEY: str = ""
 
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
@@ -65,6 +66,17 @@ class Settings(BaseSettings):
     ADMIN_USERNAME: str = ""
     ADMIN_PASSWORD: str = ""
 
+    # ─── Dsp Bot 频道降级阈值（Mon 不可用时的兜底机制）────────
+    CHANNEL_FAILURE_THRESHOLD: int = 3   # 60 秒内失败 N 次触发降级
+    CHANNEL_FAILURE_WINDOW: int = 60     # 统计窗口（秒）
+
+    # ─── 配额同步间隔 ──────────────────────────────────────────
+    QUOTA_SYNC_INTERVAL: int = 60        # 秒
+
+    # ─── 进程管理 ──────────────────────────────────────────────
+    RESTART_COOLDOWN: int = 600          # 子进程崩溃冷却期（秒）
+    TOPOLOGY_SEED_RETRIES: int = 3       # 拓扑初始化重试次数
+
     FREE_DAILY_QUOTA: int = 3
     BASIC_DAILY_QUOTA: int = 20
     PREMIUM_DAILY_QUOTA: int = -1
@@ -76,13 +88,23 @@ class Settings(BaseSettings):
     RATE_LIMIT_GLOBAL_PER_SECOND: int = 30
     RATE_LIMIT_PER_USER_PER_MINUTE: int = 10
 
-    LOG_LEVEL: str = "DEBUG"
+    LOG_LEVEL: str = "INFO"
 
     FILE_CODE_PREFIX: str = "tgwenjian"
 
     # ── 上传选项默认值 ──
     DEFAULT_PROTECT_CONTENT: bool = False
     DEFAULT_FILE_TTL_DAYS: int = 0  # 0=永久有效
+
+    # ── 可调参数（原硬编码魔法数字） ──
+    MEDIA_GROUP_BUFFER_WAIT: float = 3.0       # 媒体组缓冲等待时间（秒）
+    PENDING_TTL: int = 300                      # 外部码等待超时（秒）
+    SEND_CONCURRENCY: int = 25                  # Dsp 发送并发上限
+    PAGE_SIZE: int = 10                         # 分页大小
+    EXTERNAL_MEDIA_GROUP_TTL: int = 300         # 外部媒体组 TTL（秒）
+    CACHE_STORE_CLEANUP_DAYS: int = 30          # 本地缓存清理天数
+    MAX_RESTART_COUNT: int = 3                  # 5分钟内最大重启次数
+    MAX_RESTART_WINDOW: int = 300               # 重启计数窗口（秒）
 
     class Config:
         env_file = ".env"
@@ -127,10 +149,10 @@ class Settings(BaseSettings):
     @staticmethod
     def get_config_default(key: str) -> str:
         defaults = {
-            "storage_channel_id": "",
-            "decoder_chat_id": "",
+            "storage_channel_id": "-1000000000000",
+            "decoder_chat_id": "0",
             "file_code_prefix": "tgwenjian",
-            "force_join_channel_id": "",
+            "force_join_channel_id": "0",
             "force_join_link": "",
             "upload_bot_username": "",
             "decoder_bot_username": "",

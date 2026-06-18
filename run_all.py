@@ -2,6 +2,7 @@
 启动 5 个主进程：up / idx / dsp / mon / admin_bot
 + admin web + db_backup
 启动时自动初始化拓扑（无需手动运行 seed_topology.py）
++ 子进程崩溃自动重启（带限流保护，永不删除进程记录）
 """
 
 import multiprocessing
@@ -9,9 +10,17 @@ import os
 import signal
 import sys
 import time
+from collections import defaultdict
 
 from loguru import logger
 from config import settings
+
+try:
+    import uvloop
+    uvloop.install()
+    print("[RunAll] uvloop 已启用")
+except ImportError:
+    print("[RunAll] uvloop 未安装，使用默认事件循环")
 
 
 def run_up_bot():
@@ -68,17 +77,18 @@ BOT_RUNNERS = {
 }
 
 
-def _shutdown(processes):
+def _shutdown(processes: dict):
+    """优雅关闭所有进程。"""
     logger.info("正在优雅关闭进程...")
-    for p in processes:
+    for name, p in processes.items():
         if p.is_alive():
             try:
                 os.kill(p.pid, signal.SIGINT)
             except Exception:
                 p.terminate()
-    for p in processes:
+    for name, p in processes.items():
         p.join(timeout=5)
-    for p in processes:
+    for name, p in processes.items():
         if p.is_alive():
             p.terminate()
             p.join(timeout=2)
@@ -86,13 +96,87 @@ def _shutdown(processes):
 
 
 def _auto_seed():
-    """启动前自动初始化拓扑（静默，不交互）。"""
-    try:
-        import asyncio
-        from admin.seed_topology import auto_seed
-        asyncio.run(auto_seed())
-    except Exception as e:
-        logger.warning(f"[seed] 自动拓扑初始化失败（可能已有数据）: {e}")
+    """启动前自动初始化拓扑（静默，不交互）。
+    失败后检查 cells 表是否为空，为空则重试 3 次。
+    """
+    import asyncio
+
+    max_retries = settings.TOPOLOGY_SEED_RETRIES
+    for attempt in range(1, max_retries + 1):
+        try:
+            from admin.seed_topology import auto_seed
+            asyncio.run(auto_seed())
+            return
+        except Exception as e:
+            logger.warning(f"[seed] 自动拓扑初始化失败 (第{attempt}次): {e}")
+            if attempt < max_retries:
+                # 检查 cells 表是否为空
+                try:
+                    from database import get_cells_col
+                    count = asyncio.run(get_cells_col().count_documents({}))
+                    if count == 0:
+                        logger.info(f"[seed] cells 表为空，5秒后重试 ({attempt}/{max_retries})...")
+                        time.sleep(5)
+                        continue
+                    else:
+                        logger.info(f"[seed] cells 表已有 {count} 条记录，跳过重试")
+                        return
+                except Exception as check_err:
+                    logger.warning(f"[seed] 检查 cells 表失败: {check_err}")
+                    time.sleep(5)
+            else:
+                logger.error("[seed] 自动拓扑初始化重试耗尽，cells 表可能为空，程序将退出")
+                sys.exit(1)
+
+
+def _monitor_and_restart(processes: dict, running_flag: multiprocessing.Value):
+    """监控子进程，崩溃后自动重启（带限流保护，永不删除进程记录）。
+    每 5 分钟最多重启 3 次，超过后记录日志但不删除，冷却期后重置计数。
+    """
+    # 重启计数：{name: [(timestamp, ...)]}
+    restart_history: dict[str, list[float]] = defaultdict(list)
+    max_restart = getattr(settings, "MAX_RESTART_COUNT", 3)
+    restart_window = getattr(settings, "MAX_RESTART_WINDOW", 300)
+    # 冷却期：10 分钟
+    cooldown_period = settings.RESTART_COOLDOWN
+
+    while running_flag.value:
+        for name, p in list(processes.items()):
+            if not p.is_alive():
+                exitcode = p.exitcode
+                logger.warning(f"[RunAll] {name} 进程已退出 (exitcode={exitcode})")
+
+                # 限流检查：窗口内重启次数
+                now = time.time()
+                history = restart_history[name]
+                history[:] = [t for t in history if now - t < restart_window]
+                if len(history) >= max_restart:
+                    # 检查冷却期：如果最后一次重启已超过冷却期，重置计数
+                    last_restart = history[-1] if history else 0
+                    if now - last_restart > cooldown_period:
+                        logger.info(f"[RunAll] {name} 冷却期已过，重置重启计数")
+                        history.clear()
+                    else:
+                        logger.warning(
+                            f"[RunAll] {name} 在 {restart_window}s 内重启 {len(history)} 次，"
+                            f"已达上限 {max_restart}，进入冷却期（{cooldown_period}s），暂停自动重启"
+                        )
+                        time.sleep(5)
+                        continue
+
+                history.append(now)
+                logger.info(f"[RunAll] {name} 3秒后自动重启 (第{len(history)}次)")
+                time.sleep(3)
+
+                if name in BOT_RUNNERS:
+                    new_p = multiprocessing.Process(
+                        target=BOT_RUNNERS[name], name=name, daemon=True
+                    )
+                    new_p.start()
+                    processes[name] = new_p
+                    logger.info(f"[RunAll] {name} 已重启 (PID: {new_p.pid})")
+
+        time.sleep(5)
 
 
 def main():
@@ -110,13 +194,13 @@ def main():
     if not args:
         args = ["all"]
 
-    processes = []
+    processes: dict[str, multiprocessing.Process] = {}
 
     def _start(name, runner):
         p = multiprocessing.Process(target=runner, name=name, daemon=True)
         p.start()
         logger.info(f"启动 {name} (PID: {p.pid})")
-        processes.append(p)
+        processes[name] = p
 
     if "all" in args:
         for name, runner in BOT_RUNNERS.items():
@@ -130,10 +214,13 @@ def main():
             else:
                 logger.warning(f"未知的组件: {arg}")
 
+    # 运行标志（进程间共享），用于控制监控循环退出
+    running_flag = multiprocessing.Value('i', 1)
+
     try:
-        for p in processes:
-            p.join()
+        _monitor_and_restart(processes, running_flag)
     except KeyboardInterrupt:
+        running_flag.value = 0
         _shutdown(processes)
 
 

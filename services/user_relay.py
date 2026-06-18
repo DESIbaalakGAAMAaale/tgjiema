@@ -49,7 +49,7 @@ class UserRelay:
         return self._relay_user_id
 
     def set_pending_cleanup(self, callback):
-        pass
+        self._pending_cleanup = callback
 
     async def _report_status(self, status: str):
         try:

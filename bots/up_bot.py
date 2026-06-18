@@ -4,7 +4,10 @@
 
 import asyncio
 import datetime
-import json
+try:
+    import orjson as json
+except ImportError:
+    import json
 from collections import defaultdict
 
 from telegram import Update
@@ -18,15 +21,17 @@ from database.cache_store import get_cache_store
 from services.permission import check_upload_permission
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
+from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import safe_copy_message, safe_send_message, safe_send_media_group
+from utils.file_utils import detect_file_type, extract_file_meta
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
 
 _pending_media_groups: dict[str, dict] = {}
 _active_a_slots: list[dict] = []
 _active_slot_index: int = 0
-# 中继外部文件缓冲区：code → {user_id, msg_ids, files_meta, file_types, timer}
+# 中继外部文件缓冲区：code → {user_id, msg_ids, files_meta, file_types, timer, flushed}
 _external_buffers: dict[str, dict] = {}
 
 
@@ -56,39 +61,6 @@ async def _get_upload_target_channel() -> int:
 
 
 # ─── 以下逻辑与原来基本相同，仅 channel 选择改为环形槽位 ───
-
-
-def _detect_file_type(update: Update) -> str:
-    if update.message.photo:
-        return "photo"
-    if update.message.video:
-        return "video"
-    if update.message.document:
-        return "document"
-    if update.message.audio:
-        return "audio"
-    if update.message.voice:
-        return "audio"
-    if update.message.animation:
-        return "animation"
-    return "document"
-
-
-def _extract_file_meta(update: Update) -> dict:
-    msg = update.message
-    if msg.photo:
-        return {"type": "photo", "file_id": msg.photo[-1].file_id}
-    if msg.video:
-        return {"type": "video", "file_id": msg.video.file_id}
-    if msg.document:
-        return {"type": "document", "file_id": msg.document.file_id}
-    if msg.audio:
-        return {"type": "audio", "file_id": msg.audio.file_id}
-    if msg.voice:
-        return {"type": "audio", "file_id": msg.voice.file_id}
-    if msg.animation:
-        return {"type": "animation", "file_id": msg.animation.file_id}
-    return {"type": "document", "file_id": ""}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -181,9 +153,9 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给您"
     )
 
-    type_str = json.dumps(dict(batch["file_types"]))
+    type_str = json.dumps(dict(batch["file_types"])).decode()
     batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
-    batch_file_meta_str = json.dumps(batch["files_meta"])
+    batch_file_meta_str = json.dumps(batch["files_meta"]).decode()
 
     try:
         pending_col = get_pending_uploads_col()
@@ -229,7 +201,7 @@ async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch = context.user_data["batch"]
-    file_type = _detect_file_type(update)
+    file_type = detect_file_type(update)
 
     if update.message.media_group_id:
         mgid = update.message.media_group_id
@@ -251,7 +223,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
     else:
         batch["file_types"][file_type] += 1
-        batch["files_meta"].append(_extract_file_meta(update))
+        batch["files_meta"].append(extract_file_meta(update))
         try:
             target_ch = await _get_upload_target_channel()
             forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
@@ -274,7 +246,7 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
         try:
             forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
             batch["pinned_msg_ids"].append(forwarded.message_id)
-            batch["files_meta"].append(_extract_file_meta(up))
+            batch["files_meta"].append(extract_file_meta(up))
             copied += 1
         except Exception as e:
             logger.error(f"[Up] 批次媒体组复制文件到存储频道失败: {e}")
@@ -302,7 +274,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("您没有上传权限。")
         return
 
-    file_type = _detect_file_type(update)
+    file_type = detect_file_type(update)
     file_types = {file_type: 1}
     await _process_upload(user.id, update, context, file_types)
 
@@ -313,7 +285,7 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("您没有上传权限。")
         return
 
-    file_type = _detect_file_type(update)
+    file_type = detect_file_type(update)
 
     if update.message.media_group_id not in _pending_media_groups:
         _pending_media_groups[update.message.media_group_id] = {
@@ -350,7 +322,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         try:
             forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
             all_mids.append(forwarded.message_id)
-            all_meta.append(_extract_file_meta(up))
+            all_meta.append(extract_file_meta(up))
         except Exception as e:
             logger.error(f"[Up] 媒体组复制文件到存储频道失败: {e}")
 
@@ -362,9 +334,9 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             pass
         return
 
-    type_str = json.dumps(file_types)
+    type_str = json.dumps(file_types).decode()
     batch_ids_str = ",".join(str(mid) for mid in all_mids)
-    batch_file_meta_str = json.dumps(all_meta)
+    batch_file_meta_str = json.dumps(all_meta).decode()
     note = group["updates"][0].message.caption or ""
 
     sent_msg = await safe_send_message(
@@ -441,7 +413,7 @@ async def _process_upload(
     except Exception:
         pass
 
-    type_str = json.dumps(file_types)
+    type_str = json.dumps(file_types).decode()
     note = update.message.caption or ""
     opts = context.user_data.pop("upload_options", {})
 
@@ -554,8 +526,8 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         logger.error(f"[Up][ext_relay] copy 到存储频道失败 (code={external_code}): {e}")
         return
 
-    file_type = _detect_file_type(update)
-    file_meta = _extract_file_meta(update)
+    file_type = detect_file_type(update)
+    file_meta = extract_file_meta(update)
 
     if external_code not in _external_buffers:
         _external_buffers[external_code] = {
@@ -563,6 +535,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
             "msg_ids": [],
             "files_meta": [],
             "file_types": defaultdict(int),
+            "flushed": False,
         }
 
     buf = _external_buffers[external_code]
@@ -598,10 +571,20 @@ async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
-    """刷新外部文件缓冲区：写入 pending_uploads。"""
-    buf = _external_buffers.pop(external_code, None)
+    """刷新外部文件缓冲区：写入 pending_uploads。
+    如果 safe_mode=True 的 flush 已执行，EXTERNAL_DONE 到达时不应重复处理。
+    """
+    buf = _external_buffers.get(external_code)
     if buf is None:
         return
+
+    # 防止竞态：safe_mode 的超时 flush 已执行后，EXTERNAL_DONE 不应重复处理
+    if buf.get("flushed"):
+        return
+
+    # 标记为已处理，防止重复 flush
+    buf["flushed"] = True
+    _external_buffers.pop(external_code, None)
 
     if buf.get("timer"):
         buf["timer"].cancel()
@@ -612,10 +595,10 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         return
 
     target_ch = await _get_upload_target_channel()
-    type_str = json.dumps(dict(buf["file_types"]))
+    type_str = json.dumps(dict(buf["file_types"])).decode()
     batch_ids_str = ",".join(str(mid) for mid in msg_ids)
-    batch_file_meta_str = json.dumps(buf["files_meta"])
-    note = json.dumps({"type": "external", "code": external_code})
+    batch_file_meta_str = json.dumps(buf["files_meta"]).decode()
+    note = json.dumps({"type": "external", "code": external_code}).decode()
 
     try:
         pending_col = get_pending_uploads_col()
@@ -685,8 +668,8 @@ async def _async_main():
             await asyncio.sleep(60)
 
     loop = asyncio.get_running_loop()
-    loop.create_task(health_ping())
-    loop.create_task(slot_refresh_loop())
+    create_safe_task(health_ping(), name="health-ping")
+    create_safe_task(slot_refresh_loop(), name="slot-refresh")
 
     async with app:
         await app.start()

@@ -2,9 +2,71 @@
 - 中继账号配置、认证、使用统计全部存储在本地，不占用 CockroachDB Cloud 配额
 - VPS 重启后从本地恢复，无需重新登录
 """
+import os
 import aiosqlite
+from datetime import date
 from pathlib import Path
 from loguru import logger
+
+# ── 加密层（Fernet 对称加密）──────────────────────────────────────────
+_fernet = None
+_FERNET_ERROR = None
+
+try:
+    from cryptography.fernet import Fernet
+except ImportError as e:
+    _FERNET_ERROR = str(e)
+    logger.warning(f"[RelayDB] cryptography 库未安装，API_HASH 将以明文存储: {_FERNET_ERROR}")
+
+
+def _get_fernet() -> Fernet | None:
+    """延迟初始化 Fernet 实例，从环境变量读取密钥或自动生成"""
+    global _fernet, _FERNET_ERROR
+    if _fernet is not None:
+        return _fernet
+    if _FERNET_ERROR is not None:
+        return None
+
+    key = os.getenv("RELAY_ENCRYPTION_KEY", "")
+    if not key:
+        key = Fernet.generate_key().decode()
+        os.environ["RELAY_ENCRYPTION_KEY"] = key
+        logger.warning(
+            "[RelayDB] ⚠️  RELAY_ENCRYPTION_KEY 未设置，已自动生成密钥。"
+            "请立即将以下密钥添加到 .env 文件以确保重启后能解密已有数据：\n"
+            f"RELAY_ENCRYPTION_KEY={key}"
+        )
+    try:
+        _fernet = Fernet(key.encode() if isinstance(key, str) else key)
+        return _fernet
+    except Exception as e:
+        _FERNET_ERROR = str(e)
+        logger.error(f"[RelayDB] Fernet 初始化失败，API_HASH 将以明文存储: {e}")
+        return None
+
+
+def encrypt(plain_text: str) -> str:
+    """加密明文，返回密文字符串；如果加密不可用则返回明文 + 标记前缀"""
+    f = _get_fernet()
+    if f is None:
+        return plain_text
+    return f.encrypt(plain_text.encode()).decode()
+
+
+def decrypt(cipher_text: str) -> str:
+    """解密密文，返回明文字符串；如果解密失败或不可用则返回原文"""
+    f = _get_fernet()
+    if f is None:
+        return cipher_text
+    try:
+        return f.decrypt(cipher_text.encode()).decode()
+    except Exception as e:
+        logger.error(
+            f"[RelayDB] 解密失败，API_HASH 数据可能已损坏或密钥不匹配，"
+            f"返回原值（可能无法正确登录）: {e}"
+        )
+        return cipher_text
+
 
 DB_PATH = Path(__file__).parent.parent / "data" / "relay_pool.db"
 
@@ -46,12 +108,14 @@ CREATE TABLE IF NOT EXISTS relay_log (
 class RelayDB:
     def __init__(self):
         self._db: aiosqlite.Connection | None = None
+        self._request_count = 0
 
     async def init(self):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(DB_PATH))
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA wal_autocheckpoint=1000")
         await self._db.executescript(DDL)
         await self._db.commit()
         logger.info(f"[RelayDB] 初始化完成: {DB_PATH}")
@@ -66,7 +130,7 @@ class RelayDB:
     async def add_account(self, api_id: int, api_hash: str, phone: str) -> int:
         cursor = await self._db.execute(
             "INSERT INTO relay_accounts (api_id, api_hash, phone) VALUES (?, ?, ?)",
-            (api_id, api_hash, phone),
+            (api_id, encrypt(api_hash), phone),
         )
         await self._db.commit()
         return cursor.lastrowid
@@ -74,7 +138,7 @@ class RelayDB:
     async def update_account(self, phone: str, api_id: int, api_hash: str):
         await self._db.execute(
             "UPDATE relay_accounts SET api_id=?, api_hash=? WHERE phone=?",
-            (api_id, api_hash, phone),
+            (api_id, encrypt(api_hash), phone),
         )
         await self._db.commit()
 
@@ -106,7 +170,7 @@ class RelayDB:
             {
                 "id": r[0],
                 "api_id": r[1],
-                "api_hash": r[2],
+                "api_hash": decrypt(r[2]),
                 "phone": r[3],
                 "is_active": bool(r[4]),
                 "created_at": r[5],
@@ -124,7 +188,7 @@ class RelayDB:
             {
                 "id": r[0],
                 "api_id": r[1],
-                "api_hash": r[2],
+                "api_hash": decrypt(r[2]),
                 "phone": r[3],
                 "is_active": bool(r[4]),
                 "created_at": r[5],
@@ -167,38 +231,27 @@ class RelayDB:
         }
 
     async def record_request(self, relay_id: int, duration_ms: int):
-        today = date_today()
-        # 检查是否需要重置日统计
-        row = await self._db.execute_fetchone(
-            "SELECT last_reset_at, today_requests, total_requests, total_wait_ms "
-            "FROM relay_usage WHERE relay_id=?", (relay_id,)
+        """原子操作记录请求：使用 INSERT ... ON CONFLICT DO UPDATE 避免竞态条件"""
+        self._request_count += 1
+        await self._db.execute(
+            "INSERT INTO relay_usage "
+            "(relay_id, today_requests, total_requests, total_wait_ms, "
+            "last_request_at, last_reset_at) "
+            "VALUES (?, 1, 1, ?, datetime('now'), date('now')) "
+            "ON CONFLICT(relay_id) DO UPDATE SET "
+            "  today_requests = CASE WHEN last_reset_at != date('now') "
+            "    THEN 1 ELSE today_requests + 1 END, "
+            "  total_requests = total_requests + 1, "
+            "  total_wait_ms = total_wait_ms + ?, "
+            "  avg_wait_ms = (total_wait_ms + ?) * 1.0 / (total_requests + 1), "
+            "  last_request_at = datetime('now'), "
+            "  last_reset_at = CASE WHEN last_reset_at != date('now') "
+            "    THEN date('now') ELSE last_reset_at END",
+            (relay_id, duration_ms, duration_ms, duration_ms),
         )
-        if not row:
-            await self._db.execute(
-                "INSERT INTO relay_usage (relay_id, today_requests, total_requests, total_wait_ms) "
-                "VALUES (?, 1, 1, ?)",
-                (relay_id, duration_ms),
-            )
-        else:
-            last_reset = row[0]
-            today_req = row[1]
-            total_req = row[2]
-            total_wait = row[3]
-            if last_reset != today:
-                today_req = 0
-                total_req = 0
-                total_wait = 0
-            today_req += 1
-            total_req += 1
-            total_wait += duration_ms
-            avg = total_wait / total_req if total_req > 0 else 0
-            await self._db.execute(
-                "UPDATE relay_usage SET today_requests=?, total_requests=?, "
-                "total_wait_ms=?, avg_wait_ms=?, last_request_at=datetime('now') "
-                "WHERE relay_id=?",
-                (today_req, total_req, total_wait, avg, relay_id),
-            )
         await self._db.commit()
+        if self._request_count % 100 == 0:
+            await self._db.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
     async def reset_usage(self):
         await self._db.execute("DELETE FROM relay_usage")
@@ -217,7 +270,6 @@ class RelayDB:
 
 
 def date_today() -> str:
-    from datetime import date
     return date.today().isoformat()
 
 

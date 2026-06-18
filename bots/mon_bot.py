@@ -10,9 +10,8 @@
 
 import asyncio
 import datetime as _dt
-import logging
-import re
 
+from loguru import logger
 from telegram import Bot
 from telegram.error import TelegramError
 
@@ -22,11 +21,10 @@ from database import (
     set_cell_status, update_cell_heartbeat, log_rotate,
     add_spare_channel, get_spare_for_account, get_any_spare,
     consume_spare, get_rotation_config, set_rotation_config,
+    _client,
 )
 from services.mon import MonScheduler
 from utils.monitor import metrics
-
-logger = logging.getLogger("mon_bot")
 
 TOKEN = settings.MON_BOT_TOKEN
 if not TOKEN:
@@ -68,6 +66,9 @@ class MonBot:
             "time_per_slot": 3600,
         }
         self._rotation_reload_countdown = 0
+        # ─── 心跳本地缓存：减少 CRDB 写入 ───
+        # slot_id → True（上次心跳成功）/ False（上次心跳失败）
+        self._cell_healthy: dict[str, bool] = {}
 
     async def _reload_rotation_config(self):
         """从 DB rotation_config 表重新读取轮转参数（30 个周期一次）。"""
@@ -201,16 +202,15 @@ class MonBot:
 
         await self._notify_admin(notify_msg)
 
-    async def _check_rotation(self):
+    async def _check_rotation(self, all_cells: list[dict]):
         """检查活跃频道窗口是否该轮转。
         条件：当前窗口内任一活跃频道满足 file_count >= files_per_slot
               或 rotation time >= time_per_slot
         切换：将当前窗口的 status 由 active 改为 rotation（临时）标记，
               推进窗口指针到下一组。
         """
-        col = get_cells_col()
-        all_cells = await col.find({"status": "active"})
-        if not all_cells:
+        active_cells = [c for c in all_cells if c.get("status") == "active"]
+        if not active_cells:
             return
 
         window_size = self._rotation.get("active_window_size", 3)
@@ -245,76 +245,62 @@ class MonBot:
             return
 
         # ── 执行轮转：将当前窗口全部标记为 shadow1（休眠），推进窗口 ──
-        # 当前窗口内的 active cells → 改为 "idle"（临时休眠）
-        # 环中接下来 window_size 个 shadow1 → 提升为 active
-        # 注意：active 滑块推进，原 active 降为新窗口的 shadow1
+        # 使用 CRDB 事务保证原子性：所有 update 要么全部成功，要么全部回滚
+        # 避免中途失败导致部分槽位状态不一致
 
-        # 先获取所有 slot（包括 active, shadow1, shadow2）
-        all_cells_full = await col.find({})
-        groups = self.scheduler._group_slots(all_cells_full)
+        # 先计算分组和窗口信息（在事务外，避免长事务）
+        groups = self.scheduler._group_slots(all_cells)
+        all_group_keys = sorted(groups.keys(), key=lambda x: int(x))
 
-        # 找到所有 active 组并排序
-        active_groups = []
-        for gkey, (a_slot, s1_slot, s2_slot) in groups.items():
-            if a_slot and a_slot["status"] == "active":
-                active_groups.append((int(gkey), a_slot, s1_slot, s2_slot))
-        active_groups.sort(key=lambda x: x[0])
-
-        if not active_groups:
+        if not all_group_keys:
+            logger.warning("[Mon][Rotation] 无有效分组，跳过轮转")
             return
 
-        # 当前窗口索引
-        first_active_group = active_groups[0][0]
-        all_group_keys = sorted(int(k) for k in groups.keys())
-        current_idx = all_group_keys.index(first_active_group)
+        # 找到当前 active 窗口的起始位置
+        current_idx = 0
+        for i, gkey in enumerate(all_group_keys):
+            a_slot = groups[gkey][0]
+            if a_slot and a_slot.get("status") == "active":
+                current_idx = i
+                break
 
-        # 找出下一组 active 窗口起始位置
-        next_start_idx = (current_idx + window_size) % len(all_group_keys)
+        # 计算下一窗口的组键列表
         next_window_keys = []
         for i in range(window_size):
-            ni = (next_start_idx + i) % len(all_group_keys)
-            next_window_keys.append(str(all_group_keys[ni]))
+            wi = (current_idx + window_size + i) % len(all_group_keys)
+            next_window_keys.append(all_group_keys[wi])
 
-        # 休眠当前窗口（active → idle）
-        for i in range(window_size):
-            wi = (current_idx + i) % len(all_group_keys)
-            gkey = str(all_group_keys[wi])
-            if gkey in groups and groups[gkey][0]:
-                a_slot = groups[gkey][0]
-                await col.update_one(
-                    {"slot_id": a_slot["slot_id"]},
-                    {"$set": {
-                        "status": "shadow1",
-                        "file_count": 0,
-                        "rotation_started_at": now.isoformat(),
-                    }},
-                )
-                logger.info(f"[Mon][Rotation] 休眠 {a_slot['slot_id']}")
-
-        # 唤醒下一窗口（shadow1 → active）
-        for gkey in next_window_keys:
-            if gkey in groups and groups[gkey][1]:
-                s1_slot = groups[gkey][1]
-                # 获取当前 active 的 next_active_chat_id
-                target_active = groups[gkey][0]
-                nxt = target_active.get("next_active_chat_id") if target_active else None
-                await col.update_one(
-                    {"slot_id": s1_slot["slot_id"]},
-                    {"$set": {
-                        "status": "active",
-                        "next_active_chat_id": nxt,
-                        "file_count": 0,
-                        "rotation_started_at": now.isoformat(),
-                        "last_heartbeat": now.isoformat(),
-                    }},
-                )
-                # 同组的原 active → shadow1（如果还没变的话）
-                if target_active and target_active["status"] == "active":
-                    await col.update_one(
-                        {"slot_id": target_active["slot_id"]},
-                        {"$set": {"status": "shadow1"}},
+        now_iso = now.isoformat()
+        async with _client.transaction() as conn:
+            # 休眠当前窗口（active → shadow1）
+            for i in range(window_size):
+                wi = (current_idx + i) % len(all_group_keys)
+                gkey = str(all_group_keys[wi])
+                if gkey in groups and groups[gkey][0]:
+                    a_slot = groups[gkey][0]
+                    await conn.execute(
+                        "UPDATE cells SET status = $1, file_count = 0, rotation_started_at = $2 WHERE slot_id = $3",
+                        "shadow1", now_iso, a_slot["slot_id"],
                     )
-                logger.info(f"[Mon][Rotation] 唤醒 {s1_slot['slot_id']} → active")
+                    logger.info(f"[Mon][Rotation] 休眠 {a_slot['slot_id']}")
+
+            # 唤醒下一窗口（shadow1 → active）
+            for gkey in next_window_keys:
+                if gkey in groups and groups[gkey][1]:
+                    s1_slot = groups[gkey][1]
+                    target_active = groups[gkey][0]
+                    nxt = target_active.get("next_active_chat_id") if target_active else None
+                    await conn.execute(
+                        "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3, last_heartbeat = $4 WHERE slot_id = $5",
+                        "active", str(nxt) if nxt else None, now_iso, now_iso, s1_slot["slot_id"],
+                    )
+                    # 同组的原 active → shadow1（如果还没变的话）
+                    if target_active and target_active["status"] == "active":
+                        await conn.execute(
+                            "UPDATE cells SET status = $1 WHERE slot_id = $2",
+                            "shadow1", target_active["slot_id"],
+                        )
+                    logger.info(f"[Mon][Rotation] 唤醒 {s1_slot['slot_id']} → active")
 
         await self._notify_admin(
             f"🔄 频道轮转通知\n\n"
@@ -337,23 +323,27 @@ class MonBot:
                 # 0. 重新加载轮转配置（每 30 周期一次）
                 await self._reload_rotation_config()
 
+                # ── 一次查询 cells 表，所有方法复用（减少 3 次 DB 查询） ──
+                col = get_cells_col()
+                all_cells = await col.find({})
+
                 # 1. 对所有 active + shadow 槽位发心跳（同时检测封禁）
-                ok_count, ban_count = await self._heartbeat_with_ban_detection()
+                ok_count, ban_count = await self._heartbeat_with_ban_detection(all_cells)
                 if ok_count > 0:
                     logger.info(f"[Mon] 心跳: {ok_count} 正常, {ban_count} 封禁")
 
                 # 2. 核心写入：将 Active 槽位新文件同步到 Shadow 频道
-                copied = await self.scheduler.replicate_all_active_to_shadows(self.bot)
+                copied = await self.scheduler.replicate_all_active_to_shadows(self.bot, all_cells)
                 if copied > 0:
                     logger.info(f"[Mon] 文件同步: 复制了 {copied} 条消息到 Shadow 频道")
 
                 # 3. 智能替补：新频道自动补齐存量文件
-                filled = await self.scheduler.auto_fill_new_channels(self.bot)
+                filled = await self.scheduler.auto_fill_new_channels(self.bot, all_cells)
                 if filled > 0:
                     logger.info(f"[Mon] 智能替补: 补齐 {filled} 条消息到新频道")
 
                 # 4. 降级检查
-                alerts = await self.scheduler.run_degrade_check()
+                alerts = await self.scheduler.run_degrade_check(all_cells)
                 if alerts:
                     for msg in alerts:
                         logger.warning(msg)
@@ -363,40 +353,49 @@ class MonBot:
                             await self._notify_admin(f"⚠️ {msg}")
 
                 # 5. 活跃频道轮转检查
-                await self._check_rotation()
+                await self._check_rotation(all_cells)
 
                 # 6. 定期拓扑校验（每 10 轮一次）
                 self._cycle_count += 1
                 if self._cycle_count % 10 == 0:
-                    issues = await self.scheduler.validate_topology()
+                    issues = await self.scheduler.validate_topology(all_cells)
                     if issues:
                         for issue in issues:
                             logger.warning(issue)
                     else:
                         logger.info("[Mon] 拓扑校验: 健康")
 
-                # 7. 报告当前拓扑状态
-                await self._report_status()
+                # 7. 报告当前拓扑状态（从缓存读取，不查 DB）
+                await self._report_status(all_cells)
 
             except Exception as e:
                 logger.error(f"[Mon] 调度异常: {e}")
 
             await asyncio.sleep(RECOVERY_INTERVAL)
 
-    async def _heartbeat_with_ban_detection(self) -> tuple[int, int]:
-        """心跳检测 + 封禁识别。返回 (ok_count, ban_count)。"""
-        col = get_cells_col()
-        cells = await col.find({"status": {"$in": ["active", "shadow1", "shadow2"]}})
+    async def _heartbeat_with_ban_detection(self, all_cells: list[dict]) -> tuple[int, int]:
+        """心跳检测 + 封禁识别。返回 (ok_count, ban_count)。
+        优化：只有状态变化时或每 5 个周期才写一次 CRDB，减少 RU 消耗。
+        """
+        # 从传入的 all_cells 中筛选 active/shadow
+        cells = [c for c in all_cells if c.get("status") in ("active", "shadow1", "shadow2")]
         ok_count = 0
         ban_count = 0
         for cell in cells:
+            slot_id = cell["slot_id"]
             try:
                 # 使用 get_chat 做更彻底的检测
                 await self.bot.get_chat(cell["channel_id"])
-                await update_cell_heartbeat(cell["slot_id"])
+                was_healthy = self._cell_healthy.get(slot_id, False)
+                if not was_healthy:
+                    # 从不健康变健康，或连续 5 个周期写一次
+                    if self._cycle_count % 5 == 0:
+                        await update_cell_heartbeat(slot_id)
+                self._cell_healthy[slot_id] = True
                 ok_count += 1
             except TelegramError as e:
                 if _is_ban_error(e):
+                    self._cell_healthy[slot_id] = False
                     ban_count += 1
                     await self._handle_channel_ban(cell, str(e))
                 else:
@@ -404,6 +403,7 @@ class MonBot:
                     pass
             except Exception as e:
                 if _is_ban_error(e):
+                    self._cell_healthy[slot_id] = False
                     ban_count += 1
                     await self._handle_channel_ban(cell, str(e))
         return ok_count, ban_count
@@ -420,14 +420,12 @@ class MonBot:
         await close_db()
         logger.info("[Mon] 监控机器人已停止")
 
-    async def _report_status(self):
-        """输出当前拓扑健康状态到日志。"""
-        cells = await get_active_cells()
-        active_count = len(cells)
-        all_cells = await get_cells_col().find({})
+    async def _report_status(self, all_cells: list[dict]):
+        """输出当前拓扑健康状态到日志（从缓存读取，不查 DB）。"""
+        active_count = len([c for c in all_cells if c.get("status") == "active"])
         total = len(all_cells)
-        lost = len([c for c in all_cells if c["status"] == "lost"])
-        r100 = len([c for c in all_cells if c["status"] == "r100"])
+        lost = len([c for c in all_cells if c.get("status") == "lost"])
+        r100 = len([c for c in all_cells if c.get("status") == "r100"])
         rotation_config = self._rotation
         logger.info(
             f"[Mon] 拓扑: {active_count}/{total} 活跃, {lost} 失联, {r100} R100 | "
