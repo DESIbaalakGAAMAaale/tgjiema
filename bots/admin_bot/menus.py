@@ -15,6 +15,7 @@ _status_counters = {
     "active_files": 0,
     "today_decodes": 0,
 }
+_status_counters_initialized = False
 
 
 def _auth_required(func):

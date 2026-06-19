@@ -49,7 +49,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/user <用户ID>")
+        await update.message.reply_text("用法:/user <用户ID>")
         return
     try:
         user_id = int(args[0])
@@ -63,18 +63,18 @@ async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     level = user.get("membership_level", "free")
     msg = (
         f"👤 用户详情\n\n"
-        f"🆔 ID：{user.get('user_id')}\n"
-        f"📝 用户名：@{user.get('username') or 'N/A'}\n"
-        f"👤 昵称：{user.get('first_name') or 'N/A'}\n"
-        f"🏅 会员等级：{MEMBERSHIP_LEVELS.get(level, level)}\n"
-        f"🔒 是否封禁：{'是 ❌' if user.get('is_banned') else '否 ✅'}\n"
-        f"📤 允许上传：{'是 ✅' if user.get('can_upload') else '否 ❌'}\n"
-        f"📅 解码配额：{_quota_display(user.get('daily_decode_quota'))}/天\n"
-        f"📊 今日已用：{user.get('quota_used_today', 0)}次\n"
-        f"🌐 外部码配额：{_quota_display(user.get('external_decode_quota'))}/天\n"
-        f"🌐 外部已用：{user.get('external_used_today', 0)}次\n"
-        f"📅 注册时间：{format_datetime(user.get('created_at'))}\n"
-        f"🔄 更新时间：{format_datetime(user.get('updated_at'))}"
+        f"🆔 ID:{user.get('user_id')}\n"
+        f"📝 用户名:@{user.get('username') or 'N/A'}\n"
+        f"👤 昵称:{user.get('first_name') or 'N/A'}\n"
+        f"🏅 会员等级:{MEMBERSHIP_LEVELS.get(level, level)}\n"
+        f"🔒 是否封禁:{'是 ❌' if user.get('is_banned') else '否 ✅'}\n"
+        f"📤 允许上传:{'是 ✅' if user.get('can_upload') else '否 ❌'}\n"
+        f"📅 解码配额:{_quota_display(user.get('daily_decode_quota'))}/天\n"
+        f"📊 今日已用:{user.get('quota_used_today', 0)}次\n"
+        f"🌐 外部码配额:{_quota_display(user.get('external_decode_quota'))}/天\n"
+        f"🌐 外部已用:{user.get('external_used_today', 0)}次\n"
+        f"📅 注册时间:{format_datetime(user.get('created_at'))}\n"
+        f"🔄 更新时间:{format_datetime(user.get('updated_at'))}"
     )
     await update.message.reply_text(msg)
 
@@ -96,7 +96,7 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text("用法：/set_level <用户ID> <1|2|3>")
+        await update.message.reply_text("用法:/set_level <用户ID> <1|2|3>")
         return
     try:
         user_id = int(args[0])
@@ -105,7 +105,8 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     level = LEVEL_ALIAS.get(args[1].lower())
     if not level:
-        await update.message.reply_text("❌ 等级：1=免费 2=基础 3=高级")
+        await update.message.reply_text("❌ 等级:1=免费 2=基础 3=高级")
+        return
 
     users_col = get_users_col()
     user = await _ensure_user(user_id)
@@ -141,7 +142,7 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/ban <用户ID>")
+        await update.message.reply_text("用法:/ban <用户ID>")
         return
     try:
         user_id = int(args[0])
@@ -163,7 +164,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/unban <用户ID>")
+        await update.message.reply_text("用法:/unban <用户ID>")
         return
     try:
         user_id = int(args[0])
@@ -185,7 +186,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text("用法：/set_quota <用户ID> <每日解码配额(-1为不限)>")
+        await update.message.reply_text("用法:/set_quota <用户ID> <每日解码配额(-1为不限)>")
         return
     try:
         user_id = int(args[0])
@@ -208,7 +209,7 @@ async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text("用法：/set_external_quota <用户ID> <外部码配额(-1为不限，0为禁止)>")
+        await update.message.reply_text("用法:/set_external_quota <用户ID> <外部码配额(-1为不限,0为禁止)>")
         return
     try:
         user_id = int(args[0])
@@ -231,7 +232,7 @@ async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def file_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/file <文件码>")
+        await update.message.reply_text("用法:/file <文件码>")
         return
     file_code = args[0]
 
@@ -254,18 +255,18 @@ async def file_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"📁 文件详情\n\n"
-        f"🔑 文件码：{file_code}\n"
-        f"👤 上传者：{record.get('uploader_id')}\n"
-        f"📦 文件类型：{type_desc}\n"
-        f"📊 状态：{record.get('status', 'active')}\n"
-        f"📈 请求次数：{record.get('request_count', 0)}\n"
-        f"📅 创建时间：{format_datetime(record.get('create_time'))}\n"
-        f"📺 主频道：{record.get('primary_channel_id')}\n"
-        f"🔄 备份数：{len(backups)}个频道\n"
+        f"🔑 文件码:{file_code}\n"
+        f"👤 上传者:{record.get('uploader_id')}\n"
+        f"📦 文件类型:{type_desc}\n"
+        f"📊 状态:{record.get('status', 'active')}\n"
+        f"📈 请求次数:{record.get('request_count', 0)}\n"
+        f"📅 创建时间:{format_datetime(record.get('create_time'))}\n"
+        f"📺 主频道:{record.get('primary_channel_id')}\n"
+        f"🔄 备份数:{len(backups)}个频道\n"
     )
     note = record.get("note", "")
     if note:
-        msg += f"📝 备注：{note}\n"
+        msg += f"📝 备注:{note}\n"
     await update.message.reply_text(msg)
 
 
@@ -294,9 +295,9 @@ async def files_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = await files_col.find(query, sort=("create_time", -1), skip=skip, limit=per_page)
     total_pages = max(1, (total + per_page - 1) // per_page)
 
-    msg = f"📁 文件列表 (第{page}/{total_pages}页，共{total}个)\n"
+    msg = f"📁 文件列表 (第{page}/{total_pages}页,共{total}个)\n"
     if search:
-        msg += f"🔍 搜索：{search}\n"
+        msg += f"🔍 搜索:{search}\n"
     msg += "\n"
 
     for f in files:
@@ -316,7 +317,7 @@ async def files_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/delete_file <文件码>")
+        await update.message.reply_text("用法:/delete_file <文件码>")
         return
     file_code = args[0]
 
@@ -345,14 +346,14 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "用法：/relay_code <验证码>\n\n"
+            "用法:/relay_code <验证码>\n\n"
             "用于解码机器人登录 Telegram 用户账号时提交验证码。\n"
-            "验证码（6位）会发送到该账号已登录的 Telegram 客户端。"
+            "验证码(6位)会发送到该账号已登录的 Telegram 客户端。"
         )
         return
     code = args[0].strip()
     if not code.isdigit() or len(code) not in (5, 6):
-        await update.message.reply_text("❌ 验证码格式不正确，应为 5-6 位数字")
+        await update.message.reply_text("❌ 验证码格式不正确,应为 5-6 位数字")
         return
 
     await set_config("relay_auth_code", code)
@@ -367,8 +368,8 @@ async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
         await update.message.reply_text(
-            "用法：/relay_set_api <api_id> <api_hash> <手机号>\n\n"
-            "示例：/relay_set_api 12345 abc123def456 +8613800138000"
+            "用法:/relay_set_api <api_id> <api_hash> <手机号>\n\n"
+            "示例:/relay_set_api 12345 abc123def456 +8613800138000"
         )
         return
     try:
@@ -382,9 +383,9 @@ async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_relay_config(api_id, api_hash, phone)
     await update.message.reply_text(
         f"✅ 中继账号已配置\n"
-        f"API_ID：{api_id}\n"
-        f"手机号：{phone[:3]}****{phone[-2:] if len(phone) > 5 else ''}\n\n"
-        f"⚠️ 配置已保存到数据库，解码机器人下次重启时生效。\n"
+        f"API_ID:{api_id}\n"
+        f"手机号:{phone[:3]}****{phone[-2:] if len(phone) > 5 else ''}\n\n"
+        f"⚠️ 配置已保存到数据库,解码机器人下次重启时生效。\n"
         f"⚠️ 请确保该账号未开启二步验证。\n"
         f"🔐 建议在配置完成后立即删除本聊天记录中的密钥信息。"
     )
@@ -396,14 +397,14 @@ async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending == "1":
         await update.message.reply_text(
             "⏳ 中继正在等待验证码\n\n"
-            "Telegram 已发送 6 位验证码到中继账号的已登录客户端，\n"
-            "请查看并提交：/relay_code <验证码>"
+            "Telegram 已发送 6 位验证码到中继账号的已登录客户端,\n"
+            "请查看并提交:/relay_code <验证码>"
         )
     else:
         await update.message.reply_text(
             "✅ 中继当前不需要验证码\n\n"
-            "如果解码机器人在等待验证码但此处显示不需要，\n"
-            "可能是状态同步延迟，请稍后重试或查看状态面板。"
+            "如果解码机器人在等待验证码但此处显示不需要,\n"
+            "可能是状态同步延迟,请稍后重试或查看状态面板。"
         )
 
 
@@ -420,7 +421,7 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not pool_status:
         await update.message.reply_text(
             "⚠️ 中继账号池为空\n"
-            "请使用 /relay_add 添加中继账号，或通过管理面板配置。"
+            "请使用 /relay_add 添加中继账号,或通过管理面板配置。"
         )
         return
     msg = f"🔐 中继账号池 ({len(pool_status)} 个账号)\n\n"
@@ -436,13 +437,13 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_auth_required
 async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """添加中继账号（命令行方式）"""
+    """添加中继账号(命令行方式)"""
     args = context.args
     if len(args) < 3:
         await update.message.reply_text(
-            "用法：/relay_add <api_id> <api_hash> <手机号>\n\n"
-            "示例：/relay_add 12345 abc123def456 +8613800138000\n\n"
-            "添加后需要提交验证码完成登录，或直接在管理面板中配置。"
+            "用法:/relay_add <api_id> <api_hash> <手机号>\n\n"
+            "示例:/relay_add 12345 abc123def456 +8613800138000\n\n"
+            "添加后需要提交验证码完成登录,或直接在管理面板中配置。"
         )
         return
     try:
@@ -463,7 +464,7 @@ async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"  API_HASH: {api_hash[:8]}...\n"
             f"  手机号: {masked}\n\n"
             f"解码机器人将自动检测新账号并连接。\n"
-            f"如需要登录验证码，请使用 /relay_code 提交。"
+            f"如需要登录验证码,请使用 /relay_code 提交。"
         )
     except Exception as e:
         await update.message.reply_text(f"❌ 添加失败: {e}")
@@ -475,8 +476,8 @@ async def relay_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "用法：/relay_remove <手机号>\n\n"
-            "示例：/relay_remove +8613800138000"
+            "用法:/relay_remove <手机号>\n\n"
+            "示例:/relay_remove +8613800138000"
         )
         return
     phone = args[0].strip()
@@ -511,7 +512,7 @@ async def settings_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_storage_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/set_storage_channel <频道ID>")
+        await update.message.reply_text("用法:/set_storage_channel <频道ID>")
         return
     try:
         channel_id = int(args[0])
@@ -526,7 +527,7 @@ async def set_storage_channel(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def set_decoder_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/set_decoder_chat <ChatID>")
+        await update.message.reply_text("用法:/set_decoder_chat <ChatID>")
         return
     try:
         chat_id = int(args[0])
@@ -541,7 +542,7 @@ async def set_decoder_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_file_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/set_file_prefix <前缀>\n当前：/settings 查看")
+        await update.message.reply_text("用法:/set_file_prefix <前缀>\n当前:/settings 查看")
         return
     prefix = args[0].strip()
     await set_config("file_code_prefix", prefix)
@@ -552,7 +553,7 @@ async def set_file_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/set_force_join <频道ID> [加群链接]")
+        await update.message.reply_text("用法:/set_force_join <频道ID> [加群链接]")
         return
     try:
         channel_id = int(args[0])
@@ -563,14 +564,14 @@ async def set_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     link = args[1] if len(args) > 1 else ""
     if link:
         await set_config("force_join_link", link)
-    await update.message.reply_text(f"✅ 强制加群频道已设为 {channel_id}\n" + (f"🔗 链接：{link}" if link else "") + " ✅热更新")
+    await update.message.reply_text(f"✅ 强制加群频道已设为 {channel_id}\n" + (f"🔗 链接:{link}" if link else "") + " ✅热更新")
 
 
 @_auth_required
 async def set_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("用法：/set_username <upload|decoder|sender> <@用户名>")
+        await update.message.reply_text("用法:/set_username <upload|decoder|sender> <@用户名>")
         return
     bot_role = args[0].lower()
     username = args[1].lstrip("@")
@@ -587,16 +588,16 @@ async def set_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("用法：/set_quota_default <1|2|3> <日配额> [外部码日配额]")
+        await update.message.reply_text("用法:/set_quota_default <1|2|3> <日配额> [外部码日配额]")
         return
     level = LEVEL_ALIAS.get(args[0].lower())
     if not level:
-        await update.message.reply_text("❌ 等级：1=免费 2=基础 3=高级")
+        await update.message.reply_text("❌ 等级:1=免费 2=基础 3=高级")
         return
     try:
         quota = int(args[1])
     except ValueError:
-        await update.message.reply_text("❌ 配额必须是数字（-1 表示不限）")
+        await update.message.reply_text("❌ 配额必须是数字(-1 表示不限)")
         return
     await set_config(f"quota_default_{level}", str(quota))
     msg = f"✅ {level} 日配额已设为 {_quota_display(quota)}"
@@ -607,7 +608,7 @@ async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             ext_quota = quota
         await set_config(f"quota_external_{level}", str(ext_quota))
-        msg += f"，外部码配额 {_quota_display(ext_quota)}"
+        msg += f",外部码配额 {_quota_display(ext_quota)}"
 
     msg += "\n⚠️ 已有用户的配额不受影响 ✅热更新"
     await update.message.reply_text(msg)
@@ -617,7 +618,7 @@ async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text("用法：/set_r2 <账号ID> <AccessKey> <SecretKey> [桶名]")
+        await update.message.reply_text("用法:/set_r2 <账号ID> <AccessKey> <SecretKey> [桶名]")
         return
     await set_config("r2_account_id", args[0])
     await set_config("r2_access_key", args[1])
@@ -635,18 +636,18 @@ async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("用法：/set_db_backup <间隔分钟> <开/关>")
+        await update.message.reply_text("用法:/set_db_backup <间隔分钟> <开/关>")
         return
     try:
         interval = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ 间隔必须是数字（分钟）")
+        await update.message.reply_text("❌ 间隔必须是数字(分钟)")
         return
     enabled = args[1].lower() in ("开", "1", "true", "yes", "on")
     await set_config("db_backup_interval", str(interval))
     await set_config("db_backup_enabled", "true" if enabled else "false")
     await update.message.reply_text(
-        f"✅ 数据库备份：间隔 {interval} 分钟，状态：{'开启' if enabled else '关闭'} ✅热更新"
+        f"✅ 数据库备份:间隔 {interval} 分钟,状态:{'开启' if enabled else '关闭'} ✅热更新"
     )
 
 
@@ -665,17 +666,17 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not args:
         await update.message.reply_text(
-            "⚠️️ ️ 危险的工厂重置！\n\n"
-            "此操作将清空以下所有数据：\n"
-            "• 📦 file_records（文件记录）\n"
-            "• 📋 decode_logs（解码日志）\n"
-            "• 📤 pending_uploads（上传队列）\n"
-            "• 👤 users（用户数据）\n"
-            "• ⚙️ backup_config（系统配置与备份配置）\n\n"
-            "频道中的消息不会被删除，但备份状态会重置，全量备份将被重新触发。\n\n"
-            "🔴 如果您确认，请发送：\n"
+            "⚠️️ ️ 危险的工厂重置!\n\n"
+            "此操作将清空以下所有数据:\n"
+            "• 📦 file_records(文件记录)\n"
+            "• 📋 decode_logs(解码日志)\n"
+            "• 📤 pending_uploads(上传队列)\n"
+            "• 👤 users(用户数据)\n"
+            "• ⚙️ backup_config(系统配置与备份配置)\n\n"
+            "频道中的消息不会被删除,但备份状态会重置,全量备份将被重新触发。\n\n"
+            "🔴 如果您确认,请发送:\n"
             "/factory_reset confirm\n\n"
-            "🔴 最终确认请发送：\n"
+            "🔴 最终确认请发送:\n"
             "/factory_reset confirm I_UNDERSTAND"
         )
         return
@@ -687,9 +688,9 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 2 or args[1] != "I_UNDERSTAND":
         await update.message.reply_text(
             "⚠️ 二次确认\n\n"
-            "发送以下命令执行最终重置：\n"
+            "发送以下命令执行最终重置:\n"
             "/factory_reset confirm I_UNDERSTAND\n\n"
-            "此操作不可撤销！所有用户数据、文件码、配置将被永久清空。\n"
+            "此操作不可撤销!所有用户数据、文件码、配置将被永久清空。\n"
             "频道消息需要手动删除。"
         )
         return
@@ -711,11 +712,13 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"[factory_reset] 清空 {table} 失败: {e}")
 
+    await client.close()
+
     await msg.edit_text(
-        "✅ 工厂重置完成！\n\n"
-        f"已清空 {len(cleared)} 张表：{', '.join(cleared)}\n\n"
+        "✅ 工厂重置完成!\n\n"
+        f"已清空 {len(cleared)} 张表:{', '.join(cleared)}\n\n"
         "⚠️ 存储频道的消息不会被自动删除。\n"
-        "如需清空存储频道，请手动执行：\n"
+        "如需清空存储频道,请手动执行:\n"
         "  /purge_channel <频道ID>\n\n"
         "🔄 请重启所有机器人以使配置生效。"
     )
@@ -725,7 +728,7 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def purge_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/purge_channel <频道ID>")
+        await update.message.reply_text("用法:/purge_channel <频道ID>")
         return
     try:
         channel_id = int(args[0])
@@ -735,7 +738,7 @@ async def purge_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"⚠️ Telegram Bot API 不支持批量删除频道消息。\n\n"
-        f"请手动处理频道 {channel_id}：\n"
+        f"请手动处理频道 {channel_id}:\n"
         f"1. 打开频道管理界面\n"
         f"2. 删除所有消息\n"
         f"3. 或直接创建一个新的测试频道\n\n"
@@ -751,10 +754,10 @@ async def add_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "用法：/add_code_route <前缀> <机器人用户名>\n\n"
+            "用法:/add_code_route <前缀> <机器人用户名>\n\n"
             "设置文件码前缀对应的解码机器人。\n"
-            "当文件码以指定前缀开头时，中继将路由到该机器人解码。\n\n"
-            "示例：\n"
+            "当文件码以指定前缀开头时,中继将路由到该机器人解码。\n\n"
+            "示例:\n"
             "/add_code_route qqfile qqfile_bot\n"
             "/add_code_route tgwenjian mydecoder_bot"
         )
@@ -764,8 +767,8 @@ async def add_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_code_bot_route(prefix, bot_username)
     await update.message.reply_text(
         f"✅ 文件码路由已设置\n"
-        f"  前缀：{prefix}\n"
-        f"  目标机器人：@{bot_username}\n\n"
+        f"  前缀:{prefix}\n"
+        f"  目标机器人:@{bot_username}\n\n"
         f"以 `{prefix}` 开头的文件码将通过 @{bot_username} 解码。"
     )
 
@@ -775,15 +778,15 @@ async def remove_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "用法：/remove_code_route <前缀>\n\n"
+            "用法:/remove_code_route <前缀>\n\n"
             "删除文件码前缀路由配置。\n"
             "删除后该前缀的文件码将恢复原有解码规则。\n\n"
-            "示例：/remove_code_route qqfile"
+            "示例:/remove_code_route qqfile"
         )
         return
     prefix = args[0].strip().lower()
     await delete_code_bot_route(prefix)
-    await update.message.reply_text(f"✅ 文件码前缀路由已删除：{prefix}")
+    await update.message.reply_text(f"✅ 文件码前缀路由已删除:{prefix}")
 
 
 @_auth_required
@@ -807,10 +810,10 @@ async def set_bot_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "用法：/set_bot_interval <机器人用户名> <间隔秒数>\n\n"
+            "用法:/set_bot_interval <机器人用户名> <间隔秒数>\n\n"
             "设置向指定机器人发送解码请求的最小间隔时间。\n"
-            "某些机器人限制每个文件码之间的解码间隔，此设置可自动等待。\n\n"
-            "示例：\n"
+            "某些机器人限制每个文件码之间的解码间隔,此设置可自动等待。\n\n"
+            "示例:\n"
             "/set_bot_interval qqfile_bot 3\n"
             "/set_bot_interval tgfile_bot 5\n\n"
             "设为 0 表示不限间隔。"
@@ -837,9 +840,9 @@ async def remove_bot_interval(update: Update, context: ContextTypes.DEFAULT_TYPE
     args = context.args
     if not args:
         await update.message.reply_text(
-            "用法：/remove_bot_interval <机器人用户名>\n\n"
+            "用法:/remove_bot_interval <机器人用户名>\n\n"
             "删除指定机器人的解码间隔配置。\n\n"
-            "示例：/remove_bot_interval qqfile_bot"
+            "示例:/remove_bot_interval qqfile_bot"
         )
         return
     bot_username = args[0].strip().lower().lstrip("@")
@@ -867,11 +870,11 @@ async def spare_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "用法：/spare_add <频道ID> [账号名]\n\n"
+            "用法:/spare_add <频道ID> [账号名]\n\n"
             "添加备用频道到备用池。\n"
-            "• 指定账号名：该频道封禁后优先补充同账号频道的空缺\n"
-            "• 不指定账号名：作为通用备用池频道，补充任意空缺\n\n"
-            "示例：\n"
+            "• 指定账号名:该频道封禁后优先补充同账号频道的空缺\n"
+            "• 不指定账号名:作为通用备用池频道,补充任意空缺\n\n"
+            "示例:\n"
             "/spare_add -1001234567890\n"
             "/spare_add -1001234567890 账号1"
         )
@@ -891,7 +894,7 @@ async def spare_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def spare_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法：/spare_remove <频道ID>")
+        await update.message.reply_text("用法:/spare_remove <频道ID>")
         return
     try:
         channel_id = int(args[0])
@@ -924,12 +927,12 @@ async def rotation_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "用法：/rotation_set <参数名> <值>\n\n"
-            "可配置参数：\n"
-            "• active_window_size — 活跃窗口大小（每组几个活跃频道，默认 3）\n"
-            "• files_per_slot — 每个频道接收文件数后切换（默认 500）\n"
-            "• time_per_slot — 每个频道活跃时间（秒）后切换（默认 3600）\n\n"
-            "示例：\n"
+            "用法:/rotation_set <参数名> <值>\n\n"
+            "可配置参数:\n"
+            "• active_window_size — 活跃窗口大小(每组几个活跃频道,默认 3)\n"
+            "• files_per_slot — 每个频道接收文件数后切换(默认 500)\n"
+            "• time_per_slot — 每个频道活跃时间(秒)后切换(默认 3600)\n\n"
+            "示例:\n"
             "/rotation_set files_per_slot 200\n"
             "/rotation_set time_per_slot 1800\n"
             "/rotation_set active_window_size 5"

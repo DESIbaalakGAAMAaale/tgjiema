@@ -4,6 +4,8 @@ from telegram import Update
 
 
 def detect_file_type(update: Update) -> str:
+    if not update.message:
+        return "document"
     if update.message.photo:
         return "photo"
     if update.message.video:
@@ -20,6 +22,8 @@ def detect_file_type(update: Update) -> str:
 
 
 def extract_file_meta(update: Update) -> dict:
+    if not update.message:
+        return {"type": "document", "file_id": ""}
     msg = update.message
     if msg.photo:
         return {"type": "photo", "file_id": msg.photo[-1].file_id}

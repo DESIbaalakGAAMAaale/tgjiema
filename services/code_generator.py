@@ -17,16 +17,16 @@ _BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
 def _generate_deterministic_id(length: int = 12) -> str:
     """Deterministic unique ID, zero DB round trips.
 
-    原理：nanotimestamp + PID 作为种子 → SHA256 扩散 → 映射到 CODE_ALPHABET。
-    - 同进程内：time.time_ns() 单调递增，每次调用种子不同
-    - 跨进程：不同的 PID 确保即使同一纳秒种子也不同
-    - 输出看似随机（SHA256 avalanche effect），不可猜测
-    数学保证唯一，无需 CRDB 冲突检测。
+    原理:nanotimestamp + PID 作为种子 → SHA256 扩散 → 映射到 CODE_ALPHABET。
+    - 同进程内:time.time_ns() 单调递增,每次调用种子不同
+    - 跨进程:不同的 PID 确保即使同一纳秒种子也不同
+    - 输出看似随机(SHA256 avalanche effect),不可猜测
+    数学保证唯一,无需 CRDB 冲突检测。
     """
     seed = f"{time.time_ns():x}{os.getpid():x}"
     digest = hashlib.sha256(seed.encode()).hexdigest()
     val = int(digest, 16)
-    return ''.join(CODE_ALPHABET[val % 36] for _ in range(length))
+    return ''.join(CODE_ALPHABET[(val >> (i * 5)) % 36] for i in range(length))
 
 
 def build_file_code(file_types: dict) -> str:
@@ -57,7 +57,7 @@ def extract_bot_username(code: str) -> str:
 def extract_code_and_bot_from_message(text: str) -> tuple[str, str]:
     """从消息文本中提取文件码和目标解码器 bot 用户名。
 
-    处理码头不含 bot 名称但消息内含有解码器标识的情况，例如：
+    处理码头不含 bot 名称但消息内含有解码器标识的情况,例如:
     - "utheigh1231gg1f4     解码器ccmarkbot" → ("utheigh1231gg1f4", "ccmarkbot")
     - "utheigh1231gg1f4\\n@ccmarkbot"        → ("utheigh1231gg1f4", "ccmarkbot")
     - "@ccmarkbot utheigh1231gg1f4"           → ("utheigh1231gg1f4", "ccmarkbot")
@@ -102,7 +102,7 @@ def extract_code_and_bot_from_message(text: str) -> tuple[str, str]:
     for indicator in ("解码器", "解码", "解码Bot:", "解码bot:", "解码器:"):
         code = code.replace(indicator, "")
     code = code.replace("@", "")
-    code = code.strip(":：\t\n\r -_")
+    code = code.strip("::\t\n\r -_")
     code = re.sub(r'[\u4e00-\u9fff]+', '', code).strip()
 
     if code:
@@ -124,8 +124,8 @@ def parse_file_types_from_code(code: str) -> dict:
 
 
 async def generate_unique_code(file_types: dict) -> str:
-    """直接生成文件码，无需 DB 冲突检测。
+    """直接生成文件码,无需 DB 冲突检测。
     
-    确定性 ID 算法数学保证唯一，PRIMARY KEY 约束是最后一层保险。
+    确定性 ID 算法数学保证唯一,PRIMARY KEY 约束是最后一层保险。
     """
     return build_file_code(file_types)

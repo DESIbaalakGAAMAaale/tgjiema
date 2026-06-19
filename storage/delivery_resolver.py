@@ -1,6 +1,6 @@
 """Delivery Resolver — Dsp 发送频道解析器
-给定一个取件任务，按环形顺序解析最佳存储频道。
-如果首选频道不可达，自动降级到 Shadow1→Shadow2→下一环。
+给定一个取件任务,按环形顺序解析最佳存储频道。
+如果首选频道不可达,自动降级到 Shadow1→Shadow2→下一环。
 """
 import asyncio
 import time
@@ -13,14 +13,14 @@ from database import (
 from utils.flood_waiter import safe_copy_message
 from utils.per_channel_limiter import acquire_channel_limit
 
-# 模块级缓存：避免每次 resolve_delivery_channel() 都查询 CRDB
+# 模块级缓存:避免每次 resolve_delivery_channel() 都查询 CRDB
 _cell_cache: dict[int, dict] = {}
 _cell_cache_ts: float = 0
 _CELL_CACHE_TTL: float = 60.0
 
 
 class DeliveryChannel:
-    """解析结果：推荐的存储频道 + 降级链路。"""
+    """解析结果:推荐的存储频道 + 降级链路。"""
 
     def __init__(self, channel_id: int, slot_id: str, status: str):
         self.channel_id = channel_id
@@ -32,20 +32,20 @@ class DeliveryChannel:
 
 
 async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
-    """给定主存储频道ID，返回当前可用的发送频道。
+    """给定主存储频道ID,返回当前可用的发送频道。
 
-    解析顺序：
-    1. 查询该频道对应的 cell（可能是 active/shadow1/shadow2/lost）
-    2. 如果是 active 或 r100，直接返回
-    3. 如果是 shadow 或 lost，沿环形找下一个 active 或 shadow1
-    4. 最多尝试 3 层降级，防止无限环
+    解析顺序:
+    1. 查询该频道对应的 cell(可能是 active/shadow1/shadow2/lost)
+    2. 如果是 active 或 r100,直接返回
+    3. 如果是 shadow 或 lost,沿环形找下一个 active 或 shadow1
+    4. 最多尝试 3 层降级,防止无限环
     """
-    # 先查本地缓存，避免每次调用都查询 CRDB
+    # 先查本地缓存,避免每次调用都查询 CRDB
     now = time.monotonic()
     if now - _cell_cache_ts < _CELL_CACHE_TTL:
         cell = _cell_cache.get(primary_channel_id)
     else:
-        cell = None  # 缓存过期，强制重新查询
+        cell = None  # 缓存过期,强制重新查询
 
     if cell is None:
         cell = await get_active_or_shadow_cell(primary_channel_id)
@@ -53,37 +53,52 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
         _cell_cache_ts = time.monotonic()
 
     if cell is None:
-        # 该频道不在 cells 表中，直接返回原频道
+        # 该频道不在 cells 表中,直接返回原频道
         return DeliveryChannel(primary_channel_id, "unknown", "direct")
 
     status = cell["status"]
 
-    # active 或 r100：直接用
+    # active 或 r100:直接用
     if status in ("active", "r100"):
         return DeliveryChannel(cell["channel_id"], cell["slot_id"], status)
 
-    # shadow1：可用但非首选
+    # shadow1:可用但非首选
     if status == "shadow1":
         return DeliveryChannel(cell["channel_id"], cell["slot_id"], "shadow1")
 
-    # shadow2 或 lost：需要沿环找下一个
+    # shadow2 或 lost:需要沿环找下一个
     return await _walk_ring_for_channel(primary_channel_id, max_hops=5)
 
 
-async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> DeliveryChannel:
-    """环形遍历，找到第一个可用的频道。"""
+async def _walk_ring_for_channel(channel_id: int, max_hops: int = 45) -> DeliveryChannel:
+    """环形遍历,找到第一个可用的频道。使用 cells 全量数据在内存中遍历环形链表。"""
     col = get_cells_col()
+    all_cells = list(await col.find({}))
+    if not all_cells:
+        return DeliveryChannel(channel_id, "unknown", "fallback")
+
+    # 构建 channel_id → cell 的映射
+    cell_map = {c["channel_id"]: c for c in all_cells}
+
     visited = {channel_id}
     current_channel = channel_id
 
     for _ in range(max_hops):
-        next_cell = await get_next_active_cell(current_channel)
+        current_cell = cell_map.get(current_channel)
+        if current_cell is None:
+            break
+
+        next_chat_id = current_cell.get("next_active_chat_id")
+        if next_chat_id is None:
+            break
+
+        next_cell = cell_map.get(next_chat_id)
         if next_cell is None:
             break
 
         nid = next_cell["channel_id"]
         if nid in visited:
-            break  # 检测到环，跳出
+            break  # 检测到环,跳出
         visited.add(nid)
 
         status = next_cell["status"]
@@ -92,33 +107,30 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
 
         current_channel = nid
 
-    # 兜底：找同组的 shadow1
-    original_cell = await col.find_one({"channel_id": channel_id})
+    # 兜底:找同组的 shadow1,在 Python 内存中过滤
+    original_cell = cell_map.get(channel_id)
     if original_cell:
         slot_id = original_cell.get("slot_id", "")
-        # 提取组号
         import re
         m = re.match(r'[as](\d+)', slot_id)
         if m:
             group_num = m.group(1)
-            shadows = await col.find({
-                "slot_id": {"$regex": f"s{group_num}a$"},
-                "status": "shadow1",
-            })
+            shadows = [c for c in all_cells if c.get("slot_id", "").endswith(f"s{group_num}a") and c.get("status") == "shadow1"]
             if shadows:
                 sc = shadows[0]
                 return DeliveryChannel(sc["channel_id"], sc["slot_id"], "shadow1")
 
-    # 最终兜底：原频道
+    # 最终兜底:原频道
     return DeliveryChannel(channel_id, "unknown", "fallback")
 
 
 async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False) -> bool:
-    """尝试从指定频道发送一条消息给用户（带 Flood Wait 退避 + 频道限流）。成功返回 True。"""
-    # 频道限流：检查是否超过 15 msg/min
+    """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。"""
+    # 频道限流:检查是否超过 15 msg/min
     wait = await acquire_channel_limit(from_channel_id)
     if wait > 0:
         await asyncio.sleep(wait)
+        await acquire_channel_limit(from_channel_id)
 
     try:
         await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id, protect_content=protect_content)
@@ -136,7 +148,7 @@ async def deliver_with_fallback(
     max_attempts: int = 3,
     protect_content: bool = False,
 ) -> int:
-    """带降级的批量发送。逐个消息尝试，失败时换频道。
+    """带降级的批量发送。逐个消息尝试,失败时换频道。
 
     返回成功发送的消息数。
     """
@@ -146,6 +158,7 @@ async def deliver_with_fallback(
     tried_channels = set()
 
     for msg_id in message_ids:
+        tried_channels = set()
         for attempt in range(max_attempts):
             if attempt > 0:
                 # 尝试下一个频道

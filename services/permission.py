@@ -9,14 +9,14 @@ from database import get_file_record_cached, update_file_record_and_invalidate
 from config import settings
 from services.code_generator import extract_bot_username
 
-# ─── Quota 本地计数（跨进程共享，通过环境变量传递）─────────────
-# 每个 Idx Bot 进程用不同计数器，PID 作为命名空间
+# ─── Quota 本地计数(跨进程共享,通过环境变量传递)─────────────
+# 每个 Idx Bot 进程用不同计数器,PID 作为命名空间
 _PID = os.getpid()
 _local_quota_counts: dict[int, int] = {}
 
 
 def _increment_local_quota(user_id: int):
-    """本地累加配额计数，不写 CRDB（由 idx_bot 后台同步）"""
+    """本地累加配额计数,不写 CRDB(由 idx_bot 后台同步)"""
     _local_quota_counts[user_id] = _local_quota_counts.get(user_id, 0) + 1
 
 
@@ -48,7 +48,12 @@ async def get_or_create_user(user_id: int, username: str = None, first_name: str
             daily_decode_quota=settings.FREE_DAILY_QUOTA,
             external_decode_quota=settings.FREE_EXTERNAL_DAILY_QUOTA,
         )
-        await col.insert_one(user)
+        try:
+            await col.insert_one(user)
+        except Exception:
+            user = await col.find_one({"user_id": user_id})
+            if not user:
+                raise
     return user
 
 
@@ -88,7 +93,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
 
     if not is_system_code(file_code):
         if not bot_username:
-            return DecodeResult(allowed=False, reason="无效的文件码格式，无法识别目标机器人。")
+            return DecodeResult(allowed=False, reason="无效的文件码格式,无法识别目标机器人。")
 
     today = datetime.datetime.now(datetime.UTC).date()
 
@@ -139,11 +144,11 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         await update_user_and_invalidate(user_id, {"$set": reset_set})
 
     quota = user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA)
-    used = user.get("quota_used_today", 0)
+    used = user.get("quota_used_today", 0) + _local_quota_counts.get(user_id, 0)
     if membership_level != "premium" and used >= quota:
         return DecodeResult(
             allowed=False,
-            reason=f"今日解码次数已用完（{quota}次），请明天再试",
+            reason=f"今日解码次数已用完({quota}次),请明天再试",
             remaining_quota=0,
         )
 
@@ -158,7 +163,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         if external_quota != -1 and external_used >= external_quota:
             return DecodeResult(
                 allowed=False,
-                reason=f"今日非本系统码解码次数已用完（{external_quota}次），请明天再试",
+                reason=f"今日非本系统码解码次数已用完({external_quota}次),请明天再试",
             )
 
     # 使用缓存查询文件记录
@@ -194,7 +199,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         )
 
     if not is_system_code(file_code):
-        _increment_local_quota(user_id)  # 外部码：quota + external 合并为一次计数
+        _increment_local_quota(user_id)  # 外部码:quota + external 合并为一次计数
         remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
         remaining_ext = -1
         ext_q = user.get("external_decode_quota", 0)

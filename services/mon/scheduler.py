@@ -1,4 +1,4 @@
-"""Mon 调度器：心跳检测、自动降级、环形推进、智能补齐"""
+"""Mon 调度器:心跳检测、自动降级、环形推进、智能补齐"""
 
 import asyncio
 import os
@@ -6,6 +6,7 @@ import re
 import datetime as _dt
 
 import yaml
+from loguru import logger
 from database import (
     get_cells_col,
     set_cell_status, update_cell_heartbeat,
@@ -36,10 +37,10 @@ def _load_mon_config():
 class MonScheduler:
     """Mon 调度器。
 
-    每个调度周期：
-    1. 遍历所有 active 槽位，检查心跳是否超时
+    每个调度周期:
+    1. 遍历所有 active 槽位,检查心跳是否超时
     2. 超时 → 降级: active→lost, shadow1→active, shadow2→shadow1
-    3. R100 槽位永不自降，仅记告警
+    3. R100 槽位永不自降,仅记告警
     """
 
     def __init__(self):
@@ -47,15 +48,15 @@ class MonScheduler:
         self.heartbeat_timeout = cfg["heartbeat_timeout"]
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
-        # ─── last_synced_msg_id 本地缓存：每 10 次同步写一次 CRDB ───
+        # ─── last_synced_msg_id 本地缓存:每 10 次同步写一次 CRDB ───
         self._cursor_cache: dict[str, int] = {}
         self._replicate_count = 0
 
     async def run_degrade_check(self, all_cells: list[dict]) -> list[str]:
-        """执行一轮降级检查，返回日志描述列表。
+        """执行一轮降级检查,返回日志描述列表。
 
         Args:
-            all_cells: 由调用方统一查询传入，避免重复 DB 查询。
+            all_cells: 由调用方统一查询传入,避免重复 DB 查询。
         """
         alerts = []
         now = _dt.datetime.now(_dt.timezone.utc)
@@ -80,7 +81,7 @@ class MonScheduler:
             if elapsed <= self.heartbeat_timeout:
                 continue
 
-            # ── 降级冷却时间分级（防抖动）—— 根据 degrade_count 递增 ──
+            # ── 降级冷却时间分级(防抖动)—— 根据 degrade_count 递增 ──
             degrade_count = a_slot.get("degrade_count", 0)
             if degrade_count == 0:
                 cooldown = self.degrade_cooldown  # 默认 300s
@@ -90,11 +91,11 @@ class MonScheduler:
                 cooldown = 1200
 
             if elapsed < cooldown:
-                continue  # 冷却中，跳过本次降级
+                continue  # 冷却中,跳过本次降级
 
             if is_r100 and not self.r100_managed:
                 alerts.append(
-                    f"[R100] {a_slot['slot_id']} 心跳超时 {elapsed:.0f}s，仅告警不降级"
+                    f"[R100] {a_slot['slot_id']} 心跳超时 {elapsed:.0f}s,仅告警不降级"
                 )
                 await log_rotate(
                     from_slot_id=a_slot["slot_id"],
@@ -140,12 +141,14 @@ class MonScheduler:
     async def _degrade_group(
         self, a_slot: dict, s1_slot: dict, s2_slot: dict, elapsed: float
     ):
-        """执行降级：active→lost, shadow1→active, shadow2→shadow1
+        """执行降级:active→lost, shadow1→active, shadow2→shadow1
         
-        使用 CRDB 事务保证原子性：所有状态变更要么全部成功，要么全部回滚。
+        使用 CRDB 事务保证原子性:所有状态变更要么全部成功,要么全部回滚。
+        log_rotate 在事务提交成功后执行,避免事务内写入审计日志。
         """
         now = _dt.datetime.now(_dt.timezone.utc)
         now_iso = now.isoformat()
+        log_entries = []
 
         async with _client.transaction() as conn:
             # active → lost
@@ -153,11 +156,11 @@ class MonScheduler:
                 "UPDATE cells SET status = $1 WHERE slot_id = $2",
                 "lost", a_slot["slot_id"],
             )
-            await log_rotate(
+            log_entries.append((
                 a_slot["slot_id"], s1_slot["slot_id"] if s1_slot else "none",
                 "active", "lost",
                 f"heartbeat timeout {elapsed:.0f}s", "mon",
-            )
+            ))
 
             # shadow1 → active
             if s1_slot:
@@ -172,11 +175,11 @@ class MonScheduler:
                         "UPDATE cells SET next_active_chat_id = $1 WHERE slot_id = $2",
                         new_next, prev_id,
                     )
-                await log_rotate(
+                log_entries.append((
                     s1_slot["slot_id"], s1_slot["slot_id"],
                     "shadow1", "active",
                     f"promoted after {a_slot['slot_id']} timeout", "mon",
-                )
+                ))
 
             # shadow2 → shadow1
             if s2_slot:
@@ -184,14 +187,18 @@ class MonScheduler:
                     "UPDATE cells SET status = $1 WHERE slot_id = $2",
                     "shadow1", s2_slot["slot_id"],
                 )
-                await log_rotate(
+                log_entries.append((
                     s2_slot["slot_id"], s2_slot["slot_id"],
                     "shadow2", "shadow1",
                     f"cascade after {a_slot['slot_id']} timeout", "mon",
-                )
+                ))
+
+        # 事务提交成功后再写审计日志
+        for entry in log_entries:
+            await log_rotate(*entry)
 
     async def heartbeat_all(self, bot_instance) -> int:
-        """对 active/shadow 槽位发心跳（频道拉一条消息验证可达性）。
+        """对 active/shadow 槽位发心跳(频道拉一条消息验证可达性)。
         返回成功计数。
         """
         col = get_cells_col()
@@ -208,7 +215,7 @@ class MonScheduler:
         return count
 
     async def replicate_all_active_to_shadows(self, bot_instance, all_cells: list[dict]) -> int:
-        """核心功能：将每个 Active A 槽的新消息复制到对应的 Shadow1/Shadow2。
+        """核心功能:将每个 Active A 槽的新消息复制到对应的 Shadow1/Shadow2。
 
         这是 Mon 的「写入」职责——替代原 backup_bot 的文件备份功能。
         返回复制的消息总数。
@@ -224,7 +231,7 @@ class MonScheduler:
             if not a_slot or a_slot["status"] != "active":
                 continue
 
-            # 读游标：优先用本地缓存，避免依赖 CRDB 数据
+            # 读游标:优先用本地缓存,避免依赖 CRDB 数据
             slot_id = a_slot["slot_id"]
             last_cursor = self._cursor_cache.get(slot_id) or a_slot.get("last_synced_msg_id") or 0
             new_messages = await self._fetch_new_messages(
@@ -249,7 +256,7 @@ class MonScheduler:
                 )
                 total_copied += copied_2
 
-            # 更新游标：本地缓存 + 定期 flush CRDB
+            # 更新游标:本地缓存 + 定期 flush CRDB
             latest_id = max(msg.message_id for msg in new_messages if msg)
             self._cursor_cache[slot_id] = latest_id
 
@@ -274,10 +281,10 @@ class MonScheduler:
                 pass  # 下次同步自动重试
 
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
-        """获取频道中最后游标之后的新消息（媒体文件）。"""
+        """获取频道中最后游标之后的新消息(媒体文件)。"""
         msgs = []
         try:
-            # 从最新消息开始往回拉，直到遇到 last_cursor
+            # 从最新消息开始往回拉,直到遇到 last_cursor
             async for msg in bot_instance.iter_messages(channel_id, limit=50):
                 if msg.message_id <= last_cursor:
                     break
@@ -289,15 +296,15 @@ class MonScheduler:
 
     @staticmethod
     async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list) -> int:
-        """批量复制消息到目标频道（带 Flood Wait 自动退避）。返回成功复制数。
+        """批量复制消息到目标频道(带 Flood Wait 自动退避)。返回成功复制数。
 
-        优先使用 Bot API 7.0+ 的 copy_messages 批量接口，
+        优先使用 Bot API 7.0+ 的 copy_messages 批量接口,
         不支持时回退到逐条 copy_message。
         """
         if not messages:
             return 0
 
-        # 尝试批量 API（Bot API 7.0+）
+        # 尝试批量 API(Bot API 7.0+)
         if hasattr(bot_instance, 'copy_messages'):
             try:
                 msg_ids = [msg.message_id for msg in messages]
@@ -309,9 +316,9 @@ class MonScheduler:
                 reset_backoff()
                 return len(msg_ids)
             except Exception as e:
-                logger.warning(f"[Mon][复制] 批量复制消息失败 (ch={from_channel})，回退逐条: {e}")
+                logger.warning(f"[Mon][复制] 批量复制消息失败 (ch={from_channel}),回退逐条: {e}")
 
-        # 逐条复制（旧版 API 或批量失败）
+        # 逐条复制(旧版 API 或批量失败)
         copied = 0
         for msg in messages:
             try:
@@ -326,16 +333,17 @@ class MonScheduler:
         return copied
 
     async def auto_fill_new_channels(self, bot_instance, all_cells: list[dict]) -> int:
-        """智能替补：检测新频道（last_synced_msg_id=0 且消息数 < Active），
+        """智能替补:检测新频道(last_synced_msg_id=0 且消息数 < Active),
         从对应的 Active 槽位补齐所有存量文件。
 
-        「新频道只拉 Mon，系统自动补齐」—— 元宝方案核心设计。
+        「新频道只拉 Mon,系统自动补齐」—— 元宝方案核心设计。
         返回补齐的消息总数。
 
         Args:
             all_cells: 由调用方统一查询传入。
         """
         groups = self._group_slots(all_cells)
+        col = get_cells_col()
         total_filled = 0
 
         for _group_key, (a_slot, s1_slot, s2_slot) in groups.items():
@@ -350,14 +358,14 @@ class MonScheduler:
 
                 last_synced = shadow_slot.get("last_synced_msg_id") or 0
                 if last_synced > 0:
-                    continue  # 已有同步记录，走增量
+                    continue  # 已有同步记录,走增量
 
-                # 检查该 shadow 频道是否为空（或几乎为空）
+                # 检查该 shadow 频道是否为空(或几乎为空)
                 shadow_empty = await self._is_channel_nearly_empty(
                     bot_instance, shadow_slot["channel_id"]
                 )
                 if not shadow_empty:
-                    # 有内容但不是通过 Mon 同步的，跳过
+                    # 有内容但不是通过 Mon 同步的,跳过
                     continue
 
                 # 从 Active 获取所有媒体消息
@@ -377,7 +385,6 @@ class MonScheduler:
                         {"$set": {"last_synced_msg_id": latest_id}},
                     )
                     total_filled += filled
-                    from loguru import logger
                     logger.info(
                         f"[Mon][填充] {shadow_slot['slot_id']} "
                         f"新频道补齐 {filled} 条消息"
@@ -387,7 +394,7 @@ class MonScheduler:
 
     @staticmethod
     async def _is_channel_nearly_empty(bot_instance, channel_id: int, threshold: int = 3) -> bool:
-        """判断频道是否几乎为空（媒体消息 ≤ threshold）。"""
+        """判断频道是否几乎为空(媒体消息 ≤ threshold)。"""
         try:
             count = 0
             async for msg in bot_instance.iter_messages(channel_id, limit=20):
@@ -400,7 +407,7 @@ class MonScheduler:
 
     @staticmethod
     async def _fetch_all_media(bot_instance, channel_id: int, limit: int = 200) -> list:
-        """拉取频道中所有媒体消息（用于智能补齐）。"""
+        """拉取频道中所有媒体消息(用于智能补齐)。"""
         msgs = []
         try:
             async for msg in bot_instance.iter_messages(channel_id, limit=limit):
@@ -411,15 +418,15 @@ class MonScheduler:
         return list(reversed(msgs))
 
     async def validate_topology(self, all_cells: list[dict]) -> list[str]:
-        """定期拓扑校验：检测环形链表是否断裂。
+        """定期拓扑校验:检测环形链表是否断裂。
 
-        检查项：
+        检查项:
         1. 每个 active cell 的 next_active_chat_id 指向有效的 active cell
         2. 无重复的 next 指针
-        3. 所有 active 槽位可达（单向遍历）
+        3. 所有 active 槽位可达(单向遍历)
         4. 每组 (a, s1, s2) 三元组完整
 
-        返回问题描述列表，空列表表示健康。
+        返回问题描述列表,空列表表示健康。
 
         Args:
             all_cells: 由调用方统一查询传入。
@@ -428,7 +435,7 @@ class MonScheduler:
         active_cells = [c for c in all_cells if c["status"] == "active"]
 
         if not active_cells:
-            issues.append("[拓扑] 无 Active 槽位，系统不可用")
+            issues.append("[拓扑] 无 Active 槽位,系统不可用")
             return issues
 
         active_channels = {c["channel_id"] for c in active_cells}
@@ -445,7 +452,7 @@ class MonScheduler:
             nxt = c.get("next_active_chat_id")
             if nxt and nxt not in active_channels:
                 issues.append(
-                    f"[拓扑]{c['slot_id']}的next指向 {nxt}，但该频道不是active"
+                    f"[拓扑]{c['slot_id']}的next指向 {nxt},但该频道不是active"
                 )
 
         # 2. 重复指针
@@ -459,7 +466,7 @@ class MonScheduler:
                     f"[拓扑] 多个槽位指向同一个next {nxt}: {slot_names}"
                 )
 
-        # 3. 可达性：从第一个 active 出发遍历
+        # 3. 可达性:从第一个 active 出发遍历
         visited = set()
         if active_cells:
             current = active_cells[0]

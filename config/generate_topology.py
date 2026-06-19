@@ -1,17 +1,17 @@
 """拓扑生成器 — 5 账号轮转配对 + R100 独立兜底
 
-配对策略（5 账号滑动窗口）：
-  对于第 g 组（g 从 1 开始）:
+配对策略(5 账号滑动窗口):
+  对于第 g 组(g 从 1 开始):
     Active  = 账号 ((g-1) % 5)
     Shadow1 = 账号 (g % 5)
     Shadow2 = 账号 ((g+1) % 5)
 
-确保每组 3 个插槽来自 3 个不同的 Telegram 账号，任何单一账号被封，
+确保每组 3 个插槽来自 3 个不同的 Telegram 账号,任何单一账号被封,
 另外两个账号的频道仍可维持该组的冗余。
 
-R100：不接入环形链表，仅作最终兜底存档。
+R100:不接入环形链表,仅作最终兜底存档。
 
-轮转参数优先从 DB rotation_config 读取，其次从 .env，最后从 groups.yaml。
+轮转参数优先从 DB rotation_config 读取,其次从 .env,最后从 groups.yaml。
 
 用法:
     python config/generate_topology.py
@@ -24,7 +24,7 @@ import yaml
 
 
 def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
-    """从 DB rotation_config 表读取轮转参数，无则从 groups.yaml / .env 兜底。"""
+    """从 DB rotation_config 表读取轮转参数,优先 .env 作为默认值,DB 有值则覆盖 .env。"""
     from config import settings as _settings
 
     result = {
@@ -35,6 +35,14 @@ def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
         "heartbeat_timeout": mon_cfg.get("heartbeat_timeout", 90),
         "degrade_cooldown": mon_cfg.get("degrade_cooldown", 300),
     }
+
+    # .env 作为默认值(优先级高于 groups.yaml 默认值)
+    if hasattr(_settings, "ROTATION_ACTIVE_WINDOW_SIZE"):
+        result["active_window_size"] = _settings.ROTATION_ACTIVE_WINDOW_SIZE
+    if hasattr(_settings, "ROTATION_FILES_PER_SLOT"):
+        result["rotation_files_per_slot"] = _settings.ROTATION_FILES_PER_SLOT
+    if hasattr(_settings, "ROTATION_TIME_PER_SLOT"):
+        result["rotation_time_per_slot"] = _settings.ROTATION_TIME_PER_SLOT
 
     try:
         import asyncio
@@ -54,15 +62,7 @@ def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
 
         asyncio.get_event_loop().run_until_complete(close_db())
     except Exception as e:
-        print(f"[警告] 无法从 DB 读取轮转配置，使用默认值: {e}")
-
-    # .env 兜底（优先级高于 groups.yaml 默认值）
-    if hasattr(_settings, "ROTATION_ACTIVE_WINDOW_SIZE"):
-        result["active_window_size"] = _settings.ROTATION_ACTIVE_WINDOW_SIZE
-    if hasattr(_settings, "ROTATION_FILES_PER_SLOT"):
-        result["rotation_files_per_slot"] = _settings.ROTATION_FILES_PER_SLOT
-    if hasattr(_settings, "ROTATION_TIME_PER_SLOT"):
-        result["rotation_time_per_slot"] = _settings.ROTATION_TIME_PER_SLOT
+        print(f"[警告] 无法从 DB 读取轮转配置,使用默认值: {e}")
 
     return result
 
@@ -74,7 +74,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     if output_path is None:
         output_path = os.path.join(base, "topology.yaml")
 
-    # ── 优先使用 .env 配置（env_config），无则回退到 groups.yaml ──
+    # ── 优先使用 .env 配置(env_config),无则回退到 groups.yaml ──
     if env_config is None:
         try:
             from config import settings as _s
@@ -86,10 +86,10 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     r100_cfg = env_config.get("r100", {})
     mon_cfg = env_config.get("mon", {})
 
-    # 如果 .env 中没有配置账号，回退到 groups.yaml
+    # 如果 .env 中没有配置账号,回退到 groups.yaml
     if not accounts:
         if not os.path.exists(groups_path):
-            print("[错误] .env 中未配置账号频道，且未找到 config/groups.yaml")
+            print("[错误] .env 中未配置账号频道,且未找到 config/groups.yaml")
             sys.exit(1)
 
         with open(groups_path, "r", encoding="utf-8") as f:
@@ -103,12 +103,12 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
         print(f"[info] 从 .env 读取账号配置: {len(accounts)} 个账号")
 
     if not accounts:
-        print("[错误] 未配置任何账号频道，请在 .env 或 groups.yaml 中配置")
+        print("[错误] 未配置任何账号频道,请在 .env 或 groups.yaml 中配置")
         sys.exit(1)
 
     account_count = len(accounts)
 
-    # ── 校验：每个账号频道数相同，且为 3 的倍数 ──
+    # ── 校验:每个账号频道数相同,且为 3 的倍数 ──
     ch_counts = [len(a.get("channels", [])) for a in accounts]
     if len(set(ch_counts)) != 1:
         for a in accounts:
@@ -118,7 +118,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
 
     ch_per_account = ch_counts[0]
     if ch_per_account % 3 != 0:
-        print(f"[错误] 每个账号频道数必须是 3 的倍数，当前: {ch_per_account}")
+        print(f"[错误] 每个账号频道数必须是 3 的倍数,当前: {ch_per_account}")
         sys.exit(1)
 
     group_count = (account_count * ch_per_account) // 3
@@ -184,7 +184,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     # ── R100 独立槽位 ──
     r100_channel = r100_cfg.get("channel")
     if r100_channel is None:
-        print("[警告] 未配置 R100 兜底频道，跳过")
+        print("[警告] 未配置 R100 兜底频道,跳过")
     r100_fallback = r100_cfg.get("fallback", []) or []
 
     # ── Mon 配置 ──
@@ -194,7 +194,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     slots = []
     active_channel_ids = []
 
-    # 构建 channel_id → account_name 映射（用于 topology 输出）
+    # 构建 channel_id → account_name 映射(用于 topology 输出)
     ch_to_account = {}
     for a in accounts:
         for ch in a.get("channels", []):
@@ -236,7 +236,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
         slots.extend([a_entry, s1_entry, s2_entry])
         active_channel_ids.append((aid, g["active"]))
 
-    # ── 填充环形链表（仅常规组，不含 R100） ──
+    # ── 填充环形链表(仅常规组,不含 R100) ──
     for i, (aid, _) in enumerate(active_channel_ids):
         next_i = (i + 1) % len(active_channel_ids)
         next_ch = active_channel_ids[next_i][1]
@@ -247,10 +247,10 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
 
     # ── 输出 YAML ──
     lines = [
-        "# 环形冗余拓扑配置（自动生成，请勿手动编辑）",
+        "# 环形冗余拓扑配置(自动生成,请勿手动编辑)",
         f"# 配置来源: .env 或 config/groups.yaml",
-        f"# 共 {len(accounts)} 个账号，{len(groups)} 组，{len(slots)} 个槽位",
-        f"# 配对策略: 5 账号轮转滑动窗口，每组 A/S1/S2 三不同账号",
+        f"# 共 {len(accounts)} 个账号,{len(groups)} 组,{len(slots)} 个槽位",
+        f"# 配对策略: 5 账号轮转滑动窗口,每组 A/S1/S2 三不同账号",
         "#",
         "slots:",
     ]
@@ -272,9 +272,9 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
             lines.append(f"    prev_slot_id: \"{s['prev_slot_id']}\"")
             lines.append("")
 
-    # ── R100 独立槽位（不参与环形链表） ──
+    # ── R100 独立槽位(不参与环形链表) ──
     if r100_channel:
-        lines.append("  # ─── R100 最终兜底（不接入环形调度）───")
+        lines.append("  # ─── R100 最终兜底(不接入环形调度)───")
         lines.append("  - slot_id: \"r100\"")
         lines.append(f"    channel_id: {r100_channel}")
         lines.append("    status: \"r100\"")
@@ -311,9 +311,9 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     print(f"\n[生成] {len(accounts)} 账号 → {len(groups)} 组 → {len(slots)} 槽位")
     print(f"[策略] 5 账号轮转滑动窗口: 每组 A/S1/S2 三不同账号")
     if r100_channel:
-        print(f"[R100] 兜底频道 {r100_channel}（不参与环形调度）")
+        print(f"[R100] 兜底频道 {r100_channel}(不参与环形调度)")
 
-    # 验证：每个账号的用量
+    # 验证:每个账号的用量
     usage = {}
     for a in accounts:
         usage[a.get("name", "?")] = {"A": 0, "S1": 0, "S2": 0}

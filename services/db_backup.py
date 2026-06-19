@@ -10,10 +10,10 @@ from storage.r2 import _r2 as r2_storage
 
 
 async def backup_all_tables() -> dict:
-    """动态发现所有用户表并备份，排除 CockroachDB 系统表。"""
+    """动态发现所有用户表并备份,排除 CockroachDB 系统表。"""
     results = {}
     async with db_client._pool.acquire() as conn:
-        # 动态查询所有用户表（排除系统 schema）
+        # 动态查询所有用户表(排除系统 schema)
         tables = await conn.fetch("""
             SELECT table_name
             FROM information_schema.tables
@@ -24,7 +24,7 @@ async def backup_all_tables() -> dict:
         table_names = [r["table_name"] for r in tables]
 
         if not table_names:
-            # 兜底：手动列出所有表
+            # 兜底:手动列出所有表
             table_names = [
                 "users", "file_records", "decode_logs", "cells", "codes",
                 "jobs", "rotate_log", "pending_uploads",
@@ -42,15 +42,16 @@ async def backup_all_tables() -> dict:
 
 async def run_db_backup():
     if not settings.DB_BACKUP_ENABLED:
-        logger.info("数据库备份未启用（DB_BACKUP_ENABLED=false），跳过启动")
+        logger.info("数据库备份未启用(DB_BACKUP_ENABLED=false),跳过启动")
         return
 
     if not settings.R2_ACCOUNT_ID or not settings.R2_ACCESS_KEY_ID or not settings.R2_SECRET_ACCESS_KEY:
-        logger.warning("R2 凭证未配置，数据库备份跳过")
+        logger.warning("R2 凭证未配置,数据库备份跳过")
         return
 
     from database import init_db
-    await init_db()
+    if db_client._pool is None:
+        await init_db()
 
     r2_storage.configure(
         account_id=settings.R2_ACCOUNT_ID,
@@ -61,7 +62,7 @@ async def run_db_backup():
     )
     await r2_storage.connect()
 
-    logger.info("CockroachDB 数据库备份服务启动，间隔 {} 分钟", settings.DB_BACKUP_INTERVAL_MINUTES)
+    logger.info("CockroachDB 数据库备份服务启动,间隔 {} 分钟", settings.DB_BACKUP_INTERVAL_MINUTES)
 
     while True:
         try:

@@ -1,3 +1,5 @@
+from loguru import logger
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
@@ -19,8 +21,8 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         if member.status not in ("left", "kicked"):
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"强制加群检查失败: {e}")
 
     channel_link = settings.FORCE_JOIN_CHANNEL_LINK
     keyboard = InlineKeyboardMarkup([
@@ -28,7 +30,7 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ])
     if update.message:
         await update.message.reply_text(
-            "⚠️ 使用前请先加入频道，加入后重新发送指令即可。",
+            "⚠️ 使用前请先加入频道,加入后重新发送指令即可。",
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )
@@ -43,12 +45,12 @@ def three_bot_reminder() -> str:
     up = settings.UPLOAD_BOT_USERNAME
     de = settings.DECODER_BOT_USERNAME
     se = settings.SENDER_BOT_USERNAME
-    lines = ["\n⚠️ 使用前请先启动以下三个机器人："]
+    lines = ["\n⚠️ 使用前请先启动以下三个机器人:"]
     if up:
-        lines.append(f"  1️⃣ 上传机器人：@{up}")
+        lines.append(f"  1️⃣ 上传机器人:@{up}")
     if de:
-        lines.append(f"  2️⃣ 解码机器人：@{de}")
+        lines.append(f"  2️⃣ 解码机器人:@{de}")
     if se:
-        lines.append(f"  3️⃣ 发送机器人：@{se}")
-    lines.append("\n请确保已向这三个机器人均发送过 /start 命令，否则系统无法正常工作。")
+        lines.append(f"  3️⃣ 发送机器人:@{se}")
+    lines.append("\n请确保已向这三个机器人均发送过 /start 命令,否则系统无法正常工作。")
     return "\n".join(lines)

@@ -15,11 +15,12 @@ from utils.monitor import metrics
 from utils.storage_channel import get_active_storage_channel_id
 from utils.time_utils import format_datetime
 
-from .menus import _quota_display, _status_counters
+from .menus import _quota_display, _status_counters, _status_counters_initialized
+from . import menus
 
 
 async def _ensure_user(user_id: int) -> dict:
-    """获取或创建用户，走缓存。"""
+    """获取或创建用户,走缓存。"""
     user = await get_user_cached(user_id)
     if user is None:
         user = make_user(user_id=user_id)
@@ -32,16 +33,14 @@ async def _get_status_text() -> str:
     users_col = get_users_col()
     files_col = get_file_records_col()
     logs_col = get_decode_logs_col()
-    # 首次启动或计数器为 0 时，用 DB 查询初始化
-    if _status_counters["total_users"] == 0:
+    # 首次启动时,用 DB 查询初始化
+    if not _status_counters_initialized:
         _status_counters["total_users"] = await users_col.count_documents({})
-    if _status_counters["total_files"] == 0:
         _status_counters["total_files"] = await files_col.count_documents({})
-    if _status_counters["active_files"] == 0:
         _status_counters["active_files"] = await files_col.count_documents({"status": "active"})
-    if _status_counters["today_decodes"] == 0:
         today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
+        menus._status_counters_initialized = True
     relay_pending = await get_config("relay_auth_pending")
     try:
         from services.relay_pool import relay_pool
@@ -58,15 +57,15 @@ async def _get_status_text() -> str:
     active_channel = await get_active_storage_channel_id()
     msg = (
         f"📊 系统概览\n\n"
-        f"👤 总用户数：{_status_counters['total_users']}\n"
-        f"📁 总文件数：{_status_counters['total_files']}\n"
-        f"✅ 活跃文件：{_status_counters['active_files']}\n"
-        f"🔄 今日解码：{_status_counters['today_decodes']}\n"
-        f"📤 发送成功：{metrics.send_success_count}\n"
-        f"📤 发送失败：{metrics.send_fail_count}\n"
-        f"\n📺 当前主存储频道：{active_channel}\n"
-        f"\n🔐 用户中继：{relay_status}\n"
-        f"\n🤖 机器人状态：\n"
+        f"👤 总用户数:{_status_counters['total_users']}\n"
+        f"📁 总文件数:{_status_counters['total_files']}\n"
+        f"✅ 活跃文件:{_status_counters['active_files']}\n"
+        f"🔄 今日解码:{_status_counters['today_decodes']}\n"
+        f"📤 发送成功:{metrics.send_success_count}\n"
+        f"📤 发送失败:{metrics.send_fail_count}\n"
+        f"\n📺 当前主存储频道:{active_channel}\n"
+        f"\n🔐 用户中继:{relay_status}\n"
+        f"\n🤖 机器人状态:\n"
     )
     for name, health in metrics.bots.items():
         status_icon = "✅" if health.is_running else "❌"
@@ -81,9 +80,9 @@ async def _get_health_text() -> str:
         last_ping = format_datetime(health.last_ping)
         msg += (
             f"{status_icon} {name}\n"
-            f"  最后活跃：{last_ping}\n"
-            f"  处理次数：{health.total_processed}\n"
-            f"  错误次数：{health.total_errors}\n"
+            f"  最后活跃:{last_ping}\n"
+            f"  处理次数:{health.total_processed}\n"
+            f"  错误次数:{health.total_errors}\n"
         )
     return msg
 
@@ -116,7 +115,7 @@ async def _get_topology_text() -> str:
         by_group = {}
         for c in cells:
             sid = c.get("slot_id", "")
-            # 从 slot_id 提取组号，如 a1 → 1, s2a → 2
+            # 从 slot_id 提取组号,如 a1 → 1, s2a → 2
             m = re.match(r'[as](\d+)', sid)
             if m:
                 gn = int(m.group(1))
@@ -148,7 +147,7 @@ async def _get_topology_text() -> str:
                 parts.append(f"{icon}{c.get('slot_id')}: {c.get('channel_id')}")
             msg += f"  组{gn}: {' | '.join(parts)}\n"
     else:
-        msg += "  (未加载拓扑，请运行 seed_topology.py)\n"
+        msg += "  (未加载拓扑,请运行 seed_topology.py)\n"
 
     # 轮转配置
     try:
@@ -198,9 +197,9 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
     skip = (page - 1) * per_page
     users = await users_col.find(query, sort=("created_at", -1), skip=skip, limit=per_page)
     total_pages = max(1, (total + per_page - 1) // per_page)
-    msg = f"👤 用户列表 (第{page}/{total_pages}页，共{total}人)\n"
+    msg = f"👤 用户列表 (第{page}/{total_pages}页,共{total}人)\n"
     if search:
-        msg += f"🔍 搜索：{search}\n"
+        msg += f"🔍 搜索:{search}\n"
     msg += "\n"
     for u in users:
         level_icon = {"free": "🆓", "basic": "🥇", "premium": "👑"}.get(u.get("membership_level", "free"), "🆓")
@@ -242,7 +241,7 @@ async def _get_relay_status_text() -> str:
         msg += f"\n就绪: {ready_count}/{len(pool_status)}"
 
     if pending == "1":
-        msg += "\n⚠️ 正在等待验证码，请通过 /relay_code 提交"
+        msg += "\n⚠️ 正在等待验证码,请通过 /relay_code 提交"
 
     return msg
 
@@ -325,7 +324,7 @@ async def _get_configs_text() -> str:
         if not val:
             val = _config_fallback(key)
         display = val if val else "❌ 未配置"
-        msg += f"  {label}：{display} {indicator}\n"
+        msg += f"  {label}:{display} {indicator}\n"
 
     msg += "\n🎫 默认配额\n"
     for key, label, indicator in quota_keys:
@@ -336,7 +335,7 @@ async def _get_configs_text() -> str:
             display = _quota_display(int(val)) if val else "未配置"
         except (ValueError, TypeError):
             display = str(val) if val else "未配置"
-        msg += f"  {label}：{display} {indicator}\n"
+        msg += f"  {label}:{display} {indicator}\n"
 
     r2_keys_to_check = ["r2_account_id", "r2_access_key", "r2_secret_key"]
     r2_vals = await asyncio.gather(*(get_config(k) for k in r2_keys_to_check), return_exceptions=True)
@@ -344,7 +343,7 @@ async def _get_configs_text() -> str:
     if not r2_configured:
         r2_check = lambda k: _config_fallback(k) != settings.get_config_default(k)
         r2_configured = any(r2_check(k) for k in r2_keys_to_check)
-    msg += f"\n☁️ R2 备份：{'✅ 已配置' if r2_configured else '❌ 未配置'} ⚠️需重启\n"
+    msg += f"\n☁️ R2 备份:{'✅ 已配置' if r2_configured else '❌ 未配置'} ⚠️需重启\n"
 
     for key, label, indicator in backup_keys:
         val = await get_config(key)
@@ -353,7 +352,7 @@ async def _get_configs_text() -> str:
         display = val if val else "未配置"
         if key == "db_backup_enabled":
             display = "✅ 开启" if display.lower() in ("true", "1", "on") else "❌ 关闭"
-        msg += f"  {label}：{display} {indicator}\n"
+        msg += f"  {label}:{display} {indicator}\n"
 
-    msg += "\n使用 /set_* 命令修改配置，或点击菜单按钮操作。"
+    msg += "\n使用 /set_* 命令修改配置,或点击菜单按钮操作。"
     return msg

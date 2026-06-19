@@ -3,11 +3,20 @@ try:
 except ImportError:
     import json
 import time as _time
+import re
 from datetime import datetime
 from typing import Any, Optional
 
 import asyncpg
 from loguru import logger
+
+
+def _json_dumps(obj, **kwargs):
+    """json.dumps compatible wrapper."""
+    result = json.dumps(obj, **kwargs)
+    if isinstance(result, bytes):
+        return result.decode()
+    return result
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -57,7 +66,7 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_requester ON decode_logs(requester_id)",
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_request_time ON decode_logs(request_time)",
     "CREATE INDEX IF NOT EXISTS idx_file_records_msg_id ON file_records(primary_channel_msg_id)",
-    "CREATE INDEX IF NOT EXISTS idx_send_queue_processed_created ON send_queue(processed, created_at)",  # 已废弃（v2 用 jobs 表）
+    "CREATE INDEX IF NOT EXISTS idx_send_queue_processed_created ON send_queue(processed, created_at)",  # 已废弃(v2 用 jobs 表)
     """CREATE TABLE IF NOT EXISTS pending_uploads (
         id SERIAL PRIMARY KEY,
         uploader_id BIGINT,
@@ -71,7 +80,7 @@ DDL_STATEMENTS = [
         processed INTEGER DEFAULT 0
     )""",
     "CREATE INDEX IF NOT EXISTS idx_pending_uploads_unprocessed ON pending_uploads(processed)",
-    # 已废弃（v2 环形冗余架构用 jobs 表替代 send_queue）
+    # 已废弃(v2 环形冗余架构用 jobs 表替代 send_queue)
     """CREATE TABLE IF NOT EXISTS send_queue (
         id SERIAL PRIMARY KEY,
         target_user_id BIGINT,
@@ -169,7 +178,7 @@ DDL_STATEMENTS = [
         config_value TEXT,
         updated_at TEXT
     )""",
-    # ─── 外部码映射表（采集器写入，idx_bot 查询�?─────────────────
+    # ─── 外部码映射表(采集器写入,idx_bot 查询�?─────────────────
     """CREATE TABLE IF NOT EXISTS external_code_mapping (
         external_code TEXT PRIMARY KEY,
         system_code TEXT NOT NULL,
@@ -179,7 +188,7 @@ DDL_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_system ON external_code_mapping(system_code)",
     "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_bot ON external_code_mapping(bot_username)",
-    # ─── code_bot_mapping 表（代码前缀 �?Bot 路由�?──────────────
+    # ─── code_bot_mapping 表(代码前缀 �?Bot 路由�?──────────────
     """CREATE TABLE IF NOT EXISTS code_bot_mapping (
         code_prefix TEXT PRIMARY KEY,
         bot_username TEXT NOT NULL,
@@ -199,10 +208,10 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     # ─── jobs 表补�?───────────────────────────────────────────────
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
-    # ─── CRDB 行级 TTL：零 RU 自动清理，替�?Python cleanup ───
+    # ─── CRDB 行级 TTL:零 RU 自动清理,替�?Python cleanup ───
     "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''7 days''', ttl_job_cron = '@hourly')",
     "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''7 days''', ttl_job_cron = '@hourly')",
-    # ─── 死信队列（Dead Letter Queue）──────────────────────────────
+    # ─── 死信队列(Dead Letter Queue)──────────────────────────────
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_reason TEXT DEFAULT ''",
 ]
@@ -229,7 +238,7 @@ class CockroachDBClient:
             statement_cache_size=256,
         )
 
-        # ─── SQLite 缓存备份：初始化并恢复内存缓�?───
+        # ─── SQLite 缓存备份:初始化并恢复内存缓�?───
         from .cache_store import get_cache_store
         from .cache import load_cache_from_disk
 
@@ -255,7 +264,7 @@ class CockroachDBClient:
             await conn.execute(sql, *(params or []))
 
     async def transaction(self):
-        """获取一个带事务的连接，用于需要原子性的多步操作�?        
+        """获取一个带事务的连接,用于需要原子性的多步操作�?        
         用法:
             async with db.transaction() as conn:
                 await conn.execute(...)
@@ -329,7 +338,7 @@ def _safe_str(val: Any):
     if isinstance(val, int):
         return val
     if isinstance(val, (list, dict)):
-        return json.dumps(val, default=str).decode()
+        return _json_dumps(val, default=str)
     if isinstance(val, datetime):
         return val.isoformat()
     return str(val)
@@ -424,7 +433,7 @@ class D1Collection:
                 all_params.append(int(v))
         if "$push" in update:
             for k, v in update["$push"].items():
-                val_json = json.dumps(v, default=str).decode()
+                val_json = _json_dumps(v, default=str)
                 set_parts.append(
                     f"{k} = CASE WHEN {k} IS NULL OR {k} = '' "
                     f"THEN jsonb_build_array(${len(all_params) + 1}::jsonb) "
@@ -567,6 +576,8 @@ class D1Collection:
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         if sort and len(sort) >= 2:
+            if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', sort[0]):
+                raise ValueError(f"Invalid sort column: {sort[0]}")
             direction = "DESC" if sort[1] < 0 else "ASC"
             sql += f" ORDER BY {sort[0]} {direction}"
         if limit is not None:
@@ -625,19 +636,19 @@ async def save_code_bot_mapping(code: str, bot_username: str):
     col = get_code_bot_mapping_col()
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    existing = await col.find_one({"code": code})
+    existing = await col.find_one({"code_prefix": code})
     if existing:
         await col.update_one(
-            {"code": code},
+            {"code_prefix": code},
             {"$set": {"bot_username": bot_username, "created_at": now}},
         )
     else:
-        await col.insert_one({"code": code, "bot_username": bot_username, "created_at": now})
+        await col.insert_one({"code_prefix": code, "bot_username": bot_username, "created_at": now})
 
 
 async def get_bot_for_code(code: str) -> str:
     col = get_code_bot_mapping_col()
-    row = await col.find_one({"code": code})
+    row = await col.find_one({"code_prefix": code})
     if row:
         return row.get("bot_username", "")
     return ""
@@ -675,7 +686,7 @@ async def get_backup_channels(group: int) -> list[int]:
 
 
 async def set_backup_channels(group: int, channels: list[int]):
-    await _set_config(f"backup_channels_{group}", json.dumps(channels).decode())
+    await _set_config(f"backup_channels_{group}", _json_dumps(channels))
 
 
 async def get_all_backup_channels() -> list[int]:
@@ -708,7 +719,7 @@ async def delete_backup_bot_token(bot_num: int):
 
 
 async def get_config(key: str) -> str | None:
-    """获取配置值，走内存缓存（10分钟 TTL�?""
+    """获取配置值,走内存缓存(10分钟 TTL�?""
     return await get_config_cached(key)
 
 
@@ -817,7 +828,7 @@ async def delete_code_bot_route(prefix: str):
 
 
 async def get_all_code_bot_routes() -> dict[str, str]:
-    """获取所�?code_bot_route，走内存缓存�?0 分钟 TTL）�?""
+    """获取所�?code_bot_route,走内存缓存�?0 分钟 TTL)�?""
     global _code_bot_routes_cache, _code_bot_routes_cache_ts
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
@@ -825,7 +836,7 @@ async def get_all_code_bot_routes() -> dict[str, str]:
 
 
 async def resolve_bot_for_code(code: str, default_bot: str) -> str:
-    """根据文件码前缀匹配配置的路由，无匹配则返回 default_bot�?""
+    """根据文件码前缀匹配配置的路由,无匹配则返回 default_bot�?""
     global _code_bot_routes_cache, _code_bot_routes_cache_ts
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
@@ -848,7 +859,7 @@ async def set_bot_decode_interval(bot_username: str, interval_seconds: int):
 
 
 async def get_bot_decode_interval(bot_username: str) -> int:
-    """获取 bot 解码间隔，走内存缓存�?0 分钟 TTL）�?""
+    """获取 bot 解码间隔,走内存缓存�?0 分钟 TTL)�?""
     global _bot_decode_interval_cache, _bot_decode_interval_cache_ts
     if _time.time() - _bot_decode_interval_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
@@ -926,7 +937,7 @@ def get_external_code_mapping_col() -> D1Collection:
     return _external_code_mapping_col
 
 
-# ─── 外部码映射内存缓存（启动加载�?0 分钟刷新�?─────────────────────
+# ─── 外部码映射内存缓存(启动加载�?0 分钟刷新�?─────────────────────
 _external_code_mapping_cache: dict[str, str] = {}
 _external_code_mapping_cache_ts = 0
 _EXTERNAL_CODE_MAPPING_TTL = 600  # 10 分钟
@@ -948,15 +959,16 @@ async def _refresh_external_code_mapping_cache():
 
 
 async def get_system_code_for_external(external_code: str) -> str | None:
-    """查询外部码对应的系统码，命中�?idx_bot 可直接走本地解码流程�?""
+    """查询外部码对应的系统码,命中�?idx_bot 可直接走本地解码流程�?""
     global _external_code_mapping_cache, _external_code_mapping_cache_ts
-    # 检查缓存是否过�?    if _time.time() - _external_code_mapping_cache_ts > _EXTERNAL_CODE_MAPPING_TTL:
+    # 检查缓存是否过期
+    if _time.time() - _external_code_mapping_cache_ts > _EXTERNAL_CODE_MAPPING_TTL:
         await _refresh_external_code_mapping_cache()
     # 先查内存缓存
     system_code = _external_code_mapping_cache.get(external_code)
     if system_code:
         return system_code
-    # 缓存未命中，回退�?DB 查询
+    # 缓存未命中,回退�?DB 查询
     try:
         row = await _external_code_mapping_col.find_one({"external_code": external_code})
         if row:
@@ -974,7 +986,7 @@ async def set_external_code_mapping(
     system_code: str,
     bot_username: str = "",
 ) -> bool:
-    """写入外部码→系统码映射（由采集器调用）�?""
+    """写入外部码→系统码映射(由采集器调用)�?""
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     try:
@@ -1007,7 +1019,7 @@ async def get_user_cached(user_id: int) -> Optional[dict]:
     if cached is not None:
         return cached
 
-    # L2: SQLite 兜底（避免穿 CRDB）
+    # L2: SQLite 兜底(避免穿 CRDB)
     from .cache_store import get_cache_store
     store = get_cache_store()
     cached = await store.get(cache_key)
@@ -1150,7 +1162,7 @@ async def add_spare_channel(channel_id: int, account_name: str = None) -> bool:
 
 
 async def get_spare_for_account(account_name: str) -> dict | None:
-    """获取指定账号的未使用备用频道（优先同账号）�?""
+    """获取指定账号的未使用备用频道(优先同账号)�?""
     col = get_spare_pool_col()
     # 优先匹配同账�?    spare = await col.find_one({"account_name": account_name, "is_used": 0})
     if spare:
@@ -1159,7 +1171,7 @@ async def get_spare_for_account(account_name: str) -> dict | None:
 
 
 async def get_any_spare() -> dict | None:
-    """获取任意未使用的备用频道（无账号归属）�?""
+    """获取任意未使用的备用频道(无账号归属)�?""
     col = get_spare_pool_col()
     # 优先无归属的备用池频�?    spare = await col.find_one({"account_name": None, "is_used": 0})
     if not spare:
@@ -1175,7 +1187,7 @@ async def consume_spare(channel_id: int) -> bool:
 
 
 async def release_spare(channel_id: int) -> bool:
-    """释放备用频道回池（标记为未使用）�?""
+    """释放备用频道回池(标记为未使用)�?""
     col = get_spare_pool_col()
     await col.update_one({"channel_id": channel_id}, {"$set": {"is_used": 0}})
     return True
@@ -1222,7 +1234,7 @@ async def set_rotation_config(key: str, value: str):
 
 
 async def get_active_cells() -> list[dict]:
-    """获取所有状态为 active 的槽位，按环�?next_active_chat_id 排序�?""
+    """获取所有状态为 active 的槽位,按环�?next_active_chat_id 排序�?""
     col = get_cells_col()
     cells = await col.find({"status": "active"})
     # 尝试按环形顺序排�?    if len(cells) <= 1:
@@ -1256,13 +1268,13 @@ async def get_next_active_cell(current_channel_id: int) -> dict | None:
     nxt_id = current.get("next_active_chat_id")
     if nxt_id:
         return await col.find_one({"channel_id": nxt_id, "status": "active"})
-    # 回环：取第一�?active
+    # 回环:取第一�?active
     cells = await col.find({"status": "active"}, sort=("created_at", 1), limit=1)
     return cells[0] if cells else None
 
 
 async def get_active_or_shadow_cell(channel_id: int) -> dict | None:
-    """获取指定 channel �?cell 记录（任�?status）�?""
+    """获取指定 channel �?cell 记录(任�?status)�?""
     col = get_cells_col()
     return await col.find_one({"channel_id": channel_id})
 
@@ -1310,20 +1322,20 @@ async def enqueue_job(
         "code": code,
         "target_user_id": target_user_id,
         "storage_channel_id": storage_channel_id,
-        "storage_msg_ids": _json.dumps(storage_msg_ids).decode(),
+        "storage_msg_ids": _json_dumps(storage_msg_ids),
         "batch_file_meta": batch_file_meta,
         "task_type": task_type,
         "status": "pending",
         "protect_content": protect_content,
         "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     })
-    # 递增本地计数器（用于 admin /status�?    try:
+    # 递增本地计数器(用于 admin /status�?    try:
         from bots.admin_bot.menus import _status_counters
         _status_counters["total_files"] = _status_counters.get("total_files", 0) + 1
         _status_counters["active_files"] = _status_counters.get("active_files", 0) + 1
     except Exception:
         pass
-    # 通知 Dsp Bot（本�?SQLite 通知，零 RU�?    try:
+    # 通知 Dsp Bot(本�?SQLite 通知,零 RU�?    try:
         from .cache_store import get_cache_store
         store = get_cache_store()
         await store.notify_dsp_new_job()
@@ -1332,11 +1344,11 @@ async def enqueue_job(
 
 
 async def dequeue_jobs(batch_size: int = 10) -> list:
-    """�?jobs 表批量取出待派工任务（原子操作：CTE + UPDATE ... RETURNING *，一�?DB 往返）�?    
+    """�?jobs 表批量取出待派工任务(原子操作:CTE + UPDATE ... RETURNING *,一�?DB 往返)�?    
     Args:
-        batch_size: 一次取出的最大任务数，默�?10�?    
+        batch_size: 一次取出的最大任务数,默�?10�?    
     Returns:
-        JobResult 列表，可能为空列表�?    """
+        JobResult 列表,可能为空列表�?    """
     col = get_jobs_col()
     rows = await col._query("""
         WITH next AS (
@@ -1379,19 +1391,19 @@ async def dequeue_jobs(batch_size: int = 10) -> list:
 
 
 async def dequeue_job():
-    """�?jobs 表取出一个待派工任务（保持向后兼容，内部调用 dequeue_jobs(1)）�?""
+    """�?jobs 表取出一个待派工任务(保持向后兼容,内部调用 dequeue_jobs(1))�?""
     results = await dequeue_jobs(1)
     return results[0] if results else None
 
 
 async def reenqueue_job(job_id: int) -> bool:
-    """将一�?dispatched �?job 重新标记�?pending（用�?semaphore 等待超时）�?""
+    """将一�?dispatched �?job 重新标记�?pending(用�?semaphore 等待超时)�?""
     col = get_jobs_col()
     result = await col._query("""
         UPDATE jobs SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1
         WHERE id = $1 AND status = 'dispatched'
         RETURNING id
-    """, job_id)
+    """, [job_id])
     return len(result) > 0
 
 
@@ -1420,7 +1432,7 @@ class JobResult:
 
 
 async def mark_job_dead(job_id: int, reason: str):
-    """将反复失败的 job 标记为死信（status='dead'），不再重试�?""
+    """将反复失败的 job 标记为死信(status='dead'),不再重试�?""
     import datetime as _dt
     col = get_jobs_col()
     await col.update_one(
@@ -1465,4 +1477,4 @@ async def log_rotate(
 
 
 # ─── 清理函数已移�?──────────────────────────────────────────────
-# CRDB 行级 TTL 已启用（decode_logs + jobs �?7 天自动清理）�?# �?RU 自动清理，Python 兜底清理不再需要�
+# CRDB 行级 TTL 已启用(decode_logs + jobs �?7 天自动清理)�?# �?RU 自动清理,Python 兜底清理不再需要�

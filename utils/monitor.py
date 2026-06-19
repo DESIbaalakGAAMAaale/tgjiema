@@ -30,7 +30,7 @@ class SystemMetrics:
     def ping_bot(self, name: str):
         bot = self.get_bot(name)
         bot.is_running = True
-        bot.last_ping = time.time()
+        bot.last_ping = time.monotonic()
 
     def record_error(self, name: str):
         bot = self.get_bot(name)

@@ -19,13 +19,13 @@ BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # ─── 登录速率限制 ──────────────────────────────────────────────
-# IP -> [timestamps]，记录 5 分钟内的失败时间戳
+# IP -> [timestamps],记录 5 分钟内的失败时间戳
 _login_failures: dict[str, list[float]] = {}
 _LOGIN_LIMIT_WINDOW = 300   # 5 分钟
 _LOGIN_LIMIT_MAX = 5        # 最多 5 次失败
 
 # ─── CSRF 保护 ─────────────────────────────────────────────────
-# 使用 secrets.token_hex(32) 生成 CSRF token，存储在 cookie 中
+# 使用 secrets.token_hex(32) 生成 CSRF token,存储在 cookie 中
 _csrf_token: str = secrets.token_hex(32)
 
 
@@ -34,21 +34,17 @@ def _get_csrf_token() -> str:
     return _csrf_token
 
 
-def _verify_csrf(request: Request) -> bool:
-    """验证 CSRF token：对比表单中的 csrf_token 和 cookie 中的 csrf_token。"""
+def _verify_csrf(request: Request, form_token: str = None) -> bool:
+    """验证 CSRF token:对比表单中的 csrf_token 和 cookie 中的 csrf_token。"""
     cookie_token = request.cookies.get("csrf_token", "")
-    # 尝试从表单获取
-    form_token = ""
-    # Form data is only available in endpoints that accept Form, so we check via request
-    if not cookie_token:
+    if not cookie_token or not form_token:
         return False
-    # 对于 POST 请求，通过请求体获取 csrf_token
-    return True  # 实际验证在 verify_admin 中通过 form 参数完成
+    return cookie_token == form_token
 
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request: Request = None):
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
-        raise HTTPException(status_code=503, detail="管理员账号未配置，请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD")
+        raise HTTPException(status_code=503, detail="管理员账号未配置,请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD")
 
     # 速率限制检查
     client_ip = request.client.host if request else "unknown"
@@ -63,7 +59,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     if len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
-            detail=f"登录尝试过于频繁，请 {_LOGIN_LIMIT_WINDOW // 60} 分钟后再试",
+            detail=f"登录尝试过于频繁,请 {_LOGIN_LIMIT_WINDOW // 60} 分钟后再试",
         )
 
     correct_username = secrets.compare_digest(
@@ -79,7 +75,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
         _login_failures[client_ip].append(now)
         raise HTTPException(status_code=401, detail="未授权访问")
 
-    # 登录成功，清除该 IP 的失败记录
+    # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)
     return credentials.username
 
@@ -108,7 +104,7 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
     total_files = await files_col.count_documents({})
     active_files = await files_col.count_documents({"status": "active"})
 
-    today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     today_decodes = await logs_col.count_documents({"request_time": {"$gte": today}})
 
     bot_statuses = []
@@ -201,7 +197,7 @@ async def update_membership(
     update = {
         "$set": {
             "membership_level": level,
-            "updated_at": datetime.datetime.now(datetime.UTC),
+            "updated_at": datetime.datetime.now(datetime.timezone.utc),
         }
     }
     if level == "free":
@@ -245,7 +241,7 @@ async def toggle_ban(
     new_ban = not user.get("is_banned", False)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.now(datetime.UTC)}},
+        {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
     )
     response = RedirectResponse(url="/users", status_code=303)
     response.set_cookie(key="csrf_token", value=_csrf_token, httponly=True, samesite="strict", max_age=3600)
