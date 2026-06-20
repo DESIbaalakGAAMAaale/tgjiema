@@ -48,9 +48,10 @@ class MonScheduler:
         self.heartbeat_timeout = cfg["heartbeat_timeout"]
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
-        # ─── last_synced_msg_id 本地缓存:每 10 次同步写一次 CRDB ───
+        # ─── last_synced_msg_id 本地缓存:每 5 次同步写一次 CRDB ───
         self._cursor_cache: dict[str, int] = {}
         self._replicate_count = 0
+        self._cursor_flush_interval = 5  # 每 N 次同步 flush 一次
 
     async def run_degrade_check(self, all_cells: list[dict]) -> list[str]:
         """执行一轮降级检查,返回日志描述列表。
@@ -129,12 +130,14 @@ class MonScheduler:
             if group_num not in groups:
                 groups[group_num] = [None, None, None]
 
-            if sid.startswith("a"):
-                groups[group_num][0] = cell
-            elif sid.endswith("a"):
+            # 优先级: endsWith("a") > endsWith("b") > startswith("a")
+            # a1a 应归类为 shadow1(索引1), 而不是 active(索引0)
+            if sid.endswith("a") and not sid.startswith("a"):
                 groups[group_num][1] = cell
             elif sid.endswith("b"):
                 groups[group_num][2] = cell
+            elif sid.startswith("a"):
+                groups[group_num][0] = cell
 
         return groups
 
@@ -260,8 +263,8 @@ class MonScheduler:
             latest_id = max(msg.message_id for msg in new_messages if msg)
             self._cursor_cache[slot_id] = latest_id
 
-        # 每 10 次同步批量 flush 游标到 CRDB
-        if self._replicate_count % 10 == 0:
+        # 每 N 次同步批量 flush 游标到 CRDB
+        if self._replicate_count % self._cursor_flush_interval == 0:
             await self._flush_cursor_cache()
 
         return total_copied

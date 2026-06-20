@@ -26,15 +26,15 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '2.0'
-          memory: 1G
-    # 健康检查仅验证主进程存活，不检查各子进程具体状态
+          cpus: '4.0'
+          memory: 2G
+    # 健康检查:使用 ps + grep 替代 pgrep(更可靠)
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f run_all.py > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "ps aux | grep '[r]un_all.py' > /dev/null || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
     logging:
       driver: "json-file"
       options:

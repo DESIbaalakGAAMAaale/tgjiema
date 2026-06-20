@@ -16,7 +16,17 @@ from utils.per_channel_limiter import acquire_channel_limit
 # 模块级缓存:避免每次 resolve_delivery_channel() 都查询 CRDB
 _cell_cache: dict[int, dict] = {}
 _cell_cache_ts: float = 0
-_CELL_CACHE_TTL: float = 60.0
+_CELL_CACHE_TTL: float = 30.0  # 缩短到 30 秒,与 Mon Bot 心跳频率对齐
+
+
+def invalidate_cell_cache(channel_id: int = None):
+    """失效 delivery_resolver 缓存,用于 Mon Bot 改变频道状态时通知 Dsp。"""
+    global _cell_cache_ts
+    if channel_id is not None:
+        _cell_cache.pop(channel_id, None)
+    else:
+        _cell_cache.clear()
+    _cell_cache_ts = time.monotonic()
 
 
 class DeliveryChannel:
@@ -72,8 +82,21 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
 
 async def _walk_ring_for_channel(channel_id: int, max_hops: int = 45) -> DeliveryChannel:
     """环形遍历,找到第一个可用的频道。使用 cells 全量数据在内存中遍历环形链表。"""
-    col = get_cells_col()
-    all_cells = list(await col.find({}))
+    # 尝试从 Mon Bot 缓存获取(避免全表扫描)
+    all_cells = None
+    try:
+        from bots.mon_bot import MonBot
+        # 如果 Mon Bot 正在运行,尝试获取其缓存
+        mon = MonBot._instance
+        if mon and mon._cells_cache:
+            all_cells = list(mon._cells_cache)
+    except (ImportError, AttributeError, Exception):
+        pass
+
+    if all_cells is None:
+        col = get_cells_col()
+        all_cells = list(await col.find({}))
+
     if not all_cells:
         return DeliveryChannel(channel_id, "unknown", "fallback")
 
@@ -124,16 +147,17 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 45) -> Deliver
     return DeliveryChannel(channel_id, "unknown", "fallback")
 
 
-async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False) -> bool:
+async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False, bot_id: int = 1) -> bool:
     """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。"""
-    # 频道限流:检查是否超过 15 msg/min
-    wait = await acquire_channel_limit(from_channel_id)
-    if wait > 0:
+    # 频道限流:检查是否超过 15 msg/min,循环等待直到拿到配额
+    while True:
+        wait = await acquire_channel_limit(from_channel_id)
+        if wait <= 0:
+            break
         await asyncio.sleep(wait)
-        await acquire_channel_limit(from_channel_id)
 
     try:
-        await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id, protect_content=protect_content)
+        await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id, protect_content=protect_content, bot_id=bot_id)
         return True
     except Exception as e:
         logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={message_id}): {e}")

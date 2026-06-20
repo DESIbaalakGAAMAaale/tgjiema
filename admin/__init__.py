@@ -94,6 +94,12 @@ def _make_csrf_response(template_name: str, context: dict) -> HTMLResponse:
     return response
 
 
+@app.get("/health")
+async def health_check():
+    """健康检查端点(无需认证),供 Docker healthcheck 和负载均衡器使用。"""
+    return {"status": "ok", "bots": {name: h.is_running for name, h in metrics.bots.items()}}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, admin=Depends(verify_admin)):
     users_col = get_users_col()

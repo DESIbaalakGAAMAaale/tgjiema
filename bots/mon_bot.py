@@ -359,6 +359,7 @@ class MonBot:
                     logger.info(f"[Mon] 心跳: {ok_count} 正常, {ban_count} 封禁")
                 if ban_count > 0:
                     self._invalidate_cells_cache()  # 封禁替换写了 cells,下次循环重载
+                    all_cells = await self._get_cells()  # 重新加载以反映变更
 
                 # 2. 核心写入:将 Active 槽位新文件同步到 Shadow 频道
                 copied = await self.scheduler.replicate_all_active_to_shadows(self.bot, all_cells)
@@ -380,11 +381,13 @@ class MonBot:
                         if "[DEGRADE]" in msg:
                             await self._notify_admin(f"⚠️ {msg}")
                     self._invalidate_cells_cache()  # 降级改了 cells status,失效缓存
+                    all_cells = await self._get_cells()  # 重新加载以反映变更
 
                 # 5. 活跃频道轮转检查
                 rotated = await self._check_rotation(all_cells)
                 if rotated:
                     self._invalidate_cells_cache()  # 轮转改了 cells status,失效缓存
+                    all_cells = await self._get_cells()  # 重新加载以反映变更
 
                 # 6. 定期拓扑校验(每 10 轮一次)
                 self._cycle_count += 1
@@ -419,8 +422,8 @@ class MonBot:
                 await self.bot.get_chat(cell["channel_id"])
                 was_healthy = self._cell_healthy.get(slot_id, False)
                 if not was_healthy:
-                    # 从不健康变健康,或连续 5 个周期写一次
-                    if self._cycle_count % 5 == 0:
+                    # 连续 10 个周期写一次(约 600s),减少 CRDB RU 消耗
+                    if self._cycle_count % 10 == 0:
                         await update_cell_heartbeat(slot_id)
                 self._cell_healthy[slot_id] = True
                 ok_count += 1

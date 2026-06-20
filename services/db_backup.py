@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from config import settings
-from database.session import _client as db_client
+from database.session import _client as db_client, get_config
 from storage.r2 import _r2 as r2_storage
 
 
@@ -41,7 +41,12 @@ async def backup_all_tables() -> dict:
 
 
 async def run_db_backup():
-    if not settings.DB_BACKUP_ENABLED:
+    enabled_cfg = await get_config("db_backup_enabled")
+    if enabled_cfg is None:
+        enabled = settings.DB_BACKUP_ENABLED
+    else:
+        enabled = enabled_cfg.lower() == "true"
+    if not enabled:
         logger.info("数据库备份未启用(DB_BACKUP_ENABLED=false),跳过启动")
         return
 
@@ -62,7 +67,12 @@ async def run_db_backup():
     )
     await r2_storage.connect()
 
-    logger.info("CockroachDB 数据库备份服务启动,间隔 {} 分钟", settings.DB_BACKUP_INTERVAL_MINUTES)
+    interval_cfg = await get_config("db_backup_interval")
+    if interval_cfg is None:
+        interval = settings.DB_BACKUP_INTERVAL_MINUTES
+    else:
+        interval = int(interval_cfg)
+    logger.info("CockroachDB 数据库备份服务启动,间隔 {} 分钟", interval)
 
     while True:
         try:
@@ -83,7 +93,14 @@ async def run_db_backup():
                     "application/json",
                 )
 
-        except Exception as e:
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as e:
             logger.error(f"数据库备份失败: {e}")
 
-        await asyncio.sleep(settings.DB_BACKUP_INTERVAL_MINUTES * 60)
+        interval_cfg = await get_config("db_backup_interval")
+        if interval_cfg is None:
+            interval = settings.DB_BACKUP_INTERVAL_MINUTES
+        else:
+            interval = int(interval_cfg)
+        await asyncio.sleep(interval * 60)

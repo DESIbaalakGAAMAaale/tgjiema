@@ -2,6 +2,7 @@
 - 中继账号配置、认证、使用统计全部存储在本地，不占用 CockroachDB Cloud 配额
 - VPS 重启后从本地恢复，无需重新登录
 """
+import asyncio
 import os
 import aiosqlite
 from datetime import date
@@ -70,6 +71,17 @@ def decrypt(cipher_text: str) -> str:
 
 DB_PATH = Path(__file__).parent.parent / "data" / "relay_pool.db"
 
+
+async def _sync_relay_to_crdb(api_id: int, api_hash: str, phone: str):
+    """异步同步中继账号到 CRDB（不阻塞主流程）"""
+    try:
+        from .session import _client, sync_relay_to_crdb as _do_sync
+        if _client._pool is None:
+            return  # CRDB 未连接，跳过
+        await _do_sync(api_id, api_hash, phone)
+    except Exception as e:
+        logger.debug(f"[RelayDB] CRDB 同步失败（不影响本地）: {e}")
+
 DDL = """
 CREATE TABLE IF NOT EXISTS relay_accounts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +130,19 @@ class RelayDB:
         await self._db.execute("PRAGMA wal_autocheckpoint=1000")
         await self._db.executescript(DDL)
         await self._db.commit()
+        
+        # 启动恢复：如果 SQLite 为空，从 CRDB 拉取
+        row = await self._db.execute_fetchone("SELECT COUNT(*) FROM relay_accounts")
+        if row and row[0] == 0:
+            try:
+                from .session import get_relay_accounts_from_crdb
+                accounts = await get_relay_accounts_from_crdb()
+                for acc in accounts:
+                    await self.add_account(acc['api_id'], acc['api_hash'], acc['phone'])
+                logger.info(f"[RelayDB] 从 CRDB 恢复 {len(accounts)} 个中继账号")
+            except Exception as e:
+                logger.warning(f"[RelayDB] CRDB 恢复失败（回退空池模式）: {e}")
+        
         logger.info(f"[RelayDB] 初始化完成: {DB_PATH}")
 
     async def close(self):
@@ -133,6 +158,10 @@ class RelayDB:
             (api_id, encrypt(api_hash), phone),
         )
         await self._db.commit()
+        
+        # 双向同步到 CRDB（异步，不阻塞）
+        asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))
+        
         return cursor.lastrowid
 
     async def update_account(self, phone: str, api_id: int, api_hash: str):
@@ -141,6 +170,9 @@ class RelayDB:
             (api_id, encrypt(api_hash), phone),
         )
         await self._db.commit()
+        
+        # 双向同步到 CRDB（异步，不阻塞）
+        asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))
 
     async def deactivate_account(self, phone: str):
         await self._db.execute(

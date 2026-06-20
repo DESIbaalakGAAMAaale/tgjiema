@@ -9,7 +9,7 @@ from database import (
     get_config, set_config,
     set_code_bot_route, delete_code_bot_route,
     set_bot_decode_interval, delete_bot_decode_interval,
-    add_spare_channel, remove_spare_channel,
+    add_spare_channel, remove_spare,
     set_rotation_config,
     update_user_and_invalidate,
 )
@@ -24,12 +24,14 @@ from .display import _ensure_user
 
 async def _conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
     context.user_data["conv_state"] = state
+    context.user_data["conv_data"] = {}
     query = update.callback_query
     await query.edit_message_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
 
 
 async def _conv_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
     context.user_data["conv_state"] = state
+    context.user_data.setdefault("conv_data", {})
     await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
 
 
@@ -441,8 +443,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if on_off not in ("on", "off"):
             await update.message.reply_text("❌ 请输入 on 或 off:")
             return
-        await set_config("db_backup_interval_minutes", str(data["interval"]))
-        await set_config("db_backup_enabled", "1" if on_off == "on" else "0")
+        await set_config("db_backup_interval", str(data["interval"]))
+        await set_config("db_backup_enabled", "true" if on_off == "on" else "false")
         await _end(f"✅ DB 自动备份已{'开启' if on_off == 'on' else '关闭'},间隔 {data['interval']} 分钟 ✅热更新")
 
     # ─── 备用池 ────────────────────────────────────────────────

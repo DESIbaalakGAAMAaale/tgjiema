@@ -45,6 +45,7 @@ class RelayInstance:
         self._lock = asyncio.Lock()
         # 缓存锁
         self._cache_locks: dict[str, asyncio.Lock] = {}
+        self._event_locks: dict[str, asyncio.Lock] = {}
         self._pending_cache_counts: dict[str, int] = {}
         self._pending_cache_events: dict[str, asyncio.Event] = {}
 
@@ -371,7 +372,7 @@ class RelayInstance:
                 pass
         return fixed_count
 
-    def _decrement_cache_counter(self, code: str):
+    async def _decrement_cache_counter(self, code: str):
         current = self._pending_cache_counts.get(code, 0)
         self._pending_cache_counts[code] = max(0, current - 1)
         if self._pending_cache_counts[code] == 0:
@@ -381,7 +382,7 @@ class RelayInstance:
 
     async def _download_and_cache_one(self, msg, user_id: int, code: str):
         if not getattr(msg, "media", None):
-            self._decrement_cache_counter(code)
+            await self._decrement_cache_counter(code)
             return
         try:
             if self._up_bot_entity:
@@ -395,7 +396,7 @@ class RelayInstance:
         except Exception as e:
             logger.error(f"[RelayInstance:{self.phone}] 发送到 Up Bot 失败 (code={code}): {e}")
         finally:
-            self._decrement_cache_counter(code)
+            await self._decrement_cache_counter(code)
 
     @staticmethod
     def _detect_media_type(msg) -> str:
@@ -574,14 +575,20 @@ class RelayInstance:
         pending = self._pending_cache_counts.get(code, 0)
         if pending <= 0:
             return
-        ev = self._pending_cache_events.setdefault(code, asyncio.Event())
-        ev.clear()
-        if self._pending_cache_counts.get(code, 0) <= 0:
-            return
-        try:
-            await asyncio.wait_for(ev.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
+        # 使用 lock 保护 clear/wait 原子性
+        ev_lock = self._event_locks.setdefault(code, asyncio.Lock())
+        async with ev_lock:
+            ev = self._pending_cache_events.get(code)
+            if ev is None:
+                ev = self._pending_cache_events[code] = asyncio.Event()
+            ev.clear()
+            # 再次检查计数，避免在 clear 后 decrement 还没到来
+            if self._pending_cache_counts.get(code, 0) <= 0:
+                return
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
 
     async def _message_loop(self, bot_username: str, settle_wait: float = _SETTLE_WAIT):
         task = asyncio.current_task()

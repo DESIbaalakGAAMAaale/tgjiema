@@ -17,14 +17,56 @@ from config import settings
 from storage.r2 import _r2 as r2_storage
 
 # 备份中会包含的表（按依赖顺序排列，先恢复无依赖的表）
-ALL_TABLES = ["users", "file_records", "decode_logs"]
+ALL_TABLES = ["users", "file_records", "decode_logs", "cells", "codes", "jobs",
+              "rotate_log", "pending_uploads", "spare_pool", "backup_config",
+              "code_bot_mapping", "message_backups"]
 
 # 各表的主键列
 TABLE_PK = {
     "users": "user_id",
     "file_records": "file_code",
     "decode_logs": "id",
+    "cells": "slot_id",
+    "codes": "code",
+    "jobs": "id",
+    "rotate_log": "id",
+    "pending_uploads": "id",
+    "spare_pool": "id",
+    "backup_config": "key",
+    "code_bot_mapping": "prefix",
+    "message_backups": "id",
 }
+
+# 白名单:只允许这些列名出现在 INSERT/UPDATE 语句中
+_ALLOWED_COLUMNS = set()
+for _tbl in ALL_TABLES:
+    # 预定义常见列名白名单(防止注入)
+    _ALLOWED_COLUMNS.update([
+        "id", "user_id", "file_code", "slot_id", "code", "key", "prefix",
+        "username", "first_name", "membership_level", "quota_used_today",
+        "daily_decode_quota", "quota_date", "external_decode_quota",
+        "external_used_today", "external_quota_date", "is_banned",
+        "created_at", "updated_at", "primary_channel_id", "primary_channel_msg_id",
+        "file_types", "batch_msg_ids", "batch_file_meta", "note",
+        "protect_content", "file_ttl_days", "status", "storage_channel_id",
+        "storage_msg_ids", "target_user_id", "task_type", "retry_count",
+        "dead", "dead_reason", "dead_retry", "dead_retry_at",
+        "dispatched_at", "expire_time", "last_heartbeat", "rotation_started_at",
+        "is_r100", "next_active_chat_id", "prev_slot_id", "channel_id",
+        "group_key", "account_index", "description", "interval_minutes",
+        "enabled", "usage", "total_requests", "avg_wait_ms", "last_used",
+        "bot_username", "bot_type", "phone", "api_id", "api_hash_encrypted",
+        "session_data", "message_id", "chat_id", "from_chat_id",
+        "decoded_at", "decode_result", "backup_time",
+    ])
+
+
+def _sanitize_column(name: str) -> str:
+    """白名单校验列名,防止 SQL 注入。"""
+    clean = name.strip().lower()
+    if clean not in _ALLOWED_COLUMNS:
+        raise ValueError(f"非法列名: {name}")
+    return clean
 
 
 async def get_latest_backup() -> dict:
@@ -64,7 +106,13 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
         logger.info(f"[DRY-RUN] [{table}] 将恢复 {len(records)} 条记录")
         return len(records)
 
-    columns = list(records[0].keys())
+    # 白名单校验所有列名,防止 SQL 注入
+    try:
+        columns = [_sanitize_column(c) for c in records[0].keys()]
+    except ValueError as e:
+        logger.error(f"[{table}] 列名校验失败: {e}, 跳过此表")
+        return 0
+
     # 排除 SERIAL 自增列（decode_logs.id）
     insert_cols = [c for c in columns if not (table == "decode_logs" and c == "id")]
     placeholders = [f"${i + 1}" for i in range(len(insert_cols))]
@@ -72,7 +120,7 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
     update_parts = [f"{c} = EXCLUDED.{c}" for c in insert_cols if c != pk]
 
     sql = (
-        f"INSERT INTO {table} ({', '.join(insert_cols)}) "
+        f"INSERT INTO {_sanitize_column(table)} ({', '.join(insert_cols)}) "
         f"VALUES ({', '.join(placeholders)}) "
         f"ON CONFLICT ({pk}) DO UPDATE SET {', '.join(update_parts)}"
     )
@@ -152,8 +200,7 @@ async def run_restore(table: str = None, dry_run: bool = False):
             logger.info(f"[{tbl}] 恢复完成: {count} 条记录")
     finally:
         await conn.close()
-
-    await r2_storage.close()
+        await r2_storage.close()
     logger.info("数据库恢复完成")
 
 

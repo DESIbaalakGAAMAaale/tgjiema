@@ -9,6 +9,47 @@ from database import get_file_record_cached, update_file_record_and_invalidate
 from config import settings
 from services.code_generator import extract_bot_username
 
+
+# ─── 统一的文件码过期检查 ────────────────────────────────────────
+_CHINA_TZ_FOR_EXPIRY = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def check_code_expired(file_record: dict) -> tuple[bool, str]:
+    """检查文件码是否过期。返回 (expired, reason)。"""
+    expire_time = file_record.get("expire_time")
+    if expire_time is None:
+        return False, ""
+    
+    # 确定时区:如果有 file_ttl_days 且 > 0,使用相对过期时间(UTC)
+    ttl_days = file_record.get("file_ttl_days", 0)
+    if isinstance(ttl_days, str):
+        try:
+            ttl_days = int(ttl_days)
+        except ValueError:
+            ttl_days = 0
+    
+    # 统一使用 UTC 进行比较,避免时区混淆
+    now = datetime.datetime.now(datetime.UTC)
+    
+    expire_dt = expire_time
+    if isinstance(expire_time, str):
+        try:
+            expire_dt = datetime.fromisoformat(expire_time)
+        except (ValueError, TypeError):
+            return False, ""
+    
+    # 如果 expire_dt 没有时区信息,假设为 UTC+8
+    if expire_dt.tzinfo is None:
+        expire_dt = expire_dt.replace(tzinfo=_CHINA_TZ_FOR_EXPIRY)
+    
+    # 确保比较时都在 UTC
+    if expire_dt.tzinfo != datetime.UTC:
+        expire_dt = expire_dt.astimezone(datetime.UTC)
+    
+    if expire_dt < now:
+        return True, "该文件码已过期"
+    return False, ""
+
 # ─── Quota 本地计数(跨进程共享,通过环境变量传递)─────────────
 # 每个 Idx Bot 进程用不同计数器,PID 作为命名空间
 _PID = os.getpid()
@@ -95,7 +136,13 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         if not bot_username:
             return DecodeResult(allowed=False, reason="无效的文件码格式,无法识别目标机器人。")
 
-    today = datetime.datetime.now(datetime.UTC).date()
+    # 使用 UTC+8 (中国时区) 进行配额重置
+    _CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+    def _china_now():
+        return datetime.datetime.now(_CHINA_TZ)
+
+    today = _china_now().date()
 
     def _parse_date(val) -> Optional[datetime.date]:
         if val:
@@ -112,7 +159,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
 
     if quota_date is None or quota_date != today:
         reset_set["quota_used_today"] = 0
-        reset_set["quota_date"] = datetime.datetime.now(datetime.UTC).isoformat()
+        reset_set["quota_date"] = _china_now().isoformat()
         user["quota_used_today"] = 0
         user["quota_date"] = reset_set["quota_date"]
         if membership_level == "free":
@@ -127,7 +174,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
 
     if external_quota_date is None or external_quota_date != today:
         reset_set["external_used_today"] = 0
-        reset_set["external_quota_date"] = datetime.datetime.now(datetime.UTC).isoformat()
+        reset_set["external_quota_date"] = _china_now().isoformat()
         user["external_used_today"] = 0
         user["external_quota_date"] = reset_set["external_quota_date"]
         if membership_level == "free":
@@ -169,19 +216,10 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     # 使用缓存查询文件记录
     file_record = await get_file_record_cached(file_code)
     if file_record is not None and file_record.get("status") == "active":
-        # 检查文件码是否过期
-        expire_time = file_record.get("expire_time")
-        if expire_time is not None:
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc)
-            expire_dt = expire_time
-            if isinstance(expire_time, str):
-                try:
-                    expire_dt = datetime.fromisoformat(expire_time)
-                except (ValueError, TypeError):
-                    pass
-            if expire_dt < now:
-                return DecodeResult(allowed=False, reason="该文件码已过期")
+        # 统一检查文件码是否过期
+        expired, reason = check_code_expired(file_record)
+        if expired:
+            return DecodeResult(allowed=False, reason=reason)
         _increment_local_quota(user_id)
         from database.cache import incr_request_count
         await incr_request_count(file_code)

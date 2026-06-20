@@ -174,6 +174,26 @@ class CacheStore:
             await self._db.close()
             self._db = None
 
+    async def cleanup_notify_tables(self):
+        """清理通知表中超过 1 小时的旧记录,防止无限增长。
+        
+        每 100 条通知插入后自动触发一次清理。
+        """
+        if not self._db:
+            return
+        try:
+            await self._db.execute(
+                "DELETE FROM pending_notify WHERE ts < ?",
+                (time.time() - 3600,),
+            )
+            await self._db.execute(
+                "DELETE FROM dsp_notify WHERE ts < ?",
+                (time.time() - 3600,),
+            )
+            await self._db.commit()
+        except Exception:
+            pass  # 清理失败不影响主流程
+
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────
 

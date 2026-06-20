@@ -1,6 +1,6 @@
-"""Dsp Bot — 发送机器人(环形冗余架构版)
-职责:从 jobs 表轮询任务 → 通过 delivery_resolver 解析最佳频道 → 媒体组发送给用户
-替代原 sender_bot,数据源从 send_queue 改为 jobs 表。
+"""Dsp Bot - 发送机器人(环形冗余架构)
+职责: 从 jobs 表轮询任务, 通过 delivery_resolver 解析最佳频道, 以媒体组发送给用户
+替代: sender_bot,数据源从 send_queue 改为 jobs 表
 """
 
 import asyncio
@@ -18,9 +18,10 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from loguru import logger
 
 from config import settings
-from database import dequeue_jobs, get_file_records_col, reenqueue_job, mark_job_dead, set_cell_status, get_active_or_shadow_cell
+from database import dequeue_jobs, get_file_records_col, reenqueue_job, mark_job_dead, set_cell_status, get_active_or_shadow_cell, get_pending_jobs_count
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.monitor import metrics
+from utils.dynamic_rate_limiter import dynamic_rate_limiter
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import (
     safe_send_message,
@@ -37,35 +38,62 @@ from utils.task_utils import create_safe_task
 TOKEN = settings.SENDER_BOT_TOKEN
 PAGE_SIZE = settings.PAGE_SIZE
 
-# ─── 多 worker 并发控制 ───
-# 最大并发发送数(留 5 个余量给 copy_message 等其他 API 调用)
+# ─── 4 worker 并发控制 ───
+# 最大并发发送数(25 个余量给 copy_message 等其他 API 调用)
 _SEND_CONCURRENCY = settings.SEND_CONCURRENCY
 _send_semaphore = asyncio.Semaphore(_SEND_CONCURRENCY)
 
 # ─── Dsp 侧频道路由降级(Mon Bot 补充机制)───
-# 当 Mon Bot 不可用时,Dsp 通过发送失败率自动触发降级,作为兜底。
-# 阈值比 Mon 更保守,仅窗口内多次失败才触发,避免误判。
+# 当 Mon Bot 不可用时,Dsp 通过发送失败率自动触发降级,作为兜底方案
+# 阈值比 Mon 更保守,仅窗口内多次失败才触发,避免误判
 _channel_failures: dict[int, list[float]] = {}  # channel_id -> [failure_timestamps]
 _CHANNEL_FAILURE_THRESHOLD = settings.CHANNEL_FAILURE_THRESHOLD  # 60 秒内失败 N 次触发降级
 _CHANNEL_FAILURE_WINDOW = settings.CHANNEL_FAILURE_WINDOW  # 统计窗口(秒)
 
 _pagination_states: dict[str, dict] = {}
+_PAGE_STATE_TTL = 300  # 5 分钟过期清理
+
+
+async def _cleanup_page_states():
+    """定期清理过期的分页状态"""
+    while True:
+        try:
+            now = time.time()
+            expired = [k for k, v in _pagination_states.items() if now - v.get("created_at", 0) > _PAGE_STATE_TTL]
+            for k in expired:
+                _pagination_states.pop(k, None)
+        except Exception:
+            pass
+        await asyncio.sleep(60)
+
+
+async def _retry_dead_jobs():
+    """每小时重试一次死信队列中的 job"""
+    from database import get_and_reset_dead_jobs
+    while True:
+        try:
+            dead_ids = await get_and_reset_dead_jobs(max_count=10)
+            if dead_ids:
+                logger.info(f"[Dsp] 死信重试: 重置 {len(dead_ids)} 个 job")
+        except Exception as e:
+            logger.error(f"[Dsp] 死信重试异常: {e}")
+        await asyncio.sleep(3600)
 
 
 def _record_channel_failure(channel_id: int):
-    """记录频道路由发送失败时间戳,用于 Dsp 侧降级检测。"""
+    """记录频道路由发送失败时间戳,用于 Dsp 侧降级检测"""
     now = time.time()
     if channel_id not in _channel_failures:
         _channel_failures[channel_id] = []
     _channel_failures[channel_id].append(now)
-    logger.debug(f"[Dsp] 频道 {channel_id} 发送失败记录 (当前窗口内失败: {len(_channel_failures[channel_id])})")
+    logger.debug(f"[Dsp] 频道 {channel_id} 发送失败记录(当前窗口内失败 {len(_channel_failures[channel_id])})")
 
 
 async def _check_channel_degrade(channel_id: int):
-    """检查某个频道是否在窗口内失败次数超过阈值,触发降级(兜底机制)。
+    """检查某个频道是否在窗口内失败次数超过阈值,触发降级(兜底机制)
     
-    作为 Mon Bot 的补充,仅在 Mon 不可用时作为兜底。
-    阈值设置更保守(3次/60秒),避免误触发短暂网络波动。
+    作为 Mon Bot 的补充,仅在 Mon 不可用时作为兜底
+    阈值设置更保守(3次/60秒),避免误触发短暂网络波动
     """
     if channel_id not in _channel_failures:
         return
@@ -81,7 +109,7 @@ async def _check_channel_degrade(channel_id: int):
     if fail_count < _CHANNEL_FAILURE_THRESHOLD:
         return
 
-    # 超过阈值,触发降级
+    # 超过阈值触发降级
     try:
         cell = await get_active_or_shadow_cell(channel_id)
         if not cell:
@@ -97,7 +125,7 @@ async def _check_channel_degrade(channel_id: int):
             return
         if current_status == "r100":
             # R100 槽位永不自降
-            logger.warning(f"[Dsp] 频道 {channel_id} 是 R100 槽位,跳过降级")
+            logger.warning(f"[Dsp] 频道 {channel_id} 为 R100 槽位,跳过降级")
             _channel_failures.pop(channel_id, None)
             return
 
@@ -105,7 +133,7 @@ async def _check_channel_degrade(channel_id: int):
         logger.warning(
             f"[Dsp] 频道降级触发: {slot_id} (channel={channel_id}) "
             f"status={current_status}→lost, "
-            f"窗口内失败 {fail_count} 次/{_CHANNEL_FAILURE_WINDOW}s"
+            f"窗口内失败{fail_count}次/{_CHANNEL_FAILURE_WINDOW}s"
         )
         # 降级成功后清除该频道失败记录
         _channel_failures.pop(channel_id, None)
@@ -153,19 +181,19 @@ def _build_page_number_buttons(file_code: str, current_page: int, total_pages: i
     buttons = []
     for p in range(start, start + window):
         if p == current_page:
-            buttons.append(InlineKeyboardButton(f"● {p}", callback_data="noop"))
+            buttons.append(InlineKeyboardButton(f"●{p}", callback_data="noop"))
         else:
             buttons.append(InlineKeyboardButton(str(p), callback_data=f"pg|{file_code}|{p}"))
     return buttons
 
 
-# ─── 核心:多 worker 并发处理 jobs 表 ───
+# ─── 核心: 4 worker 并发处理 jobs ───
 
 async def process_queue(bot):
-    """启动多个 worker 并发处理 jobs 队列。"""
+    """启动多个 worker 并发处理 jobs 队列"""
     workers = []
     num_workers = min(4, _SEND_CONCURRENCY)  # 最多 4 个 worker
-    logger.info(f"[Dsp] 启动 {num_workers} 个 worker,并发上限 {_SEND_CONCURRENCY}")
+    logger.info(f"[Dsp] 启动 {num_workers} 个worker,并发上限 {_SEND_CONCURRENCY}")
     for i in range(num_workers):
         w = create_safe_task(_dsp_worker(bot, i), name=f"dsp-worker-{i}")
         workers.append(w)
@@ -175,9 +203,9 @@ async def process_queue(bot):
 
 
 async def _dsp_worker(bot: Any, worker_id: int):
-    """单个 worker 循环拉取任务。
-    策略:维护本地队列,空时批量从 CRDB dequeue_jobs(10),有任务时本地消费不查 DB。
-    无事时最多 30 秒查一次本地通知,几乎零消耗。
+    """单个 worker 循环拉取任务
+    策略:维护本地队列,空时批量查 CRDB dequeue_jobs(10),有任务时本地消费不查 DB
+    无事时最大 30 秒查一次本地通知,几乎零消耗
     """
     from database.cache_store import get_cache_store
     store = get_cache_store()
@@ -186,7 +214,7 @@ async def _dsp_worker(bot: Any, worker_id: int):
     idle_count = 0
     while True:
         try:
-            # 本地队列有任务 → 直接处理
+            # 本地队列有任务,直接处理
             if not local_queue:
                 # 先查本地通知(零 RU)
                 has_job = await store.has_new_dsp_job()
@@ -196,7 +224,7 @@ async def _dsp_worker(bot: Any, worker_id: int):
                     await asyncio.sleep(sleep_time)
                     continue
 
-                # 有本地通知 → 批量从 CRDB 拉取
+                # 有本地通知,批量查 CRDB 拉取
                 local_queue = await dequeue_jobs(10)
                 if not local_queue:
                     idle_count += 1
@@ -206,7 +234,10 @@ async def _dsp_worker(bot: Any, worker_id: int):
             idle_count = 0
             job = local_queue.pop(0)  # FIFO 消费本地队列
 
-            # 死信检查:retry_count >= 3 直接标记为 dead,不再尝试
+            # ── 动态限速：根据 pending jobs 数量自动调节延迟 ──
+            await dynamic_rate_limiter.acquire(get_pending_jobs_count)
+
+            # 死信检查:retry_count >= 3 标记为 dead
             if job.retry_count >= 3:
                 await mark_job_dead(job.job_id, f"重试次数已达上限({job.retry_count})")
                 logger.warning(f"[Dsp-{worker_id}] 死信标记: job={job.job_id}, code={job.code}, retry={job.retry_count}")
@@ -218,7 +249,7 @@ async def _dsp_worker(bot: Any, worker_id: int):
                     _send_semaphore.acquire(), timeout=10.0
                 )
             except asyncio.TimeoutError:
-                # 等超时,重新入队
+                # 等超时重新入队
                 await reenqueue_job(job.job_id)
                 logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时,重新入队 job={job.job_id}")
                 await asyncio.sleep(1)
@@ -227,25 +258,25 @@ async def _dsp_worker(bot: Any, worker_id: int):
             send_ok = False
             try:
                 if job.task_type == "batch":
-                    await _process_batch_job(bot, job)
+                    await _process_batch_job(bot, job, bot_id=worker_id)
                     send_ok = True
                 else:
-                    send_ok = await _process_single_job(bot, job)
+                    send_ok = await _process_single_job(bot, job, bot_id=worker_id)
             except Exception as e:
-                logger.error(f"[Dsp-{worker_id}] 发送异常 (retry={job.retry_count}): {e}")
+                logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
             finally:
                 _send_semaphore.release()
 
             # 发送失败处理:根据 retry_count 决定重试还是死信
             if not send_ok:
                 if job.retry_count >= 2:
-                    await mark_job_dead(job.job_id, f"发送失败(已重试{job.retry_count}次): {job.code}")
+                    await mark_job_dead(job.job_id, f"发送失败,已重试{job.retry_count}次: {job.code}")
                     logger.warning(f"[Dsp-{worker_id}] 死信: job={job.job_id}, code={job.code}, retry={job.retry_count}")
                 else:
                     await reenqueue_job(job.job_id)
                     logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{job.retry_count + 1}")
 
-                # Dsp 侧降级检测(Mon Bot 补充机制,兜底)
+                # Dsp 侧降级检查(Mon Bot 补充机制,兜底)
                 for ch_id in list(_channel_failures.keys()):
                     await _check_channel_degrade(ch_id)
 
@@ -255,9 +286,9 @@ async def _dsp_worker(bot: Any, worker_id: int):
 
 
 async def _send_file_direct(bot, job) -> bool:
-    """直接用 file_id 向用户发文件,不走 copy_message(避开频道限速)。
-
-    返回 True 表示成功,False 表示回退到 copy_message。
+    """直接用 file_id 向用户发文件,不走 copy_message(避开频道限速)
+    
+    返回 True 表示成功,False 表示回退到 copy_message
     """
     meta_raw = getattr(job, "batch_file_meta", None)
     if not meta_raw:
@@ -293,13 +324,13 @@ async def _send_file_direct(bot, job) -> bool:
             await safe_send_animation(bot, animation=fid, **kwargs)
         else:
             await safe_send_document(bot, document=fid, **kwargs)
-        logger.info(f"[Dsp] file_id 直发成功: 用户 {job.target_user_id}, 码 {job.code}")
+        logger.info(f"[Dsp] file_id 直发成功: 用户 {job.target_user_id}, �?{job.code}")
         return True
     except Exception:
         return False
 
 
-async def _process_single_job(bot, job):
+async def _process_single_job(bot, job, bot_id: int = 1):
     logger.info(
         f"[Dsp] 发送文件: 用户 {job.target_user_id}, "
         f"频道 {job.storage_channel_id}, 消息 {job.storage_msg_ids[0] if job.storage_msg_ids else '?'}"
@@ -312,45 +343,57 @@ async def _process_single_job(bot, job):
     # protect_content 已从 jobs 表直接获取,无需再查 file_records
     protect_content = getattr(job, "protect_content", False)
 
-    # ── 优先走 file_id 直发(避开 copy_message 的频道限速) ──
+    # ── 优先用 file_id 直发(避开 copy_message 的频道限速) ──
     if await _send_file_direct(bot, job):
         metrics.send_success_count += 1
-        metrics.record_processed("dsp_bot")
+        await metrics.record_processed("dsp_bot")
         return True
 
     # ── 直发失败,回退到 copy_message ──
     resolved = await resolve_delivery_channel(job.storage_channel_id)
-    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content)
+    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
 
     if not success:
         _record_channel_failure(resolved.channel_id)
-        # 环形降级:沿环找下一个可用频道
-        next_resolved = await resolve_delivery_channel(resolved.channel_id)
-        if next_resolved.channel_id != resolved.channel_id:
-            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content)
-            if not success:
-                _record_channel_failure(next_resolved.channel_id)
+        # 环形降级:沿环找下一个可用频道,避免重复尝试同一频道
+        tried = {resolved.channel_id}
+        current_id = resolved.channel_id
+        for _ in range(10):  # 最多尝试 10 个降级槽位(原 5 个不够)
+            next_resolved = await resolve_delivery_channel(current_id)
+            if next_resolved.channel_id in tried:
+                break
+            tried.add(next_resolved.channel_id)
+            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
+            if success:
+                break
+            _record_channel_failure(next_resolved.channel_id)
+            current_id = next_resolved.channel_id
 
     if success:
-        logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码 {job.code}")
+        logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
         metrics.send_success_count += 1
-        metrics.record_processed("dsp_bot")
+        await metrics.record_processed("dsp_bot")
         return True
 
-    logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码 {job.code}")
+    # 区分失败原因
+    if len(tried) > 1:
+        error_reason = f"文件发送失败,已尝试{len(tried)} 个频道,请稍后重试或联系管理员"
+    else:
+        error_reason = "文件发送失败,请稍后重试或联系管理员"
+    logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried)}")
     metrics.send_fail_count += 1
-    metrics.record_error("dsp_bot")
+    await metrics.record_error("dsp_bot")
     try:
-        await safe_send_message(bot, chat_id=job.target_user_id, text="文件发送失败,请稍后重试或联系管理员。")
+        await safe_send_message(bot, chat_id=job.target_user_id, text=error_reason)
     except Exception:
         pass
     return False
 
 
-async def _process_batch_job(bot, job):
+async def _process_batch_job(bot, job, bot_id: int = 1):
     logger.info(
         f"[Dsp] 批量发送: 用户 {job.target_user_id}, "
-        f"共 {len(job.storage_msg_ids)} 个文件, 码 {job.code}"
+        f"共{len(job.storage_msg_ids)} 个文件, 码:{job.code}"
     )
 
     file_meta_list = []
@@ -364,7 +407,7 @@ async def _process_batch_job(bot, job):
             pass
 
     if not file_meta_list:
-        await _fallback_single_send(bot, job)
+        await _fallback_single_send(bot, job, bot_id=bot_id)
         return
 
     total_pages = (len(file_meta_list) + PAGE_SIZE - 1) // PAGE_SIZE
@@ -376,6 +419,7 @@ async def _process_batch_job(bot, job):
             "total_pages": total_pages,
             "chat_id": job.target_user_id,
             "storage_channel_id": job.storage_channel_id,
+            "created_at": time.time(),
         }
 
     await _send_page(
@@ -385,18 +429,26 @@ async def _process_batch_job(bot, job):
     )
 
 
-async def _fallback_single_send(bot, job):
+async def _fallback_single_send(bot, job, bot_id: int = 1):
     protect_content = getattr(job, "protect_content", False)
     for i, mid in enumerate(job.storage_msg_ids):
-        resolved = await resolve_delivery_channel(job.storage_channel_id)
-        if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content):
-            metrics.send_success_count += 1
-        else:
-            metrics.send_fail_count += 1
-        # 每条消息之间间隔 0.15s,避免同频道/同用户超限
+        # 使用信号量控制并发,避免 Telegram API 限流
+        acquired = await asyncio.wait_for(_send_semaphore.acquire(), timeout=30)
+        if not acquired:
+            logger.warning(f"[Dsp] 信号量超时,跳过消息 {mid}")
+            continue
+        try:
+            resolved = await resolve_delivery_channel(job.storage_channel_id)
+            if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id):
+                metrics.send_success_count += 1
+            else:
+                metrics.send_fail_count += 1
+        finally:
+            _send_semaphore.release()
+        # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
         if i < len(job.storage_msg_ids) - 1:
             await asyncio.sleep(0.15)
-    metrics.record_processed("dsp_bot")
+    await metrics.record_processed("dsp_bot")
 
 
 async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None):
@@ -407,15 +459,15 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     input_media = [_build_input_media(meta) for meta in page_items]
     try:
         await safe_send_media_group(bot, chat_id=chat_id, media=input_media)
-        logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码 {file_code}, 第{page}/{total_pages}页, {len(input_media)}个")
+        logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(input_media)}张)")
         metrics.send_success_count += 1
-        metrics.record_processed("dsp_bot")
+        await metrics.record_processed("dsp_bot")
     except Exception as e:
         logger.error(f"[Dsp] 媒体组发送失败: {e}")
         metrics.send_fail_count += 1
-        metrics.record_error("dsp_bot")
+        await metrics.record_error("dsp_bot")
         try:
-            await safe_send_message(bot, chat_id=chat_id, text="文件发送失败,请稍后重试或联系管理员。")
+            await safe_send_message(bot, chat_id=chat_id, text="文件发送失败,请稍后重试或联系管理员")
         except Exception:
             pass
         return
@@ -425,13 +477,13 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         total_files = len(file_meta_list)
         sent_msg = await safe_send_message(
             bot, chat_id=chat_id,
-            text=f"第 {page}/{total_pages} 页(共 {total_files} 个文件)",
+            text=f"[{page}/{total_pages} 页] 共{total_files} 个文件",
             reply_markup=keyboard,
         )
         state = _pagination_states.get(file_code)
         if state and sent_msg:
             state["last_pagination_msg_id"] = sent_msg.message_id
-        # 翻页提示之间间隔 0.3s,避免用户聊天被消息淹没
+        # 翻页提示之间间隔 0.3s,避免用户聊天被消息淹�?
         await asyncio.sleep(0.3)
 
 
@@ -475,8 +527,14 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer()
         return
 
-    state = _pagination_states.get(file_code)
+    # 使用 pop 原子性地获取并移除,避免 TOCTOU 竞态
+    state = _pagination_states.pop(file_code, None)
     if not state:
+        await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
+        return
+
+    # 检�� TTL
+    if time.time() - state.get("created_at", 0) > _PAGE_STATE_TTL:
         await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
         return
 
@@ -484,7 +542,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     total_pages = state["total_pages"]
 
     if page < 1 or page > total_pages:
-        await query.answer("无效的页码。")
+        await query.answer("无效的页码�?)
         return
 
     old_msg_id = state.get("last_pagination_msg_id")
@@ -523,16 +581,18 @@ async def _async_main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(pagination_callback))
 
-    metrics.ping_bot("dsp_bot")
+    await metrics.ping_bot("dsp_bot")
 
     async def health_ping():
         while True:
-            metrics.ping_bot("dsp_bot")
+            await metrics.ping_bot("dsp_bot")
             await asyncio.sleep(30)
 
     loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(process_queue(bot), name="process-queue")
+    create_safe_task(_cleanup_page_states(), name="cleanup-page-states")
+    create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")
 
@@ -550,7 +610,7 @@ async def _async_main():
 
 
 def run():
-    """启动 Dsp Bot(使用 asyncio.run 标准模式)。"""
+    """启动 Dsp Bot(使用 asyncio.run 标准模式)�?""
     asyncio.run(_async_main())
 
 

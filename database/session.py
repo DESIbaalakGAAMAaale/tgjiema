@@ -2,6 +2,7 @@ try:
     import orjson as json
 except ImportError:
     import json
+import asyncio
 import time as _time
 import re
 from datetime import datetime
@@ -178,6 +179,17 @@ DDL_STATEMENTS = [
         config_value TEXT,
         updated_at TEXT
     )""",
+    # ─── 中继账号池（云端备份，与 SQLite relay_pool.db 双向同步）─────────────
+    """CREATE TABLE IF NOT EXISTS relay_accounts (
+        id           SERIAL PRIMARY KEY,
+        api_id       BIGINT NOT NULL,
+        api_hash     TEXT NOT NULL,
+        phone        TEXT NOT NULL UNIQUE,
+        is_active    INTEGER DEFAULT 1,
+        created_at   TEXT DEFAULT (datetime('now')),
+        last_login_at TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_relay_accounts_phone ON relay_accounts(phone)",
     # ─── 外部码映射表(采集器写入,idx_bot 查询�?─────────────────
     """CREATE TABLE IF NOT EXISTS external_code_mapping (
         external_code TEXT PRIMARY KEY,
@@ -937,10 +949,10 @@ def get_external_code_mapping_col() -> D1Collection:
     return _external_code_mapping_col
 
 
-# ─── 外部码映射内存缓存(启动加载�?0 分钟刷新�?─────────────────────
+# ─── 外部码映射内存缓存(启动加载,60 秒刷新)─────────────────────
 _external_code_mapping_cache: dict[str, str] = {}
 _external_code_mapping_cache_ts = 0
-_EXTERNAL_CODE_MAPPING_TTL = 600  # 10 分钟
+_EXTERNAL_CODE_MAPPING_TTL = 60  # 60 秒(缩短以快速响应管理员修改)
 
 
 async def _refresh_external_code_mapping_cache():
@@ -1344,23 +1356,30 @@ async def enqueue_job(
 
 
 async def dequeue_jobs(batch_size: int = 10) -> list:
-    """�?jobs 表批量取出待派工任务(原子操作:CTE + UPDATE ... RETURNING *,一�?DB 往返)�?    
+    """从 jobs 表批量取出待派工任务(原子操作:CTE + UPDATE ... RETURNING *,一次 DB 往返)。
+    
+    注意: 查询带 asyncio.wait_for 超时保护(5s),防止数据库异常时永久阻塞。
     Args:
-        batch_size: 一次取出的最大任务数,默�?10�?    
+        batch_size: 一次取出的最大任务数,默认 10
     Returns:
-        JobResult 列表,可能为空列表�?    """
+        JobResult 列表,可能为空列表
+    """
     col = get_jobs_col()
-    rows = await col._query("""
-        WITH next AS (
-            SELECT id FROM jobs
-            WHERE status = 'pending'
-            ORDER BY created_at
-            LIMIT $1
-        )
-        UPDATE jobs SET status = 'dispatched'
-        WHERE id IN (SELECT id FROM next)
-        RETURNING *
-    """, [batch_size])
+    try:
+        rows = await asyncio.wait_for(col._query("""
+            WITH next AS (
+                SELECT id FROM jobs
+                WHERE status = 'pending'
+                ORDER BY created_at
+                LIMIT $1
+            )
+            UPDATE jobs SET status = 'dispatched'
+            WHERE id IN (SELECT id FROM next)
+            RETURNING *
+        """, [batch_size]), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.error("[DB] dequeue_jobs 查询超时(>5s),跳过本次")
+        return []
     if not rows:
         return []
     try:
@@ -1391,20 +1410,45 @@ async def dequeue_jobs(batch_size: int = 10) -> list:
 
 
 async def dequeue_job():
-    """�?jobs 表取出一个待派工任务(保持向后兼容,内部调用 dequeue_jobs(1))�?""
+    """从 jobs 表取出一个待派工任务(保持向后兼容,内部调用 dequeue_jobs(1))"""
     results = await dequeue_jobs(1)
     return results[0] if results else None
 
 
-async def reenqueue_job(job_id: int) -> bool:
-    """将一�?dispatched �?job 重新标记�?pending(用�?semaphore 等待超时)�?""
+async def get_pending_jobs_count() -> int:
+    """获取 pending 状态的 jobs 数量（用于动态限速）。"""
     col = get_jobs_col()
-    result = await col._query("""
-        UPDATE jobs SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1
-        WHERE id = $1 AND status = 'dispatched'
-        RETURNING id
-    """, [job_id])
-    return len(result) > 0
+    rows = await col._query(
+        "SELECT COUNT(*) as cnt FROM jobs WHERE status = 'pending'",
+    )
+    if rows:
+        return int(rows[0].get("cnt", 0))
+    return 0
+
+
+async def reenqueue_job(job_id: int, max_retries: int = 3) -> bool:
+    """将一条 dispatched 的 job 重新标记为 pending(用于 semaphore 等待超时)。
+    
+    Args:
+        job_id: 任务 ID
+        max_retries: 数据库操作最大重试次数
+    Returns:
+        True 表示成功
+    """
+    col = get_jobs_col()
+    for attempt in range(max_retries):
+        try:
+            result = await col._query("""
+                UPDATE jobs SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1
+                WHERE id = $1 AND status = 'dispatched'
+                RETURNING id
+            """, [job_id])
+            return len(result) > 0
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"[DB] reenqueue_job 重试{max_retries}次后失败 job_id={job_id}: {e}")
+                return False
+            await asyncio.sleep(0.5 * (attempt + 1))
 
 
 class JobResult:
@@ -1431,18 +1475,78 @@ class JobResult:
         self.retry_count = retry_count
 
 
-async def mark_job_dead(job_id: int, reason: str):
-    """将反复失败的 job 标记为死信(status='dead'),不再重试�?""
+async def mark_job_dead(job_id: int, reason: str, max_retries: int = 3):
+    """将反复失败的 job 标记为死信(status='dead'),不再重试。
+    
+    Args:
+        job_id: 任务 ID
+        reason: 死信原因
+        max_retries: 数据库操作最大重试次数
+    """
     import datetime as _dt
     col = get_jobs_col()
-    await col.update_one(
-        {"id": job_id},
-        {"$set": {
-            "status": "dead",
-            "dead_reason": reason,
-            "dispatched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+    for attempt in range(max_retries):
+        try:
+            await col.update_one(
+                {"id": job_id},
+                {"$set": {
+                    "status": "dead",
+                    "dead_reason": reason,
+                    "dispatched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                }},
+            )
+            return
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"[DB] mark_job_dead 重试{max_retries}次后失败 job_id={job_id}: {e}")
+            else:
+                await asyncio.sleep(0.5 * (attempt + 1))
+
+
+async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
+    """获取死信队列中的 job 并重置为 pending,供 DSP 重试。
+    
+    限制: 每个 job 最多重试 2 次死信队列,超过后永久丢弃。
+    """
+    col = get_jobs_col()
+    # 查找死信 job,且死信重试次数 < 2
+    pipeline = [
+        {"$match": {
+            "status": "dead", 
+            "dead_retry": {"$ne": True},
+            "$or": [{"dead_retry_count": {"$lt": 2}}, {"dead_retry_count": {"$exists": False}}],
         }},
-    )
+        {"$limit": max_count},
+        {"$project": {"_id": 1}},
+    ]
+    dead_jobs = []
+    async for doc in col.aggregate(pipeline):
+        dead_jobs.append(doc["_id"])
+
+    if not dead_jobs:
+        return []
+
+    # 重置这些 job,并递增死信重试次数
+    updated = 0
+    for job_id in dead_jobs:
+        result = await col.update_one(
+            {"id": job_id},
+            {"$set": {
+                "status": "pending",
+                "retry_count": 0,
+                "dead_retry": True,
+                "dead_retry_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            },
+            "$inc": {"dead_retry_count": 1}},
+        )
+        if result.modified_count > 0:
+            updated += 1
+
+    # 返回重置的 job IDs
+    jobs = []
+    for job_id in dead_jobs[:updated]:
+        jobs.append(job_id)
+    return jobs
 
 
 async def set_code_expiry(code: str, expires_at: str):
@@ -1474,6 +1578,56 @@ async def log_rotate(
         "reason": reason,
         "triggered_by": triggered_by,
     })
+
+
+# ─── 中继账号池 CRDB 备份 ──────────────────────────────────────
+
+async def get_relay_accounts_from_crdb() -> list[dict]:
+    """从 CRDB 拉取中继账号列表（用于 VPS 重启恢复）"""
+    try:
+        rows = await _query_raw(
+            "SELECT id, api_id, api_hash, phone, is_active, created_at, last_login_at "
+            "FROM relay_accounts WHERE is_active = 1 ORDER BY id"
+        )
+        return [
+            {
+                "id": r["id"],
+                "api_id": r["api_id"],
+                "api_hash": r["api_hash"],
+                "phone": r["phone"],
+                "is_active": bool(r["is_active"]),
+                "created_at": r.get("created_at"),
+                "last_login_at": r.get("last_login_at"),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning(f"[RelayDB/CRDB] 拉取中继账号失败: {e}")
+        return []
+
+
+async def sync_relay_to_crdb(api_id: int, api_hash: str, phone: str):
+    """同步中继账号到 CRDB（幂等操作，phone 有 UNIQUE 约束）"""
+    try:
+        await _client.execute(
+            """INSERT INTO relay_accounts (api_id, api_hash, phone, is_active)
+               VALUES ($1, $2, $3, 1)
+               ON CONFLICT(phone) DO UPDATE SET
+                   api_id = EXCLUDED.api_id,
+                   api_hash = EXCLUDED.api_hash,
+                   is_active = 1
+            """,
+            [api_id, api_hash, phone],
+        )
+    except Exception as e:
+        logger.warning(f"[RelayDB/CRDB] 同步中继账号失败 (phone={phone}): {e}")
+
+
+async def _query_raw(sql: str, params: list = None) -> list[dict]:
+    """执行原始 SQL 查询，返回 dict 列表"""
+    async with _client._pool.acquire() as conn:
+        records = await conn.fetch(sql, *(params or []))
+        return [_row_to_dict(r) for r in records]
 
 
 # ─── 清理函数已移�?──────────────────────────────────────────────

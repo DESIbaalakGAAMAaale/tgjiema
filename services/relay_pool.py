@@ -83,18 +83,29 @@ class RelayPool:
         - avg_wait_ms (40%): 平均解码耗时，越小越好
         - today_requests (40%): 今日请求数，越少越好
         - last_request_gap (20%): 距上次请求的时间差，越大越好（冷却优先）
+        
+        权重和归一化因子可从 settings 配置项覆盖。
         """
         if not self.instances:
             return None
+        from config import settings
+        # 权重配置（可覆盖）
+        w_avg = getattr(settings, 'RELAY_WEIGHT_AVG_WAIT', 0.4)
+        w_today = getattr(settings, 'RELAY_WEIGHT_TODAY_REQ', 0.4)
+        w_gap = getattr(settings, 'RELAY_WEIGHT_GAP', 0.2)
+        # 归一化因子（可覆盖）
+        norm_avg_wait = getattr(settings, 'RELAY_NORM_AVG_WAIT', 1000.0)
+        norm_today_req = getattr(settings, 'RELAY_NORM_TODAY_REQ', 50000.0)
+        norm_gap = getattr(settings, 'RELAY_NORM_GAP', 3600.0)
+        
         db = await get_relay_db()
         async with self._lock:
             instances_snapshot = list(self.instances)
         scores = []
         for instance in instances_snapshot:
             usage = await db.get_usage(instance.account_id)
-            # avg_wait_ms 越小越好 -> 用倒数
+            # avg_wait_ms 越小越好 -> 归一化后取倒数
             avg_wait = max(usage["avg_wait_ms"], 1)
-            # today_requests 越少越好
             today_req = max(usage["today_requests"], 1)
             # last_request_gap 越大越好 -> 用倒数
             last_req = usage["last_request_at"]
@@ -106,8 +117,13 @@ class RelayPool:
                 except (ValueError, TypeError):
                     gap_seconds = 1
             else:
-                gap_seconds = 3600  # 从未请求过，给最高冷却分
-            score = (avg_wait * 0.4) + (today_req * 0.4) + (3600 / max(gap_seconds, 1) * 0.4)
+                gap_seconds = norm_gap * 2  # 从未请求过，给最高冷却分
+            # 加权评分：越低越好
+            score = (
+                (avg_wait / norm_avg_wait) * w_avg +
+                (today_req / norm_today_req) * w_today +
+                (norm_gap / max(gap_seconds, 1)) * w_gap
+            )
             scores.append((score, instance))
         # 按 score 升序排列，选最低的
         scores.sort(key=lambda x: x[0])

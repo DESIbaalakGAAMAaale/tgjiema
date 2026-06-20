@@ -1,6 +1,8 @@
 import json
 from typing import List, Optional
 
+from loguru import logger
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -70,8 +72,16 @@ class Settings(BaseSettings):
     CHANNEL_FAILURE_THRESHOLD: int = 3   # 60 秒内失败 N 次触发降级
     CHANNEL_FAILURE_WINDOW: int = 60     # 统计窗口（秒）
 
+    # ─── Relay Pool 负载均衡权重配置 ──────────────────────────
+    RELAY_WEIGHT_AVG_WAIT: float = 0.4   # avg_wait_ms 权重
+    RELAY_WEIGHT_TODAY_REQ: float = 0.4  # today_requests 权重
+    RELAY_WEIGHT_GAP: float = 0.2        # last_request_gap 权重
+    RELAY_NORM_AVG_WAIT: float = 1000.0  # avg_wait_ms 归一化因子
+    RELAY_NORM_TODAY_REQ: float = 50000.0  # today_requests 归一化因子
+    RELAY_NORM_GAP: float = 3600.0       # gap 归一化因子
+
     # ─── 配额同步间隔 ──────────────────────────────────────────
-    QUOTA_SYNC_INTERVAL: int = 60        # 秒
+    QUOTA_SYNC_INTERVAL: int = 300       # 秒(5分钟),减少 CRDB RU 消耗
 
     # ─── 进程管理 ──────────────────────────────────────────────
     RESTART_COOLDOWN: int = 600          # 子进程崩溃冷却期（秒）
@@ -106,9 +116,52 @@ class Settings(BaseSettings):
     MAX_RESTART_COUNT: int = 3                  # 5分钟内最大重启次数
     MAX_RESTART_WINDOW: int = 300               # 重启计数窗口（秒）
 
+    # ── 动态限速参数 ──
+    RATE_LIMIT_BASE_DELAY: float = 0.2          # 空闲时基础延迟（秒）
+    RATE_LIMIT_MAX_DELAY: float = 3.0           # 高峰期最大延迟（秒）
+    RATE_LIMIT_THRESHOLD_LOW: int = 10          # 低负载阈值（jobs 数量 < 此值用基础延迟）
+    RATE_LIMIT_THRESHOLD_HIGH: int = 30         # 高负载阈值（jobs 数量 > 此值用最大延迟）
+
+    # ─── 管理员 Bot 配置键名映射 ──────────────────────────
+    @property
+    def db_backup_interval(self) -> int:
+        return self.DB_BACKUP_INTERVAL_MINUTES
+
+    @db_backup_interval.setter
+    def db_backup_interval(self, value: int):
+        self.DB_BACKUP_INTERVAL_MINUTES = int(value)
+
+    @property
+    def db_backup_enabled(self) -> bool:
+        return self.DB_BACKUP_ENABLED
+
+    @db_backup_enabled.setter
+    def db_backup_enabled(self, value):
+        if isinstance(value, str):
+            value = value.lower() == "true"
+        self.DB_BACKUP_ENABLED = bool(value)
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    @model_validator(mode='after')
+    def validate_required_fields(self):
+        """验证必填字段,在启动时尽早发现问题。"""
+        missing = []
+        if not self.UPLOAD_BOT_TOKEN:
+            missing.append('UPLOAD_BOT_TOKEN')
+        if not self.DECODER_BOT_TOKEN:
+            missing.append('DECODER_BOT_TOKEN')
+        if not self.SENDER_BOT_TOKEN:
+            missing.append('SENDER_BOT_TOKEN')
+        if not self.MON_BOT_TOKEN:
+            missing.append('MON_BOT_TOKEN')
+        if not self.COCKROACHDB_URL:
+            missing.append('COCKROACHDB_URL')
+        if missing:
+            logger.warning(f"[Settings] 以下环境变量未配置: {', '.join(missing)}")
+        return self
 
     @property
     def STORAGE_CHANNEL_ID(self) -> int:
@@ -135,7 +188,7 @@ class Settings(BaseSettings):
                     try:
                         channels.append(int(ch))
                     except ValueError:
-                        pass
+                        logger.warning(f"[Settings] 无效的频道ID(已跳过): '{ch}'")
             if channels:
                 accounts.append({"name": name, "channels": channels})
 

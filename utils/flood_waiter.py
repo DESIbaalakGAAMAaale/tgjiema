@@ -14,6 +14,7 @@ from telegram.error import RetryAfter, TimedOut, NetworkError
 _backoff_until: dict[int, float] = {}
 _consecutive_floods: dict[int, int] = {}
 MAX_BACKOFF = 120  # 最大退避时间（秒）
+MAX_CONSECUTIVE_FLOODS = 10  # 连续触发上限,防止异常累加
 
 
 def reset_backoff(bot_id: int = 0):
@@ -48,14 +49,13 @@ async def api_call_with_backoff(coro_factory, description: str = "", bot_id: int
         try:
             coro = coro_factory()
             result = await coro
-            # 成功后重置该账号退避
-            if attempt > 0:
-                reset_backoff(bot_id)
+            # 成功后重置该账号退避(无论是否重试过)
+            reset_backoff(bot_id)
             return result
 
         except RetryAfter as e:
             wait = e.retry_after
-            floods = _consecutive_floods.get(bot_id, 0) + 1
+            floods = min(_consecutive_floods.get(bot_id, 0) + 1, MAX_CONSECUTIVE_FLOODS)
             _consecutive_floods[bot_id] = floods
             # 指数退避 + consecutive_floods 叠加 + Jitter 抖动
             extra = min(floods * 5, MAX_BACKOFF)

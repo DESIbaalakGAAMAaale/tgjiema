@@ -11,7 +11,7 @@ from database import (
     get_relay_config, set_relay_config,
     get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
     get_all_bot_decode_intervals, set_bot_decode_interval, delete_bot_decode_interval,
-    add_spare_channel, remove_spare_channel, list_spare_pool,
+    add_spare_channel, remove_spare, list_spare_pool,
     get_rotation_config, set_rotation_config,
     get_user_cached, update_user_and_invalidate,
 )
@@ -329,6 +329,12 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result.matched_count == 0:
         await update.message.reply_text(f"❌ 文件码 {file_code} 不存在")
         return
+    # 失效缓存
+    try:
+        from database.cache import invalidate_file_record
+        invalidate_file_record(file_code)
+    except Exception:
+        pass
     await update.message.reply_text(f"✅ 文件 {file_code} 已删除")
 
 
@@ -704,24 +710,34 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await client.connect()
 
     cleared = []
+    errors = []
     for table in _FACTORY_RESET_TABLES:
         try:
             sql = f"DELETE FROM {table}"
             await client.execute(sql)
             cleared.append(table)
         except Exception as e:
-            logger.warning(f"[factory_reset] 清空 {table} 失败: {e}")
+            errors.append(f"{table}: {e}")
+            logger.error(f"[factory_reset] 清空 {table} 失败: {e}")
 
     await client.close()
 
-    await msg.edit_text(
-        "✅ 工厂重置完成!\n\n"
-        f"已清空 {len(cleared)} 张表:{', '.join(cleared)}\n\n"
-        "⚠️ 存储频道的消息不会被自动删除。\n"
-        "如需清空存储频道,请手动执行:\n"
-        "  /purge_channel <频道ID>\n\n"
-        "🔄 请重启所有机器人以使配置生效。"
-    )
+    if errors:
+        await msg.edit_text(
+            "⚠️ 工厂重置部分完成!\n\n"
+            f"已清空 {len(cleared)} 张表: {', '.join(cleared)}\n\n"
+            "以下表清空失败:\n" + "\n".join(f"  • {e}" for e in errors) + "\n\n"
+            "请检查数据库状态后重试。"
+        )
+    else:
+        await msg.edit_text(
+            "✅ 工厂重置完成!\n\n"
+            f"已清空 {len(cleared)} 张表:{', '.join(cleared)}\n\n"
+            "⚠️ 存储频道的消息不会被自动删除。\n"
+            "如需清空存储频道,请手动执行:\n"
+            "  /purge_channel <频道ID>\n\n"
+            "🔄 请重启所有机器人以使配置生效。"
+        )
 
 
 @_auth_required
@@ -764,6 +780,18 @@ async def add_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     prefix = args[0].strip().lower()
     bot_username = args[1].strip().lower().lstrip("@")
+    # 输入验证: 前缀只能包含字母数字和下划线,长度 1-50
+    if not prefix or len(prefix) > 50 or not all(c.isalnum() or c == '_' for c in prefix):
+        await update.message.reply_text(
+            "❌ 前缀格式无效:只能包含字母、数字和下划线,长度 1-50 字符。"
+        )
+        return
+    # bot_username 只能包含字母、数字、下划线和 bot 后缀
+    if not bot_username or len(bot_username) > 32 or not all(c.isalnum() or c == '_' for c in bot_username):
+        await update.message.reply_text(
+            "❌ 机器人用户名格式无效:只能包含字母、数字和下划线,长度 1-32 字符。"
+        )
+        return
     await set_code_bot_route(prefix, bot_username)
     await update.message.reply_text(
         f"✅ 文件码路由已设置\n"

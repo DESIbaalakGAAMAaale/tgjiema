@@ -44,7 +44,7 @@ class QueryCache:
 
 
 _user_cache = QueryCache(max_size=1000, ttl_seconds=10800)           # 1000条/3小时
-_file_record_cache = QueryCache(max_size=1000, ttl_seconds=604800)  # 1000条/7天(解码热门)
+_file_record_cache = QueryCache(max_size=1000, ttl_seconds=300)  # 1000条/5分钟(缩短以快速响应状态变更)
 _config_cache = QueryCache(max_size=100, ttl_seconds=600)            # 10分钟
 
 
@@ -54,6 +54,11 @@ def get_user_cache() -> QueryCache:
 
 def get_file_record_cache() -> QueryCache:
     return _file_record_cache
+
+
+def invalidate_file_record(file_code: str):
+    """失效指定文件码的缓存,用于文件状态变更时立即生效。"""
+    _file_record_cache.invalidate(f"file_record:{file_code}")
 
 
 def get_config_cache() -> QueryCache:
@@ -73,7 +78,7 @@ def get_code_cache() -> QueryCache:
 
 _request_count_buffer: dict[str, int] = {}
 _request_count_lock = asyncio.Lock()
-_REQUEST_COUNT_FLUSH_INTERVAL = 60  # 每 60 秒 flush 一次
+_REQUEST_COUNT_FLUSH_INTERVAL = 300  # 每 300 秒 flush 一次(5分钟),减少 CRDB RU 消耗
 
 
 async def incr_request_count(file_code: str):
@@ -93,10 +98,10 @@ async def _flush_request_count_loop():
             async with _request_count_lock:
                 if not _request_count_buffer:
                     continue
-                batch = _request_count_buffer.copy()
+                batch = dict(_request_count_buffer)
+                _request_count_buffer.clear()
             for code, count in batch.items():
                 await _update(code, {"$inc": {"request_count": count}})
-            _request_count_buffer.clear()
             logger.debug(f"[request_count] flushed {len(batch)} codes, {sum(batch.values())} counts")
         except Exception as e:
             logger.error(f"[request_count] flush failed: {e}")
@@ -125,14 +130,23 @@ async def dump_cache_to_disk():
 
 
 async def dump_cache_to_disk_loop():
-    """后台任务:每 60 秒定期 dump 内存缓存到 SQLite"""
+    """后台任务:每 60 秒定期 dump 内存缓存到 SQLite,并清理过期通知"""
     import asyncio as _asyncio
     from loguru import logger
+    from .cache_store import get_cache_store
 
+    cleanup_counter = 0
     while True:
         await _asyncio.sleep(60)
         try:
             await dump_cache_to_disk()
+            # 每 10 分钟清理一次通知表
+            cleanup_counter += 1
+            if cleanup_counter >= 10:
+                cleanup_counter = 0
+                store = get_cache_store()
+                await store.cleanup_notify_tables()
+                logger.debug("[cache_store] 已清理过期通知表记录")
         except Exception as e:
             logger.debug(f"[cache_store] 定期 dump 失败: {e}")
 
