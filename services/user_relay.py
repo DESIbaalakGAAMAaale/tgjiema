@@ -388,8 +388,17 @@ class UserRelay:
             expired = [k for k, v in list(self._bot_exchange.items()) if v.get("_expires", 0) < now_ts]
             for k in expired:
                 old = self._bot_exchange.pop(k, None)
-                if old and old.get("_settle_task") and not old["_settle_task"].done():
-                    old["_settle_task"].cancel()
+                if old:
+                    self._cleanup_code_dicts(old.get("code", ""))
+                    if old.get("_settle_task") and not old["_settle_task"].done():
+                        old["_settle_task"].cancel()
+            # 清理过期的 media_buffers
+            stale_buffers = [
+                mgid for mgid, buf in list(self._media_buffers.items())
+                if buf.get("_expires", 0) < now_ts
+            ]
+            for mgid in stale_buffers:
+                self._media_buffers.pop(mgid, None)
 
             sender = await event.get_sender()
 
@@ -949,6 +958,8 @@ class UserRelay:
 
         user_id = exchange.get("user_id")
         code = exchange.get("code")
+        # 清理对应的缓存字典，防止无限增长
+        self._cleanup_code_dicts(code)
         all_events = exchange.get("events", [])
 
         logger.info(
@@ -1080,13 +1091,19 @@ class UserRelay:
         exchange = self._bot_exchange.pop(bot_username, None)
         if exchange:
             code = exchange.get("code", "")
-            if code:
-                self._pending_cache_counts.pop(code, None)
-                self._pending_cache_events.pop(code, None)
+            self._cleanup_code_dicts(code)
             if exchange.get("_settle_task") and not exchange["_settle_task"].done():
                 exchange["_settle_task"].cancel()
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)
+
+    def _cleanup_code_dicts(self, code: str):
+        """清理与指定 code 关联的所有缓存字典条目，防止内存泄漏。"""
+        if code:
+            self._pending_cache_counts.pop(code, None)
+            self._pending_cache_events.pop(code, None)
+            self._cache_locks.pop(code, None)
+            self._event_locks.pop(code, None)
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         if not self._client:
