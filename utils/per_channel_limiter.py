@@ -6,6 +6,7 @@ Telegram 对同一频道的操作限制约为 20 msg/min，留 5 个余量，
 import time
 import asyncio
 from collections import defaultdict
+from loguru import logger
 
 
 class PerChannelRateLimiter:
@@ -35,6 +36,23 @@ class PerChannelRateLimiter:
             # 记录本次操作
             self._channels[channel_id].append(now)
             return 0.0
+
+    async def cleanup_stale(self):
+        """清理超过 5 分钟未访问的频道条目,防止内存泄漏。"""
+        now = time.monotonic()
+        async with self._lock:
+            stale = []
+            for ch_id, timestamps in list(self._channels.items()):
+                # 保留最近 5 分钟内有请求的频道
+                active = [t for t in timestamps if now - t < 300.0]
+                if active:
+                    self._channels[ch_id] = active
+                else:
+                    stale.append(ch_id)
+            for ch_id in stale:
+                del self._channels[ch_id]
+            if stale:
+                logger.debug(f"[PerChannelLimiter] 清理 {len(stale)} 个过期频道条目")
 
 
 _channel_limiter = PerChannelRateLimiter(max_per_minute=15)

@@ -61,8 +61,8 @@ async def _cleanup_pending():
                 if buf and buf.get("timer"):
                     buf["timer"].cancel()
                 logger.warning(f"[up_bot] 清理超时 external buffer: {k}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[up_bot] 清理超时缓冲区异常: {e}")
         await asyncio.sleep(60)
 
 

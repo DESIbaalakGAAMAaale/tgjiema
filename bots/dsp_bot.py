@@ -20,6 +20,7 @@ from loguru import logger
 from config import settings
 from database import dequeue_jobs, get_file_records_col, reenqueue_job, mark_job_dead, set_cell_status, get_active_or_shadow_cell, get_pending_jobs_count
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
+from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
 from utils.force_join import check_force_join, three_bot_reminder
@@ -62,9 +63,37 @@ async def _cleanup_page_states():
             expired = [k for k, v in _pagination_states.items() if now - v.get("created_at", 0) > _PAGE_STATE_TTL]
             for k in expired:
                 _pagination_states.pop(k, None)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"[Dsp] 清理分页状态异常: {e}")
         await asyncio.sleep(60)
+
+
+async def _cleanup_channel_failures():
+    """定期清理超过 10 分钟未访问的频道失败记录,防止内存泄漏"""
+    while True:
+        try:
+            now = time.time()
+            stale = [
+                ch_id for ch_id, timestamps in _channel_failures.items()
+                if not timestamps or now - max(timestamps) > 600
+            ]
+            for ch_id in stale:
+                _channel_failures.pop(ch_id, None)
+            if stale:
+                logger.debug(f"[Dsp] 清理频道失败记录: {len(stale)} 个")
+        except Exception as e:
+            logger.error(f"[Dsp] 清理频道失败记录异常: {e}")
+        await asyncio.sleep(300)
+
+
+async def _cleanup_channel_limiter_loop():
+    """定期清理按频道限流器中超过 5 分钟未访问的条目"""
+    while True:
+        try:
+            await _channel_limiter.cleanup_stale()
+        except Exception as e:
+            logger.error(f"[Dsp] 清理频道限流器异常: {e}")
+        await asyncio.sleep(300)
 
 
 async def _retry_dead_jobs():
@@ -604,6 +633,8 @@ async def _async_main():
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(process_queue(bot), name="process-queue")
     create_safe_task(_cleanup_page_states(), name="cleanup-page-states")
+    create_safe_task(_cleanup_channel_failures(), name="cleanup-channel-failures")
+    create_safe_task(_cleanup_channel_limiter_loop(), name="cleanup-channel-limiter")
     create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")

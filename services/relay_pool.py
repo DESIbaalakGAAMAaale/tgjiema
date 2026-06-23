@@ -104,10 +104,8 @@ class RelayPool:
         norm_gap = getattr(settings, 'RELAY_NORM_GAP', 3600.0)
         
         db = await get_relay_db()
-        async with self._lock:
-            instances_snapshot = list(self.instances)
         scores = []
-        for instance in instances_snapshot:
+        for instance in ready_instances:
             usage = await db.get_usage(instance.account_id)
             # avg_wait_ms 越小越好 -> 归一化后取倒数
             avg_wait = max(usage["avg_wait_ms"], 1)
