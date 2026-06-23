@@ -269,6 +269,8 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
     grp = _pending_media_groups.pop(mgid, None)
     if grp is None:
         return
+    if not grp.get("updates"):
+        return
     file_types = grp["file_types"]
     for k, v in file_types.items():
         batch["file_types"][k] += v
@@ -396,8 +398,9 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     try:
         pending_col = get_pending_uploads_col()
-        # 优先使用已写�?MongoDB 的选项(�?upload_option_callback 更新)
-        latest = await pending_col.find_one({"uploader_id": user_id, "processed": 0}, sort=[("_id", -1)])
+        # 优先使用已写入的选项(由 upload_option_callback 更新)
+        results = await pending_col.find({"uploader_id": user_id, "processed": 0}, sort=("id", -1), limit=1)
+        latest = results[0] if results else None
         if latest and "id" in latest:
             # 使用 MongoDB 中的�?
             protect = latest.get("protect_content", settings.DEFAULT_PROTECT_CONTENT)
@@ -518,8 +521,9 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
     # 直接更新 MongoDB 中的 pending_uploads 记录
     try:
         pending_col = get_pending_uploads_col()
-        # 查找该用户最近一条未处理的上传记�?
-        latest = await pending_col.find_one({"uploader_id": user_id, "processed": 0}, sort=[("_id", -1)])
+        # 查找该用户最近一条未处理的上传记录
+        results = await pending_col.find({"uploader_id": user_id, "processed": 0}, sort=("id", -1), limit=1)
+        latest = results[0] if results else None
         if latest and "id" in latest:
             update_fields = {}
             if key == "protect_content":
@@ -603,6 +607,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
             "files_meta": [],
             "file_types": defaultdict(int),
             "flushed": False,
+            "created_at": time.time(),
         }
 
     buf = _external_buffers[external_code]

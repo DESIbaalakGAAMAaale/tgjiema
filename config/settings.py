@@ -16,7 +16,6 @@ class Settings(BaseSettings):
     ADMIN_TELEGRAM_ID: int = 0
 
     MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
-    DECODER_BOT_CHAT_ID: int = 0
     MON_CHECK_INTERVAL: int = 60
 
     # ── 轮转参数（可在 .env 或管理员 Bot 运行时覆盖） ──
@@ -41,8 +40,8 @@ class Settings(BaseSettings):
 
     COCKROACHDB_URL: str = ""
 
-    FORCE_JOIN_CHANNEL_ID: int = 0
-    FORCE_JOIN_CHANNEL_LINK: str = ""
+    FORCE_JOIN_CHANNEL_ID: int = 0         # 强制关注频道ID（admin_bot 可热更新）
+    FORCE_JOIN_CHANNEL_LINK: str = ""      # 强制关注频道链接
 
     UPLOAD_BOT_USERNAME: str = ""
     DECODER_BOT_USERNAME: str = ""
@@ -72,7 +71,7 @@ class Settings(BaseSettings):
     CHANNEL_FAILURE_THRESHOLD: int = 3   # 60 秒内失败 N 次触发降级
     CHANNEL_FAILURE_WINDOW: int = 60     # 统计窗口（秒）
 
-    # ─── Relay Pool 负载均衡权重配置 ──────────────────────────
+    # ─── Relay Pool 负载均衡权重配置（relay_pool.py 动态读取） ──
     RELAY_WEIGHT_AVG_WAIT: float = 0.4   # avg_wait_ms 权重
     RELAY_WEIGHT_TODAY_REQ: float = 0.4  # today_requests 权重
     RELAY_WEIGHT_GAP: float = 0.2        # last_request_gap 权重
@@ -112,7 +111,6 @@ class Settings(BaseSettings):
     SEND_CONCURRENCY: int = 25                  # Dsp 发送并发上限
     PAGE_SIZE: int = 10                         # 分页大小
     EXTERNAL_MEDIA_GROUP_TTL: int = 300         # 外部媒体组 TTL（秒）
-    CACHE_STORE_CLEANUP_DAYS: int = 30          # 本地缓存清理天数
     MAX_RESTART_COUNT: int = 3                  # 5分钟内最大重启次数
     MAX_RESTART_WINDOW: int = 300               # 重启计数窗口（秒）
 
@@ -203,10 +201,7 @@ class Settings(BaseSettings):
     def get_config_default(key: str) -> str:
         defaults = {
             "storage_channel_id": "-1000000000000",
-            "decoder_chat_id": "0",
             "file_code_prefix": "tgwenjian",
-            "force_join_channel_id": "0",
-            "force_join_link": "",
             "upload_bot_username": "",
             "decoder_bot_username": "",
             "sender_bot_username": "",

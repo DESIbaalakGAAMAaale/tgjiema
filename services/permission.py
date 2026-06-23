@@ -54,6 +54,7 @@ def check_code_expired(file_record: dict) -> tuple[bool, str]:
 # 每个 Idx Bot 进程用不同计数器,PID 作为命名空间
 _PID = os.getpid()
 _local_quota_counts: dict[int, int] = {}
+_local_external_quota_counts: dict[int, int] = {}
 
 
 def _increment_local_quota(user_id: int):
@@ -61,9 +62,25 @@ def _increment_local_quota(user_id: int):
     _local_quota_counts[user_id] = _local_quota_counts.get(user_id, 0) + 1
 
 
+def _increment_local_external_quota(user_id: int):
+    """本地累加外部码配额计数"""
+    _local_external_quota_counts[user_id] = _local_external_quota_counts.get(user_id, 0) + 1
+
+
 def _get_local_quota_counts() -> dict[int, int]:
     """导出计数器供 idx_bot 同步到 CRDB"""
     return dict(_local_quota_counts)
+
+
+def _get_local_external_quota_counts() -> dict[int, int]:
+    """导出外部码计数器供 idx_bot 同步到 CRDB"""
+    return dict(_local_external_quota_counts)
+
+
+def _clear_local_quota_counts():
+    """同步完成后清空本地计数器"""
+    _local_quota_counts.clear()
+    _local_external_quota_counts.clear()
 
 
 @dataclass
@@ -238,6 +255,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
 
     if not is_system_code(file_code):
         _increment_local_quota(user_id)  # 外部码:quota + external 合并为一次计数
+        _increment_local_external_quota(user_id)  # 外部码配额单独追踪
         remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
         remaining_ext = -1
         ext_q = user.get("external_decode_quota", 0)

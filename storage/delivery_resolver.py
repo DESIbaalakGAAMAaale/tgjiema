@@ -82,16 +82,12 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
 
 async def _walk_ring_for_channel(channel_id: int, max_hops: int = 45) -> DeliveryChannel:
     """环形遍历,找到第一个可用的频道。使用 cells 全量数据在内存中遍历环形链表。"""
-    # 尝试从 Mon Bot 缓存获取(避免全表扫描)
+    # 尝试从 delivery_resolver 自身缓存获取(避免全表扫描)
     all_cells = None
-    try:
-        from bots.mon_bot import MonBot
-        # 如果 Mon Bot 正在运行,尝试获取其缓存
-        mon = MonBot._instance
-        if mon and mon._cells_cache:
-            all_cells = list(mon._cells_cache)
-    except (ImportError, AttributeError, Exception):
-        pass
+    now = time.monotonic()
+    if now - _cell_cache_ts < _CELL_CACHE_TTL * 2:
+        # 扩展缓存:从已缓存的 cell 中构建全量数据(从缓存中获取所有 channel_id)
+        all_cells = list(_cell_cache.values())
 
     if all_cells is None:
         col = get_cells_col()

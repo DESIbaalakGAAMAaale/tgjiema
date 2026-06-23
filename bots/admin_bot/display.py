@@ -15,8 +15,9 @@ from utils.monitor import metrics
 from utils.storage_channel import get_active_storage_channel_id
 from utils.time_utils import format_datetime
 
-from .menus import _quota_display, _status_counters, _status_counters_initialized
-from . import menus
+from .menus import _quota_display
+from utils.shared_counters import status_counters as _status_counters
+import utils.shared_counters as _shared_counters
 
 
 async def _ensure_user(user_id: int) -> dict:
@@ -34,13 +35,13 @@ async def _get_status_text() -> str:
     files_col = get_file_records_col()
     logs_col = get_decode_logs_col()
     # 首次启动时,用 DB 查询初始化
-    if not _status_counters_initialized:
+    if not _shared_counters.status_counters_initialized:
         _status_counters["total_users"] = await users_col.count_documents({})
         _status_counters["total_files"] = await files_col.count_documents({})
         _status_counters["active_files"] = await files_col.count_documents({"status": "active"})
         today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
-        menus._status_counters_initialized = True
+        _shared_counters.status_counters_initialized = True
     relay_pending = await get_config("relay_auth_pending")
     try:
         from services.relay_pool import relay_pool
@@ -248,7 +249,6 @@ async def _get_relay_status_text() -> str:
 
 _CONFIG_SETTINGS_MAP = {
     "storage_channel_id": "MAIN_STORAGE_CHANNEL_ID",
-    "decoder_chat_id": "DECODER_BOT_CHAT_ID",
     "file_code_prefix": "FILE_CODE_PREFIX",
     "force_join_channel_id": "FORCE_JOIN_CHANNEL_ID",
     "force_join_link": "FORCE_JOIN_CHANNEL_LINK",
@@ -285,7 +285,6 @@ def _config_fallback(key: str) -> str:
 async def _get_configs_text() -> str:
     cfg_keys = [
         ("storage_channel_id", "📺 主存储频道", "⚠️需重启"),
-        ("decoder_chat_id", "🤖 解码机器人对话", "✅热更新"),
         ("file_code_prefix", "📝 文件码前缀", "⚠️需重启"),
         ("force_join_channel_id", "🔒 强制加群频道", "✅热更新"),
         ("force_join_link", "🔗 加群链接", "✅热更新"),

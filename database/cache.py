@@ -230,8 +230,8 @@ async def _flush_decode_log_buffer_loop():
                 logger.info(f"[DecodeLog] flushed {len(rows)} logs to CRDB")
                 # 递增本地计数器
                 try:
-                    from bots.admin_bot.menus import _status_counters
-                    _status_counters["today_decodes"] = _status_counters.get("today_decodes", 0) + len(rows)
+                    from utils.shared_counters import status_counters
+                    status_counters["today_decodes"] = status_counters.get("today_decodes", 0) + len(rows)
                 except Exception:
                     pass
             else:

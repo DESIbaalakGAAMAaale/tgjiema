@@ -530,21 +530,6 @@ async def set_storage_channel(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @_auth_required
-async def set_decoder_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("用法:/set_decoder_chat <ChatID>")
-        return
-    try:
-        chat_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ ChatID必须是数字")
-        return
-    await set_config("decoder_chat_id", str(chat_id))
-    await update.message.reply_text(f"✅ 解码机器人对话已设为 {chat_id} ✅热更新")
-
-
-@_auth_required
 async def set_file_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:

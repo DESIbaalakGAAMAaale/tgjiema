@@ -88,6 +88,11 @@ class RelayPool:
         """
         if not self.instances:
             return None
+        # 筛选就绪的实例
+        ready_instances = [i for i in self.instances if i.is_ready]
+        if not ready_instances:
+            logger.warning("[RelayPool] 没有就绪的中继账号")
+            return None
         from config import settings
         # 权重配置（可覆盖）
         w_avg = getattr(settings, 'RELAY_WEIGHT_AVG_WAIT', 0.4)

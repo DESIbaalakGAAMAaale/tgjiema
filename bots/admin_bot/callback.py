@@ -218,10 +218,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "set_storage_channel:id",
                 "📺 设置主存储频道\n\n请输入频道ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
             ),
-            "set_decoder_chat": (
-                "set_decoder_chat:id",
-                "🤖 设置解码机器人对话\n\n请输入 ChatID（数字）：\n\n❌ 如需取消请点击下方按钮。"
-            ),
             "set_file_prefix": (
                 "set_file_prefix:prefix",
                 "📝 设置文件码前缀\n\n请输入新的文件码前缀（例如：tgwenjian）：\n\n❌ 如需取消请点击下方按钮。"

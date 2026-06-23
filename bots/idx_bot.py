@@ -63,8 +63,18 @@ def _increment_local_quota(user_id: int):
 
 
 async def _sync_quota_to_db():
-    """批量同步配额到 CRDB(原子递增,支持多实例部署)"""
-    if not _local_quota_counts:
+    """批量同步配额到 CRDB(原子递增,支持多实例部署)。
+    合并 permission.py 的本地计数器,确保 decode 流程中累加的配额被同步。
+    """
+    # 合并 permission.py 的本地计数器
+    from services.permission import _get_local_quota_counts, _get_local_external_quota_counts, _clear_local_quota_counts
+    perm_counts = _get_local_quota_counts()
+    perm_ext_counts = _get_local_external_quota_counts()
+    _clear_local_quota_counts()
+    for uid, count in perm_counts.items():
+        if count > 0:
+            _local_quota_counts[uid] = _local_quota_counts.get(uid, 0) + count
+    if not _local_quota_counts and not perm_ext_counts:
         return
     from database import _client
     for user_id, count in list(_local_quota_counts.items()):
@@ -76,6 +86,15 @@ async def _sync_quota_to_db():
                 )
             except Exception as e:
                 logger.error(f"[Quota] sync failed for user {user_id}: {e}")
+    for user_id, count in perm_ext_counts.items():
+        if count > 0:
+            try:
+                await _client.execute(
+                    "UPDATE users SET external_used_today = external_used_today + $1 WHERE user_id = $2",
+                    [count, user_id],
+                )
+            except Exception as e:
+                logger.error(f"[Quota] ext sync failed for user {user_id}: {e}")
     _local_quota_counts.clear()
 
 

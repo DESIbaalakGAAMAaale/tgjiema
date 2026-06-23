@@ -1341,10 +1341,11 @@ async def enqueue_job(
         "protect_content": protect_content,
         "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
     })
-    # 递增本地计数器(用于 admin /status�?    try:
-        from bots.admin_bot.menus import _status_counters
-        _status_counters["total_files"] = _status_counters.get("total_files", 0) + 1
-        _status_counters["active_files"] = _status_counters.get("active_files", 0) + 1
+    # 递增本地计数器(用于 admin /status)
+    try:
+        from utils.shared_counters import status_counters
+        status_counters["total_files"] = status_counters.get("total_files", 0) + 1
+        status_counters["active_files"] = status_counters.get("active_files", 0) + 1
     except Exception:
         pass
     # 通知 Dsp Bot(本�?SQLite 通知,零 RU�?    try:
@@ -1509,44 +1510,41 @@ async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
     限制: 每个 job 最多重试 2 次死信队列,超过后永久丢弃。
     """
     col = get_jobs_col()
+    import datetime as _dt
     # 查找死信 job,且死信重试次数 < 2
-    pipeline = [
-        {"$match": {
-            "status": "dead", 
-            "dead_retry": {"$ne": True},
-            "$or": [{"dead_retry_count": {"$lt": 2}}, {"dead_retry_count": {"$exists": False}}],
-        }},
-        {"$limit": max_count},
-        {"$project": {"_id": 1}},
-    ]
-    dead_jobs = []
-    async for doc in col.aggregate(pipeline):
-        dead_jobs.append(doc["_id"])
+    # 使用 find 替代不存在的 aggregate 方法
+    dead_jobs = await col.find(
+        {"status": "dead"},
+        sort=("created_at", 1),
+        limit=max_count,
+    )
 
     if not dead_jobs:
         return []
 
     # 重置这些 job,并递增死信重试次数
-    updated = 0
-    for job_id in dead_jobs:
+    # 不重置 retry_count,避免每个死信周期都重试 3 次
+    updated = []
+    for job in dead_jobs:
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        dead_retry_count = job.get("dead_retry_count", 0)
+        if dead_retry_count >= 2:
+            continue  # 超过重试上限,永久丢弃
         result = await col.update_one(
             {"id": job_id},
             {"$set": {
                 "status": "pending",
-                "retry_count": 0,
                 "dead_retry": True,
-                "dead_retry_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "dead_retry_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             },
             "$inc": {"dead_retry_count": 1}},
         )
-        if result.modified_count > 0:
-            updated += 1
+        if result.matched_count > 0:
+            updated.append(job_id)
 
-    # 返回重置的 job IDs
-    jobs = []
-    for job_id in dead_jobs[:updated]:
-        jobs.append(job_id)
-    return jobs
+    return updated
 
 
 async def set_code_expiry(code: str, expires_at: str):
@@ -1625,6 +1623,9 @@ async def sync_relay_to_crdb(api_id: int, api_hash: str, phone: str):
 
 async def _query_raw(sql: str, params: list = None) -> list[dict]:
     """执行原始 SQL 查询，返回 dict 列表"""
+    if _client._pool is None:
+        logger.error("[DB] _query_raw: 连接池未初始化")
+        return []
     async with _client._pool.acquire() as conn:
         records = await conn.fetch(sql, *(params or []))
         return [_row_to_dict(r) for r in records]

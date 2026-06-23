@@ -411,21 +411,27 @@ async def _process_batch_job(bot, job, bot_id: int = 1):
         return
 
     total_pages = (len(file_meta_list) + PAGE_SIZE - 1) // PAGE_SIZE
+    page_key = None
 
     if total_pages > 1:
-        _pagination_states[job.code] = {
+        # 加 user_id 避免多用户同码键冲突
+        page_key = f"{job.code}:{job.target_user_id}"
+        _pagination_states[page_key] = {
             "channel_msg_ids": job.storage_msg_ids,
             "batch_file_meta": file_meta_list,
             "total_pages": total_pages,
             "chat_id": job.target_user_id,
             "storage_channel_id": job.storage_channel_id,
             "created_at": time.time(),
+            "file_code": job.code,
+            "target_user_id": job.target_user_id,
         }
 
     await _send_page(
         bot, job.target_user_id, job.code,
         file_meta_list, page=1, total_pages=total_pages,
         storage_channel_id=job.storage_channel_id,
+        page_key=page_key if total_pages > 1 else None,
     )
 
 
@@ -433,8 +439,9 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     protect_content = getattr(job, "protect_content", False)
     for i, mid in enumerate(job.storage_msg_ids):
         # 使用信号量控制并发,避免 Telegram API 限流
-        acquired = await asyncio.wait_for(_send_semaphore.acquire(), timeout=30)
-        if not acquired:
+        try:
+            await asyncio.wait_for(_send_semaphore.acquire(), timeout=30)
+        except asyncio.TimeoutError:
             logger.warning(f"[Dsp] 信号量超时,跳过消息 {mid}")
             continue
         try:
@@ -451,7 +458,7 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     await metrics.record_processed("dsp_bot")
 
 
-async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None):
+async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None):
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
     page_items = file_meta_list[start:end]
@@ -473,14 +480,16 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         return
 
     if total_pages > 1 and page < total_pages:
-        keyboard = _build_pagination_keyboard(file_code, page, total_pages)
+        # 使用 page_key 避免多用户同码键冲突
+        pk = page_key or file_code
+        keyboard = _build_pagination_keyboard(pk, page, total_pages)
         total_files = len(file_meta_list)
         sent_msg = await safe_send_message(
             bot, chat_id=chat_id,
             text=f"[{page}/{total_pages} 页] 共{total_files} 个文件",
             reply_markup=keyboard,
         )
-        state = _pagination_states.get(file_code)
+        state = _pagination_states.get(pk)
         if state and sent_msg:
             state["last_pagination_msg_id"] = sent_msg.message_id
         # 翻页提示之间间隔 0.3s,避免用户聊天被消息淹�?
@@ -520,26 +529,28 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer()
         return
 
-    file_code = parts[1]
+    page_key = parts[1]  # 格式: file_code:user_id
     try:
         page = int(parts[2])
     except ValueError:
         await query.answer()
         return
 
-    # 使用 pop 原子性地获取并移除,避免 TOCTOU 竞态
-    state = _pagination_states.pop(file_code, None)
+    # 使用 get 保留状态（支持多页翻页），结束或过期时才清理
+    state = _pagination_states.get(page_key)
     if not state:
         await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
         return
 
-    # 检�� TTL
+    # 检查 TTL
     if time.time() - state.get("created_at", 0) > _PAGE_STATE_TTL:
+        _pagination_states.pop(page_key, None)
         await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
         return
 
     file_meta_list = state["batch_file_meta"]
     total_pages = state["total_pages"]
+    file_code = state.get("file_code", page_key)
 
     if page < 1 or page > total_pages:
         await query.answer("无效的页码�?)
@@ -556,10 +567,11 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.bot, query.message.chat_id, file_code,
         file_meta_list, page=page, total_pages=total_pages,
         storage_channel_id=state.get("storage_channel_id"),
+        page_key=page_key,
     )
 
     if page >= total_pages:
-        _pagination_states.pop(file_code, None)
+        _pagination_states.pop(page_key, None)
 
     await query.answer()
 

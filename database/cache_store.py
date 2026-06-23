@@ -60,7 +60,9 @@ class CacheStore:
         rows = []
         for k, v, ts in cache_entries:
             try:
-                rows.append((k, json.dumps(v, default=str).decode(), ts))
+                raw = json.dumps(v, default=str)
+                val = raw.decode() if isinstance(raw, bytes) else raw
+                rows.append((k, val, ts))
             except (TypeError, ValueError):
                 continue
         if rows:
@@ -104,7 +106,8 @@ class CacheStore:
         if not self._db:
             return
         try:
-            val = json.dumps(data, default=str).decode()
+            raw = json.dumps(data, default=str)
+            val = raw.decode() if isinstance(raw, bytes) else raw
             await self._db.execute(
                 "INSERT OR REPLACE INTO cache_backup (key, value, ts) VALUES (?, ?, ?)",
                 (key, val, time.time()),

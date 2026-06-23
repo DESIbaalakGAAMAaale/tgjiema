@@ -320,15 +320,6 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await set_config("storage_channel_id", str(channel_id))
         await _end(f"✅ 主存储频道已设为 {channel_id}\n⚠️ 需重启所有机器人后生效")
 
-    elif state == "set_decoder_chat:id":
-        try:
-            chat_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ ChatID必须是数字,请重新输入:")
-            return
-        await set_config("decoder_chat_id", str(chat_id))
-        await _end(f"✅ 解码机器人对话已设为 {chat_id} ✅热更新")
-
     elif state == "set_file_prefix:prefix":
         prefix = text.strip()
         await set_config("file_code_prefix", prefix)

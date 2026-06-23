@@ -2,20 +2,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from config import settings
-
-TOKEN = settings.ADMIN_BOT_TOKEN
-AUTHORIZED_USER_ID = settings.ADMIN_TELEGRAM_ID
-MEMBERSHIP_LEVELS = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
-LEVEL_ALIAS = {"1": "free", "2": "basic", "3": "premium", "free": "free", "basic": "basic", "premium": "premium"}
-
-# ─── 本地计数器：替代 count_documents 查询 ──────────────────
-_status_counters = {
-    "total_users": 0,
-    "total_files": 0,
-    "active_files": 0,
-    "today_decodes": 0,
-}
-_status_counters_initialized = False
+from utils.shared_counters import status_counters as _status_counters, status_counters_initialized as _status_counters_initialized
 
 
 def _auth_required(func):
@@ -99,8 +86,7 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         text = "⚙️ 系统配置 — 点击按钮操作\n\n⚠️需重启 = 配置需重启所有Bot后生效 | ✅热更新 = 配置即时生效"
         kb = [
             [InlineKeyboardButton("📋 查看全部配置", callback_data="action:settings")],
-            [InlineKeyboardButton("📺 主存储频道", callback_data="interactive:set_storage_channel"),
-             InlineKeyboardButton("🤖 解码对话", callback_data="interactive:set_decoder_chat")],
+            [InlineKeyboardButton("📺 主存储频道", callback_data="interactive:set_storage_channel")],
             [InlineKeyboardButton("📝 文件码前缀", callback_data="interactive:set_file_prefix"),
              InlineKeyboardButton("🔒 强制加群", callback_data="interactive:set_force_join")],
             [InlineKeyboardButton("👤 机器人用户名", callback_data="interactive:set_username"),
