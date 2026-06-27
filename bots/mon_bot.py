@@ -19,11 +19,12 @@ from telegram.error import TelegramError
 from config import settings
 from database import (
     init_db, close_db, get_cells_col, get_active_cells,
-    set_cell_status, update_cell_heartbeat, log_rotate,
+    set_cell_status, log_rotate,
     add_spare_channel, get_spare_for_account, get_any_spare,
     consume_spare, get_rotation_config, set_rotation_config,
     _client,
 )
+from database.cache_store import get_cache_store
 from services.mon import MonScheduler
 from utils.monitor import metrics
 
@@ -67,9 +68,11 @@ class MonBot:
             "time_per_slot": 3600,
         }
         self._rotation_reload_countdown = 0
-        # ─── 心跳本地缓存:减少 CRDB 写入 ───
+        # ─── 心跳本地缓存:写入 SQLite,零 CRDB RU ───
         # slot_id → True(上次心跳成功)/ False(上次心跳失败)
         self._cell_healthy: dict[str, bool] = {}
+        # slot_id → 连续失败次数(用于降级判断)
+        self._cell_fail_streak: dict[str, int] = {}
         # ─── cells 全量缓存:一次查询,多轮复用 ───
         self._cells_cache: list[dict] | None = None
         self._cells_cache_ts: float = 0
@@ -343,6 +346,14 @@ class MonBot:
         await self.bot.initialize()
         self._running = True
         self._rotation_reload_countdown = 0
+        # 从本地 SQLite 恢复心跳状态,避免重启后 fail_streak 从零开始
+        store = get_cache_store()
+        hb_data = await store.get_all_heartbeats()
+        for slot_id, data in hb_data.items():
+            self._cell_healthy[slot_id] = True  # 历史记录存在说明上次是健康的
+            self._cell_fail_streak[slot_id] = data.get("fail_streak", 0)
+        if hb_data:
+            logger.info(f"[Mon] 从 SQLite 恢复 {len(hb_data)} 条心跳记录")
         logger.info("[Mon] 监控机器人 v2 已启动")
 
         while self._running:
@@ -371,8 +382,8 @@ class MonBot:
                 if filled > 0:
                     logger.info(f"[Mon] 智能替补: 补齐 {filled} 条消息到新频道")
 
-                # 4. 降级检查
-                alerts = await self.scheduler.run_degrade_check(all_cells)
+                # 4. 降级检查(使用内存中的连续失败次数,零 CRDB RU)
+                alerts = await self.scheduler.run_degrade_check(all_cells, self._cell_fail_streak)
                 if alerts:
                     for msg in alerts:
                         logger.warning(msg)
@@ -409,9 +420,10 @@ class MonBot:
 
     async def _heartbeat_with_ban_detection(self, all_cells: list[dict]) -> tuple[int, int]:
         """心跳检测 + 封禁识别。返回 (ok_count, ban_count)。
-        优化:每 3 个周期(约 180s)写一次 CRDB,减少 RU 消耗。
-        degrade_check 的 heartbeat_timeout 默认 240s,180s 写入间隔留有 60s 安全余量。
+        优化:心跳写入本地 SQLite(零 CRDB RU)，降级判断使用内存 fail_streak。
+        仅在实际发生状态变更时才写入 CRDB。
         """
+        store = get_cache_store()
         # 从传入的 all_cells 中筛选 active/shadow
         cells = [c for c in all_cells if c.get("status") in ("active", "shadow1", "shadow2")]
         ok_count = 0
@@ -421,11 +433,10 @@ class MonBot:
             try:
                 # 使用 get_chat 做更彻底的检测
                 await self.bot.get_chat(cell["channel_id"])
-                # 每 3 个周期写一次心跳到 CRDB,保持 last_heartbeat 新鲜
-                # 避免因心跳过旧被 degrade_check 误判为挂掉
-                if self._cycle_count % 3 == 0:
-                    await update_cell_heartbeat(slot_id)
+                # 心跳成功 → 写入本地 SQLite,重置失败计数
+                await store.write_heartbeat(slot_id, ok=True)
                 self._cell_healthy[slot_id] = True
+                self._cell_fail_streak[slot_id] = 0
                 ok_count += 1
             except TelegramError as e:
                 if _is_ban_error(e):
@@ -433,8 +444,9 @@ class MonBot:
                     ban_count += 1
                     await self._handle_channel_ban(cell, str(e))
                 else:
-                    # 普通错误(如 flood),只记不降级
-                    pass
+                    # 普通错误(如 flood),记录失败但不降级
+                    await store.write_heartbeat(slot_id, ok=False)
+                    self._cell_fail_streak[slot_id] = self._cell_fail_streak.get(slot_id, 0) + 1
             except Exception as e:
                 if _is_ban_error(e):
                     self._cell_healthy[slot_id] = False

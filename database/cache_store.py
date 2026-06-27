@@ -48,6 +48,14 @@ class CacheStore:
         # ─── Decode Logs 缓冲表 ───
         for sql in DDL_BUFFER_TABLES:
             await self._db.execute(sql)
+        # ─── 心跳本地表：Mon Bot 写入，零 CRDB RU ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS heartbeat_local (
+                slot_id    TEXT PRIMARY KEY,
+                last_ok    REAL NOT NULL,
+                fail_streak INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
         await self._db.commit()
         # 注入 db 连接给 DecodeLogBuffer
         _decode_log_buffer.set_db(self._db)
@@ -196,6 +204,38 @@ class CacheStore:
             await self._db.commit()
         except Exception:
             pass  # 清理失败不影响主流程
+
+    # ─── 心跳本地存储：Mon Bot 写入 SQLite，零 CRDB RU ───
+
+    async def write_heartbeat(self, slot_id: str, ok: bool):
+        """写入本地心跳记录。ok=True 时重置 fail_streak，ok=False 时递增。"""
+        if not self._db:
+            return
+        now = time.time()
+        if ok:
+            await self._db.execute(
+                "INSERT INTO heartbeat_local (slot_id, last_ok, fail_streak) VALUES (?, ?, 0) "
+                "ON CONFLICT(slot_id) DO UPDATE SET last_ok = ?, fail_streak = 0",
+                (slot_id, now, now),
+            )
+        else:
+            await self._db.execute(
+                "INSERT INTO heartbeat_local (slot_id, last_ok, fail_streak) VALUES (?, ?, 1) "
+                "ON CONFLICT(slot_id) DO UPDATE SET last_ok = ?, fail_streak = fail_streak + 1",
+                (slot_id, now, now),
+            )
+        await self._db.commit()
+
+    async def get_all_heartbeats(self) -> dict[str, dict]:
+        """读取所有本地心跳记录，返回 {slot_id: {last_ok, fail_streak}}。
+        用于 Mon Bot 启动时恢复到内存。
+        """
+        if not self._db:
+            return {}
+        rows = await self._db.execute_fetchall(
+            "SELECT slot_id, last_ok, fail_streak FROM heartbeat_local"
+        )
+        return {row[0]: {"last_ok": row[1], "fail_streak": row[2]} for row in rows}
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────

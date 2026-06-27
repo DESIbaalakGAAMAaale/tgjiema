@@ -34,18 +34,22 @@ def _load_mon_config():
     }
 
 
+# ─── 降级阈值：连续 fail_streak 达到此值触发降级 ───
+# 每个周期默认 60s,阈值 3 = 180s 无响应后触发
+FAIL_STREAK_DEGRADE_THRESHOLD = 3
+
+
 class MonScheduler:
     """Mon 调度器。
 
     每个调度周期:
-    1. 遍历所有 active 槽位,检查心跳是否超时
-    2. 超时 → 降级: active→lost, shadow1→active, shadow2→shadow1
+    1. 遍历所有 active 槽位,检查连续失败次数是否超过阈值
+    2. 超阈值 → 降级: active→lost, shadow1→active, shadow2→shadow1
     3. R100 槽位永不自降,仅记告警
     """
 
     def __init__(self):
         cfg = _load_mon_config()
-        self.heartbeat_timeout = cfg["heartbeat_timeout"]
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
         # ─── last_synced_msg_id 本地缓存:每 5 次同步写一次 CRDB ───
@@ -53,14 +57,19 @@ class MonScheduler:
         self._replicate_count = 0
         self._cursor_flush_interval = 5  # 每 N 次同步 flush 一次
 
-    async def run_degrade_check(self, all_cells: list[dict]) -> list[str]:
+    async def run_degrade_check(self, all_cells: list[dict], cell_fail_streak: dict[str, int] = None) -> list[str]:
         """执行一轮降级检查,返回日志描述列表。
+
+        降级判断基于内存中的连续失败次数(fail_streak),零 CRDB RU。
+        仅在实际触发降级时才写入 CRDB(set_cell_status + log_rotate)。
 
         Args:
             all_cells: 由调用方统一查询传入,避免重复 DB 查询。
+            cell_fail_streak: {slot_id: 连续失败次数},由 MonBot 心跳循环维护。
         """
         alerts = []
-        now = _dt.datetime.now(_dt.timezone.utc)
+        if cell_fail_streak is None:
+            cell_fail_streak = {}
 
         groups = self._group_slots(all_cells)
 
@@ -69,17 +78,11 @@ class MonScheduler:
                 continue
 
             is_r100 = a_slot.get("is_r100", 0) == 1
-            last_hb = a_slot.get("last_heartbeat", "")
-            if not last_hb:
-                continue
+            slot_id = a_slot["slot_id"]
+            fail_streak = cell_fail_streak.get(slot_id, 0)
 
-            try:
-                hb_time = _dt.datetime.fromisoformat(last_hb)
-                elapsed = (now - hb_time).total_seconds()
-            except (ValueError, TypeError):
-                continue
-
-            if elapsed <= self.heartbeat_timeout:
+            # 连续失败次数未达阈值,跳过
+            if fail_streak < FAIL_STREAK_DEGRADE_THRESHOLD:
                 continue
 
             # ── 降级冷却时间分级(防抖动)—— 根据 degrade_count 递增 ──
@@ -91,29 +94,37 @@ class MonScheduler:
             else:  # >= 2
                 cooldown = 1200
 
-            if elapsed < cooldown:
-                continue  # 冷却中,跳过本次降级
+            # 冷却检查:从 last_heartbeat 推算上次降级时间
+            last_hb = a_slot.get("last_heartbeat", "")
+            if last_hb:
+                try:
+                    hb_time = _dt.datetime.fromisoformat(last_hb)
+                    elapsed = (_dt.datetime.now(_dt.timezone.utc) - hb_time).total_seconds()
+                    if elapsed < cooldown:
+                        continue  # 冷却中,跳过本次降级
+                except (ValueError, TypeError):
+                    pass
 
             if is_r100 and not self.r100_managed:
                 alerts.append(
-                    f"[R100] {a_slot['slot_id']} 心跳超时 {elapsed:.0f}s,仅告警不降级"
+                    f"[R100] {slot_id} 连续失败{fail_streak}次,仅告警不降级"
                 )
                 await log_rotate(
-                    from_slot_id=a_slot["slot_id"],
-                    to_slot_id=a_slot["slot_id"],
+                    from_slot_id=slot_id,
+                    to_slot_id=slot_id,
                     from_status="r100",
                     to_status="r100",
-                    reason=f"R100 heartbeat timeout {elapsed:.0f}s — manual takeover required",
+                    reason=f"R100 fail_streak={fail_streak} — manual takeover required",
                     triggered_by="mon",
                 )
                 continue
 
-            await self._degrade_group(a_slot, s1_slot, s2_slot, elapsed)
+            await self._degrade_group(a_slot, s1_slot, s2_slot, fail_streak)
             alerts.append(
-                f"[DEGRADE] {a_slot['slot_id']}(active→lost) "
+                f"[DEGRADE] {slot_id}(active→lost) "
                 f"→ {s1_slot['slot_id']}(shadow1→active) "
                 f"→ {s2_slot['slot_id']}(shadow2→shadow1) "
-                f"超时{elapsed:.0f}s"
+                f"连续失败{fail_streak}次"
             )
 
         return alerts
@@ -142,7 +153,7 @@ class MonScheduler:
         return groups
 
     async def _degrade_group(
-        self, a_slot: dict, s1_slot: dict, s2_slot: dict, elapsed: float
+        self, a_slot: dict, s1_slot: dict, s2_slot: dict, fail_streak: int
     ):
         """执行降级:active→lost, shadow1→active, shadow2→shadow1
         
@@ -162,7 +173,7 @@ class MonScheduler:
             log_entries.append((
                 a_slot["slot_id"], s1_slot["slot_id"] if s1_slot else "none",
                 "active", "lost",
-                f"heartbeat timeout {elapsed:.0f}s", "mon",
+                f"fail_streak={fail_streak}", "mon",
             ))
 
             # shadow1 → active
