@@ -355,22 +355,34 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     file_types = dict(group["file_types"])
 
     target_ch = await _get_upload_target_channel()
+    total_count = len(group["updates"])
     all_mids = []
     all_meta = []
     failed_count = 0
-    for up in group["updates"]:
+
+    progress_msg = await safe_send_message(
+        context.bot, chat_id=user_id,
+        text=f"processing {total_count} files...\nfinished 0/{total_count}"
+    )
+
+    for i, up in enumerate(group["updates"]):
         try:
             forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
             all_mids.append(forwarded.message_id)
             all_meta.append(extract_file_meta(up))
         except Exception as e:
-            logger.error(f"[Up] 媒体组复制文件到存储频道失败: {e}")
+            logger.error(f"[Up] media group copy failed: {e}")
             failed_count += 1
+        if (i + 1) % 3 == 0 or i == total_count - 1:
+            try:
+                await progress_msg.edit_text(f"processing {total_count} files...\nfinished {i + 1}/{total_count}")
+            except Exception:
+                pass
 
     if not all_mids:
         await metrics.record_error("up_bot")
         try:
-            await safe_send_message(context.bot, chat_id=user_id, text="文件处理失败,请稍后重试�?)
+            await progress_msg.edit_text("file processing failed, please retry")
         except Exception:
             pass
         return
@@ -380,11 +392,17 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     batch_file_meta_str = _json_dumps(all_meta)
     note = group["updates"][0].message.caption or ""
 
-    sent_msg = await safe_send_message(
-        context.bot, chat_id=user_id,
-        text=f"文件已接�?文件码将�?@{settings.DECODER_BOT_USERNAME} 发送给�?
-        + (f"(其中 {failed_count} 个文件处理失�?" if failed_count > 0 else "")
-    )
+    try:
+        await progress_msg.edit_text(
+            f"file received, code will be sent by @{settings.DECODER_BOT_USERNAME}"
+            + (f"\n({failed_count} files failed)" if failed_count > 0 else "")
+        )
+    except Exception:
+        await safe_send_message(
+            context.bot, chat_id=user_id,
+            text=f"file received, code will be sent by @{settings.DECODER_BOT_USERNAME}"
+            + (f"\n({failed_count} files failed)" if failed_count > 0 else "")
+        )
 
     # 发送上传选项
     try:
@@ -418,7 +436,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             "batch_msg_ids": batch_ids_str,
             "batch_file_meta": batch_file_meta_str,
             "note": note,
-            "status_msg_id": sent_msg.message_id,
+            "status_msg_id": progress_msg.message_id,
             "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "processed": 0,
             "protect_content": protect,

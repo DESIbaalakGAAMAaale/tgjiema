@@ -927,12 +927,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if clean_text and len(clean_text) >= 4 and not re.search(r'[\u4e00-\u9fff]', clean_text):
         known_bot = await get_bot_for_code(clean_text)
         if known_bot:
-            logger.info(f"[Idx] 命中无头码缓�? code={clean_text}, bot={known_bot}")
+            logger.info(f"[Idx] 命中无头码缓存: code={clean_text}, bot={known_bot}")
             context.user_data["_original_external_code"] = clean_text
             context.user_data["_extracted_bot"] = known_bot
             object.__setattr__(update.message, "text", f"{known_bot}:{clean_text}")
             await handle_code(update, context)
             return
+
+        # ── 通配符前缀匹配：用 code_routes 中的前缀匹配未知码 ──
+        from database import get_all_code_bot_routes
+        routes = await get_all_code_bot_routes()
+        if routes:
+            best_prefix = ""
+            best_bot = ""
+            for prefix, bot_username in routes.items():
+                if clean_text.startswith(prefix) and len(prefix) > len(best_prefix):
+                    best_prefix = prefix
+                    best_bot = bot_username
+            if best_bot:
+                logger.info(f"[Idx] 通配符匹配: code={clean_text}, prefix={best_prefix}, bot={best_bot}")
+                context.user_data["_original_external_code"] = clean_text
+                context.user_data["_extracted_bot"] = best_bot
+                object.__setattr__(update.message, "text", f"{best_bot}:{clean_text}")
+                create_safe_task(save_code_bot_mapping(clean_text, best_bot), name="save_code_bot_mapping")
+                await handle_code(update, context)
+                return
 
 
 # ─── 运行 ───
