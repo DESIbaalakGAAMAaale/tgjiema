@@ -18,7 +18,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from loguru import logger
 
 from config import settings
-from database import dequeue_jobs, get_file_records_col, reenqueue_job, mark_job_dead, set_cell_status, get_active_or_shadow_cell, get_pending_jobs_count
+from database import dequeue_jobs, get_file_records_col, reenqueue_job, reenqueue_job_no_retry, mark_job_dead, set_cell_status, get_active_or_shadow_cell, get_pending_jobs_count
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
@@ -278,8 +278,8 @@ async def _dsp_worker(bot: Any, worker_id: int):
                     _send_semaphore.acquire(), timeout=10.0
                 )
             except asyncio.TimeoutError:
-                # 等超时重新入队
-                await reenqueue_job(job.job_id)
+                # 等超时重新入队(不递增 retry_count,避免白白消耗重试次数)
+                await reenqueue_job_no_retry(job.job_id)
                 logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时,重新入队 job={job.job_id}")
                 await asyncio.sleep(1)
                 continue
@@ -404,16 +404,12 @@ async def _process_single_job(bot, job, bot_id: int = 1):
         await metrics.record_processed("dsp_bot")
         return True
 
-    # 区分失败原因
-    if len(tried) > 1:
-        error_reason = "文件发送失败，请稍后重试或联系管理员"
-    else:
-        error_reason = "文件发送失败，请稍后重试或联系管理员"
+    # 所有槽位均不可用,记录失败
     logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried)}")
     metrics.send_fail_count += 1
     await metrics.record_error("dsp_bot")
     try:
-        await safe_send_message(bot, chat_id=job.target_user_id, text=error_reason)
+        await safe_send_message(bot, chat_id=job.target_user_id, text="文件发送失败，请稍后重试或联系管理员")
     except Exception:
         pass
     return False

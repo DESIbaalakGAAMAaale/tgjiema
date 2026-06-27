@@ -409,7 +409,8 @@ class MonBot:
 
     async def _heartbeat_with_ban_detection(self, all_cells: list[dict]) -> tuple[int, int]:
         """心跳检测 + 封禁识别。返回 (ok_count, ban_count)。
-        优化:只有状态变化时或每 5 个周期才写一次 CRDB,减少 RU 消耗。
+        优化:每 3 个周期(约 180s)写一次 CRDB,减少 RU 消耗。
+        degrade_check 的 heartbeat_timeout 默认 240s,180s 写入间隔留有 60s 安全余量。
         """
         # 从传入的 all_cells 中筛选 active/shadow
         cells = [c for c in all_cells if c.get("status") in ("active", "shadow1", "shadow2")]
@@ -420,11 +421,10 @@ class MonBot:
             try:
                 # 使用 get_chat 做更彻底的检测
                 await self.bot.get_chat(cell["channel_id"])
-                was_healthy = self._cell_healthy.get(slot_id, False)
-                if not was_healthy:
-                    # 连续 10 个周期写一次(约 600s),减少 CRDB RU 消耗
-                    if self._cycle_count % 10 == 0:
-                        await update_cell_heartbeat(slot_id)
+                # 每 3 个周期写一次心跳到 CRDB,保持 last_heartbeat 新鲜
+                # 避免因心跳过旧被 degrade_check 误判为挂掉
+                if self._cycle_count % 3 == 0:
+                    await update_cell_heartbeat(slot_id)
                 self._cell_healthy[slot_id] = True
                 ok_count += 1
             except TelegramError as e:

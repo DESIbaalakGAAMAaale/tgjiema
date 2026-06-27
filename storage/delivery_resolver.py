@@ -14,19 +14,17 @@ from utils.flood_waiter import safe_copy_message
 from utils.per_channel_limiter import acquire_channel_limit
 
 # 模块级缓存:避免每次 resolve_delivery_channel() 都查询 CRDB
-_cell_cache: dict[int, dict] = {}
-_cell_cache_ts: float = 0
-_CELL_CACHE_TTL: float = 30.0  # 缩短到 30 秒,与 Mon Bot 心跳频率对齐
+# 使用 per-entry 时间戳,避免新条目加入时延长整个缓存的生命周期
+_cell_cache: dict[int, tuple[dict, float]] = {}  # channel_id -> (cell_dict, cached_at)
+_CELL_CACHE_TTL: float = 30.0  # 单条缓存有效期 30 秒
 
 
 def invalidate_cell_cache(channel_id: int = None):
     """失效 delivery_resolver 缓存,用于 Mon Bot 改变频道状态时通知 Dsp。"""
-    global _cell_cache_ts
     if channel_id is not None:
         _cell_cache.pop(channel_id, None)
     else:
         _cell_cache.clear()
-    _cell_cache_ts = time.monotonic()
 
 
 class DeliveryChannel:
@@ -50,17 +48,17 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
     3. 如果是 shadow 或 lost,沿环形找下一个 active 或 shadow1
     4. 最多尝试 3 层降级,防止无限环
     """
-    # 先查本地缓存,避免每次调用都查询 CRDB
+    # 先查本地缓存(per-entry TTL),避免每次调用都查询 CRDB
     now = time.monotonic()
-    if now - _cell_cache_ts < _CELL_CACHE_TTL:
-        cell = _cell_cache.get(primary_channel_id)
+    cached = _cell_cache.get(primary_channel_id)
+    if cached is not None and now - cached[1] < _CELL_CACHE_TTL:
+        cell = cached[0]
     else:
-        cell = None  # 缓存过期,强制重新查询
+        cell = None  # 缓存过期或未命中,强制重新查询
 
     if cell is None:
         cell = await get_active_or_shadow_cell(primary_channel_id)
-        _cell_cache[primary_channel_id] = cell
-        _cell_cache_ts = time.monotonic()
+        _cell_cache[primary_channel_id] = (cell, time.monotonic())
 
     if cell is None:
         # 该频道不在 cells 表中,直接返回原频道
@@ -80,14 +78,19 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
     return await _walk_ring_for_channel(primary_channel_id, max_hops=5)
 
 
-async def _walk_ring_for_channel(channel_id: int, max_hops: int = 45) -> DeliveryChannel:
+async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> DeliveryChannel:
     """环形遍历,找到第一个可用的频道。使用 cells 全量数据在内存中遍历环形链表。"""
     # 尝试从 delivery_resolver 自身缓存获取(避免全表扫描)
+    # 从 per-entry 缓存中提取所有 cell 字典
     all_cells = None
-    now = time.monotonic()
-    if now - _cell_cache_ts < _CELL_CACHE_TTL * 2:
-        # 扩展缓存:从已缓存的 cell 中构建全量数据(从缓存中获取所有 channel_id)
-        all_cells = list(_cell_cache.values())
+    if _cell_cache:
+        now = time.monotonic()
+        cached_cells = []
+        for ch_id, (cell, ts) in list(_cell_cache.items()):
+            if now - ts < _CELL_CACHE_TTL * 2:
+                cached_cells.append(cell)
+        if cached_cells:
+            all_cells = cached_cells
 
     if all_cells is None:
         col = get_cells_col()

@@ -1428,7 +1428,7 @@ async def get_pending_jobs_count() -> int:
 
 
 async def reenqueue_job(job_id: int, max_retries: int = 3) -> bool:
-    """将一条 dispatched 的 job 重新标记为 pending(用于 semaphore 等待超时)。
+    """将一条 dispatched 的 job 重新标记为 pending 并递增 retry_count。
     
     Args:
         job_id: 任务 ID
@@ -1448,6 +1448,32 @@ async def reenqueue_job(job_id: int, max_retries: int = 3) -> bool:
         except Exception as e:
             if attempt == max_retries - 1:
                 logger.error(f"[DB] reenqueue_job 重试{max_retries}次后失败 job_id={job_id}: {e}")
+                return False
+            await asyncio.sleep(0.5 * (attempt + 1))
+
+
+async def reenqueue_job_no_retry(job_id: int, max_retries: int = 3) -> bool:
+    """将一条 dispatched 的 job 重新标记为 pending，不递增 retry_count。
+    用于 semaphore 等待超时等尚未实际尝试发送的场景，避免白白消耗重试次数。
+    
+    Args:
+        job_id: 任务 ID
+        max_retries: 数据库操作最大重试次数
+    Returns:
+        True 表示成功
+    """
+    col = get_jobs_col()
+    for attempt in range(max_retries):
+        try:
+            result = await col._query("""
+                UPDATE jobs SET status = 'pending'
+                WHERE id = $1 AND status = 'dispatched'
+                RETURNING id
+            """, [job_id])
+            return len(result) > 0
+        except Exception as e:
+            if attempt == max_retries - 1:
+                logger.error(f"[DB] reenqueue_job_no_retry 重试{max_retries}次后失败 job_id={job_id}: {e}")
                 return False
             await asyncio.sleep(0.5 * (attempt + 1))
 

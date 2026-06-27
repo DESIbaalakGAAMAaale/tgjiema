@@ -28,7 +28,7 @@ def _load_mon_config():
     mon_cfg = config.get("mon", {})
     return {
         "heartbeat_interval": mon_cfg.get("heartbeat_interval", 30),
-        "heartbeat_timeout": mon_cfg.get("heartbeat_timeout", 90),
+        "heartbeat_timeout": mon_cfg.get("heartbeat_timeout", 240),
         "degrade_cooldown": mon_cfg.get("degrade_cooldown", 300),
         "r100_managed": mon_cfg.get("r100_managed", False),
     }
