@@ -120,7 +120,7 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
     update_parts = [f"{c} = EXCLUDED.{c}" for c in insert_cols if c != pk]
 
     sql = (
-        f"INSERT INTO {_sanitize_column(table)} ({', '.join(insert_cols)}) "
+        f"INSERT INTO {_sanitize_table(table)} ({', '.join(insert_cols)}) "
         f"VALUES ({', '.join(placeholders)}) "
         f"ON CONFLICT ({pk}) DO UPDATE SET {', '.join(update_parts)}"
     )

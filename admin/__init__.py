@@ -339,7 +339,7 @@ async def logs_page(
     )
 
 
-@app.get("/health", response_class=HTMLResponse)
+@app.get("/health-page", response_class=HTMLResponse)
 async def health_page(request: Request, admin=Depends(verify_admin)):
     bot_statuses = []
     for name, health in metrics.bots.items():

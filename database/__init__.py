@@ -36,7 +36,6 @@ from .session import (
     enqueue_job, dequeue_jobs, dequeue_job, get_pending_jobs_count, reenqueue_job, reenqueue_job_no_retry, JobResult, mark_job_dead,
     log_rotate,
     get_external_code_mapping_col, get_system_code_for_external, set_external_code_mapping, set_code_expiry,
-    cleanup_old_records,
     get_spare_pool_col, add_spare_channel, get_spare_for_account, get_any_spare,
     consume_spare, release_spare, remove_spare, list_spare_pool,
     get_rotation_config_col, get_rotation_config, set_rotation_config,

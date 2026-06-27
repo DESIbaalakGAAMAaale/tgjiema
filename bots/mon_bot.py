@@ -108,7 +108,7 @@ class MonBot:
         self._rotation_reload_countdown = 30
         try:
             vals = {}
-            for key in ("active_window_size", "rotation_files_per_slot", "rotation_time_per_slot"):
+            for key in ("rotation_active_window_size", "rotation_files_per_slot", "rotation_time_per_slot"):
                 val = await get_rotation_config(key)
                 if val and val.isdigit():
                     vals[key.replace("rotation_", "")] = int(val)
@@ -193,7 +193,7 @@ class MonBot:
                 {"slot_id": slot_id},
                 {"$set": {
                     "channel_id": spare_ch,
-                    "status": status,  # 保持原状态
+                    "status": status if status in ("active", "shadow1", "shadow2", "r100") else "active",
                     "account_name": account_name,  # 继承原账号
                     "last_heartbeat": now.isoformat(),
                     "file_count": 0,
@@ -315,9 +315,9 @@ class MonBot:
 
             # 唤醒下一窗口(shadow1 → active)
             for gkey in next_window_keys:
-                if gkey in groups and groups[gkey][1]:
+                if gkey in groups and len(groups[gkey]) > 1 and groups[gkey][1]:
                     s1_slot = groups[gkey][1]
-                    target_active = groups[gkey][0]
+                    target_active = groups[gkey][0] if len(groups[gkey]) > 0 else None
                     nxt = target_active.get("next_active_chat_id") if target_active else None
                     await conn.execute(
                         "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3, last_heartbeat = $4 WHERE slot_id = $5",

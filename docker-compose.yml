@@ -5,7 +5,7 @@
 #   1. 创建 .env 文件（从 .env.example 复制并填写）
 #   2. 编辑 config/groups.yaml（填写 15 组的 channel_id）
 #   3. docker-compose up -d --build
-#   4. docker-compose exec app python admin/seed_topology.py --yes
+#   4. 拓扑已自动初始化（run_all.py 启动时自动执行 seed_topology）
 
 services:
   app:

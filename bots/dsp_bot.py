@@ -298,7 +298,7 @@ async def _dsp_worker(bot: Any, worker_id: int):
 
             # 发送失败处理:根据 retry_count 决定重试还是死信
             if not send_ok:
-                if job.retry_count >= 2:
+                if job.retry_count >= 3:
                     await mark_job_dead(job.job_id, f"发送失败,已重试{job.retry_count}次: {job.code}")
                     logger.warning(f"[Dsp-{worker_id}] 死信: job={job.job_id}, code={job.code}, retry={job.retry_count}")
                 else:
@@ -578,7 +578,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_code = state.get("file_code", page_key)
 
     if page < 1 or page > total_pages:
-        await query.answer("无效的页码)
+        await query.answer("无效的页码")
         return
 
     old_msg_id = state.get("last_pagination_msg_id")
@@ -649,7 +649,7 @@ async def _async_main():
 
 
 def run():
-    """启动 Dsp Bot(使用 asyncio.run 标准模式)""
+    """启动 Dsp Bot(使用 asyncio.run 标准模式)"""
     asyncio.run(_async_main())
 
 

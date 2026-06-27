@@ -5,6 +5,7 @@ except ImportError:
 import asyncio
 import time as _time
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
 
@@ -226,6 +227,9 @@ MIGRATION_STATEMENTS = [
     # ─── 死信队列(Dead Letter Queue)──────────────────────────────
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_reason TEXT DEFAULT ''",
+    "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_retry_count INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_retry BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_retry_at TEXT DEFAULT ''",
 ]
 
 
@@ -275,6 +279,7 @@ class CockroachDBClient:
         async with self._pool.acquire() as conn:
             await conn.execute(sql, *(params or []))
 
+    @asynccontextmanager
     async def transaction(self):
         """获取一个带事务的连接,用于需要原子性的多步操作        
         用法:
@@ -774,7 +779,8 @@ async def get_relay_status() -> str:
 
 # ─── 文件码前缀 → Bot 路由 ──────────────────────────────────────
 
-# 内存缓存0 分钟 TTL_code_bot_routes_cache: dict[str, str] = {}
+# 内存缓存(10 分钟 TTL)
+_code_bot_routes_cache: dict[str, str] = {}
 _code_bot_routes_cache_ts: float = 0.0
 _bot_decode_interval_cache: dict[str, int] = {}
 _bot_decode_interval_cache_ts: float = 0.0
@@ -1176,7 +1182,8 @@ async def add_spare_channel(channel_id: int, account_name: str = None) -> bool:
 async def get_spare_for_account(account_name: str) -> dict | None:
     """获取指定账号的未使用备用频道(优先同账号)""
     col = get_spare_pool_col()
-    # 优先匹配同账号    spare = await col.find_one({"account_name": account_name, "is_used": 0})
+    # 优先匹配同账号
+    spare = await col.find_one({"account_name": account_name, "is_used": 0})
     if spare:
         return spare
     return None
@@ -1185,7 +1192,8 @@ async def get_spare_for_account(account_name: str) -> dict | None:
 async def get_any_spare() -> dict | None:
     """获取任意未使用的备用频道(无账号归属)""
     col = get_spare_pool_col()
-    # 优先无归属的备用池频道    spare = await col.find_one({"account_name": None, "is_used": 0})
+    # 优先无归属的备用池频道
+    spare = await col.find_one({"account_name": None, "is_used": 0})
     if not spare:
         spare = await col.find_one({"is_used": 0})
     return spare
@@ -1249,9 +1257,11 @@ async def get_active_cells() -> list[dict]:
     """获取所有状态为 active 的槽位,按环next_active_chat_id 排序""
     col = get_cells_col()
     cells = await col.find({"status": "active"})
-    # 尝试按环形顺序排序    if len(cells) <= 1:
+    # 尝试按环形顺序排序
+    if len(cells) <= 1:
         return cells
-    # next_active_chat_id 构成    channel_map = {c["channel_id"]: c for c in cells}
+    # next_active_chat_id 构成
+    channel_map = {c["channel_id"]: c for c in cells}
     ordered = []
     visited = set()
     if cells:

@@ -4,6 +4,9 @@ from telegram.ext import ContextTypes
 from config import settings
 from utils.shared_counters import status_counters as _status_counters, status_counters_initialized as _status_counters_initialized
 
+TOKEN = settings.ADMIN_BOT_TOKEN
+AUTHORIZED_USER_ID = settings.ADMIN_TELEGRAM_ID
+
 
 def _auth_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):

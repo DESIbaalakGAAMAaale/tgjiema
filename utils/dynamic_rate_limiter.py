@@ -33,10 +33,11 @@ class DynamicRateLimiter:
             threshold_high: 高负载阈值（jobs 数量 > 此值用 max_delay）
             recovery_factor: 负载下降时的恢复速度（0-1，越小恢复越慢）
         """
-        self.base_delay = base_delay or settings.RATE_LIMIT_BASE_DELAY
-        self.max_delay = max_delay or settings.RATE_LIMIT_MAX_DELAY
-        self.threshold_low = threshold_low or settings.RATE_LIMIT_THRESHOLD_LOW
-        self.threshold_high = threshold_high or settings.RATE_LIMIT_THRESHOLD_HIGH
+        self.base_delay = base_delay if base_delay is not None else settings.RATE_LIMIT_BASE_DELAY
+        self.max_delay = max_delay if max_delay is not None else settings.RATE_LIMIT_MAX_DELAY
+        self.threshold_low = threshold_low if threshold_low is not None else settings.RATE_LIMIT_THRESHOLD_LOW
+        self.threshold_high = threshold_high if threshold_high is not None else settings.RATE_LIMIT_THRESHOLD_HIGH
+        assert self.threshold_high > self.threshold_low, "threshold_high must be greater than threshold_low"
         self.recovery_factor = recovery_factor
 
         self._current_delay = self.base_delay

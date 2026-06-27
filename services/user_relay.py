@@ -457,8 +457,10 @@ class UserRelay:
                 return
 
             exchange.setdefault("events", []).append(event)
-            self._pending_cache_counts[exchange.get("code")] = self._pending_cache_counts.get(exchange.get("code"), 0) + 1
-            await self._download_and_cache_one(event.message, exchange.get("user_id"), exchange.get("code"))
+            code = exchange.get("code")
+            if code:
+                self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
+                await self._download_and_cache_one(event.message, exchange.get("user_id"), code)
             self._restart_settle(exchange, bot_username)
 
         @self._client.on(events.MessageEdited(incoming=True))

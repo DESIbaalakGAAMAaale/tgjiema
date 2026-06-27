@@ -93,6 +93,8 @@ class R2Storage:
         return key
 
     async def download(self, key: str) -> bytes:
+        if self._http is None:
+            raise RuntimeError("R2Storage not connected, call connect() first")
         url = f"{self.base_url}/{key}"
         headers = self._sign("GET", key)
         resp = await self._http.get(url, headers=headers)
@@ -101,6 +103,8 @@ class R2Storage:
 
     async def list_objects(self, prefix: str = "", max_keys: int = 1000) -> list[dict]:
         """列出 R2 存储桶中指定前缀的对象。返回 [{"key": ..., "size": ..., "last_modified": ...}, ...]"""
+        if self._http is None:
+            raise RuntimeError("R2Storage not connected, call connect() first")
         import xml.etree.ElementTree as ET
         url = f"{self.base_url}?list-type=2&prefix={prefix}"
         headers = self._sign("GET", f"?list-type=2&prefix={prefix}")

@@ -46,6 +46,7 @@ class RelayInstance:
         # 缓存锁
         self._cache_locks: dict[str, asyncio.Lock] = {}
         self._event_locks: dict[str, asyncio.Lock] = {}
+        self._handlers_registered = False
         self._pending_cache_counts: dict[str, int] = {}
         self._pending_cache_events: dict[str, asyncio.Event] = {}
 
@@ -439,6 +440,9 @@ class RelayInstance:
         return 5
 
     def _register_handlers(self):
+        if self._handlers_registered:
+            return
+        self._handlers_registered = True
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
             now_ts = asyncio.get_event_loop().time()

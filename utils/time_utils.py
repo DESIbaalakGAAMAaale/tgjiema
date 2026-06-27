@@ -10,7 +10,7 @@ def format_datetime(dt) -> str:
         if isinstance(dt, float):
             if dt == 0:
                 return "N/A"
-            dt = datetime.datetime.fromtimestamp(dt, tz=datetime.UTC)
+            dt = datetime.datetime.fromtimestamp(dt, tz=datetime.timezone.utc)
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(dt, str):
         try:

@@ -178,7 +178,6 @@ async def deliver_with_fallback(
     resolved = await resolve_delivery_channel(primary_channel_id)
     current_channel = resolved.channel_id
     success_count = 0
-    tried_channels = set()
 
     for msg_id in message_ids:
         tried_channels = set()

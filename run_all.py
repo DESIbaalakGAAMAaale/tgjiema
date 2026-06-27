@@ -1,5 +1,5 @@
 """环形冗余架构 v2 运行入口
-启动 5 个主进程:up / idx / dsp / mon / admin_bot
+启动 6 个主进程:up / idx / dsp / mon / admin_bot / file_bot
 + admin web + db_backup
 启动时自动初始化拓扑(无需手动运行 seed_topology.py)
 + 子进程崩溃自动重启(带限流保护,永不删除进程记录)
@@ -155,6 +155,10 @@ def _monitor_and_restart(processes: dict, running_flag: multiprocessing.Value):
             if not p.is_alive():
                 exitcode = p.exitcode
                 logger.warning(f"[RunAll] {name} 进程已退出 (exitcode={exitcode})")
+
+                if exitcode is not None and exitcode == 0:
+                    logger.info(f"[RunAll] {name} 正常退出 (exitcode=0),跳过重启")
+                    continue
 
                 # 限流检查:窗口内重启次数
                 now = time.time()

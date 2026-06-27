@@ -77,7 +77,7 @@ async def _refresh_active_slots():
 
 
 async def _get_upload_target_channel() -> int:
-    """选择上传目标频道:在活跃频道间轮转(round-robin)""
+    """选择上传目标频道:在活跃频道间轮转(round-robin)"""
     global _active_slot_index
     if not _active_a_slots:
         await _refresh_active_slots()
@@ -105,7 +105,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /start_upload - 开始批次上传\n"
         "  发送多个文件...\n"
         "  /end_upload - 结束批次,生成文件码\n\n"
-        "所有用含免费用均可上传文件
+        "所有用户均可免费上传文件\n"
         + three_bot_reminder()
     )
 
@@ -115,7 +115,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     if not await check_upload_permission(user.id):
-        await update.message.reply_text("您被禁止使用上传功能)
+        await update.message.reply_text("您被禁止使用上传功能")
         return
 
     context.user_data["batch"] = {
@@ -128,7 +128,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📦 已进入批次上传模请发送文件。\n"
         "发/end_upload 结束并生成文件码。\n"
         "发/cancel_upload 取消本次上传。\n\n"
-        "💬 可使用 /note 文字 为本次批次添加备注
+        "💬 可使用 /note 文字 为本次批次添加备注"
     )
 
 
@@ -137,22 +137,22 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if "batch" in context.user_data:
         del context.user_data["batch"]
-        await update.message.reply_text("批次上传已取消)
+        await update.message.reply_text("批次上传已取消")
     else:
-        await update.message.reply_text("当前没有进行中的批次上传)
+        await update.message.reply_text("当前没有进行中的批次上传")
 
 
 async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """设置批次上传备注""
+    """设置批次上传备注"""
     if not await check_force_join(update, context):
         return
     batch = context.user_data.get("batch")
     if batch is None:
-        await update.message.reply_text("当前没有进行中的批次上传,请先使用 /start_upload 开始)
+        await update.message.reply_text("当前没有进行中的批次上传,请先使用 /start_upload 开始")
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text("用法:/note 备注内容\n例如:/note 这是张三的文)
+        await update.message.reply_text("用法:/note 备注内容\n例如:/note 这是张三的文")
         return
     batch["note"] = note_text
     await update.message.reply_text(f"备注已设{note_text}")
@@ -164,7 +164,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = context.user_data.pop("batch", None)
     if batch is None:
-        await update.message.reply_text("当前没有进行中的批次上传,请先使用 /start_upload 开始)
+        await update.message.reply_text("当前没有进行中的批次上传,请先使用 /start_upload 开始")
         return
 
     pending_mgids = list(_pending_media_groups.keys())
@@ -177,12 +177,12 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_msg_ids = batch["pinned_msg_ids"]
 
     if not channel_msg_ids:
-        await update.message.reply_text("没有接收到任何文批次已取消)
+        await update.message.reply_text("没有接收到任何文批次已取消")
         return
 
     sent_msg = await update.message.reply_text(
         f"📦 {len(channel_msg_ids)} 个文件已接收,"
-        f"文件码将@{settings.DECODER_BOT_USERNAME} 发送给你
+        f"文件码将@{settings.DECODER_BOT_USERNAME} 发送给你"
     )
 
     type_str = _json_dumps(dict(batch["file_types"]))
@@ -201,7 +201,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "batch_file_meta": batch_file_meta_str,
             "note": batch.get("note", ""),
             "status_msg_id": sent_msg.message_id,
-            "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
             "protect_content": opts.get("protect_content", "false") == "true" or settings.DEFAULT_PROTECT_CONTENT,
             "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
@@ -211,7 +211,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
-        await update.message.reply_text("文件处理失败，请稍后重试)
+        await update.message.reply_text("文件处理失败，请稍后重试")
         return
 
     metrics.upload_count += 1
@@ -280,9 +280,12 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
     for up in grp["updates"]:
         try:
             forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
-            batch["pinned_msg_ids"].append(forwarded.message_id)
-            batch["files_meta"].append(extract_file_meta(up))
-            copied += 1
+            if forwarded is not None:
+                batch["pinned_msg_ids"].append(forwarded.message_id)
+                batch["files_meta"].append(extract_file_meta(up))
+                copied += 1
+            else:
+                failed += 1
         except Exception as e:
             logger.error(f"[Up] 批次媒体组复制文件到存储频道失败: {e}")
             failed += 1
@@ -304,13 +307,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await global_rate_limiter.acquire():
-        await update.message.reply_text("系统繁忙,请稍后重试)
+        await update.message.reply_text("系统繁忙,请稍后重试")
         return
     if not await user_rate_limiter.acquire(user.id):
-        await update.message.reply_text("操作过于频繁,请稍后重试)
+        await update.message.reply_text("操作过于频繁,请稍后重试")
         return
     if not await check_upload_permission(user.id):
-        await update.message.reply_text("您没有上传权限)
+        await update.message.reply_text("您没有上传权限")
         return
 
     file_type = detect_file_type(update)
@@ -321,7 +324,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_upload_permission(user.id):
-        await update.message.reply_text("您没有上传权限)
+        await update.message.reply_text("您没有上传权限")
         return
 
     file_type = detect_file_type(update)
@@ -437,7 +440,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             "batch_file_meta": batch_file_meta_str,
             "note": note,
             "status_msg_id": progress_msg.message_id,
-            "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
             "protect_content": protect,
             "file_ttl_days": ttl,
@@ -448,7 +451,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
         try:
-            await safe_send_message(context.bot, chat_id=user_id, text="文件处理失败，请稍后重试)
+            await safe_send_message(context.bot, chat_id=user_id, text="文件处理失败，请稍后重试")
         except Exception:
             pass
         return
@@ -467,11 +470,11 @@ async def _process_upload(
     except Exception as e:
         logger.error(f"[Up] 转发文件到存储频道失败 {e}")
         await metrics.record_error("up_bot")
-        await update.message.reply_text("文件处理失败，请稍后重试)
+        await update.message.reply_text("文件处理失败，请稍后重试")
         return
 
     sent_msg = await update.message.reply_text(
-        f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你
+        f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
     )
 
     # 发送上传选项
@@ -499,7 +502,7 @@ async def _process_upload(
             "batch_file_meta": _json_dumps([extract_file_meta(update)]),
             "note": note,
             "status_msg_id": sent_msg.message_id,
-            "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
             "protect_content": opts.get("protect_content", "false") == "true" or settings.DEFAULT_PROTECT_CONTENT,
             "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
@@ -509,7 +512,7 @@ async def _process_upload(
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
-        await update.message.reply_text("文件处理失败，请稍后重试)
+        await update.message.reply_text("文件处理失败，请稍后重试")
         return
 
     metrics.upload_count += 1
@@ -519,7 +522,7 @@ async def _process_upload(
 # ─── 上传选项回调 ───
 
 async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理上传选项按钮回调。直接更新 MongoDB 中的 pending_uploads 记录。""
+    """处理上传选项按钮回调。直接更新 MongoDB 中的 pending_uploads 记录。"""
     query = update.callback_query
     await query.answer()
     data = query.data  # format: "option|key|value"
@@ -555,12 +558,12 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
                 update_fields["file_ttl_days"] = ttl_days
                 ttl_labels = {
                     0: "永久有效",
-                    1: "1天,
-                    7: "7天,
-                    30: "30天,
-                    90: "90天,
+                    1: "1天",
+                    7: "7天",
+                    30: "30天",
+                    90: "90天",
                 }
-                label = ttl_labels.get(ttl_days, f"{ttl_days}天)
+                label = ttl_labels.get(ttl_days, f"{ttl_days}天")
                 await query.edit_message_text(f"文件码有效期:{label}")
             if update_fields:
                 await pending_col.update_one({"id": latest["id"]}, {"$set": update_fields})
@@ -569,7 +572,7 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def _build_upload_options_keyboard():
-    """构建上传选项按钮。""
+    """构建上传选项按钮。"""
     keyboard = [
         [
             InlineKeyboardButton("🔒 禁止转发", callback_data="option|protect_content|true"),
@@ -577,14 +580,14 @@ def _build_upload_options_keyboard():
         ],
         [
             InlineKeyboardButton("∞ 永久有效", callback_data="option|file_ttl|0"),
-            InlineKeyboardButton("1天, callback_data="option|file_ttl|1"),
+            InlineKeyboardButton("1天", callback_data="option|file_ttl|1"),
         ],
         [
-            InlineKeyboardButton("7天, callback_data="option|file_ttl|7"),
-            InlineKeyboardButton("30天, callback_data="option|file_ttl|30"),
+            InlineKeyboardButton("7天", callback_data="option|file_ttl|7"),
+            InlineKeyboardButton("30天", callback_data="option|file_ttl|30"),
         ],
         [
-            InlineKeyboardButton("90天, callback_data="option|file_ttl|90"),
+            InlineKeyboardButton("90天", callback_data="option|file_ttl|90"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -639,11 +642,11 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     buf["timer"] = asyncio.get_running_loop().call_later(
         60, lambda: asyncio.ensure_future(_flush_external_buffer(external_code, safe_mode=True))
     )
-    logger.debug(f"[Up][ext_relay] 外部文件已缓存 (code={external_code}), 共{len(buf['msg_ids'])}个文件)
+    logger.debug(f"[Up][ext_relay] 外部文件已缓存 (code={external_code}), 共{len(buf['msg_ids'])}个文件")
 
 
 async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理 EXTERNAL_DONE 信号:中继账号通知文件收集完毕,触发批量写入""
+    """处理 EXTERNAL_DONE 信号:中继账号通知文件收集完毕,触发批量写入"""
     text = update.message.text or ""
     if not text.startswith("EXTERNAL_DONE:"):
         return
@@ -701,10 +704,10 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
             "batch_file_meta": batch_file_meta_str,
             "note": note,
             "status_msg_id": 0,
-            "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
         })
-        logger.info(f"[Up][ext_relay] 外部文件已写入pending_uploads: code={external_code}, {len(msg_ids)}个文件)
+        logger.info(f"[Up][ext_relay] 外部文件已写入pending_uploads: code={external_code}, {len(msg_ids)}个文件")
         await get_cache_store().notify_new_upload()
     except Exception as e:
         logger.error(f"[Up][ext_relay] 写入pending_uploads失败 (code={external_code}): {e}")
@@ -776,7 +779,7 @@ async def _async_main():
 
 
 def run():
-    """启动 Up Bot(使用 asyncio.run 标准模式)""
+    """启动 Up Bot(使用 asyncio.run 标准模式)"""
     asyncio.run(_async_main())
 
 
