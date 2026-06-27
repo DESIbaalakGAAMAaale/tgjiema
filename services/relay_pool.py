@@ -28,8 +28,8 @@ class RelayPool:
         db = await get_relay_db()
         accounts = await db.get_active_accounts()
         if not accounts:
-            logger.info("[RelayPool] 本地无中继账号，使用单账号模式兼容")
-            await self._init_from_settings()
+            logger.warning("[RelayPool] 无中继账号，请通过 admin_bot /relay_set_api 添加")
+            self._initialized = True
             return
         for acct in accounts:
             instance = RelayInstance(
@@ -40,27 +40,6 @@ class RelayPool:
             )
             self.instances.append(instance)
         logger.info(f"[RelayPool] 从本地加载 {len(self.instances)} 个中继账号")
-        self._initialized = True
-
-    async def _init_from_settings(self):
-        """从 .env 配置初始化（兼容旧单账号模式）"""
-        from config import settings
-        api_id = settings.RELAY_API_ID
-        api_hash = settings.RELAY_API_HASH
-        phone = settings.RELAY_PHONE
-
-        if api_id and api_hash and phone:
-            db = await get_relay_db()
-            db_row = await db.add_account(api_id, api_hash, phone)
-            instance = RelayInstance(
-                account_id=db_row,
-                api_id=api_id,
-                api_hash=api_hash,
-                phone=phone,
-            )
-            self.instances.append(instance)
-            logger.info(f"[RelayPool] 单账号兼容模式: {phone}")
-
         self._initialized = True
 
     async def start_all(self):

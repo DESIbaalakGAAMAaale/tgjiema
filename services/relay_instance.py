@@ -101,14 +101,8 @@ class RelayInstance:
         if not await self._client.is_user_authorized():
             await self._client.send_code_request(self.phone)
             logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram 账号")
-
-            code = ""
-            if settings.RELAY_CODE:
-                code = settings.RELAY_CODE.strip()
-
-            if not code:
-                logger.info(f"[RelayInstance:{self.phone}] 验证码未设置，等待管理员提交...")
-                code = await self._wait_for_admin_code()
+            logger.info(f"[RelayInstance:{self.phone}] 等待管理员通过 /relay_code 提交验证码...")
+            code = await self._wait_for_admin_code()
 
             if not code:
                 logger.error(f"[RelayInstance:{self.phone}] 无法获取验证码，登录失败")

@@ -80,24 +80,23 @@ class UserRelay:
         return None
 
     async def _load_config(self):
-        api_id = settings.RELAY_API_ID or 0
-        api_hash = settings.RELAY_API_HASH or ""
-        phone = settings.RELAY_PHONE or ""
+        api_id = 0
+        api_hash = ""
+        phone = ""
 
-        if not api_id or not api_hash or not phone:
-            try:
-                from database.session import get_relay_config
-                db_config = await get_relay_config()
-                if db_config.get("api_id"):
-                    api_id = db_config["api_id"]
-                if db_config.get("api_hash"):
-                    api_hash = db_config["api_hash"]
-                if db_config.get("phone"):
-                    phone = db_config["phone"]
-                if api_id and api_hash and phone:
-                    logger.info("[UserRelay] 使用数据库中配置的中继账号")
-            except Exception as e:
-                logger.warning(f"[UserRelay] 读取 DB 中继配置失败: {e}")
+        try:
+            from database.session import get_relay_config
+            db_config = await get_relay_config()
+            if db_config.get("api_id"):
+                api_id = db_config["api_id"]
+            if db_config.get("api_hash"):
+                api_hash = db_config["api_hash"]
+            if db_config.get("phone"):
+                phone = db_config["phone"]
+            if api_id and api_hash and phone:
+                logger.info("[UserRelay] 使用数据库中配置的中继账号")
+        except Exception as e:
+            logger.warning(f"[UserRelay] 读取 DB 中继配置失败: {e}")
 
         self._relay_api_id = api_id
         self._relay_api_hash = api_hash
@@ -124,11 +123,8 @@ class UserRelay:
         if not await self._client.is_user_authorized():
             await self._client.send_code_request(self._relay_phone)
             logger.info("[UserRelay] 验证码已发送到 Telegram 账号")
-
-            code = settings.RELAY_CODE.strip() if settings.RELAY_CODE else None
-            if not code:
-                logger.info("[UserRelay] 环境变量 RELAY_CODE 未设置，等待管理员通过管理机器人提交...")
-                code = await self._wait_for_admin_code()
+            logger.info("[UserRelay] 等待管理员通过 /relay_code 提交验证码...")
+            code = await self._wait_for_admin_code()
 
             if not code:
                 logger.error("[UserRelay] 无法获取验证码，登录失败")

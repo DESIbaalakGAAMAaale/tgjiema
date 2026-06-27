@@ -49,10 +49,6 @@ class Settings(BaseSettings):
     SENDER_BOT_USERNAME: str = ""
     FILE_BOT_USERNAME: str = ""
 
-    RELAY_API_ID: int = 0
-    RELAY_API_HASH: str = ""
-    RELAY_PHONE: str = ""
-    RELAY_CODE: str = ""
     RELAY_ENCRYPTION_KEY: str = ""
 
     R2_ACCOUNT_ID: str = ""
