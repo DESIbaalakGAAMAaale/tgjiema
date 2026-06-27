@@ -353,7 +353,7 @@ async def _send_file_direct(bot, job) -> bool:
             await safe_send_animation(bot, animation=fid, **kwargs)
         else:
             await safe_send_document(bot, document=fid, **kwargs)
-        logger.info(f"[Dsp] file_id 直发成功: 用户 {job.target_user_id}, �?{job.code}")
+        logger.info(f"[Dsp] file_id 直发成功: 用户 {job.target_user_id}, {job.code}")
         return True
     except Exception:
         return False
@@ -503,7 +503,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         metrics.send_fail_count += 1
         await metrics.record_error("dsp_bot")
         try:
-            await safe_send_message(bot, chat_id=chat_id, text="文件发送失败,请稍后重试或联系管理员")
+            await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
         except Exception:
             pass
         return
@@ -521,7 +521,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         state = _pagination_states.get(pk)
         if state and sent_msg:
             state["last_pagination_msg_id"] = sent_msg.message_id
-        # 翻页提示之间间隔 0.3s,避免用户聊天被消息淹�?
+        # 翻页提示之间间隔 0.3s,避免用户聊天被消息淹
         await asyncio.sleep(0.3)
 
 
@@ -582,7 +582,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_code = state.get("file_code", page_key)
 
     if page < 1 or page > total_pages:
-        await query.answer("无效的页码�?)
+        await query.answer("无效的页码)
         return
 
     old_msg_id = state.get("last_pagination_msg_id")
@@ -653,7 +653,7 @@ async def _async_main():
 
 
 def run():
-    """启动 Dsp Bot(使用 asyncio.run 标准模式)�?""
+    """启动 Dsp Bot(使用 asyncio.run 标准模式)""
     asyncio.run(_async_main())
 
 
