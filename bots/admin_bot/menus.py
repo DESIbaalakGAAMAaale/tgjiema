@@ -93,6 +93,7 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("🎫 默认配额", callback_data="interactive:set_quota_default")],
             [InlineKeyboardButton("☁️ R2备份配置", callback_data="interactive:set_r2"),
              InlineKeyboardButton("💾 DB自动备份", callback_data="interactive:set_db_backup")],
+            [InlineKeyboardButton("📋 引导Bot消息", callback_data="interactive:set_filebot_msg")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 

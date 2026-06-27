@@ -1007,3 +1007,88 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ 操作已取消。")
     else:
         await update.message.reply_text("当前没有正在进行的操作。")
+
+
+# ─── 引导机器人消息热更新 ──────────────────────────────────────
+
+@_auth_required
+async def set_filebot_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args) if context.args else ""
+    if not text:
+        await update.message.reply_text(
+            "用法: /set_filebot_msg <文本>\n\n"
+            "设置 File Bot 的引导回复文本，支持换行符 \\n。\n"
+            "设为 reset 可恢复默认文本（从 .env 用户名拼接）。"
+        )
+        return
+    if text.lower() == "reset":
+        await set_config("filebot_msg", "")
+        await update.message.reply_text("✅ 已重置为默认引导文本，最多 60 秒后生效。")
+        return
+    # 处理 \n 转义
+    text = text.replace("\\n", "\n")
+    await set_config("filebot_msg", text)
+    await update.message.reply_text(f"✅ File Bot 引导文本已更新，最多 60 秒后生效:\n\n{text}")
+
+
+# ─── 帮助命令 ──────────────────────────────────────────────────
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "管理员面板 模块说明\n\n"
+        "系统状态\n"
+        "  /status — 系统概览（进程运行状态、各Bot状态）\n"
+        "  /health — 健康检查（频道状态、降级情况）\n\n"
+        "用户管理\n"
+        "  /users [关键词] [页码] — 用户列表\n"
+        "  /user <用户ID> — 查看用户详情（等级、配额、封禁状态）\n"
+        "  /set_level <用户ID> <free|basic|premium> — 设置用户等级\n"
+        "  /set_quota <用户ID> <日配额> — 设置用户解码配额\n"
+        "  /set_external_quota <用户ID> <配额> — 设置外部码配额\n"
+        "  /ban <用户ID> — 封禁用户\n"
+        "  /unban <用户ID> — 解封用户\n\n"
+        "文件管理\n"
+        "  /files [页码] — 文件列表\n"
+        "  /file <文件ID> — 查看文件详情\n"
+        "  /delete_file <文件ID> — 删除文件\n"
+        "  /purge_channel <频道ID> — 清理频道所有文件\n\n"
+        "中继管理（外部码解码用）\n"
+        "  /relay_set_api <API_ID> <API_HASH> <手机号> — 配置中继账号\n"
+        "  /relay_code <验证码> — 提交中继验证码\n"
+        "  /relay_pending — 查看待处理的中继请求\n"
+        "  /relay_list — 查看中继实例列表\n"
+        "  /relay_add <API_ID> <API_HASH> <手机号> — 添加中继实例\n"
+        "  /relay_remove <索引> — 移除中继实例\n"
+        "  /relay_reset_stats — 重置中继统计\n\n"
+        "系统配置\n"
+        "  /settings — 查看全部配置\n"
+        "  /set_storage_channel <频道ID> — 主存储频道（需重启）\n"
+        "  /set_file_prefix <前缀> — 文件码前缀（需重启）\n"
+        "  /set_force_join <频道ID> <链接> — 强制加群（热更新）\n"
+        "  /set_username <upload|decoder|sender> <@用户名> — 机器人用户名（热更新）\n"
+        "  /set_quota_default <free|basic|premium> <配额> — 默认日配额（热更新）\n"
+        "  /set_r2 <账号ID> <AccessKey> <SecretKey> — R2备份配置（需重启）\n"
+        "  /set_db_backup <间隔分钟> <on|off> — 数据库自动备份（热更新）\n"
+        "  /set_filebot_msg <文本> — File Bot 引导文本（热更新）\n"
+        "  /factory_reset — 恢复出厂设置\n\n"
+        "文件码路由（第三方机器人迁移用）\n"
+        "  /add_code_route <前缀> <机器人用户名> — 添加路由规则\n"
+        "  /remove_code_route <前缀> — 删除路由规则\n"
+        "  /code_routes — 查看路由表\n\n"
+        "Bot 限流（解码间隔控制）\n"
+        "  /set_bot_interval <机器人用户名> <秒数> — 设置解码间隔\n"
+        "  /remove_bot_interval <机器人用户名> — 删除解码间隔\n"
+        "  /bot_intervals — 查看限流配置\n\n"
+        "环形拓扑\n"
+        "  /topology — 查看环形拓扑结构\n"
+        "  /spare_add <频道ID> — 添加备用频道\n"
+        "  /spare_remove <频道ID> — 移除备用频道\n"
+        "  /spare_list — 查看备用池\n"
+        "  /rotation_set <参数> <值> — 设置轮转参数\n"
+        "  /rotation_view — 查看轮转配置\n\n"
+        "解码日志\n"
+        "  /logs [页码] — 查看解码日志\n\n"
+        "使用 /cancel 取消当前交互操作\n"
+        "点击按钮操作更便捷，推荐使用菜单面板。"
+    )
+    await update.message.reply_text(msg)

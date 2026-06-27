@@ -50,6 +50,11 @@ def run_admin_bot():
     run()
 
 
+def run_file_bot():
+    from bots.file_bot import run
+    run()
+
+
 def run_admin():
     import uvicorn
     from admin import app
@@ -73,6 +78,7 @@ BOT_RUNNERS = {
     "dsp": run_dsp_bot,
     "mon": run_mon_bot,
     "admin_bot": run_admin_bot,
+    "file_bot": run_file_bot,
     "admin": run_admin,
     "db_backup": run_db_backup,
 }

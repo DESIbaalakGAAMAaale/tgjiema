@@ -242,6 +242,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "set_db_backup:interval",
                 "💾 配置 DB 自动备份\n\n请输入备份间隔（分钟）：\n\n❌ 如需取消请点击下方按钮。"
             ),
+            # 引导机器人消息
+            "set_filebot_msg": (
+                "set_filebot_msg:text",
+                "📋 设置 File Bot 引导消息\n\n请输入引导文本，支持 \\n 换行。\n输入 reset 恢复默认值。\n\n❌ 如需取消请点击下方按钮。"
+            ),
             # 备用池
             "spare_add": (
                 "spare_add:channel_id",

@@ -7,12 +7,13 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # ── 环形冗余 v2 架构：5 个 Bot Token ──
+    # ── 环形冗余 v2 架构：6 个 Bot Token ──
     UPLOAD_BOT_TOKEN: str = ""
     DECODER_BOT_TOKEN: str = ""
     SENDER_BOT_TOKEN: str = ""
     ADMIN_BOT_TOKEN: str = ""
     MON_BOT_TOKEN: str = ""
+    FILE_BOT_TOKEN: str = ""
     ADMIN_TELEGRAM_ID: int = 0
 
     MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
@@ -46,6 +47,7 @@ class Settings(BaseSettings):
     UPLOAD_BOT_USERNAME: str = ""
     DECODER_BOT_USERNAME: str = ""
     SENDER_BOT_USERNAME: str = ""
+    FILE_BOT_USERNAME: str = ""
 
     RELAY_API_ID: int = 0
     RELAY_API_HASH: str = ""

@@ -438,6 +438,16 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await set_config("db_backup_enabled", "true" if on_off == "on" else "false")
         await _end(f"✅ DB 自动备份已{'开启' if on_off == 'on' else '关闭'},间隔 {data['interval']} 分钟 ✅热更新")
 
+    # ─── 引导机器人消息 ──────────────────────────────────────────
+    elif state == "set_filebot_msg:text":
+        if text.lower() == "reset":
+            await set_config("filebot_msg", "")
+            await _end("✅ 已重置为默认引导文本，最多 60 秒后生效。")
+        else:
+            text = text.replace("\\n", "\n")
+            await set_config("filebot_msg", text)
+            await _end(f"✅ File Bot 引导文本已更新，最多 60 秒后生效:\n\n{text}")
+
     # ─── 备用池 ────────────────────────────────────────────────
     elif state == "spare_add:channel_id":
         try:
