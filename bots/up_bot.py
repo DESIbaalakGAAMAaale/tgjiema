@@ -362,7 +362,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     progress_msg = await safe_send_message(
         context.bot, chat_id=user_id,
-        text=f"processing {total_count} files...\nfinished 0/{total_count}"
+        text=f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}"
     )
 
     for i, up in enumerate(group["updates"]):
@@ -375,14 +375,14 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             failed_count += 1
         if (i + 1) % 3 == 0 or i == total_count - 1:
             try:
-                await progress_msg.edit_text(f"processing {total_count} files...\nfinished {i + 1}/{total_count}")
+                await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
             except Exception:
                 pass
 
     if not all_mids:
         await metrics.record_error("up_bot")
         try:
-            await progress_msg.edit_text("file processing failed, please retry")
+            await progress_msg.edit_text("文件处理失败，请稍后重试")
         except Exception:
             pass
         return
@@ -394,14 +394,14 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     try:
         await progress_msg.edit_text(
-            f"file received, code will be sent by @{settings.DECODER_BOT_USERNAME}"
-            + (f"\n({failed_count} files failed)" if failed_count > 0 else "")
+            f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
+            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else "")
         )
     except Exception:
         await safe_send_message(
             context.bot, chat_id=user_id,
-            text=f"file received, code will be sent by @{settings.DECODER_BOT_USERNAME}"
-            + (f"\n({failed_count} files failed)" if failed_count > 0 else "")
+            text=f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
+            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else "")
         )
 
     # 发送上传选项

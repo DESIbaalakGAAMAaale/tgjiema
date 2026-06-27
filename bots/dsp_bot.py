@@ -406,9 +406,9 @@ async def _process_single_job(bot, job, bot_id: int = 1):
 
     # 区分失败原因
     if len(tried) > 1:
-        error_reason = f"文件发送失败,已尝试{len(tried)} 个频道,请稍后重试或联系管理员"
+        error_reason = "文件发送失败，请稍后重试或联系管理员"
     else:
-        error_reason = "文件发送失败,请稍后重试或联系管理员"
+        error_reason = "文件发送失败，请稍后重试或联系管理员"
     logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried)}")
     metrics.send_fail_count += 1
     await metrics.record_error("dsp_bot")
