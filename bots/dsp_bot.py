@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import datetime
 import time
 try:
     import orjson as json
@@ -287,10 +288,11 @@ async def _dsp_worker(bot: Any, worker_id: int):
             send_ok = False
             try:
                 if job.task_type == "batch":
-                    await _process_batch_job(bot, job, bot_id=worker_id)
-                    send_ok = True
+                    send_ok = await _process_batch_job(bot, job, bot_id=worker_id)
                 else:
                     send_ok = await _process_single_job(bot, job, bot_id=worker_id)
+                if send_ok:
+                    await _send_report_button(bot, job.target_user_id, job.code)
             except Exception as e:
                 logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
             finally:
@@ -527,6 +529,89 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     return True
 
 
+# ─── 举报按钮 ───
+
+async def _send_report_button(bot, chat_id: int, file_code: str):
+    """发送成功后追加举报按钮"""
+    try:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{file_code}")
+        ]])
+        await safe_send_message(bot, chat_id=chat_id, text="文件已送达", reply_markup=keyboard)
+    except Exception as e:
+        logger.debug(f"[Dsp] 发送举报按钮失败: {e}")
+
+
+_report_debounce: dict[str, float] = {}
+
+async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理用户点击举报按钮，推送消息给管理员"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("report_req|"):
+        return
+
+    file_code = data.split("|", 1)[1]
+    reporter = update.effective_user
+    if not reporter:
+        return
+
+    # 60 秒防抖
+    key = f"{reporter.id}:{file_code}"
+    now = time.time()
+    if key in _report_debounce and now - _report_debounce[key] < 60:
+        await query.answer("已提交举报，请勿重复操作", show_alert=True)
+        return
+    _report_debounce[key] = now
+
+    # 查文件记录获取上传者
+    try:
+        files_col = get_file_records_col()
+        file_record = await files_col.find_one({"file_code": file_code})
+        if not file_record:
+            await query.answer("文件记录不存在", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"[Dsp][report] 查询文件失败: {e}")
+        await query.answer("系统繁忙，请稍后重试", show_alert=True)
+        return
+
+    uploader_id = file_record.get("uploader_id", 0)
+    reporter_username = f"@{reporter.username}" if reporter.username else str(reporter.id)
+
+    report_text = (
+        f"🚨 文件举报\n\n"
+        f"📁 文件码: {file_code}\n"
+        f"👤 上传者: {uploader_id}\n"
+        f"👤 举报人: {reporter.id} ({reporter_username})\n"
+        f"📋 来源: Dsp Bot\n"
+        f"⏰ 时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔒 封禁上传者", callback_data=f"report:ban|{uploader_id}")],
+        [InlineKeyboardButton("🔗 脱钩文件码", callback_data=f"report:detach|{file_code}")],
+        [InlineKeyboardButton("🚫 限制举报人", callback_data=f"report:block|{file_code}|{reporter.id}")],
+        [InlineKeyboardButton("✅ 忽略", callback_data="report:ignore")],
+    ])
+
+    try:
+        admin_token = settings.ADMIN_BOT_TOKEN
+        admin_chat_id = settings.ADMIN_TELEGRAM_ID
+        if admin_token and admin_chat_id:
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=report_text,
+                reply_markup=keyboard,
+            )
+        await query.answer("举报已提交，管理员将尽快处理", show_alert=True)
+    except Exception as e:
+        logger.error(f"[Dsp][report] 推送管理员失败: {e}")
+        await query.answer("举报提交失败，请稍后重试", show_alert=True)
+
+
 # ─── 命令处理 ───
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -623,6 +708,7 @@ async def _async_main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(pagination_callback))
+    app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))
 
     await metrics.ping_bot("dsp_bot")
 

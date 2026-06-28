@@ -1,5 +1,6 @@
 from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from loguru import logger
 
 from database import (
     get_file_records_col,
@@ -269,9 +270,90 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.edit_message_text(f"❌ 未知操作：{action}", reply_markup=back_kb)
 
+    # ─── 举报处理 ──────────────────────────────────────────────
+    elif data.startswith("report:"):
+        await _handle_report_action(update, context, data)
+
     elif data == "conv:cancel":
         _conv_end(context)
         await query.edit_message_text(
             "❌ 操作已取消。",
             reply_markup=back_kb,
         )
+
+
+# ─── 举报动作处理 ──────────────────────────────────────────────
+
+async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    """处理管理员对举报的操作：封禁/脱钩/限制/忽略"""
+    import datetime as _dt
+    from database import get_users_col, get_file_records_col, update_user_and_invalidate
+
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    if not user or user.id != AUTHORIZED_USER_ID:
+        await query.answer("⛔ 无权限", show_alert=True)
+        return
+
+    if data == "report:ignore":
+        await query.edit_message_text(
+            query.message.text + "\n\n✅ 已忽略",
+            reply_markup=None,
+        )
+        return
+
+    parts = data.split("|")
+    action = parts[0]  # report:ban, report:detach, report:block
+
+    try:
+        if action == "report:ban":
+            if len(parts) < 2:
+                await query.answer("参数缺失", show_alert=True)
+                return
+            uid = int(parts[1])
+            users_col = get_users_col()
+            await users_col.update_one(
+                {"user_id": uid},
+                {"$set": {"is_banned": True, "updated_at": _dt.datetime.now(_dt.UTC).isoformat()}},
+            )
+            await update_user_and_invalidate(uid)
+            await query.edit_message_text(
+                query.message.text + f"\n\n✅ 已封禁用户 {uid}",
+                reply_markup=None,
+            )
+
+        elif action == "report:detach":
+            if len(parts) < 2:
+                await query.answer("参数缺失", show_alert=True)
+                return
+            file_code = parts[1]
+            files_col = get_file_records_col()
+            await files_col.update_one(
+                {"file_code": file_code},
+                {"$set": {"status": "detached"}},
+            )
+            await query.edit_message_text(
+                query.message.text + f"\n\n✅ 已脱钩文件码 {file_code}",
+                reply_markup=None,
+            )
+
+        elif action == "report:block":
+            if len(parts) < 3:
+                await query.answer("参数缺失", show_alert=True)
+                return
+            file_code = parts[1]
+            reporter_id = int(parts[2])
+            files_col = get_file_records_col()
+            await files_col.update_one(
+                {"file_code": file_code},
+                {"$push": {"blocked_users": reporter_id}},
+            )
+            await query.edit_message_text(
+                query.message.text + f"\n\n✅ 已限制举报人 {reporter_id} 解码 {file_code}",
+                reply_markup=None,
+            )
+
+    except Exception as e:
+        logger.error(f"[Admin][report] 操作失败: {e}")
+        await query.answer(f"操作失败: {e}", show_alert=True)

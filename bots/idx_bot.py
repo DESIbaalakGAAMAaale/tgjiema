@@ -13,8 +13,8 @@ import re
 import time
 from collections import defaultdict, deque
 
-from telegram import Update
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
 from loguru import logger
 
 from config import settings
@@ -696,6 +696,16 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"[Idx][handle_code] codes 表查询失(code={text}): {e}")
 
     file_record = result.file_record
+
+    # ── 举报拦截：脱钩或限制举报人 ──
+    if file_record.get("status") == "detached":
+        await safe_reply_text(update.message, "文件不存在或已被删除")
+        return
+    blocked = file_record.get("blocked_users")
+    if isinstance(blocked, list) and user.id in blocked:
+        await safe_reply_text(update.message, "文件不存在或已被删除")
+        return
+
     storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
 
     try:
@@ -730,15 +740,88 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply_text(update.message, "系统繁忙，文件发送请求失败，请稍后重试")
         return
 
-    remaining_info = ""
-    if result.remaining_quota >= 0:
-        remaining_info = f"今日剩余解码次数:{result.remaining_quota}"
-
-    await safe_reply_text(update.message, f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。\n{remaining_info}")
+    await safe_reply_text(
+        update.message,
+        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{text}")
+        ]])
+    )
 
     metrics.decode_count += 1
     await metrics.record_processed("idx_bot")
     logger.info(f"[Idx][handle_code] 用户 {user.id} 请求文件{text}")
+
+
+# ─── 举报回调 ───
+
+_report_debounce: dict[str, float] = {}
+
+async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理用户点击举报按钮，推送消息给管理员"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("report_req|"):
+        return
+
+    file_code = data.split("|", 1)[1]
+    reporter = update.effective_user
+    if not reporter:
+        return
+
+    # 60 秒防抖
+    key = f"{reporter.id}:{file_code}"
+    now = time.time()
+    if key in _report_debounce and now - _report_debounce[key] < 60:
+        await query.answer("已提交举报，请勿重复操作", show_alert=True)
+        return
+    _report_debounce[key] = now
+
+    # 查文件记录获取上传者
+    try:
+        file_record = await get_file_record_cached(file_code)
+        if not file_record:
+            await query.answer("文件记录不存在", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"[Idx][report] 查询文件失败: {e}")
+        await query.answer("系统繁忙，请稍后重试", show_alert=True)
+        return
+
+    uploader_id = file_record.get("uploader_id", 0)
+    reporter_username = f"@{reporter.username}" if reporter.username else str(reporter.id)
+
+    report_text = (
+        f"🚨 文件举报\n\n"
+        f"📁 文件码: {file_code}\n"
+        f"👤 上传者: {uploader_id}\n"
+        f"👤 举报人: {reporter.id} ({reporter_username})\n"
+        f"📋 来源: Idx Bot\n"
+        f"⏰ 时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔒 封禁上传者", callback_data=f"report:ban|{uploader_id}")],
+        [InlineKeyboardButton("🔗 脱钩文件码", callback_data=f"report:detach|{file_code}")],
+        [InlineKeyboardButton("🚫 限制举报人", callback_data=f"report:block|{file_code}|{reporter.id}")],
+        [InlineKeyboardButton("✅ 忽略", callback_data="report:ignore")],
+    ])
+
+    try:
+        admin_token = settings.ADMIN_BOT_TOKEN
+        admin_chat_id = settings.ADMIN_TELEGRAM_ID
+        if admin_token and admin_chat_id:
+            await context.bot.send_message(
+                chat_id=admin_chat_id,
+                text=report_text,
+                reply_markup=keyboard,
+            )
+        await query.answer("举报已提交，管理员将尽快处理", show_alert=True)
+    except Exception as e:
+        logger.error(f"[Idx][report] 推送管理员失败: {e}")
+        await query.answer("举报提交失败，请稍后重试", show_alert=True)
 
 
 # ─── 外部码处───
@@ -982,6 +1065,7 @@ async def _async_main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))
 
     media_filter = (
         filters.Document.ALL | filters.VIDEO | filters.PHOTO

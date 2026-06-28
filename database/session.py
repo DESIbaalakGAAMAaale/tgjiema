@@ -50,7 +50,8 @@ DDL_STATEMENTS = [
         status TEXT DEFAULT 'active',
         request_count INTEGER DEFAULT 0,
         create_time TEXT,
-        expire_time TEXT
+        expire_time TEXT,
+        blocked_users JSONB DEFAULT '[]'
     )""",
     """CREATE TABLE IF NOT EXISTS decode_logs (
         id SERIAL PRIMARY KEY,
@@ -235,6 +236,7 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS file_ttl_days INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS blocked_users JSONB DEFAULT '[]'",
 ]
 
 
@@ -332,6 +334,14 @@ def _row_to_dict(record) -> dict:
                     result[col] = json.loads(val)
                 except (json.JSONDecodeError, TypeError):
                     result[col] = val
+        elif col == "blocked_users":
+            if val is None or val == "" or val == "null":
+                result[col] = []
+            else:
+                try:
+                    result[col] = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    result[col] = []
         elif col == "batch_msg_ids":
             result[col] = str(val) if val else ""
         elif col in (

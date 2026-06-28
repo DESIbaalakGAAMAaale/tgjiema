@@ -82,6 +82,6 @@ def run():
     app.add_handler(CommandHandler("cancel", cancel_conversation))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:)"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:|report:)"))
 
     app.run_polling()
