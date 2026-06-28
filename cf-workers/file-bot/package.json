@@ -1,0 +1,18 @@
+{
+  "name": "mfile-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Mfile 引导机器人 — 部署在 Cloudflare Workers，哑巴导航员",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.100.0"
+  }
+}
