@@ -1,8 +1,0 @@
-name = "mfile-bot"
-main = "src/index.js"
-compatibility_date = "2025-06-01"
-
-[vars]
-UPLOAD_BOT_USERNAME = "your_upload_bot"
-DECODER_BOT_USERNAME = "your_decoder_bot"
-SENDER_BOT_USERNAME = "your_sender_bot"
