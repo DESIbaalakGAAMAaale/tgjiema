@@ -419,7 +419,7 @@ class D1Collection:
         return doc
 
     async def insert_many(self, docs: list[dict]) -> list[dict]:
-        """批量插入文档""
+        """批量插入文档"""
         if not docs:
             return []
         keys = list(docs[0].keys())
@@ -736,7 +736,7 @@ async def delete_backup_bot_token(bot_num: int):
 
 
 async def get_config(key: str) -> str | None:
-    """获取配置值,走内存缓存(10分钟 TTL""
+    """获取配置值,走内存缓存(10分钟 TTL"""
     return await get_config_cached(key)
 
 
@@ -788,7 +788,7 @@ _BOT_CONFIG_TTL: int = 600  # 10 分钟
 
 
 async def _refresh_bot_config_cache():
-    """DB 刷新 code_bot_route bot_decode_interval 缓存""
+    """DB 刷新 code_bot_route bot_decode_interval 缓存"""
     global _code_bot_routes_cache, _code_bot_routes_cache_ts
     global _bot_decode_interval_cache, _bot_decode_interval_cache_ts
     from loguru import logger
@@ -846,7 +846,7 @@ async def delete_code_bot_route(prefix: str):
 
 
 async def get_all_code_bot_routes() -> dict[str, str]:
-    """获取所code_bot_route,走内存缓存0 分钟 TTL)""
+    """获取所code_bot_route,走内存缓存0 分钟 TTL)"""
     global _code_bot_routes_cache, _code_bot_routes_cache_ts
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
@@ -854,7 +854,7 @@ async def get_all_code_bot_routes() -> dict[str, str]:
 
 
 async def resolve_bot_for_code(code: str, default_bot: str) -> str:
-    """根据文件码前缀匹配配置的路由，无匹配则返回 default_bot。""
+    """根据文件码前缀匹配配置的路由，无匹配则返回 default_bot。"""
     global _code_bot_routes_cache, _code_bot_routes_cache_ts
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
@@ -877,7 +877,7 @@ async def set_bot_decode_interval(bot_username: str, interval_seconds: int):
 
 
 async def get_bot_decode_interval(bot_username: str) -> int:
-    """获取 bot 解码间隔,走内存缓存0 分钟 TTL)""
+    """获取 bot 解码间隔,走内存缓存0 分钟 TTL)"""
     global _bot_decode_interval_cache, _bot_decode_interval_cache_ts
     if _time.time() - _bot_decode_interval_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
@@ -962,7 +962,7 @@ _EXTERNAL_CODE_MAPPING_TTL = 60  # 60 秒(缩短以快速响应管理员修改)
 
 
 async def _refresh_external_code_mapping_cache():
-    """刷新外部码映射内存缓存""
+    """刷新外部码映射内存缓存"""
     global _external_code_mapping_cache, _external_code_mapping_cache_ts
     try:
         rows = await _external_code_mapping_col.find({})
@@ -977,7 +977,7 @@ async def _refresh_external_code_mapping_cache():
 
 
 async def get_system_code_for_external(external_code: str) -> str | None:
-    """查询外部码对应的系统码,命中idx_bot 可直接走本地解码流程""
+    """查询外部码对应的系统码,命中idx_bot 可直接走本地解码流程"""
     global _external_code_mapping_cache, _external_code_mapping_cache_ts
     # 检查缓存是否过期
     if _time.time() - _external_code_mapping_cache_ts > _EXTERNAL_CODE_MAPPING_TTL:
@@ -1004,7 +1004,7 @@ async def set_external_code_mapping(
     system_code: str,
     bot_username: str = "",
 ) -> bool:
-    """写入外部码→系统码映射(由采集器调用)""
+    """写入外部码→系统码映射(由采集器调用)"""
     import datetime as _dt
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     try:
@@ -1160,7 +1160,7 @@ def get_rotation_config_col() -> D1Collection:
 # ─── 备用池操作──────────────────────────────────────────────────
 
 async def add_spare_channel(channel_id: int, account_name: str = None) -> bool:
-    """添加备用频道到备用池""
+    """添加备用频道到备用池"""
     import datetime as _dt
     col = get_spare_pool_col()
     existing = await col.find_one({"channel_id": channel_id})
@@ -1180,7 +1180,7 @@ async def add_spare_channel(channel_id: int, account_name: str = None) -> bool:
 
 
 async def get_spare_for_account(account_name: str) -> dict | None:
-    """获取指定账号的未使用备用频道(优先同账号)""
+    """获取指定账号的未使用备用频道(优先同账号)"""
     col = get_spare_pool_col()
     # 优先匹配同账号
     spare = await col.find_one({"account_name": account_name, "is_used": 0})
@@ -1190,7 +1190,7 @@ async def get_spare_for_account(account_name: str) -> dict | None:
 
 
 async def get_any_spare() -> dict | None:
-    """获取任意未使用的备用频道(无账号归属)""
+    """获取任意未使用的备用频道(无账号归属)"""
     col = get_spare_pool_col()
     # 优先无归属的备用池频道
     spare = await col.find_one({"account_name": None, "is_used": 0})
@@ -1200,28 +1200,28 @@ async def get_any_spare() -> dict | None:
 
 
 async def consume_spare(channel_id: int) -> bool:
-    """标记备用频道为已使用""
+    """标记备用频道为已使用"""
     col = get_spare_pool_col()
     await col.update_one({"channel_id": channel_id}, {"$set": {"is_used": 1}})
     return True
 
 
 async def release_spare(channel_id: int) -> bool:
-    """释放备用频道回池(标记为未使用)""
+    """释放备用频道回池(标记为未使用)"""
     col = get_spare_pool_col()
     await col.update_one({"channel_id": channel_id}, {"$set": {"is_used": 0}})
     return True
 
 
 async def remove_spare(channel_id: int) -> bool:
-    """从备用池中删除频道""
+    """从备用池中删除频道"""
     col = get_spare_pool_col()
     await col.delete_one({"channel_id": channel_id})
     return True
 
 
 async def list_spare_pool() -> list[dict]:
-    """列出所有备用池频道""
+    """列出所有备用池频道"""
     col = get_spare_pool_col()
     return await col.find({}, sort=("account_name", 1))
 
@@ -1229,14 +1229,14 @@ async def list_spare_pool() -> list[dict]:
 # ─── 轮转配置操作 ──────────────────────────────────────────────
 
 async def get_rotation_config(key: str) -> str | None:
-    """读取轮转配置""
+    """读取轮转配置"""
     col = get_rotation_config_col()
     row = await col.find_one({"config_key": key})
     return row.get("config_value") if row else None
 
 
 async def set_rotation_config(key: str, value: str):
-    """写入轮转配置""
+    """写入轮转配置"""
     import datetime as _dt
     col = get_rotation_config_col()
     existing = await col.find_one({"config_key": key})
@@ -1254,7 +1254,7 @@ async def set_rotation_config(key: str, value: str):
 
 
 async def get_active_cells() -> list[dict]:
-    """获取所有状态为 active 的槽位,按环next_active_chat_id 排序""
+    """获取所有状态为 active 的槽位,按环next_active_chat_id 排序"""
     col = get_cells_col()
     cells = await col.find({"status": "active"})
     # 尝试按环形顺序排序
@@ -1282,7 +1282,7 @@ async def get_active_cells() -> list[dict]:
 
 
 async def get_next_active_cell(current_channel_id: int) -> dict | None:
-    """获取环形current 的下一active 槽位""
+    """获取环形current 的下一active 槽位"""
     col = get_cells_col()
     current = await col.find_one({"channel_id": current_channel_id, "status": "active"})
     if not current:
@@ -1296,13 +1296,13 @@ async def get_next_active_cell(current_channel_id: int) -> dict | None:
 
 
 async def get_active_or_shadow_cell(channel_id: int) -> dict | None:
-    """获取指定 channel cell 记录(任status)""
+    """获取指定 channel cell 记录(任status)"""
     col = get_cells_col()
     return await col.find_one({"channel_id": channel_id})
 
 
 async def set_cell_status(slot_id: str, new_status: str):
-    """更新 cell 状态""
+    """更新 cell 状态"""
     import datetime as _dt
     col = get_cells_col()
     await col.update_one(
@@ -1315,7 +1315,7 @@ async def set_cell_status(slot_id: str, new_status: str):
 
 
 async def update_cell_heartbeat(slot_id: str):
-    """更新 cell 心跳时间""
+    """更新 cell 心跳时间"""
     import datetime as _dt
     col = get_cells_col()
     await col.update_one(
@@ -1333,7 +1333,7 @@ async def enqueue_job(
     task_type: str = "single",
     protect_content: bool = False,
 ):
-    """jobs 表写入派工任务""
+    """jobs 表写入派工任务"""
     import datetime as _dt
     try:
         import orjson as _json
@@ -1358,7 +1358,8 @@ async def enqueue_job(
         status_counters["active_files"] = status_counters.get("active_files", 0) + 1
     except Exception:
         pass
-    # 通知 Dsp Bot（本地 SQLite 通知，零 RU）。    try:
+    # 通知 Dsp Bot（本地 SQLite 通知，零 RU）
+    try:
         from .cache_store import get_cache_store
         store = get_cache_store()
         await store.notify_dsp_new_job()
@@ -1584,7 +1585,7 @@ async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
 
 
 async def set_code_expiry(code: str, expires_at: str):
-    """设置取件码的过期时间""
+    """设置取件码的过期时间"""
     col = get_codes_col()
     await col.update_one(
         {"code": code},
@@ -1600,7 +1601,7 @@ async def log_rotate(
     reason: str,
     triggered_by: str = "mon",
 ):
-    """写降级审计日志""
+    """写降级审计日志"""
     import datetime as _dt
     col = get_rotate_log_col()
     await col.insert_one({

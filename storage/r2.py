@@ -85,6 +85,8 @@ class R2Storage:
         }
 
     async def upload(self, key: str, data: bytes, content_type: str = "application/octet-stream"):
+        if self._http is None:
+            raise RuntimeError("R2Storage not connected, call connect() first")
         url = f"{self.base_url}/{key}"
         headers = self._sign("PUT", key, content_type)
         headers["Content-Type"] = content_type
@@ -125,6 +127,8 @@ class R2Storage:
         return result
 
     async def delete(self, key: str):
+        if self._http is None:
+            raise RuntimeError("R2Storage not connected, call connect() first")
         url = f"{self.base_url}/{key}"
         headers = self._sign("DELETE", key)
         resp = await self._http.delete(url, headers=headers)

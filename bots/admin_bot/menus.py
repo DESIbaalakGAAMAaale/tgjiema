@@ -7,6 +7,12 @@ from utils.shared_counters import status_counters as _status_counters, status_co
 TOKEN = settings.ADMIN_BOT_TOKEN
 AUTHORIZED_USER_ID = settings.ADMIN_TELEGRAM_ID
 
+MEMBERSHIP_LEVELS = ("free", "basic", "premium")
+LEVEL_ALIAS = {
+    "1": "free", "2": "basic", "3": "premium",
+    "免费": "free", "基础": "basic", "高级": "premium",
+}
+
 
 def _auth_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):

@@ -61,6 +61,20 @@ for _tbl in ALL_TABLES:
     ])
 
 
+_ALLOWED_TABLES = frozenset([
+    "users", "file_records", "decode_logs", "pending_uploads",
+    "cells", "codes", "jobs", "rotate_log", "relay_accounts",
+    "spare_pool", "kv_config",
+])
+
+def _sanitize_table(name: str) -> str:
+    """白名单校验表名,防止 SQL 注入。"""
+    clean = name.strip().lower()
+    if clean not in _ALLOWED_TABLES:
+        raise ValueError(f"非法表名: {name}")
+    return clean
+
+
 def _sanitize_column(name: str) -> str:
     """白名单校验列名,防止 SQL 注入。"""
     clean = name.strip().lower()

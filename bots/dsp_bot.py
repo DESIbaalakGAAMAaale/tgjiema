@@ -334,6 +334,9 @@ async def _send_file_direct(bot, job) -> bool:
         except (json.JSONDecodeError, TypeError, IndexError):
             return False
 
+    if file_meta is None:
+        return False
+
     fid = file_meta.get("file_id", "")
     mtype = file_meta.get("type", "document")
     if not fid:
