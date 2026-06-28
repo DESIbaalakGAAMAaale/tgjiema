@@ -1,16 +1,8 @@
-# Mfile Bot — Cloudflare Workers 配置
 name = "mfile-bot"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
 
-# ─── 环境变量（Bot 公开用户名，用于引导文本）───
-# 部署后可在 Cloudflare Dashboard 修改
 [vars]
 UPLOAD_BOT_USERNAME = "your_upload_bot"
 DECODER_BOT_USERNAME = "your_decoder_bot"
 SENDER_BOT_USERNAME = "your_sender_bot"
-
-# ─── 免费额度说明 ───
-# Workers 免费: 10 万请求/天, 10ms CPU/请求
-# 防抖使用 Cache API（完全免费，无限量）
-# 预计日请求 < 1 万，远低于免费额度
