@@ -413,8 +413,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if bucket == "0":
             bucket = ""
         await set_config("r2_account_id", data["account_id"])
-        await set_config("r2_access_key_id", data["access_key"])
-        await set_config("r2_secret_access_key", data["secret_key"])
+        await set_config("r2_access_key", data["access_key"])
+        await set_config("r2_secret_key", data["secret_key"])
         if bucket:
             await set_config("r2_bucket", bucket)
         await _end(f"✅ R2 备份配置已保存\n  Bucket: {bucket or '(默认)'}\n⚠️ 需重启后生效")

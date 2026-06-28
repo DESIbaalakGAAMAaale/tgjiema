@@ -418,7 +418,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     return False
 
 
-async def _process_batch_job(bot, job, bot_id: int = 1):
+async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
     logger.info(
         f"[Dsp] 批量发送: 用户 {job.target_user_id}, "
         f"共{len(job.storage_msg_ids)} 个文件, 码:{job.code}"
@@ -455,12 +455,13 @@ async def _process_batch_job(bot, job, bot_id: int = 1):
             "target_user_id": job.target_user_id,
         }
 
-    await _send_page(
+    result = await _send_page(
         bot, job.target_user_id, job.code,
         file_meta_list, page=1, total_pages=total_pages,
         storage_channel_id=job.storage_channel_id,
         page_key=page_key if total_pages > 1 else None,
     )
+    return result
 
 
 async def _fallback_single_send(bot, job, bot_id: int = 1):
@@ -486,7 +487,7 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     await metrics.record_processed("dsp_bot")
 
 
-async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None):
+async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None) -> bool:
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
     page_items = file_meta_list[start:end]
@@ -505,7 +506,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
         except Exception:
             pass
-        return
+        return False
 
     if total_pages > 1 and page < total_pages:
         # 使用 page_key 避免多用户同码键冲突
@@ -522,6 +523,8 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             state["last_pagination_msg_id"] = sent_msg.message_id
         # 翻页提示之间间隔 0.3s,避免用户聊天被消息淹
         await asyncio.sleep(0.3)
+
+    return True
 
 
 # ─── 命令处理 ───

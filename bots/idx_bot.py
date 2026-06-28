@@ -713,7 +713,12 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if batch_ids_str:
         msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()]
     if not msg_ids:
-        msg_ids = [file_record.get("primary_channel_msg_id")]
+        primary_mid = file_record.get("primary_channel_msg_id")
+        if primary_mid is None:
+            logger.error(f"[Idx] primary_channel_msg_id 为空，无法发送: code={text}")
+            await safe_reply_text(update.message, "文件记录异常，请联系管理员")
+            return True
+        msg_ids = [primary_mid]
 
     batch_file_meta_str = file_record.get("batch_file_meta") or ""
     protect_content = file_record.get("protect_content", False)

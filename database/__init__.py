@@ -40,4 +40,5 @@ from .session import (
     consume_spare, release_spare, remove_spare, list_spare_pool,
     get_rotation_config_col, get_rotation_config, set_rotation_config,
     get_user_cached, update_user_and_invalidate, get_file_record_cached,
+    get_and_reset_dead_jobs,
 )

@@ -1033,6 +1033,7 @@ async def set_filebot_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── 帮助命令 ──────────────────────────────────────────────────
 
+@_auth_required
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "管理员面板 模块说明\n\n"
