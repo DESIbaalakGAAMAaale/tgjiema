@@ -11,7 +11,7 @@ from .handlers import (
     set_db_backup, factory_reset, purge_channel, add_code_route, remove_code_route,
     list_code_routes, set_bot_interval, remove_bot_interval, list_bot_intervals,
     spare_add, spare_remove, spare_list, rotation_set, rotation_view, topology,
-    cancel_conversation, set_filebot_msg, help_command,
+    cancel_conversation, help_command,
 )
 from .callback import menu_callback
 from .conversation import handle_conversation
@@ -80,7 +80,6 @@ def run():
     app.add_handler(CommandHandler("rotation_view", rotation_view))
     app.add_handler(CommandHandler("topology", topology))
     app.add_handler(CommandHandler("cancel", cancel_conversation))
-    app.add_handler(CommandHandler("set_filebot_msg", set_filebot_msg))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:)"))

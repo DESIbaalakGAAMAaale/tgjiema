@@ -1009,28 +1009,6 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("当前没有正在进行的操作。")
 
 
-# ─── 引导机器人消息热更新 ──────────────────────────────────────
-
-@_auth_required
-async def set_filebot_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = " ".join(context.args) if context.args else ""
-    if not text:
-        await update.message.reply_text(
-            "用法: /set_filebot_msg <文本>\n\n"
-            "设置 File Bot 的引导回复文本，支持换行符 \\n。\n"
-            "设为 reset 可恢复默认文本（从 .env 用户名拼接）。"
-        )
-        return
-    if text.lower() == "reset":
-        await set_config("filebot_msg", "")
-        await update.message.reply_text("✅ 已重置为默认引导文本，最多 60 秒后生效。")
-        return
-    # 处理 \n 转义
-    text = text.replace("\\n", "\n")
-    await set_config("filebot_msg", text)
-    await update.message.reply_text(f"✅ File Bot 引导文本已更新，最多 60 秒后生效:\n\n{text}")
-
-
 # ─── 帮助命令 ──────────────────────────────────────────────────
 
 @_auth_required
@@ -1070,7 +1048,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /set_quota_default <free|basic|premium> <配额> — 默认日配额（热更新）\n"
         "  /set_r2 <账号ID> <AccessKey> <SecretKey> — R2备份配置（需重启）\n"
         "  /set_db_backup <间隔分钟> <on|off> — 数据库自动备份（热更新）\n"
-        "  /set_filebot_msg <文本> — File Bot 引导文本（热更新）\n"
         "  /factory_reset — 恢复出厂设置\n\n"
         "文件码路由（第三方机器人迁移用）\n"
         "  /add_code_route <前缀> <机器人用户名> — 添加路由规则\n"

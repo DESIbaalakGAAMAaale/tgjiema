@@ -291,7 +291,6 @@ async def _get_configs_text() -> str:
         ("upload_bot_username", "📤 上传机器人", "✅热更新"),
         ("decoder_bot_username", "🔓 解码机器人", "✅热更新"),
         ("sender_bot_username", "📨 发送机器人", "✅热更新"),
-        ("filebot_msg", "📋 引导机器人消息", "✅热更新"),
     ]
 
     quota_keys = [
@@ -323,11 +322,7 @@ async def _get_configs_text() -> str:
         val = await get_config(key)
         if not val:
             val = _config_fallback(key)
-        if key == "filebot_msg" and val:
-            # 引导文本可能很长，截断显示
-            display = val[:50] + "..." if len(val) > 50 else val
-        else:
-            display = val if val else "❌ 未配置"
+        display = val if val else "❌ 未配置"
         msg += f"  {label}:{display} {indicator}\n"
 
     msg += "\n🎫 默认配额\n"

@@ -1,5 +1,6 @@
 # TG文件解码器 — Docker Compose 一键部署
-# 环形冗余 v2 架构（up / idx / dsp / mon / admin_bot / file_bot）
+# 环形冗余 v2 架构（up / idx / dsp / mon / admin_bot）
+# file_bot 已独立部署至 CF Workers
 #
 # 部署步骤:
 #   1. 创建 .env 文件（从 .env.example 复制并填写）

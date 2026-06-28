@@ -1,6 +1,7 @@
 """环形冗余架构 v2 运行入口
-启动 6 个主进程:up / idx / dsp / mon / admin_bot / file_bot
+启动 5 个主进程:up / idx / dsp / mon / admin_bot
 + admin web + db_backup
++ file_bot 已独立部署至 CF Workers,不在此启动
 启动时自动初始化拓扑(无需手动运行 seed_topology.py)
 + 子进程崩溃自动重启(带限流保护,永不删除进程记录)
 """
@@ -50,11 +51,6 @@ def run_admin_bot():
     run()
 
 
-def run_file_bot():
-    from bots.file_bot import run
-    run()
-
-
 def run_admin():
     import uvicorn
     from admin import app
@@ -78,7 +74,6 @@ BOT_RUNNERS = {
     "dsp": run_dsp_bot,
     "mon": run_mon_bot,
     "admin_bot": run_admin_bot,
-    "file_bot": run_file_bot,
     "admin": run_admin,
     "db_backup": run_db_backup,
 }
