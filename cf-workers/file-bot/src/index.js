@@ -9,6 +9,8 @@
  */
 
 // ─── 内存防抖 ───
+// 注意：CF Workers 是请求驱动、用完即焚的，多 isolate 下防抖可能"失效"，
+// 同一用户 60s 内可能收到两次回复。这对导航 bot 是可接受的，无需引入 KV。
 const debounce = new Map();
 const DEBOUNCE_MS = 60_000;
 
@@ -18,14 +20,6 @@ function isDebounced(uid) {
   debounce.set(uid, Date.now());
   return false;
 }
-
-// 每 10 分钟清理过期条目
-setInterval(() => {
-  const now = Date.now();
-  for (const [uid, ts] of debounce) {
-    if (now - ts > 600_000) debounce.delete(uid);
-  }
-}, 600_000);
 
 // ─── 引导文本 ───
 function buildGuide(up, idx, dsp) {
