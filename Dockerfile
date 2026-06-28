@@ -22,7 +22,7 @@ WORKDIR /app
 # 只安装运行时依赖（不含编译工具）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    libpq-dev && \
+    libpq-dev procps && \
     rm -rf /var/lib/apt/lists/*
 
 # 从 builder 复制已安装的 Python 包
