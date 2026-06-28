@@ -1056,10 +1056,10 @@ async def get_user_cached(user_id: int) -> Optional[dict]:
     return user
 
 
-async def update_user_and_invalidate(user_id: int, update: dict):
-    col = get_users_col()
-    await col.update_one({"user_id": user_id}, update)
-
+async def update_user_and_invalidate(user_id: int, update: dict = None):
+    if update is not None:
+        col = get_users_col()
+        await col.update_one({"user_id": user_id}, update)
     cache = get_user_cache()
     cache.invalidate(f"user:{user_id}")
 

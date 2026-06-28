@@ -39,4 +39,5 @@ from .session import (
     get_spare_pool_col, add_spare_channel, get_spare_for_account, get_any_spare,
     consume_spare, release_spare, remove_spare, list_spare_pool,
     get_rotation_config_col, get_rotation_config, set_rotation_config,
+    get_user_cached, update_user_and_invalidate, get_file_record_cached,
 )

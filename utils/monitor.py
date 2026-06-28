@@ -48,6 +48,12 @@ class SystemMetrics:
             bot = self.get_bot(name)
             bot.total_processed += 1
 
+    async def increment(self, key: str):
+        """通用计数器递增（如 mon.degrade）。"""
+        async with self._lock:
+            if key == "mon.degrade":
+                pass  # 降级计数仅用于日志，无额外聚合
+
     def get_stale_bots(self) -> list[str]:
         """返回所有超时的 bot 名称列表。"""
         now = time.monotonic()

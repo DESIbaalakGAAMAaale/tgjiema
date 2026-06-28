@@ -35,6 +35,7 @@ from database import (
     get_system_code_for_external,
     set_code_expiry,
     get_pending_jobs_count,
+    get_file_record_cached,
 )
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user

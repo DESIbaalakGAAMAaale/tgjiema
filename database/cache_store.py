@@ -10,6 +10,7 @@ except ImportError:
 import time
 import aiosqlite
 from pathlib import Path
+from typing import Optional
 from loguru import logger
 
 DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
