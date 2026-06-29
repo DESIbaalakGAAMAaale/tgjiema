@@ -551,33 +551,21 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["upload_options"] = {}
     context.user_data["upload_options"][key] = value
 
-    # 直接更新 MongoDB 中的 pending_uploads 记录
+    # 直接更新 pending_uploads 记录
     try:
         pending_col = get_pending_uploads_col()
-        # 查找该用户最近一条未处理的上传记录
         results = await pending_col.find({"uploader_id": user_id, "processed": 0}, sort=("id", -1), limit=1)
         latest = results[0] if results else None
         if latest and "id" in latest:
             update_fields = {}
             if key == "protect_content":
                 update_fields["protect_content"] = value == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
-                label = "🔒 禁止转发" if value == "true" else "↗️ 允许转发"
-                await query.edit_message_text(f"已选择:{label}")
+                await pending_col.update_one({"id": latest["id"]}, {"$set": update_fields})
             elif key == "file_ttl":
                 ttl_days = int(value) if value.isdigit() else settings.DEFAULT_FILE_TTL_DAYS
                 if ttl_days == 0:
                     ttl_days = settings.DEFAULT_FILE_TTL_DAYS
                 update_fields["file_ttl_days"] = ttl_days
-                ttl_labels = {
-                    0: "永久有效",
-                    1: "1天",
-                    7: "7天",
-                    30: "30天",
-                    90: "90天",
-                }
-                label = ttl_labels.get(ttl_days, f"{ttl_days}天")
-                await query.edit_message_text(f"文件码有效期:{label}")
-            if update_fields:
                 await pending_col.update_one({"id": latest["id"]}, {"$set": update_fields})
     except Exception as e:
         logger.debug(f"[Up] 更新 pending_uploads 选项失败: {e}")
