@@ -51,19 +51,20 @@ def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
         import asyncio
         from database import init_db, close_db, get_rotation_config
 
-        asyncio.get_event_loop().run_until_complete(init_db())
+        async def _load():
+            await init_db()
+            db_keys = {
+                "active_window_size": "active_window_size",
+                "rotation_files_per_slot": "rotation_files_per_slot",
+                "rotation_time_per_slot": "rotation_time_per_slot",
+            }
+            for key, db_key in db_keys.items():
+                val = await get_rotation_config(db_key)
+                if val and val.isdigit():
+                    result[key] = int(val)
+            await close_db()
 
-        db_keys = {
-            "active_window_size": "active_window_size",
-            "rotation_files_per_slot": "rotation_files_per_slot",
-            "rotation_time_per_slot": "rotation_time_per_slot",
-        }
-        for key, db_key in db_keys.items():
-            val = asyncio.get_event_loop().run_until_complete(get_rotation_config(db_key))
-            if val and val.isdigit():
-                result[key] = int(val)
-
-        asyncio.get_event_loop().run_until_complete(close_db())
+        asyncio.run(_load())
     except Exception as e:
         print(f"[警告] 无法从 DB 读取轮转配置,使用默认值: {e}")
 
