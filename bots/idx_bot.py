@@ -615,7 +615,7 @@ async def _process_pending_uploads(app: Application):
                         await safe_send_message(app.bot, chat_id=uploader_id, text=f"文件码：{file_code}\n\n"
                                  f"{note_line}"
                                  f"📤 发送文件@{settings.UPLOAD_BOT_USERNAME}\n"
-                                 f"🔍 输入文件码@{settings.DECODER_BOT_USERNAME}\n"
+                                 f"🔍 收码解码@{settings.DECODER_BOT_USERNAME}\n"
                                  f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
                         )
                         logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
@@ -640,6 +640,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = context.user_data.pop("_override_text", None) or update.message.text.strip()
 
     if not is_valid_code_format(text):
+        await safe_reply_text(update.message, "文件码无效，请发送纯文件码（如 mfilebot_xxx_1p）")
         return
 
     if not await global_rate_limiter.acquire():
