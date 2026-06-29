@@ -42,9 +42,11 @@ def build_file_code(file_types: dict) -> str:
 
 
 def is_valid_code_format(code: str) -> bool:
+    code = code.strip()
     if code.startswith(settings.FILE_CODE_PREFIX):
         return True
-    return bool(_BOT_PATTERN.match(code))
+    # 只有纯文件码（不含空格、换行、bot用户名）才算有效
+    return bool(_BOT_PATTERN.match(code)) and '\n' not in code and ' ' not in code
 
 
 def extract_bot_username(code: str) -> str:
