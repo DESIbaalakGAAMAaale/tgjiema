@@ -4,6 +4,10 @@
 + file_bot 已独立部署至 CF Workers,不在此启动
 启动时自动初始化拓扑(无需手动运行 seed_topology.py)
 + 子进程崩溃自动重启(带限流保护,永不删除进程记录)
+
+支持两种运行模式:
+  python run_all.py               → 多进程模式(所有 Bot,内部监控重启)
+  python run_all.py --standalone up  → 独立模式(单 Bot 直接运行,交给 systemd 管理)
 """
 
 import multiprocessing
@@ -188,6 +192,13 @@ def _monitor_and_restart(processes: dict, running_flag: multiprocessing.Value):
         time.sleep(5)
 
 
+def _run_standalone(name: str):
+    """独立模式:直接在主进程运行单个 Bot,崩溃后进程退出,交给 systemd 重启。"""
+    logger.info(f"[Standalone] 启动 {name} (独立模式,由 systemd 管理)")
+    runner = BOT_RUNNERS[name]
+    runner()
+
+
 def main():
     logger.add(
         "logs/tgjiema_{time}.log",
@@ -200,6 +211,19 @@ def main():
     _auto_seed()
 
     args = sys.argv[1:]
+
+    # ── 独立模式:--standalone <bot_name> ──
+    if args and args[0] == "--standalone":
+        if len(args) < 2:
+            logger.error("--standalone 需要指定 bot 名称,例如: python run_all.py --standalone up")
+            sys.exit(1)
+        bot_name = args[1]
+        if bot_name not in BOT_RUNNERS:
+            logger.error(f"未知的组件: {bot_name},可用: {list(BOT_RUNNERS.keys())}")
+            sys.exit(1)
+        _run_standalone(bot_name)
+        return
+
     if not args:
         args = ["all"]
 
