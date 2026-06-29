@@ -34,7 +34,7 @@ def check_code_expired(file_record: dict) -> tuple[bool, str]:
     expire_dt = expire_time
     if isinstance(expire_time, str):
         try:
-            expire_dt = datetime.fromisoformat(expire_time)
+            expire_dt = datetime.datetime.fromisoformat(expire_time)
         except (ValueError, TypeError):
             return False, ""
     
