@@ -31,7 +31,10 @@ def run():
         return
 
     import asyncio as _asyncio
-    _asyncio.get_event_loop().run_until_complete(_init())
+    _loop = _asyncio.new_event_loop()
+    _asyncio.set_event_loop(_loop)
+    _loop.run_until_complete(_init())
+    _loop.close()
     logger.info("启动管理员机器人...")
 
     app = Application.builder().token(TOKEN).build()

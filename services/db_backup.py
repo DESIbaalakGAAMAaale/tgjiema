@@ -54,9 +54,14 @@ async def run_db_backup():
         logger.warning("R2 凭证未配置,数据库备份跳过")
         return
 
-    from database import init_db
+    # 确保数据库连接已建立
     if db_client._pool is None:
-        await init_db()
+        try:
+            from database import init_db
+            await init_db()
+        except Exception as e:
+            logger.warning(f"数据库连接初始化失败,跳过备份: {e}")
+            return
 
     r2_storage.configure(
         account_id=settings.R2_ACCOUNT_ID,
