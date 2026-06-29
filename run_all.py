@@ -106,8 +106,7 @@ def _shutdown(processes: dict):
 
 def _auto_seed():
     """启动前自动初始化拓扑(静默,不交互)。
-    失败后检查 cells 表是否为空,为空则重试 3 次。
-    如果数据库本身没建表(首次部署),先执行 init_db 建表。
+    先建表,再初始化拓扑,失败不阻塞启动。
     """
     import asyncio
 
@@ -119,33 +118,13 @@ def _auto_seed():
     except Exception as e:
         logger.warning(f"[seed] 数据库表初始化失败: {e}")
 
-    max_retries = settings.TOPOLOGY_SEED_RETRIES
-    for attempt in range(1, max_retries + 1):
-        try:
-            from admin.seed_topology import auto_seed
-            asyncio.run(auto_seed())
-            logger.info("[seed] 拓扑初始化完成")
-            return
-        except Exception as e:
-            logger.warning(f"[seed] 自动拓扑初始化失败 (第{attempt}次): {e}")
-            if attempt < max_retries:
-                # 检查 cells 表是否为空
-                try:
-                    from database import get_cells_col
-                    count = asyncio.run(get_cells_col().count_documents({}))
-                    if count == 0:
-                        logger.info(f"[seed] cells 表为空,5秒后重试 ({attempt}/{max_retries})...")
-                        time.sleep(5)
-                        continue
-                    else:
-                        logger.info(f"[seed] cells 表已有 {count} 条记录,跳过重试")
-                        return
-                except Exception as check_err:
-                    logger.warning(f"[seed] 检查 cells 表失败: {check_err}")
-                    time.sleep(5)
-            else:
-                logger.warning(f"[seed] 拓扑初始化重试耗尽,将在首次使用时重试")
-                return
+    # 拓扑初始化(只试一次,失败不阻塞)
+    try:
+        from admin.seed_topology import auto_seed
+        asyncio.run(auto_seed())
+        logger.info("[seed] 拓扑初始化完成")
+    except Exception as e:
+        logger.warning(f"[seed] 拓扑初始化失败,将在首次使用时重试: {e}")
 
 
 def _monitor_and_restart(processes: dict, running_flag: multiprocessing.Value):
