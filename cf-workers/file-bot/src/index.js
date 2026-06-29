@@ -22,8 +22,8 @@ function isDebounced(uid) {
 }
 
 // ─── 引导文本 ───
-function buildGuide(up, idx, dsp) {
-  return (
+function buildGuide(up, idx, dsp, channelLink) {
+  let guide =
     `📁 Mfile — 使用指南\n\n` +
     `📤 上传文件\n` +
     `向 @${up} 发送文件，@${idx} 收到后会自动回复文件码。\n` +
@@ -34,9 +34,12 @@ function buildGuide(up, idx, dsp) {
     `📥 接收文件\n` +
     `解码成功后，@${dsp} 会自动将文件发送给您。\n\n` +
     `⚠️ 免责声明\n` +
-    `用户应对上传内容负责，本服务仅提供功能引导，不对文件内容负责。\n\n` +
-    `🔗 快速开始`
-  );
+    `用户应对上传内容负责，本服务仅提供功能引导，不对文件内容负责。`;
+  if (channelLink) {
+    guide += `\n\n📢 官方频道: ${channelLink}`;
+  }
+  guide += `\n\n🔗 快速开始`;
+  return guide;
 }
 
 function buildKeyboard(up, idx, dsp) {
@@ -64,7 +67,7 @@ async function sendMessage(chatId, text, replyMarkup, token) {
 }
 
 // ─── 消息处理 ───
-async function handleMessage(msg, token, up, idx, dsp) {
+async function handleMessage(msg, token, up, idx, dsp, channelLink) {
   const chat = msg?.chat;
   if (!chat || chat.type !== "private") return;
   const uid = msg?.from?.id;
@@ -73,7 +76,7 @@ async function handleMessage(msg, token, up, idx, dsp) {
   const text = msg?.text || "";
   try {
     if (text === "/start") {
-      await sendMessage(chat.id, buildGuide(up, idx, dsp), buildKeyboard(up, idx, dsp), token);
+      await sendMessage(chat.id, buildGuide(up, idx, dsp, channelLink), buildKeyboard(up, idx, dsp), token);
     } else {
       await sendMessage(chat.id, "请发送 /start 获取说明", undefined, token);
     }
@@ -92,7 +95,8 @@ export default {
             env.BOT_TOKEN,
             env.UP_BOT,
             env.IDX_BOT,
-            env.DSP_BOT
+            env.DSP_BOT,
+            env.CHANNEL_LINK || ""
           );
         }
       } catch {}

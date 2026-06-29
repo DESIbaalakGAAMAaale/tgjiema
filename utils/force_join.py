@@ -45,6 +45,7 @@ def three_bot_reminder() -> str:
     up = settings.UPLOAD_BOT_USERNAME
     de = settings.DECODER_BOT_USERNAME
     se = settings.SENDER_BOT_USERNAME
+    channel_link = settings.FORCE_JOIN_CHANNEL_LINK
     lines = ["\n⚠️ 使用前请先启动以下三个机器人:"]
     if up:
         lines.append(f"  1️⃣ 上传机器人:@{up}")
@@ -53,4 +54,6 @@ def three_bot_reminder() -> str:
     if se:
         lines.append(f"  3️⃣ 发送机器人:@{se}")
     lines.append("\n请确保已向这三个机器人均发送过 /start 命令,否则系统无法正常工作。")
+    if channel_link:
+        lines.append(f"\n📢 官方频道: {channel_link}")
     return "\n".join(lines)
