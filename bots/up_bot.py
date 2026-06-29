@@ -207,12 +207,16 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
         })
         logger.info(f"[Up] 批次文件写入pending_uploads: user={user.id}")
-        await get_cache_store().notify_new_upload()
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
         await update.message.reply_text("文件处理失败，请稍后重试")
         return
+
+    try:
+        await get_cache_store().notify_new_upload()
+    except Exception as e:
+        logger.warning(f"[Up] 通知 idx_bot 失败(不影响上传): {e}")
 
     metrics.upload_count += 1
     await metrics.record_processed("up_bot")
@@ -446,7 +450,6 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             "file_ttl_days": ttl,
         })
         logger.info(f"[Up] 媒体组文件写入pending_uploads: user={user_id}")
-        await get_cache_store().notify_new_upload()
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
@@ -455,6 +458,11 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         except Exception:
             pass
         return
+
+    try:
+        await get_cache_store().notify_new_upload()
+    except Exception as e:
+        logger.warning(f"[Up] 通知 idx_bot 失败(不影响上传): {e}")
 
     metrics.upload_count += 1
     await metrics.record_processed("up_bot")
@@ -508,12 +516,16 @@ async def _process_upload(
             "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
         })
         logger.info(f"[Up] 文件写入pending_uploads: user={user_id}")
-        await get_cache_store().notify_new_upload()
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
         await update.message.reply_text("文件处理失败，请稍后重试")
         return
+
+    try:
+        await get_cache_store().notify_new_upload()
+    except Exception as e:
+        logger.warning(f"[Up] 通知 idx_bot 失败(不影响上传): {e}")
 
     metrics.upload_count += 1
     await metrics.record_processed("up_bot")
@@ -708,9 +720,13 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
             "processed": 0,
         })
         logger.info(f"[Up][ext_relay] 外部文件已写入pending_uploads: code={external_code}, {len(msg_ids)}个文件")
-        await get_cache_store().notify_new_upload()
     except Exception as e:
         logger.error(f"[Up][ext_relay] 写入pending_uploads失败 (code={external_code}): {e}")
+
+    try:
+        await get_cache_store().notify_new_upload()
+    except Exception as e:
+        logger.warning(f"[Up][ext_relay] 通知 idx_bot 失败(不影响上传): {e}")
 
 
 async def _init():

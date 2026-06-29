@@ -7,6 +7,7 @@ try:
     import orjson as json
 except ImportError:
     import json
+import asyncio
 import time
 import aiosqlite
 from pathlib import Path
@@ -142,10 +143,19 @@ class CacheStore:
         """Up Bot 写入 pending_uploads 后调用，通知 Idx Bot 有新任务。"""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT INTO pending_notify (ts) VALUES (?)", (time.time(),)
-        )
-        await self._db.commit()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT INTO pending_notify (ts) VALUES (?)", (time.time(),)
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                logger.warning(f"[CacheStore] notify_new_upload 失败: {e}")
+                break
 
     async def has_new_upload(self) -> bool:
         """Idx Bot 检查是否有未处理的上传通知。有则返回 True 并原子清空。
@@ -165,10 +175,19 @@ class CacheStore:
         """Idx Bot 写 jobs 表后调用，通知 Dsp Bot 有新任务。"""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT INTO dsp_notify (ts) VALUES (?)", (time.time(),)
-        )
-        await self._db.commit()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT INTO dsp_notify (ts) VALUES (?)", (time.time(),)
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                logger.warning(f"[CacheStore] notify_dsp_new_job 失败: {e}")
+                break
 
     async def has_new_dsp_job(self) -> bool:
         """Dsp Bot 检查是否有未处理的新 jobs。有则返回 True 并原子清空。
