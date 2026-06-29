@@ -203,7 +203,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
-            "protect_content": opts.get("protect_content", "false") == "true" or settings.DEFAULT_PROTECT_CONTENT,
+            "protect_content": opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT),
             "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
         })
         logger.info(f"[Up] 批次文件写入pending_uploads: user={user.id}")
@@ -429,7 +429,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         else:
             # Fallback: 使用内存中的选项
             opts = context.user_data.pop("upload_options", {})
-            protect = opts.get("protect_content", "false") == "true" or settings.DEFAULT_PROTECT_CONTENT
+            protect = opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
             ttl = int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS
         await pending_col.insert_one({
             "uploader_id": user_id,
@@ -504,7 +504,7 @@ async def _process_upload(
             "status_msg_id": sent_msg.message_id,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
-            "protect_content": opts.get("protect_content", "false") == "true" or settings.DEFAULT_PROTECT_CONTENT,
+            "protect_content": opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT),
             "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
         })
         logger.info(f"[Up] 文件写入pending_uploads: user={user_id}")
@@ -548,7 +548,7 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
         if latest and "id" in latest:
             update_fields = {}
             if key == "protect_content":
-                update_fields["protect_content"] = value == "true" or settings.DEFAULT_PROTECT_CONTENT
+                update_fields["protect_content"] = value == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
                 label = "🔒 禁止转发" if value == "true" else "↗️ 允许转发"
                 await query.edit_message_text(f"已选择:{label}")
             elif key == "file_ttl":
