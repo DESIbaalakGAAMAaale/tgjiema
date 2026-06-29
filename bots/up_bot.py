@@ -482,59 +482,22 @@ async def _process_upload(
         return
 
     sent_msg = await update.message.reply_text(
-        f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
+        f"文件已接收，请选择上传选项："
     )
 
-    # 发送上传选项
-    try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="⚙️ 上传选项（可在发送文件码前修改）：",
-            reply_markup=_build_upload_options_keyboard(),
-        )
-    except Exception:
-        pass
-
-    type_str = _json_dumps(file_types)
-    note = update.message.caption or ""
-
-    try:
-        pending_col = get_pending_uploads_col()
-        opts = context.user_data.pop("upload_options", {})
-        await pending_col.insert_one({
-            "uploader_id": user_id,
-            "primary_channel_id": main_channel,
-            "primary_channel_msg_id": channel_msg_id,
-            "file_types": type_str,
-            "batch_msg_ids": "",
-            "batch_file_meta": _json_dumps([extract_file_meta(update)]),
-            "note": note,
-            "status_msg_id": sent_msg.message_id,
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "processed": 0,
-            "protect_content": opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT),
-            "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
-        })
-        logger.info(f"[Up] 文件写入pending_uploads: user={user_id}")
-    except Exception as e:
-        logger.error(f"[Up] 写入pending_uploads失败: {e}")
-        await metrics.record_error("up_bot")
-        await update.message.reply_text("文件处理失败，请稍后重试")
-        return
-
-    try:
-        await get_cache_store().notify_new_upload()
-    except Exception as e:
-        logger.warning(f"[Up] 通知 idx_bot 失败(不影响上传): {e}")
-
-    metrics.upload_count += 1
-    await metrics.record_processed("up_bot")
+    # 暂存必要信息，等用户选完选项后再写入 pending_uploads
+    context.user_data["_sent_msg_id"] = sent_msg.message_id
+    context.user_data["_main_channel"] = main_channel
+    context.user_data["_channel_msg_id"] = channel_msg_id
+    context.user_data["_file_types"] = file_types
+    context.user_data["_note"] = update.message.caption or ""
+    context.user_data["_file_meta"] = extract_file_meta(update)
 
 
 # ─── 上传选项回调 ───
 
 async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理上传选项按钮回调。直接更新 MongoDB 中的 pending_uploads 记录。"""
+    """处理上传选项按钮回调。选完所有选项后清除按钮并继续。"""
     query = update.callback_query
     await query.answer()
     data = query.data  # format: "option|key|value"
@@ -546,29 +509,77 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
     key = parts[1]
     value = parts[2]
 
-    # 更新内存中的选项(兼容旧逻辑)
+    # 第一次点击：发送选项键盘
     if "upload_options" not in context.user_data:
         context.user_data["upload_options"] = {}
+
     context.user_data["upload_options"][key] = value
 
-    # 直接更新 pending_uploads 记录
+    # 检查两个选项是否都已选
+    opts = context.user_data.get("upload_options", {})
+    if "protect_content" in opts and "file_ttl" in opts:
+        # 所有选项已选完，写入 pending_uploads 并通知 idx_bot
+        await _finalize_upload(query, context, user_id)
+    else:
+        # 只选了一个，发送选项键盘让用户选第二个
+        await query.edit_message_text(
+            text=query.message.text.markdown if query.message.text and query.message.text.parse_mode == "Markdown" else "⚙️ 上传选项：",
+            reply_markup=_build_upload_options_keyboard(),
+        )
+
+
+async def _finalize_upload(query, context, user_id: int):
+    """用户选完所有选项后，写入 pending_uploads 并通知 idx_bot。"""
     try:
         pending_col = get_pending_uploads_col()
-        results = await pending_col.find({"uploader_id": user_id, "processed": 0}, sort=("id", -1), limit=1)
-        latest = results[0] if results else None
-        if latest and "id" in latest:
-            update_fields = {}
-            if key == "protect_content":
-                update_fields["protect_content"] = value == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
-                await pending_col.update_one({"id": latest["id"]}, {"$set": update_fields})
-            elif key == "file_ttl":
-                ttl_days = int(value) if value.isdigit() else settings.DEFAULT_FILE_TTL_DAYS
-                if ttl_days == 0:
-                    ttl_days = settings.DEFAULT_FILE_TTL_DAYS
-                update_fields["file_ttl_days"] = ttl_days
-                await pending_col.update_one({"id": latest["id"]}, {"$set": update_fields})
+        sent_msg_id = context.user_data.pop("_sent_msg_id", 0)
+        main_channel = context.user_data.pop("_main_channel", 0)
+        channel_msg_id = context.user_data.pop("_channel_msg_id", 0)
+        file_types = context.user_data.pop("_file_types", {})
+        note = context.user_data.pop("_note", "")
+        file_meta = context.user_data.pop("_file_meta", {})
+        opts = context.user_data.pop("upload_options", {})
+
+        type_str = _json_dumps(file_types)
+        protect = opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
+        ttl = int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS
+
+        await pending_col.insert_one({
+            "uploader_id": user_id,
+            "primary_channel_id": main_channel,
+            "primary_channel_msg_id": channel_msg_id,
+            "file_types": type_str,
+            "batch_msg_ids": "",
+            "batch_file_meta": _json_dumps([file_meta]),
+            "note": note,
+            "status_msg_id": sent_msg_id,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "processed": 0,
+            "protect_content": protect,
+            "file_ttl_days": ttl,
+        })
+        logger.info(f"[Up] 文件写入pending_uploads: user={user_id}")
+
+        try:
+            await get_cache_store().notify_new_upload()
+        except Exception as e:
+            logger.warning(f"[Up] 通知 idx_bot 失败(不影响上传): {e}")
+
+        metrics.upload_count += 1
+        await metrics.record_processed("up_bot")
+
+        # 清除按钮，显示确认消息
+        await query.edit_message_text(
+            text=f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你",
+            reply_markup=None,
+        )
     except Exception as e:
-        logger.debug(f"[Up] 更新 pending_uploads 选项失败: {e}")
+        logger.error(f"[Up] 写入pending_uploads失败: {e}")
+        await metrics.record_error("up_bot")
+        try:
+            await query.edit_message_text(text="文件处理失败，请稍后重试")
+        except Exception:
+            pass
 
 
 def _build_upload_options_keyboard():
