@@ -903,9 +903,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
 
     remaining_info = ""
     parts = []
-    if result.remaining_quota >= 0:
+    if result and result.remaining_quota >= 0:
         parts.append(f"总解码剩{result.remaining_quota}")
-    if result.remaining_external_quota >= 0:
+    if result and result.remaining_external_quota >= 0:
         parts.append(f"外部码剩{result.remaining_external_quota}")
     remaining_info = " | ".join(parts)
 
