@@ -187,7 +187,7 @@ DDL_STATEMENTS = [
         api_hash     TEXT NOT NULL,
         phone        TEXT NOT NULL UNIQUE,
         is_active    INTEGER DEFAULT 1,
-        created_at   TEXT DEFAULT (datetime('now')),
+        created_at   TEXT DEFAULT (CAST(current_timestamp AS TEXT)),
         last_login_at TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_relay_accounts_phone ON relay_accounts(phone)",
