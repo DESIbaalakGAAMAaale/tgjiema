@@ -167,6 +167,7 @@ class CacheStore:
         row = await self._db.execute_fetchall(
             "DELETE FROM pending_notify WHERE id = (SELECT id FROM pending_notify LIMIT 1) RETURNING id"
         )
+        await self._db.commit()
         return bool(row)
 
     # ─── Dsp Bot 通知：Idx Bot 写入 → Dsp Bot 感知 ───
@@ -199,6 +200,7 @@ class CacheStore:
         row = await self._db.execute_fetchall(
             "DELETE FROM dsp_notify WHERE id = (SELECT id FROM dsp_notify LIMIT 1) RETURNING id"
         )
+        await self._db.commit()
         return bool(row)
 
     async def close(self):
