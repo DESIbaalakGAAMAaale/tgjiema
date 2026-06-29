@@ -641,7 +641,8 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1. 先检查消息中是否包含内部文件码（最高优先级）
     prefix = settings.FILE_CODE_PREFIX
-    internal_match = re.search(r'(' + re.escape(prefix) + r'[a-z0-9_]+(?:_[0-9]+[padvg])?)', raw_text, re.IGNORECASE)
+    # 匹配 mfilebot_xxx_xxx 或 mfilebot_xxx_1p 等格式
+    internal_match = re.search(r'(?:^|\s|：)([' + re.escape(prefix) + r'][a-zA-Z0-9_]+(?:_[0-9]+[a-z]+)?)', raw_text)
 
     if internal_match:
         # 内部码：优先走本地解码
