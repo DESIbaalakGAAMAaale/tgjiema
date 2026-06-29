@@ -107,14 +107,24 @@ def _shutdown(processes: dict):
 def _auto_seed():
     """启动前自动初始化拓扑(静默,不交互)。
     失败后检查 cells 表是否为空,为空则重试 3 次。
+    如果数据库本身没建表(首次部署),先执行 init_db 建表。
     """
     import asyncio
+
+    # 先尝试建表
+    try:
+        from database.session import init_db
+        asyncio.run(init_db())
+        logger.info("[seed] 数据库表初始化完成")
+    except Exception as e:
+        logger.warning(f"[seed] 数据库表初始化失败: {e}")
 
     max_retries = settings.TOPOLOGY_SEED_RETRIES
     for attempt in range(1, max_retries + 1):
         try:
             from admin.seed_topology import auto_seed
             asyncio.run(auto_seed())
+            logger.info("[seed] 拓扑初始化完成")
             return
         except Exception as e:
             logger.warning(f"[seed] 自动拓扑初始化失败 (第{attempt}次): {e}")
@@ -134,8 +144,8 @@ def _auto_seed():
                     logger.warning(f"[seed] 检查 cells 表失败: {check_err}")
                     time.sleep(5)
             else:
-                logger.error("[seed] 自动拓扑初始化重试耗尽,cells 表可能为空,程序将退出")
-                sys.exit(1)
+                logger.warning(f"[seed] 拓扑初始化重试耗尽,将在首次使用时重试")
+                return
 
 
 def _monitor_and_restart(processes: dict, running_flag: multiprocessing.Value):
