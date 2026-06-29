@@ -107,6 +107,7 @@ class Settings(BaseSettings):
     SEND_CONCURRENCY: int = 25                  # Dsp 发送并发上限
     PAGE_SIZE: int = 10                         # 分页大小
     EXTERNAL_MEDIA_GROUP_TTL: int = 300         # 外部媒体组 TTL（秒）
+    CACHE_STORE_CLEANUP_DAYS: int = 30          # 本地缓存清理天数
     MAX_RESTART_COUNT: int = 3                  # 5分钟内最大重启次数
     MAX_RESTART_WINDOW: int = 300               # 重启计数窗口（秒）
 
