@@ -18,8 +18,8 @@ from .conversation import handle_conversation
 
 
 async def _init():
-    from database import init_db
-    await init_db()
+    """数据库初始化已在 _auto_seed 中执行，无需重复。"""
+    pass
 
 
 def run():
@@ -30,11 +30,6 @@ def run():
         logger.warning("管理员 Telegram ID 未配置（ADMIN_TELEGRAM_ID），跳过启动")
         return
 
-    import asyncio as _asyncio
-    _loop = _asyncio.new_event_loop()
-    _asyncio.set_event_loop(_loop)
-    _loop.run_until_complete(_init())
-    _loop.close()
     logger.info("启动管理员机器人...")
 
     app = Application.builder().token(TOKEN).build()
