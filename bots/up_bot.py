@@ -415,8 +415,8 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text="⚙️ 上传选项（可在发送文件码前修改）：",
-            reply_markup=_build_upload_options_keyboard(),
+            text="请选择文件有效期：",
+            reply_markup=_build_ttl_keyboard(),
         )
     except Exception:
         pass
@@ -481,23 +481,24 @@ async def _process_upload(
         await update.message.reply_text("文件处理失败，请稍后重试")
         return
 
-    sent_msg = await update.message.reply_text(
-        f"文件已接收，请选择上传选项："
-    )
-
-    # 暂存必要信息，等用户选完选项后再写入 pending_uploads
-    context.user_data["_sent_msg_id"] = sent_msg.message_id
+    # 暂存必要信息
     context.user_data["_main_channel"] = main_channel
     context.user_data["_channel_msg_id"] = channel_msg_id
     context.user_data["_file_types"] = file_types
     context.user_data["_note"] = update.message.caption or ""
     context.user_data["_file_meta"] = extract_file_meta(update)
 
+    # 第一步：发送有效期选择
+    await update.message.reply_text(
+        "请选择文件有效期：",
+        reply_markup=_build_ttl_keyboard(),
+    )
+
 
 # ─── 上传选项回调 ───
 
 async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理上传选项按钮回调。选完所有选项后清除按钮并继续。"""
+    """处理上传选项按钮回调。分两步：先选有效期，再选转发权限。"""
     query = update.callback_query
     await query.answer()
     data = query.data  # format: "option|key|value"
@@ -509,22 +510,26 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
     key = parts[1]
     value = parts[2]
 
-    # 第一次点击：发送选项键盘
-    if "upload_options" not in context.user_data:
-        context.user_data["upload_options"] = {}
-
-    context.user_data["upload_options"][key] = value
-
-    # 检查两个选项是否都已选
-    opts = context.user_data.get("upload_options", {})
-    if "protect_content" in opts and "file_ttl" in opts:
-        # 所有选项已选完，写入 pending_uploads 并通知 idx_bot
-        await _finalize_upload(query, context, user_id)
-    else:
-        # 只选了一个，发送选项键盘让用户选第二个
+    # 第一步：已选有效期 → 弹出转发权限选择
+    if "file_ttl" in context.user_data and "protect_content" not in context.user_data:
+        context.user_data["protect_content"] = value
         await query.edit_message_text(
-            text=query.message.text.markdown if query.message.text and query.message.text.parse_mode == "Markdown" else "⚙️ 上传选项：",
-            reply_markup=_build_upload_options_keyboard(),
+            text="请选择转发权限：",
+            reply_markup=_build_protect_keyboard(),
+        )
+        return
+
+    # 第二步：已选转发权限 → 完成上传
+    if "file_ttl" in context.user_data and "protect_content" in context.user_data:
+        await _finalize_upload(query, context, user_id)
+        return
+
+    # 首次点击：弹出有效期选择
+    if "file_ttl" not in context.user_data:
+        context.user_data["file_ttl"] = value
+        await query.edit_message_text(
+            text="请选择转发权限：",
+            reply_markup=_build_protect_keyboard(),
         )
 
 
@@ -532,17 +537,19 @@ async def _finalize_upload(query, context, user_id: int):
     """用户选完所有选项后，写入 pending_uploads 并通知 idx_bot。"""
     try:
         pending_col = get_pending_uploads_col()
-        sent_msg_id = context.user_data.pop("_sent_msg_id", 0)
         main_channel = context.user_data.pop("_main_channel", 0)
         channel_msg_id = context.user_data.pop("_channel_msg_id", 0)
         file_types = context.user_data.pop("_file_types", {})
         note = context.user_data.pop("_note", "")
         file_meta = context.user_data.pop("_file_meta", {})
-        opts = context.user_data.pop("upload_options", {})
+        ttl = context.user_data.pop("file_ttl", "0")
+        protect = context.user_data.pop("protect_content", "false")
 
         type_str = _json_dumps(file_types)
-        protect = opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
-        ttl = int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS
+        protect_bool = protect == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
+        ttl_days = int(ttl) if ttl.isdigit() else settings.DEFAULT_FILE_TTL_DAYS
+        if ttl_days == 0:
+            ttl_days = settings.DEFAULT_FILE_TTL_DAYS
 
         await pending_col.insert_one({
             "uploader_id": user_id,
@@ -552,11 +559,11 @@ async def _finalize_upload(query, context, user_id: int):
             "batch_msg_ids": "",
             "batch_file_meta": _json_dumps([file_meta]),
             "note": note,
-            "status_msg_id": sent_msg_id,
+            "status_msg_id": 0,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
-            "protect_content": protect,
-            "file_ttl_days": ttl,
+            "protect_content": protect_bool,
+            "file_ttl_days": ttl_days,
         })
         logger.info(f"[Up] 文件写入pending_uploads: user={user_id}")
 
@@ -582,13 +589,9 @@ async def _finalize_upload(query, context, user_id: int):
             pass
 
 
-def _build_upload_options_keyboard():
-    """构建上传选项按钮。"""
+def _build_ttl_keyboard():
+    """构建有效期选择按钮。"""
     keyboard = [
-        [
-            InlineKeyboardButton("🔒 禁止转发", callback_data="option|protect_content|true"),
-            InlineKeyboardButton("↗️ 允许转发", callback_data="option|protect_content|false"),
-        ],
         [
             InlineKeyboardButton("∞ 永久有效", callback_data="option|file_ttl|0"),
             InlineKeyboardButton("1天", callback_data="option|file_ttl|1"),
@@ -599,6 +602,17 @@ def _build_upload_options_keyboard():
         ],
         [
             InlineKeyboardButton("90天", callback_data="option|file_ttl|90"),
+        ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_protect_keyboard():
+    """构建转发权限选择按钮。"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🔒 禁止转发", callback_data="option|protect_content|true"),
+            InlineKeyboardButton("↗️ 允许转发", callback_data="option|protect_content|false"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
