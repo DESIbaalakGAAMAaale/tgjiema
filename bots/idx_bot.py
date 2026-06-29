@@ -637,10 +637,28 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_force_join(update, context):
         return
-    text = context.user_data.pop("_override_text", None) or update.message.text.strip()
+    raw_text = context.user_data.pop("_override_text", None) or update.message.text.strip()
 
-    if not is_valid_code_format(text):
-        await safe_reply_text(update.message, "文件码无效，请发送纯文件码（如 mfilebot_xxx_1p）")
+    # 1. 提取文件码和 bot 用户名
+    prefix = settings.FILE_CODE_PREFIX
+    code, bot_username = extract_code_and_bot_from_message(raw_text)
+
+    # 2. 判断走内部码还是第三方码
+    if code.startswith(prefix):
+        # 内部码：文件码前缀匹配 FILE_CODE_PREFIX
+        text_to_use = code
+        is_external = False
+    elif bot_username:
+        # 第三方码：消息内含 bot 用户名
+        text_to_use = code
+        is_external = True
+    elif code:
+        # 有内容但不含 bot → 尝试当内部码处理
+        text_to_use = code
+        is_external = False
+    else:
+        # 什么都提取不到
+        await safe_reply_text(update.message, "消息格式不正确，请发送文件码或包含 bot 用户名的消息")
         return
 
     if not await global_rate_limiter.acquire():
@@ -655,46 +673,39 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
 
-    result = await check_decode_permission(user.id, text)
+    if is_external:
+        # 第三方码：走中继或目标 bot
+        await handle_external_code(update, context, user.id, text_to_use, bot_username, result=None)
+        return
+
+    # 内部码：查 codes 表
+    result = await check_decode_permission(user.id, text_to_use)
 
     if not result.allowed:
         await safe_reply_text(update.message, result.reason)
         return
 
-    if result.is_external:
-        from utils.code_decoder import is_likely_bot_api_file_id
-        if is_likely_bot_api_file_id(text) and relay_pool.instances:
-            # 选择任意一个就绪的实例来交付缓
-            for inst in relay_pool.instances:
-                if inst.is_ready:
-                    await inst.deliver_cached(user.id, text)
-                    await safe_reply_text(update.message, "正在发送文请稍..")
-                    return
-        await handle_external_code(update, context, user.id, text, result)
-        return
-
-    # 检查取件码是否过期(codes 走缓
+    # 检查取件码是否过期
     try:
         from database.cache import get_code_cache
         from services.permission import check_code_expired
         code_cache = get_code_cache()
-        cache_key = f"code:{text}"
+        cache_key = f"code:{text_to_use}"
         code_entry = code_cache.get(cache_key)
         if code_entry is None:
             codes_col = get_codes_col()
-            code_entry = await codes_col.find_one({"code": text})
+            code_entry = await codes_col.find_one({"code": text_to_use})
             if code_entry:
                 code_cache.set(cache_key, code_entry)
         if code_entry:
-            # 同时file_records 获取完整过期信息
-            file_record = await get_file_record_cached(text)
+            file_record = await get_file_record_cached(text_to_use)
             if file_record:
                 expired, reason = check_code_expired(file_record)
                 if expired:
                     await safe_reply_text(update.message, reason)
                     return
     except Exception as e:
-        logger.warning(f"[Idx][handle_code] codes 表查询失(code={text}): {e}")
+        logger.warning(f"[Idx][handle_code] codes 表查询失败(code={text_to_use}): {e}")
 
     file_record = result.file_record
 
@@ -840,8 +851,9 @@ def _resolve_bot_username(update: Update) -> str | None:
     return None
 
 
-async def handle_external_code(update, context, user_id, code, result):
-    bot_username = result.external_bot_username
+async def handle_external_code(update, context, user_id, code, bot_username, result):
+    if bot_username is None and result:
+        bot_username = result.external_bot_username
 
     original_code = context.user_data.pop("_original_external_code", None)
     if original_code:
