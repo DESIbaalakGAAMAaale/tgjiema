@@ -22,7 +22,7 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if member.status not in ("left", "kicked"):
             return True
     except Exception as e:
-        logger.warning(f"强制加群检查失败: {e}")
+        logger.debug(f"强制加群检查失败: {e}")
 
     channel_link = settings.FORCE_JOIN_CHANNEL_LINK
     keyboard = InlineKeyboardMarkup([

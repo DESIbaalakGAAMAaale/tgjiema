@@ -22,9 +22,10 @@ class CacheStore:
 
     async def init(self):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(DB_PATH))
+        self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS cache_backup (
                 key    TEXT PRIMARY KEY,

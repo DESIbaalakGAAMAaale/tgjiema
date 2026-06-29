@@ -124,15 +124,17 @@ class RelayDB:
 
     async def init(self):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(DB_PATH))
+        self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA busy_timeout=5000")
         await self._db.execute("PRAGMA wal_autocheckpoint=1000")
         await self._db.executescript(DDL)
         await self._db.commit()
         
         # 启动恢复：如果 SQLite 为空，从 CRDB 拉取
-        row = await self._db.execute_fetchone("SELECT COUNT(*) FROM relay_accounts")
+        cursor = await self._db.execute("SELECT COUNT(*) FROM relay_accounts")
+        row = await cursor.fetchone()
         if row and row[0] == 0:
             try:
                 from .session import get_relay_accounts_from_crdb
@@ -237,11 +239,12 @@ class RelayDB:
     # ── relay_usage ──
 
     async def get_usage(self, relay_id: int) -> dict:
-        row = await self._db.execute_fetchone(
+        cursor = await self._db.execute(
             "SELECT today_requests, total_requests, total_wait_ms, avg_wait_ms, "
             "last_request_at, last_reset_at FROM relay_usage WHERE relay_id=?",
             (relay_id,),
         )
+        row = await cursor.fetchone()
         if not row:
             return {
                 "relay_id": relay_id,

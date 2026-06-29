@@ -172,9 +172,9 @@ class Settings(BaseSettings):
         """
         accounts = []
         for i in range(1, 6):
-            name = getattr(self, f"ACCOUNT_{i}_NAME", "")
+            name = getattr(self, f"ACCOUNT_{i}_NAME", "") or f"账号{i}"
             channels_str = getattr(self, f"ACCOUNT_{i}_CHANNELS", "")
-            if not name or not channels_str:
+            if not channels_str:
                 continue
             channels = []
             for ch in channels_str.split(","):

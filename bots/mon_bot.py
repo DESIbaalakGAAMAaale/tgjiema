@@ -61,6 +61,7 @@ class MonBot:
         # 通知管理员的 admin_bot 实例(延迟初始化)
         self._admin_bot = None
         self._admin_chat_id = settings.ADMIN_TELEGRAM_ID
+        self._notify_last_fail_ts: float = 0
         # 轮转状态
         self._rotation = {
             "active_window_size": 3,
@@ -135,8 +136,11 @@ class MonBot:
 
     async def _notify_admin(self, msg: str):
         """通知管理员(通过 admin_bot 或直接向管理员聊天发消息)。"""
-        if not self._admin_chat_id:
-            logger.warning(f"[Mon][Notify] 未配置 ADMIN_TELEGRAM_ID,无法通知: {msg}")
+        if not self._admin_chat_id or self._admin_chat_id == 0:
+            return  # 未配置管理员 ID,静默跳过
+        # 冷却机制:连续失败后 10 分钟不再重试
+        now = time.time()
+        if self._notify_last_fail_ts and now - self._notify_last_fail_ts < 600:
             return
         try:
             if not self._admin_bot:
@@ -145,14 +149,16 @@ class MonBot:
                     self._admin_bot = Bot(token=admin_token)
                     await self._admin_bot.initialize()
                 else:
-                    self._admin_bot = self.bot  # 回退到 Mon Bot 自己的 token
+                    self._admin_bot = self.bot
             await self._admin_bot.send_message(
                 chat_id=self._admin_chat_id,
                 text=msg,
                 disable_web_page_preview=True,
             )
+            self._notify_last_fail_ts = 0  # 成功,重置冷却
         except Exception as e:
-            logger.error(f"[Mon][Notify] 发送通知失败: {e}")
+            self._notify_last_fail_ts = now
+            logger.warning(f"[Mon][Notify] 发送通知失败: {e}")
 
     async def _handle_channel_ban(self, cell: dict, error: str):
         """处理频道封禁/丢失:通知管理员 + 尝试从备用池补充。"""
