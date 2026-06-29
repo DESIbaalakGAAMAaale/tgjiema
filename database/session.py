@@ -69,7 +69,6 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_requester ON decode_logs(requester_id)",
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_request_time ON decode_logs(request_time)",
     "CREATE INDEX IF NOT EXISTS idx_file_records_msg_id ON file_records(primary_channel_msg_id)",
-    "CREATE INDEX IF NOT EXISTS idx_send_queue_processed_created ON send_queue(processed, created_at)",  # 已废弃(v2 用 jobs 表)
     """CREATE TABLE IF NOT EXISTS pending_uploads (
         id SERIAL PRIMARY KEY,
         uploader_id BIGINT,
