@@ -28,8 +28,8 @@
 - 拓扑配置编辑 **config/groups.yaml**（只需填每组的 3 个 channel_id，共 45 行）
 - 运行 `python config/generate_topology.py` 自动生成 topology.yaml（环形指针自动计算）
 - 运行 `python admin/seed_topology.py` 写入数据库 cells 表
-- Docker 部署：`docker-compose up -d --build`
-- 一键部署：`.\deploy.ps1`
+- VPS 部署：`bash deploy_vps_per_bot.sh`（每个 Bot 独立 systemd 服务，7 个单元）
+- Windows 部署：`.\deploy.ps1`
 
 ## Git 提交规则
 - 每次完成代码修改后，**自动执行 git 提交和推送**到 GitHub，不需要用户提醒
