@@ -639,27 +639,23 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     raw_text = context.user_data.pop("_override_text", None) or update.message.text.strip()
 
-    # 1. 提取文件码和 bot 用户名
+    # 1. 先检查消息中是否包含内部文件码（最高优先级）
     prefix = settings.FILE_CODE_PREFIX
-    code, bot_username = extract_code_and_bot_from_message(raw_text)
+    internal_match = re.search(r'(' + re.escape(prefix) + r'[a-z0-9_]+(?:_[0-9]+[padvg])?)', raw_text, re.IGNORECASE)
 
-    # 2. 判断走内部码还是第三方码
-    if code.startswith(prefix):
-        # 内部码：文件码前缀匹配 FILE_CODE_PREFIX
-        text_to_use = code
-        is_external = False
-    elif bot_username:
-        # 第三方码：消息内含 bot 用户名
-        text_to_use = code
-        is_external = True
-    elif code:
-        # 有内容但不含 bot → 尝试当内部码处理
-        text_to_use = code
+    if internal_match:
+        # 内部码：优先走本地解码
+        text_to_use = internal_match.group(1)
         is_external = False
     else:
-        # 什么都提取不到
-        await safe_reply_text(update.message, "消息格式不正确，请发送文件码或包含 bot 用户名的消息")
-        return
+        # 2. 没有内部码 → 提取 bot 用户名走第三方码
+        code, bot_username = extract_code_and_bot_from_message(raw_text)
+        if bot_username:
+            text_to_use = code
+            is_external = True
+        else:
+            await safe_reply_text(update.message, "消息格式不正确，请发送文件码或包含 bot 用户名的消息")
+            return
 
     if not await global_rate_limiter.acquire():
         await safe_reply_text(update.message, "系统繁忙,请稍后重试")
