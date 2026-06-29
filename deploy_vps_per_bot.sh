@@ -172,7 +172,7 @@ info "创建聚合 target..."
 cat > "/etc/systemd/system/${SVC_PREFIX}.target" << EOF
 [Unit]
 Description=TG文件解码器 — 全部服务
-Wants=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-file_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service
+Wants=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service
 After=network.target
 
 [Install]
@@ -210,7 +210,6 @@ sleep 3
 systemctl start "${SVC_PREFIX}-dsp" 2>/dev/null || true
 systemctl start "${SVC_PREFIX}-mon" 2>/dev/null || true
 systemctl start "${SVC_PREFIX}-admin_bot" 2>/dev/null || true
-systemctl start "${SVC_PREFIX}-file_bot" 2>/dev/null || true
 systemctl start "${SVC_PREFIX}-admin" 2>/dev/null || true
 
 sleep 3
