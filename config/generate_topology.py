@@ -20,6 +20,9 @@ R100:不接入环形链表,仅作最终兜底存档。
 import os
 import sys
 
+# 确保项目根目录在 sys.path 中（从项目根目录 python config/generate_topology.py 运行时需要）
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import yaml
 
 
