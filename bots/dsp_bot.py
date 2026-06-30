@@ -19,7 +19,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from loguru import logger
 
 from config import settings
-from database import dequeue_jobs, get_file_records_col, get_file_record_cached, get_pending_jobs_count_local, reenqueue_job, reenqueue_job_no_retry, mark_job_dead, set_cell_status, get_active_or_shadow_cell
+from database import get_file_record_cached, get_pending_jobs_count_local, set_cell_status, get_active_or_shadow_cell
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
@@ -212,121 +212,114 @@ def _build_page_number_buttons(file_code: str, current_page: int, total_pages: i
     return buttons
 
 
-# ─── 核心: 4 worker 并发处理 jobs ───
+# ─── 核心: worker 并发处理 jobs ───
 
 async def process_queue(bot):
-    """启动多个 worker 并发处理 jobs 队列"""
-    workers = []
-    num_workers = min(4, _SEND_CONCURRENCY)  # 最多 4 个 worker
+    """启动 worker 并发处理 jobs 队列。每个 worker 批量拉取后并发发送。"""
+    num_workers = 2  # 2 个 worker 并发拉取 + 内部并发发送,足以支撑 25 并发上限
     logger.info(f"[Dsp] 启动 {num_workers} 个worker,并发上限 {_SEND_CONCURRENCY}")
-    for i in range(num_workers):
-        w = create_safe_task(_dsp_worker(bot, i), name=f"dsp-worker-{i}")
-        workers.append(w)
-
+    workers = [create_safe_task(_dsp_worker(bot, i), name=f"dsp-worker-{i}") for i in range(num_workers)]
     for w in workers:
         await w
 
 
+def _raw_jobs_to_results(raw_jobs: list[dict]) -> list:
+    """将 SQLite 原始行转换为 JobResult 列表"""
+    from database import JobResult
+    results = []
+    for rj in raw_jobs:
+        storage_ids = []
+        raw_ids = rj.get("storage_msg_ids", "")
+        if raw_ids:
+            try:
+                storage_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+            except (json.JSONDecodeError, TypeError):
+                storage_ids = []
+        results.append(JobResult(
+            job_id=rj["crdb_id"],
+            code=rj["code"],
+            target_user_id=rj["target_user_id"],
+            storage_channel_id=rj["storage_channel_id"],
+            storage_msg_ids=storage_ids,
+            batch_file_meta=rj.get("batch_file_meta", ""),
+            task_type=rj.get("task_type", "single"),
+            protect_content=rj.get("protect_content", False),
+            retry_count=rj.get("retry_count", 0),
+        ))
+    return results
+
+
+async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
+    """发送单个 job（由 worker 并发调用，内部处理 semaphore/限速/失败）"""
+    # 死信检查
+    if job.retry_count >= 3:
+        await store.update_local_job_status(job.job_id, "dead", dead_reason=f"重试次数已达上限({job.retry_count})")
+        logger.warning(f"[Dsp-{worker_id}] 死信标记: job={job.job_id}, code={job.code}, retry={job.retry_count}")
+        return False
+
+    # 动态限速
+    await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
+
+    # 等待 semaphore
+    try:
+        await asyncio.wait_for(_send_semaphore.acquire(), timeout=10.0)
+    except asyncio.TimeoutError:
+        await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count)
+        logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时 job={job.job_id}")
+        return False
+
+    send_ok = False
+    try:
+        if job.task_type == "batch":
+            send_ok = await _process_batch_job(bot, job, bot_id=worker_id)
+        else:
+            send_ok = await _process_single_job(bot, job, bot_id=worker_id)
+        if send_ok:
+            await _send_report_button(bot, job.target_user_id, job.code)
+    except Exception as e:
+        logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
+    finally:
+        _send_semaphore.release()
+
+    if not send_ok:
+        if job.retry_count >= 3:
+            await store.update_local_job_status(job.job_id, "dead", dead_reason=f"发送失败,已重试{job.retry_count}次: {job.code}")
+        else:
+            await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count + 1)
+            logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{job.retry_count + 1}")
+
+        # Dsp 侧降级检查
+        for ch_id in list(_channel_failures.keys()):
+            await _check_channel_degrade(ch_id)
+
+    return send_ok
+
+
 async def _dsp_worker(bot: Any, worker_id: int):
-    """单个 worker 循环拉取任务
-    D: 改为从本地 SQLite 队列消费,不再直接查 CRDB dequeue_jobs
-    节省 98% RU 消耗
+    """worker: 批量拉取 jobs → 并发发送
+    D: 从本地 SQLite 队列消费,零 CRDB RU
     """
     from database.cache_store import get_cache_store
-    from database import JobResult
     store = get_cache_store()
 
-    local_queue: list = []  # 本地任务队列,有任务时直接处理
-    idle_count = 0
     while True:
         try:
-            # 本地队列有任务,直接处理
-            if not local_queue:
-                # D: 从本地 SQLite 取 pending jobs(零 RU)
-                raw_jobs = await store.get_local_pending_jobs(10)
-                if not raw_jobs:
-                    # G: 检查是否有新通知(Idx 直写)，有则立即重试
-                    if await store.has_new_dsp_job():
-                        idle_count = 0
-                        continue
-                    idle_count += 1
-                    sleep_time = min(2.0 * (1.6 ** min(idle_count, 12)), 30.0)
-                    await asyncio.sleep(sleep_time)
+            # 批量拉取 pending jobs
+            raw_jobs = await store.get_local_pending_jobs(10)
+            if not raw_jobs:
+                if await store.has_new_dsp_job():
                     continue
-
-                # 转换为 JobResult 对象
-                for rj in raw_jobs:
-                    storage_ids = []
-                    raw_ids = rj.get("storage_msg_ids", "")
-                    if raw_ids:
-                        try:
-                            storage_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
-                        except (json.JSONDecodeError, TypeError):
-                            storage_ids = []
-                    local_queue.append(JobResult(
-                        job_id=rj["crdb_id"],
-                        code=rj["code"],
-                        target_user_id=rj["target_user_id"],
-                        storage_channel_id=rj["storage_channel_id"],
-                        storage_msg_ids=storage_ids,
-                        batch_file_meta=rj.get("batch_file_meta", ""),
-                        task_type=rj.get("task_type", "single"),
-                        protect_content=rj.get("protect_content", False),
-                        retry_count=rj.get("retry_count", 0),
-                    ))
-
-            idle_count = 0
-            job = local_queue.pop(0)  # FIFO 消费本地队列
-
-            # D: 标记本地 job 为 dispatched
-            await store.mark_local_job_dispatched(job.job_id)
-
-            # ── 动态限速：根据本地 pending jobs 数量自动调节延迟 ──
-            await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
-
-            # 死信检查:retry_count >= 3 标记为 dead
-            if job.retry_count >= 3:
-                await store.update_local_job_status(job.job_id, "dead", dead_reason=f"重试次数已达上限({job.retry_count})")
-                logger.warning(f"[Dsp-{worker_id}] 死信标记: job={job.job_id}, code={job.code}, retry={job.retry_count}")
+                await asyncio.sleep(2)
                 continue
 
-            # 等待 semaphore(最多 10 秒)
-            try:
-                await asyncio.wait_for(
-                    _send_semaphore.acquire(), timeout=10.0
-                )
-            except asyncio.TimeoutError:
-                # D: 本地标记 retried(不递增),等待 sync_back 同步 CRDB
-                await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count)
-                logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时,重新入队 job={job.job_id}")
-                await asyncio.sleep(1)
-                continue
+            # 转换为 JobResult 并标记 dispatched
+            jobs = _raw_jobs_to_results(raw_jobs)
+            for job in jobs:
+                await store.mark_local_job_dispatched(job.job_id)
 
-            send_ok = False
-            try:
-                if job.task_type == "batch":
-                    send_ok = await _process_batch_job(bot, job, bot_id=worker_id)
-                else:
-                    send_ok = await _process_single_job(bot, job, bot_id=worker_id)
-                if send_ok:
-                    await _send_report_button(bot, job.target_user_id, job.code)
-            except Exception as e:
-                logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
-            finally:
-                _send_semaphore.release()
-
-            # 发送失败处理:根据 retry_count 决定重试还是死信
-            if not send_ok:
-                if job.retry_count >= 3:
-                    await store.update_local_job_status(job.job_id, "dead", dead_reason=f"发送失败,已重试{job.retry_count}次: {job.code}")
-                    logger.warning(f"[Dsp-{worker_id}] 死信: job={job.job_id}, code={job.code}, retry={job.retry_count}")
-                else:
-                    await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count + 1)
-                    logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{job.retry_count + 1}")
-
-                # Dsp 侧降级检查(Mon Bot 补充机制,兜底)
-                for ch_id in list(_channel_failures.keys()):
-                    await _check_channel_degrade(ch_id)
+            # 并发发送这批 jobs
+            tasks = [asyncio.create_task(_send_one_job(bot, job, worker_id, store)) for job in jobs]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             logger.error(f"[Dsp-{worker_id}] 队列处理异常: {e}")
