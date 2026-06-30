@@ -572,12 +572,12 @@ async def _process_pending_uploads(app: Application):
                         await safe_send_message(app.bot, chat_id=uploader_id, text=f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。")
                         logger.info(f"[Idx][poll] 外部码已就绪: {ext_code} {file_code}")
                     else:
-                        note_line = f"\n📝 备注:{note}\n" if note else ""
-                        await safe_send_message(app.bot, chat_id=uploader_id, text=f"文件码：{file_code}\n\n"
-                                 f"{note_line}"
-                                 f"📤 发送文件@{settings.UPLOAD_BOT_USERNAME}\n"
-                                 f"🔍 收码解码@{settings.DECODER_BOT_USERNAME}\n"
-                                 f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
+                        note_line = f"备注：{note}" if note else ""
+                        await safe_send_message(app.bot, chat_id=uploader_id, text=f"文件码：{file_code}\n"
+                                 f"{note_line}\n\n"
+                                 f"上传bot: @{settings.UPLOAD_BOT_USERNAME}\n"
+                                 f"解码bot: @{settings.DECODER_BOT_USERNAME}\n"
+                                 f"接收bot: @{settings.SENDER_BOT_USERNAME}",
                         )
                         logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
                 except Exception as e:
