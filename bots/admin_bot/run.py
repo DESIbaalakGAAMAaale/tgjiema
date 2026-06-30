@@ -1,3 +1,4 @@
+import asyncio
 from loguru import logger
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
