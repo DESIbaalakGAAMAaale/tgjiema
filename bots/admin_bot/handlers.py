@@ -114,7 +114,7 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_doc = {
         "$set": {
             "membership_level": level,
-            "updated_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
     }
     if level == "free":
@@ -157,7 +157,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"is_banned": True, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
+        {"$set": {"is_banned": True, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
     )
     await update_user_and_invalidate(user_id)
     await update.message.reply_text(f"✅ 用户 {user_id} 已封禁")
@@ -179,7 +179,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"is_banned": False, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
+        {"$set": {"is_banned": False, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
     )
     await update_user_and_invalidate(user_id)
     await update.message.reply_text(f"✅ 用户 {user_id} 已解封")
@@ -202,7 +202,7 @@ async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
+        {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
     )
     await update_user_and_invalidate(user_id)
     from database.cache_store import invalidate_user_quota_cache
@@ -227,7 +227,7 @@ async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
-        {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
+        {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
     )
     await update_user_and_invalidate(user_id)
     from database.cache_store import invalidate_user_quota_cache

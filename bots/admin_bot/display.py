@@ -54,7 +54,7 @@ async def _get_status_text() -> str:
             _status_counters["total_users"] = await users_col.count_documents({})
             _status_counters["total_files"] = await files_col.count_documents({})
             _status_counters["active_files"] = await files_col.count_documents({"status": "active"})
-            today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
         _shared_counters.status_counters_initialized = True
         _shared_counters.status_counters_loaded_at = now_ts

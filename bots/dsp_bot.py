@@ -326,54 +326,6 @@ async def _dsp_worker(bot: Any, worker_id: int):
             await asyncio.sleep(1)
 
 
-async def _send_file_direct(bot, job) -> bool:
-    """直接用 file_id 向用户发文件,不走 copy_message(避开频道限速)
-    
-    返回 True 表示成功,False 表示回退到 copy_message
-    """
-    meta_raw = getattr(job, "batch_file_meta", None)
-    if not meta_raw:
-        return False
-    if isinstance(meta_raw, list):
-        file_meta = meta_raw[0]
-    else:
-        try:
-            parsed = json.loads(meta_raw)
-            if isinstance(parsed, list):
-                file_meta = parsed[0]
-            else:
-                file_meta = parsed
-        except (json.JSONDecodeError, TypeError, IndexError):
-            return False
-
-    if file_meta is None:
-        return False
-
-    fid = file_meta.get("file_id", "")
-    mtype = file_meta.get("type", "document")
-    if not fid:
-        return False
-
-    protect_content = getattr(job, "protect_content", False)
-    kwargs = {"protect_content": protect_content}
-
-    try:
-        if mtype == "photo":
-            await bot.send_photo(chat_id=job.target_user_id, photo=fid, **kwargs)
-        elif mtype == "video":
-            await bot.send_video(chat_id=job.target_user_id, video=fid, **kwargs)
-        elif mtype in ("audio", "voice"):
-            await bot.send_audio(chat_id=job.target_user_id, audio=fid, **kwargs)
-        elif mtype == "animation":
-            await bot.send_animation(chat_id=job.target_user_id, animation=fid, **kwargs)
-        else:
-            await bot.send_document(chat_id=job.target_user_id, document=fid, **kwargs)
-        logger.info(f"[Dsp] file_id 直发成功: 用户 {job.target_user_id}, {job.code}")
-        return True
-    except Exception:
-        return False
-
-
 async def _process_single_job(bot, job, bot_id: int = 1):
     logger.info(
         f"[Dsp] 发送文件: 用户 {job.target_user_id}, "
@@ -387,16 +339,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     # protect_content 已从 jobs 表直接获取,无需再查 file_records
     protect_content = getattr(job, "protect_content", False)
 
-    # ── file_id 直发（跨 bot file_id 不通用，静默尝试一次即可） ──
-    try:
-        if await _send_file_direct(bot, job):
-            metrics.send_success_count += 1
-            await metrics.record_processed("dsp_bot")
-            return True
-    except Exception:
-        pass
-
-    # ── 回退到 copy_message ──
+    # ── 使用 copy_message 发送 ──
     resolved = await resolve_delivery_channel(job.storage_channel_id)
     success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
 

@@ -408,7 +408,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ext_quota = local_q.get("ext_quota", 0)
         ext_used = local_q.get("ext_used_today", 0)
     else:
-        today = datetime.datetime.now(datetime.UTC).date()
+        today = datetime.datetime.now(datetime.timezone.utc).date()
         quota_date_str = db_user.get("quota_date")
         quota_date = None
         if quota_date_str:
@@ -512,7 +512,7 @@ async def _process_one_pending(app: Application, row: dict):
 
     # 写入 codes 表（含 expire_time，省一次 UPDATE）
     try:
-        expire_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
+        expire_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
             days=settings.DEFAULT_FILE_TTL_DAYS if settings.DEFAULT_FILE_TTL_DAYS is not None else 60
         )
         codes_col = get_codes_col()
@@ -1139,7 +1139,7 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     if days == 0:
         new_expire = None  # 永久
     else:
-        new_expire = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=days)).isoformat()
+        new_expire = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)).isoformat()
 
     # 写入缓冲
     from database.cache_store import get_code_change_buffer
@@ -1418,13 +1418,13 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
             if days_val == 0:
                 new_expire = None
             else:
-                new_expire = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=days_val)).isoformat()
+                new_expire = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days_val)).isoformat()
         except ValueError:
             # 尝试解析 ISO 时间
             try:
                 exp_dt = datetime.datetime.fromisoformat(text)
                 if exp_dt.tzinfo is None:
-                    exp_dt = exp_dt.replace(tzinfo=datetime.UTC)
+                    exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
                 new_expire = exp_dt.isoformat()
             except ValueError:
                 await update.message.reply_text("格式不正确，请输入天数（如 15）或 ISO 时间（如 2026-12-31T23:59:59）")

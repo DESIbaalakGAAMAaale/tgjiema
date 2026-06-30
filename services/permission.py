@@ -34,7 +34,7 @@ def check_code_expired(file_record: dict) -> tuple[bool, str]:
             ttl_days = int(ttl_days)
         except ValueError:
             ttl_days = 0
-    now = datetime.datetime.now(datetime.UTC)
+    now = datetime.datetime.now(datetime.timezone.utc)
     expire_dt = expire_time
     if isinstance(expire_time, str):
         try:
@@ -43,8 +43,8 @@ def check_code_expired(file_record: dict) -> tuple[bool, str]:
             return False, ""
     if expire_dt.tzinfo is None:
         expire_dt = expire_dt.replace(tzinfo=_CHINA_TZ_FOR_EXPIRY)
-    if expire_dt.tzinfo != datetime.UTC:
-        expire_dt = expire_dt.astimezone(datetime.UTC)
+    if expire_dt.tzinfo != datetime.timezone.utc:
+        expire_dt = expire_dt.astimezone(datetime.timezone.utc)
     if expire_dt < now:
         return True, "该文件码已过期"
     return False, ""

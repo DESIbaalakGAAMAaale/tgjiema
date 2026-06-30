@@ -25,19 +25,26 @@ _LOGIN_LIMIT_WINDOW = 300   # 5 分钟
 _LOGIN_LIMIT_MAX = 5        # 最多 5 次失败
 
 # ─── CSRF 保护 ─────────────────────────────────────────────────
-# 使用 secrets.token_hex(32) 生成 CSRF token,存储在 cookie 中
-_csrf_token: str = secrets.token_hex(32)
+# 每个登录会话独立 token，防止跨站请求伪造
+_csrf_tokens: dict[str, str] = {}
 
 
-def _get_csrf_token() -> str:
-    """获取当前 CSRF token。"""
-    return _csrf_token
+def _get_csrf_token(username: str = "") -> str:
+    """获取或生成当前会话的 CSRF token。"""
+    if not username:
+        return ""
+    if username not in _csrf_tokens:
+        _csrf_tokens[username] = secrets.token_hex(32)
+    return _csrf_tokens[username]
 
 
 def _verify_csrf(request: Request, form_token: str = None) -> bool:
     """验证 CSRF token:对比表单中的 csrf_token 和 cookie 中的 csrf_token。"""
     cookie_token = request.cookies.get("csrf_token", "")
     if not cookie_token or not form_token:
+        return False
+    # cookie token 必须在服务端已注册（防止伪造）
+    if cookie_token not in _csrf_tokens.values():
         return False
     return cookie_token == form_token
 
@@ -80,13 +87,14 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     return credentials.username
 
 
-def _make_csrf_response(template_name: str, context: dict) -> HTMLResponse:
+def _make_csrf_response(template_name: str, context: dict, username: str = "") -> HTMLResponse:
     """生成带 CSRF cookie 的 HTML 响应。"""
-    context["csrf_token"] = _csrf_token
+    token = _get_csrf_token(username)
+    context["csrf_token"] = token
     response = templates.TemplateResponse(template_name, context)
     response.set_cookie(
         key="csrf_token",
-        value=_csrf_token,
+        value=token,
         httponly=True,
         samesite="strict",
         max_age=3600,
@@ -102,16 +110,25 @@ async def health_check():
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, admin=Depends(verify_admin)):
-    users_col = get_users_col()
-    files_col = get_file_records_col()
-    logs_col = get_decode_logs_col()
+    import utils.shared_counters as _sc
 
-    total_users = await users_col.count_documents({})
-    total_files = await files_col.count_documents({})
-    active_files = await files_col.count_documents({"status": "active"})
+    # 首次加载或 TTL 过期（60s）时从 CRDB 初始化计数器
+    now = _time.time()
+    if not _sc.status_counters_initialized or (now - _sc.status_counters_loaded_at > 60):
+        users_col = get_users_col()
+        files_col = get_file_records_col()
+        _sc.status_counters["total_users"] = await users_col.count_documents({})
+        _sc.status_counters["total_files"] = await files_col.count_documents({})
+        _sc.status_counters["active_files"] = await files_col.count_documents({"status": "active"})
+        _sc.status_counters_initialized = True
+        _sc.status_counters_loaded_at = now
+
+    total_users = _sc.status_counters.get("total_users", 0)
+    total_files = _sc.status_counters.get("total_files", 0)
+    active_files = _sc.status_counters.get("active_files", 0)
 
     today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_decodes = await logs_col.count_documents({"request_time": {"$gte": today}})
+    today_decodes = _sc.status_counters.get("today_decodes", 0)
 
     bot_statuses = []
     for name, health in metrics.bots.items():
@@ -138,6 +155,7 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
             "backup_count": metrics.backup_count,
             "backup_fail": metrics.backup_fail_count,
         },
+        username=admin,
     )
 
 
@@ -188,8 +206,7 @@ async def update_membership(
     admin=Depends(verify_admin),
 ):
     # CSRF 验证
-    cookie_token = request.cookies.get("csrf_token", "")
-    if not secrets.compare_digest(csrf_token, _csrf_token) or not secrets.compare_digest(cookie_token, _csrf_token):
+    if not _verify_csrf(request, csrf_token):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
     if level not in ("free", "basic", "premium"):
@@ -224,7 +241,7 @@ async def update_membership(
 
     await users_col.update_one({"user_id": user_id}, update)
     response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_csrf_token, httponly=True, samesite="strict", max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", max_age=3600)
     return response
 
 
@@ -236,8 +253,7 @@ async def toggle_ban(
     admin=Depends(verify_admin),
 ):
     # CSRF 验证
-    cookie_token = request.cookies.get("csrf_token", "")
-    if not secrets.compare_digest(csrf_token, _csrf_token) or not secrets.compare_digest(cookie_token, _csrf_token):
+    if not _verify_csrf(request, csrf_token):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
     users_col = get_users_col()
@@ -250,7 +266,7 @@ async def toggle_ban(
         {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
     )
     response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_csrf_token, httponly=True, samesite="strict", max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", max_age=3600)
     return response
 
 
@@ -297,8 +313,7 @@ async def delete_file(
     admin=Depends(verify_admin),
 ):
     # CSRF 验证
-    cookie_token = request.cookies.get("csrf_token", "")
-    if not secrets.compare_digest(csrf_token, _csrf_token) or not secrets.compare_digest(cookie_token, _csrf_token):
+    if not _verify_csrf(request, csrf_token):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
     files_col = get_file_records_col()
@@ -309,7 +324,7 @@ async def delete_file(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="文件不存在")
     response = RedirectResponse(url="/files", status_code=303)
-    response.set_cookie(key="csrf_token", value=_csrf_token, httponly=True, samesite="strict", max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", max_age=3600)
     return response
 
 
@@ -364,4 +379,5 @@ async def health_page(request: Request, admin=Depends(verify_admin)):
             "request": request,
             "bot_statuses": bot_statuses,
         },
+        username=admin,
     )
