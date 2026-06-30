@@ -220,7 +220,7 @@ class MonScheduler:
         count = 0
         for cell in cells:
             try:
-                msgs = await bot_instance.get_messages(cell["channel_id"], limit=1)
+                msgs = [msg async for msg in bot_instance.get_chat_history(chat_id=cell["channel_id"], limit=1)]
                 if msgs and len(msgs) > 0:
                     await update_cell_heartbeat(cell["slot_id"])
                     count += 1
@@ -298,8 +298,8 @@ class MonScheduler:
         """获取频道中最后游标之后的新消息(媒体文件)。"""
         msgs = []
         try:
-            # 从最新消息开始往回拉,直到遇到 last_cursor
-            async for msg in bot_instance.iter_messages(channel_id, limit=50):
+            # 使用 get_chat_history 替代已废弃的 iter_messages
+            async for msg in bot_instance.get_chat_history(chat_id=channel_id, limit=50):
                 if msg.message_id <= last_cursor:
                     break
                 if is_media_message(msg):
@@ -411,7 +411,7 @@ class MonScheduler:
         """判断频道是否几乎为空(媒体消息 ≤ threshold)。"""
         try:
             count = 0
-            async for msg in bot_instance.iter_messages(channel_id, limit=20):
+            async for msg in bot_instance.get_chat_history(chat_id=channel_id, limit=20):
                 if is_media_message(msg):
                     count += 1
             return count <= threshold
@@ -424,7 +424,7 @@ class MonScheduler:
         """拉取频道中所有媒体消息(用于智能补齐)。"""
         msgs = []
         try:
-            async for msg in bot_instance.iter_messages(channel_id, limit=limit):
+            async for msg in bot_instance.get_chat_history(chat_id=channel_id, limit=limit):
                 if is_media_message(msg):
                     msgs.append(msg)
         except Exception as e:

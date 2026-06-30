@@ -22,7 +22,7 @@ async def _init():
     pass
 
 
-def run():
+async def _async_main():
     if not TOKEN:
         logger.warning("管理员机器人 Token 未配置（ADMIN_BOT_TOKEN），跳过启动")
         return
@@ -82,4 +82,20 @@ def run():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:|report:)"))
 
-    app.run_polling()
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        try:
+            stop_event = asyncio.Event()
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await app.updater.stop()
+            await app.stop()
+
+
+def run():
+    """启动 Admin Bot (使用 asyncio.run 标准模式)"""
+    import asyncio
+    asyncio.run(_async_main())

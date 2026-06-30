@@ -327,7 +327,7 @@ class MonBot:
                     nxt = target_active.get("next_active_chat_id") if target_active else None
                     await conn.execute(
                         "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3, last_heartbeat = $4 WHERE slot_id = $5",
-                        "active", str(nxt) if nxt else None, now_iso, now_iso, s1_slot["slot_id"],
+                        "active", nxt, now_iso, now_iso, s1_slot["slot_id"],
                     )
                     # 同组的原 active → shadow1(如果还没变的话)
                     if target_active and target_active["status"] == "active":
