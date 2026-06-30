@@ -646,13 +646,13 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if internal_match:
         # 内部码：优先走本地解码
-        text_to_use = internal_match.group(1)
+        text = internal_match.group(1)
         is_external = False
     else:
         # 2. 没有内部码 → 提取 bot 用户名走第三方码
         code, bot_username = extract_code_and_bot_from_message(raw_text)
         if bot_username:
-            text_to_use = code
+            text = code
             is_external = True
         else:
             await safe_reply_text(update.message, "消息格式不正确，请发送文件码或包含 bot 用户名的消息")
@@ -672,11 +672,11 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_external:
         # 第三方码：走中继或目标 bot
-        await handle_external_code(update, context, user.id, text_to_use, bot_username, result=None)
+        await handle_external_code(update, context, user.id, text, bot_username, result=None)
         return
 
     # 内部码：查 codes 表
-    result = await check_decode_permission(user.id, text_to_use)
+    result = await check_decode_permission(user.id, text)
 
     if not result.allowed:
         await safe_reply_text(update.message, result.reason)
@@ -687,22 +687,22 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from database.cache import get_code_cache
         from services.permission import check_code_expired
         code_cache = get_code_cache()
-        cache_key = f"code:{text_to_use}"
+        cache_key = f"code:{text}"
         code_entry = code_cache.get(cache_key)
         if code_entry is None:
             codes_col = get_codes_col()
-            code_entry = await codes_col.find_one({"code": text_to_use})
+            code_entry = await codes_col.find_one({"code": text})
             if code_entry:
                 code_cache.set(cache_key, code_entry)
         if code_entry:
-            file_record = await get_file_record_cached(text_to_use)
+            file_record = await get_file_record_cached(text)
             if file_record:
                 expired, reason = check_code_expired(file_record)
                 if expired:
                     await safe_reply_text(update.message, reason)
                     return
     except Exception as e:
-        logger.warning(f"[Idx][handle_code] codes 表查询失败(code={text_to_use}): {e}")
+        logger.warning(f"[Idx][handle_code] codes 表查询失败(code={text}): {e}")
 
     file_record = result.file_record
 
