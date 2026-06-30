@@ -30,12 +30,13 @@ def _get_fernet() -> Fernet | None:
 
     key = os.getenv("RELAY_ENCRYPTION_KEY", "")
     if not key:
-        key = Fernet.generate_key().decode()
-        os.environ["RELAY_ENCRYPTION_KEY"] = key
-        logger.warning(
-            "[RelayDB] ⚠️  RELAY_ENCRYPTION_KEY 未设置，已自动生成密钥。"
-            "请立即将以下密钥添加到 .env 文件以确保重启后能解密已有数据：\n"
-            f"RELAY_ENCRYPTION_KEY={key}"
+        raise RuntimeError(
+            "[RelayDB] RELAY_ENCRYPTION_KEY 未设置！\n"
+            "请运行以下命令生成密钥并添加到 .env 文件：\n"
+            "  python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"\n"
+            "然后将输出的密钥添加到 .env：\n"
+            "  RELAY_ENCRYPTION_KEY=<生成的密钥>\n"
+            "注意：密钥一旦设定不可更改，否则已加密的 API_HASH 将无法解密。"
         )
     try:
         _fernet = Fernet(key.encode() if isinstance(key, str) else key)

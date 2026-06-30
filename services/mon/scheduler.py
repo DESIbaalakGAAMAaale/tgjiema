@@ -142,8 +142,8 @@ class MonScheduler:
             if group_num not in groups:
                 groups[group_num] = [None, None, None]
 
-            # 优先级: endsWith("a") > endsWith("b") > startswith("a")
-            # a1a 应归类为 shadow1(索引1), 而不是 active(索引0)
+            # 优先级: 以 slot_id 格式为准(aN=active, sNa=shadow1, sNb=shadow2)
+            # 注意: 不要与"a1a"混淆，实际命名是 "s1a"（见 generate_topology.py）
             if sid.endswith("a") and not sid.startswith("a"):
                 groups[group_num][1] = cell
             elif sid.endswith("b"):
@@ -213,7 +213,7 @@ class MonScheduler:
             await log_rotate(*entry)
 
     async def heartbeat_all(self, bot_instance) -> int:
-        """对 active/shadow 槽位发心跳(频道拉一条消息验证可达性)。
+        """对 active/shadow 槽位发心跳(通过 get_chat_member_count 验证频道可达性)。
         返回成功计数。
         """
         col = get_cells_col()
@@ -221,9 +221,9 @@ class MonScheduler:
         count = 0
         for cell in cells:
             try:
-                # python-telegram-bot 21.6 (aiogram backend) 不支持迭代消息
-                # 使用 get_chat_menu_button 验证频道可达性
-                await bot_instance.get_chat(cell["channel_id"])
+                # 使用 get_chat_member_count 验证频道可达性(比 get_chat 更强,
+                # 需要 bot 在频道内且有读权限,能检测出 bot 被踢出的情况)
+                await bot_instance.get_chat_member_count(cell["channel_id"])
                 await update_cell_heartbeat(cell["slot_id"])
                 count += 1
             except Exception as e:
@@ -299,36 +299,43 @@ class MonScheduler:
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
         """获取频道中最后游标之后的新消息(媒体文件)。
         
-        python-telegram-bot 21.6 (aiogram backend) 不支持 iter_messages/get_chat_history,
-        直接使用 Telegram Bot API HTTP 接口获取消息。
+        使用 getUpdates API 获取最近频道消息，筛选目标频道中 > last_cursor 的媒体消息。
         """
         msgs = []
         try:
-            # 通过 bot_instance.get_me() 获取 token
-            token = bot_instance.token
-            base_url = f"https://api.telegram.org/bot{token}"
-            
-            # 使用 getChat 验证频道可达
-            await bot_instance.get_chat(channel_id)
-            
-            # 获取最近消息
-            import httpx
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(f"{base_url}/getChat", params={"chat_id": channel_id})
-                # 这里只验证可达性，实际消息复制通过 copy_message 完成
+            updates = await bot_instance.get_updates(
+                offset=-100,  # 获取最近 100 条更新
+                allowed_updates=["channel_post"],
+                timeout=5,
+            )
+            for update in updates:
+                if update.channel_post and update.channel_post.chat_id == channel_id:
+                    msg = update.channel_post
+                    if msg.message_id > last_cursor:
+                        # 只复制媒体消息
+                        if msg.photo or msg.video or msg.document or msg.audio or msg.animation:
+                            msgs.append(msg)
         except Exception as e:
             logger.warning(f"[Mon][复制] 获取频道 {channel_id} 消息失败: {e}")
-        return msgs  # 空列表表示无法迭代消息，跳过复制
+        return msgs
 
     @staticmethod
     async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list) -> int:
-        """批量复制消息到目标频道(带 Flood Wait 自动退避)。返回成功复制数。
-        
-        由于 ptb 21.6 无法迭代消息，此方法改为直接 copy 整个频道的媒体消息。
-        """
+        """批量复制消息到目标频道。返回成功复制数。"""
         if not messages:
             return 0
-        return 0  # 无消息可复制
+        copied = 0
+        for msg in messages:
+            try:
+                await bot_instance.copy_message(
+                    chat_id=to_channel,
+                    from_chat_id=from_channel,
+                    message_id=msg.message_id,
+                )
+                copied += 1
+            except Exception as e:
+                logger.warning(f"[Mon][复制] copy_message 失败 msg_id={msg.message_id}: {e}")
+        return copied
 
     async def auto_fill_new_channels(self, bot_instance, all_cells: list[dict]) -> int:
         """智能替补:检测新频道(last_synced_msg_id=0 且消息数 < Active),

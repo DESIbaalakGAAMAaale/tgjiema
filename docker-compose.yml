@@ -31,9 +31,9 @@ services:
         limits:
           cpus: '4.0'
           memory: 2G
-    # 健康检查:使用 ps + grep 替代 pgrep(更可靠)
+    # 健康检查: 通过 admin web 的 /health 端点验证整体服务状态
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep '[r]un_all.py' > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; r=urllib.request.urlopen('http://localhost:8080/health'); exit(0 if r.status==200 else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
