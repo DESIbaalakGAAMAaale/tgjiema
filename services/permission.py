@@ -1,11 +1,21 @@
+"""权限和配额检查 — SQLite First 架构
+
+配额读写优先走本地 SQLite（零 CRDB RU）：
+- 检查配额：SQLite → CRDB 兜底
+- 递增使用量：直接写 SQLite
+- 后台任务每 6h 批量同步 SQLite → CRDB
+"""
+
 import datetime
-import os
 from dataclasses import dataclass
 from typing import Optional
 
 from database import get_users_col, get_file_records_col, make_user
 from database import get_user_cached, update_user_and_invalidate
 from database import get_file_record_cached, update_file_record_and_invalidate
+from database.cache_store import (
+    get_user_quota, upsert_user_quota, increment_user_quota_used,
+)
 from config import settings
 from services.code_generator import extract_bot_username
 
@@ -15,72 +25,29 @@ _CHINA_TZ_FOR_EXPIRY = datetime.timezone(datetime.timedelta(hours=8))
 
 
 def check_code_expired(file_record: dict) -> tuple[bool, str]:
-    """检查文件码是否过期。返回 (expired, reason)。"""
     expire_time = file_record.get("expire_time")
     if expire_time is None:
         return False, ""
-    
-    # 确定时区:如果有 file_ttl_days 且 > 0,使用相对过期时间(UTC)
     ttl_days = file_record.get("file_ttl_days", 0)
     if isinstance(ttl_days, str):
         try:
             ttl_days = int(ttl_days)
         except ValueError:
             ttl_days = 0
-    
-    # 统一使用 UTC 进行比较,避免时区混淆
     now = datetime.datetime.now(datetime.UTC)
-    
     expire_dt = expire_time
     if isinstance(expire_time, str):
         try:
             expire_dt = datetime.datetime.fromisoformat(expire_time)
         except (ValueError, TypeError):
             return False, ""
-    
-    # 如果 expire_dt 没有时区信息,假设为 UTC+8
     if expire_dt.tzinfo is None:
         expire_dt = expire_dt.replace(tzinfo=_CHINA_TZ_FOR_EXPIRY)
-    
-    # 确保比较时都在 UTC
     if expire_dt.tzinfo != datetime.UTC:
         expire_dt = expire_dt.astimezone(datetime.UTC)
-    
     if expire_dt < now:
         return True, "该文件码已过期"
     return False, ""
-
-# ─── Quota 本地计数(跨进程共享,通过环境变量传递)─────────────
-# 每个 Idx Bot 进程用不同计数器,PID 作为命名空间
-_PID = os.getpid()
-_local_quota_counts: dict[int, int] = {}
-_local_external_quota_counts: dict[int, int] = {}
-
-
-def _increment_local_quota(user_id: int):
-    """本地累加配额计数,不写 CRDB(由 idx_bot 后台同步)"""
-    _local_quota_counts[user_id] = _local_quota_counts.get(user_id, 0) + 1
-
-
-def _increment_local_external_quota(user_id: int):
-    """本地累加外部码配额计数"""
-    _local_external_quota_counts[user_id] = _local_external_quota_counts.get(user_id, 0) + 1
-
-
-def _get_local_quota_counts() -> dict[int, int]:
-    """导出计数器供 idx_bot 同步到 CRDB"""
-    return dict(_local_quota_counts)
-
-
-def _get_local_external_quota_counts() -> dict[int, int]:
-    """导出外部码计数器供 idx_bot 同步到 CRDB"""
-    return dict(_local_external_quota_counts)
-
-
-def _clear_local_quota_counts():
-    """同步完成后清空本地计数器"""
-    _local_quota_counts.clear()
-    _local_external_quota_counts.clear()
 
 
 @dataclass
@@ -133,82 +100,133 @@ async def check_upload_permission(user_id: int) -> bool:
     return True
 
 
+# ─── 配额本地 SQLite 工具函数 ──────────────────────────────────
+
+_CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+async def _init_quota_from_crdb(user_id: int) -> dict:
+    """从 CRDB 读取用户配额并写入本地 SQLite。返回写入后的数据。"""
+    user = await get_user_cached(user_id)
+    if user is None:
+        return {}
+    today = datetime.datetime.now(_CHINA_TZ).date()
+    qd = user.get("quota_date")
+    eqd = user.get("external_quota_date")
+    qd_today = False
+    eqd_today = False
+    if qd:
+        try:
+            qd_today = datetime.datetime.fromisoformat(qd).date() == today
+        except (ValueError, TypeError):
+            pass
+    if eqd:
+        try:
+            eqd_today = datetime.datetime.fromisoformat(eqd).date() == today
+        except (ValueError, TypeError):
+            pass
+    data = {
+        "level": user.get("membership_level", "free"),
+        "daily_quota": user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA),
+        "used_today": user.get("quota_used_today", 0) if qd_today else 0,
+        "quota_date": user.get("quota_date"),
+        "ext_quota": user.get("external_decode_quota", 0),
+        "ext_used_today": user.get("external_used_today", 0) if eqd_today else 0,
+        "ext_quota_date": user.get("external_quota_date"),
+        "synced_at": 0,
+    }
+    await upsert_user_quota(user_id, data)
+    data["user_id"] = user_id
+    return data
+
+
+async def _get_quota_sqlite_first(user_id: int) -> dict:
+    """从 SQLite 读取配额，未找到则从 CRDB 兜底并缓存到 SQLite。"""
+    q = await get_user_quota(user_id)
+    if q is not None:
+        return q
+    return await _init_quota_from_crdb(user_id)
+
+
+async def _reset_quota_if_needed(q: dict, now_date: datetime.date) -> dict:
+    """检查是否需要重置配额日期（跨天）。需要重置则返回新的数据。"""
+    changed = False
+    qd = q.get("quota_date")
+    eqd = q.get("ext_quota_date")
+    need_reset = False
+    need_ext_reset = False
+    if qd:
+        try:
+            need_reset = datetime.datetime.fromisoformat(str(qd)).date() != now_date
+        except (ValueError, TypeError):
+            need_reset = True
+    else:
+        need_reset = True
+    if eqd:
+        try:
+            need_ext_reset = datetime.datetime.fromisoformat(str(eqd)).date() != now_date
+        except (ValueError, TypeError):
+            need_ext_reset = True
+    else:
+        need_ext_reset = True
+    if need_reset:
+        q["used_today"] = 0
+        q["quota_date"] = datetime.datetime.now(_CHINA_TZ).isoformat()
+        q["daily_quota"] = {
+            "free": settings.FREE_DAILY_QUOTA,
+            "basic": settings.BASIC_DAILY_QUOTA,
+            "premium": settings.PREMIUM_DAILY_QUOTA,
+        }.get(q.get("level", "free"), settings.FREE_DAILY_QUOTA)
+        changed = True
+    if need_ext_reset:
+        q["ext_used_today"] = 0
+        q["ext_quota_date"] = datetime.datetime.now(_CHINA_TZ).isoformat()
+        q["ext_quota"] = {
+            "free": settings.FREE_EXTERNAL_DAILY_QUOTA,
+            "basic": settings.BASIC_EXTERNAL_DAILY_QUOTA,
+            "premium": settings.PREMIUM_EXTERNAL_DAILY_QUOTA,
+        }.get(q.get("level", "free"), settings.FREE_EXTERNAL_DAILY_QUOTA)
+        changed = True
+    if changed:
+        await upsert_user_quota(q["user_id"], q)
+    return q
+
+
+# ─── 核心：解码权限检查（SQLite First）───────────────────────────
+
+
 async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
-    users_col = get_users_col()
     files_col = get_file_records_col()
 
-    # 使用缓存查询用户
+    # 从 CRDB 获取用户基础信息（等级/封禁状态）
     user = await get_user_cached(user_id)
     if user is None:
         return DecodeResult(allowed=False, reason="用户未注册")
-
     if user.get("is_banned"):
         return DecodeResult(allowed=False, reason="您的账户已被禁用")
 
     membership_level = user.get("membership_level", "free")
-
     bot_username = extract_bot_username(file_code)
-
     if not is_system_code(file_code):
         if not bot_username:
             return DecodeResult(allowed=False, reason="无效的文件码格式,无法识别目标机器人。")
 
-    # 使用 UTC+8 (中国时区) 进行配额重置
-    _CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
+    # ─── SQLite First 配额 ─────────────────────────────────
+    today = datetime.datetime.now(_CHINA_TZ).date()
+    q = await _get_quota_sqlite_first(user_id)
+    if not q:
+        return DecodeResult(allowed=False, reason="系统繁忙,请稍后重试")
+    # 如果等级变了（管理员手动修改），同步到 SQLite
+    if q.get("level") != membership_level:
+        q["level"] = membership_level
+        await upsert_user_quota(user_id, q)
 
-    def _china_now():
-        return datetime.datetime.now(_CHINA_TZ)
+    q = await _reset_quota_if_needed(q, today)
 
-    today = _china_now().date()
+    quota = q.get("daily_quota", settings.FREE_DAILY_QUOTA)
+    used = q.get("used_today", 0)
 
-    def _parse_date(val) -> Optional[datetime.date]:
-        if val:
-            try:
-                return datetime.datetime.fromisoformat(val).date()
-            except (ValueError, TypeError):
-                pass
-        return None
-
-    quota_date = _parse_date(user.get("quota_date"))
-    external_quota_date = _parse_date(user.get("external_quota_date"))
-
-    reset_set = {}
-
-    if quota_date is None or quota_date != today:
-        reset_set["quota_used_today"] = 0
-        reset_set["quota_date"] = _china_now().isoformat()
-        user["quota_used_today"] = 0
-        user["quota_date"] = reset_set["quota_date"]
-        if membership_level == "free":
-            reset_set["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
-            user["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
-        elif membership_level == "basic":
-            reset_set["daily_decode_quota"] = settings.BASIC_DAILY_QUOTA
-            user["daily_decode_quota"] = settings.BASIC_DAILY_QUOTA
-        elif membership_level == "premium":
-            reset_set["daily_decode_quota"] = settings.PREMIUM_DAILY_QUOTA
-            user["daily_decode_quota"] = settings.PREMIUM_DAILY_QUOTA
-
-    if external_quota_date is None or external_quota_date != today:
-        reset_set["external_used_today"] = 0
-        reset_set["external_quota_date"] = _china_now().isoformat()
-        user["external_used_today"] = 0
-        user["external_quota_date"] = reset_set["external_quota_date"]
-        if membership_level == "free":
-            reset_set["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
-            user["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
-        elif membership_level == "basic":
-            reset_set["external_decode_quota"] = settings.BASIC_EXTERNAL_DAILY_QUOTA
-            user["external_decode_quota"] = settings.BASIC_EXTERNAL_DAILY_QUOTA
-        elif membership_level == "premium":
-            reset_set["external_decode_quota"] = settings.PREMIUM_EXTERNAL_DAILY_QUOTA
-            user["external_decode_quota"] = settings.PREMIUM_EXTERNAL_DAILY_QUOTA
-
-    if reset_set:
-        await update_user_and_invalidate(user_id, {"$set": reset_set})
-
-    quota = user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA)
-    used = user.get("quota_used_today", 0) + _local_quota_counts.get(user_id, 0)
+    # Premium 不限量
     if membership_level != "premium" and used >= quota:
         return DecodeResult(
             allowed=False,
@@ -217,56 +235,81 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         )
 
     if not is_system_code(file_code):
-        external_quota = user.get("external_decode_quota", 0)
-        external_used = user.get("external_used_today", 0)
-        if external_quota == 0:
+        ext_quota = q.get("ext_quota", 0)
+        ext_used = q.get("ext_used_today", 0)
+        if ext_quota == 0:
             return DecodeResult(
                 allowed=False,
                 reason="您没有非本系统码的解码权限。升级会员即可解锁此功能。",
             )
-        if external_quota != -1 and external_used >= external_quota:
+        if ext_quota != -1 and ext_used >= ext_quota:
             return DecodeResult(
                 allowed=False,
-                reason=f"今日非本系统码解码次数已用完({external_quota}次),请明天再试",
+                reason=f"今日非本系统码解码次数已用完({ext_quota}次),请明天再试",
             )
 
-    # 使用缓存查询文件记录
-    file_record = await get_file_record_cached(file_code)
-    if file_record is not None and file_record.get("status") == "active":
-        # 统一检查文件码是否过期
-        expired, reason = check_code_expired(file_record)
-        if expired:
-            return DecodeResult(allowed=False, reason=reason)
-        _increment_local_quota(user_id)
-        from database.cache import incr_request_count
-        await incr_request_count(file_code)
-        remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
-        remaining_ext = -1
-        if not is_system_code(file_code):
-            ext_q = user.get("external_decode_quota", 0)
-            if ext_q != -1:
-                remaining_ext = max(0, ext_q - (external_used + 1))
-        return DecodeResult(
-            allowed=True,
-            file_record=file_record,
-            remaining_quota=remaining,
-            remaining_external_quota=remaining_ext,
-        )
+    # 查找文件记录（系统码走 CRDB，外部码不查）
+    file_record = None
+    if is_system_code(file_code):
+        file_record = await get_file_record_cached(file_code)
+        if file_record is not None and file_record.get("status") == "active":
+            expired, reason = check_code_expired(file_record)
+            if expired:
+                return DecodeResult(allowed=False, reason=reason)
+            from database.cache import incr_request_count
+            await incr_request_count(file_code)
+        else:
+            return DecodeResult(allowed=False, reason="文件码无效")
 
+    # ─── 配额本地递增（SQLite，零 RU）────────────────────
+    await increment_user_quota_used(user_id, is_external=not is_system_code(file_code))
+
+    remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
+    remaining_ext = -1
     if not is_system_code(file_code):
-        _increment_local_quota(user_id)  # 外部码:quota + external 合并为一次计数
-        _increment_local_external_quota(user_id)  # 外部码配额单独追踪
-        remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
-        remaining_ext = -1
-        ext_q = user.get("external_decode_quota", 0)
+        ext_q = q.get("ext_quota", 0)
         if ext_q != -1:
-            remaining_ext = max(0, ext_q - (external_used + 1))
-        return DecodeResult(
-            allowed=True,
-            is_external=True,
-            external_bot_username=bot_username,
-            remaining_quota=remaining,
-            remaining_external_quota=remaining_ext,
-        )
+            remaining_ext = max(0, ext_q - (ext_used + 1))
 
-    return DecodeResult(allowed=False, reason="文件码无效")
+    return DecodeResult(
+        allowed=True,
+        file_record=file_record,
+        remaining_quota=remaining,
+        remaining_external_quota=remaining_ext,
+        is_external=not is_system_code(file_code),
+        external_bot_username=bot_username or "",
+    )
+
+
+# ─── 批量同步 SQLite → CRDB（由后台任务每 6h 调用）────────────
+
+async def sync_quotas_to_crdb():
+    """遍历 SQLite 中有变动的配额记录，逐条写回 CRDB。"""
+    from database.cache_store import get_unsynced_quotas, mark_quota_synced
+    rows = await get_unsynced_quotas()
+    if not rows:
+        return
+    users_col = get_users_col()
+    for r in rows:
+        try:
+            uid = r["user_id"]
+            update_fields = {
+                "quota_used_today": r["used_today"],
+                "quota_date": r["quota_date"],
+                "external_used_today": r["ext_used_today"],
+                "external_quota_date": r["ext_quota_date"],
+                "daily_decode_quota": r["daily_quota"],
+                "external_decode_quota": r["ext_quota"],
+                "membership_level": r["level"],
+            }
+            await users_col.update_one(
+                {"user_id": uid},
+                {"$set": update_fields},
+            )
+            # 使缓存失效
+            from database import update_user_and_invalidate
+            await update_user_and_invalidate(uid)
+            await mark_quota_synced(uid)
+        except Exception as e:
+            import logging
+            logging.getLogger("permission").error(f"[QuotaSync] sync user {r.get('user_id')} failed: {e}")

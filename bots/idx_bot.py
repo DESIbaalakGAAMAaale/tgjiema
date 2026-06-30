@@ -53,63 +53,17 @@ TOKEN = settings.DECODER_BOT_TOKEN
 _pending_external: dict[str, deque[tuple[int, str, float]]] = defaultdict(deque)
 _PENDING_TTL = settings.PENDING_TTL
 
-# ─── Quota 本地计数 + 定时同步(减少 CRDB RU 消耗)─────────────
-_local_quota_counts: dict[int, int] = {}  # {user_id: 累计解码次数}
-_QUOTA_SYNC_INTERVAL = settings.QUOTA_SYNC_INTERVAL  # 秒
-_quota_lock = asyncio.Lock()
-
-
-async def _increment_local_quota(user_id: int):
-    """本地累加配额计数,不写 CRDB"""
-    async with _quota_lock:
-        _local_quota_counts[user_id] = _local_quota_counts.get(user_id, 0) + 1
-
-
-async def _sync_quota_to_db():
-    """批量同步配额到 CRDB(原子递增,支持多实例部署)。
-    合并 permission.py 的本地计数器,确保 decode 流程中累加的配额被同步。
-    """
-    # 合并 permission.py 的本地计数器
-    from services.permission import _get_local_quota_counts, _get_local_external_quota_counts, _clear_local_quota_counts
-    perm_counts = _get_local_quota_counts()
-    perm_ext_counts = _get_local_external_quota_counts()
-    _clear_local_quota_counts()
-    async with _quota_lock:
-        for uid, count in perm_counts.items():
-            if count > 0:
-                _local_quota_counts[uid] = _local_quota_counts.get(uid, 0) + count
-        if not _local_quota_counts and not perm_ext_counts:
-            return
-        # 快照一份后清空，避免长时间持锁
-        snapshot = dict(_local_quota_counts)
-        _local_quota_counts.clear()
-    from database import _client
-    for user_id, count in snapshot.items():
-        if count > 0:
-            try:
-                await _client.execute(
-                    "UPDATE users SET quota_used_today = quota_used_today + $1 WHERE user_id = $2",
-                    [count, user_id],
-                )
-            except Exception as e:
-                logger.error(f"[Quota] sync failed for user {user_id}: {e}")
-    for user_id, count in perm_ext_counts.items():
-        if count > 0:
-            try:
-                await _client.execute(
-                    "UPDATE users SET external_used_today = external_used_today + $1 WHERE user_id = $2",
-                    [count, user_id],
-                )
-            except Exception as e:
-                logger.error(f"[Quota] ext sync failed for user {user_id}: {e}")
+# ─── Quota 同步至 CRDB（SQLite First，每 6h 批量写入）─────────
+_QUOTA_SYNC_INTERVAL = 21600  # 6 小时
 
 
 async def _quota_sync_loop():
-    """后台任务: 每60 秒同步配额到 CRDB"""
+    """后台任务: 每6小时将 SQLite 配额同步到 CRDB"""
     while True:
         await asyncio.sleep(_QUOTA_SYNC_INTERVAL)
         try:
-            await _sync_quota_to_db()
+            from services.permission import sync_quotas_to_crdb
+            await sync_quotas_to_crdb()
         except Exception as e:
             logger.error(f"[Quota] sync loop error: {e}")
 
@@ -436,32 +390,39 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     level_map = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
     level_name = level_map.get(db_user.get("membership_level"), "未知")
 
-    today = datetime.datetime.now(datetime.UTC).date()
-    quota_date_str = db_user.get("quota_date")
-    quota_date = None
-    if quota_date_str:
-        try:
-            quota_date = datetime.datetime.fromisoformat(quota_date_str).date()
-        except (ValueError, TypeError):
-            pass
-
-    total = db_user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA)
-    used = db_user.get("quota_used_today", 0) if quota_date == today else 0
+    # 从本地 SQLite 读取配额（更准确）
+    from database.cache_store import get_user_quota
+    local_q = await get_user_quota(user.id)
+    if local_q:
+        total = local_q.get("daily_quota", settings.FREE_DAILY_QUOTA)
+        used = local_q.get("used_today", 0)
+        ext_quota = local_q.get("ext_quota", 0)
+        ext_used = local_q.get("ext_used_today", 0)
+    else:
+        today = datetime.datetime.now(datetime.UTC).date()
+        quota_date_str = db_user.get("quota_date")
+        quota_date = None
+        if quota_date_str:
+            try:
+                quota_date = datetime.datetime.fromisoformat(quota_date_str).date()
+            except (ValueError, TypeError):
+                pass
+        total = db_user.get("daily_decode_quota", settings.FREE_DAILY_QUOTA)
+        used = db_user.get("quota_used_today", 0) if quota_date == today else 0
+        ext_quota = db_user.get("external_decode_quota", 0)
+        ext_date_str = db_user.get("external_quota_date")
+        ext_date = None
+        if ext_date_str:
+            try:
+                ext_date = datetime.datetime.fromisoformat(ext_date_str).date()
+            except (ValueError, TypeError):
+                pass
+        ext_used = db_user.get("external_used_today", 0) if ext_date == today else 0
 
     if db_user.get("membership_level") == "premium":
         quota_str = "无限"
     else:
         quota_str = f"{max(0, total - used)}/{total}"
-
-    ext_quota = db_user.get("external_decode_quota", 0)
-    ext_date_str = db_user.get("external_quota_date")
-    ext_date = None
-    if ext_date_str:
-        try:
-            ext_date = datetime.datetime.fromisoformat(ext_date_str).date()
-        except (ValueError, TypeError):
-            pass
-    ext_used = db_user.get("external_used_today", 0) if ext_date == today else 0
 
     if ext_quota == -1:
         ext_str = "不限"

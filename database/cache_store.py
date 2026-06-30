@@ -69,6 +69,20 @@ class CacheStore:
                 total_errors INTEGER NOT NULL DEFAULT 0
             )"""
         )
+        # ─── 用户配额本地表：Idx Bot 读写零 RU，每 6h 同步 CRDB ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS user_quota (
+                user_id            INTEGER PRIMARY KEY,
+                level              TEXT NOT NULL DEFAULT 'free',
+                daily_quota        INTEGER NOT NULL DEFAULT 3,
+                used_today         INTEGER NOT NULL DEFAULT 0,
+                quota_date         TEXT,
+                ext_quota          INTEGER NOT NULL DEFAULT 0,
+                ext_used_today     INTEGER NOT NULL DEFAULT 0,
+                ext_quota_date     TEXT,
+                synced_at          REAL NOT NULL DEFAULT 0
+            )"""
+        )
         await self._db.commit()
         # 注入 db 连接给 DecodeLogBuffer
         _decode_log_buffer.set_db(self._db)
@@ -311,6 +325,118 @@ class CacheStore:
             for row in rows
         }
 
+    # ─── 用户配额本地存储：Idx Bot 读写零 RU ───
+
+    async def get_user_quota(self, user_id: int) -> dict | None:
+        """从 SQLite 读取用户配额。未找到返回 None。"""
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            "SELECT user_id, level, daily_quota, used_today, quota_date, "
+            "ext_quota, ext_used_today, ext_quota_date, synced_at "
+            "FROM user_quota WHERE user_id = ?",
+            (user_id,),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "user_id": r[0],
+            "level": r[1],
+            "daily_quota": r[2],
+            "used_today": r[3],
+            "quota_date": r[4],
+            "ext_quota": r[5],
+            "ext_used_today": r[6],
+            "ext_quota_date": r[7],
+            "synced_at": r[8],
+        }
+
+    async def upsert_user_quota(self, user_id: int, data: dict):
+        """写入或更新用户配额到 SQLite。"""
+        if not self._db:
+            return
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO user_quota "
+                    "(user_id, level, daily_quota, used_today, quota_date, "
+                    "ext_quota, ext_used_today, ext_quota_date, synced_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        user_id,
+                        data.get("level", "free"),
+                        data.get("daily_quota", 3),
+                        data.get("used_today", 0),
+                        data.get("quota_date"),
+                        data.get("ext_quota", 0),
+                        data.get("ext_used_today", 0),
+                        data.get("ext_quota_date"),
+                        data.get("synced_at", 0),
+                    ),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                return
+
+    async def increment_user_quota_used(self, user_id: int, is_external: bool = False):
+        """原子递增用户已用配额（不涉及 CRDB）。"""
+        if not self._db:
+            return
+        col = "used_today" if not is_external else "ext_used_today"
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    f"UPDATE user_quota SET {col} = {col} + 1 WHERE user_id = ?",
+                    (user_id,),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                return
+
+    async def get_unsynced_quotas(self, min_synced_at: float = 0) -> list[dict]:
+        """获取需要同步到 CRDB 的配额记录。"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT user_id, level, daily_quota, used_today, quota_date, "
+            "ext_quota, ext_used_today, ext_quota_date "
+            "FROM user_quota WHERE synced_at <= ?",
+            (min_synced_at,),
+        )
+        return [
+            {
+                "user_id": r[0],
+                "level": r[1],
+                "daily_quota": r[2],
+                "used_today": r[3],
+                "quota_date": r[4],
+                "ext_quota": r[5],
+                "ext_used_today": r[6],
+                "ext_quota_date": r[7],
+            }
+            for r in rows
+        ]
+
+    async def mark_quota_synced(self, user_id: int):
+        """标记配额已同步到 CRDB。"""
+        if not self._db:
+            return
+        now = time.time()
+        await self._db.execute(
+            "UPDATE user_quota SET synced_at = ? WHERE user_id = ?",
+            (now, user_id),
+        )
+        await self._db.commit()
+
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────
 
@@ -383,3 +509,28 @@ async def report_bot_heartbeat(name: str, total_processed: int = 0, total_errors
 async def get_all_bot_heartbeats() -> dict[str, dict]:
     """模块级便利函数：admin_bot 读取所有 Bot 心跳。"""
     return await _store.get_all_bot_heartbeats()
+
+
+async def get_user_quota(user_id: int) -> dict | None:
+    """模块级便利函数：读取用户本地配额。"""
+    return await _store.get_user_quota(user_id)
+
+
+async def upsert_user_quota(user_id: int, data: dict):
+    """模块级便利函数：写入用户本地配额。"""
+    await _store.upsert_user_quota(user_id, data)
+
+
+async def increment_user_quota_used(user_id: int, is_external: bool = False):
+    """模块级便利函数：原子递增用户已用配额。"""
+    await _store.increment_user_quota_used(user_id, is_external)
+
+
+async def get_unsynced_quotas(min_synced_at: float = 0) -> list[dict]:
+    """模块级便利函数：获取待同步到 CRDB 的配额。"""
+    return await _store.get_unsynced_quotas(min_synced_at)
+
+
+async def mark_quota_synced(user_id: int):
+    """模块级便利函数：标记配额已同步。"""
+    await _store.mark_quota_synced(user_id)
