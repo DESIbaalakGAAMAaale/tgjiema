@@ -19,8 +19,9 @@ from .conversation import handle_conversation
 
 
 async def _init():
-    """数据库初始化已在 _auto_seed 中执行，无需重复。"""
-    pass
+    """数据库初始化。"""
+    from database import init_db
+    await init_db()
 
 
 async def _async_main():
