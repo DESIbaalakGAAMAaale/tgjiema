@@ -249,6 +249,20 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"已接{file_type}")
 
 
+async def _copy_one_media(context, target_ch, up, batch: dict):
+    """复制单个媒体文件到存储频道,由 _flush_batch_media_group 并发调用"""
+    try:
+        forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
+        if forwarded is not None:
+            batch["pinned_msg_ids"].append(forwarded.message_id)
+            batch["files_meta"].append(extract_file_meta(up))
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"[Up] 媒体组复制文件失败: {e}")
+        return False
+
+
 async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE, batch: dict):
     grp = _pending_media_groups.pop(mgid, None)
     if grp is None:
@@ -258,21 +272,15 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
     file_types = grp["file_types"]
     for k, v in file_types.items():
         batch["file_types"][k] += v
-    copied = 0
-    failed = 0
     target_ch = await _get_upload_target_channel()
-    for up in grp["updates"]:
-        try:
-            forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
-            if forwarded is not None:
-                batch["pinned_msg_ids"].append(forwarded.message_id)
-                batch["files_meta"].append(extract_file_meta(up))
-                copied += 1
-            else:
-                failed += 1
-        except Exception as e:
-            logger.error(f"[Up] 批次媒体组复制文件到存储频道失败: {e}")
-            failed += 1
+
+    # 并发复制所有媒体文件到存储频道
+    tasks = [asyncio.create_task(_copy_one_media(context, target_ch, up, batch)) for up in grp["updates"]]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    copied = sum(1 for r in results if r is True)
+    failed = sum(1 for r in results if r is not True)
+
     first = grp["updates"][0]
     type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items()))
     if failed > 0:
