@@ -139,6 +139,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
     @model_validator(mode='after')
     def validate_required_fields(self):
