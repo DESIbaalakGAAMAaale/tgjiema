@@ -55,7 +55,17 @@ async def _get_status_text() -> str:
             relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
     except Exception:
         relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
-    active_channel = await get_active_storage_channel_id()
+    # 从环形拓扑获取当前活跃频道
+    active_cells_text = ""
+    try:
+        from database import get_cells_col
+        col = get_cells_col()
+        active_cells = await col.find({"status": "active"}, sort=("slot_id", 1))
+        if active_cells:
+            slots = [f"{c.get('slot_id')}" for c in active_cells[:5]]
+            active_cells_text = ", ".join(slots)
+    except Exception:
+        active_cells_text = "读取失败"
     msg = (
         f"📊 系统概览\n\n"
         f"👤 总用户数:{_status_counters['total_users']}\n"
@@ -64,7 +74,7 @@ async def _get_status_text() -> str:
         f"🔄 今日解码:{_status_counters['today_decodes']}\n"
         f"📤 发送成功:{metrics.send_success_count}\n"
         f"📤 发送失败:{metrics.send_fail_count}\n"
-        f"\n📺 当前主存储频道:{active_channel}\n"
+        f"\n🔄 活跃槽位:{active_cells_text}\n"
         f"\n🔐 用户中继:{relay_status}\n"
         f"\n🤖 机器人状态:\n"
     )
@@ -76,27 +86,20 @@ async def _get_status_text() -> str:
 
 async def _get_health_text() -> str:
     msg = "🤖 机器人健康状态\n\n"
-    if not metrics.bots:
-        msg += "⚠️ 暂无 Bot 状态数据\n"
-        msg += "(各 Bot 启动后会自动上报心跳)\n"
-        msg += "\n📡 以下为各 Bot 运行状态:\n"
-        bot_names = ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]
-        for name in bot_names:
-            bot = metrics.get_bot(name)
-            if bot.is_running:
-                msg += f"  ✅ {name}: 运行中 ({bot.total_processed}次, {bot.total_errors}次错误)\n"
-            else:
-                msg += f"  ⏳ {name}: 未上报/离线\n"
-    else:
-        for name, health in metrics.bots.items():
-            status_icon = "✅" if health.is_running else "❌"
-            last_ping = format_datetime(health.last_ping)
+    bot_names = ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]
+    for name in bot_names:
+        bot = metrics.get_bot(name)
+        status_icon = "✅" if bot.is_running else "⏳"
+        if bot.last_ping > 0:
+            last_ping = format_datetime(bot.last_ping)
             msg += (
                 f"{status_icon} {name}\n"
                 f"  最后活跃:{last_ping}\n"
-                f"  处理次数:{health.total_processed}\n"
-                f"  错误次数:{health.total_errors}\n"
+                f"  处理次数:{bot.total_processed}\n"
+                f"  错误次数:{bot.total_errors}\n"
             )
+        else:
+            msg += f"{status_icon} {name}: 未上报/离线\n"
     return msg
 
 
