@@ -34,6 +34,8 @@ async def _async_main():
 
     logger.info("启动管理员机器人...")
 
+    await _init()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
