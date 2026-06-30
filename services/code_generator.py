@@ -45,6 +45,9 @@ def is_valid_code_format(code: str) -> bool:
     code = code.strip()
     if code.startswith(settings.FILE_CODE_PREFIX):
         return True
+    # 消息中包含 FILE_CODE_PREFIX 开头的文件码也算有效
+    if settings.FILE_CODE_PREFIX in code:
+        return True
     # 只有纯文件码（不含空格、换行、bot用户名）才算有效
     return bool(_BOT_PATTERN.match(code)) and '\n' not in code and ' ' not in code
 
