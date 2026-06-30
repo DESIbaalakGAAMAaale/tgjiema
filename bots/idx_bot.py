@@ -573,11 +573,13 @@ async def _process_pending_uploads(app: Application):
                         logger.info(f"[Idx][poll] 外部码已就绪: {ext_code} {file_code}")
                     else:
                         note_line = f"备注：{note}" if note else ""
-                        await safe_send_message(app.bot, chat_id=uploader_id, text=f"文件码：{file_code}\n"
+                        await safe_send_message(app.bot, chat_id=uploader_id,
+                            text=f"文件码：{file_code}\n"
                                  f"{note_line}\n\n"
-                                 f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
-                                 f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
-                                 f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
+                                 f'📤 发送文件 <a href="tg://resolve?domain={settings.UPLOAD_BOT_USERNAME}">@{settings.UPLOAD_BOT_USERNAME}</a>\n'
+                                 f'🔍 收码解码 <a href="tg://resolve?domain={settings.DECODER_BOT_USERNAME}">@{settings.DECODER_BOT_USERNAME}</a>\n'
+                                 f'📥 收取文件 <a href="tg://resolve?domain={settings.SENDER_BOT_USERNAME}">@{settings.SENDER_BOT_USERNAME}</a>',
+                            parse_mode="HTML",
                         )
                         logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
                 except Exception as e:
@@ -712,7 +714,8 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply_text(
         update.message,
-        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
+        f'文件将由 <a href="tg://resolve?domain={settings.SENDER_BOT_USERNAME}">@{settings.SENDER_BOT_USERNAME}</a> 发送给你，请查收。',
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{text}")
         ]])
