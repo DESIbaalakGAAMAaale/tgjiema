@@ -16,7 +16,7 @@ from utils.per_channel_limiter import acquire_channel_limit
 # 模块级缓存:避免每次 resolve_delivery_channel() 都查询 CRDB
 # 使用 per-entry 时间戳,避免新条目加入时延长整个缓存的生命周期
 _cell_cache: dict[int, tuple[dict, float]] = {}  # channel_id -> (cell_dict, cached_at)
-_CELL_CACHE_TTL: float = 30.0  # 单条缓存有效期 30 秒
+_CELL_CACHE_TTL: float = 120.0  # 单条缓存有效期 120 秒(与 Mon Bot 对齐,减少降级时全表扫描)
 
 
 def invalidate_cell_cache(channel_id: int = None):

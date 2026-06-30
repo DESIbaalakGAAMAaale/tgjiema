@@ -35,13 +35,22 @@ async def _get_status_text() -> str:
     users_col = get_users_col()
     files_col = get_file_records_col()
     logs_col = get_decode_logs_col()
-    # 首次启动时,用 DB 查询初始化
+    # F5: 首次启动时优先从本地 SQLite 加载快照,避免 CRDB count_documents
     if not _shared_counters.status_counters_initialized:
-        _status_counters["total_users"] = await users_col.count_documents({})
-        _status_counters["total_files"] = await files_col.count_documents({})
-        _status_counters["active_files"] = await files_col.count_documents({"status": "active"})
-        today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-        _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        cached = await store.load_counter_snapshot()
+        if cached and "total_users" in cached:
+            # 命中本地快照,零 CRDB RU
+            for k, v in cached.items():
+                _status_counters[k] = v
+        else:
+            # 本地无快照,回退 CRDB 查询
+            _status_counters["total_users"] = await users_col.count_documents({})
+            _status_counters["total_files"] = await files_col.count_documents({})
+            _status_counters["active_files"] = await files_col.count_documents({"status": "active"})
+            today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+            _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
         _shared_counters.status_counters_initialized = True
     relay_pending = await get_config("relay_auth_pending")
     try:

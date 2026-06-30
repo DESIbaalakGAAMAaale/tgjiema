@@ -83,6 +83,52 @@ class CacheStore:
                 synced_at          REAL NOT NULL DEFAULT 0
             )"""
         )
+        # ─── D: 本地任务队列 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS local_job_queue (
+                crdb_id       INTEGER PRIMARY KEY,
+                code          TEXT NOT NULL,
+                target_user_id INTEGER NOT NULL,
+                storage_channel_id INTEGER NOT NULL,
+                storage_msg_ids TEXT,
+                batch_file_meta TEXT,
+                task_type     TEXT DEFAULT 'single',
+                status        TEXT DEFAULT 'pending',
+                retry_count   INTEGER DEFAULT 0,
+                protect_content BOOLEAN DEFAULT 0,
+                created_at    TEXT,
+                dispatched_at TEXT,
+                dead_reason   TEXT,
+                synced_at     REAL DEFAULT 0
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_local_job_pending ON local_job_queue(status, created_at)"
+        )
+        # ─── F5: 启动统计快照 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS counter_snapshot (
+                key   TEXT PRIMARY KEY,
+                value INTEGER NOT NULL,
+                ts    REAL NOT NULL
+            )"""
+        )
+        # ─── E1: cells 跨进程快照 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS cells_snapshot (
+                id         INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                data       TEXT NOT NULL,
+                version    INTEGER NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS cells_change_notify (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                version INTEGER NOT NULL,
+                ts      REAL NOT NULL
+            )"""
+        )
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -247,6 +293,10 @@ class CacheStore:
             )
             await self._db.execute(
                 "DELETE FROM dsp_notify WHERE ts < ?",
+                (time.time() - 3600,),
+            )
+            await self._db.execute(
+                "DELETE FROM cells_change_notify WHERE ts < ?",
                 (time.time() - 3600,),
             )
             await self._db.commit()
@@ -437,6 +487,271 @@ class CacheStore:
             (now, user_id),
         )
         await self._db.commit()
+
+    # ─── D: 本地任务队列操作 ───
+
+    # ─── H方案: 本地插入新 job(返回临时负数 ID) ───
+
+    async def insert_local_job(self, job: dict) -> int:
+        """H方案: 插入新 job 到本地队列，返回临时负数 ID。
+        
+        SQLite 是主路径，失败抛异常由调用方给用户重试反馈。
+        """
+        if not self._db:
+            raise RuntimeError("SQLite 连接未就绪")
+        local_id = -int(time.time() * 1000000)
+        # 确保 ID 唯一(极端情况下同一微秒内多次调用)
+        while True:
+            existing = await self._db.execute_fetchall(
+                "SELECT 1 FROM local_job_queue WHERE crdb_id = ?", (local_id,)
+            )
+            if not existing:
+                break
+            local_id -= 1
+        await self._db.execute(
+            """INSERT INTO local_job_queue
+            (crdb_id, code, target_user_id, storage_channel_id,
+             storage_msg_ids, batch_file_meta, task_type, status,
+             retry_count, protect_content, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                local_id, job["code"], job["target_user_id"],
+                job.get("storage_channel_id", 0),
+                job.get("storage_msg_ids", ""),
+                job.get("batch_file_meta", ""),
+                job.get("task_type", "single"),
+                job.get("status", "pending"),
+                job.get("retry_count", 0),
+                job.get("protect_content", False),
+                job.get("created_at", ""),
+            ),
+        )
+        await self._db.commit()
+        return local_id
+
+    async def update_local_job_crdb_id(self, local_id: int, crdb_id: int):
+        """H方案: 后台 CRDB 同步完成后，更新真实 CRDB ID"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE local_job_queue SET crdb_id = ? WHERE crdb_id = ?",
+            (crdb_id, local_id),
+        )
+        await self._db.commit()
+
+    async def get_local_job_by_code(self, code: str) -> dict | None:
+        """H方案: 按 code 查找本地 job(启动同步去重用)"""
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            "SELECT crdb_id FROM local_job_queue WHERE code = ? LIMIT 1",
+            (code,),
+        )
+        return {"crdb_id": rows[0][0]} if rows else None
+
+    async def upsert_local_job(self, job: dict):
+        """将 CRDB job 数据同步到本地队列"""
+        if not self._db:
+            return
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    """INSERT OR REPLACE INTO local_job_queue
+                    (crdb_id, code, target_user_id, storage_channel_id,
+                     storage_msg_ids, batch_file_meta, task_type, status,
+                     retry_count, protect_content, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        job["id"], job["code"], job["target_user_id"],
+                        job.get("storage_channel_id", 0),
+                        job.get("storage_msg_ids", ""),
+                        job.get("batch_file_meta", ""),
+                        job.get("task_type", "single"),
+                        job.get("status", "pending"),
+                        job.get("retry_count", 0),
+                        job.get("protect_content", False),
+                        job.get("created_at", ""),
+                    ),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                return
+
+    async def get_local_pending_jobs(self, limit: int = 10) -> list[dict]:
+        """从本地队列获取 pending 状态的 jobs"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT crdb_id, code, target_user_id, storage_channel_id,
+               storage_msg_ids, batch_file_meta, task_type, status,
+               retry_count, protect_content, created_at
+               FROM local_job_queue WHERE status = 'pending'
+               ORDER BY created_at LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {
+                "crdb_id": r[0], "code": r[1], "target_user_id": r[2],
+                "storage_channel_id": r[3], "storage_msg_ids": r[4],
+                "batch_file_meta": r[5], "task_type": r[6], "status": r[7],
+                "retry_count": r[8], "protect_content": r[9], "created_at": r[10],
+            }
+            for r in rows
+        ]
+
+    async def mark_local_job_dispatched(self, crdb_id: int):
+        """标记本地 job 为 dispatched"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE local_job_queue SET status='dispatched', dispatched_at=? WHERE crdb_id=?",
+            (time.time(), crdb_id),
+        )
+        await self._db.commit()
+
+    async def update_local_job_status(self, crdb_id: int, status: str, retry_count: int = None, dead_reason: str = None):
+        """更新本地 job 状态"""
+        if not self._db:
+            return
+        if retry_count is not None:
+            await self._db.execute(
+                "UPDATE local_job_queue SET status=?, retry_count=?, synced_at=0 WHERE crdb_id=?",
+                (status, retry_count, crdb_id),
+            )
+        elif dead_reason:
+            await self._db.execute(
+                "UPDATE local_job_queue SET status=?, dead_reason=?, synced_at=0 WHERE crdb_id=?",
+                (status, dead_reason, crdb_id),
+            )
+        else:
+            await self._db.execute(
+                "UPDATE local_job_queue SET status=?, synced_at=0 WHERE crdb_id=?",
+                (status, crdb_id),
+            )
+        await self._db.commit()
+
+    async def get_local_unsynced_jobs(self) -> list[dict]:
+        """获取需要同步回 CRDB 的 job(状态变更未同步,仅 crdb_id>0 的)"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT crdb_id, status, retry_count, dead_reason
+               FROM local_job_queue WHERE synced_at = 0 AND crdb_id > 0
+               AND status IN ('retried','dead')
+               LIMIT 50"""
+        )
+        return [
+            {"crdb_id": r[0], "status": r[1], "retry_count": r[2], "dead_reason": r[3]}
+            for r in rows
+        ]
+
+    async def mark_local_job_synced(self, crdb_id: int):
+        """标记已同步回 CRDB"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE local_job_queue SET synced_at=? WHERE crdb_id=?",
+            (time.time(), crdb_id),
+        )
+        await self._db.commit()
+
+    async def count_local_pending(self) -> int:
+        """本地 pending 任务数(0 RU)"""
+        if not self._db:
+            return 0
+        row = await self._db.execute_fetchall(
+            "SELECT COUNT(*) FROM local_job_queue WHERE status='pending'"
+        )
+        return row[0][0] if row else 0
+
+    async def cleanup_local_jobs(self, max_age_days: int = 7):
+        """清理超过 N 天的旧 job 记录"""
+        if not self._db:
+            return
+        cutoff = time.time() - max_age_days * 86400
+        await self._db.execute(
+            "DELETE FROM local_job_queue WHERE created_at < ? AND status IN ('dispatched','done','dead')",
+            (str(cutoff),),
+        )
+        await self._db.commit()
+
+    # ─── F5: 启动统计快照 ───
+
+    async def save_counter_snapshot(self, counters: dict[str, int]):
+        """保存启动统计快照(各 Bot 周期性写入)"""
+        if not self._db:
+            return
+        now = time.time()
+        for k, v in counters.items():
+            await self._db.execute(
+                "INSERT OR REPLACE INTO counter_snapshot (key, value, ts) VALUES (?, ?, ?)",
+                (k, v, now),
+            )
+        await self._db.commit()
+
+    async def load_counter_snapshot(self) -> dict[str, int]:
+        """加载启动统计快照"""
+        if not self._db:
+            return {}
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT key, value FROM counter_snapshot"
+            )
+            return {r[0]: r[1] for r in rows}
+        except Exception:
+            return {}
+
+    # ─── E1: cells 跨进程共享 ───
+
+    async def save_cells_snapshot(self, cells: list[dict], version: int):
+        """保存 cells 全量快照(仅 Mon Bot 写)"""
+        if not self._db:
+            return
+        try:
+            raw = json.dumps(cells, default=str)
+            val = raw.decode() if isinstance(raw, bytes) else raw
+        except Exception:
+            return
+        now = time.time()
+        await self._db.execute(
+            "INSERT OR REPLACE INTO cells_snapshot (id, data, version, updated_at) VALUES (1, ?, ?, ?)",
+            (val, version, now),
+        )
+        await self._db.execute(
+            "INSERT INTO cells_change_notify (version, ts) VALUES (?, ?)",
+            (version, now),
+        )
+        await self._db.commit()
+
+    async def load_cells_snapshot(self) -> tuple[list[dict] | None, int]:
+        """加载 cells 快照(其他 Bot 启动时调)"""
+        if not self._db:
+            return None, 0
+        try:
+            row = await self._db.execute_fetchall(
+                "SELECT data, version FROM cells_snapshot WHERE id=1"
+            )
+            if not row:
+                return None, 0
+            cells = json.loads(row[0][0])
+            return cells, row[0][1]
+        except Exception:
+            return None, 0
+
+    async def has_cells_change(self, last_version: int) -> tuple[bool, int]:
+        """检查是否有 cells 变更"""
+        if not self._db:
+            return False, last_version
+        row = await self._db.execute_fetchall(
+            "SELECT MAX(version) FROM cells_change_notify WHERE version > ?",
+            (last_version,),
+        )
+        new_version = row[0][0] if row and row[0][0] else last_version
+        return new_version > last_version, new_version
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────

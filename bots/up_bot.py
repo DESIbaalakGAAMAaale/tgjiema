@@ -23,7 +23,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from loguru import logger
 
 from config import settings
-from database import get_pending_uploads_col, get_active_cells
+from database import get_pending_uploads_col, get_active_cells_local
 from database.cache_store import get_cache_store
 from services.permission import check_upload_permission
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
@@ -70,7 +70,7 @@ async def _refresh_active_slots():
     """刷新当前 Active A 槽列 (读取 cells 表)"""
     global _active_a_slots
     try:
-        _active_a_slots = await get_active_cells()
+        _active_a_slots = await get_active_cells_local()
         logger.info(f"[Up] 刷新 Active 槽位: {len(_active_a_slots)} 个")
     except Exception as e:
         logger.error(f"[Up] 刷新槽位失败: {e}")

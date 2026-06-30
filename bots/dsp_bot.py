@@ -19,7 +19,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from loguru import logger
 
 from config import settings
-from database import dequeue_jobs, get_file_records_col, reenqueue_job, reenqueue_job_no_retry, mark_job_dead, set_cell_status, get_active_or_shadow_cell, get_pending_jobs_count
+from database import dequeue_jobs, get_file_records_col, get_file_record_cached, get_pending_jobs_count_local, reenqueue_job, reenqueue_job_no_retry, mark_job_dead, set_cell_status, get_active_or_shadow_cell
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
@@ -229,42 +229,64 @@ async def process_queue(bot):
 
 async def _dsp_worker(bot: Any, worker_id: int):
     """单个 worker 循环拉取任务
-    策略:维护本地队列,空时批量查 CRDB dequeue_jobs(10),有任务时本地消费不查 DB
-    无事时最大 30 秒查一次本地通知,几乎零消耗
+    D: 改为从本地 SQLite 队列消费,不再直接查 CRDB dequeue_jobs
+    节省 98% RU 消耗
     """
     from database.cache_store import get_cache_store
+    from database import JobResult
     store = get_cache_store()
 
-    local_queue: list = []  # 本地任务队列,有任务时直接处理不查 CRDB
+    local_queue: list = []  # 本地任务队列,有任务时直接处理
     idle_count = 0
     while True:
         try:
             # 本地队列有任务,直接处理
             if not local_queue:
-                # 先查本地通知(零 RU)
-                has_job = await store.has_new_dsp_job()
-                if not has_job:
+                # D: 从本地 SQLite 取 pending jobs(零 RU)
+                raw_jobs = await store.get_local_pending_jobs(10)
+                if not raw_jobs:
+                    # G: 检查是否有新通知(Idx 直写)，有则立即重试
+                    if await store.has_new_dsp_job():
+                        idle_count = 0
+                        continue
                     idle_count += 1
                     sleep_time = min(2.0 * (1.6 ** min(idle_count, 12)), 30.0)
                     await asyncio.sleep(sleep_time)
                     continue
 
-                # 有本地通知,批量查 CRDB 拉取
-                local_queue = await dequeue_jobs(10)
-                if not local_queue:
-                    idle_count += 1
-                    await asyncio.sleep(1)
-                    continue
+                # 转换为 JobResult 对象
+                for rj in raw_jobs:
+                    storage_ids = []
+                    raw_ids = rj.get("storage_msg_ids", "")
+                    if raw_ids:
+                        try:
+                            storage_ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                        except (json.JSONDecodeError, TypeError):
+                            storage_ids = []
+                    local_queue.append(JobResult(
+                        job_id=rj["crdb_id"],
+                        code=rj["code"],
+                        target_user_id=rj["target_user_id"],
+                        storage_channel_id=rj["storage_channel_id"],
+                        storage_msg_ids=storage_ids,
+                        batch_file_meta=rj.get("batch_file_meta", ""),
+                        task_type=rj.get("task_type", "single"),
+                        protect_content=rj.get("protect_content", False),
+                        retry_count=rj.get("retry_count", 0),
+                    ))
 
             idle_count = 0
             job = local_queue.pop(0)  # FIFO 消费本地队列
 
-            # ── 动态限速：根据 pending jobs 数量自动调节延迟 ──
-            await dynamic_rate_limiter.acquire(get_pending_jobs_count)
+            # D: 标记本地 job 为 dispatched
+            await store.mark_local_job_dispatched(job.job_id)
+
+            # ── 动态限速：根据本地 pending jobs 数量自动调节延迟 ──
+            await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
 
             # 死信检查:retry_count >= 3 标记为 dead
             if job.retry_count >= 3:
-                await mark_job_dead(job.job_id, f"重试次数已达上限({job.retry_count})")
+                await store.update_local_job_status(job.job_id, "dead", dead_reason=f"重试次数已达上限({job.retry_count})")
                 logger.warning(f"[Dsp-{worker_id}] 死信标记: job={job.job_id}, code={job.code}, retry={job.retry_count}")
                 continue
 
@@ -274,8 +296,8 @@ async def _dsp_worker(bot: Any, worker_id: int):
                     _send_semaphore.acquire(), timeout=10.0
                 )
             except asyncio.TimeoutError:
-                # 等超时重新入队(不递增 retry_count,避免白白消耗重试次数)
-                await reenqueue_job_no_retry(job.job_id)
+                # D: 本地标记 retried(不递增),等待 sync_back 同步 CRDB
+                await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count)
                 logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时,重新入队 job={job.job_id}")
                 await asyncio.sleep(1)
                 continue
@@ -296,10 +318,10 @@ async def _dsp_worker(bot: Any, worker_id: int):
             # 发送失败处理:根据 retry_count 决定重试还是死信
             if not send_ok:
                 if job.retry_count >= 3:
-                    await mark_job_dead(job.job_id, f"发送失败,已重试{job.retry_count}次: {job.code}")
+                    await store.update_local_job_status(job.job_id, "dead", dead_reason=f"发送失败,已重试{job.retry_count}次: {job.code}")
                     logger.warning(f"[Dsp-{worker_id}] 死信: job={job.job_id}, code={job.code}, retry={job.retry_count}")
                 else:
-                    await reenqueue_job(job.job_id)
+                    await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count + 1)
                     logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{job.retry_count + 1}")
 
                 # Dsp 侧降级检查(Mon Bot 补充机制,兜底)
@@ -566,8 +588,8 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 查文件记录获取上传者
     try:
-        files_col = get_file_records_col()
-        file_record = await files_col.find_one({"file_code": file_code})
+        # A2: 走缓存,避免每次直查 CRDB
+        file_record = await get_file_record_cached(file_code)
         if not file_record:
             await query.answer("文件记录不存在", show_alert=True)
             return
@@ -717,8 +739,39 @@ async def _async_main():
             await metrics.ping_bot("dsp_bot")
             await asyncio.sleep(30)
 
+    # H: 启动时一次性从 CRDB 同步，补齐 Dsp 离线期间遗漏的 job
+    async def startup_sync():
+        from database.session import sync_jobs_from_crdb_to_sqlite
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        logger.info("[Dsp] 启动同步: 从 CRDB 补齐可能遗漏的 jobs...")
+        try:
+            await sync_jobs_from_crdb_to_sqlite(100)
+        except Exception as e:
+            logger.warning(f"[Dsp] 启动同步异常: {e}")
+        # 之后每 5 分钟轻量同步 + 清理旧记录
+        while True:
+            await asyncio.sleep(300)
+            try:
+                await sync_jobs_from_crdb_to_sqlite(100)
+                await store.cleanup_local_jobs(7)
+            except Exception as e:
+                logger.debug(f"[Dsp] 周期同步异常: {e}")
+
+    # D: Sync Back - 每 30 秒同步本地状态变更回 CRDB
+    async def sync_back_loop():
+        from database.session import sync_local_jobs_to_crdb
+        while True:
+            try:
+                await sync_local_jobs_to_crdb()
+            except Exception as e:
+                logger.debug(f"[SyncBack] 同步异常: {e}")
+            await asyncio.sleep(30)
+
     loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")
+    create_safe_task(startup_sync(), name="startup-sync")          # H: 启动同步 + 周期兜底
+    create_safe_task(sync_back_loop(), name="sync-back")          # D: 新增
     create_safe_task(process_queue(bot), name="process-queue")
     create_safe_task(_cleanup_page_states(), name="cleanup-page-states")
     create_safe_task(_cleanup_channel_failures(), name="cleanup-channel-failures")

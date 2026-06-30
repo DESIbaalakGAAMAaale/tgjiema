@@ -101,6 +101,22 @@ class MonBot:
     def _invalidate_cells_cache(self):
         """写入 cells 后调用,下次循环自动重载。"""
         self._cells_cache = None
+        # E1: 异步保存 cells 快照到 SQLite 供其他进程使用
+        try:
+            asyncio.ensure_future(self._save_cells_to_sqlite())
+        except Exception:
+            pass
+
+    async def _save_cells_to_sqlite(self):
+        """E1: 将当前 cells 全量保存到本地 SQLite"""
+        from database.cache_store import get_cache_store
+        try:
+            cells = await self._get_cells()
+            version = int(time.time())
+            store = get_cache_store()
+            await store.save_cells_snapshot(cells, version)
+        except Exception:
+            pass
 
     async def _reload_rotation_config(self):
         """从 DB rotation_config 表重新读取轮转参数(30 个周期一次)。"""

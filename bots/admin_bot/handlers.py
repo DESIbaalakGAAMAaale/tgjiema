@@ -6,7 +6,7 @@ from telegram.ext import ContextTypes
 
 from config import settings
 from database import (
-    get_users_col, get_file_records_col, get_decode_logs_col,
+    get_users_col, get_file_records_col, get_file_record_cached, get_decode_logs_col,
     get_config, set_config,
     get_relay_config, set_relay_config,
     get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
@@ -236,8 +236,8 @@ async def file_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     file_code = args[0]
 
-    files_col = get_file_records_col()
-    record = await files_col.find_one({"file_code": file_code})
+    # A2: 走缓存,避免每次直查 CRDB
+    record = await get_file_record_cached(file_code)
     if record is None:
         await update.message.reply_text(f"❌ 文件码 {file_code} 不存在")
         return

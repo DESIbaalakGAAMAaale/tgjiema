@@ -9,30 +9,38 @@ class QueryCache:
         self.cache = OrderedDict()
         self.max_size = max_size
         self.ttl = ttl_seconds
+        self.hits = 0
+        self.misses = 0
 
-    def _clean_expired(self):
+    def _evict_expired_or_lru(self):
+        """淘汰策略:优先淘汰过期项,无过期项则 LRU 弹出最旧项。
+        
+        避免每次 get/set 全量扫描过期项,改为懒清理:只在淘汰时检查最多 10 个。
+        """
         now = time.time()
-        to_remove = []
-        for key, entry in self.cache.items():
-            if now - entry["ts"] >= self.ttl:
-                to_remove.append(key)
-        for key in to_remove:
-            del self.cache[key]
+        keys_to_check = list(self.cache.keys())[:10]
+        for key in keys_to_check:
+            if key in self.cache and now - self.cache[key]["ts"] >= self.ttl:
+                del self.cache[key]
+                return  # 找到一个过期项即可
+        # 无过期项,正常 LRU 淘汰
+        if self.cache:
+            self.cache.popitem(last=False)
 
     def get(self, key: str) -> Optional[Any]:
-        self._clean_expired()
         if key in self.cache:
             entry = self.cache[key]
             if time.time() - entry["ts"] < self.ttl:
                 self.cache.move_to_end(key)
+                self.hits += 1
                 return entry["data"]
             del self.cache[key]
+        self.misses += 1
         return None
 
     def set(self, key: str, data: Any):
-        self._clean_expired()
         if len(self.cache) >= self.max_size:
-            self.cache.popitem(last=False)
+            self._evict_expired_or_lru()
         self.cache[key] = {"data": data, "ts": time.time()}
 
     def invalidate(self, key: str):
@@ -42,10 +50,26 @@ class QueryCache:
     def clear(self):
         self.cache.clear()
 
+    def stats(self) -> dict:
+        total = self.hits + self.misses
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(self.hits / total * 100, 1) if total > 0 else 0,
+            "size": len(self.cache),
+            "max_size": self.max_size,
+        }
+
 
 _user_cache = QueryCache(max_size=1000, ttl_seconds=10800)           # 1000条/3小时
 _file_record_cache = QueryCache(max_size=1000, ttl_seconds=300)  # 1000条/5分钟(缩短以快速响应状态变更)
 _config_cache = QueryCache(max_size=100, ttl_seconds=600)            # 10分钟
+
+# ─── C1: 负缓存(防穿透) ──────────────────────────────────
+# 查询不存在的 user_id/file_code 时缓存空值 60 秒,避免恶意穿透到 CRDB
+_NEGATIVE_CACHE_TTL = 60
+_negative_user_cache: dict[int, float] = {}   # user_id -> expired_at
+_negative_file_cache: dict[str, float] = {}   # file_code -> expired_at
 
 
 def get_user_cache() -> QueryCache:
@@ -56,9 +80,48 @@ def get_file_record_cache() -> QueryCache:
     return _file_record_cache
 
 
+def check_negative_user(user_id: int) -> bool:
+    """检查是否命中负缓存,返回 True 表示该用户确认不存在"""
+    if user_id in _negative_user_cache:
+        if time.time() < _negative_user_cache[user_id]:
+            return True
+        del _negative_user_cache[user_id]
+    return False
+
+
+def set_negative_user(user_id: int):
+    """写入负缓存:该用户确认不存在"""
+    _negative_user_cache[user_id] = time.time() + _NEGATIVE_CACHE_TTL
+
+
+def clear_negative_user(user_id: int):
+    """清除负缓存:用户创建/更新时调用"""
+    _negative_user_cache.pop(user_id, None)
+
+
+def check_negative_file(file_code: str) -> bool:
+    """检查是否命中负缓存,返回 True 表示该文件确认不存在"""
+    if file_code in _negative_file_cache:
+        if time.time() < _negative_file_cache[file_code]:
+            return True
+        del _negative_file_cache[file_code]
+    return False
+
+
+def set_negative_file(file_code: str):
+    """写入负缓存:该文件确认不存在"""
+    _negative_file_cache[file_code] = time.time() + _NEGATIVE_CACHE_TTL
+
+
+def clear_negative_file(file_code: str):
+    """清除负缓存:文件创建/更新时调用"""
+    _negative_file_cache.pop(file_code, None)
+
+
 def invalidate_file_record(file_code: str):
     """失效指定文件码的缓存,用于文件状态变更时立即生效。"""
     _file_record_cache.invalidate(f"file_record:{file_code}")
+    clear_negative_file(file_code)  # C1: 同时清负缓存
 
 
 def get_config_cache() -> QueryCache:
@@ -67,11 +130,41 @@ def get_config_cache() -> QueryCache:
 
 # ─── codes 表缓存(取件码创建后不变,7天 TTL) ────────────
 
-_code_cache = QueryCache(max_size=5000, ttl_seconds=604800)  # 5000条/7天
+_code_cache = QueryCache(max_size=5000, ttl_seconds=3600)  # 5000条/1小时(原7天,缩短避免幽灵解码)
 
 
 def get_code_cache() -> QueryCache:
     return _code_cache
+
+
+# ─── J 方案: code 缓存 SQLite 失效 ──────────────────────────
+
+def invalidate_code_entry(code: str):
+    """失效 code 缓存（内存 + SQLite），用于 status/expiry/note 变更时。"""
+    cache = _code_cache
+    cache_key = f"code:{code}"
+    cache.invalidate(cache_key)
+    # 同步删除 SQLite 持久化缓存
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    asyncio.ensure_future(store.delete(cache_key))
+
+
+# ─── E7: 用户码列表缓存 ──────────────────────────────────
+
+_user_codes_cache = QueryCache(max_size=500, ttl_seconds=300)  # 500用户/5分钟
+
+
+def get_user_codes_cache() -> QueryCache:
+    return _user_codes_cache
+
+
+def invalidate_user_codes(user_id: int):
+    """用户改码后调用(下架/删除/修改),失效该用户所有分页缓存"""
+    cache = get_user_codes_cache()
+    keys_to_remove = [k for k in cache.cache if k.startswith(f"user_codes:{user_id}:")]
+    for k in keys_to_remove:
+        cache.invalidate(k)
 
 
 # ─── request_count 本地累积:批量写 CRDB ──────────────────
@@ -140,12 +233,19 @@ async def dump_cache_to_disk_loop():
         await _asyncio.sleep(60)
         try:
             await dump_cache_to_disk()
-            # 每 10 分钟清理一次通知表
+            # 每 10 分钟清理一次通知表 + 保存 counter 快照
             cleanup_counter += 1
             if cleanup_counter >= 10:
                 cleanup_counter = 0
                 store = get_cache_store()
                 await store.cleanup_notify_tables()
+                # F5: 保存 status_counters 快照,下次启动从 SQLite 恢复
+                try:
+                    from utils.shared_counters import status_counters
+                    core = {k: v for k, v in status_counters.items() if not k.startswith("user_code_count:")}
+                    await store.save_counter_snapshot(core)
+                except Exception:
+                    pass
                 logger.debug("[cache_store] 已清理过期通知表记录")
         except Exception as e:
             logger.debug(f"[cache_store] 定期 dump 失败: {e}")

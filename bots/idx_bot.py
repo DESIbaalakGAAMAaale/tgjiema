@@ -1167,13 +1167,15 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     await get_code_change_buffer().insert(code, "expiry", new_expire or "NULL", user.id)
 
     # 更新本地缓存
-    from database.cache import get_code_cache
+    from database.cache import get_code_cache, invalidate_code_entry
     cache_key = f"code:{code}"
     if code_entry in get_code_cache().cache:
         if new_expire:
             get_code_cache().cache[cache_key]["expire_time"] = new_expire
         else:
             get_code_cache().cache[cache_key].pop("expire_time", None)
+    # J: 同步删除 SQLite 持久化缓存
+    invalidate_code_entry(code)
     # E7: 失效用户码列表缓存
     from database.cache import invalidate_user_codes
     invalidate_user_codes(user.id)
@@ -1295,10 +1297,12 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
     await get_code_change_buffer().insert(code, "status", new_status, user.id)
 
     # 更新本地缓存
-    from database.cache import get_code_cache
+    from database.cache import get_code_cache, invalidate_code_entry
     cache_key = f"code:{code}"
     if cache_key in get_code_cache().cache:
         get_code_cache().cache[cache_key]["status"] = new_status
+    # J: 同步删除 SQLite 持久化缓存
+    invalidate_code_entry(code)
     # F1: 下架/上架时同步 local_job_queue 状态
     if new_status == "offline":
         try:
@@ -1418,10 +1422,12 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
     if action == "edit_note":
         await get_code_change_buffer().insert(code, "note", text, user.id)
         # 更新缓存
-        from database.cache import get_code_cache
+        from database.cache import get_code_cache, invalidate_code_entry
         cache_key = f"code:{code}"
         if cache_key in get_code_cache().cache:
             get_code_cache().cache[cache_key]["note"] = text
+        # J: 同步删除 SQLite 持久化缓存
+        invalidate_code_entry(code)
         # E7: 失效用户码列表缓存
         from database.cache import invalidate_user_codes
         invalidate_user_codes(user.id)
@@ -1451,13 +1457,15 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
             await get_code_change_buffer().insert(code, "expiry", "NULL", user.id)
 
         # 更新缓存
-        from database.cache import get_code_cache
+        from database.cache import get_code_cache, invalidate_code_entry
         cache_key = f"code:{code}"
         if cache_key in get_code_cache().cache:
             if new_expire:
                 get_code_cache().cache[cache_key]["expire_time"] = new_expire
             else:
                 get_code_cache().cache[cache_key].pop("expire_time", None)
+        # J: 同步删除 SQLite 持久化缓存
+        invalidate_code_entry(code)
         # E7: 失效用户码列表缓存
         from database.cache import invalidate_user_codes
         invalidate_user_codes(user.id)

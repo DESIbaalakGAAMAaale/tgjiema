@@ -62,23 +62,39 @@ class DecodeResult:
 
 
 async def get_or_create_user(user_id: int, username: str = None, first_name: str = None) -> dict:
+    # A1: 优先走三级缓存(内存→SQLite→CRDB),避免每次直查 CRDB
+    user = await get_user_cached(user_id)
+    if user is not None:
+        return user
+    # 缓存未命中,创建新用户
+    user = make_user(
+        user_id=user_id,
+        username=username,
+        first_name=first_name,
+        membership_level="free",
+        daily_decode_quota=settings.FREE_DAILY_QUOTA,
+        external_decode_quota=settings.FREE_EXTERNAL_DAILY_QUOTA,
+    )
     col = get_users_col()
-    user = await col.find_one({"user_id": user_id})
-    if user is None:
-        user = make_user(
-            user_id=user_id,
-            username=username,
-            first_name=first_name,
-            membership_level="free",
-            daily_decode_quota=settings.FREE_DAILY_QUOTA,
-            external_decode_quota=settings.FREE_EXTERNAL_DAILY_QUOTA,
-        )
+    try:
+        await col.insert_one(user)
+        # F1: 新用户注册,递增本地计数器
         try:
-            await col.insert_one(user)
+            from utils.shared_counters import incr_total_users
+            incr_total_users()
         except Exception:
-            user = await col.find_one({"user_id": user_id})
-            if not user:
-                raise
+            pass
+    except Exception:
+        # 并发插入冲突,重新查询(可能已被另一个请求创建)
+        user = await get_user_cached(user_id) or await col.find_one({"user_id": user_id})
+        if not user:
+            raise
+    # 写入缓存(插入成功后才写,避免缓存脏数据)
+    try:
+        from database.cache import get_user_cache
+        get_user_cache().set(f"user:{user_id}", user)
+    except Exception:
+        pass
     return user
 
 
@@ -91,8 +107,8 @@ def is_external_code(file_code: str) -> bool:
 
 
 async def check_upload_permission(user_id: int) -> bool:
-    col = get_users_col()
-    user = await col.find_one({"user_id": user_id})
+    # A1: 走缓存,避免每次直查 CRDB
+    user = await get_user_cached(user_id)
     if user is None:
         return False
     if user.get("is_banned"):
@@ -253,10 +269,9 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     if is_system_code(file_code):
         file_record = await get_file_record_cached(file_code)
         if file_record is not None and file_record.get("status") == "active":
-            # 检查 codes 表 status（用户下架拦截）
-            from database import get_codes_col
-            codes_col = get_codes_col()
-            code_entry = await codes_col.find_one({"code": file_code})
+            # I: codes 表走 B1 缓存，避免每次解码直查 CRDB(1 RU)
+            from database import get_code_entry_cached
+            code_entry = await get_code_entry_cached(file_code)
             if code_entry and code_entry.get("status") == "offline":
                 return DecodeResult(allowed=False, reason="文件不存在或已被删除")
             expired, reason = check_code_expired(file_record)

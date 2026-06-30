@@ -1046,6 +1046,11 @@ async def get_user_cached(user_id: int) -> Optional[dict]:
     cache = get_user_cache()
     cache_key = f"user:{user_id}"
 
+    # C1: 负缓存检查,避免穿透
+    from .cache import check_negative_user
+    if check_negative_user(user_id):
+        return None
+
     # L1: 内存缓存
     cached = cache.get(cache_key)
     if cached is not None:
@@ -1066,6 +1071,10 @@ async def get_user_cached(user_id: int) -> Optional[dict]:
     if user:
         cache.set(cache_key, user)
         await store.set(cache_key, user)  # 写穿透到 L2
+    else:
+        # C1: 写入负缓存,60 秒内不重复查 CRDB
+        from .cache import set_negative_user
+        set_negative_user(user_id)
 
     return user
 
@@ -1076,11 +1085,19 @@ async def update_user_and_invalidate(user_id: int, update: dict = None):
         await col.update_one({"user_id": user_id}, update)
     cache = get_user_cache()
     cache.invalidate(f"user:{user_id}")
+    # C1: 清除负缓存,确保新用户可被查到
+    from .cache import clear_negative_user
+    clear_negative_user(user_id)
 
 
 async def get_file_record_cached(file_code: str) -> Optional[dict]:
     cache = get_file_record_cache()
     cache_key = f"file:{file_code}"
+
+    # C1: 负缓存检查,避免穿透
+    from .cache import check_negative_file
+    if check_negative_file(file_code):
+        return None
 
     # L1: 内存缓存
     cached = cache.get(cache_key)
@@ -1102,6 +1119,10 @@ async def get_file_record_cached(file_code: str) -> Optional[dict]:
     if record:
         cache.set(cache_key, record)
         await store.set(cache_key, record)
+    else:
+        # C1: 写入负缓存,60 秒内不重复查 CRDB
+        from .cache import set_negative_file
+        set_negative_file(file_code)
 
     return record
 
@@ -1112,6 +1133,40 @@ async def update_file_record_and_invalidate(file_code: str, update: dict):
 
     cache = get_file_record_cache()
     cache.invalidate(f"file:{file_code}")
+
+
+# ─── I: codes 表缓存查询(复用 B1 code_cache) ──────────────────
+
+async def get_code_entry_cached(code: str) -> Optional[dict]:
+    """查 codes 表，三级缓存：内存 → SQLite → CRDB（J 方案）
+    
+    每次解码都调 check_decode_permission → 原来直查 CRDB(1 RU)，
+    加缓存后 99% 命中，零 RU。
+    """
+    from .cache import get_code_cache
+    cache = get_code_cache()
+    cache_key = f"code:{code}"
+    
+    # L1: 内存缓存
+    entry = cache.get(cache_key)
+    if entry is not None:
+        return entry
+    
+    # L2: SQLite 持久化缓存（J 方案新增）
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    entry = await store.get(cache_key)
+    if entry is not None:
+        cache.set(cache_key, entry)  # 回填内存
+        return entry
+    
+    # L3: CRDB
+    col = get_codes_col()
+    entry = await col.find_one({"code": code})
+    if entry:
+        cache.set(cache_key, entry)
+        await store.set(cache_key, entry)  # J: 持久化到 SQLite
+    return entry
 
 
 async def get_config_cached(key: str) -> Optional[str]:
@@ -1338,6 +1393,40 @@ async def update_cell_heartbeat(slot_id: str):
     )
 
 
+# ─── H方案: 后台异步同步新 job 到 CRDB ─────────────────────────
+
+async def _sync_new_job_to_crdb(
+    local_id: int,
+    code: str,
+    target_user_id: int,
+    storage_channel_id: int,
+    storage_msg_ids_str: str,
+    batch_file_meta: str,
+    task_type: str,
+    protect_content: bool,
+    created_at: str,
+):
+    """后台异步: 将 SQLite 中的新 job 写入 CRDB(仅审计),更新 crdb_id"""
+    from .cache_store import get_cache_store
+    try:
+        col = get_jobs_col()
+        rows = await col._query(
+            """INSERT INTO jobs (code, target_user_id, storage_channel_id,
+               storage_msg_ids, batch_file_meta, task_type, status,
+               protect_content, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               RETURNING id""",
+            [code, target_user_id, storage_channel_id, storage_msg_ids_str,
+             batch_file_meta, task_type, "pending", protect_content, created_at],
+        )
+        crdb_id = rows[0]["id"] if rows else None
+        if crdb_id is not None:
+            store = get_cache_store()
+            await store.update_local_job_crdb_id(local_id, crdb_id)
+    except Exception as e:
+        logger.debug(f"[H] 后台 CRDB 同步失败 local_id={local_id}: {e}")
+
+
 async def enqueue_job(
     code: str,
     target_user_id: int,
@@ -1347,24 +1436,35 @@ async def enqueue_job(
     task_type: str = "single",
     protect_content: bool = False,
 ):
-    """jobs 表写入派工任务"""
+    """jobs 表写入派工任务 + H方案: SQLite 优先，CRDB 异步审计
+    
+    SQLite 写入失败 → 抛异常，调用方给用户重试反馈。
+    CRDB 写入走后台异步，不阻塞用户响应。
+    """
     import datetime as _dt
     try:
         import orjson as _json
     except ImportError:
         import json as _json
-    col = get_jobs_col()
-    await col.insert_one({
+    created_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    storage_msg_ids_str = _json_dumps(storage_msg_ids)
+    
+    # H方案: 先写 SQLite 本地队列(主路径)，失败则抛异常让用户重试
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    local_id = await store.insert_local_job({
         "code": code,
         "target_user_id": target_user_id,
         "storage_channel_id": storage_channel_id,
-        "storage_msg_ids": _json_dumps(storage_msg_ids),
+        "storage_msg_ids": storage_msg_ids_str,
         "batch_file_meta": batch_file_meta,
         "task_type": task_type,
         "status": "pending",
         "protect_content": protect_content,
-        "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "created_at": created_at,
     })
+    await store.notify_dsp_new_job()
+    
     # 递增本地计数器(用于 admin /status)
     try:
         from utils.shared_counters import status_counters
@@ -1372,13 +1472,19 @@ async def enqueue_job(
         status_counters["active_files"] = status_counters.get("active_files", 0) + 1
     except Exception:
         pass
-    # 通知 Dsp Bot（本地 SQLite 通知，零 RU）
-    try:
-        from .cache_store import get_cache_store
-        store = get_cache_store()
-        await store.notify_dsp_new_job()
-    except Exception:
-        pass  # 通知失败不影响 jobs 写入
+    
+    # H方案: CRDB 写入走后台异步(fire-and-forget)，仅用于审计，不阻塞
+    asyncio.ensure_future(_sync_new_job_to_crdb(
+        local_id=local_id,
+        code=code,
+        target_user_id=target_user_id,
+        storage_channel_id=storage_channel_id,
+        storage_msg_ids_str=storage_msg_ids_str,
+        batch_file_meta=batch_file_meta,
+        task_type=task_type,
+        protect_content=protect_content,
+        created_at=created_at,
+    ))
 
 
 async def dequeue_jobs(batch_size: int = 10) -> list:
@@ -1596,6 +1702,122 @@ async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
             updated.append(job_id)
 
     return updated
+
+
+# ─── D: SQLite 本地队列同步函数 ─────────────────────────────────
+
+async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
+    """Queue Syncer: 从 CRDB 拉取 pending/dispatched jobs 到本地 SQLite
+    
+    每 5 秒调用一次,批量同步。这是 D 方案的核心:将 CRDB 的 CTE 操作
+    改为本地 SQLite 消费,节省 98% RU。
+    """
+    from loguru import logger
+    from .cache_store import get_cache_store
+
+    col = get_jobs_col()
+    try:
+        rows = await col.find(
+            {"status": {"$in": ["pending", "dispatched"]}},
+            sort=("created_at", 1),
+            limit=limit,
+        )
+    except Exception as e:
+        logger.debug(f"[QueueSyncer] 拉取 CRDB jobs 失败: {e}")
+        return
+
+    if not rows:
+        return
+
+    store = get_cache_store()
+    synced = 0
+    for row in rows:
+        job_id = row.get("id")
+        if not job_id:
+            continue
+        await store.upsert_local_job(dict(row))
+        synced += 1
+
+    if synced > 0:
+        logger.debug(f"[QueueSyncer] 同步 {synced} 条 job 到本地 SQLite")
+
+
+async def sync_local_jobs_to_crdb():
+    """Sync Back: 将本地 SQLite 中状态变更的 job 批量同步回 CRDB
+    
+    每 30 秒调用一次。处理 retried/dead 状态的 job。
+    """
+    from loguru import logger
+    from .cache_store import get_cache_store
+
+    store = get_cache_store()
+    unsynced = await store.get_local_unsynced_jobs()
+    if not unsynced:
+        return
+
+    col = get_jobs_col()
+    synced = 0
+    for job in unsynced:
+        crdb_id = job["crdb_id"]
+        status = job["status"]
+        try:
+            if status == "retried":
+                await col.update_one(
+                    {"id": crdb_id},
+                    {"$set": {"status": "pending"}, "$inc": {"retry_count": 1}},
+                )
+            elif status == "dead":
+                await col.update_one(
+                    {"id": crdb_id},
+                    {"$set": {"status": "dead", "dead_reason": job.get("dead_reason", "unknown")}},
+                )
+            await store.mark_local_job_synced(crdb_id)
+            synced += 1
+        except Exception as e:
+            logger.debug(f"[SyncBack] 同步 job={crdb_id} 失败: {e}")
+
+    if synced > 0:
+        logger.debug(f"[SyncBack] 同步 {synced} 条 job 状态到 CRDB")
+
+
+async def get_pending_jobs_count_local() -> int:
+    """D: 从本地 SQLite 获取 pending 任务数(0 RU)"""
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    return await store.count_local_pending()
+
+
+# ─── E1: cells 本地缓存 ─────────────────────────────────────────
+
+_cells_local_version: int = 0
+_cells_local_cache: list[dict] | None = None
+
+
+async def get_active_cells_local() -> list[dict]:
+    """E1: 本地 SQLite cells 快照优先,CRDB 兜底"""
+    global _cells_local_cache, _cells_local_version
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+
+    if _cells_local_cache is None:
+        cells, version = await store.load_cells_snapshot()
+        if cells:
+            _cells_local_cache = cells
+            _cells_local_version = version
+        else:
+            col = get_cells_col()
+            _cells_local_cache = await col.find({"status": "active"})
+            _cells_local_version = 0
+        return _cells_local_cache
+
+    has_change, new_version = await store.has_cells_change(_cells_local_version)
+    if has_change:
+        cells, version = await store.load_cells_snapshot()
+        if cells:
+            _cells_local_cache = cells
+            _cells_local_version = version
+
+    return _cells_local_cache
 
 
 async def set_code_expiry(code: str, expires_at: str):
