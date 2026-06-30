@@ -268,6 +268,7 @@ class UserRelay:
                 return pack_bot_file_id(inner) or ""
             return pack_bot_file_id(media) or ""
         except Exception:
+            logger.debug(f"[UserRelay] _extract_file_id 失败 (msg_id={getattr(msg, 'id', '?')})")
             return ""
 
     async def _self_heal_file_ids(self, code: str, meta_list: list) -> int:
@@ -574,6 +575,7 @@ class UserRelay:
         exchange["_ai_running"] = True
 
         stale_clicks = 0
+        last_msg_ids = set()  # 追踪消息 ID 去重，防止翻页无新内容时死循环
         try:
             while True:
 
@@ -677,12 +679,21 @@ class UserRelay:
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
                         events_after = len(exchange.get("events", []))
-                        if events_after > events_before:
+                        # 用消息 ID 去重判断是否有新内容，而非仅靠数量
+                        current_ids = set()
+                        for ev in exchange.get("events", []):
+                            mid = getattr(ev.message, "id", None)
+                            if mid:
+                                current_ids.add(mid)
+                        new_ids = current_ids - last_msg_ids
+                        if new_ids:
                             stale_clicks = 0
+                            last_msg_ids = current_ids
                         else:
                             stale_clicks += 1
                             logger.info(
-                                f"[UserRelay] 翻页无新增消息 (stale_clicks={stale_clicks}/3)"
+                                f"[UserRelay] 翻页无新消息 ID (stale_clicks={stale_clicks}/3), "
+                                f"events_before={events_before}, events_after={events_after}"
                             )
                             if stale_clicks >= 3:
                                 logger.info("[UserRelay] 连续翻页无新消息，结束收集")
@@ -872,6 +883,11 @@ class UserRelay:
                 if msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows:
                     keyboard_msg = msg
                     exchange["_keyboard_msg"] = msg
+                    # 重新校验 row/col 在新键盘中是否有效
+                    if exchange.get("_row", 0) >= len(msg.reply_markup.rows):
+                        exchange["_row"] = 0
+                    if exchange.get("_col", 0) >= len(msg.reply_markup.rows[exchange.get("_row", 0)].buttons):
+                        exchange["_col"] = 0
                     break
         if not keyboard_msg or not keyboard_msg.reply_markup:
             logger.warning(f"[UserRelay] 无可用键盘消息 (bot={bot_username})")

@@ -19,7 +19,7 @@ from storage.r2 import _r2 as r2_storage
 # 备份中会包含的表（按依赖顺序排列，先恢复无依赖的表）
 ALL_TABLES = ["users", "file_records", "decode_logs", "cells", "codes", "jobs",
               "rotate_log", "pending_uploads", "spare_pool", "backup_config",
-              "code_bot_mapping", "message_backups"]
+              "code_bot_mapping", "message_backups", "relay_accounts", "kv_config"]
 
 # 各表的主键列
 TABLE_PK = {

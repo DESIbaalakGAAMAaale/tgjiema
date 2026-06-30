@@ -24,6 +24,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import yaml
+import asyncio
+from database import init_db, close_db, get_rotation_config
 
 
 def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
@@ -48,9 +50,6 @@ def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
         result["rotation_time_per_slot"] = _settings.ROTATION_TIME_PER_SLOT
 
     try:
-        import asyncio
-        from database import init_db, close_db, get_rotation_config
-
         async def _load():
             await init_db()
             db_keys = {

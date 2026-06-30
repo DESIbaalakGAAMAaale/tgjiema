@@ -32,12 +32,16 @@ async def backup_all_tables() -> dict:
                 "message_backups",
             ]
 
+        # 白名单校验，防止表名注入
+        allowed = set(ALL_TABLES)
         for table in table_names:
-            records = await conn.fetch(f"SELECT * FROM {table}")
+            if table not in allowed:
+                continue
+            records = await conn.fetch("SELECT * FROM \"{}\"".format(table))
             results[table] = [dict(r) for r in records]
 
-    data = {"backup_time": datetime.now(timezone.utc).isoformat(), "tables": results}
-    return data
+        data = {"backup_time": datetime.now(timezone.utc).isoformat(), "tables": results}
+        return data
 
 
 async def run_db_backup():

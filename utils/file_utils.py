@@ -57,7 +57,7 @@ def extract_media_info(msg):
 
 
 def is_media_message(msg) -> bool:
-    return any([
+    return any((
         msg.photo, msg.video, msg.document,
         msg.audio, msg.voice, msg.animation,
-    ])
+    ))

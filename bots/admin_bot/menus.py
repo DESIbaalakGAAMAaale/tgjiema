@@ -157,6 +157,7 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
+    # 未知 menu_id 兜底返回主菜单
     return _build_menu("main")
 
 
