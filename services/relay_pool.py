@@ -122,12 +122,15 @@ class RelayPool:
     async def release_account(self, instance: RelayInstance, duration_ms: int):
         """释放账号，更新使用统计"""
         db = await get_relay_db()
-        await db.record_request(instance.account_id, duration_ms)
-        await db.add_log(
-            instance.account_id,
-            action="decode_success",
-            duration_ms=duration_ms,
-        )
+        try:
+            await db.record_request(instance.account_id, duration_ms)
+            await db.add_log(
+                instance.account_id,
+                action="decode_success",
+                duration_ms=duration_ms,
+            )
+        except Exception as e:
+            logger.error(f"[RelayPool] release_account 失败: {e}")
         logger.debug(
             f"[RelayPool] 账号 {instance.phone} 请求完成, 耗时={duration_ms}ms, "
             f"今日总请求={await self._get_today_req(instance)}"

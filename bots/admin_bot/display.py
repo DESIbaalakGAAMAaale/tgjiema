@@ -28,6 +28,12 @@ async def _ensure_user(user_id: int) -> dict:
         user = make_user(user_id=user_id)
         users_col = get_users_col()
         await users_col.insert_one(user)
+        # 写入缓存
+        try:
+            from database.cache import get_user_cache
+            get_user_cache().set(f"user:{user_id}", user)
+        except Exception:
+            pass
     return user
 
 
@@ -35,23 +41,23 @@ async def _get_status_text() -> str:
     users_col = get_users_col()
     files_col = get_file_records_col()
     logs_col = get_decode_logs_col()
-    # F5: 首次启动时优先从本地 SQLite 加载快照,避免 CRDB count_documents
-    if not _shared_counters.status_counters_initialized:
+    # F5: 计数器 TTL 刷新 — 每 5 分钟从 SQLite 快照或 CRDB 重新加载
+    now_ts = time.time()
+    if not _shared_counters.status_counters_initialized or (now_ts - _shared_counters.status_counters_loaded_at) > 300:
         from database.cache_store import get_cache_store
         store = get_cache_store()
         cached = await store.load_counter_snapshot()
         if cached and "total_users" in cached:
-            # 命中本地快照,零 CRDB RU
             for k, v in cached.items():
                 _status_counters[k] = v
         else:
-            # 本地无快照,回退 CRDB 查询
             _status_counters["total_users"] = await users_col.count_documents({})
             _status_counters["total_files"] = await files_col.count_documents({})
             _status_counters["active_files"] = await files_col.count_documents({"status": "active"})
             today = datetime.datetime.now(datetime.UTC).replace(hour=0, minute=0, second=0, microsecond=0)
             _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
         _shared_counters.status_counters_initialized = True
+        _shared_counters.status_counters_loaded_at = now_ts
     relay_pending = await get_config("relay_auth_pending")
     try:
         from services.relay_pool import relay_pool
@@ -93,8 +99,8 @@ async def _get_status_text() -> str:
     now = time.time()
     for _name in ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]:
         hb = hb_map.get(_name)
-        if hb and (now - hb["last_ping"]) < 120:
-            msg += f"  ✅ {_name}: {hb['total_processed']}次/ {hb['total_errors']}次错误\n"
+        if hb and (now - hb.get("last_ping", 0)) < 120:
+            msg += f"  ✅ {_name}: {hb.get('total_processed', 0)}次/ {hb.get('total_errors', 0)}次错误\n"
         else:
             msg += f"  ⏳ {_name}: 未上报\n"
     return msg
@@ -108,13 +114,13 @@ async def _get_health_text() -> str:
     bot_names = ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]
     for name in bot_names:
         hb = heartbeats.get(name)
-        if hb and (now - hb["last_ping"]) < 120:
-            last_ping = format_datetime(hb["last_ping"])
+        if hb and (now - hb.get("last_ping", 0)) < 120:
+            last_ping = format_datetime(hb.get("last_ping", 0))
             msg += (
                 f"✅ {name}\n"
                 f"  最后活跃:{last_ping}\n"
-                f"  处理次数:{hb['total_processed']}\n"
-                f"  错误次数:{hb['total_errors']}\n"
+                f"  处理次数:{hb.get('total_processed', 0)}\n"
+                f"  错误次数:{hb.get('total_errors', 0)}\n"
             )
         else:
             msg += f"⏳ {name}: 未上报/离线\n"

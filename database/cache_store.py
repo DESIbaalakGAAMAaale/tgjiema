@@ -503,6 +503,16 @@ class CacheStore:
         )
         await self._db.commit()
 
+    async def invalidate_user_quota(self, user_id: int):
+        """使 SQLite 配额缓存失效，下次访问从 CRDB 重新加载。"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE user_quota SET synced_at = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        await self._db.commit()
+
     # ─── D: 本地任务队列操作 ───
 
     # ─── H方案: 本地插入新 job(返回临时负数 ID) ───
@@ -929,3 +939,8 @@ async def get_unsynced_quotas(min_synced_at: float = 0) -> list[dict]:
 async def mark_quota_synced(user_id: int):
     """模块级便利函数：标记配额已同步。"""
     await _store.mark_quota_synced(user_id)
+
+
+async def invalidate_user_quota_cache(user_id: int):
+    """模块级便利函数：使 SQLite 配额缓存失效。"""
+    await _store.invalidate_user_quota(user_id)

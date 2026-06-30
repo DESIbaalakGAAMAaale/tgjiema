@@ -135,6 +135,9 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await users_col.update_one({"user_id": user_id}, update_doc)
     await update_user_and_invalidate(user_id)  # 使缓存失效
+    # 使 SQLite 配额缓存失效，下次解码时从 CRDB 重新加载
+    from database.cache_store import invalidate_user_quota_cache
+    await invalidate_user_quota_cache(user_id)
     await update.message.reply_text(f"✅ 用户 {user_id} 已设置为 {MEMBERSHIP_LEVELS[level]}")
 
 
@@ -202,6 +205,8 @@ async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
     )
     await update_user_and_invalidate(user_id)
+    from database.cache_store import invalidate_user_quota_cache
+    await invalidate_user_quota_cache(user_id)
     await update.message.reply_text(f"✅ 用户 {user_id} 每日解码配额已设为 {_quota_display(quota)}")
 
 
@@ -225,6 +230,8 @@ async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE)
         {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}},
     )
     await update_user_and_invalidate(user_id)
+    from database.cache_store import invalidate_user_quota_cache
+    await invalidate_user_quota_cache(user_id)
     await update.message.reply_text(f"✅ 用户 {user_id} 外部码配额已设为 {_quota_display(quota)}")
 
 
@@ -716,6 +723,9 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     errors = []
     for table in _FACTORY_RESET_TABLES:
         try:
+            # 白名单校验，防止 SQL 注入
+            if table not in _FACTORY_RESET_TABLES:
+                continue
             sql = f"DELETE FROM {table}"
             await client.execute(sql)
             cleared.append(table)

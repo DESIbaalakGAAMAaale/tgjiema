@@ -158,6 +158,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             update_doc["$set"]["can_upload"] = True
         await users_col.update_one({"user_id": user_id}, update_doc)
         await update_user_and_invalidate(user_id)
+        from database.cache_store import invalidate_user_quota_cache
+        await invalidate_user_quota_cache(user_id)
         await _end(f"✅ 用户 {user_id} 已设置为 {MEMBERSHIP_LEVELS[level]}")
 
     elif state == "ban:user_id":
@@ -204,6 +206,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _ensure_user(data["user_id"])
         await users_col.update_one({"user_id": data["user_id"]}, {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}})
         await update_user_and_invalidate(data["user_id"])
+        from database.cache_store import invalidate_user_quota_cache
+        await invalidate_user_quota_cache(data["user_id"])
         await _end(f"✅ 用户 {data['user_id']} 每日解码配额已设为 {_quota_display(quota)}")
 
     elif state == "set_external_quota:user_id":
@@ -226,6 +230,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _ensure_user(data["user_id"])
         await users_col.update_one({"user_id": data["user_id"]}, {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.UTC).isoformat()}})
         await update_user_and_invalidate(data["user_id"])
+        from database.cache_store import invalidate_user_quota_cache
+        await invalidate_user_quota_cache(data["user_id"])
         await _end(f"✅ 用户 {data['user_id']} 外部码配额已设为 {_quota_display(quota)}")
 
     # ─── 文件管理 ────────────────────────────────────────────────

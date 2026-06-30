@@ -59,11 +59,14 @@ async function sendMessage(chatId, text, replyMarkup, token) {
   };
   if (replyMarkup) body.reply_markup = replyMarkup;
 
-  await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+  const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+  if (!resp.ok) {
+    console.error(`[FileBot] sendMessage failed: ${resp.status} ${await resp.text()}`);
+  }
 }
 
 // ─── 消息处理 ───

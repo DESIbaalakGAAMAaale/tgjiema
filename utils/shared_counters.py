@@ -13,10 +13,14 @@ status_counters: dict = {
 # 初始化标记，admin_bot 用于判断是否需要首次 DB 查询
 status_counters_initialized: bool = False
 
+# 计数器加载时间戳，用于 TTL 过期刷新（防止数据过时）
+status_counters_loaded_at: float = 0
+
 
 # ─── E2: 用户码本地计数器 ───────────────────────────────────
 # 进程内增量计数，避免每次 /my_codes 查 CRDB count_documents
 _user_code_count_delta: dict[int, int] = {}  # user_id -> delta
+_user_code_count_cleanup_at: float = 0
 
 
 def incr_user_code_count(user_id: int, delta: int = 1):
@@ -33,7 +37,16 @@ def decr_user_code_count(user_id: int, delta: int = 1):
 
 def get_user_code_count(user_id: int, base: int = 0) -> int:
     """获取用户的码总数(本地计数 + 基线)"""
+    global _user_code_count_cleanup_at
     delta = _user_code_count_delta.get(user_id, 0)
+    # 每小时清理一次零值条目，防止内存泄漏
+    import time
+    now = time.monotonic()
+    if now - _user_code_count_cleanup_at > 3600:
+        stale = [uid for uid, d in _user_code_count_delta.items() if d == 0]
+        for uid in stale:
+            del _user_code_count_delta[uid]
+        _user_code_count_cleanup_at = now
     return max(0, base + delta)
 
 

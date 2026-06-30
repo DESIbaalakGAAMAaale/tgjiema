@@ -84,10 +84,14 @@ async def get_or_create_user(user_id: int, username: str = None, first_name: str
             incr_total_users()
         except Exception:
             pass
-    except Exception:
-        # 并发插入冲突,重新查询(可能已被另一个请求创建)
-        user = await get_user_cached(user_id) or await col.find_one({"user_id": user_id})
-        if not user:
+    except Exception as e:
+        # 并发插入冲突，重新查询；其他异常原样抛出
+        error_str = str(e).lower()
+        if "duplicate" in error_str or "unique" in error_str or "already exists" in error_str:
+            user = await get_user_cached(user_id) or await col.find_one({"user_id": user_id})
+            if not user:
+                raise
+        else:
             raise
     # 写入缓存(插入成功后才写,避免缓存脏数据)
     try:

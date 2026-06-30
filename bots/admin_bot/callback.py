@@ -64,7 +64,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "action:files":
         files_col = get_file_records_col()
-        total = await files_col.count_documents({})
+        from utils.shared_counters import status_counters
+        total = status_counters.get("total_files", 0)
         files = await files_col.find(sort=("create_time", -1), limit=10)
         total_pages = max(1, (total + 10 - 1) // 10)
         text = f"📁 文件列表 (第1/{total_pages}页，共{total}个)\n\n"
