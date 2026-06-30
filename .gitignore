@@ -27,3 +27,8 @@ env/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 优化文档（本地参考，不推送）
+docs/RU_OPTIMIZATION_PLAN.md
+docs/RU_OPTIMIZATION_PLAN_PART2.md
+test_plan.md

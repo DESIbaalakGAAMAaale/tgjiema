@@ -323,8 +323,9 @@ async def _flush_decode_log_buffer_loop():
                     ])
                 # 清空已 flush 的记录
                 ids = [r[0] for r in rows]
+                placeholders = ",".join("?" for _ in ids)
                 await buf._db.execute(
-                    "DELETE FROM decode_log_buffer WHERE id IN ({})".format(",".join(str(i) for i in ids))
+                    f"DELETE FROM decode_log_buffer WHERE id IN ({placeholders})", ids
                 )
                 await buf._db.commit()
                 logger.info(f"[DecodeLog] flushed {len(rows)} logs to CRDB")

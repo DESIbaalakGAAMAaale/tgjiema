@@ -492,6 +492,11 @@ class MonBot:
                     self._cell_healthy[slot_id] = False
                     ban_count += 1
                     await self._handle_channel_ban(cell, str(e))
+                else:
+                    # 非 TelegramError 异常（如网络超时），记录失败
+                    await store.write_heartbeat(slot_id, ok=False)
+                    self._cell_fail_streak[slot_id] = self._cell_fail_streak.get(slot_id, 0) + 1
+                    logger.warning(f"[Mon] 心跳异常 slot={slot_id}: {e}")
         return ok_count, ban_count
 
     async def stop(self):

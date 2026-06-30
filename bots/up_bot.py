@@ -501,10 +501,10 @@ async def _finalize_upload(query, context, user_id: int):
     try:
         pending_col = get_pending_uploads_col()
         ttl = context.user_data.pop("file_ttl", "0")
-        protect = context.user_data.pop("protect_content", "false")
+        protect = context.user_data.pop("protect_content", str(settings.DEFAULT_PROTECT_CONTENT))
         note = context.user_data.pop("_note", "")
 
-        protect_bool = protect == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
+        protect_bool = protect.lower() == "true"
         ttl_days = int(ttl) if ttl.isdigit() else settings.DEFAULT_FILE_TTL_DAYS
         if ttl_days == 0:
             ttl_days = settings.DEFAULT_FILE_TTL_DAYS

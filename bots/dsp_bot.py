@@ -264,7 +264,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
     try:
         await asyncio.wait_for(_send_semaphore.acquire(), timeout=10.0)
     except asyncio.TimeoutError:
-        await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count)
+        await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count + 1)
         logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时 job={job.job_id}")
         return False
 

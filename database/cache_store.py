@@ -145,8 +145,8 @@ class CacheStore:
                 raw = json.dumps(v, default=str)
                 val = raw.decode() if isinstance(raw, bytes) else raw
                 rows.append((k, val, ts))
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as e:
+                logger.warning(f"[CacheStore] dump({k}) JSON 序列化失败: {e}")
         if rows:
             await self._db.executemany(
                 "INSERT OR REPLACE INTO cache_backup (key, value, ts) VALUES (?, ?, ?)",
@@ -195,7 +195,19 @@ class CacheStore:
                 (key, val, time.time()),
             )
             await self._db.commit()
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as e:
+            logger.warning(f"[CacheStore] set({key}) JSON 序列化失败: {e}")
+
+    async def delete(self, key: str):
+        """删除指定 key 的缓存"""
+        if not self._db:
+            return
+        try:
+            await self._db.execute(
+                "DELETE FROM cache_backup WHERE key = ?", (key,)
+            )
+            await self._db.commit()
+        except Exception:
             pass
 
     async def cleanup(self, max_age_days: int = 30):
@@ -439,6 +451,9 @@ class CacheStore:
         if not self._db:
             return
         col = "used_today" if not is_external else "ext_used_today"
+        # 白名单校验，防止拼接注入
+        if col not in ("used_today", "ext_used_today"):
+            return
         for attempt in range(3):
             try:
                 await self._db.execute(

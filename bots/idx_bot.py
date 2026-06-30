@@ -1871,7 +1871,8 @@ async def _async_main():
             pass
         finally:
             # 关闭前同步配额到 CRDB
-            await _sync_quota_to_db()
+            from services.permission import sync_quotas_to_crdb
+            await sync_quotas_to_crdb()
             await app.updater.stop()
             await app.stop()
 
