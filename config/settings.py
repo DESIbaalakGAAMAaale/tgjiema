@@ -49,6 +49,10 @@ class Settings(BaseSettings):
 
     RELAY_ENCRYPTION_KEY: str = ""
 
+    # ─── Telegram Relay API 密钥（添加中继账号时从此处读取）───
+    RELAY_API_ID: int = 0
+    RELAY_API_HASH: str = ""
+
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""

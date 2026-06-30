@@ -211,8 +211,8 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🔑 提交验证码\n\n请输入 Telegram 发送的 6 位验证码：\n\n❌ 如需取消请点击下方按钮。"
             ),
             "relay_set_api": (
-                "relay_set_api:api_id",
-                "⚙️ 配置中继账号\n\n第一步：请输入 API_ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+                "relay_set_api:phone",
+                "⚙️ 配置中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\n❌ 如需取消请点击下方按钮。"
             ),
             # 系统配置
             "set_storage_channel": (

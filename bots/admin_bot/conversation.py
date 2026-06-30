@@ -275,26 +275,15 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await set_config("relay_auth_pending", "1")
         await _end(f"✅ 验证码 `{code}` 已提交\n中继实例将在几秒内自动获取并使用。")
 
-    elif state == "relay_set_api:api_id":
-        try:
-            int(text)
-        except ValueError:
-            await update.message.reply_text("❌ API_ID 必须是数字,请重新输入:")
-            return
-        await _ask("relay_set_api:api_hash",
-                    f"✅ API_ID 已记录:{text}\n\n第二步:请输入 API_HASH:",
-                    {"api_id": text.strip()})
-
-    elif state == "relay_set_api:api_hash":
-        await _ask("relay_set_api:phone",
-                    f"✅ API_HASH 已记录:{text}\n\n第三步:请输入手机号(含区号,如 +8613800138000):",
-                    {"api_hash": text.strip()})
-
     elif state == "relay_set_api:phone":
         from services.relay_pool import relay_pool
+        from config import settings
         phone = text.strip()
-        api_id = int(data["api_id"])
-        api_hash = data["api_hash"]
+        api_id = settings.RELAY_API_ID
+        api_hash = settings.RELAY_API_HASH
+        if not api_id or not api_hash:
+            await _end("❌ 中继 API 配置未设置\n请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n（从 https://my.telegram.org 申请）")
+            return
         instance = await relay_pool.add_account(api_id, api_hash, phone)
         # 开始登录
         try:

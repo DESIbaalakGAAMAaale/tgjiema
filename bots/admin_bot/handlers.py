@@ -372,19 +372,27 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @_auth_required
 async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
-    if len(args) < 3:
+    if not args:
         await update.message.reply_text(
-            "用法:/relay_set_api <api_id> <api_hash> <手机号>\n\n"
-            "示例:/relay_set_api 12345 abc123def456 +8613800138000"
+            "用法:/relay_set_api <手机号>\n\n"
+            "示例:/relay_set_api +8613800138000\n\n"
+            "API_ID 和 API_HASH 从 .env 自动读取。\n"
+            "配置后保存在数据库中,解码机器人下次重启时生效。"
         )
         return
-    try:
-        api_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ api_id 必须是数字")
+    phone = args[0].strip()
+
+    from services.relay_pool import relay_pool
+    from config import settings
+    api_id = settings.RELAY_API_ID
+    api_hash = settings.RELAY_API_HASH
+    if not api_id or not api_hash:
+        await update.message.reply_text(
+            "❌ 中继 API 配置未设置\n"
+            "请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n"
+            "（从 https://my.telegram.org 申请）"
+        )
         return
-    api_hash = args[1].strip()
-    phone = args[2].strip()
 
     await set_relay_config(api_id, api_hash, phone)
     await update.message.reply_text(
@@ -445,22 +453,28 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """添加中继账号(命令行方式)"""
     args = context.args
-    if len(args) < 3:
+    if not args:
         await update.message.reply_text(
-            "用法:/relay_add <api_id> <api_hash> <手机号>\n\n"
-            "示例:/relay_add 12345 abc123def456 +8613800138000\n\n"
+            "用法:/relay_add <手机号>\n\n"
+            "示例:/relay_add +8613800138000\n\n"
+            "API_ID 和 API_HASH 从 .env 自动读取。\n"
             "添加后需要提交验证码完成登录,或直接在管理面板中配置。"
         )
         return
-    try:
-        api_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ api_id 必须是数字")
-        return
-    api_hash = args[1].strip()
-    phone = args[2].strip()
+    phone = args[0].strip()
 
     from services.relay_pool import relay_pool
+    from config import settings
+    api_id = settings.RELAY_API_ID
+    api_hash = settings.RELAY_API_HASH
+    if not api_id or not api_hash:
+        await update.message.reply_text(
+            "❌ 中继 API 配置未设置\n"
+            "请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n"
+            "（从 https://my.telegram.org 申请）"
+        )
+        return
+
     try:
         instance = await relay_pool.add_account(api_id, api_hash, phone)
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
@@ -1036,12 +1050,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /delete_file <文件ID> — 删除文件\n"
         "  /purge_channel <频道ID> — 清理频道所有文件\n\n"
         "中继管理（外部码解码用）\n"
-        "  /relay_set_api <API_ID> <API_HASH> <手机号> — 配置中继账号\n"
+        "  /relay_set_api <手机号> — 配置中继账号（API从.env自动读取）\n"
         "  /relay_code <验证码> — 提交中继验证码\n"
         "  /relay_pending — 查看待处理的中继请求\n"
         "  /relay_list — 查看中继实例列表\n"
-        "  /relay_add <API_ID> <API_HASH> <手机号> — 添加中继实例\n"
-        "  /relay_remove <索引> — 移除中继实例\n"
+        "  /relay_add <手机号> — 添加中继实例\n"
+        "  /relay_remove <手机号> — 移除中继实例\n"
         "  /relay_reset_stats — 重置中继统计\n\n"
         "系统配置\n"
         "  /settings — 查看全部配置\n"
