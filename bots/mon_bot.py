@@ -81,18 +81,30 @@ class MonBot:
         self._cells_cache_ts: float = 0
 
     async def _get_cells(self) -> list[dict]:
-        """获取全量 cells,带进程内缓存。
+        """获取全量 cells，SQLite 优先，CRDB 兜底。
 
         缓存策略:
-        - 正常周期:复用缓存(0 CRDB 查询)
-        - 每 5 周期:强制重载一次(兜底其他进程写入)
-        - 写入 cells 后(轮转/降级/封禁):主动失效
+        - 优先读 SQLite 快照（Mon 自己写入的，0 RU）
+        - 缓存 300 秒，超时后重新加载 SQLite
+        - 每 10 周期强制重载（兜底其他进程写入）
+        - 写入 cells 后（轮转/降级/封禁）主动失效
         """
         now = time.time()
-        if self._cycle_count % 5 == 0:
+        if self._cycle_count % 10 == 0:
             self._cells_cache = None
-        if self._cells_cache and (now - self._cells_cache_ts) < 120:
+        if self._cells_cache and (now - self._cells_cache_ts) < 300:
             return self._cells_cache
+
+        # 优先读 SQLite 快照（0 RU）
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        cells, version = await store.load_cells_snapshot()
+        if cells:
+            self._cells_cache = cells
+            self._cells_cache_ts = now
+            return self._cells_cache
+
+        # CRDB 兜底
         col = get_cells_col()
         self._cells_cache = await col.find({})
         self._cells_cache_ts = now
