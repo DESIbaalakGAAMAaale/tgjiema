@@ -640,9 +640,9 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = context.user_data.pop("_override_text", None) or update.message.text.strip()
 
     # 1. 先检查消息中是否包含内部文件码（最高优先级）
+    # 只要消息中出现 FILE_CODE_PREFIX，后面无论是什么，均视为内部码
     prefix = settings.FILE_CODE_PREFIX
-    # 匹配 mfilebot_xxx_xxx 或 mfilebot_xxx_1p 等格式
-    internal_match = re.search(r'(?:^|\s|：)([' + re.escape(prefix) + r'][a-zA-Z0-9_]+(?:_[0-9]+[a-z]+)?)', raw_text)
+    internal_match = re.search(r'(' + re.escape(prefix) + r'\S+)', raw_text)
 
     if internal_match:
         # 内部码：优先走本地解码
@@ -707,7 +707,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     file_record = result.file_record
 
     # ── 举报拦截：脱钩或限制举报人 ──
-    if file_record.get("status") == "detached":
+    if file_record and file_record.get("status") == "detached":
         await safe_reply_text(update.message, "文件不存在或已被删除")
         return
     blocked = file_record.get("blocked_users")
