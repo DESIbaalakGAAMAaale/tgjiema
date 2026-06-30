@@ -451,153 +451,154 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── pending_uploads 轮询(生成文件 ───
 
+async def _process_one_pending(app: Application, row: dict):
+    """处理单个 pending_upload 记录,生成文件码并通知用户。
+    由 _process_pending_uploads 并发调用。
+    """
+    pend_id = row.get("id")
+    uploader_id = row.get("uploader_id")
+    channel_id = row.get("primary_channel_id")
+    message_id = row.get("primary_channel_msg_id")
+    file_types = row.get("file_types", {})
+    if not isinstance(file_types, dict):
+        file_types = {}
+    batch_msg_ids_str = row.get("batch_msg_ids", "")
+    batch_file_meta_str = row.get("batch_file_meta", "")
+    note = row.get("note", "")
+    protect_content = row.get("protect_content", settings.DEFAULT_PROTECT_CONTENT)
+    file_ttl_days = row.get("file_ttl_days", settings.DEFAULT_FILE_TTL_DAYS)
+
+    pending_col = get_pending_uploads_col()
+
+    if not uploader_id or not channel_id or not message_id:
+        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+        return
+
+    try:
+        file_code = await generate_unique_code(file_types)
+    except Exception as e:
+        logger.error(f"[Idx][poll] 生成文件码失败(uploader={uploader_id}): {e}")
+        try:
+            await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试或联系管理员。")
+        except Exception:
+            pass
+        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+        return
+
+    # 写入 file_records
+    try:
+        files_col = get_file_records_col()
+        record = make_file_record(
+            file_code=file_code,
+            uploader_id=uploader_id,
+            primary_channel_id=channel_id,
+            primary_channel_msg_id=message_id,
+            file_types=file_types,
+            batch_msg_ids=batch_msg_ids_str,
+            batch_file_meta=batch_file_meta_str,
+            note=note,
+            protect_content=protect_content,
+            file_ttl_days=file_ttl_days,
+        )
+        await files_col.insert_one(record)
+    except Exception as e:
+        logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
+        try:
+            await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试")
+        except Exception:
+            pass
+        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+        return
+
+    # 写入 codes 表（含 expire_time，省一次 UPDATE）
+    try:
+        expire_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
+            days=settings.DEFAULT_FILE_TTL_DAYS if settings.DEFAULT_FILE_TTL_DAYS is not None else 60
+        )
+        codes_col = get_codes_col()
+        ce = make_code_entry(
+            code=file_code,
+            uploader_id=uploader_id,
+            file_types=file_types,
+            batch_msg_ids=batch_msg_ids_str,
+            batch_file_meta=batch_file_meta_str,
+            primary_channel_id=channel_id,
+            note=note,
+            expire_time=expire_dt.isoformat(),
+        )
+        await codes_col.insert_one(ce)
+        # 同时写入 code_cache,后续解码查缓存即
+        from database.cache import get_code_cache
+        get_code_cache().set(f"code:{file_code}", ce)
+        # E2: 递增用户码计数
+        try:
+            from utils.shared_counters import incr_user_code_count
+            incr_user_code_count(uploader_id, 1)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"[Idx][poll] codes表写入失败(code={file_code}): {e}")
+
+    # ── 外部文件:写入外部码映射 ──
+    ext_code = None
+    if note:
+        try:
+            note_parsed = json.loads(note)
+            if isinstance(note_parsed, dict) and note_parsed.get("type") == "external":
+                ext_code = note_parsed.get("code", "")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if ext_code:
+        try:
+            from database import set_external_code_mapping
+            await set_external_code_mapping(ext_code, file_code, bot_username="")
+            logger.info(f"[Idx][poll] 外部码映射已写入: {ext_code} {file_code}")
+        except Exception as e:
+            logger.error(f"[Idx][poll] 外部码映射写入失败(code={ext_code}): {e}")
+
+    # 通知上传者
+    try:
+        if ext_code:
+            await safe_send_message(app.bot, chat_id=uploader_id, text=f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。")
+            logger.info(f"[Idx][poll] 外部码已就绪: {ext_code} {file_code}")
+        else:
+            note_line = f"备注：{note}" if note else ""
+            await safe_send_message(app.bot, chat_id=uploader_id, text=f"文件码：{file_code}\n"
+                     f"{note_line}\n\n"
+                     f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
+                     f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
+                     f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
+            )
+            logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
+    except Exception as e:
+        logger.error(f"[Idx][poll] 发送文件码失败 (code={file_code}): {e}")
+
+    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+    metrics.decode_count += 1
+    await metrics.record_processed("idx_bot")
+
+
 async def _process_pending_uploads(app: Application):
-    """处理 pending_uploads:先查本地 SQLite 通知(RU),有信号才CRDB"""
+    """处理 pending_uploads: 先查本地 SQLite 通知(0 RU),有信号才查 CRDB,并发处理多条"""
     from database.cache_store import get_cache_store
     store = get_cache_store()
 
     while True:
         try:
-            # 无事发生:查本SQLite,RU
             if not await store.has_new_upload():
                 await asyncio.sleep(30)
                 continue
 
             pending_col = get_pending_uploads_col()
-            rows = await pending_col.find({"processed": 0}, limit=5)
+            rows = await pending_col.find({"processed": 0}, limit=10)
 
             if not rows:
                 await asyncio.sleep(1)
                 continue
 
-            for row in rows:
-                pend_id = row.get("id")
-                uploader_id = row.get("uploader_id")
-                channel_id = row.get("primary_channel_id")
-                message_id = row.get("primary_channel_msg_id")
-                file_types = row.get("file_types", {})
-                if not isinstance(file_types, dict):
-                    file_types = {}
-                batch_msg_ids_str = row.get("batch_msg_ids", "")
-                batch_file_meta_str = row.get("batch_file_meta", "")
-                note = row.get("note", "")
-                protect_content = row.get("protect_content", settings.DEFAULT_PROTECT_CONTENT)
-                file_ttl_days = row.get("file_ttl_days", settings.DEFAULT_FILE_TTL_DAYS)
-
-                if not uploader_id or not channel_id or not message_id:
-                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
-                    continue
-
-                try:
-                    file_code = await generate_unique_code(file_types)
-                except Exception as e:
-                    logger.error(f"[Idx][poll] 生成文件码失(uploader={uploader_id}): {e}")
-                    try:
-                        await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试或联系管理员。")
-                    except Exception:
-                        pass
-                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
-                    continue
-
-                # 写入 file_records
-                try:
-                    files_col = get_file_records_col()
-                    record = make_file_record(
-                        file_code=file_code,
-                        uploader_id=uploader_id,
-                        primary_channel_id=channel_id,
-                        primary_channel_msg_id=message_id,
-                        file_types=file_types,
-                        batch_msg_ids=batch_msg_ids_str,
-                        batch_file_meta=batch_file_meta_str,
-                        note=note,
-                        protect_content=protect_content,
-                        file_ttl_days=file_ttl_days,
-                    )
-                    await files_col.insert_one(record)
-                except Exception as e:
-                    logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
-                    try:
-                        await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试")
-                    except Exception:
-                        pass
-                    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
-                    continue
-
-                # 写入 codes 表（含 expire_time，省一次 UPDATE）
-                try:
-                    expire_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
-                        days=settings.DEFAULT_FILE_TTL_DAYS if settings.DEFAULT_FILE_TTL_DAYS is not None else 60
-                    )
-                    codes_col = get_codes_col()
-                    ce = make_code_entry(
-                        code=file_code,
-                        uploader_id=uploader_id,
-                        file_types=file_types,
-                        batch_msg_ids=batch_msg_ids_str,
-                        batch_file_meta=batch_file_meta_str,
-                        primary_channel_id=channel_id,
-                        note=note,
-                        expire_time=expire_dt.isoformat(),
-                    )
-                    await codes_col.insert_one(ce)
-                    # 同时写入 code_cache,后续解码查缓存即
-                    from database.cache import get_code_cache
-                    get_code_cache().set(f"code:{file_code}", ce)
-                    # E2: 递增用户码计数
-                    try:
-                        from utils.shared_counters import incr_user_code_count
-                        incr_user_code_count(uploader_id, 1)
-                    except Exception:
-                        pass
-                except Exception as e:
-                    logger.error(f"[Idx][poll] codes表写入失败(code={file_code}): {e}")
-
-                # ── 外部文件:写入外部码映──
-                ext_code = None
-                if note:
-                    try:
-                        note_parsed = json.loads(note)
-                        if isinstance(note_parsed, dict) and note_parsed.get("type") == "external":
-                            ext_code = note_parsed.get("code", "")
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                if ext_code:
-                    try:
-                        from database import set_external_code_mapping
-                        await set_external_code_mapping(ext_code, file_code, bot_username="")
-                        logger.info(f"[Idx][poll] 外部码映射已写入: {ext_code} {file_code}")
-                    except Exception as e:
-                        logger.error(f"[Idx][poll] 外部码映射写入失(code={ext_code}): {e}")
-
-                # 通知上传
-                try:
-                    type_map = {
-                        "photo": "张图", "video": "个视", "document": "个文",
-                        "audio": "个音", "animation": "个动",
-                    }
-                    type_desc = " ".join(
-                        f"{v}{type_map.get(k, k)}"
-                        for k, v in sorted(file_types.items())
-                    ) if file_types else "文件"
-                    if ext_code:
-                        await safe_send_message(app.bot, chat_id=uploader_id, text=f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。")
-                        logger.info(f"[Idx][poll] 外部码已就绪: {ext_code} {file_code}")
-                    else:
-                        note_line = f"备注：{note}" if note else ""
-                        await safe_send_message(app.bot, chat_id=uploader_id, text=f"文件码：{file_code}\n"
-                                 f"{note_line}\n\n"
-                                 f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
-                                 f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
-                                 f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
-                        )
-                        logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
-                except Exception as e:
-                    logger.error(f"[Idx][poll] 发送文件码失败 (code={file_code}): {e}")
-
-                await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
-                metrics.decode_count += 1
-                await metrics.record_processed("idx_bot")
+            # 并发处理每条 pending_upload
+            tasks = [asyncio.create_task(_process_one_pending(app, row)) for row in rows]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
             logger.error(f"[Idx][poll] pending_uploads 轮询异常: {e}")
