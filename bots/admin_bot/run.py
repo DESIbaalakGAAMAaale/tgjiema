@@ -3,6 +3,7 @@ from loguru import logger
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 from .menus import TOKEN, AUTHORIZED_USER_ID
+from utils.monitor import metrics
 from .handlers import (
     start, status, health, user_detail, users_list, set_level, ban_user, unban_user,
     set_quota, set_external_quota, file_detail, files_list, delete_file, logs,
@@ -35,6 +36,7 @@ async def _async_main():
     logger.info("启动管理员机器人...")
 
     await _init()
+    await metrics.ping_bot("admin_bot")
 
     app = Application.builder().token(TOKEN).build()
 

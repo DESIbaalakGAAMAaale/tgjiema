@@ -76,15 +76,27 @@ async def _get_status_text() -> str:
 
 async def _get_health_text() -> str:
     msg = "🤖 机器人健康状态\n\n"
-    for name, health in metrics.bots.items():
-        status_icon = "✅" if health.is_running else "❌"
-        last_ping = format_datetime(health.last_ping)
-        msg += (
-            f"{status_icon} {name}\n"
-            f"  最后活跃:{last_ping}\n"
-            f"  处理次数:{health.total_processed}\n"
-            f"  错误次数:{health.total_errors}\n"
-        )
+    if not metrics.bots:
+        msg += "⚠️ 暂无 Bot 状态数据\n"
+        msg += "(各 Bot 启动后会自动上报心跳)\n"
+        msg += "\n📡 以下为各 Bot 运行状态:\n"
+        bot_names = ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]
+        for name in bot_names:
+            bot = metrics.get_bot(name)
+            if bot.is_running:
+                msg += f"  ✅ {name}: 运行中 ({bot.total_processed}次, {bot.total_errors}次错误)\n"
+            else:
+                msg += f"  ⏳ {name}: 未上报/离线\n"
+    else:
+        for name, health in metrics.bots.items():
+            status_icon = "✅" if health.is_running else "❌"
+            last_ping = format_datetime(health.last_ping)
+            msg += (
+                f"{status_icon} {name}\n"
+                f"  最后活跃:{last_ping}\n"
+                f"  处理次数:{health.total_processed}\n"
+                f"  错误次数:{health.total_errors}\n"
+            )
     return msg
 
 
