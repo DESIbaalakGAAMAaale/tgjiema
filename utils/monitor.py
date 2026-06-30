@@ -36,7 +36,7 @@ class SystemMetrics:
         async with self._lock:
             bot = self.get_bot(name)
             bot.is_running = True
-            bot.last_ping = time.monotonic()
+            bot.last_ping = time.time()
 
     async def record_error(self, name: str):
         async with self._lock:
@@ -56,7 +56,7 @@ class SystemMetrics:
 
     def get_stale_bots(self) -> list[str]:
         """返回所有超时的 bot 名称列表。"""
-        now = time.monotonic()
+        now = time.time()
         return [
             name for name, bot in self.bots.items()
             if bot.last_ping > 0 and (now - bot.last_ping) > _STALE_THRESHOLD
@@ -64,7 +64,7 @@ class SystemMetrics:
 
     def to_dict(self) -> dict:
         """导出为字典格式,用于 admin 面板展示或 prometheus 导出。"""
-        now = time.monotonic()
+        now = time.time()
         return {
             "bots": {
                 name: {

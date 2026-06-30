@@ -510,8 +510,12 @@ async def relay_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_auth_required
 async def settings_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = await _get_configs_text()
-    await update.message.reply_text(text)
+    try:
+        text = await _get_configs_text()
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"[settings] 获取配置失败: {e}")
+        await update.message.reply_text(f"❌ 获取配置失败: {e}")
 
 
 @_auth_required
