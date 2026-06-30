@@ -147,7 +147,13 @@ def invalidate_code_entry(code: str):
     # 同步删除 SQLite 持久化缓存
     from .cache_store import get_cache_store
     store = get_cache_store()
-    asyncio.ensure_future(store.delete(cache_key))
+    try:
+        loop = asyncio.get_running_loop()
+        if loop.is_running():
+            loop.create_task(store.delete(cache_key))
+    except RuntimeError:
+        # 无运行中的事件循环（如测试环境），跳过异步删除
+        pass
 
 
 # ─── E7: 用户码列表缓存 ──────────────────────────────────

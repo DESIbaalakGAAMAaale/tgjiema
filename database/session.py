@@ -201,7 +201,7 @@ DDL_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_system ON external_code_mapping(system_code)",
     "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_bot ON external_code_mapping(bot_username)",
-    # ─── code_bot_mapping 表(代码前缀 → Bot 路由──────────────
+    # ─── code_bot_mapping 表(代码前缀 → Bot 路由) ──────────────
     """CREATE TABLE IF NOT EXISTS code_bot_mapping (
         code_prefix TEXT PRIMARY KEY,
         bot_username TEXT NOT NULL,
@@ -891,7 +891,7 @@ async def set_bot_decode_interval(bot_username: str, interval_seconds: int):
 
 
 async def get_bot_decode_interval(bot_username: str) -> int:
-    """获取 bot 解码间隔,走内存缓存0 分钟 TTL)"""
+    """获取 bot 解码间隔，走内存缓存(10 分钟 TTL)"""
     global _bot_decode_interval_cache, _bot_decode_interval_cache_ts
     if _time.time() - _bot_decode_interval_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
