@@ -160,8 +160,10 @@ class UserRelay:
 
         try:
             self._storage_channel_entity = PeerChannel(settings.MAIN_STORAGE_CHANNEL_ID)
+            self._storage_channel_id = settings.MAIN_STORAGE_CHANNEL_ID
         except Exception:
             self._storage_channel_entity = None
+            self._storage_channel_id = 0
 
         self._register_handlers()
         self._ready.set()
@@ -173,7 +175,6 @@ class UserRelay:
         async with lock:
             try:
                 from database import get_file_records_col, make_file_record
-                from config import settings as _s
 
                 files_col = get_file_records_col()
                 existing = await files_col.find_one({"file_code": code})
@@ -237,7 +238,7 @@ class UserRelay:
                     record = make_file_record(
                         file_code=code,
                         uploader_id=0,
-                        primary_channel_id=_s.MAIN_STORAGE_CHANNEL_ID,
+                        primary_channel_id=self._storage_channel_id,
                         primary_channel_msg_id=message_id,
                         file_types={},
                     )
