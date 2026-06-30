@@ -34,7 +34,7 @@ from database import (
     get_active_cells_local,
     enqueue_job,
     get_system_code_for_external,
-    get_pending_jobs_count,
+    get_pending_jobs_count_local,
 )
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
@@ -640,7 +640,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── 动态限速：根据 jobs 队列长度自动调节 ──
-    await dynamic_rate_limiter.acquire(get_pending_jobs_count)
+    await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
 
     await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
 
@@ -655,28 +655,6 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not result.allowed:
         await safe_reply_text(update.message, result.reason)
         return
-
-    # 检查取件码是否过期
-    try:
-        from database.cache import get_code_cache
-        from services.permission import check_code_expired
-        code_cache = get_code_cache()
-        cache_key = f"code:{text}"
-        code_entry = code_cache.get(cache_key)
-        if code_entry is None:
-            codes_col = get_codes_col()
-            code_entry = await codes_col.find_one({"code": text})
-            if code_entry:
-                code_cache.set(cache_key, code_entry)
-        if code_entry:
-            file_record = await get_file_record_cached(text)
-            if file_record:
-                expired, reason = check_code_expired(file_record)
-                if expired:
-                    await safe_reply_text(update.message, reason)
-                    return
-    except Exception as e:
-        logger.warning(f"[Idx][handle_code] codes 表查询失败(code={text}): {e}")
 
     file_record = result.file_record
 

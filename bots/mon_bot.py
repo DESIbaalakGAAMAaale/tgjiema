@@ -61,7 +61,7 @@ class MonBot:
         # 通知管理员的 admin_bot 实例(延迟初始化)
         self._admin_bot = None
         self._admin_chat_id = settings.ADMIN_TELEGRAM_ID
-        self._notify_last_fail_ts: float = 0
+        self._notify_cooldowns: dict[str, float] = {}
         # 轮转状态
         self._rotation = {
             "active_window_size": 3,
@@ -153,13 +153,21 @@ class MonBot:
             logger.warning(f"[Mon][Config] 读取轮转配置失败: {e}")
 
     async def _notify_admin(self, msg: str):
-        """通知管理员(通过 admin_bot 或直接向管理员聊天发消息)。"""
+        """通知管理员(通过 admin_bot 或直接向管理员聊天发消息)。
+        按事件类型冷却：同一事件类型 10 分钟内不重复发送。
+        """
         if not self._admin_chat_id or self._admin_chat_id == 0:
-            return  # 未配置管理员 ID,静默跳过
-        # 冷却机制:连续失败后 10 分钟不再重试
-        now = time.time()
-        if self._notify_last_fail_ts and now - self._notify_last_fail_ts < 600:
             return
+
+        # 按事件类型冷却：取消息首行作为事件标识
+        event_key = msg.split("\n")[0] if msg else msg
+        if not hasattr(self, "_notify_cooldowns"):
+            self._notify_cooldowns: dict[str, float] = {}
+        now = time.time()
+        last = self._notify_cooldowns.get(event_key, 0)
+        if now - last < 600:
+            return
+
         try:
             if not self._admin_bot:
                 admin_token = settings.ADMIN_BOT_TOKEN
@@ -173,9 +181,9 @@ class MonBot:
                 text=msg,
                 disable_web_page_preview=True,
             )
-            self._notify_last_fail_ts = 0  # 成功,重置冷却
+            self._notify_cooldowns[event_key] = 0  # 成功，清除冷却
         except Exception as e:
-            self._notify_last_fail_ts = now
+            self._notify_cooldowns[event_key] = now
             logger.warning(f"[Mon][Notify] 发送通知失败: {e}")
 
     async def _handle_channel_ban(self, cell: dict, error: str):
@@ -254,6 +262,7 @@ class MonBot:
                 )
 
         await self._notify_admin(notify_msg)
+        self._invalidate_cells_cache()
 
     async def _check_rotation(self, all_cells: list[dict]):
         """检查活跃频道窗口是否该轮转。
