@@ -378,16 +378,14 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     try:
         await progress_msg.edit_text(
-            f'文件已接收，文件码将由 <a href="tg://resolve?domain={settings.DECODER_BOT_USERNAME}">@{settings.DECODER_BOT_USERNAME}</a> 发送给你'
-            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else ""),
-            parse_mode="HTML",
+            f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
+            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else "")
         )
     except Exception:
         await safe_send_message(
             context.bot, chat_id=user_id,
-            text=f'文件已接收，文件码将由 <a href="tg://resolve?domain={settings.DECODER_BOT_USERNAME}">@{settings.DECODER_BOT_USERNAME}</a> 发送给你'
-            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else ""),
-            parse_mode="HTML",
+            text=f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
+            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else "")
         )
 
     # 暂存媒体组数据，等待用户选择有效期→备注→转发权限
@@ -578,9 +576,8 @@ async def _finalize_upload(query, context, user_id: int):
 
         # 清除按钮，显示确认消息
         await query.edit_message_text(
-            text=f'文件已接收，文件码将由 <a href="tg://resolve?domain={settings.DECODER_BOT_USERNAME}">@{settings.DECODER_BOT_USERNAME}</a> 发送给你',
+            text=f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你",
             reply_markup=None,
-            parse_mode="HTML",
         )
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
