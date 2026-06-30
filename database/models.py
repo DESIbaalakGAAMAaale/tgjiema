@@ -141,6 +141,7 @@ def make_code_entry(
     batch_file_meta: str = "",
     primary_channel_id: int = 0,
     note: str = "",
+    expire_time: str = None,
 ):
     from datetime import datetime, timezone
 
@@ -157,6 +158,7 @@ def make_code_entry(
         "note": note,
         "status": "active",
         "created_at": now.isoformat(),
+        "expire_time": expire_time,
     }
 
 

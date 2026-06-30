@@ -20,6 +20,7 @@ from loguru import logger
 from config import settings
 from database import (
     get_file_records_col,
+    get_file_record_cached,
     get_decode_logs_col,
     get_pending_uploads_col,
     get_codes_col,
@@ -30,12 +31,10 @@ from database import (
     get_bot_for_code,
     resolve_bot_for_code,
     get_bot_decode_interval,
-    get_active_cells,
+    get_active_cells_local,
     enqueue_job,
     get_system_code_for_external,
-    set_code_expiry,
     get_pending_jobs_count,
-    get_file_record_cached,
 )
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
@@ -154,7 +153,7 @@ async def _refresh_active_channels():
     """每60 秒刷新一次活跃频道缓存, 与 Up Bot 对齐"""
     global _active_channels_cache, _active_channels_index
     try:
-        _active_channels_cache = await get_active_cells()
+        _active_channels_cache = await get_active_cells_local()
         _active_channels_index = 0
     except Exception:
         pass
@@ -169,7 +168,7 @@ async def _get_storage_channel() -> int:
         return _active_channels_cache[idx]["channel_id"]
     # 缓存未就绪, 回退 DB 查询
     try:
-        cells = await get_active_cells()
+        cells = await get_active_cells_local()
         if cells:
             return cells[0]["channel_id"]
     except Exception:
@@ -235,8 +234,8 @@ async def _flush_media_group_buffer(media_group_id: str):
                 logger.warning(f"[Idx] 中继媒体 无STORAGE_IDS (code={code})")
                 return
 
-            files_col = get_file_records_col()
-            record = await files_col.find_one({"file_code": code})
+            # A2: 走缓存,避免每次直查 CRDB
+            record = await get_file_record_cached(code)
             if not record:
                 logger.warning(f"[Idx] 中继媒体 DB无记(code={code})")
                 return
@@ -295,13 +294,18 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         if not storage_ids:
             return
 
-        files_col = get_file_records_col()
-        record = await files_col.find_one({"file_code": code})
+        # A2: 走缓存，避免每次直查 CRDB
+        record = await get_file_record_cached(code)
         if not record:
             return
 
         storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
-        await _dispatch_to_dsp(target_user_id, code, storage_channel, list(storage_ids))
+        try:
+            await _dispatch_to_dsp(target_user_id, code, storage_channel, list(storage_ids))
+        except Exception as e:
+            logger.error(f"[Idx] RELAY_BATCH 写入 jobs 失败: {e}")
+            await safe_send_message(context.bot, chat_id=target_user_id, text="文件发送失败，请稍后重试。")
+            return
 
         if context:
             try:
@@ -312,8 +316,8 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
 
     logger.info(f"[Idx] 中继代发: user {target_user_id}, code {code}")
 
-    files_col = get_file_records_col()
-    record = await files_col.find_one({"file_code": code})
+    # A2: 走缓存，避免每次直查 CRDB
+    record = await get_file_record_cached(code)
     if not record:
         await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 已处理，请重新发送该码获取文件。")
         return
@@ -326,7 +330,12 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     if not msg_ids:
         msg_ids = [record.get("primary_channel_msg_id")]
 
-    await _dispatch_to_dsp(target_user_id, code, storage_channel, msg_ids, record.get("batch_file_meta", ""))
+    try:
+        await _dispatch_to_dsp(target_user_id, code, storage_channel, msg_ids, record.get("batch_file_meta", ""))
+    except Exception as e:
+        logger.error(f"[Idx] 中继代发写入 jobs 失败: {e}")
+        await safe_send_message(context.bot, chat_id=target_user_id, text="文件发送失败，请稍后重试。")
+        return
 
     try:
         await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 已就绪，正在发送，请查收。")
@@ -515,8 +524,11 @@ async def _process_pending_uploads(app: Application):
                     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
                     continue
 
-                # 写入 codes 新增)
+                # 写入 codes 表（含 expire_time，省一次 UPDATE）
                 try:
+                    expire_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(
+                        days=settings.DEFAULT_FILE_TTL_DAYS if settings.DEFAULT_FILE_TTL_DAYS is not None else 60
+                    )
                     codes_col = get_codes_col()
                     ce = make_code_entry(
                         code=file_code,
@@ -526,20 +538,20 @@ async def _process_pending_uploads(app: Application):
                         batch_file_meta=batch_file_meta_str,
                         primary_channel_id=channel_id,
                         note=note,
+                        expire_time=expire_dt.isoformat(),
                     )
                     await codes_col.insert_one(ce)
                     # 同时写入 code_cache,后续解码查缓存即
                     from database.cache import get_code_cache
                     get_code_cache().set(f"code:{file_code}", ce)
+                    # E2: 递增用户码计数
+                    try:
+                        from utils.shared_counters import incr_user_code_count
+                        incr_user_code_count(uploader_id, 1)
+                    except Exception:
+                        pass
                 except Exception as e:
-                    logger.error(f"[Idx][poll] codes表写入失(code={file_code}): {e}")
-
-                # 设置取件码过期时默认 60 
-                try:
-                    expire_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=settings.DEFAULT_FILE_TTL_DAYS if settings.DEFAULT_FILE_TTL_DAYS is not None else 60)
-                    await set_code_expiry(file_code, expire_dt.isoformat())
-                except Exception as e:
-                    logger.error(f"[Idx][poll] 设置取件码过期时间失(code={file_code}): {e}")
+                    logger.error(f"[Idx][poll] codes表写入失败(code={file_code}): {e}")
 
                 # ── 外部文件:写入外部码映──
                 ext_code = None
@@ -831,7 +843,9 @@ def _format_code_status(code_entry: dict) -> str:
 
 
 async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """列出用户所有文件码（分页）"""
+    """列出用户所有文件码（分页）
+    E2: 计数走本地缓存; E7: 列表查询走内存缓存
+    """
     user = update.effective_user
     if not user:
         return
@@ -841,23 +855,42 @@ async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0].isdigit():
         page = max(1, int(context.args[0]))
 
-    # 查 codes 表获取用户的所有文件码
-    codes_col = get_codes_col()
-    total_rows = await codes_col.count_documents({"uploader_id": user.id})
-    if total_rows == 0:
-        await safe_reply_text(update.message, "您还没有上传过文件码。")
-        return
+    # E2: 用户码计数走本地缓存(0 RU)
+    from utils.shared_counters import get_user_code_count
+    from database.cache import get_user_codes_cache
+
+    total_rows = get_user_code_count(user.id)
+    if total_rows <= 0:
+        # 首次访问,按需同步基线
+        codes_col = get_codes_col()
+        total_rows = await codes_col.count_documents({"uploader_id": user.id})
+        if total_rows == 0:
+            await safe_reply_text(update.message, "您还没有上传过文件码。")
+            return
+        # 写入基线
+        from utils.shared_counters import status_counters
+        status_counters[f"user_code_count:{user.id}"] = total_rows
 
     total_pages = max(1, (total_rows + _PAGE_SIZE - 1) // _PAGE_SIZE)
     page = min(page, total_pages)
     skip = (page - 1) * _PAGE_SIZE
 
-    rows = await codes_col.find(
-        {"uploader_id": user.id},
-        sort=("created_at", -1),
-        skip=skip,
-        limit=_PAGE_SIZE,
-    )
+    # E7: 列表查询走内存缓存(5 分钟 TTL)
+    codes_cache = get_user_codes_cache()
+    cache_key = f"user_codes:{user.id}:{page}"
+    cached = codes_cache.get(cache_key)
+    if cached is not None:
+        rows = cached
+    else:
+        codes_col = get_codes_col()
+        rows = await codes_col.find(
+            {"uploader_id": user.id},
+            sort=("created_at", -1),
+            skip=skip,
+            limit=_PAGE_SIZE,
+        )
+        rows = list(rows)
+        codes_cache.set(cache_key, rows)
 
     items = []
     for i, row in enumerate(rows, 1):
@@ -1141,6 +1174,9 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
             get_code_cache().cache[cache_key]["expire_time"] = new_expire
         else:
             get_code_cache().cache[cache_key].pop("expire_time", None)
+    # E7: 失效用户码列表缓存
+    from database.cache import invalidate_user_codes
+    invalidate_user_codes(user.id)
 
     await query.edit_message_text(
         f"✅ 有效期已设置为 {days} 天后\n\n"
@@ -1263,6 +1299,16 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
     cache_key = f"code:{code}"
     if cache_key in get_code_cache().cache:
         get_code_cache().cache[cache_key]["status"] = new_status
+    # F1: 下架/上架时同步 local_job_queue 状态
+    if new_status == "offline":
+        try:
+            from utils.shared_counters import decr_user_code_count
+            decr_user_code_count(user.id, 1)
+        except Exception:
+            pass
+    # E7: 失效用户码列表缓存
+    from database.cache import invalidate_user_codes
+    invalidate_user_codes(user.id)
 
     status_text = "下架" if new_status == "offline" else "恢复上架"
     await query.edit_message_text(f"✅ 已{status_text}文件码 [{code}]")
@@ -1376,6 +1422,9 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         cache_key = f"code:{code}"
         if cache_key in get_code_cache().cache:
             get_code_cache().cache[cache_key]["note"] = text
+        # E7: 失效用户码列表缓存
+        from database.cache import invalidate_user_codes
+        invalidate_user_codes(user.id)
         await update.message.reply_text(f"✅ 备注已更新为: {text}")
 
     elif action == "set_expiry_custom":
@@ -1409,6 +1458,9 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
                 get_code_cache().cache[cache_key]["expire_time"] = new_expire
             else:
                 get_code_cache().cache[cache_key].pop("expire_time", None)
+        # E7: 失效用户码列表缓存
+        from database.cache import invalidate_user_codes
+        invalidate_user_codes(user.id)
 
         await update.message.reply_text("✅ 有效期已更新")
 
@@ -1456,8 +1508,8 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
     system_code = await get_system_code_for_external(code)
     if system_code:
         logger.info(f"[Idx][external] 外部{code} 命中映射 系统{system_code}")
-        files_col = get_file_records_col()
-        file_record = await files_col.find_one({"file_code": system_code})
+        # A2: 走缓存,避免每次直查 CRDB
+        file_record = await get_file_record_cached(system_code)
         if file_record:
             storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
             batch_ids_str = file_record.get("batch_msg_ids") or ""
@@ -1578,8 +1630,8 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         if not storage_ids:
             return True
 
-        files_col = get_file_records_col()
-        record = await files_col.find_one({"file_code": code_part})
+        # A2: 走缓存,避免每次直查 CRDB
+        record = await get_file_record_cached(code_part)
         if not record:
             try:
                 await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code_part} 发送失败，请稍后重试。")
