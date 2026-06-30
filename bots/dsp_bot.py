@@ -355,7 +355,7 @@ async def _send_file_direct(bot, job) -> bool:
         return False
 
     protect_content = getattr(job, "protect_content", False)
-    kwargs = {"chat_id": job.target_user_id, "protect_content": protect_content}
+    kwargs = {"protect_content": protect_content}
 
     try:
         if mtype == "photo":

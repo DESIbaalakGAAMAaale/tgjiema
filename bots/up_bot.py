@@ -82,7 +82,8 @@ async def _get_upload_target_channel() -> int:
     if not _active_a_slots:
         await _refresh_active_slots()
     if not _active_a_slots:
-        return settings.STORAGE_CHANNEL_ID
+        logger.error("[Up] 无可用活跃槽位，无法处理上传请求")
+        raise RuntimeError("无可用活跃槽位，请检查拓扑配置")
     # 轮转:每次取下一个活跃频道
     async with _pending_lock:
         idx = _active_slot_index % len(_active_a_slots)
@@ -92,7 +93,7 @@ async def _get_upload_target_channel() -> int:
     return channel_id
 
 
-# ─── 以下逻辑与原来基本相channel 选择改为环形槽位 ───
+# ─── 以下逻辑与原来基本相同，channel 选择改为环形槽位 ───
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -125,7 +126,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "note": "",
     }
     await update.message.reply_text(
-        "📦 已进入批次上传模请发送文件。\n"
+        "📦 已进入批次上传模式，请发送文件。\n"
         "发/end_upload 结束并生成文件码。\n"
         "发/cancel_upload 取消本次上传。\n\n"
         "💬 可使用 /note 文字 为本次批次添加备注"
@@ -152,10 +153,10 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text("用法:/note 备注内容\n例如:/note 这是张三的文")
+        await update.message.reply_text("用法:/note 备注内容\n例如:/note 这是张三的文件")
         return
     batch["note"] = note_text
-    await update.message.reply_text(f"备注已设{note_text}")
+    await update.message.reply_text(f"备注已设置为：{note_text}")
 
 
 async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -245,7 +246,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
             batch["pinned_msg_ids"].append(forwarded.message_id)
         except Exception as e:
-            logger.error(f"[Up] 批次上传复制文件到存储频道失 {e}")
+            logger.error(f"[Up] 批次上传复制文件到存储频道失败: {e}")
         await update.message.reply_text(f"已接{file_type}")
 
 
@@ -284,9 +285,9 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
     first = grp["updates"][0]
     type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items()))
     if failed > 0:
-        await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"⚠️ 已接收媒体组:{type_desc}(成功{copied}失败{failed}")
+        await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"⚠️ 已接收媒体组:{type_desc}(成功{copied}个，失败{failed}个)")
     else:
-        await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"已接收媒体组:{type_desc}({copied}个文")
+        await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"已接收媒体组:{type_desc}({copied}个文件)")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):

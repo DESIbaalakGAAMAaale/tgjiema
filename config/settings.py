@@ -160,7 +160,7 @@ class Settings(BaseSettings):
         if not self.COCKROACHDB_URL:
             missing.append('COCKROACHDB_URL')
         if missing:
-            logger.warning(f"[Settings] 以下环境变量未配置: {', '.join(missing)}")
+            raise ValueError(f"[Settings] 以下必填环境变量未配置: {', '.join(missing)}。请检查 .env 文件。")
         return self
 
     @property

@@ -1148,7 +1148,7 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     # 更新本地缓存
     from database.cache import get_code_cache, invalidate_code_entry
     cache_key = f"code:{code}"
-    if code_entry in get_code_cache().cache:
+    if cache_key in get_code_cache().cache:
         if new_expire:
             get_code_cache().cache[cache_key]["expire_time"] = new_expire
         else:
