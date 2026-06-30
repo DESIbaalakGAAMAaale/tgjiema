@@ -26,15 +26,10 @@ from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import (
+    safe_reply_text,
     safe_send_message,
     safe_send_media_group,
-    safe_send_photo,
-    safe_send_video,
-    safe_send_audio,
-    safe_send_animation,
-    safe_send_document,
-    safe_reply_text,
-)
+) 
 from utils.task_utils import create_safe_task
 
 TOKEN = settings.SENDER_BOT_TOKEN
@@ -349,15 +344,15 @@ async def _send_file_direct(bot, job) -> bool:
 
     try:
         if mtype == "photo":
-            await safe_send_photo(bot, photo=fid, **kwargs)
+            await bot.send_photo(chat_id=job.target_user_id, photo=fid, **kwargs)
         elif mtype == "video":
-            await safe_send_video(bot, video=fid, **kwargs)
+            await bot.send_video(chat_id=job.target_user_id, video=fid, **kwargs)
         elif mtype in ("audio", "voice"):
-            await safe_send_audio(bot, audio=fid, **kwargs)
+            await bot.send_audio(chat_id=job.target_user_id, audio=fid, **kwargs)
         elif mtype == "animation":
-            await safe_send_animation(bot, animation=fid, **kwargs)
+            await bot.send_animation(chat_id=job.target_user_id, animation=fid, **kwargs)
         else:
-            await safe_send_document(bot, document=fid, **kwargs)
+            await bot.send_document(chat_id=job.target_user_id, document=fid, **kwargs)
         logger.info(f"[Dsp] file_id 直发成功: 用户 {job.target_user_id}, {job.code}")
         return True
     except Exception:
@@ -377,13 +372,16 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     # protect_content 已从 jobs 表直接获取,无需再查 file_records
     protect_content = getattr(job, "protect_content", False)
 
-    # ── 优先用 file_id 直发(避开 copy_message 的频道限速) ──
-    if await _send_file_direct(bot, job):
-        metrics.send_success_count += 1
-        await metrics.record_processed("dsp_bot")
-        return True
+    # ── file_id 直发（跨 bot file_id 不通用，静默尝试一次即可） ──
+    try:
+        if await _send_file_direct(bot, job):
+            metrics.send_success_count += 1
+            await metrics.record_processed("dsp_bot")
+            return True
+    except Exception:
+        pass
 
-    # ── 直发失败,回退到 copy_message ──
+    # ── 回退到 copy_message ──
     resolved = await resolve_delivery_channel(job.storage_channel_id)
     success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
 
