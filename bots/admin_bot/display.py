@@ -79,9 +79,15 @@ async def _get_status_text() -> str:
         f"\n🔐 用户中继:{relay_status}\n"
         f"\n🤖 机器人状态:\n"
     )
-    for name, health in metrics.bots.items():
-        status_icon = "✅" if health.is_running else "❌"
-        msg += f"  {status_icon} {name}: {health.total_processed}次/ {health.total_errors}次错误\n"
+    from database.cache_store import get_all_bot_heartbeats
+    hb_map = await get_all_bot_heartbeats()
+    now = time.time()
+    for _name in ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]:
+        hb = hb_map.get(_name)
+        if hb and (now - hb["last_ping"]) < 120:
+            msg += f"  ✅ {_name}: {hb['total_processed']}次/ {hb['total_errors']}次错误\n"
+        else:
+            msg += f"  ⏳ {_name}: 未上报\n"
     return msg
 
 
