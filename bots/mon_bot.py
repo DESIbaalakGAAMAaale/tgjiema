@@ -69,6 +69,8 @@ class MonBot:
             "time_per_slot": 3600,
         }
         self._rotation_reload_countdown = 0
+        # ─── 轮转通知频率控制: 每 3600 秒最多通知一次 ───
+        self._last_rotation_notify_ts: float = 0
         # ─── 心跳本地缓存:写入 SQLite,零 CRDB RU ───
         # slot_id → True(上次心跳成功)/ False(上次心跳失败)
         self._cell_healthy: dict[str, bool] = {}
@@ -337,13 +339,8 @@ class MonBot:
                         )
                     logger.info(f"[Mon][Rotation] 唤醒 {s1_slot['slot_id']} → active")
 
-        await self._notify_admin(
-            f"🔄 频道轮转通知\n\n"
-            f"原窗口: 组 {all_group_keys[current_idx]}-{all_group_keys[(current_idx + window_size - 1) % len(all_group_keys)]}\n"
-            f"新窗口: 组 {next_window_keys[0]}-{next_window_keys[-1]}\n"
-            f"触发条件: 文件数/时间达到阈值\n"
-            f"当前参数: {files_per_slot}文件 / {time_per_slot}秒 / {window_size}活态"
-        )
+        # 轮转完成，只记录日志，通知由 start() 循环统一控制频率
+        logger.info(f"[Mon][Rotation] 轮转完成: 窗口 {all_group_keys[current_idx]}-{all_group_keys[(current_idx + window_size - 1) % len(all_group_keys)]} → {next_window_keys[0]}-{next_window_keys[-1]}")
         return True
 
     async def start(self):
@@ -405,6 +402,16 @@ class MonBot:
                 if rotated:
                     self._invalidate_cells_cache()  # 轮转改了 cells status,失效缓存
                     all_cells = await self._get_cells()  # 重新加载以反映变更
+                    # 轮转通知频率控制: 每 3600 秒最多通知一次
+                    now = time.time()
+                    if now - self._last_rotation_notify_ts > 3600:
+                        self._last_rotation_notify_ts = now
+                        await self._notify_admin(
+                            f"🔄 频道轮转完成\n\n"
+                            f"当前窗口已推进，新窗口已激活\n"
+                            f"参数: {self._rotation['active_window_size']}活态 / "
+                            f"{self._rotation['files_per_slot']}文件/{self._rotation['time_per_slot']}秒"
+                        )
 
                 # 6. 定期拓扑校验(每 10 轮一次)
                 self._cycle_count += 1
