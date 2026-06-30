@@ -59,6 +59,16 @@ class CacheStore:
                 fail_streak INTEGER NOT NULL DEFAULT 0
             )"""
         )
+        # ─── 跨进程 Bot 心跳表：各 Bot 独立进程写入，admin_bot 读取展示 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS bot_heartbeat (
+                name      TEXT PRIMARY KEY,
+                last_ping REAL NOT NULL,
+                is_running INTEGER NOT NULL DEFAULT 1,
+                total_processed INTEGER NOT NULL DEFAULT 0,
+                total_errors INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
         await self._db.commit()
         # 注入 db 连接给 DecodeLogBuffer
         _decode_log_buffer.set_db(self._db)
@@ -260,6 +270,47 @@ class CacheStore:
         )
         return {row[0]: {"last_ok": row[1], "fail_streak": row[2]} for row in rows}
 
+    # ─── 跨进程 Bot 心跳：各 Bot 写入，admin_bot 读取 ───
+
+    async def write_bot_heartbeat(self, name: str, total_processed: int = 0, total_errors: int = 0):
+        """写入 Bot 心跳。由各 Bot 独立进程定期调用。"""
+        if not self._db:
+            return
+        now = time.time()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO bot_heartbeat (name, last_ping, is_running, total_processed, total_errors) "
+                    "VALUES (?, ?, 1, ?, ?)",
+                    (name, now, total_processed, total_errors),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                return  # 静默失败
+
+    async def get_all_bot_heartbeats(self) -> dict[str, dict]:
+        """读取所有 Bot 心跳记录。
+        返回 {name: {last_ping, is_running, total_processed, total_errors}}。
+        """
+        if not self._db:
+            return {}
+        rows = await self._db.execute_fetchall(
+            "SELECT name, last_ping, is_running, total_processed, total_errors FROM bot_heartbeat"
+        )
+        return {
+            row[0]: {
+                "last_ping": row[1],
+                "is_running": bool(row[2]),
+                "total_processed": row[3],
+                "total_errors": row[4],
+            }
+            for row in rows
+        }
+
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────
 
@@ -322,3 +373,13 @@ def get_cache_store() -> CacheStore:
 
 def get_decode_log_buffer() -> DecodeLogBuffer:
     return _decode_log_buffer
+
+
+async def report_bot_heartbeat(name: str, total_processed: int = 0, total_errors: int = 0):
+    """模块级便利函数：各 Bot 启动/定时上报心跳。"""
+    await _store.write_bot_heartbeat(name, total_processed, total_errors)
+
+
+async def get_all_bot_heartbeats() -> dict[str, dict]:
+    """模块级便利函数：admin_bot 读取所有 Bot 心跳。"""
+    return await _store.get_all_bot_heartbeats()

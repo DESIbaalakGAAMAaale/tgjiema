@@ -699,6 +699,8 @@ async def _init():
 
 async def _async_main():
     await _init()
+    from database.cache_store import report_bot_heartbeat
+    await report_bot_heartbeat("dsp_bot")
 
     logger.info("[Dsp] 启动发送机器人 (Dsp Bot)...")
     app = Application.builder().token(TOKEN).build()

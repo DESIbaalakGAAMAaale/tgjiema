@@ -346,6 +346,8 @@ class MonBot:
     async def start(self):
         """启动 Mon 主循环。"""
         await init_db()
+        from database.cache_store import report_bot_heartbeat
+        await report_bot_heartbeat("mon_bot")
         await self.bot.initialize()
         self._running = True
         self._rotation_reload_countdown = 0

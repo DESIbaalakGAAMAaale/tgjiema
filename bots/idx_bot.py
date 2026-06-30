@@ -1067,6 +1067,8 @@ async def _init():
 
 async def _async_main():
     await _init()
+    from database.cache_store import report_bot_heartbeat
+    await report_bot_heartbeat("idx_bot")
 
     logger.info("[Idx] 启动解码机器(Idx Bot)...")
     app = Application.builder().token(TOKEN).build()

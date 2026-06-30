@@ -750,6 +750,8 @@ async def _init():
 
 async def _async_main():
     await _init()
+    from database.cache_store import report_bot_heartbeat
+    await report_bot_heartbeat("up_bot")
 
     logger.info(f"[Up] 启动上传机器人（Up Bot）...")
     app = Application.builder().token(TOKEN).build()

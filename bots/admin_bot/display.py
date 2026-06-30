@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import re
+import time
 
 from loguru import logger
 from config import settings
@@ -86,20 +87,22 @@ async def _get_status_text() -> str:
 
 async def _get_health_text() -> str:
     msg = "🤖 机器人健康状态\n\n"
+    from database.cache_store import get_all_bot_heartbeats
+    heartbeats = await get_all_bot_heartbeats()
+    now = time.time()
     bot_names = ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]
     for name in bot_names:
-        bot = metrics.get_bot(name)
-        status_icon = "✅" if bot.is_running else "⏳"
-        if bot.last_ping > 0:
-            last_ping = format_datetime(bot.last_ping)
+        hb = heartbeats.get(name)
+        if hb and (now - hb["last_ping"]) < 120:
+            last_ping = format_datetime(hb["last_ping"])
             msg += (
-                f"{status_icon} {name}\n"
+                f"✅ {name}\n"
                 f"  最后活跃:{last_ping}\n"
-                f"  处理次数:{bot.total_processed}\n"
-                f"  错误次数:{bot.total_errors}\n"
+                f"  处理次数:{hb['total_processed']}\n"
+                f"  错误次数:{hb['total_errors']}\n"
             )
         else:
-            msg += f"{status_icon} {name}: 未上报/离线\n"
+            msg += f"⏳ {name}: 未上报/离线\n"
     return msg
 
 
@@ -299,7 +302,6 @@ def _config_fallback(key: str) -> str:
 
 async def _get_configs_text() -> str:
     cfg_keys = [
-        ("storage_channel_id", "📺 主存储频道", "⚠️需重启"),
         ("file_code_prefix", "📝 文件码前缀", "⚠️需重启"),
         ("force_join_channel_id", "🔒 强制加群频道", "✅热更新"),
         ("force_join_link", "🔗 加群链接", "✅热更新"),

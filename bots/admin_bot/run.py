@@ -36,6 +36,8 @@ async def _async_main():
     logger.info("启动管理员机器人...")
 
     await _init()
+    from database.cache_store import report_bot_heartbeat
+    await report_bot_heartbeat("admin_bot")
     await metrics.ping_bot("admin_bot")
 
     app = Application.builder().token(TOKEN).build()
