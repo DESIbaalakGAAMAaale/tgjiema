@@ -376,17 +376,12 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     note = group["updates"][0].message.caption or ""
 
+    # 编辑进度消息为完成状态（最终确认消息由 _finalize_upload 发出）
     try:
-        await progress_msg.edit_text(
-            f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
-            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else "")
-        )
+        failed_hint = f"（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else ""
+        await progress_msg.edit_text(f"文件处理完成{failed_hint}")
     except Exception:
-        await safe_send_message(
-            context.bot, chat_id=user_id,
-            text=f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你"
-            + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else "")
-        )
+        pass
 
     # 暂存媒体组数据，等待用户选择有效期→备注→转发权限
     context.user_data["_pending_media_group"] = {
