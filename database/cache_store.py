@@ -84,8 +84,9 @@ class CacheStore:
             )"""
         )
         await self._db.commit()
-        # 注入 db 连接给 DecodeLogBuffer
+        # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
+        _code_change_buffer.set_db(self._db)
         logger.info(f"[CacheStore] 初始化完成: {DB_PATH}")
 
     async def dump(self, cache_entries: list[tuple[str, dict, float]]):
@@ -450,6 +451,16 @@ DDL_BUFFER_TABLES = [
         source_channel_id BIGINT,
         buffered_at REAL
     )""",
+    # ─── 文件码变更缓冲表：用户管理操作先写 SQLite，后台批量 flush CRDB ───
+    """CREATE TABLE IF NOT EXISTS code_changes (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        code       TEXT NOT NULL,
+        change_type TEXT NOT NULL,  -- 'note' | 'expiry' | 'status'
+        new_value  TEXT,
+        uploader_id BIGINT NOT NULL,
+        created_at REAL NOT NULL,
+        synced     INTEGER DEFAULT 0
+    )""",
 ]
 
 
@@ -489,8 +500,58 @@ class DecodeLogBuffer:
         pass
 
 
+class CodeChangeBuffer:
+    """文件码变更缓冲，定时批量 flush 到 CRDB"""
+
+    def __init__(self):
+        self._db = None
+
+    def set_db(self, db):
+        self._db = db
+
+    async def insert(self, code: str, change_type: str, new_value: str, uploader_id: int):
+        """写入变更缓冲（零 CRDB RU）"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT INTO code_changes (code, change_type, new_value, uploader_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (code, change_type, new_value, uploader_id, time.time()),
+        )
+        await self._db.commit()
+
+    async def get_unsynced(self, limit: int = 100) -> list[dict]:
+        """获取未同步的变更记录"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT id, code, change_type, new_value, uploader_id FROM code_changes "
+            "WHERE synced = 0 ORDER BY created_at ASC LIMIT ?",
+            (limit,),
+        )
+        return [
+            {"id": r[0], "code": r[1], "change_type": r[2], "new_value": r[3], "uploader_id": r[4]}
+            for r in rows
+        ]
+
+    async def mark_synced(self, change_ids: list[int]):
+        """标记已同步"""
+        if not self._db or not change_ids:
+            return
+        placeholders = ",".join("?" * len(change_ids))
+        await self._db.execute(
+            f"UPDATE code_changes SET synced = 1 WHERE id IN ({placeholders})",
+            change_ids,
+        )
+        await self._db.commit()
+
+    async def close(self):
+        pass
+
+
 _store = CacheStore()
 _decode_log_buffer = DecodeLogBuffer()
+_code_change_buffer = CodeChangeBuffer()
 
 
 def get_cache_store() -> CacheStore:
@@ -499,6 +560,10 @@ def get_cache_store() -> CacheStore:
 
 def get_decode_log_buffer() -> DecodeLogBuffer:
     return _decode_log_buffer
+
+
+def get_code_change_buffer() -> CodeChangeBuffer:
+    return _code_change_buffer
 
 
 async def report_bot_heartbeat(name: str, total_processed: int = 0, total_errors: int = 0):

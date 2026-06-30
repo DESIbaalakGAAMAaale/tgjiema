@@ -253,6 +253,12 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     if is_system_code(file_code):
         file_record = await get_file_record_cached(file_code)
         if file_record is not None and file_record.get("status") == "active":
+            # 检查 codes 表 status（用户下架拦截）
+            from database import get_codes_col
+            codes_col = get_codes_col()
+            code_entry = await codes_col.find_one({"code": file_code})
+            if code_entry and code_entry.get("status") == "offline":
+                return DecodeResult(allowed=False, reason="文件不存在或已被删除")
             expired, reason = check_code_expired(file_record)
             if expired:
                 return DecodeResult(allowed=False, reason=reason)

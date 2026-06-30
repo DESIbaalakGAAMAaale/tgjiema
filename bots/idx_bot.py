@@ -794,6 +794,639 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("举报提交失败，请稍后重试", show_alert=True)
 
 
+# ─── 用户文件码管理 ───────────────────────────────────────────────
+
+_PAGE_SIZE = 12  # 每页 12 条
+
+
+def _format_code_status(code_entry: dict) -> str:
+    """格式化文件码状态摘要"""
+    status = code_entry.get("status", "active")
+    if status == "offline":
+        status_icon = "🚫"
+        status_text = "已下架"
+    elif status == "expired":
+        status_icon = "⏰"
+        status_text = "已过期"
+    else:
+        status_icon = "✅"
+        status_text = "正常"
+
+    note = code_entry.get("note", "")
+    expire_time = code_entry.get("expire_time", "")
+
+    parts = [f"   状态: {status_icon} {status_text}"]
+    if note:
+        # 截断过长的备注
+        display_note = note[:20] + ("..." if len(note) > 20 else "")
+        parts.append(f"备注: {display_note}")
+    if expire_time:
+        try:
+            exp_dt = datetime.datetime.fromisoformat(expire_time)
+            parts.append(f"到期: {exp_dt.strftime('%Y-%m-%d')}")
+        except (ValueError, TypeError):
+            pass
+
+    return "\n".join(parts)
+
+
+async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出用户所有文件码（分页）"""
+    user = update.effective_user
+    if not user:
+        return
+
+    # 从 page 参数获取页码
+    page = 1
+    if context.args and context.args[0].isdigit():
+        page = max(1, int(context.args[0]))
+
+    # 查 codes 表获取用户的所有文件码
+    codes_col = get_codes_col()
+    total_rows = await codes_col.count_documents({"uploader_id": user.id})
+    if total_rows == 0:
+        await safe_reply_text(update.message, "您还没有上传过文件码。")
+        return
+
+    total_pages = max(1, (total_rows + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    page = min(page, total_pages)
+    skip = (page - 1) * _PAGE_SIZE
+
+    rows = await codes_col.find(
+        {"uploader_id": user.id},
+        sort=("created_at", -1),
+        skip=skip,
+        limit=_PAGE_SIZE,
+    )
+
+    items = []
+    for i, row in enumerate(rows, 1):
+        code = row.get("code", "")
+        detail = _format_code_status(row)
+        items.append(f"{i}. {code}\n{detail}")
+
+    header = f"📋 我的文件码（共 {total_rows} 个，显示 {skip + 1}-{min(skip + _PAGE_SIZE, total_rows)}）"
+    page_info = f"\n\n共 {total_pages} 页，当前第 {page} 页"
+
+    # 构建内联键盘
+    kb = []
+    if page > 1:
+        kb.append(InlineKeyboardButton("⬅ 上一页", callback_data=f"mycode:page|{page - 1}"))
+    if page < total_pages:
+        kb.append(InlineKeyboardButton("下一页 ➡", callback_data=f"mycode:page|{page + 1}"))
+
+    reply = header + "\n\n" + "\n\n".join(items) + page_info
+    keyboard = InlineKeyboardMarkup([kb]) if kb else None
+
+    await update.message.reply_text(reply, reply_markup=keyboard)
+
+
+async def my_code_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """翻页回调"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("mycode:page|"):
+        return
+
+    try:
+        page = int(data.split("|")[1])
+    except (ValueError, IndexError):
+        return
+
+    # 复用 my_codes_command 逻辑
+    context.args = [str(page)]
+    await my_codes_command(update, context)
+
+
+async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看文件码详情"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    if not data.startswith("mycode:detail|"):
+        return
+
+    code = data.split("|", 1)[1]
+
+    # 权限校验：只能查看自己的文件码
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        # 静默：不透露该码是否存在
+        await query.edit_message_text("操作失败")
+        return
+
+    # 构建详情
+    status = code_entry.get("status", "active")
+    if status == "offline":
+        status_text = "🚫 已下架"
+    elif status == "expired":
+        status_text = "⏰ 已过期"
+    else:
+        status_text = "✅ 正常"
+
+    note = code_entry.get("note", "")
+    expire_time = code_entry.get("expire_time", "")
+    created_at = code_entry.get("created_at", "")
+    file_types_raw = code_entry.get("file_types", "{}")
+
+    # 解析 file_types
+    try:
+        ft = json.loads(file_types_raw) if isinstance(file_types_raw, str) else file_types_raw
+        type_parts = [f"{v}{k}" for k, v in ft.items()] if isinstance(ft, dict) else []
+        type_text = ", ".join(type_parts) if type_parts else "未知"
+    except (json.JSONDecodeError, TypeError):
+        type_text = "未知"
+
+    detail_lines = [
+        f"📋 文件码详情",
+        f"",
+        f"码: {code}",
+        f"状态: {status_text}",
+    ]
+    if note:
+        detail_lines.append(f"备注: {note}")
+    if expire_time:
+        try:
+            exp_dt = datetime.datetime.fromisoformat(expire_time)
+            detail_lines.append(f"有效期: {exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        except (ValueError, TypeError):
+            detail_lines.append(f"有效期: {expire_time}")
+    if created_at:
+        try:
+            cr_dt = datetime.datetime.fromisoformat(created_at)
+            detail_lines.append(f"上传时间: {cr_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        except (ValueError, TypeError):
+            detail_lines.append(f"上传时间: {created_at}")
+    detail_lines.append(f"文件类型: {type_text}")
+
+    # 构建操作按钮
+    kb = [
+        [
+            InlineKeyboardButton("✏️ 修改备注", callback_data=f"mycode:edit_note|{code}"),
+            InlineKeyboardButton("⏰ 设置有效期", callback_data=f"mycode:set_expiry|{code}"),
+        ],
+    ]
+    if status == "offline":
+        kb.append([InlineKeyboardButton("✅ 恢复上架", callback_data=f"mycode:toggle_status|{code}|active")])
+    else:
+        kb.append([InlineKeyboardButton("🚫 立刻下架", callback_data=f"mycode:toggle_status|{code}|offline")])
+
+    kb.extend([
+        [InlineKeyboardButton("📊 查看统计", callback_data=f"mycode:stats|{code}")],
+        [InlineKeyboardButton("🔙 返回列表", callback_data="mycode:list")],
+    ])
+
+    await query.edit_message_text("\n".join(detail_lines), reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def my_code_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """返回列表"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    # 复用 my_codes_command
+    context.args = ["1"]
+    await my_codes_command(update, context)
+
+
+async def my_code_edit_note_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """修改备注"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    if not data.startswith("mycode:edit_note|"):
+        return
+
+    code = data.split("|", 1)[1]
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await query.edit_message_text("操作失败")
+        return
+
+    # 保存当前 code 到用户上下文，等待输入
+    context.user_data["_manage_code"] = code
+    context.user_data["_manage_action"] = "edit_note"
+
+    old_note = code_entry.get("note", "")
+    await query.edit_message_text(
+        f"📝 修改备注\n\n"
+        f"当前备注: {old_note if old_note else '(空)'}\n\n"
+        f"请输入新备注（发送 /cancel 取消）",
+    )
+
+
+async def my_code_set_expiry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """设置有效期"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    if not data.startswith("mycode:set_expiry|"):
+        return
+
+    code = data.split("|", 1)[1]
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await query.edit_message_text("操作失败")
+        return
+
+    context.user_data["_manage_code"] = code
+    context.user_data["_manage_action"] = "set_expiry"
+
+    expire_time = code_entry.get("expire_time", "")
+    if expire_time:
+        try:
+            exp_dt = datetime.datetime.fromisoformat(expire_time)
+            expire_text = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            expire_text = expire_time
+    else:
+        expire_text = "永久"
+
+    kb = [
+        [
+            InlineKeyboardButton("1天", callback_data=f"mycode:expiry_pick|{code}|1"),
+            InlineKeyboardButton("7天", callback_data=f"mycode:expiry_pick|{code}|7"),
+            InlineKeyboardButton("30天", callback_data=f"mycode:expiry_pick|{code}|30"),
+        ],
+        [
+            InlineKeyboardButton("90天", callback_data=f"mycode:expiry_pick|{code}|90"),
+            InlineKeyboardButton("自定义", callback_data=f"mycode:expiry_custom|{code}"),
+            InlineKeyboardButton("永久", callback_data=f"mycode:expiry_pick|{code}|0"),
+        ],
+        [InlineKeyboardButton("🔙 返回", callback_data=f"mycode:detail|{code}")],
+    ]
+
+    await query.edit_message_text(
+        f"⏰ 设置有效期\n\n"
+        f"当前有效期: {expire_text}\n\n"
+        f"请选择新有效期：",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """快捷选择有效期"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    if not data.startswith("mycode:expiry_pick|"):
+        return
+
+    parts = data.split("|")
+    code = parts[1]
+    days = int(parts[2])
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await query.edit_message_text("操作失败")
+        return
+
+    # 计算新过期时间
+    if days == 0:
+        new_expire = None  # 永久
+    else:
+        new_expire = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=days)).isoformat()
+
+    # 写入缓冲
+    from database.cache_store import get_code_change_buffer
+    await get_code_change_buffer().insert(code, "expiry", new_expire or "NULL", user.id)
+
+    # 更新本地缓存
+    from database.cache import get_code_cache
+    cache_key = f"code:{code}"
+    if code_entry in get_code_cache().cache:
+        if new_expire:
+            get_code_cache().cache[cache_key]["expire_time"] = new_expire
+        else:
+            get_code_cache().cache[cache_key].pop("expire_time", None)
+
+    await query.edit_message_text(
+        f"✅ 有效期已设置为 {days} 天后\n\n"
+        f"[{code}]"
+    )
+
+
+async def my_code_expiry_custom_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """自定义有效期"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    data = query.data
+    parts = data.split("|")
+    code = parts[1]
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code})
+    if not code_entry or code_entry.get("uploader_id") != (update.effective_user and update.effective_user.id):
+        await query.edit_message_text("操作失败")
+        return
+
+    context.user_data["_manage_code"] = code
+    context.user_data["_manage_action"] = "set_expiry_custom"
+
+    await query.edit_message_text(
+        "请输入自定义有效期，格式：\n"
+        "1. 天数，如 15（表示 15 天后过期）\n"
+        "2. ISO 时间，如 2026-12-31T23:59:59\n"
+        "3. 0 或 permanent 表示永久有效\n\n"
+        "（发送 /cancel 取消）"
+    )
+
+
+async def my_code_toggle_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """下架/恢复上架"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    if not data.startswith("mycode:toggle_status|"):
+        return
+
+    parts = data.split("|")
+    code = parts[1]
+    new_status = parts[2]
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await query.edit_message_text("操作失败")
+        return
+
+    action_text = "下架" if new_status == "offline" else "恢复上架"
+
+    # 二次确认
+    kb = [
+        [
+            InlineKeyboardButton(f"确认{action_text}", callback_data=f"mycode:confirm_{new_status}|{code}"),
+            InlineKeyboardButton("取消", callback_data=f"mycode:detail|{code}"),
+        ]
+    ]
+
+    await query.edit_message_text(
+        f"⚠️ 确认{action_text}\n\n"
+        f"文件码: {code}\n"
+        f"此操作后其他人将无法解码此文件。\n\n"
+        f"确定要继续吗？",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def my_code_confirm_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """确认执行下架/恢复"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    # 格式: mycode:confirm_offline|CODE 或 mycode:confirm_active|CODE
+    if not data.startswith("mycode:confirm_"):
+        return
+
+    parts = data.split("|")
+    new_status = parts[0].replace("mycode:confirm_", "")
+    code = parts[1]
+
+    if new_status not in ("offline", "active"):
+        await query.edit_message_text("操作失败")
+        return
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await query.edit_message_text("操作失败")
+        return
+
+    # 写入缓冲
+    from database.cache_store import get_code_change_buffer
+    await get_code_change_buffer().insert(code, "status", new_status, user.id)
+
+    # 更新本地缓存
+    from database.cache import get_code_cache
+    cache_key = f"code:{code}"
+    if cache_key in get_code_cache().cache:
+        get_code_cache().cache[cache_key]["status"] = new_status
+
+    status_text = "下架" if new_status == "offline" else "恢复上架"
+    await query.edit_message_text(f"✅ 已{status_text}文件码 [{code}]")
+
+
+async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看文件码统计"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    if not data.startswith("mycode:stats|"):
+        return
+
+    code = data.split("|", 1)[1]
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await query.edit_message_text("操作失败")
+        return
+
+    # 从 decode_log_buffer 查解码次数（SQLite 本地）
+    from database.cache_store import get_decode_log_buffer
+    buf = get_decode_log_buffer()
+    decode_count = 0
+    last_decode = ""
+    if buf._db:
+        try:
+            row = await buf._db.execute_fetchall(
+                "SELECT COUNT(*) as cnt, MAX(request_time) as last_time "
+                "FROM decode_log_buffer WHERE file_code = ?",
+                (code,),
+            )
+            if row:
+                decode_count = row[0][0] if row[0][0] else 0
+                last_decode = row[0][1] if row[0][1] else ""
+        except Exception:
+            pass
+
+    # 也从 CRDB 查历史 decode_logs
+    try:
+        decode_logs_col = get_decode_logs_col()
+        cr_count = await decode_logs_col.count_documents({"file_code": code})
+        if cr_count > decode_count:
+            decode_count = cr_count
+    except Exception:
+        pass
+
+    stats_lines = [
+        f"📊 文件码统计",
+        f"",
+        f"码: {code}",
+        f"总解码次数: {decode_count}",
+    ]
+    if last_decode:
+        try:
+            dt = datetime.datetime.fromisoformat(last_decode)
+            stats_lines.append(f"最近解码: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        except (ValueError, TypeError):
+            pass
+
+    kb = [
+        [InlineKeyboardButton("🔙 返回详情", callback_data=f"mycode:detail|{code}")],
+    ]
+
+    await query.edit_message_text("\n".join(stats_lines), reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理用户输入的备注/有效期文本"""
+    user = update.effective_user
+    if not user:
+        return
+
+    text = (update.message.text or "").strip()
+    if text == "/cancel":
+        context.user_data.pop("_manage_code", None)
+        context.user_data.pop("_manage_action", None)
+        await update.message.reply_text("操作已取消")
+        return
+
+    action = context.user_data.get("_manage_action")
+    code = context.user_data.get("_manage_code")
+
+    if not action or not code:
+        return
+
+    # 权限校验
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await update.message.reply_text("操作失败")
+        context.user_data.pop("_manage_code", None)
+        context.user_data.pop("_manage_action", None)
+        return
+
+    from database.cache_store import get_code_change_buffer
+
+    if action == "edit_note":
+        await get_code_change_buffer().insert(code, "note", text, user.id)
+        # 更新缓存
+        from database.cache import get_code_cache
+        cache_key = f"code:{code}"
+        if cache_key in get_code_cache().cache:
+            get_code_cache().cache[cache_key]["note"] = text
+        await update.message.reply_text(f"✅ 备注已更新为: {text}")
+
+    elif action == "set_expiry_custom":
+        try:
+            days_val = int(text)
+            if days_val == 0:
+                new_expire = None
+            else:
+                new_expire = (datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=days_val)).isoformat()
+        except ValueError:
+            # 尝试解析 ISO 时间
+            try:
+                exp_dt = datetime.datetime.fromisoformat(text)
+                if exp_dt.tzinfo is None:
+                    exp_dt = exp_dt.replace(tzinfo=datetime.UTC)
+                new_expire = exp_dt.isoformat()
+            except ValueError:
+                await update.message.reply_text("格式不正确，请输入天数（如 15）或 ISO 时间（如 2026-12-31T23:59:59）")
+                return
+
+        if new_expire:
+            await get_code_change_buffer().insert(code, "expiry", new_expire, user.id)
+        else:
+            await get_code_change_buffer().insert(code, "expiry", "NULL", user.id)
+
+        # 更新缓存
+        from database.cache import get_code_cache
+        cache_key = f"code:{code}"
+        if cache_key in get_code_cache().cache:
+            if new_expire:
+                get_code_cache().cache[cache_key]["expire_time"] = new_expire
+            else:
+                get_code_cache().cache[cache_key].pop("expire_time", None)
+
+        await update.message.reply_text("✅ 有效期已更新")
+
+    context.user_data.pop("_manage_code", None)
+    context.user_data.pop("_manage_action", None)
+
+
+async def my_code_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """取消操作"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+    context.user_data.pop("_manage_code", None)
+    context.user_data.pop("_manage_action", None)
+    await query.edit_message_text("操作已取消")
+
+
 # ─── 外部码处───
 
 def _resolve_bot_username(update: Update) -> str | None:
@@ -972,6 +1605,11 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
 
+    # 优先检查是否有进行中的文件码管理操作
+    if context.user_data.get("_manage_action"):
+        await my_code_manage_text_handler(update, context)
+        return
+
     if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
         await handle_relay_delivery(update, context)
         return
@@ -1037,8 +1675,21 @@ async def _async_main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("my-codes", my_codes_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))
+    # 文件码管理回调
+    app.add_handler(CallbackQueryHandler(my_code_page_callback, pattern=r"^mycode:page\|"))
+    app.add_handler(CallbackQueryHandler(my_code_list_callback, pattern=r"^mycode:list"))
+    app.add_handler(CallbackQueryHandler(my_code_detail_callback, pattern=r"^mycode:detail\|"))
+    app.add_handler(CallbackQueryHandler(my_code_edit_note_callback, pattern=r"^mycode:edit_note\|"))
+    app.add_handler(CallbackQueryHandler(my_code_set_expiry_callback, pattern=r"^mycode:set_expiry\|"))
+    app.add_handler(CallbackQueryHandler(my_code_expiry_pick_callback, pattern=r"^mycode:expiry_pick\|"))
+    app.add_handler(CallbackQueryHandler(my_code_expiry_custom_callback, pattern=r"^mycode:expiry_custom\|"))
+    app.add_handler(CallbackQueryHandler(my_code_toggle_status_callback, pattern=r"^mycode:toggle_status\|"))
+    app.add_handler(CallbackQueryHandler(my_code_confirm_status_callback, pattern=r"^mycode:confirm_"))
+    app.add_handler(CallbackQueryHandler(my_code_stats_callback, pattern=r"^mycode:stats\|"))
+    app.add_handler(CallbackQueryHandler(my_code_cancel_callback, pattern=r"^mycode:cancel"))
 
     media_filter = (
         filters.Document.ALL | filters.VIDEO | filters.PHOTO
@@ -1123,6 +1774,52 @@ async def _async_main():
             await asyncio.sleep(60)
             await _refresh_active_channels()
     create_safe_task(_channel_refresh_loop(), name="channel-refresh")
+
+    # 文件码变更批量 flush CRDB 后台任务
+    async def _code_changes_sync_loop():
+        """每 5 分钟将 SQLite code_changes 批量 flush 到 CRDB"""
+        while True:
+            await asyncio.sleep(300)
+            try:
+                from database.cache_store import get_code_change_buffer
+                buf = get_code_change_buffer()
+                changes = await buf.get_unsynced(limit=100)
+                if not changes:
+                    continue
+
+                codes_col = get_codes_col()
+                synced_ids = []
+                for change in changes:
+                    code = change["code"]
+                    change_type = change["change_type"]
+                    new_value = change["new_value"]
+                    try:
+                        if change_type == "note":
+                            await codes_col.update_one(
+                                {"code": code},
+                                {"$set": {"note": new_value}},
+                            )
+                        elif change_type == "expiry":
+                            expire_val = None if new_value == "NULL" else new_value
+                            await codes_col.update_one(
+                                {"code": code},
+                                {"$set": {"expire_time": expire_val}},
+                            )
+                        elif change_type == "status":
+                            await codes_col.update_one(
+                                {"code": code},
+                                {"$set": {"status": new_value}},
+                            )
+                        synced_ids.append(change["id"])
+                    except Exception as e:
+                        logger.error(f"[CodeChanges] flush failed (code={code}, type={change_type}): {e}")
+
+                if synced_ids:
+                    await buf.mark_synced(synced_ids)
+                    logger.info(f"[CodeChanges] flushed {len(synced_ids)} changes to CRDB")
+            except Exception as e:
+                logger.error(f"[CodeChanges] sync loop error: {e}")
+    create_safe_task(_code_changes_sync_loop(), name="code-changes-sync")
 
     async with app:
         await app.start()
