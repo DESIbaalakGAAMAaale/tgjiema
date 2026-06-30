@@ -177,49 +177,29 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_msg_ids = batch["pinned_msg_ids"]
 
     if not channel_msg_ids:
-        await update.message.reply_text("没有接收到任何文批次已取消")
+        await update.message.reply_text("没有接收到任何文件，批次已取消")
         return
-
-    sent_msg = await update.message.reply_text(
-        f"📦 {len(channel_msg_ids)} 个文件已接收,"
-        f"文件码将@{settings.DECODER_BOT_USERNAME} 发送给你"
-    )
 
     type_str = _json_dumps(dict(batch["file_types"]))
     batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
     batch_file_meta_str = _json_dumps(batch["files_meta"])
 
-    try:
-        pending_col = get_pending_uploads_col()
-        opts = context.user_data.pop("upload_options", {})
-        await pending_col.insert_one({
-            "uploader_id": user.id,
-            "primary_channel_id": await _get_upload_target_channel(),
-            "primary_channel_msg_id": channel_msg_ids[0],
-            "file_types": type_str,
-            "batch_msg_ids": batch_ids_str,
-            "batch_file_meta": batch_file_meta_str,
-            "note": batch.get("note", ""),
-            "status_msg_id": sent_msg.message_id,
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "processed": 0,
-            "protect_content": opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT),
-            "file_ttl_days": int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS,
-        })
-        logger.info(f"[Up] 批次文件写入pending_uploads: user={user.id}")
-    except Exception as e:
-        logger.error(f"[Up] 写入pending_uploads失败: {e}")
-        await metrics.record_error("up_bot")
-        await update.message.reply_text("文件处理失败，请稍后重试")
-        return
+    # 暂存批次数据，等待用户选择有效期→备注→转发权限
+    context.user_data["_pending_batch"] = {
+        "user_id": user.id,
+        "file_types": type_str,
+        "batch_msg_ids": batch_ids_str,
+        "batch_file_meta": batch_file_meta_str,
+        "note": batch.get("note", ""),
+        "primary_channel_id": await _get_upload_target_channel(),
+        "primary_channel_msg_id": channel_msg_ids[0],
+        "total_count": len(channel_msg_ids),
+    }
 
-    try:
-        await get_cache_store().notify_new_upload()
-    except Exception as e:
-        logger.warning(f"[Up] 通知 idx_bot 失败(不影响上传): {e}")
-
-    metrics.upload_count += 1
-    await metrics.record_processed("up_bot")
+    await update.message.reply_text(
+        f"📦 {len(channel_msg_ids)} 个文件已接收\n请选择文件有效期：",
+        reply_markup=_build_ttl_keyboard(),
+    )
 
 
 async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -394,9 +374,6 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             pass
         return
 
-    type_str = _json_dumps(file_types)
-    batch_ids_str = ",".join(str(mid) for mid in all_mids)
-    batch_file_meta_str = _json_dumps(all_meta)
     note = group["updates"][0].message.caption or ""
 
     try:
@@ -411,6 +388,18 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             + (f"\n（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else "")
         )
 
+    # 暂存媒体组数据，等待用户选择有效期→备注→转发权限
+    context.user_data["_pending_media_group"] = {
+        "user_id": user_id,
+        "primary_channel_id": target_ch,
+        "primary_channel_msg_id": all_mids[0],
+        "file_types": _json_dumps(file_types),
+        "batch_msg_ids": ",".join(str(mid) for mid in all_mids),
+        "batch_file_meta": _json_dumps(all_meta),
+        "note": note,
+        "total_count": total_count,
+    }
+
     # 发送上传选项
     try:
         await context.bot.send_message(
@@ -420,52 +409,6 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         )
     except Exception:
         pass
-
-    try:
-        pending_col = get_pending_uploads_col()
-        # 优先使用已写入的选项(由 upload_option_callback 更新)
-        results = await pending_col.find({"uploader_id": user_id, "processed": 0}, sort=("id", -1), limit=1)
-        latest = results[0] if results else None
-        if latest and "id" in latest:
-            # 使用 MongoDB 中的
-            protect = latest.get("protect_content", settings.DEFAULT_PROTECT_CONTENT)
-            ttl = latest.get("file_ttl_days", settings.DEFAULT_FILE_TTL_DAYS)
-        else:
-            # Fallback: 使用内存中的选项
-            opts = context.user_data.pop("upload_options", {})
-            protect = opts.get("protect_content", "false") == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
-            ttl = int(opts.get("file_ttl", settings.DEFAULT_FILE_TTL_DAYS)) or settings.DEFAULT_FILE_TTL_DAYS
-        await pending_col.insert_one({
-            "uploader_id": user_id,
-            "primary_channel_id": target_ch,
-            "primary_channel_msg_id": all_mids[0],
-            "file_types": type_str,
-            "batch_msg_ids": batch_ids_str,
-            "batch_file_meta": batch_file_meta_str,
-            "note": note,
-            "status_msg_id": progress_msg.message_id,
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "processed": 0,
-            "protect_content": protect,
-            "file_ttl_days": ttl,
-        })
-        logger.info(f"[Up] 媒体组文件写入pending_uploads: user={user_id}")
-    except Exception as e:
-        logger.error(f"[Up] 写入pending_uploads失败: {e}")
-        await metrics.record_error("up_bot")
-        try:
-            await safe_send_message(context.bot, chat_id=user_id, text="文件处理失败，请稍后重试")
-        except Exception:
-            pass
-        return
-
-    try:
-        await get_cache_store().notify_new_upload()
-    except Exception as e:
-        logger.warning(f"[Up] 通知 idx_bot 失败(不影响上传): {e}")
-
-    metrics.upload_count += 1
-    await metrics.record_processed("up_bot")
 
 
 async def _process_upload(
@@ -498,74 +441,130 @@ async def _process_upload(
 # ─── 上传选项回调 ───
 
 async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理上传选项按钮回调。分两步：先选有效期，再选转发权限。"""
+    """处理上传选项按钮回调。三步流: 有效期 → 备注 → 转发权限"""
     query = update.callback_query
     await query.answer()
-    data = query.data  # format: "option|key|value"
+    data = query.data  # format: "opt|key|value"
     parts = data.split("|")
-    if len(parts) != 3 or parts[0] != "option":
+    if len(parts) != 3 or parts[0] != "opt":
         return
 
     user_id = query.from_user.id
     key = parts[1]
     value = parts[2]
 
-    # 第一步：已选有效期 → 弹出转发权限选择
-    if "file_ttl" in context.user_data and "protect_content" not in context.user_data:
-        context.user_data["protect_content"] = value
-        await query.edit_message_text(
-            text="请选择转发权限：",
-            reply_markup=_build_protect_keyboard(),
-        )
-        return
-
-    # 第二步：已选转发权限 → 完成上传
-    if "file_ttl" in context.user_data and "protect_content" in context.user_data:
-        await _finalize_upload(query, context, user_id)
-        return
-
-    # 首次点击：弹出有效期选择
-    if "file_ttl" not in context.user_data:
+    if key == "ttl":
         context.user_data["file_ttl"] = value
-        await query.edit_message_text(
-            text="请选择转发权限：",
-            reply_markup=_build_protect_keyboard(),
-        )
+        # 批次已通过 /note 设置备注的，跳过备注步骤
+        if ("_pending_batch" in context.user_data
+                and context.user_data["_pending_batch"].get("note")):
+            await query.edit_message_text(
+                text="请选择转发权限：",
+                reply_markup=_build_protect_keyboard(),
+            )
+        else:
+            await query.edit_message_text(
+                text="是否需要添加备注？",
+                reply_markup=_build_note_keyboard(),
+            )
+
+    elif key == "note":
+        if value == "skip":
+            await query.edit_message_text(
+                text="请选择转发权限：",
+                reply_markup=_build_protect_keyboard(),
+            )
+        elif value == "add":
+            context.user_data["awaiting_note_since"] = time.time()
+            context.user_data["_note_query_msg_id"] = query.message.message_id
+            context.user_data["_note_query_chat_id"] = query.message.chat_id
+            await query.edit_message_text(
+                text="📝 请发送备注文字（60秒内有效）\n发送任意文字即可，或发送 /cancel_note 跳过",
+                reply_markup=None,
+            )
+
+    elif key == "protect":
+        context.user_data["protect_content"] = value
+        await _finalize_upload(query, context, user_id)
 
 
 async def _finalize_upload(query, context, user_id: int):
-    """用户选完所有选项后，写入 pending_uploads 并通知 idx_bot。"""
+    """用户选完所有选项后，写入 pending_uploads 并通知 idx_bot。
+    支持三种场景: 单文件 / 媒体组 / 批次上传
+    """
+    pending_batch = context.user_data.pop("_pending_batch", None)
+    pending_mg = context.user_data.pop("_pending_media_group", None)
+
     try:
         pending_col = get_pending_uploads_col()
-        main_channel = context.user_data.pop("_main_channel", 0)
-        channel_msg_id = context.user_data.pop("_channel_msg_id", 0)
-        file_types = context.user_data.pop("_file_types", {})
-        note = context.user_data.pop("_note", "")
-        file_meta = context.user_data.pop("_file_meta", {})
         ttl = context.user_data.pop("file_ttl", "0")
         protect = context.user_data.pop("protect_content", "false")
+        note = context.user_data.pop("_note", "")
 
-        type_str = _json_dumps(file_types)
         protect_bool = protect == "true" or bool(settings.DEFAULT_PROTECT_CONTENT)
         ttl_days = int(ttl) if ttl.isdigit() else settings.DEFAULT_FILE_TTL_DAYS
         if ttl_days == 0:
             ttl_days = settings.DEFAULT_FILE_TTL_DAYS
 
-        await pending_col.insert_one({
-            "uploader_id": user_id,
-            "primary_channel_id": main_channel,
-            "primary_channel_msg_id": channel_msg_id,
-            "file_types": type_str,
-            "batch_msg_ids": "",
-            "batch_file_meta": _json_dumps([file_meta]),
-            "note": note,
-            "status_msg_id": 0,
-            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "processed": 0,
-            "protect_content": protect_bool,
-            "file_ttl_days": ttl_days,
-        })
-        logger.info(f"[Up] 文件写入pending_uploads: user={user_id}")
+        if pending_batch:
+            # ── 批次上传 ──
+            note = note or pending_batch.get("note", "")
+            await pending_col.insert_one({
+                "uploader_id": user_id,
+                "primary_channel_id": pending_batch["primary_channel_id"],
+                "primary_channel_msg_id": pending_batch["primary_channel_msg_id"],
+                "file_types": pending_batch["file_types"],
+                "batch_msg_ids": pending_batch["batch_msg_ids"],
+                "batch_file_meta": pending_batch["batch_file_meta"],
+                "note": note,
+                "status_msg_id": 0,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "processed": 0,
+                "protect_content": protect_bool,
+                "file_ttl_days": ttl_days,
+            })
+            logger.info(f"[Up] 批次写入pending_uploads: user={user_id}, {pending_batch['total_count']}个文件")
+
+        elif pending_mg:
+            # ── 媒体组上传 ──
+            await pending_col.insert_one({
+                "uploader_id": user_id,
+                "primary_channel_id": pending_mg["primary_channel_id"],
+                "primary_channel_msg_id": pending_mg["primary_channel_msg_id"],
+                "file_types": pending_mg["file_types"],
+                "batch_msg_ids": pending_mg["batch_msg_ids"],
+                "batch_file_meta": pending_mg["batch_file_meta"],
+                "note": note or pending_mg.get("note", ""),
+                "status_msg_id": 0,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "processed": 0,
+                "protect_content": protect_bool,
+                "file_ttl_days": ttl_days,
+            })
+            logger.info(f"[Up] 媒体组写入pending_uploads: user={user_id}")
+
+        else:
+            # ── 单文件上传 ──
+            main_channel = context.user_data.pop("_main_channel", 0)
+            channel_msg_id = context.user_data.pop("_channel_msg_id", 0)
+            file_types = context.user_data.pop("_file_types", {})
+            file_meta = context.user_data.pop("_file_meta", {})
+
+            await pending_col.insert_one({
+                "uploader_id": user_id,
+                "primary_channel_id": main_channel,
+                "primary_channel_msg_id": channel_msg_id,
+                "file_types": _json_dumps(file_types),
+                "batch_msg_ids": "",
+                "batch_file_meta": _json_dumps([file_meta]),
+                "note": note,
+                "status_msg_id": 0,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "processed": 0,
+                "protect_content": protect_bool,
+                "file_ttl_days": ttl_days,
+            })
+            logger.info(f"[Up] 单文件写入pending_uploads: user={user_id}")
 
         try:
             await get_cache_store().notify_new_upload()
@@ -589,19 +588,67 @@ async def _finalize_upload(query, context, user_id: int):
             pass
 
 
+# ─── 备注文字输入处理 ───
+
+async def _handle_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """当用户处于等待备注输入状态时，捕获文字消息作为备注。"""
+    user_id = update.effective_user.id
+    note_since = context.user_data.get("awaiting_note_since")
+    if note_since is None:
+        return  # 不在等待备注状态，忽略
+
+    if time.time() - note_since > 60:
+        del context.user_data["awaiting_note_since"]
+        await update.message.reply_text("⏰ 备注输入已超时，请重新上传文件")
+        return
+
+    # 保存备注
+    context.user_data["_note"] = update.message.text
+    del context.user_data["awaiting_note_since"]
+
+    await update.message.reply_text(f"✅ 备注已设置：{update.message.text}")
+
+    # 弹出转发权限选择
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="请选择转发权限：",
+            reply_markup=_build_protect_keyboard(),
+        )
+    except Exception as e:
+        logger.warning(f"[Up] 发送转发权限选择失败: {e}")
+
+
+async def cancel_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """取消/跳过备注输入"""
+    if context.user_data.get("awaiting_note_since"):
+        del context.user_data["awaiting_note_since"]
+        await update.message.reply_text("已跳过备注")
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text="请选择转发权限：",
+                reply_markup=_build_protect_keyboard(),
+            )
+        except Exception as e:
+            logger.warning(f"[Up] 发送转发权限选择失败: {e}")
+    else:
+        await update.message.reply_text("当前没有待设置的备注")
+
+
 def _build_ttl_keyboard():
     """构建有效期选择按钮。"""
     keyboard = [
         [
-            InlineKeyboardButton("∞ 永久有效", callback_data="option|file_ttl|0"),
-            InlineKeyboardButton("1天", callback_data="option|file_ttl|1"),
+            InlineKeyboardButton("∞ 永久有效", callback_data="opt|ttl|0"),
+            InlineKeyboardButton("1天", callback_data="opt|ttl|1"),
         ],
         [
-            InlineKeyboardButton("7天", callback_data="option|file_ttl|7"),
-            InlineKeyboardButton("30天", callback_data="option|file_ttl|30"),
+            InlineKeyboardButton("7天", callback_data="opt|ttl|7"),
+            InlineKeyboardButton("30天", callback_data="opt|ttl|30"),
         ],
         [
-            InlineKeyboardButton("90天", callback_data="option|file_ttl|90"),
+            InlineKeyboardButton("90天", callback_data="opt|ttl|90"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -611,9 +658,18 @@ def _build_protect_keyboard():
     """构建转发权限选择按钮。"""
     keyboard = [
         [
-            InlineKeyboardButton("🔒 禁止转发", callback_data="option|protect_content|true"),
-            InlineKeyboardButton("↗️ 允许转发", callback_data="option|protect_content|false"),
+            InlineKeyboardButton("🔒 禁止转发", callback_data="opt|protect|true"),
+            InlineKeyboardButton("↗️ 允许转发", callback_data="opt|protect|false"),
         ],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_note_keyboard():
+    """构建备注选择按钮。"""
+    keyboard = [
+        [InlineKeyboardButton("📝 添加备注", callback_data="opt|note|add")],
+        [InlineKeyboardButton("⏭ 跳过", callback_data="opt|note|skip")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -761,7 +817,14 @@ async def _async_main():
     app.add_handler(CommandHandler("end_upload", end_upload))
     app.add_handler(CommandHandler("cancel_upload", cancel_upload))
     app.add_handler(CommandHandler("note", note_command))
-    app.add_handler(CallbackQueryHandler(upload_option_callback, pattern=r"^option\|"))
+    app.add_handler(CommandHandler("cancel_note", cancel_note))
+    app.add_handler(CallbackQueryHandler(upload_option_callback, pattern=r"^opt\|"))
+
+    # 备注文字输入处理（需在 EXTERNAL_DONE 和 media 之前）
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.Regex(r"^EXTERNAL_DONE:"),
+        _handle_note_text
+    ))
 
     # 中继外部文件完成信号
     app.add_handler(MessageHandler(
