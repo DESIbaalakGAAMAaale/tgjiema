@@ -20,6 +20,8 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
+DDL_VERSION = 1  # 递增此值以触发 DDL 升级
+
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
@@ -268,13 +270,34 @@ class CockroachDBClient:
         await store.init()
         await load_cache_from_disk()
 
-        for sql in DDL_STATEMENTS:
-            await self.execute(sql)
-        for sql in MIGRATION_STATEMENTS:
-            try:
+        # ─── DDL 版本检查：跳过已执行的 DDL，省 RU ───
+        need_ddl = True
+        try:
+            current_version = await self._pool.fetchval(
+                "SELECT config_value FROM rotation_config WHERE config_key = 'ddl_version'"
+            )
+            if current_version == str(DDL_VERSION):
+                need_ddl = False
+                logger.info(f"DDL 版本 {DDL_VERSION} 已是最新，跳过")
+            else:
+                logger.info(f"DDL 版本变更: {current_version} → {DDL_VERSION}，执行升级")
+        except Exception:
+            logger.info("首次运行或 rotation_config 表不存在，执行 DDL 初始化")
+
+        if need_ddl:
+            for sql in DDL_STATEMENTS:
                 await self.execute(sql)
-            except Exception as e:
-                logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略）：{e}")
+            for sql in MIGRATION_STATEMENTS:
+                try:
+                    await self.execute(sql)
+                except Exception as e:
+                    logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略）：{e}")
+            # 写入版本号
+            await self.execute(
+                "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
+                str(DDL_VERSION),
+            )
+            logger.info(f"DDL 升级完成，版本 {DDL_VERSION}")
 
     async def close(self):
         if self._pool:
