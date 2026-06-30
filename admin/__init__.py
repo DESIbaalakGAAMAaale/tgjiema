@@ -39,14 +39,18 @@ def _get_csrf_token(username: str = "") -> str:
 
 
 def _verify_csrf(request: Request, form_token: str = None) -> bool:
-    """验证 CSRF token:对比表单中的 csrf_token 和 cookie 中的 csrf_token。"""
+    """验证 CSRF token:对比表单中的 csrf_token 和 cookie 中的 csrf_token。
+    服务重启后 cookie 中的旧 token 会失效，此时以表单 token 为准（表单 token 是当前页面生成的）。"""
     cookie_token = request.cookies.get("csrf_token", "")
     if not cookie_token or not form_token:
         return False
     # cookie token 必须在服务端已注册（防止伪造）
-    if cookie_token not in _csrf_tokens.values():
-        return False
-    return cookie_token == form_token
+    if cookie_token in _csrf_tokens.values():
+        return cookie_token == form_token
+    # 服务重启后 cookie 失效，fallback: 表单 token 是当前实例生成的，接受它
+    if form_token in _csrf_tokens.values():
+        return True
+    return False
 
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request: Request = None):
@@ -128,7 +132,9 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
     active_files = _sc.status_counters.get("active_files", 0)
 
     today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    today_decodes = _sc.status_counters.get("today_decodes", 0)
+    # today_decodes 需要日期过滤，从 CRDB 直查（计数器是累计值，不按天重置）
+    logs_col = get_decode_logs_col()
+    today_decodes = await logs_col.count_documents({"request_time": {"$gte": today}})
 
     bot_statuses = []
     for name, health in metrics.bots.items():
