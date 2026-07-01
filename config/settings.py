@@ -64,7 +64,7 @@ class Settings(BaseSettings):
     R2_BUCKET_NAME: str = "tgjiema-backup"
     R2_ENDPOINT: Optional[str] = None
 
-    DB_BACKUP_INTERVAL_MINUTES: int = 60
+    DB_BACKUP_INTERVAL_MINUTES: int = 14400  # 10 天 1 次，减少 CRDB RU
     DB_BACKUP_ENABLED: bool = True
 
     ADMIN_WEB_PORT: int = 8080

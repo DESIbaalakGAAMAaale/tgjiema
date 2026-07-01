@@ -292,9 +292,9 @@ async def load_cache_from_disk():
 
 
 # ─── Decode Logs 缓冲:定时 flush ──────────────────
-# 策略:30 分钟兜底 + Bot 关闭时强制 flush
+# 策略:60 分钟兜底 + Bot 关闭时强制 flush
 
-_DECODE_LOG_FLUSH_INTERVAL = 30 * 60  # 30 分钟
+_DECODE_LOG_FLUSH_INTERVAL = 60 * 60  # 60 分钟，减少 CRDB 写入频率
 
 
 async def _flush_decode_log_buffer_loop():
@@ -325,11 +325,11 @@ async def _flush_decode_log_buffer_loop():
             buf = get_decode_log_buffer()
             rows = await buf._db.execute_fetchall(
                 "SELECT id, file_code, requester_id, request_time, status, source_channel_id "
-                "FROM decode_log_buffer ORDER BY id LIMIT 500"
+                "FROM decode_log_buffer ORDER BY id LIMIT 200"
             )
             if rows:
-                # 分批写入,每批 200 条
-                batch_size = 200
+                # 分批写入,每批 100 条(减少单次 CRDB 事务大小)
+                batch_size = 100
                 for i in range(0, len(rows), batch_size):
                     batch = rows[i:i + batch_size]
                     await decode_logs_col.insert_many([

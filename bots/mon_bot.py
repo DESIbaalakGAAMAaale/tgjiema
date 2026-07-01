@@ -134,18 +134,31 @@ class MonBot:
             pass
 
     async def _reload_rotation_config(self):
-        """从 DB rotation_config 表重新读取轮转参数(30 个周期一次)。"""
+        """从 DB rotation_config 表重新读取轮转参数(30 个周期一次)。
+        优化: rotation_config 值缓存 30 分钟，减少 CRDB RU。
+        """
         self._rotation_reload_countdown -= 1
         if self._rotation_reload_countdown > 0:
             return
 
         self._rotation_reload_countdown = 30
         try:
-            vals = {}
-            for key in ("rotation_active_window_size", "rotation_files_per_slot", "rotation_time_per_slot"):
-                val = await get_rotation_config(key)
-                if val and val.isdigit():
-                    vals[key.replace("rotation_", "")] = int(val)
+            # 内存缓存：30 分钟内不重复查 CRDB
+            if not hasattr(self, "_rotation_config_cache"):
+                self._rotation_config_cache: dict[str, str | None] = {}
+                self._rotation_config_cache_ts: float = 0
+            now_ts = time.time()
+            if self._rotation_config_cache and (now_ts - self._rotation_config_cache_ts) < 1800:
+                # 缓存命中，直接用缓存值
+                vals = self._rotation_config_cache
+            else:
+                vals = {}
+                for key in ("rotation_active_window_size", "rotation_files_per_slot", "rotation_time_per_slot"):
+                    val = await get_rotation_config(key)
+                    if val and val.isdigit():
+                        vals[key.replace("rotation_", "")] = int(val)
+                self._rotation_config_cache = vals
+                self._rotation_config_cache_ts = now_ts
             # .env 兜底
             if "files_per_slot" not in vals:
                 vals["files_per_slot"] = getattr(settings, "ROTATION_FILES_PER_SLOT", 500)

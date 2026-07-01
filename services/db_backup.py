@@ -10,7 +10,16 @@ from storage.r2 import _r2 as r2_storage
 
 
 async def backup_all_tables() -> dict:
-    """动态发现所有用户表并备份,排除 CockroachDB 系统表。"""
+    """动态发现所有用户表并备份，排除 CockroachDB 系统表和大表。
+
+    排除策略：
+    - decode_logs / jobs：大表，全表扫描消耗大量 RU，不备份
+    - message_backups：可能很大，不备份
+    - 其余元数据表（users, file_records, cells, codes, rotate_log 等）正常备份
+    """
+    # 大表黑名单：全表扫描 RU 太高，不备份
+    SKIP_TABLES = {"decode_logs", "jobs", "message_backups"}
+
     results = {}
     async with db_client._pool.acquire() as conn:
         # 动态查询所有用户表(排除系统 schema)
@@ -36,6 +45,9 @@ async def backup_all_tables() -> dict:
         allowed = set(ALL_TABLES)
         for table in table_names:
             if table not in allowed:
+                continue
+            if table in SKIP_TABLES:
+                logger.debug(f"跳过备份大表: {table}")
                 continue
             records = await conn.fetch("SELECT * FROM \"{}\"".format(table))
             results[table] = [dict(r) for r in records]
