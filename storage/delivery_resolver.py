@@ -93,8 +93,16 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
             all_cells = cached_cells
 
     if all_cells is None:
-        col = get_cells_col()
-        all_cells = list(await col.find({}))
+        # 优先从 SQLite 快照加载（0 RU）
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        cells, _ = await store.load_cells_snapshot()
+        if cells:
+            all_cells = cells
+        else:
+            # SQLite 无数据时 CRDB 兜底（仅启动早期）
+            col = get_cells_col()
+            all_cells = list(await col.find({}))
 
     if not all_cells:
         return DeliveryChannel(channel_id, "unknown", "fallback")

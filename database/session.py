@@ -12,9 +12,9 @@ from typing import Any, Optional
 import asyncpg
 from loguru import logger
 
-# SQL 查询日志开关（默认开启用于诊断，调试后改回 "0"）
+# SQL 查询日志开关（默认关闭，开启用 ENABLE_SQL_LOG=1）
 import os as _os
-_SQL_LOG_ENABLED = _os.getenv("ENABLE_SQL_LOG", "1") == "1"
+_SQL_LOG_ENABLED = _os.getenv("ENABLE_SQL_LOG", "0") == "1"
 
 
 def _json_dumps(obj, **kwargs):

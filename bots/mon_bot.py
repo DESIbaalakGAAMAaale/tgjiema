@@ -248,6 +248,8 @@ class MonBot:
                     "updated_at": now.isoformat(),
                 }},
             )
+            # 同步更新 SQLite 快照（0 RU），避免其他进程 CRDB 兜底
+            asyncio.ensure_future(self._save_cells_to_sqlite())
             await log_rotate(
                 from_slot_id=slot_id, to_slot_id=slot_id,
                 from_status=status, to_status=status,
@@ -269,6 +271,8 @@ class MonBot:
             # 标记为 lost
             if status in ("active", "shadow1", "shadow2"):
                 await set_cell_status(slot_id, "lost")
+                # 同步更新 SQLite 快照（0 RU）
+                asyncio.ensure_future(self._save_cells_to_sqlite())
                 await log_rotate(
                     from_slot_id=slot_id, to_slot_id="NONE",
                     from_status=status, to_status="lost",
