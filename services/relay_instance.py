@@ -194,6 +194,16 @@ class RelayInstance:
                 return False
             self.is_busy = True
         try:
+            # 检查冷却期
+            from database.relay_db import get_relay_db
+            relay_db = await get_relay_db()
+            cooldown = await relay_db.get_bot_cooldown(bot_username)
+            if cooldown > 0:
+                logger.info(
+                    f"[RelayInstance:{self.phone}] @{bot_username} 在冷却期，"
+                    f"等待 {cooldown:.0f}s"
+                )
+                await asyncio.sleep(cooldown)
             return await self._do_send_external_code(bot_username, code, user_id)
         finally:
             self.is_busy = False
@@ -520,6 +530,10 @@ class RelayInstance:
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
                         exchange["_last_click_time"] = asyncio.get_event_loop().time() + wait_sec
+                    # 记录冷却到本地 SQLite
+                    from database.relay_db import get_relay_db
+                    relay_db = await get_relay_db()
+                    await relay_db.set_bot_cooldown(bot_username, int(wait_sec))
                     await asyncio.sleep(wait_sec)
                     continue
                 elif action == "click_button":

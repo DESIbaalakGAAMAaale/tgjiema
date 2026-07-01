@@ -55,6 +55,18 @@ class RelayPool:
             logger.info(f"[RelayPool] 启动完成: {ready_count}/{len(self.instances)} 个账号就绪")
         else:
             logger.warning("[RelayPool] 没有可用的中继账号")
+        # 启动定期清理过期冷却记录
+        asyncio.create_task(self._cleanup_cooldowns_loop())
+
+    async def _cleanup_cooldowns_loop(self):
+        """每 10 分钟清理一次过期冷却记录。"""
+        while True:
+            await asyncio.sleep(600)
+            try:
+                db = await get_relay_db()
+                await db.cleanup_cooldowns()
+            except Exception as e:
+                logger.debug(f"[RelayPool] 清理冷却记录异常: {e}")
 
     async def get_best_account(self) -> RelayInstance | None:
         """

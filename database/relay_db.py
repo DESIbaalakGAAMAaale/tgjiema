@@ -115,6 +115,14 @@ CREATE TABLE IF NOT EXISTS relay_log (
     error       TEXT,
     created_at  TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS bot_cooldown (
+    bot_username     TEXT PRIMARY KEY,
+    cooldown_seconds INTEGER NOT NULL DEFAULT 0,
+    last_decode_at   TEXT,
+    created_at       TEXT DEFAULT (datetime('now')),
+    updated_at       TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -303,6 +311,53 @@ class RelayDB:
             (relay_id, action, code, bot_target, duration_ms, error),
         )
         await self._db.commit()
+
+    # ─── bot_cooldown ──
+
+    async def get_bot_cooldown(self, bot_username: str) -> float:
+        """检查机器人是否在冷却期，返回剩余冷却秒数（0 表示不在冷却期）。"""
+        cursor = await self._db.execute(
+            "SELECT cooldown_seconds, last_decode_at FROM bot_cooldown WHERE bot_username = ?",
+            (bot_username.lower(),),
+        )
+        row = await cursor.fetchone()
+        if not row or not row[1]:
+            return 0
+        try:
+            last_at = datetime.fromisoformat(row[1])
+        except (ValueError, TypeError):
+            return 0
+        elapsed = (datetime.utcnow() - last_at).total_seconds()
+        return max(0, row[0] - elapsed)
+
+    async def set_bot_cooldown(self, bot_username: str, cooldown_seconds: int):
+        """记录机器人的冷却时间（从解码器返回的限速文本中提取）。"""
+        now = datetime.utcnow().isoformat()
+        logger.info(f"[RelayDB] 设置 @{bot_username} 冷却 {cooldown_seconds}s")
+        await self._db.execute(
+            """INSERT INTO bot_cooldown (bot_username, cooldown_seconds, last_decode_at, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(bot_username) DO UPDATE SET
+               cooldown_seconds=excluded.cooldown_seconds,
+               last_decode_at=excluded.last_decode_at,
+               updated_at=excluded.updated_at""",
+            (bot_username.lower(), cooldown_seconds, now, now),
+        )
+        await self._db.commit()
+
+    async def cleanup_cooldowns(self):
+        """清理已过期的冷却记录，防止无用堆积。"""
+        now = datetime.utcnow().isoformat()
+        cursor = await self._db.execute(
+            """DELETE FROM bot_cooldown
+               WHERE last_decode_at IS NOT NULL
+               AND datetime(last_decode_at, '+' || cooldown_seconds || ' seconds') < ?""",
+            (now,),
+        )
+        deleted = cursor.rowcount
+        await self._db.commit()
+        if deleted > 0:
+            logger.debug(f"[RelayDB] 清理 {deleted} 条过期 bot_cooldown 记录")
 
 
 def date_today() -> str:

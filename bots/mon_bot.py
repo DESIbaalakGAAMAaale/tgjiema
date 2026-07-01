@@ -104,10 +104,13 @@ class MonBot:
             self._cells_cache_ts = now
             return self._cells_cache
 
-        # CRDB 兜底
+        # CRDB 兜底，并写入 SQLite 供后续使用
+        logger.info("[Mon] cells 缓存未命中，从 CRDB 加载并写入 SQLite")
         col = get_cells_col()
         self._cells_cache = await col.find({})
         self._cells_cache_ts = now
+        # 写入 SQLite 快照，避免后续继续查 CRDB
+        asyncio.ensure_future(self._save_cells_to_sqlite())
         return self._cells_cache
 
     def _invalidate_cells_cache(self):
