@@ -329,7 +329,12 @@ class CockroachDBClient:
         # ─── 启动时预填充 cells 快照到 SQLite ───
         # 避免 Mon Bot 首次运行时回退到 CRDB（SELECT * FROM cells）
         try:
-            cells, _ = await store.load_cells_snapshot()
+            cells = await store.get_all_cells_local()
+            if not cells:
+                snap_cells, _ = await store.load_cells_snapshot()
+                if snap_cells:
+                    await store.bulk_upsert_cells_local(snap_cells)
+                    cells = snap_cells
             if not cells:
                 col = D1Collection("cells")
                 all_cells = await col.find({}, projection=[
@@ -338,10 +343,10 @@ class CockroachDBClient:
                     "file_count", "rotation_started_at", "last_heartbeat",
                 ])
                 if all_cells:
-                    await store.save_cells_snapshot(all_cells, int(_time.time()))
-                    logger.info(f"[DB] 预填充 cells 快照到 SQLite: {len(all_cells)} 条")
+                    await store.bulk_upsert_cells_local(all_cells)
+                    logger.info(f"[DB] 预填充 cells 到本地 SQLite: {len(all_cells)} 条")
         except Exception:
-            pass  # cells 快照非关键，静默失败
+            pass
 
     async def close(self):
         if self._pool:
@@ -1922,9 +1927,9 @@ async def get_active_cells_local() -> list[dict]:
     store = get_cache_store()
 
     if _cells_local_cache is None:
-        cells = await store.get_active_cells_local()
-        if cells:
-            _cells_local_cache = await store.get_all_cells_local()
+        all_cells = await store.get_all_cells_local()
+        if all_cells:
+            _cells_local_cache = all_cells
             _cells_local_version = int(_time.time() * 1000)
         else:
             snap_cells, version = await store.load_cells_snapshot()
@@ -1936,9 +1941,9 @@ async def get_active_cells_local() -> list[dict]:
 
     has_change, new_version = await store.has_cells_change(_cells_local_version)
     if has_change:
-        cells = await store.get_all_cells_local()
-        if cells:
-            _cells_local_cache = cells
+        all_cells = await store.get_all_cells_local()
+        if all_cells:
+            _cells_local_cache = all_cells
             _cells_local_version = new_version
         else:
             snap_cells, version = await store.load_cells_snapshot()

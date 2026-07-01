@@ -210,9 +210,11 @@ class MonScheduler:
         batch_updates.append((failed_slot["slot_id"], {
             "status": "lost",
             "degrade_count": new_degrade_count,
+            "next_active_chat_id": None,
         }, True))
         failed_slot["status"] = "lost"
         failed_slot["degrade_count"] = new_degrade_count
+        failed_slot["next_active_chat_id"] = None
         log_entries.append((
             failed_slot["slot_id"], promote_slot["slot_id"] if promote_slot else "none",
             old_status, "lost",

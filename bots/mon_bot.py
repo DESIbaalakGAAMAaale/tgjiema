@@ -148,7 +148,7 @@ class MonBot:
                 "rotation_time_per_slot": ("time_per_slot", int, 3600),
             }
             for cfg_key, (local_key, cast_fn, default) in key_map.items():
-                local_val = await store.get_kv(f"rot_{cfg_key}")
+                local_val = await store.get_kv(f"rotconf:{cfg_key}")
                 if local_val is not None:
                     try:
                         val = cast_fn(local_val)
@@ -158,11 +158,11 @@ class MonBot:
                     crdb_val = await get_rotation_config(cfg_key)
                     if crdb_val and crdb_val.isdigit():
                         val = int(crdb_val)
-                        await store.set_kv(f"rot_{cfg_key}", str(val))
+                        await store.set_kv(f"rotconf:{cfg_key}", str(val))
                     else:
                         env_key = local_key.upper()
                         val = getattr(settings, f"ROTATION_{env_key}", default)
-                        await store.set_kv(f"rot_{cfg_key}", str(val))
+                        await store.set_kv(f"rotconf:{cfg_key}", str(val))
                 old = self._rotation.get(local_key, 0)
                 if old != val:
                     changed = True
@@ -389,6 +389,7 @@ class MonBot:
             if nxt:
                 next_reverse.setdefault(nxt, []).append(c)
 
+        demoted_slot_ids: set[str] = set()
         for cell in to_demote:
             sid = cell["slot_id"]
             m = re.match(r'[as](\d+)', sid)
@@ -399,6 +400,7 @@ class MonBot:
             if not group:
                 continue
             demoted_slots.append(cell)
+            demoted_slot_ids.add(sid)
             promote, cascade = self.scheduler._get_next_promotable(group)
             if promote:
                 promoted_slots.append((promote, cell))
@@ -406,7 +408,7 @@ class MonBot:
                     cascade_slots.append(cascade)
                 preds = next_reverse.get(cell["channel_id"], [])
                 for pred in preds:
-                    if pred["slot_id"] != cell["slot_id"]:
+                    if pred["slot_id"] != cell["slot_id"] and pred["slot_id"] not in demoted_slot_ids:
                         ring_repairs.append((pred["slot_id"], promote["channel_id"]))
             else:
                 logger.warning(f"[Mon][Rotation] {sid} 无可用 shadow 提升,仅休眠不替换")
@@ -415,17 +417,23 @@ class MonBot:
             logger.warning("[Mon][Rotation] 无可提升的 shadow 槽位,跳过轮转")
             return False
 
+        demoted_ch_to_promoted_ch: dict[int, int] = {}
+        for promote_slot, from_cell in promoted_slots:
+            demoted_ch_to_promoted_ch[from_cell["channel_id"]] = promote_slot["channel_id"]
+
         for cell in demoted_slots:
             if cell.get("status") != "shadow1":
                 batch_updates.append((cell["slot_id"], {
-                    "status": "shadow1", "file_count": 0,
+                    "status": "shadow1", "file_count": 0, "next_active_chat_id": None,
                 }, False))
                 self._update_cell_in_cache(cell["slot_id"], {
-                    "status": "shadow1", "file_count": 0,
+                    "status": "shadow1", "file_count": 0, "next_active_chat_id": None,
                 })
 
         for promote_slot, from_cell in promoted_slots:
             nxt = from_cell.get("next_active_chat_id")
+            if nxt and nxt in demoted_ch_to_promoted_ch:
+                nxt = demoted_ch_to_promoted_ch[nxt]
             batch_updates.append((promote_slot["slot_id"], {
                 "status": "active", "next_active_chat_id": nxt,
                 "file_count": 0, "rotation_started_at": now_iso,
@@ -440,6 +448,8 @@ class MonBot:
             self._update_cell_in_cache(cascade_slot["slot_id"], {"status": "shadow1"})
 
         for prev_slot_id, new_next in ring_repairs:
+            if new_next and new_next in demoted_ch_to_promoted_ch:
+                new_next = demoted_ch_to_promoted_ch[new_next]
             batch_updates.append((prev_slot_id, {"next_active_chat_id": new_next}, False))
             self._update_cell_in_cache(prev_slot_id, {"next_active_chat_id": new_next})
 

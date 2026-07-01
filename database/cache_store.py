@@ -859,10 +859,12 @@ class CacheStore:
     async def update_cell_fields_local(self, slot_id: str, fields: dict, mark_dirty: bool = False):
         """更新本地 cell 的若干字段（零 CRDB RU）。
         mark_dirty=True 时标记为需同步到 CRDB（异常事件用）。
+        若更新涉及 status/next_active_chat_id（路由关键字段），自动重建 JSON 快照。
         """
         if not self._db or not fields:
             return
         now = time.time()
+        routing_changed = bool(set(fields.keys()) & {"status", "next_active_chat_id"})
         set_parts = []
         params = []
         for k, v in fields.items():
@@ -880,7 +882,10 @@ class CacheStore:
             try:
                 await self._db.execute(sql, params)
                 await self._db.commit()
-                await self._bump_cells_version(now)
+                if routing_changed:
+                    await self._rebuild_cells_snapshot()
+                else:
+                    await self._bump_cells_version(now)
                 return
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 2:
@@ -892,10 +897,15 @@ class CacheStore:
         """原子批量更新多个 cell（零 CRDB RU）。
         updates: [(slot_id, {fields}, mark_dirty), ...]
         所有更新在一个 SQLite 事务中完成，保证原子性。
+        若更新涉及 status/next_active_chat_id（路由关键字段），自动重建 JSON 快照。
         """
         if not self._db or not updates:
             return
         now = time.time()
+        routing_changed = any(
+            bool(set(fields.keys()) & {"status", "next_active_chat_id"})
+            for _, fields, _ in updates
+        )
         for attempt in range(3):
             try:
                 await self._db.execute("BEGIN IMMEDIATE")
@@ -921,7 +931,10 @@ class CacheStore:
                 except Exception:
                     await self._db.rollback()
                     raise
-                await self._bump_cells_version(now)
+                if routing_changed:
+                    await self._rebuild_cells_snapshot()
+                else:
+                    await self._bump_cells_version(now)
                 return
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 2:
