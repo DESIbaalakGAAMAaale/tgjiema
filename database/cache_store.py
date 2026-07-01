@@ -129,6 +129,27 @@ class CacheStore:
                 ts      REAL NOT NULL
             )"""
         )
+        # ─── E2: cells 本地逐行存储(热路径零CRDB,仅异常事件同步CRDB) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS cells_local (
+                slot_id TEXT PRIMARY KEY,
+                channel_id BIGINT NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'shadow1',
+                next_active_chat_id BIGINT,
+                account_name TEXT DEFAULT '',
+                is_r100 INTEGER DEFAULT 0,
+                last_heartbeat TEXT,
+                last_synced_msg_id BIGINT DEFAULT 0,
+                degrade_count INTEGER DEFAULT 0,
+                file_count INTEGER DEFAULT 0,
+                rotation_started_at TEXT,
+                updated_at REAL NOT NULL,
+                crdb_synced INTEGER DEFAULT 1
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cells_local_status ON cells_local(status)"
+        )
         # ─── KV 键值存储：用于缓存 DDL 版本等配置 ───
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS kv_store (
@@ -323,10 +344,14 @@ class CacheStore:
     # ─── 心跳本地存储：Mon Bot 写入 SQLite，零 CRDB RU ───
 
     async def write_heartbeat(self, slot_id: str, ok: bool):
-        """写入本地心跳记录。ok=True 时重置 fail_streak，ok=False 时递增。"""
+        """写入本地心跳记录。ok=True 时重置 fail_streak，ok=False 时递增。
+        同时更新 cells_local.last_heartbeat（ISO 格式）供降级 cooldown 判断使用。
+        """
         if not self._db:
             return
         now = time.time()
+        import datetime as _dt
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
         if ok:
             await self._db.execute(
                 "INSERT INTO heartbeat_local (slot_id, last_ok, fail_streak) VALUES (?, ?, 0) "
@@ -339,6 +364,10 @@ class CacheStore:
                 "ON CONFLICT(slot_id) DO UPDATE SET last_ok = ?, fail_streak = fail_streak + 1",
                 (slot_id, now, now),
             )
+        await self._db.execute(
+            "UPDATE cells_local SET last_heartbeat = ?, updated_at = ? WHERE slot_id = ?",
+            (now_iso, now, slot_id),
+        )
         await self._db.commit()
 
     async def get_all_heartbeats(self) -> dict[str, dict]:
@@ -782,6 +811,247 @@ class CacheStore:
         )
         new_version = row[0][0] if row and row[0][0] else last_version
         return new_version > last_version, new_version
+
+    # ─── E2: cells 本地逐行存储（热路径零 CRDB RU） ───
+
+    async def bulk_upsert_cells_local(self, cells: list[dict]):
+        """初始化/全量同步:批量写入 cells 到本地表(crdb_synced=1,视为已同步)"""
+        if not self._db or not cells:
+            return
+        now = time.time()
+        rows = []
+        for c in cells:
+            rows.append((
+                c["slot_id"],
+                c.get("channel_id", 0),
+                c.get("status", "shadow1"),
+                c.get("next_active_chat_id"),
+                c.get("account_name", ""),
+                c.get("is_r100", 0),
+                c.get("last_heartbeat"),
+                c.get("last_synced_msg_id", 0),
+                c.get("degrade_count", 0),
+                c.get("file_count", 0),
+                c.get("rotation_started_at"),
+                now,
+                1,
+            ))
+        for attempt in range(3):
+            try:
+                await self._db.executemany(
+                    """INSERT OR REPLACE INTO cells_local
+                    (slot_id, channel_id, status, next_active_chat_id, account_name,
+                     is_r100, last_heartbeat, last_synced_msg_id, degrade_count,
+                     file_count, rotation_started_at, updated_at, crdb_synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+                await self._db.commit()
+                await self._rebuild_cells_snapshot()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                logger.warning(f"[CacheStore] bulk_upsert_cells_local 失败: {e}")
+                return
+
+    async def update_cell_fields_local(self, slot_id: str, fields: dict, mark_dirty: bool = False):
+        """更新本地 cell 的若干字段（零 CRDB RU）。
+        mark_dirty=True 时标记为需同步到 CRDB（异常事件用）。
+        """
+        if not self._db or not fields:
+            return
+        now = time.time()
+        set_parts = []
+        params = []
+        for k, v in fields.items():
+            if k in ("slot_id",):
+                continue
+            set_parts.append(f"{k} = ?")
+            params.append(v)
+        set_parts.append("updated_at = ?")
+        params.append(now)
+        if mark_dirty:
+            set_parts.append("crdb_synced = 0")
+        params.append(slot_id)
+        sql = f"UPDATE cells_local SET {', '.join(set_parts)} WHERE slot_id = ?"
+        for attempt in range(3):
+            try:
+                await self._db.execute(sql, params)
+                await self._db.commit()
+                await self._bump_cells_version(now)
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.2)
+                    continue
+                return
+
+    async def batch_update_cells_local(self, updates: list[tuple[str, dict, bool]]):
+        """原子批量更新多个 cell（零 CRDB RU）。
+        updates: [(slot_id, {fields}, mark_dirty), ...]
+        所有更新在一个 SQLite 事务中完成，保证原子性。
+        """
+        if not self._db or not updates:
+            return
+        now = time.time()
+        for attempt in range(3):
+            try:
+                await self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    for slot_id, fields, mark_dirty in updates:
+                        if not fields:
+                            continue
+                        set_parts = []
+                        params = []
+                        for k, v in fields.items():
+                            if k in ("slot_id",):
+                                continue
+                            set_parts.append(f"{k} = ?")
+                            params.append(v)
+                        set_parts.append("updated_at = ?")
+                        params.append(now)
+                        if mark_dirty:
+                            set_parts.append("crdb_synced = 0")
+                        params.append(slot_id)
+                        sql = f"UPDATE cells_local SET {', '.join(set_parts)} WHERE slot_id = ?"
+                        await self._db.execute(sql, params)
+                    await self._db.commit()
+                except Exception:
+                    await self._db.rollback()
+                    raise
+                await self._bump_cells_version(now)
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                logger.warning(f"[CacheStore] batch_update_cells_local 失败: {e}")
+                return
+
+    async def increment_cell_file_count_local(self, slot_id: str, delta: int = 1):
+        """原子递增 file_count（Up Bot 上传文件后调用，零 CRDB RU）"""
+        if not self._db:
+            return
+        now = time.time()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "UPDATE cells_local SET file_count = file_count + ?, updated_at = ? WHERE slot_id = ?",
+                    (delta, now, slot_id),
+                )
+                await self._db.commit()
+                await self._bump_cells_version(now)
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.2)
+                    continue
+                return
+
+    async def get_all_cells_local(self) -> list[dict]:
+        """从本地表读取全部 cells，返回 dict 列表（零 CRDB RU）"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT slot_id, channel_id, status, next_active_chat_id, account_name,
+                      is_r100, last_heartbeat, last_synced_msg_id, degrade_count,
+                      file_count, rotation_started_at
+               FROM cells_local ORDER BY slot_id"""
+        )
+        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "account_name",
+                "is_r100", "last_heartbeat", "last_synced_msg_id", "degrade_count",
+                "file_count", "rotation_started_at"]
+        result = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["is_r100"] = int(d["is_r100"] or 0)
+            d["degrade_count"] = int(d["degrade_count"] or 0)
+            d["file_count"] = int(d["file_count"] or 0)
+            d["last_synced_msg_id"] = int(d["last_synced_msg_id"] or 0)
+            if d["next_active_chat_id"]:
+                d["next_active_chat_id"] = int(d["next_active_chat_id"])
+            result.append(d)
+        return result
+
+    async def get_active_cells_local(self) -> list[dict]:
+        """从本地表读取 status=active 的 cells（零 CRDB RU）"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT slot_id, channel_id, status, next_active_chat_id, account_name,
+                      is_r100, last_heartbeat, last_synced_msg_id, degrade_count,
+                      file_count, rotation_started_at
+               FROM cells_local WHERE status = 'active'"""
+        )
+        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "account_name",
+                "is_r100", "last_heartbeat", "last_synced_msg_id", "degrade_count",
+                "file_count", "rotation_started_at"]
+        result = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["is_r100"] = int(d["is_r100"] or 0)
+            d["degrade_count"] = int(d["degrade_count"] or 0)
+            d["file_count"] = int(d["file_count"] or 0)
+            d["last_synced_msg_id"] = int(d["last_synced_msg_id"] or 0)
+            if d["next_active_chat_id"]:
+                d["next_active_chat_id"] = int(d["next_active_chat_id"])
+            result.append(d)
+        return result
+
+    async def get_dirty_cells_local(self, limit: int = 50) -> list[dict]:
+        """获取需要同步到 CRDB 的脏 cells（异常事件）"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT slot_id, channel_id, status, next_active_chat_id, account_name,
+                      is_r100, degrade_count
+               FROM cells_local WHERE crdb_synced = 0 LIMIT ?""",
+            (limit,),
+        )
+        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "account_name",
+                "is_r100", "degrade_count"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def mark_cell_synced_local(self, slot_id: str):
+        """标记 cell 已同步到 CRDB"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE cells_local SET crdb_synced = 1 WHERE slot_id = ?",
+            (slot_id,),
+        )
+        await self._db.commit()
+
+    async def _rebuild_cells_snapshot(self):
+        """从 cells_local 重建 JSON 快照，保持向后兼容（其他 Bot 读 snapshot）"""
+        if not self._db:
+            return
+        cells = await self.get_all_cells_local()
+        try:
+            raw = json.dumps(cells, default=str)
+            val = raw.decode() if isinstance(raw, bytes) else raw
+        except Exception:
+            return
+        now = time.time()
+        version = int(now * 1000)
+        await self._db.execute(
+            "INSERT OR REPLACE INTO cells_snapshot (id, data, version, updated_at) VALUES (1, ?, ?, ?)",
+            (val, version, now),
+        )
+        await self._bump_cells_version(now)
+
+    async def _bump_cells_version(self, ts: float):
+        """写入变更通知 + 递增版本号"""
+        if not self._db:
+            return
+        version = int(ts * 1000)
+        await self._db.execute(
+            "INSERT INTO cells_change_notify (version, ts) VALUES (?, ?)",
+            (version, ts),
+        )
+        await self._db.commit()
 
     # ─── KV 键值存储（0 CRDB RU）───
 

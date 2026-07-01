@@ -19,11 +19,10 @@ from telegram.error import TelegramError
 
 from config import settings
 from database import (
-    init_db, close_db, get_cells_col, get_active_cells,
-    set_cell_status, log_rotate,
+    init_db, close_db, get_cells_col,
+    log_rotate,
     add_spare_channel, get_spare_for_account, get_any_spare,
     consume_spare, get_rotation_config, set_rotation_config,
-    _client,
 )
 from database.cache_store import get_cache_store
 from services.mon import MonScheduler
@@ -82,107 +81,93 @@ class MonBot:
         self._cells_cache_ts: float = 0
 
     async def _get_cells(self) -> list[dict]:
-        """获取全量 cells，SQLite 优先，CRDB 兜底。
+        """获取全量 cells，本地 SQLite 优先（零 CRDB RU），CRDB 仅首次兜底。
 
-        缓存策略:
-        - 优先读 SQLite 快照（Mon 自己写入的，0 RU）
-        - 缓存 300 秒，超时后重新加载 SQLite
-        - 每 10 周期强制重载（兜底其他进程写入）
-        - 写入 cells 后（轮转/降级/封禁）主动失效
+        热路径数据（status/next_active_chat_id/file_count/rotation_started_at/last_synced_msg_id）
+        全部从本地 SQLite 读取。CRDB 仅在首次启动本地无数据时读取一次做 bootstrap。
         """
         now = time.time()
         if self._cycle_count % 10 == 0:
             self._cells_cache = None
-        if self._cells_cache and (now - self._cells_cache_ts) < 300:
+        if self._cells_cache and (now - self._cells_cache_ts) < 60:
             return self._cells_cache
 
-        # 优先读 SQLite 快照（0 RU）
-        from database.cache_store import get_cache_store
         store = get_cache_store()
-        cells, version = await store.load_cells_snapshot()
+        cells = await store.get_all_cells_local()
         if cells:
             self._cells_cache = cells
             self._cells_cache_ts = now
             return self._cells_cache
 
-        # CRDB 兜底（仅启动时 SQLite 无数据时触发一次）
-        logger.info("[Mon] cells 缓存未命中，从 CRDB 加载并写入 SQLite")
+        logger.info("[Mon] 本地 cells 为空，从 CRDB 加载并写入本地（bootstrap）")
         col = get_cells_col()
-        self._cells_cache = await col.find({}, projection=[
+        crdb_cells = await col.find({}, projection=[
             "slot_id", "channel_id", "status", "next_active_chat_id",
-            "prev_slot_id", "account_name", "is_r100",
-            "file_count", "rotation_started_at", "last_heartbeat",
+            "account_name", "is_r100", "last_heartbeat",
+            "file_count", "rotation_started_at", "last_synced_msg_id",
+            "degrade_count",
         ])
+        if not crdb_cells:
+            return []
+        await store.bulk_upsert_cells_local(crdb_cells)
+        self._cells_cache = await store.get_all_cells_local()
         self._cells_cache_ts = now
-        # 写入 SQLite 快照，避免后续继续查 CRDB
-        asyncio.ensure_future(self._save_cells_to_sqlite())
+        logger.info(f"[Mon] Bootstrap 完成: {len(self._cells_cache)} 条 cells 写入本地")
         return self._cells_cache
 
     def _invalidate_cells_cache(self):
-        """写入 cells 后调用,下次循环自动重载。"""
+        """下次循环重新从本地 SQLite 加载 cells。"""
         self._cells_cache = None
-        # E1: 异步保存 cells 快照到 SQLite 供其他进程使用
-        try:
-            asyncio.ensure_future(self._save_cells_to_sqlite())
-        except Exception:
-            pass
+        self._cells_cache_ts = 0
 
-    async def _save_cells_to_sqlite(self):
-        """E1: 将当前 cells 全量保存到本地 SQLite"""
-        from database.cache_store import get_cache_store
-        try:
-            cells = await self._get_cells()
-            if not cells:
-                logger.warning("[Mon] _save_cells_to_sqlite: cells 为空，跳过写入")
-                return
-            version = int(time.time())
-            store = get_cache_store()
-            await store.save_cells_snapshot(cells, version)
-            logger.debug(f"[Mon] cells 快照已写入 SQLite: {len(cells)} 条, version={version}")
-        except Exception as e:
-            logger.error(f"[Mon] _save_cells_to_sqlite 失败: {e}")
+    def _update_cell_in_cache(self, slot_id: str, updates: dict):
+        """在内存缓存中更新某个 cell 的字段（本地写入后立即生效，无需等下次加载）。"""
+        if not self._cells_cache:
+            return
+        for c in self._cells_cache:
+            if c["slot_id"] == slot_id:
+                for k, v in updates.items():
+                    c[k] = v
+                break
 
     async def _reload_rotation_config(self):
-        """从 DB rotation_config 表重新读取轮转参数(30 个周期一次)。
-        优化: rotation_config 值缓存 30 分钟，减少 CRDB RU。
+        """从本地 KV 读取轮转参数(30 个周期一次, 零 CRDB RU)。
+        首次无本地值时从 CRDB 读取一次并写入本地 KV，后续全部走本地。
         """
         self._rotation_reload_countdown -= 1
         if self._rotation_reload_countdown > 0:
             return
 
         self._rotation_reload_countdown = 30
+        store = get_cache_store()
         try:
-            # 内存缓存：30 分钟内不重复查 CRDB
-            if not hasattr(self, "_rotation_config_cache"):
-                self._rotation_config_cache: dict[str, str | None] = {}
-                self._rotation_config_cache_ts: float = 0
-            now_ts = time.time()
-            if self._rotation_config_cache and (now_ts - self._rotation_config_cache_ts) < 1800:
-                # 缓存命中，直接用缓存值
-                vals = self._rotation_config_cache
-            else:
-                vals = {}
-                for key in ("rotation_active_window_size", "rotation_files_per_slot", "rotation_time_per_slot"):
-                    val = await get_rotation_config(key)
-                    if val and val.isdigit():
-                        vals[key.replace("rotation_", "")] = int(val)
-                self._rotation_config_cache = vals
-                self._rotation_config_cache_ts = now_ts
-            # .env 兜底
-            if "files_per_slot" not in vals:
-                vals["files_per_slot"] = getattr(settings, "ROTATION_FILES_PER_SLOT", 500)
-            if "time_per_slot" not in vals:
-                vals["time_per_slot"] = getattr(settings, "ROTATION_TIME_PER_SLOT", 3600)
-            if "active_window_size" not in vals:
-                vals["active_window_size"] = getattr(settings, "ROTATION_ACTIVE_WINDOW_SIZE", 3)
-
             changed = False
-            for k, v in vals.items():
-                old = self._rotation.get(k, 0)
-                if old != v:
+            key_map = {
+                "rotation_active_window_size": ("active_window_size", int, 3),
+                "rotation_files_per_slot": ("files_per_slot", int, 500),
+                "rotation_time_per_slot": ("time_per_slot", int, 3600),
+            }
+            for cfg_key, (local_key, cast_fn, default) in key_map.items():
+                local_val = await store.get_kv(f"rot_{cfg_key}")
+                if local_val is not None:
+                    try:
+                        val = cast_fn(local_val)
+                    except (ValueError, TypeError):
+                        val = default
+                else:
+                    crdb_val = await get_rotation_config(cfg_key)
+                    if crdb_val and crdb_val.isdigit():
+                        val = int(crdb_val)
+                        await store.set_kv(f"rot_{cfg_key}", str(val))
+                    else:
+                        env_key = local_key.upper()
+                        val = getattr(settings, f"ROTATION_{env_key}", default)
+                        await store.set_kv(f"rot_{cfg_key}", str(val))
+                old = self._rotation.get(local_key, 0)
+                if old != val:
                     changed = True
-                    logger.info(f"[Mon][Config] {k}: {old} → {v}")
-                self._rotation[k] = v
+                    logger.info(f"[Mon][Config] {local_key}: {old} → {val}")
+                self._rotation[local_key] = val
 
             if changed:
                 logger.info(f"[Mon][Config] 轮转参数已更新: {self._rotation}")
@@ -224,13 +209,15 @@ class MonBot:
             logger.warning(f"[Mon][Notify] 发送通知失败: {e}")
 
     async def _handle_channel_ban(self, cell: dict, error: str):
-        """处理频道封禁/丢失:通知管理员 + 尝试从备用池补充。"""
+        """处理频道封禁/丢失:通知管理员 + 尝试从备用池补充。
+        异常事件: CRDB 写入审计(log_rotate), 本地同步更新缓存。
+        """
         slot_id = cell.get("slot_id", "?")
         channel_id = cell.get("channel_id", 0)
         account_name = cell.get("account_name", "未知")
         status = cell.get("status", "?")
+        store = get_cache_store()
 
-        # ── 1. 通知管理员 ──
         notify_msg = (
             f"🚨 频道封禁告警\n\n"
             f"槽位: {slot_id}\n"
@@ -240,7 +227,6 @@ class MonBot:
             f"错误: {error}\n\n"
         )
 
-        # ── 2. 尝试从备用池补充 ──
         spare = None
         spare_source = ""
 
@@ -255,25 +241,34 @@ class MonBot:
         if spare:
             spare_ch = spare["channel_id"]
             await consume_spare(spare_ch)
-            # 将备用频道写入 cells 表替换封禁频道
+            new_status = status if status in ("active", "shadow1", "shadow2", "r100") else "active"
+            now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
             col = get_cells_col()
-            now = _dt.datetime.now(_dt.timezone.utc)
             await col.update_one(
                 {"slot_id": slot_id},
                 {"$set": {
                     "channel_id": spare_ch,
-                    "status": status if status in ("active", "shadow1", "shadow2", "r100") else "active",
+                    "status": new_status,
                     "account_name": account_name,
                     "file_count": 0,
-                    "rotation_started_at": now.isoformat(),
-                    "updated_at": now.isoformat(),
+                    "rotation_started_at": now_iso,
+                    "updated_at": now_iso,
                 }},
             )
-            # 同步更新 SQLite 快照（0 RU），避免其他进程 CRDB 兜底
-            asyncio.ensure_future(self._save_cells_to_sqlite())
+            await store.update_cell_fields_local(slot_id, {
+                "channel_id": spare_ch,
+                "status": new_status,
+                "account_name": account_name,
+                "file_count": 0,
+                "rotation_started_at": now_iso,
+            }, mark_dirty=True)
+            self._update_cell_in_cache(slot_id, {
+                "channel_id": spare_ch, "status": new_status,
+                "file_count": 0, "rotation_started_at": now_iso,
+            })
             await log_rotate(
                 from_slot_id=slot_id, to_slot_id=slot_id,
-                from_status=status, to_status=status,
+                from_status=status, to_status=new_status,
                 reason=f"封禁替换: old={channel_id} → new={spare_ch} ({spare_source})",
                 triggered_by="mon",
             )
@@ -289,11 +284,15 @@ class MonBot:
                 "请通过管理员 Bot 添加备用频道:\n"
                 "/spare_add <频道ID> [账号名]\n"
             )
-            # 标记为 lost
             if status in ("active", "shadow1", "shadow2"):
-                await set_cell_status(slot_id, "lost")
-                # 同步更新 SQLite 快照（0 RU）
-                asyncio.ensure_future(self._save_cells_to_sqlite())
+                col = get_cells_col()
+                now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+                await col.update_one(
+                    {"slot_id": slot_id},
+                    {"$set": {"status": "lost", "updated_at": now_iso}},
+                )
+                await store.update_cell_fields_local(slot_id, {"status": "lost"}, mark_dirty=True)
+                self._update_cell_in_cache(slot_id, {"status": "lost"})
                 await log_rotate(
                     from_slot_id=slot_id, to_slot_id="NONE",
                     from_status=status, to_status="lost",
@@ -382,6 +381,7 @@ class MonBot:
         promoted_slots = []
         cascade_slots = []
         ring_repairs = []
+        batch_updates = []
 
         next_reverse: dict[int, list[dict]] = {}
         for c in active_cells:
@@ -402,7 +402,7 @@ class MonBot:
             promote, cascade = self.scheduler._get_next_promotable(group)
             if promote:
                 promoted_slots.append((promote, cell))
-                if cascade:
+                if cascade and cascade.get("status") != "shadow1":
                     cascade_slots.append(cascade)
                 preds = next_reverse.get(cell["channel_id"], [])
                 for pred in preds:
@@ -415,40 +415,43 @@ class MonBot:
             logger.warning("[Mon][Rotation] 无可提升的 shadow 槽位,跳过轮转")
             return False
 
-        async with _client.transaction() as conn:
-            for cell in demoted_slots:
-                if cell.get("status") != "shadow1":
-                    await conn.execute(
-                        "UPDATE cells SET status = $1, file_count = 0, rotation_started_at = $2 WHERE slot_id = $3",
-                        "shadow1", now_iso, cell["slot_id"],
-                    )
+        for cell in demoted_slots:
+            if cell.get("status") != "shadow1":
+                batch_updates.append((cell["slot_id"], {
+                    "status": "shadow1", "file_count": 0,
+                }, False))
+                self._update_cell_in_cache(cell["slot_id"], {
+                    "status": "shadow1", "file_count": 0,
+                })
 
-            for promote_slot, from_cell in promoted_slots:
-                nxt = from_cell.get("next_active_chat_id")
-                await conn.execute(
-                    "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3 WHERE slot_id = $4",
-                    "active", nxt, now_iso, promote_slot["slot_id"],
-                )
+        for promote_slot, from_cell in promoted_slots:
+            nxt = from_cell.get("next_active_chat_id")
+            batch_updates.append((promote_slot["slot_id"], {
+                "status": "active", "next_active_chat_id": nxt,
+                "file_count": 0, "rotation_started_at": now_iso,
+            }, False))
+            self._update_cell_in_cache(promote_slot["slot_id"], {
+                "status": "active", "next_active_chat_id": nxt,
+                "file_count": 0, "rotation_started_at": now_iso,
+            })
 
-            for cascade_slot in cascade_slots:
-                if cascade_slot.get("status") != "shadow1":
-                    await conn.execute(
-                        "UPDATE cells SET status = $1 WHERE slot_id = $2",
-                        "shadow1", cascade_slot["slot_id"],
-                    )
+        for cascade_slot in cascade_slots:
+            batch_updates.append((cascade_slot["slot_id"], {"status": "shadow1"}, False))
+            self._update_cell_in_cache(cascade_slot["slot_id"], {"status": "shadow1"})
 
-            for prev_slot_id, new_next in ring_repairs:
-                await conn.execute(
-                    "UPDATE cells SET next_active_chat_id = $1 WHERE slot_id = $2",
-                    new_next, prev_slot_id,
-                )
+        for prev_slot_id, new_next in ring_repairs:
+            batch_updates.append((prev_slot_id, {"next_active_chat_id": new_next}, False))
+            self._update_cell_in_cache(prev_slot_id, {"next_active_chat_id": new_next})
+
+        store = get_cache_store()
+        await store.batch_update_cells_local(batch_updates)
 
         for cell in demoted_slots:
             logger.info(f"[Mon][Rotation] 休眠 {cell['slot_id']}")
         for promote_slot, from_cell in promoted_slots:
             logger.info(f"[Mon][Rotation] 唤醒 {promote_slot['slot_id']}→active (替换 {from_cell['slot_id']})")
 
-        logger.info(f"[Mon][Rotation] 轮转完成: 休眠{len(demoted_slots)}个, 唤醒{len(promoted_slots)}个")
+        logger.info(f"[Mon][Rotation] 轮转完成: 休眠{len(demoted_slots)}个, 唤醒{len(promoted_slots)}个 (零CRDB)")
         return True
 
     async def start(self):

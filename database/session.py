@@ -1421,8 +1421,9 @@ async def get_rotation_config(key: str) -> str | None:
 
 
 async def set_rotation_config(key: str, value: str):
-    """写入轮转配置（值无变化时跳过UPDATE，省RU）"""
+    """写入轮转配置（值无变化时跳过UPDATE，省RU），同时更新本地 KV 缓存。"""
     import datetime as _dt
+    from .cache_store import get_cache_store
     col = get_rotation_config_col()
     existing = await col.find_one({"config_key": key}, projection=["config_key", "config_value"])
     if existing:
@@ -1437,6 +1438,11 @@ async def set_rotation_config(key: str, value: str):
             "config_value": value,
             "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         })
+    try:
+        store = get_cache_store()
+        await store.set_kv(f"rotconf:{key}", value)
+    except Exception:
+        pass
 
 
 async def get_active_cells() -> list[dict]:
@@ -1910,27 +1916,50 @@ _cells_local_cache: list[dict] | None = None
 
 
 async def get_active_cells_local() -> list[dict]:
-    """E1: 从本地 SQLite 加载 cells 快照 (0 RU)，无兜底"""
+    """从本地 SQLite 加载 active cells (0 RU)，优先 cells_local 表，兼容旧 snapshot。"""
     global _cells_local_cache, _cells_local_version
     from .cache_store import get_cache_store
     store = get_cache_store()
 
     if _cells_local_cache is None:
-        cells, version = await store.load_cells_snapshot()
+        cells = await store.get_active_cells_local()
         if cells:
-            _cells_local_cache = cells
-            _cells_local_version = version
-        # SQLite 未就绪时返回空列表，调用方需有 fallback 逻辑
-        return _cells_local_cache or []
+            _cells_local_cache = await store.get_all_cells_local()
+            _cells_local_version = int(_time.time() * 1000)
+        else:
+            snap_cells, version = await store.load_cells_snapshot()
+            if snap_cells:
+                _cells_local_cache = snap_cells
+                _cells_local_version = version
+                await store.bulk_upsert_cells_local(snap_cells)
+        return [c for c in (_cells_local_cache or []) if c.get("status") == "active"]
 
     has_change, new_version = await store.has_cells_change(_cells_local_version)
     if has_change:
-        cells, version = await store.load_cells_snapshot()
+        cells = await store.get_all_cells_local()
         if cells:
             _cells_local_cache = cells
-            _cells_local_version = version
+            _cells_local_version = new_version
+        else:
+            snap_cells, version = await store.load_cells_snapshot()
+            if snap_cells:
+                _cells_local_cache = snap_cells
+                _cells_local_version = version
 
-    return _cells_local_cache
+    return [c for c in (_cells_local_cache or []) if c.get("status") == "active"]
+
+
+async def get_all_cells_local() -> list[dict]:
+    """从本地 SQLite 加载全部 cells (0 RU)。"""
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    cells = await store.get_all_cells_local()
+    if cells:
+        return cells
+    snap_cells, _ = await store.load_cells_snapshot()
+    if snap_cells:
+        await store.bulk_upsert_cells_local(snap_cells)
+    return snap_cells or []
 
 
 async def set_code_expiry(code: str, expires_at: str):

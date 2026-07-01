@@ -10,9 +10,7 @@ import yaml
 from loguru import logger
 from database import (
     get_cells_col,
-    set_cell_status,
     log_rotate,
-    _client,
 )
 from utils.flood_waiter import safe_copy_message, reset_backoff
 from utils.file_utils import is_media_message
@@ -187,9 +185,13 @@ class MonScheduler:
     ):
         """执行降级:failed→lost, promote_slot→active, cascade_slot→shadow1
 
-        使用 CRDB 事务保证原子性:所有状态变更要么全部成功,要么全部回滚。
-        log_rotate 在事务提交成功后执行,避免事务内写入审计日志。
+        热路径零 CRDB RU:常规 failover(shadow→active, shadow2→shadow1)只写本地 SQLite。
+        异常事件(failed→lost)写入 CRDB 审计 + 本地标记脏。
+        log_rotate 在本地更新完成后执行(审计日志,低频)。
         """
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        batch_updates = []
         log_entries = []
 
         pred_slot_ids = []
@@ -200,46 +202,68 @@ class MonScheduler:
                    and c["slot_id"] != failed_slot["slot_id"]:
                     pred_slot_ids.append(c["slot_id"])
 
-        async with _client.transaction() as conn:
-            await conn.execute(
-                "UPDATE cells SET status = $1 WHERE slot_id = $2",
-                "lost", failed_slot["slot_id"],
-            )
+        new_next = failed_slot.get("next_active_chat_id")
+        promote_channel = promote_slot["channel_id"] if promote_slot else None
+        new_degrade_count = failed_slot.get("degrade_count", 0) + 1
+        old_status = failed_slot.get("status", "active")
+
+        batch_updates.append((failed_slot["slot_id"], {
+            "status": "lost",
+            "degrade_count": new_degrade_count,
+        }, True))
+        failed_slot["status"] = "lost"
+        failed_slot["degrade_count"] = new_degrade_count
+        log_entries.append((
+            failed_slot["slot_id"], promote_slot["slot_id"] if promote_slot else "none",
+            old_status, "lost",
+            f"fail_streak={fail_streak}", "mon",
+        ))
+
+        if promote_slot:
+            promote_old_status = promote_slot.get("status", "shadow1")
+            batch_updates.append((promote_slot["slot_id"], {
+                "status": "active",
+                "next_active_chat_id": new_next,
+                "degrade_count": new_degrade_count,
+            }, False))
+            promote_slot["status"] = "active"
+            promote_slot["next_active_chat_id"] = new_next
+            promote_slot["degrade_count"] = new_degrade_count
+
+            for pred_sid in pred_slot_ids:
+                batch_updates.append((pred_sid, {"next_active_chat_id": promote_channel}, False))
+                for c in all_cells:
+                    if c["slot_id"] == pred_sid:
+                        c["next_active_chat_id"] = promote_channel
+                        break
             log_entries.append((
-                failed_slot["slot_id"], promote_slot["slot_id"] if promote_slot else "none",
-                failed_slot.get("status", "active"), "lost",
-                f"fail_streak={fail_streak}", "mon",
+                promote_slot["slot_id"], promote_slot["slot_id"],
+                promote_old_status, "active",
+                f"promoted after {failed_slot['slot_id']} timeout", "mon",
             ))
 
-            if promote_slot:
-                new_next = failed_slot.get("next_active_chat_id")
-                promote_channel = promote_slot["channel_id"]
-                await conn.execute(
-                    "UPDATE cells SET status = $1, next_active_chat_id = $2, degrade_count = $3 WHERE slot_id = $4",
-                    "active", new_next, failed_slot.get("degrade_count", 0) + 1, promote_slot["slot_id"],
-                )
-                for pred_sid in pred_slot_ids:
-                    await conn.execute(
-                        "UPDATE cells SET next_active_chat_id = $1 WHERE slot_id = $2",
-                        promote_channel, pred_sid,
-                    )
-                log_entries.append((
-                    promote_slot["slot_id"], promote_slot["slot_id"],
-                    promote_slot.get("status", "shadow1"), "active",
-                    f"promoted after {failed_slot['slot_id']} timeout", "mon",
-                ))
+        if cascade_slot:
+            cascade_old_status = cascade_slot.get("status", "shadow2")
+            if cascade_old_status != "shadow1":
+                batch_updates.append((cascade_slot["slot_id"], {"status": "shadow1"}, False))
+                cascade_slot["status"] = "shadow1"
+            log_entries.append((
+                cascade_slot["slot_id"], cascade_slot["slot_id"],
+                cascade_old_status, "shadow1",
+                f"cascade after {failed_slot['slot_id']} timeout", "mon",
+            ))
 
-            if cascade_slot:
-                if cascade_slot.get("status") != "shadow1":
-                    await conn.execute(
-                        "UPDATE cells SET status = $1 WHERE slot_id = $2",
-                        "shadow1", cascade_slot["slot_id"],
-                    )
-                log_entries.append((
-                    cascade_slot["slot_id"], cascade_slot["slot_id"],
-                    cascade_slot.get("status", "shadow2"), "shadow1",
-                    f"cascade after {failed_slot['slot_id']} timeout", "mon",
-                ))
+        await store.batch_update_cells_local(batch_updates)
+
+        try:
+            import datetime as _dt
+            now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            await get_cells_col().update_one(
+                {"slot_id": failed_slot["slot_id"]},
+                {"$set": {"status": "lost", "degrade_count": new_degrade_count, "updated_at": now_iso}},
+            )
+        except Exception as e:
+            logger.warning(f"[Degrade] CRDB 同步失败(本地已更新): {e}")
 
         for entry in log_entries:
             await log_rotate(*entry)
@@ -291,25 +315,23 @@ class MonScheduler:
         return total_copied
 
     async def _flush_cursor_cache(self):
-        """批量 flush 本地缓存的游标到 CRDB。只 flush 自上次以来有变化的游标。"""
+        """批量 flush 本地缓存的游标到 SQLite（零 CRDB RU）。只 flush 自上次以来有变化的游标。"""
         if not self._cursor_cache:
             return
-        col = get_cells_col()
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
         changed = 0
         for slot_id, cursor in self._cursor_cache.items():
             if self._flushed_cursors.get(slot_id) == cursor:
-                continue  # 游标未变化，跳过，零 RU
+                continue
             try:
-                await col.update_one(
-                    {"slot_id": slot_id},
-                    {"$set": {"last_synced_msg_id": cursor}},
-                )
+                await store.update_cell_fields_local(slot_id, {"last_synced_msg_id": cursor})
                 self._flushed_cursors[slot_id] = cursor
                 changed += 1
             except Exception:
-                pass  # 下次同步自动重试
+                pass
         if changed > 0:
-            logger.debug(f"[Mon] flush 游标到 CRDB: {changed} 个有变化")
+            logger.debug(f"[Mon] flush 游标到本地: {changed} 个有变化")
 
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
         """获取频道中最后游标之后的新消息(媒体文件)。
@@ -363,7 +385,8 @@ class MonScheduler:
             all_cells: 由调用方统一查询传入。
         """
         groups = self._group_slots(all_cells)
-        col = get_cells_col()
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
         total_filled = 0
 
         for _group_key, group in groups.items():
@@ -400,10 +423,8 @@ class MonScheduler:
                 )
                 if filled > 0:
                     latest_id = max(msg.message_id for msg in all_media)
-                    await col.update_one(
-                        {"slot_id": shadow_slot["slot_id"]},
-                        {"$set": {"last_synced_msg_id": latest_id}},
-                    )
+                    await store.update_cell_fields_local(shadow_slot["slot_id"], {"last_synced_msg_id": latest_id})
+                    shadow_slot["last_synced_msg_id"] = latest_id
                     total_filled += filled
                     logger.info(
                         f"[Mon][填充] {shadow_slot['slot_id']} "
