@@ -43,7 +43,14 @@ async def _get_cells_cached(status_filter: dict | None = None, sort_key: str = "
         pass
     # CRDB 兜底（1 RU）
     col = get_cells_col()
-    cells = await col.find(status_filter or {}, sort=(sort_key, 1))
+    cells = await col.find(
+        status_filter or {},
+        sort=(sort_key, 1),
+        projection=["slot_id", "channel_id", "status", "next_active_chat_id",
+                     "prev_slot_id", "account_name", "is_r100",
+                     "file_count", "rotation_started_at", "last_heartbeat",
+                     "degrade_count", "created_at", "updated_at"],
+    )
     _cells_cache = (now, cells)
     return cells
 

@@ -592,7 +592,13 @@ async def _process_pending_uploads(app: Application):
             pending_col = get_pending_uploads_col()
             processed_any = False
             while True:
-                rows = await pending_col.find({"processed": 0}, limit=10)
+                rows = await pending_col.find(
+                    {"processed": 0},
+                    limit=10,
+                    projection=["id", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
+                                "file_types", "batch_msg_ids", "batch_file_meta", "note",
+                                "protect_content", "file_ttl_days"],
+                )
 
                 if not rows:
                     break

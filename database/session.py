@@ -1416,7 +1416,7 @@ async def list_spare_pool() -> list[dict]:
 async def get_rotation_config(key: str) -> str | None:
     """读取轮转配置"""
     col = get_rotation_config_col()
-    row = await col.find_one({"config_key": key})
+    row = await col.find_one({"config_key": key}, projection=["config_value"])
     return row.get("config_value") if row else None
 
 
@@ -1424,7 +1424,7 @@ async def set_rotation_config(key: str, value: str):
     """写入轮转配置"""
     import datetime as _dt
     col = get_rotation_config_col()
-    existing = await col.find_one({"config_key": key})
+    existing = await col.find_one({"config_key": key}, projection=["config_key"])
     if existing:
         await col.update_one(
             {"config_key": key},
@@ -1496,7 +1496,11 @@ async def get_next_active_cell(current_channel_id: int) -> dict | None:
 async def get_active_or_shadow_cell(channel_id: int) -> dict | None:
     """获取指定 channel cell 记录(任status)"""
     col = get_cells_col()
-    return await col.find_one({"channel_id": channel_id})
+    return await col.find_one(
+        {"channel_id": channel_id},
+        projection=["slot_id", "channel_id", "status", "next_active_chat_id",
+                     "account_name", "is_r100", "file_count"],
+    )
 
 
 async def set_cell_status(slot_id: str, new_status: str):
@@ -1636,7 +1640,9 @@ async def dequeue_jobs(batch_size: int = 10) -> list:
             )
             UPDATE jobs SET status = 'dispatched'
             WHERE id IN (SELECT id FROM next)
-            RETURNING *
+            RETURNING id, code, target_user_id, storage_channel_id,
+                      storage_msg_ids, batch_file_meta, task_type,
+                      protect_content, retry_count
         """, [batch_size]), timeout=5.0)
     except asyncio.TimeoutError:
         logger.error("[DB] dequeue_jobs 查询超时(>5s),跳过本次")

@@ -262,8 +262,7 @@ class MonBot:
                 {"$set": {
                     "channel_id": spare_ch,
                     "status": status if status in ("active", "shadow1", "shadow2", "r100") else "active",
-                    "account_name": account_name,  # 继承原账号
-                    "last_heartbeat": now.isoformat(),
+                    "account_name": account_name,
                     "file_count": 0,
                     "rotation_started_at": now.isoformat(),
                     "updated_at": now.isoformat(),
@@ -393,8 +392,8 @@ class MonBot:
                     target_active = groups[gkey][0] if len(groups[gkey]) > 0 else None
                     nxt = target_active.get("next_active_chat_id") if target_active else None
                     await conn.execute(
-                        "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3, last_heartbeat = $4 WHERE slot_id = $5",
-                        "active", nxt, now_iso, now_iso, s1_slot["slot_id"],
+                        "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3 WHERE slot_id = $4",
+                        "active", nxt, now_iso, s1_slot["slot_id"],
                     )
                     # 同组的原 active → shadow1(如果还没变的话)
                     if target_active and target_active["status"] == "active":

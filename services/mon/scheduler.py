@@ -181,8 +181,8 @@ class MonScheduler:
             if s1_slot:
                 new_next = a_slot.get("next_active_chat_id")
                 await conn.execute(
-                    "UPDATE cells SET status = $1, next_active_chat_id = $2, last_heartbeat = $3, degrade_count = $4 WHERE slot_id = $5",
-                    "active", new_next, now_iso, a_slot.get("degrade_count", 0) + 1, s1_slot["slot_id"],
+                    "UPDATE cells SET status = $1, next_active_chat_id = $2, degrade_count = $3 WHERE slot_id = $4",
+                    "active", new_next, a_slot.get("degrade_count", 0) + 1, s1_slot["slot_id"],
                 )
                 prev_id = a_slot.get("prev_slot_id")
                 if prev_id:
