@@ -248,17 +248,13 @@ class CacheStore:
                 break
 
     async def has_new_upload(self) -> bool:
-        """Idx Bot 检查是否有未处理的上传通知。有则返回 True 并原子清空。
-        
-        使用 DELETE ... RETURNING 实现原子出队，避免 SELECT + DELETE 竞态。
-        """
+        """Idx Bot 检查是否有未处理的上传通知。有则返回 True 并原子清空所有通知。"""
         if not self._db:
             return True  # 连接未就绪，回退到直接查 CRDB
-        row = await self._db.execute_fetchall(
-            "DELETE FROM pending_notify WHERE id = (SELECT id FROM pending_notify LIMIT 1) RETURNING id"
-        )
+        cursor = await self._db.execute("DELETE FROM pending_notify")
+        deleted = cursor.rowcount
         await self._db.commit()
-        return bool(row)
+        return deleted > 0
 
     # ─── Dsp Bot 通知：Idx Bot 写入 → Dsp Bot 感知 ───
 
@@ -281,17 +277,13 @@ class CacheStore:
                 break
 
     async def has_new_dsp_job(self) -> bool:
-        """Dsp Bot 检查是否有未处理的新 jobs。有则返回 True 并原子清空。
-        
-        使用 DELETE ... RETURNING 实现原子出队，避免 SELECT + DELETE 竞态。
-        """
+        """Dsp Bot 检查是否有新的派发通知。有则返回 True 并原子清空所有通知。"""
         if not self._db:
             return True  # 连接未就绪，回退到直接查 CRDB
-        row = await self._db.execute_fetchall(
-            "DELETE FROM dsp_notify WHERE id = (SELECT id FROM dsp_notify LIMIT 1) RETURNING id"
-        )
+        cursor = await self._db.execute("DELETE FROM dsp_notify")
+        deleted = cursor.rowcount
         await self._db.commit()
-        return bool(row)
+        return deleted > 0
 
     async def close(self):
         if self._db:

@@ -309,7 +309,7 @@ async def _dsp_worker(bot: Any, worker_id: int):
             if not raw_jobs:
                 if await store.has_new_dsp_job():
                     continue
-                await asyncio.sleep(5)
+                await asyncio.sleep(2)
                 continue
 
             # 转换为 JobResult 并标记 dispatched
@@ -694,7 +694,7 @@ async def _async_main():
             except Exception as e:
                 logger.debug(f"[Dsp] 周期同步异常: {e}")
 
-    # D: Sync Back - 每 60 秒同步本地状态变更回 CRDB（30s→60s，减少空轮询）
+    # D: Sync Back - 每 30 秒同步本地状态变更回 CRDB
     async def sync_back_loop():
         from database.session import sync_local_jobs_to_crdb
         while True:
@@ -702,12 +702,12 @@ async def _async_main():
                 await sync_local_jobs_to_crdb()
             except Exception as e:
                 logger.debug(f"[SyncBack] 同步异常: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
     loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(startup_sync(), name="startup-sync")          # H: 启动同步 + 周期兜底
-    create_safe_task(sync_back_loop(), name="sync-back")          # D: 60s 同步本地状态回 CRDB
+    create_safe_task(sync_back_loop(), name="sync-back")          # D: 新增
     create_safe_task(process_queue(bot), name="process-queue")
     create_safe_task(_cleanup_page_states(), name="cleanup-page-states")
     create_safe_task(_cleanup_channel_failures(), name="cleanup-channel-failures")
