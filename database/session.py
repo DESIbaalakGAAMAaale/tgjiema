@@ -12,6 +12,10 @@ from typing import Any, Optional
 import asyncpg
 from loguru import logger
 
+# SQL 查询日志开关（默认关闭，环境变量 ENABLE_SQL_LOG=1 开启）
+import os as _os
+_SQL_LOG_ENABLED = _os.getenv("ENABLE_SQL_LOG", "0") == "1"
+
 
 def _json_dumps(obj, **kwargs):
     """json.dumps compatible wrapper."""
@@ -407,11 +411,15 @@ class D1Collection:
     async def _query(self, sql: str, params: list = None) -> list[dict]:
         async with _client._pool.acquire() as conn:
             records = await conn.fetch(sql, *(params or []))
+            if _SQL_LOG_ENABLED:
+                logger.debug(f"[SQL_QUERY] {self.table}: {sql[:200]}")
             return [_row_to_dict(r) for r in records]
 
     async def _execute(self, sql: str, params: list = None) -> int:
         async with _client._pool.acquire() as conn:
-            await conn.execute(sql, *(params or []))
+            result = await conn.execute(sql, *(params or []))
+            if _SQL_LOG_ENABLED:
+                logger.debug(f"[SQL_EXEC] {self.table}: {sql[:200]}")
             return 1
 
     async def find_one(self, query: dict) -> Optional[dict]:
