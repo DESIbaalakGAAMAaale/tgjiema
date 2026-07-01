@@ -227,11 +227,6 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     # ─── jobs 表补充───────────────────────────────────────────────
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
-    # ─── CRDB 行级 TTL 已废弃：hourly 全表扫描消耗大量 RU ───
-    # 改为 Python 端负责清理（见 database/cache.py: _flush_decode_log_buffer_loop）
-    # decode_logs / jobs 7 天前数据由本地清理循环处理
-    "ALTER TABLE decode_logs RESET (ttl_expiration_expression, ttl_job_cron)",
-    "ALTER TABLE jobs RESET (ttl_expiration_expression, ttl_job_cron)",
     # ─── 死信队列(Dead Letter Queue)──────────────────────────────
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_reason TEXT DEFAULT ''",
@@ -276,19 +271,33 @@ class CockroachDBClient:
         await store.init()
         await load_cache_from_disk()
 
-        # ─── DDL 版本检查：跳过已执行的 DDL，省 RU ───
+        # ─── DDL 版本检查：优先用 SQLite 缓存，避免每次 init_db 查 CRDB ───
         need_ddl = True
         try:
-            current_version = await self._pool.fetchval(
-                "SELECT config_value FROM rotation_config WHERE config_key = 'ddl_version'"
-            )
-            if current_version == str(DDL_VERSION):
+            # 优先级 1: SQLite 本地缓存（0 CRDB RU）
+            ddl_version = await store.get_kv("ddl_version")
+            if ddl_version == str(DDL_VERSION):
                 need_ddl = False
-                logger.info(f"DDL 版本 {DDL_VERSION} 已是最新，跳过")
             else:
-                logger.info(f"DDL 版本变更: {current_version} → {DDL_VERSION}，执行升级")
+                logger.info(f"DDL 版本变更(SQLite): {ddl_version} → {DDL_VERSION}，执行升级")
         except Exception:
-            logger.info("首次运行或 rotation_config 表不存在，执行 DDL 初始化")
+            pass
+
+        if need_ddl:
+            # 优先级 2: CRDB 兜底查询（仅 SQLite 无缓存时）
+            try:
+                current_version = await self._pool.fetchval(
+                    "SELECT config_value FROM rotation_config WHERE config_key = 'ddl_version'"
+                )
+                if current_version == str(DDL_VERSION):
+                    need_ddl = False
+                    # 回填 SQLite 缓存
+                    await store.set_kv("ddl_version", str(DDL_VERSION))
+                    logger.info(f"DDL 版本 {DDL_VERSION} 已是最新，跳过（CRDB 兜底）")
+                else:
+                    logger.info(f"DDL 版本变更(CRDB): {current_version} → {DDL_VERSION}，执行升级")
+            except Exception:
+                logger.info("首次运行或 rotation_config 表不存在，执行 DDL 初始化")
 
         if need_ddl:
             for sql in DDL_STATEMENTS:
@@ -298,11 +307,23 @@ class CockroachDBClient:
                     await self.execute(sql)
                 except Exception as e:
                     logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略）：{e}")
-            # 写入版本号
+            # ─── CRDB 行级 TTL 已废弃：一次性禁用 ───
+            # 改为 Python 端负责清理（见 database/cache.py: _flush_decode_log_buffer_loop）
+            for ttl_sql in (
+                "ALTER TABLE decode_logs RESET (ttl_expiration_expression, ttl_job_cron)",
+                "ALTER TABLE jobs RESET (ttl_expiration_expression, ttl_job_cron)",
+            ):
+                try:
+                    await self.execute(ttl_sql)
+                except Exception:
+                    pass  # TTL 已禁用或不存在，忽略
+            # 写入 CRDB 版本号
             await self.execute(
                 "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
                 str(DDL_VERSION),
             )
+            # 写入 SQLite 缓存版本号（后续启动 0 CRDB RU）
+            await store.set_kv("ddl_version", str(DDL_VERSION))
             logger.info(f"DDL 升级完成，版本 {DDL_VERSION}")
 
     async def close(self):

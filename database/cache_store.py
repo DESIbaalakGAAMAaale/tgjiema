@@ -129,6 +129,13 @@ class CacheStore:
                 ts      REAL NOT NULL
             )"""
         )
+        # ─── KV 键值存储：用于缓存 DDL 版本等配置 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS kv_store (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )"""
+        )
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -777,6 +784,30 @@ class CacheStore:
         )
         new_version = row[0][0] if row and row[0][0] else last_version
         return new_version > last_version, new_version
+
+    # ─── KV 键值存储（0 CRDB RU）───
+
+    async def get_kv(self, key: str) -> str | None:
+        """读取键值缓存（SQLite，零 CRDB RU）"""
+        if not self._db:
+            return None
+        try:
+            row = await self._db.execute_fetchall(
+                "SELECT value FROM kv_store WHERE key = ?", (key,)
+            )
+            return row[0][0] if row else None
+        except Exception:
+            return None
+
+    async def set_kv(self, key: str, value: str):
+        """写入键值缓存（SQLite，零 CRDB RU）"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+            (key, value),
+        )
+        await self._db.commit()
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────
