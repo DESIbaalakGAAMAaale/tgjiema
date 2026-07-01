@@ -301,7 +301,7 @@ class MonBot:
         now = _dt.datetime.now(_dt.timezone.utc)
         should_rotate = False
 
-        for cell in all_cells:
+        for cell in active_cells:
             # 检查文件数
             fc = cell.get("file_count") or 0
             if fc >= files_per_slot:
@@ -479,8 +479,9 @@ class MonBot:
 
     async def _heartbeat_with_ban_detection(self, all_cells: list[dict]) -> tuple[int, int]:
         """心跳检测 + 封禁识别。返回 (ok_count, ban_count)。
-        优化:心跳写入本地 SQLite(零 CRDB RU)，降级判断使用内存 fail_streak。
-        仅在实际发生状态变更时才写入 CRDB。
+        优化:心跳只写入本地 SQLite(零 CRDB RU)，降级判断使用内存 fail_streak。
+        仅在实际发生状态变更(降级/轮转/封禁替换)时才写入 CRDB。
+        last_heartbeat 不再写入 CRDB，减少 RU 消耗。
         """
         store = get_cache_store()
         # 从传入的 all_cells 中筛选 active/shadow
@@ -492,7 +493,7 @@ class MonBot:
             try:
                 # 使用 get_chat 做更彻底的检测
                 await self.bot.get_chat(cell["channel_id"])
-                # 心跳成功 → 写入本地 SQLite,重置失败计数
+                # 心跳成功 → 只写本地 SQLite,不碰 CRDB → 零 RU
                 await store.write_heartbeat(slot_id, ok=True)
                 self._cell_healthy[slot_id] = True
                 self._cell_fail_streak[slot_id] = 0

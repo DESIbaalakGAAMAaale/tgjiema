@@ -537,9 +537,10 @@ class D1Collection:
         await self._execute(sql, params)
         return True
 
-    async def delete_many(self, query: dict) -> int:
+    async def delete_many(self, query: dict, limit: int | None = None) -> int:
         """删除匹配 query 的所有记录,返回实际删除条数。
         用于清理任务(如过期 decode_logs / jobs),不依赖 CRDB TTL job。
+        limit: 单次删除最多删除多少条,用于分批删除避免大事务。
         """
         params = []
         where_parts = []
@@ -568,6 +569,8 @@ class D1Collection:
         sql = f"DELETE FROM {self.table}"
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
+        if limit is not None and limit > 0:
+            sql += f" LIMIT {limit}"
         async with _client._pool.acquire() as conn:
             status = await conn.execute(sql, *params)
             # asyncpg/CRDB 返回 "DELETE N" 格式

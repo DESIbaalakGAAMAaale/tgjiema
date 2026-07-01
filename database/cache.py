@@ -379,7 +379,7 @@ async def _flush_decode_log_buffer_loop():
                 while True:
                     deleted = await decode_logs_col.delete_many({
                         "request_time": {"$lt": cutoff_iso}
-                    })
+                    }, limit=cleanup_batch_size)
                     deleted_total += deleted
                     if deleted < cleanup_batch_size:
                         break
@@ -389,14 +389,20 @@ async def _flush_decode_log_buffer_loop():
             except Exception as e:
                 logger.warning(f"[Cleanup] decode_logs 清理失败: {e}")
 
-            # CRDB jobs:按 created_at 删 7 天前已完成/失败记录（保留 dead_retry 队列）
+            # CRDB jobs:按 created_at 删 7 天前已完成/失败记录（分批，保留 dead_retry 队列）
             try:
-                deleted = await jobs_col.delete_many({
-                    "created_at": {"$lt": cutoff_iso},
-                    "status": {"$in": ["done", "failed"]},
-                })
-                if deleted > 0:
-                    logger.info(f"[Cleanup] jobs 删除 {deleted} 条 {cleanup_days} 天前已完成记录")
+                deleted_total = 0
+                while True:
+                    deleted = await jobs_col.delete_many({
+                        "created_at": {"$lt": cutoff_iso},
+                        "status": {"$in": ["done", "failed"]},
+                    }, limit=cleanup_batch_size)
+                    deleted_total += deleted
+                    if deleted < cleanup_batch_size:
+                        break
+                    await asyncio.sleep(1)
+                if deleted_total > 0:
+                    logger.info(f"[Cleanup] jobs 删除 {deleted_total} 条 {cleanup_days} 天前已完成记录")
             except Exception as e:
                 logger.warning(f"[Cleanup] jobs 清理失败: {e}")
         except Exception as e:
