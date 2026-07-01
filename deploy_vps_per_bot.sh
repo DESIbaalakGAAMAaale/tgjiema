@@ -125,6 +125,7 @@ generate_service() {
 Description=TG文件解码器 — ${desc}
 After=network.target
 Wants=network.target
+PartOf=${SVC_PREFIX}.target
 
 [Service]
 Type=simple
