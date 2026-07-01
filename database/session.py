@@ -164,14 +164,7 @@ DDL_STATEMENTS = [
         reason TEXT,
         triggered_by TEXT
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_cells_channel ON cells(channel_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cells_status ON cells(status)",
-    "CREATE INDEX IF NOT EXISTS idx_cells_next_active ON cells(next_active_chat_id)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_pending ON jobs(status, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_rotate_log_timestamp ON rotate_log(timestamp)",
-    "CREATE INDEX IF NOT EXISTS idx_codes_expire_time ON codes(expire_time)",
-    "CREATE INDEX IF NOT EXISTS idx_codes_status ON codes(status)",
-    "CREATE INDEX IF NOT EXISTS idx_codes_file_record_code ON codes(file_record_code)",
     # ─── 备用池 + 轮转配置 ──────────────────────────────────────────
     """CREATE TABLE IF NOT EXISTS spare_pool (
         channel_id BIGINT PRIMARY KEY,
@@ -196,7 +189,7 @@ DDL_STATEMENTS = [
         created_at   TEXT DEFAULT (CAST(current_timestamp AS TEXT)),
         last_login_at TEXT
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_relay_accounts_phone ON relay_accounts(phone)",
+    # idx_relay_accounts_phone 已删除（UNIQUE 约束自带索引，冗余）
     # ─── 外部码映射表（采集器写入，idx_bot 查询）─────────────────
     """CREATE TABLE IF NOT EXISTS external_code_mapping (
         external_code TEXT PRIMARY KEY,
@@ -205,8 +198,7 @@ DDL_STATEMENTS = [
         created_at TEXT,
         updated_at TEXT
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_system ON external_code_mapping(system_code)",
-    "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_bot ON external_code_mapping(bot_username)",
+    # idx_external_code_mapping_system / idx_external_code_mapping_bot 已删除（WHERE 从未使用）
     # ─── code_bot_mapping 表(代码前缀 → Bot 路由) ──────────────
     """CREATE TABLE IF NOT EXISTS code_bot_mapping (
         code_prefix TEXT PRIMARY KEY,
@@ -239,6 +231,17 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS blocked_users JSONB DEFAULT '[]'",
+    # ─── 索引清理：删除冗余/未使用的索引（减少 UPDATE 维护开销）─────────────
+    "DROP INDEX IF EXISTS idx_cells_channel",
+    "DROP INDEX IF EXISTS idx_cells_status",
+    "DROP INDEX IF EXISTS idx_cells_next_active",
+    "DROP INDEX IF EXISTS idx_codes_expire_time",
+    "DROP INDEX IF EXISTS idx_codes_status",
+    "DROP INDEX IF EXISTS idx_codes_file_record_code",
+    "DROP INDEX IF EXISTS idx_rotate_log_timestamp",
+    "DROP INDEX IF EXISTS idx_relay_accounts_phone",
+    "DROP INDEX IF EXISTS idx_external_code_mapping_system",
+    "DROP INDEX IF EXISTS idx_external_code_mapping_bot",
 ]
 
 
@@ -1448,94 +1451,6 @@ async def set_rotation_config(key: str, value: str):
         await store.set_kv(f"rotconf:{key}", value)
     except Exception:
         pass
-
-
-async def get_active_cells() -> list[dict]:
-    """获取所有状态为 active 的槽位,按环next_active_chat_id 排序"""
-    col = get_cells_col()
-    cells = await col.find(
-        {"status": "active"},
-        projection=["slot_id", "channel_id", "status", "next_active_chat_id",
-                     "file_count", "rotation_started_at", "last_heartbeat"],
-    )
-    # 尝试按环形顺序排序
-    if len(cells) <= 1:
-        return cells
-    # next_active_chat_id 构成
-    channel_map = {c["channel_id"]: c for c in cells}
-    ordered = []
-    visited = set()
-    if cells:
-        current = cells[0]
-        while current["channel_id"] not in visited:
-            visited.add(current["channel_id"])
-            ordered.append(current)
-            nxt = current.get("next_active_chat_id")
-            if nxt and nxt in channel_map:
-                current = channel_map[nxt]
-            else:
-                # 加入未访问的剩余 cell
-                for c in cells:
-                    if c["channel_id"] not in visited:
-                        ordered.append(c)
-                break
-    return ordered
-
-
-async def get_next_active_cell(current_channel_id: int) -> dict | None:
-    """获取环形current 的下一active 槽位"""
-    col = get_cells_col()
-    current = await col.find_one(
-        {"channel_id": current_channel_id, "status": "active"},
-        projection=["channel_id", "next_active_chat_id", "slot_id", "status"],
-    )
-    if not current:
-        return None
-    nxt_id = current.get("next_active_chat_id")
-    if nxt_id:
-        return await col.find_one(
-            {"channel_id": nxt_id, "status": "active"},
-            projection=["channel_id", "next_active_chat_id", "slot_id", "status"],
-        )
-    # 回环：取第一个 active
-    cells = await col.find(
-        {"status": "active"}, sort=("created_at", 1), limit=1,
-        projection=["channel_id", "next_active_chat_id", "slot_id", "status"],
-    )
-    return cells[0] if cells else None
-
-
-async def get_active_or_shadow_cell(channel_id: int) -> dict | None:
-    """获取指定 channel cell 记录(任status)"""
-    col = get_cells_col()
-    return await col.find_one(
-        {"channel_id": channel_id},
-        projection=["slot_id", "channel_id", "status", "next_active_chat_id",
-                     "account_name", "is_r100", "file_count"],
-    )
-
-
-async def set_cell_status(slot_id: str, new_status: str):
-    """更新 cell 状态"""
-    import datetime as _dt
-    col = get_cells_col()
-    await col.update_one(
-        {"slot_id": slot_id},
-        {"$set": {
-            "status": new_status,
-            "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        }},
-    )
-
-
-async def update_cell_heartbeat(slot_id: str):
-    """更新 cell 心跳时间"""
-    import datetime as _dt
-    col = get_cells_col()
-    await col.update_one(
-        {"slot_id": slot_id},
-        {"$set": {"last_heartbeat": _dt.datetime.now(_dt.timezone.utc).isoformat()}},
-    )
 
 
 # ─── H方案: 后台异步同步新 job 到 CRDB ─────────────────────────

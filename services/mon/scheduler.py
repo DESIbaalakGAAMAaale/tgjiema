@@ -60,7 +60,7 @@ class MonScheduler:
         """执行一轮降级检查,返回日志描述列表。
 
         降级判断基于内存中的连续失败次数(fail_streak),零 CRDB RU。
-        仅在实际触发降级时才写入 CRDB(set_cell_status + log_rotate)。
+        仅在实际触发降级时才写入 CRDB(sync_dirty_cells_to_crdb + log_rotate)。
 
         Args:
             all_cells: 由调用方统一查询传入,避免重复 DB 查询。
