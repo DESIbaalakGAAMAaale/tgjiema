@@ -412,14 +412,14 @@ class D1Collection:
         async with _client._pool.acquire() as conn:
             records = await conn.fetch(sql, *(params or []))
             if _SQL_LOG_ENABLED:
-                logger.debug(f"[SQL_QUERY] {self.table}: {sql[:200]}")
+                logger.info(f"[SQL_QUERY] {self.table}: {sql[:200]}")
             return [_row_to_dict(r) for r in records]
 
     async def _execute(self, sql: str, params: list = None) -> int:
         async with _client._pool.acquire() as conn:
             result = await conn.execute(sql, *(params or []))
             if _SQL_LOG_ENABLED:
-                logger.debug(f"[SQL_EXEC] {self.table}: {sql[:200]}")
+                logger.info(f"[SQL_EXEC] {self.table}: {sql[:200]}")
             return 1
 
     async def find_one(self, query: dict) -> Optional[dict]:
