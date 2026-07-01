@@ -697,7 +697,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if primary_mid is None:
             logger.error(f"[Idx] primary_channel_msg_id 为空，无法发送: code={text}")
             await safe_reply_text(update.message, "文件记录异常，请联系管理员")
-            return True
+            return
         msg_ids = [primary_mid]
 
     batch_file_meta_str = file_record.get("batch_file_meta") or ""

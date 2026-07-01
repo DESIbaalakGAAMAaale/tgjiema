@@ -223,8 +223,8 @@ class Settings(BaseSettings):
             "r2_secret_key": "",
             "r2_bucket": "tgjiema-backup",
             "r2_endpoint": "",
-            "db_backup_interval": "60",
-            "db_backup_enabled": "true",
+            "db_backup_interval": "360",
+            "db_backup_enabled": "false",
         }
         return defaults.get(key, "")
 

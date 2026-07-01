@@ -528,7 +528,7 @@ class D1Collection:
         await self._execute(sql, all_params)
         return docs
 
-    async def update_one(self, query: dict, update: dict) -> UpdateResult:
+    async def update_one(self, query: dict, update: dict, **kwargs) -> UpdateResult:
         all_params = []
 
         set_parts = []
@@ -1945,7 +1945,6 @@ async def sync_dirty_cells_to_crdb():
             await col.update_one(
                 {"slot_id": cell["slot_id"]},
                 {"$set": set_fields},
-                upsert=True,
             )
             await store.mark_cell_synced_local(cell["slot_id"])
             synced += 1

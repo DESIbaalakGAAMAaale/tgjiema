@@ -9,51 +9,43 @@ from database.session import _client as db_client, get_config
 from storage.r2 import _r2 as r2_storage
 
 
+SMALL_TABLES = {
+    "cells", "users", "spare_pool", "backup_config", "rotation_config",
+    "relay_accounts", "code_bot_mapping", "external_code_mapping",
+    "kv_config",
+}
+
+_LARGE_TABLES = {
+    "file_records", "codes", "decode_logs", "jobs", "message_backups",
+    "pending_uploads", "rotate_log",
+}
+
+BACKUP_TABLES = SMALL_TABLES
+
+MAX_ROWS_PER_TABLE = 5000
+
+
 async def backup_all_tables() -> dict:
-    """动态发现所有用户表并备份，排除 CockroachDB 系统表和大表。
+    """仅备份小元数据表（单表 <= 几百行），避免全表扫描大表消耗大量 RU。
 
-    排除策略：
-    - decode_logs / jobs：大表，全表扫描消耗大量 RU，不备份
-    - message_backups：可能很大，不备份
-    - 其余元数据表（users, file_records, cells, codes, rotate_log 等）正常备份
+    大表（file_records/codes/decode_logs/jobs 等）跳过：
+    - file_records/codes 数据可从 Telegram 频道重新索引
+    - decode_logs/jobs 是短期流水数据，无需长期备份
     """
-    # 大表黑名单：全表扫描 RU 太高，不备份
-    SKIP_TABLES = {"decode_logs", "jobs", "message_backups"}
-
     results = {}
     async with db_client._pool.acquire() as conn:
-        # 动态查询所有用户表(排除系统 schema)
-        tables = await conn.fetch("""
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_type = 'BASE TABLE'
-            ORDER BY table_name
-        """)
-        table_names = [r["table_name"] for r in tables]
+        for table in sorted(BACKUP_TABLES):
+            try:
+                safe_name = table.replace('"', '""')
+                records = await conn.fetch(
+                    f'SELECT * FROM "{safe_name}" LIMIT {MAX_ROWS_PER_TABLE}'
+                )
+                results[table] = [dict(r) for r in records]
+                logger.debug(f"[Backup] {table}: {len(records)} 行")
+            except Exception as e:
+                logger.debug(f"[Backup] 跳过表 {table}: {e}")
 
-        if not table_names:
-            # 兜底:手动列出所有表
-            table_names = [
-                "users", "file_records", "decode_logs", "cells", "codes",
-                "jobs", "rotate_log", "pending_uploads",
-                "spare_pool", "backup_config", "code_bot_mapping",
-                "message_backups",
-            ]
-
-        # 白名单校验，防止表名注入
-        allowed = set(ALL_TABLES)
-        for table in table_names:
-            if table not in allowed:
-                continue
-            if table in SKIP_TABLES:
-                logger.debug(f"跳过备份大表: {table}")
-                continue
-            records = await conn.fetch("SELECT * FROM \"{}\"".format(table))
-            results[table] = [dict(r) for r in records]
-
-        data = {"backup_time": datetime.now(timezone.utc).isoformat(), "tables": results}
-        return data
+    return {"backup_time": datetime.now(timezone.utc).isoformat(), "tables": results}
 
 
 async def run_db_backup():
@@ -70,7 +62,6 @@ async def run_db_backup():
         logger.warning("R2 凭证未配置,数据库备份跳过")
         return
 
-    # 确保数据库连接已建立
     if db_client._pool is None:
         try:
             from database import init_db
@@ -102,7 +93,11 @@ async def run_db_backup():
             data = await backup_all_tables()
             content = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
             await r2_storage.upload(key, content, "application/json")
-            logger.info(f"数据库已备份到 R2: {key} ({len(content)} 字节)")
+            total_rows = sum(len(v) for v in data["tables"].values())
+            logger.info(
+                f"数据库已备份到 R2: {key} ({len(content)} 字节, "
+                f"{len(data['tables'])} 表, {total_rows} 行)"
+            )
 
             for table in data["tables"]:
                 t_content = json.dumps(

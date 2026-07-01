@@ -309,7 +309,7 @@ async def _flush_decode_log_buffer_loop():
     from datetime import datetime, timezone, timedelta
     from .session import get_decode_logs_col, get_jobs_col
     from .cache_store import get_decode_log_buffer
-    from utils.config import settings
+    from config.settings import settings
 
     decode_logs_col = get_decode_logs_col()
     jobs_col = get_jobs_col()

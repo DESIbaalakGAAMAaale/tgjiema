@@ -62,12 +62,14 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     now = _time.time()
     if client_ip not in _login_failures:
         _login_failures[client_ip] = []
-    # 清理过期记录
+    # 清理过期记录，key 为空则删除避免内存泄漏
     _login_failures[client_ip] = [
         ts for ts in _login_failures[client_ip]
         if now - ts < _LOGIN_LIMIT_WINDOW
     ]
-    if len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
+    if not _login_failures[client_ip]:
+        del _login_failures[client_ip]
+    elif len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
             detail=f"登录尝试过于频繁,请 {_LOGIN_LIMIT_WINDOW // 60} 分钟后再试",
