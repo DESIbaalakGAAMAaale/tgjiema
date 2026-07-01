@@ -585,8 +585,7 @@ async def _process_pending_uploads(app: Application):
 
     while True:
         try:
-            if not await store.has_new_upload():
-                await asyncio.sleep(30)
+            if not await store.wait_for_new_upload(timeout=30.0):
                 continue
 
             pending_col = get_pending_uploads_col()

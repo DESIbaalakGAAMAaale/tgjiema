@@ -275,6 +275,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
         else:
             send_ok = await _process_single_job(bot, job, bot_id=worker_id)
         if send_ok:
+            await store.update_local_job_status(job.job_id, "done")
             await _send_report_button(bot, job.target_user_id, job.code)
     except Exception as e:
         logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
@@ -301,20 +302,14 @@ async def _dsp_worker(bot: Any, worker_id: int):
     """
     from database.cache_store import get_cache_store
     store = get_cache_store()
-    empty_polls = 0
 
     while True:
         try:
             raw_jobs = await store.get_local_pending_jobs(10)
             if not raw_jobs:
-                empty_polls += 1
-                if await store.has_new_dsp_job() and empty_polls < 5:
-                    continue
-                empty_polls = 0
-                await asyncio.sleep(2)
+                await store.wait_for_dsp_job(timeout=2.0)
                 continue
 
-            empty_polls = 0
             jobs = _raw_jobs_to_results(raw_jobs)
             for job in jobs:
                 await store.mark_local_job_dispatched(job.job_id)

@@ -1832,9 +1832,10 @@ async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
 # ─── D: SQLite 本地队列同步函数 ─────────────────────────────────
 
 async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
-    """Queue Syncer: 从 CRDB 拉取 pending/dispatched jobs 到本地 SQLite
+    """Queue Syncer: 从 CRDB 拉取 pending jobs 到本地 SQLite
     
-    启动时一次性 + 30 分钟兜底同步。空闲时 SELECT 返回空结果，RU 极低。
+    启动时一次性 + 30 分钟兜底同步。
+    仅同步真正未处理的 pending 任务，避免空闲时反复扫描历史 dispatched 记录。
     """
     from loguru import logger
     from .cache_store import get_cache_store
@@ -1842,7 +1843,7 @@ async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
     col = get_jobs_col()
     try:
         rows = await col.find(
-            {"status": {"$in": ["pending", "dispatched"]}},
+            {"status": "pending"},
             sort=("created_at", 1),
             limit=limit,
             projection=["id", "code", "target_user_id", "storage_channel_id",
@@ -1872,7 +1873,7 @@ async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
 async def sync_local_jobs_to_crdb():
     """Sync Back: 将本地 SQLite 中状态变更的 job 批量同步回 CRDB
     
-    每 30 秒调用一次。处理 retried/dead 状态的 job。
+    每 30 秒调用一次。处理 retried/dead/done 状态的 job。
     """
     from loguru import logger
     from .cache_store import get_cache_store
@@ -1898,6 +1899,13 @@ async def sync_local_jobs_to_crdb():
                     {"id": crdb_id},
                     {"$set": {"status": "dead", "dead_reason": job.get("dead_reason", "unknown")}},
                 )
+            elif status == "done":
+                await col.update_one(
+                    {"id": crdb_id},
+                    {"$set": {"status": "done"}},
+                )
+            else:
+                continue
             await store.mark_local_job_synced(crdb_id)
             synced += 1
         except Exception as e:

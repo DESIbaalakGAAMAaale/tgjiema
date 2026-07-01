@@ -280,6 +280,19 @@ class CacheStore:
         except Exception:
             return False
 
+    async def wait_for_new_upload(self, timeout: float = 30.0) -> bool:
+        """等待上传通知，空闲时使用退避轮询降低 SQLite 空转。"""
+        deadline = time.monotonic() + max(timeout, 0)
+        delay = 0.2
+        while True:
+            if await self.has_new_upload():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 5.0)
+
     # ─── Dsp Bot 通知：Idx Bot 写入 → Dsp Bot 感知 ───
 
     async def notify_dsp_new_job(self):
@@ -311,6 +324,19 @@ class CacheStore:
             return deleted > 0
         except Exception:
             return False
+
+    async def wait_for_dsp_job(self, timeout: float = 2.0) -> bool:
+        """等待派发通知，避免空队列时高频自旋。"""
+        deadline = time.monotonic() + max(timeout, 0)
+        delay = 0.1
+        while True:
+            if await self.has_new_dsp_job():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 1.0)
 
     async def close(self):
         if self._db:
@@ -700,7 +726,7 @@ class CacheStore:
         rows = await self._db.execute_fetchall(
             """SELECT crdb_id, status, retry_count, dead_reason
                FROM local_job_queue WHERE synced_at = 0 AND crdb_id > 0
-               AND status IN ('retried','dead')
+               AND status IN ('retried','dead','done')
                LIMIT 50"""
         )
         return [
