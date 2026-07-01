@@ -804,11 +804,32 @@ DDL_BUFFER_TABLES = [
 ]
 
 
+
 class DecodeLogBuffer:
     """Decode Logs 本地缓冲，定时批量 flush 到 CRDB
-    
+
     注意：缓冲表 DDL 由 CacheStore.init() 统一创建，此处无需重复。
     """
+
+    async def cleanup_old(self, days: int = 7) -> int:
+        """清理 N 天前的本地缓冲记录（0 RU，纯本地 SQLite）
+        Returns: 删除的行数
+        """
+        from loguru import logger
+        import time as _t
+        cutoff = _t.time() - days * 86400
+        try:
+            cursor = await self._db.execute(
+                "DELETE FROM decode_log_buffer WHERE buffered_at < ?", (cutoff,)
+            )
+            await self._db.commit()
+            deleted = cursor.rowcount or 0
+            if deleted > 0:
+                logger.info(f"[DecodeLog] 本地缓冲清理 {deleted} 条 {days} 天前记录")
+            return deleted
+        except Exception as e:
+            logger.warning(f"[DecodeLog] 本地缓冲清理失败: {e}")
+            return 0
 
     def __init__(self):
         self._db = None

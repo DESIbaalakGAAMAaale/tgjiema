@@ -223,9 +223,11 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     # ─── jobs 表补充───────────────────────────────────────────────
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
-    # ─── CRDB 行级 TTL：零 RU 自动清理，替代 Python cleanup ───
-    "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''7 days''', ttl_job_cron = '@hourly')",
-    "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''7 days''', ttl_job_cron = '@hourly')",
+    # ─── CRDB 行级 TTL 已废弃：hourly 全表扫描消耗大量 RU ───
+    # 改为 Python 端负责清理（见 database/cache.py: _flush_decode_log_buffer_loop）
+    # decode_logs / jobs 7 天前数据由本地清理循环处理
+    "ALTER TABLE decode_logs RESET (ttl_expiration_expression, ttl_job_cron)",
+    "ALTER TABLE jobs RESET (ttl_expiration_expression, ttl_job_cron)",
     # ─── 死信队列(Dead Letter Queue)──────────────────────────────
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_reason TEXT DEFAULT ''",
@@ -526,6 +528,45 @@ class D1Collection:
         sql += " LIMIT 1"
         await self._execute(sql, params)
         return True
+
+    async def delete_many(self, query: dict) -> int:
+        """删除匹配 query 的所有记录,返回实际删除条数。
+        用于清理任务(如过期 decode_logs / jobs),不依赖 CRDB TTL job。
+        """
+        params = []
+        where_parts = []
+        for k, v in query.items():
+            if isinstance(v, dict):
+                for op, val in v.items():
+                    if op == "$gte":
+                        where_parts.append(f"{k} >= ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$lte":
+                        where_parts.append(f"{k} <= ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$gt":
+                        where_parts.append(f"{k} > ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$lt":
+                        where_parts.append(f"{k} < ${len(params) + 1}")
+                        params.append(val)
+                    elif op == "$in":
+                        placeholders = [f"${len(params) + j + 1}" for j in range(len(val))]
+                        params.extend(val)
+                        where_parts.append(f"{k} IN ({', '.join(placeholders)})")
+                continue
+            where_parts.append(f"{k} = ${len(params) + 1}")
+            params.append(v)
+        sql = f"DELETE FROM {self.table}"
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+        async with _client._pool.acquire() as conn:
+            status = await conn.execute(sql, *params)
+            # asyncpg/CRDB 返回 "DELETE N" 格式
+            try:
+                return int(str(status).split()[-1])
+            except Exception:
+                return 0
 
     async def count_documents(self, query: dict) -> int:
         params = []

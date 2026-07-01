@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     ROTATION_FILES_PER_SLOT: int = 500         # 每槽位文件数上限
     ROTATION_TIME_PER_SLOT: int = 3600         # 每槽位最多使用时间（秒）
 
+    # ── 数据保留（替代废弃的 CRDB TTL job，0 RU 起） ──
+    DATA_RETENTION_DAYS: int = 7               # decode_logs / jobs 保留天数
+    CRDB_CLEANUP_CRON_HOURS: int = 6           # 清理周期（小时）
+    CRDB_CLEANUP_BATCH_SIZE: int = 5000        # 单批删除条数上限
+
     # ── 账号频道配置（部署时在 .env 中填写，无需编辑 groups.yaml） ──
     # 5 个账号 × 9 频道 = 45 频道 = 15 组
     # 格式: ACCOUNT_N_NAME=账号名, ACCOUNT_N_CHANNELS=频道ID,频道ID,...

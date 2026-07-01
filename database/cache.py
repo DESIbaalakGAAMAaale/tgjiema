@@ -298,11 +298,26 @@ _DECODE_LOG_FLUSH_INTERVAL = 30 * 60  # 30 分钟
 
 
 async def _flush_decode_log_buffer_loop():
-    """后台任务:混合策略 flush decode_logs 到 CRDB"""
+    """后台任务:混合策略 flush decode_logs 到 CRDB + 清理 7 天前数据
+
+    清理策略（替代废弃的 CRDB TTL job，0 RU 起）：
+    - decode_log_buffer（SQLite）：按 buffered_at 删 7 天前记录（0 RU）
+    - decode_logs（CRDB）：按 request_time 删 7 天前记录（每 30 分钟一次，分批）
+    - jobs（CRDB）：按 created_at 删 7 天前 done/failed 状态记录
+    """
     from loguru import logger
-    from .session import get_decode_logs_col
-    decode_logs_col = get_decode_logs_col()
+    from datetime import datetime, timezone, timedelta
+    from .session import get_decode_logs_col, get_jobs_col
     from .cache_store import get_decode_log_buffer
+    from utils.config import settings
+
+    decode_logs_col = get_decode_logs_col()
+    jobs_col = get_jobs_col()
+
+    cleanup_cron_hours = int(getattr(settings, "CRDB_CLEANUP_CRON_HOURS", 6))
+    cleanup_days = int(getattr(settings, "DATA_RETENTION_DAYS", 7))
+    cleanup_batch_size = int(getattr(settings, "CRDB_CLEANUP_BATCH_SIZE", 5000))
+    last_cleanup_at = 0.0
 
     while True:
         await asyncio.sleep(_DECODE_LOG_FLUSH_INTERVAL)
@@ -343,5 +358,46 @@ async def _flush_decode_log_buffer_loop():
                     pass
             else:
                 logger.debug("[DecodeLog] flush: no new logs")
+
+            # ── 0. 本地 SQLite 缓冲清理（0 RU）──────────────────
+            try:
+                await buf.cleanup_old(days=cleanup_days)
+            except Exception as e:
+                logger.warning(f"[DecodeLog] 本地缓冲清理异常: {e}")
+
+            # ── 1. CRDB 端周期清理（每 cleanup_cron_hours 跑一次，代替废弃的 TTL job）────
+            import time as _t
+            now = _t.time()
+            if now - last_cleanup_at < cleanup_cron_hours * 3600:
+                continue  # 还没到清理周期
+            last_cleanup_at = now
+
+            cutoff_iso = (datetime.now(timezone.utc) - timedelta(days=cleanup_days)).isoformat()
+            # CRDB decode_logs:按 request_time 删 7 天前记录（分批 5000 条避免大事务）
+            try:
+                deleted_total = 0
+                while True:
+                    deleted = await decode_logs_col.delete_many({
+                        "request_time": {"$lt": cutoff_iso}
+                    })
+                    deleted_total += deleted
+                    if deleted < cleanup_batch_size:
+                        break
+                    await asyncio.sleep(1)
+                if deleted_total > 0:
+                    logger.info(f"[Cleanup] decode_logs 删除 {deleted_total} 条 {cleanup_days} 天前记录")
+            except Exception as e:
+                logger.warning(f"[Cleanup] decode_logs 清理失败: {e}")
+
+            # CRDB jobs:按 created_at 删 7 天前已完成/失败记录（保留 dead_retry 队列）
+            try:
+                deleted = await jobs_col.delete_many({
+                    "created_at": {"$lt": cutoff_iso},
+                    "status": {"$in": ["done", "failed"]},
+                })
+                if deleted > 0:
+                    logger.info(f"[Cleanup] jobs 删除 {deleted} 条 {cleanup_days} 天前已完成记录")
+            except Exception as e:
+                logger.warning(f"[Cleanup] jobs 清理失败: {e}")
         except Exception as e:
             logger.error(f"[DecodeLog] flush failed: {e}")
