@@ -1421,15 +1421,16 @@ async def get_rotation_config(key: str) -> str | None:
 
 
 async def set_rotation_config(key: str, value: str):
-    """写入轮转配置"""
+    """写入轮转配置（值无变化时跳过UPDATE，省RU）"""
     import datetime as _dt
     col = get_rotation_config_col()
-    existing = await col.find_one({"config_key": key}, projection=["config_key"])
+    existing = await col.find_one({"config_key": key}, projection=["config_key", "config_value"])
     if existing:
-        await col.update_one(
-            {"config_key": key},
-            {"$set": {"config_value": value, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}},
-        )
+        if existing.get("config_value") != value:
+            await col.update_one(
+                {"config_key": key},
+                {"$set": {"config_value": value, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()}},
+            )
     else:
         await col.insert_one({
             "config_key": key,

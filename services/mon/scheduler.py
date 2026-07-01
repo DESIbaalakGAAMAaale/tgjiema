@@ -53,10 +53,11 @@ class MonScheduler:
         cfg = _load_mon_config()
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
-        # ─── last_synced_msg_id 本地缓存:每 5 次同步写一次 CRDB ───
+        # ─── last_synced_msg_id 本地缓存:每 30 次同步 flush 一次(30分钟)，且只 flush 有变化的 ───
         self._cursor_cache: dict[str, int] = {}
+        self._flushed_cursors: dict[str, int] = {}  # 已 flush 到 CRDB 的游标值
         self._replicate_count = 0
-        self._cursor_flush_interval = 5  # 每 N 次同步 flush 一次
+        self._cursor_flush_interval = 30  # 每 N 次同步 flush 一次(约30分钟)
 
     async def run_degrade_check(self, all_cells: list[dict], cell_fail_streak: dict[str, int] = None) -> list[str]:
         """执行一轮降级检查,返回日志描述列表。
@@ -265,18 +266,25 @@ class MonScheduler:
         return total_copied
 
     async def _flush_cursor_cache(self):
-        """批量 flush 本地缓存的游标到 CRDB。"""
+        """批量 flush 本地缓存的游标到 CRDB。只 flush 自上次以来有变化的游标。"""
         if not self._cursor_cache:
             return
         col = get_cells_col()
+        changed = 0
         for slot_id, cursor in self._cursor_cache.items():
+            if self._flushed_cursors.get(slot_id) == cursor:
+                continue  # 游标未变化，跳过，零 RU
             try:
                 await col.update_one(
                     {"slot_id": slot_id},
                     {"$set": {"last_synced_msg_id": cursor}},
                 )
+                self._flushed_cursors[slot_id] = cursor
+                changed += 1
             except Exception:
                 pass  # 下次同步自动重试
+        if changed > 0:
+            logger.debug(f"[Mon] flush 游标到 CRDB: {changed} 个有变化")
 
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
         """获取频道中最后游标之后的新消息(媒体文件)。

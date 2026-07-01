@@ -73,13 +73,16 @@ async def seed(dry_run: bool = False, force: bool = False):
     await init_db()
     col = get_cells_col()
 
-    existing = await col.find({})
-    existing_slot_ids = {r["slot_id"] for r in existing}
+    existing = await col.find({}, projection=["slot_id", "channel_id", "status",
+                                                "next_active_chat_id", "prev_slot_id",
+                                                "account_name", "is_r100"])
+    existing_map = {r["slot_id"]: r for r in existing}
 
-    print(f"\n数据库现有 {len(existing)} 个槽位,配置 {len(slots)} 个")
+    print(f"\n数据库现有 {len(existing_map)} 个槽位,配置 {len(slots)} 个")
 
     added = 0
     updated = 0
+    skipped = 0
     for slot in slots:
         sid = slot["slot_id"]
         update_data = {
@@ -91,11 +94,19 @@ async def seed(dry_run: bool = False, force: bool = False):
             "is_r100": 1 if slot.get("is_r100") else 0,
         }
 
-        if sid in existing_slot_ids:
-            await col.update_one({"slot_id": sid}, {"$set": update_data})
-            updated += 1
-            print(f"  [update] {sid} → channel={slot['channel_id']} status={slot['status']}")
+        if sid in existing_map:
+            old = existing_map[sid]
+            changed = any(
+                old.get(k) != v for k, v in update_data.items()
+            )
+            if changed:
+                await col.update_one({"slot_id": sid}, {"$set": update_data})
+                updated += 1
+                print(f"  [update] {sid} → channel={slot['channel_id']} status={slot['status']}")
+            else:
+                skipped += 1
         else:
+            from database import make_cell
             cell = make_cell(
                 slot_id=sid,
                 channel_id=slot["channel_id"],
@@ -110,7 +121,7 @@ async def seed(dry_run: bool = False, force: bool = False):
             print(f"  [create] {sid} → channel={slot['channel_id']} status={slot['status']}")
 
     await close_db()
-    print(f"\n完成: 新增 {added} 个, 更新 {updated} 个")
+    print(f"\n完成: 新增 {added} 个, 更新 {updated} 个, 跳过 {skipped} 个(无变化)")
 
     # ── 步骤4:初始化轮转配置(如果不存在) ──
     await init_db()

@@ -703,7 +703,7 @@ async def _async_main():
                 await sync_local_jobs_to_crdb()
             except Exception as e:
                 logger.debug(f"[SyncBack] 同步异常: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(120)
 
     loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")
