@@ -1866,7 +1866,7 @@ _cells_local_cache: list[dict] | None = None
 
 
 async def get_active_cells_local() -> list[dict]:
-    """E1: 本地 SQLite cells 快照优先,CRDB 兜底"""
+    """E1: 从本地 SQLite 加载 cells 快照 (0 RU)，无兜底"""
     global _cells_local_cache, _cells_local_version
     from .cache_store import get_cache_store
     store = get_cache_store()
@@ -1876,11 +1876,8 @@ async def get_active_cells_local() -> list[dict]:
         if cells:
             _cells_local_cache = cells
             _cells_local_version = version
-        else:
-            col = get_cells_col()
-            _cells_local_cache = await col.find({"status": "active"})
-            _cells_local_version = 0
-        return _cells_local_cache
+        # SQLite 未就绪时返回空列表，调用方需有 fallback 逻辑
+        return _cells_local_cache or []
 
     has_change, new_version = await store.has_cells_change(_cells_local_version)
     if has_change:
