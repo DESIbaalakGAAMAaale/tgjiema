@@ -116,14 +116,22 @@ async def health_check():
 async def dashboard(request: Request, admin=Depends(verify_admin)):
     import utils.shared_counters as _sc
 
-    # 首次加载或 TTL 过期（60s）时从 CRDB 初始化计数器
+    # 首次加载或 TTL 过期（60s）时从 SQLite 快照刷新计数器
     now = _time.time()
     if not _sc.status_counters_initialized or (now - _sc.status_counters_loaded_at > 60):
-        users_col = get_users_col()
-        files_col = get_file_records_col()
-        _sc.status_counters["total_users"] = await users_col.count_documents({})
-        _sc.status_counters["total_files"] = await files_col.count_documents({})
-        _sc.status_counters["active_files"] = await files_col.count_documents({"status": "active"})
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        cached = await store.load_counter_snapshot()  # 0 RU，SQLite
+        if cached and "total_users" in cached:
+            for k, v in cached.items():
+                _sc.status_counters[k] = v
+        else:
+            # SQLite 无数据时 CRDB 兜底
+            users_col = get_users_col()
+            files_col = get_file_records_col()
+            _sc.status_counters["total_users"] = await users_col.count_documents({})
+            _sc.status_counters["total_files"] = await files_col.count_documents({})
+            _sc.status_counters["active_files"] = await files_col.count_documents({"status": "active"})
         _sc.status_counters_initialized = True
         _sc.status_counters_loaded_at = now
 
