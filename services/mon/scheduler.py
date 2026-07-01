@@ -75,35 +75,34 @@ class MonScheduler:
 
         groups = self._group_slots(all_cells)
 
-        for _group_key, (a_slot, s1_slot, s2_slot) in groups.items():
-            if not a_slot:
+        for _group_key, group in groups.items():
+            active_slot = self._find_active_slot(group)
+            if not active_slot:
                 continue
 
-            is_r100 = a_slot.get("is_r100", 0) == 1
-            slot_id = a_slot["slot_id"]
+            a_slot, s1_slot, s2_slot = group
+            is_r100 = active_slot.get("is_r100", 0) == 1
+            slot_id = active_slot["slot_id"]
             fail_streak = cell_fail_streak.get(slot_id, 0)
 
-            # 连续失败次数未达阈值,跳过
             if fail_streak < FAIL_STREAK_DEGRADE_THRESHOLD:
                 continue
 
-            # ── 降级冷却时间分级(防抖动)—— 根据 degrade_count 递增 ──
-            degrade_count = a_slot.get("degrade_count", 0)
+            degrade_count = active_slot.get("degrade_count", 0)
             if degrade_count == 0:
-                cooldown = self.degrade_cooldown  # 默认 300s
+                cooldown = self.degrade_cooldown
             elif degrade_count == 1:
                 cooldown = 600
-            else:  # >= 2
+            else:
                 cooldown = 1200
 
-            # 冷却检查:从 last_heartbeat 推算上次降级时间
-            last_hb = a_slot.get("last_heartbeat", "")
+            last_hb = active_slot.get("last_heartbeat", "")
             if last_hb:
                 try:
                     hb_time = _dt.datetime.fromisoformat(last_hb)
                     elapsed = (_dt.datetime.now(_dt.timezone.utc) - hb_time).total_seconds()
                     if elapsed < cooldown:
-                        continue  # 冷却中,跳过本次降级
+                        continue
                 except (ValueError, TypeError):
                     pass
 
@@ -121,11 +120,13 @@ class MonScheduler:
                 )
                 continue
 
-            await self._degrade_group(a_slot, s1_slot, s2_slot, fail_streak)
+            promote_slot, cascade_slot = self._get_next_promotable(group)
+            await self._degrade_group(active_slot, promote_slot, cascade_slot, fail_streak, all_cells)
+            from_status = active_slot.get("status", "?")
             alerts.append(
-                f"[DEGRADE] {slot_id}(active→lost) "
-                f"→ {s1_slot['slot_id']}(shadow1→active) "
-                f"→ {s2_slot['slot_id']}(shadow2→shadow1) "
+                f"[DEGRADE] {slot_id}({from_status}→lost) "
+                f"→ {promote_slot['slot_id'] if promote_slot else 'none'}(shadow→active) "
+                f"→ {cascade_slot['slot_id'] if cascade_slot else 'none'}(shadow2→shadow1) "
                 f"连续失败{fail_streak}次"
             )
 
@@ -143,8 +144,6 @@ class MonScheduler:
             if group_num not in groups:
                 groups[group_num] = [None, None, None]
 
-            # 优先级: 以 slot_id 格式为准(aN=active, sNa=shadow1, sNb=shadow2)
-            # 注意: 不要与"a1a"混淆，实际命名是 "s1a"（见 generate_topology.py）
             if sid.endswith("a") and not sid.startswith("a"):
                 groups[group_num][1] = cell
             elif sid.endswith("b"):
@@ -154,67 +153,99 @@ class MonScheduler:
 
         return groups
 
+    @staticmethod
+    def _find_active_slot(group: list) -> dict | None:
+        """返回组内当前 status=active 的槽位,若无则返回 None。"""
+        for slot in group:
+            if slot and slot.get("status") == "active":
+                return slot
+        return None
+
+    @staticmethod
+    def _get_next_promotable(group: list) -> tuple[dict | None, dict | None]:
+        """返回组内下一个可提升的 shadow 槽位和后续 shadow 槽位。
+        返回 (promote_to_active, promote_to_shadow1)
+        - 若 s1 是 shadow1: 提升 s1→active, s2→shadow1
+        - 若 s1 是 shadow2/lost 但 s2 是 shadow1: 提升 s2→active
+        - 若无可用 shadow: 返回 (None, None)
+        """
+        a_slot, s1_slot, s2_slot = group
+        s1_ok = s1_slot and s1_slot.get("status") in ("shadow1", "shadow2")
+        s2_ok = s2_slot and s2_slot.get("status") in ("shadow1", "shadow2")
+        if s1_slot and s1_slot.get("status") == "shadow1":
+            return s1_slot, s2_slot if s2_slot and s2_slot.get("status") == "shadow2" else None
+        if s1_slot and s1_slot.get("status") in ("shadow2", "lost"):
+            if s2_slot and s2_slot.get("status") == "shadow1":
+                return s2_slot, None
+        if s2_slot and s2_slot.get("status") == "shadow1":
+            return s2_slot, None
+        return None, None
+
     async def _degrade_group(
-        self, a_slot: dict, s1_slot: dict, s2_slot: dict, fail_streak: int
+        self, failed_slot: dict, promote_slot: dict | None, cascade_slot: dict | None,
+        fail_streak: int, all_cells: list[dict],
     ):
-        """执行降级:active→lost, shadow1→active, shadow2→shadow1
-        
+        """执行降级:failed→lost, promote_slot→active, cascade_slot→shadow1
+
         使用 CRDB 事务保证原子性:所有状态变更要么全部成功,要么全部回滚。
         log_rotate 在事务提交成功后执行,避免事务内写入审计日志。
         """
-        now = _dt.datetime.now(_dt.timezone.utc)
-        now_iso = now.isoformat()
         log_entries = []
 
+        pred_slot_ids = []
+        if promote_slot:
+            failed_chan = failed_slot["channel_id"]
+            for c in all_cells:
+                if c.get("status") == "active" and c.get("next_active_chat_id") == failed_chan \
+                   and c["slot_id"] != failed_slot["slot_id"]:
+                    pred_slot_ids.append(c["slot_id"])
+
         async with _client.transaction() as conn:
-            # active → lost
             await conn.execute(
                 "UPDATE cells SET status = $1 WHERE slot_id = $2",
-                "lost", a_slot["slot_id"],
+                "lost", failed_slot["slot_id"],
             )
             log_entries.append((
-                a_slot["slot_id"], s1_slot["slot_id"] if s1_slot else "none",
-                "active", "lost",
+                failed_slot["slot_id"], promote_slot["slot_id"] if promote_slot else "none",
+                failed_slot.get("status", "active"), "lost",
                 f"fail_streak={fail_streak}", "mon",
             ))
 
-            # shadow1 → active
-            if s1_slot:
-                new_next = a_slot.get("next_active_chat_id")
+            if promote_slot:
+                new_next = failed_slot.get("next_active_chat_id")
+                promote_channel = promote_slot["channel_id"]
                 await conn.execute(
                     "UPDATE cells SET status = $1, next_active_chat_id = $2, degrade_count = $3 WHERE slot_id = $4",
-                    "active", new_next, a_slot.get("degrade_count", 0) + 1, s1_slot["slot_id"],
+                    "active", new_next, failed_slot.get("degrade_count", 0) + 1, promote_slot["slot_id"],
                 )
-                prev_id = a_slot.get("prev_slot_id")
-                if prev_id:
+                for pred_sid in pred_slot_ids:
                     await conn.execute(
                         "UPDATE cells SET next_active_chat_id = $1 WHERE slot_id = $2",
-                        new_next, prev_id,
+                        promote_channel, pred_sid,
                     )
                 log_entries.append((
-                    s1_slot["slot_id"], s1_slot["slot_id"],
-                    "shadow1", "active",
-                    f"promoted after {a_slot['slot_id']} timeout", "mon",
+                    promote_slot["slot_id"], promote_slot["slot_id"],
+                    promote_slot.get("status", "shadow1"), "active",
+                    f"promoted after {failed_slot['slot_id']} timeout", "mon",
                 ))
 
-            # shadow2 → shadow1
-            if s2_slot:
-                await conn.execute(
-                    "UPDATE cells SET status = $1 WHERE slot_id = $2",
-                    "shadow1", s2_slot["slot_id"],
-                )
+            if cascade_slot:
+                if cascade_slot.get("status") != "shadow1":
+                    await conn.execute(
+                        "UPDATE cells SET status = $1 WHERE slot_id = $2",
+                        "shadow1", cascade_slot["slot_id"],
+                    )
                 log_entries.append((
-                    s2_slot["slot_id"], s2_slot["slot_id"],
-                    "shadow2", "shadow1",
-                    f"cascade after {a_slot['slot_id']} timeout", "mon",
+                    cascade_slot["slot_id"], cascade_slot["slot_id"],
+                    cascade_slot.get("status", "shadow2"), "shadow1",
+                    f"cascade after {failed_slot['slot_id']} timeout", "mon",
                 ))
 
-        # 事务提交成功后再写审计日志
         for entry in log_entries:
             await log_rotate(*entry)
 
     async def replicate_all_active_to_shadows(self, bot_instance, all_cells: list[dict]) -> int:
-        """核心功能:将每个 Active A 槽的新消息复制到对应的 Shadow1/Shadow2。
+        """核心功能:将每个 Active 槽的新消息复制到同组的 Shadow 槽位。
 
         这是 Mon 的「写入」职责——替代原 backup_bot 的文件备份功能。
         返回复制的消息总数。
@@ -226,40 +257,34 @@ class MonScheduler:
         groups = self._group_slots(all_cells)
         total_copied = 0
 
-        for _group_key, (a_slot, s1_slot, s2_slot) in groups.items():
-            if not a_slot or a_slot["status"] != "active":
+        for _group_key, group in groups.items():
+            active_slot = self._find_active_slot(group)
+            if not active_slot:
                 continue
 
-            # 读游标:优先用本地缓存,避免依赖 CRDB 数据
-            slot_id = a_slot["slot_id"]
-            last_cursor = self._cursor_cache.get(slot_id) or a_slot.get("last_synced_msg_id") or 0
+            a_slot, s1_slot, s2_slot = group
+            shadows = [s for s in (s1_slot, s2_slot) if s and s.get("status") in ("shadow1", "shadow2")]
+            if not shadows:
+                continue
+
+            slot_id = active_slot["slot_id"]
+            last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
             new_messages = await self._fetch_new_messages(
-                bot_instance, a_slot["channel_id"], last_cursor
+                bot_instance, active_slot["channel_id"], last_cursor
             )
             if not new_messages:
                 continue
 
-            # 复制到 shadow1
-            if s1_slot:
-                copied_1 = await self._copy_messages(
-                    bot_instance, a_slot["channel_id"],
-                    s1_slot["channel_id"], new_messages,
+            for shadow in shadows:
+                copied = await self._copy_messages(
+                    bot_instance, active_slot["channel_id"],
+                    shadow["channel_id"], new_messages,
                 )
-                total_copied += copied_1
+                total_copied += copied
 
-            # 复制到 shadow2
-            if s2_slot:
-                copied_2 = await self._copy_messages(
-                    bot_instance, a_slot["channel_id"],
-                    s2_slot["channel_id"], new_messages,
-                )
-                total_copied += copied_2
-
-            # 更新游标:本地缓存 + 定期 flush CRDB
             latest_id = max(msg.message_id for msg in new_messages if msg)
             self._cursor_cache[slot_id] = latest_id
 
-        # 每 N 次同步批量 flush 游标到 CRDB
         if self._replicate_count % self._cursor_flush_interval == 0:
             await self._flush_cursor_cache()
 
@@ -341,29 +366,30 @@ class MonScheduler:
         col = get_cells_col()
         total_filled = 0
 
-        for _group_key, (a_slot, s1_slot, s2_slot) in groups.items():
-            if not a_slot or a_slot["status"] != "active":
+        for _group_key, group in groups.items():
+            active_slot = self._find_active_slot(group)
+            if not active_slot:
                 continue
 
-            active_channel = a_slot["channel_id"]
+            active_channel = active_slot["channel_id"]
+            a_slot, s1_slot, s2_slot = group
 
             for shadow_slot in [s1_slot, s2_slot]:
                 if not shadow_slot:
                     continue
+                if shadow_slot["slot_id"] == active_slot["slot_id"]:
+                    continue
 
                 last_synced = shadow_slot.get("last_synced_msg_id") or 0
                 if last_synced > 0:
-                    continue  # 已有同步记录,走增量
+                    continue
 
-                # 检查该 shadow 频道是否为空(或几乎为空)
                 shadow_empty = await self._is_channel_nearly_empty(
                     bot_instance, shadow_slot["channel_id"]
                 )
                 if not shadow_empty:
-                    # 有内容但不是通过 Mon 同步的,跳过
                     continue
 
-                # 从 Active 获取所有媒体消息
                 all_media = await self._fetch_all_media(bot_instance, active_channel)
                 if not all_media:
                     continue
@@ -373,7 +399,6 @@ class MonScheduler:
                     shadow_slot["channel_id"], all_media,
                 )
                 if filled > 0:
-                    # 更新游标
                     latest_id = max(msg.message_id for msg in all_media)
                     await col.update_one(
                         {"slot_id": shadow_slot["slot_id"]},

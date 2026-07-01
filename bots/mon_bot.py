@@ -10,6 +10,7 @@
 
 import asyncio
 import datetime as _dt
+import re
 import time
 
 from loguru import logger
@@ -305,14 +306,13 @@ class MonBot:
 
     async def _check_rotation(self, all_cells: list[dict]):
         """检查活跃频道窗口是否该轮转。
-        条件:当前窗口内任一活跃频道满足 file_count >= files_per_slot
-              或 rotation time >= time_per_slot
-        切换:将当前窗口的 status 由 active 改为 rotation(临时)标记,
-              推进窗口指针到下一组。
+        条件:任一活跃频道满足 file_count >= files_per_slot 或 rotation time >= time_per_slot
+        轮转:将环形链表中最早的 window_size 个 active 槽位休眠(shadow1),
+              唤醒对应组的下一个 shadow 槽位,修复环形链表指针。
         """
         active_cells = [c for c in all_cells if c.get("status") == "active"]
         if not active_cells:
-            return
+            return False
 
         window_size = self._rotation.get("active_window_size", 3)
         files_per_slot = self._rotation.get("files_per_slot", 500)
@@ -320,16 +320,15 @@ class MonBot:
 
         now = _dt.datetime.now(_dt.timezone.utc)
         should_rotate = False
+        trigger_cell = None
 
         for cell in active_cells:
-            # 检查文件数
             fc = cell.get("file_count") or 0
             if fc >= files_per_slot:
                 logger.info(f"[Mon][Rotation] {cell['slot_id']} file_count={fc} >= {files_per_slot},触发轮转")
                 should_rotate = True
+                trigger_cell = cell
                 break
-
-            # 检查时间
             rts = cell.get("rotation_started_at")
             if rts:
                 try:
@@ -338,6 +337,7 @@ class MonBot:
                     if elapsed >= time_per_slot:
                         logger.info(f"[Mon][Rotation] {cell['slot_id']} 已运行 {elapsed:.0f}s >= {time_per_slot}s,触发轮转")
                         should_rotate = True
+                        trigger_cell = cell
                         break
                 except (ValueError, TypeError):
                     pass
@@ -345,66 +345,110 @@ class MonBot:
         if not should_rotate:
             return False
 
-        # ── 执行轮转:将当前窗口全部标记为 shadow1(休眠),推进窗口 ──
-        # 使用 CRDB 事务保证原子性:所有 update 要么全部成功,要么全部回滚
-        # 避免中途失败导致部分槽位状态不一致
-
-        # 先计算分组和窗口信息(在事务外,避免长事务)
         groups = self.scheduler._group_slots(all_cells)
-        all_group_keys = sorted(groups.keys(), key=lambda x: int(x))
-
-        if not all_group_keys:
+        if not groups:
             logger.warning("[Mon][Rotation] 无有效分组,跳过轮转")
-            return
+            return False
 
-        # 找到当前 active 窗口的起始位置
-        current_idx = 0
-        for i, gkey in enumerate(all_group_keys):
-            a_slot = groups[gkey][0]
-            if a_slot and a_slot.get("status") == "active":
-                current_idx = i
-                break
+        channel_to_cell = {c["channel_id"]: c for c in active_cells}
 
-        # 计算下一窗口的组键列表
-        next_window_keys = []
-        for i in range(window_size):
-            wi = (current_idx + window_size + i) % len(all_group_keys)
-            next_window_keys.append(all_group_keys[wi])
+        def _ring_order(start_cell: dict) -> list[dict]:
+            ordered = []
+            visited = set()
+            current = start_cell
+            while current and current["channel_id"] not in visited:
+                visited.add(current["channel_id"])
+                if current.get("status") == "active":
+                    ordered.append(current)
+                nxt_id = current.get("next_active_chat_id")
+                current = channel_to_cell.get(nxt_id) if nxt_id else None
+            for c in active_cells:
+                if c["channel_id"] not in visited:
+                    ordered.append(c)
+            return ordered
+
+        if trigger_cell:
+            ring_ordered = _ring_order(trigger_cell)
+        else:
+            ring_ordered = _ring_order(active_cells[0])
+
+        to_demote = ring_ordered[:window_size]
+        if len(to_demote) < window_size:
+            logger.warning(f"[Mon][Rotation] 活跃槽位不足 {window_size} 个,跳过轮转")
+            return False
 
         now_iso = now.isoformat()
+        demoted_slots = []
+        promoted_slots = []
+        cascade_slots = []
+        ring_repairs = []
+
+        next_reverse: dict[int, list[dict]] = {}
+        for c in active_cells:
+            nxt = c.get("next_active_chat_id")
+            if nxt:
+                next_reverse.setdefault(nxt, []).append(c)
+
+        for cell in to_demote:
+            sid = cell["slot_id"]
+            m = re.match(r'[as](\d+)', sid)
+            if not m:
+                continue
+            gnum = m.group(1)
+            group = groups.get(gnum)
+            if not group:
+                continue
+            demoted_slots.append(cell)
+            promote, cascade = self.scheduler._get_next_promotable(group)
+            if promote:
+                promoted_slots.append((promote, cell))
+                if cascade:
+                    cascade_slots.append(cascade)
+                preds = next_reverse.get(cell["channel_id"], [])
+                for pred in preds:
+                    if pred["slot_id"] != cell["slot_id"]:
+                        ring_repairs.append((pred["slot_id"], promote["channel_id"]))
+            else:
+                logger.warning(f"[Mon][Rotation] {sid} 无可用 shadow 提升,仅休眠不替换")
+
+        if not promoted_slots:
+            logger.warning("[Mon][Rotation] 无可提升的 shadow 槽位,跳过轮转")
+            return False
+
         async with _client.transaction() as conn:
-            # 休眠当前窗口(active → shadow1)
-            for i in range(window_size):
-                wi = (current_idx + i) % len(all_group_keys)
-                gkey = str(all_group_keys[wi])
-                if gkey in groups and groups[gkey][0]:
-                    a_slot = groups[gkey][0]
+            for cell in demoted_slots:
+                if cell.get("status") != "shadow1":
                     await conn.execute(
                         "UPDATE cells SET status = $1, file_count = 0, rotation_started_at = $2 WHERE slot_id = $3",
-                        "shadow1", now_iso, a_slot["slot_id"],
+                        "shadow1", now_iso, cell["slot_id"],
                     )
-                    logger.info(f"[Mon][Rotation] 休眠 {a_slot['slot_id']}")
 
-            # 唤醒下一窗口(shadow1 → active)
-            for gkey in next_window_keys:
-                if gkey in groups and len(groups[gkey]) > 1 and groups[gkey][1]:
-                    s1_slot = groups[gkey][1]
-                    target_active = groups[gkey][0] if len(groups[gkey]) > 0 else None
-                    nxt = target_active.get("next_active_chat_id") if target_active else None
+            for promote_slot, from_cell in promoted_slots:
+                nxt = from_cell.get("next_active_chat_id")
+                await conn.execute(
+                    "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3 WHERE slot_id = $4",
+                    "active", nxt, now_iso, promote_slot["slot_id"],
+                )
+
+            for cascade_slot in cascade_slots:
+                if cascade_slot.get("status") != "shadow1":
                     await conn.execute(
-                        "UPDATE cells SET status = $1, next_active_chat_id = $2, file_count = 0, rotation_started_at = $3 WHERE slot_id = $4",
-                        "active", nxt, now_iso, s1_slot["slot_id"],
+                        "UPDATE cells SET status = $1 WHERE slot_id = $2",
+                        "shadow1", cascade_slot["slot_id"],
                     )
-                    # 同组的原 active → shadow1(如果还没变的话)
-                    if target_active and target_active["status"] == "active":
-                        await conn.execute(
-                            "UPDATE cells SET status = $1 WHERE slot_id = $2",
-                            "shadow1", target_active["slot_id"],
-                        )
-                    logger.info(f"[Mon][Rotation] 唤醒 {s1_slot['slot_id']} → active")
 
-        # 轮转完成，只记录日志，通知由 start() 循环统一控制频率
-        logger.info(f"[Mon][Rotation] 轮转完成: 窗口 {all_group_keys[current_idx]}-{all_group_keys[(current_idx + window_size - 1) % len(all_group_keys)]} → {next_window_keys[0]}-{next_window_keys[-1]}")
+            for prev_slot_id, new_next in ring_repairs:
+                await conn.execute(
+                    "UPDATE cells SET next_active_chat_id = $1 WHERE slot_id = $2",
+                    new_next, prev_slot_id,
+                )
+
+        for cell in demoted_slots:
+            logger.info(f"[Mon][Rotation] 休眠 {cell['slot_id']}")
+        for promote_slot, from_cell in promoted_slots:
+            logger.info(f"[Mon][Rotation] 唤醒 {promote_slot['slot_id']}→active (替换 {from_cell['slot_id']})")
+
+        logger.info(f"[Mon][Rotation] 轮转完成: 休眠{len(demoted_slots)}个, 唤醒{len(promoted_slots)}个")
         return True
 
     async def start(self):
