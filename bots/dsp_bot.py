@@ -19,7 +19,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from loguru import logger
 
 from config import settings
-from database import get_file_record_cached, get_pending_jobs_count_local, set_cell_status, get_active_or_shadow_cell
+from database import get_file_record_cached, get_pending_jobs_count_local
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
@@ -93,13 +93,16 @@ async def _cleanup_channel_limiter_loop():
 
 
 async def _retry_dead_jobs():
-    """每小时重试一次死信队列中的 job"""
-    from database import get_and_reset_dead_jobs
+    """每小时重试本地死信队列中的 job（0 RU）"""
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
     while True:
         try:
-            dead_ids = await get_and_reset_dead_jobs(max_count=10)
-            if dead_ids:
-                logger.info(f"[Dsp] 死信重试: 重置 {len(dead_ids)} 个 job")
+            dead_jobs = await store.get_local_dead_jobs(limit=10, max_dead_retry=2)
+            if dead_jobs:
+                for dj in dead_jobs:
+                    await store.retry_local_dead_job(dj["crdb_id"])
+                logger.info(f"[Dsp] 本地死信重试: 重置 {len(dead_jobs)} 个 job")
         except Exception as e:
             logger.error(f"[Dsp] 死信重试异常: {e}")
         await asyncio.sleep(3600)
@@ -134,33 +137,37 @@ async def _check_channel_degrade(channel_id: int):
     if fail_count < _CHANNEL_FAILURE_THRESHOLD:
         return
 
-    # 超过阈值触发降级
+    # 超过阈值触发降级(兜底机制,Dsp 侧作为 Mon 的补充)
     try:
-        cell = await get_active_or_shadow_cell(channel_id)
+        from database.session import get_cell_by_channel_local
+        from database.cache_store import get_cache_store
+        cell = await get_cell_by_channel_local(channel_id)
         if not cell:
-            logger.warning(f"[Dsp] 降级失败: 频道 {channel_id} 不在 cells 表中")
+            logger.warning(f"[Dsp] 降级失败: 频道 {channel_id} 不在 cells 中")
             _channel_failures.pop(channel_id, None)
             return
 
         slot_id = cell.get("slot_id")
         current_status = cell.get("status", "")
-        if current_status == "lost":
-            # 已经是 lost 状态,无需重复降级
+        if current_status in ("lost", "shadow2"):
             _channel_failures.pop(channel_id, None)
             return
         if current_status == "r100":
-            # R100 槽位永不自降
             logger.warning(f"[Dsp] 频道 {channel_id} 为 R100 槽位,跳过降级")
             _channel_failures.pop(channel_id, None)
             return
 
-        await set_cell_status(slot_id, "lost")
+        store = get_cache_store()
+        new_degrade_count = cell.get("degrade_count", 0) + 1
+        await store.update_cell_fields_local(slot_id, {
+            "status": "lost",
+            "degrade_count": new_degrade_count,
+            "next_active_chat_id": None,
+        }, mark_dirty=True)
         logger.warning(
-            f"[Dsp] 频道降级触发: {slot_id} (channel={channel_id}) "
-            f"status={current_status}→lost, "
-            f"窗口内失败{fail_count}次/{_CHANNEL_FAILURE_WINDOW}s"
+            f"[Dsp] 频道降级触发(兜底): {slot_id} (channel={channel_id}) "
+            f"status={current_status}→lost, fail={fail_count}"
         )
-        # 降级成功后清除该频道失败记录
         _channel_failures.pop(channel_id, None)
     except Exception as e:
         logger.error(f"[Dsp] 频道降级异常 (channel={channel_id}): {e}")
@@ -264,7 +271,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
     try:
         await asyncio.wait_for(_send_semaphore.acquire(), timeout=10.0)
     except asyncio.TimeoutError:
-        await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count + 1)
+        await store.retry_local_job(job.job_id, job.retry_count + 1)
         logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时 job={job.job_id}")
         return False
 
@@ -283,11 +290,12 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
         _send_semaphore.release()
 
     if not send_ok:
-        if job.retry_count >= 3:
+        new_retry = job.retry_count + 1
+        if new_retry >= 3:
             await store.update_local_job_status(job.job_id, "dead", dead_reason=f"发送失败,已重试{job.retry_count}次: {job.code}")
         else:
-            await store.update_local_job_status(job.job_id, "retried", retry_count=job.retry_count + 1)
-            logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{job.retry_count + 1}")
+            await store.retry_local_job(job.job_id, new_retry)
+            logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{new_retry}")
 
         # Dsp 侧降级检查
         for ch_id in list(_channel_failures.keys()):
@@ -681,9 +689,9 @@ async def _async_main():
             await sync_jobs_from_crdb_to_sqlite(100)
         except Exception as e:
             logger.warning(f"[Dsp] 启动同步异常: {e}")
-        # 之后每 30 分钟轻量同步 + 清理旧记录
+        # 之后每 6 小时轻量同步 + 清理旧记录(兜底,正常流程零 CRDB 依赖)
         while True:
-            await asyncio.sleep(1800)
+            await asyncio.sleep(21600)
             try:
                 await sync_jobs_from_crdb_to_sqlite(100)
                 await store.cleanup_local_jobs(7)

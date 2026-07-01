@@ -1915,6 +1915,47 @@ async def sync_local_jobs_to_crdb():
         logger.debug(f"[SyncBack] 同步 {synced} 条 job 状态到 CRDB")
 
 
+async def sync_dirty_cells_to_crdb():
+    """Sync Back: 将本地 SQLite 中脏 cells（状态/路由变更）批量同步回 CRDB
+    
+    每 60 秒调用一次。仅同步异常事件和路由变更（ban/lost/rotation/degrade）。
+    心跳、file_count、cursor 等高频数据不回写 CRDB。
+    """
+    import datetime as _dt
+    from loguru import logger
+    from .cache_store import get_cache_store
+
+    store = get_cache_store()
+    dirty = await store.get_dirty_cells_local(50)
+    if not dirty:
+        return
+
+    col = get_cells_col()
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    synced = 0
+    for cell in dirty:
+        try:
+            set_fields = {"updated_at": now_iso}
+            for key in ("channel_id", "status", "next_active_chat_id", "account_name",
+                        "is_r100", "degrade_count", "file_count", "rotation_started_at"):
+                if key in cell and cell[key] is not None:
+                    set_fields[key] = cell[key]
+            if cell.get("status") == "lost":
+                set_fields["next_active_chat_id"] = None
+            await col.update_one(
+                {"slot_id": cell["slot_id"]},
+                {"$set": set_fields},
+                upsert=True,
+            )
+            await store.mark_cell_synced_local(cell["slot_id"])
+            synced += 1
+        except Exception as e:
+            logger.debug(f"[SyncBack] 同步 cell={cell['slot_id']} 失败: {e}")
+
+    if synced > 0:
+        logger.debug(f"[SyncBack] 同步 {synced} 条 cell 到 CRDB")
+
+
 async def get_pending_jobs_count_local() -> int:
     """D: 从本地 SQLite 获取 pending 任务数(0 RU)"""
     from .cache_store import get_cache_store
@@ -1973,6 +2014,23 @@ async def get_all_cells_local() -> list[dict]:
     if snap_cells:
         await store.bulk_upsert_cells_local(snap_cells)
     return snap_cells or []
+
+
+_cell_by_ch_cache: dict[int, dict] = {}
+_cell_by_ch_ts: float = 0
+_cell_by_ch_ttl: float = 5.0
+
+
+async def get_cell_by_channel_local(channel_id: int) -> dict | None:
+    """按 channel_id 从本地 SQLite 查询 cell (0 RU)，带 5 秒进程内缓存。"""
+    global _cell_by_ch_cache, _cell_by_ch_ts
+    now = _time.time()
+    if _cell_by_ch_cache and (now - _cell_by_ch_ts) < _cell_by_ch_ttl:
+        return _cell_by_ch_cache.get(channel_id)
+    all_cells = await get_all_cells_local()
+    _cell_by_ch_cache = {c["channel_id"]: c for c in all_cells if "channel_id" in c}
+    _cell_by_ch_ts = now
+    return _cell_by_ch_cache.get(channel_id)
 
 
 async def set_code_expiry(code: str, expires_at: str):

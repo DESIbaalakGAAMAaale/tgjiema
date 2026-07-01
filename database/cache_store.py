@@ -99,9 +99,14 @@ class CacheStore:
                 created_at    TEXT,
                 dispatched_at TEXT,
                 dead_reason   TEXT,
+                dead_retry_count INTEGER DEFAULT 0,
                 synced_at     REAL DEFAULT 0
             )"""
         )
+        try:
+            await self._db.execute("ALTER TABLE local_job_queue ADD COLUMN dead_retry_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_local_job_pending ON local_job_queue(status, created_at)"
         )
@@ -635,13 +640,13 @@ class CacheStore:
         return {"crdb_id": rows[0][0]} if rows else None
 
     async def upsert_local_job(self, job: dict):
-        """将 CRDB job 数据同步到本地队列"""
+        """将 CRDB job 数据同步到本地队列（仅插入不存在的 job，不覆盖本地状态）"""
         if not self._db:
             return
         for attempt in range(3):
             try:
                 await self._db.execute(
-                    """INSERT OR REPLACE INTO local_job_queue
+                    """INSERT OR IGNORE INTO local_job_queue
                     (crdb_id, code, target_user_id, storage_channel_id,
                      storage_msg_ids, batch_file_meta, task_type, status,
                      retry_count, protect_content, created_at)
@@ -718,6 +723,41 @@ class CacheStore:
                 (status, crdb_id),
             )
         await self._db.commit()
+
+    async def retry_local_job(self, crdb_id: int, new_retry_count: int):
+        """将失败 job 重置为 pending 状态，递增 retry_count，清空 dispatched_at，唤醒 worker。"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE local_job_queue SET status='pending', retry_count=?, dispatched_at=NULL, synced_at=0 WHERE crdb_id=?",
+            (new_retry_count, crdb_id),
+        )
+        await self._db.commit()
+        await self.notify_dsp_new_job()
+
+    async def get_local_dead_jobs(self, limit: int = 10, max_dead_retry: int = 2) -> list[dict]:
+        """获取可重试的本地 dead jobs（dead_retry_count < max_dead_retry）。"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT crdb_id, retry_count, dead_reason, COALESCE(dead_retry_count,0) as drc
+               FROM local_job_queue WHERE status='dead' AND COALESCE(dead_retry_count,0) < ?
+               ORDER BY created_at LIMIT ?""",
+            (max_dead_retry, limit),
+        )
+        return [{"crdb_id": r[0], "retry_count": r[1], "dead_reason": r[2], "dead_retry_count": r[3]} for r in rows]
+
+    async def retry_local_dead_job(self, crdb_id: int):
+        """将 dead job 重置为 pending，重置 retry_count=0，递增 dead_retry_count。"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE local_job_queue SET status='pending', retry_count=0, dispatched_at=NULL, "
+            "dead_retry_count=COALESCE(dead_retry_count,0)+1, synced_at=0 WHERE crdb_id=?",
+            (crdb_id,),
+        )
+        await self._db.commit()
+        await self.notify_dsp_new_job()
 
     async def get_local_unsynced_jobs(self) -> list[dict]:
         """获取需要同步回 CRDB 的 job(状态变更未同步,仅 crdb_id>0 的)"""
@@ -1045,12 +1085,12 @@ class CacheStore:
             return []
         rows = await self._db.execute_fetchall(
             """SELECT slot_id, channel_id, status, next_active_chat_id, account_name,
-                      is_r100, degrade_count
+                      is_r100, degrade_count, file_count, rotation_started_at
                FROM cells_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
         cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "account_name",
-                "is_r100", "degrade_count"]
+                "is_r100", "degrade_count", "file_count", "rotation_started_at"]
         return [dict(zip(cols, r)) for r in rows]
 
     async def mark_cell_synced_local(self, slot_id: str):

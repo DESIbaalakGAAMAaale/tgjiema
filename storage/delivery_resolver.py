@@ -6,9 +6,7 @@ import asyncio
 import time
 from loguru import logger
 from database import (
-    get_active_or_shadow_cell,
-    get_next_active_cell,
-    get_cells_col,
+    get_cell_by_channel_local,
 )
 from utils.flood_waiter import safe_copy_message
 from utils.per_channel_limiter import acquire_channel_limit
@@ -57,11 +55,11 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
         cell = None  # 缓存过期或未命中,强制重新查询
 
     if cell is None:
-        cell = await get_active_or_shadow_cell(primary_channel_id)
-        _cell_cache[primary_channel_id] = (cell, time.monotonic())
+        cell = await get_cell_by_channel_local(primary_channel_id)
+        if cell is not None:
+            _cell_cache[primary_channel_id] = (cell, time.monotonic())
 
     if cell is None:
-        # 该频道不在 cells 表中,直接返回原频道
         return DeliveryChannel(primary_channel_id, "unknown", "direct")
 
     status = cell["status"]
@@ -100,13 +98,7 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
             all_cells = cells
         else:
             snap_cells, _ = await store.load_cells_snapshot()
-            if snap_cells:
-                all_cells = snap_cells
-            else:
-                col = get_cells_col()
-                all_cells = list(await col.find({}, projection=[
-                    "slot_id", "channel_id", "status", "next_active_chat_id",
-                ]))
+            all_cells = snap_cells or []
 
     if not all_cells:
         return DeliveryChannel(channel_id, "unknown", "fallback")

@@ -243,18 +243,6 @@ class MonBot:
             await consume_spare(spare_ch)
             new_status = status if status in ("active", "shadow1", "shadow2", "r100") else "active"
             now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            col = get_cells_col()
-            await col.update_one(
-                {"slot_id": slot_id},
-                {"$set": {
-                    "channel_id": spare_ch,
-                    "status": new_status,
-                    "account_name": account_name,
-                    "file_count": 0,
-                    "rotation_started_at": now_iso,
-                    "updated_at": now_iso,
-                }},
-            )
             await store.update_cell_fields_local(slot_id, {
                 "channel_id": spare_ch,
                 "status": new_status,
@@ -285,14 +273,8 @@ class MonBot:
                 "/spare_add <频道ID> [账号名]\n"
             )
             if status in ("active", "shadow1", "shadow2"):
-                col = get_cells_col()
-                now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-                await col.update_one(
-                    {"slot_id": slot_id},
-                    {"$set": {"status": "lost", "updated_at": now_iso}},
-                )
-                await store.update_cell_fields_local(slot_id, {"status": "lost"}, mark_dirty=True)
-                self._update_cell_in_cache(slot_id, {"status": "lost"})
+                await store.update_cell_fields_local(slot_id, {"status": "lost", "next_active_chat_id": None}, mark_dirty=True)
+                self._update_cell_in_cache(slot_id, {"status": "lost", "next_active_chat_id": None})
                 await log_rotate(
                     from_slot_id=slot_id, to_slot_id="NONE",
                     from_status=status, to_status="lost",
@@ -425,7 +407,7 @@ class MonBot:
             if cell.get("status") != "shadow1":
                 batch_updates.append((cell["slot_id"], {
                     "status": "shadow1", "file_count": 0, "next_active_chat_id": None,
-                }, False))
+                }, True))
                 self._update_cell_in_cache(cell["slot_id"], {
                     "status": "shadow1", "file_count": 0, "next_active_chat_id": None,
                 })
@@ -437,20 +419,20 @@ class MonBot:
             batch_updates.append((promote_slot["slot_id"], {
                 "status": "active", "next_active_chat_id": nxt,
                 "file_count": 0, "rotation_started_at": now_iso,
-            }, False))
+            }, True))
             self._update_cell_in_cache(promote_slot["slot_id"], {
                 "status": "active", "next_active_chat_id": nxt,
                 "file_count": 0, "rotation_started_at": now_iso,
             })
 
         for cascade_slot in cascade_slots:
-            batch_updates.append((cascade_slot["slot_id"], {"status": "shadow1"}, False))
+            batch_updates.append((cascade_slot["slot_id"], {"status": "shadow1"}, True))
             self._update_cell_in_cache(cascade_slot["slot_id"], {"status": "shadow1"})
 
         for prev_slot_id, new_next in ring_repairs:
             if new_next and new_next in demoted_ch_to_promoted_ch:
                 new_next = demoted_ch_to_promoted_ch[new_next]
-            batch_updates.append((prev_slot_id, {"next_active_chat_id": new_next}, False))
+            batch_updates.append((prev_slot_id, {"next_active_chat_id": new_next}, True))
             self._update_cell_in_cache(prev_slot_id, {"next_active_chat_id": new_next})
 
         store = get_cache_store()
@@ -545,6 +527,14 @@ class MonBot:
                             logger.warning(issue)
                     else:
                         logger.info("[Mon] 拓扑校验: 健康")
+
+                # 6.5 脏数据同步到 CRDB(每 10 轮一次,~5分钟)
+                if self._cycle_count % 10 == 0:
+                    try:
+                        from database.session import sync_dirty_cells_to_crdb
+                        await sync_dirty_cells_to_crdb()
+                    except Exception as e:
+                        logger.debug(f"[Mon] 脏数据同步异常: {e}")
 
                 # 7. 报告当前拓扑状态(从缓存读取,不查 DB)
                 await self._report_status(all_cells)

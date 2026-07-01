@@ -9,7 +9,6 @@ from typing import Any
 import yaml
 from loguru import logger
 from database import (
-    get_cells_col,
     log_rotate,
 )
 from utils.flood_waiter import safe_copy_message, reset_backoff
@@ -227,13 +226,13 @@ class MonScheduler:
                 "status": "active",
                 "next_active_chat_id": new_next,
                 "degrade_count": new_degrade_count,
-            }, False))
+            }, True))
             promote_slot["status"] = "active"
             promote_slot["next_active_chat_id"] = new_next
             promote_slot["degrade_count"] = new_degrade_count
 
             for pred_sid in pred_slot_ids:
-                batch_updates.append((pred_sid, {"next_active_chat_id": promote_channel}, False))
+                batch_updates.append((pred_sid, {"next_active_chat_id": promote_channel}, True))
                 for c in all_cells:
                     if c["slot_id"] == pred_sid:
                         c["next_active_chat_id"] = promote_channel
@@ -247,7 +246,7 @@ class MonScheduler:
         if cascade_slot:
             cascade_old_status = cascade_slot.get("status", "shadow2")
             if cascade_old_status != "shadow1":
-                batch_updates.append((cascade_slot["slot_id"], {"status": "shadow1"}, False))
+                batch_updates.append((cascade_slot["slot_id"], {"status": "shadow1"}, True))
                 cascade_slot["status"] = "shadow1"
             log_entries.append((
                 cascade_slot["slot_id"], cascade_slot["slot_id"],
@@ -256,16 +255,6 @@ class MonScheduler:
             ))
 
         await store.batch_update_cells_local(batch_updates)
-
-        try:
-            import datetime as _dt
-            now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            await get_cells_col().update_one(
-                {"slot_id": failed_slot["slot_id"]},
-                {"$set": {"status": "lost", "degrade_count": new_degrade_count, "updated_at": now_iso}},
-            )
-        except Exception as e:
-            logger.warning(f"[Degrade] CRDB 同步失败(本地已更新): {e}")
 
         for entry in log_entries:
             await log_rotate(*entry)
