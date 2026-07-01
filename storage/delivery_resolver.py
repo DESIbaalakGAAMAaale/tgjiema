@@ -102,7 +102,9 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
         else:
             # SQLite 无数据时 CRDB 兜底（仅启动早期）
             col = get_cells_col()
-            all_cells = list(await col.find({}))
+            all_cells = list(await col.find({}, projection=[
+                "slot_id", "channel_id", "status", "next_active_chat_id",
+            ]))
 
     if not all_cells:
         return DeliveryChannel(channel_id, "unknown", "fallback")

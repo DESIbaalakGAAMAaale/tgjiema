@@ -443,7 +443,7 @@ class D1Collection:
                 logger.info(f"[SQL_EXEC] {self.table}: {sql[:200]}")
             return 1
 
-    async def find_one(self, query: dict) -> Optional[dict]:
+    async def find_one(self, query: dict, projection: list[str] | None = None) -> Optional[dict]:
         params = []
         where_parts = []
         for k, v in query.items():
@@ -471,7 +471,9 @@ class D1Collection:
                 continue
             where_parts.append(f"{k} = ${len(params) + 1}")
             params.append(v)
-        sql = f"SELECT * FROM {self.table}"
+        # projection: 指定只查询需要的列，减少 IO 和 RU 消耗
+        cols = ", ".join(projection) if projection else "*"
+        sql = f"SELECT {cols} FROM {self.table}"
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         sql += " LIMIT 1"
@@ -652,6 +654,7 @@ class D1Collection:
     async def find(
         self, query: dict = None, sort: tuple = None,
         skip: int = 0, limit: int = None,
+        projection: list[str] | None = None,
     ) -> list[dict]:
         query = query or {}
         params = []
@@ -699,7 +702,7 @@ class D1Collection:
             if or_parts:
                 where_parts.append("(" + " OR ".join(or_parts) + ")")
 
-        sql = f"SELECT * FROM {self.table}"
+        sql = "SELECT " + (", ".join(projection) if projection else "*") + f" FROM {self.table}"
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         if sort and len(sort) >= 2:
@@ -1421,7 +1424,11 @@ async def set_rotation_config(key: str, value: str):
 async def get_active_cells() -> list[dict]:
     """获取所有状态为 active 的槽位,按环next_active_chat_id 排序"""
     col = get_cells_col()
-    cells = await col.find({"status": "active"})
+    cells = await col.find(
+        {"status": "active"},
+        projection=["slot_id", "channel_id", "status", "next_active_chat_id",
+                     "file_count", "rotation_started_at", "last_heartbeat"],
+    )
     # 尝试按环形顺序排序
     if len(cells) <= 1:
         return cells
@@ -1449,14 +1456,23 @@ async def get_active_cells() -> list[dict]:
 async def get_next_active_cell(current_channel_id: int) -> dict | None:
     """获取环形current 的下一active 槽位"""
     col = get_cells_col()
-    current = await col.find_one({"channel_id": current_channel_id, "status": "active"})
+    current = await col.find_one(
+        {"channel_id": current_channel_id, "status": "active"},
+        projection=["channel_id", "next_active_chat_id", "slot_id", "status"],
+    )
     if not current:
         return None
     nxt_id = current.get("next_active_chat_id")
     if nxt_id:
-        return await col.find_one({"channel_id": nxt_id, "status": "active"})
+        return await col.find_one(
+            {"channel_id": nxt_id, "status": "active"},
+            projection=["channel_id", "next_active_chat_id", "slot_id", "status"],
+        )
     # 回环：取第一个 active
-    cells = await col.find({"status": "active"}, sort=("created_at", 1), limit=1)
+    cells = await col.find(
+        {"status": "active"}, sort=("created_at", 1), limit=1,
+        projection=["channel_id", "next_active_chat_id", "slot_id", "status"],
+    )
     return cells[0] if cells else None
 
 
@@ -1654,55 +1670,39 @@ async def get_pending_jobs_count() -> int:
     return 0
 
 
-async def reenqueue_job(job_id: int, max_retries: int = 3) -> bool:
+async def reenqueue_job(job_id: int) -> bool:
     """将一条 dispatched 的 job 重新标记为 pending 并递增 retry_count。
-    
-    Args:
-        job_id: 任务 ID
-        max_retries: 数据库操作最大重试次数
-    Returns:
-        True 表示成功
+    不再手动重试 — CRDB 已内置自动重试机制，手动重试会导致同一请求计两次 RU。
     """
     col = get_jobs_col()
-    for attempt in range(max_retries):
-        try:
-            result = await col._query("""
-                UPDATE jobs SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1
-                WHERE id = $1 AND status = 'dispatched'
-                RETURNING id
-            """, [job_id])
-            return len(result) > 0
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.error(f"[DB] reenqueue_job 重试{max_retries}次后失败 job_id={job_id}: {e}")
-                return False
-            await asyncio.sleep(0.5 * (attempt + 1))
+    try:
+        result = await col._query("""
+            UPDATE jobs SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1
+            WHERE id = $1 AND status = 'dispatched'
+            RETURNING id
+        """, [job_id])
+        return len(result) > 0
+    except Exception as e:
+        logger.error(f"[DB] reenqueue_job 失败 job_id={job_id}: {e}")
+        return False
 
 
-async def reenqueue_job_no_retry(job_id: int, max_retries: int = 3) -> bool:
+async def reenqueue_job_no_retry(job_id: int) -> bool:
     """将一条 dispatched 的 job 重新标记为 pending，不递增 retry_count。
     用于 semaphore 等待超时等尚未实际尝试发送的场景，避免白白消耗重试次数。
-    
-    Args:
-        job_id: 任务 ID
-        max_retries: 数据库操作最大重试次数
-    Returns:
-        True 表示成功
+    不再手动重试 — CRDB 已内置自动重试机制。
     """
     col = get_jobs_col()
-    for attempt in range(max_retries):
-        try:
-            result = await col._query("""
-                UPDATE jobs SET status = 'pending'
-                WHERE id = $1 AND status = 'dispatched'
-                RETURNING id
-            """, [job_id])
-            return len(result) > 0
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.error(f"[DB] reenqueue_job_no_retry 重试{max_retries}次后失败 job_id={job_id}: {e}")
-                return False
-            await asyncio.sleep(0.5 * (attempt + 1))
+    try:
+        result = await col._query("""
+            UPDATE jobs SET status = 'pending'
+            WHERE id = $1 AND status = 'dispatched'
+            RETURNING id
+        """, [job_id])
+        return len(result) > 0
+    except Exception as e:
+        logger.error(f"[DB] reenqueue_job_no_retry 失败 job_id={job_id}: {e}")
+        return False
 
 
 class JobResult:
@@ -1729,32 +1729,23 @@ class JobResult:
         self.retry_count = retry_count
 
 
-async def mark_job_dead(job_id: int, reason: str, max_retries: int = 3):
+async def mark_job_dead(job_id: int, reason: str):
     """将反复失败的 job 标记为死信(status='dead'),不再重试。
-    
-    Args:
-        job_id: 任务 ID
-        reason: 死信原因
-        max_retries: 数据库操作最大重试次数
+    不再手动重试 — CRDB 已内置自动重试机制。
     """
     import datetime as _dt
     col = get_jobs_col()
-    for attempt in range(max_retries):
-        try:
-            await col.update_one(
-                {"id": job_id},
-                {"$set": {
-                    "status": "dead",
-                    "dead_reason": reason,
-                    "dispatched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-                }},
-            )
-            return
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.error(f"[DB] mark_job_dead 重试{max_retries}次后失败 job_id={job_id}: {e}")
-            else:
-                await asyncio.sleep(0.5 * (attempt + 1))
+    try:
+        await col.update_one(
+            {"id": job_id},
+            {"$set": {
+                "status": "dead",
+                "dead_reason": reason,
+                "dispatched_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            }},
+        )
+    except Exception as e:
+        logger.error(f"[DB] mark_job_dead 失败 job_id={job_id}: {e}")
 
 
 async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
