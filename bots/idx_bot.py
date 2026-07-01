@@ -590,15 +590,19 @@ async def _process_pending_uploads(app: Application):
                 continue
 
             pending_col = get_pending_uploads_col()
+            processed_any = False
             while True:
                 rows = await pending_col.find({"processed": 0}, limit=10)
 
                 if not rows:
                     break
 
-                # 并发处理每条 pending_upload
+                processed_any = True
                 tasks = [asyncio.create_task(_process_one_pending(app, row)) for row in rows]
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            if not processed_any:
+                await asyncio.sleep(5)
 
         except Exception as e:
             logger.error(f"[Idx][poll] pending_uploads 轮询异常: {e}")

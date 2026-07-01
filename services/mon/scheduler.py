@@ -10,7 +10,7 @@ import yaml
 from loguru import logger
 from database import (
     get_cells_col,
-    set_cell_status, update_cell_heartbeat,
+    set_cell_status,
     log_rotate,
     _client,
 )
@@ -211,24 +211,6 @@ class MonScheduler:
         # 事务提交成功后再写审计日志
         for entry in log_entries:
             await log_rotate(*entry)
-
-    async def heartbeat_all(self, bot_instance) -> int:
-        """对 active/shadow 槽位发心跳(通过 get_chat_member_count 验证频道可达性)。
-        返回成功计数。
-        """
-        col = get_cells_col()
-        cells = await col.find({"status": {"$in": ["active", "shadow1", "shadow2"]}})
-        count = 0
-        for cell in cells:
-            try:
-                # 使用 get_chat_member_count 验证频道可达性(比 get_chat 更强,
-                # 需要 bot 在频道内且有读权限,能检测出 bot 被踢出的情况)
-                await bot_instance.get_chat_member_count(cell["channel_id"])
-                await update_cell_heartbeat(cell["slot_id"])
-                count += 1
-            except Exception as e:
-                logger.warning(f"[Mon][健康检查] 频道 {cell.get('channel_id')} 心跳失败: {e}")
-        return count
 
     async def replicate_all_active_to_shadows(self, bot_instance, all_cells: list[dict]) -> int:
         """核心功能:将每个 Active A 槽的新消息复制到对应的 Shadow1/Shadow2。

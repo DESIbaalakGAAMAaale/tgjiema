@@ -301,23 +301,24 @@ async def _dsp_worker(bot: Any, worker_id: int):
     """
     from database.cache_store import get_cache_store
     store = get_cache_store()
+    empty_polls = 0
 
     while True:
         try:
-            # 批量拉取 pending jobs
             raw_jobs = await store.get_local_pending_jobs(10)
             if not raw_jobs:
-                if await store.has_new_dsp_job():
+                empty_polls += 1
+                if await store.has_new_dsp_job() and empty_polls < 5:
                     continue
+                empty_polls = 0
                 await asyncio.sleep(2)
                 continue
 
-            # 转换为 JobResult 并标记 dispatched
+            empty_polls = 0
             jobs = _raw_jobs_to_results(raw_jobs)
             for job in jobs:
                 await store.mark_local_job_dispatched(job.job_id)
 
-            # 并发发送这批 jobs
             tasks = [asyncio.create_task(_send_one_job(bot, job, worker_id, store)) for job in jobs]
             await asyncio.gather(*tasks, return_exceptions=True)
 

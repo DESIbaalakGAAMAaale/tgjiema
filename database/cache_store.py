@@ -250,11 +250,14 @@ class CacheStore:
     async def has_new_upload(self) -> bool:
         """Idx Bot 检查是否有未处理的上传通知。有则返回 True 并原子清空所有通知。"""
         if not self._db:
-            return True  # 连接未就绪，回退到直接查 CRDB
-        cursor = await self._db.execute("DELETE FROM pending_notify")
-        deleted = cursor.rowcount
-        await self._db.commit()
-        return deleted > 0
+            return False
+        try:
+            cursor = await self._db.execute("DELETE FROM pending_notify")
+            deleted = cursor.rowcount
+            await self._db.commit()
+            return deleted > 0
+        except Exception:
+            return False
 
     # ─── Dsp Bot 通知：Idx Bot 写入 → Dsp Bot 感知 ───
 
@@ -279,11 +282,14 @@ class CacheStore:
     async def has_new_dsp_job(self) -> bool:
         """Dsp Bot 检查是否有新的派发通知。有则返回 True 并原子清空所有通知。"""
         if not self._db:
-            return True  # 连接未就绪，回退到直接查 CRDB
-        cursor = await self._db.execute("DELETE FROM dsp_notify")
-        deleted = cursor.rowcount
-        await self._db.commit()
-        return deleted > 0
+            return False
+        try:
+            cursor = await self._db.execute("DELETE FROM dsp_notify")
+            deleted = cursor.rowcount
+            await self._db.commit()
+            return deleted > 0
+        except Exception:
+            return False
 
     async def close(self):
         if self._db:
