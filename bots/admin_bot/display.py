@@ -20,6 +20,33 @@ from .menus import _quota_display
 from utils.shared_counters import status_counters as _status_counters
 import utils.shared_counters as _shared_counters
 
+# ── cells 缓存：admin 面板频繁刷新，加 60s 缓存避免每次点按钮都查 CRDB ──
+_cells_cache: tuple[float, list[dict]] | None = None
+_CELLS_CACHE_TTL = 60  # 秒
+
+
+async def _get_cells_cached(status_filter: dict | None = None, sort_key: str = "slot_id") -> list[dict]:
+    """带 60s 缓存的 cells 查询，admin 面板用。0 RU（复用 SQLite）或 1 RU（CRDB 兜底）。"""
+    global _cells_cache
+    now = time.time()
+    if _cells_cache and (now - _cells_cache[0]) < _CELLS_CACHE_TTL:
+        return _cells_cache[1]
+    from database import get_cells_col
+    from database.session import get_active_cells_local
+    # 优先走 SQLite 快照（0 RU）
+    try:
+        cells = await get_active_cells_local()
+        if cells:
+            _cells_cache = (now, cells)
+            return cells
+    except Exception:
+        pass
+    # CRDB 兜底（1 RU）
+    col = get_cells_col()
+    cells = await col.find(status_filter or {}, sort=(sort_key, 1))
+    _cells_cache = (now, cells)
+    return cells
+
 
 async def _ensure_user(user_id: int) -> dict:
     """获取或创建用户,走缓存。"""
@@ -71,13 +98,12 @@ async def _get_status_text() -> str:
             relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
     except Exception:
         relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
-    # 从环形拓扑获取当前活跃频道
+    # 从环形拓扑获取当前活跃频道（走 60s 缓存，0 RU）
     active_cells_text = ""
     try:
-        from database import get_cells_col
-        col = get_cells_col()
-        active_cells = await col.find({"status": "active"}, sort=("slot_id", 1))
+        active_cells = await _get_cells_cached({"status": "active"})
         if active_cells:
+            active_cells = [c for c in active_cells if c.get("status") == "active"]
             slots = [f"{c.get('slot_id')}" for c in active_cells[:5]]
             active_cells_text = ", ".join(slots)
     except Exception:
@@ -131,9 +157,7 @@ async def _get_topology_text() -> str:
     """显示环形冗余拓扑状态。"""
     active_channel = await get_active_storage_channel_id()
     try:
-        from database import get_cells_col
-        col = get_cells_col()
-        cells = await col.find({}, sort=("slot_id", 1))
+        cells = await _get_cells_cached()
     except Exception:
         cells = []
 

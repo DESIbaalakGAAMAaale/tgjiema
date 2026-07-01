@@ -104,7 +104,7 @@ class MonBot:
             self._cells_cache_ts = now
             return self._cells_cache
 
-        # CRDB 兜底，并写入 SQLite 供后续使用
+        # CRDB 兜底（仅启动时 SQLite 无数据时触发一次）
         logger.info("[Mon] cells 缓存未命中，从 CRDB 加载并写入 SQLite")
         col = get_cells_col()
         self._cells_cache = await col.find({})
