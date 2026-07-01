@@ -685,16 +685,16 @@ async def _async_main():
             await sync_jobs_from_crdb_to_sqlite(100)
         except Exception as e:
             logger.warning(f"[Dsp] 启动同步异常: {e}")
-        # 之后每 5 分钟轻量同步 + 清理旧记录
+        # 之后每 30 分钟轻量同步 + 清理旧记录
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(1800)
             try:
                 await sync_jobs_from_crdb_to_sqlite(100)
                 await store.cleanup_local_jobs(7)
             except Exception as e:
                 logger.debug(f"[Dsp] 周期同步异常: {e}")
 
-    # D: Sync Back - 每 30 秒同步本地状态变更回 CRDB
+    # D: Sync Back - 每 60 秒同步本地状态变更回 CRDB
     async def sync_back_loop():
         from database.session import sync_local_jobs_to_crdb
         while True:
@@ -702,7 +702,7 @@ async def _async_main():
                 await sync_local_jobs_to_crdb()
             except Exception as e:
                 logger.debug(f"[SyncBack] 同步异常: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
 
     loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")

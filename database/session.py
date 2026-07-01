@@ -1778,6 +1778,9 @@ async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
         {"status": "dead"},
         sort=("created_at", 1),
         limit=max_count,
+        projection=["id", "dead_retry_count", "code", "target_user_id",
+                     "storage_channel_id", "storage_msg_ids", "batch_file_meta",
+                     "task_type", "retry_count", "protect_content", "created_at"],
     )
 
     if not dead_jobs:
@@ -1813,8 +1816,7 @@ async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
 async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
     """Queue Syncer: 从 CRDB 拉取 pending/dispatched jobs 到本地 SQLite
     
-    每 5 秒调用一次,批量同步。这是 D 方案的核心:将 CRDB 的 CTE 操作
-    改为本地 SQLite 消费,节省 98% RU。
+    启动时一次性 + 30 分钟兜底同步。空闲时 SELECT 返回空结果，RU 极低。
     """
     from loguru import logger
     from .cache_store import get_cache_store
@@ -1825,6 +1827,9 @@ async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
             {"status": {"$in": ["pending", "dispatched"]}},
             sort=("created_at", 1),
             limit=limit,
+            projection=["id", "code", "target_user_id", "storage_channel_id",
+                         "storage_msg_ids", "batch_file_meta", "task_type",
+                         "status", "retry_count", "protect_content", "created_at"],
         )
     except Exception as e:
         logger.debug(f"[QueueSyncer] 拉取 CRDB jobs 失败: {e}")
