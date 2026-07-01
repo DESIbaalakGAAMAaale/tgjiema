@@ -107,7 +107,11 @@ class MonBot:
         # CRDB 兜底（仅启动时 SQLite 无数据时触发一次）
         logger.info("[Mon] cells 缓存未命中，从 CRDB 加载并写入 SQLite")
         col = get_cells_col()
-        self._cells_cache = await col.find({})
+        self._cells_cache = await col.find({}, projection=[
+            "slot_id", "channel_id", "status", "next_active_chat_id",
+            "prev_slot_id", "account_name", "is_r100",
+            "file_count", "rotation_started_at", "last_heartbeat",
+        ])
         self._cells_cache_ts = now
         # 写入 SQLite 快照，避免后续继续查 CRDB
         asyncio.ensure_future(self._save_cells_to_sqlite())
@@ -127,11 +131,15 @@ class MonBot:
         from database.cache_store import get_cache_store
         try:
             cells = await self._get_cells()
+            if not cells:
+                logger.warning("[Mon] _save_cells_to_sqlite: cells 为空，跳过写入")
+                return
             version = int(time.time())
             store = get_cache_store()
             await store.save_cells_snapshot(cells, version)
-        except Exception:
-            pass
+            logger.debug(f"[Mon] cells 快照已写入 SQLite: {len(cells)} 条, version={version}")
+        except Exception as e:
+            logger.error(f"[Mon] _save_cells_to_sqlite 失败: {e}")
 
     async def _reload_rotation_config(self):
         """从 DB rotation_config 表重新读取轮转参数(30 个周期一次)。

@@ -326,6 +326,23 @@ class CockroachDBClient:
             await store.set_kv("ddl_version", str(DDL_VERSION))
             logger.info(f"DDL 升级完成，版本 {DDL_VERSION}")
 
+        # ─── 启动时预填充 cells 快照到 SQLite ───
+        # 避免 Mon Bot 首次运行时回退到 CRDB（SELECT * FROM cells）
+        try:
+            cells, _ = await store.load_cells_snapshot()
+            if not cells:
+                col = D1Collection("cells")
+                all_cells = await col.find({}, projection=[
+                    "slot_id", "channel_id", "status", "next_active_chat_id",
+                    "prev_slot_id", "account_name", "is_r100",
+                    "file_count", "rotation_started_at", "last_heartbeat",
+                ])
+                if all_cells:
+                    await store.save_cells_snapshot(all_cells, int(_time.time()))
+                    logger.info(f"[DB] 预填充 cells 快照到 SQLite: {len(all_cells)} 条")
+        except Exception:
+            pass  # cells 快照非关键，静默失败
+
     async def close(self):
         if self._pool:
             await self._pool.close()
