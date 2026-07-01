@@ -1918,7 +1918,7 @@ async def sync_local_jobs_to_crdb():
 async def sync_dirty_cells_to_crdb():
     """Sync Back: 将本地 SQLite 中脏 cells（状态/路由变更）批量同步回 CRDB
     
-    每 60 秒调用一次。仅同步异常事件和路由变更（ban/lost/rotation/degrade）。
+    由 mon_bot 主循环每 ~5 分钟调用一次。仅同步异常事件和路由变更（ban/lost/rotation/degrade）。
     心跳、file_count、cursor 等高频数据不回写 CRDB。
     """
     import datetime as _dt
