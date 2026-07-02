@@ -24,7 +24,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 1  # 递增此值以触发 DDL 升级
+DDL_VERSION = 2  # 递增此值以触发 DDL 升级
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -67,14 +67,13 @@ DDL_STATEMENTS = [
         status TEXT DEFAULT 'queued',
         source_channel_id BIGINT
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
-    "CREATE INDEX IF NOT EXISTS idx_users_first_name ON users(first_name)",
+    # idx_users_username/first_name 已删除（仅 LIKE '%...%' 前缀模糊查询，B-tree 索引无效）
     "CREATE INDEX IF NOT EXISTS idx_file_records_status ON file_records(status)",
     "CREATE INDEX IF NOT EXISTS idx_file_records_uploader ON file_records(uploader_id)",
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_file_code ON decode_logs(file_code)",
-    "CREATE INDEX IF NOT EXISTS idx_decode_logs_requester ON decode_logs(requester_id)",
+    # idx_decode_logs_requester 已删除（无 WHERE requester_id 查询）
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_request_time ON decode_logs(request_time)",
-    "CREATE INDEX IF NOT EXISTS idx_file_records_msg_id ON file_records(primary_channel_msg_id)",
+    # idx_file_records_msg_id 已删除（primary_channel_msg_id 仅做数据字段读取，无 WHERE 过滤）
     """CREATE TABLE IF NOT EXISTS pending_uploads (
         id SERIAL PRIMARY KEY,
         uploader_id BIGINT,
@@ -242,6 +241,11 @@ MIGRATION_STATEMENTS = [
     "DROP INDEX IF EXISTS idx_relay_accounts_phone",
     "DROP INDEX IF EXISTS idx_external_code_mapping_system",
     "DROP INDEX IF EXISTS idx_external_code_mapping_bot",
+    # 第二批索引清理：无用索引，减少写入维护开销
+    "DROP INDEX IF EXISTS idx_users_username",
+    "DROP INDEX IF EXISTS idx_users_first_name",
+    "DROP INDEX IF EXISTS idx_decode_logs_requester",
+    "DROP INDEX IF EXISTS idx_file_records_msg_id",
 ]
 
 
@@ -310,16 +314,17 @@ class CockroachDBClient:
                     await self.execute(sql)
                 except Exception as e:
                     logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略）：{e}")
-            # ─── CRDB 行级 TTL 已废弃：一次性禁用 ───
+            # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
+            # RESET 在某些 CRDB 版本不生效，改用与 migration 一致的 SET 方式，确保 TTL job 不运行
             # 改为 Python 端负责清理（见 database/cache.py: _flush_decode_log_buffer_loop）
             for ttl_sql in (
-                "ALTER TABLE decode_logs RESET (ttl_expiration_expression, ttl_job_cron)",
-                "ALTER TABLE jobs RESET (ttl_expiration_expression, ttl_job_cron)",
+                "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
+                "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
             ):
                 try:
                     await self.execute(ttl_sql)
                 except Exception:
-                    pass  # TTL 已禁用或不存在，忽略
+                    pass
             # 写入 CRDB 版本号
             await self.execute(
                 "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
