@@ -240,7 +240,11 @@ class MonBot:
 
         if spare:
             spare_ch = spare["channel_id"]
-            await consume_spare(spare_ch)
+            try:
+                await consume_spare(spare_ch)
+            except Exception as e:
+                logger.error(f"[Mon] consume_spare 失败 (channel={spare_ch}): {e}")
+                # 继续执行替换逻辑，consume_spare 失败不影响封禁处理
             new_status = status if status in ("active", "shadow1", "shadow2", "r100") else "active"
             now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
             await store.update_cell_fields_local(slot_id, {
@@ -284,6 +288,53 @@ class MonBot:
 
         await self._notify_admin(notify_msg)
         self._invalidate_cells_cache()
+
+    async def _recover_lost(self, all_cells: list[dict]) -> int:
+        """定期检查 lost 频道是否恢复可用，若可用则重新激活为 shadow2。
+
+        lost 频道可能因临时网络波动被降级，或封禁后频道被解封。
+        恢复的频道设为 shadow2（最低优先级），由后续轮转自然提升。
+        返回恢复数量。
+        """
+        lost_cells = [c for c in all_cells if c.get("status") == "lost"]
+        if not lost_cells:
+            return 0
+
+        store = get_cache_store()
+        recovered = 0
+        for cell in lost_cells:
+            slot_id = cell["slot_id"]
+            channel_id = cell["channel_id"]
+            try:
+                await self.bot.get_chat(channel_id)
+                # 频道可访问，恢复为 shadow2
+                await store.update_cell_fields_local(slot_id, {
+                    "status": "shadow2",
+                    "next_active_chat_id": None,
+                    "degrade_count": 0,
+                    "file_count": 0,
+                    "demoted_to_channel_id": None,
+                }, mark_dirty=True)
+                self._update_cell_in_cache(slot_id, {
+                    "status": "shadow2", "next_active_chat_id": None,
+                    "degrade_count": 0, "file_count": 0,
+                    "demoted_to_channel_id": None,
+                })
+                self._cell_healthy[slot_id] = True
+                self._cell_fail_streak[slot_id] = 0
+                recovered += 1
+                logger.info(f"[Mon] lost 频道恢复: {slot_id} (channel={channel_id}) → shadow2")
+            except Exception as e:
+                logger.debug(f"[Mon] lost 频道 {slot_id} 仍不可用: {e}")
+
+        if recovered > 0:
+            await store._bump_cells_version()
+            await self._notify_admin(
+                f"🔄 lost 频道恢复\n\n"
+                f"共恢复 {recovered} 个频道为 shadow2\n"
+                f"已重新加入环形拓扑，后续轮转将自然提升"
+            )
+        return recovered
 
     async def _check_rotation(self, all_cells: list[dict]):
         """检查活跃频道窗口是否该轮转。
@@ -443,8 +494,12 @@ class MonBot:
             })
 
         for cascade_slot in cascade_slots:
-            batch_updates.append((cascade_slot["slot_id"], {"status": "shadow1"}, True))
-            self._update_cell_in_cache(cascade_slot["slot_id"], {"status": "shadow1"})
+            updates = {
+                "status": "shadow1", "file_count": 0, "degrade_count": 0,
+                "next_active_chat_id": None, "demoted_to_channel_id": None,
+            }
+            batch_updates.append((cascade_slot["slot_id"], updates, True))
+            self._update_cell_in_cache(cascade_slot["slot_id"], updates)
 
         for prev_slot_id, new_next in ring_repairs:
             if new_next and new_next in demoted_ch_to_promoted_ch:
@@ -555,6 +610,13 @@ class MonBot:
 
                 # 7. 报告当前拓扑状态(从缓存读取,不查 DB)
                 await self._report_status(all_cells)
+
+                # 8. 定期恢复 lost 频道（每 10 轮一次，~10 分钟）
+                if self._cycle_count % 10 == 0:
+                    recovered = await self._recover_lost(all_cells)
+                    if recovered > 0:
+                        self._invalidate_cells_cache()
+                        all_cells = await self._get_cells()
 
             except Exception as e:
                 logger.error(f"[Mon] 调度异常: {e}")

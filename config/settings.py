@@ -168,6 +168,8 @@ class Settings(BaseSettings):
             missing.append('SENDER_BOT_TOKEN')
         if not self.MON_BOT_TOKEN:
             missing.append('MON_BOT_TOKEN')
+        if not self.ADMIN_BOT_TOKEN:
+            missing.append('ADMIN_BOT_TOKEN')
         if not self.COCKROACHDB_URL:
             missing.append('COCKROACHDB_URL')
         if missing:

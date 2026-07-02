@@ -781,7 +781,7 @@ class CacheStore:
             return
         await self._db.execute(
             "UPDATE local_job_queue SET status='dispatched', dispatched_at=? WHERE crdb_id=?",
-            (time.time(), crdb_id),
+            (datetime.datetime.now(datetime.timezone.utc).isoformat(), crdb_id),
         )
         await self._db.commit()
 
@@ -1111,6 +1111,7 @@ class CacheStore:
                 )
                 await self._db.commit()
                 await self._bump_cells_version(now)
+                await self._rebuild_cells_snapshot()  # 保持快照与逐行数据一致
                 return
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 2:

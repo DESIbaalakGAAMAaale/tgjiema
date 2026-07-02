@@ -30,7 +30,7 @@ from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
-from utils.flood_waiter import safe_copy_message, safe_send_message, safe_send_media_group, safe_reply_text
+from utils.flood_waiter import safe_copy_message, safe_send_message, safe_reply_text
 from utils.file_utils import detect_file_type, extract_file_meta
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
