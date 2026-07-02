@@ -1825,7 +1825,10 @@ async def _async_main():
 
     # 文件码变更批量 flush CRDB 后台任务
     async def _code_changes_sync_loop():
-        """每 5 分钟将 SQLite code_changes 批量 flush 到 CRDB"""
+        """每 5 分钟将 SQLite code_changes 批量 flush 到 CRDB
+        
+        使用 CASE WHEN 批量 UPDATE，替代 N+1 循环，大幅减少 RU 消耗。
+        """
         while True:
             await asyncio.sleep(300)
             try:
@@ -1837,30 +1840,34 @@ async def _async_main():
 
                 codes_col = get_codes_col()
                 synced_ids = []
-                for change in changes:
-                    code = change["code"]
-                    change_type = change["change_type"]
-                    new_value = change["new_value"]
+                
+                # 按 change_type 分组，每组执行一条批量 SQL
+                for ctype, field in (("note", "note"), ("expiry", "expire_time"), ("status", "status")):
+                    group = [c for c in changes if c["change_type"] == ctype]
+                    if not group:
+                        continue
+                    
+                    params = []
+                    cases = []
+                    for c in group:
+                        params.append(c["code"])
+                        if ctype == "expiry":
+                            val = None if c["new_value"] == "NULL" else c["new_value"]
+                        else:
+                            val = c["new_value"]
+                        params.append(val)
+                        cases.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
+                    
+                    placeholders = ", ".join([f"${i * 2 + 1}" for i in range(len(group))])
+                    sql = (
+                        f"UPDATE codes SET {field} = CASE code {' '.join(cases)} END "
+                        f"WHERE code IN ({placeholders})"
+                    )
                     try:
-                        if change_type == "note":
-                            await codes_col.update_one(
-                                {"code": code},
-                                {"$set": {"note": new_value}},
-                            )
-                        elif change_type == "expiry":
-                            expire_val = None if new_value == "NULL" else new_value
-                            await codes_col.update_one(
-                                {"code": code},
-                                {"$set": {"expire_time": expire_val}},
-                            )
-                        elif change_type == "status":
-                            await codes_col.update_one(
-                                {"code": code},
-                                {"$set": {"status": new_value}},
-                            )
-                        synced_ids.append(change["id"])
+                        await codes_col._execute(sql, params)
+                        synced_ids.extend(c["id"] for c in group)
                     except Exception as e:
-                        logger.error(f"[CodeChanges] flush failed (code={code}, type={change_type}): {e}")
+                        logger.error(f"[CodeChanges] batch flush failed (type={ctype}): {e}")
 
                 if synced_ids:
                     await buf.mark_synced(synced_ids)

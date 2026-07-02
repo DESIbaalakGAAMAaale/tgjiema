@@ -177,7 +177,7 @@ def invalidate_user_codes(user_id: int):
 
 _request_count_buffer: dict[str, int] = {}
 _request_count_lock = asyncio.Lock()
-_REQUEST_COUNT_FLUSH_INTERVAL = 300  # 每 300 秒 flush 一次(5分钟),减少 CRDB RU 消耗
+_REQUEST_COUNT_FLUSH_INTERVAL = 900  # 每 900 秒 flush 一次(15分钟),大幅减少 CRDB RU 消耗
 
 
 async def incr_request_count(file_code: str):
@@ -187,9 +187,14 @@ async def incr_request_count(file_code: str):
 
 
 async def _flush_request_count_loop():
-    """后台任务:每 60 秒批量 flush request_count 到 CRDB。"""
+    """后台任务:批量 flush request_count 到 CRDB。
+    
+    使用单条 SQL 批量 UPDATE，替代 N+1 循环，大幅减少 RU 消耗。
+    """
     from loguru import logger
-    from .session import update_file_record_and_invalidate as _update
+    from .session import get_file_records_col
+    from .session import bulk_update_request_counts
+    from database.cache import get_file_record_cache
 
     while True:
         await asyncio.sleep(_REQUEST_COUNT_FLUSH_INTERVAL)
@@ -199,9 +204,14 @@ async def _flush_request_count_loop():
                     continue
                 batch = dict(_request_count_buffer)
                 _request_count_buffer.clear()
-            for code, count in batch.items():
-                await _update(code, {"$inc": {"request_count": count}})
-            logger.debug(f"[request_count] flushed {len(batch)} codes, {sum(batch.values())} counts")
+            
+            # 单条 SQL 批量 UPDATE (CASE WHEN 技巧)
+            affected = await bulk_update_request_counts(batch)
+            cache = get_file_record_cache()
+            for code in batch:
+                cache.invalidate(f"file:{code}")
+            
+            logger.debug(f"[request_count] flushed {len(batch)} codes, {sum(batch.values())} counts, affected rows={affected}")
         except Exception as e:
             logger.error(f"[request_count] flush failed: {e}")
 

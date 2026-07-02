@@ -1793,7 +1793,8 @@ async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
 async def sync_local_jobs_to_crdb():
     """Sync Back: 将本地 SQLite 中状态变更的 job 批量同步回 CRDB
     
-    每 30 秒调用一次。处理 retried/dead/done 状态的 job。
+    每 120 秒调用一次。处理 retried/dead/done 状态的 job。
+    按 status 分组，每组各执行一条 SQL，替代 N 次 update_one。
     """
     from loguru import logger
     from .cache_store import get_cache_store
@@ -1803,36 +1804,21 @@ async def sync_local_jobs_to_crdb():
     if not unsynced:
         return
 
-    col = get_jobs_col()
-    synced = 0
+    # 按 status 分组
+    groups: dict[str, list[dict]] = {"retried": [], "dead": [], "done": []}
     for job in unsynced:
-        crdb_id = job["crdb_id"]
-        status = job["status"]
-        try:
-            if status == "retried":
-                await col.update_one(
-                    {"id": crdb_id},
-                    {"$set": {"status": "pending"}, "$inc": {"retry_count": 1}},
-                )
-            elif status == "dead":
-                await col.update_one(
-                    {"id": crdb_id},
-                    {"$set": {"status": "dead", "dead_reason": job.get("dead_reason", "unknown")}},
-                )
-            elif status == "done":
-                await col.update_one(
-                    {"id": crdb_id},
-                    {"$set": {"status": "done"}},
-                )
-            else:
-                continue
-            await store.mark_local_job_synced(crdb_id)
-            synced += 1
-        except Exception as e:
-            logger.debug(f"[SyncBack] 同步 job={crdb_id} 失败: {e}")
+        status = job.get("status", "")
+        if status in groups:
+            groups[status].append(job)
 
-    if synced > 0:
-        logger.debug(f"[SyncBack] 同步 {synced} 条 job 状态到 CRDB")
+    try:
+        affected = await batch_update_jobs_status(groups)
+        for job in unsynced:
+            await store.mark_local_job_synced(job["crdb_id"])
+        if affected > 0:
+            logger.debug(f"[SyncBack] 批量同步 {len(unsynced)} 条 job 状态到 CRDB")
+    except Exception as e:
+        logger.debug(f"[SyncBack] 批量同步 job 失败: {e}")
 
 
 async def sync_dirty_cells_to_crdb():
@@ -1840,8 +1826,9 @@ async def sync_dirty_cells_to_crdb():
     
     由 mon_bot 主循环每 ~5 分钟调用一次。仅同步异常事件和路由变更（ban/lost/rotation/degrade）。
     心跳、file_count、cursor 等高频数据不回写 CRDB。
+    
+    使用单条 SQL 批量 UPDATE（CASE WHEN 技巧），替代 N 次 update_one。
     """
-    import datetime as _dt
     from loguru import logger
     from .cache_store import get_cache_store
 
@@ -1850,29 +1837,125 @@ async def sync_dirty_cells_to_crdb():
     if not dirty:
         return
 
-    col = get_cells_col()
-    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-    synced = 0
-    for cell in dirty:
-        try:
-            set_fields = {"updated_at": now_iso}
-            for key in ("channel_id", "status", "next_active_chat_id", "account_name",
-                        "is_r100", "degrade_count", "file_count", "rotation_started_at"):
-                if key in cell and cell[key] is not None:
-                    set_fields[key] = cell[key]
-            if cell.get("status") == "lost":
-                set_fields["next_active_chat_id"] = None
-            await col.update_one(
-                {"slot_id": cell["slot_id"]},
-                {"$set": set_fields},
-            )
+    try:
+        await batch_update_cells_dirty(dirty)
+        for cell in dirty:
             await store.mark_cell_synced_local(cell["slot_id"])
-            synced += 1
-        except Exception as e:
-            logger.debug(f"[SyncBack] 同步 cell={cell['slot_id']} 失败: {e}")
+        logger.debug(f"[SyncBack] 批量同步 {len(dirty)} 条 cell 到 CRDB")
+    except Exception as e:
+        logger.debug(f"[SyncBack] 批量同步 cell 失败: {e}")
 
-    if synced > 0:
-        logger.debug(f"[SyncBack] 同步 {synced} 条 cell 到 CRDB")
+
+# ─── 批量 UPDATE 优化（替代 N+1 循环）───
+
+async def bulk_update_request_counts(counts: dict[str, int]) -> int:
+    """单条 SQL 批量累加 file_records.request_count，替代 N 次 UPDATE。
+    
+    使用 CASE WHEN 技巧：UPDATE ... SET request_count = request_count + CASE code WHEN ...
+    50 个码从 50 次 UPDATE(~500 RU) 压到 1 次(~10 RU)，节省 ~95% RU。
+    """
+    if not counts:
+        return 0
+    params = []
+    cases = []
+    for code, count in counts.items():
+        params.append(code)
+        params.append(count)
+        cases.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
+    
+    placeholders = ", ".join([f"${i * 2 + 1}" for i in range(len(counts))])
+    sql = (
+        f"UPDATE file_records SET request_count = COALESCE(request_count, 0) + "
+        f"CASE file_code {' '.join(cases)} END "
+        f"WHERE file_code IN ({placeholders})"
+    )
+    col = get_file_records_col()
+    return await col._execute(sql, params)
+
+
+async def batch_update_cells_dirty(cells: list[dict]) -> int:
+    """单条 SQL 批量同步 dirty cells 到 CRDB，替代 N 次 update_one。
+    
+    对每个 cell 的不同字段用 CASE WHEN 聚合到一条 UPDATE 中。
+    """
+    if not cells:
+        return 0
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    slot_ids = [c["slot_id"] for c in cells]
+    
+    # 收集所有字段值，按 slot_id 索引
+    params = [now_iso]
+    field_cases = {}
+    for key in ("channel_id", "status", "next_active_chat_id", "account_name", "is_r100",
+                "degrade_count", "file_count", "rotation_started_at"):
+        parts = []
+        for i, c in enumerate(cells):
+            val = c.get(key)
+            if val is not None:
+                params.append(c["slot_id"])
+                params.append(val)
+                parts.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
+        if parts:
+            # Handle lost cells: set next_active_chat_id to NULL
+            if key == "next_active_chat_id":
+                for i, c in enumerate(cells):
+                    if c.get("status") == "lost":
+                        params.append(c["slot_id"])
+                        params.append(None)
+                        parts.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
+            field_cases[key] = " ".join(parts)
+    
+    set_clauses = ["updated_at = $1"]
+    for key, cases in field_cases.items():
+        if key == "next_active_chat_id":
+            set_clauses.append(f"{key} = CASE slot_id {cases} END")
+        else:
+            set_clauses.append(f"{key} = CASE slot_id {cases} ELSE {key} END")
+    
+    placeholders = ", ".join([f"${len(params) + i + 1}" for i in range(len(slot_ids))])
+    params.extend(slot_ids)
+    
+    sql = f"UPDATE cells SET {', '.join(set_clauses)} WHERE slot_id IN ({placeholders})"
+    col = get_cells_col()
+    return await col._execute(sql, params)
+
+
+async def batch_update_jobs_status(jobs_by_status: dict[str, list[dict]]) -> int:
+    """批量同步 job 状态到 CRDB，按 status 分组各执行一条 SQL。
+    
+    jobs_by_status: {"retried": [...], "dead": [...], "done": [...]}
+    """
+    total = 0
+    col = get_jobs_col()
+    
+    for status, jobs in jobs_by_status.items():
+        if not jobs:
+            continue
+        ids = [j["crdb_id"] for j in jobs]
+        placeholders = ", ".join([f"${i + 1}" for i in range(len(ids))])
+        
+        if status == "retried":
+            sql = f"UPDATE jobs SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1 WHERE id IN ({placeholders})"
+            total += await col._execute(sql, ids)
+        elif status == "done":
+            sql = f"UPDATE jobs SET status = 'done' WHERE id IN ({placeholders})"
+            total += await col._execute(sql, ids)
+        elif status == "dead":
+            # dead_reason 各不同，需要 CASE WHEN
+            params = []
+            cases = []
+            for j in jobs:
+                params.append(j["crdb_id"])
+                params.append(j.get("dead_reason", "unknown"))
+                cases.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
+            sql = (
+                f"UPDATE jobs SET status = 'dead', "
+                f"dead_reason = CASE id {' '.join(cases)} END "
+                f"WHERE id IN ({placeholders})"
+            )
+            total += await col._execute(sql, params)
+    
+    return total
 
 
 async def get_pending_jobs_count_local() -> int:
