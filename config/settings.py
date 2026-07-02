@@ -61,11 +61,6 @@ class Settings(BaseSettings):
     RELAY_API_ID: int = 0
     RELAY_API_HASH: str = ""
 
-    # ─── PRE-11: EXTERNAL_RELAY 协议白名单 ───
-    # 采集器账号 user_id 列表（逗号分隔），仅这些账号可通过 EXTERNAL_RELAY 协议上传文件。
-    # 留空表示禁止所有外部中继上传（安全默认）。
-    EXTERNAL_RELAY_ALLOWED_USER_IDS: str = ""
-
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""

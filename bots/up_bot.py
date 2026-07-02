@@ -41,29 +41,6 @@ _active_slot_index: int = 0
 _external_buffers: dict[str, dict] = {}
 _pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
 
-# PRE-11: EXTERNAL_RELAY 协议白名单 —— 仅允许配置的采集器账号上传外部文件。
-# 启动时从 settings.EXTERNAL_RELAY_ALLOWED_USER_IDS 解析（逗号分隔的 user_id）。
-# 留空时 _external_relay_allowed 为空集，所有 EXTERNAL_RELAY / EXTERNAL_DONE 消息都会被拒绝。
-_external_relay_allowed: set[int] = set()
-
-
-def _load_external_relay_whitelist() -> set[int]:
-    """从 settings 解析 EXTERNAL_RELAY 白名单 user_id 集合。"""
-    raw = (settings.EXTERNAL_RELAY_ALLOWED_USER_IDS or "").strip()
-    if not raw:
-        return set()
-    result: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            result.add(int(part))
-        except ValueError:
-            logger.warning(f"[Up] EXTERNAL_RELAY_ALLOWED_USER_IDS 含非法值已忽略: {part!r}")
-    return result
-
-
 async def _cleanup_pending():
     """定期清理超时未完成的 media group 和 external buffer。"""
     while True:
@@ -728,11 +705,6 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     格式:EXTERNAL_RELAY:{user_id}:{external_code}
     文件先 copy 到存储频道，积累后由 EXTERNAL_DONE 触发批量写入 pending_uploads。
     """
-    # PRE-11: 校验消息来源是否为已授权的采集器账号，防止任意用户伪造 EXTERNAL_RELAY 绕过权限上传
-    sender_id = update.effective_user.id if update.effective_user else 0
-    if sender_id not in _external_relay_allowed:
-        logger.warning(f"[Up][ext_relay] 拒绝非白名单发送者的 EXTERNAL_RELAY: sender_id={sender_id}")
-        return
     caption = update.message.caption or ""
     rest = caption[len("EXTERNAL_RELAY:"):]
     user_end = rest.find(":")
@@ -788,11 +760,6 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
 
 async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 EXTERNAL_DONE 信号:中继账号通知文件收集完毕,触发批量写入"""
-    # PRE-11: 同样校验白名单，防止非授权账号触发 flush 干扰缓冲区
-    sender_id = update.effective_user.id if update.effective_user else 0
-    if sender_id not in _external_relay_allowed:
-        logger.warning(f"[Up][ext_relay] 拒绝非白名单发送者的 EXTERNAL_DONE: sender_id={sender_id}")
-        return
     text = update.message.text or ""
     if not text.startswith("EXTERNAL_DONE:"):
         return
@@ -875,13 +842,6 @@ async def _init():
     from database import init_db
     await init_db()
     await _refresh_active_slots()
-    # PRE-11: 加载 EXTERNAL_RELAY 白名单
-    global _external_relay_allowed
-    _external_relay_allowed = _load_external_relay_whitelist()
-    if _external_relay_allowed:
-        logger.info(f"[Up] EXTERNAL_RELAY 白名单已加载: {len(_external_relay_allowed)} 个账号")
-    else:
-        logger.warning("[Up] EXTERNAL_RELAY 白名单为空，所有外部中继上传将被拒绝（请在 .env 配置 EXTERNAL_RELAY_ALLOWED_USER_IDS）")
 
 
 async def _async_main():
