@@ -460,6 +460,11 @@ async def _process_one_pending(app: Application, row: dict):
     channel_id = row.get("primary_channel_id")
     message_id = row.get("primary_channel_msg_id")
     file_types = row.get("file_types", {})
+    if isinstance(file_types, str):
+        try:
+            file_types = json.loads(file_types)
+        except (json.JSONDecodeError, TypeError):
+            file_types = {}
     if not isinstance(file_types, dict):
         file_types = {}
     batch_msg_ids_str = row.get("batch_msg_ids", "")
@@ -518,9 +523,12 @@ async def _process_one_pending(app: Application, row: dict):
 
     # 写入 codes 表（含 expire_time，省一次 UPDATE）
     try:
-        expire_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-            days=file_ttl_days if file_ttl_days else settings.DEFAULT_FILE_TTL_DAYS
-        )
+        actual_ttl_days = file_ttl_days if file_ttl_days else settings.DEFAULT_FILE_TTL_DAYS
+        if actual_ttl_days == 0:
+            # 0 = 永久有效，设置远期过期时间
+            expire_dt = datetime.datetime(2099, 12, 31, 23, 59, 59, tzinfo=datetime.timezone.utc)
+        else:
+            expire_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=actual_ttl_days)
         codes_col = get_codes_col()
         ce = make_code_entry(
             code=file_code,
@@ -1882,7 +1890,7 @@ async def _async_main():
                         f"WHERE code IN ({placeholders})"
                     )
                     try:
-                        await codes_col._execute(sql, params)
+                        await codes_col.execute_raw(sql, params)
                         synced_ids.extend(c["id"] for c in group)
                     except Exception as e:
                         logger.error(f"[CodeChanges] batch flush failed (type={ctype}): {e}")

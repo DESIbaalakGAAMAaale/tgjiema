@@ -419,8 +419,7 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
             pass
 
     if not file_meta_list:
-        await _fallback_single_send(bot, job, bot_id=bot_id)
-        return
+        return await _fallback_single_send(bot, job, bot_id=bot_id)
 
     total_pages = (len(file_meta_list) + PAGE_SIZE - 1) // PAGE_SIZE
     page_key = None
@@ -437,6 +436,7 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
             "created_at": time.time(),
             "file_code": job.code,
             "target_user_id": job.target_user_id,
+            "protect_content": getattr(job, "protect_content", False),
         }
 
     result = await _send_page(
@@ -444,6 +444,9 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
         file_meta_list, page=1, total_pages=total_pages,
         storage_channel_id=job.storage_channel_id,
         page_key=page_key if total_pages > 1 else None,
+        storage_msg_ids=job.storage_msg_ids,
+        protect_content=getattr(job, "protect_content", False),
+        bot_id=bot_id,
     )
     return result
 
@@ -469,28 +472,46 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
         if i < len(job.storage_msg_ids) - 1:
             await asyncio.sleep(0.15)
     await metrics.record_processed("dsp_bot")
+    return True
 
 
-async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None) -> bool:
+async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None, storage_msg_ids=None, protect_content=False, bot_id=1) -> bool:
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
-    page_items = file_meta_list[start:end]
 
-    input_media = [_build_input_media(meta) for meta in page_items]
-    try:
-        await safe_send_media_group(bot, chat_id=chat_id, media=input_media)
-        logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(input_media)}张)")
+    # 使用 copy_message 从存储频道复制（跨Bot file_id 不可用，必须走 copy 路径）
+    if storage_msg_ids and storage_channel_id:
+        page_msg_ids = storage_msg_ids[start:end]
+        for i, mid in enumerate(page_msg_ids):
+            try:
+                resolved = await resolve_delivery_channel(storage_channel_id)
+                if not await try_deliver(bot, chat_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id):
+                    logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid})")
+            except Exception as e:
+                logger.error(f"[Dsp] _send_page copy 异常 (msg={mid}): {e}")
+            if i < len(page_msg_ids) - 1:
+                await asyncio.sleep(0.15)
+        logger.info(f"[Dsp] 分页发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(page_msg_ids)}个文件)")
         metrics.send_success_count += 1
         await metrics.record_processed("dsp_bot")
-    except Exception as e:
-        logger.error(f"[Dsp] 媒体组发送失败: {e}")
-        metrics.send_fail_count += 1
-        await metrics.record_error("dsp_bot")
+    else:
+        # 旧路径：media group 方式（file_id 跨Bot 不可用，仅作兜底）
+        page_items = file_meta_list[start:end]
+        input_media = [_build_input_media(meta) for meta in page_items]
         try:
-            await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
-        except Exception:
-            pass
-        return False
+            await safe_send_media_group(bot, chat_id=chat_id, media=input_media)
+            logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(input_media)}张)")
+            metrics.send_success_count += 1
+            await metrics.record_processed("dsp_bot")
+        except Exception as e:
+            logger.error(f"[Dsp] 媒体组发送失败: {e}")
+            metrics.send_fail_count += 1
+            await metrics.record_error("dsp_bot")
+            try:
+                await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
+            except Exception:
+                pass
+            return False
 
     if total_pages > 1 and page < total_pages:
         # 使用 page_key 避免多用户同码键冲突
@@ -666,6 +687,8 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         file_meta_list, page=page, total_pages=total_pages,
         storage_channel_id=state.get("storage_channel_id"),
         page_key=page_key,
+        storage_msg_ids=state.get("channel_msg_ids"),
+        protect_content=state.get("protect_content", False),
     )
 
     if page >= total_pages:

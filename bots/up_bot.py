@@ -118,11 +118,13 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("您被禁止使用上传功能")
         return
 
+    target_channel_id = await _get_upload_target_channel()
     context.user_data["batch"] = {
         "file_types": defaultdict(int),
         "pinned_msg_ids": [],
         "files_meta": [],
         "note": "",
+        "target_channel_id": target_channel_id,
     }
     await update.message.reply_text(
         "📦 已进入批次上传模式，请发送文件。\n"
@@ -195,7 +197,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "batch_msg_ids": batch_ids_str,
         "batch_file_meta": batch_file_meta_str,
         "note": batch.get("note", ""),
-        "primary_channel_id": await _get_upload_target_channel(),
+        "primary_channel_id": batch.get("target_channel_id") or await _get_upload_target_channel(),
         "primary_channel_msg_id": channel_msg_ids[0],
         "total_count": len(channel_msg_ids),
     }
@@ -248,7 +250,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
         batch["file_types"][file_type] += 1
         batch["files_meta"].append(extract_file_meta(update))
         try:
-            target_ch = await _get_upload_target_channel()
+            target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
             forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
             batch["pinned_msg_ids"].append(forwarded.message_id)
         except Exception as e:
@@ -279,7 +281,7 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
     file_types = grp["file_types"]
     for k, v in file_types.items():
         batch["file_types"][k] += v
-    target_ch = await _get_upload_target_channel()
+    target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
 
     # 并发复制所有媒体文件到存储频道
     tasks = [asyncio.create_task(_copy_one_media(context, target_ch, up, batch)) for up in grp["updates"]]

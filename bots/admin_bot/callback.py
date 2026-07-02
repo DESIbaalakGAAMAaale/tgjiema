@@ -15,7 +15,7 @@ from database.cache import invalidate_file_record
 from config import settings
 
 from .menus import (
-    _build_menu, BACK_BTN, _CONV_CANCEL_KEYBOARD,
+    _build_menu, BACK_BTN,
     AUTHORIZED_USER_ID,
 )
 from .display import (

@@ -548,6 +548,10 @@ class D1Collection:
                 logger.info(f"[SQL_EXEC] {self.table}: {sql[:200]}")
             return 1
 
+    async def execute_raw(self, sql: str, params: list = None) -> int:
+        """公开的原始 SQL 执行方法，用于批量操作（如 CASE WHEN UPDATE）"""
+        return await self._execute(sql, params)
+
     async def find_one(self, query: dict, projection: list[str] | None = None) -> Optional[dict]:
         params = []
         where_parts = []
@@ -1956,7 +1960,7 @@ async def bulk_update_request_counts(counts: dict[str, int]) -> int:
         f"WHERE file_code IN ({placeholders})"
     )
     col = get_file_records_col()
-    return await col._execute(sql, params)
+    return await col.execute_raw(sql, params)
 
 
 async def batch_update_cells_dirty(cells: list[dict]) -> int:
@@ -2010,7 +2014,7 @@ async def batch_update_cells_dirty(cells: list[dict]) -> int:
     
     sql = f"UPDATE cells SET {', '.join(set_clauses)} WHERE slot_id IN ({placeholders})"
     col = get_cells_col()
-    return await col._execute(sql, params)
+    return await col.execute_raw(sql, params)
 
 
 async def batch_update_jobs_status(jobs_by_status: dict[str, list[dict]]) -> int:
@@ -2029,10 +2033,10 @@ async def batch_update_jobs_status(jobs_by_status: dict[str, list[dict]]) -> int
         
         if status == "retried":
             sql = f"UPDATE jobs SET status = 'pending', retry_count = COALESCE(retry_count, 0) + 1 WHERE id IN ({placeholders})"
-            total += await col._execute(sql, ids)
+            total += await col.execute_raw(sql, ids)
         elif status == "done":
             sql = f"UPDATE jobs SET status = 'done' WHERE id IN ({placeholders})"
-            total += await col._execute(sql, ids)
+            total += await col.execute_raw(sql, ids)
         elif status == "dead":
             # dead_reason 各不同，需要 CASE WHEN
             params = []
@@ -2046,7 +2050,7 @@ async def batch_update_jobs_status(jobs_by_status: dict[str, list[dict]]) -> int
                 f"dead_reason = CASE id {' '.join(cases)} END "
                 f"WHERE id IN ({placeholders})"
             )
-            total += await col._execute(sql, params)
+            total += await col.execute_raw(sql, params)
     
     return total
 
