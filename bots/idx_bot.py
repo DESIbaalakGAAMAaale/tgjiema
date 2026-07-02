@@ -519,7 +519,7 @@ async def _process_one_pending(app: Application, row: dict):
     # 写入 codes 表（含 expire_time，省一次 UPDATE）
     try:
         expire_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
-            days=settings.DEFAULT_FILE_TTL_DAYS if settings.DEFAULT_FILE_TTL_DAYS is not None else 60
+            days=file_ttl_days if file_ttl_days else settings.DEFAULT_FILE_TTL_DAYS
         )
         codes_col = get_codes_col()
         ce = make_code_entry(
@@ -1575,6 +1575,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             metrics.decode_count += 1
             await metrics.record_processed("idx_bot")
             return
+        else:
+            # 发送失败也释放账号，避免泄漏
+            await relay_pool.release_account(account, duration_ms)
 
     try:
         await safe_send_message(context.bot, chat_id=bot_username, text=code)

@@ -78,6 +78,8 @@ def make_file_record(
         "create_time": now,
         "expire_time": expire_time,
         "protect_content": protect_content,
+        "file_ttl_days": file_ttl_days,
+        "updated_at": now,
     }
 
 

@@ -105,28 +105,19 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
 
 
 async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> DeliveryChannel:
-    """环形遍历,找到第一个可用的频道。使用 cells 全量数据在内存中遍历环形链表。"""
-    # 尝试从 delivery_resolver 自身缓存获取(避免全表扫描)
-    # 从 per-entry 缓存中提取所有 cell 字典
-    all_cells = None
-    if _cell_cache:
-        now = time.monotonic()
-        cached_cells = []
-        for ch_id, (cell, ts) in list(_cell_cache.items()):
-            if now - ts < _CELL_CACHE_TTL * 2:
-                cached_cells.append(cell)
-        if cached_cells:
-            all_cells = cached_cells
+    """环形遍历,找到第一个可用的频道。使用 cells 全量数据在内存中遍历环形链表。
 
-    if all_cells is None:
-        from database.cache_store import get_cache_store
-        store = get_cache_store()
-        cells = await store.get_all_cells_local()
-        if cells:
-            all_cells = cells
-        else:
-            snap_cells, _ = await store.load_cells_snapshot()
-            all_cells = snap_cells or []
+    注意：始终从 SQLite cells_local 读取全量数据，不使用 _cell_cache 部分缓存。
+    环形遍历需要完整的拓扑信息，部分缓存会导致 cell_map 缺失中间节点，遍历提前中断。
+    """
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    cells = await store.get_all_cells_local()
+    if cells:
+        all_cells = cells
+    else:
+        snap_cells, _ = await store.load_cells_snapshot()
+        all_cells = snap_cells or []
 
     if not all_cells:
         return DeliveryChannel(channel_id, "unknown", "fallback")

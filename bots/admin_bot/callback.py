@@ -315,12 +315,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.answer("参数缺失", show_alert=True)
                 return
             uid = int(parts[1])
-            users_col = get_users_col()
-            await users_col.update_one(
-                {"user_id": uid},
-                {"$set": {"is_banned": True, "updated_at": _dt.datetime.now(_dt.UTC).isoformat()}},
-            )
-            await update_user_and_invalidate(uid)
+            await update_user_and_invalidate(uid, {
+                "$set": {"is_banned": True, "updated_at": _dt.datetime.now(_dt.UTC).isoformat()},
+            })
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ 已封禁用户 {uid}",
                 reply_markup=None,

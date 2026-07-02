@@ -449,22 +449,22 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
 
 
 async def _fallback_single_send(bot, job, bot_id: int = 1):
+    """兜底逐个发送（媒体组发送失败时使用）。
+    
+    注意：调用方 _send_one_job 已持有 _send_semaphore，此处不再获取，
+    避免双重获取导致低并发时死锁。消息逐个发送本身已串行，无需额外限流。
+    """
     protect_content = getattr(job, "protect_content", False)
     for i, mid in enumerate(job.storage_msg_ids):
-        # 使用信号量控制并发,避免 Telegram API 限流
-        try:
-            await asyncio.wait_for(_send_semaphore.acquire(), timeout=30)
-        except asyncio.TimeoutError:
-            logger.warning(f"[Dsp] 信号量超时,跳过消息 {mid}")
-            continue
         try:
             resolved = await resolve_delivery_channel(job.storage_channel_id)
             if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id):
                 metrics.send_success_count += 1
             else:
                 metrics.send_fail_count += 1
-        finally:
-            _send_semaphore.release()
+        except Exception as e:
+            logger.error(f"[Dsp] 兜底发送异常 (msg={mid}): {e}")
+            metrics.send_fail_count += 1
         # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
         if i < len(job.storage_msg_ids) - 1:
             await asyncio.sleep(0.15)

@@ -2,10 +2,12 @@
 - 中继账号配置、认证、使用统计全部存储在本地，不占用 CockroachDB Cloud 配额
 - VPS 重启后从本地恢复，无需重新登录
 """
+from __future__ import annotations
+
 import asyncio
 import os
 import aiosqlite
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from loguru import logger
 

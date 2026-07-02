@@ -1076,9 +1076,8 @@ class UserRelay:
                                  if isinstance(e, dict) and e.get("file_id")]
                     fids_update["file_ids"] = ",".join(fids_list)
                     fids_update["batch_file_meta"] = json.dumps(bfm_parsed)
-                    await files_col.update_one(
-                        {"file_code": code}, {"$set": fids_update}
-                    )
+                    from database import update_file_record_and_invalidate
+                    await update_file_record_and_invalidate(code, {"$set": fids_update})
                     logger.info(
                         f"[UserRelay] 自修复已保存: code={code}, "
                         f"修复了 {healed} 个 file_id"
@@ -1210,6 +1209,8 @@ class UserRelay:
             logger.warning(
                 f"[UserRelay] 缓存交付: 码 {code} 无 file_id，记录已过期，清除并通知重新请求"
             )
+            from database import get_file_records_col
+            col = get_file_records_col()
             await col.delete_one({"file_code": code})
             if self._decoder_bot_entity:
                 await self._client.send_message(

@@ -203,7 +203,7 @@ class MonBot:
                 text=msg,
                 disable_web_page_preview=True,
             )
-            self._notify_cooldowns[event_key] = 0  # 成功，清除冷却
+            self._notify_cooldowns[event_key] = now  # 成功，设置冷却（10分钟内不再发送同类通知）
         except Exception as e:
             self._notify_cooldowns[event_key] = now
             logger.warning(f"[Mon][Notify] 发送通知失败: {e}")

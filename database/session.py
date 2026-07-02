@@ -241,6 +241,7 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS codes ADD COLUMN updated_at TEXT",
     # PRE-01: cells 表补充 demoted_to_channel_id 字段（CRDB 不支持 ADD COLUMN IF NOT EXISTS，用 try/except 兼容已存在）
     "ALTER TABLE IF EXISTS cells ADD COLUMN demoted_to_channel_id BIGINT",
+    "ALTER TABLE IF EXISTS cells ADD COLUMN prev_slot_id TEXT",
     # ─── 索引清理：删除冗余/未使用的索引（减少 UPDATE 维护开销）─────────────
     "DROP INDEX IF EXISTS idx_cells_channel",
     "DROP INDEX IF EXISTS idx_cells_status",
@@ -1974,18 +1975,25 @@ async def batch_update_cells_dirty(cells: list[dict]) -> int:
     for key in ("channel_id", "status", "next_active_chat_id", "demoted_to_channel_id",
                 "account_name", "is_r100", "degrade_count", "file_count", "rotation_started_at"):
         parts = []
+        seen_slots = set()  # 防止同一 slot_id 出现多个 WHEN（CASE WHEN 冲突）
         for i, c in enumerate(cells):
             val = c.get(key)
             if val is not None:
-                params.append(c["slot_id"])
+                sid = c["slot_id"]
+                if sid in seen_slots:
+                    continue
+                seen_slots.add(sid)
+                params.append(sid)
                 params.append(val)
                 parts.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
         if parts:
             # Handle lost cells: set next_active_chat_id to NULL
             if key == "next_active_chat_id":
                 for i, c in enumerate(cells):
-                    if c.get("status") == "lost":
-                        params.append(c["slot_id"])
+                    sid = c["slot_id"]
+                    if c.get("status") == "lost" and sid not in seen_slots:
+                        seen_slots.add(sid)
+                        params.append(sid)
                         params.append(None)
                         parts.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
             field_cases[key] = " ".join(parts)
