@@ -235,9 +235,9 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS blocked_users JSONB DEFAULT '[]'",
-    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS updated_at TEXT",
-    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS file_ttl_days INTEGER DEFAULT 0",
-    "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS updated_at TEXT",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN updated_at TEXT",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN file_ttl_days INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS codes ADD COLUMN updated_at TEXT",
     # ─── 索引清理：删除冗余/未使用的索引（减少 UPDATE 维护开销）─────────────
     "DROP INDEX IF EXISTS idx_cells_channel",
     "DROP INDEX IF EXISTS idx_cells_status",
