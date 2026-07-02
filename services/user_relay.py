@@ -232,8 +232,8 @@ class UserRelay:
                                      if isinstance(e, dict) and e.get("file_id")]
                         update["$set"]["file_ids"] = ",".join(fids_list)
 
-                    await files_col.update_one({"file_code": code}, update)
-                    # PRE-05: 同步写 SQLite + 失效内存缓存，确保后续 get_file_record_cached 命中
+                    # PRE-05: 用 update_file_record_and_invalidate 一次性双写 CRDB+SQLite 并失效缓存
+                    # 避免先 files_col.update_one 再 update_file_record_and_invalidate 造成双重 CRDB 写入
                     try:
                         from database import update_file_record_and_invalidate
                         await update_file_record_and_invalidate(code, update)

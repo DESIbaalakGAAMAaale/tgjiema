@@ -1335,12 +1335,19 @@ async def update_file_record_and_invalidate(file_code: str, update: dict):
         if "$set" in update:
             existing.update(update["$set"])
         if "$push" in update:
+            # SQLite 中 list 字段以 JSON 字符串存储，需先反序列化再追加
             for k, v in update["$push"].items():
                 cur = existing.get(k)
+                if isinstance(cur, str):
+                    try:
+                        cur = json.loads(cur)
+                    except (json.JSONDecodeError, TypeError):
+                        cur = []
                 if isinstance(cur, list):
                     cur.append(v)
                 else:
-                    existing[k] = [v]
+                    cur = [v]
+                existing[k] = cur  # upsert_file_record_local 会通过 _serialize 转回 JSON 字符串
         if "$inc" not in update and "$set" not in update and "$push" not in update:
             # 兼容：直接传入 {field: value} 形式（无操作符）
             existing.update(update)
