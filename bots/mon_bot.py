@@ -174,12 +174,13 @@ class MonBot:
         except Exception as e:
             logger.warning(f"[Mon][Config] 读取轮转配置失败: {e}")
 
-    async def _notify_admin(self, msg: str):
+    async def _notify_admin(self, msg: str) -> bool:
         """通知管理员(通过 admin_bot 或直接向管理员聊天发消息)。
         按事件类型冷却：同一事件类型 10 分钟内不重复发送。
+        返回 True 表示消息已发出，False 表示被冷却或失败。
         """
         if not self._admin_chat_id or self._admin_chat_id == 0:
-            return
+            return False
 
         # 按事件类型冷却：取消息首行作为事件标识
         event_key = msg.split("\n")[0] if msg else msg
@@ -188,7 +189,7 @@ class MonBot:
         now = time.time()
         last = self._notify_cooldowns.get(event_key, 0)
         if now - last < 600:
-            return
+            return False
 
         try:
             if not self._admin_bot:
@@ -204,9 +205,10 @@ class MonBot:
                 disable_web_page_preview=True,
             )
             self._notify_cooldowns[event_key] = now  # 成功，设置冷却（10分钟内不再发送同类通知）
+            return True
         except Exception as e:
-            self._notify_cooldowns[event_key] = now
             logger.warning(f"[Mon][Notify] 发送通知失败: {e}")
+            return False  # 失败不设冷却，下次循环可重试
 
     async def _handle_channel_ban(self, cell: dict, error: str):
         """处理频道封禁/丢失:通知管理员 + 尝试从备用池补充。
@@ -585,13 +587,13 @@ class MonBot:
                     # 轮转通知频率控制: 每 3600 秒最多通知一次
                     now = time.time()
                     if now - self._last_rotation_notify_ts > 3600:
-                        self._last_rotation_notify_ts = now
-                        await self._notify_admin(
+                        if await self._notify_admin(
                             f"🔄 频道轮转完成\n\n"
                             f"当前窗口已推进，新窗口已激活\n"
                             f"参数: {self._rotation['active_window_size']}活态 / "
                             f"{self._rotation['files_per_slot']}文件/{self._rotation['time_per_slot']}秒"
-                        )
+                        ):
+                            self._last_rotation_notify_ts = now
 
                 # 6. 定期拓扑校验(每 10 轮一次)
                 self._cycle_count += 1
