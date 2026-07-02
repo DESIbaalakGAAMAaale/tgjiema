@@ -889,6 +889,7 @@ async def _async_main():
     async def health_ping():
         while True:
             await metrics.ping_bot("up_bot")
+            await report_bot_heartbeat("up_bot")
             await asyncio.sleep(30)
 
     async def slot_refresh_loop():

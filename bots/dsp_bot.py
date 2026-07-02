@@ -722,6 +722,7 @@ async def _async_main():
     async def health_ping():
         while True:
             await metrics.ping_bot("dsp_bot")
+            await report_bot_heartbeat("dsp_bot")
             await asyncio.sleep(30)
 
     # H: 启动时一次性从 CRDB 同步，补齐 Dsp 离线期间遗漏的 job

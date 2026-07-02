@@ -1816,6 +1816,7 @@ async def _async_main():
     async def health_ping():
         while True:
             await metrics.ping_bot("idx_bot")
+            await report_bot_heartbeat("idx_bot")
             await asyncio.sleep(30)
 
     async def cleanup_loop():

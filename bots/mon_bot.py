@@ -538,7 +538,10 @@ class MonBot:
 
         while self._running:
             try:
-                # 0. 重新加载轮转配置(每 30 周期一次)
+                # 0. 心跳上报（跨进程共享）
+                await report_bot_heartbeat("mon_bot")
+
+                # 1. 重新加载轮转配置(每 30 周期一次)
                 await self._reload_rotation_config()
 
                 # ── 一次查询 cells 表(走缓存),所有方法复用 ──

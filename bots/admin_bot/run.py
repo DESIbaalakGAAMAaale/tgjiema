@@ -4,6 +4,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 from .menus import TOKEN, AUTHORIZED_USER_ID
 from utils.monitor import metrics
+from utils.task_utils import create_safe_task
 from .handlers import (
     start, status, health, user_detail, users_list, set_level, ban_user, unban_user,
     set_quota, set_external_quota, file_detail, files_list, delete_file, logs,
@@ -89,6 +90,14 @@ async def _async_main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:|report:)"))
+
+    async def health_ping():
+        while True:
+            await metrics.ping_bot("admin_bot")
+            await report_bot_heartbeat("admin_bot")
+            await asyncio.sleep(30)
+
+    create_safe_task(health_ping(), name="health-ping")
 
     async with app:
         await app.start()
