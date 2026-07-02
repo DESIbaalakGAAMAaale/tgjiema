@@ -124,6 +124,7 @@ DDL_STATEMENTS = [
         status TEXT NOT NULL DEFAULT 'shadow1',
         next_active_chat_id BIGINT,
         prev_slot_id TEXT,
+        demoted_to_channel_id BIGINT,
         account_name TEXT DEFAULT '',
         is_r100 INTEGER DEFAULT 0,
         last_heartbeat TEXT,
@@ -238,6 +239,8 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN updated_at TEXT",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN file_ttl_days INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS codes ADD COLUMN updated_at TEXT",
+    # PRE-01: cells 表补充 demoted_to_channel_id 字段（CRDB 不支持 ADD COLUMN IF NOT EXISTS，用 try/except 兼容已存在）
+    "ALTER TABLE IF EXISTS cells ADD COLUMN demoted_to_channel_id BIGINT",
     # ─── 索引清理：删除冗余/未使用的索引（减少 UPDATE 维护开销）─────────────
     "DROP INDEX IF EXISTS idx_cells_channel",
     "DROP INDEX IF EXISTS idx_cells_status",
@@ -1311,28 +1314,42 @@ async def get_file_record_cached(file_code: str) -> Optional[dict]:
 
 
 async def update_file_record_and_invalidate(file_code: str, update: dict):
-    """双写：先写 CRDB，再同步 SQLite 全表缓存"""
+    """双写：先写 CRDB，再同步 SQLite 全表缓存
+
+    PRE-06: 扩展支持 $push 操作符（admin_bot 的 report:block 使用 $push 更新 blocked_users）。
+    其他操作符（$set/$inc）保持原有行为。
+    """
     from .cache_store import get_cache_store
     store = get_cache_store()
-    
+
     # 1. 写 CRDB
     col = get_file_records_col()
     await col.update_one({"file_code": file_code}, update)
-    
+
     # 2. 同步 SQLite（标记 dirty，由 sync 循环确认）
     existing = await store.get_file_record_local(file_code)
     if existing:
         if "$inc" in update:
             for k, v in update["$inc"].items():
                 existing[k] = existing.get(k, 0) + v
-        else:
-            existing.update(update.get("$set", update))
+        if "$set" in update:
+            existing.update(update["$set"])
+        if "$push" in update:
+            for k, v in update["$push"].items():
+                cur = existing.get(k)
+                if isinstance(cur, list):
+                    cur.append(v)
+                else:
+                    existing[k] = [v]
+        if "$inc" not in update and "$set" not in update and "$push" not in update:
+            # 兼容：直接传入 {field: value} 形式（无操作符）
+            existing.update(update)
         await store.upsert_file_record_local(existing, mark_dirty=False)
     else:
         record = await col.find_one({"file_code": file_code})
         if record:
             await store.upsert_file_record_local(record, mark_dirty=False)
-    
+
     cache = get_file_record_cache()
     cache.invalidate(f"file:{file_code}")
 
@@ -1947,8 +1964,8 @@ async def batch_update_cells_dirty(cells: list[dict]) -> int:
     # 收集所有字段值，按 slot_id 索引
     params = [now_iso]
     field_cases = {}
-    for key in ("channel_id", "status", "next_active_chat_id", "account_name", "is_r100",
-                "degrade_count", "file_count", "rotation_started_at"):
+    for key in ("channel_id", "status", "next_active_chat_id", "demoted_to_channel_id",
+                "account_name", "is_r100", "degrade_count", "file_count", "rotation_started_at"):
         parts = []
         for i, c in enumerate(cells):
             val = c.get(key)

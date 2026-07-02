@@ -20,7 +20,7 @@ from loguru import logger
 
 from config import settings
 from database import get_file_record_cached, get_pending_jobs_count_local
-from storage.delivery_resolver import resolve_delivery_channel, try_deliver
+from storage.delivery_resolver import resolve_delivery_channel, try_deliver, invalidate_cell_cache
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
@@ -106,6 +106,28 @@ async def _retry_dead_jobs():
         except Exception as e:
             logger.error(f"[Dsp] 死信重试异常: {e}")
         await asyncio.sleep(3600)
+
+
+async def _watch_cells_change():
+    """PRE-02: 定期检查 cells_change_notify，发现 mon_bot 轮转/降级后立即失效 delivery_resolver 缓存。
+
+    mon_bot 通过 _bump_cells_version 写入 cells_change_notify 表（跨进程 SQLite 共享）。
+    本任务每 5 秒检查一次，若有变更则调用 invalidate_cell_cache() 清空 per-entry 缓存，
+    强制 resolve_delivery_channel 重新读取 cells_local，避免投递到已降级的频道。
+    """
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    last_version = 0
+    while True:
+        try:
+            changed, new_version = await store.has_cells_change(last_version)
+            if changed:
+                invalidate_cell_cache()  # 清空全部 per-entry 缓存
+                last_version = new_version
+                logger.info(f"[Dsp] cells 变更检测(version={new_version})，已失效 delivery_resolver 缓存")
+        except Exception as e:
+            logger.debug(f"[Dsp] cells 变更检测异常: {e}")
+        await asyncio.sleep(5)
 
 
 def _record_channel_failure(channel_id: int):
@@ -717,6 +739,7 @@ async def _async_main():
     create_safe_task(_cleanup_channel_failures(), name="cleanup-channel-failures")
     create_safe_task(_cleanup_channel_limiter_loop(), name="cleanup-channel-limiter")
     create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
+    create_safe_task(_watch_cells_change(), name="watch-cells-change")  # PRE-02: 失效 delivery_resolver 缓存
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")
 

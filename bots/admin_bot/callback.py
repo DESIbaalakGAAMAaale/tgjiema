@@ -9,7 +9,9 @@ from database import (
     get_all_bot_decode_intervals,
     list_spare_pool,
     get_rotation_config,
+    update_file_record_and_invalidate,
 )
+from database.cache import invalidate_file_record
 from config import settings
 
 from .menus import (
@@ -329,11 +331,12 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 await query.answer("参数缺失", show_alert=True)
                 return
             file_code = parts[1]
-            files_col = get_file_records_col()
-            await files_col.update_one(
-                {"file_code": file_code},
-                {"$set": {"status": "detached"}},
-            )
+            # PRE-06: 用 update_file_record_and_invalidate 一次性双写 CRDB+SQLite 并失效内存缓存
+            try:
+                await update_file_record_and_invalidate(file_code, {"$set": {"status": "detached"}})
+            except Exception as e:
+                logger.error(f"[Admin][report:detach] 双写失败: {e}")
+                invalidate_file_record(file_code)
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ 已脱钩文件码 {file_code}",
                 reply_markup=None,
@@ -345,11 +348,12 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             file_code = parts[1]
             reporter_id = int(parts[2])
-            files_col = get_file_records_col()
-            await files_col.update_one(
-                {"file_code": file_code},
-                {"$push": {"blocked_users": reporter_id}},
-            )
+            # PRE-06: 用 update_file_record_and_invalidate 一次性双写 CRDB+SQLite 并失效内存缓存
+            try:
+                await update_file_record_and_invalidate(file_code, {"$push": {"blocked_users": reporter_id}})
+            except Exception as e:
+                logger.error(f"[Admin][report:block] 双写失败: {e}")
+                invalidate_file_record(file_code)
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ 已限制举报人 {reporter_id} 解码 {file_code}",
                 reply_markup=None,

@@ -43,8 +43,10 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
     解析顺序:
     1. 查询该频道对应的 cell(可能是 active/shadow1/shadow2/lost)
     2. 如果是 active 或 r100,直接返回
-    3. 如果是 shadow 或 lost,沿环形找下一个 active 或 shadow1
-    4. 最多尝试 3 层降级,防止无限环
+    3. PRE-01: 如果 cell 有 demoted_to_channel_id（被轮转降级且接替频道已就绪），
+       立即跳转到接替频道（接替频道已镜像了原频道内容），无需走环形遍历
+    4. 如果是 shadow 或 lost,沿环形找下一个 active 或 shadow1
+    5. 最多尝试 3 层降级,防止无限环
     """
     # 先查本地缓存(per-entry TTL),避免每次调用都查询 CRDB
     now = time.monotonic()
@@ -67,6 +69,32 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
     # active 或 r100:直接用
     if status in ("active", "r100"):
         return DeliveryChannel(cell["channel_id"], cell["slot_id"], status)
+
+    # PRE-01: 降级映射优先 —— 若 mon_bot 已记录 demoted_to_channel_id，
+    # 直接跳转到接替频道（该频道是提升后的 active，已镜像原频道内容）。
+    # 这避免了环形遍历的开销，且确保 Dsp 在 mon_bot 轮转后第一时间命中新频道。
+    demoted_to = cell.get("demoted_to_channel_id")
+    if demoted_to:
+        # 递归解析接替频道（通常一步到位为 active，但防御性递归以防多次降级）
+        # 加 visited 集合防止循环
+        visited = {primary_channel_id}
+        current_to = demoted_to
+        for _ in range(5):
+            if current_to in visited:
+                break
+            visited.add(current_to)
+            promoted_cell = await get_cell_by_channel_local(current_to)
+            if promoted_cell is None:
+                break
+            p_status = promoted_cell.get("status", "")
+            if p_status in ("active", "r100"):
+                return DeliveryChannel(promoted_cell["channel_id"], promoted_cell["slot_id"], p_status)
+            # 接替频道也已被降级？沿其 demoted_to_channel_id 继续
+            next_to = promoted_cell.get("demoted_to_channel_id")
+            if not next_to:
+                break
+            current_to = next_to
+        # 降级映射未能命中 active，继续走环形遍历兜底
 
     # shadow1:可用但非首选
     if status == "shadow1":

@@ -233,6 +233,12 @@ class UserRelay:
                         update["$set"]["file_ids"] = ",".join(fids_list)
 
                     await files_col.update_one({"file_code": code}, update)
+                    # PRE-05: 同步写 SQLite + 失效内存缓存，确保后续 get_file_record_cached 命中
+                    try:
+                        from database import update_file_record_and_invalidate
+                        await update_file_record_and_invalidate(code, update)
+                    except Exception:
+                        pass
                     logger.info(f"[UserRelay] 外部码 {code} 追加 msg_id={message_id}，batch={batch_ids}")
                 else:
                     record = make_file_record(
@@ -250,6 +256,14 @@ class UserRelay:
                             "type": media_type,
                         }])
                     await files_col.insert_one(record)
+                    # PRE-05: 同步写 SQLite + 失效内存缓存，确保后续 get_file_record_cached 命中
+                    try:
+                        from database.cache_store import get_cache_store
+                        from database.cache import invalidate_file_record
+                        await get_cache_store().upsert_file_record_local(record, mark_dirty=False)
+                        invalidate_file_record(code)
+                    except Exception:
+                        pass
                     logger.info(f"[UserRelay] 外部码 {code} 已缓存到本地存储")
             except Exception as e:
                 logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
@@ -999,19 +1013,20 @@ class UserRelay:
                 self._pending_cleanup(bot_username)
             return
 
-        from database import get_file_records_col
+        from database import get_file_record_cached
         try:
             await self._wait_all_cached(bot_username, timeout=60)
             lock = self._cache_locks.get(code)
             if lock:
                 async with lock:
                     pass
-            files_col = get_file_records_col()
+            # PRE-05: 热路径使用 get_file_record_cached（内存→SQLite，0 CRDB RU）
+            # idx_bot 创建记录时双写 CRDB+SQLite，重试循环可从 SQLite 命中
             record = None
             for retry in range(6):
                 if retry > 0:
                     await asyncio.sleep(2)
-                record = await files_col.find_one({"file_code": code})
+                record = await get_file_record_cached(code)
                 if record:
                     break
                 if retry < 5:
@@ -1162,9 +1177,9 @@ class UserRelay:
             return False
 
         try:
-            from database import get_file_records_col
-            col = get_file_records_col()
-            record = await col.find_one({"file_code": code})
+            # PRE-05: 热路径使用 get_file_record_cached（内存→SQLite，0 CRDB RU）
+            from database import get_file_record_cached
+            record = await get_file_record_cached(code)
             if not record:
                 logger.warning(f"[UserRelay] 缓存交付: 码 {code} 无记录")
                 return False

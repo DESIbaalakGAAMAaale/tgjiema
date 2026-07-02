@@ -141,6 +141,8 @@ class CacheStore:
                 channel_id BIGINT NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'shadow1',
                 next_active_chat_id BIGINT,
+                prev_slot_id TEXT,
+                demoted_to_channel_id BIGINT,
                 account_name TEXT DEFAULT '',
                 is_r100 INTEGER DEFAULT 0,
                 last_heartbeat TEXT,
@@ -152,6 +154,15 @@ class CacheStore:
                 crdb_synced INTEGER DEFAULT 1
             )"""
         )
+        # PRE-04 / PRE-01: 为已存在的数据库补字段（CRDB/SQLite 不支持 ADD COLUMN IF NOT EXISTS，用 try-except 兼容）
+        for _col_ddl in [
+            "ALTER TABLE cells_local ADD COLUMN prev_slot_id TEXT",
+            "ALTER TABLE cells_local ADD COLUMN demoted_to_channel_id BIGINT",
+        ]:
+            try:
+                await self._db.execute(_col_ddl)
+            except Exception:
+                pass  # 字段已存在
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_cells_local_status ON cells_local(status)"
         )
@@ -952,7 +963,11 @@ class CacheStore:
     # ─── E2: cells 本地逐行存储（热路径零 CRDB RU） ───
 
     async def bulk_upsert_cells_local(self, cells: list[dict]):
-        """初始化/全量同步:批量写入 cells 到本地表(crdb_synced=1,视为已同步)"""
+        """初始化/全量同步:批量写入 cells 到本地表(crdb_synced=1,视为已同步)
+
+        PRE-04/PRE-01: 包含 prev_slot_id 和 demoted_to_channel_id 字段，
+        前者用于反向遍历环形链表，后者用于降级时立即跳转到接替频道。
+        """
         if not self._db or not cells:
             return
         now = time.time()
@@ -963,6 +978,8 @@ class CacheStore:
                 c.get("channel_id", 0),
                 c.get("status", "shadow1"),
                 c.get("next_active_chat_id"),
+                c.get("prev_slot_id"),
+                c.get("demoted_to_channel_id"),
                 c.get("account_name", ""),
                 c.get("is_r100", 0),
                 c.get("last_heartbeat"),
@@ -977,10 +994,11 @@ class CacheStore:
             try:
                 await self._db.executemany(
                     """INSERT OR REPLACE INTO cells_local
-                    (slot_id, channel_id, status, next_active_chat_id, account_name,
-                     is_r100, last_heartbeat, last_synced_msg_id, degrade_count,
-                     file_count, rotation_started_at, updated_at, crdb_synced)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (slot_id, channel_id, status, next_active_chat_id, prev_slot_id,
+                     demoted_to_channel_id, account_name, is_r100, last_heartbeat,
+                     last_synced_msg_id, degrade_count, file_count, rotation_started_at,
+                     updated_at, crdb_synced)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     rows,
                 )
                 await self._db.commit()
@@ -1101,18 +1119,21 @@ class CacheStore:
                 return
 
     async def get_all_cells_local(self) -> list[dict]:
-        """从本地表读取全部 cells，返回 dict 列表（零 CRDB RU）"""
+        """从本地表读取全部 cells，返回 dict 列表（零 CRDB RU）
+
+        PRE-04/PRE-01: 包含 prev_slot_id 和 demoted_to_channel_id 字段。
+        """
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
-            """SELECT slot_id, channel_id, status, next_active_chat_id, account_name,
-                      is_r100, last_heartbeat, last_synced_msg_id, degrade_count,
-                      file_count, rotation_started_at
+            """SELECT slot_id, channel_id, status, next_active_chat_id, prev_slot_id,
+                      demoted_to_channel_id, account_name, is_r100, last_heartbeat,
+                      last_synced_msg_id, degrade_count, file_count, rotation_started_at
                FROM cells_local ORDER BY slot_id"""
         )
-        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "account_name",
-                "is_r100", "last_heartbeat", "last_synced_msg_id", "degrade_count",
-                "file_count", "rotation_started_at"]
+        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "prev_slot_id",
+                "demoted_to_channel_id", "account_name", "is_r100", "last_heartbeat",
+                "last_synced_msg_id", "degrade_count", "file_count", "rotation_started_at"]
         result = []
         for r in rows:
             d = dict(zip(cols, r))
@@ -1122,22 +1143,27 @@ class CacheStore:
             d["last_synced_msg_id"] = int(d["last_synced_msg_id"] or 0)
             if d["next_active_chat_id"]:
                 d["next_active_chat_id"] = int(d["next_active_chat_id"])
+            if d.get("demoted_to_channel_id"):
+                d["demoted_to_channel_id"] = int(d["demoted_to_channel_id"])
             result.append(d)
         return result
 
     async def get_active_cells_local(self) -> list[dict]:
-        """从本地表读取 status=active 的 cells（零 CRDB RU）"""
+        """从本地表读取 status=active 的 cells（零 CRDB RU）
+
+        PRE-04/PRE-01: 包含 prev_slot_id 和 demoted_to_channel_id 字段（active 通常二者为空）。
+        """
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
-            """SELECT slot_id, channel_id, status, next_active_chat_id, account_name,
-                      is_r100, last_heartbeat, last_synced_msg_id, degrade_count,
-                      file_count, rotation_started_at
+            """SELECT slot_id, channel_id, status, next_active_chat_id, prev_slot_id,
+                      demoted_to_channel_id, account_name, is_r100, last_heartbeat,
+                      last_synced_msg_id, degrade_count, file_count, rotation_started_at
                FROM cells_local WHERE status = 'active'"""
         )
-        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "account_name",
-                "is_r100", "last_heartbeat", "last_synced_msg_id", "degrade_count",
-                "file_count", "rotation_started_at"]
+        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "prev_slot_id",
+                "demoted_to_channel_id", "account_name", "is_r100", "last_heartbeat",
+                "last_synced_msg_id", "degrade_count", "file_count", "rotation_started_at"]
         result = []
         for r in rows:
             d = dict(zip(cols, r))
@@ -1147,21 +1173,28 @@ class CacheStore:
             d["last_synced_msg_id"] = int(d["last_synced_msg_id"] or 0)
             if d["next_active_chat_id"]:
                 d["next_active_chat_id"] = int(d["next_active_chat_id"])
+            if d.get("demoted_to_channel_id"):
+                d["demoted_to_channel_id"] = int(d["demoted_to_channel_id"])
             result.append(d)
         return result
 
     async def get_dirty_cells_local(self, limit: int = 50) -> list[dict]:
-        """获取需要同步到 CRDB 的脏 cells（异常事件）"""
+        """获取需要同步到 CRDB 的脏 cells（异常事件）
+
+        PRE-01: 包含 demoted_to_channel_id 字段，确保降级映射关系同步到 CRDB。
+        """
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
-            """SELECT slot_id, channel_id, status, next_active_chat_id, account_name,
-                      is_r100, degrade_count, file_count, rotation_started_at
+            """SELECT slot_id, channel_id, status, next_active_chat_id, prev_slot_id,
+                      demoted_to_channel_id, account_name, is_r100, degrade_count,
+                      file_count, rotation_started_at
                FROM cells_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
-        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "account_name",
-                "is_r100", "degrade_count", "file_count", "rotation_started_at"]
+        cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "prev_slot_id",
+                "demoted_to_channel_id", "account_name", "is_r100", "degrade_count",
+                "file_count", "rotation_started_at"]
         return [dict(zip(cols, r)) for r in rows]
 
     async def mark_cell_synced_local(self, slot_id: str):

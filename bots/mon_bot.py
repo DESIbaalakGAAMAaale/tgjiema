@@ -400,29 +400,46 @@ class MonBot:
             return False
 
         demoted_ch_to_promoted_ch: dict[int, int] = {}
+        # PRE-01: 同时建立 slot_id → promoted_channel_id 映射，用于持久化到 cells_local.demoted_to_channel_id
+        demoted_slot_to_promoted_ch: dict[str, int] = {}
         for promote_slot, from_cell in promoted_slots:
             demoted_ch_to_promoted_ch[from_cell["channel_id"]] = promote_slot["channel_id"]
+            demoted_slot_to_promoted_ch[from_cell["slot_id"]] = promote_slot["channel_id"]
 
         for cell in demoted_slots:
+            # PRE-01: 持久化降级映射，delivery_resolver 可立即跳转到接替频道
+            promoted_ch = demoted_slot_to_promoted_ch.get(cell["slot_id"])
             if cell.get("status") != "shadow1":
-                batch_updates.append((cell["slot_id"], {
+                update_fields = {
                     "status": "shadow1", "file_count": 0, "next_active_chat_id": None,
-                }, True))
-                self._update_cell_in_cache(cell["slot_id"], {
-                    "status": "shadow1", "file_count": 0, "next_active_chat_id": None,
-                })
+                }
+                if promoted_ch is not None:
+                    update_fields["demoted_to_channel_id"] = promoted_ch
+                batch_updates.append((cell["slot_id"], update_fields, True))
+                self._update_cell_in_cache(cell["slot_id"], update_fields)
+            elif promoted_ch is not None:
+                # 已是 shadow1 但需更新降级映射（确保接替关系最新）
+                update_fields = {
+                    "file_count": 0, "next_active_chat_id": None,
+                    "demoted_to_channel_id": promoted_ch,
+                }
+                batch_updates.append((cell["slot_id"], update_fields, True))
+                self._update_cell_in_cache(cell["slot_id"], update_fields)
 
         for promote_slot, from_cell in promoted_slots:
             nxt = from_cell.get("next_active_chat_id")
             if nxt and nxt in demoted_ch_to_promoted_ch:
                 nxt = demoted_ch_to_promoted_ch[nxt]
+            # PRE-01: 提升为 active 时清除 demoted_to_channel_id（它现在就是接替频道本身）
             batch_updates.append((promote_slot["slot_id"], {
                 "status": "active", "next_active_chat_id": nxt,
                 "file_count": 0, "rotation_started_at": now_iso,
+                "demoted_to_channel_id": None,
             }, True))
             self._update_cell_in_cache(promote_slot["slot_id"], {
                 "status": "active", "next_active_chat_id": nxt,
                 "file_count": 0, "rotation_started_at": now_iso,
+                "demoted_to_channel_id": None,
             })
 
         for cascade_slot in cascade_slots:

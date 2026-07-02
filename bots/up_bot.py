@@ -41,6 +41,28 @@ _active_slot_index: int = 0
 _external_buffers: dict[str, dict] = {}
 _pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
 
+# PRE-11: EXTERNAL_RELAY 协议白名单 —— 仅允许配置的采集器账号上传外部文件。
+# 启动时从 settings.EXTERNAL_RELAY_ALLOWED_USER_IDS 解析（逗号分隔的 user_id）。
+# 留空时 _external_relay_allowed 为空集，所有 EXTERNAL_RELAY / EXTERNAL_DONE 消息都会被拒绝。
+_external_relay_allowed: set[int] = set()
+
+
+def _load_external_relay_whitelist() -> set[int]:
+    """从 settings 解析 EXTERNAL_RELAY 白名单 user_id 集合。"""
+    raw = (settings.EXTERNAL_RELAY_ALLOWED_USER_IDS or "").strip()
+    if not raw:
+        return set()
+    result: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except ValueError:
+            logger.warning(f"[Up] EXTERNAL_RELAY_ALLOWED_USER_IDS 含非法值已忽略: {part!r}")
+    return result
+
 
 async def _cleanup_pending():
     """定期清理超时未完成的 media group 和 external buffer。"""
@@ -168,7 +190,11 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("当前没有进行中的批次上传,请先使用 /start_upload 开始")
         return
 
-    pending_mgids = list(_pending_media_groups.keys())
+    # PRE-13: 仅 flush 当前用户的 media group，避免清掉其他用户正在进行中的批次
+    pending_mgids = [
+        mgid for mgid, grp in _pending_media_groups.items()
+        if grp.get("user_id") == user.id
+    ]
     for mgid in pending_mgids:
         grp = _pending_media_groups.get(mgid)
         if grp and grp.get("timer"):
@@ -218,15 +244,18 @@ async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batch = context.user_data["batch"]
+    user = update.effective_user
     file_type = detect_file_type(update)
 
     if update.message.media_group_id:
         mgid = update.message.media_group_id
         if mgid not in _pending_media_groups:
             _pending_media_groups[mgid] = {
+                "user_id": user.id,  # PRE-13: 标记所属用户，end_upload 仅 flush 本人的
                 "file_types": defaultdict(int),
                 "updates": [],
                 "timer": None,
+                "created_at": time.time(),  # PRE-12: 供 _cleanup_pending 超时清理判断
             }
         grp = _pending_media_groups[mgid]
         grp["file_types"][file_type] += 1
@@ -328,6 +357,7 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "file_types": defaultdict(int),
             "updates": [],
             "timer": None,
+            "created_at": time.time(),  # PRE-12: 供 _cleanup_pending 超时清理判断
         }
 
     group = _pending_media_groups[update.message.media_group_id]
@@ -554,6 +584,19 @@ async def _finalize_upload(query, context, user_id: int):
             file_types = context.user_data.pop("_file_types", {})
             file_meta = context.user_data.pop("_file_meta", {})
 
+            # PRE-14: 校验存储频道与消息 ID 非零，避免写入无效记录导致 dsp_bot 投递失败
+            if not main_channel or not channel_msg_id:
+                logger.error(
+                    f"[Up] 单文件 _finalize_upload 状态缺失: main_channel={main_channel}, "
+                    f"channel_msg_id={channel_msg_id}, user={user_id} — 拒绝写入 pending_uploads"
+                )
+                await metrics.record_error("up_bot")
+                try:
+                    await query.edit_message_text(text="文件处理失败：存储频道未就绪，请重新上传")
+                except Exception:
+                    pass
+                return
+
             await pending_col.insert_one({
                 "uploader_id": user_id,
                 "primary_channel_id": main_channel,
@@ -685,6 +728,11 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     格式:EXTERNAL_RELAY:{user_id}:{external_code}
     文件先 copy 到存储频道，积累后由 EXTERNAL_DONE 触发批量写入 pending_uploads。
     """
+    # PRE-11: 校验消息来源是否为已授权的采集器账号，防止任意用户伪造 EXTERNAL_RELAY 绕过权限上传
+    sender_id = update.effective_user.id if update.effective_user else 0
+    if sender_id not in _external_relay_allowed:
+        logger.warning(f"[Up][ext_relay] 拒绝非白名单发送者的 EXTERNAL_RELAY: sender_id={sender_id}")
+        return
     caption = update.message.caption or ""
     rest = caption[len("EXTERNAL_RELAY:"):]
     user_end = rest.find(":")
@@ -696,7 +744,14 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         return
     external_code = rest[user_end + 1:].strip()
 
-    target_ch = await _get_upload_target_channel()
+    buf = _external_buffers.get(external_code)
+    # 同一 external_code 的所有文件必须 copy 到同一存储频道，
+    # 否则 pending_uploads 的 primary_channel_id 与 batch_msg_ids 中的消息 ID 不匹配（PRE-15 关联修复）
+    if buf is not None and buf.get("channel_id"):
+        target_ch = buf["channel_id"]
+    else:
+        target_ch = await _get_upload_target_channel()
+
     try:
         forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
     except Exception as e:
@@ -709,6 +764,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     if external_code not in _external_buffers:
         _external_buffers[external_code] = {
             "user_id": external_user_id,
+            "channel_id": target_ch,  # 记录实际存储频道，flush 时复用
             "msg_ids": [],
             "files_meta": [],
             "file_types": defaultdict(int),
@@ -732,6 +788,11 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
 
 async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 EXTERNAL_DONE 信号:中继账号通知文件收集完毕,触发批量写入"""
+    # PRE-11: 同样校验白名单，防止非授权账号触发 flush 干扰缓冲区
+    sender_id = update.effective_user.id if update.effective_user else 0
+    if sender_id not in _external_relay_allowed:
+        logger.warning(f"[Up][ext_relay] 拒绝非白名单发送者的 EXTERNAL_DONE: sender_id={sender_id}")
+        return
     text = update.message.text or ""
     if not text.startswith("EXTERNAL_DONE:"):
         return
@@ -772,7 +833,11 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         logger.warning(f"[Up][ext_relay] 外部文件缓冲区为空，跳过 (code={external_code})")
         return
 
-    target_ch = await _get_upload_target_channel()
+    # 复用 buf 中记录的实际存储频道，而非重新轮选（与 _handle_external_relay_file 保持一致）
+    target_ch = buf.get("channel_id")
+    if not target_ch:
+        logger.error(f"[Up][ext_relay] 缓冲区缺失 channel_id (code={external_code})，跳过")
+        return
     type_str = _json_dumps(dict(buf["file_types"]))
     batch_ids_str = ",".join(str(mid) for mid in msg_ids)
     batch_file_meta_str = _json_dumps(buf["files_meta"])
@@ -780,6 +845,8 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
 
     try:
         pending_col = get_pending_uploads_col()
+        # PRE-15: 补全 protect_content / file_ttl_days 字段，与正常上传路径保持一致，
+        # 避免 idx_bot 处理 pending_uploads 时因字段缺失而写入不完整的 file_records
         await pending_col.insert_one({
             "uploader_id": buf["user_id"],
             "primary_channel_id": target_ch,
@@ -791,6 +858,8 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
             "status_msg_id": 0,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
+            "protect_content": False,  # 外部中继文件默认允许转发
+            "file_ttl_days": 0,  # 0 = 永久有效，与 DEFAULT_FILE_TTL_DAYS 一致
         })
         logger.info(f"[Up][ext_relay] 外部文件已写入pending_uploads: code={external_code}, {len(msg_ids)}个文件")
     except Exception as e:
@@ -806,6 +875,13 @@ async def _init():
     from database import init_db
     await init_db()
     await _refresh_active_slots()
+    # PRE-11: 加载 EXTERNAL_RELAY 白名单
+    global _external_relay_allowed
+    _external_relay_allowed = _load_external_relay_whitelist()
+    if _external_relay_allowed:
+        logger.info(f"[Up] EXTERNAL_RELAY 白名单已加载: {len(_external_relay_allowed)} 个账号")
+    else:
+        logger.warning("[Up] EXTERNAL_RELAY 白名单为空，所有外部中继上传将被拒绝（请在 .env 配置 EXTERNAL_RELAY_ALLOWED_USER_IDS）")
 
 
 async def _async_main():

@@ -119,8 +119,11 @@ def clear_negative_file(file_code: str):
 
 
 def invalidate_file_record(file_code: str):
-    """失效指定文件码的缓存,用于文件状态变更时立即生效。"""
-    _file_record_cache.invalidate(f"file_record:{file_code}")
+    """失效指定文件码的缓存,用于文件状态变更时立即生效。
+    注意：缓存键前缀必须与 dump_cache_to_disk/load_cache_from_disk 使用的 "file:" 一致，
+    否则失效操作不会命中缓存条目（审查问题 PRE-03）。
+    """
+    _file_record_cache.invalidate(f"file:{file_code}")
     clear_negative_file(file_code)  # C1: 同时清负缓存
 
 

@@ -1,3 +1,4 @@
+import base64
 import json
 from typing import Optional
 
@@ -15,7 +16,9 @@ class Settings(BaseSettings):
     MON_BOT_TOKEN: str = ""
     ADMIN_TELEGRAM_ID: int = 0
 
-    MAIN_STORAGE_CHANNEL_ID: int = -1000000000000
+    # PRE-09: 默认 0 表示未配置，由 validate_required_fields 强制校验。
+    # 原 -1000000000000 是占位符，可能导致误用为真实频道 ID 引发静默错误。
+    MAIN_STORAGE_CHANNEL_ID: int = 0
     MON_CHECK_INTERVAL: int = 60
 
     # ── 轮转参数（可在 .env 或管理员 Bot 运行时覆盖） ──
@@ -58,14 +61,22 @@ class Settings(BaseSettings):
     RELAY_API_ID: int = 0
     RELAY_API_HASH: str = ""
 
+    # ─── PRE-11: EXTERNAL_RELAY 协议白名单 ───
+    # 采集器账号 user_id 列表（逗号分隔），仅这些账号可通过 EXTERNAL_RELAY 协议上传文件。
+    # 留空表示禁止所有外部中继上传（安全默认）。
+    EXTERNAL_RELAY_ALLOWED_USER_IDS: str = ""
+
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""
     R2_BUCKET_NAME: str = "tgjiema-backup"
     R2_ENDPOINT: Optional[str] = None
 
-    DB_BACKUP_INTERVAL_MINUTES: int = 14400  # 10 天 1 次，减少 CRDB RU
-    DB_BACKUP_ENABLED: bool = True
+    # PRE-07: 默认关闭备份（避免新部署未配置 R2 凭证时静默失败 + 持续消耗 RU）。
+    # 启用备份需显式设置 DB_BACKUP_ENABLED=true 并配置 R2 凭证。
+    # 间隔从 14400(10天) 改为 360(6小时)，与原 get_config_default 一致，更符合备份预期。
+    DB_BACKUP_INTERVAL_MINUTES: int = 360
+    DB_BACKUP_ENABLED: bool = False
 
     ADMIN_WEB_PORT: int = 8080
     ADMIN_WEB_HOST: str = "127.0.0.1"
@@ -166,6 +177,40 @@ class Settings(BaseSettings):
             missing.append('COCKROACHDB_URL')
         if missing:
             raise ValueError(f"[Settings] 以下必填环境变量未配置: {', '.join(missing)}。请检查 .env 文件。")
+
+        # PRE-08: RELAY_ENCRYPTION_KEY 必填且必须是合法的 Fernet 密钥格式
+        # Fernet 密钥：44 字符 urlsafe-base64，解码后 32 字节。
+        # 若留空或格式错误，relay_db 会静默回退到明文存储 API_HASH（PRE-10 已改为抛错，
+        # 但前置校验能更早在启动时暴露问题，避免运行时崩溃）。
+        if not self.RELAY_ENCRYPTION_KEY:
+            raise ValueError(
+                "[Settings] RELAY_ENCRYPTION_KEY 未配置。"
+                "请运行以下命令生成：python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            )
+        try:
+            decoded = base64.urlsafe_b64decode(self.RELAY_ENCRYPTION_KEY.encode())
+            if len(decoded) != 32:
+                raise ValueError(f"解码后长度 {len(decoded)} != 32")
+        except Exception as e:
+            raise ValueError(
+                f"[Settings] RELAY_ENCRYPTION_KEY 不是合法的 Fernet 密钥（{e}）。"
+                "请运行以下命令重新生成：python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+            )
+
+        # PRE-09: MAIN_STORAGE_CHANNEL_ID 必须显式配置为真实频道 ID
+        # 默认值 0 或历史占位符 -1000000000000 都视为未配置
+        if self.MAIN_STORAGE_CHANNEL_ID == 0 or self.MAIN_STORAGE_CHANNEL_ID == -1000000000000:
+            raise ValueError(
+                "[Settings] MAIN_STORAGE_CHANNEL_ID 未配置或仍为占位符（0 或 -1000000000000）。"
+                "请在 .env 中设置真实的主存储频道 ID。"
+            )
+        # Telegram 超级群/频道 ID 通常是 -100 开头的负数
+        if self.MAIN_STORAGE_CHANNEL_ID > 0:
+            logger.warning(
+                f"[Settings] MAIN_STORAGE_CHANNEL_ID={self.MAIN_STORAGE_CHANNEL_ID} 为正数，"
+                "Telegram 超级群/频道 ID 通常是 -100 开头的负数，请确认配置正确。"
+            )
+
         return self
 
     @property
@@ -207,7 +252,8 @@ class Settings(BaseSettings):
     @staticmethod
     def get_config_default(key: str) -> str:
         defaults = {
-            "storage_channel_id": "-1000000000000",
+            # PRE-09: 占位符与 MAIN_STORAGE_CHANNEL_ID 默认值 0 对齐
+            "storage_channel_id": "0",
             "file_code_prefix": "tgwenjian",
             "upload_bot_username": "",
             "decoder_bot_username": "",
@@ -223,6 +269,7 @@ class Settings(BaseSettings):
             "r2_secret_key": "",
             "r2_bucket": "tgjiema-backup",
             "r2_endpoint": "",
+            # PRE-07: 与 DB_BACKUP_* 新默认值对齐
             "db_backup_interval": "360",
             "db_backup_enabled": "false",
         }

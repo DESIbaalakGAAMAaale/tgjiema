@@ -10,23 +10,31 @@ from pathlib import Path
 from loguru import logger
 
 # ── 加密层（Fernet 对称加密）──────────────────────────────────────────
+# PRE-10: 取消所有静默回退路径。cryptography 缺失、密钥未配置、密钥格式非法、
+# 解密失败均直接抛出 RuntimeError，避免 API_HASH 明文落盘或静默登录失败。
 _fernet = None
 _FERNET_ERROR = None
 
 try:
     from cryptography.fernet import Fernet
 except ImportError as e:
-    _FERNET_ERROR = str(e)
-    logger.warning(f"[RelayDB] cryptography 库未安装，API_HASH 将以明文存储: {_FERNET_ERROR}")
+    _FERNET_ERROR = (
+        f"cryptography 库未安装: {e}。"
+        "请运行: pip install cryptography"
+    )
+    logger.error(f"[RelayDB] {_FERNET_ERROR}")
 
 
-def _get_fernet() -> Fernet | None:
-    """延迟初始化 Fernet 实例，从环境变量读取密钥或自动生成"""
+def _get_fernet() -> Fernet:
+    """延迟初始化 Fernet 实例，从环境变量读取密钥。
+
+    PRE-10: 任何失败路径都抛出 RuntimeError，绝不返回 None 以避免静默回退明文存储。
+    """
     global _fernet, _FERNET_ERROR
     if _fernet is not None:
         return _fernet
     if _FERNET_ERROR is not None:
-        return None
+        raise RuntimeError(f"[RelayDB] 加密不可用: {_FERNET_ERROR}")
 
     key = os.getenv("RELAY_ENCRYPTION_KEY", "")
     if not key:
@@ -42,32 +50,41 @@ def _get_fernet() -> Fernet | None:
         _fernet = Fernet(key.encode() if isinstance(key, str) else key)
         return _fernet
     except Exception as e:
-        _FERNET_ERROR = str(e)
-        logger.error(f"[RelayDB] Fernet 初始化失败，API_HASH 将以明文存储: {e}")
-        return None
+        _FERNET_ERROR = (
+            f"Fernet 初始化失败（密钥格式非法或损坏）: {e}。"
+            "请重新生成 RELAY_ENCRYPTION_KEY 并更新 .env。"
+            "注意：更换密钥后已加密的 API_HASH 将无法解密，需重新录入中继账号。"
+        )
+        logger.error(f"[RelayDB] {_FERNET_ERROR}")
+        raise RuntimeError(f"[RelayDB] {_FERNET_ERROR}")
 
 
 def encrypt(plain_text: str) -> str:
-    """加密明文，返回密文字符串；如果加密不可用则返回明文 + 标记前缀"""
+    """加密明文，返回密文字符串。
+
+    PRE-10: 加密失败直接抛出 RuntimeError，绝不返回明文（避免 API_HASH 明文落盘）。
+    """
     f = _get_fernet()
-    if f is None:
-        return plain_text
     return f.encrypt(plain_text.encode()).decode()
 
 
 def decrypt(cipher_text: str) -> str:
-    """解密密文，返回明文字符串；如果解密失败或不可用则返回原文"""
+    """解密密文，返回明文字符串。
+
+    PRE-10: 解密失败直接抛出 RuntimeError，绝不静默返回原值。
+    原行为（返回 cipher_text）会让登录静默失败且日志含糊，改为显式抛错让运维立即感知。
+    若库中存在历史明文数据（PRE-10 之前写入），此函数会抛错，需用正确密钥重新加密或清理。
+    """
     f = _get_fernet()
-    if f is None:
-        return cipher_text
     try:
         return f.decrypt(cipher_text.encode()).decode()
     except Exception as e:
-        logger.error(
-            f"[RelayDB] 解密失败，API_HASH 数据可能已损坏或密钥不匹配，"
-            f"返回原值（可能无法正确登录）: {e}"
+        raise RuntimeError(
+            f"[RelayDB] 解密失败: {e}。"
+            "API_HASH 数据可能已损坏或密钥不匹配。"
+            "请检查 RELAY_ENCRYPTION_KEY 是否与加密时使用的密钥一致，"
+            "或清理 relay_accounts 表后重新录入中继账号。"
         )
-        return cipher_text
 
 
 DB_PATH = Path(__file__).parent.parent / "data" / "relay_pool.db"
