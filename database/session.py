@@ -235,6 +235,9 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS blocked_users JSONB DEFAULT '[]'",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS updated_at TEXT",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS file_ttl_days INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS updated_at TEXT",
     # ─── 索引清理：删除冗余/未使用的索引（减少 UPDATE 维护开销）─────────────
     "DROP INDEX IF EXISTS idx_cells_channel",
     "DROP INDEX IF EXISTS idx_cells_status",
@@ -375,9 +378,9 @@ class CockroachDBClient:
                 fr_col = get_file_records_col()
                 all_fr = await fr_col.find({}, projection=[
                     "file_code", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
-                    "file_types", "batch_msg_ids", "batch_file_meta", "file_ids",
-                    "status", "request_count", "protect_content", "file_ttl_days",
-                    "note", "created_at", "updated_at",
+                    "file_types", "backup_channel_msg_ids", "batch_msg_ids", "batch_file_meta",
+                    "file_ids", "status", "request_count", "protect_content", "file_ttl_days",
+                    "note", "expire_time", "blocked_users", "create_time", "updated_at",
                 ])
                 if all_fr:
                     await store.bootstrap_file_records(all_fr)

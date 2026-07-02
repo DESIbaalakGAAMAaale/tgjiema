@@ -174,10 +174,10 @@ class UserRelay:
         lock = self._cache_locks.setdefault(code, asyncio.Lock())
         async with lock:
             try:
-                from database import get_file_records_col, make_file_record
+                from database import get_file_records_col, get_file_record_cached, make_file_record
 
                 files_col = get_file_records_col()
-                existing = await files_col.find_one({"file_code": code})
+                existing = await get_file_record_cached(code)
                 if existing:
                     batch = existing.get("batch_msg_ids", "") or ""
                     if not isinstance(batch, str):

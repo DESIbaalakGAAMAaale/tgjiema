@@ -798,9 +798,9 @@ class RelayInstance:
         if not self._client:
             return False
         try:
-            from database import get_file_records_col
+            from database import get_file_records_col, get_file_record_cached
             col = get_file_records_col()
-            record = await col.find_one({"file_code": code})
+            record = await get_file_record_cached(code)
             if not record:
                 return False
             file_ids_str = record.get("file_ids", "") or ""

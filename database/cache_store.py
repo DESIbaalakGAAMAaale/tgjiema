@@ -172,6 +172,7 @@ class CacheStore:
                 primary_channel_id   BIGINT,
                 primary_channel_msg_id BIGINT,
                 file_types           TEXT,
+                backup_channel_msg_ids TEXT,
                 batch_msg_ids        TEXT,
                 batch_file_meta      TEXT,
                 file_ids             TEXT,
@@ -180,7 +181,9 @@ class CacheStore:
                 protect_content      INTEGER DEFAULT 0,
                 file_ttl_days        INTEGER DEFAULT 0,
                 note                 TEXT DEFAULT '',
-                created_at           TEXT,
+                expire_time          TEXT,
+                blocked_users        TEXT DEFAULT '[]',
+                create_time          TEXT,
                 updated_at           TEXT,
                 crdb_synced          INTEGER DEFAULT 1
             )"""
@@ -1231,24 +1234,37 @@ class CacheStore:
         if not self._db or not rows:
             return
         await self._db.execute("DELETE FROM file_records_local")
+        # 序列化可能为 list/dict/datetime 的字段（CRDB _row_to_dict 会反序列化 JSONB / 转 datetime）
+        import json as _json
+        from datetime import datetime as _dt
+        def _serialize(val):
+            if val is None:
+                return None
+            if isinstance(val, _dt):
+                return val.isoformat()
+            if isinstance(val, (list, dict)):
+                return _json.dumps(val, default=str)
+            return val
         records = []
         for r in rows:
             records.append((
                 r.get("file_code"), r.get("uploader_id"),
                 r.get("primary_channel_id"), r.get("primary_channel_msg_id"),
-                r.get("file_types"), r.get("batch_msg_ids"), r.get("batch_file_meta"),
+                _serialize(r.get("file_types")), _serialize(r.get("backup_channel_msg_ids")),
+                r.get("batch_msg_ids"), _serialize(r.get("batch_file_meta")),
                 r.get("file_ids"), r.get("status", "active"),
                 r.get("request_count", 0), int(r.get("protect_content", 0) or 0),
                 r.get("file_ttl_days", 0), r.get("note", ""),
-                r.get("created_at"), r.get("updated_at"), 1,  # crdb_synced=1
+                r.get("expire_time"), _serialize(r.get("blocked_users", "[]")),
+                r.get("create_time"), r.get("updated_at"), 1,  # crdb_synced=1
             ))
         await self._db.executemany(
             """INSERT OR REPLACE INTO file_records_local
             (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
-             file_types, batch_msg_ids, batch_file_meta, file_ids, status,
-             request_count, protect_content, file_ttl_days, note,
-             created_at, updated_at, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
+             file_ids, status, request_count, protect_content, file_ttl_days, note,
+             expire_time, blocked_users, create_time, updated_at, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             records,
         )
         await self._db.commit()
@@ -1259,9 +1275,9 @@ class CacheStore:
             return None
         rows = await self._db.execute_fetchall(
             """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
-                      file_types, batch_msg_ids, batch_file_meta, file_ids, status,
-                      request_count, protect_content, file_ttl_days, note,
-                      created_at, updated_at
+                      file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
+                      file_ids, status, request_count, protect_content, file_ttl_days, note,
+                      expire_time, blocked_users, create_time, updated_at
                FROM file_records_local WHERE file_code = ?""",
             (file_code,),
         )
@@ -1270,10 +1286,12 @@ class CacheStore:
         r = rows[0]
         return {
             "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
-            "primary_channel_msg_id": r[3], "file_types": r[4], "batch_msg_ids": r[5],
-            "batch_file_meta": r[6], "file_ids": r[7], "status": r[8],
-            "request_count": r[9], "protect_content": r[10], "file_ttl_days": r[11],
-            "note": r[12], "created_at": r[13], "updated_at": r[14],
+            "primary_channel_msg_id": r[3], "file_types": r[4],
+            "backup_channel_msg_ids": r[5], "batch_msg_ids": r[6],
+            "batch_file_meta": r[7], "file_ids": r[8], "status": r[9],
+            "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
+            "note": r[13], "expire_time": r[14], "blocked_users": r[15],
+            "create_time": r[16], "updated_at": r[17],
         }
 
     async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True):
@@ -1281,20 +1299,33 @@ class CacheStore:
         if not self._db:
             return
         synced = 0 if mark_dirty else 1
+        # 序列化可能为 list/dict/datetime 的字段（CRDB _row_to_dict 会反序列化 JSONB / 转 datetime）
+        import json as _json
+        from datetime import datetime as _dt
+        def _serialize(val):
+            if val is None:
+                return None
+            if isinstance(val, _dt):
+                return val.isoformat()
+            if isinstance(val, (list, dict)):
+                return _json.dumps(val, default=str)
+            return val
         await self._db.execute(
             """INSERT OR REPLACE INTO file_records_local
             (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
-             file_types, batch_msg_ids, batch_file_meta, file_ids, status,
-             request_count, protect_content, file_ttl_days, note,
-             created_at, updated_at, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
+             file_ids, status, request_count, protect_content, file_ttl_days, note,
+             expire_time, blocked_users, create_time, updated_at, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record.get("file_code"), record.get("uploader_id"),
              record.get("primary_channel_id"), record.get("primary_channel_msg_id"),
-             record.get("file_types"), record.get("batch_msg_ids"), record.get("batch_file_meta"),
+             _serialize(record.get("file_types")), _serialize(record.get("backup_channel_msg_ids")),
+             record.get("batch_msg_ids"), _serialize(record.get("batch_file_meta")),
              record.get("file_ids"), record.get("status", "active"),
              record.get("request_count", 0), int(record.get("protect_content", 0) or 0),
              record.get("file_ttl_days", 0), record.get("note", ""),
-             record.get("created_at"), record.get("updated_at"), synced),
+             record.get("expire_time"), _serialize(record.get("blocked_users", "[]")),
+             record.get("create_time"), record.get("updated_at"), synced),
         )
         await self._db.commit()
 
@@ -1304,18 +1335,19 @@ class CacheStore:
             return []
         rows = await self._db.execute_fetchall(
             """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
-                      file_types, batch_msg_ids, batch_file_meta, file_ids, status,
-                      request_count, protect_content, file_ttl_days, note,
-                      created_at, updated_at
+                      file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
+                      file_ids, status, request_count, protect_content, file_ttl_days, note,
+                      expire_time, blocked_users, create_time, updated_at
                FROM file_records_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
         return [{
             "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
-            "primary_channel_msg_id": r[3], "file_types": r[4], "batch_msg_ids": r[5],
-            "batch_file_meta": r[6], "file_ids": r[7], "status": r[8],
-            "request_count": r[9], "protect_content": r[10], "file_ttl_days": r[11],
-            "note": r[12], "created_at": r[13], "updated_at": r[14],
+            "primary_channel_msg_id": r[3], "file_types": r[4], "backup_channel_msg_ids": r[5],
+            "batch_msg_ids": r[6], "batch_file_meta": r[7], "file_ids": r[8], "status": r[9],
+            "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
+            "note": r[13], "expire_time": r[14], "blocked_users": r[15],
+            "create_time": r[16], "updated_at": r[17],
         } for r in rows]
 
     async def mark_file_record_synced(self, file_code: str):

@@ -158,6 +158,7 @@ def make_code_entry(
         "note": note,
         "status": "active",
         "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
         "expire_time": expire_time,
     }
 
