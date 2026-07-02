@@ -1970,6 +1970,7 @@ async def batch_update_cells_dirty(cells: list[dict]) -> int:
     """
     if not cells:
         return 0
+    import datetime as _dt
     now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
     slot_ids = [c["slot_id"] for c in cells]
     
