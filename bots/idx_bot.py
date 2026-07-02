@@ -501,6 +501,12 @@ async def _process_one_pending(app: Application, row: dict):
             file_ttl_days=file_ttl_days,
         )
         await files_col.insert_one(record)
+        # 同步写入 SQLite 本地缓存（0 CRDB RU 后续读取）
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().upsert_file_record_local(record, mark_dirty=False)
+        except Exception:
+            pass
     except Exception as e:
         logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
         try:
@@ -527,6 +533,12 @@ async def _process_one_pending(app: Application, row: dict):
             expire_time=expire_dt.isoformat(),
         )
         await codes_col.insert_one(ce)
+        # 同步写入 SQLite 本地缓存
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().upsert_code_local(ce, mark_dirty=False)
+        except Exception:
+            pass
         # 同时写入 code_cache,后续解码查缓存即
         from database.cache import get_code_cache
         get_code_cache().set(f"code:{file_code}", ce)
@@ -1814,6 +1826,9 @@ async def _async_main():
     # request_count 批量 flush 后台任务
     from database.cache import _flush_request_count_loop
     create_safe_task(_flush_request_count_loop(), name="flush-request-count")
+    # 热表增量同步：每 120 秒从 CRDB 拉取新记录到 SQLite
+    from database.cache import _sync_local_tables_loop
+    create_safe_task(_sync_local_tables_loop(), name="sync-local-tables")
     # Quota 同步后台任务
     create_safe_task(_quota_sync_loop(), name="quota-sync")
     # Active Channels 刷新后台任务

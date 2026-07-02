@@ -24,7 +24,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 2  # 递增此值以触发 DDL 升级
+DDL_VERSION = 3  # 递增此值以触发 DDL 升级
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -74,6 +74,11 @@ DDL_STATEMENTS = [
     # idx_decode_logs_requester 已删除（无 WHERE requester_id 查询）
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_request_time ON decode_logs(request_time)",
     # idx_file_records_msg_id 已删除（primary_channel_msg_id 仅做数据字段读取，无 WHERE 过滤）
+    # ─── 增量同步索引：_sync_local_tables_loop 用 updated_at 过滤新记录 ───
+    "CREATE INDEX IF NOT EXISTS idx_file_records_updated_at ON file_records(updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_codes_updated_at ON codes(updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_users_updated_at ON users(updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_updated_at ON external_code_mapping(updated_at)",
     """CREATE TABLE IF NOT EXISTS pending_uploads (
         id SERIAL PRIMARY KEY,
         uploader_id BIGINT,
@@ -355,6 +360,69 @@ class CockroachDBClient:
                     logger.info(f"[DB] 预填充 cells 到本地 SQLite: {len(all_cells)} 条")
         except Exception:
             pass
+
+        # ─── Phase 3: 全表缓存热路径到 SQLite（0 CRDB RU）─────
+        # 启动时从 CRDB 全量加载 users / codes / file_records / external_code_mapping
+        # 之后所有读操作走 SQLite，写操作双写+异步批量同步到 CRDB
+        try:
+            # 检查是否已经存在完整缓存（根据表行数判断）
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            
+            # 1. file_records: 跳过如果已有（已bootstrap）
+            fr_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM file_records_local")
+            if fr_count[0][0] == 0:
+                fr_col = get_file_records_col()
+                all_fr = await fr_col.find({}, projection=[
+                    "file_code", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
+                    "file_types", "batch_msg_ids", "batch_file_meta", "file_ids",
+                    "status", "request_count", "protect_content", "file_ttl_days",
+                    "note", "created_at", "updated_at",
+                ])
+                if all_fr:
+                    await store.bootstrap_file_records(all_fr)
+                    logger.info(f"[DB] 预填充 file_records 到本地 SQLite: {len(all_fr)} 条")
+            
+            # 2. codes: 跳过如果已有
+            codes_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM codes_local")
+            if codes_count[0][0] == 0:
+                codes_col = get_codes_col()
+                all_codes = await codes_col.find({}, projection=[
+                    "code", "file_record_code", "uploader_id", "file_types",
+                    "batch_msg_ids", "batch_file_meta", "primary_channel_id",
+                    "status", "created_at", "expire_time", "note",
+                ])
+                if all_codes:
+                    await store.bootstrap_codes(all_codes)
+                    logger.info(f"[DB] 预填充 codes 到本地 SQLite: {len(all_codes)} 条")
+            
+            # 3. users: 跳过如果已有
+            users_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM users_local")
+            if users_count[0][0] == 0:
+                users_col = get_users_col()
+                all_users = await users_col.find({}, projection=[
+                    "user_id", "username", "first_name", "membership_level",
+                    "daily_decode_quota", "quota_used_today", "quota_date",
+                    "can_upload", "external_decode_quota", "external_used_today",
+                    "external_quota_date", "is_banned", "created_at", "updated_at",
+                ])
+                if all_users:
+                    await store.bootstrap_users(all_users)
+                    logger.info(f"[DB] 预填充 users 到本地 SQLite: {len(all_users)} 条")
+            
+            # 4. external_code_mapping: 跳过如果已有
+            ec_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM external_code_mapping_local")
+            if ec_count[0][0] == 0:
+                ec_col = get_external_code_mapping_col()
+                all_ec = await ec_col.find({}, projection=[
+                    "external_code", "system_code", "bot_username", "created_at", "updated_at",
+                ])
+                if all_ec:
+                    await store.bootstrap_external_mappings(all_ec)
+                    logger.info(f"[DB] 预填充 external_code_mapping 到本地 SQLite: {len(all_ec)} 条")
+
+        except Exception as e:
+            logger.warning(f"[DB] 预填充热表到本地SQLite失败（可忽略）: {e}")
 
     async def close(self):
         if self._pool:
@@ -1105,10 +1173,12 @@ _EXTERNAL_CODE_MAPPING_TTL = 60  # 60 秒(缩短以快速响应管理员修改)
 
 
 async def _refresh_external_code_mapping_cache():
-    """刷新外部码映射内存缓存"""
+    """刷新外部码映射内存缓存（从 SQLite）"""
     global _external_code_mapping_cache, _external_code_mapping_cache_ts
     try:
-        rows = await _external_code_mapping_col.find({})
+        from .cache_store import get_cache_store
+        store = get_cache_store()
+        rows = await store.get_all_external_mappings_local()
         _external_code_mapping_cache = {
             row["external_code"]: row.get("system_code", "")
             for row in rows
@@ -1120,7 +1190,7 @@ async def _refresh_external_code_mapping_cache():
 
 
 async def get_system_code_for_external(external_code: str) -> str | None:
-    """查询外部码对应的系统码,命中idx_bot 可直接走本地解码流程"""
+    """查询外部码对应的系统码,走 SQLite 全表缓存（0 CRDB RU）"""
     global _external_code_mapping_cache, _external_code_mapping_cache_ts
     # 检查缓存是否过期
     if _time.time() - _external_code_mapping_cache_ts > _EXTERNAL_CODE_MAPPING_TTL:
@@ -1129,9 +1199,11 @@ async def get_system_code_for_external(external_code: str) -> str | None:
     system_code = _external_code_mapping_cache.get(external_code)
     if system_code:
         return system_code
-    # 缓存未命中，回退到 DB 查询。
+    # 从 SQLite 查询
     try:
-        row = await _external_code_mapping_col.find_one({"external_code": external_code})
+        from .cache_store import get_cache_store
+        store = get_cache_store()
+        row = await store.get_external_mapping_local(external_code)
         if row:
             sc = row.get("system_code")
             if sc:
@@ -1172,106 +1244,100 @@ async def set_external_code_mapping(
 
 
 async def get_user_cached(user_id: int) -> Optional[dict]:
+    """查询用户，二级缓存：内存 → SQLite 全表（0 CRDB RU）"""
     cache = get_user_cache()
     cache_key = f"user:{user_id}"
-
-    # C1: 负缓存检查,避免穿透
-    from .cache import check_negative_user
-    if check_negative_user(user_id):
-        return None
 
     # L1: 内存缓存
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
-    # L2: SQLite 兜底(避免穿 CRDB)
+    # L2: SQLite 全表缓存（0 CRDB RU，替代原 KV 缓存 + CRDB 兜底）
     from .cache_store import get_cache_store
     store = get_cache_store()
-    cached = await store.get(cache_key)
-    if cached is not None:
-        cache.set(cache_key, cached)  # promote 到 L1
-        return cached
-
-    # CRDB
-    col = get_users_col()
-    user = await col.find_one({"user_id": user_id})
-
-    if user:
+    user = await store.get_user_local(user_id)
+    if user is not None:
         cache.set(cache_key, user)
-        await store.set(cache_key, user)  # 写穿透到 L2
-    else:
-        # C1: 写入负缓存,60 秒内不重复查 CRDB
-        from .cache import set_negative_user
-        set_negative_user(user_id)
-
     return user
 
 
 async def update_user_and_invalidate(user_id: int, update: dict = None):
+    """双写：先写 SQLite(标记 dirty)，再异步写 CRDB"""
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    
     if update is not None:
+        # 1. 先写 CRDB（保证数据安全）
         col = get_users_col()
         await col.update_one({"user_id": user_id}, update)
+        # 2. 同步写 SQLite 全表缓存（标记已同步）
+        existing = await store.get_user_local(user_id)
+        if existing:
+            existing.update(update)
+            await store.upsert_user_local(existing, mark_dirty=False)
+        else:
+            # 新用户：从 CRDB 重新读取
+            user = await col.find_one({"user_id": user_id})
+            if user:
+                await store.upsert_user_local(user, mark_dirty=False)
+    
     cache = get_user_cache()
     cache.invalidate(f"user:{user_id}")
-    # C1: 清除负缓存,确保新用户可被查到
     from .cache import clear_negative_user
     clear_negative_user(user_id)
 
 
 async def get_file_record_cached(file_code: str) -> Optional[dict]:
+    """查询文件记录，二级缓存：内存 → SQLite 全表（0 CRDB RU）"""
     cache = get_file_record_cache()
     cache_key = f"file:{file_code}"
-
-    # C1: 负缓存检查,避免穿透
-    from .cache import check_negative_file
-    if check_negative_file(file_code):
-        return None
 
     # L1: 内存缓存
     cached = cache.get(cache_key)
     if cached is not None:
         return cached
 
-    # L2: SQLite 兜底
+    # L2: SQLite 全表缓存
     from .cache_store import get_cache_store
     store = get_cache_store()
-    cached = await store.get(cache_key)
-    if cached is not None:
-        cache.set(cache_key, cached)
-        return cached
-
-    # CRDB
-    col = get_file_records_col()
-    record = await col.find_one({"file_code": file_code})
-
-    if record:
+    record = await store.get_file_record_local(file_code)
+    if record is not None:
         cache.set(cache_key, record)
-        await store.set(cache_key, record)
-    else:
-        # C1: 写入负缓存,60 秒内不重复查 CRDB
-        from .cache import set_negative_file
-        set_negative_file(file_code)
-
     return record
 
 
 async def update_file_record_and_invalidate(file_code: str, update: dict):
+    """双写：先写 CRDB，再同步 SQLite 全表缓存"""
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    
+    # 1. 写 CRDB
     col = get_file_records_col()
     await col.update_one({"file_code": file_code}, update)
-
+    
+    # 2. 同步 SQLite（标记 dirty，由 sync 循环确认）
+    existing = await store.get_file_record_local(file_code)
+    if existing:
+        if "$inc" in update:
+            for k, v in update["$inc"].items():
+                existing[k] = existing.get(k, 0) + v
+        else:
+            existing.update(update.get("$set", update))
+        await store.upsert_file_record_local(existing, mark_dirty=False)
+    else:
+        record = await col.find_one({"file_code": file_code})
+        if record:
+            await store.upsert_file_record_local(record, mark_dirty=False)
+    
     cache = get_file_record_cache()
     cache.invalidate(f"file:{file_code}")
 
 
-# ─── I: codes 表缓存查询(复用 B1 code_cache) ──────────────────
+# ─── I: codes 表缓存查询(纯 SQLite，0 CRDB RU) ──────────────────
 
 async def get_code_entry_cached(code: str) -> Optional[dict]:
-    """查 codes 表，三级缓存：内存 → SQLite → CRDB（J 方案）
-    
-    每次解码都调 check_decode_permission → 原来直查 CRDB(1 RU)，
-    加缓存后 99% 命中，零 RU。
-    """
+    """查 codes 表，二级缓存：内存 → SQLite 全表（0 CRDB RU）"""
     from .cache import get_code_cache
     cache = get_code_cache()
     cache_key = f"code:{code}"
@@ -1281,20 +1347,12 @@ async def get_code_entry_cached(code: str) -> Optional[dict]:
     if entry is not None:
         return entry
     
-    # L2: SQLite 持久化缓存（J 方案新增）
+    # L2: SQLite 全表缓存
     from .cache_store import get_cache_store
     store = get_cache_store()
-    entry = await store.get(cache_key)
+    entry = await store.get_code_local(code)
     if entry is not None:
-        cache.set(cache_key, entry)  # 回填内存
-        return entry
-    
-    # L3: CRDB
-    col = get_codes_col()
-    entry = await col.find_one({"code": code})
-    if entry:
         cache.set(cache_key, entry)
-        await store.set(cache_key, entry)  # J: 持久化到 SQLite
     return entry
 
 

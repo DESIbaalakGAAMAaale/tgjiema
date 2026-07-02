@@ -78,6 +78,12 @@ async def get_or_create_user(user_id: int, username: str = None, first_name: str
     col = get_users_col()
     try:
         await col.insert_one(user)
+        # 同步写入 SQLite 本地缓存
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().upsert_user_local(user, mark_dirty=False)
+        except Exception:
+            pass
         # F1: 新用户注册,递增本地计数器
         try:
             from utils.shared_counters import incr_total_users

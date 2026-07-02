@@ -417,3 +417,92 @@ async def _flush_decode_log_buffer_loop():
                 logger.warning(f"[Cleanup] jobs 清理失败: {e}")
         except Exception as e:
             logger.error(f"[DecodeLog] flush failed: {e}")
+
+
+# ─── 热表增量同步：每 120 秒从 CRDB 拉取新记录到 SQLite ──────────
+
+async def _sync_local_tables_loop():
+    """每 120 秒从 CRDB 增量同步 4 张热表到本地 SQLite
+    
+    确保 SQLite 本地缓存与 CRDB 保持同步（最长 120 秒延迟）。
+    增量查询：只拉取 updated_at > 上次同步时间的记录，极高性价比。
+    """
+    from loguru import logger
+    from .cache_store import get_cache_store
+    from .session import (
+        get_file_records_col, get_codes_col, get_users_col,
+        get_external_code_mapping_col,
+    )
+    import datetime as _dt
+
+    while True:
+        await asyncio.sleep(120)
+        store = get_cache_store()
+        if not store._db:
+            continue
+
+        last_sync = await store.get_kv("_last_sync_local_tables")
+        last_sync_iso = last_sync or "1970-01-01T00:00:00+00:00"
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        total = 0
+
+        try:
+            # 1. file_records 增量
+            fr_col = get_file_records_col()
+            new_fr = await fr_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
+            for r in new_fr:
+                try:
+                    await store.upsert_file_record_local(r, mark_dirty=False)
+                    total += 1
+                except Exception:
+                    pass
+            if new_fr:
+                logger.debug(f"[Sync] file_records 增量: {len(new_fr)} 条")
+
+            # 2. codes 增量
+            codes_col = get_codes_col()
+            new_codes = await codes_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
+            for r in new_codes:
+                try:
+                    await store.upsert_code_local(r, mark_dirty=False)
+                    total += 1
+                except Exception:
+                    pass
+            if new_codes:
+                logger.debug(f"[Sync] codes 增量: {len(new_codes)} 条")
+
+            # 3. users 增量
+            users_col = get_users_col()
+            new_users = await users_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=100)
+            for r in new_users:
+                try:
+                    await store.upsert_user_local(r, mark_dirty=False)
+                    total += 1
+                except Exception:
+                    pass
+            if new_users:
+                logger.debug(f"[Sync] users 增量: {len(new_users)} 条")
+
+            # 4. external_code_mapping 增量
+            ec_col = get_external_code_mapping_col()
+            new_ec = await ec_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=50)
+            for r in new_ec:
+                try:
+                    await store._db.execute(
+                        "INSERT OR REPLACE INTO external_code_mapping_local "
+                        "(external_code, system_code, bot_username, created_at, updated_at, crdb_synced) "
+                        "VALUES (?, ?, ?, ?, ?, 1)",
+                        (r["external_code"], r.get("system_code", ""),
+                         r.get("bot_username"), r.get("created_at"), r.get("updated_at")),
+                    )
+                    await store._db.commit()
+                    total += 1
+                except Exception:
+                    pass
+
+            await store.set_kv("_last_sync_local_tables", now_iso)
+            if total > 0:
+                logger.debug(f"[Sync] 本地表同步 {total} 条记录")
+
+        except Exception as e:
+            logger.warning(f"[Sync] 本地表同步失败: {e}")

@@ -162,6 +162,74 @@ class CacheStore:
                 value TEXT NOT NULL
             )"""
         )
+        # ─── 热路径全表缓存：file_records / codes / users / external_code_mapping ───
+        # 启动时从 CRDB 全量加载，后续所有读操作走 SQLite（0 CRDB RU）
+        # 写操作双写：先写 SQLite(标记 dirty)，CRDB 异步/批量同步
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS file_records_local (
+                file_code            TEXT PRIMARY KEY,
+                uploader_id          BIGINT,
+                primary_channel_id   BIGINT,
+                primary_channel_msg_id BIGINT,
+                file_types           TEXT,
+                batch_msg_ids        TEXT,
+                batch_file_meta      TEXT,
+                file_ids             TEXT,
+                status               TEXT DEFAULT 'active',
+                request_count        INTEGER DEFAULT 0,
+                protect_content      INTEGER DEFAULT 0,
+                file_ttl_days        INTEGER DEFAULT 0,
+                note                 TEXT DEFAULT '',
+                created_at           TEXT,
+                updated_at           TEXT,
+                crdb_synced          INTEGER DEFAULT 1
+            )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS codes_local (
+                code                 TEXT PRIMARY KEY,
+                file_record_code     TEXT,
+                uploader_id          BIGINT,
+                file_types           TEXT,
+                batch_msg_ids        TEXT,
+                batch_file_meta      TEXT,
+                primary_channel_id   BIGINT,
+                status               TEXT DEFAULT 'active',
+                created_at           TEXT,
+                expire_time          TEXT,
+                note                 TEXT DEFAULT '',
+                crdb_synced          INTEGER DEFAULT 1
+            )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS users_local (
+                user_id              BIGINT PRIMARY KEY,
+                username             TEXT,
+                first_name           TEXT,
+                membership_level     TEXT DEFAULT 'free',
+                daily_decode_quota   INTEGER DEFAULT 3,
+                quota_used_today     INTEGER DEFAULT 0,
+                quota_date           TEXT,
+                can_upload           INTEGER DEFAULT 0,
+                external_decode_quota INTEGER DEFAULT 0,
+                external_used_today  INTEGER DEFAULT 0,
+                external_quota_date  TEXT,
+                is_banned            INTEGER DEFAULT 0,
+                created_at           TEXT,
+                updated_at           TEXT,
+                crdb_synced          INTEGER DEFAULT 1
+            )"""
+        )
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS external_code_mapping_local (
+                external_code        TEXT PRIMARY KEY,
+                system_code          TEXT NOT NULL,
+                bot_username         TEXT,
+                created_at           TEXT,
+                updated_at           TEXT,
+                crdb_synced          INTEGER DEFAULT 1
+            )"""
+        )
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -1155,6 +1223,337 @@ class CacheStore:
             (key, value),
         )
         await self._db.commit()
+
+    # ─── 热路径全表缓存 CRUD：file_records / codes / users / external_code_mapping ───
+
+    async def bootstrap_file_records(self, rows: list[dict]):
+        """启动时从 CRDB 全量加载 file_records 到 SQLite（清空旧数据）"""
+        if not self._db or not rows:
+            return
+        await self._db.execute("DELETE FROM file_records_local")
+        records = []
+        for r in rows:
+            records.append((
+                r.get("file_code"), r.get("uploader_id"),
+                r.get("primary_channel_id"), r.get("primary_channel_msg_id"),
+                r.get("file_types"), r.get("batch_msg_ids"), r.get("batch_file_meta"),
+                r.get("file_ids"), r.get("status", "active"),
+                r.get("request_count", 0), int(r.get("protect_content", 0) or 0),
+                r.get("file_ttl_days", 0), r.get("note", ""),
+                r.get("created_at"), r.get("updated_at"), 1,  # crdb_synced=1
+            ))
+        await self._db.executemany(
+            """INSERT OR REPLACE INTO file_records_local
+            (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
+             file_types, batch_msg_ids, batch_file_meta, file_ids, status,
+             request_count, protect_content, file_ttl_days, note,
+             created_at, updated_at, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            records,
+        )
+        await self._db.commit()
+
+    async def get_file_record_local(self, file_code: str) -> dict | None:
+        """从 SQLite 读取 file_record（0 CRDB RU）"""
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
+                      file_types, batch_msg_ids, batch_file_meta, file_ids, status,
+                      request_count, protect_content, file_ttl_days, note,
+                      created_at, updated_at
+               FROM file_records_local WHERE file_code = ?""",
+            (file_code,),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
+            "primary_channel_msg_id": r[3], "file_types": r[4], "batch_msg_ids": r[5],
+            "batch_file_meta": r[6], "file_ids": r[7], "status": r[8],
+            "request_count": r[9], "protect_content": r[10], "file_ttl_days": r[11],
+            "note": r[12], "created_at": r[13], "updated_at": r[14],
+        }
+
+    async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True):
+        """写入/更新 file_record 到 SQLite"""
+        if not self._db:
+            return
+        synced = 0 if mark_dirty else 1
+        await self._db.execute(
+            """INSERT OR REPLACE INTO file_records_local
+            (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
+             file_types, batch_msg_ids, batch_file_meta, file_ids, status,
+             request_count, protect_content, file_ttl_days, note,
+             created_at, updated_at, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (record.get("file_code"), record.get("uploader_id"),
+             record.get("primary_channel_id"), record.get("primary_channel_msg_id"),
+             record.get("file_types"), record.get("batch_msg_ids"), record.get("batch_file_meta"),
+             record.get("file_ids"), record.get("status", "active"),
+             record.get("request_count", 0), int(record.get("protect_content", 0) or 0),
+             record.get("file_ttl_days", 0), record.get("note", ""),
+             record.get("created_at"), record.get("updated_at"), synced),
+        )
+        await self._db.commit()
+
+    async def get_dirty_file_records(self, limit: int = 100) -> list[dict]:
+        """获取需要同步到 CRDB 的脏 file_records"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
+                      file_types, batch_msg_ids, batch_file_meta, file_ids, status,
+                      request_count, protect_content, file_ttl_days, note,
+                      created_at, updated_at
+               FROM file_records_local WHERE crdb_synced = 0 LIMIT ?""",
+            (limit,),
+        )
+        return [{
+            "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
+            "primary_channel_msg_id": r[3], "file_types": r[4], "batch_msg_ids": r[5],
+            "batch_file_meta": r[6], "file_ids": r[7], "status": r[8],
+            "request_count": r[9], "protect_content": r[10], "file_ttl_days": r[11],
+            "note": r[12], "created_at": r[13], "updated_at": r[14],
+        } for r in rows]
+
+    async def mark_file_record_synced(self, file_code: str):
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE file_records_local SET crdb_synced = 1 WHERE file_code = ?",
+            (file_code,),
+        )
+        await self._db.commit()
+
+    # ─── codes_local ───
+
+    async def bootstrap_codes(self, rows: list[dict]):
+        if not self._db or not rows:
+            return
+        await self._db.execute("DELETE FROM codes_local")
+        records = []
+        for r in rows:
+            records.append((
+                r.get("code"), r.get("file_record_code"), r.get("uploader_id"),
+                r.get("file_types"), r.get("batch_msg_ids"), r.get("batch_file_meta"),
+                r.get("primary_channel_id"), r.get("status", "active"),
+                r.get("created_at"), r.get("expire_time"), r.get("note", ""),
+                1,  # crdb_synced=1
+            ))
+        await self._db.executemany(
+            """INSERT OR REPLACE INTO codes_local
+            (code, file_record_code, uploader_id, file_types, batch_msg_ids,
+             batch_file_meta, primary_channel_id, status, created_at, expire_time,
+             note, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            records,
+        )
+        await self._db.commit()
+
+    async def get_code_local(self, code: str) -> dict | None:
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            """SELECT code, file_record_code, uploader_id, file_types, batch_msg_ids,
+                      batch_file_meta, primary_channel_id, status, created_at,
+                      expire_time, note
+               FROM codes_local WHERE code = ?""",
+            (code,),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "code": r[0], "file_record_code": r[1], "uploader_id": r[2],
+            "file_types": r[3], "batch_msg_ids": r[4], "batch_file_meta": r[5],
+            "primary_channel_id": r[6], "status": r[7], "created_at": r[8],
+            "expire_time": r[9], "note": r[10],
+        }
+
+    async def upsert_code_local(self, record: dict, mark_dirty: bool = True):
+        if not self._db:
+            return
+        synced = 0 if mark_dirty else 1
+        await self._db.execute(
+            """INSERT OR REPLACE INTO codes_local
+            (code, file_record_code, uploader_id, file_types, batch_msg_ids,
+             batch_file_meta, primary_channel_id, status, created_at, expire_time,
+             note, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (record.get("code"), record.get("file_record_code"), record.get("uploader_id"),
+             record.get("file_types"), record.get("batch_msg_ids"), record.get("batch_file_meta"),
+             record.get("primary_channel_id"), record.get("status", "active"),
+             record.get("created_at"), record.get("expire_time"), record.get("note", ""),
+             synced),
+        )
+        await self._db.commit()
+
+    async def get_dirty_codes(self, limit: int = 100) -> list[dict]:
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT code, file_record_code, uploader_id, file_types, batch_msg_ids,
+                      batch_file_meta, primary_channel_id, status, created_at,
+                      expire_time, note
+               FROM codes_local WHERE crdb_synced = 0 LIMIT ?""",
+            (limit,),
+        )
+        return [{
+            "code": r[0], "file_record_code": r[1], "uploader_id": r[2],
+            "file_types": r[3], "batch_msg_ids": r[4], "batch_file_meta": r[5],
+            "primary_channel_id": r[6], "status": r[7], "created_at": r[8],
+            "expire_time": r[9], "note": r[10],
+        } for r in rows]
+
+    async def mark_code_synced(self, code: str):
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE codes_local SET crdb_synced = 1 WHERE code = ?", (code,),
+        )
+        await self._db.commit()
+
+    # ─── users_local ───
+
+    async def bootstrap_users(self, rows: list[dict]):
+        if not self._db or not rows:
+            return
+        await self._db.execute("DELETE FROM users_local")
+        records = []
+        for r in rows:
+            records.append((
+                r.get("user_id"), r.get("username"), r.get("first_name"),
+                r.get("membership_level", "free"), r.get("daily_decode_quota", 3),
+                r.get("quota_used_today", 0), r.get("quota_date"),
+                r.get("can_upload", 0), r.get("external_decode_quota", 0),
+                r.get("external_used_today", 0), r.get("external_quota_date"),
+                r.get("is_banned", 0), r.get("created_at"), r.get("updated_at"),
+                1,  # crdb_synced=1
+            ))
+        await self._db.executemany(
+            """INSERT OR REPLACE INTO users_local
+            (user_id, username, first_name, membership_level, daily_decode_quota,
+             quota_used_today, quota_date, can_upload, external_decode_quota,
+             external_used_today, external_quota_date, is_banned,
+             created_at, updated_at, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            records,
+        )
+        await self._db.commit()
+
+    async def get_user_local(self, user_id: int) -> dict | None:
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            """SELECT user_id, username, first_name, membership_level,
+                      daily_decode_quota, quota_used_today, quota_date, can_upload,
+                      external_decode_quota, external_used_today, external_quota_date,
+                      is_banned, created_at, updated_at
+               FROM users_local WHERE user_id = ?""",
+            (user_id,),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "user_id": r[0], "username": r[1], "first_name": r[2],
+            "membership_level": r[3], "daily_decode_quota": r[4],
+            "quota_used_today": r[5], "quota_date": r[6], "can_upload": r[7],
+            "external_decode_quota": r[8], "external_used_today": r[9],
+            "external_quota_date": r[10], "is_banned": r[11],
+            "created_at": r[12], "updated_at": r[13],
+        }
+
+    async def upsert_user_local(self, user: dict, mark_dirty: bool = True):
+        if not self._db:
+            return
+        synced = 0 if mark_dirty else 1
+        await self._db.execute(
+            """INSERT OR REPLACE INTO users_local
+            (user_id, username, first_name, membership_level, daily_decode_quota,
+             quota_used_today, quota_date, can_upload, external_decode_quota,
+             external_used_today, external_quota_date, is_banned,
+             created_at, updated_at, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user.get("user_id"), user.get("username"), user.get("first_name"),
+             user.get("membership_level", "free"), user.get("daily_decode_quota", 3),
+             user.get("quota_used_today", 0), user.get("quota_date"),
+             user.get("can_upload", 0), user.get("external_decode_quota", 0),
+             user.get("external_used_today", 0), user.get("external_quota_date"),
+             user.get("is_banned", 0), user.get("created_at"), user.get("updated_at"),
+             synced),
+        )
+        await self._db.commit()
+
+    async def get_dirty_users(self, limit: int = 100) -> list[dict]:
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            """SELECT user_id, username, first_name, membership_level,
+                      daily_decode_quota, quota_used_today, quota_date, can_upload,
+                      external_decode_quota, external_used_today, external_quota_date,
+                      is_banned, created_at, updated_at
+               FROM users_local WHERE crdb_synced = 0 LIMIT ?""",
+            (limit,),
+        )
+        return [{
+            "user_id": r[0], "username": r[1], "first_name": r[2],
+            "membership_level": r[3], "daily_decode_quota": r[4],
+            "quota_used_today": r[5], "quota_date": r[6], "can_upload": r[7],
+            "external_decode_quota": r[8], "external_used_today": r[9],
+            "external_quota_date": r[10], "is_banned": r[11],
+            "created_at": r[12], "updated_at": r[13],
+        } for r in rows]
+
+    async def mark_user_synced(self, user_id: int):
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE users_local SET crdb_synced = 1 WHERE user_id = ?", (user_id,),
+        )
+        await self._db.commit()
+
+    # ─── external_code_mapping_local ───
+
+    async def bootstrap_external_mappings(self, rows: list[dict]):
+        if not self._db or not rows:
+            return
+        await self._db.execute("DELETE FROM external_code_mapping_local")
+        records = [(r["external_code"], r["system_code"], r.get("bot_username"),
+                    r.get("created_at"), r.get("updated_at"), 1) for r in rows]
+        await self._db.executemany(
+            """INSERT OR REPLACE INTO external_code_mapping_local
+            (external_code, system_code, bot_username, created_at, updated_at, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            records,
+        )
+        await self._db.commit()
+
+    async def get_external_mapping_local(self, external_code: str) -> dict | None:
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            "SELECT external_code, system_code, bot_username, created_at, updated_at "
+            "FROM external_code_mapping_local WHERE external_code = ?",
+            (external_code,),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return {"external_code": r[0], "system_code": r[1], "bot_username": r[2],
+                "created_at": r[3], "updated_at": r[4]}
+
+    async def get_all_external_mappings_local(self) -> list[dict]:
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT external_code, system_code, bot_username, created_at, updated_at "
+            "FROM external_code_mapping_local"
+        )
+        return [{"external_code": r[0], "system_code": r[1], "bot_username": r[2],
+                 "created_at": r[3], "updated_at": r[4]} for r in rows]
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────
