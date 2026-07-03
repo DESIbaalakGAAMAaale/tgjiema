@@ -62,20 +62,21 @@ class UserRelay:
     async def _wait_for_admin_code(self) -> str | None:
         from database.session import get_config, set_config
 
-        await set_config("relay_auth_pending", "1")
+        phone = self._relay_phone
+        await set_config(f"relay_auth_pending:{phone}", "1")
         await self._report_status("pending_auth")
         logger.info("[UserRelay] 验证码已发送到 Telegram，等待管理员通过管理机器人提交...")
 
         for i in range(100):
             await asyncio.sleep(3)
-            code = await get_config("relay_auth_code")
+            code = await get_config(f"relay_auth_code:{phone}")
             if code and code.strip():
-                await set_config("relay_auth_pending", "0")
-                await set_config("relay_auth_code", "")
+                await set_config(f"relay_auth_pending:{phone}", "0")
+                await set_config(f"relay_auth_code:{phone}", "")
                 logger.info("[UserRelay] 已收到管理员提交的验证码")
                 return code.strip()
 
-        await set_config("relay_auth_pending", "0")
+        await set_config(f"relay_auth_pending:{phone}", "0")
         logger.error("[UserRelay] 等待验证码超时（5分钟）")
         return None
 

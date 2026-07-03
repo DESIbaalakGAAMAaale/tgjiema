@@ -35,6 +35,11 @@ def _load_mon_config():
 FAIL_STREAK_DEGRADE_THRESHOLD = 3
 
 
+def _get_msg_id(msg) -> int:
+    """获取消息 ID，兼容 Telethon (.id) 和 PTB (.message_id)。"""
+    return msg.id if hasattr(msg, 'id') else msg.message_id
+
+
 class MonScheduler:
     """Mon 调度器。
 
@@ -328,13 +333,17 @@ class MonScheduler:
                 continue
 
             for shadow in shadows:
-                copied = await self._copy_messages(
+                copied, mappings = await self._copy_messages(
                     bot_instance, active_slot["channel_id"],
                     shadow["channel_id"], new_messages,
                 )
                 total_copied += copied
+                if mappings:
+                    await self._write_backup_mappings(
+                        active_slot["channel_id"], shadow["channel_id"], mappings
+                    )
 
-            latest_id = max(msg.message_id for msg in new_messages if msg)
+            latest_id = max(_get_msg_id(msg) for msg in new_messages if msg)
             self._cursor_cache[slot_id] = latest_id
 
         if self._replicate_count % self._cursor_flush_interval == 0:
@@ -360,6 +369,29 @@ class MonScheduler:
                 pass
         if changed > 0:
             logger.debug(f"[Mon] flush 游标到本地: {changed} 个有变化")
+
+    @staticmethod
+    async def _write_backup_mappings(main_channel_id: int, backup_channel_id: int, mappings: list[tuple[int, int]]):
+        """将影子复制产生的 msg_id 映射写入 message_backups 表。
+        故障切换时 dsp_bot 可据此查找影子频道中的新 msg_id。
+        """
+        try:
+            from database.session import get_message_backups_col
+            col = get_message_backups_col()
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            for main_msg_id, backed_msg_id in mappings:
+                try:
+                    await col.insert_one({
+                        "main_msg_id": main_msg_id,
+                        "backup_channel_id": backup_channel_id,
+                        "backed_msg_id": backed_msg_id,
+                        "backed_at": now,
+                    })
+                except Exception:
+                    pass  # 主键冲突忽略
+        except Exception as e:
+            logger.warning(f"[Mon] 写入 message_backups 映射失败: {e}")
 
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
         """获取频道中最后游标之后的新消息(媒体文件)。
@@ -396,22 +428,24 @@ class MonScheduler:
         return msgs
 
     @staticmethod
-    async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list) -> int:
-        """批量复制消息到目标频道。返回成功复制数。"""
+    async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list) -> tuple[int, list[tuple[int, int]]]:
+        """批量复制消息到目标频道。返回 (成功复制数, [(原msg_id, 新msg_id)])。"""
         if not messages:
-            return 0
+            return 0, []
         copied = 0
+        mappings = []
         for msg in messages:
             try:
-                await bot_instance.copy_message(
+                result = await bot_instance.copy_message(
                     chat_id=to_channel,
                     from_chat_id=from_channel,
-                    message_id=msg.message_id,
+                    message_id=_get_msg_id(msg),
                 )
                 copied += 1
+                mappings.append((_get_msg_id(msg), result.message_id))
             except Exception as e:
-                logger.warning(f"[Mon][复制] copy_message 失败 msg_id={msg.message_id}: {e}")
-        return copied
+                logger.warning(f"[Mon][复制] copy_message 失败 msg_id={_get_msg_id(msg)}: {e}")
+        return copied, mappings
 
     async def auto_fill_new_channels(self, bot_instance, all_cells: list[dict]) -> int:
         """智能替补:检测新频道(last_synced_msg_id=0 且消息数 < Active),
@@ -456,12 +490,15 @@ class MonScheduler:
                 if not all_media:
                     continue
 
-                filled = await self._copy_messages(
+                filled, mappings = await self._copy_messages(
                     bot_instance, active_channel,
                     shadow_slot["channel_id"], all_media,
                 )
                 if filled > 0:
-                    latest_id = max(msg.message_id for msg in all_media)
+                    await self._write_backup_mappings(
+                        active_channel, shadow_slot["channel_id"], mappings
+                    )
+                    latest_id = max(_get_msg_id(msg) for msg in all_media)
                     await store.update_cell_fields_local(shadow_slot["slot_id"], {"last_synced_msg_id": latest_id})
                     shadow_slot["last_synced_msg_id"] = latest_id
                     total_filled += filled

@@ -412,18 +412,27 @@ async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_auth_required
 async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pending = await get_config("relay_auth_pending")
-    if pending == "1":
+    """查看所有中继账号的验证码等待状态。"""
+    from database.session import get_collection
+    col = get_collection("relay_accounts")
+    accounts = await col.find({}, limit=20)
+    pending_phones = []
+    for acct in accounts:
+        phone = acct.get("phone", "")
+        if phone:
+            pending = await get_config(f"relay_auth_pending:{phone}")
+            if pending == "1":
+                pending_phones.append(phone)
+    if pending_phones:
+        phones_str = "\n".join(f"  • {p}" for p in pending_phones)
         await update.message.reply_text(
-            "⏳ 中继正在等待验证码\n\n"
-            "Telegram 已发送 6 位验证码到中继账号的已登录客户端,\n"
-            "请查看并提交:/relay_code <验证码>"
+            f"⏳ 以下中继账号正在等待验证码：\n{phones_str}\n\n"
+            "请使用 /relay_code <手机号> <验证码> 提交验证码。"
         )
     else:
         await update.message.reply_text(
-            "✅ 中继当前不需要验证码\n\n"
-            "如果解码机器人在等待验证码但此处显示不需要,\n"
-            "可能是状态同步延迟,请稍后重试或查看状态面板。"
+            "✅ 当前没有中继账号在等待验证码。\n\n"
+            "如需添加中继账号，请使用 /relay_set_api <手机号>。"
         )
 
 
@@ -1061,7 +1070,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /purge_channel <频道ID> — 清理频道所有文件\n\n"
         "中继管理（外部码解码用）\n"
         "  /relay_set_api <手机号> — 配置中继账号（API从.env自动读取）\n"
-        "  /relay_code <验证码> — 提交中继验证码\n"
+        "  /relay_code <手机号> <验证码> — 提交中继验证码\n"
         "  /relay_pending — 查看待处理的中继请求\n"
         "  /relay_list — 查看中继实例列表\n"
         "  /relay_add <手机号> — 添加中继实例\n"

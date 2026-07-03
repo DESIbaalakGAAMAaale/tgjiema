@@ -171,7 +171,13 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
 
 
 async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False, bot_id: int = 1) -> bool:
-    """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。"""
+    """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。
+    
+    如果 from_channel_id 是影子频道，会先查 message_backups 映射表获取正确的 backed_msg_id。
+    """
+    # 查询影子频道 msg_id 映射（如果存在）
+    resolved_msg_id = await resolve_backup_msg_id(message_id, from_channel_id)
+    
     # 频道限流:检查是否超过 15 msg/min,循环等待直到拿到配额
     while True:
         wait = await acquire_channel_limit(from_channel_id)
@@ -180,15 +186,36 @@ async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, m
         await asyncio.sleep(wait)
 
     try:
-        await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id, protect_content=protect_content, bot_id=bot_id)
+        await safe_copy_message(bot_instance, target_user_id, from_channel_id, resolved_msg_id, protect_content=protect_content, bot_id=bot_id)
         return True
     except BadRequest as e:
         # C3: 消息不存在于该频道(常见于 failover/rotation 后 target 频道无历史文件)
-        logger.warning(f"[delivery] 消息不存在 (channel={from_channel_id}, msg={message_id}): {e}")
+        logger.warning(f"[delivery] 消息不存在 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
         return False
     except Exception as e:
-        logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={message_id}): {e}")
+        logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
         return False
+
+
+async def resolve_backup_msg_id(main_msg_id: int, channel_id: int) -> int:
+    """查询 message_backups 表，获取影子频道中对应的 msg_id。
+    如果无映射（该消息是直接存储而非复制），返回原始 main_msg_id。
+    """
+    try:
+        from database.session import get_message_backups_col
+        col = get_message_backups_col()
+        result = await col.find_one({
+            "main_msg_id": main_msg_id,
+            "backup_channel_id": channel_id,
+        })
+        if result:
+            backed_id = result.get("backed_msg_id")
+            if backed_id:
+                logger.debug(f"[delivery] msg_id 映射: {main_msg_id} → {backed_id} (channel={channel_id})")
+                return backed_id
+    except Exception:
+        pass
+    return main_msg_id
 
 
 async def deliver_with_fallback(
