@@ -1,12 +1,12 @@
 import datetime
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import ContextTypes
 
 from config import settings
 from database import (
     get_users_col, get_file_records_col,
-    get_config, set_config,
+    set_config,
     set_code_bot_route, delete_code_bot_route,
     set_bot_decode_interval, delete_bot_decode_interval,
     add_spare_channel, remove_spare,
@@ -283,7 +283,6 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif state == "relay_set_api:phone":
         from services.relay_pool import relay_pool
-        from config import settings
         phone = text.strip()
         api_id = settings.RELAY_API_ID
         api_hash = settings.RELAY_API_HASH

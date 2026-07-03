@@ -45,7 +45,6 @@ from utils.dynamic_rate_limiter import dynamic_rate_limiter
 from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import safe_send_message, safe_reply_text
-from utils.file_utils import extract_media_info
 
 TOKEN = settings.DECODER_BOT_TOKEN
 
@@ -799,15 +798,10 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ 忽略", callback_data="report:ignore")],
     ])
 
+    # 通过 Admin Bot 发送，确保操作按钮回调能回到 Admin Bot 处理
+    from utils.admin_notify import send_to_admin
     try:
-        admin_token = settings.ADMIN_BOT_TOKEN
-        admin_chat_id = settings.ADMIN_TELEGRAM_ID
-        if admin_token and admin_chat_id:
-            await context.bot.send_message(
-                chat_id=admin_chat_id,
-                text=report_text,
-                reply_markup=keyboard,
-            )
+        await send_to_admin(report_text, keyboard)
         await query.answer("举报已提交，管理员将尽快处理", show_alert=True)
     except Exception as e:
         logger.error(f"[Idx][report] 推送管理员失败: {e}")
@@ -991,8 +985,8 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
         type_text = "未知"
 
     detail_lines = [
-        f"📋 文件码详情",
-        f"",
+        "📋 文件码详情",
+        "",
         f"码: {code}",
         f"状态: {status_text}",
     ]
@@ -1378,8 +1372,8 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
         pass
 
     stats_lines = [
-        f"📊 文件码统计",
-        f"",
+        "📊 文件码统计",
+        "",
         f"码: {code}",
         f"总解码次数: {decode_count}",
     ]
@@ -1746,7 +1740,7 @@ async def _async_main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("my-codes", my_codes_command))
+    app.add_handler(CommandHandler("my_codes", my_codes_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))
     # 文件码管理回调
@@ -1825,7 +1819,6 @@ async def _async_main():
             _cleanup_media_groups()
             await asyncio.sleep(60)
 
-    loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(_process_pending_uploads(app), name="process-pending")
     create_safe_task(cleanup_loop(), name="cleanup")

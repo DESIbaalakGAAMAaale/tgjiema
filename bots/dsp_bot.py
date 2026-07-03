@@ -600,15 +600,10 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("✅ 忽略", callback_data="report:ignore")],
     ])
 
+    # 通过 Admin Bot 发送，确保操作按钮回调能回到 Admin Bot 处理
+    from utils.admin_notify import send_to_admin
     try:
-        admin_token = settings.ADMIN_BOT_TOKEN
-        admin_chat_id = settings.ADMIN_TELEGRAM_ID
-        if admin_token and admin_chat_id:
-            await context.bot.send_message(
-                chat_id=admin_chat_id,
-                text=report_text,
-                reply_markup=keyboard,
-            )
+        await send_to_admin(report_text, keyboard)
         await query.answer("举报已提交，管理员将尽快处理", show_alert=True)
     except Exception as e:
         logger.error(f"[Dsp][report] 推送管理员失败: {e}")
@@ -714,8 +709,10 @@ async def _async_main():
     bot = app.bot
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(pagination_callback))
+    # report_callback 必须先于分页回调，且分页回调需限定 pattern，
+    # 否则无 pattern 的 pagination_callback 会吞掉 report_req| 回调，导致举报按钮失效。
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))
+    app.add_handler(CallbackQueryHandler(pagination_callback, pattern=r"^(pg\||noop$)"))
 
     await metrics.ping_bot("dsp_bot")
 
@@ -754,7 +751,6 @@ async def _async_main():
                 logger.debug(f"[SyncBack] 同步异常: {e}")
             await asyncio.sleep(120)
 
-    loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(startup_sync(), name="startup-sync")          # H: 启动同步 + 周期兜底
     create_safe_task(sync_back_loop(), name="sync-back")          # D: 新增

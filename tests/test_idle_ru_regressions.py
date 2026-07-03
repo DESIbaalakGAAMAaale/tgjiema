@@ -61,6 +61,7 @@ class _FakeJobsCol:
         self.rows = rows or []
         self.find_calls = []
         self.update_calls = []
+        self.execute_raw_calls = []
 
     async def find(self, query, **kwargs):
         self.find_calls.append((query, kwargs))
@@ -69,6 +70,12 @@ class _FakeJobsCol:
     async def update_one(self, query, update):
         self.update_calls.append((query, update))
         return _FakeUpdateResult()
+
+    async def execute_raw(self, sql, params=None):
+        # 现网实现通过批量 CASE WHEN / IN(...) 的 execute_raw 回写 CRDB，
+        # 替代早期逐条 update_one。测试记录调用以断言批量语义。
+        self.execute_raw_calls.append((sql, list(params or [])))
+        return len(params or [])
 
 
 class IdleRuRegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -107,10 +114,11 @@ class IdleRuRegressionTests(unittest.IsolatedAsyncioTestCase):
         with patch("database.session.get_jobs_col", return_value=fake_col):
             await session.sync_local_jobs_to_crdb()
 
-        self.assertEqual(len(fake_col.update_calls), 1)
-        query, update = fake_col.update_calls[0]
-        self.assertEqual(query, {"id": 321})
-        self.assertEqual(update["$set"]["status"], "done")
+        # 现网实现按 status 分组，用一条批量 execute_raw 回写，而非逐条 update_one
+        self.assertEqual(len(fake_col.execute_raw_calls), 1)
+        sql, params = fake_col.execute_raw_calls[0]
+        self.assertIn("status = 'done'", sql)
+        self.assertEqual(params, [321])
 
         rows = await store._db.execute_fetchall(
             "SELECT synced_at FROM local_job_queue WHERE crdb_id = ?",
