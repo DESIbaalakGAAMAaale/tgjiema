@@ -753,10 +753,7 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async with aiosqlite.connect(str(db_path)) as local_db:
             local_tables = [
                 "cells_local", "file_records_local", "users_local",
-                "codes_local", "local_job_queue", "spare_pool_local",
-                "backup_config_local", "code_bot_mapping_local",
-                "external_code_mapping_local", "message_backups_local",
-                "relay_accounts_local", "rotation_config_local",
+                "codes_local", "local_job_queue", "external_code_mapping_local",
             ]
             for tbl in local_tables:
                 try:

@@ -368,35 +368,49 @@ class MonScheduler:
             shadows = [s for s in (s1_slot, s2_slot) if s and s.get("status") in ("shadow1", "shadow2")]
 
             slot_id = active_slot["slot_id"]
+            last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
 
             # 1. R100 全量归档（独立游标，在 shadow 之前执行，静默期也能追赶）
+            # N25-4: R100 游标追上 shadow 时跳过 fetch，减少 Telethon 调用
             if r100_slot:
                 await self._load_r100_cursors()
                 r100_cursor_key = f"{slot_id}_r100"
                 r100_last_cursor = self._r100_cursors.get(r100_cursor_key, 0)
-                r100_new_messages = await self._fetch_new_messages(
-                    bot_instance, active_slot["channel_id"], r100_last_cursor
-                )
-                if r100_new_messages:
-                    copied_r100, mappings_r100 = await self._copy_messages(
-                        bot_instance, active_slot["channel_id"],
-                        r100_slot["channel_id"], r100_new_messages,
+                if r100_last_cursor < last_cursor:
+                    r100_new_messages = await self._fetch_new_messages(
+                        bot_instance, active_slot["channel_id"], r100_last_cursor
                     )
-                    total_copied += copied_r100
-                    if mappings_r100:
-                        await self._write_backup_mappings(
-                            active_slot["channel_id"], r100_slot["channel_id"], mappings_r100
+                    if r100_new_messages:
+                        # N24-2: 去重——查询 message_backups 中已存在的映射，避免重启后重复 copy
+                        r100_channel_id = r100_slot["channel_id"]
+                        existing_ids = await self._get_existing_backup_ids(
+                            active_slot["channel_id"], r100_channel_id,
+                            [m.id for m in r100_new_messages]
                         )
-                        self._r100_cursors[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
-                    else:
-                        logger.warning(
-                            f"[Mon] R100 复制失败 slot={slot_id} "
-                            f"channel={active_slot['channel_id']}→{r100_slot['channel_id']}，"
-                            f"游标保持 {r100_last_cursor}，下周期重试"
-                        )
+                        deduped = [m for m in r100_new_messages if m.id not in existing_ids]
+                        if deduped:
+                            copied_r100, mappings_r100 = await self._copy_messages(
+                                bot_instance, active_slot["channel_id"],
+                                r100_channel_id, deduped,
+                            )
+                            total_copied += copied_r100
+                            if mappings_r100:
+                                await self._write_backup_mappings(
+                                    active_slot["channel_id"], r100_channel_id, mappings_r100
+                                )
+                                # 游标推进到本次实际 fetch 的最大 id（含已去重的），避免重复拉取
+                                self._r100_cursors[r100_cursor_key] = max(m.id for m in r100_new_messages)
+                            else:
+                                logger.warning(
+                                    f"[Mon] R100 复制失败 slot={slot_id} "
+                                    f"channel={active_slot['channel_id']}→{r100_channel_id}，"
+                                    f"游标保持 {r100_last_cursor}，下周期重试"
+                                )
+                        else:
+                            # 所有消息已去重，游标直接推进
+                            self._r100_cursors[r100_cursor_key] = max(m.id for m in r100_new_messages)
 
             # 2. 复制到同组的 shadow1/shadow2
-            last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
             new_messages = await self._fetch_new_messages(
                 bot_instance, active_slot["channel_id"], last_cursor
             )
@@ -453,6 +467,21 @@ class MonScheduler:
                 await store.set("r100_cursors", self._r100_cursors.copy())
             except Exception as e:
                 logger.warning(f"[Mon] flush R100 游标失败: {e}")
+
+    @staticmethod
+    async def _get_existing_backup_ids(main_channel_id: int, backup_channel_id: int, msg_ids: list[int]) -> set[int]:
+        """查询 message_backups 中已存在的映射，返回已归档的 main_msg_id 集合（用于 R100 去重）。"""
+        if not msg_ids:
+            return set()
+        try:
+            from database.session import get_message_backups_col
+            col = get_message_backups_col()
+            existing = await col.find(
+                {"main_msg_id": {"$in": msg_ids}, "backup_channel_id": backup_channel_id}
+            )
+            return {r["main_msg_id"] for r in existing}
+        except Exception:
+            return set()
 
     @staticmethod
     async def _write_backup_mappings(main_channel_id: int, backup_channel_id: int, mappings: list[tuple[int, int]]):
