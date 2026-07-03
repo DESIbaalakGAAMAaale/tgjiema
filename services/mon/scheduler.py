@@ -110,19 +110,29 @@ class MonScheduler:
         
         return None
 
-    async def run_degrade_check(self, all_cells: list[dict], cell_fail_streak: dict[str, int] = None) -> list[str]:
+    async def run_degrade_check(
+        self, all_cells: list[dict],
+        cell_fail_streak: dict[str, int] = None,
+        cell_suspicious: dict[str, bool] = None,
+    ) -> list[str] | tuple[list[str], dict[str, bool]]:
         """执行一轮降级检查,返回日志描述列表。
 
         降级判断基于内存中的连续失败次数(fail_streak),零 CRDB RU。
         仅在实际触发降级时才写入 CRDB(sync_dirty_cells_to_crdb + log_rotate)。
 
+        二次确认去抖: fail_streak >= 3 时先标记为「疑似」,下一轮仍失败才确认降级,
+        避免 Telegram 临时报错(网络抖动)触发级联写风暴。
+
         Args:
             all_cells: 由调用方统一查询传入,避免重复 DB 查询。
             cell_fail_streak: {slot_id: 连续失败次数},由 MonBot 心跳循环维护。
+            cell_suspicious: {slot_id: 是否已标记为疑似},由 MonBot 维护。
         """
         alerts = []
         if cell_fail_streak is None:
             cell_fail_streak = {}
+        if cell_suspicious is None:
+            cell_suspicious = {}
 
         groups = self._group_slots(all_cells)
 
@@ -161,17 +171,28 @@ class MonScheduler:
                 )
                 continue
 
+            # 二次确认去抖: 首轮标记疑似,次轮确认降级
+            if not cell_suspicious.get(slot_id):
+                cell_suspicious[slot_id] = True
+                alerts.append(
+                    f"[SUSPICIOUS] {slot_id} 连续失败{fail_streak}次,标记疑似,"
+                    f"等待下一轮确认(防误降级)"
+                )
+                continue
+
+            # 已确认: 执行降级
             promote_slot, cascade_slot = self._get_next_promotable(group)
             await self._degrade_group(active_slot, promote_slot, cascade_slot, fail_streak, all_cells)
+            cell_suspicious.pop(slot_id, None)  # 降级后清除疑似标记
             from_status = active_slot.get("status", "?")
             alerts.append(
                 f"[DEGRADE] {slot_id}({from_status}→lost) "
                 f"→ {promote_slot['slot_id'] if promote_slot else 'none'}(shadow→active) "
                 f"→ {cascade_slot['slot_id'] if cascade_slot else 'none'}(shadow2→shadow1) "
-                f"连续失败{fail_streak}次"
+                f"连续失败{fail_streak}次(已二次确认)"
             )
 
-        return alerts
+        return alerts, cell_suspicious
 
     def _group_slots(self, all_cells: list[dict]) -> dict:
         """将槽位按组号聚合为 (a, s1, s2) 三元组。"""

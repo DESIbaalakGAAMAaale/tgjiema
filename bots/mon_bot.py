@@ -76,6 +76,8 @@ class MonBot:
         self._cell_healthy: dict[str, bool] = {}
         # slot_id → 连续失败次数(用于降级判断)
         self._cell_fail_streak: dict[str, int] = {}
+        # slot_id → 是否已标记为疑似(二次确认去抖,首轮标记次轮确认)
+        self._cell_suspicious: dict[str, bool] = {}
         # ─── cells 全量缓存:一次查询,多轮复用 ───
         self._cells_cache: list[dict] | None = None
         self._cells_cache_ts: float = 0
@@ -568,7 +570,9 @@ class MonBot:
                     logger.info(f"[Mon] 智能替补: 补齐 {filled} 条消息到新频道")
 
                 # 4. 降级检查(使用内存中的连续失败次数,零 CRDB RU)
-                alerts = await self.scheduler.run_degrade_check(all_cells, self._cell_fail_streak)
+                alerts, self._cell_suspicious = await self.scheduler.run_degrade_check(
+                    all_cells, self._cell_fail_streak, self._cell_suspicious
+                )
                 if alerts:
                     for msg in alerts:
                         logger.warning(msg)
@@ -648,6 +652,7 @@ class MonBot:
                 await store.write_heartbeat(slot_id, ok=True)
                 self._cell_healthy[slot_id] = True
                 self._cell_fail_streak[slot_id] = 0
+                self._cell_suspicious.pop(slot_id, None)  # 恢复后清除疑似标记
                 ok_count += 1
             except TelegramError as e:
                 if _is_ban_error(e):
