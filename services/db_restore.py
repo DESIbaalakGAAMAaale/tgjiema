@@ -35,7 +35,7 @@ TABLE_PK = {
     "spare_pool": "channel_id",
     "backup_config": "config_key",
     "code_bot_mapping": "code_prefix",
-    "message_backups": "main_msg_id",
+    "message_backups": "main_msg_id, backup_channel_id",
     "relay_accounts": "id",
     "rotation_config": "config_key",
     "external_code_mapping": "external_code",
@@ -153,6 +153,11 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
         logger.warning(f"[{table}] 未知主键，跳过")
         return 0
 
+    # 支持复合主键（如 "main_msg_id, backup_channel_id"）
+    pk_cols = [c.strip() for c in pk.split(",")]
+    # 复合主键使用所有列名，单主键使用单列名
+    pk_clause = pk  # ON CONFLICT (main_msg_id, backup_channel_id) 或 ON CONFLICT (slot_id)
+
     if dry_run:
         logger.info(f"[DRY-RUN] [{table}] 将恢复 {len(records)} 条记录")
         return len(records)
@@ -172,12 +177,12 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
     # N-16-4: relay_accounts.api_hash 备份中已脱敏，UPDATE 时跳过该列保留 DB 现值，
     # 但 INSERT 时保留（满足 NOT NULL 约束，全新库可插入占位值）
     _skip_update_cols = {"relay_accounts": {"api_hash"}}
-    update_parts = [f"{c} = EXCLUDED.{c}" for c in insert_cols if c != pk and c not in _skip_update_cols.get(table, set())]
+    update_parts = [f"{c} = EXCLUDED.{c}" for c in insert_cols if c not in pk_cols and c not in _skip_update_cols.get(table, set())]
 
     sql = (
         f"INSERT INTO {_sanitize_table(table)} ({', '.join(insert_cols)}) "
         f"VALUES ({', '.join(placeholders)}) "
-        f"ON CONFLICT ({pk}) DO UPDATE SET {', '.join(update_parts)}"
+        f"ON CONFLICT ({pk_clause}) DO UPDATE SET {', '.join(update_parts)}"
     )
 
     restored = 0
@@ -201,7 +206,7 @@ def _safe_val(val):
     if val is None:
         return None
     if isinstance(val, bool):
-        return 1 if val else 0
+        return val  # 保持 bool，asyncpg 兼容 INTEGER/BOOLEAN 列
     if isinstance(val, (list, dict)):
         return json.dumps(val, default=str, ensure_ascii=False)
     if isinstance(val, datetime):

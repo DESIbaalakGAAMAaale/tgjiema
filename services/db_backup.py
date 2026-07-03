@@ -68,10 +68,12 @@ async def backup_all_tables() -> dict:
             try:
                 safe_name = table.replace('"', '""')
                 where = _TABLE_WHERE.get(table)
+                # message_backups 是核心映射表，行数可能远超 5000，取消上限
+                limit = "" if table == "message_backups" else f" LIMIT {MAX_ROWS_PER_TABLE}"
                 if where:
-                    sql = f'SELECT * FROM "{safe_name}" WHERE {where} LIMIT {MAX_ROWS_PER_TABLE}'
+                    sql = f'SELECT * FROM "{safe_name}" WHERE {where}{limit}'
                 else:
-                    sql = f'SELECT * FROM "{safe_name}" LIMIT {MAX_ROWS_PER_TABLE}'
+                    sql = f'SELECT * FROM "{safe_name}"{limit}'
                 records = await conn.fetch(sql)
                 results[table] = [dict(r) for r in records]
                 logger.debug(f"[Backup] {table}: {len(records)} 行")
