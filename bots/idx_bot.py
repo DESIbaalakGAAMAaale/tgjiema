@@ -172,7 +172,7 @@ async def _get_storage_channel() -> int:
             return cells[0]["channel_id"]
     except Exception:
         pass
-    return settings.STORAGE_CHANNEL_ID
+    return 0
 
 
 # ─── 入队新方jobs ───

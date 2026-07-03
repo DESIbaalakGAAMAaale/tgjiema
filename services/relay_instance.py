@@ -9,7 +9,6 @@ from pathlib import Path
 from loguru import logger
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
-from telethon.tl.types import PeerChannel
 
 from config import settings
 
@@ -28,7 +27,6 @@ class RelayInstance:
         self._client: TelegramClient | None = None
         self._decoder_bot_entity = None
         self._up_bot_entity = None
-        self._storage_channel_entity = None
         # bot_username -> exchange info
         self._bot_exchange: dict[str, dict] = {}
         self._media_buffers: dict[str, dict] = {}
@@ -142,11 +140,6 @@ class RelayInstance:
         except Exception as e:
             logger.warning(f"[RelayInstance:{self.phone}] 无法获取上传机器人 @{settings.UPLOAD_BOT_USERNAME}: {e}")
 
-        try:
-            self._storage_channel_entity = PeerChannel(settings.MAIN_STORAGE_CHANNEL_ID)
-        except Exception:
-            self._storage_channel_entity = None
-
         self._register_handlers()
         self._ready.set()
         await self._report_status("online")
@@ -178,7 +171,6 @@ class RelayInstance:
         me = await self._client.get_me()
         self._relay_user_id = me.id
         self._decoder_bot_entity = await self._client.get_entity(settings.DECODER_BOT_USERNAME)
-        self._storage_channel_entity = PeerChannel(settings.MAIN_STORAGE_CHANNEL_ID)
         self._register_handlers()
         self._ready.set()
         logger.info(f"[RelayInstance:{self.phone}] 动态添加并登录成功: {me.username}")

@@ -85,7 +85,6 @@ File Bot 独立部署于 Cloudflare Workers，代码位于 `cf-workers/file-bot/
 | `ADMIN_BOT_TOKEN` | 管理 Bot Token |
 | `MON_BOT_TOKEN` | 监控 Bot Token |
 | `COCKROACHDB_URL` | CockroachDB 连接地址 |
-| `MAIN_STORAGE_CHANNEL_ID` | 主存储频道 ID |
 | `ACCOUNT_1_CHANNELS` ~ `ACCOUNT_5_CHANNELS` | 5 个账号的频道 ID |
 | `R100_CHANNEL` | R100 兜底频道 ID |
 | `RELAY_ENCRYPTION_KEY` | 中继账号加密密钥 |

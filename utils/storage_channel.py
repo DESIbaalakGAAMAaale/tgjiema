@@ -1,7 +1,7 @@
 import asyncio
 import time
 from loguru import logger
-from config import settings
+
 
 _cache_active_channel: int | None = None
 _cache_ts: float = 0
@@ -28,9 +28,9 @@ async def get_active_storage_channel_id() -> int:
         except Exception as e:
             logger.warning(f"[storage_channel] 读取DB配置失败: {e}")
 
-        _cache_active_channel = settings.MAIN_STORAGE_CHANNEL_ID
+        _cache_active_channel = 0
         _cache_ts = now
-        logger.info(f"[storage_channel] 使用settings默认主存储频道: {_cache_active_channel}")
+        logger.warning(f"[storage_channel] 读取DB配置失败, 回退到默认值 0")
         return _cache_active_channel
 
 

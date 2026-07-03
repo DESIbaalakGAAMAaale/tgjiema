@@ -323,7 +323,6 @@ async def _get_relay_status_text() -> str:
 
 
 _CONFIG_SETTINGS_MAP = {
-    "storage_channel_id": "MAIN_STORAGE_CHANNEL_ID",
     "file_code_prefix": "FILE_CODE_PREFIX",
     "force_join_channel_id": "FORCE_JOIN_CHANNEL_ID",
     "force_join_link": "FORCE_JOIN_CHANNEL_LINK",

@@ -15,9 +15,6 @@ class Settings(BaseSettings):
     MON_BOT_TOKEN: str = ""
     ADMIN_TELEGRAM_ID: int = 0
 
-    # PRE-09: 默认 0 表示未配置，由 validate_required_fields 强制校验。
-    # 原 -1000000000000 是占位符，可能导致误用为真实频道 ID 引发静默错误。
-    MAIN_STORAGE_CHANNEL_ID: int = 0
     MON_CHECK_INTERVAL: int = 60
 
     # ── 轮转参数（可在 .env 或管理员 Bot 运行时覆盖） ──
@@ -193,20 +190,6 @@ class Settings(BaseSettings):
                 "请运行以下命令重新生成：python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
             )
 
-        # PRE-09: MAIN_STORAGE_CHANNEL_ID 必须显式配置为真实频道 ID
-        # 默认值 0 或历史占位符 -1000000000000 都视为未配置
-        if self.MAIN_STORAGE_CHANNEL_ID == 0 or self.MAIN_STORAGE_CHANNEL_ID == -1000000000000:
-            raise ValueError(
-                "[Settings] MAIN_STORAGE_CHANNEL_ID 未配置或仍为占位符（0 或 -1000000000000）。"
-                "请在 .env 中设置真实的主存储频道 ID。"
-            )
-        # Telegram 超级群/频道 ID 通常是 -100 开头的负数
-        if self.MAIN_STORAGE_CHANNEL_ID > 0:
-            logger.warning(
-                f"[Settings] MAIN_STORAGE_CHANNEL_ID={self.MAIN_STORAGE_CHANNEL_ID} 为正数，"
-                "Telegram 超级群/频道 ID 通常是 -100 开头的负数，请确认配置正确。"
-            )
-
         # ── Admin Web 安全校验：拒绝默认/空密码 ──
         if not self.ADMIN_USERNAME:
             raise ValueError(
@@ -224,10 +207,6 @@ class Settings(BaseSettings):
             )
 
         return self
-
-    @property
-    def STORAGE_CHANNEL_ID(self) -> int:
-        return self.MAIN_STORAGE_CHANNEL_ID
 
     def get_accounts_config(self) -> dict:
         """从 .env 配置中解析账号频道配置。
@@ -264,8 +243,6 @@ class Settings(BaseSettings):
     @staticmethod
     def get_config_default(key: str) -> str:
         defaults = {
-            # PRE-09: 占位符与 MAIN_STORAGE_CHANNEL_ID 默认值 0 对齐
-            "storage_channel_id": "0",
             "file_code_prefix": "tgwenjian",
             "upload_bot_username": "",
             "decoder_bot_username": "",
