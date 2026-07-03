@@ -744,6 +744,32 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await client.close()
 
+    # 同步清空本地 SQLite 缓存，防止脏行回写重新推回 CRDB
+    sqlite_cleared = []
+    try:
+        import aiosqlite
+        from pathlib import Path
+        db_path = Path(__file__).parent.parent.parent / "data" / "cache_store.db"
+        async with aiosqlite.connect(str(db_path)) as local_db:
+            local_tables = [
+                "cells_local", "file_records_local", "users_local",
+                "codes_local", "local_job_queue", "spare_pool_local",
+                "backup_config_local", "code_bot_mapping_local",
+                "external_code_mapping_local", "message_backups_local",
+                "relay_accounts_local", "rotation_config_local",
+            ]
+            for tbl in local_tables:
+                try:
+                    await local_db.execute(f"DELETE FROM {tbl}")
+                    sqlite_cleared.append(tbl)
+                except Exception:
+                    pass  # 表可能不存在，忽略
+            await local_db.commit()
+        if sqlite_cleared:
+            logger.info(f"[factory_reset] 已清空本地缓存: {', '.join(sqlite_cleared)}")
+    except Exception as e:
+        logger.warning(f"[factory_reset] 清空本地缓存失败: {e}")
+
     if errors:
         await msg.edit_text(
             "⚠️ 工厂重置部分完成!\n\n"
