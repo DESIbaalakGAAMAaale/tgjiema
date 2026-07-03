@@ -24,6 +24,22 @@ BACKUP_TABLES = SMALL_TABLES
 
 MAX_ROWS_PER_TABLE = 5000
 
+# N-M9: 备份中需要脱敏的敏感字段（不改原库，仅脱敏备份 JSON）
+_SENSITIVE_FIELDS = {"r2_secret_key", "r2_access_key", "api_hash"}
+_REDACTED_VALUE = "***REDACTED***"
+
+
+def _redact_secrets(data: dict) -> dict:
+    """脱敏备份数据中的敏感字段，不影响原始数据库。"""
+    tables = data.get("tables", {})
+    for table_name, rows in tables.items():
+        if table_name in ("backup_config", "relay_accounts"):
+            for row in rows:
+                for key in list(row.keys()):
+                    if key.lower() in _SENSITIVE_FIELDS:
+                        row[key] = _REDACTED_VALUE
+    return data
+
 
 async def backup_all_tables() -> dict:
     """仅备份小元数据表（单表 <= 几百行），避免全表扫描大表消耗大量 RU。
@@ -91,6 +107,8 @@ async def run_db_backup():
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             key = f"db_backup/db_backup_{timestamp}.json"
             data = await backup_all_tables()
+            # N-M9: 脱敏备份数据中的敏感字段
+            data = _redact_secrets(data)
             content = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
             await r2_storage.upload(key, content, "application/json")
             total_rows = sum(len(v) for v in data["tables"].values())

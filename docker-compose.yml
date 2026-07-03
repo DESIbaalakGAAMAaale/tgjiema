@@ -26,6 +26,8 @@ services:
     # 可选：单独启动某个组件
     # command: python run_all.py up idx dsp mon admin_bot
     command: python run_all.py
+    cap_drop:
+      - ALL
     deploy:
       resources:
         limits:

@@ -346,12 +346,12 @@ class RelayDB:
             last_at = datetime.fromisoformat(row[1])
         except (ValueError, TypeError):
             return 0
-        elapsed = (datetime.utcnow() - last_at).total_seconds()
+        elapsed = (datetime.now(datetime.timezone.utc) - last_at).total_seconds()
         return max(0, row[0] - elapsed)
 
     async def set_bot_cooldown(self, bot_username: str, cooldown_seconds: int):
         """记录机器人的冷却时间（从解码器返回的限速文本中提取）。"""
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(datetime.timezone.utc).isoformat()
         logger.info(f"[RelayDB] 设置 @{bot_username} 冷却 {cooldown_seconds}s")
         await self._db.execute(
             """INSERT INTO bot_cooldown (bot_username, cooldown_seconds, last_decode_at, updated_at)
@@ -366,7 +366,7 @@ class RelayDB:
 
     async def cleanup_cooldowns(self):
         """清理已过期的冷却记录，防止无用堆积。"""
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(datetime.timezone.utc).isoformat()
         cursor = await self._db.execute(
             """DELETE FROM bot_cooldown
                WHERE last_decode_at IS NOT NULL

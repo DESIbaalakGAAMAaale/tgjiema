@@ -685,7 +685,11 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• 📋 decode_logs(解码日志)\n"
             "• 📤 pending_uploads(上传队列)\n"
             "• 👤 users(用户数据)\n"
-            "• ⚙️ backup_config(系统配置与备份配置)\n\n"
+            "• ⚙️ backup_config(系统配置)\n"
+            "• 🔑 codes(文件码)\n"
+            "• 🔗 external_code_mapping(外部码映射)\n"
+            "• 📨 jobs(派工队列)\n"
+            "• 🔄 spare_pool(备用池)\n\n"
             "频道中的消息不会被删除,但备份状态会重置,全量备份将被重新触发。\n\n"
             "🔴 如果您确认,请发送:\n"
             "/factory_reset confirm\n\n"
@@ -720,9 +724,6 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     errors = []
     for table in _FACTORY_RESET_TABLES:
         try:
-            # 白名单校验，防止 SQL 注入
-            if table not in _FACTORY_RESET_TABLES:
-                continue
             sql = f"DELETE FROM {table}"
             await client.execute(sql)
             cleared.append(table)

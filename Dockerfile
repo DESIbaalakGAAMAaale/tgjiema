@@ -32,8 +32,15 @@ ENV PATH=/root/.local/bin:$PATH
 # 项目代码
 COPY . .
 
+# 创建非root用户
+RUN useradd -m app
+
 # 数据目录（SQLite relay_pool.db）
-RUN mkdir -p /app/data /app/logs
+RUN mkdir -p /app/data /app/logs && \
+    chown -R app:app /app
+
+# 切换到非root用户
+USER app
 
 # 默认启动所有服务
 CMD ["python", "run_all.py"]

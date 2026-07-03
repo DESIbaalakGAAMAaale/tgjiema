@@ -290,15 +290,15 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         else:
             return DecodeResult(allowed=False, reason="文件码无效")
 
-    # ─── 配额本地递增（SQLite，零 RU）────────────────────
-    await increment_user_quota_used(user_id, is_external=not is_system_code(file_code))
+    # ─── 配额不在此时递增，由调用方在投递成功后递增 ────
+    # 原此处 increment_user_quota_used 已移除，避免投递失败时配额已扣
 
-    remaining = -1 if membership_level == "premium" else max(0, quota - (used + 1))
+    remaining = -1 if membership_level == "premium" else max(0, quota - used)
     remaining_ext = -1
     if not is_system_code(file_code):
         ext_q = q.get("ext_quota", 0)
         if ext_q != -1:
-            remaining_ext = max(0, ext_q - (ext_used + 1))
+            remaining_ext = max(0, ext_q - ext_used)
 
     return DecodeResult(
         allowed=True,

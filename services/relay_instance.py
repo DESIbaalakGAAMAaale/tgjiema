@@ -69,20 +69,20 @@ class RelayInstance:
     async def _wait_for_admin_code(self) -> str | None:
         from database.session import get_config, set_config
 
-        await set_config("relay_auth_pending", "1")
+        await set_config(f"relay_auth_pending:{self.phone}", "1")
         await self._report_status("pending_auth")
         logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram，等待管理员通过管理机器人提交...")
 
         for i in range(100):
             await asyncio.sleep(3)
-            code = await get_config("relay_auth_code")
+            code = await get_config(f"relay_auth_code:{self.phone}")
             if code and code.strip():
-                await set_config("relay_auth_pending", "0")
-                await set_config("relay_auth_code", "")
+                await set_config(f"relay_auth_pending:{self.phone}", "0")
+                await set_config(f"relay_auth_code:{self.phone}", "")
                 logger.info(f"[RelayInstance:{self.phone}] 已收到管理员提交的验证码")
                 return code.strip()
 
-        await set_config("relay_auth_pending", "0")
+        await set_config(f"relay_auth_pending:{self.phone}", "0")
         logger.error(f"[RelayInstance:{self.phone}] 等待验证码超时（5分钟）")
         return None
 
@@ -187,25 +187,22 @@ class RelayInstance:
         """发送外部码解码请求"""
         if not self._client:
             return False
+        # 检查冷却期（在锁外执行，避免阻塞整个实例）
+        from database.relay_db import get_relay_db
+        relay_db = await get_relay_db()
+        cooldown = await relay_db.get_bot_cooldown(bot_username)
+        if cooldown > 0:
+            logger.info(
+                f"[RelayInstance:{self.phone}] @{bot_username} 在冷却期，"
+                f"等待 {cooldown:.0f}s"
+            )
+            await asyncio.sleep(cooldown)
         async with self._lock:
             if self.is_busy:
                 logger.warning(f"[RelayInstance:{self.phone}] 账号正忙，拒绝新请求")
                 return False
             self.is_busy = True
-        try:
-            # 检查冷却期
-            from database.relay_db import get_relay_db
-            relay_db = await get_relay_db()
-            cooldown = await relay_db.get_bot_cooldown(bot_username)
-            if cooldown > 0:
-                logger.info(
-                    f"[RelayInstance:{self.phone}] @{bot_username} 在冷却期，"
-                    f"等待 {cooldown:.0f}s"
-                )
-                await asyncio.sleep(cooldown)
-            return await self._do_send_external_code(bot_username, code, user_id)
-        finally:
-            self.is_busy = False
+        return await self._do_send_external_code(bot_username, code, user_id)
 
     async def _do_send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         try:
@@ -583,6 +580,8 @@ class RelayInstance:
         finally:
             if bot_username in self._bot_exchange:
                 self._bot_exchange[bot_username]["_ai_running"] = False
+            else:
+                self.is_busy = False
 
     def _make_decision(self, exchange: dict) -> dict:
         _NEXT_KW = ("next", "\u4e0b\u4e00\u9875", "\u4e0b\u4e00\u9801", "\u4e0b\u4e00\u7ec4",
@@ -742,6 +741,7 @@ class RelayInstance:
 
     async def _process_all_collected(self, bot_username: str):
         exchange = self._bot_exchange.pop(bot_username, None)
+        self.is_busy = False
         if not exchange:
             return
         user_id = exchange.get("user_id")
@@ -777,6 +777,7 @@ class RelayInstance:
 
     async def _cleanup_exchange(self, bot_username: str):
         exchange = self._bot_exchange.pop(bot_username, None)
+        self.is_busy = False
         if exchange:
             code = exchange.get("code", "")
             self._cleanup_code_dicts(code)
@@ -820,6 +821,12 @@ class RelayInstance:
                 return True
             # expired
             await col.delete_one({"file_code": code})
+            # N-M13: 同时删除 SQLite 本地缓存和内存缓存，防止 RENEW 循环
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            await store.delete_file_record_local(code)
+            from database.cache import get_file_record_cache
+            get_file_record_cache().invalidate(f"file:{code}")
             if self._decoder_bot_entity:
                 await self._client.send_message(
                     self._decoder_bot_entity,

@@ -165,6 +165,7 @@ class RelayPool:
         )
         async with self._lock:
             self.instances.append(instance)
+        await instance.start()
         logger.info(f"[RelayPool] 动态添加中继账号: {phone}")
         return instance
 

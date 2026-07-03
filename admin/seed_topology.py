@@ -81,30 +81,12 @@ async def seed(dry_run: bool = False, force: bool = False):
     print(f"\n数据库现有 {len(existing_map)} 个槽位,配置 {len(slots)} 个")
 
     added = 0
-    updated = 0
     skipped = 0
     for slot in slots:
         sid = slot["slot_id"]
-        update_data = {
-            "channel_id": slot["channel_id"],
-            "status": slot["status"],
-            "next_active_chat_id": slot.get("next_active_chat_id"),
-            "prev_slot_id": slot.get("prev_slot_id"),
-            "account_name": slot.get("account_name", ""),
-            "is_r100": 1 if slot.get("is_r100") else 0,
-        }
 
         if sid in existing_map:
-            old = existing_map[sid]
-            changed = any(
-                old.get(k) != v for k, v in update_data.items()
-            )
-            if changed:
-                await col.update_one({"slot_id": sid}, {"$set": update_data})
-                updated += 1
-                print(f"  [update] {sid} → channel={slot['channel_id']} status={slot['status']}")
-            else:
-                skipped += 1
+            skipped += 1
         else:
             from database import make_cell
             cell = make_cell(
@@ -121,19 +103,24 @@ async def seed(dry_run: bool = False, force: bool = False):
             print(f"  [create] {sid} → channel={slot['channel_id']} status={slot['status']}")
 
     await close_db()
-    print(f"\n完成: 新增 {added} 个, 更新 {updated} 个, 跳过 {skipped} 个(无变化)")
+    print(f"\n完成: 新增 {added} 个, 跳过 {skipped} 个(已存在)")
 
-    # ── 步骤4:初始化轮转配置(如果不存在) ──
+    # ── 步骤4:初始化轮转配置(仅当不存在时写入，不覆盖已有值) ──
     await init_db()
+    from database import get_rotation_config
     mon_cfg = config.get("mon", {})
     defaults = {
-        "active_window_size": str(mon_cfg.get("active_window_size", 3)),
+        "rotation_active_window_size": str(mon_cfg.get("active_window_size", 3)),
         "rotation_files_per_slot": str(mon_cfg.get("rotation_files_per_slot", 500)),
         "rotation_time_per_slot": str(mon_cfg.get("rotation_time_per_slot", 3600)),
     }
+    initialized = 0
     for key, val in defaults.items():
-        await set_rotation_config(key, val)
-    print(f"轮转配置已初始化: {defaults}")
+        existing_val = await get_rotation_config(key)
+        if existing_val is None:
+            await set_rotation_config(key, val)
+            initialized += 1
+    print(f"轮转配置已初始化: {initialized}/{len(defaults)} 项(新增)")
     await close_db()
 
     print("下一步: python run_all.py")
@@ -146,7 +133,16 @@ if __name__ == "__main__":
 
 
 async def auto_seed():
-    """自动初始化拓扑(启动时静默调用,不交互)。"""
+    """自动初始化拓扑(启动时静默调用,不交互)。
+    仅在 cells 表为空时写入，避免覆盖运行时状态。"""
     print("[seed] 自动初始化拓扑...")
+    from database import init_db, close_db, get_cells_col
+    await init_db()
+    col = get_cells_col()
+    cell_count = await col.count_documents({})
+    await close_db()
+    if cell_count > 0:
+        print(f"[seed] cells 表已有 {cell_count} 个槽位,跳过初始化(避免覆盖运行时状态)")
+        return
     await seed(dry_run=False, force=True)
     print("[seed] 拓扑初始化完成")

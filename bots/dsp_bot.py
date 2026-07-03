@@ -385,6 +385,11 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             _record_channel_failure(next_resolved.channel_id)
             current_id = next_resolved.channel_id
 
+        # C3: 环形降级耗尽后,尝试原始存储频道(消息实际存储位置,即使已降级消息仍存在)
+        if not success and job.storage_channel_id not in tried:
+            logger.info(f"[Dsp] 环形降级耗尽,尝试原始存储频道: {job.storage_channel_id}")
+            success = await try_deliver(bot, job.target_user_id, job.storage_channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
+
     if success:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
         metrics.send_success_count += 1

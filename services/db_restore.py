@@ -19,7 +19,8 @@ from storage.r2 import _r2 as r2_storage
 # 备份中会包含的表（按依赖顺序排列，先恢复无依赖的表）
 ALL_TABLES = ["users", "file_records", "decode_logs", "cells", "codes", "jobs",
               "rotate_log", "pending_uploads", "spare_pool", "backup_config",
-              "code_bot_mapping", "message_backups", "relay_accounts", "kv_config"]
+              "code_bot_mapping", "message_backups", "relay_accounts",
+              "rotation_config", "external_code_mapping"]
 
 # 各表的主键列
 TABLE_PK = {
@@ -31,10 +32,13 @@ TABLE_PK = {
     "jobs": "id",
     "rotate_log": "id",
     "pending_uploads": "id",
-    "spare_pool": "id",
-    "backup_config": "key",
-    "code_bot_mapping": "prefix",
-    "message_backups": "id",
+    "spare_pool": "channel_id",
+    "backup_config": "config_key",
+    "code_bot_mapping": "code_prefix",
+    "message_backups": "main_msg_id",
+    "relay_accounts": "id",
+    "rotation_config": "config_key",
+    "external_code_mapping": "external_code",
 }
 
 # 白名单:只允许这些列名出现在 INSERT/UPDATE 语句中
@@ -42,21 +46,53 @@ _ALLOWED_COLUMNS = set()
 for _tbl in ALL_TABLES:
     # 预定义常见列名白名单(防止注入)
     _ALLOWED_COLUMNS.update([
-        "id", "user_id", "file_code", "slot_id", "code", "key", "prefix",
-        "username", "first_name", "membership_level", "quota_used_today",
-        "daily_decode_quota", "quota_date", "external_decode_quota",
-        "external_used_today", "external_quota_date", "is_banned",
-        "created_at", "updated_at", "primary_channel_id", "primary_channel_msg_id",
-        "file_types", "batch_msg_ids", "batch_file_meta", "note",
-        "protect_content", "file_ttl_days", "status", "storage_channel_id",
-        "storage_msg_ids", "target_user_id", "task_type", "retry_count",
-        "dead", "dead_reason", "dead_retry", "dead_retry_at",
-        "dispatched_at", "expire_time", "last_heartbeat", "rotation_started_at",
-        "is_r100", "next_active_chat_id", "prev_slot_id", "channel_id",
+        # 通用
+        "id", "created_at", "updated_at", "status", "note",
+        # users 表
+        "user_id", "username", "first_name", "membership_level",
+        "daily_decode_quota", "quota_used_today", "quota_date",
+        "can_upload", "external_decode_quota", "external_used_today",
+        "external_quota_date", "is_banned",
+        # file_records 表
+        "file_code", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
+        "file_types", "backup_channel_msg_ids", "batch_msg_ids", "batch_file_meta",
+        "file_ids", "request_count", "create_time", "expire_time",
+        "blocked_users", "protect_content", "file_ttl_days",
+        # decode_logs 表
+        "requester_id", "request_time", "source_channel_id",
+        # pending_uploads 表
+        "status_msg_id", "processed",
+        # backup_config / rotation_config 表
+        "config_key", "config_value",
+        # message_backups 表
+        "main_msg_id", "backup_channel_id", "backed_msg_id", "backed_at",
+        # cells 表
+        "slot_id", "channel_id", "next_active_chat_id", "prev_slot_id",
+        "demoted_to_channel_id", "account_name", "is_r100",
+        "last_heartbeat", "last_synced_msg_id", "degrade_count",
+        "file_count", "rotation_started_at",
+        # codes 表
+        "code", "file_record_code",
+        # jobs 表
+        "target_user_id", "storage_channel_id", "storage_msg_ids",
+        "task_type", "dispatched_at", "retry_count",
+        "dead", "dead_reason", "dead_retry", "dead_retry_at", "dead_retry_count",
+        # rotate_log 表
+        "timestamp", "from_slot_id", "to_slot_id", "from_status",
+        "to_status", "reason", "triggered_by",
+        # spare_pool 表
+        "is_used",
+        # relay_accounts 表
+        "api_id", "api_hash", "phone", "is_active", "last_login_at",
+        # external_code_mapping 表
+        "external_code", "system_code", "bot_username",
+        # code_bot_mapping 表
+        "code_prefix",
+        # 向后兼容(旧备份可能包含的列)
+        "key", "prefix", "api_hash_encrypted",
         "group_key", "account_index", "description", "interval_minutes",
         "enabled", "usage", "total_requests", "avg_wait_ms", "last_used",
-        "bot_username", "bot_type", "phone", "api_id", "api_hash_encrypted",
-        "session_data", "message_id", "chat_id", "from_chat_id",
+        "bot_type", "session_data", "message_id", "chat_id", "from_chat_id",
         "decoded_at", "decode_result", "backup_time",
     ])
 
@@ -64,7 +100,8 @@ for _tbl in ALL_TABLES:
 _ALLOWED_TABLES = frozenset([
     "users", "file_records", "decode_logs", "pending_uploads",
     "cells", "codes", "jobs", "rotate_log", "relay_accounts",
-    "spare_pool", "kv_config",
+    "spare_pool", "backup_config", "code_bot_mapping",
+    "message_backups", "rotation_config", "external_code_mapping",
 ])
 
 def _sanitize_table(name: str) -> str:

@@ -315,7 +315,7 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             uid = int(parts[1])
             await update_user_and_invalidate(uid, {
-                "$set": {"is_banned": True, "updated_at": _dt.datetime.now(_dt.UTC).isoformat()},
+                "$set": {"is_banned": True, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()},
             })
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ 已封禁用户 {uid}",

@@ -53,7 +53,7 @@ def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
         async def _load():
             await init_db()
             db_keys = {
-                "active_window_size": "active_window_size",
+                "active_window_size": "rotation_active_window_size",
                 "rotation_files_per_slot": "rotation_files_per_slot",
                 "rotation_time_per_slot": "rotation_time_per_slot",
             }

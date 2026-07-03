@@ -5,6 +5,7 @@
 import asyncio
 import time
 from loguru import logger
+from telegram.error import BadRequest
 from database import (
     get_cell_by_channel_local,
 )
@@ -181,6 +182,10 @@ async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, m
     try:
         await safe_copy_message(bot_instance, target_user_id, from_channel_id, message_id, protect_content=protect_content, bot_id=bot_id)
         return True
+    except BadRequest as e:
+        # C3: 消息不存在于该频道(常见于 failover/rotation 后 target 频道无历史文件)
+        logger.warning(f"[delivery] 消息不存在 (channel={from_channel_id}, msg={message_id}): {e}")
+        return False
     except Exception as e:
         logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={message_id}): {e}")
         return False

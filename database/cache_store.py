@@ -17,6 +17,15 @@ from loguru import logger
 
 DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
 
+# 单调递增版本号计数器，替代时间戳避免同一毫秒内多次变更获得相同版本号
+_cells_version_counter = int(time.time() * 1000)
+
+
+def _next_cells_version() -> int:
+    global _cells_version_counter
+    _cells_version_counter += 1
+    return _cells_version_counter
+
 
 class CacheStore:
     def __init__(self):
@@ -1220,7 +1229,7 @@ class CacheStore:
         except Exception:
             return
         now = time.time()
-        version = int(now * 1000)
+        version = _next_cells_version()
         await self._db.execute(
             "INSERT OR REPLACE INTO cells_snapshot (id, data, version, updated_at) VALUES (1, ?, ?, ?)",
             (val, version, now),
@@ -1231,7 +1240,7 @@ class CacheStore:
         """写入变更通知 + 递增版本号"""
         if not self._db:
             return
-        version = int(ts * 1000)
+        version = _next_cells_version()
         await self._db.execute(
             "INSERT INTO cells_change_notify (version, ts) VALUES (?, ?)",
             (version, ts),
@@ -1390,6 +1399,16 @@ class CacheStore:
             return
         await self._db.execute(
             "UPDATE file_records_local SET crdb_synced = 1 WHERE file_code = ?",
+            (file_code,),
+        )
+        await self._db.commit()
+
+    async def delete_file_record_local(self, file_code: str):
+        """从 SQLite 本地缓存中删除 file_record（N-M13: deliver_cached 过期清理）"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "DELETE FROM file_records_local WHERE file_code = ?",
             (file_code,),
         )
         await self._db.commit()

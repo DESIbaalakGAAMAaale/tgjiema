@@ -75,10 +75,7 @@ DDL_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_decode_logs_request_time ON decode_logs(request_time)",
     # idx_file_records_msg_id 已删除（primary_channel_msg_id 仅做数据字段读取，无 WHERE 过滤）
     # ─── 增量同步索引：_sync_local_tables_loop 用 updated_at 过滤新记录 ───
-    "CREATE INDEX IF NOT EXISTS idx_file_records_updated_at ON file_records(updated_at)",
-    "CREATE INDEX IF NOT EXISTS idx_codes_updated_at ON codes(updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_users_updated_at ON users(updated_at)",
-    "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_updated_at ON external_code_mapping(updated_at)",
     """CREATE TABLE IF NOT EXISTS pending_uploads (
         id SERIAL PRIMARY KEY,
         uploader_id BIGINT,
@@ -238,7 +235,10 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS blocked_users JSONB DEFAULT '[]'",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN updated_at TEXT",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN file_ttl_days INTEGER DEFAULT 0",
+    "CREATE INDEX IF NOT EXISTS idx_file_records_updated_at ON file_records(updated_at)",
     "ALTER TABLE IF EXISTS codes ADD COLUMN updated_at TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_codes_updated_at ON codes(updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_external_code_mapping_updated_at ON external_code_mapping(updated_at)",
     # PRE-01: cells 表补充 demoted_to_channel_id 字段（CRDB 不支持 ADD COLUMN IF NOT EXISTS，用 try/except 兼容已存在）
     "ALTER TABLE IF EXISTS cells ADD COLUMN demoted_to_channel_id BIGINT",
     "ALTER TABLE IF EXISTS cells ADD COLUMN prev_slot_id TEXT",
@@ -258,6 +258,9 @@ MIGRATION_STATEMENTS = [
     "DROP INDEX IF EXISTS idx_users_first_name",
     "DROP INDEX IF EXISTS idx_decode_logs_requester",
     "DROP INDEX IF EXISTS idx_file_records_msg_id",
+    # ─── CRDB 行级 TTL 禁用：延长到 100 年 + @yearly cron，由 Python 端负责清理 ───
+    "ALTER TABLE decode_logs SET (ttl_expiration_expression = '((request_time::TIMESTAMPTZ + INTERVAL ''100 years'') AT TIME ZONE ''UTC'')', ttl_job_cron = '@yearly')",
+    "ALTER TABLE jobs SET (ttl_expiration_expression = '((created_at::TIMESTAMPTZ + INTERVAL ''100 years'') AT TIME ZONE ''UTC'')', ttl_job_cron = '@yearly')",
 ]
 
 
@@ -320,12 +323,22 @@ class CockroachDBClient:
 
         if need_ddl:
             for sql in DDL_STATEMENTS:
-                await self.execute(sql)
+                try:
+                    await self.execute(sql)
+                except Exception as e:
+                    logger.warning(f"[DB] DDL SQL 执行失败（可忽略）：{e}")
             for sql in MIGRATION_STATEMENTS:
                 try:
                     await self.execute(sql)
                 except Exception as e:
-                    logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略）：{e}")
+                    err_msg = str(e).lower()
+                    # 只忽略"列已存在"或"关系已存在"错误，这些是预期的（因为没有 IF NOT EXISTS）
+                    if "already exists" in err_msg or "duplicate" in err_msg:
+                        logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略，已存在）：{sql[:60]}... → {e}")
+                    else:
+                        logger.error(f"[DB] 迁移 SQL 执行失败（严重）：{sql} → {e}")
+                        # 重新抛出非预期错误，确保启动失败被发现
+                        raise
             # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
             # RESET 在某些 CRDB 版本不生效，改用与 migration 一致的 SET 方式，确保 TTL job 不运行
             # 改为 Python 端负责清理（见 database/cache.py: _flush_decode_log_buffer_loop）
@@ -455,6 +468,9 @@ class CockroachDBClient:
 
 _client: CockroachDBClient = CockroachDBClient()
 
+# 后台异步同步任务的引用集合，防止 GC 回收 fire-and-forget 任务
+_pending_sync_tasks: set[asyncio.Task] = set()
+
 
 async def init_db():
     from config import settings as _settings
@@ -530,6 +546,24 @@ def _safe_str(val: Any):
     return str(val)
 
 
+def _escape_like(value: str) -> str:
+    """转义 LIKE 通配符: \ → \\, % → \%, _ → \_"""
+    if not isinstance(value, str):
+        value = str(value)
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _validate_identifier(name: str) -> str:
+    """验证标识符（列名/表名）仅包含安全字符，防止 SQL 注入。
+
+    虽然当前所有列名均来自代码常量，但作为安全加固措施，
+    运行时校验确保不会有意外的动态拼接进入 SQL。
+    """
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+        raise ValueError(f"Invalid SQL identifier: {name!r}")
+    return name
+
+
 class D1Collection:
     def __init__(self, table: str):
         self.table = table
@@ -556,6 +590,7 @@ class D1Collection:
         params = []
         where_parts = []
         for k, v in query.items():
+            _validate_identifier(k)
             if isinstance(v, dict):
                 for op, val in v.items():
                     if op == "$gte":
@@ -581,8 +616,13 @@ class D1Collection:
             where_parts.append(f"{k} = ${len(params) + 1}")
             params.append(v)
         # projection: 指定只查询需要的列，减少 IO 和 RU 消耗
-        cols = ", ".join(projection) if projection else "*"
-        sql = f"SELECT {cols} FROM {self.table}"
+        if projection:
+            for col in projection:
+                _validate_identifier(col)
+            cols = ", ".join(projection)
+        else:
+            cols = "*"
+        sql = f"SELECT {cols} FROM {_validate_identifier(self.table)}"
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         sql += " LIMIT 1"
@@ -621,14 +661,17 @@ class D1Collection:
         set_parts = []
         if "$set" in update:
             for k, v in update["$set"].items():
+                _validate_identifier(k)
                 set_parts.append(f"{k} = ${len(all_params) + 1}")
                 all_params.append(_safe_str(v))
         if "$inc" in update:
             for k, v in update["$inc"].items():
+                _validate_identifier(k)
                 set_parts.append(f"{k} = {k} + ${len(all_params) + 1}")
                 all_params.append(int(v))
         if "$push" in update:
             for k, v in update["$push"].items():
+                _validate_identifier(k)
                 val_json = _json_dumps(v, default=str)
                 set_parts.append(
                     f"{k} = CASE WHEN {k} IS NULL OR {k} = '' "
@@ -643,6 +686,7 @@ class D1Collection:
 
         where_parts = []
         for k, v in query.items():
+            _validate_identifier(k)
             if isinstance(v, dict):
                 continue
             where_parts.append(f"{k} = ${len(all_params) + 1}")
@@ -651,13 +695,19 @@ class D1Collection:
         sql = f"UPDATE {self.table} SET {', '.join(set_parts)}"
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
-        await self._execute(sql, all_params)
-        return UpdateResult(1)
+        async with _client._pool.acquire() as conn:
+            status = await conn.execute(sql, *all_params)
+            # asyncpg/CRDB 返回 "UPDATE N" 格式
+            try:
+                return UpdateResult(int(str(status).split()[-1]))
+            except Exception:
+                return UpdateResult(0)
 
     async def delete_one(self, query: dict) -> bool:
         params = []
         where_parts = []
         for k, v in query.items():
+            _validate_identifier(k)
             if isinstance(v, dict):
                 continue
             where_parts.append(f"{k} = ${len(params) + 1}")
@@ -666,8 +716,13 @@ class D1Collection:
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         sql += " LIMIT 1"
-        await self._execute(sql, params)
-        return True
+        async with _client._pool.acquire() as conn:
+            status = await conn.execute(sql, *params)
+            # asyncpg/CRDB 返回 "DELETE N" 格式
+            try:
+                return int(str(status).split()[-1]) > 0
+            except Exception:
+                return False
 
     async def delete_many(self, query: dict, limit: int | None = None) -> int:
         """删除匹配 query 的所有记录,返回实际删除条数。
@@ -677,6 +732,7 @@ class D1Collection:
         params = []
         where_parts = []
         for k, v in query.items():
+            _validate_identifier(k)
             if isinstance(v, dict):
                 for op, val in v.items():
                     if op == "$gte":
@@ -717,6 +773,7 @@ class D1Collection:
         for k, v in query.items():
             if k == "$or":
                 continue
+            _validate_identifier(k)
             if isinstance(v, dict):
                 if "$gte" in v:
                     where_parts.append(f"{k} >= ${len(params) + 1}")
@@ -738,8 +795,8 @@ class D1Collection:
                     params.extend([_safe_str(x) for x in v["$in"]])
                     where_parts.append(f"{k} IN ({', '.join(placeholders)})")
                 elif "$regex" in v:
-                    where_parts.append(f"{k} LIKE ${len(params) + 1}")
-                    params.append(f"%{_safe_str(v['$regex'])}%")
+                    where_parts.append(f"{k} LIKE ${len(params) + 1} ESCAPE '\\'")
+                    params.append(f"%{_escape_like(_safe_str(v['$regex']))}%")
                 continue
             where_parts.append(f"{k} = ${len(params) + 1}")
             params.append(_safe_str(v))
@@ -748,9 +805,10 @@ class D1Collection:
             or_parts = []
             for sub_q in query["$or"]:
                 for sk, sv in sub_q.items():
+                    _validate_identifier(sk)
                     if isinstance(sv, dict) and "$regex" in sv:
-                        or_parts.append(f"{sk} LIKE ${len(params) + 1}")
-                        params.append(f"%{_safe_str(sv['$regex'])}%")
+                        or_parts.append(f"{sk} LIKE ${len(params) + 1} ESCAPE '\\'")
+                        params.append(f"%{_escape_like(_safe_str(sv['$regex']))}%")
             if or_parts:
                 where_parts.append("(" + " OR ".join(or_parts) + ")")
 
@@ -771,6 +829,7 @@ class D1Collection:
         for k, v in query.items():
             if k == "$or":
                 continue
+            _validate_identifier(k)
             if isinstance(v, dict):
                 if "$gte" in v:
                     where_parts.append(f"{k} >= ${len(params) + 1}")
@@ -792,8 +851,8 @@ class D1Collection:
                     params.extend([_safe_str(x) for x in v["$in"]])
                     where_parts.append(f"{k} IN ({', '.join(placeholders)})")
                 elif "$regex" in v:
-                    where_parts.append(f"{k} LIKE ${len(params) + 1}")
-                    params.append(f"%{_safe_str(v['$regex'])}%")
+                    where_parts.append(f"{k} LIKE ${len(params) + 1} ESCAPE '\\'")
+                    params.append(f"%{_escape_like(_safe_str(v['$regex']))}%")
                 continue
             where_parts.append(f"{k} = ${len(params) + 1}")
             params.append(_safe_str(v))
@@ -803,15 +862,19 @@ class D1Collection:
             for sub_q in query["$or"]:
                 or_clause = []
                 for sk, sv in sub_q.items():
+                    _validate_identifier(sk)
                     if isinstance(sv, dict) and "$regex" in sv:
-                        or_clause.append(f"{sk} LIKE ${len(params) + 1}")
-                        params.append(f"%{_safe_str(sv['$regex'])}%")
+                        or_clause.append(f"{sk} LIKE ${len(params) + 1} ESCAPE '\\'")
+                        params.append(f"%{_escape_like(_safe_str(sv['$regex']))}%")
                 if or_clause:
                     or_parts.append("(" + " OR ".join(or_clause) + ")")
             if or_parts:
                 where_parts.append("(" + " OR ".join(or_parts) + ")")
 
-        sql = "SELECT " + (", ".join(projection) if projection else "*") + f" FROM {self.table}"
+        if projection:
+            for col in projection:
+                _validate_identifier(col)
+        sql = "SELECT " + (", ".join(projection) if projection else "*") + f" FROM {_validate_identifier(self.table)}"
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)
         if sort and len(sort) >= 2:
@@ -964,6 +1027,7 @@ async def get_config(key: str) -> str | None:
 
 async def set_config(key: str, value: str):
     await _set_config(key, value)
+    get_config_cache().invalidate(f"config:{key}")
 
 
 async def delete_config(key: str):
@@ -973,6 +1037,7 @@ async def delete_config(key: str):
             {"config_key": key},
             {"$set": {"config_value": "", "updated_at": ""}},
         )
+    get_config_cache().invalidate(f"config:{key}")
 
 
 async def get_relay_config() -> dict:
@@ -1018,7 +1083,7 @@ async def _refresh_bot_config_cache():
     try:
         # 刷新 code_bot_route 缓存
         routes = {}
-        all_routes = await _backup_config_col.find({"config_key": {"$regex": "^code_bot_route:"}})
+        all_routes = await _backup_config_col.find({"config_key": {"$regex": "code_bot_route:"}})
         for row in all_routes:
             key = row.get("config_key", "")
             val = row.get("config_value", "")
@@ -1030,7 +1095,7 @@ async def _refresh_bot_config_cache():
 
         # 刷新 bot_decode_interval 缓存
         intervals = {}
-        all_intervals = await _backup_config_col.find({"config_key": {"$regex": "^bot_decode_interval:"}})
+        all_intervals = await _backup_config_col.find({"config_key": {"$regex": "bot_decode_interval:"}})
         for row in all_intervals:
             key = row.get("config_key", "")
             val = row.get("config_value", "")
@@ -1625,7 +1690,7 @@ async def enqueue_job(
         pass
     
     # H方案: CRDB 写入走后台异步(fire-and-forget)，仅用于审计，不阻塞
-    asyncio.ensure_future(_sync_new_job_to_crdb(
+    task = asyncio.ensure_future(_sync_new_job_to_crdb(
         local_id=local_id,
         code=code,
         target_user_id=target_user_id,
@@ -1636,6 +1701,8 @@ async def enqueue_job(
         protect_content=protect_content,
         created_at=created_at,
     ))
+    _pending_sync_tasks.add(task)
+    task.add_done_callback(_pending_sync_tasks.discard)
 
 
 async def dequeue_jobs(batch_size: int = 10) -> list:

@@ -26,6 +26,8 @@ _user_code_count_cleanup_at: float = 0
 def incr_user_code_count(user_id: int, delta: int = 1):
     """用户生成新码时 +1（F1: 同时更新 active_files）"""
     _user_code_count_delta[user_id] = _user_code_count_delta.get(user_id, 0) + delta
+    # N-M15: 与 decr 对称，同时递增 active_files
+    status_counters["active_files"] = status_counters.get("active_files", 0) + delta
 
 
 def decr_user_code_count(user_id: int, delta: int = 1):

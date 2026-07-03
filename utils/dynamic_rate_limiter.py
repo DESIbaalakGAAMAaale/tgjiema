@@ -78,6 +78,8 @@ class DynamicRateLimiter:
             self._last_queue_length = queue_length
 
         # 等待（在锁外执行，不影响并发）
+        # ✅ 确认：asyncio.sleep 在 async with self._lock 块之外，
+        # 确保等待期间不阻塞其他并发的 acquire() 调用。
         if self._current_delay > 0:
             await asyncio.sleep(self._current_delay)
 

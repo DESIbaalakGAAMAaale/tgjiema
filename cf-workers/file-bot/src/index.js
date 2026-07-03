@@ -89,6 +89,17 @@ async function handleMessage(msg, token, up, idx, dsp, channelLink) {
 // ─── Workers 入口 ───
 export default {
   async fetch(req, env) {
+    // 验证 webhook secret token，防止伪造更新
+    // 需在 Cloudflare Dashboard → Workers → Settings → Variables 中设置 SECRET_TOKEN
+    // 或通过 wrangler secret put SECRET_TOKEN 设置
+    const secret = env.SECRET_TOKEN;
+    if (secret) {
+      const headerToken = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
+      if (headerToken !== secret) {
+        return new Response("Forbidden", { status: 403 });
+      }
+    }
+
     if (req.headers.get("content-type")?.includes("application/json")) {
       try {
         const body = await req.json();

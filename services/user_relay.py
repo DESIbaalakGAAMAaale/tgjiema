@@ -269,6 +269,12 @@ class UserRelay:
                 logger.error(f"[UserRelay] 缓存外部码失败 (code={code}, msg_id={message_id}): {e}")
 
     def _extract_file_id(self, msg) -> str:
+        """从消息中提取 bot file_id。
+
+        警告: pack_bot_file_id 使用中继账号的 MTProto 会话生成 file_id，
+        这些 file_id 可能无法被 bot 账号直接使用（Telegram file_id 与账号绑定）。
+        dsp_bot 在发送时已使用 copy_message 作为兜底方案，因此本风险部分缓解。
+        """
         if not msg or not msg.media:
             return ""
         try:
@@ -1211,6 +1217,12 @@ class UserRelay:
             from database import get_file_records_col
             col = get_file_records_col()
             await col.delete_one({"file_code": code})
+            # N-M13: 同时删除 SQLite 本地缓存和内存缓存，防止 RENEW 循环
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            await store.delete_file_record_local(code)
+            from database.cache import get_file_record_cache
+            get_file_record_cache().invalidate(f"file:{code}")
             if self._decoder_bot_entity:
                 await self._client.send_message(
                     self._decoder_bot_entity,

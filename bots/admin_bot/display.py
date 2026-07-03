@@ -18,23 +18,33 @@ from utils.shared_counters import status_counters as _status_counters
 import utils.shared_counters as _shared_counters
 
 # ── cells 缓存：admin 面板频繁刷新，加 60s 缓存避免每次点按钮都查 CRDB ──
-_cells_cache: tuple[float, list[dict]] | None = None
+# N-M12: 缓存键包含 status_filter + sort_key，避免不同视图共享错误缓存
+_cells_cache: dict[tuple, tuple[float, list[dict]]] = {}
 _CELLS_CACHE_TTL = 60  # 秒
+
+
+def _make_cells_cache_key(status_filter: dict | None, sort_key: str) -> tuple:
+    """生成 cells 缓存键，包含 status_filter 和 sort_key。"""
+    if status_filter:
+        return (frozenset(status_filter.items()), sort_key)
+    return (None, sort_key)
 
 
 async def _get_cells_cached(status_filter: dict | None = None, sort_key: str = "slot_id") -> list[dict]:
     """带 60s 缓存的 cells 查询，admin 面板用。0 RU（复用 SQLite）或 1 RU（CRDB 兜底）。"""
     global _cells_cache
     now = time.time()
-    if _cells_cache and (now - _cells_cache[0]) < _CELLS_CACHE_TTL:
-        return _cells_cache[1]
+    cache_key = _make_cells_cache_key(status_filter, sort_key)
+    cached = _cells_cache.get(cache_key)
+    if cached and (now - cached[0]) < _CELLS_CACHE_TTL:
+        return cached[1]
     from database import get_cells_col
     from database.session import get_active_cells_local
     # 优先走 SQLite 快照（0 RU）
     try:
         cells = await get_active_cells_local()
         if cells:
-            _cells_cache = (now, cells)
+            _cells_cache[cache_key] = (now, cells)
             return cells
     except Exception:
         pass
@@ -48,7 +58,7 @@ async def _get_cells_cached(status_filter: dict | None = None, sort_key: str = "
                      "file_count", "rotation_started_at", "last_heartbeat",
                      "degrade_count", "created_at", "updated_at"],
     )
-    _cells_cache = (now, cells)
+    _cells_cache[cache_key] = (now, cells)
     return cells
 
 

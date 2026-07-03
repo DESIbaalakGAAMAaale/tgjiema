@@ -729,6 +729,10 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply_text(update.message, "系统繁忙，文件发送请求失败，请稍后重试")
         return
 
+    # 投递成功后才递增配额（避免投递失败时配额已扣）
+    from services.permission import increment_user_quota_used
+    await increment_user_quota_used(user.id, is_external=False)
+
     await safe_reply_text(
         update.message,
         f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
@@ -763,6 +767,10 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 60 秒防抖
     key = f"{reporter.id}:{file_code}"
     now = time.time()
+    # N-L9: 同时清理过期条目（>120s），防止字典无限增长
+    stale = [k for k, v in _report_debounce.items() if now - v > 120]
+    for k in stale:
+        _report_debounce.pop(k, None)
     if key in _report_debounce and now - _report_debounce[key] < 60:
         await query.answer("已提交举报，请勿重复操作", show_alert=True)
         return
@@ -869,9 +877,8 @@ async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total_rows == 0:
             await safe_reply_text(update.message, "您还没有上传过文件码。")
             return
-        # 写入基线
-        from utils.shared_counters import status_counters
-        status_counters[f"user_code_count:{user.id}"] = total_rows
+        # N-M15: 将基线传入 get_user_code_count，确保后续调用使用正确基线
+        total_rows = get_user_code_count(user.id, base=total_rows)
 
     total_pages = max(1, (total_rows + _PAGE_SIZE - 1) // _PAGE_SIZE)
     page = min(page, total_pages)
@@ -1312,6 +1319,13 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
             decr_user_code_count(user.id, 1)
         except Exception:
             pass
+    else:
+        # N-L8: 恢复上架时递增用户码计数，与下架对称
+        try:
+            from utils.shared_counters import incr_user_code_count
+            incr_user_code_count(user.id, 1)
+        except Exception:
+            pass
     # E7: 失效用户码列表缓存
     from database.cache import invalidate_user_codes
     invalidate_user_codes(user.id)
@@ -1508,6 +1522,14 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
     if bot_username is None and result:
         bot_username = result.external_bot_username
 
+    # ── 配额检查（仅检查不递增，投递成功后再递增）──
+    if result is None:
+        from services.permission import check_decode_permission
+        result = await check_decode_permission(user_id, code)
+        if not result.allowed:
+            await safe_reply_text(update.message, result.reason)
+            return
+
     original_code = context.user_data.pop("_original_external_code", None)
     if original_code:
         code = original_code
@@ -1533,6 +1555,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             protect_content = file_record.get("protect_content", False)
             try:
                 await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str, protect_content)
+                # 投递成功后才递增配额
+                from services.permission import increment_user_quota_used
+                await increment_user_quota_used(user_id, is_external=True)
                 await safe_reply_text(update.message,
                     f"文件{code} 已缓正在发请查收。\n"
                     f"(系统 {system_code})"
@@ -1573,6 +1598,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         if ok:
             await relay_pool.release_account(account, duration_ms)
             _enqueue_external(bot_username, user_id, code)
+            # 投递成功后才递增配额
+            from services.permission import increment_user_quota_used
+            await increment_user_quota_used(user_id, is_external=True)
             await safe_reply_text(update.message, f"正在查询外部文件请稍候查收。\n{remaining_info}")
             metrics.decode_count += 1
             await metrics.record_processed("idx_bot")
@@ -1584,6 +1612,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
     try:
         await safe_send_message(context.bot, chat_id=bot_username, text=code)
         _enqueue_external(bot_username, user_id, code)
+        # 投递成功后才递增配额
+        from services.permission import increment_user_quota_used
+        await increment_user_quota_used(user_id, is_external=True)
         await safe_reply_text(update.message, f"正在查询外部文件请稍候查收。\n{remaining_info}")
         metrics.decode_count += 1
         await metrics.record_processed("idx_bot")

@@ -28,6 +28,11 @@ _LOGIN_LIMIT_MAX = 5        # 最多 5 次失败
 # 每个登录会话独立 token，防止跨站请求伪造
 _csrf_tokens: dict[str, str] = {}
 
+# M7: TTL 缓存 — 无筛选条件的 count_documents 走 CRDB 很贵，60s 缓存
+# 仅缓存 {}, 有搜索条件时仍需 CRDB（regex 等无法缓存）
+_count_cache: dict[str, tuple[float, int]] = {}
+_COUNT_CACHE_TTL = 60  # 秒
+
 
 def _get_csrf_token(username: str = "") -> str:
     """获取或生成当前会话的 CSRF token。"""
@@ -40,16 +45,13 @@ def _get_csrf_token(username: str = "") -> str:
 
 def _verify_csrf(request: Request, form_token: str = None) -> bool:
     """验证 CSRF token:对比表单中的 csrf_token 和 cookie 中的 csrf_token。
-    服务重启后 cookie 中的旧 token 会失效，此时以表单 token 为准（表单 token 是当前页面生成的）。"""
+    要求 cookie token 在服务端已注册且与表单 token 一致。"""
     cookie_token = request.cookies.get("csrf_token", "")
     if not cookie_token or not form_token:
         return False
-    # cookie token 必须在服务端已注册（防止伪造）
+    # cookie token 必须在服务端已注册（防止伪造），且必须与表单 token 一致
     if cookie_token in _csrf_tokens.values():
         return cookie_token == form_token
-    # 服务重启后 cookie 失效，fallback: 表单 token 是当前实例生成的，接受它
-    if form_token in _csrf_tokens.values():
-        return True
     return False
 
 
@@ -210,7 +212,17 @@ async def users_page(
                 {"first_name": {"$regex": search, "$options": "i"}},
             ]
 
-    total = await users_col.count_documents(query)
+    # M7: 无筛选条件时走 60s TTL 缓存，避免每次翻页都 count_documents CRDB
+    if not search:
+        now = _time.time()
+        cached = _count_cache.get("users")
+        if cached and (now - cached[0]) < _COUNT_CACHE_TTL:
+            total = cached[1]
+        else:
+            total = await users_col.count_documents({})
+            _count_cache["users"] = (now, total)
+    else:
+        total = await users_col.count_documents(query)
     skip = (page - 1) * per_page
     users = await users_col.find(query, sort=("created_at", -1), skip=skip, limit=per_page)
 
@@ -318,7 +330,17 @@ async def files_page(
         else:
             query["file_code"] = {"$regex": search, "$options": "i"}
 
-    total = await files_col.count_documents(query)
+    # M7: 无筛选条件时走 60s TTL 缓存
+    if not search:
+        now = _time.time()
+        cached = _count_cache.get("files")
+        if cached and (now - cached[0]) < _COUNT_CACHE_TTL:
+            total = cached[1]
+        else:
+            total = await files_col.count_documents({})
+            _count_cache["files"] = (now, total)
+    else:
+        total = await files_col.count_documents(query)
     skip = (page - 1) * per_page
     files = await files_col.find(query, sort=("create_time", -1), skip=skip, limit=per_page)
 
@@ -368,7 +390,14 @@ async def logs_page(
     per_page = 50
     logs_col = get_decode_logs_col()
 
-    total = await logs_col.count_documents({})
+    # M7: logs 无筛选条件，走 60s TTL 缓存
+    now = _time.time()
+    cached = _count_cache.get("logs")
+    if cached and (now - cached[0]) < _COUNT_CACHE_TTL:
+        total = cached[1]
+    else:
+        total = await logs_col.count_documents({})
+        _count_cache["logs"] = (now, total)
     skip = (page - 1) * per_page
     logs = await logs_col.find(sort=("request_time", -1), skip=skip, limit=per_page)
 

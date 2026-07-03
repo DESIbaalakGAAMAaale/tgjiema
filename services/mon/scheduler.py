@@ -22,7 +22,7 @@ def _load_mon_config():
     mon_cfg = config.get("mon", {})
     return {
         "heartbeat_interval": mon_cfg.get("heartbeat_interval", 30),
-        "heartbeat_timeout": mon_cfg.get("heartbeat_timeout", 240),
+        "heartbeat_timeout": mon_cfg.get("heartbeat_timeout", 90),
         "degrade_cooldown": mon_cfg.get("degrade_cooldown", 300),
         "r100_managed": mon_cfg.get("r100_managed", False),
     }
@@ -88,16 +88,6 @@ class MonScheduler:
                 cooldown = 600
             else:
                 cooldown = 1200
-
-            last_hb = active_slot.get("last_heartbeat", "")
-            if last_hb:
-                try:
-                    hb_time = _dt.datetime.fromisoformat(last_hb)
-                    elapsed = (_dt.datetime.now(_dt.timezone.utc) - hb_time).total_seconds()
-                    if elapsed < cooldown:
-                        continue
-                except (ValueError, TypeError):
-                    pass
 
             if is_r100 and not self.r100_managed:
                 alerts.append(

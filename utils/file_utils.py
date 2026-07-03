@@ -15,7 +15,7 @@ def detect_file_type(update: Update) -> str:
     if update.message.audio:
         return "audio"
     if update.message.voice:
-        return "audio"
+        return "voice"
     if update.message.animation:
         return "animation"
     return "document"
@@ -34,7 +34,7 @@ def extract_file_meta(update: Update) -> dict:
     if msg.audio:
         return {"type": "audio", "file_id": msg.audio.file_id}
     if msg.voice:
-        return {"type": "audio", "file_id": msg.voice.file_id}
+        return {"type": "voice", "file_id": msg.voice.file_id}
     if msg.animation:
         return {"type": "animation", "file_id": msg.animation.file_id}
     return {"type": "document", "file_id": ""}

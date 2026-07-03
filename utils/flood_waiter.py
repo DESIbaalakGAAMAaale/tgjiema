@@ -8,7 +8,7 @@ import random
 import time
 from loguru import logger
 
-from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
 
 # 按账号隔离的退避状态：key 为 bot_id，value 为退避截止时间戳
 _backoff_until: dict[int, float] = {}
@@ -68,6 +68,14 @@ async def api_call_with_backoff(coro_factory, description: str = "", bot_id: int
                 f"(第 {floods} 次连续触发)"
             )
             await asyncio.sleep(total_wait)
+
+        except BadRequest as e:
+            # C3: "message not found" 类错误重试无意义，直接抛出
+            # 常见于 failover/rotation 后 shadow 频道没有历史文件
+            logger.warning(
+                f"[BadRequest] bot_id={bot_id} {description}: {e}"
+            )
+            raise
 
         except (TimedOut, NetworkError) as e:
             wait = 2 ** attempt  # 指数退避: 2s, 4s, 8s, 16s, 32s
