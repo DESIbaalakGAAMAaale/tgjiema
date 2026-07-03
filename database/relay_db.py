@@ -358,7 +358,7 @@ class RelayDB:
             last_at = datetime.fromisoformat(row[1])
         except (ValueError, TypeError):
             return 0
-        elapsed = (datetime.now(datetime.timezone.utc) - last_at).total_seconds()
+        elapsed = (datetime.now(timezone.utc) - last_at).total_seconds()
         return max(0, row[0] - elapsed)
 
     async def set_bot_cooldown(self, bot_username: str, cooldown_seconds: int):

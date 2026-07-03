@@ -1055,6 +1055,13 @@ async def get_relay_config() -> dict:
     api_id = await _get_config("relay_api_id")
     api_hash = await _get_config("relay_api_hash")
     phone = await _get_config("relay_phone")
+    # N19-2: config 表中 api_hash 已加密存储，读取时解密
+    if api_hash:
+        try:
+            from .relay_db import decrypt
+            api_hash = decrypt(api_hash)
+        except (RuntimeError, ImportError):
+            pass  # 兼容旧明文数据或解密失败
     return {
         "api_id": int(api_id) if api_id else 0,
         "api_hash": api_hash or "",
@@ -1063,6 +1070,13 @@ async def get_relay_config() -> dict:
 
 
 async def set_relay_config(api_id: int, api_hash: str, phone: str):
+    # N19-2: api_hash 入云前加密，与 S-1 relay_accounts 对齐
+    if api_hash:
+        try:
+            from .relay_db import encrypt
+            api_hash = encrypt(api_hash)
+        except (RuntimeError, ImportError, AttributeError):
+            pass  # 加密不可用时保持明文（极端情况）
     if api_id:
         await _set_config("relay_api_id", str(api_id))
     if api_hash:
