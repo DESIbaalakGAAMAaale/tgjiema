@@ -904,6 +904,7 @@ _rotate_log_col = D1Collection("rotate_log")
 _spare_pool_col = D1Collection("spare_pool")
 _rotation_config_col = D1Collection("rotation_config")
 _external_code_mapping_col = D1Collection("external_code_mapping")
+_relay_accounts_col = D1Collection("relay_accounts")
 
 
 def get_users_col() -> D1Collection:
@@ -1533,6 +1534,36 @@ def get_spare_pool_col() -> D1Collection:
 
 def get_rotation_config_col() -> D1Collection:
     return _rotation_config_col
+
+
+# N21-1: 通用按表名获取 D1Collection，替代已删除的 get_collection
+# 仅供 relay_pending 和 _ensure_telethon_client 等少数场景使用
+_COLLECTION_REGISTRY = {
+    "users": _users_col,
+    "file_records": _file_records_col,
+    "decode_logs": _decode_logs_col,
+    "pending_uploads": _pending_uploads_col,
+    "send_queue": _send_queue_col,
+    "backup_config": _backup_config_col,
+    "code_bot_mapping": _code_bot_mapping_col,
+    "message_backups": _message_backups_col,
+    "cells": _cells_col,
+    "codes": _codes_col,
+    "jobs": _jobs_col,
+    "rotate_log": _rotate_log_col,
+    "spare_pool": _spare_pool_col,
+    "rotation_config": _rotation_config_col,
+    "external_code_mapping": _external_code_mapping_col,
+    "relay_accounts": _relay_accounts_col,
+}
+
+
+def get_collection(name: str) -> D1Collection:
+    """按表名获取对应的 D1Collection 实例。"""
+    col = _COLLECTION_REGISTRY.get(name)
+    if col is None:
+        raise ValueError(f"未知的表名: {name}，可用: {list(_COLLECTION_REGISTRY.keys())}")
+    return col
 
 
 # ─── 备用池操作──────────────────────────────────────────────────

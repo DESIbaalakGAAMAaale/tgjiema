@@ -332,7 +332,7 @@ class MonBot:
                 logger.debug(f"[Mon] lost 频道 {slot_id} 仍不可用: {e}")
 
         if recovered > 0:
-            await store._bump_cells_version()
+            # N21-2: 移除冗余 _bump_cells_version()，update_cell_fields_local 已内部 bump
             await self._notify_admin(
                 f"🔄 lost 频道恢复\n\n"
                 f"共恢复 {recovered} 个频道为 shadow2\n"
