@@ -326,7 +326,9 @@ class MonScheduler:
         """核心功能:将每个 Active 槽的新消息复制到同组的 Shadow 槽位 + R100 全量归档。
 
         这是 Mon 的「写入」职责——替代原 backup_bot 的文件备份功能。
-        R100 作为最终全量归档，接收所有 Active 写入的消息（不重复写入）。
+        R100 作为最终全量归档，使用独立游标确保复制必须成功：
+        - R100 复制失败 → 游标不推进 → 下个周期自动重试
+        - Shadow 游标不受 R100 影响，主流程不阻塞
         返回复制的消息总数。
 
         Args:
@@ -345,7 +347,6 @@ class MonScheduler:
                 continue
 
             a_slot, s1_slot, s2_slot = group
-            # 1. 复制到同组的 shadow1/shadow2
             shadows = [s for s in (s1_slot, s2_slot) if s and s.get("status") in ("shadow1", "shadow2")]
 
             slot_id = active_slot["slot_id"]
@@ -356,9 +357,10 @@ class MonScheduler:
             if not new_messages:
                 continue
 
+            # 1. 复制到同组的 shadow1/shadow2
             # N-16-2: 仅将游标推进到「所有影子都成功复制」的最大 msg_id
             # 避免某条消息复制失败后被永久跳过
-            shadow_max_ids = []  # 每个影子成功复制的最大 msg_id
+            shadow_max_ids = []
             for shadow in shadows:
                 copied, mappings = await self._copy_messages(
                     bot_instance, active_slot["channel_id"],
@@ -370,22 +372,34 @@ class MonScheduler:
                         active_slot["channel_id"], shadow["channel_id"], mappings
                     )
                     shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
-
-            # 2. 额外复制到 R100 全量归档（如果配置了 R100）
-            if r100_slot and new_messages:
-                copied_r100, mappings_r100 = await self._copy_messages(
-                    bot_instance, active_slot["channel_id"],
-                    r100_slot["channel_id"], new_messages,
-                )
-                total_copied += copied_r100
-                if mappings_r100:
-                    await self._write_backup_mappings(
-                        active_slot["channel_id"], r100_slot["channel_id"], mappings_r100
-                    )
-
             if shadow_max_ids:
-                # 取所有影子中最小的成功最大 id，确保失败的消息不会被跳过
                 self._cursor_cache[slot_id] = min(shadow_max_ids)
+
+            # 2. 复制到 R100 全量归档（独立游标，必须成功）
+            if r100_slot:
+                r100_cursor_key = f"{slot_id}_r100"
+                r100_last_cursor = self._cursor_cache.get(r100_cursor_key) or 0
+                r100_new_messages = await self._fetch_new_messages(
+                    bot_instance, active_slot["channel_id"], r100_last_cursor
+                )
+                if r100_new_messages:
+                    copied_r100, mappings_r100 = await self._copy_messages(
+                        bot_instance, active_slot["channel_id"],
+                        r100_slot["channel_id"], r100_new_messages,
+                    )
+                    total_copied += copied_r100
+                    if mappings_r100:
+                        await self._write_backup_mappings(
+                            active_slot["channel_id"], r100_slot["channel_id"], mappings_r100
+                        )
+                        # R100 独立游标：只有成功才推进，失败则下周期重试
+                        self._cursor_cache[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
+                    else:
+                        logger.warning(
+                            f"[Mon] R100 复制失败 slot={slot_id} "
+                            f"channel={active_slot['channel_id']}→{r100_slot['channel_id']}，"
+                            f"游标保持 {r100_last_cursor}，下周期重试"
+                        )
 
         if self._replicate_count % self._cursor_flush_interval == 0:
             await self._flush_cursor_cache()
@@ -393,13 +407,16 @@ class MonScheduler:
         return total_copied
 
     async def _flush_cursor_cache(self):
-        """批量 flush 本地缓存的游标到 SQLite（零 CRDB RU）。只 flush 自上次以来有变化的游标。"""
+        """批量 flush 本地缓存的游标到 SQLite（零 CRDB RU）。只 flush 自上次以来有变化的游标。
+        跳过 R100 独立游标（{slot_id}_r100），它们仅存内存，重启后从 0 重新追赶。"""
         if not self._cursor_cache:
             return
         from database.cache_store import get_cache_store
         store = get_cache_store()
         changed = 0
         for slot_id, cursor in self._cursor_cache.items():
+            if slot_id.endswith("_r100"):
+                continue
             if self._flushed_cursors.get(slot_id) == cursor:
                 continue
             try:
