@@ -376,20 +376,9 @@ class MonScheduler:
         故障切换时 dsp_bot 可据此查找影子频道中的新 msg_id。
         """
         try:
-            from database.session import get_message_backups_col
-            col = get_message_backups_col()
-            import datetime as _dt
-            now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+            from database.session import save_message_backup
             for main_msg_id, backed_msg_id in mappings:
-                try:
-                    await col.insert_one({
-                        "main_msg_id": main_msg_id,
-                        "backup_channel_id": backup_channel_id,
-                        "backed_msg_id": backed_msg_id,
-                        "backed_at": now,
-                    })
-                except Exception:
-                    pass  # 主键冲突忽略
+                await save_message_backup(main_msg_id, backup_channel_id, backed_msg_id)
         except Exception as e:
             logger.warning(f"[Mon] 写入 message_backups 映射失败: {e}")
 

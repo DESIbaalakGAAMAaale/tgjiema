@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
+import asyncio
 from pathlib import Path
 import datetime
 
@@ -15,17 +16,25 @@ from config import settings
 app = FastAPI(title="TG解码器管理后台")
 security = HTTPBasic()
 
+
+@app.on_event("startup")
+async def startup():
+    """启动时从 SQLite 恢复 CSRF token 和登录失败计数。"""
+    await _load_state_from_cache()
+
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # ─── 登录速率限制 ──────────────────────────────────────────────
 # IP -> [timestamps],记录 5 分钟内的失败时间戳
+# 主存为进程内存（读写快），辅助持久化到 SQLite 恢复重启后状态
 _login_failures: dict[str, list[float]] = {}
 _LOGIN_LIMIT_WINDOW = 300   # 5 分钟
 _LOGIN_LIMIT_MAX = 5        # 最多 5 次失败
 
 # ─── CSRF 保护 ─────────────────────────────────────────────────
 # 每个登录会话独立 token，防止跨站请求伪造
+# 主存为进程内存，辅助持久化到 SQLite 恢复重启后状态
 _csrf_tokens: dict[str, str] = {}
 
 # M7: TTL 缓存 — 无筛选条件的 count_documents 走 CRDB 很贵，60s 缓存
@@ -34,12 +43,56 @@ _count_cache: dict[str, tuple[float, int]] = {}
 _COUNT_CACHE_TTL = 60  # 秒
 
 
+async def _load_state_from_cache():
+    """从 SQLite 恢复 CSRF token 和登录失败计数（进程重启后恢复）。"""
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        # 恢复 CSRF token
+        csrf_data = await store.get("admin:csrf_tokens")
+        if csrf_data:
+            import json
+            _csrf_tokens.update(json.loads(csrf_data))
+        # 恢复登录失败计数
+        fail_data = await store.get("admin:login_failures")
+        if fail_data:
+            import json
+            loaded = json.loads(fail_data)
+            for ip, timestamps in loaded.items():
+                _login_failures[ip] = timestamps
+    except Exception:
+        pass
+
+
+async def _persist_csrf_tokens():
+    """异步持久化 CSRF token 到 SQLite（fire-and-forget）。"""
+    try:
+        from database.cache_store import get_cache_store
+        import json
+        store = get_cache_store()
+        await store.set("admin:csrf_tokens", json.dumps(_csrf_tokens))
+    except Exception:
+        pass
+
+
+async def _persist_login_failures():
+    """异步持久化登录失败计数到 SQLite（fire-and-forget）。"""
+    try:
+        from database.cache_store import get_cache_store
+        import json
+        store = get_cache_store()
+        await store.set("admin:login_failures", json.dumps(_login_failures))
+    except Exception:
+        pass
+
+
 def _get_csrf_token(username: str = "") -> str:
     """获取或生成当前会话的 CSRF token。"""
     if not username:
         return ""
     if username not in _csrf_tokens:
         _csrf_tokens[username] = secrets.token_hex(32)
+        asyncio.ensure_future(_persist_csrf_tokens())
     return _csrf_tokens[username]
 
 
@@ -71,6 +124,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     ]
     if not _login_failures[client_ip]:
         del _login_failures[client_ip]
+        asyncio.ensure_future(_persist_login_failures())
     elif len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
@@ -88,10 +142,12 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     if not (correct_username and correct_password):
         # 记录失败
         _login_failures[client_ip].append(now)
+        asyncio.ensure_future(_persist_login_failures())
         raise HTTPException(status_code=401, detail="未授权访问")
 
     # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)
+    asyncio.ensure_future(_persist_login_failures())
     return credentials.username
 
 

@@ -214,6 +214,7 @@ async def resolve_backup_msg_id(main_msg_id: int, channel_id: int) -> int:
                 logger.debug(f"[delivery] msg_id 映射: {main_msg_id} → {backed_id} (channel={channel_id})")
                 return backed_id
     except Exception:
+        logger.debug(f"[delivery] 查询 message_backups 映射失败 (main_msg_id={main_msg_id}, channel={channel_id})")
         pass
     return main_msg_id
 
