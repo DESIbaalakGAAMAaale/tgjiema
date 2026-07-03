@@ -110,8 +110,15 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
 
 @app.get("/health")
 async def health_check():
-    """健康检查端点(无需认证),供 Docker healthcheck 和负载均衡器使用。"""
-    return {"status": "ok", "bots": {name: h.is_running for name, h in metrics.bots.items()}}
+    """健康检查端点(无需认证),供 Docker healthcheck 和负载均衡器使用。
+    读取 SQLite 共享心跳表，反映所有 Bot 进程的真实状态。
+    """
+    from database.cache_store import get_all_bot_heartbeats
+    beats = await get_all_bot_heartbeats()
+    bot_status = {}
+    for name, info in beats.items():
+        bot_status[name] = info.get("is_running", False)
+    return {"status": "ok", "bots": bot_status}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -372,21 +379,17 @@ async def logs_page(
 
 @app.get("/health-page", response_class=HTMLResponse)
 async def health_page(request: Request, admin=Depends(verify_admin)):
+    from database.cache_store import get_all_bot_heartbeats
+    beats = await get_all_bot_heartbeats()
     bot_statuses = []
-    for name, health in metrics.bots.items():
+    for name, info in beats.items():
         bot_statuses.append(
             {
                 "name": name,
-                "is_running": health.is_running,
-                "last_ping": (
-                    datetime.datetime.fromtimestamp(health.last_ping).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    )
-                    if health.last_ping
-                    else "N/A"
-                ),
-                "total_processed": health.total_processed,
-                "total_errors": health.total_errors,
+                "is_running": info.get("is_running", False),
+                "last_ping": info.get("last_ping", "N/A"),
+                "total_processed": info.get("total_processed", 0),
+                "total_errors": info.get("total_errors", 0),
             }
         )
     return _make_csrf_response(

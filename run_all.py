@@ -145,7 +145,8 @@ def _monitor_and_restart(processes: dict, running_flag: multiprocessing.Value):
                 logger.warning(f"[RunAll] {name} 进程已退出 (exitcode={exitcode})")
 
                 if exitcode is not None and exitcode == 0:
-                    logger.info(f"[RunAll] {name} 正常退出 (exitcode=0),跳过重启")
+                    logger.info(f"[RunAll] {name} 正常退出 (exitcode=0),从监控列表移除")
+                    processes.pop(name, None)
                     continue
 
                 # 限流检查:窗口内重启次数

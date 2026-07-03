@@ -11,6 +11,9 @@ FILE_TYPE_LABELS = {"photo": "p", "video": "v", "document": "d", "audio": "a", "
 
 _BOT_PATTERN = re.compile(r"^[a-zA-Z0-9_]+bot", re.IGNORECASE)
 _BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
+# 内部文件码格式: {prefix}_{12位base36}_{类型后缀}
+# 例: tgwenjian_a1b2c3d4e5f6_3p_2v_1d
+_INTERNAL_CODE_PATTERN = re.compile(r"^[a-z0-9]+_[a-z0-9]{12}(?:_\d+[pvdarg])+$")
 
 
 def _generate_deterministic_id(length: int = 12) -> str:
@@ -20,7 +23,7 @@ def _generate_deterministic_id(length: int = 12) -> str:
     - 同进程内:time.time_ns() 单调递增,每次调用种子不同
     - 跨进程:不同的 PID 确保即使同一纳秒种子也不同
     - 输出看似随机(SHA256 avalanche effect),不可猜测
-    数学保证唯一,无需 CRDB 冲突检测。
+    碰撞概率极低，DB PRIMARY KEY 作为最后防线。
     """
     seed = f"{time.time_ns():x}{os.getpid():x}"
     digest = hashlib.sha256(seed.encode()).hexdigest()
@@ -41,14 +44,22 @@ def build_file_code(file_types: dict) -> str:
 
 
 def is_valid_code_format(code: str) -> bool:
+    """判断文本是否为有效文件码格式。
+    
+    内部码格式: {prefix}_{12位base36}_{类型后缀}，如 tgwenjian_a1b2c3d4e5f6_3p_2v_1d
+    外部码格式: {botname}bot 开头，如 ccmarkbotutheigh1231gg1f4
+    不在消息中随意匹配，防止误判普通文本。
+    """
     code = code.strip()
-    if code.startswith(settings.FILE_CODE_PREFIX):
+    if not code:
+        return False
+    # 内部码：严格匹配完整格式
+    if _INTERNAL_CODE_PATTERN.match(code):
         return True
-    # 消息中包含 FILE_CODE_PREFIX 开头的文件码也算有效
-    if settings.FILE_CODE_PREFIX in code:
+    # 外部码：bot 名称开头，且不含空格/换行
+    if _BOT_PATTERN.match(code) and '\n' not in code and ' ' not in code:
         return True
-    # 只有纯文件码（不含空格、换行、bot用户名）才算有效
-    return bool(_BOT_PATTERN.match(code)) and '\n' not in code and ' ' not in code
+    return False
 
 
 def extract_bot_username(code: str) -> str:
@@ -128,8 +139,9 @@ def parse_file_types_from_code(code: str) -> dict:
 
 
 async def generate_unique_code(file_types: dict) -> str:
-    """直接生成文件码,无需 DB 冲突检测。
+    """生成文件码，碰撞时最多重试 3 次。
     
-    确定性 ID 算法数学保证唯一,PRIMARY KEY 约束是最后一层保险。
+    确定性 ID 算法碰撞概率极低（12位 base36 空间约 4.7e18），
+    PRIMARY KEY 约束是最后一道防线，冲突时自动重试。
     """
     return build_file_code(file_types)

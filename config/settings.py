@@ -207,6 +207,22 @@ class Settings(BaseSettings):
                 "Telegram 超级群/频道 ID 通常是 -100 开头的负数，请确认配置正确。"
             )
 
+        # ── Admin Web 安全校验：拒绝默认/空密码 ──
+        if not self.ADMIN_USERNAME:
+            raise ValueError(
+                "[Settings] ADMIN_USERNAME 未配置。请在 .env 中设置管理员用户名。"
+            )
+        if not self.ADMIN_PASSWORD or self.ADMIN_PASSWORD == "CHANGE_ME_NOW":
+            raise ValueError(
+                "[Settings] ADMIN_PASSWORD 未配置或仍为默认值 'CHANGE_ME_NOW'。"
+                "请在 .env 中设置一个安全的密码。"
+            )
+        if self.ADMIN_WEB_HOST != "127.0.0.1" and len(self.ADMIN_PASSWORD) < 12:
+            raise ValueError(
+                "[Settings] ADMIN_WEB_HOST 非本地回环地址时，"
+                "ADMIN_PASSWORD 长度必须 >= 12 字符以确保安全。"
+            )
+
         return self
 
     @property
