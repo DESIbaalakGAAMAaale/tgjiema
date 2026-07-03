@@ -11,9 +11,10 @@ FILE_TYPE_LABELS = {"photo": "p", "video": "v", "document": "d", "audio": "a", "
 
 _BOT_PATTERN = re.compile(r"^[a-zA-Z0-9_]+bot", re.IGNORECASE)
 _BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
-# 内部文件码格式: {prefix}_{12位base36}_{类型后缀}
-# 例: tgwenjian_a1b2c3d4e5f6_3p_2v_1d
-_INTERNAL_CODE_PATTERN = re.compile(r"^[a-z0-9]+_[a-z0-9]{12}(?:_\d+[pvdarg])+$")
+# 内部文件码后缀格式: {12位base36}_{类型后缀}
+# 例: a1b2c3d4e5f6_3p_2v_1d
+# 前缀由 settings.FILE_CODE_PREFIX 动态校验，不在此正则中硬编码
+_INTERNAL_CODE_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]{12}(?:_\d+[pvdarg])+$")
 
 
 def _generate_deterministic_id(length: int = 12) -> str:
@@ -53,9 +54,12 @@ def is_valid_code_format(code: str) -> bool:
     code = code.strip()
     if not code:
         return False
-    # 内部码：严格匹配完整格式
-    if _INTERNAL_CODE_PATTERN.match(code):
-        return True
+    # 内部码：前缀严格匹配 settings.FILE_CODE_PREFIX，后缀校验格式
+    prefix = settings.FILE_CODE_PREFIX
+    if code.startswith(prefix + "_"):
+        suffix = code[len(prefix) + 1:]
+        if _INTERNAL_CODE_SUFFIX_PATTERN.match(suffix):
+            return True
     # 外部码：bot 名称开头，且不含空格/换行
     if _BOT_PATTERN.match(code) and '\n' not in code and ' ' not in code:
         return True
@@ -139,9 +143,5 @@ def parse_file_types_from_code(code: str) -> dict:
 
 
 async def generate_unique_code(file_types: dict) -> str:
-    """生成文件码，碰撞时最多重试 3 次。
-    
-    确定性 ID 算法碰撞概率极低（12位 base36 空间约 4.7e18），
-    PRIMARY KEY 约束是最后一道防线，冲突时自动重试。
-    """
+    """生成文件码。碰撞概率极低，数据库 PRIMARY KEY 是最后防线。"""
     return build_file_code(file_types)

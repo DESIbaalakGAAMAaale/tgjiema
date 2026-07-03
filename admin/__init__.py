@@ -1,7 +1,7 @@
 import time as _time
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
@@ -109,16 +109,24 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(response: Response):
     """健康检查端点(无需认证),供 Docker healthcheck 和负载均衡器使用。
-    读取 SQLite 共享心跳表，反映所有 Bot 进程的真实状态。
+    读取 SQLite 共享心跳表，任一关键 Bot 离线时返回 503。
     """
     from database.cache_store import get_all_bot_heartbeats
+    required = {"up", "idx", "dsp", "mon", "admin_bot"}
     beats = await get_all_bot_heartbeats()
-    bot_status = {}
-    for name, info in beats.items():
-        bot_status[name] = info.get("is_running", False)
-    return {"status": "ok", "bots": bot_status}
+    bot_status = {
+        name: beats.get(name, {}).get("is_running", False)
+        for name in required
+    }
+    healthy = all(bot_status.values())
+    if not healthy:
+        response.status_code = 503
+    return {
+        "status": "ok" if healthy else "degraded",
+        "bots": bot_status,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
