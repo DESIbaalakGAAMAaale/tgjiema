@@ -323,9 +323,10 @@ class MonScheduler:
             await log_rotate(*entry)
 
     async def replicate_all_active_to_shadows(self, bot_instance, all_cells: list[dict]) -> int:
-        """核心功能:将每个 Active 槽的新消息复制到同组的 Shadow 槽位。
+        """核心功能:将每个 Active 槽的新消息复制到同组的 Shadow 槽位 + R100 全量归档。
 
         这是 Mon 的「写入」职责——替代原 backup_bot 的文件备份功能。
+        R100 作为最终全量归档，接收所有 Active 写入的消息（不重复写入）。
         返回复制的消息总数。
 
         Args:
@@ -335,15 +336,17 @@ class MonScheduler:
         groups = self._group_slots(all_cells)
         total_copied = 0
 
+        # 找到 R100 槽位（全量归档用）
+        r100_slot = next((c for c in all_cells if c.get("is_r100", 0) == 1 and c.get("status") == "r100"), None)
+
         for _group_key, group in groups.items():
             active_slot = self._find_active_slot(group)
             if not active_slot:
                 continue
 
             a_slot, s1_slot, s2_slot = group
+            # 1. 复制到同组的 shadow1/shadow2
             shadows = [s for s in (s1_slot, s2_slot) if s and s.get("status") in ("shadow1", "shadow2")]
-            if not shadows:
-                continue
 
             slot_id = active_slot["slot_id"]
             last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
@@ -367,6 +370,19 @@ class MonScheduler:
                         active_slot["channel_id"], shadow["channel_id"], mappings
                     )
                     shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
+
+            # 2. 额外复制到 R100 全量归档（如果配置了 R100）
+            if r100_slot and new_messages:
+                copied_r100, mappings_r100 = await self._copy_messages(
+                    bot_instance, active_slot["channel_id"],
+                    r100_slot["channel_id"], new_messages,
+                )
+                total_copied += copied_r100
+                if mappings_r100:
+                    await self._write_backup_mappings(
+                        active_slot["channel_id"], r100_slot["channel_id"], mappings_r100
+                    )
+
             if shadow_max_ids:
                 # 取所有影子中最小的成功最大 id，确保失败的消息不会被跳过
                 self._cursor_cache[slot_id] = min(shadow_max_ids)
