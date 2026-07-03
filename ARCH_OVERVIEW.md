@@ -227,12 +227,12 @@
    └──────────────┘
 ```
 
-## 九、部署只需 2 步
+## 九、部署只需 3 步
 
 ```bash
-# 1. 编辑 config/groups.yaml（填 5 个账号各 9 个频道 ID + R100 频道 ID）
+# 1. cp .env.example .env 并编辑 .env，填入 5 个账号各 9 个频道 ID + Bot Token 等配置
 # 2. 一键部署
-.\deploy.ps1
+bash deploy_vps_per_bot.sh
 ```
 
 ---
