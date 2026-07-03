@@ -400,6 +400,7 @@ class MonScheduler:
             logger.warning(f"[Mon][复制] Telethon 获取频道 {channel_id} 消息失败: {e}")
         
         # 回退到 get_updates
+        logger.warning(f"[Mon][复制] Telethon 不可用，回退到 get_updates 获取频道 {channel_id} 消息（建议排查 Telethon 连接）")
         try:
             updates = await bot_instance.get_updates(
                 offset=-100,

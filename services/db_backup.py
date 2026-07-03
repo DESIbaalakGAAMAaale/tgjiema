@@ -12,11 +12,11 @@ from storage.r2 import _r2 as r2_storage
 SMALL_TABLES = {
     "cells", "users", "spare_pool", "backup_config", "rotation_config",
     "relay_accounts", "code_bot_mapping", "external_code_mapping",
-    "kv_config",
+    "kv_config", "message_backups",
 }
 
 _LARGE_TABLES = {
-    "file_records", "codes", "decode_logs", "jobs", "message_backups",
+    "file_records", "codes", "decode_logs", "jobs",
     "pending_uploads", "rotate_log",
 }
 
@@ -33,7 +33,13 @@ def _redact_secrets(data: dict) -> dict:
     """脱敏备份数据中的敏感字段，不影响原始数据库。"""
     tables = data.get("tables", {})
     for table_name, rows in tables.items():
-        if table_name in ("backup_config", "relay_accounts"):
+        if table_name in ("backup_config", "kv_config"):
+            for row in rows:
+                # N-15-1: 按 config_key 匹配行级密钥（如 config_key="r2_secret_key" → config_value 脱敏）
+                config_key = (row.get("config_key") or "").lower()
+                if config_key in _SENSITIVE_FIELDS:
+                    row["config_value"] = _REDACTED_VALUE
+        if table_name == "relay_accounts":
             for row in rows:
                 for key in list(row.keys()):
                     if key.lower() in _SENSITIVE_FIELDS:

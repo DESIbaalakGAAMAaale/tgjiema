@@ -96,13 +96,17 @@ def _get_csrf_token(username: str = "") -> str:
     return _csrf_tokens[username]
 
 
-def _verify_csrf(request: Request, form_token: str = None) -> bool:
+def _verify_csrf(request: Request, form_token: str = None, username: str = "") -> bool:
     """验证 CSRF token:对比表单中的 csrf_token 和 cookie 中的 csrf_token。
-    要求 cookie token 在服务端已注册且与表单 token 一致。"""
+    要求 cookie token 与当前登录用户的 token 一致，且与表单 token 一致。"""
     cookie_token = request.cookies.get("csrf_token", "")
     if not cookie_token or not form_token:
         return False
-    # cookie token 必须在服务端已注册（防止伪造），且必须与表单 token 一致
+    # N-15-4: 按 username 精确绑定，而非 values() 全局匹配
+    if username:
+        expected_token = _csrf_tokens.get(username, "")
+        return secrets.compare_digest(cookie_token, expected_token) and secrets.compare_digest(cookie_token, form_token)
+    # 无 username 时回退到全局匹配（兼容旧逻辑）
     if cookie_token in _csrf_tokens.values():
         return cookie_token == form_token
     return False
@@ -305,7 +309,7 @@ async def update_membership(
     admin=Depends(verify_admin),
 ):
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token):
+    if not _verify_csrf(request, csrf_token, username=admin):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
     if level not in ("free", "basic", "premium"):
@@ -352,7 +356,7 @@ async def toggle_ban(
     admin=Depends(verify_admin),
 ):
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token):
+    if not _verify_csrf(request, csrf_token, username=admin):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
     users_col = get_users_col()
@@ -422,7 +426,7 @@ async def delete_file(
     admin=Depends(verify_admin),
 ):
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token):
+    if not _verify_csrf(request, csrf_token, username=admin):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
     files_col = get_file_records_col()

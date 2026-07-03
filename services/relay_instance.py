@@ -1,4 +1,4 @@
-﻿"""单个中继账号实例 — 独立 Telethon 客户端
+"""单个中继账号实例 — 独立 Telethon 客户端
 - 每个账号独立 TelegramClient + session 文件
 - 支持并发处理解码任务
 - session 文件持久化，VPS 重启后自动恢复
@@ -581,10 +581,10 @@ class RelayInstance:
             logger.error(f"[RelayInstance:{self.phone}] 翻页循环异常: {e}")
             await self._process_all_collected(bot_username)
         finally:
+            # N-15-6: 统一复位 is_busy，防止 CancelledError 等边缘路径导致永久 busy
+            self.is_busy = False
             if bot_username in self._bot_exchange:
                 self._bot_exchange[bot_username]["_ai_running"] = False
-            else:
-                self.is_busy = False
 
     def _make_decision(self, exchange: dict) -> dict:
         _NEXT_KW = ("next", "\u4e0b\u4e00\u9875", "\u4e0b\u4e00\u9801", "\u4e0b\u4e00\u7ec4",

@@ -167,6 +167,9 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
     # 排除 SERIAL 自增列（decode_logs.id / relay_accounts.id），避免恢复时序列不同步
     _serial_tables = {"decode_logs", "relay_accounts"}
     insert_cols = [c for c in columns if not (table in _serial_tables and c == "id")]
+    # N-15-3: relay_accounts.api_hash 备份中已脱敏，恢复时跳过该列，保留 DB 中现有值
+    _skip_cols_per_table = {"relay_accounts": {"api_hash"}}
+    insert_cols = [c for c in insert_cols if c not in _skip_cols_per_table.get(table, set())]
     placeholders = [f"${i + 1}" for i in range(len(insert_cols))]
     # 构建 ON CONFLICT ... DO UPDATE SET 子句
     update_parts = [f"{c} = EXCLUDED.{c}" for c in insert_cols if c != pk]
