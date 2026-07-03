@@ -367,7 +367,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
 
     # ── 使用 copy_message 发送 ──
     resolved = await resolve_delivery_channel(job.storage_channel_id)
-    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
+    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
 
     if not success:
         _record_channel_failure(resolved.channel_id)
@@ -379,7 +379,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             if next_resolved.channel_id in tried:
                 break
             tried.add(next_resolved.channel_id)
-            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
+            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
             if success:
                 break
             _record_channel_failure(next_resolved.channel_id)
@@ -388,7 +388,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
         # C3: 环形降级耗尽后,尝试原始存储频道(消息实际存储位置,即使已降级消息仍存在)
         if not success and job.storage_channel_id not in tried:
             logger.info(f"[Dsp] 环形降级耗尽,尝试原始存储频道: {job.storage_channel_id}")
-            success = await try_deliver(bot, job.target_user_id, job.storage_channel_id, msg_id, protect_content=protect_content, bot_id=bot_id)
+            success = await try_deliver(bot, job.target_user_id, job.storage_channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
 
     if success:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
@@ -468,7 +468,7 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     for i, mid in enumerate(job.storage_msg_ids):
         try:
             resolved = await resolve_delivery_channel(job.storage_channel_id)
-            if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id):
+            if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id):
                 metrics.send_success_count += 1
             else:
                 metrics.send_fail_count += 1
@@ -494,7 +494,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         for i, mid in enumerate(page_msg_ids):
             try:
                 resolved = await resolve_delivery_channel(storage_channel_id)
-                if not await try_deliver(bot, chat_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id):
+                if not await try_deliver(bot, chat_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id):
                     logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid})")
             except Exception as e:
                 logger.error(f"[Dsp] _send_page copy 异常 (msg={mid}): {e}")

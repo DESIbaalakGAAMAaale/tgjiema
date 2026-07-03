@@ -170,13 +170,16 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
     return DeliveryChannel(channel_id, "unknown", "fallback")
 
 
-async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False, bot_id: int = 1) -> bool:
+async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False, bot_id: int = 1, original_channel_id: int | None = None) -> bool:
     """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。
     
     如果 from_channel_id 是影子频道，会先查 message_backups 映射表获取正确的 backed_msg_id。
+    映射缺失时返回 False（禁止回退用主频道 msg_id 盲发，避免投错文件）。
     """
     # 查询影子频道 msg_id 映射（如果存在）
-    resolved_msg_id = await resolve_backup_msg_id(message_id, from_channel_id)
+    resolved_msg_id = await resolve_backup_msg_id(message_id, from_channel_id, original_channel_id)
+    if resolved_msg_id is None:
+        return False
     
     # 频道限流:检查是否超过 15 msg/min,循环等待直到拿到配额
     while True:
@@ -197,9 +200,12 @@ async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, m
         return False
 
 
-async def resolve_backup_msg_id(main_msg_id: int, channel_id: int) -> int:
+async def resolve_backup_msg_id(main_msg_id: int, channel_id: int, original_channel_id: int | None = None) -> int | None:
     """查询 message_backups 表，获取影子频道中对应的 msg_id。
-    如果无映射（该消息是直接存储而非复制），返回原始 main_msg_id。
+
+    当 channel_id 与原始存储频道不同（即从影子频道发送）且映射缺失时，
+    返回 None 禁止回退用主频道 msg_id 盲发（可能投错文件）。
+    当 channel_id 就是原始频道时，返回 main_msg_id 本身。
     """
     try:
         from database.session import get_message_backups_col
@@ -216,6 +222,14 @@ async def resolve_backup_msg_id(main_msg_id: int, channel_id: int) -> int:
     except Exception:
         logger.debug(f"[delivery] 查询 message_backups 映射失败 (main_msg_id={main_msg_id}, channel={channel_id})")
         pass
+
+    # 从影子频道发送但无映射 → 返回 None，禁止盲发
+    if original_channel_id is not None and channel_id != original_channel_id:
+        logger.warning(
+            f"[delivery] 影子频道映射缺失 (main_msg_id={main_msg_id}, "
+            f"channel={channel_id}, original={original_channel_id})，跳过该频道"
+        )
+        return None
     return main_msg_id
 
 
@@ -246,7 +260,7 @@ async def deliver_with_fallback(
                 current_channel = next_resolved.channel_id
                 tried_channels.add(current_channel)
 
-            ok = await try_deliver(bot_instance, target_user_id, current_channel, msg_id, protect_content=protect_content)
+            ok = await try_deliver(bot_instance, target_user_id, current_channel, msg_id, protect_content=protect_content, original_channel_id=primary_channel_id)
             if ok:
                 success_count += 1
                 tried_channels.add(current_channel)

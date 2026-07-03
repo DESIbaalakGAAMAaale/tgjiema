@@ -58,7 +58,7 @@ class MonScheduler:
         self._cursor_cache: dict[str, int] = {}
         self._flushed_cursors: dict[str, int] = {}  # 已 flush 到 CRDB 的游标值
         self._replicate_count = 0
-        self._cursor_flush_interval = 30  # 每 N 次同步 flush 一次(约30分钟)
+        self._cursor_flush_interval = 10  # 每 N 次同步 flush 一次(约10分钟，缩短以减少崩溃窗口)
         # R100 独立游标持久化：避免重启后重复归档
         self._r100_cursors: dict[str, int] = {}  # {slot_id}_r100 → cursor
         self._r100_cursors_loaded = False
@@ -368,32 +368,8 @@ class MonScheduler:
             shadows = [s for s in (s1_slot, s2_slot) if s and s.get("status") in ("shadow1", "shadow2")]
 
             slot_id = active_slot["slot_id"]
-            last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
-            new_messages = await self._fetch_new_messages(
-                bot_instance, active_slot["channel_id"], last_cursor
-            )
-            if not new_messages:
-                continue
 
-            # 1. 复制到同组的 shadow1/shadow2
-            # N-16-2: 仅将游标推进到「所有影子都成功复制」的最大 msg_id
-            # 避免某条消息复制失败后被永久跳过
-            shadow_max_ids = []
-            for shadow in shadows:
-                copied, mappings = await self._copy_messages(
-                    bot_instance, active_slot["channel_id"],
-                    shadow["channel_id"], new_messages,
-                )
-                total_copied += copied
-                if mappings:
-                    await self._write_backup_mappings(
-                        active_slot["channel_id"], shadow["channel_id"], mappings
-                    )
-                    shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
-            if shadow_max_ids:
-                self._cursor_cache[slot_id] = min(shadow_max_ids)
-
-            # 2. 复制到 R100 全量归档（独立游标，持久化避免重启重复）
+            # 1. R100 全量归档（独立游标，在 shadow 之前执行，静默期也能追赶）
             if r100_slot:
                 await self._load_r100_cursors()
                 r100_cursor_key = f"{slot_id}_r100"
@@ -411,7 +387,6 @@ class MonScheduler:
                         await self._write_backup_mappings(
                             active_slot["channel_id"], r100_slot["channel_id"], mappings_r100
                         )
-                        # R100 独立游标：只有成功才推进，持久化到 SQLite
                         self._r100_cursors[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
                     else:
                         logger.warning(
@@ -419,6 +394,31 @@ class MonScheduler:
                             f"channel={active_slot['channel_id']}→{r100_slot['channel_id']}，"
                             f"游标保持 {r100_last_cursor}，下周期重试"
                         )
+
+            # 2. 复制到同组的 shadow1/shadow2
+            last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
+            new_messages = await self._fetch_new_messages(
+                bot_instance, active_slot["channel_id"], last_cursor
+            )
+            if not new_messages:
+                continue
+
+            # N-16-2: 仅将游标推进到「所有影子都成功复制」的最大 msg_id
+            # 避免某条消息复制失败后被永久跳过
+            shadow_max_ids = []
+            for shadow in shadows:
+                copied, mappings = await self._copy_messages(
+                    bot_instance, active_slot["channel_id"],
+                    shadow["channel_id"], new_messages,
+                )
+                total_copied += copied
+                if mappings:
+                    await self._write_backup_mappings(
+                        active_slot["channel_id"], shadow["channel_id"], mappings
+                    )
+                    shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
+            if shadow_max_ids:
+                self._cursor_cache[slot_id] = min(shadow_max_ids)
 
         if self._replicate_count % self._cursor_flush_interval == 0:
             await self._flush_cursor_cache()
