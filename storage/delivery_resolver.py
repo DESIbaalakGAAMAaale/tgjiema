@@ -43,7 +43,7 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
 
     解析顺序:
     1. 查询该频道对应的 cell(可能是 active/shadow1/shadow2/lost)
-    2. 如果是 active 或 r100,直接返回
+    2. 如果是 active,直接返回（r100 是只写归档频道，不参与派发）
     3. PRE-01: 如果 cell 有 demoted_to_channel_id（被轮转降级且接替频道已就绪），
        立即跳转到接替频道（接替频道已镜像了原频道内容），无需走环形遍历
     4. 如果是 shadow 或 lost,沿环形找下一个 active 或 shadow1
@@ -67,8 +67,8 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
 
     status = cell["status"]
 
-    # active 或 r100:直接用
-    if status in ("active", "r100"):
+    # active:直接用（R-2: r100 是只写归档频道，不参与派发）
+    if status == "active":
         return DeliveryChannel(cell["channel_id"], cell["slot_id"], status)
 
     # PRE-01: 降级映射优先 —— 若 mon_bot 已记录 demoted_to_channel_id，
@@ -88,7 +88,7 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
             if promoted_cell is None:
                 break
             p_status = promoted_cell.get("status", "")
-            if p_status in ("active", "r100"):
+            if p_status == "active":
                 return DeliveryChannel(promoted_cell["channel_id"], promoted_cell["slot_id"], p_status)
             # 接替频道也已被降级？沿其 demoted_to_channel_id 继续
             next_to = promoted_cell.get("demoted_to_channel_id")
@@ -148,7 +148,7 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
         visited.add(nid)
 
         status = next_cell["status"]
-        if status in ("active", "r100", "shadow1"):
+        if status in ("active", "shadow1"):
             return DeliveryChannel(nid, next_cell["slot_id"], status)
 
         current_channel = nid

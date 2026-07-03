@@ -13,14 +13,21 @@ SMALL_TABLES = {
     "cells", "users", "spare_pool", "backup_config", "rotation_config",
     "relay_accounts", "code_bot_mapping", "external_code_mapping",
     "kv_config", "message_backups",
+    # R-1: codes/file_records 纳入备份（取件码→频道/消息的映射是核心数据，
+    # 无外部备份则为单点故障。每表上限 5000 行，file_records 仅备份 active 状态）
+    "codes", "file_records",
 }
 
 _LARGE_TABLES = {
-    "file_records", "codes", "decode_logs", "jobs",
-    "pending_uploads", "rotate_log",
+    "decode_logs", "jobs", "pending_uploads", "rotate_log",
 }
 
 BACKUP_TABLES = SMALL_TABLES
+
+# 每个表可选的 WHERE 条件，用于过滤备份范围
+_TABLE_WHERE = {
+    "file_records": "status = 'active'",  # 仅备份活跃文件，跳过已过期/删除
+}
 
 MAX_ROWS_PER_TABLE = 5000
 
@@ -48,20 +55,24 @@ def _redact_secrets(data: dict) -> dict:
 
 
 async def backup_all_tables() -> dict:
-    """仅备份小元数据表（单表 <= 几百行），避免全表扫描大表消耗大量 RU。
+    """备份核心元数据表（含 codes/file_records 的取件映射）。
 
-    大表（file_records/codes/decode_logs/jobs 等）跳过：
-    - file_records/codes 数据可从 Telegram 频道重新索引
+    大表（decode_logs/jobs/pending_uploads/rotate_log）跳过：
     - decode_logs/jobs 是短期流水数据，无需长期备份
+    - pending_uploads 是瞬时状态，重启后从频道重放
+    - rotate_log 是审计日志，数据量大但非核心
     """
     results = {}
     async with db_client._pool.acquire() as conn:
         for table in sorted(BACKUP_TABLES):
             try:
                 safe_name = table.replace('"', '""')
-                records = await conn.fetch(
-                    f'SELECT * FROM "{safe_name}" LIMIT {MAX_ROWS_PER_TABLE}'
-                )
+                where = _TABLE_WHERE.get(table)
+                if where:
+                    sql = f'SELECT * FROM "{safe_name}" WHERE {where} LIMIT {MAX_ROWS_PER_TABLE}'
+                else:
+                    sql = f'SELECT * FROM "{safe_name}" LIMIT {MAX_ROWS_PER_TABLE}'
+                records = await conn.fetch(sql)
                 results[table] = [dict(r) for r in records]
                 logger.debug(f"[Backup] {table}: {len(records)} 行")
             except Exception as e:
