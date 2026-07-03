@@ -297,6 +297,7 @@ async def users_page(
             "search": search,
             "total_pages": max(1, (total + per_page - 1) // per_page),
         },
+        username=admin,
     )
 
 
@@ -415,6 +416,7 @@ async def files_page(
             "search": search,
             "total_pages": max(1, (total + per_page - 1) // per_page),
         },
+        username=admin,
     )
 
 
@@ -471,6 +473,7 @@ async def logs_page(
             "per_page": per_page,
             "total_pages": max(1, (total + per_page - 1) // per_page),
         },
+        username=admin,
     )
 
 

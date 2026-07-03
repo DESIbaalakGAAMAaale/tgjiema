@@ -332,6 +332,9 @@ class MonScheduler:
             if not new_messages:
                 continue
 
+            # N-16-2: 仅将游标推进到「所有影子都成功复制」的最大 msg_id
+            # 避免某条消息复制失败后被永久跳过
+            shadow_max_ids = []  # 每个影子成功复制的最大 msg_id
             for shadow in shadows:
                 copied, mappings = await self._copy_messages(
                     bot_instance, active_slot["channel_id"],
@@ -342,9 +345,10 @@ class MonScheduler:
                     await self._write_backup_mappings(
                         active_slot["channel_id"], shadow["channel_id"], mappings
                     )
-
-            latest_id = max(_get_msg_id(msg) for msg in new_messages if msg)
-            self._cursor_cache[slot_id] = latest_id
+                    shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
+            if shadow_max_ids:
+                # 取所有影子中最小的成功最大 id，确保失败的消息不会被跳过
+                self._cursor_cache[slot_id] = min(shadow_max_ids)
 
         if self._replicate_count % self._cursor_flush_interval == 0:
             await self._flush_cursor_cache()
@@ -514,14 +518,28 @@ class MonScheduler:
         return False
 
     async def _fetch_all_media(self, bot_instance, channel_id: int, limit: int = 200) -> list:
-        """拉取频道中所有媒体消息(用于智能补齐)。"""
+        """拉取频道中所有媒体消息(用于智能补齐)。
+
+        N-16-3: 分页拉取全部历史，而非仅最新 200 条，确保大频道补齐完整。
+        """
         msgs = []
         try:
             client = await self._ensure_telethon_client()
             if client:
-                async for msg in client.iter_messages(channel_id, limit=limit):
-                    if msg.media:
-                        msgs.append(msg)
+                batch_size = 200
+                max_id = 0  # 0 表示从最新开始
+                while True:
+                    batch = []
+                    async for msg in client.iter_messages(channel_id, limit=batch_size, max_id=max_id):
+                        if msg.media:
+                            batch.append(msg)
+                    if not batch:
+                        break
+                    msgs.extend(batch)
+                    # 用本批最小 id 作为下一批的 max_id，继续往前翻页
+                    max_id = min(_get_msg_id(msg) for msg in batch) - 1
+                    if len(batch) < batch_size:
+                        break
         except Exception as e:
             logger.warning(f"[Mon][填充] 拉取频道 {channel_id} 媒体消息失败: {e}")
         return msgs
