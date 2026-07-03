@@ -37,7 +37,7 @@ class R2Storage:
         return f"https://{self._endpoint}/{self._bucket}"
 
     def _sign(self, method: str, key: str, content_type: str = "",
-              payload_hash: str = "UNSIGNED-PAYLOAD") -> dict:
+              payload_hash: str = "UNSIGNED-PAYLOAD", querystring: str = "") -> dict:
         service = "s3"
         region = "auto"
         now = datetime.datetime.now(datetime.timezone.utc)
@@ -45,7 +45,7 @@ class R2Storage:
         date_stamp = now.strftime("%Y%m%d")
 
         canonical_uri = "/" + self._bucket + "/" + key
-        canonical_querystring = ""
+        canonical_querystring = querystring
         canonical_headers = (
             f"host:{self._endpoint}\n"
             f"x-amz-content-sha256:{payload_hash}\n"
@@ -107,8 +107,10 @@ class R2Storage:
         if self._http is None:
             raise RuntimeError("R2Storage not connected, call connect() first")
         import xml.etree.ElementTree as ET
-        url = f"{self.base_url}?list-type=2&prefix={prefix}"
-        headers = self._sign("GET", f"?list-type=2&prefix={prefix}")
+        query = f"list-type=2&prefix={prefix}"
+        url = f"{self.base_url}?{query}"
+        # S-8: list_objects 签名包含 querystring，确保规范请求与 URL 一致
+        headers = self._sign("GET", "", querystring=query)
         resp = await self._http.get(url, headers=headers)
         resp.raise_for_status()
         root = ET.fromstring(resp.text)

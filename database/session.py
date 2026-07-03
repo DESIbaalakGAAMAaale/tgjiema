@@ -1717,13 +1717,15 @@ async def enqueue_job(
 
 
 async def dequeue_jobs(batch_size: int = 10) -> list:
-    """从 jobs 表批量取出待派工任务(原子操作:CTE + UPDATE ... RETURNING *,一次 DB 往返)。
-    
-    注意: 查询带 asyncio.wait_for 超时保护(5s),防止数据库异常时永久阻塞。
+    """从 jobs 表批量取出待派工任务（原子操作：CTE + FOR UPDATE SKIP LOCKED + UPDATE RETURNING）。
+
+    S-3: FOR UPDATE SKIP LOCKED 防止并发 worker 认领同一行，
+    与 CTE + UPDATE + RETURNING 组合保证单次 DB 往返的原子出队。
+
     Args:
-        batch_size: 一次取出的最大任务数,默认 10
+        batch_size: 一次取出的最大任务数，默认 10
     Returns:
-        JobResult 列表,可能为空列表
+        JobResult 列表，可能为空列表
     """
     col = get_jobs_col()
     try:
@@ -1733,6 +1735,7 @@ async def dequeue_jobs(batch_size: int = 10) -> list:
                 WHERE status = 'pending'
                 ORDER BY created_at
                 LIMIT $1
+                FOR UPDATE SKIP LOCKED
             )
             UPDATE jobs SET status = 'dispatched'
             WHERE id IN (SELECT id FROM next)

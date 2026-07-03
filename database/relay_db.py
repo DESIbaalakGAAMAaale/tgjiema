@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import os
 import aiosqlite
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from loguru import logger
 
@@ -93,12 +93,14 @@ DB_PATH = Path(__file__).parent.parent / "data" / "relay_pool.db"
 
 
 async def _sync_relay_to_crdb(api_id: int, api_hash: str, phone: str):
-    """异步同步中继账号到 CRDB（不阻塞主流程）"""
+    """异步同步中继账号到 CRDB（不阻塞主流程）。
+    S-1: api_hash 在落云前加密，与本地 SQLite 保持一致的安全级别。
+    """
     try:
         from .session import _client, sync_relay_to_crdb as _do_sync
         if _client._pool is None:
             return  # CRDB 未连接，跳过
-        await _do_sync(api_id, api_hash, phone)
+        await _do_sync(api_id, encrypt(api_hash), phone)
     except Exception as e:
         logger.debug(f"[RelayDB] CRDB 同步失败（不影响本地）: {e}")
 
@@ -168,7 +170,17 @@ class RelayDB:
                 from .session import get_relay_accounts_from_crdb
                 accounts = await get_relay_accounts_from_crdb()
                 for acc in accounts:
-                    await self.add_account(acc['api_id'], acc['api_hash'], acc['phone'])
+                    # S-1: CRDB 中 api_hash 已加密，需先解密再交给 add_account（add_account 会再次加密存本地）
+                    crdb_hash = acc.get('api_hash', '')
+                    if crdb_hash:
+                        try:
+                            api_hash = decrypt(crdb_hash)
+                        except RuntimeError:
+                            # 兼容旧数据：CRDB 中可能是明文（迁移前写入的），直接用
+                            api_hash = crdb_hash
+                    else:
+                        api_hash = ''
+                    await self.add_account(acc['api_id'], api_hash, acc['phone'])
                 logger.info(f"[RelayDB] 从 CRDB 恢复 {len(accounts)} 个中继账号")
             except Exception as e:
                 logger.warning(f"[RelayDB] CRDB 恢复失败（回退空池模式）: {e}")
@@ -351,7 +363,7 @@ class RelayDB:
 
     async def set_bot_cooldown(self, bot_username: str, cooldown_seconds: int):
         """记录机器人的冷却时间（从解码器返回的限速文本中提取）。"""
-        now = datetime.now(datetime.timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         logger.info(f"[RelayDB] 设置 @{bot_username} 冷却 {cooldown_seconds}s")
         await self._db.execute(
             """INSERT INTO bot_cooldown (bot_username, cooldown_seconds, last_decode_at, updated_at)
@@ -366,7 +378,7 @@ class RelayDB:
 
     async def cleanup_cooldowns(self):
         """清理已过期的冷却记录，防止无用堆积。"""
-        now = datetime.now(datetime.timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         cursor = await self._db.execute(
             """DELETE FROM bot_cooldown
                WHERE last_decode_at IS NOT NULL

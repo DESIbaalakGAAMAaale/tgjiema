@@ -1,6 +1,7 @@
 import hashlib
 import os
 import re
+import secrets
 import string
 import time
 
@@ -18,18 +19,16 @@ _INTERNAL_CODE_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]{12}(?:_\d+[pvdarg])+$")
 
 
 def _generate_deterministic_id(length: int = 12) -> str:
-    """Deterministic unique ID, zero DB round trips.
+    """密码学安全随机 ID，零 DB 往返。
 
-    原理:nanotimestamp + PID 作为种子 → SHA256 扩散 → 映射到 CODE_ALPHABET。
-    - 同进程内:time.time_ns() 单调递增,每次调用种子不同
-    - 跨进程:不同的 PID 确保即使同一纳秒种子也不同
-    - 输出看似随机(SHA256 avalanche effect),不可猜测
-    碰撞概率极低，DB PRIMARY KEY 作为最后防线。
+    S-5: 改用 secrets.randbelow 替代 SHA256(time_ns+PID)，
+    消除确定性派生带来的可预测性风险，碰撞概率极低（36^12 ≈ 4.7×10^18）。
+    DB PRIMARY KEY 作为最后防线。
     """
-    seed = f"{time.time_ns():x}{os.getpid():x}"
-    digest = hashlib.sha256(seed.encode()).hexdigest()
-    val = int(digest, 16)
-    return ''.join(CODE_ALPHABET[(val >> (i * 5)) % 36] for i in range(length))
+    result = []
+    for _ in range(length):
+        result.append(CODE_ALPHABET[secrets.randbelow(36)])
+    return ''.join(result)
 
 
 def build_file_code(file_types: dict) -> str:

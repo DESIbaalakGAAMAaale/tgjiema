@@ -1,4 +1,5 @@
 import time as _time
+import re as _re
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -41,6 +42,15 @@ _csrf_tokens: dict[str, str] = {}
 # 仅缓存 {}, 有搜索条件时仍需 CRDB（regex 等无法缓存）
 _count_cache: dict[str, tuple[float, int]] = {}
 _COUNT_CACHE_TTL = 60  # 秒
+_SEARCH_MAX_LENGTH = 50  # S-6: 搜索输入长度限制，防止 ReDoS
+
+
+def _sanitize_search(raw: str) -> str:
+    """S-6: 搜索输入消毒 —— 长度限制 + 正则特殊字符转义，防止 ReDoS 攻击。"""
+    if not raw:
+        return ""
+    raw = raw.strip()[:_SEARCH_MAX_LENGTH]
+    return _re.escape(raw)
 
 
 async def _load_state_from_cache():
@@ -112,12 +122,23 @@ def _verify_csrf(request: Request, form_token: str = None, username: str = "") -
     return False
 
 
+def _get_client_ip(request: Request) -> str:
+    """S-7: 解析真实客户端 IP，优先使用 X-Forwarded-For（反向代理场景）。"""
+    if request is None:
+        return "unknown"
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        # X-Forwarded-For 格式: "client, proxy1, proxy2"，取第一个（真实客户端）
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request: Request = None):
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="管理员账号未配置,请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD")
 
     # 速率限制检查
-    client_ip = request.client.host if request else "unknown"
+    client_ip = _get_client_ip(request)
     now = _time.time()
     if client_ip not in _login_failures:
         _login_failures[client_ip] = []
@@ -264,6 +285,7 @@ async def users_page(
 
     query = {}
     if search:
+        search = _sanitize_search(search)
         if search.isdigit():
             query["user_id"] = int(search)
         else:
@@ -386,6 +408,7 @@ async def files_page(
 
     query = {}
     if search:
+        search = _sanitize_search(search)
         if search.isdigit():
             query["uploader_id"] = int(search)
         else:

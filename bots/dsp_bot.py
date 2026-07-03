@@ -461,8 +461,10 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     
     注意：调用方 _send_one_job 已持有 _send_semaphore，此处不再获取，
     避免双重获取导致低并发时死锁。消息逐个发送本身已串行，无需额外限流。
+    S-4: 返回值反映实际发送结果，不再恒为 True。
     """
     protect_content = getattr(job, "protect_content", False)
+    all_success = True
     for i, mid in enumerate(job.storage_msg_ids):
         try:
             resolved = await resolve_delivery_channel(job.storage_channel_id)
@@ -470,14 +472,16 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
                 metrics.send_success_count += 1
             else:
                 metrics.send_fail_count += 1
+                all_success = False
         except Exception as e:
             logger.error(f"[Dsp] 兜底发送异常 (msg={mid}): {e}")
             metrics.send_fail_count += 1
+            all_success = False
         # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
         if i < len(job.storage_msg_ids) - 1:
             await asyncio.sleep(0.15)
     await metrics.record_processed("dsp_bot")
-    return True
+    return all_success
 
 
 async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None, storage_msg_ids=None, protect_content=False, bot_id=1) -> bool:

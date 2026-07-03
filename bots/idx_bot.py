@@ -598,8 +598,12 @@ async def _process_one_pending(app: Application, row: dict):
 
 
 async def _process_pending_uploads(app: Application):
-    """处理 pending_uploads: 先查本地 SQLite 通知(0 RU),有信号才查 CRDB,并发处理多条"""
+    """处理 pending_uploads: 先查本地 SQLite 通知(0 RU),有信号才查 CRDB,并发处理多条。
+    S-2: 用 CAS 原子认领，避免多 worker 同时处理同一 pending → 重复生成码。
+    原子语义: UPDATE ... WHERE id=$1 AND processed=0 且仅当该行未被认领过。
+    """
     from database.cache_store import get_cache_store
+    from database.session import db_client
     store = get_cache_store()
 
     while True:
@@ -610,7 +614,8 @@ async def _process_pending_uploads(app: Application):
             pending_col = get_pending_uploads_col()
             processed_any = False
             while True:
-                rows = await pending_col.find(
+                # 先查询候选行
+                candidates = await pending_col.find(
                     {"processed": 0},
                     limit=10,
                     projection=["id", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
@@ -618,12 +623,24 @@ async def _process_pending_uploads(app: Application):
                                 "protect_content", "file_ttl_days"],
                 )
 
-                if not rows:
+                if not candidates:
                     break
 
                 processed_any = True
-                tasks = [asyncio.create_task(_process_one_pending(app, row)) for row in rows]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                tasks = []
+                for row in candidates:
+                    pend_id = row["id"]
+                    # S-2: CAS 原子认领：仅当 processed 仍为 0 时标记为 1，只有一个 worker 能成功
+                    result = await pending_col.update_one(
+                        {"id": pend_id, "processed": 0},
+                        {"$set": {"processed": 1, "processing_started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}}
+                    )
+                    # 认领成功才处理
+                    if result and result.get("matched_count", 0) > 0:
+                        tasks.append(asyncio.create_task(_process_one_pending(app, row)))
+
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
             if not processed_any:
                 await asyncio.sleep(5)
