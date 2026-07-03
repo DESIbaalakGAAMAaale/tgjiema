@@ -277,8 +277,9 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif state == "relay_code:code":
         code = text.strip()
         # 验证码写入 DB,由 idx_bot 的 relay_instance 自动读取
-        await set_config("relay_auth_code", code)
-        await set_config("relay_auth_pending", "1")
+        phone = context.user_data.get("relay_phone", "")
+        await set_config(f"relay_auth_code:{phone}", code)
+        await set_config(f"relay_auth_pending:{phone}", "1")
         await _end(f"✅ 验证码 `{code}` 已提交\n中继实例将在几秒内自动获取并使用。")
 
     elif state == "relay_set_api:phone":

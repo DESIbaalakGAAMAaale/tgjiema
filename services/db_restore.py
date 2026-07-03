@@ -164,8 +164,9 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
         logger.error(f"[{table}] 列名校验失败: {e}, 跳过此表")
         return 0
 
-    # 排除 SERIAL 自增列（decode_logs.id）
-    insert_cols = [c for c in columns if not (table == "decode_logs" and c == "id")]
+    # 排除 SERIAL 自增列（decode_logs.id / relay_accounts.id），避免恢复时序列不同步
+    _serial_tables = {"decode_logs", "relay_accounts"}
+    insert_cols = [c for c in columns if not (table in _serial_tables and c == "id")]
     placeholders = [f"${i + 1}" for i in range(len(insert_cols))]
     # 构建 ON CONFLICT ... DO UPDATE SET 子句
     update_parts = [f"{c} = EXCLUDED.{c}" for c in insert_cols if c != pk]

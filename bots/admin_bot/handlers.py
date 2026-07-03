@@ -355,21 +355,22 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @_auth_required
 async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
-    if not args:
+    if len(args) < 2:
         await update.message.reply_text(
-            "用法:/relay_code <验证码>\n\n"
+            "用法:/relay_code <手机号> <验证码>\n\n"
             "用于解码机器人登录 Telegram 用户账号时提交验证码。\n"
             "验证码(6位)会发送到该账号已登录的 Telegram 客户端。"
         )
         return
-    code = args[0].strip()
+    phone = args[0].strip()
+    code = args[1].strip()
     if not code.isdigit() or len(code) not in (5, 6):
         await update.message.reply_text("❌ 验证码格式不正确,应为 5-6 位数字")
         return
 
-    await set_config("relay_auth_code", code)
+    await set_config(f"relay_auth_code:{phone}", code)
     await update.message.reply_text(
-        f"✅ 验证码 `{code}` 已提交\n"
+        f"✅ 验证码 `{code}` 已提交至 {phone}\n"
         f"解码机器人将在几秒内自动获取并使用。"
     )
 
@@ -669,7 +670,8 @@ async def set_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 _FACTORY_RESET_TABLES = [
     "file_records", "decode_logs", "pending_uploads",
-    "users", "backup_config",
+    "users", "backup_config", "codes", "external_code_mapping",
+    "jobs", "spare_pool",
 ]
 
 

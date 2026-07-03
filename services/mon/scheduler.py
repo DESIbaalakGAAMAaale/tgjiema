@@ -3,8 +3,10 @@
 import os
 import re
 import datetime as _dt
+from pathlib import Path
 
 import yaml
+from telethon import TelegramClient
 from loguru import logger
 from database import (
     log_rotate,
@@ -47,10 +49,61 @@ class MonScheduler:
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
         # ─── last_synced_msg_id 本地缓存:每 30 次同步 flush 一次(30分钟)，且只 flush 有变化的 ───
+        self._telethon_client: TelegramClient | None = None
         self._cursor_cache: dict[str, int] = {}
         self._flushed_cursors: dict[str, int] = {}  # 已 flush 到 CRDB 的游标值
         self._replicate_count = 0
         self._cursor_flush_interval = 30  # 每 N 次同步 flush 一次(约30分钟)
+
+    async def _ensure_telethon_client(self):
+        """获取或创建 Telethon 客户端，用于读取频道历史消息。
+        优先复用 relay_pool 已有实例，否则查询 relay_accounts 表创建新客户端。
+        失败时返回 None，调用方回退到旧 get_updates 行为。
+        """
+        if self._telethon_client and self._telethon_client.is_connected():
+            return self._telethon_client
+        
+        from config.settings import settings
+        api_id = settings.RELAY_API_ID
+        api_hash = settings.RELAY_API_HASH
+        if not api_id or not api_hash:
+            logger.warning("[Mon] RELAY_API_ID/RELAY_API_HASH 未配置，无法使用 Telethon 历史复制")
+            return None
+        
+        # 尝试复用 relay_pool 已有实例
+        try:
+            from services.relay_pool import relay_pool
+            if relay_pool.instances:
+                for instance in relay_pool.instances:
+                    if instance._client and instance._client.is_connected():
+                        self._telethon_client = instance._client
+                        logger.info(f"[Mon] 复用 relay_pool 已有 Telethon 客户端 ({instance.phone})")
+                        return self._telethon_client
+        except Exception:
+            pass
+        
+        # 创建新客户端：从 relay_accounts 表获取第一个账号
+        try:
+            from database.session import get_collection
+            col = get_collection("relay_accounts")
+            accounts = await col.find({}, limit=1)
+            if accounts:
+                phone = accounts[0]["phone"]
+                session_path = str(Path(__file__).parent.parent.parent / "data" / f"relay_session_{phone}")
+                if os.path.exists(session_path + ".session"):
+                    client = TelegramClient(session_path, api_id, api_hash)
+                    await client.connect()
+                    if await client.is_user_authorized():
+                        self._telethon_client = client
+                        logger.info(f"[Mon] 创建 Telethon 客户端成功 ({phone})")
+                        return client
+                    await client.disconnect()
+                else:
+                    logger.warning(f"[Mon] session 文件不存在: {session_path}.session，跳过 Telethon 初始化")
+        except Exception as e:
+            logger.warning(f"[Mon] 创建 Telethon 客户端失败: {e}")
+        
+        return None
 
     async def run_degrade_check(self, all_cells: list[dict], cell_fail_streak: dict[str, int] = None) -> list[str]:
         """执行一轮降级检查,返回日志描述列表。
@@ -311,12 +364,24 @@ class MonScheduler:
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
         """获取频道中最后游标之后的新消息(媒体文件)。
         
-        使用 getUpdates API 获取最近频道消息，筛选目标频道中 > last_cursor 的媒体消息。
+        优先使用 Telethon iter_messages 可靠获取历史消息，
+        失败时回退到 get_updates。
         """
         msgs = []
         try:
+            client = await self._ensure_telethon_client()
+            if client:
+                async for msg in client.iter_messages(channel_id, min_id=last_cursor, reverse=True):
+                    if msg.media:
+                        msgs.append(msg)
+                return msgs
+        except Exception as e:
+            logger.warning(f"[Mon][复制] Telethon 获取频道 {channel_id} 消息失败: {e}")
+        
+        # 回退到 get_updates
+        try:
             updates = await bot_instance.get_updates(
-                offset=-100,  # 获取最近 100 条更新
+                offset=-100,
                 allowed_updates=["channel_post"],
                 timeout=5,
             )
@@ -324,7 +389,6 @@ class MonScheduler:
                 if update.channel_post and update.channel_post.chat_id == channel_id:
                     msg = update.channel_post
                     if msg.message_id > last_cursor:
-                        # 只复制媒体消息
                         if msg.photo or msg.video or msg.document or msg.audio or msg.animation:
                             msgs.append(msg)
         except Exception as e:
@@ -408,28 +472,32 @@ class MonScheduler:
 
         return total_filled
 
-    @staticmethod
-    async def _is_channel_nearly_empty(bot_instance, channel_id: int, threshold: int = 3) -> bool:
-        """判断频道是否几乎为空(媒体消息 ≤ threshold)。
-        
-        通过 getChat 获取频道信息，检查 recently_active_date 等指标。
-        """
+    async def _is_channel_nearly_empty(self, bot_instance, channel_id: int, threshold: int = 3) -> bool:
+        """判断频道是否几乎为空(媒体消息 ≤ threshold)。"""
         try:
-            # 直接验证频道可达，返回 True 表示需要检查
-            await bot_instance.get_chat(channel_id)
-            # 无法迭代消息，保守返回 False（不做补齐）
-            return False
+            client = await self._ensure_telethon_client()
+            if client:
+                count = 0
+                async for msg in client.iter_messages(channel_id, limit=threshold):
+                    if msg.media:
+                        count += 1
+                return count < threshold
         except Exception as e:
             logger.warning(f"[Mon][检查] 频道 {channel_id} 检查失败: {e}")
-            return False
+        return False
 
-    @staticmethod
-    async def _fetch_all_media(bot_instance, channel_id: int, limit: int = 200) -> list:
-        """拉取频道中所有媒体消息(用于智能补齐)。
-        
-        ptb 21.6 不支持迭代消息，返回空列表。
-        """
-        return []
+    async def _fetch_all_media(self, bot_instance, channel_id: int, limit: int = 200) -> list:
+        """拉取频道中所有媒体消息(用于智能补齐)。"""
+        msgs = []
+        try:
+            client = await self._ensure_telethon_client()
+            if client:
+                async for msg in client.iter_messages(channel_id, limit=limit):
+                    if msg.media:
+                        msgs.append(msg)
+        except Exception as e:
+            logger.warning(f"[Mon][填充] 拉取频道 {channel_id} 媒体消息失败: {e}")
+        return msgs
 
     async def validate_topology(self, all_cells: list[dict]) -> list[str]:
         """定期拓扑校验:检测环形链表是否断裂。

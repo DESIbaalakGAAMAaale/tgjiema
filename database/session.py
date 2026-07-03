@@ -1027,7 +1027,7 @@ async def get_config(key: str) -> str | None:
 
 async def set_config(key: str, value: str):
     await _set_config(key, value)
-    get_config_cache().invalidate(f"config:{key}")
+    await _invalidate_config_caches(key)
 
 
 async def delete_config(key: str):
@@ -1037,7 +1037,18 @@ async def delete_config(key: str):
             {"config_key": key},
             {"$set": {"config_value": "", "updated_at": ""}},
         )
+    await _invalidate_config_caches(key)
+
+
+async def _invalidate_config_caches(key: str):
+    """同时失效 L1 内存缓存和 L2 SQLite 缓存，防止旧值被命中。"""
     get_config_cache().invalidate(f"config:{key}")
+    try:
+        from .cache_store import get_cache_store
+        store = get_cache_store()
+        await store.delete(f"config:{key}")
+    except Exception:
+        pass
 
 
 async def get_relay_config() -> dict:

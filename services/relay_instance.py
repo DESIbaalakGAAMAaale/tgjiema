@@ -1,4 +1,4 @@
-"""单个中继账号实例 — 独立 Telethon 客户端
+﻿"""单个中继账号实例 — 独立 Telethon 客户端
 - 每个账号独立 TelegramClient + session 文件
 - 支持并发处理解码任务
 - session 文件持久化，VPS 重启后自动恢复
@@ -202,7 +202,10 @@ class RelayInstance:
                 logger.warning(f"[RelayInstance:{self.phone}] 账号正忙，拒绝新请求")
                 return False
             self.is_busy = True
-        return await self._do_send_external_code(bot_username, code, user_id)
+        result = await self._do_send_external_code(bot_username, code, user_id)
+        if not result:
+            self.is_busy = False
+        return result
 
     async def _do_send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         try:
