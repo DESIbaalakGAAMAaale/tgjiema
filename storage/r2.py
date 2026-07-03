@@ -1,7 +1,6 @@
 import hashlib
 import hmac
 import datetime
-from urllib.parse import urlparse, quote
 
 import httpx
 

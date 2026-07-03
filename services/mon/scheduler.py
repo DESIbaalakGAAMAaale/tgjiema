@@ -1,18 +1,14 @@
 """Mon 调度器:心跳检测、自动降级、环形推进、智能补齐"""
 
-import asyncio
 import os
 import re
 import datetime as _dt
-from typing import Any
 
 import yaml
 from loguru import logger
 from database import (
     log_rotate,
 )
-from utils.flood_waiter import safe_copy_message, reset_backoff
-from utils.file_utils import is_media_message
 
 
 def _load_mon_config():
@@ -167,8 +163,6 @@ class MonScheduler:
         - 若无可用 shadow: 返回 (None, None)
         """
         a_slot, s1_slot, s2_slot = group
-        s1_ok = s1_slot and s1_slot.get("status") in ("shadow1", "shadow2")
-        s2_ok = s2_slot and s2_slot.get("status") in ("shadow1", "shadow2")
         if s1_slot and s1_slot.get("status") == "shadow1":
             return s1_slot, s2_slot if s2_slot and s2_slot.get("status") == "shadow2" else None
         if s1_slot and s1_slot.get("status") in ("shadow2", "lost"):

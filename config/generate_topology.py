@@ -251,9 +251,9 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     # ── 输出 YAML ──
     lines = [
         "# 环形冗余拓扑配置(自动生成,请勿手动编辑)",
-        f"# 配置来源: .env 或 config/groups.yaml",
+        "# 配置来源: .env 或 config/groups.yaml",
         f"# 共 {len(accounts)} 个账号,{len(groups)} 组,{len(slots)} 个槽位",
-        f"# 配对策略: 5 账号轮转滑动窗口,每组 A/S1/S2 三不同账号",
+        "# 配对策略: 5 账号轮转滑动窗口,每组 A/S1/S2 三不同账号",
         "#",
         "slots:",
     ]
@@ -287,7 +287,6 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
         lines.append("    is_r100: true")
         lines.append("")
         # R100 备选
-        all_r100 = [r100_channel] + r100_fallback
         for fi, fb_ch in enumerate(r100_fallback):
             lines.append(f"  - slot_id: \"r100-fb{fi+1}\"")
             lines.append(f"    channel_id: {fb_ch}")
@@ -312,7 +311,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
 
     # ── 汇总 + 验证 ──
     print(f"\n[生成] {len(accounts)} 账号 → {len(groups)} 组 → {len(slots)} 槽位")
-    print(f"[策略] 5 账号轮转滑动窗口: 每组 A/S1/S2 三不同账号")
+    print("[策略] 5 账号轮转滑动窗口: 每组 A/S1/S2 三不同账号")
     if r100_channel:
         print(f"[R100] 兜底频道 {r100_channel}(不参与环形调度)")
 
@@ -328,13 +327,13 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
             role, name = [x.strip() for x in p.split("=", 1)]
             usage[name][role] += 1
 
-    print(f"\n[账号用量验证]")
+    print("\n[账号用量验证]")
     for name, counts in usage.items():
         total = sum(counts.values())
         print(f"  {name}: A={counts['A']} S1={counts['S1']} S2={counts['S2']} = {total}")
 
     print(f"\n[输出] {output_path}")
-    print(f"[下一步] python admin/seed_topology.py --yes")
+    print("[下一步] python admin/seed_topology.py --yes")
 
 
 if __name__ == "__main__":

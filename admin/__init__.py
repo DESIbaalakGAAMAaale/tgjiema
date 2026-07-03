@@ -1,6 +1,6 @@
 import time as _time
 
-from fastapi import FastAPI, Request, Depends, HTTPException, Query, Form, Response
+from fastapi import FastAPI, Request, Depends, HTTPException, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials

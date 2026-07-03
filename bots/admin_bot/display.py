@@ -3,13 +3,10 @@ import datetime
 import re
 import time
 
-from loguru import logger
 from config import settings
 from database import (
     get_users_col, get_file_records_col, get_decode_logs_col,
-    get_config, set_config,
-    get_rotation_config,
-    get_user_cached,
+    get_config, get_user_cached,
 )
 from database.models import make_user
 from utils.monitor import metrics
@@ -168,7 +165,7 @@ async def _get_topology_text() -> str:
     except Exception:
         cells = []
 
-    msg = f"🔗 环形冗余拓扑\n\n"
+    msg = "🔗 环形冗余拓扑\n\n"
     msg += f"📌 当前主频道: {active_channel}\n"
     msg += f"📊 总槽位数: {len(cells)}\n"
 
@@ -213,8 +210,6 @@ async def _get_topology_text() -> str:
             for c in group:
                 st = c.get("status", "?")
                 icon = status_icons.get(st, "⚪")
-                acc = c.get("account_name", "")
-                fc = c.get("file_count") or 0
                 parts.append(f"{icon}{c.get('slot_id')}: {c.get('channel_id')}")
             msg += f"  组{gn}: {' | '.join(parts)}\n"
     else:
@@ -369,14 +364,6 @@ async def _get_configs_text() -> str:
         ("quota_external_basic", "🥇 基础外部码配额", "✅热更新"),
         ("quota_default_premium", "👑 高级会员日配额", "✅热更新"),
         ("quota_external_premium", "👑 高级外部码配额", "✅热更新"),
-    ]
-
-    r2_keys = [
-        ("r2_account_id", "☁️ R2 账号ID"),
-        ("r2_access_key", "🔑 R2 Access Key"),
-        ("r2_secret_key", "🔒 R2 Secret Key"),
-        ("r2_bucket", "🪣 R2 桶名"),
-        ("r2_endpoint", "🔗 R2 Endpoint"),
     ]
 
     backup_keys = [

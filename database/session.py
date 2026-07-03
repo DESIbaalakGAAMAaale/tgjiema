@@ -543,7 +543,7 @@ class D1Collection:
 
     async def _execute(self, sql: str, params: list = None) -> int:
         async with _client._pool.acquire() as conn:
-            result = await conn.execute(sql, *(params or []))
+            await conn.execute(sql, *(params or []))
             if _SQL_LOG_ENABLED:
                 logger.info(f"[SQL_EXEC] {self.table}: {sql[:200]}")
             return 1
@@ -1597,10 +1597,6 @@ async def enqueue_job(
     CRDB 写入走后台异步，不阻塞用户响应。
     """
     import datetime as _dt
-    try:
-        import orjson as _json
-    except ImportError:
-        import json as _json
     created_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
     storage_msg_ids_str = _json_dumps(storage_msg_ids)
     

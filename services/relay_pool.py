@@ -5,7 +5,7 @@
 - 支持并发处理解码任务
 """
 import asyncio
-from datetime import datetime, date
+from datetime import datetime
 
 from loguru import logger
 

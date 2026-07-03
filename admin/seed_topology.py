@@ -17,8 +17,8 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from database import init_db, close_db, get_cells_col, make_cell
-from database import set_rotation_config, add_spare_channel
+from database import init_db, close_db, get_cells_col
+from database import set_rotation_config
 
 
 async def seed(dry_run: bool = False, force: bool = False):

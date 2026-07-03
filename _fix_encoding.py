@@ -1,5 +1,4 @@
 import pathlib
-import os
 
 files = [
     'bots/dsp_bot.py', 'bots/idx_bot.py', 'bots/up_bot.py', 'bots/mon_bot.py',

@@ -195,7 +195,6 @@ async def _flush_request_count_loop():
     使用单条 SQL 批量 UPDATE，替代 N+1 循环，大幅减少 RU 消耗。
     """
     from loguru import logger
-    from .session import get_file_records_col
     from .session import bulk_update_request_counts
     from database.cache import get_file_record_cache
 
@@ -223,7 +222,6 @@ async def _flush_request_count_loop():
 
 async def dump_cache_to_disk():
     """将本进程内存缓存 dump 到 SQLite(由后台任务定期调用)"""
-    import asyncio as _asyncio
     from .cache_store import get_cache_store
 
     store = get_cache_store()

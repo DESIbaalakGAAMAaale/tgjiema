@@ -827,7 +827,6 @@ class UserRelay:
                             break
                         target_num = next_num
 
-                    target_str = str(target_num)
                     for col_idx, t, n in numbers:
                         if n == target_num:
                             exchange["_last_clicked_number"] = target_num
@@ -1172,7 +1171,7 @@ class UserRelay:
 
     async def deliver_cached(self, user_id: int, code: str) -> bool:
         if not self._client:
-            logger.warning(f"[UserRelay] 无法交付缓存: 客户端未就绪")
+            logger.warning("[UserRelay] 无法交付缓存: 客户端未就绪")
             return False
 
         try:

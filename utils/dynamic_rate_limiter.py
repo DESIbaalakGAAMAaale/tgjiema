@@ -2,8 +2,6 @@
 高峰期自动拉长等待时间，防止 Telegram API 被打爆。
 """
 import asyncio
-import time
-from loguru import logger
 from config import settings
 
 

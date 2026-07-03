@@ -6,14 +6,13 @@ from telegram.ext import ContextTypes
 
 from config import settings
 from database import (
-    get_users_col, get_file_records_col, get_file_record_cached, get_decode_logs_col,
-    get_config, set_config,
-    get_relay_config, set_relay_config,
+    get_users_col, get_file_records_col, get_file_record_cached, get_config, set_config,
+    set_relay_config,
     get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
     get_all_bot_decode_intervals, set_bot_decode_interval, delete_bot_decode_interval,
     add_spare_channel, remove_spare, list_spare_pool,
     get_rotation_config, set_rotation_config,
-    get_user_cached, update_user_and_invalidate,
+    update_user_and_invalidate,
 )
 from utils.time_utils import format_datetime
 
@@ -57,7 +56,6 @@ async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 用户ID必须是数字")
         return
 
-    users_col = get_users_col()
     user = await _ensure_user(user_id)
 
     level = user.get("membership_level", "free")
@@ -109,7 +107,7 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await _ensure_user(user_id)
+    await _ensure_user(user_id)
 
     update_doc = {
         "$set": {
@@ -154,7 +152,7 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await _ensure_user(user_id)
+    await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"is_banned": True, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
@@ -176,7 +174,7 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await _ensure_user(user_id)
+    await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"is_banned": False, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
@@ -199,7 +197,7 @@ async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     users_col = get_users_col()
-    user = await _ensure_user(user_id)
+    await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"daily_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
@@ -224,7 +222,7 @@ async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     users_col = get_users_col()
-    user = await _ensure_user(user_id)
+    await _ensure_user(user_id)
     await users_col.update_one(
         {"user_id": user_id},
         {"$set": {"external_decode_quota": quota, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
@@ -389,7 +387,6 @@ async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     phone = args[0].strip()
 
-    from services.relay_pool import relay_pool
     from config import settings
     api_id = settings.RELAY_API_ID
     api_hash = settings.RELAY_API_HASH
@@ -483,7 +480,7 @@ async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        instance = await relay_pool.add_account(api_id, api_hash, phone)
+        await relay_pool.add_account(api_id, api_hash, phone)
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
         await update.message.reply_text(
             f"✅ 中继账号已添加到池中\n"

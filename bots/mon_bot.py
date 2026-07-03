@@ -21,8 +21,8 @@ from config import settings
 from database import (
     init_db, close_db, get_cells_col,
     log_rotate,
-    add_spare_channel, get_spare_for_account, get_any_spare,
-    consume_spare, get_rotation_config, set_rotation_config,
+    get_spare_for_account, get_any_spare,
+    consume_spare, get_rotation_config,
 )
 from database.cache_store import get_cache_store
 from services.mon import MonScheduler

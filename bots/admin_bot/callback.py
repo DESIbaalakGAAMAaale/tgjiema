@@ -4,7 +4,6 @@ from loguru import logger
 
 from database import (
     get_file_records_col,
-    get_config, set_config,
     get_all_code_bot_routes,
     get_all_bot_decode_intervals,
     list_spare_pool,
@@ -77,7 +76,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uploader = f.get("uploader_id", "?")
             text += f"{status_icon} {fc} (上传者:{uploader})\n"
         if total_pages > 1:
-            text += f"\n使用 /files 2 查看下一页"
+            text += "\n使用 /files 2 查看下一页"
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:relay_status":
@@ -290,7 +289,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     """处理管理员对举报的操作：封禁/脱钩/限制/忽略"""
     import datetime as _dt
-    from database import get_users_col, get_file_records_col, update_user_and_invalidate
+    from database import update_user_and_invalidate
 
     query = update.callback_query
     await query.answer()

@@ -1,7 +1,6 @@
 import asyncio
 import time
 from dataclasses import dataclass, field
-from collections import defaultdict
 
 
 _STALE_THRESHOLD = 300  # 5 分钟无 ping 视为离线

@@ -4,7 +4,6 @@
 - session 文件持久化，VPS 重启后自动恢复
 """
 import asyncio
-import json
 from pathlib import Path
 
 from loguru import logger

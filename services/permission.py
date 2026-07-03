@@ -10,9 +10,9 @@ import datetime
 from dataclasses import dataclass
 from typing import Optional
 
-from database import get_users_col, get_file_records_col, make_user
-from database import get_user_cached, update_user_and_invalidate
-from database import get_file_record_cached, update_file_record_and_invalidate
+from database import get_users_col, make_user
+from database import get_user_cached
+from database import get_file_record_cached
 from database.cache_store import (
     get_user_quota, upsert_user_quota, increment_user_quota_used,
 )
@@ -222,8 +222,6 @@ async def _reset_quota_if_needed(q: dict, now_date: datetime.date) -> dict:
 
 
 async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
-    files_col = get_file_records_col()
-
     # 从 CRDB 获取用户基础信息（等级/封禁状态）
     user = await get_user_cached(user_id)
     if user is None:

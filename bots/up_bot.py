@@ -770,7 +770,7 @@ async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TY
     if user_end == -1:
         return
     try:
-        external_user_id = int(rest[:user_end])
+        int(rest[:user_end])  # 仅校验 user_id 段为数字，实际 flush 只需 external_code
     except ValueError:
         return
     external_code = rest[user_end + 1:].strip()
@@ -851,7 +851,7 @@ async def _async_main():
     from database.cache_store import report_bot_heartbeat
     await report_bot_heartbeat("up_bot")
 
-    logger.info(f"[Up] 启动上传机器人（Up Bot）...")
+    logger.info("[Up] 启动上传机器人（Up Bot）...")
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -897,7 +897,6 @@ async def _async_main():
             await _refresh_active_slots()
             await asyncio.sleep(60)
 
-    loop = asyncio.get_running_loop()
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(slot_refresh_loop(), name="slot-refresh")
     create_safe_task(_cleanup_pending(), name="cleanup-pending")
