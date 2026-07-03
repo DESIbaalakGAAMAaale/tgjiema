@@ -256,11 +256,13 @@ class MonBot:
                 "status": new_status,
                 "account_name": account_name,
                 "file_count": 0,
+                "last_synced_msg_id": 0,  # 归零触发 auto_fill_new_channels 补齐存量
                 "rotation_started_at": now_iso,
             }, mark_dirty=True)
             self._update_cell_in_cache(slot_id, {
                 "channel_id": spare_ch, "status": new_status,
-                "file_count": 0, "rotation_started_at": now_iso,
+                "file_count": 0, "last_synced_msg_id": 0,
+                "rotation_started_at": now_iso,
             })
             await log_rotate(
                 from_slot_id=slot_id, to_slot_id=slot_id,
@@ -274,6 +276,11 @@ class MonBot:
                 f"操作: 直接替换,无需降级"
             )
             logger.info(f"[Mon][Ban] {slot_id} 封禁 → 备用池 {spare_ch} 替换")
+            # 重置 R100 游标：新频道内容不同，需从 Active 重新追赶
+            r100_key = f"{slot_id}_r100"
+            if r100_key in self.scheduler._r100_cursors:
+                del self.scheduler._r100_cursors[r100_key]
+                logger.info(f"[Mon][Ban] 已重置 R100 游标: {r100_key}")
         else:
             notify_msg += (
                 "⚠️ 备用池无可用频道!\n"

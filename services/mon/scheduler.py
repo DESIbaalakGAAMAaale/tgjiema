@@ -59,6 +59,24 @@ class MonScheduler:
         self._flushed_cursors: dict[str, int] = {}  # 已 flush 到 CRDB 的游标值
         self._replicate_count = 0
         self._cursor_flush_interval = 30  # 每 N 次同步 flush 一次(约30分钟)
+        # R100 独立游标持久化：避免重启后重复归档
+        self._r100_cursors: dict[str, int] = {}  # {slot_id}_r100 → cursor
+        self._r100_cursors_loaded = False
+
+    async def _load_r100_cursors(self):
+        """从 SQLite 加载 R100 独立游标，避免重启后重复归档。"""
+        if self._r100_cursors_loaded:
+            return
+        try:
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            data = await store.get("r100_cursors")
+            if data and isinstance(data, dict):
+                self._r100_cursors = {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
+                logger.info(f"[Mon] 加载 R100 游标: {len(self._r100_cursors)} 个槽位")
+        except Exception as e:
+            logger.warning(f"[Mon] 加载 R100 游标失败: {e}")
+        self._r100_cursors_loaded = True
 
     async def _ensure_telethon_client(self):
         """获取或创建 Telethon 客户端，用于读取频道历史消息。
@@ -375,10 +393,11 @@ class MonScheduler:
             if shadow_max_ids:
                 self._cursor_cache[slot_id] = min(shadow_max_ids)
 
-            # 2. 复制到 R100 全量归档（独立游标，必须成功）
+            # 2. 复制到 R100 全量归档（独立游标，持久化避免重启重复）
             if r100_slot:
+                await self._load_r100_cursors()
                 r100_cursor_key = f"{slot_id}_r100"
-                r100_last_cursor = self._cursor_cache.get(r100_cursor_key) or 0
+                r100_last_cursor = self._r100_cursors.get(r100_cursor_key, 0)
                 r100_new_messages = await self._fetch_new_messages(
                     bot_instance, active_slot["channel_id"], r100_last_cursor
                 )
@@ -392,8 +411,8 @@ class MonScheduler:
                         await self._write_backup_mappings(
                             active_slot["channel_id"], r100_slot["channel_id"], mappings_r100
                         )
-                        # R100 独立游标：只有成功才推进，失败则下周期重试
-                        self._cursor_cache[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
+                        # R100 独立游标：只有成功才推进，持久化到 SQLite
+                        self._r100_cursors[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
                     else:
                         logger.warning(
                             f"[Mon] R100 复制失败 slot={slot_id} "
@@ -407,26 +426,33 @@ class MonScheduler:
         return total_copied
 
     async def _flush_cursor_cache(self):
-        """批量 flush 本地缓存的游标到 SQLite（零 CRDB RU）。只 flush 自上次以来有变化的游标。
-        跳过 R100 独立游标（{slot_id}_r100），它们仅存内存，重启后从 0 重新追赶。"""
-        if not self._cursor_cache:
-            return
-        from database.cache_store import get_cache_store
-        store = get_cache_store()
-        changed = 0
-        for slot_id, cursor in self._cursor_cache.items():
-            if slot_id.endswith("_r100"):
-                continue
-            if self._flushed_cursors.get(slot_id) == cursor:
-                continue
+        """批量 flush 本地缓存的游标到 SQLite（零 CRDB RU）。
+        Shadow 游标写 cells 表，R100 游标写 cache_backup 表。"""
+        # 1. Flush shadow 游标
+        if self._cursor_cache:
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            changed = 0
+            for slot_id, cursor in self._cursor_cache.items():
+                if self._flushed_cursors.get(slot_id) == cursor:
+                    continue
+                try:
+                    await store.update_cell_fields_local(slot_id, {"last_synced_msg_id": cursor})
+                    self._flushed_cursors[slot_id] = cursor
+                    changed += 1
+                except Exception:
+                    pass
+            if changed > 0:
+                logger.debug(f"[Mon] flush 游标到本地: {changed} 个有变化")
+
+        # 2. Flush R100 游标到 cache_backup（持久化，避免重启重复归档）
+        if self._r100_cursors:
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
             try:
-                await store.update_cell_fields_local(slot_id, {"last_synced_msg_id": cursor})
-                self._flushed_cursors[slot_id] = cursor
-                changed += 1
-            except Exception:
-                pass
-        if changed > 0:
-            logger.debug(f"[Mon] flush 游标到本地: {changed} 个有变化")
+                await store.set("r100_cursors", self._r100_cursors.copy())
+            except Exception as e:
+                logger.warning(f"[Mon] flush R100 游标失败: {e}")
 
     @staticmethod
     async def _write_backup_mappings(main_channel_id: int, backup_channel_id: int, mappings: list[tuple[int, int]]):
