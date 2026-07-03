@@ -58,6 +58,17 @@ fi
 
 success "部署目录创建完成：$DEPLOY_DIR"
 
+# P-2: 创建专用非特权用户（替代 root 运行服务）
+info "创建专用用户 tgjiema..."
+if ! id -u tgjiema &>/dev/null; then
+    useradd -r -s /usr/sbin/nologin -d "$DEPLOY_DIR" tgjiema
+    success "用户 tgjiema 已创建（系统用户，无登录 shell）"
+else
+    info "用户 tgjiema 已存在，跳过"
+fi
+chown -R tgjiema:tgjiema "$DEPLOY_DIR"
+success "部署目录权限已设置"
+
 # ──────────────────────────────────────────────
 # 第三步：虚拟环境
 # ──────────────────────────────────────────────
@@ -87,6 +98,9 @@ if [[ ! -f "$ENV_FILE" ]]; then
     warn "请编辑: $ENV_FILE"
     nano "$ENV_FILE"
 fi
+# P-1: 收紧权限: .env 仅所有者可读，data 目录仅所有者可读写
+chmod 600 "$ENV_FILE"
+chmod 700 "$DEPLOY_DIR/data"
 
 if [[ ! -f "$DEPLOY_DIR/config/topology.yaml" ]] && [[ -f "$DEPLOY_DIR/config/groups.yaml" ]]; then
     source venv/bin/activate
@@ -129,7 +143,7 @@ PartOf=${SVC_PREFIX}.target
 
 [Service]
 Type=simple
-User=root
+User=tgjiema
 WorkingDirectory=${DEPLOY_DIR}
 Environment="PYTHONUNBUFFERED=1"
 ExecStart=${DEPLOY_DIR}/venv/bin/python ${DEPLOY_DIR}/run_all.py --standalone ${name}
