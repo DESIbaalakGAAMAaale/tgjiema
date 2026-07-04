@@ -29,7 +29,7 @@ async def seed(dry_run: bool = False, force: bool = False):
 
     print("[info] 从 .env 账号配置实时生成拓扑...")
     from config.generate_topology import generate
-    generate(groups_path, topo_path)
+    generate(groups_path, topo_path, skip_db_lookup=True)
 
     with open(topo_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)

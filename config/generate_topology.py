@@ -27,7 +27,7 @@ import asyncio
 from database import init_db, close_db, get_rotation_config
 
 
-def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
+def _load_rotation_from_db_or_env(mon_cfg: dict, skip_db_lookup: bool = False) -> dict:
     """从 DB rotation_config 表读取轮转参数,优先 .env 作为默认值,DB 有值则覆盖 .env。"""
     from config import settings as _settings
 
@@ -48,28 +48,29 @@ def _load_rotation_from_db_or_env(mon_cfg: dict) -> dict:
     if hasattr(_settings, "ROTATION_TIME_PER_SLOT"):
         result["rotation_time_per_slot"] = _settings.ROTATION_TIME_PER_SLOT
 
-    try:
-        async def _load():
-            await init_db()
-            db_keys = {
-                "active_window_size": "rotation_active_window_size",
-                "rotation_files_per_slot": "rotation_files_per_slot",
-                "rotation_time_per_slot": "rotation_time_per_slot",
-            }
-            for key, db_key in db_keys.items():
-                val = await get_rotation_config(db_key)
-                if val and val.isdigit():
-                    result[key] = int(val)
-            await close_db()
+    if not skip_db_lookup:
+        try:
+            async def _load():
+                await init_db()
+                db_keys = {
+                    "active_window_size": "rotation_active_window_size",
+                    "rotation_files_per_slot": "rotation_files_per_slot",
+                    "rotation_time_per_slot": "rotation_time_per_slot",
+                }
+                for key, db_key in db_keys.items():
+                    val = await get_rotation_config(db_key)
+                    if val and val.isdigit():
+                        result[key] = int(val)
+                await close_db()
 
-        asyncio.run(_load())
-    except Exception as e:
-        print(f"[警告] 无法从 DB 读取轮转配置,使用默认值: {e}")
+            asyncio.run(_load())
+        except Exception as e:
+            print(f"[警告] 无法从 DB 读取轮转配置,使用默认值: {e}")
 
     return result
 
 
-def generate(groups_path: str = None, output_path: str = None, env_config: dict = None):
+def generate(groups_path: str = None, output_path: str = None, env_config: dict = None, skip_db_lookup: bool = False):
     base = os.path.dirname(os.path.abspath(__file__))
     if groups_path is None:
         groups_path = os.path.join(base, "groups.yaml")
@@ -186,7 +187,8 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     r100_fallback = r100_cfg.get("fallback", []) or []
 
     # ── Mon 配置 ──
-    rotation = _load_rotation_from_db_or_env(mon_cfg)
+    rotation = _load_rotation_from_db_or_env(mon_cfg, skip_db_lookup)
+
 
     # ── 构建拓扑结构 ──
     slots = []
