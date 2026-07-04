@@ -20,7 +20,20 @@ security = HTTPBasic()
 
 @app.on_event("startup")
 async def startup():
-    """启动时从 SQLite 恢复 CSRF token 和登录失败计数。"""
+    """启动时初始化数据库连接并从 SQLite 恢复 CSRF token 和登录失败计数。"""
+    try:
+        from database import init_db
+        await init_db()
+    except Exception as e:
+        import sys
+        from loguru import logger
+        logger.error(f"[Admin] 数据库初始化失败，退出: {e}")
+        try:
+            from database import close_db
+            await close_db()
+        except Exception:
+            pass
+        sys.exit(1)
     await _load_state_from_cache()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,8 +43,8 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # IP -> [timestamps],记录 5 分钟内的失败时间戳
 # 主存为进程内存（读写快），辅助持久化到 SQLite 恢复重启后状态
 _login_failures: dict[str, list[float]] = {}
-_LOGIN_LIMIT_WINDOW = 300   # 5 分钟
-_LOGIN_LIMIT_MAX = 5        # 最多 5 次失败
+_LOGIN_LIMIT_WINDOW = settings.ADMIN_LOGIN_WINDOW
+_LOGIN_LIMIT_MAX = settings.ADMIN_LOGIN_MAX_FAIL
 
 # ─── CSRF 保护 ─────────────────────────────────────────────────
 # 每个登录会话独立 token，防止跨站请求伪造
@@ -41,8 +54,9 @@ _csrf_tokens: dict[str, str] = {}
 # M7: TTL 缓存 — 无筛选条件的 count_documents 走 CRDB 很贵，60s 缓存
 # 仅缓存 {}, 有搜索条件时仍需 CRDB（regex 等无法缓存）
 _count_cache: dict[str, tuple[float, int]] = {}
-_COUNT_CACHE_TTL = 60  # 秒
-_SEARCH_MAX_LENGTH = 50  # S-6: 搜索输入长度限制，防止 ReDoS
+_COUNT_CACHE_TTL = settings.ADMIN_COUNT_CACHE_TTL
+_SEARCH_MAX_LENGTH = settings.ADMIN_SEARCH_MAX_LENGTH
+_background_tasks: set = set()
 
 
 def _sanitize_search(raw: str) -> str:
@@ -70,8 +84,9 @@ async def _load_state_from_cache():
             loaded = json.loads(fail_data)
             for ip, timestamps in loaded.items():
                 _login_failures[ip] = timestamps
-    except Exception:
-        pass
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[Admin] 从缓存恢复状态失败: {e}")
 
 
 async def _persist_csrf_tokens():
@@ -81,8 +96,9 @@ async def _persist_csrf_tokens():
         import json
         store = get_cache_store()
         await store.set("admin:csrf_tokens", json.dumps(_csrf_tokens))
-    except Exception:
-        pass
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[Admin] 持久化CSRF token失败: {e}")
 
 
 async def _persist_login_failures():
@@ -92,8 +108,9 @@ async def _persist_login_failures():
         import json
         store = get_cache_store()
         await store.set("admin:login_failures", json.dumps(_login_failures))
-    except Exception:
-        pass
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[Admin] 持久化登录失败计数失败: {e}")
 
 
 def _get_csrf_token(username: str = "") -> str:
@@ -102,7 +119,9 @@ def _get_csrf_token(username: str = "") -> str:
         return ""
     if username not in _csrf_tokens:
         _csrf_tokens[username] = secrets.token_hex(32)
-        asyncio.ensure_future(_persist_csrf_tokens())
+        task = asyncio.ensure_future(_persist_csrf_tokens())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
     return _csrf_tokens[username]
 
 
@@ -149,7 +168,9 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     ]
     if not _login_failures[client_ip]:
         del _login_failures[client_ip]
-        asyncio.ensure_future(_persist_login_failures())
+        task = asyncio.ensure_future(_persist_login_failures())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
     elif len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
@@ -167,12 +188,16 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     if not (correct_username and correct_password):
         # 记录失败
         _login_failures[client_ip].append(now)
-        asyncio.ensure_future(_persist_login_failures())
+        task = asyncio.ensure_future(_persist_login_failures())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
         raise HTTPException(status_code=401, detail="未授权访问")
 
     # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)
-    asyncio.ensure_future(_persist_login_failures())
+    task = asyncio.ensure_future(_persist_login_failures())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     return credentials.username
 
 
@@ -186,6 +211,7 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
         value=token,
         httponly=True,
         samesite="strict",
+        secure=True,
         max_age=3600,
     )
     return response
@@ -280,7 +306,7 @@ async def users_page(
     page: int = Query(1, ge=1),
     search: str = Query(""),
 ):
-    per_page = 20
+    per_page = settings.ADMIN_PAGE_SIZE
     users_col = get_users_col()
 
     query = {}
@@ -295,6 +321,7 @@ async def users_page(
             ]
 
     # M7: 无筛选条件时走 60s TTL 缓存，避免每次翻页都 count_documents CRDB
+    # 注意: count 和 find 之间数据可能变化，翻页时可能看到少量重复/遗漏记录
     if not search:
         now = _time.time()
         cached = _count_cache.get("users")
@@ -367,7 +394,7 @@ async def update_membership(
 
     await users_col.update_one({"user_id": user_id}, update)
     response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=True, max_age=3600)
     return response
 
 
@@ -392,7 +419,7 @@ async def toggle_ban(
         {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
     )
     response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=True, max_age=3600)
     return response
 
 
@@ -462,7 +489,7 @@ async def delete_file(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="文件不存在")
     response = RedirectResponse(url="/files", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=True, max_age=3600)
     return response
 
 
@@ -472,7 +499,7 @@ async def logs_page(
     admin=Depends(verify_admin),
     page: int = Query(1, ge=1),
 ):
-    per_page = 50
+    per_page = settings.ADMIN_FILES_PAGE_SIZE
     logs_col = get_decode_logs_col()
 
     # M7: logs 无筛选条件，走 60s TTL 缓存

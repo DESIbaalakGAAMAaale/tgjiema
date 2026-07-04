@@ -282,10 +282,13 @@ class CockroachDBClient:
         async def _init_conn(conn):
             await conn.execute("SET default_transaction_use_follower_reads = off")
 
+        from config import settings as _settings
+        min_size = max(1, _settings.CRDB_POOL_MIN_SIZE)
+        max_size = min(_settings.CRDB_POOL_MAX_SIZE, 20)  # 单进程上限 20，7 进程 ≤ 140，远低于 CRDB 上限
         self._pool = await asyncpg.create_pool(
             self._url,
-            min_size=1,
-            max_size=5,
+            min_size=min_size,
+            max_size=max_size,
             statement_cache_size=256,
             init=_init_conn,
         )
@@ -307,8 +310,8 @@ class CockroachDBClient:
                 need_ddl = False
             else:
                 logger.info(f"DDL 版本变更(SQLite): {ddl_version} → {DDL_VERSION}，执行升级")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[DB] DDL版本SQLite检查跳过: {e}")
 
         if need_ddl:
             # 优先级 2: CRDB 兜底查询（仅 SQLite 无缓存时）
@@ -351,8 +354,8 @@ class CockroachDBClient:
                 ):
                     try:
                         await self.execute(ttl_sql)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"[DB] TTL设置失败: {e}")
                 await self.execute(
                     "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
                     str(DDL_VERSION),
@@ -383,8 +386,8 @@ class CockroachDBClient:
                 if all_cells:
                     await store.bulk_upsert_cells_local(all_cells)
                     logger.info(f"[DB] 预填充 cells 到本地 SQLite: {len(all_cells)} 条")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[DB] cells预填充SQLite失败: {e}")
 
         # ─── Phase 3: 全表缓存热路径到 SQLite（0 CRDB RU）─────
         # 启动时从 CRDB 全量加载 users / codes / file_records / external_code_mapping

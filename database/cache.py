@@ -3,6 +3,8 @@ import asyncio
 from collections import OrderedDict
 from typing import Optional, Any
 
+from config import settings
+
 
 class QueryCache:
     def __init__(self, max_size: int = 2000, ttl_seconds: int = 120):
@@ -61,13 +63,13 @@ class QueryCache:
         }
 
 
-_user_cache = QueryCache(max_size=1000, ttl_seconds=10800)           # 1000条/3小时
-_file_record_cache = QueryCache(max_size=1000, ttl_seconds=300)  # 1000条/5分钟(缩短以快速响应状态变更)
-_config_cache = QueryCache(max_size=100, ttl_seconds=600)            # 10分钟
+_user_cache = QueryCache(max_size=settings.CACHE_USER_MAX_SIZE, ttl_seconds=settings.CACHE_USER_TTL)
+_file_record_cache = QueryCache(max_size=settings.CACHE_FILE_MAX_SIZE, ttl_seconds=settings.CACHE_FILE_TTL)
+_config_cache = QueryCache(max_size=settings.CACHE_CONFIG_MAX_SIZE, ttl_seconds=settings.CACHE_CONFIG_TTL)
 
 # ─── C1: 负缓存(防穿透) ──────────────────────────────────
 # 查询不存在的 user_id/file_code 时缓存空值 60 秒,避免恶意穿透到 CRDB
-_NEGATIVE_CACHE_TTL = 60
+_NEGATIVE_CACHE_TTL = settings.CACHE_NEGATIVE_TTL
 _negative_user_cache: dict[int, float] = {}   # user_id -> expired_at
 _negative_file_cache: dict[str, float] = {}   # file_code -> expired_at
 
@@ -180,7 +182,7 @@ def invalidate_user_codes(user_id: int):
 
 _request_count_buffer: dict[str, int] = {}
 _request_count_lock = asyncio.Lock()
-_REQUEST_COUNT_FLUSH_INTERVAL = 900  # 每 900 秒 flush 一次(15分钟),大幅减少 CRDB RU 消耗
+_REQUEST_COUNT_FLUSH_INTERVAL = settings.CACHE_REQUEST_COUNT_FLUSH
 
 
 async def incr_request_count(file_code: str):
@@ -305,7 +307,7 @@ async def load_cache_from_disk():
 # ─── Decode Logs 缓冲:定时 flush ──────────────────
 # 策略:60 分钟兜底 + Bot 关闭时强制 flush
 
-_DECODE_LOG_FLUSH_INTERVAL = 60 * 60  # 60 分钟，减少 CRDB 写入频率
+_DECODE_LOG_FLUSH_INTERVAL = settings.CACHE_DECODE_LOG_FLUSH
 
 
 async def _flush_decode_log_buffer_loop():

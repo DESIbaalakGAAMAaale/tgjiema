@@ -24,7 +24,7 @@ class SystemMetrics:
     send_fail_count: int = 0
     backup_count: int = 0
     backup_fail_count: int = 0
-    _lock = asyncio.Lock()
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def get_bot(self, name: str) -> BotHealth:
         if name not in self.bots:

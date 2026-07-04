@@ -84,6 +84,15 @@ async def backup_all_tables() -> dict:
 
 
 async def run_db_backup():
+    # 确保数据库连接池已初始化（某些场景下 _auto_seed 可能未成功初始化）
+    if db_client._pool is None:
+        try:
+            from database.session import init_db
+            await init_db()
+        except Exception as e:
+            logger.warning(f"数据库连接初始化失败,跳过备份: {e}")
+            return
+
     enabled_cfg = await get_config("db_backup_enabled")
     if enabled_cfg is None:
         enabled = settings.DB_BACKUP_ENABLED
@@ -96,14 +105,6 @@ async def run_db_backup():
     if not settings.R2_ACCOUNT_ID or not settings.R2_ACCESS_KEY_ID or not settings.R2_SECRET_ACCESS_KEY:
         logger.warning("R2 凭证未配置,数据库备份跳过")
         return
-
-    if db_client._pool is None:
-        try:
-            from database import init_db
-            await init_db()
-        except Exception as e:
-            logger.warning(f"数据库连接初始化失败,跳过备份: {e}")
-            return
 
     r2_storage.configure(
         account_id=settings.R2_ACCOUNT_ID,
@@ -147,6 +148,8 @@ async def run_db_backup():
                 )
 
         except (SystemExit, KeyboardInterrupt):
+            raise
+        except asyncio.CancelledError:
             raise
         except BaseException as e:
             logger.error(f"数据库备份失败: {e}")

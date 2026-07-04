@@ -39,6 +39,7 @@ _pending_media_groups: dict[str, dict] = {}
 _active_a_slots: list[dict] = []
 _active_slot_index: int = 0
 _external_buffers: dict[str, dict] = {}
+_mg_lock = asyncio.Lock()  # 保护 _pending_media_groups 和 _external_buffers
 _pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
 
 async def _cleanup_pending():
@@ -46,20 +47,21 @@ async def _cleanup_pending():
     while True:
         try:
             now = time.time()
-            # 清理超时的 media group (>30s)
-            expired_mg = [k for k, v in _pending_media_groups.items() if now - v.get("created_at", 0) > 30]
-            for k in expired_mg:
-                grp = _pending_media_groups.pop(k, None)
-                if grp and grp.get("timer"):
-                    grp["timer"].cancel()
-                logger.warning(f"[up_bot] 清理超时 media group: {k}")
-            # 清理超时的 external buffer (>120s)
-            expired_ext = [k for k, v in _external_buffers.items() if now - v.get("created_at", 0) > 120]
-            for k in expired_ext:
-                buf = _external_buffers.pop(k, None)
-                if buf and buf.get("timer"):
-                    buf["timer"].cancel()
-                logger.warning(f"[up_bot] 清理超时 external buffer: {k}")
+            async with _mg_lock:
+                # 清理超时的 media group (>30s)
+                expired_mg = [k for k, v in _pending_media_groups.items() if now - v.get("created_at", 0) > 30]
+                for k in expired_mg:
+                    grp = _pending_media_groups.pop(k, None)
+                    if grp and grp.get("timer"):
+                        grp["timer"].cancel()
+                    logger.warning(f"[up_bot] 清理超时 media group: {k}")
+                # 清理超时的 external buffer (>120s)
+                expired_ext = [k for k, v in _external_buffers.items() if now - v.get("created_at", 0) > 120]
+                for k in expired_ext:
+                    buf = _external_buffers.pop(k, None)
+                    if buf and buf.get("timer"):
+                        buf["timer"].cancel()
+                    logger.warning(f"[up_bot] 清理超时 external buffer: {k}")
         except Exception as e:
             logger.error(f"[up_bot] 清理超时缓冲区异常: {e}")
         await asyncio.sleep(60)
@@ -173,14 +175,16 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # PRE-13: 仅 flush 当前用户的 media group，避免清掉其他用户正在进行中的批次
-    pending_mgids = [
-        mgid for mgid, grp in _pending_media_groups.items()
-        if grp.get("user_id") == user.id
-    ]
+    async with _mg_lock:
+        pending_mgids = [
+            mgid for mgid, grp in _pending_media_groups.items()
+            if grp.get("user_id") == user.id
+        ]
+        for mgid in pending_mgids:
+            grp = _pending_media_groups.get(mgid)
+            if grp and grp.get("timer"):
+                grp["timer"].cancel()
     for mgid in pending_mgids:
-        grp = _pending_media_groups.get(mgid)
-        if grp and grp.get("timer"):
-            grp["timer"].cancel()
         await _flush_batch_media_group(mgid, context, batch)
 
     channel_msg_ids = batch["pinned_msg_ids"]
@@ -231,24 +235,25 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if update.message.media_group_id:
         mgid = update.message.media_group_id
-        if mgid not in _pending_media_groups:
-            _pending_media_groups[mgid] = {
-                "user_id": user.id,  # PRE-13: 标记所属用户，end_upload 仅 flush 本人的
-                "file_types": defaultdict(int),
-                "updates": [],
-                "timer": None,
-                "created_at": time.time(),  # PRE-12: 供 _cleanup_pending 超时清理判断
-            }
-        grp = _pending_media_groups[mgid]
-        grp["file_types"][file_type] += 1
-        grp["updates"].append(update)
-        if grp["timer"]:
-            grp["timer"].cancel()
-        grp["timer"] = asyncio.get_running_loop().call_later(
-            1.5, lambda: asyncio.ensure_future(
-                _flush_batch_media_group(mgid, context, batch)
+        async with _mg_lock:
+            if mgid not in _pending_media_groups:
+                _pending_media_groups[mgid] = {
+                    "user_id": user.id,  # PRE-13: 标记所属用户，end_upload 仅 flush 本人的
+                    "file_types": defaultdict(int),
+                    "updates": [],
+                    "timer": None,
+                    "created_at": time.time(),  # PRE-12: 供 _cleanup_pending 超时清理判断
+                }
+            grp = _pending_media_groups[mgid]
+            grp["file_types"][file_type] += 1
+            grp["updates"].append(update)
+            if grp["timer"]:
+                grp["timer"].cancel()
+            grp["timer"] = asyncio.get_running_loop().call_later(
+                1.5, lambda: asyncio.ensure_future(
+                    _flush_batch_media_group(mgid, context, batch)
+                )
             )
-        )
     else:
         batch["file_types"][file_type] += 1
         batch["files_meta"].append(extract_file_meta(update))
@@ -276,7 +281,8 @@ async def _copy_one_media(context, target_ch, up, batch: dict):
 
 
 async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE, batch: dict):
-    grp = _pending_media_groups.pop(mgid, None)
+    async with _mg_lock:
+        grp = _pending_media_groups.pop(mgid, None)
     if grp is None:
         return
     if not grp.get("updates"):
@@ -333,29 +339,31 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     file_type = detect_file_type(update)
 
-    if update.message.media_group_id not in _pending_media_groups:
-        _pending_media_groups[update.message.media_group_id] = {
-            "user_id": user.id,
-            "file_types": defaultdict(int),
-            "updates": [],
-            "timer": None,
-            "created_at": time.time(),  # PRE-12: 供 _cleanup_pending 超时清理判断
-        }
+    async with _mg_lock:
+        if update.message.media_group_id not in _pending_media_groups:
+            _pending_media_groups[update.message.media_group_id] = {
+                "user_id": user.id,
+                "file_types": defaultdict(int),
+                "updates": [],
+                "timer": None,
+                "created_at": time.time(),  # PRE-12: 供 _cleanup_pending 超时清理判断
+            }
 
-    group = _pending_media_groups[update.message.media_group_id]
-    group["file_types"][file_type] += 1
-    group["updates"].append(update)
+        group = _pending_media_groups[update.message.media_group_id]
+        group["file_types"][file_type] += 1
+        group["updates"].append(update)
 
-    if group["timer"]:
-        group["timer"].cancel()
+        if group["timer"]:
+            group["timer"].cancel()
 
-    group["timer"] = asyncio.get_running_loop().call_later(
-        1.5, lambda: asyncio.ensure_future(_flush_media_group(update.message.media_group_id, context))
-    )
+        group["timer"] = asyncio.get_running_loop().call_later(
+            1.5, lambda: asyncio.ensure_future(_flush_media_group(update.message.media_group_id, context))
+        )
 
 
 async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
-    group = _pending_media_groups.pop(media_group_id, None)
+    async with _mg_lock:
+        group = _pending_media_groups.pop(media_group_id, None)
     if group is None:
         return
 
@@ -423,7 +431,8 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             text="请选择文件有效期：",
             reply_markup=_build_ttl_keyboard(),
         )
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[Up] 发送TTL选择键盘失败: {e}")
         pass
 
 
@@ -721,10 +730,12 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         return
     external_code = rest[user_end + 1:].strip()
 
-    buf = _external_buffers.get(external_code)
+    async with _mg_lock:
+        buf = _external_buffers.get(external_code)
+        has_channel = buf is not None and buf.get("channel_id")
     # 同一 external_code 的所有文件必须 copy 到同一存储频道，
     # 否则 pending_uploads 的 primary_channel_id 与 batch_msg_ids 中的消息 ID 不匹配（PRE-15 关联修复）
-    if buf is not None and buf.get("channel_id"):
+    if has_channel:
         target_ch = buf["channel_id"]
     else:
         target_ch = await _get_upload_target_channel()
@@ -738,29 +749,31 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     file_type = detect_file_type(update)
     file_meta = extract_file_meta(update)
 
-    if external_code not in _external_buffers:
-        _external_buffers[external_code] = {
-            "user_id": external_user_id,
-            "channel_id": target_ch,  # 记录实际存储频道，flush 时复用
-            "msg_ids": [],
-            "files_meta": [],
-            "file_types": defaultdict(int),
-            "flushed": False,
-            "created_at": time.time(),
-        }
+    async with _mg_lock:
+        if external_code not in _external_buffers:
+            _external_buffers[external_code] = {
+                "user_id": external_user_id,
+                "channel_id": target_ch,  # 记录实际存储频道，flush 时复用
+                "msg_ids": [],
+                "files_meta": [],
+                "file_types": defaultdict(int),
+                "flushed": False,
+                "created_at": time.time(),
+            }
 
-    buf = _external_buffers[external_code]
-    buf["msg_ids"].append(forwarded.message_id)
-    buf["files_meta"].append(file_meta)
-    buf["file_types"][file_type] += 1
+        buf = _external_buffers[external_code]
+        buf["msg_ids"].append(forwarded.message_id)
+        buf["files_meta"].append(file_meta)
+        buf["file_types"][file_type] += 1
 
-    # 重置安全超时定时器
-    if buf.get("timer"):
-        buf["timer"].cancel()
-    buf["timer"] = asyncio.get_running_loop().call_later(
-        60, lambda: asyncio.ensure_future(_flush_external_buffer(external_code, safe_mode=True))
-    )
-    logger.debug(f"[Up][ext_relay] 外部文件已缓存 (code={external_code}), 共{len(buf['msg_ids'])}个文件")
+        # 重置安全超时定时器
+        if buf.get("timer"):
+            buf["timer"].cancel()
+        buf["timer"] = asyncio.get_running_loop().call_later(
+            60, lambda: asyncio.ensure_future(_flush_external_buffer(external_code, safe_mode=True))
+        )
+        msg_count = len(buf["msg_ids"])
+    logger.debug(f"[Up][ext_relay] 外部文件已缓存 (code={external_code}), 共{msg_count}个文件")
 
 
 async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -785,20 +798,21 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
     """刷新外部文件缓冲写入 pending_uploads
     如果 safe_mode=True，则 flush 已执行，EXTERNAL_DONE 到达时不应重复处理。
     """
-    buf = _external_buffers.get(external_code)
-    if buf is None:
-        return
+    async with _mg_lock:
+        buf = _external_buffers.get(external_code)
+        if buf is None:
+            return
 
-    # 防止竞争：safe_mode 的超时 flush 已执行后，EXTERNAL_DONE 不应重复处理。
-    if buf.get("flushed"):
-        return
+        # 防止竞争：safe_mode 的超时 flush 已执行后，EXTERNAL_DONE 不应重复处理。
+        if buf.get("flushed"):
+            return
 
-    # 标记为已处理,防止重复 flush
-    buf["flushed"] = True
-    _external_buffers.pop(external_code, None)
+        # 标记为已处理,防止重复 flush
+        buf["flushed"] = True
+        _external_buffers.pop(external_code, None)
 
-    if buf.get("timer"):
-        buf["timer"].cancel()
+        if buf.get("timer"):
+            buf["timer"].cancel()
 
     msg_ids = buf.get("msg_ids", [])
     if not msg_ids:

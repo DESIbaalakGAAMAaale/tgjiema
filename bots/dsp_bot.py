@@ -44,10 +44,12 @@ _send_semaphore = asyncio.Semaphore(_SEND_CONCURRENCY)
 # 当 Mon Bot 不可用时,Dsp 通过发送失败率自动触发降级,作为兜底方案
 # 阈值比 Mon 更保守,仅窗口内多次失败才触发,避免误判
 _channel_failures: dict[int, list[float]] = {}  # channel_id -> [failure_timestamps]
+_cf_lock = asyncio.Lock()
 _CHANNEL_FAILURE_THRESHOLD = settings.CHANNEL_FAILURE_THRESHOLD  # 60 秒内失败 N 次触发降级
 _CHANNEL_FAILURE_WINDOW = settings.CHANNEL_FAILURE_WINDOW  # 统计窗口(秒)
 
 _pagination_states: dict[str, dict] = {}
+_pg_lock = asyncio.Lock()
 _PAGE_STATE_TTL = 300  # 5 分钟过期清理
 
 
@@ -56,9 +58,10 @@ async def _cleanup_page_states():
     while True:
         try:
             now = time.time()
-            expired = [k for k, v in _pagination_states.items() if now - v.get("created_at", 0) > _PAGE_STATE_TTL]
-            for k in expired:
-                _pagination_states.pop(k, None)
+            async with _pg_lock:
+                expired = [k for k, v in _pagination_states.items() if now - v.get("created_at", 0) > _PAGE_STATE_TTL]
+                for k in expired:
+                    _pagination_states.pop(k, None)
         except Exception as e:
             logger.error(f"[Dsp] 清理分页状态异常: {e}")
         await asyncio.sleep(60)
@@ -69,12 +72,13 @@ async def _cleanup_channel_failures():
     while True:
         try:
             now = time.time()
-            stale = [
-                ch_id for ch_id, timestamps in _channel_failures.items()
-                if not timestamps or now - max(timestamps) > 600
-            ]
-            for ch_id in stale:
-                _channel_failures.pop(ch_id, None)
+            async with _cf_lock:
+                stale = [
+                    ch_id for ch_id, timestamps in _channel_failures.items()
+                    if not timestamps or now - max(timestamps) > 600
+                ]
+                for ch_id in stale:
+                    _channel_failures.pop(ch_id, None)
             if stale:
                 logger.debug(f"[Dsp] 清理频道失败记录: {len(stale)} 个")
         except Exception as e:
@@ -126,16 +130,17 @@ async def _watch_cells_change():
                 last_version = new_version
                 logger.info(f"[Dsp] cells 变更检测(version={new_version})，已失效 delivery_resolver 缓存")
         except Exception as e:
-            logger.debug(f"[Dsp] cells 变更检测异常: {e}")
+            logger.warning(f"[Dsp] cells 变更检测异常: {e}")
         await asyncio.sleep(5)
 
 
-def _record_channel_failure(channel_id: int):
+async def _record_channel_failure(channel_id: int):
     """记录频道路由发送失败时间戳,用于 Dsp 侧降级检测"""
     now = time.time()
-    if channel_id not in _channel_failures:
-        _channel_failures[channel_id] = []
-    _channel_failures[channel_id].append(now)
+    async with _cf_lock:
+        if channel_id not in _channel_failures:
+            _channel_failures[channel_id] = []
+        _channel_failures[channel_id].append(now)
     logger.debug(f"[Dsp] 频道 {channel_id} 发送失败记录(当前窗口内失败 {len(_channel_failures[channel_id])})")
 
 
@@ -145,17 +150,18 @@ async def _check_channel_degrade(channel_id: int):
     作为 Mon Bot 的补充,仅在 Mon 不可用时作为兜底
     阈值设置更保守(3次/60秒),避免误触发短暂网络波动
     """
-    if channel_id not in _channel_failures:
-        return
+    async with _cf_lock:
+        if channel_id not in _channel_failures:
+            return
 
-    now = time.time()
-    # 清理过期记录
-    _channel_failures[channel_id] = [
-        ts for ts in _channel_failures[channel_id]
-        if now - ts <= _CHANNEL_FAILURE_WINDOW
-    ]
+        now = time.time()
+        # 清理过期记录
+        _channel_failures[channel_id] = [
+            ts for ts in _channel_failures[channel_id]
+            if now - ts <= _CHANNEL_FAILURE_WINDOW
+        ]
 
-    fail_count = len(_channel_failures[channel_id])
+        fail_count = len(_channel_failures[channel_id])
     if fail_count < _CHANNEL_FAILURE_THRESHOLD:
         return
 
@@ -166,17 +172,20 @@ async def _check_channel_degrade(channel_id: int):
         cell = await get_cell_by_channel_local(channel_id)
         if not cell:
             logger.warning(f"[Dsp] 降级失败: 频道 {channel_id} 不在 cells 中")
-            _channel_failures.pop(channel_id, None)
+            async with _cf_lock:
+                _channel_failures.pop(channel_id, None)
             return
 
         slot_id = cell.get("slot_id")
         current_status = cell.get("status", "")
         if current_status in ("lost", "shadow2"):
-            _channel_failures.pop(channel_id, None)
+            async with _cf_lock:
+                _channel_failures.pop(channel_id, None)
             return
         if current_status == "r100":
             logger.warning(f"[Dsp] 频道 {channel_id} 为 R100 槽位,跳过降级")
-            _channel_failures.pop(channel_id, None)
+            async with _cf_lock:
+                _channel_failures.pop(channel_id, None)
             return
 
         store = get_cache_store()
@@ -190,7 +199,8 @@ async def _check_channel_degrade(channel_id: int):
             f"[Dsp] 频道降级触发(兜底): {slot_id} (channel={channel_id}) "
             f"status={current_status}→lost, fail={fail_count}"
         )
-        _channel_failures.pop(channel_id, None)
+        async with _cf_lock:
+            _channel_failures.pop(channel_id, None)
     except Exception as e:
         logger.error(f"[Dsp] 频道降级异常 (channel={channel_id}): {e}")
 
@@ -293,8 +303,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
     try:
         await asyncio.wait_for(_send_semaphore.acquire(), timeout=10.0)
     except asyncio.TimeoutError:
-        await store.retry_local_job(job.job_id, job.retry_count + 1)
-        logger.debug(f"[Dsp-{worker_id}] semaphore 等待超时 job={job.job_id}")
+        logger.warning("[Dsp] 信号量获取超时，跳过本次发送")
         return False
 
     send_ok = False
@@ -320,7 +329,9 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
             logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{new_retry}")
 
         # Dsp 侧降级检查
-        for ch_id in list(_channel_failures.keys()):
+        async with _cf_lock:
+            ch_ids = list(_channel_failures.keys())
+        for ch_id in ch_ids:
             await _check_channel_degrade(ch_id)
 
     return send_ok
@@ -370,7 +381,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
 
     if not success:
-        _record_channel_failure(resolved.channel_id)
+        await _record_channel_failure(resolved.channel_id)
         # 环形降级:沿环找下一个可用频道,避免重复尝试同一频道
         tried = {resolved.channel_id}
         current_id = resolved.channel_id
@@ -382,7 +393,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
             if success:
                 break
-            _record_channel_failure(next_resolved.channel_id)
+            await _record_channel_failure(next_resolved.channel_id)
             current_id = next_resolved.channel_id
 
         # C3: 环形降级耗尽后,尝试原始存储频道(消息实际存储位置,即使已降级消息仍存在)
@@ -432,17 +443,18 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
     if total_pages > 1:
         # 加 user_id 避免多用户同码键冲突
         page_key = f"{job.code}:{job.target_user_id}"
-        _pagination_states[page_key] = {
-            "channel_msg_ids": job.storage_msg_ids,
-            "batch_file_meta": file_meta_list,
-            "total_pages": total_pages,
-            "chat_id": job.target_user_id,
-            "storage_channel_id": job.storage_channel_id,
-            "created_at": time.time(),
-            "file_code": job.code,
-            "target_user_id": job.target_user_id,
-            "protect_content": getattr(job, "protect_content", False),
-        }
+        async with _pg_lock:
+            _pagination_states[page_key] = {
+                "channel_msg_ids": job.storage_msg_ids,
+                "batch_file_meta": file_meta_list,
+                "total_pages": total_pages,
+                "chat_id": job.target_user_id,
+                "storage_channel_id": job.storage_channel_id,
+                "created_at": time.time(),
+                "file_code": job.code,
+                "target_user_id": job.target_user_id,
+                "protect_content": getattr(job, "protect_content", False),
+            }
 
     result = await _send_page(
         bot, job.target_user_id, job.code,
@@ -532,9 +544,10 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             text=f"[{page}/{total_pages} 页] 共{total_files} 个文件",
             reply_markup=keyboard,
         )
-        state = _pagination_states.get(pk)
-        if state and sent_msg:
-            state["last_pagination_msg_id"] = sent_msg.message_id
+        async with _pg_lock:
+            state = _pagination_states.get(pk)
+            if state and sent_msg:
+                state["last_pagination_msg_id"] = sent_msg.message_id
         # 翻页提示之间间隔 0.3s,避免用户聊天被消息淹
         await asyncio.sleep(0.3)
 
@@ -551,7 +564,7 @@ async def _send_report_button(bot, chat_id: int, file_code: str):
         ]])
         await safe_send_message(bot, chat_id=chat_id, text="文件已送达", reply_markup=keyboard)
     except Exception as e:
-        logger.debug(f"[Dsp] 发送举报按钮失败: {e}")
+        logger.warning(f"[Dsp] 发送举报按钮失败: {e}")
 
 
 _report_debounce: dict[str, float] = {}
@@ -660,14 +673,16 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # 使用 get 保留状态（支持多页翻页），结束或过期时才清理
-    state = _pagination_states.get(page_key)
+    async with _pg_lock:
+        state = _pagination_states.get(page_key)
     if not state:
         await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
         return
 
     # 检查 TTL
     if time.time() - state.get("created_at", 0) > _PAGE_STATE_TTL:
-        _pagination_states.pop(page_key, None)
+        async with _pg_lock:
+            _pagination_states.pop(page_key, None)
         await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
         return
 
@@ -696,7 +711,8 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     if page >= total_pages:
-        _pagination_states.pop(page_key, None)
+        async with _pg_lock:
+            _pagination_states.pop(page_key, None)
 
     await query.answer()
 
@@ -748,7 +764,7 @@ async def _async_main():
                 await sync_jobs_from_crdb_to_sqlite(100)
                 await store.cleanup_local_jobs(7)
             except Exception as e:
-                logger.debug(f"[Dsp] 周期同步异常: {e}")
+                logger.warning(f"[Dsp] 周期同步异常: {e}")
 
     # D: Sync Back - 每 60 秒同步本地状态变更回 CRDB
     async def sync_back_loop():
@@ -757,7 +773,7 @@ async def _async_main():
             try:
                 await sync_local_jobs_to_crdb()
             except Exception as e:
-                logger.debug(f"[SyncBack] 同步异常: {e}")
+                logger.warning(f"[SyncBack] 同步异常: {e}")
             await asyncio.sleep(120)
 
     create_safe_task(health_ping(), name="health-ping")

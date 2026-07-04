@@ -95,11 +95,9 @@ async def seed(dry_run: bool = False, force: bool = False):
             added += 1
             print(f"  [create] {sid} → channel={slot['channel_id']} status={slot['status']}")
 
-    await close_db()
     print(f"\n完成: 新增 {added} 个, 跳过 {skipped} 个(已存在)")
 
     # ── 步骤4:初始化轮转配置(仅当不存在时写入，不覆盖已有值) ──
-    await init_db()
     from database import get_rotation_config
     mon_cfg = config.get("mon", {})
     defaults = {

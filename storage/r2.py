@@ -87,7 +87,8 @@ class R2Storage:
         if self._http is None:
             raise RuntimeError("R2Storage not connected, call connect() first")
         url = f"{self.base_url}/{key}"
-        headers = self._sign("PUT", key, content_type)
+        payload_hash = hashlib.sha256(data).hexdigest()
+        headers = self._sign("PUT", key, content_type, payload_hash=payload_hash)
         headers["Content-Type"] = content_type
         resp = await self._http.put(url, headers=headers, content=data)
         resp.raise_for_status()
@@ -107,25 +108,44 @@ class R2Storage:
         if self._http is None:
             raise RuntimeError("R2Storage not connected, call connect() first")
         import xml.etree.ElementTree as ET
-        query = f"list-type=2&prefix={prefix}"
-        url = f"{self.base_url}?{query}"
-        # S-8: list_objects 签名包含 querystring，确保规范请求与 URL 一致
-        headers = self._sign("GET", "", querystring=query)
-        resp = await self._http.get(url, headers=headers)
-        resp.raise_for_status()
-        root = ET.fromstring(resp.text)
         ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
         result = []
-        for contents in root.findall("s3:Contents", ns):
-            key = contents.find("s3:Key", ns)
-            size = contents.find("s3:Size", ns)
-            modified = contents.find("s3:LastModified", ns)
-            result.append({
-                "key": key.text if key is not None else "",
-                "size": int(size.text) if size is not None and size.text else 0,
-                "last_modified": modified.text if modified is not None else "",
-            })
-        return result
+        continuation_token = None
+        per_request = min(max_keys, 1000)
+
+        while True:
+            query = f"list-type=2&prefix={prefix}&max-keys={per_request}"
+            if continuation_token:
+                query += f"&continuation-token={continuation_token}"
+            url = f"{self.base_url}?{query}"
+            headers = self._sign("GET", "", querystring=query)
+            resp = await self._http.get(url, headers=headers)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.text)
+
+            for contents in root.findall("s3:Contents", ns):
+                key = contents.find("s3:Key", ns)
+                size = contents.find("s3:Size", ns)
+                modified = contents.find("s3:LastModified", ns)
+                result.append({
+                    "key": key.text if key is not None else "",
+                    "size": int(size.text) if size is not None and size.text else 0,
+                    "last_modified": modified.text if modified is not None else "",
+                })
+
+            if len(result) >= max_keys:
+                break
+
+            is_truncated = root.find("s3:IsTruncated", ns)
+            if is_truncated is None or is_truncated.text != "true":
+                break
+
+            next_token = root.find("s3:NextContinuationToken", ns)
+            if next_token is None or not next_token.text:
+                break
+            continuation_token = next_token.text
+
+        return result[:max_keys]
 
     async def delete(self, key: str):
         if self._http is None:

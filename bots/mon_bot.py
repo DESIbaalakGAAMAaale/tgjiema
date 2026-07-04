@@ -336,7 +336,7 @@ class MonBot:
                 recovered += 1
                 logger.info(f"[Mon] lost 频道恢复: {slot_id} (channel={channel_id}) → shadow2")
             except Exception as e:
-                logger.debug(f"[Mon] lost 频道 {slot_id} 仍不可用: {e}")
+                logger.warning(f"[Mon] lost 频道 {slot_id} 仍不可用: {e}")
 
         if recovered > 0:
             # N21-2: 移除冗余 _bump_cells_version()，update_cell_fields_local 已内部 bump
@@ -622,7 +622,7 @@ class MonBot:
                         from database.session import sync_dirty_cells_to_crdb
                         await sync_dirty_cells_to_crdb()
                     except Exception as e:
-                        logger.debug(f"[Mon] 脏数据同步异常: {e}")
+                        logger.warning(f"[Mon] 脏数据同步异常: {e}")
 
                 # 7. 报告当前拓扑状态(从缓存读取,不查 DB)
                 await self._report_status(all_cells)

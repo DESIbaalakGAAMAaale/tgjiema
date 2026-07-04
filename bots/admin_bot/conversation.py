@@ -297,7 +297,6 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await _end(
                 f"✅ 中继账号已添加并登录成功\n"
                 f"  API_ID: {api_id}\n"
-                f"  API_HASH: {api_hash[:8]}...\n"
                 f"  手机号: {phone}\n\n"
                 f"该账号已加入账号池,可立即使用。"
             )

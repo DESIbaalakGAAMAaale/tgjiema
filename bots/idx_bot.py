@@ -49,6 +49,7 @@ from utils.flood_waiter import safe_send_message, safe_reply_text
 TOKEN = settings.DECODER_BOT_TOKEN
 
 _pending_external: dict[str, deque[tuple[int, str, float]]] = defaultdict(deque)
+_ext_lock = asyncio.Lock()
 _PENDING_TTL = settings.PENDING_TTL
 
 # ─── Quota 同步至 CRDB（SQLite First，每 6h 批量写入）─────────
@@ -66,33 +67,36 @@ async def _quota_sync_loop():
             logger.error(f"[Quota] sync loop error: {e}")
 
 
-def _enqueue_external(bot_username: str, user_id: int, code: str):
-    _pending_external[bot_username].append((user_id, code, time.time()))
+async def _enqueue_external(bot_username: str, user_id: int, code: str):
+    async with _ext_lock:
+        _pending_external[bot_username].append((user_id, code, time.time()))
 
 
-def _dequeue_external(bot_username: str) -> tuple[int, str]:
-    q = _pending_external.get(bot_username)
-    while q:
-        entry = q.popleft()
-        if time.time() - entry[2] < _PENDING_TTL:
-            return entry[0], entry[1]
-    return None, None
+async def _dequeue_external(bot_username: str) -> tuple[int, str]:
+    async with _ext_lock:
+        q = _pending_external.get(bot_username)
+        while q:
+            entry = q.popleft()
+            if time.time() - entry[2] < _PENDING_TTL:
+                return entry[0], entry[1]
+        return None, None
 
 
-def _cleanup_stale_pending():
+async def _cleanup_stale_pending():
     now = time.time()
-    stale = []
-    for bot, q in _pending_external.items():
-        while q and now - q[0][2] >= _PENDING_TTL:
-            q.popleft()
-        if not q:
-            stale.append(bot)
-    for bot in stale:
-        del _pending_external[bot]
+    async with _ext_lock:
+        stale = []
+        for bot, q in _pending_external.items():
+            while q and now - q[0][2] >= _PENDING_TTL:
+                q.popleft()
+            if not q:
+                stale.append(bot)
+        for bot in stale:
+            del _pending_external[bot]
 
 
-def _relay_pending_cleanup(bot_username: str):
-    _dequeue_external(bot_username)
+async def _relay_pending_cleanup(bot_username: str):
+    await _dequeue_external(bot_username)
 
 _external_media_groups: dict[str, tuple[int, str, float]] = {}
 _MEDIA_GROUP_TTL = settings.EXTERNAL_MEDIA_GROUP_TTL
@@ -110,22 +114,25 @@ async def _wait_bot_interval(bot_username: str):
     _bot_last_request[bot_username] = time.time()
 
 
-def _track_external_media_group(media_group_id: str, user_id: int, code: str):
-    _external_media_groups[media_group_id] = (user_id, code, time.time())
+async def _track_external_media_group(media_group_id: str, user_id: int, code: str):
+    async with _ext_lock:
+        _external_media_groups[media_group_id] = (user_id, code, time.time())
 
 
-def _get_external_media_group_user(media_group_id: str) -> tuple[int, str]:
-    entry = _external_media_groups.pop(media_group_id, None)
-    if entry and time.time() - entry[2] < _MEDIA_GROUP_TTL:
-        return entry[0], entry[1]
-    return None, None
+async def _get_external_media_group_user(media_group_id: str) -> tuple[int, str]:
+    async with _ext_lock:
+        entry = _external_media_groups.pop(media_group_id, None)
+        if entry and time.time() - entry[2] < _MEDIA_GROUP_TTL:
+            return entry[0], entry[1]
+        return None, None
 
 
-def _cleanup_media_groups():
+async def _cleanup_media_groups():
     now = time.time()
-    stale = [k for k, v in _external_media_groups.items() if now - v[2] >= _MEDIA_GROUP_TTL]
-    for k in stale:
-        _external_media_groups.pop(k, None)
+    async with _ext_lock:
+        stale = [k for k, v in _external_media_groups.items() if now - v[2] >= _MEDIA_GROUP_TTL]
+        for k in stale:
+            _external_media_groups.pop(k, None)
 
 
 _MEDIA_GROUP_BUFFER_WAIT = settings.MEDIA_GROUP_BUFFER_WAIT
@@ -146,6 +153,7 @@ def _parse_storage_ids_from_caption(caption: str) -> list[int]:
 # ─── 活跃频道本地缓存(避免每次解码都查询 cells) ───
 _active_channels_cache: list[dict] = []
 _active_channels_index = 0
+_ch_lock = asyncio.Lock()
 
 
 async def _refresh_active_channels():
@@ -154,7 +162,8 @@ async def _refresh_active_channels():
     try:
         _active_channels_cache = await get_active_cells_local()
         _active_channels_index = 0
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[Idx] 刷新活跃频道失败: {e}")
         pass
 
 
@@ -162,15 +171,17 @@ async def _get_storage_channel() -> int:
     """获取当前活跃存储频道(从本地缓存, 每60 秒刷新一次)"""
     global _active_channels_index
     if _active_channels_cache:
-        idx = _active_channels_index % len(_active_channels_cache)
-        _active_channels_index += 1
+        async with _ch_lock:
+            idx = _active_channels_index % len(_active_channels_cache)
+            _active_channels_index += 1
         return _active_channels_cache[idx]["channel_id"]
     # 缓存未就绪, 回退 DB 查询
     try:
         cells = await get_active_cells_local()
         if cells:
             return cells[0]["channel_id"]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[Idx] 获取存储频道失败: {e}")
         pass
     return 0
 
@@ -484,7 +495,8 @@ async def _process_one_pending(app: Application, row: dict):
         logger.error(f"[Idx][poll] 生成文件码失败(uploader={uploader_id}): {e}")
         try:
             await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试或联系管理员。")
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[Idx] 通知用户处理失败: {e}")
             pass
         await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
         return
@@ -1614,7 +1626,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         duration_ms = int((_time.time() - start) * 1000)
         if ok:
             await relay_pool.release_account(account, duration_ms)
-            _enqueue_external(bot_username, user_id, code)
+            await _enqueue_external(bot_username, user_id, code)
             # 投递成功后才递增配额
             from services.permission import increment_user_quota_used
             await increment_user_quota_used(user_id, is_external=True)
@@ -1628,7 +1640,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
 
     try:
         await safe_send_message(context.bot, chat_id=bot_username, text=code)
-        _enqueue_external(bot_username, user_id, code)
+        await _enqueue_external(bot_username, user_id, code)
         # 投递成功后才递增配额
         from services.permission import increment_user_quota_used
         await increment_user_quota_used(user_id, is_external=True)
@@ -1650,7 +1662,7 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
     bot_username = _resolve_bot_username(update)
     if not bot_username:
         return
-    target_user_id, code = _dequeue_external(bot_username)
+    target_user_id, code = await _dequeue_external(bot_username)
     if target_user_id is None:
         return
 
@@ -1664,7 +1676,7 @@ async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TY
     bot_username = _resolve_bot_username(update)
     if not bot_username:
         return
-    target_user_id, code = _dequeue_external(bot_username)
+    target_user_id, code = await _dequeue_external(bot_username)
     if target_user_id is None:
         return
 
@@ -1833,7 +1845,7 @@ async def _async_main():
                         source = "external"
                         bot_username = _resolve_bot_username(update)
                         if bot_username:
-                            user_id, code = _dequeue_external(bot_username)
+                            user_id, code = await _dequeue_external(bot_username)
                     if not user_id or not code:
                         return
                     timer = create_safe_task(_flush_media_group_buffer(mg_id), name=f"flush-mg-{mg_id}")
@@ -1863,8 +1875,8 @@ async def _async_main():
 
     async def cleanup_loop():
         while True:
-            _cleanup_stale_pending()
-            _cleanup_media_groups()
+            await _cleanup_stale_pending()
+            await _cleanup_media_groups()
             await asyncio.sleep(60)
 
     create_safe_task(health_ping(), name="health-ping")

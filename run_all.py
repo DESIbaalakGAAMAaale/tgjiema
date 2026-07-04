@@ -106,25 +106,20 @@ def _shutdown(processes: dict):
 
 def _auto_seed():
     """启动前自动初始化拓扑(静默,不交互)。
-    先建表,再初始化拓扑,失败不阻塞启动。
+    仅用于多进程模式。独立模式下各 Bot 自行调用 init_db()，
+    拓扑已由部署脚本预初始化，无需重复执行。
+    auto_seed() 是幂等的（cells 已存在则跳过），失败说明 CRDB 不可达，
+    应直接退出而非静默继续。
     """
     import asyncio
 
-    # 先尝试建表
-    try:
-        from database.session import init_db
-        asyncio.run(init_db())
-        logger.info("[seed] 数据库表初始化完成")
-    except Exception as e:
-        logger.warning(f"[seed] 数据库表初始化失败: {e}")
-
-    # 拓扑初始化(只试一次,失败不阻塞)
     try:
         from admin.seed_topology import auto_seed
         asyncio.run(auto_seed())
         logger.info("[seed] 拓扑初始化完成")
     except Exception as e:
-        logger.warning(f"[seed] 拓扑初始化失败,将在首次使用时重试: {e}")
+        logger.error(f"[seed] 拓扑初始化失败（CRDB 可能不可达），退出: {e}")
+        sys.exit(1)
 
 
 def _monitor_and_restart(processes: dict, running_flag: multiprocessing.Value):
@@ -197,10 +192,12 @@ def main():
         level=settings.LOG_LEVEL,
     )
 
-    # ── 启动前自动初始化拓扑 ──
-    _auto_seed()
-
     args = sys.argv[1:]
+
+    # ── 启动前自动初始化拓扑（仅多进程模式需要）──
+    # 独立模式下各 Bot 自行调用 init_db()，拓扑已预初始化
+    if not (args and args[0] == "--standalone"):
+        _auto_seed()
 
     # ── 独立模式:--standalone <bot_name> ──
     if args and args[0] == "--standalone":

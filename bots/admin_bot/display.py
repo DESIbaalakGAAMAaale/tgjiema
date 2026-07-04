@@ -46,7 +46,8 @@ async def _get_cells_cached(status_filter: dict | None = None, sort_key: str = "
         if cells:
             _cells_cache[cache_key] = (now, cells)
             return cells
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[Admin] cells缓存查询失败: {e}")
         pass
     # CRDB 兜底（1 RU）
     col = get_cells_col()
@@ -172,7 +173,8 @@ async def _get_topology_text() -> str:
     active_channel = await get_active_storage_channel_id()
     try:
         cells = await _get_cells_cached()
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[Admin] cells缓存查询失败: {e}")
         cells = []
 
     msg = "🔗 环形冗余拓扑\n\n"
@@ -296,7 +298,8 @@ async def _get_relay_status_text() -> str:
     if not relay_pool._initialized:
         try:
             await relay_pool.init()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[Admin] 中继池初始化失败: {e}")
             pass
 
     msg = "🔐 中继账号池状态\n\n"

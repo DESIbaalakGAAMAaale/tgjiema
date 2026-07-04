@@ -402,7 +402,7 @@ async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_relay_config(api_id, api_hash, phone)
     await update.message.reply_text(
         f"✅ 中继账号已配置\n"
-        f"API_ID:{api_id}\n"
+        f"API_ID:{str(api_id)[:4]}...\n"
         f"手机号:{phone[:3]}****{phone[-2:] if len(phone) > 5 else ''}\n\n"
         f"⚠️ 配置已保存到数据库,解码机器人下次重启时生效。\n"
         f"⚠️ 请确保该账号未开启二步验证。\n"
@@ -443,7 +443,8 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not relay_pool._initialized:
         try:
             await relay_pool.init()
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[Admin] 中继池初始化失败: {e}")
             pass
     pool_status = await relay_pool.get_pool_status()
     if not pool_status:
@@ -494,8 +495,7 @@ async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
         await update.message.reply_text(
             f"✅ 中继账号已添加到池中\n"
-            f"  API_ID: {api_id}\n"
-            f"  API_HASH: {api_hash[:8]}...\n"
+            f"  API_ID: {str(api_id)[:4]}...\n"
             f"  手机号: {masked}\n\n"
             f"解码机器人将自动检测新账号并连接。\n"
             f"如需要登录验证码,请使用 /relay_code 提交。"
@@ -759,7 +759,8 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await local_db.execute(f"DELETE FROM {tbl}")
                     sqlite_cleared.append(tbl)
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"[Admin] 清空本地表 {tbl} 失败: {e}")
                     pass  # 表可能不存在，忽略
             await local_db.commit()
         if sqlite_cleared:

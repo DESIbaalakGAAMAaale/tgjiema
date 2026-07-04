@@ -6,10 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
 import aiosqlite
 from datetime import date, datetime, timezone
 from pathlib import Path
 from loguru import logger
+
+# 后台异步同步任务的引用集合，防止 GC 回收 fire-and-forget 任务
+_background_tasks: set = set()
 
 # ── 加密层（Fernet 对称加密）──────────────────────────────────────────
 # PRE-10: 取消所有静默回退路径。cryptography 缺失、密钥未配置、密钥格式非法、
@@ -154,7 +158,15 @@ class RelayDB:
 
     async def init(self):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+        try:
+            self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+        except (sqlite3.DatabaseError, aiosqlite.Error) as e:
+            if "file is not a database" in str(e).lower() and DB_PATH.exists():
+                logger.warning(f"[RelayDB] SQLite 文件已损坏，删除重建: {DB_PATH}")
+                DB_PATH.unlink()
+                self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+            else:
+                raise
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.execute("PRAGMA busy_timeout=5000")
@@ -202,7 +214,9 @@ class RelayDB:
         await self._db.commit()
         
         # 双向同步到 CRDB（异步，不阻塞）
-        asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))
+        task = asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
         
         return cursor.lastrowid
 
@@ -214,7 +228,9 @@ class RelayDB:
         await self._db.commit()
         
         # 双向同步到 CRDB（异步，不阻塞）
-        asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))
+        task = asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
     async def deactivate_account(self, phone: str):
         await self._db.execute(

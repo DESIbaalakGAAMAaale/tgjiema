@@ -85,6 +85,9 @@ pip install --upgrade pip
 pip install --no-cache-dir -r requirements.txt
 pip install --no-cache-dir "uvloop>=0.19.0,<0.21.0" "orjson>=3.9.0,<4.0.0"
 
+# P-2b: pip install 后重新 chown，确保 venv 文件属主正确
+chown -R tgjiema:tgjiema "$DEPLOY_DIR"
+
 success "Python 依赖安装完成"
 
 # ──────────────────────────────────────────────

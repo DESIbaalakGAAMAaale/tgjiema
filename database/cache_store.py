@@ -9,6 +9,7 @@ except ImportError:
     import json
 import asyncio
 import datetime
+import sqlite3
 import time
 import aiosqlite
 from pathlib import Path
@@ -33,7 +34,15 @@ class CacheStore:
 
     async def init(self):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+        try:
+            self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+        except (sqlite3.DatabaseError, aiosqlite.Error) as e:
+            if "file is not a database" in str(e).lower() and DB_PATH.exists():
+                logger.warning(f"[CacheStore] SQLite 文件已损坏，删除重建: {DB_PATH}")
+                DB_PATH.unlink()
+                self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+            else:
+                raise
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.execute("PRAGMA busy_timeout=5000")
@@ -115,8 +124,8 @@ class CacheStore:
         )
         try:
             await self._db.execute("ALTER TABLE local_job_queue ADD COLUMN dead_retry_count INTEGER DEFAULT 0")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[CacheStore] ALTER TABLE失败(非预期): {e}")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_local_job_pending ON local_job_queue(status, created_at)"
         )
@@ -171,8 +180,8 @@ class CacheStore:
         ]:
             try:
                 await self._db.execute(_col_ddl)
-            except Exception:
-                pass  # 字段已存在
+            except Exception as e:
+                logger.warning(f"[CacheStore] ALTER TABLE失败(非预期): {e}")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_cells_local_status ON cells_local(status)"
         )
@@ -332,8 +341,8 @@ class CacheStore:
                 "DELETE FROM cache_backup WHERE key = ?", (key,)
             )
             await self._db.commit()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[CacheStore] 删除缓存失败: {e}")
 
     async def cleanup(self, max_age_days: int = 30):
         """清理超过 N 天的旧缓存"""
@@ -461,8 +470,8 @@ class CacheStore:
                 (time.time() - 3600,),
             )
             await self._db.commit()
-        except Exception:
-            pass  # 清理失败不影响主流程
+        except Exception as e:
+            logger.debug(f"[CacheStore] 通知表清理失败: {e}")
 
     # ─── 心跳本地存储：Mon Bot 写入 SQLite，零 CRDB RU ───
 

@@ -128,6 +128,29 @@ class Settings(BaseSettings):
     RATE_LIMIT_THRESHOLD_LOW: int = 10          # 低负载阈值（jobs 数量 < 此值用基础延迟）
     RATE_LIMIT_THRESHOLD_HIGH: int = 30         # 高负载阈值（jobs 数量 > 此值用最大延迟）
 
+    # ── 数据库连接池（自动适配，不超过 CRDB 上限）──
+    CRDB_POOL_MIN_SIZE: int = 1                 # 最小连接数
+    CRDB_POOL_MAX_SIZE: int = 5                 # 最大连接数（7 进程 × 此值 ≤ CRDB 上限，建议 ≤20）
+
+    # ── 缓存参数 ──
+    CACHE_USER_MAX_SIZE: int = 1000             # 用户缓存最大条目
+    CACHE_USER_TTL: int = 10800                 # 用户缓存 TTL（秒）
+    CACHE_FILE_MAX_SIZE: int = 1000             # 文件缓存最大条目
+    CACHE_FILE_TTL: int = 300                   # 文件缓存 TTL（秒）
+    CACHE_CONFIG_MAX_SIZE: int = 100            # 配置缓存最大条目
+    CACHE_CONFIG_TTL: int = 600                 # 配置缓存 TTL（秒）
+    CACHE_NEGATIVE_TTL: int = 60                # 负面缓存 TTL（秒）
+    CACHE_REQUEST_COUNT_FLUSH: int = 900        # 请求计数刷新间隔（秒）
+    CACHE_DECODE_LOG_FLUSH: int = 3600          # 解码日志刷新间隔（秒）
+
+    # ── Admin Web 参数 ──
+    ADMIN_LOGIN_WINDOW: int = 300               # 登录失败计数窗口（秒）
+    ADMIN_LOGIN_MAX_FAIL: int = 5               # 窗口内最大失败次数
+    ADMIN_COUNT_CACHE_TTL: int = 60             # count 缓存 TTL（秒）
+    ADMIN_SEARCH_MAX_LENGTH: int = 50           # 搜索输入最大长度
+    ADMIN_PAGE_SIZE: int = 20                   # 默认分页大小
+    ADMIN_FILES_PAGE_SIZE: int = 50             # 文件列表分页大小
+
     # ─── 管理员 Bot 配置键名映射 ──────────────────────────
     @property
     def db_backup_interval(self) -> int:

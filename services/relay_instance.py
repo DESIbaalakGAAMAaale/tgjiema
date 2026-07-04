@@ -8,6 +8,7 @@ from pathlib import Path
 
 from loguru import logger
 from telethon import TelegramClient, events
+from utils.task_utils import create_safe_task
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 from config import settings
@@ -377,7 +378,7 @@ class RelayInstance:
                     "bot_username": bot_username,
                     "_expires": now_ts + 5,
                 }
-                asyncio.create_task(
+                create_safe_task(
                     self._flush_media_group_buffer(media_group_id, bot_username)
                 )
                 return
@@ -413,7 +414,7 @@ class RelayInstance:
                 old.cancel()
             else:
                 return
-        exchange["_settle_task"] = asyncio.create_task(
+        exchange["_settle_task"] = create_safe_task(
             self._message_loop(bot_username, settle_wait)
         )
 
