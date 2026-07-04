@@ -98,6 +98,9 @@ async def _get_upload_target_channel() -> int:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
+    user = update.effective_user
+    from services.permission import get_or_create_user
+    await get_or_create_user(user.id, user.username, user.first_name)
     await safe_reply_text(update.message,
         "欢迎使用上传机器人。\n\n"
         "📤 **单次上传**: 直接发送文件, 立即生成文件码\n\n"
