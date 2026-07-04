@@ -1,4 +1,5 @@
 import base64
+import re
 from typing import Optional
 
 from loguru import logger
@@ -182,6 +183,19 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         extra = "ignore"
+
+    @model_validator(mode='before')
+    @classmethod
+    def strip_inline_comments(cls, data: dict) -> dict:
+        """移除 .env 文件中行内注释（# 及之后的内容），防止 pydantic 解析失败。"""
+        if not isinstance(data, dict):
+            return data
+        stripped = {}
+        for key, value in data.items():
+            if isinstance(value, str):
+                value = re.sub(r'\s+#.*$', '', value).rstrip()
+            stripped[key] = value
+        return stripped
 
     @model_validator(mode='after')
     def validate_required_fields(self):
