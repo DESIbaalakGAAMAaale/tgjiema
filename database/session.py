@@ -322,39 +322,48 @@ class CockroachDBClient:
                 logger.info("首次运行或 rotation_config 表不存在，执行 DDL 初始化")
 
         if need_ddl:
-            for sql in DDL_STATEMENTS:
-                try:
-                    await self.execute(sql)
-                except Exception as e:
-                    logger.warning(f"[DB] DDL SQL 执行失败（可忽略）：{e}")
-            for sql in MIGRATION_STATEMENTS:
-                try:
-                    await self.execute(sql)
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    # 只忽略"列已存在"或"关系已存在"错误，这些是预期的（因为没有 IF NOT EXISTS）
-                    if "already exists" in err_msg or "duplicate" in err_msg:
-                        logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略，已存在）：{sql[:60]}... → {e}")
-                    else:
-                        logger.error(f"[DB] 迁移 SQL 执行失败（严重）：{sql} → {e}")
-                        # 重新抛出非预期错误，确保启动失败被发现
-                        raise
+            # DDL/迁移需写操作，临时关闭 follower reads（否则 default_transaction_use_follower_reads=on 导致只读事务）
+            await self.execute("SET default_transaction_use_follower_reads = off")
+            try:
+                for sql in DDL_STATEMENTS:
+                    try:
+                        await self.execute(sql)
+                    except Exception as e:
+                        logger.warning(f"[DB] DDL SQL 执行失败（可忽略）：{e}")
+                for sql in MIGRATION_STATEMENTS:
+                    try:
+                        await self.execute(sql)
+                    except Exception as e:
+                        err_msg = str(e).lower()
+                        # 只忽略"列已存在"或"关系已存在"错误，这些是预期的（因为没有 IF NOT EXISTS）
+                        if "already exists" in err_msg or "duplicate" in err_msg:
+                            logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略，已存在）：{sql[:60]}... → {e}")
+                        else:
+                            logger.error(f"[DB] 迁移 SQL 执行失败（严重）：{sql} → {e}")
+                            # 重新抛出非预期错误，确保启动失败被发现
+                            raise
+            finally:
+                await self.execute("SET default_transaction_use_follower_reads = on")
             # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
             # RESET 在某些 CRDB 版本不生效，改用与 migration 一致的 SET 方式，确保 TTL job 不运行
             # 改为 Python 端负责清理（见 database/cache.py: _flush_decode_log_buffer_loop）
-            for ttl_sql in (
-                "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
-                "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
-            ):
-                try:
-                    await self.execute(ttl_sql)
-                except Exception:
-                    pass
-            # 写入 CRDB 版本号
-            await self.execute(
-                "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
-                str(DDL_VERSION),
-            )
+            await self.execute("SET default_transaction_use_follower_reads = off")
+            try:
+                for ttl_sql in (
+                    "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
+                    "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
+                ):
+                    try:
+                        await self.execute(ttl_sql)
+                    except Exception:
+                        pass
+                # 写入 CRDB 版本号
+                await self.execute(
+                    "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
+                    str(DDL_VERSION),
+                )
+            finally:
+                await self.execute("SET default_transaction_use_follower_reads = on")
             # 写入 SQLite 缓存版本号（后续启动 0 CRDB RU）
             await store.set_kv("ddl_version", str(DDL_VERSION))
             logger.info(f"DDL 升级完成，版本 {DDL_VERSION}")
