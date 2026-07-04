@@ -22,7 +22,6 @@ import sys
 
 # 确保项目根目录在 sys.path 中（从项目根目录 python config/generate_topology.py 运行时需要）
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import yaml
 import asyncio
 from database import init_db, close_db, get_rotation_config
@@ -92,8 +91,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     # 如果 .env 中没有配置账号,回退到 groups.yaml
     if not accounts:
         if not os.path.exists(groups_path):
-            print("[错误] .env 中未配置账号频道,且未找到 config/groups.yaml")
-            sys.exit(1)
+            raise RuntimeError(".env 中未配置账号频道,且未找到 config/groups.yaml")
 
         with open(groups_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
@@ -106,8 +104,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
         print(f"[info] 从 .env 读取账号配置: {len(accounts)} 个账号")
 
     if not accounts:
-        print("[错误] 未配置任何账号频道,请在 .env 或 groups.yaml 中配置")
-        sys.exit(1)
+        raise RuntimeError("未配置任何账号频道,请在 .env 或 groups.yaml 中配置")
 
     account_count = len(accounts)
 
@@ -116,13 +113,11 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
     if len(set(ch_counts)) != 1:
         for a in accounts:
             print(f"  {a.get('name', '?')}: {len(a.get('channels', []))} 个频道")
-        print("[错误] 所有账号的频道数必须相同")
-        sys.exit(1)
+        raise RuntimeError("所有账号的频道数必须相同")
 
     ch_per_account = ch_counts[0]
     if ch_per_account % 3 != 0:
-        print(f"[错误] 每个账号频道数必须是 3 的倍数,当前: {ch_per_account}")
-        sys.exit(1)
+        raise RuntimeError(f"每个账号频道数必须是 3 的倍数,当前: {ch_per_account}")
 
     group_count = (account_count * ch_per_account) // 3
 
@@ -148,7 +143,7 @@ def generate(groups_path: str = None, output_path: str = None, env_config: dict 
             if ch in (r100_cfg.get("fallback") or []):
                 owners.append("R100-fallback")
             print(f"  {ch} 出现在: {owners}")
-        sys.exit(1)
+        raise RuntimeError(f"检测到重复频道 ID: {dupes}")
 
     # ── 为每个账号建立频道池 + 游标 ──
     pools = []

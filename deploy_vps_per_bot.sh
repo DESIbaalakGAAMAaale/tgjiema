@@ -230,9 +230,42 @@ systemctl start "${SVC_PREFIX}-admin" 2>/dev/null || true
 sleep 3
 
 # ──────────────────────────────────────────────
-# 第七步：状态检查
+# 第七步：拓扑刷新（清理 git 占位 ID，从 .env 重新生成）
 # ──────────────────────────────────────────────
-info "第七步：状态检查..."
+info "第七步：拓扑刷新..."
+
+source venv/bin/activate
+cd "$DEPLOY_DIR"
+
+# 检查 topology.yaml 是否含有占位频道 ID（-1000000000xxx），有则从 .env 重新生成
+if grep -q -- "-1000000000" config/topology.yaml 2>/dev/null; then
+    warn "检测到 topology.yaml 含有占位频道 ID，从 .env 重新生成..."
+    python3.12 -c "
+import asyncio
+from database import init_db, close_db, get_cells_col
+from admin.seed_topology import seed
+
+async def refresh():
+    await init_db()
+    col = get_cells_col()
+    count = await col.count_documents({})
+    if count > 0:
+        await col.delete_many({})
+        print(f'cells 表 {count} 个旧槽位已清空')
+    await close_db()
+asyncio.run(refresh())
+"
+    python3.12 admin/seed_topology.py --yes
+    success "拓扑已从 .env 刷新，频道 ID 已更新"
+    info "请手动执行: systemctl restart tgjiema.target"
+else
+    success "topology.yaml 已包含真实频道 ID，跳过"
+fi
+
+# ──────────────────────────────────────────────
+# 第八步：状态检查
+# ──────────────────────────────────────────────
+info "第八步：状态检查..."
 
 echo ""
 echo "--------------------------------------------------------------------------------"

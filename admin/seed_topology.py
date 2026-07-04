@@ -22,27 +22,14 @@ from database import set_rotation_config
 
 
 async def seed(dry_run: bool = False, force: bool = False):
-    # ── 步骤1:自动生成 topology.yaml(如果 groups.yaml 更新) ──
+    # ── 步骤1:始终从 .env 实时生成拓扑(不依赖 git 缓存文件中的占位 ID) ──
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     groups_path = os.path.join(base, "config", "groups.yaml")
     topo_path = os.path.join(base, "config", "topology.yaml")
 
-    if not os.path.exists(groups_path):
-        print("[错误] 未找到 config/groups.yaml,请先创建拓扑配置")
-        raise RuntimeError("未找到 config/groups.yaml,请先创建拓扑配置")
-
-    need_regenerate = True
-    if os.path.exists(topo_path):
-        groups_mtime = os.path.getmtime(groups_path)
-        topo_mtime = os.path.getmtime(topo_path)
-        need_regenerate = groups_mtime > topo_mtime
-
-    if need_regenerate:
-        print("[info] groups.yaml 有更新,重新生成 topology.yaml ...")
-        from config.generate_topology import generate
-        generate(groups_path, topo_path)
-    else:
-        print("[info] topology.yaml 已是最新,跳过生成")
+    print("[info] 从 .env 账号配置实时生成拓扑...")
+    from config.generate_topology import generate
+    generate(groups_path, topo_path)
 
     with open(topo_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
