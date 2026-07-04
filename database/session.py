@@ -259,8 +259,8 @@ MIGRATION_STATEMENTS = [
     "DROP INDEX IF EXISTS idx_decode_logs_requester",
     "DROP INDEX IF EXISTS idx_file_records_msg_id",
     # ─── CRDB 行级 TTL 禁用：延长到 100 年 + @yearly cron，由 Python 端负责清理 ───
-    "ALTER TABLE decode_logs SET (ttl_expiration_expression = '((request_time::TIMESTAMPTZ + INTERVAL ''100 years'') AT TIME ZONE ''UTC'')', ttl_job_cron = '@yearly')",
-    "ALTER TABLE jobs SET (ttl_expiration_expression = '((created_at::TIMESTAMPTZ + INTERVAL ''100 years'') AT TIME ZONE ''UTC'')', ttl_job_cron = '@yearly')",
+    "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
+    "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
 ]
 
 
