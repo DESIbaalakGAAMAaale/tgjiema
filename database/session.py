@@ -258,9 +258,9 @@ MIGRATION_STATEMENTS = [
     "DROP INDEX IF EXISTS idx_users_first_name",
     "DROP INDEX IF EXISTS idx_decode_logs_requester",
     "DROP INDEX IF EXISTS idx_file_records_msg_id",
-    # ─── CRDB 行级 TTL 禁用：延长到 100 年 + @yearly cron，由 Python 端负责清理 ───
-    "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
-    "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
+    # TTL 设置不在此处执行 — ADD COLUMN 是异步 schema change，
+    # 紧跟 TTL 修改会报 "cannot modify TTL settings while another schema change
+    # is being processed"。改为在下方单独循环中带等待执行。
 ]
 
 
@@ -348,14 +348,24 @@ class CockroachDBClient:
                             logger.error(f"[DB] 迁移 SQL 执行失败（严重）：{sql} → {e}")
                             raise
                 # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
+                # 等待前面的 ADD COLUMN 等 schema change 完成，否则 CRDB 报
+                # "cannot modify TTL settings while another schema change is being processed"
+                await asyncio.sleep(3)
                 for ttl_sql in (
                     "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
                     "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
                 ):
-                    try:
-                        await self.execute(ttl_sql)
-                    except Exception as e:
-                        logger.warning(f"[DB] TTL设置失败: {e}")
+                    for attempt in range(3):
+                        try:
+                            await self.execute(ttl_sql)
+                            break
+                        except Exception as e:
+                            if "another schema change" in str(e).lower() and attempt < 2:
+                                logger.warning(f"[DB] TTL 设置等待 schema change 完成，重试 {attempt + 1}/3: {e}")
+                                await asyncio.sleep(5)
+                            else:
+                                logger.warning(f"[DB] TTL设置失败: {e}")
+                                break
                 await self.execute(
                     "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
                     str(DDL_VERSION),
