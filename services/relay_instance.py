@@ -50,6 +50,9 @@ class RelayInstance:
         self._pending_cache_events: dict[str, asyncio.Event] = {}
         # idx_bot 确认等待：code -> Event
         self._ready_events: dict[str, asyncio.Event] = {}
+        # bot_override 内存缓存（避免每次外发都全表扫描 SQLite）
+        self._bot_override_cache: list[dict] = []
+        self._bot_override_cache_ts: float = 0
 
     @property
     def is_ready(self) -> bool:
@@ -234,15 +237,21 @@ class RelayInstance:
             except Exception:
                 pass
 
-            # 检查 bot_overrides 覆盖规则（按最长前缀匹配）
+            # 检查 bot_overrides 覆盖规则（按最长前缀匹配，带内存缓存避免每次全表扫描）
             try:
-                from database.relay_db import get_relay_db
-                relay_db = await get_relay_db()
-                if relay_db:
-                    override = await relay_db.get_bot_override(code)
-                    if override:
-                        logger.info(f"[RelayInstance:{self.phone}] 前缀覆盖: {code} → @{override}")
-                        bot_username = override
+                import time
+                now = time.time()
+                if now - self._bot_override_cache_ts > 60:
+                    from database.relay_db import get_relay_db
+                    relay_db = await get_relay_db()
+                    if relay_db:
+                        self._bot_override_cache = await relay_db.list_bot_overrides()
+                        self._bot_override_cache_ts = now
+                for ov in self._bot_override_cache:
+                    if ov.get("is_active") and code.startswith(ov["prefix"]):
+                        logger.info(f"[RelayInstance:{self.phone}] 前缀覆盖: {code} → @{ov['bot_username']}")
+                        bot_username = ov["bot_username"]
+                        break
             except Exception:
                 pass
 
@@ -432,7 +441,8 @@ class RelayInstance:
             if bot_username == decoder_un and self._ready_events:
                 text = getattr(event.message, "message", None) or ""
                 for code, ev in list(self._ready_events.items()):
-                    if code in text and ("已就绪" in text or "ready" in text.lower()):
+                    # 精确匹配：code 作为独立词出现（前后为空格/冒号/行首尾）
+                    if re.search(rf"(?:^|\s|:|：){re.escape(code)}(?:\s|$|，|。)", text) and ("已就绪" in text or "ready" in text.lower()):
                         if not ev.is_set():
                             ev.set()
                             logger.info(f"[RelayInstance:{self.phone}] idx_bot 已确认外部文件就绪: code={code}")
@@ -471,6 +481,9 @@ class RelayInstance:
                 text = getattr(msg, "message", None) or ""
                 if text:
                     exchange.setdefault("text_responses", []).append({"msg_id": msg.id, "text": text})
+                # 带键盘的文本消息也需对决策函数可见（翻页按钮、错误文本检测）
+                if msg.reply_markup:
+                    exchange.setdefault("events", []).append(event)
             code = exchange.get("code")
             if code:
                 self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
@@ -666,19 +679,10 @@ class RelayInstance:
             # N-15-6: 统一复位 is_busy，防止 CancelledError 等边缘路径导致永久 busy
             self.is_busy = False
             if bot_username in self._bot_exchange:
-                exchange = self._bot_exchange[bot_username]
-                exchange["_ai_running"] = False
-                # 标记码已映射到本地缓存，避免重复查询 CRDB
-                try:
-                    from database.relay_db import get_relay_db
-                    relay_db = await get_relay_db()
-                    if relay_db:
-                        await relay_db.mark_code_mapped(exchange.get("code", ""))
-                except Exception:
-                    pass
+                self._bot_exchange[bot_username]["_ai_running"] = False
 
     def _make_decision(self, exchange: dict) -> dict:
-        _NEXT_KW = ("next", "下一页", "下一页", "下一组",
+        _NEXT_KW = ("next", "下一页", "下一頁", "下一组",
                      "→", "▶", "➡", ">>", "»")
         _ERROR_KW = ("未找到", "已过期", "已失效",
                      "不存在", "not found", "expired", "invalid")
@@ -799,7 +803,6 @@ class RelayInstance:
             target_btn = target_row.buttons[col]
         except (IndexError, AttributeError):
             return False
-        exchange.pop("_keyboard_msg", None)
         try:
             if hasattr(target_btn, "data") and target_btn.data:
                 await keyboard_msg.click(data=target_btn.data)
@@ -809,6 +812,13 @@ class RelayInstance:
                 if "t.me/" in url or "telegram.me/" in url:
                     from urllib.parse import urlparse, parse_qs
                     parsed = urlparse(url)
+                    target_user = parsed.path.strip("/").lower()
+                    # 仅允许向已知可信 Bot 自动发送 /start（解码器 Bot、上传 Bot）
+                    allowed = {settings.DECODER_BOT_USERNAME.lower().lstrip("@"),
+                               settings.UPLOAD_BOT_USERNAME.lower().lstrip("@")}
+                    if target_user not in allowed:
+                        logger.warning(f"[RelayInstance:{self.phone}] 拒绝向不可信实体自动 /start: {target_user}")
+                        return False
                     params = parse_qs(parsed.query)
                     start_param = params.get("start", [None])[0]
                     if start_param:
@@ -860,6 +870,10 @@ class RelayInstance:
         try:
             await self._wait_all_cached(bot_username, timeout=60)
             if self._up_bot_entity:
+                # 先注册确认事件，再发 EXTERNAL_DONE，避免竞态（R29-4）
+                wait_event = asyncio.Event()
+                self._ready_events[code] = wait_event
+
                 await self._client.send_message(
                     self._up_bot_entity,
                     f"EXTERNAL_DONE:{user_id}:{code}",
@@ -867,17 +881,19 @@ class RelayInstance:
                 logger.info(f"[RelayInstance:{self.phone}] 已通知 Up Bot 完成外部文件收集: code={code}")
 
                 # 等待 idx_bot 确认处理完成（最多 120 秒）
-                wait_event = asyncio.Event()
-                self._ready_events[code] = wait_event
                 try:
                     await asyncio.wait_for(wait_event.wait(), timeout=120.0)
                     logger.info(f"[RelayInstance:{self.phone}] idx_bot 确认外部文件已就绪: code={code}")
+                    # 成功后标记到本地缓存
+                    await self._mark_code_mapped(code)
                 except asyncio.TimeoutError:
                     logger.warning(f"[RelayInstance:{self.phone}] 等待 idx_bot 确认超时 (code={code})")
+                    await self._unmark_code(code)
                 finally:
                     self._ready_events.pop(code, None)
         except Exception as e:
             logger.error(f"[RelayInstance:{self.phone}] 通知 Up Bot 失败 (code={code}): {e}")
+            await self._unmark_code(code)
         if self._pending_cleanup:
             self._pending_cleanup(bot_username)
 
@@ -886,6 +902,7 @@ class RelayInstance:
         self.is_busy = False
         if exchange:
             code = exchange.get("code", "")
+            await self._unmark_code(code)
             self._cleanup_code_dicts(code)
             if exchange.get("_settle_task") and not exchange["_settle_task"].done():
                 exchange["_settle_task"].cancel()
@@ -899,6 +916,30 @@ class RelayInstance:
             self._pending_cache_events.pop(code, None)
             self._cache_locks.pop(code, None)
             self._event_locks.pop(code, None)
+
+    async def _mark_code_mapped(self, code: str):
+        """标记码已成功映射到本地缓存，避免重复查询 CRDB。"""
+        if not code:
+            return
+        try:
+            from database.relay_db import get_relay_db
+            relay_db = await get_relay_db()
+            if relay_db:
+                await relay_db.mark_code_mapped(code)
+        except Exception as e:
+            logger.debug(f"[RelayInstance:{self.phone}] mark_code_mapped 失败: {e}")
+
+    async def _unmark_code(self, code: str):
+        """清除码的本地缓存标记（失败/超时时调用）。"""
+        if not code:
+            return
+        try:
+            from database.relay_db import get_relay_db
+            relay_db = await get_relay_db()
+            if relay_db:
+                await relay_db.unmark_code(code)
+        except Exception as e:
+            logger.debug(f"[RelayInstance:{self.phone}] unmark_code 失败: {e}")
 
     async def deliver_cached(self, user_id: int, code: str) -> bool:
         if not self._client:
