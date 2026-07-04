@@ -612,26 +612,26 @@ async def _process_one_pending(app: Application, row: dict):
         except Exception as e:
             logger.error(f"[Idx][poll] 外部码映射写入失败(code={ext_code}): {e}")
 
-    # 通知上传者
+    # 通知上传者（总是尝试发送，失败则暂存等 /start 后补发）
     try:
         from database.cache_store import get_cache_store
         store = get_cache_store()
-        # 检查用户是否已向 idx 发送 /start，未启动则暂存文件码
-        if not await store.is_user_started(uploader_id, "idx"):
-            await store.add_pending_file_code(uploader_id, file_code, note, ext_code)
-            logger.info(f"[Idx][poll] 用户 {uploader_id} 未 /start idx，文件码 {file_code} 已暂存")
-        elif ext_code:
-            await safe_send_message(app.bot, chat_id=uploader_id, text=f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。")
-            logger.info(f"[Idx][poll] 外部码已就绪: {ext_code} {file_code}")
+        if ext_code:
+            msg_text = f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。"
         else:
             note_line = f"备注：{note}" if note else ""
-            await safe_send_message(app.bot, chat_id=uploader_id, text=f"文件码：{file_code}\n"
+            msg_text = (f"文件码：{file_code}\n"
                      f"{note_line}\n\n"
                      f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
                      f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
-                     f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
-            )
+                     f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
+        try:
+            await safe_send_message(app.bot, chat_id=uploader_id, text=msg_text)
             logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
+        except Exception as send_err:
+            # 发送失败（用户未 /start idx），暂存等 /start 后补发
+            await store.add_pending_file_code(uploader_id, file_code, note, ext_code or "")
+            logger.info(f"[Idx][poll] 用户 {uploader_id} 未 /start idx，文件码 {file_code} 已暂存: {send_err}")
     except Exception as e:
         logger.error(f"[Idx][poll] 发送文件码失败 (code={file_code}): {e}")
 
