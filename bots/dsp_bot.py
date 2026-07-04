@@ -837,21 +837,6 @@ async def _async_main():
                 logger.warning(f"[Dsp] 回收 dispatched jobs 异常: {e}")
             await asyncio.sleep(120)
 
-    # 定期扫描 waiting_start jobs，用户已 /start dsp 的改回 pending
-    async def waiting_start_reactor_loop():
-        from database.cache_store import get_cache_store
-        store = get_cache_store()
-        while True:
-            try:
-                users = await store.get_waiting_start_job_users()
-                for uid in users:
-                    if await store.is_user_started(uid, "dsp"):
-                        await store.reactivate_waiting_start_jobs(uid)
-                        logger.info(f"[Dsp] 用户 {uid} 已 /start，waiting_start jobs 已恢复为 pending")
-            except Exception as e:
-                logger.warning(f"[Dsp] waiting_start 扫描异常: {e}")
-            await asyncio.sleep(60)
-
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(startup_sync(), name="startup-sync")          # H: 启动同步 + 周期兜底
     create_safe_task(sync_back_loop(), name="sync-back")          # D: 新增
@@ -861,7 +846,6 @@ async def _async_main():
     create_safe_task(_cleanup_channel_limiter_loop(), name="cleanup-channel-limiter")
     create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
     create_safe_task(reclaim_dispatched_loop(), name="reclaim-dispatched")  # E: 回收超时 dispatched
-    create_safe_task(waiting_start_reactor_loop(), name="waiting-start-reactor")  # 定期恢复 waiting_start jobs
     create_safe_task(_watch_cells_change(), name="watch-cells-change")  # PRE-02: 失效 delivery_resolver 缓存
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")

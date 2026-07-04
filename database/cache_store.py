@@ -553,18 +553,6 @@ class CacheStore:
         await self._db.execute("INSERT INTO dsp_notify (ts) VALUES (?)", (time.time(),))
         await self._db.commit()
 
-    async def get_waiting_start_job_users(self) -> list[int]:
-        """获取所有 waiting_start 状态 job 的 target_user_id（去重）"""
-        if not self._db:
-            return []
-        try:
-            rows = await self._db.execute_fetchall(
-                "SELECT DISTINCT target_user_id FROM local_job_queue WHERE status = 'waiting_start'"
-            )
-            return [r[0] for r in rows]
-        except Exception:
-            return []
-
     async def close(self):
         if self._db:
             await self._db.close()
