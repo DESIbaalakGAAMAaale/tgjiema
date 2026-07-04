@@ -301,6 +301,12 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
         logger.warning(f"[Dsp-{worker_id}] 死信标记: job={job.job_id}, code={job.code}, retry={job.retry_count}")
         return False
 
+    # 检查用户是否已向 dsp 发送 /start，未启动则标记 waiting_start（不计入重试）
+    if not await store.is_user_started(job.target_user_id, "dsp"):
+        await store.mark_job_waiting_start(job.job_id)
+        logger.info(f"[Dsp-{worker_id}] 用户 {job.target_user_id} 未 /start dsp，job={job.job_id} 标记 waiting_start")
+        return False
+
     # 动态限速
     await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
 
@@ -672,6 +678,15 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
+    user = update.effective_user
+
+    # 标记用户已启动 dsp bot，并恢复 waiting_start 的 jobs
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    await store.mark_user_started(user.id, "dsp")
+    await store.reactivate_waiting_start_jobs(user.id)
+    logger.info(f"[Dsp][start] 用户 {user.id} 已启动，waiting_start jobs 已恢复")
+
     await safe_reply_text(update.message,
         "欢迎使用文件发送机器人!\n\n"
         "此机器人用于接收解码后的文件,无需手动操作。\n"
@@ -822,6 +837,21 @@ async def _async_main():
                 logger.warning(f"[Dsp] 回收 dispatched jobs 异常: {e}")
             await asyncio.sleep(120)
 
+    # 定期扫描 waiting_start jobs，用户已 /start dsp 的改回 pending
+    async def waiting_start_reactor_loop():
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        while True:
+            try:
+                users = await store.get_waiting_start_job_users()
+                for uid in users:
+                    if await store.is_user_started(uid, "dsp"):
+                        await store.reactivate_waiting_start_jobs(uid)
+                        logger.info(f"[Dsp] 用户 {uid} 已 /start，waiting_start jobs 已恢复为 pending")
+            except Exception as e:
+                logger.warning(f"[Dsp] waiting_start 扫描异常: {e}")
+            await asyncio.sleep(60)
+
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(startup_sync(), name="startup-sync")          # H: 启动同步 + 周期兜底
     create_safe_task(sync_back_loop(), name="sync-back")          # D: 新增
@@ -831,6 +861,7 @@ async def _async_main():
     create_safe_task(_cleanup_channel_limiter_loop(), name="cleanup-channel-limiter")
     create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
     create_safe_task(reclaim_dispatched_loop(), name="reclaim-dispatched")  # E: 回收超时 dispatched
+    create_safe_task(waiting_start_reactor_loop(), name="waiting-start-reactor")  # 定期恢复 waiting_start jobs
     create_safe_task(_watch_cells_change(), name="watch-cells-change")  # PRE-02: 失效 delivery_resolver 缓存
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")

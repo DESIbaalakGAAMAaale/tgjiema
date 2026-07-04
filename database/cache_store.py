@@ -193,6 +193,30 @@ class CacheStore:
                 value TEXT NOT NULL
             )"""
         )
+        # ─── 用户 Bot 启动状态跟踪（跨进程共享）───
+        # 用户向 idx/dsp 发送 /start 后写入，up/idx/dsp 发送消息前检查
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS user_bot_started (
+                user_id    BIGINT NOT NULL,
+                bot_name   TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                PRIMARY KEY (user_id, bot_name)
+            )"""
+        )
+        # ─── 待发送文件码（用户未 /start idx 时暂存）───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS pending_file_codes (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    BIGINT NOT NULL,
+                file_code  TEXT NOT NULL,
+                note       TEXT DEFAULT '',
+                ext_code   TEXT DEFAULT '',
+                created_at REAL NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_file_codes_user ON pending_file_codes(user_id)"
+        )
         # ─── 热路径全表缓存：file_records / codes / users / external_code_mapping ───
         # 启动时从 CRDB 全量加载，后续所有读操作走 SQLite（0 CRDB RU）
         # 写操作双写：先写 SQLite(标记 dirty)，CRDB 异步/批量同步
@@ -444,6 +468,102 @@ class CacheStore:
                 return False
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, 1.0)
+
+    # ─── 用户 Bot 启动状态 ──────────────────────────────
+
+    async def mark_user_started(self, user_id: int, bot_name: str):
+        """标记用户已向指定 bot 发送 /start"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT OR REPLACE INTO user_bot_started (user_id, bot_name, started_at) VALUES (?, ?, ?)",
+            (user_id, bot_name, time.time()),
+        )
+        await self._db.commit()
+
+    async def is_user_started(self, user_id: int, bot_name: str) -> bool:
+        """检查用户是否已向指定 bot 发送 /start"""
+        if not self._db:
+            return True  # 数据库不可用时放行，避免阻塞流程
+        try:
+            row = await self._db.execute_fetchall(
+                "SELECT 1 FROM user_bot_started WHERE user_id = ? AND bot_name = ?",
+                (user_id, bot_name),
+            )
+            return bool(row)
+        except Exception:
+            return True  # 出错时放行
+
+    # ─── 待发送文件码（用户未 /start idx 时暂存）──────────────
+
+    async def add_pending_file_code(self, user_id: int, file_code: str, note: str = "", ext_code: str = ""):
+        """暂存文件码，等待用户 /start 后补发"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "INSERT INTO pending_file_codes (user_id, file_code, note, ext_code, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, file_code, note, ext_code, time.time()),
+        )
+        await self._db.commit()
+
+    async def get_pending_file_codes(self, user_id: int) -> list[dict]:
+        """取出并删除用户的所有待发文件码"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT id, file_code, note, ext_code FROM pending_file_codes WHERE user_id = ? ORDER BY id",
+            (user_id,),
+        )
+        if not rows:
+            return []
+        ids = [r[0] for r in rows]
+        placeholders = ",".join("?" * len(ids))
+        await self._db.execute(
+            f"DELETE FROM pending_file_codes WHERE id IN ({placeholders})",
+            ids,
+        )
+        await self._db.commit()
+        return [
+            {"file_code": r[1], "note": r[2] or "", "ext_code": r[3] or ""}
+            for r in rows
+        ]
+
+    # ─── Dsp job 等待用户启动 ──────────────────────────
+
+    async def mark_job_waiting_start(self, job_id: int):
+        """将 job 标记为 waiting_start 状态（不计入重试次数）"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE local_job_queue SET status = 'waiting_start' WHERE crdb_id = ?",
+            (job_id,),
+        )
+        await self._db.commit()
+
+    async def reactivate_waiting_start_jobs(self, user_id: int):
+        """用户 /start dsp 后，将其 waiting_start jobs 改回 pending"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "UPDATE local_job_queue SET status = 'pending' WHERE target_user_id = ? AND status = 'waiting_start'",
+            (user_id,),
+        )
+        await self._db.commit()
+        # 写入 dsp_notify 触发 worker 重新拉取
+        await self._db.execute("INSERT INTO dsp_notify (ts) VALUES (?)", (time.time(),))
+        await self._db.commit()
+
+    async def get_waiting_start_job_users(self) -> list[int]:
+        """获取所有 waiting_start 状态 job 的 target_user_id（去重）"""
+        if not self._db:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT DISTINCT target_user_id FROM local_job_queue WHERE status = 'waiting_start'"
+            )
+            return [r[0] for r in rows]
+        except Exception:
+            return []
 
     async def close(self):
         if self._db:

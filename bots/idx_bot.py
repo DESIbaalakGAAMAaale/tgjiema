@@ -365,6 +365,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[Idx][start] 创建用户失败 (user={user.id}): {e}")
         await safe_reply_text(update.message, "系统繁忙,请稍后重试")
         return
+
+    # 标记用户已启动 idx bot
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    await store.mark_user_started(user.id, "idx")
+
     await safe_reply_text(update.message,
         "欢迎使用文件解码机器\n\n"
         "发送文件码即可获取对应文件。\n"
@@ -372,6 +378,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "发/help 查看帮助信息\n"
         + three_bot_reminder()
     )
+
+    # 补发用户启动前暂存的文件码
+    try:
+        pending_codes = await store.get_pending_file_codes(user.id)
+        for pc in pending_codes:
+            if pc["ext_code"]:
+                await safe_send_message(context.bot, chat_id=user.id,
+                    text=f"外部文件 {pc['ext_code']} 已就绪，请重新发送文件码即可查收。")
+            else:
+                note_line = f"备注：{pc['note']}" if pc["note"] else ""
+                await safe_send_message(context.bot, chat_id=user.id,
+                    text=f"文件码：{pc['file_code']}\n{note_line}\n\n"
+                         f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
+                         f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
+                         f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
+        if pending_codes:
+            logger.info(f"[Idx][start] 补发 {len(pending_codes)} 条暂存文件码给用户 {user.id}")
+    except Exception as e:
+        logger.error(f"[Idx][start] 补发暂存文件码失败 (user={user.id}): {e}")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -589,7 +614,13 @@ async def _process_one_pending(app: Application, row: dict):
 
     # 通知上传者
     try:
-        if ext_code:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        # 检查用户是否已向 idx 发送 /start，未启动则暂存文件码
+        if not await store.is_user_started(uploader_id, "idx"):
+            await store.add_pending_file_code(uploader_id, file_code, note, ext_code)
+            logger.info(f"[Idx][poll] 用户 {uploader_id} 未 /start idx，文件码 {file_code} 已暂存")
+        elif ext_code:
             await safe_send_message(app.bot, chat_id=uploader_id, text=f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。")
             logger.info(f"[Idx][poll] 外部码已就绪: {ext_code} {file_code}")
         else:
