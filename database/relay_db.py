@@ -148,6 +148,20 @@ CREATE TABLE IF NOT EXISTS bot_cooldown (
     created_at       TEXT DEFAULT (datetime('now')),
     updated_at       TEXT DEFAULT (datetime('now'))
 );
+
+-- 外部码映射缓存：本地缓存已映射的码，避免重复查询 CRDB
+CREATE TABLE IF NOT EXISTS mapped_codes (
+    code        TEXT PRIMARY KEY,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
+
+-- Bot 覆盖规则：按文件码前缀将解码请求路由到指定 Bot
+CREATE TABLE IF NOT EXISTS bot_overrides (
+    prefix      TEXT PRIMARY KEY,
+    bot_username TEXT NOT NULL,
+    is_active   INTEGER DEFAULT 1,
+    created_at  TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -405,6 +419,58 @@ class RelayDB:
         await self._db.commit()
         if deleted > 0:
             logger.debug(f"[RelayDB] 清理 {deleted} 条过期 bot_cooldown 记录")
+
+    # ── 外部码映射缓存 ──
+
+    async def is_code_mapped(self, code: str) -> bool:
+        async with self._db.execute("SELECT 1 FROM mapped_codes WHERE code = ?", (code,)) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def mark_code_mapped(self, code: str) -> None:
+        await self._db.execute("INSERT OR IGNORE INTO mapped_codes (code) VALUES (?)", (code,))
+        await self._db.commit()
+
+    async def unmark_code(self, code: str) -> None:
+        await self._db.execute("DELETE FROM mapped_codes WHERE code = ?", (code,))
+        await self._db.commit()
+
+    # ── Bot 覆盖规则 ──
+
+    async def add_bot_override(self, prefix: str, bot_username: str) -> bool:
+        await self._db.execute(
+            "INSERT OR REPLACE INTO bot_overrides (prefix, bot_username, is_active) VALUES (?, ?, 1)",
+            (prefix, bot_username),
+        )
+        await self._db.commit()
+        return True
+
+    async def remove_bot_override(self, prefix: str) -> bool:
+        cursor = await self._db.execute("DELETE FROM bot_overrides WHERE prefix = ?", (prefix,))
+        deleted = cursor.rowcount
+        await self._db.commit()
+        return deleted > 0
+
+    async def toggle_bot_override(self, prefix: str) -> bool:
+        cursor = await self._db.execute(
+            "UPDATE bot_overrides SET is_active = CASE WHEN is_active THEN 0 ELSE 1 END WHERE prefix = ?",
+            (prefix,),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def list_bot_overrides(self) -> list[dict]:
+        rows = await self._db.execute_fetchall(
+            "SELECT prefix, bot_username, is_active FROM bot_overrides ORDER BY length(prefix) DESC"
+        )
+        return [{"prefix": r[0], "bot_username": r[1], "is_active": bool(r[2])} for r in rows]
+
+    async def get_bot_override(self, code: str) -> str | None:
+        """按最长前缀匹配返回覆盖的 Bot 用户名，无匹配返回 None"""
+        overrides = await self.list_bot_overrides()
+        for ov in overrides:
+            if ov["is_active"] and code.startswith(ov["prefix"]):
+                return ov["bot_username"]
+        return None
 
 
 def date_today() -> str:

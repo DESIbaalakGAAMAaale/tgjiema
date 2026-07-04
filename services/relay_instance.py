@@ -4,10 +4,12 @@
 - session 文件持久化，VPS 重启后自动恢复
 """
 import asyncio
+import re
 from pathlib import Path
 
 from loguru import logger
 from telethon import TelegramClient, events
+from telethon.tl.types import MessageMediaWebPage
 from utils.task_utils import create_safe_task
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
@@ -46,6 +48,8 @@ class RelayInstance:
         self._handlers_registered = False
         self._pending_cache_counts: dict[str, int] = {}
         self._pending_cache_events: dict[str, asyncio.Event] = {}
+        # idx_bot 确认等待：code -> Event
+        self._ready_events: dict[str, asyncio.Event] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -146,6 +150,24 @@ class RelayInstance:
         await self._report_status("online")
         logger.info(f"[RelayInstance:{self.phone}] 中继已就绪")
 
+        # 启动周期清理冷却记录的后台任务
+        create_safe_task(self._cleanup_cooldowns_loop())
+
+    async def _cleanup_cooldowns_loop(self):
+        """每 10 分钟清理一次过期的 bot_cooldown 记录"""
+        try:
+            from database.relay_db import get_relay_db
+            while True:
+                await asyncio.sleep(600)
+                try:
+                    relay_db = await get_relay_db()
+                    if relay_db:
+                        await relay_db.cleanup_cooldowns()
+                except Exception as e:
+                    logger.debug(f"[RelayInstance:{self.phone}] cleanup_cooldowns 失败: {e}")
+        except asyncio.CancelledError:
+            pass
+
     async def login_with_credentials(self, api_id: int, api_hash: str, phone: str):
         """使用指定凭证登录（用于动态添加账号）"""
         self.api_id = api_id
@@ -202,6 +224,28 @@ class RelayInstance:
 
     async def _do_send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         try:
+            # 检查 mapped_codes 本地缓存，避免重复查询 CRDB
+            try:
+                from database.relay_db import get_relay_db
+                relay_db = await get_relay_db()
+                if relay_db and await relay_db.is_code_mapped(code):
+                    logger.info(f"[RelayInstance:{self.phone}] 码已映射（本地缓存），跳过: code={code}")
+                    return True
+            except Exception:
+                pass
+
+            # 检查 bot_overrides 覆盖规则（按最长前缀匹配）
+            try:
+                from database.relay_db import get_relay_db
+                relay_db = await get_relay_db()
+                if relay_db:
+                    override = await relay_db.get_bot_override(code)
+                    if override:
+                        logger.info(f"[RelayInstance:{self.phone}] 前缀覆盖: {code} → @{override}")
+                        bot_username = override
+            except Exception:
+                pass
+
             entity = await self._client.get_entity(bot_username)
             logger.info(
                 f"[RelayInstance:{self.phone}] 目标实体: {type(entity).__name__}, "
@@ -229,6 +273,7 @@ class RelayInstance:
                 "_clicked_buttons": set(),
                 "_min_click_interval": 0,
                 "_last_click_time": 0,
+                "_page_count": 0,
             }
             self._restart_settle(
                 self._bot_exchange[bot_username.lower()], bot_username.lower(),
@@ -298,19 +343,44 @@ class RelayInstance:
             return int(digits)
         return None
 
-    @staticmethod
-    def _extract_wait_seconds(msg) -> int:
+    _RATE_LIMIT_PATTERNS = [
+        (re.compile(r"(?:请|等待?|需\s*要?)\s*(\d+)\s*秒"), 1),
+        (re.compile(r"(\d+)\s*秒\s*(?:后|再|之?后)"), 1),
+        (re.compile(r"wait\s+(\d+)\s*sec(?:ond)?s?", re.IGNORECASE), 1),
+        (re.compile(r"try\s+again\s+(?:in|after)\s+(\d+)\s*sec(?:ond)?s?", re.IGNORECASE), 1),
+        (re.compile(r"(\d+)\s*sec(?:ond)?s?\s*(?:later|after)", re.IGNORECASE), 1),
+        (re.compile(r"(?:频率|操作)\s*(?:过快|频繁|过于频繁)"), None),
+        (re.compile(r"too\s+(?:fast|frequent|many\s+requests)", re.IGNORECASE), None),
+        (re.compile(r"(?:请稍[候后]|稍[候后]再试|请勿频繁)"), None),
+        (re.compile(r"flood\s*wait", re.IGNORECASE), None),
+    ]
+
+    _DEFAULT_RATE_LIMIT_WAIT = 5
+
+    def _check_rate_limit(self, exchange: dict) -> float:
         import re
-        text = (getattr(msg, "message", None) or "").lower()
-        patterns = [
-            r"(\d+)\s*秒", r"(\d+)\s*seconds?", r"(\d+)\s*secs?",
-            r"wait\s*(\d+)", r"等\s*(\d+)", r"稍等\s*(\d+)",
-        ]
-        for pat in patterns:
-            m = re.search(pat, text)
-            if m:
-                return max(int(m.group(1)), 1)
-        return 5
+        text_responses = exchange.get("text_responses", [])
+        if not text_responses:
+            return 0
+        recent = text_responses[-5:]
+        for entry in recent:
+            text = entry.get("text", "")
+            if not text:
+                continue
+            for pattern, group_idx in self._RATE_LIMIT_PATTERNS:
+                m = pattern.search(text)
+                if m:
+                    if group_idx is not None:
+                        try:
+                            seconds = int(m.group(group_idx))
+                        except (IndexError, ValueError):
+                            seconds = self._DEFAULT_RATE_LIMIT_WAIT
+                    else:
+                        seconds = self._DEFAULT_RATE_LIMIT_WAIT
+                    wait_time = min(max(seconds, 1), 60)
+                    exchange["_min_click_interval"] = max(exchange.get("_min_click_interval", 0), wait_time)
+                    return wait_time
+        return 0
 
     def _register_handlers(self):
         if self._handlers_registered:
@@ -357,6 +427,17 @@ class RelayInstance:
             if not bot_username:
                 return
 
+            # 检测 idx_bot 确认消息：解码器 Bot 转发"外部文件已就绪"
+            decoder_un = settings.DECODER_BOT_USERNAME.lower().lstrip("@")
+            if bot_username == decoder_un and self._ready_events:
+                text = getattr(event.message, "message", None) or ""
+                for code, ev in list(self._ready_events.items()):
+                    if code in text and ("已就绪" in text or "ready" in text.lower()):
+                        if not ev.is_set():
+                            ev.set()
+                            logger.info(f"[RelayInstance:{self.phone}] idx_bot 已确认外部文件就绪: code={code}")
+                return
+
             exchange = self._bot_exchange.get(bot_username)
             if not exchange:
                 return
@@ -383,7 +464,13 @@ class RelayInstance:
                 )
                 return
 
-            exchange.setdefault("events", []).append(event)
+            msg = event.message
+            if msg.media and not isinstance(msg.media, MessageMediaWebPage):
+                exchange.setdefault("events", []).append(event)
+            else:
+                text = getattr(msg, "message", None) or ""
+                if text:
+                    exchange.setdefault("text_responses", []).append({"msg_id": msg.id, "text": text})
             code = exchange.get("code")
             if code:
                 self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
@@ -552,6 +639,8 @@ class RelayInstance:
                     if exchange:
                         exchange.setdefault("_clicked_buttons", set()).add((row, col))
                         exchange["_last_click_time"] = asyncio.get_event_loop().time()
+                        exchange["_page_count"] = exchange.get("_page_count", 0) + 1
+                        logger.info(f"[RelayInstance:{self.phone}] 翻页: 第{exchange['_page_count']}次 (bot=@{bot_username})")
                     await asyncio.sleep(4)
                     await self._wait_all_cached(bot_username)
                     exchange = self._bot_exchange.get(bot_username)
@@ -577,43 +666,42 @@ class RelayInstance:
             # N-15-6: 统一复位 is_busy，防止 CancelledError 等边缘路径导致永久 busy
             self.is_busy = False
             if bot_username in self._bot_exchange:
-                self._bot_exchange[bot_username]["_ai_running"] = False
+                exchange = self._bot_exchange[bot_username]
+                exchange["_ai_running"] = False
+                # 标记码已映射到本地缓存，避免重复查询 CRDB
+                try:
+                    from database.relay_db import get_relay_db
+                    relay_db = await get_relay_db()
+                    if relay_db:
+                        await relay_db.mark_code_mapped(exchange.get("code", ""))
+                except Exception:
+                    pass
 
     def _make_decision(self, exchange: dict) -> dict:
-        _NEXT_KW = ("next", "\u4e0b\u4e00\u9875", "\u4e0b\u4e00\u9801", "\u4e0b\u4e00\u7ec4",
-                     "\u2192", "\u25b6", "\u27a1", ">>", "\u00bb")
-        _ERROR_KW = ("\u672a\u627e\u5230", "\u5df2\u8fc7\u671f", "\u5df2\u5931\u6548",
-                     "\u4e0d\u5b58\u5728", "not found", "expired", "invalid")
-        _RATE_LIMIT_KW = ("\u8bf7\u7a0d\u540e", "\u8bf7\u7b49\u5f85", "\u7a0d\u540e\u518d\u8bd5",
-                         "\u901f\u5ea6\u592a\u5feb", "\u7ffb\u9875\u592a\u5feb", "\u64cd\u4f5c\u592a\u5feb",
-                         "\u9891\u7e41", "\u8bf7\u6162\u4e00\u70b9", "\u6162\u4e00\u70b9",
-                         "too fast", "wait", "slow down", "rate limit", "\u8bf7\u52ff\u8fc7\u5feb")
-        _FINISH_KW = {"finish", "done", "\u5b8c\u6210", "\u7ed3\u675f"}
+        _NEXT_KW = ("next", "下一页", "下一页", "下一组",
+                     "→", "▶", "➡", ">>", "»")
+        _ERROR_KW = ("未找到", "已过期", "已失效",
+                     "不存在", "not found", "expired", "invalid")
+        _FINISH_KW = {"finish", "done", "完成", "结束"}
 
         msg_events = exchange.get("events", [])
         if not msg_events:
             return {"action": "finish", "target_button_row": None, "target_button_col": None,
-                    "target_button_text": None, "reason": "\u65e0\u6d88\u606f", "wait_seconds": None}
+                    "target_button_text": None, "reason": "无消息", "wait_seconds": None}
 
         for ev in msg_events:
             text = (getattr(ev.message, "message", None) or "").lower()
             for ek in _ERROR_KW:
                 if ek in text:
                     return {"action": "error", "target_button_row": None, "target_button_col": None,
-                            "target_button_text": None, "reason": f"\u68c0\u6d4b\u5230\u9519\u8bef: {ek}",
+                            "target_button_text": None, "reason": f"检测到错误: {ek}",
                             "wait_seconds": None}
 
-        for ev in msg_events:
-            msg = ev.message
-            text = (getattr(msg, "message", None) or "").lower()
-            for rk in _RATE_LIMIT_KW:
-                if rk in text:
-                    wait_sec = self._extract_wait_seconds(msg)
-                    exchange["_min_click_interval"] = max(exchange.get("_min_click_interval", 0), wait_sec)
-                    return {"action": "wait", "target_button_row": None, "target_button_col": None,
-                            "target_button_text": None,
-                            "reason": f"\u68c0\u6d4b\u5230\u9650\u5236: {rk}",
-                            "wait_seconds": wait_sec}
+        wait_sec = self._check_rate_limit(exchange)
+        if wait_sec > 0:
+            return {"action": "wait", "target_button_row": None, "target_button_col": None,
+                    "target_button_text": None,
+                    "reason": "检测到限速", "wait_seconds": wait_sec}
 
         for ev in msg_events:
             msg = ev.message
@@ -627,7 +715,7 @@ class RelayInstance:
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": col_idx,
                                 "target_button_text": getattr(btn, "text", None) or "",
-                                "reason": f"\u68c0\u6d4b\u5230\u7ffb\u9875\u6309\u94ae: {btn_text}",
+                                "reason": f"检测到翻页按钮: {btn_text}",
                                 "wait_seconds": None}
             for row_idx, row in enumerate(rows):
                 btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
@@ -637,21 +725,27 @@ class RelayInstance:
                     if n is not None:
                         numbers.append((col_idx, t, n))
                 if len(numbers) >= 3:
-                    all_digits = sorted([n for _, _, n in numbers])
-                    last_clicked = exchange.get("_last_clicked_number")
-                    if last_clicked is None:
-                        target_num = 2 if 2 in all_digits else all_digits[1]
+                    all_nums = sorted([n for _, _, n in numbers])
+                    last = exchange.get("_last_clicked_number")
+                    if last is None:
+                        target = 2 if 2 in all_nums else all_nums[1] if len(all_nums) > 1 else all_nums[0]
+                        exchange["_last_button_range"] = tuple(all_nums)
                     else:
-                        next_num = last_clicked + 1
-                        if next_num > all_digits[-1]:
-                            break
-                        target_num = next_num
+                        target = last + 1
+                        if target > all_nums[-1]:
+                            current_range = tuple(all_nums)
+                            prev_range = exchange.get("_last_button_range")
+                            if current_range != prev_range:
+                                exchange["_last_button_range"] = current_range
+                                target = 2 if 2 in all_nums else all_nums[1] if len(all_nums) > 1 else all_nums[0]
+                            else:
+                                break
                     for col_idx, t, n in numbers:
-                        if n == target_num:
-                            exchange["_last_clicked_number"] = target_num
+                        if n == target:
+                            exchange["_last_clicked_number"] = target
                             return {"action": "click_button", "target_button_row": row_idx,
                                     "target_button_col": col_idx, "target_button_text": t,
-                                    "reason": f"\u6570\u5b57\u7ffb\u9875\u7b2c{target_num}\u9875",
+                                    "reason": f"数字翻页第{target}页",
                                     "wait_seconds": None}
                     break
             for row_idx in range(len(rows) - 1, -1, -1):
@@ -664,7 +758,7 @@ class RelayInstance:
                     if getattr(last_btn, "data", None):
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": len(row.buttons) - 1, "target_button_text": "",
-                                "reason": "\u7eaf\u56fe\u6807", "wait_seconds": None}
+                                "reason": "纯图标", "wait_seconds": None}
             clicked = exchange.get("_clicked_buttons") or set()
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
@@ -677,10 +771,10 @@ class RelayInstance:
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": col_idx,
                                 "target_button_text": getattr(btn, "text", None) or "",
-                                "reason": f"\u5c1d\u8bd5\u70b9\u51fb: {btn_text}",
+                                "reason": f"尝试点击: {btn_text}",
                                 "wait_seconds": None}
         return {"action": "finish", "target_button_row": None, "target_button_col": None,
-                "target_button_text": None, "reason": "\u65e0\u7ffb\u9875\u6309\u94ae",
+                "target_button_text": None, "reason": "无翻页按钮",
                 "wait_seconds": None}
 
     async def _click_button(self, bot_username: str, row: int, col: int) -> bool:
@@ -724,6 +818,11 @@ class RelayInstance:
                 return False
             return False
         except FloodWaitError as e:
+            exchange = self._bot_exchange.get(bot_username)
+            if exchange:
+                exchange["_min_click_interval"] = max(
+                    exchange.get("_min_click_interval", 0), e.seconds
+                )
             await asyncio.sleep(e.seconds)
             try:
                 if hasattr(target_btn, "data") and target_btn.data:
@@ -766,6 +865,17 @@ class RelayInstance:
                     f"EXTERNAL_DONE:{user_id}:{code}",
                 )
                 logger.info(f"[RelayInstance:{self.phone}] 已通知 Up Bot 完成外部文件收集: code={code}")
+
+                # 等待 idx_bot 确认处理完成（最多 120 秒）
+                wait_event = asyncio.Event()
+                self._ready_events[code] = wait_event
+                try:
+                    await asyncio.wait_for(wait_event.wait(), timeout=120.0)
+                    logger.info(f"[RelayInstance:{self.phone}] idx_bot 确认外部文件已就绪: code={code}")
+                except asyncio.TimeoutError:
+                    logger.warning(f"[RelayInstance:{self.phone}] 等待 idx_bot 确认超时 (code={code})")
+                finally:
+                    self._ready_events.pop(code, None)
         except Exception as e:
             logger.error(f"[RelayInstance:{self.phone}] 通知 Up Bot 失败 (code={code}): {e}")
         if self._pending_cleanup:
