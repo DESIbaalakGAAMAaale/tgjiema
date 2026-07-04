@@ -454,8 +454,15 @@ class CockroachDBClient:
 
     async def close(self):
         if self._pool:
-            await self._pool.close()
-            self._pool = None
+            try:
+                # 加 10 秒超时，避免 CRDB 连接池关闭卡住导致进程无法退出
+                await asyncio.wait_for(self._pool.close(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning("[DB] CRDB 连接池关闭超时(10s)，强制放弃")
+            except Exception as e:
+                logger.warning(f"[DB] CRDB 连接池关闭异常: {e}")
+            finally:
+                self._pool = None
 
     async def execute(self, sql: str, params: list = None):
         async with self._pool.acquire() as conn:
@@ -501,6 +508,12 @@ async def init_db():
 
 
 async def close_db():
+    # 先关闭 SQLite 缓存（释放 WAL 锁），避免后续进程打开同一文件被阻塞
+    try:
+        from .cache_store import get_cache_store
+        await get_cache_store().close()
+    except Exception as e:
+        logger.debug(f"[DB] 关闭 CacheStore 失败（可忽略）: {e}")
     await _client.close()
 
 
