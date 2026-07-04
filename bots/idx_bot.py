@@ -319,7 +319,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
 
         if context:
             try:
-                await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 已就绪，正在发送，请查收。")
+                await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。")
             except Exception:
                 pass
         return
@@ -348,7 +348,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     try:
-        await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 已就绪，正在发送，请查收。")
+        await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。")
     except Exception:
         pass
 
