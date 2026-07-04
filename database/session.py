@@ -278,11 +278,16 @@ class CockroachDBClient:
         self._url = url
 
     async def connect(self):
+        # 初始化连接时关闭 follower_reads，否则 default_transaction_use_follower_reads=on 让所有写入报只读错误
+        async def _init_conn(conn):
+            await conn.execute("SET default_transaction_use_follower_reads = off")
+
         self._pool = await asyncpg.create_pool(
             self._url,
             min_size=1,
             max_size=5,
             statement_cache_size=256,
+            init=_init_conn,
         )
 
         # ─── SQLite 缓存备份：初始化并恢复内存缓存───
@@ -322,8 +327,6 @@ class CockroachDBClient:
                 logger.info("首次运行或 rotation_config 表不存在，执行 DDL 初始化")
 
         if need_ddl:
-            # DDL/迁移需写操作，临时关闭 follower reads（否则 default_transaction_use_follower_reads=on 导致只读事务）
-            await self.execute("SET default_transaction_use_follower_reads = off")
             try:
                 for sql in DDL_STATEMENTS:
                     try:
@@ -340,15 +343,8 @@ class CockroachDBClient:
                             logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略，已存在）：{sql[:60]}... → {e}")
                         else:
                             logger.error(f"[DB] 迁移 SQL 执行失败（严重）：{sql} → {e}")
-                            # 重新抛出非预期错误，确保启动失败被发现
                             raise
-            finally:
-                await self.execute("SET default_transaction_use_follower_reads = on")
-            # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
-            # RESET 在某些 CRDB 版本不生效，改用与 migration 一致的 SET 方式，确保 TTL job 不运行
-            # 改为 Python 端负责清理（见 database/cache.py: _flush_decode_log_buffer_loop）
-            await self.execute("SET default_transaction_use_follower_reads = off")
-            try:
+                # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
                 for ttl_sql in (
                     "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
                     "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
@@ -357,13 +353,13 @@ class CockroachDBClient:
                         await self.execute(ttl_sql)
                     except Exception:
                         pass
-                # 写入 CRDB 版本号
                 await self.execute(
                     "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
                     str(DDL_VERSION),
                 )
-            finally:
-                await self.execute("SET default_transaction_use_follower_reads = on")
+            except Exception:
+                logger.exception("[DB] DDL 迁移整体失败")
+                raise
             # 写入 SQLite 缓存版本号（后续启动 0 CRDB RU）
             await store.set_kv("ddl_version", str(DDL_VERSION))
             logger.info(f"DDL 升级完成，版本 {DDL_VERSION}")
