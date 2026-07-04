@@ -65,6 +65,12 @@ async def seed(dry_run: bool = False, force: bool = False):
                                                 "account_name", "is_r100"])
     existing_map = {r["slot_id"]: r for r in existing}
 
+    # force=True 时清空旧数据重新写入，确保拓扑与 .env / topology.yaml 一致
+    if force and existing_map:
+        await col.delete_many({})
+        existing_map = {}
+        print("  强制模式: 清空了数据库 cells 表，重新写入最新拓扑")
+
     print(f"\n数据库现有 {len(existing_map)} 个槽位,配置 {len(slots)} 个")
 
     added = 0
