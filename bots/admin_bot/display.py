@@ -3,6 +3,7 @@ import datetime
 import re
 import time
 
+from loguru import logger
 from config import settings
 from database import (
     get_users_col, get_file_records_col, get_decode_logs_col,
