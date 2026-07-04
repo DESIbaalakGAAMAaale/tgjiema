@@ -556,7 +556,7 @@ def _safe_str(val: Any):
 
 
 def _escape_like(value: str) -> str:
-    """转义 LIKE 通配符: \ → \\, % → \%, _ → \_"""
+    r"""转义 LIKE 通配符: \ → \\, % → \%, _ → \_"""
     if not isinstance(value, str):
         value = str(value)
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
