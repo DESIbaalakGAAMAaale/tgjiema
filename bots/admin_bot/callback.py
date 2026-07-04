@@ -85,8 +85,18 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "action:relay_pending":
         from database import get_config as _get_cfg
-        pending = await _get_cfg("relay_auth_pending")
-        if pending == "1":
+        # R31-2: 遍历中继实例检查各账号的 pending 状态，而非读全局键
+        pending_found = False
+        try:
+            from services.relay_pool import relay_pool
+            if relay_pool._initialized:
+                for inst in relay_pool.instances:
+                    if await _get_cfg(f"relay_auth_pending:{inst.phone}") == "1":
+                        pending_found = True
+                        break
+        except Exception:
+            pending_found = await _get_cfg("relay_auth_pending") == "1"
+        if pending_found:
             text = "⏳ 中继正在等待验证码\n\nTelegram 已发送 6 位验证码到中继账号的已登录客户端，请查看并使用 /relay_code 提交。"
         else:
             text = "✅ 中继当前不需要验证码。"

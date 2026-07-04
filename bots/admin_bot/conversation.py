@@ -276,8 +276,23 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # ─── 中继 ────────────────────────────────────────────────────
     elif state == "relay_code:code":
         code = text.strip()
-        # 验证码写入 DB,由 idx_bot 的 relay_instance 自动读取
+        # 验证码写入 DB,由 relay_instance 自动读取
         phone = context.user_data.get("relay_phone", "")
+        # R31-2: 交互式按钮入口未设置 relay_phone，从 relay pool 自动检测等待中的账号
+        if not phone:
+            try:
+                from services.relay_pool import relay_pool
+                from database import get_config as _get_cfg
+                if relay_pool._initialized:
+                    for inst in relay_pool.instances:
+                        if await _get_cfg(f"relay_auth_pending:{inst.phone}") == "1":
+                            phone = inst.phone
+                            break
+            except Exception:
+                pass
+        if not phone:
+            await _end("❌ 无法确定中继账号，请使用 /relay_code <手机号> <验证码> 直接提交")
+            return
         await set_config(f"relay_auth_code:{phone}", code)
         await set_config(f"relay_auth_pending:{phone}", "1")
         await _end(f"✅ 验证码 `{code}` 已提交\n中继实例将在几秒内自动获取并使用。")

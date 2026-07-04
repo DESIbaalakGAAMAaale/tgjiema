@@ -100,18 +100,25 @@ async def _get_status_text() -> str:
             _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
         _shared_counters.status_counters_initialized = True
         _shared_counters.status_counters_loaded_at = now_ts
-    relay_pending = await get_config("relay_auth_pending")
     try:
         from services.relay_pool import relay_pool
         if not relay_pool._initialized:
             await relay_pool.init()
         pool_status = await relay_pool.get_pool_status()
+        # R31-2: 检查各中继实例的 pending 状态，而非读全局键
+        relay_pending = "0"
+        if relay_pool._initialized:
+            for inst in relay_pool.instances:
+                if await get_config(f"relay_auth_pending:{inst.phone}") == "1":
+                    relay_pending = "1"
+                    break
         if pool_status:
             ready = sum(1 for p in pool_status if p["is_ready"])
             relay_status = f"✅ 账号池 {ready}/{len(pool_status)} 就绪"
         else:
             relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
     except Exception:
+        relay_pending = await get_config("relay_auth_pending")
         relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
     # 从环形拓扑获取当前活跃频道（走 60s 缓存，0 RU）
     active_cells_text = ""
@@ -293,7 +300,16 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
 
 async def _get_relay_status_text() -> str:
     from services.relay_pool import relay_pool
-    pending = await get_config("relay_auth_pending")
+    # R31-2: 检查各中继实例的 pending 状态，而非读全局键
+    pending = "0"
+    try:
+        if relay_pool._initialized:
+            for inst in relay_pool.instances:
+                if await get_config(f"relay_auth_pending:{inst.phone}") == "1":
+                    pending = "1"
+                    break
+    except Exception:
+        pending = await get_config("relay_auth_pending")
 
     if not relay_pool._initialized:
         try:
