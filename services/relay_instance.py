@@ -306,6 +306,10 @@ class RelayInstance:
         if not getattr(msg, "media", None):
             await self._decrement_cache_counter(code)
             return
+        # R30-6: 排除 webpage 预览，避免无意义的 send_file 失败尝试
+        if isinstance(msg.media, MessageMediaWebPage):
+            await self._decrement_cache_counter(code)
+            return
         try:
             if self._up_bot_entity:
                 # 发送到 Up Bot，带 EXTERNAL_RELAY 标记统一上传到存储频道
@@ -813,9 +817,10 @@ class RelayInstance:
                     from urllib.parse import urlparse, parse_qs
                     parsed = urlparse(url)
                     target_user = parsed.path.strip("/").lower()
-                    # 仅允许向已知可信 Bot 自动发送 /start（解码器 Bot、上传 Bot）
+                    # 仅允许向已知可信 Bot 自动发送 /start（解码器 Bot、上传 Bot、当前交互 Bot）
                     allowed = {settings.DECODER_BOT_USERNAME.lower().lstrip("@"),
-                               settings.UPLOAD_BOT_USERNAME.lower().lstrip("@")}
+                               settings.UPLOAD_BOT_USERNAME.lower().lstrip("@"),
+                               bot_username.lower().lstrip("@")}
                     if target_user not in allowed:
                         logger.warning(f"[RelayInstance:{self.phone}] 拒绝向不可信实体自动 /start: {target_user}")
                         return False

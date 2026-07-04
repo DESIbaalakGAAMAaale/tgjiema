@@ -719,6 +719,16 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     格式:EXTERNAL_RELAY:{user_id}:{external_code}
     文件先 copy 到存储频道，积累后由 EXTERNAL_DONE 触发批量写入 pending_uploads。
     """
+    # R30-3: 校验发送者是否为受信中继账号，防止任意用户绕过上传权限/限速注入文件
+    relay_ids_str = settings.RELAY_ACCOUNT_IDS
+    if relay_ids_str:
+        relay_ids = {int(x.strip()) for x in relay_ids_str.split(",") if x.strip()}
+        if update.effective_user.id not in relay_ids:
+            logger.warning(f"[Up][ext_relay] 拒绝非中继账号的 EXTERNAL_RELAY 请求: user={update.effective_user.id}")
+            return
+    else:
+        logger.warning("[Up][ext_relay] RELAY_ACCOUNT_IDS 未配置，中继文件入口无身份校验——请尽快在 .env 中配置")
+
     caption = update.message.caption or ""
     rest = caption[len("EXTERNAL_RELAY:"):]
     user_end = rest.find(":")
