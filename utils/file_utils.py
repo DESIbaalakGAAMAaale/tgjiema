@@ -41,6 +41,8 @@ def extract_file_meta(update: Update) -> dict:
 
 
 def extract_media_info(msg):
+    if msg is None:
+        return None, "document"
     if msg.photo:
         return msg.photo[-1].file_id, "photo"
     if msg.video:
@@ -57,6 +59,8 @@ def extract_media_info(msg):
 
 
 def is_media_message(msg) -> bool:
+    if msg is None:
+        return False
     return any((
         msg.photo, msg.video, msg.document,
         msg.audio, msg.voice, msg.animation,

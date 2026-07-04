@@ -293,7 +293,8 @@ async def files_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if search.isdigit():
             query["uploader_id"] = int(search)
         else:
-            query["file_code"] = {"$regex": search, "$options": "i"}
+            import re
+            query["file_code"] = {"$regex": re.escape(search), "$options": "i"}
 
     total = await files_col.count_documents(query)
     skip = (page - 1) * per_page
@@ -733,16 +734,29 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cleared = []
     errors = []
-    for table in _FACTORY_RESET_TABLES:
+    try:
+        # 使用事务保证原子性：任一表失败则整体回滚，避免部分清空的不一致状态
+        await client.execute("BEGIN")
+        for table in _FACTORY_RESET_TABLES:
+            try:
+                sql = f"DELETE FROM {table}"
+                await client.execute(sql)
+                cleared.append(table)
+            except Exception as e:
+                errors.append(f"{table}: {e}")
+                logger.error(f"[factory_reset] 清空 {table} 失败: {e}")
+                # 任一表失败则回滚整个事务
+                await client.execute("ROLLBACK")
+                cleared = []  # 清空已记录的"成功"列表，因为已回滚
+                break
+        else:
+            await client.execute("COMMIT")
+    finally:
+        # 确保连接一定关闭,避免连接泄漏
         try:
-            sql = f"DELETE FROM {table}"
-            await client.execute(sql)
-            cleared.append(table)
+            await client.close()
         except Exception as e:
-            errors.append(f"{table}: {e}")
-            logger.error(f"[factory_reset] 清空 {table} 失败: {e}")
-
-    await client.close()
+            logger.warning(f"[factory_reset] client.close 异常: {e}")
 
     # 同步清空本地 SQLite 缓存，防止脏行回写重新推回 CRDB
     sqlite_cleared = []
@@ -754,6 +768,12 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             local_tables = [
                 "cells_local", "file_records_local", "users_local",
                 "codes_local", "local_job_queue", "external_code_mapping_local",
+                # 关键:防止后台 flush 任务将残留数据回写 CRDB
+                "decode_log_buffer", "code_changes",
+                # 其他缓存表
+                "user_quota", "heartbeat_local", "bot_heartbeat",
+                "cells_snapshot", "cells_change_notify", "counter_snapshot",
+                "pending_notify", "dsp_notify", "cache_backup", "kv_store",
             ]
             for tbl in local_tables:
                 try:
@@ -1053,6 +1073,152 @@ async def rotation_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+# ─── 白名单热管理（中继账号 & 采集器账号） ──────────────────────────
+
+@_auth_required
+async def relay_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """中继账号白名单热管理
+    用法:
+      /relay_whitelist              — 查看当前白名单
+      /relay_whitelist add <用户ID>  — 添加中继账号
+      /relay_whitelist remove <用户ID> — 移除中继账号
+      /relay_whitelist clear        — 清空白名单（回退到 .env 配置）
+    """
+    from database import (
+        get_relay_whitelist, add_relay_whitelist, remove_relay_whitelist, delete_config,
+    )
+    args = context.args
+    if not args:
+        ids = await get_relay_whitelist()
+        if not ids:
+            await update.message.reply_text(
+                "📋 中继账号白名单（当前为空）\n\n"
+                "未配置白名单时，所有 EXTERNAL_RELAY/EXTERNAL_DONE 请求将被拒绝。\n"
+                "使用 /relay_whitelist add <用户ID> 添加中继账号 ✅热更新"
+            )
+            return
+        msg = "📋 中继账号白名单\n\n"
+        for uid in sorted(ids):
+            msg += f"  • `{uid}`\n"
+        msg += f"\n共 {len(ids)} 个账号 ✅热更新\n"
+        msg += "使用 /relay_whitelist add/remove <用户ID> 增删"
+        await update.message.reply_text(msg)
+        return
+
+    action = args[0].lower()
+    if action == "add":
+        if len(args) < 2:
+            await update.message.reply_text("用法:/relay_whitelist add <用户ID>")
+            return
+        try:
+            user_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字")
+            return
+        added = await add_relay_whitelist(user_id)
+        if added:
+            await update.message.reply_text(f"✅ 中继账号 `{user_id}` 已添加到白名单 ✅热更新")
+        else:
+            await update.message.reply_text(f"⚠️ 中继账号 `{user_id}` 已在白名单中")
+    elif action == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("用法:/relay_whitelist remove <用户ID>")
+            return
+        try:
+            user_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字")
+            return
+        removed = await remove_relay_whitelist(user_id)
+        if removed:
+            await update.message.reply_text(f"✅ 中继账号 `{user_id}` 已从白名单移除 ✅热更新")
+        else:
+            await update.message.reply_text(f"⚠️ 中继账号 `{user_id}` 不在白名单中")
+    elif action == "clear":
+        await delete_config("relay_account_ids")
+        await update.message.reply_text("✅ 中继账号白名单已清空（回退到 .env 配置） ✅热更新")
+    else:
+        await update.message.reply_text(
+            "用法:\n"
+            "  /relay_whitelist              — 查看白名单\n"
+            "  /relay_whitelist add <用户ID>  — 添加\n"
+            "  /relay_whitelist remove <用户ID> — 移除\n"
+            "  /relay_whitelist clear        — 清空"
+        )
+
+
+@_auth_required
+async def collector_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """采集器账号白名单热管理
+    用法:
+      /collector_whitelist              — 查看当前白名单
+      /collector_whitelist add <用户ID>  — 添加采集器账号
+      /collector_whitelist remove <用户ID> — 移除采集器账号
+      /collector_whitelist clear        — 清空白名单（回退到 .env 配置）
+    """
+    from database import (
+        get_collector_whitelist, add_collector_whitelist, remove_collector_whitelist, delete_config,
+    )
+    args = context.args
+    if not args:
+        ids = await get_collector_whitelist()
+        if not ids:
+            await update.message.reply_text(
+                "📋 采集器账号白名单（当前为空）\n\n"
+                "未配置白名单时，外挂采集器推送将被拒绝。\n"
+                "使用 /collector_whitelist add <用户ID> 添加采集器账号 ✅热更新"
+            )
+            return
+        msg = "📋 采集器账号白名单\n\n"
+        for uid in sorted(ids):
+            msg += f"  • `{uid}`\n"
+        msg += f"\n共 {len(ids)} 个账号 ✅热更新\n"
+        msg += "使用 /collector_whitelist add/remove <用户ID> 增删"
+        await update.message.reply_text(msg)
+        return
+
+    action = args[0].lower()
+    if action == "add":
+        if len(args) < 2:
+            await update.message.reply_text("用法:/collector_whitelist add <用户ID>")
+            return
+        try:
+            user_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字")
+            return
+        added = await add_collector_whitelist(user_id)
+        if added:
+            await update.message.reply_text(f"✅ 采集器账号 `{user_id}` 已添加到白名单 ✅热更新")
+        else:
+            await update.message.reply_text(f"⚠️ 采集器账号 `{user_id}` 已在白名单中")
+    elif action == "remove":
+        if len(args) < 2:
+            await update.message.reply_text("用法:/collector_whitelist remove <用户ID>")
+            return
+        try:
+            user_id = int(args[1])
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字")
+            return
+        removed = await remove_collector_whitelist(user_id)
+        if removed:
+            await update.message.reply_text(f"✅ 采集器账号 `{user_id}` 已从白名单移除 ✅热更新")
+        else:
+            await update.message.reply_text(f"⚠️ 采集器账号 `{user_id}` 不在白名单中")
+    elif action == "clear":
+        await delete_config("collector_account_ids")
+        await update.message.reply_text("✅ 采集器账号白名单已清空（回退到 .env 配置） ✅热更新")
+    else:
+        await update.message.reply_text(
+            "用法:\n"
+            "  /collector_whitelist              — 查看白名单\n"
+            "  /collector_whitelist add <用户ID>  — 添加\n"
+            "  /collector_whitelist remove <用户ID> — 移除\n"
+            "  /collector_whitelist clear        — 清空"
+        )
+
+
 # ─── 拓扑查看 ──────────────────────────────────────────────────
 
 @_auth_required
@@ -1099,7 +1265,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /relay_list — 查看中继实例列表\n"
         "  /relay_add <手机号> — 添加中继实例\n"
         "  /relay_remove <手机号> — 移除中继实例\n"
-        "  /relay_reset_stats — 重置中继统计\n\n"
+        "  /relay_reset_stats — 重置中继统计\n"
+        "  /relay_whitelist [add|remove|clear] [用户ID] — 中继账号白名单（热更新）\n"
+        "  /collector_whitelist [add|remove|clear] [用户ID] — 采集器账号白名单（热更新）\n\n"
         "系统配置\n"
         "  /settings — 查看全部配置\n"
         "  /set_storage_channel <频道ID> — 主存储频道（需重启）\n"

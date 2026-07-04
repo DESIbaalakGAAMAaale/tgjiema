@@ -263,6 +263,8 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             batch["pinned_msg_ids"].append(forwarded.message_id)
         except Exception as e:
             logger.error(f"[Up] 批次上传复制文件到存储频道失败: {e}")
+            await update.message.reply_text(f"❌ {file_type}接收失败,请重传")
+            return
         await update.message.reply_text(f"已接{file_type}")
 
 
@@ -292,12 +294,15 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
         batch["file_types"][k] += v
     target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
 
-    # 并发复制所有媒体文件到存储频道
-    tasks = [asyncio.create_task(_copy_one_media(context, target_ch, up, batch)) for up in grp["updates"]]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    copied = sum(1 for r in results if r is True)
-    failed = sum(1 for r in results if r is not True)
+    # 串行复制所有媒体文件到存储频道(保持原始顺序,确保 pinned_msg_ids 与 files_meta 对应)
+    copied = 0
+    failed = 0
+    for up in grp["updates"]:
+        ok = await _copy_one_media(context, target_ch, up, batch)
+        if ok:
+            copied += 1
+        else:
+            failed += 1
 
     first = grp["updates"][0]
     type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items()))
@@ -720,14 +725,17 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     文件先 copy 到存储频道，积累后由 EXTERNAL_DONE 触发批量写入 pending_uploads。
     """
     # R30-3: 校验发送者是否为受信中继账号，防止任意用户绕过上传权限/限速注入文件
-    relay_ids_str = settings.RELAY_ACCOUNT_IDS
-    if relay_ids_str:
-        relay_ids = {int(x.strip()) for x in relay_ids_str.split(",") if x.strip()}
+    # 白名单支持热修改：优先从 DB 读取（admin_bot /relay_whitelist 命令维护），回退到环境变量
+    from database import get_relay_whitelist
+    relay_ids = await get_relay_whitelist()
+    if relay_ids:
         if update.effective_user.id not in relay_ids:
             logger.warning(f"[Up][ext_relay] 拒绝非中继账号的 EXTERNAL_RELAY 请求: user={update.effective_user.id}")
             return
     else:
-        logger.warning("[Up][ext_relay] RELAY_ACCOUNT_IDS 未配置，中继文件入口无身份校验——请尽快在 .env 中配置")
+        # 安全默认拒绝:未配置白名单时禁止所有 EXTERNAL_RELAY 文件,防止任意用户注入
+        logger.error("[Up][ext_relay] RELAY_ACCOUNT_IDS 未配置,拒绝 EXTERNAL_RELAY 请求——请在 .env 中配置或通过 /relay_whitelist add 添加中继账号白名单")
+        return
 
     caption = update.message.caption or ""
     rest = caption[len("EXTERNAL_RELAY:"):]
@@ -740,15 +748,29 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         return
     external_code = rest[user_end + 1:].strip()
 
-    async with _mg_lock:
-        buf = _external_buffers.get(external_code)
-        has_channel = buf is not None and buf.get("channel_id")
     # 同一 external_code 的所有文件必须 copy 到同一存储频道，
     # 否则 pending_uploads 的 primary_channel_id 与 batch_msg_ids 中的消息 ID 不匹配（PRE-15 关联修复）
-    if has_channel:
-        target_ch = buf["channel_id"]
-    else:
-        target_ch = await _get_upload_target_channel()
+    # 在锁内确定 channel_id 并创建占位 buffer，避免并发文件分散到不同频道（TOCTOU 竞态修复）
+    async with _mg_lock:
+        buf = _external_buffers.get(external_code)
+        if buf is not None and buf.get("channel_id"):
+            target_ch = buf["channel_id"]
+        else:
+            # 首次见到此 external_code：在锁内确定频道并创建占位 buffer
+            try:
+                target_ch = await _get_upload_target_channel()
+            except RuntimeError as e:
+                logger.error(f"[Up][ext_relay] 无法获取上传目标频道 (code={external_code}): {e}")
+                return
+            _external_buffers[external_code] = {
+                "user_id": external_user_id,
+                "channel_id": target_ch,
+                "msg_ids": [],
+                "files_meta": [],
+                "file_types": defaultdict(int),
+                "flushed": False,
+                "created_at": time.time(),
+            }
 
     try:
         forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
@@ -760,18 +782,20 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     file_meta = extract_file_meta(update)
 
     async with _mg_lock:
-        if external_code not in _external_buffers:
-            _external_buffers[external_code] = {
+        buf = _external_buffers.get(external_code)
+        if buf is None:
+            # 极端情况：buffer 被安全超时 flush 清理了，重新创建
+            buf = {
                 "user_id": external_user_id,
-                "channel_id": target_ch,  # 记录实际存储频道，flush 时复用
+                "channel_id": target_ch,
                 "msg_ids": [],
                 "files_meta": [],
                 "file_types": defaultdict(int),
                 "flushed": False,
                 "created_at": time.time(),
             }
+            _external_buffers[external_code] = buf
 
-        buf = _external_buffers[external_code]
         buf["msg_ids"].append(forwarded.message_id)
         buf["files_meta"].append(file_meta)
         buf["file_types"][file_type] += 1
@@ -788,6 +812,18 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
 
 async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 EXTERNAL_DONE 信号:中继账号通知文件收集完毕,触发批量写入"""
+    # 安全校验:仅受信中继账号可触发 flush,防止任意用户提前 flush 外部缓冲区
+    # 白名单支持热修改：优先从 DB 读取（admin_bot /relay_whitelist 命令维护），回退到环境变量
+    from database import get_relay_whitelist
+    relay_ids = await get_relay_whitelist()
+    if relay_ids:
+        if update.effective_user.id not in relay_ids:
+            logger.warning(f"[Up][ext_done] 拒绝非中继账号的 EXTERNAL_DONE 请求: user={update.effective_user.id}")
+            return
+    else:
+        logger.error("[Up][ext_done] RELAY_ACCOUNT_IDS 未配置,拒绝 EXTERNAL_DONE 请求——请通过 /relay_whitelist add 配置白名单")
+        return
+
     text = update.message.text or ""
     if not text.startswith("EXTERNAL_DONE:"):
         return

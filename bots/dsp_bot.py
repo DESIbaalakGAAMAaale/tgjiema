@@ -189,7 +189,12 @@ async def _check_channel_degrade(channel_id: int):
             return
 
         store = get_cache_store()
-        new_degrade_count = cell.get("degrade_count", 0) + 1
+        # 类型安全:degrade_count 可能是 None/str,统一转 int
+        try:
+            raw_dc = cell.get("degrade_count", 0)
+            new_degrade_count = int(raw_dc) + 1 if raw_dc is not None else 1
+        except (TypeError, ValueError):
+            new_degrade_count = 1
         await store.update_cell_fields_local(slot_id, {
             "status": "lost",
             "degrade_count": new_degrade_count,
@@ -313,7 +318,17 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
         else:
             send_ok = await _process_single_job(bot, job, bot_id=worker_id)
         if send_ok:
-            await store.update_local_job_status(job.job_id, "done")
+            # 状态更新失败时不能让 send_ok 保持 True,否则 job 残留在 dispatched 状态,
+            # 600秒后会被 reclaim_stale_dispatched 回收重新派发,导致用户收到重复文件
+            try:
+                await store.update_local_job_status(job.job_id, "done")
+            except Exception as status_err:
+                logger.error(
+                    f"[Dsp-{worker_id}] job={job.job_id} 状态更新失败: {status_err}"
+                    f",重置 send_ok=False 触发重试,避免重复投递"
+                )
+                send_ok = False
+                raise
             await _send_report_button(bot, job.target_user_id, job.code)
     except Exception as e:
         logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
@@ -352,10 +367,15 @@ async def _dsp_worker(bot: Any, worker_id: int):
                 continue
 
             jobs = _raw_jobs_to_results(raw_jobs)
+            # CAS 认领:仅发送成功标记为 dispatched 的 job,防止多 worker 重复发送
+            claimed_jobs = []
             for job in jobs:
-                await store.mark_local_job_dispatched(job.job_id)
+                if await store.mark_local_job_dispatched(job.job_id):
+                    claimed_jobs.append(job)
 
-            tasks = [asyncio.create_task(_send_one_job(bot, job, worker_id, store)) for job in jobs]
+            if not claimed_jobs:
+                continue
+            tasks = [asyncio.create_task(_send_one_job(bot, job, worker_id, store)) for job in claimed_jobs]
             await asyncio.gather(*tasks, return_exceptions=True)
 
         except Exception as e:
@@ -383,10 +403,15 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     if not success:
         await _record_channel_failure(resolved.channel_id)
         # 环形降级:沿环找下一个可用频道,避免重复尝试同一频道
+        # 注意:不能用 resolve_delivery_channel(current_id),因为对 active 频道它会返回自身,导致循环立即 break
+        # 必须用 _walk_ring_for_channel 直接获取环上的下一个频道
+        # 从 resolved.channel_id(已失败的频道)开始沿环找下一个,而非 job.storage_channel_id
+        # 否则当 resolve(A) 返回 B 时,_walk_ring_for_channel(A) 也会返回 B,循环立即 break
+        from storage.delivery_resolver import _walk_ring_for_channel
         tried = {resolved.channel_id}
         current_id = resolved.channel_id
-        for _ in range(10):  # 最多尝试 10 个降级槽位(原 5 个不够)
-            next_resolved = await resolve_delivery_channel(current_id)
+        for _ in range(10):  # 最多尝试 10 个降级槽位
+            next_resolved = await _walk_ring_for_channel(current_id)
             if next_resolved.channel_id in tried:
                 break
             tried.add(next_resolved.channel_id)
@@ -568,24 +593,34 @@ async def _send_report_button(bot, chat_id: int, file_code: str):
 
 
 _report_debounce: dict[str, float] = {}
+_REPORT_DEBOUNCE_TTL = 300  # 5 分钟,超过此时间的记录可清理
+_report_debounce_last_gc = 0.0  # 上次 GC 时间,用于惰性清理
 
 async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理用户点击举报按钮，推送消息给管理员"""
     query = update.callback_query
-    await query.answer()
 
     data = query.data
     if not data.startswith("report_req|"):
+        await query.answer()
         return
 
     file_code = data.split("|", 1)[1]
     reporter = update.effective_user
     if not reporter:
+        await query.answer()
         return
 
     # 60 秒防抖
     key = f"{reporter.id}:{file_code}"
     now = time.time()
+    # 惰性 GC:每 60 秒清理一次过期记录,避免 _report_debounce 无限增长导致内存泄漏
+    global _report_debounce_last_gc
+    if now - _report_debounce_last_gc > 60:
+        expired_keys = [k for k, ts in _report_debounce.items() if now - ts > _REPORT_DEBOUNCE_TTL]
+        for k in expired_keys:
+            _report_debounce.pop(k, None)
+        _report_debounce_last_gc = now
     if key in _report_debounce and now - _report_debounce[key] < 60:
         await query.answer("已提交举报，请勿重复操作", show_alert=True)
         return
@@ -776,6 +811,17 @@ async def _async_main():
                 logger.warning(f"[SyncBack] 同步异常: {e}")
             await asyncio.sleep(120)
 
+    # E: 回收超时 dispatched jobs,防止进程崩溃导致 job 永久丢失
+    async def reclaim_dispatched_loop():
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        while True:
+            try:
+                await store.reclaim_stale_dispatched(timeout_seconds=600)
+            except Exception as e:
+                logger.warning(f"[Dsp] 回收 dispatched jobs 异常: {e}")
+            await asyncio.sleep(120)
+
     create_safe_task(health_ping(), name="health-ping")
     create_safe_task(startup_sync(), name="startup-sync")          # H: 启动同步 + 周期兜底
     create_safe_task(sync_back_loop(), name="sync-back")          # D: 新增
@@ -784,6 +830,7 @@ async def _async_main():
     create_safe_task(_cleanup_channel_failures(), name="cleanup-channel-failures")
     create_safe_task(_cleanup_channel_limiter_loop(), name="cleanup-channel-limiter")
     create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
+    create_safe_task(reclaim_dispatched_loop(), name="reclaim-dispatched")  # E: 回收超时 dispatched
     create_safe_task(_watch_cells_change(), name="watch-cells-change")  # PRE-02: 失效 delivery_resolver 缓存
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")

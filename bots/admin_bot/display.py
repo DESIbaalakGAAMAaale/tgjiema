@@ -92,13 +92,16 @@ async def _get_status_text() -> str:
         cached = await store.load_counter_snapshot()
         if cached and "total_users" in cached:
             for k, v in cached.items():
-                _status_counters[k] = v
+                # today_decodes 是累积值,不走缓存,下方直查 DB 保证按天统计
+                if k != "today_decodes":
+                    _status_counters[k] = v
         else:
             _status_counters["total_users"] = await users_col.count_documents({})
             _status_counters["total_files"] = await files_col.count_documents({})
             _status_counters["active_files"] = await files_col.count_documents({"status": "active"})
-            today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-            _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
+        # today_decodes 始终直查 DB(1 RU),避免跨天累积导致统计虚高
+        today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        _status_counters["today_decodes"] = await logs_col.count_documents({"request_time": {"$gte": today.isoformat()}})
         _shared_counters.status_counters_initialized = True
         _shared_counters.status_counters_loaded_at = now_ts
     try:
@@ -137,8 +140,6 @@ async def _get_status_text() -> str:
         f"📁 总文件数:{_status_counters['total_files']}\n"
         f"✅ 活跃文件:{_status_counters['active_files']}\n"
         f"🔄 今日解码:{_status_counters['today_decodes']}\n"
-        f"📤 发送成功:{metrics.send_success_count}\n"
-        f"📤 发送失败:{metrics.send_fail_count}\n"
         f"\n🔄 活跃槽位:{active_cells_text}\n"
         f"\n🔐 用户中继:{relay_status}\n"
         f"\n🤖 机器人状态:\n"
@@ -423,7 +424,8 @@ async def _get_configs_text() -> str:
 
     r2_keys_to_check = ["r2_account_id", "r2_access_key", "r2_secret_key"]
     r2_vals = await asyncio.gather(*(get_config(k) for k in r2_keys_to_check), return_exceptions=True)
-    r2_configured = any(v for v in r2_vals if v)
+    # 注意: return_exceptions=True 时 Exception 实例是 truthy,必须显式判断 isinstance(v, str)
+    r2_configured = any(isinstance(v, str) and v for v in r2_vals)
     if not r2_configured:
         r2_check = lambda k: _config_fallback(k) != settings.get_config_default(k)
         r2_configured = any(r2_check(k) for k in r2_keys_to_check)

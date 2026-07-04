@@ -54,7 +54,12 @@ class Settings(BaseSettings):
     RELAY_ENCRYPTION_KEY: str = ""
 
     # ─── 中继账号白名单：逗号分隔的 Telegram 用户 ID，仅这些账号可向 Up Bot 发送 EXTERNAL_RELAY 文件 ───
+    # 支持热修改：admin_bot /relay_whitelist 命令可动态增删，DB 配置优先于环境变量
     RELAY_ACCOUNT_IDS: str = ""
+
+    # ─── 采集器账号白名单：逗号分隔的 Telegram 用户 ID，仅这些账号可向主系统推送采集结果 ───
+    # 支持热修改：admin_bot /collector_whitelist 命令可动态增删，DB 配置优先于环境变量
+    COLLECTOR_ACCOUNT_IDS: str = ""
 
     # ─── Telegram Relay API 密钥（添加中继账号时从此处读取）───
     RELAY_API_ID: int = 0
@@ -170,7 +175,7 @@ class Settings(BaseSettings):
     @db_backup_enabled.setter
     def db_backup_enabled(self, value):
         if isinstance(value, str):
-            value = value.lower() == "true"
+            value = value.lower() in ("true", "1", "on", "yes")
         self.DB_BACKUP_ENABLED = bool(value)
 
     class Config:

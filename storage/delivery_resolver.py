@@ -245,29 +245,30 @@ async def deliver_with_fallback(
 
     返回成功发送的消息数。
     """
-    resolved = await resolve_delivery_channel(primary_channel_id)
-    current_channel = resolved.channel_id
+    # 初始解析一次主频道,后续每条消息从主频道开始尝试,避免上一条消息的降级状态污染下一条
+    initial_resolved = await resolve_delivery_channel(primary_channel_id)
+    initial_channel = initial_resolved.channel_id
     success_count = 0
 
     for msg_id in message_ids:
-        tried_channels = set()
+        # 每条消息独立维护尝试过的频道集合和当前频道,避免跨消息状态污染
+        current_channel = initial_channel
+        tried_channels = {current_channel}
         for attempt in range(max_attempts):
-            if attempt > 0:
-                # 尝试下一个频道
-                next_resolved = await resolve_delivery_channel(current_channel)
-                if next_resolved.channel_id in tried_channels:
-                    break
-                current_channel = next_resolved.channel_id
-                tried_channels.add(current_channel)
-
             ok = await try_deliver(bot_instance, target_user_id, current_channel, msg_id, protect_content=protect_content, original_channel_id=primary_channel_id)
             if ok:
                 success_count += 1
-                tried_channels.add(current_channel)
                 break
 
-            # 同一条消息重试前短暂等待
+            # 失败:尝试下一个频道
             if attempt < max_attempts - 1:
+                # 同一条消息重试前短暂等待
                 await asyncio.sleep(0.15)
+                next_resolved = await resolve_delivery_channel(current_channel)
+                if next_resolved.channel_id in tried_channels:
+                    # 所有可用频道都试过了,放弃这条消息
+                    break
+                current_channel = next_resolved.channel_id
+                tried_channels.add(current_channel)
 
     return success_count

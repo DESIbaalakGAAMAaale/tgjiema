@@ -67,7 +67,9 @@ async def api_call_with_backoff(coro_factory, description: str = "", bot_id: int
                 f"叠加退避 +{extra}s, 抖动 +{jitter:.1f}s, 总计 {total_wait:.1f}s "
                 f"(第 {floods} 次连续触发)"
             )
-            await asyncio.sleep(total_wait)
+            # 最后一次重试不再 sleep,避免白等后直接抛错
+            if attempt < max_retries - 1:
+                await asyncio.sleep(total_wait)
 
         except BadRequest as e:
             # C3: "message not found" 类错误重试无意义，直接抛出
@@ -83,7 +85,9 @@ async def api_call_with_backoff(coro_factory, description: str = "", bot_id: int
                 f"[Backoff] bot_id={bot_id} {description}: {type(e).__name__}, "
                 f"等待 {wait}s 后重试 (attempt {attempt + 1}/{max_retries})"
             )
-            await asyncio.sleep(wait)
+            # 最后一次重试不再 sleep,避免白等后直接抛错
+            if attempt < max_retries - 1:
+                await asyncio.sleep(wait)
 
     logger.error(f"[FloodWait] bot_id={bot_id} {description}: 超过最大重试次数 {max_retries}")
     raise RuntimeError(f"API call failed after {max_retries} retries: {description}")

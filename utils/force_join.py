@@ -2,6 +2,7 @@ from loguru import logger
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from telegram.error import NetworkError, TimedOut, BadRequest, Forbidden
 
 from config import settings
 
@@ -21,16 +22,31 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         if member.status not in ("left", "kicked"):
             return True
+    except (NetworkError, TimedOut) as e:
+        # 网络/超时错误:不应误判用户未加群,放行避免误伤
+        logger.warning(f"强制加群检查网络异常,放行: {e}")
+        return True
+    except (BadRequest, Forbidden) as e:
+        # 配置错误(bot 不在频道/频道不存在):告警并放行,避免阻塞所有用户
+        logger.error(f"强制加群配置异常,请检查 FORCE_JOIN_CHANNEL_ID 和 bot 权限: {e}")
+        return True
     except Exception as e:
-        logger.debug(f"强制加群检查失败: {e}")
+        # 未预期异常:安全默认放行,避免误伤用户
+        logger.warning(f"强制加群检查未预期异常,放行: {e}")
+        return True
 
     channel_link = settings.FORCE_JOIN_CHANNEL_LINK
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 加入频道", url=channel_link)],
-    ])
+    if channel_link:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 加入频道", url=channel_link)],
+        ])
+        text = "⚠️ 使用前请先加入频道,加入后重新发送指令即可。"
+    else:
+        keyboard = None
+        text = "⚠️ 使用前请先加入指定频道,加入后重新发送指令即可。"
     if update.message:
         await update.message.reply_text(
-            "⚠️ 使用前请先加入频道,加入后重新发送指令即可。",
+            text,
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )

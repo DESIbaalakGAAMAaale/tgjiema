@@ -461,9 +461,23 @@ class CockroachDBClient:
         async with self._pool.acquire() as conn:
             await conn.execute(sql, *(params or []))
 
+    async def fetch(self, sql: str, params: list = None) -> list:
+        """公开的原始 SQL 查询方法,返回多行记录(列表)。
+        供 db_backup 等模块使用,避免外部直接访问 _pool 私有属性。
+        """
+        if self._pool is None:
+            raise RuntimeError("数据库连接池未初始化")
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(sql, *(params or []))
+
+    @property
+    def is_connected(self) -> bool:
+        """连接池是否已初始化。"""
+        return self._pool is not None
+
     @asynccontextmanager
     async def transaction(self):
-        """获取一个带事务的连接,用于需要原子性的多步操作        
+        """获取一个带事务的连接,用于需要原子性的多步操作
         用法:
             async with db.transaction() as conn:
                 await conn.execute(...)
@@ -617,9 +631,13 @@ class D1Collection:
                         where_parts.append(f"{k} != ${len(params) + 1}")
                         params.append(val)
                     elif op == "$in":
-                        placeholders = [f"${len(params) + j + 1}" for j in range(len(val))]
-                        params.extend(val)
-                        where_parts.append(f"{k} IN ({', '.join(placeholders)})")
+                        # 空列表 $in: 匹配 nothing（与 MongoDB 语义一致），避免生成 `IN ()` 语法错误
+                        if not val:
+                            where_parts.append("FALSE")
+                        else:
+                            placeholders = [f"${len(params) + j + 1}" for j in range(len(val))]
+                            params.extend(val)
+                            where_parts.append(f"{k} IN ({', '.join(placeholders)})")
                 continue
             where_parts.append(f"{k} = ${len(params) + 1}")
             params.append(v)
@@ -756,9 +774,13 @@ class D1Collection:
                         where_parts.append(f"{k} < ${len(params) + 1}")
                         params.append(val)
                     elif op == "$in":
-                        placeholders = [f"${len(params) + j + 1}" for j in range(len(val))]
-                        params.extend(val)
-                        where_parts.append(f"{k} IN ({', '.join(placeholders)})")
+                        # 空列表 $in: 匹配 nothing（与 MongoDB 语义一致），避免生成 `IN ()` 语法错误
+                        if not val:
+                            where_parts.append("FALSE")
+                        else:
+                            placeholders = [f"${len(params) + j + 1}" for j in range(len(val))]
+                            params.extend(val)
+                            where_parts.append(f"{k} IN ({', '.join(placeholders)})")
                 continue
             where_parts.append(f"{k} = ${len(params) + 1}")
             params.append(v)
@@ -799,9 +821,14 @@ class D1Collection:
                     where_parts.append(f"{k} != ${len(params) + 1}")
                     params.append(_safe_str(v["$ne"]))
                 elif "$in" in v:
-                    placeholders = [f"${len(params) + j + 1}" for j in range(len(v["$in"]))]
-                    params.extend([_safe_str(x) for x in v["$in"]])
-                    where_parts.append(f"{k} IN ({', '.join(placeholders)})")
+                    in_list = v["$in"]
+                    # 空列表 $in: 匹配 nothing（与 MongoDB 语义一致），避免生成 `IN ()` 语法错误
+                    if not in_list:
+                        where_parts.append("FALSE")
+                    else:
+                        placeholders = [f"${len(params) + j + 1}" for j in range(len(in_list))]
+                        params.extend([_safe_str(x) for x in in_list])
+                        where_parts.append(f"{k} IN ({', '.join(placeholders)})")
                 elif "$regex" in v:
                     where_parts.append(f"{k} LIKE ${len(params) + 1} ESCAPE '\\'")
                     params.append(f"%{_escape_like(_safe_str(v['$regex']))}%")
@@ -855,9 +882,14 @@ class D1Collection:
                     where_parts.append(f"{k} != ${len(params) + 1}")
                     params.append(_safe_str(v["$ne"]))
                 elif "$in" in v:
-                    placeholders = [f"${len(params) + j + 1}" for j in range(len(v["$in"]))]
-                    params.extend([_safe_str(x) for x in v["$in"]])
-                    where_parts.append(f"{k} IN ({', '.join(placeholders)})")
+                    in_list = v["$in"]
+                    # 空列表 $in: 匹配 nothing（与 MongoDB 语义一致），避免生成 `IN ()` 语法错误
+                    if not in_list:
+                        where_parts.append("FALSE")
+                    else:
+                        placeholders = [f"${len(params) + j + 1}" for j in range(len(in_list))]
+                        params.extend([_safe_str(x) for x in in_list])
+                        where_parts.append(f"{k} IN ({', '.join(placeholders)})")
                 elif "$regex" in v:
                     where_parts.append(f"{k} LIKE ${len(params) + 1} ESCAPE '\\'")
                     params.append(f"%{_escape_like(_safe_str(v['$regex']))}%")
@@ -1056,8 +1088,92 @@ async def _invalidate_config_caches(key: str):
         from .cache_store import get_cache_store
         store = get_cache_store()
         await store.delete(f"config:{key}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[config] 失效 L2 缓存失败 key={key}: {e}")
+
+
+# ─── 中继账号白名单 & 采集器白名单：热修改支持 ───
+# DB key: relay_account_ids / collector_account_ids
+# 优先从 DB 读取（支持热修改），DB 未配置时回退到 settings 环境变量
+
+# 进程内互斥锁：防止并发 add/remove 导致读-改-写竞态（覆盖丢失）
+_whitelist_modify_lock = asyncio.Lock()
+
+
+async def get_relay_whitelist() -> set[int]:
+    """获取中继账号白名单（动态加载，支持热修改）。
+    优先从 DB 读取，DB 未配置时回退到 settings.RELAY_ACCOUNT_IDS。
+    使用 get_config_fresh 绕过 L1 缓存,确保 admin_bot 热修改后立即生效。
+    """
+    from config import settings
+    db_val = await get_config_fresh("relay_account_ids")
+    raw = db_val if db_val else getattr(settings, "RELAY_ACCOUNT_IDS", "")
+    if not raw:
+        return set()
+    try:
+        return {int(x.strip()) for x in raw.split(",") if x.strip()}
+    except (ValueError, TypeError):
+        return set()
+
+
+async def add_relay_whitelist(user_id: int) -> bool:
+    """添加中继账号到白名单。返回 True 表示新增，False 表示已存在。"""
+    async with _whitelist_modify_lock:
+        current = await get_relay_whitelist()
+        if user_id in current:
+            return False
+        current.add(user_id)
+        await set_config("relay_account_ids", ",".join(str(x) for x in sorted(current)))
+        return True
+
+
+async def remove_relay_whitelist(user_id: int) -> bool:
+    """从中继账号白名单移除。返回 True 表示已移除，False 表示不存在。"""
+    async with _whitelist_modify_lock:
+        current = await get_relay_whitelist()
+        if user_id not in current:
+            return False
+        current.discard(user_id)
+        await set_config("relay_account_ids", ",".join(str(x) for x in sorted(current)))
+        return True
+
+
+async def get_collector_whitelist() -> set[int]:
+    """获取采集器账号白名单（动态加载，支持热修改）。
+    优先从 DB 读取，DB 未配置时回退到 settings.COLLECTOR_ACCOUNT_IDS。
+    使用 get_config_fresh 绕过 L1 缓存,确保 admin_bot 热修改后立即生效。
+    """
+    from config import settings
+    db_val = await get_config_fresh("collector_account_ids")
+    raw = db_val if db_val else getattr(settings, "COLLECTOR_ACCOUNT_IDS", "")
+    if not raw:
+        return set()
+    try:
+        return {int(x.strip()) for x in raw.split(",") if x.strip()}
+    except (ValueError, TypeError):
+        return set()
+
+
+async def add_collector_whitelist(user_id: int) -> bool:
+    """添加采集器账号到白名单。返回 True 表示新增，False 表示已存在。"""
+    async with _whitelist_modify_lock:
+        current = await get_collector_whitelist()
+        if user_id in current:
+            return False
+        current.add(user_id)
+        await set_config("collector_account_ids", ",".join(str(x) for x in sorted(current)))
+        return True
+
+
+async def remove_collector_whitelist(user_id: int) -> bool:
+    """从采集器账号白名单移除。返回 True 表示已移除，False 表示不存在。"""
+    async with _whitelist_modify_lock:
+        current = await get_collector_whitelist()
+        if user_id not in current:
+            return False
+        current.discard(user_id)
+        await set_config("collector_account_ids", ",".join(str(x) for x in sorted(current)))
+        return True
 
 
 async def get_relay_config() -> dict:
@@ -1509,6 +1625,25 @@ async def get_config_cached(key: str) -> Optional[str]:
     cache.set(cache_key, val)
     await store.set(cache_key, val)
     return val
+
+
+async def get_config_fresh(key: str) -> Optional[str]:
+    """读取配置值,绕过 L1 内存缓存,确保跨进程一致性。
+
+    用于白名单等需要跨进程即时一致性的场景。
+    读取路径: L2 SQLite (0 RU) → CRDB (L2 miss 时)。
+    不会写入 L1 或 L2,避免与 set_config 的失效操作产生竞态导致旧值回填。
+    代价: L2 miss 后每次读都走 CRDB (1 RU),但白名单是低频读取,可接受。
+    """
+    cache_key = f"config:{key}"
+    # L2: SQLite (跨进程共享,set_config 时会被失效)
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+    cached = await store.get(cache_key)
+    if cached is not None:
+        return cached
+    # CRDB 兜底,不回填 L2,避免跨进程竞态
+    return await _get_config(key)
 
 
 async def set_config_and_invalidate(key: str, value: str):

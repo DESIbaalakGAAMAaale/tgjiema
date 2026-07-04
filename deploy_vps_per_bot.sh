@@ -38,9 +38,31 @@ echo ""
 # ──────────────────────────────────────────────
 info "第一步：安装系统依赖..."
 
-apt-get update
+# 检测发行版：Ubuntu 需添加 deadsnakes PPA 才能装 python3.12；
+# Debian 等则检测系统自带 Python 版本，≥3.10 直接复用，否则报错。
+if grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
+    info "检测到 Ubuntu，安装 software-properties-common 并添加 deadsnakes PPA..."
+    apt-get update
+    apt-get install -y --no-install-recommends software-properties-common ca-certificates
+    add-apt-repository -y ppa:deadsnakes/ppa
+    apt-get update
+else
+    info "检测到非 Ubuntu（Debian 等），检查系统自带 Python 版本..."
+    apt-get update
+    apt-get install -y --no-install-recommends python3 ca-certificates
+    SYS_PY_VER=$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "0.0")
+    SYS_PY_MAJOR=$(echo "$SYS_PY_VER" | cut -d. -f1)
+    SYS_PY_MINOR=$(echo "$SYS_PY_VER" | cut -d. -f2)
+    if [[ "$SYS_PY_MAJOR" -ge 3 && "$SYS_PY_MINOR" -ge 10 ]]; then
+        info "系统自带 Python ${SYS_PY_VER} ≥ 3.10，使用系统自带版本替代 python3.12"
+        PYTHON="python3"
+    else
+        error "系统自带 Python ${SYS_PY_VER} 低于 3.10，请手动安装 Python 3.10+ 后重试"
+    fi
+fi
+
 apt-get install -y --no-install-recommends \
-    python3.12 python3.12-venv python3.12-dev \
+    ${PYTHON} ${PYTHON}-venv ${PYTHON}-dev \
     libpq-dev gcc g++ make curl git sqlite3 procps net-tools
 
 success "系统依赖安装完成"
@@ -77,7 +99,7 @@ info "第三步：创建 Python 虚拟环境..."
 cd "$DEPLOY_DIR"
 
 if [[ ! -d "venv" ]]; then
-    python3.12 -m venv venv
+    ${PYTHON} -m venv venv
 fi
 
 source venv/bin/activate
@@ -99,11 +121,23 @@ ENV_FILE="$DEPLOY_DIR/.env"
 if [[ ! -f "$ENV_FILE" ]]; then
     cp "$DEPLOY_DIR/.env.example" "$ENV_FILE"
     warn "请编辑: $ENV_FILE"
-    nano "$ENV_FILE"
+    ${EDITOR:-vi} "$ENV_FILE"
 fi
 # P-1: 收紧权限: .env 仅所有者可读，data 目录仅所有者可读写
 chmod 600 "$ENV_FILE"
 chmod 700 "$DEPLOY_DIR/data"
+
+# 自动生成 RELAY_ENCRYPTION_KEY（若 .env 中为空）—— 必须用 venv 的 python，
+# 因为系统 Python 可能未安装 cryptography。此处 venv 已激活。
+if grep -q "^RELAY_ENCRYPTION_KEY=$" "$ENV_FILE" 2>/dev/null; then
+    KEY=$("${DEPLOY_DIR}/venv/bin/python" -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" 2>/dev/null)
+    if [[ -n "$KEY" ]]; then
+        sed -i "s|^RELAY_ENCRYPTION_KEY=.*|RELAY_ENCRYPTION_KEY=${KEY}|" "$ENV_FILE"
+        success "已自动生成 RELAY_ENCRYPTION_KEY"
+    else
+        warn "RELAY_ENCRYPTION_KEY 为空且自动生成失败，请手动执行：venv/bin/python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    fi
+fi
 
 if [[ ! -f "$DEPLOY_DIR/config/topology.yaml" ]] && [[ -f "$DEPLOY_DIR/config/groups.yaml" ]]; then
     source venv/bin/activate
@@ -136,6 +170,13 @@ generate_service() {
     local desc="$2"
     local detail="$3"
     local svc="${SVC_PREFIX}-${name}"
+    local restart_type="always"
+    local restart_sec="5"
+    # db_backup 备份任务失败不应无限重启，等待更久再重试
+    if [[ "$name" == "db_backup" ]]; then
+        restart_type="on-failure"
+        restart_sec="60"
+    fi
 
     cat > "/etc/systemd/system/${svc}.service" << EOF
 [Unit]
@@ -143,22 +184,22 @@ Description=TG文件解码器 — ${desc}
 After=network.target
 Wants=network.target
 PartOf=${SVC_PREFIX}.target
+# systemd 内置防抖:60秒内最多重启5次,超限后冷却30秒
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
 User=tgjiema
 WorkingDirectory=${DEPLOY_DIR}
 Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=-${DEPLOY_DIR}/.env
 ExecStart=${DEPLOY_DIR}/venv/bin/python ${DEPLOY_DIR}/run_all.py --standalone ${name}
-Restart=always
-RestartSec=5
+Restart=${restart_type}
+RestartSec=${restart_sec}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=${svc}
-
-# systemd 内置防抖:60秒内最多重启5次,超限后冷却30秒
-StartLimitBurst=5
-StartLimitInterval=60
 
 # 优雅关闭
 KillSignal=SIGINT
@@ -216,19 +257,19 @@ success "所有服务已启用（开机自启）"
 info "第六步：启动所有服务..."
 
 # 先启动数据库备份（无依赖）
-systemctl start "${SVC_PREFIX}-db_backup" 2>/dev/null || true
+systemctl start "${SVC_PREFIX}-db_backup" || warn "启动 ${SVC_PREFIX}-db_backup 失败，请查看日志"
 sleep 1
 
 # 启动核心 Bot（up 和 idx 先启动，让拓扑初始化完成）
-systemctl start "${SVC_PREFIX}-up" 2>/dev/null || true
-systemctl start "${SVC_PREFIX}-idx" 2>/dev/null || true
+systemctl start "${SVC_PREFIX}-up" || warn "启动 ${SVC_PREFIX}-up 失败，请查看日志"
+systemctl start "${SVC_PREFIX}-idx" || warn "启动 ${SVC_PREFIX}-idx 失败，请查看日志"
 sleep 3
 
 # 启动其余服务
-systemctl start "${SVC_PREFIX}-dsp" 2>/dev/null || true
-systemctl start "${SVC_PREFIX}-mon" 2>/dev/null || true
-systemctl start "${SVC_PREFIX}-admin_bot" 2>/dev/null || true
-systemctl start "${SVC_PREFIX}-admin" 2>/dev/null || true
+systemctl start "${SVC_PREFIX}-dsp" || warn "启动 ${SVC_PREFIX}-dsp 失败，请查看日志"
+systemctl start "${SVC_PREFIX}-mon" || warn "启动 ${SVC_PREFIX}-mon 失败，请查看日志"
+systemctl start "${SVC_PREFIX}-admin_bot" || warn "启动 ${SVC_PREFIX}-admin_bot 失败，请查看日志"
+systemctl start "${SVC_PREFIX}-admin" || warn "启动 ${SVC_PREFIX}-admin 失败，请查看日志"
 
 sleep 3
 
@@ -243,7 +284,7 @@ cd "$DEPLOY_DIR"
 # 检查 topology.yaml 是否含有占位频道 ID（-1000000000xxx），有则从 .env 重新生成
 if grep -q -- "-1000000000" config/topology.yaml 2>/dev/null; then
     warn "检测到 topology.yaml 含有占位频道 ID，从 .env 重新生成..."
-    python3.12 -c "
+    "${DEPLOY_DIR}/venv/bin/python" -c "
 import asyncio
 from database import init_db, close_db, get_cells_col
 from admin.seed_topology import seed
@@ -258,7 +299,9 @@ async def refresh():
     await close_db()
 asyncio.run(refresh())
 "
-    python3.12 admin/seed_topology.py --yes
+    "${DEPLOY_DIR}/venv/bin/python" admin/seed_topology.py --yes
+    # 拓扑刷新以 root 身份执行，生成的 data/ 下文件属主会变成 root，需重新 chown
+    chown -R tgjiema:tgjiema "$DEPLOY_DIR"
     success "拓扑已从 .env 刷新，频道 ID 已更新"
     info "请手动执行: systemctl restart tgjiema.target"
 else
@@ -292,7 +335,7 @@ done
 echo "--------------------------------------------------------------------------------"
 echo ""
 
-if $ALL_OK; then
+if [[ "$ALL_OK" == "true" ]]; then
     success "全部 7 个服务运行正常！"
 else
     warn "部分服务未正常启动，请查看日志："

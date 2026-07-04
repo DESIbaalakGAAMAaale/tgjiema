@@ -10,11 +10,14 @@ import datetime
 from dataclasses import dataclass
 from typing import Optional
 
+from loguru import logger
+
 from database import get_users_col, make_user
 from database import get_user_cached
 from database import get_file_record_cached
 from database.cache_store import (
     get_user_quota, upsert_user_quota, increment_user_quota_used,
+    try_consume_quota, refund_quota,
 )
 from config import settings
 from services.code_generator import extract_bot_username
@@ -59,6 +62,7 @@ class DecodeResult:
     remaining_external_quota: int = 0
     is_external: bool = False
     external_bot_username: str = ""
+    quota_consumed: bool = False  # 是否已预扣配额(投递失败时需要 refund)
 
 
 async def get_or_create_user(user_id: int, username: str = None, first_name: str = None) -> dict:
@@ -82,14 +86,14 @@ async def get_or_create_user(user_id: int, username: str = None, first_name: str
         try:
             from database.cache_store import get_cache_store
             await get_cache_store().upsert_user_local(user, mark_dirty=False)
-        except Exception:
-            pass
+        except Exception as cache_err:
+            logger.debug(f"[Permission] upsert_user_local 失败 user={user_id}: {cache_err}")
         # F1: 新用户注册,递增本地计数器
         try:
             from utils.shared_counters import incr_total_users
             incr_total_users()
-        except Exception:
-            pass
+        except Exception as counter_err:
+            logger.debug(f"[Permission] incr_total_users 失败 user={user_id}: {counter_err}")
     except Exception as e:
         # 并发插入冲突，重新查询；其他异常原样抛出
         error_str = str(e).lower()
@@ -103,8 +107,8 @@ async def get_or_create_user(user_id: int, username: str = None, first_name: str
     try:
         from database.cache import get_user_cache
         get_user_cache().set(f"user:{user_id}", user)
-    except Exception:
-        pass
+    except Exception as cache_err:
+        logger.debug(f"[Permission] user_cache.set 失败 user={user_id}: {cache_err}")
     return user
 
 
@@ -129,6 +133,15 @@ async def check_upload_permission(user_id: int) -> bool:
 # ─── 配额本地 SQLite 工具函数 ──────────────────────────────────
 
 _CHINA_TZ = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _quota_for_level(level: str) -> tuple[int, int]:
+    """根据会员等级返回 (daily_quota, ext_quota)。集中管理避免散落多处不一致。"""
+    return {
+        "free": (settings.FREE_DAILY_QUOTA, settings.FREE_EXTERNAL_DAILY_QUOTA),
+        "basic": (settings.BASIC_DAILY_QUOTA, settings.BASIC_EXTERNAL_DAILY_QUOTA),
+        "premium": (settings.PREMIUM_DAILY_QUOTA, settings.PREMIUM_EXTERNAL_DAILY_QUOTA),
+    }.get(level, (settings.FREE_DAILY_QUOTA, settings.FREE_EXTERNAL_DAILY_QUOTA))
 
 
 async def _init_quota_from_crdb(user_id: int) -> dict:
@@ -198,20 +211,13 @@ async def _reset_quota_if_needed(q: dict, now_date: datetime.date) -> dict:
     if need_reset:
         q["used_today"] = 0
         q["quota_date"] = datetime.datetime.now(_CHINA_TZ).isoformat()
-        q["daily_quota"] = {
-            "free": settings.FREE_DAILY_QUOTA,
-            "basic": settings.BASIC_DAILY_QUOTA,
-            "premium": settings.PREMIUM_DAILY_QUOTA,
-        }.get(q.get("level", "free"), settings.FREE_DAILY_QUOTA)
+        # 使用集中函数,避免多处硬编码不一致;同时与 level 变化时的同步逻辑保持一致
+        q["daily_quota"], _ = _quota_for_level(q.get("level", "free"))
         changed = True
     if need_ext_reset:
         q["ext_used_today"] = 0
         q["ext_quota_date"] = datetime.datetime.now(_CHINA_TZ).isoformat()
-        q["ext_quota"] = {
-            "free": settings.FREE_EXTERNAL_DAILY_QUOTA,
-            "basic": settings.BASIC_EXTERNAL_DAILY_QUOTA,
-            "premium": settings.PREMIUM_EXTERNAL_DAILY_QUOTA,
-        }.get(q.get("level", "free"), settings.FREE_EXTERNAL_DAILY_QUOTA)
+        _, q["ext_quota"] = _quota_for_level(q.get("level", "free"))
         changed = True
     if changed:
         await upsert_user_quota(q["user_id"], q)
@@ -240,9 +246,12 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     q = await _get_quota_sqlite_first(user_id)
     if not q:
         return DecodeResult(allowed=False, reason="系统繁忙,请稍后重试")
-    # 如果等级变了（管理员手动修改），同步到 SQLite
+    # 如果等级变了（管理员手动修改），同步到 SQLite,并立即更新配额上限,避免升级后当天仍按旧配额
     if q.get("level") != membership_level:
         q["level"] = membership_level
+        new_daily, new_ext = _quota_for_level(membership_level)
+        q["daily_quota"] = new_daily
+        q["ext_quota"] = new_ext
         await upsert_user_quota(user_id, q)
 
     q = await _reset_quota_if_needed(q, today)
@@ -290,23 +299,34 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         else:
             return DecodeResult(allowed=False, reason="文件码无效")
 
-    # ─── 配额不在此时递增，由调用方在投递成功后递增 ────
-    # 原此处 increment_user_quota_used 已移除，避免投递失败时配额已扣
+    # ─── 原子预扣配额(乐观锁),解决 TOCTOU 竞态 ────
+    # 并发场景下,若多个请求同时通过上面的"检查",再各自在投递成功后递增,
+    # 会导致用户超额使用(used 超过 quota)。
+    # 改为:在检查通过后立即原子条件递增,投递失败时由调用方 refund。
+    is_ext = not is_system_code(file_code)
+    consumed = await try_consume_quota(user_id, is_external=is_ext)
+    if not consumed:
+        # 配额在 check 与 consume 之间被并发请求耗尽
+        return DecodeResult(
+            allowed=False,
+            reason="今日解码次数已用完,请明天再试",
+        )
 
-    remaining = -1 if membership_level == "premium" else max(0, quota - used)
+    remaining = -1 if membership_level == "premium" else max(0, quota - used - 1)
     remaining_ext = -1
-    if not is_system_code(file_code):
+    if is_ext:
         ext_q = q.get("ext_quota", 0)
         if ext_q != -1:
-            remaining_ext = max(0, ext_q - ext_used)
+            remaining_ext = max(0, ext_q - ext_used - 1)
 
     return DecodeResult(
         allowed=True,
         file_record=file_record,
         remaining_quota=remaining,
         remaining_external_quota=remaining_ext,
-        is_external=not is_system_code(file_code),
+        is_external=is_ext,
         external_bot_username=bot_username or "",
+        quota_consumed=True,
     )
 
 
@@ -340,5 +360,19 @@ async def sync_quotas_to_crdb():
             await update_user_and_invalidate(uid)
             await mark_quota_synced(uid)
         except Exception as e:
-            import logging
-            logging.getLogger("permission").error(f"[QuotaSync] sync user {r.get('user_id')} failed: {e}")
+            logger.error(f"[QuotaSync] sync user {r.get('user_id')} failed: {e}")
+
+
+# ─── 配额回滚(投递失败时调用)─────────────────────────────────
+
+
+async def refund_user_quota(user_id: int, is_external: bool = False):
+    """投递失败时回滚预扣的配额。与 check_decode_permission 中的 try_consume_quota 配对。
+
+    幂等:对 premium/不限量用户不操作;对正常用户递减 1 且不低于 0。
+    """
+    try:
+        await refund_quota(user_id, is_external=is_external)
+    except Exception as e:
+        # 不抛出:避免影响投递失败处理流程。但必须记录日志,便于运维监控配额泄漏并手动补偿
+        logger.warning(f"[Quota] refund 失败 user={user_id} ext={is_external}: {e}")

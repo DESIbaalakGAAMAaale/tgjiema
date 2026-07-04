@@ -89,15 +89,19 @@ async function handleMessage(msg, token, up, idx, dsp, channelLink) {
 // ─── Workers 入口 ───
 export default {
   async fetch(req, env) {
-    // 验证 webhook secret token，防止伪造更新
+    // 强制验证 webhook secret token，防止伪造更新
     // 需在 Cloudflare Dashboard → Workers → Settings → Variables 中设置 SECRET_TOKEN
     // 或通过 wrangler secret put SECRET_TOKEN 设置
+    // 安全默认:未配置 SECRET_TOKEN 时拒绝所有请求,防止任意用户伪造 Telegram update
     const secret = env.SECRET_TOKEN;
-    if (secret) {
-      const headerToken = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
-      if (headerToken !== secret) {
-        return new Response("Forbidden", { status: 403 });
-      }
+    if (!secret) {
+      console.error("[FileBot][FATAL] SECRET_TOKEN 未配置,拒绝所有请求以防 webhook 伪造。请在 Cloudflare Dashboard 设置 SECRET_TOKEN");
+      return new Response("Service Unavailable: SECRET_TOKEN not configured", { status: 503 });
+    }
+    const headerToken = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
+    // 用长度恒定比较防时序攻击;空字符串与空字符串也判定为不匹配
+    if (!headerToken || headerToken.length !== secret.length || headerToken !== secret) {
+      return new Response("Forbidden", { status: 403 });
     }
 
     if (req.headers.get("content-type")?.includes("application/json")) {

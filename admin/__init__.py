@@ -1,5 +1,8 @@
 import time as _time
 import re as _re
+import hashlib
+import hmac as _hmac
+import ipaddress as _ipaddr
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -16,6 +19,73 @@ from config import settings
 
 app = FastAPI(title="TG解码器管理后台")
 security = HTTPBasic()
+
+
+# ─── 密码哈希支持（PBKDF2-HMAC-SHA256，无需新增依赖）──────────────
+# 哈希格式: $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
+# 若 ADMIN_PASSWORD 以此前缀开头，按哈希校验；否则按明文常量时间比较（向后兼容）
+_PBKDF2_PREFIX = "$pbkdf2-sha256$"
+_PBKDF2_ITERATIONS = 200_000  # OWASP 2023 推荐 ≥ 600k，平衡部署机器性能取 200k
+
+
+def _verify_password(plaintext: str, stored: str) -> bool:
+    """校验密码。支持明文（向后兼容）和 PBKDF2 哈希格式。
+
+    - 哈希格式: $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
+    - 明文格式: 直接常量时间比较
+    """
+    if not stored:
+        return False
+    if stored.startswith(_PBKDF2_PREFIX):
+        try:
+            parts = stored.split("$")
+            # parts: ['', 'pbkdf2-sha256', '<iter>', '<salt_hex>', '<hash_hex>']
+            if len(parts) != 5:
+                return False
+            iterations = int(parts[2])
+            if iterations < 10_000:  # 防御：拒绝过低的迭代次数
+                return False
+            salt = bytes.fromhex(parts[3])
+            expected_hash = bytes.fromhex(parts[4])
+            # 对输入密码做同样的 PBKDF2 派生
+            actual_hash = hashlib.pbkdf2_hmac("sha256", plaintext.encode("utf-8"), salt, iterations)
+            return _hmac.compare_digest(actual_hash, expected_hash)
+        except (ValueError, TypeError):
+            return False
+    # 明文模式：常量时间比较
+    return secrets.compare_digest(plaintext.encode("utf-8"), stored.encode("utf-8"))
+
+
+def generate_password_hash(password: str, iterations: int = _PBKDF2_ITERATIONS) -> str:
+    """生成 PBKDF2 哈希密码。可在外部脚本中调用以生成 .env 中的 ADMIN_PASSWORD 值。
+
+    用法:
+        python -c "from admin import generate_password_hash; print(generate_password_hash('YOUR_PASSWORD'))"
+    """
+    if not password:
+        raise ValueError("密码不能为空")
+    salt = secrets.token_bytes(16)
+    hash_bytes = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"{_PBKDF2_PREFIX}{iterations}${salt.hex()}${hash_bytes.hex()}"
+
+
+# ─── 可信代理集合：仅这些来源的 X-Forwarded-For 才被信任 ─────────────
+# 本地回环（IPv4/IPv6）+ Unix socket
+_TRUSTED_PROXY_NETWORKS = (
+    _ipaddr.ip_network("127.0.0.0/8"),
+    _ipaddr.ip_network("::1/128"),
+)
+
+
+def _is_trusted_proxy(peer_host: str) -> bool:
+    """判断直连对端是否为可信代理（本地回环）。"""
+    if not peer_host:
+        return False
+    try:
+        ip = _ipaddr.ip_address(peer_host)
+    except ValueError:
+        return False
+    return any(ip in net for net in _TRUSTED_PROXY_NETWORKS)
 
 
 @app.on_event("startup")
@@ -49,7 +119,11 @@ _LOGIN_LIMIT_MAX = settings.ADMIN_LOGIN_MAX_FAIL
 # ─── CSRF 保护 ─────────────────────────────────────────────────
 # 每个登录会话独立 token，防止跨站请求伪造
 # 主存为进程内存，辅助持久化到 SQLite 恢复重启后状态
-_csrf_tokens: dict[str, str] = {}
+# value: (token, created_at_monotonic) — 加入过期时间，避免 token 永不过期导致：
+#   1. 内存无限增长
+#   2. 攻击者窃取 token 后可永久使用
+_csrf_tokens: dict[str, tuple[str, float]] = {}
+_CSRF_TOKEN_TTL: float = 3600.0  # 与 cookie max_age 对齐（1小时）
 
 # M7: TTL 缓存 — 无筛选条件的 count_documents 走 CRDB 很贵，60s 缓存
 # 仅缓存 {}, 有搜索条件时仍需 CRDB（regex 等无法缓存）
@@ -76,7 +150,19 @@ async def _load_state_from_cache():
         csrf_data = await store.get("admin:csrf_tokens")
         if csrf_data:
             import json
-            _csrf_tokens.update(json.loads(csrf_data))
+            loaded = json.loads(csrf_data)
+            # 兼容旧格式 (str) 和新格式 (tuple/list)
+            now = _time.time()
+            for k, v in loaded.items():
+                if isinstance(v, str):
+                    # 旧格式：纯字符串 token，给一个"已过期"的时间戳，
+                    # 下次访问时会被 _get_csrf_token 重新生成
+                    _csrf_tokens[k] = (v, now - _CSRF_TOKEN_TTL - 1)
+                elif isinstance(v, (list, tuple)) and len(v) == 2:
+                    try:
+                        _csrf_tokens[k] = (str(v[0]), float(v[1]))
+                    except (TypeError, ValueError):
+                        continue
         # 恢复登录失败计数
         fail_data = await store.get("admin:login_failures")
         if fail_data:
@@ -90,12 +176,21 @@ async def _load_state_from_cache():
 
 
 async def _persist_csrf_tokens():
-    """异步持久化 CSRF token 到 SQLite（fire-and-forget）。"""
+    """异步持久化 CSRF token 到 SQLite（fire-and-forget）。
+
+    仅持久化未过期的 token，避免重启后立即过期。
+    """
     try:
         from database.cache_store import get_cache_store
         import json
         store = get_cache_store()
-        await store.set("admin:csrf_tokens", json.dumps(_csrf_tokens))
+        now = _time.time()
+        # 仅持久化未过期的 token，减小存储体积
+        active = {
+            u: [t, ts] for u, (t, ts) in _csrf_tokens.items()
+            if now - ts < _CSRF_TOKEN_TTL
+        }
+        await store.set("admin:csrf_tokens", json.dumps(active))
     except Exception as e:
         from loguru import logger
         logger.warning(f"[Admin] 持久化CSRF token失败: {e}")
@@ -114,42 +209,73 @@ async def _persist_login_failures():
 
 
 def _get_csrf_token(username: str = "") -> str:
-    """获取或生成当前会话的 CSRF token。"""
+    """获取或生成当前会话的 CSRF token。若 token 已过期则重新生成。"""
     if not username:
         return ""
-    if username not in _csrf_tokens:
-        _csrf_tokens[username] = secrets.token_hex(32)
+    now = _time.time()
+    entry = _csrf_tokens.get(username)
+    if entry is None or (now - entry[1]) >= _CSRF_TOKEN_TTL:
+        # 新生成或过期重新生成
+        _csrf_tokens[username] = (secrets.token_hex(32), now)
         task = asyncio.ensure_future(_persist_csrf_tokens())
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
-    return _csrf_tokens[username]
+    return _csrf_tokens[username][0]
 
 
 def _verify_csrf(request: Request, form_token: str = None, username: str = "") -> bool:
     """验证 CSRF token:对比表单中的 csrf_token 和 cookie 中的 csrf_token。
-    要求 cookie token 与当前登录用户的 token 一致，且与表单 token 一致。"""
+    要求 cookie token 与当前登录用户的 token 一致，且与表单 token 一致。
+    同时检查 token 是否已过期。"""
     cookie_token = request.cookies.get("csrf_token", "")
     if not cookie_token or not form_token:
         return False
+    now = _time.time()
     # N-15-4: 按 username 精确绑定，而非 values() 全局匹配
     if username:
-        expected_token = _csrf_tokens.get(username, "")
-        return secrets.compare_digest(cookie_token, expected_token) and secrets.compare_digest(cookie_token, form_token)
-    # 无 username 时回退到全局匹配（兼容旧逻辑）
-    if cookie_token in _csrf_tokens.values():
-        return cookie_token == form_token
+        entry = _csrf_tokens.get(username)
+        if entry is None:
+            return False
+        expected_token, created_at = entry
+        # 过期检查
+        if (now - created_at) >= _CSRF_TOKEN_TTL:
+            # 主动清理过期 token，避免内存泄漏
+            _csrf_tokens.pop(username, None)
+            return False
+        return (secrets.compare_digest(cookie_token, expected_token)
+                and secrets.compare_digest(cookie_token, form_token))
+    # 无 username 时回退到全局匹配（兼容旧逻辑）—— 带过期检查
+    for u, (t, ts) in list(_csrf_tokens.items()):
+        if (now - ts) >= _CSRF_TOKEN_TTL:
+            _csrf_tokens.pop(u, None)
+            continue
+        if secrets.compare_digest(cookie_token, t):
+            return secrets.compare_digest(cookie_token, form_token)
     return False
 
 
 def _get_client_ip(request: Request) -> str:
-    """S-7: 解析真实客户端 IP，优先使用 X-Forwarded-For（反向代理场景）。"""
+    """S-7: 解析真实客户端 IP。
+
+    仅当直连对端为可信代理（本地回环）时才信任 X-Forwarded-For，
+    否则使用直连对端 IP。防止客户端伪造 XFF 绕过登录速率限制。
+
+    Nginx/Caddy 反向代理场景下，部署时应将 ADMIN_WEB_HOST 设为 127.0.0.1，
+    此时直连对端为 127.0.0.1（可信代理），可正确解析 XFF 中的真实客户端。
+    """
     if request is None:
         return "unknown"
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        # X-Forwarded-For 格式: "client, proxy1, proxy2"，取第一个（真实客户端）
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    peer_host = request.client.host if request.client else ""
+    # 仅可信代理场景才信任 XFF
+    if peer_host and _is_trusted_proxy(peer_host):
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            # X-Forwarded-For 格式: "client, proxy1, proxy2"，取第一个（真实客户端）
+            # 注意：可信代理设置的 XFF 中，最左侧是真实客户端 IP
+            client_ip = forwarded.split(",")[0].strip()
+            if client_ip:
+                return client_ip
+    return peer_host if peer_host else "unknown"
 
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request: Request = None):
@@ -177,21 +303,25 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
             detail=f"登录尝试过于频繁,请 {_LOGIN_LIMIT_WINDOW // 60} 分钟后再试",
         )
 
+    # 用户名常量时间比较
     correct_username = secrets.compare_digest(
         credentials.username.encode("utf8"),
         settings.ADMIN_USERNAME.encode("utf8"),
     )
-    correct_password = secrets.compare_digest(
-        credentials.password.encode("utf8"),
-        settings.ADMIN_PASSWORD.encode("utf8"),
-    )
+    # 密码：支持 PBKDF2 哈希格式与明文（向后兼容）
+    correct_password = _verify_password(credentials.password, settings.ADMIN_PASSWORD)
     if not (correct_username and correct_password):
         # 记录失败
         _login_failures[client_ip].append(now)
         task = asyncio.ensure_future(_persist_login_failures())
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
-        raise HTTPException(status_code=401, detail="未授权访问")
+        # RFC 7235: 401 必须带 WWW-Authenticate 头，提示浏览器弹出认证框
+        raise HTTPException(
+            status_code=401,
+            detail="未授权访问",
+            headers={"WWW-Authenticate": 'Basic realm="TG解码器管理后台", charset="UTF-8"'},
+        )
 
     # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)
@@ -354,7 +484,7 @@ async def users_page(
 async def update_membership(
     user_id: int,
     request: Request,
-    level: str = Query(...),
+    level: str = Form(...),
     csrf_token: str = Form(...),
     admin=Depends(verify_admin),
 ):

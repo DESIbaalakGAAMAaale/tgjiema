@@ -1,3 +1,5 @@
+import time
+
 import datetime
 
 from telegram import Update
@@ -22,15 +24,21 @@ from .menus import (
 from .display import _ensure_user
 
 
+# 对话超时时间(秒):用户 5 分钟无响应自动清理对话状态
+_CONV_TIMEOUT_SECONDS = 300
+
+
 async def _conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
     context.user_data["conv_state"] = state
     context.user_data["conv_data"] = {}
+    context.user_data["conv_started_at"] = time.time()
     query = update.callback_query
     await query.edit_message_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
 
 
 async def _conv_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
     context.user_data["conv_state"] = state
+    context.user_data["conv_started_at"] = time.time()
     context.user_data.setdefault("conv_data", {})
     await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
 
@@ -38,12 +46,22 @@ async def _conv_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, state: s
 def _conv_end(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("conv_state", None)
     context.user_data.pop("conv_data", None)
+    context.user_data.pop("conv_started_at", None)
+    # 清理中继交互式流程中可能残留的 relay_phone（避免影响下次 relay_code 流程）
+    context.user_data.pop("relay_phone", None)
 
 
 @_auth_required
 async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("conv_state")
     if not state:
+        return
+
+    # 对话超时检查:超过 5 分钟无响应自动清理
+    started_at = context.user_data.get("conv_started_at", 0)
+    if time.time() - started_at > _CONV_TIMEOUT_SECONDS:
+        _conv_end(context)
+        await update.message.reply_text("⏳ 对话已超时(5分钟无响应),请重新点击按钮开始操作。")
         return
 
     text = update.message.text.strip()
@@ -58,6 +76,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if extra_data:
             context.user_data["conv_data"].update(extra_data)
         context.user_data["conv_state"] = next_state
+        # 刷新超时计时器,确保多轮对话不被误判超时
+        context.user_data["conv_started_at"] = time.time()
         await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
 
     # ─── 文件码前缀路由 ──────────────────────────────────────────
@@ -148,14 +168,17 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             update_doc["$set"]["daily_decode_quota"] = settings.FREE_DAILY_QUOTA
             update_doc["$set"]["external_decode_quota"] = settings.FREE_EXTERNAL_DAILY_QUOTA
             update_doc["$set"]["can_upload"] = True
+            update_doc["$set"]["external_used_today"] = 0
         elif level == "basic":
             update_doc["$set"]["daily_decode_quota"] = settings.BASIC_DAILY_QUOTA
             update_doc["$set"]["external_decode_quota"] = settings.BASIC_EXTERNAL_DAILY_QUOTA
             update_doc["$set"]["can_upload"] = True
+            update_doc["$set"]["external_used_today"] = 0
         elif level == "premium":
             update_doc["$set"]["daily_decode_quota"] = settings.PREMIUM_DAILY_QUOTA
             update_doc["$set"]["external_decode_quota"] = settings.PREMIUM_EXTERNAL_DAILY_QUOTA
             update_doc["$set"]["can_upload"] = True
+            update_doc["$set"]["external_used_today"] = 0
         await users_col.update_one({"user_id": user_id}, update_doc)
         await update_user_and_invalidate(user_id)
         from database.cache_store import invalidate_user_quota_cache

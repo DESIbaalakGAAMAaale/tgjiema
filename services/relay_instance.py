@@ -208,42 +208,43 @@ class RelayInstance:
         # 检查冷却期（在锁外执行，避免阻塞整个实例）
         from database.relay_db import get_relay_db
         relay_db = await get_relay_db()
-        cooldown = await relay_db.get_bot_cooldown(bot_username)
-        if cooldown > 0:
-            logger.info(
-                f"[RelayInstance:{self.phone}] @{bot_username} 在冷却期，"
-                f"等待 {cooldown:.0f}s"
-            )
-            await asyncio.sleep(cooldown)
+        if relay_db:
+            cooldown = await relay_db.get_bot_cooldown(bot_username)
+            if cooldown > 0:
+                logger.info(
+                    f"[RelayInstance:{self.phone}] @{bot_username} 在冷却期，"
+                    f"等待 {cooldown:.0f}s"
+                )
+                await asyncio.sleep(cooldown)
+        # 在加锁前先检查 mapped_codes 本地缓存：已映射的码无需重新发送，
+        # 返回 False 让调用方从存储直接投递，避免 is_busy 泄漏和静默失败
+        try:
+            if relay_db and await relay_db.is_code_mapped(code):
+                logger.info(f"[RelayInstance:{self.phone}] 码已映射（本地缓存），跳过发送: code={code}")
+                return False
+        except Exception:
+            pass
         async with self._lock:
             if self.is_busy:
                 logger.warning(f"[RelayInstance:{self.phone}] 账号正忙，拒绝新请求")
                 return False
             self.is_busy = True
-        result = await self._do_send_external_code(bot_username, code, user_id)
+        result = await self._do_send_external_code(bot_username, code, user_id, relay_db)
         if not result:
             self.is_busy = False
         return result
 
-    async def _do_send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
+    async def _do_send_external_code(self, bot_username: str, code: str, user_id: int, relay_db=None) -> bool:
         try:
-            # 检查 mapped_codes 本地缓存，避免重复查询 CRDB
-            try:
-                from database.relay_db import get_relay_db
-                relay_db = await get_relay_db()
-                if relay_db and await relay_db.is_code_mapped(code):
-                    logger.info(f"[RelayInstance:{self.phone}] 码已映射（本地缓存），跳过: code={code}")
-                    return True
-            except Exception:
-                pass
 
             # 检查 bot_overrides 覆盖规则（按最长前缀匹配，带内存缓存避免每次全表扫描）
             try:
                 import time
                 now = time.time()
                 if now - self._bot_override_cache_ts > 60:
-                    from database.relay_db import get_relay_db
-                    relay_db = await get_relay_db()
+                    if relay_db is None:
+                        from database.relay_db import get_relay_db
+                        relay_db = await get_relay_db()
                     if relay_db:
                         self._bot_override_cache = await relay_db.list_bot_overrides()
                         self._bot_override_cache_ts = now
@@ -617,8 +618,11 @@ class RelayInstance:
                                 self._decoder_bot_entity,
                                 f"RELAY_ERROR:{user_id}:{code}:{reason}",
                             )
-                        except Exception:
-                            pass
+                        except Exception as notify_err:
+                            logger.warning(
+                                f"[Relay] RELAY_ERROR 通知失败 user={user_id} code={code} "
+                                f"reason={reason}: {notify_err}"
+                            )
                     await self._cleanup_exchange(bot_username)
                     break
                 elif action == "wait":
@@ -843,13 +847,19 @@ class RelayInstance:
                 if hasattr(target_btn, "data") and target_btn.data:
                     await keyboard_msg.click(data=target_btn.data)
                     return True
-            except Exception:
-                pass
+            except Exception as click_err:
+                logger.debug(f"[Relay] FloodWait 后按钮点击失败: {click_err}")
             return False
         except Exception:
             return False
 
     async def _process_all_collected(self, bot_username: str):
+        # 关键:必须先等待所有文件缓存完成,再 pop exchange
+        # 否则 _wait_all_cached 内部 get(bot_username) 会返回 None,等待逻辑失效,导致文件丢失
+        try:
+            await self._wait_all_cached(bot_username, timeout=60)
+        except Exception as e:
+            logger.warning(f"[RelayInstance:{self.phone}] _wait_all_cached 异常: {e}")
         exchange = self._bot_exchange.pop(bot_username, None)
         self.is_busy = False
         if not exchange:
@@ -866,14 +876,16 @@ class RelayInstance:
                         self._decoder_bot_entity,
                         f"RELAY_ERROR:{user_id}:{code}:目标机器人未返回任何文件",
                     )
-                except Exception:
-                    pass
+                except Exception as notify_err:
+                    logger.warning(
+                        f"[Relay] RELAY_ERROR 通知失败(目标机器人无文件) "
+                        f"user={user_id} code={code}: {notify_err}"
+                    )
             if self._pending_cleanup:
                 self._pending_cleanup(bot_username)
             return
         # 所有文件已发送到 Up Bot，发送 EXTERNAL_DONE 信号触发批量写入
         try:
-            await self._wait_all_cached(bot_username, timeout=60)
             if self._up_bot_entity:
                 # 先注册确认事件，再发 EXTERNAL_DONE，避免竞态（R29-4）
                 wait_event = asyncio.Event()
@@ -961,15 +973,35 @@ class RelayInstance:
             file_ids = [f.strip() for f in file_ids_str.split(",") if f.strip()]
             if file_ids:
                 if self._decoder_bot_entity:
+                    # 跟踪每个文件发送结果,任一失败都通知 decoder_bot 重试
+                    sent_ids: list[str] = []
+                    failed_ids: list[str] = []
                     for fid in file_ids:
                         try:
                             await self._client.send_file(self._decoder_bot_entity, fid)
-                        except Exception:
-                            pass
+                            sent_ids.append(fid)
+                        except Exception as e:
+                            logger.warning(
+                                f"[RelayInstance:{self.phone}] send_file 失败 (code={code}, fid={fid}): {e}"
+                            )
+                            failed_ids.append(fid)
+                    if not sent_ids:
+                        # 全部失败,不发送 RELAY_DELIVER,避免 decoder_bot 误以为文件已到
+                        logger.error(
+                            f"[RelayInstance:{self.phone}] deliver_cached 全部文件发送失败 (code={code}),"
+                            f"不发送 RELAY_DELIVER,触发上层重试"
+                        )
+                        return False
                     await self._client.send_message(
                         self._decoder_bot_entity,
                         f"RELAY_DELIVER:{user_id}:{code}",
                     )
+                    if failed_ids:
+                        # 部分失败:记录日志,decoder_bot 可据此提示用户部分文件缺失
+                        logger.warning(
+                            f"[RelayInstance:{self.phone}] deliver_cached 部分文件发送失败 "
+                            f"(code={code}, failed={len(failed_ids)}/{len(file_ids)})"
+                        )
                 return True
             # expired
             await col.delete_one({"file_code": code})

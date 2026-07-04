@@ -9,6 +9,7 @@ except ImportError:
     import json
 import asyncio
 import datetime
+import os
 import sqlite3
 import time
 import aiosqlite
@@ -634,6 +635,90 @@ class CacheStore:
                     continue
                 return
 
+    async def try_consume_quota(self, user_id: int, is_external: bool = False) -> bool:
+        """原子条件递增配额(乐观扣减),解决 TOCTOU 竞态。
+
+        - Premium 用户(level='premium')跳过扣减,直接返回 True
+        - 配额为 -1(不限) 跳过扣减,直接返回 True
+        - 配额为 0(禁止) 返回 False
+        - 已达上限返回 False
+        - 成功扣减返回 True
+
+        通过单条 UPDATE 的 WHERE 子句保证原子性,
+        避免并发场景下多个请求同时通过 check 后超额。
+        """
+        if not self._db:
+            return False
+        col = "used_today" if not is_external else "ext_used_today"
+        quota_col = "daily_quota" if not is_external else "ext_quota"
+        # 白名单校验,防止拼接注入
+        if col not in ("used_today", "ext_used_today") or quota_col not in ("daily_quota", "ext_quota"):
+            return False
+        for attempt in range(3):
+            try:
+                # premium 用户不扣减(used_today 保持不变);quota=-1 不限量不扣减;quota=0 禁止;否则 used < quota 才扣
+                # 用 CASE 表达式让 premium 用户的 {col} 不递增,避免计数器只增不减(refund_quota 也不退 premium)
+                # UPDATE 仍匹配行(rowcount=1),保证返回 True
+                cursor = await self._db.execute(
+                    f"UPDATE user_quota SET {col} = CASE WHEN level = 'premium' THEN {col} ELSE {col} + 1 END "
+                    f"WHERE user_id = ? "
+                    f"AND (level = 'premium' OR {quota_col} = -1 OR "
+                    f"({quota_col} > 0 AND {col} < {quota_col}))",
+                    (user_id,),
+                )
+                await self._db.commit()
+                # rowcount: 1=成功扣减或premium跳过, 0=配额已满或用户不存在
+                # 需进一步区分:premium 用户存在但跳过扣减的情况
+                rc = cursor.rowcount if cursor else 0
+                if rc > 0:
+                    return True
+                # rc=0:可能是 premium 用户但行不存在(已被删除),或配额已满,或用户不存在
+                # 查询确认用户是否存在以及 level
+                rows = await self._db.execute_fetchall(
+                    f"SELECT level, {quota_col}, {col} FROM user_quota WHERE user_id = ?",
+                    (user_id,),
+                )
+                if not rows:
+                    return False  # 用户不存在
+                level, q, used = rows[0]
+                if level == "premium" or q == -1:
+                    return True  # premium/不限量,跳过扣减视为成功
+                return False  # 配额已满
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                return False
+
+    async def refund_quota(self, user_id: int, is_external: bool = False):
+        """投递失败时回滚配额(递减),与 try_consume_quota 配对使用。
+
+        - Premium 用户不操作(未扣减)
+        - 配额为 -1 不操作(未扣减)
+        - 正常用户递减 1,但不低于 0
+        """
+        if not self._db:
+            return
+        col = "used_today" if not is_external else "ext_used_today"
+        quota_col = "daily_quota" if not is_external else "ext_quota"
+        if col not in ("used_today", "ext_used_today") or quota_col not in ("daily_quota", "ext_quota"):
+            return
+        for attempt in range(3):
+            try:
+                # 只对非 premium、非 -1 配额的用户递减,且不低于 0
+                await self._db.execute(
+                    f"UPDATE user_quota SET {col} = MAX(0, {col} - 1) "
+                    f"WHERE user_id = ? AND level != 'premium' AND {quota_col} != -1",
+                    (user_id,),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                return
+
     async def get_unsynced_quotas(self, min_synced_at: float = 0) -> list[dict]:
         """获取需要同步到 CRDB 的配额记录。"""
         if not self._db:
@@ -794,15 +879,21 @@ class CacheStore:
             for r in rows
         ]
 
-    async def mark_local_job_dispatched(self, crdb_id: int):
-        """标记本地 job 为 dispatched"""
+    async def mark_local_job_dispatched(self, crdb_id: int) -> bool:
+        """标记本地 job 为 dispatched (CAS 语义,防止多 worker 重复认领)。
+
+        Returns:
+            True 表示成功认领(从 pending → dispatched);False 表示已被其他 worker 认领。
+        """
         if not self._db:
-            return
-        await self._db.execute(
-            "UPDATE local_job_queue SET status='dispatched', dispatched_at=? WHERE crdb_id=?",
+            return False
+        cursor = await self._db.execute(
+            "UPDATE local_job_queue SET status='dispatched', dispatched_at=? "
+            "WHERE crdb_id=? AND status='pending'",
             (datetime.datetime.now(datetime.timezone.utc).isoformat(), crdb_id),
         )
         await self._db.commit()
+        return cursor.rowcount > 0
 
     async def update_local_job_status(self, crdb_id: int, status: str, retry_count: int = None, dead_reason: str = None):
         """更新本地 job 状态"""
@@ -860,6 +951,27 @@ class CacheStore:
         await self._db.commit()
         await self.notify_dsp_new_job()
 
+    async def reclaim_stale_dispatched(self, timeout_seconds: int = 300) -> int:
+        """回收超时的 dispatched 状态 job,重置为 pending。
+        防止进程崩溃或 task 异常导致 job 永久停留在 dispatched 状态。
+        返回回收的 job 数量。
+        """
+        if not self._db:
+            return 0
+        cutoff = (datetime.datetime.now(datetime.timezone.utc) -
+                  datetime.timedelta(seconds=timeout_seconds)).isoformat()
+        cursor = await self._db.execute(
+            "UPDATE local_job_queue SET status='pending', dispatched_at=NULL, synced_at=0 "
+            "WHERE status='dispatched' AND dispatched_at < ?",
+            (cutoff,),
+        )
+        count = cursor.rowcount
+        if count > 0:
+            await self._db.commit()
+            await self.notify_dsp_new_job()
+            logger.info(f"[CacheStore] 回收 {count} 个超时 dispatched jobs")
+        return count
+
     async def get_local_unsynced_jobs(self) -> list[dict]:
         """获取需要同步回 CRDB 的 job(状态变更未同步,仅 crdb_id>0 的)"""
         if not self._db:
@@ -905,29 +1017,61 @@ class CacheStore:
         )
         await self._db.commit()
 
-    # ─── F5: 启动统计快照 ───
+    # ─── F5: 启动统计快照（多进程隔离 + 聚合读取） ───
 
-    async def save_counter_snapshot(self, counters: dict[str, int]):
-        """保存启动统计快照(各 Bot 周期性写入)"""
+    async def save_counter_snapshot(self, counters: dict[str, int], role: str = None):
+        """保存启动统计快照(各 Bot 周期性写入)
+
+        多进程隔离：每个进程写入带进程标识前缀的 key（如 `up_bot:total_files`），
+        避免不同进程互相覆盖。admin_bot 读取时通过 load_counter_snapshot 聚合求和。
+
+        Args:
+            counters: 计数器字典
+            role: 进程标识（如 up_bot/idx_bot/dsp_bot/mon_bot/admin_bot）。
+                  若未传入则从环境变量 BOT_ROLE 读取，再回退到 "default"。
+        """
         if not self._db:
             return
+        if role is None:
+            role = os.environ.get("BOT_ROLE", "default")
         now = time.time()
+        # 先清除本进程的旧快照（防止本次未更新的 key 残留旧值）
+        await self._db.execute(
+            "DELETE FROM counter_snapshot WHERE key LIKE ?",
+            (f"{role}:%",),
+        )
         for k, v in counters.items():
             await self._db.execute(
                 "INSERT OR REPLACE INTO counter_snapshot (key, value, ts) VALUES (?, ?, ?)",
-                (k, v, now),
+                (f"{role}:{k}", v, now),
             )
         await self._db.commit()
 
     async def load_counter_snapshot(self) -> dict[str, int]:
-        """加载启动统计快照"""
+        """加载启动统计快照（聚合所有进程的计数）
+
+        多进程聚合：各进程写入带前缀的 key（如 `up_bot:total_files`），
+        本方法读取所有 key，按 `:` 后的部分聚合求和，得到全局总数。
+        """
         if not self._db:
             return {}
         try:
             rows = await self._db.execute_fetchall(
                 "SELECT key, value FROM counter_snapshot"
             )
-            return {r[0]: r[1] for r in rows}
+            aggregated: dict[str, int] = {}
+            for k, v in rows:
+                # key 格式: <role>:<counter_name>
+                if ":" in k:
+                    counter_name = k.split(":", 1)[1]
+                else:
+                    # 兼容旧格式（无前缀）
+                    counter_name = k
+                try:
+                    aggregated[counter_name] = aggregated.get(counter_name, 0) + int(v)
+                except (ValueError, TypeError):
+                    continue
+            return aggregated
         except Exception:
             return {}
 
@@ -1822,6 +1966,16 @@ async def upsert_user_quota(user_id: int, data: dict):
 async def increment_user_quota_used(user_id: int, is_external: bool = False):
     """模块级便利函数：原子递增用户已用配额。"""
     await _store.increment_user_quota_used(user_id, is_external)
+
+
+async def try_consume_quota(user_id: int, is_external: bool = False) -> bool:
+    """模块级便利函数：原子条件递增配额(乐观扣减),解决 TOCTOU 竞态。"""
+    return await _store.try_consume_quota(user_id, is_external)
+
+
+async def refund_quota(user_id: int, is_external: bool = False):
+    """模块级便利函数：投递失败时回滚配额。"""
+    await _store.refund_quota(user_id, is_external)
 
 
 async def get_unsynced_quotas(min_synced_at: float = 0) -> list[dict]:

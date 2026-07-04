@@ -5,7 +5,7 @@
 - 支持并发处理解码任务
 """
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from loguru import logger
 
@@ -20,27 +20,29 @@ class RelayPool:
         self.instances: list[RelayInstance] = []
         self._lock = asyncio.Lock()
         self._initialized = False
+        self._cleanup_task: asyncio.Task | None = None
 
     async def init(self):
         """从本地 SQLite 加载账号并创建实例"""
-        if self._initialized:
-            return
-        db = await get_relay_db()
-        accounts = await db.get_active_accounts()
-        if not accounts:
-            logger.warning("[RelayPool] 无中继账号，请通过 admin_bot /relay_set_api 添加")
+        async with self._lock:
+            if self._initialized:
+                return
+            db = await get_relay_db()
+            accounts = await db.get_active_accounts()
+            if not accounts:
+                logger.warning("[RelayPool] 无中继账号，请通过 admin_bot /relay_set_api 添加")
+                self._initialized = True
+                return
+            for acct in accounts:
+                instance = RelayInstance(
+                    account_id=acct["id"],
+                    api_id=acct["api_id"],
+                    api_hash=acct["api_hash"],
+                    phone=acct["phone"],
+                )
+                self.instances.append(instance)
+            logger.info(f"[RelayPool] 从本地加载 {len(self.instances)} 个中继账号")
             self._initialized = True
-            return
-        for acct in accounts:
-            instance = RelayInstance(
-                account_id=acct["id"],
-                api_id=acct["api_id"],
-                api_hash=acct["api_hash"],
-                phone=acct["phone"],
-            )
-            self.instances.append(instance)
-        logger.info(f"[RelayPool] 从本地加载 {len(self.instances)} 个中继账号")
-        self._initialized = True
 
     async def start_all(self):
         """启动所有中继实例"""
@@ -56,7 +58,7 @@ class RelayPool:
         else:
             logger.warning("[RelayPool] 没有可用的中继账号")
         # 启动定期清理过期冷却记录
-        asyncio.create_task(self._cleanup_cooldowns_loop())
+        self._cleanup_task = asyncio.create_task(self._cleanup_cooldowns_loop())
 
     async def _cleanup_cooldowns_loop(self):
         """每 10 分钟清理一次过期冷却记录。"""
@@ -106,7 +108,10 @@ class RelayPool:
             if last_req:
                 try:
                     last_dt = datetime.fromisoformat(last_req.replace("Z", "+00:00"))
-                    now_dt = datetime.now(last_dt.tzinfo)
+                    # SQLite datetime('now') 返回无时区的 UTC 时间,需显式补上 tzinfo
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    now_dt = datetime.now(timezone.utc)
                     gap_seconds = max((now_dt - last_dt).total_seconds(), 1)
                 except (ValueError, TypeError):
                     gap_seconds = 1
@@ -165,7 +170,29 @@ class RelayPool:
         )
         async with self._lock:
             self.instances.append(instance)
-        await instance.start()
+        start_failed = False
+        try:
+            await instance.start()
+        except Exception as e:
+            # start 抛异常:回滚
+            logger.error(f"[RelayPool] 中继账号 {phone} start 异常,回滚: {e}")
+            start_failed = True
+        # start() 内部失败时直接 return 不抛异常,这里通过 is_ready 判断
+        if start_failed or not instance.is_ready:
+            if not start_failed:
+                logger.error(f"[RelayPool] 中继账号 {phone} start 后未就绪(可能登录失败/二步验证),回滚")
+            async with self._lock:
+                self.instances = [i for i in self.instances if i.phone != phone]
+            # 关闭已建立的 TelegramClient 连接,防止资源泄漏
+            try:
+                await instance.shutdown()
+            except Exception as shutdown_err:
+                logger.warning(f"[RelayPool] 回滚关闭 client {phone} 失败: {shutdown_err}")
+            try:
+                await db.remove_account(phone)
+            except Exception as rm_err:
+                logger.warning(f"[RelayPool] 回滚删除 DB 账号 {phone} 失败: {rm_err}")
+            raise RuntimeError(f"中继账号 {phone} 启动失败,已回滚")
         logger.info(f"[RelayPool] 动态添加中继账号: {phone}")
         return instance
 
@@ -174,8 +201,22 @@ class RelayPool:
         db = await get_relay_db()
         removed = await db.remove_account(phone)
         if removed:
+            # 先找到 instance 引用用于关闭连接
+            removed_instance: RelayInstance | None = None
             async with self._lock:
-                self.instances = [i for i in self.instances if i.phone != phone]
+                remaining = []
+                for i in self.instances:
+                    if i.phone == phone:
+                        removed_instance = i
+                    else:
+                        remaining.append(i)
+                self.instances = remaining
+            # 在锁外关闭 TelegramClient 连接
+            if removed_instance:
+                try:
+                    await removed_instance.shutdown()
+                except Exception as e:
+                    logger.warning(f"[RelayPool] 关闭 {phone} client 失败: {e}")
             logger.info(f"[RelayPool] 移除中继账号: {phone}")
         return removed
 
@@ -204,6 +245,18 @@ class RelayPool:
         async with self._lock:
             instances = list(self.instances)
         await asyncio.gather(*(i.shutdown() for i in instances), return_exceptions=True)
+        # 取消清理循环任务
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
+        # 复位状态,允许后续重新 init
+        async with self._lock:
+            self.instances = []
+            self._initialized = False
+            self._cleanup_task = None
         logger.info("[RelayPool] 所有中继账号已关闭")
 
 

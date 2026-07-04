@@ -2,6 +2,7 @@
 高峰期自动拉长等待时间，防止 Telegram API 被打爆。
 """
 import asyncio
+import time
 from config import settings
 
 
@@ -41,13 +42,17 @@ class DynamicRateLimiter:
         self._current_delay = self.base_delay
         self._last_queue_length = 0
         self._lock = asyncio.Lock()
+        self._last_release_time: float = 0.0  # 上次释放许可的 monotonic 时间
 
     async def acquire(self, get_queue_length):
-        """获取许可，自动等待。
+        """获取许可，自动等待（串行化）。
+
+        通过在锁内 sleep 确保请求被串行化释放，避免并发请求同时通过。
+        多个协程并发调用时会排队等待，每个协程至少间隔 _current_delay 秒。
 
         Args:
             get_queue_length: 异步函数，返回当前队列长度
-            
+
         Returns:
             True 表示允许通过
         """
@@ -77,11 +82,16 @@ class DynamicRateLimiter:
 
             self._last_queue_length = queue_length
 
-        # 等待（在锁外执行，不影响并发）
-        # ✅ 确认：asyncio.sleep 在 async with self._lock 块之外，
-        # 确保等待期间不阻塞其他并发的 acquire() 调用。
-        if self._current_delay > 0:
-            await asyncio.sleep(self._current_delay)
+            # 计算需要等待的时间：距上次释放至少间隔 _current_delay 秒
+            now = time.monotonic()
+            elapsed = now - self._last_release_time if self._last_release_time > 0 else self._current_delay
+            wait = max(0, self._current_delay - elapsed)
+
+            # 在锁内 sleep，串行化所有并发请求
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            self._last_release_time = time.monotonic()
 
         return True
 

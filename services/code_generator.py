@@ -15,7 +15,8 @@ _BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
 # 内部文件码后缀格式: {12位base36}_{类型后缀}
 # 例: a1b2c3d4e5f6_3p_2v_1d
 # 前缀由 settings.FILE_CODE_PREFIX 动态校验，不在此正则中硬编码
-_INTERNAL_CODE_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]{12}(?:_\d+[pvdarg])+$")
+# 字符集 [pvdag] 对应 FILE_TYPE_LABELS 的缩写: photo/video/document/audio/animation
+_INTERNAL_CODE_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]{12}(?:_\d+[pvdag])+$")
 
 
 def _generate_deterministic_id(length: int = 12) -> str:

@@ -25,6 +25,12 @@ class R2Storage:
         self._endpoint = endpoint or f"{account_id}.r2.cloudflarestorage.com"
 
     async def connect(self):
+        # 防止反复调用导致旧 client 泄漏:先关闭旧的再创建新的
+        if self._http is not None:
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
         self._http = httpx.AsyncClient(timeout=120)
 
     async def close(self):
@@ -44,7 +50,10 @@ class R2Storage:
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
         date_stamp = now.strftime("%Y%m%d")
 
-        canonical_uri = "/" + self._bucket + "/" + key
+        if key:
+            canonical_uri = "/" + self._bucket + "/" + key
+        else:
+            canonical_uri = "/" + self._bucket
         canonical_querystring = querystring
         canonical_headers = (
             f"host:{self._endpoint}\n"
@@ -108,15 +117,26 @@ class R2Storage:
         if self._http is None:
             raise RuntimeError("R2Storage not connected, call connect() first")
         import xml.etree.ElementTree as ET
+        from urllib.parse import quote
         ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
         result = []
         continuation_token = None
         per_request = min(max_keys, 1000)
 
         while True:
-            query = f"list-type=2&prefix={prefix}&max-keys={per_request}"
+            # S3 SigV4 要求 canonical querystring 按参数名字典序排序
+            # 构建参数字典后按键排序,确保 continuation-token('c') < list-type('l') < max-keys('m') < prefix('p')
+            params_dict = {
+                "list-type": "2",
+                "max-keys": str(per_request),
+            }
+            if prefix:
+                params_dict["prefix"] = prefix
             if continuation_token:
-                query += f"&continuation-token={continuation_token}"
+                params_dict["continuation-token"] = continuation_token
+            ordered_params = sorted(params_dict.items(), key=lambda x: x[0])
+            # 用 quote 编码特殊字符(如 / + 空格 + =),signature 与 URL 必须用同一编码
+            query = "&".join(f"{k}={quote(v, safe='')}" for k, v in ordered_params)
             url = f"{self.base_url}?{query}"
             headers = self._sign("GET", "", querystring=query)
             resp = await self._http.get(url, headers=headers)

@@ -55,6 +55,8 @@ class MonScheduler:
         self.r100_managed = cfg["r100_managed"]
         # ─── last_synced_msg_id 本地缓存:每 30 次同步 flush 一次(30分钟)，且只 flush 有变化的 ───
         self._telethon_client: TelegramClient | None = None
+        # 标记是否为自建客户端(复用 relay_pool 的不能关闭,由 relay_pool 管理)
+        self._owns_telethon_client: bool = False
         self._cursor_cache: dict[str, int] = {}
         self._flushed_cursors: dict[str, int] = {}  # 已 flush 到 CRDB 的游标值
         self._replicate_count = 0
@@ -62,6 +64,21 @@ class MonScheduler:
         # R100 独立游标持久化：避免重启后重复归档
         self._r100_cursors: dict[str, int] = {}  # {slot_id}_r100 → cursor
         self._r100_cursors_loaded = False
+
+    async def shutdown(self):
+        """关闭自建的 Telethon 客户端,释放资源。
+        复用 relay_pool 的客户端不在此关闭,由 relay_pool 自行管理。
+        """
+        if self._owns_telethon_client and self._telethon_client:
+            try:
+                if self._telethon_client.is_connected():
+                    await self._telethon_client.disconnect()
+                    logger.info("[Mon] 自建 Telethon 客户端已关闭")
+            except Exception as e:
+                logger.warning(f"[Mon] 关闭 Telethon 客户端失败: {e}")
+            finally:
+                self._telethon_client = None
+                self._owns_telethon_client = False
 
     async def _load_r100_cursors(self):
         """从 SQLite 加载 R100 独立游标，避免重启后重复归档。"""
@@ -82,29 +99,33 @@ class MonScheduler:
         """获取或创建 Telethon 客户端，用于读取频道历史消息。
         优先复用 relay_pool 已有实例，否则查询 relay_accounts 表创建新客户端。
         失败时返回 None，调用方回退到旧 get_updates 行为。
+
+        注意: 复用 relay_pool 的实例时 _owns_telethon_client=False,shutdown 不会关闭它;
+        自建的实例 _owns_telethon_client=True,shutdown 时会关闭。
         """
         if self._telethon_client and self._telethon_client.is_connected():
             return self._telethon_client
-        
+
         from config.settings import settings
         api_id = settings.RELAY_API_ID
         api_hash = settings.RELAY_API_HASH
         if not api_id or not api_hash:
             logger.warning("[Mon] RELAY_API_ID/RELAY_API_HASH 未配置，无法使用 Telethon 历史复制")
             return None
-        
-        # 尝试复用 relay_pool 已有实例
+
+        # 尝试复用 relay_pool 已有实例(不归本 scheduler 所有,shutdown 不关闭)
         try:
             from services.relay_pool import relay_pool
             if relay_pool.instances:
                 for instance in relay_pool.instances:
                     if instance._client and instance._client.is_connected():
                         self._telethon_client = instance._client
+                        self._owns_telethon_client = False  # 复用,不归本类管理
                         logger.info(f"[Mon] 复用 relay_pool 已有 Telethon 客户端 ({instance.phone})")
                         return self._telethon_client
         except Exception:
             pass
-        
+
         # 创建新客户端：从 relay_accounts 表获取第一个账号
         try:
             from database.session import get_collection
@@ -118,6 +139,7 @@ class MonScheduler:
                     await client.connect()
                     if await client.is_user_authorized():
                         self._telethon_client = client
+                        self._owns_telethon_client = True  # 自建,归本类管理,shutdown 时关闭
                         logger.info(f"[Mon] 创建 Telethon 客户端成功 ({phone})")
                         return client
                     await client.disconnect()
@@ -125,7 +147,7 @@ class MonScheduler:
                     logger.warning(f"[Mon] session 文件不存在: {session_path}.session，跳过 Telethon 初始化")
         except Exception as e:
             logger.warning(f"[Mon] 创建 Telethon 客户端失败: {e}")
-        
+
         return None
 
     async def run_degrade_check(
@@ -165,6 +187,9 @@ class MonScheduler:
             fail_streak = cell_fail_streak.get(slot_id, 0)
 
             if fail_streak < FAIL_STREAK_DEGRADE_THRESHOLD:
+                # 失败次数已回落到阈值以下,说明频道已恢复健康,清除疑似标记
+                # 不清除会导致下次 fail_streak 再次升到阈值时跳过"首轮标记"步骤,直接降级
+                cell_suspicious.pop(slot_id, None)
                 continue
 
             degrade_count = active_slot.get("degrade_count", 0)
@@ -392,14 +417,24 @@ class MonScheduler:
                             copied_r100, mappings_r100 = await self._copy_messages(
                                 bot_instance, active_slot["channel_id"],
                                 r100_channel_id, deduped,
+                                stop_on_failure=True,  # 保证 mappings 连续成功,避免游标跳过失败消息导致永久丢失
                             )
                             total_copied += copied_r100
                             if mappings_r100:
-                                await self._write_backup_mappings(
+                                # 写入映射失败时不推进游标,下周期重试(避免故障切换时找不到映射)
+                                write_ok = await self._write_backup_mappings(
                                     active_slot["channel_id"], r100_channel_id, mappings_r100
                                 )
-                                # 游标推进到本次实际 fetch 的最大 id（含已去重的），避免重复拉取
-                                self._r100_cursors[r100_cursor_key] = max(m.id for m in r100_new_messages)
+                                if write_ok:
+                                    # 致命修复:游标只能推进到成功复制的最大 id,否则复制失败的消息会被永久跳过丢失
+                                    # mappings_r100 是 (orig_id, backup_id) 元组列表
+                                    self._r100_cursors[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
+                                else:
+                                    logger.warning(
+                                        f"[Mon] R100 映射写入失败 slot={slot_id} "
+                                        f"channel={active_slot['channel_id']}→{r100_channel_id}，"
+                                        f"游标保持 {r100_last_cursor}，下周期重试"
+                                    )
                             else:
                                 logger.warning(
                                     f"[Mon] R100 复制失败 slot={slot_id} "
@@ -417,22 +452,63 @@ class MonScheduler:
             if not new_messages:
                 continue
 
-            # N-16-2: 仅将游标推进到「所有影子都成功复制」的最大 msg_id
-            # 避免某条消息复制失败后被永久跳过
+            # N-16-2: 仅将游标推进到「所有影子都连续成功复制」的最大 msg_id
+            # 修复:用 stop_on_failure 保证 mappings 连续成功,避免中间失败的消息被永久跳过
+            # 修复:复制前查询 message_backups 去重,避免重启/重试导致重复复制
             shadow_max_ids = []
+            all_msg_ids = [_get_msg_id(m) for m in new_messages]
             for shadow in shadows:
+                # 去重:查询该 shadow 频道已存在的映射,跳过已复制的消息
+                try:
+                    existing_ids = await self._get_existing_backup_ids(
+                        active_slot["channel_id"], shadow["channel_id"], all_msg_ids
+                    )
+                except Exception:
+                    existing_ids = set()
+                pending_messages = [m for m in new_messages if _get_msg_id(m) not in existing_ids]
+                if not pending_messages:
+                    # 所有消息已存在,游标可直接推进到最大 id
+                    shadow_max_ids.append(max(all_msg_ids))
+                    continue
                 copied, mappings = await self._copy_messages(
                     bot_instance, active_slot["channel_id"],
-                    shadow["channel_id"], new_messages,
+                    shadow["channel_id"], pending_messages,
+                    stop_on_failure=True,
                 )
                 total_copied += copied
                 if mappings:
-                    await self._write_backup_mappings(
+                    # 写入映射失败时不推进该 shadow 的游标,下周期重试
+                    # 否则故障切换时 dsp_bot 找不到 message_backups 映射,用户收不到文件
+                    write_ok = await self._write_backup_mappings(
                         active_slot["channel_id"], shadow["channel_id"], mappings
                     )
-                    shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
-            if shadow_max_ids:
+                    if write_ok:
+                        shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
+                    else:
+                        logger.warning(
+                            f"[Mon] shadow 映射写入失败 slot={slot_id} "
+                            f"channel={active_slot['channel_id']}→{shadow['channel_id']}"
+                        )
+            if shadow_max_ids and len(shadow_max_ids) == len(shadows):
+                # min:取所有 shadow 中连续成功复制的最小最大 id
+                # 保证所有 shadow 都已复制到该 id,下次 fetch 不会跳过任何 shadow 的缺失消息
+                # 严格校验:所有 shadow 都必须有成功条目才推进游标,否则保持游标下周期重试
+                # 避免某个 shadow 全部复制失败时游标仍推进,导致该 shadow 永久丢消息
                 self._cursor_cache[slot_id] = min(shadow_max_ids)
+            elif shadows and len(shadow_max_ids) < len(shadows):
+                # 部分 shadow 失败(复制失败或映射写入失败),游标保持,下周期重试
+                logger.warning(
+                    f"[Mon] 部分 shadow 复制失败 slot={slot_id} "
+                    f"({len(shadow_max_ids)}/{len(shadows)} 成功),"
+                    f"游标保持 {last_cursor},下周期重试"
+                )
+            elif not shadows:
+                # 无可用 shadow(两个 shadow 都 lost 或未配置),无法复制,告警
+                # validate_topology 会检测三元组缺失,但运行时也需即时告警
+                logger.warning(
+                    f"[Mon] slot={slot_id} 无可用 shadow,跳过复制 "
+                    f"(可能两个 shadow 均 lost,请检查拓扑健康)"
+                )
 
         if self._replicate_count % self._cursor_flush_interval == 0:
             await self._flush_cursor_cache()
@@ -454,8 +530,8 @@ class MonScheduler:
                     await store.update_cell_fields_local(slot_id, {"last_synced_msg_id": cursor})
                     self._flushed_cursors[slot_id] = cursor
                     changed += 1
-                except Exception:
-                    pass
+                except Exception as flush_err:
+                    logger.debug(f"[Mon] flush 游标失败 slot={slot_id}: {flush_err}")
             if changed > 0:
                 logger.debug(f"[Mon] flush 游标到本地: {changed} 个有变化")
 
@@ -484,16 +560,21 @@ class MonScheduler:
             return set()
 
     @staticmethod
-    async def _write_backup_mappings(main_channel_id: int, backup_channel_id: int, mappings: list[tuple[int, int]]):
+    async def _write_backup_mappings(main_channel_id: int, backup_channel_id: int, mappings: list[tuple[int, int]]) -> bool:
         """将影子复制产生的 msg_id 映射写入 message_backups 表。
         故障切换时 dsp_bot 可据此查找影子频道中的新 msg_id。
+
+        Returns:
+            True 表示全部写入成功;False 表示失败,调用方不应推进游标。
         """
         try:
             from database.session import save_message_backup
             for main_msg_id, backed_msg_id in mappings:
                 await save_message_backup(main_msg_id, backup_channel_id, backed_msg_id)
+            return True
         except Exception as e:
             logger.warning(f"[Mon] 写入 message_backups 映射失败: {e}")
+            return False
 
     async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
         """获取频道中最后游标之后的新消息(媒体文件)。
@@ -531,8 +612,15 @@ class MonScheduler:
         return msgs
 
     @staticmethod
-    async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list) -> tuple[int, list[tuple[int, int]]]:
-        """批量复制消息到目标频道。返回 (成功复制数, [(原msg_id, 新msg_id)])。"""
+    async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list,
+                             stop_on_failure: bool = False) -> tuple[int, list[tuple[int, int]]]:
+        """批量复制消息到目标频道。返回 (成功复制数, [(原msg_id, 新msg_id)])。
+
+        Args:
+            stop_on_failure: 遇到第一个失败就停止复制后续消息。
+                用于 shadow 复制场景:保证返回的 mappings 是从 messages 开头连续成功的,
+                这样游标推进到 max(mappings) 时不会跳过中间失败的消息。
+        """
         if not messages:
             return 0, []
         copied = 0
@@ -548,6 +636,8 @@ class MonScheduler:
                 mappings.append((_get_msg_id(msg), result.message_id))
             except Exception as e:
                 logger.warning(f"[Mon][复制] copy_message 失败 msg_id={_get_msg_id(msg)}: {e}")
+                if stop_on_failure:
+                    break
         return copied, mappings
 
     async def auto_fill_new_channels(self, bot_instance, all_cells: list[dict]) -> int:
@@ -598,17 +688,24 @@ class MonScheduler:
                     shadow_slot["channel_id"], all_media,
                 )
                 if filled > 0:
-                    await self._write_backup_mappings(
+                    write_ok = await self._write_backup_mappings(
                         active_channel, shadow_slot["channel_id"], mappings
                     )
-                    latest_id = max(_get_msg_id(msg) for msg in all_media)
-                    await store.update_cell_fields_local(shadow_slot["slot_id"], {"last_synced_msg_id": latest_id})
-                    shadow_slot["last_synced_msg_id"] = latest_id
-                    total_filled += filled
-                    logger.info(
-                        f"[Mon][填充] {shadow_slot['slot_id']} "
-                        f"新频道补齐 {filled} 条消息"
-                    )
+                    if write_ok:
+                        latest_id = max(_get_msg_id(msg) for msg in all_media)
+                        await store.update_cell_fields_local(shadow_slot["slot_id"], {"last_synced_msg_id": latest_id})
+                        shadow_slot["last_synced_msg_id"] = latest_id
+                        total_filled += filled
+                        logger.info(
+                            f"[Mon][填充] {shadow_slot['slot_id']} "
+                            f"新频道补齐 {filled} 条消息"
+                        )
+                    else:
+                        # 映射写入失败,不推进游标,下周期 replicate 会重试
+                        logger.warning(
+                            f"[Mon][填充] {shadow_slot['slot_id']} 映射写入失败,"
+                            f"游标保持 0,下周期重试"
+                        )
 
         return total_filled
 

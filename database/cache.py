@@ -1,3 +1,4 @@
+import os
 import time
 import asyncio
 from collections import OrderedDict
@@ -218,6 +219,10 @@ async def _flush_request_count_loop():
             logger.debug(f"[request_count] flushed {len(batch)} codes, {sum(batch.values())} counts, affected rows={affected}")
         except Exception as e:
             logger.error(f"[request_count] flush failed: {e}")
+            # 失败时将 batch 合并回缓冲,防止计数永久丢失
+            async with _request_count_lock:
+                for code, cnt in batch.items():
+                    _request_count_buffer[code] = _request_count_buffer.get(code, 0) + cnt
 
 
 # ─── SQLite 持久化备份 ──────────────────────────────────────────
@@ -247,6 +252,27 @@ async def dump_cache_to_disk_loop():
     from loguru import logger
     from .cache_store import get_cache_store
 
+    # 启动时恢复本进程上次的 counter 快照（防止重启后计数归零）
+    try:
+        role = os.environ.get("BOT_ROLE", "default")
+        store = get_cache_store()
+        rows = await store._db.execute_fetchall(
+            "SELECT key, value FROM counter_snapshot WHERE key LIKE ?",
+            (f"{role}:%",),
+        )
+        if rows:
+            from utils.shared_counters import status_counters
+            for k, v in rows:
+                # key 格式: <role>:<counter_name>
+                counter_name = k.split(":", 1)[1] if ":" in k else k
+                try:
+                    status_counters[counter_name] = int(v)
+                except (ValueError, TypeError):
+                    continue
+            logger.info(f"[cache_store] 恢复 {role} 进程 counter 快照: {len(rows)} 项")
+    except Exception as e:
+        logger.debug(f"[cache_store] 恢复 counter 快照失败: {e}")
+
     cleanup_counter = 0
     while True:
         await _asyncio.sleep(60)
@@ -263,8 +289,8 @@ async def dump_cache_to_disk_loop():
                     from utils.shared_counters import status_counters
                     core = {k: v for k, v in status_counters.items() if not k.startswith("user_code_count:")}
                     await store.save_counter_snapshot(core)
-                except Exception:
-                    pass
+                except Exception as snap_err:
+                    logger.debug(f"[cache_store] save_counter_snapshot 失败: {snap_err}")
                 logger.debug("[cache_store] 已清理过期通知表记录")
         except Exception as e:
             logger.debug(f"[cache_store] 定期 dump 失败: {e}")
@@ -342,31 +368,47 @@ async def _flush_decode_log_buffer_loop():
             )
             if rows:
                 # 分批写入,每批 100 条(减少单次 CRDB 事务大小)
+                # 逐批提交+逐批删除:某批失败时已成功的批次会被清理,未成功的批次保留在 buffer 下次重试
+                # insert_many 成功后立即 DELETE，DELETE 失败则 break（保留 buffer 下次重试，避免 CRDB 重复写入）
                 batch_size = 100
+                flushed_count = 0
                 for i in range(0, len(rows), batch_size):
                     batch = rows[i:i + batch_size]
-                    await decode_logs_col.insert_many([
-                        {
-                            "file_code": r[1],
-                            "requester_id": r[2],
-                            "request_time": r[3],
-                            "status": r[4],
-                            "source_channel_id": r[5],
-                        }
-                        for r in batch
-                    ])
-                # 清空已 flush 的记录
-                ids = [r[0] for r in rows]
-                placeholders = ",".join("?" for _ in ids)
-                await buf._db.execute(
-                    f"DELETE FROM decode_log_buffer WHERE id IN ({placeholders})", ids
-                )
-                await buf._db.commit()
-                logger.info(f"[DecodeLog] flushed {len(rows)} logs to CRDB")
-                # 递增本地计数器
+                    try:
+                        await decode_logs_col.insert_many([
+                            {
+                                "file_code": r[1],
+                                "requester_id": r[2],
+                                "request_time": r[3],
+                                "status": r[4],
+                                "source_channel_id": r[5],
+                            }
+                            for r in batch
+                        ])
+                    except Exception as batch_err:
+                        logger.error(f"[DecodeLog] 批次 {i//batch_size} 写入失败: {batch_err}, "
+                                    f"该批 {len(batch)} 条保留在 buffer,已成功 {flushed_count} 条")
+                        break
+                    # 仅删除本批已成功写入的记录
+                    # DELETE 失败时也必须 break，否则下一轮会重复写入 CRDB
+                    batch_ids = [r[0] for r in batch]
+                    placeholders = ",".join("?" for _ in batch_ids)
+                    try:
+                        await buf._db.execute(
+                            f"DELETE FROM decode_log_buffer WHERE id IN ({placeholders})", batch_ids
+                        )
+                        await buf._db.commit()
+                    except Exception as del_err:
+                        logger.error(f"[DecodeLog] 批次 {i//batch_size} DELETE 失败: {del_err}, "
+                                    f"已写入 CRDB 但 buffer 未清理,停止本轮 flush 避免重复写入")
+                        break
+                    flushed_count += len(batch)
+                logger.info(f"[DecodeLog] flushed {flushed_count}/{len(rows)} logs to CRDB")
+                # 仅递增已成功 flush 的数量
                 try:
-                    from utils.shared_counters import status_counters
-                    status_counters["today_decodes"] = status_counters.get("today_decodes", 0) + len(rows)
+                    if flushed_count > 0:
+                        from utils.shared_counters import status_counters
+                        status_counters["today_decodes"] = status_counters.get("today_decodes", 0) + flushed_count
                 except Exception:
                     pass
             else:
@@ -450,6 +492,7 @@ async def _sync_local_tables_loop():
         total = 0
 
         try:
+            failed_count = 0  # 记录同步失败数,有失败则不推进水位
             # 1. file_records 增量
             fr_col = get_file_records_col()
             new_fr = await fr_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
@@ -457,38 +500,46 @@ async def _sync_local_tables_loop():
                 try:
                     await store.upsert_file_record_local(r, mark_dirty=False)
                     total += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    failed_count += 1
+                    logger.warning(f"[Sync] file_records 单条失败 (code={r.get('file_code')}): {e}")
             if new_fr:
-                logger.debug(f"[Sync] file_records 增量: {len(new_fr)} 条")
+                logger.debug(f"[Sync] file_records 增量: {len(new_fr)} 条, 失败 {failed_count} 条")
 
             # 2. codes 增量
             codes_col = get_codes_col()
             new_codes = await codes_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
+            code_failed = 0
             for r in new_codes:
                 try:
                     await store.upsert_code_local(r, mark_dirty=False)
                     total += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    code_failed += 1
+                    failed_count += 1
+                    logger.warning(f"[Sync] codes 单条失败 (code={r.get('code')}): {e}")
             if new_codes:
-                logger.debug(f"[Sync] codes 增量: {len(new_codes)} 条")
+                logger.debug(f"[Sync] codes 增量: {len(new_codes)} 条, 失败 {code_failed} 条")
 
             # 3. users 增量
             users_col = get_users_col()
             new_users = await users_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=100)
+            user_failed = 0
             for r in new_users:
                 try:
                     await store.upsert_user_local(r, mark_dirty=False)
                     total += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    user_failed += 1
+                    failed_count += 1
+                    logger.warning(f"[Sync] users 单条失败 (user_id={r.get('user_id')}): {e}")
             if new_users:
-                logger.debug(f"[Sync] users 增量: {len(new_users)} 条")
+                logger.debug(f"[Sync] users 增量: {len(new_users)} 条, 失败 {user_failed} 条")
 
             # 4. external_code_mapping 增量
             ec_col = get_external_code_mapping_col()
             new_ec = await ec_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=50)
+            ec_failed = 0
             for r in new_ec:
                 try:
                     await store._db.execute(
@@ -500,12 +551,20 @@ async def _sync_local_tables_loop():
                     )
                     await store._db.commit()
                     total += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    ec_failed += 1
+                    failed_count += 1
+                    logger.warning(f"[Sync] external_code_mapping 单条失败: {e}")
+            if new_ec:
+                logger.debug(f"[Sync] external_code_mapping 增量: {len(new_ec)} 条, 失败 {ec_failed} 条")
 
-            await store.set_kv("_last_sync_local_tables", now_iso)
-            if total > 0:
-                logger.debug(f"[Sync] 本地表同步 {total} 条记录")
+            # 仅当全部成功时才推进水位,有失败时保留旧水位下次重试(upsert 幂等,重复查询无害)
+            if failed_count == 0:
+                await store.set_kv("_last_sync_local_tables", now_iso)
+                if total > 0:
+                    logger.debug(f"[Sync] 本地表同步 {total} 条记录, 水位推进到 {now_iso}")
+            else:
+                logger.warning(f"[Sync] 本表同步有 {failed_count} 条失败, 保留水位 {last_sync_iso} 下次重试")
 
         except Exception as e:
             logger.warning(f"[Sync] 本地表同步失败: {e}")

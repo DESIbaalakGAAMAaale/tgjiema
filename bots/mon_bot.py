@@ -15,7 +15,7 @@ import time
 
 from loguru import logger
 from telegram import Bot
-from telegram.error import TelegramError
+from telegram.error import TelegramError, RetryAfter
 
 from config import settings
 from database import (
@@ -197,8 +197,14 @@ class MonBot:
             if not self._admin_bot:
                 admin_token = settings.ADMIN_BOT_TOKEN
                 if admin_token:
-                    self._admin_bot = Bot(token=admin_token)
-                    await self._admin_bot.initialize()
+                    try:
+                        self._admin_bot = Bot(token=admin_token)
+                        await self._admin_bot.initialize()
+                    except Exception as init_err:
+                        # 初始化失败时重置 _admin_bot,以便下次重试,避免永久锁死
+                        self._admin_bot = None
+                        logger.warning(f"[Mon][Notify] admin_bot 初始化失败: {init_err}")
+                        return False
                 else:
                     self._admin_bot = self.bot
             await self._admin_bot.send_message(
@@ -248,7 +254,11 @@ class MonBot:
                 await consume_spare(spare_ch)
             except Exception as e:
                 logger.error(f"[Mon] consume_spare 失败 (channel={spare_ch}): {e}")
-                # 继续执行替换逻辑，consume_spare 失败不影响封禁处理
+                # consume_spare 失败意味着该 spare 在 DB 中仍 is_used=0,
+                # 继续替换会导致同一 spare 被双重分配。必须中止替换。
+                notify_msg += f"⚠️ 备用池标记失败，已跳过替换: {e}"
+                await self._notify_admin(notify_msg)
+                return
             new_status = status if status in ("active", "shadow1", "shadow2", "r100") else "active"
             now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
             await store.update_cell_fields_local(slot_id, {
@@ -333,6 +343,7 @@ class MonBot:
                 })
                 self._cell_healthy[slot_id] = True
                 self._cell_fail_streak[slot_id] = 0
+                self._cell_suspicious.pop(slot_id, None)  # 恢复后清除疑似标记,与心跳成功一致
                 recovered += 1
                 logger.info(f"[Mon] lost 频道恢复: {slot_id} (channel={channel_id}) → shadow2")
             except Exception as e:
@@ -615,6 +626,29 @@ class MonBot:
                             logger.warning(issue)
                     else:
                         logger.info("[Mon] 拓扑校验: 健康")
+                    # 清理字典中已不存在的 slot_id,防止槽位删除/重命名后内存泄漏
+                    valid_slots = {c["slot_id"] for c in all_cells}
+                    # _notify_cooldowns 的 key 是消息首行(非 slot_id),按时间清理(超过 1200s 的条目)
+                    now_ts = time.time()
+                    stale_notify = [k for k, ts in self._notify_cooldowns.items() if now_ts - ts > 1200]
+                    for k in stale_notify:
+                        del self._notify_cooldowns[k]
+                    # 其余三个字典按 slot_id 清理
+                    stale_healthy = [k for k in self._cell_healthy if k not in valid_slots]
+                    for k in stale_healthy:
+                        del self._cell_healthy[k]
+                    stale_streak = [k for k in self._cell_fail_streak if k not in valid_slots]
+                    for k in stale_streak:
+                        del self._cell_fail_streak[k]
+                    stale_suspicious = [k for k in self._cell_suspicious if k not in valid_slots]
+                    for k in stale_suspicious:
+                        del self._cell_suspicious[k]
+                    if stale_notify or stale_healthy or stale_streak or stale_suspicious:
+                        logger.debug(
+                            f"[Mon] 清理过期字典条目: notify={len(stale_notify)} "
+                            f"healthy={len(stale_healthy)} streak={len(stale_streak)} "
+                            f"suspicious={len(stale_suspicious)}"
+                        )
 
                 # 6.5 脏数据同步到 CRDB(每 10 轮一次,~5分钟)
                 if self._cycle_count % 10 == 0:
@@ -661,6 +695,12 @@ class MonBot:
                 self._cell_fail_streak[slot_id] = 0
                 self._cell_suspicious.pop(slot_id, None)  # 恢复后清除疑似标记
                 ok_count += 1
+            except RetryAfter as e:
+                # FloodWait: 等待后继续,不视为封禁
+                logger.warning(f"[Mon] 心跳触发 FloodWait slot={slot_id}, 等待 {e.retry_after}s")
+                await asyncio.sleep(e.retry_after + 1)
+                await store.write_heartbeat(slot_id, ok=False)
+                self._cell_fail_streak[slot_id] = self._cell_fail_streak.get(slot_id, 0) + 1
             except TelegramError as e:
                 if _is_ban_error(e):
                     self._cell_healthy[slot_id] = False
@@ -688,10 +728,22 @@ class MonBot:
         if self._admin_bot:
             try:
                 await self._admin_bot.shutdown()
-            except Exception:
-                pass
-        await self.bot.shutdown()
-        await close_db()
+            except Exception as e:
+                logger.warning(f"[Mon] admin_bot shutdown 异常: {e}")
+        try:
+            await self.bot.shutdown()
+        except Exception as e:
+            logger.warning(f"[Mon] bot shutdown 异常: {e}")
+        # 关闭 scheduler 自建的 Telethon 客户端(复用 relay_pool 的不关闭)
+        try:
+            await self.scheduler.shutdown()
+        except Exception as e:
+            logger.warning(f"[Mon] scheduler shutdown 异常: {e}")
+        # close_db 可能因初始化失败/重复关闭而抛异常,需保护避免掩盖其他错误
+        try:
+            await close_db()
+        except Exception as e:
+            logger.warning(f"[Mon] close_db 异常: {e}")
         logger.info("[Mon] 监控机器人已停止")
 
     async def _report_status(self, all_cells: list[dict]):

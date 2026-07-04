@@ -14,6 +14,7 @@ from .handlers import (
     set_db_backup, factory_reset, purge_channel, add_code_route, remove_code_route,
     list_code_routes, set_bot_interval, remove_bot_interval, list_bot_intervals,
     spare_add, spare_remove, spare_list, rotation_set, rotation_view, topology,
+    relay_whitelist, collector_whitelist,
     cancel_conversation, help_command,
 )
 from .callback import menu_callback
@@ -86,6 +87,8 @@ async def _async_main():
     app.add_handler(CommandHandler("rotation_set", rotation_set))
     app.add_handler(CommandHandler("rotation_view", rotation_view))
     app.add_handler(CommandHandler("topology", topology))
+    app.add_handler(CommandHandler("relay_whitelist", relay_whitelist))
+    app.add_handler(CommandHandler("collector_whitelist", collector_whitelist))
     app.add_handler(CommandHandler("cancel", cancel_conversation))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
@@ -108,8 +111,10 @@ async def _async_main():
         except asyncio.CancelledError:
             pass
         finally:
-            await app.updater.stop()
-            await app.stop()
+            try:
+                await app.updater.stop()
+            finally:
+                await app.stop()
 
 
 def run():

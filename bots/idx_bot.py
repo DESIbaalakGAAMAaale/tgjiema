@@ -261,9 +261,9 @@ async def _flush_media_group_buffer(media_group_id: str):
                 pass
         return
 
-    # 外部媒体bot 间不可达,仅记录日
+    # 外部媒体组 Bot 间不可达,仅记录日志
     # 外部码解码走中继系统(真实 Telegram 账号),中继账号上传到存储频道后RELAY_BATCH 通知
-    logger.warning(f"[Idx][mg_buf] 外部媒体组无法直接处bot 间无权限),code={code}, {len(msgs)}条消息")
+    logger.warning(f"[Idx][mg_buf] 外部媒体组无法直接处理(Bot 间无权限),code={code}, {len(msgs)}条消息")
     return
 
 
@@ -521,8 +521,8 @@ async def _process_one_pending(app: Application, row: dict):
         try:
             from database.cache_store import get_cache_store
             await get_cache_store().upsert_file_record_local(record, mark_dirty=False)
-        except Exception:
-            pass
+        except Exception as cache_err:
+            logger.debug(f"[Idx][poll] upsert_file_record_local 失败 code={file_code}: {cache_err}")
     except Exception as e:
         logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
         try:
@@ -556,8 +556,8 @@ async def _process_one_pending(app: Application, row: dict):
         try:
             from database.cache_store import get_cache_store
             await get_cache_store().upsert_code_local(ce, mark_dirty=False)
-        except Exception:
-            pass
+        except Exception as cache_err:
+            logger.debug(f"[Idx][poll] upsert_code_local 失败 code={file_code}: {cache_err}")
         # 同时写入 code_cache,后续解码查缓存即
         from database.cache import get_code_cache
         get_code_cache().set(f"code:{file_code}", ce)
@@ -565,8 +565,8 @@ async def _process_one_pending(app: Application, row: dict):
         try:
             from utils.shared_counters import incr_user_code_count
             incr_user_code_count(uploader_id, 1)
-        except Exception:
-            pass
+        except Exception as counter_err:
+            logger.debug(f"[Idx][poll] incr_user_code_count 失败 user={uploader_id}: {counter_err}")
     except Exception as e:
         logger.error(f"[Idx][poll] codes表写入失败(code={file_code}): {e}")
 
@@ -717,17 +717,25 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 举报拦截：脱钩或限制举报人 ──
     if file_record and file_record.get("status") == "detached":
+        # 配额已在 check_decode_permission 中预扣,此处拦截需回滚
+        if result.quota_consumed:
+            from services.permission import refund_user_quota
+            await refund_user_quota(user.id, is_external=False)
         await safe_reply_text(update.message, "文件不存在或已被删除")
         return
     blocked = file_record.get("blocked_users")
     if isinstance(blocked, list) and user.id in blocked:
+        # 同上,回滚预扣
+        if result.quota_consumed:
+            from services.permission import refund_user_quota
+            await refund_user_quota(user.id, is_external=False)
         await safe_reply_text(update.message, "文件不存在或已被删除")
         return
 
     storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
 
     try:
-        # 写入本地 SQLite 缓冲RU),后台6 小时 flush CRDB
+        # 写入本地 SQLite 缓冲(0 RU),后台6 小时 flush CRDB
         from database.cache_store import get_decode_log_buffer
         log_doc = make_decode_log(file_code=text, requester_id=user.id, status="queued")
         await get_decode_log_buffer().insert(log_doc)
@@ -744,6 +752,9 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         primary_mid = file_record.get("primary_channel_msg_id")
         if primary_mid is None:
             logger.error(f"[Idx] primary_channel_msg_id 为空，无法发送: code={text}")
+            if result.quota_consumed:
+                from services.permission import refund_user_quota
+                await refund_user_quota(user.id, is_external=False)
             await safe_reply_text(update.message, "文件记录异常，请联系管理员")
             return
         msg_ids = [primary_mid]
@@ -755,12 +766,14 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _dispatch_to_dsp(user.id, text, storage_channel, msg_ids, batch_file_meta_str, protect_content)
     except Exception as e:
         logger.error(f"[Idx][handle_code] jobs 失败 (user={user.id}, code={text}): {e}")
+        # 投递失败,回滚预扣配额
+        if result.quota_consumed:
+            from services.permission import refund_user_quota
+            await refund_user_quota(user.id, is_external=False)
         await safe_reply_text(update.message, "系统繁忙，文件发送请求失败，请稍后重试")
         return
 
-    # 投递成功后才递增配额（避免投递失败时配额已扣）
-    from services.permission import increment_user_quota_used
-    await increment_user_quota_used(user.id, is_external=False)
+    # 配额已在 check_decode_permission 中预扣(原子条件递增),投递成功无需再递增
 
     await safe_reply_text(
         update.message,
@@ -1204,14 +1217,8 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     from database.cache_store import get_code_change_buffer
     await get_code_change_buffer().insert(code, "expiry", new_expire or "NULL", user.id)
 
-    # 更新本地缓存
-    from database.cache import get_code_cache, invalidate_code_entry
-    cache_key = f"code:{code}"
-    if cache_key in get_code_cache().cache:
-        if new_expire:
-            get_code_cache().cache[cache_key]["expire_time"] = new_expire
-        else:
-            get_code_cache().cache[cache_key].pop("expire_time", None)
+    # 更新本地缓存:直接 invalidate,下次查询从 CRDB/SQLite 重新加载
+    from database.cache import invalidate_code_entry
     # J: 同步删除 SQLite 持久化缓存
     invalidate_code_entry(code)
     # E7: 失效用户码列表缓存
@@ -1334,11 +1341,9 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
     from database.cache_store import get_code_change_buffer
     await get_code_change_buffer().insert(code, "status", new_status, user.id)
 
-    # 更新本地缓存
-    from database.cache import get_code_cache, invalidate_code_entry
-    cache_key = f"code:{code}"
-    if cache_key in get_code_cache().cache:
-        get_code_cache().cache[cache_key]["status"] = new_status
+    # 更新本地缓存:直接 invalidate,下次查询会从 CRDB/SQLite 重新加载最新状态
+    # 避免直接突变 cache 私有属性破坏 QueryCache 封装(并发读可能读到半突变状态)
+    from database.cache import invalidate_code_entry
     # J: 同步删除 SQLite 持久化缓存
     invalidate_code_entry(code)
     # F1: 下架/上架时同步 local_job_queue 状态
@@ -1346,15 +1351,15 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
         try:
             from utils.shared_counters import decr_user_code_count
             decr_user_code_count(user.id, 1)
-        except Exception:
-            pass
+        except Exception as counter_err:
+            logger.debug(f"[Idx] decr_user_code_count 失败 user={user.id} code={code}: {counter_err}")
     else:
         # N-L8: 恢复上架时递增用户码计数，与下架对称
         try:
             from utils.shared_counters import incr_user_code_count
             incr_user_code_count(user.id, 1)
-        except Exception:
-            pass
+        except Exception as counter_err:
+            logger.debug(f"[Idx] incr_user_code_count 失败 user={user.id} code={code}: {counter_err}")
     # E7: 失效用户码列表缓存
     from database.cache import invalidate_user_codes
     invalidate_user_codes(user.id)
@@ -1466,11 +1471,8 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
 
     if action == "edit_note":
         await get_code_change_buffer().insert(code, "note", text, user.id)
-        # 更新缓存
-        from database.cache import get_code_cache, invalidate_code_entry
-        cache_key = f"code:{code}"
-        if cache_key in get_code_cache().cache:
-            get_code_cache().cache[cache_key]["note"] = text
+        # 更新缓存:直接 invalidate,下次查询从 CRDB/SQLite 重新加载
+        from database.cache import invalidate_code_entry
         # J: 同步删除 SQLite 持久化缓存
         invalidate_code_entry(code)
         # E7: 失效用户码列表缓存
@@ -1501,14 +1503,8 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         else:
             await get_code_change_buffer().insert(code, "expiry", "NULL", user.id)
 
-        # 更新缓存
-        from database.cache import get_code_cache, invalidate_code_entry
-        cache_key = f"code:{code}"
-        if cache_key in get_code_cache().cache:
-            if new_expire:
-                get_code_cache().cache[cache_key]["expire_time"] = new_expire
-            else:
-                get_code_cache().cache[cache_key].pop("expire_time", None)
+        # 更新缓存:直接 invalidate,下次查询从 CRDB/SQLite 重新加载
+        from database.cache import invalidate_code_entry
         # J: 同步删除 SQLite 持久化缓存
         invalidate_code_entry(code)
         # E7: 失效用户码列表缓存
@@ -1584,11 +1580,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             protect_content = file_record.get("protect_content", False)
             try:
                 await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str, protect_content)
-                # 投递成功后才递增配额
-                from services.permission import increment_user_quota_used
-                await increment_user_quota_used(user_id, is_external=True)
+                # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
                 await safe_reply_text(update.message,
-                    f"文件{code} 已缓正在发请查收。\n"
+                    f"文件 {code} 已缓存，正在发送，请查收。\n"
                     f"(系统 {system_code})"
                 )
                 metrics.decode_count += 1
@@ -1596,7 +1590,11 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                 return
             except Exception as e:
                 logger.error(f"[Idx][external] 映射调度失败 (ext={code}, sys={system_code}): {e}")
-                await safe_reply_text(update.message, "外部文件码发送失请稍后重试")
+                # 投递失败,回滚预扣配额
+                if result.quota_consumed:
+                    from services.permission import refund_user_quota
+                    await refund_user_quota(user_id, is_external=True)
+                await safe_reply_text(update.message, "外部文件码发送失败，请稍后重试")
                 return
         else:
             logger.warning(f"[Idx][external] 映射的系统码 {system_code} file_record,回退到外部查")
@@ -1622,40 +1620,71 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
     if account:
         import time as _time
         start = _time.time()
-        ok = await account.send_external_code(bot_username, code, user_id)
-        duration_ms = int((_time.time() - start) * 1000)
-        if ok:
+        ok = False
+        try:
+            ok = await account.send_external_code(bot_username, code, user_id)
+        except Exception as e:
+            logger.warning(f"[Idx][external] 中继发送异常: {e}")
+            ok = False
+        finally:
+            duration_ms = int((_time.time() - start) * 1000)
+            # 无论成功/失败/异常,都释放账号,避免池泄漏
             await relay_pool.release_account(account, duration_ms)
+        if ok:
             await _enqueue_external(bot_username, user_id, code)
-            # 投递成功后才递增配额
-            from services.permission import increment_user_quota_used
-            await increment_user_quota_used(user_id, is_external=True)
+            # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
             await safe_reply_text(update.message, f"正在查询外部文件请稍候查收。\n{remaining_info}")
             metrics.decode_count += 1
             await metrics.record_processed("idx_bot")
             return
-        else:
-            # 发送失败也释放账号，避免泄漏
-            await relay_pool.release_account(account, duration_ms)
+        # 中继返回 False（可能是账号忙/发送失败/码已映射本地缓存），
+        # 在回退直接发送前重新查询一次系统码映射（可能刚被其他中继同步完成）
+        try:
+            system_code_retry = await get_system_code_for_external(code)
+            if system_code_retry:
+                file_record_retry = await get_file_record_cached(system_code_retry)
+                if file_record_retry:
+                    storage_channel_r = file_record_retry.get("primary_channel_id") or await _get_storage_channel()
+                    batch_ids_str_r = file_record_retry.get("batch_msg_ids") or ""
+                    if not isinstance(batch_ids_str_r, str):
+                        batch_ids_str_r = str(batch_ids_str_r)
+                    msg_ids_r = [int(mid) for mid in batch_ids_str_r.split(",") if mid.strip().isdigit()]
+                    if not msg_ids_r:
+                        msg_ids_r = [file_record_retry.get("primary_channel_msg_id")]
+                    batch_file_meta_r = file_record_retry.get("batch_file_meta") or ""
+                    protect_content_r = file_record_retry.get("protect_content", False)
+                    await _dispatch_to_dsp(user_id, system_code_retry, storage_channel_r, msg_ids_r, batch_file_meta_r, protect_content_r)
+                    await safe_reply_text(update.message,
+                        f"文件 {code} 已缓存，正在发送，请查收。\n"
+                        f"(系统 {system_code_retry})"
+                    )
+                    metrics.decode_count += 1
+                    await metrics.record_processed("idx_bot")
+                    return
+        except Exception as e:
+            logger.warning(f"[Idx][external] 中继返回False后重试系统码映射失败: {e}")
+        # 中继发送失败,继续回退到直接发送;配额暂不回滚(后续路径可能成功)
 
     try:
         await safe_send_message(context.bot, chat_id=bot_username, text=code)
         await _enqueue_external(bot_username, user_id, code)
-        # 投递成功后才递增配额
-        from services.permission import increment_user_quota_used
-        await increment_user_quota_used(user_id, is_external=True)
+        # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
         await safe_reply_text(update.message, f"正在查询外部文件请稍候查收。\n{remaining_info}")
         metrics.decode_count += 1
         await metrics.record_processed("idx_bot")
     except Exception as e:
         err_msg = str(e)
         logger.warning(f"[Idx][external] 无法发送到 @{bot_username}: {err_msg}")
+        # 所有投递路径均失败,回滚预扣配额
+        if result.quota_consumed:
+            from services.permission import refund_user_quota
+            await refund_user_quota(user_id, is_external=True)
         if "chat not found" in err_msg.lower() or "nobody is using" in err_msg.lower():
             await safe_reply_text(update.message,
-                f"机器@{bot_username} 未找请检查文件码中的机器人用户名是否正确"
+                f"机器人 @{bot_username} 未找到，请检查文件码中的机器人用户名是否正确"
             )
         else:
-            await safe_reply_text(update.message, "外部码解码功能暂不可请联系管理员配置用户中继")
+            await safe_reply_text(update.message, "外部码解码功能暂不可用，请联系管理员配置用户中继")
 
 
 async def handle_external_file_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1666,10 +1695,10 @@ async def handle_external_file_response(update: Update, context: ContextTypes.DE
     if target_user_id is None:
         return
 
-    # 边缘情况:第三bot 直接Idx Bot 回复文件
-    # Telegram 不允bot 间直接交此路径实际不可用
+    # 边缘情况:第三方 bot 直接向 Idx Bot 回复文件
+    # Telegram 不允许 Bot 间直接交互,此路径实际不可用
     # 外部码解码走中继系统(真实 Telegram 账号),中继完成后再上游通知 Idx Bot
-    logger.warning(f"[Idx][ext_resp] 收到外部文件但无法处bot 间无权限),code={code}, from=@{bot_username}")
+    logger.warning(f"[Idx][ext_resp] 收到外部文件但无法处理(Bot 间无权限),code={code}, from=@{bot_username}")
 
 
 async def handle_external_media(update: Update, context: ContextTypes.DEFAULT_TYPE):

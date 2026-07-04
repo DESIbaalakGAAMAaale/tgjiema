@@ -27,13 +27,14 @@ from .conversation import _conv_start, _conv_end
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     data = query.data
 
     user = update.effective_user
     if not user or user.id != AUTHORIZED_USER_ID:
         await query.answer("⛔ 无权限", show_alert=True)
         return
+
+    await query.answer()
 
     back_kb = InlineKeyboardMarkup(BACK_BTN)
 
@@ -162,6 +163,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("interactive:"):
         context.user_data.pop("conv_state", None)
         context.user_data.pop("conv_data", None)
+        context.user_data.pop("conv_started_at", None)
         action = data[len("interactive:"):]
 
         prompts = {
