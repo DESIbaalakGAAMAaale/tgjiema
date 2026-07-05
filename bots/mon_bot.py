@@ -572,7 +572,7 @@ class MonBot:
                 # 1. 对所有 active + shadow 槽位发心跳(同时检测封禁)
                 ok_count, ban_count = await self._heartbeat_with_ban_detection(all_cells)
                 if ok_count > 0:
-                    logger.info(f"[Mon] 心跳: {ok_count} 正常, {ban_count} 封禁")
+                    logger.debug(f"[Mon] 心跳: {ok_count} 正常, {ban_count} 封禁")
                 if ban_count > 0:
                     self._invalidate_cells_cache()  # 封禁替换写了 cells,下次循环重载
                     all_cells = await self._get_cells()  # 重新加载以反映变更
@@ -580,12 +580,12 @@ class MonBot:
                 # 2. 核心写入:将 Active 槽位新文件同步到 Shadow 频道
                 copied = await self.scheduler.replicate_all_active_to_shadows(self.bot, all_cells)
                 if copied > 0:
-                    logger.info(f"[Mon] 文件同步: 复制了 {copied} 条消息到 Shadow 频道")
+                    logger.debug(f"[Mon] 文件同步: 复制了 {copied} 条消息到 Shadow 频道")
 
                 # 3. 智能替补:新频道自动补齐存量文件
                 filled = await self.scheduler.auto_fill_new_channels(self.bot, all_cells)
                 if filled > 0:
-                    logger.info(f"[Mon] 智能替补: 补齐 {filled} 条消息到新频道")
+                    logger.debug(f"[Mon] 智能替补: 补齐 {filled} 条消息到新频道")
 
                 # 4. 降级检查(使用内存中的连续失败次数,零 CRDB RU)
                 alerts, self._cell_suspicious = await self.scheduler.run_degrade_check(
@@ -625,7 +625,7 @@ class MonBot:
                         for issue in issues:
                             logger.warning(issue)
                     else:
-                        logger.info("[Mon] 拓扑校验: 健康")
+                        logger.debug("[Mon] 拓扑校验: 健康")
                     # 清理字典中已不存在的 slot_id,防止槽位删除/重命名后内存泄漏
                     valid_slots = {c["slot_id"] for c in all_cells}
                     # _notify_cooldowns 的 key 是消息首行(非 slot_id),按时间清理(超过 1200s 的条目)

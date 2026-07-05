@@ -543,12 +543,25 @@ def _row_to_dict(record) -> dict:
             result[col] = bool(val)
         elif col in ("file_types", "backup_channel_msg_ids", "batch_file_meta"):
             if val is None or val == "":
-                result[col] = ""
+                # 返回正确的空类型，避免下游代码收到空字符串后 json.loads("") 失败
+                if col == "file_types":
+                    result[col] = {}
+                else:
+                    result[col] = []
+                logger.debug(f"[_row_to_dict] {col} 为空/None, 返回空{type(result[col]).__name__}")
             else:
                 try:
                     result[col] = json.loads(val)
-                except (json.JSONDecodeError, TypeError):
-                    result[col] = val
+                    logger.debug(f"[_row_to_dict] {col} JSON解析成功: type={type(result[col]).__name__}, value={result[col]!r}")
+                except (json.JSONDecodeError, TypeError) as e:
+                    # 如果已经是预期类型（如 asyncpg 直接返回了 dict/list），直接使用
+                    if col == "file_types" and isinstance(val, dict):
+                        result[col] = val
+                    elif col in ("backup_channel_msg_ids", "batch_file_meta") and isinstance(val, list):
+                        result[col] = val
+                    else:
+                        result[col] = val
+                    logger.warning(f"[_row_to_dict] {col} JSON解析失败，使用原始值: type={type(val).__name__}, value={val!r}, error={e}")
         elif col == "blocked_users":
             if val is None or val == "" or val == "null":
                 result[col] = []

@@ -285,6 +285,7 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
     file_record = None
     if is_system_code(file_code):
         file_record = await get_file_record_cached(file_code)
+        logger.debug(f"[Permission] 解码查询 file_code={file_code}: record_found={file_record is not None}, status={file_record.get('status') if file_record else 'N/A'}")
         if file_record is not None and file_record.get("status") == "active":
             # I: codes 表走 B1 缓存，避免每次解码直查 CRDB(1 RU)
             from database import get_code_entry_cached

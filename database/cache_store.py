@@ -22,6 +22,35 @@ DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
 # 单调递增版本号计数器，替代时间戳避免同一毫秒内多次变更获得相同版本号
 _cells_version_counter = int(time.time() * 1000)
 
+# ─── JSON 字段反序列化（SQLite 存储为 JSON 字符串，读取时需还原为 Python 对象）───
+_JSON_FIELDS_DICT = {"file_types"}  # 期望 dict 的字段
+_JSON_FIELDS_LIST = {"backup_channel_msg_ids", "batch_file_meta", "blocked_users"}  # 期望 list 的字段
+
+
+def _deserialize_sqlite_row(row: dict) -> dict:
+    """将 SQLite 行中的 JSON 字符串字段反序列化为 Python 对象。"""
+    for key in _JSON_FIELDS_DICT:
+        if key in row:
+            val = row[key]
+            if isinstance(val, str):
+                try:
+                    row[key] = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    row[key] = {}
+            elif val is None:
+                row[key] = {}
+    for key in _JSON_FIELDS_LIST:
+        if key in row:
+            val = row[key]
+            if isinstance(val, str):
+                try:
+                    row[key] = json.loads(val)
+                except (json.JSONDecodeError, TypeError):
+                    row[key] = []
+            elif val is None:
+                row[key] = []
+    return row
+
 
 def _next_cells_version() -> int:
     global _cells_version_counter
@@ -292,7 +321,7 @@ class CacheStore:
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
         _code_change_buffer.set_db(self._db)
-        logger.info(f"[CacheStore] 初始化完成: {DB_PATH}")
+        logger.debug(f"[CacheStore] 初始化完成: {DB_PATH}")
 
     async def dump(self, cache_entries: list[tuple[str, dict, float]]):
         """批量写入 [(key, data, timestamp), ...]"""
@@ -1578,7 +1607,7 @@ class CacheStore:
         await self._db.commit()
 
     async def get_file_record_local(self, file_code: str) -> dict | None:
-        """从 SQLite 读取 file_record（0 CRDB RU）"""
+        """从 SQLite 读取 file_record（0 CRDB RU），自动反序列化 JSON 字段。"""
         if not self._db:
             return None
         rows = await self._db.execute_fetchall(
@@ -1592,7 +1621,7 @@ class CacheStore:
         if not rows:
             return None
         r = rows[0]
-        return {
+        return _deserialize_sqlite_row({
             "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
             "primary_channel_msg_id": r[3], "file_types": r[4],
             "backup_channel_msg_ids": r[5], "batch_msg_ids": r[6],
@@ -1600,7 +1629,7 @@ class CacheStore:
             "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
             "note": r[13], "expire_time": r[14], "blocked_users": r[15],
             "create_time": r[16], "updated_at": r[17],
-        }
+        })
 
     async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True):
         """写入/更新 file_record 到 SQLite"""
@@ -1649,14 +1678,14 @@ class CacheStore:
                FROM file_records_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
-        return [{
+        return [_deserialize_sqlite_row({
             "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
             "primary_channel_msg_id": r[3], "file_types": r[4], "backup_channel_msg_ids": r[5],
             "batch_msg_ids": r[6], "batch_file_meta": r[7], "file_ids": r[8], "status": r[9],
             "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
             "note": r[13], "expire_time": r[14], "blocked_users": r[15],
             "create_time": r[16], "updated_at": r[17],
-        } for r in rows]
+        }) for r in rows]
 
     async def mark_file_record_synced(self, file_code: str):
         if not self._db:
@@ -1703,6 +1732,7 @@ class CacheStore:
         await self._db.commit()
 
     async def get_code_local(self, code: str) -> dict | None:
+        """从 SQLite 读取 code 记录（0 CRDB RU），自动反序列化 JSON 字段。"""
         if not self._db:
             return None
         rows = await self._db.execute_fetchall(
@@ -1715,12 +1745,12 @@ class CacheStore:
         if not rows:
             return None
         r = rows[0]
-        return {
+        return _deserialize_sqlite_row({
             "code": r[0], "file_record_code": r[1], "uploader_id": r[2],
             "file_types": r[3], "batch_msg_ids": r[4], "batch_file_meta": r[5],
             "primary_channel_id": r[6], "status": r[7], "created_at": r[8],
             "expire_time": r[9], "note": r[10],
-        }
+        })
 
     async def upsert_code_local(self, record: dict, mark_dirty: bool = True):
         if not self._db:
@@ -1760,12 +1790,12 @@ class CacheStore:
                FROM codes_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
-        return [{
+        return [_deserialize_sqlite_row({
             "code": r[0], "file_record_code": r[1], "uploader_id": r[2],
             "file_types": r[3], "batch_msg_ids": r[4], "batch_file_meta": r[5],
             "primary_channel_id": r[6], "status": r[7], "created_at": r[8],
             "expire_time": r[9], "note": r[10],
-        } for r in rows]
+        }) for r in rows]
 
     async def mark_code_synced(self, code: str):
         if not self._db:

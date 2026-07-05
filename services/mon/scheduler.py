@@ -383,6 +383,10 @@ class MonScheduler:
 
         # 找到 R100 槽位（全量归档用）
         r100_slot = next((c for c in all_cells if c.get("is_r100", 0) == 1 and c.get("status") == "r100"), None)
+        if r100_slot:
+            logger.debug(f"[Mon][R100] R100 槽位已找到: slot_id={r100_slot.get('slot_id')}, channel={r100_slot.get('channel_id')}")
+        else:
+            logger.warning(f"[Mon][R100] 未找到 R100 槽位，跳过归档。cells 总数={len(all_cells)}, is_r100 槽位数={len([c for c in all_cells if c.get('is_r100')])}")
 
         for _group_key, group in groups.items():
             active_slot = self._find_active_slot(group)
@@ -404,6 +408,7 @@ class MonScheduler:
                 r100_new_messages = await self._fetch_new_messages(
                     bot_instance, active_slot["channel_id"], r100_last_cursor
                 )
+                logger.debug(f"[Mon][R100] slot={slot_id} channel={active_slot['channel_id']} cursor={r100_last_cursor} 新消息={len(r100_new_messages) if r100_new_messages else 0}")
                 if r100_new_messages:
                     # N24-2: 去重——查询 message_backups 中已存在的映射，避免重启后重复 copy
                     r100_channel_id = r100_slot["channel_id"]
@@ -412,6 +417,7 @@ class MonScheduler:
                         [m.id for m in r100_new_messages]
                     )
                     deduped = [m for m in r100_new_messages if m.id not in existing_ids]
+                    logger.debug(f"[Mon][R100] slot={slot_id} 去重: 新消息={len(r100_new_messages)}, 已存在={len(existing_ids)}, 待复制={len(deduped)}")
                     if deduped:
                         copied_r100, mappings_r100 = await self._copy_messages(
                             bot_instance, active_slot["channel_id"],
@@ -419,6 +425,7 @@ class MonScheduler:
                             stop_on_failure=True,
                         )
                         total_copied += copied_r100
+                        logger.debug(f"[Mon][R100] slot={slot_id} 复制完成: copied={copied_r100}/{len(deduped)}, mappings={len(mappings_r100) if mappings_r100 else 0}")
                         if mappings_r100:
                             write_ok = await self._write_backup_mappings(
                                 active_slot["channel_id"], r100_channel_id, mappings_r100
@@ -585,6 +592,7 @@ class MonScheduler:
                 async for msg in client.iter_messages(channel_id, min_id=last_cursor, reverse=True):
                     if msg.media:
                         msgs.append(msg)
+                logger.debug(f"[Mon][fetch] Telethon 获取频道 {channel_id} 消息: cursor={last_cursor}, 新消息={len(msgs)}")
                 return msgs
         except Exception as e:
             logger.warning(f"[Mon][复制] Telethon 获取频道 {channel_id} 消息失败: {e}")
@@ -603,6 +611,7 @@ class MonScheduler:
                     if msg.message_id > last_cursor:
                         if msg.photo or msg.video or msg.document or msg.audio or msg.animation:
                             msgs.append(msg)
+            logger.debug(f"[Mon][fetch] get_updates 回退获取频道 {channel_id} 消息: total_updates={len(updates)}, matched={len(msgs)}")
         except Exception as e:
             logger.warning(f"[Mon][复制] 获取频道 {channel_id} 消息失败: {e}")
         return msgs

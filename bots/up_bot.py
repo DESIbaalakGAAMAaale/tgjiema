@@ -80,9 +80,51 @@ async def _refresh_active_slots():
     global _active_a_slots
     try:
         _active_a_slots = await get_active_cells_local()
-        logger.info(f"[Up] 刷新 Active 槽位: {len(_active_a_slots)} 个")
+        logger.debug(f"[Up] 刷新 Active 槽位: {len(_active_a_slots)} 个")
     except Exception as e:
         logger.error(f"[Up] 刷新槽位失败: {e}")
+
+
+# ─── R100 归档频道缓存 ───
+_r100_channel_id: int = 0
+_r100_channel_ts: float = 0.0
+_R100_CACHE_TTL: float = 600.0  # 缓存 600 秒
+
+
+async def _get_r100_channel() -> int:
+    """获取 R100 归档频道 ID（从 cells 表查询，缓存 600 秒）。"""
+    global _r100_channel_id, _r100_channel_ts
+    now = time.time()
+    if _r100_channel_ts > 0 and (now - _r100_channel_ts) < _R100_CACHE_TTL:
+        return _r100_channel_id
+    try:
+        from database.cache_store import get_cache_store
+        cells = await get_cache_store().get_all_cells_local()
+        _r100_channel_id = 0
+        for c in cells:
+            if c.get("is_r100") == 1 or c.get("status") == "r100":
+                _r100_channel_id = c.get("channel_id", 0)
+                break
+        _r100_channel_ts = now
+        if _r100_channel_id:
+            logger.debug(f"[Up] R100 归档频道: {_r100_channel_id}")
+        else:
+            logger.debug("[Up] 未找到 R100 归档频道，跳过 R100 归档")
+    except Exception as e:
+        logger.warning(f"[Up] 获取 R100 频道失败: {e}")
+    return _r100_channel_id
+
+
+async def _forward_to_r100(context: ContextTypes.DEFAULT_TYPE, from_chat_id: int, message_id: int):
+    """将文件转发到 R100 归档频道（fire-and-forget，不阻塞主流程）。"""
+    try:
+        r100_ch = await _get_r100_channel()
+        if not r100_ch:
+            return
+        await safe_copy_message(context.bot, r100_ch, from_chat_id, message_id)
+        logger.debug(f"[Up] R100 归档成功: msg_id={message_id} -> channel={r100_ch}")
+    except Exception as e:
+        logger.warning(f"[Up] R100 归档失败 msg_id={message_id}: {e}")
 
 
 async def _get_upload_target_channel() -> int:
@@ -269,6 +311,8 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
             forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
             batch["pinned_msg_ids"].append(forwarded.message_id)
+            # R100 归档
+            asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
         except Exception as e:
             logger.error(f"[Up] 批次上传复制文件到存储频道失败: {e}")
             await update.message.reply_text(f"❌ {file_type}接收失败,请重传")
@@ -283,6 +327,8 @@ async def _copy_one_media(context, target_ch, up, batch: dict):
         if forwarded is not None:
             batch["pinned_msg_ids"].append(forwarded.message_id)
             batch["files_meta"].append(extract_file_meta(up))
+            # R100 归档
+            asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
             return True
         return False
     except Exception as e:
@@ -399,6 +445,8 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
             all_mids.append(forwarded.message_id)
             all_meta.append(extract_file_meta(up))
+            # R100 归档
+            asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
         except Exception as e:
             logger.error(f"[Up] media group copy failed: {e}")
             failed_count += 1
@@ -461,6 +509,9 @@ async def _process_upload(
         await metrics.record_error("up_bot")
         await update.message.reply_text("文件处理失败，请稍后重试")
         return
+
+    # R100 归档：异步转发到 R100 存储频道（fire-and-forget）
+    asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
 
     # 暂存必要信息到模块级 dict（context.user_data 在 callback 间不可靠）
     _pending_upload_meta[user_id] = {
