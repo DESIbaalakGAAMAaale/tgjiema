@@ -43,6 +43,8 @@ _active_slot_index: int = 0
 _external_buffers: dict[str, dict] = {}
 _mg_lock = asyncio.Lock()  # 保护 _pending_media_groups 和 _external_buffers
 _pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
+# PRE-15: 追踪已完成的 _finalize_upload 消息 ID，防止 Telegram 重复回调覆盖成功消息
+_finalized_msg_ids: set[int] = set()
 
 async def _cleanup_pending():
     """定期清理超时未完成的 media group 和 external buffer。"""
@@ -64,6 +66,10 @@ async def _cleanup_pending():
                     if buf and buf.get("timer"):
                         buf["timer"].cancel()
                     logger.warning(f"[up_bot] 清理超时 external buffer: {k}")
+            # PRE-15: 限制 _finalized_msg_ids 大小，防止内存泄漏
+            if len(_finalized_msg_ids) > 10000:
+                _finalized_msg_ids.clear()
+                logger.debug("[up_bot] 清理 _finalized_msg_ids (超过10000条)")
         except Exception as e:
             logger.error(f"[up_bot] 清理超时缓冲区异常: {e}")
         await asyncio.sleep(60)
@@ -532,6 +538,12 @@ async def _finalize_upload(query, context, user_id: int):
     """用户选完所有选项后，写入 pending_uploads 并通知 idx_bot。
     支持三种场景: 单文件 / 媒体组 / 批次上传
     """
+    # PRE-15: 防止 Telegram 重复回调覆盖成功消息
+    msg_id = query.message.message_id
+    if msg_id in _finalized_msg_ids:
+        logger.debug(f"[Up] _finalize_upload 重复回调(消息已处理)，忽略: user={user_id}, msg_id={msg_id}")
+        return
+
     pending_batch = context.user_data.pop("_pending_batch", None)
     pending_mg = context.user_data.pop("_pending_media_group", None)
 
@@ -564,6 +576,7 @@ async def _finalize_upload(query, context, user_id: int):
                 "file_ttl_days": ttl_days,
             })
             logger.info(f"[Up] 批次写入pending_uploads: user={user_id}, {pending_batch['total_count']}个文件")
+            _finalized_msg_ids.add(msg_id)
 
         elif pending_mg:
             # ── 媒体组上传 ──
@@ -582,15 +595,18 @@ async def _finalize_upload(query, context, user_id: int):
                 "file_ttl_days": ttl_days,
             })
             logger.info(f"[Up] 媒体组写入pending_uploads: user={user_id}")
+            _finalized_msg_ids.add(msg_id)
 
         else:
             # ── 单文件上传 ──
             # 优先从模块级 dict 读取（context.user_data 在 callback 间不可靠）
-            meta = _pending_upload_meta.pop(user_id, {})
+            meta = _pending_upload_meta.get(user_id, {})
             main_channel = context.user_data.pop("_main_channel", 0) or meta.get("main_channel", 0)
             channel_msg_id = context.user_data.pop("_channel_msg_id", 0) or meta.get("channel_msg_id", 0)
             file_types = context.user_data.pop("_file_types", {}) or meta.get("file_types", {})
             file_meta = context.user_data.pop("_file_meta", {}) or meta.get("file_meta", {})
+            logger.debug(f"[Up] _finalize_upload user={user_id} meta_keys={list(meta.keys())} "
+                         f"main_channel={main_channel} channel_msg_id={channel_msg_id} file_types={file_types}")
             # file_types 丢失时从 file_meta 推断
             if not file_types and file_meta and isinstance(file_meta, dict) and "type" in file_meta:
                 file_types = {file_meta["type"]: 1}
@@ -624,6 +640,8 @@ async def _finalize_upload(query, context, user_id: int):
                 "file_ttl_days": ttl_days,
             })
             logger.info(f"[Up] 单文件写入pending_uploads: user={user_id}")
+            _finalized_msg_ids.add(msg_id)
+            _pending_upload_meta.pop(user_id, None)  # 成功后清理
 
         try:
             await get_cache_store().notify_new_upload()
