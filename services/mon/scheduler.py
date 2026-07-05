@@ -225,9 +225,9 @@ class MonScheduler:
 
             # 已确认: 执行降级
             promote_slot, cascade_slot = self._get_next_promotable(group)
+            from_status = active_slot.get("status", "?")  # 在 _degrade_group 修改前捕获
             await self._degrade_group(active_slot, promote_slot, cascade_slot, fail_streak, all_cells)
             cell_suspicious.pop(slot_id, None)  # 降级后清除疑似标记
-            from_status = active_slot.get("status", "?")
             alerts.append(
                 f"[DEGRADE] {slot_id}({from_status}→lost) "
                 f"→ {promote_slot['slot_id'] if promote_slot else 'none'}(shadow→active) "
@@ -395,55 +395,51 @@ class MonScheduler:
             slot_id = active_slot["slot_id"]
             last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
 
-            # 1. R100 全量归档（独立游标，在 shadow 之前执行，静默期也能追赶）
-            # N25-4: R100 游标追上 shadow 时跳过 fetch，减少 Telethon 调用
+            # 1. R100 全量归档（完全独立游标，不受 shadow 复制进度影响）
             if r100_slot:
                 await self._load_r100_cursors()
                 r100_cursor_key = f"{slot_id}_r100"
                 r100_last_cursor = self._r100_cursors.get(r100_cursor_key, 0)
-                if r100_last_cursor < last_cursor:
-                    r100_new_messages = await self._fetch_new_messages(
-                        bot_instance, active_slot["channel_id"], r100_last_cursor
+                # R100 独立追赶，不依赖 shadow 游标推进
+                r100_new_messages = await self._fetch_new_messages(
+                    bot_instance, active_slot["channel_id"], r100_last_cursor
+                )
+                if r100_new_messages:
+                    # N24-2: 去重——查询 message_backups 中已存在的映射，避免重启后重复 copy
+                    r100_channel_id = r100_slot["channel_id"]
+                    existing_ids = await self._get_existing_backup_ids(
+                        active_slot["channel_id"], r100_channel_id,
+                        [m.id for m in r100_new_messages]
                     )
-                    if r100_new_messages:
-                        # N24-2: 去重——查询 message_backups 中已存在的映射，避免重启后重复 copy
-                        r100_channel_id = r100_slot["channel_id"]
-                        existing_ids = await self._get_existing_backup_ids(
-                            active_slot["channel_id"], r100_channel_id,
-                            [m.id for m in r100_new_messages]
+                    deduped = [m for m in r100_new_messages if m.id not in existing_ids]
+                    if deduped:
+                        copied_r100, mappings_r100 = await self._copy_messages(
+                            bot_instance, active_slot["channel_id"],
+                            r100_channel_id, deduped,
+                            stop_on_failure=True,
                         )
-                        deduped = [m for m in r100_new_messages if m.id not in existing_ids]
-                        if deduped:
-                            copied_r100, mappings_r100 = await self._copy_messages(
-                                bot_instance, active_slot["channel_id"],
-                                r100_channel_id, deduped,
-                                stop_on_failure=True,  # 保证 mappings 连续成功,避免游标跳过失败消息导致永久丢失
+                        total_copied += copied_r100
+                        if mappings_r100:
+                            write_ok = await self._write_backup_mappings(
+                                active_slot["channel_id"], r100_channel_id, mappings_r100
                             )
-                            total_copied += copied_r100
-                            if mappings_r100:
-                                # 写入映射失败时不推进游标,下周期重试(避免故障切换时找不到映射)
-                                write_ok = await self._write_backup_mappings(
-                                    active_slot["channel_id"], r100_channel_id, mappings_r100
-                                )
-                                if write_ok:
-                                    # 致命修复:游标只能推进到成功复制的最大 id,否则复制失败的消息会被永久跳过丢失
-                                    # mappings_r100 是 (orig_id, backup_id) 元组列表
-                                    self._r100_cursors[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
-                                else:
-                                    logger.warning(
-                                        f"[Mon] R100 映射写入失败 slot={slot_id} "
-                                        f"channel={active_slot['channel_id']}→{r100_channel_id}，"
-                                        f"游标保持 {r100_last_cursor}，下周期重试"
-                                    )
+                            if write_ok:
+                                self._r100_cursors[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
                             else:
                                 logger.warning(
-                                    f"[Mon] R100 复制失败 slot={slot_id} "
+                                    f"[Mon] R100 映射写入失败 slot={slot_id} "
                                     f"channel={active_slot['channel_id']}→{r100_channel_id}，"
                                     f"游标保持 {r100_last_cursor}，下周期重试"
                                 )
                         else:
-                            # 所有消息已去重，游标直接推进
-                            self._r100_cursors[r100_cursor_key] = max(m.id for m in r100_new_messages)
+                            logger.warning(
+                                f"[Mon] R100 复制失败 slot={slot_id} "
+                                f"channel={active_slot['channel_id']}→{r100_channel_id}，"
+                                f"游标保持 {r100_last_cursor}，下周期重试"
+                            )
+                    else:
+                        # 所有消息已去重，游标直接推进
+                        self._r100_cursors[r100_cursor_key] = max(m.id for m in r100_new_messages)
 
             # 2. 复制到同组的 shadow1/shadow2
             new_messages = await self._fetch_new_messages(

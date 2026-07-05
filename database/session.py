@@ -1538,7 +1538,7 @@ async def update_user_and_invalidate(user_id: int, update: dict = None):
 
 
 async def get_file_record_cached(file_code: str) -> Optional[dict]:
-    """查询文件记录，二级缓存：内存 → SQLite 全表（0 CRDB RU）"""
+    """查询文件记录，三级缓存：内存 → SQLite 全表 → CRDB"""
     cache = get_file_record_cache()
     cache_key = f"file:{file_code}"
 
@@ -1553,6 +1553,17 @@ async def get_file_record_cached(file_code: str) -> Optional[dict]:
     record = await store.get_file_record_local(file_code)
     if record is not None:
         cache.set(cache_key, record)
+        return record
+
+    # L3: CRDB 回退（SQLite 缓存写入失败或未同步时）
+    col = get_file_records_col()
+    record = await col.find_one({"file_code": file_code})
+    if record is not None:
+        cache.set(cache_key, record)
+        try:
+            await store.upsert_file_record_local(record, mark_dirty=False)
+        except Exception:
+            pass
     return record
 
 

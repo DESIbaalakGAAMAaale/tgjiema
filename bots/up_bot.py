@@ -579,6 +579,10 @@ async def _finalize_upload(query, context, user_id: int):
             channel_msg_id = context.user_data.pop("_channel_msg_id", 0)
             file_types = context.user_data.pop("_file_types", {})
             file_meta = context.user_data.pop("_file_meta", {})
+            # file_types 丢失时从 file_meta 推断
+            if not file_types and file_meta and isinstance(file_meta, dict) and "type" in file_meta:
+                file_types = {file_meta["type"]: 1}
+                logger.info(f"[Up] file_types 从 file_meta 推断: {file_types}")
 
             # PRE-14: 校验存储频道与消息 ID 非零，避免写入无效记录导致 dsp_bot 投递失败
             if not main_channel or not channel_msg_id:
