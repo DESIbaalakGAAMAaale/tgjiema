@@ -509,6 +509,22 @@ async def _process_one_pending(app: Application, row: dict):
             file_types = {}
     if not isinstance(file_types, dict):
         file_types = {}
+    # 如果 file_types 为空（Up Bot context.user_data 丢失），从 batch_file_meta 推断
+    if not file_types:
+        batch_meta_raw = row.get("batch_file_meta", "")
+        if isinstance(batch_meta_raw, str) and batch_meta_raw:
+            try:
+                meta_list = json.loads(batch_meta_raw)
+                if isinstance(meta_list, list):
+                    for m in meta_list:
+                        if isinstance(m, dict) and "type" in m:
+                            file_types[m["type"]] = file_types.get(m["type"], 0) + 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+        elif isinstance(batch_meta_raw, list):
+            for m in batch_meta_raw:
+                if isinstance(m, dict) and "type" in m:
+                    file_types[m["type"]] = file_types.get(m["type"], 0) + 1
     batch_msg_ids_str = row.get("batch_msg_ids", "")
     batch_file_meta_str = row.get("batch_file_meta", "")
     note = row.get("note", "")

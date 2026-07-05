@@ -1624,7 +1624,7 @@ class CacheStore:
              file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
              file_ids, status, request_count, protect_content, file_ttl_days, note,
              expire_time, blocked_users, create_time, updated_at, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record.get("file_code"), record.get("uploader_id"),
              record.get("primary_channel_id"), record.get("primary_channel_msg_id"),
              _serialize(record.get("file_types")), _serialize(record.get("backup_channel_msg_ids")),
@@ -1726,6 +1726,16 @@ class CacheStore:
         if not self._db:
             return
         synced = 0 if mark_dirty else 1
+        import json as _json
+        from datetime import datetime as _dt
+        def _serialize(val):
+            if val is None:
+                return None
+            if isinstance(val, _dt):
+                return val.isoformat()
+            if isinstance(val, (list, dict)):
+                return _json.dumps(val, default=str)
+            return val
         await self._db.execute(
             """INSERT OR REPLACE INTO codes_local
             (code, file_record_code, uploader_id, file_types, batch_msg_ids,
@@ -1733,7 +1743,7 @@ class CacheStore:
              note, crdb_synced)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record.get("code"), record.get("file_record_code"), record.get("uploader_id"),
-             record.get("file_types"), record.get("batch_msg_ids"), record.get("batch_file_meta"),
+             _serialize(record.get("file_types")), record.get("batch_msg_ids"), _serialize(record.get("batch_file_meta")),
              record.get("primary_channel_id"), record.get("status", "active"),
              record.get("created_at"), record.get("expire_time"), record.get("note", ""),
              synced),
