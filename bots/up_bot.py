@@ -37,6 +37,8 @@ TOKEN = settings.UPLOAD_BOT_TOKEN
 
 _pending_media_groups: dict[str, dict] = {}
 _active_a_slots: list[dict] = []
+# 模块级存储：上传元数据，避免 context.user_data 在 callback 间丢失
+_pending_upload_meta: dict[int, dict] = {}
 _active_slot_index: int = 0
 _external_buffers: dict[str, dict] = {}
 _mg_lock = asyncio.Lock()  # 保护 _pending_media_groups 和 _external_buffers
@@ -454,7 +456,15 @@ async def _process_upload(
         await update.message.reply_text("文件处理失败，请稍后重试")
         return
 
-    # 暂存必要信息
+    # 暂存必要信息到模块级 dict（context.user_data 在 callback 间不可靠）
+    _pending_upload_meta[user_id] = {
+        "main_channel": main_channel,
+        "channel_msg_id": channel_msg_id,
+        "file_types": file_types,
+        "note": update.message.caption or "",
+        "file_meta": extract_file_meta(update),
+    }
+    # 同时存 context.user_data（兼容旧逻辑）
     context.user_data["_main_channel"] = main_channel
     context.user_data["_channel_msg_id"] = channel_msg_id
     context.user_data["_file_types"] = file_types
@@ -575,10 +585,12 @@ async def _finalize_upload(query, context, user_id: int):
 
         else:
             # ── 单文件上传 ──
-            main_channel = context.user_data.pop("_main_channel", 0)
-            channel_msg_id = context.user_data.pop("_channel_msg_id", 0)
-            file_types = context.user_data.pop("_file_types", {})
-            file_meta = context.user_data.pop("_file_meta", {})
+            # 优先从模块级 dict 读取（context.user_data 在 callback 间不可靠）
+            meta = _pending_upload_meta.pop(user_id, {})
+            main_channel = context.user_data.pop("_main_channel", 0) or meta.get("main_channel", 0)
+            channel_msg_id = context.user_data.pop("_channel_msg_id", 0) or meta.get("channel_msg_id", 0)
+            file_types = context.user_data.pop("_file_types", {}) or meta.get("file_types", {})
+            file_meta = context.user_data.pop("_file_meta", {}) or meta.get("file_meta", {})
             # file_types 丢失时从 file_meta 推断
             if not file_types and file_meta and isinstance(file_meta, dict) and "type" in file_meta:
                 file_types = {file_meta["type"]: 1}
