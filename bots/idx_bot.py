@@ -685,7 +685,7 @@ async def _process_pending_uploads(app: Application):
                         {"$set": {"processed": 1}}
                     )
                     # 认领成功才处理
-                    if result and result.get("matched_count", 0) > 0:
+                    if result and result.matched_count > 0:
                         tasks.append(asyncio.create_task(_process_one_pending(app, row)))
 
                 if tasks:
