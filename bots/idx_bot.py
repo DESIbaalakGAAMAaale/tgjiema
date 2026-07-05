@@ -379,22 +379,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + three_bot_reminder()
     )
 
-    # 补发用户启动前暂存的文件码
+    # 补发用户启动前暂存的文件码（发送成功一条才删一条，避免发送失败丢码）
     try:
         pending_codes = await store.get_pending_file_codes(user.id)
+        sent_count = 0
         for pc in pending_codes:
-            if pc["ext_code"]:
-                await safe_send_message(context.bot, chat_id=user.id,
-                    text=f"外部文件 {pc['ext_code']} 已就绪，请重新发送文件码即可查收。")
-            else:
-                note_line = f"备注：{pc['note']}" if pc["note"] else ""
-                await safe_send_message(context.bot, chat_id=user.id,
-                    text=f"文件码：{pc['file_code']}\n{note_line}\n\n"
-                         f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
-                         f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
-                         f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
-        if pending_codes:
-            logger.info(f"[Idx][start] 补发 {len(pending_codes)} 条暂存文件码给用户 {user.id}")
+            try:
+                if pc["ext_code"]:
+                    await safe_send_message(context.bot, chat_id=user.id,
+                        text=f"外部文件 {pc['ext_code']} 已就绪，请重新发送文件码即可查收。")
+                else:
+                    note_line = f"备注：{pc['note']}" if pc["note"] else ""
+                    await safe_send_message(context.bot, chat_id=user.id,
+                        text=f"文件码：{pc['file_code']}\n{note_line}\n\n"
+                             f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
+                             f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
+                             f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
+                await store.delete_pending_file_code(pc["id"])
+                sent_count += 1
+            except Exception as send_err:
+                logger.warning(f"[Idx][start] 补发文件码失败 (user={user.id}, code={pc['file_code']}): {send_err}，该码保留在暂存表中")
+                break
+        if sent_count:
+            logger.info(f"[Idx][start] 补发 {sent_count} 条暂存文件码给用户 {user.id}")
     except Exception as e:
         logger.error(f"[Idx][start] 补发暂存文件码失败 (user={user.id}): {e}")
 

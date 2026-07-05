@@ -8,7 +8,7 @@ import random
 import time
 from loguru import logger
 
-from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
+from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest, Forbidden
 
 # 按账号隔离的退避状态：key 为 bot_id，value 为退避截止时间戳
 _backoff_until: dict[int, float] = {}
@@ -76,6 +76,13 @@ async def api_call_with_backoff(coro_factory, description: str = "", bot_id: int
             # 常见于 failover/rotation 后 shadow 频道没有历史文件
             logger.warning(
                 f"[BadRequest] bot_id={bot_id} {description}: {e}"
+            )
+            raise
+
+        except Forbidden as e:
+            # 用户未 /start bot 或已 block bot，重试无意义，直接抛出
+            logger.warning(
+                f"[Forbidden] bot_id={bot_id} {description}: {e}"
             )
             raise
 

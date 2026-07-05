@@ -507,7 +507,7 @@ class CacheStore:
         await self._db.commit()
 
     async def get_pending_file_codes(self, user_id: int) -> list[dict]:
-        """取出并删除用户的所有待发文件码"""
+        """取出用户的所有待发文件码（不删除，发送成功后调 delete_pending_file_code 删除）"""
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
@@ -516,17 +516,20 @@ class CacheStore:
         )
         if not rows:
             return []
-        ids = [r[0] for r in rows]
-        placeholders = ",".join("?" * len(ids))
-        await self._db.execute(
-            f"DELETE FROM pending_file_codes WHERE id IN ({placeholders})",
-            ids,
-        )
-        await self._db.commit()
         return [
-            {"file_code": r[1], "note": r[2] or "", "ext_code": r[3] or ""}
+            {"id": r[0], "file_code": r[1], "note": r[2] or "", "ext_code": r[3] or ""}
             for r in rows
         ]
+
+    async def delete_pending_file_code(self, row_id: int):
+        """发送成功后删除单条暂存文件码"""
+        if not self._db:
+            return
+        await self._db.execute(
+            "DELETE FROM pending_file_codes WHERE id = ?",
+            (row_id,),
+        )
+        await self._db.commit()
 
     # ─── Dsp job 等待用户启动 ──────────────────────────
 
