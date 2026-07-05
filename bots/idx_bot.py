@@ -682,7 +682,7 @@ async def _process_pending_uploads(app: Application):
                     # S-2: CAS 原子认领：仅当 processed 仍为 0 时标记为 1，只有一个 worker 能成功
                     result = await pending_col.update_one(
                         {"id": pend_id, "processed": 0},
-                        {"$set": {"processed": 1, "processing_started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}}
+                        {"$set": {"processed": 1}}
                     )
                     # 认领成功才处理
                     if result and result.get("matched_count", 0) > 0:
