@@ -653,7 +653,6 @@ async def _process_pending_uploads(app: Application):
     原子语义: UPDATE ... WHERE id=$1 AND processed=0 且仅当该行未被认领过。
     """
     from database.cache_store import get_cache_store
-    from database.session import db_client
     store = get_cache_store()
 
     while True:
