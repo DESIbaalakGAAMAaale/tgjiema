@@ -106,10 +106,19 @@ async def resolve_delivery_channel(primary_channel_id: int) -> DeliveryChannel:
 
 
 async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> DeliveryChannel:
-    """环形遍历,找到第一个可用的频道。使用 cells 全量数据在内存中遍历环形链表。
+    """原频道降级(shadow2/lost)时解析可用频道。使用 cells 全量数据在内存中遍历。
 
     注意：始终从 SQLite cells_local 读取全量数据，不使用 _cell_cache 部分缓存。
     环形遍历需要完整的拓扑信息，部分缓存会导致 cell_map 缺失中间节点，遍历提前中断。
+
+    解析顺序(关键):
+    1. 优先同组 shadow1 —— 文件由 mon_bot 同组镜像(active→shadow1/shadow2),
+       同组 shadow1 一定有文件副本且 message_backups 有映射。
+    2. 同组 shadow1 不可用 → 沿环形链表找其他可用频道(跨组,可能无文件,仅作兜底)。
+    3. 都失败 → 返回原频道(fallback)。
+
+    注意:不能先走环形遍历!环形 next_active_chat_id 指向的是其他组的 active 频道,
+    文件没有跨组复制,先走环形会返回一个没有文件的频道,导致映射缺失、投递失败。
     """
     from database.cache_store import get_cache_store
     store = get_cache_store()
@@ -125,10 +134,28 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
 
     # 构建 channel_id → cell 的映射
     cell_map = {c["channel_id"]: c for c in all_cells}
+    original_cell = cell_map.get(channel_id)
 
+    # 1. 优先同组 shadow1(文件镜像于此,映射存在)
+    if original_cell:
+        slot_id = original_cell.get("slot_id", "")
+        m = re.match(r'[as](\d+)', slot_id)
+        if m:
+            group_num = m.group(1)
+            # 同组 shadow1: slot_id 形如 s{N}a,且状态为 shadow1
+            for c in all_cells:
+                if (c.get("slot_id", "") == f"s{group_num}a"
+                        and c.get("status") == "shadow1"):
+                    return DeliveryChannel(c["channel_id"], c["slot_id"], "shadow1")
+            # 同组 shadow2 也可能存有镜像(若 shadow1 已提升为 active,原 shadow2 仍是 shadow2)
+            for c in all_cells:
+                if (c.get("slot_id", "") == f"s{group_num}b"
+                        and c.get("status") in ("shadow1", "shadow2")):
+                    return DeliveryChannel(c["channel_id"], c["slot_id"], c["status"])
+
+    # 2. 同组都不可用 → 沿环形链表找其他可用频道(跨组兜底,可能无文件)
     visited = {channel_id}
     current_channel = channel_id
-
     for _ in range(max_hops):
         current_cell = cell_map.get(current_channel)
         if current_cell is None:
@@ -153,20 +180,7 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
 
         current_channel = nid
 
-    # 兜底:找同组的 shadow1,在 Python 内存中过滤
-    original_cell = cell_map.get(channel_id)
-    if original_cell:
-        slot_id = original_cell.get("slot_id", "")
-        import re
-        m = re.match(r'[as](\d+)', slot_id)
-        if m:
-            group_num = m.group(1)
-            shadows = [c for c in all_cells if c.get("slot_id", "").endswith(f"s{group_num}a") and c.get("status") == "shadow1"]
-            if shadows:
-                sc = shadows[0]
-                return DeliveryChannel(sc["channel_id"], sc["slot_id"], "shadow1")
-
-    # 最终兜底:原频道
+    # 3. 最终兜底:原频道
     return DeliveryChannel(channel_id, "unknown", "fallback")
 
 
@@ -174,42 +188,29 @@ async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, m
     """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。
 
     如果 from_channel_id 是影子频道，会先查 message_backups 映射表获取正确的 backed_msg_id。
-    映射缺失时回退到原始存储频道尝试(文件上传时存于主频道,降级不等于删除)。
+    映射缺失时返回 False（禁止回退用主频道 msg_id 盲发，避免投错文件）。
     """
     # 查询影子频道 msg_id 映射（如果存在）
     resolved_msg_id = await resolve_backup_msg_id(message_id, from_channel_id, original_channel_id)
-
-    # 影子频道映射缺失 → 回退原始存储频道(文件实际上传于此,msg_id 正确,不会投错)
     if resolved_msg_id is None:
-        if original_channel_id is not None and original_channel_id != from_channel_id:
-            logger.info(
-                f"[delivery] 影子频道无映射,回退主频道 "
-                f"(msg={message_id}, shadow={from_channel_id}, original={original_channel_id})"
-            )
-            use_channel = original_channel_id
-            use_msg_id = message_id
-        else:
-            return False
-    else:
-        use_channel = from_channel_id
-        use_msg_id = resolved_msg_id
+        return False
 
     # 频道限流:检查是否超过 15 msg/min,循环等待直到拿到配额
     while True:
-        wait = await acquire_channel_limit(use_channel)
+        wait = await acquire_channel_limit(from_channel_id)
         if wait <= 0:
             break
         await asyncio.sleep(wait)
 
     try:
-        await safe_copy_message(bot_instance, target_user_id, use_channel, use_msg_id, protect_content=protect_content, bot_id=bot_id)
+        await safe_copy_message(bot_instance, target_user_id, from_channel_id, resolved_msg_id, protect_content=protect_content, bot_id=bot_id)
         return True
     except BadRequest as e:
         # C3: 消息不存在于该频道(常见于 failover/rotation 后 target 频道无历史文件)
-        logger.warning(f"[delivery] 消息不存在 (channel={use_channel}, msg={use_msg_id}): {e}")
+        logger.warning(f"[delivery] 消息不存在 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
         return False
     except Exception as e:
-        logger.warning(f"[delivery] try_deliver 失败 (channel={use_channel}, msg={use_msg_id}): {e}")
+        logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
         return False
 
 
@@ -236,11 +237,11 @@ async def resolve_backup_msg_id(main_msg_id: int, channel_id: int, original_chan
         logger.debug(f"[delivery] 查询 message_backups 映射失败 (main_msg_id={main_msg_id}, channel={channel_id})")
         pass
 
-    # 从影子频道发送但无映射 → 返回 None，由 try_deliver 回退主频道尝试
+    # 从影子频道发送但无映射 → 返回 None，禁止盲发
     if original_channel_id is not None and channel_id != original_channel_id:
-        logger.info(
+        logger.warning(
             f"[delivery] 影子频道映射缺失 (main_msg_id={main_msg_id}, "
-            f"channel={channel_id}, original={original_channel_id})，将回退主频道"
+            f"channel={channel_id}, original={original_channel_id})，跳过该频道"
         )
         return None
     return main_msg_id
