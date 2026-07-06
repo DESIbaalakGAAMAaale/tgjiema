@@ -389,18 +389,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_send_message(context.bot, chat_id=user.id,
                         text=f"外部文件 {pc['ext_code']} 已就绪，请重新发送文件码即可查收。")
                 else:
-                    # 用 HTML parse_mode 发送,文件码里的 _ 用 &#95; 实体编码
-                    # 防止 Telegram 客户端把 _xxx_yyy_ 解析为 markdown 斜体导致复制丢失
-                    import html as _html
-                    safe_code = pc['file_code'].replace("_", "&#95;")
-                    safe_note = _html.escape(pc["note"]) if pc["note"] else ""
-                    note_line = f"\n备注：{safe_note}" if safe_note else ""
-                    await safe_send_message(context.bot, chat_id=user.id,
-                        text=f"文件码：{safe_code}{note_line}\n\n"
+                    # 补发通知也加"立即解码"按钮
+                    note_line = f"\n备注：{pc['note']}" if pc["note"] else ""
+                    msg_text = (f"文件码：{pc['file_code']}{note_line}\n\n"
                              f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
                              f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
-                             f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}",
-                        parse_mode="HTML")
+                             f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔍 立即解码", callback_data=f"decode_now|{pc['file_code']}")]
+                    ])
+                    await safe_send_message(context.bot, chat_id=user.id,
+                        text=msg_text, reply_markup=keyboard)
                 await store.delete_pending_file_code(pc["id"])
                 sent_count += 1
             except Exception as send_err:
@@ -688,19 +687,18 @@ async def _process_one_pending(app: Application, row: dict):
                 await store.add_pending_file_code(uploader_id, file_code, note, ext_code or "")
                 logger.info(f"[Idx][poll] 用户 {uploader_id} 未 /start idx，文件码 {file_code} 已暂存: {send_err}")
         else:
-            # 用 HTML parse_mode 发送,文件码里的 _ 用 &#95; 实体编码
-            # 防止 Telegram 客户端把 _xxx_yyy_ 解析为 markdown 斜体导致复制丢失
-            # 视觉上 &#95; 显示为普通下划线,格式完全不变
-            import html as _html
-            safe_code = file_code.replace("_", "&#95;")
-            safe_note = _html.escape(note) if note else ""
-            note_line = f"\n备注：{safe_note}" if safe_note else ""
-            msg_text = (f"文件码：{safe_code}{note_line}\n\n"
+            # 通知消息加"立即解码"按钮,避免用户复制文件码时下划线被 Telegram 解析丢失
+            note_line = f"\n备注：{note}" if note else ""
+            msg_text = (f"文件码：{file_code}{note_line}\n\n"
                      f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
                      f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
                      f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
+            # 按钮回调数据格式: decode_now|<file_code>
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔍 立即解码", callback_data=f"decode_now|{file_code}")]
+            ])
             try:
-                await safe_send_message(app.bot, chat_id=uploader_id, text=msg_text, parse_mode="HTML")
+                await safe_send_message(app.bot, chat_id=uploader_id, text=msg_text, reply_markup=keyboard)
                 logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
             except Exception as send_err:
                 await store.add_pending_file_code(uploader_id, file_code, note, ext_code or "")
@@ -912,6 +910,28 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── 举报回调 ───
 
 _report_debounce: dict[str, float] = {}
+
+# ─── 立即解码回调(通知消息按钮) ───
+
+async def decode_now_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """处理用户点击"立即解码"按钮,等同于手动发送文件码"""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("decode_now|"):
+        return
+
+    file_code = data.split("|", 1)[1]
+    user = update.effective_user
+    if not user:
+        return
+
+    logger.info(f"[decode_now] 用户 {user.id} 点击解码按钮, file_code={file_code}")
+    # 模拟用户发送文件码,走 handle_code 流程
+    context.user_data["_override_text"] = file_code
+    await handle_code(update, context)
+
 
 async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理用户点击举报按钮，推送消息给管理员"""
@@ -1960,6 +1980,7 @@ async def _async_main():
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("my_codes", my_codes_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(decode_now_callback, pattern=r"^decode_now\|"))
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))
     # 文件码管理回调
     app.add_handler(CallbackQueryHandler(my_code_page_callback, pattern=r"^mycode:page\|"))
