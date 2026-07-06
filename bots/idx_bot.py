@@ -589,7 +589,13 @@ async def _process_one_pending(app: Application, row: dict):
             from database.cache_store import get_cache_store
             await get_cache_store().upsert_file_record_local(record, mark_dirty=False)
         except Exception as cache_err:
-            logger.debug(f"[Idx][poll] upsert_file_record_local 失败 code={file_code}: {cache_err}")
+            logger.warning(f"[Idx][poll] upsert_file_record_local 失败 code={file_code}: {cache_err}", exc_info=True)
+            # 写失败时标记 dirty，让 sync 循环重试补齐
+            try:
+                from database.cache_store import get_cache_store
+                await get_cache_store().upsert_file_record_local(record, mark_dirty=True)
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
         try:
@@ -624,10 +630,19 @@ async def _process_one_pending(app: Application, row: dict):
             from database.cache_store import get_cache_store
             await get_cache_store().upsert_code_local(ce, mark_dirty=False)
         except Exception as cache_err:
-            logger.debug(f"[Idx][poll] upsert_code_local 失败 code={file_code}: {cache_err}")
+            logger.warning(f"[Idx][poll] upsert_code_local 失败 code={file_code}: {cache_err}", exc_info=True)
+            try:
+                from database.cache_store import get_cache_store
+                await get_cache_store().upsert_code_local(ce, mark_dirty=True)
+            except Exception:
+                pass
         # 同时写入 code_cache,后续解码查缓存即
         from database.cache import get_code_cache
         get_code_cache().set(f"code:{file_code}", ce)
+        # 清除该文件码的负缓存（防止先生成前有人查过一次，负缓存挡住后续解码）
+        from database.cache import clear_negative_file
+        clear_negative_file(file_code)
+        logger.info(f"[Idx][poll] 已清除负缓存并写入本地镜像: code={file_code}")
         # E2: 递增用户码计数
         try:
             from utils.shared_counters import incr_user_code_count
@@ -741,18 +756,18 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     raw_text = context.user_data.pop("_override_text", None) or update.message.text.strip()
-    print(f"[DEBUG handle_code] raw_text={raw_text!r}", flush=True)
+    logger.info(f"[handle_code] raw_text={raw_text!r}, repr_bytes={raw_text.encode('utf-8')!r}")
 
     # 1. 先检查消息中是否包含内部文件码（最高优先级）
     # 只要消息中出现 FILE_CODE_PREFIX，后面无论是什么，均视为内部码
     prefix = settings.FILE_CODE_PREFIX
     internal_match = re.search(r'(' + re.escape(prefix) + r'\S+)', raw_text)
-    print(f"[DEBUG handle_code] prefix={prefix!r}, internal_match={internal_match.group(1)!r if internal_match else None}", flush=True)
+    logger.info(f"[handle_code] prefix={prefix!r}, internal_match={internal_match.group(1)!r if internal_match else None}")
 
     if internal_match:
         # 内部码：优先走本地解码
         text = internal_match.group(1)
-        print(f"[DEBUG handle_code] extracted internal code={text!r}", flush=True)
+        logger.info(f"[handle_code] extracted internal code={text!r}, repr_bytes={text.encode('utf-8')!r}")
         is_external = False
     else:
         # 2. 没有内部码 → 提取 bot 用户名走第三方码

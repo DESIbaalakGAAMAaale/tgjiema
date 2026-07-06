@@ -5,18 +5,20 @@ import secrets
 import string
 import time
 
+from loguru import logger
+
 from config import settings
 
 CODE_ALPHABET = string.ascii_lowercase + string.digits
-FILE_TYPE_LABELS = {"photo": "p", "video": "v", "document": "d", "audio": "a", "animation": "g"}
+FILE_TYPE_LABELS = {"photo": "p", "video": "v", "document": "d", "audio": "a", "animation": "g", "voice": "o"}
 
 _BOT_PATTERN = re.compile(r"^[a-zA-Z0-9_]+bot", re.IGNORECASE)
 _BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
 # 内部文件码后缀格式: {12位base36}_{类型后缀}
 # 例: a1b2c3d4e5f6_3p_2v_1d
 # 前缀由 settings.FILE_CODE_PREFIX 动态校验，不在此正则中硬编码
-# 字符集 [pvdag] 对应 FILE_TYPE_LABELS 的缩写: photo/video/document/audio/animation
-_INTERNAL_CODE_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]{12}(?:_\d+[pvdag])+$")
+# 字符集 [pvdago] 对应 FILE_TYPE_LABELS 的缩写: photo/video/document/audio/animation/voice
+_INTERNAL_CODE_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]{12}(?:_\d+[pvdago])+$")
 
 
 def _generate_deterministic_id(length: int = 12) -> str:
@@ -36,17 +38,19 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_deterministic_id(12)
     type_parts = []
-    print(f"[DEBUG build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}", flush=True)
-    print(f"[DEBUG build_file_code] FILE_TYPE_LABELS={FILE_TYPE_LABELS!r}", flush=True)
+    logger.info(f"[build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}")
     for label, abbr in FILE_TYPE_LABELS.items():
         count = file_types.get(label, 0)
-        print(f"[DEBUG build_file_code] label={label!r}, abbr={abbr!r}, count={count!r}, count>0={count > 0}", flush=True)
+        logger.info(f"[build_file_code] label={label!r}, abbr={abbr!r}, count={count!r}, count>0={count > 0}")
         if count > 0:
             type_parts.append(f"{count}{abbr}")
-    suffix = "_".join(type_parts) if type_parts else "0d"
-    print(f"[DEBUG build_file_code] type_parts={type_parts!r}, suffix={suffix!r}", flush=True)
+    if not type_parts:
+        logger.error(f"[build_file_code] file_types 为空或无已知类型! file_types={file_types!r}, 将使用 0d 兜底")
+        suffix = "0d"
+    else:
+        suffix = "_".join(type_parts)
     result = f"{prefix}_{random_part}_{suffix}"
-    print(f"[DEBUG build_file_code] FINAL code={result!r}", flush=True)
+    logger.info(f"[build_file_code] FINAL code={result!r}")
     return result
 
 
