@@ -34,7 +34,7 @@ from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
-from utils.flood_waiter import safe_copy_message, safe_send_message, safe_reply_text
+from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text
 from utils.file_utils import detect_file_type, extract_file_meta
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
@@ -444,21 +444,52 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         text=f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}"
     )
 
-    for i, up in enumerate(group["updates"]):
-        try:
-            forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
-            all_mids.append(forwarded.message_id)
-            all_meta.append(extract_file_meta(up))
-            # R100 归档
-            asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
-        except Exception as e:
-            logger.error(f"[Up] media group copy failed: {e}")
-            failed_count += 1
-        if (i + 1) % 3 == 0 or i == total_count - 1:
+    # 用 copy_messages 一次性批量复制整个媒体组,保留 media_group_id 关系,
+    # 这样存储频道里的消息仍是同一媒体组,dsp 用 copyMessages 复制时才能以相册展示。
+    # 失败则回退逐条 copy_message(保证可用性优先)。
+    updates = group["updates"]
+    src_chat_id = updates[0].effective_chat.id
+    src_msg_ids = [up.message.message_id for up in updates]
+
+    try:
+        await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}")
+    except Exception:
+        pass
+
+    batch_success = False
+    try:
+        copied = await safe_copy_messages(context.bot, target_ch, src_chat_id, src_msg_ids)
+        if copied and len(copied) == total_count:
+            # copy_messages 返回 MessageId 列表,顺序与输入一致
+            all_mids = [m.message_id for m in copied]
+            all_meta = [extract_file_meta(up) for up in updates]
+            # R100 归档(逐条,因 R100 是独立归档频道)
+            for up in updates:
+                asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
+            batch_success = True
             try:
-                await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
+                await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
             except Exception:
                 pass
+    except Exception as e:
+        logger.warning(f"[Up] copy_messages 批量复制失败,回退逐条: {e}")
+
+    if not batch_success:
+        # 回退逐条 copy_message
+        for i, up in enumerate(updates):
+            try:
+                forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
+                all_mids.append(forwarded.message_id)
+                all_meta.append(extract_file_meta(up))
+                asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
+            except Exception as e:
+                logger.error(f"[Up] media group copy failed: {e}")
+                failed_count += 1
+            if (i + 1) % 3 == 0 or i == total_count - 1:
+                try:
+                    await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
+                except Exception:
+                    pass
 
     if not all_mids:
         await metrics.record_error("up_bot")
