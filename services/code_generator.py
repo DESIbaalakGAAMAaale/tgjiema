@@ -38,9 +38,18 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_deterministic_id(12)
     type_parts = []
-    logger.info(f"[build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}, keys={list(file_types.keys()) if isinstance(file_types, dict) else 'N/A'}")
+    logger.info(f"[build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}, keys={list(file_types.keys()) if isinstance(file_types, dict) else 'N/A'}, repr_bytes={str(file_types).encode('utf-8')!r}")
     for label, abbr in FILE_TYPE_LABELS.items():
-        count = file_types.get(label, 0) if isinstance(file_types, dict) else 0
+        if isinstance(file_types, dict):
+            count = file_types.get(label, 0)
+            # 详细排查 key 不匹配问题
+            for actual_key, actual_val in file_types.items():
+                if actual_key == label:
+                    count = actual_val
+                    logger.info(f"[build_file_code] EXACT key match: label={label!r}, actual_key={actual_key!r}, actual_key_bytes={actual_key.encode('utf-8')!r}, val={actual_val!r}")
+                    break
+        else:
+            count = 0
         logger.info(f"[build_file_code] label={label!r}, abbr={abbr!r}, count={count!r}, count>0={count > 0}, type(count)={type(count).__name__}")
         if count > 0:
             type_parts.append(f"{count}{abbr}")

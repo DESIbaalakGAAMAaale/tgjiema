@@ -851,6 +851,14 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_ids = [primary_mid]
 
     batch_file_meta_str = file_record.get("batch_file_meta") or ""
+    # 如果是 list（从 SQLite/CRDB 反序列化），转回 JSON 字符串
+    if isinstance(batch_file_meta_str, list):
+        import json as _json
+        batch_file_meta_str = _json.dumps(batch_file_meta_str) if batch_file_meta_str else ""
+        if isinstance(batch_file_meta_str, bytes):
+            batch_file_meta_str = batch_file_meta_str.decode()
+    elif isinstance(batch_file_meta_str, bytes):
+        batch_file_meta_str = batch_file_meta_str.decode()
     protect_content = file_record.get("protect_content", False)
 
     try:
@@ -1668,6 +1676,14 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                 msg_ids = [file_record.get("primary_channel_msg_id")]
 
             batch_file_meta_str = file_record.get("batch_file_meta") or ""
+            # 如果是 list（从 SQLite/CRDB 反序列化），转回 JSON 字符串
+            if isinstance(batch_file_meta_str, list):
+                import json as _json
+                batch_file_meta_str = _json.dumps(batch_file_meta_str) if batch_file_meta_str else ""
+                if isinstance(batch_file_meta_str, bytes):
+                    batch_file_meta_str = batch_file_meta_str.decode()
+            elif isinstance(batch_file_meta_str, bytes):
+                batch_file_meta_str = batch_file_meta_str.decode()
             protect_content = file_record.get("protect_content", False)
             try:
                 await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str, protect_content)
