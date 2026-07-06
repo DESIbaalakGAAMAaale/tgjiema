@@ -762,7 +762,8 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 只要消息中出现 FILE_CODE_PREFIX，后面无论是什么，均视为内部码
     prefix = settings.FILE_CODE_PREFIX
     internal_match = re.search(r'(' + re.escape(prefix) + r'\S+)', raw_text)
-    logger.info(f"[handle_code] prefix={prefix!r}, internal_match={internal_match.group(1)!r if internal_match else None}")
+    matched_code = internal_match.group(1) if internal_match else None
+    logger.info(f"[handle_code] prefix={prefix!r}, internal_match={matched_code!r}")
 
     if internal_match:
         # 内部码：优先走本地解码
