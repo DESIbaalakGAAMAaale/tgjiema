@@ -601,6 +601,8 @@ def _safe_str(val: Any):
         return _json_dumps(val, default=str)
     if isinstance(val, datetime):
         return val.isoformat()
+    if isinstance(val, bytes):
+        return val.decode()
     return str(val)
 
 
