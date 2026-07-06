@@ -172,31 +172,44 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
 
 async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False, bot_id: int = 1, original_channel_id: int | None = None) -> bool:
     """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。
-    
+
     如果 from_channel_id 是影子频道，会先查 message_backups 映射表获取正确的 backed_msg_id。
-    映射缺失时返回 False（禁止回退用主频道 msg_id 盲发，避免投错文件）。
+    映射缺失时回退到原始存储频道尝试(文件上传时存于主频道,降级不等于删除)。
     """
     # 查询影子频道 msg_id 映射（如果存在）
     resolved_msg_id = await resolve_backup_msg_id(message_id, from_channel_id, original_channel_id)
+
+    # 影子频道映射缺失 → 回退原始存储频道(文件实际上传于此,msg_id 正确,不会投错)
     if resolved_msg_id is None:
-        return False
-    
+        if original_channel_id is not None and original_channel_id != from_channel_id:
+            logger.info(
+                f"[delivery] 影子频道无映射,回退主频道 "
+                f"(msg={message_id}, shadow={from_channel_id}, original={original_channel_id})"
+            )
+            use_channel = original_channel_id
+            use_msg_id = message_id
+        else:
+            return False
+    else:
+        use_channel = from_channel_id
+        use_msg_id = resolved_msg_id
+
     # 频道限流:检查是否超过 15 msg/min,循环等待直到拿到配额
     while True:
-        wait = await acquire_channel_limit(from_channel_id)
+        wait = await acquire_channel_limit(use_channel)
         if wait <= 0:
             break
         await asyncio.sleep(wait)
 
     try:
-        await safe_copy_message(bot_instance, target_user_id, from_channel_id, resolved_msg_id, protect_content=protect_content, bot_id=bot_id)
+        await safe_copy_message(bot_instance, target_user_id, use_channel, use_msg_id, protect_content=protect_content, bot_id=bot_id)
         return True
     except BadRequest as e:
         # C3: 消息不存在于该频道(常见于 failover/rotation 后 target 频道无历史文件)
-        logger.warning(f"[delivery] 消息不存在 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
+        logger.warning(f"[delivery] 消息不存在 (channel={use_channel}, msg={use_msg_id}): {e}")
         return False
     except Exception as e:
-        logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
+        logger.warning(f"[delivery] try_deliver 失败 (channel={use_channel}, msg={use_msg_id}): {e}")
         return False
 
 
@@ -223,11 +236,11 @@ async def resolve_backup_msg_id(main_msg_id: int, channel_id: int, original_chan
         logger.debug(f"[delivery] 查询 message_backups 映射失败 (main_msg_id={main_msg_id}, channel={channel_id})")
         pass
 
-    # 从影子频道发送但无映射 → 返回 None，禁止盲发
+    # 从影子频道发送但无映射 → 返回 None，由 try_deliver 回退主频道尝试
     if original_channel_id is not None and channel_id != original_channel_id:
-        logger.warning(
+        logger.info(
             f"[delivery] 影子频道映射缺失 (main_msg_id={main_msg_id}, "
-            f"channel={channel_id}, original={original_channel_id})，跳过该频道"
+            f"channel={channel_id}, original={original_channel_id})，将回退主频道"
         )
         return None
     return main_msg_id
