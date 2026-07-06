@@ -36,12 +36,18 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_deterministic_id(12)
     type_parts = []
+    print(f"[DEBUG build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}", flush=True)
+    print(f"[DEBUG build_file_code] FILE_TYPE_LABELS={FILE_TYPE_LABELS!r}", flush=True)
     for label, abbr in FILE_TYPE_LABELS.items():
         count = file_types.get(label, 0)
+        print(f"[DEBUG build_file_code] label={label!r}, abbr={abbr!r}, count={count!r}, count>0={count > 0}", flush=True)
         if count > 0:
             type_parts.append(f"{count}{abbr}")
     suffix = "_".join(type_parts) if type_parts else "0d"
-    return f"{prefix}_{random_part}_{suffix}"
+    print(f"[DEBUG build_file_code] type_parts={type_parts!r}, suffix={suffix!r}", flush=True)
+    result = f"{prefix}_{random_part}_{suffix}"
+    print(f"[DEBUG build_file_code] FINAL code={result!r}", flush=True)
+    return result
 
 
 def is_valid_code_format(code: str) -> bool:

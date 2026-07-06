@@ -741,15 +741,18 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     raw_text = context.user_data.pop("_override_text", None) or update.message.text.strip()
+    print(f"[DEBUG handle_code] raw_text={raw_text!r}", flush=True)
 
     # 1. 先检查消息中是否包含内部文件码（最高优先级）
     # 只要消息中出现 FILE_CODE_PREFIX，后面无论是什么，均视为内部码
     prefix = settings.FILE_CODE_PREFIX
     internal_match = re.search(r'(' + re.escape(prefix) + r'\S+)', raw_text)
+    print(f"[DEBUG handle_code] prefix={prefix!r}, internal_match={internal_match.group(1)!r if internal_match else None}", flush=True)
 
     if internal_match:
         # 内部码：优先走本地解码
         text = internal_match.group(1)
+        print(f"[DEBUG handle_code] extracted internal code={text!r}", flush=True)
         is_external = False
     else:
         # 2. 没有内部码 → 提取 bot 用户名走第三方码
