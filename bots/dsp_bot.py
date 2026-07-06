@@ -20,7 +20,7 @@ from loguru import logger
 
 from config import settings
 from database import get_file_record_cached, get_pending_jobs_count_local
-from storage.delivery_resolver import resolve_delivery_channel, try_deliver, invalidate_cell_cache
+from storage.delivery_resolver import resolve_delivery_channel, try_deliver, try_deliver_batch, invalidate_cell_cache
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
@@ -534,38 +534,55 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     # 使用 copy_message 从存储频道复制（跨Bot file_id 不可用，必须走 copy 路径）
     if storage_msg_ids and storage_channel_id:
         page_msg_ids = storage_msg_ids[start:end]
-        success_count = 0
-        fail_details = []
-        for i, mid in enumerate(page_msg_ids):
-            try:
-                resolved = await resolve_delivery_channel(storage_channel_id)
-                if await try_deliver(bot, chat_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id):
-                    success_count += 1
-                else:
-                    fail_details.append(f"msg={mid}(channel={resolved.channel_id}/{resolved.status})")
-                    logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={resolved.channel_id}/{resolved.status}, original_channel={storage_channel_id})")
-            except Exception as e:
-                fail_details.append(f"msg={mid}(exc={type(e).__name__})")
-                logger.error(f"[Dsp] _send_page copy 异常 (msg={mid}): {e}")
-            if i < len(page_msg_ids) - 1:
-                await asyncio.sleep(0.15)
-        # 只有真正发出至少一条才记为成功,否则返回 False 触发上层重试
-        if success_count > 0:
-            logger.info(f"[Dsp] 分页发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({success_count}/{len(page_msg_ids)}个文件)")
+
+        # 优先用 copy_messages 批量复制(保持媒体组相册形态),失败再回退逐条 copy_message
+        try:
+            resolved = await resolve_delivery_channel(storage_channel_id)
+            batch_ok = await try_deliver_batch(
+                bot, chat_id, resolved.channel_id, page_msg_ids,
+                protect_content=protect_content, bot_id=bot_id,
+                original_channel_id=storage_channel_id,
+            )
+        except Exception as e:
+            batch_ok = False
+            logger.warning(f"[Dsp] _send_page 批量复制异常,回退逐条: {e}")
+
+        if batch_ok:
+            logger.info(f"[Dsp] 分页发送成功(批量相册): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(page_msg_ids)}个文件)")
             metrics.send_success_count += 1
             await metrics.record_processed("dsp_bot")
         else:
-            logger.error(
-                f"[Dsp] 分页发送全部失败: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页,"
-                f"storage_channel={storage_channel_id}, msg_ids={page_msg_ids}, 失败详情={fail_details}"
-            )
-            metrics.send_fail_count += 1
-            await metrics.record_error("dsp_bot")
-            try:
-                await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
-            except Exception:
-                pass
-            return False
+            # 回退逐条 copy_message(批量失败原因:影子映射不全/BadRequest/部分消息损坏等)
+            success_count = 0
+            fail_details = []
+            for i, mid in enumerate(page_msg_ids):
+                try:
+                    if await try_deliver(bot, chat_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id):
+                        success_count += 1
+                    else:
+                        fail_details.append(f"msg={mid}(channel={resolved.channel_id}/{resolved.status})")
+                        logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={resolved.channel_id}/{resolved.status}, original_channel={storage_channel_id})")
+                except Exception as e:
+                    fail_details.append(f"msg={mid}(exc={type(e).__name__})")
+                    logger.error(f"[Dsp] _send_page copy 异常 (msg={mid}): {e}")
+                if i < len(page_msg_ids) - 1:
+                    await asyncio.sleep(0.15)
+            if success_count > 0:
+                logger.info(f"[Dsp] 分页发送成功(逐条回退): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({success_count}/{len(page_msg_ids)}个文件)")
+                metrics.send_success_count += 1
+                await metrics.record_processed("dsp_bot")
+            else:
+                logger.error(
+                    f"[Dsp] 分页发送全部失败: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页,"
+                    f"storage_channel={storage_channel_id}, msg_ids={page_msg_ids}, 失败详情={fail_details}"
+                )
+                metrics.send_fail_count += 1
+                await metrics.record_error("dsp_bot")
+                try:
+                    await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
+                except Exception:
+                    pass
+                return False
     else:
         # 旧路径：media group 方式（file_id 跨Bot 不可用，仅作兜底）
         page_items = file_meta_list[start:end]

@@ -128,6 +128,20 @@ async def safe_copy_message(bot, chat_id: int, from_chat_id: int, message_id: in
     )
 
 
+async def safe_copy_messages(bot, chat_id: int, from_chat_id: int, message_ids: list[int], bot_id: int = 0, **kwargs) -> list:
+    """安全批量复制消息（自动退避）。一次复制多条,Telegram 会保持媒体组相册形态。
+
+    Telegram Bot API: copyMessages 接收 message_ids 数组(1-100 条),返回 MessageId[]。
+    同一媒体组的消息用此方法复制,目标聊天会以相册形式展示,而非逐条独立消息。
+    """
+    _cid, _fid, _mids, _kw = chat_id, from_chat_id, message_ids, kwargs
+    return await api_call_with_backoff(
+        lambda: bot.copy_messages(chat_id=_cid, from_chat_id=_fid, message_ids=_mids, **_kw),
+        f"copy_messages({from_chat_id}→{chat_id}, {len(message_ids)} msgs)",
+        bot_id=bot_id,
+    )
+
+
 async def safe_send_message(bot, chat_id: int, text: str, bot_id: int = 0, **kwargs) -> object:
     """安全发送文本消息（自动退避）。"""
     _cid, _text, _kw = chat_id, text, kwargs

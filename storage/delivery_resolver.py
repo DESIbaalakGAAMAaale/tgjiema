@@ -247,6 +247,71 @@ async def resolve_backup_msg_id(main_msg_id: int, channel_id: int, original_chan
     return main_msg_id
 
 
+async def resolve_backup_msg_ids(main_msg_ids: list[int], channel_id: int, original_channel_id: int | None = None) -> list[int] | None:
+    """批量查询影子频道 msg_id 映射。返回解析后的 msg_id 列表,任一缺失则返回 None。
+
+    用于 copy_messages 批量复制场景:同组消息要么全部有映射(一起复制保持相册形态),
+    要么放弃批量回退逐条(部分相册无意义)。
+    """
+    if not main_msg_ids:
+        return None
+    # 原频道:msg_id 不变
+    if original_channel_id is None or channel_id == original_channel_id:
+        return list(main_msg_ids)
+    try:
+        from database.session import get_message_backups_col
+        col = get_message_backups_col()
+        results = await col.find({
+            "main_msg_id": {"$in": main_msg_ids},
+            "backup_channel_id": channel_id,
+        })
+        id_map = {r["main_msg_id"]: r.get("backed_msg_id") for r in results}
+    except Exception:
+        logger.debug(f"[delivery] 批量查询 message_backups 映射失败 (channel={channel_id})")
+        return None
+    resolved = []
+    for mid in main_msg_ids:
+        backed = id_map.get(mid)
+        if not backed:
+            logger.warning(
+                f"[delivery] 影子频道批量映射缺失 (main_msg_id={mid}, "
+                f"channel={channel_id}, original={original_channel_id})，放弃批量"
+            )
+            return None
+        resolved.append(backed)
+    logger.debug(f"[delivery] 批量映射成功: {main_msg_ids} → {resolved} (channel={channel_id})")
+    return resolved
+
+
+async def try_deliver_batch(bot_instance, target_user_id: int, from_channel_id: int, message_ids: list[int], protect_content: bool = False, bot_id: int = 1, original_channel_id: int | None = None) -> bool:
+    """批量复制多条消息(保持媒体组相册形态)。成功返回 True。
+
+    用 Telegram Bot API copyMessages 一次性复制,同媒体组的消息在目标聊天以相册展示。
+    影子频道场景需先解析批量 msg_id 映射,任一缺失则返回 False(回退逐条)。
+    """
+    from utils.flood_waiter import safe_copy_messages
+    resolved_ids = await resolve_backup_msg_ids(message_ids, from_channel_id, original_channel_id)
+    if resolved_ids is None:
+        return False
+
+    # 频道限流:批量算一次调用,但仍按频道配额等待
+    while True:
+        wait = await acquire_channel_limit(from_channel_id)
+        if wait <= 0:
+            break
+        await asyncio.sleep(wait)
+
+    try:
+        await safe_copy_messages(bot_instance, target_user_id, from_channel_id, resolved_ids, protect_content=protect_content, bot_id=bot_id)
+        return True
+    except BadRequest as e:
+        logger.warning(f"[delivery] 批量消息不存在 (channel={from_channel_id}, msgs={resolved_ids}): {e}")
+        return False
+    except Exception as e:
+        logger.warning(f"[delivery] try_deliver_batch 失败 (channel={from_channel_id}, msgs={resolved_ids}): {e}")
+        return False
+
+
 async def deliver_with_fallback(
     bot_instance,
     target_user_id: int,
