@@ -759,9 +759,9 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[handle_code] raw_text={raw_text!r}, repr_bytes={raw_text.encode('utf-8')!r}")
 
     # 1. 先检查消息中是否包含内部文件码（最高优先级）
-    # 只要消息中出现 FILE_CODE_PREFIX，后面无论是什么，均视为内部码
+    # 只要消息中出现 FILE_CODE_PREFIX，后续字符集限定为 [a-z0-9_]，避免误匹配 :：等字符
     prefix = settings.FILE_CODE_PREFIX
-    internal_match = re.search(r'(' + re.escape(prefix) + r'\S+)', raw_text)
+    internal_match = re.search(r'(' + re.escape(prefix) + r'[a-z0-9_]+)', raw_text)
     matched_code = internal_match.group(1) if internal_match else None
     logger.info(f"[handle_code] prefix={prefix!r}, internal_match={matched_code!r}")
 

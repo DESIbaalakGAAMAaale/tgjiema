@@ -38,10 +38,10 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_deterministic_id(12)
     type_parts = []
-    logger.info(f"[build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}")
+    logger.info(f"[build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}, keys={list(file_types.keys()) if isinstance(file_types, dict) else 'N/A'}")
     for label, abbr in FILE_TYPE_LABELS.items():
-        count = file_types.get(label, 0)
-        logger.info(f"[build_file_code] label={label!r}, abbr={abbr!r}, count={count!r}, count>0={count > 0}")
+        count = file_types.get(label, 0) if isinstance(file_types, dict) else 0
+        logger.info(f"[build_file_code] label={label!r}, abbr={abbr!r}, count={count!r}, count>0={count > 0}, type(count)={type(count).__name__}")
         if count > 0:
             type_parts.append(f"{count}{abbr}")
     if not type_parts:
