@@ -390,8 +390,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"外部文件 {pc['ext_code']} 已就绪，请重新发送文件码即可查收。")
                 else:
                     note_line = f"备注：{pc['note']}" if pc["note"] else ""
+                    # 文件码用反引号包裹,防止 Telegram 把 _xxx_ 解析为 markdown 斜体导致复制丢失
                     await safe_send_message(context.bot, chat_id=user.id,
-                        text=f"文件码：{pc['file_code']}\n{note_line}\n\n"
+                        text=f"文件码：`{pc['file_code']}`\n{note_line}\n\n"
                              f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
                              f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
                              f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
@@ -677,7 +678,8 @@ async def _process_one_pending(app: Application, row: dict):
             msg_text = f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。"
         else:
             note_line = f"备注：{note}" if note else ""
-            msg_text = (f"文件码：{file_code}\n"
+            # 文件码用反引号包裹,防止 Telegram 把 _xxx_ 解析为 markdown 斜体导致复制丢失
+            msg_text = (f"文件码：`{file_code}`\n"
                      f"{note_line}\n\n"
                      f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
                      f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
