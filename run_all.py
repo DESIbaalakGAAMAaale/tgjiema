@@ -18,6 +18,9 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
+from typing import Optional
+
+import asyncio
 
 from loguru import logger
 from config import settings
@@ -31,7 +34,7 @@ except ImportError:
 
 
 # 全局停止信号事件,各 Bot 的 _async_main 通过 set 它来优雅退出
-_stop_event: asyncio.Event | None = None
+_stop_event: Optional[asyncio.Event] = None
 
 
 def _register_sigterm_handler():
