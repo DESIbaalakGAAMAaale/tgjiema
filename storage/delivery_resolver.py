@@ -3,6 +3,7 @@
 如果首选频道不可达,自动降级到 Shadow1→Shadow2→下一环。
 """
 import asyncio
+import re
 import time
 from loguru import logger
 from telegram.error import BadRequest
@@ -113,22 +114,31 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
     cell_map = {c["channel_id"]: c for c in all_cells}
     original_cell = cell_map.get(channel_id)
 
-    # 1. 优先同组 shadow1(文件镜像于此,映射存在)
+    # 1. 优先同组频道(文件镜像于同组 shadow1/shadow2,映射存在)
+    # slot_id 格式: active=a{N}, shadow1=s{N}a, shadow2=s{N}b
+    # 轮转后 slot_id 不变只改 status,所以按组号查找,不按 slot_id 字面匹配
     if original_cell:
         slot_id = original_cell.get("slot_id", "")
         m = re.match(r'[as](\d+)', slot_id)
         if m:
             group_num = m.group(1)
-            # 同组 shadow1: slot_id 形如 s{N}a,且状态为 shadow1
-            for c in all_cells:
-                if (c.get("slot_id", "") == f"s{group_num}a"
-                        and c.get("status") == "shadow1"):
+            # 同组所有 cell: slot_id 中数字部分 == group_num
+            same_group = [
+                c for c in all_cells
+                if re.match(rf'[as]{group_num}[ab]?$', c.get("slot_id", ""))
+            ]
+            # 优先同组 active(可能是轮转提升的,有完整镜像)
+            for c in same_group:
+                if c.get("status") == "active" and c["channel_id"] != channel_id:
+                    return DeliveryChannel(c["channel_id"], c["slot_id"], "active")
+            # 其次同组 shadow1(有镜像)
+            for c in same_group:
+                if c.get("status") == "shadow1":
                     return DeliveryChannel(c["channel_id"], c["slot_id"], "shadow1")
-            # 同组 shadow2 也可能存有镜像(若 shadow1 已提升为 active,原 shadow2 仍是 shadow2)
-            for c in all_cells:
-                if (c.get("slot_id", "") == f"s{group_num}b"
-                        and c.get("status") in ("shadow1", "shadow2")):
-                    return DeliveryChannel(c["channel_id"], c["slot_id"], c["status"])
+            # 最后同组 shadow2(也有镜像,优先级最低)
+            for c in same_group:
+                if c.get("status") == "shadow2":
+                    return DeliveryChannel(c["channel_id"], c["slot_id"], "shadow2")
 
     # 2. 同组都不可用 → 沿环形链表找其他可用频道(跨组兜底,可能无文件)
     visited = {channel_id}

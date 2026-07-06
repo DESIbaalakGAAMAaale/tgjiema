@@ -536,6 +536,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         page_msg_ids = storage_msg_ids[start:end]
 
         # 优先用 copy_messages 批量复制(保持媒体组相册形态),失败再回退逐条 copy_message
+        resolved = None
         try:
             resolved = await resolve_delivery_channel(storage_channel_id)
             batch_ok = await try_deliver_batch(
@@ -553,15 +554,18 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             await metrics.record_processed("dsp_bot")
         else:
             # 回退逐条 copy_message(批量失败原因:影子映射不全/BadRequest/部分消息损坏等)
+            # resolved 可能为 None(resolve_delivery_channel 异常),回退用原始 storage_channel_id
+            fallback_channel = resolved.channel_id if resolved else storage_channel_id
+            fallback_status = resolved.status if resolved else "unknown"
             success_count = 0
             fail_details = []
             for i, mid in enumerate(page_msg_ids):
                 try:
-                    if await try_deliver(bot, chat_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id):
+                    if await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id):
                         success_count += 1
                     else:
-                        fail_details.append(f"msg={mid}(channel={resolved.channel_id}/{resolved.status})")
-                        logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={resolved.channel_id}/{resolved.status}, original_channel={storage_channel_id})")
+                        fail_details.append(f"msg={mid}(channel={fallback_channel}/{fallback_status})")
+                        logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={fallback_channel}/{fallback_status}, original_channel={storage_channel_id})")
                 except Exception as e:
                     fail_details.append(f"msg={mid}(exc={type(e).__name__})")
                     logger.error(f"[Dsp] _send_page copy 异常 (msg={mid}): {e}")
