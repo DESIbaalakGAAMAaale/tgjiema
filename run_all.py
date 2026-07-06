@@ -30,21 +30,49 @@ except ImportError:
     print("[RunAll] uvloop 未安装,使用默认事件循环")
 
 
+# 全局停止信号事件,各 Bot 的 _async_main 通过 set 它来优雅退出
+_stop_event: asyncio.Event | None = None
+
+
 def _register_sigterm_handler():
-    """在子进程中注册 SIGTERM 处理函数,转为 KeyboardInterrupt 优雅关闭。
-    systemd 默认发 SIGTERM;主进程的 signal handler 不会被子进程继承。
+    """在子进程中注册信号处理函数,优雅关闭避免幽灵 polling 连接。
+
+    systemd 默认发 SIGTERM,但 service 配置可能改成 SIGINT,所以两个都注册。
+    收到信号后 set 全局 _stop_event,让 _async_main 的 stop_event.wait() 返回,
+    从而走 finally 块执行 app.updater.stop() 优雅关闭 polling。
     Windows 无 SIGTERM,使用 SIGBREAK 替代。
     """
-    try:
-        def _sigterm_handler(signum, frame):
-            raise KeyboardInterrupt
-        if platform.system() == "Windows":
-            signal.signal(signal.SIGBREAK, _sigterm_handler)
-        else:
-            signal.signal(signal.SIGTERM, _sigterm_handler)
-    except (ValueError, AttributeError, OSError):
-        # 非 主线程 或 平台不支持 时跳过,不影响启动
-        pass
+    def _signal_handler(signum, frame):
+        # 优先 set 事件,让事件循环走正常的 finally 优雅关闭路径
+        if _stop_event is not None:
+            try:
+                _stop_event.set()
+                return
+            except Exception:
+                pass
+        # 兜底:事件不可用时退回 KeyboardInterrupt
+        raise KeyboardInterrupt
+
+    signals_to_register = []
+    if platform.system() == "Windows":
+        signals_to_register.append(signal.SIGBREAK)
+        signals_to_register.append(signal.SIGINT)
+    else:
+        signals_to_register.append(signal.SIGTERM)
+        signals_to_register.append(signal.SIGINT)
+
+    for sig in signals_to_register:
+        try:
+            signal.signal(sig, _signal_handler)
+        except (ValueError, AttributeError, OSError):
+            # 非 主线程 或 平台不支持 时跳过,不影响启动
+            pass
+
+
+def _set_stop_event(event: asyncio.Event):
+    """由各 Bot 的 _async_main 调用,注册全局停止事件。"""
+    global _stop_event
+    _stop_event = event
 
 
 def run_up_bot():

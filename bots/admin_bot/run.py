@@ -105,16 +105,29 @@ async def _async_main():
     async with app:
         await app.start()
         await app.updater.start_polling()
+        # 注册全局停止事件,让信号 handler 能 set 它触发优雅关闭
+        from run_all import _set_stop_event
+        stop_event = asyncio.Event()
+        _set_stop_event(stop_event)
         try:
-            stop_event = asyncio.Event()
             await stop_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
+            logger.info("[Admin] 收到停止信号,正在优雅关闭 polling...")
             try:
-                await app.updater.stop()
-            finally:
-                await app.stop()
+                await asyncio.wait_for(app.updater.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Admin] polling 关闭超时(15s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Admin] polling 关闭异常: {e}")
+            try:
+                await asyncio.wait_for(app.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Admin] app.stop 超时(10s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Admin] app.stop 异常: {e}")
+            logger.info("[Admin] 优雅关闭完成")
 
 
 def run():

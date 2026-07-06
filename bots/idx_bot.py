@@ -2095,18 +2095,38 @@ async def _async_main():
     async with app:
         await app.start()
         await app.updater.start_polling()
+        # 注册全局停止事件,让信号 handler 能 set 它触发优雅关闭
+        from run_all import _set_stop_event
+        stop_event = asyncio.Event()
+        _set_stop_event(stop_event)
         # 等待停止信号
         try:
-            stop_event = asyncio.Event()
             await stop_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
+            logger.info("[Idx] 收到停止信号,正在优雅关闭...")
             # 关闭前同步配额到 CRDB
-            from services.permission import sync_quotas_to_crdb
-            await sync_quotas_to_crdb()
-            await app.updater.stop()
-            await app.stop()
+            try:
+                from services.permission import sync_quotas_to_crdb
+                await asyncio.wait_for(sync_quotas_to_crdb(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Idx] 配额同步超时(10s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Idx] 配额同步异常: {e}")
+            try:
+                await asyncio.wait_for(app.updater.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Idx] polling 关闭超时(15s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Idx] polling 关闭异常: {e}")
+            try:
+                await asyncio.wait_for(app.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Idx] app.stop 超时(10s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Idx] app.stop 异常: {e}")
+            logger.info("[Idx] 优雅关闭完成")
 
 
 def run():
