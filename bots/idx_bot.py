@@ -538,7 +538,12 @@ async def _process_one_pending(app: Application, row: dict):
     batch_file_meta_raw = row.get("batch_file_meta", "")
     # 如果 _row_to_dict 返回了 list，序列化为 JSON 字符串用于存储
     if isinstance(batch_file_meta_raw, list):
-        batch_file_meta_str = json.dumps(batch_file_meta_raw) if batch_file_meta_raw else ""
+        result = json.dumps(batch_file_meta_raw) if batch_file_meta_raw else ""
+        if isinstance(result, bytes):
+            result = result.decode()
+        batch_file_meta_str = result
+    elif isinstance(batch_file_meta_raw, bytes):
+        batch_file_meta_str = batch_file_meta_raw.decode()
     else:
         batch_file_meta_str = batch_file_meta_raw if batch_file_meta_raw else ""
     note = row.get("note", "")
