@@ -1896,6 +1896,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_code(update, context)
         return
 
+    # 容错: 用户复制整条文件码通知消息(含"文件码：prefix_xxx\n备注：..."等)时,
+    # 若 FILE_CODE_PREFIX 以 "bot" 结尾(如 mfilebot),会被 extract_code_and_bot_from_message
+    # 误识别为外部 bot 用户名,从而提取错误的 code。先检查消息中是否含内部文件码,
+    # 若有则直接走内部解码(handle_code 内部会用正则从全文中提取实际码)。
+    _prefix = settings.FILE_CODE_PREFIX
+    if re.search(re.escape(_prefix) + r"_[a-z0-9]{12}", text):
+        await handle_code(update, context)
+        return
+
     code, bot_username = extract_code_and_bot_from_message(text)
     if code and bot_username:
         context.user_data["_original_external_code"] = code

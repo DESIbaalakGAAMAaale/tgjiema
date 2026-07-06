@@ -118,10 +118,12 @@ def extract_code_and_bot_from_message(text: str) -> tuple[str, str]:
         return "", ""
 
     # 排除系统自己的三个 bot 用户名，避免用户转发/复制文件码消息时误识别为第三方码
+    # 同时排除文件码前缀(可能以 "bot" 结尾,如 mfilebot),否则会被误识别为外部 bot
     system_bots = {
         settings.UPLOAD_BOT_USERNAME.lower(),
         settings.DECODER_BOT_USERNAME.lower(),
         settings.SENDER_BOT_USERNAME.lower(),
+        settings.FILE_CODE_PREFIX.lower(),
     }
     external_bots = [b for b in all_bots if b.lower() not in system_bots]
     if not external_bots:
