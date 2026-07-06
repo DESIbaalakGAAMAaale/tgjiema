@@ -1564,14 +1564,23 @@ async def update_user_and_invalidate(user_id: int, update: dict = None):
 
 
 async def get_file_record_cached(file_code: str) -> Optional[dict]:
-    """查询文件记录，三级缓存：内存 → SQLite 全表 → CRDB"""
+    """查询文件记录，三级缓存：内存 → SQLite 全表 → CRDB
+
+    防止 L1 内存缓存里残留损坏记录(如启动时从 cache_backup 恢复了旧版 status=None 的记录):
+    若 L1 命中但 status 字段无效(None/空),视为缓存失效,降级重新查 SQLite/CRDB。
+    """
     cache = get_file_record_cache()
     cache_key = f"file:{file_code}"
 
     # L1: 内存缓存
     cached = cache.get(cache_key)
     if cached is not None:
-        return cached
+        # 完整性校验:status 必须是有效字符串,否则视为损坏记录降级重查
+        if cached.get("status"):
+            return cached
+        # 损坏记录,清缓存降级
+        cache.invalidate(cache_key)
+        logger.warning(f"[get_file_record_cached] L1 缓存记录 status 无效(file_code={file_code}),降级重查")
 
     # L2: SQLite 全表缓存
     from .cache_store import get_cache_store
