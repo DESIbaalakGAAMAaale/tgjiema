@@ -171,11 +171,13 @@ generate_service() {
     local detail="$3"
     local svc="${SVC_PREFIX}-${name}"
     local restart_type="always"
-    local restart_sec="5"
+    local restart_sec="10"
+    local stop_timeout="40"
     # db_backup 备份任务失败不应无限重启，等待更久再重试
     if [[ "$name" == "db_backup" ]]; then
         restart_type="on-failure"
         restart_sec="60"
+        stop_timeout="15"
     fi
 
     cat > "/etc/systemd/system/${svc}.service" << EOF
@@ -201,9 +203,11 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=${svc}
 
-# 优雅关闭
-KillSignal=SIGINT
-TimeoutStopSec=15
+# 优雅关闭:用 SIGTERM(run_all.py 同时处理 SIGTERM 和 SIGINT)
+# 给 40 秒时间让 polling 优雅关闭,避免幽灵连接导致 409 Conflict
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=${stop_timeout}
 
 # 资源限制
 LimitNOFILE=65536
