@@ -21,7 +21,10 @@ def _json_dumps(obj, **kwargs):
     """json.dumps compatible wrapper."""
     result = json.dumps(obj, **kwargs)
     if isinstance(result, bytes):
-        return result.decode()
+        decoded = result.decode()
+        print(f"[DEBUG db._json_dumps] type(in)={type(obj).__name__}, bytes→str, repr={decoded[:120]!r}", flush=True)
+        return decoded
+    print(f"[DEBUG db._json_dumps] type(in)={type(obj).__name__}, type(out)={type(result).__name__}, repr={result[:120]!r}", flush=True)
     return result
 
 DDL_VERSION = 3  # 递增此值以触发 DDL 升级
@@ -598,12 +601,20 @@ def _safe_str(val: Any):
     if isinstance(val, int):
         return val
     if isinstance(val, (list, dict)):
-        return _json_dumps(val, default=str)
+        result = _json_dumps(val, default=str)
+        print(f"[DEBUG _safe_str] list/dict → type(out)={type(result).__name__}, repr={result[:120]!r}", flush=True)
+        return result
     if isinstance(val, datetime):
         return val.isoformat()
     if isinstance(val, bytes):
+        print(f"[DEBUG _safe_str] BYTES detected! repr={val[:120]!r}", flush=True)
         return val.decode()
-    return str(val)
+    result = str(val)
+    if isinstance(val, str):
+        print(f"[DEBUG _safe_str] str pass-through, repr={result[:120]!r}", flush=True)
+    else:
+        print(f"[DEBUG _safe_str] str() on type={type(val).__name__}, repr={result[:120]!r}", flush=True)
+    return result
 
 
 def _escape_like(value: str) -> str:

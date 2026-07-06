@@ -13,8 +13,12 @@ from collections import defaultdict
 
 
 def _json_dumps(obj, **kwargs):
-    if isinstance(result := json.dumps(obj, **kwargs), bytes):
-        return result.decode()
+    result = json.dumps(obj, **kwargs)
+    if isinstance(result, bytes):
+        decoded = result.decode()
+        print(f"[DEBUG up._json_dumps] type(in)={type(obj).__name__}, type(out)={type(decoded).__name__}, repr={decoded[:120]!r}", flush=True)
+        return decoded
+    print(f"[DEBUG up._json_dumps] type(in)={type(obj).__name__}, type(out)={type(result).__name__}, repr={result[:120]!r}", flush=True)
     return result
 
 from telegram import Update
