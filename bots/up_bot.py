@@ -13,12 +13,10 @@ from collections import defaultdict
 
 
 def _json_dumps(obj, **kwargs):
+    """序列化对象为 JSON 字符串，兼容 orjson(bytes) 与标准 json(str)。"""
     result = json.dumps(obj, **kwargs)
     if isinstance(result, bytes):
-        decoded = result.decode()
-        print(f"[DEBUG up._json_dumps] type(in)={type(obj).__name__}, type(out)={type(decoded).__name__}, repr={decoded[:120]!r}", flush=True)
-        return decoded
-    print(f"[DEBUG up._json_dumps] type(in)={type(obj).__name__}, type(out)={type(result).__name__}, repr={result[:120]!r}", flush=True)
+        return result.decode()
     return result
 
 from telegram import Update
@@ -36,6 +34,7 @@ from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text
 from utils.file_utils import detect_file_type, extract_file_meta
+from utils.relay_auth import is_relay_sender_allowed
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
 
@@ -845,16 +844,8 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     文件先 copy 到存储频道，积累后由 EXTERNAL_DONE 触发批量写入 pending_uploads。
     """
     # R30-3: 校验发送者是否为受信中继账号，防止任意用户绕过上传权限/限速注入文件
-    # 白名单支持热修改：优先从 DB 读取（admin_bot /relay_whitelist 命令维护），回退到环境变量
-    from database import get_relay_whitelist
-    relay_ids = await get_relay_whitelist()
-    if relay_ids:
-        if update.effective_user.id not in relay_ids:
-            logger.warning(f"[Up][ext_relay] 拒绝非中继账号的 EXTERNAL_RELAY 请求: user={update.effective_user.id}")
-            return
-    else:
-        # 安全默认拒绝:未配置白名单时禁止所有 EXTERNAL_RELAY 文件,防止任意用户注入
-        logger.error("[Up][ext_relay] RELAY_ACCOUNT_IDS 未配置,拒绝 EXTERNAL_RELAY 请求——请在 .env 中配置或通过 /relay_whitelist add 添加中继账号白名单")
+    # C11: 统一使用 utils.relay_auth.is_relay_sender_allowed（fail-closed 语义一致）
+    if not await is_relay_sender_allowed(update.effective_user.id):
         return
 
     caption = update.message.caption or ""
@@ -933,15 +924,8 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
 async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """处理 EXTERNAL_DONE 信号:中继账号通知文件收集完毕,触发批量写入"""
     # 安全校验:仅受信中继账号可触发 flush,防止任意用户提前 flush 外部缓冲区
-    # 白名单支持热修改：优先从 DB 读取（admin_bot /relay_whitelist 命令维护），回退到环境变量
-    from database import get_relay_whitelist
-    relay_ids = await get_relay_whitelist()
-    if relay_ids:
-        if update.effective_user.id not in relay_ids:
-            logger.warning(f"[Up][ext_done] 拒绝非中继账号的 EXTERNAL_DONE 请求: user={update.effective_user.id}")
-            return
-    else:
-        logger.error("[Up][ext_done] RELAY_ACCOUNT_IDS 未配置,拒绝 EXTERNAL_DONE 请求——请通过 /relay_whitelist add 配置白名单")
+    # C11: 统一使用 utils.relay_auth.is_relay_sender_allowed（fail-closed 语义一致）
+    if not await is_relay_sender_allowed(update.effective_user.id):
         return
 
     text = update.message.text or ""

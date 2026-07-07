@@ -3,7 +3,6 @@
 """
 import asyncio
 import time
-from config import settings
 
 
 class DynamicRateLimiter:
@@ -32,11 +31,33 @@ class DynamicRateLimiter:
             threshold_high: 高负载阈值（jobs 数量 > 此值用 max_delay）
             recovery_factor: 负载下降时的恢复速度（0-1，越小恢复越慢）
         """
-        self.base_delay = base_delay if base_delay is not None else settings.RATE_LIMIT_BASE_DELAY
-        self.max_delay = max_delay if max_delay is not None else settings.RATE_LIMIT_MAX_DELAY
-        self.threshold_low = threshold_low if threshold_low is not None else settings.RATE_LIMIT_THRESHOLD_LOW
-        self.threshold_high = threshold_high if threshold_high is not None else settings.RATE_LIMIT_THRESHOLD_HIGH
-        assert self.threshold_high > self.threshold_low, "threshold_high must be greater than threshold_low"
+        # L4: 延迟读取 settings，消除 import 副作用（配置未就绪即崩溃）
+        if base_delay is not None:
+            self.base_delay = base_delay
+        else:
+            from config import settings
+            self.base_delay = settings.RATE_LIMIT_BASE_DELAY
+        if max_delay is not None:
+            self.max_delay = max_delay
+        else:
+            from config import settings
+            self.max_delay = settings.RATE_LIMIT_MAX_DELAY
+        if threshold_low is not None:
+            self.threshold_low = threshold_low
+        else:
+            from config import settings
+            self.threshold_low = settings.RATE_LIMIT_THRESHOLD_LOW
+        if threshold_high is not None:
+            self.threshold_high = threshold_high
+        else:
+            from config import settings
+            self.threshold_high = settings.RATE_LIMIT_THRESHOLD_HIGH
+        # L5: 使用显式校验替代 assert（-O 模式下 assert 失效）
+        if not self.threshold_high > self.threshold_low:
+            raise ValueError(
+                f"threshold_high ({self.threshold_high}) must be greater than "
+                f"threshold_low ({self.threshold_low})"
+            )
         self.recovery_factor = recovery_factor
 
         self._current_delay = self.base_delay
@@ -105,5 +126,18 @@ class DynamicRateLimiter:
         }
 
 
-# 全局单例
-dynamic_rate_limiter = DynamicRateLimiter()
+# L4: 延迟创建全局单例，避免模块 import 时读取 settings
+_dynamic_rate_limiter: "DynamicRateLimiter | None" = None
+
+
+def _get_dynamic_rate_limiter() -> DynamicRateLimiter:
+    global _dynamic_rate_limiter
+    if _dynamic_rate_limiter is None:
+        _dynamic_rate_limiter = DynamicRateLimiter()
+    return _dynamic_rate_limiter
+
+
+def __getattr__(name: str):
+    if name == "dynamic_rate_limiter":
+        return _get_dynamic_rate_limiter()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

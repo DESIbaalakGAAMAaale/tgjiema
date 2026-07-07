@@ -288,7 +288,7 @@ class RelayInstance:
                 )
                 return False
             await self._client.send_message(entity, code)
-            now = asyncio.get_event_loop().time()
+            now = asyncio.get_running_loop().time()
             self._bot_exchange[bot_username.lower()] = {
                 "user_id": user_id,
                 "code": code,
@@ -422,7 +422,7 @@ class RelayInstance:
         self._handlers_registered = True
         @self._client.on(events.NewMessage(incoming=True))
         async def on_new_message(event):
-            now_ts = asyncio.get_event_loop().time()
+            now_ts = asyncio.get_running_loop().time()
             expired = [k for k, v in list(self._bot_exchange.items()) if v.get("_expires", 0) < now_ts]
             for k in expired:
                 old = self._bot_exchange.pop(k, None)
@@ -545,14 +545,14 @@ class RelayInstance:
 
     async def _flush_media_group_buffer(self, media_group_id: str, bot_username: str):
         await asyncio.sleep(3)
-        now_ts = asyncio.get_event_loop().time()
+        now_ts = asyncio.get_running_loop().time()
         while True:
             buf = self._media_buffers.get(media_group_id)
             if not buf:
                 return
             if buf["_expires"] > now_ts:
                 await asyncio.sleep(0.5)
-                now_ts = asyncio.get_event_loop().time()
+                now_ts = asyncio.get_running_loop().time()
                 continue
             break
         buf = self._media_buffers.pop(media_group_id, None)
@@ -614,7 +614,7 @@ class RelayInstance:
                 if bot_username not in self._bot_exchange:
                     break
                 exchange = self._bot_exchange[bot_username]
-                exchange["_expires"] = asyncio.get_event_loop().time() + 120
+                exchange["_expires"] = asyncio.get_running_loop().time() + 120
                 version_before = exchange.get("_msg_version", 0)
                 decision = self._make_decision(exchange)
                 if bot_username not in self._bot_exchange:
@@ -649,7 +649,7 @@ class RelayInstance:
                     wait_sec = decision.get("wait_seconds", 5)
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
-                        exchange["_last_click_time"] = asyncio.get_event_loop().time() + wait_sec
+                        exchange["_last_click_time"] = asyncio.get_running_loop().time() + wait_sec
                     # 记录冷却到本地 SQLite
                     from database.relay_db import get_relay_db
                     relay_db = await get_relay_db()
@@ -661,7 +661,7 @@ class RelayInstance:
                     if exchange:
                         min_interval = exchange.get("_min_click_interval", 0)
                         last_click = exchange.get("_last_click_time", 0)
-                        now = asyncio.get_event_loop().time()
+                        now = asyncio.get_running_loop().time()
                         remaining = (last_click + min_interval) - now
                         if remaining > 0:
                             await asyncio.sleep(remaining)
@@ -679,7 +679,7 @@ class RelayInstance:
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
                         exchange.setdefault("_clicked_buttons", set()).add((row, col))
-                        exchange["_last_click_time"] = asyncio.get_event_loop().time()
+                        exchange["_last_click_time"] = asyncio.get_running_loop().time()
                         exchange["_page_count"] = exchange.get("_page_count", 0) + 1
                         logger.info(f"[RelayInstance:{self.phone}] 翻页: 第{exchange['_page_count']}次 (bot=@{bot_username})")
                     await asyncio.sleep(4)

@@ -45,6 +45,7 @@ from utils.dynamic_rate_limiter import dynamic_rate_limiter
 from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
 from utils.flood_waiter import safe_send_message, safe_reply_text
+from utils.relay_auth import is_relay_sender_allowed
 
 TOKEN = settings.DECODER_BOT_TOKEN
 
@@ -271,19 +272,12 @@ async def _flush_media_group_buffer(media_group_id: str):
 
 async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # P0-1: 校验发送者是否为受信中继账号,防止任意用户向任意 target_user_id 未授权投递文件
-    # 复用 up_bot 的外部中继白名单逻辑(fail-closed 行为一致:白名单为空时默认拒绝)
-    from database import get_relay_whitelist
-    relay_ids = await get_relay_whitelist()
+    # C11: 统一使用 utils.relay_auth.is_relay_sender_allowed（fail-closed 语义一致）
     sender_id = update.effective_user.id if update.effective_user else None
     if not sender_id:
         logger.warning("[Idx][relay_delivery] 无法识别发送者,拒绝 RELAY 请求")
         return
-    if relay_ids:
-        if sender_id not in relay_ids:
-            logger.warning(f"[Idx][relay_delivery] 拒绝非中继账号的 RELAY 请求: user={sender_id}")
-            return
-    else:
-        logger.error("[Idx][relay_delivery] RELAY_ACCOUNT_IDS 未配置,拒绝 RELAY 请求——请通过 /relay_whitelist add 配置白名单")
+    if not await is_relay_sender_allowed(sender_id):
         return
 
     text = update.message.text or ""
@@ -1858,19 +1852,12 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         return False
 
     # P0-1: 校验发送者是否为受信中继账号,防止任意用户经 RELAY_FILE 媒体未授权投递文件
-    # 复用 up_bot 的外部中继白名单逻辑(fail-closed 行为一致:白名单为空时默认拒绝)
-    from database import get_relay_whitelist
-    relay_ids = await get_relay_whitelist()
+    # C11: 统一使用 utils.relay_auth.is_relay_sender_allowed（fail-closed 语义一致）
     sender_id = update.effective_user.id if update.effective_user else None
     if not sender_id:
         logger.warning("[Idx][relay_file] 无法识别发送者,拒绝 RELAY_FILE 请求")
         return True
-    if relay_ids:
-        if sender_id not in relay_ids:
-            logger.warning(f"[Idx][relay_file] 拒绝非中继账号的 RELAY_FILE 请求: user={sender_id}")
-            return True
-    else:
-        logger.error("[Idx][relay_file] RELAY_ACCOUNT_IDS 未配置,拒绝 RELAY_FILE 请求——请通过 /relay_whitelist add 配置白名单")
+    if not await is_relay_sender_allowed(sender_id):
         return True
 
     rest = caption[len("RELAY_FILE:"):]

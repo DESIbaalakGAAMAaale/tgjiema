@@ -121,7 +121,11 @@ def extract_code_and_bot_from_message(text: str) -> tuple[str, str]:
 
     bot = extract_bot_username(text)
     if bot:
-        return text, bot
+        # B8: 仅提取第一个空白分隔的 token 作为文件码，不把含 bot 名的整条消息当码。
+        # 外部码是单个 token（以 bot 名开头，不含空格/换行），如 "ccmarkbotutheigh1231gg1f4"。
+        # 整条消息可能是 "ccmarkbotutheigh1231gg1f4  解码器ccmarkbot"，仅取首段。
+        first_token = text.split()[0] if text.split() else text
+        return first_token, bot
 
     normalized = re.sub(r'@([a-zA-Z0-9_]+bot)', r'\1', text, flags=re.IGNORECASE)
 

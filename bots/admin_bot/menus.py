@@ -4,7 +4,9 @@ from telegram.ext import ContextTypes
 from config import settings
 
 TOKEN = settings.ADMIN_BOT_TOKEN
-AUTHORIZED_USER_ID = settings.ADMIN_TELEGRAM_ID
+# B7: 确保 AUTHORIZED_USER_ID 为 int，防止 env 中 ADMIN_TELEGRAM_ID 为字符串时
+# 与 from_user.id(int) 恒不等导致装饰器失效（int != str 永远为 True → 恒拒绝合法管理员）
+AUTHORIZED_USER_ID = int(settings.ADMIN_TELEGRAM_ID) if settings.ADMIN_TELEGRAM_ID else 0
 
 MEMBERSHIP_LEVELS = {"free": "免费", "basic": "基础", "premium": "高级"}
 LEVEL_ALIAS = {

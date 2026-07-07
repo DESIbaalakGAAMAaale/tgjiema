@@ -2,8 +2,13 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
+from loguru import logger
+
 
 _STALE_THRESHOLD = 300  # 5 分钟无 ping 视为离线
+
+# 模块级通用计数器（L3：SystemMetrics.increment 的实际存储）
+_counters: dict[str, int] = {}
 
 
 @dataclass
@@ -47,11 +52,21 @@ class SystemMetrics:
             bot = self.get_bot(name)
             bot.total_processed += 1
 
-    async def increment(self, key: str):
-        """通用计数器递增（如 mon.degrade）。"""
+    async def increment(self, key: str, amount: int = 1):
+        """通用计数器递增（如 mon.degrade）。
+
+        L3: 实际自增模块级 _counters 并记录 debug 日志，
+        替代原来的空 stub 实现。
+        """
         async with self._lock:
-            if key == "mon.degrade":
-                pass  # 降级计数仅用于日志，无额外聚合
+            val = _counters.get(key, 0) + amount
+            _counters[key] = val
+            logger.debug("metric %s +%d -> %d", key, amount, val)
+
+    @staticmethod
+    def snapshot() -> dict:
+        """返回当前所有通用计数器的快照（副本）。"""
+        return dict(_counters)
 
     def get_stale_bots(self) -> list[str]:
         """返回所有超时的 bot 名称列表。"""

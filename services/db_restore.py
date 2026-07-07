@@ -169,9 +169,10 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
         logger.error(f"[{table}] 列名校验失败: {e}, 跳过此表")
         return 0
 
-    # 排除 SERIAL 自增列（decode_logs.id / relay_accounts.id），避免恢复时序列不同步
-    _serial_tables = {"decode_logs", "relay_accounts"}
-    insert_cols = [c for c in columns if not (table in _serial_tables and c == "id")]
+    # B9: 不排除 id 列 — 排除后 ON CONFLICT(id) 永不触发（id 不在 INSERT 列中），
+    # 导致重复恢复时插入重复行而非 upsert。包含 id 列以保证幂等性。
+    # 注意：CockroachDB 使用 unique_rowid() 而非传统 sequence，显式插入 id 不影响后续自增。
+    insert_cols = columns
     placeholders = [f"${i + 1}" for i in range(len(insert_cols))]
     # 构建 ON CONFLICT ... DO UPDATE SET 子句
     # N-16-4: relay_accounts.api_hash 备份中已脱敏，UPDATE 时跳过该列保留 DB 现值，
@@ -251,15 +252,18 @@ async def run_restore(table: str = None, dry_run: bool = False):
         logger.error("COCKROACHDB_URL 未配置")
         sys.exit(1)
 
-    conn = await asyncpg.connect(settings.COCKROACHDB_URL)
+    # B9: 初始化 conn = None 防止 connect 抛异常时 finally 引用未绑定变量
+    conn = None
     try:
+        conn = await asyncpg.connect(settings.COCKROACHDB_URL)
         for tbl in target_tables:
             records = tables_data[tbl]
             logger.info(f"[{tbl}] 开始恢复 {len(records)} 条记录...")
             count = await restore_table(conn, tbl, records, dry_run=dry_run)
             logger.info(f"[{tbl}] 恢复完成: {count} 条记录")
     finally:
-        await conn.close()
+        if conn is not None:
+            await conn.close()
         await r2_storage.close()
     logger.info("数据库恢复完成")
 

@@ -24,13 +24,14 @@ import asyncio
 
 from loguru import logger
 from config import settings
+from utils.logging_config import setup_logging, LOG_FORMAT
 
 try:
     import uvloop
     uvloop.install()
-    print("[RunAll] uvloop 已启用")
+    logger.info("[RunAll] uvloop 已启用")
 except ImportError:
-    print("[RunAll] uvloop 未安装,使用默认事件循环")
+    logger.info("[RunAll] uvloop 未安装,使用默认事件循环")
 
 
 # 全局停止信号事件,各 Bot 的 _async_main 通过 set 它来优雅退出
@@ -268,8 +269,12 @@ def _run_standalone(name: str):
 
 
 def main():
+    # C12: 统一结构化日志基线（移除默认 handler，添加格式化的 stderr handler）
+    setup_logging(level=settings.LOG_LEVEL)
+
     logger.add(
         "logs/tgjiema_{time}.log",
+        format=LOG_FORMAT,
         rotation="10 MB",
         retention="7 days",
         level=settings.LOG_LEVEL,
