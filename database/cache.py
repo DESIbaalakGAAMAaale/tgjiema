@@ -145,6 +145,10 @@ def get_code_cache() -> QueryCache:
 
 # ─── J 方案: code 缓存 SQLite 失效 ──────────────────────────
 
+# 持有 fire-and-forget 异步任务的强引用,防止被 GC 静默回收导致 SQLite 删除丢失(P1-10)
+_pending_tasks: set = set()
+
+
 def invalidate_code_entry(code: str):
     """失效 code 缓存（内存 + SQLite），用于 status/expiry/note 变更时。"""
     cache = _code_cache
@@ -156,7 +160,10 @@ def invalidate_code_entry(code: str):
     try:
         loop = asyncio.get_running_loop()
         if loop.is_running():
-            loop.create_task(store.delete(cache_key))
+            task = loop.create_task(store.delete(cache_key))
+            # 持有引用,任务完成后自动 discard,避免 GC 提前回收导致删除丢失
+            _pending_tasks.add(task)
+            task.add_done_callback(_pending_tasks.discard)
     except RuntimeError:
         # 无运行中的事件循环（如测试环境），跳过异步删除
         pass

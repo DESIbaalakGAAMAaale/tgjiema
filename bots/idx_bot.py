@@ -270,6 +270,22 @@ async def _flush_media_group_buffer(media_group_id: str):
 # ─── 中继处理 ───
 
 async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # P0-1: 校验发送者是否为受信中继账号,防止任意用户向任意 target_user_id 未授权投递文件
+    # 复用 up_bot 的外部中继白名单逻辑(fail-closed 行为一致:白名单为空时默认拒绝)
+    from database import get_relay_whitelist
+    relay_ids = await get_relay_whitelist()
+    sender_id = update.effective_user.id if update.effective_user else None
+    if not sender_id:
+        logger.warning("[Idx][relay_delivery] 无法识别发送者,拒绝 RELAY 请求")
+        return
+    if relay_ids:
+        if sender_id not in relay_ids:
+            logger.warning(f"[Idx][relay_delivery] 拒绝非中继账号的 RELAY 请求: user={sender_id}")
+            return
+    else:
+        logger.error("[Idx][relay_delivery] RELAY_ACCOUNT_IDS 未配置,拒绝 RELAY 请求——请通过 /relay_whitelist add 配置白名单")
+        return
+
     text = update.message.text or ""
     if not text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
         return
@@ -1840,6 +1856,22 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
     caption = (update.message.caption or "").strip()
     if not caption.startswith("RELAY_FILE:"):
         return False
+
+    # P0-1: 校验发送者是否为受信中继账号,防止任意用户经 RELAY_FILE 媒体未授权投递文件
+    # 复用 up_bot 的外部中继白名单逻辑(fail-closed 行为一致:白名单为空时默认拒绝)
+    from database import get_relay_whitelist
+    relay_ids = await get_relay_whitelist()
+    sender_id = update.effective_user.id if update.effective_user else None
+    if not sender_id:
+        logger.warning("[Idx][relay_file] 无法识别发送者,拒绝 RELAY_FILE 请求")
+        return True
+    if relay_ids:
+        if sender_id not in relay_ids:
+            logger.warning(f"[Idx][relay_file] 拒绝非中继账号的 RELAY_FILE 请求: user={sender_id}")
+            return True
+    else:
+        logger.error("[Idx][relay_file] RELAY_ACCOUNT_IDS 未配置,拒绝 RELAY_FILE 请求——请通过 /relay_whitelist add 配置白名单")
+        return True
 
     rest = caption[len("RELAY_FILE:"):]
     user_end = rest.find(":")

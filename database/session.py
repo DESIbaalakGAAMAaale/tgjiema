@@ -21,10 +21,7 @@ def _json_dumps(obj, **kwargs):
     """json.dumps compatible wrapper."""
     result = json.dumps(obj, **kwargs)
     if isinstance(result, bytes):
-        decoded = result.decode()
-        print(f"[DEBUG db._json_dumps] type(in)={type(obj).__name__}, bytes→str, repr={decoded[:120]!r}", flush=True)
-        return decoded
-    print(f"[DEBUG db._json_dumps] type(in)={type(obj).__name__}, type(out)={type(result).__name__}, repr={result[:120]!r}", flush=True)
+        return result.decode()
     return result
 
 DDL_VERSION = 3  # 递增此值以触发 DDL 升级
@@ -601,20 +598,12 @@ def _safe_str(val: Any):
     if isinstance(val, int):
         return val
     if isinstance(val, (list, dict)):
-        result = _json_dumps(val, default=str)
-        print(f"[DEBUG _safe_str] list/dict → type(out)={type(result).__name__}, repr={result[:120]!r}", flush=True)
-        return result
+        return _json_dumps(val, default=str)
     if isinstance(val, datetime):
         return val.isoformat()
     if isinstance(val, bytes):
-        print(f"[DEBUG _safe_str] BYTES detected! repr={val[:120]!r}", flush=True)
         return val.decode()
-    result = str(val)
-    if isinstance(val, str):
-        print(f"[DEBUG _safe_str] str pass-through, repr={result[:120]!r}", flush=True)
-    else:
-        print(f"[DEBUG _safe_str] str() on type={type(val).__name__}, repr={result[:120]!r}", flush=True)
-    return result
+    return str(val)
 
 
 def _escape_like(value: str) -> str:
@@ -888,11 +877,44 @@ class D1Collection:
         if "$or" in query:
             or_parts = []
             for sub_q in query["$or"]:
+                # 完整翻译每个 $or 子条件(复用单条件操作符逻辑,保持与顶层一致)
+                sub_clauses = []
                 for sk, sv in sub_q.items():
                     _validate_identifier(sk)
-                    if isinstance(sv, dict) and "$regex" in sv:
-                        or_parts.append(f"{sk} LIKE ${len(params) + 1} ESCAPE '\\'")
-                        params.append(f"%{_escape_like(_safe_str(sv['$regex']))}%")
+                    if isinstance(sv, dict):
+                        if "$gte" in sv:
+                            sub_clauses.append(f"{sk} >= ${len(params) + 1}")
+                            params.append(_safe_str(sv["$gte"]))
+                        elif "$lte" in sv:
+                            sub_clauses.append(f"{sk} <= ${len(params) + 1}")
+                            params.append(_safe_str(sv["$lte"]))
+                        elif "$gt" in sv:
+                            sub_clauses.append(f"{sk} > ${len(params) + 1}")
+                            params.append(_safe_str(sv["$gt"]))
+                        elif "$lt" in sv:
+                            sub_clauses.append(f"{sk} < ${len(params) + 1}")
+                            params.append(_safe_str(sv["$lt"]))
+                        elif "$ne" in sv:
+                            sub_clauses.append(f"{sk} != ${len(params) + 1}")
+                            params.append(_safe_str(sv["$ne"]))
+                        elif "$in" in sv:
+                            in_list = sv["$in"]
+                            if not in_list:
+                                sub_clauses.append("FALSE")
+                            else:
+                                placeholders = [f"${len(params) + j + 1}" for j in range(len(in_list))]
+                                params.extend([_safe_str(x) for x in in_list])
+                                sub_clauses.append(f"{sk} IN ({', '.join(placeholders)})")
+                        elif "$regex" in sv:
+                            sub_clauses.append(f"{sk} LIKE ${len(params) + 1} ESCAPE '\\'")
+                            params.append(f"%{_escape_like(_safe_str(sv['$regex']))}%")
+                        else:
+                            logger.warning(f"[db] $or 子条件含未支持操作符(字段={sk}),已跳过: {sv}")
+                    else:
+                        sub_clauses.append(f"{sk} = ${len(params) + 1}")
+                        params.append(_safe_str(sv))
+                if sub_clauses:
+                    or_parts.append("(" + " AND ".join(sub_clauses) + ")")
             if or_parts:
                 where_parts.append("(" + " OR ".join(or_parts) + ")")
 
@@ -949,14 +971,44 @@ class D1Collection:
         if "$or" in query:
             or_parts = []
             for sub_q in query["$or"]:
-                or_clause = []
+                # 完整翻译每个 $or 子条件(复用单条件操作符逻辑,保持与顶层一致)
+                sub_clauses = []
                 for sk, sv in sub_q.items():
                     _validate_identifier(sk)
-                    if isinstance(sv, dict) and "$regex" in sv:
-                        or_clause.append(f"{sk} LIKE ${len(params) + 1} ESCAPE '\\'")
-                        params.append(f"%{_escape_like(_safe_str(sv['$regex']))}%")
-                if or_clause:
-                    or_parts.append("(" + " OR ".join(or_clause) + ")")
+                    if isinstance(sv, dict):
+                        if "$gte" in sv:
+                            sub_clauses.append(f"{sk} >= ${len(params) + 1}")
+                            params.append(_safe_str(sv["$gte"]))
+                        elif "$lte" in sv:
+                            sub_clauses.append(f"{sk} <= ${len(params) + 1}")
+                            params.append(_safe_str(sv["$lte"]))
+                        elif "$gt" in sv:
+                            sub_clauses.append(f"{sk} > ${len(params) + 1}")
+                            params.append(_safe_str(sv["$gt"]))
+                        elif "$lt" in sv:
+                            sub_clauses.append(f"{sk} < ${len(params) + 1}")
+                            params.append(_safe_str(sv["$lt"]))
+                        elif "$ne" in sv:
+                            sub_clauses.append(f"{sk} != ${len(params) + 1}")
+                            params.append(_safe_str(sv["$ne"]))
+                        elif "$in" in sv:
+                            in_list = sv["$in"]
+                            if not in_list:
+                                sub_clauses.append("FALSE")
+                            else:
+                                placeholders = [f"${len(params) + j + 1}" for j in range(len(in_list))]
+                                params.extend([_safe_str(x) for x in in_list])
+                                sub_clauses.append(f"{sk} IN ({', '.join(placeholders)})")
+                        elif "$regex" in sv:
+                            sub_clauses.append(f"{sk} LIKE ${len(params) + 1} ESCAPE '\\'")
+                            params.append(f"%{_escape_like(_safe_str(sv['$regex']))}%")
+                        else:
+                            logger.warning(f"[db] $or 子条件含未支持操作符(字段={sk}),已跳过: {sv}")
+                    else:
+                        sub_clauses.append(f"{sk} = ${len(params) + 1}")
+                        params.append(_safe_str(sv))
+                if sub_clauses:
+                    or_parts.append("(" + " AND ".join(sub_clauses) + ")")
             if or_parts:
                 where_parts.append("(" + " OR ".join(or_parts) + ")")
 

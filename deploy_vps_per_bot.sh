@@ -149,6 +149,34 @@ fi
 success "配置文件检查完成"
 
 # ──────────────────────────────────────────────
+# 步骤 4.5：CRDB TTL 迁移（幂等，自动执行不阻断部署）
+# ──────────────────────────────────────────────
+info "执行 CRDB TTL 迁移（关闭已废弃的行级 TTL job）..."
+
+_TTL_SQL="$DEPLOY_DIR/admin/migrations/disable_crdb_ttl.sql"
+if [[ ! -f "$_TTL_SQL" ]]; then
+    warn "未找到 TTL 迁移脚本: $_TTL_SQL,跳过"
+else
+    # 从 .env 读取 COCKROACHDB_URL(兼容行内注释)
+    _DB_URL=""
+    if [[ -f "$ENV_FILE" ]]; then
+        _DB_URL=$(grep -E '^COCKROACHDB_URL=' "$ENV_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | sed 's/[[:space:]]*#.*$//' | xargs 2>/dev/null || true)
+    fi
+    if [[ -z "$_DB_URL" ]]; then
+        warn "未配置 COCKROACHDB_URL,TTL 迁移已跳过(可在配置后手动执行 cockroach sql --url \"\$COCKROACHDB_URL\" -f $_TTL_SQL)"
+    elif ! command -v cockroach &> /dev/null; then
+        warn "未找到 cockroach 命令行客户端,TTL 迁移已跳过——请手动执行:"
+        warn "    cockroach sql --url \"\$COCKROACHDB_URL\" -f $_TTL_SQL"
+    else
+        if cockroach sql --url "$_DB_URL" -f "$_TTL_SQL" >> "$DEPLOY_DIR/logs/deploy_ttl_migration.log" 2>&1; then
+            success "CRDB TTL 迁移执行成功(详见 $DEPLOY_DIR/logs/deploy_ttl_migration.log)"
+        else
+            warn "CRDB TTL 迁移执行失败(不影响部署),详见 $DEPLOY_DIR/logs/deploy_ttl_migration.log"
+        fi
+    fi
+fi
+
+# ──────────────────────────────────────────────
 # 第五步：创建 systemd 服务（7 个独立单元）
 # ──────────────────────────────────────────────
 info "第五步：创建 systemd 服务单元..."

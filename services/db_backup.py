@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from config import settings
-from database.session import _client as db_client, get_config
+from database.session import _client as db_client, get_config, _validate_identifier
 from storage.r2 import _r2 as r2_storage
 
 
@@ -32,9 +32,12 @@ _TABLE_WHERE = {
 # 备份保留份数（超出则自动清理最旧的）
 MAX_BACKUP_RETENTION = 168  # 7天 × 24小时 / 1小时间隔 ≈ 168 份
 
-# N-M9: 备份中需要脱敏的敏感字段（不改原库，仅脱敏备份 JSON）
-_SENSITIVE_FIELDS = {"r2_secret_key", "r2_access_key", "api_hash"}
-_REDACTED_VALUE = "***REDACTED***"
+# P0-3: 备份中不再脱敏敏感字段 (api_hash / r2_secret_key / r2_access_key)。
+# 备份仅存储在运维自有 R2 桶内(需可信环境),若替换为 ***REDACTED*** 占位符,
+# 会导致 db_restore 恢复后中继账号与 R2 凭证变为占位符、不可用(废库)。
+# 因此保留真实值,确保恢复后凭证可用。_SENSITIVE_FIELDS 置空即关闭脱敏。
+_SENSITIVE_FIELDS: set[str] = set()
+_REDACTED_VALUE = "***REDACTED***"  # 保留常量以便未来按需启用,当前脱敏集为空故不会被写入
 
 
 def _redact_secrets(data: dict) -> dict:
@@ -267,27 +270,40 @@ async def restore_from_backup(key: str, tables: list[str] | None = None) -> dict
         await init_db()
 
     for table_name, rows in restore_tables.items():
+        # P0-2: 表名格式白名单校验(防 SQL 注入),非法表名跳过并记录告警
+        try:
+            safe_name = _validate_identifier(table_name)
+        except ValueError as e:
+            logger.warning(f"[db_restore] 跳过非法表名: {e}")
+            result["skipped"].append(table_name)
+            continue
         if not rows:
             result["restored"][table_name] = 0
             continue
         try:
-            safe_name = table_name.replace('"', '""')
             # 使用事务保证原子性:TRUNCATE + INSERT 全部成功才 COMMIT,任一失败 ROLLBACK
             await db_client.execute("BEGIN")
             try:
                 # 清空目标表（恢复前清空，避免主键冲突）
                 await db_client.execute(f'TRUNCATE TABLE "{safe_name}" RESTART IDENTITY CASCADE')
                 # 批量插入
+                inserted = 0
                 for row in rows:
-                    cols = list(row.keys())
+                    # P0-2: 每个列名格式校验,非法列名跳过该行并记录告警(绝不拼接未校验标识符)
+                    try:
+                        cols = [_validate_identifier(c) for c in row.keys()]
+                    except ValueError as e:
+                        logger.warning(f"[db_restore] 表 {safe_name} 含非法列名,跳过该行: {e}")
+                        continue
                     placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
                     col_list = ", ".join(f'"{c}"' for c in cols)
                     params = [row[c] for c in cols]
                     sql = f'INSERT INTO "{safe_name}" ({col_list}) VALUES ({placeholders})'
                     await db_client.execute(sql, params)
+                    inserted += 1
                 await db_client.execute("COMMIT")
-                result["restored"][table_name] = len(rows)
-                logger.info(f"[db_restore] 恢复表 {table_name}: {len(rows)} 行")
+                result["restored"][table_name] = inserted
+                logger.info(f"[db_restore] 恢复表 {table_name}: {inserted} 行")
             except Exception as inner_e:
                 # ROLLBACK 失败不应吞噬原始异常,使用嵌套 try/except 保护
                 try:

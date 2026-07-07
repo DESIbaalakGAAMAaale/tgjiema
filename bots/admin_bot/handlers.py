@@ -649,8 +649,18 @@ async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await set_config("r2_secret_key", args[2])
     if len(args) >= 4:
         await set_config("r2_bucket", args[3])
+
+    # P1-13: 回显时掩码密钥,避免明文泄露到聊天记录
+    def _mask_secret(secret: str) -> str:
+        secret = secret or ""
+        if len(secret) <= 8:
+            return "****"
+        return f"{secret[:4]}****{secret[-4:]}"
+
     await update.message.reply_text(
         "✅ R2 配置已保存\n"
+        f"🔑 AccessKey: {_mask_secret(args[1])}\n"
+        f"🔒 SecretKey: {_mask_secret(args[2])}\n"
         "⚠️ 需重启服务后生效\n"
         "🔐 建议在配置完成后立即删除本聊天记录中的密钥信息。"
     )

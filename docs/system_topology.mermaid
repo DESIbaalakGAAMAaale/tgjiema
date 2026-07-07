@@ -1,0 +1,55 @@
+graph TD
+    subgraph USERS["用户 / 外部"]
+        U["Telegram 用户"]
+        EXT["外部 Bot 用户<br/>(外部文件码)"]
+    end
+
+    subgraph INGRESS["接入层"]
+        CFW["Cloudflare Worker<br/>零依赖引导 / Webhook secret 校验"]
+        ADM_WEB["FastAPI 管理后台<br/>Basic 认证 + 双重提交 CSRF + 限流"]
+    end
+
+    subgraph BOTS["Bot 进程 (python-telegram-bot)"]
+        UP["Up Bot<br/>上传 / 轮转分发"]
+        IDX["Idx Bot<br/>解码 / 文件码生成 (≈2165 行)"]
+        DSP["Dsp Bot<br/>jobs 唯一出口 / 媒体组发送"]
+        MON["Mon Bot<br/>频道健康监控 / 自动降级"]
+        ABOT["Admin Bot<br/>Telegram 内联管理"]
+    end
+
+    subgraph DATA["数据层"]
+        CRDB[("CockroachDB<br/>主库 asyncpg<br/>D1Collection 翻译层")]
+        SQLCACHE[("SQLite 缓存<br/>跨进程通知 / 心跳 / kv")]
+        RELAYPOOL[("SQLite 中继池<br/>api_id / api_hash / phone")]
+    end
+
+    subgraph STORE["存储层"]
+        RING["环形 cells<br/>Active / Shadow 存储频道"]
+        R2[("Cloudflare R2<br/>DB 备份 (默认关闭)")]
+    end
+
+    U -->|发文件| UP
+    U -->|发文件码| IDX
+    EXT -->|外部码 / 中继投递| IDX
+    CFW -->|引导 / webhook| UP
+    U -->|管理操作| ABOT
+    ADM_WEB -->|查询 / 变更| CRDB
+
+    UP -->|转发到 Active| RING
+    RING -->|生成文件码| IDX
+    IDX -->|写 jobs| CRDB
+    IDX -->|解码校验 配额/限速/force-join| CRDB
+    RELAYPOOL -->|中继账号| IDX
+
+    DSP -->|轮询 jobs (唯一出口)| CRDB
+    DSP -->|从 cells 取频道发送| RING
+
+    MON -->|监控 / 自动降级| RING
+    MON -->|心跳| SQLCACHE
+
+    ABOT -->|管理| CRDB
+
+    CRDB -->|备份| R2
+    SQLCACHE <-.->|跨进程通知| UP
+    SQLCACHE <-.->|跨进程通知| IDX
+    SQLCACHE <-.->|跨进程通知| DSP
