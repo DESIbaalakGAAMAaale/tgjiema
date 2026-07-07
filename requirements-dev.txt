@@ -1,0 +1,17 @@
+# 批次三 P0 测试套件开发依赖（不含生产依赖，生产依赖见 requirements.txt）
+pytest>=8.0
+pytest-asyncio>=0.23
+
+# 真实传递依赖：services/mon/scheduler.py 等模块在 import 期会 import yaml，
+# 沙箱 venv 需真实安装 pyyaml 才能 import 业务模块（conftest 不会桩掉它）。
+pyyaml>=6.0
+
+# 说明：
+# - pydantic / pydantic-settings 以真实包安装在沙箱 venv 中，无需在此重复声明；
+#   若需本地安装可执行：pip install pydantic pydantic-settings
+# - 本套件通过 tests/conftest.py 在 import 业务模块前，用 sys.modules 注入桩模块
+#   （loguru / asyncpg / telethon* / telegram* / aiosqlite / database.cache_store /
+#    storage.r2 / storage.delivery_resolver / config / config.settings），
+#   屏蔽本机未安装的 python-telegram-bot / telethon / asyncpg / aiosqlite 等重型依赖，
+#   因此无需在沙箱内安装这些生产依赖即可真实跑通纯逻辑回归测试。
+# - 生产依赖仍来自 requirements.txt，请勿在本文件中修改生产依赖。

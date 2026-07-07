@@ -131,6 +131,24 @@ Web 管理后台默认监听 `127.0.0.1:8080`，提供用户、文件、日志�
 └── ADMIN_BOT.md           # 管理 Bot 操作文档
 ```
 
+## 测试（P0 回归测试套件）
+
+仓库内置基于 pytest 的回归测试套件（`tests/`），覆盖批次二/三已修复的 P0/P1 安全缺陷：中继投递白名单 fail-closed、备份恢复防 SQL 注入与保留真实密钥、日志脱敏、缓存失效持久化、强制加群 fail-closed、媒体类型词表统一、MonBot 优雅退出等。
+
+### 运行
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q
+```
+
+### 设计说明
+
+- `tests/conftest.py` 在 import 任何业务模块**之前**，通过 `sys.modules` 注入桩模块（loguru / asyncpg / telethon* / telegram* / aiosqlite / database.cache_store / storage.r2 / storage.delivery_resolver / config），屏蔽本机未安装的 python-telegram-bot / telethon / asyncpg / aiosqlite 等重型依赖，使纯逻辑回归测试可在**无外部服务**（无需 CockroachDB / R2 / Telegram API）的沙箱中真实跑通。
+- `telegram.error` 注入的是**真实异常类**（BadRequest / Forbidden / NetworkError / TimedOut 等），因为 `utils/force_join.py` 在 `except` 子句中直接使用，MagicMock 不能作为异常捕获类型。
+- `config` 注入测试桩（字段与 `config/settings.py` 对齐）。原因：项目 `config/settings.py` 使用 class-based `Config` 且 `extra = "warn"`，与当前 pydantic v2 不兼容（`extra` 仅接受 allow/forbid/ignore）；为避免改动生产源码，测试桩保持源码零修改。
+- 生产依赖仍来自 `requirements.txt`，本套件不修改它。
+
 ## 许可
 
 MIT License
