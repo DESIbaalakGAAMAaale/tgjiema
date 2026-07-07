@@ -410,3 +410,84 @@ echo ""
 echo "  错误日志:"
 echo "    journalctl -u tgjiema-* -p err -n 50 --no-pager"
 echo ""
+
+# ──────────────────────────────────────────────
+# 第九步：TLS 反代（Caddy）— 可选，仅当 caddy 已安装时自动配置
+# ──────────────────────────────────────────────
+info "第九步：TLS 反代（Caddy）配置检查..."
+
+if command -v caddy &> /dev/null; then
+    info "检测到 Caddy，正在生成 TLS 反代配置模板..."
+    CADDYFILE="/etc/caddy/Caddyfile.tgjiema"
+    cat > "$CADDYFILE" << 'CADDY_EOF'
+# ============================================================
+#  TGJiema 管理后台 — Caddy TLS 反代配置
+#  生成方式: deploy_vps_per_bot.sh 自动检测
+#  使用说明:
+#    1. 将 your-domain.com 替换为你的真实域名（DNS 需已指向本机）
+#    2. 包含此配置到 Caddyfile 或复制到 /etc/caddy/Caddyfile
+#    3. systemctl reload caddy
+#    4. 在 .env 中设置 CSRF_COOKIE_SECURE=1
+# ============================================================
+
+# --- 方法一：独立站点配置（推荐）---
+# 执行: sudo cp /etc/caddy/Caddyfile.tgjiema /etc/caddy/Caddyfile
+#       然后修改下方域名后: sudo systemctl reload caddy
+
+your-domain.com {
+    reverse_proxy localhost:8080
+
+    # 可选：IP 白名单（仅允许特定 IP 访问管理后台）
+    # @allowed remote_ip 1.2.3.4 5.6.7.8
+    # handle @allowed {
+    #     reverse_proxy localhost:8080
+    # }
+    # handle {
+    #     respond "Access Denied" 403
+    # }
+
+    # 可选：Basic Auth 作为额外安全层
+    # basicauth {
+    #     admin $2a$14$...
+    # }
+
+    # 安全头
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}
+
+# --- 方法二：作为片段引入已有 Caddyfile ---
+# 在已有的 Caddyfile 站点块中添加: reverse_proxy localhost:8080
+CADDY_EOF
+
+    chmod 644 "$CADDYFILE"
+    success "Caddy 反代模板已生成: $CADDYFILE"
+    echo ""
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}  TLS 反代配置说明:${NC}"
+    echo -e "${YELLOW}  1. 编辑 $CADDYFILE${NC}"
+    echo -e "${YELLOW}     将 your-domain.com 替换为你的真实域名${NC}"
+    echo -e "${YELLOW}  2. 复制到 Caddy 配置目录:${NC}"
+    echo -e "${YELLOW}     sudo cp $CADDYFILE /etc/caddy/Caddyfile${NC}"
+    echo -e "${YELLOW}  3. 重载 Caddy（自动申请 Let's Encrypt 证书）:${NC}"
+    echo -e "${YELLOW}     sudo systemctl reload caddy${NC}"
+    echo -e "${YELLOW}  4. 在 .env 中启用 Secure Cookie:${NC}"
+    echo -e "${YELLOW}     echo 'CSRF_COOKIE_SECURE=1' >> $DEPLOY_DIR/.env${NC}"
+    echo -e "${YELLOW}  5. 重启管理服务:${NC}"
+    echo -e "${YELLOW}     sudo systemctl restart ${SVC_PREFIX}-admin${NC}"
+    echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+else
+    info "未检测到 Caddy（跳过 TLS 反代配置）"
+    info "如需启用 HTTPS，请安装 Caddy 后重新运行此脚本，或手动执行："
+    info "  bash deploy_tls_caddy.sh"
+    echo ""
+    echo -e "${YELLOW}  ⚠ 警告：管理后台通过 HTTP 明文传输凭据，仅限可信内网使用！${NC}"
+    echo -e "${YELLOW}  生产环境强烈建议安装 Caddy 启用 HTTPS:${NC}"
+    echo -e "${YELLOW}    sudo apt install -y caddy${NC}"
+    echo -e "${YELLOW}    bash deploy_tls_caddy.sh${NC}"
+    echo ""
+fi

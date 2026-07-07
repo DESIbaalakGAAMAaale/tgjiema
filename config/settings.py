@@ -159,6 +159,7 @@ class Settings(BaseSettings):
     ADMIN_SEARCH_MAX_LENGTH: int = 50           # 搜索输入最大长度
     ADMIN_PAGE_SIZE: int = 20                   # 默认分页大小
     ADMIN_FILES_PAGE_SIZE: int = 50             # 文件列表分页大小
+    CSRF_COOKIE_SECURE: bool = False            # CSRF Cookie Secure 标志；部署 TLS 后设为 1/true
 
     # ─── 管理员 Bot 配置键名映射 ──────────────────────────
     @property

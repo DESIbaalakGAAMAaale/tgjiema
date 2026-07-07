@@ -1,5 +1,62 @@
 # 管理员机器人操作文档
 
+## TLS 要求
+
+管理后台（FastAPI）**无内置 TLS**，生产环境**强烈建议**前置 Caddy 或 Nginx 反代启用 HTTPS。
+
+### 为什么需要 TLS
+
+- 管理后台使用 HTTP Basic Auth，凭据经 HTTP 明文传输 → 可被中间人截获
+- CSRF Cookie 默认 `Secure=False`（兼容无 TLS 的本地开发），但纯 HTTP 下写操作（修改会员、封禁、删文件等）的安全性大幅降低
+- 若强行 `Secure=True` 而前端为 HTTP，浏览器会**拒绝设置 Cookie** → 所有管理后台写操作返回 `403 CSRF token 验证失败`
+
+### 启用方式
+
+#### 自动（推荐）：deploy_tls_caddy.sh
+
+部署脚本会自动检测 Caddy 是否已安装；已安装则生成模板。也可手动执行：
+
+```bash
+sudo bash deploy_tls_caddy.sh your-domain.com
+```
+
+脚本会自动：
+1. 检测 `.env` 中的 `ADMIN_WEB_HOST` / `ADMIN_WEB_PORT`
+2. 生成 Caddyfile 反代配置（`localhost:8080` → HTTPS）
+3. 自动 Let's Encrypt 证书
+4. 设置 `CSRF_COOKIE_SECURE=1`
+
+#### 手动：部署脚本内置提示
+
+`deploy_vps.sh`（第十步）和 `deploy_vps_per_bot.sh`（第九步）末尾均包含 TLS 配置检查块——当检测到 `caddy` 已安装时自动生成 `/etc/caddy/Caddyfile.tgjiema` 模板，否则给出安装提示。
+
+#### CSRF Cookie Secure 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CSRF_COOKIE_SECURE` | `false`（即 `0`） | 设为 `1` / `true` / `yes` 启用 `Secure` Cookie |
+
+```ini
+# .env
+CSRF_COOKIE_SECURE=1
+```
+
+> **本地开发**：默认关闭 Secure → HTTP `localhost` 可正常登录和操作。
+> **生产部署**：启用 TLS 后务必设 `CSRF_COOKIE_SECURE=1`。
+
+### 反代架构
+
+```
+浏览器 ──[HTTPS]──→ Caddy (:443) ──[HTTP]──→ FastAPI (:8080 / 127.0.0.1)
+                        │
+                  Let's Encrypt
+                   自动证书
+```
+
+> **⚠ 警告**：HTTP 下管理凭据明文传输，**仅限可信内网**使用。公网部署无 TLS 的管理后台存在严重安全隐患。
+
+---
+
 ## 部署配置
 
 在 `.env` 中配置以下内容：

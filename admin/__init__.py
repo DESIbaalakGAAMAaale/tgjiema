@@ -341,7 +341,7 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
         value=token,
         httponly=True,
         samesite="strict",
-        secure=True,
+        secure=settings.CSRF_COOKIE_SECURE,
         max_age=3600,
     )
     return response
@@ -524,7 +524,7 @@ async def update_membership(
 
     await users_col.update_one({"user_id": user_id}, update)
     response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=True, max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
     return response
 
 
@@ -549,7 +549,7 @@ async def toggle_ban(
         {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
     )
     response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=True, max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
     return response
 
 
@@ -619,7 +619,7 @@ async def delete_file(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="文件不存在")
     response = RedirectResponse(url="/files", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=True, max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
     return response
 
 
