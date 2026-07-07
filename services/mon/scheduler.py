@@ -597,23 +597,14 @@ class MonScheduler:
         except Exception as e:
             logger.warning(f"[Mon][复制] Telethon 获取频道 {channel_id} 消息失败: {e}")
         
-        # 回退到 get_updates
-        logger.warning(f"[Mon][复制] Telethon 不可用，回退到 get_updates 获取频道 {channel_id} 消息（建议排查 Telethon 连接）")
-        try:
-            updates = await bot_instance.get_updates(
-                offset=-100,
-                allowed_updates=["channel_post"],
-                timeout=5,
-            )
-            for update in updates:
-                if update.channel_post and update.channel_post.chat_id == channel_id:
-                    msg = update.channel_post
-                    if msg.message_id > last_cursor:
-                        if msg.photo or msg.video or msg.document or msg.audio or msg.animation:
-                            msgs.append(msg)
-            logger.debug(f"[Mon][fetch] get_updates 回退获取频道 {channel_id} 消息: total_updates={len(updates)}, matched={len(msgs)}")
-        except Exception as e:
-            logger.warning(f"[Mon][复制] 获取频道 {channel_id} 消息失败: {e}")
+        # 注:Telethon 不可用时,不再回退到 bot_instance.get_updates()——
+        # 它会消费运行中 bot 自己的更新队列(P1-9),导致用户消息/解码回调被偷走而丢失。
+        # 改为跳过本次拉取并告警,依赖下一个监控周期重试(降级决策能力保留:
+        # 调用方本就周期性重试,且 Telethon 连接恢复后下一轮即可正常补齐)。
+        logger.warning(
+            f"[Mon][复制] Telethon 不可用,跳过频道 {channel_id} 的新消息拉取"
+            f"(不调用会消费 update 的 get_updates,避免偷走运行中 bot 的更新队列)"
+        )
         return msgs
 
     @staticmethod

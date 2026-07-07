@@ -369,10 +369,17 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 验证码格式不正确,应为 5-6 位数字")
         return
 
+    # P1-13:回执中对登录码掩码(复用 _mask_secret),避免明文泄露到聊天记录。
+    # 注意:验证码仍写入 config 存储,因为解码机器人(relay 实例,运行在 mon 进程)
+    # 需要通过 config 跨进程握手拿到明文以完成 Telethon sign_in——这是当前架构下
+    # 必需的跨进程传递方式(详见本次整改报告的设计选择说明)。明文在 relay 实例读取后即被清空
+    #(_wait_for_admin_code 读取后立即 set_config(..., "")),滞留窗口仅数秒至至多 5 分钟握手超时。
     await set_config(f"relay_auth_code:{phone}", code)
     await update.message.reply_text(
-        f"✅ 验证码 `{code}` 已提交至 {phone}\n"
-        f"解码机器人将在几秒内自动获取并使用。"
+        f"✅ 验证码已提交至 {phone}\n"
+        f"🔑 验证码: `{_mask_secret(code)}`\n"
+        f"解码机器人将在几秒内自动获取并使用。\n\n"
+        f"🔐 出于安全考虑,回执仅显示掩码,登录码明文不会留存于聊天记录。"
     )
 
 
@@ -638,6 +645,17 @@ async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+def _mask_secret(secret: str) -> str:
+    """掩码密钥/验证码,避免明文泄露到聊天记录(P1-13)。
+
+    显示首尾少量字符,中间以 **** 替代。短于等于 8 位的整体打码,避免泄露过多。
+    """
+    secret = secret or ""
+    if len(secret) <= 8:
+        return "****"
+    return f"{secret[:4]}****{secret[-4:]}"
+
+
 @_auth_required
 async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -651,12 +669,6 @@ async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_config("r2_bucket", args[3])
 
     # P1-13: 回显时掩码密钥,避免明文泄露到聊天记录
-    def _mask_secret(secret: str) -> str:
-        secret = secret or ""
-        if len(secret) <= 8:
-            return "****"
-        return f"{secret[:4]}****{secret[-4:]}"
-
     await update.message.reply_text(
         "✅ R2 配置已保存\n"
         f"🔑 AccessKey: {_mask_secret(args[1])}\n"
@@ -797,6 +809,36 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"[factory_reset] 已清空本地缓存: {', '.join(sqlite_cleared)}")
     except Exception as e:
         logger.warning(f"[factory_reset] 清空本地缓存失败: {e}")
+
+    # P1-14:失效内存缓存 + 拓扑缓存,确保 reset 后历史文件码/记录不可再解码,
+    # 管理面板不再显示旧数据。直接调用各缓存的 clear/invalidate 公共方法,不戳私有属性。
+    try:
+        from database.cache import (
+            get_code_cache, get_file_record_cache, get_user_cache,
+            get_user_codes_cache, get_config_cache, clear_negative_caches,
+        )
+        from bots.admin_bot import display as _display
+        from storage.delivery_resolver import invalidate_cell_cache
+        from database.session import invalidate_cell_by_channel_cache
+
+        # 1) 取件码 / 文件记录 / 用户 / 用户码列表 / 系统配置 内存缓存
+        get_code_cache().clear()
+        get_file_record_cache().clear()
+        get_user_cache().clear()
+        get_user_codes_cache().clear()
+        get_config_cache().clear()
+        clear_negative_caches()
+
+        # 2) 管理面板 cells 缓存
+        _display.invalidate_cells_cache()
+
+        # 3) 投递解析器拓扑缓存 + 按 channel 的 cell 进程内缓存
+        invalidate_cell_cache()
+        invalidate_cell_by_channel_cache()
+
+        logger.info("[factory_reset] 已失效内存缓存与拓扑缓存,重置后历史数据不可再解码")
+    except Exception as e:
+        logger.warning(f"[factory_reset] 失效内存缓存失败: {e}")
 
     if errors:
         await msg.edit_text(

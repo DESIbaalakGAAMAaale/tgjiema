@@ -24,6 +24,15 @@ _cells_cache: dict[tuple, tuple[float, list[dict]]] = {}
 _CELLS_CACHE_TTL = 60  # 秒
 
 
+def invalidate_cells_cache():
+    """失效 cells 缓存(P1-14 factory_reset 调用)。
+
+    直接清空模块级缓存字典,避免 factory_reset 后管理面板仍显示旧拓扑/频道状态。
+    """
+    global _cells_cache
+    _cells_cache = {}
+
+
 def _make_cells_cache_key(status_filter: dict | None, sort_key: str) -> tuple:
     """生成 cells 缓存键，包含 status_filter 和 sort_key。"""
     if status_filter:

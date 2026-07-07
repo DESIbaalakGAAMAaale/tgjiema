@@ -121,6 +121,12 @@ def clear_negative_file(file_code: str):
     _negative_file_cache.pop(file_code, None)
 
 
+def clear_negative_caches():
+    """清空全部负缓存(P1-14 factory_reset 调用),避免重置后残留的负缓存掩盖新数据。"""
+    _negative_user_cache.clear()
+    _negative_file_cache.clear()
+
+
 def invalidate_file_record(file_code: str):
     """失效指定文件码的缓存,用于文件状态变更时立即生效。
     注意：缓存键前缀必须与 dump_cache_to_disk/load_cache_from_disk 使用的 "file:" 一致，

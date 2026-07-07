@@ -53,6 +53,12 @@ class RelayInstance:
         # bot_override 内存缓存（避免每次外发都全表扫描 SQLite）
         self._bot_override_cache: list[dict] = []
         self._bot_override_cache_ts: float = 0
+        # P1-8:跟踪内部 create_task 产生的后台任务,shutdown() 时统一 cancel 并 await 完成,
+        # 避免孤儿任务/资源泄漏(参考批次一 cache.py 的 _pending_tasks 模式)。
+        self._background_tasks: set[asyncio.Task] = set()
+        # P1-8:start() 守卫,避免重复创建 cleanup 循环(重复调用 start 时)。
+        self._cleanup_loop_started = False
+        self._shutdown_done = False
 
     @property
     def is_ready(self) -> bool:
@@ -71,6 +77,16 @@ class RelayInstance:
             await set_config("relay_status", status)
         except Exception:
             pass
+
+    def _spawn(self, coro, name: str | None = None) -> asyncio.Task:
+        """创建内部后台任务并纳入 _background_tasks 跟踪(P1-8)。
+
+        任务完成后自动从集合中移除,防止集合无限增长。
+        """
+        task = create_safe_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _wait_for_admin_code(self) -> str | None:
         from database.session import get_config, set_config
@@ -153,8 +169,10 @@ class RelayInstance:
         await self._report_status("online")
         logger.info(f"[RelayInstance:{self.phone}] 中继已就绪")
 
-        # 启动周期清理冷却记录的后台任务
-        create_safe_task(self._cleanup_cooldowns_loop())
+        # 启动周期清理冷却记录的后台任务(P1-8:start 守卫 + 任务跟踪)
+        if not self._cleanup_loop_started:
+            self._cleanup_loop_started = True
+            self._spawn(self._cleanup_cooldowns_loop(), name="relay-cleanup-cooldowns")
 
     async def _cleanup_cooldowns_loop(self):
         """每 10 分钟清理一次过期的 bot_cooldown 记录"""
@@ -327,28 +345,30 @@ class RelayInstance:
 
     @staticmethod
     def _detect_media_type(msg) -> str:
+        # P1-16:引用 file_utils.MEDIA_TYPE 规范词表,确保 voice 与 file_utils 一致(返回 "voice" 而非 "audio")
+        from utils.file_utils import MEDIA_TYPE
         if hasattr(msg, "photo") and msg.photo:
-            return "photo"
+            return MEDIA_TYPE["PHOTO"]
         if hasattr(msg, "video") and msg.video:
-            return "video"
+            return MEDIA_TYPE["VIDEO"]
         if hasattr(msg, "audio") and msg.audio:
-            return "audio"
+            return MEDIA_TYPE["AUDIO"]
         if hasattr(msg, "voice") and msg.voice:
-            return "audio"
+            return MEDIA_TYPE["VOICE"]
         if hasattr(msg, "animation") and msg.animation:
-            return "animation"
+            return MEDIA_TYPE["ANIMATION"]
         if hasattr(msg, "gif") and msg.gif:
-            return "animation"
+            return MEDIA_TYPE["ANIMATION"]
         if hasattr(msg, "sticker") and msg.sticker:
-            return "sticker"
+            return MEDIA_TYPE["STICKER"]
         if hasattr(msg, "document") and msg.document:
             mime = getattr(msg.document, "mime_type", "") or ""
             if "video" in mime:
-                return "video"
+                return MEDIA_TYPE["VIDEO"]
             if "audio" in mime:
-                return "audio"
-            return "document"
-        return "document"
+                return MEDIA_TYPE["AUDIO"]
+            return MEDIA_TYPE["DOCUMENT"]
+        return MEDIA_TYPE["DOCUMENT"]
 
     @staticmethod
     def _extract_number(text: str) -> int | None:
@@ -474,7 +494,7 @@ class RelayInstance:
                     "bot_username": bot_username,
                     "_expires": now_ts + 5,
                 }
-                create_safe_task(
+                self._spawn(
                     self._flush_media_group_buffer(media_group_id, bot_username)
                 )
                 return
@@ -519,7 +539,7 @@ class RelayInstance:
                 old.cancel()
             else:
                 return
-        exchange["_settle_task"] = create_safe_task(
+        exchange["_settle_task"] = self._spawn(
             self._message_loop(bot_username, settle_wait)
         )
 
@@ -1022,5 +1042,18 @@ class RelayInstance:
             return False
 
     async def shutdown(self):
+        # P1-8:取消所有内部后台任务,等待其完成,避免孤儿任务/资源泄漏。
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        pending = [t for t in self._background_tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            except Exception as e:
+                logger.debug(f"[RelayInstance:{self.phone}] 等待后台任务结束异常: {e}")
+        self._background_tasks.clear()
         if self._client:
             await self._client.disconnect()

@@ -2519,6 +2519,13 @@ async def get_cell_by_channel_local(channel_id: int) -> dict | None:
     return _cell_by_ch_cache.get(channel_id)
 
 
+def invalidate_cell_by_channel_cache():
+    """失效按 channel_id 查询的 cell 进程内缓存(P1-14 factory_reset / 拓扑变更调用)。"""
+    global _cell_by_ch_cache, _cell_by_ch_ts
+    _cell_by_ch_cache = {}
+    _cell_by_ch_ts = 0
+
+
 async def set_code_expiry(code: str, expires_at: str):
     """设置取件码的过期时间"""
     col = get_codes_col()

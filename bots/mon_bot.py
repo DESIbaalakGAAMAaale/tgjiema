@@ -53,7 +53,7 @@ def _is_ban_error(exc: Exception) -> bool:
 class MonBot:
     """Mon 监控机器人 v2(后台轮询 + 轮转 + 备用池补充)。"""
 
-    def __init__(self):
+    def __init__(self, stop_event: asyncio.Event | None = None):
         self.bot = Bot(token=TOKEN)
         self.scheduler = MonScheduler()
         self._running = False
@@ -62,6 +62,9 @@ class MonBot:
         self._admin_bot = None
         self._admin_chat_id = settings.ADMIN_TELEGRAM_ID
         self._notify_cooldowns: dict[str, float] = {}
+        # P1-15:接入 run_all 的全局停止事件,确保 run_all 触发停止时 mon_bot 优雅退出,
+        # 与其它 4 个 bot 行为一致。None 表示未注册(独立运行时仍可靠 self._running 退出)。
+        self._stop_event: asyncio.Event | None = stop_event
         # 轮转状态
         self._rotation = {
             "active_window_size": 3,
@@ -558,7 +561,7 @@ class MonBot:
             logger.info(f"[Mon] 从 SQLite 恢复 {len(hb_data)} 条心跳记录")
         logger.info("[Mon] 监控机器人 v2 已启动")
 
-        while self._running:
+        while self._running and not (self._stop_event and self._stop_event.is_set()):
             try:
                 # 0. 心跳上报（跨进程共享）
                 await report_bot_heartbeat("mon_bot")
@@ -671,7 +674,15 @@ class MonBot:
             except Exception as e:
                 logger.error(f"[Mon] 调度异常: {e}")
 
-            await asyncio.sleep(RECOVERY_INTERVAL)
+            # P1-15:以 stop_event.wait 替代固定 sleep,run_all 触发停止时立即唤醒退出,
+            # 避免最多等待一个 RECOVERY_INTERVAL(60s)才响应。超时即正常进入下一轮。
+            if self._stop_event is not None:
+                try:
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=RECOVERY_INTERVAL)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(RECOVERY_INTERVAL)
 
     async def _heartbeat_with_ban_detection(self, all_cells: list[dict]) -> tuple[int, int]:
         """心跳检测 + 封禁识别。返回 (ok_count, ban_count)。
@@ -762,13 +773,20 @@ class MonBot:
 
 async def run_mon():
     """启动 Mon 监控机器人。"""
-    mon = MonBot()
+    # P1-15:创建并注册全局停止事件,让 run_all 的 SIGTERM/SIGINT handler 能 set 它,
+    # 触发 mon_bot 优雅退出,与其它 4 个 bot 行为一致。
+    from run_all import _set_stop_event
+    stop_event = asyncio.Event()
+    _set_stop_event(stop_event)
+    mon = MonBot(stop_event=stop_event)
     try:
         await mon.start()
-    except KeyboardInterrupt:
-        await mon.stop()
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("[Mon] 收到中断信号,正在停止...")
     except Exception as e:
         logger.error(f"[Mon] 异常退出: {e}")
+    finally:
+        # start() 正常返回(停止事件触发)或异常退出,都需执行优雅关闭
         await mon.stop()
 
 
