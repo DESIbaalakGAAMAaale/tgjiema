@@ -1336,7 +1336,8 @@ async def get_r2_config() -> dict:
     account_id = await _get_config("r2_account_id") or ""
     access_key = await _get_config("r2_access_key") or ""
     secret_key_cipher = await _get_config("r2_secret_key") or ""
-    bucket = await _get_config("r2_bucket_name") or ""
+    # R27-M1: 键名与写入侧对齐（admin /set_r2 写入的是 r2_bucket，不是 r2_bucket_name）
+    bucket = await _get_config("r2_bucket") or ""
     endpoint = await _get_config("r2_endpoint") or ""
 
     secret_key = ""
@@ -1344,8 +1345,13 @@ async def get_r2_config() -> dict:
         try:
             from .relay_db import decrypt
             secret_key = decrypt(secret_key_cipher)
-        except (RuntimeError, ImportError):
-            # 兼容旧明文数据（P2-4 加密前写入的）
+        except (RuntimeError, ImportError) as e:
+            # R27-L1: 兼容旧明文数据（P2-4 加密前写入的），但打 warning 以便定位
+            # 若是真加密数据 + RELAY_ENCRYPTION_KEY 缺失/轮换，会退化为密文当密钥 → SigV4 403
+            logger.warning(
+                f"[DB] r2_secret_key 解密失败，按旧明文兼容返回。"
+                f"若 RELAY_ENCRYPTION_KEY 已轮换，需用正确密钥重新加密或重新录入 R2 凭证: {e}"
+            )
             secret_key = secret_key_cipher
 
     return {
