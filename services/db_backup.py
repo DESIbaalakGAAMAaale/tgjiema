@@ -6,7 +6,7 @@ from loguru import logger
 
 from config import settings
 from database.session import _client as db_client, get_config, _validate_identifier
-from storage.r2 import _r2 as r2_storage
+from storage.r2 import _r2 as r2_storage, configure_r2_dynamic
 
 
 SMALL_TABLES = {
@@ -105,18 +105,11 @@ async def run_db_backup():
         logger.info("数据库备份未启用(DB_BACKUP_ENABLED=false),跳过启动")
         return
 
-    if not settings.R2_ACCOUNT_ID or not settings.R2_ACCESS_KEY_ID or not settings.R2_SECRET_ACCESS_KEY:
-        logger.warning("R2 凭证未配置,数据库备份跳过")
+    # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
+    await configure_r2_dynamic()
+    if not r2_storage._access_key or not r2_storage._secret_key:
+        logger.warning("R2 凭证未配置(.env 和 config 表均无),数据库备份跳过")
         return
-
-    r2_storage.configure(
-        account_id=settings.R2_ACCOUNT_ID,
-        access_key=settings.R2_ACCESS_KEY_ID,
-        secret_key=settings.R2_SECRET_ACCESS_KEY,
-        bucket=settings.R2_BUCKET_NAME,
-        endpoint=settings.R2_ENDPOINT if settings.R2_ENDPOINT else None,
-    )
-    await r2_storage.connect()
 
     interval_cfg = await get_config("db_backup_interval")
     if interval_cfg is None:
@@ -214,16 +207,10 @@ async def list_backups() -> list[dict]:
 
     供管理后台/admin_bot 调用，展示可恢复的备份列表。
     """
-    if not settings.R2_ACCOUNT_ID or not settings.R2_ACCESS_KEY_ID:
+    # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
+    await configure_r2_dynamic()
+    if not r2_storage._access_key:
         return []
-    r2_storage.configure(
-        account_id=settings.R2_ACCOUNT_ID,
-        access_key=settings.R2_ACCESS_KEY_ID,
-        secret_key=settings.R2_SECRET_ACCESS_KEY,
-        bucket=settings.R2_BUCKET_NAME,
-        endpoint=settings.R2_ENDPOINT if settings.R2_ENDPOINT else None,
-    )
-    await r2_storage.connect()
     objects = await r2_storage.list_objects(prefix="db_backup/db_backup_", max_keys=1000)
     # 按时间倒序（key 含时间戳，倒序 = 最新在前）
     objects.sort(key=lambda obj: obj.get("key", ""), reverse=True)
@@ -240,16 +227,10 @@ async def restore_from_backup(key: str, tables: list[str] | None = None) -> dict
     Returns:
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
     """
-    if not settings.R2_ACCOUNT_ID or not settings.R2_ACCESS_KEY_ID:
-        raise RuntimeError("R2 凭证未配置，无法恢复")
-    r2_storage.configure(
-        account_id=settings.R2_ACCOUNT_ID,
-        access_key=settings.R2_ACCESS_KEY_ID,
-        secret_key=settings.R2_SECRET_ACCESS_KEY,
-        bucket=settings.R2_BUCKET_NAME,
-        endpoint=settings.R2_ENDPOINT if settings.R2_ENDPOINT else None,
-    )
-    await r2_storage.connect()
+    # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
+    await configure_r2_dynamic()
+    if not r2_storage._access_key:
+        raise RuntimeError("R2 凭证未配置(.env 和 config 表均无)，无法恢复")
 
     # 下载备份
     content = await r2_storage.download(key)

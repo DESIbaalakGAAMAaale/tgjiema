@@ -1326,6 +1326,37 @@ async def set_relay_config(api_id: int, api_hash: str, phone: str):
         await _set_config("relay_phone", phone)
 
 
+async def get_r2_config() -> dict:
+    """读取 R2 配置（config 表优先，r2_secret_key 解密）。
+
+    R26-M1: 与 relay api_hash 对称，写入时 Fernet 加密、读取时解密。
+    返回 {"account_id", "access_key", "secret_key", "bucket", "endpoint"}，
+    任一字段在 config 表缺失时返回空字符串，由调用方决定是否 fallback 到 .env。
+    """
+    account_id = await _get_config("r2_account_id") or ""
+    access_key = await _get_config("r2_access_key") or ""
+    secret_key_cipher = await _get_config("r2_secret_key") or ""
+    bucket = await _get_config("r2_bucket_name") or ""
+    endpoint = await _get_config("r2_endpoint") or ""
+
+    secret_key = ""
+    if secret_key_cipher:
+        try:
+            from .relay_db import decrypt
+            secret_key = decrypt(secret_key_cipher)
+        except (RuntimeError, ImportError):
+            # 兼容旧明文数据（P2-4 加密前写入的）
+            secret_key = secret_key_cipher
+
+    return {
+        "account_id": account_id,
+        "access_key": access_key,
+        "secret_key": secret_key,
+        "bucket": bucket,
+        "endpoint": endpoint,
+    }
+
+
 async def get_relay_status() -> str:
     return await _get_config("relay_status") or "offline"
 

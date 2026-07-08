@@ -183,17 +183,42 @@ def get_r2() -> R2Storage:
     return _r2
 
 
-async def init_r2():
+async def configure_r2_dynamic():
+    """优先从 config 表读取 R2 凭证（r2_secret_key 解密），fallback 到 .env。
+
+    R26-M1: 让 admin /set_r2 写入的加密凭证真正参与运行时消费，
+    与 relay api_hash 的「写入加密→读取解密→使用明文」范式对齐。
+    config 表任一字段缺失时，对应字段回退到 .env。
+    """
     from config import settings as _settings
+    cfg = {}
+    try:
+        from database.session import get_r2_config
+        cfg = await get_r2_config()
+    except Exception as e:
+        # DB 未就绪/查询失败：静默回退到 .env（启动早期常见）
+        import logging
+        logging.getLogger(__name__).debug(f"[r2] 读取 config 表失败，回退 .env: {e}")
+
+    account_id = cfg.get("account_id") or _settings.R2_ACCOUNT_ID
+    access_key = cfg.get("access_key") or _settings.R2_ACCESS_KEY_ID
+    secret_key = cfg.get("secret_key") or _settings.R2_SECRET_ACCESS_KEY
+    bucket = cfg.get("bucket") or _settings.R2_BUCKET_NAME
+    endpoint = cfg.get("endpoint") or (_settings.R2_ENDPOINT if _settings.R2_ENDPOINT else None)
 
     _r2.configure(
-        account_id=_settings.R2_ACCOUNT_ID,
-        access_key=_settings.R2_ACCESS_KEY_ID,
-        secret_key=_settings.R2_SECRET_ACCESS_KEY,
-        bucket=_settings.R2_BUCKET_NAME,
-        endpoint=_settings.R2_ENDPOINT if _settings.R2_ENDPOINT else None,
+        account_id=account_id,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=bucket,
+        endpoint=endpoint,
     )
     await _r2.connect()
+
+
+async def init_r2():
+    """启动时初始化 R2（优先 config 表，fallback .env）。"""
+    await configure_r2_dynamic()
 
 
 async def close_r2():
