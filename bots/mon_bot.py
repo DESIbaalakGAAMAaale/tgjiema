@@ -289,11 +289,7 @@ class MonBot:
                 f"操作: 直接替换,无需降级"
             )
             logger.info(f"[Mon][Ban] {slot_id} 封禁 → 备用池 {spare_ch} 替换")
-            # 重置 R100 游标：新频道内容不同，需从 Active 重新追赶
-            r100_key = f"{slot_id}_r100"
-            if r100_key in self.scheduler._r100_cursors:
-                del self.scheduler._r100_cursors[r100_key]
-                logger.info(f"[Mon][Ban] 已重置 R100 游标: {r100_key}")
+            # Manifest 驱动:新频道无 manifest 记录,auto_fill_new_channels 会自动从 Active 补齐
         else:
             notify_msg += (
                 "⚠️ 备用池无可用频道!\n"

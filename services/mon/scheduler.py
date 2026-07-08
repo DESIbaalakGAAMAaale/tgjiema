@@ -3,10 +3,8 @@
 import os
 import re
 import datetime as _dt
-from pathlib import Path
 
 import yaml
-from telethon import TelegramClient
 from loguru import logger
 from database import (
     log_rotate,
@@ -35,11 +33,6 @@ def _load_mon_config():
 FAIL_STREAK_DEGRADE_THRESHOLD = 3
 
 
-def _get_msg_id(msg) -> int:
-    """获取消息 ID，兼容 Telethon (.id) 和 PTB (.message_id)。"""
-    return msg.id if hasattr(msg, 'id') else msg.message_id
-
-
 class MonScheduler:
     """Mon 调度器。
 
@@ -53,102 +46,13 @@ class MonScheduler:
         cfg = _load_mon_config()
         self.degrade_cooldown = cfg["degrade_cooldown"]
         self.r100_managed = cfg["r100_managed"]
-        # ─── last_synced_msg_id 本地缓存:每 30 次同步 flush 一次(30分钟)，且只 flush 有变化的 ───
-        self._telethon_client: TelegramClient | None = None
-        # 标记是否为自建客户端(复用 relay_pool 的不能关闭,由 relay_pool 管理)
-        self._owns_telethon_client: bool = False
-        self._cursor_cache: dict[str, int] = {}
-        self._flushed_cursors: dict[str, int] = {}  # 已 flush 到 CRDB 的游标值
         self._replicate_count = 0
-        self._cursor_flush_interval = 10  # 每 N 次同步 flush 一次(约10分钟，缩短以减少崩溃窗口)
-        # R100 独立游标持久化：避免重启后重复归档
-        self._r100_cursors: dict[str, int] = {}  # {slot_id}_r100 → cursor
-        self._r100_cursors_loaded = False
 
     async def shutdown(self):
-        """关闭自建的 Telethon 客户端,释放资源。
-        复用 relay_pool 的客户端不在此关闭,由 relay_pool 自行管理。
+        """Manifest 驱动后无需 Telethon 客户端,shutdown 无操作。
+        保留方法签名兼容 mon_bot 调用。
         """
-        if self._owns_telethon_client and self._telethon_client:
-            try:
-                if self._telethon_client.is_connected():
-                    await self._telethon_client.disconnect()
-                    logger.info("[Mon] 自建 Telethon 客户端已关闭")
-            except Exception as e:
-                logger.warning(f"[Mon] 关闭 Telethon 客户端失败: {e}")
-            finally:
-                self._telethon_client = None
-                self._owns_telethon_client = False
-
-    async def _load_r100_cursors(self):
-        """从 SQLite 加载 R100 独立游标，避免重启后重复归档。"""
-        if self._r100_cursors_loaded:
-            return
-        try:
-            from database.cache_store import get_cache_store
-            store = get_cache_store()
-            data = await store.get("r100_cursors")
-            if data and isinstance(data, dict):
-                self._r100_cursors = {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
-                logger.info(f"[Mon] 加载 R100 游标: {len(self._r100_cursors)} 个槽位")
-        except Exception as e:
-            logger.warning(f"[Mon] 加载 R100 游标失败: {e}")
-        self._r100_cursors_loaded = True
-
-    async def _ensure_telethon_client(self):
-        """获取或创建 Telethon 客户端，用于读取频道历史消息。
-        优先复用 relay_pool 已有实例，否则查询 relay_accounts 表创建新客户端。
-        失败时返回 None，调用方回退到旧 get_updates 行为。
-
-        注意: 复用 relay_pool 的实例时 _owns_telethon_client=False,shutdown 不会关闭它;
-        自建的实例 _owns_telethon_client=True,shutdown 时会关闭。
-        """
-        if self._telethon_client and self._telethon_client.is_connected():
-            return self._telethon_client
-
-        from config.settings import settings
-        api_id = settings.RELAY_API_ID
-        api_hash = settings.RELAY_API_HASH
-        if not api_id or not api_hash:
-            logger.warning("[Mon] RELAY_API_ID/RELAY_API_HASH 未配置，无法使用 Telethon 历史复制")
-            return None
-
-        # 尝试复用 relay_pool 已有实例(不归本 scheduler 所有,shutdown 不关闭)
-        try:
-            from services.relay_pool import relay_pool
-            if relay_pool.instances:
-                for instance in relay_pool.instances:
-                    if instance._client and instance._client.is_connected():
-                        self._telethon_client = instance._client
-                        self._owns_telethon_client = False  # 复用,不归本类管理
-                        logger.info(f"[Mon] 复用 relay_pool 已有 Telethon 客户端 ({instance.phone})")
-                        return self._telethon_client
-        except Exception:
-            pass
-
-        # 创建新客户端：从 relay_accounts 表获取第一个账号
-        try:
-            from database.session import get_collection
-            col = get_collection("relay_accounts")
-            accounts = await col.find({}, limit=1)
-            if accounts:
-                phone = accounts[0]["phone"]
-                session_path = str(Path(__file__).parent.parent.parent / "data" / f"relay_session_{phone}")
-                if os.path.exists(session_path + ".session"):
-                    client = TelegramClient(session_path, api_id, api_hash)
-                    await client.connect()
-                    if await client.is_user_authorized():
-                        self._telethon_client = client
-                        self._owns_telethon_client = True  # 自建,归本类管理,shutdown 时关闭
-                        logger.info(f"[Mon] 创建 Telethon 客户端成功 ({phone})")
-                        return client
-                    await client.disconnect()
-                else:
-                    logger.warning(f"[Mon] session 文件不存在: {session_path}.session，跳过 Telethon 初始化")
-        except Exception as e:
-            logger.warning(f"[Mon] 创建 Telethon 客户端失败: {e}")
-
-        return None
+        pass
 
     async def run_degrade_check(
         self, all_cells: list[dict],
@@ -368,10 +272,11 @@ class MonScheduler:
     async def replicate_all_active_to_shadows(self, bot_instance, all_cells: list[dict]) -> int:
         """核心功能:将每个 Active 槽的新消息复制到同组的 Shadow 槽位 + R100 全量归档。
 
-        这是 Mon 的「写入」职责——替代原 backup_bot 的文件备份功能。
-        R100 作为最终全量归档，使用独立游标确保复制必须成功：
-        - R100 复制失败 → 游标不推进 → 下个周期自动重试
-        - Shadow 游标不受 R100 影响，主流程不阻塞
+        Manifest 驱动(免 Telethon 读历史):
+        - Up Bot 写入 Active 时已登记 manifest
+        - Mon Bot 查 manifest 获取"Active 有但 Shadow/R100 没有"的文件
+        - 用 bot.copy_messages 从 Active 复制到 Shadow/R100
+        - 更新 manifest + message_backups(兼容 dsp_bot 故障切换)
         返回复制的消息总数。
 
         Args:
@@ -380,13 +285,13 @@ class MonScheduler:
         self._replicate_count += 1
         groups = self._group_slots(all_cells)
         total_copied = 0
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
 
         # 找到 R100 槽位（全量归档用）
         r100_slot = next((c for c in all_cells if c.get("is_r100", 0) == 1 and c.get("status") == "r100"), None)
-        if r100_slot:
-            logger.debug(f"[Mon][R100] R100 槽位已找到: slot_id={r100_slot.get('slot_id')}, channel={r100_slot.get('channel_id')}")
-        else:
-            logger.warning(f"[Mon][R100] 未找到 R100 槽位，跳过归档。cells 总数={len(all_cells)}, is_r100 槽位数={len([c for c in all_cells if c.get('is_r100')])}")
+        if not r100_slot:
+            logger.warning(f"[Mon][R100] 未找到 R100 槽位，跳过归档。cells 总数={len(all_cells)}")
 
         for _group_key, group in groups.items():
             active_slot = self._find_active_slot(group)
@@ -395,172 +300,132 @@ class MonScheduler:
 
             a_slot, s1_slot, s2_slot = group
             shadows = [s for s in (s1_slot, s2_slot) if s and s.get("status") in ("shadow1", "shadow2")]
-
             slot_id = active_slot["slot_id"]
-            last_cursor = self._cursor_cache.get(slot_id) or active_slot.get("last_synced_msg_id") or 0
+            group_id = int(_group_key)
+            active_channel = active_slot["channel_id"]
 
-            # 1. R100 全量归档（完全独立游标，不受 shadow 复制进度影响）
+            # 1. R100 全量归档(manifest 驱动)
             if r100_slot:
-                await self._load_r100_cursors()
-                r100_cursor_key = f"{slot_id}_r100"
-                r100_last_cursor = self._r100_cursors.get(r100_cursor_key, 0)
-                # R100 独立追赶，不依赖 shadow 游标推进
-                r100_new_messages = await self._fetch_new_messages(
-                    bot_instance, active_slot["channel_id"], r100_last_cursor
-                )
-                logger.debug(f"[Mon][R100] slot={slot_id} channel={active_slot['channel_id']} cursor={r100_last_cursor} 新消息={len(r100_new_messages) if r100_new_messages else 0}")
-                if r100_new_messages:
-                    # N24-2: 去重——查询 message_backups 中已存在的映射，避免重启后重复 copy
-                    r100_channel_id = r100_slot["channel_id"]
-                    existing_ids = await self._get_existing_backup_ids(
-                        active_slot["channel_id"], r100_channel_id,
-                        [m.id for m in r100_new_messages]
-                    )
-                    deduped = [m for m in r100_new_messages if m.id not in existing_ids]
-                    logger.debug(f"[Mon][R100] slot={slot_id} 去重: 新消息={len(r100_new_messages)}, 已存在={len(existing_ids)}, 待复制={len(deduped)}")
-                    if deduped:
-                        copied_r100, mappings_r100 = await self._copy_messages(
-                            bot_instance, active_slot["channel_id"],
-                            r100_channel_id, deduped,
-                            stop_on_failure=True,
-                        )
-                        total_copied += copied_r100
-                        logger.debug(f"[Mon][R100] slot={slot_id} 复制完成: copied={copied_r100}/{len(deduped)}, mappings={len(mappings_r100) if mappings_r100 else 0}")
-                        if mappings_r100:
-                            write_ok = await self._write_backup_mappings(
-                                active_slot["channel_id"], r100_channel_id, mappings_r100
-                            )
-                            if write_ok:
-                                self._r100_cursors[r100_cursor_key] = max(orig_id for orig_id, _ in mappings_r100)
-                            else:
-                                logger.warning(
-                                    f"[Mon] R100 映射写入失败 slot={slot_id} "
-                                    f"channel={active_slot['channel_id']}→{r100_channel_id}，"
-                                    f"游标保持 {r100_last_cursor}，下周期重试"
-                                )
-                        else:
-                            logger.warning(
-                                f"[Mon] R100 复制失败 slot={slot_id} "
-                                f"channel={active_slot['channel_id']}→{r100_channel_id}，"
-                                f"游标保持 {r100_last_cursor}，下周期重试"
-                            )
-                    else:
-                        # 所有消息已去重，游标直接推进
-                        self._r100_cursors[r100_cursor_key] = max(m.id for m in r100_new_messages)
-
-            # 2. 复制到同组的 shadow1/shadow2
-            new_messages = await self._fetch_new_messages(
-                bot_instance, active_slot["channel_id"], last_cursor
-            )
-            if not new_messages:
-                continue
-
-            # N-16-2: 仅将游标推进到「所有影子都连续成功复制」的最大 msg_id
-            # 修复:用 stop_on_failure 保证 mappings 连续成功,避免中间失败的消息被永久跳过
-            # 修复:复制前查询 message_backups 去重,避免重启/重试导致重复复制
-            shadow_max_ids = []
-            all_msg_ids = [_get_msg_id(m) for m in new_messages]
-            for shadow in shadows:
-                # 去重:查询该 shadow 频道已存在的映射,跳过已复制的消息
-                try:
-                    existing_ids = await self._get_existing_backup_ids(
-                        active_slot["channel_id"], shadow["channel_id"], all_msg_ids
-                    )
-                except Exception:
-                    existing_ids = set()
-                pending_messages = [m for m in new_messages if _get_msg_id(m) not in existing_ids]
-                if not pending_messages:
-                    # 所有消息已存在,游标可直接推进到最大 id
-                    shadow_max_ids.append(max(all_msg_ids))
-                    continue
-                copied, mappings = await self._copy_messages(
-                    bot_instance, active_slot["channel_id"],
-                    shadow["channel_id"], pending_messages,
-                    stop_on_failure=True,
+                r100_channel_id = r100_slot["channel_id"]
+                copied = await self._copy_missing_via_manifest(
+                    bot_instance, store, group_id,
+                    src_channel_id=active_channel,
+                    dst_channel_id=r100_channel_id,
+                    main_channel_id=active_channel,  # R100 的 main_msg_id 用 active 的
                 )
                 total_copied += copied
-                if mappings:
-                    # 写入映射失败时不推进该 shadow 的游标,下周期重试
-                    # 否则故障切换时 dsp_bot 找不到 message_backups 映射,用户收不到文件
-                    write_ok = await self._write_backup_mappings(
-                        active_slot["channel_id"], shadow["channel_id"], mappings
-                    )
-                    if write_ok:
-                        shadow_max_ids.append(max(orig_id for orig_id, _ in mappings))
-                    else:
-                        logger.warning(
-                            f"[Mon] shadow 映射写入失败 slot={slot_id} "
-                            f"channel={active_slot['channel_id']}→{shadow['channel_id']}"
-                        )
-            if shadow_max_ids and len(shadow_max_ids) == len(shadows):
-                # min:取所有 shadow 中连续成功复制的最小最大 id
-                # 保证所有 shadow 都已复制到该 id,下次 fetch 不会跳过任何 shadow 的缺失消息
-                # 严格校验:所有 shadow 都必须有成功条目才推进游标,否则保持游标下周期重试
-                # 避免某个 shadow 全部复制失败时游标仍推进,导致该 shadow 永久丢消息
-                self._cursor_cache[slot_id] = min(shadow_max_ids)
-            elif shadows and len(shadow_max_ids) < len(shadows):
-                # 部分 shadow 失败(复制失败或映射写入失败),游标保持,下周期重试
-                logger.warning(
-                    f"[Mon] 部分 shadow 复制失败 slot={slot_id} "
-                    f"({len(shadow_max_ids)}/{len(shadows)} 成功),"
-                    f"游标保持 {last_cursor},下周期重试"
-                )
-            elif not shadows:
-                # 无可用 shadow(两个 shadow 都 lost 或未配置),无法复制,告警
-                # validate_topology 会检测三元组缺失,但运行时也需即时告警
+                if copied > 0:
+                    logger.info(f"[Mon][R100] slot={slot_id} 归档 {copied} 条")
+
+            # 2. 复制到同组的 shadow1/shadow2(manifest 驱动)
+            if not shadows:
                 logger.warning(
                     f"[Mon] slot={slot_id} 无可用 shadow,跳过复制 "
                     f"(可能两个 shadow 均 lost,请检查拓扑健康)"
                 )
+                continue
 
-        if self._replicate_count % self._cursor_flush_interval == 0:
-            await self._flush_cursor_cache()
+            for shadow in shadows:
+                copied = await self._copy_missing_via_manifest(
+                    bot_instance, store, group_id,
+                    src_channel_id=active_channel,
+                    dst_channel_id=shadow["channel_id"],
+                    main_channel_id=active_channel,  # message_backups 的 main_msg_id 用 active 的
+                )
+                total_copied += copied
+                if copied > 0:
+                    logger.info(
+                        f"[Mon][复制] slot={slot_id} {active_channel}→{shadow['channel_id']} "
+                        f"复制 {copied} 条"
+                    )
 
         return total_copied
 
-    async def _flush_cursor_cache(self):
-        """批量 flush 本地缓存的游标到 SQLite（零 CRDB RU）。
-        Shadow 游标写 cells 表，R100 游标写 cache_backup 表。"""
-        # 1. Flush shadow 游标
-        if self._cursor_cache:
-            from database.cache_store import get_cache_store
-            store = get_cache_store()
-            changed = 0
-            for slot_id, cursor in self._cursor_cache.items():
-                if self._flushed_cursors.get(slot_id) == cursor:
-                    continue
-                try:
-                    await store.update_cell_fields_local(slot_id, {"last_synced_msg_id": cursor})
-                    self._flushed_cursors[slot_id] = cursor
-                    changed += 1
-                except Exception as flush_err:
-                    logger.debug(f"[Mon] flush 游标失败 slot={slot_id}: {flush_err}")
-            if changed > 0:
-                logger.debug(f"[Mon] flush 游标到本地: {changed} 个有变化")
+    async def _copy_missing_via_manifest(
+        self, bot_instance, store, group_id: int,
+        src_channel_id: int, dst_channel_id: int, main_channel_id: int,
+    ) -> int:
+        """Manifest 驱动的副本同步:查 manifest 获取 dst 缺失的文件,从 src 复制过去。
 
-        # 2. Flush R100 游标到 cache_backup（持久化，避免重启重复归档）
-        if self._r100_cursors:
-            from database.cache_store import get_cache_store
-            store = get_cache_store()
-            try:
-                await store.set("r100_cursors", self._r100_cursors.copy())
-            except Exception as e:
-                logger.warning(f"[Mon] flush R100 游标失败: {e}")
-
-    @staticmethod
-    async def _get_existing_backup_ids(main_channel_id: int, backup_channel_id: int, msg_ids: list[int]) -> set[int]:
-        """查询 message_backups 中已存在的映射，返回已归档的 main_msg_id 集合（用于 R100 去重）。"""
-        if not msg_ids:
-            return set()
+        Args:
+            src_channel_id: 源频道(复制来源,通常是 active)
+            dst_channel_id: 目标频道(复制目标,shadow 或 R100)
+            main_channel_id: message_backups 的 main_msg_id 对应的频道(通常是 active)
+                             补位场景下可能不同于 src_channel_id
+        Returns:
+            成功复制的消息数。
+        """
+        # 1. 查 manifest:src 有但 dst 没有的文件
         try:
-            from database.session import get_message_backups_col
-            col = get_message_backups_col()
-            existing = await col.find(
-                {"main_msg_id": {"$in": msg_ids}, "backup_channel_id": backup_channel_id}
-            )
-            return {r["main_msg_id"] for r in existing}
-        except Exception:
-            return set()
+            missing = await store.get_missing_from_src(group_id, src_channel_id, dst_channel_id)
+        except Exception as e:
+            logger.warning(f"[Mon][manifest] 查询缺失文件失败 group={group_id} src={src_channel_id} dst={dst_channel_id}: {e}")
+            return 0
+        if not missing:
+            return 0
+
+        # 2. 按源 message_id 排序(保持顺序),批量 copy_messages
+        # 注意:copy_messages 要求 message_ids 是同一频道的,这里源都是 src_channel_id
+        missing.sort(key=lambda x: x["src_message_id"])
+        batch_size = 30  # 每批最多 30 条,避免 FloodWait
+        total_copied = 0
+
+        for i in range(0, len(missing), batch_size):
+            batch = missing[i:i + batch_size]
+            src_msg_ids = [item["src_message_id"] for item in batch]
+            try:
+                # 用 bot.copy_messages 批量复制(不带转发尾巴)
+                copied_msgs = await bot_instance.copy_messages(
+                    chat_id=dst_channel_id,
+                    from_chat_id=src_channel_id,
+                    message_ids=src_msg_ids,
+                )
+                # copy_messages 返回 List[MessageId],顺序与输入一致
+                manifest_records = []
+                backup_mappings = []
+                for item, sent in zip(batch, copied_msgs):
+                    sent_msg_id = sent.message_id
+                    manifest_records.append({
+                        "group_id": group_id,
+                        "file_unique_id": item["file_unique_id"],
+                        "channel_id": dst_channel_id,
+                        "message_id": sent_msg_id,
+                        "media_type": item.get("media_type", ""),
+                    })
+                    # message_backups: main_msg_id 用 main_channel 的 msg_id
+                    # 常规场景 main_channel_id == src_channel_id,直接用 src_message_id
+                    # 补位场景 main_channel_id 可能不同,需查 manifest 获取 main_channel 的 msg_id
+                    if main_channel_id == src_channel_id:
+                        main_msg_id = item["src_message_id"]
+                    else:
+                        main_msg_id = await store.get_manifest_msg_id(
+                            group_id, main_channel_id, item["file_unique_id"]
+                        )
+                    if main_msg_id:
+                        backup_mappings.append((main_msg_id, sent_msg_id))
+
+                # 3. 更新 manifest + message_backups
+                try:
+                    await store.upsert_manifest_batch(manifest_records)
+                except Exception as e:
+                    logger.warning(f"[Mon][manifest] 批量登记失败 dst={dst_channel_id}: {e}")
+
+                if backup_mappings:
+                    try:
+                        await self._write_backup_mappings(main_channel_id, dst_channel_id, backup_mappings)
+                    except Exception as e:
+                        logger.warning(f"[Mon][manifest] message_backups 写入失败 dst={dst_channel_id}: {e}")
+
+                total_copied += len(copied_msgs)
+            except Exception as e:
+                logger.warning(
+                    f"[Mon][manifest] copy_messages 失败 src={src_channel_id} dst={dst_channel_id} "
+                    f"batch={i}-{i+len(batch)}: {e}"
+                )
+                # 失败的批次下周期重试(幂等:manifest 未登记,get_missing_from_src 会再次返回)
+                break
+
+        return total_copied
 
     @staticmethod
     async def _write_backup_mappings(main_channel_id: int, backup_channel_id: int, mappings: list[tuple[int, int]]) -> bool:
@@ -579,68 +444,13 @@ class MonScheduler:
             logger.warning(f"[Mon] 写入 message_backups 映射失败: {e}")
             return False
 
-    async def _fetch_new_messages(self, bot_instance, channel_id: int, last_cursor: int) -> list:
-        """获取频道中最后游标之后的新消息(媒体文件)。
-        
-        优先使用 Telethon iter_messages 可靠获取历史消息，
-        失败时回退到 get_updates。
-        """
-        msgs = []
-        try:
-            client = await self._ensure_telethon_client()
-            if client:
-                async for msg in client.iter_messages(channel_id, min_id=last_cursor, reverse=True):
-                    if msg.media:
-                        msgs.append(msg)
-                logger.debug(f"[Mon][fetch] Telethon 获取频道 {channel_id} 消息: cursor={last_cursor}, 新消息={len(msgs)}")
-                return msgs
-        except Exception as e:
-            logger.warning(f"[Mon][复制] Telethon 获取频道 {channel_id} 消息失败: {e}")
-        
-        # 注:Telethon 不可用时,不再回退到 bot_instance.get_updates()——
-        # 它会消费运行中 bot 自己的更新队列(P1-9),导致用户消息/解码回调被偷走而丢失。
-        # 改为跳过本次拉取并告警,依赖下一个监控周期重试(降级决策能力保留:
-        # 调用方本就周期性重试,且 Telethon 连接恢复后下一轮即可正常补齐)。
-        logger.warning(
-            f"[Mon][复制] Telethon 不可用,跳过频道 {channel_id} 的新消息拉取"
-            f"(不调用会消费 update 的 get_updates,避免偷走运行中 bot 的更新队列)"
-        )
-        return msgs
-
-    @staticmethod
-    async def _copy_messages(bot_instance, from_channel: int, to_channel: int, messages: list,
-                             stop_on_failure: bool = False) -> tuple[int, list[tuple[int, int]]]:
-        """批量复制消息到目标频道。返回 (成功复制数, [(原msg_id, 新msg_id)])。
-
-        Args:
-            stop_on_failure: 遇到第一个失败就停止复制后续消息。
-                用于 shadow 复制场景:保证返回的 mappings 是从 messages 开头连续成功的,
-                这样游标推进到 max(mappings) 时不会跳过中间失败的消息。
-        """
-        if not messages:
-            return 0, []
-        copied = 0
-        mappings = []
-        for msg in messages:
-            try:
-                result = await bot_instance.copy_message(
-                    chat_id=to_channel,
-                    from_chat_id=from_channel,
-                    message_id=_get_msg_id(msg),
-                )
-                copied += 1
-                mappings.append((_get_msg_id(msg), result.message_id))
-            except Exception as e:
-                logger.warning(f"[Mon][复制] copy_message 失败 msg_id={_get_msg_id(msg)}: {e}")
-                if stop_on_failure:
-                    break
-        return copied, mappings
-
     async def auto_fill_new_channels(self, bot_instance, all_cells: list[dict]) -> int:
-        """智能替补:检测新频道(last_synced_msg_id=0 且消息数 < Active),
-        从对应的 Active 槽位补齐所有存量文件。
+        """智能替补:检测新频道(manifest 中无记录),从 Active 槽位补齐所有存量文件。
 
-        「新频道只拉 Mon,系统自动补齐」—— 元宝方案核心设计。
+        Manifest 驱动(免 Telethon):
+        - 检测条件:该频道在 manifest 中无记录(新频道)
+        - 从当前 Active 复制缺失文件到新频道
+        - message_backups 的 main_msg_id 优先用组内 lost 频道(原 active)的 msg_id
         返回补齐的消息总数。
 
         Args:
@@ -657,94 +467,54 @@ class MonScheduler:
                 continue
 
             active_channel = active_slot["channel_id"]
+            group_id = int(_group_key)
             a_slot, s1_slot, s2_slot = group
+
+            # 找组内 lost 状态的槽位(原 active,补位时 main_msg_id 用它的 msg_id)
+            lost_slot = next(
+                (s for s in group if s and s.get("status") == "lost" and not s.get("is_r100")),
+                None,
+            )
+            # main_channel_id:优先用 lost(原 active),否则用当前 active
+            main_channel_id = lost_slot["channel_id"] if lost_slot else active_channel
 
             for shadow_slot in [s1_slot, s2_slot]:
                 if not shadow_slot:
                     continue
                 if shadow_slot["slot_id"] == active_slot["slot_id"]:
                     continue
-
-                last_synced = shadow_slot.get("last_synced_msg_id") or 0
-                if last_synced > 0:
+                if shadow_slot.get("status") not in ("shadow1", "shadow2"):
                     continue
 
-                shadow_empty = await self._is_channel_nearly_empty(
-                    bot_instance, shadow_slot["channel_id"]
-                )
-                if not shadow_empty:
-                    continue
+                shadow_channel = shadow_slot["channel_id"]
+                # 检测新频道:manifest 中无记录
+                try:
+                    has_manifest = await store.has_manifest_for_channel(group_id, shadow_channel)
+                except Exception:
+                    has_manifest = True  # 查询失败不触发补齐,避免误判
+                if has_manifest:
+                    continue  # 已有记录,非新频道
 
-                all_media = await self._fetch_all_media(bot_instance, active_channel)
-                if not all_media:
-                    continue
-
-                filled, mappings = await self._copy_messages(
-                    bot_instance, active_channel,
-                    shadow_slot["channel_id"], all_media,
+                # 从 active 复制缺失文件到新 shadow
+                filled = await self._copy_missing_via_manifest(
+                    bot_instance, store, group_id,
+                    src_channel_id=active_channel,
+                    dst_channel_id=shadow_channel,
+                    main_channel_id=main_channel_id,
                 )
                 if filled > 0:
-                    write_ok = await self._write_backup_mappings(
-                        active_channel, shadow_slot["channel_id"], mappings
+                    total_filled += filled
+                    # 标记 last_synced_msg_id 为非 0,表示已补齐(兼容旧逻辑)
+                    await store.update_cell_fields_local(
+                        shadow_slot["slot_id"], {"last_synced_msg_id": 1}
                     )
-                    if write_ok:
-                        latest_id = max(_get_msg_id(msg) for msg in all_media)
-                        await store.update_cell_fields_local(shadow_slot["slot_id"], {"last_synced_msg_id": latest_id})
-                        shadow_slot["last_synced_msg_id"] = latest_id
-                        total_filled += filled
-                        logger.info(
-                            f"[Mon][填充] {shadow_slot['slot_id']} "
-                            f"新频道补齐 {filled} 条消息"
-                        )
-                    else:
-                        # 映射写入失败,不推进游标,下周期 replicate 会重试
-                        logger.warning(
-                            f"[Mon][填充] {shadow_slot['slot_id']} 映射写入失败,"
-                            f"游标保持 0,下周期重试"
-                        )
+                    shadow_slot["last_synced_msg_id"] = 1
+                    logger.info(
+                        f"[Mon][填充] {shadow_slot['slot_id']} "
+                        f"新频道补齐 {filled} 条文件 (main_channel={main_channel_id})"
+                    )
 
         return total_filled
-
-    async def _is_channel_nearly_empty(self, bot_instance, channel_id: int, threshold: int = 3) -> bool:
-        """判断频道是否几乎为空(媒体消息 ≤ threshold)。"""
-        try:
-            client = await self._ensure_telethon_client()
-            if client:
-                count = 0
-                async for msg in client.iter_messages(channel_id, limit=threshold):
-                    if msg.media:
-                        count += 1
-                return count < threshold
-        except Exception as e:
-            logger.warning(f"[Mon][检查] 频道 {channel_id} 检查失败: {e}")
-        return False
-
-    async def _fetch_all_media(self, bot_instance, channel_id: int, limit: int = 200) -> list:
-        """拉取频道中所有媒体消息(用于智能补齐)。
-
-        N-16-3: 分页拉取全部历史，而非仅最新 200 条，确保大频道补齐完整。
-        """
-        msgs = []
-        try:
-            client = await self._ensure_telethon_client()
-            if client:
-                batch_size = 200
-                max_id = 0  # 0 表示从最新开始
-                while True:
-                    batch = []
-                    async for msg in client.iter_messages(channel_id, limit=batch_size, max_id=max_id):
-                        if msg.media:
-                            batch.append(msg)
-                    if not batch:
-                        break
-                    msgs.extend(batch)
-                    # 用本批最小 id 作为下一批的 max_id，继续往前翻页
-                    max_id = min(_get_msg_id(msg) for msg in batch) - 1
-                    if len(batch) < batch_size:
-                        break
-        except Exception as e:
-            logger.warning(f"[Mon][填充] 拉取频道 {channel_id} 媒体消息失败: {e}")
-        return msgs
 
     async def validate_topology(self, all_cells: list[dict]) -> list[str]:
         """定期拓扑校验:检测环形链表是否断裂。

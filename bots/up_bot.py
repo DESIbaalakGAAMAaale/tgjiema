@@ -40,6 +40,10 @@ TOKEN = settings.UPLOAD_BOT_TOKEN
 
 _pending_media_groups: dict[str, dict] = {}
 _active_a_slots: list[dict] = []
+# Manifest: channel_id → group_id 内存缓存(从 cells_local 加载,定期刷新)
+_channel_to_group: dict[int, int] = {}
+_channel_to_group_ts: float = 0.0
+_CHANNEL_GROUP_CACHE_TTL: float = 300.0  # 缓存 300 秒
 # 模块级存储：上传元数据，避免 context.user_data 在 callback 间丢失
 _pending_upload_meta: dict[int, dict] = {}
 _active_slot_index: int = 0
@@ -48,6 +52,80 @@ _mg_lock = asyncio.Lock()  # 保护 _pending_media_groups 和 _external_buffers
 _pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
 # PRE-15: 追踪已完成的 _finalize_upload 消息 ID，防止 Telegram 重复回调覆盖成功消息
 _finalized_msg_ids: set[int] = set()
+
+
+def _extract_file_unique_id(msg) -> str:
+    """从 PTB Message 对象提取 file_unique_id(跨 bot 稳定去重键)。"""
+    if not msg:
+        return ""
+    if msg.photo:
+        return msg.photo[-1].file_unique_id
+    if msg.video:
+        return msg.video.file_unique_id
+    if msg.document:
+        return msg.document.file_unique_id
+    if msg.audio:
+        return msg.audio.file_unique_id
+    if msg.voice:
+        return msg.voice.file_unique_id
+    if msg.sticker:
+        return msg.sticker.file_unique_id
+    if msg.animation:
+        return msg.animation.file_unique_id
+    return ""
+
+
+async def _ensure_channel_group_map():
+    """刷新 channel_id → group_id 内存缓存(从 cells_local 加载)。
+
+    group_id 从 slot_id 解析: 'a1'→1, 's1a'→1, 's1b'→1, 'a2'→2 ...
+    """
+    global _channel_to_group, _channel_to_group_ts
+    import re as _re
+    now = time.time()
+    if _channel_to_group_ts > 0 and (now - _channel_to_group_ts) < _CHANNEL_GROUP_CACHE_TTL:
+        return
+    try:
+        store = get_cache_store()
+        cells = await store.get_all_cells_local()
+        new_map = {}
+        for c in cells:
+            sid = c.get("slot_id", "")
+            chan = c.get("channel_id", 0)
+            if not sid or not chan:
+                continue
+            m = _re.match(r'[as](\d+)[ab]?', sid)
+            if m:
+                new_map[chan] = int(m.group(1))
+        _channel_to_group = new_map
+        _channel_to_group_ts = now
+        logger.debug(f"[Up] channel→group 映射已刷新: {len(new_map)} 条")
+    except Exception as e:
+        logger.warning(f"[Up] 刷新 channel→group 映射失败: {e}")
+
+
+async def _register_manifest(channel_id: int, message_id: int, msg, media_type: str = ""):
+    """写入 Active 频道后登记 manifest(异步,失败不影响主流程)。
+
+    Args:
+        channel_id: 存储频道 ID
+        message_id: 该频道中的消息 ID
+        msg: PTB Message 对象(用于提取 file_unique_id),或 None
+        media_type: 文件类型(document/photo/video...)
+    """
+    try:
+        fuid = _extract_file_unique_id(msg) if msg else ""
+        if not fuid:
+            return
+        await _ensure_channel_group_map()
+        group_id = _channel_to_group.get(channel_id)
+        if group_id is None:
+            logger.warning(f"[Up] 无法解析频道 {channel_id} 的 group_id,跳过 manifest 登记")
+            return
+        store = get_cache_store()
+        await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type)
+    except Exception as e:
+        logger.warning(f"[Up] 登记 manifest 失败 (channel={channel_id}, msg_id={message_id}): {e}")
 
 async def _cleanup_pending():
     """定期清理超时未完成的 media group 和 external buffer。"""
@@ -462,6 +540,11 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             # copy_messages 返回 MessageId 列表,顺序与输入一致
             all_mids = [m.message_id for m in copied]
             all_meta = [extract_file_meta(up) for up in updates]
+            # Manifest 登记(逐条,用原始 update.message 提取 file_unique_id)
+            for up, mid in zip(updates, all_mids):
+                asyncio.create_task(_register_manifest(
+                    target_ch, mid, up.message, detect_file_type(up),
+                ))
             # R100 归档(逐条,因 R100 是独立归档频道)
             for up in updates:
                 asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
@@ -480,6 +563,10 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                 forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
                 all_mids.append(forwarded.message_id)
                 all_meta.append(extract_file_meta(up))
+                # Manifest 登记
+                asyncio.create_task(_register_manifest(
+                    target_ch, forwarded.message_id, up.message, detect_file_type(up),
+                ))
                 asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
             except Exception as e:
                 logger.error(f"[Up] media group copy failed: {e}")
@@ -538,6 +625,11 @@ async def _process_upload(
     try:
         forwarded = await safe_copy_message(context.bot, main_channel, update.effective_chat.id, update.message.message_id)
         channel_msg_id = forwarded.message_id
+        # Manifest 登记(异步,失败不影响主流程)
+        asyncio.create_task(_register_manifest(
+            main_channel, channel_msg_id, update.message,
+            next(iter(file_types.keys()), "") if file_types else "",
+        ))
     except Exception as e:
         logger.error(f"[Up] 转发文件到存储频道失败 {e}")
         await metrics.record_error("up_bot")

@@ -215,6 +215,25 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_cells_local_status ON cells_local(status)"
         )
+        # ─── Manifest 表：Manifest 驱动的副本同步（免 Telethon 读历史）───
+        # 记录每个文件(file_unique_id)在每个频道的 message_id,补位时按 manifest 从存活频道 copyMessages
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS manifest (
+                group_id        INTEGER NOT NULL,
+                file_unique_id  TEXT NOT NULL,
+                channel_id      BIGINT NOT NULL,
+                message_id      BIGINT NOT NULL,
+                media_type      TEXT,
+                first_seen_at   TEXT,
+                PRIMARY KEY (group_id, file_unique_id, channel_id)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_manifest_group ON manifest(group_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_manifest_channel ON manifest(channel_id)"
+        )
         # ─── KV 键值存储：用于缓存 DDL 版本等配置 ───
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS kv_store (
@@ -1539,6 +1558,175 @@ class CacheStore:
             (version, ts),
         )
         await self._db.commit()
+
+    # ─── Manifest 驱动的副本同步（免 Telethon 读历史）───
+
+    async def upsert_manifest(
+        self, group_id: int, file_unique_id: str, channel_id: int,
+        message_id: int, media_type: str = "",
+    ):
+        """登记/更新一条 manifest 记录(本地 SQLite,零 CRDB RU)。
+
+        同一 (group_id, file_unique_id, channel_id) 幂等:已存在则更新 message_id。
+        """
+        if not self._db or not file_unique_id:
+            return
+        import datetime as _dt
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        await self._db.execute(
+            "INSERT OR REPLACE INTO manifest "
+            "(group_id, file_unique_id, channel_id, message_id, media_type, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (group_id, file_unique_id, channel_id, message_id, media_type, now_iso),
+        )
+        await self._db.commit()
+
+    async def upsert_manifest_batch(self, records: list[dict]):
+        """批量登记 manifest 记录。records: [{group_id, file_unique_id, channel_id, message_id, media_type}]"""
+        if not self._db or not records:
+            return
+        import datetime as _dt
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        rows = [
+            (r["group_id"], r["file_unique_id"], r["channel_id"],
+             r["message_id"], r.get("media_type", ""), now_iso)
+            for r in records if r.get("file_unique_id")
+        ]
+        if not rows:
+            return
+        await self._db.executemany(
+            "INSERT OR REPLACE INTO manifest "
+            "(group_id, file_unique_id, channel_id, message_id, media_type, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        await self._db.commit()
+
+    async def get_manifest_by_group(self, group_id: int) -> list[dict]:
+        """返回该组所有 manifest 记录。"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT group_id, file_unique_id, channel_id, message_id, media_type, first_seen_at "
+            "FROM manifest WHERE group_id = ?",
+            (group_id,),
+        )
+        cols = ["group_id", "file_unique_id", "channel_id", "message_id", "media_type", "first_seen_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def get_manifest_channels_for_group(self, group_id: int) -> list[int]:
+        """返回该组在 manifest 中有记录的所有 channel_id(去重)。"""
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT DISTINCT channel_id FROM manifest WHERE group_id = ?",
+            (group_id,),
+        )
+        return [r[0] for r in rows]
+
+    async def get_missing_in_channel(
+        self, group_id: int, channel_id: int,
+    ) -> list[dict]:
+        """返回该频道缺失的 file_unique_id 列表(含一个可用的源副本)。
+
+        每条: {file_unique_id, media_type, src_channel_id, src_message_id}
+        从任一其他存活频道取一个源副本。
+        """
+        if not self._db:
+            return []
+        # 先取该组所有 file_unique_id
+        all_rows = await self._db.execute_fetchall(
+            "SELECT DISTINCT file_unique_id FROM manifest WHERE group_id = ?",
+            (group_id,),
+        )
+        if not all_rows:
+            return []
+        all_fuids = [r[0] for r in all_rows]
+        # 再取该频道已有的 file_unique_id
+        existing_rows = await self._db.execute_fetchall(
+            "SELECT file_unique_id FROM manifest WHERE group_id = ? AND channel_id = ?",
+            (group_id, channel_id),
+        )
+        existing = {r[0] for r in existing_rows}
+        missing_fuids = [f for f in all_fuids if f not in existing]
+        if not missing_fuids:
+            return []
+        # 为每个缺失的 fuid 取一个源副本(从其他频道)
+        placeholders = ",".join("?" * len(missing_fuids))
+        src_rows = await self._db.execute_fetchall(
+            f"SELECT file_unique_id, channel_id, message_id, media_type "
+            f"FROM manifest WHERE group_id = ? AND file_unique_id IN ({placeholders}) "
+            f"AND channel_id != ? "
+            f"GROUP BY file_unique_id",  # 每个文件取一条
+            [group_id, *missing_fuids, channel_id],
+        )
+        cols = ["file_unique_id", "src_channel_id", "src_message_id", "media_type"]
+        return [dict(zip(cols, r)) for r in src_rows]
+
+    async def pick_peer_copy(
+        self, group_id: int, file_unique_id: str, exclude_channel: int,
+    ) -> dict | None:
+        """从存活频道取该文件的一个源副本(排除指定频道)。
+
+        返回 {channel_id, message_id, media_type} 或 None。
+        """
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            "SELECT channel_id, message_id, media_type FROM manifest "
+            "WHERE group_id = ? AND file_unique_id = ? AND channel_id != ? LIMIT 1",
+            (group_id, file_unique_id, exclude_channel),
+        )
+        if not rows:
+            return None
+        return {"channel_id": rows[0][0], "message_id": rows[0][1], "media_type": rows[0][2]}
+
+    async def has_manifest_for_channel(self, group_id: int, channel_id: int) -> bool:
+        """该频道是否已有 manifest 记录(用于判断是否需要补齐)。"""
+        if not self._db:
+            return False
+        rows = await self._db.execute_fetchall(
+            "SELECT 1 FROM manifest WHERE group_id = ? AND channel_id = ? LIMIT 1",
+            (group_id, channel_id),
+        )
+        return bool(rows)
+
+    async def get_missing_from_src(
+        self, group_id: int, src_channel_id: int, dst_channel_id: int,
+    ) -> list[dict]:
+        """返回 dst_channel 缺失、但 src_channel 有的文件列表。
+
+        每条: {file_unique_id, src_message_id, media_type}
+        用于常规复制(active→shadow):指定源为 active 频道。
+        """
+        if not self._db:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT a.file_unique_id, a.message_id, a.media_type "
+            "FROM manifest a "
+            "WHERE a.group_id = ? AND a.channel_id = ? "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM manifest b "
+            "  WHERE b.group_id = a.group_id AND b.channel_id = ? "
+            "  AND b.file_unique_id = a.file_unique_id"
+            ")",
+            (group_id, src_channel_id, dst_channel_id),
+        )
+        cols = ["file_unique_id", "src_message_id", "media_type"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def get_manifest_msg_id(
+        self, group_id: int, channel_id: int, file_unique_id: str,
+    ) -> int | None:
+        """查询某文件在某频道的 message_id,不存在返回 None。"""
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            "SELECT message_id FROM manifest "
+            "WHERE group_id = ? AND channel_id = ? AND file_unique_id = ? LIMIT 1",
+            (group_id, channel_id, file_unique_id),
+        )
+        return rows[0][0] if rows else None
 
     # ─── KV 键值存储（0 CRDB RU）───
 
