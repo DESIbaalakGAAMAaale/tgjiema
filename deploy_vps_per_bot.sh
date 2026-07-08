@@ -284,9 +284,60 @@ done
 success "所有服务已启用（开机自启）"
 
 # ──────────────────────────────────────────────
-# 第六步：启动所有服务
+# 第六步：DNS pinning（避免 IPv6-only 解析导致 R2/CockroachDB 不可达）
 # ──────────────────────────────────────────────
-info "第六步：启动所有服务..."
+info "第六步：配置 /etc/hosts 静态解析（IPv4 pinning）..."
+
+# 某些 VPS（如 LXC 容器）的 DNS 对 Cloudflare/CockroachDB 只返回 AAAA，
+# 而 VPS 本身没有 IPv6 公网，导致 httpx/asyncpg 报 "name resolution" 失败。
+# 这里把关键外部服务固定到 Cloudflare anycast IPv4，绕过 IPv6-only 解析。
+ensure_host_pin() {
+    local ip="$1"
+    local host="$2"
+    # 幂等：已存在则跳过
+    if grep -qE "^\s*${ip}\s+${host}\s*$" /etc/hosts 2>/dev/null; then
+        return 0
+    fi
+    # 删除该 host 的旧 pin（可能 IP 已更新）
+    sed -i "/[[:space:]]${host//./\\.}[[:space:]]*$/d" /etc/hosts 2>/dev/null || true
+    echo "${ip} ${host}" >> /etc/hosts
+}
+
+# 1. CockroachDB Cloud（从 .env 读取主机名）
+CRDB_URL=$(grep -E "^COCKROACHDB_URL=" "$DEPLOY_DIR/.env" 2>/dev/null | head -1 | sed 's/.*@\([^:]*\).*/\1/')
+if [[ -n "$CRDB_URL" ]]; then
+    # 用 getent 取当前解析到的任一 IPv4（CRDB Cloud 的 ELB 有多个）
+    CRDB_IP=$(getent ahostsv4 "$CRDB_URL" 2>/dev/null | head -1 | awk '{print $1}')
+    if [[ -n "$CRDB_IP" ]]; then
+        ensure_host_pin "$CRDB_IP" "$CRDB_URL"
+        success "已 pin CockroachDB: $CRDB_IP → $CRDB_URL"
+    else
+        warn "无法解析 CockroachDB 主机 $CRDB_URL 的 IPv4，跳过（请检查 DNS）"
+    fi
+fi
+
+# 2. Cloudflare R2（从 .env 读取 endpoint，回退用 account_id 拼接）
+R2_ENDPOINT=$(grep -E "^R2_ENDPOINT=" "$DEPLOY_DIR/.env" 2>/dev/null | head -1 | sed 's/.*=//' | sed 's|^https\\?://||' | sed 's|/.*||' | tr -d '`' )
+R2_ACCOUNT=$(grep -E "^R2_ACCOUNT_ID=" "$DEPLOY_DIR/.env" 2>/dev/null | head -1 | sed 's/.*=//')
+R2_HOST="${R2_ENDPOINT:-${R2_ACCOUNT}.r2.cloudflarestorage.com}"
+R2_HOST="${R2_HOST#\`}"  # 去除可能的反引号
+R2_HOST="${R2_HOST%\`}"
+if [[ -n "$R2_HOST" ]]; then
+    # R2 用 Cloudflare anycast IPv4（104.16.0.0/12 段），不依赖 DNS 返回
+    ensure_host_pin "104.16.0.1" "$R2_HOST"
+    success "已 pin Cloudflare R2: 104.16.0.1 → $R2_HOST"
+fi
+
+# 3. Telegram API（可选，通常 DNS 正常，但保险起见也 pin 上）
+# TG_IP=$(getent ahostsv4 api.telegram.org 2>/dev/null | head -1 | awk '{print $1}')
+# [[ -n "$TG_IP" ]] && ensure_host_pin "$TG_IP" "api.telegram.org"
+
+success "DNS pinning 完成"
+
+# ──────────────────────────────────────────────
+# 第七步：启动所有服务
+# ──────────────────────────────────────────────
+info "第七步：启动所有服务..."
 
 # 先启动数据库备份（无依赖）
 systemctl start "${SVC_PREFIX}-db_backup" || warn "启动 ${SVC_PREFIX}-db_backup 失败，请查看日志"
@@ -306,9 +357,9 @@ systemctl start "${SVC_PREFIX}-admin" || warn "启动 ${SVC_PREFIX}-admin 失败
 sleep 3
 
 # ──────────────────────────────────────────────
-# 第七步：拓扑刷新（清理 git 占位 ID，从 .env 重新生成）
+# 第八步：拓扑刷新（清理 git 占位 ID，从 .env 重新生成）
 # ──────────────────────────────────────────────
-info "第七步：拓扑刷新..."
+info "第八步：拓扑刷新..."
 
 source venv/bin/activate
 cd "$DEPLOY_DIR"
@@ -341,9 +392,9 @@ else
 fi
 
 # ──────────────────────────────────────────────
-# 第八步：状态检查
+# 第九步：状态检查
 # ──────────────────────────────────────────────
-info "第八步：状态检查..."
+info "第九步：状态检查..."
 
 echo ""
 echo "--------------------------------------------------------------------------------"
@@ -412,9 +463,9 @@ echo "    journalctl -u tgjiema-* -p err -n 50 --no-pager"
 echo ""
 
 # ──────────────────────────────────────────────
-# 第九步：TLS 反代（Caddy）— 可选，仅当 caddy 已安装时自动配置
+# 第十步：TLS 反代（Caddy）— 可选，仅当 caddy 已安装时自动配置
 # ──────────────────────────────────────────────
-info "第九步：TLS 反代（Caddy）配置检查..."
+info "第十步：TLS 反代（Caddy）配置检查..."
 
 if command -v caddy &> /dev/null; then
     info "检测到 Caddy，正在生成 TLS 反代配置模板..."
