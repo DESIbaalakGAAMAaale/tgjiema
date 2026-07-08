@@ -744,6 +744,21 @@ class D1Collection:
                 )
                 all_params.append(val_json)
                 all_params.append(val_json)
+        if "$addToSet" in update:
+            # P2-5/F-L4: 去重追加,用 jsonb @> 包含检查避免重复入列
+            for k, v in update["$addToSet"].items():
+                _validate_identifier(k)
+                val_json = _json_dumps(v, default=str)
+                set_parts.append(
+                    f"{k} = CASE WHEN {k} IS NULL OR {k} = '' "
+                    f"THEN jsonb_build_array(${len(all_params) + 1}::jsonb) "
+                    f"WHEN NOT ({k}::jsonb @> jsonb_build_array(${len(all_params) + 2}::jsonb)) "
+                    f"THEN {k}::jsonb || jsonb_build_array(${len(all_params) + 3}::jsonb) "
+                    f"ELSE {k}::jsonb END"
+                )
+                all_params.append(val_json)
+                all_params.append(val_json)
+                all_params.append(val_json)
 
         if not set_parts:
             return UpdateResult(0)
@@ -1689,7 +1704,22 @@ async def update_file_record_and_invalidate(file_code: str, update: dict):
                 else:
                     cur = [v]
                 existing[k] = cur  # upsert_file_record_local 会通过 _serialize 转回 JSON 字符串
-        if "$inc" not in update and "$set" not in update and "$push" not in update:
+        if "$addToSet" in update:
+            # P2-5/F-L4: 去重追加,同一值不重复入列
+            for k, v in update["$addToSet"].items():
+                cur = existing.get(k)
+                if isinstance(cur, str):
+                    try:
+                        cur = json.loads(cur)
+                    except (json.JSONDecodeError, TypeError):
+                        cur = []
+                if isinstance(cur, list):
+                    if v not in cur:
+                        cur.append(v)
+                else:
+                    cur = [v]
+                existing[k] = cur
+        if "$inc" not in update and "$set" not in update and "$push" not in update and "$addToSet" not in update:
             # 兼容：直接传入 {field: value} 形式（无操作符）
             existing.update(update)
         await store.upsert_file_record_local(existing, mark_dirty=False)
@@ -2002,10 +2032,10 @@ async def enqueue_job(
     await store.notify_dsp_new_job()
     
     # 递增本地计数器(用于 admin /status)
+    # R25-L2: active_files 由 incr_user_code_count 统一维护(在线码数),此处不再重复递增
     try:
         from utils.shared_counters import status_counters
         status_counters["total_files"] = status_counters.get("total_files", 0) + 1
-        status_counters["active_files"] = status_counters.get("active_files", 0) + 1
     except Exception:
         pass
     
@@ -2177,52 +2207,6 @@ async def mark_job_dead(job_id: int, reason: str):
         )
     except Exception as e:
         logger.error(f"[DB] mark_job_dead 失败 job_id={job_id}: {e}")
-
-
-async def get_and_reset_dead_jobs(max_count: int = 10) -> list:
-    """获取死信队列中的 job 并重置为 pending,供 DSP 重试。
-    
-    限制: 每个 job 最多重试 2 次死信队列,超过后永久丢弃。
-    """
-    col = get_jobs_col()
-    import datetime as _dt
-    # 查找死信 job,且死信重试次数 < 2
-    # 使用 find 替代不存在的 aggregate 方法
-    dead_jobs = await col.find(
-        {"status": "dead"},
-        sort=("created_at", 1),
-        limit=max_count,
-        projection=["id", "dead_retry_count", "code", "target_user_id",
-                     "storage_channel_id", "storage_msg_ids", "batch_file_meta",
-                     "task_type", "retry_count", "protect_content", "created_at"],
-    )
-
-    if not dead_jobs:
-        return []
-
-    # 重置这些 job,并递增死信重试次数
-    # 不重置 retry_count,避免每个死信周期都重试 3 次
-    updated = []
-    for job in dead_jobs:
-        job_id = job.get("id")
-        if not job_id:
-            continue
-        dead_retry_count = job.get("dead_retry_count", 0)
-        if dead_retry_count >= 2:
-            continue  # 超过重试上限,永久丢弃
-        result = await col.update_one(
-            {"id": job_id},
-            {"$set": {
-                "status": "pending",
-                "dead_retry": True,
-                "dead_retry_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            },
-            "$inc": {"dead_retry_count": 1}},
-        )
-        if result.matched_count > 0:
-            updated.append(job_id)
-
-    return updated
 
 
 # ─── D: SQLite 本地队列同步函数 ─────────────────────────────────

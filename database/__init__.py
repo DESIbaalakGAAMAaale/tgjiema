@@ -43,7 +43,6 @@ from .session import (
     get_rotation_config_col, get_rotation_config, set_rotation_config,
     get_user_cached, update_user_and_invalidate, get_file_record_cached, update_file_record_and_invalidate,
     get_code_entry_cached,
-    get_and_reset_dead_jobs,
 )
 __all__ = [
     "USER_DOC",
@@ -141,5 +140,4 @@ __all__ = [
     "get_file_record_cached",
     "update_file_record_and_invalidate",
     "get_code_entry_cached",
-    "get_and_reset_dead_jobs",
 ]

@@ -770,22 +770,14 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     raw_text = context.user_data.pop("_override_text", None) or update.message.text.strip()
-    logger.info(f"[handle_code] raw_text={raw_text!r}, repr_bytes={raw_text.encode('utf-8')!r}")
-    # 打印消息实体,排查 Telegram 是否把文件码识别为 mention 导致截断
-    if update.message.entities:
-        for ent in update.message.entities:
-            entity_text = raw_text[ent.offset:ent.offset + ent.length] if ent.offset + ent.length <= len(raw_text) else "(out of range)"
-            logger.info(f"[handle_code] entity type={ent.type}, offset={ent.offset}, length={ent.length}, text={entity_text!r}")
-    else:
-        logger.info(f"[handle_code] no entities in message")
+    # R25-L1: 文件码属敏感凭据,日志降级到 DEBUG 且不记录原始文本/repr_bytes
+    logger.debug(f"[handle_code] received text, len={len(raw_text)}, entities={len(update.message.entities) if update.message.entities else 0}")
 
     # 1. 先检查消息中是否包含内部文件码（最高优先级）
     # 容错: 用户复制"文件码：xxx"通知消息时,可能带入前缀后面的中英文冒号(: ：),需先剥掉
     prefix = settings.FILE_CODE_PREFIX
     # 匹配 prefix + 可选的冒号(中英文) + 实际文件码字符
     internal_match = re.search(r'(' + re.escape(prefix) + r'[:：]*[a-z0-9_]+)', raw_text)
-    matched_code = internal_match.group(1) if internal_match else None
-    logger.info(f"[handle_code] prefix={prefix!r}, internal_match={matched_code!r}")
 
     if internal_match:
         # 内部码：优先走本地解码。剥掉 prefix 后可能残留的冒号,只保留实际码
@@ -795,7 +787,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tail = text[len(prefix):]
             tail = tail.lstrip(":：")
             text = prefix + tail
-        logger.info(f"[handle_code] extracted internal code={text!r}, repr_bytes={text.encode('utf-8')!r}")
+        logger.debug(f"[handle_code] internal code matched, len={len(text)}")
         is_external = False
     else:
         # 2. 没有内部码 → 提取 bot 用户名走第三方码

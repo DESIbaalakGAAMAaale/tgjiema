@@ -356,9 +356,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             file_code = parts[1]
             reporter_id = int(parts[2])
-            # PRE-06: 用 update_file_record_and_invalidate 一次性双写 CRDB+SQLite 并失效内存缓存
+            # P2-5/F-L4: 用 $addToSet 去重写入,防止同一举报人重复入列
             try:
-                await update_file_record_and_invalidate(file_code, {"$push": {"blocked_users": reporter_id}})
+                await update_file_record_and_invalidate(file_code, {"$addToSet": {"blocked_users": reporter_id}})
             except Exception as e:
                 logger.error(f"[Admin][report:block] 双写失败: {e}")
                 invalidate_file_record(file_code)

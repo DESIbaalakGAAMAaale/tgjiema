@@ -33,12 +33,11 @@ _BOT_USERNAME_IN_MESSAGE = re.compile(r"([a-zA-Z0-9_]+bot)", re.IGNORECASE)
 _INTERNAL_CODE_SUFFIX_PATTERN = re.compile(r"^[a-z0-9]{12}(?:_\d+[pvdagos])+$")
 
 
-def _generate_deterministic_id(length: int = 12) -> str:
+def _generate_random_id(length: int = 12) -> str:
     """密码学安全随机 ID，零 DB 往返。
 
-    S-5: 改用 secrets.randbelow 替代 SHA256(time_ns+PID)，
-    消除确定性派生带来的可预测性风险，碰撞概率极低（36^12 ≈ 4.7×10^18）。
-    DB PRIMARY KEY 作为最后防线。
+    使用 secrets.randbelow 生成不可预测的随机 ID，
+    碰撞概率极低（36^12 ≈ 4.7×10^18），DB PRIMARY KEY 作为最后防线。
     """
     result = []
     for _ in range(length):
@@ -48,30 +47,19 @@ def _generate_deterministic_id(length: int = 12) -> str:
 
 def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
-    random_part = _generate_deterministic_id(12)
+    random_part = _generate_random_id(12)
     type_parts = []
-    logger.info(f"[build_file_code] input file_types={file_types!r}, type={type(file_types).__name__}, keys={list(file_types.keys()) if isinstance(file_types, dict) else 'N/A'}, repr_bytes={str(file_types).encode('utf-8')!r}")
     for label, abbr in FILE_TYPE_LABELS.items():
-        if isinstance(file_types, dict):
-            count = file_types.get(label, 0)
-            # 详细排查 key 不匹配问题
-            for actual_key, actual_val in file_types.items():
-                if actual_key == label:
-                    count = actual_val
-                    logger.info(f"[build_file_code] EXACT key match: label={label!r}, actual_key={actual_key!r}, actual_key_bytes={actual_key.encode('utf-8')!r}, val={actual_val!r}")
-                    break
-        else:
-            count = 0
-        logger.info(f"[build_file_code] label={label!r}, abbr={abbr!r}, count={count!r}, count>0={count > 0}, type(count)={type(count).__name__}")
+        count = file_types.get(label, 0) if isinstance(file_types, dict) else 0
         if count > 0:
             type_parts.append(f"{count}{abbr}")
     if not type_parts:
-        logger.error(f"[build_file_code] file_types 为空或无已知类型! file_types={file_types!r}, 将使用 0d 兜底")
+        logger.error(f"[build_file_code] file_types 为空或无已知类型, 将使用 0d 兜底")
         suffix = "0d"
     else:
         suffix = "_".join(type_parts)
     result = f"{prefix}_{random_part}_{suffix}"
-    logger.info(f"[build_file_code] FINAL code={result!r}")
+    logger.debug(f"[build_file_code] generated code, suffix={suffix!r}")
     return result
 
 

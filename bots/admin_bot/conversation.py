@@ -446,7 +446,9 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             bucket = ""
         await set_config("r2_account_id", data["account_id"])
         await set_config("r2_access_key", data["access_key"])
-        await set_config("r2_secret_key", data["secret_key"])
+        # P2-4: R2 Secret Key 比照 relay api_hash 做 Fernet 加密存储
+        from database.relay_db import encrypt as _encrypt_secret
+        await set_config("r2_secret_key", _encrypt_secret(data["secret_key"]))
         if bucket:
             await set_config("r2_bucket", bucket)
         await _end(f"✅ R2 备份配置已保存\n  Bucket: {bucket or '(默认)'}\n⚠️ 需重启后生效")

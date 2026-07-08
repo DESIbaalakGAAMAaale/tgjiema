@@ -664,7 +664,9 @@ async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await set_config("r2_account_id", args[0])
     await set_config("r2_access_key", args[1])
-    await set_config("r2_secret_key", args[2])
+    # P2-4: R2 Secret Key 比照 relay api_hash 做 Fernet 加密存储
+    from database.relay_db import encrypt as _encrypt_secret
+    await set_config("r2_secret_key", _encrypt_secret(args[2]))
     if len(args) >= 4:
         await set_config("r2_bucket", args[3])
 
