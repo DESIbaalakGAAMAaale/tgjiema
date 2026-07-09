@@ -293,6 +293,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /start_upload - 开始批次上传\n"
         "  发送多个文件...\n"
         "  /end_upload - 结束批次,生成文件码\n\n"
+        "🗂 **合集打包** (多个文件码打包成一个合集码):\n"
+        "  /new_collection - 开始合集打包\n"
+        "  发送文件码(可多次追加)...\n"
+        "  /end_collection - 生成合集码\n"
+        "  /cancel_collection - 取消合集打包\n"
+        "  /note_collection 文字 - 添加备注\n\n"
         "所有用户均可免费上传文件\n"
         + three_bot_reminder()
     )
@@ -347,6 +353,166 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch["note"] = note_text
     await update.message.reply_text(f"备注已设置为：{note_text}")
+
+
+async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """开始合集打包模式:用户后续发送的文件码将被收集进合集。"""
+    user = update.effective_user
+    if not await check_force_join(update, context):
+        return
+    if not await check_upload_permission(user.id):
+        await update.message.reply_text("您被禁止使用上传功能")
+        return
+    if "batch" in context.user_data:
+        await update.message.reply_text("当前正在进行批次上传,请先 /end_upload 或 /cancel_upload")
+        return
+    context.user_data["_collecting_collection"] = {
+        "codes": [],
+        "note": "",
+    }
+    await update.message.reply_text(
+        "📦 已进入合集打包模式。\n\n"
+        "请发送要打包的文件码(每行一个或空格分隔),\n"
+        "可多次发送以追加文件码。\n\n"
+        "发 /end_collection 完成打包并生成合集码。\n"
+        "发 /cancel_collection 取消本次合集打包。\n"
+        "发 /note_collection 文字 为合集添加备注"
+    )
+
+
+async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """结束合集打包,生成合集码并写入 file_records。"""
+    user = update.effective_user
+    if not await check_force_join(update, context):
+        return
+    coll = context.user_data.pop("_collecting_collection", None)
+    if coll is None:
+        await update.message.reply_text("当前没有进行中的合集打包,请先使用 /new_collection 开始")
+        return
+
+    codes = coll.get("codes", [])
+    if not codes:
+        await update.message.reply_text("合集为空(未收集到任何文件码),已取消")
+        return
+
+    # 去重并保留顺序
+    seen = set()
+    unique_codes = []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            unique_codes.append(c)
+
+    # 生成合集码
+    from services.code_generator import build_collection_code
+    collection_code = build_collection_code()
+
+    # 写入 file_records(is_collection=1, collection_codes=JSON, 无主频道)
+    collection_codes_json = _json_dumps(unique_codes)
+
+    from database import get_file_records_col, make_file_record, get_codes_col, make_code_entry
+    try:
+        files_col = get_file_records_col()
+        record = make_file_record(
+            file_code=collection_code,
+            uploader_id=user.id,
+            primary_channel_id=0,
+            primary_channel_msg_id=0,
+            file_types={},
+            batch_msg_ids="",
+            batch_file_meta="",
+            note=coll.get("note", ""),
+            protect_content=False,
+            file_ttl_days=settings.DEFAULT_FILE_TTL_DAYS,
+            is_collection=1,
+            collection_codes=collection_codes_json,
+        )
+        await files_col.insert_one(record)
+        # 同步写入 SQLite 本地缓存(0 CRDB RU 后续读取)
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().upsert_file_record_local(record, mark_dirty=False)
+        except Exception as cache_err:
+            logger.warning(f"[Up][collection] upsert_file_record_local 失败 code={collection_code}: {cache_err}", exc_info=True)
+            try:
+                from database.cache_store import get_cache_store
+                await get_cache_store().upsert_file_record_local(record, mark_dirty=True)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"[Up][collection] file_records 写入失败 (code={collection_code}): {e}")
+        await update.message.reply_text("合集保存失败,请稍后重试")
+        return
+
+    # 写入 codes 表(支持后续 offline 标记与过期检查)
+    try:
+        actual_ttl_days = settings.DEFAULT_FILE_TTL_DAYS if settings.DEFAULT_FILE_TTL_DAYS else 0
+        if actual_ttl_days == 0:
+            expire_dt = datetime.datetime(2099, 12, 31, 23, 59, 59, tzinfo=datetime.timezone.utc)
+        else:
+            expire_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=actual_ttl_days)
+        codes_col = get_codes_col()
+        ce = make_code_entry(
+            code=collection_code,
+            uploader_id=user.id,
+            file_types={},
+            batch_msg_ids="",
+            batch_file_meta="",
+            primary_channel_id=0,
+            note=coll.get("note", ""),
+            expire_time=expire_dt.isoformat(),
+        )
+        await codes_col.insert_one(ce)
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().upsert_code_local(ce, mark_dirty=False)
+        except Exception as cache_err:
+            logger.warning(f"[Up][collection] upsert_code_local 失败 code={collection_code}: {cache_err}", exc_info=True)
+            try:
+                from database.cache_store import get_cache_store
+                await get_cache_store().upsert_code_local(ce, mark_dirty=True)
+            except Exception:
+                pass
+        from database.cache import get_code_cache
+        get_code_cache().set(f"code:{collection_code}", ce)
+        from database.cache import clear_negative_file
+        clear_negative_file(collection_code)
+    except Exception as e:
+        logger.error(f"[Up][collection] codes 表写入失败(code={collection_code}): {e}")
+
+    await update.message.reply_text(
+        f"✅ 合集打包完成!\n\n"
+        f"📦 合集码: {collection_code}\n"
+        f"📄 包含 {len(unique_codes)} 个文件码\n"
+        f"💡 将合集码发送给解码机器人即可一次性获取全部文件"
+    )
+
+
+async def cancel_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """取消合集打包。"""
+    if not await check_force_join(update, context):
+        return
+    if "_collecting_collection" in context.user_data:
+        del context.user_data["_collecting_collection"]
+        await update.message.reply_text("合集打包已取消")
+    else:
+        await update.message.reply_text("当前没有进行中的合集打包")
+
+
+async def note_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """为合集添加备注。"""
+    if not await check_force_join(update, context):
+        return
+    coll = context.user_data.get("_collecting_collection")
+    if coll is None:
+        await update.message.reply_text("当前没有进行中的合集打包,请先使用 /new_collection 开始")
+        return
+    note_text = " ".join(context.args) if context.args else ""
+    if not note_text:
+        await update.message.reply_text("用法:/note_collection 备注内容\n例如:/note_collection 张三的合集")
+        return
+    coll["note"] = note_text
+    await update.message.reply_text(f"合集备注已设置为：{note_text}")
 
 
 async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1049,6 +1215,34 @@ async def _finalize_upload(query, context, user_id: int):
 
 async def _handle_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """当用户处于等待备注输入状态时，捕获文字消息作为备注。"""
+    # ── 合集打包模式:捕获用户发送的文件码 ──
+    coll = context.user_data.get("_collecting_collection")
+    if coll is not None:
+        text = update.message.text or ""
+        # 按换行/空格分割,过滤出有效文件码
+        from services.code_generator import is_valid_code_format
+        tokens = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) > 1:
+                tokens.extend(parts)
+            else:
+                tokens.append(line)
+        new_codes = [t for t in tokens if is_valid_code_format(t)]
+        if not new_codes:
+            await update.message.reply_text("未识别到有效文件码,请发送格式正确的文件码")
+            return
+        coll["codes"].extend(new_codes)
+        await update.message.reply_text(
+            f"✅ 已追加 {len(new_codes)} 个文件码\n"
+            f"📦 当前合集共 {len(coll['codes'])} 个文件码\n"
+            f"继续发送文件码,或 /end_collection 完成"
+        )
+        return
+
     user_id = update.effective_user.id
     note_since = context.user_data.get("awaiting_note_since")
     if note_since is None:
@@ -1333,6 +1527,10 @@ async def _async_main():
     app.add_handler(CommandHandler("cancel_upload", cancel_upload))
     app.add_handler(CommandHandler("note", note_command))
     app.add_handler(CommandHandler("cancel_note", cancel_note))
+    app.add_handler(CommandHandler("new_collection", new_collection))
+    app.add_handler(CommandHandler("end_collection", end_collection))
+    app.add_handler(CommandHandler("cancel_collection", cancel_collection))
+    app.add_handler(CommandHandler("note_collection", note_collection))
     app.add_handler(CallbackQueryHandler(upload_option_callback, pattern=r"^opt\|"))
 
     # 备注文字输入处理（需在 EXTERNAL_DONE 和 media 之前）

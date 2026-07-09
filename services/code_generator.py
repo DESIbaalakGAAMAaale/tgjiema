@@ -63,10 +63,20 @@ def build_file_code(file_types: dict) -> str:
     return result
 
 
+def build_collection_code() -> str:
+    """生成合集码。格式: {prefix}_box_{12位base36}，如 tgwenjian_box_a1b2c3d4e5f6"""
+    prefix = settings.FILE_CODE_PREFIX
+    random_part = _generate_random_id(12)
+    result = f"{prefix}_box_{random_part}"
+    logger.debug(f"[build_collection_code] generated collection code: {result}")
+    return result
+
+
 def is_valid_code_format(code: str) -> bool:
     """判断文本是否为有效文件码格式。
-    
+
     内部码格式: {prefix}_{12位base36}_{类型后缀}，如 tgwenjian_a1b2c3d4e5f6_3p_2v_1d
+    合集码格式: {prefix}_box_{12位base36}，如 tgwenjian_box_a1b2c3d4e5f6
     外部码格式: {botname}bot 开头，如 ccmarkbotutheigh1231gg1f4
     不在消息中随意匹配，防止误判普通文本。
     """
@@ -78,6 +88,11 @@ def is_valid_code_format(code: str) -> bool:
     if code.startswith(prefix + "_"):
         suffix = code[len(prefix) + 1:]
         if _INTERNAL_CODE_SUFFIX_PATTERN.match(suffix):
+            return True
+    # 合集码: {prefix}_box_{12位base36}
+    if code.startswith(prefix + "_box_"):
+        box_suffix = code[len(prefix) + 5:]  # 去掉 prefix + "_box_"
+        if re.match(r"^[a-z0-9]{12}$", box_suffix):
             return True
     # 外部码：bot 名称开头，且不含空格/换行
     if _BOT_PATTERN.match(code) and '\n' not in code and ' ' not in code:

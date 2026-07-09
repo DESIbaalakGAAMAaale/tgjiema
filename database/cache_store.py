@@ -319,6 +319,8 @@ class CacheStore:
                 create_time          TEXT,
                 updated_at           TEXT,
                 max_requests         INTEGER DEFAULT 0,
+                is_collection        INTEGER DEFAULT 0,
+                collection_codes     TEXT DEFAULT '[]',
                 crdb_synced          INTEGER DEFAULT 1
             )"""
         )
@@ -327,6 +329,15 @@ class CacheStore:
             await self._db.execute("ALTER TABLE file_records_local ADD COLUMN max_requests INTEGER DEFAULT 0")
         except Exception as e:
             logger.debug(f"[CacheStore] file_records_local ADD max_requests (幂等,可忽略): {e}")
+        # 合集码字段：is_collection 标记是否为合集,collection_codes 存储 JSON 数组
+        try:
+            await self._db.execute("ALTER TABLE file_records_local ADD COLUMN is_collection INTEGER DEFAULT 0")
+        except Exception as e:
+            logger.debug(f"[CacheStore] file_records_local ADD is_collection (幂等,可忽略): {e}")
+        try:
+            await self._db.execute("ALTER TABLE file_records_local ADD COLUMN collection_codes TEXT DEFAULT '[]'")
+        except Exception as e:
+            logger.debug(f"[CacheStore] file_records_local ADD collection_codes (幂等,可忽略): {e}")
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS codes_local (
                 code                 TEXT PRIMARY KEY,
@@ -2054,15 +2065,18 @@ class CacheStore:
                 r.get("file_ttl_days", 0), r.get("note", ""),
                 r.get("expire_time"), _serialize(r.get("blocked_users", "[]")),
                 r.get("create_time"), r.get("updated_at"),
-                int(r.get("max_requests", 0) or 0), 1,  # crdb_synced=1
+                int(r.get("max_requests", 0) or 0),
+                int(r.get("is_collection", 0) or 0), r.get("collection_codes", "[]") or "[]",
+                1,  # crdb_synced=1
             ))
         await self._db.executemany(
             """INSERT OR REPLACE INTO file_records_local
             (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
              file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
              file_ids, status, request_count, protect_content, file_ttl_days, note,
-             expire_time, blocked_users, create_time, updated_at, max_requests, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             expire_time, blocked_users, create_time, updated_at, max_requests,
+             is_collection, collection_codes, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             records,
         )
         await self._db.commit()
@@ -2075,7 +2089,8 @@ class CacheStore:
             """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
                       file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
                       file_ids, status, request_count, protect_content, file_ttl_days, note,
-                      expire_time, blocked_users, create_time, updated_at, max_requests
+                      expire_time, blocked_users, create_time, updated_at, max_requests,
+                      is_collection, collection_codes
                FROM file_records_local WHERE file_code = ?""",
             (file_code,),
         )
@@ -2090,6 +2105,7 @@ class CacheStore:
             "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
             "note": r[13], "expire_time": r[14], "blocked_users": r[15],
             "create_time": r[16], "updated_at": r[17], "max_requests": r[18],
+            "is_collection": r[19], "collection_codes": r[20],
         })
 
     async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True):
@@ -2113,8 +2129,9 @@ class CacheStore:
             (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
              file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
              file_ids, status, request_count, protect_content, file_ttl_days, note,
-             expire_time, blocked_users, create_time, updated_at, max_requests, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             expire_time, blocked_users, create_time, updated_at, max_requests,
+             is_collection, collection_codes, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record.get("file_code"), record.get("uploader_id"),
              record.get("primary_channel_id"), record.get("primary_channel_msg_id"),
              _serialize(record.get("file_types")), _serialize(record.get("backup_channel_msg_ids")),
@@ -2124,7 +2141,9 @@ class CacheStore:
              record.get("file_ttl_days", 0), record.get("note", ""),
              record.get("expire_time"), _serialize(record.get("blocked_users", "[]")),
              record.get("create_time"), record.get("updated_at"),
-             int(record.get("max_requests", 0) or 0), synced),
+             int(record.get("max_requests", 0) or 0),
+             int(record.get("is_collection", 0) or 0), record.get("collection_codes", "[]") or "[]",
+             synced),
         )
         await self._db.commit()
 
@@ -2136,7 +2155,8 @@ class CacheStore:
             """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
                       file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
                       file_ids, status, request_count, protect_content, file_ttl_days, note,
-                      expire_time, blocked_users, create_time, updated_at, max_requests
+                      expire_time, blocked_users, create_time, updated_at, max_requests,
+                      is_collection, collection_codes
                FROM file_records_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
@@ -2147,6 +2167,7 @@ class CacheStore:
             "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
             "note": r[13], "expire_time": r[14], "blocked_users": r[15],
             "create_time": r[16], "updated_at": r[17], "max_requests": r[18],
+            "is_collection": r[19], "collection_codes": r[20],
         }) for r in rows]
 
     async def mark_file_record_synced(self, file_code: str):

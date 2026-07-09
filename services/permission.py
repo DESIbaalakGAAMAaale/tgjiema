@@ -7,7 +7,7 @@
 """
 
 import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from loguru import logger
@@ -63,6 +63,8 @@ class DecodeResult:
     is_external: bool = False
     external_bot_username: str = ""
     quota_consumed: bool = False  # 是否已预扣配额(投递失败时需要 refund)
+    is_collection: bool = False  # 是否为合集码(调用方需展开 collection_codes 批量派发)
+    collection_codes: list = field(default_factory=list)  # 合集包含的文件码列表
 
 
 async def get_or_create_user(user_id: int, username: str = None, first_name: str = None) -> dict:
@@ -338,6 +340,34 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         ext_q = q.get("ext_quota", 0)
         if ext_q != -1:
             remaining_ext = max(0, ext_q - ext_used - 1)
+
+    # ─── 合集码: 消耗 1 次配额后,返回合集包含的文件码列表交给调用方批量派发 ────
+    # 合集码本身消耗 1 次配额("打开合集"的消耗),合集中的每个文件码不额外消耗配额,
+    # 这样用户用一个配额就能获取合集中的所有文件。
+    if file_record is not None:
+        is_collection = file_record.get("is_collection", 0)
+        if isinstance(is_collection, str):
+            try:
+                is_collection = int(is_collection)
+            except ValueError:
+                is_collection = 0
+        if is_collection == 1:
+            import json as _json
+            try:
+                collection_codes = _json.loads(file_record.get("collection_codes", "[]") or "[]")
+            except (ValueError, TypeError):
+                collection_codes = []
+            return DecodeResult(
+                allowed=True,
+                file_record=file_record,
+                is_collection=True,
+                collection_codes=collection_codes,
+                remaining_quota=remaining,
+                remaining_external_quota=remaining_ext,
+                is_external=is_ext,
+                external_bot_username=bot_username or "",
+                quota_consumed=True,
+            )
 
     return DecodeResult(
         allowed=True,

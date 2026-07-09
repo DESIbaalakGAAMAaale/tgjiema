@@ -842,6 +842,47 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply_text(update.message, "文件不存在或已被删除")
         return
 
+    # ── 合集码:展开后批量派发(合集中的文件码不额外消耗配额) ──
+    # 合集码本身已消耗 1 次配额,合集中的每个文件码不再扣配额。
+    # 合集中的文件码可能本身也是合集 — 不递归处理,直接按普通码派发。
+    if result.is_collection:
+        sub_codes = result.collection_codes or []
+        await safe_reply_text(update.message, f"📦 合集包含 {len(sub_codes)} 个文件,正在批量发送...")
+        sub_ok = 0
+        sub_fail = 0
+        for sub_code in sub_codes:
+            try:
+                sub_record = await get_file_record_cached(sub_code)
+                if not sub_record or sub_record.get("status") != "active":
+                    sub_fail += 1
+                    continue
+                sub_channel = sub_record.get("primary_channel_id") or await _get_storage_channel()
+                sub_ids_str = sub_record.get("batch_msg_ids") or ""
+                if not isinstance(sub_ids_str, str):
+                    sub_ids_str = str(sub_ids_str)
+                sub_msg_ids = [int(mid) for mid in sub_ids_str.split(",") if mid.strip().isdigit()] if sub_ids_str else []
+                if not sub_msg_ids:
+                    primary_mid = sub_record.get("primary_channel_msg_id")
+                    if primary_mid is None:
+                        sub_fail += 1
+                        continue
+                    sub_msg_ids = [primary_mid]
+                sub_meta = sub_record.get("batch_file_meta") or ""
+                if isinstance(sub_meta, (list, bytes)):
+                    sub_meta = json.dumps(sub_meta) if sub_meta else ""
+                    if isinstance(sub_meta, bytes):
+                        sub_meta = sub_meta.decode()
+                sub_protect = sub_record.get("protect_content", False)
+                await _dispatch_to_dsp(user.id, sub_code, sub_channel, sub_msg_ids, sub_meta, sub_protect)
+                sub_ok += 1
+            except Exception as e:
+                logger.error(f"[Idx][collection] sub_code={sub_code} 派发失败: {e}")
+                sub_fail += 1
+        metrics.decode_count += 1
+        await metrics.record_processed("idx_bot")
+        await safe_reply_text(update.message, f"📦 合集发送完成: 成功 {sub_ok} 个,失败 {sub_fail} 个")
+        return
+
     storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
 
     try:
@@ -1961,6 +2002,141 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
 
 # ─── 消息路由 ───
 
+async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE, codes: list[str]):
+    """批量取件:逐个解码文件码,每个独立消耗配额,最后汇总结果。
+
+    提取 handle_code 的核心逻辑(check_decode_permission + _dispatch_to_dsp),
+    不对每个码单独回复,最后汇总成功/失败。
+    """
+    user = update.effective_user
+
+    # 限流与用户初始化(整批只做一次,避免逐码重复消耗限流令牌)
+    if not await global_rate_limiter.acquire():
+        await safe_reply_text(update.message, "系统繁忙,请稍后重试")
+        return
+    if not await user_rate_limiter.acquire(user.id):
+        await safe_reply_text(update.message, "操作过于频繁,请稍后重试")
+        return
+    await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
+    await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
+
+    await safe_reply_text(update.message, f"🔄 正在处理 {len(codes)} 个文件码,请稍候...")
+
+    success_codes: list[str] = []
+    failed_codes: list[tuple[str, str]] = []
+
+    for code in codes:
+        try:
+            result = await check_decode_permission(user.id, code)
+            if not result.allowed:
+                failed_codes.append((code, result.reason))
+                continue
+
+            # ── 合集码:展开后逐个派发(合集中的文件码不额外消耗配额) ──
+            if result.is_collection:
+                sub_codes = result.collection_codes or []
+                sub_ok = 0
+                sub_fail = 0
+                for sub_code in sub_codes:
+                    try:
+                        sub_record = await get_file_record_cached(sub_code)
+                        if not sub_record or sub_record.get("status") != "active":
+                            sub_fail += 1
+                            continue
+                        sub_channel = sub_record.get("primary_channel_id") or await _get_storage_channel()
+                        sub_ids_str = sub_record.get("batch_msg_ids") or ""
+                        if not isinstance(sub_ids_str, str):
+                            sub_ids_str = str(sub_ids_str)
+                        sub_msg_ids = [int(mid) for mid in sub_ids_str.split(",") if mid.strip().isdigit()] if sub_ids_str else []
+                        if not sub_msg_ids:
+                            primary_mid = sub_record.get("primary_channel_msg_id")
+                            if primary_mid is None:
+                                sub_fail += 1
+                                continue
+                            sub_msg_ids = [primary_mid]
+                        sub_meta = sub_record.get("batch_file_meta") or ""
+                        if isinstance(sub_meta, (list, bytes)):
+                            sub_meta = json.dumps(sub_meta) if sub_meta else ""
+                            if isinstance(sub_meta, bytes):
+                                sub_meta = sub_meta.decode()
+                        sub_protect = sub_record.get("protect_content", False)
+                        await _dispatch_to_dsp(user.id, sub_code, sub_channel, sub_msg_ids, sub_meta, sub_protect)
+                        sub_ok += 1
+                    except Exception as e:
+                        logger.error(f"[Idx][batch_collection] sub_code={sub_code} 派发失败: {e}")
+                        sub_fail += 1
+                success_codes.append(f"{code}(合集:{sub_ok}成功/{sub_fail}失败)")
+                metrics.decode_count += 1
+                continue
+
+            file_record = result.file_record
+            # ── 举报拦截:脱钩或限制举报人 ──
+            if file_record and file_record.get("status") == "detached":
+                if result.quota_consumed:
+                    from services.permission import refund_user_quota
+                    await refund_user_quota(user.id, is_external=False)
+                failed_codes.append((code, "文件不存在或已被删除"))
+                continue
+            blocked = file_record.get("blocked_users")
+            if isinstance(blocked, list) and user.id in blocked:
+                if result.quota_consumed:
+                    from services.permission import refund_user_quota
+                    await refund_user_quota(user.id, is_external=False)
+                failed_codes.append((code, "文件不存在或已被删除"))
+                continue
+
+            storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
+            batch_ids_str = file_record.get("batch_msg_ids") or ""
+            if not isinstance(batch_ids_str, str):
+                batch_ids_str = str(batch_ids_str)
+            msg_ids = [int(mid) for mid in batch_ids_str.split(",") if mid.strip().isdigit()] if batch_ids_str else []
+            if not msg_ids:
+                primary_mid = file_record.get("primary_channel_msg_id")
+                if primary_mid is None:
+                    if result.quota_consumed:
+                        from services.permission import refund_user_quota
+                        await refund_user_quota(user.id, is_external=False)
+                    failed_codes.append((code, "文件记录异常"))
+                    continue
+                msg_ids = [primary_mid]
+
+            batch_file_meta_str = file_record.get("batch_file_meta") or ""
+            if isinstance(batch_file_meta_str, list):
+                batch_file_meta_str = json.dumps(batch_file_meta_str) if batch_file_meta_str else ""
+                if isinstance(batch_file_meta_str, bytes):
+                    batch_file_meta_str = batch_file_meta_str.decode()
+            elif isinstance(batch_file_meta_str, bytes):
+                batch_file_meta_str = batch_file_meta_str.decode()
+            protect_content = file_record.get("protect_content", False)
+
+            try:
+                await _dispatch_to_dsp(user.id, code, storage_channel, msg_ids, batch_file_meta_str, protect_content)
+            except Exception as e:
+                logger.error(f"[Idx][batch] dispatch 失败 (user={user.id}, code={code}): {e}")
+                if result.quota_consumed:
+                    from services.permission import refund_user_quota
+                    await refund_user_quota(user.id, is_external=False)
+                failed_codes.append((code, "发送失败"))
+                continue
+
+            success_codes.append(code)
+            metrics.decode_count += 1
+        except Exception as e:
+            logger.error(f"[Idx][batch] 处理异常 code={code}: {e}")
+            failed_codes.append((code, "处理异常"))
+
+    # ── 汇总结果 ──
+    summary_lines = [f"📦 批量取件完成(共 {len(codes)} 个):"]
+    if success_codes:
+        summary_lines.append(f"✅ 成功 {len(success_codes)} 个: {', '.join(success_codes)}")
+    if failed_codes:
+        summary_lines.append(f"❌ 失败 {len(failed_codes)} 个:")
+        for fc, reason in failed_codes:
+            summary_lines.append(f"  • {fc}: {reason}")
+    await safe_reply_text(update.message, "\n".join(summary_lines))
+    await metrics.record_processed("idx_bot")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
 
@@ -1971,6 +2147,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text.startswith(("RELAY_DELIVER:", "RELAY_RENEW:", "RELAY_ERROR:", "RELAY_BATCH:")):
         await handle_relay_delivery(update, context)
+        return
+
+    # === 批量取件:检测多文件码(换行/空格分隔) ===
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    tokens = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) > 1:
+            tokens.extend(parts)
+        else:
+            tokens.append(line)
+    valid_codes = [t for t in tokens if is_valid_code_format(t)]
+    if len(valid_codes) > 1:
+        if len(valid_codes) > 10:
+            await safe_reply_text(update.message, f"⚠️ 批量取件最多支持 10 个文件码,您发送了 {len(valid_codes)} 个,将只处理前 10 个")
+            valid_codes = valid_codes[:10]
+        await _handle_batch_codes(update, context, valid_codes)
         return
 
     if is_valid_code_format(text.strip()):

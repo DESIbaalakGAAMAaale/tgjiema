@@ -44,9 +44,9 @@ def make_user(
 def make_file_record(
     file_code: str,
     uploader_id: int,
-    primary_channel_id: int,
-    primary_channel_msg_id: int,
-    file_types: dict,
+    primary_channel_id: int = 0,
+    primary_channel_msg_id: int = 0,
+    file_types: dict = None,
     backup_channel_msg_ids: list = None,
     status: str = "active",
     request_count: int = 0,
@@ -56,6 +56,8 @@ def make_file_record(
     protect_content: bool = False,
     file_ttl_days: int = 0,
     max_requests: int = 0,
+    is_collection: int = 0,
+    collection_codes: str = "[]",
 ):
     from datetime import datetime, timezone
 
@@ -69,7 +71,7 @@ def make_file_record(
         "uploader_id": uploader_id,
         "primary_channel_id": primary_channel_id,
         "primary_channel_msg_id": primary_channel_msg_id,
-        "file_types": file_types,
+        "file_types": file_types or {},
         "backup_channel_msg_ids": backup_channel_msg_ids or [],
         "batch_msg_ids": batch_msg_ids,
         "batch_file_meta": batch_file_meta,
@@ -81,6 +83,8 @@ def make_file_record(
         "protect_content": protect_content,
         "file_ttl_days": file_ttl_days,
         "max_requests": max_requests,
+        "is_collection": is_collection,
+        "collection_codes": collection_codes,
         "updated_at": now,
     }
 
