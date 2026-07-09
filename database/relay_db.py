@@ -183,7 +183,7 @@ class RelayDB:
                 raise
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
-        await self._db.execute("PRAGMA busy_timeout=5000")
+        await self._db.execute("PRAGMA busy_timeout=15000")  # 多进程并发写,15 秒超时
         await self._db.execute("PRAGMA wal_autocheckpoint=1000")
         await self._db.executescript(DDL)
         await self._db.commit()
