@@ -224,6 +224,7 @@ class CacheStore:
                 channel_id      BIGINT NOT NULL,
                 message_id      BIGINT NOT NULL,
                 media_type      TEXT,
+                media_group_id  TEXT,
                 first_seen_at   TEXT,
                 PRIMARY KEY (group_id, file_unique_id, channel_id)
             )"""
@@ -234,6 +235,11 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_manifest_channel ON manifest(channel_id)"
         )
+        # 为已存在的 manifest 表补 media_group_id 列(幂等,重复执行报错可忽略)
+        try:
+            await self._db.execute("ALTER TABLE manifest ADD COLUMN media_group_id TEXT")
+        except Exception as e:
+            logger.warning(f"[CacheStore] ALTER TABLE manifest失败(幂等,可忽略): {e}")
         # ─── KV 键值存储：用于缓存 DDL 版本等配置 ───
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS kv_store (
@@ -1563,11 +1569,12 @@ class CacheStore:
 
     async def upsert_manifest(
         self, group_id: int, file_unique_id: str, channel_id: int,
-        message_id: int, media_type: str = "",
+        message_id: int, media_type: str = "", media_group_id: str = "",
     ):
         """登记/更新一条 manifest 记录(本地 SQLite,零 CRDB RU)。
 
         同一 (group_id, file_unique_id, channel_id) 幂等:已存在则更新 message_id。
+        media_group_id 为分组键(空串表示独立文件),mon_bot 据此避免跨批次拆散相册。
         """
         if not self._db or not file_unique_id:
             return
@@ -1575,29 +1582,29 @@ class CacheStore:
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
         await self._db.execute(
             "INSERT OR REPLACE INTO manifest "
-            "(group_id, file_unique_id, channel_id, message_id, media_type, first_seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (group_id, file_unique_id, channel_id, message_id, media_type, now_iso),
+            "(group_id, file_unique_id, channel_id, message_id, media_type, media_group_id, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (group_id, file_unique_id, channel_id, message_id, media_type, media_group_id or "", now_iso),
         )
         await self._db.commit()
 
     async def upsert_manifest_batch(self, records: list[dict]):
-        """批量登记 manifest 记录。records: [{group_id, file_unique_id, channel_id, message_id, media_type}]"""
+        """批量登记 manifest 记录。records: [{group_id, file_unique_id, channel_id, message_id, media_type, media_group_id}]"""
         if not self._db or not records:
             return
         import datetime as _dt
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
         rows = [
             (r["group_id"], r["file_unique_id"], r["channel_id"],
-             r["message_id"], r.get("media_type", ""), now_iso)
+             r["message_id"], r.get("media_type", ""), r.get("media_group_id", ""), now_iso)
             for r in records if r.get("file_unique_id")
         ]
         if not rows:
             return
         await self._db.executemany(
             "INSERT OR REPLACE INTO manifest "
-            "(group_id, file_unique_id, channel_id, message_id, media_type, first_seen_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(group_id, file_unique_id, channel_id, message_id, media_type, media_group_id, first_seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             rows,
         )
         await self._db.commit()
@@ -1607,11 +1614,11 @@ class CacheStore:
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
-            "SELECT group_id, file_unique_id, channel_id, message_id, media_type, first_seen_at "
+            "SELECT group_id, file_unique_id, channel_id, message_id, media_type, media_group_id, first_seen_at "
             "FROM manifest WHERE group_id = ?",
             (group_id,),
         )
-        cols = ["group_id", "file_unique_id", "channel_id", "message_id", "media_type", "first_seen_at"]
+        cols = ["group_id", "file_unique_id", "channel_id", "message_id", "media_type", "media_group_id", "first_seen_at"]
         return [dict(zip(cols, r)) for r in rows]
 
     async def get_manifest_channels_for_group(self, group_id: int) -> list[int]:
@@ -1696,13 +1703,14 @@ class CacheStore:
     ) -> list[dict]:
         """返回 dst_channel 缺失、但 src_channel 有的文件列表。
 
-        每条: {file_unique_id, src_message_id, media_type}
+        每条: {file_unique_id, src_message_id, media_type, media_group_id}
         用于常规复制(active→shadow):指定源为 active 频道。
+        media_group_id 为分组键,mon_bot 据此避免跨批次拆散相册。
         """
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
-            "SELECT a.file_unique_id, a.message_id, a.media_type "
+            "SELECT a.file_unique_id, a.message_id, a.media_type, a.media_group_id "
             "FROM manifest a "
             "WHERE a.group_id = ? AND a.channel_id = ? "
             "AND NOT EXISTS ("
@@ -1712,7 +1720,7 @@ class CacheStore:
             ")",
             (group_id, src_channel_id, dst_channel_id),
         )
-        cols = ["file_unique_id", "src_message_id", "media_type"]
+        cols = ["file_unique_id", "src_message_id", "media_type", "media_group_id"]
         return [dict(zip(cols, r)) for r in rows]
 
     async def get_manifest_msg_id(

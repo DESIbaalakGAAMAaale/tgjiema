@@ -20,7 +20,7 @@ def _json_dumps(obj, **kwargs):
     return result
 
 from telegram import Update
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from loguru import logger
 
@@ -32,7 +32,7 @@ from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder
-from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text
+from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text, safe_send_media_group
 from utils.file_utils import detect_file_type, extract_file_meta
 from utils.relay_auth import is_relay_sender_allowed
 
@@ -75,6 +75,25 @@ def _extract_file_unique_id(msg) -> str:
     return ""
 
 
+def _build_input_media(file_meta: dict):
+    """从 file_meta 构造 InputMedia* 对象(用于 send_media_group)。
+    返回 None 表示该类型不支持媒体组(animation/sticker/voice)。
+    """
+    ftype = file_meta.get("type", "")
+    file_id = file_meta.get("file_id", "")
+    if not file_id:
+        return None
+    if ftype == "photo":
+        return InputMediaPhoto(media=file_id)
+    if ftype == "video":
+        return InputMediaVideo(media=file_id)
+    if ftype == "audio":
+        return InputMediaAudio(media=file_id)
+    if ftype == "document":
+        return InputMediaDocument(media=file_id)
+    return None
+
+
 async def _ensure_channel_group_map():
     """刷新 channel_id → group_id 内存缓存(从 cells_local 加载)。
 
@@ -104,7 +123,7 @@ async def _ensure_channel_group_map():
         logger.warning(f"[Up] 刷新 channel→group 映射失败: {e}")
 
 
-async def _register_manifest(channel_id: int, message_id: int, msg, media_type: str = ""):
+async def _register_manifest(channel_id: int, message_id: int, msg, media_type: str = "", file_unique_id_override: str = "", media_group_id: str = ""):
     """写入 Active 频道后登记 manifest(异步,失败不影响主流程)。
 
     Args:
@@ -112,18 +131,25 @@ async def _register_manifest(channel_id: int, message_id: int, msg, media_type: 
         message_id: 该频道中的消息 ID
         msg: PTB Message 对象(用于提取 file_unique_id),或 None
         media_type: 文件类型(document/photo/video...)
+        file_unique_id_override: 直接提供 file_unique_id(优先于 msg 提取,用于 copy_messages 返回 MessageId 无 fuid 的场景)
+        media_group_id: 媒体组分组键(空串表示独立文件)。mon_bot 据此避免跨批次拆散相册。
+                       可传源 media_group_id 或 send_media_group 返回的 media_group_id。
     """
     try:
-        fuid = _extract_file_unique_id(msg) if msg else ""
+        fuid = file_unique_id_override or (_extract_file_unique_id(msg) if msg else "")
         if not fuid:
             return
+        # 若未显式传入,尝试从 msg 提取 media_group_id
+        mgid = media_group_id or ""
+        if not mgid and msg is not None:
+            mgid = getattr(msg, "media_group_id", "") or ""
         await _ensure_channel_group_map()
         group_id = _channel_to_group.get(channel_id)
         if group_id is None:
             logger.warning(f"[Up] 无法解析频道 {channel_id} 的 group_id,跳过 manifest 登记")
             return
         store = get_cache_store()
-        await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type)
+        await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type, mgid)
     except Exception as e:
         logger.warning(f"[Up] 登记 manifest 失败 (channel={channel_id}, msg_id={message_id}): {e}")
 
@@ -261,6 +287,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "files_meta": [],
         "note": "",
         "target_channel_id": target_channel_id,
+        "src_messages": [],
     }
     await update.message.reply_text(
         "📦 已进入批次上传模式，请发送文件。\n"
@@ -318,15 +345,134 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for mgid in pending_mgids:
         await _flush_batch_media_group(mgid, context, batch)
 
-    channel_msg_ids = batch["pinned_msg_ids"]
+    src_messages = batch.get("src_messages", [])
+    if not src_messages:
+        await update.message.reply_text("没有接收到任何文件，批次已取消")
+        return
+
+    target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
+    channel_msg_ids = []
+    files_meta = []
+
+    # 按 media_group_id 分组:有 mgid 的用 copy_messages 保持相册,无 mgid 的用 send_media_group 整合
+    mg_groups: dict[str, list] = {}
+    singles: list = []
+    for src in src_messages:
+        mgid = src.get("media_group_id")
+        if mgid:
+            mg_groups.setdefault(mgid, []).append(src)
+        else:
+            singles.append(src)
+
+    # 1. 复制源媒体组(保持相册)
+    for mgid, group in mg_groups.items():
+        src_chat = group[0]["chat_id"]
+        src_msg_ids = [s["msg_id"] for s in group]
+        try:
+            copied = await safe_copy_messages(context.bot, target_ch, src_chat, src_msg_ids)
+            if copied:
+                for s, c in zip(group, copied):
+                    channel_msg_ids.append(c.message_id)
+                    files_meta.append(s["file_meta"])
+                    asyncio.create_task(_register_manifest(
+                        target_ch, c.message_id, None, s["file_type"],
+                        file_unique_id_override=s["file_unique_id"],
+                        media_group_id=mgid,
+                    ))
+        except Exception as e:
+            logger.warning(f"[Up] 媒体组 copy_messages 失败,回退逐条: {e}")
+            for s in group:
+                try:
+                    forwarded = await safe_copy_message(context.bot, target_ch, s["chat_id"], s["msg_id"])
+                    channel_msg_ids.append(forwarded.message_id)
+                    files_meta.append(s["file_meta"])
+                    asyncio.create_task(_register_manifest(
+                        target_ch, forwarded.message_id, None, s["file_type"],
+                        file_unique_id_override=s["file_unique_id"],
+                        media_group_id=mgid,
+                    ))
+                except Exception as e2:
+                    logger.error(f"[Up] 媒体组逐条复制失败: {e2}")
+        # R100 归档(逐条)
+        for s in group:
+            asyncio.create_task(_forward_to_r100(context, s["chat_id"], s["msg_id"]))
+
+    # 2. 整合单个文件为媒体组(按类型分组,用 send_media_group + InputMedia*)
+    if singles:
+        type_groups: dict[str, list] = {}
+        for s in singles:
+            type_groups.setdefault(s["file_type"], []).append(s)
+
+        for ftype, group in type_groups.items():
+            media_list = []
+            valid_singles = []
+            unsupported = []
+            for s in group:
+                im = _build_input_media(s["file_meta"])
+                if im is not None:
+                    media_list.append(im)
+                    valid_singles.append(s)
+                else:
+                    unsupported.append(s)  # animation/sticker/voice 不支持媒体组
+
+            # 支持媒体组且数量>=2:用 send_media_group 整合(每 10 个一组)
+            if len(media_list) >= 2:
+                for i in range(0, len(media_list), 10):
+                    chunk_media = media_list[i:i + 10]
+                    chunk_singles = valid_singles[i:i + 10]
+                    try:
+                        sent = await safe_send_media_group(context.bot, target_ch, chunk_media)
+                        if sent:
+                            for s, m in zip(chunk_singles, sent):
+                                channel_msg_ids.append(m.message_id)
+                                files_meta.append(s["file_meta"])
+                                asyncio.create_task(_register_manifest(
+                                    target_ch, m.message_id, m, s["file_type"],
+                                ))
+                    except Exception as e:
+                        logger.warning(f"[Up] send_media_group 失败,回退 copy_messages: {e}")
+                        src_chat = chunk_singles[0]["chat_id"]
+                        src_msg_ids = [s["msg_id"] for s in chunk_singles]
+                        try:
+                            copied = await safe_copy_messages(context.bot, target_ch, src_chat, src_msg_ids)
+                            if copied:
+                                for s, c in zip(chunk_singles, copied):
+                                    channel_msg_ids.append(c.message_id)
+                                    files_meta.append(s["file_meta"])
+                                    asyncio.create_task(_register_manifest(
+                                        target_ch, c.message_id, None, s["file_type"],
+                                        file_unique_id_override=s["file_unique_id"],
+                                    ))
+                        except Exception as e2:
+                            logger.error(f"[Up] copy_messages fallback 也失败: {e2}")
+            elif len(media_list) == 1:
+                # 只有 1 个支持的文件,用 copy_message 单独复制
+                unsupported.extend(valid_singles)
+
+            # 不支持媒体组的类型 + 单个文件:用 copy_message 单独复制
+            for s in unsupported:
+                try:
+                    forwarded = await safe_copy_message(context.bot, target_ch, s["chat_id"], s["msg_id"])
+                    channel_msg_ids.append(forwarded.message_id)
+                    files_meta.append(s["file_meta"])
+                    asyncio.create_task(_register_manifest(
+                        target_ch, forwarded.message_id, None, s["file_type"],
+                        file_unique_id_override=s["file_unique_id"],
+                    ))
+                except Exception as e:
+                    logger.error(f"[Up] 单文件复制失败: {e}")
+            # R100 归档
+            for s in group:
+                asyncio.create_task(_forward_to_r100(context, s["chat_id"], s["msg_id"]))
 
     if not channel_msg_ids:
-        await update.message.reply_text("没有接收到任何文件，批次已取消")
+        await update.message.reply_text("文件处理失败，请稍后重试")
+        await metrics.record_error("up_bot")
         return
 
     type_str = _json_dumps(dict(batch["file_types"]))
     batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
-    batch_file_meta_str = _json_dumps(batch["files_meta"])
+    batch_file_meta_str = _json_dumps(files_meta)
 
     # 暂存批次数据，等待用户选择有效期→备注→转发权限
     context.user_data["_pending_batch"] = {
@@ -335,7 +481,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "batch_msg_ids": batch_ids_str,
         "batch_file_meta": batch_file_meta_str,
         "note": batch.get("note", ""),
-        "primary_channel_id": batch.get("target_channel_id") or await _get_upload_target_channel(),
+        "primary_channel_id": target_ch,
         "primary_channel_msg_id": channel_msg_ids[0],
         "total_count": len(channel_msg_ids),
     }
@@ -387,64 +533,41 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     else:
         batch["file_types"][file_type] += 1
-        batch["files_meta"].append(extract_file_meta(update))
-        try:
-            target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
-            forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
-            batch["pinned_msg_ids"].append(forwarded.message_id)
-            # R100 归档
-            asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
-        except Exception as e:
-            logger.error(f"[Up] 批次上传复制文件到存储频道失败: {e}")
-            await update.message.reply_text(f"❌ {file_type}接收失败,请重传")
-            return
+        file_meta = extract_file_meta(update)
+        batch["files_meta"].append(file_meta)
+        # 缓存源消息,不立即复制(end_upload 时批量复制以保持媒体组关系)
+        batch["src_messages"].append({
+            "chat_id": update.effective_chat.id,
+            "msg_id": update.message.message_id,
+            "media_group_id": None,
+            "file_type": file_type,
+            "file_meta": file_meta,
+            "file_unique_id": _extract_file_unique_id(update.message),
+        })
         await update.message.reply_text(f"已接{file_type}")
 
 
-async def _copy_one_media(context, target_ch, up, batch: dict):
-    """复制单个媒体文件到存储频道,由 _flush_batch_media_group 并发调用"""
-    try:
-        forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
-        if forwarded is not None:
-            batch["pinned_msg_ids"].append(forwarded.message_id)
-            batch["files_meta"].append(extract_file_meta(up))
-            # R100 归档
-            asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"[Up] 媒体组复制文件失败: {e}")
-        return False
-
-
 async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE, batch: dict):
+    """聚合批次中的媒体组消息到缓存,不立即复制(end_upload 时批量复制保持相册)。"""
     async with _mg_lock:
         grp = _pending_media_groups.pop(mgid, None)
-    if grp is None:
-        return
-    if not grp.get("updates"):
+    if grp is None or not grp.get("updates"):
         return
     file_types = grp["file_types"]
     for k, v in file_types.items():
         batch["file_types"][k] += v
-    target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
-
-    # 串行复制所有媒体文件到存储频道(保持原始顺序,确保 pinned_msg_ids 与 files_meta 对应)
-    copied = 0
-    failed = 0
     for up in grp["updates"]:
-        ok = await _copy_one_media(context, target_ch, up, batch)
-        if ok:
-            copied += 1
-        else:
-            failed += 1
-
+        batch["src_messages"].append({
+            "chat_id": up.effective_chat.id,
+            "msg_id": up.message.message_id,
+            "media_group_id": mgid,
+            "file_type": detect_file_type(up),
+            "file_meta": extract_file_meta(up),
+            "file_unique_id": _extract_file_unique_id(up.message),
+        })
     first = grp["updates"][0]
     type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items()))
-    if failed > 0:
-        await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"⚠️ 已接收媒体组:{type_desc}(成功{copied}个，失败{failed}个)")
-    else:
-        await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"已接收媒体组:{type_desc}({copied}个文件)")
+    await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"已接收媒体组:{type_desc}({len(grp['updates'])}个文件)")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):

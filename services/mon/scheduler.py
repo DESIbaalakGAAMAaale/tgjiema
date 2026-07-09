@@ -367,11 +367,35 @@ class MonScheduler:
         # 2. 按源 message_id 排序(保持顺序),批量 copy_messages
         # 注意:copy_messages 要求 message_ids 是同一频道的,这里源都是 src_channel_id
         missing.sort(key=lambda x: x["src_message_id"])
-        batch_size = 30  # 每批最多 30 条,避免 FloodWait
-        total_copied = 0
 
-        for i in range(0, len(missing), batch_size):
-            batch = missing[i:i + batch_size]
+        # 媒体组感知分批:同一 media_group_id 的消息必须在同一个 copy_messages 调用中,
+        # 否则 Telegram 会把一个相册拆成多个独立相册。
+        # 策略:遍历排序后的列表,批次满 30 条时,若下一条与当前批次属同一媒体组则延展批次。
+        batch_size = 30  # 每批最多 30 条,避免 FloodWait
+        batches: list[list[dict]] = []
+        cur_batch: list[dict] = []
+        cur_mgids: set[str] = set()
+        for item in missing:
+            mgid = item.get("media_group_id") or ""
+            if not cur_batch:
+                cur_batch.append(item)
+                if mgid:
+                    cur_mgids.add(mgid)
+                continue
+            # 批次已满 且 下一条不属于当前批次任何媒体组 → 开新批次
+            if len(cur_batch) >= batch_size and mgid not in cur_mgids:
+                batches.append(cur_batch)
+                cur_batch = [item]
+                cur_mgids = {mgid} if mgid else set()
+            else:
+                cur_batch.append(item)
+                if mgid:
+                    cur_mgids.add(mgid)
+        if cur_batch:
+            batches.append(cur_batch)
+
+        total_copied = 0
+        for batch in batches:
             src_msg_ids = [item["src_message_id"] for item in batch]
             try:
                 # 用 bot.copy_messages 批量复制(不带转发尾巴)
@@ -391,6 +415,7 @@ class MonScheduler:
                         "channel_id": dst_channel_id,
                         "message_id": sent_msg_id,
                         "media_type": item.get("media_type", ""),
+                        "media_group_id": item.get("media_group_id", ""),
                     })
                     # message_backups: main_msg_id 用 main_channel 的 msg_id
                     # 常规场景 main_channel_id == src_channel_id,直接用 src_message_id
@@ -420,7 +445,7 @@ class MonScheduler:
             except Exception as e:
                 logger.warning(
                     f"[Mon][manifest] copy_messages 失败 src={src_channel_id} dst={dst_channel_id} "
-                    f"batch={i}-{i+len(batch)}: {e}"
+                    f"batch_size={len(batch)}: {e}"
                 )
                 # 失败的批次下周期重试(幂等:manifest 未登记,get_missing_from_src 会再次返回)
                 break
