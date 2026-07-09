@@ -81,7 +81,11 @@ async def backup_all_tables() -> dict:
             results[table] = [dict(r) for r in records]
             logger.debug(f"[Backup] {table}: {len(records)} 行")
         except Exception as e:
-            logger.warning(f"[Backup] 跳过表 {table}: {e}")
+            # 表不存在时降级为 DEBUG(如 kv_config 在部分部署中不存在)
+            if "does not exist" in str(e):
+                logger.debug(f"[Backup] 表 {table} 不存在,跳过: {e}")
+            else:
+                logger.warning(f"[Backup] 跳过表 {table}: {e}")
 
     return {"backup_time": datetime.now(timezone.utc).isoformat(), "tables": results}
 
@@ -96,6 +100,24 @@ async def run_db_backup():
             logger.warning(f"数据库连接初始化失败,跳过备份: {e}")
             return
 
+    try:
+        await _run_backup_loop()
+    finally:
+        # 确保退出时关闭数据库连接和 SQLite 缓存,避免进程挂起被 SIGKILL
+        try:
+            from database.session import close_db
+            await close_db()
+        except Exception:
+            pass
+        try:
+            await r2_storage.close()
+        except Exception:
+            pass
+        logger.info("[db_backup] 资源已清理,进程退出")
+
+
+async def _run_backup_loop():
+    """备份主循环(由 run_db_backup 调用,确保 finally 中清理资源)。"""
     enabled_cfg = await get_config("db_backup_enabled")
     if enabled_cfg is None:
         enabled = settings.DB_BACKUP_ENABLED

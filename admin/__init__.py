@@ -106,6 +106,16 @@ async def startup():
         sys.exit(1)
     await _load_state_from_cache()
 
+
+@app.on_event("shutdown")
+async def shutdown():
+    """关闭时清理数据库连接和 SQLite 缓存,避免进程挂起被 SIGKILL。"""
+    try:
+        from database import close_db
+        await close_db()
+    except Exception:
+        pass
+
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 

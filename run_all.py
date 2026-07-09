@@ -117,7 +117,8 @@ def run_admin_bot():
 
 def run_admin():
     os.environ["BOT_ROLE"] = "admin_web"
-    _register_sigterm_handler()
+    # admin(uvicorn)不注册自定义 SIGTERM handler——uvicorn 内部自己管理信号,
+    # 自定义 handler 会干扰 uvicorn 的优雅关闭,导致进程无法退出被 SIGKILL。
     import uvicorn
     from admin import app
     uvicorn.run(
@@ -130,10 +131,14 @@ def run_admin():
 
 def run_db_backup():
     os.environ["BOT_ROLE"] = "db_backup"
-    _register_sigterm_handler()
+    # db_backup 不注册自定义 SIGTERM handler——asyncio.run 内部通过
+    # CancelledError 传播信号,自定义 raise KeyboardInterrupt 会绕过清理路径。
     import asyncio
     from services.db_backup import run_db_backup as _run
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        logger.info("[db_backup] 收到中断信号,已停止")
 
 
 BOT_RUNNERS = {
