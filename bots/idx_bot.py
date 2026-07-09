@@ -856,6 +856,17 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not sub_record or sub_record.get("status") != "active":
                     sub_fail += 1
                     continue
+                # 检查 blocked_users(与普通码路径一致)
+                blocked_users = sub_record.get("blocked_users")
+                if isinstance(blocked_users, list) and user.id in blocked_users:
+                    sub_fail += 1
+                    continue
+                # 检查 expire_time(与普通码路径一致)
+                from services.permission import check_code_expired
+                expired, _ = check_code_expired(sub_record)
+                if expired:
+                    sub_fail += 1
+                    continue
                 sub_channel = sub_record.get("primary_channel_id") or await _get_storage_channel()
                 sub_ids_str = sub_record.get("batch_msg_ids") or ""
                 if not isinstance(sub_ids_str, str):
@@ -878,9 +889,16 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"[Idx][collection] sub_code={sub_code} 派发失败: {e}")
                 sub_fail += 1
+        # 全部失败时 refund 配额(用户什么都没收到)
+        if sub_ok == 0 and result.quota_consumed:
+            from services.permission import refund_user_quota
+            await refund_user_quota(user.id, is_external=False)
         metrics.decode_count += 1
         await metrics.record_processed("idx_bot")
-        await safe_reply_text(update.message, f"📦 合集发送完成: 成功 {sub_ok} 个,失败 {sub_fail} 个")
+        if sub_ok == 0:
+            await safe_reply_text(update.message, f"❌ 合集中 {sub_fail} 个文件全部失败,已退回配额")
+        else:
+            await safe_reply_text(update.message, f"📦 合集发送完成: 成功 {sub_ok} 个,失败 {sub_fail} 个")
         return
 
     storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
@@ -2043,6 +2061,17 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
                         if not sub_record or sub_record.get("status") != "active":
                             sub_fail += 1
                             continue
+                        # 检查 blocked_users(与普通码路径一致)
+                        blocked_users = sub_record.get("blocked_users")
+                        if isinstance(blocked_users, list) and user.id in blocked_users:
+                            sub_fail += 1
+                            continue
+                        # 检查 expire_time(与普通码路径一致)
+                        from services.permission import check_code_expired
+                        expired, _ = check_code_expired(sub_record)
+                        if expired:
+                            sub_fail += 1
+                            continue
                         sub_channel = sub_record.get("primary_channel_id") or await _get_storage_channel()
                         sub_ids_str = sub_record.get("batch_msg_ids") or ""
                         if not isinstance(sub_ids_str, str):
@@ -2065,7 +2094,13 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
                     except Exception as e:
                         logger.error(f"[Idx][batch_collection] sub_code={sub_code} 派发失败: {e}")
                         sub_fail += 1
-                success_codes.append(f"{code}(合集:{sub_ok}成功/{sub_fail}失败)")
+                # 全部失败时 refund 配额并标记为失败
+                if sub_ok == 0 and result.quota_consumed:
+                    from services.permission import refund_user_quota
+                    await refund_user_quota(user.id, is_external=False)
+                    failed_codes.append((code, f"合集内 {sub_fail} 个文件全部失败"))
+                else:
+                    success_codes.append(f"{code}(合集:{sub_ok}成功/{sub_fail}失败)")
                 metrics.decode_count += 1
                 continue
 
@@ -2461,6 +2496,25 @@ async def _async_main():
                         await file_records_col.execute_raw(fr_sql, fr_params)
                     except Exception as e:
                         logger.error(f"[CodeChanges] file_records expire_time sync failed: {e}")
+
+                # status 变更同步到 file_records.status(管理员 /file 查看状态一致性)
+                status_changes = [c for c in changes if c["change_type"] == "status"]
+                if status_changes:
+                    st_params = []
+                    st_cases = []
+                    for c in status_changes:
+                        st_params.append(c["code"])
+                        st_params.append(c["new_value"])
+                        st_cases.append(f"WHEN ${len(st_params) - 1} THEN ${len(st_params)}")
+                    st_placeholders = ", ".join([f"${i * 2 + 1}" for i in range(len(status_changes))])
+                    st_sql = (
+                        f"UPDATE file_records SET status = CASE file_code {' '.join(st_cases)} END "
+                        f"WHERE file_code IN ({st_placeholders})"
+                    )
+                    try:
+                        await file_records_col.execute_raw(st_sql, st_params)
+                    except Exception as e:
+                        logger.error(f"[CodeChanges] file_records status sync failed: {e}")
 
                 if synced_ids:
                     await buf.mark_synced(synced_ids)

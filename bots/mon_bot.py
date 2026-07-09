@@ -336,15 +336,20 @@ class MonBot:
                 if prev_severity != severity:
                     emoji = severity_emoji.get(severity, "⚠️")
                     # 通知首行用 alert_key 作为稳定事件标识(利于 _notify_admin 冷却)
-                    await self._notify_admin(f"{emoji} [{severity}] {alert_key}\n{message}")
-                    self._alert_states[alert_key] = severity
+                    sent = await self._notify_admin(f"{emoji} [{severity}] {alert_key}\n{message}")
+                    # 仅在通知成功发送时更新状态,避免冷却抑制导致永久丢失告警
+                    if sent:
+                        self._alert_states[alert_key] = severity
 
             # 发送恢复通知(之前有告警但现在已恢复)
             for alert_key in list(self._alert_states.keys()):
                 if alert_key not in active_keys:
                     prev = self._alert_states.pop(alert_key, "")
                     if prev:
-                        await self._notify_admin(f"✅ [恢复] {alert_key} 已恢复正常")
+                        sent = await self._notify_admin(f"✅ [恢复] {alert_key} 已恢复正常")
+                        # 通知发送失败时恢复状态,下轮会重试
+                        if not sent:
+                            self._alert_states[alert_key] = prev
 
         except Exception as e:
             logger.warning(f"[Mon][Alerts] 告警检查异常: {e}")
@@ -723,7 +728,7 @@ class MonBot:
                 if alerts:
                     for msg in alerts:
                         logger.warning(msg)
-                        metrics.increment("mon.degrade")
+                        await metrics.increment("mon.degrade")
                         # 降级告警通知管理员
                         if "[DEGRADE]" in msg:
                             await self._notify_admin(f"⚠️ {msg}")

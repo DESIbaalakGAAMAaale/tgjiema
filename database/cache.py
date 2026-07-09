@@ -200,9 +200,17 @@ _REQUEST_COUNT_FLUSH_INTERVAL = settings.CACHE_REQUEST_COUNT_FLUSH
 
 
 async def incr_request_count(file_code: str):
-    """本地累积 request_count,避免每次解码写一次 CRDB。"""
+    """本地累积 request_count,避免每次解码写一次 CRDB。
+    同时更新 file_record 缓存中的 request_count,防止 max_requests 检查 TOCTOU 竞态。
+    """
     async with _request_count_lock:
         _request_count_buffer[file_code] = _request_count_buffer.get(file_code, 0) + 1
+    # 同步递增 file_record 内存缓存中的 request_count,使后续 check_decode_permission 读到最新值
+    cache = get_file_record_cache()
+    cached = cache.get(f"file:{file_code}")
+    if cached is not None:
+        cur = cached.get("request_count", 0) or 0
+        cached["request_count"] = cur + 1
 
 
 async def _flush_request_count_loop():

@@ -638,18 +638,31 @@ class CacheStore:
         )
         await self._db.commit()
 
-    async def reactivate_waiting_start_jobs(self, user_id: int):
-        """用户 /start dsp 后，将其 waiting_start jobs 改回 pending"""
+    async def reactivate_waiting_start_jobs(self, user_id: int) -> list[int]:
+        """用户 /start dsp 后，将其 waiting_start jobs 改回 pending。
+        返回被恢复的 crdb_id 列表(供调用方 xadd 到 Redis Stream)。
+        """
         if not self._db:
-            return
+            return []
+        # 先 SELECT 再 UPDATE,获取被恢复的 crdb_id 列表
+        rows = await self._db.execute_fetchall(
+            "SELECT crdb_id FROM local_job_queue "
+            "WHERE target_user_id = ? AND status = 'waiting_start' AND crdb_id > 0",
+            (user_id,),
+        )
+        reactivated_ids = [r[0] for r in rows if r and r[0]]
+        if not reactivated_ids:
+            return []
         await self._db.execute(
-            "UPDATE local_job_queue SET status = 'pending' WHERE target_user_id = ? AND status = 'waiting_start'",
+            "UPDATE local_job_queue SET status = 'pending' "
+            "WHERE target_user_id = ? AND status = 'waiting_start'",
             (user_id,),
         )
         await self._db.commit()
         # 写入 dsp_notify 触发 worker 重新拉取
         await self._db.execute("INSERT INTO dsp_notify (ts) VALUES (?)", (time.time(),))
         await self._db.commit()
+        return reactivated_ids
 
     async def close(self):
         if self._db:
@@ -1637,27 +1650,28 @@ class CacheStore:
         """
         if not self._db:
             return False
-        # 先获取待删除 cell 的 channel_id
-        rows = await self._db.execute_fetchall(
-            "SELECT channel_id FROM cells_local WHERE slot_id = ?",
-            (slot_id,),
-        )
-        if not rows:
-            return False
-        target_channel_id = rows[0][0]
-        # 查找前驱 P:next_active_chat_id == target_channel_id 的 cell
-        prev_rows = await self._db.execute_fetchall(
-            "SELECT slot_id, channel_id FROM cells_local WHERE next_active_chat_id = ?",
-            (target_channel_id,),
-        )
-        # 查找后继 S:prev_slot_id == slot_id 的 cell
-        next_rows = await self._db.execute_fetchall(
-            "SELECT slot_id, channel_id FROM cells_local WHERE prev_slot_id = ?",
-            (slot_id,),
-        )
-        # 修复指针(单事务)
+        # 修复指针(单事务,SELECT 也在事务内避免 TOCTOU)
         await self._db.execute("BEGIN IMMEDIATE")
         try:
+            # 先获取待删除 cell 的 channel_id
+            rows = await self._db.execute_fetchall(
+                "SELECT channel_id FROM cells_local WHERE slot_id = ?",
+                (slot_id,),
+            )
+            if not rows:
+                await self._db.execute("ROLLBACK")
+                return False
+            target_channel_id = rows[0][0]
+            # 查找前驱 P:next_active_chat_id == target_channel_id 的 cell
+            prev_rows = await self._db.execute_fetchall(
+                "SELECT slot_id, channel_id FROM cells_local WHERE next_active_chat_id = ?",
+                (target_channel_id,),
+            )
+            # 查找后继 S:prev_slot_id == slot_id 的 cell
+            next_rows = await self._db.execute_fetchall(
+                "SELECT slot_id, channel_id FROM cells_local WHERE prev_slot_id = ?",
+                (slot_id,),
+            )
             prev_slot_id = prev_rows[0][0] if prev_rows else None
             prev_channel_id = prev_rows[0][1] if prev_rows else None
             next_slot_id = next_rows[0][0] if next_rows else None

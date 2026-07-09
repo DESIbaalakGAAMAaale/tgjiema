@@ -78,6 +78,7 @@ class RelayPool:
 
         - 清除已到期的 FloodWait 限制
         - 对不可用的账号(ban/FloodWait到期/断线)做主动探测
+        - FloodWait 未到期的账号跳过(避免加重 Telegram 限制)
         - ban 账号定期尝试恢复(Telegram 可能解除临时限制)
         """
         while True:
@@ -90,6 +91,9 @@ class RelayPool:
                     inst.clear_expired_floodwait()
                     # 2. 对不可用账号做健康检查(跳过正在操作的账号)
                     if not inst.is_ready and not inst.is_busy:
+                        # 跳过 FloodWait 未到期的账号(避免加重 Telegram 限制)
+                        if inst._floodwait_until > 0:
+                            continue
                         try:
                             await inst.check_health()
                         except Exception as e:
@@ -193,7 +197,11 @@ class RelayPool:
         return usage["today_requests"]
 
     async def add_account(self, api_id: int, api_hash: str, phone: str) -> RelayInstance:
-        """动态添加中继账号"""
+        """动态添加中继账号。
+        注意:此方法在 admin_bot 进程中调用时,仅验证账号可用性并写入 DB,
+        验证成功后立即关闭客户端,避免与 idx_bot 进程的 Telethon session 文件冲突。
+        idx_bot 通过 reload_from_db 负责实际运行时连接。
+        """
         db = await get_relay_db()
         account_id = await db.add_account(api_id, api_hash, phone)
         instance = RelayInstance(
@@ -202,8 +210,6 @@ class RelayPool:
             api_hash=api_hash,
             phone=phone,
         )
-        async with self._lock:
-            self.instances.append(instance)
         start_failed = False
         try:
             await instance.start()
@@ -215,8 +221,6 @@ class RelayPool:
         if start_failed or not instance.is_ready:
             if not start_failed:
                 logger.error(f"[RelayPool] 中继账号 {phone} start 后未就绪(可能登录失败/二步验证),回滚")
-            async with self._lock:
-                self.instances = [i for i in self.instances if i.phone != phone]
             # 关闭已建立的 TelegramClient 连接,防止资源泄漏
             try:
                 await instance.shutdown()
@@ -227,6 +231,14 @@ class RelayPool:
             except Exception as rm_err:
                 logger.warning(f"[RelayPool] 回滚删除 DB 账号 {phone} 失败: {rm_err}")
             raise RuntimeError(f"中继账号 {phone} 启动失败,已回滚")
+        # 验证成功:关闭客户端,仅保留 DB 记录。
+        # idx_bot 通过 reload_from_db 创建自己的 instance 并连接(共享 session 文件)。
+        # 不保留 admin_bot 的 instance,避免两进程同时使用同一 session 文件冲突。
+        try:
+            await instance.shutdown()
+            logger.info(f"[RelayPool] 账号 {phone} 验证成功,已关闭 admin_bot 侧 client(交由 idx_bot 运行)")
+        except Exception as shutdown_err:
+            logger.warning(f"[RelayPool] 验证后关闭 client {phone} 失败: {shutdown_err}")
         logger.info(f"[RelayPool] 动态添加中继账号: {phone}")
         return instance
 

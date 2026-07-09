@@ -397,13 +397,41 @@ class MonScheduler:
         total_copied = 0
         for batch in batches:
             src_msg_ids = [item["src_message_id"] for item in batch]
+            # FloodWait 重试:RetryAfter 时等待后重试,避免反复触发限制
+            copied_msgs = None
+            for attempt in range(3):
+                try:
+                    copied_msgs = await bot_instance.copy_messages(
+                        chat_id=dst_channel_id,
+                        from_chat_id=src_channel_id,
+                        message_ids=src_msg_ids,
+                    )
+                    break
+                except Exception as e:
+                    # 检测 FloodWait / RetryAfter
+                    retry_after = getattr(e, "retry_after", None)
+                    if retry_after is None and "Too Many Requests" in str(e):
+                        # 解析 retry_after
+                        try:
+                            retry_after = float(str(e).split("retry in")[-1].split("seconds")[0].strip())
+                        except Exception:
+                            retry_after = 30
+                    if retry_after and attempt < 2:
+                        logger.warning(
+                            f"[Mon][manifest] FloodWait {retry_after}s,等待后重试(attempt={attempt+1}) "
+                            f"src={src_channel_id} dst={dst_channel_id}"
+                        )
+                        await asyncio.sleep(retry_after + 1)
+                        continue
+                    logger.warning(
+                        f"[Mon][manifest] copy_messages 失败 src={src_channel_id} dst={dst_channel_id} "
+                        f"batch_size={len(batch)}: {e}"
+                    )
+                    break
+            if copied_msgs is None:
+                # 失败的批次下周期重试(幂等:manifest 未登记,get_missing_from_src 会再次返回)
+                break
             try:
-                # 用 bot.copy_messages 批量复制(不带转发尾巴)
-                copied_msgs = await bot_instance.copy_messages(
-                    chat_id=dst_channel_id,
-                    from_chat_id=src_channel_id,
-                    message_ids=src_msg_ids,
-                )
                 # copy_messages 返回 List[MessageId],顺序与输入一致
                 manifest_records = []
                 backup_mappings = []
@@ -443,11 +471,7 @@ class MonScheduler:
 
                 total_copied += len(copied_msgs)
             except Exception as e:
-                logger.warning(
-                    f"[Mon][manifest] copy_messages 失败 src={src_channel_id} dst={dst_channel_id} "
-                    f"batch_size={len(batch)}: {e}"
-                )
-                # 失败的批次下周期重试(幂等:manifest 未登记,get_missing_from_src 会再次返回)
+                logger.warning(f"[Mon][manifest] 复制后处理异常 dst={dst_channel_id}: {e}")
                 break
 
         return total_copied

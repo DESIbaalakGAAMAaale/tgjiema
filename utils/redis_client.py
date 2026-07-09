@@ -4,8 +4,10 @@
 - REDIS_URL 为空时禁用 Redis,所有方法返回 None/False/空(降级到 SQLite 轮询)
 - 延迟初始化:首次调用时创建连接池
 - 连接失败不抛异常,返回 None/False(降级)
+- 连接失败后周期性重试(60s),避免临时网络抖动导致永久降级
 - Stream + 消费者组幂等创建
 """
+import time
 from typing import Any
 from loguru import logger
 
@@ -15,32 +17,40 @@ CONSUMER_GROUP = "dsp_grp"
 _redis_client: Any = None
 _redis_init_attempted: bool = False
 _redis_available: bool = False
+_redis_last_attempt_ts: float = 0
+_REDIS_RETRY_INTERVAL = 60.0  # 失败后 60 秒重试
 
 
 async def get_redis() -> Any:
     """获取 Redis 客户端(延迟初始化)。未配置或连接失败返回 None。"""
-    global _redis_client, _redis_init_attempted, _redis_available
-    if not _redis_init_attempted:
-        _redis_init_attempted = True
-        from config import settings
-        if not settings.REDIS_URL:
-            return None
-        try:
-            import redis.asyncio as aioredis
-            _redis_client = aioredis.from_url(
-                settings.REDIS_URL,
-                decode_responses=True,
-                socket_timeout=2.0,
-                socket_connect_timeout=2.0,
-            )
-            await _redis_client.ping()
-            _redis_available = True
-            logger.info(f"[Redis] 连接成功,Stream 事件驱动已启用")
-            await _init_consumer_group()
-        except Exception as e:
-            logger.warning(f"[Redis] 连接失败,降级到 SQLite 轮询: {e}")
-            _redis_available = False
-            _redis_client = None
+    global _redis_client, _redis_init_attempted, _redis_available, _redis_last_attempt_ts
+    if _redis_available and _redis_client:
+        return _redis_client
+    now = time.time()
+    # 首次尝试 或 失败后周期性重试
+    if _redis_init_attempted and (now - _redis_last_attempt_ts) < _REDIS_RETRY_INTERVAL:
+        return None
+    _redis_init_attempted = True
+    _redis_last_attempt_ts = now
+    from config import settings
+    if not settings.REDIS_URL:
+        return None
+    try:
+        import redis.asyncio as aioredis
+        _redis_client = aioredis.from_url(
+            settings.REDIS_URL,
+            decode_responses=True,
+            socket_timeout=2.0,
+            socket_connect_timeout=2.0,
+        )
+        await _redis_client.ping()
+        _redis_available = True
+        logger.info(f"[Redis] 连接成功,Stream 事件驱动已启用")
+        await _init_consumer_group()
+    except Exception as e:
+        logger.warning(f"[Redis] 连接失败,降级到 SQLite 轮询(60s 后重试): {e}")
+        _redis_available = False
+        _redis_client = None
     return _redis_client if _redis_available else None
 
 

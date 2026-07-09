@@ -419,6 +419,19 @@ async def _dsp_worker(bot: Any, worker_id: int):
                         msg_id = msg_id_map.get(job.job_id)
                         if msg_id:
                             await xack_job(msg_id)
+
+                # C1 兜底:Redis 消息不足时补充 SQLite pending(防止 MAXLEN 截断的 job 饥饿)
+                # 当 Redis 拉取的消息少于 count(10),说明 Stream 已无积压,此时检查 SQLite
+                if len(redis_messages) < 10:
+                    fallback_jobs = await store.get_local_pending_jobs(5)
+                    if fallback_jobs:
+                        fb_claimed = []
+                        for rj in fallback_jobs:
+                            if await store.mark_local_job_dispatched(rj["crdb_id"]):
+                                fb_claimed.append(_raw_jobs_to_results([rj])[0])
+                        if fb_claimed:
+                            fb_tasks = [asyncio.create_task(_send_one_job(bot, j, worker_id, store)) for j in fb_claimed]
+                            await asyncio.gather(*fb_tasks, return_exceptions=True)
                 continue
 
             # 降级/兜底:SQLite 轮询(处理 Redis 超时无消息 或 Redis 不可用)
@@ -782,8 +795,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from database.cache_store import get_cache_store
     store = get_cache_store()
     await store.mark_user_started(user.id, "dsp")
-    await store.reactivate_waiting_start_jobs(user.id)
-    logger.info(f"[Dsp][start] 用户 {user.id} 已启动，waiting_start jobs 已恢复")
+    reactivated_ids = await store.reactivate_waiting_start_jobs(user.id)
+    # C1: 恢复的 job 重新投递到 Redis Stream,避免 Redis 模式下饥饿
+    if reactivated_ids:
+        try:
+            from utils.redis_client import xadd_job
+            for crdb_id in reactivated_ids:
+                try:
+                    await xadd_job(crdb_id)
+                except Exception:
+                    pass  # 降级:dsp_notify 已写入
+        except Exception:
+            pass
+    logger.info(f"[Dsp][start] 用户 {user.id} 已启动，waiting_start jobs 已恢复({len(reactivated_ids)}个)")
 
     await safe_reply_text(update.message,
         "欢迎使用文件发送机器人!\n\n"
@@ -983,6 +1007,12 @@ async def _async_main():
                 logger.warning("[Dsp] app.stop 超时(10s),强制继续")
             except Exception as e:
                 logger.warning(f"[Dsp] app.stop 异常: {e}")
+            # C1: 关闭 Redis 连接
+            try:
+                from utils.redis_client import close_redis
+                await asyncio.wait_for(close_redis(), timeout=5.0)
+            except Exception as e:
+                logger.debug(f"[Dsp] close_redis 异常: {e}")
             logger.info("[Dsp] 优雅关闭完成")
 
 
