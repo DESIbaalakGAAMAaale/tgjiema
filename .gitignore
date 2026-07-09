@@ -32,3 +32,7 @@ Thumbs.db
 docs/RU_OPTIMIZATION_PLAN.md
 docs/RU_OPTIMIZATION_PLAN_PART2.md
 test_plan.md
+
+# 审查报告（本地参考，不推送）
+docs/*审查*.md
+docs/*审查报告*.md
