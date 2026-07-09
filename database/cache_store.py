@@ -2132,7 +2132,7 @@ class CacheStore:
             "is_collection": r[19], "collection_codes": r[20],
         })
 
-    async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True):
+    async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True, _batch: bool = False):
         """写入/更新 file_record 到 SQLite"""
         if not self._db:
             return
@@ -2169,7 +2169,8 @@ class CacheStore:
              int(record.get("is_collection", 0) or 0), record.get("collection_codes", "[]") or "[]",
              synced),
         )
-        await self._db.commit()
+        if not _batch:
+            await self._db.commit()
 
     async def get_dirty_file_records(self, limit: int = 100) -> list[dict]:
         """获取需要同步到 CRDB 的脏 file_records"""
@@ -2259,7 +2260,7 @@ class CacheStore:
             "expire_time": r[9], "note": r[10],
         })
 
-    async def upsert_code_local(self, record: dict, mark_dirty: bool = True):
+    async def upsert_code_local(self, record: dict, mark_dirty: bool = True, _batch: bool = False):
         if not self._db:
             return
         synced = 0 if mark_dirty else 1
@@ -2285,7 +2286,8 @@ class CacheStore:
              record.get("created_at"), record.get("expire_time"), record.get("note", ""),
              synced),
         )
-        await self._db.commit()
+        if not _batch:
+            await self._db.commit()
 
     async def get_dirty_codes(self, limit: int = 100) -> list[dict]:
         if not self._db:
@@ -2363,7 +2365,7 @@ class CacheStore:
             "created_at": r[12], "updated_at": r[13],
         }
 
-    async def upsert_user_local(self, user: dict, mark_dirty: bool = True):
+    async def upsert_user_local(self, user: dict, mark_dirty: bool = True, _batch: bool = False):
         if not self._db:
             return
         synced = 0 if mark_dirty else 1
@@ -2382,7 +2384,8 @@ class CacheStore:
              user.get("is_banned", 0), user.get("created_at"), user.get("updated_at"),
              synced),
         )
-        await self._db.commit()
+        if not _batch:
+            await self._db.commit()
 
     async def get_dirty_users(self, limit: int = 100) -> list[dict]:
         if not self._db:

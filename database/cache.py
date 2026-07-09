@@ -519,7 +519,7 @@ async def _sync_local_tables_loop():
             new_fr = await fr_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
             for r in new_fr:
                 try:
-                    await store.upsert_file_record_local(r, mark_dirty=False)
+                    await store.upsert_file_record_local(r, mark_dirty=False, _batch=True)
                     total += 1
                 except Exception as e:
                     failed_count += 1
@@ -533,7 +533,7 @@ async def _sync_local_tables_loop():
             code_failed = 0
             for r in new_codes:
                 try:
-                    await store.upsert_code_local(r, mark_dirty=False)
+                    await store.upsert_code_local(r, mark_dirty=False, _batch=True)
                     total += 1
                 except Exception as e:
                     code_failed += 1
@@ -548,7 +548,7 @@ async def _sync_local_tables_loop():
             user_failed = 0
             for r in new_users:
                 try:
-                    await store.upsert_user_local(r, mark_dirty=False)
+                    await store.upsert_user_local(r, mark_dirty=False, _batch=True)
                     total += 1
                 except Exception as e:
                     user_failed += 1
@@ -570,7 +570,6 @@ async def _sync_local_tables_loop():
                         (r["external_code"], r.get("system_code", ""),
                          r.get("bot_username"), r.get("created_at"), r.get("updated_at")),
                     )
-                    await store._db.commit()
                     total += 1
                 except Exception as e:
                     ec_failed += 1
@@ -578,6 +577,14 @@ async def _sync_local_tables_loop():
                     logger.warning(f"[Sync] external_code_mapping 单条失败: {e}")
             if new_ec:
                 logger.debug(f"[Sync] external_code_mapping 增量: {len(new_ec)} 条, 失败 {ec_failed} 条")
+
+            # 批量 commit:将 N 次单独 commit 合并为 1 次,大幅减少 SQLite 锁冲突
+            if total > 0:
+                try:
+                    await store.commit()
+                except Exception as e:
+                    failed_count += 1
+                    logger.warning(f"[Sync] 批量 commit 失败: {e}")
 
             # 仅当全部成功时才推进水位,有失败时保留旧水位下次重试(upsert 幂等,重复查询无害)
             if failed_count == 0:
