@@ -254,6 +254,63 @@ class RelayPool:
             logger.info(f"[RelayPool] 移除中继账号: {phone}")
         return removed
 
+    async def reload_from_db(self):
+        """C3: 从 DB 增量同步账号列表(不中断现有连接,不触发通知)。
+
+        由 idx_bot 的 _watch_relay_change 后台任务在检测到 relay_change_notify 时调用。
+        - 对比 DB 账号列表 vs 内存 instances
+        - 移除 DB 中已删除的账号(shutdown 实例)
+        - 添加 DB 中新增的账号(创建实例 + start)
+        注意:此方法不调用 add_account/remove_account(避免 DB 重复写入),
+        也不调用 notify_relay_change(避免循环通知)。
+        """
+        db = await get_relay_db()
+        db_accounts = await db.get_active_accounts()
+        db_phones = {a["phone"] for a in db_accounts}
+        # 获取 DB 账号字典(phone → account)
+        db_account_map = {a["phone"]: a for a in db_accounts}
+        async with self._lock:
+            current_phones = {i.phone for i in self.instances}
+            to_remove = current_phones - db_phones
+            to_add = db_phones - current_phones
+        # 移除已删账号
+        for phone in to_remove:
+            try:
+                removed_instance: RelayInstance | None = None
+                async with self._lock:
+                    remaining = []
+                    for i in self.instances:
+                        if i.phone == phone:
+                            removed_instance = i
+                        else:
+                            remaining.append(i)
+                    self.instances = remaining
+                if removed_instance:
+                    await removed_instance.shutdown()
+                logger.info(f"[RelayPool] reload 移除账号: {phone}")
+            except Exception as e:
+                logger.warning(f"[RelayPool] reload 移除 {phone} 失败: {e}")
+        # 添加新增账号
+        for phone in to_add:
+            acct = db_account_map[phone]
+            try:
+                instance = RelayInstance(
+                    account_id=acct["id"],
+                    api_id=acct["api_id"],
+                    api_hash=acct["api_hash"],
+                    phone=acct["phone"],
+                )
+                async with self._lock:
+                    self.instances.append(instance)
+                # 启动实例(可能需要验证码,未就绪不回滚——账号已存在于 DB)
+                try:
+                    await instance.start()
+                except Exception as e:
+                    logger.warning(f"[RelayPool] reload 启动 {phone} 异常(可能需要验证码): {e}")
+                logger.info(f"[RelayPool] reload 添加账号: {phone} (ready={instance.is_ready})")
+            except Exception as e:
+                logger.warning(f"[RelayPool] reload 添加 {phone} 失败: {e}")
+
     async def get_pool_status(self) -> list[dict]:
         """获取账号池状态"""
         db = await get_relay_db()

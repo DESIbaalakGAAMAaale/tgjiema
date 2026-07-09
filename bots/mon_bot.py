@@ -86,6 +86,9 @@ class MonBot:
         # ─── cells 全量缓存:一次查询,多轮复用 ───
         self._cells_cache: list[dict] | None = None
         self._cells_cache_ts: float = 0
+        # C3: cells 变更监听任务(5s 轮询,替代 10 周期强制清空)
+        self._cells_change_task: asyncio.Task | None = None
+        self._last_cells_version: int = 0
 
     async def _get_cells(self) -> list[dict]:
         """获取全量 cells，本地 SQLite 优先（零 CRDB RU），CRDB 仅首次兜底。
@@ -136,6 +139,38 @@ class MonBot:
                 for k, v in updates.items():
                     c[k] = v
                 break
+
+    async def _watch_cells_change_loop(self):
+        """C3: 每 5 秒检查 cells_change_notify,发现外部变更(admin_bot 增减槽位)
+        立即失效内存缓存,将感知延迟从 ~10 分钟降到 ~5 秒。
+        """
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        while self._running:
+            try:
+                changed, new_version = await store.has_cells_change(self._last_cells_version)
+                if changed:
+                    self._invalidate_cells_cache()
+                    self._last_cells_version = new_version
+                    logger.info(f"[Mon] cells 外部变更检测(version={new_version}),已失效缓存")
+            except Exception as e:
+                logger.debug(f"[Mon] cells 变更检测异常: {e}")
+            await asyncio.sleep(5)
+
+    async def _start_cells_change_watcher(self):
+        """启动 cells 变更监听任务(幂等)。"""
+        if self._cells_change_task is None or self._cells_change_task.done():
+            self._cells_change_task = asyncio.create_task(self._watch_cells_change_loop())
+
+    async def _stop_cells_change_watcher(self):
+        """停止 cells 变更监听任务。"""
+        if self._cells_change_task and not self._cells_change_task.done():
+            self._cells_change_task.cancel()
+            try:
+                await self._cells_change_task
+            except asyncio.CancelledError:
+                pass
+        self._cells_change_task = None
 
     async def _reload_rotation_config(self):
         """从本地 KV 读取轮转参数(30 个周期一次, 零 CRDB RU)。
@@ -639,6 +674,8 @@ class MonBot:
         await report_bot_heartbeat("mon_bot")
         await self.bot.initialize()
         self._running = True
+        # C3: 启动 cells 变更监听(5s 轮询,加速外部变更感知)
+        await self._start_cells_change_watcher()
         self._rotation_reload_countdown = 0
         # 从本地 SQLite 恢复心跳状态,避免重启后 fail_streak 从零开始
         store = get_cache_store()
@@ -829,6 +866,8 @@ class MonBot:
     async def stop(self):
         """停止 Mon。"""
         self._running = False
+        # C3: 停止 cells 变更监听任务
+        await self._stop_cells_change_watcher()
         if self._admin_bot:
             try:
                 await self._admin_bot.shutdown()

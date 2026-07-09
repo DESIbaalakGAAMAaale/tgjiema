@@ -2071,6 +2071,28 @@ async def _async_main():
                 pass
             await asyncio.sleep(60)
     create_safe_task(_report_relay_stats(), name="relay-stats")
+    # C3: 监听 relay 账号池变更通知(admin_bot /relay_add、/relay_remove 触发)
+    async def _watch_relay_change():
+        """每 5 秒检查 relay_change_notify,发现变更后 reload_from_db。
+
+        admin_bot 通过 notify_relay_change() 写入 SQLite 通知表(跨进程共享)。
+        本任务检测到变更后调用 relay_pool.reload_from_db() 增量同步账号列表,
+        无需重启 idx_bot 即可感知新增/移除的中继账号。
+        """
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        last_version = 0
+        while True:
+            try:
+                changed, new_version = await store.has_relay_change(last_version)
+                if changed:
+                    logger.info(f"[Idx] relay 账号池变更检测(version={new_version}),执行 reload_from_db")
+                    await relay_pool.reload_from_db()
+                    last_version = new_version
+            except Exception as e:
+                logger.warning(f"[Idx] relay 变更检测异常: {e}")
+            await asyncio.sleep(5)
+    create_safe_task(_watch_relay_change(), name="watch-relay-change")
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")
     # Decode Logs 缓冲 flush 后台任务

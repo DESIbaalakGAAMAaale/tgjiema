@@ -21,6 +21,8 @@ DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
 
 # 单调递增版本号计数器，替代时间戳避免同一毫秒内多次变更获得相同版本号
 _cells_version_counter = int(time.time() * 1000)
+# C3: relay 账号池变更版本计数器(独立于 cells,语义隔离)
+_relay_version_counter = int(time.time() * 1000)
 
 # ─── JSON 字段反序列化（SQLite 存储为 JSON 字符串，读取时需还原为 Python 对象）───
 _JSON_FIELDS_DICT = {"file_types"}  # 期望 dict 的字段
@@ -56,6 +58,12 @@ def _next_cells_version() -> int:
     global _cells_version_counter
     _cells_version_counter += 1
     return _cells_version_counter
+
+
+def _next_relay_version() -> int:
+    global _relay_version_counter
+    _relay_version_counter += 1
+    return _relay_version_counter
 
 
 class CacheStore:
@@ -178,6 +186,14 @@ class CacheStore:
         )
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS cells_change_notify (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                version INTEGER NOT NULL,
+                ts      REAL NOT NULL
+            )"""
+        )
+        # ─── C3: relay 账号池跨进程变更通知表(admin_bot 写 → idx_bot 读)───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS relay_change_notify (
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 version INTEGER NOT NULL,
                 ts      REAL NOT NULL
@@ -641,6 +657,10 @@ class CacheStore:
             )
             await self._db.execute(
                 "DELETE FROM cells_change_notify WHERE ts < ?",
+                (time.time() - 3600,),
+            )
+            await self._db.execute(
+                "DELETE FROM relay_change_notify WHERE ts < ?",
                 (time.time() - 3600,),
             )
             await self._db.commit()
@@ -1556,6 +1576,82 @@ class CacheStore:
         )
         await self._db.commit()
 
+    async def delete_cell_local(self, slot_id: str) -> bool:
+        """C3: 删除单个 cell 并修复环形链表指针,然后重建快照。
+
+        - 查找前驱 P(P.next_active_chat_id == X.channel_id)
+        - 查找后继 S(S.prev_slot_id == X.slot_id)
+        - 修复 P 和 S 的指针
+        - 删除 X
+        - 重建快照 + bump version(触发跨进程通知)
+        返回 True 表示删除成功,False 表示 slot_id 不存在。
+        """
+        if not self._db:
+            return False
+        # 先获取待删除 cell 的 channel_id
+        rows = await self._db.execute_fetchall(
+            "SELECT channel_id FROM cells_local WHERE slot_id = ?",
+            (slot_id,),
+        )
+        if not rows:
+            return False
+        target_channel_id = rows[0][0]
+        # 查找前驱 P:next_active_chat_id == target_channel_id 的 cell
+        prev_rows = await self._db.execute_fetchall(
+            "SELECT slot_id, channel_id FROM cells_local WHERE next_active_chat_id = ?",
+            (target_channel_id,),
+        )
+        # 查找后继 S:prev_slot_id == slot_id 的 cell
+        next_rows = await self._db.execute_fetchall(
+            "SELECT slot_id, channel_id FROM cells_local WHERE prev_slot_id = ?",
+            (slot_id,),
+        )
+        # 修复指针(单事务)
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            prev_slot_id = prev_rows[0][0] if prev_rows else None
+            prev_channel_id = prev_rows[0][1] if prev_rows else None
+            next_slot_id = next_rows[0][0] if next_rows else None
+            next_channel_id = next_rows[0][1] if next_rows else None
+            # 排除自引用(X 的 next 指向自己或 prev 指向自己)
+            if prev_slot_id == slot_id:
+                prev_slot_id = None
+            if next_slot_id == slot_id:
+                next_slot_id = None
+            # 更新前驱的 next 指向后继
+            if prev_slot_id:
+                new_next = next_channel_id if next_slot_id else None
+                if new_next is not None:
+                    await self._db.execute(
+                        "UPDATE cells_local SET next_active_chat_id = ?, updated_at = ? WHERE slot_id = ?",
+                        (new_next, time.time(), prev_slot_id),
+                    )
+                else:
+                    await self._db.execute(
+                        "UPDATE cells_local SET next_active_chat_id = NULL, updated_at = ? WHERE slot_id = ?",
+                        (time.time(), prev_slot_id),
+                    )
+            # 更新后继的 prev 指向前驱
+            if next_slot_id:
+                new_prev = prev_slot_id if prev_slot_id else None
+                await self._db.execute(
+                    "UPDATE cells_local SET prev_slot_id = ?, updated_at = ? WHERE slot_id = ?",
+                    (new_prev, time.time(), next_slot_id),
+                )
+            # 删除目标 cell
+            await self._db.execute(
+                "DELETE FROM cells_local WHERE slot_id = ?",
+                (slot_id,),
+            )
+            await self._db.commit()
+        except Exception as e:
+            await self._db.execute("ROLLBACK")
+            logger.error(f"[CacheStore] delete_cell_local 事务失败: {e}")
+            raise
+        # 重建快照 + bump version(触发跨进程通知)
+        await self._rebuild_cells_snapshot()
+        return True
+
     async def _rebuild_cells_snapshot(self):
         """从 cells_local 重建 JSON 快照，保持向后兼容（其他 Bot 读 snapshot）"""
         if not self._db:
@@ -1584,6 +1680,35 @@ class CacheStore:
             (version, ts),
         )
         await self._db.commit()
+
+    async def notify_relay_change(self):
+        """C3: 写入 relay 账号池变更通知,触发 idx_bot 等消费者 reload。
+
+        由 admin_bot 在 /relay_add、/relay_remove 成功后调用。
+        """
+        if not self._db:
+            return
+        version = _next_relay_version()
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO relay_change_notify (version, ts) VALUES (?, ?)",
+            (version, now),
+        )
+        await self._db.commit()
+
+    async def has_relay_change(self, last_version: int) -> tuple[bool, int]:
+        """C3: 检查是否有 relay 账号池变更。
+
+        返回 (是否有变更, 最新版本号)。
+        """
+        if not self._db:
+            return False, last_version
+        row = await self._db.execute_fetchall(
+            "SELECT MAX(version) FROM relay_change_notify WHERE version > ?",
+            (last_version,),
+        )
+        new_version = row[0][0] if row and row[0][0] else last_version
+        return new_version > last_version, new_version
 
     # ─── Manifest 驱动的副本同步（免 Telethon 读历史）───
 

@@ -500,6 +500,12 @@ async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await relay_pool.add_account(api_id, api_hash, phone)
+        # C3: 通知 idx_bot 进程的 relay_pool 增量同步新账号
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().notify_relay_change()
+        except Exception as notify_err:
+            logger.warning(f"[Admin] notify_relay_change 失败(非致命): {notify_err}")
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
         await update.message.reply_text(
             f"✅ 中继账号已添加到池中\n"
@@ -527,6 +533,12 @@ async def relay_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from services.relay_pool import relay_pool
     removed = await relay_pool.remove_account(phone)
     if removed:
+        # C3: 通知 idx_bot 进程的 relay_pool 移除该账号
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().notify_relay_change()
+        except Exception as notify_err:
+            logger.warning(f"[Admin] notify_relay_change 失败(非致命): {notify_err}")
         await update.message.reply_text(f"✅ 已移除中继账号: {phone}")
     else:
         await update.message.reply_text(f"❌ 未找到该手机号的中继账号: {phone}")
@@ -1066,6 +1078,136 @@ async def spare_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"  {used} {s['channel_id']} — {acc}\n"
     msg += f"\n共 {len(spares)} 个备用频道\n使用 /spare_add 添加 | /spare_remove 删除"
     await update.message.reply_text(msg)
+
+
+# ─── C3: 频道槽位运行时增减 ──────────────────────────────────
+
+@_auth_required
+async def cell_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """添加频道槽位到环形拓扑(默认 shadow1 状态,不破坏现有 active 拓扑)"""
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "用法:/cell_add <slot_id> <channel_id> [account_name] [status]\n\n"
+            "添加频道槽位到环形拓扑。\n"
+            "• slot_id: 槽位标识(如 a3、s3a)\n"
+            "• channel_id: 频道 ID(如 -1001234567890)\n"
+            "• account_name: 账号名(可选)\n"
+            "• status: 状态(可选,默认 shadow1,可选 active/shadow1/shadow2/r100)\n\n"
+            "示例:\n"
+            "/cell_add a3 -1001234567890 账号1\n"
+            "/cell_add s3a -1001234567890 账号1 shadow1"
+        )
+        return
+    slot_id = args[0].strip()
+    try:
+        channel_id = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ channel_id 必须是数字")
+        return
+    account_name = args[2] if len(args) > 2 else ""
+    status = args[3] if len(args) > 3 else "shadow1"
+    if status not in ("active", "shadow1", "shadow2", "r100"):
+        await update.message.reply_text("❌ status 必须是 active/shadow1/shadow2/r100 之一")
+        return
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    # 检查 slot_id 是否已存在
+    existing = await store.get_all_cells_local()
+    if any(c.get("slot_id") == slot_id for c in existing):
+        await update.message.reply_text(f"❌ slot_id {slot_id} 已存在")
+        return
+    if any(c.get("channel_id") == channel_id for c in existing):
+        await update.message.reply_text(f"❌ channel_id {channel_id} 已被其他槽位占用")
+        return
+    # 构造新 cell 记录
+    import time as _time
+    import datetime as _dt
+    now_ts = _time.time()
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    new_cell = {
+        "slot_id": slot_id,
+        "channel_id": channel_id,
+        "status": status,
+        "next_active_chat_id": None,
+        "prev_slot_id": None,
+        "demoted_to_channel_id": None,
+        "account_name": account_name,
+        "is_r100": 1 if status == "r100" else 0,
+        "last_heartbeat": None,
+        "last_synced_msg_id": 0,
+        "degrade_count": 0,
+        "file_count": 0,
+        "rotation_started_at": None,
+        "updated_at": now_ts,
+        "crdb_synced": 0,  # 标记为脏,mon_bot 会异步同步到 CRDB
+    }
+    try:
+        await store.bulk_upsert_cells_local([new_cell])
+        # 失效 admin_bot 自己的 cells 缓存
+        from bots.admin_bot.display import invalidate_cells_cache
+        await invalidate_cells_cache()
+        await update.message.reply_text(
+            f"✅ 已添加槽位\n"
+            f"  slot_id: {slot_id}\n"
+            f"  channel_id: {channel_id}\n"
+            f"  account: {account_name or '(无)'}\n"
+            f"  status: {status}\n\n"
+            f"其他 bot 将在 5-60 秒内感知变更。\n"
+            f"注意:新槽位的环形指针(next/prev)为空,如需接入环请用 /topology 查看。"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ 添加失败: {e}")
+
+
+@_auth_required
+async def cell_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """移除频道槽位(拒绝移除 active 状态,需先降级)"""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "用法:/cell_remove <slot_id>\n\n"
+            "从环形拓扑移除频道槽位。\n"
+            "• 自动修复环形链表指针(前驱/后继)\n"
+            "• 拒绝移除 active 状态的槽位(请先等待轮转或手动降级)\n\n"
+            "示例:/cell_remove s3a"
+        )
+        return
+    slot_id = args[0].strip()
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    # 检查槽位是否存在及状态
+    existing = await store.get_all_cells_local()
+    target = None
+    for c in existing:
+        if c.get("slot_id") == slot_id:
+            target = c
+            break
+    if not target:
+        await update.message.reply_text(f"❌ slot_id {slot_id} 不存在")
+        return
+    if target.get("status") == "active":
+        await update.message.reply_text(
+            f"❌ 拒绝移除 active 状态的槽位 {slot_id}\n"
+            f"请先等待轮转使其变为 shadow,或通过其他方式降级后再移除。"
+        )
+        return
+    try:
+        deleted = await store.delete_cell_local(slot_id)
+        if deleted:
+            # 失效 admin_bot 自己的 cells 缓存
+            from bots.admin_bot.display import invalidate_cells_cache
+            await invalidate_cells_cache()
+            await update.message.reply_text(
+                f"✅ 已移除槽位 {slot_id}\n"
+                f"  channel_id: {target.get('channel_id')}\n"
+                f"  环形链表指针已修复\n"
+                f"其他 bot 将在 5-60 秒内感知变更。"
+            )
+        else:
+            await update.message.reply_text(f"❌ 移除失败: slot_id {slot_id} 不存在")
+    except Exception as e:
+        await update.message.reply_text(f"❌ 移除失败: {e}")
 
 
 # ─── 轮转配置管理 ──────────────────────────────────────────────
