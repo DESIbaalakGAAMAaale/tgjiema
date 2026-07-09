@@ -685,6 +685,55 @@ class MonBot:
         store = get_cache_store()
         await store.batch_update_cells_local(batch_updates)
 
+        # ── 轮转后重建环指针:确保所有 active 槽位形成闭环 ──
+        # 轮转可能导致 next 指针指向非 active 频道(如 a 槽位是 shadow1),
+        # 这里重新计算所有 active 槽位的环顺序,确保闭环正确。
+        # 顺序规则:按组号排序,末尾指向首部形成环。
+        updated_cells = await store.get_all_cells_local()
+        active_after = [c for c in updated_cells if c.get("status") == "active"]
+        if len(active_after) >= 2:
+            # 按组号排序
+            def _group_num(c):
+                m = re.match(r'[as](\d+)', c.get("slot_id", ""))
+                return int(m.group(1)) if m else 999
+            active_after.sort(key=_group_num)
+
+            ring_updates = []
+            for i, c in enumerate(active_after):
+                next_i = (i + 1) % len(active_after)
+                next_ch = active_after[next_i]["channel_id"]
+                cur_next = c.get("next_active_chat_id")
+                if cur_next != next_ch:
+                    ring_updates.append((c["slot_id"], next_ch))
+                    self._update_cell_in_cache(c["slot_id"], {"next_active_chat_id": next_ch})
+
+            if ring_updates:
+                await store.batch_update_cells_local([
+                    (sid, {"next_active_chat_id": ch}, True) for sid, ch in ring_updates
+                ])
+                logger.info(
+                    f"[Mon][Rotation] 环指针重建: 修复 {len(ring_updates)} 个 active 槽位的 next 指针"
+                )
+
+        # ── 清理非 active 槽位的脏 next 指针 ──
+        # shadow1/shadow2/lost 槽位不应持有指向非 active 频道的 next 指针,
+        # 否则 validate_topology 会误报。仅保留 shadow2 指向同组 a 槽位的指针(设计如此)。
+        active_channels_set = {c["channel_id"] for c in active_after} if len(active_after) >= 2 else set()
+        clean_updates = []
+        for c in updated_cells:
+            if c.get("status") not in ("active", "r100"):
+                nxt = c.get("next_active_chat_id")
+                if nxt and nxt not in active_channels_set and c.get("status") != "shadow2":
+                    clean_updates.append((c["slot_id"], None))
+                    self._update_cell_in_cache(c["slot_id"], {"next_active_chat_id": None})
+        if clean_updates:
+            await store.batch_update_cells_local([
+                (sid, {"next_active_chat_id": None}, True) for sid, _ in clean_updates
+            ])
+            logger.info(
+                f"[Mon][Rotation] 清理 {len(clean_updates)} 个非 active 槽位的脏 next 指针"
+            )
+
         for cell in demoted_slots:
             logger.info(f"[Mon][Rotation] 休眠 {cell['slot_id']}")
         for promote_slot, from_cell in promoted_slots:
