@@ -89,6 +89,13 @@ class MonBot:
         # C3: cells 变更监听任务(5s 轮询,替代 10 周期强制清空)
         self._cells_change_task: asyncio.Task | None = None
         self._last_cells_version: int = 0
+        # ─── FloodWait 跳过机制:避免被限速频道恶性循环 ───
+        # slot_id → FloodWait 解除时间戳(time.time())
+        # 处于 FloodWait 期的频道跳过心跳,直到解除时间到达
+        self._cell_floodwait_until: dict[str, float] = {}
+        # ─── shadow2 冷备心跳降频:每 N 轮检测一次,减少不必要的 API 调用 ───
+        # shadow2 是冷备频道,不需要跟 active/shadow1 同频率检测
+        self._SHADOW2_HEARTBEAT_EVERY_N_CYCLES = 5  # 5 轮 = 5 分钟(60s 间隔)
 
     async def _get_cells(self) -> list[dict]:
         """获取全量 cells，本地 SQLite 优先（零 CRDB RU），CRDB 仅首次兜底。
@@ -777,6 +784,14 @@ class MonBot:
                     stale_suspicious = [k for k in self._cell_suspicious if k not in valid_slots]
                     for k in stale_suspicious:
                         del self._cell_suspicious[k]
+                    # 清理已解除的 FloodWait 记录 + 已删除槽位的记录
+                    stale_fw = [k for k in self._cell_floodwait_until if k not in valid_slots]
+                    for k in stale_fw:
+                        del self._cell_floodwait_until[k]
+                    # 顺便清理已过期的 FloodWait 记录(释放内存)
+                    expired_fw = [k for k, v in self._cell_floodwait_until.items() if v <= now_ts]
+                    for k in expired_fw:
+                        del self._cell_floodwait_until[k]
                     if stale_notify or stale_healthy or stale_streak or stale_suspicious:
                         logger.debug(
                             f"[Mon] 清理过期字典条目: notify={len(stale_notify)} "
@@ -824,14 +839,31 @@ class MonBot:
         优化:心跳只写入本地 SQLite(零 CRDB RU)，降级判断使用内存 fail_streak。
         仅在实际发生状态变更(降级/轮转/封禁替换)时才写入 CRDB。
         last_heartbeat 不再写入 CRDB，减少 RU 消耗。
+
+        优化:
+        - FloodWait 跳过:处于限速期的频道跳过心跳,避免恶性循环
+        - shadow2 降频:冷备频道每 N 轮检测一次,减少不必要的 API 调用
         """
         store = get_cache_store()
+        now = time.time()
         # 从传入的 all_cells 中筛选 active/shadow
         cells = [c for c in all_cells if c.get("status") in ("active", "shadow1", "shadow2")]
         ok_count = 0
         ban_count = 0
         for cell in cells:
             slot_id = cell["slot_id"]
+            status = cell.get("status", "")
+
+            # FloodWait 跳过:处于限速期的频道跳过心跳,避免恶性循环
+            fw_until = self._cell_floodwait_until.get(slot_id, 0)
+            if fw_until > now:
+                logger.debug(f"[Mon] 心跳跳过 slot={slot_id} (FloodWait 剩余 {int(fw_until - now)}s)")
+                continue
+
+            # shadow2 冷备降频:每 N 轮检测一次
+            if status == "shadow2" and self._cycle_count % self._SHADOW2_HEARTBEAT_EVERY_N_CYCLES != 0:
+                continue
+
             try:
                 # 使用 get_chat 做更彻底的检测
                 await self.bot.get_chat(cell["channel_id"])
@@ -842,9 +874,13 @@ class MonBot:
                 self._cell_suspicious.pop(slot_id, None)  # 恢复后清除疑似标记
                 ok_count += 1
             except RetryAfter as e:
-                # FloodWait: 等待后继续,不视为封禁
-                logger.warning(f"[Mon] 心跳触发 FloodWait slot={slot_id}, 等待 {e.retry_after}s")
-                await asyncio.sleep(e.retry_after + 1)
+                # FloodWait:记录解除时间,本轮跳过等待,后续轮次跳过心跳直到解除
+                wait_sec = e.retry_after + 2  # 多加 2s 余量
+                self._cell_floodwait_until[slot_id] = now + wait_sec
+                logger.warning(
+                    f"[Mon] 心跳触发 FloodWait slot={slot_id}, 跳过 {wait_sec}s "
+                    f"(本轮不等待,后续轮次自动跳过)"
+                )
                 await store.write_heartbeat(slot_id, ok=False)
                 self._cell_fail_streak[slot_id] = self._cell_fail_streak.get(slot_id, 0) + 1
             except TelegramError as e:
