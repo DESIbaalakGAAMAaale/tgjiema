@@ -259,7 +259,6 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         "cells": "slot_id",
         "codes": "code",
         "spare_pool": "channel_id",
-        "config": "config_key",
         "kv_config": "config_key",
         "external_code_mapping": "external_code",
         "relay_accounts": "phone",  # 主键 id 是 SERIAL,用 phone UNIQUE 做冲突

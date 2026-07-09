@@ -175,8 +175,9 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
     insert_cols = columns
     placeholders = [f"${i + 1}" for i in range(len(insert_cols))]
     # 构建 ON CONFLICT ... DO UPDATE SET 子句
-    # N-16-4: relay_accounts.api_hash 备份中已脱敏，UPDATE 时跳过该列保留 DB 现值，
-    # 但 INSERT 时保留（满足 NOT NULL 约束，全新库可插入占位值）
+    # N-16-4: relay_accounts.api_hash 在 UPSERT 时跳过 UPDATE，
+    # 保留 DB 现值（避免备份中的密文覆盖运行中已更新的密钥）；
+    # INSERT 时仍包含（满足 NOT NULL 约束，全新库可插入）
     _skip_update_cols = {"relay_accounts": {"api_hash"}}
     update_parts = [f"{c} = EXCLUDED.{c}" for c in insert_cols if c not in pk_cols and c not in _skip_update_cols.get(table, set())]
 

@@ -28,7 +28,8 @@
 ## 技术栈
 
 - **语言**: Python 3.12+
-- **框架**: Pyrofork / Telethon（MTProto 客户端）
+- **Bot 框架**: python-telegram-bot 21.6（Bot API）
+- **用户账号层**: Telethon 1.38.0（MTProto 客户端）
 - **数据库**: CockroachDB（主库）+ SQLite（本地缓存）
 - **对象存储**: Cloudflare R2（数据库备份）
 - **部署**: systemd 独立服务（VPS）+ Cloudflare Workers（File Bot）

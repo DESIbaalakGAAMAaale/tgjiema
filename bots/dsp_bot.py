@@ -118,6 +118,25 @@ async def _retry_dead_jobs():
         await asyncio.sleep(3600)
 
 
+async def _reclaim_stale_pel_loop():
+    """N-R1: 周期性回收 Redis PEL 中的孤儿条目(worker 崩溃后未 XACK 的消息)。
+
+    SQLite 的 reclaim_stale_dispatched(600s) 已重投 job 到 pending,
+    这里只需 XACK 丢弃 PEL 中的陈旧条目,防止 PEL 无限膨胀。
+    """
+    from utils.redis_client import xautoclaim_stale_jobs, xack_job
+    while True:
+        try:
+            stale = await xautoclaim_stale_jobs(min_idle_ms=600000, count=20)
+            for msg_id, _fields in stale:
+                await xack_job(msg_id)  # 丢弃孤儿条目,job 已由 SQLite 兜底重投
+            if stale:
+                logger.info(f"[Dsp] PEL 回收: 清理 {len(stale)} 个孤儿条目")
+        except Exception as e:
+            logger.warning(f"[Dsp] PEL 回收异常: {e}")
+        await asyncio.sleep(300)
+
+
 async def _watch_cells_change():
     """PRE-02: 定期检查 cells_change_notify，发现 mon_bot 轮转/降级后立即失效 delivery_resolver 缓存。
 
@@ -376,11 +395,13 @@ async def _dsp_worker(bot: Any, worker_id: int):
     C1: 优先使用 Redis Stream XREADGROUP(事件驱动),降级到 dsp_notify 轮询
     """
     from database.cache_store import get_cache_store
-    from utils.redis_client import xreadgroup_jobs, xack_job, get_redis
+    from utils.redis_client import xreadgroup_jobs, xack_job, get_redis, get_consumer_name
     store = get_cache_store()
-    consumer_name = f"worker-{worker_id}"
+    consumer_name = f"{get_consumer_name()}-{worker_id}"
+    round_counter = 0
 
     while True:
+        round_counter += 1
         try:
             # C1: 优先从 Redis Stream 读取(事件驱动,BLOCK 5s)
             redis = await get_redis()
@@ -423,6 +444,18 @@ async def _dsp_worker(bot: Any, worker_id: int):
                 # C1 兜底:Redis 消息不足时补充 SQLite pending(防止 MAXLEN 截断的 job 饥饿)
                 # 当 Redis 拉取的消息少于 count(10),说明 Stream 已无积压,此时检查 SQLite
                 if len(redis_messages) < 10:
+                    fallback_jobs = await store.get_local_pending_jobs(5)
+                    if fallback_jobs:
+                        fb_claimed = []
+                        for rj in fallback_jobs:
+                            if await store.mark_local_job_dispatched(rj["crdb_id"]):
+                                fb_claimed.append(_raw_jobs_to_results([rj])[0])
+                        if fb_claimed:
+                            fb_tasks = [asyncio.create_task(_send_one_job(bot, j, worker_id, store)) for j in fb_claimed]
+                            await asyncio.gather(*fb_tasks, return_exceptions=True)
+                # N-R3: 每 50 轮强制轮询 SQLite pending,防止持续满载下被 MAXLEN 裁剪的 job 饥饿
+                if len(redis_messages) >= 10 and (round_counter % 50 == 0):
+                    # 强制补充 SQLite pending 检查
                     fallback_jobs = await store.get_local_pending_jobs(5)
                     if fallback_jobs:
                         fb_claimed = []
@@ -978,6 +1011,7 @@ async def _async_main():
     create_safe_task(_cleanup_channel_limiter_loop(), name="cleanup-channel-limiter")
     create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
     create_safe_task(reclaim_dispatched_loop(), name="reclaim-dispatched")  # E: 回收超时 dispatched
+    create_safe_task(_reclaim_stale_pel_loop(), name="reclaim-stale-pel")  # N-R1: 回收 PEL 孤儿条目
     create_safe_task(_watch_cells_change(), name="watch-cells-change")  # PRE-02: 失效 delivery_resolver 缓存
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")

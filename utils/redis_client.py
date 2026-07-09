@@ -7,6 +7,8 @@
 - 连接失败后周期性重试(60s),避免临时网络抖动导致永久降级
 - Stream + 消费者组幂等创建
 """
+import os
+import socket
 import time
 from typing import Any
 from loguru import logger
@@ -19,6 +21,11 @@ _redis_init_attempted: bool = False
 _redis_available: bool = False
 _redis_last_attempt_ts: float = 0
 _REDIS_RETRY_INTERVAL = 60.0  # 失败后 60 秒重试
+
+
+def get_consumer_name() -> str:
+    """生成唯一消费者名(主机名+PID),防多进程撞名。"""
+    return f"dw-{socket.gethostname()}-{os.getpid()}"
 
 
 async def get_redis() -> Any:
@@ -124,6 +131,35 @@ async def xack_job(message_id: str) -> bool:
     except Exception as e:
         logger.debug(f"[Redis] xack 异常: {e}")
         return False
+
+
+async def xautoclaim_stale_jobs(min_idle_ms: int = 600000, count: int = 10) -> list[tuple[str, dict]]:
+    """回收 PEL 中陈旧的孤儿条目(worker 崩溃后未 XACK 的消息)。
+
+    使用 XAUTOCLAIM 认领 idle 时间超过 min_idle_ms 的条目。
+    返回 [(message_id, fields), ...],失败返回空列表。
+    """
+    redis = await get_redis()
+    if not redis:
+        return []
+    try:
+        # XAUTOCLAIM 返回 (next_start_id, [(msg_id, fields), ...], deleted_ids)
+        resp = await redis.xautoclaim(
+            STREAM_NAME,
+            CONSUMER_GROUP,
+            get_consumer_name(),  # 用动态消费者名认领
+            min_idle_time=min_idle_ms,
+            count=count,
+            start_id="0-0",
+        )
+        result = []
+        if isinstance(resp, (list, tuple)) and len(resp) >= 2:
+            for msg_id, fields in resp[1]:
+                result.append((msg_id, fields))
+        return result
+    except Exception as e:
+        logger.debug(f"[Redis] xautoclaim 异常: {e}")
+        return []
 
 
 async def close_redis():
