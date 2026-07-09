@@ -700,9 +700,12 @@ class CacheStore:
 
     # ─── 心跳本地存储：Mon Bot 写入 SQLite，零 CRDB RU ───
 
-    async def write_heartbeat(self, slot_id: str, ok: bool):
+    async def write_heartbeat(self, slot_id: str, ok: bool, _batch: bool = False):
         """写入本地心跳记录。ok=True 时重置 fail_streak，ok=False 时递增。
         同时更新 cells_local.last_heartbeat（ISO 格式）供降级 cooldown 判断使用。
+
+        _batch=True 时不调用 commit(由调用方批量完成后统一 commit),
+        减少 commit 次数避免多进程 SQLite 锁冲突。
         """
         if not self._db:
             return
@@ -725,7 +728,13 @@ class CacheStore:
             "UPDATE cells_local SET last_heartbeat = ?, updated_at = ? WHERE slot_id = ?",
             (now_iso, now, slot_id),
         )
-        await self._db.commit()
+        if not _batch:
+            await self._db.commit()
+
+    async def commit(self):
+        """显式 commit(批量操作后调用)。"""
+        if self._db:
+            await self._db.commit()
 
     async def get_all_heartbeats(self) -> dict[str, dict]:
         """读取所有本地心跳记录，返回 {slot_id: {last_ok, fail_streak}}。

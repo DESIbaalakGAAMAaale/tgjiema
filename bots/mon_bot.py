@@ -906,6 +906,7 @@ class MonBot:
         优化:
         - FloodWait 跳过:处于限速期的频道跳过心跳,避免恶性循环
         - shadow2 降频:冷备频道每 N 轮检测一次,减少不必要的 API 调用
+        - 批量 commit:所有心跳写入完成后统一 commit,减少 SQLite 锁冲突
         """
         store = get_cache_store()
         now = time.time()
@@ -913,6 +914,7 @@ class MonBot:
         cells = [c for c in all_cells if c.get("status") in ("active", "shadow1", "shadow2")]
         ok_count = 0
         ban_count = 0
+        has_writes = False  # 标记是否有写入操作,用于决定是否 commit
         for cell in cells:
             slot_id = cell["slot_id"]
             status = cell.get("status", "")
@@ -931,7 +933,8 @@ class MonBot:
                 # 使用 get_chat 做更彻底的检测
                 await self.bot.get_chat(cell["channel_id"])
                 # 心跳成功 → 只写本地 SQLite,不碰 CRDB → 零 RU
-                await store.write_heartbeat(slot_id, ok=True)
+                await store.write_heartbeat(slot_id, ok=True, _batch=True)
+                has_writes = True
                 self._cell_healthy[slot_id] = True
                 self._cell_fail_streak[slot_id] = 0
                 self._cell_suspicious.pop(slot_id, None)  # 恢复后清除疑似标记
@@ -944,7 +947,8 @@ class MonBot:
                     f"[Mon] 心跳触发 FloodWait slot={slot_id}, 跳过 {wait_sec}s "
                     f"(本轮不等待,后续轮次自动跳过)"
                 )
-                await store.write_heartbeat(slot_id, ok=False)
+                await store.write_heartbeat(slot_id, ok=False, _batch=True)
+                has_writes = True
                 self._cell_fail_streak[slot_id] = self._cell_fail_streak.get(slot_id, 0) + 1
             except TelegramError as e:
                 if _is_ban_error(e):
@@ -953,7 +957,8 @@ class MonBot:
                     await self._handle_channel_ban(cell, str(e))
                 else:
                     # 普通错误(如 flood),记录失败但不降级
-                    await store.write_heartbeat(slot_id, ok=False)
+                    await store.write_heartbeat(slot_id, ok=False, _batch=True)
+                    has_writes = True
                     self._cell_fail_streak[slot_id] = self._cell_fail_streak.get(slot_id, 0) + 1
             except Exception as e:
                 if _is_ban_error(e):
@@ -962,9 +967,17 @@ class MonBot:
                     await self._handle_channel_ban(cell, str(e))
                 else:
                     # 非 TelegramError 异常（如网络超时），记录失败
-                    await store.write_heartbeat(slot_id, ok=False)
+                    await store.write_heartbeat(slot_id, ok=False, _batch=True)
+                    has_writes = True
                     self._cell_fail_streak[slot_id] = self._cell_fail_streak.get(slot_id, 0) + 1
                     logger.warning(f"[Mon] 心跳异常 slot={slot_id}: {e}")
+
+        # 批量 commit:所有心跳写入完成后统一提交,减少 SQLite 锁冲突
+        if has_writes:
+            try:
+                await store.commit()
+            except Exception as e:
+                logger.warning(f"[Mon] 心跳批量 commit 失败: {e}")
         return ok_count, ban_count
 
     async def stop(self):
