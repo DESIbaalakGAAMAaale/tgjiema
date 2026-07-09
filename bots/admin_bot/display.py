@@ -11,7 +11,6 @@ from database import (
 )
 from database.models import make_user
 from utils.monitor import metrics
-from utils.storage_channel import get_active_storage_channel_id
 from utils.time_utils import format_datetime
 
 from .menus import _quota_display
@@ -192,7 +191,6 @@ async def _get_health_text() -> str:
 
 async def _get_topology_text() -> str:
     """显示环形冗余拓扑状态。"""
-    active_channel = await get_active_storage_channel_id()
     try:
         cells = await _get_cells_cached()
     except Exception as e:
@@ -200,7 +198,12 @@ async def _get_topology_text() -> str:
         cells = []
 
     msg = "🔗 环形冗余拓扑\n\n"
-    msg += f"📌 当前主频道: {active_channel}\n"
+    # 环形架构无主频道概念,显示第一个 active 槽位作为当前活跃频道
+    active_cells = [c for c in cells if c.get("status") == "active"]
+    if active_cells:
+        msg += f"📌 活跃频道数: {len(active_cells)}\n"
+    else:
+        msg += "📌 活跃频道数: 0 (系统不可用)\n"
     msg += f"📊 总槽位数: {len(cells)}\n"
 
     # 统计
