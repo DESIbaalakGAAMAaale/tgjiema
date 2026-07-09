@@ -5,6 +5,7 @@
 """
 import asyncio
 import re
+import time
 from pathlib import Path
 
 from loguru import logger
@@ -17,6 +18,19 @@ from config import settings
 
 _SETTLE_WAIT = 5
 _INITIAL_SETTLE_WAIT = 20
+
+_BAN_KEYWORDS = [
+    "deactivated", "banned", "auth_key", "unauthorized",
+    "session_revoked", "auth_key_duplicated",
+    "user_deactivated", "phone_number_banned",
+    "phone is banned", "user is deactivated",
+]
+
+
+def _is_ban_error(exc: Exception) -> bool:
+    """判断异常是否为账号封禁/受限/失效错误。"""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in _BAN_KEYWORDS)
 
 
 class RelayInstance:
@@ -59,10 +73,84 @@ class RelayInstance:
         # P1-8:start() 守卫,避免重复创建 cleanup 循环(重复调用 start 时)。
         self._cleanup_loop_started = False
         self._shutdown_done = False
+        # A2: FloodWait / 封禁自愈
+        self._floodwait_until: float = 0.0  # FloodWait 到期时间戳, 0 表示无限制
+        self._ban_detected: bool = False  # 是否检测到封禁/受限
 
     @property
     def is_ready(self) -> bool:
-        return self._ready.is_set()
+        if not self._ready.is_set():
+            return False
+        if self._ban_detected:
+            return False
+        if time.time() < self._floodwait_until:
+            return False
+        return True
+
+    def record_flood_wait(self, seconds: int):
+        """记录 FloodWait,暂时标记账号不可用。"""
+        self._floodwait_until = time.time() + seconds + 5  # 额外 5s 缓冲
+        logger.warning(
+            f"[RelayInstance:{self.phone}] FloodWait {seconds}s, "
+            f"暂时不可用"
+        )
+
+    def record_ban(self, reason: str):
+        """记录账号封禁/受限。"""
+        if not self._ban_detected:
+            logger.error(f"[RelayInstance:{self.phone}] 账号受限/封禁: {reason}")
+        self._ban_detected = True
+        try:
+            asyncio.create_task(self._report_status("banned"))
+        except Exception:
+            pass
+
+    def clear_expired_floodwait(self):
+        """清除已到期的 FloodWait 限制。"""
+        if self._floodwait_until > 0 and time.time() >= self._floodwait_until:
+            self._floodwait_until = 0.0
+            logger.info(f"[RelayInstance:{self.phone}] FloodWait 已到期,恢复可用")
+
+    async def check_health(self) -> bool:
+        """A2: 主动健康检查,验证账号是否仍可用。
+
+        用于:
+        - 恢复误判封禁的账号
+        - 恢复 FloodWait 到期的账号
+        - 检测客户端断线并尝试重连
+        """
+        if not self._client:
+            return False
+        try:
+            if not self._client.is_connected():
+                await self._client.connect()
+                if not await self._client.is_user_authorized():
+                    return False
+            me = await self._client.get_me()
+            if me:
+                if self._ban_detected or self._floodwait_until > 0:
+                    logger.info(f"[RelayInstance:{self.phone}] 健康检查通过,恢复可用")
+                self._ban_detected = False
+                self._floodwait_until = 0.0
+                await self._report_status("online")
+                return True
+        except FloodWaitError as e:
+            self._floodwait_until = time.time() + e.seconds + 5
+            logger.warning(
+                f"[RelayInstance:{self.phone}] 健康检查触发 FloodWait: {e.seconds}s"
+            )
+            return False
+        except Exception as e:
+            if _is_ban_error(e):
+                if not self._ban_detected:
+                    logger.error(f"[RelayInstance:{self.phone}] 健康检查检测到封禁: {e}")
+                self._ban_detected = True
+                try:
+                    await self._report_status("banned")
+                except Exception:
+                    pass
+            return False
+        return False
 
     @property
     def relay_user_id(self) -> int | None:
@@ -309,7 +397,15 @@ class RelayInstance:
             )
             logger.info(f"[RelayInstance:{self.phone}] 已向 @{bot_username} 发送外部码 (user={user_id}, code={code})")
             return True
+        except FloodWaitError as e:
+            self.record_flood_wait(e.seconds)
+            logger.warning(
+                f"[RelayInstance:{self.phone}] 向 @{bot_username} 发送触发 FloodWait: {e.seconds}s"
+            )
+            return False
         except Exception as e:
+            if _is_ban_error(e):
+                self.record_ban(str(e))
             logger.error(f"[RelayInstance:{self.phone}] 向 @{bot_username} 发送失败: {e}")
             return False
 
@@ -338,7 +434,14 @@ class RelayInstance:
                 )
             else:
                 logger.warning(f"[RelayInstance:{self.phone}] Up Bot 不可用，跳过文件 (code={code})")
+        except FloodWaitError as e:
+            self.record_flood_wait(e.seconds)
+            logger.warning(
+                f"[RelayInstance:{self.phone}] 发送到 Up Bot 触发 FloodWait (code={code}): {e.seconds}s"
+            )
         except Exception as e:
+            if _is_ban_error(e):
+                self.record_ban(str(e))
             logger.error(f"[RelayInstance:{self.phone}] 发送到 Up Bot 失败 (code={code}): {e}")
         finally:
             await self._decrement_cache_counter(code)
@@ -857,6 +960,7 @@ class RelayInstance:
                 return False
             return False
         except FloodWaitError as e:
+            self.record_flood_wait(e.seconds)
             exchange = self._bot_exchange.get(bot_username)
             if exchange:
                 exchange["_min_click_interval"] = max(
@@ -1037,7 +1141,15 @@ class RelayInstance:
                     f"RELAY_RENEW:{user_id}:{code}",
                 )
             return False
+        except FloodWaitError as e:
+            self.record_flood_wait(e.seconds)
+            logger.warning(
+                f"[RelayInstance:{self.phone}] 缓存交付触发 FloodWait (code={code}): {e.seconds}s"
+            )
+            return False
         except Exception as e:
+            if _is_ban_error(e):
+                self.record_ban(str(e))
             logger.error(f"[RelayInstance:{self.phone}] 缓存交付失败 (code={code}): {e}")
             return False
 

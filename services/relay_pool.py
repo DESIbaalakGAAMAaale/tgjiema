@@ -21,6 +21,7 @@ class RelayPool:
         self._lock = asyncio.Lock()
         self._initialized = False
         self._cleanup_task: asyncio.Task | None = None
+        self._health_check_task: asyncio.Task | None = None
 
     async def init(self):
         """从本地 SQLite 加载账号并创建实例"""
@@ -59,6 +60,8 @@ class RelayPool:
             logger.warning("[RelayPool] 没有可用的中继账号")
         # 启动定期清理过期冷却记录
         self._cleanup_task = asyncio.create_task(self._cleanup_cooldowns_loop())
+        # A2: 启动健康检查循环(FloodWait 恢复 + 封禁探测)
+        self._health_check_task = asyncio.create_task(self._health_check_loop())
 
     async def _cleanup_cooldowns_loop(self):
         """每 10 分钟清理一次过期冷却记录。"""
@@ -69,6 +72,30 @@ class RelayPool:
                 await db.cleanup_cooldowns()
             except Exception as e:
                 logger.debug(f"[RelayPool] 清理冷却记录异常: {e}")
+
+    async def _health_check_loop(self):
+        """A2: 每 120 秒执行健康检查 + 恢复 FloodWait 到期的账号。
+
+        - 清除已到期的 FloodWait 限制
+        - 对不可用的账号(ban/FloodWait到期/断线)做主动探测
+        - ban 账号定期尝试恢复(Telegram 可能解除临时限制)
+        """
+        while True:
+            await asyncio.sleep(120)
+            try:
+                async with self._lock:
+                    instances_snapshot = list(self.instances)
+                for inst in instances_snapshot:
+                    # 1. 清除已到期的 FloodWait
+                    inst.clear_expired_floodwait()
+                    # 2. 对不可用账号做健康检查(跳过正在操作的账号)
+                    if not inst.is_ready and not inst.is_busy:
+                        try:
+                            await inst.check_health()
+                        except Exception as e:
+                            logger.debug(f"[RelayPool] 健康检查异常 ({inst.phone}): {e}")
+            except Exception as e:
+                logger.debug(f"[RelayPool] 健康检查循环异常: {e}")
 
     async def get_survival_stats(self) -> tuple[int, int]:
         """返回 (存活账号数, 总账号数) 用于账号存活率监控"""
@@ -259,11 +286,19 @@ class RelayPool:
                 await self._cleanup_task
             except asyncio.CancelledError:
                 pass
+        # A2: 取消健康检查循环任务
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                pass
         # 复位状态,允许后续重新 init
         async with self._lock:
             self.instances = []
             self._initialized = False
             self._cleanup_task = None
+            self._health_check_task = None
         logger.info("[RelayPool] 所有中继账号已关闭")
 
 

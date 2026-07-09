@@ -279,6 +279,12 @@ class MonBot:
                     alerts_to_check.append(("account_survival", "WARNING",
                         f"中继账号存活率偏低: {alive}/{total} ({survival_rate:.0f}%)"))
 
+            # A2: 绝对数量告警(即使存活率高,但绝对数量低于安全水位也告警)
+            safe_threshold = getattr(settings, "RELAY_SAFE_POOL_SIZE", 2)
+            if total > 0 and alive < safe_threshold:
+                alerts_to_check.append(("account_pool_low", "CRITICAL",
+                    f"中继账号池即将耗尽: 仅剩 {alive}/{total} 个可用账号 (安全水位: {safe_threshold})"))
+
             # Bot 离线
             if stale_bots:
                 alerts_to_check.append(("bot_stale", "CRITICAL",
