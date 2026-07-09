@@ -345,6 +345,40 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @_auth_required
+async def set_access_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """设置取件码访问次数上限（0=不限制）
+
+    同时更新 file_records.max_requests(CRDB)和本地缓存。
+    """
+    args = context.args
+    if len(args) != 2:
+        await update.message.reply_text("用法:/set_access_limit <文件码> <最大访问次数(0=不限制)>")
+        return
+    file_code = args[0]
+    try:
+        max_requests = int(args[1])
+        if max_requests < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ 最大访问次数必须是非负整数（0=不限制）")
+        return
+
+    # 同时更新 CRDB 和本地缓存（update_file_record_and_invalidate 双写）
+    from database import update_file_record_and_invalidate
+    try:
+        await update_file_record_and_invalidate(
+            file_code, {"$set": {"max_requests": max_requests}}
+        )
+    except Exception as e:
+        logger.error(f"[Admin] set_access_limit 失败 code={file_code}: {e}")
+        await update.message.reply_text(f"❌ 设置失败: {e}")
+        return
+
+    limit_text = f"{max_requests} 次" if max_requests > 0 else "不限制"
+    await update.message.reply_text(f"✅ 文件码 {file_code} 访问次数限制已设为 {limit_text}")
+
+
+@_auth_required
 async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     page = 1

@@ -318,9 +318,15 @@ class CacheStore:
                 blocked_users        TEXT DEFAULT '[]',
                 create_time          TEXT,
                 updated_at           TEXT,
+                max_requests         INTEGER DEFAULT 0,
                 crdb_synced          INTEGER DEFAULT 1
             )"""
         )
+        # 为已存在的 file_records_local 补字段（SQLite 不支持 ADD COLUMN IF NOT EXISTS，用 try-except 兼容）
+        try:
+            await self._db.execute("ALTER TABLE file_records_local ADD COLUMN max_requests INTEGER DEFAULT 0")
+        except Exception as e:
+            logger.debug(f"[CacheStore] file_records_local ADD max_requests (幂等,可忽略): {e}")
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS codes_local (
                 code                 TEXT PRIMARY KEY,
@@ -2047,14 +2053,15 @@ class CacheStore:
                 r.get("request_count", 0), int(r.get("protect_content", 0) or 0),
                 r.get("file_ttl_days", 0), r.get("note", ""),
                 r.get("expire_time"), _serialize(r.get("blocked_users", "[]")),
-                r.get("create_time"), r.get("updated_at"), 1,  # crdb_synced=1
+                r.get("create_time"), r.get("updated_at"),
+                int(r.get("max_requests", 0) or 0), 1,  # crdb_synced=1
             ))
         await self._db.executemany(
             """INSERT OR REPLACE INTO file_records_local
             (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
              file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
              file_ids, status, request_count, protect_content, file_ttl_days, note,
-             expire_time, blocked_users, create_time, updated_at, crdb_synced)
+             expire_time, blocked_users, create_time, updated_at, max_requests, crdb_synced)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             records,
         )
@@ -2068,7 +2075,7 @@ class CacheStore:
             """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
                       file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
                       file_ids, status, request_count, protect_content, file_ttl_days, note,
-                      expire_time, blocked_users, create_time, updated_at
+                      expire_time, blocked_users, create_time, updated_at, max_requests
                FROM file_records_local WHERE file_code = ?""",
             (file_code,),
         )
@@ -2082,7 +2089,7 @@ class CacheStore:
             "batch_file_meta": r[7], "file_ids": r[8], "status": r[9],
             "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
             "note": r[13], "expire_time": r[14], "blocked_users": r[15],
-            "create_time": r[16], "updated_at": r[17],
+            "create_time": r[16], "updated_at": r[17], "max_requests": r[18],
         })
 
     async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True):
@@ -2106,8 +2113,8 @@ class CacheStore:
             (file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
              file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
              file_ids, status, request_count, protect_content, file_ttl_days, note,
-             expire_time, blocked_users, create_time, updated_at, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             expire_time, blocked_users, create_time, updated_at, max_requests, crdb_synced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (record.get("file_code"), record.get("uploader_id"),
              record.get("primary_channel_id"), record.get("primary_channel_msg_id"),
              _serialize(record.get("file_types")), _serialize(record.get("backup_channel_msg_ids")),
@@ -2116,7 +2123,8 @@ class CacheStore:
              record.get("request_count", 0), int(record.get("protect_content", 0) or 0),
              record.get("file_ttl_days", 0), record.get("note", ""),
              record.get("expire_time"), _serialize(record.get("blocked_users", "[]")),
-             record.get("create_time"), record.get("updated_at"), synced),
+             record.get("create_time"), record.get("updated_at"),
+             int(record.get("max_requests", 0) or 0), synced),
         )
         await self._db.commit()
 
@@ -2128,7 +2136,7 @@ class CacheStore:
             """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
                       file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
                       file_ids, status, request_count, protect_content, file_ttl_days, note,
-                      expire_time, blocked_users, create_time, updated_at
+                      expire_time, blocked_users, create_time, updated_at, max_requests
                FROM file_records_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
@@ -2138,7 +2146,7 @@ class CacheStore:
             "batch_msg_ids": r[6], "batch_file_meta": r[7], "file_ids": r[8], "status": r[9],
             "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
             "note": r[13], "expire_time": r[14], "blocked_users": r[15],
-            "create_time": r[16], "updated_at": r[17],
+            "create_time": r[16], "updated_at": r[17], "max_requests": r[18],
         }) for r in rows]
 
     async def mark_file_record_synced(self, file_code: str):

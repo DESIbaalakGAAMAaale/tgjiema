@@ -1179,6 +1179,7 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
             InlineKeyboardButton("✏️ 修改备注", callback_data=f"mycode:edit_note|{code}"),
             InlineKeyboardButton("⏰ 设置有效期", callback_data=f"mycode:set_expiry|{code}"),
         ],
+        [InlineKeyboardButton("📋 设置访问次数", callback_data=f"mycode:set_access_limit|{code}")],
     ]
     if status == "offline":
         kb.append([InlineKeyboardButton("✅ 恢复上架", callback_data=f"mycode:toggle_status|{code}|active")])
@@ -1376,6 +1377,52 @@ async def my_code_expiry_custom_callback(update: Update, context: ContextTypes.D
         "2. ISO 时间，如 2026-12-31T23:59:59\n"
         "3. 0 或 permanent 表示永久有效\n\n"
         "（发送 /cancel 取消）"
+    )
+
+
+async def my_code_set_access_limit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """设置访问次数限制"""
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    user = update.effective_user
+    if not user:
+        return
+
+    data = query.data
+    if not data.startswith("mycode:set_access_limit|"):
+        return
+
+    code = data.split("|", 1)[1]
+
+    # 权限校验：只能操作自己的文件码
+    codes_col = get_codes_col()
+    code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
+    if not code_entry:
+        await query.edit_message_text("操作失败")
+        return
+
+    # 读取当前 max_requests（从 file_records 缓存）
+    current_limit = 0
+    file_record = await get_file_record_cached(code)
+    if file_record:
+        try:
+            current_limit = int(file_record.get("max_requests", 0) or 0)
+        except (ValueError, TypeError):
+            current_limit = 0
+
+    current_text = f"{current_limit} 次" if current_limit > 0 else "不限制"
+
+    context.user_data["_manage_code"] = code
+    context.user_data["_manage_action"] = "set_access_limit"
+
+    await query.edit_message_text(
+        f"📋 设置访问次数限制\n\n"
+        f"当前限制: {current_text}\n\n"
+        f"请输入最大访问次数（0=不限制）：\n"
+        f"（发送 /cancel 取消）"
     )
 
 
@@ -1630,6 +1677,29 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         invalidate_user_codes(user.id)
 
         await update.message.reply_text("✅ 有效期已更新")
+
+    elif action == "set_access_limit":
+        # 设置访问次数限制（max_requests，0=不限制）
+        try:
+            max_req = int(text)
+            if max_req < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ 请输入非负整数（0=不限制）")
+            return
+
+        # 写入 code_change_buffer（类型 access_limit → 同步到 file_records.max_requests）
+        await get_code_change_buffer().insert(code, "access_limit", str(max_req), user.id)
+
+        # 同步更新本地 SQLite file_records 缓存，避免缓存未过期时读到旧值
+        try:
+            from database import update_file_record_and_invalidate
+            await update_file_record_and_invalidate(code, {"$set": {"max_requests": max_req}})
+        except Exception as e:
+            logger.warning(f"[Idx] 同步 max_requests 到本地缓存失败 code={code}: {e}")
+
+        limit_text = f"{max_req} 次" if max_req > 0 else "不限制"
+        await update.message.reply_text(f"✅ 访问次数限制已设置为: {limit_text}")
 
     context.user_data.pop("_manage_code", None)
     context.user_data.pop("_manage_action", None)
@@ -1987,6 +2057,7 @@ async def _async_main():
     app.add_handler(CallbackQueryHandler(my_code_set_expiry_callback, pattern=r"^mycode:set_expiry\|"))
     app.add_handler(CallbackQueryHandler(my_code_expiry_pick_callback, pattern=r"^mycode:expiry_pick\|"))
     app.add_handler(CallbackQueryHandler(my_code_expiry_custom_callback, pattern=r"^mycode:expiry_custom\|"))
+    app.add_handler(CallbackQueryHandler(my_code_set_access_limit_callback, pattern=r"^mycode:set_access_limit\|"))
     app.add_handler(CallbackQueryHandler(my_code_toggle_status_callback, pattern=r"^mycode:toggle_status\|"))
     app.add_handler(CallbackQueryHandler(my_code_confirm_status_callback, pattern=r"^mycode:confirm_"))
     app.add_handler(CallbackQueryHandler(my_code_stats_callback, pattern=r"^mycode:stats\|"))
@@ -2116,7 +2187,7 @@ async def _async_main():
     # 文件码变更批量 flush CRDB 后台任务
     async def _code_changes_sync_loop():
         """每 5 分钟将 SQLite code_changes 批量 flush 到 CRDB
-        
+
         使用 CASE WHEN 批量 UPDATE，替代 N+1 循环，大幅减少 RU 消耗。
         """
         while True:
@@ -2129,35 +2200,74 @@ async def _async_main():
                     continue
 
                 codes_col = get_codes_col()
+                file_records_col = get_file_records_col()
                 synced_ids = []
-                
+
                 # 按 change_type 分组，每组执行一条批量 SQL
-                for ctype, field in (("note", "note"), ("expiry", "expire_time"), ("status", "status")):
+                # note/expiry/status → 更新 codes 表；access_limit → 更新 file_records.max_requests
+                for ctype, field in (("note", "note"), ("expiry", "expire_time"), ("status", "status"), ("access_limit", "max_requests")):
                     group = [c for c in changes if c["change_type"] == ctype]
                     if not group:
                         continue
-                    
+
                     params = []
                     cases = []
                     for c in group:
                         params.append(c["code"])
                         if ctype == "expiry":
                             val = None if c["new_value"] == "NULL" else c["new_value"]
+                        elif ctype == "access_limit":
+                            # max_requests 为整数，0 表示不限制
+                            try:
+                                val = int(c["new_value"])
+                            except (ValueError, TypeError):
+                                val = 0
                         else:
                             val = c["new_value"]
                         params.append(val)
                         cases.append(f"WHEN ${len(params) - 1} THEN ${len(params)}")
-                    
+
                     placeholders = ", ".join([f"${i * 2 + 1}" for i in range(len(group))])
-                    sql = (
-                        f"UPDATE codes SET {field} = CASE code {' '.join(cases)} END "
-                        f"WHERE code IN ({placeholders})"
-                    )
+                    if ctype == "access_limit":
+                        # access_limit 写入 file_records.max_requests（解码拦截查的是 file_records）
+                        sql = (
+                            f"UPDATE file_records SET {field} = CASE file_code {' '.join(cases)} END "
+                            f"WHERE file_code IN ({placeholders})"
+                        )
+                        target_col = file_records_col
+                    else:
+                        sql = (
+                            f"UPDATE codes SET {field} = CASE code {' '.join(cases)} END "
+                            f"WHERE code IN ({placeholders})"
+                        )
+                        target_col = codes_col
                     try:
-                        await codes_col.execute_raw(sql, params)
+                        await target_col.execute_raw(sql, params)
                         synced_ids.extend(c["id"] for c in group)
                     except Exception as e:
                         logger.error(f"[CodeChanges] batch flush failed (type={ctype}): {e}")
+
+                # 修复 expire_time 不同步 bug：expiry 变更需同步到 file_records.expire_time
+                # 解码拦截查的是 file_records.expire_time（services/permission.py check_code_expired），
+                # 仅更新 codes.expire_time 会导致 file_records.expire_time 不一致，用户设置的有效期不生效。
+                expiry_changes = [c for c in changes if c["change_type"] == "expiry"]
+                if expiry_changes:
+                    fr_params = []
+                    fr_cases = []
+                    for c in expiry_changes:
+                        fr_params.append(c["code"])
+                        val = None if c["new_value"] == "NULL" else c["new_value"]
+                        fr_params.append(val)
+                        fr_cases.append(f"WHEN ${len(fr_params) - 1} THEN ${len(fr_params)}")
+                    fr_placeholders = ", ".join([f"${i * 2 + 1}" for i in range(len(expiry_changes))])
+                    fr_sql = (
+                        f"UPDATE file_records SET expire_time = CASE file_code {' '.join(fr_cases)} END "
+                        f"WHERE file_code IN ({fr_placeholders})"
+                    )
+                    try:
+                        await file_records_col.execute_raw(fr_sql, fr_params)
+                    except Exception as e:
+                        logger.error(f"[CodeChanges] file_records expire_time sync failed: {e}")
 
                 if synced_ids:
                     await buf.mark_synced(synced_ids)

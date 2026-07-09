@@ -55,6 +55,7 @@ def make_file_record(
     note: str = "",
     protect_content: bool = False,
     file_ttl_days: int = 0,
+    max_requests: int = 0,
 ):
     from datetime import datetime, timezone
 
@@ -79,6 +80,7 @@ def make_file_record(
         "expire_time": expire_time,
         "protect_content": protect_content,
         "file_ttl_days": file_ttl_days,
+        "max_requests": max_requests,
         "updated_at": now,
     }
 

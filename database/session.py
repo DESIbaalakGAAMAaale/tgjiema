@@ -24,7 +24,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 3  # 递增此值以触发 DDL 升级
+DDL_VERSION = 4  # 递增此值以触发 DDL 升级
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -235,6 +235,8 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS blocked_users JSONB DEFAULT '[]'",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN updated_at TEXT",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN file_ttl_days INTEGER DEFAULT 0",
+    # 取件码访问次数限制(0=不限制)，参考 file_ttl_days 迁移写法(CRDB 不支持 ADD COLUMN IF NOT EXISTS,用 try/except 兼容)
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN max_requests INTEGER DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_file_records_updated_at ON file_records(updated_at)",
     "ALTER TABLE IF EXISTS codes ADD COLUMN updated_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_codes_updated_at ON codes(updated_at)",
@@ -416,6 +418,7 @@ class CockroachDBClient:
                     "file_types", "backup_channel_msg_ids", "batch_msg_ids", "batch_file_meta",
                     "file_ids", "status", "request_count", "protect_content", "file_ttl_days",
                     "note", "expire_time", "blocked_users", "create_time", "updated_at",
+                    "max_requests",
                 ])
                 if all_fr:
                     await store.bootstrap_file_records(all_fr)
@@ -537,6 +540,7 @@ def _row_to_dict(record) -> dict:
             "daily_decode_quota", "quota_used_today", "uploader_id",
             "external_decode_quota", "external_used_today", "target_user_id",
             "channel_id", "message_id", "cnt", "status_msg_id",
+            "max_requests",
         ):
             result[col] = int(val) if val is not None else 0
         elif col in ("can_upload", "is_banned"):

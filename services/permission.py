@@ -295,6 +295,25 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
             expired, reason = check_code_expired(file_record)
             if expired:
                 return DecodeResult(allowed=False, reason=reason)
+            # 访问次数限制检查（max_requests=0 表示不限制）
+            # 注意：request_count 在下方 incr_request_count 之前检查，所以检查时用的是当前值，
+            # incr 后值+1。逻辑：max_requests=3 时，第 1 次 count=0(允许)→1，第 2 次 count=1(允许)→2，
+            # 第 3 次 count=2(允许)→3，第 4 次 count=3>=3(拒绝)。正好允许 3 次访问。
+            max_requests = file_record.get("max_requests", 0)
+            if isinstance(max_requests, str):
+                try:
+                    max_requests = int(max_requests)
+                except ValueError:
+                    max_requests = 0
+            if max_requests > 0:
+                current_count = file_record.get("request_count", 0)
+                if isinstance(current_count, str):
+                    try:
+                        current_count = int(current_count)
+                    except ValueError:
+                        current_count = 0
+                if current_count >= max_requests:
+                    return DecodeResult(allowed=False, reason=f"该文件码已达访问次数上限({max_requests}次)")
             from database.cache import incr_request_count
             await incr_request_count(file_code)
         else:

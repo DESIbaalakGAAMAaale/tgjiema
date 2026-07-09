@@ -15,7 +15,7 @@ from .handlers import (
     list_code_routes, set_bot_interval, remove_bot_interval, list_bot_intervals,
     spare_add, spare_remove, spare_list, rotation_set, rotation_view, topology,
     relay_whitelist, collector_whitelist, cell_add, cell_remove,
-    cancel_conversation, help_command, restore,
+    cancel_conversation, help_command, restore, set_access_limit,
 )
 from .callback import menu_callback
 from .conversation import handle_conversation
@@ -57,6 +57,7 @@ async def _async_main():
     app.add_handler(CommandHandler("file", file_detail))
     app.add_handler(CommandHandler("files", files_list))
     app.add_handler(CommandHandler("delete_file", delete_file))
+    app.add_handler(CommandHandler("set_access_limit", set_access_limit))
     app.add_handler(CommandHandler("logs", logs))
     app.add_handler(CommandHandler("relay_code", relay_code))
     app.add_handler(CommandHandler("relay_set_api", relay_set_api))
