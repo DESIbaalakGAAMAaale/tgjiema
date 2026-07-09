@@ -639,7 +639,21 @@ class MonBot:
                 self._update_cell_in_cache(cell["slot_id"], update_fields)
 
         for promote_slot, from_cell in promoted_slots:
-            nxt = from_cell.get("next_active_chat_id")
+            # 环指针继承:优先从同组 a 槽位(持有正确的环 next 指针)继承,
+            # 而非从 from_cell(被降级的 active,其 next 通常为 NULL)继承。
+            # a 槽位的 next 指向环中下一个 active 频道,这是正确的环顺序。
+            sid = from_cell["slot_id"]
+            m = re.match(r'[as](\d+)', sid)
+            inherited_next = from_cell.get("next_active_chat_id")
+            if m:
+                gnum = m.group(1)
+                group = groups.get(gnum)
+                if group and group[0]:  # group[0] 是 a 槽位
+                    a_next = group[0].get("next_active_chat_id")
+                    if a_next:
+                        inherited_next = a_next
+            # 如果继承的 next 指向被降级的频道,替换为提升后的频道
+            nxt = inherited_next
             if nxt and nxt in demoted_ch_to_promoted_ch:
                 nxt = demoted_ch_to_promoted_ch[nxt]
             # PRE-01: 提升为 active 时清除 demoted_to_channel_id（它现在就是接替频道本身）
