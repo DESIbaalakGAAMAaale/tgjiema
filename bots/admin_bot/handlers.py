@@ -1298,8 +1298,10 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     用法:
       /restore                  — 列出可用备份(最新在前,显示序号)
-      /restore <序号>           — 显示确认按钮,点击后全量恢复
+      /restore <序号>           — 显示确认按钮,点击后全量覆盖恢复
       /restore <序号> table:xxx,yyy — 只恢复指定表(逗号分隔)
+      /restore <序号> merge:yes — 增量补充(冲突保留现有,不删现有数据)
+    table: 和 merge: 可组合使用,顺序不限。
     """
     args = context.args
 
@@ -1308,20 +1310,26 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _restore_list_backups(update, context)
         return
 
-    # 解析序号和可选的 table: 过滤
+    # 解析序号
     try:
         seq = int(args[0])
     except ValueError:
         await update.message.reply_text("❌ 序号必须是数字。使用 /restore 查看备份列表。")
         return
 
+    # 解析可选参数 table: 和 merge:
     tables = None
-    if len(args) >= 2 and args[1].startswith("table:"):
-        tables_str = args[1][len("table:"):]
-        tables = [t.strip() for t in tables_str.split(",") if t.strip()]
-        if not tables:
-            await update.message.reply_text("❌ table: 后必须指定表名(逗号分隔)")
-            return
+    merge = False
+    for arg in args[1:]:
+        if arg.startswith("table:"):
+            tables_str = arg[len("table:"):]
+            tables = [t.strip() for t in tables_str.split(",") if t.strip()]
+            if not tables:
+                await update.message.reply_text("❌ table: 后必须指定表名(逗号分隔)")
+                return
+        elif arg.startswith("merge:"):
+            merge_val = arg[len("merge:"):].lower()
+            merge = merge_val in ("yes", "1", "true", "on")
 
     # 查备份列表,取出对应序号的 key
     from services.db_backup import list_backups
@@ -1346,13 +1354,13 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 构造确认按钮
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    cb_data = f"restore:confirm|{seq}"
+    cb_data = f"restore:confirm|{seq}|{'1' if merge else '0'}"
     if tables:
         cb_data += f"|table:{','.join(tables)}"
 
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ 确认恢复(清空目标表后写入)", callback_data=cb_data),
+            InlineKeyboardButton("✅ 确认恢复", callback_data=cb_data),
         ],
         [
             InlineKeyboardButton("❌ 取消", callback_data="restore:cancel"),
@@ -1360,14 +1368,19 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     scope_text = f"仅恢复表: {', '.join(tables)}" if tables else "全量恢复(所有表)"
+    if merge:
+        mode_text = "增量补充(冲突保留现有数据,不删除任何记录)"
+    else:
+        mode_text = "覆盖恢复(先清空目标表,再写入备份数据)"
     await update.message.reply_text(
         "⚠️ 数据库恢复确认\n\n"
         f"📁 备份文件: `{key}`\n"
         f"📏 大小: {size} 字节\n"
         f"🕒 备份时间: {last_mod}\n"
-        f"📋 恢复范围: {scope_text}\n\n"
-        "🔴 警告: 恢复会先 TRUNCATE 清空目标表,再写入备份数据!\n"
-        "🔴 建议先停止相关 Bot 服务再恢复。\n\n"
+        f"📋 恢复范围: {scope_text}\n"
+        f"🔧 恢复模式: {mode_text}\n\n"
+        + ("" if merge else "🔴 警告: 覆盖模式会先 TRUNCATE 清空目标表!\n")
+        + "🔴 建议先停止相关 Bot 服务再恢复。\n\n"
         "点击下方按钮确认或取消:",
         reply_markup=kb,
     )
@@ -1404,8 +1417,10 @@ async def _restore_list_backups(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append(f"\n(仅显示最近 20 份,共 {len(backups)} 份)")
 
     lines.append("\n用法:")
-    lines.append("  /restore <序号>           — 全量恢复")
-    lines.append("  /restore <序号> table:xxx — 仅恢复指定表")
+    lines.append("  /restore <序号>                   — 全量覆盖恢复")
+    lines.append("  /restore <序号> table:xxx,yyy     — 仅恢复指定表")
+    lines.append("  /restore <序号> merge:yes         — 增量补充(冲突保留现有,不删现有数据)")
+    lines.append("  table: 与 merge:yes 可组合使用,顺序不限")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -1448,7 +1463,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /set_quota_default <free|basic|premium> <配额> — 默认日配额（热更新）\n"
         "  /set_r2 <账号ID> <AccessKey> <SecretKey> — R2备份配置（需重启）\n"
         "  /set_db_backup <间隔分钟> <on|off> — 数据库自动备份（热更新）\n"
-        "  /restore — 查看备份列表并恢复数据库（按钮确认,支持指定表）\n"
+        "  /restore [序号] [table:xxx,yyy] [merge:yes] — 查看备份列表/恢复数据库\n"
+        "     · merge:yes = 增量补充(冲突保留现有,不删现有数据)\n"
         "  /factory_reset — 恢复出厂设置\n\n"
         "文件码路由（第三方机器人迁移用）\n"
         "  /add_code_route <前缀> <机器人用户名> — 添加路由规则\n"

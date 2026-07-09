@@ -217,12 +217,13 @@ async def list_backups() -> list[dict]:
     return objects
 
 
-async def restore_from_backup(key: str, tables: list[str] | None = None) -> dict:
+async def restore_from_backup(key: str, tables: list[str] | None = None, merge: bool = False) -> dict:
     """从 R2 备份恢复数据库。
 
     Args:
         key: R2 对象 key（如 db_backup/db_backup_20240101_120000.json）
         tables: 仅恢复指定表；None 则恢复备份中的所有表
+        merge: True=增量补充(冲突保留现有数据); False=覆盖(清空后写入,默认)
 
     Returns:
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
@@ -250,6 +251,21 @@ async def restore_from_backup(key: str, tables: list[str] | None = None) -> dict
         from database.session import init_db
         await init_db()
 
+    # 各表的冲突目标列（用于 merge 模式的 ON CONFLICT DO NOTHING）
+    # 键=表名, 值=冲突列名(主键或唯一键)
+    _CONFLICT_COLS = {
+        "users": "user_id",
+        "file_records": "file_code",
+        "cells": "slot_id",
+        "codes": "code",
+        "spare_pool": "channel_id",
+        "config": "config_key",
+        "kv_config": "config_key",
+        "external_code_mapping": "external_code",
+        "relay_accounts": "phone",  # 主键 id 是 SERIAL,用 phone UNIQUE 做冲突
+    }
+    # message_backups 是复合主键 (main_msg_id, backup_channel_id),需特殊处理
+
     for table_name, rows in restore_tables.items():
         # P0-2: 表名格式白名单校验(防 SQL 注入),非法表名跳过并记录告警
         try:
@@ -262,11 +278,26 @@ async def restore_from_backup(key: str, tables: list[str] | None = None) -> dict
             result["restored"][table_name] = 0
             continue
         try:
-            # 使用事务保证原子性:TRUNCATE + INSERT 全部成功才 COMMIT,任一失败 ROLLBACK
+            # 使用事务保证原子性
             await db_client.execute("BEGIN")
             try:
-                # 清空目标表（恢复前清空，避免主键冲突）
-                await db_client.execute(f'TRUNCATE TABLE "{safe_name}" RESTART IDENTITY CASCADE')
+                if not merge:
+                    # 覆盖模式:清空目标表（恢复前清空，避免主键冲突）
+                    await db_client.execute(f'TRUNCATE TABLE "{safe_name}" RESTART IDENTITY CASCADE')
+
+                # 确定 ON CONFLICT 子句(仅 merge 模式)
+                conflict_clause = ""
+                if merge:
+                    if table_name == "message_backups":
+                        conflict_clause = ' ON CONFLICT (main_msg_id, backup_channel_id) DO NOTHING'
+                    elif table_name in _CONFLICT_COLS:
+                        conflict_col = _CONFLICT_COLS[table_name]
+                        conflict_clause = f' ON CONFLICT ("{conflict_col}") DO NOTHING'
+                    else:
+                        # 未知主键结构的表,merge 模式下退化为普通 INSERT
+                        # 遇到冲突会报错并由事务 ROLLBACK
+                        logger.warning(f"[db_restore] 表 {safe_name} 未知冲突列,merge 模式可能因主键冲突失败")
+
                 # 批量插入
                 inserted = 0
                 for row in rows:
@@ -279,12 +310,13 @@ async def restore_from_backup(key: str, tables: list[str] | None = None) -> dict
                     placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
                     col_list = ", ".join(f'"{c}"' for c in cols)
                     params = [row[c] for c in cols]
-                    sql = f'INSERT INTO "{safe_name}" ({col_list}) VALUES ({placeholders})'
+                    sql = f'INSERT INTO "{safe_name}" ({col_list}) VALUES ({placeholders}){conflict_clause}'
                     await db_client.execute(sql, params)
                     inserted += 1
                 await db_client.execute("COMMIT")
                 result["restored"][table_name] = inserted
-                logger.info(f"[db_restore] 恢复表 {table_name}: {inserted} 行")
+                mode_text = "增量补充" if merge else "覆盖恢复"
+                logger.info(f"[db_restore] {mode_text} 表 {table_name}: {inserted} 行")
             except Exception as inner_e:
                 # ROLLBACK 失败不应吞噬原始异常,使用嵌套 try/except 保护
                 try:
@@ -298,6 +330,6 @@ async def restore_from_backup(key: str, tables: list[str] | None = None) -> dict
 
     logger.info(
         f"[db_restore] 恢复完成: {sum(result['restored'].values())} 行, "
-        f"{len(result['errors'])} 个错误"
+        f"{len(result['errors'])} 个错误, 模式={'merge' if merge else 'overwrite'}"
     )
     return result

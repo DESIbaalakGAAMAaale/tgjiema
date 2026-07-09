@@ -392,7 +392,7 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ 恢复操作已取消。", reply_markup=back_kb)
         return
 
-    # restore:confirm|<seq>|table:xxx,yyy  (table 部分可选)
+    # restore:confirm|<seq>|<0或1>|table:xxx,yyy  (merge标志和table部分均可选)
     if not data.startswith("restore:confirm|"):
         await query.edit_message_text("❌ 未知恢复操作", reply_markup=back_kb)
         return
@@ -408,12 +408,18 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ 序号无效", reply_markup=back_kb)
         return
 
+    # 解析 merge 标志(parts[2],0 或 1)和 table 列表(parts[3],可选)
+    merge = False
     tables = None
-    if len(parts) >= 3 and parts[2].startswith("table:"):
-        tables = [t.strip() for t in parts[2][len("table:"):].split(",") if t.strip()]
+    if len(parts) >= 3:
+        # parts[2] 是 merge 标志(0/1)
+        merge = parts[2] == "1"
+    if len(parts) >= 4 and parts[3].startswith("table:"):
+        tables = [t.strip() for t in parts[3][len("table:"):].split(",") if t.strip()]
 
     # 先给用户一个"正在恢复"的反馈
-    await query.edit_message_text("⏳ 正在从 R2 下载备份并恢复数据库,请稍候...")
+    mode_label = "增量补充" if merge else "覆盖恢复"
+    await query.edit_message_text(f"⏳ 正在从 R2 下载备份并{mode_label}数据库,请稍候...")
 
     from services.db_backup import list_backups, restore_from_backup
     try:
@@ -427,10 +433,10 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     key = backups[seq - 1].get("key", "")
-    logger.info(f"[Admin][restore] 开始恢复: key={key}, tables={tables}, 操作者={user.id}")
+    logger.info(f"[Admin][restore] 开始恢复: key={key}, tables={tables}, merge={merge}, 操作者={user.id}")
 
     try:
-        result = await restore_from_backup(key, tables)
+        result = await restore_from_backup(key, tables, merge=merge)
     except Exception as e:
         logger.error(f"[Admin][restore] 恢复失败: {e}")
         await query.edit_message_text(
