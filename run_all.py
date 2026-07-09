@@ -22,6 +22,12 @@ from typing import Optional
 
 import asyncio
 
+# 防止双模块导入:run_all.py 作为主脚本运行时加载为 __main__,
+# 但子模块用 `from run_all import xxx` 会再次导入 run_all 创建副本,
+# 导致全局变量(_stop_event 等)分裂为两份,信号 handler 读到的是 None。
+# 此行让 run_all 指向 __main__,确保所有模块共享同一份全局变量。
+sys.modules.setdefault('run_all', sys.modules[__name__])
+
 from loguru import logger
 from config import settings
 from utils.logging_config import setup_logging, LOG_FORMAT
