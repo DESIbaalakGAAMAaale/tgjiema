@@ -20,46 +20,50 @@ import utils.shared_counters as _shared_counters
 
 # ── cells 缓存：admin 面板频繁刷新，加 60s 缓存避免每次点按钮都查 CRDB ──
 # N-M12: 缓存键包含 status_filter + sort_key，避免不同视图共享错误缓存
-_cells_cache: dict[tuple, tuple[float, list[dict]]] = {}
+# C2: _cells_cache 已迁移到 cache_store (ttl_cache 表),跨进程共享
 _CELLS_CACHE_TTL = 60  # 秒
 
 
-def invalidate_cells_cache():
+async def invalidate_cells_cache():
     """失效 cells 缓存(P1-14 factory_reset 调用)。
 
-    直接清空模块级缓存字典,避免 factory_reset 后管理面板仍显示旧拓扑/频道状态。
+    C2: 清空 cache_store 中的 cells 缓存,跨进程生效。
     """
-    global _cells_cache
-    _cells_cache = {}
+    from database.cache_store import get_cache_store
+    await get_cache_store().cache_delete_prefix("cells_cache:")
 
 
-def _make_cells_cache_key(status_filter: dict | None, sort_key: str) -> tuple:
-    """生成 cells 缓存键，包含 status_filter 和 sort_key。"""
+def _make_cache_key_str(status_filter: dict | None, sort_key: str) -> str:
+    """生成 cache_store 用的字符串缓存键。"""
     if status_filter:
-        return (frozenset(status_filter.items()), sort_key)
-    return (None, sort_key)
+        filter_str = ",".join(f"{k}={v}" for k, v in sorted(status_filter.items()))
+        return f"cells_cache:{filter_str}:{sort_key}"
+    return f"cells_cache:all:{sort_key}"
 
 
 async def _get_cells_cached(status_filter: dict | None = None, sort_key: str = "slot_id") -> list[dict]:
-    """带 60s 缓存的 cells 查询，admin 面板用。0 RU（复用 SQLite）或 1 RU（CRDB 兜底）。"""
-    global _cells_cache
-    now = time.time()
-    cache_key = _make_cells_cache_key(status_filter, sort_key)
-    cached = _cells_cache.get(cache_key)
-    if cached and (now - cached[0]) < _CELLS_CACHE_TTL:
-        return cached[1]
+    """带 60s 缓存的 cells 查询，admin 面板用。0 RU（复用 SQLite）或 1 RU（CRDB 兜底）。
+
+    C2: 缓存迁移到 cache_store (ttl_cache 表),跨进程共享。
+    """
+    from database.cache_store import get_cache_store
+    cache_key = _make_cache_key_str(status_filter, sort_key)
+    # 1. 检查 cache_store TTL 缓存
+    cached = await get_cache_store().cache_get(cache_key, _CELLS_CACHE_TTL)
+    if cached is not None:
+        return cached
+    # 2. 优先走 SQLite 快照（0 RU）
     from database import get_cells_col
     from database.session import get_active_cells_local
-    # 优先走 SQLite 快照（0 RU）
     try:
         cells = await get_active_cells_local()
         if cells:
-            _cells_cache[cache_key] = (now, cells)
+            await get_cache_store().cache_set(cache_key, cells)
             return cells
     except Exception as e:
         logger.warning(f"[Admin] cells缓存查询失败: {e}")
         pass
-    # CRDB 兜底（1 RU）
+    # 3. CRDB 兜底（1 RU）
     col = get_cells_col()
     cells = await col.find(
         status_filter or {},
@@ -69,7 +73,7 @@ async def _get_cells_cached(status_filter: dict | None = None, sort_key: str = "
                      "file_count", "rotation_started_at", "last_heartbeat",
                      "degrade_count", "created_at", "updated_at"],
     )
-    _cells_cache[cache_key] = (now, cells)
+    await get_cache_store().cache_set(cache_key, cells)
     return cells
 
 

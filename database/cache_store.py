@@ -247,6 +247,14 @@ class CacheStore:
                 value TEXT NOT NULL
             )"""
         )
+        # ─── C2: 通用 TTL 缓存(跨进程共享,JSON 序列化) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS ttl_cache (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
         # ─── 用户 Bot 启动状态跟踪（跨进程共享）───
         # 用户向 idx/dsp 发送 /start 后写入，up/idx/dsp 发送消息前检查
         await self._db.execute(
@@ -1801,6 +1809,57 @@ class CacheStore:
             (key, value),
         )
         await self._db.commit()
+
+    async def cache_get(self, key: str, ttl: float):
+        """C2: 读取 TTL 缓存。如果缓存不存在或已过期,返回 None。
+
+        value 会被 JSON 反序列化后返回。
+        """
+        if not self._db:
+            return None
+        try:
+            import time as _time
+            import json
+            rows = await self._db.execute_fetchall(
+                "SELECT value, updated_at FROM ttl_cache WHERE key = ?", (key,)
+            )
+            if not rows:
+                return None
+            value_str, updated_at = rows[0]
+            if _time.time() - updated_at > ttl:
+                return None
+            return json.loads(value_str)
+        except Exception:
+            return None
+
+    async def cache_set(self, key: str, value):
+        """C2: 写入 TTL 缓存。value 会被 JSON 序列化。"""
+        if not self._db:
+            return
+        try:
+            import time as _time
+            import json
+            value_str = json.dumps(value, default=str)
+            now = _time.time()
+            await self._db.execute(
+                "INSERT OR REPLACE INTO ttl_cache (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value_str, now),
+            )
+            await self._db.commit()
+        except Exception as e:
+            logger.debug(f"[cache_store] cache_set 失败: {e}")
+
+    async def cache_delete_prefix(self, prefix: str):
+        """C2: 删除所有以指定前缀开头的缓存条目(用于批量失效)。"""
+        if not self._db:
+            return
+        try:
+            await self._db.execute(
+                "DELETE FROM ttl_cache WHERE key LIKE ?", (prefix + "%",)
+            )
+            await self._db.commit()
+        except Exception as e:
+            logger.debug(f"[cache_store] cache_delete_prefix 失败: {e}")
 
     # ─── 热路径全表缓存 CRUD：file_records / codes / users / external_code_mapping ───
 

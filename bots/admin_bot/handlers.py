@@ -832,7 +832,7 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_negative_caches()
 
         # 2) 管理面板 cells 缓存
-        _display.invalidate_cells_cache()
+        await _display.invalidate_cells_cache()
 
         # 3) 投递解析器拓扑缓存 + 按 channel 的 cell 进程内缓存
         invalidate_cell_cache()

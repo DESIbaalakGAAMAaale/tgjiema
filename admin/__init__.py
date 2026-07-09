@@ -127,7 +127,7 @@ _CSRF_TOKEN_TTL: float = 3600.0  # 与 cookie max_age 对齐（1小时）
 
 # M7: TTL 缓存 — 无筛选条件的 count_documents 走 CRDB 很贵，60s 缓存
 # 仅缓存 {}, 有搜索条件时仍需 CRDB（regex 等无法缓存）
-_count_cache: dict[str, tuple[float, int]] = {}
+# C2: _count_cache 已迁移到 cache_store (ttl_cache 表),跨进程共享
 _COUNT_CACHE_TTL = settings.ADMIN_COUNT_CACHE_TTL
 _SEARCH_MAX_LENGTH = settings.ADMIN_SEARCH_MAX_LENGTH
 _background_tasks: set = set()
@@ -453,13 +453,13 @@ async def users_page(
     # M7: 无筛选条件时走 60s TTL 缓存，避免每次翻页都 count_documents CRDB
     # 注意: count 和 find 之间数据可能变化，翻页时可能看到少量重复/遗漏记录
     if not search:
-        now = _time.time()
-        cached = _count_cache.get("users")
-        if cached and (now - cached[0]) < _COUNT_CACHE_TTL:
-            total = cached[1]
+        from database.cache_store import get_cache_store
+        cached = await get_cache_store().cache_get("count_cache:users", _COUNT_CACHE_TTL)
+        if cached is not None:
+            total = cached
         else:
             total = await users_col.count_documents({})
-            _count_cache["users"] = (now, total)
+            await get_cache_store().cache_set("count_cache:users", total)
     else:
         total = await users_col.count_documents(query)
     skip = (page - 1) * per_page
@@ -573,13 +573,13 @@ async def files_page(
 
     # M7: 无筛选条件时走 60s TTL 缓存
     if not search:
-        now = _time.time()
-        cached = _count_cache.get("files")
-        if cached and (now - cached[0]) < _COUNT_CACHE_TTL:
-            total = cached[1]
+        from database.cache_store import get_cache_store
+        cached = await get_cache_store().cache_get("count_cache:files", _COUNT_CACHE_TTL)
+        if cached is not None:
+            total = cached
         else:
             total = await files_col.count_documents({})
-            _count_cache["files"] = (now, total)
+            await get_cache_store().cache_set("count_cache:files", total)
     else:
         total = await files_col.count_documents(query)
     skip = (page - 1) * per_page
@@ -633,13 +633,13 @@ async def logs_page(
     logs_col = get_decode_logs_col()
 
     # M7: logs 无筛选条件，走 60s TTL 缓存
-    now = _time.time()
-    cached = _count_cache.get("logs")
-    if cached and (now - cached[0]) < _COUNT_CACHE_TTL:
-        total = cached[1]
+    from database.cache_store import get_cache_store
+    cached = await get_cache_store().cache_get("count_cache:logs", _COUNT_CACHE_TTL)
+    if cached is not None:
+        total = cached
     else:
         total = await logs_col.count_documents({})
-        _count_cache["logs"] = (now, total)
+        await get_cache_store().cache_set("count_cache:logs", total)
     skip = (page - 1) * per_page
     logs = await logs_col.find(sort=("request_time", -1), skip=skip, limit=per_page)
 
