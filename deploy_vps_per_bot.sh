@@ -65,6 +65,14 @@ apt-get install -y --no-install-recommends \
     ${PYTHON} ${PYTHON}-venv ${PYTHON}-dev \
     libpq-dev gcc g++ make curl git sqlite3 procps net-tools
 
+# C1: Redis Stream 事件驱动(dsp_bot 替代轮询)
+if ! command -v redis-cli &> /dev/null; then
+    echo "安装 Redis..."
+    apt-get install -y redis-server
+    systemctl enable redis-server
+    systemctl start redis-server
+fi
+
 success "系统依赖安装完成"
 
 # ──────────────────────────────────────────────
@@ -139,6 +147,12 @@ if grep -q "^RELAY_ENCRYPTION_KEY=$" "$ENV_FILE" 2>/dev/null; then
     fi
 fi
 
+# C1: Redis Stream 事件驱动 — 若 .env 未配置 REDIS_URL 则写入本地默认值
+if ! grep -q "^REDIS_URL=" "$ENV_FILE" 2>/dev/null; then
+    echo "REDIS_URL=redis://127.0.0.1:6379/0" >> "$ENV_FILE"
+    success "已写入 REDIS_URL=redis://127.0.0.1:6379/0 (dsp_bot 事件驱动)"
+fi
+
 if [[ ! -f "$DEPLOY_DIR/config/topology.yaml" ]] && [[ -f "$DEPLOY_DIR/config/groups.yaml" ]]; then
     source venv/bin/activate
     cd "$DEPLOY_DIR"
@@ -208,10 +222,16 @@ generate_service() {
         stop_timeout="15"
     fi
 
+    # C1: Bot 服务依赖 redis.service(db_backup 不依赖 Redis)
+    local after_deps="network.target"
+    if [[ "$name" != "db_backup" ]]; then
+        after_deps="network.target redis.service"
+    fi
+
     cat > "/etc/systemd/system/${svc}.service" << EOF
 [Unit]
 Description=TG文件解码器 — ${desc}
-After=network.target
+After=${after_deps}
 Wants=network.target
 PartOf=${SVC_PREFIX}.target
 # systemd 内置防抖:60秒内最多重启5次,超限后冷却30秒

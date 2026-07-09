@@ -99,6 +99,7 @@ async def _cleanup_channel_limiter_loop():
 async def _retry_dead_jobs():
     """每小时重试本地死信队列中的 job（0 RU）"""
     from database.cache_store import get_cache_store
+    from utils.redis_client import xadd_job
     store = get_cache_store()
     while True:
         try:
@@ -106,6 +107,11 @@ async def _retry_dead_jobs():
             if dead_jobs:
                 for dj in dead_jobs:
                     await store.retry_local_dead_job(dj["crdb_id"])
+                    # C1: 重试入队后重新投递到 Redis Stream,避免 Redis 模式下重试 job 饥饿
+                    try:
+                        await xadd_job(dj["crdb_id"])
+                    except Exception:
+                        pass  # 降级:notify_dsp_new_job 已写入 dsp_notify
                 logger.info(f"[Dsp] 本地死信重试: 重置 {len(dead_jobs)} 个 job")
         except Exception as e:
             logger.error(f"[Dsp] 死信重试异常: {e}")
@@ -347,6 +353,12 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
             await store.update_local_job_status(job.job_id, "dead", dead_reason=f"发送失败,已重试{job.retry_count}次: {job.code}")
         else:
             await store.retry_local_job(job.job_id, new_retry)
+            # C1: 重试入队后重新投递到 Redis Stream,避免 Redis 模式下重试 job 饥饿
+            try:
+                from utils.redis_client import xadd_job
+                await xadd_job(job.job_id)
+            except Exception:
+                pass  # 降级:notify_dsp_new_job 已写入 dsp_notify
             logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{new_retry}")
 
         # Dsp 侧降级检查
@@ -361,15 +373,60 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
 async def _dsp_worker(bot: Any, worker_id: int):
     """worker: 批量拉取 jobs → 并发发送
     D: 从本地 SQLite 队列消费,零 CRDB RU
+    C1: 优先使用 Redis Stream XREADGROUP(事件驱动),降级到 dsp_notify 轮询
     """
     from database.cache_store import get_cache_store
+    from utils.redis_client import xreadgroup_jobs, xack_job, get_redis
     store = get_cache_store()
+    consumer_name = f"worker-{worker_id}"
 
     while True:
         try:
+            # C1: 优先从 Redis Stream 读取(事件驱动,BLOCK 5s)
+            redis = await get_redis()
+            redis_messages = []
+            if redis:
+                redis_messages = await xreadgroup_jobs(consumer_name, count=10, block=5000)
+
+            if redis_messages:
+                # Redis 模式:按 crdb_id 查 job + CAS 认领 + 并发发送 + XACK
+                claimed_jobs = []
+                msg_id_map = {}  # crdb_id → msg_id
+                for msg_id, fields in redis_messages:
+                    try:
+                        crdb_id = int(fields.get("crdb_id", 0))
+                    except (ValueError, TypeError):
+                        crdb_id = 0
+                    if crdb_id <= 0:
+                        await xack_job(msg_id)
+                        continue
+                    # CAS 认领
+                    if await store.mark_local_job_dispatched(crdb_id):
+                        job_dict = await store.get_local_job_by_crdb_id(crdb_id)
+                        if job_dict:
+                            job = _raw_jobs_to_results([job_dict])[0]
+                            claimed_jobs.append(job)
+                            msg_id_map[crdb_id] = msg_id
+                    else:
+                        # 已被认领或不存在,ACK 避免重复消费
+                        await xack_job(msg_id)
+
+                if claimed_jobs:
+                    tasks = [asyncio.create_task(_send_one_job(bot, job, worker_id, store)) for job in claimed_jobs]
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    # 发送后 XACK(无论成功失败,重试会重新 XADD)
+                    for job in claimed_jobs:
+                        msg_id = msg_id_map.get(job.job_id)
+                        if msg_id:
+                            await xack_job(msg_id)
+                continue
+
+            # 降级/兜底:SQLite 轮询(处理 Redis 超时无消息 或 Redis 不可用)
             raw_jobs = await store.get_local_pending_jobs(10)
             if not raw_jobs:
-                await store.wait_for_dsp_job(timeout=2.0)
+                if not redis:
+                    # Redis 不可用时才等待通知(Redis 可用但无消息时不等待,继续循环)
+                    await store.wait_for_dsp_job(timeout=2.0)
                 continue
 
             jobs = _raw_jobs_to_results(raw_jobs)
@@ -873,10 +930,17 @@ async def _async_main():
     # E: 回收超时 dispatched jobs,防止进程崩溃导致 job 永久丢失
     async def reclaim_dispatched_loop():
         from database.cache_store import get_cache_store
+        from utils.redis_client import xadd_job
         store = get_cache_store()
         while True:
             try:
-                await store.reclaim_stale_dispatched(timeout_seconds=600)
+                reclaimed_ids = await store.reclaim_stale_dispatched(timeout_seconds=600)
+                # C1: 回收的 job 重新投递到 Redis Stream,避免 Redis 模式下饥饿
+                for crdb_id in reclaimed_ids:
+                    try:
+                        await xadd_job(crdb_id)
+                    except Exception:
+                        pass  # 降级:notify_dsp_new_job 已写入 dsp_notify
             except Exception as e:
                 logger.warning(f"[Dsp] 回收 dispatched jobs 异常: {e}")
             await asyncio.sleep(120)

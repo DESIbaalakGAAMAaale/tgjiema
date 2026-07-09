@@ -1072,6 +1072,30 @@ class CacheStore:
             for r in rows
         ]
 
+    async def get_local_job_by_crdb_id(self, crdb_id: int) -> dict | None:
+        """C1: 按 crdb_id 精确查 job(Redis Stream 消费者用)。"""
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            "SELECT crdb_id, code, target_user_id, storage_channel_id, "
+            "storage_msg_ids, batch_file_meta, task_type, status, "
+            "retry_count, protect_content, created_at "
+            "FROM local_job_queue WHERE crdb_id = ?",
+            (crdb_id,),
+        )
+        if not rows:
+            return None
+        cols = ["crdb_id", "code", "target_user_id", "storage_channel_id",
+                "storage_msg_ids", "batch_file_meta", "task_type", "status",
+                "retry_count", "protect_content", "created_at"]
+        row = dict(zip(cols, rows[0]))
+        # 类型转换(与 get_local_pending_jobs 保持一致)
+        try:
+            row["protect_content"] = bool(row.get("protect_content", False))
+        except Exception:
+            row["protect_content"] = False
+        return row
+
     async def count_pending_jobs(self) -> int:
         """统计本地队列中 pending 状态的 job 数量(队列积压深度, 0 CRDB RU)"""
         if not self._db:
@@ -1156,26 +1180,34 @@ class CacheStore:
         await self._db.commit()
         await self.notify_dsp_new_job()
 
-    async def reclaim_stale_dispatched(self, timeout_seconds: int = 300) -> int:
+    async def reclaim_stale_dispatched(self, timeout_seconds: int = 300) -> list[int]:
         """回收超时的 dispatched 状态 job,重置为 pending。
         防止进程崩溃或 task 异常导致 job 永久停留在 dispatched 状态。
-        返回回收的 job 数量。
+        返回回收的 crdb_id 列表(供调用方重新投递 Redis Stream)。
         """
         if not self._db:
-            return 0
+            return []
         cutoff = (datetime.datetime.now(datetime.timezone.utc) -
                   datetime.timedelta(seconds=timeout_seconds)).isoformat()
-        cursor = await self._db.execute(
-            "UPDATE local_job_queue SET status='pending', dispatched_at=NULL, synced_at=0 "
-            "WHERE status='dispatched' AND dispatched_at < ?",
+        # 先 SELECT 再 UPDATE,获取被回收的 crdb_id 列表
+        rows = await self._db.execute_fetchall(
+            "SELECT crdb_id FROM local_job_queue "
+            "WHERE status='dispatched' AND dispatched_at < ? AND crdb_id > 0",
             (cutoff,),
         )
-        count = cursor.rowcount
-        if count > 0:
-            await self._db.commit()
-            await self.notify_dsp_new_job()
-            logger.info(f"[CacheStore] 回收 {count} 个超时 dispatched jobs")
-        return count
+        reclaimed_ids = [r[0] for r in rows if r and r[0]]
+        if not reclaimed_ids:
+            return []
+        placeholders = ",".join("?" * len(reclaimed_ids))
+        await self._db.execute(
+            f"UPDATE local_job_queue SET status='pending', dispatched_at=NULL, synced_at=0 "
+            f"WHERE status='dispatched' AND dispatched_at < ? AND crdb_id IN ({placeholders})",
+            (cutoff, *reclaimed_ids),
+        )
+        await self._db.commit()
+        await self.notify_dsp_new_job()
+        logger.info(f"[CacheStore] 回收 {len(reclaimed_ids)} 个超时 dispatched jobs")
+        return reclaimed_ids
 
     async def get_local_unsynced_jobs(self) -> list[dict]:
         """获取需要同步回 CRDB 的 job(状态变更未同步,仅 crdb_id>0 的)"""

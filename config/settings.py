@@ -95,6 +95,11 @@ class Settings(BaseSettings):
     RELAY_NORM_TODAY_REQ: float = 50000.0  # today_requests 归一化因子
     RELAY_NORM_GAP: float = 3600.0       # gap 归一化因子
 
+    # ─── C1: Redis Stream 事件驱动(dsp_bot 替代轮询)───
+    # REDIS_URL 为空时禁用 Redis,使用 SQLite 轮询(本地开发零依赖)
+    REDIS_URL: str = ""
+    REDIS_STREAM_MAXLEN: int = 10000  # Stream 最大长度,防止无限增长
+
     # ─── 配额同步间隔 ──────────────────────────────────────────
     QUOTA_SYNC_INTERVAL: int = 300       # 秒(5分钟),减少 CRDB RU 消耗
 

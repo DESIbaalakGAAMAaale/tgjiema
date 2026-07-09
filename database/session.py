@@ -2030,6 +2030,14 @@ async def _sync_new_job_to_crdb(
         if crdb_id is not None:
             store = get_cache_store()
             await store.update_local_job_crdb_id(local_id, crdb_id)
+            # C1: CRDB 写入成功后,用真实 crdb_id 投递到 Redis Stream。
+            # 不在 enqueue_job 时 xadd local_id(负数临时 ID),避免与 update_local_job_crdb_id 竞态导致 job 丢失。
+            # CRDB 写入失败的 job(crdb_id 保持负数)由 dsp_bot 降级轮询(get_local_pending_jobs)兜底消费。
+            try:
+                from utils.redis_client import xadd_job
+                await xadd_job(crdb_id)
+            except Exception:
+                pass  # 降级:notify_dsp_new_job 已在 enqueue_job 中写入 dsp_notify
     except Exception as e:
         logger.debug(f"[H] 后台 CRDB 同步失败 local_id={local_id}: {e}")
 
@@ -2067,7 +2075,10 @@ async def enqueue_job(
         "created_at": created_at,
     })
     await store.notify_dsp_new_job()
-    
+    # C1: Redis Stream 事件通知移至 _sync_new_job_to_crdb 成功后触发(用真实 crdb_id)。
+    # 此处仅写 dsp_notify(SQLite),降级轮询路径由此驱动;
+    # 若 Redis 可用,_sync_new_job_to_crdb 完成后会 xadd 真实 crdb_id 触发即时派发。
+
     # 递增本地计数器(用于 admin /status)
     # R25-L2: active_files 由 incr_user_code_count 统一维护(在线码数),此处不再重复递增
     try:
