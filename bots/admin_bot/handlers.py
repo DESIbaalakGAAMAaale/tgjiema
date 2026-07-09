@@ -1293,6 +1293,123 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ─── 帮助命令 ──────────────────────────────────────────────────
 
 @_auth_required
+async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """数据库恢复命令。
+
+    用法:
+      /restore                  — 列出可用备份(最新在前,显示序号)
+      /restore <序号>           — 显示确认按钮,点击后全量恢复
+      /restore <序号> table:xxx,yyy — 只恢复指定表(逗号分隔)
+    """
+    args = context.args
+
+    # 无参数:列出备份
+    if not args:
+        await _restore_list_backups(update, context)
+        return
+
+    # 解析序号和可选的 table: 过滤
+    try:
+        seq = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 序号必须是数字。使用 /restore 查看备份列表。")
+        return
+
+    tables = None
+    if len(args) >= 2 and args[1].startswith("table:"):
+        tables_str = args[1][len("table:"):]
+        tables = [t.strip() for t in tables_str.split(",") if t.strip()]
+        if not tables:
+            await update.message.reply_text("❌ table: 后必须指定表名(逗号分隔)")
+            return
+
+    # 查备份列表,取出对应序号的 key
+    from services.db_backup import list_backups
+    try:
+        backups = await list_backups()
+    except Exception as e:
+        await update.message.reply_text(f"❌ 读取备份列表失败: {e}")
+        return
+
+    if not backups:
+        await update.message.reply_text("📭 R2 中没有可用的备份")
+        return
+
+    if seq < 1 or seq > len(backups):
+        await update.message.reply_text(f"❌ 序号超出范围(1-{len(backups)})。使用 /restore 查看列表。")
+        return
+
+    target = backups[seq - 1]
+    key = target.get("key", "")
+    size = target.get("size", 0)
+    last_mod = target.get("last_modified", "")
+
+    # 构造确认按钮
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    cb_data = f"restore:confirm|{seq}"
+    if tables:
+        cb_data += f"|table:{','.join(tables)}"
+
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ 确认恢复(清空目标表后写入)", callback_data=cb_data),
+        ],
+        [
+            InlineKeyboardButton("❌ 取消", callback_data="restore:cancel"),
+        ],
+    ])
+
+    scope_text = f"仅恢复表: {', '.join(tables)}" if tables else "全量恢复(所有表)"
+    await update.message.reply_text(
+        "⚠️ 数据库恢复确认\n\n"
+        f"📁 备份文件: `{key}`\n"
+        f"📏 大小: {size} 字节\n"
+        f"🕒 备份时间: {last_mod}\n"
+        f"📋 恢复范围: {scope_text}\n\n"
+        "🔴 警告: 恢复会先 TRUNCATE 清空目标表,再写入备份数据!\n"
+        "🔴 建议先停止相关 Bot 服务再恢复。\n\n"
+        "点击下方按钮确认或取消:",
+        reply_markup=kb,
+    )
+
+
+async def _restore_list_backups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """列出 R2 中的备份文件。"""
+    from services.db_backup import list_backups
+    try:
+        backups = await list_backups()
+    except Exception as e:
+        await update.message.reply_text(f"❌ 读取备份列表失败: {e}")
+        return
+
+    if not backups:
+        await update.message.reply_text("📭 R2 中没有可用的备份")
+        return
+
+    lines = [f"📦 可用备份(共 {len(backups)} 份,最新在前)\n"]
+    lines.append("序号  大小      备份时间                 文件名")
+    lines.append("─" * 70)
+    # 只显示最近 20 条,避免消息过长
+    show_count = min(len(backups), 20)
+    for i in range(show_count):
+        b = backups[i]
+        key = b.get("key", "")
+        size = b.get("size", 0)
+        last_mod = b.get("last_modified", "")[:19]
+        # 从 key 提取短文件名
+        short_name = key.split("/")[-1] if "/" in key else key
+        lines.append(f" {i+1:3d}  {size:>7}  {last_mod}  {short_name}")
+
+    if len(backups) > 20:
+        lines.append(f"\n(仅显示最近 20 份,共 {len(backups)} 份)")
+
+    lines.append("\n用法:")
+    lines.append("  /restore <序号>           — 全量恢复")
+    lines.append("  /restore <序号> table:xxx — 仅恢复指定表")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "管理员面板 模块说明\n\n"
@@ -1331,6 +1448,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /set_quota_default <free|basic|premium> <配额> — 默认日配额（热更新）\n"
         "  /set_r2 <账号ID> <AccessKey> <SecretKey> — R2备份配置（需重启）\n"
         "  /set_db_backup <间隔分钟> <on|off> — 数据库自动备份（热更新）\n"
+        "  /restore — 查看备份列表并恢复数据库（按钮确认,支持指定表）\n"
         "  /factory_reset — 恢复出厂设置\n\n"
         "文件码路由（第三方机器人迁移用）\n"
         "  /add_code_route <前缀> <机器人用户名> — 添加路由规则\n"

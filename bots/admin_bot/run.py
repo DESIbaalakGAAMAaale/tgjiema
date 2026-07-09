@@ -15,7 +15,7 @@ from .handlers import (
     list_code_routes, set_bot_interval, remove_bot_interval, list_bot_intervals,
     spare_add, spare_remove, spare_list, rotation_set, rotation_view, topology,
     relay_whitelist, collector_whitelist,
-    cancel_conversation, help_command,
+    cancel_conversation, help_command, restore,
 )
 from .callback import menu_callback
 from .conversation import handle_conversation
@@ -90,9 +90,10 @@ async def _async_main():
     app.add_handler(CommandHandler("relay_whitelist", relay_whitelist))
     app.add_handler(CommandHandler("collector_whitelist", collector_whitelist))
     app.add_handler(CommandHandler("cancel", cancel_conversation))
+    app.add_handler(CommandHandler("restore", restore))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:|report:)"))
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:|report:|restore:)"))
 
     async def health_ping():
         while True:

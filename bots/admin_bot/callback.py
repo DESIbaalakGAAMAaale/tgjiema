@@ -295,6 +295,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=back_kb,
         )
 
+    # ─── 数据库恢复 ──────────────────────────────────────────────
+    elif data.startswith("restore:"):
+        await _handle_restore_action(update, context, data)
+
 
 # ─── 举报动作处理 ──────────────────────────────────────────────
 
@@ -370,3 +374,98 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"[Admin][report] 操作失败: {e}")
         await query.answer(f"操作失败: {e}", show_alert=True)
+
+
+# ─── 数据库恢复动作处理 ──────────────────────────────────────────
+
+async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    """处理数据库恢复的确认/取消按钮。"""
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id != AUTHORIZED_USER_ID:
+        await query.answer("⛔ 无权限", show_alert=True)
+        return
+
+    back_kb = InlineKeyboardMarkup(BACK_BTN)
+
+    if data == "restore:cancel":
+        await query.edit_message_text("❌ 恢复操作已取消。", reply_markup=back_kb)
+        return
+
+    # restore:confirm|<seq>|table:xxx,yyy  (table 部分可选)
+    if not data.startswith("restore:confirm|"):
+        await query.edit_message_text("❌ 未知恢复操作", reply_markup=back_kb)
+        return
+
+    parts = data.split("|")
+    if len(parts) < 2:
+        await query.edit_message_text("❌ 参数缺失", reply_markup=back_kb)
+        return
+
+    try:
+        seq = int(parts[1])
+    except ValueError:
+        await query.edit_message_text("❌ 序号无效", reply_markup=back_kb)
+        return
+
+    tables = None
+    if len(parts) >= 3 and parts[2].startswith("table:"):
+        tables = [t.strip() for t in parts[2][len("table:"):].split(",") if t.strip()]
+
+    # 先给用户一个"正在恢复"的反馈
+    await query.edit_message_text("⏳ 正在从 R2 下载备份并恢复数据库,请稍候...")
+
+    from services.db_backup import list_backups, restore_from_backup
+    try:
+        backups = await list_backups()
+    except Exception as e:
+        await query.edit_message_text(f"❌ 读取备份列表失败: {e}", reply_markup=back_kb)
+        return
+
+    if not backups or seq < 1 or seq > len(backups):
+        await query.edit_message_text("❌ 备份序号无效", reply_markup=back_kb)
+        return
+
+    key = backups[seq - 1].get("key", "")
+    logger.info(f"[Admin][restore] 开始恢复: key={key}, tables={tables}, 操作者={user.id}")
+
+    try:
+        result = await restore_from_backup(key, tables)
+    except Exception as e:
+        logger.error(f"[Admin][restore] 恢复失败: {e}")
+        await query.edit_message_text(
+            f"❌ 恢复失败: {e}\n\n备份文件: `{key}`",
+            reply_markup=back_kb,
+        )
+        return
+
+    # 构造恢复结果摘要
+    restored = result.get("restored", {})
+    skipped = result.get("skipped", [])
+    errors = result.get("errors", [])
+
+    lines = ["✅ 数据库恢复完成\n"]
+    lines.append(f"📁 备份文件: `{key}`\n")
+
+    if restored:
+        lines.append("恢复的表:")
+        total_rows = 0
+        for tbl, cnt in restored.items():
+            lines.append(f"  • {tbl}: {cnt} 行")
+            total_rows += cnt
+        lines.append(f"\n共恢复 {len(restored)} 个表, {total_rows} 行")
+
+    if skipped:
+        lines.append(f"\n⚠️ 跳过的表: {', '.join(skipped)}")
+
+    if errors:
+        lines.append(f"\n❌ 错误 ({len(errors)} 个):")
+        for err in errors[:5]:  # 只显示前5个错误
+            lines.append(f"  • {err}")
+        if len(errors) > 5:
+            lines.append(f"  ...等 {len(errors)} 个错误")
+
+    lines.append("\n💡 建议:重启相关 Bot 服务以加载恢复的数据")
+    lines.append(f"  systemctl restart tgjiema.target")
+
+    await query.edit_message_text("\n".join(lines), reply_markup=back_kb)
