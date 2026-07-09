@@ -1736,6 +1736,36 @@ class CacheStore:
         )
         return rows[0][0] if rows else None
 
+    async def get_existing_file_in_group(
+        self, group_id: int, file_unique_id: str,
+    ) -> dict | None:
+        """秒传去重:查询该组内是否已存在此 file_unique_id 的文件。
+
+        优先返回 active 频道的记录,其次返回任一存活频道记录。
+        返回 {channel_id, message_id, media_type, media_group_id} 或 None。
+        """
+        if not self._db or not file_unique_id:
+            return None
+        rows = await self._db.execute_fetchall(
+            "SELECT channel_id, message_id, media_type, media_group_id "
+            "FROM manifest WHERE group_id = ? AND file_unique_id = ?",
+            (group_id, file_unique_id),
+        )
+        if not rows:
+            return None
+        cols = ["channel_id", "message_id", "media_type", "media_group_id"]
+        records = [dict(zip(cols, r)) for r in rows]
+        # 优先返回 active 频道的记录(dsp_bot 主要从 active 读取)
+        active_rows = await self._db.execute_fetchall(
+            "SELECT channel_id FROM cells_local WHERE status = 'active'"
+        )
+        active_channels = {r[0] for r in active_rows}
+        for r in records:
+            if r["channel_id"] in active_channels:
+                return r
+        # 无 active 频道记录,返回第一条(shadow 频道,dsp_bot 可通过 message_backups 找到)
+        return records[0]
+
     # ─── KV 键值存储（0 CRDB RU）───
 
     async def get_kv(self, key: str) -> str | None:

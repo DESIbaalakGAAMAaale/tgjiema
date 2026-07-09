@@ -153,6 +153,32 @@ async def _register_manifest(channel_id: int, message_id: int, msg, media_type: 
     except Exception as e:
         logger.warning(f"[Up] 登记 manifest 失败 (channel={channel_id}, msg_id={message_id}): {e}")
 
+
+async def _check_dedup(target_channel: int, msg) -> dict | None:
+    """秒传去重检查:查询该组内是否已存在此文件(file_unique_id)的记录。
+
+    Args:
+        target_channel: 目标存储频道(用于解析 group_id)
+        msg: PTB Message 对象(用于提取 file_unique_id)
+
+    Returns:
+        命中时返回 {channel_id, message_id, media_type, media_group_id};
+        未命中或查询失败返回 None。
+    """
+    fuid = _extract_file_unique_id(msg)
+    if not fuid:
+        return None
+    await _ensure_channel_group_map()
+    group_id = _channel_to_group.get(target_channel)
+    if group_id is None:
+        return None
+    try:
+        return await get_cache_store().get_existing_file_in_group(group_id, fuid)
+    except Exception as e:
+        logger.warning(f"[Up] 去重查询失败 (fuid={fuid}): {e}")
+        return None
+
+
 async def _cleanup_pending():
     """定期清理超时未完成的 media group 和 external buffer。"""
     while True:
@@ -354,6 +380,9 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_msg_ids = []
     files_meta = []
 
+    # 注:批次路径不做秒传去重。批次内多文件可能来自不同源,channel 绑定复杂,
+    # 跨 channel 复用会破坏 primary_channel_id + batch_msg_ids 的一致性。
+    # 单文件与媒体组路径已覆盖主要秒传场景(_process_upload / _flush_media_group)。
     # 按 media_group_id 分组:有 mgid 的用 copy_messages 保持相册,无 mgid 的用 send_media_group 整合
     mg_groups: dict[str, list] = {}
     singles: list = []
@@ -656,49 +685,91 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     except Exception:
         pass
 
-    batch_success = False
-    try:
-        copied = await safe_copy_messages(context.bot, target_ch, src_chat_id, src_msg_ids)
-        if copied and len(copied) == total_count:
-            # copy_messages 返回 MessageId 列表,顺序与输入一致
-            all_mids = [m.message_id for m in copied]
-            all_meta = [extract_file_meta(up) for up in updates]
-            # Manifest 登记(逐条,用原始 update.message 提取 file_unique_id)
-            for up, mid in zip(updates, all_mids):
-                asyncio.create_task(_register_manifest(
-                    target_ch, mid, up.message, detect_file_type(up),
-                ))
-            # R100 归档(逐条,因 R100 是独立归档频道)
-            for up in updates:
-                asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
-            batch_success = True
+    # B1 媒体组级秒传去重:整组所有文件都已存在且在同一 channel 才复用
+    # (保证 batch_msg_ids 与 primary_channel_id 的一致性)
+    dedup_hit = False
+    await _ensure_channel_group_map()
+    group_id = _channel_to_group.get(target_ch)
+    if group_id is not None:
+        hit_channel = 0
+        hit_mids: list[int] = []
+        hit_meta: list = []
+        all_found = True
+        for up in updates:
+            fuid = _extract_file_unique_id(up.message)
+            if not fuid:
+                all_found = False
+                break
+            try:
+                existing = await get_cache_store().get_existing_file_in_group(group_id, fuid)
+            except Exception:
+                existing = None
+            if not existing:
+                all_found = False
+                break
+            if hit_channel == 0:
+                hit_channel = existing["channel_id"]
+            elif existing["channel_id"] != hit_channel:
+                all_found = False  # 跨 channel,放弃秒传(保持 batch_msg_ids 一致性)
+                break
+            hit_mids.append(existing["message_id"])
+            hit_meta.append(extract_file_meta(up))
+        if all_found and hit_mids:
+            dedup_hit = True
+            target_ch = hit_channel  # 更新为文件实际所在频道
+            all_mids = hit_mids
+            all_meta = hit_meta
+            await metrics.increment("up.dedup_hit", len(hit_mids))
+            logger.info(f"[Up] 媒体组秒传去重命中: {len(hit_mids)} 个文件, channel={hit_channel}")
             try:
                 await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
             except Exception:
                 pass
-    except Exception as e:
-        logger.warning(f"[Up] copy_messages 批量复制失败,回退逐条: {e}")
 
-    if not batch_success:
-        # 回退逐条 copy_message
-        for i, up in enumerate(updates):
-            try:
-                forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
-                all_mids.append(forwarded.message_id)
-                all_meta.append(extract_file_meta(up))
-                # Manifest 登记
-                asyncio.create_task(_register_manifest(
-                    target_ch, forwarded.message_id, up.message, detect_file_type(up),
-                ))
-                asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
-            except Exception as e:
-                logger.error(f"[Up] media group copy failed: {e}")
-                failed_count += 1
-            if (i + 1) % 3 == 0 or i == total_count - 1:
+    if not dedup_hit:
+        batch_success = False
+        try:
+            copied = await safe_copy_messages(context.bot, target_ch, src_chat_id, src_msg_ids)
+            if copied and len(copied) == total_count:
+                # copy_messages 返回 MessageId 列表,顺序与输入一致
+                all_mids = [m.message_id for m in copied]
+                all_meta = [extract_file_meta(up) for up in updates]
+                # Manifest 登记(逐条,用原始 update.message 提取 file_unique_id)
+                for up, mid in zip(updates, all_mids):
+                    asyncio.create_task(_register_manifest(
+                        target_ch, mid, up.message, detect_file_type(up),
+                    ))
+                # R100 归档(逐条,因 R100 是独立归档频道)
+                for up in updates:
+                    asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
+                batch_success = True
                 try:
-                    await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
+                    await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
                 except Exception:
                     pass
+        except Exception as e:
+            logger.warning(f"[Up] copy_messages 批量复制失败,回退逐条: {e}")
+
+        if not batch_success:
+            # 回退逐条 copy_message
+            for i, up in enumerate(updates):
+                try:
+                    forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
+                    all_mids.append(forwarded.message_id)
+                    all_meta.append(extract_file_meta(up))
+                    # Manifest 登记
+                    asyncio.create_task(_register_manifest(
+                        target_ch, forwarded.message_id, up.message, detect_file_type(up),
+                    ))
+                    asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
+                except Exception as e:
+                    logger.error(f"[Up] media group copy failed: {e}")
+                    failed_count += 1
+                if (i + 1) % 3 == 0 or i == total_count - 1:
+                    try:
+                        await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
+                    except Exception:
+                        pass
 
     if not all_mids:
         await metrics.record_error("up_bot")
@@ -745,22 +816,31 @@ async def _process_upload(
     user_id: int, update: Update, context: ContextTypes.DEFAULT_TYPE, file_types: dict
 ):
     main_channel = await _get_upload_target_channel()
-    try:
-        forwarded = await safe_copy_message(context.bot, main_channel, update.effective_chat.id, update.message.message_id)
-        channel_msg_id = forwarded.message_id
-        # Manifest 登记(异步,失败不影响主流程)
-        asyncio.create_task(_register_manifest(
-            main_channel, channel_msg_id, update.message,
-            next(iter(file_types.keys()), "") if file_types else "",
-        ))
-    except Exception as e:
-        logger.error(f"[Up] 转发文件到存储频道失败 {e}")
-        await metrics.record_error("up_bot")
-        await update.message.reply_text("文件处理失败，请稍后重试")
-        return
 
-    # R100 归档：异步转发到 R100 存储频道（fire-and-forget）
-    asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
+    # B1 秒传去重:若该文件(file_unique_id)已存在于同组频道,直接复用 msg_id
+    existing = await _check_dedup(main_channel, update.message)
+    if existing:
+        channel_msg_id = existing["message_id"]
+        main_channel = existing["channel_id"]  # 文件实际所在频道
+        logger.info(f"[Up] 秒传去重命中: reuse channel={main_channel} msg_id={channel_msg_id}")
+        await metrics.increment("up.dedup_hit")
+    else:
+        try:
+            forwarded = await safe_copy_message(context.bot, main_channel, update.effective_chat.id, update.message.message_id)
+            channel_msg_id = forwarded.message_id
+            # Manifest 登记(异步,失败不影响主流程)
+            asyncio.create_task(_register_manifest(
+                main_channel, channel_msg_id, update.message,
+                next(iter(file_types.keys()), "") if file_types else "",
+            ))
+        except Exception as e:
+            logger.error(f"[Up] 转发文件到存储频道失败 {e}")
+            await metrics.record_error("up_bot")
+            await update.message.reply_text("文件处理失败，请稍后重试")
+            return
+
+        # R100 归档：异步转发到 R100 存储频道（fire-and-forget）
+        asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
 
     # 暂存必要信息到模块级 dict（context.user_data 在 callback 间不可靠）
     _pending_upload_meta[user_id] = {
@@ -1098,11 +1178,19 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
                 "created_at": time.time(),
             }
 
-    try:
-        forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
-    except Exception as e:
-        logger.error(f"[Up][ext_relay] copy 到存储频道失败 (code={external_code}): {e}")
-        return
+    # B1 秒传去重:仅复用同 channel 的已有文件(保证 buffer channel 一致性)
+    existing = await _check_dedup(target_ch, update.message)
+    if existing and existing["channel_id"] == target_ch:
+        channel_msg_id = existing["message_id"]
+        logger.info(f"[Up][ext_relay] 秒传去重命中: reuse msg_id={channel_msg_id} (code={external_code})")
+        await metrics.increment("up.dedup_hit")
+    else:
+        try:
+            forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
+            channel_msg_id = forwarded.message_id
+        except Exception as e:
+            logger.error(f"[Up][ext_relay] copy 到存储频道失败 (code={external_code}): {e}")
+            return
 
     file_type = detect_file_type(update)
     file_meta = extract_file_meta(update)
@@ -1122,7 +1210,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
             }
             _external_buffers[external_code] = buf
 
-        buf["msg_ids"].append(forwarded.message_id)
+        buf["msg_ids"].append(channel_msg_id)
         buf["files_meta"].append(file_meta)
         buf["file_types"][file_type] += 1
 
