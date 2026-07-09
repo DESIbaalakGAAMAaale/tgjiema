@@ -1044,6 +1044,18 @@ class CacheStore:
             for r in rows
         ]
 
+    async def count_pending_jobs(self) -> int:
+        """统计本地队列中 pending 状态的 job 数量(队列积压深度, 0 CRDB RU)"""
+        if not self._db:
+            return 0
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT COUNT(*) FROM local_job_queue WHERE status = 'pending'"
+            )
+            return rows[0][0] if rows else 0
+        except Exception:
+            return 0
+
     async def mark_local_job_dispatched(self, crdb_id: int) -> bool:
         """标记本地 job 为 dispatched (CAS 语义,防止多 worker 重复认领)。
 

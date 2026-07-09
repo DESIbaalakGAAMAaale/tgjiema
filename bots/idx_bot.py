@@ -1966,6 +1966,9 @@ async def _async_main():
     await _init()
     from database.cache_store import report_bot_heartbeat
     await report_bot_heartbeat("idx_bot")
+    # A1: 启动计数器定期上报(跨进程聚合)
+    from utils.monitor import start_counter_reporter
+    asyncio.create_task(start_counter_reporter("idx_bot"))
 
     logger.info("[Idx] 启动解码机器(Idx Bot)...")
     app = Application.builder().token(TOKEN).build()
@@ -2056,6 +2059,18 @@ async def _async_main():
     create_safe_task(_process_pending_uploads(app), name="process-pending")
     create_safe_task(cleanup_loop(), name="cleanup")
     create_safe_task(relay_pool.start_all(), name="relay-start")
+
+    # A1: 定期上报中继账号存活统计到 counter_snapshot(供 mon_bot 跨进程监控)
+    async def _report_relay_stats():
+        while True:
+            try:
+                alive, total = await relay_pool.get_survival_stats()
+                await metrics.set_counter("relay.alive", alive)
+                await metrics.set_counter("relay.total", total)
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+    create_safe_task(_report_relay_stats(), name="relay-stats")
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")
     # Decode Logs 缓冲 flush 后台任务

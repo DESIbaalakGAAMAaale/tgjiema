@@ -396,7 +396,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     )
     msg_id = job.storage_msg_ids[0] if job.storage_msg_ids else 0
     if not msg_id:
-        metrics.send_fail_count += 1
+        await metrics.record_send_fail()
         return False
 
     # protect_content 已从 jobs 表直接获取,无需再查 file_records
@@ -434,13 +434,13 @@ async def _process_single_job(bot, job, bot_id: int = 1):
 
     if success:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
-        metrics.send_success_count += 1
+        await metrics.record_send_success()
         await metrics.record_processed("dsp_bot")
         return True
 
     # 所有槽位均不可用,记录失败
     logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried)}")
-    metrics.send_fail_count += 1
+    await metrics.record_send_fail()
     await metrics.record_error("dsp_bot")
     try:
         await safe_send_message(bot, chat_id=job.target_user_id, text="文件发送失败，请稍后重试或联系管理员")
@@ -512,13 +512,13 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
         try:
             resolved = await resolve_delivery_channel(job.storage_channel_id)
             if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id):
-                metrics.send_success_count += 1
+                await metrics.record_send_success()
             else:
-                metrics.send_fail_count += 1
+                await metrics.record_send_fail()
                 all_success = False
         except Exception as e:
             logger.error(f"[Dsp] 兜底发送异常 (msg={mid}): {e}")
-            metrics.send_fail_count += 1
+            await metrics.record_send_fail()
             all_success = False
         # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
         if i < len(job.storage_msg_ids) - 1:
@@ -550,7 +550,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
 
         if batch_ok:
             logger.info(f"[Dsp] 分页发送成功(批量相册): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(page_msg_ids)}个文件)")
-            metrics.send_success_count += 1
+            await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
         else:
             # 回退逐条 copy_message(批量失败原因:影子映射不全/BadRequest/部分消息损坏等)
@@ -573,14 +573,14 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                     await asyncio.sleep(0.15)
             if success_count > 0:
                 logger.info(f"[Dsp] 分页发送成功(逐条回退): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({success_count}/{len(page_msg_ids)}个文件)")
-                metrics.send_success_count += 1
+                await metrics.record_send_success()
                 await metrics.record_processed("dsp_bot")
             else:
                 logger.error(
                     f"[Dsp] 分页发送全部失败: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页,"
                     f"storage_channel={storage_channel_id}, msg_ids={page_msg_ids}, 失败详情={fail_details}"
                 )
-                metrics.send_fail_count += 1
+                await metrics.record_send_fail()
                 await metrics.record_error("dsp_bot")
                 try:
                     await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
@@ -594,11 +594,11 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         try:
             await safe_send_media_group(bot, chat_id=chat_id, media=input_media)
             logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(input_media)}张)")
-            metrics.send_success_count += 1
+            await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
         except Exception as e:
             logger.error(f"[Dsp] 媒体组发送失败: {e}")
-            metrics.send_fail_count += 1
+            await metrics.record_send_fail()
             await metrics.record_error("dsp_bot")
             try:
                 await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
@@ -819,6 +819,9 @@ async def _async_main():
     await _init()
     from database.cache_store import report_bot_heartbeat
     await report_bot_heartbeat("dsp_bot")
+    # A1: 启动计数器定期上报(跨进程聚合)
+    from utils.monitor import start_counter_reporter
+    asyncio.create_task(start_counter_reporter("dsp_bot"))
 
     logger.info("[Dsp] 启动发送机器人 (Dsp Bot)...")
     app = Application.builder().token(TOKEN).build()

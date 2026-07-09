@@ -70,6 +70,13 @@ class RelayPool:
             except Exception as e:
                 logger.debug(f"[RelayPool] 清理冷却记录异常: {e}")
 
+    async def get_survival_stats(self) -> tuple[int, int]:
+        """返回 (存活账号数, 总账号数) 用于账号存活率监控"""
+        async with self._lock:
+            total = len(self.instances)
+            alive = sum(1 for inst in self.instances if inst.is_ready)
+        return alive, total
+
     async def get_best_account(self) -> RelayInstance | None:
         """
         智能选择最优账号（三维度负载均衡）:

@@ -63,6 +63,30 @@ class SystemMetrics:
             _counters[key] = val
             logger.debug("metric %s +%d -> %d", key, amount, val)
 
+    async def record_send_success(self):
+        """记录投递成功(双写: dataclass 字段 + _counters 用于跨进程聚合)"""
+        async with self._lock:
+            self.send_success_count += 1
+            val = _counters.get("dsp.send_success", 0) + 1
+            _counters["dsp.send_success"] = val
+
+    async def record_send_fail(self):
+        """记录投递失败(双写: dataclass 字段 + _counters 用于跨进程聚合)"""
+        async with self._lock:
+            self.send_fail_count += 1
+            val = _counters.get("dsp.send_fail", 0) + 1
+            _counters["dsp.send_fail"] = val
+
+    @staticmethod
+    def get_counter(key: str, default: int = 0) -> int:
+        """读取指定计数器的当前值"""
+        return _counters.get(key, default)
+
+    async def set_counter(self, key: str, value: int):
+        """设置计数器为指定值(用于绝对值指标,如账号存活数、队列积压)"""
+        async with self._lock:
+            _counters[key] = value
+
     @staticmethod
     def snapshot() -> dict:
         """返回当前所有通用计数器的快照（副本）。"""
@@ -100,3 +124,20 @@ class SystemMetrics:
 
 
 metrics = SystemMetrics()
+
+
+async def start_counter_reporter(role: str, interval: float = 60.0):
+    """启动计数器定期上报任务(每 interval 秒将 _counters 写入 SQLite counter_snapshot)。
+
+    各 bot 进程在启动时调用此函数,实现跨进程计数器聚合。
+    mon_bot 通过 load_counter_snapshot() 读取全局聚合数据。
+    """
+    from database.cache_store import get_cache_store
+    while True:
+        try:
+            counters = SystemMetrics.snapshot()
+            if counters:
+                await get_cache_store().save_counter_snapshot(counters, role)
+        except Exception as e:
+            logger.debug(f"[metrics] counter report failed ({role}): {e}")
+        await asyncio.sleep(interval)

@@ -62,6 +62,8 @@ class MonBot:
         self._admin_bot = None
         self._admin_chat_id = settings.ADMIN_TELEGRAM_ID
         self._notify_cooldowns: dict[str, float] = {}
+        # A1: 告警状态追踪(每种告警独立冷却 + 恢复通知)
+        self._alert_states: dict[str, str] = {}  # alert_key -> "active"|"resolved"
         # P1-15:接入 run_all 的全局停止事件,确保 run_all 触发停止时 mon_bot 优雅退出,
         # 与其它 4 个 bot 行为一致。None 表示未注册(独立运行时仍可靠 self._running 退出)。
         self._stop_event: asyncio.Event | None = stop_event
@@ -220,6 +222,91 @@ class MonBot:
         except Exception as e:
             logger.warning(f"[Mon][Notify] 发送通知失败: {e}")
             return False  # 失败不设冷却，下次循环可重试
+
+    async def _check_alerts(self):
+        """A1: 端到端监控告警检查。
+
+        从 counter_snapshot 聚合各进程计数器,计算全局指标,
+        按 WARNING/CRITICAL 分级告警,支持恢复通知。
+        relay 存活统计由 idx_bot 上报到 counter_snapshot(跨进程)。
+        """
+        try:
+            store = get_cache_store()
+            # 1. 从 counter_snapshot 读取跨进程聚合计数器
+            aggregated = await store.load_counter_snapshot()
+            send_success = aggregated.get("dsp.send_success", 0)
+            send_fail = aggregated.get("dsp.send_fail", 0)
+            total_deliveries = send_success + send_fail
+            delivery_rate = (send_success / total_deliveries * 100) if total_deliveries > 0 else 100.0
+
+            # 2. 队列积压深度(共享 SQLite, 0 RU)
+            queue_backlog = await store.count_pending_jobs()
+
+            # 3. 账号存活率(从 counter_snapshot 读取 idx_bot 上报的数据)
+            alive = aggregated.get("relay.alive", 0)
+            total = aggregated.get("relay.total", 0)
+            survival_rate = (alive / total * 100) if total > 0 else 0.0
+
+            # 4. Bot 离线检测
+            stale_bots = metrics.get_stale_bots()
+
+            # ── 告警规则 ──
+            alerts_to_check = []
+
+            # 投递成功率(仅在有投递数据时检查,避免冷启动误报)
+            if total_deliveries >= 10:
+                if delivery_rate < 80:
+                    alerts_to_check.append(("delivery_rate", "CRITICAL",
+                        f"投递成功率严重偏低: {delivery_rate:.1f}% ({send_success}/{total_deliveries})"))
+                elif delivery_rate < 95:
+                    alerts_to_check.append(("delivery_rate", "WARNING",
+                        f"投递成功率偏低: {delivery_rate:.1f}% ({send_success}/{total_deliveries})"))
+
+            # 队列积压
+            if queue_backlog > 200:
+                alerts_to_check.append(("queue_backlog", "CRITICAL",
+                    f"队列积压严重: {queue_backlog} 个待处理任务"))
+            elif queue_backlog > 50:
+                alerts_to_check.append(("queue_backlog", "WARNING",
+                    f"队列积压偏高: {queue_backlog} 个待处理任务"))
+
+            # 账号存活率
+            if total > 0:
+                if survival_rate < 50:
+                    alerts_to_check.append(("account_survival", "CRITICAL",
+                        f"中继账号存活率严重偏低: {alive}/{total} ({survival_rate:.0f}%)"))
+                elif survival_rate < 80:
+                    alerts_to_check.append(("account_survival", "WARNING",
+                        f"中继账号存活率偏低: {alive}/{total} ({survival_rate:.0f}%)"))
+
+            # Bot 离线
+            if stale_bots:
+                alerts_to_check.append(("bot_stale", "CRITICAL",
+                    f"以下 Bot 离线超过 5 分钟: {', '.join(stale_bots)}"))
+
+            # ── 发送告警 + 恢复通知 ──
+            # 状态追踪只用 severity(不含变化的数值),避免每轮都因数值变化触发重复通知
+            active_keys = {a[0] for a in alerts_to_check}
+            severity_emoji = {"WARNING": "⚠️", "CRITICAL": "🚨"}
+
+            # 发送新告警(或严重级别变化时)
+            for alert_key, severity, message in alerts_to_check:
+                prev_severity = self._alert_states.get(alert_key)
+                if prev_severity != severity:
+                    emoji = severity_emoji.get(severity, "⚠️")
+                    # 通知首行用 alert_key 作为稳定事件标识(利于 _notify_admin 冷却)
+                    await self._notify_admin(f"{emoji} [{severity}] {alert_key}\n{message}")
+                    self._alert_states[alert_key] = severity
+
+            # 发送恢复通知(之前有告警但现在已恢复)
+            for alert_key in list(self._alert_states.keys()):
+                if alert_key not in active_keys:
+                    prev = self._alert_states.pop(alert_key, "")
+                    if prev:
+                        await self._notify_admin(f"✅ [恢复] {alert_key} 已恢复正常")
+
+        except Exception as e:
+            logger.warning(f"[Mon][Alerts] 告警检查异常: {e}")
 
     async def _handle_channel_ban(self, cell: dict, error: str):
         """处理频道封禁/丢失:通知管理员 + 尝试从备用池补充。
@@ -656,6 +743,10 @@ class MonBot:
                         await sync_dirty_cells_to_crdb()
                     except Exception as e:
                         logger.warning(f"[Mon] 脏数据同步异常: {e}")
+
+                # A1: 端到端监控告警(每 10 轮一次, ~10 分钟)
+                if self._cycle_count % 10 == 0:
+                    await self._check_alerts()
 
                 # 7. 报告当前拓扑状态(从缓存读取,不查 DB)
                 await self._report_status(all_cells)

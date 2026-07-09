@@ -1320,6 +1320,9 @@ async def _async_main():
     await _init()
     from database.cache_store import report_bot_heartbeat
     await report_bot_heartbeat("up_bot")
+    # A1: 启动计数器定期上报(跨进程聚合)
+    from utils.monitor import start_counter_reporter
+    asyncio.create_task(start_counter_reporter("up_bot"))
 
     logger.info("[Up] 启动上传机器人（Up Bot）...")
     app = Application.builder().token(TOKEN).build()
