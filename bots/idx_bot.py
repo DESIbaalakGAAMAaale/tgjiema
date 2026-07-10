@@ -1946,6 +1946,58 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                     return
         except Exception as e:
             logger.warning(f"[Idx][external] 中继返回False后重试系统码映射失败: {e}")
+
+        # ── 码已标记映射但实际映射不存在（脏标记）：清除标记并重试中继 ──
+        try:
+            from database.relay_db import get_relay_db
+            relay_db = await get_relay_db()
+            if relay_db and await relay_db.is_code_mapped(code):
+                logger.warning(f"[Idx][external] 检测到脏映射标记，清除并重试中继: code={code}")
+                await relay_db.unmark_code(code)
+                # 重试中继发送
+                retry_account = await relay_pool.get_best_account()
+                if retry_account:
+                    try:
+                        ok_retry = await retry_account.send_external_code(bot_username, code, user_id)
+                    except Exception as e:
+                        logger.warning(f"[Idx][external] 脏标记重试中继异常: {e}")
+                        ok_retry = False
+                    finally:
+                        await relay_pool.release_account(retry_account, 0)
+                    if ok_retry:
+                        await _enqueue_external(bot_username, user_id, code)
+                        await safe_reply_text(update.message, f"正在查询外部文件，请稍候查收。\n{remaining_info}")
+                        metrics.decode_count += 1
+                        await metrics.record_processed("idx_bot")
+                        return
+                    # 重试后再次检查映射
+                    system_code_retry2 = await get_system_code_for_external(code)
+                    if system_code_retry2:
+                        file_record_retry2 = await get_file_record_cached(system_code_retry2)
+                        if file_record_retry2:
+                            sr_channel = file_record_retry2.get("primary_channel_id") or await _get_storage_channel()
+                            sr_ids_str = file_record_retry2.get("batch_msg_ids") or ""
+                            if not isinstance(sr_ids_str, str):
+                                sr_ids_str = str(sr_ids_str)
+                            sr_msg_ids = [int(mid) for mid in sr_ids_str.split(",") if mid.strip().isdigit()]
+                            if not sr_msg_ids:
+                                sr_msg_ids = [file_record_retry2.get("primary_channel_msg_id")]
+                            sr_meta = file_record_retry2.get("batch_file_meta") or ""
+                            sr_protect = file_record_retry2.get("protect_content", False)
+                            await _dispatch_to_dsp(user_id, system_code_retry2, sr_channel, sr_msg_ids, sr_meta, sr_protect)
+                            await safe_reply_text(
+                                update.message,
+                                f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+                                reply_markup=InlineKeyboardMarkup([[
+                                    InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                                ]])
+                            )
+                            metrics.decode_count += 1
+                            await metrics.record_processed("idx_bot")
+                            return
+        except Exception as e:
+            logger.warning(f"[Idx][external] 脏映射标记清除重试失败: {e}")
+
         # 中继发送失败,继续回退到直接发送;配额暂不回滚(后续路径可能成功)
 
     try:
