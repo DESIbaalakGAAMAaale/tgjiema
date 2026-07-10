@@ -1011,8 +1011,14 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file_record = await get_file_record_cached(file_code)
         if not file_record:
-            await query.answer("文件记录不存在", show_alert=True)
-            return
+            # 外部码举报:查外部码→系统码映射,再用系统码查 file_record
+            from database import get_system_code_for_external
+            sys_code = await get_system_code_for_external(file_code)
+            if sys_code:
+                file_record = await get_file_record_cached(sys_code)
+            if not file_record:
+                await query.answer("文件记录不存在", show_alert=True)
+                return
     except Exception as e:
         logger.error(f"[Idx][report] 查询文件失败: {e}")
         await query.answer("系统繁忙，请稍后重试", show_alert=True)
@@ -1848,8 +1854,12 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             try:
                 await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str, protect_content)
                 # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
-                await safe_reply_text(update.message,
-                    f"文件 {code} 已缓存，正在发送，请查收。"
+                await safe_reply_text(
+                    update.message,
+                    f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                    ]])
                 )
                 metrics.decode_count += 1
                 await metrics.record_processed("idx_bot")
@@ -1920,8 +1930,12 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                     batch_file_meta_r = file_record_retry.get("batch_file_meta") or ""
                     protect_content_r = file_record_retry.get("protect_content", False)
                     await _dispatch_to_dsp(user_id, system_code_retry, storage_channel_r, msg_ids_r, batch_file_meta_r, protect_content_r)
-                    await safe_reply_text(update.message,
-                        f"文件 {code} 已缓存，正在发送，请查收。"
+                    await safe_reply_text(
+                        update.message,
+                        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                        ]])
                     )
                     metrics.decode_count += 1
                     await metrics.record_processed("idx_bot")
