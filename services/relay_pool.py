@@ -338,44 +338,34 @@ class RelayPool:
     async def get_pool_status(self) -> list[dict]:
         """获取账号池状态。
 
-        优先遍历内存中的 instances（含运行时状态 is_ready/is_busy）。
-        如果 instances 为空（如 admin_bot 进程未加载实例），则从 DB 读取账号列表，
-        返回基本信息（运行时状态标记为未知）。
+        以 DB 为真实来源，遍历 DB 中的所有账号，
+        内存中有对应 instance 的补充运行时状态（is_ready/is_busy），
+        没有的标记为未知（admin_bot 进程不加载实例，或新添加未同步）。
         """
         db = await get_relay_db()
-        status = []
+        # 从 DB 获取所有账号（真实来源）
+        try:
+            accounts = await db.get_active_accounts()
+        except Exception:
+            accounts = []
+        # 内存 instances 按 phone 索引，用于补充运行时状态
         async with self._lock:
-            instances_snapshot = list(self.instances)
-        for instance in instances_snapshot:
-            usage = await db.get_usage(instance.account_id)
+            inst_by_phone = {i.phone: i for i in self.instances}
+        status = []
+        for acct in accounts:
+            phone = acct["phone"]
+            inst = inst_by_phone.get(phone)
+            usage = await db.get_usage(acct["id"])
             status.append({
-                "phone": instance.phone,
-                "is_ready": instance.is_ready,
-                "is_busy": instance.is_busy,
-                "relay_user_id": instance.relay_user_id,
+                "phone": phone,
+                "is_ready": inst.is_ready if inst else False,
+                "is_busy": inst.is_busy if inst else False,
+                "relay_user_id": inst.relay_user_id if inst else None,
                 "today_requests": usage["today_requests"],
                 "total_requests": usage["total_requests"],
                 "avg_wait_ms": usage["avg_wait_ms"],
                 "last_request_at": usage["last_request_at"],
             })
-        # 内存实例为空时，从 DB 读取账号列表（admin_bot 进程不加载实例）
-        if not status:
-            try:
-                accounts = await db.get_active_accounts()
-            except Exception:
-                accounts = []
-            for acct in accounts:
-                usage = await db.get_usage(acct["id"])
-                status.append({
-                    "phone": acct["phone"],
-                    "is_ready": False,
-                    "is_busy": False,
-                    "relay_user_id": None,
-                    "today_requests": usage["today_requests"],
-                    "total_requests": usage["total_requests"],
-                    "avg_wait_ms": usage["avg_wait_ms"],
-                    "last_request_at": usage["last_request_at"],
-                })
         return status
 
     async def shutdown(self):
