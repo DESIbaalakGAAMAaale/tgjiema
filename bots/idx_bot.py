@@ -100,9 +100,6 @@ async def _relay_pending_cleanup(bot_username: str):
     await _dequeue_external(bot_username)
 
 _bot_last_request: dict[str, float] = {}
-# 脏标记检测冷却：code → 上次重试时间，避免同一码短期内重复触发中继重试
-_dirty_check_cooldown: dict[str, float] = {}
-_DIRTY_COOLDOWN_SEC = 300  # 5 分钟内同一码不重复重试中继
 
 
 async def _wait_bot_interval(bot_username: str):
@@ -2018,75 +2015,27 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         except Exception as e:
             logger.warning(f"[Idx][external] 中继返回False后重试系统码映射失败: {e}")
 
-        # ── 码已标记映射但实际映射不存在（脏标记）：清除标记并重试中继 ──
-        # 增加冷却时间，避免同一码短期内重复触发中继重试（防止循环）
+        # ── 中继已处理过该码（is_code_mapped=True）但映射尚未创建 ──
+        # 说明文件已存入频道，idx_bot 正在处理 pending 创建映射
+        # 不重试中继（避免重复请求第三方bot），通知用户稍后重试
+        # idx_bot 处理 pending 成功 → 映射创建 → 用户重试直接走映射
+        # idx_bot 处理 pending 失败 → unmark_code → 用户重试走中继重新获取
         try:
             from database.relay_db import get_relay_db
             relay_db = await get_relay_db()
             if relay_db and await relay_db.is_code_mapped(code):
-                # 冷却检查：5分钟内同一码不重复重试中继
-                last_retry = _dirty_check_cooldown.get(code, 0)
-                if time.time() - last_retry < _DIRTY_COOLDOWN_SEC:
-                    logger.warning(
-                        f"[Idx][external] 脏标记冷却中（{int(_DIRTY_COOLDOWN_SEC - (time.time() - last_retry))}s 后可重试）"
-                        f"，通知用户稍后重试: code={code}"
-                    )
-                    # 清除脏标记，让下次用户重试时能走正常中继流程
-                    await relay_db.unmark_code(code)
-                    if result.quota_consumed:
-                        from services.permission import refund_user_quota
-                        await refund_user_quota(user_id, is_external=True)
-                    await safe_reply_text(
-                        update.message,
-                        "文件正在处理中，请稍后重新发送该文件码获取文件。"
-                    )
-                    return
-                _dirty_check_cooldown[code] = time.time()
-                logger.warning(f"[Idx][external] 检测到脏映射标记，清除并重试中继: code={code}")
-                await relay_db.unmark_code(code)
-                # 重试中继发送
-                retry_account = await relay_pool.get_best_account()
-                if retry_account:
-                    try:
-                        ok_retry = await retry_account.send_external_code(bot_username, code, user_id)
-                    except Exception as e:
-                        logger.warning(f"[Idx][external] 脏标记重试中继异常: {e}")
-                        ok_retry = False
-                    finally:
-                        await relay_pool.release_account(retry_account, 0)
-                    if ok_retry:
-                        await _enqueue_external(bot_username, user_id, code)
-                        await safe_reply_text(update.message, f"正在查询外部文件，请稍候查收。\n{remaining_info}")
-                        metrics.decode_count += 1
-                        await metrics.record_processed("idx_bot")
-                        return
-                    # 重试后再次检查映射
-                    system_code_retry2 = await get_system_code_for_external(code)
-                    if system_code_retry2:
-                        file_record_retry2 = await get_file_record_cached(system_code_retry2)
-                        if file_record_retry2:
-                            sr_channel = file_record_retry2.get("primary_channel_id") or await _get_storage_channel()
-                            sr_ids_str = file_record_retry2.get("batch_msg_ids") or ""
-                            if not isinstance(sr_ids_str, str):
-                                sr_ids_str = str(sr_ids_str)
-                            sr_msg_ids = [int(mid) for mid in sr_ids_str.split(",") if mid.strip().isdigit()]
-                            if not sr_msg_ids:
-                                sr_msg_ids = [file_record_retry2.get("primary_channel_msg_id")]
-                            sr_meta = file_record_retry2.get("batch_file_meta") or ""
-                            sr_protect = file_record_retry2.get("protect_content", False)
-                            await _dispatch_to_dsp(user_id, system_code_retry2, sr_channel, sr_msg_ids, sr_meta, sr_protect)
-                            await safe_reply_text(
-                                update.message,
-                                f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
-                                reply_markup=InlineKeyboardMarkup([[
-                                    InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
-                                ]])
-                            )
-                            metrics.decode_count += 1
-                            await metrics.record_processed("idx_bot")
-                            return
+                logger.info(f"[Idx][external] 码已标记映射但映射尚未创建，文件处理中: code={code}")
+                # 回滚预扣配额
+                if result.quota_consumed:
+                    from services.permission import refund_user_quota
+                    await refund_user_quota(user_id, is_external=True)
+                await safe_reply_text(
+                    update.message,
+                    "文件正在处理中，请稍后重新发送该文件码获取文件。"
+                )
+                return
         except Exception as e:
-            logger.warning(f"[Idx][external] 脏映射标记清除重试失败: {e}")
+            logger.warning(f"[Idx][external] 检查 mapped_codes 失败: {e}")
 
         # 中继发送失败,继续回退到直接发送;配额暂不回滚(后续路径可能成功)
 
