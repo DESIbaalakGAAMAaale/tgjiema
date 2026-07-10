@@ -99,8 +99,6 @@ async def _cleanup_stale_pending():
 async def _relay_pending_cleanup(bot_username: str):
     await _dequeue_external(bot_username)
 
-_external_media_groups: dict[str, tuple[int, str, float]] = {}
-_MEDIA_GROUP_TTL = settings.EXTERNAL_MEDIA_GROUP_TTL
 _bot_last_request: dict[str, float] = {}
 
 
@@ -113,27 +111,6 @@ async def _wait_bot_interval(bot_username: str):
     if elapsed < interval:
         await asyncio.sleep(interval - elapsed)
     _bot_last_request[bot_username] = time.time()
-
-
-async def _track_external_media_group(media_group_id: str, user_id: int, code: str):
-    async with _ext_lock:
-        _external_media_groups[media_group_id] = (user_id, code, time.time())
-
-
-async def _get_external_media_group_user(media_group_id: str) -> tuple[int, str]:
-    async with _ext_lock:
-        entry = _external_media_groups.pop(media_group_id, None)
-        if entry and time.time() - entry[2] < _MEDIA_GROUP_TTL:
-            return entry[0], entry[1]
-        return None, None
-
-
-async def _cleanup_media_groups():
-    now = time.time()
-    async with _ext_lock:
-        stale = [k for k, v in _external_media_groups.items() if now - v[2] >= _MEDIA_GROUP_TTL]
-        for k in stale:
-            _external_media_groups.pop(k, None)
 
 
 _MEDIA_GROUP_BUFFER_WAIT = settings.MEDIA_GROUP_BUFFER_WAIT
@@ -559,7 +536,8 @@ async def _process_one_pending(app: Application, row: dict):
     pending_col = get_pending_uploads_col()
 
     if not uploader_id or not channel_id or not message_id:
-        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+        # 数据残缺，重试无意义，标记完成避免无限循环
+        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1, "claimed_at": 0}})
         return
 
     try:
@@ -571,7 +549,8 @@ async def _process_one_pending(app: Application, row: dict):
         except Exception as e:
             logger.warning(f"[Idx] 通知用户处理失败: {e}")
             pass
-        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+        # I-1: 瞬时失败，重置 claimed_at 让下轮重领（at-least-once）
+        await pending_col.update_one({"id": pend_id}, {"$set": {"claimed_at": 0}})
         return
 
     # 写入 file_records
@@ -608,7 +587,8 @@ async def _process_one_pending(app: Application, row: dict):
             await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试")
         except Exception:
             pass
-        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+        # I-1: 瞬时失败，重置 claimed_at 让下轮重领（at-least-once）
+        await pending_col.update_one({"id": pend_id}, {"$set": {"claimed_at": 0}})
         return
 
     # 写入 codes 表（含 expire_time，省一次 UPDATE）
@@ -714,18 +694,21 @@ async def _process_one_pending(app: Application, row: dict):
     except Exception as e:
         logger.error(f"[Idx][poll] 发送文件码失败 (code={file_code}): {e}")
 
-    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1}})
+    # I-1: 处理成功，置 processed=1 并清除 claimed_at
+    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1, "claimed_at": 0}})
     metrics.decode_count += 1
     await metrics.record_processed("idx_bot")
 
 
 async def _process_pending_uploads(app: Application):
     """处理 pending_uploads: 先查本地 SQLite 通知(0 RU),有信号才查 CRDB,并发处理多条。
-    S-2: 用 CAS 原子认领，避免多 worker 同时处理同一 pending → 重复生成码。
-    原子语义: UPDATE ... WHERE id=$1 AND processed=0 且仅当该行未被认领过。
+    I-1: at-least-once 语义。用 claimed_at 认领（不置 processed=1），
+    处理成功后才置 processed=1。认领后崩溃的记录由 _CLAIM_TIMEOUT 回收重领。
     """
     from database.cache_store import get_cache_store
     store = get_cache_store()
+
+    _CLAIM_TIMEOUT = 300.0  # 认领超 5 分钟未完成视为崩溃，可被重领
 
     while True:
         try:
@@ -735,9 +718,12 @@ async def _process_pending_uploads(app: Application):
             pending_col = get_pending_uploads_col()
             processed_any = False
             while True:
-                # 先查询候选行
+                # 查询未处理候选行：processed=0 且 claimed_at <= cutoff
+                # (claimed_at=0 未认领 → 0<=cutoff 恒真；已认领 → 仅超时才可重领)
+                now = time.time()
+                cutoff = now - _CLAIM_TIMEOUT
                 candidates = await pending_col.find(
-                    {"processed": 0},
+                    {"processed": 0, "claimed_at": {"$lte": cutoff}},
                     limit=10,
                     projection=["id", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
                                 "file_types", "batch_msg_ids", "batch_file_meta", "note",
@@ -751,10 +737,10 @@ async def _process_pending_uploads(app: Application):
                 tasks = []
                 for row in candidates:
                     pend_id = row["id"]
-                    # S-2: CAS 原子认领：仅当 processed 仍为 0 时标记为 1，只有一个 worker 能成功
+                    # I-1: CAS 原子认领：仅当 claimed_at 仍 <= cutoff，才设置 claimed_at=now
                     result = await pending_col.update_one(
-                        {"id": pend_id, "processed": 0},
-                        {"$set": {"processed": 1}}
+                        {"id": pend_id, "processed": 0, "claimed_at": {"$lte": cutoff}},
+                        {"$set": {"claimed_at": now}}
                     )
                     # 认领成功才处理
                     if result and result.matched_count > 0:
@@ -2048,6 +2034,10 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     user = update.effective_user
 
+    # I-2: 批量取件与单码路径对齐，补 force-join 校验
+    if not await check_force_join(update, context):
+        return
+
     # 限流与用户初始化(整批只做一次,避免逐码重复消耗限流令牌)
     if not await global_rate_limiter.acquire():
         await safe_reply_text(update.message, "系统繁忙，请稍后重试")
@@ -2335,7 +2325,9 @@ async def _async_main():
             mg_id = update.message.media_group_id
             if mg_id:
                 caption = (update.message.caption or "").strip()
-                if mg_id not in _media_group_buffer:
+                # I-3: 已有 buffer 直接追加，无 buffer 才进入创建路径
+                buf = _media_group_buffer.get(mg_id)
+                if buf is None:
                     user_id = None
                     code = None
                     source = None
@@ -2355,12 +2347,17 @@ async def _async_main():
                             user_id, code = await _dequeue_external(bot_username)
                     if not user_id or not code:
                         return
-                    timer = create_safe_task(_flush_media_group_buffer(mg_id), name=f"flush-mg-{mg_id}")
-                    _media_group_buffer[mg_id] = {
-                        "source": source, "bot": context.bot, "msgs": [],
-                        "user_id": user_id, "code": code, "timer": timer,
-                    }
-                _media_group_buffer[mg_id]["msgs"].append(
+                    # I-3: 用锁保护 check-then-act，防止同组消息并发创建多个 buffer/timer
+                    async with _ext_lock:
+                        buf = _media_group_buffer.get(mg_id)
+                        if buf is None:
+                            timer = create_safe_task(_flush_media_group_buffer(mg_id), name=f"flush-mg-{mg_id}")
+                            buf = {
+                                "source": source, "bot": context.bot, "msgs": [],
+                                "user_id": user_id, "code": code, "timer": timer,
+                            }
+                            _media_group_buffer[mg_id] = buf
+                buf["msgs"].append(
                     (update.message.chat_id, update.message.message_id, caption)
                 )
                 return
@@ -2383,7 +2380,6 @@ async def _async_main():
     async def cleanup_loop():
         while True:
             await _cleanup_stale_pending()
-            await _cleanup_media_groups()
             await asyncio.sleep(60)
 
     create_safe_task(health_ping(), name="health-ping")

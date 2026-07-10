@@ -2516,23 +2516,32 @@ class DecodeLogBuffer:
         self._db = db
 
     async def insert(self, entry: dict):
-        """写入本地缓冲表（零 RU）"""
+        """写入本地缓冲表（零 RU）。SQLite WAL 模式下并发写可能 'database is locked'，重试即可。"""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT INTO decode_log_buffer "
-            "(file_code, requester_id, request_time, status, source_channel_id, buffered_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                entry["file_code"],
-                entry["requester_id"],
-                entry.get("request_time"),
-                entry.get("status", "queued"),
-                entry.get("source_channel_id"),
-                time.time(),
-            ),
-        )
-        await self._db.commit()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT INTO decode_log_buffer "
+                    "(file_code, requester_id, request_time, status, source_channel_id, buffered_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        entry["file_code"],
+                        entry["requester_id"],
+                        entry.get("request_time"),
+                        entry.get("status", "queued"),
+                        entry.get("source_channel_id"),
+                        time.time(),
+                    ),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.2)
+                    continue
+                logger.debug(f"[DecodeLogBuffer] insert 失败(非致命): {e}")
+                return
 
     async def close(self):
         pass
@@ -2548,15 +2557,24 @@ class CodeChangeBuffer:
         self._db = db
 
     async def insert(self, code: str, change_type: str, new_value: str, uploader_id: int):
-        """写入变更缓冲（零 CRDB RU）"""
+        """写入变更缓冲（零 CRDB RU）。SQLite WAL 模式下并发写可能 'database is locked'，重试即可。"""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT INTO code_changes (code, change_type, new_value, uploader_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (code, change_type, new_value, uploader_id, time.time()),
-        )
-        await self._db.commit()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT INTO code_changes (code, change_type, new_value, uploader_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (code, change_type, new_value, uploader_id, time.time()),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.2)
+                    continue
+                logger.debug(f"[CodeChangeBuffer] insert 失败(非致命): {e}")
+                return
 
     async def get_unsynced(self, limit: int = 100) -> list[dict]:
         """获取未同步的变更记录"""
