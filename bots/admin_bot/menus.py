@@ -119,14 +119,16 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
 
     if menu_id == "code_route":
         text = (
-            "🗺️ 文件码前缀路由\n\n"
-            "当第三方机器人迁移后，可通过此功能将特定前缀的文件码\n"
-            "路由到指定的新机器人解码。\n\n"
+            "🗺️ 文件码路由\n\n"
+            "前缀路由：按文件码开头的前缀匹配（如 qqfile 开头）\n"
+            "正则路由：按正则表达式匹配（用于 40位hash / emoji 等非前缀式码）\n\n"
             "点击下方按钮开始操作："
         )
         kb = [
-            [InlineKeyboardButton("➕ 新增路由", callback_data="interactive:add_code_route"),
-             InlineKeyboardButton("➖ 删除路由", callback_data="interactive:remove_code_route")],
+            [InlineKeyboardButton("➕ 新增前缀路由", callback_data="interactive:add_code_route"),
+             InlineKeyboardButton("➖ 删除前缀路由", callback_data="interactive:remove_code_route")],
+            [InlineKeyboardButton("➕ 新增正则路由", callback_data="interactive:add_code_route_regex"),
+             InlineKeyboardButton("➖ 删除正则路由", callback_data="interactive:remove_code_route_regex")],
             [InlineKeyboardButton("📋 查看路由表", callback_data="action:code_routes")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)

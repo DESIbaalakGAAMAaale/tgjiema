@@ -1418,7 +1418,10 @@ async def _refresh_bot_config_cache():
         _bot_decode_interval_cache = intervals
         _bot_decode_interval_cache_ts = _time.time()
 
-        logger.debug(f"[ConfigCache] 已刷新 {len(routes)} routes, {len(intervals)} intervals")
+        # 刷新正则路由缓存
+        await _refresh_code_bot_routes_regex_cache()
+
+        logger.debug(f"[ConfigCache] 已刷新 {len(routes)} routes, {len(intervals)} intervals, {len(_code_bot_routes_regex_cache)} regex routes")
     except Exception as e:
         logger.warning(f"[ConfigCache] 刷新失败: {e}")
 
@@ -1462,6 +1465,117 @@ async def resolve_bot_for_code(code: str, default_bot: str) -> str:
             best_prefix = prefix
             best_bot = bot_username
     return best_bot or default_bot
+
+
+# ─── 文件码正则 → Bot 路由 ──────────────────────────────────────
+# 用于第三方码格式不规则（40位hash / emoji / 其他非前缀式）时按正则匹配路由。
+# config_key 命名: code_bot_route_regex:<id>  其中 <id> 为自增整数序号
+# config_value 格式: "<bot_username>\t<regex_pattern>"  (tab 分隔)
+# 内存缓存: _code_bot_routes_regex_cache: list[tuple[str, str]]  (bot, pattern)
+# _code_bot_routes_regex_cache_ts 与 _code_bot_routes_cache_ts 共享 TTL
+
+_code_bot_routes_regex_cache: list[tuple[str, str]] = []
+
+
+async def _refresh_code_bot_routes_regex_cache():
+    """从 DB 加载正则路由到内存缓存。在 _refresh_bot_config_cache 中调用。"""
+    global _code_bot_routes_regex_cache
+    try:
+        items: list[tuple[str, str]] = []
+        rows = await _backup_config_col.find({"config_key": {"$regex": "code_bot_route_regex:"}})
+        for row in rows:
+            val = row.get("config_value", "")
+            if not val or "\t" not in val:
+                continue
+            bot_username, pattern = val.split("\t", 1)
+            if bot_username and pattern:
+                items.append((bot_username, pattern))
+        _code_bot_routes_regex_cache = items
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[ConfigCache] 正则路由刷新失败: {e}")
+
+
+async def set_code_bot_route_regex(pattern: str, bot_username: str) -> int:
+    """新增一条正则路由，返回分配的 id。pattern 可带锚点也可不带。"""
+    import re as _re
+    # 校验正则可编译
+    try:
+        _re.compile(pattern)
+    except _re.error as e:
+        raise ValueError(f"正则表达式无效: {e}")
+    # 自增 id: 扫描现有最大序号
+    existing = await _backup_config_col.find({"config_key": {"$regex": "code_bot_route_regex:"}})
+    max_id = 0
+    for row in existing:
+        key = row.get("config_key", "")
+        try:
+            n = int(key.replace("code_bot_route_regex:", ""))
+            if n > max_id:
+                max_id = n
+        except ValueError:
+            pass
+    new_id = max_id + 1
+    val = f"{bot_username}\t{pattern}"
+    await _set_config(f"code_bot_route_regex:{new_id}", val)
+    _code_bot_routes_regex_cache.append((bot_username, pattern))
+    return new_id
+
+
+async def delete_code_bot_route_regex(route_id: int) -> bool:
+    """删除指定 id 的正则路由。返回是否删除成功。"""
+    key = f"code_bot_route_regex:{route_id}"
+    existing = await _backup_config_col.find_one({"config_key": key})
+    if not existing:
+        return False
+    await _backup_config_col.update_one(
+        {"config_key": key},
+        {"$set": {"config_value": "", "updated_at": ""}},
+    )
+    # 重新加载缓存（移除被删除项）
+    await _refresh_code_bot_routes_regex_cache()
+    return True
+
+
+async def get_all_code_bot_routes_regex() -> list[tuple[int, str, str]]:
+    """获取所有正则路由: [(id, bot_username, pattern), ...]"""
+    global _code_bot_routes_regex_cache, _code_bot_routes_cache_ts
+    if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
+        await _refresh_bot_config_cache()
+    result: list[tuple[int, str, str]] = []
+    rows = await _backup_config_col.find({"config_key": {"$regex": "code_bot_route_regex:"}})
+    for row in rows:
+        key = row.get("config_key", "")
+        val = row.get("config_value", "")
+        if not val or "\t" not in val:
+            continue
+        try:
+            n = int(key.replace("code_bot_route_regex:", ""))
+        except ValueError:
+            continue
+        bot_username, pattern = val.split("\t", 1)
+        if bot_username and pattern:
+            result.append((n, bot_username, pattern))
+    return result
+
+
+async def resolve_bot_for_code_regex(code: str) -> str | None:
+    """按正则路由匹配文件码，返回第一个命中的 bot_username，未命中返回 None。
+
+    使用 re.search 匹配，若 pattern 带 ^ $ 锚点则按全文匹配。
+    遍历顺序按 id 升序（先添加的优先）。
+    """
+    import re as _re
+    global _code_bot_routes_regex_cache, _code_bot_routes_cache_ts
+    if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
+        await _refresh_bot_config_cache()
+    for bot_username, pattern in _code_bot_routes_regex_cache:
+        try:
+            if _re.search(pattern, code):
+                return bot_username
+        except Exception:
+            continue
+    return None
 
 
 # ─── Bot 解码间隔限流 ────────────────────────────────────────────

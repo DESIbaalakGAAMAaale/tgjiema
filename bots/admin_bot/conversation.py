@@ -12,6 +12,7 @@ from database import (
     get_users_col, get_file_records_col,
     set_config,
     set_code_bot_route, delete_code_bot_route,
+    set_code_bot_route_regex, delete_code_bot_route_regex,
     add_spare_channel, remove_spare,
     set_rotation_config,
     update_user_and_invalidate,
@@ -144,6 +145,33 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         prefix = text.lower()
         await delete_code_bot_route(prefix)
         await _end(f"✅ 文件码前缀路由已删除:`{prefix}`")
+
+    # ─── 文件码正则路由（用于 40位hash / emoji 等非前缀式第三方码）───
+    elif state == "add_code_route_regex:pattern":
+        await _ask("add_code_route_regex:bot",
+                    f"✅ 正则已记录:`{text}`\n\n请输入目标机器人用户名（不需要 @）：",
+                    {"pattern": text})
+
+    elif state == "add_code_route_regex:bot":
+        bot_username = text.lstrip("@").lower()
+        pattern = data["pattern"]
+        try:
+            route_id = await set_code_bot_route_regex(pattern, bot_username)
+            await _end(f"✅ 文件码正则路由已设置 (id={route_id})\n  正则:`{pattern}`\n  目标机器人:@{bot_username}")
+        except ValueError as e:
+            await _end(f"❌ 设置失败:{e}")
+
+    elif state == "remove_code_route_regex:id":
+        try:
+            route_id = int(text.strip())
+        except ValueError:
+            await _end("❌ ID 格式无效，请输入数字。")
+            return
+        ok = await delete_code_bot_route_regex(route_id)
+        if ok:
+            await _end(f"✅ 正则路由已删除 (id={route_id})")
+        else:
+            await _end(f"❌ 未找到 id={route_id} 的正则路由")
 
     # ─── Bot 解码间隔 ────────────────────────────────────────────
     elif state == "set_bot_interval:bot":

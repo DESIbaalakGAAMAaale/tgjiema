@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     COCKROACHDB_URL: str = ""
 
     FORCE_JOIN_CHANNEL_ID: int = 0         # 强制关注频道ID（admin_bot 可热更新）
-    FORCE_JOIN_CHANNEL_LINK: str = ""      # 强制关注频道链接
+    FORCE_JOIN_CHANNEL_LINK: str = ""      # 强制关注频道链接（兼作官方频道地址）
 
     UPLOAD_BOT_USERNAME: str = ""
     DECODER_BOT_USERNAME: str = ""

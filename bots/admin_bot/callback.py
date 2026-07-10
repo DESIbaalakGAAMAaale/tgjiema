@@ -5,6 +5,7 @@ from loguru import logger
 from database import (
     get_file_records_col,
     get_all_code_bot_routes,
+    get_all_code_bot_routes_regex,
     get_all_bot_decode_intervals,
     list_spare_pool,
     get_rotation_config,
@@ -127,12 +128,21 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "action:code_routes":
         routes = await get_all_code_bot_routes()
-        if not routes:
-            text = "📭 尚未配置文件码前缀路由。"
+        regex_routes = await get_all_code_bot_routes_regex()
+        if not routes and not regex_routes:
+            text = "📭 尚未配置文件码路由。"
         else:
-            text = "🗺️ 文件码前缀路由表\n\n"
-            for prefix in sorted(routes.keys()):
-                text += f"  • `{prefix}` → @{routes[prefix]}\n"
+            text = "🗺️ 文件码路由表\n\n"
+            if routes:
+                text += "【前缀路由】\n"
+                for prefix in sorted(routes.keys()):
+                    text += f"  • `{prefix}` → @{routes[prefix]}\n"
+            if regex_routes:
+                if routes:
+                    text += "\n"
+                text += "【正则路由】\n"
+                for rid, bot, pattern in regex_routes:
+                    text += f"  • [{rid}] `{pattern}` → @{bot}\n"
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:bot_intervals":
@@ -193,6 +203,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "remove_code_route": (
                 "remove_code_route:prefix",
                 "🗺️ 删除文件码前缀路由\n\n请输入要删除的路由前缀（例如：qqfile）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "add_code_route_regex": (
+                "add_code_route_regex:pattern",
+                "🗺️ 新增文件码正则路由\n\n"
+                "用于 40位hash / emoji 等非前缀式第三方码。\n\n"
+                "请输入正则表达式（例如：^[a-f0-9]{40}$）：\n\n"
+                "❌ 如需取消请点击下方按钮。"
+            ),
+            "remove_code_route_regex": (
+                "remove_code_route_regex:id",
+                "🗺️ 删除文件码正则路由\n\n请输入要删除的路由 ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
             ),
             # Bot限流
             "set_bot_interval": (

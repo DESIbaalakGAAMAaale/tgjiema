@@ -373,7 +373,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
     except Exception as e:
         logger.error(f"[Idx][start] 创建用户失败 (user={user.id}): {e}")
-        await safe_reply_text(update.message, "系统繁忙,请稍后重试")
+        await safe_reply_text(update.message, "系统繁忙，请稍后重试")
         return
 
     # 标记用户已启动 idx bot
@@ -382,10 +382,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await store.mark_user_started(user.id, "idx")
 
     await safe_reply_text(update.message,
-        "欢迎使用文件解码机器\n\n"
+        "👋 欢迎使用文件解码机器人\n\n"
         "发送文件码即可获取对应文件。\n"
-        "发/status 查看您的会员状态和今日剩余解码次数。\n"
-        "发/help 查看帮助信息\n"
+        "发送 /status 查看您的会员状态和今日剩余解码次数。\n"
+        "发送 /help 查看帮助信息\n"
         + three_bot_reminder()
     )
 
@@ -419,22 +419,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
+    channel_link = settings.FORCE_JOIN_CHANNEL_LINK
+    contact_line = f"\n\n如有问题请联系管理员或访问官方频道：{channel_link}" if channel_link else "\n\n如有问题请联系管理员"
     await safe_reply_text(update.message,
-        "文件解码机器使用帮助\n\n"
-        "1. 获取文件:直接发送文件码即可获取文件。\n"
-        "2. 上传文件:请使用上传机器人发送文上传后会自动收到文件码。\n"
-        "3. 分享文件:将文件码分享给其他用对方发送给我即可获取文件。\n\n"
-        "会员权益:\n"
-        f"- 免费用户:每日解码 {settings.FREE_DAILY_QUOTA} 仅限本系统文件码\n"
-        f"- 基础会员:每日解码 {settings.BASIC_DAILY_QUOTA} 可上可解码非本系统文件码\n"
-        f"- 高级会员:无限解码,可上可解码非本系统文件码\n\n"
-        "文件码格式说\n"
-        "码的开头即对应机器人的用户Telegram 机器人必须以 bot 结尾)。\n"
-        f"本系统码{settings.FILE_CODE_PREFIX}_a1b2c3d4e5f6_3p_2v_1d\n"
-        "外部码如:QQfile2_bot:qq10ad1e0200_6V\n"
-        "系统会根_bot 自动识别目标机器人并路由解码。\n\n"
-        "文件码永久有不会过期。\n\n"
-        "如有问题请联系管理员"
+        "📁 文件解码机器人使用帮助\n\n"
+        "1. 获取文件：直接发送文件码即可获取对应文件。\n"
+        "2. 上传文件：请使用上传机器人发送文件，上传后会自动收到文件码。\n"
+        "3. 分享文件：将文件码分享给其他用户，对方发送给我即可获取文件。\n\n"
+        "会员权益：\n"
+        f"- 免费用户：每日解码 {settings.FREE_DAILY_QUOTA} 次，仅限本系统文件码\n"
+        f"- 基础会员：每日解码 {settings.BASIC_DAILY_QUOTA} 次，可解码非本系统文件码\n"
+        f"- 高级会员：无限解码，可解码非本系统文件码\n"
+        + contact_line
     )
 
 
@@ -446,7 +442,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_user = await get_or_create_user(user.id)
     except Exception as e:
         logger.error(f"[Idx][status] 获取用户信息失败: {e}")
-        await safe_reply_text(update.message, "系统繁忙,无法获取用户信息,请稍后重试")
+        await safe_reply_text(update.message, "系统繁忙，无法获取用户信息，请稍后重试")
         return
     level_map = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
     level_name = level_map.get(db_user.get("membership_level"), "未知")
@@ -493,11 +489,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ext_str = f"{max(0, ext_quota - ext_used)}/{ext_quota}"
 
     await safe_reply_text(update.message,
-        f"用户状态\n"
-        f"会员等级:{level_name}\n"
-        f"今日剩余解码次数:{quota_str}\n"
-        f"上传权限:{'有' if db_user.get('can_upload') else '无'}\n"
-        f"外部码解码配{ext_str}"
+        f"📊 用户状态\n"
+        f"会员等级：{level_name}\n"
+        f"今日剩余解码次数：{quota_str}\n"
+        f"上传权限：{'有' if db_user.get('can_upload') else '无'}\n"
+        f"外部码解码配额：{ext_str}"
     )
 
 
@@ -812,10 +808,10 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if not await global_rate_limiter.acquire():
-        await safe_reply_text(update.message, "系统繁忙,请稍后重试")
+        await safe_reply_text(update.message, "系统繁忙，请稍后重试")
         return
     if not await user_rate_limiter.acquire(user.id):
-        await safe_reply_text(update.message, "操作过于频繁,请稍后重试")
+        await safe_reply_text(update.message, "操作过于频繁，请稍后重试")
         return
 
     # ── 动态限速：根据 jobs 队列长度自动调节 ──
@@ -859,7 +855,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 合集中的文件码可能本身也是合集 — 不递归处理,直接按普通码派发。
     if result.is_collection:
         sub_codes = result.collection_codes or []
-        await safe_reply_text(update.message, f"📦 合集包含 {len(sub_codes)} 个文件,正在批量发送...")
+        await safe_reply_text(update.message, f"📦 合集包含 {len(sub_codes)} 个文件，正在批量发送...")
         sub_ok = 0
         sub_fail = 0
         for sub_code in sub_codes:
@@ -908,9 +904,9 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         metrics.decode_count += 1
         await metrics.record_processed("idx_bot")
         if sub_ok == 0:
-            await safe_reply_text(update.message, f"❌ 合集中 {sub_fail} 个文件全部失败,已退回配额")
+            await safe_reply_text(update.message, f"❌ 合集中 {sub_fail} 个文件全部失败，已退回配额")
         else:
-            await safe_reply_text(update.message, f"📦 合集发送完成: 成功 {sub_ok} 个,失败 {sub_fail} 个")
+            await safe_reply_text(update.message, f"📦 合集发送完成：成功 {sub_ok} 个，失败 {sub_fail} 个")
         return
 
     storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
@@ -966,7 +962,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply_text(
         update.message,
-        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
+        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{text}")
         ]])
@@ -1074,15 +1070,15 @@ def _format_code_status(code_entry: dict) -> str:
     note = code_entry.get("note", "")
     expire_time = code_entry.get("expire_time", "")
 
-    parts = [f"   状态: {status_icon} {status_text}"]
+    parts = [f"   状态：{status_icon} {status_text}"]
     if note:
         # 截断过长的备注
         display_note = note[:20] + ("..." if len(note) > 20 else "")
-        parts.append(f"备注: {display_note}")
+        parts.append(f"备注：{display_note}")
     if expire_time:
         try:
             exp_dt = datetime.datetime.fromisoformat(expire_time)
-            parts.append(f"到期: {exp_dt.strftime('%Y-%m-%d')}")
+            parts.append(f"到期：{exp_dt.strftime('%Y-%m-%d')}")
         except (ValueError, TypeError):
             pass
 
@@ -1231,24 +1227,24 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
     detail_lines = [
         "📋 文件码详情",
         "",
-        f"码: {code}",
-        f"状态: {status_text}",
+        f"码：{code}",
+        f"状态：{status_text}",
     ]
     if note:
-        detail_lines.append(f"备注: {note}")
+        detail_lines.append(f"备注：{note}")
     if expire_time:
         try:
             exp_dt = datetime.datetime.fromisoformat(expire_time)
-            detail_lines.append(f"有效期: {exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            detail_lines.append(f"有效期：{exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
         except (ValueError, TypeError):
-            detail_lines.append(f"有效期: {expire_time}")
+            detail_lines.append(f"有效期：{expire_time}")
     if created_at:
         try:
             cr_dt = datetime.datetime.fromisoformat(created_at)
-            detail_lines.append(f"上传时间: {cr_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            detail_lines.append(f"上传时间：{cr_dt.strftime('%Y-%m-%d %H:%M:%S')}")
         except (ValueError, TypeError):
-            detail_lines.append(f"上传时间: {created_at}")
-    detail_lines.append(f"文件类型: {type_text}")
+            detail_lines.append(f"上传时间：{created_at}")
+    detail_lines.append(f"文件类型：{type_text}")
 
     # 构建操作按钮
     kb = [
@@ -1313,7 +1309,7 @@ async def my_code_edit_note_callback(update: Update, context: ContextTypes.DEFAU
     old_note = code_entry.get("note", "")
     await query.edit_message_text(
         f"📝 修改备注\n\n"
-        f"当前备注: {old_note if old_note else '(空)'}\n\n"
+        f"当前备注：{old_note if old_note else '（空）'}\n\n"
         f"请输入新备注（发送 /cancel 取消）",
     )
 
@@ -1497,7 +1493,7 @@ async def my_code_set_access_limit_callback(update: Update, context: ContextType
 
     await query.edit_message_text(
         f"📋 设置访问次数限制\n\n"
-        f"当前限制: {current_text}\n\n"
+        f"当前限制：{current_text}\n\n"
         f"请输入最大访问次数（0=不限制）：\n"
         f"（发送 /cancel 取消）"
     )
@@ -1541,7 +1537,7 @@ async def my_code_toggle_status_callback(update: Update, context: ContextTypes.D
 
     await query.edit_message_text(
         f"⚠️ 确认{action_text}\n\n"
-        f"文件码: {code}\n"
+        f"文件码：{code}\n"
         f"此操作后其他人将无法解码此文件。\n\n"
         f"确定要继续吗？",
         reply_markup=InlineKeyboardMarkup(kb),
@@ -1664,13 +1660,13 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
     stats_lines = [
         "📊 文件码统计",
         "",
-        f"码: {code}",
-        f"总解码次数: {decode_count}",
+        f"码：{code}",
+        f"总解码次数：{decode_count}",
     ]
     if last_decode:
         try:
             dt = datetime.datetime.fromisoformat(last_decode)
-            stats_lines.append(f"最近解码: {dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            stats_lines.append(f"最近解码：{dt.strftime('%Y-%m-%d %H:%M:%S')}")
         except (ValueError, TypeError):
             pass
 
@@ -1720,7 +1716,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         # E7: 失效用户码列表缓存
         from database.cache import invalidate_user_codes
         invalidate_user_codes(user.id)
-        await update.message.reply_text(f"✅ 备注已更新为: {text}")
+        await update.message.reply_text(f"✅ 备注已更新为：{text}")
 
     elif action == "set_expiry_custom":
         try:
@@ -1776,7 +1772,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
             logger.warning(f"[Idx] 同步 max_requests 到本地缓存失败 code={code}: {e}")
 
         limit_text = f"{max_req} 次" if max_req > 0 else "不限制"
-        await update.message.reply_text(f"✅ 访问次数限制已设置为: {limit_text}")
+        await update.message.reply_text(f"✅ 访问次数限制已设置为：{limit_text}")
 
     context.user_data.pop("_manage_code", None)
     context.user_data.pop("_manage_action", None)
@@ -1856,7 +1852,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                 # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
                 await safe_reply_text(
                     update.message,
-                    f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
+                    f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
                     ]])
@@ -1909,7 +1905,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         if ok:
             await _enqueue_external(bot_username, user_id, code)
             # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
-            await safe_reply_text(update.message, f"正在查询外部文件请稍候查收。\n{remaining_info}")
+            await safe_reply_text(update.message, f"正在查询外部文件，请稍候查收。\n{remaining_info}")
             metrics.decode_count += 1
             await metrics.record_processed("idx_bot")
             return
@@ -1932,7 +1928,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                     await _dispatch_to_dsp(user_id, system_code_retry, storage_channel_r, msg_ids_r, batch_file_meta_r, protect_content_r)
                     await safe_reply_text(
                         update.message,
-                        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你请查收。",
+                        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
                         reply_markup=InlineKeyboardMarkup([[
                             InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
                         ]])
@@ -1948,7 +1944,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         await safe_send_message(context.bot, chat_id=bot_username, text=code)
         await _enqueue_external(bot_username, user_id, code)
         # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
-        await safe_reply_text(update.message, f"正在查询外部文件请稍候查收。\n{remaining_info}")
+        await safe_reply_text(update.message, f"正在查询外部文件，请稍候查收。\n{remaining_info}")
         metrics.decode_count += 1
         await metrics.record_processed("idx_bot")
     except Exception as e:
@@ -2054,15 +2050,15 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 限流与用户初始化(整批只做一次,避免逐码重复消耗限流令牌)
     if not await global_rate_limiter.acquire():
-        await safe_reply_text(update.message, "系统繁忙,请稍后重试")
+        await safe_reply_text(update.message, "系统繁忙，请稍后重试")
         return
     if not await user_rate_limiter.acquire(user.id):
-        await safe_reply_text(update.message, "操作过于频繁,请稍后重试")
+        await safe_reply_text(update.message, "操作过于频繁，请稍后重试")
         return
     await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
     await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
 
-    await safe_reply_text(update.message, f"🔄 正在处理 {len(codes)} 个文件码,请稍候...")
+    await safe_reply_text(update.message, f"🔄 正在处理 {len(codes)} 个文件码，请稍候...")
 
     success_codes: list[str] = []
     failed_codes: list[tuple[str, str]] = []
@@ -2185,13 +2181,13 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
             failed_codes.append((code, "处理异常"))
 
     # ── 汇总结果 ──
-    summary_lines = [f"📦 批量取件完成(共 {len(codes)} 个):"]
+    summary_lines = [f"📦 批量取件完成（共 {len(codes)} 个）："]
     if success_codes:
-        summary_lines.append(f"✅ 成功 {len(success_codes)} 个: {', '.join(success_codes)}")
+        summary_lines.append(f"✅ 成功 {len(success_codes)} 个：{', '.join(success_codes)}")
     if failed_codes:
-        summary_lines.append(f"❌ 失败 {len(failed_codes)} 个:")
+        summary_lines.append(f"❌ 失败 {len(failed_codes)} 个：")
         for fc, reason in failed_codes:
-            summary_lines.append(f"  • {fc}: {reason}")
+            summary_lines.append(f"  • {fc}：{reason}")
     await safe_reply_text(update.message, "\n".join(summary_lines))
     await metrics.record_processed("idx_bot")
 
@@ -2220,7 +2216,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     valid_codes = [t for t in tokens if is_valid_code_format(t)]
     if len(valid_codes) > 1:
         if len(valid_codes) > 10:
-            await safe_reply_text(update.message, f"⚠️ 批量取件最多支持 10 个文件码,您发送了 {len(valid_codes)} 个,将只处理前 10 个")
+            await safe_reply_text(update.message, f"⚠️ 批量取件最多支持 10 个文件码，您发送了 {len(valid_codes)} 个，将只处理前 10 个")
             valid_codes = valid_codes[:10]
         await _handle_batch_codes(update, context, valid_codes)
         return
@@ -2275,6 +2271,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 create_safe_task(save_code_bot_mapping(clean_text, best_bot), name="save_code_bot_mapping")
                 await handle_code(update, context)
                 return
+
+        # ── 正则路由匹配：用于 40位hash / emoji / 其他非前缀式第三方码 ──
+        from database import resolve_bot_for_code_regex
+        regex_bot = await resolve_bot_for_code_regex(clean_text)
+        if regex_bot:
+            logger.info(f"[Idx] 正则路由匹配: code={clean_text}, bot={regex_bot}")
+            context.user_data["_original_external_code"] = clean_text
+            context.user_data["_extracted_bot"] = regex_bot
+            context.user_data["_override_text"] = f"{regex_bot}:{clean_text}"
+            create_safe_task(save_code_bot_mapping(clean_text, regex_bot), name="save_code_bot_mapping")
+            await handle_code(update, context)
+            return
 
 
 # ─── 运行 ───

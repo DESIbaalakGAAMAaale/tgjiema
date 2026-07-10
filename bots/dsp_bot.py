@@ -843,9 +843,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[Dsp][start] 用户 {user.id} 已启动，waiting_start jobs 已恢复({len(reactivated_ids)}个)")
 
     await safe_reply_text(update.message,
-        "欢迎使用文件发送机器人!\n\n"
-        "此机器人用于接收解码后的文件,无需手动操作。\n"
-        "当您通过解码机器人获取文件码后,文件会自动发送给您。"
+        "📥 欢迎使用文件发送机器人！\n\n"
+        "此机器人用于接收解码后的文件，无需手动操作。\n"
+        "当您通过解码机器人获取文件码后，文件会自动发送给您。"
         + three_bot_reminder()
     )
 
@@ -881,14 +881,14 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with _pg_lock:
         state = _pagination_states.get(page_key)
     if not state:
-        await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
+        await query.answer("会话已过期，请重新发送文件码。", show_alert=True)
         return
 
     # 检查 TTL
     if time.time() - state.get("created_at", 0) > _PAGE_STATE_TTL:
         async with _pg_lock:
             _pagination_states.pop(page_key, None)
-        await query.answer("会话已过期,请重新发送文件码。", show_alert=True)
+        await query.answer("会话已过期，请重新发送文件码。", show_alert=True)
         return
 
     file_meta_list = state["batch_file_meta"]

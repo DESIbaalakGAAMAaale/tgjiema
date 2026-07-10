@@ -296,18 +296,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from services.permission import get_or_create_user
     await get_or_create_user(user.id, user.username, user.first_name)
     await safe_reply_text(update.message,
-        "欢迎使用上传机器人。\n\n"
-        "📤 **单次上传**: 直接发送文件, 立即生成文件码\n\n"
-        "📦 **批次上传** (所有文件共用一个文件码):\n"
-        "  /start_upload - 开始批次上传\n"
+        "📤 欢迎使用上传机器人\n\n"
+        "1. 单次上传：直接发送文件，立即生成文件码\n\n"
+        "2. 批次上传（所有文件共用一个文件码）：\n"
+        "  /start_upload — 开始批次上传\n"
         "  发送多个文件...\n"
-        "  /end_upload - 结束批次,生成文件码\n\n"
-        "🗂 **合集打包** (多个文件码打包成一个合集码):\n"
-        "  /new_collection - 开始合集打包\n"
-        "  发送文件码(可多次追加)...\n"
-        "  /end_collection - 生成合集码\n"
-        "  /cancel_collection - 取消合集打包\n"
-        "  /note_collection 文字 - 添加备注\n\n"
+        "  /end_upload — 结束批次，生成文件码\n\n"
+        "3. 合集打包（多个文件码打包成一个合集码）：\n"
+        "  /new_collection — 开始合集打包\n"
+        "  发送文件码（可多次追加）...\n"
+        "  /end_collection — 生成合集码\n"
+        "  /cancel_collection — 取消合集打包\n"
+        "  /note_collection 文字 — 添加备注\n\n"
         "所有用户均可免费上传文件\n"
         + three_bot_reminder()
     )
@@ -332,8 +332,8 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     await update.message.reply_text(
         "📦 已进入批次上传模式，请发送文件。\n"
-        "发/end_upload 结束并生成文件码。\n"
-        "发/cancel_upload 取消本次上传。\n\n"
+        "发送 /end_upload 结束并生成文件码。\n"
+        "发送 /cancel_upload 取消本次上传。\n\n"
         "💬 可使用 /note 文字 为本次批次添加备注"
     )
 
@@ -354,14 +354,14 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = context.user_data.get("batch")
     if batch is None:
-        await update.message.reply_text("当前没有进行中的批次上传,请先使用 /start_upload 开始")
+        await update.message.reply_text("当前没有进行中的批次上传，请先使用 /start_upload 开始")
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text("用法:/note 备注内容\n例如:/note 这是张三的文件")
+        await update.message.reply_text("用法：/note 备注内容\n例如：/note 这是张三的文件")
         return
     batch["note"] = note_text
-    await update.message.reply_text(f"备注已设置为：{note_text}")
+    await update.message.reply_text(f"✅ 备注已设置为：{note_text}")
 
 
 async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,7 +373,7 @@ async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("您被禁止使用上传功能")
         return
     if "batch" in context.user_data:
-        await update.message.reply_text("当前正在进行批次上传,请先 /end_upload 或 /cancel_upload")
+        await update.message.reply_text("当前正在进行批次上传，请先 /end_upload 或 /cancel_upload")
         return
     context.user_data["_collecting_collection"] = {
         "codes": [],
@@ -396,12 +396,12 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     coll = context.user_data.pop("_collecting_collection", None)
     if coll is None:
-        await update.message.reply_text("当前没有进行中的合集打包,请先使用 /new_collection 开始")
+        await update.message.reply_text("当前没有进行中的合集打包，请先使用 /new_collection 开始")
         return
 
     codes = coll.get("codes", [])
     if not codes:
-        await update.message.reply_text("合集为空(未收集到任何文件码),已取消")
+        await update.message.reply_text("合集为空（未收集到任何文件码），已取消")
         return
 
     # 去重并保留顺序
@@ -450,7 +450,7 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
     except Exception as e:
         logger.error(f"[Up][collection] file_records 写入失败 (code={collection_code}): {e}")
-        await update.message.reply_text("合集保存失败,请稍后重试")
+        await update.message.reply_text("合集保存失败，请稍后重试")
         return
 
     # 写入 codes 表(支持后续 offline 标记与过期检查)
@@ -490,8 +490,8 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[Up][collection] codes 表写入失败(code={collection_code}): {e}")
 
     await update.message.reply_text(
-        f"✅ 合集打包完成!\n\n"
-        f"📦 合集码: {collection_code}\n"
+        f"✅ 合集打包完成！\n\n"
+        f"📦 合集码：{collection_code}\n"
         f"📄 包含 {len(unique_codes)} 个文件码\n"
         f"💡 将合集码发送给解码机器人即可一次性获取全部文件"
     )
@@ -514,14 +514,14 @@ async def note_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     coll = context.user_data.get("_collecting_collection")
     if coll is None:
-        await update.message.reply_text("当前没有进行中的合集打包,请先使用 /new_collection 开始")
+        await update.message.reply_text("当前没有进行中的合集打包，请先使用 /new_collection 开始")
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text("用法:/note_collection 备注内容\n例如:/note_collection 张三的合集")
+        await update.message.reply_text("用法：/note_collection 备注内容\n例如：/note_collection 张三的合集")
         return
     coll["note"] = note_text
-    await update.message.reply_text(f"合集备注已设置为：{note_text}")
+    await update.message.reply_text(f"✅ 合集备注已设置为：{note_text}")
 
 
 async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -530,7 +530,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = context.user_data.pop("batch", None)
     if batch is None:
-        await update.message.reply_text("当前没有进行中的批次上传,请先使用 /start_upload 开始")
+        await update.message.reply_text("当前没有进行中的批次上传，请先使用 /start_upload 开始")
         return
 
     # PRE-13: 仅 flush 当前用户的 media group，避免清掉其他用户正在进行中的批次
@@ -765,7 +765,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             "file_meta": file_meta,
             "file_unique_id": _extract_file_unique_id(update.message),
         })
-        await update.message.reply_text(f"已接{file_type}")
+        await update.message.reply_text(f"✅ 已接收：{file_type}")
 
 
 async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE, batch: dict):
@@ -788,7 +788,7 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
         })
     first = grp["updates"][0]
     type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items()))
-    await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"已接收媒体组:{type_desc}({len(grp['updates'])}个文件)")
+    await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"✅ 已接收媒体组：{type_desc}（{len(grp['updates'])}个文件）")
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -801,10 +801,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await global_rate_limiter.acquire():
-        await update.message.reply_text("系统繁忙,请稍后重试")
+        await update.message.reply_text("系统繁忙，请稍后重试")
         return
     if not await user_rate_limiter.acquire(user.id):
-        await update.message.reply_text("操作过于频繁,请稍后重试")
+        await update.message.reply_text("操作过于频繁，请稍后重试")
         return
     if not await check_upload_permission(user.id):
         await update.message.reply_text("您没有上传权限")
@@ -1259,13 +1259,13 @@ async def _handle_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tokens.append(line)
         new_codes = [t for t in tokens if is_valid_code_format(t)]
         if not new_codes:
-            await update.message.reply_text("未识别到有效文件码,请发送格式正确的文件码")
+            await update.message.reply_text("未识别到有效文件码，请发送格式正确的文件码")
             return
         coll["codes"].extend(new_codes)
         await update.message.reply_text(
             f"✅ 已追加 {len(new_codes)} 个文件码\n"
             f"📦 当前合集共 {len(coll['codes'])} 个文件码\n"
-            f"继续发送文件码,或 /end_collection 完成"
+            f"继续发送文件码，或 /end_collection 完成"
         )
         return
 

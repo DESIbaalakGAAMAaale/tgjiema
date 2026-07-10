@@ -72,10 +72,10 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔗 加入频道", url=channel_link)],
         ])
-        text = "⚠️ 使用前请先加入频道,加入后重新发送指令即可。"
+        text = "⚠️ 使用前请先加入频道，加入后重新发送指令即可。"
     else:
         keyboard = None
-        text = "⚠️ 使用前请先加入指定频道,加入后重新发送指令即可。"
+        text = "⚠️ 使用前请先加入指定频道，加入后重新发送指令即可。"
     if update.message:
         await update.message.reply_text(
             text,
@@ -95,14 +95,14 @@ def three_bot_reminder() -> str:
     de = settings.DECODER_BOT_USERNAME
     se = settings.SENDER_BOT_USERNAME
     channel_link = settings.FORCE_JOIN_CHANNEL_LINK
-    lines = ["\n⚠️ 使用前请先启动以下三个机器人:"]
+    lines = ["\n⚠️ 使用前请先启动以下三个机器人："]
     if up:
-        lines.append(f"  1️⃣ 上传机器人:@{up}")
+        lines.append(f"  1️⃣ 上传机器人：@{up}")
     if de:
-        lines.append(f"  2️⃣ 解码机器人:@{de}")
+        lines.append(f"  2️⃣ 解码机器人：@{de}")
     if se:
-        lines.append(f"  3️⃣ 发送机器人:@{se}")
-    lines.append("\n请确保已向这三个机器人均发送过 /start 命令,否则系统无法正常工作。")
+        lines.append(f"  3️⃣ 发送机器人：@{se}")
+    lines.append("\n请确保已向这三个机器人均发送过 /start 命令，否则系统无法正常工作。")
     if channel_link:
-        lines.append(f"\n📢 官方频道: {channel_link}")
+        lines.append(f"\n📢 官方频道：{channel_link}")
     return "\n".join(lines)
