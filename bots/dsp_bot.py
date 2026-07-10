@@ -24,7 +24,7 @@ from storage.delivery_resolver import resolve_delivery_channel, try_deliver, try
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
-from utils.force_join import check_force_join, three_bot_reminder
+from utils.force_join import check_force_join, three_bot_reminder, common_faq
 from utils.flood_waiter import (
     safe_reply_text,
     safe_send_message,
@@ -924,8 +924,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(update.message,
         "📥 欢迎使用文件发送机器人！\n\n"
         "此机器人用于接收解码后的文件，无需手动操作。\n"
-        "当您通过解码机器人获取文件码后，文件会自动发送给您。"
+        "当您通过解码机器人获取文件码后，文件会自动发送给您。\n"
+        "发送 /help 查看帮助信息"
         + three_bot_reminder()
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
+    await safe_reply_text(update.message,
+        "📥 文件发送机器人使用帮助\n\n"
+        "可用命令：\n"
+        "/start — 启动机器人 / 查看欢迎语\n"
+        "/help — 查看本帮助\n\n"
+        "使用说明：\n"
+        "1. 本机器人自动接收解码后的文件，无需手动操作。\n"
+        "2. 在解码机器人发送文件码后，文件会自动发送到此处。\n"
+        "3. 如遇文件异常，可点击文件下方的「举报」按钮通知管理员处理。\n"
+        "4. 文件较多时支持分页浏览，点击翻页按钮即可查看。"
+        + common_faq()
     )
 
 
@@ -1021,6 +1039,7 @@ async def _async_main():
     bot = app.bot
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     # report_callback 必须先于分页回调，且分页回调需限定 pattern，
     # 否则无 pattern 的 pagination_callback 会吞掉 report_req| 回调，导致举报按钮失效。
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))

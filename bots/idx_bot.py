@@ -43,7 +43,7 @@ from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
 from utils.task_utils import create_safe_task
-from utils.force_join import check_force_join, three_bot_reminder
+from utils.force_join import check_force_join, three_bot_reminder, common_faq
 from utils.flood_waiter import safe_send_message, safe_reply_text
 from utils.relay_auth import is_relay_sender_allowed
 
@@ -396,10 +396,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
-    channel_link = settings.FORCE_JOIN_CHANNEL_LINK
-    contact_line = f"\n\n如有问题请联系管理员或访问官方频道：{channel_link}" if channel_link else "\n\n如有问题请联系管理员"
     await safe_reply_text(update.message,
         "📁 文件解码机器人使用帮助\n\n"
+        "可用命令：\n"
+        "/start — 启动机器人 / 查看欢迎语\n"
+        "/help — 查看本帮助\n"
+        "/status — 查看会员等级与今日剩余解码次数\n"
+        "/my_codes — 查看我的文件码列表（可管理备注、过期时间、访问次数、停用/启用）\n\n"
+        "使用说明：\n"
         "1. 获取文件：直接发送文件码即可获取对应文件。\n"
         "2. 上传文件：请使用上传机器人发送文件，上传后会自动收到文件码。\n"
         "3. 分享文件：将文件码分享给其他用户，对方发送给我即可获取文件。\n\n"
@@ -407,7 +411,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- 免费用户：每日解码 {settings.FREE_DAILY_QUOTA} 次，仅限本系统文件码\n"
         f"- 基础会员：每日解码 {settings.BASIC_DAILY_QUOTA} 次，可解码非本系统文件码\n"
         f"- 高级会员：无限解码，可解码非本系统文件码\n"
-        + contact_line
+        + common_faq()
     )
 
 

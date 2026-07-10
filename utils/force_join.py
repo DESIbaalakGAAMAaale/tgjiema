@@ -106,3 +106,26 @@ def three_bot_reminder() -> str:
     if channel_link:
         lines.append(f"\n📢 官方频道：{channel_link}")
     return "\n".join(lines)
+
+
+def common_faq() -> str:
+    """常见问题与解决步骤（三个机器人共用的帮助文案）。"""
+    from config import settings
+    channel_link = settings.FORCE_JOIN_CHANNEL_LINK
+    channel_line = f"\n\n📢 官方频道：{channel_link}" if channel_link else ""
+    return (
+        "\n\n❓ 常见问题\n\n"
+        "Q: 收不到文件怎么办？\n"
+        "A: 1) 确认已向「上传、解码、发送」三个机器人都发送过 /start；\n"
+        "   2) 确认已加入官方频道；\n"
+        "   3) 检查是否被 Telegram 限制或账号被冻结。\n\n"
+        "Q: 文件码无效 / 无法解码？\n"
+        "A: 1) 检查文件码是否输入正确（支持中英文冒号）；\n"
+        "   2) 文件码可能已过期或被停用，请联系上传者；\n"
+        "   3) 非本系统文件码需升级为基础或高级会员才能解码。\n\n"
+        "Q: 解码次数用完了？\n"
+        "A: 免费用户每日配额将在次日自动重置；如需更多次数可升级会员。\n\n"
+        "Q: 文件无法转发或保存？\n"
+        "A: 上传者在上传时可设置转发权限，受限文件无法转发；如需可转发版本请联系上传者重新上传。"
+        + channel_line
+    )

@@ -31,7 +31,7 @@ from services.permission import check_upload_permission
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.task_utils import create_safe_task
-from utils.force_join import check_force_join, three_bot_reminder
+from utils.force_join import check_force_join, three_bot_reminder, common_faq
 from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text, safe_send_media_group
 from utils.file_utils import detect_file_type, extract_file_meta
 from utils.relay_auth import is_relay_sender_allowed
@@ -309,7 +309,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /cancel_collection — 取消合集打包\n"
         "  /note_collection 文字 — 添加备注\n\n"
         "所有用户均可免费上传文件\n"
+        "发送 /help 查看完整帮助\n"
         + three_bot_reminder()
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_force_join(update, context):
+        return
+    await safe_reply_text(update.message,
+        "📤 上传机器人使用帮助\n\n"
+        "可用命令：\n"
+        "/start — 启动机器人 / 查看欢迎语\n"
+        "/help — 查看本帮助\n"
+        "/start_upload — 开始批次上传（多文件共用一个文件码）\n"
+        "/end_upload — 结束批次上传并生成文件码\n"
+        "/cancel_upload — 取消当前批次上传\n"
+        "/note 文字 — 为当前批次添加备注\n"
+        "/cancel_note — 跳过备注输入\n"
+        "/new_collection — 开始合集打包（多个文件码打包成一个合集码）\n"
+        "/end_collection — 结束合集打包并生成合集码\n"
+        "/cancel_collection — 取消合集打包\n"
+        "/note_collection 文字 — 为合集添加备注\n\n"
+        "使用说明：\n"
+        "1. 单次上传：直接发送文件，立即生成文件码。\n"
+        "2. 批次上传：/start_upload 开始 → 发送多个文件 → /end_upload 结束生成文件码。\n"
+        "3. 合集打包：/new_collection 开始 → 发送文件码（可多次追加）→ /end_collection 生成合集码。\n"
+        "4. 上传时可设置转发权限，受限文件将无法被他人转发。\n"
+        + common_faq()
     )
 
 
@@ -1636,6 +1663,7 @@ async def _async_main():
     _bot = app.bot
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("start_upload", start_upload))
     app.add_handler(CommandHandler("end_upload", end_upload))
     app.add_handler(CommandHandler("cancel_upload", cancel_upload))
