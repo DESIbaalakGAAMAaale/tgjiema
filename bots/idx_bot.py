@@ -534,6 +534,7 @@ async def _process_one_pending(app: Application, row: dict):
     else:
         batch_file_meta_str = batch_file_meta_raw if batch_file_meta_raw else ""
     note = row.get("note", "")
+    logger.info(f"[Idx][poll] note 字段: type={type(note).__name__}, value={note!r}, len={len(note) if note else 0}")
     protect_content = row.get("protect_content", settings.DEFAULT_PROTECT_CONTENT)
     file_ttl_days = row.get("file_ttl_days", settings.DEFAULT_FILE_TTL_DAYS)
 
