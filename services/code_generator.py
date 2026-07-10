@@ -49,21 +49,35 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_random_id(12)
     type_parts = []
+    # 诊断日志：确认 FILE_TYPE_LABELS 的实际内容
+    logger.info(f"[build_file_code] FILE_TYPE_LABELS={FILE_TYPE_LABELS!r}, keys={[repr(k) for k in FILE_TYPE_LABELS.keys()]}")
+    logger.info(f"[build_file_code] file_types={file_types!r}, type={type(file_types).__name__}")
     if isinstance(file_types, dict):
-        # 重建 dict：强制 CPython 重新计算 hash 并重建内部哈希表
-        # 规避 orjson(C 扩展)反序列化的 dict 可能存在的 get() 查找异常
-        clean_types = {str(k): v for k, v in file_types.items()}
-        for media_type, count in clean_types.items():
-            if not isinstance(count, (int, float)) or count <= 0:
+        # 构建 label 列表，用 == 遍历比较，完全不用 dict.get() hash 查找
+        label_list = [(str(k), v) for k, v in FILE_TYPE_LABELS.items()]
+        logger.info(f"[build_file_code] label_list={[(repr(k), repr(v)) for k, v in label_list]}")
+        for k, v in file_types.items():
+            ks = str(k)
+            logger.info(f"[build_file_code] key: k={k!r} type={type(k).__name__} ks={ks!r} len={len(ks)} ords={[ord(c) for c in ks]} val={v!r} val_type={type(v).__name__}")
+            if not isinstance(v, (int, float)) or v <= 0:
+                logger.info(f"[build_file_code] skip: val not numeric or <=0")
                 continue
-            label = FILE_TYPE_LABELS.get(media_type)
-            if label:
-                type_parts.append(f"{int(count)}{label}")
+            matched = False
+            for lk, lv in label_list:
+                if lk == ks:
+                    type_parts.append(f"{int(v)}{lv}")
+                    matched = True
+                    logger.info(f"[build_file_code] matched: lk={lk!r} lv={lv!r}")
+                    break
+            if not matched:
+                logger.warning(f"[build_file_code] no match for key: {ks!r}")
+    logger.info(f"[build_file_code] type_parts={type_parts}")
     if not type_parts:
         suffix = "0d"
     else:
         suffix = "_".join(type_parts)
     result = f"{prefix}_{random_part}_{suffix}"
+    logger.info(f"[build_file_code] result={result}")
     return result
 
 
