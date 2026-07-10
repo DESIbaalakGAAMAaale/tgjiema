@@ -220,6 +220,9 @@ class RelayInstance:
     async def start(self):
         await self._report_status("connecting")
 
+        # 诊断日志:记录实际使用的凭证(脱敏)
+        logger.info(f"[RelayInstance:{self.phone}] 启动登录, api_id={self.api_id}(type={type(self.api_id).__name__}), api_hash={self.api_hash[:10]}...(len={len(self.api_hash)})")
+
         self._client = TelegramClient(
             self._session_path,
             self.api_id,
@@ -230,6 +233,7 @@ class RelayInstance:
             await self._client.connect()
         except Exception as e:
             logger.error(f"[RelayInstance:{self.phone}] connect 失败(api_id/api_hash 可能无效): {e}")
+            logger.error(f"[RelayInstance:{self.phone}] 提示: 如果确认 api_id/api_hash 正确,可能是 DB 存储值与 .env 不匹配")
             await self._report_status("offline")
             return
 
@@ -238,6 +242,8 @@ class RelayInstance:
                 await self._client.send_code_request(self.phone)
             except Exception as e:
                 logger.error(f"[RelayInstance:{self.phone}] send_code_request 失败: {e}")
+                logger.error(f"[RelayInstance:{self.phone}] 请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH 是否正确")
+                logger.error(f"[RelayInstance:{self.phone}] 如已更新 .env,需从 DB 删除该账号后重新添加(旧 api_hash 可能已加密存储)")
                 await self._report_status("offline")
                 await self._client.disconnect()
                 return
