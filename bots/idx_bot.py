@@ -653,13 +653,18 @@ async def _process_one_pending(app: Application, row: dict):
                 note_parsed = note
             else:
                 note_parsed = {}
+            logger.info(f"[Idx][poll] note_parsed: type={type(note_parsed).__name__}, value={note_parsed!r}")
             # orjson 反序列化的 dict 可能存在 hash 表异常，重建 dict 强制重新计算 hash
             if isinstance(note_parsed, dict):
                 note_parsed = {str(k): v for k, v in note_parsed.items()}
+                logger.info(f"[Idx][poll] note_parsed 重建后: keys={list(note_parsed.keys())}, type_val={note_parsed.get('type')!r}, code_val={note_parsed.get('code')!r}")
             if isinstance(note_parsed, dict) and note_parsed.get("type") == "external":
                 ext_code = note_parsed.get("code", "")
-        except (json.JSONDecodeError, TypeError):
-            pass
+                logger.info(f"[Idx][poll] ext_code 提取成功: {ext_code}")
+            else:
+                logger.warning(f"[Idx][poll] ext_code 提取失败: note_parsed={note_parsed!r}, type_match={note_parsed.get('type') == 'external' if isinstance(note_parsed, dict) else 'N/A'}")
+        except Exception as e:
+            logger.error(f"[Idx][poll] note 解析异常: {type(e).__name__}: {e}", exc_info=True)
     if ext_code:
         try:
             from database import set_external_code_mapping
