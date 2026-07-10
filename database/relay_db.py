@@ -108,6 +108,17 @@ async def _sync_relay_to_crdb(api_id: int, api_hash: str, phone: str):
     except Exception as e:
         logger.debug(f"[RelayDB] CRDB 同步失败（不影响本地）: {e}")
 
+
+async def _delete_relay_from_crdb(phone: str):
+    """异步从 CRDB 删除中继账号(不阻塞主流程)。"""
+    try:
+        from .session import _client, delete_relay_from_crdb as _do_delete
+        if _client._pool is None:
+            return  # CRDB 未连接，跳过
+        await _do_delete(phone)
+    except Exception as e:
+        logger.debug(f"[RelayDB] CRDB 删除失败（不影响本地）: {e}")
+
 DDL = """
 CREATE TABLE IF NOT EXISTS relay_accounts (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,7 +315,13 @@ class RelayDB:
     async def remove_account(self, phone: str) -> bool:
         cur = await self._db.execute("DELETE FROM relay_accounts WHERE phone=?", (phone,))
         await self._db.commit()
-        return cur.rowcount > 0
+        deleted = cur.rowcount > 0
+        if deleted:
+            # 同步删除 CRDB 中的记录,避免重启后从 CRDB 拉回已删除的账号
+            task = asyncio.create_task(_delete_relay_from_crdb(phone))
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
+        return deleted
 
     # ── relay_usage ──
 

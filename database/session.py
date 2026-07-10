@@ -2639,6 +2639,18 @@ async def sync_relay_to_crdb(api_id: int, api_hash: str, phone: str):
         logger.warning(f"[RelayDB/CRDB] 同步中继账号失败 (phone={phone}): {e}")
 
 
+async def delete_relay_from_crdb(phone: str):
+    """从 CRDB 删除中继账号(同步删除,避免重启后从 CRDB 拉回已删除的账号)"""
+    try:
+        await _client.execute(
+            "DELETE FROM relay_accounts WHERE phone = $1",
+            [phone],
+        )
+        logger.info(f"[RelayDB/CRDB] 已从 CRDB 删除中继账号 (phone={phone})")
+    except Exception as e:
+        logger.warning(f"[RelayDB/CRDB] 删除中继账号失败 (phone={phone}): {e}")
+
+
 async def _query_raw(sql: str, params: list = None) -> list[dict]:
     """执行原始 SQL 查询，返回 dict 列表"""
     if _client._pool is None:
