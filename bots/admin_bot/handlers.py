@@ -1483,7 +1483,7 @@ async def topology(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @_auth_required
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("conv_state"):
-        _conv_end(context)
+        await _conv_end(context)
         await update.message.reply_text("❌ 操作已取消。")
     else:
         await update.message.reply_text("当前没有正在进行的操作。")
@@ -1647,8 +1647,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /set_access_limit <文件码> <次数> — 访问次数限制(0=不限)\n"
         "  /purge_channel <频道ID> — 清理频道(需手动操作)\n\n"
         "🔐 中继管理(外部码解码用)\n"
-        "  /relay_add <手机号> — 添加中继账号(自动发送验证码,对话式登录)\n"
+        "  /relay_add <手机号> — 添加中继账号(交互式登录:手机号→验证码→密码)\n"
+        "  /relay_code <手机号> <验证码> — 提交登录验证码(旧账号重新登录用)\n"
+        "  /relay_password <手机号> <密码> — 提交二步验证密码(旧账号重新登录用)\n"
         "  /relay_list — 查看中继账号列表\n"
+        "  /relay_pending — 查看待处理验证码\n"
         "  /relay_remove <手机号> — 移除中继账号\n"
         "  /relay_reset_stats — 重置使用统计\n"
         "  /relay_whitelist [add|remove|clear] [用户ID] — 中继白名单(热更新)\n"

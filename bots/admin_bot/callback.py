@@ -226,7 +226,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             "relay_add": (
                 "relay_add:phone",
-                "➕ 添加中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\nAPI_ID/API_HASH 从 .env 自动读取\n系统将自动发送验证码到该 Telegram 账号\n❌ 如需取消请点击下方按钮。"
+                "➕ 添加中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\n登录流程:输入手机号 → 收到验证码 → 输入验证码 → 如有二步验证则输入密码 → 成功后写入\n❌ 如需取消请点击下方按钮。"
+            ),
+            "relay_password": (
+                "relay_password:password",
+                "🔒 提交二步验证密码\n\n请输入该中继账号的二步验证密码：\n\n❌ 如需取消请点击下方按钮。"
             ),
             "relay_remove": (
                 "relay_remove:phone",
@@ -305,7 +309,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_report_action(update, context, data)
 
     elif data == "conv:cancel":
-        _conv_end(context)
+        await _conv_end(context)
         await query.edit_message_text(
             "❌ 操作已取消。",
             reply_markup=back_kb,

@@ -1,7 +1,6 @@
 import time
 
 import datetime
-from pathlib import Path
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -48,88 +47,19 @@ async def _conv_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, state: s
     await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
 
 
-def _conv_end(context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("conv_state", None)
-    context.user_data.pop("conv_data", None)
-    context.user_data.pop("conv_started_at", None)
-    # 清理中继交互式流程中可能残留的 relay_phone（避免影响下次 relay_code 流程）
-    context.user_data.pop("relay_phone", None)
-
-
-async def _finalize_relay_login(context, client, phone, temp_session):
-    """登录成功后的收尾工作:迁移 session 到持久化路径,写入 DB,通知 idx_bot。"""
-    import os, shutil
-    from loguru import logger
-    from services.relay_pool import relay_pool
-
-    try:
-        # 迁移临时 session 到持久化路径(避免 idx_bot 重复登录)
-        persistent_session = str(Path(__file__).parent.parent.parent / "data" / f"relay_session_{phone}")
-        for suffix in ("", "-journal"):
-            src = temp_session + suffix
-            dst = persistent_session + suffix
-            if os.path.exists(src):
-                if os.path.exists(dst):
-                    os.remove(dst)
-                shutil.move(src, dst)
-
-        # 获取 api_id/api_hash 写入 DB
-        api_id = client.api_id
-        api_hash = client.api_hash
-        await relay_pool.add_account(api_id, api_hash, phone)
-
-        # 通知 idx_bot 同步新账号
-        try:
-            from database.cache_store import get_cache_store
-            await get_cache_store().notify_relay_change()
-        except Exception:
-            pass
-
-        # 清理 user_data 和临时客户端
-        _conv_end(context)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        logger.info(f"[Admin] 中继账号 {phone} 登录成功并已写入 DB")
-    except Exception as e:
-        logger.error(f"[Admin] finalize_relay_login 异常: {e}")
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        # 清理临时 session
-        for suffix in ("", "-journal"):
-            try:
-                p = temp_session + suffix
-                if os.path.exists(p):
-                    os.remove(p)
-            except Exception:
-                pass
-        raise
-
-
-async def _cleanup_relay_add(context):
-    """清理中继添加流程中的临时客户端和 session 文件(超时/取消时调用)。"""
-    import os
-    client = context.user_data.get("relay_add_client")
-    temp_session = context.user_data.get("relay_add_temp_session", "")
+async def _conv_end(context: ContextTypes.DEFAULT_TYPE):
+    """清理对话状态。如果有临时 Telethon 客户端（relay_add 流程），一并断开连接。"""
+    client = context.user_data.pop("_relay_temp_client", None)
     if client:
         try:
             await client.disconnect()
         except Exception:
             pass
-    for suffix in ("", "-journal"):
-        try:
-            p = temp_session + suffix
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-    context.user_data.pop("relay_add_client", None)
-    context.user_data.pop("relay_add_phone", None)
-    context.user_data.pop("relay_add_phone_code_hash", None)
-    context.user_data.pop("relay_add_temp_session", None)
+    context.user_data.pop("conv_state", None)
+    context.user_data.pop("conv_data", None)
+    context.user_data.pop("conv_started_at", None)
+    # 清理中继交互式流程中可能残留的 relay_phone（避免影响下次 relay_code 流程）
+    context.user_data.pop("relay_phone", None)
 
 
 @_auth_required
@@ -141,10 +71,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 对话超时检查:超过 5 分钟无响应自动清理
     started_at = context.user_data.get("conv_started_at", 0)
     if time.time() - started_at > _CONV_TIMEOUT_SECONDS:
-        # 如果正在中继添加流程,清理临时客户端和 session 文件
-        if state and state.startswith("relay_add:"):
-            await _cleanup_relay_add(context)
-        _conv_end(context)
+        await _conv_end(context)
         await update.message.reply_text("⏳ 对话已超时(5分钟无响应),请重新点击按钮开始操作。")
         return
 
@@ -153,7 +80,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ─── Helper: execute and end ─────────────────────────────────
     async def _end(msg: str):
-        _conv_end(context)
+        await _conv_end(context)
         await update.message.reply_text(msg)
 
     async def _ask(next_state: str, prompt: str, extra_data: dict | None = None):
@@ -428,99 +355,218 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _end(f"✅ 二步验证密码已提交\n中继实例将在几秒内自动获取并使用。")
 
     elif state == "relay_add:phone":
-        from services.relay_pool import relay_pool, _normalize_phone
+        from services.relay_pool import _normalize_phone
+        from database.relay_db import get_relay_db
+        from loguru import logger
+        from pathlib import Path
+        from telethon import TelegramClient
+
         phone = _normalize_phone(text.strip())
         api_id = settings.RELAY_API_ID
         api_hash = settings.RELAY_API_HASH
         if not api_id or not api_hash:
-            await _end("❌ 中继 API 配置未设置\n请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n（从 https://my.telegram.org 申请）")
+            await _end(
+                "❌ 中继 API 配置未设置\n"
+                "请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n"
+                "（从 https://my.telegram.org 申请）"
+            )
             return
         try:
-            api_id = int(api_id)
+            api_id_int = int(api_id)
         except (TypeError, ValueError):
             await _end(f"❌ api_id 必须是数字,当前值: {api_id}")
             return
 
-        # 使用临时客户端在 admin_bot 进程完成登录流程
-        from telethon import TelegramClient
-        from telethon.errors import ApiIdInvalidError, PhoneCodeInvalid, PhoneCodeExpired
-        import tempfile, os
+        # 检查重复
+        db = await get_relay_db()
+        existing = await db.get_active_accounts()
+        if any(a["phone"] == phone for a in existing):
+            await _end(f"❌ 手机号 {phone} 已存在,请勿重复添加")
+            return
 
-        temp_session = os.path.join(tempfile.gettempdir(), f"relay_login_{phone.lstrip('+')}_{int(time.time())}")
-        client = None
+        # 创建临时 Telethon 客户端(使用与 relay_instance 相同的 session 路径)
+        project_root = Path(__file__).resolve().parent.parent.parent
+        session_path = str(project_root / "data" / f"relay_session_{phone}")
+        client = TelegramClient(session_path, api_id_int, api_hash)
+
         try:
-            client = TelegramClient(temp_session, api_id, api_hash, timeout=30)
             await client.connect()
-            sent = await client.send_code_request(phone)
-            # 存储临时客户端状态到 user_data
-            context.user_data["relay_add_client"] = client
-            context.user_data["relay_add_phone"] = phone
-            context.user_data["relay_add_phone_code_hash"] = sent.phone_code_hash
-            context.user_data["relay_add_temp_session"] = temp_session
-            masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
-            await _conv_ask(update, context, "relay_add:code",
-                            f"📱 验证码已发送到 {masked}\n\n"
-                            f"请输入收到的验证码(5-6 位数字):")
-        except ApiIdInvalidError:
-            await _end("❌ api_id/api_hash 无效(Telegram 服务器拒绝)\n请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH")
         except Exception as e:
-            if client:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            for suffix in ("", "-journal"):
-                try:
-                    p = temp_session + suffix
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
+            logger.error(f"[Admin] relay_add connect 失败: {e}")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            await _end(
+                f"❌ 连接 Telegram 失败: {e}\n"
+                f"请检查 .env 中 RELAY_API_ID 和 RELAY_API_HASH 是否正确"
+            )
+            return
+
+        # 如果 session 已授权(之前登录过),直接写入 DB
+        if await client.is_user_authorized():
+            try:
+                me = await client.get_me()
+            except Exception as e:
+                logger.error(f"[Admin] relay_add get_me 失败: {e}")
+                me = None
+            await client.disconnect()
+            account_id = await db.add_account(api_id_int, api_hash, phone)
+            logger.info(f"[Admin] relay_add: session已授权,直接写入DB (account_id={account_id})")
+            try:
+                from database.cache_store import get_cache_store
+                await get_cache_store().notify_relay_change()
+            except Exception:
+                pass
+            masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+            user_info = f"\n  用户: {me.first_name} (@{me.username})" if me else ""
+            await _end(f"✅ 中继账号添加成功(已有有效 session)\n  手机号: {masked}{user_info}")
+            return
+
+        # 发送验证码
+        try:
+            sent = await client.send_code_request(phone)
+            phone_code_hash = sent.phone_code_hash
+        except Exception as e:
+            logger.error(f"[Admin] relay_add send_code_request 失败: {e}")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             await _end(f"❌ 发送验证码失败: {e}")
+            return
+
+        # 保存客户端引用和登录参数到 user_data
+        context.user_data["_relay_temp_client"] = client
+        masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+        await _ask(
+            "relay_add:code",
+            f"📱 验证码已发送到 {masked} 的 Telegram 客户端\n\n"
+            f"请输入收到的验证码(5-6位数字):\n\n"
+            f"❌ 如需取消请点击下方按钮。",
+            {"phone": phone, "phone_code_hash": phone_code_hash,
+             "api_id": api_id_int, "api_hash": api_hash}
+        )
 
     elif state == "relay_add:code":
-        client = context.user_data.get("relay_add_client")
-        phone = context.user_data.get("relay_add_phone", "")
-        phone_code_hash = context.user_data.get("relay_add_phone_code_hash", "")
-        temp_session = context.user_data.get("relay_add_temp_session", "")
-        if not client:
-            await _end("❌ 会话已过期,请重新从菜单选择添加中继账号")
-            return
-        code = text.strip().replace(" ", "")
+        from telethon.errors import (
+            SessionPasswordNeededError, PhoneCodeExpiredError,
+            PhoneCodeInvalidError, PhoneNumberBannedError,
+        )
+        from database.relay_db import get_relay_db
+        from loguru import logger
+
+        code = text.strip()
         if not code.isdigit() or len(code) not in (5, 6):
-            await update.message.reply_text("❌ 验证码应为 5-6 位数字,请重新输入:")
+            await update.message.reply_text("❌ 验证码格式不正确,应为 5-6 位数字,请重新输入:")
             return
-        from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalid, PhoneCodeExpired
+
+        client = context.user_data.get("_relay_temp_client")
+        if not client or not client.is_connected():
+            await _end("❌ 会话已断开,请重新点击「添加账号」按钮")
+            return
+
+        phone = data["phone"]
+        phone_code_hash = data["phone_code_hash"]
+
         try:
-            await client.sign_in(phone, phone_code_hash, code)
-            await _finalize_relay_login(context, client, phone, temp_session)
+            await client.sign_in(phone, code, phone_code_hash=phone_code_hash)
         except SessionPasswordNeededError:
-            await _conv_ask(update, context, "relay_add:password",
-                            "🔒 该账号开启了二步验证\n\n请输入二步验证密码:")
-        except (PhoneCodeInvalid, PhoneCodeExpired) as e:
-            await _cleanup_relay_add(context)
-            await _end(f"❌ 验证码错误: {e}\n请重新从菜单选择添加中继账号")
+            # 需要二步验证密码
+            await _ask(
+                "relay_add:password",
+                "🔒 该账号开启了二步验证\n\n请输入二步验证密码:\n\n❌ 如需取消请点击下方按钮。"
+            )
+            return
+        except PhoneCodeExpiredError:
+            # 验证码过期,清理并结束
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            context.user_data.pop("_relay_temp_client", None)
+            await _end("❌ 验证码已过期,请重新点击「添加账号」按钮开始。")
+            return
+        except PhoneCodeInvalidError:
+            await update.message.reply_text("❌ 验证码错误,请重新输入:")
+            return
+        except PhoneNumberBannedError:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            context.user_data.pop("_relay_temp_client", None)
+            await _end("❌ 该手机号已被 Telegram 封禁,无法添加")
+            return
         except Exception as e:
-            await _cleanup_relay_add(context)
-            await _end(f"❌ 登录失败: {e}\n请重新从菜单选择添加中继账号")
+            logger.error(f"[Admin] relay_add sign_in 失败: {e}")
+            await update.message.reply_text(f"❌ 登录失败: {e}\n请重新输入验证码,或点击取消。")
+            return
+
+        # 登录成功,写入 DB
+        me = await client.get_me()
+        await client.disconnect()
+        context.user_data.pop("_relay_temp_client", None)
+
+        db = await get_relay_db()
+        account_id = await db.add_account(data["api_id"], data["api_hash"], phone)
+        logger.info(f"[Admin] relay_add: 登录成功,写入DB (account_id={account_id})")
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().notify_relay_change()
+        except Exception:
+            pass
+
+        masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+        await _end(
+            f"✅ 中继账号添加成功\n"
+            f"  手机号: {masked}\n"
+            f"  用户: {me.first_name} (@{me.username})"
+        )
 
     elif state == "relay_add:password":
-        client = context.user_data.get("relay_add_client")
-        phone = context.user_data.get("relay_add_phone", "")
-        temp_session = context.user_data.get("relay_add_temp_session", "")
-        if not client:
-            await _end("❌ 会话已过期,请重新从菜单选择添加中继账号")
-            return
+        from database.relay_db import get_relay_db
+        from loguru import logger
+
         password = text.strip()
         if not password:
             await update.message.reply_text("❌ 密码不能为空,请重新输入:")
             return
+
+        client = context.user_data.get("_relay_temp_client")
+        if not client or not client.is_connected():
+            await _end("❌ 会话已断开,请重新点击「添加账号」按钮")
+            return
+
+        phone = data["phone"]
+
         try:
-            await client.check_password(password)
-            await _finalize_relay_login(context, client, phone, temp_session)
+            await client.sign_in(password=password)
         except Exception as e:
-            await _cleanup_relay_add(context)
-            await _end(f"❌ 二步验证密码错误: {e}\n请重新从菜单选择添加中继账号")
+            logger.error(f"[Admin] relay_add password sign_in 失败: {e}")
+            await update.message.reply_text(f"❌ 密码错误或登录失败: {e}\n请重新输入密码,或点击取消。")
+            return
+
+        # 登录成功,写入 DB
+        me = await client.get_me()
+        await client.disconnect()
+        context.user_data.pop("_relay_temp_client", None)
+
+        db = await get_relay_db()
+        account_id = await db.add_account(data["api_id"], data["api_hash"], phone)
+        logger.info(f"[Admin] relay_add: 二步验证成功,写入DB (account_id={account_id})")
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().notify_relay_change()
+        except Exception:
+            pass
+
+        masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+        await _end(
+            f"✅ 中继账号添加成功\n"
+            f"  手机号: {masked}\n"
+            f"  用户: {me.first_name} (@{me.username})"
+        )
 
     elif state == "relay_remove:phone":
         from services.relay_pool import relay_pool, _normalize_phone
@@ -859,5 +905,5 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 未知状态 → 清理
     else:
-        _conv_end(context)
+        await _conv_end(context)
         await update.message.reply_text("⏳ 对话已超时,请重新点击按钮开始操作。")
