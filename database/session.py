@@ -606,7 +606,7 @@ def _safe_str(val: Any):
         return None
     if isinstance(val, bool):
         return val
-    if isinstance(val, int):
+    if isinstance(val, (int, float)):
         return val
     if isinstance(val, (list, dict)):
         return _json_dumps(val, default=str)
