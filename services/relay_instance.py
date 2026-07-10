@@ -782,10 +782,11 @@ class RelayInstance:
                         self._up_bot_entity, media_list[0], caption=first_caption
                     )
                 else:
-                    # grouping=True 保持相册格式；仅第一条消息带 caption，其余不带
+                    # Telethon send_file 传入列表时自动以相册(sendMultiMedia)发送，无需 grouping 参数
+                    # 仅第一条消息带 caption，其余不带（保持相册单 caption 展示）
                     captions = [first_caption] + [None] * (len(media_list) - 1)
                     await self._client.send_file(
-                        self._up_bot_entity, media_list, caption=captions, grouping=True
+                        self._up_bot_entity, media_list, caption=captions
                     )
                     logger.info(f"[RelayInstance:{self.phone}] 媒体组批量发送 ({len(media_list)}个文件, code={code}, orig_caption={'有' if orig_caption else '无'})")
             else:
@@ -849,12 +850,18 @@ class RelayInstance:
             return
         exchange["_ai_running"] = True
         stale_clicks = 0
+        _MAX_PAGES = 30  # 安全上限：防止翻页死循环
         try:
             while True:
                 if bot_username not in self._bot_exchange:
                     break
                 exchange = self._bot_exchange[bot_username]
                 exchange["_expires"] = asyncio.get_running_loop().time() + 120
+                # 翻页次数安全上限
+                if exchange.get("_page_count", 0) >= _MAX_PAGES:
+                    logger.warning(f"[RelayInstance:{self.phone}] 翻页达到安全上限 {_MAX_PAGES} 次，终止 (bot=@{bot_username})")
+                    await self._process_all_collected(bot_username)
+                    break
                 version_before = exchange.get("_msg_version", 0)
                 decision = self._make_decision(exchange)
                 if bot_username not in self._bot_exchange:
@@ -952,6 +959,7 @@ class RelayInstance:
     def _make_decision(self, exchange: dict) -> dict:
         _NEXT_KW = ("next", "下一页", "下一頁", "下一组",
                      "→", "▶", "➡", ">>", "»")
+        _PREV_KW = ("prev", "上一页", "上一頁", "上一组", "上一組", "←", "◀", "⬅", "<<", "«", "back", "返回")
         _ERROR_KW = ("未找到", "已过期", "已失效",
                      "不存在", "not found", "expired", "invalid")
         _FINISH_KW = {"finish", "done", "完成", "结束"}
@@ -975,20 +983,26 @@ class RelayInstance:
                     "target_button_text": None,
                     "reason": "检测到限速", "wait_seconds": wait_sec}
 
+        clicked = exchange.get("_clicked_buttons") or set()
         for ev in msg_events:
             msg = ev.message
             if not (msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows):
                 continue
             rows = msg.reply_markup.rows
+            # 1. 优先查找"下一页"按钮（跳过已点击过的位置，防止死循环）
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
                     btn_text = (getattr(btn, "text", None) or "").lower().strip()
                     if any(kw in btn_text for kw in _NEXT_KW):
+                        if (row_idx, col_idx) in clicked:
+                            # 此位置的"下一页"已点击过，可能是翻回的旧页面，不再重复点击
+                            continue
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": col_idx,
                                 "target_button_text": getattr(btn, "text", None) or "",
                                 "reason": f"检测到翻页按钮: {btn_text}",
                                 "wait_seconds": None}
+            # 2. 数字翻页（需要单行至少3个数字按钮）
             for row_idx, row in enumerate(rows):
                 btn_texts = [(getattr(b, "text", None) or "").strip() for b in row.buttons]
                 numbers = []
@@ -1020,6 +1034,7 @@ class RelayInstance:
                                     "reason": f"数字翻页第{target}页",
                                     "wait_seconds": None}
                     break
+            # 3. 纯图标按钮（最后一行全空文本）
             for row_idx in range(len(rows) - 1, -1, -1):
                 row = rows[row_idx]
                 if not row.buttons:
@@ -1028,15 +1043,20 @@ class RelayInstance:
                 if all(not t for t in btn_texts):
                     last_btn = row.buttons[-1]
                     if getattr(last_btn, "data", None):
+                        if (row_idx, len(row.buttons) - 1) in clicked:
+                            continue
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": len(row.buttons) - 1, "target_button_text": "",
                                 "reason": "纯图标", "wait_seconds": None}
-            clicked = exchange.get("_clicked_buttons") or set()
+            # 4. 兜底：点击未点击过的按钮（排除"上一页"和"完成"）
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
                     if getattr(btn, "data", None):
                         btn_text = (getattr(btn, "text", None) or "").strip().lower()
                         if any(kw in btn_text for kw in _FINISH_KW):
+                            continue
+                        # 排除"上一页"类按钮，防止翻回前一页造成死循环
+                        if any(kw in btn_text for kw in _PREV_KW):
                             continue
                         if (row_idx, col_idx) in clicked:
                             continue

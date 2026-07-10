@@ -24,7 +24,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 5  # 递增此值以触发 DDL 升级
+DDL_VERSION = 6  # 递增此值以触发 DDL 升级
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -231,7 +231,8 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS file_ttl_days INTEGER DEFAULT 0",
     # I-1: claimed_at 用于 at-least-once 语义，认领后崩溃的记录可被回收重领
-    "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS claimed_at REAL DEFAULT 0",
+    # CRDB 不支持 ADD COLUMN IF NOT EXISTS，用不带 IF NOT EXISTS 的语法（重复执行由 try/except 兼容）
+    "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN claimed_at REAL DEFAULT 0",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS blocked_users JSONB DEFAULT '[]'",
