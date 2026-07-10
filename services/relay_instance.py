@@ -226,10 +226,21 @@ class RelayInstance:
             self.api_hash,
         )
 
-        await self._client.connect()
+        try:
+            await self._client.connect()
+        except Exception as e:
+            logger.error(f"[RelayInstance:{self.phone}] connect 失败(api_id/api_hash 可能无效): {e}")
+            await self._report_status("offline")
+            return
 
         if not await self._client.is_user_authorized():
-            await self._client.send_code_request(self.phone)
+            try:
+                await self._client.send_code_request(self.phone)
+            except Exception as e:
+                logger.error(f"[RelayInstance:{self.phone}] send_code_request 失败: {e}")
+                await self._report_status("offline")
+                await self._client.disconnect()
+                return
             logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram 账号")
             logger.info(f"[RelayInstance:{self.phone}] 等待管理员通过 /relay_code 提交验证码...")
             code = await self._wait_for_admin_code()

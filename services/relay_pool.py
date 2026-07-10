@@ -5,7 +5,6 @@
 - 支持并发处理解码任务
 """
 import asyncio
-import os
 from datetime import datetime, timezone
 
 from loguru import logger
@@ -20,17 +19,6 @@ def _normalize_phone(phone: str) -> str:
     if not phone.startswith("+"):
         phone = "+" + phone
     return phone
-
-
-def _cleanup_temp_session(session_path: str):
-    """清理临时 session 文件(.session + .session-journal)。"""
-    for suffix in ("", "-journal"):
-        try:
-            p = session_path + suffix
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
 
 
 class RelayPool:
@@ -217,14 +205,16 @@ class RelayPool:
         return usage["today_requests"]
 
     async def add_account(self, api_id: int, api_hash: str, phone: str) -> RelayInstance:
-        """动态添加中继账号(非阻塞模式)。
+        """动态添加中继账号(非阻塞模式,参考 Save-Restricted-Content-Bot-v3)。
 
-        仅验证 api_id/api_hash 有效性(connect + send_code_request),
-        不等待验证码/密码登录,避免阻塞 admin_bot conversation handler。
+        不在添加时调用任何 Telegram API,直接保存到 DB。
+        完整登录(connect → send_code → sign_in → password)由 idx_bot 的
+        instance.start() 异步完成,避免阻塞 admin_bot conversation handler。
 
-        验证码/密码登录由 idx_bot 的 relay_pool 负责:
+        登录流程:
         - idx_bot 通过 reload_from_db 检测新账号
-        - 调用 instance.start() 完成完整登录(含验证码/密码等待)
+        - 调用 instance.start() 完成完整登录
+        - 验证码通过 /relay_code 提交,密码通过 /relay_password 提交
         """
         # 防御性:确保 api_id 为 int(Telethon 要求)
         try:
@@ -243,61 +233,11 @@ class RelayPool:
         if any(a["phone"] == phone for a in existing):
             raise RuntimeError(f"手机号 {phone} 已存在,请勿重复添加")
 
-        # 阶段1:仅验证 api_id/api_hash 有效性(非阻塞,不发送验证码)
-        from services.relay_instance import RelayInstance
-        from telethon import TelegramClient
-        from telethon.errors import ApiIdInvalidError, AuthKeyError
-
-        logger.info(f"[RelayPool] 验证 api_id={api_id}, api_hash={api_hash[:10]}...")
-
-        import tempfile, os
-        temp_session = os.path.join(tempfile.gettempdir(), f"relay_verify_{phone.lstrip('+')}")
-        client = None
-        try:
-            client = TelegramClient(temp_session, api_id, api_hash, timeout=30)
-            await client.connect()
-            # 仅 connect 验证 api_id/api_hash,不调用 send_code_request(避免发验证码)
-            # connect() 时 Telethon 会初始化授权,如果 api_id/api_hash 无效会在这里抛异常
-            logger.info(f"[RelayPool] 账号 {phone} api_id/api_hash 验证通过(connect 成功)")
-        except ApiIdInvalidError:
-            if client:
-                await client.disconnect()
-            _cleanup_temp_session(temp_session)
-            raise RuntimeError(
-                f"api_id/api_hash 无效(Telegram 服务器拒绝)\n"
-                f"当前使用: api_id={api_id}, api_hash={api_hash[:10]}...\n"
-                f"请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH\n"
-                f"申请地址: https://my.telegram.org → API development tools"
-            )
-        except Exception as e:
-            if client:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            _cleanup_temp_session(temp_session)
-            err_msg = str(e)
-            logger.error(f"[RelayPool] 验证失败,原始错误: {type(e).__name__}: {err_msg}")
-            if "api_id" in err_msg.lower() or "api_hash" in err_msg.lower() or "invalid" in err_msg.lower():
-                raise RuntimeError(
-                    f"api_id/api_hash 验证失败: {err_msg}\n"
-                    f"当前使用: api_id={api_id}, api_hash={api_hash[:10]}...\n"
-                    f"请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH"
-                )
-            if "PHONE_NUMBER_INVALID" in err_msg or "phone" in err_msg.lower():
-                raise RuntimeError(f"手机号格式无效: {phone}\n请确保包含国际区号,如 +8613800138000")
-            raise RuntimeError(f"验证失败: {err_msg}")
-
-        # 验证通过:关闭临时 client,清理临时 session
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        _cleanup_temp_session(temp_session)
-
-        # 阶段2:写入 DB
+        # 直接写入 DB,不做 Telegram API 验证
+        # api_id/api_hash 有效性由 idx_bot 的 instance.start() 在 connect 时验证
         account_id = await db.add_account(api_id, api_hash, phone)
         logger.info(f"[RelayPool] 动态添加中继账号: {phone}(account_id={account_id})")
+        logger.info(f"[RelayPool] 账号 {phone} 已保存,等待 idx_bot 异步登录(验证码/密码通过管理机器人提交)")
 
         # 阶段3:通知 idx_bot 增量同步新账号
         try:

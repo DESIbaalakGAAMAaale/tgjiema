@@ -362,11 +362,10 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
             await _end(
                 f"✅ 中继账号已添加\n"
-                f"  手机号: {masked}\n"
-                f"  api_id/api_hash 验证通过,验证码已发送到该 Telegram 账号\n\n"
-                f"idx_bot 将自动检测新账号并开始登录流程。\n"
-                f"📱 如需验证码,请通过 /relay_code {phone} <验证码> 提交\n"
-                f"🔒 如开启二步验证,请通过 /relay_password {phone} <密码> 提交"
+                f"  手机号: {masked}\n\n"
+                f"idx_bot 将自动检测新账号并发送验证码到该 Telegram 账号。\n"
+                f"📱 收到验证码后,通过 /relay_code {phone} <验证码> 提交\n"
+                f"🔒 如开启二步验证,通过 /relay_password {phone} <密码> 提交"
             )
         except RuntimeError as e:
             await _end(f"❌ 添加中继账号失败: {e}")
