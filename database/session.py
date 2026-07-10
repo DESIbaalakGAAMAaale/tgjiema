@@ -24,7 +24,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 6  # 递增此值以触发 DDL 升级
+DDL_VERSION = 7  # 递增此值以触发 DDL 升级
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -86,7 +86,8 @@ DDL_STATEMENTS = [
         batch_file_meta TEXT,
         status_msg_id BIGINT,
         created_at TEXT,
-        processed INTEGER DEFAULT 0
+        processed INTEGER DEFAULT 0,
+        claimed_at REAL DEFAULT 0
     )""",
     "CREATE INDEX IF NOT EXISTS idx_pending_uploads_unprocessed ON pending_uploads(processed)",
     # 已废弃(v2 环形冗余架构用 jobs 表替代 send_queue)
