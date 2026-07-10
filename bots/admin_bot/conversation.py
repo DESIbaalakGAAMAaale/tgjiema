@@ -15,6 +15,7 @@ from database import (
     add_spare_channel, remove_spare,
     set_rotation_config,
     update_user_and_invalidate,
+    add_relay_whitelist,
 )
 from utils.time_utils import format_datetime
 
@@ -473,6 +474,14 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await get_cache_store().notify_relay_change()
             except Exception:
                 pass
+            # 自动将该账号 user_id 加入中继白名单,免手动配置
+            if me:
+                try:
+                    added = await add_relay_whitelist(me.id)
+                    if added:
+                        logger.info(f"[Admin] relay_add: 已自动加入中继白名单 (user_id={me.id})")
+                except Exception as e:
+                    logger.warning(f"[Admin] relay_add: 自动加白名单失败: {e}")
             masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
             user_info = f"\n  用户: {me.first_name} (@{me.username})" if me else ""
             await _end(f"✅ 中继账号添加成功(已有有效 session)\n  手机号: {masked}{user_info}")
@@ -593,6 +602,13 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await get_cache_store().notify_relay_change()
         except Exception:
             pass
+        # 自动将该账号 user_id 加入中继白名单,免手动配置
+        try:
+            added = await add_relay_whitelist(me.id)
+            if added:
+                logger.info(f"[Admin] relay_add: 已自动加入中继白名单 (user_id={me.id})")
+        except Exception as e:
+            logger.warning(f"[Admin] relay_add: 自动加白名单失败: {e}")
 
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
         await _end(
@@ -645,6 +661,13 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await get_cache_store().notify_relay_change()
         except Exception:
             pass
+        # 自动将该账号 user_id 加入中继白名单,免手动配置
+        try:
+            added = await add_relay_whitelist(me.id)
+            if added:
+                logger.info(f"[Admin] relay_add: 已自动加入中继白名单 (user_id={me.id})")
+        except Exception as e:
+            logger.warning(f"[Admin] relay_add: 自动加白名单失败: {e}")
 
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
         await _end(
@@ -666,6 +689,33 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await _end(f"✅ 已移除中继账号: {phone[:3]}****{phone[-2:] if len(phone) > 5 else '***'}")
         else:
             await _end(f"❌ 未找到该手机号的中继账号: {phone}")
+
+    # ─── 白名单管理 ──────────────────────────────────────────────
+    elif state == "collector_wl_add:user_id":
+        from database import add_collector_whitelist
+        try:
+            user_id = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字,请重新输入:")
+            return
+        added = await add_collector_whitelist(user_id)
+        if added:
+            await _end(f"✅ 已添加采集器白名单: {user_id}")
+        else:
+            await _end(f"ℹ️ 该用户ID已在采集器白名单中: {user_id}")
+
+    elif state == "collector_wl_remove:user_id":
+        from database import remove_collector_whitelist
+        try:
+            user_id = int(text.strip())
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字,请重新输入:")
+            return
+        removed = await remove_collector_whitelist(user_id)
+        if removed:
+            await _end(f"✅ 已移除采集器白名单: {user_id}")
+        else:
+            await _end(f"ℹ️ 该用户ID不在采集器白名单中: {user_id}")
 
     elif state == "set_access_limit:code":
         file_code = text.strip()
@@ -795,15 +845,6 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await _end(f"❌ 移除失败: {e}")
 
     # ─── 系统配置 ────────────────────────────────────────────────
-    elif state == "set_storage_channel:id":
-        try:
-            channel_id = int(text)
-        except ValueError:
-            await update.message.reply_text("❌ 频道ID必须是数字,请重新输入:")
-            return
-        await set_config("storage_channel_id", str(channel_id))
-        await _end(f"✅ 主存储频道已设为 {channel_id}\n⚠️ 需重启所有机器人后生效")
-
     elif state == "set_file_prefix:prefix":
         prefix = text.strip()
         await set_config("file_code_prefix", prefix)

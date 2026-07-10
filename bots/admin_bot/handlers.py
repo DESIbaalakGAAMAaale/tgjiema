@@ -631,21 +631,6 @@ async def settings_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @_auth_required
-async def set_storage_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if not args:
-        await update.message.reply_text("用法:/set_storage_channel <频道ID>")
-        return
-    try:
-        channel_id = int(args[0])
-    except ValueError:
-        await update.message.reply_text("❌ 频道ID必须是数字")
-        return
-    await set_config("storage_channel_id", str(channel_id))
-    await update.message.reply_text(f"✅ 主存储频道已设为 {channel_id}\n⚠️ 需重启所有机器人后生效")
-
-
-@_auth_required
 async def set_file_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
@@ -954,7 +939,7 @@ async def purge_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"1. 打开频道管理界面\n"
         f"2. 删除所有消息\n"
         f"3. 或直接创建一个新的测试频道\n\n"
-        f"完成后使用 /set_storage_channel <新频道ID> 重新配置。"
+        f"环形架构下频道通过 seed_topology 管理,无需手动设置主存储频道。"
     )
 
 
@@ -1665,7 +1650,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /collector_whitelist [add|remove|clear] [用户ID] — 采集器白名单(热更新)\n\n"
         "⚙️ 系统配置\n"
         "  /settings — 查看全部配置\n"
-        "  /set_storage_channel <频道ID> — 主存储频道(需重启)\n"
         "  /set_file_prefix <前缀> — 文件码前缀(需重启)\n"
         "  /set_force_join <频道ID> [链接] — 强制加群(热更新)\n"
         "  /set_username <upload|decoder|sender> <@用户名> — Bot用户名(热更新)\n"

@@ -90,6 +90,17 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
              InlineKeyboardButton("➕ 添加账号", callback_data="interactive:relay_add")],
             [InlineKeyboardButton("➖ 移除账号", callback_data="interactive:relay_remove"),
              InlineKeyboardButton("📋 查看待处理", callback_data="action:relay_pending")],
+            [InlineKeyboardButton("📋 白名单管理", callback_data="menu:whitelist")],
+        ] + BACK_BTN
+        return text, InlineKeyboardMarkup(kb)
+
+    if menu_id == "whitelist":
+        text = "📋 白名单管理 — 点击按钮操作"
+        kb = [
+            [InlineKeyboardButton("🔐 中继白名单", callback_data="action:relay_whitelist"),
+             InlineKeyboardButton("📦 采集器白名单", callback_data="action:collector_whitelist")],
+            [InlineKeyboardButton("➕ 添加采集器", callback_data="interactive:collector_wl_add"),
+             InlineKeyboardButton("➖ 移除采集器", callback_data="interactive:collector_wl_remove")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -97,7 +108,6 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         text = "⚙️ 系统配置 — 点击按钮操作\n\n⚠️需重启 = 配置需重启所有Bot后生效 | ✅热更新 = 配置即时生效"
         kb = [
             [InlineKeyboardButton("📋 查看全部配置", callback_data="action:settings")],
-            [InlineKeyboardButton("📺 主存储频道", callback_data="interactive:set_storage_channel")],
             [InlineKeyboardButton("📝 文件码前缀", callback_data="interactive:set_file_prefix"),
              InlineKeyboardButton("🔒 强制加群", callback_data="interactive:set_force_join")],
             [InlineKeyboardButton("👤 机器人用户名", callback_data="interactive:set_username"),

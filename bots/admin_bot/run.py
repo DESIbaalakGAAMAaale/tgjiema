@@ -9,7 +9,7 @@ from .handlers import (
     start, status, health, user_detail, users_list, set_level, ban_user, unban_user,
     set_quota, set_external_quota, file_detail, files_list, delete_file, logs,
     relay_code, relay_password, relay_pending, relay_list, relay_add, relay_remove,
-    relay_reset_stats, settings_view, set_storage_channel,
+    relay_reset_stats, settings_view,
     set_file_prefix, set_force_join, set_username, set_quota_default, set_r2,
     set_db_backup, factory_reset, purge_channel, add_code_route, remove_code_route,
     list_code_routes, set_bot_interval, remove_bot_interval, list_bot_intervals,
@@ -67,7 +67,6 @@ async def _async_main():
     app.add_handler(CommandHandler("relay_remove", relay_remove))
     app.add_handler(CommandHandler("relay_reset_stats", relay_reset_stats))
     app.add_handler(CommandHandler("settings", settings_view))
-    app.add_handler(CommandHandler("set_storage_channel", set_storage_channel))
     app.add_handler(CommandHandler("set_file_prefix", set_file_prefix))
     app.add_handler(CommandHandler("set_force_join", set_force_join))
     app.add_handler(CommandHandler("set_username", set_username))

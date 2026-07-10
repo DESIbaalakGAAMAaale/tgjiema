@@ -103,6 +103,24 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text = "✅ 中继当前不需要验证码。"
         await query.edit_message_text(text, reply_markup=back_kb)
 
+    elif data == "action:relay_whitelist":
+        from database import get_relay_whitelist
+        wl = await get_relay_whitelist()
+        if wl:
+            text = "🔐 中继白名单\n\n" + "\n".join(f"  • {uid}" for uid in sorted(wl))
+        else:
+            text = "🔐 中继白名单\n\n❌ 白名单为空（添加中继账号时会自动加入）\n\n可通过 /relay_whitelist add <用户ID> 手动添加"
+        await query.edit_message_text(text, reply_markup=back_kb)
+
+    elif data == "action:collector_whitelist":
+        from database import get_collector_whitelist
+        wl = await get_collector_whitelist()
+        if wl:
+            text = "📦 采集器白名单\n\n" + "\n".join(f"  • {uid}" for uid in sorted(wl))
+        else:
+            text = "📦 采集器白名单\n\n❌ 白名单为空\n\n点击下方「➕ 添加采集器」按钮添加"
+        await query.edit_message_text(text, reply_markup=back_kb)
+
     elif data == "action:settings":
         text = await _get_configs_text()
         await query.edit_message_text(text, reply_markup=back_kb)
@@ -236,6 +254,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "relay_remove:phone",
                 "➖ 移除中继账号\n\n请输入要移除的中继账号手机号(含区号)：\n\n❌ 如需取消请点击下方按钮。"
             ),
+            "collector_wl_add": (
+                "collector_wl_add:user_id",
+                "➕ 添加采集器白名单\n\n请输入 Telegram 用户ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "collector_wl_remove": (
+                "collector_wl_remove:user_id",
+                "➖ 移除采集器白名单\n\n请输入要移除的 Telegram 用户ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+            ),
             "set_access_limit": (
                 "set_access_limit:code",
                 "🔢 设置访问次数限制\n\n请输入文件码：\n\n❌ 如需取消请点击下方按钮。"
@@ -249,10 +275,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "➖ 移除频道槽位\n\n请输入要移除的槽位ID(如 s3a)：\n\n❌ 如需取消请点击下方按钮。"
             ),
             # 系统配置
-            "set_storage_channel": (
-                "set_storage_channel:id",
-                "📺 设置主存储频道\n\n请输入频道ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
-            ),
             "set_file_prefix": (
                 "set_file_prefix:prefix",
                 "📝 设置文件码前缀\n\n请输入新的文件码前缀（例如：tgwenjian）：\n\n❌ 如需取消请点击下方按钮。"
