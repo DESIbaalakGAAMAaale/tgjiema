@@ -100,6 +100,9 @@ async def _relay_pending_cleanup(bot_username: str):
     await _dequeue_external(bot_username)
 
 _bot_last_request: dict[str, float] = {}
+# 脏标记检测冷却：code → 上次重试时间，避免同一码短期内重复触发中继重试
+_dirty_check_cooldown: dict[str, float] = {}
+_DIRTY_COOLDOWN_SEC = 300  # 5 分钟内同一码不重复重试中继
 
 
 async def _wait_bot_interval(bot_username: str):
@@ -675,8 +678,57 @@ async def _process_one_pending(app: Application, row: dict):
             from database import set_external_code_mapping
             await set_external_code_mapping(ext_code, file_code, bot_username="")
             logger.info(f"[Idx][poll] 外部码映射已写入: {ext_code} {file_code}")
+            # 映射写入成功后标记 mapped_codes，确保与 external_code_mapping 同步
+            # 这样中继的 is_code_mapped 检查不会产生脏标记
+            try:
+                from database.relay_db import get_relay_db
+                relay_db = await get_relay_db()
+                if relay_db:
+                    await relay_db.mark_code_mapped(ext_code)
+            except Exception as mark_err:
+                logger.debug(f"[Idx][poll] mark_code_mapped 失败(非致命): {mark_err}")
         except Exception as e:
             logger.error(f"[Idx][poll] 外部码映射写入失败(code={ext_code}): {e}")
+            # 映射写入失败时清除中继的 mapped_codes 标记，避免脏标记导致循环
+            try:
+                from database.relay_db import get_relay_db
+                relay_db = await get_relay_db()
+                if relay_db:
+                    await relay_db.unmark_code(ext_code)
+                    logger.info(f"[Idx][poll] 映射写入失败，已清除中继脏标记: {ext_code}")
+            except Exception as unmark_err:
+                logger.debug(f"[Idx][poll] unmark_code 失败(非致命): {unmark_err}")
+    elif note:
+        # note 存在但 ext_code 提取失败（非外部文件或解析异常），清除中继脏标记
+        try:
+            # 仅当 note 是外部文件类型时才需要清理
+            _is_external_note = False
+            if isinstance(note, str):
+                _is_external_note = '"type"' in note and '"external"' in note
+            elif isinstance(note, dict):
+                _is_external_note = note.get("type") == "external"
+            if _is_external_note:
+                # 尝试从 note 中提取 code 用于 unmark
+                _unmark_code = None
+                if isinstance(note, str):
+                    try:
+                        _np = json.loads(note)
+                        if isinstance(_np, dict):
+                            for k, v in _np.items():
+                                if k == "code":
+                                    _unmark_code = v
+                    except Exception:
+                        pass
+                elif isinstance(note, dict):
+                    _unmark_code = note.get("code")
+                if _unmark_code:
+                    from database.relay_db import get_relay_db
+                    relay_db = await get_relay_db()
+                    if relay_db:
+                        await relay_db.unmark_code(_unmark_code)
+                        logger.warning(f"[Idx][poll] ext_code 提取失败，已清除中继脏标记: {_unmark_code}")
+        except Exception as cleanup_err:
+            logger.debug(f"[Idx][poll] 清理脏标记失败(非致命): {cleanup_err}")
 
     # 通知上传者 + 外部码直接调度 dsp 发送(不再要求用户重新发送码)
     try:
@@ -1967,10 +2019,29 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             logger.warning(f"[Idx][external] 中继返回False后重试系统码映射失败: {e}")
 
         # ── 码已标记映射但实际映射不存在（脏标记）：清除标记并重试中继 ──
+        # 增加冷却时间，避免同一码短期内重复触发中继重试（防止循环）
         try:
             from database.relay_db import get_relay_db
             relay_db = await get_relay_db()
             if relay_db and await relay_db.is_code_mapped(code):
+                # 冷却检查：5分钟内同一码不重复重试中继
+                last_retry = _dirty_check_cooldown.get(code, 0)
+                if time.time() - last_retry < _DIRTY_COOLDOWN_SEC:
+                    logger.warning(
+                        f"[Idx][external] 脏标记冷却中（{int(_DIRTY_COOLDOWN_SEC - (time.time() - last_retry))}s 后可重试）"
+                        f"，通知用户稍后重试: code={code}"
+                    )
+                    # 清除脏标记，让下次用户重试时能走正常中继流程
+                    await relay_db.unmark_code(code)
+                    if result.quota_consumed:
+                        from services.permission import refund_user_quota
+                        await refund_user_quota(user_id, is_external=True)
+                    await safe_reply_text(
+                        update.message,
+                        "文件正在处理中，请稍后重新发送该文件码获取文件。"
+                    )
+                    return
+                _dirty_check_cooldown[code] = time.time()
                 logger.warning(f"[Idx][external] 检测到脏映射标记，清除并重试中继: code={code}")
                 await relay_db.unmark_code(code)
                 # 重试中继发送
