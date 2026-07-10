@@ -387,11 +387,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
     parts = data.split("|")
     action = parts[0]  # report:ban, report:detach, report:block
 
-    # 解析举报人信息和来源 bot(新格式: report:xxx|...|reporter_id|source)
-    # 兼容旧格式(无 reporter_id 和 source)
+    # 解析举报人信息和来源 bot(格式: report:xxx|...|reporter_id|source)
     reporter_id_str = None
     source_bot = None
-    # 从 parts 末尾提取 source(idx/dsp)和 reporter_id
     if len(parts) >= 4 and parts[-1] in ("idx", "dsp"):
         source_bot = parts[-1]
         reporter_id_str = parts[-2]
@@ -444,7 +442,7 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             )
             # 通知举报人
             if reporter_id_str and source_bot:
-                await _notify_reporter(reporter_id_str, source_bot, "您的举报已受理生效，文件码已脱钩处理。")
+                await _notify_reporter(reporter_id_str, source_bot, "您的举报已受理生效，文件已经移除。")
 
         elif action == "report:block":
             if len(parts) < 3:
