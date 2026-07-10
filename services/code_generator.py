@@ -49,12 +49,25 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_random_id(12)
     type_parts = []
-    # 迭代 file_types.items()（已验证可用），在 FILE_TYPE_LABELS 上查 abbr
+    # 直接用字符串比较，避免 .get() 在服务器上的异常行为
     if isinstance(file_types, dict):
-        for k, v in file_types.items():
-            abbr = FILE_TYPE_LABELS.get(k)
-            if abbr and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}{abbr}")
+        items = list(file_types.items())
+        for k, v in items:
+            ks = str(k)
+            if ks == "photo" and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}p")
+            elif ks == "video" and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}v")
+            elif ks == "document" and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}d")
+            elif ks == "audio" and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}a")
+            elif ks == "animation" and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}g")
+            elif ks == "voice" and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}o")
+            elif ks == "sticker" and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}s")
     if not type_parts:
         suffix = "0d"
     else:
