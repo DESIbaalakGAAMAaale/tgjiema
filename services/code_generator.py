@@ -49,25 +49,16 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_random_id(12)
     type_parts = []
-    # 直接用字符串比较，避免 .get() 在服务器上的异常行为
     if isinstance(file_types, dict):
-        items = list(file_types.items())
-        for k, v in items:
-            ks = str(k)
-            if ks == "photo" and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}p")
-            elif ks == "video" and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}v")
-            elif ks == "document" and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}d")
-            elif ks == "audio" and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}a")
-            elif ks == "animation" and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}g")
-            elif ks == "voice" and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}o")
-            elif ks == "sticker" and isinstance(v, (int, float)) and v > 0:
-                type_parts.append(f"{int(v)}s")
+        # 重建 dict：强制 CPython 重新计算 hash 并重建内部哈希表
+        # 规避 orjson(C 扩展)反序列化的 dict 可能存在的 get() 查找异常
+        clean_types = {str(k): v for k, v in file_types.items()}
+        for media_type, count in clean_types.items():
+            if not isinstance(count, (int, float)) or count <= 0:
+                continue
+            label = FILE_TYPE_LABELS.get(media_type)
+            if label:
+                type_parts.append(f"{int(count)}{label}")
     if not type_parts:
         suffix = "0d"
     else:

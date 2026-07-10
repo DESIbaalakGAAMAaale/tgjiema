@@ -562,14 +562,22 @@ def _row_to_dict(record) -> dict:
                 logger.debug(f"[_row_to_dict] {col} 为空/None, 返回空{type(result[col]).__name__}")
             else:
                 try:
-                    result[col] = json.loads(val)
+                    parsed = json.loads(val)
+                    # 重建 dict/list：强制 CPython 重新计算 hash 并重建内部哈希表
+                    # orjson(C 扩展)反序列化的 dict 可能存在 get() 查找异常(items 能遍历但 get 返回默认值)
+                    if isinstance(parsed, dict):
+                        result[col] = {str(k): v for k, v in parsed.items()}
+                    elif isinstance(parsed, list):
+                        result[col] = list(parsed)
+                    else:
+                        result[col] = parsed
                     logger.debug(f"[_row_to_dict] {col} JSON解析成功: type={type(result[col]).__name__}, value={result[col]!r}")
                 except (json.JSONDecodeError, TypeError) as e:
-                    # 如果已经是预期类型（如 asyncpg 直接返回了 dict/list），直接使用
+                    # 如果已经是预期类型（如 asyncpg 直接返回了 dict/list），同样重建
                     if col == "file_types" and isinstance(val, dict):
-                        result[col] = val
+                        result[col] = {str(k): v for k, v in val.items()}
                     elif col in ("backup_channel_msg_ids", "batch_file_meta") and isinstance(val, list):
-                        result[col] = val
+                        result[col] = list(val)
                     else:
                         result[col] = val
                     logger.warning(f"[_row_to_dict] {col} JSON解析失败，使用原始值: type={type(val).__name__}, value={val!r}, error={e}")
