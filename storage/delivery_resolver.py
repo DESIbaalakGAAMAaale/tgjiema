@@ -171,16 +171,17 @@ async def _walk_ring_for_channel(channel_id: int, max_hops: int = 5) -> Delivery
     return DeliveryChannel(channel_id, "unknown", "fallback")
 
 
-async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False, bot_id: int = 1, original_channel_id: int | None = None) -> bool:
-    """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回 True。
+async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, message_id: int, protect_content: bool = False, bot_id: int = 1, original_channel_id: int | None = None) -> int | None:
+    """尝试从指定频道发送一条消息给用户(带 Flood Wait 退避 + 频道限流)。成功返回复制后的 message_id，失败返回 None。
 
     如果 from_channel_id 是影子频道，会先查 message_backups 映射表获取正确的 backed_msg_id。
-    映射缺失时返回 False（禁止回退用主频道 msg_id 盲发，避免投错文件）。
+    映射缺失时返回 None（禁止回退用主频道 msg_id 盲发，避免投错文件）。
+    返回 int 在 truthiness 判断中等价于 True，None 等价于 False，兼容现有 if 调用方式。
     """
     # 查询影子频道 msg_id 映射（如果存在）
     resolved_msg_id = await resolve_backup_msg_id(message_id, from_channel_id, original_channel_id)
     if resolved_msg_id is None:
-        return False
+        return None
 
     # 频道限流:检查是否超过 15 msg/min,循环等待直到拿到配额
     while True:
@@ -190,15 +191,15 @@ async def try_deliver(bot_instance, target_user_id: int, from_channel_id: int, m
         await asyncio.sleep(wait)
 
     try:
-        await safe_copy_message(bot_instance, target_user_id, from_channel_id, resolved_msg_id, protect_content=protect_content, bot_id=bot_id)
-        return True
+        sent = await safe_copy_message(bot_instance, target_user_id, from_channel_id, resolved_msg_id, protect_content=protect_content, bot_id=bot_id)
+        return sent.message_id if sent else None
     except BadRequest as e:
         # C3: 消息不存在于该频道(常见于 failover/rotation 后 target 频道无历史文件)
         logger.warning(f"[delivery] 消息不存在 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
-        return False
+        return None
     except Exception as e:
         logger.warning(f"[delivery] try_deliver 失败 (channel={from_channel_id}, msg={resolved_msg_id}): {e}")
-        return False
+        return None
 
 
 async def resolve_backup_msg_id(main_msg_id: int, channel_id: int, original_channel_id: int | None = None) -> int | None:
@@ -270,16 +271,16 @@ async def resolve_backup_msg_ids(main_msg_ids: list[int], channel_id: int, origi
     return resolved
 
 
-async def try_deliver_batch(bot_instance, target_user_id: int, from_channel_id: int, message_ids: list[int], protect_content: bool = False, bot_id: int = 1, original_channel_id: int | None = None) -> bool:
-    """批量复制多条消息(保持媒体组相册形态)。成功返回 True。
+async def try_deliver_batch(bot_instance, target_user_id: int, from_channel_id: int, message_ids: list[int], protect_content: bool = False, bot_id: int = 1, original_channel_id: int | None = None) -> list[int] | None:
+    """批量复制多条消息(保持媒体组相册形态)。成功返回复制后的 message_id 列表，失败返回 None。
 
     用 Telegram Bot API copyMessages 一次性复制,同媒体组的消息在目标聊天以相册展示。
-    影子频道场景需先解析批量 msg_id 映射,任一缺失则返回 False(回退逐条)。
+    影子频道场景需先解析批量 msg_id 映射,任一缺失则返回 None(回退逐条)。
     """
     from utils.flood_waiter import safe_copy_messages
     resolved_ids = await resolve_backup_msg_ids(message_ids, from_channel_id, original_channel_id)
     if resolved_ids is None:
-        return False
+        return None
 
     # 频道限流:批量算一次调用,但仍按频道配额等待
     while True:
@@ -289,14 +290,16 @@ async def try_deliver_batch(bot_instance, target_user_id: int, from_channel_id: 
         await asyncio.sleep(wait)
 
     try:
-        await safe_copy_messages(bot_instance, target_user_id, from_channel_id, resolved_ids, protect_content=protect_content, bot_id=bot_id)
-        return True
+        copied = await safe_copy_messages(bot_instance, target_user_id, from_channel_id, resolved_ids, protect_content=protect_content, bot_id=bot_id)
+        if copied:
+            return [m.message_id for m in copied]
+        return None
     except BadRequest as e:
         logger.warning(f"[delivery] 批量消息不存在 (channel={from_channel_id}, msgs={resolved_ids}): {e}")
-        return False
+        return None
     except Exception as e:
         logger.warning(f"[delivery] try_deliver_batch 失败 (channel={from_channel_id}, msgs={resolved_ids}): {e}")
-        return False
+        return None
 
 
 async def deliver_with_fallback(

@@ -235,6 +235,36 @@ async def _check_channel_degrade(channel_id: int):
         logger.error(f"[Dsp] 频道降级异常 (channel={channel_id}): {e}")
 
 
+async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
+    """构建发送给用户的媒体组/文件 caption，包含文件总数、备注、文件码。"""
+    lines = []
+    if total_count > 1:
+        lines.append(f"文件获取完毕 文件总数：{total_count}")
+    else:
+        lines.append("文件获取完毕")
+
+    try:
+        record = await get_file_record_cached(file_code)
+        note = ""
+        if record:
+            note = (record.get("note") or "").strip()
+        if note:
+            lines.append(f"备注：{note}")
+    except Exception:
+        pass
+
+    lines.append(f"文件码：{file_code}")
+    return "\n".join(lines)
+
+
+async def _edit_sent_caption(bot: Any, chat_id: int, message_id: int, caption: str):
+    """给已发送的消息/媒体组第一条消息编辑 caption，失败静默。"""
+    try:
+        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption)
+    except Exception as e:
+        logger.debug(f"[Dsp] edit_caption 失败(非致命, msg={message_id}): {e}")
+
+
 def _build_input_media(meta: dict):
     mtype = meta.get("type", "document")
     fid = meta.get("file_id", "")
@@ -507,15 +537,11 @@ async def _process_single_job(bot, job, bot_id: int = 1):
 
     # ── 使用 copy_message 发送 ──
     resolved = await resolve_delivery_channel(job.storage_channel_id)
-    success = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+    sent_msg_id = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
 
-    if not success:
+    if not sent_msg_id:
         await _record_channel_failure(resolved.channel_id)
         # 环形降级:沿环找下一个可用频道,避免重复尝试同一频道
-        # 注意:不能用 resolve_delivery_channel(current_id),因为对 active 频道它会返回自身,导致循环立即 break
-        # 必须用 _walk_ring_for_channel 直接获取环上的下一个频道
-        # 从 resolved.channel_id(已失败的频道)开始沿环找下一个,而非 job.storage_channel_id
-        # 否则当 resolve(A) 返回 B 时,_walk_ring_for_channel(A) 也会返回 B,循环立即 break
         from storage.delivery_resolver import _walk_ring_for_channel
         tried = {resolved.channel_id}
         current_id = resolved.channel_id
@@ -524,19 +550,22 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             if next_resolved.channel_id in tried:
                 break
             tried.add(next_resolved.channel_id)
-            success = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
-            if success:
+            sent_msg_id = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+            if sent_msg_id:
                 break
             await _record_channel_failure(next_resolved.channel_id)
             current_id = next_resolved.channel_id
 
         # C3: 环形降级耗尽后,尝试原始存储频道(消息实际存储位置,即使已降级消息仍存在)
-        if not success and job.storage_channel_id not in tried:
+        if not sent_msg_id and job.storage_channel_id not in tried:
             logger.info(f"[Dsp] 环形降级耗尽,尝试原始存储频道: {job.storage_channel_id}")
-            success = await try_deliver(bot, job.target_user_id, job.storage_channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+            sent_msg_id = await try_deliver(bot, job.target_user_id, job.storage_channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
 
-    if success:
+    if sent_msg_id:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
+        # 给文件添加 caption（文件码+备注）
+        caption = await _build_delivery_caption(job.code, total_count=1)
+        await _edit_sent_caption(bot, job.target_user_id, sent_msg_id, caption)
         await metrics.record_send_success()
         await metrics.record_processed("dsp_bot")
         return True
@@ -611,11 +640,15 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     """
     protect_content = getattr(job, "protect_content", False)
     all_success = True
+    first_sent_mid: int | None = None
     for i, mid in enumerate(job.storage_msg_ids):
         try:
             resolved = await resolve_delivery_channel(job.storage_channel_id)
-            if await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id):
+            sent_mid = await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+            if sent_mid:
                 await metrics.record_send_success()
+                if first_sent_mid is None:
+                    first_sent_mid = sent_mid
             else:
                 await metrics.record_send_fail()
                 all_success = False
@@ -626,6 +659,10 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
         # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
         if i < len(job.storage_msg_ids) - 1:
             await asyncio.sleep(0.15)
+    # 第一条消息添加 caption
+    if first_sent_mid:
+        caption = await _build_delivery_caption(job.code, total_count=len(job.storage_msg_ids))
+        await _edit_sent_caption(bot, job.target_user_id, first_sent_mid, caption)
     await metrics.record_processed("dsp_bot")
     return all_success
 
@@ -634,25 +671,31 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
 
+    # caption 只在第一页添加（多页分页时后续页不重复附加 caption）
+    caption = await _build_delivery_caption(file_code, total_count=len(file_meta_list)) if page == 1 else None
+    first_sent_msg_id: int | None = None
+
     # 使用 copy_message 从存储频道复制（跨Bot file_id 不可用，必须走 copy 路径）
     if storage_msg_ids and storage_channel_id:
         page_msg_ids = storage_msg_ids[start:end]
 
         # 优先用 copy_messages 批量复制(保持媒体组相册形态),失败再回退逐条 copy_message
         resolved = None
+        batch_copied_ids = None
         try:
             resolved = await resolve_delivery_channel(storage_channel_id)
-            batch_ok = await try_deliver_batch(
+            batch_copied_ids = await try_deliver_batch(
                 bot, chat_id, resolved.channel_id, page_msg_ids,
                 protect_content=protect_content, bot_id=bot_id,
                 original_channel_id=storage_channel_id,
             )
         except Exception as e:
-            batch_ok = False
+            batch_copied_ids = None
             logger.warning(f"[Dsp] _send_page 批量复制异常,回退逐条: {e}")
 
-        if batch_ok:
+        if batch_copied_ids:
             logger.info(f"[Dsp] 分页发送成功(批量相册): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(page_msg_ids)}个文件)")
+            first_sent_msg_id = batch_copied_ids[0]
             await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
         else:
@@ -664,8 +707,11 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             fail_details = []
             for i, mid in enumerate(page_msg_ids):
                 try:
-                    if await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id):
+                    sent_mid = await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id)
+                    if sent_mid:
                         success_count += 1
+                        if first_sent_msg_id is None:
+                            first_sent_msg_id = sent_mid
                     else:
                         fail_details.append(f"msg={mid}(channel={fallback_channel}/{fallback_status})")
                         logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={fallback_channel}/{fallback_status}, original_channel={storage_channel_id})")
@@ -695,7 +741,9 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         page_items = file_meta_list[start:end]
         input_media = [_build_input_media(meta) for meta in page_items]
         try:
-            await safe_send_media_group(bot, chat_id=chat_id, media=input_media)
+            sent_msgs = await safe_send_media_group(bot, chat_id=chat_id, media=input_media)
+            if sent_msgs:
+                first_sent_msg_id = sent_msgs[0].message_id
             logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(input_media)}张)")
             await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
@@ -708,6 +756,10 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             except Exception:
                 pass
             return False
+
+    # 第一页发送成功后，给第一条消息编辑 caption（显示文件总数+备注+文件码）
+    if caption and first_sent_msg_id:
+        await _edit_sent_caption(bot, chat_id, first_sent_msg_id, caption)
 
     if total_pages > 1 and page < total_pages:
         # 使用 page_key 避免多用户同码键冲突
