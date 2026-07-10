@@ -776,31 +776,42 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # R25-L1: 文件码属敏感凭据,日志降级到 DEBUG 且不记录原始文本/repr_bytes
     logger.debug(f"[handle_code] received text, len={len(raw_text)}, entities={len(update.message.entities) if update.message.entities else 0}")
 
-    # 1. 先检查消息中是否包含内部文件码（最高优先级）
-    # 容错: 用户复制"文件码：xxx"通知消息时,可能带入前缀后面的中英文冒号(: ：),需先剥掉
     prefix = settings.FILE_CODE_PREFIX
-    # 匹配 prefix + 可选的冒号(中英文) + 实际文件码字符
-    internal_match = re.search(r'(' + re.escape(prefix) + r'[:：]*[a-z0-9_]+)', raw_text)
 
-    if internal_match:
-        # 内部码：优先走本地解码。剥掉 prefix 后可能残留的冒号,只保留实际码
-        text = internal_match.group(1)
-        # 去掉 prefix 后,如果开头是冒号(中英文),剥掉
-        if text.startswith(prefix):
-            tail = text[len(prefix):]
-            tail = tail.lstrip(":：")
-            text = prefix + tail
-        logger.debug(f"[handle_code] internal code matched, len={len(text)}")
-        is_external = False
+    # 路由匹配优先：如果 _extracted_bot 已设置（前缀/正则路由命中），
+    # 直接走外部码流程，跳过内部码检查，避免 _override_text 中的 bot:code 格式
+    # 被 internal_match 误匹配或被 extract_code_and_bot_from_message 错误解析
+    _route_bot = context.user_data.get("_extracted_bot")
+    if _route_bot:
+        text = context.user_data.get("_original_external_code") or raw_text
+        bot_username = _route_bot
+        is_external = True
+        logger.debug(f"[handle_code] route-matched code, bot={bot_username}, code_len={len(text)}")
     else:
-        # 2. 没有内部码 → 提取 bot 用户名走第三方码
-        code, bot_username = extract_code_and_bot_from_message(raw_text)
-        if bot_username:
-            text = code
-            is_external = True
+        # 1. 先检查消息中是否包含内部文件码（最高优先级）
+        # 容错: 用户复制"文件码：xxx"通知消息时,可能带入前缀后面的中英文冒号(: ：),需先剥掉
+        # 匹配 prefix + 可选的冒号(中英文) + 实际文件码字符
+        internal_match = re.search(r'(' + re.escape(prefix) + r'[:：]*[a-z0-9_]+)', raw_text)
+
+        if internal_match:
+            # 内部码：优先走本地解码。剥掉 prefix 后可能残留的冒号,只保留实际码
+            text = internal_match.group(1)
+            # 去掉 prefix 后,如果开头是冒号(中英文),剥掉
+            if text.startswith(prefix):
+                tail = text[len(prefix):]
+                tail = tail.lstrip(":：")
+                text = prefix + tail
+            logger.debug(f"[handle_code] internal code matched, len={len(text)}")
+            is_external = False
         else:
-            await safe_reply_text(update.message, "消息格式不正确，请发送文件码或包含 bot 用户名的消息")
-            return
+            # 2. 没有内部码 → 提取 bot 用户名走第三方码
+            code, bot_username = extract_code_and_bot_from_message(raw_text)
+            if bot_username:
+                text = code
+                is_external = True
+            else:
+                await safe_reply_text(update.message, "消息格式不正确，请发送文件码或包含 bot 用户名的消息")
+                return
 
     if not await global_rate_limiter.acquire():
         await safe_reply_text(update.message, "系统繁忙，请稍后重试")
@@ -1803,6 +1814,14 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
     if bot_username is None and result:
         bot_username = result.external_bot_username
 
+    # ── 路由匹配纠正：用原始码替换 extract_code_and_bot_from_message 的错误提取 ──
+    # 必须在 check_decode_permission 之前执行，确保配额检查和后续流程使用正确的 code
+    original_code = context.user_data.pop("_original_external_code", None)
+    if original_code:
+        code = original_code
+        bot_username = context.user_data.pop("_extracted_bot", bot_username)
+        create_safe_task(save_code_bot_mapping(code, bot_username), name="save_code_bot_mapping")
+
     # ── 配额检查（仅检查不递增，投递成功后再递增）──
     if result is None:
         from services.permission import check_decode_permission
@@ -1810,12 +1829,6 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         if not result.allowed:
             await safe_reply_text(update.message, result.reason)
             return
-
-    original_code = context.user_data.pop("_original_external_code", None)
-    if original_code:
-        code = original_code
-        bot_username = context.user_data.pop("_extracted_bot", bot_username)
-        create_safe_task(save_code_bot_mapping(code, bot_username), name="save_code_bot_mapping")
 
     # ── 检查外部码映射:如果有系统码映射,直接走本地解码流──
     system_code = await get_system_code_for_external(code)
@@ -2241,47 +2254,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_code(update, context)
         return
 
+    # ── 无头码/第三方码路由匹配 ──
+    # 从消息中提取可能的码 token，逐个尝试匹配路由
+    # 支持消息含其他文字（中文/英文）时仍能提取码
     clean_text = text.strip()
+    # 候选码列表：优先整条消息(无中文时)，然后提取的 token
+    candidates: list[str] = []
     if clean_text and len(clean_text) >= 4 and not re.search(r'[\u4e00-\u9fff]', clean_text):
-        known_bot = await get_bot_for_code(clean_text)
-        if known_bot:
-            logger.info(f"[Idx] 命中无头码缓存: code={clean_text}, bot={known_bot}")
-            context.user_data["_original_external_code"] = clean_text
-            context.user_data["_extracted_bot"] = known_bot
-            context.user_data["_override_text"] = f"{known_bot}:{clean_text}"
-            await handle_code(update, context)
-            return
+        candidates.append(clean_text)
+    # 提取所有 4+ 字符的字母数字 token（含下划线/连字符），即使消息含中文也提取
+    for token in re.findall(r'[a-zA-Z0-9_\-]{4,}', clean_text):
+        if token not in candidates:
+            candidates.append(token)
 
-        # ── 通配符前缀匹配：用 code_routes 中的前缀匹配未知码 ──
-        from database import get_all_code_bot_routes
+    # 过滤掉内部码（已在前面处理）
+    candidates = [c for c in candidates if not c.startswith(_prefix + "_")]
+
+    if candidates:
+        from database import get_all_code_bot_routes, resolve_bot_for_code_regex
         routes = await get_all_code_bot_routes()
-        if routes:
-            best_prefix = ""
-            best_bot = ""
-            for prefix, bot_username in routes.items():
-                if clean_text.startswith(prefix) and len(prefix) > len(best_prefix):
-                    best_prefix = prefix
-                    best_bot = bot_username
-            if best_bot:
-                logger.info(f"[Idx] 通配符匹配: code={clean_text}, prefix={best_prefix}, bot={best_bot}")
-                context.user_data["_original_external_code"] = clean_text
-                context.user_data["_extracted_bot"] = best_bot
-                context.user_data["_override_text"] = f"{best_bot}:{clean_text}"
-                create_safe_task(save_code_bot_mapping(clean_text, best_bot), name="save_code_bot_mapping")
+        for candidate in candidates:
+            # 1. 无头码缓存
+            known_bot = await get_bot_for_code(candidate)
+            if known_bot:
+                logger.info(f"[Idx] 命中无头码缓存: code={candidate}, bot={known_bot}")
+                context.user_data["_original_external_code"] = candidate
+                context.user_data["_extracted_bot"] = known_bot
+                context.user_data["_override_text"] = f"{known_bot}:{candidate}"
                 await handle_code(update, context)
                 return
 
-        # ── 正则路由匹配：用于 40位hash / emoji / 其他非前缀式第三方码 ──
-        from database import resolve_bot_for_code_regex
-        regex_bot = await resolve_bot_for_code_regex(clean_text)
-        if regex_bot:
-            logger.info(f"[Idx] 正则路由匹配: code={clean_text}, bot={regex_bot}")
-            context.user_data["_original_external_code"] = clean_text
-            context.user_data["_extracted_bot"] = regex_bot
-            context.user_data["_override_text"] = f"{regex_bot}:{clean_text}"
-            create_safe_task(save_code_bot_mapping(clean_text, regex_bot), name="save_code_bot_mapping")
-            await handle_code(update, context)
-            return
+            # 2. 前缀路由匹配
+            if routes:
+                best_prefix = ""
+                best_bot = ""
+                for rp, rb in routes.items():
+                    if candidate.startswith(rp) and len(rp) > len(best_prefix):
+                        best_prefix = rp
+                        best_bot = rb
+                if best_bot:
+                    logger.info(f"[Idx] 通配符匹配: code={candidate}, prefix={best_prefix}, bot={best_bot}")
+                    context.user_data["_original_external_code"] = candidate
+                    context.user_data["_extracted_bot"] = best_bot
+                    context.user_data["_override_text"] = f"{best_bot}:{candidate}"
+                    create_safe_task(save_code_bot_mapping(candidate, best_bot), name="save_code_bot_mapping")
+                    await handle_code(update, context)
+                    return
+
+            # 3. 正则路由匹配（仅对不含空格/换行的单个 token）
+            if ' ' not in candidate and '\n' not in candidate:
+                regex_bot = await resolve_bot_for_code_regex(candidate)
+                if regex_bot:
+                    logger.info(f"[Idx] 正则路由匹配: code={candidate}, bot={regex_bot}")
+                    context.user_data["_original_external_code"] = candidate
+                    context.user_data["_extracted_bot"] = regex_bot
+                    context.user_data["_override_text"] = f"{regex_bot}:{candidate}"
+                    create_safe_task(save_code_bot_mapping(candidate, regex_bot), name="save_code_bot_mapping")
+                    await handle_code(update, context)
+                    return
 
 
 # ─── 运行 ───
