@@ -237,11 +237,7 @@ async def _check_channel_degrade(channel_id: int):
 
 async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
     """构建发送给用户的媒体组/文件 caption，包含文件总数、备注、文件码。"""
-    lines = []
-    if total_count > 1:
-        lines.append(f"文件获取完毕 文件总数：{total_count}")
-    else:
-        lines.append("文件获取完毕")
+    lines = [f"文件获取完毕 文件总数：{total_count}"]
 
     try:
         record = await get_file_record_cached(file_code)
@@ -253,7 +249,7 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
     except Exception:
         pass
 
-    lines.append(f"文件码：{file_code}")
+    lines.append(f"分享给好友（点击复制）：{file_code}")
     return "\n".join(lines)
 
 
