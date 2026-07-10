@@ -52,6 +52,12 @@ _mg_lock = asyncio.Lock()  # 保护 _pending_media_groups 和 _external_buffers
 _pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
 # PRE-15: 追踪已完成的 _finalize_upload 消息 ID，防止 Telegram 重复回调覆盖成功消息
 _finalized_msg_ids: set[int] = set()
+# 模块级 bot 引用,供 _flush_external_buffer 等非 handler 函数使用
+_bot = None
+# 媒体组路由:media_group_id -> external_code
+# 当 relay 用 grouping=True 发送时,只有第一条消息有 EXTERNAL_RELAY: caption,
+# 后续消息靠 media_group_id 匹配此映射,统一走 _handle_external_relay_file
+_external_mgid_map: dict[str, str] = {}
 
 
 def _extract_file_unique_id(msg) -> str:
@@ -203,6 +209,9 @@ async def _cleanup_pending():
             if len(_finalized_msg_ids) > 10000:
                 _finalized_msg_ids.clear()
                 logger.debug("[up_bot] 清理 _finalized_msg_ids (超过10000条)")
+            # 清理 _external_mgid_map (超过 300s 的旧映射)
+            if _external_mgid_map:
+                _external_mgid_map.clear()
         except Exception as e:
             logger.error(f"[up_bot] 清理超时缓冲区异常: {e}")
         await asyncio.sleep(60)
@@ -688,6 +697,23 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 外部中继文件优先路由:caption 以 EXTERNAL_RELAY: 开头,或 media_group_id 已登记为外部组
+    caption = update.message.caption or ""
+    mgid = update.message.media_group_id or ""
+    if caption.startswith("EXTERNAL_RELAY:"):
+        if mgid:
+            # 从 caption 提取 external_code 并登记 media_group_id 映射
+            rest = caption[len("EXTERNAL_RELAY:"):]
+            user_end = rest.find(":")
+            if user_end != -1:
+                _external_mgid_map[mgid] = rest[user_end + 1:].strip()
+        await _handle_external_relay_file(update, context)
+        return
+    if mgid and mgid in _external_mgid_map:
+        # 媒体组后续消息(无 caption,但 media_group_id 匹配外部中继组)
+        await _handle_external_relay_file(update, context, ext_code_override=_external_mgid_map[mgid])
+        return
+
     if not await check_force_join(update, context):
         return
     if "batch" in context.user_data:
@@ -1327,36 +1353,46 @@ def _build_note_keyboard():
 
 # ─── 中继外部文件处理 ───
 
-async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFAULT_TYPE, ext_code_override: str = ""):
     """处理中继账号转发到 Up Bot 的外部文件。
     格式:EXTERNAL_RELAY:{user_id}:{external_code}
-    文件先 copy 到存储频道，积累后由 EXTERNAL_DONE 触发批量写入 pending_uploads。
+    文件先缓存消息引用，积累后由 EXTERNAL_DONE 触发批量 copy 到存储频道（保持媒体组格式）。
+    ext_code_override: 媒体组后续消息(无 caption)时,由 _dispatch_media 传入已解析的 external_code。
     """
     # R30-3: 校验发送者是否为受信中继账号，防止任意用户绕过上传权限/限速注入文件
     # C11: 统一使用 utils.relay_auth.is_relay_sender_allowed（fail-closed 语义一致）
     if not await is_relay_sender_allowed(update.effective_user.id):
         return
 
-    caption = update.message.caption or ""
-    rest = caption[len("EXTERNAL_RELAY:"):]
-    user_end = rest.find(":")
-    if user_end == -1:
-        return
-    try:
-        external_user_id = int(rest[:user_end])
-    except ValueError:
-        return
-    external_code = rest[user_end + 1:].strip()
+    if ext_code_override:
+        # 媒体组后续消息:从已有 buffer 获取 user_id,external_code 由参数提供
+        external_code = ext_code_override
+        async with _mg_lock:
+            buf = _external_buffers.get(external_code)
+            external_user_id = buf["user_id"] if buf else 0
+            target_ch = buf["channel_id"] if buf else 0
+        if not target_ch:
+            # buffer 尚未创建(首条 caption 消息可能延迟到达),跳过等待首条
+            logger.debug(f"[Up][ext_relay] 媒体组后续消息到达但 buffer 尚未创建 (code={external_code}), 跳过")
+            return
+    else:
+        caption = update.message.caption or ""
+        rest = caption[len("EXTERNAL_RELAY:"):]
+        user_end = rest.find(":")
+        if user_end == -1:
+            return
+        try:
+            external_user_id = int(rest[:user_end])
+        except ValueError:
+            return
+        external_code = rest[user_end + 1:].strip()
 
-    # 同一 external_code 的所有文件必须 copy 到同一存储频道，
-    # 否则 pending_uploads 的 primary_channel_id 与 batch_msg_ids 中的消息 ID 不匹配（PRE-15 关联修复）
-    # 在锁内确定 channel_id 并创建占位 buffer，避免并发文件分散到不同频道（TOCTOU 竞态修复）
+        # 同一 external_code 的所有文件必须 copy 到同一存储频道
     async with _mg_lock:
         buf = _external_buffers.get(external_code)
         if buf is not None and buf.get("channel_id"):
             target_ch = buf["channel_id"]
         else:
-            # 首次见到此 external_code：在锁内确定频道并创建占位 buffer
             try:
                 target_ch = await _get_upload_target_channel()
             except RuntimeError as e:
@@ -1366,56 +1402,62 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
                 "user_id": external_user_id,
                 "channel_id": target_ch,
                 "msg_ids": [],
+                "pending_copies": [],  # P1: 待批量 copy 的 (chat_id, message_id, file_type, file_meta)
                 "files_meta": [],
                 "file_types": defaultdict(int),
                 "flushed": False,
                 "created_at": time.time(),
             }
-
-    # B1 秒传去重:仅复用同 channel 的已有文件(保证 buffer channel 一致性)
-    existing = await _check_dedup(target_ch, update.message)
-    if existing and existing["channel_id"] == target_ch:
-        channel_msg_id = existing["message_id"]
-        logger.info(f"[Up][ext_relay] 秒传去重命中: reuse msg_id={channel_msg_id} (code={external_code})")
-        await metrics.increment("up.dedup_hit")
-    else:
-        try:
-            forwarded = await safe_copy_message(context.bot, target_ch, update.effective_chat.id, update.message.message_id)
-            channel_msg_id = forwarded.message_id
-        except Exception as e:
-            logger.error(f"[Up][ext_relay] copy 到存储频道失败 (code={external_code}): {e}")
-            return
 
     file_type = detect_file_type(update)
     file_meta = extract_file_meta(update)
 
-    async with _mg_lock:
-        buf = _external_buffers.get(external_code)
-        if buf is None:
-            # 极端情况：buffer 被安全超时 flush 清理了，重新创建
-            buf = {
-                "user_id": external_user_id,
-                "channel_id": target_ch,
-                "msg_ids": [],
-                "files_meta": [],
-                "file_types": defaultdict(int),
-                "flushed": False,
-                "created_at": time.time(),
-            }
-            _external_buffers[external_code] = buf
-
-        buf["msg_ids"].append(channel_msg_id)
-        buf["files_meta"].append(file_meta)
-        buf["file_types"][file_type] += 1
-
-        # 重置安全超时定时器
-        if buf.get("timer"):
-            buf["timer"].cancel()
-        buf["timer"] = asyncio.get_running_loop().call_later(
-            60, lambda: asyncio.ensure_future(_flush_external_buffer(external_code, safe_mode=True))
-        )
-        msg_count = len(buf["msg_ids"])
-    logger.debug(f"[Up][ext_relay] 外部文件已缓存 (code={external_code}), 共{msg_count}个文件")
+    # B1 秒传去重:仅复用同 channel 的已有文件
+    existing = await _check_dedup(target_ch, update.message)
+    if existing and existing["channel_id"] == target_ch:
+        # 去重命中:直接记录已有 msg_id,无需 copy
+        channel_msg_id = existing["message_id"]
+        logger.info(f"[Up][ext_relay] 秒传去重命中: reuse msg_id={channel_msg_id} (code={external_code})")
+        await metrics.increment("up.dedup_hit")
+        async with _mg_lock:
+            buf = _external_buffers.get(external_code)
+            if buf is None:
+                return
+            buf["msg_ids"].append(channel_msg_id)
+            buf["files_meta"].append(file_meta)
+            buf["file_types"][file_type] += 1
+            if buf.get("timer"):
+                buf["timer"].cancel()
+            buf["timer"] = asyncio.get_running_loop().call_later(
+                60, lambda: asyncio.ensure_future(_flush_external_buffer(external_code, safe_mode=True))
+            )
+            msg_count = len(buf["msg_ids"]) + len(buf["pending_copies"])
+        logger.debug(f"[Up][ext_relay] 外部文件已缓存(去重) (code={external_code}), 共{msg_count}个文件")
+    else:
+        # 未命中去重:缓存消息引用,flush 时批量 copy 保持媒体组
+        async with _mg_lock:
+            buf = _external_buffers.get(external_code)
+            if buf is None:
+                # buffer 被安全超时 flush 清理了,重新创建
+                buf = {
+                    "user_id": external_user_id,
+                    "channel_id": target_ch,
+                    "msg_ids": [],
+                    "pending_copies": [],
+                    "files_meta": [],
+                    "file_types": defaultdict(int),
+                    "flushed": False,
+                    "created_at": time.time(),
+                }
+                _external_buffers[external_code] = buf
+            buf["pending_copies"].append((update.effective_chat.id, update.message.message_id, file_type, file_meta))
+            if buf.get("timer"):
+                buf["timer"].cancel()
+            buf["timer"] = asyncio.get_running_loop().call_later(
+                60, lambda: asyncio.ensure_future(_flush_external_buffer(external_code, safe_mode=True))
+            )
+            msg_count = len(buf["msg_ids"]) + len(buf["pending_copies"])
+        logger.debug(f"[Up][ext_relay] 外部文件待批量copy (code={external_code}), 共{msg_count}个文件")
 
 
 async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1442,44 +1484,81 @@ async def _handle_external_done(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
-    """刷新外部文件缓冲写入 pending_uploads
+    """刷新外部文件缓冲:先批量 copy 到存储频道,再写入 pending_uploads。
     如果 safe_mode=True，则 flush 已执行，EXTERNAL_DONE 到达时不应重复处理。
     """
     async with _mg_lock:
         buf = _external_buffers.get(external_code)
         if buf is None:
             return
-
-        # 防止竞争：safe_mode 的超时 flush 已执行后，EXTERNAL_DONE 不应重复处理。
         if buf.get("flushed"):
             return
-
-        # 标记为已处理,防止重复 flush
         buf["flushed"] = True
         _external_buffers.pop(external_code, None)
-
         if buf.get("timer"):
             buf["timer"].cancel()
+        # 清理 _external_mgid_map 中对应的映射
+        stale_mgids = [k for k, v in _external_mgid_map.items() if v == external_code]
+        for k in stale_mgids:
+            _external_mgid_map.pop(k, None)
 
-    msg_ids = buf.get("msg_ids", [])
-    if not msg_ids:
-        logger.warning(f"[Up][ext_relay] 外部文件缓冲区为空，跳过 (code={external_code})")
-        return
-
-    # 复用 buf 中记录的实际存储频道，而非重新轮选（与 _handle_external_relay_file 保持一致）
     target_ch = buf.get("channel_id")
     if not target_ch:
         logger.error(f"[Up][ext_relay] 缓冲区缺失 channel_id (code={external_code})，跳过")
         return
-    type_str = _json_dumps(dict(buf["file_types"]))
+
+    msg_ids = list(buf.get("msg_ids", []))
+    files_meta = list(buf.get("files_meta", []))
+    file_types = buf.get("file_types", defaultdict(int))
+    pending_copies = buf.get("pending_copies", [])
+
+    # P1: 批量 copy 未去重的文件到存储频道(保持媒体组格式)
+    if pending_copies:
+        from utils.flood_waiter import safe_copy_messages
+        # 取所有待 copy 的消息 ID
+        from_chat = pending_copies[0][0]
+        copy_msg_ids = [pc[1] for pc in pending_copies]
+        try:
+            if len(copy_msg_ids) == 1:
+                # 单文件直接 copy
+                from utils.flood_waiter import safe_copy_message
+                forwarded = await safe_copy_message(_bot, target_ch, from_chat, copy_msg_ids[0])
+                new_ids = [forwarded.message_id]
+            else:
+                # 多文件用 copy_messages 批量复制(保持相册格式)
+                results = await safe_copy_messages(_bot, target_ch, from_chat, copy_msg_ids)
+                new_ids = [r.message_id for r in results]
+            logger.info(f"[Up][ext_relay] 批量 copy 到存储频道: {len(new_ids)}个文件 (code={external_code})")
+            # 补充 file_meta 和 file_types(从 pending_copies 中取)
+            for i, (_, _, ft, fm) in enumerate(pending_copies):
+                if i < len(new_ids):
+                    msg_ids.append(new_ids[i])
+                    files_meta.append(fm)
+                    file_types[ft] += 1
+        except Exception as e:
+            logger.error(f"[Up][ext_relay] 批量 copy 失败,回退逐条 (code={external_code}): {e}")
+            # 回退到逐条 copy
+            from utils.flood_waiter import safe_copy_message
+            for from_chat, msg_id, ft, fm in pending_copies:
+                try:
+                    forwarded = await safe_copy_message(_bot, target_ch, from_chat, msg_id)
+                    msg_ids.append(forwarded.message_id)
+                    files_meta.append(fm)
+                    file_types[ft] += 1
+                except Exception as e2:
+                    logger.error(f"[Up][ext_relay] 逐条 copy 也失败 (msg={msg_id}): {e2}")
+
+    if not msg_ids:
+        logger.warning(f"[Up][ext_relay] 外部文件缓冲区为空，跳过 (code={external_code})")
+        return
+
+    type_str = _json_dumps(dict(file_types))
     batch_ids_str = ",".join(str(mid) for mid in msg_ids)
-    batch_file_meta_str = _json_dumps(buf["files_meta"])
+    batch_file_meta_str = _json_dumps(files_meta)
     note = _json_dumps({"type": "external", "code": external_code})
 
     try:
         pending_col = get_pending_uploads_col()
-        # PRE-15: 补全 protect_content / file_ttl_days 字段，与正常上传路径保持一致，
-        # 避免 idx_bot 处理 pending_uploads 时因字段缺失而写入不完整的 file_records
         await pending_col.insert_one({
             "uploader_id": buf["user_id"],
             "primary_channel_id": target_ch,
@@ -1491,8 +1570,8 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
             "status_msg_id": 0,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "processed": 0,
-            "protect_content": False,  # 外部中继文件默认允许转发
-            "file_ttl_days": 0,  # 0 = 永久有效，与 DEFAULT_FILE_TTL_DAYS 一致
+            "protect_content": False,
+            "file_ttl_days": 0,
         })
         logger.info(f"[Up][ext_relay] 外部文件已写入pending_uploads: code={external_code}, {len(msg_ids)}个文件")
     except Exception as e:
@@ -1520,6 +1599,8 @@ async def _async_main():
 
     logger.info("[Up] 启动上传机器人（Up Bot）...")
     app = Application.builder().token(TOKEN).build()
+    global _bot
+    _bot = app.bot
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("start_upload", start_upload))

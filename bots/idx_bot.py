@@ -1849,8 +1849,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                 await _dispatch_to_dsp(user_id, system_code, storage_channel, msg_ids, batch_file_meta_str, protect_content)
                 # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
                 await safe_reply_text(update.message,
-                    f"文件 {code} 已缓存，正在发送，请查收。\n"
-                    f"(系统 {system_code})"
+                    f"文件 {code} 已缓存，正在发送，请查收。"
                 )
                 metrics.decode_count += 1
                 await metrics.record_processed("idx_bot")
@@ -1922,8 +1921,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                     protect_content_r = file_record_retry.get("protect_content", False)
                     await _dispatch_to_dsp(user_id, system_code_retry, storage_channel_r, msg_ids_r, batch_file_meta_r, protect_content_r)
                     await safe_reply_text(update.message,
-                        f"文件 {code} 已缓存，正在发送，请查收。\n"
-                        f"(系统 {system_code_retry})"
+                        f"文件 {code} 已缓存，正在发送，请查收。"
                     )
                     metrics.decode_count += 1
                     await metrics.record_processed("idx_bot")
