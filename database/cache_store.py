@@ -23,6 +23,8 @@ DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
 _cells_version_counter = int(time.time() * 1000)
 # C3: relay 账号池变更版本计数器(独立于 cells,语义隔离)
 _relay_version_counter = int(time.time() * 1000)
+# 文件记录变更版本计数器(admin_bot 写 → idx_bot/dsp_bot 读,失效内存缓存)
+_file_record_version_counter = int(time.time() * 1000)
 
 # ─── JSON 字段反序列化（SQLite 存储为 JSON 字符串，读取时需还原为 Python 对象）───
 _JSON_FIELDS_DICT = {"file_types"}  # 期望 dict 的字段
@@ -64,6 +66,12 @@ def _next_relay_version() -> int:
     global _relay_version_counter
     _relay_version_counter += 1
     return _relay_version_counter
+
+
+def _next_file_record_version() -> int:
+    global _file_record_version_counter
+    _file_record_version_counter += 1
+    return _file_record_version_counter
 
 
 class CacheStore:
@@ -198,6 +206,17 @@ class CacheStore:
                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
                 version INTEGER NOT NULL,
                 ts      REAL NOT NULL
+            )"""
+        )
+        # ─── 文件记录变更跨进程通知表(admin_bot 写 → idx_bot/dsp_bot 读)───
+        # admin_bot 处理举报(脱钩/封禁/限制)后写入,idx_bot/dsp_bot 检测到变更后失效内存缓存
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS file_record_change_notify (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                version      INTEGER NOT NULL,
+                change_type  TEXT NOT NULL,
+                record_key   TEXT NOT NULL,
+                ts           REAL NOT NULL
             )"""
         )
         # ─── E2: cells 本地逐行存储(热路径零CRDB,仅异常事件同步CRDB) ───
@@ -1782,6 +1801,45 @@ class CacheStore:
         )
         new_version = row[0][0] if row and row[0][0] else last_version
         return new_version > last_version, new_version
+
+    # ─── 记录变更跨进程通知(admin_bot 写 → idx_bot/dsp_bot 读)───
+
+    async def notify_record_change(self, change_type: str, record_key: str):
+        """写入记录变更通知,触发 idx_bot/dsp_bot 失效内存缓存。
+
+        change_type: "file" 或 "user"
+        record_key: file_code 或 user_id
+        由 admin_bot 在处理举报(脱钩/封禁/限制)后调用。
+        """
+        if not self._db:
+            return
+        version = _next_file_record_version()
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO file_record_change_notify (version, change_type, record_key, ts) VALUES (?, ?, ?, ?)",
+            (version, change_type, str(record_key), now),
+        )
+        await self._db.commit()
+
+    async def consume_record_changes(self, last_version: int) -> tuple[list[tuple[str, str]], int]:
+        """查询 last_version 之后的所有记录变更,返回 ((change_type, record_key) 列表, 最新版本号)。
+
+        idx_bot/dsp_bot 后台任务定期调用,检测到变更后逐个失效对应缓存。
+        """
+        if not self._db:
+            return [], last_version
+        rows = await self._db.execute_fetchall(
+            "SELECT DISTINCT change_type, record_key FROM file_record_change_notify WHERE version > ?",
+            (last_version,),
+        )
+        if not rows:
+            return [], last_version
+        changes = [(row[0], row[1]) for row in rows if row[0] and row[1]]
+        ver_row = await self._db.execute_fetchall(
+            "SELECT MAX(version) FROM file_record_change_notify"
+        )
+        new_version = ver_row[0][0] if ver_row and ver_row[0][0] else last_version
+        return changes, new_version
 
     # ─── Manifest 驱动的副本同步（免 Telethon 读历史）───
 

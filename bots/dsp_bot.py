@@ -880,8 +880,8 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔒 封禁上传者", callback_data=f"report:ban|{uploader_id}")],
-        [InlineKeyboardButton("🔗 脱钩文件码", callback_data=f"report:detach|{file_code}")],
+        [InlineKeyboardButton("🔒 封禁上传者", callback_data=f"report:ban|{uploader_id}|{reporter.id}|dsp")],
+        [InlineKeyboardButton("🔗 脱钩文件码", callback_data=f"report:detach|{file_code}|{reporter.id}|dsp")],
         [InlineKeyboardButton("🚫 限制举报人", callback_data=f"report:block|{file_code}|{reporter.id}")],
         [InlineKeyboardButton("✅ 忽略", callback_data="report:ignore")],
     ])
@@ -1092,6 +1092,38 @@ async def _async_main():
     create_safe_task(reclaim_dispatched_loop(), name="reclaim-dispatched")  # E: 回收超时 dispatched
     create_safe_task(_reclaim_stale_pel_loop(), name="reclaim-stale-pel")  # N-R1: 回收 PEL 孤儿条目
     create_safe_task(_watch_cells_change(), name="watch-cells-change")  # PRE-02: 失效 delivery_resolver 缓存
+    # 监听文件/用户记录变更通知(admin_bot 举报处理触发),失效本进程内存缓存
+    async def _watch_record_change():
+        """每 3 秒检查 file_record_change_notify,发现变更后失效对应内存缓存。
+
+        admin_bot 处理举报(脱钩/封禁/限制)后通过 notify_record_change 写入 SQLite 通知表。
+        本任务检测到变更后逐个失效 file/user 缓存,确保脱钩封禁等实时生效。
+        """
+        from database.cache_store import get_cache_store
+        from database.cache import invalidate_file_record, get_user_cache
+        store = get_cache_store()
+        last_version = 0
+        while True:
+            try:
+                changes, new_version = await store.consume_record_changes(last_version)
+                if changes:
+                    for change_type, record_key in changes:
+                        if change_type == "file":
+                            invalidate_file_record(record_key)
+                        elif change_type == "user":
+                            try:
+                                uid = int(record_key)
+                                get_user_cache().invalidate(f"user:{uid}")
+                                from database.cache import clear_negative_user
+                                clear_negative_user(uid)
+                            except (ValueError, TypeError):
+                                pass
+                    last_version = new_version
+                    logger.info(f"[Dsp] 记录变更检测(version={new_version}),已失效 {len(changes)} 条缓存")
+            except Exception as e:
+                logger.warning(f"[Dsp] 记录变更检测异常: {e}")
+            await asyncio.sleep(3)
+    create_safe_task(_watch_record_change(), name="watch-record-change")
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")
 

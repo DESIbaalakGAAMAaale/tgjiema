@@ -387,6 +387,15 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
     parts = data.split("|")
     action = parts[0]  # report:ban, report:detach, report:block
 
+    # 解析举报人信息和来源 bot(新格式: report:xxx|...|reporter_id|source)
+    # 兼容旧格式(无 reporter_id 和 source)
+    reporter_id_str = None
+    source_bot = None
+    # 从 parts 末尾提取 source(idx/dsp)和 reporter_id
+    if len(parts) >= 4 and parts[-1] in ("idx", "dsp"):
+        source_bot = parts[-1]
+        reporter_id_str = parts[-2]
+
     try:
         if action == "report:ban":
             if len(parts) < 2:
@@ -396,10 +405,20 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             await update_user_and_invalidate(uid, {
                 "$set": {"is_banned": True, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()},
             })
+            # 跨进程通知 idx_bot/dsp_bot 失效用户缓存
+            try:
+                from database.cache_store import get_cache_store
+                store = get_cache_store()
+                await store.notify_record_change("user", str(uid))
+            except Exception as e:
+                logger.warning(f"[Admin][report:ban] 通知记录变更失败: {e}")
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ 已封禁用户 {uid}",
                 reply_markup=None,
             )
+            # 通知举报人
+            if reporter_id_str and source_bot:
+                await _notify_reporter(reporter_id_str, source_bot, "您的举报已受理生效，违规用户已被封禁。")
 
         elif action == "report:detach":
             if len(parts) < 2:
@@ -412,10 +431,20 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.error(f"[Admin][report:detach] 双写失败: {e}")
                 invalidate_file_record(file_code)
+            # 跨进程通知 idx_bot/dsp_bot 失效文件记录缓存
+            try:
+                from database.cache_store import get_cache_store
+                store = get_cache_store()
+                await store.notify_record_change("file", file_code)
+            except Exception as e:
+                logger.warning(f"[Admin][report:detach] 通知记录变更失败: {e}")
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ 已脱钩文件码 {file_code}",
                 reply_markup=None,
             )
+            # 通知举报人
+            if reporter_id_str and source_bot:
+                await _notify_reporter(reporter_id_str, source_bot, "您的举报已受理生效，文件码已脱钩处理。")
 
         elif action == "report:block":
             if len(parts) < 3:
@@ -429,6 +458,13 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as e:
                 logger.error(f"[Admin][report:block] 双写失败: {e}")
                 invalidate_file_record(file_code)
+            # 跨进程通知 idx_bot/dsp_bot 失效文件记录缓存
+            try:
+                from database.cache_store import get_cache_store
+                store = get_cache_store()
+                await store.notify_record_change("file", file_code)
+            except Exception as e:
+                logger.warning(f"[Admin][report:block] 通知记录变更失败: {e}")
             await query.edit_message_text(
                 query.message.text + f"\n\n✅ 已限制举报人 {reporter_id} 解码 {file_code}",
                 reply_markup=None,
@@ -437,6 +473,34 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logger.error(f"[Admin][report] 操作失败: {e}")
         await query.answer(f"操作失败: {e}", show_alert=True)
+
+
+async def _notify_reporter(reporter_id_str: str, source_bot: str, message: str):
+    """通过来源 Bot 向举报人发送受理通知。
+
+    source_bot: "idx" 或 "dsp",对应使用 DECODER_BOT_TOKEN 或 SENDER_BOT_TOKEN。
+    """
+    from telegram import Bot
+    from config import settings
+    try:
+        reporter_id = int(reporter_id_str)
+    except (ValueError, TypeError):
+        return
+
+    token = None
+    if source_bot == "idx":
+        token = settings.DECODER_BOT_TOKEN
+    elif source_bot == "dsp":
+        token = settings.SENDER_BOT_TOKEN
+    if not token:
+        logger.warning(f"[Admin][notify_reporter] 未配置 {source_bot} bot token,跳过通知")
+        return
+
+    try:
+        async with Bot(token=token) as bot:
+            await bot.send_message(chat_id=reporter_id, text=message)
+    except Exception as e:
+        logger.warning(f"[Admin][notify_reporter] 通过 {source_bot} 通知用户 {reporter_id} 失败: {e}")
 
 
 # ─── 数据库恢复动作处理 ──────────────────────────────────────────
