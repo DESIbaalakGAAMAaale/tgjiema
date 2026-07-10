@@ -33,7 +33,11 @@ async def _conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, state:
     context.user_data["conv_data"] = {}
     context.user_data["conv_started_at"] = time.time()
     query = update.callback_query
-    await query.edit_message_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+    try:
+        await query.edit_message_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+    except Exception:
+        # 忽略 Message is not modified 错误(用户重复点击相同按钮)
+        pass
 
 
 async def _conv_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
@@ -345,9 +349,11 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif state == "relay_add:phone":
         from services.relay_pool import relay_pool, _normalize_phone
+        from loguru import logger
         phone = _normalize_phone(text.strip())
         api_id = settings.RELAY_API_ID
         api_hash = settings.RELAY_API_HASH
+        logger.info(f"[Admin] relay_add: api_id={api_id}(type={type(api_id).__name__}), api_hash={api_hash[:10] if api_hash else '(empty)'}(type={type(api_hash).__name__})")
         if not api_id or not api_hash:
             await _end("❌ 中继 API 配置未设置\n请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n（从 https://my.telegram.org 申请）")
             return

@@ -246,17 +246,16 @@ class RelayPool:
         # 阶段1:仅验证 api_id/api_hash 有效性(非阻塞)
         from services.relay_instance import RelayInstance
         from telethon import TelegramClient
-        from telethon.errors import PhoneCodeInvalidError, AuthKeyError, ApiIdInvalidError
+        from telethon.errors import ApiIdInvalidError
 
-        # 使用临时 session 名称(不使用正式 session 文件,避免冲突)
+        logger.info(f"[RelayPool] 验证 api_id={api_id}, api_hash={api_hash[:10]}...")
+
         import tempfile, os
         temp_session = os.path.join(tempfile.gettempdir(), f"relay_verify_{phone.lstrip('+')}")
         client = None
         try:
             client = TelegramClient(temp_session, api_id, api_hash, timeout=30)
             await client.connect()
-            # 尝试 send_code_request 验证 api_id/api_hash 有效性
-            # 如果 api_id/api_hash 无效,这里会抛 ApiIdInvalidError
             await client.send_code_request(phone)
             logger.info(f"[RelayPool] 账号 {phone} api_id/api_hash 验证通过,验证码已发送")
         except ApiIdInvalidError:
@@ -265,6 +264,7 @@ class RelayPool:
             _cleanup_temp_session(temp_session)
             raise RuntimeError(
                 f"api_id/api_hash 无效(Telegram 服务器拒绝)\n"
+                f"当前使用: api_id={api_id}, api_hash={api_hash[:10]}...\n"
                 f"请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH\n"
                 f"申请地址: https://my.telegram.org → API development tools"
             )
@@ -276,9 +276,16 @@ class RelayPool:
                     pass
             _cleanup_temp_session(temp_session)
             err_msg = str(e)
+            logger.error(f"[RelayPool] 验证失败,原始错误: {type(e).__name__}: {err_msg}")
+            if "api_id" in err_msg.lower() or "api_hash" in err_msg.lower() or "invalid" in err_msg.lower():
+                raise RuntimeError(
+                    f"api_id/api_hash 验证失败: {err_msg}\n"
+                    f"当前使用: api_id={api_id}, api_hash={api_hash[:10]}...\n"
+                    f"请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH"
+                )
             if "PHONE_NUMBER_INVALID" in err_msg or "phone" in err_msg.lower():
                 raise RuntimeError(f"手机号格式无效: {phone}\n请确保包含国际区号,如 +8613800138000")
-            raise RuntimeError(f"验证 api_id/api_hash 失败: {e}")
+            raise RuntimeError(f"验证失败: {err_msg}")
 
         # 验证通过:关闭临时 client,清理临时 session
         try:
