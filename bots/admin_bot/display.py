@@ -138,7 +138,11 @@ async def _get_status_text() -> str:
                     break
         if pool_status:
             ready = sum(1 for p in pool_status if p["is_ready"])
-            relay_status = f"✅ 账号池 {ready}/{len(pool_status)} 就绪"
+            loaded = sum(1 for p in pool_status if p.get("_inst_loaded"))
+            if loaded < len(pool_status):
+                relay_status = f"⚪ 账号池 {len(pool_status)} 个 ({loaded} 个已加载)"
+            else:
+                relay_status = f"✅ 账号池 {ready}/{len(pool_status)} 就绪"
         else:
             relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
     except Exception:
@@ -361,14 +365,18 @@ async def _get_relay_status_text() -> str:
     else:
         msg += f"账号池: {len(pool_status)} 个账号\n\n"
         for i, ps in enumerate(pool_status, 1):
-            ready = "✅" if ps["is_ready"] else "❌"
+            if ps.get("_inst_loaded"):
+                ready = "✅" if ps["is_ready"] else "❌"
+            else:
+                ready = "⚪"
             busy = "🔴" if ps["is_busy"] else "⚪"
             phone = ps["phone"]
             masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
             msg += f"{i}. {ready}{busy} {masked}\n"
             msg += f"   今日请求: {ps['today_requests']}, 累计: {ps['total_requests']}, 平均: {ps['avg_wait_ms']:.0f}ms\n"
         ready_count = sum(1 for p in pool_status if p["is_ready"])
-        msg += f"\n就绪: {ready_count}/{len(pool_status)}"
+        loaded_count = sum(1 for p in pool_status if p.get("_inst_loaded"))
+        msg += f"\n就绪: {ready_count}/{len(pool_status)} (已加载实例: {loaded_count})"
 
     if pending == "1":
         msg += "\n⚠️ 正在等待验证码,请通过 /relay_code 提交"

@@ -360,6 +360,7 @@ class RelayPool:
                 "phone": phone,
                 "is_ready": inst.is_ready if inst else False,
                 "is_busy": inst.is_busy if inst else False,
+                "_inst_loaded": inst is not None,
                 "relay_user_id": inst.relay_user_id if inst else None,
                 "today_requests": usage["today_requests"],
                 "total_requests": usage["total_requests"],

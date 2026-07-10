@@ -520,7 +520,10 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     msg = f"🔐 中继账号池 ({len(pool_status)} 个账号)\n\n"
     for i, ps in enumerate(pool_status, 1):
-        ready = "✅" if ps["is_ready"] else "❌"
+        if ps.get("_inst_loaded"):
+            ready = "✅" if ps["is_ready"] else "❌"
+        else:
+            ready = "⚪"
         busy = "🔴忙" if ps["is_busy"] else "⚪空闲"
         phone = ps["phone"]
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
