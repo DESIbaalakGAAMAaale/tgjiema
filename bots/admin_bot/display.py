@@ -121,11 +121,19 @@ async def _get_status_text() -> str:
         if not relay_pool._initialized:
             await relay_pool.init()
         pool_status = await relay_pool.get_pool_status()
-        # R31-2: 检查各中继实例的 pending 状态，而非读全局键
+        # 检查 pending 状态：优先遍历内存 instances，为空时查 DB
         relay_pending = "0"
-        if relay_pool._initialized:
+        if relay_pool._initialized and relay_pool.instances:
             for inst in relay_pool.instances:
                 if await get_config(f"relay_auth_pending:{inst.phone}") == "1":
+                    relay_pending = "1"
+                    break
+        else:
+            from database.relay_db import get_relay_db
+            db = await get_relay_db()
+            accounts = await db.get_active_accounts()
+            for acct in accounts:
+                if await get_config(f"relay_auth_pending:{acct['phone']}") == "1":
                     relay_pending = "1"
                     break
         if pool_status:
@@ -318,12 +326,21 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
 
 async def _get_relay_status_text() -> str:
     from services.relay_pool import relay_pool
-    # R31-2: 检查各中继实例的 pending 状态，而非读全局键
+    from database.relay_db import get_relay_db
+    # 检查 pending 状态：优先遍历内存 instances，为空时查 DB
     pending = "0"
     try:
-        if relay_pool._initialized:
+        if relay_pool._initialized and relay_pool.instances:
             for inst in relay_pool.instances:
                 if await get_config(f"relay_auth_pending:{inst.phone}") == "1":
+                    pending = "1"
+                    break
+        else:
+            # instances 为空（admin_bot 进程），从 DB 读取手机号检查 pending
+            db = await get_relay_db()
+            accounts = await db.get_active_accounts()
+            for acct in accounts:
+                if await get_config(f"relay_auth_pending:{acct['phone']}") == "1":
                     pending = "1"
                     break
     except Exception:

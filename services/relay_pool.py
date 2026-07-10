@@ -336,7 +336,12 @@ class RelayPool:
                 logger.warning(f"[RelayPool] reload 添加 {phone} 失败: {e}")
 
     async def get_pool_status(self) -> list[dict]:
-        """获取账号池状态"""
+        """获取账号池状态。
+
+        优先遍历内存中的 instances（含运行时状态 is_ready/is_busy）。
+        如果 instances 为空（如 admin_bot 进程未加载实例），则从 DB 读取账号列表，
+        返回基本信息（运行时状态标记为未知）。
+        """
         db = await get_relay_db()
         status = []
         async with self._lock:
@@ -353,6 +358,24 @@ class RelayPool:
                 "avg_wait_ms": usage["avg_wait_ms"],
                 "last_request_at": usage["last_request_at"],
             })
+        # 内存实例为空时，从 DB 读取账号列表（admin_bot 进程不加载实例）
+        if not status:
+            try:
+                accounts = await db.get_active_accounts()
+            except Exception:
+                accounts = []
+            for acct in accounts:
+                usage = await db.get_usage(acct["id"])
+                status.append({
+                    "phone": acct["phone"],
+                    "is_ready": False,
+                    "is_busy": False,
+                    "relay_user_id": None,
+                    "today_requests": usage["today_requests"],
+                    "total_requests": usage["total_requests"],
+                    "avg_wait_ms": usage["avg_wait_ms"],
+                    "last_request_at": usage["last_request_at"],
+                })
         return status
 
     async def shutdown(self):
