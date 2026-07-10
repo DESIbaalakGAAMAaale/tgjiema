@@ -131,7 +131,25 @@ async def _async_main():
                 logger.warning("[Admin] app.stop 超时(10s),强制继续")
             except Exception as e:
                 logger.warning(f"[Admin] app.stop 异常: {e}")
+            # 取消所有剩余后台任务,防止进程卡死无法退出
+            import os as _os
+            pending = asyncio.all_tasks() - {asyncio.current_task()}
+            for task in pending:
+                task.cancel()
+            if pending:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[Admin] {len(pending)} 个后台任务未在 5s 内完成")
             logger.info("[Admin] 优雅关闭完成")
+            # 如果仍有未完成任务,强制退出避免 systemd SIGKILL
+            remaining = asyncio.all_tasks() - {asyncio.current_task()}
+            if any(not t.done() for t in remaining):
+                logger.warning(f"[Admin] {sum(1 for t in remaining if not t.done())} 个任务仍运行,强制退出")
+                _os._exit(0)
 
 
 def run():

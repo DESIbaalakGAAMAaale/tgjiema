@@ -523,7 +523,8 @@ async def _sync_local_tables_loop():
                     total += 1
                 except Exception as e:
                     failed_count += 1
-                    logger.warning(f"[Sync] file_records 单条失败 (code={r.get('file_code')}): {e}")
+                    if "database is locked" not in str(e):
+                        logger.warning(f"[Sync] file_records 单条失败 (code={r.get('file_code')}): {e}")
             if new_fr:
                 logger.debug(f"[Sync] file_records 增量: {len(new_fr)} 条, 失败 {failed_count} 条")
 
@@ -538,7 +539,8 @@ async def _sync_local_tables_loop():
                 except Exception as e:
                     code_failed += 1
                     failed_count += 1
-                    logger.warning(f"[Sync] codes 单条失败 (code={r.get('code')}): {e}")
+                    if "database is locked" not in str(e):
+                        logger.warning(f"[Sync] codes 单条失败 (code={r.get('code')}): {e}")
             if new_codes:
                 logger.debug(f"[Sync] codes 增量: {len(new_codes)} 条, 失败 {code_failed} 条")
 
@@ -553,7 +555,8 @@ async def _sync_local_tables_loop():
                 except Exception as e:
                     user_failed += 1
                     failed_count += 1
-                    logger.warning(f"[Sync] users 单条失败 (user_id={r.get('user_id')}): {e}")
+                    if "database is locked" not in str(e):
+                        logger.warning(f"[Sync] users 单条失败 (user_id={r.get('user_id')}): {e}")
             if new_users:
                 logger.debug(f"[Sync] users 增量: {len(new_users)} 条, 失败 {user_failed} 条")
 
@@ -574,7 +577,8 @@ async def _sync_local_tables_loop():
                 except Exception as e:
                     ec_failed += 1
                     failed_count += 1
-                    logger.warning(f"[Sync] external_code_mapping 单条失败: {e}")
+                    if "database is locked" not in str(e):
+                        logger.warning(f"[Sync] external_code_mapping 单条失败: {e}")
             if new_ec:
                 logger.debug(f"[Sync] external_code_mapping 增量: {len(new_ec)} 条, 失败 {ec_failed} 条")
 
@@ -584,15 +588,30 @@ async def _sync_local_tables_loop():
                     await store.commit()
                 except Exception as e:
                     failed_count += 1
-                    logger.warning(f"[Sync] 批量 commit 失败: {e}")
+                    if "database is locked" in str(e):
+                        # SQLite 锁冲突是正常的多进程竞争,降级为 debug 避免日志刷屏
+                        logger.debug(f"[Sync] 批量 commit 等待锁(正常): {e}")
+                    else:
+                        logger.warning(f"[Sync] 批量 commit 失败: {e}")
 
             # 仅当全部成功时才推进水位,有失败时保留旧水位下次重试(upsert 幂等,重复查询无害)
             if failed_count == 0:
-                await store.set_kv("_last_sync_local_tables", now_iso)
-                if total > 0:
-                    logger.debug(f"[Sync] 本地表同步 {total} 条记录, 水位推进到 {now_iso}")
+                # set_kv 内部也有 commit,可能触发锁冲突
+                try:
+                    await store.set_kv("_last_sync_local_tables", now_iso)
+                    if total > 0:
+                        logger.debug(f"[Sync] 本地表同步 {total} 条记录, 水位推进到 {now_iso}")
+                except Exception as e:
+                    if "database is locked" in str(e):
+                        logger.debug(f"[Sync] set_kv 等待锁(正常),下次重试: {e}")
+                    else:
+                        logger.warning(f"[Sync] set_kv 失败: {e}")
             else:
-                logger.warning(f"[Sync] 本表同步有 {failed_count} 条失败, 保留水位 {last_sync_iso} 下次重试")
+                logger.debug(f"[Sync] 本表同步有 {failed_count} 条失败, 保留水位下次重试")
 
         except Exception as e:
-            logger.warning(f"[Sync] 本地表同步失败: {e}")
+            if "database is locked" in str(e):
+                # SQLite 锁冲突是正常的多进程竞争,降级为 debug 避免日志刷屏
+                logger.debug(f"[Sync] 本地表同步等待锁(正常),下次重试")
+            else:
+                logger.warning(f"[Sync] 本地表同步失败: {e}")
