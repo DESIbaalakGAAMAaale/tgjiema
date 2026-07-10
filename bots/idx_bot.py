@@ -646,7 +646,15 @@ async def _process_one_pending(app: Application, row: dict):
     ext_code = None
     if note:
         try:
-            note_parsed = json.loads(note)
+            if isinstance(note, str):
+                note_parsed = json.loads(note)
+            elif isinstance(note, dict):
+                note_parsed = note
+            else:
+                note_parsed = {}
+            # orjson 反序列化的 dict 可能存在 hash 表异常，重建 dict 强制重新计算 hash
+            if isinstance(note_parsed, dict):
+                note_parsed = {str(k): v for k, v in note_parsed.items()}
             if isinstance(note_parsed, dict) and note_parsed.get("type") == "external":
                 ext_code = note_parsed.get("code", "")
         except (json.JSONDecodeError, TypeError):
