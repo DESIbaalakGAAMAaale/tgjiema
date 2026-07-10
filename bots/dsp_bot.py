@@ -243,7 +243,17 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
         record = await get_file_record_cached(file_code)
         note = ""
         if record:
-            note = (record.get("note") or "").strip()
+            note_raw = (record.get("note") or "").strip()
+            # 外部中继的 note 是 JSON 对象（{"type":"external",...}），不作为备注显示
+            if note_raw:
+                try:
+                    parsed = json.loads(note_raw)
+                    if isinstance(parsed, dict) and parsed.get("type") == "external":
+                        note = ""
+                    else:
+                        note = note_raw
+                except (TypeError, ValueError):
+                    note = note_raw
         if note:
             lines.append(f"备注：{note}")
     except Exception:
@@ -259,6 +269,25 @@ async def _edit_sent_caption(bot: Any, chat_id: int, message_id: int, caption: s
         await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption)
     except Exception as e:
         logger.debug(f"[Dsp] edit_caption 失败(非致命, msg={message_id}): {e}")
+
+
+async def _should_preserve_caption(file_code: str) -> bool:
+    """检查是否应保留第三方 Bot 原始 caption（不被标准模板覆盖）。
+    当外部中继的 note 中标记 preserve_caption=True 时返回 True。"""
+    try:
+        record = await get_file_record_cached(file_code)
+        if not record:
+            return False
+        note = record.get("note") or ""
+        if not note:
+            return False
+        try:
+            parsed = json.loads(note)
+        except (TypeError, ValueError):
+            return False
+        return isinstance(parsed, dict) and bool(parsed.get("preserve_caption"))
+    except Exception:
+        return False
 
 
 def _build_input_media(meta: dict):
@@ -559,9 +588,10 @@ async def _process_single_job(bot, job, bot_id: int = 1):
 
     if sent_msg_id:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
-        # 给文件添加 caption（文件码+备注）
-        caption = await _build_delivery_caption(job.code, total_count=1)
-        await _edit_sent_caption(bot, job.target_user_id, sent_msg_id, caption)
+        # 第三方 Bot 原始 caption 需原样保留，不覆盖为标准模板
+        if not await _should_preserve_caption(job.code):
+            caption = await _build_delivery_caption(job.code, total_count=1)
+            await _edit_sent_caption(bot, job.target_user_id, sent_msg_id, caption)
         await metrics.record_send_success()
         await metrics.record_processed("dsp_bot")
         return True
@@ -655,8 +685,8 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
         # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
         if i < len(job.storage_msg_ids) - 1:
             await asyncio.sleep(0.15)
-    # 第一条消息添加 caption
-    if first_sent_mid:
+    # 第一条消息添加 caption（第三方原始 caption 保留时跳过）
+    if first_sent_mid and not await _should_preserve_caption(job.code):
         caption = await _build_delivery_caption(job.code, total_count=len(job.storage_msg_ids))
         await _edit_sent_caption(bot, job.target_user_id, first_sent_mid, caption)
     await metrics.record_processed("dsp_bot")
@@ -667,8 +697,9 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
 
-    # caption 只在第一页添加（多页分页时后续页不重复附加 caption）
-    caption = await _build_delivery_caption(file_code, total_count=len(file_meta_list)) if page == 1 else None
+    # caption 只在第一页添加（多页分页时后续页不重复附加 caption）；第三方原始 caption 保留时跳过
+    preserve = await _should_preserve_caption(file_code)
+    caption = (await _build_delivery_caption(file_code, total_count=len(file_meta_list))) if (page == 1 and not preserve) else None
     first_sent_msg_id: int | None = None
 
     # 使用 copy_message 从存储频道复制（跨Bot file_id 不可用，必须走 copy 路径）

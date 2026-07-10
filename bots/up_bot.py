@@ -702,11 +702,12 @@ async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mgid = update.message.media_group_id or ""
     if caption.startswith("EXTERNAL_RELAY:"):
         if mgid:
-            # 从 caption 提取 external_code 并登记 media_group_id 映射
+            # 从 caption 第一行提取 external_code（忽略换行后的原始 caption），登记 media_group_id 映射
             rest = caption[len("EXTERNAL_RELAY:"):]
-            user_end = rest.find(":")
+            first_line = rest.split("\n", 1)[0]
+            user_end = first_line.find(":")
             if user_end != -1:
-                _external_mgid_map[mgid] = rest[user_end + 1:].strip()
+                _external_mgid_map[mgid] = first_line[user_end + 1:].strip()
         await _handle_external_relay_file(update, context)
         return
     if mgid and mgid in _external_mgid_map:
@@ -1367,6 +1368,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     if ext_code_override:
         # 媒体组后续消息:从已有 buffer 获取 user_id,external_code 由参数提供
         external_code = ext_code_override
+        orig_caption = ""  # 后续消息无 caption
         async with _mg_lock:
             buf = _external_buffers.get(external_code)
             external_user_id = buf["user_id"] if buf else 0
@@ -1378,16 +1380,21 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     else:
         caption = update.message.caption or ""
         rest = caption[len("EXTERNAL_RELAY:"):]
-        user_end = rest.find(":")
+        # 第一行是 user_id:code，换行之后是第三方 Bot 的原始 caption
+        first_line, _, orig_caption = rest.partition("\n")
+        user_end = first_line.find(":")
         if user_end == -1:
             return
         try:
-            external_user_id = int(rest[:user_end])
+            external_user_id = int(first_line[:user_end])
         except ValueError:
             return
-        external_code = rest[user_end + 1:].strip()
+        external_code = first_line[user_end + 1:].strip()
+        orig_caption = orig_caption.strip()
 
-        # 同一 external_code 的所有文件必须 copy 到同一存储频道
+    caption_src_msg_id = update.message.message_id if orig_caption else None
+
+    # 同一 external_code 的所有文件必须 copy 到同一存储频道
     async with _mg_lock:
         buf = _external_buffers.get(external_code)
         if buf is not None and buf.get("channel_id"):
@@ -1407,6 +1414,8 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
                 "file_types": defaultdict(int),
                 "flushed": False,
                 "created_at": time.time(),
+                "orig_caption": orig_caption or "",
+                "caption_src_msg_id": caption_src_msg_id,
             }
 
     file_type = detect_file_type(update)
@@ -1448,6 +1457,8 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
                     "file_types": defaultdict(int),
                     "flushed": False,
                     "created_at": time.time(),
+                    "orig_caption": orig_caption or "",
+                    "caption_src_msg_id": caption_src_msg_id,
                 }
                 _external_buffers[external_code] = buf
             buf["pending_copies"].append((update.effective_chat.id, update.message.message_id, file_type, file_meta))
@@ -1511,40 +1522,43 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
     files_meta = list(buf.get("files_meta", []))
     file_types = buf.get("file_types", defaultdict(int))
     pending_copies = buf.get("pending_copies", [])
+    orig_caption = (buf.get("orig_caption") or "").strip()
+    caption_src_msg_id = buf.get("caption_src_msg_id")
 
     # P1: 批量 copy 未去重的文件到存储频道(保持媒体组格式)
+    # copied_map: src_msg_id -> new_storage_msg_id（用于定位 caption 承载消息）
+    copied_map: dict[int, int] = {}
     if pending_copies:
         from utils.flood_waiter import safe_copy_messages
-        # 取所有待 copy 的消息 ID
         from_chat = pending_copies[0][0]
         copy_msg_ids = [pc[1] for pc in pending_copies]
         try:
             if len(copy_msg_ids) == 1:
-                # 单文件直接 copy
                 from utils.flood_waiter import safe_copy_message
                 forwarded = await safe_copy_message(_bot, target_ch, from_chat, copy_msg_ids[0])
                 new_ids = [forwarded.message_id]
             else:
-                # 多文件用 copy_messages 批量复制(保持相册格式)
                 results = await safe_copy_messages(_bot, target_ch, from_chat, copy_msg_ids)
                 new_ids = [r.message_id for r in results]
             logger.info(f"[Up][ext_relay] 批量 copy 到存储频道: {len(new_ids)}个文件 (code={external_code})")
-            # 补充 file_meta 和 file_types(从 pending_copies 中取)
-            for i, (_, _, ft, fm) in enumerate(pending_copies):
+            for i, (_, src_mid, ft, fm) in enumerate(pending_copies):
                 if i < len(new_ids):
-                    msg_ids.append(new_ids[i])
+                    new_mid = new_ids[i]
+                    msg_ids.append(new_mid)
                     files_meta.append(fm)
                     file_types[ft] += 1
+                    copied_map[src_mid] = new_mid
         except Exception as e:
             logger.error(f"[Up][ext_relay] 批量 copy 失败,回退逐条 (code={external_code}): {e}")
-            # 回退到逐条 copy
             from utils.flood_waiter import safe_copy_message
             for from_chat, msg_id, ft, fm in pending_copies:
                 try:
                     forwarded = await safe_copy_message(_bot, target_ch, from_chat, msg_id)
-                    msg_ids.append(forwarded.message_id)
+                    new_mid = forwarded.message_id
+                    msg_ids.append(new_mid)
                     files_meta.append(fm)
                     file_types[ft] += 1
+                    copied_map[msg_id] = new_mid
                 except Exception as e2:
                     logger.error(f"[Up][ext_relay] 逐条 copy 也失败 (msg={msg_id}): {e2}")
 
@@ -1552,10 +1566,29 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         logger.warning(f"[Up][ext_relay] 外部文件缓冲区为空，跳过 (code={external_code})")
         return
 
+    # 如果有第三方原始 caption，编辑存储频道中承载 caption 的消息，去除 EXTERNAL_RELAY 路由前缀
+    if orig_caption and caption_src_msg_id and caption_src_msg_id in copied_map:
+        target_mid = copied_map[caption_src_msg_id]
+        try:
+            await _bot.edit_message_caption(chat_id=target_ch, message_id=target_mid, caption=orig_caption)
+            logger.info(f"[Up][ext_relay] 已还原第三方原始 caption (code={external_code}, msg_id={target_mid})")
+        except Exception as e:
+            logger.warning(f"[Up][ext_relay] 编辑存储频道 caption 失败(非致命, code={external_code}): {e}")
+    elif not orig_caption and caption_src_msg_id and caption_src_msg_id in copied_map:
+        # 无原始 caption 时，清除 EXTERNAL_RELAY 前缀行，使消息无 caption（后续由 dsp_bot 添加标准 caption）
+        target_mid = copied_map[caption_src_msg_id]
+        try:
+            await _bot.edit_message_caption(chat_id=target_ch, message_id=target_mid, caption="")
+        except Exception as e:
+            logger.debug(f"[Up][ext_relay] 清除 EXTERNAL_RELAY caption 失败(非致命, code={external_code}): {e}")
+
     type_str = _json_dumps(dict(file_types))
     batch_ids_str = ",".join(str(mid) for mid in msg_ids)
     batch_file_meta_str = _json_dumps(files_meta)
-    note = _json_dumps({"type": "external", "code": external_code})
+    note_obj: dict = {"type": "external", "code": external_code}
+    if orig_caption:
+        note_obj["preserve_caption"] = True
+    note = _json_dumps(note_obj)
 
     try:
         pending_col = get_pending_uploads_col()

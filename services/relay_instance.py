@@ -484,7 +484,12 @@ class RelayInstance:
         if isinstance(msg.media, MessageMediaWebPage):
             await self._decrement_cache_counter(code)
             return
-        caption = f"EXTERNAL_RELAY:{user_id}:{code}"
+        # 保留第三方 Bot 的原始 caption（文本消息内容），使最终投递到用户时样式与第三方返回一致
+        orig_caption = (getattr(msg, "message", "") or "").strip()
+        if orig_caption:
+            caption = f"EXTERNAL_RELAY:{user_id}:{code}\n{orig_caption}"
+        else:
+            caption = f"EXTERNAL_RELAY:{user_id}:{code}"
         try:
             if self._up_bot_entity:
                 # 优先用 InputMedia 引用原文件发送(相当于复制,非转发)
@@ -749,7 +754,8 @@ class RelayInstance:
         # P1: 筛选有效媒体,保持媒体组格式批量发送
         media_list = []
         valid_events = []
-        caption = f"EXTERNAL_RELAY:{user_id}:{code}"
+        # 收集第三方 Bot 原始 caption（通常只有组内一条消息带文本）
+        orig_caption = ""
         for ev in events_list:
             msg = ev.message
             if not getattr(msg, "media", None):
@@ -758,8 +764,13 @@ class RelayInstance:
                 continue
             media_list.append(msg.media)
             valid_events.append(ev)
+            msg_text = (getattr(msg, "message", "") or "").strip()
+            if msg_text and not orig_caption:
+                orig_caption = msg_text
         if not media_list:
             return
+        # 第一条消息承载路由前缀 + 原始 caption，其余消息无 caption（保持相册单 caption 展示）
+        first_caption = f"EXTERNAL_RELAY:{user_id}:{code}\n{orig_caption}" if orig_caption else f"EXTERNAL_RELAY:{user_id}:{code}"
         # 递增 pending 计数器
         for _ in valid_events:
             if code:
@@ -768,15 +779,15 @@ class RelayInstance:
             if self._up_bot_entity:
                 if len(media_list) == 1:
                     await self._client.send_file(
-                        self._up_bot_entity, media_list[0], caption=caption
+                        self._up_bot_entity, media_list[0], caption=first_caption
                     )
                 else:
-                    # grouping=True 保持相册格式,每个文件设置相同 caption
-                    captions = [caption] * len(media_list)
+                    # grouping=True 保持相册格式；仅第一条消息带 caption，其余不带
+                    captions = [first_caption] + [None] * (len(media_list) - 1)
                     await self._client.send_file(
                         self._up_bot_entity, media_list, caption=captions, grouping=True
                     )
-                    logger.info(f"[RelayInstance:{self.phone}] 媒体组批量发送 ({len(media_list)}个文件, code={code})")
+                    logger.info(f"[RelayInstance:{self.phone}] 媒体组批量发送 ({len(media_list)}个文件, code={code}, orig_caption={'有' if orig_caption else '无'})")
             else:
                 logger.warning(f"[RelayInstance:{self.phone}] Up Bot 不可用，跳过媒体组 (code={code})")
         except FloodWaitError as e:
