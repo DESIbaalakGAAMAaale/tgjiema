@@ -452,6 +452,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         from telethon.errors import (
             SessionPasswordNeededError, PhoneCodeExpiredError,
             PhoneCodeInvalidError, PhoneNumberBannedError,
+            AuthRestartError,
         )
         from database.relay_db import get_relay_db
         from loguru import logger
@@ -497,6 +498,15 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 pass
             context.user_data.pop("_relay_temp_client", None)
             await _end("❌ 该手机号已被 Telegram 封禁,无法添加")
+            return
+        except AuthRestartError:
+            # Telegram 要求重新开始认证流程,需重新发送验证码
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            context.user_data.pop("_relay_temp_client", None)
+            await _end("❌ Telegram 要求重新认证,请重新点击「添加账号」按钮开始。")
             return
         except Exception as e:
             logger.error(f"[Admin] relay_add sign_in 失败: {e}")

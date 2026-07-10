@@ -101,16 +101,15 @@ class RelayInstance:
         if not self._ban_detected:
             logger.error(f"[RelayInstance:{self.phone}] 账号受限/封禁: {reason}")
         self._ban_detected = True
-        try:
-            asyncio.create_task(self._report_status("banned", reason[:200]))
-        except Exception:
-            pass
+        self._spawn(self._report_status("banned", reason[:200]))
 
     def clear_expired_floodwait(self):
         """清除已到期的 FloodWait 限制。"""
         if self._floodwait_until > 0 and time.time() >= self._floodwait_until:
             self._floodwait_until = 0.0
             logger.info(f"[RelayInstance:{self.phone}] FloodWait 已到期,恢复可用")
+            # 写回 DB 状态,避免 admin_bot 显示过时的 floodwait
+            self._spawn(self._report_status("online", "FloodWait 已到期"))
 
     async def check_health(self) -> bool:
         """A2: 主动健康检查,验证账号是否仍可用。
@@ -171,10 +170,6 @@ class RelayInstance:
             await db.update_account_status(self.phone, status, info)
         except Exception:
             pass
-
-    def _update_status(self, status: str, info: str = ""):
-        """同步工具方法：内部状态变更时调用 _report_status。"""
-        self._spawn(self._report_status(status, info))
 
     def _spawn(self, coro, name: str | None = None) -> asyncio.Task:
         """创建内部后台任务并纳入 _background_tasks 跟踪(P1-8)。
@@ -368,6 +363,7 @@ class RelayInstance:
         self._decoder_bot_entity = await self._client.get_entity(settings.DECODER_BOT_USERNAME)
         self._register_handlers()
         self._ready.set()
+        await self._report_status("online", f"{me.first_name}(@{me.username})")
         logger.info(f"[RelayInstance:{self.phone}] 动态添加并登录成功: {me.username}")
 
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
