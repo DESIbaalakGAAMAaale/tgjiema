@@ -8,7 +8,7 @@ from utils.task_utils import create_safe_task
 from .handlers import (
     start, status, health, user_detail, users_list, set_level, ban_user, unban_user,
     set_quota, set_external_quota, file_detail, files_list, delete_file, logs,
-    relay_code, relay_set_api, relay_pending, relay_list, relay_add, relay_remove,
+    relay_code, relay_password, relay_pending, relay_list, relay_add, relay_remove,
     relay_reset_stats, settings_view, set_storage_channel,
     set_file_prefix, set_force_join, set_username, set_quota_default, set_r2,
     set_db_backup, factory_reset, purge_channel, add_code_route, remove_code_route,
@@ -60,7 +60,7 @@ async def _async_main():
     app.add_handler(CommandHandler("set_access_limit", set_access_limit))
     app.add_handler(CommandHandler("logs", logs))
     app.add_handler(CommandHandler("relay_code", relay_code))
-    app.add_handler(CommandHandler("relay_set_api", relay_set_api))
+    app.add_handler(CommandHandler("relay_password", relay_password))
     app.add_handler(CommandHandler("relay_pending", relay_pending))
     app.add_handler(CommandHandler("relay_list", relay_list))
     app.add_handler(CommandHandler("relay_add", relay_add))

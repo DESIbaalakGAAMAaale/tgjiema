@@ -78,7 +78,8 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         kb = [
             [InlineKeyboardButton("📂 文件列表", callback_data="action:files"),
              InlineKeyboardButton("🔍 查询文件", callback_data="interactive:file_detail")],
-            [InlineKeyboardButton("🗑️ 删除文件", callback_data="interactive:delete_file")],
+            [InlineKeyboardButton("🗑️ 删除文件", callback_data="interactive:delete_file"),
+             InlineKeyboardButton("🔢 访问限制", callback_data="interactive:set_access_limit")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -86,9 +87,11 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         text = "🔐 用户中继管理 — 点击按钮操作"
         kb = [
             [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status"),
-             InlineKeyboardButton("⚙️ 配置账号", callback_data="interactive:relay_set_api")],
+             InlineKeyboardButton("➕ 添加账号", callback_data="interactive:relay_add")],
             [InlineKeyboardButton("🔑 提交验证码", callback_data="interactive:relay_code"),
-             InlineKeyboardButton("📋 查看待处理", callback_data="action:relay_pending")],
+             InlineKeyboardButton("🔒 提交二步密码", callback_data="interactive:relay_password")],
+            [InlineKeyboardButton("📋 查看待处理", callback_data="action:relay_pending"),
+             InlineKeyboardButton("➖ 移除账号", callback_data="interactive:relay_remove")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -135,9 +138,11 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "topology":
-        text = "🔗 环形冗余拓扑 — 点击查看"
+        text = "🔗 环形冗余拓扑 — 查看与管理槽位"
         kb = [
             [InlineKeyboardButton("📋 查看拓扑", callback_data="action:topology")],
+            [InlineKeyboardButton("➕ 添加槽位", callback_data="interactive:cell_add"),
+             InlineKeyboardButton("➖ 移除槽位", callback_data="interactive:cell_remove")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 

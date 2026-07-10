@@ -31,7 +31,7 @@ class RelayPool:
             db = await get_relay_db()
             accounts = await db.get_active_accounts()
             if not accounts:
-                logger.warning("[RelayPool] 无中继账号，请通过 admin_bot /relay_set_api 添加")
+                logger.warning("[RelayPool] 无中继账号，请通过 admin_bot /relay_add 添加")
                 self._initialized = True
                 return
             for acct in accounts:
@@ -202,6 +202,13 @@ class RelayPool:
         验证成功后立即关闭客户端,避免与 idx_bot 进程的 Telethon session 文件冲突。
         idx_bot 通过 reload_from_db 负责实际运行时连接。
         """
+        # 防御性:确保 api_id 为 int(Telethon 要求)
+        try:
+            api_id = int(api_id)
+        except (TypeError, ValueError):
+            raise RuntimeError(f"api_id 必须是数字,当前值: {api_id}")
+        if not api_hash or not isinstance(api_hash, str):
+            raise RuntimeError("api_hash 不能为空且必须是字符串")
         db = await get_relay_db()
         account_id = await db.add_account(api_id, api_hash, phone)
         instance = RelayInstance(

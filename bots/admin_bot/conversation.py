@@ -320,7 +320,30 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await set_config(f"relay_auth_pending:{phone}", "1")
         await _end(f"✅ 验证码 `{code}` 已提交\n中继实例将在几秒内自动获取并使用。")
 
-    elif state == "relay_set_api:phone":
+    elif state == "relay_password:password":
+        password = text.strip()
+        if not password:
+            await _end("❌ 密码不能为空")
+            return
+        phone = context.user_data.get("relay_phone", "")
+        if not phone:
+            try:
+                from services.relay_pool import relay_pool
+                from database import get_config as _get_cfg
+                if relay_pool._initialized:
+                    for inst in relay_pool.instances:
+                        if await _get_cfg(f"relay_password_pending:{inst.phone}") == "1":
+                            phone = inst.phone
+                            break
+            except Exception:
+                pass
+        if not phone:
+            await _end("❌ 无法确定中继账号，请使用 /relay_password <手机号> <密码> 直接提交")
+            return
+        await set_config(f"relay_auth_password:{phone}", password)
+        await _end(f"✅ 二步验证密码已提交\n中继实例将在几秒内自动获取并使用。")
+
+    elif state == "relay_add:phone":
         from services.relay_pool import relay_pool
         phone = text.strip()
         api_id = settings.RELAY_API_ID
@@ -328,19 +351,168 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not api_id or not api_hash:
             await _end("❌ 中继 API 配置未设置\n请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n（从 https://my.telegram.org 申请）")
             return
-        instance = await relay_pool.add_account(api_id, api_hash, phone)
-        # 开始登录
         try:
-            await instance.login_with_credentials(api_id, api_hash, phone)
+            await relay_pool.add_account(api_id, api_hash, phone)
+            # C3: 通知 idx_bot 进程的 relay_pool 增量同步新账号
+            try:
+                from database.cache_store import get_cache_store
+                await get_cache_store().notify_relay_change()
+            except Exception as notify_err:
+                import logging
+                logging.warning(f"[Admin] notify_relay_change 失败(非致命): {notify_err}")
+            masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
             await _end(
-                f"✅ 中继账号已添加并登录成功\n"
-                f"  API_ID: {api_id}\n"
-                f"  手机号: {phone}\n\n"
-                f"该账号已加入账号池,可立即使用。"
+                f"✅ 中继账号已添加并验证成功\n"
+                f"  手机号: {masked}\n\n"
+                f"idx_bot 将自动检测新账号并连接运行。\n"
+                f"如该账号需要验证码,系统会提示你通过 /relay_code 提交。\n"
+                f"如该账号开启了二步验证,请通过 /relay_password 提交密码。"
             )
         except RuntimeError as e:
-            await relay_pool.remove_account(phone)
-            await _end(f"❌ 登录失败: {e}")
+            await _end(f"❌ 添加中继账号失败: {e}")
+        except Exception as e:
+            await _end(f"❌ 添加中继账号异常: {e}")
+
+    elif state == "relay_remove:phone":
+        phone = text.strip()
+        from services.relay_pool import relay_pool
+        removed = await relay_pool.remove_account(phone)
+        if removed:
+            try:
+                from database.cache_store import get_cache_store
+                await get_cache_store().notify_relay_change()
+            except Exception:
+                pass
+            await _end(f"✅ 已移除中继账号: {phone[:3]}****{phone[-2:] if len(phone) > 5 else '***'}")
+        else:
+            await _end(f"❌ 未找到该手机号的中继账号: {phone}")
+
+    elif state == "set_access_limit:code":
+        file_code = text.strip()
+        await _ask("set_access_limit:max",
+                   f"✅ 文件码已记录:{file_code}\n\n请输入最大访问次数(0=不限制):",
+                   {"file_code": file_code})
+
+    elif state == "set_access_limit:max":
+        try:
+            max_requests = int(text)
+            if max_requests < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ 必须是非负整数(0=不限制),请重新输入:")
+            return
+        from database import update_file_record_and_invalidate
+        try:
+            await update_file_record_and_invalidate(
+                data["file_code"], {"$set": {"max_requests": max_requests}}
+            )
+        except Exception as e:
+            await _end(f"❌ 设置失败: {e}")
+            return
+        limit_text = f"{max_requests} 次" if max_requests > 0 else "不限制"
+        await _end(f"✅ 文件码 {data['file_code']} 访问限制已设为 {limit_text}")
+
+    elif state == "cell_add:slot_id":
+        slot_id = text.strip()
+        await _ask("cell_add:channel_id",
+                   f"✅ 槽位ID已记录:{slot_id}\n\n请输入频道ID(数字,如 -1001234567890):",
+                   {"slot_id": slot_id})
+
+    elif state == "cell_add:channel_id":
+        try:
+            channel_id = int(text)
+        except ValueError:
+            await update.message.reply_text("❌ 频道ID必须是数字,请重新输入:")
+            return
+        await _ask("cell_add:account_name",
+                   f"✅ 频道ID已记录:{channel_id}\n\n请输入账号名(不填则无,直接发送 0 跳过):",
+                   {"slot_id": data["slot_id"], "channel_id": channel_id})
+
+    elif state == "cell_add:account_name":
+        account_name = text.strip()
+        if account_name == "0":
+            account_name = ""
+        await _ask("cell_add:status",
+                   f"✅ 账号名已记录:{account_name or '(无)'}\n\n请输入状态(active/shadow1/shadow2/r100,默认 shadow1,直接发送 0 跳过):",
+                   {"slot_id": data["slot_id"], "channel_id": data["channel_id"], "account_name": account_name})
+
+    elif state == "cell_add:status":
+        status = text.strip()
+        if status == "0":
+            status = "shadow1"
+        if status not in ("active", "shadow1", "shadow2", "r100"):
+            await update.message.reply_text("❌ 状态必须是 active/shadow1/shadow2/r100 之一,请重新输入:")
+            return
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        existing = await store.get_all_cells_local()
+        if any(c.get("slot_id") == data["slot_id"] for c in existing):
+            await _end(f"❌ slot_id {data['slot_id']} 已存在")
+            return
+        if any(c.get("channel_id") == data["channel_id"] for c in existing):
+            await _end(f"❌ channel_id {data['channel_id']} 已被其他槽位占用")
+            return
+        import time as _time
+        import datetime as _dt
+        now_ts = _time.time()
+        new_cell = {
+            "slot_id": data["slot_id"],
+            "channel_id": data["channel_id"],
+            "status": status,
+            "next_active_chat_id": None,
+            "prev_slot_id": None,
+            "demoted_to_channel_id": None,
+            "account_name": data["account_name"],
+            "is_r100": 1 if status == "r100" else 0,
+            "last_heartbeat": None,
+            "last_synced_msg_id": 0,
+            "degrade_count": 0,
+            "file_count": 0,
+            "rotation_started_at": None,
+            "updated_at": now_ts,
+            "crdb_synced": 0,
+        }
+        try:
+            await store.bulk_upsert_cells_local([new_cell])
+            from bots.admin_bot.display import invalidate_cells_cache
+            await invalidate_cells_cache()
+            await _end(
+                f"✅ 已添加槽位\n"
+                f"  slot_id: {data['slot_id']}\n"
+                f"  channel_id: {data['channel_id']}\n"
+                f"  account: {data['account_name'] or '(无)'}\n"
+                f"  status: {status}\n\n"
+                f"其他 bot 将在 5-60 秒内感知变更。"
+            )
+        except Exception as e:
+            await _end(f"❌ 添加失败: {e}")
+
+    elif state == "cell_remove:slot_id":
+        slot_id = text.strip()
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        existing = await store.get_all_cells_local()
+        target = None
+        for c in existing:
+            if c.get("slot_id") == slot_id:
+                target = c
+                break
+        if not target:
+            await _end(f"❌ slot_id {slot_id} 不存在")
+            return
+        if target.get("status") == "active":
+            await _end(f"❌ 拒绝移除 active 状态的槽位 {slot_id},请先等待轮转降级后再移除。")
+            return
+        try:
+            deleted = await store.delete_cell_local(slot_id)
+            if deleted:
+                from bots.admin_bot.display import invalidate_cells_cache
+                await invalidate_cells_cache()
+                await _end(f"✅ 已移除槽位 {slot_id}\n其他 bot 将在 5-60 秒内感知变更。")
+            else:
+                await _end(f"❌ 移除失败: slot_id {slot_id} 不存在")
+        except Exception as e:
+            await _end(f"❌ 移除失败: {e}")
 
     # ─── 系统配置 ────────────────────────────────────────────────
     elif state == "set_storage_channel:id":

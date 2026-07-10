@@ -224,9 +224,29 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "relay_code:code",
                 "🔑 提交验证码\n\n请输入 Telegram 发送的 6 位验证码：\n\n❌ 如需取消请点击下方按钮。"
             ),
-            "relay_set_api": (
-                "relay_set_api:phone",
-                "⚙️ 配置中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\n❌ 如需取消请点击下方按钮。"
+            "relay_add": (
+                "relay_add:phone",
+                "➕ 添加中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\nAPI_ID/API_HASH 从 .env 自动读取\n❌ 如需取消请点击下方按钮。"
+            ),
+            "relay_password": (
+                "relay_password:password",
+                "🔒 提交二步验证密码\n\n请输入该中继账号的二步验证密码：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "relay_remove": (
+                "relay_remove:phone",
+                "➖ 移除中继账号\n\n请输入要移除的中继账号手机号(含区号)：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "set_access_limit": (
+                "set_access_limit:code",
+                "🔢 设置访问次数限制\n\n请输入文件码：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "cell_add": (
+                "cell_add:slot_id",
+                "➕ 添加频道槽位\n\n请输入槽位ID(如 a3、s3a)：\n\n❌ 如需取消请点击下方按钮。"
+            ),
+            "cell_remove": (
+                "cell_remove:slot_id",
+                "➖ 移除频道槽位\n\n请输入要移除的槽位ID(如 s3a)：\n\n❌ 如需取消请点击下方按钮。"
             ),
             # 系统配置
             "set_storage_channel": (

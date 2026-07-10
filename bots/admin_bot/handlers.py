@@ -7,7 +7,6 @@ from telegram.ext import ContextTypes
 from config import settings
 from database import (
     get_users_col, get_file_records_col, get_file_record_cached, get_config, set_config,
-    set_relay_config,
     get_all_code_bot_routes, set_code_bot_route, delete_code_bot_route,
     get_all_bot_decode_intervals, set_bot_decode_interval, delete_bot_decode_interval,
     add_spare_channel, remove_spare, list_spare_pool,
@@ -418,37 +417,55 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @_auth_required
-async def relay_set_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def relay_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """提交中继账号二步验证密码。
+
+    用法:
+      /relay_password <手机号> <密码>
+      /relay_password <密码>  (从 pending 状态自动检测手机号)
+    """
     args = context.args
     if not args:
         await update.message.reply_text(
-            "用法:/relay_set_api <手机号>\n\n"
-            "示例:/relay_set_api +8613800138000\n\n"
-            "API_ID 和 API_HASH 从 .env 自动读取。\n"
-            "配置后保存在数据库中,解码机器人下次重启时生效。"
-        )
-        return
-    phone = args[0].strip()
-
-    from config import settings
-    api_id = settings.RELAY_API_ID
-    api_hash = settings.RELAY_API_HASH
-    if not api_id or not api_hash:
-        await update.message.reply_text(
-            "❌ 中继 API 配置未设置\n"
-            "请在 .env 文件中配置 RELAY_API_ID 和 RELAY_API_HASH\n"
-            "（从 https://my.telegram.org 申请）"
+            "用法:/relay_password <手机号> <二步验证密码>\n\n"
+            "用于中继账号开启了二步验证(Two-Step Verification)时提交密码。\n"
+            "如果只有一个账号在等待密码,可省略手机号:\n"
+            "  /relay_password <密码>\n\n"
+            "⚠️ 密码明文不会留存于聊天记录(提交后立即清除)。"
         )
         return
 
-    await set_relay_config(api_id, api_hash, phone)
+    # 判断是否省略了手机号(只有一个参数=密码,两个参数=手机号+密码)
+    if len(args) == 1:
+        password = args[0].strip()
+        phone = ""
+        # 从 pending 状态自动检测手机号
+        try:
+            from services.relay_pool import relay_pool
+            from database import get_config as _get_cfg
+            if relay_pool._initialized:
+                for inst in relay_pool.instances:
+                    if await _get_cfg(f"relay_password_pending:{inst.phone}") == "1":
+                        phone = inst.phone
+                        break
+        except Exception:
+            pass
+        if not phone:
+            await update.message.reply_text("❌ 无法确定中继账号,请使用 /relay_password <手机号> <密码> 提交")
+            return
+    else:
+        phone = args[0].strip()
+        password = " ".join(args[1:]).strip()
+
+    if not password:
+        await update.message.reply_text("❌ 密码不能为空")
+        return
+
+    from database import set_config
+    await set_config(f"relay_auth_password:{phone}", password)
     await update.message.reply_text(
-        f"✅ 中继账号已配置\n"
-        f"API_ID:{str(api_id)[:4]}...\n"
-        f"手机号:{phone[:3]}****{phone[-2:] if len(phone) > 5 else ''}\n\n"
-        f"⚠️ 配置已保存到数据库,解码机器人下次重启时生效。\n"
-        f"⚠️ 请确保该账号未开启二步验证。\n"
-        f"🔐 建议在配置完成后立即删除本聊天记录中的密钥信息。"
+        f"✅ 二步验证密码已提交至 {phone[:3]}****{phone[-2:] if len(phone) > 5 else '***'}\n"
+        f"🔐 出于安全考虑,密码明文将在使用后立即清除。"
     )
 
 
@@ -474,7 +491,7 @@ async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "✅ 当前没有中继账号在等待验证码。\n\n"
-            "如需添加中继账号，请使用 /relay_set_api <手机号>。"
+            "如需添加中继账号，请使用 /relay_add <手机号>。"
         )
 
 
@@ -1603,63 +1620,67 @@ async def _restore_list_backups(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "管理员面板 模块说明\n\n"
-        "系统状态\n"
-        "  /status — 系统概览（进程运行状态、各Bot状态）\n"
-        "  /health — 健康检查（频道状态、降级情况）\n\n"
-        "用户管理\n"
+        "📖 管理员命令手册\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📊 系统状态\n"
+        "  /status — 系统概览(进程状态、各Bot状态)\n"
+        "  /health — 健康检查(频道状态、降级情况)\n"
+        "  /topology — 查看环形拓扑结构\n\n"
+        "👤 用户管理\n"
         "  /users [关键词] [页码] — 用户列表\n"
-        "  /user <用户ID> — 查看用户详情（等级、配额、封禁状态）\n"
-        "  /set_level <用户ID> <free|basic|premium> — 设置用户等级\n"
-        "  /set_quota <用户ID> <日配额> — 设置用户解码配额\n"
-        "  /set_external_quota <用户ID> <配额> — 设置外部码配额\n"
+        "  /user <用户ID> — 查看用户详情\n"
+        "  /set_level <用户ID> <1|2|3> — 设置等级(1=免费 2=基础 3=高级)\n"
+        "  /set_quota <用户ID> <日配额> — 解码配额(-1=不限 0=禁止)\n"
+        "  /set_external_quota <用户ID> <配额> — 外部码配额(-1=不限 0=禁止)\n"
         "  /ban <用户ID> — 封禁用户\n"
         "  /unban <用户ID> — 解封用户\n\n"
-        "文件管理\n"
+        "📁 文件管理\n"
         "  /files [页码] — 文件列表\n"
-        "  /file <文件ID> — 查看文件详情\n"
-        "  /delete_file <文件ID> — 删除文件\n"
-        "  /purge_channel <频道ID> — 清理频道所有文件\n\n"
-        "中继管理（外部码解码用）\n"
-        "  /relay_set_api <手机号> — 配置中继账号（API从.env自动读取）\n"
-        "  /relay_code <手机号> <验证码> — 提交中继验证码\n"
-        "  /relay_pending — 查看待处理的中继请求\n"
-        "  /relay_list — 查看中继实例列表\n"
-        "  /relay_add <手机号> — 添加中继实例\n"
-        "  /relay_remove <手机号> — 移除中继实例\n"
-        "  /relay_reset_stats — 重置中继统计\n"
-        "  /relay_whitelist [add|remove|clear] [用户ID] — 中继账号白名单（热更新）\n"
-        "  /collector_whitelist [add|remove|clear] [用户ID] — 采集器账号白名单（热更新）\n\n"
-        "系统配置\n"
+        "  /file <文件码> — 查看文件详情\n"
+        "  /delete_file <文件码> — 删除文件\n"
+        "  /set_access_limit <文件码> <次数> — 访问次数限制(0=不限)\n"
+        "  /purge_channel <频道ID> — 清理频道(需手动操作)\n\n"
+        "🔐 中继管理(外部码解码用)\n"
+        "  /relay_add <手机号> — 添加中继账号(API从.env读取)\n"
+        "  /relay_code <手机号> <验证码> — 提交登录验证码\n"
+        "  /relay_password <手机号> <密码> — 提交二步验证密码\n"
+        "  /relay_list — 查看中继账号列表\n"
+        "  /relay_pending — 查看待处理验证码\n"
+        "  /relay_remove <手机号> — 移除中继账号\n"
+        "  /relay_reset_stats — 重置使用统计\n"
+        "  /relay_whitelist [add|remove|clear] [用户ID] — 中继白名单(热更新)\n"
+        "  /collector_whitelist [add|remove|clear] [用户ID] — 采集器白名单(热更新)\n\n"
+        "⚙️ 系统配置\n"
         "  /settings — 查看全部配置\n"
-        "  /set_storage_channel <频道ID> — 主存储频道（需重启）\n"
-        "  /set_file_prefix <前缀> — 文件码前缀（需重启）\n"
-        "  /set_force_join <频道ID> <链接> — 强制加群（热更新）\n"
-        "  /set_username <upload|decoder|sender> <@用户名> — 机器人用户名（热更新）\n"
-        "  /set_quota_default <free|basic|premium> <配额> — 默认日配额（热更新）\n"
-        "  /set_r2 <账号ID> <AccessKey> <SecretKey> — R2备份配置（需重启）\n"
-        "  /set_db_backup <间隔分钟> <on|off> — 数据库自动备份（热更新）\n"
-        "  /restore [序号] [table:xxx,yyy] [merge:yes] — 查看备份列表/恢复数据库\n"
-        "     · merge:yes = 增量补充(冲突保留现有,不删现有数据)\n"
-        "  /factory_reset — 恢复出厂设置\n\n"
-        "文件码路由（第三方机器人迁移用）\n"
-        "  /add_code_route <前缀> <机器人用户名> — 添加路由规则\n"
-        "  /remove_code_route <前缀> — 删除路由规则\n"
+        "  /set_storage_channel <频道ID> — 主存储频道(需重启)\n"
+        "  /set_file_prefix <前缀> — 文件码前缀(需重启)\n"
+        "  /set_force_join <频道ID> [链接] — 强制加群(热更新)\n"
+        "  /set_username <upload|decoder|sender> <@用户名> — Bot用户名(热更新)\n"
+        "  /set_quota_default <1|2|3> <配额> [外部码配额] — 默认配额(热更新)\n"
+        "  /set_r2 <账号ID> <AccessKey> <SecretKey> [桶名] — R2备份(需重启)\n"
+        "  /set_db_backup <间隔分钟> <on|off> — 自动备份(热更新)\n"
+        "  /restore [序号] [table:xxx,yyy] [merge:yes] — 数据库恢复\n"
+        "  /factory_reset — 恢复出厂设置(危险)\n\n"
+        "🗺️ 文件码路由(第三方机器人迁移用)\n"
+        "  /add_code_route <前缀> <机器人用户名> — 添加路由\n"
+        "  /remove_code_route <前缀> — 删除路由\n"
         "  /code_routes — 查看路由表\n\n"
-        "Bot 限流（解码间隔控制）\n"
-        "  /set_bot_interval <机器人用户名> <秒数> — 设置解码间隔\n"
-        "  /remove_bot_interval <机器人用户名> — 删除解码间隔\n"
+        "⏱️ Bot限流(解码间隔控制)\n"
+        "  /set_bot_interval <机器人用户名> <秒数> — 设置间隔(0=取消)\n"
+        "  /remove_bot_interval <机器人用户名> — 删除限流\n"
         "  /bot_intervals — 查看限流配置\n\n"
-        "环形拓扑\n"
-        "  /topology — 查看环形拓扑结构\n"
-        "  /spare_add <频道ID> — 添加备用频道\n"
+        "🔄 环形拓扑与轮转\n"
+        "  /cell_add <slot_id> <channel_id> [账号名] [状态] — 添加槽位\n"
+        "  /cell_remove <slot_id> — 移除槽位(拒绝active)\n"
+        "  /spare_add <频道ID> [账号名] — 添加备用频道\n"
         "  /spare_remove <频道ID> — 移除备用频道\n"
         "  /spare_list — 查看备用池\n"
-        "  /rotation_set <参数> <值> — 设置轮转参数\n"
+        "  /rotation_set <参数> <值> — 轮转参数\n"
         "  /rotation_view — 查看轮转配置\n\n"
-        "解码日志\n"
+        "📋 解码日志\n"
         "  /logs [页码] — 查看解码日志\n\n"
-        "使用 /cancel 取消当前交互操作\n"
-        "点击按钮操作更便捷，推荐使用菜单面板。"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "💡 /cancel 取消当前交互操作\n"
+        "💡 推荐使用菜单面板(发送 /start 打开)"
     )
     await update.message.reply_text(msg)

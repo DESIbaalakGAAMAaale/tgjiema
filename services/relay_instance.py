@@ -196,6 +196,27 @@ class RelayInstance:
         logger.error(f"[RelayInstance:{self.phone}] 等待验证码超时（5分钟）")
         return None
 
+    async def _wait_for_admin_password(self) -> str | None:
+        """等待管理员提交二步验证密码(类似验证码流程,5分钟超时)。"""
+        from database.session import get_config, set_config
+
+        await set_config(f"relay_password_pending:{self.phone}", "1")
+        await self._report_status("pending_password")
+        logger.info(f"[RelayInstance:{self.phone}] 该账号开启了二步验证,等待管理员通过 /relay_password 提交密码...")
+
+        for i in range(100):
+            await asyncio.sleep(3)
+            password = await get_config(f"relay_auth_password:{self.phone}")
+            if password and password.strip():
+                await set_config(f"relay_password_pending:{self.phone}", "0")
+                await set_config(f"relay_auth_password:{self.phone}", "")
+                logger.info(f"[RelayInstance:{self.phone}] 已收到管理员提交的二步验证密码")
+                return password.strip()
+
+        await set_config(f"relay_password_pending:{self.phone}", "0")
+        logger.error(f"[RelayInstance:{self.phone}] 等待二步验证密码超时（5分钟）")
+        return None
+
     async def start(self):
         await self._report_status("connecting")
 
@@ -222,12 +243,20 @@ class RelayInstance:
             try:
                 await self._client.sign_in(self.phone, code)
             except SessionPasswordNeededError:
-                logger.error(
-                    f"[RelayInstance:{self.phone}] 该账号开启了二步验证，暂不支持"
-                )
-                await self._report_status("offline")
-                await self._client.disconnect()
-                return
+                logger.info(f"[RelayInstance:{self.phone}] 该账号开启了二步验证,等待密码")
+                password = await self._wait_for_admin_password()
+                if not password:
+                    logger.error(f"[RelayInstance:{self.phone}] 无法获取二步验证密码，登录失败")
+                    await self._report_status("offline")
+                    await self._client.disconnect()
+                    return
+                try:
+                    await self._client.sign_in(password=password)
+                except Exception as e:
+                    logger.error(f"[RelayInstance:{self.phone}] 二步验证密码错误或登录失败: {e}")
+                    await self._report_status("offline")
+                    await self._client.disconnect()
+                    return
             except Exception as e:
                 logger.error(f"[RelayInstance:{self.phone}] 登录失败: {e}")
                 await self._report_status("offline")
@@ -298,7 +327,14 @@ class RelayInstance:
             try:
                 await self._client.sign_in(self.phone, code)
             except SessionPasswordNeededError:
-                raise RuntimeError("账号开启二步验证，暂不支持")
+                logger.info(f"[RelayInstance:{self.phone}] 该账号开启了二步验证,等待密码")
+                password = await self._wait_for_admin_password()
+                if not password:
+                    raise RuntimeError("二步验证密码获取超时")
+                try:
+                    await self._client.sign_in(password=password)
+                except Exception as e:
+                    raise RuntimeError(f"二步验证密码错误或登录失败: {e}")
 
         me = await self._client.get_me()
         self._relay_user_id = me.id
