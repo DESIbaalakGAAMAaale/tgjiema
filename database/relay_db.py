@@ -201,6 +201,22 @@ class RelayDB:
         await self._db.execute("PRAGMA wal_autocheckpoint=1000")
         await self._db.executescript(DDL)
         await self._db.commit()
+
+        # 幂等迁移:为旧表补充新增列(CREATE TABLE IF NOT EXISTS 不会为已存在的表添加列)
+        # duplicate column 错误是预期的,表示列已存在,可忽略
+        for col_def in (
+            "status TEXT DEFAULT 'unknown'",
+            "status_info TEXT",
+            "status_updated_at TEXT",
+        ):
+            try:
+                await self._db.execute(f"ALTER TABLE relay_accounts ADD COLUMN {col_def}")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" in str(e).lower():
+                    logger.debug(f"[RelayDB] ALTER TABLE 已存在列(幂等,可忽略): {col_def.split()[0]}")
+                else:
+                    logger.warning(f"[RelayDB] ALTER TABLE 失败(非预期): {e}")
+        await self._db.commit()
         
         # 启动恢复：如果 SQLite 为空，从 CRDB 拉取
         cursor = await self._db.execute("SELECT COUNT(*) FROM relay_accounts")
