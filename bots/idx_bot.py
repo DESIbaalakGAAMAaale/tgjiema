@@ -2063,8 +2063,27 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                         metrics.decode_count += 1
                         await metrics.record_processed("idx_bot")
                         return
-                # file_code 为空：idx_bot 还没处理完 pending，文件刚存入频道
-                logger.info(f"[Idx][external] 文件处理中，通知用户稍后重试: code={code}")
+                # file_code 为空：idx_bot 还没处理完 pending 或映射创建失败
+                # 用 created_at 判断：超过 60 秒说明 pending 早已处理完但映射创建失败（脏标记）
+                # 清除脏标记让下次发码能走中继重新获取；60 秒内说明 pending 可能还在处理中
+                mapped_fc2, mapped_created = await relay_db.get_mapped_code_info(code)
+                _should_clear = False
+                if mapped_created:
+                    try:
+                        from datetime import datetime as _dt
+                        ct = _dt.fromisoformat(mapped_created.replace("Z", "+00:00"))
+                        age = (datetime.datetime.now(datetime.timezone.utc) - ct).total_seconds()
+                        if age > 60:
+                            _should_clear = True
+                    except Exception:
+                        _should_clear = True  # 时间解析失败，安全清除
+                else:
+                    _should_clear = True  # 无 created_at，安全清除
+                if _should_clear:
+                    logger.warning(f"[Idx][external] 脏标记已过期(file_code为空)，清除标记让下次走中继: code={code}")
+                    await relay_db.unmark_code(code)
+                else:
+                    logger.info(f"[Idx][external] pending 处理中，通知用户稍后重试: code={code}")
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user_id, is_external=True)

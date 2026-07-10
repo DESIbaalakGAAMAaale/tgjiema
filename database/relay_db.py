@@ -523,6 +523,14 @@ class RelayDB:
             row = await cursor.fetchone()
             return row[0] if row and row[0] else ""
 
+    async def get_mapped_code_info(self, code: str) -> tuple[str, str]:
+        """返回 (file_code, created_at)，用于判断脏标记是否过期"""
+        async with self._db.execute("SELECT file_code, created_at FROM mapped_codes WHERE code = ?", (code,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row[0] or "", row[1] or ""
+            return "", ""
+
     async def update_mapped_file_code(self, code: str, file_code: str) -> None:
         """idx_bot 处理 pending 后更新 file_code，使后续请求可直接从存储频道发送"""
         await self._db.execute(
