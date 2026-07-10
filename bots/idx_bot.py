@@ -675,24 +675,25 @@ async def _process_one_pending(app: Application, row: dict):
             from database import set_external_code_mapping
             await set_external_code_mapping(ext_code, file_code, bot_username="")
             logger.info(f"[Idx][poll] 外部码映射已写入: {ext_code} {file_code}")
-            # 映射写入成功后标记 mapped_codes，确保与 external_code_mapping 同步
-            # 这样中继的 is_code_mapped 检查不会产生脏标记
+            # 映射写入成功后更新 mapped_codes：标记 + 记录 file_code
+            # 这样即使 external_code_mapping 查询失败，也能从 mapped_codes.file_code 直接找到文件
             try:
                 from database.relay_db import get_relay_db
                 relay_db = await get_relay_db()
                 if relay_db:
                     await relay_db.mark_code_mapped(ext_code)
+                    await relay_db.update_mapped_file_code(ext_code, file_code)
             except Exception as mark_err:
                 logger.debug(f"[Idx][poll] mark_code_mapped 失败(非致命): {mark_err}")
         except Exception as e:
             logger.error(f"[Idx][poll] 外部码映射写入失败(code={ext_code}): {e}")
-            # 映射写入失败时清除中继的 mapped_codes 标记，避免脏标记导致循环
+            # 映射写入失败时清除中继的 mapped_codes 标记，下次用户发码可重新走中继
             try:
                 from database.relay_db import get_relay_db
                 relay_db = await get_relay_db()
                 if relay_db:
                     await relay_db.unmark_code(ext_code)
-                    logger.info(f"[Idx][poll] 映射写入失败，已清除中继脏标记: {ext_code}")
+                    logger.info(f"[Idx][poll] 映射写入失败，已清除中继标记: {ext_code}")
             except Exception as unmark_err:
                 logger.debug(f"[Idx][poll] unmark_code 失败(非致命): {unmark_err}")
     elif note:
@@ -2016,16 +2017,45 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             logger.warning(f"[Idx][external] 中继返回False后重试系统码映射失败: {e}")
 
         # ── 中继已处理过该码（is_code_mapped=True）但映射尚未创建 ──
-        # 说明文件已存入频道，idx_bot 正在处理 pending 创建映射
-        # 不重试中继（避免重复请求第三方bot），通知用户稍后重试
-        # idx_bot 处理 pending 成功 → 映射创建 → 用户重试直接走映射
-        # idx_bot 处理 pending 失败 → unmark_code → 用户重试走中继重新获取
+        # 文件已存入频道，直接从 mapped_codes.file_code 查找文件发送
+        # 不重试中继（避免重复请求第三方bot）
         try:
             from database.relay_db import get_relay_db
             relay_db = await get_relay_db()
             if relay_db and await relay_db.is_code_mapped(code):
-                logger.info(f"[Idx][external] 码已标记映射但映射尚未创建，文件处理中: code={code}")
-                # 回滚预扣配额
+                # 查 mapped_codes.file_code（idx_bot 处理 pending 后写入）
+                mapped_fc = await relay_db.get_mapped_file_code(code)
+                if mapped_fc:
+                    file_record_mc = await get_file_record_cached(mapped_fc)
+                    if file_record_mc:
+                        mc_channel = file_record_mc.get("primary_channel_id") or await _get_storage_channel()
+                        mc_ids_str = file_record_mc.get("batch_msg_ids") or ""
+                        if not isinstance(mc_ids_str, str):
+                            mc_ids_str = str(mc_ids_str)
+                        mc_msg_ids = [int(mid) for mid in mc_ids_str.split(",") if mid.strip().isdigit()]
+                        if not mc_msg_ids:
+                            mc_msg_ids = [file_record_mc.get("primary_channel_msg_id")]
+                        mc_meta = file_record_mc.get("batch_file_meta") or ""
+                        if isinstance(mc_meta, (list, bytes)):
+                            import json as _json2
+                            mc_meta = _json2.dumps(mc_meta) if mc_meta else ""
+                            if isinstance(mc_meta, bytes):
+                                mc_meta = mc_meta.decode()
+                        mc_protect = file_record_mc.get("protect_content", False)
+                        await _dispatch_to_dsp(user_id, mapped_fc, mc_channel, mc_msg_ids, mc_meta, mc_protect)
+                        logger.info(f"[Idx][external] 从 mapped_codes 直接调度: code={code}, file_code={mapped_fc}")
+                        await safe_reply_text(
+                            update.message,
+                            f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                            ]])
+                        )
+                        metrics.decode_count += 1
+                        await metrics.record_processed("idx_bot")
+                        return
+                # file_code 为空：idx_bot 还没处理完 pending，文件刚存入频道
+                logger.info(f"[Idx][external] 文件处理中，通知用户稍后重试: code={code}")
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user_id, is_external=True)

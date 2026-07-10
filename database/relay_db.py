@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS bot_cooldown (
 -- 外部码映射缓存：本地缓存已映射的码，避免重复查询 CRDB
 CREATE TABLE IF NOT EXISTS mapped_codes (
     code        TEXT PRIMARY KEY,
+    file_code   TEXT DEFAULT '',
     created_at  TEXT DEFAULT (datetime('now'))
 );
 
@@ -218,6 +219,14 @@ class RelayDB:
                     logger.debug(f"[RelayDB] ALTER TABLE 已存在列(幂等,可忽略): {col_def.split()[0]}")
                 else:
                     logger.warning(f"[RelayDB] ALTER TABLE 失败(非预期): {e}")
+        # mapped_codes 表补充 file_code 列
+        try:
+            await self._db.execute("ALTER TABLE mapped_codes ADD COLUMN file_code TEXT DEFAULT ''")
+        except sqlite3.OperationalError as e:
+            if "duplicate column" in str(e).lower():
+                logger.debug("[RelayDB] mapped_codes.file_code 列已存在(幂等,可忽略)")
+            else:
+                logger.warning(f"[RelayDB] ALTER TABLE mapped_codes 失败(非预期): {e}")
         await self._db.commit()
         
         # 启动恢复：如果 SQLite 为空，从 CRDB 拉取
@@ -506,6 +515,20 @@ class RelayDB:
 
     async def unmark_code(self, code: str) -> None:
         await self._db.execute("DELETE FROM mapped_codes WHERE code = ?", (code,))
+        await self._db.commit()
+
+    async def get_mapped_file_code(self, code: str) -> str:
+        """获取 mapped_codes 中记录的 file_code（idx_bot 处理 pending 后写入）"""
+        async with self._db.execute("SELECT file_code FROM mapped_codes WHERE code = ?", (code,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row and row[0] else ""
+
+    async def update_mapped_file_code(self, code: str, file_code: str) -> None:
+        """idx_bot 处理 pending 后更新 file_code，使后续请求可直接从存储频道发送"""
+        await self._db.execute(
+            "UPDATE mapped_codes SET file_code = ? WHERE code = ?",
+            (file_code, code),
+        )
         await self._db.commit()
 
     # ── Bot 覆盖规则 ──
