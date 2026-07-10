@@ -1508,9 +1508,29 @@ async def _refresh_code_bot_routes_regex_cache():
         logger.warning(f"[ConfigCache] 正则路由刷新失败: {e}")
 
 
-async def set_code_bot_route_regex(pattern: str, bot_username: str) -> int:
-    """新增一条正则路由，返回分配的 id。pattern 可带锚点也可不带。"""
+def _unescape_unicode_in_pattern(pattern: str) -> str:
+    r"""将正则字符串中的 \Uxxxxxxxx 和 \uxxxx 转义序列转换为实际 Unicode 字符。
+
+    Python re 模块不原生支持 \U/\u 转义（这是 Python 字符串字面量语法）。
+    用户在 Telegram 中只能输入纯 ASCII 文本，因此需要在此解析转义。
+    """
     import re as _re
+    def _replace(m):
+        return chr(int(m.group(1), 16))
+    # 先处理 \Uxxxxxxxx (8位)，再处理 \uxxxx (4位)
+    pattern = _re.sub(r'\\U([0-9a-fA-F]{8})', _replace, pattern)
+    pattern = _re.sub(r'\\u([0-9a-fA-F]{4})', _replace, pattern)
+    return pattern
+
+
+async def set_code_bot_route_regex(pattern: str, bot_username: str) -> int:
+    r"""新增一条正则路由，返回分配的 id。pattern 可带锚点也可不带。
+
+    支持 \Uxxxxxxxx 和 \uxxxx 转义序列（用于在 Telegram 中输入 emoji/特殊 Unicode 范围）。
+    """
+    import re as _re
+    # 解析 \U/\u 转义序列，转换为实际 Unicode 字符
+    pattern = _unescape_unicode_in_pattern(pattern)
     # 校验正则可编译
     try:
         _re.compile(pattern)

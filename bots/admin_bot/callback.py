@@ -208,7 +208,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "add_code_route_regex:pattern",
                 "🗺️ 新增文件码正则路由\n\n"
                 "用于 40位hash / emoji 等非前缀式第三方码。\n\n"
-                "请输入正则表达式（例如：^[a-f0-9]{40}$）：\n\n"
+                "请输入正则表达式：\n\n"
+                "示例：\n"
+                "• 40位hex码：^[a-f0-9]{40}$\n"
+                "• emoji码：^[\\U0001F000-\\U0001FAFF]+$\n"
+                "• 自定义长度：^[a-zA-Z0-9]{32}$\n\n"
+                "支持 \\Uxxxxxxxx 和 \\uxxxx 转义序列。\n\n"
                 "❌ 如需取消请点击下方按钮。"
             ),
             "remove_code_route_regex": (
