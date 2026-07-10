@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS relay_accounts (
     status       TEXT DEFAULT 'unknown',
     status_info  TEXT,
     auth_code    TEXT,
+    relay_user_id BIGINT,
     created_at   TEXT DEFAULT (datetime('now')),
     last_login_at TEXT,
     status_updated_at TEXT
@@ -208,6 +209,7 @@ class RelayDB:
             "status TEXT DEFAULT 'unknown'",
             "status_info TEXT",
             "status_updated_at TEXT",
+            "relay_user_id BIGINT",
         ):
             try:
                 await self._db.execute(f"ALTER TABLE relay_accounts ADD COLUMN {col_def}")
@@ -310,6 +312,23 @@ class RelayDB:
             (status, info, phone),
         )
         await self._db.commit()
+
+    async def update_relay_user_id(self, phone: str, user_id: int):
+        """登录成功后记录该中继账号的 Telegram user_id,用于移除时清理白名单"""
+        await self._db.execute(
+            "UPDATE relay_accounts SET relay_user_id=? WHERE phone=?",
+            (user_id, phone),
+        )
+        await self._db.commit()
+
+    async def get_relay_user_id(self, phone: str) -> int | None:
+        """查询中继账号的 Telegram user_id,用于移除时从白名单清除"""
+        cursor = await self._db.execute(
+            "SELECT relay_user_id FROM relay_accounts WHERE phone=?",
+            (phone,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def get_active_accounts(self) -> list[dict]:
         rows = await self._db.execute_fetchall(

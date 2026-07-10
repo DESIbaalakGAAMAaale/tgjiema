@@ -477,6 +477,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             # 自动将该账号 user_id 加入中继白名单,免手动配置
             if me:
                 try:
+                    await db.update_relay_user_id(phone, me.id)
                     added = await add_relay_whitelist(me.id)
                     if added:
                         logger.info(f"[Admin] relay_add: 已自动加入中继白名单 (user_id={me.id})")
@@ -604,6 +605,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
         # 自动将该账号 user_id 加入中继白名单,免手动配置
         try:
+            await db.update_relay_user_id(phone, me.id)
             added = await add_relay_whitelist(me.id)
             if added:
                 logger.info(f"[Admin] relay_add: 已自动加入中继白名单 (user_id={me.id})")
@@ -663,6 +665,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             pass
         # 自动将该账号 user_id 加入中继白名单,免手动配置
         try:
+            await db.update_relay_user_id(phone, me.id)
             added = await add_relay_whitelist(me.id)
             if added:
                 logger.info(f"[Admin] relay_add: 已自动加入中继白名单 (user_id={me.id})")
@@ -678,7 +681,12 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     elif state == "relay_remove:phone":
         from services.relay_pool import relay_pool, _normalize_phone
+        from database.relay_db import get_relay_db
+        from database import remove_relay_whitelist
         phone = _normalize_phone(text.strip())
+        # 移除前先查询 relay_user_id,用于清理白名单(remove_account 会删除 DB 记录)
+        db = await get_relay_db()
+        relay_user_id = await db.get_relay_user_id(phone)
         removed = await relay_pool.remove_account(phone)
         if removed:
             try:
@@ -686,6 +694,13 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await get_cache_store().notify_relay_change()
             except Exception:
                 pass
+            # 自动从白名单移除该账号的 user_id
+            if relay_user_id:
+                try:
+                    await remove_relay_whitelist(relay_user_id)
+                    logger.info(f"[Admin] relay_remove: 已自动移除白名单 (user_id={relay_user_id})")
+                except Exception as e:
+                    logger.warning(f"[Admin] relay_remove: 自动移除白名单失败: {e}")
             await _end(f"✅ 已移除中继账号: {phone[:3]}****{phone[-2:] if len(phone) > 5 else '***'}")
         else:
             await _end(f"❌ 未找到该手机号的中继账号: {phone}")
