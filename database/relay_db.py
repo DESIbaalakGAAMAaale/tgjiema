@@ -242,10 +242,13 @@ class RelayDB:
             )
             await self._db.commit()
         except sqlite3.IntegrityError as e:
-            # H-3: 捕获 UNIQUE 约束冲突(重复手机号),提供友好错误信息
+            # H-3/R-1: 捕获 UNIQUE 约束冲突(重复手机号),提供友好错误信息
             if "UNIQUE" in str(e) and "phone" in str(e):
                 raise RuntimeError(f"手机号 {phone} 已存在(UNIQUE 冲突),请勿重复添加") from e
-            raise
+            raise RuntimeError(f"数据库约束冲突: {e}") from e
+        except sqlite3.Error as e:
+            # R-1: 捕获其他 sqlite3 异常(如 database is locked),统一转 RuntimeError
+            raise RuntimeError(f"数据库写入失败: {e}") from e
 
         # 双向同步到 CRDB（异步，不阻塞）
         task = asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))

@@ -1,3 +1,4 @@
+import os
 import time
 
 import datetime
@@ -29,25 +30,20 @@ _CONV_TIMEOUT_SECONDS = 300
 
 
 def _rename_auth_session(auth_path: str, target_path: str):
-    """H-2: 将临时 session 文件重命名为正式路径。
+    """H-2/R-2: 将临时 session 文件原子替换为正式路径。
 
-    admin_bot 用 *_auth 临时路径登录,成功后重命名为正式路径供 idx_bot 使用。
-    避免与 idx_bot 运行中的实例争用同一 session SQLite 文件。
+    admin_bot 用 *_auth 临时路径登录,成功后替换正式路径供 idx_bot 使用。
+    R-2: 使用 os.replace 原子替换,避免先删后 rename 在崩溃时丢失 session。
     """
     try:
         auth_p = Path(auth_path)
         target_p = Path(target_path)
-        # 删除旧的正式 session(如果存在)
-        for suffix in ("", "-journal", "-wal", "-shm"):
-            old = Path(str(target_p) + suffix)
-            if old.exists():
-                old.unlink()
-        # 重命名临时 session 及其 WAL/journal 文件
+        # R-2: os.replace 原子替换(自动覆盖目标,无需先删)
         for suffix in ("", "-journal", "-wal", "-shm"):
             src = Path(str(auth_p) + suffix)
             dst = Path(str(target_p) + suffix)
             if src.exists():
-                src.rename(dst)
+                os.replace(src, dst)
     except Exception as e:
         from loguru import logger
         logger.warning(f"[Admin] _rename_auth_session 失败: {e}")
