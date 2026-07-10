@@ -243,10 +243,10 @@ class RelayPool:
         if any(a["phone"] == phone for a in existing):
             raise RuntimeError(f"手机号 {phone} 已存在,请勿重复添加")
 
-        # 阶段1:仅验证 api_id/api_hash 有效性(非阻塞)
+        # 阶段1:仅验证 api_id/api_hash 有效性(非阻塞,不发送验证码)
         from services.relay_instance import RelayInstance
         from telethon import TelegramClient
-        from telethon.errors import ApiIdInvalidError
+        from telethon.errors import ApiIdInvalidError, AuthKeyError
 
         logger.info(f"[RelayPool] 验证 api_id={api_id}, api_hash={api_hash[:10]}...")
 
@@ -256,8 +256,9 @@ class RelayPool:
         try:
             client = TelegramClient(temp_session, api_id, api_hash, timeout=30)
             await client.connect()
-            await client.send_code_request(phone)
-            logger.info(f"[RelayPool] 账号 {phone} api_id/api_hash 验证通过,验证码已发送")
+            # 仅 connect 验证 api_id/api_hash,不调用 send_code_request(避免发验证码)
+            # connect() 时 Telethon 会初始化授权,如果 api_id/api_hash 无效会在这里抛异常
+            logger.info(f"[RelayPool] 账号 {phone} api_id/api_hash 验证通过(connect 成功)")
         except ApiIdInvalidError:
             if client:
                 await client.disconnect()
