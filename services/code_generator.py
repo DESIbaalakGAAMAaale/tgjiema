@@ -49,23 +49,17 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_random_id(12)
     type_parts = []
-    logger.info(f"[build_file_code] file_types={file_types!r} type={type(file_types).__name__} id={id(file_types)}, FILE_TYPE_LABELS={FILE_TYPE_LABELS!r} id={id(FILE_TYPE_LABELS)}")
+    # 迭代 file_types.items()（已验证可用），在 FILE_TYPE_LABELS 上查 abbr
     if isinstance(file_types, dict):
-        logger.info(f"[build_file_code] file_types keys={list(file_types.keys())!r} key_repr={[repr(k) for k in file_types.keys()]}")
         for k, v in file_types.items():
-            logger.info(f"[build_file_code]   entry: key={k!r} key_type={type(k).__name__} val={v!r} val_type={type(v).__name__}")
-    for label, abbr in FILE_TYPE_LABELS.items():
-        count = file_types.get(label, 0) if isinstance(file_types, dict) else 0
-        logger.info(f"[build_file_code] label={label!r} label_type={type(label).__name__} abbr={abbr!r} count={count}")
-        if count > 0:
-            type_parts.append(f"{count}{abbr}")
+            abbr = FILE_TYPE_LABELS.get(k)
+            if abbr and isinstance(v, (int, float)) and v > 0:
+                type_parts.append(f"{int(v)}{abbr}")
     if not type_parts:
-        logger.error(f"[build_file_code] file_types 为空或无已知类型, 将使用 0d 兜底")
         suffix = "0d"
     else:
         suffix = "_".join(type_parts)
     result = f"{prefix}_{random_part}_{suffix}"
-    logger.info(f"[build_file_code] generated code, suffix={suffix!r}")
     return result
 
 
