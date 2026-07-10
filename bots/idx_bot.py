@@ -671,6 +671,11 @@ async def _process_one_pending(app: Application, row: dict):
                     batch_file_meta_str, protect_content,
                 )
                 logger.info(f"[Idx][poll] 外部码 {ext_code} 已直接调度 dsp 发送给 {uploader_id}")
+                try:
+                    await safe_send_message(app.bot, chat_id=uploader_id,
+                        text=f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。")
+                except Exception as notify_err:
+                    logger.warning(f"[Idx][poll] 外部码 {ext_code} 通知用户失败: {notify_err}")
             except Exception as dispatch_err:
                 logger.error(f"[Idx][poll] 外部码直接调度 dsp 失败 (code={ext_code}): {dispatch_err}, 回退通知用户")
                 # 调度失败时回退到通知用户重新发送码

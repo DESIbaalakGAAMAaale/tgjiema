@@ -49,8 +49,10 @@ def build_file_code(file_types: dict) -> str:
     prefix = settings.FILE_CODE_PREFIX
     random_part = _generate_random_id(12)
     type_parts = []
+    logger.info(f"[build_file_code] file_types={file_types!r} type={type(file_types).__name__}, FILE_TYPE_LABELS={FILE_TYPE_LABELS!r}")
     for label, abbr in FILE_TYPE_LABELS.items():
         count = file_types.get(label, 0) if isinstance(file_types, dict) else 0
+        logger.info(f"[build_file_code] label={label!r} abbr={abbr!r} count={count}")
         if count > 0:
             type_parts.append(f"{count}{abbr}")
     if not type_parts:
@@ -59,7 +61,7 @@ def build_file_code(file_types: dict) -> str:
     else:
         suffix = "_".join(type_parts)
     result = f"{prefix}_{random_part}_{suffix}"
-    logger.debug(f"[build_file_code] generated code, suffix={suffix!r}")
+    logger.info(f"[build_file_code] generated code, suffix={suffix!r}")
     return result
 
 
