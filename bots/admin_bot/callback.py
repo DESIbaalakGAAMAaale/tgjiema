@@ -226,11 +226,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             "relay_add": (
                 "relay_add:phone",
-                "➕ 添加中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\nAPI_ID/API_HASH 从 .env 自动读取\n❌ 如需取消请点击下方按钮。"
-            ),
-            "relay_password": (
-                "relay_password:password",
-                "🔒 提交二步验证密码\n\n请输入该中继账号的二步验证密码：\n\n❌ 如需取消请点击下方按钮。"
+                "➕ 添加中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\nAPI_ID/API_HASH 从 .env 自动读取\n系统将自动发送验证码到该 Telegram 账号\n❌ 如需取消请点击下方按钮。"
             ),
             "relay_remove": (
                 "relay_remove:phone",
