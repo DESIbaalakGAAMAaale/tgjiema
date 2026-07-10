@@ -259,7 +259,7 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
     except Exception:
         pass
 
-    lines.append(f"分享给好友（点击复制）：{file_code}")
+    lines.append(f"文件码：<code>{file_code}</code>")
     return "\n".join(lines)
 
 
