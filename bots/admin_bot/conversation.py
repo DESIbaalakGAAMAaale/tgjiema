@@ -1,6 +1,7 @@
 import time
 
 import datetime
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -10,7 +11,6 @@ from database import (
     get_users_col, get_file_records_col,
     set_config,
     set_code_bot_route, delete_code_bot_route,
-    set_bot_decode_interval, delete_bot_decode_interval,
     add_spare_channel, remove_spare,
     set_rotation_config,
     update_user_and_invalidate,
@@ -26,6 +26,43 @@ from .display import _ensure_user
 
 # 对话超时时间(秒):用户 5 分钟无响应自动清理对话状态
 _CONV_TIMEOUT_SECONDS = 300
+
+
+def _rename_auth_session(auth_path: str, target_path: str):
+    """H-2: 将临时 session 文件重命名为正式路径。
+
+    admin_bot 用 *_auth 临时路径登录,成功后重命名为正式路径供 idx_bot 使用。
+    避免与 idx_bot 运行中的实例争用同一 session SQLite 文件。
+    """
+    try:
+        auth_p = Path(auth_path)
+        target_p = Path(target_path)
+        # 删除旧的正式 session(如果存在)
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            old = Path(str(target_p) + suffix)
+            if old.exists():
+                old.unlink()
+        # 重命名临时 session 及其 WAL/journal 文件
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            src = Path(str(auth_p) + suffix)
+            dst = Path(str(target_p) + suffix)
+            if src.exists():
+                src.rename(dst)
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[Admin] _rename_auth_session 失败: {e}")
+
+
+def _cleanup_auth_session(auth_path: str):
+    """H-2: 清理临时 session 文件(对话取消/失败时调用)。"""
+    try:
+        auth_p = Path(auth_path)
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            p = Path(str(auth_p) + suffix)
+            if p.exists():
+                p.unlink()
+    except Exception:
+        pass
 
 
 async def _conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
@@ -55,6 +92,10 @@ async def _conv_end(context: ContextTypes.DEFAULT_TYPE):
             await client.disconnect()
         except Exception:
             pass
+    # H-2: 清理临时 session 文件(对话取消/超时时)
+    auth_path = context.user_data.pop("_relay_auth_session_path", None)
+    if auth_path:
+        _cleanup_auth_session(auth_path)
     context.user_data.pop("conv_state", None)
     context.user_data.pop("conv_data", None)
     context.user_data.pop("conv_started_at", None)
@@ -358,7 +399,6 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         from services.relay_pool import _normalize_phone
         from database.relay_db import get_relay_db
         from loguru import logger
-        from pathlib import Path
         from telethon import TelegramClient
 
         phone = _normalize_phone(text.strip())
@@ -384,10 +424,21 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await _end(f"❌ 手机号 {phone} 已存在,请勿重复添加")
             return
 
-        # 创建临时 Telethon 客户端(使用与 relay_instance 相同的 session 路径)
+        # H-2: 使用临时 session 路径,避免与 idx_bot 运行中的实例争用 session 文件
+        # 登录成功后,断开连接,将临时 session 文件重命名为正式路径
         project_root = Path(__file__).resolve().parent.parent.parent
         session_path = str(project_root / "data" / f"relay_session_{phone}")
-        client = TelegramClient(session_path, api_id_int, api_hash)
+        auth_session_path = str(project_root / "data" / f"relay_session_{phone}_auth")
+        # 清理可能残留的临时 session
+        try:
+            p = Path(auth_session_path)
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+        client = TelegramClient(auth_session_path, api_id_int, api_hash)
+        # H-2: 保存临时 session 路径到 user_data,供 _conv_end 清理
+        context.user_data["_relay_auth_session_path"] = auth_session_path
 
         try:
             await client.connect()
@@ -411,7 +462,15 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.error(f"[Admin] relay_add get_me 失败: {e}")
                 me = None
             await client.disconnect()
-            account_id = await db.add_account(api_id_int, api_hash, phone)
+            # H-2: 清理临时 session 路径标记 + 重命名为正式路径
+            context.user_data.pop("_relay_auth_session_path", None)
+            _rename_auth_session(auth_session_path, session_path)
+            try:
+                account_id = await db.add_account(api_id_int, api_hash, phone)
+            except RuntimeError as e:
+                logger.error(f"[Admin] relay_add add_account(session) 失败: {e}")
+                await _end(f"❌ 写入数据库失败: {e}")
+                return
             logger.info(f"[Admin] relay_add: session已授权,直接写入DB (account_id={account_id})")
             try:
                 from database.cache_store import get_cache_store
@@ -445,7 +504,9 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"请输入收到的验证码(5-6位数字):\n\n"
             f"❌ 如需取消请点击下方按钮。",
             {"phone": phone, "phone_code_hash": phone_code_hash,
-             "api_id": api_id_int, "api_hash": api_hash}
+             "api_id": api_id_int, "api_hash": api_hash,
+             "auth_session_path": auth_session_path,
+             "session_path": session_path}
         )
 
     elif state == "relay_add:code":
@@ -517,9 +578,19 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         me = await client.get_me()
         await client.disconnect()
         context.user_data.pop("_relay_temp_client", None)
+        # H-2: 清理临时 session 路径标记(即将重命名,无需再被 _conv_end 清理)
+        context.user_data.pop("_relay_auth_session_path", None)
+        # H-2: 将临时 session 重命名为正式路径
+        _rename_auth_session(data.get("auth_session_path", ""), data.get("session_path", ""))
 
         db = await get_relay_db()
-        account_id = await db.add_account(data["api_id"], data["api_hash"], phone)
+        try:
+            account_id = await db.add_account(data["api_id"], data["api_hash"], phone)
+        except RuntimeError as e:
+            # H-3: UNIQUE 冲突或其他 DB 错误
+            logger.error(f"[Admin] relay_add add_account 失败: {e}")
+            await _end(f"❌ 写入数据库失败: {e}")
+            return
         logger.info(f"[Admin] relay_add: 登录成功,写入DB (account_id={account_id})")
         try:
             from database.cache_store import get_cache_store
@@ -561,9 +632,17 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         me = await client.get_me()
         await client.disconnect()
         context.user_data.pop("_relay_temp_client", None)
+        # H-2: 清理临时 session 路径标记 + 重命名为正式路径
+        context.user_data.pop("_relay_auth_session_path", None)
+        _rename_auth_session(data.get("auth_session_path", ""), data.get("session_path", ""))
 
         db = await get_relay_db()
-        account_id = await db.add_account(data["api_id"], data["api_hash"], phone)
+        try:
+            account_id = await db.add_account(data["api_id"], data["api_hash"], phone)
+        except RuntimeError as e:
+            logger.error(f"[Admin] relay_add add_account(2FA) 失败: {e}")
+            await _end(f"❌ 写入数据库失败: {e}")
+            return
         logger.info(f"[Admin] relay_add: 二步验证成功,写入DB (account_id={account_id})")
         try:
             from database.cache_store import get_cache_store

@@ -336,22 +336,47 @@ class RelayPool:
                 logger.warning(f"[RelayPool] reload 添加 {phone} 失败: {e}")
 
     async def get_pool_status(self) -> list[dict]:
-        """获取账号池状态（DB 层信息，由 idx_bot 写入 status 字段）。"""
+        """获取账号池状态（DB 层信息，由 idx_bot 写入 status 字段）。
+
+        H-1: 结合 status_updated_at 判断状态新鲜度,超过 5 分钟未更新标记为 stale。
+        idx_bot 进程崩溃后,admin 侧读取会降级显示 ⚪ 陈旧,避免误显「正常」。
+        """
         db = await get_relay_db()
         try:
             accounts = await db.get_active_accounts()
         except Exception:
             accounts = []
+        # H-1: 状态新鲜度阈值(秒),超过此值未更新则标记为 stale
+        STALE_THRESHOLD = 300  # 5 分钟
+        now_utc = datetime.now(timezone.utc)
         status = []
         for acct in accounts:
             phone = acct["phone"]
             usage = await db.get_usage(acct["id"])
+            raw_status = acct.get("status", "unknown")
+            status_updated = acct.get("status_updated_at", "")
+            # 判断新鲜度
+            stale = False
+            if status_updated:
+                try:
+                    # SQLite datetime('now') 格式: YYYY-MM-DD HH:MM:SS (无时区)
+                    last_dt = datetime.fromisoformat(status_updated)
+                    if last_dt.tzinfo is None:
+                        last_dt = last_dt.replace(tzinfo=timezone.utc)
+                    age = (now_utc - last_dt).total_seconds()
+                    if age > STALE_THRESHOLD:
+                        stale = True
+                except (ValueError, TypeError):
+                    stale = True  # 解析失败视为陈旧
+            else:
+                stale = True  # 无时间戳视为陈旧
             status.append({
                 "phone": phone,
                 "account_id": acct["id"],
-                "status": acct.get("status", "unknown"),
+                "status": raw_status,
+                "stale": stale,
                 "status_info": acct.get("status_info", ""),
-                "status_updated_at": acct.get("status_updated_at", ""),
+                "status_updated_at": status_updated,
                 "today_requests": usage["today_requests"],
                 "total_requests": usage["total_requests"],
                 "avg_wait_ms": usage["avg_wait_ms"],

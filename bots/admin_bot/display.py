@@ -120,8 +120,12 @@ async def _get_status_text() -> str:
         from services.relay_pool import relay_pool
         pool_status = await relay_pool.get_pool_status()
         if pool_status:
-            online = sum(1 for p in pool_status if p.get("status") == "online")
+            # H-1: 仅非陈旧的 online 才计入正常
+            online = sum(1 for p in pool_status if p.get("status") == "online" and not p.get("stale", False))
+            stale_count = sum(1 for p in pool_status if p.get("stale", False))
             relay_status = f"⚪ {online}/{len(pool_status)} 正常"
+            if stale_count:
+                relay_status += f" ({stale_count}个陈旧)"
         else:
             relay_status = "✅ 就绪/未配置"
     except Exception:
@@ -330,13 +334,20 @@ async def _get_relay_status_text() -> str:
 
     for i, ps in enumerate(pool_status, 1):
         status = ps.get("status", "unknown")
-        icon = STATUS_ICON.get(status, "⚪")
+        stale = ps.get("stale", False)
+        # H-1: 陈旧状态降级显示为 ⚪,避免 idx_bot 崩溃后误显「正常」
+        if stale and status in ("online", "connecting"):
+            icon = "⚪"
+            display_status = f"{status}(陈旧)"
+        else:
+            icon = STATUS_ICON.get(status, "⚪")
+            display_status = status
         phone = ps["phone"]
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
         info = ps.get("status_info", "")
         updated = ps.get("status_updated_at", "")
         msg += f"{i}. {icon} {masked}\n"
-        msg += f"   状态: {status}"
+        msg += f"   状态: {display_status}"
         if info:
             msg += f" — {info}"
         msg += "\n"
@@ -344,7 +355,8 @@ async def _get_relay_status_text() -> str:
         if updated:
             msg += f"   更新: {updated}\n"
 
-    online_count = sum(1 for p in pool_status if p.get("status") == "online")
+    # H-1: 仅非陈旧的 online 才计入「正常」
+    online_count = sum(1 for p in pool_status if p.get("status") == "online" and not p.get("stale", False))
     msg += f"\n正常: {online_count}/{len(pool_status)}"
     return msg
 

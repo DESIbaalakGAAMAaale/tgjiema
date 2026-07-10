@@ -26,6 +26,11 @@ import asyncio
 # 但子模块用 `from run_all import xxx` 会再次导入 run_all 创建副本,
 # 导致全局变量(_stop_event 等)分裂为两份,信号 handler 读到的是 None。
 # 此行让 run_all 指向 __main__,确保所有模块共享同一份全局变量。
+#
+# H-4 技术债(TODO): 此 hack 有效但脆弱,依赖导入名 `run_all` 不变。
+#   中期应把 _stop_event / _register_sigterm_handler 等共享状态移入
+#   独立模块(如 utils/process_state.py),由各 Bot 直接 import,
+#   从根本上消除双模块导入陷阱,届时可删除此行。
 sys.modules.setdefault('run_all', sys.modules[__name__])
 
 from loguru import logger

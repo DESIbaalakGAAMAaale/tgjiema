@@ -235,17 +235,23 @@ class RelayDB:
     # ── relay_accounts ──
 
     async def add_account(self, api_id: int, api_hash: str, phone: str) -> int:
-        cursor = await self._db.execute(
-            "INSERT INTO relay_accounts (api_id, api_hash, phone) VALUES (?, ?, ?)",
-            (api_id, encrypt(api_hash), phone),
-        )
-        await self._db.commit()
-        
+        try:
+            cursor = await self._db.execute(
+                "INSERT INTO relay_accounts (api_id, api_hash, phone) VALUES (?, ?, ?)",
+                (api_id, encrypt(api_hash), phone),
+            )
+            await self._db.commit()
+        except sqlite3.IntegrityError as e:
+            # H-3: 捕获 UNIQUE 约束冲突(重复手机号),提供友好错误信息
+            if "UNIQUE" in str(e) and "phone" in str(e):
+                raise RuntimeError(f"手机号 {phone} 已存在(UNIQUE 冲突),请勿重复添加") from e
+            raise
+
         # 双向同步到 CRDB（异步，不阻塞）
         task = asyncio.create_task(_sync_relay_to_crdb(api_id, api_hash, phone))
         _background_tasks.add(task)
         task.add_done_callback(_background_tasks.discard)
-        
+
         return cursor.lastrowid
 
     async def update_account(self, phone: str, api_id: int, api_hash: str):
