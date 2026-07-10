@@ -126,6 +126,15 @@ def _parse_storage_ids_from_caption(caption: str) -> list[int]:
     return []
 
 
+def _is_internal_note(note) -> bool:
+    """判断 note 是否是内部信息（外部中继/采集器的 JSON 标记），不作为备注显示给用户"""
+    if not note or not isinstance(note, str):
+        return False
+    # 外部中继的 note 格式为 {"type":"external","code":"..."}
+    # 用字符串检查避免 orjson hash 表异常
+    return '"type"' in note and '"external"' in note
+
+
 # ─── 通道选择: cells 表获取 active 槽位 ───
 
 # ─── 活跃频道本地缓存(避免每次解码都查询 cells) ───
@@ -376,7 +385,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await safe_send_message(context.bot, chat_id=user.id,
                         text=f"外部文件 {pc['ext_code']} 已就绪，请重新发送文件码即可查收。")
                 else:
-                    note_line = f"\n备注：{pc['note']}" if pc["note"] else ""
+                    note_line = f"\n备注：{pc['note']}" if pc["note"] and not _is_internal_note(pc["note"]) else ""
                     await safe_send_message(context.bot, chat_id=user.id,
                         text=f"文件码：{pc['file_code']}{note_line}\n\n"
                              f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
@@ -758,7 +767,7 @@ async def _process_one_pending(app: Application, row: dict):
                 except Exception as send_err:
                     await store.add_pending_file_code(uploader_id, file_code, note, ext_code or "")
         else:
-            note_line = f"\n备注：{note}" if note else ""
+            note_line = f"\n备注：{note}" if note and not _is_internal_note(note) else ""
             msg_text = (f"文件码：{file_code}{note_line}\n\n"
                      f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
                      f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
@@ -1146,7 +1155,7 @@ def _format_code_status(code_entry: dict) -> str:
     expire_time = code_entry.get("expire_time", "")
 
     parts = [f"   状态：{status_icon} {status_text}"]
-    if note:
+    if note and not _is_internal_note(note):
         # 截断过长的备注
         display_note = note[:20] + ("..." if len(note) > 20 else "")
         parts.append(f"备注：{display_note}")
@@ -1305,7 +1314,7 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
         f"码：{code}",
         f"状态：{status_text}",
     ]
-    if note:
+    if note and not _is_internal_note(note):
         detail_lines.append(f"备注：{note}")
     if expire_time:
         try:
