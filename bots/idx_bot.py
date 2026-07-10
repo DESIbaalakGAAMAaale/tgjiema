@@ -653,16 +653,21 @@ async def _process_one_pending(app: Application, row: dict):
                 note_parsed = note
             else:
                 note_parsed = {}
-            logger.info(f"[Idx][poll] note_parsed: type={type(note_parsed).__name__}, value={note_parsed!r}")
-            # orjson 反序列化的 dict 可能存在 hash 表异常，重建 dict 强制重新计算 hash
+            # orjson 反序列化的 dict 可能存在 hash 表异常，dict.get() 返回 None
+            # 不用 .get()，改为遍历 items 逐个比较 key（== 不依赖 hash）
             if isinstance(note_parsed, dict):
-                note_parsed = {str(k): v for k, v in note_parsed.items()}
-                logger.info(f"[Idx][poll] note_parsed 重建后: keys={list(note_parsed.keys())}, type_val={note_parsed.get('type')!r}, code_val={note_parsed.get('code')!r}")
-            if isinstance(note_parsed, dict) and note_parsed.get("type") == "external":
-                ext_code = note_parsed.get("code", "")
-                logger.info(f"[Idx][poll] ext_code 提取成功: {ext_code}")
-            else:
-                logger.warning(f"[Idx][poll] ext_code 提取失败: note_parsed={note_parsed!r}, type_match={note_parsed.get('type') == 'external' if isinstance(note_parsed, dict) else 'N/A'}")
+                _note_type = None
+                _note_code = None
+                for k, v in note_parsed.items():
+                    if k == "type":
+                        _note_type = v
+                    elif k == "code":
+                        _note_code = v
+                if _note_type == "external":
+                    ext_code = _note_code or ""
+                    logger.info(f"[Idx][poll] ext_code 提取成功(遍历): {ext_code}")
+                else:
+                    logger.warning(f"[Idx][poll] ext_code 提取失败: type={_note_type!r}, code={_note_code!r}")
         except Exception as e:
             logger.error(f"[Idx][poll] note 解析异常: {type(e).__name__}: {e}", exc_info=True)
     if ext_code:
