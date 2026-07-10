@@ -519,16 +519,20 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     msg = f"🔐 中继账号池 ({len(pool_status)} 个账号)\n\n"
+    STATUS_ICON = {"online": "✅", "banned": "❌", "floodwait": "⏳", "offline": "❌",
+                   "connecting": "🔄", "pending_auth": "⏳", "pending_password": "⏳", "unknown": "⚪"}
     for i, ps in enumerate(pool_status, 1):
-        if ps.get("_inst_loaded"):
-            ready = "✅" if ps["is_ready"] else "❌"
-        else:
-            ready = "⚪"
-        busy = "🔴忙" if ps["is_busy"] else "⚪空闲"
+        status = ps.get("status", "unknown")
+        icon = STATUS_ICON.get(status, "⚪")
         phone = ps["phone"]
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
-        msg += f"{i}. {ready}{busy} {masked}\n"
-        msg += f"   今日: {ps['today_requests']} | 累计: {ps['total_requests']} | 平均: {ps['avg_wait_ms']:.0f}ms\n\n"
+        info = ps.get("status_info", "")
+        msg += f"{i}. {icon} {masked}\n"
+        msg += f"   状态: {status}"
+        if info:
+            msg += f" — {info}"
+        msg += "\n"
+        msg += f"   今日: {ps['today_requests']} | 累计: {ps['total_requests']} | 均耗: {ps['avg_wait_ms']:.0f}ms\n\n"
     await update.message.reply_text(msg)
 
 

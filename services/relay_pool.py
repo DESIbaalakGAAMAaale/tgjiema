@@ -336,32 +336,22 @@ class RelayPool:
                 logger.warning(f"[RelayPool] reload 添加 {phone} 失败: {e}")
 
     async def get_pool_status(self) -> list[dict]:
-        """获取账号池状态。
-
-        以 DB 为真实来源，遍历 DB 中的所有账号，
-        内存中有对应 instance 的补充运行时状态（is_ready/is_busy），
-        没有的标记为未知（admin_bot 进程不加载实例，或新添加未同步）。
-        """
+        """获取账号池状态（DB 层信息，由 idx_bot 写入 status 字段）。"""
         db = await get_relay_db()
-        # 从 DB 获取所有账号（真实来源）
         try:
             accounts = await db.get_active_accounts()
         except Exception:
             accounts = []
-        # 内存 instances 按 phone 索引，用于补充运行时状态
-        async with self._lock:
-            inst_by_phone = {i.phone: i for i in self.instances}
         status = []
         for acct in accounts:
             phone = acct["phone"]
-            inst = inst_by_phone.get(phone)
             usage = await db.get_usage(acct["id"])
             status.append({
                 "phone": phone,
-                "is_ready": inst.is_ready if inst else False,
-                "is_busy": inst.is_busy if inst else False,
-                "_inst_loaded": inst is not None,
-                "relay_user_id": inst.relay_user_id if inst else None,
+                "account_id": acct["id"],
+                "status": acct.get("status", "unknown"),
+                "status_info": acct.get("status_info", ""),
+                "status_updated_at": acct.get("status_updated_at", ""),
                 "today_requests": usage["today_requests"],
                 "total_requests": usage["total_requests"],
                 "avg_wait_ms": usage["avg_wait_ms"],

@@ -89,7 +89,8 @@ class RelayInstance:
 
     def record_flood_wait(self, seconds: int):
         """记录 FloodWait,暂时标记账号不可用。"""
-        self._floodwait_until = time.time() + seconds + 5  # 额外 5s 缓冲
+        self._floodwait_until = time.time() + seconds + 5
+        self._spawn(self._report_status("floodwait", f"限制{seconds}秒"))
         logger.warning(
             f"[RelayInstance:{self.phone}] FloodWait {seconds}s, "
             f"暂时不可用"
@@ -101,7 +102,7 @@ class RelayInstance:
             logger.error(f"[RelayInstance:{self.phone}] 账号受限/封禁: {reason}")
         self._ban_detected = True
         try:
-            asyncio.create_task(self._report_status("banned"))
+            asyncio.create_task(self._report_status("banned", reason[:200]))
         except Exception:
             pass
 
@@ -132,7 +133,7 @@ class RelayInstance:
                     logger.info(f"[RelayInstance:{self.phone}] 健康检查通过,恢复可用")
                 self._ban_detected = False
                 self._floodwait_until = 0.0
-                await self._report_status("online")
+                await self._report_status("online", f"{me.first_name}(@{me.username})")
                 return True
         except FloodWaitError as e:
             self._floodwait_until = time.time() + e.seconds + 5
@@ -146,7 +147,7 @@ class RelayInstance:
                     logger.error(f"[RelayInstance:{self.phone}] 健康检查检测到封禁: {e}")
                 self._ban_detected = True
                 try:
-                    await self._report_status("banned")
+                    await self._report_status("banned", str(e)[:200])
                 except Exception:
                     pass
             return False
@@ -159,12 +160,21 @@ class RelayInstance:
     def set_pending_cleanup(self, callback):
         self._pending_cleanup = callback
 
-    async def _report_status(self, status: str):
+    async def _report_status(self, status: str, info: str = ""):
+        """将账号状态写入 relay_pool.db 的 relay_accounts.status 字段。
+
+        idx_bot 进程写入，admin_bot 进程读取。
+        """
         try:
-            from database.session import set_config
-            await set_config("relay_status", status)
+            from database.relay_db import get_relay_db
+            db = await get_relay_db()
+            await db.update_account_status(self.phone, status, info)
         except Exception:
             pass
+
+    def _update_status(self, status: str, info: str = ""):
+        """同步工具方法：内部状态变更时调用 _report_status。"""
+        self._spawn(self._report_status(status, info))
 
     def _spawn(self, coro, name: str | None = None) -> asyncio.Task:
         """创建内部后台任务并纳入 _background_tasks 跟踪(P1-8)。
@@ -180,7 +190,7 @@ class RelayInstance:
         from database.session import get_config, set_config
 
         await set_config(f"relay_auth_pending:{self.phone}", "1")
-        await self._report_status("pending_auth")
+        await self._report_status("pending_auth", "等待管理员提交验证码")
         logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram，等待管理员通过管理机器人提交...")
 
         for i in range(100):
@@ -201,7 +211,7 @@ class RelayInstance:
         from database.session import get_config, set_config
 
         await set_config(f"relay_password_pending:{self.phone}", "1")
-        await self._report_status("pending_password")
+        await self._report_status("pending_password", "等待管理员提交二步验证密码")
         logger.info(f"[RelayInstance:{self.phone}] 该账号开启了二步验证,等待管理员通过 /relay_password 提交密码...")
 
         for i in range(100):
@@ -234,7 +244,7 @@ class RelayInstance:
         except Exception as e:
             logger.error(f"[RelayInstance:{self.phone}] connect 失败(api_id/api_hash 可能无效): {e}")
             logger.error(f"[RelayInstance:{self.phone}] 提示: 如果确认 api_id/api_hash 正确,可能是 DB 存储值与 .env 不匹配")
-            await self._report_status("offline")
+            await self._report_status("offline", f"连接失败:{str(e)[:100]}")
             return
 
         if not await self._client.is_user_authorized():
@@ -244,7 +254,7 @@ class RelayInstance:
                 logger.error(f"[RelayInstance:{self.phone}] send_code_request 失败: {e}")
                 logger.error(f"[RelayInstance:{self.phone}] 请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH 是否正确")
                 logger.error(f"[RelayInstance:{self.phone}] 如已更新 .env,需从 DB 删除该账号后重新添加(旧 api_hash 可能已加密存储)")
-                await self._report_status("offline")
+                await self._report_status("offline", f"发送验证码失败:{str(e)[:100]}")
                 await self._client.disconnect()
                 return
             logger.info(f"[RelayInstance:{self.phone}] 验证码已发送到 Telegram 账号")
@@ -253,7 +263,7 @@ class RelayInstance:
 
             if not code:
                 logger.error(f"[RelayInstance:{self.phone}] 无法获取验证码，登录失败")
-                await self._report_status("offline")
+                await self._report_status("offline", "等待验证码超时(5分钟)")
                 await self._client.disconnect()
                 return
 
@@ -264,19 +274,19 @@ class RelayInstance:
                 password = await self._wait_for_admin_password()
                 if not password:
                     logger.error(f"[RelayInstance:{self.phone}] 无法获取二步验证密码，登录失败")
-                    await self._report_status("offline")
+                    await self._report_status("offline", "等待二步验证密码超时(5分钟)")
                     await self._client.disconnect()
                     return
                 try:
                     await self._client.sign_in(password=password)
                 except Exception as e:
                     logger.error(f"[RelayInstance:{self.phone}] 二步验证密码错误或登录失败: {e}")
-                    await self._report_status("offline")
+                    await self._report_status("offline", f"二步验证失败:{str(e)[:100]}")
                     await self._client.disconnect()
                     return
             except Exception as e:
                 logger.error(f"[RelayInstance:{self.phone}] 登录失败: {e}")
-                await self._report_status("offline")
+                await self._report_status("offline", f"登录失败:{str(e)[:100]}")
                 await self._client.disconnect()
                 return
 
@@ -300,7 +310,7 @@ class RelayInstance:
 
         self._register_handlers()
         self._ready.set()
-        await self._report_status("online")
+        await self._report_status("online", f"{me.first_name}(@{me.username})")
         logger.info(f"[RelayInstance:{self.phone}] 中继已就绪")
 
         # 启动周期清理冷却记录的后台任务(P1-8:start 守卫 + 任务跟踪)

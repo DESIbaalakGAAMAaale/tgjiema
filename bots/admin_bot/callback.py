@@ -80,7 +80,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "\n使用 /files 2 查看下一页"
         await query.edit_message_text(text, reply_markup=back_kb)
 
-    elif data == "action:relay_status":
+    elif data == "action:relay_health":
         text = await _get_relay_status_text()
         await query.edit_message_text(text, reply_markup=back_kb)
 

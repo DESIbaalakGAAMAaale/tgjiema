@@ -126,9 +126,12 @@ CREATE TABLE IF NOT EXISTS relay_accounts (
     api_hash     TEXT NOT NULL,
     phone        TEXT NOT NULL UNIQUE,
     is_active    INTEGER DEFAULT 1,
+    status       TEXT DEFAULT 'unknown',
+    status_info  TEXT,
     auth_code    TEXT,
     created_at   TEXT DEFAULT (datetime('now')),
-    last_login_at TEXT
+    last_login_at TEXT,
+    status_updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS relay_usage (
@@ -276,9 +279,16 @@ class RelayDB:
         )
         await self._db.commit()
 
+    async def update_account_status(self, phone: str, status: str, info: str = ""):
+        await self._db.execute(
+            "UPDATE relay_accounts SET status=?, status_info=?, status_updated_at=datetime('now') WHERE phone=?",
+            (status, info, phone),
+        )
+        await self._db.commit()
+
     async def get_active_accounts(self) -> list[dict]:
         rows = await self._db.execute_fetchall(
-            "SELECT id, api_id, api_hash, phone, is_active, created_at, last_login_at "
+            "SELECT id, api_id, api_hash, phone, is_active, status, status_info, status_updated_at, created_at, last_login_at "
             "FROM relay_accounts WHERE is_active=1 ORDER BY id"
         )
         return [
@@ -288,8 +298,11 @@ class RelayDB:
                 "api_hash": decrypt(r[2]),
                 "phone": r[3],
                 "is_active": bool(r[4]),
-                "created_at": r[5],
-                "last_login_at": r[6],
+                "status": r[5] or 'unknown',
+                "status_info": r[6] or '',
+                "status_updated_at": r[7],
+                "created_at": r[8],
+                "last_login_at": r[9],
             }
             for r in rows
         ]

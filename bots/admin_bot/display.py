@@ -118,36 +118,14 @@ async def _get_status_text() -> str:
         _shared_counters.status_counters_loaded_at = now_ts
     try:
         from services.relay_pool import relay_pool
-        if not relay_pool._initialized:
-            await relay_pool.init()
         pool_status = await relay_pool.get_pool_status()
-        # 检查 pending 状态：优先遍历内存 instances，为空时查 DB
-        relay_pending = "0"
-        if relay_pool._initialized and relay_pool.instances:
-            for inst in relay_pool.instances:
-                if await get_config(f"relay_auth_pending:{inst.phone}") == "1":
-                    relay_pending = "1"
-                    break
-        else:
-            from database.relay_db import get_relay_db
-            db = await get_relay_db()
-            accounts = await db.get_active_accounts()
-            for acct in accounts:
-                if await get_config(f"relay_auth_pending:{acct['phone']}") == "1":
-                    relay_pending = "1"
-                    break
         if pool_status:
-            ready = sum(1 for p in pool_status if p["is_ready"])
-            loaded = sum(1 for p in pool_status if p.get("_inst_loaded"))
-            if loaded < len(pool_status):
-                relay_status = f"⚪ 账号池 {len(pool_status)} 个 ({loaded} 个已加载)"
-            else:
-                relay_status = f"✅ 账号池 {ready}/{len(pool_status)} 就绪"
+            online = sum(1 for p in pool_status if p.get("status") == "online")
+            relay_status = f"⚪ {online}/{len(pool_status)} 正常"
         else:
-            relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
+            relay_status = "✅ 就绪/未配置"
     except Exception:
-        relay_pending = await get_config("relay_auth_pending")
-        relay_status = "⏳ 等待验证码" if relay_pending == "1" else "✅ 就绪/未配置"
+        relay_status = "✅ 就绪/未配置"
     # 从环形拓扑获取当前活跃频道（走 60s 缓存，0 RU）
     active_cells_text = ""
     try:
@@ -329,58 +307,45 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
 
 
 async def _get_relay_status_text() -> str:
+    """从 relay_pool.db 读取 idx_bot 写入的账号状态。"""
     from services.relay_pool import relay_pool
-    from database.relay_db import get_relay_db
-    # 检查 pending 状态：优先遍历内存 instances，为空时查 DB
-    pending = "0"
-    try:
-        if relay_pool._initialized and relay_pool.instances:
-            for inst in relay_pool.instances:
-                if await get_config(f"relay_auth_pending:{inst.phone}") == "1":
-                    pending = "1"
-                    break
-        else:
-            # instances 为空（admin_bot 进程），从 DB 读取手机号检查 pending
-            db = await get_relay_db()
-            accounts = await db.get_active_accounts()
-            for acct in accounts:
-                if await get_config(f"relay_auth_pending:{acct['phone']}") == "1":
-                    pending = "1"
-                    break
-    except Exception:
-        pending = await get_config("relay_auth_pending")
-
-    if not relay_pool._initialized:
-        try:
-            await relay_pool.init()
-        except Exception as e:
-            logger.warning(f"[Admin] 中继池初始化失败: {e}")
-            pass
-
-    msg = "🔐 中继账号池状态\n\n"
     pool_status = await relay_pool.get_pool_status()
+    msg = "🔐 中继账号池状态\n\n"
     if not pool_status:
         msg += "⚠️ 无中继账号\n"
         msg += "请使用下方按钮配置中继账号\n"
-    else:
-        msg += f"账号池: {len(pool_status)} 个账号\n\n"
-        for i, ps in enumerate(pool_status, 1):
-            if ps.get("_inst_loaded"):
-                ready = "✅" if ps["is_ready"] else "❌"
-            else:
-                ready = "⚪"
-            busy = "🔴" if ps["is_busy"] else "⚪"
-            phone = ps["phone"]
-            masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
-            msg += f"{i}. {ready}{busy} {masked}\n"
-            msg += f"   今日请求: {ps['today_requests']}, 累计: {ps['total_requests']}, 平均: {ps['avg_wait_ms']:.0f}ms\n"
-        ready_count = sum(1 for p in pool_status if p["is_ready"])
-        loaded_count = sum(1 for p in pool_status if p.get("_inst_loaded"))
-        msg += f"\n就绪: {ready_count}/{len(pool_status)} (已加载实例: {loaded_count})"
+        return msg
 
-    if pending == "1":
-        msg += "\n⚠️ 正在等待验证码,请通过 /relay_code 提交"
+    # 状态图标映射
+    STATUS_ICON = {
+        "online": "✅",
+        "banned": "❌",
+        "floodwait": "⏳",
+        "offline": "❌",
+        "connecting": "🔄",
+        "pending_auth": "⏳",
+        "pending_password": "⏳",
+        "unknown": "⚪",
+    }
 
+    for i, ps in enumerate(pool_status, 1):
+        status = ps.get("status", "unknown")
+        icon = STATUS_ICON.get(status, "⚪")
+        phone = ps["phone"]
+        masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
+        info = ps.get("status_info", "")
+        updated = ps.get("status_updated_at", "")
+        msg += f"{i}. {icon} {masked}\n"
+        msg += f"   状态: {status}"
+        if info:
+            msg += f" — {info}"
+        msg += "\n"
+        msg += f"   今日: {ps['today_requests']}, 累计: {ps['total_requests']}, 均耗: {ps['avg_wait_ms']:.0f}ms\n"
+        if updated:
+            msg += f"   更新: {updated}\n"
+
+    online_count = sum(1 for p in pool_status if p.get("status") == "online")
+    msg += f"\n正常: {online_count}/{len(pool_status)}"
     return msg
 
 

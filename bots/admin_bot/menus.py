@@ -86,9 +86,8 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
     if menu_id == "relay":
         text = "🔐 用户中继管理 — 点击按钮操作"
         kb = [
-            [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status"),
-             InlineKeyboardButton("➕ 添加账号", callback_data="interactive:relay_add")],
-            [InlineKeyboardButton("📋 查看待处理", callback_data="action:relay_pending"),
+            [InlineKeyboardButton("🩺 一键检测", callback_data="action:relay_health")],
+            [InlineKeyboardButton("➕ 添加账号", callback_data="interactive:relay_add"),
              InlineKeyboardButton("➖ 移除账号", callback_data="interactive:relay_remove")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
