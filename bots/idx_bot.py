@@ -485,7 +485,7 @@ async def _process_one_pending(app: Application, row: dict):
     channel_id = row.get("primary_channel_id")
     message_id = row.get("primary_channel_msg_id")
     file_types = row.get("file_types", {})
-    logger.debug(f"[Idx][poll] raw file_types from CRDB: type={type(file_types).__name__}, value={file_types!r}")
+    logger.info(f"[Idx][poll] raw file_types from CRDB: type={type(file_types).__name__}, value={file_types!r}")
     # _row_to_dict 已经保证 file_types 是 dict（空为 {}），此处仅做兜底
     if isinstance(file_types, str):
         try:
@@ -498,7 +498,7 @@ async def _process_one_pending(app: Application, row: dict):
     # 如果 file_types 为空（Up Bot context.user_data 丢失），从 batch_file_meta 推断
     if not file_types:
         batch_meta_raw = row.get("batch_file_meta", [])
-        logger.debug(f"[Idx][poll] file_types 为空，尝试从 batch_file_meta 推断: type={type(batch_meta_raw).__name__}, value={batch_meta_raw!r}")
+        logger.info(f"[Idx][poll] file_types 为空，尝试从 batch_file_meta 推断: type={type(batch_meta_raw).__name__}, value={batch_meta_raw!r}")
         if isinstance(batch_meta_raw, str) and batch_meta_raw:
             try:
                 meta_list = json.loads(batch_meta_raw)
@@ -506,17 +506,17 @@ async def _process_one_pending(app: Application, row: dict):
                     for m in meta_list:
                         if isinstance(m, dict) and "type" in m:
                             file_types[m["type"]] = file_types.get(m["type"], 0) + 1
-                logger.debug(f"[Idx][poll] 从 batch_file_meta(str) 推断 file_types: {file_types}")
+                logger.info(f"[Idx][poll] 从 batch_file_meta(str) 推断 file_types: {file_types}")
             except (json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"[Idx][poll] batch_file_meta JSON解析失败: {e}")
         elif isinstance(batch_meta_raw, list):
             for m in batch_meta_raw:
                 if isinstance(m, dict) and "type" in m:
                     file_types[m["type"]] = file_types.get(m["type"], 0) + 1
-            logger.debug(f"[Idx][poll] 从 batch_file_meta(list) 推断 file_types: {file_types}")
+            logger.info(f"[Idx][poll] 从 batch_file_meta(list) 推断 file_types: {file_types}")
         else:
             logger.warning(f"[Idx][poll] batch_file_meta 无法用于推断: type={type(batch_meta_raw).__name__}")
-    logger.debug(f"[Idx][poll] 最终 file_types 用于生成文件码: {file_types}")
+    logger.info(f"[Idx][poll] 最终 file_types 用于生成文件码: {file_types}")
     batch_msg_ids_str = row.get("batch_msg_ids", "")
     batch_file_meta_raw = row.get("batch_file_meta", "")
     # 如果 _row_to_dict 返回了 list，序列化为 JSON 字符串用于存储
