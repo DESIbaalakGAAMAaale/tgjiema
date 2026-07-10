@@ -662,7 +662,7 @@ async def _process_one_pending(app: Application, row: dict):
     except Exception as e:
         logger.error(f"[Idx][poll] codes表写入失败(code={file_code}): {e}")
 
-    # ── 外部文件:写入外部码映射 ──
+    # ── 外部文件:写入外部码映射 + 直接调度 dsp 发送 ──
     ext_code = None
     if note:
         try:
@@ -679,18 +679,30 @@ async def _process_one_pending(app: Application, row: dict):
         except Exception as e:
             logger.error(f"[Idx][poll] 外部码映射写入失败(code={ext_code}): {e}")
 
-    # 通知上传者（总是尝试发送，失败则暂存等 /start 后补发）
+    # 通知上传者 + 外部码直接调度 dsp 发送(不再要求用户重新发送码)
     try:
         from database.cache_store import get_cache_store
         store = get_cache_store()
         if ext_code:
-            msg_text = f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。"
+            # P2: 外部码直接调度 dsp 发送文件给用户,省去用户重新发送码的步骤
             try:
-                await safe_send_message(app.bot, chat_id=uploader_id, text=msg_text)
-                logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
-            except Exception as send_err:
-                await store.add_pending_file_code(uploader_id, file_code, note, ext_code or "")
-                logger.info(f"[Idx][poll] 用户 {uploader_id} 未 /start idx，文件码 {file_code} 已暂存: {send_err}")
+                ids_str = batch_msg_ids_str if isinstance(batch_msg_ids_str, str) else str(batch_msg_ids_str)
+                msg_ids = [int(mid) for mid in ids_str.split(",") if mid.strip().isdigit()]
+                if not msg_ids:
+                    msg_ids = [message_id]
+                await _dispatch_to_dsp(
+                    uploader_id, file_code, channel_id, msg_ids,
+                    batch_file_meta_str, protect_content,
+                )
+                logger.info(f"[Idx][poll] 外部码 {ext_code} 已直接调度 dsp 发送给 {uploader_id}")
+            except Exception as dispatch_err:
+                logger.error(f"[Idx][poll] 外部码直接调度 dsp 失败 (code={ext_code}): {dispatch_err}, 回退通知用户")
+                # 调度失败时回退到通知用户重新发送码
+                msg_text = f"外部文件 {ext_code} 已就绪，请重新发送文件码即可查收。"
+                try:
+                    await safe_send_message(app.bot, chat_id=uploader_id, text=msg_text)
+                except Exception as send_err:
+                    await store.add_pending_file_code(uploader_id, file_code, note, ext_code or "")
         else:
             note_line = f"\n备注：{note}" if note else ""
             msg_text = (f"文件码：{file_code}{note_line}\n\n"

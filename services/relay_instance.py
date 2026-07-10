@@ -16,8 +16,8 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 from config import settings
 
-_SETTLE_WAIT = 5
-_INITIAL_SETTLE_WAIT = 20
+_SETTLE_WAIT = 4
+_INITIAL_SETTLE_WAIT = 8
 
 _BAN_KEYWORDS = [
     "deactivated", "banned", "auth_key", "unauthorized",
@@ -484,10 +484,10 @@ class RelayInstance:
         if isinstance(msg.media, MessageMediaWebPage):
             await self._decrement_cache_counter(code)
             return
+        caption = f"EXTERNAL_RELAY:{user_id}:{code}"
         try:
             if self._up_bot_entity:
-                # 发送到 Up Bot，带 EXTERNAL_RELAY 标记统一上传到存储频道
-                caption = f"EXTERNAL_RELAY:{user_id}:{code}"
+                # 优先用 InputMedia 引用原文件发送(相当于复制,非转发)
                 await self._client.send_file(
                     self._up_bot_entity, msg.media, caption=caption
                 )
@@ -501,9 +501,29 @@ class RelayInstance:
         except Exception as e:
             if _is_ban_error(e):
                 self.record_ban(str(e))
-            logger.error(f"[RelayInstance:{self.phone}] 发送到 Up Bot 失败 (code={code}): {e}")
+                return
+            # P3: noforwards 等场景回退到下载再上传
+            logger.warning(f"[RelayInstance:{self.phone}] send_file 引用失败,尝试下载再上传 (code={code}): {e}")
+            await self._download_and_upload(msg, user_id, code, caption)
         finally:
             await self._decrement_cache_counter(code)
+
+    async def _download_and_upload(self, msg, user_id: int, code: str, caption: str):
+        """P3: noforwards 回退 — 下载媒体到内存再上传给 Up Bot"""
+        try:
+            data = await self._client.download_media(msg, file=bytes)
+            if data is None:
+                logger.warning(f"[RelayInstance:{self.phone}] download_media 返回 None (code={code})")
+                return
+            # 下载到 bytes 后作为新文件上传,Telethon 自动推断文件类型
+            await self._client.send_file(
+                self._up_bot_entity, data, caption=caption, force_document=False,
+            )
+            logger.info(f"[RelayInstance:{self.phone}] 下载再上传成功 (code={code})")
+        except Exception as e2:
+            if _is_ban_error(e2):
+                self.record_ban(str(e2))
+            logger.error(f"[RelayInstance:{self.phone}] 下载再上传也失败 (code={code}): {e2}")
 
     @staticmethod
     def _detect_media_type(msg) -> str:
@@ -726,11 +746,58 @@ class RelayInstance:
         events_list = buf["events"]
         user_id = exchange.get("user_id")
         code = exchange.get("code")
+        # P1: 筛选有效媒体,保持媒体组格式批量发送
+        media_list = []
+        valid_events = []
+        caption = f"EXTERNAL_RELAY:{user_id}:{code}"
         for ev in events_list:
+            msg = ev.message
+            if not getattr(msg, "media", None):
+                continue
+            if isinstance(msg.media, MessageMediaWebPage):
+                continue
+            media_list.append(msg.media)
+            valid_events.append(ev)
+        if not media_list:
+            return
+        # 递增 pending 计数器
+        for _ in valid_events:
             if code:
                 self._pending_cache_counts[code] = self._pending_cache_counts.get(code, 0) + 1
-        for ev in events_list:
-            await self._download_and_cache_one(ev.message, user_id, code)
+        try:
+            if self._up_bot_entity:
+                if len(media_list) == 1:
+                    await self._client.send_file(
+                        self._up_bot_entity, media_list[0], caption=caption
+                    )
+                else:
+                    # grouping=True 保持相册格式,每个文件设置相同 caption
+                    captions = [caption] * len(media_list)
+                    await self._client.send_file(
+                        self._up_bot_entity, media_list, caption=captions, grouping=True
+                    )
+                    logger.info(f"[RelayInstance:{self.phone}] 媒体组批量发送 ({len(media_list)}个文件, code={code})")
+            else:
+                logger.warning(f"[RelayInstance:{self.phone}] Up Bot 不可用，跳过媒体组 (code={code})")
+        except FloodWaitError as e:
+            self.record_flood_wait(e.seconds)
+            logger.warning(f"[RelayInstance:{self.phone}] 媒体组发送 FloodWait (code={code}): {e.seconds}s")
+            for _ in valid_events:
+                await self._decrement_cache_counter(code)
+        except Exception as e:
+            if _is_ban_error(e):
+                self.record_ban(str(e))
+                for _ in valid_events:
+                    await self._decrement_cache_counter(code)
+            else:
+                # P3: 批量失败回退到逐个 send_file + download_and_upload
+                logger.warning(f"[RelayInstance:{self.phone}] 媒体组批量发送失败,回退逐个发送 (code={code}): {e}")
+                for ev in valid_events:
+                    await self._download_and_cache_one(ev.message, user_id, code)
+        else:
+            # 成功时递减计数器(失败路径由 _download_and_cache_one 的 finally 处理)
+            for _ in valid_events:
+                await self._decrement_cache_counter(code)
         exchange.setdefault("events", []).extend(events_list)
         self._restart_settle(exchange, bot_username)
 
@@ -1070,27 +1137,16 @@ class RelayInstance:
         # 所有文件已发送到 Up Bot，发送 EXTERNAL_DONE 信号触发批量写入
         try:
             if self._up_bot_entity:
-                # 先注册确认事件，再发 EXTERNAL_DONE，避免竞态（R29-4）
-                wait_event = asyncio.Event()
-                self._ready_events[code] = wait_event
-
+                # P4: 不再等待 idx_bot 确认(原 120s 超时是最大延迟瓶颈)
+                # up_bot 收到 EXTERNAL_DONE 后会 flush 并通知 idx_bot 处理
+                # idx_bot 处理完直接调度 dsp 发送给用户(P2),无需中继等待
                 await self._client.send_message(
                     self._up_bot_entity,
                     f"EXTERNAL_DONE:{user_id}:{code}",
                 )
                 logger.info(f"[RelayInstance:{self.phone}] 已通知 Up Bot 完成外部文件收集: code={code}")
-
-                # 等待 idx_bot 确认处理完成（最多 120 秒）
-                try:
-                    await asyncio.wait_for(wait_event.wait(), timeout=120.0)
-                    logger.info(f"[RelayInstance:{self.phone}] idx_bot 确认外部文件已就绪: code={code}")
-                    # 成功后标记到本地缓存
-                    await self._mark_code_mapped(code)
-                except asyncio.TimeoutError:
-                    logger.warning(f"[RelayInstance:{self.phone}] 等待 idx_bot 确认超时 (code={code})")
-                    await self._unmark_code(code)
-                finally:
-                    self._ready_events.pop(code, None)
+                # 直接标记为已映射(下次该外部码可直接走本地缓存)
+                await self._mark_code_mapped(code)
         except Exception as e:
             logger.error(f"[RelayInstance:{self.phone}] 通知 Up Bot 失败 (code={code}): {e}")
             await self._unmark_code(code)
