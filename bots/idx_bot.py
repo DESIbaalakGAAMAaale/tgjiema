@@ -1825,7 +1825,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
     # ── 配额检查（仅检查不递增，投递成功后再递增）──
     if result is None:
         from services.permission import check_decode_permission
-        result = await check_decode_permission(user_id, code)
+        result = await check_decode_permission(user_id, code, bot_username=bot_username)
         if not result.allowed:
             await safe_reply_text(update.message, result.reason)
             return

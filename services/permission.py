@@ -229,7 +229,7 @@ async def _reset_quota_if_needed(q: dict, now_date: datetime.date) -> dict:
 # ─── 核心：解码权限检查（SQLite First）───────────────────────────
 
 
-async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
+async def check_decode_permission(user_id: int, file_code: str, bot_username: str = "") -> DecodeResult:
     # 从 CRDB 获取用户基础信息（等级/封禁状态）
     user = await get_user_cached(user_id)
     if user is None:
@@ -238,7 +238,9 @@ async def check_decode_permission(user_id: int, file_code: str) -> DecodeResult:
         return DecodeResult(allowed=False, reason="您的账户已被禁用")
 
     membership_level = user.get("membership_level", "free")
-    bot_username = extract_bot_username(file_code)
+    # 路由匹配的无头码(如40位hash)不含bot名，由调用方传入 bot_username
+    if not bot_username:
+        bot_username = extract_bot_username(file_code)
     if not is_system_code(file_code):
         if not bot_username:
             return DecodeResult(allowed=False, reason="无效的文件码格式，无法识别目标机器人。")
