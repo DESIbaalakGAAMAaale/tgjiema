@@ -344,8 +344,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _end(f"✅ 二步验证密码已提交\n中继实例将在几秒内自动获取并使用。")
 
     elif state == "relay_add:phone":
-        from services.relay_pool import relay_pool
-        phone = text.strip()
+        from services.relay_pool import relay_pool, _normalize_phone
+        phone = _normalize_phone(text.strip())
         api_id = settings.RELAY_API_ID
         api_hash = settings.RELAY_API_HASH
         if not api_id or not api_hash:
@@ -353,20 +353,14 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         try:
             await relay_pool.add_account(api_id, api_hash, phone)
-            # C3: 通知 idx_bot 进程的 relay_pool 增量同步新账号
-            try:
-                from database.cache_store import get_cache_store
-                await get_cache_store().notify_relay_change()
-            except Exception as notify_err:
-                import logging
-                logging.warning(f"[Admin] notify_relay_change 失败(非致命): {notify_err}")
             masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
             await _end(
-                f"✅ 中继账号已添加并验证成功\n"
-                f"  手机号: {masked}\n\n"
-                f"idx_bot 将自动检测新账号并连接运行。\n"
-                f"如该账号需要验证码,系统会提示你通过 /relay_code 提交。\n"
-                f"如该账号开启了二步验证,请通过 /relay_password 提交密码。"
+                f"✅ 中继账号已添加\n"
+                f"  手机号: {masked}\n"
+                f"  api_id/api_hash 验证通过,验证码已发送到该 Telegram 账号\n\n"
+                f"idx_bot 将自动检测新账号并开始登录流程。\n"
+                f"📱 如需验证码,请通过 /relay_code {phone} <验证码> 提交\n"
+                f"🔒 如开启二步验证,请通过 /relay_password {phone} <密码> 提交"
             )
         except RuntimeError as e:
             await _end(f"❌ 添加中继账号失败: {e}")
@@ -374,8 +368,8 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await _end(f"❌ 添加中继账号异常: {e}")
 
     elif state == "relay_remove:phone":
-        phone = text.strip()
-        from services.relay_pool import relay_pool
+        from services.relay_pool import relay_pool, _normalize_phone
+        phone = _normalize_phone(text.strip())
         removed = await relay_pool.remove_account(phone)
         if removed:
             try:

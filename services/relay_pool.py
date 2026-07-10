@@ -5,12 +5,32 @@
 - 支持并发处理解码任务
 """
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from loguru import logger
 
 from services.relay_instance import RelayInstance
 from database.relay_db import get_relay_db
+
+
+def _normalize_phone(phone: str) -> str:
+    """手机号规范化:去除空格,确保以 + 开头。"""
+    phone = phone.strip().replace(" ", "").replace("-", "")
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    return phone
+
+
+def _cleanup_temp_session(session_path: str):
+    """清理临时 session 文件(.session + .session-journal)。"""
+    for suffix in ("", "-journal"):
+        try:
+            p = session_path + suffix
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
 
 
 class RelayPool:
@@ -197,10 +217,14 @@ class RelayPool:
         return usage["today_requests"]
 
     async def add_account(self, api_id: int, api_hash: str, phone: str) -> RelayInstance:
-        """动态添加中继账号。
-        注意:此方法在 admin_bot 进程中调用时,仅验证账号可用性并写入 DB,
-        验证成功后立即关闭客户端,避免与 idx_bot 进程的 Telethon session 文件冲突。
-        idx_bot 通过 reload_from_db 负责实际运行时连接。
+        """动态添加中继账号(非阻塞模式)。
+
+        仅验证 api_id/api_hash 有效性(connect + send_code_request),
+        不等待验证码/密码登录,避免阻塞 admin_bot conversation handler。
+
+        验证码/密码登录由 idx_bot 的 relay_pool 负责:
+        - idx_bot 通过 reload_from_db 检测新账号
+        - 调用 instance.start() 完成完整登录(含验证码/密码等待)
         """
         # 防御性:确保 api_id 为 int(Telethon 要求)
         try:
@@ -209,48 +233,81 @@ class RelayPool:
             raise RuntimeError(f"api_id 必须是数字,当前值: {api_id}")
         if not api_hash or not isinstance(api_hash, str):
             raise RuntimeError("api_hash 不能为空且必须是字符串")
+
+        # 手机号规范化:确保以 + 开头
+        phone = _normalize_phone(phone)
+
         db = await get_relay_db()
+        # 检查是否已存在
+        existing = await db.get_active_accounts()
+        if any(a["phone"] == phone for a in existing):
+            raise RuntimeError(f"手机号 {phone} 已存在,请勿重复添加")
+
+        # 阶段1:仅验证 api_id/api_hash 有效性(非阻塞)
+        from services.relay_instance import RelayInstance
+        from telethon import TelegramClient
+        from telethon.errors import PhoneCodeInvalidError, AuthKeyError, ApiIdInvalidError
+
+        # 使用临时 session 名称(不使用正式 session 文件,避免冲突)
+        import tempfile, os
+        temp_session = os.path.join(tempfile.gettempdir(), f"relay_verify_{phone.lstrip('+')}")
+        client = None
+        try:
+            client = TelegramClient(temp_session, api_id, api_hash, timeout=30)
+            await client.connect()
+            # 尝试 send_code_request 验证 api_id/api_hash 有效性
+            # 如果 api_id/api_hash 无效,这里会抛 ApiIdInvalidError
+            await client.send_code_request(phone)
+            logger.info(f"[RelayPool] 账号 {phone} api_id/api_hash 验证通过,验证码已发送")
+        except ApiIdInvalidError:
+            if client:
+                await client.disconnect()
+            _cleanup_temp_session(temp_session)
+            raise RuntimeError(
+                f"api_id/api_hash 无效(Telegram 服务器拒绝)\n"
+                f"请检查 .env 中的 RELAY_API_ID 和 RELAY_API_HASH\n"
+                f"申请地址: https://my.telegram.org → API development tools"
+            )
+        except Exception as e:
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            _cleanup_temp_session(temp_session)
+            err_msg = str(e)
+            if "PHONE_NUMBER_INVALID" in err_msg or "phone" in err_msg.lower():
+                raise RuntimeError(f"手机号格式无效: {phone}\n请确保包含国际区号,如 +8613800138000")
+            raise RuntimeError(f"验证 api_id/api_hash 失败: {e}")
+
+        # 验证通过:关闭临时 client,清理临时 session
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        _cleanup_temp_session(temp_session)
+
+        # 阶段2:写入 DB
         account_id = await db.add_account(api_id, api_hash, phone)
-        instance = RelayInstance(
+        logger.info(f"[RelayPool] 动态添加中继账号: {phone}(account_id={account_id})")
+
+        # 阶段3:通知 idx_bot 增量同步新账号
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().notify_relay_change()
+        except Exception as notify_err:
+            logger.warning(f"[RelayPool] notify_relay_change 失败(非致命): {notify_err}")
+
+        return RelayInstance(
             account_id=account_id,
             api_id=api_id,
             api_hash=api_hash,
             phone=phone,
         )
-        start_failed = False
-        try:
-            await instance.start()
-        except Exception as e:
-            # start 抛异常:回滚
-            logger.error(f"[RelayPool] 中继账号 {phone} start 异常,回滚: {e}")
-            start_failed = True
-        # start() 内部失败时直接 return 不抛异常,这里通过 is_ready 判断
-        if start_failed or not instance.is_ready:
-            if not start_failed:
-                logger.error(f"[RelayPool] 中继账号 {phone} start 后未就绪(可能登录失败/二步验证),回滚")
-            # 关闭已建立的 TelegramClient 连接,防止资源泄漏
-            try:
-                await instance.shutdown()
-            except Exception as shutdown_err:
-                logger.warning(f"[RelayPool] 回滚关闭 client {phone} 失败: {shutdown_err}")
-            try:
-                await db.remove_account(phone)
-            except Exception as rm_err:
-                logger.warning(f"[RelayPool] 回滚删除 DB 账号 {phone} 失败: {rm_err}")
-            raise RuntimeError(f"中继账号 {phone} 启动失败,已回滚")
-        # 验证成功:关闭客户端,仅保留 DB 记录。
-        # idx_bot 通过 reload_from_db 创建自己的 instance 并连接(共享 session 文件)。
-        # 不保留 admin_bot 的 instance,避免两进程同时使用同一 session 文件冲突。
-        try:
-            await instance.shutdown()
-            logger.info(f"[RelayPool] 账号 {phone} 验证成功,已关闭 admin_bot 侧 client(交由 idx_bot 运行)")
-        except Exception as shutdown_err:
-            logger.warning(f"[RelayPool] 验证后关闭 client {phone} 失败: {shutdown_err}")
-        logger.info(f"[RelayPool] 动态添加中继账号: {phone}")
-        return instance
 
     async def remove_account(self, phone: str) -> bool:
         """动态移除中继账号"""
+        phone = _normalize_phone(phone)
         db = await get_relay_db()
         removed = await db.remove_account(phone)
         if removed:

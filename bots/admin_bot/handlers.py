@@ -397,6 +397,9 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     phone = args[0].strip()
+    # 手机号规范化:确保以 + 开头
+    if not phone.startswith("+"):
+        phone = "+" + phone
     code = args[1].strip()
     if not code.isdigit() or len(code) not in (5, 6):
         await update.message.reply_text("❌ 验证码格式不正确,应为 5-6 位数字")
@@ -455,6 +458,9 @@ async def relay_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         phone = args[0].strip()
+        # 手机号规范化:确保以 + 开头
+        if not phone.startswith("+"):
+            phone = "+" + phone
         password = " ".join(args[1:]).strip()
 
     if not password:
