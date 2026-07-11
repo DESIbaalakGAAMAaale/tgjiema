@@ -58,6 +58,10 @@ _bot = None
 # 当 relay 用 grouping=True 发送时,只有第一条消息有 EXTERNAL_RELAY: caption,
 # 后续消息靠 media_group_id 匹配此映射,统一走 _handle_external_relay_file
 _external_mgid_map: dict[str, str] = {}
+# 内存级 file_unique_id 去重：external_code -> set of file_unique_id
+# 防止多个用户并发触发中继发送同一文件时，Up Bot 重复 copy 到存储频道
+# （manifest 在 copy 完成后才写入，并发请求的 _check_dedup 都不命中）
+_external_fuid_dedup: dict[str, set[str]] = {}
 
 
 def _decode_external_code(code_part: str) -> str:
@@ -224,6 +228,9 @@ async def _cleanup_pending():
             # 清理 _external_mgid_map (超过 300s 的旧映射)
             if _external_mgid_map:
                 _external_mgid_map.clear()
+            # 清理超时的内存级去重集合（防止内存泄漏）
+            if _external_fuid_dedup:
+                _external_fuid_dedup.clear()
         except Exception as e:
             logger.error(f"[up_bot] 清理超时缓冲区异常: {e}")
         await asyncio.sleep(60)
@@ -1460,6 +1467,17 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     file_type = detect_file_type(update)
     file_meta = extract_file_meta(update)
 
+    # 内存级 file_unique_id 去重：防止并发请求导致同一文件被重复 copy
+    fuid = _extract_file_unique_id(update.message)
+    if fuid:
+        async with _mg_lock:
+            if external_code not in _external_fuid_dedup:
+                _external_fuid_dedup[external_code] = set()
+            if fuid in _external_fuid_dedup[external_code]:
+                logger.info(f"[Up][ext_relay] 内存去重命中: fuid={fuid} (code={external_code}), 跳过重复文件")
+                return
+            _external_fuid_dedup[external_code].add(fuid)
+
     # B1 秒传去重:仅复用同 channel 的已有文件
     existing = await _check_dedup(target_ch, update.message)
     if existing and existing["channel_id"] == target_ch:
@@ -1551,6 +1569,8 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         stale_mgids = [k for k, v in _external_mgid_map.items() if v == external_code]
         for k in stale_mgids:
             _external_mgid_map.pop(k, None)
+        # 清理内存级 file_unique_id 去重集合
+        _external_fuid_dedup.pop(external_code, None)
 
     target_ch = buf.get("channel_id")
     if not target_ch:
