@@ -19,6 +19,12 @@ from config import settings
 _SETTLE_WAIT = 1.5
 _INITIAL_SETTLE_WAIT = 3
 
+# B1: 指数退避参数
+_BOT_BACKOFF_BASE = 5        # 初始退避秒数
+_BOT_BACKOFF_MAX = 300        # 最大退避秒数(5分钟)
+_BOT_BACKOFF_THRESHOLD = 5   # 连续限速 N 次触发熔断
+_BOT_CIRCUIT_BREAK_SEC = 600  # 熔断持续时间(10分钟)
+
 _BAN_KEYWORDS = [
     "deactivated", "banned", "auth_key", "unauthorized",
     "session_revoked", "auth_key_duplicated",
@@ -80,6 +86,9 @@ class RelayInstance:
         self._download_buffers: dict[str, list] = {}
         # P3-2: 消息引用缓冲 — 所有文件先缓冲,最后统一批量作为媒体组发送(避免逐个发送破坏相册格式)
         self._pending_msgs: dict[str, list] = {}
+        # B1: 指数退避 — bot 级别连续限速计数,等待时间指数递增
+        # bot_username_lower -> {"count": N, "next_backoff": seconds, "last_at": ts}
+        self._bot_backoff: dict[str, dict] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -174,6 +183,52 @@ class RelayInstance:
             await db.update_account_status(self.phone, status, info)
         except Exception:
             pass
+
+    # ── B1: 指数退避 + 熔断 ──
+
+    def _record_rate_limit(self, bot_username: str, suggested_wait: int = 0) -> float:
+        """记录一次限速事件,返回本次应等待的秒数(指数递增)。
+        suggested_wait: 解码器/Telegram 建议的等待秒数,0 表示未知。
+        """
+        key = bot_username.lower()
+        state = self._bot_backoff.get(key, {"count": 0, "next_backoff": _BOT_BACKOFF_BASE, "last_at": 0.0})
+        state["count"] += 1
+        state["last_at"] = time.time()
+        # 取 max(指数退避, 建议等待),避免低于解码器要求
+        backoff = state["next_backoff"]
+        actual_wait = max(backoff, suggested_wait) if suggested_wait > 0 else backoff
+        # 计算下次退避: 指数递增 *2,上限 _BOT_BACKOFF_MAX
+        state["next_backoff"] = min(state["next_backoff"] * 2, _BOT_BACKOFF_MAX)
+        self._bot_backoff[key] = state
+        logger.warning(
+            f"[RelayInstance:{self.phone}] @{bot_username} 限速第{state['count']}次, "
+            f"退避 {actual_wait:.0f}s (下次 {state['next_backoff']:.0f}s)"
+        )
+        return actual_wait
+
+    def _reset_rate_limit(self, bot_username: str):
+        """成功完成一次解码后重置该 bot 的退避计数。"""
+        key = bot_username.lower()
+        if key in self._bot_backoff:
+            old = self._bot_backoff.pop(key)
+            logger.info(f"[RelayInstance:{self.phone}] @{bot_username} 退避重置 (之前限速{old.get('count', 0)}次)")
+
+    def _is_circuit_broken(self, bot_username: str) -> tuple[bool, float]:
+        """检查 bot 是否被熔断(连续限速超阈值)。
+        返回 (是否熔断, 剩余熔断秒数)。
+        """
+        key = bot_username.lower()
+        state = self._bot_backoff.get(key)
+        if not state or state.get("count", 0) < _BOT_BACKOFF_THRESHOLD:
+            return False, 0
+        elapsed = time.time() - state.get("last_at", 0)
+        remaining = _BOT_CIRCUIT_BREAK_SEC - elapsed
+        if remaining <= 0:
+            # 熔断已过期,重置
+            self._bot_backoff.pop(key, None)
+            logger.info(f"[RelayInstance:{self.phone}] @{bot_username} 熔断已过期,恢复可用")
+            return False, 0
+        return True, remaining
 
     def _spawn(self, coro, name: str | None = None) -> asyncio.Task:
         """创建内部后台任务并纳入 _background_tasks 跟踪(P1-8)。
@@ -373,6 +428,14 @@ class RelayInstance:
     async def send_external_code(self, bot_username: str, code: str, user_id: int) -> bool:
         """发送外部码解码请求"""
         if not self._client:
+            return False
+        # B1: 检查 bot 是否被熔断(连续限速超阈值)
+        broken, remaining = self._is_circuit_broken(bot_username)
+        if broken:
+            logger.warning(
+                f"[RelayInstance:{self.phone}] @{bot_username} 已熔断(连续限速),"
+                f"拒绝请求,剩余 {remaining:.0f}s (user={user_id}, code={code})"
+            )
             return False
         # 检查冷却期（在锁外执行，避免阻塞整个实例）
         from database.relay_db import get_relay_db
@@ -1017,14 +1080,37 @@ class RelayInstance:
                     await self._cleanup_exchange(bot_username)
                     break
                 elif action == "wait":
-                    wait_sec = decision.get("wait_seconds", 5)
+                    # B1: 指数退避 — 用 _record_rate_limit 递增等待时间
+                    suggested = decision.get("wait_seconds", 5)
+                    wait_sec = self._record_rate_limit(bot_username, int(suggested))
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
                         exchange["_last_click_time"] = asyncio.get_running_loop().time() + wait_sec
-                    # 记录冷却到本地 SQLite
+                    # 记录冷却到本地 SQLite(跨请求级别)
                     from database.relay_db import get_relay_db
                     relay_db = await get_relay_db()
                     await relay_db.set_bot_cooldown(bot_username, int(wait_sec))
+                    # B1: 检查是否触发熔断
+                    broken, break_remaining = self._is_circuit_broken(bot_username)
+                    if broken:
+                        logger.warning(
+                            f"[RelayInstance:{self.phone}] @{bot_username} 触发熔断,"
+                            f"终止解码 (剩余{break_remaining:.0f}s)"
+                        )
+                        # 通知 decoder_bot 解码失败
+                        exchange_data = self._bot_exchange.get(bot_username)
+                        if exchange_data:
+                            user_id = exchange_data.get("user_id", 0)
+                            code = exchange_data.get("code", "")
+                            try:
+                                await self._client.send_message(
+                                    self._decoder_bot_entity,
+                                    f"RELAY_ERROR:{user_id}:{code}:目标Bot连续限速熔断{break_remaining:.0f}s",
+                                )
+                            except Exception:
+                                pass
+                        await self._cleanup_exchange(bot_username)
+                        break
                     await asyncio.sleep(wait_sec)
                     continue
                 elif action == "click_button":
@@ -1261,6 +1347,8 @@ class RelayInstance:
                 exchange["_min_click_interval"] = max(
                     exchange.get("_min_click_interval", 0), e.seconds
                 )
+            # B1: FloodWait 也记录限速事件(指数退避)
+            self._record_rate_limit(bot_username, e.seconds)
             await asyncio.sleep(e.seconds)
             try:
                 if hasattr(target_btn, "data") and target_btn.data:
@@ -1322,6 +1410,8 @@ class RelayInstance:
                 logger.info(f"[RelayInstance:{self.phone}] 已通知 Up Bot 完成外部文件收集: code={code}")
                 # 直接标记为已映射(下次该外部码可直接走本地缓存)
                 await self._mark_code_mapped(code)
+                # B1: 成功完成,重置该 bot 的退避计数
+                self._reset_rate_limit(bot_username)
         except Exception as e:
             logger.error(f"[RelayInstance:{self.phone}] 通知 Up Bot 失败 (code={code}): {e}")
             await self._unmark_code(code)
