@@ -1986,6 +1986,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         from services.permission import check_decode_permission
         result = await check_decode_permission(user_id, code, bot_username=bot_username)
         if not result.allowed:
+            logger.warning(f"[Idx][external] 配额检查失败: user={user_id}, code={code}, reason={result.reason}")
             await safe_reply_text(update.message, result.reason)
             return
 
