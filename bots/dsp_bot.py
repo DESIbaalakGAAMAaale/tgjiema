@@ -243,17 +243,29 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
         record = await get_file_record_cached(file_code)
         note = ""
         if record:
-            note_raw = (record.get("note") or "").strip()
-            # 外部中继的 note 是 JSON 对象（{"type":"external",...}），不作为备注显示
-            # 用字符串检查避免 orjson hash 表异常导致 dict.get() 返回 None
-            if note_raw and not ('"type"' in note_raw and '"external"' in note_raw):
-                note = note_raw
+            note_val = record.get("note")
+            # note 可能是 str 或 dict（CRDB JSONB 反序列化），统一转为 str 检查
+            if isinstance(note_val, dict):
+                # dict 类型：检查是否是外部中继的内部标记
+                _nt = None
+                for k, v in note_val.items():
+                    if k == "type":
+                        _nt = v
+                if _nt != "external":
+                    # 非外部标记的 dict，尝试提取有意义的备注文本
+                    note = str(note_val)
+            elif isinstance(note_val, str):
+                note_raw = note_val.strip()
+                # 外部中继的 note 是 JSON 对象（{"type":"external",...}），不作为备注显示
+                # 用字符串检查避免 orjson hash 表异常导致 dict.get() 返回 None
+                if note_raw and not ('"type"' in note_raw and '"external"' in note_raw):
+                    note = note_raw
         if note:
             lines.append(f"备注：{note}")
     except Exception:
         pass
 
-    lines.append(f"文件码：<code>{file_code}</code>")
+    lines.append(f"文件码：{file_code}")
     return "\n".join(lines)
 
 
