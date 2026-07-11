@@ -135,6 +135,21 @@ def _is_internal_note(note) -> bool:
     return '"type"' in note and '"external"' in note
 
 
+def _decode_external_code(code_part: str) -> str:
+    """解码 external_code，支持 hex 编码（H:前缀）和原始格式（向后兼容）。
+    emoji 码在 Telethon→Bot API 传输中会变成 NULL 字符，中继用 hex 编码传递，
+    up_bot 解码后写入 note；但旧数据或未重启的 up_bot 可能仍存 hex 编码，此处兼容解码。"""
+    if not code_part:
+        return code_part
+    code_part = code_part.strip()
+    if code_part.startswith("H:"):
+        try:
+            return bytes.fromhex(code_part[2:]).decode('utf-8')
+        except (ValueError, UnicodeDecodeError):
+            return code_part[2:]
+    return code_part
+
+
 # ─── 通道选择: cells 表获取 active 槽位 ───
 
 # ─── 活跃频道本地缓存(避免每次解码都查询 cells) ───
@@ -673,7 +688,9 @@ async def _process_one_pending(app: Application, row: dict):
                     elif k == "code":
                         _note_code = v
                 if _note_type == "external":
-                    ext_code = _note_code or ""
+                    # note 中的 code 可能是 hex 编码（H:前缀），解码回原始 emoji 码
+                    # 保持与中继 mark_code_mapped 使用的 key 一致
+                    ext_code = _decode_external_code(_note_code or "")
                     logger.info(f"[Idx][poll] ext_code 提取成功(遍历): {ext_code}")
                 else:
                     logger.warning(f"[Idx][poll] ext_code 提取失败: type={_note_type!r}, code={_note_code!r}")
@@ -729,6 +746,7 @@ async def _process_one_pending(app: Application, row: dict):
                 elif isinstance(note, dict):
                     _unmark_code = note.get("code")
                 if _unmark_code:
+                    _unmark_code = _decode_external_code(_unmark_code)
                     from database.relay_db import get_relay_db
                     relay_db = await get_relay_db()
                     if relay_db:

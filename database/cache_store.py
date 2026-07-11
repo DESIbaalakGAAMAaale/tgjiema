@@ -2191,18 +2191,29 @@ class CacheStore:
         })
 
     async def find_file_record_by_external_code(self, ext_code: str) -> dict | None:
-        """通过 note 中的 external code 反查文件记录（用于历史遗留的 mapped_codes.file_code 为空的情况）"""
+        """通过 note 中的 external code 反查文件记录（用于历史遗留的 mapped_codes.file_code 为空的情况）。
+        兼容 note 中 code 为原始 emoji 码或 hex 编码（H:前缀）两种情况。"""
         if not self._db:
             return None
-        rows = await self._db.execute_fetchall(
-            """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
-                      file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
-                      file_ids, status, request_count, protect_content, file_ttl_days, note,
-                      expire_time, blocked_users, create_time, updated_at, max_requests,
-                      is_collection, collection_codes
-               FROM file_records_local WHERE note LIKE ? LIMIT 1""",
-            (f'%"code":"{ext_code}"%',),
-        )
+        # 构造候选 key 列表：原始码 + hex 编码码（兼容旧数据）
+        candidates = [ext_code]
+        try:
+            hex_code = "H:" + ext_code.encode('utf-8').hex()
+            candidates.append(hex_code)
+        except Exception:
+            pass
+        for cand in candidates:
+            rows = await self._db.execute_fetchall(
+                """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
+                          file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
+                          file_ids, status, request_count, protect_content, file_ttl_days, note,
+                          expire_time, blocked_users, create_time, updated_at, max_requests,
+                          is_collection, collection_codes
+                   FROM file_records_local WHERE note LIKE ? LIMIT 1""",
+                (f'%"code":"{cand}"%',),
+            )
+            if rows:
+                break
         if not rows:
             return None
         r = rows[0]
