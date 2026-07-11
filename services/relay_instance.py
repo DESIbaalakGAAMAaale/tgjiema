@@ -76,6 +76,8 @@ class RelayInstance:
         # A2: FloodWait / 封禁自愈
         self._floodwait_until: float = 0.0  # FloodWait 到期时间戳, 0 表示无限制
         self._ban_detected: bool = False  # 是否检测到封禁/受限
+        # P3: noforwards 受保护聊天回退 — 下载到内存缓冲,稍后批量作为媒体组发送(保持格式)
+        self._download_buffers: dict[str, list] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -509,28 +511,90 @@ class RelayInstance:
             if _is_ban_error(e):
                 self.record_ban(str(e))
                 return
-            # P3: noforwards 等场景回退到下载再上传
-            logger.warning(f"[RelayInstance:{self.phone}] send_file 引用失败,尝试下载再上传 (code={code}): {e}")
-            await self._download_and_upload(msg, user_id, code, caption)
+            # P3: noforwards 等场景回退到下载并缓冲(保持媒体组格式,稍后批量发送)
+            logger.warning(f"[RelayInstance:{self.phone}] send_file 引用失败,下载并缓冲 (code={code}): {e}")
+            await self._buffer_download(msg, code, orig_caption)
         finally:
             await self._decrement_cache_counter(code)
 
-    async def _download_and_upload(self, msg, user_id: int, code: str, caption: str):
-        """P3: noforwards 回退 — 下载媒体到内存再上传给 Up Bot"""
+    async def _buffer_download(self, msg, code: str, orig_caption: str):
+        """P3: noforwards 回退 — 下载媒体到内存缓冲,稍后批量作为媒体组发送(保持格式)"""
         try:
             data = await self._client.download_media(msg, file=bytes)
             if data is None:
                 logger.warning(f"[RelayInstance:{self.phone}] download_media 返回 None (code={code})")
                 return
-            # 下载到 bytes 后作为新文件上传,Telethon 自动推断文件类型
-            await self._client.send_file(
-                self._up_bot_entity, data, caption=caption, force_document=False,
-            )
-            logger.info(f"[RelayInstance:{self.phone}] 下载再上传成功 (code={code})")
+            # 提取文件名以便 Telethon 正确推断文件类型
+            file_name = None
+            if hasattr(msg, "document") and msg.document:
+                file_name = getattr(msg.document, "file_name", None) or None
+            buf = self._download_buffers.setdefault(code, [])
+            buf.append({
+                "data": data,
+                "file_name": file_name,
+                "orig_caption": orig_caption,
+            })
+            logger.info(f"[RelayInstance:{self.phone}] 下载并缓冲 (code={code}, 已缓冲{len(buf)}个)")
         except Exception as e2:
             if _is_ban_error(e2):
                 self.record_ban(str(e2))
-            logger.error(f"[RelayInstance:{self.phone}] 下载再上传也失败 (code={code}): {e2}")
+            logger.error(f"[RelayInstance:{self.phone}] 下载缓冲失败 (code={code}): {e2}")
+
+    async def _flush_download_buffer(self, user_id: int, code: str):
+        """将下载缓冲的文件以媒体组格式批量发送给 Up Bot(保持相册格式)"""
+        buf = self._download_buffers.pop(code, None)
+        if not buf:
+            return
+        if not self._up_bot_entity:
+            logger.warning(f"[RelayInstance:{self.phone}] Up Bot 不可用,丢弃下载缓冲 (code={code}, {len(buf)}个)")
+            return
+        _code_hex = code.encode('utf-8').hex()
+        # 找到第一个非空 orig_caption(通常只有组内一条消息带文本)
+        orig_caption = ""
+        for item in buf:
+            if item.get("orig_caption"):
+                orig_caption = item["orig_caption"]
+                break
+        first_caption = f"EXTERNAL_RELAY:{user_id}:H:{_code_hex}\n{orig_caption}" if orig_caption else f"EXTERNAL_RELAY:{user_id}:H:{_code_hex}"
+        # 分批发送(每批最多10个,Telegram 媒体组上限)
+        BATCH = 10
+        for i in range(0, len(buf), BATCH):
+            batch = buf[i:i + BATCH]
+            try:
+                if len(batch) == 1:
+                    item = batch[0]
+                    await self._client.send_file(
+                        self._up_bot_entity, item["data"],
+                        caption=first_caption, force_document=False,
+                    )
+                else:
+                    # Telethon send_file 传入列表时自动以相册(sendMultiMedia)发送
+                    captions = [first_caption] + [None] * (len(batch) - 1)
+                    await self._client.send_file(
+                        self._up_bot_entity,
+                        [item["data"] for item in batch],
+                        caption=captions, force_document=False,
+                    )
+                logger.info(f"[RelayInstance:{self.phone}] 下载缓冲批量发送 ({len(batch)}个, code={code})")
+            except FloodWaitError as e:
+                self.record_flood_wait(e.seconds)
+                logger.warning(f"[RelayInstance:{self.phone}] 下载缓冲发送 FloodWait (code={code}): {e.seconds}s")
+            except Exception as e:
+                if _is_ban_error(e):
+                    self.record_ban(str(e))
+                # 批量失败回退到逐个发送
+                logger.warning(f"[RelayInstance:{self.phone}] 下载缓冲批量发送失败,回退逐个 (code={code}): {e}")
+                for j, item in enumerate(batch):
+                    cap = first_caption if j == 0 else None
+                    try:
+                        await self._client.send_file(
+                            self._up_bot_entity, item["data"],
+                            caption=cap, force_document=False,
+                        )
+                    except Exception as e2:
+                        if _is_ban_error(e2):
+                            self.record_ban(str(e2))
+                        logger.error(f"[RelayInstance:{self.phone}] 逐个发送也失败 (code={code}): {e2}")
 
     @staticmethod
     def _detect_media_type(msg) -> str:
@@ -806,7 +870,7 @@ class RelayInstance:
                 for _ in valid_events:
                     await self._decrement_cache_counter(code)
             else:
-                # P3: 批量失败回退到逐个 send_file + download_and_upload
+                # P3: 批量失败回退到逐个 send_file + _buffer_download(保持媒体组格式)
                 logger.warning(f"[RelayInstance:{self.phone}] 媒体组批量发送失败,回退逐个发送 (code={code}): {e}")
                 for ev in valid_events:
                     await self._download_and_cache_one(ev.message, user_id, code)
@@ -963,6 +1027,10 @@ class RelayInstance:
     def _make_decision(self, exchange: dict) -> dict:
         _NEXT_KW = ("next", "下一页", "下一頁", "下一组",
                      "→", "▶", "➡", ">>", "»")
+        # "继续发送"类按钮:可重复点击,每次加载更多内容(不受 _clicked_buttons 跳过限制)
+        # 靠 stale_clicks >= 3 机制防止死循环(连续3次无新文件则终止)
+        _CONTINUE_KW = ("继续发送", "继续", "更多", "加载更多", "继续接收",
+                        "continue", "more", "load more", "show more", "send more")
         _PREV_KW = ("prev", "上一页", "上一頁", "上一组", "上一組", "←", "◀", "⬅", "<<", "«", "back", "返回")
         _ERROR_KW = ("未找到", "已过期", "已失效",
                      "不存在", "not found", "expired", "invalid")
@@ -993,6 +1061,16 @@ class RelayInstance:
             if not (msg.reply_markup and hasattr(msg.reply_markup, "rows") and msg.reply_markup.rows):
                 continue
             rows = msg.reply_markup.rows
+            # 0. 优先查找"继续发送"类按钮(可重复点击,每次加载更多内容,不跳过已点击位置)
+            for row_idx, row in enumerate(rows):
+                for col_idx, btn in enumerate(row.buttons):
+                    btn_text = (getattr(btn, "text", None) or "").lower().strip()
+                    if any(kw in btn_text for kw in _CONTINUE_KW):
+                        return {"action": "click_button", "target_button_row": row_idx,
+                                "target_button_col": col_idx,
+                                "target_button_text": getattr(btn, "text", None) or "",
+                                "reason": f"检测到继续发送按钮: {btn_text}",
+                                "wait_seconds": None}
             # 1. 优先查找"下一页"按钮（跳过已点击过的位置，防止死循环）
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
@@ -1151,6 +1229,12 @@ class RelayInstance:
             return
         user_id = exchange.get("user_id")
         code = exchange.get("code")
+        # P3: flush 下载缓冲(noforwards 回退的文件)作为媒体组发送给 Up Bot
+        # 必须在 _cleanup_code_dicts 之前执行(后者会清理 _download_buffers)
+        try:
+            await self._flush_download_buffer(user_id, code)
+        except Exception as e:
+            logger.error(f"[RelayInstance:{self.phone}] flush 下载缓冲异常 (code={code}): {e}")
         # 清理对应的缓存字典，防止无限增长
         self._cleanup_code_dicts(code)
         all_events = exchange.get("events", [])
@@ -1207,6 +1291,7 @@ class RelayInstance:
             self._pending_cache_events.pop(code, None)
             self._cache_locks.pop(code, None)
             self._event_locks.pop(code, None)
+            self._download_buffers.pop(code, None)
 
     async def _mark_code_mapped(self, code: str):
         """标记码已成功映射到本地缓存，避免重复查询 CRDB。"""
