@@ -1906,6 +1906,35 @@ def _resolve_bot_username(update: Update) -> str | None:
     return None
 
 
+async def _dispatch_external_from_record(update, user_id, code, file_code, file_record, source: str = ""):
+    """从 file_record 调度 DSP 发送文件给用户，并回复通知消息。
+    用于已映射的外部码（文件已在存储频道中），不消耗配额。"""
+    storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
+    ids_str = file_record.get("batch_msg_ids") or ""
+    if not isinstance(ids_str, str):
+        ids_str = str(ids_str)
+    msg_ids = [int(mid) for mid in ids_str.split(",") if mid.strip().isdigit()]
+    if not msg_ids:
+        msg_ids = [file_record.get("primary_channel_msg_id")]
+    meta = file_record.get("batch_file_meta") or ""
+    if isinstance(meta, (list, bytes)):
+        meta = json.dumps(meta) if meta else ""
+        if isinstance(meta, bytes):
+            meta = meta.decode()
+    protect = file_record.get("protect_content", False)
+    await _dispatch_to_dsp(user_id, file_code, storage_channel, msg_ids, meta, protect)
+    logger.info(f"[Idx][external] 已映射码直接调度({source}): code={code}, fc={file_code}")
+    await safe_reply_text(
+        update.message,
+        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+        ]])
+    )
+    metrics.decode_count += 1
+    await metrics.record_processed("idx_bot")
+
+
 async def handle_external_code(update, context, user_id, code, bot_username, result):
     if bot_username is None and result:
         bot_username = result.external_bot_username
@@ -1917,6 +1946,40 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         code = original_code
         bot_username = context.user_data.pop("_extracted_bot", bot_username)
         create_safe_task(save_code_bot_mapping(code, bot_username), name="save_code_bot_mapping")
+
+    # ── 已映射的码：直接调度 DSP，不消耗配额（文件已在存储频道中）──
+    # 在配额检查之前执行，避免已映射码重复消耗用户配额
+    try:
+        # 1. 检查 external_code_mapping
+        _sys_code = await get_system_code_for_external(code)
+        if _sys_code:
+            _fr = await get_file_record_cached(_sys_code)
+            if _fr:
+                await _dispatch_external_from_record(update, user_id, code, _sys_code, _fr, "external_code_mapping")
+                return
+        # 2. 检查 mapped_codes
+        from database.relay_db import get_relay_db
+        _relay_db = await get_relay_db()
+        if _relay_db and await _relay_db.is_code_mapped(code):
+            _mapped_fc = await _relay_db.get_mapped_file_code(code)
+            if _mapped_fc:
+                _fr = await get_file_record_cached(_mapped_fc)
+                if _fr:
+                    await _dispatch_external_from_record(update, user_id, code, _mapped_fc, _fr, "mapped_codes")
+                    return
+            # file_code 为空：反查本地缓存
+            from database.cache_store import get_cache_store
+            _cached_rec = await get_cache_store().find_file_record_by_external_code(code)
+            if _cached_rec and _cached_rec.get("file_code"):
+                _cached_fc = _cached_rec["file_code"]
+                await _relay_db.update_mapped_file_code(code, _cached_fc)
+                await _dispatch_external_from_record(update, user_id, code, _cached_fc, _cached_rec, "反查缓存")
+                return
+            # 反查无果：清除脏标记，继续走配额检查 + 中继
+            await _relay_db.unmark_code(code)
+            logger.warning(f"[Idx][external] file_code为空且反查无果，清除脏标记(降级到配额检查): code={code}")
+    except Exception as e:
+        logger.warning(f"[Idx][external] 已映射码检查异常(降级到配额检查): {e}")
 
     # ── 配额检查（仅检查不递增，投递成功后再递增）──
     if result is None:
