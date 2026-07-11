@@ -1,6 +1,6 @@
 import os
+import re
 import time
-
 import datetime
 from pathlib import Path
 
@@ -148,9 +148,23 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # ─── 文件码正则路由（用于 40位hash / emoji 等非前缀式第三方码）───
     elif state == "add_code_route_regex:pattern":
+        pattern = text
+        # P2-7: 正则路由 ReDoS 防护 —— 校验长度、嵌套量词、可编译性
+        if len(pattern) > 200:
+            await update.message.reply_text("❌ 正则表达式过长(>200字符),已拒绝,请重新输入:")
+            return
+        # 基础 ReDoS 检测:嵌套量词,如 (.*+)+、(.+)+
+        if re.search(r'\([^)]*[+*?][^)]*\)[+*?]', pattern) or re.search(r'(.+.*|.*.+){2,}', pattern):
+            await update.message.reply_text("❌ 检测到潜在的 ReDoS 模式(嵌套量词),已拒绝,请重新输入:")
+            return
+        try:
+            re.compile(pattern)
+        except re.error as e:
+            await update.message.reply_text(f"❌ 正则表达式无效: {e}\n请重新输入:")
+            return
         await _ask("add_code_route_regex:bot",
-                    f"✅ 正则已记录:`{text}`\n\n请输入目标机器人用户名（不需要 @）：",
-                    {"pattern": text})
+                    f"✅ 正则已记录:`{pattern}`\n\n请输入目标机器人用户名（不需要 @）：",
+                    {"pattern": pattern})
 
     elif state == "add_code_route_regex:bot":
         bot_username = text.lstrip("@").lower()

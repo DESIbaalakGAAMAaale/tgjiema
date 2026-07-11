@@ -199,7 +199,8 @@ async def _get_storage_channel() -> int:
     except Exception as e:
         logger.warning(f"[Idx] 获取存储频道失败: {e}")
         pass
-    return 0
+    # P2: 所有渠道失败时抛异常而非返回 0,避免后续写入无效记录
+    raise RuntimeError("无可用存储频道,请检查 cells 表配置")
 
 
 # ─── 入队新方jobs ───
@@ -583,6 +584,15 @@ async def _process_one_pending(app: Application, row: dict):
 
     if not uploader_id or not channel_id or not message_id:
         # 数据残缺，重试无意义，标记完成避免无限循环
+        # P2: 通知上传者数据残缺,避免上传者无反馈
+        if uploader_id:
+            try:
+                await safe_send_message(
+                    app.bot, chat_id=uploader_id,
+                    text="⚠️ 您的文件上传数据处理异常(数据残缺),请重新上传。如问题持续,请联系管理员。"
+                )
+            except Exception as e:
+                logger.warning(f"[Idx] 通知上传者数据残缺失败: {e}")
         await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1, "claimed_at": 0}})
         return
 

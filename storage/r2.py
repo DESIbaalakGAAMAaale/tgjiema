@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import datetime
+from urllib.parse import quote
 
 import httpx
 
@@ -95,7 +96,9 @@ class R2Storage:
     async def upload(self, key: str, data: bytes, content_type: str = "application/octet-stream"):
         if self._http is None:
             raise RuntimeError("R2Storage not connected, call connect() first")
-        url = f"{self.base_url}/{key}"
+        # P2: URL 编码 object key,避免特殊字符(/, 空格等)导致路径拼接错误
+        safe_key = quote(key, safe="")
+        url = f"{self.base_url}/{safe_key}"
         payload_hash = hashlib.sha256(data).hexdigest()
         headers = self._sign("PUT", key, content_type, payload_hash=payload_hash)
         headers["Content-Type"] = content_type
@@ -106,7 +109,9 @@ class R2Storage:
     async def download(self, key: str) -> bytes:
         if self._http is None:
             raise RuntimeError("R2Storage not connected, call connect() first")
-        url = f"{self.base_url}/{key}"
+        # P2: URL 编码 object key
+        safe_key = quote(key, safe="")
+        url = f"{self.base_url}/{safe_key}"
         headers = self._sign("GET", key)
         resp = await self._http.get(url, headers=headers)
         resp.raise_for_status()
@@ -170,7 +175,9 @@ class R2Storage:
     async def delete(self, key: str):
         if self._http is None:
             raise RuntimeError("R2Storage not connected, call connect() first")
-        url = f"{self.base_url}/{key}"
+        # P2: URL 编码 object key
+        safe_key = quote(key, safe="")
+        url = f"{self.base_url}/{safe_key}"
         headers = self._sign("DELETE", key)
         resp = await self._http.delete(url, headers=headers)
         resp.raise_for_status()

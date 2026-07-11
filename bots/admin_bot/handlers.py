@@ -83,7 +83,7 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = 1
     for arg in args:
         if arg.isdigit():
-            page = int(arg)
+            page = max(1, int(arg))
         else:
             search = arg
     await update.message.reply_text(await _get_users_page_text(search, page))
@@ -281,7 +281,7 @@ async def files_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = 1
     for arg in args:
         if arg.isdigit():
-            page = int(arg)
+            page = max(1, int(arg))
         else:
             search = arg
 
@@ -296,9 +296,10 @@ async def files_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query["file_code"] = {"$regex": re.escape(search), "$options": "i"}
 
     total = await files_col.count_documents(query)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
     skip = (page - 1) * per_page
     files = await files_col.find(query, sort=("create_time", -1), skip=skip, limit=per_page)
-    total_pages = max(1, (total + per_page - 1) // per_page)
 
     msg = f"📁 文件列表 (第{page}/{total_pages}页,共{total}个)\n"
     if search:
@@ -311,7 +312,7 @@ async def files_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uploader = f.get("uploader_id", "?")
         msg += f"{status_icon} {fc} (上传者:{uploader})\n"
 
-    if total_pages > 1:
+    if total_pages > 1 and page < total_pages:
         ns = f" {search}" if search else ""
         msg += f"\n使用 /files{ns} {page+1} 查看下一页"
 
@@ -326,21 +327,25 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     file_code = args[0]
 
-    files_col = get_file_records_col()
-    result = await files_col.update_one(
-        {"file_code": file_code},
-        {"$set": {"status": "deleted"}},
-    )
-    if result.matched_count == 0:
+    # P2-8: 二次确认,避免误删。先校验文件存在,再弹出确认按钮,实际删除在 callback 中执行。
+    record = await get_file_record_cached(file_code)
+    if record is None:
         await update.message.reply_text(f"❌ 文件码 {file_code} 不存在")
         return
-    # 失效缓存
-    try:
-        from database.cache import invalidate_file_record
-        invalidate_file_record(file_code)
-    except Exception:
-        pass
-    await update.message.reply_text(f"✅ 文件 {file_code} 已删除")
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️ 确认删除", callback_data=f"delfile|{file_code}")],
+        [InlineKeyboardButton("❌ 取消", callback_data=f"delfile_cancel|{file_code}")],
+    ])
+    await update.message.reply_text(
+        f"⚠️ 确认删除文件\n\n"
+        f"🔑 文件码:{file_code}\n"
+        f"👤 上传者:{record.get('uploader_id')}\n"
+        f"📊 当前状态:{record.get('status', 'active')}\n\n"
+        f"删除后文件将标记为已删除状态。请点击下方按钮确认或取消:",
+        reply_markup=kb,
+    )
 
 
 @_auth_required
@@ -382,7 +387,7 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     page = 1
     if args and args[0].isdigit():
-        page = int(args[0])
+        page = max(1, int(args[0]))
     await update.message.reply_text(await _get_logs_page_text(page))
 
 
@@ -698,7 +703,8 @@ async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             ext_quota = int(args[2])
         except ValueError:
-            ext_quota = quota
+            await update.message.reply_text("❌ 外部码配额值无效,请输入正整数(-1 表示不限)")
+            return
         await set_config(f"quota_external_{level}", str(ext_quota))
         msg += f",外部码配额 {_quota_display(ext_quota)}"
 

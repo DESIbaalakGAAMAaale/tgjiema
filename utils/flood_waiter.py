@@ -36,6 +36,10 @@ async def api_call_with_backoff(coro_factory, description: str = "", bot_id: int
             bot_id=12345,
         )
     """
+    # P2: bot_id=0 时所有调用共享同一退避桶,记录 warning 提示显式传入
+    if bot_id == 0 and not getattr(api_call_with_backoff, "_warned_default", False):
+        logger.debug("[FloodWait] 调用未传入 bot_id,退避状态将共享(仅首次提示)")
+        api_call_with_backoff._warned_default = True
     max_retries = 5
     for attempt in range(max_retries):
         # 检查该账号的退避状态

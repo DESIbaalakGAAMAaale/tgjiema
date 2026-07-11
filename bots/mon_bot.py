@@ -773,7 +773,10 @@ class MonBot:
         store = get_cache_store()
         hb_data = await store.get_all_heartbeats()
         for slot_id, data in hb_data.items():
-            self._cell_healthy[slot_id] = True  # 历史记录存在说明上次是健康的
+            # P2: 根据上次心跳结果恢复健康状态,而非一律置 True
+            # 避免重启后丢失上次心跳的真实状态导致降级失效
+            last_ok = data.get("last_ok", True)
+            self._cell_healthy[slot_id] = last_ok
             self._cell_fail_streak[slot_id] = data.get("fail_streak", 0)
         if hb_data:
             logger.info(f"[Mon] 从 SQLite 恢复 {len(hb_data)} 条心跳记录")

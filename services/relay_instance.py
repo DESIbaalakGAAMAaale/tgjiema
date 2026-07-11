@@ -419,7 +419,15 @@ class RelayInstance:
 
         me = await self._client.get_me()
         self._relay_user_id = me.id
-        self._decoder_bot_entity = await self._client.get_entity(settings.DECODER_BOT_USERNAME)
+        # P2: get_entity 对不存在的用户名会抛异常,加 try/except 避免登录流程中断
+        try:
+            self._decoder_bot_entity = await self._client.get_entity(settings.DECODER_BOT_USERNAME)
+        except Exception as e:
+            logger.warning(f"[RelayInstance:{self.phone}] 无法获取解码机器人 @{settings.DECODER_BOT_USERNAME}: {e}")
+        try:
+            self._up_bot_entity = await self._client.get_entity(settings.UPLOAD_BOT_USERNAME)
+        except Exception as e:
+            logger.warning(f"[RelayInstance:{self.phone}] 无法获取上传机器人 @{settings.UPLOAD_BOT_USERNAME}: {e}")
         self._register_handlers()
         self._ready.set()
         await self._report_status("online", f"{me.first_name}(@{me.username})")
@@ -815,6 +823,14 @@ class RelayInstance:
                     self._cleanup_code_dicts(old.get("code", ""))
                     if old.get("_settle_task") and not old["_settle_task"].done():
                         old["_settle_task"].cancel()
+                    # P2: 交换过期时 flush 未完成的下载缓冲,避免文件丢失
+                    _code = old.get("code", "")
+                    if _code and (_code in self._pending_msgs or _code in self._download_buffers):
+                        try:
+                            asyncio.create_task(self._flush_download_buffer(old.get("user_id", 0), _code))
+                            logger.warning(f"[RelayInstance:{self.phone}] 交换过期,触发缓冲 flush (code={_code})")
+                        except Exception as flush_err:
+                            logger.warning(f"[RelayInstance:{self.phone}] 交换过期 flush 失败: {flush_err}")
             # 清理过期的 media_buffers
             stale_buffers = [
                 mgid for mgid, buf in list(self._media_buffers.items())

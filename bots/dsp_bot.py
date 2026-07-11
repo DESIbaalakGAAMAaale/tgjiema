@@ -349,9 +349,20 @@ async def process_queue(bot):
     """启动 worker 并发处理 jobs 队列。每个 worker 批量拉取后并发发送。"""
     num_workers = 2  # 2 个 worker 并发拉取 + 内部并发发送,足以支撑 25 并发上限
     logger.info(f"[Dsp] 启动 {num_workers} 个worker,并发上限 {_SEND_CONCURRENCY}")
+    # P2: 用 supervisor 监控 worker,worker 异常退出时记录错误并结束
     workers = [create_safe_task(_dsp_worker(bot, i), name=f"dsp-worker-{i}") for i in range(num_workers)]
-    for w in workers:
-        await w
+    try:
+        for w in workers:
+            await w
+    finally:
+        # worker 异常退出时取消其他 worker,避免部分运行
+        for w in workers:
+            if not w.done():
+                w.cancel()
+        # 记录异常退出的 worker
+        for i, w in enumerate(workers):
+            if w.done() and w.exception():
+                logger.error(f"[Dsp] worker-{i} 异常退出: {w.exception()}")
 
 
 def _raw_jobs_to_results(raw_jobs: list[dict]) -> list:

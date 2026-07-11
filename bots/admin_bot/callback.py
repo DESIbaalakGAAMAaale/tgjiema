@@ -367,6 +367,10 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("restore:"):
         await _handle_restore_action(update, context, data)
 
+    # ─── 文件删除二次确认(P2-8)────────────────────────────────────
+    elif data.startswith("delfile|") or data.startswith("delfile_cancel|"):
+        await _handle_delete_file_action(update, context, data)
+
 
 # ─── 举报动作处理 ──────────────────────────────────────────────
 
@@ -605,3 +609,42 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
     lines.append(f"  systemctl restart tgjiema.target")
 
     await query.edit_message_text("\n".join(lines), reply_markup=back_kb)
+
+
+# ─── 文件删除二次确认处理 ──────────────────────────────────────────
+
+async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
+    """处理文件删除的二次确认/取消按钮(P2-8)。"""
+    query = update.callback_query
+    user = update.effective_user
+    if not user or user.id != AUTHORIZED_USER_ID:
+        await query.answer("⛔ 无权限", show_alert=True)
+        return
+
+    back_kb = InlineKeyboardMarkup(BACK_BTN)
+
+    if data.startswith("delfile_cancel|"):
+        await query.edit_message_text("❌ 删除操作已取消。", reply_markup=back_kb)
+        return
+
+    # delfile|{file_code}
+    parts = data.split("|", 1)
+    if len(parts) < 2:
+        await query.edit_message_text("❌ 参数缺失", reply_markup=back_kb)
+        return
+    file_code = parts[1]
+
+    files_col = get_file_records_col()
+    result = await files_col.update_one(
+        {"file_code": file_code},
+        {"$set": {"status": "deleted"}},
+    )
+    if result.matched_count == 0:
+        await query.edit_message_text(f"❌ 文件码 {file_code} 不存在", reply_markup=back_kb)
+        return
+    # 失效缓存
+    try:
+        invalidate_file_record(file_code)
+    except Exception:
+        pass
+    await query.edit_message_text(f"✅ 文件 {file_code} 已删除", reply_markup=back_kb)

@@ -45,7 +45,8 @@ _channel_to_group: dict[int, int] = {}
 _channel_to_group_ts: float = 0.0
 _CHANNEL_GROUP_CACHE_TTL: float = 300.0  # 缓存 300 秒
 # 模块级存储：上传元数据，避免 context.user_data 在 callback 间丢失
-_pending_upload_meta: dict[int, dict] = {}
+# P2: 键改为 "user_id:upload_msg_id" 复合键,避免同用户并发上传互相覆盖
+_pending_upload_meta: dict[str, dict] = {}
 _active_slot_index: int = 0
 _external_buffers: dict[str, dict] = {}
 _mg_lock = asyncio.Lock()  # 保护 _pending_media_groups 和 _external_buffers
@@ -54,14 +55,13 @@ _pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
 _finalized_msg_ids: set[int] = set()
 # 模块级 bot 引用,供 _flush_external_buffer 等非 handler 函数使用
 _bot = None
-# 媒体组路由:media_group_id -> external_code
+# 媒体组路由:media_group_id -> (external_code, created_at)
 # 当 relay 用 grouping=True 发送时,只有第一条消息有 EXTERNAL_RELAY: caption,
 # 后续消息靠 media_group_id 匹配此映射,统一走 _handle_external_relay_file
-_external_mgid_map: dict[str, str] = {}
-# 内存级 file_unique_id 去重：external_code -> set of file_unique_id
-# 防止多个用户并发触发中继发送同一文件时，Up Bot 重复 copy 到存储频道
-# （manifest 在 copy 完成后才写入，并发请求的 _check_dedup 都不命中）
-_external_fuid_dedup: dict[str, set[str]] = {}
+# P2: 带 created_at 时间戳,改为惰性清理(超过 300s 才清),避免每轮全清破坏防重复
+_external_mgid_map: dict[str, tuple[str, float]] = {}
+# 内存级 file_unique_id 去重：external_code -> (set of file_unique_id, created_at)
+_external_fuid_dedup: dict[str, tuple[set[str], float]] = {}
 
 
 def _decode_external_code(code_part: str) -> str:
@@ -225,12 +225,22 @@ async def _cleanup_pending():
             if len(_finalized_msg_ids) > 10000:
                 _finalized_msg_ids.clear()
                 logger.debug("[up_bot] 清理 _finalized_msg_ids (超过10000条)")
-            # 清理 _external_mgid_map (超过 300s 的旧映射)
+            # P2: 惰性清理 _external_mgid_map (超过 300s 的旧映射)
             if _external_mgid_map:
-                _external_mgid_map.clear()
-            # 清理超时的内存级去重集合（防止内存泄漏）
+                now_ts = time.time()
+                expired_mgids = [k for k, (_, ts) in _external_mgid_map.items() if now_ts - ts > 300]
+                for k in expired_mgids:
+                    _external_mgid_map.pop(k, None)
+                if expired_mgids:
+                    logger.debug(f"[up_bot] 惰性清理 _external_mgid_map: {len(expired_mgids)} 个")
+            # P2: 惰性清理超时的内存级去重集合
             if _external_fuid_dedup:
-                _external_fuid_dedup.clear()
+                now_ts = time.time()
+                expired_dedup = [k for k, (_, ts) in _external_fuid_dedup.items() if now_ts - ts > 300]
+                for k in expired_dedup:
+                    _external_fuid_dedup.pop(k, None)
+                if expired_dedup:
+                    logger.debug(f"[up_bot] 惰性清理 _external_fuid_dedup: {len(expired_dedup)} 个")
         except Exception as e:
             logger.error(f"[up_bot] 清理超时缓冲区异常: {e}")
         await asyncio.sleep(60)
@@ -755,12 +765,13 @@ async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             first_line = rest.split("\n", 1)[0]
             user_end = first_line.find(":")
             if user_end != -1:
-                _external_mgid_map[mgid] = _decode_external_code(first_line[user_end + 1:])
+                _external_mgid_map[mgid] = (_decode_external_code(first_line[user_end + 1:]), time.time())
         await _handle_external_relay_file(update, context)
         return
     if mgid and mgid in _external_mgid_map:
         # 媒体组后续消息(无 caption,但 media_group_id 匹配外部中继组)
-        await _handle_external_relay_file(update, context, ext_code_override=_external_mgid_map[mgid])
+        _ext_code, _ = _external_mgid_map[mgid]
+        await _handle_external_relay_file(update, context, ext_code_override=_ext_code)
         return
 
     if not await check_force_join(update, context):
@@ -1091,12 +1102,15 @@ async def _process_upload(
         asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
 
     # 暂存必要信息到模块级 dict（context.user_data 在 callback 间不可靠）
-    _pending_upload_meta[user_id] = {
+    # P2: 改用 user_id:msg_id 复合键,避免同用户并发上传互相覆盖
+    _meta_key = f"{user_id}:{update.message.message_id}"
+    _pending_upload_meta[_meta_key] = {
         "main_channel": main_channel,
         "channel_msg_id": channel_msg_id,
         "file_types": file_types,
         "note": update.message.caption or "",
         "file_meta": extract_file_meta(update),
+        "created_at": time.time(),
     }
     # 同时存 context.user_data（兼容旧逻辑）
     context.user_data["_main_channel"] = main_channel
@@ -1104,6 +1118,8 @@ async def _process_upload(
     context.user_data["_file_types"] = file_types
     context.user_data["_note"] = update.message.caption or ""
     context.user_data["_file_meta"] = extract_file_meta(update)
+    # P2: 记录上传消息 ID 用于 _finalize_upload 复合键查找
+    context.user_data["_upload_msg_id"] = update.message.message_id
 
     # 第一步：发送有效期选择
     await update.message.reply_text(
@@ -1182,9 +1198,17 @@ async def _finalize_upload(query, context, user_id: int):
         note = context.user_data.pop("_note", "")
 
         protect_bool = protect.lower() == "true"
-        ttl_days = int(ttl) if ttl.isdigit() else settings.DEFAULT_FILE_TTL_DAYS
-        if ttl_days == 0:
+        # P2: -1=永久有效哨兵,0=使用默认值,正数=指定天数
+        try:
+            ttl_val = int(ttl)
+        except (ValueError, TypeError):
+            ttl_val = 0
+        if ttl_val == -1:
+            ttl_days = 0  # 永久有效
+        elif ttl_val == 0:
             ttl_days = settings.DEFAULT_FILE_TTL_DAYS
+        else:
+            ttl_days = ttl_val
 
         if pending_batch:
             # ── 批次上传 ──
@@ -1228,7 +1252,10 @@ async def _finalize_upload(query, context, user_id: int):
         else:
             # ── 单文件上传 ──
             # 优先从模块级 dict 读取（context.user_data 在 callback 间不可靠）
-            meta = _pending_upload_meta.get(user_id, {})
+            # P2: 用 user_id:upload_msg_id 复合键查找,避免并发上传覆盖
+            upload_msg_id = context.user_data.pop("_upload_msg_id", 0)
+            _meta_key = f"{user_id}:{upload_msg_id}" if upload_msg_id else f"{user_id}:"
+            meta = _pending_upload_meta.get(_meta_key) or _pending_upload_meta.get(user_id, {})
             main_channel = context.user_data.pop("_main_channel", 0) or meta.get("main_channel", 0)
             channel_msg_id = context.user_data.pop("_channel_msg_id", 0) or meta.get("channel_msg_id", 0)
             file_types = context.user_data.pop("_file_types", {}) or meta.get("file_types", {})
@@ -1269,7 +1296,9 @@ async def _finalize_upload(query, context, user_id: int):
             })
             logger.info(f"[Up] 单文件写入pending_uploads: user={user_id}")
             _finalized_msg_ids.add(msg_id)
-            _pending_upload_meta.pop(user_id, None)  # 成功后清理
+            # P2: 清理复合键(user_id:upload_msg_id)和旧键(user_id)
+            _pending_upload_meta.pop(_meta_key, None)
+            _pending_upload_meta.pop(user_id, None)
 
         try:
             await get_cache_store().notify_new_upload()
@@ -1373,7 +1402,8 @@ def _build_ttl_keyboard():
     """构建有效期选择按钮。"""
     keyboard = [
         [
-            InlineKeyboardButton("∞ 永久有效", callback_data="opt|ttl|0"),
+            # P2: 用 -1 哨兵区分「永久(0)」与「默认」
+            InlineKeyboardButton("∞ 永久有效", callback_data="opt|ttl|-1"),
             InlineKeyboardButton("1天", callback_data="opt|ttl|1"),
         ],
         [
@@ -1480,12 +1510,19 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     fuid = _extract_file_unique_id(update.message)
     if fuid:
         async with _mg_lock:
+            # P2: 惰性清理超 300s 的旧去重集合
+            now = time.time()
+            if external_code in _external_fuid_dedup:
+                _fuids, _ts = _external_fuid_dedup[external_code]
+                if now - _ts > 300:
+                    _external_fuid_dedup.pop(external_code, None)
             if external_code not in _external_fuid_dedup:
-                _external_fuid_dedup[external_code] = set()
-            if fuid in _external_fuid_dedup[external_code]:
+                _external_fuid_dedup[external_code] = (set(), now)
+            _fuids, _ts = _external_fuid_dedup[external_code]
+            if fuid in _fuids:
                 logger.info(f"[Up][ext_relay] 内存去重命中: fuid={fuid} (code={external_code}), 跳过重复文件")
                 return
-            _external_fuid_dedup[external_code].add(fuid)
+            _fuids.add(fuid)
 
     # B1 秒传去重:仅复用同 channel 的已有文件
     existing = await _check_dedup(target_ch, update.message)
@@ -1575,7 +1612,7 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         if buf.get("timer"):
             buf["timer"].cancel()
         # 清理 _external_mgid_map 中对应的映射
-        stale_mgids = [k for k, v in _external_mgid_map.items() if v == external_code]
+        stale_mgids = [k for k, (v, _) in _external_mgid_map.items() if v == external_code]
         for k in stale_mgids:
             _external_mgid_map.pop(k, None)
         # 清理内存级 file_unique_id 去重集合

@@ -344,11 +344,18 @@ class RelayDB:
             "SELECT id, api_id, api_hash, phone, is_active, status, status_info, status_updated_at, created_at, last_login_at "
             "FROM relay_accounts WHERE is_active=1 ORDER BY id"
         )
-        return [
-            {
+        # P2: 单条解密失败不中断整批,跳过损坏记录并记录日志
+        result = []
+        for r in rows:
+            try:
+                api_hash = decrypt(r[2])
+            except RuntimeError as e:
+                logger.error(f"[RelayDB] 跳过损坏账号 id={r[0]} phone={r[3]}: {e}")
+                continue
+            result.append({
                 "id": r[0],
                 "api_id": r[1],
-                "api_hash": decrypt(r[2]),
+                "api_hash": api_hash,
                 "phone": r[3],
                 "is_active": bool(r[4]),
                 "status": r[5] or 'unknown',
@@ -356,27 +363,32 @@ class RelayDB:
                 "status_updated_at": r[7],
                 "created_at": r[8],
                 "last_login_at": r[9],
-            }
-            for r in rows
-        ]
+            })
+        return result
 
     async def get_all_accounts(self) -> list[dict]:
         rows = await self._db.execute_fetchall(
             "SELECT id, api_id, api_hash, phone, is_active, created_at, last_login_at "
             "FROM relay_accounts ORDER BY id"
         )
-        return [
-            {
+        # P2: 单条解密失败不中断整批
+        result = []
+        for r in rows:
+            try:
+                api_hash = decrypt(r[2])
+            except RuntimeError as e:
+                logger.error(f"[RelayDB] 跳过损坏账号 id={r[0]} phone={r[3]}: {e}")
+                continue
+            result.append({
                 "id": r[0],
                 "api_id": r[1],
-                "api_hash": decrypt(r[2]),
+                "api_hash": api_hash,
                 "phone": r[3],
                 "is_active": bool(r[4]),
                 "created_at": r[5],
                 "last_login_at": r[6],
-            }
-            for r in rows
-        ]
+            })
+        return result
 
     async def remove_account(self, phone: str) -> bool:
         cur = await self._db.execute("DELETE FROM relay_accounts WHERE phone=?", (phone,))
