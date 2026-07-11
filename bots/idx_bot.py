@@ -2097,14 +2097,16 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                         metrics.decode_count += 1
                         await metrics.record_processed("idx_bot")
                         return
-                # 本地缓存也没找到，pending 可能还在处理中
-                logger.info(f"[Idx][external] pending 处理中，通知用户稍后重试: code={code}")
+                # 本地缓存也没找到：可能是历史脏数据（emoji传输bug导致映射写到了NULL key）
+                # 清除脏标记，让用户下次发码走中继重新获取（hex编码后不会再出问题）
+                logger.warning(f"[Idx][external] file_code为空且反查无果，清除脏标记: code={code}")
+                await relay_db.unmark_code(code)
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user_id, is_external=True)
                 await safe_reply_text(
                     update.message,
-                    "文件正在处理中，请稍后重新发送该文件码获取文件。"
+                    "文件码已重置，请重新发送该文件码获取文件。"
                 )
                 return
         except Exception as e:
