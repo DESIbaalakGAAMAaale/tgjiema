@@ -245,15 +245,9 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
         if record:
             note_raw = (record.get("note") or "").strip()
             # 外部中继的 note 是 JSON 对象（{"type":"external",...}），不作为备注显示
-            if note_raw:
-                try:
-                    parsed = json.loads(note_raw)
-                    if isinstance(parsed, dict) and parsed.get("type") == "external":
-                        note = ""
-                    else:
-                        note = note_raw
-                except (TypeError, ValueError):
-                    note = note_raw
+            # 用字符串检查避免 orjson hash 表异常导致 dict.get() 返回 None
+            if note_raw and not ('"type"' in note_raw and '"external"' in note_raw):
+                note = note_raw
         if note:
             lines.append(f"备注：{note}")
     except Exception:
@@ -273,19 +267,16 @@ async def _edit_sent_caption(bot: Any, chat_id: int, message_id: int, caption: s
 
 async def _should_preserve_caption(file_code: str) -> bool:
     """检查是否应保留第三方 Bot 原始 caption（不被标准模板覆盖）。
-    当外部中继的 note 中标记 preserve_caption=True 时返回 True。"""
+    当外部中继的 note 中标记 preserve_caption=True 时返回 True。
+    用字符串检查避免 orjson hash 表异常导致 dict.get() 返回 None。"""
     try:
         record = await get_file_record_cached(file_code)
         if not record:
             return False
         note = record.get("note") or ""
-        if not note:
+        if not note or not isinstance(note, str):
             return False
-        try:
-            parsed = json.loads(note)
-        except (TypeError, ValueError):
-            return False
-        return isinstance(parsed, dict) and bool(parsed.get("preserve_caption"))
+        return '"preserve_caption"' in note and '"true"' in note.lower()
     except Exception:
         return False
 
