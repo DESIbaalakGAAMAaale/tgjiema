@@ -16,8 +16,8 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 from config import settings
 
-_SETTLE_WAIT = 4
-_INITIAL_SETTLE_WAIT = 8
+_SETTLE_WAIT = 1.5
+_INITIAL_SETTLE_WAIT = 3
 
 _BAN_KEYWORDS = [
     "deactivated", "banned", "auth_key", "unauthorized",
@@ -796,12 +796,12 @@ class RelayInstance:
                 buf = self._media_buffers.get(media_group_id)
                 if buf:
                     buf["events"].append(event)
-                    buf["_expires"] = now_ts + 5
+                    buf["_expires"] = now_ts + 2
                     return
                 self._media_buffers[media_group_id] = {
                     "events": [event],
                     "bot_username": bot_username,
-                    "_expires": now_ts + 5,
+                    "_expires": now_ts + 2,
                 }
                 self._spawn(
                     self._flush_media_group_buffer(media_group_id, bot_username)
@@ -853,14 +853,14 @@ class RelayInstance:
         )
 
     async def _flush_media_group_buffer(self, media_group_id: str, bot_username: str):
-        await asyncio.sleep(3)
+        await asyncio.sleep(1.5)
         now_ts = asyncio.get_running_loop().time()
         while True:
             buf = self._media_buffers.get(media_group_id)
             if not buf:
                 return
             if buf["_expires"] > now_ts:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.3)
                 now_ts = asyncio.get_running_loop().time()
                 continue
             break
@@ -1053,7 +1053,7 @@ class RelayInstance:
                         exchange["_last_click_time"] = asyncio.get_running_loop().time()
                         exchange["_page_count"] = exchange.get("_page_count", 0) + 1
                         logger.info(f"[RelayInstance:{self.phone}] 翻页: 第{exchange['_page_count']}次 (bot=@{bot_username})")
-                    await asyncio.sleep(4)
+                    await asyncio.sleep(2)
                     await self._wait_all_cached(bot_username)
                     exchange = self._bot_exchange.get(bot_username)
                     if exchange:
