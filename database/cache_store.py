@@ -2190,6 +2190,33 @@ class CacheStore:
             "is_collection": r[19], "collection_codes": r[20],
         })
 
+    async def find_file_record_by_external_code(self, ext_code: str) -> dict | None:
+        """通过 note 中的 external code 反查文件记录（用于历史遗留的 mapped_codes.file_code 为空的情况）"""
+        if not self._db:
+            return None
+        rows = await self._db.execute_fetchall(
+            """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
+                      file_types, backup_channel_msg_ids, batch_msg_ids, batch_file_meta,
+                      file_ids, status, request_count, protect_content, file_ttl_days, note,
+                      expire_time, blocked_users, create_time, updated_at, max_requests,
+                      is_collection, collection_codes
+               FROM file_records_local WHERE note LIKE ? LIMIT 1""",
+            (f'%"code":"{ext_code}"%',),
+        )
+        if not rows:
+            return None
+        r = rows[0]
+        return _deserialize_sqlite_row({
+            "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
+            "primary_channel_msg_id": r[3], "file_types": r[4],
+            "backup_channel_msg_ids": r[5], "batch_msg_ids": r[6],
+            "batch_file_meta": r[7], "file_ids": r[8], "status": r[9],
+            "request_count": r[10], "protect_content": r[11], "file_ttl_days": r[12],
+            "note": r[13], "expire_time": r[14], "blocked_users": r[15],
+            "create_time": r[16], "updated_at": r[17], "max_requests": r[18],
+            "is_collection": r[19], "collection_codes": r[20],
+        })
+
     async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True, _batch: bool = False):
         """写入/更新 file_record 到 SQLite"""
         if not self._db:

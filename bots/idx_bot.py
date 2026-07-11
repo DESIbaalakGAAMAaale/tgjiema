@@ -2063,8 +2063,41 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                         metrics.decode_count += 1
                         await metrics.record_processed("idx_bot")
                         return
-                # file_code 为空：pending 还在处理中，通知用户稍后重试
-                # pending 处理失败时 _process_one_pending 会自动 unmark_code，下次发码走中继
+                # file_code 为空：可能 pending 还在处理中，也可能是历史遗留（orjson fix 前）
+                # 先从本地缓存按 note 中的 ext_code 反查文件记录
+                from database.cache_store import get_cache_store
+                cached_rec = await get_cache_store().find_file_record_by_external_code(code)
+                if cached_rec:
+                    cached_fc = cached_rec.get("file_code", "")
+                    if cached_fc:
+                        # 找到文件记录，补写 mapped_codes.file_code 并直接调度 DSP
+                        await relay_db.update_mapped_file_code(code, cached_fc)
+                        mc_channel = cached_rec.get("primary_channel_id") or await _get_storage_channel()
+                        mc_ids_str = cached_rec.get("batch_msg_ids") or ""
+                        if not isinstance(mc_ids_str, str):
+                            mc_ids_str = str(mc_ids_str)
+                        mc_msg_ids = [int(mid) for mid in mc_ids_str.split(",") if mid.strip().isdigit()]
+                        if not mc_msg_ids:
+                            mc_msg_ids = [cached_rec.get("primary_channel_msg_id")]
+                        mc_meta = cached_rec.get("batch_file_meta") or ""
+                        if isinstance(mc_meta, (list, bytes)):
+                            mc_meta = json.dumps(mc_meta) if mc_meta else ""
+                            if isinstance(mc_meta, bytes):
+                                mc_meta = mc_meta.decode()
+                        mc_protect = cached_rec.get("protect_content", False)
+                        await _dispatch_to_dsp(user_id, cached_fc, mc_channel, mc_msg_ids, mc_meta, mc_protect)
+                        logger.info(f"[Idx][external] 从本地缓存反查到文件，直接调度: code={code}, file_code={cached_fc}")
+                        await safe_reply_text(
+                            update.message,
+                            f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                            ]])
+                        )
+                        metrics.decode_count += 1
+                        await metrics.record_processed("idx_bot")
+                        return
+                # 本地缓存也没找到，pending 可能还在处理中
                 logger.info(f"[Idx][external] pending 处理中，通知用户稍后重试: code={code}")
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
