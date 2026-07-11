@@ -518,35 +518,51 @@ class RelayInstance:
             await self._decrement_cache_counter(code)
 
     async def _buffer_download(self, msg, code: str, orig_caption: str):
-        """P3: noforwards 回退 — 下载媒体到内存缓冲,稍后批量作为媒体组发送(保持格式)"""
+        """P3: noforwards 回退 — 下载媒体到临时文件缓冲,稍后批量作为媒体组发送(保持格式)
+        用临时文件而非内存 bytes,避免大文件(2GB+)导致内存耗尽。
+        """
+        import os
+        import tempfile
         try:
-            data = await self._client.download_media(msg, file=bytes)
-            if data is None:
-                logger.warning(f"[RelayInstance:{self.phone}] download_media 返回 None (code={code})")
-                return
-            # 提取文件名以便 Telethon 正确推断文件类型
-            file_name = None
+            # 提取原始文件名扩展名,以便 Telethon 正确推断文件类型
+            ext = ""
             if hasattr(msg, "document") and msg.document:
-                file_name = getattr(msg.document, "file_name", None) or None
+                file_name = getattr(msg.document, "file_name", None) or ""
+                if "." in file_name:
+                    ext = "." + file_name.rsplit(".", 1)[-1].lower()
+            elif hasattr(msg, "photo") and msg.photo:
+                ext = ".jpg"
+            # 创建临时文件(不自动删除,发送后手动清理)
+            fd, tmp_path = tempfile.mkstemp(suffix=ext, prefix=f"relay_{code[:8]}_")
+            os.close(fd)
+            downloaded = await self._client.download_media(msg, file=tmp_path)
+            if downloaded is None:
+                logger.warning(f"[RelayInstance:{self.phone}] download_media 返回 None (code={code})")
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+                return
             buf = self._download_buffers.setdefault(code, [])
             buf.append({
-                "data": data,
-                "file_name": file_name,
+                "path": tmp_path,
                 "orig_caption": orig_caption,
             })
-            logger.info(f"[RelayInstance:{self.phone}] 下载并缓冲 (code={code}, 已缓冲{len(buf)}个)")
+            logger.info(f"[RelayInstance:{self.phone}] 下载并缓冲到临时文件 (code={code}, 已缓冲{len(buf)}个, path={tmp_path})")
         except Exception as e2:
             if _is_ban_error(e2):
                 self.record_ban(str(e2))
             logger.error(f"[RelayInstance:{self.phone}] 下载缓冲失败 (code={code}): {e2}")
 
     async def _flush_download_buffer(self, user_id: int, code: str):
-        """将下载缓冲的文件以媒体组格式批量发送给 Up Bot(保持相册格式)"""
+        """将下载缓冲的临时文件以媒体组格式批量发送给 Up Bot(保持相册格式),发送后清理临时文件"""
+        import os
         buf = self._download_buffers.pop(code, None)
         if not buf:
             return
         if not self._up_bot_entity:
             logger.warning(f"[RelayInstance:{self.phone}] Up Bot 不可用,丢弃下载缓冲 (code={code}, {len(buf)}个)")
+            self._cleanup_tmp_files(buf)
             return
         _code_hex = code.encode('utf-8').hex()
         # 找到第一个非空 orig_caption(通常只有组内一条消息带文本)
@@ -564,7 +580,7 @@ class RelayInstance:
                 if len(batch) == 1:
                     item = batch[0]
                     await self._client.send_file(
-                        self._up_bot_entity, item["data"],
+                        self._up_bot_entity, item["path"],
                         caption=first_caption, force_document=False,
                     )
                 else:
@@ -572,7 +588,7 @@ class RelayInstance:
                     captions = [first_caption] + [None] * (len(batch) - 1)
                     await self._client.send_file(
                         self._up_bot_entity,
-                        [item["data"] for item in batch],
+                        [item["path"] for item in batch],
                         caption=captions, force_document=False,
                     )
                 logger.info(f"[RelayInstance:{self.phone}] 下载缓冲批量发送 ({len(batch)}个, code={code})")
@@ -588,13 +604,27 @@ class RelayInstance:
                     cap = first_caption if j == 0 else None
                     try:
                         await self._client.send_file(
-                            self._up_bot_entity, item["data"],
+                            self._up_bot_entity, item["path"],
                             caption=cap, force_document=False,
                         )
                     except Exception as e2:
                         if _is_ban_error(e2):
                             self.record_ban(str(e2))
                         logger.error(f"[RelayInstance:{self.phone}] 逐个发送也失败 (code={code}): {e2}")
+        # 清理所有临时文件(无论成功失败)
+        self._cleanup_tmp_files(buf)
+
+    @staticmethod
+    def _cleanup_tmp_files(buf: list):
+        """清理临时文件缓冲中的磁盘文件"""
+        import os
+        for item in buf:
+            path = item.get("path")
+            if path:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _detect_media_type(msg) -> str:
@@ -1285,13 +1315,16 @@ class RelayInstance:
             self._pending_cleanup(bot_username)
 
     def _cleanup_code_dicts(self, code: str):
-        """清理与指定 code 关联的所有缓存字典条目，防止内存泄漏。"""
+        """清理与指定 code 关联的所有缓存字典条目，防止内存泄漏和磁盘残留。"""
         if code:
             self._pending_cache_counts.pop(code, None)
             self._pending_cache_events.pop(code, None)
             self._cache_locks.pop(code, None)
             self._event_locks.pop(code, None)
-            self._download_buffers.pop(code, None)
+            # 清理磁盘上的临时文件(异常路径,_flush_download_buffer 未来得及执行)
+            buf = self._download_buffers.pop(code, None)
+            if buf:
+                self._cleanup_tmp_files(buf)
 
     async def _mark_code_mapped(self, code: str):
         """标记码已成功映射到本地缓存，避免重复查询 CRDB。"""
@@ -1402,5 +1435,9 @@ class RelayInstance:
             except Exception as e:
                 logger.debug(f"[RelayInstance:{self.phone}] 等待后台任务结束异常: {e}")
         self._background_tasks.clear()
+        # 清理残留的临时文件(防止服务重启时磁盘泄漏)
+        for code, buf in list(self._download_buffers.items()):
+            self._cleanup_tmp_files(buf)
+        self._download_buffers.clear()
         if self._client:
             await self._client.disconnect()
