@@ -60,6 +60,18 @@ _bot = None
 _external_mgid_map: dict[str, str] = {}
 
 
+def _decode_external_code(code_part: str) -> str:
+    """解码 external_code，支持 hex 编码（H:前缀）和原始格式（向后兼容）。
+    emoji 码在 Telethon→Bot API 传输中会变成 NULL 字符，用 hex 编码规避。"""
+    code_part = code_part.strip()
+    if code_part.startswith("H:"):
+        try:
+            return bytes.fromhex(code_part[2:]).decode('utf-8')
+        except (ValueError, UnicodeDecodeError):
+            return code_part[2:]
+    return code_part
+
+
 def _extract_file_unique_id(msg) -> str:
     """从 PTB Message 对象提取 file_unique_id(跨 bot 稳定去重键)。"""
     if not msg:
@@ -734,7 +746,7 @@ async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             first_line = rest.split("\n", 1)[0]
             user_end = first_line.find(":")
             if user_end != -1:
-                _external_mgid_map[mgid] = first_line[user_end + 1:].strip()
+                _external_mgid_map[mgid] = _decode_external_code(first_line[user_end + 1:])
         await _handle_external_relay_file(update, context)
         return
     if mgid and mgid in _external_mgid_map:
@@ -1416,7 +1428,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
             external_user_id = int(first_line[:user_end])
         except ValueError:
             return
-        external_code = first_line[user_end + 1:].strip()
+        external_code = _decode_external_code(first_line[user_end + 1:])
         orig_caption = orig_caption.strip()
 
     caption_src_msg_id = update.message.message_id if orig_caption else None

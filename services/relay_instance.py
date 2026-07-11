@@ -485,11 +485,13 @@ class RelayInstance:
             await self._decrement_cache_counter(code)
             return
         # 保留第三方 Bot 的原始 caption（文本消息内容），使最终投递到用户时样式与第三方返回一致
+        # code 用 hex 编码，避免 emoji 在 Telethon→Bot API 传输中变成 NULL 字符
         orig_caption = (getattr(msg, "message", "") or "").strip()
+        _code_hex = code.encode('utf-8').hex()
         if orig_caption:
-            caption = f"EXTERNAL_RELAY:{user_id}:{code}\n{orig_caption}"
+            caption = f"EXTERNAL_RELAY:{user_id}:H:{_code_hex}\n{orig_caption}"
         else:
-            caption = f"EXTERNAL_RELAY:{user_id}:{code}"
+            caption = f"EXTERNAL_RELAY:{user_id}:H:{_code_hex}"
         try:
             if self._up_bot_entity:
                 # 优先用 InputMedia 引用原文件发送(相当于复制,非转发)
@@ -770,7 +772,9 @@ class RelayInstance:
         if not media_list:
             return
         # 第一条消息承载路由前缀 + 原始 caption，其余消息无 caption（保持相册单 caption 展示）
-        first_caption = f"EXTERNAL_RELAY:{user_id}:{code}\n{orig_caption}" if orig_caption else f"EXTERNAL_RELAY:{user_id}:{code}"
+        # code 用 hex 编码，避免 emoji 在 Telethon→Bot API 传输中变成 NULL 字符
+        _code_hex = code.encode('utf-8').hex()
+        first_caption = f"EXTERNAL_RELAY:{user_id}:H:{_code_hex}\n{orig_caption}" if orig_caption else f"EXTERNAL_RELAY:{user_id}:H:{_code_hex}"
         # 递增 pending 计数器
         for _ in valid_events:
             if code:
