@@ -85,15 +85,27 @@ async def _dequeue_external(bot_username: str) -> tuple[int, str]:
 
 async def _cleanup_stale_pending():
     now = time.time()
+    stale_entries = []
     async with _ext_lock:
         stale = []
         for bot, q in _pending_external.items():
             while q and now - q[0][2] >= _PENDING_TTL:
-                q.popleft()
+                stale_entries.append(q.popleft())
             if not q:
                 stale.append(bot)
         for bot in stale:
             del _pending_external[bot]
+    # 超时的 pending 条目退款: 用户已扣配额但中继未能在 TTL 内完成投递
+    if stale_entries:
+        from services.permission import refund_user_quota
+        for entry in stale_entries:
+            if entry and len(entry) >= 2:
+                uid, code = entry[0], entry[1]
+                try:
+                    await refund_user_quota(uid, is_external=True)
+                    logger.info(f"[Idx][external] pending TTL 超时退款: user={uid}, code={code}")
+                except Exception as e:
+                    logger.warning(f"[Idx][external] pending TTL 超时退款失败: user={uid}, code={code}, err={e}")
 
 
 async def _relay_pending_cleanup(bot_username: str):
@@ -299,6 +311,9 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
 
     if is_error:
         logger.info(f"[Idx] 外部机器人返回错 code={code}")
+        # 退款: 中继成功发送但第三方解码失败,用户没收到文件,不应扣配额
+        from services.permission import refund_user_quota
+        await refund_user_quota(target_user_id, is_external=True)
         await safe_send_message(context.bot, chat_id=target_user_id, text="外部文件码查询失败，该码可能已失效或暂时不可用，请稍后重试。")
         return
 
@@ -1245,15 +1260,22 @@ async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = f"📋 我的文件码（共 {total_rows} 个，显示 {skip + 1}-{min(skip + _PAGE_SIZE, total_rows)}）"
     page_info = f"\n\n共 {total_pages} 页，当前第 {page} 页"
 
-    # 构建内联键盘
+    # 构建内联键盘: 每个文件码一行管理按钮
     kb = []
+    for i, row in enumerate(rows, 1):
+        code = row.get("code", "")
+        kb.append([InlineKeyboardButton(f"⚙️ {code}", callback_data=f"mycode:detail|{code}")])
+    # 分页按钮
+    page_row = []
     if page > 1:
-        kb.append(InlineKeyboardButton("⬅ 上一页", callback_data=f"mycode:page|{page - 1}"))
+        page_row.append(InlineKeyboardButton("⬅ 上一页", callback_data=f"mycode:page|{page - 1}"))
     if page < total_pages:
-        kb.append(InlineKeyboardButton("下一页 ➡", callback_data=f"mycode:page|{page + 1}"))
+        page_row.append(InlineKeyboardButton("下一页 ➡", callback_data=f"mycode:page|{page + 1}"))
+    if page_row:
+        kb.append(page_row)
 
     reply = header + "\n\n" + "\n\n".join(items) + page_info
-    keyboard = InlineKeyboardMarkup([kb]) if kb else None
+    keyboard = InlineKeyboardMarkup(kb) if kb else None
 
     await update.message.reply_text(reply, reply_markup=keyboard)
 
@@ -2193,6 +2215,12 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                 return
         except Exception as e:
             logger.warning(f"[Idx][external] 检查 mapped_codes 失败: {e}")
+            # 异常路径也要回滚配额(此分支不会继续走到下面的直接发送)
+            if result.quota_consumed:
+                from services.permission import refund_user_quota
+                await refund_user_quota(user_id, is_external=True)
+            await safe_reply_text(update.message, "外部码解码失败，请稍后重试")
+            return
 
         # 中继发送失败,继续回退到直接发送;配额暂不回滚(后续路径可能成功)
 
