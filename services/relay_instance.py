@@ -1213,14 +1213,12 @@ class RelayInstance:
                                 "target_button_text": getattr(btn, "text", None) or "",
                                 "reason": f"检测到继续发送按钮: {btn_text}",
                                 "wait_seconds": None}
-            # 1. 优先查找"下一页"按钮（跳过已点击过的位置，防止死循环）
+            # 1. 查找"下一页"按钮(可重复点击,每次加载新页面,不跳过已点击位置)
+            # 防死循环靠 stale_clicks >= 3 机制(连续3次翻页无新文件则终止)
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
                     btn_text = (getattr(btn, "text", None) or "").lower().strip()
                     if any(kw in btn_text for kw in _NEXT_KW):
-                        if (row_idx, col_idx) in clicked:
-                            # 此位置的"下一页"已点击过，可能是翻回的旧页面，不再重复点击
-                            continue
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": col_idx,
                                 "target_button_text": getattr(btn, "text", None) or "",
