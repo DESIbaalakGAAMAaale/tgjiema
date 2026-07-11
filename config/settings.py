@@ -66,6 +66,10 @@ class Settings(BaseSettings):
     RELAY_API_ID: int = 0
     RELAY_API_HASH: str = ""
 
+    # ─── P1-9: 允许的外部解码器 bot 白名单(逗号分隔的用户名,不带@) ───
+    # 为空时允许所有 bot(fail-open,兼容现有部署);配置后仅允许白名单内 bot
+    ALLOWED_DECODER_BOTS: str = ""
+
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""
     R2_SECRET_ACCESS_KEY: str = ""

@@ -514,73 +514,98 @@ async def _sync_local_tables_loop():
 
         try:
             failed_count = 0  # 记录同步失败数,有失败则不推进水位
+            # P1-4: 对每张表分页循环拉取,直到取空再推进水位,
+            # 避免 120s 内变更 > limit 时剩余记录被永久跳过。
+
             # 1. file_records 增量
             fr_col = get_file_records_col()
-            new_fr = await fr_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
-            for r in new_fr:
-                try:
-                    await store.upsert_file_record_local(r, mark_dirty=False, _batch=True)
-                    total += 1
-                except Exception as e:
-                    failed_count += 1
-                    if "database is locked" not in str(e):
-                        logger.warning(f"[Sync] file_records 单条失败 (code={r.get('file_code')}): {e}")
-            if new_fr:
-                logger.debug(f"[Sync] file_records 增量: {len(new_fr)} 条, 失败 {failed_count} 条")
+            fr_total_synced = 0
+            while True:
+                new_fr = await fr_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
+                if not new_fr:
+                    break
+                for r in new_fr:
+                    try:
+                        await store.upsert_file_record_local(r, mark_dirty=False, _batch=True)
+                        total += 1
+                        fr_total_synced += 1
+                    except Exception as e:
+                        failed_count += 1
+                        if "database is locked" not in str(e):
+                            logger.warning(f"[Sync] file_records 单条失败 (code={r.get('file_code')}): {e}")
+                if len(new_fr) < 200:
+                    break  # 不足 limit 说明已无更多记录
+            if fr_total_synced:
+                logger.debug(f"[Sync] file_records 增量: {fr_total_synced} 条")
 
             # 2. codes 增量
             codes_col = get_codes_col()
-            new_codes = await codes_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
-            code_failed = 0
-            for r in new_codes:
-                try:
-                    await store.upsert_code_local(r, mark_dirty=False, _batch=True)
-                    total += 1
-                except Exception as e:
-                    code_failed += 1
-                    failed_count += 1
-                    if "database is locked" not in str(e):
-                        logger.warning(f"[Sync] codes 单条失败 (code={r.get('code')}): {e}")
-            if new_codes:
-                logger.debug(f"[Sync] codes 增量: {len(new_codes)} 条, 失败 {code_failed} 条")
+            code_total_synced = 0
+            while True:
+                new_codes = await codes_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=200)
+                if not new_codes:
+                    break
+                for r in new_codes:
+                    try:
+                        await store.upsert_code_local(r, mark_dirty=False, _batch=True)
+                        total += 1
+                        code_total_synced += 1
+                    except Exception as e:
+                        failed_count += 1
+                        if "database is locked" not in str(e):
+                            logger.warning(f"[Sync] codes 单条失败 (code={r.get('code')}): {e}")
+                if len(new_codes) < 200:
+                    break
+            if code_total_synced:
+                logger.debug(f"[Sync] codes 增量: {code_total_synced} 条")
 
             # 3. users 增量
             users_col = get_users_col()
-            new_users = await users_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=100)
-            user_failed = 0
-            for r in new_users:
-                try:
-                    await store.upsert_user_local(r, mark_dirty=False, _batch=True)
-                    total += 1
-                except Exception as e:
-                    user_failed += 1
-                    failed_count += 1
-                    if "database is locked" not in str(e):
-                        logger.warning(f"[Sync] users 单条失败 (user_id={r.get('user_id')}): {e}")
-            if new_users:
-                logger.debug(f"[Sync] users 增量: {len(new_users)} 条, 失败 {user_failed} 条")
+            user_total_synced = 0
+            while True:
+                new_users = await users_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=100)
+                if not new_users:
+                    break
+                for r in new_users:
+                    try:
+                        await store.upsert_user_local(r, mark_dirty=False, _batch=True)
+                        total += 1
+                        user_total_synced += 1
+                    except Exception as e:
+                        failed_count += 1
+                        if "database is locked" not in str(e):
+                            logger.warning(f"[Sync] users 单条失败 (user_id={r.get('user_id')}): {e}")
+                if len(new_users) < 100:
+                    break
+            if user_total_synced:
+                logger.debug(f"[Sync] users 增量: {user_total_synced} 条")
 
             # 4. external_code_mapping 增量
             ec_col = get_external_code_mapping_col()
-            new_ec = await ec_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=50)
-            ec_failed = 0
-            for r in new_ec:
-                try:
-                    await store._db.execute(
-                        "INSERT OR REPLACE INTO external_code_mapping_local "
-                        "(external_code, system_code, bot_username, created_at, updated_at, crdb_synced) "
-                        "VALUES (?, ?, ?, ?, ?, 1)",
-                        (r["external_code"], r.get("system_code", ""),
-                         r.get("bot_username"), r.get("created_at"), r.get("updated_at")),
-                    )
-                    total += 1
-                except Exception as e:
-                    ec_failed += 1
-                    failed_count += 1
-                    if "database is locked" not in str(e):
-                        logger.warning(f"[Sync] external_code_mapping 单条失败: {e}")
-            if new_ec:
-                logger.debug(f"[Sync] external_code_mapping 增量: {len(new_ec)} 条, 失败 {ec_failed} 条")
+            ec_total_synced = 0
+            while True:
+                new_ec = await ec_col.find({"updated_at": {"$gt": last_sync_iso}}, limit=50)
+                if not new_ec:
+                    break
+                for r in new_ec:
+                    try:
+                        await store._db.execute(
+                            "INSERT OR REPLACE INTO external_code_mapping_local "
+                            "(external_code, system_code, bot_username, created_at, updated_at, crdb_synced) "
+                            "VALUES (?, ?, ?, ?, ?, 1)",
+                            (r["external_code"], r.get("system_code", ""),
+                             r.get("bot_username"), r.get("created_at"), r.get("updated_at")),
+                        )
+                        total += 1
+                        ec_total_synced += 1
+                    except Exception as e:
+                        failed_count += 1
+                        if "database is locked" not in str(e):
+                            logger.warning(f"[Sync] external_code_mapping 单条失败: {e}")
+                if len(new_ec) < 50:
+                    break
+            if ec_total_synced:
+                logger.debug(f"[Sync] external_code_mapping 增量: {ec_total_synced} 条")
 
             # 批量 commit:将 N 次单独 commit 合并为 1 次,大幅减少 SQLite 锁冲突
             if total > 0:

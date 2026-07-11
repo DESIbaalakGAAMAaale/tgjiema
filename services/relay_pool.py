@@ -149,7 +149,7 @@ class RelayPool:
             # avg_wait_ms 越小越好 -> 归一化后取倒数
             avg_wait = max(usage["avg_wait_ms"], 1)
             today_req = max(usage["today_requests"], 1)
-            # last_request_gap 越大越好 -> 用倒数
+            # last_request_gap 越大越好 -> 归一化封顶到 [0,1]
             last_req = usage["last_request_at"]
             if last_req:
                 try:
@@ -162,12 +162,15 @@ class RelayPool:
                 except (ValueError, TypeError):
                     gap_seconds = 1
             else:
-                gap_seconds = norm_gap * 2  # 从未请求过，给最高冷却分
-            # 加权评分：越低越好
+                gap_seconds = norm_gap  # 从未请求过,给满分(归一化后=1)
+            # P1-6: gap 项改归一化封顶形式 min(gap,norm)/norm,使其与另两项同处 [0,1] 量级,
+            # 避免 norm_gap/gap_seconds 倒数量纲淹没 avg_wait/today_req 权重。
+            gap_norm = min(gap_seconds, norm_gap) / norm_gap
+            # 加权评分：越低越好(三项都归一化到 [0,1] 量级)
             score = (
-                (avg_wait / norm_avg_wait) * w_avg +
-                (today_req / norm_today_req) * w_today +
-                (norm_gap / max(gap_seconds, 1)) * w_gap
+                min(avg_wait / norm_avg_wait, 1.0) * w_avg +
+                min(today_req / norm_today_req, 1.0) * w_today +
+                gap_norm * w_gap
             )
             scores.append((score, instance))
         # 按 score 升序排列，选最低的

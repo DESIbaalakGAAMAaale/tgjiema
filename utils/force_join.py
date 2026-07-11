@@ -33,7 +33,14 @@ async def check_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     channel_id = settings.FORCE_JOIN_CHANNEL_ID
     if not channel_id:
-        return True
+        # P1-11: 配置缺失时不再静默放行(fail-open)。
+        # 默认 fail-closed 拒绝,仅在运维显式开启 FORCE_JOIN_FAIL_OPEN 时放行,
+        # 避免配置丢失/拼写错导致加群门槛被静默关闭。
+        if _fail_open_enabled():
+            logger.warning("强制加群:FORCE_JOIN_CHANNEL_ID 未配置,运维放行开关已开启,临时放行")
+            return True
+        logger.error("强制加群:FORCE_JOIN_CHANNEL_ID 未配置,默认拒绝放行(安全默认)。如需关闭加群限制,请设置 FORCE_JOIN_FAIL_OPEN=true")
+        return False
 
     user = update.effective_user
     if not user:

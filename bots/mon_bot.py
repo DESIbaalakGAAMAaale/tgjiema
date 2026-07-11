@@ -417,6 +417,23 @@ class MonBot:
                 "file_count": 0, "last_synced_msg_id": 0,
                 "rotation_started_at": now_iso,
             })
+            # P2: 修正环形链表前驱指针:找到 next_active_chat_id 指向旧 channel_id 的槽位,
+            # 更新为新的 spare_ch,避免 delivery_resolver 沿旧指针投到已封禁频道
+            try:
+                all_cells = await store.get_all_cells_local()
+                for prev_cell in all_cells:
+                    if prev_cell.get("next_active_chat_id") == channel_id:
+                        prev_slot_id = prev_cell["slot_id"]
+                        await store.update_cell_fields_local(prev_slot_id, {
+                            "next_active_chat_id": spare_ch,
+                        }, mark_dirty=True)
+                        self._update_cell_in_cache(prev_slot_id, {
+                            "next_active_chat_id": spare_ch,
+                        })
+                        logger.info(f"[Mon][Ban] 环指针修正: {prev_slot_id}.next_active_chat_id {channel_id} → {spare_ch}")
+                        break
+            except Exception as ring_err:
+                logger.warning(f"[Mon][Ban] 环指针修正失败(非致命,下次轮转会重建): {ring_err}")
             await log_rotate(
                 from_slot_id=slot_id, to_slot_id=slot_id,
                 from_status=status, to_status=new_status,

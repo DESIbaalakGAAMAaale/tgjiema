@@ -280,11 +280,15 @@ def _get_client_ip(request: Request) -> str:
     if peer_host and _is_trusted_proxy(peer_host):
         forwarded = request.headers.get("X-Forwarded-For", "")
         if forwarded:
-            # X-Forwarded-For 格式: "client, proxy1, proxy2"，取第一个（真实客户端）
-            # 注意：可信代理设置的 XFF 中，最左侧是真实客户端 IP
-            client_ip = forwarded.split(",")[0].strip()
-            if client_ip:
-                return client_ip
+            # P1-10: X-Forwarded-For 格式: "client, proxy1, proxy2"
+            # Caddy/Nginx 反向代理会向已有 XFF 追加真实客户端 IP(在最右),
+            # 攻击者自带伪造的 XFF 最左段会保留在头部左侧。
+            # 因此取最右段(可信代理追加的真实客户端),而非最左段(可能被伪造)。
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            if parts:
+                client_ip = parts[-1]
+                if client_ip:
+                    return client_ip
     return peer_host if peer_host else "unknown"
 
 

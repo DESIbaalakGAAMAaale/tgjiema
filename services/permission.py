@@ -318,8 +318,6 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
                         current_count = 0
                 if current_count >= max_requests:
                     return DecodeResult(allowed=False, reason=f"该文件码已达访问次数上限（{max_requests}次）")
-            from database.cache import incr_request_count
-            await incr_request_count(file_code)
         else:
             return DecodeResult(allowed=False, reason="文件码无效")
 
@@ -335,6 +333,11 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
             allowed=False,
             reason="今日解码次数已用完，请明天再试",
         )
+
+    # P2: 配额预扣成功后才递增 request_count,避免被拒用户消耗文件码访问次数
+    if file_record is not None and file_record.get("max_requests", 0) > 0:
+        from database.cache import incr_request_count
+        await incr_request_count(file_code)
 
     remaining = -1 if membership_level == "premium" else max(0, quota - used - 1)
     remaining_ext = -1

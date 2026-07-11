@@ -297,10 +297,12 @@ async def _get_upload_target_channel() -> int:
         logger.error("[Up] 无可用活跃槽位，无法处理上传请求")
         raise RuntimeError("无可用活跃槽位，请检查拓扑配置")
     # 轮转:每次取下一个活跃频道
+    # P1-7: 在锁内同时完成取列表引用+取模+读 channel_id,
+    # 避免 _refresh_active_slots 替换列表后 idx 越界。
     async with _pending_lock:
         idx = _active_slot_index % len(_active_a_slots)
         _active_slot_index += 1
-    channel_id = _active_a_slots[idx]["channel_id"]
+        channel_id = _active_a_slots[idx]["channel_id"]
     logger.debug(f"[Up] 轮转分发 频道 {channel_id} (index={idx}/{len(_active_a_slots)})")
     return channel_id
 
@@ -864,6 +866,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    # P2: 媒体组上传同样需要限速,防止数十文件洪泛
+    if not await global_rate_limiter.acquire():
+        await update.message.reply_text("系统繁忙，请稍后重试")
+        return
+    if not await user_rate_limiter.acquire(user.id):
+        await update.message.reply_text("操作过于频繁，请稍后重试")
+        return
     if not await check_upload_permission(user.id):
         await update.message.reply_text("您没有上传权限")
         return

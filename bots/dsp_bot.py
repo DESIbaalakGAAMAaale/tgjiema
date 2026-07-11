@@ -52,6 +52,10 @@ _pagination_states: dict[str, dict] = {}
 _pg_lock = asyncio.Lock()
 _PAGE_STATE_TTL = 300  # 5 分钟过期清理
 
+# P1-2: 已成功投递的 msg_id 跟踪,避免重试时重复投递
+# job_id -> set(storage_msg_id),job 完成或死信时清理
+_sent_msg_tracker: dict[int, set[int]] = {}
+
 
 async def _cleanup_page_states():
     """定期清理过期的分页状态"""
@@ -380,6 +384,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
     """发送单个 job（由 worker 并发调用，内部处理 semaphore/限速/失败）"""
     # 死信检查
     if job.retry_count >= 3:
+        _sent_msg_tracker.pop(job.job_id, None)
         await store.update_local_job_status(job.job_id, "dead", dead_reason=f"重试次数已达上限({job.retry_count})")
         logger.warning(f"[Dsp-{worker_id}] 死信标记: job={job.job_id}, code={job.code}, retry={job.retry_count}")
         return False
@@ -393,11 +398,37 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
     # 动态限速
     await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
 
+    # P1-2: 过滤已成功投递的 msg_id,避免重试时重复投递
+    sent_set = _sent_msg_tracker.setdefault(job.job_id, set())
+    original_ids = list(job.storage_msg_ids)
+    if sent_set:
+        job.storage_msg_ids = [mid for mid in job.storage_msg_ids if mid not in sent_set]
+        if not job.storage_msg_ids:
+            # 所有 msg_id 已成功投递,标记完成
+            logger.info(f"[Dsp-{worker_id}] job={job.job_id} 所有文件已投递,跳过重试")
+            _sent_msg_tracker.pop(job.job_id, None)
+            await store.update_local_job_status(job.job_id, "done")
+            await _send_report_button(bot, job.target_user_id, job.code)
+            return True
+        logger.info(f"[Dsp-{worker_id}] job={job.job_id} 跳过已投递 {len(original_ids) - len(job.storage_msg_ids)}/{len(original_ids)} 个,剩余 {len(job.storage_msg_ids)} 个")
+
     # 等待 semaphore
     try:
         await asyncio.wait_for(_send_semaphore.acquire(), timeout=10.0)
     except asyncio.TimeoutError:
-        logger.warning("[Dsp] 信号量获取超时，跳过本次发送")
+        # P2: 信号量超时后显式重试入队,避免 job 滞留 dispatched 最多 600s
+        logger.warning(f"[Dsp-{worker_id}] 信号量获取超时,重试入队: job={job.job_id}")
+        new_retry = job.retry_count + 1
+        if new_retry >= 3:
+            _sent_msg_tracker.pop(job.job_id, None)
+            await store.update_local_job_status(job.job_id, "dead", dead_reason=f"信号量获取超时,已重试{job.retry_count}次")
+        else:
+            await store.retry_local_job(job.job_id, new_retry)
+            try:
+                from utils.redis_client import xadd_job
+                await xadd_job(job.job_id)
+            except Exception:
+                pass
         return False
 
     send_ok = False
@@ -418,6 +449,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
                 )
                 send_ok = False
                 raise
+            _sent_msg_tracker.pop(job.job_id, None)
             await _send_report_button(bot, job.target_user_id, job.code)
     except Exception as e:
         logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
@@ -427,6 +459,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
     if not send_ok:
         new_retry = job.retry_count + 1
         if new_retry >= 3:
+            _sent_msg_tracker.pop(job.job_id, None)
             await store.update_local_job_status(job.job_id, "dead", dead_reason=f"发送失败,已重试{job.retry_count}次: {job.code}")
         else:
             await store.retry_local_job(job.job_id, new_retry)
@@ -591,6 +624,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
 
     if sent_msg_id:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
+        _sent_msg_tracker.setdefault(job.job_id, set()).add(msg_id)
         # 第三方 Bot 原始 caption 需原样保留，不覆盖为标准模板
         if not await _should_preserve_caption(job.code):
             caption = await _build_delivery_caption(job.code, total_count=1)
@@ -656,16 +690,18 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
         storage_msg_ids=job.storage_msg_ids,
         protect_content=getattr(job, "protect_content", False),
         bot_id=bot_id,
+        job_id=job.job_id,
     )
     return result
 
 
 async def _fallback_single_send(bot, job, bot_id: int = 1):
     """兜底逐个发送（媒体组发送失败时使用）。
-    
+
     注意：调用方 _send_one_job 已持有 _send_semaphore，此处不再获取，
     避免双重获取导致低并发时死锁。消息逐个发送本身已串行，无需额外限流。
     S-4: 返回值反映实际发送结果，不再恒为 True。
+    P1-2: 成功投递的 msg_id 记入 _sent_msg_tracker,重试时跳过。
     """
     protect_content = getattr(job, "protect_content", False)
     all_success = True
@@ -675,6 +711,7 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
             resolved = await resolve_delivery_channel(job.storage_channel_id)
             sent_mid = await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
             if sent_mid:
+                _sent_msg_tracker.setdefault(job.job_id, set()).add(mid)
                 await metrics.record_send_success()
                 if first_sent_mid is None:
                     first_sent_mid = sent_mid
@@ -696,7 +733,7 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     return all_success
 
 
-async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None, storage_msg_ids=None, protect_content=False, bot_id=1) -> bool:
+async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None, storage_msg_ids=None, protect_content=False, bot_id=1, job_id: int | None = None) -> bool:
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
 
@@ -725,6 +762,10 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
 
         if batch_copied_ids:
             logger.info(f"[Dsp] 分页发送成功(批量相册): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(page_msg_ids)}个文件)")
+            # P1-2: 记录已成功投递的 msg_id(仅 job 调用路径)
+            if job_id is not None:
+                for mid in page_msg_ids:
+                    _sent_msg_tracker.setdefault(job_id, set()).add(mid)
             first_sent_msg_id = batch_copied_ids[0]
             await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
@@ -740,6 +781,9 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                     sent_mid = await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id)
                     if sent_mid:
                         success_count += 1
+                        # P1-2: 记录已成功投递的 msg_id(仅 job 调用路径)
+                        if job_id is not None:
+                            _sent_msg_tracker.setdefault(job_id, set()).add(mid)
                         if first_sent_msg_id is None:
                             first_sent_msg_id = sent_mid
                     else:
@@ -999,15 +1043,33 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("无效的页码")
         return
 
+    # P1-3: 翻页前校验文件状态(detached/offline 则拒绝),避免下架文件借分页继续扩散
+    try:
+        record = await get_file_record_cached(file_code)
+        if not record:
+            await query.answer("文件记录不存在", show_alert=True)
+            return
+        status = record.get("status")
+        if status in ("detached", "offline"):
+            await query.answer("该文件已下架，无法继续浏览", show_alert=True)
+            # 清理会话,避免后续翻页继续触发
+            async with _pg_lock:
+                _pagination_states.pop(page_key, None)
+            return
+    except Exception as e:
+        logger.warning(f"[Dsp] 翻页前文件状态校验异常(码={file_code}): {e}")
+
     old_msg_id = state.get("last_pagination_msg_id")
+    # P1-3: 优先用 state 中的原始收件人 chat_id,避免转发后任意点击者触发重投
+    target_chat_id = state.get("chat_id") or query.message.chat_id
     if old_msg_id:
         try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=old_msg_id)
+            await context.bot.delete_message(chat_id=target_chat_id, message_id=old_msg_id)
         except Exception:
             pass
 
     await _send_page(
-        context.bot, query.message.chat_id, file_code,
+        context.bot, target_chat_id, file_code,
         file_meta_list, page=page, total_pages=total_pages,
         storage_channel_id=state.get("storage_channel_id"),
         page_key=page_key,

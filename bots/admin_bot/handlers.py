@@ -1616,6 +1616,7 @@ async def _restore_list_backups(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("\n".join(lines))
 
 
+@_auth_required
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "📖 管理员命令手册\n"

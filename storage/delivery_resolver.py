@@ -208,7 +208,10 @@ async def resolve_backup_msg_id(main_msg_id: int, channel_id: int, original_chan
     当 channel_id 与原始存储频道不同（即从影子频道发送）且映射缺失时，
     返回 None 禁止回退用主频道 msg_id 盲发（可能投错文件）。
     当 channel_id 就是原始频道时，返回 main_msg_id 本身。
+    original_channel_id 默认为 channel_id，避免漏传时静默用主频道 msg_id 盲发影子频道。
     """
+    if original_channel_id is None:
+        original_channel_id = channel_id
     try:
         from database.session import get_message_backups_col
         col = get_message_backups_col()
@@ -226,7 +229,7 @@ async def resolve_backup_msg_id(main_msg_id: int, channel_id: int, original_chan
         pass
 
     # 从影子频道发送但无映射 → 返回 None，禁止盲发
-    if original_channel_id is not None and channel_id != original_channel_id:
+    if channel_id != original_channel_id:
         logger.warning(
             f"[delivery] 影子频道映射缺失 (main_msg_id={main_msg_id}, "
             f"channel={channel_id}, original={original_channel_id})，跳过该频道"
@@ -243,8 +246,10 @@ async def resolve_backup_msg_ids(main_msg_ids: list[int], channel_id: int, origi
     """
     if not main_msg_ids:
         return None
-    # 原频道:msg_id 不变
-    if original_channel_id is None or channel_id == original_channel_id:
+    # 原频道:msg_id 不变(original_channel_id 默认为 channel_id,避免漏传)
+    if original_channel_id is None:
+        original_channel_id = channel_id
+    if channel_id == original_channel_id:
         return list(main_msg_ids)
     try:
         from database.session import get_message_backups_col

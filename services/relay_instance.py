@@ -429,6 +429,19 @@ class RelayInstance:
         """发送外部码解码请求"""
         if not self._client:
             return False
+        # P1-9: 目标解码器 bot 白名单校验,避免被诱导向任意 bot 发消息
+        try:
+            from config import settings
+            allowed = getattr(settings, "ALLOWED_DECODER_BOTS", "")
+            if allowed:
+                allowed_set = {b.strip().lower().lstrip("@") for b in allowed.split(",") if b.strip()}
+                if bot_username.lower().lstrip("@") not in allowed_set:
+                    logger.warning(
+                        f"[RelayInstance:{self.phone}] 拒绝向非白名单 bot 发送: @{bot_username} (user={user_id})"
+                    )
+                    return False
+        except Exception as e:
+            logger.debug(f"[RelayInstance] 白名单校验异常(放行): {e}")
         # B1: 检查 bot 是否被熔断(连续限速超阈值)
         broken, remaining = self._is_circuit_broken(bot_username)
         if broken:

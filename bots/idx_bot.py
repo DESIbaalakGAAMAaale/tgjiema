@@ -185,10 +185,12 @@ async def _get_storage_channel() -> int:
     """获取当前活跃存储频道(从本地缓存, 每60 秒刷新一次)"""
     global _active_channels_index
     if _active_channels_cache:
+        # P1-7: 在锁内同时完成取模+读 channel_id,
+        # 避免 _refresh_active_channels 替换列表后 idx 越界。
         async with _ch_lock:
             idx = _active_channels_index % len(_active_channels_cache)
             _active_channels_index += 1
-        return _active_channels_cache[idx]["channel_id"]
+            return _active_channels_cache[idx]["channel_id"]
     # 缓存未就绪, 回退 DB 查询
     try:
         cells = await get_active_cells_local()

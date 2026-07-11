@@ -36,3 +36,6 @@ test_plan.md
 # 审查报告（本地参考，不推送）
 docs/*审查*.md
 docs/*审查报告*.md
+docs/CODE_REVIEW_REPORT.md
+CODE_REVIEW_REPORT.md
+.workbuddy/
