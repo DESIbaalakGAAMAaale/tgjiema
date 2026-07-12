@@ -905,7 +905,12 @@ class MonBot:
                         all_cells = await self._get_cells()
 
             except Exception as e:
-                logger.error(f"[Mon] 调度异常: {e}")
+                # SQLite WAL 模式下多进程并发写产生 'database is locked' 是正常现象,
+                # 降级为 debug 避免日志刷屏;下一轮会自动重试。
+                if "database is locked" in str(e).lower():
+                    logger.debug(f"[Mon] SQLite 锁冲突(正常,下轮重试): {e}")
+                else:
+                    logger.error(f"[Mon] 调度异常: {e}")
 
             # P1-15:以 stop_event.wait 替代固定 sleep,run_all 触发停止时立即唤醒退出,
             # 避免最多等待一个 RECOVERY_INTERVAL(60s)才响应。超时即正常进入下一轮。

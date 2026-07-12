@@ -731,24 +731,33 @@ class CacheStore:
         now = time.time()
         import datetime as _dt
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        if ok:
-            await self._db.execute(
-                "INSERT INTO heartbeat_local (slot_id, last_ok, fail_streak) VALUES (?, ?, 0) "
-                "ON CONFLICT(slot_id) DO UPDATE SET last_ok = ?, fail_streak = 0",
-                (slot_id, now, now),
-            )
-        else:
-            await self._db.execute(
-                "INSERT INTO heartbeat_local (slot_id, last_ok, fail_streak) VALUES (?, ?, 1) "
-                "ON CONFLICT(slot_id) DO UPDATE SET last_ok = ?, fail_streak = fail_streak + 1",
-                (slot_id, now, now),
-            )
-        await self._db.execute(
-            "UPDATE cells_local SET last_heartbeat = ?, updated_at = ? WHERE slot_id = ?",
-            (now_iso, now, slot_id),
-        )
-        if not _batch:
-            await self._db.commit()
+        for attempt in range(3):
+            try:
+                if ok:
+                    await self._db.execute(
+                        "INSERT INTO heartbeat_local (slot_id, last_ok, fail_streak) VALUES (?, ?, 0) "
+                        "ON CONFLICT(slot_id) DO UPDATE SET last_ok = ?, fail_streak = 0",
+                        (slot_id, now, now),
+                    )
+                else:
+                    await self._db.execute(
+                        "INSERT INTO heartbeat_local (slot_id, last_ok, fail_streak) VALUES (?, ?, 1) "
+                        "ON CONFLICT(slot_id) DO UPDATE SET last_ok = ?, fail_streak = fail_streak + 1",
+                        (slot_id, now, now),
+                    )
+                await self._db.execute(
+                    "UPDATE cells_local SET last_heartbeat = ?, updated_at = ? WHERE slot_id = ?",
+                    (now_iso, now, slot_id),
+                )
+                if not _batch:
+                    await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.2)
+                    continue
+                # 非锁冲突或重试耗尽,静默跳过(心跳下一轮会补上)
+                return
 
     async def commit(self):
         """显式 commit(批量操作后调用)。"""
@@ -2060,11 +2069,19 @@ class CacheStore:
         """写入键值缓存（SQLite，零 CRDB RU）"""
         if not self._db:
             return
-        await self._db.execute(
-            "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
-            (key, value),
-        )
-        await self._db.commit()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.2)
+                    continue
+                return  # 锁冲突静默跳过,KV 缓存下一轮会重新写入
 
     async def cache_get(self, key: str, ttl: float):
         """C2: 读取 TTL 缓存。如果缓存不存在或已过期,返回 None。
