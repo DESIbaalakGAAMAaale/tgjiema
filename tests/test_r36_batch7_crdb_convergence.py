@@ -191,18 +191,15 @@ class TestCrdbSyncService:
             if sleep_count >= 2:
                 raise asyncio.CancelledError()
 
-        # R38 P0-4: _sync_loop 现在每批前调用 _renew_leader_lease()(async,返回 bool)
-        # 还会调用 _close_crdb_only / _acquire_leader_lease 等 R38 新增函数,
-        # 全部 patch 成 no-op 协程,让 _sync_loop 顺利走到 sync_func 调用
-        async def mock_true():
-            return True
-
+        # R39 P1-2: _sync_loop 不再调用 _renew_leader_lease(),
+        # 只读模块级 _lease_valid 标志(由 _leader_renewal_task 唯一更新)。
+        # 测试需 patch _lease_valid=True 让循环进入正常同步分支。
+        # _close_crdb_only / _lazy_connect_crdb 仍需 patch 为 no-op 协程。
         async def mock_noop():
             return None
 
         with patch.object(svc.asyncio, "sleep", mock_sleep), \
-             patch.object(svc, "_renew_leader_lease", mock_true), \
-             patch.object(svc, "_acquire_leader_lease", mock_true), \
+             patch.object(svc, "_lease_valid", True), \
              patch.object(svc, "_close_crdb_only", mock_noop), \
              patch.object(svc, "_lazy_connect_crdb", mock_noop):
             try:
@@ -242,7 +239,11 @@ class TestCrdbSyncService:
             if sleep_count >= 3:
                 raise asyncio.CancelledError()
 
-        with patch.object(svc.asyncio, "sleep", mock_sleep):
+        # R39 P1-2: _sync_loop 只读模块级 _lease_valid 标志,
+        # 需 patch 为 True 才能进入正常同步分支(否则走 lease-invalid 路径,
+        # sleep _LEADER_RENEWAL_INTERVAL=30s 而非 backoff)
+        with patch.object(svc.asyncio, "sleep", mock_sleep), \
+             patch.object(svc, "_lease_valid", True):
             try:
                 await svc._sync_loop("test", mock_sync, mock_get_dirty, None)
             except asyncio.CancelledError:

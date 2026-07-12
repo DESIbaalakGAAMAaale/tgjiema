@@ -21,21 +21,102 @@ app = FastAPI(title="TG解码器管理后台")
 security = HTTPBasic()
 
 
-# ─── 密码哈希支持（PBKDF2-HMAC-SHA256，无需新增依赖）──────────────
-# 哈希格式: $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
-# 若 ADMIN_PASSWORD 以此前缀开头，按哈希校验；否则按明文常量时间比较（向后兼容）
+# ─── R39 P2-8: CSP nonce + 点击劫持防护 ──────────────────────────
+# 通过中间件为每个 HTML 响应注入 Content-Security-Policy 头,
+# 使用 per-request nonce 防止 inline script 注入(防 XSS)。
+# 同时设置 X-Frame-Options: DENY 与 frame-ancestors 'none' 防止点击劫持。
+@app.middleware("http")
+async def _csp_and_clickjacking_middleware(request: Request, call_next):
+    """R39 P2-8: 为每个响应添加安全头。
+
+    - Content-Security-Policy: per-request nonce + frame-ancestors 'none'
+    - X-Frame-Options: DENY (兼容旧浏览器)
+    - X-Content-Type-Options: nosniff (防 MIME 嗅探)
+    - Referrer-Policy: strict-origin-when-cross-origin
+    """
+    import secrets as _secrets_mod
+    # R39 P2-8: 生成 per-request CSP nonce (16 字节 base64)
+    csp_nonce = _secrets_mod.token_urlsafe(16)
+    # 将 nonce 放入 request.state 供模板使用
+    request.state.csp_nonce = csp_nonce
+
+    response = await call_next(request)
+
+    # R39 P2-8: CSP 头 — 只允许 nonce 匹配的 inline script/style
+    # frame-ancestors 'none' 防止被 iframe 嵌入(点击劫持)
+    csp_header = (
+        "default-src 'self'; "
+        f"script-src 'self' 'nonce-{csp_nonce}'; "
+        f"style-src 'self' 'nonce-{csp_nonce}'; "
+        "img-src 'self' data:; "
+        "font-src 'self'; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'"
+    )
+    response.headers["Content-Security-Policy"] = csp_header
+    # R39 P2-8: X-Frame-Options 兜底(旧浏览器不支持 CSP frame-ancestors)
+    response.headers["X-Frame-Options"] = "DENY"
+    # R39 P2-8: 防 MIME 嗅探
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # R39 P2-8: Referrer 仅在同源时发送完整 URL
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+
+# ─── 密码哈希支持（R39 P1-12: 强制哈希格式，移除明文兼容）──────────────
+# 哈希格式（按优先级）:
+#   1. Argon2id:   $argon2id$v=<ver>$m=<mem>,t=<iter>,p=<par>$<salt_b64>$<hash_b64>  (需 argon2-cffi)
+#   2. PBKDF2:     $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
+# 明文密码已被 R39 P1-12 移除，启动时若 ADMIN_PASSWORD 不以哈希前缀开头，
+# 将拒绝登录并打印强制告警，要求运维重新生成哈希。
 _PBKDF2_PREFIX = "$pbkdf2-sha256$"
+_ARGON2ID_PREFIX = "$argon2id$"
 _PBKDF2_ITERATIONS = 200_000  # OWASP 2023 推荐 ≥ 600k，平衡部署机器性能取 200k
+
+# R39 P1-12: 尝试导入 argon2-cffi（可选，未安装时降级到 PBKDF2-only）
+try:
+    from argon2 import PasswordHasher as _Argon2Hasher
+    from argon2.exceptions import VerifyMismatchError as _Argon2Mismatch
+    _argon2_hasher = _Argon2Hasher(
+        time_cost=3, memory_cost=65536, parallelism=4,  # OWASP 2023 推荐
+        hash_len=32, salt_len=16,
+    )
+    _ARGON2_AVAILABLE = True
+except ImportError:
+    _argon2_hasher = None
+    _Argon2Mismatch = Exception
+    _ARGON2_AVAILABLE = False
+
+
+def _is_hashed_password(stored: str) -> bool:
+    """R39 P1-12: 判断密码是否为受支持的哈希格式。"""
+    if not stored:
+        return False
+    return stored.startswith(_PBKDF2_PREFIX) or stored.startswith(_ARGON2ID_PREFIX)
 
 
 def _verify_password(plaintext: str, stored: str) -> bool:
-    """校验密码。支持明文（向后兼容）和 PBKDF2 哈希格式。
+    """R39 P1-12: 校验密码（仅接受哈希格式，明文一律拒绝）。
 
-    - 哈希格式: $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
-    - 明文格式: 直接常量时间比较
+    支持格式（按优先级）:
+    - Argon2id:   $argon2id$v=19$m=...,t=...,p=...$<salt_b64>$<hash_b64>
+    - PBKDF2:     $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
+
+    明文密码不再被接受，调用方应在启动时通过 _warn_if_plaintext_password() 提示。
     """
-    if not stored:
+    if not stored or not plaintext:
         return False
+    # R39 P1-12: Argon2id 优先（若 argon2-cffi 已安装）
+    if _ARGON2_AVAILABLE and stored.startswith(_ARGON2ID_PREFIX):
+        try:
+            return _argon2_hasher.verify(stored, plaintext)
+        except _Argon2Mismatch:
+            return False
+        except Exception:
+            return False
+    # R39 P1-12: PBKDF2 哈希校验
     if stored.startswith(_PBKDF2_PREFIX):
         try:
             parts = stored.split("$")
@@ -52,18 +133,56 @@ def _verify_password(plaintext: str, stored: str) -> bool:
             return _hmac.compare_digest(actual_hash, expected_hash)
         except (ValueError, TypeError):
             return False
-    # 明文模式：常量时间比较
-    return secrets.compare_digest(plaintext.encode("utf-8"), stored.encode("utf-8"))
+    # R39 P1-12: 明文密码一律拒绝（不再向后兼容）
+    return False
+
+
+# R39 P1-12: 启动时检测明文密码，仅告警一次（避免日志爆炸）
+_plaintext_password_warned = False
+
+
+def _warn_if_plaintext_password() -> None:
+    """R39 P1-12: 启动时若 ADMIN_PASSWORD 为明文，打印强制告警并标记。
+
+    明文密码将被 _verify_password 拒绝，所有登录都会失败。
+    运维需使用 generate_password_hash() 生成哈希值写入 .env。
+    """
+    global _plaintext_password_warned
+    if _plaintext_password_warned:
+        return
+    pwd = getattr(settings, "ADMIN_PASSWORD", "") or ""
+    if pwd and not _is_hashed_password(pwd):
+        _plaintext_password_warned = True
+        try:
+            from loguru import logger
+            logger.error(
+                "[Admin] R39 P1-12: ADMIN_PASSWORD 为明文格式，已被禁用！"
+                "请使用以下命令生成哈希后写入 .env:\n"
+                "  python -c \"from admin import generate_password_hash; "
+                "print(generate_password_hash('YOUR_PASSWORD'))\"\n"
+                "在修复前所有登录尝试将返回 401。"
+            )
+        except Exception:
+            pass
 
 
 def generate_password_hash(password: str, iterations: int = _PBKDF2_ITERATIONS) -> str:
-    """生成 PBKDF2 哈希密码。可在外部脚本中调用以生成 .env 中的 ADMIN_PASSWORD 值。
+    """R39 P1-12: 生成哈希密码（优先 Argon2id，降级 PBKDF2）。
+
+    - 若已安装 argon2-cffi，生成 Argon2id 哈希（推荐，抗 GPU/ASIC 攻击）
+    - 否则生成 PBKDF2-HMAC-SHA256 哈希（无需额外依赖）
+
+    可在外部脚本中调用以生成 .env 中的 ADMIN_PASSWORD 值。
 
     用法:
         python -c "from admin import generate_password_hash; print(generate_password_hash('YOUR_PASSWORD'))"
     """
     if not password:
         raise ValueError("密码不能为空")
+    # R39 P1-12: 优先 Argon2id
+    if _ARGON2_AVAILABLE:
+        return _argon2_hasher.hash(password)
+    # 降级 PBKDF2
     salt = secrets.token_bytes(16)
     hash_bytes = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
     return f"{_PBKDF2_PREFIX}{iterations}${salt.hex()}${hash_bytes.hex()}"
@@ -91,6 +210,8 @@ def _is_trusted_proxy(peer_host: str) -> bool:
 @app.on_event("startup")
 async def startup():
     """启动时初始化数据库连接并从 SQLite 恢复 CSRF token 和登录失败计数。"""
+    # R39 P1-12: 启动时检测明文密码并告警
+    _warn_if_plaintext_password()
     try:
         from database import init_db
         await init_db()
@@ -334,7 +455,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
         credentials.username.encode("utf8"),
         settings.ADMIN_USERNAME.encode("utf8"),
     )
-    # 密码：支持 PBKDF2 哈希格式与明文（向后兼容）
+    # R39 P1-12: 密码强制哈希格式（Argon2id 或 PBKDF2），明文一律拒绝
     correct_password = _verify_password(credentials.password, settings.ADMIN_PASSWORD)
     if not (correct_username and correct_password):
         # 记录失败
@@ -609,13 +730,27 @@ async def delete_file(
     if not _verify_csrf(request, csrf_token, username=admin):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
+    # R39 P1-5: 使用 tombstone 软删除 — 同时设置 deleted_at + status='deleted',
+    # 并通过 cache_store.soft_delete 写入 dirty_outbox tombstone(供 crdb_sync 同步到 CRDB)
+    import datetime as _dt
+    deleted_at = _dt.datetime.now().isoformat()
     files_col = get_file_records_col()
     result = await files_col.update_one(
         {"file_code": file_code},
-        {"$set": {"status": "deleted"}},
+        {"$set": {"status": "deleted", "deleted_at": deleted_at}},
     )
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="文件不存在")
+    # R39 P1-5: 写本地 SQLite tombstone + dirty_outbox(保证 CRDB 同步删除事件)
+    try:
+        from database.cache_store import get_cache_store
+        await get_cache_store().soft_delete("file_records", file_code, deleted_at)
+    except Exception as e:
+        # CRDB 已更新,本地 tombstone 失败仅记录(下次 crdb_sync 会通过 status='deleted' 补偿)
+        import logging as _logging
+        _logging.getLogger("admin").warning(
+            f"R39 P1-5: soft_delete 本地 tombstone 失败(已更新 CRDB): {e}"
+        )
     response = RedirectResponse(url="/files", status_code=303)
     response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
     return response

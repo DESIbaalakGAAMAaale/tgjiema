@@ -574,20 +574,67 @@ async def _run_backup_loop():
             else:
                 manifest["encryption"] = {"encrypted": False, "algorithm": "none"}
 
-            # R38 P1-5: 原子上传 — manifest 单独存储,ciphertext 单独存储
+            # R39 P1-6: 原子上传 — 先上传临时 payload,校验 HEAD/checksum,再上传 manifest,
+            # 最后原子更新 latest pointer(条件更新,避免 manifest 指向不存在 payload)
+            # 原 R38 实现:先上传 manifest,再上传 ciphertext;
+            #   第二步失败会留下指向不存在 payload 的 manifest(恢复时读到坏 manifest)。
+            # 新顺序:1) 临时 payload 2) 校验 checksum 3) 正式 payload 4) manifest 5) latest(条件)
+            payload_ct = (
+                "application/octet-stream" if enc_result["encrypted"] else "application/json"
+            )
+            # 1. 先上传到临时 key(带随机后缀,避免与并发备份冲突)
+            import secrets as _secrets
+            _tmp_suffix = _secrets.token_hex(4)
+            _tmp_key = f"db_backup/.tmp_{timestamp}_{_tmp_suffix}_{backup_type}.bin"
+            await r2_storage.upload(_tmp_key, upload_content, payload_ct)
+            # 2. 校验:重新下载并校验 checksum(R39 P1-6: 防止静默上传失败/截断)
+            try:
+                _verify_bytes = await r2_storage.download(_tmp_key)
+                _verify_sha = _compute_sha256(_verify_bytes)
+                if _verify_sha != manifest.get("checksum_sha256"):
+                    raise RuntimeError(
+                        f"R39 P1-6: 临时 payload checksum 不匹配"
+                        f"(expected={manifest.get('checksum_sha256','')[:16]}, "
+                        f"actual={_verify_sha[:16]})"
+                    )
+                if len(_verify_bytes) != len(upload_content):
+                    raise RuntimeError(
+                        f"R39 P1-6: 临时 payload 大小不匹配"
+                        f"(expected={len(upload_content)}, actual={len(_verify_bytes)})"
+                    )
+                logger.debug(
+                    f"[Backup] R39 P1-6: 临时 payload 校验通过"
+                    f"(key={_tmp_key}, sha256={_verify_sha[:16]}...)"
+                )
+            except Exception as verify_err:
+                # 校验失败:清理临时 payload,本次备份失败(不写 manifest,不留坏指针)
+                logger.error(
+                    f"[Backup] R39 P1-6: 临时 payload 校验失败,清理并中止本次备份: {verify_err}"
+                )
+                try:
+                    await r2_storage.delete(_tmp_key)
+                except Exception:
+                    pass
+                raise
+
+            # 3. 上传到正式 key(覆盖临时 key 内容,或保留临时 key 作为额外副本)
+            await r2_storage.upload(key, upload_content, payload_ct)
+            # 清理临时 key(正式 key 已上传成功)
+            try:
+                await r2_storage.delete(_tmp_key)
+            except Exception:
+                pass
+
+            # 4. 上传 manifest(此时 payload 已确认存在且校验通过)
             manifest_content = json.dumps(manifest, default=str, ensure_ascii=False).encode("utf-8")
             await r2_storage.upload(
                 f"db_backup/manifest_{timestamp}_{backup_type}.json",
                 manifest_content,
                 "application/json",
             )
-            await r2_storage.upload(
-                key, upload_content,
-                "application/octet-stream" if enc_result["encrypted"] else "application/json",
-            )
 
             total_rows = sum(len(v) for v in data["tables"].values())
-            # R35 P1-7 + R36 H7 + R38 P1-5: 日志中包含 bundle manifest 摘要
+            # R35 P1-7 + R36 H7 + R38 P1-5 + R39 P1-6: 日志中包含 bundle manifest 摘要
             logger.info(
                 f"数据库已备份到 R2: {key} ({len(upload_content)} 字节, "
                 f"{len(data['tables'])} 表, {total_rows} 行, "
@@ -602,17 +649,21 @@ async def _run_backup_loop():
             if current_wm:
                 await _save_watermark(current_wm, backup_type, incremental_count)
 
-            # 逐表上传 latest(仅全量备份时更新 latest,避免增量覆盖)
-            if backup_type == "full":
-                for table in data["tables"]:
-                    t_content = json.dumps(
-                        data["tables"][table], default=str, ensure_ascii=False
-                    ).encode("utf-8")
-                    await r2_storage.upload(
-                        f"db_backup/latest_{table}.json",
-                        t_content,
-                        "application/json",
-                    )
+            # R39 P0-6: 删除明文 latest_<table>.json 上传逻辑
+            # 原实现: 全量备份时逐表上传明文 latest_{table}.json 到 R2,
+            #   绕过了 R36 H7 的 AES-256-GCM 信封加密(BACKUP_KEK),
+            #   导致即使配置了 BACKUP_ENCRYPTION_REQUIRED=true,
+            #   明文表数据仍可通过 latest_*.json 直接下载,违反强制加密原则。
+            #
+            # 修复方案:
+            #   - 不再上传明文 latest_<table>.json
+            #   - 加密 bundle(已上传到 timestamped key)+ manifest(含 checksum)
+            #     已提供完整的最新备份状态,恢复时通过 manifest 定位加密 bundle 即可
+            #   - 如需 latest 指针,可上传 latest_manifest.json(仅含 manifest key + checksum,
+            #     不含表数据),此处暂不实现以保持最小改动
+            #
+            # 注意: 历史 R2 中已存在的 latest_<table>.json 文件需手动清理,
+            #   可用 r2_storage.delete(f"db_backup/latest_{table}.json") 批量删除
 
             # 清理旧备份，仅保留最近 MAX_BACKUP_RETENTION 份
             try:

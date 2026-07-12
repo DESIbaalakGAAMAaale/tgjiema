@@ -31,8 +31,14 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # R39 P0-1: healthcheck 改用专用 health 用户(仅允许 PING),
+    # 不再使用被禁用的 default 用户导致认证失败。
+    # REDIS_HEALTH_PASSWORD 由 .env.secrets.redis 注入(或 redis 服务的 environment 字段)。
+    # 注意: $$ 转义避免 Compose 插值,运行时由 shell 展开 $REDIS_HEALTH_PASSWORD。
+    environment:
+      - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:-changeme_health_ping}
     healthcheck:
-      test: ["CMD", "redis-cli", "--user", "default", "ping"]
+      test: ["CMD-SHELL", "redis-cli --user health -a $$REDIS_HEALTH_PASSWORD --no-auth-warning ping || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3

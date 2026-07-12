@@ -87,6 +87,34 @@ async function handleMessage(msg, token, up, idx, dsp, channelLink) {
 }
 
 // ─── Workers 入口 ───
+
+// R39 P2-3: 使用 Web Crypto HMAC 做恒定时间比较,防止时序攻击泄露 secret
+// 原实现 headerToken !== secret 是普通字符串比较,首字节不同即返回,
+// 攻击者可通过响应时间差逐字节爆破 secret。
+// 改用 crypto.subtle.verify(HMAC) 做恒定时间布尔比较。
+async function constantTimeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (a.length === 0 || b.length === 0) return false;
+  const encoder = new TextEncoder();
+  // 用固定 key 派生 HMAC(仅用于比较,不暴露 secret)
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode("tgjiema-constant-time-compare-v1"),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"],
+  );
+  // 对 a 计算 HMAC 签名
+  const sigA = await crypto.subtle.sign(
+    "HMAC", key, encoder.encode(a),
+  );
+  // verify 检查 sigA 是否为 b 的 HMAC(恒定时间布尔返回)
+  // a === b 时签名匹配 → true;a !== b 时签名不匹配 → false
+  return crypto.subtle.verify(
+    "HMAC", key, sigA, encoder.encode(b),
+  );
+}
+
 export default {
   async fetch(req, env) {
     // 强制验证 webhook secret token，防止伪造更新
@@ -99,8 +127,13 @@ export default {
       return new Response("Service Unavailable: SECRET_TOKEN not configured", { status: 503 });
     }
     const headerToken = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
-    // 用长度恒定比较防时序攻击;空字符串与空字符串也判定为不匹配
-    if (!headerToken || headerToken.length !== secret.length || headerToken !== secret) {
+    // R39 P2-3: 改用 Web Crypto HMAC 恒定时间比较,不再使用 headerToken !== secret
+    // 长度差异本身不是秘密(secret 长度可预测),但仍先做长度短路避免无谓的 HMAC 计算
+    if (!headerToken || headerToken.length !== secret.length) {
+      return new Response("Forbidden", { status: 403 });
+    }
+    const ok = await constantTimeEqual(headerToken, secret);
+    if (!ok) {
       return new Response("Forbidden", { status: 403 });
     }
 

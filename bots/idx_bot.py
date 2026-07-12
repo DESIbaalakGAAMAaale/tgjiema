@@ -662,7 +662,13 @@ async def _process_one_pending(app: Application, row: dict):
 
     # 写入 file_records
     try:
-        files_col = get_file_records_col()
+        # R39 P0-3: 不再直连 CRDB files_col.insert_one(record)
+        # 原版本直写 CRDB + 写 SQLite 镜像(mark_dirty=False),
+        # 但 CRDB 直写会消耗 RU 且 SQLite mirror 失败时数据不一致。
+        # 新版本只写 SQLite 本地权威 + dirty_outbox,
+        # crdb_sync 服务消费 dirty_outbox 后批量 UPSERT 到 CRDB。
+        # 历史数据读取:Bot 读 SQLite 本地缓存(0 RU),如本地数据缺失
+        # 由 bootstrap_runner 显式恢复,不允许运行时隐式访问 CRDB。
         record = make_file_record(
             file_code=file_code,
             uploader_id=uploader_id,
@@ -675,19 +681,23 @@ async def _process_one_pending(app: Application, row: dict):
             protect_content=protect_content,
             file_ttl_days=file_ttl_days,
         )
-        await files_col.insert_one(record)
-        # 同步写入 SQLite 本地缓存（0 CRDB RU 后续读取）
+        from database.cache_store import get_cache_store
+        # mark_dirty=True:写 SQLite 后立即入 dirty_outbox,
+        # crdb_sync dispatcher 消费时 UPSERT 到 CRDB file_records 表
+        await get_cache_store().upsert_file_record_local(record, mark_dirty=True)
+        # R39 P0-3: 显式 add_dirty_outbox 确保 dirty_outbox 表有变更记录
+        # (upsert_file_record_local 通过 crdb_synced=0 间接标记,
+        # 但 dirty_outbox 提供通用 dispatcher 路径,与 P0-4 配套)
         try:
-            from database.cache_store import get_cache_store
-            await get_cache_store().upsert_file_record_local(record, mark_dirty=False)
-        except Exception as cache_err:
-            logger.warning(f"[Idx][poll] upsert_file_record_local 失败 code={file_code}: {cache_err}", exc_info=True)
-            # 写失败时标记 dirty，让 sync 循环重试补齐
-            try:
-                from database.cache_store import get_cache_store
-                await get_cache_store().upsert_file_record_local(record, mark_dirty=True)
-            except Exception:
-                pass
+            record_payload = json.dumps(record, default=str)
+            if isinstance(record_payload, bytes):
+                record_payload = record_payload.decode()
+            await get_cache_store().add_dirty_outbox(
+                "file_records", record["file_code"], "upsert", record_payload
+            )
+        except Exception as outbox_err:
+            # dirty_outbox 写失败不影响主流程(crdb_synced=0 兜底)
+            logger.warning(f"[Idx][poll] add_dirty_outbox(file_records) 失败 code={file_code}: {outbox_err}")
     except Exception as e:
         logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
         try:
@@ -711,7 +721,9 @@ async def _process_one_pending(app: Application, row: dict):
             expire_dt = datetime.datetime(2099, 12, 31, 23, 59, 59, tzinfo=datetime.timezone.utc)
         else:
             expire_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=actual_ttl_days)
-        codes_col = get_codes_col()
+        # R39 P0-3: 不再直连 CRDB codes_col.insert_one(ce)
+        # 改为只写 SQLite 本地权威 + dirty_outbox,
+        # crdb_sync dispatcher 消费 dirty_outbox 后 UPSERT 到 CRDB codes 表
         ce = make_code_entry(
             code=file_code,
             uploader_id=uploader_id,
@@ -722,18 +734,19 @@ async def _process_one_pending(app: Application, row: dict):
             note=note,
             expire_time=expire_dt.isoformat(),
         )
-        await codes_col.insert_one(ce)
-        # 同步写入 SQLite 本地缓存
+        from database.cache_store import get_cache_store
+        # mark_dirty=True:写 SQLite 后立即入 dirty_outbox
+        await get_cache_store().upsert_code_local(ce, mark_dirty=True)
+        # R39 P0-3: 显式 add_dirty_outbox 通用 dispatcher 路径(与 P0-4 配套)
         try:
-            from database.cache_store import get_cache_store
-            await get_cache_store().upsert_code_local(ce, mark_dirty=False)
-        except Exception as cache_err:
-            logger.warning(f"[Idx][poll] upsert_code_local 失败 code={file_code}: {cache_err}", exc_info=True)
-            try:
-                from database.cache_store import get_cache_store
-                await get_cache_store().upsert_code_local(ce, mark_dirty=True)
-            except Exception:
-                pass
+            ce_payload = json.dumps(ce, default=str)
+            if isinstance(ce_payload, bytes):
+                ce_payload = ce_payload.decode()
+            await get_cache_store().add_dirty_outbox(
+                "codes", ce["code"], "upsert", ce_payload
+            )
+        except Exception as outbox_err:
+            logger.warning(f"[Idx][poll] add_dirty_outbox(codes) 失败 code={file_code}: {outbox_err}")
         # 同时写入 code_cache,后续解码查缓存即
         from database.cache import get_code_cache
         get_code_cache().set(f"code:{file_code}", ce)

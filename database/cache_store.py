@@ -749,8 +749,9 @@ class CacheStore:
     async def add_dirty_outbox(
         self, table_name: str, pk: str, operation: str = "upsert",
         payload: str | None = None, version: int = 0,
+        connection: Any = None,
     ) -> int:
-        """R38 P1-2: 写入 dirty_outbox 一条变更记录。
+        """R38 P1-2 + R39 P0-4: 写入 dirty_outbox 一条变更记录。
 
         Args:
             table_name: 受影响表名(如 file_records_local / codes_local)
@@ -758,10 +759,32 @@ class CacheStore:
             operation: 'upsert'(默认) 或 'tombstone'(软删除)
             payload: 可选 JSON 序列化后的载荷(行快照或变更字段)
             version: 单调递增版本号(用于 CRDB UPSERT 条件)
+            connection: R39 P0-4 可选事务连接,传入时不自动 commit
+                (由调用方在同一事务内控制 commit/rollback,确保与业务表更新原子性)
 
         Returns:
             新插入行 id;失败返回 0
         """
+        # R39 P0-4: 事务发件箱模式 — 若调用方传入 connection,
+        # 则使用该连接(不自动 commit),确保 dirty_outbox 写入与业务表更新
+        # 在同一事务内原子提交/回滚,避免半提交导致数据不一致。
+        if connection is not None:
+            try:
+                cursor = await connection.execute(
+                    """INSERT INTO dirty_outbox
+                       (table_name, pk, version, operation, payload, created_at, processed)
+                       VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                    (
+                        table_name, pk, version, operation, payload,
+                        datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
+                    ),
+                )
+                # 不调用 commit,由调用方控制事务
+                return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            except Exception as e:
+                logger.warning(f"[CacheStore] add_dirty_outbox(事务模式) 失败: {e}")
+                return 0
+        # 兼容模式: 无 connection 时自动 commit(向后兼容旧调用方)
         if not self._db:
             return 0
         try:
@@ -847,6 +870,76 @@ class CacheStore:
         except Exception as e:
             logger.debug(f"[CacheStore] count_unprocessed_dirty_outbox 异常: {e}")
             return 0
+
+    # ─── R39 P1-5: 统一软删除 API(tombstone 贯穿删除路径) ───
+
+    # 支持软删除的本地表 → 对应 SQLite 表名 + 主键列名
+    _SOFT_DELETE_TABLES: dict[str, tuple[str, str]] = {
+        "file_records": ("file_records_local", "file_code"),
+        "codes": ("codes_local", "code"),
+        "users": ("users_local", "user_id"),
+        "cells": ("cells_local", "slot_id"),
+        "external_code_mapping": ("external_code_mapping_local", "external_code"),
+    }
+
+    async def soft_delete(self, table: str, pk: str, deleted_at: str | None = None) -> bool:
+        """R39 P1-5: 统一软删除 API — 设置 deleted_at + status='deleted' + 写 dirty_outbox tombstone。
+
+        所有 UI / Bot / retention 删除路径必须走此 API,禁止物理 DELETE。
+        物理删除仅在已备份、已同步、保留期届满后由独立 retention job 执行。
+
+        Args:
+            table: 逻辑表名(file_records / codes / users / cells / external_code_mapping)
+            pk: 行主键值(字符串)
+            deleted_at: 删除时间戳(ISO),None 时自动取当前时间
+
+        Returns:
+            True: 软删除成功(已更新 deleted_at + 写入 dirty_outbox tombstone)
+            False: 软删除失败(表不支持 / 记录不存在 / 异常)
+        """
+        if not self._db:
+            return False
+        import datetime as _dt
+        if deleted_at is None:
+            deleted_at = _dt.datetime.now().isoformat()
+        mapping = self._SOFT_DELETE_TABLES.get(table)
+        if not mapping:
+            logger.warning(f"[CacheStore] R39 P1-5: soft_delete 不支持表 {table}")
+            return False
+        sqlite_table, pk_col = mapping
+        try:
+            # 1. 设置 deleted_at + status='deleted' + crdb_synced=0(触发 crdb_sync tombstone)
+            cursor = await self._db.execute(
+                f"UPDATE {sqlite_table} SET deleted_at = ?, status = 'deleted', "
+                f"crdb_synced = 0 WHERE {pk_col} = ?",
+                (deleted_at, pk),
+            )
+            if cursor.rowcount == 0:
+                logger.warning(
+                    f"[CacheStore] R39 P1-5: soft_delete 未命中记录"
+                    f"(table={table}, pk={pk})"
+                )
+                return False
+            if not self._in_writer_tx:
+                await self._db.commit()
+            # 2. 写 dirty_outbox tombstone(供 crdb_sync 同步到 CRDB)
+            await self._db.execute(
+                """INSERT INTO dirty_outbox
+                   (table_name, pk, version, operation, payload, created_at, processed)
+                   VALUES (?, ?, ?, 'tombstone', ?, ?, 0)""",
+                (sqlite_table, pk, 0, f'{{"deleted_at":"{deleted_at}"}}',
+                 _dt.datetime.now().isoformat()),
+            )
+            if not self._in_writer_tx:
+                await self._db.commit()
+            logger.info(
+                f"[CacheStore] R39 P1-5: soft_delete 成功"
+                f"(table={table}, pk={pk}, deleted_at={deleted_at})"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[CacheStore] R39 P1-5: soft_delete 失败: {e}")
+            return False
 
     async def dump(self, cache_entries: list[tuple[str, dict, float]]):
         """批量写入 [(key, data, timestamp), ...]"""
@@ -934,6 +1027,12 @@ class CacheStore:
         R35 P1-2 修复: 异常安全性 — BEGIN IMMEDIATE 失败时必须恢复 commit 方法
         并重置 _in_writer_tx 标志,否则后续调用会因 commit 被替换为 no-op 而
         静默丢数据。先设标志,再尝试 BEGIN,失败时在 except 中恢复。
+
+        TODO: R39 P1-10 待迁移 — 当前 monkey-patch self._db.commit 为 no-op 的方式
+        脆弱且影响同连接并发。迁移计划见 docs/writer-monkeypatch-removal.md:
+          1. 改用显式 connection.execute("BEGIN IMMEDIATE") + 显式 COMMIT/ROLLBACK
+          2. 所有业务方法不再调用 self._db.commit(),改由 Writer 统一控制事务边界
+          3. 移除 _in_writer_tx 标志和 80+ 处 if self._in_writer_tx 分支
         """
         if not self._db:
             raise RuntimeError("CacheStore 未初始化")
@@ -1626,7 +1725,7 @@ class CacheStore:
         source_msg_ids: list | None = None,
         options_json: dict | None = None,
         trace_id: str = "",
-    ) -> None:
+    ) -> bool:
         """创建上传会话,初始状态 RECEIVED。
 
         Args:
@@ -1635,9 +1734,21 @@ class CacheStore:
             source_msg_ids: 用户原消息 ID 列表(JSON 序列化存储)
             options_json: 上传选项(protect_content/ttl/note 等,JSON 序列化)
             trace_id: 链路追踪 ID
+
+        Returns:
+            True 表示创建成功(或已存在,幂等)
+
+        Raises:
+            StoreUnavailable: R39 P0-5 当 _db 未初始化或 upload_id 为空时抛出,
+                替代原先静默 return None,避免 strict 调用方误判为成功。
         """
+        # R39 P0-5: 静默 return 改抛 StoreUnavailable,避免 strict 调用方绕过检查
         if not self._db or not upload_id:
-            return
+            from utils.exceptions import StoreUnavailable
+            raise StoreUnavailable(
+                f"create_upload_session: store unavailable "
+                f"(db_init={self._db is not None}, upload_id_empty={not upload_id})"
+            )
         now = time.time()
         src_json = _m1_json_dumps(source_msg_ids) if source_msg_ids is not None else None
         opt_json = _m1_json_dumps(options_json) if options_json is not None else None
@@ -1652,14 +1763,20 @@ class CacheStore:
                      now, now, now),
                 )
                 await self._db.commit()
-                return
+                return True
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
                 if self._in_writer_tx:
                     raise
-                return
+                # R39 P0-5: 重试耗尽后抛 StoreUnavailable,不再静默 return
+                from utils.exceptions import StoreUnavailable
+                raise StoreUnavailable(
+                    f"create_upload_session: failed after retries (upload_id={upload_id}): {e}"
+                ) from e
+        # 兜底返回 False(理论上不会到达,for 循环内必有 return 或 raise)
+        return False
 
     async def get_upload_session(self, upload_id: str) -> dict | None:
         """按主键查询上传会话,未找到返回 None。"""
@@ -1728,9 +1845,18 @@ class CacheStore:
         + update_fields 中的额外字段(白名单校验)。
 
         Returns: True 表示迁移成功(rowcount>0),False 表示会话不存在或已在目标状态。
+
+        Raises:
+            StoreUnavailable: R39 P0-5 当 _db 未初始化或 upload_id 为空时抛出,
+                替代原先静默 return False,避免 strict 调用方误判为状态已推进。
         """
+        # R39 P0-5: 静默 return False 改抛 StoreUnavailable,避免 strict 调用方绕过检查
         if not self._db or not upload_id:
-            return False
+            from utils.exceptions import StoreUnavailable
+            raise StoreUnavailable(
+                f"transition_upload_session: store unavailable "
+                f"(db_init={self._db is not None}, upload_id_empty={not upload_id})"
+            )
         # 白名单校验可更新的列,防止 SQL 注入
         _ALLOWED_UPDATE_COLS = {
             "primary_channel_id", "primary_msg_ids", "media_group_id",
@@ -1870,13 +1996,25 @@ class CacheStore:
         batch_file_meta: list | None = None,
         task_type: str = "single", protect_content: int = 0,
         event_type: str = "delivery_requested",
-    ) -> None:
+    ) -> bool:
         """创建发件箱条目,初始状态 PENDING。
 
         幂等:使用 INSERT OR IGNORE 避免重复插入(同 outbox_id 已存在则跳过)。
+
+        Returns:
+            True 表示创建成功(或已存在,幂等)
+
+        Raises:
+            StoreUnavailable: R39 P0-5 当 _db 未初始化或 outbox_id 为空时抛出,
+                替代原先静默 return None,避免 strict 调用方误判为成功。
         """
+        # R39 P0-5: 静默 return 改抛 StoreUnavailable,避免 strict 调用方绕过检查
         if not self._db or not outbox_id:
-            return
+            from utils.exceptions import StoreUnavailable
+            raise StoreUnavailable(
+                f"create_outbox_entry: store unavailable "
+                f"(db_init={self._db is not None}, outbox_id_empty={not outbox_id})"
+            )
         now = time.time()
         sm_json = _m1_json_dumps(storage_msg_ids) if storage_msg_ids is not None else None
         bfm_json = _m1_json_dumps(batch_file_meta) if batch_file_meta is not None else None
@@ -1893,14 +2031,20 @@ class CacheStore:
                      sm_json, bfm_json, task_type, protect_content, event_type, now),
                 )
                 await self._db.commit()
-                return
+                return True
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
                 if self._in_writer_tx:
                     raise
-                return
+                # R39 P0-5: 重试耗尽后抛 StoreUnavailable,不再静默 return
+                from utils.exceptions import StoreUnavailable
+                raise StoreUnavailable(
+                    f"create_outbox_entry: failed after retries (outbox_id={outbox_id}): {e}"
+                ) from e
+        # 兜底返回 False(理论上不会到达,for 循环内必有 return 或 raise)
+        return False
 
     async def get_pending_outbox(self, limit: int = 10) -> list[dict]:
         """查询待处理发件箱条目(status='PENDING' 且 next_retry_at 已到或为 NULL)。"""

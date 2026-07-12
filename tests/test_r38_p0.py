@@ -409,8 +409,16 @@ class TestP04LeaderLeaseAtomicCAS:
         )
 
     def test_fence_check_before_each_batch(self, crdb_sync_content: str):
-        """每批写前校验 fencing token(renew_leader 返回 0 → 停止同步 + 关闭 pool)。"""
-        # _sync_loop 中应在 sync_func 调用前 renew
+        """每批写前校验 fencing token(renew_leader 返回 0 → 停止同步 + 关闭 pool)。
+
+        R39 P1-2: _sync_loop 不再直接调用 _renew_leader_lease(),
+        改为只读模块级 _lease_valid 标志(由 _leader_renewal_task 唯一更新)。
+        因此本测试接受两种实现:
+          (a) R38 形式: _sync_loop 内调用 _renew_leader_lease
+          (b) R39 形式: _sync_loop 内读取 _lease_valid 标志
+        R39 P0-4: close_db 改名为 _close_crdb_only(只关 CRDB pool,保留 SQLite)。
+        """
+        # _sync_loop 中应在 sync_func 调用前 renew 或读 lease 标志
         tree = ast.parse(crdb_sync_content)
         sync_loop_func = None
         for node in ast.walk(tree):
@@ -420,13 +428,14 @@ class TestP04LeaderLeaseAtomicCAS:
                 break
         assert sync_loop_func is not None
         body = ast.unparse(sync_loop_func)
-        # 应调用 _renew_leader_lease 并在返回 False 时停止
-        assert "_renew_leader_lease" in body, (
-            "_sync_loop 应在每批写前调用 _renew_leader_lease 校验 fencing token"
+        # R39 P1-2: 接受 _renew_leader_lease(R38)或 _lease_valid(R39)两种形式
+        assert "_renew_leader_lease" in body or "_lease_valid" in body, (
+            "_sync_loop 应在每批写前调用 _renew_leader_lease 或读取 _lease_valid "
+            "校验 fencing token"
         )
-        # 应有 close_db 调用(丢租约时关闭 CRDB pool)
-        assert "close_db" in body, (
-            "丢租约时应关闭 CRDB pool 避免越权写入"
+        # R39 P0-4: 接受 _close_crdb_only(R39)或 close_db(R38)两种形式
+        assert "_close_crdb_only" in body or "close_db" in body, (
+            "丢租约时应关闭 CRDB pool(_close_crdb_only 或 close_db)避免越权写入"
         )
 
     def test_has_fallback_to_sqlite_kv(self, crdb_sync_content: str):

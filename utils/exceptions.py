@@ -33,3 +33,28 @@ class DurabilityError(Exception):
     """
 
     pass
+
+
+class StoreUnavailable(Exception):
+    """R39 P0-5: 底层存储不可用 (CacheStore._db 未初始化 / 主键无效)。
+
+    触发场景:
+    - create_upload_session / create_outbox_entry 等方法在 _db 为 None
+      (cache_store 未初始化) 或主键 (upload_id / outbox_id) 为空时,
+      原先静默 return None, 会让上层 strict 调用方误以为已成功创建,
+      导致后续状态机推进时找不到记录 → 数据丢失。
+
+    与 DurabilityError 的区别:
+    - DurabilityError: 业务逻辑失败 (状态不匹配 / 记录不存在), 不可重试
+    - StoreUnavailable: 底层资源不可用 (_db 未初始化 / 主键缺失),
+      可通过修复初始化后重试 (启动顺序问题或配置缺失)
+
+    处理方式:
+    - cache_store.create_upload_session / create_outbox_entry 等方法
+      在 _db 为 None 或主键无效时抛 StoreUnavailable
+    - up_bot.create_upload_session_strict 捕获后包装为 DurabilityError 抛出,
+      确保主流程不继续推进状态机
+    """
+
+    pass
+

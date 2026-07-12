@@ -115,64 +115,104 @@ configure_redis_persistence() {
 configure_redis_persistence
 
 # ──────────────────────────────────────────────
-# R37 P2-3: Redis ACL 初始化(最小权限 + 禁用 default 用户)
-# 参考文档: docs/redis-security.md
+# R39 P0-1 + P0-2: Redis ACL 初始化(占位符 sed 替换 + healthcheck 用户)
+# 参考文档: docs/redis-security.md, docs/redis-acl-setup.md
 # ──────────────────────────────────────────────
 init_redis_acl() {
     if ! command -v redis-cli &> /dev/null; then
         warn "未找到 redis-cli,跳过 ACL 初始化"
         return 0
     fi
-    info "R37 P2-3: 初始化 Redis ACL(独立用户 + 最小权限)..."
+    info "R39 P0-2: 初始化 Redis ACL(占位符 sed 替换 + 正向白名单 + tgjiema:* 命名空间)..."
 
-    # 从 .env 读取(若已配置) REDIS_WRITER_PWD / REDIS_READER_PWD;
-    # 否则生成随机密码并回写 .env(供业务 Bot 通过 ACL 用户连接)
     local env_file="$DEPLOY_DIR/.env"
-    local writer_pwd reader_pwd
-    writer_pwd=$(grep -E '^REDIS_WRITER_PWD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
-    reader_pwd=$(grep -E '^REDIS_READER_PWD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    local writer_pwd reader_pwd health_pwd
+    # R39 P0-2: 优先读取新变量名 REDIS_WRITER_PASSWORD / REDIS_READER_PASSWORD / REDIS_HEALTH_PASSWORD
+    writer_pwd=$(grep -E '^REDIS_WRITER_PASSWORD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    reader_pwd=$(grep -E '^REDIS_READER_PASSWORD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    health_pwd=$(grep -E '^REDIS_HEALTH_PASSWORD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    # 兼容: 若旧变量 REDIS_WRITER_PWD / REDIS_READER_PWD 存在,迁移到新变量名
+    if [[ -z "$writer_pwd" ]]; then
+        writer_pwd=$(grep -E '^REDIS_WRITER_PWD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    fi
+    if [[ -z "$reader_pwd" ]]; then
+        reader_pwd=$(grep -E '^REDIS_READER_PWD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    fi
     if [[ -z "$writer_pwd" ]]; then
         writer_pwd=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | xxd -p)
-        echo "REDIS_WRITER_PWD=${writer_pwd}" >> "$env_file"
-        success "已生成 REDIS_WRITER_PWD 并写入 .env"
+        echo "REDIS_WRITER_PASSWORD=${writer_pwd}" >> "$env_file"
+        success "已生成 REDIS_WRITER_PASSWORD 并写入 .env"
     fi
     if [[ -z "$reader_pwd" ]]; then
         reader_pwd=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | xxd -p)
-        echo "REDIS_READER_PWD=${reader_pwd}" >> "$env_file"
-        success "已生成 REDIS_READER_PWD 并写入 .env"
+        echo "REDIS_READER_PASSWORD=${reader_pwd}" >> "$env_file"
+        success "已生成 REDIS_READER_PASSWORD 并写入 .env"
+    fi
+    if [[ -z "$health_pwd" ]]; then
+        # R39 P0-1: healthcheck 用户密码(仅 PING 权限,密码也需随机但权限极低)
+        health_pwd=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | xxd -p)
+        echo "REDIS_HEALTH_PASSWORD=${health_pwd}" >> "$env_file"
+        success "已生成 REDIS_HEALTH_PASSWORD 并写入 .env(healthcheck 用户专用)"
     fi
 
-    # 创建 writer 用户(允许 XADD/XREADGROUP/XACK/XLEN/XPENDING/XCLAIM/XTRIM/XINFO/XDEL,
-    # 仅 ~tgjiema:* 前缀 key;禁用危险命令 -@all)
-    if redis-cli ACL SETUSER tgjiema_writer on >"${writer_pwd}" ~tgjiema:* \
-            +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XTRIM +XINFO +XDEL -@all 2>/dev/null; then
-        success "Redis ACL 用户 tgjiema_writer 已创建(写权限)"
+    # R39 P0-2: 从仓库 ACL 模板 sed 替换占位符后部署到 /etc/redis/users.acl
+    # 占位符格式: <REDIS_WRITER_PASSWORD> / <REDIS_READER_PASSWORD> / <REDIS_HEALTH_PASSWORD>
+    local acl_template="$DEPLOY_DIR/config/redis/users.acl"
+    local acl_target="/etc/redis/users.acl"
+    if [[ ! -f "$acl_template" ]]; then
+        warn "未找到 ACL 模板 $acl_template,回退到旧 redis-cli ACL SETUSER 模式"
+        # 兼容回退: 直接调用 ACL SETUSER(向后兼容)
+        redis-cli ACL SETUSER tgjiema_writer on >"${writer_pwd}" ~tgjiema:* \
+            -@all +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XTRIM +XINFO +XDEL +PING +EXPIRE +TTL +SET +GET +DEL 2>/dev/null \
+            && success "Redis ACL 用户 tgjiema_writer 已创建(回退模式, 写权限)" \
+            || warn "Redis ACL SETUSER tgjiema_writer 失败"
+        redis-cli ACL SETUSER tgjiema_reader on >"${reader_pwd}" ~tgjiema:* \
+            -@all +XREADGROUP +XINFO +XLEN +XPENDING +PING +GET +TTL 2>/dev/null \
+            && success "Redis ACL 用户 tgjiema_reader 已创建(回退模式, 只读)" \
+            || warn "Redis ACL SETUSER tgjiema_reader 失败"
+        redis-cli ACL SETUSER health on >"${health_pwd}" ~* &* \
+            -@all +PING 2>/dev/null \
+            && success "Redis ACL 用户 health 已创建(回退模式, 仅 PING)" \
+            || warn "Redis ACL SETUSER health 失败"
+        redis-cli ACL SETUSER default off 2>/dev/null \
+            && success "Redis default 用户已禁用" \
+            || warn "Redis 禁用 default 失败"
+        redis-cli ACL SAVE 2>/dev/null && success "Redis ACL 已持久化(回退模式)"
     else
-        warn "Redis ACL SETUSER tgjiema_writer 失败(可能 Redis 未启用 ACL,≥6.0 支持)"
+        # R39 P0-2: 主路径 — sed 替换占位符,部署 ACL 文件
+        # 用 | 作为 sed 分隔符避免密码中可能的 / 冲突
+        # 占位符在 ACL 文件中是 <REDIS_WRITER_PASSWORD> 等形式
+        sed \
+            -e "s|<REDIS_WRITER_PASSWORD>|${writer_pwd}|g" \
+            -e "s|<REDIS_READER_PASSWORD>|${reader_pwd}|g" \
+            -e "s|<REDIS_HEALTH_PASSWORD>|${health_pwd}|g" \
+            "$acl_template" > "$acl_target"
+        chmod 600 "$acl_target"
+        chown redis:redis "$acl_target" 2>/dev/null || true
+        success "ACL 文件已从模板生成并写入 $acl_target (R39 P0-2: 占位符 sed 替换)"
+
+        # 配置 redis.conf 加载 ACL 文件(幂等)
+        local redis_conf="/etc/redis/redis.conf"
+        if [[ -f "$redis_conf" ]]; then
+            # 移除可能存在的旧 aclfile 配置行
+            sed -i '/^\s*aclfile\s/d' "$redis_conf"
+            echo "aclfile $acl_target" >> "$redis_conf"
+            systemctl restart redis-server 2>/dev/null || systemctl restart redis 2>/dev/null || true
+            sleep 1
+            success "Redis ACL 已加载(从 $acl_target)"
+        fi
+
+        # 验证 health 用户能 PING(若 redis 可用)
+        if redis-cli --user health -a "${health_pwd}" --no-auth-warning ping 2>/dev/null | grep -q PONG; then
+            success "R39 P0-1: health 用户 PING 验证通过(healthcheck 可用)"
+        else
+            warn "R39 P0-1: health 用户 PING 验证失败,请检查 ACL 文件 + 密码"
+        fi
     fi
 
-    # 创建 reader 用户(只读消费组)
-    if redis-cli ACL SETUSER tgjiema_reader on >"${reader_pwd}" ~tgjiema:* \
-            +XREADGROUP +XINFO +XLEN +XPENDING -@all 2>/dev/null; then
-        success "Redis ACL 用户 tgjiema_reader 已创建(只读)"
-    else
-        warn "Redis ACL SETUSER tgjiema_reader 失败"
-    fi
-
-    # 禁用 default 无密码用户(防止无密码裸登录)
-    # 注意: 禁用前必须确认业务已切换到 ACL 用户连接,否则会丢失连接
-    if redis-cli ACL SETUSER default off 2>/dev/null; then
-        success "Redis default 用户已禁用(防止无密码登录)"
-    else
-        warn "Redis 禁用 default 失败(可手动: redis-cli ACL SETUSER default off)"
-    fi
-
-    # 持久化 ACL 到 /etc/redis/users.acl(重启不丢)
-    local acl_file="/etc/redis/users.acl"
-    redis-cli ACL SAVE 2>/dev/null && success "Redis ACL 已持久化"
-
-    info "  R37 P2-3: 业务 Bot 应使用 redis://tgjiema_writer:<pwd>@127.0.0.1:6379/0 连接"
-    info "  db_writer 用 writer,其它 Bot 用 reader"
+    info "  R39 P0-2: 业务 Bot 应使用 redis://tgjiema_writer:<pwd>@127.0.0.1:6379/0 连接"
+    info "  db_writer 用 writer,其它 Bot 用 reader(或 writer 视需要)"
+    info "  REDIS_URL 在 .env.shared 中应嵌入凭证(部署后由 deploy 脚本辅助更新)"
 }
 init_redis_acl
 

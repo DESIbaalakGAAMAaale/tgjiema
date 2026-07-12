@@ -1,41 +1,40 @@
-# R38 P1-8: Redis ACL 配置 — 按服务角色最小权限
+# R39 P0-1 + P0-2: Redis ACL 配置 — 占位符密码 + 正向白名单 + key 命名空间隔离
 #
-# 禁用 default 用户(默认无密码全权限,安全风险)
-# 每个服务使用独立用户,仅授予所需命令权限
+# 修复历史问题:
+#   P0-1: 原版本禁用 default 用户后,docker-compose healthcheck 仍用
+#         `redis-cli --user default ping` 导致认证失败,容器永不健康。
+#         新增专用 health 用户(仅 PING),healthcheck 改用此用户。
+#   P0-2: 原版本硬编码 *_changeme_password 密码,服务共享单一 REDIS_URL
+#         高权限账号。改为占位符 <REDIS_*_PASSWORD>,部署时由 deploy 脚本
+#         sed 替换;ACL 收口为 3 个用户(health / writer / reader),
+#         命令采用正向白名单(-@all 后逐个 +),key 限制到 tgjiema:* 命名空间。
 #
-# 用户名:密码 对应 .env.shared 中的 REDIS_URL
-# 格式: redis://<user>:<password>@redis:6379/0
+# 部署流程:
+#   1. .env 中配置 REDIS_WRITER_PASSWORD / REDIS_READER_PASSWORD / REDIS_HEALTH_PASSWORD
+#   2. deploy_vps_per_bot.sh 读取 .env,sed 替换占位符后复制到 /etc/redis/users.acl
+#   3. redis-server --aclfile /etc/redis/users.acl 加载
+#   4. 各服务的 REDIS_URL 使用 redis://tgjiema_writer:<pwd>@redis:6379/0
+#      (写服务) 或 redis://tgjiema_reader:<pwd>@redis:6379/0 (读服务)
 #
-# 更新密码后需重启 redis 容器(docker compose restart redis)
+# 注意: ACL 规则按从左到右顺序评估,后出现的规则覆盖先出现的。
+#       因此正确写法是 `-@all +cmd1 +cmd2`(先拒绝全部,再逐个放行),
+#       而非 `+cmd1 +cmd2 -@all`(后者会让 -@all 覆盖前面的 +cmd)。
 
 # ── default 用户: 禁用(不允许任何连接) ──
 user default off
 
-# ── db_writer: Redis Stream 消费 + 写入 ──
-# 需要: XADD/XREADGROUP/XACK/XLEN/XPENDING/XCLAIM/XAUTOCLAIM/XINFO/XTRIM
-#       DEL/EXISTS/EXPIRE/TTL(leader lease + kv_store)
-user db_writer on >db_writer_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+# ── health 用户: 仅用于 docker-compose healthcheck 的 PING 命令 ──
+# R39 P0-1: 专用 healthcheck 用户,密码由 REDIS_HEALTH_PASSWORD 注入
+# 仅允许 PING 命令,不能读写任何 key(~* 仅为语法占位,实际无任何 +命令能访问 key)
+user health on ><REDIS_HEALTH_PASSWORD> ~* &* -@all +PING
 
-# ── up_bot: 上传接收,写 Redis Stream + 读 kv_store ──
-user up_bot on >up_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+# ── tgjiema_writer: 写入用户(Stream 消费 + 写入 + kv_store 基本操作) ──
+# R39 P0-2: 正向白名单,仅允许业务所需命令;key 限制到 tgjiema:* 命名空间
+# 用途: db_writer / up_bot / idx_bot / dsp_bot / mon_bot / admin_bot / admin
+#       共享此用户(写权限),由 REDIS_URL 中嵌入凭证实现单一连接点
+user tgjiema_writer on ><REDIS_WRITER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XTRIM +XINFO +XDEL +PING +EXPIRE +TTL +SET +GET +DEL
 
-# ── idx_bot: 解码索引,读写 Redis ──
-user idx_bot on >idx_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
-
-# ── dsp_bot: 派送分发,读写 Redis ──
-user dsp_bot on >dsp_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
-
-# ── mon_bot: 监控管理,读 Redis 指标 + 写告警 ──
-user mon_bot on >mon_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
-
-# ── admin_bot: 管理 Bot,读写 Redis ──
-user admin_bot on >admin_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
-
-# ── admin: Web 管理后台,读 Redis ──
-user admin on >admin_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
-
-# ── db_backup: 备份服务,不需要 Redis(仅连 CRDB + R2) ──
-# 不创建 Redis 用户,backup 服务不连 Redis
-
-# ── prometheus_exporter: 不需要 Redis(只读 SQLite) ──
-# 不创建 Redis 用户
+# ── tgjiema_reader: 只读用户(消费组读取 + kv_store 只读) ──
+# R39 P0-2: 正向白名单,仅允许读命令;key 限制到 tgjiema:* 命名空间
+# 用途: 仅需读取的服务(如 prometheus_exporter)或调试用途
+user tgjiema_reader on ><REDIS_READER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XREADGROUP +XINFO +XLEN +XPENDING +PING +GET +TTL

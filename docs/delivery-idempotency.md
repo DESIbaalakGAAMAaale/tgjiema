@@ -265,3 +265,114 @@ delivery_latency_seconds_bucket{le="10"}
 告警规则:
 - `rate(duplicate_delivery_count_total[1h]) > 0` → 立即告警(重复投递发生)
 - `rate(delivery_token_check_fail_total[5m]) / rate(delivery_total_total[5m]) > 0.01` → token 检查失败率告警
+
+---
+
+## 9. R39 P1-11: Receipt 失败暂停 Job
+
+### 9.1 问题背景
+
+原实现中,`_upsert_delivery_receipt_safe()` 与 `_confirm_delivery_receipt_safe()`
+在写 receipt 失败时仅记录 warning 后继续投递流程。这意味着:
+
+- **权威持久层 receipt 写失败** → 内存 `_sent_msg_tracker` 仍标记成功
+- 进程崩溃后重启 → 内存丢失,但 Telegram 副作用已发出
+- 重试时由于无 receipt 记录 → `is_delivery_already_done()` 返回 False
+- → **重复 `copy_message` 调用**,用户收到重复消息
+
+虽然 §4 撤回流程可兜底,但这违反"权威 receipt 写失败时不应继续 Telegram 副作用"原则,
+使 effectively-once 的第二层防线(投递后记录)失效。
+
+### 9.2 改进方案
+
+R39 P1-11 调整 receipt 写入失败的语义为 **fail-closed**:
+
+```python
+async def _upsert_delivery_receipt_safe(...) -> bool:
+    """R39 P1-11: 失败返回 False,调用方应暂停 job。"""
+    if store is None:
+        return False
+    try:
+        await store.upsert_delivery_receipt(...)
+        return True
+    except Exception as e:
+        logger.error(f"[Dsp] R39 P1-11: upsert_delivery_receipt 失败(应暂停 job) ...")
+        return False  # ← 关键: 不再"忽略后继续"
+
+
+async def _confirm_delivery_receipt_safe(...) -> bool:
+    """R39 P1-11: 失败返回 False,调用方应暂停 job。"""
+    if store is None:
+        return False
+    try:
+        await store.confirm_delivery_receipt(...)
+        return True
+    except Exception as e:
+        logger.error(f"[Dsp] R39 P1-11: confirm_delivery_receipt 失败(应暂停 job) ...")
+        return False
+
+
+async def _pause_job_for_receipt_failure(store, job_id: int) -> None:
+    """R39 P1-11: receipt 写失败时暂停该 job(标记 receipt_pending)。"""
+    if store is None:
+        return
+    try:
+        await store.update_local_job_status(job_id, "receipt_pending")
+        logger.warning(f"[Dsp] R39 P1-11: job={job_id} 已暂停(receipt_pending),等待 receipt 恢复后重新入队")
+    except Exception as e:
+        logger.error(f"[Dsp] R39 P1-11: 暂停 job={job_id} 失败(可能重复投递): {e}")
+```
+
+### 9.3 调用点行为变化
+
+| 调用点 | 原行为 | R39 P1-11 新行为 |
+| ------ | ------ | ---------------- |
+| 投递前写 PENDING receipt | 失败 → warning + 继续 | 失败 → `_pause_job_for_receipt_failure()` + return False |
+| 投递成功后写 CONFIRMED receipt | 失败 → warning + 继续 | 失败 → `_pause_job_for_receipt_failure()` + 不再更新内存 tracker |
+
+### 9.4 job 状态机扩展
+
+新增 `receipt_pending` 状态:
+
+```
+pending → in_progress → (receipt 写失败) → receipt_pending
+                                              ↓
+                                  (运维修复 receipt 后重新入队)
+                                              ↓
+                                          pending
+```
+
+- Dsp 主循环跳过 `receipt_pending` 状态的 job
+- 等待运维介入修复 receipt 表(例如修复 SQLite/CRDB 写入)
+- 修复完成后将状态改回 `pending`,job 重新入队
+- 重试时 `is_delivery_already_done()` 会检查 receipt 是否已存在
+
+### 9.5 SLO 影响
+
+| 场景 | R39 P1-11 后行为 | SLO 影响 |
+| ---- | ---------------- | -------- |
+| receipt 写入失败(SQLite 故障) | job 暂停,不发出 Telegram 副作用 | 漏投率短暂升高,但无重复投递 |
+| receipt 写入失败后进程崩溃 | 重启后 job 仍为 `receipt_pending`,不会重复发 | 重复率保持 0 |
+| 运维修复后重新入队 | 重试时 token 检查拦截已投递的 job | 无影响 |
+
+**取舍**: 漏投率(可重试恢复)优于重复投递(无法回滚的 Telegram 副作用),
+符合 effectively-once 的"宁可漏投不可重复"原则(见 §5.1)。
+
+### 9.6 监控指标
+
+```prometheus
+# receipt 写入失败导致 job 暂停的计数
+receipt_pause_job_total
+
+# 当前处于 receipt_pending 状态的 job 数量
+receipt_pending_jobs
+```
+
+告警规则:
+- `rate(receipt_pause_job_total[1h]) > 0` → 立即告警(receipt 写入异常)
+- `receipt_pending_jobs > 10` → 容量告警(积压过多需运维介入)
+
+### 9.7 引用
+
+- `bots/dsp_bot.py` — `_upsert_delivery_receipt_safe()` / `_confirm_delivery_receipt_safe()` / `_pause_job_for_receipt_failure()`
+- `database/cache_store.py` — `update_local_job_status()` 方法

@@ -73,6 +73,16 @@ LISTEN_PORT = int(os.getenv("PROMETHEUS_EXPORTER_PORT", "9100"))
 RELAY_SPOOL_HIGH_WATER_MARK = 0.80
 RELAY_SPOOL_MAX_BYTES_DEFAULT = 5 * 1024 * 1024 * 1024  # 5GB
 
+# R39 P1-8: readiness 状态跟踪
+# _last_scrape_ok: 最近一次 collect_metrics 是否成功(至少一次 SQLite 查询成功)
+# _last_scrape_ts: 最近一次成功采集的时间戳
+# _scrape_errors: 累计采集错误数
+_last_scrape_ok: bool = False
+_last_scrape_ts: float = 0.0
+_scrape_errors: int = 0
+# R39 P1-8: 数据新鲜度告警阈值(秒) — 超过此值认为数据陈旧
+_DATA_AGE_ALERT_THRESHOLD = 300  # 5 分钟无成功采集 → 不 ready
+
 
 # ── SQLite 读取工具 ─────────────────────────────────────
 
@@ -309,7 +319,94 @@ def collect_metrics() -> str:
         if not line.startswith("#"):
             _check_no_high_cardinality_labels(line)
 
+    # R39 P1-8: 新增 readiness 指标 — scrape_errors / data_age_seconds / readiness_checks
+    global _last_scrape_ok, _last_scrape_ts, _scrape_errors
+    # 判断本次采集是否成功(kv_store 至少可读)
+    scrape_ok = CACHE_STORE_DB.exists() and pel_str != "0" or crdb_ru_str != "0" or True
+    # 简化:只要 SQLite 文件可读即认为成功(_read_kv_value 不抛异常就算成功)
+    scrape_ok = CACHE_STORE_DB.exists()
+    if scrape_ok:
+        _last_scrape_ok = True
+        _last_scrape_ts = time.time()
+    else:
+        _last_scrape_ok = False
+        _scrape_errors += 1
+
+    # scrape_errors: 累计采集错误数
+    lines.append("# HELP scrape_errors Total number of scrape errors")
+    lines.append("# TYPE scrape_errors counter")
+    lines.append(f"scrape_errors {_scrape_errors}")
+
+    # data_age_seconds: 最近成功采集距今秒数(-1 表示从未成功采集)
+    data_age = (time.time() - _last_scrape_ts) if _last_scrape_ts > 0 else -1.0
+    lines.append("# HELP data_age_seconds Seconds since last successful scrape (-1 if never)")
+    lines.append("# TYPE data_age_seconds gauge")
+    lines.append(f"data_age_seconds {data_age}")
+
+    # readiness_checks: readiness 检查项数(0=未通过,1+=通过的检查项)
+    readiness = check_readiness()
+    lines.append("# HELP readiness_checks Number of readiness checks passed")
+    lines.append("# TYPE readiness_checks gauge")
+    lines.append(f"readiness_checks {readiness['passed']}")
+
     return "\n".join(lines) + "\n"
+
+
+def check_readiness() -> dict:
+    """R39 P1-8: readiness 检查 — 数据库可读 + 最近采集成功 + 关键 schema 存在。
+
+    供 /health 端点调用,不满足时返回 503 Service Unavailable。
+
+    Returns:
+        {"ready": bool, "passed": int, "checks": {name: bool}}
+    """
+    checks: dict[str, bool] = {}
+    # 1. SQLite 可读(cache_store.db 存在且可查询)
+    sqlite_ok = False
+    if CACHE_STORE_DB.exists():
+        try:
+            conn = sqlite3.connect(
+                f"file:{CACHE_STORE_DB}?mode=ro", uri=True, timeout=2
+            )
+            conn.execute("SELECT 1 FROM kv_store LIMIT 1")
+            conn.close()
+            sqlite_ok = True
+        except Exception:
+            sqlite_ok = False
+    checks["sqlite_readable"] = sqlite_ok
+
+    # 2. 最近采集成功(_last_scrape_ok + data_age 未超阈值)
+    data_age = (time.time() - _last_scrape_ts) if _last_scrape_ts > 0 else -1.0
+    scrape_recent = (
+        _last_scrape_ok
+        and data_age >= 0
+        and data_age < _DATA_AGE_ALERT_THRESHOLD
+    )
+    checks["recent_scrape"] = scrape_recent
+
+    # 3. 关键 schema 存在(kv_store 表存在,且至少有一个业务表)
+    schema_ok = False
+    if sqlite_ok:
+        try:
+            conn = sqlite3.connect(
+                f"file:{CACHE_STORE_DB}?mode=ro", uri=True, timeout=2
+            )
+            # 检查关键表存在(file_records_local / cells_local / upload_outbox)
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('file_records_local', 'cells_local', 'upload_outbox') "
+                "LIMIT 1"
+            )
+            row = cursor.fetchone()
+            conn.close()
+            schema_ok = row is not None
+        except Exception:
+            schema_ok = False
+    checks["key_schema_exists"] = schema_ok
+
+    passed = sum(1 for v in checks.values() if v)
+    ready = all(checks.values())
+    return {"ready": ready, "passed": passed, "checks": checks}
 
 
 # ── HTTP Handler ─────────────────────────────────────────
@@ -339,11 +436,23 @@ class MetricsHTTPRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif self.path == "/health":
-            self.send_response(200)
+            # R39 P1-8: readiness 增强 — 不再永远返回 OK
+            # 检查: SQLite 可读 + 最近采集成功 + 关键 schema 存在
+            readiness = check_readiness()
+            if readiness["ready"]:
+                body = b"OK"
+                self.send_response(200)
+            else:
+                # 不满足时返回 503 Service Unavailable
+                failed = [k for k, v in readiness["checks"].items() if not v]
+                body = (
+                    f"Service Unavailable: readiness checks failed: {failed}"
+                ).encode("utf-8")
+                self.send_response(503)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", "2")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"OK")
+            self.wfile.write(body)
         elif self.path == "/" or self.path == "/index":
             body = (
                 b"TGJiema Prometheus Exporter\n"

@@ -107,23 +107,38 @@ async def create_upload_session_strict(
     source_msg_ids: list | None = None,
     options: dict | None = None,
 ) -> str:
-    """R38 P0-3: 严格创建上传会话(upload_sessions 表),返回 upload_id(UUID)。
+    """R38 P0-3 / R39 P0-5: 严格创建上传会话(upload_sessions 表),返回 upload_id(UUID)。
 
     失败时抛 DurabilityError,由调用方决定是否回滚主流程。
     不返回空字符串(避免主流程误以为已创建会话而继续推进状态机)。
+
+    R39 P0-5: 新增 `ok is True` 检查 — 即使 CacheStore.create_upload_session
+    未抛异常但返回 False(理论兜底路径),也视为失败抛 DurabilityError,
+    避免 CacheStore 静默 return 绕过 strict 检查。
     """
     from utils.exceptions import DurabilityError
     upload_id = str(uuid.uuid4())
     try:
         store = get_cache_store()
-        await store.create_upload_session(
+        # R39 P0-5: 检查返回值 ok is True (cache_store 现已返回 bool)
+        # 若返回 False 或 None(理论兜底),视为失败抛 DurabilityError
+        ok = await store.create_upload_session(
             upload_id, user_id,
             source_msg_ids=source_msg_ids,
             options_json=options,
             trace_id=f"up_bot:{upload_id[:8]}",
         )
+        if ok is not True:
+            # R39 P0-5: cache_store 未抛异常但返回非 True(兜底路径)
+            raise DurabilityError(
+                f"create upload session returned false (upload_id={upload_id}, ok={ok!r})"
+            )
+    except DurabilityError:
+        # 已经是 DurabilityError,直接向上传播(避免被下面 Exception 分支包装两次)
+        raise
     except Exception as e:
-        # R38 P0-3: 创建失败抛 DurabilityError,不返回空串
+        # R38 P0-3 / R39 P0-5: 创建失败抛 DurabilityError,不返回空串
+        # R39 P0-5: StoreUnavailable 也会被此分支捕获并包装为 DurabilityError
         raise DurabilityError(
             f"create upload session returned false / failed: {e}"
         ) from e

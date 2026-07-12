@@ -86,6 +86,25 @@ end
 # R38 P0-4: Redis 不可用降级标志(True=使用 SQLite KV fallback)
 _redis_leader_fallback: bool = False
 
+# R39 P1-2: 本地 lease 状态标志(由 _leader_renewal_task 唯一更新,_sync_loop 只读)
+# _sync_loop 不再调用 _renew_leader_lease(),仅读取 _lease_valid 判断是否可同步
+_lease_valid: bool = False
+# R39 P1-2: fencing token(leader_id 副本),供 worker 在写前只读校验
+_fencing_token: str = ""
+
+
+def _is_production() -> bool:
+    """R39 P1-1: 判断当前是否为生产环境。
+
+    生产环境 Redis 不可用时 fail-closed(关闭 CRDB pool + 停止同步),
+    仅开发模式允许 SQLite KV fallback。
+    """
+    try:
+        from config import settings
+        return getattr(settings, "ENVIRONMENT", "development") == "production"
+    except Exception:
+        return False
+
 
 async def _get_redis_client():
     """R38 P0-4: 获取 Redis 客户端(复用项目 redis_queue 模块的连接)。
@@ -101,20 +120,24 @@ async def _get_redis_client():
 
 
 async def _acquire_leader_lease() -> bool:
-    """R38 P0-4: 原子获取 sync_leader 租约。
+    """R38 P0-4 / R39 P1-1: 原子获取 sync_leader 租约。
 
     优先使用 Redis SET key value NX PX <ttl_ms> 原子 CAS:
     - SET NX:仅当 key 不存在时才设置(原子性由 Redis 单线程保证)
     - PX <ttl_ms>:同时设置过期时间,避免设置后崩溃导致永久锁
     - 返回 True:获得租约;False:已被其他实例持有
 
-    Redis 不可用时降级到原 SQLite kv_store 逻辑(get_kv → 判断 → set_kv),
-    记录 warning(非原子,可能出现双 leader,仅在单实例或维护场景可接受)。
+    R39 P1-1: 生产环境(ENVIRONMENT=production)Redis 不可用时 fail-closed,
+    不降级到 SQLite KV(非原子,split-brain 风险)。
+    仅开发模式允许 SQLite KV fallback。
+
+    R39 P1-2: 获取成功时设置全局 _lease_valid=True 与 _fencing_token,
+    供 _sync_loop 只读判断。
 
     Returns:
         True if 当前进程获得租约;False if 其他实例持有租约
     """
-    global _redis_leader_fallback
+    global _redis_leader_fallback, _lease_valid, _fencing_token
 
     redis_client = await _get_redis_client()
     if redis_client is not None:
@@ -126,6 +149,9 @@ async def _acquire_leader_lease() -> bool:
             )
             if ok:
                 _redis_leader_fallback = False
+                # R39 P1-2: 更新本地 lease 状态(由 renewal task 维护)
+                _lease_valid = True
+                _fencing_token = _LEADER_ID
                 logger.info(
                     f"[crdb_sync] 获得 leader 租约(Redis CAS, "
                     f"leader_id={_LEADER_ID}, TTL={_LEADER_TTL}s)"
@@ -137,17 +163,38 @@ async def _acquire_leader_lease() -> bool:
             )
             return False
         except Exception as e:
+            # R39 P1-1: 生产环境 Redis 异常 → fail-closed,不降级
+            if _is_production():
+                logger.error(
+                    f"[crdb_sync] R39 P1-1: 生产环境 Redis 租约获取异常,"
+                    f"fail-closed(不降级到 SQLite KV,避免 split-brain): {e}"
+                )
+                _lease_valid = False
+                _fencing_token = ""
+                return False
             logger.warning(
                 f"[crdb_sync] Redis 租约获取异常,降级到 SQLite KV fallback: {e}"
             )
             _redis_leader_fallback = True
 
-    # R38 P0-4: Redis 不可用 → SQLite KV fallback(非原子,记录 warning)
+    # R39 P1-1: Redis 客户端不可用(None)时,生产环境 fail-closed
+    if _is_production():
+        logger.error(
+            "[crdb_sync] R39 P1-1: 生产环境 Redis 不可用,"
+            "fail-closed(不降级到非原子 SQLite KV,避免 split-brain 风险)。"
+            "请恢复 Redis 服务后重启 crdb_sync。"
+        )
+        _lease_valid = False
+        _fencing_token = ""
+        return False
+
+    # R38 P0-4: Redis 不可用 → SQLite KV fallback(仅开发模式,非原子,记录 warning)
     if not _redis_leader_fallback:
         _redis_leader_fallback = True
         logger.warning(
             "[crdb_sync] Redis 不可用,降级到 SQLite KV leader 租约(非原子 CAS,"
-            "多实例部署可能出现双 leader,建议修复 Redis 后切回原子模式)"
+            "多实例部署可能出现双 leader,建议修复 Redis 后切回原子模式)。"
+            "R39 P1-1: 生产环境已禁止此 fallback。"
         )
 
     store = _get_cache_store_safe()
@@ -173,6 +220,9 @@ async def _acquire_leader_lease() -> bool:
         "fallback": "sqlite_kv",
     })
     await store.set_kv(_LEADER_KEY, lease_data)
+    # R39 P1-2: 更新本地 lease 状态
+    _lease_valid = True
+    _fencing_token = _LEADER_ID
     logger.info(
         f"[crdb_sync] 获得 leader 租约(SQLite KV fallback, "
         f"leader_id={_LEADER_ID}, TTL={_LEADER_TTL}s)"
@@ -181,16 +231,24 @@ async def _acquire_leader_lease() -> bool:
 
 
 async def _renew_leader_lease() -> bool:
-    """R38 P0-4: 续约 leader 租约(原子 compare-and-renew)。
+    """R38 P0-4 / R39 P1-1 / R39 P1-2: 续约 leader 租约(原子 compare-and-renew)。
 
     Redis 模式用 Lua 脚本原子校验 + 续约:
         if GET key == leader_id then PEXPIRE key ttl_ms else return 0
     防止两个进程同时续约各自的过期时间。
 
+    R39 P1-1: 生产环境 Redis 续约异常时 fail-closed(不降级到 SQLite),
+    避免非原子续约导致 split-brain。仅开发模式允许降级。
+
+    R39 P1-2: 续约结果同步更新全局 _lease_valid / _fencing_token,
+    供 _sync_loop 只读判断(不再自己调用本函数)。
+
     Returns:
         True:续约成功(仍是 leader)
         False:租约被抢占或丢失(必须立即停止同步 + 关闭 CRDB pool)
     """
+    global _lease_valid, _fencing_token
+
     if not _redis_leader_fallback:
         redis_client = await _get_redis_client()
         if redis_client is not None:
@@ -204,26 +262,56 @@ async def _renew_leader_lease() -> bool:
                         f"[crdb_sync] leader 租约续约成功(Lua CAS, "
                         f"leader_id={_LEADER_ID})"
                     )
+                    _lease_valid = True
+                    _fencing_token = _LEADER_ID
                     return True
                 logger.warning(
                     f"[crdb_sync] leader 租约续约失败(Lua 返回 0,租约被抢占或丢失)"
                 )
+                # R39 P1-2: 续约失败,清空本地 lease 标志
+                _lease_valid = False
+                _fencing_token = ""
                 return False
             except Exception as e:
+                # R39 P1-1: 生产环境 Redis 续约异常 → fail-closed,不降级
+                if _is_production():
+                    logger.error(
+                        f"[crdb_sync] R39 P1-1: 生产环境 Redis Lua 续约异常,"
+                        f"fail-closed(不降级到非原子 SQLite KV): {e}"
+                    )
+                    _lease_valid = False
+                    _fencing_token = ""
+                    return False
                 logger.warning(
                     f"[crdb_sync] Redis Lua 续约异常,降级到 SQLite KV: {e}"
                 )
                 # 降级路径见下方 SQLite fallback
+        else:
+            # R39 P1-1: Redis 客户端不可用,生产环境 fail-closed
+            if _is_production():
+                logger.error(
+                    "[crdb_sync] R39 P1-1: 生产环境 Redis 不可用,"
+                    "续约 fail-closed(不降级到 SQLite KV)。"
+                )
+                _lease_valid = False
+                _fencing_token = ""
+                return False
 
-    # SQLite KV fallback(非原子,记录 warning)
+    # SQLite KV fallback(仅开发模式,非原子,记录 warning)
     store = _get_cache_store_safe()
     if store is None:
+        _lease_valid = False
+        _fencing_token = ""
         return False
     now = time.time()
     current = await store.get_kv(_LEADER_KEY)
     if not current:
         # 租约丢失,尝试重新获取
-        return await _acquire_leader_lease()
+        ok = await _acquire_leader_lease()
+        if not ok:
+            _lease_valid = False
+            _fencing_token = ""
+        return ok
     try:
         data = json.loads(current)
         leader_id = data.get("leader_id", "")
@@ -231,17 +319,29 @@ async def _renew_leader_lease() -> bool:
             logger.warning(
                 f"[crdb_sync] leader 租约被 {leader_id} 抢占,停止同步"
             )
+            _lease_valid = False
+            _fencing_token = ""
             return False
         data["expire_at"] = now + _LEADER_TTL
         data["renewed_at"] = now
         await store.set_kv(_LEADER_KEY, json.dumps(data))
+        _lease_valid = True
+        _fencing_token = _LEADER_ID
         return True
     except (json.JSONDecodeError, TypeError):
-        return await _acquire_leader_lease()
+        ok = await _acquire_leader_lease()
+        if not ok:
+            _lease_valid = False
+            _fencing_token = ""
+        return ok
 
 
 async def _release_leader_lease():
-    """R38 P0-4: 释放 leader 租约(优雅关闭时调用,仅 owner 可释放)。"""
+    """R38 P0-4 / R39 P1-2: 释放 leader 租约(优雅关闭时调用,仅 owner 可释放)。"""
+    global _lease_valid, _fencing_token
+    # R39 P1-2: 释放时清空本地 lease 标志
+    _lease_valid = False
+    _fencing_token = ""
     if not _redis_leader_fallback:
         redis_client = await _get_redis_client()
         if redis_client is not None:
@@ -255,7 +355,7 @@ async def _release_leader_lease():
             except Exception as e:
                 logger.debug(f"[crdb_sync] Redis 释放异常(fallback SQLite): {e}")
 
-    # SQLite KV fallback
+    # SQLite KV fallback(仅开发模式)
     store = _get_cache_store_safe()
     if store is None:
         return
@@ -343,7 +443,7 @@ async def _close_crdb_only():
 
 
 async def _sync_loop(name: str, sync_func, get_dirty_func, mark_synced_func):
-    """R37 P0-3 / R38 P0-4 / R38 P1-1: 通用同步循环 — dirty 驱动 + 受控 cadence + 退避 + leader fencing + CRDB 懒加载。
+    """R37 P0-3 / R38 P0-4 / R38 P1-1 / R39 P1-2: 通用同步循环 — dirty 驱动 + 受控 cadence + 退避 + leader fencing + CRDB 懒加载。
 
     改进点(vs R36):
     - 有 dirty 时:处理一批,short sleep(DIRTY_BATCH_INTERVAL=2s),再查
@@ -351,8 +451,11 @@ async def _sync_loop(name: str, sync_func, get_dirty_func, mark_synced_func):
     - 异常时:指数退避(不快速重试,避免消耗 RU)
     - 每轮检查 leader 租约,非 leader 不执行同步
 
-    R38 P0-4: 每批写前调用 _renew_leader_lease() 校验 fencing token,
-    丢租约立即停止同步 + 关闭 CRDB pool(由调用方处理 close_db)。
+    R39 P1-2: 单续约任务 —
+    - _sync_loop 不再调用 _renew_leader_lease(),
+      只读取本地 _lease_valid / _fencing_token 标志(由 _leader_renewal_task 唯一更新)
+    - 开头检查 if not _lease_valid: sleep + continue(等待 renewal task 重新获取)
+    - 避免三处续约(jobs/cells 循环各自 renew + renewal task)产生竞态
 
     R38 P1-1: CRDB 懒加载 —
     - get_dirty_func 查 SQLite(不触发 CRDB)
@@ -365,22 +468,19 @@ async def _sync_loop(name: str, sync_func, get_dirty_func, mark_synced_func):
     backoff = DEFAULT_SYNC_INTERVAL
     while True:
         try:
-            # R38 P0-4: 每批写前校验 fencing token(renew_leader 返回 0 = 丢租约)
-            if not await _renew_leader_lease():
-                logger.error(
-                    f"[crdb_sync] {name}: leader 租约丢失或被抢占,"
-                    f"停止同步循环(等待重新获取或主进程退出)"
+            # R39 P1-2: 只读本地 lease 标志(由 _leader_renewal_task 唯一更新),
+            # 不再调用 _renew_leader_lease()(去除 jobs/cells 循环各自续约的冗余)
+            if not _lease_valid:
+                logger.warning(
+                    f"[crdb_sync] {name}: lease 无效(等待 renewal task 重新获取),"
+                    f"本轮跳过同步"
                 )
                 # R38 P1-1: 关闭 CRDB pool 避免越权写入(只关 CRDB,保留 SQLite)
                 await _close_crdb_only()
-                # 等待 lease TTL 过期后尝试重新获取
-                await asyncio.sleep(_LEADER_TTL // 2)
-                if not await _acquire_leader_lease():
-                    # 重新获取失败,继续等待下一轮
-                    backoff = min(backoff * 2, MAX_BACKOFF)
-                    await asyncio.sleep(backoff)
-                    continue
-                # 重新获得租约后不立即连 CRDB(R38 P1-1: 等待 dirty 检测后再懒加载)
+                # 等待 renewal task 重新获取租约(短 sleep,不消耗 RU)
+                await asyncio.sleep(_LEADER_RENEWAL_INTERVAL)
+                backoff = DEFAULT_SYNC_INTERVAL  # 重置退避
+                continue
 
             # R38 P1-1: get_dirty 只查 SQLite,不触发 CRDB
             dirty = await get_dirty_func()
@@ -419,25 +519,37 @@ async def _sync_loop(name: str, sync_func, get_dirty_func, mark_synced_func):
 
 
 async def _leader_renewal_task():
-    """R38 P0-4: 独立 leader 租约续约 task。
+    """R38 P0-4 / R39 P1-2: 独立 leader 租约续约 task(唯一续约源)。
 
     与主同步循环解耦,每 _LEADER_RENEWAL_INTERVAL(约 30s = TTL/3)续约一次,
     不受主循环 backoff(可达 30min)影响,避免无 dirty 时租约过期被抢占。
 
-    续约失败时记录 error,主循环下一轮会检测到并停止同步。
+    R39 P1-2: 续约失败时主动尝试重新获取租约(因为 _sync_loop 不再自己
+    重新获取,只读 _lease_valid 标志)。renew 失败 → 尝试 acquire,
+    保持 renewal task 为唯一续约/重获取源。
+
+    续约失败时记录 error,主循环下一轮通过 _lease_valid=False 检测到并停止同步。
     """
     logger.info(
-        f"[crdb_sync] leader renewal task 启动(间隔 {_LEADER_RENEWAL_INTERVAL}s)"
+        f"[crdb_sync] leader renewal task 启动(间隔 {_LEADER_RENEWAL_INTERVAL}s,"
+        f"R39 P1-2: 唯一续约源,_sync_loop 只读 lease 标志)"
     )
     while True:
         try:
             await asyncio.sleep(_LEADER_RENEWAL_INTERVAL)
             ok = await _renew_leader_lease()
             if not ok:
-                logger.error(
+                logger.warning(
                     "[crdb_sync] renewal task: 续约失败,租约已丢失/被抢占,"
-                    "等待主循环检测并停止同步"
+                    "尝试重新获取(_sync_loop 等待 _lease_valid 恢复)"
                 )
+                # R39 P1-2: renewal task 负责重新获取(sleep 后重试)
+                await asyncio.sleep(_LEADER_RENEWAL_INTERVAL)
+                if not await _acquire_leader_lease():
+                    logger.error(
+                        "[crdb_sync] renewal task: 重新获取租约失败,"
+                        "_lease_valid 仍为 False,_sync_loop 将跳过同步"
+                    )
         except asyncio.CancelledError:
             logger.info("[crdb_sync] leader renewal task 收到取消信号,退出")
             raise
@@ -465,6 +577,270 @@ async def _sync_cells():
 async def _get_dirty_cells():
     from database.cache_store import get_cache_store
     return await get_cache_store().get_dirty_cells_local(50)
+
+
+# ──────────────────────────────────────────────────────────────
+# R39 P0-4: dirty_outbox 通用 dispatcher (事务发件箱消费)
+#
+# 设计:
+#   - Bot 写本地 SQLite + add_dirty_outbox(table, pk, op, payload)
+#   - crdb_sync 消费 dirty_outbox: 按 table_name 分组 dispatch 到 CRDB
+#   - 成功后 mark_dirty_processed(ids)
+#   - 未知 table/operation → DEAD (不标记 processed, 保留供人工检查, 避免丢弃)
+#
+# 已有专用同步循环覆盖的表 (jobs/cells):
+#   - jobs 由 _sync_jobs (sync_local_jobs_to_crdb) 处理
+#   - cells 由 _sync_cells (sync_dirty_cells_to_crdb) 处理
+#   - 这两类的 dirty_outbox 记录直接标记 processed (避免重复处理)
+# ──────────────────────────────────────────────────────────────
+
+
+async def _get_dirty_outbox():
+    """R39 P0-4: 检查 dirty_outbox 是否有未处理记录 (供 _sync_loop 判断是否有 dirty)。"""
+    store = _get_cache_store_safe()
+    if store is None:
+        return []
+    return await store.get_dirty_outbox_batch(limit=100)
+
+
+async def _dispatch_file_records_upsert(records: list[dict]) -> list[int]:
+    """R39 P0-4: 将 file_records 的 dirty_outbox 记录 UPSERT 到 CRDB。
+
+    Args:
+        records: dirty_outbox 行列表 (含 payload JSON 行快照)
+
+    Returns:
+        成功处理的 dirty_outbox.id 列表
+    """
+    from database.session import get_file_records_col
+
+    col = get_file_records_col()
+    processed_ids: list[int] = []
+    # file_records 表字段 (与 DDL 对齐, 排除 file_code 作为 conflict key)
+    _UPSERT_COLS = [
+        "file_code", "uploader_id", "primary_channel_id",
+        "primary_channel_msg_id", "file_types", "backup_channel_msg_ids",
+        "batch_msg_ids", "batch_file_meta", "file_ids", "status",
+        "request_count", "create_time", "expire_time",
+    ]
+    for r in records:
+        rid = r.get("id")
+        payload = r.get("payload")
+        if not payload:
+            logger.warning(f"[crdb_sync] R39 P0-4: dirty_outbox id={rid} 无 payload, 跳过")
+            continue
+        try:
+            row = json.loads(payload) if isinstance(payload, str) else payload
+            # 仅保留 DDL 中已知列, 缺失字段填 NULL
+            values = [row.get(c) for c in _UPSERT_COLS]
+            placeholders = [f"${i + 1}" for i in range(len(_UPSERT_COLS))]
+            # ON CONFLICT (file_code) DO UPDATE: 更新除 file_code 外的所有列
+            update_cols = [c for c in _UPSERT_COLS if c != "file_code"]
+            set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+            sql = (
+                f"INSERT INTO file_records ({', '.join(_UPSERT_COLS)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"ON CONFLICT (file_code) DO UPDATE SET {set_clause}"
+            )
+            await col.execute_raw(sql, values)
+            processed_ids.append(rid)
+        except Exception as e:
+            logger.warning(f"[crdb_sync] R39 P0-4: file_records UPSERT 失败 id={rid}: {e}")
+    return processed_ids
+
+
+async def _dispatch_codes_upsert(records: list[dict]) -> list[int]:
+    """R39 P0-4: 将 codes 的 dirty_outbox 记录 UPSERT 到 CRDB。
+
+    Args:
+        records: dirty_outbox 行列表 (含 payload JSON 行快照)
+
+    Returns:
+        成功处理的 dirty_outbox.id 列表
+    """
+    from database.session import get_codes_col
+
+    col = get_codes_col()
+    processed_ids: list[int] = []
+    # codes 表字段 (与 DDL 对齐, 排除 code 作为 conflict key)
+    _UPSERT_COLS = [
+        "code", "file_record_code", "uploader_id", "file_types",
+        "batch_msg_ids", "batch_file_meta", "primary_channel_id",
+        "status", "created_at", "expire_time",
+    ]
+    for r in records:
+        rid = r.get("id")
+        payload = r.get("payload")
+        if not payload:
+            logger.warning(f"[crdb_sync] R39 P0-4: dirty_outbox id={rid} 无 payload, 跳过")
+            continue
+        try:
+            row = json.loads(payload) if isinstance(payload, str) else payload
+            values = [row.get(c) for c in _UPSERT_COLS]
+            placeholders = [f"${i + 1}" for i in range(len(_UPSERT_COLS))]
+            update_cols = [c for c in _UPSERT_COLS if c != "code"]
+            set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+            sql = (
+                f"INSERT INTO codes ({', '.join(_UPSERT_COLS)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"ON CONFLICT (code) DO UPDATE SET {set_clause}"
+            )
+            await col.execute_raw(sql, values)
+            processed_ids.append(rid)
+        except Exception as e:
+            logger.warning(f"[crdb_sync] R39 P0-4: codes UPSERT 失败 id={rid}: {e}")
+    return processed_ids
+
+
+async def _dispatch_users_upsert(records: list[dict]) -> list[int]:
+    """R39 P0-4: 将 users 的 dirty_outbox 记录 UPSERT 到 CRDB。
+
+    Args:
+        records: dirty_outbox 行列表 (含 payload JSON 行快照)
+
+    Returns:
+        成功处理的 dirty_outbox.id 列表
+    """
+    from database.session import get_users_col
+
+    col = get_users_col()
+    processed_ids: list[int] = []
+    # users 表字段 (与 DDL 对齐, 排除 user_id 作为 conflict key)
+    _UPSERT_COLS = [
+        "user_id", "username", "first_name", "membership_level",
+        "daily_decode_quota", "quota_used_today", "quota_date",
+        "can_upload", "external_decode_quota", "external_used_today",
+        "external_quota_date", "is_banned", "created_at", "updated_at",
+    ]
+    for r in records:
+        rid = r.get("id")
+        payload = r.get("payload")
+        if not payload:
+            logger.warning(f"[crdb_sync] R39 P0-4: dirty_outbox id={rid} 无 payload, 跳过")
+            continue
+        try:
+            row = json.loads(payload) if isinstance(payload, str) else payload
+            values = [row.get(c) for c in _UPSERT_COLS]
+            placeholders = [f"${i + 1}" for i in range(len(_UPSERT_COLS))]
+            update_cols = [c for c in _UPSERT_COLS if c != "user_id"]
+            set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+            sql = (
+                f"INSERT INTO users ({', '.join(_UPSERT_COLS)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"ON CONFLICT (user_id) DO UPDATE SET {set_clause}"
+            )
+            await col.execute_raw(sql, values)
+            processed_ids.append(rid)
+        except Exception as e:
+            logger.warning(f"[crdb_sync] R39 P0-4: users UPSERT 失败 id={rid}: {e}")
+    return processed_ids
+
+
+# R39 P0-4: table_name → dispatcher 映射 (jobs/cells 由专用循环处理, 此处跳过)
+# 未知 table 不在此映射中 → 走 DEAD 分支 (保留不标记 processed)
+_DIRTY_OUTBOX_TABLE_HANDLERS = {
+    "file_records": _dispatch_file_records_upsert,
+    "codes": _dispatch_codes_upsert,
+    "users": _dispatch_users_upsert,
+}
+# 已由专用同步循环覆盖的表 (dirty_outbox 记录直接标记 processed, 避免重复处理)
+_DIRTY_OUTBOX_TABLES_DELEGATED = {"jobs", "cells"}
+
+
+async def _dispatch_dirty_outbox_to_crdb(
+    table_name: str, records: list[dict],
+) -> list[int]:
+    """R39 P0-4: 按 table_name 分发 dirty_outbox 记录到 CRDB。
+
+    分发规则:
+        - file_records / codes / users → UPSERT 到对应 CRDB 表
+        - jobs / cells → 已由专用同步循环 (_sync_jobs / _sync_cells) 处理,
+          此处直接标记为 processed (避免重复 UPSERT)
+        - 未知 table_name → DEAD: 不标记 processed, 保留供人工检查
+          (避免静默丢弃变更, 违反"不能丢弃"原则)
+        - 未知 operation (非 upsert/tombstone) → DEAD: 同上
+
+    Args:
+        table_name: 受影响表名
+        records: 该表的 dirty_outbox 行列表
+
+    Returns:
+        成功处理的 dirty_outbox.id 列表 (DEAD 分支返回空列表)
+    """
+    # 已由专用循环覆盖的表: 直接标记 processed
+    if table_name in _DIRTY_OUTBOX_TABLES_DELEGATED:
+        logger.debug(
+            f"[crdb_sync] R39 P0-4: {table_name} 由专用同步循环处理, "
+            f"dirty_outbox {len(records)} 条直接标记 processed"
+        )
+        return [r.get("id") for r in records if r.get("id") is not None]
+
+    # 已知 table: 调用对应 dispatcher
+    handler = _DIRTY_OUTBOX_TABLE_HANDLERS.get(table_name)
+    if handler is not None:
+        # 检查 operation: 仅处理 upsert, tombstone 暂走 DEAD (待后续实现)
+        valid_ops = {"upsert"}
+        valid_records = [r for r in records if r.get("operation") in valid_ops]
+        dead_records = [r for r in records if r.get("operation") not in valid_ops]
+        if dead_records:
+            logger.error(
+                f"[crdb_sync] R39 P0-4: table={table_name} 含未知 operation "
+                f"{len(dead_records)} 条 → DEAD (不标记 processed): "
+                f"ops={[r.get('operation') for r in dead_records]}"
+            )
+        if not valid_records:
+            return []
+        return await handler(valid_records)
+
+    # 未知 table → DEAD: 不标记 processed, 保留供人工检查
+    logger.error(
+        f"[crdb_sync] R39 P0-4: 未知 table_name={table_name}, "
+        f"records={len(records)} 条 → DEAD (不标记 processed, 保留供人工检查)"
+    )
+    return []
+
+
+async def _sync_dirty_outbox():
+    """R39 P0-4: 消费 dirty_outbox — 按 table_name 分组 dispatch 到 CRDB。
+
+    流程:
+        1. get_dirty_outbox_batch(100): 拉取未处理记录
+        2. 按 table_name 分组
+        3. 调用 _dispatch_dirty_outbox_to_crdb(table, records)
+        4. mark_dirty_processed(ids): 标记成功处理的记录
+
+    幂等: dispatcher 使用 INSERT ON CONFLICT DO UPDATE, 重复处理不会产生副作用。
+    """
+    store = _get_cache_store_safe()
+    if store is None:
+        return
+    batch = await store.get_dirty_outbox_batch(limit=100)
+    if not batch:
+        return
+
+    # 按 table_name 分组
+    groups: dict[str, list[dict]] = {}
+    for r in batch:
+        tn = r.get("table_name", "") or ""
+        groups.setdefault(tn, []).append(r)
+
+    all_processed: list[int] = []
+    for table_name, records in groups.items():
+        try:
+            ids = await _dispatch_dirty_outbox_to_crdb(table_name, records)
+            all_processed.extend(ids)
+        except Exception as e:
+            logger.warning(
+                f"[crdb_sync] R39 P0-4: dispatch table={table_name} 异常: {e}"
+            )
+
+    # 标记已处理 (仅成功 dispatch 的记录)
+    if all_processed:
+        await store.mark_dirty_processed(all_processed)
+        logger.debug(
+            f"[crdb_sync] R39 P0-4: dirty_outbox 已处理 "
+            f"{len(all_processed)}/{len(batch)} 条"
+        )
 
 
 async def main():
@@ -513,6 +889,7 @@ async def main():
     from database import close_db
 
     # 并发运行同步循环 + R38 P0-4: 独立 leader renewal task
+    # R39 P0-4: 新增 sync-dirty-outbox 循环, 消费 dirty_outbox (file_records/codes/users)
     tasks = [
         asyncio.create_task(
             _sync_loop("jobs", _sync_jobs, _get_dirty_jobs, None),
@@ -521,6 +898,11 @@ async def main():
         asyncio.create_task(
             _sync_loop("cells", _sync_cells, _get_dirty_cells, None),
             name="sync-cells",
+        ),
+        # R39 P0-4: dirty_outbox dispatcher (与 jobs/cells 循环并行运行)
+        asyncio.create_task(
+            _sync_loop("dirty_outbox", _sync_dirty_outbox, _get_dirty_outbox, None),
+            name="sync-dirty-outbox",
         ),
         asyncio.create_task(
             _leader_renewal_task(),

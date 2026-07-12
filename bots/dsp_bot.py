@@ -65,16 +65,21 @@ async def _upsert_delivery_receipt_safe(
     store, job_id: int, source_msg_id: int, target_user_id: int,
     status: str = "PENDING", sent_msg_id: int | None = None,
     media_group_id: str = "", group_receipt_id: str = "",
-) -> None:
-    """异常安全地写入/更新投递回执(失败仅记录 warning,不传播到主流程)。
+) -> bool:
+    """R39 P1-11: 异常安全地写入/更新投递回执(失败返回 False,供调用方暂停 job)。
 
     作为 _sent_msg_tracker 的持久化权威层:
     - 投递前写 PENDING
     - 投递成功后由 _confirm_delivery_receipt_safe 升级为 CONFIRMED
     - 投递失败后由 _mark_delivery_failed_safe 标记 FAILED
+
+    R39 P1-11 改进: 不再"失败仅记录 warning 后继续"。
+    权威 receipt 写失败时返回 False,调用方应暂停该 job(标记 receipt_pending),
+    不继续执行 Telegram 副作用(防止进程崩溃后重复发送)。
     """
     if store is None:
-        return
+        # R39 P1-11: store 不可用时返回 False(调用方应暂停 job)
+        return False
     try:
         await store.upsert_delivery_receipt(
             job_id, source_msg_id, target_user_id,
@@ -83,28 +88,56 @@ async def _upsert_delivery_receipt_safe(
             group_receipt_id=group_receipt_id,
             status=status,
         )
+        return True
     except Exception as e:
-        logger.warning(
-            f"[Dsp] upsert_delivery_receipt 失败(忽略) "
+        # R39 P1-11: receipt 写失败 → 返回 False,调用方应暂停 job
+        logger.error(
+            f"[Dsp] R39 P1-11: upsert_delivery_receipt 失败(应暂停 job) "
             f"job={job_id}, msg={source_msg_id}, status={status}: {e}"
         )
+        return False
 
 
 async def _confirm_delivery_receipt_safe(
     store, job_id: int, source_msg_id: int, sent_msg_id: int,
-) -> None:
-    """异常安全地确认投递回执(status='CONFIRMED', confirmed_at=now)。
+) -> bool:
+    """R39 P1-11: 异常安全地确认投递回执(status='CONFIRMED', confirmed_at=now)。
 
     与 _sent_msg_tracker.setdefault(...).add(mid) 双写,保证向后兼容。
+
+    R39 P1-11 改进: 失败时返回 False,调用方应暂停 job(标记 receipt_pending)。
+    """
+    if store is None:
+        return False
+    try:
+        await store.confirm_delivery_receipt(job_id, source_msg_id, sent_msg_id)
+        return True
+    except Exception as e:
+        logger.error(
+            f"[Dsp] R39 P1-11: confirm_delivery_receipt 失败(应暂停 job) "
+            f"job={job_id}, msg={source_msg_id}: {e}"
+        )
+        return False
+
+
+async def _pause_job_for_receipt_failure(store, job_id: int) -> None:
+    """R39 P1-11: receipt 写失败时暂停该 job(标记 receipt_pending),防止重复发送。
+
+    将 job 状态标记为 'receipt_pending',Dsp 主循环跳过此状态的 job,
+    直到运维/定时任务恢复(修复 receipt 后重新入队)。
     """
     if store is None:
         return
     try:
-        await store.confirm_delivery_receipt(job_id, source_msg_id, sent_msg_id)
-    except Exception as e:
+        # 标记 job 为 receipt_pending(暂停投递,等待 receipt 恢复)
+        await store.update_local_job_status(job_id, "receipt_pending")
         logger.warning(
-            f"[Dsp] confirm_delivery_receipt 失败(忽略) "
-            f"job={job_id}, msg={source_msg_id}: {e}"
+            f"[Dsp] R39 P1-11: job={job_id} 已暂停(receipt_pending),"
+            f"等待 receipt 恢复后重新入队"
+        )
+    except Exception as e:
+        logger.error(
+            f"[Dsp] R39 P1-11: 暂停 job={job_id} 失败(可能重复投递): {e}"
         )
 
 
@@ -800,9 +833,14 @@ async def _process_single_job(bot, job, bot_id: int = 1):
                 return True
         except Exception as e:
             logger.warning(f"[Dsp] 检查 delivery_receipt 幂等失败(忽略): {e}")
-    await _upsert_delivery_receipt_safe(
+    # R39 P1-11: PENDING receipt 写失败时暂停 job,不继续 Telegram 副作用
+    _receipt_ok = await _upsert_delivery_receipt_safe(
         store, job.job_id, msg_id, job.target_user_id, status="PENDING"
     )
+    if not _receipt_ok:
+        # receipt 写失败 → 暂停 job(防止进程崩溃后重复发送)
+        await _pause_job_for_receipt_failure(store, job.job_id)
+        return False
 
     # R35 §22: 优先尝试 ReplicaAwareResolver(按 manifest 副本解析,fail-closed)
     # R36 B0-1: 优先从结构化字段读取,使 Resolver 成为真实投递主路径
