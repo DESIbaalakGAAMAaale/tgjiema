@@ -167,9 +167,12 @@ def run_db_writer():
         try:
             await writer.init()
         except Exception as e:
-            # P1修复: init 失败时 exit(1) 让 systemd StartLimitBurst 生效,
-            # 反复失败后进入停止状态而非无限重启循环
+            # P1修复: init 失败时先清理资源再 exit(1) 让 systemd 生效
             logger.error(f"[db_writer] 初始化失败,退出: {e}")
+            try:
+                await writer.close()
+            except Exception as ce:
+                logger.error(f"[db_writer] 初始化失败后清理资源也失败: {ce}")
             import sys as _sys
             _sys.exit(1)
         try:

@@ -2763,10 +2763,6 @@ class CacheStoreRouter(CacheStore):
     零调用方改动:所有改造在本子类内完成,19 个引用 cache_store 的文件无需修改。
     """
 
-    def __init__(self):
-        super().__init__()
-        self._route_to_redis = True  # bot 进程启用路由
-
     # ── 重写高频写方法(路由到 Redis Queue)──
 
     async def write_heartbeat(self, slot_id: str, ok: bool, _batch: bool = False):
@@ -3186,10 +3182,13 @@ class CacheStoreRouter(CacheStore):
     # ── CAS 写方法(直写 SQLite + 失效读缓存,保证强一致)──
 
     async def try_consume_quota(self, user_id: int, is_external: bool = False) -> bool:
-        """CAS 扣减配额 — 直写 SQLite(保证强一致),写后失效配额缓存"""
+        """CAS 扣减配额 — 直写 SQLite(保证强一致),仅扣减成功时失效配额缓存
+        (P1修复: 扣减失败时不删缓存,避免误删其他进程刚写入的有效缓存)
+        """
         result = await super().try_consume_quota(user_id, is_external)
-        from database import redis_queue
-        await redis_queue.cache_delete(f"cache:user_quota:{user_id}")
+        if result:
+            from database import redis_queue
+            await redis_queue.cache_delete(f"cache:user_quota:{user_id}")
         return result
 
     async def bulk_upsert_cells_local(self, cells: list[dict]):
@@ -3197,6 +3196,21 @@ class CacheStoreRouter(CacheStore):
         await super().bulk_upsert_cells_local(cells)
         from database import redis_queue
         await redis_queue.cache_delete("cache:all_cells")
+
+    async def delete_file_record_local(self, file_code: str):
+        """删除文件记录 — 路由到 Redis Queue,写后失效文件记录缓存
+        (P0修复: 原先未重写,绕过 Redis 串行化且不失效 cache:file_record,
+        导致 get_file_record_local 读到已删除的记录)
+        """
+        from database import write_router
+        return await write_router.route_write(
+            method_name="delete_file_record_local",
+            table="file_records_local",
+            op_type="delete",
+            data={"file_code": file_code},
+            redis_key=f"cache:file_record:{file_code}",
+            fallback=lambda: super(CacheStoreRouter, self).delete_file_record_local(file_code),
+        )
 
     async def batch_update_cells_local(self, updates: list[tuple[str, dict, bool]]):
         """原子批量更新 cells — 直写 SQLite(需事务原子性,不走 Redis),
@@ -3218,8 +3232,9 @@ class CacheStoreRouter(CacheStore):
     # ── 重写读方法(加 Redis 缓存层)──
 
     async def get_user_quota(self, user_id: int) -> dict | None:
-        """配额读取 — 优先 Redis 缓存(5s TTL),未命中回退 SQLite + 回填"""
+        """配额读取 — 优先 Redis 缓存,未命中回退 SQLite + 回填"""
         from database import redis_queue
+        from config import settings
         cache_key = f"cache:user_quota:{user_id}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
@@ -3228,12 +3243,13 @@ class CacheStoreRouter(CacheStore):
                 return parsed
         result = await super().get_user_quota(user_id)
         if result:
-            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=5)
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=settings.WRITER_CACHE_TTL_QUOTA)
         return result
 
     async def get_file_record_local(self, file_code: str) -> dict | None:
-        """文件记录读取 — 优先 Redis 缓存(30s TTL),未命中回退 SQLite + 回填"""
+        """文件记录读取 — 优先 Redis 缓存,未命中回退 SQLite + 回填"""
         from database import redis_queue
+        from config import settings
         cache_key = f"cache:file_record:{file_code}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
@@ -3242,12 +3258,13 @@ class CacheStoreRouter(CacheStore):
                 return parsed
         result = await super().get_file_record_local(file_code)
         if result:
-            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=settings.WRITER_CACHE_TTL_FILE_RECORD)
         return result
 
     async def get_code_local(self, code: str) -> dict | None:
-        """验证码读取 — 优先 Redis 缓存(30s TTL),未命中回退 SQLite + 回填"""
+        """验证码读取 — 优先 Redis 缓存,未命中回退 SQLite + 回填"""
         from database import redis_queue
+        from config import settings
         cache_key = f"cache:code:{code}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
@@ -3256,12 +3273,13 @@ class CacheStoreRouter(CacheStore):
                 return parsed
         result = await super().get_code_local(code)
         if result:
-            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=settings.WRITER_CACHE_TTL_CODE)
         return result
 
     async def get_user_local(self, user_id: int) -> dict | None:
-        """用户记录读取 — 优先 Redis 缓存(30s TTL),未命中回退 SQLite + 回填"""
+        """用户记录读取 — 优先 Redis 缓存,未命中回退 SQLite + 回填"""
         from database import redis_queue
+        from config import settings
         cache_key = f"cache:user:{user_id}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
@@ -3270,12 +3288,13 @@ class CacheStoreRouter(CacheStore):
                 return parsed
         result = await super().get_user_local(user_id)
         if result:
-            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=settings.WRITER_CACHE_TTL_USER)
         return result
 
     async def get_all_cells_local(self) -> list[dict]:
-        """全量 cells 读取 — 优先 Redis 缓存(10s TTL),未命中回退 SQLite + 回填"""
+        """全量 cells 读取 — 优先 Redis 缓存,未命中回退 SQLite + 回填"""
         from database import redis_queue
+        from config import settings
         cache_key = "cache:all_cells"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
@@ -3284,12 +3303,13 @@ class CacheStoreRouter(CacheStore):
                 return parsed
         result = await super().get_all_cells_local()
         if result:
-            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=10)
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=settings.WRITER_CACHE_TTL_CELLS)
         return result
 
     async def get_all_bot_heartbeats(self) -> dict[str, dict]:
-        """全量 Bot 心跳读取 — 优先 Redis 缓存(5s TTL),未命中回退 SQLite + 回填"""
+        """全量 Bot 心跳读取 — 优先 Redis 缓存,未命中回退 SQLite + 回填"""
         from database import redis_queue
+        from config import settings
         cache_key = "cache:all_bot_heartbeats"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
@@ -3298,19 +3318,20 @@ class CacheStoreRouter(CacheStore):
                 return parsed
         result = await super().get_all_bot_heartbeats()
         if result:
-            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=5)
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=settings.WRITER_CACHE_TTL_BOT_HB)
         return result
 
     async def get_kv(self, key: str) -> str | None:
-        """KV 读取 — 优先 Redis 缓存(60s TTL),未命中回退 SQLite + 回填"""
+        """KV 读取 — 优先 Redis 缓存,未命中回退 SQLite + 回填"""
         from database import redis_queue
+        from config import settings
         cache_key = f"cache:kv:{key}"
         cached = await redis_queue.cache_get(cache_key)
         if cached is not None:
             return cached
         result = await super().get_kv(key)
         if result is not None:
-            await redis_queue.cache_set(cache_key, result, ttl=60)
+            await redis_queue.cache_set(cache_key, result, ttl=settings.WRITER_CACHE_TTL_KV)
         return result
 
 

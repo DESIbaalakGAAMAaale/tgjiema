@@ -205,7 +205,7 @@ SERVICES=(
     "admin_bot:管理员Bot:管理配置、用户、重置等操作"
     "admin:Web管理后台:Web管理面板，fastapi+uvicorn"
     "db_backup:数据库备份:定期备份数据库到R2"
-    "db_writer:数据库写入:40:always:10"
+    "db_writer:数据库写入:40:on-failure:10"
 )
 
 # 生成 systemd 模板函数

@@ -328,7 +328,27 @@ class MonBot:
                         f"Writer 队列积压严重: {writer_queue_len} 条(阈值 {writer_threshold})"))
                 elif writer_queue_len > writer_threshold // 2:
                     alerts_to_check.append(("writer_queue_backlog", "WARNING",
-                        f"Writer 队列积压偏高: {writer_queue_len} 条(阈值 {writer_threshold})"))
+                        f"Writer 队列积压偏高: {writer_queue_len} 条(警告阈值 {writer_threshold // 2}, 严重阈值 {writer_threshold})"))
+            elif writer_queue_len == -1:
+                # P1修复: Redis 不可达时也告警,避免 db_writer 静默故障
+                alerts_to_check.append(("writer_redis_unavailable", "WARNING",
+                    "Writer 队列检查失败(Redis 不可达),db_writer 可能无法消费消息"))
+
+            # db_writer 服务状态告警(P1修复: 原先仅日志不告警,db_writer 宕机会被忽略)
+            dw_status = "unknown"
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "systemctl", "is-active", "tgjiema-db_writer",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+                dw_status = stdout.decode().strip() or "unknown"
+            except Exception as e:
+                logger.debug(f"[Mon] db_writer 服务状态检查异常: {e}")
+            if dw_status not in ("active", "unknown"):
+                alerts_to_check.append(("db_writer_down", "CRITICAL",
+                    f"db_writer 服务异常: 状态={dw_status},写操作无法落盘 SQLite"))
 
             # 账号存活率
             if total > 0:

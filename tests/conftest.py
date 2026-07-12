@@ -33,7 +33,14 @@ def _install_fake_config() -> None:
     settings.WRITER_QUEUE_KEY = "tgjiema:writer:queue"
     settings.WRITER_BATCH_SIZE = 10
     settings.WRITER_QUEUE_ALERT_THRESHOLD = 1000
-    settings.WRITER_READ_CACHE_TTL = 5
+    # P2修复: 分级 TTL 配置
+    settings.WRITER_CACHE_TTL_QUOTA = 5
+    settings.WRITER_CACHE_TTL_FILE_RECORD = 30
+    settings.WRITER_CACHE_TTL_CODE = 30
+    settings.WRITER_CACHE_TTL_USER = 30
+    settings.WRITER_CACHE_TTL_CELLS = 10
+    settings.WRITER_CACHE_TTL_BOT_HB = 5
+    settings.WRITER_CACHE_TTL_KV = 60
     settings.WRITER_DEAD_QUEUE_KEY = "tgjiema:writer:dead"
     settings.CRDB_POOL_MIN_SIZE = 1
     settings.CRDB_POOL_MAX_SIZE = 5
@@ -130,6 +137,8 @@ def reset_redis_queue_state():
     rq._redis_available = False
     rq._redis_init_attempted = False
     rq._redis_last_attempt_ts = 0.0
+    # P1修复: 重置 asyncio Lock,避免跨事件循环复用导致死锁
+    rq._redis_init_lock = None
     yield
 
 
@@ -151,6 +160,8 @@ def mock_redis():
     client.ping = AsyncMock(return_value=True)
     client.lpush = AsyncMock(return_value=1)
     client.brpop = AsyncMock(return_value=None)    # 默认超时返回 None
+    client.rpush = AsyncMock(return_value=1)       # P0修复: 死信队列用
+    client.lpop = AsyncMock(return_value=None)    # P1修复: 批量弹出用
     client.delete = AsyncMock(return_value=1)
     client.llen = AsyncMock(return_value=0)
     client.get = AsyncMock(return_value=None)      # 默认缓存未命中

@@ -35,6 +35,7 @@ _ALLOWED_METHODS: frozenset[str] = frozenset({
     "mark_quota_synced", "invalidate_user_quota",
     # 热路径全表缓存 CRUD
     "upsert_file_record_local", "upsert_code_local", "upsert_user_local",
+    "delete_file_record_local",  # P0修复: 文件记录删除也入队
     "mark_file_record_synced", "mark_code_synced", "mark_user_synced",
     # cells 本地逐行存储
     "update_cell_fields_local", "increment_cell_file_count_local",
@@ -56,6 +57,10 @@ _ALLOWED_METHODS: frozenset[str] = frozenset({
     "save_counter_snapshot",
     # Manifest 副本同步
     "upsert_manifest", "upsert_manifest_batch",
+    # CAS/事务操作(虽在 DIRECT_WRITE 集合中,但也提供支持以防路由策略调整)
+    "try_consume_quota", "mark_local_job_dispatched",
+    "reactivate_waiting_start_jobs", "reclaim_stale_dispatched",
+    "insert_local_job", "has_new_upload", "has_new_dsp_job",
     # 通用
     "delete", "cleanup", "cleanup_notify_tables",
 })

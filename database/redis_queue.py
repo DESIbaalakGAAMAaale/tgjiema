@@ -18,6 +18,7 @@
 }
 """
 import json
+import os
 import time
 from typing import Any, Optional
 
@@ -29,36 +30,61 @@ _redis_init_attempted: bool = False
 _redis_available: bool = False
 _redis_last_attempt_ts: float = 0
 _REDIS_RETRY_INTERVAL = 60.0  # 失败后 60 秒重试
+_redis_init_lock = None  # asyncio.Lock,延迟初始化(P1修复: 防止并发 race)
+
+
+def _get_init_lock():
+    """延迟获取 asyncio.Lock(避免在模块加载时创建事件循环)"""
+    global _redis_init_lock
+    if _redis_init_lock is None:
+        _redis_init_lock = __import__("asyncio").Lock()
+    return _redis_init_lock
 
 
 async def get_redis() -> Any:
-    """获取 Redis 客户端(延迟初始化)。未配置或连接失败返回 None。"""
+    """获取 Redis 客户端(延迟初始化)。未配置或连接失败返回 None。
+
+    P1修复: 用 asyncio.Lock 双检锁防止并发初始化导致 socket 泄漏
+    P1修复: 连接失败时 aclose 旧 client 再置 None
+    """
     global _redis_client, _redis_init_attempted, _redis_available, _redis_last_attempt_ts
     if _redis_available and _redis_client:
         return _redis_client
-    now = time.time()
-    if _redis_init_attempted and (now - _redis_last_attempt_ts) < _REDIS_RETRY_INTERVAL:
-        return None
-    _redis_init_attempted = True
-    _redis_last_attempt_ts = now
+    # REDIS_URL 为空时直接返回,不走重试节流
     from config import settings
     if not settings.REDIS_URL:
         return None
-    try:
-        import redis.asyncio as aioredis
-        _redis_client = aioredis.from_url(
-            settings.REDIS_URL,
-            decode_responses=True,
-            socket_timeout=2.0,
-            socket_connect_timeout=2.0,
-        )
-        await _redis_client.ping()
-        _redis_available = True
-        logger.info("[RedisQueue] 连接成功,Writer 缓冲层已启用")
-    except Exception as e:
-        logger.warning(f"[RedisQueue] 连接失败,降级到 SQLite 直写(60s 后重试): {e}")
-        _redis_available = False
-        _redis_client = None
+    now = time.time()
+    if _redis_init_attempted and (now - _redis_last_attempt_ts) < _REDIS_RETRY_INTERVAL:
+        return None
+    # P1修复: asyncio.Lock 防止多协程并发初始化
+    async with _get_init_lock():
+        # 双检锁:拿到锁后再次检查(可能其他协程已完成初始化)
+        if _redis_available and _redis_client:
+            return _redis_client
+        _redis_init_attempted = True
+        _redis_last_attempt_ts = now
+        try:
+            import redis.asyncio as aioredis
+            _redis_client = aioredis.from_url(
+                settings.REDIS_URL,
+                decode_responses=True,
+                socket_timeout=2.0,
+                socket_connect_timeout=2.0,
+            )
+            await _redis_client.ping()
+            _redis_available = True
+            logger.info("[RedisQueue] 连接成功,Writer 缓冲层已启用")
+        except Exception as e:
+            logger.warning(f"[RedisQueue] 连接失败,降级到 SQLite 直写(60s 后重试): {e}")
+            # P1修复: aclose 旧 client 再置 None,避免 socket 泄漏
+            if _redis_client is not None:
+                try:
+                    await _redis_client.aclose()
+                except Exception:
+                    pass
+            _redis_available = False
+            _redis_client = None
     return _redis_client if _redis_available else None
 
 
@@ -97,11 +123,15 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
 
 
 async def pop(timeout: int = 0, count: int = 1) -> list[dict]:
-    """从 Redis Queue 弹出消息(BRPOP,阻塞)。
+    """从 Redis Queue 弹出消息(BRPOP + LPOP 组合,避免批量退化)。
+
+    P1修复: 首条用 BRPOP(阻塞等待),后续 count-1 条用 LPOP(非阻塞立即返回),
+    避免低吞吐下循环 BRPOP 导致的空等。
+    P1修复: JSON 解析失败的消息入死信队列,不永久丢失。
 
     Args:
-        timeout: 阻塞超时秒数,0 表示永久阻塞
-        count: 单次弹出数量(减少往返,实际用循环实现)
+        timeout: 阻塞超时秒数,0 表示永久阻塞(仅对首条生效)
+        count: 单次弹出数量
 
     Returns:
         消息列表,空列表表示超时或降级
@@ -112,21 +142,28 @@ async def pop(timeout: int = 0, count: int = 1) -> list[dict]:
     try:
         from config import settings
         result = []
-        for _ in range(count):
-            item = await redis.brpop(settings.WRITER_QUEUE_KEY, timeout=timeout)
-            if item is None:
-                break
-            _key, raw = item
-            # P1修复: 单条消息 JSON 解析失败不影响整批,丢弃坏消息并告警
-            try:
-                msg = json.loads(raw)
-            except (json.JSONDecodeError, TypeError, ValueError) as e:
-                logger.warning(
-                    f"[RedisQueue] 消息 JSON 解析失败,丢弃该消息: {e}, "
-                    f"raw={raw!r}"
-                )
-                continue
+        # 首条:BRPOP 阻塞等待
+        item = await redis.brpop(settings.WRITER_QUEUE_KEY, timeout=timeout)
+        if item is None:
+            return []
+        _key, raw = item
+        try:
+            msg = json.loads(raw)
             result.append(msg)
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"[RedisQueue] BRPOP 消息 JSON 解析失败,入死信: {e}, raw={raw!r}")
+            await push_dead({"raw": raw}, reason=f"JSON decode failed: {e}")
+        # 后续 count-1 条:LPOP 非阻塞立即取(不等待)
+        for _ in range(count - 1):
+            raw2 = await redis.lpop(settings.WRITER_QUEUE_KEY)
+            if raw2 is None:
+                break  # 队列已空
+            try:
+                msg2 = json.loads(raw2)
+                result.append(msg2)
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                logger.warning(f"[RedisQueue] LPOP 消息 JSON 解析失败,入死信: {e}, raw={raw2!r}")
+                await push_dead({"raw": raw2}, reason=f"JSON decode failed: {e}")
         return result
     except Exception as e:
         logger.debug(f"[RedisQueue] pop 异常: {e}")
@@ -149,27 +186,41 @@ async def delete(key: str) -> bool:
 async def push_dead(msg: dict, reason: str = "") -> bool:
     """推入死信队列(P0修复: 处理失败的消息转入死信队列,避免永久丢失)。
 
+    P0修复: Redis 不可达时降级写本地文件 dead_letter.jsonl,避免消息永久丢失。
+
     Args:
         msg: 原始消息字典(或任意可序列化对象)
         reason: 失败原因(记录在消息中,便于排查)
 
     Returns:
-        True 推入成功, False 失败(此时消息已丢失,只能靠日志排查)
+        True 推入成功, False 失败(此时已降级写本地文件)
     """
+    from config import settings
+    dead_msg = {
+        "original": msg,
+        "reason": reason,
+        "failed_at": time.time(),
+    }
     redis = await get_redis()
-    if not redis:
-        return False
+    if redis:
+        try:
+            await redis.rpush(settings.WRITER_DEAD_QUEUE_KEY, json.dumps(dead_msg, default=str))
+            return True
+        except Exception as e:
+            logger.error(f"[RedisQueue] push_dead Redis 失败,降级写本地文件: {e}")
+    # P0修复: Redis 不可达时降级写本地文件,避免消息永久丢失
     try:
-        from config import settings
-        dead_msg = {
-            "original": msg,
-            "reason": reason,
-            "failed_at": time.time(),
-        }
-        await redis.rpush(settings.WRITER_DEAD_QUEUE_KEY, json.dumps(dead_msg, default=str))
+        dead_file = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data", "dead_letter.jsonl"
+        )
+        os.makedirs(os.path.dirname(dead_file), exist_ok=True)
+        with open(dead_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(dead_msg, default=str, ensure_ascii=False) + "\n")
+        logger.warning(f"[RedisQueue] 死信已写入本地文件: {dead_file}")
         return True
     except Exception as e:
-        logger.error(f"[RedisQueue] push_dead 失败(消息已丢失): {e}")
+        logger.error(f"[RedisQueue] push_dead 本地文件也失败(消息已丢失): {e}")
         return False
 
 

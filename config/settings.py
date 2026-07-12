@@ -117,8 +117,14 @@ class Settings(BaseSettings):
     WRITER_BATCH_SIZE: int = 10
     # Writer 队列积压告警阈值(mon_bot 监控)
     WRITER_QUEUE_ALERT_THRESHOLD: int = 1000
-    # 读缓存 TTL(秒),热数据 Redis 缓存过期时间
-    WRITER_READ_CACHE_TTL: int = 5
+    # 读缓存 TTL(秒),按数据类型分级(P2修复: 替代硬编码)
+    WRITER_CACHE_TTL_QUOTA: int = 5        # 用户配额(高频变更,短TTL)
+    WRITER_CACHE_TTL_FILE_RECORD: int = 30 # 文件记录(中频变更)
+    WRITER_CACHE_TTL_CODE: int = 30        # 验证码(中频变更)
+    WRITER_CACHE_TTL_USER: int = 30        # 用户记录(中频变更)
+    WRITER_CACHE_TTL_CELLS: int = 10       # 全量cells(中频变更)
+    WRITER_CACHE_TTL_BOT_HB: int = 5       # Bot心跳(高频变更,短TTL)
+    WRITER_CACHE_TTL_KV: int = 60          # KV存储(低频变更,长TTL)
     # 死信队列 key(P0修复: 处理失败的消息转入此队列,避免永久丢失)
     WRITER_DEAD_QUEUE_KEY: str = "tgjiema:writer:dead"
 
