@@ -1,5 +1,10 @@
+from __future__ import annotations
+
 import asyncio
+import hashlib
 import json
+import os
+import subprocess
 from datetime import datetime, timezone
 
 from loguru import logger
@@ -9,6 +14,7 @@ from database.session import _client as db_client, get_config, _validate_identif
 from storage.r2 import _r2 as r2_storage, configure_r2_dynamic
 from services.backup_schema import (
     BACKUP_SCHEMA, get_backup_tables, get_conflict_col,
+    get_tables_by_source,
 )
 
 # ─── 表清单(单一事实源: services/backup_schema.py) ───
@@ -23,6 +29,9 @@ _TABLE_WHERE = {t.name: t.where_clause for t in BACKUP_SCHEMA.values() if t.wher
 
 # 备份保留份数（超出则自动清理最旧的）
 MAX_BACKUP_RETENTION = 168  # 7天 × 24小时 / 1小时间隔 ≈ 168 份
+
+# R35 P1-7: Schema 版本(从 backup_schema 的表数量派生,用于 bundle manifest)
+_BACKUP_SCHEMA_VERSION = f"r35_batch3_{len(BACKUP_SCHEMA)}tables"
 
 # P0-3: 备份中不再脱敏敏感字段 (api_hash / r2_secret_key / r2_access_key)。
 # 备份仅存储在运维自有 R2 桶内(需可信环境),若替换为 ***REDACTED*** 占位符,
@@ -50,20 +59,94 @@ def _redact_secrets(data: dict) -> dict:
     return data
 
 
-async def backup_all_tables() -> dict:
-    """备份核心元数据表（含 codes/file_records 的取件映射）。
+# ═══════════════════════════════════════════════════════════════
+#  R35 P1-7: Bundle Manifest 辅助函数
+# ═══════════════════════════════════════════════════════════════
 
-    大表（decode_logs/jobs/pending_uploads/rotate_log）跳过：
-    - decode_logs/jobs 是短期流水数据，无需长期备份
-    - pending_uploads 是瞬时状态，重启后从频道重放
-    - rotate_log 是审计日志，数据量大但非核心
+def _get_commit_sha() -> str:
+    """获取当前 git commit SHA(R35 P1-7: bundle manifest 必含字段)。
+
+    优先级:
+    1. 环境变量 GIT_COMMIT_SHA(部署时注入)
+    2. git rev-parse HEAD(开发环境)
+    3. "unknown"(git 不可用时)
+    """
+    sha = os.environ.get("GIT_COMMIT_SHA", "").strip()
+    if sha:
+        return sha[:12]  # 短 SHA
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()[:12]
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _compute_sha256(content: bytes) -> str:
+    """计算内容的 SHA-256 校验和(R35 P1-7: bundle manifest 必含字段)。"""
+    return hashlib.sha256(content).hexdigest()
+
+
+def _build_bundle_manifest(
+    backup_data: dict,
+    content: bytes,
+    start_time: datetime,
+    end_time: datetime,
+) -> dict:
+    """构建 bundle manifest(R35 P1-7)。
+
+    Bundle 包含:
+    - commit SHA(git rev-parse HEAD 或环境变量)
+    - schema version(backup_schema 版本)
+    - 每表行数
+    - SHA-256 checksum(整个 backup JSON 的校验和)
+    - 开始/结束时间
+    - source 标记(crdb/sqlite/relay_sqlite)
+    """
+    tables = backup_data.get("tables", {})
+    table_stats = {}
+    for table_name, rows in tables.items():
+        source = "unknown"
+        if table_name in BACKUP_SCHEMA:
+            source = BACKUP_SCHEMA[table_name].source
+        table_stats[table_name] = {
+            "row_count": len(rows),
+            "source": source,
+        }
+
+    return {
+        "version": "2.0",  # R35: bundle manifest v2(含 source 标记)
+        "commit_sha": _get_commit_sha(),
+        "schema_version": _BACKUP_SCHEMA_VERSION,
+        "checksum_sha256": _compute_sha256(content),
+        "content_size_bytes": len(content),
+        "backup_started_at": start_time.isoformat(),
+        "backup_finished_at": end_time.isoformat(),
+        "table_stats": table_stats,
+        "total_tables": len(tables),
+        "total_rows": sum(len(v) for v in tables.values()),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  R35 P1-5: 按 source 分组的备份快照器
+# ═══════════════════════════════════════════════════════════════
+
+async def _backup_crdb_tables(tables: list[str]) -> dict:
+    """备份 CRDB 表(走 CockroachDB SELECT *)。
+
+    R35 P1-5: 仅备份 source="crdb" 的表,避免对 SQLite-only 表执行 CRDB 查询。
     """
     results = {}
-    for table in sorted(BACKUP_TABLES):
+    for table in sorted(tables):
         try:
-            safe_name = table.replace('"', '""')
+            safe_name = _validate_identifier(table)
             where = _TABLE_WHERE.get(table)
-            # 所有核心表均不限制行数，确保完整备份可恢复
             if where:
                 sql = f'SELECT * FROM "{safe_name}" WHERE {where}'
             else:
@@ -71,15 +154,131 @@ async def backup_all_tables() -> dict:
             # 使用公共 fetch API,避免访问 _pool 私有属性
             records = await db_client.fetch(sql)
             results[table] = [dict(r) for r in records]
-            logger.debug(f"[Backup] {table}: {len(records)} 行")
+            logger.debug(f"[Backup][CRDB] {table}: {len(records)} 行")
         except Exception as e:
             # 表不存在时降级为 DEBUG(如 kv_config 在部分部署中不存在)
             if "does not exist" in str(e):
-                logger.debug(f"[Backup] 表 {table} 不存在,跳过: {e}")
+                logger.debug(f"[Backup][CRDB] 表 {table} 不存在,跳过: {e}")
             else:
-                logger.warning(f"[Backup] 跳过表 {table}: {e}")
+                logger.warning(f"[Backup][CRDB] 跳过表 {table}: {e}")
+    return results
 
-    return {"backup_time": datetime.now(timezone.utc).isoformat(), "tables": results}
+
+async def _backup_sqlite_tables(tables: list[str], db_path) -> dict:
+    """备份 SQLite 表(从 cache_store.db 读取)。
+
+    R35 P1-5: source="sqlite" 的表走此路径,而非 CRDB。
+    使用独立的只读连接,不干扰 CacheStore 的运行时连接。
+
+    Args:
+        tables: 要备份的表名列表
+        db_path: SQLite 数据库文件路径(cache_store.db)
+    """
+    import aiosqlite
+
+    results = {}
+    if not os.path.exists(str(db_path)):
+        logger.warning(f"[Backup][SQLite] 数据库文件不存在,跳过: {db_path}")
+        return results
+
+    try:
+        async with aiosqlite.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10) as conn:
+            conn.row_factory = aiosqlite.Row
+            for table in sorted(tables):
+                try:
+                    safe_name = _validate_identifier(table)
+                    where = _TABLE_WHERE.get(table)
+                    if where:
+                        sql = f'SELECT * FROM "{safe_name}" WHERE {where}'
+                    else:
+                        sql = f'SELECT * FROM "{safe_name}"'
+                    cursor = await conn.execute(sql)
+                    rows = await cursor.fetchall()
+                    results[table] = [dict(r) for r in rows]
+                    logger.debug(f"[Backup][SQLite] {table}: {len(rows)} 行")
+                except Exception as e:
+                    if "no such table" in str(e).lower():
+                        logger.debug(f"[Backup][SQLite] 表 {table} 不存在,跳过: {e}")
+                    else:
+                        logger.warning(f"[Backup][SQLite] 跳过表 {table}: {e}")
+    except Exception as e:
+        logger.error(f"[Backup][SQLite] 打开数据库失败: {e}")
+    return results
+
+
+async def _backup_relay_sqlite_tables(tables: list[str]) -> dict:
+    """备份 relay SQLite 表(从 relay_pool.db 读取)。
+
+    R35 P1-5: source="relay_sqlite" 的表走此路径。
+    """
+    from database.relay_db import DB_PATH as RELAY_DB_PATH
+    return await _backup_sqlite_tables(tables, RELAY_DB_PATH)
+
+
+async def backup_all_tables() -> dict:
+    """备份所有核心表(按 source 分组,R35 P1-5/P1-7)。
+
+    R35 P1-5: 按 source 分组执行备份:
+    - source="crdb":        走 CRDB SELECT *
+    - source="sqlite":       走 SQLite SELECT *(从 cache_store.db)
+    - source="relay_sqlite": 走 relay SQLite SELECT *(从 relay_pool.db)
+    - source="redis":        跳过(暂不支持快照)
+
+    R35 P1-7: 生成 bundle manifest(commit SHA, schema version, 行数, SHA-256, 时间戳)。
+
+    大表(decode_logs/jobs/pending_uploads/rotate_log)跳过：
+    - decode_logs/jobs 是短期流水数据，无需长期备份
+    - pending_uploads 是瞬时状态，重启后从频道重放
+    - rotate_log 是审计日志，数据量大但非核心
+    """
+    start_time = datetime.now(timezone.utc)
+
+    # R35 P1-5: 按 source 分组备份
+    crdb_tables = get_tables_by_source("crdb")
+    sqlite_tables = get_tables_by_source("sqlite")
+    relay_sqlite_tables = get_tables_by_source("relay_sqlite")
+    redis_tables = get_tables_by_source("redis")
+
+    logger.info(
+        f"[Backup] 按 source 分组: CRDB={len(crdb_tables)}表, "
+        f"SQLite={len(sqlite_tables)}表, relay_sqlite={len(relay_sqlite_tables)}表, "
+        f"redis={len(redis_tables)}表(跳过)"
+    )
+
+    # 1. CRDB 表备份
+    crdb_data = await _backup_crdb_tables(crdb_tables)
+
+    # 2. SQLite 表备份(从 cache_store.db)
+    from database.cache_store import DB_PATH as CACHE_DB_PATH
+    sqlite_data = await _backup_sqlite_tables(sqlite_tables, CACHE_DB_PATH)
+
+    # 3. relay SQLite 表备份(从 relay_pool.db)
+    relay_data = await _backup_relay_sqlite_tables(relay_sqlite_tables)
+
+    # 4. Redis 表跳过(暂不支持快照)
+    if redis_tables:
+        logger.debug(f"[Backup][Redis] 跳过 {len(redis_tables)} 表(暂不支持快照): {redis_tables}")
+
+    # 合并所有数据
+    all_tables = {}
+    all_tables.update(crdb_data)
+    all_tables.update(sqlite_data)
+    all_tables.update(relay_data)
+
+    end_time = datetime.now(timezone.utc)
+
+    backup_data = {
+        "backup_time": start_time.isoformat(),
+        "tables": all_tables,
+    }
+
+    # R35 P1-7: 构建 bundle manifest 并附加到备份数据
+    # 先序列化表数据计算 checksum,再附加 manifest
+    tables_content = json.dumps(all_tables, default=str, ensure_ascii=False).encode("utf-8")
+    manifest = _build_bundle_manifest(backup_data, tables_content, start_time, end_time)
+    backup_data["manifest"] = manifest
+
+    return backup_data
 
 
 async def run_db_backup():
@@ -117,7 +316,18 @@ async def _run_backup_loop():
         enabled = enabled_cfg.lower() == "true"
     if not enabled:
         logger.info("数据库备份未启用(DB_BACKUP_ENABLED=false),跳过启动")
+        # R35 P1-7: 商用建议使用 CRDB Basic 托管备份
+        logger.warning(
+            "[R35-P1-7] 商用环境建议使用 CRDB Basic 每日托管备份(24h 自动快照,30 天保留),"
+            "而非自建每 6 小时全量 SELECT *。自建备份仅作补充手段。"
+        )
         return
+
+    # R35 P1-7: 启用自建备份时,日志警告商用建议
+    logger.warning(
+        "[R35-P1-7] 自建备份已启用。商用环境建议优先使用 CRDB Basic 托管备份,"
+        "自建全量 SELECT * 会产生额外 RU 开销。当前模式: 增量 journal + 低频完整校验(待实现)。"
+    )
 
     # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
     await configure_r2_dynamic()
@@ -146,9 +356,13 @@ async def _run_backup_loop():
             content = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
             await r2_storage.upload(key, content, "application/json")
             total_rows = sum(len(v) for v in data["tables"].values())
+            # R35 P1-7: 日志中包含 bundle manifest 摘要
+            manifest = data.get("manifest", {})
             logger.info(
                 f"数据库已备份到 R2: {key} ({len(content)} 字节, "
-                f"{len(data['tables'])} 表, {total_rows} 行)"
+                f"{len(data['tables'])} 表, {total_rows} 行, "
+                f"commit={manifest.get('commit_sha', 'unknown')}, "
+                f"checksum={manifest.get('checksum_sha256', 'unknown')[:16]}...)"
             )
 
             for table in data["tables"]:
@@ -231,8 +445,15 @@ async def list_backups() -> list[dict]:
     return objects
 
 
+# ═══════════════════════════════════════════════════════════════
+#  R35 P1-4: restore_from_backup 委托给 db_restore.py(单一 Restore Engine)
+# ═══════════════════════════════════════════════════════════════
+
 async def restore_from_backup(key: str, tables: list[str] | None = None, merge: bool = False) -> dict:
     """从 R2 备份恢复数据库。
+
+    R35 P1-4: 委托给 services/db_restore.py 的 restore_from_backup_data(),
+    消除两套恢复执行器。本函数保留向后兼容(admin_bot/callback.py 调用此入口)。
 
     Args:
         key: R2 对象 key（如 db_backup/db_backup_20240101_120000.json）
@@ -250,94 +471,9 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
     # 下载备份
     content = await r2_storage.download(key)
     data = json.loads(content)
-    backup_tables = data.get("tables", {})
 
-    if tables:
-        restore_tables = {t: backup_tables[t] for t in tables if t in backup_tables}
-        skipped = [t for t in tables if t not in backup_tables]
-    else:
-        restore_tables = backup_tables
-        skipped = []
-
-    result = {"restored": {}, "skipped": skipped, "errors": []}
-
-    if not db_client.is_connected:
-        from database.session import init_db
-        await init_db()
-
-    # 冲突策略从 BACKUP_SCHEMA 派生(单一事实源: services/backup_schema.py)
-    # - 复合主键(len(pk_columns) > 1) → ON CONFLICT (col1, col2, ...) DO NOTHING
-    # - 单列冲突(conflict_col 非空) → ON CONFLICT ("col") DO NOTHING
-    # - 自增主键(conflict_col 为空) → 退化为普通 INSERT(追加式日志语义可接受)
-
-    for table_name, rows in restore_tables.items():
-        # P0-2: 表名格式白名单校验(防 SQL 注入),非法表名跳过并记录告警
-        try:
-            safe_name = _validate_identifier(table_name)
-        except ValueError as e:
-            logger.warning(f"[db_restore] 跳过非法表名: {e}")
-            result["skipped"].append(table_name)
-            continue
-        if not rows:
-            result["restored"][table_name] = 0
-            continue
-        try:
-            # 使用事务保证原子性
-            await db_client.execute("BEGIN")
-            try:
-                if not merge:
-                    # 覆盖模式:清空目标表（恢复前清空，避免主键冲突）
-                    await db_client.execute(f'TRUNCATE TABLE "{safe_name}" RESTART IDENTITY CASCADE')
-
-                # 确定 ON CONFLICT 子句(仅 merge 模式,从 BACKUP_SCHEMA 派生)
-                conflict_clause = ""
-                if merge:
-                    _schema = BACKUP_SCHEMA.get(table_name)
-                    if _schema and len(_schema.pk_columns) > 1:
-                        # 复合主键: ON CONFLICT (col1, col2, ...) DO NOTHING
-                        # 覆盖 message_backups / manifest 等复合主键表
-                        _pk_cols = ", ".join(f'"{c}"' for c in _schema.pk_columns)
-                        conflict_clause = f' ON CONFLICT ({_pk_cols}) DO NOTHING'
-                    elif _schema and _schema.conflict_col:
-                        # 单列冲突: ON CONFLICT ("col") DO NOTHING
-                        conflict_clause = f' ON CONFLICT ("{_schema.conflict_col}") DO NOTHING'
-                    else:
-                        # 自增主键或未知冲突列,merge 模式下退化为普通 INSERT
-                        # 遇到冲突会报错并由事务 ROLLBACK
-                        logger.warning(f"[db_restore] 表 {safe_name} 未知冲突列,merge 模式可能因主键冲突失败")
-
-                # 批量插入
-                inserted = 0
-                for row in rows:
-                    # P0-2: 每个列名格式校验,非法列名跳过该行并记录告警(绝不拼接未校验标识符)
-                    try:
-                        cols = [_validate_identifier(c) for c in row.keys()]
-                    except ValueError as e:
-                        logger.warning(f"[db_restore] 表 {safe_name} 含非法列名,跳过该行: {e}")
-                        continue
-                    placeholders = ", ".join(f"${i+1}" for i in range(len(cols)))
-                    col_list = ", ".join(f'"{c}"' for c in cols)
-                    params = [row[c] for c in cols]
-                    sql = f'INSERT INTO "{safe_name}" ({col_list}) VALUES ({placeholders}){conflict_clause}'
-                    await db_client.execute(sql, params)
-                    inserted += 1
-                await db_client.execute("COMMIT")
-                result["restored"][table_name] = inserted
-                mode_text = "增量补充" if merge else "覆盖恢复"
-                logger.info(f"[db_restore] {mode_text} 表 {table_name}: {inserted} 行")
-            except Exception as inner_e:
-                # ROLLBACK 失败不应吞噬原始异常,使用嵌套 try/except 保护
-                try:
-                    await db_client.execute("ROLLBACK")
-                except Exception as rollback_err:
-                    logger.error(f"[db_restore] ROLLBACK 失败 (table={table_name}): {rollback_err}")
-                raise inner_e
-        except Exception as e:
-            result["errors"].append(f"{table_name}: {e}")
-            logger.error(f"[db_restore] 恢复表 {table_name} 失败: {e}")
-
-    logger.info(
-        f"[db_restore] 恢复完成: {sum(result['restored'].values())} 行, "
-        f"{len(result['errors'])} 个错误, 模式={'merge' if merge else 'overwrite'}"
+    # R35 P1-4: 委托给单一 Restore Engine
+    from services.db_restore import restore_from_backup_data
+    return await restore_from_backup_data(
+        data, tables=tables, merge=merge,
     )
-    return result

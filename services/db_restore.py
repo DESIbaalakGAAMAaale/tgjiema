@@ -1,12 +1,25 @@
-"""数据库恢复脚本
-从 R2 下载最新的 JSON 备份文件，解析 JSON 并逐表恢复到 CRDB。
+"""数据库恢复脚本(单一 Restore Engine)
+
+R35 P1-4: 本模块是唯一的恢复执行器,db_backup.py::restore_from_backup()
+委托给本模块的 restore_from_backup_data(),消除两套执行器。
+
+R35 P1-5: 按 source 分组恢复:
+- source="crdb":        恢复到 CockroachDB(asyncpg 直连)
+- source="sqlite":       恢复到 cache_store.db(aiosqlite)
+- source="relay_sqlite": 恢复到 relay_pool.db(aiosqlite)
+
+R35 P1-6: 恢复时按表严格校验列(使用 validate_columns_for_table),
+不再使用全局白名单。
+
 支持命令行参数：--table 指定恢复特定表，--dry-run 预览不执行。
-使用 asyncpg 直连 CRDB。
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime
 
@@ -17,6 +30,7 @@ from config import settings
 from storage.r2 import _r2 as r2_storage
 from services.backup_schema import (
     BACKUP_SCHEMA, get_restore_tables, is_table_allowed, ALLOWED_COLUMNS,
+    get_table_source, validate_columns_for_table,
 )
 
 # ─── 表清单(单一事实源: services/backup_schema.py) ───
@@ -28,10 +42,12 @@ ALL_TABLES = get_restore_tables()
 TABLE_PK = {t.name: ", ".join(t.pk_columns) for t in BACKUP_SCHEMA.values()}
 
 # 列白名单(从 BACKUP_SCHEMA 聚合所有表 columns + 向后兼容列,单一事实源)
+# R35 P1-6: 推荐使用 validate_columns_for_table() 按表校验,此全局白名单仅向后兼容
 _ALLOWED_COLUMNS = ALLOWED_COLUMNS
 
 # 表白名单(从 BACKUP_SCHEMA 派生)
 _ALLOWED_TABLES = frozenset(get_restore_tables())
+
 
 def _sanitize_table(name: str) -> str:
     """白名单校验表名,防止 SQL 注入。"""
@@ -42,7 +58,10 @@ def _sanitize_table(name: str) -> str:
 
 
 def _sanitize_column(name: str) -> str:
-    """白名单校验列名,防止 SQL 注入。"""
+    """白名单校验列名,防止 SQL 注入(全局白名单,向后兼容)。
+
+    R35 P1-6: 新代码应使用 validate_columns_for_table() 按表校验。
+    """
     clean = name.strip().lower()
     if clean not in _ALLOWED_COLUMNS:
         raise ValueError(f"非法列名: {name}")
@@ -68,11 +87,41 @@ async def get_latest_backup() -> dict:
         f"备份时间: {data.get('backup_time', '未知')}, "
         f"表: {', '.join(data.get('tables', {}).keys())}"
     )
+    # R35 P1-7: 打印 bundle manifest 摘要(如果存在)
+    manifest = data.get("manifest")
+    if manifest:
+        logger.info(
+            f"Bundle manifest: commit={manifest.get('commit_sha', 'unknown')}, "
+            f"schema={manifest.get('schema_version', 'unknown')}, "
+            f"checksum={manifest.get('checksum_sha256', 'unknown')[:16]}..., "
+            f"tables={manifest.get('total_tables', '?')}, rows={manifest.get('total_rows', '?')}"
+        )
     return data
 
 
+# ═══════════════════════════════════════════════════════════════
+#  CRDB 恢复(asyncpg 直连)
+# ═══════════════════════════════════════════════════════════════
+
+def _safe_val(val):
+    """将 Python 值转换为 CRDB 兼容的类型。"""
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return val  # 保持 bool，asyncpg 兼容 INTEGER/BOOLEAN 列
+    if isinstance(val, (list, dict)):
+        return json.dumps(val, default=str, ensure_ascii=False)
+    if isinstance(val, datetime):
+        return val.isoformat()
+    return str(val) if not isinstance(val, (int, float, str)) else val
+
+
 async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict], dry_run: bool = False):
-    """将记录逐表恢复到 CRDB（逐行 UPSERT）。"""
+    """将记录恢复到 CRDB（逐行 UPSERT）。
+
+    R35 P1-6: 使用 validate_columns_for_table() 按表校验列,
+    不再使用全局白名单 _sanitize_column()。
+    """
     if not records:
         logger.info(f"[{table}] 无记录，跳过")
         return 0
@@ -91,11 +140,16 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
         logger.info(f"[DRY-RUN] [{table}] 将恢复 {len(records)} 条记录")
         return len(records)
 
-    # 白名单校验所有列名,防止 SQL 注入
+    # R35 P1-6: 按表校验列(替代全局 _sanitize_column)
+    # 使用 validate_columns_for_table 过滤非法列,而非全局白名单
     try:
-        columns = [_sanitize_column(c) for c in records[0].keys()]
+        raw_cols = list(records[0].keys())
+        columns = validate_columns_for_table(table, raw_cols)
+        if not columns:
+            logger.error(f"[{table}] 校验后无合法列(原始列: {raw_cols}),跳过此表")
+            return 0
     except ValueError as e:
-        logger.error(f"[{table}] 列名校验失败: {e}, 跳过此表")
+        logger.error(f"[{table}] 列校验失败: {e},跳过此表")
         return 0
 
     # B9: 不排除 id 列 — 排除后 ON CONFLICT(id) 永不触发（id 不在 INSERT 列中），
@@ -124,6 +178,7 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
             for record in batch:
                 vals = [_safe_val(record.get(c)) for c in insert_cols]
                 try:
+                    # R35 P1-4: 确保参数正确展开(execute(sql, *vals) 而非 execute(sql, vals))
                     await conn.execute(sql, *vals)
                     restored += 1
                 except Exception as e:
@@ -132,12 +187,16 @@ async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict
     return restored
 
 
-def _safe_val(val):
-    """将 Python 值转换为 CRDB 兼容的类型。"""
+# ═══════════════════════════════════════════════════════════════
+#  R35 P1-5: SQLite 恢复(aiosqlite)
+# ═══════════════════════════════════════════════════════════════
+
+def _sqlite_safe_val(val):
+    """将 Python 值转换为 SQLite 兼容的类型。"""
     if val is None:
         return None
     if isinstance(val, bool):
-        return val  # 保持 bool，asyncpg 兼容 INTEGER/BOOLEAN 列
+        return 1 if val else 0  # SQLite 用 INTEGER 0/1 表示布尔
     if isinstance(val, (list, dict)):
         return json.dumps(val, default=str, ensure_ascii=False)
     if isinstance(val, datetime):
@@ -145,8 +204,302 @@ def _safe_val(val):
     return str(val) if not isinstance(val, (int, float, str)) else val
 
 
+async def _restore_sqlite_table(
+    conn, table: str, records: list[dict],
+    merge: bool = False, dry_run: bool = False,
+) -> int:
+    """将记录恢复到 SQLite 表(aiosqlite 连接)。
+
+    R35 P1-5: source="sqlite" / "relay_sqlite" 的表走此路径。
+    R35 P1-6: 使用 validate_columns_for_table() 按表校验列。
+
+    Args:
+        conn: aiosqlite.Connection(已打开)
+        table: 表名
+        records: 记录列表
+        merge: True=增量补充(INSERT OR IGNORE); False=覆盖(DELETE 后 INSERT)
+        dry_run: 预览模式
+    """
+    if not records:
+        logger.info(f"[SQLite][{table}] 无记录，跳过")
+        return 0
+
+    # R35 P1-6: 按表校验列
+    try:
+        raw_cols = list(records[0].keys())
+        columns = validate_columns_for_table(table, raw_cols)
+        if not columns:
+            logger.error(f"[SQLite][{table}] 校验后无合法列(原始列: {raw_cols}),跳过此表")
+            return 0
+    except ValueError as e:
+        logger.error(f"[SQLite][{table}] 列校验失败: {e},跳过此表")
+        return 0
+
+    if dry_run:
+        logger.info(f"[DRY-RUN][SQLite][{table}] 将恢复 {len(records)} 条记录")
+        return len(records)
+
+    # 确定 ON CONFLICT 子句
+    _schema = BACKUP_SCHEMA.get(table)
+    conflict_clause = ""
+    if merge:
+        # merge 模式: INSERT OR IGNORE(SQLite 语法)
+        if _schema and len(_schema.pk_columns) > 1:
+            _pk_cols = ", ".join(f'"{c}"' for c in _schema.pk_columns)
+            conflict_clause = f' ON CONFLICT ({_pk_cols}) DO NOTHING'
+        elif _schema and _schema.conflict_col:
+            conflict_clause = f' ON CONFLICT ("{_schema.conflict_col}") DO NOTHING'
+        else:
+            # 自增主键或无冲突列,merge 模式退化为普通 INSERT
+            logger.warning(f"[SQLite][{table}] 未知冲突列,merge 模式可能因主键冲突失败")
+    # 非 merge(覆盖)模式: 先 DELETE 再 INSERT
+
+    placeholders = ", ".join("?" for _ in columns)
+    col_list = ", ".join(f'"{c}"' for c in columns)
+    sql = f'INSERT {"OR IGNORE" if merge and not conflict_clause else "OR REPLACE" if not merge else ""} INTO "{table}" ({col_list}) VALUES ({placeholders}){conflict_clause}'
+
+    # 非 merge 模式且无 ON CONFLICT: 先清空表(覆盖恢复)
+    if not merge:
+        try:
+            await conn.execute(f'DELETE FROM "{table}"')
+            logger.debug(f"[SQLite][{table}] 已清空(覆盖恢复模式)")
+        except Exception as e:
+            logger.warning(f"[SQLite][{table}] 清空表失败: {e}")
+
+    restored = 0
+    for record in records:
+        vals = [_sqlite_safe_val(record.get(c)) for c in columns]
+        try:
+            await conn.execute(sql, vals)
+            restored += 1
+        except Exception as e:
+            logger.error(f"[SQLite][{table}] 恢复记录失败: {e}")
+    await conn.commit()
+    logger.info(f"[SQLite][{table}] 恢复完成: {restored}/{len(records)} 条记录")
+    return restored
+
+
+# ═══════════════════════════════════════════════════════════════
+#  R35 P1-4: 单一 Restore Engine 主入口
+# ═══════════════════════════════════════════════════════════════
+
+async def restore_from_backup_data(
+    data: dict,
+    tables: list[str] | None = None,
+    merge: bool = False,
+) -> dict:
+    """从备份数据恢复数据库(单一 Restore Engine 主入口)。
+
+    R35 P1-4: 本函数是唯一的恢复执行器入口。
+    db_backup.py::restore_from_backup() 委托给本函数。
+    CLI 的 run_restore() 也调用本函数。
+
+    R35 P1-5: 按 source 分组恢复:
+    - source="crdb":        恢复到 CRDB(asyncpg)
+    - source="sqlite":       恢复到 cache_store.db(aiosqlite)
+    - source="relay_sqlite": 恢复到 relay_pool.db(aiosqlite)
+
+    R35 P1-6: 恢复时按表校验列(validate_columns_for_table)。
+
+    Args:
+        data: 备份数据 dict(含 "tables" 键)
+        tables: 仅恢复指定表；None 则恢复备份中的所有表
+        merge: True=增量补充(冲突保留现有数据); False=覆盖(清空后写入,默认)
+
+    Returns:
+        {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
+    """
+    backup_tables = data.get("tables", {})
+
+    if tables:
+        restore_tables_map = {t: backup_tables[t] for t in tables if t in backup_tables}
+        skipped = [t for t in tables if t not in backup_tables]
+    else:
+        restore_tables_map = dict(backup_tables)
+        skipped = []
+
+    result = {"restored": {}, "skipped": skipped, "errors": []}
+
+    # R35 P1-5: 按 source 分组
+    crdb_to_restore: dict[str, list] = {}
+    sqlite_to_restore: dict[str, list] = {}
+    relay_sqlite_to_restore: dict[str, list] = {}
+    unknown_source_tables: dict[str, list] = {}
+
+    for table_name, rows in restore_tables_map.items():
+        if table_name not in BACKUP_SCHEMA:
+            logger.warning(f"[db_restore] 表 {table_name} 不在 BACKUP_SCHEMA 中,跳过")
+            result["skipped"].append(table_name)
+            continue
+        source = get_table_source(table_name)
+        if source == "crdb":
+            crdb_to_restore[table_name] = rows
+        elif source == "sqlite":
+            sqlite_to_restore[table_name] = rows
+        elif source == "relay_sqlite":
+            relay_sqlite_to_restore[table_name] = rows
+        else:
+            unknown_source_tables[table_name] = rows
+            logger.warning(f"[db_restore] 表 {table_name} source={source}(未知/redis),跳过")
+            result["skipped"].append(table_name)
+
+    logger.info(
+        f"[db_restore] 按 source 分组: CRDB={len(crdb_to_restore)}表, "
+        f"SQLite={len(sqlite_to_restore)}表, relay_sqlite={len(relay_sqlite_to_restore)}表"
+    )
+
+    # ─── 1. 恢复 CRDB 表 ───
+    if crdb_to_restore:
+        await _restore_crdb_tables(crdb_to_restore, merge, result)
+
+    # ─── 2. 恢复 SQLite 表(cache_store.db) ───
+    if sqlite_to_restore:
+        await _restore_sqlite_tables_to_db(sqlite_to_restore, merge, result)
+
+    # ─── 3. 恢复 relay_sqlite 表(relay_pool.db) ───
+    if relay_sqlite_to_restore:
+        await _restore_sqlite_tables_to_db(
+            relay_sqlite_to_restore, merge, result, is_relay=True,
+        )
+
+    logger.info(
+        f"[db_restore] 恢复完成: {sum(result['restored'].values())} 行, "
+        f"{len(result['errors'])} 个错误, 模式={'merge' if merge else 'overwrite'}"
+    )
+    return result
+
+
+async def _restore_crdb_tables(
+    tables_data: dict[str, list], merge: bool, result: dict,
+):
+    """恢复 CRDB 表(使用 db_client 连接池)。"""
+    from database.session import _client as db_client, _validate_identifier
+
+    if not db_client.is_connected:
+        try:
+            from database.session import init_db
+            await init_db()
+        except Exception as e:
+            result["errors"].append(f"CRDB 连接初始化失败: {e}")
+            logger.error(f"[db_restore] CRDB 连接初始化失败: {e}")
+            return
+
+    for table_name, rows in tables_data.items():
+        try:
+            _validate_identifier(table_name)
+        except ValueError as e:
+            logger.warning(f"[db_restore] 跳过非法表名: {e}")
+            result["skipped"].append(table_name)
+            continue
+        if not rows:
+            result["restored"][table_name] = 0
+            continue
+        try:
+            await db_client.execute("BEGIN")
+            try:
+                if not merge:
+                    # 覆盖模式:清空目标表
+                    await db_client.execute(f'TRUNCATE TABLE "{table_name}" RESTART IDENTITY CASCADE')
+
+                # 确定 ON CONFLICT 子句(仅 merge 模式)
+                conflict_clause = ""
+                if merge:
+                    _schema = BACKUP_SCHEMA.get(table_name)
+                    if _schema and len(_schema.pk_columns) > 1:
+                        _pk_cols = ", ".join(f'"{c}"' for c in _schema.pk_columns)
+                        conflict_clause = f' ON CONFLICT ({_pk_cols}) DO NOTHING'
+                    elif _schema and _schema.conflict_col:
+                        conflict_clause = f' ON CONFLICT ("{_schema.conflict_col}") DO NOTHING'
+                    else:
+                        logger.warning(f"[db_restore] 表 {table_name} 未知冲突列,merge 模式可能因主键冲突失败")
+
+                # R35 P1-6: 按表校验列
+                raw_cols = list(rows[0].keys())
+                cols = validate_columns_for_table(table_name, raw_cols)
+                if not cols:
+                    logger.error(f"[db_restore] 表 {table_name} 校验后无合法列,跳过")
+                    result["errors"].append(f"{table_name}: 无合法列")
+                    continue
+
+                inserted = 0
+                for row in rows:
+                    try:
+                        # 列名格式校验(防 SQL 注入)
+                        safe_cols = [_validate_identifier(c) for c in cols]
+                    except ValueError as e:
+                        logger.warning(f"[db_restore] 表 {table_name} 含非法列名,跳过该行: {e}")
+                        continue
+                    placeholders = ", ".join(f"${i+1}" for i in range(len(safe_cols)))
+                    col_list = ", ".join(f'"{c}"' for c in safe_cols)
+                    params = [row[c] for c in cols]
+                    sql = f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders}){conflict_clause}'
+                    # R35 P1-4: db_client.execute(sql, params) 内部会 *(params or []) 展开
+                    await db_client.execute(sql, params)
+                    inserted += 1
+                await db_client.execute("COMMIT")
+                result["restored"][table_name] = inserted
+                mode_text = "增量补充" if merge else "覆盖恢复"
+                logger.info(f"[db_restore] {mode_text} 表 {table_name}: {inserted} 行")
+            except Exception as inner_e:
+                try:
+                    await db_client.execute("ROLLBACK")
+                except Exception as rollback_err:
+                    logger.error(f"[db_restore] ROLLBACK 失败 (table={table_name}): {rollback_err}")
+                raise inner_e
+        except Exception as e:
+            result["errors"].append(f"{table_name}: {e}")
+            logger.error(f"[db_restore] 恢复表 {table_name} 失败: {e}")
+
+
+async def _restore_sqlite_tables_to_db(
+    tables_data: dict[str, list], merge: bool, result: dict, is_relay: bool = False,
+):
+    """恢复 SQLite 表到指定数据库(cache_store.db 或 relay_pool.db)。
+
+    R35 P1-5: source="sqlite" / "relay_sqlite" 的表走此路径。
+    """
+    import aiosqlite
+
+    if is_relay:
+        from database.relay_db import DB_PATH as SQLITE_DB_PATH
+        db_label = "relay_sqlite"
+    else:
+        from database.cache_store import DB_PATH as SQLITE_DB_PATH
+        db_label = "sqlite"
+
+    if not os.path.exists(str(SQLITE_DB_PATH)):
+        err = f"{db_label} 数据库文件不存在: {SQLITE_DB_PATH}"
+        result["errors"].append(err)
+        logger.error(f"[db_restore] {err}")
+        return
+
+    try:
+        # 读写模式连接(需要写入数据)
+        async with aiosqlite.connect(str(SQLITE_DB_PATH), timeout=15) as conn:
+            for table_name, rows in tables_data.items():
+                try:
+                    restored = await _restore_sqlite_table(
+                        conn, table_name, rows, merge=merge,
+                    )
+                    result["restored"][table_name] = restored
+                except Exception as e:
+                    result["errors"].append(f"{table_name}: {e}")
+                    logger.error(f"[db_restore][{db_label}] 恢复表 {table_name} 失败: {e}")
+    except Exception as e:
+        err = f"{db_label} 打开数据库失败: {e}"
+        result["errors"].append(err)
+        logger.error(f"[db_restore] {err}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CLI 入口(保留向后兼容)
+# ═══════════════════════════════════════════════════════════════
+
 async def run_restore(table: str = None, dry_run: bool = False):
-    """执行恢复流程。"""
+    """执行恢复流程(CLI 入口)。
+
+    R35 P1-4: 调用 restore_from_backup_data() 单一 Restore Engine。
+    """
     # 1. 初始化 R2
     if not settings.R2_ACCOUNT_ID:
         logger.error("R2 凭证未配置，无法恢复")
@@ -177,29 +530,27 @@ async def run_restore(table: str = None, dry_run: bool = False):
     if dry_run:
         logger.info("=== DRY-RUN 模式，不会实际写入数据 ===")
 
-    # 4. 连接 CRDB 并逐表恢复
-    if not settings.COCKROACHDB_URL:
-        logger.error("COCKROACHDB_URL 未配置")
-        sys.exit(1)
+    # R35 P1-4: 调用单一 Restore Engine
+    result = await restore_from_backup_data(
+        data, tables=target_tables if table else None, merge=False,
+    )
 
-    # B9: 初始化 conn = None 防止 connect 抛异常时 finally 引用未绑定变量
-    conn = None
-    try:
-        conn = await asyncpg.connect(settings.COCKROACHDB_URL)
-        for tbl in target_tables:
-            records = tables_data[tbl]
-            logger.info(f"[{tbl}] 开始恢复 {len(records)} 条记录...")
-            count = await restore_table(conn, tbl, records, dry_run=dry_run)
-            logger.info(f"[{tbl}] 恢复完成: {count} 条记录")
-    finally:
-        if conn is not None:
-            await conn.close()
-        await r2_storage.close()
+    # 打印恢复结果
+    restored = result.get("restored", {})
+    errors = result.get("errors", [])
+    for tbl, count in restored.items():
+        logger.info(f"[{tbl}] 恢复完成: {count} 条记录")
+    if errors:
+        logger.error(f"恢复过程中有 {len(errors)} 个错误:")
+        for err in errors:
+            logger.error(f"  - {err}")
+
+    await r2_storage.close()
     logger.info("数据库恢复完成")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="从 R2 备份恢复 CRDB 数据库")
+    parser = argparse.ArgumentParser(description="从 R2 备份恢复数据库")
     parser.add_argument(
         "--table", type=str, default=None,
         help="指定要恢复的表名（默认恢复所有表）",
