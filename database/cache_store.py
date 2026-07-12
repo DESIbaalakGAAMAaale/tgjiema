@@ -570,6 +570,17 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_upload_outbox_upload ON upload_outbox(upload_id)"
         )
+        # R36 B0-2: 幂等添加 lease_owner / lease_until 字段(支持 OutboxWorker CAS claim)
+        # 旧表升级时新增 2 列;新表已包含则忽略重复列错误
+        for _alter_sql in (
+            "ALTER TABLE upload_outbox ADD COLUMN lease_owner TEXT",
+            "ALTER TABLE upload_outbox ADD COLUMN lease_until REAL",
+        ):
+            try:
+                await self._db.execute(_alter_sql)
+            except Exception as e:
+                # SQLite 重复列错误是预期的(幂等升级),仅 debug 记录
+                logger.debug(f"[CacheStore] ALTER TABLE upload_outbox 升级(可忽略): {e}")
 
         # ─── M1-3: quota_ledger 配额变更流水(追加式日志) ───
         # event_type: consume/refund/sync/reset/expire
@@ -1790,12 +1801,15 @@ class CacheStore:
 
     async def mark_outbox_failed(
         self, outbox_id: str, reason: str, next_retry_at: float,
+        max_attempts: int = 0,
     ) -> bool:
         """标记发条为失败(attempts+1, next_retry_at=next_retry_at)。
 
-        本方法不直接置为 'FAILED',而是 increments attempts 并设置 next_retry_at。
-        调用方应根据 attempts >= UPLOAD_OUTBOX_MAX_ATTEMPTS 判断是否终止。
-        若需要直接终止,可将 status 置为 'FAILED'(调用方自行管理)。
+        本方法 increments attempts 并设置 next_retry_at(重试等待)。
+        当 max_attempts > 0 且 attempts+1 >= max_attempts 时,
+        自动将 status 置为 'DEAD'(永久失败,不再重试)。
+        否则将 status 重置为 'PENDING'(让 worker 在 next_retry_at 到达后重新扫描)。
+        若需要直接终止,调用 mark_outbox_dead()。
         reason 仅记录到日志(upload_outbox 表无 last_error 列)。
         """
         if not self._db or not outbox_id:
@@ -1804,11 +1818,61 @@ class CacheStore:
         logger.info(f"[CacheStore] outbox {outbox_id} 失败: {reason}, next_retry_at={next_retry_at}")
         for attempt in range(3):
             try:
+                if max_attempts > 0:
+                    # R36 B0-2: 超过 max_attempts 时置为 DEAD(幂等:不再被 claim 扫描到)
+                    # 否则重置为 PENDING(等 next_retry_at 到达后重新扫描)
+                    cursor = await self._db.execute(
+                        "UPDATE upload_outbox SET attempts = attempts + 1, "
+                        "next_retry_at = ?, processed_at = ?, "
+                        "status = CASE WHEN attempts + 1 >= ? THEN 'DEAD' ELSE 'PENDING' END, "
+                        "lease_owner = NULL, lease_until = NULL "
+                        "WHERE outbox_id = ?",
+                        (next_retry_at, now, max_attempts, outbox_id),
+                    )
+                else:
+                    # 不传 max_attempts 时重置为 PENDING(等 next_retry_at 到达后重试)
+                    cursor = await self._db.execute(
+                        "UPDATE upload_outbox SET attempts = attempts + 1, "
+                        "next_retry_at = ?, processed_at = ?, status = 'PENDING', "
+                        "lease_owner = NULL, lease_until = NULL "
+                        "WHERE outbox_id = ?",
+                        (next_retry_at, now, outbox_id),
+                    )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def claim_outbox_entry(
+        self, outbox_id: str, owner: str, lease_seconds: int = 60,
+    ) -> bool:
+        """R36 B0-2: CAS claim outbox 条目,获取独占执行权。
+
+        UPDATE upload_outbox SET status='DISPATCHED', lease_owner=?, lease_until=?
+        WHERE outbox_id=? AND status='PENDING'
+        AND (lease_until IS NULL OR lease_until < ? OR lease_owner=?)
+
+        Returns:
+            True 表示 claim 成功(本 owner 获得独占执行权);
+            False 表示已被其他 worker 抢占或状态已变更。
+        """
+        if not self._db or not outbox_id:
+            return False
+        now = time.time()
+        lease_until = now + lease_seconds
+        for attempt in range(3):
+            try:
                 cursor = await self._db.execute(
-                    "UPDATE upload_outbox SET attempts = attempts + 1, "
-                    "next_retry_at = ?, processed_at = ? "
-                    "WHERE outbox_id = ?",
-                    (next_retry_at, now, outbox_id),
+                    "UPDATE upload_outbox SET status = 'DISPATCHED', "
+                    "lease_owner = ?, lease_until = ?, processed_at = ? "
+                    "WHERE outbox_id = ? AND status = 'PENDING' "
+                    "AND (lease_until IS NULL OR lease_until < ? OR lease_owner = ?)",
+                    (owner, lease_until, now, outbox_id, now, owner),
                 )
                 await self._db.commit()
                 return bool(cursor and cursor.rowcount > 0)
@@ -1819,6 +1883,114 @@ class CacheStore:
                 if self._in_writer_tx:
                     raise
                 return False
+
+    async def mark_outbox_dead(self, outbox_id: str, reason: str = "") -> bool:
+        """R36 B0-2: 标记发条为 DEAD(永久失败,不再重试)。
+
+        用于 OutboxWorker 在 max_attempts 超出后的终态标记。
+        """
+        if not self._db or not outbox_id:
+            return False
+        now = time.time()
+        if reason:
+            logger.warning(f"[CacheStore] outbox {outbox_id} 置为 DEAD: {reason}")
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE upload_outbox SET status = 'DEAD', "
+                    "processed_at = ? WHERE outbox_id = ? "
+                    "AND status IN ('PENDING', 'DISPATCHED')",
+                    (now, outbox_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def reset_stale_outbox(self, current_owner: str = "") -> int:
+        """R36 B0-2: 重置 DISPATCHED 但 lease 已过期的 outbox 条目为 PENDING。
+
+        用于 OutboxWorker 崩溃恢复:某 worker 持有 lease 但未完成,
+        lease 过期后其他 worker 可重新 claim 这些条目。
+
+        Args:
+            current_owner: 当前 worker 的 owner 名,避免重置自己正在处理的条目。
+
+        Returns:
+            被重置为 PENDING 的行数。
+        """
+        if not self._db:
+            return 0
+        now = time.time()
+        for attempt in range(3):
+            try:
+                if current_owner:
+                    cursor = await self._db.execute(
+                        "UPDATE upload_outbox SET status = 'PENDING', "
+                        "lease_owner = NULL, lease_until = NULL "
+                        "WHERE status = 'DISPATCHED' "
+                        "AND lease_until IS NOT NULL AND lease_until < ? "
+                        "AND (lease_owner IS NULL OR lease_owner != ?)",
+                        (now, current_owner),
+                    )
+                else:
+                    cursor = await self._db.execute(
+                        "UPDATE upload_outbox SET status = 'PENDING', "
+                        "lease_owner = NULL, lease_until = NULL "
+                        "WHERE status = 'DISPATCHED' "
+                        "AND lease_until IS NOT NULL AND lease_until < ?",
+                        (now,),
+                    )
+                await self._db.commit()
+                return cursor.rowcount if cursor else 0
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return 0
+
+    async def get_dispatched_outbox_by_owner(
+        self, owner: str, limit: int = 10,
+    ) -> list[dict]:
+        """R36 B0-2: 查询某 owner 持有 lease 但仍处于 DISPATCHED 状态的条目。
+
+        用于 OutboxWorker 重启后恢复未完成的 claim(租约未过期则跳过,
+        租约已过期但状态仍为 DISPATCHED 的可重新接管)。
+        """
+        if not self._db or not owner:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT outbox_id, upload_id, job_id, code, target_user_id, "
+                "storage_channel_id, storage_msg_ids, batch_file_meta, "
+                "task_type, protect_content, event_type, status, attempts, "
+                "next_retry_at, created_at, processed_at, lease_owner, lease_until "
+                "FROM upload_outbox WHERE status = 'DISPATCHED' "
+                "AND lease_owner = ? ORDER BY created_at LIMIT ?",
+                (owner, limit),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_dispatched_outbox_by_owner 异常: {e}")
+            return []
+        cols = ["outbox_id", "upload_id", "job_id", "code", "target_user_id",
+                "storage_channel_id", "storage_msg_ids", "batch_file_meta",
+                "task_type", "protect_content", "event_type", "status",
+                "attempts", "next_retry_at", "created_at", "processed_at",
+                "lease_owner", "lease_until"]
+        results = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["storage_msg_ids"] = _m1_json_loads(d.get("storage_msg_ids"))
+            d["batch_file_meta"] = _m1_json_loads(d.get("batch_file_meta"))
+            results.append(d)
+        return results
 
     async def get_outbox_by_upload(self, upload_id: str) -> list[dict]:
         """查询某 upload_id 关联的所有发件箱条目。"""

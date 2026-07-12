@@ -467,6 +467,67 @@ async def _forward_to_r100(context: ContextTypes.DEFAULT_TYPE, from_chat_id: int
         logger.warning(f"[Up] R100 归档失败 msg_id={message_id}: {e}")
 
 
+# ─── R36 B0-2: OutboxWorker 回调函数(strict 版本,异常向上传播以触发重试) ───
+# _register_manifest 内部已 try/except 吞异常(向后兼容),这里提供 strict wrapper:
+# 失败时抛出异常,让 OutboxWorker 调用 mark_outbox_failed 触发重试/DEAD 流程
+
+async def _outbox_register_manifest_strict(
+    channel_id: int, message_id: int, file_meta: dict,
+) -> None:
+    """OutboxWorker 调用的 REGISTER_MANIFEST 处理器(strict)。
+
+    与 _register_manifest 的区别:
+    - 接受 file_meta dict(含 file_unique_id/group_id/media_group_id/type)而非 PTB Message
+    - 异常向上传播(不吞异常),让 OutboxWorker 触发重试
+    - 幂等保证: upsert_manifest(INSERT OR REPLACE)语义,重复调用不创建重复记录
+    """
+    fuid = (file_meta or {}).get("file_unique_id", "") if isinstance(file_meta, dict) else ""
+    if not fuid:
+        # 数据不完整(file_unique_id 缺失),无法定位 group_id,跳过 manifest 注册
+        # 但视为成功(否则 DEAD 也无法恢复,数据已丢失)
+        logger.warning(
+            f"[Up][Outbox] file_meta 缺失 file_unique_id,跳过 manifest 注册 "
+            f"(channel={channel_id}, msg_id={message_id})"
+        )
+        return
+    media_type = (file_meta or {}).get("type", "") if isinstance(file_meta, dict) else ""
+    mgid = (file_meta or {}).get("media_group_id", "") if isinstance(file_meta, dict) else ""
+    await _ensure_channel_group_map()
+    group_id = _channel_to_group.get(channel_id)
+    if group_id is None:
+        # 频道未映射到 group,manifest 无法注册
+        # 抛异常让 OutboxWorker 重试(可能下次刷新 channel→group 映射后命中)
+        raise RuntimeError(
+            f"无法解析频道 {channel_id} 的 group_id(可能 _channel_to_group 映射未刷新)"
+        )
+    store = get_cache_store()
+    await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type, mgid)
+
+
+async def _outbox_archive_to_r100_strict(
+    storage_channel_id: int, storage_msg_id: int,
+) -> None:
+    """OutboxWorker 调用的 ARCHIVE_R100 处理器(strict)。
+
+    与 _forward_to_r100 的区别:
+    - 源改为 storage 频道(更可靠,避免用户删除原消息导致 R100 失败)
+    - 不需要 context 参数(OutboxWorker 仅持有 bot 引用)
+    - 异常向上传播(不吞异常),让 OutboxWorker 触发重试
+    """
+    if not _bot:
+        raise RuntimeError("_bot 全局引用未初始化(OutboxWorker 无法调用 Telegram API)")
+    r100_ch = await _get_r100_channel()
+    if not r100_ch:
+        # R100 频道未配置,视为完成(不阻塞,日志已记录)
+        logger.warning("[Up][Outbox] R100 频道未配置,跳过 ARCHIVE_R100")
+        return
+    await safe_copy_message(_bot, r100_ch, storage_channel_id, storage_msg_id)
+    logger.debug(
+        f"[Up][Outbox] R100 归档成功: storage_msg_id={storage_msg_id} "
+        f"-> R100={r100_ch}"
+    )
+
+
 async def _get_upload_target_channel() -> int:
     """选择上传目标频道:在活跃频道间轮转(round-robin)"""
     global _active_slot_index
@@ -824,11 +885,8 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for s, c in zip(group, copied):
                     channel_msg_ids.append(c.message_id)
                     files_meta.append(s["file_meta"])
-                    asyncio.create_task(_register_manifest(
-                        target_ch, c.message_id, None, s["file_type"],
-                        file_unique_id_override=s["file_unique_id"],
-                        media_group_id=mgid,
-                    ))
+                    # R36 B0-2: Manifest/R100 注册改由 OutboxWorker 消费 upload_outbox 表完成,
+                    # 不再 fire-and-forget create_task(避免进程崩溃后 Manifest 丢失)
         except Exception as e:
             logger.warning(f"[Up] 媒体组 copy_messages 失败,回退逐条: {e}")
             for s in group:
@@ -836,16 +894,8 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     forwarded = await safe_copy_message(context.bot, target_ch, s["chat_id"], s["msg_id"])
                     channel_msg_ids.append(forwarded.message_id)
                     files_meta.append(s["file_meta"])
-                    asyncio.create_task(_register_manifest(
-                        target_ch, forwarded.message_id, None, s["file_type"],
-                        file_unique_id_override=s["file_unique_id"],
-                        media_group_id=mgid,
-                    ))
                 except Exception as e2:
                     logger.error(f"[Up] 媒体组逐条复制失败: {e2}")
-        # R100 归档(逐条)
-        for s in group:
-            asyncio.create_task(_forward_to_r100(context, s["chat_id"], s["msg_id"]))
 
     # 2. 整合单个文件为媒体组(按类型分组,用 send_media_group + InputMedia*)
     if singles:
@@ -876,9 +926,6 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             for s, m in zip(chunk_singles, sent):
                                 channel_msg_ids.append(m.message_id)
                                 files_meta.append(s["file_meta"])
-                                asyncio.create_task(_register_manifest(
-                                    target_ch, m.message_id, m, s["file_type"],
-                                ))
                     except Exception as e:
                         logger.warning(f"[Up] send_media_group 失败,回退 copy_messages: {e}")
                         src_chat = chunk_singles[0]["chat_id"]
@@ -889,10 +936,6 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 for s, c in zip(chunk_singles, copied):
                                     channel_msg_ids.append(c.message_id)
                                     files_meta.append(s["file_meta"])
-                                    asyncio.create_task(_register_manifest(
-                                        target_ch, c.message_id, None, s["file_type"],
-                                        file_unique_id_override=s["file_unique_id"],
-                                    ))
                         except Exception as e2:
                             logger.error(f"[Up] copy_messages fallback 也失败: {e2}")
             elif len(media_list) == 1:
@@ -905,15 +948,8 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     forwarded = await safe_copy_message(context.bot, target_ch, s["chat_id"], s["msg_id"])
                     channel_msg_ids.append(forwarded.message_id)
                     files_meta.append(s["file_meta"])
-                    asyncio.create_task(_register_manifest(
-                        target_ch, forwarded.message_id, None, s["file_type"],
-                        file_unique_id_override=s["file_unique_id"],
-                    ))
                 except Exception as e:
                     logger.error(f"[Up] 单文件复制失败: {e}")
-            # R100 归档
-            for s in group:
-                asyncio.create_task(_forward_to_r100(context, s["chat_id"], s["msg_id"]))
 
     if not channel_msg_ids:
         await update.message.reply_text("文件处理失败，请稍后重试")
@@ -1219,14 +1255,8 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                 # copy_messages 返回 MessageId 列表,顺序与输入一致
                 all_mids = [m.message_id for m in copied]
                 all_meta = [extract_file_meta(up) for up in updates]
-                # Manifest 登记(逐条,用原始 update.message 提取 file_unique_id)
-                for up, mid in zip(updates, all_mids):
-                    asyncio.create_task(_register_manifest(
-                        target_ch, mid, up.message, detect_file_type(up),
-                    ))
-                # R100 归档(逐条,因 R100 是独立归档频道)
-                for up in updates:
-                    asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
+                # R36 B0-2: Manifest/R100 注册改由 OutboxWorker 消费 upload_outbox 表完成
+                # (_finalize_upload 中创建 REGISTER_MANIFEST / ARCHIVE_R100 outbox 条目)
                 batch_success = True
                 # R35 P0-4 §24: 批量 copy 成功,标记每个任务 COPIED_UNVERIFIED → COMMITTED
                 for idx, _tid in enumerate(_mg_task_ids):
@@ -1257,11 +1287,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                     forwarded = await safe_copy_message(context.bot, target_ch, up.effective_chat.id, up.message.message_id)
                     all_mids.append(forwarded.message_id)
                     all_meta.append(extract_file_meta(up))
-                    # Manifest 登记
-                    asyncio.create_task(_register_manifest(
-                        target_ch, forwarded.message_id, up.message, detect_file_type(up),
-                    ))
-                    asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
+                    # R36 B0-2: Manifest/R100 注册改由 OutboxWorker 消费 upload_outbox 表完成
                     # R35 P0-4 §24: 逐条回退成功,标记 COPIED_UNVERIFIED → COMMITTED
                     if i < len(_mg_task_ids):
                         await _mark_replication_copied_safe(_mg_task_ids[i], forwarded.message_id)
@@ -1386,12 +1412,9 @@ async def _process_upload(
             channel_msg_id = forwarded.message_id
             # R35 P0-4 §24: copy 返回 dst_msg_id 后先写任务(COPIED_UNVERIFIED)
             await _mark_replication_copied_safe(_repl_task_id, channel_msg_id)
-            # Manifest 登记(异步,失败不影响主流程)
-            asyncio.create_task(_register_manifest(
-                main_channel, channel_msg_id, update.message,
-                next(iter(file_types.keys()), "") if file_types else "",
-            ))
-            # R35 P0-4 §24: manifest 写入后标记 COMMITTED
+            # R36 B0-2: Manifest/R100 注册改由 OutboxWorker 消费 upload_outbox 表完成
+            # (_finalize_upload 中创建 REGISTER_MANIFEST / ARCHIVE_R100 outbox 条目)
+            # R35 P0-4 §24: replication_task 标记 COMMITTED(不再依赖 manifest 写入成功)
             await _mark_replication_committed_safe(_repl_task_id)
         except Exception as e:
             logger.error(f"[Up] 转发文件到存储频道失败 {e}")
@@ -1406,8 +1429,7 @@ async def _process_upload(
             await update.message.reply_text("文件处理失败，请稍后重试")
             return
 
-        # R100 归档：异步转发到 R100 存储频道（fire-and-forget）
-        asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
+        # R36 B0-2: R100 归档改由 OutboxWorker 消费 upload_outbox 表完成(不再 fire-and-forget)
         # R35 P0-4: Telegram copy 成功,推进 RECEIVED → COPIED_PRIMARY
         await _transition_upload_session_safe(
             upload_id, "COPIED_PRIMARY", reason="copy_done",
@@ -1643,33 +1665,48 @@ async def _finalize_upload(query, context, user_id: int):
             _pending_upload_meta.pop(_meta_key, None)
             _pending_upload_meta.pop(user_id, None)
 
-        # R35 P0-4: pending_uploads 写入成功,推进 COPIED_PRIMARY → MANIFEST_PENDING
-        # 并创建 outbox 条目供 Manifest Worker 消费
+        # R35 P0-4 / R36 B0-2: pending_uploads 写入成功,推进 COPIED_PRIMARY → MANIFEST_PENDING
+        # 并创建 outbox 条目供 OutboxWorker 消费(唯一副作用驱动器)
         await _transition_upload_session_safe(
             upload_id, "MANIFEST_PENDING", reason="pending_uploads_written",
         )
-        # 解析 storage_msg_ids 供 outbox 使用
+        # 解析 storage_msg_ids 与 file_meta list 供 outbox 使用
+        # R36 B0-2: outbox 必须携带每个文件的 file_meta(含 file_unique_id/group_id/media_group_id),
+        # 否则 OutboxWorker 无法调用 _register_manifest(需要 file_unique_id 定位 group_id)
         _outbox_storage_ids = []
+        _outbox_file_meta = []
         if pending_batch:
             _outbox_storage_ids = [int(x) for x in pending_batch["batch_msg_ids"].split(",") if x.strip().isdigit()]
             _outbox_channel_id = pending_batch["primary_channel_id"]
-            _outbox_file_meta = []
+            # 解析 batch_file_meta JSON 字符串为 list(每个 dict 含 file_unique_id 等结构化字段)
+            try:
+                _parsed_meta = json.loads(pending_batch["batch_file_meta"]) if pending_batch.get("batch_file_meta") else []
+                _outbox_file_meta = _parsed_meta if isinstance(_parsed_meta, list) else []
+            except (ValueError, TypeError) as _e:
+                logger.warning(f"[Up] 解析 batch file_meta 失败(传空 list): {_e}")
+                _outbox_file_meta = []
         elif pending_mg:
             _outbox_storage_ids = [int(x) for x in pending_mg["batch_msg_ids"].split(",") if x.strip().isdigit()]
             _outbox_channel_id = pending_mg["primary_channel_id"]
-            _outbox_file_meta = []
+            try:
+                _parsed_meta = json.loads(pending_mg["batch_file_meta"]) if pending_mg.get("batch_file_meta") else []
+                _outbox_file_meta = _parsed_meta if isinstance(_parsed_meta, list) else []
+            except (ValueError, TypeError) as _e:
+                logger.warning(f"[Up] 解析 mg file_meta 失败(传空 list): {_e}")
+                _outbox_file_meta = []
         else:
             _outbox_storage_ids = [channel_msg_id] if channel_msg_id else []
             _outbox_channel_id = main_channel
-            _outbox_file_meta = []
-        # 创建 REGISTER_MANIFEST outbox 条目(供 Manifest Worker 消费)
+            # 单文件:file_meta 是 dict,包装成 [file_meta]
+            _outbox_file_meta = [file_meta] if file_meta else []
+        # 创建 REGISTER_MANIFEST outbox 条目(OutboxWorker 消费)
         await _create_outbox_entry_safe(
             f"obx-man-{upload_id}", upload_id, user_id,
             _outbox_channel_id, msg_ids=_outbox_storage_ids,
             file_meta=_outbox_file_meta, event_type="REGISTER_MANIFEST",
             protect=1 if protect_bool else 0,
         )
-        # 创建 ARCHIVE_R100 outbox 条目(R100 归档任务)
+        # 创建 ARCHIVE_R100 outbox 条目(R100 归档任务,OutboxWorker 消费)
         await _create_outbox_entry_safe(
             f"obx-r100-{upload_id}", upload_id, user_id,
             _outbox_channel_id, msg_ids=_outbox_storage_ids,
@@ -2253,6 +2290,18 @@ async def _async_main():
     create_safe_task(slot_refresh_loop(), name="slot-refresh")
     create_safe_task(_cleanup_pending(), name="cleanup-pending")
 
+    # R36 B0-2: 启动 OutboxWorker(唯一副作用驱动器,消费 upload_outbox 表)
+    # Manifest/R100 注册不再 fire-and-forget create_task,改为通过 outbox 表持久化 + worker 消费
+    from services.outbox_worker import OutboxWorker
+    outbox_worker = OutboxWorker(
+        store=get_cache_store(),
+        register_manifest_fn=_outbox_register_manifest_strict,
+        archive_to_r100_fn=_outbox_archive_to_r100_strict,
+        notify_upload_failed_fn=None,  # UPLOAD_FAILED 事件暂未启用
+        owner=f"up_bot-{__import__('socket').gethostname()}-{__import__('os').getpid()}",
+    )
+    await outbox_worker.start()
+
     async with app:
         await app.start()
         await app.updater.start_polling()
@@ -2265,7 +2314,14 @@ async def _async_main():
         except asyncio.CancelledError:
             pass
         finally:
-            logger.info("[Up] 收到停止信号,正在优雅关闭 polling...")
+            logger.info("[Up] 收到停止信号,正在优雅关闭...")
+            # R36 B0-2: 先停止 OutboxWorker(等待当前条目处理完成或超时)
+            try:
+                await asyncio.wait_for(outbox_worker.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Up] OutboxWorker 停止超时(10s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Up] OutboxWorker 停止异常: {e}")
             try:
                 await asyncio.wait_for(app.updater.stop(), timeout=15.0)
             except asyncio.TimeoutError:
