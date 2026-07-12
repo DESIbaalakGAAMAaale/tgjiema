@@ -145,10 +145,13 @@ async def ensure_consumer_group() -> bool:
 
 
 async def push(op_type: str, table: str, method_name: str, data: dict,
-               redis_key: str = "", message_id: str = "") -> bool:
+               redis_key: str = "", message_id: str = "",
+               attempts: int = 0) -> bool:
     """推入写操作到 Redis Stream(XADD)。
 
     R33修复: 每条消息携带 message_id (UUID),用于幂等去重。
+    R35 P1-1修复: 消息体携带 attempts 字段,DLQ 重试回主 Stream 时
+    递增 attempts,避免每次重试都从 0 开始导致无限重试。
 
     Args:
         op_type: 操作类型(upsert/update/delete/insert)
@@ -157,6 +160,7 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
         data: 方法参数字典
         redis_key: 关联的 Redis 缓存 key(Writer 写完后 DEL,空字符串表示无缓存)
         message_id: 幂等键(UUID),空则自动生成
+        attempts: 当前重试次数(0=首次入队,>0 表示从 DLQ 重试回主 Stream 的次数)
 
     Returns:
         True 推入成功, False 降级到 SQLite 直写
@@ -176,6 +180,8 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
             "redis_key": redis_key,
             "message_id": message_id,
             "created_at": time.time(),
+            # R35 P1-1: 携带 attempts 字段,让失败后 push_dead 能读取当前重试次数
+            "attempts": int(attempts) if attempts else 0,
         }
         await redis.xadd(
             settings.WRITER_STREAM_KEY,
@@ -470,17 +476,27 @@ async def delete(key: str) -> bool:
 
 
 async def push_dead(msg: dict, reason: str = "", message_id: str = "",
-                    attempts: int = 0) -> bool:
+                    attempts: int = 0, permanent: bool = False) -> bool:
     """推入死信队列(带重试闭环)。
 
     R33 P1修复: 死信消息携带 attempts/max_attempts,支持延迟重试。
     R33 P0修复: Redis 不可达时降级写本地文件 dead_letter.jsonl,避免消息永久丢失。
 
+    R35 P1-1 修复: 消息协议携带 attempts 字段,此函数从原 msg 读取 existing attempts
+    并 +1(避免 DLQ 重试回主 Stream 后 attempts 被重置为 0 导致无限重试)。
+    显式 attempts 参数优先(向后兼容,用于 db_writer 标记永久错误时 attempts=99)。
+    permanent=True 时直接设为永久死信(next_retry_at=None),用于 TypeError 等不可重试错误。
+
     Args:
-        msg: 原始消息字典(或任意可序列化对象)
+        msg: 原始消息字典(或任意可序列化对象)。如果 msg 是 dict 且含 "attempts" 字段,
+            则从中读取当前重试次数(existing_attempts)
         reason: 失败原因(记录在消息中,便于排查)
         message_id: 幂等键(用于去重)
-        attempts: 当前重试次数
+        attempts: 显式指定重试次数(向后兼容,优先于 msg 中的 existing attempts)。
+            - 默认 0 时,使用 existing_attempts + 1(从 msg 读取并递增)
+            - 非 0 时,使用此值(让 db_writer 可以显式标记永久错误)
+        permanent: True 表示永久死信(next_retry_at=None,不重试),用于 TypeError 等
+            不可重试错误。True 时 attempts 设为 max_attempts(确保下次直接被永久隔离)。
 
     Returns:
         True 推入成功, False 失败(此时已降级写本地文件)
@@ -489,14 +505,37 @@ async def push_dead(msg: dict, reason: str = "", message_id: str = "",
     max_attempts = getattr(settings, "WRITER_DEAD_MAX_ATTEMPTS", 3)
     retry_delay = getattr(settings, "WRITER_DEAD_RETRY_DELAY", 60)
 
+    # R35 P1-1: 从 msg 中读取 existing attempts(用于 DLQ 重试回主 Stream 后递增)
+    existing_attempts = 0
+    if isinstance(msg, dict):
+        try:
+            existing_attempts = int(msg.get("attempts", 0) or 0)
+        except (TypeError, ValueError):
+            existing_attempts = 0
+
+    # 计算最终 attempts:
+    # - permanent=True: 直接设为 max_attempts(下次就达到上限,永久隔离)
+    # - 显式 attempts > 0(向后兼容): 用显式值(db_writer 标记永久错误时 attempts=99)
+    # - attempts=0(默认): 从 msg 读取并 +1(DLQ 重试回主 Stream 后递增)
+    if permanent:
+        new_attempts = max_attempts
+    elif attempts > 0:
+        new_attempts = attempts
+    else:
+        new_attempts = existing_attempts + 1
+
+    # 判断是否为永久死信(permanent 显式标记 或 attempts >= max_attempts)
+    is_permanent = permanent or new_attempts >= max_attempts
+
     dead_msg = {
         "original": msg,
         "reason": reason,
         "message_id": message_id or str(uuid.uuid4()),
-        "attempts": attempts,
+        "attempts": new_attempts,
         "max_attempts": max_attempts,
         "failed_at": time.time(),
-        "next_retry_at": time.time() + retry_delay if attempts < max_attempts else None,
+        # 永久死信: next_retry_at=None(DLQWorker 不再重试,保留等待人工审核)
+        "next_retry_at": None if is_permanent else time.time() + retry_delay,
     }
     redis = await get_redis()
     if redis:

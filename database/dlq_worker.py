@@ -197,6 +197,8 @@ class DLQWorker:
             # R35 P0-3: 检查 push() 返回值,失败时不 XDEL 死信
             # push() 在 Redis 不可达或 XADD 失败时返回 False(不抛异常),
             # 旧逻辑仍会 XDEL 死信,导致消息永久丢失。此处显式检查返回值。
+            # R35 P1-1: 携带 attempts=new_attempts,让主 Stream 消息体保留重试次数,
+            # 后续失败时 push_dead 能从 msg.attempts 读取并 +1(避免无限重试)。
             ok = await redis_queue.push(
                 op_type=original.get("op_type", ""),
                 table=original.get("table", ""),
@@ -204,6 +206,7 @@ class DLQWorker:
                 data=original.get("data", {}) or {},
                 redis_key=original.get("redis_key", ""),
                 message_id=message_id,
+                attempts=attempts,
             )
             if not ok:
                 # push 返回 False(Redis 不可达或 XADD 失败),不删除死信

@@ -145,9 +145,12 @@ class Settings(BaseSettings):
     # R33: 死信重试延迟(秒,失败后延迟 XADD 回主队列)
     WRITER_DEAD_RETRY_DELAY: int = 60
     # M0 收尾: writer_inbox 清理保留期(小时)。
+    # R35 P1-3 修复: 从 168(7天)调整为 2160(90天),确保覆盖消息最长生命周期。
+    # 依据: Stream 安全窗口 24h + DLQ 最大重试 3 次 × 60s 退避 + 停机维护窗口 7 天
+    #       + 人工处理窗口 30 天 ≈ 90 天。
     # 必须远大于 WRITER_RECLAIM_IDLE_MS(30秒)的回收阈值,
-    # 确保崩溃恢复后仍有 inbox 记录可查(7天=168小时为安全选择)。
-    WRITER_INBOX_RETENTION_HOURS: int = 168
+    # 确保崩溃恢复 + 长停机 + 人工排查窗口内仍有 inbox 记录可查(幂等校验)。
+    WRITER_INBOX_RETENTION_HOURS: int = 2160
     # db_writer systemd 服务名(mon_bot 监控用,可配置以支持不同部署前缀)
     DB_WRITER_SERVICE_NAME: str = "tgjiema-db_writer"
 

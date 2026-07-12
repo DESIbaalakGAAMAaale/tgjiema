@@ -13,11 +13,45 @@ import os
 import sqlite3
 import time
 import aiosqlite
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 from loguru import logger
 
 DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
+
+
+# ─── R35 P1-2: WriterCommand Protocol(类型提示,不强制现有方法迁移) ───
+# 推荐用法: Writer 命令接收 connection 并禁止自行 commit,
+# 事务由单一 writer_transaction() 上下文管理器控制。
+# 现有 81 处 _in_writer_tx 标志保留兼容,新代码应优先实现此 Protocol。
+
+
+@runtime_checkable
+class WriterCommand(Protocol):
+    """Writer 命令接口规范(类型提示用,不强制实现)。
+
+    实现此 Protocol 的命令应:
+    1. 接收 connection 参数(由 writer_transaction() 传入)
+    2. 禁止自行 commit/rollback(事务由 writer_transaction() 统一控制)
+    3. 抛出异常时由 writer_transaction() 自动 ROLLBACK
+    """
+
+    async def execute(self, conn: Any, *args: Any, **kwargs: Any) -> Any:
+        """在 Writer 事务中执行命令。
+
+        Args:
+            conn: aiosqlite.Connection(由 writer_transaction() 传入,
+                  处于 BEGIN IMMEDIATE 事务中)
+            *args, **kwargs: 命令参数
+
+        Returns:
+            命令执行结果
+
+        Raises:
+            任意异常(由 writer_transaction() 捕获并 ROLLBACK)
+        """
+        ...
 
 # 单调递增版本号计数器，替代时间戳避免同一毫秒内多次变更获得相同版本号
 _cells_version_counter = int(time.time() * 1000)
@@ -691,16 +725,32 @@ class CacheStore:
         R34 P0-1: 业务写与 writer_inbox 在同一事务中提交。
         方法内部调用 self._db.commit() 在事务模式下变为 no-op,
         由 DBWriter 的 commit_writer_tx() 统一提交。
+
+        R35 P1-2 修复: 异常安全性 — BEGIN IMMEDIATE 失败时必须恢复 commit 方法
+        并重置 _in_writer_tx 标志,否则后续调用会因 commit 被替换为 no-op 而
+        静默丢数据。先设标志,再尝试 BEGIN,失败时在 except 中恢复。
         """
         if not self._db:
             raise RuntimeError("CacheStore 未初始化")
+        # R35 P1-2: 先设标志 + 替换 commit,再尝试 BEGIN IMMEDIATE
+        # 这样 BEGIN 失败时可以在 except 中恢复 commit 方法
         self._in_writer_tx = True
-        # 保存原始 commit 并替换为 no-op
         self._original_commit = self._db.commit
         async def _noop_commit():
             pass
         self._db.commit = _noop_commit
-        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            await self._db.execute("BEGIN IMMEDIATE")
+        except Exception:
+            # R35 P1-2: BEGIN IMMEDIATE 失败(如数据库锁超时),
+            # 必须恢复 commit 方法并重置标志,避免后续静默丢数据
+            if hasattr(self, '_original_commit'):
+                try:
+                    self._db.commit = self._original_commit
+                except Exception:
+                    pass
+            self._in_writer_tx = False
+            raise
 
     async def commit_writer_tx(self):
         """提交 Writer 事务:执行 COMMIT,恢复 commit 方法。"""
@@ -719,6 +769,31 @@ class CacheStore:
             if hasattr(self, '_original_commit'):
                 self._db.commit = self._original_commit
             self._in_writer_tx = False
+
+    @asynccontextmanager
+    async def writer_transaction(self):
+        """R35 P1-2: Writer 事务上下文管理器(推荐用法)。
+
+        替代手动调用 begin_writer_tx/commit_writer_tx/rollback_writer_tx,
+        确保异常时自动 ROLLBACK,避免遗漏。
+
+        用法:
+            async with store.writer_transaction():
+                # 此范围内 _in_writer_tx=True,方法内部 commit 被吞
+                await store.upsert_user_quota(...)
+                await store.upsert_file_record_local(...)
+
+        异常时会自动 ROLLBACK,正常退出时自动 COMMIT。
+        """
+        await self.begin_writer_tx()
+        try:
+            yield self._db
+        except BaseException:
+            # 任何异常(含 CancelledError)都 ROLLBACK
+            await self.rollback_writer_tx()
+            raise
+        else:
+            await self.commit_writer_tx()
 
     async def cleanup_writer_inbox(self, before_ts: float) -> int:
         """清理过期的 inbox 记录(保留最近 N 天)。

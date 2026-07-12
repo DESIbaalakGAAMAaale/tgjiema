@@ -240,7 +240,7 @@ class DBWriter:
     async def _maybe_cleanup_inbox(self):
         """M0 收尾: 每小时清理一次 writer_inbox 过期记录。
 
-        保留期由 settings.WRITER_INBOX_RETENTION_HOURS 控制(默认 168 小时=7天)。
+        保留期由 settings.WRITER_INBOX_RETENTION_HOURS 控制(R35 P1-3: 默认 2160 小时=90天)。
         必须远大于 XAUTOCLAIM 的 WRITER_RECLAIM_IDLE_MS(30秒)回收阈值,
         确保崩溃恢复后仍有 inbox 记录可查,避免旧消息重复执行。
 
@@ -251,7 +251,7 @@ class DBWriter:
             return
         try:
             from config import settings
-            retention_hours = getattr(settings, 'WRITER_INBOX_RETENTION_HOURS', 168)
+            retention_hours = getattr(settings, 'WRITER_INBOX_RETENTION_HOURS', 2160)
             before_ts = now - retention_hours * 3600
             if self._store:
                 deleted = await self._store.cleanup_writer_inbox(before_ts)
@@ -319,8 +319,9 @@ class DBWriter:
                 f"[DBWriter] 消息缺少 message_id(无效消息,入死信): "
                 f"method={msg.get('method_name', '?')}"
             )
+            # R35 P1-1: missing message_id 是不可重试错误,使用 permanent=True
             dead_ok = await redis_queue.push_dead(
-                msg, reason="missing message_id", attempts=99,
+                msg, reason="missing message_id", permanent=True,
             )
             if not dead_ok:
                 self._dead_fail_count += 1
@@ -377,9 +378,11 @@ class DBWriter:
                 f"[DBWriter] 方法签名不匹配(永久失败,入死信): "
                 f"method={writer_msg.method_name}, table={writer_msg.table}: {e}"
             )
+            # R35 P1-1: TypeError 不可重试,使用 permanent=True 让 push_dead 自动
+            # 设为 max_attempts + next_retry_at=None(永久死信)
             dead_ok = await redis_queue.push_dead(
                 msg, reason=f"TypeError: {e}",
-                message_id=message_id, attempts=99,
+                message_id=message_id, permanent=True,
             )
             # R34 P0-2: 只有 DLQ 写入成功才 ACK
             if not dead_ok:
@@ -398,9 +401,17 @@ class DBWriter:
                 f"[DBWriter] 消息处理失败(入死信): method={writer_msg.method_name}, "
                 f"table={writer_msg.table}: {e}"
             )
+            # R35 P1-1: 不硬编码 attempts=0,从 msg 读取 existing attempts
+            # 让 push_dead 内部做 +1 递增,确保 DLQ 重试回主 Stream 后 attempts 持续累加
+            existing_attempts = 0
+            if isinstance(msg, dict):
+                try:
+                    existing_attempts = int(msg.get("attempts", 0) or 0)
+                except (TypeError, ValueError):
+                    existing_attempts = 0
             dead_ok = await redis_queue.push_dead(
                 msg, reason=f"{type(e).__name__}: {e}",
-                message_id=message_id, attempts=0,
+                message_id=message_id, attempts=existing_attempts,
             )
             # R34 P0-2: 只有 DLQ 写入成功才 ACK
             if not dead_ok:
