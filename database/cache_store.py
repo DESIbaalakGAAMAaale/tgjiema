@@ -2718,12 +2718,576 @@ class CodeChangeBuffer:
         pass
 
 
-_store = CacheStore()
+def _json_safe(obj):
+    """将对象转换为 JSON 可序列化形式(datetime → isoformat,递归处理 dict/list)。
+
+    用于推入 Redis Queue 前的数据预处理,确保 redis_queue.push 内部的
+    json.dumps 不报错。转换后的数据传给 db_writer 端 CacheStore 方法时,
+    内部 _serialize 仍能正确处理(字符串原样返回,datetime 已转 isoformat)。
+    """
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    return obj
+
+
+def _dumps_str(obj) -> str:
+    """JSON 序列化为 str,兼容 orjson(bytes) 和标准 json(str)。"""
+    raw = json.dumps(obj, default=str)
+    return raw.decode() if isinstance(raw, bytes) else raw
+
+
+class CacheStoreRouter(CacheStore):
+    """带 Redis 路由的 CacheStore(bot 进程使用)。
+
+    写操作:推入 Redis Queue,由 db_writer 进程串行落盘 SQLite
+    读操作:优先 Redis 缓存,未命中回退 SQLite + 回填
+    CAS/事务写:直写 SQLite(不走 Redis,保证强一致),写后失效读缓存
+
+    零调用方改动:所有改造在本子类内完成,19 个引用 cache_store 的文件无需修改。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._route_to_redis = True  # bot 进程启用路由
+
+    # ── 重写高频写方法(路由到 Redis Queue)──
+
+    async def write_heartbeat(self, slot_id: str, ok: bool, _batch: bool = False):
+        """心跳写入 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="write_heartbeat",
+            table="heartbeat_local",
+            op_type="upsert",
+            data={"slot_id": slot_id, "ok": ok, "_batch": False},  # P0修复: db_writer 端总是立即 commit
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).write_heartbeat(slot_id, ok, _batch),
+        )
+
+    async def write_bot_heartbeat(self, name: str, total_processed: int = 0, total_errors: int = 0):
+        """Bot 心跳 — 路由到 Redis Queue,写后失效心跳缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="write_bot_heartbeat",
+            table="bot_heartbeat",
+            op_type="upsert",
+            data={"name": name, "total_processed": total_processed, "total_errors": total_errors},
+            redis_key="cache:all_bot_heartbeats",
+            fallback=lambda: super(CacheStoreRouter, self).write_bot_heartbeat(name, total_processed, total_errors),
+        )
+
+    async def upsert_user_quota(self, user_id: int, data: dict):
+        """用户配额写入 — 路由到 Redis Queue,写后失效配额缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="upsert_user_quota",
+            table="user_quota",
+            op_type="upsert",
+            data={"user_id": user_id, "data": _json_safe(data)},
+            redis_key=f"cache:user_quota:{user_id}",
+            fallback=lambda: super(CacheStoreRouter, self).upsert_user_quota(user_id, data),
+        )
+
+    async def increment_user_quota_used(self, user_id: int, is_external: bool = False):
+        """原子递增配额 — 路由到 Redis Queue,写后失效配额缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="increment_user_quota_used",
+            table="user_quota",
+            op_type="update",
+            data={"user_id": user_id, "is_external": is_external},
+            redis_key=f"cache:user_quota:{user_id}",
+            fallback=lambda: super(CacheStoreRouter, self).increment_user_quota_used(user_id, is_external),
+        )
+
+    async def refund_quota(self, user_id: int, is_external: bool = False):
+        """配额回滚 — 路由到 Redis Queue,写后失效配额缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="refund_quota",
+            table="user_quota",
+            op_type="update",
+            data={"user_id": user_id, "is_external": is_external},
+            redis_key=f"cache:user_quota:{user_id}",
+            fallback=lambda: super(CacheStoreRouter, self).refund_quota(user_id, is_external),
+        )
+
+    async def upsert_file_record_local(self, record: dict, mark_dirty: bool = True, _batch: bool = False):
+        """文件记录写入 — 路由到 Redis Queue,写后失效文件记录缓存"""
+        from database import write_router
+        safe_record = _json_safe(record)
+        file_code = record.get("file_code", "") if isinstance(record, dict) else ""
+        return await write_router.route_write(
+            method_name="upsert_file_record_local",
+            table="file_records_local",
+            op_type="upsert",
+            data={"record": safe_record, "mark_dirty": mark_dirty, "_batch": False},  # P0修复: db_writer 端总是立即 commit
+            redis_key=f"cache:file_record:{file_code}" if file_code else "",
+            fallback=lambda: super(CacheStoreRouter, self).upsert_file_record_local(record, mark_dirty, _batch),
+        )
+
+    async def upsert_code_local(self, record: dict, mark_dirty: bool = True, _batch: bool = False):
+        """验证码写入 — 路由到 Redis Queue,写后失效验证码缓存"""
+        from database import write_router
+        safe_record = _json_safe(record)
+        code = record.get("code", "") if isinstance(record, dict) else ""
+        return await write_router.route_write(
+            method_name="upsert_code_local",
+            table="codes_local",
+            op_type="upsert",
+            data={"record": safe_record, "mark_dirty": mark_dirty, "_batch": False},  # P0修复: db_writer 端总是立即 commit
+            redis_key=f"cache:code:{code}" if code else "",
+            fallback=lambda: super(CacheStoreRouter, self).upsert_code_local(record, mark_dirty, _batch),
+        )
+
+    async def upsert_user_local(self, user: dict, mark_dirty: bool = True, _batch: bool = False):
+        """用户记录写入 — 路由到 Redis Queue,写后失效用户缓存"""
+        from database import write_router
+        safe_user = _json_safe(user)
+        user_id = user.get("user_id", 0) if isinstance(user, dict) else 0
+        return await write_router.route_write(
+            method_name="upsert_user_local",
+            table="users_local",
+            op_type="upsert",
+            data={"user": safe_user, "mark_dirty": mark_dirty, "_batch": False},  # P0修复: db_writer 端总是立即 commit
+            redis_key=f"cache:user:{user_id}" if user_id else "",
+            fallback=lambda: super(CacheStoreRouter, self).upsert_user_local(user, mark_dirty, _batch),
+        )
+
+    async def update_cell_fields_local(self, slot_id: str, fields: dict, mark_dirty: bool = False):
+        """更新 cell 字段 — 路由到 Redis Queue,写后失效 cells 缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="update_cell_fields_local",
+            table="cells_local",
+            op_type="update",
+            data={"slot_id": slot_id, "fields": _json_safe(fields), "mark_dirty": mark_dirty},
+            redis_key="cache:all_cells",
+            fallback=lambda: super(CacheStoreRouter, self).update_cell_fields_local(slot_id, fields, mark_dirty),
+        )
+
+    async def increment_cell_file_count_local(self, slot_id: str, delta: int = 1):
+        """递增 cell 文件计数 — 路由到 Redis Queue,写后失效 cells 缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="increment_cell_file_count_local",
+            table="cells_local",
+            op_type="update",
+            data={"slot_id": slot_id, "delta": delta},
+            redis_key="cache:all_cells",
+            fallback=lambda: super(CacheStoreRouter, self).increment_cell_file_count_local(slot_id, delta),
+        )
+
+    async def set_kv(self, key: str, value: str):
+        """KV 写入 — 路由到 Redis Queue,写后失效 KV 缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="set_kv",
+            table="kv_store",
+            op_type="upsert",
+            data={"key": key, "value": value},
+            redis_key=f"cache:kv:{key}",
+            fallback=lambda: super(CacheStoreRouter, self).set_kv(key, value),
+        )
+
+    async def cache_set(self, key: str, value):
+        """TTL 缓存写入 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="cache_set",
+            table="cache_backup",
+            op_type="upsert",
+            data={"key": key, "value": _json_safe(value)},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).cache_set(key, value),
+        )
+
+    async def notify_new_upload(self):
+        """上传通知 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="notify_new_upload",
+            table="pending_notify",
+            op_type="insert",
+            data={},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).notify_new_upload(),
+        )
+
+    async def notify_dsp_new_job(self):
+        """DSP 通知 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="notify_dsp_new_job",
+            table="dsp_notify",
+            op_type="insert",
+            data={},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).notify_dsp_new_job(),
+        )
+
+    async def notify_relay_change(self):
+        """relay 变更通知 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="notify_relay_change",
+            table="relay_notify",
+            op_type="insert",
+            data={},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).notify_relay_change(),
+        )
+
+    async def notify_record_change(self, change_type: str, record_key: str):
+        """记录变更通知 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="notify_record_change",
+            table="record_notify",
+            op_type="insert",
+            data={"change_type": change_type, "record_key": record_key},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).notify_record_change(change_type, record_key),
+        )
+
+    async def save_counter_snapshot(self, counters: dict[str, int], role: str = None):
+        """启动统计快照 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="save_counter_snapshot",
+            table="counter_snapshot",
+            op_type="upsert",
+            data={"counters": counters, "role": role},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).save_counter_snapshot(counters, role),
+        )
+
+    async def mark_user_started(self, user_id: int, bot_name: str):
+        """标记用户已启动 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="mark_user_started",
+            table="user_bot_started",
+            op_type="upsert",
+            data={"user_id": user_id, "bot_name": bot_name},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).mark_user_started(user_id, bot_name),
+        )
+
+    async def add_pending_file_code(self, user_id: int, file_code: str, note: str = "", ext_code: str = ""):
+        """暂存文件码 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="add_pending_file_code",
+            table="pending_file_codes",
+            op_type="insert",
+            data={"user_id": user_id, "file_code": file_code, "note": note, "ext_code": ext_code},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).add_pending_file_code(user_id, file_code, note, ext_code),
+        )
+
+    async def delete_pending_file_code(self, row_id: int):
+        """删除暂存文件码 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="delete_pending_file_code",
+            table="pending_file_codes",
+            op_type="delete",
+            data={"row_id": row_id},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).delete_pending_file_code(row_id),
+        )
+
+    async def update_local_job_status(self, crdb_id: int, status: str, retry_count: int = None, dead_reason: str = None):
+        """更新 job 状态 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="update_local_job_status",
+            table="local_job_queue",
+            op_type="update",
+            data={"crdb_id": crdb_id, "status": status, "retry_count": retry_count, "dead_reason": dead_reason},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).update_local_job_status(crdb_id, status, retry_count, dead_reason),
+        )
+
+    async def retry_local_job(self, crdb_id: int, new_retry_count: int):
+        """重试 job — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="retry_local_job",
+            table="local_job_queue",
+            op_type="update",
+            data={"crdb_id": crdb_id, "new_retry_count": new_retry_count},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).retry_local_job(crdb_id, new_retry_count),
+        )
+
+    async def retry_local_dead_job(self, crdb_id: int):
+        """重试 dead job — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="retry_local_dead_job",
+            table="local_job_queue",
+            op_type="update",
+            data={"crdb_id": crdb_id},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).retry_local_dead_job(crdb_id),
+        )
+
+    async def mark_local_job_synced(self, crdb_id: int):
+        """标记 job 已同步 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="mark_local_job_synced",
+            table="local_job_queue",
+            op_type="update",
+            data={"crdb_id": crdb_id},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).mark_local_job_synced(crdb_id),
+        )
+
+    async def mark_quota_synced(self, user_id: int):
+        """标记配额已同步 — 路由到 Redis Queue,写后失效配额缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="mark_quota_synced",
+            table="user_quota",
+            op_type="update",
+            data={"user_id": user_id},
+            redis_key=f"cache:user_quota:{user_id}",
+            fallback=lambda: super(CacheStoreRouter, self).mark_quota_synced(user_id),
+        )
+
+    async def invalidate_user_quota(self, user_id: int):
+        """失效配额 — 路由到 Redis Queue,写后失效配额缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="invalidate_user_quota",
+            table="user_quota",
+            op_type="update",
+            data={"user_id": user_id},
+            redis_key=f"cache:user_quota:{user_id}",
+            fallback=lambda: super(CacheStoreRouter, self).invalidate_user_quota(user_id),
+        )
+
+    async def mark_cell_synced_local(self, slot_id: str):
+        """标记 cell 已同步 — 路由到 Redis Queue,写后失效 cells 缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="mark_cell_synced_local",
+            table="cells_local",
+            op_type="update",
+            data={"slot_id": slot_id},
+            redis_key="cache:all_cells",
+            fallback=lambda: super(CacheStoreRouter, self).mark_cell_synced_local(slot_id),
+        )
+
+    async def mark_file_record_synced(self, file_code: str):
+        """标记文件记录已同步 — 路由到 Redis Queue,写后失效文件记录缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="mark_file_record_synced",
+            table="file_records_local",
+            op_type="update",
+            data={"file_code": file_code},
+            redis_key=f"cache:file_record:{file_code}",
+            fallback=lambda: super(CacheStoreRouter, self).mark_file_record_synced(file_code),
+        )
+
+    async def mark_code_synced(self, code: str):
+        """标记验证码已同步 — 路由到 Redis Queue,写后失效验证码缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="mark_code_synced",
+            table="codes_local",
+            op_type="update",
+            data={"code": code},
+            redis_key=f"cache:code:{code}",
+            fallback=lambda: super(CacheStoreRouter, self).mark_code_synced(code),
+        )
+
+    async def mark_user_synced(self, user_id: int):
+        """标记用户已同步 — 路由到 Redis Queue,写后失效用户缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="mark_user_synced",
+            table="users_local",
+            op_type="update",
+            data={"user_id": user_id},
+            redis_key=f"cache:user:{user_id}",
+            fallback=lambda: super(CacheStoreRouter, self).mark_user_synced(user_id),
+        )
+
+    async def upsert_manifest(
+        self, group_id: int, file_unique_id: str, channel_id: int,
+        message_id: int, media_type: str = "", media_group_id: str = "",
+    ):
+        """manifest 登记 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="upsert_manifest",
+            table="manifest",
+            op_type="upsert",
+            data={
+                "group_id": group_id,
+                "file_unique_id": file_unique_id,
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "media_type": media_type,
+                "media_group_id": media_group_id,
+            },
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).upsert_manifest(
+                group_id, file_unique_id, channel_id, message_id, media_type, media_group_id
+            ),
+        )
+
+    async def upsert_manifest_batch(self, records: list[dict]):
+        """批量 manifest 登记 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="upsert_manifest_batch",
+            table="manifest",
+            op_type="upsert",
+            data={"records": _json_safe(records)},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).upsert_manifest_batch(records),
+        )
+
+    async def save_cells_snapshot(self, cells: list[dict], version: int):
+        """保存 cells 快照 — 路由到 Redis Queue"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="save_cells_snapshot",
+            table="cells_snapshot",
+            op_type="upsert",
+            data={"cells": _json_safe(cells), "version": version},
+            redis_key="",
+            fallback=lambda: super(CacheStoreRouter, self).save_cells_snapshot(cells, version),
+        )
+
+    # ── CAS 写方法(直写 SQLite + 失效读缓存,保证强一致)──
+
+    async def try_consume_quota(self, user_id: int, is_external: bool = False) -> bool:
+        """CAS 扣减配额 — 直写 SQLite(保证强一致),写后失效配额缓存"""
+        result = await super().try_consume_quota(user_id, is_external)
+        from database import redis_queue
+        await redis_queue.cache_delete(f"cache:user_quota:{user_id}")
+        return result
+
+    async def bulk_upsert_cells_local(self, cells: list[dict]):
+        """批量 upsert cells — 直写 SQLite(量大不入队,避免阻塞),写后失效 cells 缓存"""
+        await super().bulk_upsert_cells_local(cells)
+        from database import redis_queue
+        await redis_queue.cache_delete("cache:all_cells")
+
+    # ── 重写读方法(加 Redis 缓存层)──
+
+    async def get_user_quota(self, user_id: int) -> dict | None:
+        """配额读取 — 优先 Redis 缓存(5s TTL),未命中回退 SQLite + 回填"""
+        from database import redis_queue
+        cache_key = f"cache:user_quota:{user_id}"
+        cached = await redis_queue.cache_get(cache_key)
+        if cached:
+            return json.loads(cached)
+        result = await super().get_user_quota(user_id)
+        if result:
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=5)
+        return result
+
+    async def get_file_record_local(self, file_code: str) -> dict | None:
+        """文件记录读取 — 优先 Redis 缓存(30s TTL),未命中回退 SQLite + 回填"""
+        from database import redis_queue
+        cache_key = f"cache:file_record:{file_code}"
+        cached = await redis_queue.cache_get(cache_key)
+        if cached:
+            return json.loads(cached)
+        result = await super().get_file_record_local(file_code)
+        if result:
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
+        return result
+
+    async def get_code_local(self, code: str) -> dict | None:
+        """验证码读取 — 优先 Redis 缓存(30s TTL),未命中回退 SQLite + 回填"""
+        from database import redis_queue
+        cache_key = f"cache:code:{code}"
+        cached = await redis_queue.cache_get(cache_key)
+        if cached:
+            return json.loads(cached)
+        result = await super().get_code_local(code)
+        if result:
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
+        return result
+
+    async def get_user_local(self, user_id: int) -> dict | None:
+        """用户记录读取 — 优先 Redis 缓存(30s TTL),未命中回退 SQLite + 回填"""
+        from database import redis_queue
+        cache_key = f"cache:user:{user_id}"
+        cached = await redis_queue.cache_get(cache_key)
+        if cached:
+            return json.loads(cached)
+        result = await super().get_user_local(user_id)
+        if result:
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
+        return result
+
+    async def get_all_cells_local(self) -> list[dict]:
+        """全量 cells 读取 — 优先 Redis 缓存(10s TTL),未命中回退 SQLite + 回填"""
+        from database import redis_queue
+        cache_key = "cache:all_cells"
+        cached = await redis_queue.cache_get(cache_key)
+        if cached:
+            return json.loads(cached)
+        result = await super().get_all_cells_local()
+        if result:
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=10)
+        return result
+
+    async def get_all_bot_heartbeats(self) -> dict[str, dict]:
+        """全量 Bot 心跳读取 — 优先 Redis 缓存(5s TTL),未命中回退 SQLite + 回填"""
+        from database import redis_queue
+        cache_key = "cache:all_bot_heartbeats"
+        cached = await redis_queue.cache_get(cache_key)
+        if cached:
+            return json.loads(cached)
+        result = await super().get_all_bot_heartbeats()
+        if result:
+            await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=5)
+        return result
+
+    async def get_kv(self, key: str) -> str | None:
+        """KV 读取 — 优先 Redis 缓存(60s TTL),未命中回退 SQLite + 回填"""
+        from database import redis_queue
+        cache_key = f"cache:kv:{key}"
+        cached = await redis_queue.cache_get(cache_key)
+        if cached is not None:
+            return cached
+        result = await super().get_kv(key)
+        if result is not None:
+            await redis_queue.cache_set(cache_key, result, ttl=60)
+        return result
+
+
+# bot 进程返回 CacheStoreRouter(Redis 路由 + 缓存)
+# db_writer 进程返回原始 CacheStore(直写 SQLite,不路由)
+if os.environ.get("BOT_ROLE", "") == "db_writer":
+    _store: CacheStore = CacheStore()
+else:
+    _store: CacheStore = CacheStoreRouter()
 _decode_log_buffer = DecodeLogBuffer()
 _code_change_buffer = CodeChangeBuffer()
 
 
 def get_cache_store() -> CacheStore:
+    """获取单例 CacheStore。
+
+    bot 进程返回 CacheStoreRouter(Redis 路由 + 缓存)
+    db_writer 进程返回原始 CacheStore(直写 SQLite)
+    """
     return _store
 
 

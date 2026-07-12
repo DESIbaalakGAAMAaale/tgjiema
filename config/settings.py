@@ -107,6 +107,19 @@ class Settings(BaseSettings):
     REDIS_URL: str = ""
     REDIS_STREAM_MAXLEN: int = 10000  # Stream 最大长度,防止无限增长
 
+    # ─── 方案B: Redis + Writer 进程(消除 SQLite 锁冲突)───
+    # WRITER_MODE=redis: 写操作入 Redis Queue,db_writer 进程串行落盘 SQLite
+    # WRITER_MODE=sqlite: 降级模式,直写 SQLite(旧逻辑,兼容本地开发)
+    WRITER_MODE: str = "redis"
+    # Writer 队列 key(Redis List),所有写操作 LPUSH 到此 key
+    WRITER_QUEUE_KEY: str = "tgjiema:writer:queue"
+    # Writer 单次 BRPOP 批量大小(一次取多条消息减少往返)
+    WRITER_BATCH_SIZE: int = 10
+    # Writer 队列积压告警阈值(mon_bot 监控)
+    WRITER_QUEUE_ALERT_THRESHOLD: int = 1000
+    # 读缓存 TTL(秒),热数据 Redis 缓存过期时间
+    WRITER_READ_CACHE_TTL: int = 5
+
     # ─── 配额同步间隔 ──────────────────────────────────────────
     QUOTA_SYNC_INTERVAL: int = 300       # 秒(5分钟),减少 CRDB RU 消耗
 

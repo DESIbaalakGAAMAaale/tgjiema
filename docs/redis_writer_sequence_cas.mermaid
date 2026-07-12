@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant Bot as bot 进程
+    participant CS as CacheStore
+    participant RQ as RedisQueue
+    participant DW as DBWriter
+    participant DB as SQLite
+
+    Note over Bot,DB: CAS 操作直读 SQLite 保证强一致
+    Bot->>CS: try_consume_quota(user_id)
+    CS->>DB: UPDATE user_quota SET used=used+1 WHERE used<quota
+    DB-->>CS: rowcount
+    alt rowcount > 0
+        CS-->>Bot: True (扣减成功)
+        CS->>RQ: DEL cache:user_quota:{user_id} (失效缓存)
+    else rowcount = 0
+        CS->>DB: SELECT 查明原因
+        DB-->>CS: {level, quota, used}
+        CS-->>Bot: False (配额不足)
+    end

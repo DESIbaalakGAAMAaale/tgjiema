@@ -1,0 +1,71 @@
+classDiagram
+    class CacheStore {
+        -RedisQueue _queue
+        -WriteRouter _router
+        -aiosqlite.Connection _db
+        +write_heartbeat(slot_id, ok, _batch)
+        +write_bot_heartbeat(name, total_processed, total_errors)
+        +upsert_user_quota(user_id, data)
+        +try_consume_quota(user_id, is_external) bool
+        +upsert_file_record_local(record, mark_dirty, _batch)
+        +upsert_code_local(record, mark_dirty, _batch)
+        +upsert_user_local(user, mark_dirty, _batch)
+        +update_cell_fields_local(slot_id, fields, mark_dirty)
+        +batch_update_cells_local(updates)
+        +delete_cell_local(slot_id) bool
+        +get_all_cells_local() list~dict~
+        +get_user_quota(user_id) dict
+        +get_file_record_local(file_code) dict
+        +get_code_local(code) dict
+        +notify_new_upload()
+        +has_new_upload() bool
+        +set_kv(key, value)
+        +get_kv(key) str
+        +cache_set(key, value)
+        +cache_get(key, ttl) dict
+    }
+
+    class WriteRouter {
+        -str _mode
+        -RedisQueue _queue
+        -CacheStore _sqlite_store
+        +route_write(op_type, table, data) bool
+        +should_use_redis() bool
+        +fallback_to_sqlite(op_type, table, data)
+    }
+
+    class RedisQueue {
+        -redis.Redis _client
+        -str _queue_key
+        +push(op_type, table, data) bool
+        +pop(timeout) dict|null
+        +delete(key) bool
+        +length() int
+        +health_check() bool
+    }
+
+    class DBWriter {
+        -RedisQueue _queue
+        -aiosqlite.Connection _db
+        -bool _running
+        +start()
+        +stop()
+        -_process_message(msg)
+        -_execute_sqlite(op_type, table, data)
+        -_cleanup_redis_key(key)
+    }
+
+    class DBWriterMessage {
+        +str op_type
+        +str table
+        +dict data
+        +str method_name
+        +str redis_key
+        +float created_at
+    }
+
+    CacheStore --> WriteRouter : 委派写操作
+    CacheStore --> RedisQueue : 读缓存
+    WriteRouter --> RedisQueue : 推入队列
+    DBWriter --> RedisQueue : 消费队列
+    DBWriter --> DBWriterMessage : 反序列化

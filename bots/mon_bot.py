@@ -292,6 +292,14 @@ class MonBot:
             # 4. Bot 离线检测
             stale_bots = metrics.get_stale_bots()
 
+            # 5. Writer 队列积压(方案B: Redis Queue 落盘模式)
+            writer_queue_len = -1
+            try:
+                from database import redis_queue
+                writer_queue_len = await redis_queue.length()
+            except Exception as e:
+                logger.debug(f"[Mon] Writer 队列检查异常: {e}")
+
             # ── 告警规则 ──
             alerts_to_check = []
 
@@ -311,6 +319,16 @@ class MonBot:
             elif queue_backlog > 50:
                 alerts_to_check.append(("queue_backlog", "WARNING",
                     f"队列积压偏高: {queue_backlog} 个待处理任务"))
+
+            # Writer 队列积压(Redis Queue 落盘模式,-1 表示 Redis 不可用,跳过)
+            if writer_queue_len >= 0:
+                writer_threshold = settings.WRITER_QUEUE_ALERT_THRESHOLD
+                if writer_queue_len > writer_threshold:
+                    alerts_to_check.append(("writer_queue_backlog", "CRITICAL",
+                        f"Writer 队列积压严重: {writer_queue_len} 条(阈值 {writer_threshold})"))
+                elif writer_queue_len > writer_threshold // 2:
+                    alerts_to_check.append(("writer_queue_backlog", "WARNING",
+                        f"Writer 队列积压偏高: {writer_queue_len} 条(阈值 {writer_threshold})"))
 
             # 账号存活率
             if total > 0:
@@ -1042,6 +1060,27 @@ class MonBot:
             f"[Mon] 拓扑: {active_count}/{total} 活跃, {lost} 失联, {r100} R100 | "
             f"轮转: {rotation_config['active_window_size']}活态, "
             f"{rotation_config['files_per_slot']}文件/{rotation_config['time_per_slot']}秒"
+        )
+        # 检查 db_writer 服务状态 + Writer 队列长度
+        dw_status = "unknown"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "is-active", "tgjiema-db_writer",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+            dw_status = stdout.decode().strip() or "unknown"
+        except Exception as e:
+            logger.debug(f"[Mon] db_writer 服务状态检查异常: {e}")
+        writer_q_len = -1
+        try:
+            from database import redis_queue
+            writer_q_len = await redis_queue.length()
+        except Exception as e:
+            logger.debug(f"[Mon] Writer 队列长度获取异常: {e}")
+        logger.info(
+            f"[Mon] db_writer: 服务={dw_status}, Writer队列={writer_q_len}"
         )
 
 

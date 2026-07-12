@@ -2,7 +2,7 @@
 # ============================================================
 #  TG文件解码器 — VPS 部署（独立 systemd 版）
 #  每个 Bot 独立 systemd 服务，可单独启停/重启
-#  架构：环形冗余 v2（up / idx / dsp / mon / admin_bot / admin / db_backup）
+#  架构：环形冗余 v2（up / idx / dsp / mon / admin_bot / admin / db_backup / db_writer）
 # ============================================================
 
 set -euo pipefail
@@ -29,7 +29,7 @@ SVC_PREFIX="tgjiema"
 echo ""
 echo "============================================"
 echo "  TG文件解码器 — 独立 systemd 部署向导"
-echo "  每个 Bot 独立服务，共 7 个 systemd 单元"
+echo "  每个 Bot 独立服务，共 8 个 systemd 单元"
 echo "============================================"
 echo ""
 
@@ -191,11 +191,12 @@ else
 fi
 
 # ──────────────────────────────────────────────
-# 第五步：创建 systemd 服务（7 个独立单元）
+# 第五步：创建 systemd 服务（8 个独立单元）
 # ──────────────────────────────────────────────
 info "第五步：创建 systemd 服务单元..."
 
 # 服务定义：(名称, 描述, 启动类目)
+# 特殊条目可用 5 字段格式: 名称:描述:TimeoutStopSec:Restart:RestartSec
 SERVICES=(
     "up:上传接收Bot:接收用户文件，转发到存储频道"
     "idx:解码索引Bot:生成文件码，解码外部码，写派工表"
@@ -204,6 +205,7 @@ SERVICES=(
     "admin_bot:管理员Bot:管理配置、用户、重置等操作"
     "admin:Web管理后台:Web管理面板，fastapi+uvicorn"
     "db_backup:数据库备份:定期备份数据库到R2"
+    "db_writer:数据库写入:40:always:10"
 )
 
 # 生成 systemd 模板函数
@@ -215,6 +217,12 @@ generate_service() {
     local restart_type="always"
     local restart_sec="10"
     local stop_timeout="40"
+    # 5 字段格式(detail="TimeoutStopSec:Restart:RestartSec"),用于 db_writer 等需要显式指定重启策略的服务
+    if [[ "$detail" =~ ^[0-9]+:(always|on-failure|no):[0-9]+$ ]]; then
+        stop_timeout=$(echo "$detail" | cut -d: -f1)
+        restart_type=$(echo "$detail" | cut -d: -f2)
+        restart_sec=$(echo "$detail" | cut -d: -f3)
+    fi
     # db_backup 备份任务失败不应无限重启，等待更久再重试
     if [[ "$name" == "db_backup" ]]; then
         restart_type="on-failure"
@@ -283,7 +291,7 @@ info "创建聚合 target..."
 cat > "/etc/systemd/system/${SVC_PREFIX}.target" << EOF
 [Unit]
 Description=TG文件解码器 — 全部服务
-Wants=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service
+Wants=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service
 After=network.target
 
 [Install]
@@ -362,6 +370,10 @@ info "第七步：启动所有服务..."
 # 先启动数据库备份（无依赖）
 systemctl start "${SVC_PREFIX}-db_backup" || warn "启动 ${SVC_PREFIX}-db_backup 失败，请查看日志"
 sleep 1
+
+# 启动 db_writer（Redis 就绪后，其他 bot 依赖 Writer 落盘，必须先于 bot 启动）
+systemctl start "${SVC_PREFIX}-db_writer" || warn "启动 ${SVC_PREFIX}-db_writer 失败，请查看日志"
+sleep 2
 
 # 启动核心 Bot（up 和 idx 先启动，让拓扑初始化完成）
 systemctl start "${SVC_PREFIX}-up" || warn "启动 ${SVC_PREFIX}-up 失败，请查看日志"
@@ -451,7 +463,7 @@ echo "--------------------------------------------------------------------------
 echo ""
 
 if [[ "$ALL_OK" == "true" ]]; then
-    success "全部 7 个服务运行正常！"
+    success "全部 8 个服务运行正常！"
 else
     warn "部分服务未正常启动，请查看日志："
     echo "  journalctl -u ${SVC_PREFIX}-<name> -n 30 --no-pager"

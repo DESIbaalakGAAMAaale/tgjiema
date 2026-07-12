@@ -1,0 +1,30 @@
+sequenceDiagram
+    participant Bot as bot 进程
+    participant CS as CacheStore
+    participant WR as WriteRouter
+    participant RQ as RedisQueue
+    participant DW as DBWriter 进程
+    participant DB as SQLite
+
+    Bot->>CS: write_heartbeat(slot_id, ok)
+    CS->>WR: route_write("heartbeat", "heartbeat_local", data)
+    WR->>WR: should_use_redis()?
+    alt Redis 可用
+        WR->>RQ: push(op, table, data)
+        RQ->>RQ: LPUSH queue_key {json}
+        RQ-->>WR: True
+        WR-->>CS: True
+        CS-->>Bot: 立即返回
+
+        RQ->>DW: BRPOP queue_key (阻塞)
+        DW->>DW: _process_message(msg)
+        DW->>DB: INSERT INTO heartbeat_local...
+        DB-->>DW: ok
+        DW->>RQ: DEL redis_key (清缓冲)
+        DW-->>RQ: ack
+    else Redis 不可用
+        WR->>CS: fallback_to_sqlite(op, table, data)
+        CS->>DB: 直接写 SQLite(旧逻辑)
+        DB-->>CS: ok
+        CS-->>Bot: 返回
+    end

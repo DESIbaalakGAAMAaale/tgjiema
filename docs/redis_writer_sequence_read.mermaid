@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant Bot as bot 进程
+    participant CS as CacheStore
+    participant RQ as RedisQueue
+    participant DB as SQLite
+
+    Bot->>CS: get_user_quota(user_id)
+    CS->>RQ: GET cache:user_quota:{user_id}
+    alt Redis 命中
+        RQ-->>CS: {quota data}
+        CS-->>Bot: 返回(零 SQLite IO)
+    else Redis 未命中
+        RQ-->>CS: nil
+        CS->>DB: SELECT FROM user_quota WHERE user_id=?
+        DB-->>CS: row
+        CS->>RQ: SETEX cache:user_quota:{user_id} 5s {data}
+        CS-->>Bot: 返回
+    end

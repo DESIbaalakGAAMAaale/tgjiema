@@ -152,6 +152,38 @@ def run_db_backup():
         logger.info("[db_backup] 收到中断信号,已停止")
 
 
+def run_db_writer():
+    """运行 DBWriter 进程(消费 Redis Queue,串行写 SQLite)。
+
+    信号处理参考 db_backup:不注册自定义 SIGTERM handler,
+    让 asyncio.run 通过 CancelledError 传播信号,在 finally 中清理资源。
+    """
+    os.environ["BOT_ROLE"] = "db_writer"
+    import asyncio
+    from database.db_writer import DBWriter
+
+    async def _run():
+        writer = DBWriter()
+        try:
+            await writer.init()
+        except Exception as e:
+            logger.error(f"[db_writer] 初始化失败,退出: {e}")
+            return
+        try:
+            await writer.start()
+        finally:
+            try:
+                await writer.stop()
+                await writer.close()
+            except Exception as e:
+                logger.error(f"[db_writer] 清理资源失败: {e}")
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        logger.info("[db_writer] 收到中断信号,已停止")
+
+
 BOT_RUNNERS = {
     "up": run_up_bot,
     "idx": run_idx_bot,
@@ -160,6 +192,7 @@ BOT_RUNNERS = {
     "admin_bot": run_admin_bot,
     "admin": run_admin,
     "db_backup": run_db_backup,
+    "db_writer": run_db_writer,
 }
 
 
