@@ -5,8 +5,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
+import time
 import aiosqlite
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -178,6 +180,31 @@ CREATE TABLE IF NOT EXISTS bot_overrides (
     is_active   INTEGER DEFAULT 1,
     created_at  TEXT DEFAULT (datetime('now'))
 );
+
+-- M1 业务闭环：中继任务池（持久化中继代发任务，支持崩溃恢复）
+-- 状态机: RECEIVED → BUFFERED → FORWARDING → ACKED / FAILED
+CREATE TABLE IF NOT EXISTS relay_spool (
+    spool_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    relay_account_id  INTEGER NOT NULL,        -- 关联 relay_accounts.id
+    code              TEXT NOT NULL,           -- 外部码或内部码
+    user_id           BIGINT NOT NULL,
+    external_code     TEXT,
+    source_msg_ids    TEXT,                    -- JSON: 原消息 ID 列表
+    buffered_files    TEXT,                    -- JSON: 临时文件路径列表
+    checksum          TEXT,                    -- 文件校验和
+    status            TEXT NOT NULL DEFAULT 'RECEIVED',
+    prev_status       TEXT,
+    attempts          INTEGER DEFAULT 0,
+    ttl_expires_at    REAL,                    -- TTL 过期时间戳
+    last_error        TEXT,
+    created_at        REAL NOT NULL,
+    updated_at        REAL NOT NULL,
+    acked_at          REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_relay_spool_status ON relay_spool(status, ttl_expires_at);
+CREATE INDEX IF NOT EXISTS idx_relay_spool_account ON relay_spool(relay_account_id, status);
+CREATE INDEX IF NOT EXISTS idx_relay_spool_code ON relay_spool(code);
 """
 
 
@@ -588,6 +615,287 @@ class RelayDB:
             if ov["is_active"] and code.startswith(ov["prefix"]):
                 return ov["bot_username"]
         return None
+
+    # ── relay_spool（M1 业务闭环：中继任务池）──
+
+    async def create_relay_spool(self, relay_account_id: int, code: str, user_id: int,
+                                 external_code: str = "", source_msg_ids: list = None,
+                                 buffered_files: list = None, checksum: str = "",
+                                 ttl_seconds: int = 300) -> int:
+        """创建中继任务池记录，status='RECEIVED'，返回 spool_id。
+
+        source_msg_ids / buffered_files 使用 JSON 序列化存储。
+        ttl_seconds <= 0 表示不设置 TTL（ttl_expires_at 为 None）。
+        """
+        now = time.time()
+        ttl_expires_at = now + ttl_seconds if ttl_seconds > 0 else None
+        source_msg_ids_json = json.dumps(source_msg_ids or [])
+        buffered_files_json = json.dumps(buffered_files or [])
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "INSERT INTO relay_spool (relay_account_id, code, user_id, external_code, "
+                    "source_msg_ids, buffered_files, checksum, status, ttl_expires_at, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?, ?, ?)",
+                    (relay_account_id, code, user_id, external_code,
+                     source_msg_ids_json, buffered_files_json, checksum,
+                     ttl_expires_at, now, now),
+                )
+                await self._db.commit()
+                return cursor.lastrowid
+            except sqlite3.Error as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                raise RuntimeError(f"[RelayDB] 创建 relay_spool 失败: {e}") from e
+        return 0  # 不可达，避免类型告警
+
+    async def get_relay_spool(self, spool_id: int) -> dict | None:
+        """按主键查询 relay_spool 记录，反序列化 JSON 字段后返回 dict，无记录返回 None。"""
+        async with self._db.execute(
+            "SELECT spool_id, relay_account_id, code, user_id, external_code, "
+            "source_msg_ids, buffered_files, checksum, status, prev_status, "
+            "attempts, ttl_expires_at, last_error, created_at, updated_at, acked_at "
+            "FROM relay_spool WHERE spool_id = ?",
+            (spool_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "spool_id": row[0],
+            "relay_account_id": row[1],
+            "code": row[2],
+            "user_id": row[3],
+            "external_code": row[4] or "",
+            "source_msg_ids": json.loads(row[5]) if row[5] else [],
+            "buffered_files": json.loads(row[6]) if row[6] else [],
+            "checksum": row[7] or "",
+            "status": row[8],
+            "prev_status": row[9],
+            "attempts": row[10],
+            "ttl_expires_at": row[11],
+            "last_error": row[12],
+            "created_at": row[13],
+            "updated_at": row[14],
+            "acked_at": row[15],
+        }
+
+    async def get_active_spool_by_code(self, code: str) -> list[dict]:
+        """查询某 code 的活跃中继任务（status NOT IN ACKED/FAILED），用于幂等去重。"""
+        async with self._db.execute(
+            "SELECT spool_id, relay_account_id, code, user_id, external_code, "
+            "source_msg_ids, buffered_files, checksum, status, prev_status, "
+            "attempts, ttl_expires_at, last_error, created_at, updated_at, acked_at "
+            "FROM relay_spool WHERE code = ? AND status NOT IN ('ACKED', 'FAILED') "
+            "ORDER BY created_at",
+            (code,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                "spool_id": row[0],
+                "relay_account_id": row[1],
+                "code": row[2],
+                "user_id": row[3],
+                "external_code": row[4] or "",
+                "source_msg_ids": json.loads(row[5]) if row[5] else [],
+                "buffered_files": json.loads(row[6]) if row[6] else [],
+                "checksum": row[7] or "",
+                "status": row[8],
+                "prev_status": row[9],
+                "attempts": row[10],
+                "ttl_expires_at": row[11],
+                "last_error": row[12],
+                "created_at": row[13],
+                "updated_at": row[14],
+                "acked_at": row[15],
+            })
+        return result
+
+    async def get_pending_spool_by_account(self, relay_account_id: int,
+                                           limit: int = 10) -> list[dict]:
+        """拉取某中继账号待处理（RECEIVED 且未过期）的任务，用于崩溃恢复。
+
+        ttl_expires_at IS NULL 视为永不过期；ttl_expires_at > now 视为未过期。
+        """
+        now = time.time()
+        async with self._db.execute(
+            "SELECT spool_id, relay_account_id, code, user_id, external_code, "
+            "source_msg_ids, buffered_files, checksum, status, prev_status, "
+            "attempts, ttl_expires_at, last_error, created_at, updated_at, acked_at "
+            "FROM relay_spool WHERE relay_account_id = ? AND status = 'RECEIVED' "
+            "AND (ttl_expires_at IS NULL OR ttl_expires_at > ?) "
+            "ORDER BY created_at LIMIT ?",
+            (relay_account_id, now, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                "spool_id": row[0],
+                "relay_account_id": row[1],
+                "code": row[2],
+                "user_id": row[3],
+                "external_code": row[4] or "",
+                "source_msg_ids": json.loads(row[5]) if row[5] else [],
+                "buffered_files": json.loads(row[6]) if row[6] else [],
+                "checksum": row[7] or "",
+                "status": row[8],
+                "prev_status": row[9],
+                "attempts": row[10],
+                "ttl_expires_at": row[11],
+                "last_error": row[12],
+                "created_at": row[13],
+                "updated_at": row[14],
+                "acked_at": row[15],
+            })
+        return result
+
+    async def transition_spool_status(self, spool_id: int, new_status: str,
+                                      reason: str = "", **update_fields) -> bool:
+        """原子状态迁移：WHERE spool_id=? AND status != new_status。
+
+        update_fields 中的键会作为额外 UPDATE 字段（如 buffered_files/checksum/acked_at）。
+        注意：buffered_files / source_msg_ids 等 list 类型字段由调用方自行 json.dumps 后传入。
+        返回 True 表示迁移成功（rowcount > 0），False 表示状态未变化或记录不存在。
+        """
+        now = time.time()
+        # 构造动态 SET 子句（白名单字段，避免 SQL 注入）
+        allowed_fields = {
+            "external_code", "source_msg_ids", "buffered_files", "checksum",
+            "ttl_expires_at", "last_error", "acked_at", "attempts",
+        }
+        set_parts = [
+            "status = ?",
+            "prev_status = (SELECT status FROM relay_spool WHERE spool_id = ?)",
+            "updated_at = ?",
+        ]
+        params: list = [new_status, spool_id, now]
+        if reason:
+            set_parts.append("last_error = ?")
+            params.append(reason)
+        for field_name, field_value in update_fields.items():
+            if field_name not in allowed_fields:
+                logger.warning(f"[RelayDB] transition_spool_status 跳过非法字段: {field_name}")
+                continue
+            set_parts.append(f"{field_name} = ?")
+            params.append(field_value)
+        params.append(spool_id)
+        params.append(new_status)
+        sql = (
+            "UPDATE relay_spool SET " + ", ".join(set_parts) +
+            " WHERE spool_id = ? AND status != ?"
+        )
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(sql, params)
+                await self._db.commit()
+                return cursor.rowcount > 0
+            except sqlite3.Error as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                raise RuntimeError(f"[RelayDB] 迁移 relay_spool 状态失败: {e}") from e
+        return False  # 不可达，避免类型告警
+
+    async def ack_relay_spool(self, spool_id: int):
+        """标记任务为 ACKED（Up/Idx 已确认处理完成），记录 acked_at。"""
+        now = time.time()
+        await self.transition_spool_status(spool_id, "ACKED", acked_at=now)
+
+    async def fail_relay_spool(self, spool_id: int, reason: str, max_attempts: int = 3):
+        """累计失败次数；超过 max_attempts 则置为 FAILED，否则保留当前状态允许重试。
+
+        返回更新后的 attempts；若置为 FAILED 会同时写 last_error。
+        """
+        now = time.time()
+        for attempt in range(3):
+            try:
+                # 先读取当前 attempts（避免竞态下重复 +1）
+                async with self._db.execute(
+                    "SELECT attempts FROM relay_spool WHERE spool_id = ?",
+                    (spool_id,),
+                ) as cursor:
+                    row = await cursor.fetchone()
+                if not row:
+                    return
+                current_attempts = row[0] or 0
+                new_attempts = current_attempts + 1
+                if new_attempts >= max_attempts:
+                    await self._db.execute(
+                        "UPDATE relay_spool SET attempts = ?, last_error = ?, "
+                        "status = 'FAILED', updated_at = ? WHERE spool_id = ?",
+                        (new_attempts, reason, now, spool_id),
+                    )
+                else:
+                    await self._db.execute(
+                        "UPDATE relay_spool SET attempts = ?, last_error = ?, "
+                        "updated_at = ? WHERE spool_id = ?",
+                        (new_attempts, reason, now, spool_id),
+                    )
+                await self._db.commit()
+                return
+            except sqlite3.Error as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                raise RuntimeError(f"[RelayDB] fail_relay_spool 失败: {e}") from e
+
+    async def cleanup_expired_spool(self, ttl_seconds: int = 300) -> int:
+        """清理 RECEIVED/BUFFERED 状态下 TTL 已过期的任务，置为 FAILED。
+
+        判定条件：status IN ('RECEIVED','BUFFERED') AND ttl_expires_at < now - ttl_seconds
+        返回清理数量。
+        """
+        now = time.time()
+        threshold = now - ttl_seconds
+        async with self._db.execute(
+            "SELECT spool_id FROM relay_spool "
+            "WHERE status IN ('RECEIVED', 'BUFFERED') AND ttl_expires_at IS NOT NULL "
+            "AND ttl_expires_at < ?",
+            (threshold,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if not rows:
+            return 0
+        cleaned = 0
+        for (spool_id,) in rows:
+            for attempt in range(3):
+                try:
+                    await self._db.execute(
+                        "UPDATE relay_spool SET status = 'FAILED', "
+                        "last_error = 'TTL expired', updated_at = ? WHERE spool_id = ?",
+                        (now, spool_id),
+                    )
+                    await self._db.commit()
+                    cleaned += 1
+                    break
+                except sqlite3.Error as e:
+                    if "locked" in str(e).lower() and attempt < 2:
+                        await asyncio.sleep(0.3)
+                        continue
+                    logger.error(f"[RelayDB] 清理过期 relay_spool {spool_id} 失败: {e}")
+                    break
+        if cleaned > 0:
+            logger.info(f"[RelayDB] 清理 {cleaned} 条过期 relay_spool 任务")
+        return cleaned
+
+    async def get_spool_stats(self) -> dict:
+        """返回各状态的任务计数：{RECEIVED:n, BUFFERED:n, FORWARDING:n, ACKED:n, FAILED:n}。"""
+        result = {"RECEIVED": 0, "BUFFERED": 0, "FORWARDING": 0, "ACKED": 0, "FAILED": 0}
+        async with self._db.execute(
+            "SELECT status, COUNT(*) FROM relay_spool GROUP BY status",
+        ) as cursor:
+            rows = await cursor.fetchall()
+        for status, count in rows:
+            if status in result:
+                result[status] = count
+            else:
+                # 未知状态（理论上不应出现），记录日志但不抛错
+                logger.warning(f"[RelayDB] relay_spool 出现未知状态: {status} (count={count})")
+        return result
 
 
 def date_today() -> str:

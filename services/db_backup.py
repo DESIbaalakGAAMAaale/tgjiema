@@ -21,6 +21,12 @@ SMALL_TABLES = {
     # writer_inbox 保留用于恢复后幂等性校验,避免旧消息重复执行。
     # 注:若表在 CRDB 中不存在会自动跳过(见 backup_all_tables 的 does not exist 降级)。
     "manifest", "writer_inbox",
+    # M1 业务闭环: 5 张新表纳入备份(若 CRDB 中不存在会自动跳过)。
+    # upload_sessions/upload_outbox 有单主键,_CONFLICT_COLS 中配置冲突列;
+    # quota_ledger/delivery_receipts/replication_tasks 为自增主键的追加式日志,
+    # merge 模式下退化为普通 INSERT(重复恢复可能产生重复行,但语义上可接受)。
+    "delivery_receipts", "quota_ledger", "replication_tasks",
+    "upload_outbox", "upload_sessions",
 }
 
 _LARGE_TABLES = {
@@ -291,9 +297,14 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         "relay_accounts": "phone",  # 主键 id 是 SERIAL,用 phone UNIQUE 做冲突
         # M0 收尾: writer_inbox 单主键
         "writer_inbox": "message_id",
+        # M1 业务闭环: 单主键表配置冲突列(自增主键表省略,merge 时退化为普通 INSERT)
+        "upload_sessions": "upload_id",
+        "upload_outbox": "outbox_id",
     }
     # message_backups 是复合主键 (main_msg_id, backup_channel_id),需特殊处理
     # manifest 是复合主键 (group_id, file_unique_id, channel_id),需特殊处理
+    # M1: quota_ledger/delivery_receipts/replication_tasks 为自增主键,
+    #      merge 模式下不在 _CONFLICT_COLS 中,退化为普通 INSERT(追加式日志语义可接受)
 
     for table_name, rows in restore_tables.items():
         # P0-2: 表名格式白名单校验(防 SQL 注入),非法表名跳过并记录告警

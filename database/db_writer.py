@@ -72,6 +72,18 @@ _ALLOWED_METHODS: frozenset[str] = frozenset({
     "save_counter_snapshot",
     # Manifest 副本同步
     "upsert_manifest", "upsert_manifest_batch",
+    # M1 业务闭环: upload_sessions / upload_outbox / quota_ledger /
+    #             delivery_receipts / replication_tasks(仅写入方法入白名单)
+    "create_upload_session", "transition_upload_session",
+    "lease_upload_session", "delete_upload_session",
+    "create_outbox_entry", "mark_outbox_dispatched",
+    "mark_outbox_done", "mark_outbox_failed",
+    "append_quota_ledger",
+    "upsert_delivery_receipt", "confirm_delivery_receipt",
+    "mark_delivery_failed",
+    "create_replication_task", "mark_replication_copying",
+    "mark_replication_copied", "mark_replication_committed",
+    "mark_replication_failed",
     # 通用
     "delete", "cleanup", "cleanup_notify_tables",
 })

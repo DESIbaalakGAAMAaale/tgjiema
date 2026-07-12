@@ -18,11 +18,15 @@ from storage.r2 import _r2 as r2_storage
 
 # 备份中会包含的表（按依赖顺序排列，先恢复无依赖的表）
 # M0 收尾: 补齐 manifest / writer_inbox / kv_config,与 db_backup.SMALL_TABLES 对齐
+# M1 业务闭环: 补齐 5 张新表,与 db_backup.SMALL_TABLES 对齐
 ALL_TABLES = ["users", "file_records", "decode_logs", "cells", "codes", "jobs",
               "rotate_log", "pending_uploads", "spare_pool", "backup_config",
               "code_bot_mapping", "message_backups", "relay_accounts",
               "rotation_config", "external_code_mapping", "kv_config",
-              "manifest", "writer_inbox"]
+              "manifest", "writer_inbox",
+              # M1 业务闭环: 5 张新表(若备份中不存在会被 restore_table 跳过)
+              "upload_sessions", "upload_outbox", "quota_ledger",
+              "delivery_receipts", "replication_tasks"]
 
 # 各表的主键列
 TABLE_PK = {
@@ -45,6 +49,15 @@ TABLE_PK = {
     # manifest 复合主键(group_id, file_unique_id, channel_id)
     "manifest": "group_id, file_unique_id, channel_id",
     "writer_inbox": "message_id",
+    # M1 业务闭环: 5 张新表主键
+    # upload_sessions/upload_outbox 为 TEXT 单主键;
+    # quota_ledger/delivery_receipts/replication_tasks 为 INTEGER 自增主键,
+    # 恢复时按主键 UPSERT(显式指定 ID 时可幂等,未指定时新行)。
+    "upload_sessions": "upload_id",
+    "upload_outbox": "outbox_id",
+    "quota_ledger": "ledger_id",
+    "delivery_receipts": "receipt_id",
+    "replication_tasks": "task_id",
 }
 
 # 白名单:只允许这些列名出现在 INSERT/UPDATE 语句中
@@ -99,6 +112,21 @@ for _tbl in ALL_TABLES:
         "media_group_id", "first_seen_at",
         # M0 收尾: writer_inbox 表(幂等去重)
         "method_name", "stream_id", "created_at", "processed_at",
+        # M1 业务闭环: upload_sessions 表(上传会话状态机)
+        "upload_id", "source_msg_ids", "primary_msg_ids", "options_json",
+        "trace_id", "prev_status", "transitioned_at", "transition_reason",
+        "lease_owner", "lease_until", "last_error",
+        # M1 业务闭环: upload_outbox 表(事务发件箱)
+        "outbox_id", "job_id", "event_type", "attempts", "next_retry_at",
+        # M1 业务闭环: quota_ledger 表(配额变更流水)
+        "ledger_id", "is_external", "quota_before", "quota_after",
+        "request_id",
+        # M1 业务闭环: delivery_receipts 表(投递回执)
+        "receipt_id", "source_msg_id", "sent_msg_id", "group_receipt_id",
+        "error_reason", "confirmed_at",
+        # M1 业务闭环: replication_tasks 表(副本复制任务)
+        "task_id", "src_channel_id", "dst_channel_id", "src_msg_id",
+        "dst_msg_id", "priority", "max_attempts", "committed_at",
         # 向后兼容(旧备份可能包含的列)
         "key", "prefix", "api_hash_encrypted",
         "group_key", "account_index", "description", "interval_minutes",
@@ -114,6 +142,9 @@ _ALLOWED_TABLES = frozenset([
     "spare_pool", "backup_config", "code_bot_mapping",
     "message_backups", "rotation_config", "external_code_mapping",
     "kv_config", "manifest", "writer_inbox",
+    # M1 业务闭环: 5 张新表
+    "upload_sessions", "upload_outbox", "quota_ledger",
+    "delivery_receipts", "replication_tasks",
 ])
 
 def _sanitize_table(name: str) -> str:

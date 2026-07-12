@@ -74,6 +74,29 @@ def _next_file_record_version() -> int:
     return _file_record_version_counter
 
 
+# ─── M1 业务闭环: JSON 字段序列化辅助函数 ───
+# orjson.dumps 返回 bytes,SQLite TEXT 列需解码为 str;
+# 标准 json.dumps 返回 str,直接使用。json.loads 兼容两种格式。
+def _m1_json_dumps(val) -> str | None:
+    """将 Python 对象序列化为 JSON 字符串(orjson 返回 bytes 时解码为 str)。"""
+    if val is None:
+        return None
+    raw = json.dumps(val, default=str)
+    return raw.decode() if isinstance(raw, bytes) else raw
+
+
+def _m1_json_loads(val):
+    """将 JSON 字符串反序列化为 Python 对象,空值或解析失败返回 None。"""
+    if val is None or val == "":
+        return None
+    if isinstance(val, (dict, list)):
+        return val
+    try:
+        return json.loads(val)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 class CacheStore:
     def __init__(self):
         self._db: aiosqlite.Connection | None = None
@@ -415,6 +438,156 @@ class CacheStore:
                 processed_at REAL NOT NULL
             )"""
         )
+        # ════════════════════════════════════════════════════════════════
+        # M1 业务闭环: 5 张新表 — upload_sessions / upload_outbox /
+        #   quota_ledger / delivery_receipts / replication_tasks
+        # 与旧表共存,渐进式迁移。所有新表 IF NOT EXISTS 幂等建表。
+        # ════════════════════════════════════════════════════════════════
+
+        # ─── M1-1: upload_sessions 上传会话状态机 ───
+        # 状态机: RECEIVED → COPIED_PRIMARY → MANIFESTED →
+        #         OPTIONS_PENDING → INDEX_PENDING → READY / ABORTED / EXPIRED
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS upload_sessions (
+                upload_id          TEXT PRIMARY KEY,
+                user_id            BIGINT NOT NULL,
+                source_msg_ids     TEXT,
+                primary_channel_id BIGINT,
+                primary_msg_ids    TEXT,
+                media_group_id     TEXT,
+                options_json       TEXT,
+                trace_id           TEXT,
+                status             TEXT NOT NULL DEFAULT 'RECEIVED',
+                prev_status        TEXT,
+                transitioned_at    REAL,
+                transition_reason  TEXT,
+                lease_owner        TEXT,
+                lease_until        REAL,
+                last_error         TEXT,
+                created_at         REAL NOT NULL,
+                updated_at         REAL NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_sessions_status ON upload_sessions(status)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_sessions_user ON upload_sessions(user_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_sessions_lease ON upload_sessions(lease_until)"
+        )
+
+        # ─── M1-2: upload_outbox 事务发件箱(派工任务) ───
+        # 状态机: PENDING → DISPATCHED → DONE / FAILED
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS upload_outbox (
+                outbox_id          TEXT PRIMARY KEY,
+                upload_id          TEXT,
+                job_id             INTEGER,
+                code               TEXT NOT NULL,
+                target_user_id     BIGINT NOT NULL,
+                storage_channel_id BIGINT NOT NULL,
+                storage_msg_ids    TEXT,
+                batch_file_meta    TEXT,
+                task_type           TEXT DEFAULT 'single',
+                protect_content    INTEGER DEFAULT 0,
+                event_type         TEXT NOT NULL DEFAULT 'delivery_requested',
+                status             TEXT NOT NULL DEFAULT 'PENDING',
+                attempts           INTEGER DEFAULT 0,
+                next_retry_at      REAL,
+                created_at         REAL NOT NULL,
+                processed_at       REAL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_outbox_status ON upload_outbox(status, next_retry_at)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_upload_outbox_upload ON upload_outbox(upload_id)"
+        )
+
+        # ─── M1-3: quota_ledger 配额变更流水(追加式日志) ───
+        # event_type: consume/refund/sync/reset/expire
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS quota_ledger (
+                ledger_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      BIGINT NOT NULL,
+                event_type   TEXT NOT NULL,
+                is_external  INTEGER DEFAULT 0,
+                quota_before INTEGER,
+                quota_after  INTEGER,
+                request_id   TEXT,
+                reason       TEXT,
+                created_at   REAL NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quota_ledger_user ON quota_ledger(user_id, created_at)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quota_ledger_request ON quota_ledger(request_id)"
+        )
+
+        # ─── M1-4: delivery_receipts 投递回执(替代 _sent_msg_tracker 内存态) ───
+        # 状态: SENT → CONFIRMED / FAILED / PARTIAL
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS delivery_receipts (
+                receipt_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id             INTEGER NOT NULL,
+                source_msg_id      BIGINT NOT NULL,
+                target_user_id     BIGINT NOT NULL,
+                sent_msg_id        BIGINT,
+                media_group_id     TEXT,
+                group_receipt_id   TEXT,
+                status             TEXT NOT NULL DEFAULT 'SENT',
+                attempts           INTEGER DEFAULT 0,
+                error_reason       TEXT,
+                created_at         REAL NOT NULL,
+                confirmed_at       REAL,
+                UNIQUE(job_id, source_msg_id)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_receipts_job ON delivery_receipts(job_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_receipts_target ON delivery_receipts(target_user_id)"
+        )
+
+        # ─── M1-5: replication_tasks 副本复制任务 ───
+        # 状态机: PLANNED → COPYING → COPIED_UNVERIFIED → COMMITTED / FAILED
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS replication_tasks (
+                task_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                group_id       INTEGER NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                src_channel_id BIGINT NOT NULL,
+                dst_channel_id BIGINT NOT NULL,
+                src_msg_id     BIGINT NOT NULL,
+                dst_msg_id     BIGINT,
+                media_group_id TEXT,
+                task_type      TEXT DEFAULT 'replica',
+                priority       INTEGER DEFAULT 5,
+                status         TEXT NOT NULL DEFAULT 'PLANNED',
+                prev_status    TEXT,
+                attempts       INTEGER DEFAULT 0,
+                max_attempts   INTEGER DEFAULT 3,
+                next_retry_at  REAL,
+                last_error     TEXT,
+                created_at     REAL NOT NULL,
+                updated_at     REAL NOT NULL,
+                committed_at   REAL,
+                UNIQUE(group_id, file_unique_id, src_channel_id, dst_channel_id)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replication_tasks_status ON replication_tasks(status, priority)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_replication_tasks_group ON replication_tasks(group_id)"
+        )
+
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -1145,6 +1318,796 @@ class CacheStore:
             (user_id,),
         )
         await self._db.commit()
+
+    # ════════════════════════════════════════════════════════════════
+    # M1 业务闭环: upload_sessions / upload_outbox / quota_ledger /
+    #              delivery_receipts / replication_tasks
+    # ════════════════════════════════════════════════════════════════
+
+    # ─── M1-1: upload_sessions 上传会话状态机(7 个方法) ───
+
+    async def create_upload_session(
+        self, upload_id: str, user_id: int,
+        source_msg_ids: list | None = None,
+        options_json: dict | None = None,
+        trace_id: str = "",
+    ) -> None:
+        """创建上传会话,初始状态 RECEIVED。
+
+        Args:
+            upload_id: UUID 主键
+            user_id: 发起用户 ID
+            source_msg_ids: 用户原消息 ID 列表(JSON 序列化存储)
+            options_json: 上传选项(protect_content/ttl/note 等,JSON 序列化)
+            trace_id: 链路追踪 ID
+        """
+        if not self._db or not upload_id:
+            return
+        now = time.time()
+        src_json = _m1_json_dumps(source_msg_ids) if source_msg_ids is not None else None
+        opt_json = _m1_json_dumps(options_json) if options_json is not None else None
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO upload_sessions "
+                    "(upload_id, user_id, source_msg_ids, options_json, trace_id, "
+                    " status, prev_status, transitioned_at, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'RECEIVED', NULL, ?, ?, ?)",
+                    (upload_id, user_id, src_json, opt_json, trace_id,
+                     now, now, now),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return
+
+    async def get_upload_session(self, upload_id: str) -> dict | None:
+        """按主键查询上传会话,未找到返回 None。"""
+        if not self._db or not upload_id:
+            return None
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT upload_id, user_id, source_msg_ids, primary_channel_id, "
+                "primary_msg_ids, media_group_id, options_json, trace_id, status, "
+                "prev_status, transitioned_at, transition_reason, lease_owner, "
+                "lease_until, last_error, created_at, updated_at "
+                "FROM upload_sessions WHERE upload_id = ?",
+                (upload_id,),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_upload_session 异常: {e}")
+            return None
+        if not rows:
+            return None
+        r = rows[0]
+        return {
+            "upload_id": r[0],
+            "user_id": r[1],
+            "source_msg_ids": _m1_json_loads(r[2]),
+            "primary_channel_id": r[3],
+            "primary_msg_ids": _m1_json_loads(r[4]),
+            "media_group_id": r[5],
+            "options_json": _m1_json_loads(r[6]),
+            "trace_id": r[7],
+            "status": r[8],
+            "prev_status": r[9],
+            "transitioned_at": r[10],
+            "transition_reason": r[11],
+            "lease_owner": r[12],
+            "lease_until": r[13],
+            "last_error": r[14],
+            "created_at": r[15],
+            "updated_at": r[16],
+        }
+
+    async def get_active_upload_sessions_by_user(self, user_id: int) -> list[dict]:
+        """查询用户的活跃会话(status NOT IN READY/ABORTED/EXPIRED)。"""
+        if not self._db:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT upload_id, user_id, status, created_at, updated_at "
+                "FROM upload_sessions WHERE user_id = ? "
+                "AND status NOT IN ('READY', 'ABORTED', 'EXPIRED') "
+                "ORDER BY created_at DESC",
+                (user_id,),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_active_upload_sessions_by_user 异常: {e}")
+            return []
+        cols = ["upload_id", "user_id", "status", "created_at", "updated_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def transition_upload_session(
+        self, upload_id: str, new_status: str,
+        reason: str = "", **update_fields,
+    ) -> bool:
+        """状态机迁移:原子条件 UPDATE WHERE upload_id=? AND status != new_status。
+
+        更新 status / prev_status / transitioned_at / transition_reason / updated_at
+        + update_fields 中的额外字段(白名单校验)。
+
+        Returns: True 表示迁移成功(rowcount>0),False 表示会话不存在或已在目标状态。
+        """
+        if not self._db or not upload_id:
+            return False
+        # 白名单校验可更新的列,防止 SQL 注入
+        _ALLOWED_UPDATE_COLS = {
+            "primary_channel_id", "primary_msg_ids", "media_group_id",
+            "options_json", "last_error", "source_msg_ids",
+            "lease_owner", "lease_until",
+        }
+        now = time.time()
+        set_parts = [
+            "status = ?",
+            "prev_status = (SELECT status FROM upload_sessions WHERE upload_id = ?)",
+            "transitioned_at = ?",
+            "transition_reason = ?",
+            "updated_at = ?",
+        ]
+        params: list = [new_status, upload_id, now, reason, now]
+        # 处理额外字段(白名单校验)
+        for k, v in update_fields.items():
+            if k not in _ALLOWED_UPDATE_COLS:
+                logger.warning(f"[CacheStore] transition_upload_session 跳过非法列: {k}")
+                continue
+            # JSON 字段需要序列化
+            if k in ("source_msg_ids", "primary_msg_ids", "options_json") and v is not None:
+                v = _m1_json_dumps(v)
+            set_parts.append(f"{k} = ?")
+            params.append(v)
+        params.append(upload_id)
+        sql = (
+            "UPDATE upload_sessions SET " + ", ".join(set_parts) +
+            " WHERE upload_id = ? AND status != ?"
+        )
+        params.append(new_status)
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(sql, params)
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def lease_upload_session(
+        self, upload_id: str, owner: str, lease_seconds: int,
+    ) -> bool:
+        """租约会话:UPDATE lease_owner/lease_until WHERE
+        (lease_until < now OR lease_owner = owner)。
+
+        Returns: True 表示租约成功,False 表示已被其他 owner 持有。
+        """
+        if not self._db or not upload_id:
+            return False
+        now = time.time()
+        lease_until = now + lease_seconds
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE upload_sessions SET lease_owner = ?, lease_until = ?, "
+                    "updated_at = ? WHERE upload_id = ? "
+                    "AND (lease_until IS NULL OR lease_until < ? OR lease_owner = ?)",
+                    (owner, lease_until, now, upload_id, now, owner),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def cleanup_expired_upload_sessions(self, ttl_seconds: int) -> int:
+        """清理租约过期且未完成的会话(status='EXPIRED')。
+
+        Args:
+            ttl_seconds: 超出 lease_until 多少秒才视为过期(now - ttl)
+        Returns: 标记为 EXPIRED 的行数。
+        """
+        if not self._db:
+            return 0
+        now = time.time()
+        cutoff = now - ttl_seconds
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE upload_sessions SET status = 'EXPIRED', "
+                    "prev_status = status, transitioned_at = ?, "
+                    "transition_reason = 'lease_expired', updated_at = ? "
+                    "WHERE status IN ('RECEIVED', 'COPIED_PRIMARY', 'MANIFESTED', "
+                    "'OPTIONS_PENDING', 'INDEX_PENDING') "
+                    "AND lease_until IS NOT NULL AND lease_until < ?",
+                    (now, now, cutoff),
+                )
+                await self._db.commit()
+                return cursor.rowcount if cursor else 0
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return 0
+
+    async def delete_upload_session(self, upload_id: str) -> bool:
+        """删除会话(仅 READY/ABORTED/EXPIRED 状态可删)。
+
+        Returns: True 表示删除成功,False 表示状态不允许或会话不存在。
+        """
+        if not self._db or not upload_id:
+            return False
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "DELETE FROM upload_sessions WHERE upload_id = ? "
+                    "AND status IN ('READY', 'ABORTED', 'EXPIRED')",
+                    (upload_id,),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    # ─── M1-2: upload_outbox 事务发件箱(6 个方法) ───
+
+    async def create_outbox_entry(
+        self, outbox_id: str, upload_id: str, code: str,
+        target_user_id: int, storage_channel_id: int,
+        storage_msg_ids: list | None = None,
+        batch_file_meta: list | None = None,
+        task_type: str = "single", protect_content: int = 0,
+        event_type: str = "delivery_requested",
+    ) -> None:
+        """创建发件箱条目,初始状态 PENDING。
+
+        幂等:使用 INSERT OR IGNORE 避免重复插入(同 outbox_id 已存在则跳过)。
+        """
+        if not self._db or not outbox_id:
+            return
+        now = time.time()
+        sm_json = _m1_json_dumps(storage_msg_ids) if storage_msg_ids is not None else None
+        bfm_json = _m1_json_dumps(batch_file_meta) if batch_file_meta is not None else None
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO upload_outbox "
+                    "(outbox_id, upload_id, job_id, code, target_user_id, "
+                    " storage_channel_id, storage_msg_ids, batch_file_meta, "
+                    " task_type, protect_content, event_type, status, attempts, "
+                    " next_retry_at, created_at, processed_at) "
+                    "VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, NULL, ?, NULL)",
+                    (outbox_id, upload_id, code, target_user_id, storage_channel_id,
+                     sm_json, bfm_json, task_type, protect_content, event_type, now),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return
+
+    async def get_pending_outbox(self, limit: int = 10) -> list[dict]:
+        """查询待处理发件箱条目(status='PENDING' 且 next_retry_at 已到或为 NULL)。"""
+        if not self._db:
+            return []
+        now = time.time()
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT outbox_id, upload_id, job_id, code, target_user_id, "
+                "storage_channel_id, storage_msg_ids, batch_file_meta, "
+                "task_type, protect_content, event_type, status, attempts, "
+                "next_retry_at, created_at, processed_at "
+                "FROM upload_outbox WHERE status = 'PENDING' "
+                "AND (next_retry_at IS NULL OR next_retry_at <= ?) "
+                "ORDER BY created_at LIMIT ?",
+                (now, limit),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_pending_outbox 异常: {e}")
+            return []
+        cols = ["outbox_id", "upload_id", "job_id", "code", "target_user_id",
+                "storage_channel_id", "storage_msg_ids", "batch_file_meta",
+                "task_type", "protect_content", "event_type", "status",
+                "attempts", "next_retry_at", "created_at", "processed_at"]
+        results = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["storage_msg_ids"] = _m1_json_loads(d.get("storage_msg_ids"))
+            d["batch_file_meta"] = _m1_json_loads(d.get("batch_file_meta"))
+            results.append(d)
+        return results
+
+    async def mark_outbox_dispatched(self, outbox_id: str, job_id: int) -> bool:
+        """标记发条为已派工(status='DISPATCHED')。"""
+        if not self._db or not outbox_id:
+            return False
+        now = time.time()
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE upload_outbox SET status = 'DISPATCHED', "
+                    "job_id = ?, processed_at = ? WHERE outbox_id = ? "
+                    "AND status = 'PENDING'",
+                    (job_id, now, outbox_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def mark_outbox_done(self, outbox_id: str) -> bool:
+        """标记发条为已完成(status='DONE')。"""
+        if not self._db or not outbox_id:
+            return False
+        now = time.time()
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE upload_outbox SET status = 'DONE', processed_at = ? "
+                    "WHERE outbox_id = ? AND status IN ('PENDING', 'DISPATCHED')",
+                    (now, outbox_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def mark_outbox_failed(
+        self, outbox_id: str, reason: str, next_retry_at: float,
+    ) -> bool:
+        """标记发条为失败(attempts+1, next_retry_at=next_retry_at)。
+
+        本方法不直接置为 'FAILED',而是 increments attempts 并设置 next_retry_at。
+        调用方应根据 attempts >= UPLOAD_OUTBOX_MAX_ATTEMPTS 判断是否终止。
+        若需要直接终止,可将 status 置为 'FAILED'(调用方自行管理)。
+        reason 仅记录到日志(upload_outbox 表无 last_error 列)。
+        """
+        if not self._db or not outbox_id:
+            return False
+        now = time.time()
+        logger.info(f"[CacheStore] outbox {outbox_id} 失败: {reason}, next_retry_at={next_retry_at}")
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE upload_outbox SET attempts = attempts + 1, "
+                    "next_retry_at = ?, processed_at = ? "
+                    "WHERE outbox_id = ?",
+                    (next_retry_at, now, outbox_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def get_outbox_by_upload(self, upload_id: str) -> list[dict]:
+        """查询某 upload_id 关联的所有发件箱条目。"""
+        if not self._db or not upload_id:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT outbox_id, upload_id, job_id, code, target_user_id, "
+                "storage_channel_id, storage_msg_ids, batch_file_meta, "
+                "task_type, protect_content, event_type, status, attempts, "
+                "next_retry_at, created_at, processed_at "
+                "FROM upload_outbox WHERE upload_id = ? ORDER BY created_at",
+                (upload_id,),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_outbox_by_upload 异常: {e}")
+            return []
+        cols = ["outbox_id", "upload_id", "job_id", "code", "target_user_id",
+                "storage_channel_id", "storage_msg_ids", "batch_file_meta",
+                "task_type", "protect_content", "event_type", "status",
+                "attempts", "next_retry_at", "created_at", "processed_at"]
+        results = []
+        for r in rows:
+            d = dict(zip(cols, r))
+            d["storage_msg_ids"] = _m1_json_loads(d.get("storage_msg_ids"))
+            d["batch_file_meta"] = _m1_json_loads(d.get("batch_file_meta"))
+            results.append(d)
+        return results
+
+    # ─── M1-3: quota_ledger 配额变更流水(3 个方法) ───
+
+    async def append_quota_ledger(
+        self, user_id: int, event_type: str, is_external: int = 0,
+        quota_before: int | None = None, quota_after: int | None = None,
+        request_id: str = "", reason: str = "",
+    ) -> None:
+        """追加配额变更流水(INSERT,自增主键)。
+
+        Args:
+            event_type: consume/refund/sync/reset/expire
+            request_id: 业务幂等键(可选,用于去重检查)
+        """
+        if not self._db:
+            return
+        now = time.time()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT INTO quota_ledger "
+                    "(user_id, event_type, is_external, quota_before, quota_after, "
+                    " request_id, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, event_type, is_external, quota_before, quota_after,
+                     request_id or None, reason or None, now),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return
+
+    async def get_quota_ledger(self, user_id: int, limit: int = 100) -> list[dict]:
+        """查询用户配额流水(按时间倒序,默认 100 条)。"""
+        if not self._db:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT ledger_id, user_id, event_type, is_external, "
+                "quota_before, quota_after, request_id, reason, created_at "
+                "FROM quota_ledger WHERE user_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (user_id, limit),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_quota_ledger 异常: {e}")
+            return []
+        cols = ["ledger_id", "user_id", "event_type", "is_external",
+                "quota_before", "quota_after", "request_id", "reason", "created_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def get_quota_ledger_by_request(self, request_id: str) -> list[dict]:
+        """按 request_id 查询流水(幂等检查,返回所有匹配记录)。"""
+        if not self._db or not request_id:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT ledger_id, user_id, event_type, is_external, "
+                "quota_before, quota_after, request_id, reason, created_at "
+                "FROM quota_ledger WHERE request_id = ? "
+                "ORDER BY created_at",
+                (request_id,),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_quota_ledger_by_request 异常: {e}")
+            return []
+        cols = ["ledger_id", "user_id", "event_type", "is_external",
+                "quota_before", "quota_after", "request_id", "reason", "created_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    # ─── M1-4: delivery_receipts 投递回执(5 个方法) ───
+
+    async def upsert_delivery_receipt(
+        self, job_id: int, source_msg_id: int, target_user_id: int,
+        sent_msg_id: int | None = None, media_group_id: str = "",
+        group_receipt_id: str = "", status: str = "SENT",
+    ) -> None:
+        """写入或更新投递回执(基于 UNIQUE(job_id, source_msg_id))。
+
+        INSERT OR REPLACE 会删除旧记录并插入新记录(自增 receipt_id 会变)。
+        若需保留 receipt_id,应改用 UPDATE。本方法用于首次写入和重试场景。
+        """
+        if not self._db:
+            return
+        now = time.time()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT OR REPLACE INTO delivery_receipts "
+                    "(job_id, source_msg_id, target_user_id, sent_msg_id, "
+                    " media_group_id, group_receipt_id, status, attempts, "
+                    " error_reason, created_at, confirmed_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL)",
+                    (job_id, source_msg_id, target_user_id, sent_msg_id,
+                     media_group_id or "", group_receipt_id or "", status, now),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return
+
+    async def get_delivery_receipts_by_job(self, job_id: int) -> list[dict]:
+        """查询某 job 的所有投递回执。"""
+        if not self._db:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT receipt_id, job_id, source_msg_id, target_user_id, "
+                "sent_msg_id, media_group_id, group_receipt_id, status, "
+                "attempts, error_reason, created_at, confirmed_at "
+                "FROM delivery_receipts WHERE job_id = ? "
+                "ORDER BY source_msg_id",
+                (job_id,),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_delivery_receipts_by_job 异常: {e}")
+            return []
+        cols = ["receipt_id", "job_id", "source_msg_id", "target_user_id",
+                "sent_msg_id", "media_group_id", "group_receipt_id", "status",
+                "attempts", "error_reason", "created_at", "confirmed_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def confirm_delivery_receipt(
+        self, job_id: int, source_msg_id: int, sent_msg_id: int,
+    ) -> bool:
+        """确认投递回执(status='CONFIRMED', confirmed_at=now)。"""
+        if not self._db:
+            return False
+        now = time.time()
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE delivery_receipts SET status = 'CONFIRMED', "
+                    "confirmed_at = ?, sent_msg_id = COALESCE(?, sent_msg_id) "
+                    "WHERE job_id = ? AND source_msg_id = ?",
+                    (now, sent_msg_id, job_id, source_msg_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def mark_delivery_failed(
+        self, job_id: int, source_msg_id: int, reason: str,
+    ) -> bool:
+        """标记投递失败(status='FAILED', attempts+1, error_reason=reason)。"""
+        if not self._db:
+            return False
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE delivery_receipts SET status = 'FAILED', "
+                    "attempts = attempts + 1, error_reason = ? "
+                    "WHERE job_id = ? AND source_msg_id = ?",
+                    (reason, job_id, source_msg_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def get_sent_msg_ids_for_job(self, job_id: int) -> list[int]:
+        """查询 job 已成功发送的 sent_msg_id 列表(status IN SENT/CONFIRMED)。
+
+        替代 _sent_msg_tracker 内存态的查询接口。
+        """
+        if not self._db:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT sent_msg_id FROM delivery_receipts "
+                "WHERE job_id = ? AND status IN ('SENT', 'CONFIRMED') "
+                "AND sent_msg_id IS NOT NULL",
+                (job_id,),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_sent_msg_ids_for_job 异常: {e}")
+            return []
+        return [r[0] for r in rows if r[0] is not None]
+
+    # ─── M1-5: replication_tasks 副本复制任务(6 个方法) ───
+
+    async def create_replication_task(
+        self, group_id: int, file_unique_id: str, src_channel_id: int,
+        dst_channel_id: int, src_msg_id: int, media_group_id: str = "",
+        task_type: str = "replica", priority: int = 5,
+    ) -> None:
+        """创建副本复制任务(INSERT OR IGNORE 幂等)。
+
+        基于 UNIQUE(group_id, file_unique_id, src_channel_id, dst_channel_id) 去重。
+        """
+        if not self._db or not file_unique_id:
+            return
+        now = time.time()
+        for attempt in range(3):
+            try:
+                await self._db.execute(
+                    "INSERT OR IGNORE INTO replication_tasks "
+                    "(group_id, file_unique_id, src_channel_id, dst_channel_id, "
+                    " src_msg_id, dst_msg_id, media_group_id, task_type, priority, "
+                    " status, prev_status, attempts, max_attempts, next_retry_at, "
+                    " last_error, created_at, updated_at, committed_at) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, 'PLANNED', NULL, 0, 3, "
+                    " NULL, NULL, ?, ?, NULL)",
+                    (group_id, file_unique_id, src_channel_id, dst_channel_id,
+                     src_msg_id, media_group_id or "", task_type, priority, now, now),
+                )
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return
+
+    async def get_pending_replication_tasks(
+        self, limit: int = 10, priority_max: int = 10,
+    ) -> list[dict]:
+        """查询待处理的副本复制任务(status='PLANNED' 且 priority<=priority_max)。"""
+        if not self._db:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT task_id, group_id, file_unique_id, src_channel_id, "
+                "dst_channel_id, src_msg_id, dst_msg_id, media_group_id, "
+                "task_type, priority, status, prev_status, attempts, "
+                "max_attempts, next_retry_at, last_error, created_at, "
+                "updated_at, committed_at "
+                "FROM replication_tasks WHERE status = 'PLANNED' "
+                "AND priority <= ? ORDER BY priority, created_at LIMIT ?",
+                (priority_max, limit),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_pending_replication_tasks 异常: {e}")
+            return []
+        cols = ["task_id", "group_id", "file_unique_id", "src_channel_id",
+                "dst_channel_id", "src_msg_id", "dst_msg_id", "media_group_id",
+                "task_type", "priority", "status", "prev_status", "attempts",
+                "max_attempts", "next_retry_at", "last_error", "created_at",
+                "updated_at", "committed_at"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def mark_replication_copying(self, task_id: int) -> bool:
+        """标记任务为复制中(status='COPYING', prev_status=旧status)。"""
+        if not self._db:
+            return False
+        now = time.time()
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE replication_tasks SET prev_status = status, "
+                    "status = 'COPYING', updated_at = ? WHERE task_id = ? "
+                    "AND status = 'PLANNED'",
+                    (now, task_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def mark_replication_copied(self, task_id: int, dst_msg_id: int) -> bool:
+        """标记任务为已复制未验证(status='COPIED_UNVERIFIED', dst_msg_id=?)。"""
+        if not self._db:
+            return False
+        now = time.time()
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE replication_tasks SET status = 'COPIED_UNVERIFIED', "
+                    "dst_msg_id = ?, updated_at = ? WHERE task_id = ? "
+                    "AND status = 'COPYING'",
+                    (dst_msg_id, now, task_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def mark_replication_committed(self, task_id: int) -> bool:
+        """标记任务为已提交(status='COMMITTED', committed_at=now)。"""
+        if not self._db:
+            return False
+        now = time.time()
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE replication_tasks SET status = 'COMMITTED', "
+                    "committed_at = ?, updated_at = ? WHERE task_id = ? "
+                    "AND status = 'COPIED_UNVERIFIED'",
+                    (now, now, task_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
+
+    async def mark_replication_failed(
+        self, task_id: int, reason: str, max_attempts: int = 3,
+    ) -> bool:
+        """标记任务失败:attempts+1,达到上限则 status='FAILED',否则 status='PLANNED' + next_retry_at。
+
+        Returns: True 表示更新成功。
+        """
+        if not self._db:
+            return False
+        now = time.time()
+        next_retry = now + 60  # 默认 60 秒后重试
+        for attempt in range(3):
+            try:
+                # 使用 CASE 表达式根据 attempts 判断最终状态
+                cursor = await self._db.execute(
+                    "UPDATE replication_tasks SET "
+                    "attempts = attempts + 1, "
+                    "last_error = ?, "
+                    "status = CASE WHEN attempts + 1 >= ? THEN 'FAILED' ELSE 'PLANNED' END, "
+                    "next_retry_at = CASE WHEN attempts + 1 >= ? THEN NULL ELSE ? END, "
+                    "updated_at = ? "
+                    "WHERE task_id = ?",
+                    (reason, max_attempts, max_attempts, next_retry, now, task_id),
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return False
 
     # ─── D: 本地任务队列操作 ───
 

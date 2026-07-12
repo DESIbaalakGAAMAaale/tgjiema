@@ -145,6 +145,22 @@ class Settings(BaseSettings):
     # db_writer systemd 服务名(mon_bot 监控用,可配置以支持不同部署前缀)
     DB_WRITER_SERVICE_NAME: str = "tgjiema-db_writer"
 
+    # ─── M1 业务闭环配置 ───────────────────────────────────────
+    # upload_sessions 上传会话状态机
+    UPLOAD_SESSION_TTL: int = 3600          # 上传会话超时(秒),超时未推进则 EXPIRED
+    UPLOAD_SESSION_LEASE_SECONDS: int = 300 # 上传会话租约时长(秒)
+    # upload_outbox 事务发件箱
+    UPLOAD_OUTBOX_MAX_ATTEMPTS: int = 5     # 发件箱最大重试次数
+    UPLOAD_OUTBOX_RETRY_DELAY: int = 60     # 发件箱重试延迟(秒)
+    # quota_ledger 配额变更流水
+    QUOTA_LEDGER_RETENTION_DAYS: int = 90   # 配额流水保留天数
+    # delivery_receipts 投递回执
+    DELIVERY_RECEIPT_RETENTION_DAYS: int = 30  # 投递回执保留天数
+    # replication_tasks 副本复制任务
+    REPLICATION_TASK_MAX_ATTEMPTS: int = 3  # 副本复制最大重试次数
+    REPLICATION_TASK_RETRY_DELAY: int = 60 # 副本复制重试延迟(秒)
+    REPLICATION_BATCH_SIZE: int = 30        # 副本复制批量大小
+
     # ─── 配额同步间隔 ──────────────────────────────────────────
     QUOTA_SYNC_INTERVAL: int = 300       # 秒(5分钟),减少 CRDB RU 消耗
 
