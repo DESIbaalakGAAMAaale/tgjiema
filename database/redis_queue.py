@@ -181,8 +181,8 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
             settings.WRITER_STREAM_KEY,
             {"data": json.dumps(msg, default=str)},
             id="*",  # Redis 自动生成有序 ID
-            maxlen=settings.REDIS_STREAM_MAXLEN,  # R34 P1-3: 近似裁剪,防止 Stream 无限增长
-            approximate=True,  # 使用 ~ 模式,性能更好
+            # R35 P0-2: 不设置 maxlen — MAXLEN 会裁剪尚未 ACK 的 pending 消息正文,
+            # 导致 XAUTOCLAIM 无法恢复。改由独立 safe_trim() 维护。
         )
         return True
     except Exception as e:
@@ -337,33 +337,119 @@ async def ack(message_ids: list[str]) -> int:
         return 0
 
 
-async def trim_stream() -> int:
-    """裁剪 Stream(XTRIM MAXLEN ~)。
+async def safe_trim() -> int:
+    """安全裁剪 Stream(XTRIM MINID),不删除 pending 消息。
 
-    R34 P1-3: ACK 后 Stream 中的消息不会被自动删除,需定期 XTRIM 裁剪。
-    使用近似模式(~),Redis 保证至少保留 maxlen 条消息。
-    不会裁剪仍在 PEL 中的消息(通过 MAXLEN 而非 MINID)。
+    R35 P0-2 修复: MAXLEN 裁剪可能删除尚未 ACK 的 pending 消息正文。
+    改用 MINID 策略:只裁剪所有 Consumer Group 的最小 pending ID 之前的消息。
+
+    流程:
+    1. 查询所有 Consumer Group 的 pending 列表
+    2. 找到最小的 pending message ID
+    3. 额外保留 24 小时安全窗口(不裁剪最近的消息)
+    4. XTRIM MINID < 安全水位
 
     Returns:
-        被裁剪的消息数,Redis 不可达或配置 <=0 时返回 0
+        被裁剪的消息数,Redis 不可达时返回 0
     """
     redis = await get_redis()
     if not redis:
         return 0
     try:
         from config import settings
-        maxlen = getattr(settings, "REDIS_STREAM_MAXLEN", 10000)
-        if maxlen <= 0:
+        # 1. 查询 Consumer Group 的 pending 概要
+        try:
+            pending_info = await redis.xpending(
+                settings.WRITER_STREAM_KEY,
+                settings.WRITER_CONSUMER_GROUP,
+            )
+        except Exception:
+            pending_info = None
+
+        # 2. 确定安全裁剪水位
+        # redis-py 在 decode_responses=True 时可能返回 dict 或 tuple,两种格式都支持
+        min_pending_id = None
+        has_pending = False
+        if pending_info and isinstance(pending_info, dict):
+            # dict 格式: {'pending': count, 'min': min_id, 'max': max_id, 'consumers': [...]}
+            pending_count = pending_info.get('pending', 0)
+            if pending_count:
+                has_pending = True
+                min_pending_id = pending_info.get('min')
+        elif pending_info and isinstance(pending_info, (tuple, list)) and len(pending_info) >= 1:
+            # tuple 格式: (count, min_id, max_id, consumers)
+            pending_count = pending_info[0] or 0
+            if pending_count and len(pending_info) >= 2:
+                has_pending = True
+                min_pending_id = pending_info[1]
+        else:
+            # 查询失败或未知格式:保守不裁剪
             return 0
+
+        # 3. 计算安全裁剪水位
+        if has_pending and min_pending_id:
+            # 有 pending 消息: 裁剪 min_pending 之前的消息(不含 min_pending)
+            # 但额外保留安全窗口: 不裁剪最近 24 小时的消息
+            # Redis Stream ID 格式: <timestamp>-<seq>,取 timestamp 部分计算
+            safe_min_id = _compute_safe_trim_id(str(min_pending_id), retention_hours=24)
+        else:
+            # 无 pending: 裁剪 24 小时前的消息
+            safe_min_id = _compute_safe_trim_id(None, retention_hours=24)
+
+        if not safe_min_id:
+            return 0
+
         trimmed = await redis.xtrim(
             settings.WRITER_STREAM_KEY,
-            maxlen=maxlen,
-            approximate=True,
+            minid=safe_min_id,
+            approximate=False,  # 精确裁剪,不使用 ~
         )
         return trimmed
     except Exception as e:
-        logger.debug(f"[RedisQueue] trim_stream 异常: {e}")
+        logger.debug(f"[RedisQueue] safe_trim 异常: {e}")
         return 0
+
+
+def _compute_safe_trim_id(min_pending_id: Optional[str], retention_hours: int = 24) -> str:
+    """计算安全裁剪水位 ID。
+
+    R35 P0-2: 保留 pending 消息 + 额外安全窗口。
+
+    Args:
+        min_pending_id: 最小的 pending 消息 ID(如 "1700000000-0"),None 表示无 pending
+        retention_hours: 安全保留窗口(小时),不裁剪此时间内的消息
+
+    Returns:
+        安全裁剪水位 ID(如 "1699999000-0"),裁剪此 ID 之前的消息
+    """
+    now_ts = int(time.time())
+    safe_ts = now_ts - retention_hours * 3600
+
+    if min_pending_id:
+        try:
+            # Stream ID 格式: <timestamp>-<seq>
+            pending_ts = int(min_pending_id.split('-')[0])
+            # 取 min(pending_ts, safe_ts) 的较小值,确保不裁剪 pending
+            # 但不能裁剪 pending 本身,所以用 pending_ts - 1
+            actual_safe_ts = min(pending_ts - 1, safe_ts)
+        except (ValueError, IndexError):
+            actual_safe_ts = safe_ts
+    else:
+        actual_safe_ts = safe_ts
+
+    return f"{actual_safe_ts}-0"
+
+
+async def trim_stream() -> int:
+    """[已废弃] 使用 safe_trim() 替代。
+
+    R35 P0-2: 此方法使用 MAXLEN 裁剪,可能删除 pending 消息正文。
+    保留为别名,内部调用 safe_trim()。
+
+    Returns:
+        被裁剪的消息数,Redis 不可达时返回 0
+    """
+    return await safe_trim()
 
 
 async def delete(key: str) -> bool:

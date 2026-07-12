@@ -8,6 +8,12 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # ── R35 P0-1: 服务角色(用于分服务校验 secrets) ──
+    # 取值: "up" / "idx" / "dsp" / "mon" / "admin_bot" / "admin" / "db_writer" / "db_backup" / ""
+    # 空字符串(默认)→ 校验全部字段(向后兼容老部署模式)
+    # 部署脚本通过 systemd Environment=SERVICE_ROLE=up 注入
+    SERVICE_ROLE: str = ""
+
     # ── 环形冗余 v2 架构：5 个 Bot Token（file_bot 已独立部署至 CF Workers）──
     UPLOAD_BOT_TOKEN: str = ""
     DECODER_BOT_TOKEN: str = ""
@@ -272,31 +278,118 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def validate_required_fields(self):
-        """验证必填字段,在启动时尽早发现问题。"""
+        """验证必填字段,根据 SERVICE_ROLE 只校验当前服务所需的字段。
+
+        R35 P0-1 修复: Secrets 真隔离后,每个服务只加载自己的 secrets,
+        不再强制所有服务都拥有全部 5 个 Bot Token + CRDB URL + Admin 凭证。
+
+        SERVICE_ROLE 为空时(向后兼容)校验全部字段(老部署模式)。
+        """
+        role = self.SERVICE_ROLE
+
+        # 向后兼容: SERVICE_ROLE 为空时,校验全部字段(老部署模式)
+        if not role:
+            return self._validate_all_fields()
+
+        # 按角色校验
+        role_validators = {
+            "up": self._validate_up_fields,
+            "idx": self._validate_idx_fields,
+            "dsp": self._validate_dsp_fields,
+            "mon": self._validate_mon_fields,
+            "admin_bot": self._validate_admin_bot_fields,
+            "admin": self._validate_admin_fields,
+            "db_writer": self._validate_writer_fields,
+            "db_backup": self._validate_backup_fields,
+        }
+        validator = role_validators.get(role)
+        if validator:
+            validator()
+        # 未知 role 不校验(只记录警告)
+        elif role:
+            logger.warning(f"[Settings] 未知 SERVICE_ROLE={role},跳过必填字段校验")
+
+        return self
+
+    def _validate_all_fields(self):
+        """向后兼容: 校验全部必填字段(老部署模式,SERVICE_ROLE 为空)"""
         missing = []
-        if not self.UPLOAD_BOT_TOKEN:
-            missing.append('UPLOAD_BOT_TOKEN')
-        if not self.DECODER_BOT_TOKEN:
-            missing.append('DECODER_BOT_TOKEN')
-        if not self.SENDER_BOT_TOKEN:
-            missing.append('SENDER_BOT_TOKEN')
-        if not self.MON_BOT_TOKEN:
-            missing.append('MON_BOT_TOKEN')
-        if not self.ADMIN_BOT_TOKEN:
-            missing.append('ADMIN_BOT_TOKEN')
-        if not self.COCKROACHDB_URL:
-            missing.append('COCKROACHDB_URL')
+        if not self.UPLOAD_BOT_TOKEN: missing.append('UPLOAD_BOT_TOKEN')
+        if not self.DECODER_BOT_TOKEN: missing.append('DECODER_BOT_TOKEN')
+        if not self.SENDER_BOT_TOKEN: missing.append('SENDER_BOT_TOKEN')
+        if not self.MON_BOT_TOKEN: missing.append('MON_BOT_TOKEN')
+        if not self.ADMIN_BOT_TOKEN: missing.append('ADMIN_BOT_TOKEN')
+        if not self.COCKROACHDB_URL: missing.append('COCKROACHDB_URL')
         if missing:
             raise ValueError(f"[Settings] 以下必填环境变量未配置: {', '.join(missing)}。请检查 .env 文件。")
+        self._validate_relay_key()
+        self._validate_admin_credentials()
+        return self
 
-        # PRE-08: RELAY_ENCRYPTION_KEY 必填且必须是合法的 Fernet 密钥格式
-        # Fernet 密钥：44 字符 urlsafe-base64，解码后 32 字节。
-        # 若留空或格式错误，relay_db 会静默回退到明文存储 API_HASH（PRE-10 已改为抛错，
-        # 但前置校验能更早在启动时暴露问题，避免运行时崩溃）。
+    def _validate_up_fields(self):
+        """Up Bot 必填字段"""
+        if not self.UPLOAD_BOT_TOKEN:
+            raise ValueError("[Settings][up] UPLOAD_BOT_TOKEN 未配置")
+        if not self.ACCOUNT_1_CHANNELS:
+            raise ValueError("[Settings][up] ACCOUNT_1_CHANNELS 未配置(至少需要 1 个账号频道)")
+        # Up Bot 处理中继文件,需要 RELAY_ENCRYPTION_KEY
+        self._validate_relay_key()
+        # Up 不需要 CRDB URL、其他 Bot Token、Admin 凭证
+
+    def _validate_idx_fields(self):
+        """Idx Bot 必填字段"""
+        if not self.DECODER_BOT_TOKEN:
+            raise ValueError("[Settings][idx] DECODER_BOT_TOKEN 未配置")
+        # Idx 需要 CRDB URL(读写 file_records/codes/jobs)
+        if not self.COCKROACHDB_URL:
+            raise ValueError("[Settings][idx] COCKROACHDB_URL 未配置")
+        # Idx Bot 使用 relay_db 加解密 API_HASH,需要 RELAY_ENCRYPTION_KEY
+        self._validate_relay_key()
+
+    def _validate_dsp_fields(self):
+        """Dsp Bot 必填字段"""
+        if not self.SENDER_BOT_TOKEN:
+            raise ValueError("[Settings][dsp] SENDER_BOT_TOKEN 未配置")
+
+    def _validate_mon_fields(self):
+        """Mon Bot 必填字段"""
+        if not self.MON_BOT_TOKEN:
+            raise ValueError("[Settings][mon] MON_BOT_TOKEN 未配置")
+
+    def _validate_admin_bot_fields(self):
+        """Admin Bot 必填字段"""
+        if not self.ADMIN_BOT_TOKEN:
+            raise ValueError("[Settings][admin_bot] ADMIN_BOT_TOKEN 未配置")
+        if not self.ADMIN_TELEGRAM_ID:
+            raise ValueError("[Settings][admin_bot] ADMIN_TELEGRAM_ID 未配置")
+
+    def _validate_admin_fields(self):
+        """Admin Web 必填字段"""
+        self._validate_admin_credentials()
+
+    def _validate_writer_fields(self):
+        """DBWriter 必填字段 — 设计为无 secrets,只需 Redis"""
+        if self.WRITER_MODE == "redis" and not self.REDIS_URL:
+            raise ValueError("[Settings][db_writer] WRITER_MODE=redis 但 REDIS_URL 未配置")
+        # db_writer 不需要任何 Bot Token、CRDB URL、Admin 凭证
+
+    def _validate_backup_fields(self):
+        """DB Backup 必填字段"""
+        if not self.COCKROACHDB_URL:
+            raise ValueError("[Settings][db_backup] COCKROACHDB_URL 未配置")
+        if self.DB_BACKUP_ENABLED:
+            if not self.R2_ACCESS_KEY_ID:
+                raise ValueError("[Settings][db_backup] DB_BACKUP_ENABLED=true 但 R2_ACCESS_KEY_ID 未配置")
+            if not self.R2_SECRET_ACCESS_KEY:
+                raise ValueError("[Settings][db_backup] DB_BACKUP_ENABLED=true 但 R2_SECRET_ACCESS_KEY 未配置")
+        # db_backup 需要 CRDB URL 和 R2 凭证,但不需要 Bot Token
+
+    def _validate_relay_key(self):
+        """校验 RELAY_ENCRYPTION_KEY(仅 up/idx/dsp/mon 需要)"""
         if not self.RELAY_ENCRYPTION_KEY:
             raise ValueError(
                 "[Settings] RELAY_ENCRYPTION_KEY 未配置。"
-                "请运行以下命令生成：python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+                "请运行: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
             )
         try:
             decoded = base64.urlsafe_b64decode(self.RELAY_ENCRYPTION_KEY.encode())
@@ -304,27 +397,18 @@ class Settings(BaseSettings):
                 raise ValueError(f"解码后长度 {len(decoded)} != 32")
         except Exception as e:
             raise ValueError(
-                f"[Settings] RELAY_ENCRYPTION_KEY 不是合法的 Fernet 密钥（{e}）。"
-                "请运行以下命令重新生成：python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+                f"[Settings] RELAY_ENCRYPTION_KEY 不是合法的 Fernet 密钥({e})。"
+                "请运行: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
             )
 
-        # ── Admin Web 安全校验：拒绝默认/空密码 ──
+    def _validate_admin_credentials(self):
+        """校验 Admin Web 凭证(仅 admin/admin_bot 需要)"""
         if not self.ADMIN_USERNAME:
-            raise ValueError(
-                "[Settings] ADMIN_USERNAME 未配置。请在 .env 中设置管理员用户名。"
-            )
+            raise ValueError("[Settings] ADMIN_USERNAME 未配置")
         if not self.ADMIN_PASSWORD or self.ADMIN_PASSWORD == "CHANGE_ME_NOW":
-            raise ValueError(
-                "[Settings] ADMIN_PASSWORD 未配置或仍为默认值 'CHANGE_ME_NOW'。"
-                "请在 .env 中设置一个安全的密码。"
-            )
+            raise ValueError("[Settings] ADMIN_PASSWORD 未配置或仍为默认值 'CHANGE_ME_NOW'")
         if self.ADMIN_WEB_HOST != "127.0.0.1" and len(self.ADMIN_PASSWORD) < 12:
-            raise ValueError(
-                "[Settings] ADMIN_WEB_HOST 非本地回环地址时，"
-                "ADMIN_PASSWORD 长度必须 >= 12 字符以确保安全。"
-            )
-
-        return self
+            raise ValueError("[Settings] ADMIN_WEB_HOST 非本地回环时,ADMIN_PASSWORD 长度必须 >= 12")
 
     def get_accounts_config(self) -> dict:
         """从 .env 配置中解析账号频道配置。

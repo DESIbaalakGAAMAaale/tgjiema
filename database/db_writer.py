@@ -123,7 +123,7 @@ class DBWriter:
         self._skipped_count: int = 0  # R33: 幂等跳过计数
         self._dead_fail_count: int = 0  # R34: DLQ 写入失败计数
         self._dlq_task: asyncio.Task | None = None  # R34 P1-1: DLQ Worker 协程
-        self._ack_count: int = 0  # R34 P1-3: ACK 计数,每 100 次触发 trim_stream
+        self._ack_count: int = 0  # R34 P1-3: ACK 计数,每 100 次触发 safe_trim(R35 P0-2: 替代 trim_stream)
         # M0 收尾: writer_inbox 清理时间戳(每小时清理一次过期记录)
         self._last_cleanup_time: float = 0.0
 
@@ -503,23 +503,26 @@ class DBWriter:
     async def _safe_ack(self, stream_id: str):
         """安全 ACK:捕获异常并记录,不传播。
 
-        R34 P1-3: 每 100 条 ACK 后调用 trim_stream() 裁剪 Stream,
+        R34 P1-3: 每 100 条 ACK 后调用 safe_trim() 裁剪 Stream,
         防止已 ACK 消息在 Stream 中无限堆积。
+        R35 P0-2: 改用 safe_trim() 替代 trim_stream(),基于 MINID 策略
+        避免裁剪尚未 ACK 的 pending 消息正文。
         """
         try:
             await redis_queue.ack([stream_id])
             # R34 P1-3: 每 100 条 ACK 触发一次 XTRIM,裁剪已消费的旧消息
+            # R35 P0-2: 改用 safe_trim()(MINID 策略,不删 pending)
             self._ack_count += 1
             if self._ack_count % 100 == 0:
                 try:
-                    trimmed = await redis_queue.trim_stream()
+                    trimmed = await redis_queue.safe_trim()
                     if trimmed > 0:
                         logger.debug(
                             f"[DBWriter] Stream 裁剪 {trimmed} 条消息"
                             f"(ack_count={self._ack_count})"
                         )
                 except Exception as e:
-                    logger.debug(f"[DBWriter] trim_stream 异常(不影响主流程): {e}")
+                    logger.debug(f"[DBWriter] safe_trim 异常(不影响主流程): {e}")
         except Exception as e:
             logger.warning(
                 f"[DBWriter] XACK 失败(消息留 pending,下次回收处理): "

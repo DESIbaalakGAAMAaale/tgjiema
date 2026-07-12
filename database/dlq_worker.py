@@ -194,8 +194,10 @@ class DLQWorker:
         message_id = dead_msg.get("message_id", "") or original.get("message_id", "")
 
         try:
-            # XADD 回主 Stream(保留原 message_id)
-            await redis_queue.push(
+            # R35 P0-3: 检查 push() 返回值,失败时不 XDEL 死信
+            # push() 在 Redis 不可达或 XADD 失败时返回 False(不抛异常),
+            # 旧逻辑仍会 XDEL 死信,导致消息永久丢失。此处显式检查返回值。
+            ok = await redis_queue.push(
                 op_type=original.get("op_type", ""),
                 table=original.get("table", ""),
                 method_name=original.get("method_name", ""),
@@ -203,13 +205,20 @@ class DLQWorker:
                 redis_key=original.get("redis_key", ""),
                 message_id=message_id,
             )
+            if not ok:
+                # push 返回 False(Redis 不可达或 XADD 失败),不删除死信
+                logger.error(
+                    f"[DLQWorker] XADD 回主 Stream 失败(push 返回 False),"
+                    f"保留死信等待下次重试: msg_id={msg_id}"
+                )
+                return False
         except Exception as e:
             logger.error(
-                f"[DLQWorker] XADD 回主 Stream 失败,保留死信: msg_id={msg_id}: {e}"
+                f"[DLQWorker] XADD 回主 Stream 异常,保留死信: msg_id={msg_id}: {e}"
             )
             return False
 
-        # XDEL 从死信 Stream 删除
+        # R35 P0-3: 只有 push 成功后才 XDEL 死信
         deleted = await redis_queue.delete_dead_message(msg_id)
         if not deleted:
             logger.warning(
