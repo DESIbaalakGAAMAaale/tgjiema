@@ -292,19 +292,27 @@ class CockroachDBClient:
         self._url = url
 
     async def connect(self):
-        # 初始化连接时关闭 follower_reads，否则 default_transaction_use_follower_reads=on 让所有写入报只读错误
+        # R36 §6.4.1: min_size=0 允许空闲时关闭所有连接(不再强制 max(1, ...))
+        # R36 §6.4.2: application_name 用于按服务追踪 RU 消耗
+        from config import settings as _settings
+        # 实际 application_name: tgjiema-<role>(如 tgjiema-up / tgjiema-idx)
+        role = _settings.SERVICE_ROLE or "default"
+        app_name = f"{_settings.CRDB_APPLICATION_NAME_PREFIX}-{role}"
+
+        # 初始化连接时:关闭 follower_reads + 设置 application_name(按服务追踪 RU)
         async def _init_conn(conn):
             await conn.execute("SET default_transaction_use_follower_reads = off")
+            await conn.execute("SET application_name = $1", app_name)
 
-        from config import settings as _settings
-        min_size = max(1, _settings.CRDB_POOL_MIN_SIZE)
-        max_size = min(_settings.CRDB_POOL_MAX_SIZE, 20)  # 单进程上限 20，7 进程 ≤ 140，远低于 CRDB 上限
+        min_size = _settings.CRDB_POOL_MIN_SIZE  # R36: 不再强制 max(1, ...)
+        max_size = min(_settings.CRDB_POOL_MAX_SIZE, 2)  # R36: 业务 Bot ≤2,降低空载连接
         self._pool = await asyncpg.create_pool(
             self._url,
             min_size=min_size,
             max_size=max_size,
             statement_cache_size=256,
             init=_init_conn,
+            server_settings={"application_name": app_name},  # 连接级别也设置
         )
 
         # ─── SQLite 缓存备份：初始化并恢复内存缓存───

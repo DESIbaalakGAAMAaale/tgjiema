@@ -1476,25 +1476,36 @@ class ConfigRegistry:
             category=ConfigCategory.DATABASE,
             reload_policy=ReloadPolicy.RESTART_REQUIRED,
             sensitivity=SensitivityLevel.INTERNAL,
-            description="CRDB 连接池最小连接数",
-            default_value="1",
+            description="CRDB 连接池最小连接数(R36: 0=空闲时关闭所有连接,降低空载 RU)",
+            default_value="0",
             env_var="CRDB_POOL_MIN_SIZE",
             services=ALL_READERS + ["db_writer"],
             validation_regex=r"^\d+$",
-            min_value=1,
+            min_value=0,
         ))
         self.register(ConfigMetadata(
             key="CRDB_POOL_MAX_SIZE",
             category=ConfigCategory.DATABASE,
             reload_policy=ReloadPolicy.RESTART_REQUIRED,
             sensitivity=SensitivityLevel.INTERNAL,
-            description="CRDB 连接池最大连接数(7 进程 × 此值 ≤ CRDB 上限,建议 ≤20)",
-            default_value="5",
+            description="CRDB 连接池最大连接数(R36: 业务 Bot ≤2,crdb_sync 可更高)",
+            default_value="2",
             env_var="CRDB_POOL_MAX_SIZE",
             services=ALL_READERS + ["db_writer"],
             validation_regex=r"^\d+$",
             min_value=1,
-            max_value=50,
+            max_value=20,
+        ))
+        self.register(ConfigMetadata(
+            key="CRDB_APPLICATION_NAME_PREFIX",
+            category=ConfigCategory.DATABASE,
+            reload_policy=ReloadPolicy.RESTART_REQUIRED,
+            sensitivity=SensitivityLevel.INTERNAL,
+            description="application_name 前缀,实际值为 f'{前缀}-{SERVICE_ROLE}'(如 tgjiema-up),按服务追踪 RU",
+            default_value="tgjiema",
+            env_var="CRDB_APPLICATION_NAME_PREFIX",
+            services=ALL_READERS + ["db_writer"],
+            validation_regex=r"^[a-zA-Z][a-zA-Z0-9_-]*$",
         ))
 
         # ── 缓存参数 ──

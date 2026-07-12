@@ -1441,15 +1441,35 @@ async def _async_main():
             except Exception as e:
                 logger.warning(f"[Dsp] 周期同步异常: {e}")
 
-    # D: Sync Back - 每 60 秒同步本地状态变更回 CRDB
+    # D: Sync Back - R36 §6.4.4: dirty 驱动 + 退避(无 dirty 时 1m→5m→30m,关闭连接)
     async def sync_back_loop():
+        """R36 §6.4.4: 取消固定 120s 同步,改为 dirty 驱动 + 退避。
+
+        - 有 dirty job 时:处理所有 dirty,下次 60s 后再检查
+        - 连续无 dirty 时退避:60s → 300s(5min) → 1800s(30min),上限 30min
+        - 任何一次发现 dirty 后,退避重置为 60s
+        - sync_local_jobs_to_crdb 内部已含 dirty 检查,无 dirty 时直接返回,不会建立 CRDB 连接
+        """
         from database.session import sync_local_jobs_to_crdb
+        from database.cache_store import get_cache_store
+        backoff_seconds = 60  # 初始 1min
+        max_backoff = 1800    # 上限 30min
         while True:
             try:
-                await sync_local_jobs_to_crdb()
+                # 先查 dirty 数量(0 RU,SQLite 本地查询),决定是否需要 CRDB 连接
+                store = get_cache_store()
+                unsynced = await store.get_local_unsynced_jobs()
+                if unsynced:
+                    # 有 dirty:执行同步,重置退避到 60s
+                    await sync_local_jobs_to_crdb()
+                    backoff_seconds = 60
+                else:
+                    # 无 dirty:退避翻倍(上限 30min),不建立 CRDB 连接
+                    backoff_seconds = min(backoff_seconds * 2, max_backoff)
+                    logger.debug(f"[SyncBack] 无 dirty job,退避至 {backoff_seconds}s 后再检查")
             except Exception as e:
                 logger.warning(f"[SyncBack] 同步异常: {e}")
-            await asyncio.sleep(120)
+            await asyncio.sleep(backoff_seconds)
 
     # E: 回收超时 dispatched jobs,防止进程崩溃导致 job 永久丢失
     async def reclaim_dispatched_loop():

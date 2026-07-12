@@ -8,6 +8,8 @@ status_counters: dict = {
     "total_files": 0,
     "active_files": 0,
     "today_decodes": 0,
+    # R36 §6.4.5: total_logs 走预聚合 snapshot,不再每次 /logs 页都 CRDB COUNT(*)
+    "total_logs": 0,
 }
 
 # 初始化标记，admin_bot 用于判断是否需要首次 DB 查询

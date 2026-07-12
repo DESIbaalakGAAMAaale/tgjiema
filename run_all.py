@@ -190,6 +190,21 @@ def run_db_writer():
         logger.info("[db_writer] 收到中断信号,已停止")
 
 
+def run_crdb_sync():
+    """R36 §6.3: 运行单一 crdb_sync 服务(独占 CRDB 同步事实源)。
+
+    信号处理参考 db_backup:不注册自定义 SIGTERM handler,
+    让 asyncio.run 通过 CancelledError 传播信号,在 finally 中清理资源。
+    """
+    os.environ["BOT_ROLE"] = "crdb_sync"
+    import asyncio
+    from services.crdb_sync_service import main as _main
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        logger.info("[crdb_sync] 收到中断信号,已停止")
+
+
 BOT_RUNNERS = {
     "up": run_up_bot,
     "idx": run_idx_bot,
@@ -199,6 +214,7 @@ BOT_RUNNERS = {
     "admin": run_admin,
     "db_backup": run_db_backup,
     "db_writer": run_db_writer,
+    "crdb_sync": run_crdb_sync,
 }
 
 

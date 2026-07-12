@@ -404,12 +404,11 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
             for k, v in cached.items():
                 _sc.status_counters[k] = v
         else:
-            # SQLite 无数据时 CRDB 兜底
-            users_col = get_users_col()
-            files_col = get_file_records_col()
-            _sc.status_counters["total_users"] = await users_col.count_documents({})
-            _sc.status_counters["total_files"] = await files_col.count_documents({})
-            _sc.status_counters["active_files"] = await files_col.count_documents({"status": "active"})
+            # R36 §6.4.5: SQLite 无数据时走 SQLite 本地表 COUNT(0 RU),
+            # 不再回退到 CRDB count_documents(避免热 COUNT)
+            _sc.status_counters["total_users"] = await store.count_users_local()
+            _sc.status_counters["total_files"] = await store.count_file_records_local()
+            _sc.status_counters["active_files"] = await store.count_file_records_local(status="active")
         _sc.status_counters_initialized = True
         _sc.status_counters_loaded_at = now
 
@@ -417,10 +416,9 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
     total_files = _sc.status_counters.get("total_files", 0)
     active_files = _sc.status_counters.get("active_files", 0)
 
-    today = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    # today_decodes 需要日期过滤，从 CRDB 直查（计数器是累计值，不按天重置）
-    logs_col = get_decode_logs_col()
-    today_decodes = await logs_col.count_documents({"request_time": {"$gte": today}})
+    # R36 §6.4.5: today_decodes 走预聚合 snapshot(各 Bot 进程周期性写入),
+    # 不再每次打开 dashboard 都对 CRDB 执行带日期过滤的 COUNT
+    today_decodes = _sc.status_counters.get("today_decodes", 0)
 
     bot_statuses = []
     for name, health in metrics.bots.items():
@@ -459,33 +457,20 @@ async def users_page(
     search: str = Query(""),
 ):
     per_page = settings.ADMIN_PAGE_SIZE
-    users_col = get_users_col()
+    # R36 §6.4.5: count/list/search 走 SQLite read model(0 RU),
+    # 不再使用 CRDB count_documents + regex
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    sanitized = _sanitize_search(search) if search else ""
 
-    query = {}
-    if search:
-        search = _sanitize_search(search)
-        if search.isdigit():
-            query["user_id"] = int(search)
-        else:
-            query["$or"] = [
-                {"username": {"$regex": search, "$options": "i"}},
-                {"first_name": {"$regex": search, "$options": "i"}},
-            ]
-
-    # M7: 无筛选条件时走 60s TTL 缓存，避免每次翻页都 count_documents CRDB
-    # 注意: count 和 find 之间数据可能变化，翻页时可能看到少量重复/遗漏记录
-    if not search:
-        from database.cache_store import get_cache_store
-        cached = await get_cache_store().cache_get("count_cache:users", _COUNT_CACHE_TTL)
-        if cached is not None:
-            total = cached
-        else:
-            total = await users_col.count_documents({})
-            await get_cache_store().cache_set("count_cache:users", total)
-    else:
-        total = await users_col.count_documents(query)
+    # count 走 SQLite(0 RU)
+    total = await store.count_users_local(search=sanitized)
     skip = (page - 1) * per_page
-    users = await users_col.find(query, sort=("created_at", -1), skip=skip, limit=per_page)
+    # list 走 SQLite(0 RU,LIKE 搜索 + 分页 + 排序)
+    users = await store.list_users_local_paginated(
+        search=sanitized, skip=skip, limit=per_page,
+        sort_field="created_at", sort_dir="desc",
+    )
 
     return _make_csrf_response(
         "users.html",
@@ -583,29 +568,20 @@ async def files_page(
     search: str = Query(""),
 ):
     per_page = 20
-    files_col = get_file_records_col()
+    # R36 §6.4.5: count/list/search 走 SQLite read model(0 RU),
+    # 不再使用 CRDB count_documents + regex
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
+    sanitized = _sanitize_search(search) if search else ""
 
-    query = {}
-    if search:
-        search = _sanitize_search(search)
-        if search.isdigit():
-            query["uploader_id"] = int(search)
-        else:
-            query["file_code"] = {"$regex": search, "$options": "i"}
-
-    # M7: 无筛选条件时走 60s TTL 缓存
-    if not search:
-        from database.cache_store import get_cache_store
-        cached = await get_cache_store().cache_get("count_cache:files", _COUNT_CACHE_TTL)
-        if cached is not None:
-            total = cached
-        else:
-            total = await files_col.count_documents({})
-            await get_cache_store().cache_set("count_cache:files", total)
-    else:
-        total = await files_col.count_documents(query)
+    # count 走 SQLite(0 RU)
+    total = await store.count_file_records_local(search=sanitized)
     skip = (page - 1) * per_page
-    files = await files_col.find(query, sort=("create_time", -1), skip=skip, limit=per_page)
+    # list 走 SQLite(0 RU,LIKE 搜索 + 分页 + 排序)
+    files = await store.list_file_records_local_paginated(
+        search=sanitized, skip=skip, limit=per_page,
+        sort_field="create_time", sort_dir="desc",
+    )
 
     return _make_csrf_response(
         "files.html",
@@ -654,15 +630,22 @@ async def logs_page(
     per_page = settings.ADMIN_FILES_PAGE_SIZE
     logs_col = get_decode_logs_col()
 
-    # M7: logs 无筛选条件，走 60s TTL 缓存
-    from database.cache_store import get_cache_store
-    cached = await get_cache_store().cache_get("count_cache:logs", _COUNT_CACHE_TTL)
-    if cached is not None:
-        total = cached
-    else:
-        total = await logs_col.count_documents({})
-        await get_cache_store().cache_set("count_cache:logs", total)
+    # R36 §6.4.5: total_logs 走预聚合 snapshot(0 RU),
+    # 不再每次打开 /logs 都对 CRDB 执行 COUNT(*)
+    import utils.shared_counters as _sc
+    total = _sc.status_counters.get("total_logs", 0)
+    if total == 0:
+        # 兜底:首次启动 snapshot 未写入时,走 60s TTL 缓存
+        from database.cache_store import get_cache_store
+        cached = await get_cache_store().cache_get("count_cache:logs", _COUNT_CACHE_TTL)
+        if cached is not None:
+            total = cached
+        else:
+            total = await logs_col.count_documents({})
+            await get_cache_store().cache_set("count_cache:logs", total)
+            _sc.status_counters["total_logs"] = total
     skip = (page - 1) * per_page
+    # list 仍走 CRDB(已带 sort + limit,非无界排序)
     logs = await logs_col.find(sort=("request_time", -1), skip=skip, limit=per_page)
 
     return _make_csrf_response(

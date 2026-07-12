@@ -224,8 +224,12 @@ class Settings(BaseSettings):
     RATE_LIMIT_THRESHOLD_HIGH: int = 30         # 高负载阈值（jobs 数量 > 此值用最大延迟）
 
     # ── 数据库连接池（自动适配，不超过 CRDB 上限）──
-    CRDB_POOL_MIN_SIZE: int = 1                 # 最小连接数
-    CRDB_POOL_MAX_SIZE: int = 5                 # 最大连接数（7 进程 × 此值 ≤ CRDB 上限，建议 ≤20）
+    # R36 §6.4.1: min_size=0 允许空闲时关闭所有连接,降低空载 RU 消耗
+    CRDB_POOL_MIN_SIZE: int = 0                 # 最小连接数(0=空闲时不保持连接)
+    CRDB_POOL_MAX_SIZE: int = 2                 # 最大连接数(业务 Bot ≤2,crdb_sync 可更高)
+    # R36 §6.4.2: application_name 用于按服务追踪 RU 消耗
+    # 实际值为 f"{CRDB_APPLICATION_NAME_PREFIX}-{SERVICE_ROLE}"(如 tgjiema-up)
+    CRDB_APPLICATION_NAME_PREFIX: str = "tgjiema"
 
     # ── 缓存参数 ──
     CACHE_USER_MAX_SIZE: int = 1000             # 用户缓存最大条目

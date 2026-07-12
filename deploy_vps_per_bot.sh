@@ -226,6 +226,8 @@ split_env_per_service() {
         [admin]="ADMIN_USERNAME,ADMIN_PASSWORD,ADMIN_WEB_PORT,ADMIN_WEB_HOST,CSRF_COOKIE_SECURE"
         [db_backup]="R2_ACCOUNT_ID,R2_ACCESS_KEY_ID,R2_SECRET_ACCESS_KEY,R2_BUCKET_NAME,R2_ENDPOINT,DB_BACKUP_ENABLED,DB_BACKUP_INTERVAL_MINUTES,COCKROACHDB_URL"
         [db_writer]=""  # 无 secrets,只用 REDIS_URL(来自 .env.shared)
+        # R36 §6.3: crdb_sync 需要连接 CRDB,从 .env.shared 读取 COCKROACHDB_URL
+        [crdb_sync]="COCKROACHDB_URL"
     )
 
     # 共享变量(所有服务都需要,写入 .env.shared)
@@ -325,6 +327,8 @@ SERVICES=(
     "admin:Web管理后台:Web管理面板，fastapi+uvicorn"
     "db_backup:数据库备份:定期备份数据库到R2"
     "db_writer:数据库写入:40:on-failure:10"
+    # R36 §6.3: 单一 crdb_sync 服务(独占 CRDB 同步事实源)
+    "crdb_sync:CRDB同步服务:40:on-failure:10"
 )
 
 # 生成 systemd 模板函数
@@ -419,13 +423,64 @@ for entry in "${SERVICES[@]}"; do
     generate_service "$name" "$desc" "$detail"
 done
 
+# R36 §6.4.3: migration/bootstrap 改为 systemd oneshot;业务 Bot 禁止执行 DDL
+# 所有 Bot 服务 After=+Requires= tgjiema-migration.service,确保 DDL 先完成
+info "创建 migration oneshot 服务(DDL 一次性执行,业务 Bot 不再触发 DDL)..."
+
+cat > "/etc/systemd/system/${SVC_PREFIX}-migration.service" << EOF
+[Unit]
+Description=TG文件解码器 — DDL 迁移(oneshot)
+After=network.target
+Before=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service ${SVC_PREFIX}-crdb_sync.service
+PartOf=${SVC_PREFIX}.target
+
+[Service]
+Type=oneshot
+User=tgjiema
+WorkingDirectory=${DEPLOY_DIR}
+Environment="PYTHONUNBUFFERED=1"
+Environment="SERVICE_ROLE=migration"
+EnvironmentFile=-${DEPLOY_DIR}/.env.shared
+EnvironmentFile=-${DEPLOY_DIR}/.env.secrets.migration
+# 调用 init_db() 完成 DDL: 创建表/索引/迁移 + 写入 ddl_version 到 SQLite 缓存
+# 业务 Bot 启动时 SQLite 缓存命中,跳过 DDL(不再触发 CRDB DDL 兜底查询)
+ExecStart=${DEPLOY_DIR}/venv/bin/python -c "import asyncio; from database import init_db, close_db; asyncio.run(init_db()); asyncio.run(close_db())"
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SVC_PREFIX}-migration
+
+# 安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "  [OK] ${SVC_PREFIX}-migration.service 已创建(oneshot)"
+systemctl enable "${SVC_PREFIX}-migration.service" || warn "启用 migration.service 失败(可忽略,稍后手动启动)"
+
+# 业务 Bot 服务增加对 migration 的依赖(已生成的 service 文件追加 After/Requires)
+for entry in "${SERVICES[@]}"; do
+    IFS=":" read -r name desc detail <<< "$entry"
+    svc_file="/etc/systemd/system/${SVC_PREFIX}-${name}.service"
+    if [[ -f "$svc_file" ]]; then
+        # 在 After= 行追加 migration.service(若未包含)
+        if ! grep -q "migration.service" "$svc_file"; then
+            sed -i "s|^After=network.target redis.service|After=network.target redis.service ${SVC_PREFIX}-migration.service|" "$svc_file"
+            sed -i "s|^Wants=network.target|Wants=network.target\nRequires=${SVC_PREFIX}-migration.service|" "$svc_file"
+        fi
+    fi
+done
+
 # 额外：创建一键启停所有服务的 target
 info "创建聚合 target..."
 
 cat > "/etc/systemd/system/${SVC_PREFIX}.target" << EOF
 [Unit]
 Description=TG文件解码器 — 全部服务
-Wants=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service
+Wants=${SVC_PREFIX}-migration.service ${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service ${SVC_PREFIX}-crdb_sync.service
 After=network.target
 
 [Install]
@@ -508,6 +563,10 @@ sleep 1
 # 启动 db_writer（Redis 就绪后，其他 bot 依赖 Writer 落盘，必须先于 bot 启动）
 systemctl start "${SVC_PREFIX}-db_writer" || warn "启动 ${SVC_PREFIX}-db_writer 失败，请查看日志"
 sleep 2
+
+# R36 §6.3: 启动 crdb_sync(单一 CRDB 同步事实源,与其他 Bot 并行运行)
+systemctl start "${SVC_PREFIX}-crdb_sync" || warn "启动 ${SVC_PREFIX}-crdb_sync 失败，请查看日志"
+sleep 1
 
 # 启动核心 Bot（up 和 idx 先启动，让拓扑初始化完成）
 systemctl start "${SVC_PREFIX}-up" || warn "启动 ${SVC_PREFIX}-up 失败，请查看日志"

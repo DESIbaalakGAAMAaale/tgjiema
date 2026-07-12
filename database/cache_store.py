@@ -4391,6 +4391,149 @@ class CacheStore:
         )
         await self._db.commit()
 
+    # ─── R36 §6.4.5: Admin 走 SQLite read model,不再 CRDB 热 COUNT/regex ───
+
+    async def count_users_local(self, search: str = "") -> int:
+        """Admin /users 页 count — 走 SQLite,0 RU。
+
+        Args:
+            search: 搜索关键词(空字符串=全部)。支持 user_id(数字)或 username/first_name LIKE。
+        """
+        if not self._db:
+            return 0
+        if not search:
+            row = await self._db.execute_fetchall("SELECT COUNT(*) FROM users_local")
+            return int(row[0][0]) if row else 0
+        if search.isdigit():
+            uid = int(search)
+            row = await self._db.execute_fetchall(
+                "SELECT COUNT(*) FROM users_local WHERE user_id = ?", (uid,),
+            )
+            return int(row[0][0]) if row else 0
+        like = f"%{search}%"
+        row = await self._db.execute_fetchall(
+            "SELECT COUNT(*) FROM users_local WHERE username LIKE ? OR first_name LIKE ?",
+            (like, like),
+        )
+        return int(row[0][0]) if row else 0
+
+    async def list_users_local_paginated(
+        self, search: str = "", skip: int = 0, limit: int = 20,
+        sort_field: str = "created_at", sort_dir: str = "desc",
+    ) -> list[dict]:
+        """Admin /users 页 list — 走 SQLite,0 RU,LIKE 搜索 + 分页 + 排序。
+
+        Args:
+            search: 搜索关键词(空=全部,数字=user_id,其他=username/first_name LIKE)
+            skip/limit: 分页
+            sort_field: 排序字段(created_at/updated_at/user_id)
+            sort_dir: asc/desc
+        """
+        if not self._db:
+            return []
+        # 白名单排序字段,防 SQL 注入
+        allowed_sort = {"created_at", "updated_at", "user_id", "username"}
+        if sort_field not in allowed_sort:
+            sort_field = "created_at"
+        direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
+        # NULL 排序处理:created_at/updated_at 可能为 NULL
+        null_sort = f"NULLS {direction}" if sort_field in ("created_at", "updated_at") else ""
+
+        where, params = "", []
+        if search:
+            if search.isdigit():
+                where, params = "WHERE user_id = ?", [int(search)]
+            else:
+                like = f"%{search}%"
+                where, params = "WHERE username LIKE ? OR first_name LIKE ?", [like, like]
+        params.extend([skip, limit])
+        sql = (
+            f"SELECT user_id, username, first_name, membership_level, "
+            f"daily_decode_quota, quota_used_today, quota_date, can_upload, "
+            f"external_decode_quota, external_used_today, external_quota_date, "
+            f"is_banned, created_at, updated_at "
+            f"FROM users_local {where} "
+            f"ORDER BY {sort_field} {direction} {null_sort} LIMIT ? OFFSET ?"
+        )
+        rows = await self._db.execute_fetchall(sql, params)
+        return [{
+            "user_id": r[0], "username": r[1], "first_name": r[2],
+            "membership_level": r[3], "daily_decode_quota": r[4],
+            "quota_used_today": r[5], "quota_date": r[6], "can_upload": r[7],
+            "external_decode_quota": r[8], "external_used_today": r[9],
+            "external_quota_date": r[10], "is_banned": r[11],
+            "created_at": r[12], "updated_at": r[13],
+        } for r in rows]
+
+    async def count_file_records_local(self, search: str = "", status: str = "") -> int:
+        """Admin /files 页 count — 走 SQLite,0 RU。
+
+        Args:
+            search: 搜索关键词(空=全部,数字=uploader_id,其他=file_code LIKE)
+            status: 状态过滤(active/deleted 等,空=不过滤)
+        """
+        if not self._db:
+            return 0
+        where_parts, params = [], []
+        if search:
+            if search.isdigit():
+                where_parts.append("uploader_id = ?")
+                params.append(int(search))
+            else:
+                where_parts.append("file_code LIKE ?")
+                params.append(f"%{search}%")
+        if status:
+            where_parts.append("status = ?")
+            params.append(status)
+        where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        row = await self._db.execute_fetchall(
+            f"SELECT COUNT(*) FROM file_records_local {where}", params,
+        )
+        return int(row[0][0]) if row else 0
+
+    async def list_file_records_local_paginated(
+        self, search: str = "", skip: int = 0, limit: int = 20,
+        sort_field: str = "create_time", sort_dir: str = "desc",
+        status: str = "",
+    ) -> list[dict]:
+        """Admin /files 页 list — 走 SQLite,0 RU,LIKE 搜索 + 分页 + 排序。"""
+        if not self._db:
+            return []
+        allowed_sort = {"create_time", "updated_at", "file_code", "request_count"}
+        if sort_field not in allowed_sort:
+            sort_field = "create_time"
+        direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
+        null_sort = f"NULLS {direction}" if sort_field in ("create_time", "updated_at") else ""
+
+        where_parts, params = [], []
+        if search:
+            if search.isdigit():
+                where_parts.append("uploader_id = ?")
+                params.append(int(search))
+            else:
+                where_parts.append("file_code LIKE ?")
+                params.append(f"%{search}%")
+        if status:
+            where_parts.append("status = ?")
+            params.append(status)
+        where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        params.extend([skip, limit])
+        sql = (
+            f"SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id, "
+            f"file_types, status, request_count, protect_content, file_ttl_days, note, "
+            f"expire_time, create_time, updated_at, max_requests, is_collection "
+            f"FROM file_records_local {where} "
+            f"ORDER BY {sort_field} {direction} {null_sort} LIMIT ? OFFSET ?"
+        )
+        rows = await self._db.execute_fetchall(sql, params)
+        return [_deserialize_sqlite_row({
+            "file_code": r[0], "uploader_id": r[1], "primary_channel_id": r[2],
+            "primary_channel_msg_id": r[3], "file_types": r[4], "status": r[5],
+            "request_count": r[6], "protect_content": r[7], "file_ttl_days": r[8],
+            "note": r[9], "expire_time": r[10], "create_time": r[11],
+            "updated_at": r[12], "max_requests": r[13], "is_collection": r[14],
+        }) for r in rows]
+
     # ─── external_code_mapping_local ───
 
     async def bootstrap_external_mappings(self, rows: list[dict]):
