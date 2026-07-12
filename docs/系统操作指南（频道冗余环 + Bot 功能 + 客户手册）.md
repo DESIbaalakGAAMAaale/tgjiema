@@ -603,13 +603,13 @@ Admin Bot(管理) → 配置/用户/文件/中继/拓扑/备份恢复
 
 **数据流**:
 - 热路径:全部走 SQLite 本地缓存(零 CRDB RU)
-- 冷路径:后台批量同步到 CRDB(TiDB Cloud)
+- 冷路径:后台批量同步到 CRDB(CockroachDB)
 - 备份:定时 dump 到 Cloudflare R2
 
 **技术栈**:
 - Bot 框架:python-telegram-bot 21.6(Bot API)
 - 用户账号层:Telethon 1.38.0(MTProto,中继账号)
-- 数据库:SQLite(本地热路径)+ TiDB Cloud / CockroachDB(VPS)
+- 数据库:SQLite(本地热路径)+ CockroachDB / CRDB(VPS)
 - 缓存:Redis(Stream 事件驱动,可选)
 - 对象存储:Cloudflare R2(数据库备份)
 - 加密:cryptography Fernet(api_hash / R2 密钥)
