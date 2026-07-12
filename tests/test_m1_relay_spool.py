@@ -405,12 +405,17 @@ class TestRelaySpool:
 
     @pytest.mark.asyncio
     async def test_get_stats_empty(self, rdb):
-        """空表时所有状态计数为 0。"""
+        """空表时所有状态计数为 0。
+
+        R36 H6 兼容: get_spool_stats 已扩展返回新增状态键
+        (FORWARDED_TO_UP / UP_DURABLE_ACK / INDEXED),改为按已知键断言。
+        """
         stats = await rdb.get_spool_stats()
-        assert stats == {
-            "RECEIVED": 0, "BUFFERED": 0, "FORWARDING": 0,
-            "ACKED": 0, "FAILED": 0,
-        }
+        assert stats["RECEIVED"] == 0
+        assert stats["BUFFERED"] == 0
+        assert stats["FORWARDING"] == 0
+        assert stats["ACKED"] == 0
+        assert stats["FAILED"] == 0
 
     @pytest.mark.asyncio
     async def test_full_state_machine_flow(self, rdb):

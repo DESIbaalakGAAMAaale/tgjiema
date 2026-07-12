@@ -78,6 +78,8 @@ class RelayInstance:
         self._background_tasks: set[asyncio.Task] = set()
         # P1-8:start() 守卫,避免重复创建 cleanup 循环(重复调用 start 时)。
         self._cleanup_loop_started = False
+        # H6: spool 恢复循环启动守卫(避免重复创建)
+        self._spool_recovery_started = False
         self._shutdown_done = False
         # A2: FloodWait / 封禁自愈
         self._floodwait_until: float = 0.0  # FloodWait 到期时间戳, 0 表示无限制
@@ -376,6 +378,11 @@ class RelayInstance:
             self._cleanup_loop_started = True
             self._spawn(self._cleanup_cooldowns_loop(), name="relay-cleanup-cooldowns")
 
+        # H6: 启动 spool 恢复循环 — 定期扫描 relay_spool,处理 INDEXED 清理和超时未确认
+        if not self._spool_recovery_started:
+            self._spool_recovery_started = True
+            self._spawn(self._spool_recovery_loop(), name="relay-spool-recovery")
+
     async def _cleanup_cooldowns_loop(self):
         """每 10 分钟清理一次过期的 bot_cooldown 记录"""
         try:
@@ -390,6 +397,105 @@ class RelayInstance:
                     logger.debug(f"[RelayInstance:{self.phone}] cleanup_cooldowns 失败: {e}")
         except asyncio.CancelledError:
             pass
+
+    # ── H6: Relay ACK 语义增强 — 恢复循环 ──
+
+    async def _spool_recovery_loop(self):
+        """H6: 定期扫描 relay_spool,处理 INDEXED 清理和超时未确认的 spool。
+
+        - 每 30 秒扫描一次(低频,避免 DB 压力)
+        - INDEXED 状态: 删除临时文件,标记 acked_at(清理完成)
+        - FORWARDED_TO_UP / UP_DURABLE_ACK 超时: 记录告警,等待人工或上层介入
+        """
+        try:
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await self._check_unacked_spools()
+                except Exception as e:
+                    logger.debug(f"[RelayInstance:{self.phone}] _check_unacked_spools 失败: {e}")
+        except asyncio.CancelledError:
+            pass
+
+    async def _check_unacked_spools(self):
+        """H6: 扫描 relay_spool,处理已 INDEXED 的 spool(清理临时文件)和超时未确认的 spool。
+
+        通知机制(H6 设计):
+        - relay_spool 表作为跨进程通信渠道
+        - Up Bot 处理后写 upload_id + 置 UP_DURABLE_ACK
+        - Idx Bot 处理后置 INDEXED
+        - relay_instance 定期扫描,在 INDEXED 后才删除临时文件
+        """
+        try:
+            from database.relay_db import get_relay_db
+            db = await get_relay_db()
+            if not db:
+                return
+
+            # 1. 处理 INDEXED 状态的 spool(Idx Bot 已确认,可安全删除临时文件)
+            indexed_spools = await db.get_indexed_spools_for_cleanup(self.account_id)
+            for spool in indexed_spools:
+                spool_id = spool["spool_id"]
+                code = spool.get("code", "")
+                buffered_files = spool.get("buffered_files") or []
+                # 删除临时文件(buffered_files 中的路径)
+                self._cleanup_tmp_files([{"path": f} for f in buffered_files])
+                # 标记清理完成: 设置 acked_at,状态推进为 ACKED(终态)
+                await db.update_spool_status(spool_id, "ACKED", acked_at=time.time())
+                # 清理内存映射
+                if code:
+                    self._spool_ids.pop(code, None)
+                logger.info(
+                    f"[RelayInstance:{self.phone}] H6: INDEXED spool 已清理临时文件 "
+                    f"(spool_id={spool_id}, code={code}, files={len(buffered_files)})"
+                )
+
+            # 2. 处理超时未确认的 spool(FORWARDED_TO_UP / UP_DURABLE_ACK 超时)
+            unacked = await db.get_unacked_spools(
+                timeout_seconds=120, account_id=self.account_id
+            )
+            for spool in unacked:
+                status = spool.get("status")
+                spool_id = spool["spool_id"]
+                code = spool.get("code", "")
+                upload_id = spool.get("upload_id") or ""
+                if status == "FORWARDED_TO_UP":
+                    # 已发送给 Up 但长时间未收到 upload_id 确认
+                    logger.warning(
+                        f"[RelayInstance:{self.phone}] H6: spool FORWARDED_TO_UP 超时未确认 "
+                        f"(spool_id={spool_id}, code={code}),需重试或告警"
+                    )
+                elif status == "UP_DURABLE_ACK":
+                    # Up 已持久化但 Idx 长时间未索引
+                    logger.warning(
+                        f"[RelayInstance:{self.phone}] H6: spool UP_DURABLE_ACK 超时未 INDEXED "
+                        f"(spool_id={spool_id}, code={code}, upload_id={upload_id}),"
+                        f"检查 upload_session 状态"
+                    )
+        except Exception as e:
+            logger.debug(f"[RelayInstance:{self.phone}] _check_unacked_spools 异常: {e}")
+
+    async def _associate_upload_id(self, code: str, upload_id: str):
+        """H6: 关联 Up Bot 返回的 upload_id 到 spool,状态推进为 UP_DURABLE_ACK。
+
+        可在以下场景调用:
+        - relay_instance 通过 Telegram 消息收到 Up Bot 返回的 upload_id
+        - 恢复循环检测到 Up Bot 已写入 upload_id 但状态未更新时
+
+        注: Up Bot 也可直接通过 update_spool_status 写入 upload_id + UP_DURABLE_ACK,
+        此方法提供 relay_instance 侧的主动关联能力。
+        """
+        if not upload_id:
+            return
+        await self._transition_spool_safe(
+            code, "UP_DURABLE_ACK",
+            reason=f"Up 返回 upload_id={upload_id}",
+            upload_id=upload_id,
+        )
+        logger.info(
+            f"[RelayInstance:{self.phone}] H6: 已关联 upload_id 到 spool "
+            f"(code={code}, upload_id={upload_id}),状态推进为 UP_DURABLE_ACK"
+        )
 
     async def login_with_credentials(self, api_id: int, api_hash: str, phone: str):
         """使用指定凭证登录（用于动态添加账号）"""
@@ -667,7 +773,8 @@ class RelayInstance:
             if existing_spool_id:
                 # 已有 spool,更新 buffered_files 列表(追加新文件路径)
                 spool = await db.get_relay_spool(existing_spool_id)
-                if spool and spool.get("status") not in ("ACKED", "FAILED"):
+                # H6: 终态扩展 — ACKED(已清理)/INDEXED(已索引,待清理)/FAILED 不再更新
+                if spool and spool.get("status") not in ("ACKED", "INDEXED", "FAILED"):
                     buffered_files = spool.get("buffered_files") or []
                     if tmp_path and tmp_path not in buffered_files:
                         buffered_files.append(tmp_path)
@@ -692,15 +799,18 @@ class RelayInstance:
         except Exception as e:
             logger.warning(f"[RelayInstance:{self.phone}] relay_spool 创建/更新失败(不影响主流程, code={code}): {e}")
 
-    async def _transition_spool_safe(self, code: str, new_status: str, reason: str = ""):
-        """R35 P0-4 §25: 安全推进 relay_spool 状态(异常不传播)。"""
+    async def _transition_spool_safe(self, code: str, new_status: str, reason: str = "", **extra):
+        """R35 P0-4 §25: 安全推进 relay_spool 状态(异常不传播)。
+
+        H6: 支持 **extra 透传额外字段(如 upload_id)。
+        """
         try:
             spool_id = self._spool_ids.get(code)
             if not spool_id:
                 return
             from database.relay_db import get_relay_db
             db = await get_relay_db()
-            await db.transition_spool_status(spool_id, new_status, reason=reason)
+            await db.transition_spool_status(spool_id, new_status, reason=reason, **extra)
         except Exception as e:
             logger.warning(f"[RelayInstance:{self.phone}] relay_spool 状态推进失败(不影响主流程, code={code}, status={new_status}): {e}")
 
@@ -749,10 +859,11 @@ class RelayInstance:
                 await self._transition_spool_safe(code, "FORWARDING", reason="引用批量发送")
                 sent = await self._send_batch_as_album(media_list, first_caption, code, "引用")
                 if sent:
-                    # R35 P0-4 §25: Up Bot 接收成功,推进 ACKED 后才删除临时文件
-                    await self._transition_spool_safe(code, "ACKED", reason="引用发送成功")
-                    self._cleanup_tmp_files(downloads)
-                    self._spool_ids.pop(code, None)
+                    # H6: Up Bot 接收成功,推进 FORWARDED_TO_UP(不是 ACKED!)
+                    # 临时文件不删除,等待 Up 返回 upload_id(UP_DURABLE_ACK)
+                    # 和 Idx READY(INDEXED)后由恢复循环清理临时文件
+                    await self._transition_spool_safe(code, "FORWARDED_TO_UP", reason="引用发送成功,等待 Up 持久化确认")
+                    # 不删除临时文件! 不弹出 spool_id 映射!
                     return
                 # 引用发送失败(可能是 protected chat),下载所有 pending 到临时文件
                 logger.warning(f"[RelayInstance:{self.phone}] 引用批量发送失败,下载到临时文件 (code={code})")
@@ -768,10 +879,11 @@ class RelayInstance:
             # R35 P0-4 §25: 推进 spool 状态 FORWARDING(正在转发)
             await self._transition_spool_safe(code, "FORWARDING", reason="临时文件批量发送")
             await self._send_batch_as_album(path_list, first_caption, code, "临时文件")
-            # R35 P0-4 §25: Up Bot 接收成功,推进 ACKED 后才删除临时文件
-            await self._transition_spool_safe(code, "ACKED", reason="临时文件发送成功")
-            self._cleanup_tmp_files(downloads)
-            self._spool_ids.pop(code, None)
+            # H6: Up Bot 接收成功,推进 FORWARDED_TO_UP(不是 ACKED!)
+            # 临时文件不删除,等待 Up 返回 upload_id(UP_DURABLE_ACK)
+            # 和 Idx READY(INDEXED)后由恢复循环清理临时文件
+            await self._transition_spool_safe(code, "FORWARDED_TO_UP", reason="临时文件发送成功,等待 Up 持久化确认")
+            # 不删除临时文件! 不弹出 spool_id 映射!
 
     async def _send_batch_as_album(self, media_list: list, first_caption: str, code: str, mode: str) -> bool:
         """将 media_list 分批作为媒体组相册发送给 Up Bot。
