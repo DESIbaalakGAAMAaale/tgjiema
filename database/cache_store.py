@@ -2904,11 +2904,13 @@ class CacheStoreRouter(CacheStore):
         )
 
     async def cache_set(self, key: str, value):
-        """TTL 缓存写入 — 路由到 Redis Queue"""
+        """TTL 缓存写入 — 路由到 Redis Queue
+        P3修复: table 标签从 cache_backup 修正为 ttl_cache(实际写入的表名)。
+        """
         from database import write_router
         return await write_router.route_write(
             method_name="cache_set",
-            table="cache_backup",
+            table="ttl_cache",
             op_type="upsert",
             data={"key": key, "value": _json_safe(value)},
             redis_key="",
@@ -3192,9 +3194,23 @@ class CacheStoreRouter(CacheStore):
         return result
 
     async def bulk_upsert_cells_local(self, cells: list[dict]):
-        """批量 upsert cells — 直写 SQLite(量大不入队,避免阻塞),写后失效 cells 缓存"""
+        """批量 upsert cells — 小批量路由 Redis Queue 串行化(避免 SQLite 锁冲突),
+        大批量(>50)直写 SQLite + 失效缓存(避免大队列阻塞)。
+        P1修复: admin_bot 单 cell 调用走 Redis Queue,消除锁冲突。
+        """
+        from database import write_router, redis_queue
+        if len(cells) <= 50:
+            # 小批量:走 Redis Queue 串行化,避免锁冲突
+            return await write_router.route_write(
+                method_name="bulk_upsert_cells_local",
+                table="cells_local",
+                op_type="upsert",
+                data={"cells": _json_safe(cells)},
+                redis_key="cache:all_cells",
+                fallback=lambda: super(CacheStoreRouter, self).bulk_upsert_cells_local(cells),
+            )
+        # 大批量:直写 SQLite + 失效缓存(避免大队列阻塞)
         await super().bulk_upsert_cells_local(cells)
-        from database import redis_queue
         await redis_queue.cache_delete("cache:all_cells")
 
     async def delete_file_record_local(self, file_code: str):

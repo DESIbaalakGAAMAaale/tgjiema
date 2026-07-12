@@ -127,6 +127,8 @@ class Settings(BaseSettings):
     WRITER_CACHE_TTL_KV: int = 60          # KV存储(低频变更,长TTL)
     # 死信队列 key(P0修复: 处理失败的消息转入此队列,避免永久丢失)
     WRITER_DEAD_QUEUE_KEY: str = "tgjiema:writer:dead"
+    # db_writer systemd 服务名(P1修复: mon_bot 监控用,可配置以支持不同部署前缀)
+    DB_WRITER_SERVICE_NAME: str = "tgjiema-db_writer"
 
     # ─── 配额同步间隔 ──────────────────────────────────────────
     QUOTA_SYNC_INTERVAL: int = 300       # 秒(5分钟),减少 CRDB RU 消耗

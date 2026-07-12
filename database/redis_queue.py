@@ -3,7 +3,7 @@
 设计:
 - LPUSH: 写操作推入队列(<0.1ms 返回)
 - BRPOP: Writer 进程阻塞消费(串行落盘 SQLite)
-- DEL: Writer 写完后清除缓冲 key
+- DEL: Writer 写完后清除读缓存 key(以 SQLite 为权威,避免读到旧缓存)
 - LLEN: mon_bot 监控队列积压
 - REDIS_URL 为空时所有方法返回 False(降级到 SQLite 直写)
 
@@ -128,6 +128,8 @@ async def pop(timeout: int = 0, count: int = 1) -> list[dict]:
     P1修复: 首条用 BRPOP(阻塞等待),后续 count-1 条用 LPOP(非阻塞立即返回),
     避免低吞吐下循环 BRPOP 导致的空等。
     P1修复: JSON 解析失败的消息入死信队列,不永久丢失。
+    P1修复: Redis 运行时宕机时重置客户端状态,使 get_redis() 下次触发重连,
+    避免 db_writer 100% CPU 忙等(过期客户端反复抛异常)。
 
     Args:
         timeout: 阻塞超时秒数,0 表示永久阻塞(仅对首条生效)
@@ -167,11 +169,23 @@ async def pop(timeout: int = 0, count: int = 1) -> list[dict]:
         return result
     except Exception as e:
         logger.debug(f"[RedisQueue] pop 异常: {e}")
+        # P1修复: Redis 运行时宕机时重置客户端状态,使 get_redis() 下次
+        # 触发重连(受 60s 节流),避免 db_writer 100% CPU 忙等循环
+        global _redis_available, _redis_client
+        if _redis_client is not None:
+            try:
+                await _redis_client.aclose()
+            except Exception:
+                pass
+            _redis_client = None
+        _redis_available = False
         return []
 
 
 async def delete(key: str) -> bool:
-    """删除指定 key(Writer 写完 SQLite 后清除缓冲)。"""
+    """删除指定 key(Writer 写完 SQLite 后清除读缓存 key)。
+    P2修复: 合并 delete 与 cache_delete 的重复逻辑,cache_delete 复用此函数。
+    """
     redis = await get_redis()
     if not redis or not key:
         return False
@@ -225,7 +239,9 @@ async def push_dead(msg: dict, reason: str = "") -> bool:
 
 
 async def length() -> int:
-    """获取队列长度(mon_bot 监控积压)。"""
+    """获取队列长度(mon_bot 监控积压)。
+    返回 -1 表示 Redis 不可达(调用方需特殊处理此哨兵值)。
+    """
     redis = await get_redis()
     if not redis:
         return -1
@@ -262,7 +278,12 @@ async def cache_get(key: str) -> Optional[str]:
 
 
 async def cache_set(key: str, value: str, ttl: int = 5) -> bool:
-    """写入缓存(读路径回填,带 TTL)。"""
+    """写入缓存(读路径回填,带 TTL)。
+
+    Args:
+        ttl: 缓存 TTL 秒数(调用方应从 settings.WRITER_CACHE_TTL_* 传入对应分级 TTL,
+             默认 5 秒仅为函数级兜底,不应在生产路径依赖此默认值)
+    """
     redis = await get_redis()
     if not redis:
         return False
@@ -275,21 +296,17 @@ async def cache_set(key: str, value: str, ttl: int = 5) -> bool:
 
 
 async def cache_delete(key: str) -> bool:
-    """失效缓存(写操作后清除对应读缓存,保证一致性)。"""
-    redis = await get_redis()
-    if not redis:
-        return False
-    try:
-        await redis.delete(key)
-        return True
-    except Exception as e:
-        logger.debug(f"[RedisQueue] cache_delete 异常: {e}")
-        return False
+    """失效缓存(写操作后清除对应读缓存,保证一致性)。
+    P2修复: 复用 delete() 避免重复逻辑(含空 key 检查)。
+    """
+    return await delete(key)
 
 
 async def close_redis():
-    """关闭 Redis 连接(进程退出时调用)。"""
-    global _redis_client, _redis_available
+    """关闭 Redis 连接(进程退出时调用)。
+    P3修复: 重置所有全局状态,使下次 get_redis() 能重新初始化。
+    """
+    global _redis_client, _redis_available, _redis_init_attempted, _redis_last_attempt_ts
     if _redis_client:
         try:
             await _redis_client.aclose()
@@ -297,3 +314,5 @@ async def close_redis():
             pass
     _redis_client = None
     _redis_available = False
+    _redis_init_attempted = False
+    _redis_last_attempt_ts = 0

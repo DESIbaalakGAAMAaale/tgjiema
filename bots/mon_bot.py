@@ -265,6 +265,42 @@ class MonBot:
             logger.warning(f"[Mon][Notify] 发送通知失败: {e}")
             return False  # 失败不设冷却，下次循环可重试
 
+    async def _check_db_writer_status(self) -> tuple[str, int]:
+        """检查 db_writer 服务状态和 Writer 队列长度(统一入口,避免重复代码)。
+        返回 (service_status, queue_length)。queue_length=-1 表示 Redis 不可达。
+
+        P1修复: systemctl 子进程超时后显式 kill,避免僵尸进程堆积。
+        P1修复: 服务名从 settings.DB_WRITER_SERVICE_NAME 读取,支持不同部署前缀。
+        """
+        dw_status = "unknown"
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "is-active", settings.DB_WRITER_SERVICE_NAME,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+            dw_status = stdout.decode().strip() or "unknown"
+        except asyncio.TimeoutError:
+            # P1修复: 超时后显式 kill 子进程,避免僵尸进程堆积
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+            logger.debug("[Mon] db_writer 服务状态检查超时(2s),已 kill 子进程")
+        except Exception as e:
+            logger.debug(f"[Mon] db_writer 服务状态检查异常: {e}")
+        writer_q_len = -1
+        try:
+            from database import redis_queue
+            writer_q_len = await redis_queue.length()
+        except Exception as e:
+            logger.debug(f"[Mon] Writer 队列长度获取异常: {e}")
+        return dw_status, writer_q_len
+
     async def _check_alerts(self):
         """A1: 端到端监控告警检查。
 
@@ -334,18 +370,8 @@ class MonBot:
                 alerts_to_check.append(("writer_redis_unavailable", "WARNING",
                     "Writer 队列检查失败(Redis 不可达),db_writer 可能无法消费消息"))
 
-            # db_writer 服务状态告警(P1修复: 原先仅日志不告警,db_writer 宕机会被忽略)
-            dw_status = "unknown"
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    "systemctl", "is-active", "tgjiema-db_writer",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
-                dw_status = stdout.decode().strip() or "unknown"
-            except Exception as e:
-                logger.debug(f"[Mon] db_writer 服务状态检查异常: {e}")
+            # db_writer 服务状态告警(P1修复: 复用 _check_db_writer_status 避免重复代码)
+            dw_status, _ = await self._check_db_writer_status()
             if dw_status not in ("active", "unknown"):
                 alerts_to_check.append(("db_writer_down", "CRITICAL",
                     f"db_writer 服务异常: 状态={dw_status},写操作无法落盘 SQLite"))
@@ -1081,24 +1107,8 @@ class MonBot:
             f"轮转: {rotation_config['active_window_size']}活态, "
             f"{rotation_config['files_per_slot']}文件/{rotation_config['time_per_slot']}秒"
         )
-        # 检查 db_writer 服务状态 + Writer 队列长度
-        dw_status = "unknown"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "systemctl", "is-active", "tgjiema-db_writer",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
-            dw_status = stdout.decode().strip() or "unknown"
-        except Exception as e:
-            logger.debug(f"[Mon] db_writer 服务状态检查异常: {e}")
-        writer_q_len = -1
-        try:
-            from database import redis_queue
-            writer_q_len = await redis_queue.length()
-        except Exception as e:
-            logger.debug(f"[Mon] Writer 队列长度获取异常: {e}")
+        # 检查 db_writer 服务状态 + Writer 队列长度(复用 _check_db_writer_status)
+        dw_status, writer_q_len = await self._check_db_writer_status()
         logger.info(
             f"[Mon] db_writer: 服务={dw_status}, Writer队列={writer_q_len}"
         )

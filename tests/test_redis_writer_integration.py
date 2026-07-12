@@ -12,6 +12,7 @@
 
 P0修复: 整个文件基于实际 DBWriter API 重写,匹配 _store/_execute_sqlite/push_dead 接口
 """
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -27,12 +28,14 @@ if DBWriterClass is None:
 
 
 def _make_msg(**overrides) -> dict:
-    """构造一条与 redis_queue.push 序列化格式一致的消息。"""
+    """构造一条与 redis_queue.push 序列化格式一致的消息。
+    P3修复: data 字段统一为扁平结构,与 test_redis_writer.test_push_success 一致。
+    """
     base = {
         "op_type": "upsert",
         "table": "user_quota",
         "method_name": "upsert_user_quota",
-        "data": {"user_id": 1, "data": {"quota": 20}},
+        "data": {"user_id": 1, "quota": 20},
         "redis_key": "cache:user_quota:1",
         "created_at": 1000.0,
     }
@@ -68,13 +71,21 @@ class TestDBWriterProcessMessage:
 
     @pytest.mark.asyncio
     async def test_process_message_success(self, writer):
-        """成功处理消息:_execute_sqlite 被调用,redis_key 被 DEL,计数+1。"""
+        """成功处理消息:_execute_sqlite 被调用,redis_key 被 DEL,计数+1。
+        P3修复: 补充参数类型验证(DBWriterMessage 对象及字段正确性)。
+        """
         msg = _make_msg()
         writer._execute_sqlite = AsyncMock(return_value=None)
 
         await writer._process_message(msg)
 
         writer._execute_sqlite.assert_awaited_once()
+        # P3修复: 验证传入的参数类型为 DBWriterMessage 且字段正确解析
+        args = writer._execute_sqlite.await_args.args
+        passed_msg = args[0]
+        assert hasattr(passed_msg, "method_name")  # DBWriterMessage 对象
+        assert passed_msg.method_name == "upsert_user_quota"
+        assert passed_msg.redis_key == "cache:user_quota:1"
         assert writer._processed_count == 1
         assert writer._error_count == 0
 
@@ -174,9 +185,177 @@ class TestDBWriterStop:
         assert writer._running is False
 
     @pytest.mark.asyncio
-    async def test_stop_logs_counts(self, writer, capsys):
+    async def test_stop_logs_counts(self, writer):
         """stop() 记录已处理/失败的消息计数。"""
         writer._processed_count = 42
         writer._error_count = 3
         await writer.stop()
         # stop 不抛异常即可(日志通过 loguru 输出,不在此断言)
+
+    # ── P0回归测试: DEL 失败不导致已成功写入的消息入死信队列 ──
+
+    @pytest.mark.asyncio
+    async def test_process_message_del_failure_no_dead_queue(self, writer):
+        """P0回归: SQLite 写成功后 DEL 失败 → 仅记录 WARNING,不入死信队列。
+        避免数据不一致(已写入 SQLite 的消息误入死信会导致重放时重复写入)。
+        """
+        msg = _make_msg(redis_key="cache:user_quota:42")
+        writer._execute_sqlite = AsyncMock(return_value=None)  # SQLite 写成功
+        # mock DEL 抛异常
+        from database import redis_queue
+        monkeypatch_del = AsyncMock(side_effect=Exception("redis delete failed"))
+        # 重新设置 delete mock 以抛异常
+        import database.redis_queue as rq_module
+        original_delete = rq_module.delete
+        rq_module.delete = monkeypatch_del
+
+        try:
+            await writer._process_message(msg)
+        finally:
+            rq_module.delete = original_delete
+
+        # SQLite 写成功 → processed_count +1
+        assert writer._processed_count == 1
+        # DEL 失败 → error_count 不增加(不视为处理失败)
+        assert writer._error_count == 0
+        # 不入死信队列(避免重放时重复写入)
+        rq_module.push_dead.assert_not_awaited()
+
+
+# ── P2修复: 补充 DBWriter.init / close / start 测试覆盖 ──
+
+class TestDBWriterInit:
+    """DBWriter.init 初始化测试。
+    注:db_writer 内部用 ``from config import settings`` 懒加载,
+    测试通过 mock_settings fixture 设置 conftest 的全局 mock 属性。
+    """
+
+    @pytest.mark.asyncio
+    async def test_init_sqlite_mode_exits(self, mock_settings, monkeypatch):
+        """init 在 WRITER_MODE=sqlite 时优雅退出(sys.exit 0)。"""
+        instance = DBWriterClass()
+        monkeypatch.setattr(mock_settings, "WRITER_MODE", "sqlite")
+        monkeypatch.setattr(mock_settings, "REDIS_URL", "redis://localhost")
+        with pytest.raises(SystemExit) as exc_info:
+            await instance.init()
+        assert exc_info.value.code == 0
+
+    @pytest.mark.asyncio
+    async def test_init_redis_empty_exits(self, mock_settings, monkeypatch):
+        """init 在 REDIS_URL 为空时优雅退出(sys.exit 0)。"""
+        instance = DBWriterClass()
+        monkeypatch.setattr(mock_settings, "WRITER_MODE", "redis")
+        monkeypatch.setattr(mock_settings, "REDIS_URL", "")
+        with pytest.raises(SystemExit) as exc_info:
+            await instance.init()
+        assert exc_info.value.code == 0
+
+    @pytest.mark.asyncio
+    async def test_init_redis_unavailable_raises_runtimeerror(self, mock_settings, monkeypatch):
+        """init 在 Redis 不可达时抛 RuntimeError(供 run_db_writer 捕获后 exit 1)。
+        P2修复: 等待 60s 后才抛异常(对齐 get_redis 重试节流)。
+        """
+        instance = DBWriterClass()
+        monkeypatch.setattr(mock_settings, "WRITER_MODE", "redis")
+        monkeypatch.setattr(mock_settings, "REDIS_URL", "redis://localhost")
+        # mock health_check 返回 False
+        monkeypatch.setattr("database.redis_queue.health_check", AsyncMock(return_value=False))
+        # mock asyncio.sleep 避免真实等待 60s
+        monkeypatch.setattr("asyncio.sleep", AsyncMock(return_value=None))
+        with pytest.raises(RuntimeError, match="Redis 不可达"):
+            await instance.init()
+
+    @pytest.mark.asyncio
+    async def test_init_success(self, mock_settings, monkeypatch):
+        """init 在 Redis 可达 + CacheStore 初始化成功后正常返回。"""
+        instance = DBWriterClass()
+        monkeypatch.setattr(mock_settings, "WRITER_MODE", "redis")
+        monkeypatch.setattr(mock_settings, "REDIS_URL", "redis://localhost")
+        monkeypatch.setattr("database.redis_queue.health_check", AsyncMock(return_value=True))
+        # mock CacheStore
+        mock_store = MagicMock()
+        mock_store.init = AsyncMock(return_value=None)
+        monkeypatch.setattr("database.db_writer.CacheStore", MagicMock(return_value=mock_store))
+        await instance.init()
+        assert instance._store is mock_store
+
+
+class TestDBWriterClose:
+    """DBWriter.close 资源清理测试。"""
+
+    @pytest.mark.asyncio
+    async def test_close_with_store(self, monkeypatch):
+        """close 在 _store 存在时调用其 close 并清理。"""
+        instance = DBWriterClass()
+        mock_store = MagicMock()
+        mock_store.close = AsyncMock(return_value=None)
+        instance._store = mock_store
+        monkeypatch.setattr("database.redis_queue.close_redis", AsyncMock(return_value=None))
+        await instance.close()
+        mock_store.close.assert_awaited_once()
+        assert instance._store is None
+
+    @pytest.mark.asyncio
+    async def test_close_without_store(self, monkeypatch):
+        """close 在 _store 为 None 时只关闭 Redis 连接。"""
+        instance = DBWriterClass()
+        instance._store = None
+        mock_close_redis = AsyncMock(return_value=None)
+        monkeypatch.setattr("database.redis_queue.close_redis", mock_close_redis)
+        await instance.close()
+        mock_close_redis.assert_awaited_once()
+
+
+class TestDBWriterStart:
+    """DBWriter.start 消费循环测试。"""
+
+    @pytest.mark.asyncio
+    async def test_start_processes_messages_then_stops(self, monkeypatch):
+        """start 处理消息后收到 CancelledError 优雅停止。"""
+        instance = DBWriterClass()
+        instance._store = MagicMock()
+        instance._process_message = AsyncMock(return_value=None)
+
+        # mock pop: 第一次返回消息,第二次抛 CancelledError
+        msg = _make_msg()
+        call_count = [0]
+        async def mock_pop(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return [msg]
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr("database.redis_queue.pop", mock_pop)
+
+        with pytest.raises(asyncio.CancelledError):
+            await instance.start()
+
+        instance._process_message.assert_awaited_once_with(msg)
+        assert instance._running is False
+
+    @pytest.mark.asyncio
+    async def test_start_empty_messages_sleep_and_continue(self, monkeypatch):
+        """start 收到空消息时 sleep 后继续(防止忙等),最后被 CancelledError 停止。"""
+        instance = DBWriterClass()
+        instance._store = MagicMock()
+
+        call_count = [0]
+        async def mock_pop(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                return []  # 空消息
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr("database.redis_queue.pop", mock_pop)
+        sleep_called = [False]
+        original_sleep = asyncio.sleep
+        async def mock_sleep(seconds):
+            sleep_called[0] = True
+            await original_sleep(0)
+        monkeypatch.setattr("asyncio.sleep", mock_sleep)
+
+        with pytest.raises(asyncio.CancelledError):
+            await instance.start()
+
+        # 空消息路径应触发 sleep
+        assert sleep_called[0] is True

@@ -106,7 +106,10 @@ class DBWriter:
         # 健康检查:确保 Redis 可达(否则无消息可消费)
         healthy = await redis_queue.health_check()
         if not healthy:
-            logger.error("[DBWriter] Redis 不可达,Writer 无法消费消息,退出")
+            # P2修复: 等待 60s 对齐 get_redis 重试节流,避免 systemd 紧密重启循环
+            # (RestartSec=10 + 60s 节流 → 实际重启间隔约 60s,避免 StartLimitBurst 触发)
+            logger.error("[DBWriter] Redis 不可达,等待 60s 后退出(对齐 get_redis 重试节流)")
+            await asyncio.sleep(60)
             raise RuntimeError("Redis 不可达,DBWriter 无法启动")
 
         # 初始化 CacheStore(复用其 SQLite 连接 + DDL + 写方法)
@@ -131,6 +134,8 @@ class DBWriter:
                 # BRPOP 阻塞消费,timeout=1 保证能及时响应停止信号
                 messages = await redis_queue.pop(timeout=1, count=batch_size)
                 if not messages:
+                    # P1修复: Redis 宕机/降级时防止 100% CPU 忙等
+                    await asyncio.sleep(0.1)
                     continue
                 for msg in messages:
                     await self._process_message(msg)
@@ -193,10 +198,6 @@ class DBWriter:
             # 执行 SQLite 写操作
             await self._execute_sqlite(writer_msg)
             self._processed_count += 1
-            # 写完后 DEL Redis 缓冲 key(清除缓冲,以 SQLite 为权威)
-            # 仅当 SQLite 写成功后才 DEL,失败时保留旧缓存避免读到半成品
-            if writer_msg.redis_key:
-                await redis_queue.delete(writer_msg.redis_key)
         except TypeError as e:
             # P1修复: TypeError 通常是方法签名不匹配(参数名错误/缺失),
             # 属于永久性错误,重试也不会成功,直接入死信队列
@@ -208,6 +209,7 @@ class DBWriter:
             await redis_queue.push_dead(
                 msg, reason=f"TypeError: {e}"
             )
+            return  # SQLite 写失败,不需要 DEL
         except Exception as e:
             self._error_count += 1
             logger.error(
@@ -218,7 +220,19 @@ class DBWriter:
             await redis_queue.push_dead(
                 msg, reason=f"{type(e).__name__}: {e}"
             )
-            # 不抛出,继续处理下一条消息
+            return  # SQLite 写失败,不需要 DEL
+
+        # SQLite 写成功后,DEL 缓冲 key(清除读缓存,以 SQLite 为权威)
+        # P0修复: DEL 独立 try/except,失败仅记录日志,不影响已写入数据
+        # (避免 DEL 异常导致已成功写入的消息误入死信队列,造成数据不一致)
+        if writer_msg.redis_key:
+            try:
+                await redis_queue.delete(writer_msg.redis_key)
+            except Exception as e:
+                logger.warning(
+                    f"[DBWriter] DEL 缓冲 key 失败(不影响已写入数据): "
+                    f"key={writer_msg.redis_key}: {e}"
+                )
 
     async def _execute_sqlite(self, msg: DBWriterMessage):
         """根据 method_name 分派到对应的 CacheStore 写方法。

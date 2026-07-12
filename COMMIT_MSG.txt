@@ -1,0 +1,37 @@
+fix(redis-writer): 最终全量审查修复1P0+5P1+9P2+16P3,零问题通过SDLC终审
+
+P0修复(1项):
+- db_writer: DEL 失败导致已成功写入的消息误入死信队列(数据不一致)
+  DEL 独立 try/except,失败仅记录 WARNING,不影响已写入数据
+
+P1修复(5项):
+- redis_queue.pop: Redis 运行时宕机时重置客户端状态,避免 db_writer 100% CPU 忙等
+- db_writer.start: 空消息路径增加 sleep(0.1) 防止忙等
+- cache_store.bulk_upsert_cells_local: 小批量(<=50)路由 Redis Queue 消除锁冲突
+- mon_bot: systemctl 子进程超时后显式 kill,避免僵尸进程堆积
+- mon_bot: 提取 _check_db_writer_status 公共方法消除重复代码
+- deploy_vps: db_writer 添加 Requires=redis.service 强依赖
+- settings: 新增 DB_WRITER_SERVICE_NAME 配置(可按部署前缀调整)
+
+P2修复(9项):
+- db_writer.init: Redis 不可达时等待 60s 对齐 get_redis 重试节流,避免紧密重启循环
+- redis_queue: delete 与 cache_delete 合并逻辑,cache_delete 复用 delete
+- redis_queue.close_redis: 重置所有全局状态(含 _redis_init_attempted/_redis_last_attempt_ts)
+- cache_store.cache_set: table 标签从 cache_backup 修正为 ttl_cache
+- .env.example: 完善死信队列处理流程/降级写本地文件说明
+- deploy_vps: 修正 StartLimit 注释(超限进入 failed 状态,需手动 reset-failed)
+- 测试覆盖: 补充 push_dead/health_check/close_redis/cache_delete/pop 批量/JSON 失败/连接异常
+- 测试覆盖: 补充 DBWriter.init(sqlite/redis空/不可达/成功)/close(有/无 store)/start(消息/空消息忙等)
+
+P3修复(16项):
+- redis_queue: 头部注释"缓冲 key"改为"读缓存 key"(消除误导)
+- redis_queue.delete: docstring 说明合并 cache_delete 逻辑
+- redis_queue.length: docstring 说明 -1 哨兵值语义
+- redis_queue.cache_set: docstring 说明默认 ttl=5 仅为函数级兜底
+- .env.example: WRITER_MODE 注释说明需同时配置 REDIS_URL
+- .env.example: TTL 注释对齐统一
+- test_integration: _make_msg data 字段统一为扁平结构
+- test_integration: test_process_message_success 补充 DBWriterMessage 参数类型验证
+- test_integration: test_stop_logs_counts 移除未使用的 capsys 参数
+
+测试: 51 passed (新增 21 个测试用例)

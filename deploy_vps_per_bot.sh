@@ -235,14 +235,22 @@ generate_service() {
     if [[ "$name" != "db_backup" ]]; then
         after_deps="network.target redis.service"
     fi
+    # P1修复: db_writer 是 Redis 硬依赖,使用 Requires= 强制 Redis 启动
+    # (无 Redis 时 db_writer init 抛 RuntimeError,Restart=on-failure 会紧密重启循环)
+    local requires_dep=""
+    if [[ "$name" == "db_writer" ]]; then
+        requires_dep="Requires=redis.service"
+    fi
 
     cat > "/etc/systemd/system/${svc}.service" << EOF
 [Unit]
 Description=TG文件解码器 — ${desc}
 After=${after_deps}
 Wants=network.target
+${requires_dep}
 PartOf=${SVC_PREFIX}.target
-# systemd 内置防抖:60秒内最多重启5次,超限后冷却30秒
+# systemd 防抖:60秒内最多重启5次,超限后进入 failed 状态
+# (需手动 systemctl reset-failed <service> 后才能重启)
 StartLimitBurst=5
 StartLimitIntervalSec=60
 
