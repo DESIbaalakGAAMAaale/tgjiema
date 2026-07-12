@@ -736,6 +736,222 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
         )
 
+        # ─── R40: 统一任务中心(tasks) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS tasks (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type   TEXT NOT NULL,
+                user_id     INTEGER NOT NULL,
+                status      TEXT DEFAULT 'pending',
+                progress    INTEGER DEFAULT 0,
+                eta_seconds INTEGER DEFAULT 0,
+                payload     TEXT,
+                result      TEXT,
+                error       TEXT,
+                trace_id    TEXT DEFAULT '',
+                created_at  TEXT,
+                updated_at  TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(user_id, status)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_type_created ON tasks(task_type, created_at)"
+        )
+
+        # ─── R40: 文件集合(collections) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS collections (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                name         TEXT NOT NULL,
+                code         TEXT UNIQUE,
+                owner_id     INTEGER NOT NULL,
+                description  TEXT DEFAULT '',
+                version      INTEGER DEFAULT 1,
+                item_count   INTEGER DEFAULT 0,
+                status       TEXT DEFAULT 'active',
+                created_at   TEXT,
+                updated_at   TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collections_owner ON collections(owner_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collections_code ON collections(code)"
+        )
+
+        # ─── R40: 集合项目(collection_items) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS collection_items (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                collection_id INTEGER NOT NULL,
+                file_code     TEXT NOT NULL,
+                added_at      TEXT,
+                FOREIGN KEY (collection_id) REFERENCES collections(id)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collection_items_coll ON collection_items(collection_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_collection_items_code ON collection_items(file_code)"
+        )
+
+        # ─── R40: 通知(notifications) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS notifications (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL,
+                type       TEXT NOT NULL,
+                payload    TEXT,
+                is_read    INTEGER DEFAULT 0,
+                created_at TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, is_read)"
+        )
+
+        # ─── R40: 内容举报(content_reports) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS content_reports (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_id   INTEGER NOT NULL,
+                target_type   TEXT NOT NULL,
+                target_id     TEXT NOT NULL,
+                reason        TEXT NOT NULL,
+                description   TEXT DEFAULT '',
+                status        TEXT DEFAULT 'pending',
+                appeal_text   TEXT DEFAULT '',
+                appealed_at   TEXT,
+                resolved_by   INTEGER,
+                resolved_at   TEXT,
+                created_at    TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_reports_status ON content_reports(status)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_reports_target ON content_reports(target_type, target_id)"
+        )
+
+        # ─── R40: 审计日志(audit_log) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS audit_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_id    INTEGER NOT NULL,
+                actor_type  TEXT DEFAULT 'admin',
+                action      TEXT NOT NULL,
+                target_type TEXT,
+                target_id   TEXT,
+                details     TEXT,
+                ip_addr     TEXT DEFAULT '',
+                created_at  TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)"
+        )
+
+        # ─── R40: 配额预留(quota_reservations) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS quota_reservations (
+                id              TEXT PRIMARY KEY,
+                user_id         INTEGER NOT NULL,
+                amount          INTEGER NOT NULL,
+                reason          TEXT NOT NULL,
+                status          TEXT DEFAULT 'reserved',
+                actual_amount   INTEGER DEFAULT 0,
+                created_at      TEXT,
+                settled_at      TEXT,
+                expired_at      TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_quota_reservations_user ON quota_reservations(user_id, status)"
+        )
+
+        # ─── R40: RBAC 角色(rbac_roles) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS rbac_roles (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT UNIQUE NOT NULL,
+                description TEXT DEFAULT '',
+                permissions TEXT DEFAULT '[]',
+                created_at  TEXT
+            )"""
+        )
+
+        # ─── R40: RBAC 用户角色(rbac_user_roles) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS rbac_user_roles (
+                user_id     INTEGER PRIMARY KEY,
+                role_id     INTEGER NOT NULL,
+                assigned_at TEXT,
+                assigned_by INTEGER,
+                FOREIGN KEY (role_id) REFERENCES rbac_roles(id)
+            )"""
+        )
+
+        # ─── R40: 审批流(approvals) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS approvals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                action        TEXT NOT NULL,
+                payload       TEXT,
+                status        TEXT DEFAULT 'pending',
+                approver_id   INTEGER,
+                approver_note TEXT DEFAULT '',
+                created_by    INTEGER NOT NULL,
+                created_at    TEXT,
+                resolved_at   TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)"
+        )
+
+        # ─── R40: 维护模式状态(maintenance_state) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS maintenance_state (
+                id          INTEGER PRIMARY KEY CHECK(id = 1),
+                enabled     INTEGER DEFAULT 0,
+                reason      TEXT DEFAULT '',
+                started_by  INTEGER,
+                started_at  TEXT,
+                ended_at    TEXT
+            )"""
+        )
+
+        # ─── R40: 管理员访问日志(admin_access_log) ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS admin_access_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                admin_id    INTEGER NOT NULL,
+                action      TEXT NOT NULL,
+                target_type TEXT,
+                target_id   TEXT,
+                details     TEXT,
+                ip_addr     TEXT DEFAULT '',
+                created_at  TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_access_log_admin ON admin_access_log(admin_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_access_log_created ON admin_access_log(created_at)"
+        )
+
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -880,6 +1096,7 @@ class CacheStore:
         "users": ("users_local", "user_id"),
         "cells": ("cells_local", "slot_id"),
         "external_code_mapping": ("external_code_mapping_local", "external_code"),
+        "collections": ("collections", "id"),
     }
 
     async def soft_delete(self, table: str, pk: str, deleted_at: str | None = None) -> bool:
