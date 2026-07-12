@@ -5,6 +5,7 @@
 import asyncio
 import datetime
 import time
+import uuid
 try:
     import orjson as json
 except ImportError:
@@ -95,6 +96,77 @@ def _extract_file_unique_id(msg) -> str:
     if msg.animation:
         return msg.animation.file_unique_id
     return ""
+
+
+# ─── R35 P0-4: upload_session / upload_outbox 接线辅助函数 ───
+# 这些函数将 _pending_upload_meta(内存)与 upload_sessions(SQLite 权威)双写,
+# 失败时仅记录日志,不影响主上传流程(渐进式接线)。
+
+async def _create_upload_session_for_upload(
+    user_id: int,
+    source_msg_ids: list | None = None,
+    options: dict | None = None,
+) -> str:
+    """创建上传会话(upload_sessions 表),返回 upload_id(UUID)。
+
+    失败时返回空串(主流程继续,upload_session 仅作为权威持久化层,
+    缺失不会阻塞上传,但会影响状态可观测性)。
+    """
+    upload_id = str(uuid.uuid4())
+    try:
+        store = get_cache_store()
+        await store.create_upload_session(
+            upload_id, user_id,
+            source_msg_ids=source_msg_ids,
+            options_json=options,
+            trace_id=f"up_bot:{upload_id[:8]}",
+        )
+    except Exception as e:
+        logger.warning(f"[Up] 创建 upload_session 失败(不影响主流程): {e}")
+        return ""
+    return upload_id
+
+
+async def _transition_upload_session_safe(
+    upload_id: str, new_status: str, reason: str = "", **update_fields,
+) -> None:
+    """安全推进 upload_session 状态(失败不影响主流程)。
+
+    upload_id 为空时直接返回(会话未创建,跳过状态推进)。
+    """
+    if not upload_id:
+        return
+    try:
+        await get_cache_store().transition_upload_session(
+            upload_id, new_status, reason=reason, **update_fields,
+        )
+    except Exception as e:
+        logger.warning(f"[Up] 推进 upload_session 状态失败 upload_id={upload_id} -> {new_status}: {e}")
+
+
+async def _create_outbox_entry_safe(
+    outbox_id: str, upload_id: str, user_id: int,
+    channel_id: int, msg_ids: list | None = None,
+    file_meta: list | None = None, event_type: str = "REGISTER_MANIFEST",
+    protect: int = 0,
+) -> None:
+    """安全创建 upload_outbox 条目(失败不影响主流程)。
+
+    upload_id 为空时直接返回(outbox 依赖 upload_session 关联)。
+    """
+    if not upload_id:
+        return
+    try:
+        await get_cache_store().create_outbox_entry(
+            outbox_id, upload_id, "", user_id, channel_id,
+            storage_msg_ids=msg_ids,
+            batch_file_meta=file_meta,
+            task_type="single",
+            protect_content=protect,
+            event_type=event_type,
+        )
+    except Exception as e:
+        logger.warning(f"[Up] 创建 outbox 条目失败 upload_id={upload_id} event={event_type}: {e}")
 
 
 def _build_input_media(file_meta: dict):
@@ -613,6 +685,14 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channel_msg_ids = []
     files_meta = []
 
+    # R35 P0-4: 批次上传创建 upload_session
+    batch_src_ids = [s["msg_id"] for s in src_messages]
+    upload_id = await _create_upload_session_for_upload(
+        user.id,
+        source_msg_ids=batch_src_ids,
+        options={"file_types": dict(batch.get("file_types", {})), "batch": True},
+    )
+
     # 注:批次路径不做秒传去重。批次内多文件可能来自不同源,channel 绑定复杂,
     # 跨 channel 复用会破坏 primary_channel_id + batch_msg_ids 的一致性。
     # 单文件与媒体组路径已覆盖主要秒传场景(_process_upload / _flush_media_group)。
@@ -730,11 +810,23 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not channel_msg_ids:
         await update.message.reply_text("文件处理失败，请稍后重试")
         await metrics.record_error("up_bot")
+        # R35 P0-4: 批次全部文件复制失败,推进 FAILED_RETRYABLE
+        await _transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason="batch_all_copy_failed",
+            last_error="batch all copies failed",
+        )
         return
 
     type_str = _json_dumps(dict(batch["file_types"]))
     batch_ids_str = ",".join(str(mid) for mid in channel_msg_ids)
     batch_file_meta_str = _json_dumps(files_meta)
+
+    # R35 P0-4: 批次 copy 完成,推进 RECEIVED → COPIED_PRIMARY
+    await _transition_upload_session_safe(
+        upload_id, "COPIED_PRIMARY", reason="batch_copy_done",
+        primary_channel_id=target_ch,
+        primary_msg_ids=channel_msg_ids,
+    )
 
     # 暂存批次数据，等待用户选择有效期→备注→转发权限
     context.user_data["_pending_batch"] = {
@@ -746,6 +838,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "primary_channel_id": target_ch,
         "primary_channel_msg_id": channel_msg_ids[0],
         "total_count": len(channel_msg_ids),
+        "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
     }
 
     await update.message.reply_text(
@@ -927,17 +1020,24 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     all_meta = []
     failed_count = 0
 
-    progress_msg = await safe_send_message(
-        context.bot, chat_id=user_id,
-        text=f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}"
-    )
-
     # 用 copy_messages 一次性批量复制整个媒体组,保留 media_group_id 关系,
     # 这样存储频道里的消息仍是同一媒体组,dsp 用 copyMessages 复制时才能以相册展示。
     # 失败则回退逐条 copy_message(保证可用性优先)。
     updates = group["updates"]
     src_chat_id = updates[0].effective_chat.id
     src_msg_ids = [up.message.message_id for up in updates]
+
+    # R35 P0-4: 收到媒体组后创建 upload_session
+    upload_id = await _create_upload_session_for_upload(
+        user_id,
+        source_msg_ids=src_msg_ids,
+        options={"file_types": dict(file_types), "media_group": True},
+    )
+
+    progress_msg = await safe_send_message(
+        context.bot, chat_id=user_id,
+        text=f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}"
+    )
 
     try:
         await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}")
@@ -984,6 +1084,13 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                 await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
             except Exception:
                 pass
+            # R35 P0-4: 去重命中,推进 RECEIVED → COPIED_PRIMARY
+            await _transition_upload_session_safe(
+                upload_id, "COPIED_PRIMARY", reason="dedup_hit",
+                primary_channel_id=target_ch,
+                primary_msg_ids=all_mids,
+                media_group_id=media_group_id,
+            )
 
     if not dedup_hit:
         batch_success = False
@@ -1006,6 +1113,13 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                     await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
                 except Exception:
                     pass
+                # R35 P0-4: 批量 copy 成功,推进 RECEIVED → COPIED_PRIMARY
+                await _transition_upload_session_safe(
+                    upload_id, "COPIED_PRIMARY", reason="copy_batch_done",
+                    primary_channel_id=target_ch,
+                    primary_msg_ids=all_mids,
+                    media_group_id=media_group_id,
+                )
         except Exception as e:
             logger.warning(f"[Up] copy_messages 批量复制失败,回退逐条: {e}")
 
@@ -1029,9 +1143,22 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                         await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
                     except Exception:
                         pass
+            # R35 P0-4: 逐条回退完成(部分成功),推进 COPIED_PRIMARY
+            if all_mids:
+                await _transition_upload_session_safe(
+                    upload_id, "COPIED_PRIMARY", reason="copy_fallback_partial",
+                    primary_channel_id=target_ch,
+                    primary_msg_ids=all_mids,
+                    media_group_id=media_group_id,
+                )
 
     if not all_mids:
         await metrics.record_error("up_bot")
+        # R35 P0-4: 全部文件复制失败,推进 FAILED_RETRYABLE
+        await _transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason="all_copy_failed",
+            last_error="media_group all copies failed",
+        )
         try:
             await progress_msg.edit_text("文件处理失败，请稍后重试")
         except Exception:
@@ -1057,6 +1184,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         "batch_file_meta": _json_dumps(all_meta),
         "note": note,
         "total_count": total_count,
+        "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
     }
 
     # 发送上传选项
@@ -1076,6 +1204,16 @@ async def _process_upload(
 ):
     main_channel = await _get_upload_target_channel()
 
+    # R35 P0-4: 收到文件后立即创建 upload_session(权威持久化层)
+    # upload_id 关联到 _pending_upload_meta,供后续 _finalize_upload 查找
+    upload_id = await _create_upload_session_for_upload(
+        user_id,
+        source_msg_ids=[update.message.message_id],
+        options={"file_types": file_types},
+    )
+    # R35 P0-4: 立即写入 user_data,确保 dedup/copy 失败等提前 return 的路径也能追踪 upload_id
+    context.user_data["_upload_id"] = upload_id
+
     # B1 秒传去重:若该文件(file_unique_id)已存在于同组频道,直接复用 msg_id
     existing = await _check_dedup(main_channel, update.message)
     if existing:
@@ -1083,6 +1221,12 @@ async def _process_upload(
         main_channel = existing["channel_id"]  # 文件实际所在频道
         logger.info(f"[Up] 秒传去重命中: reuse channel={main_channel} msg_id={channel_msg_id}")
         await metrics.increment("up.dedup_hit")
+        # R35 P0-4: 去重命中也视为 primary copy 完成
+        await _transition_upload_session_safe(
+            upload_id, "COPIED_PRIMARY", reason="dedup_hit",
+            primary_channel_id=main_channel,
+            primary_msg_ids=[channel_msg_id],
+        )
     else:
         try:
             forwarded = await safe_copy_message(context.bot, main_channel, update.effective_chat.id, update.message.message_id)
@@ -1095,11 +1239,22 @@ async def _process_upload(
         except Exception as e:
             logger.error(f"[Up] 转发文件到存储频道失败 {e}")
             await metrics.record_error("up_bot")
+            # R35 P0-4: Telegram copy 失败,推进到 FAILED_RETRYABLE
+            await _transition_upload_session_safe(
+                upload_id, "FAILED_RETRYABLE", reason=f"copy_failed: {e}",
+                last_error=str(e),
+            )
             await update.message.reply_text("文件处理失败，请稍后重试")
             return
 
         # R100 归档：异步转发到 R100 存储频道（fire-and-forget）
         asyncio.create_task(_forward_to_r100(context, update.effective_chat.id, update.message.message_id))
+        # R35 P0-4: Telegram copy 成功,推进 RECEIVED → COPIED_PRIMARY
+        await _transition_upload_session_safe(
+            upload_id, "COPIED_PRIMARY", reason="copy_done",
+            primary_channel_id=main_channel,
+            primary_msg_ids=[channel_msg_id],
+        )
 
     # 暂存必要信息到模块级 dict（context.user_data 在 callback 间不可靠）
     # P2: 改用 user_id:msg_id 复合键,避免同用户并发上传互相覆盖
@@ -1111,6 +1266,7 @@ async def _process_upload(
         "note": update.message.caption or "",
         "file_meta": extract_file_meta(update),
         "created_at": time.time(),
+        "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
     }
     # 同时存 context.user_data（兼容旧逻辑）
     context.user_data["_main_channel"] = main_channel
@@ -1120,6 +1276,8 @@ async def _process_upload(
     context.user_data["_file_meta"] = extract_file_meta(update)
     # P2: 记录上传消息 ID 用于 _finalize_upload 复合键查找
     context.user_data["_upload_msg_id"] = update.message.message_id
+    # R35 P0-4: 记录 upload_id 供 _finalize_upload 使用
+    context.user_data["_upload_id"] = upload_id
 
     # 第一步：发送有效期选择
     await update.message.reply_text(
@@ -1191,6 +1349,13 @@ async def _finalize_upload(query, context, user_id: int):
     pending_batch = context.user_data.pop("_pending_batch", None)
     pending_mg = context.user_data.pop("_pending_media_group", None)
 
+    # R35 P0-4: 预提取 upload_id(供异常处理中的状态推进使用)
+    upload_id = ""
+    if pending_batch:
+        upload_id = pending_batch.get("upload_id", "")
+    elif pending_mg:
+        upload_id = pending_mg.get("upload_id", "")
+
     try:
         pending_col = get_pending_uploads_col()
         ttl = context.user_data.pop("file_ttl", "0")
@@ -1213,6 +1378,7 @@ async def _finalize_upload(query, context, user_id: int):
         if pending_batch:
             # ── 批次上传 ──
             note = note or pending_batch.get("note", "")
+            upload_id = pending_batch.get("upload_id", "")
             await pending_col.insert_one({
                 "uploader_id": user_id,
                 "primary_channel_id": pending_batch["primary_channel_id"],
@@ -1226,12 +1392,14 @@ async def _finalize_upload(query, context, user_id: int):
                 "processed": 0,
                 "protect_content": protect_bool,
                 "file_ttl_days": ttl_days,
+                "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
             })
             logger.info(f"[Up] 批次写入pending_uploads: user={user_id}, {pending_batch['total_count']}个文件")
             _finalized_msg_ids.add(msg_id)
 
         elif pending_mg:
             # ── 媒体组上传 ──
+            upload_id = pending_mg.get("upload_id", "")
             await pending_col.insert_one({
                 "uploader_id": user_id,
                 "primary_channel_id": pending_mg["primary_channel_id"],
@@ -1245,6 +1413,7 @@ async def _finalize_upload(query, context, user_id: int):
                 "processed": 0,
                 "protect_content": protect_bool,
                 "file_ttl_days": ttl_days,
+                "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
             })
             logger.info(f"[Up] 媒体组写入pending_uploads: user={user_id}")
             _finalized_msg_ids.add(msg_id)
@@ -1260,6 +1429,7 @@ async def _finalize_upload(query, context, user_id: int):
             channel_msg_id = context.user_data.pop("_channel_msg_id", 0) or meta.get("channel_msg_id", 0)
             file_types = context.user_data.pop("_file_types", {}) or meta.get("file_types", {})
             file_meta = context.user_data.pop("_file_meta", {}) or meta.get("file_meta", {})
+            upload_id = context.user_data.pop("_upload_id", "") or meta.get("upload_id", "")
             logger.debug(f"[Up] _finalize_upload user={user_id} meta_keys={list(meta.keys())} "
                          f"main_channel={main_channel} channel_msg_id={channel_msg_id} file_types={file_types}")
             # file_types 丢失时从 file_meta 推断
@@ -1274,6 +1444,11 @@ async def _finalize_upload(query, context, user_id: int):
                     f"channel_msg_id={channel_msg_id}, user={user_id} — 拒绝写入 pending_uploads"
                 )
                 await metrics.record_error("up_bot")
+                # R35 P0-4: 状态缺失,推进 FAILED_PERMANENT(不可恢复)
+                await _transition_upload_session_safe(
+                    upload_id, "FAILED_PERMANENT", reason="state_missing",
+                    last_error="main_channel or channel_msg_id is zero",
+                )
                 try:
                     await query.edit_message_text(text="文件处理失败：存储频道未就绪，请重新上传")
                 except Exception:
@@ -1293,12 +1468,47 @@ async def _finalize_upload(query, context, user_id: int):
                 "processed": 0,
                 "protect_content": protect_bool,
                 "file_ttl_days": ttl_days,
+                "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
             })
             logger.info(f"[Up] 单文件写入pending_uploads: user={user_id}")
             _finalized_msg_ids.add(msg_id)
             # P2: 清理复合键(user_id:upload_msg_id)和旧键(user_id)
             _pending_upload_meta.pop(_meta_key, None)
             _pending_upload_meta.pop(user_id, None)
+
+        # R35 P0-4: pending_uploads 写入成功,推进 COPIED_PRIMARY → MANIFEST_PENDING
+        # 并创建 outbox 条目供 Manifest Worker 消费
+        await _transition_upload_session_safe(
+            upload_id, "MANIFEST_PENDING", reason="pending_uploads_written",
+        )
+        # 解析 storage_msg_ids 供 outbox 使用
+        _outbox_storage_ids = []
+        if pending_batch:
+            _outbox_storage_ids = [int(x) for x in pending_batch["batch_msg_ids"].split(",") if x.strip().isdigit()]
+            _outbox_channel_id = pending_batch["primary_channel_id"]
+            _outbox_file_meta = []
+        elif pending_mg:
+            _outbox_storage_ids = [int(x) for x in pending_mg["batch_msg_ids"].split(",") if x.strip().isdigit()]
+            _outbox_channel_id = pending_mg["primary_channel_id"]
+            _outbox_file_meta = []
+        else:
+            _outbox_storage_ids = [channel_msg_id] if channel_msg_id else []
+            _outbox_channel_id = main_channel
+            _outbox_file_meta = []
+        # 创建 REGISTER_MANIFEST outbox 条目(供 Manifest Worker 消费)
+        await _create_outbox_entry_safe(
+            f"obx-man-{upload_id}", upload_id, user_id,
+            _outbox_channel_id, msg_ids=_outbox_storage_ids,
+            file_meta=_outbox_file_meta, event_type="REGISTER_MANIFEST",
+            protect=1 if protect_bool else 0,
+        )
+        # 创建 ARCHIVE_R100 outbox 条目(R100 归档任务)
+        await _create_outbox_entry_safe(
+            f"obx-r100-{upload_id}", upload_id, user_id,
+            _outbox_channel_id, msg_ids=_outbox_storage_ids,
+            file_meta=_outbox_file_meta, event_type="ARCHIVE_R100",
+            protect=1 if protect_bool else 0,
+        )
 
         try:
             await get_cache_store().notify_new_upload()
@@ -1316,6 +1526,11 @@ async def _finalize_upload(query, context, user_id: int):
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
+        # R35 P0-4: 写入失败,推进 FAILED_RETRYABLE
+        await _transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason=f"finalize_failed: {e}",
+            last_error=str(e),
+        )
         try:
             await query.edit_message_text(text="文件处理失败，请稍后重试")
         except Exception:
@@ -1629,6 +1844,14 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
     pending_copies = buf.get("pending_copies", [])
     orig_caption = (buf.get("orig_caption") or "").strip()
     caption_src_msg_id = buf.get("caption_src_msg_id")
+    ext_user_id = buf.get("user_id", 0)
+
+    # R35 P0-4: 外部中继文件创建 upload_session
+    upload_id = await _create_upload_session_for_upload(
+        ext_user_id,
+        source_msg_ids=[pc[1] for pc in pending_copies] if pending_copies else msg_ids,
+        options={"file_types": dict(file_types), "external_code": external_code},
+    )
 
     # P1: 批量 copy 未去重的文件到存储频道(保持媒体组格式)
     # copied_map: src_msg_id -> new_storage_msg_id（用于定位 caption 承载消息）
@@ -1669,7 +1892,19 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
 
     if not msg_ids:
         logger.warning(f"[Up][ext_relay] 外部文件缓冲区为空，跳过 (code={external_code})")
+        # R35 P0-4: 外部文件缓冲区为空,推进 FAILED_RETRYABLE
+        await _transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason="ext_buffer_empty",
+            last_error="no msg_ids after copy",
+        )
         return
+
+    # R35 P0-4: 外部文件 copy 完成,推进 RECEIVED → COPIED_PRIMARY
+    await _transition_upload_session_safe(
+        upload_id, "COPIED_PRIMARY", reason="ext_copy_done",
+        primary_channel_id=target_ch,
+        primary_msg_ids=msg_ids,
+    )
 
     # 如果有第三方原始 caption，编辑存储频道中承载 caption 的消息，去除 EXTERNAL_RELAY 路由前缀
     if orig_caption and caption_src_msg_id and caption_src_msg_id in copied_map:
@@ -1698,7 +1933,7 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
     try:
         pending_col = get_pending_uploads_col()
         await pending_col.insert_one({
-            "uploader_id": buf["user_id"],
+            "uploader_id": ext_user_id,
             "primary_channel_id": target_ch,
             "primary_channel_msg_id": msg_ids[0],
             "file_types": type_str,
@@ -1710,10 +1945,35 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
             "processed": 0,
             "protect_content": False,
             "file_ttl_days": 0,
+            "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
         })
         logger.info(f"[Up][ext_relay] 外部文件已写入pending_uploads: code={external_code}, {len(msg_ids)}个文件")
     except Exception as e:
         logger.error(f"[Up][ext_relay] 写入pending_uploads失败 (code={external_code}): {e}")
+        # R35 P0-4: 写入失败,推进 FAILED_RETRYABLE
+        await _transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason=f"ext_write_failed: {e}",
+            last_error=str(e),
+        )
+        return
+
+    # R35 P0-4: pending_uploads 写入成功,推进 COPIED_PRIMARY → MANIFEST_PENDING
+    # 并创建 outbox 条目供 Manifest Worker 消费
+    await _transition_upload_session_safe(
+        upload_id, "MANIFEST_PENDING", reason="ext_pending_uploads_written",
+    )
+    await _create_outbox_entry_safe(
+        f"obx-man-{upload_id}", upload_id, ext_user_id,
+        target_ch, msg_ids=msg_ids,
+        file_meta=files_meta, event_type="REGISTER_MANIFEST",
+        protect=0,
+    )
+    await _create_outbox_entry_safe(
+        f"obx-r100-{upload_id}", upload_id, ext_user_id,
+        target_ch, msg_ids=msg_ids,
+        file_meta=files_meta, event_type="ARCHIVE_R100",
+        protect=0,
+    )
 
     try:
         await get_cache_store().notify_new_upload()

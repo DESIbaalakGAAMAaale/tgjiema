@@ -522,6 +522,24 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── pending_uploads 轮询(生成文件 ───
 
+async def _idx_transition_upload_session_safe(
+    upload_id: str, new_status: str, reason: str = "", **update_fields,
+) -> None:
+    """安全推进 upload_session 状态(失败不影响 idx_bot 主流程)。
+
+    R35 P0-4: idx_bot 在文件码生成后推进 upload_session → READY。
+    """
+    if not upload_id:
+        return
+    try:
+        from database.cache_store import get_cache_store
+        await get_cache_store().transition_upload_session(
+            upload_id, new_status, reason=reason, **update_fields,
+        )
+    except Exception as e:
+        logger.warning(f"[Idx] 推进 upload_session 状态失败 upload_id={upload_id} -> {new_status}: {e}")
+
+
 async def _process_one_pending(app: Application, row: dict):
     """处理单个 pending_upload 记录,生成文件码并通知用户。
     由 _process_pending_uploads 并发调用。
@@ -531,6 +549,7 @@ async def _process_one_pending(app: Application, row: dict):
     channel_id = row.get("primary_channel_id")
     message_id = row.get("primary_channel_msg_id")
     file_types = row.get("file_types", {})
+    upload_id = row.get("upload_id", "")  # R35 P0-4: 从 pending_uploads 提取 upload_id
     logger.info(f"[Idx][poll] raw file_types from CRDB: type={type(file_types).__name__}, value={file_types!r}")
     # _row_to_dict 已经保证 file_types 是 dict（空为 {}），此处仅做兜底
     if isinstance(file_types, str):
@@ -594,6 +613,11 @@ async def _process_one_pending(app: Application, row: dict):
             except Exception as e:
                 logger.warning(f"[Idx] 通知上传者数据残缺失败: {e}")
         await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1, "claimed_at": 0}})
+        # R35 P0-4: 数据残缺不可恢复,推进 FAILED_PERMANENT
+        await _idx_transition_upload_session_safe(
+            upload_id, "FAILED_PERMANENT", reason="data_incomplete",
+            last_error="missing uploader_id/channel_id/message_id",
+        )
         return
 
     try:
@@ -607,6 +631,11 @@ async def _process_one_pending(app: Application, row: dict):
             pass
         # I-1: 瞬时失败，重置 claimed_at 让下轮重领（at-least-once）
         await pending_col.update_one({"id": pend_id}, {"$set": {"claimed_at": 0}})
+        # R35 P0-4: 文件码生成失败,推进 FAILED_RETRYABLE
+        await _idx_transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason=f"code_gen_failed: {e}",
+            last_error=str(e),
+        )
         return
 
     # 写入 file_records
@@ -645,6 +674,11 @@ async def _process_one_pending(app: Application, row: dict):
             pass
         # I-1: 瞬时失败，重置 claimed_at 让下轮重领（at-least-once）
         await pending_col.update_one({"id": pend_id}, {"$set": {"claimed_at": 0}})
+        # R35 P0-4: file_records 写入失败,推进 FAILED_RETRYABLE
+        await _idx_transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason=f"file_records_write_failed: {e}",
+            last_error=str(e),
+        )
         return
 
     # 写入 codes 表（含 expire_time，省一次 UPDATE）
@@ -828,6 +862,14 @@ async def _process_one_pending(app: Application, row: dict):
 
     # I-1: 处理成功，置 processed=1 并清除 claimed_at
     await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1, "claimed_at": 0}})
+    # R35 P0-4: 文件码生成 + file_records + codes 全部写入成功,
+    # 推进 upload_session: MANIFEST_PENDING → MANIFESTED → READY
+    await _idx_transition_upload_session_safe(
+        upload_id, "MANIFESTED", reason=f"file_code_generated: {file_code}",
+    )
+    await _idx_transition_upload_session_safe(
+        upload_id, "READY", reason=f"idx_processed: {file_code}",
+    )
     metrics.decode_count += 1
     await metrics.record_processed("idx_bot")
 
@@ -859,7 +901,7 @@ async def _process_pending_uploads(app: Application):
                     limit=10,
                     projection=["id", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
                                 "file_types", "batch_msg_ids", "batch_file_meta", "note",
-                                "protect_content", "file_ttl_days"],
+                                "protect_content", "file_ttl_days", "upload_id"],
                 )
 
                 if not candidates:
