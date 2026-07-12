@@ -713,7 +713,12 @@ class D1Collection:
         return rows[0] if rows else None
 
     async def insert_one(self, doc: dict) -> dict:
+        # P3: 校验表名防注入(与 find_one 一致)
+        _validate_identifier(self.table)
         keys = list(doc.keys())
+        # P3: 校验列名防注入
+        for k in keys:
+            _validate_identifier(k)
         params = [_safe_str(v) for v in doc.values()]
         placeholders = [f"${i + 1}" for i in range(len(params))]
         sql = f"INSERT INTO {self.table} ({', '.join(keys)}) VALUES ({', '.join(placeholders)})"
@@ -724,17 +729,28 @@ class D1Collection:
         """批量插入文档"""
         if not docs:
             return []
-        keys = list(docs[0].keys())
+        # P3: 校验表名防注入
+        _validate_identifier(self.table)
+        # P3: 取所有 doc 键的并集,避免不同键集的 doc 导致值/列错位
+        all_keys: list[str] = []
+        seen_keys: set[str] = set()
+        for doc in docs:
+            for k in doc.keys():
+                if k not in seen_keys:
+                    _validate_identifier(k)
+                    all_keys.append(k)
+                    seen_keys.add(k)
         placeholders_list = []
         all_params = []
         for doc in docs:
-            row_params = [_safe_str(v) for v in doc.values()]
+            # 按 all_keys 顺序取值,缺失的键用 NULL
+            row_params = [_safe_str(doc.get(k)) for k in all_keys]
             all_params.extend(row_params)
             start = len(all_params) - len(row_params) + 1
             placeholders_list.append(
                 "(" + ", ".join([f"${start + i}" for i in range(len(row_params))]) + ")"
             )
-        sql = f"INSERT INTO {self.table} ({', '.join(keys)}) VALUES {', '.join(placeholders_list)}"
+        sql = f"INSERT INTO {self.table} ({', '.join(all_keys)}) VALUES {', '.join(placeholders_list)}"
         await self._execute(sql, all_params)
         return docs
 

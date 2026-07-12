@@ -218,6 +218,26 @@ async def _persist_login_failures():
         logger.warning(f"[Admin] 持久化登录失败计数失败: {e}")
 
 
+def _fire_and_forget(coro):
+    """P3: 安全调度 fire-and-forget 协程。
+
+    在 threadpool 上下文中(async sync 依赖被 run_in_threadpool 调用时)
+    可能无 running event loop,此时 asyncio.ensure_future 会抛 RuntimeError。
+    降级为跳过(数据仍在内存中,下次有 loop 时会持久化)。
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(coro)
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    except RuntimeError:
+        # 无 running event loop(threadpool 上下文),跳过异步持久化
+        # 关闭未 await 的协程避免 RuntimeWarning
+        coro.close()
+        from loguru import logger
+        logger.debug("[Admin] 无 running event loop,跳过异步持久化(threadpool 上下文)")
+
+
 def _get_csrf_token(username: str = "") -> str:
     """获取或生成当前会话的 CSRF token。若 token 已过期则重新生成。"""
     if not username:
@@ -227,9 +247,8 @@ def _get_csrf_token(username: str = "") -> str:
     if entry is None or (now - entry[1]) >= _CSRF_TOKEN_TTL:
         # 新生成或过期重新生成
         _csrf_tokens[username] = (secrets.token_hex(32), now)
-        task = asyncio.ensure_future(_persist_csrf_tokens())
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        # P3: 防御 threadpool 无 running event loop 的情况
+        _fire_and_forget(_persist_csrf_tokens())
     return _csrf_tokens[username][0]
 
 
@@ -254,13 +273,8 @@ def _verify_csrf(request: Request, form_token: str = None, username: str = "") -
             return False
         return (secrets.compare_digest(cookie_token, expected_token)
                 and secrets.compare_digest(cookie_token, form_token))
-    # 无 username 时回退到全局匹配（兼容旧逻辑）—— 带过期检查
-    for u, (t, ts) in list(_csrf_tokens.items()):
-        if (now - ts) >= _CSRF_TOKEN_TTL:
-            _csrf_tokens.pop(u, None)
-            continue
-        if secrets.compare_digest(cookie_token, t):
-            return secrets.compare_digest(cookie_token, form_token)
+    # P3: 移除空 username 全局回退分支(死代码,且逻辑宽松有安全隐患)
+    # 所有调用方均传入 username,空 username 一律拒绝(fail-closed)
     return False
 
 
@@ -308,9 +322,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     ]
     if not _login_failures[client_ip]:
         del _login_failures[client_ip]
-        task = asyncio.ensure_future(_persist_login_failures())
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        _fire_and_forget(_persist_login_failures())
     elif len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
@@ -327,9 +339,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     if not (correct_username and correct_password):
         # 记录失败
         _login_failures[client_ip].append(now)
-        task = asyncio.ensure_future(_persist_login_failures())
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        _fire_and_forget(_persist_login_failures())
         # RFC 7235: 401 必须带 WWW-Authenticate 头，提示浏览器弹出认证框
         raise HTTPException(
             status_code=401,
@@ -339,9 +349,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
 
     # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)
-    task = asyncio.ensure_future(_persist_login_failures())
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    _fire_and_forget(_persist_login_failures())
     return credentials.username
 
 

@@ -25,7 +25,7 @@ class UserRateLimiter:
         # L4: 延迟读取 settings，消除 import 副作用（配置未就绪即崩溃）
         self._max_calls = max_calls_per_minute
         self._users: dict[int, list[float]] = defaultdict(list)
-        self._acquire_count = 0
+        # P3: 移除死代码 _acquire_count(从未读取/递增)
         self._lock = asyncio.Lock()
         self._last_cleanup = time.monotonic()
 

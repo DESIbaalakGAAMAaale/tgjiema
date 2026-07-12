@@ -77,9 +77,13 @@ class DynamicRateLimiter:
         Returns:
             True 表示允许通过
         """
-        async with self._lock:
-            queue_length = await get_queue_length() if callable(get_queue_length) else 0
+        # P3: 将 get_queue_length 移到锁外,避免持锁 await 外部协程
+        if callable(get_queue_length):
+            queue_length = await get_queue_length()
+        else:
+            queue_length = 0
 
+        async with self._lock:
             # 根据队列长度计算目标延迟
             if queue_length <= self.threshold_low:
                 target_delay = self.base_delay
@@ -108,11 +112,12 @@ class DynamicRateLimiter:
             elapsed = now - self._last_release_time if self._last_release_time > 0 else self._current_delay
             wait = max(0, self._current_delay - elapsed)
 
-            # 在锁内 sleep，串行化所有并发请求
-            if wait > 0:
-                await asyncio.sleep(wait)
-
             self._last_release_time = time.monotonic()
+
+        # P3: sleep 移到锁外,避免持锁期间阻塞其他协程
+        # 串行化仍由 _last_release_time 时间戳保证:后续协程拿锁时 elapsed 不足会 wait
+        if wait > 0:
+            await asyncio.sleep(wait)
 
         return True
 

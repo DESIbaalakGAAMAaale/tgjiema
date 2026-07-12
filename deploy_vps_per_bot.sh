@@ -387,6 +387,10 @@ cd "$DEPLOY_DIR"
 # 检查 topology.yaml 是否含有占位频道 ID（-1000000000xxx），有则从 .env 重新生成
 if grep -q -- "-1000000000" config/topology.yaml 2>/dev/null; then
     warn "检测到 topology.yaml 含有占位频道 ID，从 .env 重新生成..."
+    # P3: 拓扑刷新以 root 身份执行，无论 Python 是否中途失败都必须 chown，
+    # 否则 data/ 下文件属主会残留为 root，导致 tgjiema 服务无法读写。
+    # 因此临时关闭 set -e，确保 chown 一定被执行。
+    set +e
     "${DEPLOY_DIR}/venv/bin/python" -c "
 import asyncio
 from database import init_db, close_db, get_cells_col
@@ -402,11 +406,19 @@ async def refresh():
     await close_db()
 asyncio.run(refresh())
 "
+    refresh_rc1=$?
     "${DEPLOY_DIR}/venv/bin/python" admin/seed_topology.py --yes
-    # 拓扑刷新以 root 身份执行，生成的 data/ 下文件属主会变成 root，需重新 chown
+    refresh_rc2=$?
+    set -e
+    # P3: 无条件 chown，防止 root 属主文件残留
     chown -R tgjiema:tgjiema "$DEPLOY_DIR"
-    success "拓扑已从 .env 刷新，频道 ID 已更新"
-    info "请手动执行: systemctl restart tgjiema.target"
+    if [[ $refresh_rc1 -ne 0 || $refresh_rc2 -ne 0 ]]; then
+        warn "拓扑刷新过程中发生错误(rc1=$refresh_rc1, rc2=$refresh_rc2)，但属主已修复为 tgjiema"
+        info "请手动检查 topology.yaml 和 admin/seed_topology.py 输出"
+    else
+        success "拓扑已从 .env 刷新，频道 ID 已更新"
+        info "请手动执行: systemctl restart tgjiema.target"
+    fi
 else
     success "topology.yaml 已包含真实频道 ID，跳过"
 fi

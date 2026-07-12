@@ -64,18 +64,20 @@ class SystemMetrics:
             logger.debug("metric %s +%d -> %d", key, amount, val)
 
     async def record_send_success(self):
-        """记录投递成功(双写: dataclass 字段 + _counters 用于跨进程聚合)"""
+        """记录投递成功(统一写入 _counters,to_dict 也从 _counters 读取,保持一致)"""
         async with self._lock:
-            self.send_success_count += 1
             val = _counters.get("dsp.send_success", 0) + 1
             _counters["dsp.send_success"] = val
+            # P3: dataclass 字段作为缓存,与 _counters 保持同步
+            self.send_success_count = val
 
     async def record_send_fail(self):
-        """记录投递失败(双写: dataclass 字段 + _counters 用于跨进程聚合)"""
+        """记录投递失败(统一写入 _counters,to_dict 也从 _counters 读取,保持一致)"""
         async with self._lock:
-            self.send_fail_count += 1
             val = _counters.get("dsp.send_fail", 0) + 1
             _counters["dsp.send_fail"] = val
+            # P3: dataclass 字段作为缓存,与 _counters 保持同步
+            self.send_fail_count = val
 
     @staticmethod
     def get_counter(key: str, default: int = 0) -> int:
@@ -103,6 +105,7 @@ class SystemMetrics:
     def to_dict(self) -> dict:
         """导出为字典格式,用于 admin 面板展示或 prometheus 导出。"""
         now = time.time()
+        # P3: send_success/send_fail 优先从 _counters 读取,与 snapshot() 保持一致
         return {
             "bots": {
                 name: {
@@ -116,8 +119,9 @@ class SystemMetrics:
             },
             "upload_count": self.upload_count,
             "decode_count": self.decode_count,
-            "send_success_count": self.send_success_count,
-            "send_fail_count": self.send_fail_count,
+            # P3: 从 _counters 读取,确保与 snapshot() 数据源一致
+            "send_success_count": _counters.get("dsp.send_success", self.send_success_count),
+            "send_fail_count": _counters.get("dsp.send_fail", self.send_fail_count),
             "backup_count": self.backup_count,
             "backup_fail_count": self.backup_fail_count,
         }

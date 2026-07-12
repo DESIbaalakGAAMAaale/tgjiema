@@ -200,13 +200,19 @@ class Settings(BaseSettings):
     @model_validator(mode='before')
     @classmethod
     def strip_inline_comments(cls, data: dict) -> dict:
-        """移除 .env 文件中行内注释（# 及之后的内容），防止 pydantic 解析失败。"""
+        """移除 .env 文件中行内注释（# 及之后的内容），防止 pydantic 解析失败。
+
+        P3: 改进正则,要求 # 前有空格且 # 后有空格或行尾,
+        避免截断 URL fragment(# 无空格)和密码中的 # 字符。
+        """
         if not isinstance(data, dict):
             return data
         stripped = {}
         for key, value in data.items():
             if isinstance(value, str):
-                value = re.sub(r'\s+#.*$', '', value).rstrip()
+                # 只匹配 " # comment" 格式(# 前有空格, # 后有空格或行尾)
+                # 不匹配 "value#fragment"(URL fragment)或 "pass#word"(密码)
+                value = re.sub(r'\s+#(?:\s.*$|$)', '', value).rstrip()
             stripped[key] = value
         return stripped
 
@@ -292,6 +298,13 @@ class Settings(BaseSettings):
                 accounts.append({"name": name, "channels": channels})
 
         r100_ch = self.R100_CHANNEL if self.R100_CHANNEL != 0 else None
+
+        # P3: 前置校验,accounts 为空时记录 warning 提示运维
+        if not accounts:
+            logger.warning(
+                "[Settings] get_accounts_config 返回空账号列表,"
+                "请检查 .env 中 ACCOUNT_*_CHANNELS 是否已配置"
+            )
 
         return {
             "accounts": accounts,

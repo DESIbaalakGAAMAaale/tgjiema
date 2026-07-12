@@ -135,7 +135,7 @@
             {% if total_pages > 1 %}
             <div class="pagination">
                 {% for p in range(1, total_pages + 1) %}
-                <a href="?page={{ p }}&search={{ search }}" class="{% if p == page %}active{% endif %}">{{ p }}</a>
+                <a href="?page={{ p }}&search={{ search | urlencode }}" class="{% if p == page %}active{% endif %}">{{ p }}</a>
                 {% endfor %}
             </div>
             {% endif %}
