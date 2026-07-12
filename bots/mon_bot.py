@@ -8,6 +8,8 @@
 与 admin_bot 完全分离,admin 负责管理配置,mon 负责运行时监控和文件冗余。
 """
 
+from __future__ import annotations
+
 import asyncio
 import datetime as _dt
 import re
@@ -149,7 +151,8 @@ class MonBot:
 
     # ─── R35 P0-4 §23: CAS/fencing 接线 — 拓扑变更使用租约 + CAS ───
     # 防止双控制面(Mon/Dsp)同时改写同一 cell,通过 topology_version 递增 + 租约互斥实现并发安全。
-    # 异常安全: 租约/CAS 失败只记录 warning,不阻塞拓扑变更(降级到原有 update_cell_fields_local)。
+    # R36 H5: 异常安全策略改为 fail-closed(生产默认),CAS/lease 失败时拒绝拓扑变更等待重试,
+    # 不再无条件降级到 update_cell_fields_local(避免绕过并发保护)。维护模式可显式降级。
 
     async def _acquire_cell_lease_safe(self, slot_id: str, lease_seconds: int = 300) -> bool:
         """安全获取 cell 租约(异常不传播)。
@@ -196,6 +199,93 @@ class MonBot:
         except Exception as e:
             logger.warning(f"[Mon][CAS] CAS 转换失败 (slot={slot_id}, {expected_status}→{new_status}): {e}")
             return False
+
+    async def _handle_cas_failure(
+        self,
+        slot_id: str,
+        expected_status: str,
+        new_status: str,
+        fallback_fields: dict,
+        fallback_mark_dirty: bool = True,
+        owner: str = "mon_bot",
+        reason: str = "CAS 失败",
+    ) -> bool:
+        """R36 H5: CAS/lease 失败时的统一处理(fail-closed / 维护模式 fallback)。
+
+        根据 settings.TOPOLOGY_FAIL_CLOSED 决定行为:
+        - True(默认/生产): 拒绝拓扑变更,记录审计事件,返回 False(调用方应跳过后续逻辑)
+        - False(维护模式): fallback 到 update_cell_fields_local,记录审计事件,返回 True
+
+        审计事件记录到 kv_store,字段:
+        - slot_id / expected_status / new_status / lease_owner / failure_reason
+        - mode (fail_closed / maintenance) / maintenance_mode (bool)
+        - expected_version (CAS 前未捕获,置 None) / actual_version (查询当前)
+        - timestamp
+
+        Returns: True 表示已应用 fallback(继续后续逻辑); False 表示拒绝变更(调用方应跳过)。
+        """
+        import json as _json
+        fail_closed = bool(getattr(settings, "TOPOLOGY_FAIL_CLOSED", True))
+
+        # 查询当前 cell 的 topology_version 用于审计(get_all_cells_local 不含此字段)
+        actual_version = None
+        store = get_cache_store()
+        try:
+            cells_with_version = await store.get_cells_by_version(-1)
+            for c in cells_with_version:
+                if c.get("slot_id") == slot_id:
+                    actual_version = c.get("topology_version")
+                    break
+        except Exception as e:
+            logger.debug(f"[Mon][CAS] get_cells_by_version 失败 (slot={slot_id}): {e}")
+        # 退回: 查询全局最大 topology_version(独立 try,避免上面异常影响)
+        if actual_version is None:
+            try:
+                actual_version = await store.get_max_topology_version()
+            except Exception as e:
+                logger.debug(f"[Mon][CAS] get_max_topology_version 失败 (slot={slot_id}): {e}")
+
+        # 写审计事件到 kv_store(失败不阻塞主流程)
+        audit_record = {
+            "slot_id": slot_id,
+            "expected_status": expected_status,
+            "new_status": new_status,
+            "lease_owner": owner,
+            "failure_reason": reason,
+            "mode": "fail_closed" if fail_closed else "maintenance",
+            "maintenance_mode": not fail_closed,
+            "expected_version": None,  # CAS 前未捕获,置 None
+            "actual_version": actual_version,
+            "timestamp": time.time(),
+        }
+        try:
+            audit_key = f"cas_audit:{slot_id}:{int(time.time() * 1000)}"
+            await store.set_kv(audit_key, _json.dumps(audit_record, ensure_ascii=False))
+        except Exception as e:
+            logger.warning(f"[Mon][CAS] 写审计事件失败 (slot={slot_id}): {e}")
+
+        if fail_closed:
+            logger.warning(
+                f"[Mon][CAS] CAS/lease 失败,拒绝拓扑变更,等待重试 "
+                f"(slot={slot_id}, {expected_status}→{new_status}, "
+                f"actual_version={actual_version}, owner={owner}, reason={reason})"
+            )
+            return False
+
+        # 维护模式: 保留 fallback 到 update_cell_fields_local
+        logger.warning(
+            f"[Mon][CAS] 维护模式: CAS 失败,fallback 到旧写法 "
+            f"(slot={slot_id}, {expected_status}→{new_status}, "
+            f"actual_version={actual_version}, owner={owner}, reason={reason})"
+        )
+        try:
+            await store.update_cell_fields_local(
+                slot_id, fallback_fields, mark_dirty=fallback_mark_dirty
+            )
+        except Exception as e:
+            logger.error(f"[Mon][CAS] 维护模式 fallback 写入失败 (slot={slot_id}): {e}")
+            return False
+        return True
 
     async def _watch_cells_change_loop(self):
         """C3: 每 5 秒检查 cells_change_notify,发现外部变更(admin_bot 增减槽位)
@@ -536,6 +626,7 @@ class MonBot:
             now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
             # R35 P0-4 §23: 拓扑变更前获取租约 + CAS 转换(防止双控制面并发改写)
             await self._acquire_cell_lease_safe(slot_id, lease_seconds=300)
+            topology_applied = True
             try:
                 cas_ok = await self._cas_transition_cell_safe(
                     slot_id, status, new_status,
@@ -544,18 +635,28 @@ class MonBot:
                     rotation_started_at=now_iso,
                 )
                 if not cas_ok:
-                    # CAS 失败(状态已被其他控制面改写),降级到原有 update_cell_fields_local
-                    logger.warning(f"[Mon][CAS] 封禁替换 CAS 失败,降级到 update_cell_fields_local (slot={slot_id})")
-                    await store.update_cell_fields_local(slot_id, {
-                        "channel_id": spare_ch,
-                        "status": new_status,
-                        "account_name": account_name,
-                        "file_count": 0,
-                        "last_synced_msg_id": 0,  # 归零触发 auto_fill_new_channels 补齐存量
-                        "rotation_started_at": now_iso,
-                    }, mark_dirty=True)
+                    # R36 H5: CAS 失败,根据 TOPOLOGY_FAIL_CLOSED 决定 fail-closed 或 fallback
+                    topology_applied = await self._handle_cas_failure(
+                        slot_id, status, new_status,
+                        fallback_fields={
+                            "channel_id": spare_ch,
+                            "status": new_status,
+                            "account_name": account_name,
+                            "file_count": 0,
+                            "last_synced_msg_id": 0,  # 归零触发 auto_fill_new_channels 补齐存量
+                            "rotation_started_at": now_iso,
+                        },
+                        fallback_mark_dirty=True,
+                        reason="封禁替换 CAS 失败",
+                    )
             finally:
                 await self._release_cell_lease_safe(slot_id)
+            if not topology_applied:
+                # fail-closed: 拓扑变更被拒绝,跳过后续环指针修正 / log_rotate / 缓存更新
+                notify_msg += "⚠️ 拓扑变更被拒绝(CAS 失败,等待重试)\n"
+                await self._notify_admin(notify_msg)
+                self._invalidate_cells_cache()
+                return
             self._update_cell_in_cache(slot_id, {
                 "channel_id": spare_ch, "status": new_status,
                 "file_count": 0, "last_synced_msg_id": 0,
@@ -600,17 +701,28 @@ class MonBot:
             if status in ("active", "shadow1", "shadow2"):
                 # R35 P0-4 §23: 拓扑变更前获取租约 + CAS 转换(降级为 lost)
                 await self._acquire_cell_lease_safe(slot_id, lease_seconds=300)
+                topology_applied = True
                 try:
                     cas_ok = await self._cas_transition_cell_safe(
                         slot_id, status, "lost",
                         next_active_chat_id=None,
                     )
                     if not cas_ok:
-                        # CAS 失败,降级到原有 update_cell_fields_local
-                        logger.warning(f"[Mon][CAS] 降级 lost CAS 失败,降级到 update_cell_fields_local (slot={slot_id})")
-                        await store.update_cell_fields_local(slot_id, {"status": "lost", "next_active_chat_id": None}, mark_dirty=True)
+                        # R36 H5: CAS 失败,根据 TOPOLOGY_FAIL_CLOSED 决定 fail-closed 或 fallback
+                        topology_applied = await self._handle_cas_failure(
+                            slot_id, status, "lost",
+                            fallback_fields={"status": "lost", "next_active_chat_id": None},
+                            fallback_mark_dirty=True,
+                            reason=f"降级 lost CAS 失败(无备用): {error}",
+                        )
                 finally:
                     await self._release_cell_lease_safe(slot_id)
+                if not topology_applied:
+                    # fail-closed: 拓扑变更被拒绝,跳过 log_rotate 和缓存更新
+                    notify_msg += "⚠️ lost 降级被拒绝(CAS 失败,等待重试)\n"
+                    await self._notify_admin(notify_msg)
+                    self._invalidate_cells_cache()
+                    return
                 self._update_cell_in_cache(slot_id, {"status": "lost", "next_active_chat_id": None})
                 await log_rotate(
                     from_slot_id=slot_id, to_slot_id="NONE",
@@ -643,6 +755,7 @@ class MonBot:
                 # 频道可访问，恢复为 shadow2
                 # R35 P0-4 §23: 拓扑变更前获取租约 + CAS 转换(lost → shadow2)
                 await self._acquire_cell_lease_safe(slot_id, lease_seconds=300)
+                topology_applied = True
                 try:
                     cas_ok = await self._cas_transition_cell_safe(
                         slot_id, "lost", "shadow2",
@@ -650,17 +763,24 @@ class MonBot:
                         file_count=0, demoted_to_channel_id=None,
                     )
                     if not cas_ok:
-                        # CAS 失败,降级到原有 update_cell_fields_local
-                        logger.warning(f"[Mon][CAS] lost 恢复 CAS 失败,降级到 update_cell_fields_local (slot={slot_id})")
-                        await store.update_cell_fields_local(slot_id, {
-                            "status": "shadow2",
-                            "next_active_chat_id": None,
-                            "degrade_count": 0,
-                            "file_count": 0,
-                            "demoted_to_channel_id": None,
-                        }, mark_dirty=True)
+                        # R36 H5: CAS 失败,根据 TOPOLOGY_FAIL_CLOSED 决定 fail-closed 或 fallback
+                        topology_applied = await self._handle_cas_failure(
+                            slot_id, "lost", "shadow2",
+                            fallback_fields={
+                                "status": "shadow2",
+                                "next_active_chat_id": None,
+                                "degrade_count": 0,
+                                "file_count": 0,
+                                "demoted_to_channel_id": None,
+                            },
+                            fallback_mark_dirty=True,
+                            reason="lost 恢复 CAS 失败",
+                        )
                 finally:
                     await self._release_cell_lease_safe(slot_id)
+                if not topology_applied:
+                    # fail-closed: 拓扑变更被拒绝,跳过缓存更新和计数,继续下一个 cell
+                    continue
                 self._update_cell_in_cache(slot_id, {
                     "status": "shadow2", "next_active_chat_id": None,
                     "degrade_count": 0, "file_count": 0,

@@ -183,6 +183,11 @@ class Settings(BaseSettings):
     RESTART_COOLDOWN: int = 600          # 子进程崩溃冷却期（秒）
     TOPOLOGY_SEED_RETRIES: int = 3       # 拓扑初始化重试次数
 
+    # ── R36 H5: 拓扑控制面 fail-closed 模式 ──
+    # True(默认/生产): CAS/lease 失败时拒绝拓扑变更,等待重试(避免双控制面并发改写绕过)
+    # False(维护模式): CAS/lease 失败时 fallback 到旧写法 update_cell_fields_local(需人工授权)
+    TOPOLOGY_FAIL_CLOSED: bool = True
+
     FREE_DAILY_QUOTA: int = 3
     BASIC_DAILY_QUOTA: int = 20
     PREMIUM_DAILY_QUOTA: int = -1
