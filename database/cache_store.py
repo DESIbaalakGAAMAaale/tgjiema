@@ -77,6 +77,7 @@ def _next_file_record_version() -> int:
 class CacheStore:
     def __init__(self):
         self._db: aiosqlite.Connection | None = None
+        self._in_writer_tx: bool = False  # R34: Writer 事务模式标志
 
     async def init(self):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -479,6 +480,8 @@ class CacheStore:
 
         R33 P1修复: SQLite 写成功后调用,记录 message_id 用于去重。
         使用 INSERT OR IGNORE 避免重复插入。
+
+        R34: 在 Writer 事务模式下不自行 commit(由 DBWriter 统一 COMMIT)。
         """
         if not self._db or not message_id:
             return
@@ -489,7 +492,45 @@ class CacheStore:
             "VALUES (?, ?, ?, ?, ?)",
             (message_id, method_name, stream_id, now, now)
         )
-        await self._db.commit()
+        if not self._in_writer_tx:
+            await self._db.commit()
+
+    # ─── R34 P0-1: Writer 原子事务控制 ───
+
+    async def begin_writer_tx(self):
+        """开始 Writer 事务:monkey-patch commit 为 no-op,执行 BEGIN IMMEDIATE。
+
+        R34 P0-1: 业务写与 writer_inbox 在同一事务中提交。
+        方法内部调用 self._db.commit() 在事务模式下变为 no-op,
+        由 DBWriter 的 commit_writer_tx() 统一提交。
+        """
+        if not self._db:
+            raise RuntimeError("CacheStore 未初始化")
+        self._in_writer_tx = True
+        # 保存原始 commit 并替换为 no-op
+        self._original_commit = self._db.commit
+        async def _noop_commit():
+            pass
+        self._db.commit = _noop_commit
+        await self._db.execute("BEGIN IMMEDIATE")
+
+    async def commit_writer_tx(self):
+        """提交 Writer 事务:执行 COMMIT,恢复 commit 方法。"""
+        try:
+            await self._db.execute("COMMIT")
+        finally:
+            if hasattr(self, '_original_commit'):
+                self._db.commit = self._original_commit
+            self._in_writer_tx = False
+
+    async def rollback_writer_tx(self):
+        """回滚 Writer 事务:执行 ROLLBACK,恢复 commit 方法。"""
+        try:
+            await self._db.execute("ROLLBACK")
+        finally:
+            if hasattr(self, '_original_commit'):
+                self._db.commit = self._original_commit
+            self._in_writer_tx = False
 
     async def cleanup_writer_inbox(self, before_ts: float) -> int:
         """清理过期的 inbox 记录(保留最近 N 天)。
@@ -548,6 +589,8 @@ class CacheStore:
             )
             await self._db.commit()
         except Exception as e:
+            if self._in_writer_tx:
+                raise
             logger.debug(f"[CacheStore] 删除缓存失败: {e}")
 
     async def cleanup(self, max_age_days: int = 30):
@@ -577,6 +620,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
+                if self._in_writer_tx:
+                    raise
                 logger.warning(f"[CacheStore] notify_new_upload 失败: {e}")
                 break
 
@@ -622,6 +667,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
+                if self._in_writer_tx:
+                    raise
                 logger.warning(f"[CacheStore] notify_dsp_new_job 失败: {e}")
                 break
 
@@ -781,6 +828,8 @@ class CacheStore:
             )
             await self._db.commit()
         except Exception as e:
+            if self._in_writer_tx:
+                raise
             logger.debug(f"[CacheStore] 通知表清理失败: {e}")
 
     # ─── 心跳本地存储：Mon Bot 写入 SQLite，零 CRDB RU ───
@@ -823,6 +872,8 @@ class CacheStore:
                     await asyncio.sleep(0.2)
                     continue
                 # 非锁冲突或重试耗尽,静默跳过(心跳下一轮会补上)
+                if self._in_writer_tx:
+                    raise
                 return
 
     async def commit(self):
@@ -861,6 +912,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
+                if self._in_writer_tx:
+                    raise
                 return  # 静默失败
 
     async def get_all_bot_heartbeats(self) -> dict[str, dict]:
@@ -938,6 +991,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
+                if self._in_writer_tx:
+                    raise
                 return
 
     async def increment_user_quota_used(self, user_id: int, is_external: bool = False):
@@ -1456,6 +1511,8 @@ class CacheStore:
             raw = json.dumps(cells, default=str)
             val = raw.decode() if isinstance(raw, bytes) else raw
         except Exception:
+            if self._in_writer_tx:
+                raise
             return
         now = time.time()
         await self._db.execute(
@@ -1542,6 +1599,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
+                if self._in_writer_tx:
+                    raise
                 logger.warning(f"[CacheStore] bulk_upsert_cells_local 失败: {e}")
                 return
 
@@ -1580,6 +1639,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.2)
                     continue
+                if self._in_writer_tx:
+                    raise
                 return
 
     async def batch_update_cells_local(self, updates: list[tuple[str, dict, bool]]):
@@ -1597,7 +1658,8 @@ class CacheStore:
         )
         for attempt in range(3):
             try:
-                await self._db.execute("BEGIN IMMEDIATE")
+                if not self._in_writer_tx:
+                    await self._db.execute("BEGIN IMMEDIATE")
                 try:
                     for slot_id, fields, mark_dirty in updates:
                         if not fields:
@@ -1616,9 +1678,11 @@ class CacheStore:
                         params.append(slot_id)
                         sql = f"UPDATE cells_local SET {', '.join(set_parts)} WHERE slot_id = ?"
                         await self._db.execute(sql, params)
-                    await self._db.commit()
+                    if not self._in_writer_tx:
+                        await self._db.commit()
                 except Exception:
-                    await self._db.rollback()
+                    if not self._in_writer_tx:
+                        await self._db.rollback()
                     raise
                 if routing_changed:
                     await self._rebuild_cells_snapshot()
@@ -1629,6 +1693,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
+                if self._in_writer_tx:
+                    raise
                 logger.warning(f"[CacheStore] batch_update_cells_local 失败: {e}")
                 return
 
@@ -1651,6 +1717,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.2)
                     continue
+                if self._in_writer_tx:
+                    raise
                 return
 
     async def get_all_cells_local(self) -> list[dict]:
@@ -1755,7 +1823,8 @@ class CacheStore:
         if not self._db:
             return False
         # 修复指针(单事务,SELECT 也在事务内避免 TOCTOU)
-        await self._db.execute("BEGIN IMMEDIATE")
+        if not self._in_writer_tx:
+            await self._db.execute("BEGIN IMMEDIATE")
         try:
             # 先获取待删除 cell 的 channel_id
             rows = await self._db.execute_fetchall(
@@ -1763,7 +1832,8 @@ class CacheStore:
                 (slot_id,),
             )
             if not rows:
-                await self._db.execute("ROLLBACK")
+                if not self._in_writer_tx:
+                    await self._db.execute("ROLLBACK")
                 return False
             target_channel_id = rows[0][0]
             # 查找前驱 P:next_active_chat_id == target_channel_id 的 cell
@@ -1810,9 +1880,11 @@ class CacheStore:
                 "DELETE FROM cells_local WHERE slot_id = ?",
                 (slot_id,),
             )
-            await self._db.commit()
+            if not self._in_writer_tx:
+                await self._db.commit()
         except Exception as e:
-            await self._db.execute("ROLLBACK")
+            if not self._in_writer_tx:
+                await self._db.execute("ROLLBACK")
             logger.error(f"[CacheStore] delete_cell_local 事务失败: {e}")
             raise
         # 重建快照 + bump version(触发跨进程通知)
@@ -2147,6 +2219,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.2)
                     continue
+                if self._in_writer_tx:
+                    raise
                 return  # 锁冲突静默跳过,KV 缓存下一轮会重新写入
 
     async def cache_get(self, key: str, ttl: float):
@@ -2186,6 +2260,8 @@ class CacheStore:
             )
             await self._db.commit()
         except Exception as e:
+            if self._in_writer_tx:
+                raise
             logger.debug(f"[cache_store] cache_set 失败: {e}")
 
     async def cache_delete_prefix(self, prefix: str):

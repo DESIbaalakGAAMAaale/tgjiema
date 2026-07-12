@@ -1,25 +1,26 @@
 """DBWriter 进程端到端集成测试。
 
-被测模块: ``database.db_writer``(Writer 进程:XREADGROUP 消费 → 幂等检查 → SQLite 落盘 → XACK 确认)
+被测模块: ``database.db_writer``(Writer 进程:XREADGROUP 消费 → 幂等检查 → 原子事务 → XACK 确认)
 
-R33 修复: 从 BRPOP 消费改为 Streams 可靠消费模型。
-  - XREADGROUP: 消息进入 pending 不删除
-  - writer_inbox: 幂等检查(已处理则 XACK 跳过)
-  - XACK: SQLite 提交后确认(消息从 pending 删除)
-  - XAUTOCLAIM: 崩溃恢复(回收 pending >30s 的消息)
+R34 修复: 业务写与 writer_inbox 在同一 BEGIN IMMEDIATE...COMMIT 事务中执行,
+确保崩溃恢复时不会重复执行业务写(真正的 exactly-once)。
 
-测试契约(基于 ``database/db_writer.py`` 实际实现):
+测试契约(基于 ``database/db_writer.py`` R34 实现):
   * ``DBWriter()`` 构造不建立连接(连接在 ``init()`` 中建立)
   * ``_process_message(msg)`` 接收单个 dict 参数(或非 dict 触发死信)
+  * ``_execute_atomic(msg: DBWriterMessage)`` 在单一 SQLite 事务中执行:
+      begin_writer_tx → INSERT inbox → _execute_sqlite → commit_writer_tx
   * ``_execute_sqlite(msg: DBWriterMessage)`` 接收 DBWriterMessage 对象
-  * 失败消息通过 ``redis_queue.push_dead`` 转入死信队列
-  * ``TypeError`` (方法签名不匹配)单独分类为永久失败入死信
-  * R33: 成功处理的消息会写入 writer_inbox,XACK 确认
-  * R33: 崩溃恢复后,已处理的消息通过 inbox 检查跳过(幂等)
+  * 失败消息通过 ``redis_queue.push_dead`` 转入死信队列(返回 True 时才 XACK)
+  * R34: inbox 在事务内 INSERT,冲突时(rowcount==0)抛 ``_InboxConflict`` → XACK 跳过
+  * R34: 方法名白名单校验,未授权方法抛 ``ValueError``
+  * R34: 缺少 message_id 的消息安全送入 DLQ(不再执行)
+  * R34: 非 dict 消息没有 stream_id 信息,不调用 ``msg.get()``(bug 已修复)
 
-故障注入测试(R33 P1-4):
+故障注入测试(R33 P1-4 + R34 P0-1):
   * 模拟 SIGKILL 后重启:消息留在 pending,XAUTOCLAIM 回收后幂等跳过
   * 模拟 XACK 失败:消息留在 pending,下次回收后 inbox 命中跳过
+  * R34: inbox INSERT 失败 → ROLLBACK → 入死信
 """
 import asyncio
 import json
@@ -31,6 +32,7 @@ import pytest
 db_writer = pytest.importorskip("database.db_writer")
 DBWriterMessage = getattr(db_writer, "DBWriterMessage", None)
 DBWriterClass = getattr(db_writer, "DBWriter", None)
+_InboxConflict = getattr(db_writer, "_InboxConflict", None)
 
 if DBWriterClass is None:
     pytest.skip("database.db_writer 未定义 DBWriter 类", allow_module_level=True)
@@ -58,40 +60,44 @@ def _make_msg(**overrides) -> dict:
 def writer(monkeypatch):
     """构造一个 DBWriter 实例,其 Redis 与 SQLite 依赖均被 mock 隔离。
 
-    R33: _store mock 包含 writer_inbox 方法(check_writer_inbox/write_writer_inbox)。
+    R34: _store mock 包含 Writer 事务方法(begin/commit/rollback_writer_tx)
+    以及 _db.execute 返回 mock cursor(rowcount=1 表示 INSERT 成功)。
     """
     instance = DBWriterClass()
-    # mock CacheStore(含 writer_inbox 方法)
     instance._store = MagicMock(name="mock_store")
     instance._store.check_writer_inbox = AsyncMock(return_value=False)
     instance._store.write_writer_inbox = AsyncMock(return_value=None)
+    # R34: mock Writer 事务方法
+    instance._store.begin_writer_tx = AsyncMock(return_value=None)
+    instance._store.commit_writer_tx = AsyncMock(return_value=None)
+    instance._store.rollback_writer_tx = AsyncMock(return_value=None)
+    # R34: mock _db.execute 返回 mock cursor(rowcount=1 表示 INSERT 成功)
+    mock_cursor = MagicMock()
+    mock_cursor.rowcount = 1
+    instance._store._db = MagicMock()
+    instance._store._db.execute = AsyncMock(return_value=mock_cursor)
     instance._running = True
     instance._processed_count = 0
     instance._error_count = 0
     instance._skipped_count = 0
-    # mock redis_queue 的所有外部调用
-    monkeypatch.setattr(
-        "database.redis_queue.delete", AsyncMock(return_value=True), raising=True
-    )
-    monkeypatch.setattr(
-        "database.redis_queue.push_dead", AsyncMock(return_value=True), raising=True
-    )
-    monkeypatch.setattr(
-        "database.redis_queue.ack", AsyncMock(return_value=1), raising=True
-    )
+    # mock redis_queue
+    monkeypatch.setattr("database.redis_queue.delete", AsyncMock(return_value=True), raising=True)
+    monkeypatch.setattr("database.redis_queue.push_dead", AsyncMock(return_value=True), raising=True)
+    monkeypatch.setattr("database.redis_queue.ack", AsyncMock(return_value=1), raising=True)
     return instance
 
 
 class TestDBWriterProcessMessage:
     """DBWriter._process_message 单元测试。
 
-    R33: 包含幂等检查 → SQLite 写 → writer_inbox 写 → DEL 缓存 → XACK 确认。
+    R34: 包含幂等检查 → 原子事务(begin → INSERT inbox → _execute_sqlite → commit)
+    → DEL 缓存 → XACK 确认。
     """
 
     @pytest.mark.asyncio
     async def test_process_message_success(self, writer):
-        """成功处理消息:_execute_sqlite 被调用,计数+1,XACK 确认。
-        R33: 写入 writer_inbox + XACK。
+        """成功处理消息:_execute_sqlite 被调用,事务 begin/commit 被调用,
+        计数+1,XACK 确认。
         """
         msg = _make_msg()
         writer._execute_sqlite = AsyncMock(return_value=None)
@@ -109,9 +115,13 @@ class TestDBWriterProcessMessage:
         assert passed_msg.stream_id == "1700000000-0"
         assert writer._processed_count == 1
         assert writer._error_count == 0
-        # R33: writer_inbox 被写入
-        writer._store.write_writer_inbox.assert_awaited_once()
-        # R33: XACK 被调用
+        # R34: 事务方法被调用
+        writer._store.begin_writer_tx.assert_awaited_once()
+        writer._store.commit_writer_tx.assert_awaited_once()
+        writer._store.rollback_writer_tx.assert_not_awaited()
+        # R34: inbox INSERT 通过 _db.execute 执行
+        writer._store._db.execute.assert_awaited_once()
+        # XACK 被调用
         from database import redis_queue
         redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
 
@@ -139,7 +149,7 @@ class TestDBWriterProcessMessage:
 
     @pytest.mark.asyncio
     async def test_process_message_failure_to_dead_queue(self, writer):
-        """处理失败(非 TypeError)→ 消息转入死信队列 + XACK(移出 pending)。"""
+        """处理失败(非 TypeError)→ ROLLBACK → 消息转入死信队列 + XACK(移出 pending)。"""
         msg = _make_msg()
         writer._execute_sqlite = AsyncMock(side_effect=RuntimeError("db error"))
 
@@ -147,35 +157,49 @@ class TestDBWriterProcessMessage:
 
         assert writer._error_count == 1
         assert writer._processed_count == 0
+        # R34: 失败时事务回滚
+        writer._store.rollback_writer_tx.assert_awaited_once()
+        # commit 未被调用(因为业务写失败)
+        writer._store.commit_writer_tx.assert_not_awaited()
         from database import redis_queue
         redis_queue.push_dead.assert_awaited_once()
         args, kwargs = redis_queue.push_dead.call_args
         assert args[0] == msg
         assert "RuntimeError" in kwargs.get("reason", "")
-        # R33: 失败也 XACK(已入死信,不需要原地重处理)
+        # R34 P0-2: push_dead 返回 True 时 XACK(已入死信,不需要原地重处理)
         redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
 
     @pytest.mark.asyncio
     async def test_process_message_typeerror_to_dead_queue(self, writer):
-        """TypeError(方法签名不匹配)→ 永久失败,入死信队列 + XACK。"""
+        """R34: 不在白名单的方法名 → ValueError(不是 TypeError)→ 入死信队列 + XACK。"""
         msg = _make_msg(method_name="bad_method", data={"wrong_param": 1})
-        writer._execute_sqlite = AsyncMock(side_effect=TypeError("unexpected keyword argument"))
+        # _execute_sqlite 不应被调用(白名单校验在 _execute_atomic 开头)
+        writer._execute_sqlite = AsyncMock(return_value=None)
 
         await writer._process_message(msg)
 
         assert writer._error_count == 1
+        # 白名单校验失败,_execute_sqlite 不应被调用
+        writer._execute_sqlite.assert_not_awaited()
+        # 事务也不应被启动(白名单校验在 begin_writer_tx 之前)
+        writer._store.begin_writer_tx.assert_not_awaited()
         from database import redis_queue
         redis_queue.push_dead.assert_awaited_once()
         args, kwargs = redis_queue.push_dead.call_args
-        assert "TypeError" in kwargs.get("reason", "")
-        # TypeError 用 attempts=99(永久失败,不重试)
-        assert kwargs.get("attempts") == 99
-        # XACK 移出 pending
+        reason = kwargs.get("reason", "")
+        # 验证 reason 包含 "ValueError" 或 "未授权"
+        assert "ValueError" in reason or "未授权" in reason, (
+            f"reason 应包含 ValueError 或 未授权,实际: {reason}"
+        )
+        # XACK 移出 pending(push_dead 返回 True)
         redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
 
     @pytest.mark.asyncio
     async def test_process_message_non_dict_to_dead_queue(self, writer):
-        """非 dict 消息 → 直接入死信队列,不调用 _execute_sqlite。"""
+        """非 dict 消息 → 直接入死信队列,不调用 _execute_sqlite。
+
+        R34 修复: 非 dict 消息没有 stream_id 信息,不调用 msg.get()。
+        """
         writer._execute_sqlite = AsyncMock(return_value=None)
 
         for bad_msg in ["not_a_dict", None, [1, 2, 3], 42]:
@@ -186,12 +210,18 @@ class TestDBWriterProcessMessage:
         writer._execute_sqlite.assert_not_awaited()
         from database import redis_queue
         assert redis_queue.push_dead.await_count == 4
+        # R34 修复后: 非 dict 消息不调用 XACK(没有 stream_id 信息)
+        redis_queue.ack.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_process_message_failure_continues(self, writer):
-        """单条失败不影响后续消息处理(失败+成功)。"""
-        msg_bad = _make_msg(method_name="bad", message_id="bad-1")
-        msg_good = _make_msg(method_name="good", message_id="good-1")
+        """单条失败不影响后续消息处理(失败+成功)。
+
+        R34: 使用白名单内的方法名(write_heartbeat),第一条失败(RuntimeError),
+        第二条成功。
+        """
+        msg_bad = _make_msg(method_name="write_heartbeat", message_id="bad-1")
+        msg_good = _make_msg(method_name="write_heartbeat", message_id="good-1")
         writer._execute_sqlite = AsyncMock(side_effect=[RuntimeError("fail"), None])
 
         await writer._process_message(msg_bad)
@@ -203,14 +233,15 @@ class TestDBWriterProcessMessage:
 
 
 class TestDBWriterIdempotency:
-    """R33 P1-2: writer_inbox 幂等性测试。
+    """R33/R34: writer_inbox 幂等性测试。
 
     场景:消息处理成功后 XACK 前崩溃 → XAUTOCLAIM 回收 → inbox 检查命中跳过。
+    R34: inbox 在事务内 INSERT,冲突时(rowcount==0)抛 _InboxConflict → XACK 跳过。
     """
 
     @pytest.mark.asyncio
     async def test_idempotent_skip_already_processed(self, writer):
-        """已处理的消息(inbox命中)直接 XACK 跳过,不重复执行。"""
+        """已处理的消息(inbox 命中)直接 XACK 跳过,不重复执行。"""
         msg = _make_msg(message_id="already-done-001")
         # inbox 检查返回 True(已处理)
         writer._store.check_writer_inbox = AsyncMock(return_value=True)
@@ -220,6 +251,8 @@ class TestDBWriterIdempotency:
 
         # 不执行 SQLite 写
         writer._execute_sqlite.assert_not_awaited()
+        # 不启动 Writer 事务(在事务前就跳过)
+        writer._store.begin_writer_tx.assert_not_awaited()
         # _skipped_count +1
         assert writer._skipped_count == 1
         assert writer._processed_count == 0
@@ -229,34 +262,86 @@ class TestDBWriterIdempotency:
 
     @pytest.mark.asyncio
     async def test_idempotent_skip_no_message_id(self, writer):
-        """无 message_id 的消息:不进行幂等检查,正常处理(向后兼容)。"""
+        """R34: 缺少 message_id 的消息被安全送入 DLQ(不再执行)。"""
         msg = _make_msg(message_id="")
         writer._execute_sqlite = AsyncMock(return_value=None)
 
         await writer._process_message(msg)
 
-        writer._execute_sqlite.assert_awaited_once()
-        assert writer._processed_count == 1
-        assert writer._skipped_count == 0
+        # 不执行业务写
+        writer._execute_sqlite.assert_not_awaited()
+        # 不启动 Writer 事务
+        writer._store.begin_writer_tx.assert_not_awaited()
+        # _error_count +1(无效消息)
+        assert writer._error_count == 1
+        assert writer._processed_count == 0
+        # push_dead 被调用,reason="missing message_id"
+        from database import redis_queue
+        redis_queue.push_dead.assert_awaited_once()
+        args, kwargs = redis_queue.push_dead.call_args
+        assert kwargs.get("reason") == "missing message_id"
+        # XACK 被调用(push_dead 返回 True,且 stream_id 非空)
+        redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
 
     @pytest.mark.asyncio
     async def test_idempotent_inbox_write_failure_continues(self, writer):
-        """writer_inbox 写入失败:不影响已写入的数据,仍 XACK。"""
+        """R34: inbox 在事务内写入,如果 INSERT 失败 → ROLLBACK → 入死信。"""
         msg = _make_msg()
         writer._execute_sqlite = AsyncMock(return_value=None)
-        writer._store.write_writer_inbox = AsyncMock(side_effect=Exception("inbox write fail"))
+        # 模拟 _db.execute(inbox INSERT) 抛异常
+        writer._store._db.execute = AsyncMock(side_effect=Exception("inbox insert fail"))
 
         await writer._process_message(msg)
 
-        # 数据已写入
-        assert writer._processed_count == 1
-        # inbox 写入失败但仍 XACK(数据已落盘)
+        # 业务写不应被调用(inbox INSERT 在业务写之前失败)
+        writer._execute_sqlite.assert_not_awaited()
+        # 事务回滚
+        writer._store.rollback_writer_tx.assert_awaited_once()
+        # commit 未被调用
+        writer._store.commit_writer_tx.assert_not_awaited()
+        # 入死信
         from database import redis_queue
+        redis_queue.push_dead.assert_awaited_once()
+        args, kwargs = redis_queue.push_dead.call_args
+        assert "inbox insert fail" in kwargs.get("reason", "") or "Exception" in kwargs.get("reason", "")
+        # XACK 被调用(push_dead 返回 True)
+        redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
+        # _error_count +1
+        assert writer._error_count == 1
+        assert writer._processed_count == 0
+
+    @pytest.mark.asyncio
+    async def test_inbox_conflict_skip(self, writer):
+        """R34 新增: cursor.rowcount == 0 → _InboxConflict → XACK 跳过,
+        _execute_sqlite 不被调用,_skipped_count == 1。
+        """
+        msg = _make_msg(message_id="conflict-001")
+        # mock cursor.rowcount == 0 表示 INSERT OR IGNORE 命中冲突(已处理)
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        writer._store._db.execute = AsyncMock(return_value=mock_cursor)
+        writer._execute_sqlite = AsyncMock(return_value=None)
+
+        await writer._process_message(msg)
+
+        # 业务写不应被调用(inbox 冲突)
+        writer._execute_sqlite.assert_not_awaited()
+        # 事务回滚(冲突时需要 ROLLBACK)
+        writer._store.rollback_writer_tx.assert_awaited_once()
+        # commit 未被调用
+        writer._store.commit_writer_tx.assert_not_awaited()
+        # _skipped_count +1
+        assert writer._skipped_count == 1
+        assert writer._processed_count == 0
+        # 不入死信(冲突是幂等跳过,不是错误)
+        from database import redis_queue
+        redis_queue.push_dead.assert_not_awaited()
+        # XACK 被调用(消息从 pending 移除)
         redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
 
 
 class TestDBWriterCrashRecovery:
-    """R33 P0/P1-4: 故障注入测试 — 崩溃恢复场景。
+    """R33/R34: 故障注入测试 — 崩溃恢复场景。
 
     模拟 SIGKILL 崩溃后重启,验证:
     1. 消息留在 pending(Streams 特性,不丢失)
@@ -264,26 +349,24 @@ class TestDBWriterCrashRecovery:
     3. inbox 检查命中,已处理的消息 XACK 跳过(exactly-once)
     4. 未处理的消息正常执行
     """
-
     @pytest.mark.asyncio
     async def test_crash_after_sqlite_before_xack(self, writer):
-        """模拟:SQLite 写成功 + inbox 写成功 → XACK 前崩溃。
+        """模拟:SQLite 写成功 + inbox 写成功(事务 COMMIT) → XACK 前崩溃。
 
-        恢复后 XAUTOCLAIM 回收该消息,inbox 命中 → XACK 跳过(不重复执行)。
+        恢复后 XAUTOCLAIM 回收该消息,inbox 检查命中 → XACK 跳过(不重复执行)。
         """
         msg = _make_msg(message_id="crash-test-001")
-        # 第一次处理:SQLite 写成功 + inbox 写成功
+        # 第一次处理:SQLite 写成功 + 事务 COMMIT 成功
         writer._execute_sqlite = AsyncMock(return_value=None)
-        # 模拟 XACK 前崩溃:ack 抛异常
+        # 模拟 XACK 前崩溃:ack 抛异常(但 _safe_ack 会捕获,不传播)
         from database import redis_queue
-        original_ack = redis_queue.ack
         redis_queue.ack = AsyncMock(side_effect=Exception("process killed before ack"))
 
         await writer._process_message(msg)
-        # 数据已写入
+        # 数据已写入(事务已 COMMIT)
         assert writer._processed_count == 1
-        # inbox 也已写入
-        writer._store.write_writer_inbox.assert_awaited_once()
+        # R34: 事务已提交
+        writer._store.commit_writer_tx.assert_awaited_once()
 
         # 恢复后:XAUTOCLAIM 回收该消息
         # 重新处理时 inbox 检查应返回 True
@@ -304,38 +387,32 @@ class TestDBWriterCrashRecovery:
 
     @pytest.mark.asyncio
     async def test_crash_before_inbox_write(self, writer):
-        """模拟:SQLite 写成功 → inbox 写入前崩溃。
+        """R34 重写: inbox 在业务写之前写入(同一事务)。
 
-        恢复后 XAUTOCLAIM 回收,inbox 检查不命中 → 重新执行 SQLite
-        (upsert 是幂等的,重复执行不产生副作用)。
+        模拟: begin_writer_tx 成功但 _db.execute(inbox INSERT) 抛异常
+        → ROLLBACK → 入死信。
         """
         msg = _make_msg(message_id="crash-test-002")
-        # 第一次:SQLite 写成功,但 inbox 写入前崩溃(模拟 write_writer_inbox 抛异常)
+        # 模拟 inbox INSERT 失败
+        writer._store._db.execute = AsyncMock(side_effect=Exception("crashed before inbox write"))
         writer._execute_sqlite = AsyncMock(return_value=None)
-        writer._store.write_writer_inbox = AsyncMock(
-            side_effect=Exception("crashed before inbox write")
-        )
-        from database import redis_queue
-        # ack 不被调用(因为 inbox 写入异常会继续到 XACK,但这里我们模拟整个进程崩溃)
-        # 实际上 _process_message 会继续执行到 XACK,所以我们直接模拟进程崩溃:
-        # 让 write_writer_inbox 抛 SystemExit 模拟 SIGKILL
-        # 但 _process_message 捕获的是 Exception,不是 BaseException,所以 SystemExit 会传播
-        # 这里我们简化:直接验证恢复逻辑
-
-        # 恢复后:inbox 检查不命中(因为上次没写入)
-        writer._store.write_writer_inbox = AsyncMock(return_value=None)
-        writer._store.check_writer_inbox = AsyncMock(return_value=False)
-        writer._processed_count = 0
 
         await writer._process_message(msg)
 
-        # 重新执行 SQLite(upsert 幂等,重复执行无害)
-        writer._execute_sqlite.assert_awaited_once()
-        assert writer._processed_count == 1
-        # inbox 写入成功
-        writer._store.write_writer_inbox.assert_awaited_once()
-        # XACK 确认
+        # 业务写不应被调用(inbox INSERT 在业务写之前失败)
+        writer._execute_sqlite.assert_not_awaited()
+        # 事务已回滚
+        writer._store.rollback_writer_tx.assert_awaited_once()
+        # commit 未被调用
+        writer._store.commit_writer_tx.assert_not_awaited()
+        # 入死信
+        from database import redis_queue
+        redis_queue.push_dead.assert_awaited_once()
+        # XACK 被调用(push_dead 返回 True)
         redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
+        # _error_count +1
+        assert writer._error_count == 1
+        assert writer._processed_count == 0
 
     @pytest.mark.asyncio
     async def test_message_stays_in_pending_on_crash(self, mock_redis, monkeypatch):
@@ -427,7 +504,9 @@ class TestDBWriterStop:
     @pytest.mark.asyncio
     async def test_process_message_del_failure_no_dead_queue(self, writer):
         """P0回归: SQLite 写成功后 DEL 失败 → 仅记录 WARNING,不入死信队列。
-        R33: 仍执行 XACK(数据已落盘,DEL 失败只是缓存未清除,下次读会回填)。
+
+        R34: 事务已 COMMIT,DEL 失败只是缓存未清除,不影响已落盘数据。
+        R34: 仍执行 XACK(数据已落盘,下次读会回填)。
         """
         msg = _make_msg(redis_key="cache:user_quota:42")
         writer._execute_sqlite = AsyncMock(return_value=None)
@@ -445,14 +524,16 @@ class TestDBWriterStop:
         assert writer._processed_count == 1
         # DEL 失败 → error_count 不增加
         assert writer._error_count == 0
+        # 事务已 COMMIT
+        writer._store.commit_writer_tx.assert_awaited_once()
         # 不入死信队列(避免重放时重复写入)
         redis_queue.push_dead.assert_not_awaited()
-        # R33: 仍 XACK(数据已落盘)
+        # R34: 仍 XACK(数据已落盘)
         redis_queue.ack.assert_awaited_once_with(["1700000000-0"])
 
     @pytest.mark.asyncio
     async def test_xack_failure_does_not_rollback_sqlite(self, writer):
-        """R33 P0: XACK 失败不回滚 SQLite(数据已落盘)。
+        """R33/R34 P0: XACK 失败不回滚 SQLite(数据已落盘)。
 
         XACK 失败时消息留在 pending,下次 XAUTOCLAIM 回收后
         inbox 检查命中 → XACK 跳过(不会重复执行)。
@@ -466,8 +547,9 @@ class TestDBWriterStop:
 
         # SQLite 写成功(不回滚)
         assert writer._processed_count == 1
-        # inbox 也写入成功
-        writer._store.write_writer_inbox.assert_awaited_once()
+        # R34: 事务已 COMMIT(不回滚)
+        writer._store.commit_writer_tx.assert_awaited_once()
+        writer._store.rollback_writer_tx.assert_not_awaited()
         # 消息留在 pending(下次回收处理)
 
 
