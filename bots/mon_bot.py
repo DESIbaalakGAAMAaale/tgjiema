@@ -336,7 +336,12 @@ class MonBot:
                 from database import redis_queue
                 # R33: pending 数(未 ACK 的消息,反映 db_writer 处理进度)
                 pending_info = await redis_queue.get_pending_info()
-                writer_queue_len = pending_info.get("total", 0)
+                # R34 P1-4: get_pending_info() 返回 {} 表示 Redis 不可达,
+                # 必须显式区分 None/-1 与真实 0,否则不可达会被误判为 "0 pending"
+                # 导致下方 writer_queue_len == -1 分支不触发,Redis 故障静默。
+                if pending_info:
+                    writer_queue_len = pending_info.get("total", 0)
+                # 否则保持 writer_queue_len = -1(Redis 不可达)
                 # R33: 死信队列长度(反映失败消息积压)
                 dlq_len = await redis_queue.get_dlq_length()
             except Exception as e:

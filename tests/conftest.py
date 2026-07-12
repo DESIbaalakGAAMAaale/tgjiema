@@ -136,6 +136,16 @@ def _ensure_tested_modules_importable() -> None:
     except Exception:
         pass  # db_writer 加载失败时,importorskip 会优雅跳过
 
+    # R34 P1-1: 加载 dlq_worker(redis_queue 已就绪)
+    try:
+        spec = importlib.util.spec_from_file_location("database.dlq_worker", db_dir / "dlq_worker.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["database.dlq_worker"] = module
+        spec.loader.exec_module(module)
+        setattr(db_pkg, "dlq_worker", module)
+    except Exception:
+        pass  # dlq_worker 加载失败时,importorskip 会优雅跳过
+
 
 # 收集阶段即注入(早于任何 test 模块 import 被测代码)
 _install_fake_config()
@@ -195,6 +205,9 @@ def mock_redis():
     client.xpending = AsyncMock(return_value=(0, None, None, []))
     # R33: Stream 长度(XLEN)
     client.xlen = AsyncMock(return_value=0)
+    # R34 P1-1: 死信队列读取(XRANGE)与删除(XDEL)
+    client.xrange = AsyncMock(return_value=[])
+    client.xdel = AsyncMock(return_value=1)
     # 通用 key 操作(读缓存 DEL/GET/SETEX)
     client.delete = AsyncMock(return_value=1)
     client.get = AsyncMock(return_value=None)      # 默认缓存未命中

@@ -232,30 +232,49 @@ split_env_per_service() {
     # 注意: 非敏感配置放这里(REDIS_URL, 配额, 限流参数等)
     local shared_vars_pattern="^(REDIS_URL|WRITER_|CRDB_POOL_|CACHE_|RATE_LIMIT_|ROTATION_|DATA_RETENTION|CRDB_CLEANUP|CHANNEL_FAILURE|RESTART_|TOPOLOGY_|FREE_|BASIC_|PREMIUM_|FILE_CODE_PREFIX|DEFAULT_|PENDING_|SEND_|PAGE_|MEDIA_GROUP|EXTERNAL_|CACHE_STORE_|MAX_RESTART|MON_CHECK_INTERVAL|QUOTA_SYNC_|RELAY_WEIGHT|RELAY_NORM|RELAY_SAFE_POOL|ACCOUNT_|R100_CHANNEL|UPLOAD_BOT_USERNAME|DECODER_BOT_USERNAME|SENDER_BOT_USERNAME|FORCE_JOIN_|LOG_LEVEL|DB_BACKUP_INTERVAL_MINUTES)="
 
-    # 生成 .env.shared(共享配置)
+    # R34 P1-2: 生成 .env.shared(共享配置) — > 重定向即使 grep 无匹配也会创建空文件,
+    # 但需校验非空(REDIS_URL, WRITER_* 等共享配置缺失会导致服务启动失败)
     grep -E "$shared_vars_pattern" "$env_file" 2>/dev/null > "$DEPLOY_DIR/.env.shared" || true
+    if [[ ! -s "$DEPLOY_DIR/.env.shared" ]]; then
+        warn "R34: .env.shared 为空,无法从 .env 提取共享配置(REDIS_URL, WRITER_* 等)"
+        warn "  请检查 .env 是否包含 REDIS_URL=... 等共享变量,否则服务可能无法启动"
+    fi
     chmod 600 "$DEPLOY_DIR/.env.shared"
 
     # 为每个服务生成 .env.secrets.<service>
+    # R34 P1-2: 不再静默回退到完整 .env;对需要 secrets 的服务做非空校验
+    local missing_secrets=()
     for svc in "${!SERVICE_SECRETS[@]}"; do
         local secrets_file="$DEPLOY_DIR/.env.secrets.${svc}"
         local var_list="${SERVICE_SECRETS[$svc]}"
-        : > "$secrets_file"  # 清空/创建文件
+        : > "$secrets_file"  # 清空/创建文件(即使无 secrets 也创建空文件,chmod 600)
         if [[ -n "$var_list" ]]; then
             IFS=',' read -ra vars <<< "$var_list"
             for var in "${vars[@]}"; do
                 # 从主 .env 中提取该变量(兼容行内注释)
                 grep -E "^${var}=" "$env_file" 2>/dev/null >> "$secrets_file" || true
             done
+            # R34 P1-2: 验证 secrets 文件非空(对需要 secrets 的服务)
+            if [[ ! -s "$secrets_file" ]]; then
+                warn "R34: .env.secrets.${svc} 为空,但该服务需要 secrets: ${var_list}"
+                warn "  请在 .env 中配置上述变量,否则 ${svc} 服务可能无法启动"
+                missing_secrets+=("$svc")
+            fi
         fi
         chmod 600 "$secrets_file"
     done
 
-    # 保留原 .env 文件作为备份(向后兼容 + 用户参考),但 systemd 不再直接加载
+    # 保留原 .env 文件作为备份和参考,systemd 不再直接加载完整 .env
     # 权限收紧: 仅所有者可读
     chmod 600 "$env_file"
+
+    if [[ ${#missing_secrets[@]} -gt 0 ]]; then
+        warn "R34: 以下服务的 secrets 文件为空(可能影响启动): ${missing_secrets[*]}"
+        warn "  请编辑 .env 补充缺失的变量后重新运行部署脚本"
+    fi
     success "secrets 隔离完成: .env.shared + .env.secrets.<service> (8 个服务)"
-    info "  原 .env 已保留作为备份和参考,systemd 单元不再直接加载完整 .env"
+    info "  R34 P1-2: systemd 单元不再加载完整 .env,实现真隔离"
+    info "  原 .env 已保留作为备份和参考,权限 600"
 }
 
 split_env_per_service
@@ -360,12 +379,13 @@ User=tgjiema
 WorkingDirectory=${DEPLOY_DIR}
 Environment="PYTHONUNBUFFERED=1"
 # R33 P1-5: 服务级 secrets 隔离(最小权限)
+# R34 P1-2: 真隔离 — 移除 EnvironmentFile=-.env 回退,防止各服务读取全部
+#           Token/CRDB/R2/管理员凭据(原隔离被第三行 .env 抵消)
 # 1. .env.shared: 共享配置(REDIS_URL, 配额, 限流参数等,所有服务可读)
 # 2. .env.secrets.${name}: 仅该服务需要的 secrets(Bot Token, R2 凭证等)
-# 3. .env: 向后兼容回退(若 split 未执行,加载完整 .env)
+# 若对应文件不存在,systemd 因 `-` 前缀不报错(由 split_env_per_service 自动生成)
 EnvironmentFile=-${DEPLOY_DIR}/.env.shared
 EnvironmentFile=-${DEPLOY_DIR}/.env.secrets.${name}
-EnvironmentFile=-${DEPLOY_DIR}/.env
 ExecStart=${DEPLOY_DIR}/venv/bin/python ${DEPLOY_DIR}/run_all.py --standalone ${name}
 Restart=${restart_type}
 RestartSec=${restart_sec}

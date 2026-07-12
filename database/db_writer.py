@@ -106,6 +106,8 @@ class DBWriter:
         self._error_count: int = 0
         self._skipped_count: int = 0  # R33: 幂等跳过计数
         self._dead_fail_count: int = 0  # R34: DLQ 写入失败计数
+        self._dlq_task: asyncio.Task | None = None  # R34 P1-1: DLQ Worker 协程
+        self._ack_count: int = 0  # R34 P1-3: ACK 计数,每 100 次触发 trim_stream
 
     async def init(self):
         """初始化 SQLite 连接 + Consumer Group。"""
@@ -132,11 +134,17 @@ class DBWriter:
         logger.info("[DBWriter] R34 原子事务模式已启用(业务写+inbox 同事务提交)")
 
     async def start(self):
-        """主消费循环:XREADGROUP 消费 Stream,串行写入 SQLite。"""
+        """主消费循环:XREADGROUP 消费 Stream,串行写入 SQLite。
+
+        R34 P1-1: 同时启动 DLQ Worker 协程,实现死信队列重试闭环。
+        """
         from config import settings
         batch_size = settings.WRITER_BATCH_SIZE
         self._running = True
         logger.info(f"[DBWriter] 消费循环启动,批量大小: {batch_size}")
+
+        # R34 P1-1: 启动 DLQ Worker 协程(死信队列重试闭环)
+        self._dlq_task = asyncio.create_task(self._run_dlq_worker())
 
         while self._running:
             try:
@@ -157,12 +165,54 @@ class DBWriter:
         logger.info("[DBWriter] 消费循环已停止")
 
     async def stop(self):
-        """优雅停止:设置 _running=False,等当前消息处理完。"""
+        """优雅停止:设置 _running=False,等当前消息处理完。
+
+        R34 P1-1: 取消 DLQ Worker 协程,等待其清理退出。
+        """
         self._running = False
+        # R34 P1-1: 取消 DLQ Worker 协程
+        if self._dlq_task is not None:
+            self._dlq_task.cancel()
+            try:
+                await self._dlq_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"[DBWriter] DLQ Worker 退出异常: {e}")
+            self._dlq_task = None
         logger.info(
             f"[DBWriter] 停止完成,已处理 {self._processed_count} 条消息,"
             f"失败 {self._error_count} 条,幂等跳过 {self._skipped_count} 条,"
             f"DLQ写入失败 {self._dead_fail_count} 条"
+        )
+
+    async def _run_dlq_worker(self):
+        """R34 P1-1: 运行 DLQ Worker 协程(死信队列重试闭环)。
+
+        每 30 秒扫描死信 Stream,将到期的可重试消息 XADD 回主 Stream。
+        异常不传播(捕获后等待 30 秒重试),仅 CancelledError 退出。
+        """
+        from database import dlq_worker
+        worker = dlq_worker.DLQWorker()
+        ok = await worker.init()
+        if not ok:
+            logger.warning("[DBWriter] DLQ Worker 初始化失败,死信重试闭环未启用")
+            return
+        logger.info("[DBWriter] DLQ Worker 协程已启动(30s 间隔扫描死信队列)")
+        while self._running:
+            try:
+                await worker._process_dead_messages()
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[DBWriter] DLQ Worker 异常: {e}")
+                await asyncio.sleep(30)
+        await worker.close()
+        logger.info(
+            f"[DBWriter] DLQ Worker 已停止,"
+            f"扫描 {worker.processed_count} 条,重试 {worker.retried_count} 条,"
+            f"永久失败 {worker.permanent_fail_count} 条"
         )
 
     async def close(self):
@@ -401,9 +451,25 @@ class DBWriter:
         await method(**data)
 
     async def _safe_ack(self, stream_id: str):
-        """安全 ACK:捕获异常并记录,不传播。"""
+        """安全 ACK:捕获异常并记录,不传播。
+
+        R34 P1-3: 每 100 条 ACK 后调用 trim_stream() 裁剪 Stream,
+        防止已 ACK 消息在 Stream 中无限堆积。
+        """
         try:
             await redis_queue.ack([stream_id])
+            # R34 P1-3: 每 100 条 ACK 触发一次 XTRIM,裁剪已消费的旧消息
+            self._ack_count += 1
+            if self._ack_count % 100 == 0:
+                try:
+                    trimmed = await redis_queue.trim_stream()
+                    if trimmed > 0:
+                        logger.debug(
+                            f"[DBWriter] Stream 裁剪 {trimmed} 条消息"
+                            f"(ack_count={self._ack_count})"
+                        )
+                except Exception as e:
+                    logger.debug(f"[DBWriter] trim_stream 异常(不影响主流程): {e}")
         except Exception as e:
             logger.warning(
                 f"[DBWriter] XACK 失败(消息留 pending,下次回收处理): "

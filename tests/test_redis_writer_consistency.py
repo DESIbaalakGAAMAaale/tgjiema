@@ -40,7 +40,7 @@ class TestConsistency:
         stream_store = []  # 模拟 Redis Stream 持久存储
         pending_store = []  # 模拟 pending 列表
 
-        async def fake_xadd(key, fields, id="*"):
+        async def fake_xadd(key, fields, id="*", maxlen=None, approximate=True):
             msg_id = f"1700000000-{len(stream_store)}"
             stream_store.append((msg_id, fields))
             return msg_id

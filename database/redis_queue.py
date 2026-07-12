@@ -33,6 +33,12 @@ from typing import Any, Optional
 
 from loguru import logger
 
+# R34 P1-5: fcntl 仅在 Unix/Linux 可用,Windows 跳过文件锁(VPS 部署目标为 Linux)
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None  # Windows 环境,跳过文件锁
+
 
 _redis_client: Any = None
 _redis_init_attempted: bool = False
@@ -175,6 +181,8 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
             settings.WRITER_STREAM_KEY,
             {"data": json.dumps(msg, default=str)},
             id="*",  # Redis 自动生成有序 ID
+            maxlen=settings.REDIS_STREAM_MAXLEN,  # R34 P1-3: 近似裁剪,防止 Stream 无限增长
+            approximate=True,  # 使用 ~ 模式,性能更好
         )
         return True
     except Exception as e:
@@ -329,6 +337,35 @@ async def ack(message_ids: list[str]) -> int:
         return 0
 
 
+async def trim_stream() -> int:
+    """裁剪 Stream(XTRIM MAXLEN ~)。
+
+    R34 P1-3: ACK 后 Stream 中的消息不会被自动删除,需定期 XTRIM 裁剪。
+    使用近似模式(~),Redis 保证至少保留 maxlen 条消息。
+    不会裁剪仍在 PEL 中的消息(通过 MAXLEN 而非 MINID)。
+
+    Returns:
+        被裁剪的消息数,Redis 不可达或配置 <=0 时返回 0
+    """
+    redis = await get_redis()
+    if not redis:
+        return 0
+    try:
+        from config import settings
+        maxlen = getattr(settings, "REDIS_STREAM_MAXLEN", 10000)
+        if maxlen <= 0:
+            return 0
+        trimmed = await redis.xtrim(
+            settings.WRITER_STREAM_KEY,
+            maxlen=maxlen,
+            approximate=True,
+        )
+        return trimmed
+    except Exception as e:
+        logger.debug(f"[RedisQueue] trim_stream 异常: {e}")
+        return 0
+
+
 async def delete(key: str) -> bool:
     """删除指定 key(Writer 写完 SQLite 后清除读缓存 key)。
 
@@ -393,15 +430,82 @@ async def push_dead(msg: dict, reason: str = "", message_id: str = "",
             "data", "dead_letter.jsonl"
         )
         os.makedirs(os.path.dirname(dead_file), exist_ok=True)
-        # P1修复: 文件锁避免并发写入冲突,权限 0600 保护敏感数据
-        with open(dead_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(dead_msg, default=str, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())  # P1修复: 确保数据落盘
+        # R34 P1-5: 使用文件锁避免并发写入冲突,权限 0600 保护敏感数据
+        # os.open() 可直接设置文件权限为 0600(open() 受 umask 影响)
+        line = json.dumps(dead_msg, default=str, ensure_ascii=False) + "\n"
+        fd = os.open(dead_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            if _fcntl is not None:
+                # 获取排他锁(Linux/Mac); Windows 跳过
+                _fcntl.flock(fd, _fcntl.LOCK_EX)
+            os.write(fd, line.encode('utf-8'))
+            os.fsync(fd)  # 确保数据落盘
+        finally:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            os.close(fd)
         logger.warning(f"[RedisQueue] 死信已写入本地文件: {dead_file}")
         return True
     except Exception as e:
         logger.error(f"[RedisQueue] push_dead 本地文件也失败(消息已丢失): {e}")
+        return False
+
+
+async def get_dead_messages(count: int = 100) -> list[tuple[str, dict]]:
+    """读取死信队列消息(XRANGE)。
+
+    R34 P1-1: 供 DLQ Worker 消费死信 Stream,实现重试闭环。
+
+    Args:
+        count: 最多读取的消息数(默认 100)
+
+    Returns:
+        [(msg_id, dead_msg_dict), ...] — 死信消息列表。
+        Redis 不可达或解析失败时返回空列表。
+    """
+    redis = await get_redis()
+    if not redis:
+        return []
+    try:
+        from config import settings
+        result = await redis.xrange(
+            settings.WRITER_DEAD_STREAM_KEY,
+            count=count,
+        )
+        messages = []
+        for msg_id, fields in result:
+            raw = fields.get("data", "")
+            try:
+                dead_msg = json.loads(raw)
+                messages.append((msg_id, dead_msg))
+            except (json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"[RedisQueue] 死信消息 JSON 解析失败: {e}, raw={raw!r}")
+        return messages
+    except Exception as e:
+        logger.debug(f"[RedisQueue] get_dead_messages 异常: {e}")
+        return []
+
+
+async def delete_dead_message(msg_id: str) -> bool:
+    """从死信队列删除消息(XDEL)。
+
+    R34 P1-1: DLQ Worker 重试成功后调用,从死信 Stream 移除已重试的消息。
+
+    Args:
+        msg_id: 死信 Stream 消息 ID
+
+    Returns:
+        True 删除成功, False 失败(Redis 不可达或 msg_id 为空)
+    """
+    redis = await get_redis()
+    if not redis or not msg_id:
+        return False
+    try:
+        from config import settings
+        await redis.xdel(settings.WRITER_DEAD_STREAM_KEY, msg_id)
+        return True
+    except Exception as e:
+        logger.debug(f"[RedisQueue] delete_dead_message 异常: {e}")
         return False
 
 
