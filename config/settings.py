@@ -107,17 +107,24 @@ class Settings(BaseSettings):
     REDIS_URL: str = ""
     REDIS_STREAM_MAXLEN: int = 10000  # Stream 最大长度,防止无限增长
 
-    # ─── 方案B: Redis + Writer 进程(消除 SQLite 锁冲突)───
-    # WRITER_MODE=redis: 写操作入 Redis Queue,db_writer 进程串行落盘 SQLite
+    # ─── 方案B v2: Redis Streams + Writer 进程(消除 SQLite 锁冲突,零数据丢失)───
+    # WRITER_MODE=redis: 写操作入 Redis Stream,db_writer 进程串行落盘 SQLite
     # WRITER_MODE=sqlite: 降级模式,直写 SQLite(旧逻辑,兼容本地开发)
+    # R33修复: 从 Redis List BRPOP 改为 Streams XREADGROUP,实现可靠消费
     WRITER_MODE: str = "redis"
-    # Writer 队列 key(Redis List),所有写操作 LPUSH 到此 key
-    WRITER_QUEUE_KEY: str = "tgjiema:writer:queue"
-    # Writer 单次 BRPOP 批量大小(一次取多条消息减少往返)
+    # R33: Stream key(替代 List key,支持 Consumer Group)
+    WRITER_STREAM_KEY: str = "tgjiema:writer:stream"
+    # R33: Consumer Group 名(db_writer 通过此 group 消费 Stream)
+    WRITER_CONSUMER_GROUP: str = "tgjiema-writer-group"
+    # R33: Consumer 名(区分不同 db_writer 实例)
+    WRITER_CONSUMER_NAME: str = "db_writer"
+    # R33: pending 消息回收阈值(ms),超过此时间的 pending 消息会被 XAUTOCLAIM 回收
+    WRITER_RECLAIM_IDLE_MS: int = 30000
+    # Writer 单次 XREADGROUP 批量大小(一次取多条消息减少往返)
     WRITER_BATCH_SIZE: int = 10
-    # Writer 队列积压告警阈值(mon_bot 监控)
+    # Writer 队列积压告警阈值(mon_bot 监控 pending 数)
     WRITER_QUEUE_ALERT_THRESHOLD: int = 1000
-    # 读缓存 TTL(秒),按数据类型分级(P2修复: 替代硬编码)
+    # 读缓存 TTL(秒),按数据类型分级
     WRITER_CACHE_TTL_QUOTA: int = 5        # 用户配额(高频变更,短TTL)
     WRITER_CACHE_TTL_FILE_RECORD: int = 30 # 文件记录(中频变更)
     WRITER_CACHE_TTL_CODE: int = 30        # 验证码(中频变更)
@@ -125,9 +132,13 @@ class Settings(BaseSettings):
     WRITER_CACHE_TTL_CELLS: int = 10       # 全量cells(中频变更)
     WRITER_CACHE_TTL_BOT_HB: int = 5       # Bot心跳(高频变更,短TTL)
     WRITER_CACHE_TTL_KV: int = 60          # KV存储(低频变更,长TTL)
-    # 死信队列 key(P0修复: 处理失败的消息转入此队列,避免永久丢失)
-    WRITER_DEAD_QUEUE_KEY: str = "tgjiema:writer:dead"
-    # db_writer systemd 服务名(P1修复: mon_bot 监控用,可配置以支持不同部署前缀)
+    # R33: 死信队列 Stream key(替代 List,支持重试闭环)
+    WRITER_DEAD_STREAM_KEY: str = "tgjiema:writer:dead"
+    # R33: 死信最大重试次数(超过后永久死信,需人工排查)
+    WRITER_DEAD_MAX_ATTEMPTS: int = 3
+    # R33: 死信重试延迟(秒,失败后延迟 XADD 回主队列)
+    WRITER_DEAD_RETRY_DELAY: int = 60
+    # db_writer systemd 服务名(mon_bot 监控用,可配置以支持不同部署前缀)
     DB_WRITER_SERVICE_NAME: str = "tgjiema-db_writer"
 
     # ─── 配额同步间隔 ──────────────────────────────────────────

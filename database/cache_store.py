@@ -403,6 +403,17 @@ class CacheStore:
                 crdb_synced          INTEGER DEFAULT 1
             )"""
         )
+        # R33: Writer 幂等表 — 每条消息的 message_id 记录在此表,
+        # db_writer 崩溃恢复后通过此表跳过已处理的消息,实现 exactly-once
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS writer_inbox (
+                message_id   TEXT PRIMARY KEY,
+                method_name  TEXT NOT NULL,
+                stream_id    TEXT,
+                created_at   REAL NOT NULL,
+                processed_at REAL NOT NULL
+            )"""
+        )
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -442,6 +453,61 @@ class CacheStore:
             except (json.JSONDecodeError, TypeError):
                 pass
         return result
+
+    # ─── R33: Writer 幂等表方法 ───
+
+    async def check_writer_inbox(self, message_id: str) -> bool:
+        """检查消息是否已处理(幂等检查)。
+
+        R33 P1修复: db_writer 处理消息前检查此表,已存在则 XACK 跳过。
+        """
+        if not self._db or not message_id:
+            return False
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT 1 FROM writer_inbox WHERE message_id = ?",
+                (message_id,)
+            )
+            return len(rows) > 0
+        except Exception as e:
+            logger.warning(f"[CacheStore] check_writer_inbox 异常: {e}")
+            return False
+
+    async def write_writer_inbox(self, message_id: str, method_name: str,
+                                  stream_id: str = "") -> None:
+        """记录已处理的消息(幂等键写入)。
+
+        R33 P1修复: SQLite 写成功后调用,记录 message_id 用于去重。
+        使用 INSERT OR IGNORE 避免重复插入。
+        """
+        if not self._db or not message_id:
+            return
+        now = time.time()
+        await self._db.execute(
+            "INSERT OR IGNORE INTO writer_inbox "
+            "(message_id, method_name, stream_id, created_at, processed_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (message_id, method_name, stream_id, now, now)
+        )
+        await self._db.commit()
+
+    async def cleanup_writer_inbox(self, before_ts: float) -> int:
+        """清理过期的 inbox 记录(保留最近 N 天)。
+
+        Args:
+            before_ts: 删除 created_at < before_ts 的记录
+
+        Returns:
+            删除的记录数
+        """
+        if not self._db:
+            return 0
+        cursor = await self._db.execute(
+            "DELETE FROM writer_inbox WHERE created_at < ?",
+            (before_ts,)
+        )
+        await self._db.commit()
+        return cursor.rowcount if cursor else 0
 
     async def get(self, key: str) -> Optional[dict]:
         """单条读取：从 SQLite 缓存中读取指定 key 的数据"""

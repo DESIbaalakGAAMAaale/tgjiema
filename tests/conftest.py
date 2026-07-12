@@ -10,6 +10,9 @@
 3. 提供 ``mock_settings`` / ``mock_redis`` 共享 fixture。
 4. 异步用例统一用 ``@pytest.mark.asyncio`` 装饰(兼容 pytest-asyncio strict 模式,
    无需依赖 asyncio_mode=auto)。
+
+R33 修复: mock 配置从 Redis List (BRPOP/LPOP) 改为 Streams
+   (XADD/XREADGROUP/XACK/XAUTOCLAIM/XPENDING/XLEN/XGROUP CREATE)。
 """
 import importlib.util
 import sys
@@ -23,16 +26,27 @@ import pytest
 def _install_fake_config() -> None:
     """注入模拟 config 模块(覆盖可能存在的真实 config,确保测试隔离)。
 
-    被测代码仅读取 REDIS_URL / WRITER_MODE / WRITER_QUEUE_KEY 等少量属性,
+    被测代码仅读取 REDIS_URL / WRITER_MODE / WRITER_STREAM_KEY 等少量属性,
     其它属性即便未被显式设置,MagicMock 也不会影响这些用例。
+
+    R33: 配置从 List 改为 Streams(Consumer Group / XAUTOCLAIM / 死信重试)。
     """
     settings = MagicMock(name="test_settings")
     # 与 config/settings.py 默认值保持一致
     settings.REDIS_URL = ""                  # 默认空 → 降级模式;用例按需覆盖为非空启用 Redis
     settings.WRITER_MODE = "redis"
-    settings.WRITER_QUEUE_KEY = "tgjiema:writer:queue"
+    # R33: Stream 配置(替代 List)
+    settings.WRITER_STREAM_KEY = "tgjiema:writer:stream"
+    settings.WRITER_CONSUMER_GROUP = "tgjiema-writer-group"
+    settings.WRITER_CONSUMER_NAME = "db_writer"
+    settings.WRITER_RECLAIM_IDLE_MS = 30000
     settings.WRITER_BATCH_SIZE = 10
     settings.WRITER_QUEUE_ALERT_THRESHOLD = 1000
+    # R33: 死信队列配置
+    settings.WRITER_DEAD_STREAM_KEY = "tgjiema:writer:dead"
+    settings.WRITER_DEAD_MAX_ATTEMPTS = 3
+    settings.WRITER_DEAD_RETRY_DELAY = 60
+    settings.DB_WRITER_SERVICE_NAME = "tgjiema-db_writer"
     # P2修复: 分级 TTL 配置
     settings.WRITER_CACHE_TTL_QUOTA = 5
     settings.WRITER_CACHE_TTL_FILE_RECORD = 30
@@ -41,7 +55,6 @@ def _install_fake_config() -> None:
     settings.WRITER_CACHE_TTL_CELLS = 10
     settings.WRITER_CACHE_TTL_BOT_HB = 5
     settings.WRITER_CACHE_TTL_KV = 60
-    settings.WRITER_DEAD_QUEUE_KEY = "tgjiema:writer:dead"
     settings.CRDB_POOL_MIN_SIZE = 1
     settings.CRDB_POOL_MAX_SIZE = 5
 
@@ -131,7 +144,11 @@ _ensure_tested_modules_importable()
 
 @pytest.fixture(autouse=True)
 def reset_redis_queue_state():
-    """每个用例前重置 redis_queue 模块全局缓存状态,避免上一个用例的连接缓存影响下一个。"""
+    """每个用例前重置 redis_queue 模块全局缓存状态,避免上一个用例的连接缓存影响下一个。
+
+    R33: 也重置 _consumer_group_ensured 标志,确保 ensure_consumer_group
+    在每个用例中都能被重新调用。
+    """
     import database.redis_queue as rq
     rq._redis_client = None
     rq._redis_available = False
@@ -139,6 +156,8 @@ def reset_redis_queue_state():
     rq._redis_last_attempt_ts = 0.0
     # P1修复: 重置 asyncio Lock,避免跨事件循环复用导致死锁
     rq._redis_init_lock = None
+    # R33: 重置 Consumer Group 已创建标志
+    rq._consumer_group_ensured = False
     yield
 
 
@@ -155,15 +174,29 @@ def mock_settings():
 
 @pytest.fixture
 def mock_redis():
-    """返回一个 AsyncMock 的 Redis 客户端,默认方法返回值贴合真实 redis.asyncio 语义。"""
+    """返回一个 AsyncMock 的 Redis 客户端,默认方法返回值贴合真实 redis.asyncio 语义。
+
+    R33: 从 List API (lpush/brpop/lpop/rpush/llen) 改为 Streams API
+         (xadd/xreadgroup/xack/xautoclaim/xpending/xlen/xgroup_create)。
+    """
     client = AsyncMock(name="mock_redis_client")
     client.ping = AsyncMock(return_value=True)
-    client.lpush = AsyncMock(return_value=1)
-    client.brpop = AsyncMock(return_value=None)    # 默认超时返回 None
-    client.rpush = AsyncMock(return_value=1)       # P0修复: 死信队列用
-    client.lpop = AsyncMock(return_value=None)    # P1修复: 批量弹出用
+    # R33: Stream 写入(XADD 返回消息 ID)
+    client.xadd = AsyncMock(return_value="1700000000000-0")
+    # R33: Consumer Group 消费(XREADGROUP 返回 [(stream, [(msg_id, fields), ...])])
+    client.xreadgroup = AsyncMock(return_value=[])
+    # R33: Consumer Group 创建(XGROUP CREATE,BUSYGROUP 时用 side_effect 模拟)
+    client.xgroup_create = AsyncMock(return_value=True)
+    # R33: 确认消息(XACK 返回确认数)
+    client.xack = AsyncMock(return_value=1)
+    # R33: 回收 pending(XAUTOCLAIM 返回 (next_id, [(msg_id, fields), ...], []))
+    client.xautoclaim = AsyncMock(return_value=("0-0", [], []))
+    # R33: pending 信息(XPENDING 返回 (count, min_id, max_id, consumers))
+    client.xpending = AsyncMock(return_value=(0, None, None, []))
+    # R33: Stream 长度(XLEN)
+    client.xlen = AsyncMock(return_value=0)
+    # 通用 key 操作(读缓存 DEL/GET/SETEX)
     client.delete = AsyncMock(return_value=1)
-    client.llen = AsyncMock(return_value=0)
     client.get = AsyncMock(return_value=None)      # 默认缓存未命中
     client.setex = AsyncMock(return_value=True)
     client.aclose = AsyncMock(return_value=None)

@@ -1,5 +1,8 @@
 # 环境变量（含敏感信息）
 .env
+# R33: 服务级 secrets 隔离文件（每个服务独立的 secrets）
+.env.shared
+.env.secrets.*
 
 # Python
 __pycache__/

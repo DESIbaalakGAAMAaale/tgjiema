@@ -328,11 +328,17 @@ class MonBot:
             # 4. Bot 离线检测
             stale_bots = metrics.get_stale_bots()
 
-            # 5. Writer 队列积压(方案B: Redis Queue 落盘模式)
+            # 5. Writer 队列积压(R33: Streams pending 监控 + DLQ 监控)
             writer_queue_len = -1
+            pending_info = {}
+            dlq_len = -1
             try:
                 from database import redis_queue
-                writer_queue_len = await redis_queue.length()
+                # R33: pending 数(未 ACK 的消息,反映 db_writer 处理进度)
+                pending_info = await redis_queue.get_pending_info()
+                writer_queue_len = pending_info.get("total", 0)
+                # R33: 死信队列长度(反映失败消息积压)
+                dlq_len = await redis_queue.get_dlq_length()
             except Exception as e:
                 logger.debug(f"[Mon] Writer 队列检查异常: {e}")
 
@@ -356,19 +362,24 @@ class MonBot:
                 alerts_to_check.append(("queue_backlog", "WARNING",
                     f"队列积压偏高: {queue_backlog} 个待处理任务"))
 
-            # Writer 队列积压(Redis Queue 落盘模式,-1 表示 Redis 不可用,跳过)
-            if writer_queue_len >= 0:
+            # Writer pending 积压(R33: 使用 pending 数而非 stream 长度)
+            if isinstance(writer_queue_len, int) and writer_queue_len >= 0:
                 writer_threshold = settings.WRITER_QUEUE_ALERT_THRESHOLD
                 if writer_queue_len > writer_threshold:
                     alerts_to_check.append(("writer_queue_backlog", "CRITICAL",
-                        f"Writer 队列积压严重: {writer_queue_len} 条(阈值 {writer_threshold})"))
+                        f"Writer pending 积压严重: {writer_queue_len} 条(阈值 {writer_threshold})"))
                 elif writer_queue_len > writer_threshold // 2:
                     alerts_to_check.append(("writer_queue_backlog", "WARNING",
-                        f"Writer 队列积压偏高: {writer_queue_len} 条(警告阈值 {writer_threshold // 2}, 严重阈值 {writer_threshold})"))
+                        f"Writer pending 积压偏高: {writer_queue_len} 条(警告阈值 {writer_threshold // 2}, 严重阈值 {writer_threshold})"))
             elif writer_queue_len == -1:
                 # P1修复: Redis 不可达时也告警,避免 db_writer 静默故障
                 alerts_to_check.append(("writer_redis_unavailable", "WARNING",
                     "Writer 队列检查失败(Redis 不可达),db_writer 可能无法消费消息"))
+
+            # R33: 死信队列监控
+            if dlq_len > 0:
+                alerts_to_check.append(("writer_dlq", "WARNING",
+                    f"Writer 死信队列有 {dlq_len} 条消息,需人工排查"))
 
             # db_writer 服务状态告警(P1修复: 复用 _check_db_writer_status 避免重复代码)
             dw_status, _ = await self._check_db_writer_status()

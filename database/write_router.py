@@ -1,15 +1,19 @@
-"""写操作路由器(方案B: 决定走 Redis Queue 还是直写 SQLite)
+"""写操作路由器(方案B v2: 决定走 Redis Stream 还是直写 SQLite)
+
+R33修复: 非幂等操作(increment/refund)也移至直写,避免重放导致二次扣减/退款。
 
 设计:
-- WRITER_MODE=redis: 普通写操作入 Redis Queue,CAS/事务写直写 SQLite
+- WRITER_MODE=redis: 普通写操作入 Redis Stream,CAS/事务/非幂等写直写 SQLite
 - WRITER_MODE=sqlite: 降级模式,所有写操作直写 SQLite(旧逻辑)
 - Redis 不可用时自动降级到 SQLite 直写
 
-CAS 操作(需立即返回结果)和事务操作(需原子性)不走 Redis,直接写 SQLite:
+不走 Redis 的方法(CAS/事务/非幂等,必须直写 SQLite):
 - try_consume_quota: UPDATE rowcount 决定扣减成功与否
 - mark_local_job_dispatched: UPDATE rowcount 决定认领成功与否
 - batch_update_cells_local: BEGIN IMMEDIATE 多行原子提交
 - delete_cell_local: BEGIN IMMEDIATE 链表指针修复
+- R33: increment_user_quota_used: 非幂等(used = used + 1),重放会二次扣减
+- R33: refund_quota: 非幂等(used = used - amount),重放会二次退款
 """
 from typing import Callable, Awaitable, Any
 from loguru import logger
@@ -17,18 +21,24 @@ from loguru import logger
 from database import redis_queue
 
 
-# 不走 Redis 的方法名集合(CAS/事务/清理操作,必须直写 SQLite)
+# 不走 Redis 的方法名集合(CAS/事务/非幂等/清理操作,必须直写 SQLite)
 _DIRECT_WRITE_METHODS: frozenset[str] = frozenset({
+    # CAS 操作(依赖 rowcount 判断成功与否)
     "try_consume_quota",
     "mark_local_job_dispatched",
+    # 事务操作(需要 BEGIN IMMEDIATE 原子性)
     "batch_update_cells_local",
     "delete_cell_local",
+    # 非幂等操作(R33: 重放会导致二次扣减/退款)
+    "increment_user_quota_used",
+    "refund_quota",
+    # 查询类(需要立即返回结果)
     "reactivate_waiting_start_jobs",
     "reclaim_stale_dispatched",
     "insert_local_job",
     "has_new_upload",
     "has_new_dsp_job",
-    # P1修复: 清理类方法也直写(低频但可能锁冲突,加入直写避免绕过 Redis 串行化)
+    # 清理类方法(低频但可能锁冲突)
     "cleanup_local_jobs",
     "delete",
     "cleanup",

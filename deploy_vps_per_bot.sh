@@ -66,12 +66,53 @@ apt-get install -y --no-install-recommends \
     libpq-dev gcc g++ make curl git sqlite3 procps net-tools
 
 # C1: Redis Stream 事件驱动(dsp_bot 替代轮询)
+# R33 P1-3: Redis 持久化配置(AOF + noeviction),防止崩溃丢消息 + 内存写满逐出
 if ! command -v redis-cli &> /dev/null; then
     echo "安装 Redis..."
     apt-get install -y redis-server
-    systemctl enable redis-server
-    systemctl start redis-server
 fi
+
+# R33 P1-3: 配置 Redis 持久化(幂等,重复运行不破坏已有配置)
+configure_redis_persistence() {
+    local redis_conf="/etc/redis/redis.conf"
+    if [[ ! -f "$redis_conf" ]]; then
+        # Debian 12+ 路径可能在 /etc/redis/redis.conf
+        warn "未找到 $redis_conf,跳过 Redis 持久化配置"
+        return 0
+    fi
+    info "配置 Redis 持久化(AOF everysec + noeviction)..."
+
+    # 用 sed 原地修改(幂等: 先删除可能存在的旧配置行再追加新值)
+    # appendonly yes: 启用 AOF(更耐丢数据,R33 P1-3 要求)
+    sed -i 's/^\s*appendonly\s.*/appendonly yes/' "$redis_conf"
+    if ! grep -qE '^\s*appendonly\s+yes' "$redis_conf"; then
+        echo "appendonly yes" >> "$redis_conf"
+    fi
+    # appendfsync everysec: 每秒 fsync(性能与安全的平衡,最多丢 1 秒数据)
+    sed -i 's/^\s*appendfsync\s.*/appendfsync everysec/' "$redis_conf"
+    if ! grep -qE '^\s*appendfsync\s+everysec' "$redis_conf"; then
+        echo "appendfsync everysec" >> "$redis_conf"
+    fi
+    # maxmemory-policy noeviction: 内存满时不逐出写入(返回错误),防止写消息丢失
+    # R33 P1-3: 避免驱逐策略导致 Stream 消息被删除
+    sed -i 's/^\s*maxmemory-policy\s.*/maxmemory-policy noeviction/' "$redis_conf"
+    if ! grep -qE '^\s*maxmemory-policy\s+noeviction' "$redis_conf"; then
+        echo "maxmemory-policy noeviction" >> "$redis_conf"
+    fi
+    # 可选: 设置最大内存(默认 0=不限制,VPS 上建议设置)
+    # sed -i 's/^\s*maxmemory\s.*/maxmemory 512mb/' "$redis_conf"
+
+    # 重启 Redis 应用配置
+    systemctl enable redis-server
+    systemctl restart redis-server
+    sleep 1
+    if systemctl is-active --quiet redis-server; then
+        success "Redis 持久化已配置(appendonly=yes, appendfsync=everysec, maxmemory-policy=noeviction)"
+    else
+        warn "Redis 重启失败,请手动检查: systemctl status redis-server"
+    fi
+}
+configure_redis_persistence
 
 success "系统依赖安装完成"
 
@@ -159,6 +200,65 @@ if [[ ! -f "$DEPLOY_DIR/config/topology.yaml" ]] && [[ -f "$DEPLOY_DIR/config/gr
     python config/generate_topology.py
     success "topology.yaml 生成完成"
 fi
+
+# ──────────────────────────────────────────────
+# R33 P1-5: 服务级 secrets 隔离(最小权限)
+# 原: 所有 8 个 systemd 服务加载同一份 .env,每个服务都能看到所有 5 个 Bot Token + R2 凭证 + ADMIN_PASSWORD
+# 新: 拆分为 .env.shared(共享配置) + .env.secrets.<service>(仅该服务需要的 secrets)
+# 兼容: 若 .env.secrets.<service> 不存在,回退到加载完整 .env(向后兼容旧部署)
+# ──────────────────────────────────────────────
+info "R33: 配置服务级 secrets 隔离(最小权限)..."
+
+split_env_per_service() {
+    local env_file="$DEPLOY_DIR/.env"
+    if [[ ! -f "$env_file" ]]; then
+        return 0
+    fi
+
+    # 定义每个服务需要的 secret 变量(仅 secrets,不含共享配置)
+    # 格式: "服务名:变量1,变量2,..."
+    local -A SERVICE_SECRETS=(
+        [up]="UPLOAD_BOT_TOKEN,RELAY_API_ID,RELAY_API_HASH,RELAY_ENCRYPTION_KEY,RELAY_ACCOUNT_IDS,COLLECTOR_ACCOUNT_IDS"
+        [idx]="DECODER_BOT_TOKEN,RELAY_API_ID,RELAY_API_HASH,RELAY_ENCRYPTION_KEY,RELAY_ACCOUNT_IDS,ALLOWED_DECODER_BOTS"
+        [dsp]="SENDER_BOT_TOKEN"
+        [mon]="MON_BOT_TOKEN,ADMIN_BOT_TOKEN,ADMIN_TELEGRAM_ID,DB_WRITER_SERVICE_NAME"
+        [admin_bot]="ADMIN_BOT_TOKEN,ADMIN_TELEGRAM_ID"
+        [admin]="ADMIN_USERNAME,ADMIN_PASSWORD,ADMIN_WEB_PORT,ADMIN_WEB_HOST,CSRF_COOKIE_SECURE"
+        [db_backup]="R2_ACCOUNT_ID,R2_ACCESS_KEY_ID,R2_SECRET_ACCESS_KEY,R2_BUCKET_NAME,R2_ENDPOINT,DB_BACKUP_ENABLED,DB_BACKUP_INTERVAL_MINUTES,COCKROACHDB_URL"
+        [db_writer]=""  # 无 secrets,只用 REDIS_URL(来自 .env.shared)
+    )
+
+    # 共享变量(所有服务都需要,写入 .env.shared)
+    # 注意: 非敏感配置放这里(REDIS_URL, 配额, 限流参数等)
+    local shared_vars_pattern="^(REDIS_URL|WRITER_|CRDB_POOL_|CACHE_|RATE_LIMIT_|ROTATION_|DATA_RETENTION|CRDB_CLEANUP|CHANNEL_FAILURE|RESTART_|TOPOLOGY_|FREE_|BASIC_|PREMIUM_|FILE_CODE_PREFIX|DEFAULT_|PENDING_|SEND_|PAGE_|MEDIA_GROUP|EXTERNAL_|CACHE_STORE_|MAX_RESTART|MON_CHECK_INTERVAL|QUOTA_SYNC_|RELAY_WEIGHT|RELAY_NORM|RELAY_SAFE_POOL|ACCOUNT_|R100_CHANNEL|UPLOAD_BOT_USERNAME|DECODER_BOT_USERNAME|SENDER_BOT_USERNAME|FORCE_JOIN_|LOG_LEVEL|DB_BACKUP_INTERVAL_MINUTES)="
+
+    # 生成 .env.shared(共享配置)
+    grep -E "$shared_vars_pattern" "$env_file" 2>/dev/null > "$DEPLOY_DIR/.env.shared" || true
+    chmod 600 "$DEPLOY_DIR/.env.shared"
+
+    # 为每个服务生成 .env.secrets.<service>
+    for svc in "${!SERVICE_SECRETS[@]}"; do
+        local secrets_file="$DEPLOY_DIR/.env.secrets.${svc}"
+        local var_list="${SERVICE_SECRETS[$svc]}"
+        : > "$secrets_file"  # 清空/创建文件
+        if [[ -n "$var_list" ]]; then
+            IFS=',' read -ra vars <<< "$var_list"
+            for var in "${vars[@]}"; do
+                # 从主 .env 中提取该变量(兼容行内注释)
+                grep -E "^${var}=" "$env_file" 2>/dev/null >> "$secrets_file" || true
+            done
+        fi
+        chmod 600 "$secrets_file"
+    done
+
+    # 保留原 .env 文件作为备份(向后兼容 + 用户参考),但 systemd 不再直接加载
+    # 权限收紧: 仅所有者可读
+    chmod 600 "$env_file"
+    success "secrets 隔离完成: .env.shared + .env.secrets.<service> (8 个服务)"
+    info "  原 .env 已保留作为备份和参考,systemd 单元不再直接加载完整 .env"
+}
+
+split_env_per_service
 
 success "配置文件检查完成"
 
@@ -259,6 +359,12 @@ Type=simple
 User=tgjiema
 WorkingDirectory=${DEPLOY_DIR}
 Environment="PYTHONUNBUFFERED=1"
+# R33 P1-5: 服务级 secrets 隔离(最小权限)
+# 1. .env.shared: 共享配置(REDIS_URL, 配额, 限流参数等,所有服务可读)
+# 2. .env.secrets.${name}: 仅该服务需要的 secrets(Bot Token, R2 凭证等)
+# 3. .env: 向后兼容回退(若 split 未执行,加载完整 .env)
+EnvironmentFile=-${DEPLOY_DIR}/.env.shared
+EnvironmentFile=-${DEPLOY_DIR}/.env.secrets.${name}
 EnvironmentFile=-${DEPLOY_DIR}/.env
 ExecStart=${DEPLOY_DIR}/venv/bin/python ${DEPLOY_DIR}/run_all.py --standalone ${name}
 Restart=${restart_type}
