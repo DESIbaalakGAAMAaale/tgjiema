@@ -48,6 +48,19 @@ _REDIS_RETRY_INTERVAL = 60.0  # 失败后 60 秒重试
 _redis_init_lock = None  # asyncio.Lock,延迟初始化(P1修复: 防止并发 race)
 _consumer_group_ensured: bool = False  # Consumer Group 是否已创建
 
+# R36 H1: 死信重入主 Stream 的 Lua 脚本(原子 XADD + XDEL)
+# KEYS[1] = 主 Stream key, KEYS[2] = 死信 Stream key
+# ARGV[1] = 消息 JSON, ARGV[2] = 死信 msg_id
+# 顺序: 先 XADD 回主 Stream,成功后才 XDEL 死信,避免消息丢失
+_REQUEUE_LUA_SCRIPT = """
+local new_id = redis.call('XADD', KEYS[1], '*', 'data', ARGV[1])
+if new_id then
+  redis.call('XDEL', KEYS[2], ARGV[2])
+  return new_id
+end
+return false
+"""
+
 
 def _get_init_lock():
     """延迟获取 asyncio.Lock(避免在模块加载时创建事件循环)"""
@@ -344,63 +357,109 @@ async def ack(message_ids: list[str]) -> int:
 
 
 async def safe_trim() -> int:
-    """安全裁剪 Stream(XTRIM MINID),不删除 pending 消息。
+    """安全裁剪 Stream(XTRIM MINID),不删除任何 Consumer Group 的 pending 消息。
 
     R35 P0-2 修复: MAXLEN 裁剪可能删除尚未 ACK 的 pending 消息正文。
     改用 MINID 策略:只裁剪所有 Consumer Group 的最小 pending ID 之前的消息。
 
+    R36 H2 修复: 原版仅查询 WRITER_CONSUMER_GROUP 单一 group 的 pending,
+    多 group 场景下可能裁剪其他 group 未消费消息。现改用 XINFO GROUPS 获取
+    全部 group,逐组收集最小 pending ID / last-delivered-id,取全局最保守水位。
+
     流程:
-    1. 查询所有 Consumer Group 的 pending 列表
-    2. 找到最小的 pending message ID
-    3. 额外保留 24 小时安全窗口(不裁剪最近的消息)
-    4. XTRIM MINID < 安全水位
+    1. XINFO GROUPS 获取 Stream 上所有 Consumer Group
+    2. 对每个 group 查询 XPENDING 概要,取该 group 最小 pending ID
+    3. 收集所有 group 的最小 pending ID,取全局最小(最保守)
+    4. 对无 pending 的 group,用 last-delivered-id 作为保守水位
+    5. 额外保留 24 小时安全窗口(不裁剪最近的消息)
+    6. XTRIM MINID < 安全水位
 
     Returns:
-        被裁剪的消息数,Redis 不可达时返回 0
+        被裁剪的消息数,Redis 不可达或查询失败时返回 0(保守不裁剪)
     """
     redis = await get_redis()
     if not redis:
         return 0
     try:
         from config import settings
-        # 1. 查询 Consumer Group 的 pending 概要
+        # 1. XINFO GROUPS 获取所有 Consumer Group
         try:
-            pending_info = await redis.xpending(
-                settings.WRITER_STREAM_KEY,
-                settings.WRITER_CONSUMER_GROUP,
-            )
-        except Exception:
-            pending_info = None
-
-        # 2. 确定安全裁剪水位
-        # redis-py 在 decode_responses=True 时可能返回 dict 或 tuple,两种格式都支持
-        min_pending_id = None
-        has_pending = False
-        if pending_info and isinstance(pending_info, dict):
-            # dict 格式: {'pending': count, 'min': min_id, 'max': max_id, 'consumers': [...]}
-            pending_count = pending_info.get('pending', 0)
-            if pending_count:
-                has_pending = True
-                min_pending_id = pending_info.get('min')
-        elif pending_info and isinstance(pending_info, (tuple, list)) and len(pending_info) >= 1:
-            # tuple 格式: (count, min_id, max_id, consumers)
-            pending_count = pending_info[0] or 0
-            if pending_count and len(pending_info) >= 2:
-                has_pending = True
-                min_pending_id = pending_info[1]
-        else:
-            # 查询失败或未知格式:保守不裁剪
+            groups = await redis.xinfo_groups(settings.WRITER_STREAM_KEY)
+        except Exception as e:
+            # 查询失败:保守不裁剪(避免删掉未消费消息)
+            logger.debug(f"[RedisQueue] safe_trim xinfo_groups 失败,不裁剪: {e}")
             return 0
 
+        # groups 为空或 None:无 Consumer Group,保守不裁剪
+        if not groups:
+            logger.debug("[RedisQueue] safe_trim 无 Consumer Group,不裁剪")
+            return 0
+
+        # 2. 逐组收集最小 pending ID 和 last-delivered-id
+        global_min_pending = None        # 全局最小 pending ID(所有 group 中最小的)
+        global_min_delivered = None      # 全局最小 last-delivered-id(无 pending 时的保守水位)
+        has_any_pending = False
+
+        for group_info in groups:
+            # redis-py xinfo_groups 返回 list[dict],含 name/consumers/pending/last-delivered-id
+            # decode_responses 可能影响格式,兼容 dict 与 tuple 两种
+            group_name = None
+            last_delivered = None
+            if isinstance(group_info, dict):
+                group_name = group_info.get('name')
+                last_delivered = group_info.get('last-delivered-id')
+            elif isinstance(group_info, (list, tuple)) and len(group_info) >= 1:
+                # 旧版 redis-py 可能返回 tuple[name, consumers, pending, ...]
+                group_name = group_info[0]
+            if not group_name:
+                continue
+
+            # 查询该 group 的 pending 概要
+            try:
+                pending_info = await redis.xpending(
+                    settings.WRITER_STREAM_KEY, group_name,
+                )
+            except Exception:
+                pending_info = None
+
+            # 解析 pending_info(redis-py 返回 dict 或 tuple,两种格式都支持)
+            group_pending_count = 0
+            group_min_pending = None
+            if pending_info and isinstance(pending_info, dict):
+                group_pending_count = pending_info.get('pending', 0) or 0
+                if group_pending_count:
+                    group_min_pending = pending_info.get('min')
+            elif pending_info and isinstance(pending_info, (tuple, list)) and len(pending_info) >= 2:
+                group_pending_count = pending_info[0] or 0
+                if group_pending_count:
+                    group_min_pending = pending_info[1]
+
+            # 收集该 group 的最小 pending ID,取全局最小(最保守)
+            if group_pending_count and group_min_pending:
+                has_any_pending = True
+                if global_min_pending is None or _stream_id_less(
+                    str(group_min_pending), str(global_min_pending)
+                ):
+                    global_min_pending = str(group_min_pending)
+
+            # 收集该 group 的 last-delivered-id(无 pending 时的保守水位)
+            if last_delivered:
+                if global_min_delivered is None or _stream_id_less(
+                    str(last_delivered), str(global_min_delivered)
+                ):
+                    global_min_delivered = str(last_delivered)
+
         # 3. 计算安全裁剪水位
-        if has_pending and min_pending_id:
-            # 有 pending 消息: 裁剪 min_pending 之前的消息(不含 min_pending)
-            # 但额外保留安全窗口: 不裁剪最近 24 小时的消息
-            # Redis Stream ID 格式: <timestamp>-<seq>,取 timestamp 部分计算
-            safe_min_id = _compute_safe_trim_id(str(min_pending_id), retention_hours=24)
+        # 优先用 pending ID(最保守,保留未 ACK 消息)
+        # 其次用 last-delivered-id(该 group 已处理到此位置,裁剪之前的消息安全)
+        # 都没有:保守不裁剪
+        if has_any_pending and global_min_pending:
+            safe_min_id = _compute_safe_trim_id(global_min_pending, retention_hours=24)
+        elif global_min_delivered:
+            safe_min_id = _compute_safe_trim_id(global_min_delivered, retention_hours=24)
         else:
-            # 无 pending: 裁剪 24 小时前的消息
-            safe_min_id = _compute_safe_trim_id(None, retention_hours=24)
+            # 无 pending 也无 last-delivered-id:保守不裁剪
+            return 0
 
         if not safe_min_id:
             return 0
@@ -444,6 +503,32 @@ def _compute_safe_trim_id(min_pending_id: Optional[str], retention_hours: int = 
         actual_safe_ts = safe_ts
 
     return f"{actual_safe_ts}-0"
+
+
+def _stream_id_less(a: str, b: str) -> bool:
+    """比较两个 Redis Stream ID,判断 a < b。
+
+    R36 H2: safe_trim 多 group 场景取全局最小 pending ID 时使用。
+
+    Stream ID 格式: <timestamp>-<seq>(如 "1700000000-0")
+    先比较 timestamp,相同则比较 seq。
+
+    Args:
+        a, b: 两个 Stream ID 字符串
+
+    Returns:
+        True 表示 a < b, False 表示 a >= b 或解析失败(保守认为不小于)
+    """
+    try:
+        ta, sa = str(a).split('-', 1)
+        tb, sb = str(b).split('-', 1)
+        ta_i, sa_i, tb_i, sb_i = int(ta), int(sa), int(tb), int(sb)
+        if ta_i != tb_i:
+            return ta_i < tb_i
+        return sa_i < sb_i
+    except (ValueError, IndexError):
+        # 解析失败:保守认为 a 不小于 b(不更新全局最小)
+        return False
 
 
 async def trim_stream() -> int:
@@ -631,6 +716,53 @@ async def delete_dead_message(msg_id: str) -> bool:
         return True
     except Exception as e:
         logger.debug(f"[RedisQueue] delete_dead_message 异常: {e}")
+        return False
+
+
+async def requeue_from_dlq(dead_msg_id: str, msg_data: dict) -> bool:
+    """R36 H1: 原子地将死信消息重新入队主 Stream 并从死信 Stream 删除。
+
+    使用 Lua 脚本保证 XADD(回主 Stream)+ XDEL(死信 Stream)原子性,
+    替代旧的非原子双操作(push() + delete_dead_message())。
+
+    解决的问题:
+    - 旧方案 XADD 成功但 XDEL 失败 → 死信重复重入,依赖 inbox 去重(脆弱)
+    - 旧方案 XADD 失败后仍可能 XDEL → 消息永久丢失(P0-3 已加返回值检查,但非原子)
+    - 新方案 Lua 脚本内顺序执行: 先 XADD 成功才 XDEL,任一失败脚本回滚(Redis 单线程原子)
+
+    Args:
+        dead_msg_id: 死信 Stream 中的消息 ID(XDEL 目标)
+        msg_data: 要 XADD 回主 Stream 的消息字典(需包含 op_type/table/method_name/data
+                  等标准字段,与 push() 输出格式一致)
+
+    Returns:
+        True 重入成功(Lua 返回新 msg_id), False 失败
+        (Redis 不可达 / 参数为空 / Lua 执行失败 / XADD 失败返回 false)
+    """
+    redis = await get_redis()
+    if not redis:
+        return False
+    if not dead_msg_id or not msg_data:
+        return False
+    try:
+        from config import settings
+        msg_json = json.dumps(msg_data, default=str, ensure_ascii=False)
+        # eval(script, numkeys, *keys_and_args)
+        # KEYS[1]=主 Stream, KEYS[2]=死信 Stream, ARGV[1]=消息 JSON, ARGV[2]=死信 msg_id
+        result = await redis.eval(
+            _REQUEUE_LUA_SCRIPT,
+            2,  # numkeys
+            settings.WRITER_STREAM_KEY,      # KEYS[1] 主 Stream
+            settings.WRITER_DEAD_STREAM_KEY,  # KEYS[2] 死信 Stream
+            msg_json,                          # ARGV[1] 消息 JSON
+            dead_msg_id,                       # ARGV[2] 死信 msg_id
+        )
+        # Lua 返回 new_id(字符串,真值)或 false(redis-py 转为 None)
+        if result:
+            return True
+        return False
+    except Exception as e:
+        logger.warning(f"[RedisQueue] requeue_from_dlq 失败: {e}")
         return False
 
 

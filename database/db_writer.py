@@ -38,6 +38,7 @@ from loguru import logger
 
 from database import redis_queue
 from database.cache_store import CacheStore, DB_PATH
+from utils.exceptions import DurabilityError
 
 
 # 允许 DBWriter 调用的 cache_store 方法白名单(防止调用未授权方法)
@@ -90,6 +91,26 @@ _ALLOWED_METHODS: frozenset[str] = frozenset({
     "mark_replication_failed",
     # 通用
     "delete", "cleanup", "cleanup_notify_tables",
+})
+
+
+# R36 H3: 业务正确性必需方法 — 写入失败必须失败/重试当前请求
+# 这些方法的返回值会被 _execute_sqlite 检查,返回 False/0 时抛 DurabilityError。
+# DurabilityError 触发 ROLLBACK 后入永久死信(不重试,逻辑失败重试结果相同)。
+# - bool 返回的方法: False 表示状态迁移未生效(会话不存在/状态不匹配/记录不存在)
+# - int 返回的方法(create_replication_task): 0 表示任务创建失败
+# - 返回 None 的方法(create_upload_session/create_outbox_entry/upsert_delivery_receipt):
+#   Writer 事务模式下失败会 raise(_in_writer_tx=True 时),不通过返回值判断;
+#   None 是正常返回,不触发 DurabilityError。
+_DURABILITY_BOOL_METHODS: frozenset[str] = frozenset({
+    "transition_upload_session",
+    "confirm_delivery_receipt",
+    "mark_replication_copying",
+    "mark_replication_copied",
+    "mark_replication_committed",
+})
+_DURABILITY_INT_METHODS: frozenset[str] = frozenset({
+    "create_replication_task",
 })
 
 
@@ -394,6 +415,28 @@ class DBWriter:
             elif stream_id:
                 await self._safe_ack(stream_id)
             return
+        except DurabilityError as e:
+            # R36 H3: 业务必需写入失败,入永久死信(不重试当前消息)
+            # DurabilityError 已在 _execute_atomic 中触发 ROLLBACK(inbox 也回滚)
+            # 标记 permanent=True:逻辑失败重试结果相同,等待人工审核而非自动重试
+            self._error_count += 1
+            logger.error(
+                f"[DBWriter] 业务必需写入失败(入永久死信): "
+                f"method={writer_msg.method_name}, message_id={message_id}: {e}"
+            )
+            dead_ok = await redis_queue.push_dead(
+                msg, reason=f"DurabilityError: {e}",
+                message_id=message_id, permanent=True,
+            )
+            if not dead_ok:
+                self._dead_fail_count += 1
+                logger.critical(
+                    f"[DBWriter] DLQ 写入失败(DurabilityError),消息保留 pending: "
+                    f"method={writer_msg.method_name}"
+                )
+            elif stream_id:
+                await self._safe_ack(stream_id)
+            return
         except Exception as e:
             # 可重试错误:入死信队列
             self._error_count += 1
@@ -500,6 +543,10 @@ class DBWriter:
 
         R34: 在 Writer 事务模式下,方法内部 commit 被 no-op,
         异常不会被吞掉(_in_writer_tx 标志强制 raise)。
+
+        R36 H3: 对业务正确性必需方法检查返回值,返回 False/0 时抛 DurabilityError。
+        DurabilityError 触发 _execute_atomic 的 ROLLBACK(inbox 也回滚),
+        随后 _process_message 捕获并入永久死信(不重试,避免重复失败)。
         """
         if not self._store:
             raise RuntimeError("CacheStore 未初始化")
@@ -509,7 +556,23 @@ class DBWriter:
             raise ValueError(f"未知的方法名: {msg.method_name}")
 
         data = msg.data if isinstance(msg.data, dict) else {}
-        await method(**data)
+        result = await method(**data)
+
+        # R36 H3: 业务正确性必需写入检查返回值
+        # 仅对 bool/int 返回的业务方法检查;返回 None 的方法(create_upload_session 等)
+        # 在 Writer 事务模式下失败会 raise,不通过返回值判断(None 是正常返回)
+        if msg.method_name in _DURABILITY_BOOL_METHODS:
+            if result is False:
+                raise DurabilityError(
+                    f"业务必需写入失败: {msg.method_name} 返回 False "
+                    f"(状态未迁移或记录不存在), message_id={msg.message_id}"
+                )
+        elif msg.method_name in _DURABILITY_INT_METHODS:
+            if result == 0:
+                raise DurabilityError(
+                    f"业务必需写入失败: {msg.method_name} 返回 0 "
+                    f"(任务创建失败), message_id={msg.message_id}"
+                )
 
     async def _safe_ack(self, stream_id: str):
         """安全 ACK:捕获异常并记录,不传播。

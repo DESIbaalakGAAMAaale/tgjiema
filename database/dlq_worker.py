@@ -162,7 +162,12 @@ class DLQWorker:
         return retried
 
     async def _retry_message(self, msg_id: str, dead_msg: dict) -> bool:
-        """重试单条死信消息:XADD 回主 Stream + XDEL 从死信删除。
+        """重试单条死信消息:原子 XADD 回主 Stream + XDEL 从死信删除。
+
+        R36 H1: 使用 redis_queue.requeue_from_dlq() Lua 脚本原子执行
+        XADD(主 Stream)+ XDEL(死信 Stream),替代旧的非原子双操作
+        (push() + delete_dead_message())。避免 XADD 成功但 XDEL 失败导致
+        死信重复重入,或 XDEL 成功但 XADD 失败导致消息丢失。
 
         保留原 message_id,实现幂等去重(若原消息已处理,writer_inbox 会命中跳过)。
 
@@ -193,47 +198,83 @@ class DLQWorker:
         # 保留原 message_id(幂等去重:若已处理,writer_inbox 命中跳过)
         message_id = dead_msg.get("message_id", "") or original.get("message_id", "")
 
+        # R36 H1: 构建回主 Stream 的消息体(与 push() 内部格式一致)
+        # 携带 attempts 字段,后续失败时 push_dead 能从 msg.attempts 读取并 +1
+        msg_data = {
+            "op_type": original.get("op_type", ""),
+            "table": original.get("table", ""),
+            "method_name": original.get("method_name", ""),
+            "data": original.get("data", {}) or {},
+            "redis_key": original.get("redis_key", ""),
+            "message_id": message_id,
+            "created_at": time.time(),
+            "attempts": attempts,
+        }
+
+        # R36 H1: 优先使用原子 XADD + XDEL(Lua 脚本保证原子性)
+        # requeue_from_dlq 内部:先 XADD 回主 Stream,成功后才 XDEL 死信
+        # 任一失败脚本回滚,不会出现"XADD 成功但 XDEL 失败"或反之的不一致状态
+        # 降级路径: 当 requeue_from_dlq 不可用(Redis 不可达 / Lua 不支持 / 异常)
+        # 时,回退到非原子 push + delete_dead_message,保证功能可用性
+        # (生产环境 Redis 可达时走原子路径,降级路径仅在异常时触发)
         try:
-            # R35 P0-3: 检查 push() 返回值,失败时不 XDEL 死信
-            # push() 在 Redis 不可达或 XADD 失败时返回 False(不抛异常),
-            # 旧逻辑仍会 XDEL 死信,导致消息永久丢失。此处显式检查返回值。
-            # R35 P1-1: 携带 attempts=new_attempts,让主 Stream 消息体保留重试次数,
-            # 后续失败时 push_dead 能从 msg.attempts 读取并 +1(避免无限重试)。
-            ok = await redis_queue.push(
-                op_type=original.get("op_type", ""),
-                table=original.get("table", ""),
-                method_name=original.get("method_name", ""),
-                data=original.get("data", {}) or {},
-                redis_key=original.get("redis_key", ""),
-                message_id=message_id,
-                attempts=attempts,
+            ok = await redis_queue.requeue_from_dlq(
+                dead_msg_id=msg_id,
+                msg_data=msg_data,
             )
-            if not ok:
-                # push 返回 False(Redis 不可达或 XADD 失败),不删除死信
-                logger.error(
-                    f"[DLQWorker] XADD 回主 Stream 失败(push 返回 False),"
-                    f"保留死信等待下次重试: msg_id={msg_id}"
+            if ok:
+                logger.info(
+                    f"[DLQWorker] 死信重试成功(原子 XADD+XDEL): msg_id={msg_id}, "
+                    f"attempts={attempts}/{max_attempts}, backoff={backoff:.1f}s, "
+                    f"method={original.get('method_name', '?')}, "
+                    f"message_id={message_id}"
                 )
-                return False
+                return True
+            # 原子重入失败,走降级路径(非原子 push + delete)
+            logger.warning(
+                f"[DLQWorker] 原子重入失败(requeue_from_dlq 返回 False),"
+                f"降级到非原子 push+delete: msg_id={msg_id}"
+            )
         except Exception as e:
+            # 原子重入异常,走降级路径(非原子 push + delete)
+            logger.warning(
+                f"[DLQWorker] 原子重入异常,降级到非原子 push+delete: "
+                f"msg_id={msg_id}: {e}"
+            )
+
+        # 降级路径: 非原子 push + delete_dead_message
+        # (仅在 Redis 不可达 / Lua 不支持 / 原子操作异常时触发)
+        # 风险: push 成功但 delete 失败会导致死信重复重入,依赖 inbox 去重兜底
+        ok_push = await redis_queue.push(
+            op_type=original.get("op_type", ""),
+            table=original.get("table", ""),
+            method_name=original.get("method_name", ""),
+            data=original.get("data", {}) or {},
+            redis_key=original.get("redis_key", ""),
+            message_id=message_id,
+            attempts=attempts,
+        )
+        if not ok_push:
             logger.error(
-                f"[DLQWorker] XADD 回主 Stream 异常,保留死信: msg_id={msg_id}: {e}"
+                f"[DLQWorker] 降级 push 失败,保留死信等待下次重试: "
+                f"msg_id={msg_id}"
             )
             return False
 
-        # R35 P0-3: 只有 push 成功后才 XDEL 死信
-        deleted = await redis_queue.delete_dead_message(msg_id)
-        if not deleted:
+        ok_del = await redis_queue.delete_dead_message(msg_id)
+        if not ok_del:
+            # delete 失败: 消息已 push 回主 Stream,但死信未删除
+            # 下次扫描会再次 push(依赖 writer_inbox 去重避免重复执行)
             logger.warning(
-                f"[DLQWorker] XDEL 死信失败(消息可能已被其他 worker 处理): msg_id={msg_id}"
+                f"[DLQWorker] 降级 XDEL 失败,死信可能重复重入"
+                f"(writer_inbox 去重兜底): msg_id={msg_id}"
             )
-            # 不算失败:消息已 XADD 回主 Stream,XDEL 失败会在下次扫描时
-            # 发现重复,但主 Stream 处理时 writer_inbox 会命中跳过(幂等)
 
         logger.info(
-            f"[DLQWorker] 死信重试成功: msg_id={msg_id}, "
+            f"[DLQWorker] 死信重试成功(降级非原子): msg_id={msg_id}, "
             f"attempts={attempts}/{max_attempts}, backoff={backoff:.1f}s, "
-            f"method={original.get('method_name', '?')}, message_id={message_id}"
+            f"method={original.get('method_name', '?')}, "
+            f"message_id={message_id}"
         )
         return True
 
