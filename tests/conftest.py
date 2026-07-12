@@ -63,6 +63,8 @@ def _install_fake_config() -> None:
     settings.SYNC_BACK_OFF = 0  # 0=禁用 Bot 直连兜底(生产默认)
     settings.CRDB_SYNC_LEADER_LEASE = 90  # leader 租约时长(秒)
     settings.CRDB_SYNC_DIRTY_INTERVAL = 2  # 有 dirty 时 cadence(秒)
+    # R37 P1-4: 备份强制加密开关(默认 False 兼容本地开发)
+    settings.BACKUP_ENCRYPTION_REQUIRED = False
 
     fake_config = types.ModuleType("config")
     fake_config.settings = settings

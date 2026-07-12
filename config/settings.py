@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     # R36 H7: 备份 AES-256-GCM 信封加密 KEK(base64, 32 字节)
     # 未配置时备份降级为明文(商用环境必须配置)
     BACKUP_KEK: str = ""
+    # R37 P1-4: 备份强制加密开关
+    # True(生产默认建议): KEK 不可用时停止备份任务并告警,绝不上传明文
+    # False(本地开发): 允许明文降级(仅 warning)
+    BACKUP_ENCRYPTION_REQUIRED: bool = False
 
     ADMIN_WEB_PORT: int = 8080
     ADMIN_WEB_HOST: str = "127.0.0.1"
@@ -416,6 +420,13 @@ class Settings(BaseSettings):
                 raise ValueError("[Settings][db_backup] DB_BACKUP_ENABLED=true 但 R2_ACCESS_KEY_ID 未配置")
             if not self.R2_SECRET_ACCESS_KEY:
                 raise ValueError("[Settings][db_backup] DB_BACKUP_ENABLED=true 但 R2_SECRET_ACCESS_KEY 未配置")
+            # R37 P1-4: 生产强制加密检查
+            # 启用备份且 BACKUP_ENCRYPTION_REQUIRED=true 时,KEK 必须配置
+            if self.BACKUP_ENCRYPTION_REQUIRED and not self.BACKUP_KEK:
+                raise ValueError(
+                    "[Settings][db_backup] BACKUP_ENCRYPTION_REQUIRED=true 但 BACKUP_KEK 未配置"
+                    "(生产环境必须配置加密 KEK,否则不会启动备份服务)"
+                )
         # db_backup 需要 CRDB URL 和 R2 凭证,但不需要 Bot Token
 
     def _validate_crdb_sync_fields(self):

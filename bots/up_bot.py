@@ -133,6 +133,9 @@ async def _transition_upload_session_safe(
     """安全推进 upload_session 状态(失败不影响主流程)。
 
     upload_id 为空时直接返回(会话未创建,跳过状态推进)。
+
+    R37 P1-3: 此 *_safe() 包装仅用于 metrics/日志场景的 best-effort 写入。
+    权威状态写入必须使用 _transition_upload_session_strict 抛 DurabilityError。
     """
     if not upload_id:
         return
@@ -144,6 +147,28 @@ async def _transition_upload_session_safe(
         logger.warning(f"[Up] 推进 upload_session 状态失败 upload_id={upload_id} -> {new_status}: {e}")
 
 
+async def _transition_upload_session_strict(
+    upload_id: str, new_status: str, reason: str = "", **update_fields,
+) -> None:
+    """R37 P1-3: 权威推进 upload_session 状态(失败抛 DurabilityError)。
+
+    与 _safe 版本的区别: 异常向上传播,由调用方决定是否中断主流程。
+    用于权威状态写入(如 MANIFEST_PENDING → READY 等关键状态迁移)。
+    """
+    if not upload_id:
+        return
+    try:
+        await get_cache_store().transition_upload_session(
+            upload_id, new_status, reason=reason, **update_fields,
+        )
+    except Exception as e:
+        from utils.exceptions import DurabilityError
+        raise DurabilityError(
+            f"upload_session 状态推进失败 upload_id={upload_id} "
+            f"-> {new_status}: {e}"
+        ) from e
+
+
 async def _create_outbox_entry_safe(
     outbox_id: str, upload_id: str, user_id: int,
     channel_id: int, msg_ids: list | None = None,
@@ -153,6 +178,10 @@ async def _create_outbox_entry_safe(
     """安全创建 upload_outbox 条目(失败不影响主流程)。
 
     upload_id 为空时直接返回(outbox 依赖 upload_session 关联)。
+
+    R37 P1-3: 此 *_safe() 包装仅用于 metrics/日志场景的 best-effort 写入。
+    权威 outbox 写入必须使用 _create_outbox_entry_strict 抛 DurabilityError,
+    否则文件已复制但 manifest 不会被登记(永久数据丢失)。
     """
     if not upload_id:
         return
@@ -167,6 +196,36 @@ async def _create_outbox_entry_safe(
         )
     except Exception as e:
         logger.warning(f"[Up] 创建 outbox 条目失败 upload_id={upload_id} event={event_type}: {e}")
+
+
+async def _create_outbox_entry_strict(
+    outbox_id: str, upload_id: str, user_id: int,
+    channel_id: int, msg_ids: list | None = None,
+    file_meta: list | None = None, event_type: str = "REGISTER_MANIFEST",
+    protect: int = 0,
+) -> None:
+    """R37 P1-3: 权威创建 upload_outbox 条目(失败抛 DurabilityError)。
+
+    用于权威状态写入(REGISTER_MANIFEST / ARCHIVE_R100 等业务事件)。
+    outbox 条目缺失会导致 OutboxWorker 无法消费该事件,造成永久数据丢失
+    (如 manifest 未登记 → 文件已复制但无法被 Resolver 找到)。
+    """
+    if not upload_id:
+        return
+    try:
+        await get_cache_store().create_outbox_entry(
+            outbox_id, upload_id, "", user_id, channel_id,
+            storage_msg_ids=msg_ids,
+            batch_file_meta=file_meta,
+            task_type="single",
+            protect_content=protect,
+            event_type=event_type,
+        )
+    except Exception as e:
+        from utils.exceptions import DurabilityError
+        raise DurabilityError(
+            f"创建 outbox 条目失败 upload_id={upload_id} event={event_type}: {e}"
+        ) from e
 
 
 # ─── R35 P0-4 §24: replication_tasks 副本复制任务接线 ───
@@ -1701,15 +1760,16 @@ async def _finalize_upload(query, context, user_id: int):
             _outbox_channel_id = main_channel
             # 单文件:file_meta 是 dict,包装成 [file_meta]
             _outbox_file_meta = [file_meta] if file_meta else []
-        # 创建 REGISTER_MANIFEST outbox 条目(OutboxWorker 消费)
-        await _create_outbox_entry_safe(
+        # R37 P1-3: REGISTER_MANIFEST/ARCHIVE_R100 是权威 outbox 事件,
+        # 必须用 strict 版本(失败抛 DurabilityError 中断主流程),
+        # 否则文件已复制但 manifest 未登记 → 永久数据丢失。
+        await _create_outbox_entry_strict(
             f"obx-man-{upload_id}", upload_id, user_id,
             _outbox_channel_id, msg_ids=_outbox_storage_ids,
             file_meta=_outbox_file_meta, event_type="REGISTER_MANIFEST",
             protect=1 if protect_bool else 0,
         )
-        # 创建 ARCHIVE_R100 outbox 条目(R100 归档任务,OutboxWorker 消费)
-        await _create_outbox_entry_safe(
+        await _create_outbox_entry_strict(
             f"obx-r100-{upload_id}", upload_id, user_id,
             _outbox_channel_id, msg_ids=_outbox_storage_ids,
             file_meta=_outbox_file_meta, event_type="ARCHIVE_R100",
@@ -2196,16 +2256,17 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
 
     # R35 P0-4: pending_uploads 写入成功,推进 COPIED_PRIMARY → MANIFEST_PENDING
     # 并创建 outbox 条目供 Manifest Worker 消费
-    await _transition_upload_session_safe(
+    # R37 P1-3: 使用 strict 版本(outbox 是权威事件,失败必须中断主流程)
+    await _transition_upload_session_strict(
         upload_id, "MANIFEST_PENDING", reason="ext_pending_uploads_written",
     )
-    await _create_outbox_entry_safe(
+    await _create_outbox_entry_strict(
         f"obx-man-{upload_id}", upload_id, ext_user_id,
         target_ch, msg_ids=msg_ids,
         file_meta=files_meta, event_type="REGISTER_MANIFEST",
         protect=0,
     )
-    await _create_outbox_entry_safe(
+    await _create_outbox_entry_strict(
         f"obx-r100-{upload_id}", upload_id, ext_user_id,
         target_ch, msg_ids=msg_ids,
         file_meta=files_meta, event_type="ARCHIVE_R100",

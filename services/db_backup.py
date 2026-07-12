@@ -164,6 +164,8 @@ async def _backup_crdb_tables(tables: list[str], watermark: str | None = None) -
 
     R35 P1-5: 仅备份 source="crdb" 的表,避免对 SQLite-only 表执行 CRDB 查询。
     R36 H7: 支持 watermark 增量备份(只查 updated_at > watermark 的行)。
+    R37 P1-5: 增量备份同时捕捉 deleted_at > watermark 的软删除行,
+              解决仅靠 updated_at 无法捕捉删除事件的问题。
     """
     results = {}
     for table in sorted(tables):
@@ -174,13 +176,21 @@ async def _backup_crdb_tables(tables: list[str], watermark: str | None = None) -
             table_where = _TABLE_WHERE.get(table)
             if table_where:
                 conditions.append(table_where)
-            # R36 H7: 增量 watermark 条件
+            # R36 H7 + R37 P1-5: 增量 watermark 条件
+            # 同时检查 updated_at(常规变更)和 deleted_at(软删除)
+            # 任一列 > watermark 都纳入本次增量备份
             if watermark:
-                # 仅对有 updated_at 列的表应用 watermark
-                # (backup_schema 中所有 CRDB 核心表都有 updated_at 或 created_at)
-                ts_col = "updated_at" if table in BACKUP_SCHEMA and "updated_at" in BACKUP_SCHEMA[table].columns else None
-                if ts_col:
-                    conditions.append(f'"{ts_col}" > $1')
+                schema = BACKUP_SCHEMA.get(table)
+                ts_cols = []
+                if schema and "updated_at" in schema.columns:
+                    ts_cols.append('"updated_at"')
+                # R37 P1-5: 增量 watermark 同时检查 deleted_at 列
+                if schema and "deleted_at" in schema.columns:
+                    ts_cols.append('"deleted_at"')
+                if ts_cols:
+                    # (updated_at > $1 OR deleted_at > $1)
+                    or_cond = " OR ".join(f"{c} > $1" for c in ts_cols)
+                    conditions.append(f"({or_cond})")
 
             if conditions:
                 where_clause = " AND ".join(conditions)
@@ -441,14 +451,24 @@ async def _run_backup_loop():
         )
         return
 
-    # R36 H7: 检查加密可用性
+    # R36 H7 + R37 P1-4: 检查加密可用性
     encryption_enabled = is_encryption_available()
     if encryption_enabled:
         logger.info("[R36-H7] 备份加密已启用(AES-256-GCM 信封加密)")
     else:
+        # R37 P1-4: 商用强制加密 — KEK 不可用时停止备份服务,绝不上传明文
+        encryption_required = getattr(settings, "BACKUP_ENCRYPTION_REQUIRED", False)
+        if encryption_required:
+            logger.error(
+                "[R37-P1-4] BACKUP_ENCRYPTION_REQUIRED=true 但加密不可用"
+                "(BACKUP_KEK 未配置/格式错误/cryptography 未安装),"
+                "停止备份服务以避免明文数据泄露。"
+                "请配置 BACKUP_KEK(32 字节 base64)或显式设置 BACKUP_ENCRYPTION_REQUIRED=false(仅本地开发)。"
+            )
+            return
         logger.warning(
             "[R36-H7] 备份加密未启用(BACKUP_KEK 未配置或 cryptography 不可用),"
-            "备份将以明文存储。商用环境必须配置 BACKUP_KEK。"
+            "备份将以明文存储。商用环境必须配置 BACKUP_KEK + BACKUP_ENCRYPTION_REQUIRED=true。"
         )
 
     # R35 P1-7 + R36 H7: 启用自建备份时,日志说明增量模式

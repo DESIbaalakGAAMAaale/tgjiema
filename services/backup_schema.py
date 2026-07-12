@@ -62,10 +62,10 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "daily_decode_quota", "quota_used_today", "quota_date",
             "can_upload", "external_decode_quota", "external_used_today",
             "external_quota_date", "is_banned",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "deleted_at",
         ),
         conflict_col="user_id",
-        note="用户表(主键 user_id BIGINT)",
+        note="用户表(主键 user_id BIGINT;R37 P1-5 含 deleted_at tombstone)",
     ),
     "file_records": TableSchema(
         name="file_records",
@@ -78,10 +78,15 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "create_time", "expire_time", "blocked_users",
             "note", "protect_content", "updated_at", "file_ttl_days",
             "max_requests", "is_collection", "collection_codes",
+            "deleted_at",
         ),
         conflict_col="file_code",
-        where_clause="status = 'active'",  # 仅备份活跃文件,跳过已过期/删除
-        note="取件码→频道/消息映射(核心数据,仅备份 active;含合集码字段)",
+        # R37 P1-5: 移除 where_clause=status='active',
+        # 改为备份全部行(含 deleted_at 标记的软删除),
+        # 增量 watermark 通过 deleted_at > watermark 捕捉删除事件。
+        # 恢复时由业务层根据 deleted_at 决定是否激活。
+        where_clause="",
+        note="取件码→频道/消息映射(核心数据;R37 P1-5 含 deleted_at tombstone,备份全部行用于删除追溯)",
     ),
     "codes": TableSchema(
         name="codes",
@@ -90,10 +95,10 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "code", "file_record_code", "uploader_id", "file_types",
             "batch_msg_ids", "batch_file_meta", "primary_channel_id",
             "status", "created_at", "expire_time",
-            "note", "updated_at",
+            "note", "updated_at", "deleted_at",
         ),
         conflict_col="code",
-        note="取件码表(主键 code;含 uploader_id/file_types 等业务列)",
+        note="取件码表(主键 code;R37 P1-5 含 deleted_at tombstone)",
     ),
 
     # ─── 频道/槽位/轮转 ───
@@ -105,10 +110,10 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "prev_slot_id", "demoted_to_channel_id", "account_name",
             "is_r100", "last_heartbeat", "last_synced_msg_id",
             "degrade_count", "file_count", "rotation_started_at",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "deleted_at",
         ),
         conflict_col="slot_id",
-        note="频道槽位表(主键 slot_id;环形冗余架构)",
+        note="频道槽位表(主键 slot_id;环形冗余架构;R37 P1-5 含 deleted_at tombstone)",
     ),
     "spare_pool": TableSchema(
         name="spare_pool",

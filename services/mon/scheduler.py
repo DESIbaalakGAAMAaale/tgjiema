@@ -514,12 +514,14 @@ class MonScheduler:
                 item["src_message_id"], media_group_id=mgid,
             )
             if task_id == 0:
-                # 创建失败,降级到原 manifest 驱动(忽略 task-first,保持兼容)
-                # 但仍尝试复制,后续 manifest 登记走老路径
-                logger.warning(
-                    f"[Mon][repl] task 创建失败,fuid={fuid},降级到无 task 复制"
+                # R37 P1-1: task 创建失败必须 fail-closed(不可直接 copy)
+                # 原实现降级到无 task 复制(fail-open),绕过 task-first 可恢复性保证,
+                # 一旦复制成功但 manifest 登记失败将无法对账回退。
+                # 现在:跳过该条目并告警,由 reconcile worker 在 task 表恢复后重试。
+                logger.error(
+                    f"[Mon][repl] R37 P1-1: task 创建失败,fuid={fuid},"
+                    f"跳过复制(fail-closed,等待对账 worker 恢复 task 后重试)"
                 )
-                plan_items.append(item)
                 continue
             task_id_map[fuid] = task_id
             # 查询任务当前状态决定是否进入 claim 流程
@@ -781,10 +783,46 @@ class MonScheduler:
 
             # 超时检测:任务停留在 COPIED_UNVERIFIED 过久 → 标记 FAILED 重试
             if now - updated_at > reconcile_timeout:
-                logger.warning(
-                    f"[Mon][reconcile] task_id={task_id} COPIED_UNVERIFIED 超时 "
-                    f"({now - updated_at:.0f}s),标记 FAILED 重试"
-                )
+                # R37 P1-2: 重试前做二次探测,避免产生重复副本/孤儿消息
+                # 若 dst_msg_id 仍存在,说明 copy 实际已成功(只是状态机未推进),
+                # 应再尝试一次 manifest + COMMITTED 写入,不重新 copy。
+                # 只有 dst_msg_id 也丢失时,才允许标记 FAILED 让下轮重新 copy
+                # (此时确实无法判断 copy 是否成功,但这是少数边界场景)。
+                if dst_msg_id:
+                    manifest_record = {
+                        "group_id": group_id,
+                        "file_unique_id": fuid,
+                        "channel_id": dst_channel_id,
+                        "message_id": dst_msg_id,
+                        "media_type": media_type,
+                        "media_group_id": media_group_id,
+                    }
+                    backup_mappings = (
+                        [(src_msg_id, dst_msg_id)] if src_msg_id else None
+                    )
+                    committed = await _commit_replication_transaction_safe(
+                        store, task_id,
+                        manifest_records=[manifest_record],
+                        backup_mappings=backup_mappings,
+                        backup_channel_id=dst_channel_id,
+                    )
+                    if committed:
+                        reconciled += 1
+                        logger.info(
+                            f"[Mon][reconcile] R37 P1-2: task_id={task_id} "
+                            f"超时但 dst_msg_id 存在,二次写入 manifest 成功,"
+                            f"推进 COMMITTED(避免重复 copy)"
+                        )
+                        continue
+                    logger.warning(
+                        f"[Mon][reconcile] R37 P1-2: task_id={task_id} "
+                        f"超时且二次写入 manifest 失败,标记 FAILED 重试"
+                    )
+                else:
+                    logger.warning(
+                        f"[Mon][reconcile] task_id={task_id} COPIED_UNVERIFIED 超时 "
+                        f"且 dst_msg_id 缺失(无法二次探测,允许重 copy)"
+                    )
                 await _mark_replication_failed_safe(
                     store, task_id, "reconcile_timeout_copied_unverified"
                 )

@@ -24,7 +24,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 8  # R36 B0-1: jobs 表加 group_id/file_unique_id/media_group_id 列
+DDL_VERSION = 9  # R37 P1-5: 权威表增加 deleted_at tombstone 列(捕捉软删除用于增量备份)
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -41,7 +41,8 @@ DDL_STATEMENTS = [
         external_quota_date TEXT,
         is_banned INTEGER DEFAULT 0,
         created_at TEXT,
-        updated_at TEXT
+        updated_at TEXT,
+        deleted_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS file_records (
         file_code TEXT PRIMARY KEY,
@@ -57,7 +58,8 @@ DDL_STATEMENTS = [
         request_count INTEGER DEFAULT 0,
         create_time TEXT,
         expire_time TEXT,
-        blocked_users JSONB DEFAULT '[]'
+        blocked_users JSONB DEFAULT '[]',
+        deleted_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS decode_logs (
         id SERIAL PRIMARY KEY,
@@ -131,7 +133,8 @@ DDL_STATEMENTS = [
         file_count INTEGER DEFAULT 0,
         rotation_started_at TEXT,
         created_at TEXT,
-        updated_at TEXT
+        updated_at TEXT,
+        deleted_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS codes (
         code TEXT PRIMARY KEY,
@@ -143,7 +146,8 @@ DDL_STATEMENTS = [
         primary_channel_id BIGINT,
         status TEXT DEFAULT 'active',
         created_at TEXT,
-        expire_time TEXT
+        expire_time TEXT,
+        deleted_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS jobs (
         id SERIAL PRIMARY KEY,
@@ -272,6 +276,14 @@ MIGRATION_STATEMENTS = [
     "DROP INDEX IF EXISTS idx_users_first_name",
     "DROP INDEX IF EXISTS idx_decode_logs_requester",
     "DROP INDEX IF EXISTS idx_file_records_msg_id",
+    # R37 P1-5: 权威表增加 deleted_at tombstone 列(增量备份可捕捉软删除)
+    # 用于解决仅靠 updated_at 增量 watermark 无法捕捉硬删除/状态过滤的问题。
+    # 软删除时同时设置 status='deleted' 和 deleted_at=<timestamp>,
+    # 备份时通过 deleted_at > watermark 条件捕捉删除事件。
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS deleted_at TEXT",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS deleted_at TEXT",
+    "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS deleted_at TEXT",
+    "ALTER TABLE IF EXISTS cells ADD COLUMN IF NOT EXISTS deleted_at TEXT",
     # TTL 设置不在此处执行 — ADD COLUMN 是异步 schema change，
     # 紧跟 TTL 修改会报 "cannot modify TTL settings while another schema change
     # is being processed"。改为在下方单独循环中带等待执行。
