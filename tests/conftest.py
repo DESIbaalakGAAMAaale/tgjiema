@@ -34,6 +34,7 @@ def _install_fake_config() -> None:
     settings.WRITER_BATCH_SIZE = 10
     settings.WRITER_QUEUE_ALERT_THRESHOLD = 1000
     settings.WRITER_READ_CACHE_TTL = 5
+    settings.WRITER_DEAD_QUEUE_KEY = "tgjiema:writer:dead"
     settings.CRDB_POOL_MIN_SIZE = 1
     settings.CRDB_POOL_MAX_SIZE = 5
 
@@ -44,17 +45,26 @@ def _install_fake_config() -> None:
 
 
 def _ensure_tested_modules_importable() -> None:
-    """确保被测模块 database.redis_queue / database.write_router 可导入。
+    """确保被测模块 database.redis_queue / database.write_router / database.db_writer 可导入。
 
     优先走正常导入路径。若 ``database/__init__.py`` 因环境问题无法导入
     (例如其依赖的 ``session.py`` 使用了 Python 3.10+ 语法、或缺失 asyncpg 等
     运行时依赖),则降级为:构造轻量 ``database`` 包占位对象,按文件路径直接
-    加载 ``redis_queue.py`` 与 ``write_router.py`` 两个子模块并注册到 sys.modules,
-    从而绕过重 ``__init__``。被测的两个模块本身只依赖 loguru,不依赖 session。
+    加载 ``redis_queue.py`` / ``write_router.py`` / ``db_writer.py`` 三个子模块
+    并注册到 sys.modules,从而绕过重 ``__init__``。
+
+    db_writer 依赖 cache_store.CacheStore / DB_PATH,若 cache_store 因
+    aiosqlite 等依赖缺失无法加载,创建 mock 占位对象让 db_writer 可导入
+    (测试中 _execute_sqlite 被 mock,不需要真实 CacheStore 实现)。
     """
     try:
         importlib.import_module("database.redis_queue")
         importlib.import_module("database.write_router")
+        # 也尝试导入 db_writer(可能因 cache_store 依赖失败)
+        try:
+            importlib.import_module("database.db_writer")
+        except Exception:
+            pass  # 降级路径会处理
         return
     except Exception:
         # 正常导入失败 → 走降级路径,避免阻塞测试收集
@@ -76,8 +86,35 @@ def _ensure_tested_modules_importable() -> None:
         module = importlib.util.module_from_spec(spec)
         sys.modules[full_name] = module
         spec.loader.exec_module(module)
-        # 将子模块挂到包对象上,供 ``from database import redis_queue`` 解析
         setattr(db_pkg, mod_name, module)
+
+    # 尝试加载 cache_store(db_writer 依赖它);失败则创建 mock 占位
+    cache_store_name = "database.cache_store"
+    try:
+        spec = importlib.util.spec_from_file_location(cache_store_name, db_dir / "cache_store.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[cache_store_name] = module
+        spec.loader.exec_module(module)
+        setattr(db_pkg, "cache_store", module)
+    except Exception:
+        # cache_store 依赖 aiosqlite 等,测试环境可能缺失
+        # 创建 mock 占位:db_writer 只需 CacheStore 类和 DB_PATH 属性
+        from unittest.mock import MagicMock
+        mock_cs = types.ModuleType("database.cache_store")
+        mock_cs.CacheStore = MagicMock(name="MockCacheStore")
+        mock_cs.DB_PATH = db_dir.parent / "data" / "cache_store.db"
+        sys.modules[cache_store_name] = mock_cs
+        setattr(db_pkg, "cache_store", mock_cs)
+
+    # 加载 db_writer(cache_store 已就绪)
+    try:
+        spec = importlib.util.spec_from_file_location("database.db_writer", db_dir / "db_writer.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["database.db_writer"] = module
+        spec.loader.exec_module(module)
+        setattr(db_pkg, "db_writer", module)
+    except Exception:
+        pass  # db_writer 加载失败时,importorskip 会优雅跳过
 
 
 # 收集阶段即注入(早于任何 test 模块 import 被测代码)

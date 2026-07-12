@@ -159,12 +159,23 @@ class DBWriter:
         await redis_queue.close_redis()
         logger.info("[DBWriter] 资源已清理")
 
-    async def _process_message(self, msg: dict):
+    async def _process_message(self, msg):
         """处理单条消息:解析 → 执行 SQLite → DEL 缓冲 key。
 
-        单条消息处理失败不影响后续消息,记录 ERROR 后继续。
+        单条消息处理失败不影响后续消息,记录 ERROR 后转入死信队列。
         CancelledError 不被捕获(它是 BaseException 的子类),会向上传播触发优雅停止。
+
+        P0修复: 失败消息转入死信队列(tgjiema:writer:dead),避免永久丢失
+        P1修复: msg 类型校验(非 dict 直接转死信)
+        P1修复: TypeError(方法签名不匹配)单独处理为永久失败,入死信不重试
         """
+        # P1修复: msg 类型校验(防止 BRPOP 返回非 dict 导致 msg.get 崩溃)
+        if not isinstance(msg, dict):
+            self._error_count += 1
+            logger.error(f"[DBWriter] 消息非 dict 类型: {type(msg).__name__}, 转入死信队列")
+            await redis_queue.push_dead(msg, reason="msg is not a dict")
+            return
+
         writer_msg = DBWriterMessage(
             op_type=msg.get("op_type", ""),
             table=msg.get("table", ""),
@@ -181,11 +192,26 @@ class DBWriter:
             # 仅当 SQLite 写成功后才 DEL,失败时保留旧缓存避免读到半成品
             if writer_msg.redis_key:
                 await redis_queue.delete(writer_msg.redis_key)
+        except TypeError as e:
+            # P1修复: TypeError 通常是方法签名不匹配(参数名错误/缺失),
+            # 属于永久性错误,重试也不会成功,直接入死信队列
+            self._error_count += 1
+            logger.error(
+                f"[DBWriter] 方法签名不匹配(永久失败,入死信): "
+                f"method={writer_msg.method_name}, table={writer_msg.table}: {e}"
+            )
+            await redis_queue.push_dead(
+                msg, reason=f"TypeError: {e}"
+            )
         except Exception as e:
             self._error_count += 1
             logger.error(
-                f"[DBWriter] 消息处理失败(method={writer_msg.method_name}, "
-                f"table={writer_msg.table}): {e}"
+                f"[DBWriter] 消息处理失败(入死信): method={writer_msg.method_name}, "
+                f"table={writer_msg.table}: {e}"
+            )
+            # P0修复: 失败消息转入死信队列,避免永久丢失
+            await redis_queue.push_dead(
+                msg, reason=f"{type(e).__name__}: {e}"
             )
             # 不抛出,继续处理下一条消息
 

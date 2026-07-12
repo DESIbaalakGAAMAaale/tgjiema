@@ -119,6 +119,8 @@ class Settings(BaseSettings):
     WRITER_QUEUE_ALERT_THRESHOLD: int = 1000
     # 读缓存 TTL(秒),热数据 Redis 缓存过期时间
     WRITER_READ_CACHE_TTL: int = 5
+    # 死信队列 key(P0修复: 处理失败的消息转入此队列,避免永久丢失)
+    WRITER_DEAD_QUEUE_KEY: str = "tgjiema:writer:dead"
 
     # ─── 配额同步间隔 ──────────────────────────────────────────
     QUOTA_SYNC_INTERVAL: int = 300       # 秒(5分钟),减少 CRDB RU 消耗

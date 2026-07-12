@@ -2740,6 +2740,19 @@ def _dumps_str(obj) -> str:
     return raw.decode() if isinstance(raw, bytes) else raw
 
 
+def _loads_cached(cached: str):
+    """安全反序列化 Redis 缓存(P1修复: 单条缓存损坏不抛异常,回退到 SQLite 重读)。
+
+    Returns:
+        反序列化后的对象;解析失败返回 None(调用方会回退到 SQLite 重读并回填)
+    """
+    try:
+        return json.loads(cached)
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning(f"[CacheStoreRouter] 缓存反序列化失败,回退 SQLite: {e}")
+        return None
+
+
 class CacheStoreRouter(CacheStore):
     """带 Redis 路由的 CacheStore(bot 进程使用)。
 
@@ -2765,7 +2778,7 @@ class CacheStoreRouter(CacheStore):
             op_type="upsert",
             data={"slot_id": slot_id, "ok": ok, "_batch": False},  # P0修复: db_writer 端总是立即 commit
             redis_key="",
-            fallback=lambda: super(CacheStoreRouter, self).write_heartbeat(slot_id, ok, _batch),
+            fallback=lambda: super(CacheStoreRouter, self).write_heartbeat(slot_id, ok, _batch=False),  # P1修复: 与 Redis 路径保持一致
         )
 
     async def write_bot_heartbeat(self, name: str, total_processed: int = 0, total_errors: int = 0):
@@ -2827,7 +2840,7 @@ class CacheStoreRouter(CacheStore):
             op_type="upsert",
             data={"record": safe_record, "mark_dirty": mark_dirty, "_batch": False},  # P0修复: db_writer 端总是立即 commit
             redis_key=f"cache:file_record:{file_code}" if file_code else "",
-            fallback=lambda: super(CacheStoreRouter, self).upsert_file_record_local(record, mark_dirty, _batch),
+            fallback=lambda: super(CacheStoreRouter, self).upsert_file_record_local(record, mark_dirty, _batch=False),  # P1修复: 与 Redis 路径保持一致
         )
 
     async def upsert_code_local(self, record: dict, mark_dirty: bool = True, _batch: bool = False):
@@ -2841,7 +2854,7 @@ class CacheStoreRouter(CacheStore):
             op_type="upsert",
             data={"record": safe_record, "mark_dirty": mark_dirty, "_batch": False},  # P0修复: db_writer 端总是立即 commit
             redis_key=f"cache:code:{code}" if code else "",
-            fallback=lambda: super(CacheStoreRouter, self).upsert_code_local(record, mark_dirty, _batch),
+            fallback=lambda: super(CacheStoreRouter, self).upsert_code_local(record, mark_dirty, _batch=False),  # P1修复: 与 Redis 路径保持一致
         )
 
     async def upsert_user_local(self, user: dict, mark_dirty: bool = True, _batch: bool = False):
@@ -2855,7 +2868,7 @@ class CacheStoreRouter(CacheStore):
             op_type="upsert",
             data={"user": safe_user, "mark_dirty": mark_dirty, "_batch": False},  # P0修复: db_writer 端总是立即 commit
             redis_key=f"cache:user:{user_id}" if user_id else "",
-            fallback=lambda: super(CacheStoreRouter, self).upsert_user_local(user, mark_dirty, _batch),
+            fallback=lambda: super(CacheStoreRouter, self).upsert_user_local(user, mark_dirty, _batch=False),  # P1修复: 与 Redis 路径保持一致
         )
 
     async def update_cell_fields_local(self, slot_id: str, fields: dict, mark_dirty: bool = False):
@@ -3185,6 +3198,23 @@ class CacheStoreRouter(CacheStore):
         from database import redis_queue
         await redis_queue.cache_delete("cache:all_cells")
 
+    async def batch_update_cells_local(self, updates: list[tuple[str, dict, bool]]):
+        """原子批量更新 cells — 直写 SQLite(需事务原子性,不走 Redis),
+        写后失效 cells 缓存(P0修复: 原先未重写,mon_bot 旋转后会读到旧缓存)
+        """
+        await super().batch_update_cells_local(updates)
+        from database import redis_queue
+        await redis_queue.cache_delete("cache:all_cells")
+
+    async def delete_cell_local(self, slot_id: str) -> bool:
+        """删除 cell — 直写 SQLite(需事务修复链表指针,不走 Redis),
+        写后失效 cells 缓存(P0修复: 原先未重写,mon_bot 旋转后会读到旧缓存)
+        """
+        result = await super().delete_cell_local(slot_id)
+        from database import redis_queue
+        await redis_queue.cache_delete("cache:all_cells")
+        return result
+
     # ── 重写读方法(加 Redis 缓存层)──
 
     async def get_user_quota(self, user_id: int) -> dict | None:
@@ -3193,7 +3223,9 @@ class CacheStoreRouter(CacheStore):
         cache_key = f"cache:user_quota:{user_id}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
-            return json.loads(cached)
+            parsed = _loads_cached(cached)  # P1修复: 安全反序列化
+            if parsed is not None:
+                return parsed
         result = await super().get_user_quota(user_id)
         if result:
             await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=5)
@@ -3205,7 +3237,9 @@ class CacheStoreRouter(CacheStore):
         cache_key = f"cache:file_record:{file_code}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
-            return json.loads(cached)
+            parsed = _loads_cached(cached)  # P1修复: 安全反序列化
+            if parsed is not None:
+                return parsed
         result = await super().get_file_record_local(file_code)
         if result:
             await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
@@ -3217,7 +3251,9 @@ class CacheStoreRouter(CacheStore):
         cache_key = f"cache:code:{code}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
-            return json.loads(cached)
+            parsed = _loads_cached(cached)  # P1修复: 安全反序列化
+            if parsed is not None:
+                return parsed
         result = await super().get_code_local(code)
         if result:
             await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
@@ -3229,7 +3265,9 @@ class CacheStoreRouter(CacheStore):
         cache_key = f"cache:user:{user_id}"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
-            return json.loads(cached)
+            parsed = _loads_cached(cached)  # P1修复: 安全反序列化
+            if parsed is not None:
+                return parsed
         result = await super().get_user_local(user_id)
         if result:
             await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=30)
@@ -3241,7 +3279,9 @@ class CacheStoreRouter(CacheStore):
         cache_key = "cache:all_cells"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
-            return json.loads(cached)
+            parsed = _loads_cached(cached)  # P1修复: 安全反序列化
+            if parsed is not None:
+                return parsed
         result = await super().get_all_cells_local()
         if result:
             await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=10)
@@ -3253,7 +3293,9 @@ class CacheStoreRouter(CacheStore):
         cache_key = "cache:all_bot_heartbeats"
         cached = await redis_queue.cache_get(cache_key)
         if cached:
-            return json.loads(cached)
+            parsed = _loads_cached(cached)  # P1修复: 安全反序列化
+            if parsed is not None:
+                return parsed
         result = await super().get_all_bot_heartbeats()
         if result:
             await redis_queue.cache_set(cache_key, _dumps_str(result), ttl=5)

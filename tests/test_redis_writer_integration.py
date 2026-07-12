@@ -2,29 +2,27 @@
 
 被测模块: ``database.db_writer``(Writer 进程:BRPOP 消费 → SQLite 落盘 → DEL 缓冲)
 
-重要说明:
-- 当前 ``database.db_writer`` 尚未实现时,本文件全部用例自动跳过(``pytest.importorskip``),
-  不会报错,也不会阻塞 CI。
-- 用例依据 ``docs/redis_writer_design.md`` 的设计契约编写:
-  * ``DBWriter`` 类含 ``_running`` / ``_process_message(msg)`` /
-    ``_execute_sqlite(op_type, table, data)`` / ``_cleanup_redis_key(key)`` 等成员。
-  * 消息格式与 ``redis_queue.push`` 序列化格式一致(op_type/table/method_name/
-    data/redis_key/created_at)。
-- ``db_writer`` 实现后若 API 与设计契约存在差异,需相应调整断言。
+测试契约(基于 ``database/db_writer.py`` 实际实现):
+  * ``DBWriter()`` 构造不建立连接(连接在 ``init()`` 中建立)
+  * ``_process_message(msg)`` 接收单个 dict 参数(或非 dict 触发死信)
+  * ``_execute_sqlite(msg: DBWriterMessage)`` 接收 DBWriterMessage 对象(非 3 个位置参数)
+  * 无 ``_cleanup_redis_key`` 方法(DEL 内联在 ``_process_message`` 中)
+  * 失败消息通过 ``redis_queue.push_dead`` 转入死信队列
+  * ``TypeError`` (方法签名不匹配)单独分类为永久失败入死信
+
+P0修复: 整个文件基于实际 DBWriter API 重写,匹配 _store/_execute_sqlite/push_dead 接口
 """
-import inspect
 import json
-from contextlib import suppress
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 # db_writer 模块不存在时,整文件自动跳过(不报错、不阻塞)
 db_writer = pytest.importorskip("database.db_writer")
-DBWriter = getattr(db_writer, "DBWriter", None)
+DBWriter = getattr(db_writer, "DBWriterMessage", None)  # 仅验证模块可导入
+DBWriterClass = getattr(db_writer, "DBWriter", None)
 
-if DBWriter is None:
-    # 模块存在但未定义 DBWriter 类时同样跳过
+if DBWriterClass is None:
     pytest.skip("database.db_writer 未定义 DBWriter 类", allow_module_level=True)
 
 
@@ -34,7 +32,7 @@ def _make_msg(**overrides) -> dict:
         "op_type": "upsert",
         "table": "user_quota",
         "method_name": "upsert_user_quota",
-        "data": {"user_id": 1, "quota": 20},
+        "data": {"user_id": 1, "data": {"quota": 20}},
         "redis_key": "cache:user_quota:1",
         "created_at": 1000.0,
     }
@@ -42,95 +40,143 @@ def _make_msg(**overrides) -> dict:
     return base
 
 
-async def _maybe_await(value):
-    """统一处理同步/异步方法返回值(设计契约未限定 _process_message/stop 是否为 async)。"""
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
 @pytest.fixture
 def writer(monkeypatch):
     """构造一个 DBWriter 实例,其 Redis 与 SQLite 依赖均被 mock 隔离。
 
-    注:依据设计契约,``DBWriter()`` 构造不应建立真实连接(连接在 ``start()`` 中建立)。
-    若实现版本构造函数需要参数,需调整本 fixture。
+    注:依据实际实现,``DBWriter()`` 构造不建立连接(连接在 ``init()`` 中建立)。
+    ``_store`` 在 ``init()`` 后才非 None,本 fixture 不调用 init,
+    直接 mock ``_execute_sqlite`` 来测试 ``_process_message`` 的路由逻辑。
     """
-    instance = DBWriter()
-    # 注入模拟的 SQLite 连接与运行标志,避免触达真实 IO
-    instance._db = MagicMock(name="mock_sqlite_conn")
+    instance = DBWriterClass()
+    instance._store = MagicMock(name="mock_store")  # 模拟已初始化的 CacheStore
     instance._running = True
-    # Writer 内部通过 database.redis_queue 调用 pop/delete;这里仅 stub,默认不消费
-    monkeypatch.setattr(
-        "database.redis_queue.pop", AsyncMock(return_value=[]), raising=True
-    )
+    instance._processed_count = 0
+    instance._error_count = 0
+    # mock redis_queue 的所有外部调用
     monkeypatch.setattr(
         "database.redis_queue.delete", AsyncMock(return_value=True), raising=True
+    )
+    monkeypatch.setattr(
+        "database.redis_queue.push_dead", AsyncMock(return_value=True), raising=True
     )
     return instance
 
 
-class TestDBWriterIntegration:
-    """DBWriter 进程端到端集成测试。"""
+class TestDBWriterProcessMessage:
+    """DBWriter._process_message 单元测试。"""
 
     @pytest.mark.asyncio
-    async def test_writer_consumes_and_writes_sqlite(self, writer):
-        """Writer 消费 Redis Queue 中的消息并写入 SQLite(触发 _execute_sqlite)。"""
+    async def test_process_message_success(self, writer):
+        """成功处理消息:_execute_sqlite 被调用,redis_key 被 DEL,计数+1。"""
         msg = _make_msg()
         writer._execute_sqlite = AsyncMock(return_value=None)
-        writer._cleanup_redis_key = AsyncMock(return_value=None)
 
-        await _maybe_await(writer._process_message(msg))
+        await writer._process_message(msg)
 
-        writer._execute_sqlite.assert_awaited_once_with("upsert", "user_quota", msg["data"])
-
-    @pytest.mark.asyncio
-    async def test_writer_dels_redis_key_after_write(self, writer):
-        """Writer 写完 SQLite 后 DEL Redis 缓冲 key(触发 _cleanup_redis_key)。"""
-        msg = _make_msg(redis_key="cache:user_quota:1")
-        writer._execute_sqlite = AsyncMock(return_value=None)
-        writer._cleanup_redis_key = AsyncMock(return_value=None)
-
-        await _maybe_await(writer._process_message(msg))
-
-        # 写入后必须清除缓冲 key,避免下次读到旧数据
         writer._execute_sqlite.assert_awaited_once()
-        writer._cleanup_redis_key.assert_awaited_once_with("cache:user_quota:1")
+        assert writer._processed_count == 1
+        assert writer._error_count == 0
 
     @pytest.mark.asyncio
-    async def test_writer_graceful_shutdown(self, writer):
-        """Writer 收到 SIGTERM/stop 后优雅停止(_running 置 False)。"""
+    async def test_process_message_dels_redis_key(self, writer):
+        """处理成功后 DEL Redis 缓冲 key(清除缓冲)。"""
+        msg = _make_msg(redis_key="cache:user_quota:42")
+        writer._execute_sqlite = AsyncMock(return_value=None)
+
+        await writer._process_message(msg)
+
+        # 验证 redis_queue.delete 被调用(DEL 缓冲 key)
+        from database import redis_queue
+        redis_queue.delete.assert_awaited_once_with("cache:user_quota:42")
+
+    @pytest.mark.asyncio
+    async def test_process_message_no_redis_key_no_del(self, writer):
+        """redis_key 为空时不调用 DEL。"""
+        msg = _make_msg(redis_key="")
+        writer._execute_sqlite = AsyncMock(return_value=None)
+
+        await writer._process_message(msg)
+
+        from database import redis_queue
+        redis_queue.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_process_message_failure_to_dead_queue(self, writer):
+        """处理失败(非 TypeError)→ 消息转入死信队列,继续处理后续消息。"""
+        msg = _make_msg()
+        writer._execute_sqlite = AsyncMock(side_effect=RuntimeError("db error"))
+
+        await writer._process_message(msg)
+
+        assert writer._error_count == 1
+        assert writer._processed_count == 0
+        # 验证消息转入死信队列
+        from database import redis_queue
+        redis_queue.push_dead.assert_awaited_once()
+        args, kwargs = redis_queue.push_dead.call_args
+        assert args[0] == msg  # 原始消息
+        assert "RuntimeError" in kwargs.get("reason", "")
+
+    @pytest.mark.asyncio
+    async def test_process_message_typeerror_to_dead_queue(self, writer):
+        """TypeError(方法签名不匹配)→ 永久失败,入死信队列。"""
+        msg = _make_msg(method_name="bad_method", data={"wrong_param": 1})
+        writer._execute_sqlite = AsyncMock(side_effect=TypeError("unexpected keyword argument"))
+
+        await writer._process_message(msg)
+
+        assert writer._error_count == 1
+        from database import redis_queue
+        redis_queue.push_dead.assert_awaited_once()
+        args, kwargs = redis_queue.push_dead.call_args
+        assert "TypeError" in kwargs.get("reason", "")
+
+    @pytest.mark.asyncio
+    async def test_process_message_non_dict_to_dead_queue(self, writer):
+        """非 dict 消息 → 直接入死信队列,不调用 _execute_sqlite。"""
+        writer._execute_sqlite = AsyncMock(return_value=None)
+
+        # 传入非 dict(字符串、None、列表)
+        for bad_msg in ["not_a_dict", None, [1, 2, 3], 42]:
+            await writer._process_message(bad_msg)
+
+        # 所有非 dict 消息都入死信,_execute_sqlite 从未被调用
+        assert writer._error_count == 4
+        assert writer._processed_count == 0
+        writer._execute_sqlite.assert_not_awaited()
+        from database import redis_queue
+        assert redis_queue.push_dead.await_count == 4
+
+    @pytest.mark.asyncio
+    async def test_process_message_failure_continues(self, writer):
+        """单条失败不影响后续消息处理(失败+成功)。"""
+        msg_bad = _make_msg(method_name="bad")
+        msg_good = _make_msg(method_name="good")
+        writer._execute_sqlite = AsyncMock(side_effect=[RuntimeError("fail"), None])
+
+        await writer._process_message(msg_bad)
+        await writer._process_message(msg_good)
+
+        assert writer._execute_sqlite.await_count == 2
+        assert writer._error_count == 1
+        assert writer._processed_count == 1
+
+
+class TestDBWriterStop:
+    """DBWriter.stop 优雅停止测试。"""
+
+    @pytest.mark.asyncio
+    async def test_stop_sets_running_false(self, writer):
+        """stop() 设置 _running=False。"""
         assert writer._running is True
-        await _maybe_await(writer.stop())
+        await writer.stop()
         assert writer._running is False
 
     @pytest.mark.asyncio
-    async def test_writer_batch_consume(self, writer):
-        """Writer 批量消费多条消息:每条都触发一次 _execute_sqlite。"""
-        msgs = [_make_msg(method_name="m%d" % i, data={"i": i}) for i in range(3)]
-        writer._execute_sqlite = AsyncMock(return_value=None)
-        writer._cleanup_redis_key = AsyncMock(return_value=None)
-
-        for m in msgs:
-            await _maybe_await(writer._process_message(m))
-
-        assert writer._execute_sqlite.await_count == 3
-
-    @pytest.mark.asyncio
-    async def test_writer_message_failure_continues(self, writer):
-        """单条消息处理失败(_execute_sqlite 抛异常)不影响后续消息处理。"""
-        msg_bad = _make_msg(method_name="bad", data={"i": 0})
-        msg_good = _make_msg(method_name="good", data={"i": 1})
-        # 第一条抛异常,第二条正常
-        writer._execute_sqlite = AsyncMock(side_effect=[Exception("db error"), None])
-        writer._cleanup_redis_key = AsyncMock(return_value=None)
-
-        # 第一条失败:吞掉异常,模拟 Writer 循环的容错(继续处理下一条)
-        with suppress(Exception):
-            await _maybe_await(writer._process_message(msg_bad))
-
-        # 第二条应继续被处理
-        await _maybe_await(writer._process_message(msg_good))
-
-        # 两条都尝试过 _execute_sqlite(失败 + 成功)
-        assert writer._execute_sqlite.await_count == 2
+    async def test_stop_logs_counts(self, writer, capsys):
+        """stop() 记录已处理/失败的消息计数。"""
+        writer._processed_count = 42
+        writer._error_count = 3
+        await writer.stop()
+        # stop 不抛异常即可(日志通过 loguru 输出,不在此断言)

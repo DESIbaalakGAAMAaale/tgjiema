@@ -117,7 +117,15 @@ async def pop(timeout: int = 0, count: int = 1) -> list[dict]:
             if item is None:
                 break
             _key, raw = item
-            msg = json.loads(raw)
+            # P1修复: 单条消息 JSON 解析失败不影响整批,丢弃坏消息并告警
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                logger.warning(
+                    f"[RedisQueue] 消息 JSON 解析失败,丢弃该消息: {e}, "
+                    f"raw={raw!r}"
+                )
+                continue
             result.append(msg)
         return result
     except Exception as e:
@@ -135,6 +143,33 @@ async def delete(key: str) -> bool:
         return True
     except Exception as e:
         logger.debug(f"[RedisQueue] delete 异常: {e}")
+        return False
+
+
+async def push_dead(msg: dict, reason: str = "") -> bool:
+    """推入死信队列(P0修复: 处理失败的消息转入死信队列,避免永久丢失)。
+
+    Args:
+        msg: 原始消息字典(或任意可序列化对象)
+        reason: 失败原因(记录在消息中,便于排查)
+
+    Returns:
+        True 推入成功, False 失败(此时消息已丢失,只能靠日志排查)
+    """
+    redis = await get_redis()
+    if not redis:
+        return False
+    try:
+        from config import settings
+        dead_msg = {
+            "original": msg,
+            "reason": reason,
+            "failed_at": time.time(),
+        }
+        await redis.rpush(settings.WRITER_DEAD_QUEUE_KEY, json.dumps(dead_msg, default=str))
+        return True
+    except Exception as e:
+        logger.error(f"[RedisQueue] push_dead 失败(消息已丢失): {e}")
         return False
 
 
