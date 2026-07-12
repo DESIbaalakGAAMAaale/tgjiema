@@ -54,7 +54,143 @@ _PAGE_STATE_TTL = 300  # 5 分钟过期清理
 
 # P1-2: 已成功投递的 msg_id 跟踪,避免重试时重复投递
 # job_id -> set(storage_msg_id),job 完成或死信时清理
+# R35 §21.2: 保留为内存缓存层,delivery_receipts 表为权威持久化层(双写)
 _sent_msg_tracker: dict[int, set[int]] = {}
+
+
+# ─── R35 §21.2 / §22: delivery_receipts 持久化 + ReplicaAwareResolver 接线 ───
+
+
+async def _upsert_delivery_receipt_safe(
+    store, job_id: int, source_msg_id: int, target_user_id: int,
+    status: str = "PENDING", sent_msg_id: int | None = None,
+    media_group_id: str = "", group_receipt_id: str = "",
+) -> None:
+    """异常安全地写入/更新投递回执(失败仅记录 warning,不传播到主流程)。
+
+    作为 _sent_msg_tracker 的持久化权威层:
+    - 投递前写 PENDING
+    - 投递成功后由 _confirm_delivery_receipt_safe 升级为 CONFIRMED
+    - 投递失败后由 _mark_delivery_failed_safe 标记 FAILED
+    """
+    if store is None:
+        return
+    try:
+        await store.upsert_delivery_receipt(
+            job_id, source_msg_id, target_user_id,
+            sent_msg_id=sent_msg_id,
+            media_group_id=media_group_id,
+            group_receipt_id=group_receipt_id,
+            status=status,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[Dsp] upsert_delivery_receipt 失败(忽略) "
+            f"job={job_id}, msg={source_msg_id}, status={status}: {e}"
+        )
+
+
+async def _confirm_delivery_receipt_safe(
+    store, job_id: int, source_msg_id: int, sent_msg_id: int,
+) -> None:
+    """异常安全地确认投递回执(status='CONFIRMED', confirmed_at=now)。
+
+    与 _sent_msg_tracker.setdefault(...).add(mid) 双写,保证向后兼容。
+    """
+    if store is None:
+        return
+    try:
+        await store.confirm_delivery_receipt(job_id, source_msg_id, sent_msg_id)
+    except Exception as e:
+        logger.warning(
+            f"[Dsp] confirm_delivery_receipt 失败(忽略) "
+            f"job={job_id}, msg={source_msg_id}: {e}"
+        )
+
+
+async def _mark_delivery_failed_safe(
+    store, job_id: int, source_msg_id: int, reason: str,
+) -> None:
+    """异常安全地标记投递失败(status='FAILED', attempts+1)。"""
+    if store is None:
+        return
+    try:
+        await store.mark_delivery_failed(job_id, source_msg_id, reason)
+    except Exception as e:
+        logger.warning(
+            f"[Dsp] mark_delivery_failed 失败(忽略) "
+            f"job={job_id}, msg={source_msg_id}: {e}"
+        )
+
+
+def _extract_replica_info(job) -> tuple[str, int | None]:
+    """从 job.batch_file_meta 提取 (file_unique_id, group_id) 供 ReplicaAwareResolver 使用。
+
+    batch_file_meta 格式(up_bot 写入):
+      [{"chat_id":.., "msg_id":.., "media_group_id":..,
+        "file_type":.., "file_meta":.., "file_unique_id":..}, ...]
+
+    group_id 是 manifest 表的存储层概念(非 job 字段),当前数据流未暴露给 dsp。
+    返回 ("", None) 表示无可用副本信息,调用方应 fallback 到拓扑解析。
+    """
+    raw = getattr(job, "batch_file_meta", None)
+    if not raw:
+        return "", None
+    # 兼容 str(JSON) / list 两种格式
+    if isinstance(raw, str):
+        try:
+            items = json.loads(raw)
+        except Exception:
+            return "", None
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        return "", None
+    if not items or not isinstance(items, list):
+        return "", None
+    first = items[0] if isinstance(items[0], dict) else {}
+    fuid = first.get("file_unique_id", "") or ""
+    # group_id 当前不在 batch_file_meta 中(未来扩展点)
+    return fuid, None
+
+
+async def _try_replica_aware_resolve(
+    store, file_unique_id: str, group_id: int | None,
+    preferred_channels: list[int] | None = None,
+    exclude_channels: set[int] | None = None,
+) -> tuple[int, int] | None:
+    """尝试使用 ReplicaAwareResolver 按 manifest 副本解析频道。
+
+    R35 §22: Dsp 不再按拓扑猜测频道,优先以 manifest 副本为准。
+    当且仅当输入包含 file_unique_id 和 group_id 时启用;否则返回 None,由调用方 fallback。
+    Manifest 查询失败时返回 None,由调用方走 fail-closed 重试路径(普通下载降级)。
+    """
+    if not file_unique_id or group_id is None or store is None:
+        return None
+    try:
+        from services.delivery_resolver import ReplicaAwareResolver
+        resolver = ReplicaAwareResolver(store)
+        return await resolver.resolve_channel_for_file(
+            file_unique_id, group_id,
+            preferred_channels=preferred_channels,
+            exclude_channels=exclude_channels,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[Dsp] ReplicaAwareResolver 异常(降级拓扑解析) "
+            f"fuid={file_unique_id}, group={group_id}: {e}"
+        )
+        return None
+
+
+def _get_store_safe():
+    """安全获取 cache_store 实例(失败返回 None,不抛异常)。"""
+    try:
+        from database.cache_store import get_cache_store
+        return get_cache_store()
+    except Exception as e:
+        logger.warning(f"[Dsp] 获取 cache_store 失败(忽略 delivery_receipts 双写): {e}")
+        return None
 
 
 async def _cleanup_page_states():
@@ -410,7 +546,17 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
     await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
 
     # P1-2: 过滤已成功投递的 msg_id,避免重试时重复投递
+    # R35 §21.2: 优先以持久化 delivery_receipts 为权威源(进程重启后内存丢失仍可恢复),
+    #            _sent_msg_tracker 仅作内存加速缓存
     sent_set = _sent_msg_tracker.setdefault(job.job_id, set())
+    try:
+        persisted_sent_ids = await store.get_sent_msg_ids_for_job(job.job_id)
+    except Exception as e:
+        logger.warning(f"[Dsp-{worker_id}] 读取持久化 receipts 失败(降级内存): {e}")
+        persisted_sent_ids = []
+    if persisted_sent_ids:
+        # 合并到内存缓存(后续过滤以合并后的集合为准)
+        sent_set.update(persisted_sent_ids)
     original_ids = list(job.storage_msg_ids)
     if sent_set:
         job.storage_msg_ids = [mid for mid in job.storage_msg_ids if mid not in sent_set]
@@ -607,15 +753,60 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     # protect_content 已从 jobs 表直接获取,无需再查 file_records
     protect_content = getattr(job, "protect_content", False)
 
-    # ── 使用 copy_message 发送 ──
-    resolved = await resolve_delivery_channel(job.storage_channel_id)
-    sent_msg_id = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+    # R35 §21.2: 投递前写 PENDING receipt + 幂等检查(已 SENT/CONFIRMED 则跳过)
+    store = _get_store_safe()
+    if store is not None:
+        try:
+            existing = await store.get_delivery_receipts_by_job(job.job_id)
+            already_sent = {
+                r["source_msg_id"] for r in existing
+                if r.get("status") in ("SENT", "CONFIRMED")
+            }
+            if msg_id in already_sent:
+                logger.info(
+                    f"[Dsp] msg={msg_id} 已有持久化投递记录,跳过 job={job.job_id}"
+                )
+                _sent_msg_tracker.setdefault(job.job_id, set()).add(msg_id)
+                return True
+        except Exception as e:
+            logger.warning(f"[Dsp] 检查 delivery_receipt 幂等失败(忽略): {e}")
+    await _upsert_delivery_receipt_safe(
+        store, job.job_id, msg_id, job.target_user_id, status="PENDING"
+    )
 
+    # R35 §22: 优先尝试 ReplicaAwareResolver(按 manifest 副本解析,fail-closed)
+    fuid, gid = _extract_replica_info(job)
+    sent_msg_id: int | None = None
+    tried: set[int] = set()
+    if fuid and gid is not None:
+        replica = await _try_replica_aware_resolve(
+            store, fuid, gid,
+            preferred_channels=[job.storage_channel_id],
+        )
+        if replica is not None:
+            replica_channel, replica_msg_id = replica
+            logger.info(
+                f"[Dsp] ReplicaAwareResolver 命中 "
+                f"ch={replica_channel}, msg={replica_msg_id}, fuid={fuid}"
+            )
+            tried.add(replica_channel)
+            sent_msg_id = await try_deliver(
+                bot, job.target_user_id, replica_channel, replica_msg_id,
+                protect_content=protect_content, bot_id=bot_id,
+                original_channel_id=job.storage_channel_id,
+            )
+
+    # ── 使用 copy_message 发送(fallback 路径)──
+    resolved = None
     if not sent_msg_id:
+        resolved = await resolve_delivery_channel(job.storage_channel_id)
+        sent_msg_id = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+
+    if not sent_msg_id and resolved is not None:
         await _record_channel_failure(resolved.channel_id)
         # 环形降级:沿环找下一个可用频道,避免重复尝试同一频道
         from storage.delivery_resolver import _walk_ring_for_channel
-        tried = {resolved.channel_id}
+        tried.add(resolved.channel_id)
         current_id = resolved.channel_id
         for _ in range(10):  # 最多尝试 10 个降级槽位
             next_resolved = await _walk_ring_for_channel(current_id)
@@ -635,7 +826,9 @@ async def _process_single_job(bot, job, bot_id: int = 1):
 
     if sent_msg_id:
         logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
+        # R35 §21.2: 双写 — 内存缓存层(_sent_msg_tracker) + 持久化权威层(delivery_receipts)
         _sent_msg_tracker.setdefault(job.job_id, set()).add(msg_id)
+        await _confirm_delivery_receipt_safe(store, job.job_id, msg_id, sent_msg_id)
         # 第三方 Bot 原始 caption 需原样保留，不覆盖为标准模板
         if not await _should_preserve_caption(job.code):
             caption = await _build_delivery_caption(job.code, total_count=1)
@@ -645,7 +838,12 @@ async def _process_single_job(bot, job, bot_id: int = 1):
         return True
 
     # 所有槽位均不可用,记录失败
-    logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried)}")
+    logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried) or 1}")
+    # R35 §21.2: 持久化失败回执(status=PENDING → FAILED)
+    await _mark_delivery_failed_safe(
+        store, job.job_id, msg_id,
+        reason=f"all_channels_unavailable tried={len(tried) or 1}",
+    )
     await metrics.record_send_fail()
     await metrics.record_error("dsp_bot")
     try:
@@ -713,24 +911,40 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     避免双重获取导致低并发时死锁。消息逐个发送本身已串行，无需额外限流。
     S-4: 返回值反映实际发送结果，不再恒为 True。
     P1-2: 成功投递的 msg_id 记入 _sent_msg_tracker,重试时跳过。
+    R35 §21.2: 同时双写 delivery_receipts(PENDING/CONFIRMED/FAILED)。
     """
     protect_content = getattr(job, "protect_content", False)
     all_success = True
     first_sent_mid: int | None = None
+    store = _get_store_safe()
     for i, mid in enumerate(job.storage_msg_ids):
+        # R35 §21.2: 投递前写 PENDING receipt(异常安全)
+        await _upsert_delivery_receipt_safe(
+            store, job.job_id, mid, job.target_user_id, status="PENDING"
+        )
         try:
             resolved = await resolve_delivery_channel(job.storage_channel_id)
             sent_mid = await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
             if sent_mid:
+                # R35 §21.2: 双写 — 内存缓存 + 持久化权威层
                 _sent_msg_tracker.setdefault(job.job_id, set()).add(mid)
+                await _confirm_delivery_receipt_safe(store, job.job_id, mid, sent_mid)
                 await metrics.record_send_success()
                 if first_sent_mid is None:
                     first_sent_mid = sent_mid
             else:
+                # R35 §21.2: 持久化失败回执
+                await _mark_delivery_failed_safe(
+                    store, job.job_id, mid,
+                    reason=f"fallback_copy_failed ch={resolved.channel_id}",
+                )
                 await metrics.record_send_fail()
                 all_success = False
         except Exception as e:
             logger.error(f"[Dsp] 兜底发送异常 (msg={mid}): {e}")
+            await _mark_delivery_failed_safe(
+                store, job.job_id, mid, reason=f"exception:{type(e).__name__}"
+            )
             await metrics.record_send_fail()
             all_success = False
         # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
@@ -773,10 +987,13 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
 
         if batch_copied_ids:
             logger.info(f"[Dsp] 分页发送成功(批量相册): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(page_msg_ids)}个文件)")
-            # P1-2: 记录已成功投递的 msg_id(仅 job 调用路径)
+            # P1-2 + R35 §21.2: 双写 — 内存缓存 + 持久化权威层(仅 job 调用路径)
             if job_id is not None:
-                for mid in page_msg_ids:
+                store = _get_store_safe()
+                for idx, mid in enumerate(page_msg_ids):
                     _sent_msg_tracker.setdefault(job_id, set()).add(mid)
+                    sent_mid_for_receipt = batch_copied_ids[idx] if idx < len(batch_copied_ids) else None
+                    await _confirm_delivery_receipt_safe(store, job_id, mid, sent_mid_for_receipt or 0)
             first_sent_msg_id = batch_copied_ids[0]
             await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
@@ -787,20 +1004,38 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             fallback_status = resolved.status if resolved else "unknown"
             success_count = 0
             fail_details = []
+            store = _get_store_safe() if job_id is not None else None
             for i, mid in enumerate(page_msg_ids):
+                # R35 §21.2: 投递前写 PENDING receipt(仅 job 调用路径)
+                if job_id is not None:
+                    await _upsert_delivery_receipt_safe(
+                        store, job_id, mid, chat_id, status="PENDING"
+                    )
                 try:
                     sent_mid = await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id)
                     if sent_mid:
                         success_count += 1
-                        # P1-2: 记录已成功投递的 msg_id(仅 job 调用路径)
+                        # P1-2 + R35 §21.2: 双写
                         if job_id is not None:
                             _sent_msg_tracker.setdefault(job_id, set()).add(mid)
+                            await _confirm_delivery_receipt_safe(store, job_id, mid, sent_mid)
                         if first_sent_msg_id is None:
                             first_sent_msg_id = sent_mid
                     else:
+                        # R35 §21.2: 持久化失败回执
+                        if job_id is not None:
+                            await _mark_delivery_failed_safe(
+                                store, job_id, mid,
+                                reason=f"page_copy_failed ch={fallback_channel}/{fallback_status}",
+                            )
                         fail_details.append(f"msg={mid}(channel={fallback_channel}/{fallback_status})")
                         logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={fallback_channel}/{fallback_status}, original_channel={storage_channel_id})")
                 except Exception as e:
+                    # R35 §21.2: 异常时也持久化失败回执
+                    if job_id is not None:
+                        await _mark_delivery_failed_safe(
+                            store, job_id, mid, reason=f"exception:{type(e).__name__}"
+                        )
                     fail_details.append(f"msg={mid}(exc={type(e).__name__})")
                     logger.error(f"[Dsp] _send_page copy 异常 (msg={mid}): {e}")
                 if i < len(page_msg_ids) - 1:
