@@ -16,6 +16,8 @@
 - 预留超时: 1 小时未结算的自动退款(由 cleanup_expired_reservations 处理)
 - 所有写入后调用 add_dirty_outbox() 确保跨机同步
 """
+from __future__ import annotations
+
 import datetime
 import time
 import uuid

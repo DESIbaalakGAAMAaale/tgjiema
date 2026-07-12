@@ -16,6 +16,11 @@ from .handlers import (
     spare_add, spare_remove, spare_list, rotation_set, rotation_view, topology,
     relay_whitelist, collector_whitelist, cell_add, cell_remove,
     cancel_conversation, help_command, restore, set_access_limit,
+    # R40 新增管理命令
+    cmd_reports, cmd_takedown, cmd_ban_user, cmd_unban_user,
+    cmd_pending_approvals, cmd_approve, cmd_reject, cmd_roles,
+    cmd_assign_role, cmd_maintenance, cmd_repair_console, cmd_backups,
+    cmd_ru_report,
 )
 from .callback import menu_callback
 from .conversation import handle_conversation
@@ -94,6 +99,20 @@ async def _async_main():
     app.add_handler(CommandHandler("cancel", cancel_conversation))
     app.add_handler(CommandHandler("restore", restore))
     app.add_handler(CommandHandler("help", help_command))
+    # R40 新增管理命令
+    app.add_handler(CommandHandler("reports", cmd_reports))
+    app.add_handler(CommandHandler("takedown", cmd_takedown))
+    app.add_handler(CommandHandler("ban_user", cmd_ban_user))
+    app.add_handler(CommandHandler("unban_user", cmd_unban_user))
+    app.add_handler(CommandHandler("pending_approvals", cmd_pending_approvals))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("reject", cmd_reject))
+    app.add_handler(CommandHandler("roles", cmd_roles))
+    app.add_handler(CommandHandler("assign_role", cmd_assign_role))
+    app.add_handler(CommandHandler("maintenance", cmd_maintenance))
+    app.add_handler(CommandHandler("repair_console", cmd_repair_console))
+    app.add_handler(CommandHandler("backups", cmd_backups))
+    app.add_handler(CommandHandler("ru_report", cmd_ru_report))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:|report:|restore:)"))
 

@@ -9,6 +9,8 @@
 - payload / result 字段以 JSON 字符串存储
 - 错误捕获后仅记录日志,不抛出(除非致命错误)
 """
+from __future__ import annotations
+
 import datetime as _dt
 import json
 from typing import Any

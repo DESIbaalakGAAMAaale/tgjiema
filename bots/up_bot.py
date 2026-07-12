@@ -29,6 +29,7 @@ from config import settings
 from database import get_pending_uploads_col, get_active_cells_local
 from database.cache_store import get_cache_store
 from services.permission import check_upload_permission
+from services import task_center, upload_receipt, collections as collections_svc, notifications
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.task_utils import create_safe_task
@@ -2334,6 +2335,87 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         logger.warning(f"[Up][ext_relay] 通知 idx_bot 失败(不影响上传): {e}")
 
 
+# ─── R40 新增命令(状态/任务/合集/通知) ─────────────────────────
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看上传状态: /status <upload_id>"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/status <upload_id>")
+            return
+        upload_id = context.args[0]
+        receipt = await upload_receipt.get_upload_status(upload_id)
+        if not receipt:
+            await update.message.reply_text("❌ 未找到该上传记录")
+            return
+        text = await upload_receipt.format_receipt(receipt)
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.exception(f"[Up][status] 查询上传状态失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看个人任务列表: /tasks [状态]"""
+    try:
+        user = update.effective_user
+        if not user:
+            return
+        status_filter = context.args[0] if context.args else None
+        tasks = await task_center.list_user_tasks(user.id, status=status_filter, limit=20)
+        if not tasks:
+            await update.message.reply_text("📭 暂无任务记录")
+            return
+        lines = [await task_center.format_task_status(t) for t in tasks]
+        await update.message.reply_text("\n\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Up][tasks] 查询任务列表失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+async def cmd_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看个人合集列表: /collections [页码]"""
+    try:
+        user = update.effective_user
+        if not user:
+            return
+        page = 1
+        if context.args:
+            try:
+                page = int(context.args[0])
+            except ValueError:
+                page = 1
+        result = await collections_svc.list_collections(owner_id=user.id, page=page, page_size=10)
+        items = result.get("items", [])
+        if not items:
+            await update.message.reply_text("📭 暂无合集")
+            return
+        lines = [f"📁 合集列表(第 {result.get('page', 1)}/{result.get('total_pages', 1)} 页,共 {result.get('total', 0)} 个)"]
+        for c in items:
+            lines.append(f"• {c.get('name', '未命名')} (id={c.get('id')})")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Up][collections] 查询合集列表失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看未读通知: /notifications"""
+    try:
+        user = update.effective_user
+        if not user:
+            return
+        items = await notifications.list_unread(user.id, limit=20)
+        if not items:
+            await update.message.reply_text("📭 暂无未读通知")
+            return
+        lines = [await notifications.format_notification(n) for n in items]
+        await update.message.reply_text("\n\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Up][notifications] 查询通知失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
 async def _init():
     from database import init_db
     await init_db()
@@ -2364,6 +2446,11 @@ async def _async_main():
     app.add_handler(CommandHandler("end_collection", end_collection))
     app.add_handler(CommandHandler("cancel_collection", cancel_collection))
     app.add_handler(CommandHandler("note_collection", note_collection))
+    # R40 新增命令
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("tasks", cmd_tasks))
+    app.add_handler(CommandHandler("collections", cmd_collections))
+    app.add_handler(CommandHandler("notifications", cmd_notifications))
     app.add_handler(CallbackQueryHandler(upload_option_callback, pattern=r"^opt\|"))
 
     # 备注文字输入处理（需在 EXTERNAL_DONE 和 media 之前）

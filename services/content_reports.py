@@ -14,6 +14,8 @@
 - 软删除统一调用 store.soft_delete()(R39 P1-5 铁律)
 - 时间戳统一使用 datetime.datetime.now().isoformat()
 """
+from __future__ import annotations
+
 import datetime as _dt
 import json
 

@@ -3,6 +3,8 @@
 - 运行时后台定期 dump -> 下次重启有最新的热数据
 - WAL 模式支持多进程并发写入
 """
+from __future__ import annotations
+
 try:
     import orjson as json
 except ImportError:
@@ -132,19 +134,24 @@ def _m1_json_loads(val):
 
 
 class CacheStore:
-    def __init__(self):
+    def __init__(self, db_path: str | None = None):
         self._db: aiosqlite.Connection | None = None
         self._in_writer_tx: bool = False  # R34: Writer 事务模式标志
+        # R40: 支持测试传入自定义 db_path(不修改全局 DB_PATH)
+        self._custom_db_path: str | None = db_path
 
     async def init(self):
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # R40: 支持测试传入自定义 db_path
+        db_path_str = self._custom_db_path if self._custom_db_path else str(DB_PATH)
+        if not self._custom_db_path:
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+            self._db = await aiosqlite.connect(db_path_str, timeout=10)
         except (sqlite3.DatabaseError, aiosqlite.Error) as e:
-            if "file is not a database" in str(e).lower() and DB_PATH.exists():
+            if "file is not a database" in str(e).lower() and not self._custom_db_path and DB_PATH.exists():
                 logger.warning(f"[CacheStore] SQLite 文件已损坏，删除重建: {DB_PATH}")
                 DB_PATH.unlink()
-                self._db = await aiosqlite.connect(str(DB_PATH), timeout=10)
+                self._db = await aiosqlite.connect(db_path_str, timeout=10)
             else:
                 raise
         await self._db.execute("PRAGMA journal_mode=WAL")
@@ -3801,18 +3808,21 @@ class CacheStore:
         """从本地表读取全部 cells，返回 dict 列表（零 CRDB RU）
 
         PRE-04/PRE-01: 包含 prev_slot_id 和 demoted_to_channel_id 字段。
+        M2: 包含 topology_version/lease_owner/lease_until/transition_id 字段(CAS fencing)。
         """
         if not self._db:
             return []
         rows = await self._db.execute_fetchall(
             """SELECT slot_id, channel_id, status, next_active_chat_id, prev_slot_id,
                       demoted_to_channel_id, account_name, is_r100, last_heartbeat,
-                      last_synced_msg_id, degrade_count, file_count, rotation_started_at
+                      last_synced_msg_id, degrade_count, file_count, rotation_started_at,
+                      topology_version, lease_owner, lease_until, transition_id
                FROM cells_local ORDER BY slot_id"""
         )
         cols = ["slot_id", "channel_id", "status", "next_active_chat_id", "prev_slot_id",
                 "demoted_to_channel_id", "account_name", "is_r100", "last_heartbeat",
-                "last_synced_msg_id", "degrade_count", "file_count", "rotation_started_at"]
+                "last_synced_msg_id", "degrade_count", "file_count", "rotation_started_at",
+                "topology_version", "lease_owner", "lease_until", "transition_id"]
         result = []
         for r in rows:
             d = dict(zip(cols, r))
@@ -3820,6 +3830,7 @@ class CacheStore:
             d["degrade_count"] = int(d["degrade_count"] or 0)
             d["file_count"] = int(d["file_count"] or 0)
             d["last_synced_msg_id"] = int(d["last_synced_msg_id"] or 0)
+            d["topology_version"] = int(d.get("topology_version") or 0)
             if d["next_active_chat_id"]:
                 d["next_active_chat_id"] = int(d["next_active_chat_id"])
             if d.get("demoted_to_channel_id"):
@@ -5018,8 +5029,8 @@ class CacheStore:
         if sort_field not in allowed_sort:
             sort_field = "created_at"
         direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
-        # NULL 排序处理:created_at/updated_at 可能为 NULL
-        null_sort = f"NULLS {direction}" if sort_field in ("created_at", "updated_at") else ""
+        # R40: SQLite 不支持 NULLS FIRST/LAST,改用 ISNULL 函数(NULL 排在最后)
+        null_sort = f"{sort_field} IS NULL," if sort_field in ("created_at", "updated_at") else ""
 
         where, params = "", []
         if search:
@@ -5028,14 +5039,14 @@ class CacheStore:
             else:
                 like = f"%{search}%"
                 where, params = "WHERE username LIKE ? OR first_name LIKE ?", [like, like]
-        params.extend([skip, limit])
+        params.extend([limit, skip])
         sql = (
             f"SELECT user_id, username, first_name, membership_level, "
             f"daily_decode_quota, quota_used_today, quota_date, can_upload, "
             f"external_decode_quota, external_used_today, external_quota_date, "
             f"is_banned, created_at, updated_at "
             f"FROM users_local {where} "
-            f"ORDER BY {sort_field} {direction} {null_sort} LIMIT ? OFFSET ?"
+            f"ORDER BY {null_sort} {sort_field} {direction} LIMIT ? OFFSET ?"
         )
         rows = await self._db.execute_fetchall(sql, params)
         return [{
@@ -5085,7 +5096,7 @@ class CacheStore:
         if sort_field not in allowed_sort:
             sort_field = "create_time"
         direction = "DESC" if sort_dir.lower() == "desc" else "ASC"
-        null_sort = f"NULLS {direction}" if sort_field in ("create_time", "updated_at") else ""
+        null_sort = f"{sort_field} IS NULL," if sort_field in ("create_time", "updated_at") else ""
 
         where_parts, params = [], []
         if search:
@@ -5099,13 +5110,13 @@ class CacheStore:
             where_parts.append("status = ?")
             params.append(status)
         where = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
-        params.extend([skip, limit])
+        params.extend([limit, skip])
         sql = (
             f"SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id, "
             f"file_types, status, request_count, protect_content, file_ttl_days, note, "
             f"expire_time, create_time, updated_at, max_requests, is_collection "
             f"FROM file_records_local {where} "
-            f"ORDER BY {sort_field} {direction} {null_sort} LIMIT ? OFFSET ?"
+            f"ORDER BY {null_sort} {sort_field} {direction} LIMIT ? OFFSET ?"
         )
         rows = await self._db.execute_fetchall(sql, params)
         return [_deserialize_sqlite_row({

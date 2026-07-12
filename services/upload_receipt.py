@@ -9,6 +9,8 @@
 - format_receipt 返回纯文本(避免 Telegram markdown 解析问题)
 - 通过 get_cache_store() 获取 CacheStore 单例
 """
+from __future__ import annotations
+
 import datetime as _dt
 import json
 from typing import Any

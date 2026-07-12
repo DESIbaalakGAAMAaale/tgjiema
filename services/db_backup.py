@@ -309,7 +309,8 @@ async def _compute_watermark(all_tables: dict) -> str:
 
     遍历所有表的行,找最大的 updated_at 或 created_at 值。
     """
-    max_ts = datetime.now(timezone.utc).isoformat()
+    # R40: 初始用空字符串,如果无数据则返回当前时间
+    max_ts = ""
     for table_name, rows in all_tables.items():
         ts_col = None
         if table_name in BACKUP_SCHEMA:
@@ -328,6 +329,9 @@ async def _compute_watermark(all_tables: dict) -> str:
                 iso = val.isoformat()
                 if iso > max_ts:
                     max_ts = iso
+    # R40: 如果没有找到任何时间戳,返回当前时间
+    if not max_ts:
+        max_ts = datetime.now(timezone.utc).isoformat()
     return max_ts
 
 

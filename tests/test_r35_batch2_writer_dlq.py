@@ -345,9 +345,11 @@ class TestWriterTransaction:
         original_commit = store._db.commit
         async with store.writer_transaction():
             # 事务中 commit 已被替换为 no-op
-            assert store._db.commit is not original_commit
+            # 使用 != 而非 is not: bound method 每次访问创建新对象
+            assert store._db.commit != original_commit
         # 退出后 commit 应恢复为原始方法
-        assert store._db.commit is original_commit
+        # 使用 == 而非 is: bound method 每次访问创建新对象,is 比较总为 False
+        assert store._db.commit == original_commit
 
     @pytest.mark.asyncio
     async def test_writer_transaction_rollback_restores_commit(self, store):
@@ -355,10 +357,12 @@ class TestWriterTransaction:
         original_commit = store._db.commit
         with pytest.raises(RuntimeError):
             async with store.writer_transaction():
-                assert store._db.commit is not original_commit
+                # 使用 != 而非 is not: bound method 每次访问创建新对象
+                assert store._db.commit != original_commit
                 raise RuntimeError("trigger rollback")
         # ROLLBACK 后 commit 应恢复
-        assert store._db.commit is original_commit
+        # 使用 == 而非 is: bound method 每次访问创建新对象,is 比较总为 False
+        assert store._db.commit == original_commit
 
 
 # ───────────────────────── P1-2: begin_writer_tx 异常安全性 ─────────────────────────
@@ -412,7 +416,8 @@ class TestBeginWriterTxExceptionSafety:
             await store.begin_writer_tx()
 
         # 关键断言: 异常后 commit 方法应已恢复(不是 no-op)
-        assert store._db.commit is original_commit
+        # 使用 == 而非 is: bound method 每次访问创建新对象,is 比较总为 False
+        assert store._db.commit == original_commit
         # _in_writer_tx 应已重置为 False
         assert store._in_writer_tx is False
 
@@ -424,13 +429,15 @@ class TestBeginWriterTxExceptionSafety:
             await store.begin_writer_tx()
             # 事务中: _in_writer_tx=True,commit 被替换
             assert store._in_writer_tx is True
-            assert store._db.commit is not original_commit
+            # 使用 != 而非 is not: bound method 每次访问创建新对象
+            assert store._db.commit != original_commit
         finally:
             # 清理: 手动 ROLLBACK(避免影响后续测试)
             await store.rollback_writer_tx()
         # ROLLBACK 后: _in_writer_tx=False,commit 恢复
         assert store._in_writer_tx is False
-        assert store._db.commit is original_commit
+        # 使用 == 而非 is: bound method 每次访问创建新对象,is 比较总为 False
+        assert store._db.commit == original_commit
 
 
 # ───────────────────────── P1-2: WriterCommand Protocol ─────────────────────────

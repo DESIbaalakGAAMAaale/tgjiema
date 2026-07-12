@@ -214,6 +214,21 @@ def run_crdb_sync():
         logger.info("[crdb_sync] 收到中断信号,已停止")
 
 
+def run_r40_scheduler():
+    """R40: 定时任务调度器(清理过期数据 + 配额预留 + 指标采集)。
+
+    信号处理参考 crdb_sync:不注册自定义 SIGTERM handler,
+    让 asyncio.run 通过 CancelledError 传播信号,在 run_scheduler 中优雅退出。
+    """
+    os.environ["BOT_ROLE"] = "r40_scheduler"
+    import asyncio
+    from services.r40_scheduler import run_scheduler
+    try:
+        asyncio.run(run_scheduler())
+    except KeyboardInterrupt:
+        logger.info("[r40_scheduler] 收到中断信号,已停止")
+
+
 BOT_RUNNERS = {
     "up": run_up_bot,
     "idx": run_idx_bot,
@@ -224,6 +239,7 @@ BOT_RUNNERS = {
     "db_backup": run_db_backup,
     "db_writer": run_db_writer,
     "crdb_sync": run_crdb_sync,
+    "r40_scheduler": run_r40_scheduler,
 }
 
 

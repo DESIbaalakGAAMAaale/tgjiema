@@ -20,6 +20,8 @@
 - 所有写入后调用 add_dirty_outbox() 确保跨机同步
 - 权限列表存储为 JSON 数组字符串
 """
+from __future__ import annotations
+
 import datetime
 import json
 from loguru import logger

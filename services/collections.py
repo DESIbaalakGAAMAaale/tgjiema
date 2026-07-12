@@ -12,6 +12,8 @@
 - 每次写入后调用 add_dirty_outbox(table_name, pk) 触发 CRDB 同步
 - 通过 get_cache_store() 获取 CacheStore 单例
 """
+from __future__ import annotations
+
 import datetime as _dt
 import json
 from typing import Any

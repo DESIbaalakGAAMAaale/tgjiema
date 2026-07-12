@@ -9,6 +9,8 @@
 - 通过 get_cache_store() 获取 CacheStore 单例
 - 每次写入后调用 add_dirty_outbox(table_name="notifications", pk=str(notif_id))
 """
+from __future__ import annotations
+
 import datetime as _dt
 import json
 from typing import Any

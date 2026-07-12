@@ -14,6 +14,8 @@
 - 时间戳统一使用 datetime.datetime.now().isoformat()
 - 保留期表(user_data_retention)由本服务惰性创建
 """
+from __future__ import annotations
+
 import datetime as _dt
 import json
 

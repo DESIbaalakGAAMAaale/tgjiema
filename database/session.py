@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 try:
     import orjson as json
 except ImportError:

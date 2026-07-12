@@ -39,6 +39,7 @@ from database import (
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
 from services.relay_pool import relay_pool
+from services import content_reports, user_repair
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
@@ -2679,6 +2680,93 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
 
+# ─── R40 新增命令(举报/修复/重生成/失败原因) ───────────────────
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """举报文件码: /report <code> <reason>"""
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text("用法:/report <文件码> <举报原因>")
+            return
+        code = context.args[0]
+        reason = " ".join(context.args[1:])
+        user = update.effective_user
+        if not user:
+            return
+        report_id = await content_reports.create_report(
+            reporter_id=user.id,
+            target_type="file_code",
+            target_id=code,
+            reason=reason,
+        )
+        if report_id > 0:
+            await update.message.reply_text(f"✅ 已收到举报,编号 #{report_id},管理员将尽快处理")
+        else:
+            await update.message.reply_text("❌ 举报提交失败,请稍后重试")
+    except Exception as e:
+        logger.exception(f"[Idx][report] 提交举报失败: {e}")
+        await update.message.reply_text("❌ 提交失败,请稍后重试")
+
+
+async def cmd_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """修复文件码索引: /repair <code>"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/repair <文件码>")
+            return
+        code = context.args[0]
+        user = update.effective_user
+        if not user:
+            return
+        new_msg_id = await user_repair.reindex_code(code, user.id)
+        if new_msg_id > 0:
+            await update.message.reply_text(f"✅ 文件码 {code} 索引已修复,msg_id={new_msg_id}")
+        else:
+            await update.message.reply_text("❌ 修复失败,请检查文件码是否正确")
+    except Exception as e:
+        logger.exception(f"[Idx][repair] 修复索引失败: {e}")
+        await update.message.reply_text("❌ 修复失败,请稍后重试")
+
+
+async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """重新生成文件码: /regenerate <code>"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/regenerate <旧文件码>")
+            return
+        old_code = context.args[0]
+        user = update.effective_user
+        if not user:
+            return
+        result = await user_repair.regenerate_code(old_code, user.id)
+        if not result:
+            await update.message.reply_text("❌ 重新生成失败,请检查文件码是否正确")
+            return
+        new_code = result.get("new_code") or result.get("code", "")
+        await update.message.reply_text(f"✅ 文件码已重新生成\n旧码:{old_code}\n新码:{new_code}")
+    except Exception as e:
+        logger.exception(f"[Idx][regenerate] 重新生成文件码失败: {e}")
+        await update.message.reply_text("❌ 重新生成失败,请稍后重试")
+
+
+async def cmd_failure_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查询解码失败原因: /failure_reason <code>"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/failure_reason <文件码>")
+            return
+        code = context.args[0]
+        reason = await user_repair.get_failure_reason(code)
+        if not reason:
+            await update.message.reply_text(f"❌ 未找到文件码 {code} 的失败记录")
+            return
+        text = await user_repair.format_failure_reason(reason)
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.exception(f"[Idx][failure_reason] 查询失败原因异常: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
 # ─── 运行 ───
 
 async def _init():
@@ -2701,6 +2789,11 @@ async def _async_main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("my_codes", my_codes_command))
+    # R40 新增命令
+    app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CommandHandler("repair", cmd_repair))
+    app.add_handler(CommandHandler("regenerate", cmd_regenerate))
+    app.add_handler(CommandHandler("failure_reason", cmd_failure_reason))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))
     # 文件码管理回调

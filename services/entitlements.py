@@ -16,6 +16,8 @@
 - 所有写入操作后调用 store.add_dirty_outbox() 确保跨机同步
 - Plan/Quota/Limits/EntitlementResult 使用 dataclass,便于序列化和类型检查
 """
+from __future__ import annotations
+
 import datetime
 import json
 from dataclasses import dataclass, asdict

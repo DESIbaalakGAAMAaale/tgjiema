@@ -21,6 +21,7 @@ from loguru import logger
 from config import settings
 from database import get_file_record_cached, get_pending_jobs_count_local
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver, try_deliver_batch, invalidate_cell_cache
+from services import upload_receipt, notifications
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
@@ -1426,6 +1427,43 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
 
+# ─── R40 新增命令(状态/通知) ───────────────────────────────────
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看投递状态: /status <upload_id>"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/status <upload_id>")
+            return
+        upload_id = context.args[0]
+        receipt = await upload_receipt.get_upload_status(upload_id)
+        if not receipt:
+            await update.message.reply_text("❌ 未找到该投递记录")
+            return
+        text = await upload_receipt.format_receipt(receipt)
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.exception(f"[Dsp][status] 查询投递状态失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看未读通知: /notifications"""
+    try:
+        user = update.effective_user
+        if not user:
+            return
+        items = await notifications.list_unread(user.id, limit=20)
+        if not items:
+            await update.message.reply_text("📭 暂无未读通知")
+            return
+        lines = [await notifications.format_notification(n) for n in items]
+        await update.message.reply_text("\n\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Dsp][notifications] 查询通知失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
 # ─── 运行 ───
 
 async def _init():
@@ -1447,6 +1485,9 @@ async def _async_main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    # R40 新增命令
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("notifications", cmd_notifications))
     # report_callback 必须先于分页回调，且分页回调需限定 pattern，
     # 否则无 pattern 的 pagination_callback 会吞掉 report_req| 回调，导致举报按钮失效。
     app.add_handler(CallbackQueryHandler(report_callback, pattern=r"^report_req\|"))

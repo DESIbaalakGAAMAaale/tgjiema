@@ -25,6 +25,8 @@
 - 所有审批操作写入 audit_log
 - 纯函数式 + async,所有写入后调用 add_dirty_outbox()
 """
+from __future__ import annotations
+
 import datetime
 import json
 from loguru import logger

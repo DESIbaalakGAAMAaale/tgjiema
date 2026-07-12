@@ -820,3 +820,213 @@ async def health_page(request: Request, admin=Depends(verify_admin)):
         },
         username=admin,
     )
+
+
+# ─── R40: 新增管理页面路由 ──────────────────────────────────────
+
+
+@app.get("/tasks", response_class=HTMLResponse)
+async def tasks_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 任务中心 — 查看所有任务"""
+    from services.task_center import list_user_tasks
+    # 查询最近 100 条任务(user_id=0 表示所有用户)
+    tasks = await list_user_tasks(0, limit=100)
+    return _make_csrf_response(
+        "tasks.html",
+        {"request": request, "admin": admin, "tasks": tasks},
+        username=admin,
+    )
+
+
+@app.get("/reports", response_class=HTMLResponse)
+async def reports_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 举报管理 — 待处理举报列表"""
+    from services.content_reports import list_reports
+    result = await list_reports(status="pending")
+    return _make_csrf_response(
+        "reports.html",
+        {"request": request, "admin": admin, "reports": result.get("items", [])},
+        username=admin,
+    )
+
+
+@app.post("/reports/{report_id}/takedown")
+async def takedown_report(
+    report_id: int,
+    request: Request,
+    csrf_token: str = Form(...),
+    admin: str = Depends(verify_admin),
+):
+    """R40: 下架举报内容"""
+    # CSRF 验证
+    if not _verify_csrf(request, csrf_token, username=admin):
+        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+    from services.content_reports import get_report, takedown_content
+    report = await get_report(report_id)
+    if not report:
+        raise HTTPException(status_code=404, detail="举报不存在")
+    await takedown_content(
+        report["target_type"], report["target_id"],
+        report["reason"], admin_id=int(admin),
+    )
+    response = RedirectResponse(url="/reports", status_code=303)
+    response.set_cookie(
+        key="csrf_token", value=_get_csrf_token(admin),
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+    )
+    return response
+
+
+@app.get("/collections", response_class=HTMLResponse)
+async def collections_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 集合管理 — 查看所有集合"""
+    from services.collections import list_collections
+    result = await list_collections()
+    return _make_csrf_response(
+        "collections.html",
+        {"request": request, "admin": admin, "collections": result.get("items", [])},
+        username=admin,
+    )
+
+
+@app.get("/notifications", response_class=HTMLResponse)
+async def notifications_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 通知中心 — 查看所有通知"""
+    from services.notifications import list_all_notifications
+    result = await list_all_notifications()
+    return _make_csrf_response(
+        "notifications.html",
+        {"request": request, "admin": admin, "notifications": result.get("items", [])},
+        username=admin,
+    )
+
+
+@app.get("/approvals", response_class=HTMLResponse)
+async def approvals_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 审批管理 — 待审批列表"""
+    from services.approval_workflow import list_pending
+    result = await list_pending()
+    return _make_csrf_response(
+        "approvals.html",
+        {"request": request, "admin": admin, "approvals": result.get("items", [])},
+        username=admin,
+    )
+
+
+@app.get("/rbac", response_class=HTMLResponse)
+async def rbac_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: RBAC 角色管理 — 角色与权限列表"""
+    from services.rbac import list_roles, list_permissions
+    roles = await list_roles()
+    permissions = await list_permissions()
+    return _make_csrf_response(
+        "rbac.html",
+        {"request": request, "admin": admin, "roles": roles, "permissions": permissions},
+        username=admin,
+    )
+
+
+@app.get("/repair-console", response_class=HTMLResponse)
+async def repair_console_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 修复控制台 — Outbox/DLQ/Replication/Relay"""
+    from services.repair_console import (
+        get_repair_overview, list_outbox, list_dlq, list_replication_failures,
+    )
+    overview = await get_repair_overview()
+    outbox = await list_outbox(page_size=20)
+    dlq = await list_dlq(page_size=20)
+    repl = await list_replication_failures(page_size=20)
+    return _make_csrf_response(
+        "repair_console.html",
+        {
+            "request": request, "admin": admin,
+            "overview": overview, "outbox": outbox,
+            "dlq": dlq, "replication": repl,
+        },
+        username=admin,
+    )
+
+
+@app.get("/topology", response_class=HTMLResponse)
+async def topology_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 拓扑可视化"""
+    from services.topology_view import get_topology, get_health_summary
+    topology = await get_topology()
+    summary = await get_health_summary()
+    return _make_csrf_response(
+        "topology.html",
+        {"request": request, "admin": admin, "topology": topology, "summary": summary},
+        username=admin,
+    )
+
+
+@app.get("/ru-cost", response_class=HTMLResponse)
+async def ru_cost_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: RU 成本中心"""
+    from services.ru_cost_center import get_daily_report, check_ru_alert
+    report = await get_daily_report()
+    alert = await check_ru_alert()
+    return _make_csrf_response(
+        "ru_cost.html",
+        {"request": request, "admin": admin, "report": report, "alert": alert},
+        username=admin,
+    )
+
+
+@app.get("/maintenance", response_class=HTMLResponse)
+async def maintenance_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 维护模式控制台"""
+    from services.maintenance_mode import get_status, check_readiness
+    status = await get_status()
+    readiness = await check_readiness()
+    return _make_csrf_response(
+        "maintenance.html",
+        {"request": request, "admin": admin, "status": status, "readiness": readiness},
+        username=admin,
+    )
+
+
+@app.post("/maintenance/{action}")
+async def maintenance_action(
+    action: str,
+    request: Request,
+    csrf_token: str = Form(...),
+    reason: str = Form("手动维护"),
+    admin: str = Depends(verify_admin),
+):
+    """R40: 维护模式操作(enable/disable)"""
+    # CSRF 验证
+    if not _verify_csrf(request, csrf_token, username=admin):
+        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+    from services.maintenance_mode import enable, disable
+    if action == "enable":
+        await enable(reason, started_by=int(admin))
+    elif action == "disable":
+        await disable(ended_by=int(admin))
+    else:
+        raise HTTPException(status_code=400, detail="无效的操作类型")
+    response = RedirectResponse(url="/maintenance", status_code=303)
+    response.set_cookie(
+        key="csrf_token", value=_get_csrf_token(admin),
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+    )
+    return response
+
+
+@app.get("/disaster-recovery", response_class=HTMLResponse)
+async def disaster_recovery_page(request: Request, admin: str = Depends(verify_admin)):
+    """R40: 灾备控制台"""
+    from services.disaster_recovery import list_backups, get_rpo_rto, get_backup_schedule
+    backups = await list_backups()
+    rpo_rto = await get_rpo_rto()
+    schedule = await get_backup_schedule()
+    return _make_csrf_response(
+        "disaster_recovery.html",
+        {
+            "request": request, "admin": admin,
+            "backups": backups, "rpo_rto": rpo_rto, "schedule": schedule,
+        },
+        username=admin,
+    )

@@ -12,6 +12,8 @@
 - format_failure_reason 对 file_code 脱敏(只显示前 4 字符 + ***)
 - 通过 get_cache_store() 获取 CacheStore 单例
 """
+from __future__ import annotations
+
 import datetime as _dt
 import json
 from typing import Any

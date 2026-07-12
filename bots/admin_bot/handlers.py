@@ -24,6 +24,10 @@ from .display import (
     _get_configs_text,
 )
 from .conversation import _conv_end
+from services import (
+    content_reports, approval_workflow, rbac, maintenance_mode,
+    repair_console, disaster_recovery, ru_cost_center,
+)
 
 
 @_auth_required
@@ -1688,3 +1692,322 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💡 推荐使用菜单面板(发送 /start 打开)"
     )
     await update.message.reply_text(msg)
+
+
+# ─── R40 新增管理命令(13 条) ──────────────────────────────────
+
+@_auth_required
+async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看举报列表: /reports [状态] [页码]"""
+    try:
+        status_filter = context.args[0] if context.args else None
+        page = 1
+        if len(context.args) >= 2:
+            try:
+                page = int(context.args[1])
+            except ValueError:
+                page = 1
+        result = await content_reports.list_reports(status=status_filter, page=page, page_size=20)
+        items = result.get("items", [])
+        if not items:
+            await update.message.reply_text("📭 暂无举报记录")
+            return
+        lines = [f"📋 举报列表(第 {result.get('page', 1)}/{result.get('total_pages', 1)} 页,共 {result.get('total', 0)} 条)"]
+        for r in items:
+            lines.append(await content_reports.format_report(r))
+        await update.message.reply_text("\n\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Admin][reports] 查询举报列表失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_takedown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """内容下架: /takedown <target_type> <target_id> [reason]"""
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text("用法:/takedown <target_type> <target_id> [原因]\ntarget_type: file_code/user")
+            return
+        target_type = context.args[0]
+        target_id = context.args[1]
+        reason = " ".join(context.args[2:]) if len(context.args) > 2 else ""
+        user = update.effective_user
+        admin_id = user.id if user else 0
+        ok = await content_reports.takedown_content(target_type, target_id, reason, admin_id)
+        if ok:
+            await update.message.reply_text(f"✅ 已下架 {target_type}:{target_id}")
+        else:
+            await update.message.reply_text("❌ 下架失败,请检查参数或目标是否存在")
+    except Exception as e:
+        logger.exception(f"[Admin][takedown] 内容下架失败: {e}")
+        await update.message.reply_text("❌ 操作失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """R40 封禁用户: /ban_user <user_id> [reason] [duration_days]"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/ban_user <用户ID> [原因] [天数(0=永久)]")
+            return
+        try:
+            user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字")
+            return
+        reason = context.args[1] if len(context.args) > 1 else ""
+        duration_days = 0
+        if len(context.args) > 2:
+            try:
+                duration_days = int(context.args[2])
+            except ValueError:
+                duration_days = 0
+        admin = update.effective_user
+        admin_id = admin.id if admin else 0
+        ok = await content_reports.ban_user(user_id, reason, duration_days=duration_days, admin_id=admin_id)
+        if ok:
+            await update.message.reply_text(f"✅ 用户 {user_id} 已封禁({duration_days}天)")
+        else:
+            await update.message.reply_text("❌ 封禁失败,请稍后重试")
+    except Exception as e:
+        logger.exception(f"[Admin][ban_user] 封禁用户失败: {e}")
+        await update.message.reply_text("❌ 操作失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """R40 解封用户: /unban_user <user_id>"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/unban_user <用户ID>")
+            return
+        try:
+            user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字")
+            return
+        admin = update.effective_user
+        admin_id = admin.id if admin else 0
+        ok = await content_reports.unban_user(user_id, admin_id=admin_id)
+        if ok:
+            await update.message.reply_text(f"✅ 用户 {user_id} 已解封")
+        else:
+            await update.message.reply_text("❌ 解封失败,请稍后重试")
+    except Exception as e:
+        logger.exception(f"[Admin][unban_user] 解封用户失败: {e}")
+        await update.message.reply_text("❌ 操作失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_pending_approvals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """待审批列表: /pending_approvals [页码]"""
+    try:
+        page = 1
+        if context.args:
+            try:
+                page = int(context.args[0])
+            except ValueError:
+                page = 1
+        result = await approval_workflow.list_pending(page=page, page_size=20)
+        items = result.get("items", [])
+        if not items:
+            await update.message.reply_text("📭 暂无待审批请求")
+            return
+        lines = [f"⏳ 待审批列表(第 {result.get('page', 1)}/{result.get('total_pages', 1)} 页,共 {result.get('total', 0)} 条)"]
+        for a in items:
+            lines.append(await approval_workflow.format_approval(a))
+        await update.message.reply_text("\n\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Admin][pending_approvals] 查询待审批失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """批准审批: /approve <approval_id> [note]"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/approve <审批ID> [备注]")
+            return
+        try:
+            approval_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ 审批ID必须是数字")
+            return
+        note = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+        admin = update.effective_user
+        approver_id = admin.id if admin else 0
+        ok = await approval_workflow.approve(approval_id, approver_id, note=note)
+        if ok:
+            await update.message.reply_text(f"✅ 审批 #{approval_id} 已批准")
+        else:
+            await update.message.reply_text("❌ 批准失败(权限不足/状态非pending/不能审批自己创建的请求)")
+    except Exception as e:
+        logger.exception(f"[Admin][approve] 批准审批失败: {e}")
+        await update.message.reply_text("❌ 操作失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """驳回审批: /reject <approval_id> [reason]"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/reject <审批ID> [原因]")
+            return
+        try:
+            approval_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ 审批ID必须是数字")
+            return
+        reason = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+        admin = update.effective_user
+        approver_id = admin.id if admin else 0
+        ok = await approval_workflow.reject(approval_id, approver_id, reason=reason)
+        if ok:
+            await update.message.reply_text(f"✅ 审批 #{approval_id} 已驳回")
+        else:
+            await update.message.reply_text("❌ 驳回失败(权限不足/状态非pending)")
+    except Exception as e:
+        logger.exception(f"[Admin][reject] 驳回审批失败: {e}")
+        await update.message.reply_text("❌ 操作失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看角色列表: /roles"""
+    try:
+        roles = await rbac.list_roles()
+        if not roles:
+            await update.message.reply_text("📭 暂无角色")
+            return
+        lines = ["🎭 角色列表"]
+        for r in roles:
+            lines.append(await rbac.format_role_info(r))
+            lines.append("─" * 30)
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Admin][roles] 查询角色失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """分配角色: /assign_role <user_id> <role_name>"""
+    try:
+        if len(context.args) < 2:
+            await update.message.reply_text("用法:/assign_role <用户ID> <角色名>\n角色: super_admin/security/ops/support/operator")
+            return
+        try:
+            user_id = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ 用户ID必须是数字")
+            return
+        role_name = context.args[1]
+        admin = update.effective_user
+        admin_id = admin.id if admin else 0
+        ok = await rbac.assign_role(user_id, role_name, assigned_by=admin_id)
+        if ok:
+            await update.message.reply_text(f"✅ 用户 {user_id} 已分配角色 {role_name}")
+        else:
+            await update.message.reply_text("❌ 分配失败(角色不存在)")
+    except Exception as e:
+        logger.exception(f"[Admin][assign_role] 分配角色失败: {e}")
+        await update.message.reply_text("❌ 操作失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """维护模式: /maintenance <on|off|status> [reason]"""
+    try:
+        if not context.args:
+            await update.message.reply_text("用法:/maintenance <on|off|status> [原因]")
+            return
+        action = context.args[0].lower()
+        admin = update.effective_user
+        admin_id = admin.id if admin else 0
+        if action == "on":
+            reason = " ".join(context.args[1:]) if len(context.args) > 1 else "manual"
+            ok = await maintenance_mode.enable(reason, started_by=admin_id)
+            await update.message.reply_text("✅ 维护模式已开启" if ok else "❌ 开启失败")
+        elif action == "off":
+            ok = await maintenance_mode.disable(ended_by=admin_id)
+            await update.message.reply_text("✅ 维护模式已关闭" if ok else "❌ 关闭失败")
+        elif action == "status":
+            status = await maintenance_mode.get_status()
+            lines = [
+                "🔧 维护模式状态",
+                f"  启用: {status.get('enabled', False)}",
+                f"  原因: {status.get('reason', '')}",
+                f"  开启人: {status.get('started_by', 0)}",
+                f"  开启时间: {status.get('started_at', '')}",
+                f"  持续秒数: {status.get('duration_seconds', 0)}",
+            ]
+            await update.message.reply_text("\n".join(lines))
+        else:
+            await update.message.reply_text("❌ 未知操作,使用 on/off/status")
+    except Exception as e:
+        logger.exception(f"[Admin][maintenance] 维护模式操作失败: {e}")
+        await update.message.reply_text("❌ 操作失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_repair_console(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """修复控制台总览: /repair_console"""
+    try:
+        overview = await repair_console.get_repair_overview()
+        lines = [
+            "🛠️ 修复控制台总览",
+            f"  Outbox 未处理: {overview.get('outbox_unprocessed', 0)}",
+            f"  Outbox 卡死: {overview.get('outbox_dead', 0)}",
+            f"  DLQ 死信: {overview.get('dlq_count', 0)}",
+            f"  复制失败: {overview.get('replication_failed', 0)}",
+            f"  Relay 问题: {overview.get('relay_issues', 0)}",
+        ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Admin][repair_console] 查询修复总览失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看备份列表与灾备状态: /backups"""
+    try:
+        backups = await disaster_recovery.list_backups(limit=20)
+        rpo_rto = await disaster_recovery.get_rpo_rto()
+        schedule = await disaster_recovery.get_backup_schedule()
+        lines = [
+            "💾 备份与灾备状态",
+            f"  RPO 目标: {rpo_rto.get('rpo_seconds', 0)}s {'✓合规' if rpo_rto.get('rpo_compliant') else '✗违规'}",
+            f"  RTO 目标: {rpo_rto.get('rto_seconds', 0)}s {'✓合规' if rpo_rto.get('rto_compliant') else '✗违规'}",
+            f"  最近备份距今: {rpo_rto.get('last_backup_age', 0)}s",
+            f"  备份计划: 启用={schedule.get('enabled', False)} 间隔={schedule.get('interval_minutes', 0)}min",
+            f"  保留天数: {schedule.get('retention_days', 0)}",
+            "",
+            f"📂 最近备份({len(backups)} 份):",
+        ]
+        for b in backups[:10]:
+            lines.append(f"  • {b.get('backup_id', '')} ({b.get('created_at', '')})")
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Admin][backups] 查询备份失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_ru_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """RU 成本报告: /ru_report [start_date YYYYMMDD] [end_date YYYYMMDD]"""
+    try:
+        import datetime as _dt
+        if len(context.args) >= 2:
+            start_date = context.args[0]
+            end_date = context.args[1]
+        else:
+            today = _dt.datetime.now().strftime("%Y%m%d")
+            start_date = today
+            end_date = today
+        report = await ru_cost_center.generate_cost_report(start_date, end_date)
+        await update.message.reply_text(report)
+    except Exception as e:
+        logger.exception(f"[Admin][ru_report] 生成 RU 报告失败: {e}")
+        await update.message.reply_text("❌ 生成报告失败,请稍后重试")

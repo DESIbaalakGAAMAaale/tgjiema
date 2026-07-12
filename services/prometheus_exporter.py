@@ -44,8 +44,11 @@ R38 P2-7: 高基数 label 禁止规则
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
+import json as _json
 import os
 import sqlite3
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -82,6 +85,28 @@ _last_scrape_ts: float = 0.0
 _scrape_errors: int = 0
 # R39 P1-8: 数据新鲜度告警阈值(秒) — 超过此值认为数据陈旧
 _DATA_AGE_ALERT_THRESHOLD = 300  # 5 分钟无成功采集 → 不 ready
+
+# ── R40: 新增指标状态(模块级缓存,由后台采集线程更新) ──────
+# 采集由独立守护线程(独立事件循环)周期性执行,HTTP handler 只读取缓存,
+# 避免 /metrics 请求阻塞在异步采集上。采集失败时保持上一次的值(降级)。
+_r40_state: dict[str, Any] = {
+    "maintenance_enabled": 0,
+    "ru_daily_usage": {},           # {service: amount}
+    "replica_missing_count": 0,
+    "quota_reservations_active": 0,
+    "content_reports_pending": 0,
+    "approvals_pending": 0,
+    "tasks_running": 0,
+    "notifications_unread": 0,
+    "dlq_depth": 0,
+    "outbox_unprocessed": 0,
+    "audit_log_events_total": {},   # {action: count}
+    "ru_operations_total": {},      # {(service, operation): count}
+}
+_r40_state_lock = threading.Lock()
+_r40_last_collect_ts: float = 0.0
+_r40_collector_started = False
+_r40_collector_start_lock = threading.Lock()
 
 
 # ── SQLite 读取工具 ─────────────────────────────────────
@@ -198,6 +223,9 @@ def collect_metrics() -> str:
 
     参考: https://prometheus.io/docs/instrumenting/exposition_formats/
     """
+    # R40: 懒启动采集后台线程(支持测试环境不调用 main())
+    _start_r40_collector()
+
     lines: list[str] = []
 
     # 1. crdb_ru_daily — CRDB 当日 RU 消耗
@@ -314,6 +342,9 @@ def collect_metrics() -> str:
         # 无数据时输出 0,保证指标存在(避免 Prometheus 误判服务不可用)
         lines.append('relay_spool_status_count{status="unknown"} 0')
 
+    # R40: 追加 R40 新增指标(在高基数审计前加入,使 R38 P2-7 检查覆盖 R40)
+    lines.extend(_format_r40_metrics())
+
     # R38 P2-7: 输出前审计高基数 label(仅日志告警,不阻断输出)
     for line in lines:
         if not line.startswith("#"):
@@ -409,6 +440,285 @@ def check_readiness() -> dict:
     return {"ready": ready, "passed": passed, "checks": checks}
 
 
+# ── R40: 新增指标采集 ────────────────────────────────────
+
+
+async def collect_r40_metrics() -> None:
+    """R40: 采集 R40 新增指标(由后台采集线程或 scheduler 调用)。
+
+    所有采集失败均静默降级为 0(保持上一次值),不影响 exporter 可用性。
+    cache_store._db 为 aiosqlite.Connection,使用 execute_fetchall 而非 asyncpg fetchval。
+    """
+    global _r40_state, _r40_last_collect_ts
+    new_state: dict[str, Any] = {
+        "maintenance_enabled": 0,
+        "ru_daily_usage": {},
+        "replica_missing_count": 0,
+        "quota_reservations_active": 0,
+        "content_reports_pending": 0,
+        "approvals_pending": 0,
+        "tasks_running": 0,
+        "notifications_unread": 0,
+        "dlq_depth": 0,
+        "outbox_unprocessed": 0,
+        "audit_log_events_total": {},
+        "ru_operations_total": {},
+    }
+
+    # 1. maintenance_enabled — 维护模式是否开启
+    try:
+        from services.maintenance_mode import is_enabled
+        new_state["maintenance_enabled"] = 1 if await is_enabled() else 0
+    except Exception as e:
+        logger.debug(f"[R40] 采集 maintenance_enabled 失败: {e}")
+
+    # 2. ru_daily_usage + ru_operations_total — RU 当日使用量(按服务/操作)
+    try:
+        from services.ru_cost_center import get_daily_report, SERVICES
+        report = await get_daily_report()
+        for service, amount in report.get("by_service", {}).items():
+            new_state["ru_daily_usage"][service] = amount
+        # ru_operations_total: 按服务维度解析 kv_store 中的 by_operation
+        today = _dt.datetime.now().strftime("%Y%m%d")
+        from database.cache_store import get_cache_store as _get_store
+        _store = _get_store()
+        if _store._db:
+            for service in SERVICES:
+                key = f"ru_usage:{today}:{service}"
+                raw = await _store.get_kv(key)
+                if not raw:
+                    continue
+                try:
+                    data = _json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                for op, amount in data.get("by_operation", {}).items():
+                    new_state["ru_operations_total"][(service, op)] = amount
+    except Exception as e:
+        logger.debug(f"[R40] 采集 ru_daily_usage 失败: {e}")
+
+    # 3. replica_missing_count — 缺失副本数量
+    try:
+        from services.topology_view import get_replica_status
+        status = await get_replica_status()
+        new_state["replica_missing_count"] = status.get("missing_replicas", 0)
+    except Exception as e:
+        logger.debug(f"[R40] 采集 replica_missing_count 失败: {e}")
+
+    # 4. SQLite 表计数(配额预留/举报/审批/任务/通知/outbox/审计日志)
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if store._db:
+            # 活跃配额预留
+            rows = await store._db.execute_fetchall(
+                "SELECT COUNT(*) FROM quota_reservations WHERE status='reserved'"
+            )
+            new_state["quota_reservations_active"] = rows[0][0] if rows else 0
+
+            # 待处理举报
+            rows = await store._db.execute_fetchall(
+                "SELECT COUNT(*) FROM content_reports WHERE status='pending'"
+            )
+            new_state["content_reports_pending"] = rows[0][0] if rows else 0
+
+            # 待审批
+            rows = await store._db.execute_fetchall(
+                "SELECT COUNT(*) FROM approvals WHERE status='pending'"
+            )
+            new_state["approvals_pending"] = rows[0][0] if rows else 0
+
+            # 运行中任务
+            rows = await store._db.execute_fetchall(
+                "SELECT COUNT(*) FROM tasks WHERE status='running'"
+            )
+            new_state["tasks_running"] = rows[0][0] if rows else 0
+
+            # 未读通知
+            rows = await store._db.execute_fetchall(
+                "SELECT COUNT(*) FROM notifications WHERE is_read=0"
+            )
+            new_state["notifications_unread"] = rows[0][0] if rows else 0
+
+            # 未处理 dirty_outbox
+            rows = await store._db.execute_fetchall(
+                "SELECT COUNT(*) FROM dirty_outbox WHERE processed=0"
+            )
+            new_state["outbox_unprocessed"] = rows[0][0] if rows else 0
+
+            # 审计日志事件总数(按 action 分组,Counter 类型)
+            rows = await store._db.execute_fetchall(
+                "SELECT action, COUNT(*) FROM audit_log GROUP BY action"
+            )
+            for action, count in rows:
+                new_state["audit_log_events_total"][str(action)] = int(count)
+    except Exception as e:
+        logger.debug(f"[R40] 采集 R40 SQLite 指标失败: {e}")
+
+    # 5. dlq_depth — 死信队列深度(来自 repair_console)
+    try:
+        from services.repair_console import get_repair_overview
+        overview = await get_repair_overview()
+        new_state["dlq_depth"] = overview.get("dlq_count", 0)
+    except Exception as e:
+        logger.debug(f"[R40] 采集 dlq_depth 失败: {e}")
+
+    # 原子更新状态(拷贝替换,避免读取期间部分更新)
+    with _r40_state_lock:
+        _r40_state = new_state
+        _r40_last_collect_ts = time.time()
+
+
+def _format_r40_metrics() -> list[str]:
+    """R40: 将缓存的 R40 指标格式化为 Prometheus text format 行列表。
+
+    所有 label 均为低基数(service/action/operation),符合 R38 P2-7 高基数规则。
+    无数据时输出 0 值占位行,保证指标存在(避免 Prometheus 误判服务不可用)。
+    """
+    with _r40_state_lock:
+        state = {k: v for k, v in _r40_state.items()}
+
+    def _escape(value: str) -> str:
+        """转义 Prometheus label 值(防注入)。"""
+        return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+    lines: list[str] = []
+
+    # tgjiema_maintenance_enabled (Gauge)
+    lines.append("# HELP tgjiema_maintenance_enabled 维护模式是否开启(0=关闭, 1=开启)")
+    lines.append("# TYPE tgjiema_maintenance_enabled gauge")
+    lines.append(f"tgjiema_maintenance_enabled {state.get('maintenance_enabled', 0)}")
+
+    # tgjiema_ru_daily_usage{service} (Gauge)
+    lines.append("# HELP tgjiema_ru_daily_usage 当日 RU 使用量(按服务)")
+    lines.append("# TYPE tgjiema_ru_daily_usage gauge")
+    ru_usage = state.get("ru_daily_usage", {})
+    if ru_usage:
+        for service, amount in sorted(ru_usage.items()):
+            lines.append(f'tgjiema_ru_daily_usage{{service="{_escape(service)}"}} {amount}')
+    else:
+        lines.append('tgjiema_ru_daily_usage{service="unknown"} 0')
+
+    # tgjiema_replica_missing_count (Gauge)
+    lines.append("# HELP tgjiema_replica_missing_count 缺失副本数量")
+    lines.append("# TYPE tgjiema_replica_missing_count gauge")
+    lines.append(f"tgjiema_replica_missing_count {state.get('replica_missing_count', 0)}")
+
+    # tgjiema_quota_reservations_active (Gauge)
+    lines.append("# HELP tgjiema_quota_reservations_active 活跃配额预留数量")
+    lines.append("# TYPE tgjiema_quota_reservations_active gauge")
+    lines.append(f"tgjiema_quota_reservations_active {state.get('quota_reservations_active', 0)}")
+
+    # tgjiema_content_reports_pending (Gauge)
+    lines.append("# HELP tgjiema_content_reports_pending 待处理举报数量")
+    lines.append("# TYPE tgjiema_content_reports_pending gauge")
+    lines.append(f"tgjiema_content_reports_pending {state.get('content_reports_pending', 0)}")
+
+    # tgjiema_approvals_pending (Gauge)
+    lines.append("# HELP tgjiema_approvals_pending 待审批数量")
+    lines.append("# TYPE tgjiema_approvals_pending gauge")
+    lines.append(f"tgjiema_approvals_pending {state.get('approvals_pending', 0)}")
+
+    # tgjiema_tasks_running (Gauge)
+    lines.append("# HELP tgjiema_tasks_running 运行中任务数量")
+    lines.append("# TYPE tgjiema_tasks_running gauge")
+    lines.append(f"tgjiema_tasks_running {state.get('tasks_running', 0)}")
+
+    # tgjiema_notifications_unread (Gauge)
+    lines.append("# HELP tgjiema_notifications_unread 未读通知总数")
+    lines.append("# TYPE tgjiema_notifications_unread gauge")
+    lines.append(f"tgjiema_notifications_unread {state.get('notifications_unread', 0)}")
+
+    # tgjiema_dlq_depth (Gauge)
+    lines.append("# HELP tgjiema_dlq_depth 死信队列深度")
+    lines.append("# TYPE tgjiema_dlq_depth gauge")
+    lines.append(f"tgjiema_dlq_depth {state.get('dlq_depth', 0)}")
+
+    # tgjiema_outbox_unprocessed (Gauge)
+    lines.append("# HELP tgjiema_outbox_unprocessed 未处理 dirty_outbox 数量")
+    lines.append("# TYPE tgjiema_outbox_unprocessed gauge")
+    lines.append(f"tgjiema_outbox_unprocessed {state.get('outbox_unprocessed', 0)}")
+
+    # tgjiema_audit_log_events_total{action} (Counter)
+    lines.append("# HELP tgjiema_audit_log_events_total 审计日志事件总数(按 action)")
+    lines.append("# TYPE tgjiema_audit_log_events_total counter")
+    audit = state.get("audit_log_events_total", {})
+    if audit:
+        for action, count in sorted(audit.items()):
+            lines.append(
+                f'tgjiema_audit_log_events_total{{action="{_escape(action)}"}} {count}'
+            )
+    else:
+        lines.append('tgjiema_audit_log_events_total{action="none"} 0')
+
+    # tgjiema_ru_operations_total{service,operation} (Counter)
+    lines.append("# HELP tgjiema_ru_operations_total RU 操作总数(按服务+操作)")
+    lines.append("# TYPE tgjiema_ru_operations_total counter")
+    ru_ops = state.get("ru_operations_total", {})
+    if ru_ops:
+        for (service, op), count in sorted(ru_ops.items()):
+            lines.append(
+                f'tgjiema_ru_operations_total{{service="{_escape(service)}",'
+                f'operation="{_escape(op)}"}} {count}'
+            )
+    else:
+        lines.append(
+            'tgjiema_ru_operations_total{service="unknown",operation="none"} 0'
+        )
+
+    return lines
+
+
+def _r40_collector_loop() -> None:
+    """R40 采集后台线程主循环(独立事件循环,避免与 HTTP handler 冲突)。
+
+    cache_store 的 aiosqlite 连接绑定到创建它的事件循环,因此必须使用
+    持久事件循环而非每次 asyncio.run(),否则连接会在循环销毁后失效。
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        # 初始化 cache_store(创建 aiosqlite 连接,绑定到本线程的事件循环)
+        try:
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            if not store._db:
+                loop.run_until_complete(store.init())
+                logger.info("[prometheus_exporter] cache_store 已在 R40 采集线程中初始化")
+        except Exception as e:
+            logger.warning(f"[prometheus_exporter] R40 采集线程 cache_store 初始化失败: {e}")
+        while True:
+            try:
+                loop.run_until_complete(collect_r40_metrics())
+            except Exception as e:
+                logger.debug(f"[prometheus_exporter] R40 采集异常: {e}")
+            time.sleep(300)  # 5 分钟采集一次
+    except Exception as e:
+        logger.warning(f"[prometheus_exporter] R40 采集线程异常退出: {e}")
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _start_r40_collector() -> None:
+    """启动 R40 指标采集后台线程(守护线程,进程退出时自动结束)。
+
+    幂等:多次调用只启动一次。支持测试环境不调用 main() 时也能懒启动。
+    """
+    global _r40_collector_started
+    with _r40_collector_start_lock:
+        if _r40_collector_started:
+            return
+        _r40_collector_started = True
+    t = threading.Thread(
+        target=_r40_collector_loop, daemon=True, name="r40-collector"
+    )
+    t.start()
+    logger.info("[prometheus_exporter] R40 指标采集后台线程已启动")
+
+
 # ── HTTP Handler ─────────────────────────────────────────
 
 
@@ -493,6 +803,9 @@ def main() -> None:
     logger.info(f"[prometheus_exporter] cache_store_db={CACHE_STORE_DB}")
     logger.info(f"[prometheus_exporter] relay_db={RELAY_DB_PATH}")
     logger.info(f"[prometheus_exporter] relay_spool_dir={RELAY_SPOOL_DIR}")
+
+    # R40: 启动 R40 指标采集后台线程
+    _start_r40_collector()
 
     server = create_server()
     try:
