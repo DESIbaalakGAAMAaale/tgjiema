@@ -483,13 +483,15 @@ async def _outbox_register_manifest_strict(
     """
     fuid = (file_meta or {}).get("file_unique_id", "") if isinstance(file_meta, dict) else ""
     if not fuid:
-        # 数据不完整(file_unique_id 缺失),无法定位 group_id,跳过 manifest 注册
-        # 但视为成功(否则 DEAD 也无法恢复,数据已丢失)
-        logger.warning(
-            f"[Up][Outbox] file_meta 缺失 file_unique_id,跳过 manifest 注册 "
-            f"(channel={channel_id}, msg_id={message_id})"
+        # R37 P0-2: file_unique_id 缺失时绝不可静默通过(否则永久丢失 Manifest 且无法恢复)
+        # 必须 fail-closed 抛 DurabilityError,让 OutboxWorker 标记 FAILED/DEAD,
+        # 保留完整上下文(outbox_id/upload_id/storage_msg_id)供人工修复。
+        from utils.exceptions import DurabilityError
+        raise DurabilityError(
+            f"manifest event missing file_unique_id "
+            f"(channel={channel_id}, msg_id={message_id}, "
+            f"outbox upload_id 可能丢失 — 请检查 upload_outbox 表"
         )
-        return
     media_type = (file_meta or {}).get("type", "") if isinstance(file_meta, dict) else ""
     mgid = (file_meta or {}).get("media_group_id", "") if isinstance(file_meta, dict) else ""
     await _ensure_channel_group_map()

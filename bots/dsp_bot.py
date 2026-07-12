@@ -1422,8 +1422,21 @@ async def _async_main():
             await report_bot_heartbeat("dsp_bot")
             await asyncio.sleep(30)
 
-    # H: 启动时一次性从 CRDB 同步，补齐 Dsp 离线期间遗漏的 job
+    # H: R37 P0-3: 启动时一次性从 CRDB 同步 — 默认禁用(SYNC_BACK_OFF=0)
     async def startup_sync():
+        """R37 P0-3: 启动同步 + 每 6h 周期同步 — 生产默认禁用。
+
+        - SYNC_BACK_OFF=0(默认): 完全跳过,不建立 CRDB 连接
+        - SYNC_BACK_OFF=1: 启用启动同步(仅开发/迁移期)
+        """
+        from config import settings
+        sync_back_enabled = getattr(settings, "SYNC_BACK_OFF", 0)
+        if not sync_back_enabled:
+            logger.info(
+                "[Dsp] R37 P0-3: SYNC_BACK_OFF=0, 启动同步已禁用"
+                "(由 crdb_sync 独占同步)"
+            )
+            return
         from database.session import sync_jobs_from_crdb_to_sqlite
         from database.cache_store import get_cache_store
         store = get_cache_store()
@@ -1441,15 +1454,26 @@ async def _async_main():
             except Exception as e:
                 logger.warning(f"[Dsp] 周期同步异常: {e}")
 
-    # D: Sync Back - R36 §6.4.4: dirty 驱动 + 退避(无 dirty 时 1m→5m→30m,关闭连接)
+    # D: Sync Back - R37 P0-3: 默认禁用(SYNC_BACK_OFF=0),由 crdb_sync 独占同步
     async def sync_back_loop():
-        """R36 §6.4.4: 取消固定 120s 同步,改为 dirty 驱动 + 退避。
+        """R37 P0-3: Bot 直连 CRDB 兜底同步 — 生产环境默认禁用。
 
-        - 有 dirty job 时:处理所有 dirty,下次 60s 后再检查
-        - 连续无 dirty 时退避:60s → 300s(5min) → 1800s(30min),上限 30min
-        - 任何一次发现 dirty 后,退避重置为 60s
-        - sync_local_jobs_to_crdb 内部已含 dirty 检查,无 dirty 时直接返回,不会建立 CRDB 连接
+        - SYNC_BACK_OFF=0(默认): 完全跳过,不建立 CRDB 连接(由 crdb_sync 独占)
+        - SYNC_BACK_OFF=1: 启用兜底(仅开发/迁移期使用)
+        - 生产环境必须保持 0,否则会产生空载 RU 消耗
         """
+        from config import settings
+        sync_back_enabled = getattr(settings, "SYNC_BACK_OFF", 0)
+        if not sync_back_enabled:
+            logger.info(
+                "[SyncBack] R37 P0-3: SYNC_BACK_OFF=0, Bot 直连 CRDB 兜底已禁用"
+                "(由 crdb_sync 独占同步)"
+            )
+            return  # 不启动循环
+        logger.warning(
+            "[SyncBack] SYNC_BACK_OFF=1, Bot 直连 CRDB 兜底已启用"
+            "(仅开发/迁移期使用,生产环境必须设为 0)"
+        )
         from database.session import sync_local_jobs_to_crdb
         from database.cache_store import get_cache_store
         backoff_seconds = 60  # 初始 1min

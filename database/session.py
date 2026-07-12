@@ -305,7 +305,12 @@ class CockroachDBClient:
             await conn.execute("SET application_name = $1", app_name)
 
         min_size = _settings.CRDB_POOL_MIN_SIZE  # R36: 不再强制 max(1, ...)
-        max_size = min(_settings.CRDB_POOL_MAX_SIZE, 2)  # R36: 业务 Bot ≤2,降低空载连接
+        # R37 P0-3: crdb_sync 角色放宽上限(独占同步需要更多连接);
+        # 其他业务 Bot 仍保持 ≤2,降低空载连接
+        if role == "crdb_sync":
+            max_size = min(_settings.CRDB_POOL_MAX_SIZE, 5)  # crdb_sync ≤5
+        else:
+            max_size = min(_settings.CRDB_POOL_MAX_SIZE, 2)  # 业务 Bot ≤2
         self._pool = await asyncpg.create_pool(
             self._url,
             min_size=min_size,

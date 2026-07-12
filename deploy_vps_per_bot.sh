@@ -218,6 +218,8 @@ split_env_per_service() {
     # 定义每个服务需要的 secret 变量(仅 secrets,不含共享配置)
     # 格式: "服务名:变量1,变量2,..."
     local -A SERVICE_SECRETS=(
+        # R37 P0-1: migration 需要直连 CRDB 执行 DDL,必须注入 COCKROACHDB_URL
+        [migration]="COCKROACHDB_URL"
         [up]="UPLOAD_BOT_TOKEN,RELAY_API_ID,RELAY_API_HASH,RELAY_ENCRYPTION_KEY,RELAY_ACCOUNT_IDS,COLLECTOR_ACCOUNT_IDS"
         [idx]="DECODER_BOT_TOKEN,RELAY_API_ID,RELAY_API_HASH,RELAY_ENCRYPTION_KEY,RELAY_ACCOUNT_IDS,ALLOWED_DECODER_BOTS"
         [dsp]="SENDER_BOT_TOKEN"
@@ -226,7 +228,7 @@ split_env_per_service() {
         [admin]="ADMIN_USERNAME,ADMIN_PASSWORD,ADMIN_WEB_PORT,ADMIN_WEB_HOST,CSRF_COOKIE_SECURE"
         [db_backup]="R2_ACCOUNT_ID,R2_ACCESS_KEY_ID,R2_SECRET_ACCESS_KEY,R2_BUCKET_NAME,R2_ENDPOINT,DB_BACKUP_ENABLED,DB_BACKUP_INTERVAL_MINUTES,COCKROACHDB_URL,BACKUP_KEK"
         [db_writer]=""  # 无 secrets,只用 REDIS_URL(来自 .env.shared)
-        # R36 §6.3: crdb_sync 需要连接 CRDB,从 .env.shared 读取 COCKROACHDB_URL
+        # R36 §6.3: crdb_sync 需要连接 CRDB
         [crdb_sync]="COCKROACHDB_URL"
     )
 

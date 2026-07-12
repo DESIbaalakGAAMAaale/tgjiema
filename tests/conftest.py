@@ -59,6 +59,10 @@ def _install_fake_config() -> None:
     settings.CRDB_POOL_MAX_SIZE = 2  # R36 §6.4.1: 默认 2(业务 Bot ≤2)
     settings.CRDB_APPLICATION_NAME_PREFIX = "tgjiema"  # R36 §6.4.2
     settings.BACKUP_KEK = ""  # R36 H7: 默认空(未配置加密)
+    # R37 P0-3: crdb_sync 独占同步配置
+    settings.SYNC_BACK_OFF = 0  # 0=禁用 Bot 直连兜底(生产默认)
+    settings.CRDB_SYNC_LEADER_LEASE = 90  # leader 租约时长(秒)
+    settings.CRDB_SYNC_DIRTY_INTERVAL = 2  # 有 dirty 时 cadence(秒)
 
     fake_config = types.ModuleType("config")
     fake_config.settings = settings

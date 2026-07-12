@@ -234,6 +234,15 @@ class Settings(BaseSettings):
     # 实际值为 f"{CRDB_APPLICATION_NAME_PREFIX}-{SERVICE_ROLE}"(如 tgjiema-up)
     CRDB_APPLICATION_NAME_PREFIX: str = "tgjiema"
 
+    # ── R37 P0-3: crdb_sync 独占同步 + Bot 兜底禁用开关 ──
+    # SYNC_BACK_OFF=0 禁用 dsp_bot.sync_back_loop / mon_bot cells 兜底直连 CRDB
+    # 生产环境必须设为 0(由 crdb_sync 独占);开发/迁移期可设为 1 保留兜底
+    SYNC_BACK_OFF: int = 0                      # 0=禁用 Bot 直连兜底(生产默认), 1=启用
+    # crdb_sync leader 租约(秒):防止多实例 crdb_sync 并发同步
+    CRDB_SYNC_LEADER_LEASE: int = 90            # leader 租约时长(秒)
+    # crdb_sync dirty 批处理节奏(秒):有 dirty 时的短间隔(1-5s 受控 batch cadence)
+    CRDB_SYNC_DIRTY_INTERVAL: int = 2           # 有 dirty 时每 2s 处理一批(受控 cadence)
+
     # ── 缓存参数 ──
     CACHE_USER_MAX_SIZE: int = 1000             # 用户缓存最大条目
     CACHE_USER_TTL: int = 10800                 # 用户缓存 TTL（秒）
@@ -322,6 +331,10 @@ class Settings(BaseSettings):
             "admin": self._validate_admin_fields,
             "db_writer": self._validate_writer_fields,
             "db_backup": self._validate_backup_fields,
+            # R37 P0-3: crdb_sync 角色注册 validator(之前未注册,无任何校验)
+            "crdb_sync": self._validate_crdb_sync_fields,
+            # R37 P1-8: migration 角色注册 validator(oneshot DDL 执行需要 CRDB URL)
+            "migration": self._validate_migration_fields,
         }
         validator = role_validators.get(role)
         if validator:
@@ -404,6 +417,20 @@ class Settings(BaseSettings):
             if not self.R2_SECRET_ACCESS_KEY:
                 raise ValueError("[Settings][db_backup] DB_BACKUP_ENABLED=true 但 R2_SECRET_ACCESS_KEY 未配置")
         # db_backup 需要 CRDB URL 和 R2 凭证,但不需要 Bot Token
+
+    def _validate_crdb_sync_fields(self):
+        """R37 P0-3: crdb_sync 必填字段 — 独占 CRDB 同步,需要 COCKROACHDB_URL"""
+        if not self.COCKROACHDB_URL:
+            raise ValueError("[Settings][crdb_sync] COCKROACHDB_URL 未配置(crdb_sync 必须直连 CRDB)")
+        # crdb_sync 不需要 Bot Token、Admin 凭证、R2 凭证
+        # 只需要 Redis(用于 leader 租约互斥)
+        if self.WRITER_MODE == "redis" and not self.REDIS_URL:
+            raise ValueError("[Settings][crdb_sync] WRITER_MODE=redis 但 REDIS_URL 未配置(leader 租约需要 Redis)")
+
+    def _validate_migration_fields(self):
+        """R37 P1-8: migration 必填字段 — oneshot DDL 执行,需要 COCKROACHDB_URL"""
+        if not self.COCKROACHDB_URL:
+            raise ValueError("[Settings][migration] COCKROACHDB_URL 未配置(migration 必须直连 CRDB 执行 DDL)")
 
     def _validate_relay_key(self):
         """校验 RELAY_ENCRYPTION_KEY(仅 up/idx/dsp/mon 需要)"""

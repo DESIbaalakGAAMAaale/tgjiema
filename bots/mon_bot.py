@@ -1180,13 +1180,18 @@ class MonBot:
                             f"suspicious={len(stale_suspicious)}"
                         )
 
-                # 6.5 脏数据同步到 CRDB(每 10 轮一次,~5分钟)
+                # 6.5 R37 P0-3: 脏数据同步到 CRDB — 默认禁用(SYNC_BACK_OFF=0)
+                # 由 crdb_sync 独占同步,Mon 不直连 CRDB(避免空载 RU 消耗)
                 if self._cycle_count % 10 == 0:
-                    try:
-                        from database.session import sync_dirty_cells_to_crdb
-                        await sync_dirty_cells_to_crdb()
-                    except Exception as e:
-                        logger.warning(f"[Mon] 脏数据同步异常: {e}")
+                    from config import settings
+                    sync_back_enabled = getattr(settings, "SYNC_BACK_OFF", 0)
+                    if sync_back_enabled:
+                        try:
+                            from database.session import sync_dirty_cells_to_crdb
+                            await sync_dirty_cells_to_crdb()
+                        except Exception as e:
+                            logger.warning(f"[Mon] 脏数据同步异常: {e}")
+                    # SYNC_BACK_OFF=0 时:完全跳过,不建立 CRDB 连接
 
                 # A1: 端到端监控告警(每 10 轮一次, ~10 分钟)
                 if self._cycle_count % 10 == 0:

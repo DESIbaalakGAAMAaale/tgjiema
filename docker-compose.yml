@@ -28,12 +28,14 @@ services:
       retries: 3
 
   # ── migration (oneshot,DDL 执行) ──
+  # R37 P0-1: migration 必须加载 .env.secrets.migration(含 COCKROACHDB_URL)
   migration:
     build: .
     container_name: tgjiema-migration
     restart: "no"
     env_file:
       - .env.shared
+      - .env.secrets.migration
     environment:
       - SERVICE_ROLE=migration
       - PYTHONUNBUFFERED=1
@@ -66,13 +68,13 @@ services:
         condition: service_completed_successfully
 
   # ── crdb_sync (单一 CRDB 同步服务) ──
+  # R37 P0-1: 使用标准 env_file 字段加载 secrets(不再使用非标准字段)
   crdb_sync:
     build: .
     container_name: tgjiema-crdb_sync
     restart: on-failure
     env_file:
       - .env.shared
-    env_file_secrets:
       - .env.secrets.crdb_sync
     environment:
       - SERVICE_ROLE=crdb_sync
