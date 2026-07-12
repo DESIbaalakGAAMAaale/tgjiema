@@ -7,38 +7,19 @@ from loguru import logger
 from config import settings
 from database.session import _client as db_client, get_config, _validate_identifier
 from storage.r2 import _r2 as r2_storage, configure_r2_dynamic
+from services.backup_schema import (
+    BACKUP_SCHEMA, get_backup_tables, get_conflict_col,
+)
 
-
-SMALL_TABLES = {
-    "cells", "users", "spare_pool", "backup_config", "rotation_config",
-    "relay_accounts", "code_bot_mapping", "external_code_mapping",
-    "kv_config", "message_backups",
-    # R-1: codes/file_records 纳入备份（取件码→频道/消息的映射是核心数据，
-    # 无外部备份则为单点故障。取消行数上限，确保所有取件映射可恢复）
-    "codes", "file_records",
-    # M0 收尾: manifest(副本恢复元数据) 与 writer_inbox(幂等去重表) 纳入备份。
-    # manifest 驱动频道冗余环的副本重建,缺失则为单点故障;
-    # writer_inbox 保留用于恢复后幂等性校验,避免旧消息重复执行。
-    # 注:若表在 CRDB 中不存在会自动跳过(见 backup_all_tables 的 does not exist 降级)。
-    "manifest", "writer_inbox",
-    # M1 业务闭环: 5 张新表纳入备份(若 CRDB 中不存在会自动跳过)。
-    # upload_sessions/upload_outbox 有单主键,_CONFLICT_COLS 中配置冲突列;
-    # quota_ledger/delivery_receipts/replication_tasks 为自增主键的追加式日志,
-    # merge 模式下退化为普通 INSERT(重复恢复可能产生重复行,但语义上可接受)。
-    "delivery_receipts", "quota_ledger", "replication_tasks",
-    "upload_outbox", "upload_sessions",
-}
-
-_LARGE_TABLES = {
-    "decode_logs", "jobs", "pending_uploads", "rotate_log",
-}
-
+# ─── 表清单(单一事实源: services/backup_schema.py) ───
+# 保留向后兼容的别名,等价于原 SMALL_TABLES / _LARGE_TABLES / _TABLE_WHERE
+# 新增表时只需在 backup_schema.BACKUP_SCHEMA 中添加条目,无需修改本文件
+SMALL_TABLES = set(get_backup_tables())
+_LARGE_TABLES = {t.name for t in BACKUP_SCHEMA.values() if t.is_large}
 BACKUP_TABLES = SMALL_TABLES
 
-# 每个表可选的 WHERE 条件，用于过滤备份范围
-_TABLE_WHERE = {
-    "file_records": "status = 'active'",  # 仅备份活跃文件，跳过已过期/删除
-}
+# 每个表可选的 WHERE 条件,用于过滤备份范围(从 BACKUP_SCHEMA 派生)
+_TABLE_WHERE = {t.name: t.where_clause for t in BACKUP_SCHEMA.values() if t.where_clause}
 
 # 备份保留份数（超出则自动清理最旧的）
 MAX_BACKUP_RETENTION = 168  # 7天 × 24小时 / 1小时间隔 ≈ 168 份
@@ -284,27 +265,10 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         from database.session import init_db
         await init_db()
 
-    # 各表的冲突目标列（用于 merge 模式的 ON CONFLICT DO NOTHING）
-    # 键=表名, 值=冲突列名(主键或唯一键)
-    _CONFLICT_COLS = {
-        "users": "user_id",
-        "file_records": "file_code",
-        "cells": "slot_id",
-        "codes": "code",
-        "spare_pool": "channel_id",
-        "kv_config": "config_key",
-        "external_code_mapping": "external_code",
-        "relay_accounts": "phone",  # 主键 id 是 SERIAL,用 phone UNIQUE 做冲突
-        # M0 收尾: writer_inbox 单主键
-        "writer_inbox": "message_id",
-        # M1 业务闭环: 单主键表配置冲突列(自增主键表省略,merge 时退化为普通 INSERT)
-        "upload_sessions": "upload_id",
-        "upload_outbox": "outbox_id",
-    }
-    # message_backups 是复合主键 (main_msg_id, backup_channel_id),需特殊处理
-    # manifest 是复合主键 (group_id, file_unique_id, channel_id),需特殊处理
-    # M1: quota_ledger/delivery_receipts/replication_tasks 为自增主键,
-    #      merge 模式下不在 _CONFLICT_COLS 中,退化为普通 INSERT(追加式日志语义可接受)
+    # 冲突策略从 BACKUP_SCHEMA 派生(单一事实源: services/backup_schema.py)
+    # - 复合主键(len(pk_columns) > 1) → ON CONFLICT (col1, col2, ...) DO NOTHING
+    # - 单列冲突(conflict_col 非空) → ON CONFLICT ("col") DO NOTHING
+    # - 自增主键(conflict_col 为空) → 退化为普通 INSERT(追加式日志语义可接受)
 
     for table_name, rows in restore_tables.items():
         # P0-2: 表名格式白名单校验(防 SQL 注入),非法表名跳过并记录告警
@@ -325,19 +289,20 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
                     # 覆盖模式:清空目标表（恢复前清空，避免主键冲突）
                     await db_client.execute(f'TRUNCATE TABLE "{safe_name}" RESTART IDENTITY CASCADE')
 
-                # 确定 ON CONFLICT 子句(仅 merge 模式)
+                # 确定 ON CONFLICT 子句(仅 merge 模式,从 BACKUP_SCHEMA 派生)
                 conflict_clause = ""
                 if merge:
-                    if table_name == "message_backups":
-                        conflict_clause = ' ON CONFLICT (main_msg_id, backup_channel_id) DO NOTHING'
-                    elif table_name == "manifest":
-                        # M0 收尾: manifest 复合主键 (group_id, file_unique_id, channel_id)
-                        conflict_clause = ' ON CONFLICT (group_id, file_unique_id, channel_id) DO NOTHING'
-                    elif table_name in _CONFLICT_COLS:
-                        conflict_col = _CONFLICT_COLS[table_name]
-                        conflict_clause = f' ON CONFLICT ("{conflict_col}") DO NOTHING'
+                    _schema = BACKUP_SCHEMA.get(table_name)
+                    if _schema and len(_schema.pk_columns) > 1:
+                        # 复合主键: ON CONFLICT (col1, col2, ...) DO NOTHING
+                        # 覆盖 message_backups / manifest 等复合主键表
+                        _pk_cols = ", ".join(f'"{c}"' for c in _schema.pk_columns)
+                        conflict_clause = f' ON CONFLICT ({_pk_cols}) DO NOTHING'
+                    elif _schema and _schema.conflict_col:
+                        # 单列冲突: ON CONFLICT ("col") DO NOTHING
+                        conflict_clause = f' ON CONFLICT ("{_schema.conflict_col}") DO NOTHING'
                     else:
-                        # 未知主键结构的表,merge 模式下退化为普通 INSERT
+                        # 自增主键或未知冲突列,merge 模式下退化为普通 INSERT
                         # 遇到冲突会报错并由事务 ROLLBACK
                         logger.warning(f"[db_restore] 表 {safe_name} 未知冲突列,merge 模式可能因主键冲突失败")
 

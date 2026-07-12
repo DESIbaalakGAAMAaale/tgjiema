@@ -15,137 +15,23 @@ from loguru import logger
 
 from config import settings
 from storage.r2 import _r2 as r2_storage
+from services.backup_schema import (
+    BACKUP_SCHEMA, get_restore_tables, is_table_allowed, ALLOWED_COLUMNS,
+)
 
-# 备份中会包含的表（按依赖顺序排列，先恢复无依赖的表）
-# M0 收尾: 补齐 manifest / writer_inbox / kv_config,与 db_backup.SMALL_TABLES 对齐
-# M1 业务闭环: 补齐 5 张新表,与 db_backup.SMALL_TABLES 对齐
-ALL_TABLES = ["users", "file_records", "decode_logs", "cells", "codes", "jobs",
-              "rotate_log", "pending_uploads", "spare_pool", "backup_config",
-              "code_bot_mapping", "message_backups", "relay_accounts",
-              "rotation_config", "external_code_mapping", "kv_config",
-              "manifest", "writer_inbox",
-              # M1 业务闭环: 5 张新表(若备份中不存在会被 restore_table 跳过)
-              "upload_sessions", "upload_outbox", "quota_ledger",
-              "delivery_receipts", "replication_tasks"]
+# ─── 表清单(单一事实源: services/backup_schema.py) ───
+# 保留向后兼容的别名,等价于原 ALL_TABLES / TABLE_PK
+# 新增表时只需在 backup_schema.BACKUP_SCHEMA 中添加条目,无需修改本文件
+ALL_TABLES = get_restore_tables()
 
-# 各表的主键列
-TABLE_PK = {
-    "users": "user_id",
-    "file_records": "file_code",
-    "decode_logs": "id",
-    "cells": "slot_id",
-    "codes": "code",
-    "jobs": "id",
-    "rotate_log": "id",
-    "pending_uploads": "id",
-    "spare_pool": "channel_id",
-    "backup_config": "config_key",
-    "code_bot_mapping": "code_prefix",
-    "message_backups": "main_msg_id, backup_channel_id",
-    "relay_accounts": "id",
-    "rotation_config": "config_key",
-    "external_code_mapping": "external_code",
-    "kv_config": "config_key",
-    # manifest 复合主键(group_id, file_unique_id, channel_id)
-    "manifest": "group_id, file_unique_id, channel_id",
-    "writer_inbox": "message_id",
-    # M1 业务闭环: 5 张新表主键
-    # upload_sessions/upload_outbox 为 TEXT 单主键;
-    # quota_ledger/delivery_receipts/replication_tasks 为 INTEGER 自增主键,
-    # 恢复时按主键 UPSERT(显式指定 ID 时可幂等,未指定时新行)。
-    "upload_sessions": "upload_id",
-    "upload_outbox": "outbox_id",
-    "quota_ledger": "ledger_id",
-    "delivery_receipts": "receipt_id",
-    "replication_tasks": "task_id",
-}
+# 各表的主键列(从 BACKUP_SCHEMA 派生,格式与原 TABLE_PK 一致: "col1, col2" 字符串)
+TABLE_PK = {t.name: ", ".join(t.pk_columns) for t in BACKUP_SCHEMA.values()}
 
-# 白名单:只允许这些列名出现在 INSERT/UPDATE 语句中
-_ALLOWED_COLUMNS = set()
-for _tbl in ALL_TABLES:
-    # 预定义常见列名白名单(防止注入)
-    _ALLOWED_COLUMNS.update([
-        # 通用
-        "id", "created_at", "updated_at", "status", "note",
-        # users 表
-        "user_id", "username", "first_name", "membership_level",
-        "daily_decode_quota", "quota_used_today", "quota_date",
-        "can_upload", "external_decode_quota", "external_used_today",
-        "external_quota_date", "is_banned",
-        # file_records 表
-        "file_code", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
-        "file_types", "backup_channel_msg_ids", "batch_msg_ids", "batch_file_meta",
-        "file_ids", "request_count", "create_time", "expire_time",
-        "blocked_users", "protect_content", "file_ttl_days",
-        # decode_logs 表
-        "requester_id", "request_time", "source_channel_id",
-        # pending_uploads 表
-        "status_msg_id", "processed",
-        # backup_config / rotation_config 表
-        "config_key", "config_value",
-        # message_backups 表
-        "main_msg_id", "backup_channel_id", "backed_msg_id", "backed_at",
-        # cells 表
-        "slot_id", "channel_id", "next_active_chat_id", "prev_slot_id",
-        "demoted_to_channel_id", "account_name", "is_r100",
-        "last_heartbeat", "last_synced_msg_id", "degrade_count",
-        "file_count", "rotation_started_at",
-        # codes 表
-        "code", "file_record_code",
-        # jobs 表
-        "target_user_id", "storage_channel_id", "storage_msg_ids",
-        "task_type", "dispatched_at", "retry_count",
-        "dead", "dead_reason", "dead_retry", "dead_retry_at", "dead_retry_count",
-        # rotate_log 表
-        "timestamp", "from_slot_id", "to_slot_id", "from_status",
-        "to_status", "reason", "triggered_by",
-        # spare_pool 表
-        "is_used",
-        # relay_accounts 表
-        "api_id", "api_hash", "phone", "is_active", "last_login_at",
-        # external_code_mapping 表
-        "external_code", "system_code", "bot_username",
-        # code_bot_mapping 表
-        "code_prefix",
-        # M0 收尾: manifest 表(频道冗余环副本元数据)
-        "group_id", "file_unique_id", "channel_id", "media_type",
-        "media_group_id", "first_seen_at",
-        # M0 收尾: writer_inbox 表(幂等去重)
-        "method_name", "stream_id", "created_at", "processed_at",
-        # M1 业务闭环: upload_sessions 表(上传会话状态机)
-        "upload_id", "source_msg_ids", "primary_msg_ids", "options_json",
-        "trace_id", "prev_status", "transitioned_at", "transition_reason",
-        "lease_owner", "lease_until", "last_error",
-        # M1 业务闭环: upload_outbox 表(事务发件箱)
-        "outbox_id", "job_id", "event_type", "attempts", "next_retry_at",
-        # M1 业务闭环: quota_ledger 表(配额变更流水)
-        "ledger_id", "is_external", "quota_before", "quota_after",
-        "request_id",
-        # M1 业务闭环: delivery_receipts 表(投递回执)
-        "receipt_id", "source_msg_id", "sent_msg_id", "group_receipt_id",
-        "error_reason", "confirmed_at",
-        # M1 业务闭环: replication_tasks 表(副本复制任务)
-        "task_id", "src_channel_id", "dst_channel_id", "src_msg_id",
-        "dst_msg_id", "priority", "max_attempts", "committed_at",
-        # 向后兼容(旧备份可能包含的列)
-        "key", "prefix", "api_hash_encrypted",
-        "group_key", "account_index", "description", "interval_minutes",
-        "enabled", "usage", "total_requests", "avg_wait_ms", "last_used",
-        "bot_type", "session_data", "message_id", "chat_id", "from_chat_id",
-        "decoded_at", "decode_result", "backup_time",
-    ])
+# 列白名单(从 BACKUP_SCHEMA 聚合所有表 columns + 向后兼容列,单一事实源)
+_ALLOWED_COLUMNS = ALLOWED_COLUMNS
 
-
-_ALLOWED_TABLES = frozenset([
-    "users", "file_records", "decode_logs", "pending_uploads",
-    "cells", "codes", "jobs", "rotate_log", "relay_accounts",
-    "spare_pool", "backup_config", "code_bot_mapping",
-    "message_backups", "rotation_config", "external_code_mapping",
-    "kv_config", "manifest", "writer_inbox",
-    # M1 业务闭环: 5 张新表
-    "upload_sessions", "upload_outbox", "quota_ledger",
-    "delivery_receipts", "replication_tasks",
-])
+# 表白名单(从 BACKUP_SCHEMA 派生)
+_ALLOWED_TABLES = frozenset(get_restore_tables())
 
 def _sanitize_table(name: str) -> str:
     """白名单校验表名,防止 SQL 注入。"""
