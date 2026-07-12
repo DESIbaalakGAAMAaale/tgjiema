@@ -16,6 +16,11 @@ SMALL_TABLES = {
     # R-1: codes/file_records 纳入备份（取件码→频道/消息的映射是核心数据，
     # 无外部备份则为单点故障。取消行数上限，确保所有取件映射可恢复）
     "codes", "file_records",
+    # M0 收尾: manifest(副本恢复元数据) 与 writer_inbox(幂等去重表) 纳入备份。
+    # manifest 驱动频道冗余环的副本重建,缺失则为单点故障;
+    # writer_inbox 保留用于恢复后幂等性校验,避免旧消息重复执行。
+    # 注:若表在 CRDB 中不存在会自动跳过(见 backup_all_tables 的 does not exist 降级)。
+    "manifest", "writer_inbox",
 }
 
 _LARGE_TABLES = {
@@ -284,8 +289,11 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         "kv_config": "config_key",
         "external_code_mapping": "external_code",
         "relay_accounts": "phone",  # 主键 id 是 SERIAL,用 phone UNIQUE 做冲突
+        # M0 收尾: writer_inbox 单主键
+        "writer_inbox": "message_id",
     }
     # message_backups 是复合主键 (main_msg_id, backup_channel_id),需特殊处理
+    # manifest 是复合主键 (group_id, file_unique_id, channel_id),需特殊处理
 
     for table_name, rows in restore_tables.items():
         # P0-2: 表名格式白名单校验(防 SQL 注入),非法表名跳过并记录告警
@@ -311,6 +319,9 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
                 if merge:
                     if table_name == "message_backups":
                         conflict_clause = ' ON CONFLICT (main_msg_id, backup_channel_id) DO NOTHING'
+                    elif table_name == "manifest":
+                        # M0 收尾: manifest 复合主键 (group_id, file_unique_id, channel_id)
+                        conflict_clause = ' ON CONFLICT (group_id, file_unique_id, channel_id) DO NOTHING'
                     elif table_name in _CONFLICT_COLS:
                         conflict_col = _CONFLICT_COLS[table_name]
                         conflict_clause = f' ON CONFLICT ("{conflict_col}") DO NOTHING'

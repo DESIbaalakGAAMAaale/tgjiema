@@ -17,10 +17,12 @@ from config import settings
 from storage.r2 import _r2 as r2_storage
 
 # 备份中会包含的表（按依赖顺序排列，先恢复无依赖的表）
+# M0 收尾: 补齐 manifest / writer_inbox / kv_config,与 db_backup.SMALL_TABLES 对齐
 ALL_TABLES = ["users", "file_records", "decode_logs", "cells", "codes", "jobs",
               "rotate_log", "pending_uploads", "spare_pool", "backup_config",
               "code_bot_mapping", "message_backups", "relay_accounts",
-              "rotation_config", "external_code_mapping"]
+              "rotation_config", "external_code_mapping", "kv_config",
+              "manifest", "writer_inbox"]
 
 # 各表的主键列
 TABLE_PK = {
@@ -39,6 +41,10 @@ TABLE_PK = {
     "relay_accounts": "id",
     "rotation_config": "config_key",
     "external_code_mapping": "external_code",
+    "kv_config": "config_key",
+    # manifest 复合主键(group_id, file_unique_id, channel_id)
+    "manifest": "group_id, file_unique_id, channel_id",
+    "writer_inbox": "message_id",
 }
 
 # 白名单:只允许这些列名出现在 INSERT/UPDATE 语句中
@@ -88,6 +94,11 @@ for _tbl in ALL_TABLES:
         "external_code", "system_code", "bot_username",
         # code_bot_mapping 表
         "code_prefix",
+        # M0 收尾: manifest 表(频道冗余环副本元数据)
+        "group_id", "file_unique_id", "channel_id", "media_type",
+        "media_group_id", "first_seen_at",
+        # M0 收尾: writer_inbox 表(幂等去重)
+        "method_name", "stream_id", "created_at", "processed_at",
         # 向后兼容(旧备份可能包含的列)
         "key", "prefix", "api_hash_encrypted",
         "group_key", "account_index", "description", "interval_minutes",
@@ -102,6 +113,7 @@ _ALLOWED_TABLES = frozenset([
     "cells", "codes", "jobs", "rotate_log", "relay_accounts",
     "spare_pool", "backup_config", "code_bot_mapping",
     "message_backups", "rotation_config", "external_code_mapping",
+    "kv_config", "manifest", "writer_inbox",
 ])
 
 def _sanitize_table(name: str) -> str:

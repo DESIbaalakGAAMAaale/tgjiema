@@ -108,6 +108,8 @@ class DBWriter:
         self._dead_fail_count: int = 0  # R34: DLQ 写入失败计数
         self._dlq_task: asyncio.Task | None = None  # R34 P1-1: DLQ Worker 协程
         self._ack_count: int = 0  # R34 P1-3: ACK 计数,每 100 次触发 trim_stream
+        # M0 收尾: writer_inbox 清理时间戳(每小时清理一次过期记录)
+        self._last_cleanup_time: float = 0.0
 
     async def init(self):
         """初始化 SQLite 连接 + Consumer Group。"""
@@ -154,6 +156,10 @@ class DBWriter:
                     continue
                 for msg in messages:
                     await self._process_message(msg)
+
+                # M0 收尾: 每小时清理一次 writer_inbox 过期记录
+                # 保留期必须远大于 XAUTOCLAIM 回收阈值(30秒),确保崩溃恢复后仍可幂等校验
+                await self._maybe_cleanup_inbox()
             except asyncio.CancelledError:
                 logger.info("[DBWriter] 收到 CancelledError,准备停止")
                 self._running = False
@@ -214,6 +220,34 @@ class DBWriter:
             f"扫描 {worker.processed_count} 条,重试 {worker.retried_count} 条,"
             f"永久失败 {worker.permanent_fail_count} 条"
         )
+
+    async def _maybe_cleanup_inbox(self):
+        """M0 收尾: 每小时清理一次 writer_inbox 过期记录。
+
+        保留期由 settings.WRITER_INBOX_RETENTION_HOURS 控制(默认 168 小时=7天)。
+        必须远大于 XAUTOCLAIM 的 WRITER_RECLAIM_IDLE_MS(30秒)回收阈值,
+        确保崩溃恢复后仍有 inbox 记录可查,避免旧消息重复执行。
+
+        清理异常不影响主消费循环(仅记录 WARNING)。
+        """
+        now = time.time()
+        if now - self._last_cleanup_time <= 3600:
+            return
+        try:
+            from config import settings
+            retention_hours = getattr(settings, 'WRITER_INBOX_RETENTION_HOURS', 168)
+            before_ts = now - retention_hours * 3600
+            if self._store:
+                deleted = await self._store.cleanup_writer_inbox(before_ts)
+                if deleted > 0:
+                    logger.info(
+                        f"[DBWriter] 清理 writer_inbox: 删除 {deleted} 条过期记录"
+                        f"(保留 {retention_hours} 小时)"
+                    )
+        except Exception as e:
+            logger.warning(f"[DBWriter] writer_inbox 清理异常: {e}")
+        finally:
+            self._last_cleanup_time = now
 
     async def close(self):
         """关闭 SQLite 连接和 Redis 连接。"""
