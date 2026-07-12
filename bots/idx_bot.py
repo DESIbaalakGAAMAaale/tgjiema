@@ -213,7 +213,26 @@ async def _dispatch_to_dsp(
     batch_file_meta: str = "",
     protect_content: bool = False,
 ):
-    """将解码结果写jobs Dsp Bot 轮询发送"""
+    """将解码结果写jobs Dsp Bot 轮询发送
+
+    R36 B0-1: 从 batch_file_meta JSON 中提取结构化副本信息
+    (group_id/file_unique_id/media_group_id),透传给 enqueue_job,
+    使 ReplicaAwareResolver 成为真实投递主路径。
+    """
+    # R36 B0-1: 从 batch_file_meta 提取结构化副本信息
+    _group_id = 0
+    _file_unique_id = ""
+    _media_group_id = ""
+    if batch_file_meta:
+        try:
+            _meta_list = json.loads(batch_file_meta) if isinstance(batch_file_meta, str) else batch_file_meta
+            if isinstance(_meta_list, list) and _meta_list:
+                _first = _meta_list[0] if isinstance(_meta_list[0], dict) else {}
+                _group_id = int(_first.get("group_id", 0) or 0)
+                _file_unique_id = str(_first.get("file_unique_id", "") or "")
+                _media_group_id = str(_first.get("media_group_id", "") or "")
+        except (json.JSONDecodeError, TypeError, ValueError) as _e:
+            logger.warning(f"[Idx] batch_file_meta 解析副本信息失败 (code={code}): {_e}")
     try:
         await enqueue_job(
             code=code,
@@ -223,10 +242,13 @@ async def _dispatch_to_dsp(
             batch_file_meta=batch_file_meta,
             task_type="batch" if len(msg_ids) > 1 else "single",
             protect_content=protect_content,
+            group_id=_group_id,
+            file_unique_id=_file_unique_id,
+            media_group_id=_media_group_id,
         )
         logger.info(
             f"[Idx] 已写 jobs  user={target_user_id}, code={code}, "
-            f"{len(msg_ids)} 个文件\n"
+            f"{len(msg_ids)} 个文件, group_id={_group_id}, fuid={_file_unique_id[:16]}\n"
         )
     except Exception as e:
         logger.error(f"[Idx] 写入 jobs 失败 (user={target_user_id}, code={code}): {e}")

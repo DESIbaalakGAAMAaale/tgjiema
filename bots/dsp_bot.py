@@ -123,35 +123,59 @@ async def _mark_delivery_failed_safe(
         )
 
 
-def _extract_replica_info(job) -> tuple[str, int | None]:
-    """从 job.batch_file_meta 提取 (file_unique_id, group_id) 供 ReplicaAwareResolver 使用。
+def _extract_replica_info(job) -> tuple[str, int | None, str, bool]:
+    """从 job 提取 (file_unique_id, group_id, media_group_id, is_structured_new_job) 供 ReplicaAwareResolver 使用。
 
-    batch_file_meta 格式(up_bot 写入):
-      [{"chat_id":.., "msg_id":.., "media_group_id":..,
-        "file_type":.., "file_meta":.., "file_unique_id":..}, ...]
+    R36 B0-1: 优先从结构化字段(job.group_id / job.file_unique_id / job.media_group_id)读取,
+    缺失时 fallback 到 batch_file_meta JSON 解析(向后兼容旧 job)。
 
-    group_id 是 manifest 表的存储层概念(非 job 字段),当前数据流未暴露给 dsp。
-    返回 ("", None) 表示无可用副本信息,调用方应 fallback 到拓扑解析。
+    返回 (file_unique_id, group_id, media_group_id, is_structured_new_job):
+    - file_unique_id: Telegram 文件唯一标识(跨 bot 稳定去重键)
+    - group_id: 拓扑组号(1-5),None 表示未知(旧 job 或解析失败)
+    - media_group_id: Telegram 媒体组 ID(相册分组键)
+    - is_structured_new_job: True 表示这是新格式 job(结构化字段已写入),
+      调用方应严格按 fail-closed 处理(缺 group_id 进入 retry,不静默 fallback 到拓扑猜测)
     """
+    # 1. 优先从结构化字段读取(R36 B0-1)
+    fuid_struct = getattr(job, "file_unique_id", "") or ""
+    gid_struct = getattr(job, "group_id", 0) or 0
+    mgid_struct = getattr(job, "media_group_id", "") or ""
+
+    # 判断是否为新格式 job: file_unique_id 结构化字段非空,或 group_id > 0
+    is_structured_new = bool(fuid_struct) or gid_struct > 0
+    if is_structured_new:
+        # 新格式 job: group_id > 0 时返回 int,否则返回 None(数据不完整)
+        return fuid_struct, (gid_struct if gid_struct > 0 else None), mgid_struct, True
+
+    # 2. 旧 job: fallback 到 batch_file_meta JSON 解析(向后兼容)
     raw = getattr(job, "batch_file_meta", None)
     if not raw:
-        return "", None
+        return "", None, "", False
     # 兼容 str(JSON) / list 两种格式
     if isinstance(raw, str):
         try:
             items = json.loads(raw)
         except Exception:
-            return "", None
+            return "", None, "", False
     elif isinstance(raw, list):
         items = raw
     else:
-        return "", None
+        return "", None, "", False
     if not items or not isinstance(items, list):
-        return "", None
+        return "", None, "", False
     first = items[0] if isinstance(items[0], dict) else {}
     fuid = first.get("file_unique_id", "") or ""
-    # group_id 当前不在 batch_file_meta 中(未来扩展点)
-    return fuid, None
+    # 旧 job batch_file_meta 中可能已包含 group_id(up_bot 已升级但 SQLite 列未升级的过渡态)
+    gid_raw = first.get("group_id")
+    gid: int | None = None
+    if gid_raw is not None:
+        try:
+            gid_int = int(gid_raw)
+            gid = gid_int if gid_int > 0 else None
+        except (TypeError, ValueError):
+            gid = None
+    mgid = first.get("media_group_id", "") or ""
+    return fuid, gid, mgid, False
 
 
 async def _try_replica_aware_resolve(
@@ -526,6 +550,9 @@ def _raw_jobs_to_results(raw_jobs: list[dict]) -> list:
             task_type=rj.get("task_type", "single"),
             protect_content=rj.get("protect_content", False),
             retry_count=rj.get("retry_count", 0),
+            group_id=rj.get("group_id", 0) or 0,
+            file_unique_id=rj.get("file_unique_id", "") or "",
+            media_group_id=rj.get("media_group_id", "") or "",
         ))
     return results
 
@@ -778,7 +805,8 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     )
 
     # R35 §22: 优先尝试 ReplicaAwareResolver(按 manifest 副本解析,fail-closed)
-    fuid, gid = _extract_replica_info(job)
+    # R36 B0-1: 优先从结构化字段读取,使 Resolver 成为真实投递主路径
+    fuid, gid, mgid, is_structured_new = _extract_replica_info(job)
     sent_msg_id: int | None = None
     tried: set[int] = set()
     if fuid and gid is not None:
@@ -798,8 +826,35 @@ async def _process_single_job(bot, job, bot_id: int = 1):
                 protect_content=protect_content, bot_id=bot_id,
                 original_channel_id=job.storage_channel_id,
             )
+        else:
+            # R36 B0-1: Resolver 查询失败(无副本/manifest 不可达),
+            # 对新格式 job(fuid 已知)严格 fail-closed: 进入 retry 等待 manifest 同步,
+            # 不静默 fallback 到拓扑猜测(避免投递到无副本的频道导致用户收到错误文件)
+            if is_structured_new:
+                logger.error(
+                    f"[Dsp] 新 job Resolver 失败(fail-closed),进入 retry: "
+                    f"job={job.job_id}, code={job.code}, fuid={fuid}, gid={gid}"
+                )
+                await _mark_delivery_failed_safe(
+                    store, job.job_id, msg_id,
+                    reason=f"resolver_failed_fail_closed fuid={fuid} gid={gid}",
+                )
+                return False  # 触发 retry_local_job,不 fallback 到拓扑猜测
 
-    # ── 使用 copy_message 发送(fallback 路径)──
+    # R36 B0-1: 新 job 缺 group_id(数据不完整),进入 retry/reconciliation
+    # 不静默走旧拓扑猜测,避免投递到无副本的频道
+    if is_structured_new and fuid and gid is None:
+        logger.error(
+            f"[Dsp] 新 job 缺 group_id(数据不完整),进入 retry: "
+            f"job={job.job_id}, code={job.code}, fuid={fuid}"
+        )
+        await _mark_delivery_failed_safe(
+            store, job.job_id, msg_id,
+            reason=f"missing_group_id fuid={fuid}",
+        )
+        return False  # 触发 retry_local_job,等待数据修复
+
+    # ── 使用 copy_message 发送(fallback 路径,仅用于旧 job 或 Resolver 命中失败时)──
     resolved = None
     if not sent_msg_id:
         resolved = await resolve_delivery_channel(job.storage_channel_id)

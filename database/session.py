@@ -24,7 +24,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 7  # 递增此值以触发 DDL 升级
+DDL_VERSION = 8  # R36 B0-1: jobs 表加 group_id/file_unique_id/media_group_id 列
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -228,6 +228,11 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_retry_count INTEGER DEFAULT 0",
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_retry BOOLEAN DEFAULT FALSE",
     "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS dead_retry_at TEXT DEFAULT ''",
+    # R36 B0-1: 为 jobs 表添加结构化副本信息字段,使 ReplicaAwareResolver 成为真实投递主路径
+    # group_id=拓扑组号(1-5), file_unique_id=Telegram 文件唯一标识, media_group_id=相册分组键
+    "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS group_id INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS file_unique_id TEXT DEFAULT ''",
+    "ALTER TABLE IF EXISTS jobs ADD COLUMN IF NOT EXISTS media_group_id TEXT DEFAULT ''",
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS note TEXT DEFAULT ''",
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS protect_content BOOLEAN DEFAULT FALSE",
     "ALTER TABLE IF EXISTS pending_uploads ADD COLUMN IF NOT EXISTS file_ttl_days INTEGER DEFAULT 0",
@@ -2181,6 +2186,9 @@ async def _sync_new_job_to_crdb(
     task_type: str,
     protect_content: bool,
     created_at: str,
+    group_id: int = 0,
+    file_unique_id: str = "",
+    media_group_id: str = "",
 ):
     """后台异步: 将 SQLite 中的新 job 写入 CRDB(仅审计),更新 crdb_id"""
     from .cache_store import get_cache_store
@@ -2189,11 +2197,13 @@ async def _sync_new_job_to_crdb(
         rows = await col._query(
             """INSERT INTO jobs (code, target_user_id, storage_channel_id,
                storage_msg_ids, batch_file_meta, task_type, status,
-               protect_content, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               protect_content, created_at,
+               group_id, file_unique_id, media_group_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                RETURNING id""",
             [code, target_user_id, storage_channel_id, storage_msg_ids_str,
-             batch_file_meta, task_type, "pending", protect_content, created_at],
+             batch_file_meta, task_type, "pending", protect_content, created_at,
+             group_id, file_unique_id, media_group_id],
         )
         crdb_id = rows[0]["id"] if rows else None
         if crdb_id is not None:
@@ -2219,16 +2229,22 @@ async def enqueue_job(
     batch_file_meta: str = "",
     task_type: str = "single",
     protect_content: bool = False,
+    group_id: int = 0,
+    file_unique_id: str = "",
+    media_group_id: str = "",
 ):
     """jobs 表写入派工任务 + H方案: SQLite 优先，CRDB 异步审计
-    
+
     SQLite 写入失败 → 抛异常，调用方给用户重试反馈。
     CRDB 写入走后台异步，不阻塞用户响应。
+
+    R36 B0-1: group_id/file_unique_id/media_group_id 为结构化副本信息,
+    供 ReplicaAwareResolver 直接消费(无需解析 batch_file_meta JSON)。
     """
     import datetime as _dt
     created_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
     storage_msg_ids_str = _json_dumps(storage_msg_ids)
-    
+
     # H方案: 先写 SQLite 本地队列(主路径)，失败则抛异常让用户重试
     from .cache_store import get_cache_store
     store = get_cache_store()
@@ -2242,6 +2258,9 @@ async def enqueue_job(
         "status": "pending",
         "protect_content": protect_content,
         "created_at": created_at,
+        "group_id": group_id,
+        "file_unique_id": file_unique_id,
+        "media_group_id": media_group_id,
     })
     await store.notify_dsp_new_job()
     # C1: Redis Stream 事件通知移至 _sync_new_job_to_crdb 成功后触发(用真实 crdb_id)。
@@ -2255,7 +2274,7 @@ async def enqueue_job(
         status_counters["total_files"] = status_counters.get("total_files", 0) + 1
     except Exception:
         pass
-    
+
     # H方案: CRDB 写入走后台异步(fire-and-forget)，仅用于审计，不阻塞
     task = asyncio.ensure_future(_sync_new_job_to_crdb(
         local_id=local_id,
@@ -2267,6 +2286,9 @@ async def enqueue_job(
         task_type=task_type,
         protect_content=protect_content,
         created_at=created_at,
+        group_id=group_id,
+        file_unique_id=file_unique_id,
+        media_group_id=media_group_id,
     ))
     _pending_sync_tasks.add(task)
     task.add_done_callback(_pending_sync_tasks.discard)
@@ -2297,7 +2319,8 @@ async def dequeue_jobs(batch_size: int = 10) -> list:
             WHERE id IN (SELECT id FROM next)
             RETURNING id, code, target_user_id, storage_channel_id,
                       storage_msg_ids, batch_file_meta, task_type,
-                      protect_content, retry_count
+                      protect_content, retry_count,
+                      group_id, file_unique_id, media_group_id
         """, [batch_size]), timeout=5.0)
     except asyncio.TimeoutError:
         logger.error("[DB] dequeue_jobs 查询超时(>5s),跳过本次")
@@ -2327,6 +2350,9 @@ async def dequeue_jobs(batch_size: int = 10) -> list:
             task_type=row.get("task_type", "single"),
             protect_content=row.get("protect_content", False),
             retry_count=row.get("retry_count", 0),
+            group_id=row.get("group_id", 0),
+            file_unique_id=row.get("file_unique_id", ""),
+            media_group_id=row.get("media_group_id", ""),
         ))
     return results
 
@@ -2395,6 +2421,9 @@ class JobResult:
         task_type: str = "single",
         protect_content: bool = False,
         retry_count: int = 0,
+        group_id: int = 0,
+        file_unique_id: str = "",
+        media_group_id: str = "",
     ):
         self.job_id = job_id
         self.code = code
@@ -2405,6 +2434,11 @@ class JobResult:
         self.task_type = task_type
         self.protect_content = protect_content
         self.retry_count = retry_count
+        # R36 B0-1: 结构化副本信息字段,供 ReplicaAwareResolver 直接消费
+        # group_id=拓扑组号(1-5);file_unique_id=Telegram 文件唯一标识;media_group_id=相册分组键
+        self.group_id = group_id
+        self.file_unique_id = file_unique_id
+        self.media_group_id = media_group_id
 
 
 async def mark_job_dead(job_id: int, reason: str):
@@ -2445,7 +2479,8 @@ async def sync_jobs_from_crdb_to_sqlite(limit: int = 100):
             limit=limit,
             projection=["id", "code", "target_user_id", "storage_channel_id",
                          "storage_msg_ids", "batch_file_meta", "task_type",
-                         "status", "retry_count", "protect_content", "created_at"],
+                         "status", "retry_count", "protect_content", "created_at",
+                         "group_id", "file_unique_id", "media_group_id"],
         )
     except Exception as e:
         logger.debug(f"[QueueSyncer] 拉取 CRDB jobs 失败: {e}")

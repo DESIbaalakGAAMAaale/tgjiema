@@ -289,61 +289,73 @@ class TestDspBotDeliveryReceiptsHelpers:
     reason="bots.dsp_bot 不可用",
 )
 class TestExtractReplicaInfo:
-    """R35 §22: 从 job.batch_file_meta 提取 (file_unique_id, group_id)。"""
+    """R35 §22: 从 job.batch_file_meta 提取 (file_unique_id, group_id)。
+    R36 B0-1: 函数返回 4-tuple (fuid, gid, mgid, is_structured_new)。
+    """
+
+    def _make_old_job(self, batch_file_meta):
+        """构造旧格式 job mock(无结构化字段,走 batch_file_meta JSON fallback)。"""
+        job = MagicMock()
+        # 显式置空结构化字段,使 is_structured_new=False,走 JSON fallback 路径
+        job.file_unique_id = ""
+        job.group_id = 0
+        job.media_group_id = ""
+        job.batch_file_meta = batch_file_meta
+        return job
 
     def test_empty_meta_returns_empty_tuple(self):
         """空 batch_file_meta 返回 ("", None)。"""
-        job = MagicMock()
-        job.batch_file_meta = ""
-        fuid, gid = dsp_bot_module._extract_replica_info(job)
+        job = self._make_old_job("")
+        fuid, gid, mgid, is_new = dsp_bot_module._extract_replica_info(job)
         assert fuid == ""
         assert gid is None
+        assert is_new is False
 
     def test_none_meta_returns_empty_tuple(self):
         """None batch_file_meta 返回 ("", None)。"""
-        job = MagicMock()
-        job.batch_file_meta = None
-        fuid, gid = dsp_bot_module._extract_replica_info(job)
+        job = self._make_old_job(None)
+        fuid, gid, mgid, is_new = dsp_bot_module._extract_replica_info(job)
         assert fuid == ""
         assert gid is None
+        assert is_new is False
 
     def test_json_string_with_file_unique_id(self):
         """JSON 字符串格式提取 file_unique_id。"""
-        job = MagicMock()
-        job.batch_file_meta = (
+        job = self._make_old_job(
             '[{"chat_id": 1, "msg_id": 100, "file_unique_id": "fuid-abc-001", '
             '"file_type": "photo"}]'
         )
-        fuid, gid = dsp_bot_module._extract_replica_info(job)
+        fuid, gid, mgid, is_new = dsp_bot_module._extract_replica_info(job)
         assert fuid == "fuid-abc-001"
         # group_id 当前数据流未暴露
         assert gid is None
+        assert is_new is False
 
     def test_list_format_with_file_unique_id(self):
         """list 格式提取 file_unique_id。"""
-        job = MagicMock()
-        job.batch_file_meta = [
+        job = self._make_old_job([
             {"chat_id": 1, "msg_id": 100, "file_unique_id": "fuid-list-001"},
-        ]
-        fuid, gid = dsp_bot_module._extract_replica_info(job)
+        ])
+        fuid, gid, mgid, is_new = dsp_bot_module._extract_replica_info(job)
         assert fuid == "fuid-list-001"
         assert gid is None
+        assert is_new is False
 
     def test_invalid_json_returns_empty(self):
         """无效 JSON 返回空。"""
-        job = MagicMock()
-        job.batch_file_meta = "not a json"
-        fuid, gid = dsp_bot_module._extract_replica_info(job)
+        job = self._make_old_job("not a json")
+        fuid, gid, mgid, is_new = dsp_bot_module._extract_replica_info(job)
         assert fuid == ""
         assert gid is None
+        assert is_new is False
 
     def test_first_item_missing_file_unique_id(self):
         """首条记录无 file_unique_id 字段时返回空字符串。"""
-        job = MagicMock()
-        job.batch_file_meta = [{"chat_id": 1, "msg_id": 100}]
-        fuid, gid = dsp_bot_module._extract_replica_info(job)
+        job = self._make_old_job([{"chat_id": 1, "msg_id": 100}])
+        fuid, gid, mgid, is_new = dsp_bot_module._extract_replica_info(job)
         assert fuid == ""
         assert gid is None
+        assert is_new is False
 
 
 # ════════════════════════════════════════════════════════════════

@@ -224,13 +224,28 @@ class CacheStore:
                 dispatched_at TEXT,
                 dead_reason   TEXT,
                 dead_retry_count INTEGER DEFAULT 0,
-                synced_at     REAL DEFAULT 0
+                synced_at     REAL DEFAULT 0,
+                group_id      INTEGER DEFAULT 0,
+                file_unique_id TEXT DEFAULT '',
+                media_group_id TEXT DEFAULT ''
             )"""
         )
         try:
             await self._db.execute("ALTER TABLE local_job_queue ADD COLUMN dead_retry_count INTEGER DEFAULT 0")
         except Exception as e:
             logger.warning(f"[CacheStore] ALTER TABLE失败(非预期): {e}")
+        # R36 B0-1: 幂等添加 ReplicaAwareResolver 所需的结构化字段
+        # 旧表升级时新增 3 列;新表已包含则忽略重复列错误
+        for _alter_sql in (
+            "ALTER TABLE local_job_queue ADD COLUMN group_id INTEGER DEFAULT 0",
+            "ALTER TABLE local_job_queue ADD COLUMN file_unique_id TEXT DEFAULT ''",
+            "ALTER TABLE local_job_queue ADD COLUMN media_group_id TEXT DEFAULT ''",
+        ):
+            try:
+                await self._db.execute(_alter_sql)
+            except Exception as e:
+                # SQLite 重复列错误是预期的(幂等升级),仅 debug 记录
+                logger.debug(f"[CacheStore] ALTER TABLE 升级(可忽略): {e}")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_local_job_pending ON local_job_queue(status, created_at)"
         )
@@ -2231,8 +2246,9 @@ class CacheStore:
             """INSERT INTO local_job_queue
             (crdb_id, code, target_user_id, storage_channel_id,
              storage_msg_ids, batch_file_meta, task_type, status,
-             retry_count, protect_content, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             retry_count, protect_content, created_at,
+             group_id, file_unique_id, media_group_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 local_id, job["code"], job["target_user_id"],
                 job.get("storage_channel_id", 0),
@@ -2243,6 +2259,9 @@ class CacheStore:
                 job.get("retry_count", 0),
                 job.get("protect_content", False),
                 job.get("created_at", ""),
+                job.get("group_id", 0),
+                job.get("file_unique_id", ""),
+                job.get("media_group_id", ""),
             ),
         )
         await self._db.commit()
@@ -2278,8 +2297,9 @@ class CacheStore:
                     """INSERT OR IGNORE INTO local_job_queue
                     (crdb_id, code, target_user_id, storage_channel_id,
                      storage_msg_ids, batch_file_meta, task_type, status,
-                     retry_count, protect_content, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     retry_count, protect_content, created_at,
+                     group_id, file_unique_id, media_group_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         job["id"], job["code"], job["target_user_id"],
                         job.get("storage_channel_id", 0),
@@ -2290,6 +2310,9 @@ class CacheStore:
                         job.get("retry_count", 0),
                         job.get("protect_content", False),
                         job.get("created_at", ""),
+                        job.get("group_id", 0),
+                        job.get("file_unique_id", ""),
+                        job.get("media_group_id", ""),
                     ),
                 )
                 await self._db.commit()
@@ -2307,7 +2330,8 @@ class CacheStore:
         rows = await self._db.execute_fetchall(
             """SELECT crdb_id, code, target_user_id, storage_channel_id,
                storage_msg_ids, batch_file_meta, task_type, status,
-               retry_count, protect_content, created_at
+               retry_count, protect_content, created_at,
+               group_id, file_unique_id, media_group_id
                FROM local_job_queue WHERE status = 'pending'
                ORDER BY created_at LIMIT ?""",
             (limit,),
@@ -2318,6 +2342,9 @@ class CacheStore:
                 "storage_channel_id": r[3], "storage_msg_ids": r[4],
                 "batch_file_meta": r[5], "task_type": r[6], "status": r[7],
                 "retry_count": r[8], "protect_content": r[9], "created_at": r[10],
+                "group_id": r[11] if len(r) > 11 else 0,
+                "file_unique_id": r[12] if len(r) > 12 else "",
+                "media_group_id": r[13] if len(r) > 13 else "",
             }
             for r in rows
         ]
@@ -2329,7 +2356,8 @@ class CacheStore:
         rows = await self._db.execute_fetchall(
             "SELECT crdb_id, code, target_user_id, storage_channel_id, "
             "storage_msg_ids, batch_file_meta, task_type, status, "
-            "retry_count, protect_content, created_at "
+            "retry_count, protect_content, created_at, "
+            "group_id, file_unique_id, media_group_id "
             "FROM local_job_queue WHERE crdb_id = ?",
             (crdb_id,),
         )
@@ -2337,14 +2365,28 @@ class CacheStore:
             return None
         cols = ["crdb_id", "code", "target_user_id", "storage_channel_id",
                 "storage_msg_ids", "batch_file_meta", "task_type", "status",
-                "retry_count", "protect_content", "created_at"]
+                "retry_count", "protect_content", "created_at",
+                "group_id", "file_unique_id", "media_group_id"]
         row = dict(zip(cols, rows[0]))
         # 类型转换(与 get_local_pending_jobs 保持一致)
         try:
             row["protect_content"] = bool(row.get("protect_content", False))
         except Exception:
             row["protect_content"] = False
+        # 兼容旧表(可能没有新字段): 缺失则填默认值
+        row.setdefault("group_id", 0)
+        row.setdefault("file_unique_id", "")
+        row.setdefault("media_group_id", "")
         return row
+
+    async def get_local_job_with_replica_info(self, crdb_id: int) -> dict | None:
+        """R36 B0-1: 按 crdb_id 查询 job 并确保返回结构化的副本信息字段。
+
+        返回 dict 包含 group_id/file_unique_id/media_group_id,
+        供 ReplicaAwareResolver 直接消费(无需 JSON 解析 batch_file_meta)。
+        与 get_local_job_by_crdb_id 等价但语义更明确。
+        """
+        return await self.get_local_job_by_crdb_id(crdb_id)
 
     async def count_pending_jobs(self) -> int:
         """统计本地队列中 pending 状态的 job 数量(队列积压深度, 0 CRDB RU)"""

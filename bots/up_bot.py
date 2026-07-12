@@ -282,6 +282,38 @@ async def _ensure_channel_group_map():
         logger.warning(f"[Up] 刷新 channel→group 映射失败: {e}")
 
 
+async def _enrich_file_meta_for_replica(
+    file_meta: dict,
+    target_channel_id: int,
+    file_unique_id: str = "",
+    media_group_id: str = "",
+) -> dict:
+    """R36 B0-1: 为 file_meta 注入结构化副本信息字段。
+
+    将 group_id/file_unique_id/media_group_id 写入 file_meta dict,
+    使下游 idx_bot → enqueue_job → dsp_bot 无需解析 batch_file_meta JSON,
+    直接从结构化字段读取,让 ReplicaAwareResolver 成为真实投递主路径。
+
+    Args:
+        file_meta: 原 file_meta dict(含 type/file_id)
+        target_channel_id: 目标存储频道(用于查 channel_id→group_id 映射)
+        file_unique_id: Telegram 文件唯一标识(跨 bot 稳定去重键)
+        media_group_id: Telegram 媒体组 ID(空串表示独立文件)
+
+    Returns:
+        新 dict(原 file_meta + group_id/file_unique_id/media_group_id);
+        不修改原 dict。原 dict 字段保持不变。
+    """
+    await _ensure_channel_group_map()
+    # channel_id → group_id 映射未命中时返回 0(数据不完整,下游 fail-closed 进入 retry)
+    gid = _channel_to_group.get(target_channel_id, 0)
+    enriched = dict(file_meta) if isinstance(file_meta, dict) else {"type": "", "file_id": ""}
+    enriched["group_id"] = gid
+    enriched["file_unique_id"] = file_unique_id or ""
+    enriched["media_group_id"] = media_group_id or ""
+    return enriched
+
+
 async def _register_manifest(channel_id: int, message_id: int, msg, media_type: str = "", file_unique_id_override: str = "", media_group_id: str = ""):
     """写入 Active 频道后登记 manifest(异步,失败不影响主流程)。
 
@@ -757,6 +789,17 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source_msg_ids=batch_src_ids,
         options={"file_types": dict(batch.get("file_types", {})), "batch": True},
     )
+
+    # R36 B0-1: 预先为每个 src_messages 的 file_meta 注入结构化副本信息
+    # group_id 从 target_ch 解析;file_unique_id/media_group_id 已存在 src_messages 中
+    # 在原 dict 上原地修改,后续 files_meta.append(s["file_meta"]) 自动携带新字段
+    for _s in src_messages:
+        _enriched = await _enrich_file_meta_for_replica(
+            _s["file_meta"], target_ch,
+            file_unique_id=_s.get("file_unique_id", ""),
+            media_group_id=_s.get("media_group_id") or "",
+        )
+        _s["file_meta"] = _enriched
 
     # 注:批次路径不做秒传去重。批次内多文件可能来自不同源,channel 绑定复杂,
     # 跨 channel 复用会破坏 primary_channel_id + batch_msg_ids 的一致性。
@@ -1266,13 +1309,23 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         pass
 
     # 暂存媒体组数据，等待用户选择有效期→备注→转发权限
+    # R36 B0-1: 为每个 file_meta 注入结构化副本信息(group_id/file_unique_id/media_group_id)
+    _enriched_all_meta = []
+    for _idx, _up in enumerate(updates):
+        _mg_fuid = _extract_file_unique_id(_up.message)
+        _enriched_all_meta.append(await _enrich_file_meta_for_replica(
+            all_meta[_idx] if _idx < len(all_meta) else extract_file_meta(_up),
+            target_ch,
+            file_unique_id=_mg_fuid,
+            media_group_id=media_group_id or "",
+        ))
     context.user_data["_pending_media_group"] = {
         "user_id": user_id,
         "primary_channel_id": target_ch,
         "primary_channel_msg_id": all_mids[0],
         "file_types": _json_dumps(file_types),
         "batch_msg_ids": ",".join(str(mid) for mid in all_mids),
-        "batch_file_meta": _json_dumps(all_meta),
+        "batch_file_meta": _json_dumps(_enriched_all_meta),
         "note": note,
         "total_count": total_count,
         "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
@@ -1365,12 +1418,20 @@ async def _process_upload(
     # 暂存必要信息到模块级 dict（context.user_data 在 callback 间不可靠）
     # P2: 改用 user_id:msg_id 复合键,避免同用户并发上传互相覆盖
     _meta_key = f"{user_id}:{update.message.message_id}"
+    # R36 B0-1: 注入结构化副本信息(group_id/file_unique_id/media_group_id),
+    # 使下游 idx_bot → enqueue_job → dsp_bot → ReplicaAwareResolver 无需 JSON 解析
+    _enriched_meta = await _enrich_file_meta_for_replica(
+        extract_file_meta(update),
+        main_channel,
+        file_unique_id=_extract_file_unique_id(update.message),
+        media_group_id=update.message.media_group_id or "",
+    )
     _pending_upload_meta[_meta_key] = {
         "main_channel": main_channel,
         "channel_msg_id": channel_msg_id,
         "file_types": file_types,
         "note": update.message.caption or "",
-        "file_meta": extract_file_meta(update),
+        "file_meta": _enriched_meta,
         "created_at": time.time(),
         "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
     }
@@ -1379,7 +1440,7 @@ async def _process_upload(
     context.user_data["_channel_msg_id"] = channel_msg_id
     context.user_data["_file_types"] = file_types
     context.user_data["_note"] = update.message.caption or ""
-    context.user_data["_file_meta"] = extract_file_meta(update)
+    context.user_data["_file_meta"] = _enriched_meta
     # P2: 记录上传消息 ID 用于 _finalize_upload 复合键查找
     context.user_data["_upload_msg_id"] = update.message.message_id
     # R35 P0-4: 记录 upload_id 供 _finalize_upload 使用
@@ -1826,9 +1887,15 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
 
     file_type = detect_file_type(update)
     file_meta = extract_file_meta(update)
-
     # 内存级 file_unique_id 去重：防止并发请求导致同一文件被重复 copy
     fuid = _extract_file_unique_id(update.message)
+    # R36 B0-1: 为 file_meta 注入结构化副本信息(group_id/file_unique_id/media_group_id)
+    # 使下游 ReplicaAwareResolver 无需解析 batch_file_meta JSON
+    file_meta = await _enrich_file_meta_for_replica(
+        file_meta, target_ch,
+        file_unique_id=fuid,
+        media_group_id=update.message.media_group_id or "",
+    )
     if fuid:
         async with _mg_lock:
             # P2: 惰性清理超 300s 的旧去重集合
