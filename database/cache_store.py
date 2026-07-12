@@ -272,6 +272,21 @@ class CacheStore:
                 await self._db.execute(_col_ddl)
             except Exception as e:
                 logger.warning(f"[CacheStore] ALTER TABLE失败(非预期): {e}")
+        # M2: cells CAS/fencing 字段 — 防止双控制面(Mon/Dsp)并发改写同一 cell
+        # topology_version 每次成功 CAS 转换递增,作为 fencing token;lease_* 实现租约互斥;
+        # transition_id 标识当前进行中的转换事务(UUID),便于跨进程追溯。
+        for _col_name, _col_type in [
+            ("topology_version", "INTEGER DEFAULT 0"),   # 拓扑版本号,每次 CAS 转换递增
+            ("lease_owner", "TEXT DEFAULT ''"),           # 当前租约持有者(如 'mon_bot', 'dsp_bot')
+            ("lease_until", "REAL DEFAULT 0"),            # 租约到期时间戳
+            ("transition_id", "TEXT DEFAULT ''"),         # 当前转换事务 ID(UUID)
+        ]:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE cells_local ADD COLUMN {_col_name} {_col_type}"
+                )
+            except Exception as e:
+                logger.debug(f"[CacheStore] cells_local ADD {_col_name} (幂等,可忽略): {e}")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_cells_local_status ON cells_local(status)"
         )
@@ -2773,6 +2788,185 @@ class CacheStore:
         )
         await self._db.commit()
 
+    # ─── M2: cells CAS/fencing — Mon 与 Dsp 自主降级使用 CAS + fencing token ───
+    # 防止双控制面同时改写同一 cell,通过 topology_version 递增 + 租约互斥实现并发安全。
+
+    async def cas_transition_cell(
+        self,
+        slot_id: str,
+        expected_status: str,
+        new_status: str,
+        lease_owner: str,
+        transition_id: str,
+        lease_seconds: int = 60,
+        **update_fields,
+    ) -> bool:
+        """CAS 原子转换 cell 状态(双控制面并发安全)。
+
+        WHERE 子句包含 status=expected_status 实现 Compare-And-Swap:
+        - 仅当当前 status == expected_status 时才更新,否则 rowcount=0(被其他控制面抢占)。
+        - 成功更新时 topology_version 递增(作为 fencing token,防止旧版本回写)。
+        - lease_owner/lease_until/transition_id 记录本次转换归属,便于追溯。
+        - **update_fields 支持附加字段(如 channel_id, account_name)一并写入。
+        返回 True 表示 CAS 成功,False 表示状态已被其他控制面改写(需重读后重试)。
+        """
+        if not self._db:
+            return False
+        now = time.time()
+        lease_until = now + lease_seconds
+        # 构造 SET 子句:状态转换 + fencing 字段 + 附加字段
+        set_parts = [
+            "status = ?",
+            "topology_version = topology_version + 1",
+            "lease_owner = ?",
+            "lease_until = ?",
+            "transition_id = ?",
+            "updated_at = ?",
+        ]
+        params: list = [new_status, lease_owner, lease_until, transition_id, now]
+        # 附加字段(排除 CAS/fencing 保留字段,避免重复赋值)
+        _reserved = {"status", "topology_version", "lease_owner", "lease_until",
+                     "transition_id", "updated_at", "slot_id"}
+        for k, v in update_fields.items():
+            if k in _reserved:
+                continue
+            set_parts.append(f"{k} = ?")
+            params.append(v)
+        # WHERE 子句:slot_id + expected_status(CAS 关键)
+        params.extend([slot_id, expected_status])
+        sql = (
+            f"UPDATE cells_local SET {', '.join(set_parts)} "
+            "WHERE slot_id = ? AND status = ?"
+        )
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(sql, params)
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                logger.warning(f"[CacheStore] cas_transition_cell 失败: {e}")
+                return False
+        return False
+
+    async def acquire_cell_lease(
+        self, slot_id: str, owner: str, lease_seconds: int = 60
+    ) -> bool:
+        """获取 cell 租约(防并发操作)。
+
+        仅当租约已过期(lease_until < now)或当前持有者是自己时才能获取。
+        返回 True 表示获取成功,False 表示租约被其他控制面持有。
+        """
+        if not self._db:
+            return False
+        now = time.time()
+        lease_until = now + lease_seconds
+        sql = (
+            "UPDATE cells_local SET lease_owner = ?, lease_until = ? "
+            "WHERE slot_id = ? AND (lease_until < ? OR lease_owner = ?)"
+        )
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    sql, (owner, lease_until, slot_id, now, owner)
+                )
+                await self._db.commit()
+                return bool(cursor and cursor.rowcount > 0)
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                logger.warning(f"[CacheStore] acquire_cell_lease 失败: {e}")
+                return False
+        return False
+
+    async def release_cell_lease(self, slot_id: str, owner: str):
+        """释放 cell 租约(仅当当前持有者是自己时才释放,防止误释放他人租约)。"""
+        if not self._db:
+            return
+        sql = (
+            "UPDATE cells_local SET lease_owner = '', lease_until = 0 "
+            "WHERE slot_id = ? AND lease_owner = ?"
+        )
+        for attempt in range(3):
+            try:
+                await self._db.execute(sql, (slot_id, owner))
+                await self._db.commit()
+                return
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                logger.warning(f"[CacheStore] release_cell_lease 失败: {e}")
+                return
+
+    async def get_cell_lease_owner(self, slot_id: str) -> str | None:
+        """查询当前租约持有者。若租约已过期或无人持有则返回 None。"""
+        if not self._db:
+            return None
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT lease_owner, lease_until FROM cells_local WHERE slot_id = ?",
+                (slot_id,),
+            )
+            if not rows:
+                return None
+            lease_owner, lease_until = rows[0]
+            if lease_owner and lease_until and lease_until > time.time():
+                return lease_owner
+            return None
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_cell_lease_owner 失败: {e}")
+            return None
+
+    async def get_cells_by_version(self, min_version: int) -> list[dict]:
+        """查询 topology_version > min_version 的 cells(增量同步用)。
+
+        按 topology_version 升序返回,便于消费方按版本顺序应用增量。
+        """
+        if not self._db:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT * FROM cells_local WHERE topology_version > ? "
+                "ORDER BY topology_version",
+                (min_version,),
+            )
+            if not rows:
+                return []
+            # aiosqlite 的 execute_fetchall 不返回 description,用 PRAGMA 拿列名
+            col_rows = await self._db.execute_fetchall(
+                "PRAGMA table_info(cells_local)"
+            )
+            col_names = [r[1] for r in col_rows]
+            return [dict(zip(col_names, r)) for r in rows]
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_cells_by_version 失败: {e}")
+            return []
+
+    async def get_max_topology_version(self) -> int:
+        """查询当前最大 topology_version(无记录时返回 0)。"""
+        if not self._db:
+            return 0
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT MAX(topology_version) FROM cells_local"
+            )
+            if not rows or rows[0][0] is None:
+                return 0
+            return int(rows[0][0])
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_max_topology_version 失败: {e}")
+            return 0
+
     async def delete_cell_local(self, slot_id: str) -> bool:
         """C3: 删除单个 cell 并修复环形链表指针,然后重建快照。
 
@@ -4200,6 +4394,70 @@ class CacheStoreRouter(CacheStore):
             data={"slot_id": slot_id},
             redis_key="cache:all_cells",
             fallback=lambda: super(CacheStoreRouter, self).mark_cell_synced_local(slot_id),
+        )
+
+    async def cas_transition_cell(
+        self,
+        slot_id: str,
+        expected_status: str,
+        new_status: str,
+        lease_owner: str,
+        transition_id: str,
+        lease_seconds: int = 60,
+        **update_fields,
+    ) -> bool:
+        """CAS 原子转换 cell 状态 — 路由到 Redis Queue,写后失效 cells 缓存
+
+        update_fields 合并入 data,经 **data 解包后被 **update_fields 捕获。
+        """
+        from database import write_router
+        _data = {
+            "slot_id": slot_id,
+            "expected_status": expected_status,
+            "new_status": new_status,
+            "lease_owner": lease_owner,
+            "transition_id": transition_id,
+            "lease_seconds": lease_seconds,
+        }
+        _data.update(_json_safe(update_fields))
+        return await write_router.route_write(
+            method_name="cas_transition_cell",
+            table="cells_local",
+            op_type="update",
+            data=_data,
+            redis_key="cache:all_cells",
+            fallback=lambda: super(CacheStoreRouter, self).cas_transition_cell(
+                slot_id, expected_status, new_status, lease_owner, transition_id,
+                lease_seconds, **update_fields,
+            ),
+        )
+
+    async def acquire_cell_lease(
+        self, slot_id: str, owner: str, lease_seconds: int = 60
+    ) -> bool:
+        """获取 cell 租约 — 路由到 Redis Queue,写后失效 cells 缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="acquire_cell_lease",
+            table="cells_local",
+            op_type="update",
+            data={"slot_id": slot_id, "owner": owner, "lease_seconds": lease_seconds},
+            redis_key="cache:all_cells",
+            fallback=lambda: super(CacheStoreRouter, self).acquire_cell_lease(
+                slot_id, owner, lease_seconds
+            ),
+        )
+
+    async def release_cell_lease(self, slot_id: str, owner: str):
+        """释放 cell 租约 — 路由到 Redis Queue,写后失效 cells 缓存"""
+        from database import write_router
+        return await write_router.route_write(
+            method_name="release_cell_lease",
+            table="cells_local",
+            op_type="update",
+            data={"slot_id": slot_id, "owner": owner},
+            redis_key="cache:all_cells",
+            fallback=lambda: super(CacheStoreRouter, self).release_cell_lease(slot_id, owner),
         )
 
     async def mark_file_record_synced(self, file_code: str):

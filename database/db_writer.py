@@ -58,6 +58,10 @@ _ALLOWED_METHODS: frozenset[str] = frozenset({
     "delete_cell_local",         # 需要事务(BEGIN IMMEDIATE)— Writer 事务模式下内层 BEGIN 会被跳过
     "bulk_upsert_cells_local",   # 批量 upsert(小批量入队路径)
     "save_cells_snapshot",
+    # M2: cells CAS/fencing — Mon 与 Dsp 自主降级的并发安全写方法
+    "cas_transition_cell",       # CAS 原子转换 cell 状态(topology_version 递增)
+    "acquire_cell_lease",        # 获取 cell 租约(防并发操作)
+    "release_cell_lease",        # 释放 cell 租约
     # KV / TTL 缓存
     "set_kv", "cache_set",
     # 跨进程通知
