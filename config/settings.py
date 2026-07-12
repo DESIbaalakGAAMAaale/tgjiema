@@ -73,8 +73,14 @@ class Settings(BaseSettings):
     RELAY_API_HASH: str = ""
 
     # ─── P1-9: 允许的外部解码器 bot 白名单(逗号分隔的用户名,不带@) ───
-    # 为空时允许所有 bot(fail-open,兼容现有部署);配置后仅允许白名单内 bot
+    # 为空时:
+    #   - ALLOWED_DECODER_BOTS_FAIL_CLOSED=False (默认, 兼容现有部署): 允许所有 bot
+    #   - ALLOWED_DECODER_BOTS_FAIL_CLOSED=True (商用建议): 拒绝所有外部解码器
+    # 配置后仅允许白名单内 bot
     ALLOWED_DECODER_BOTS: str = ""
+    # ─── P2-1: 白名单 fail-closed 开关 ───
+    # 默认 False 保持向后兼容; 商用部署应设为 True, 空白名单时拒绝所有外部解码器
+    ALLOWED_DECODER_BOTS_FAIL_CLOSED: bool = False
 
     R2_ACCOUNT_ID: str = ""
     R2_ACCESS_KEY_ID: str = ""

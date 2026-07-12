@@ -3284,6 +3284,44 @@ class CacheStore:
         cols = ["group_id", "file_unique_id", "channel_id", "message_id", "media_type", "media_group_id", "first_seen_at"]
         return [dict(zip(cols, r)) for r in rows]
 
+    async def get_manifest_by_file_unique_id(
+        self, file_unique_id: str, group_id: int | None = None,
+    ) -> list[dict]:
+        """精确索引查询:返回指定 file_unique_id 的所有副本记录。
+
+        P2-4: ReplicaAwareResolver 不再每次拉整组 Manifest,
+        改用 (group_id, file_unique_id) 复合索引精确查询。
+        manifest 表 PRIMARY KEY (group_id, file_unique_id, channel_id) 左前缀覆盖此查询。
+
+        Args:
+            file_unique_id: 文件唯一标识(必填)
+            group_id: 可选;传入时按 (group_id, file_unique_id) 精确查询,
+                      不传时跨组扫描所有匹配 file_unique_id 的记录(慎用,影响多组)
+
+        Returns:
+            [{"group_id", "file_unique_id", "channel_id", "message_id",
+               "media_type", "media_group_id", "first_seen_at"}, ...]
+        """
+        if not self._db or not file_unique_id:
+            return []
+        cols = ["group_id", "file_unique_id", "channel_id", "message_id",
+                "media_type", "media_group_id", "first_seen_at"]
+        if group_id is not None:
+            rows = await self._db.execute_fetchall(
+                "SELECT group_id, file_unique_id, channel_id, message_id, "
+                "media_type, media_group_id, first_seen_at "
+                "FROM manifest WHERE group_id = ? AND file_unique_id = ?",
+                (group_id, file_unique_id),
+            )
+        else:
+            rows = await self._db.execute_fetchall(
+                "SELECT group_id, file_unique_id, channel_id, message_id, "
+                "media_type, media_group_id, first_seen_at "
+                "FROM manifest WHERE file_unique_id = ?",
+                (file_unique_id,),
+            )
+        return [dict(zip(cols, r)) for r in rows]
+
     async def get_manifest_channels_for_group(self, group_id: int) -> list[int]:
         """返回该组在 manifest 中有记录的所有 channel_id(去重)。"""
         if not self._db:

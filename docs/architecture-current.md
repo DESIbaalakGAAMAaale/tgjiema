@@ -1,6 +1,8 @@
 # tgjiema 架构文档(单一事实源)
 
-> 最后更新: 2026-07-12 | HEAD: 9bb28a6b3a565109b4d2ac3d52e646651c7df642 | DDL_VERSION: 7
+> 最后更新: 2026-07-12 | DDL_VERSION: 7
+> 注意: HEAD SHA 由 CI 自动注入,本文档不硬编码易过期的 commit SHA;
+> 如需查询当前 HEAD,请运行 `git rev-parse HEAD`。
 
 ## 1. 系统概览
 

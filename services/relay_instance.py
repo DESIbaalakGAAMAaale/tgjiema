@@ -286,8 +286,10 @@ class RelayInstance:
     async def start(self):
         await self._report_status("connecting")
 
-        # 诊断日志:记录实际使用的凭证(脱敏)
-        logger.info(f"[RelayInstance:{self.phone}] 启动登录, api_id={self.api_id}(type={type(self.api_id).__name__}), api_hash={self.api_hash[:10]}...(len={len(self.api_hash)})")
+        # P2-2: 诊断日志记录凭证指纹,不再输出 api_hash 前 10 位(不可逆,排障足够)
+        from utils.security import hash_api_credential
+        _hash_fingerprint = hash_api_credential(self.api_hash)
+        logger.info(f"[RelayInstance:{self.phone}] 启动登录, api_id={self.api_id}(type={type(self.api_id).__name__}), api_hash_fp={_hash_fingerprint}")
 
         self._client = TelegramClient(
             self._session_path,
@@ -439,11 +441,29 @@ class RelayInstance:
         """发送外部码解码请求"""
         if not self._client:
             return False
-        # P1-9: 目标解码器 bot 白名单校验,避免被诱导向任意 bot 发消息
+        # P1-9 / P2-1: 目标解码器 bot 白名单校验,避免被诱导向任意 bot 发消息
+        # 白名单为空时:
+        #   - ALLOWED_DECODER_BOTS_FAIL_CLOSED=False (默认, 兼容): 允许所有(警告日志)
+        #   - ALLOWED_DECODER_BOTS_FAIL_CLOSED=True (商用建议): 拒绝所有外部解码器
+        # 校验异常时按 FAIL_CLOSED 决定是否放行,避免异常导致 fail-open
         try:
             from config import settings
             allowed = getattr(settings, "ALLOWED_DECODER_BOTS", "")
-            if allowed:
+            fail_closed = getattr(settings, "ALLOWED_DECODER_BOTS_FAIL_CLOSED", False)
+            if not allowed:
+                # 白名单为空:根据 FAIL_CLOSED 决定
+                if fail_closed:
+                    logger.warning(
+                        f"[RelayInstance:{self.phone}] 拒绝向外部解码器发送: "
+                        f"@{bot_username} (user={user_id}) 原因: 白名单为空且 fail-closed 已启用"
+                    )
+                    return False
+                # fail-open (兼容):允许但记录警告,提示商用应启用 fail-closed
+                logger.warning(
+                    f"[RelayInstance:{self.phone}] 白名单为空(fail-open),允许所有外部解码器——"
+                    f"商用部署应配置 ALLOWED_DECODER_BOTS 或启用 ALLOWED_DECODER_BOTS_FAIL_CLOSED"
+                )
+            else:
                 allowed_set = {b.strip().lower().lstrip("@") for b in allowed.split(",") if b.strip()}
                 if bot_username.lower().lstrip("@") not in allowed_set:
                     logger.warning(
@@ -451,7 +471,14 @@ class RelayInstance:
                     )
                     return False
         except Exception as e:
-            logger.debug(f"[RelayInstance] 白名单校验异常(放行): {e}")
+            # 校验异常时按 FAIL_CLOSED 决定,避免异常导致 fail-open
+            fail_closed = getattr(settings, "ALLOWED_DECODER_BOTS_FAIL_CLOSED", False) if 'settings' in locals() else False
+            if fail_closed:
+                logger.warning(
+                    f"[RelayInstance:{self.phone}] 白名单校验异常(fail-closed),拒绝: @{bot_username} (user={user_id}): {e}"
+                )
+                return False
+            logger.debug(f"[RelayInstance] 白名单校验异常(fail-open 放行): {e}")
         # B1: 检查 bot 是否被熔断(连续限速超阈值)
         broken, remaining = self._is_circuit_broken(bot_username)
         if broken:

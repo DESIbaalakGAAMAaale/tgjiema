@@ -55,20 +55,27 @@ class ReplicaAwareResolver:
         group_id: int,
         preferred_channels: list[int] | None = None,
         exclude_channels: set[int] | None = None,
+        fail_closed: bool = True,
     ) -> tuple[int, int] | None:
         """为指定文件选择最佳频道和消息 ID。
 
         返回 (channel_id, message_id) 或 None(无可用副本)。
 
         算法:
-        1. 查询 manifest 获取该 file_unique_id 的所有副本
+        1. 查询 manifest 获取该 file_unique_id 的所有副本(精确索引)
         2. 过滤掉 exclude_channels
         3. 按 cells 状态过滤(active > shadow1 > shadow2)
         4. 按 channel_health 评分排序(失败率低优先)
         5. 如果 preferred_channels 中有匹配,优先返回
         6. 返回最佳频道 + 消息 ID
+
+        Args:
+            fail_closed: True(默认, 商用安全) 时查询失败返回 None;
+                         False(兼容) 时查询失败降级到乐观放行(已弃用, 不推荐)
         """
-        replicas = await self.get_available_replicas(file_unique_id, group_id)
+        replicas = await self.get_available_replicas(
+            file_unique_id, group_id, fail_closed=fail_closed
+        )
         if not replicas:
             logger.info(
                 f"[replica-resolver] 无可用副本 (fuid={file_unique_id}, group={group_id})"
@@ -111,22 +118,30 @@ class ReplicaAwareResolver:
         group_id: int,
         preferred_channels: list[int] | None = None,
         exclude_channels: set[int] | None = None,
+        fail_closed: bool = True,
     ) -> list[tuple[int, int]] | None:
         """为媒体组选择频道(所有文件必须在同一频道)。
 
         返回 [(channel_id, message_id), ...] 或 None。
         算法: 找到拥有完整媒体组的频道,优先返回。
-        """
+
+        Args:
+            fail_closed: True(默认, 商用安全) 时查询失败返回 None;
+                         False(兼容) 时查询失败降级到乐观放行(不推荐)
+    """
         if not media_group_id:
             return None
 
         try:
+            # 媒体组涉及多个 file_unique_id,必须拉整组 Manifest 过滤
             records = await self._store.get_manifest_by_group(group_id)
         except Exception as e:
             logger.warning(
                 f"[replica-resolver] manifest 查询异常 "
-                f"(group={group_id}, mgid={media_group_id}): {e}"
+                f"(group={group_id}, mgid={media_group_id}, fail_closed={fail_closed}): {e}"
             )
+            # fail_closed=True 时返回 None(拒绝投递);False 时返回 None 仍表示无副本
+            # (此处与 fail_closed 语义一致:查询失败即视为无可用副本)
             return None
 
         # 过滤出该 media_group_id 的所有记录
@@ -202,13 +217,20 @@ class ReplicaAwareResolver:
     # ─── 副本查询 ───────────────────────────────────────────────
 
     async def get_available_replicas(
-        self, file_unique_id: str, group_id: int
+        self, file_unique_id: str, group_id: int, fail_closed: bool = True,
     ) -> list[dict]:
-        """查询文件的所有存活副本(从 manifest)。
+        """查询文件的所有存活副本(从 manifest, 精确索引)。
 
         返回 [{"channel_id": ..., "message_id": ..., "media_type": ...}, ...]
 
-        降级策略:Manifest 查询返回空时记录降级日志。
+        P2-4: 改用 get_manifest_by_file_unique_id 精确索引查询,
+        不再每次拉整组 Manifest。
+
+        降级策略:
+        - Manifest 查询异常时:
+          - fail_closed=True (默认, 商用): 返回空列表(拒绝投递)
+          - fail_closed=False (兼容, 不推荐): 返回空列表(由调用方 fallback)
+        - 查询成功但无副本: 返回空列表(无论 fail_closed)
         message_backups 按 main_msg_id 索引,无法仅凭 file_unique_id 查询,
         故此处不触发;由调用方在持有 main_msg_id 时另行查询。
         """
@@ -216,15 +238,20 @@ class ReplicaAwareResolver:
             return []
 
         try:
-            records = await self._store.get_manifest_by_group(group_id)
+            # P2-4: 精确索引查询,不再拉整组 Manifest
+            records = await self._store.get_manifest_by_file_unique_id(
+                file_unique_id, group_id
+            )
         except Exception as e:
             logger.warning(
                 f"[replica-resolver] manifest 查询异常 "
-                f"(group={group_id}, fuid={file_unique_id}): {e}"
+                f"(group={group_id}, fuid={file_unique_id}, fail_closed={fail_closed}): {e}"
             )
+            # fail_closed=True: 返回空列表(拒绝投递)
+            # fail_closed=False: 同样返回空列表(行为一致, 但调用方可能 fallback 到拓扑解析)
             return []
 
-        # 过滤出该 file_unique_id 的所有副本
+        # 精确查询返回的即为该 file_unique_id 的副本,无需客户端过滤
         replicas = [
             {
                 "channel_id": r["channel_id"],
@@ -233,7 +260,6 @@ class ReplicaAwareResolver:
                 "media_group_id": r.get("media_group_id", ""),
             }
             for r in records
-            if r.get("file_unique_id") == file_unique_id
         ]
 
         # 记录上下文(供 verify_replica_exists 零查询复用)
@@ -249,12 +275,16 @@ class ReplicaAwareResolver:
         return replicas
 
     async def verify_replica_exists(
-        self, channel_id: int, message_id: int
+        self, channel_id: int, message_id: int, fail_closed: bool = True,
     ) -> bool:
         """验证副本是否真实存在(Manifest 中有记录)。
 
         注意:此方法只检查 Manifest 记录,不实际调用 Telegram API。
         实际的 Telegram copyMessage 失败由调用方处理。
+
+        Args:
+            fail_closed: True(默认, 商用安全) 时查询失败/无上下文返回 False(拒绝);
+                         False(兼容, 不推荐) 时查询失败乐观放行(由调用方 Telegram API 兜底)
         """
         # 1. 优先复用最近一次查询的副本缓存(零查询)
         for r in self._last_replicas:
@@ -264,21 +294,31 @@ class ReplicaAwareResolver:
         # 2. 回退到 manifest 查询(需要 group 上下文)
         group_id = self._context_group_id
         if group_id is None:
+            if fail_closed:
+                logger.warning(
+                    f"[replica-resolver] verify 无 group 上下文(fail-closed),拒绝 "
+                    f"(ch={channel_id}, msg={message_id})"
+                )
+                return False
             logger.debug(
-                f"[replica-resolver] verify 无 group 上下文,乐观放行 "
+                f"[replica-resolver] verify 无 group 上下文(fail-open),乐观放行 "
                 f"(ch={channel_id}, msg={message_id})"
             )
             # 无上下文时乐观放行,由调用方 Telegram API 兜底校验
             return True
 
         try:
+            # verify 需按 (channel_id, message_id) 过滤,无法用 file_unique_id 精确索引
+            # 故仍用 get_manifest_by_group(整组查询);失败时按 fail_closed 决定
             records = await self._store.get_manifest_by_group(group_id)
         except Exception as e:
             logger.warning(
                 f"[replica-resolver] verify manifest 查询异常 "
-                f"(group={group_id}): {e}"
+                f"(group={group_id}, fail_closed={fail_closed}): {e}"
             )
-            return True  # 查询失败时乐观放行,由调用方 Telegram API 兜底
+            if fail_closed:
+                return False  # 查询失败时拒绝,由调用方处理
+            return True  # 兼容:查询失败时乐观放行,由调用方 Telegram API 兜底
 
         for r in records:
             if r["channel_id"] == channel_id and r["message_id"] == message_id:

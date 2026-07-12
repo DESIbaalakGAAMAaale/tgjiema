@@ -504,11 +504,24 @@ class ConfigRegistry:
             category=ConfigCategory.SECURITY,
             reload_policy=ReloadPolicy.HOT_RELOAD,
             sensitivity=SensitivityLevel.INTERNAL,
-            description="允许的外部解码器 bot 白名单(逗号分隔的 username,不含 @);空表示 fail-open",
+            description="允许的外部解码器 bot 白名单(逗号分隔的 username,不含 @);空表示 fail-open(或根据 ALLOWED_DECODER_BOTS_FAIL_CLOSED 决定)",
             default_value="",
             env_var="ALLOWED_DECODER_BOTS",
             services=["idx_bot"],
             validation_regex=r"^[A-Za-z0-9_]+(?:\s*,\s*[A-Za-z0-9_]+)*$|^$",
+        ))
+
+        # ── P2-1 外部解码器白名单 fail-closed 开关 ──
+        self.register(ConfigMetadata(
+            key="ALLOWED_DECODER_BOTS_FAIL_CLOSED",
+            category=ConfigCategory.SECURITY,
+            reload_policy=ReloadPolicy.HOT_RELOAD,
+            sensitivity=SensitivityLevel.INTERNAL,
+            description="白名单为空时是否拒绝所有外部解码器(True=fail-closed,商用建议;False=fail-open,兼容现有部署)",
+            default_value=False,
+            env_var="ALLOWED_DECODER_BOTS_FAIL_CLOSED",
+            services=["idx_bot"],
+            validation_regex=r"^(true|false|True|False|1|0)$",
         ))
 
         # ── Cloudflare R2 备份凭证 ──

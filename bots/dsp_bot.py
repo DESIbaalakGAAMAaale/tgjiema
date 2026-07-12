@@ -170,10 +170,13 @@ async def _try_replica_aware_resolve(
     try:
         from services.delivery_resolver import ReplicaAwareResolver
         resolver = ReplicaAwareResolver(store)
+        # P2-3: 默认 fail_closed=True(商用安全优先),查询失败返回 None
+        # 由调用方走 fail-closed 重试路径(普通下载降级)
         return await resolver.resolve_channel_for_file(
             file_unique_id, group_id,
             preferred_channels=preferred_channels,
             exclude_channels=exclude_channels,
+            fail_closed=True,
         )
     except Exception as e:
         logger.warning(
