@@ -2394,6 +2394,235 @@ class CacheStore:
                     raise
                 return False
 
+    # ─── R36 B0-3: replication_tasks task-first 控制面扩展方法 ───
+    # 设计目标:
+    #   - worker 只扫描非终态(PLANNED/COPYING/COPIED_UNVERIFIED)
+    #   - COPIED_UNVERIFIED 优先对账,不重新 copy
+    #   - 提供"Manifest + message_backups + COMMITTED"原子提交边界
+    #   - 提供 lease 超时检测,把卡在 COPYING 的任务回退到 PLANNED
+
+    async def get_inflight_replication_tasks(
+        self, states: list[str] | None = None, limit: int = 50,
+    ) -> list[dict]:
+        """查询非终态 replication_tasks(默认 PLANNED/COPYING/COPIED_UNVERIFIED)。
+
+        Args:
+            states: 自定义状态过滤,默认为三种非终态。
+            limit: 最多返回条数。
+
+        Returns:
+            [{task_id, group_id, file_unique_id, src_channel_id, dst_channel_id,
+              src_msg_id, dst_msg_id, media_group_id, task_type, priority,
+              status, prev_status, attempts, max_attempts, next_retry_at,
+              last_error, created_at, updated_at, committed_at}, ...]
+        """
+        if not self._db:
+            return []
+        if states is None:
+            states = ["PLANNED", "COPYING", "COPIED_UNVERIFIED"]
+        # 用 IN (?, ?, ?) 占位符
+        placeholders = ", ".join("?" for _ in states)
+        cols = ["task_id", "group_id", "file_unique_id", "src_channel_id",
+                "dst_channel_id", "src_msg_id", "dst_msg_id", "media_group_id",
+                "task_type", "priority", "status", "prev_status", "attempts",
+                "max_attempts", "next_retry_at", "last_error", "created_at",
+                "updated_at", "committed_at"]
+        try:
+            rows = await self._db.execute_fetchall(
+                f"SELECT {', '.join(cols)} FROM replication_tasks "
+                f"WHERE status IN ({placeholders}) "
+                f"ORDER BY priority, created_at LIMIT ?",
+                (*states, limit),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_inflight_replication_tasks 异常: {e}")
+            return []
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def get_copied_unverified_tasks(self, limit: int = 50) -> list[dict]:
+        """查询所有 COPIED_UNVERIFIED 状态的任务(对账恢复专用)。
+
+        这些任务已经完成 Telegram copy(写入了 dst_msg_id),但 Manifest
+        /message_backups/COMMITTED 尚未原子提交。恢复时优先对账,不得
+        重新 copy。
+        """
+        if not self._db:
+            return []
+        cols = ["task_id", "group_id", "file_unique_id", "src_channel_id",
+                "dst_channel_id", "src_msg_id", "dst_msg_id", "media_group_id",
+                "task_type", "priority", "status", "prev_status", "attempts",
+                "max_attempts", "next_retry_at", "last_error", "created_at",
+                "updated_at", "committed_at"]
+        try:
+            rows = await self._db.execute_fetchall(
+                f"SELECT {', '.join(cols)} FROM replication_tasks "
+                "WHERE status = 'COPIED_UNVERIFIED' "
+                "ORDER BY updated_at LIMIT ?",
+                (limit,),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_copied_unverified_tasks 异常: {e}")
+            return []
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def reset_stale_copying_tasks(
+        self, lease_timeout_seconds: float = 600,
+    ) -> int:
+        """重置超时的 COPYING 任务回到 PLANNED(恢复用)。
+
+        场景: worker 崩溃后,COPYING 状态的任务 updated_at 已过期。
+        本方法把 updated_at < now - lease_timeout_seconds 的 COPYING 任务
+        回退到 PLANNED(prev_status 记录原状态为 COPYING,便于审计),
+        让后续 worker 重新走 claim → copy 流程。
+
+        Args:
+            lease_timeout_seconds: 超过此秒数视为 lease 过期。默认 600s。
+
+        Returns:
+            被重置的任务数。
+        """
+        if not self._db:
+            return 0
+        now = time.time()
+        cutoff = now - lease_timeout_seconds
+        for attempt in range(3):
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE replication_tasks SET prev_status = status, "
+                    "status = 'PLANNED', updated_at = ? "
+                    "WHERE status = 'COPYING' AND updated_at < ?",
+                    (now, cutoff),
+                )
+                await self._db.commit()
+                return cursor.rowcount if cursor else 0
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                return 0
+
+    async def commit_replication_transaction(
+        self, task_id: int,
+        manifest_records: list[dict] | None = None,
+        backup_mappings: list[tuple[int, int]] | None = None,
+        backup_channel_id: int | None = None,
+    ) -> bool:
+        """R36 B0-3: 原子提交 replication_task 的复制产物。
+
+        在同一 SQLite 事务内完成:
+        1. INSERT OR REPLACE manifest 记录
+        2. INSERT OR REPLACE message_backups 映射(需 backup_channel_id)
+        3. UPDATE replication_tasks SET status='COMMITTED', committed_at=now
+           WHERE task_id=? AND status='COPIED_UNVERIFIED'
+
+        任一步骤失败整体回滚,task 仍停留在 COPIED_UNVERIFIED 等待对账。
+
+        Args:
+            task_id: replication_task.task_id
+            manifest_records: 与 upsert_manifest_batch 相同结构的 dict 列表
+            backup_mappings: [(main_msg_id, backed_msg_id), ...]
+            backup_channel_id: message_backups 的 backup_channel_id
+
+        Returns:
+            True 表示提交成功;False 表示 task 状态不符或失败。
+        """
+        if not self._db or not task_id:
+            return False
+        import datetime as _dt
+        now = time.time()
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        for attempt in range(3):
+            try:
+                # 显式开启事务,确保下面 3 个操作原子提交
+                await self._db.execute("BEGIN")
+                try:
+                    # 1. 写 manifest
+                    if manifest_records:
+                        rows = [
+                            (r["group_id"], r["file_unique_id"], r["channel_id"],
+                             r["message_id"], r.get("media_type", ""),
+                             r.get("media_group_id", ""), now_iso)
+                            for r in manifest_records if r.get("file_unique_id")
+                        ]
+                        if rows:
+                            await self._db.executemany(
+                                "INSERT OR REPLACE INTO manifest "
+                                "(group_id, file_unique_id, channel_id, message_id, "
+                                "media_type, media_group_id, first_seen_at) "
+                                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                rows,
+                            )
+                    # 2. 写 message_backups
+                    if backup_mappings and backup_channel_id:
+                        from database.session import save_message_backup
+                        for main_msg_id, backed_msg_id in backup_mappings:
+                            await save_message_backup(
+                                main_msg_id, backup_channel_id, backed_msg_id,
+                            )
+                    # 3. 状态机推进 COPIED_UNVERIFIED → COMMITTED
+                    #    关键: WHERE 子句含 status='COPIED_UNVERIFIED' 守卫,
+                    #    若状态不符 rowcount=0,需主动 raise 触发 ROLLBACK,
+                    #    否则前面的 manifest/backup 写入会被误提交。
+                    cursor = await self._db.execute(
+                        "UPDATE replication_tasks SET status = 'COMMITTED', "
+                        "committed_at = ?, updated_at = ? "
+                        "WHERE task_id = ? AND status = 'COPIED_UNVERIFIED'",
+                        (now, now, task_id),
+                    )
+                    affected = cursor.rowcount if cursor else 0
+                    if affected == 0:
+                        # 状态不符:主动回滚,保证 manifest/backup 不被误提交
+                        raise RuntimeError(
+                            f"task_id={task_id} 状态不是 COPIED_UNVERIFIED,无法 COMMITTED"
+                        )
+                    await self._db.execute("COMMIT")
+                    return True
+                except Exception:
+                    # 任一步失败:回滚,task 仍为 COPIED_UNVERIFIED
+                    await self._db.execute("ROLLBACK")
+                    raise
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                logger.warning(
+                    f"[CacheStore] commit_replication_transaction 失败 "
+                    f"task_id={task_id}: {e}"
+                )
+                return False
+
+    async def get_replication_task_by_unique_key(
+        self, group_id: int, file_unique_id: str,
+        src_channel_id: int, dst_channel_id: int,
+    ) -> dict | None:
+        """按唯一业务键查询 replication_task(用于发现缺失时检查是否已有任务)。
+
+        Returns:
+            任务 dict(含 status 字段);若不存在返回 None。
+        """
+        if not self._db or not file_unique_id:
+            return None
+        cols = ["task_id", "group_id", "file_unique_id", "src_channel_id",
+                "dst_channel_id", "src_msg_id", "dst_msg_id", "media_group_id",
+                "task_type", "priority", "status", "prev_status", "attempts",
+                "max_attempts", "next_retry_at", "last_error", "created_at",
+                "updated_at", "committed_at"]
+        try:
+            rows = await self._db.execute_fetchall(
+                f"SELECT {', '.join(cols)} FROM replication_tasks "
+                "WHERE group_id=? AND file_unique_id=? "
+                "AND src_channel_id=? AND dst_channel_id=? LIMIT 1",
+                (group_id, file_unique_id, src_channel_id, dst_channel_id),
+            )
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_replication_task_by_unique_key 异常: {e}")
+            return None
+        return dict(zip(cols, rows[0])) if rows else None
+
     # ─── D: 本地任务队列操作 ───
 
     # ─── H方案: 本地插入新 job(返回临时负数 ID) ───

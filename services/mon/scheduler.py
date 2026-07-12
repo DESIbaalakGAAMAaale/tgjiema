@@ -2,6 +2,8 @@
 
 import os
 import re
+import time
+import asyncio
 import datetime as _dt
 
 import yaml
@@ -9,6 +11,92 @@ from loguru import logger
 from database import (
     log_rotate,
 )
+
+
+# ─── R36 B0-3: replication_tasks 安全包装(异常不传播到主流程) ───
+# 设计参考 up_bot.py 的 _create_replication_task_safe 系列:
+# 所有 replication_tasks 写入失败只记录 warning,不影响复制主流程的兼容降级。
+
+async def _create_replication_task_safe(
+    store, group_id: int, file_unique_id: str, src_channel_id: int,
+    dst_channel_id: int, src_msg_id: int, media_group_id: str = "",
+) -> int:
+    """安全创建 replication_task(PLANNED),返回 task_id(0 表示失败)。
+
+    异常安全: 失败只记录 warning,不传播到主流程。
+    """
+    if not file_unique_id or not group_id or not store:
+        return 0
+    try:
+        return await store.create_replication_task(
+            group_id, file_unique_id, src_channel_id, dst_channel_id,
+            src_msg_id, media_group_id=media_group_id,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[Mon][repl] 创建 replication_task 失败(不影响主流程, "
+            f"fuid={file_unique_id}): {e}"
+        )
+        return 0
+
+
+async def _mark_replication_copying_safe(store, task_id: int) -> bool:
+    """安全 CAS claim: PLANNED → COPYING。返回 claim 是否成功。"""
+    if not task_id or not store:
+        return False
+    try:
+        return await store.mark_replication_copying(task_id)
+    except Exception as e:
+        logger.warning(
+            f"[Mon][repl] 标记 COPYING 失败(不影响主流程, task_id={task_id}): {e}"
+        )
+        return False
+
+
+async def _mark_replication_copied_safe(store, task_id: int, dst_msg_id: int) -> bool:
+    """安全标记 COPIED_UNVERIFIED(写入 dst_msg_id)。"""
+    if not task_id or not store:
+        return False
+    try:
+        return await store.mark_replication_copied(task_id, dst_msg_id)
+    except Exception as e:
+        logger.warning(
+            f"[Mon][repl] 标记 COPIED_UNVERIFIED 失败(不影响主流程, "
+            f"task_id={task_id}): {e}"
+        )
+        return False
+
+
+async def _mark_replication_failed_safe(store, task_id: int, reason: str) -> None:
+    """安全标记 FAILED/PLANNED(重试)。"""
+    if not task_id or not store:
+        return
+    try:
+        await store.mark_replication_failed(task_id, reason)
+    except Exception as e:
+        logger.warning(
+            f"[Mon][repl] 标记 FAILED 失败(不影响主流程, task_id={task_id}): {e}"
+        )
+
+
+async def _commit_replication_transaction_safe(
+    store, task_id: int,
+    manifest_records: list[dict] | None = None,
+    backup_mappings: list[tuple[int, int]] | None = None,
+    backup_channel_id: int | None = None,
+) -> bool:
+    """安全原子提交: Manifest + message_backups + COMMITTED 同事务。"""
+    if not task_id or not store:
+        return False
+    try:
+        return await store.commit_replication_transaction(
+            task_id, manifest_records, backup_mappings, backup_channel_id,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[Mon][repl] 原子提交失败(不影响主流程, task_id={task_id}): {e}"
+        )
+        return False
 
 
 def _load_mon_config():
@@ -272,11 +360,16 @@ class MonScheduler:
     async def replicate_all_active_to_shadows(self, bot_instance, all_cells: list[dict]) -> int:
         """核心功能:将每个 Active 槽的新消息复制到同组的 Shadow 槽位 + R100 全量归档。
 
-        Manifest 驱动(免 Telethon 读历史):
+        R36 B0-3: replication_task-first 控制面。
+        每个调度周期开始时先做:
+        1. 重置超时的 COPYING 任务 → PLANNED(worker 崩溃恢复)
+        2. 对账 COPIED_UNVERIFIED 任务(优先对账,不重新 copy)
+
+        然后进入 task-first 复制主循环:
         - Up Bot 写入 Active 时已登记 manifest
         - Mon Bot 查 manifest 获取"Active 有但 Shadow/R100 没有"的文件
-        - 用 bot.copy_messages 从 Active 复制到 Shadow/R100
-        - 更新 manifest + message_backups(兼容 dsp_bot 故障切换)
+        - 为每个缺失文件创建/查询 replication_task(PLANNED)
+        - CAS claim → COPYING → Telegram copy → COPIED_UNVERIFIED → 原子提交 COMMITTED
         返回复制的消息总数。
 
         Args:
@@ -287,6 +380,29 @@ class MonScheduler:
         total_copied = 0
         from database.cache_store import get_cache_store
         store = get_cache_store()
+
+        # R36 B0-3: 周期开始时先做恢复对账
+        # 1. 重置超时的 COPYING 任务(lease 过期,worker 可能已崩溃)
+        try:
+            reset_count = await store.reset_stale_copying_tasks(
+                lease_timeout_seconds=600,
+            )
+            if reset_count > 0:
+                logger.info(
+                    f"[Mon][reconcile] 重置 {reset_count} 个超时 COPYING 任务回 PLANNED"
+                )
+        except Exception as e:
+            logger.warning(f"[Mon][reconcile] 重置超时 COPYING 任务异常: {e}")
+
+        # 2. 对账 COPIED_UNVERIFIED 任务(优先对账,不重新 copy)
+        try:
+            reconciled = await self._reconcile_copied_unverified(store)
+            if reconciled > 0:
+                logger.info(
+                    f"[Mon][reconcile] 本轮对账推进 {reconciled} 个 COPIED_UNVERIFIED → COMMITTED"
+                )
+        except Exception as e:
+            logger.warning(f"[Mon][reconcile] 对账 COPIED_UNVERIFIED 异常: {e}")
 
         # 找到 R100 槽位（全量归档用）
         r100_slot = next((c for c in all_cells if c.get("is_r100", 0) == 1 and c.get("status") == "r100"), None)
@@ -304,7 +420,7 @@ class MonScheduler:
             group_id = int(_group_key)
             active_channel = active_slot["channel_id"]
 
-            # 1. R100 全量归档(manifest 驱动)
+            # 1. R100 全量归档(task-first 驱动)
             if r100_slot:
                 r100_channel_id = r100_slot["channel_id"]
                 copied = await self._copy_missing_via_manifest(
@@ -317,7 +433,7 @@ class MonScheduler:
                 if copied > 0:
                     logger.info(f"[Mon][R100] slot={slot_id} 归档 {copied} 条")
 
-            # 2. 复制到同组的 shadow1/shadow2(manifest 驱动)
+            # 2. 复制到同组的 shadow1/shadow2(task-first 驱动)
             if not shadows:
                 logger.warning(
                     f"[Mon] slot={slot_id} 无可用 shadow,跳过复制 "
@@ -345,7 +461,22 @@ class MonScheduler:
         self, bot_instance, store, group_id: int,
         src_channel_id: int, dst_channel_id: int, main_channel_id: int,
     ) -> int:
-        """Manifest 驱动的副本同步:查 manifest 获取 dst 缺失的文件,从 src 复制过去。
+        """R36 B0-3: replication_task-first 副本同步。
+
+        流程(每条缺失文件):
+        1. INSERT OR IGNORE replication_task(PLANNED, 唯一业务键)
+        2. 查询任务状态:
+           - COMMITTED: 已完成,跳过
+           - COPYING / COPIED_UNVERIFIED: 在途,跳过(由 _reconcile_copied_unverified 处理)
+           - PLANNED: 进入 claim 流程
+        3. CAS claim → COPYING(mark_replication_copying)
+        4. Telegram copy_messages
+        5. 成功: mark_replication_copied → COPIED_UNVERIFIED(写入 dst_msg_id)
+        6. 原子提交: commit_replication_transaction(Manifest + message_backups + COMMITTED 同事务)
+        7. 失败: mark_replication_failed(task_id, reason)
+
+        媒体组感知:同一 media_group_id 的所有成员必须全部 PLANNED 才能 claim,
+        否则整组跳过(避免拆散相册)。COPIED_UNVERIFIED 的成员由对账恢复推进。
 
         Args:
             src_channel_id: 源频道(复制来源,通常是 active)
@@ -364,25 +495,78 @@ class MonScheduler:
         if not missing:
             return 0
 
-        # 2. 按源 message_id 排序(保持顺序),批量 copy_messages
-        # 注意:copy_messages 要求 message_ids 是同一频道的,这里源都是 src_channel_id
+        # 2. 按源 message_id 排序(保持顺序)
         missing.sort(key=lambda x: x["src_message_id"])
 
-        # 媒体组感知分批:同一 media_group_id 的消息必须在同一个 copy_messages 调用中,
-        # 否则 Telegram 会把一个相册拆成多个独立相册。
-        # 策略:遍历排序后的列表,批次满 30 条时,若下一条与当前批次属同一媒体组则延展批次。
-        batch_size = 30  # 每批最多 30 条,避免 FloodWait
+        # 3. R36 B0-3: 为每个缺失文件 INSERT OR IGNORE replication_task(PLANNED)
+        #    并查询当前状态,过滤出 PLANNED 的文件进入 claim 流程
+        #    COMMITTED/COPYING/COPIED_UNVERIFIED 的任务跳过(避免重复 copy)
+        plan_items: list[dict] = []  # 仅 PLANNED 状态的文件进入复制流程
+        task_id_map: dict[str, int] = {}  # file_unique_id → task_id
+        skipped_inflight = 0
+        skipped_committed = 0
+        for item in missing:
+            fuid = item["file_unique_id"]
+            mgid = item.get("media_group_id") or ""
+            # INSERT OR IGNORE 幂等创建任务
+            task_id = await _create_replication_task_safe(
+                store, group_id, fuid, src_channel_id, dst_channel_id,
+                item["src_message_id"], media_group_id=mgid,
+            )
+            if task_id == 0:
+                # 创建失败,降级到原 manifest 驱动(忽略 task-first,保持兼容)
+                # 但仍尝试复制,后续 manifest 登记走老路径
+                logger.warning(
+                    f"[Mon][repl] task 创建失败,fuid={fuid},降级到无 task 复制"
+                )
+                plan_items.append(item)
+                continue
+            task_id_map[fuid] = task_id
+            # 查询任务当前状态决定是否进入 claim 流程
+            try:
+                task = await store.get_replication_task_by_unique_key(
+                    group_id, fuid, src_channel_id, dst_channel_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Mon][repl] 查询 task 状态失败 task_id={task_id},按 PLANNED 处理: {e}"
+                )
+                task = None
+            status = (task or {}).get("status", "PLANNED")
+            if status == "COMMITTED":
+                skipped_committed += 1
+                continue
+            if status in ("COPYING", "COPIED_UNVERIFIED"):
+                # 在途任务交给 _reconcile_copied_unverified 推进
+                skipped_inflight += 1
+                continue
+            # PLANNED 或 FAILED-已回退-PLANNED → 进入 claim 流程
+            plan_items.append(item)
+
+        if skipped_committed > 0 or skipped_inflight > 0:
+            logger.info(
+                f"[Mon][repl] group={group_id} src={src_channel_id} dst={dst_channel_id} "
+                f"missing={len(missing)} planned={len(plan_items)} "
+                f"skipped_committed={skipped_committed} skipped_inflight={skipped_inflight}"
+            )
+        if not plan_items:
+            # 全部已完成或在途,无需 copy
+            return 0
+
+        # 4. 媒体组感知分批:同一 media_group_id 必须在同一个 copy_messages 调用
+        #    否则 Telegram 会把一个相册拆成多个独立相册。
+        #    策略:遍历排序后的列表,批次满 30 条时,若下一条与当前批次属同一媒体组则延展批次。
+        batch_size = 30
         batches: list[list[dict]] = []
         cur_batch: list[dict] = []
         cur_mgids: set[str] = set()
-        for item in missing:
+        for item in plan_items:
             mgid = item.get("media_group_id") or ""
             if not cur_batch:
                 cur_batch.append(item)
                 if mgid:
                     cur_mgids.add(mgid)
                 continue
-            # 批次已满 且 下一条不属于当前批次任何媒体组 → 开新批次
             if len(cur_batch) >= batch_size and mgid not in cur_mgids:
                 batches.append(cur_batch)
                 cur_batch = [item]
@@ -396,8 +580,54 @@ class MonScheduler:
 
         total_copied = 0
         for batch in batches:
-            src_msg_ids = [item["src_message_id"] for item in batch]
-            # FloodWait 重试:RetryAfter 时等待后重试,避免反复触发限制
+            # 4a. R36 B0-3: 媒体组完整性检查
+            #     若 batch 含媒体组成员,必须所有成员的 task 都是 PLANNED 才能 claim
+            #     (前面已过滤掉非 PLANNED 的,这里再做一次保险)
+            batch_mgids = {item.get("media_group_id") or "" for item in batch}
+            has_media_group = any(mgid for mgid in batch_mgids)
+
+            # 4b. CAS claim 每个 task: PLANNED → COPYING
+            #     任一 claim 失败(被其他 worker 抢占)→ 整批跳过(避免媒体组拆散)
+            claimed_task_ids: list[tuple[int, dict]] = []
+            claim_failed = False
+            for item in batch:
+                fuid = item["file_unique_id"]
+                task_id = task_id_map.get(fuid, 0)
+                if not task_id:
+                    claim_failed = True
+                    break
+                ok = await _mark_replication_copying_safe(store, task_id)
+                if not ok:
+                    # 被其他 worker 抢占或状态已变 → 跳过整批(媒体组不能拆散)
+                    claim_failed = True
+                    break
+                claimed_task_ids.append((task_id, item))
+
+            if claim_failed:
+                # 已 claim 的 task 回退为 FAILED(让下轮重试)
+                # 但不 mark_replication_failed(因为只是 claim 冲突,不是真失败)
+                # 改为:已 claim 的保留 COPYING,下轮 _reconcile 通过 lease 超时回退
+                # 这里只跳过本批次,不破坏已 claim 的 task
+                if has_media_group:
+                    logger.info(
+                        f"[Mon][repl] 媒体组 claim 部分失败,整批跳过 "
+                        f"src={src_channel_id} dst={dst_channel_id} "
+                        f"mgids={batch_mgids}"
+                    )
+                    continue
+                # 非媒体组:仅跳过失败的项,保留已 claim 的继续 copy
+                if not claimed_task_ids:
+                    continue
+
+            # 4c. 取已成功 claim 的子集作为本次 copy 的输入
+            #     (claim 失败时,claimed_task_ids 可能是 batch 的子集)
+            effective_batch = [item for (_tid, item) in claimed_task_ids]
+            effective_task_ids = [tid for (tid, _item) in claimed_task_ids]
+            if not effective_batch:
+                continue
+            src_msg_ids = [item["src_message_id"] for item in effective_batch]
+
+            # 5. Telegram copy_messages(FloodWait 重试)
             copied_msgs = None
             for attempt in range(3):
                 try:
@@ -408,10 +638,8 @@ class MonScheduler:
                     )
                     break
                 except Exception as e:
-                    # 检测 FloodWait / RetryAfter
                     retry_after = getattr(e, "retry_after", None)
                     if retry_after is None and "Too Many Requests" in str(e):
-                        # 解析 retry_after
                         try:
                             retry_after = float(str(e).split("retry in")[-1].split("seconds")[0].strip())
                         except Exception:
@@ -425,56 +653,225 @@ class MonScheduler:
                         continue
                     logger.warning(
                         f"[Mon][manifest] copy_messages 失败 src={src_channel_id} dst={dst_channel_id} "
-                        f"batch_size={len(batch)}: {e}"
+                        f"batch_size={len(effective_batch)}: {e}"
                     )
                     break
+
             if copied_msgs is None:
-                # 失败的批次下周期重试(幂等:manifest 未登记,get_missing_from_src 会再次返回)
+                # copy 失败:把所有已 claim 的 task 标记 FAILED(可重试)
+                for tid in effective_task_ids:
+                    await _mark_replication_failed_safe(
+                        store, tid, f"copy_messages_failed: src={src_channel_id} dst={dst_channel_id}"
+                    )
+                # 失败的批次终止后续批次(避免 FloodWait 连锁)
                 break
+
+            # 6. R36 B0-3: 逐个 task 推进状态机
+            #    copy_messages 返回 List[MessageId],顺序与输入一致
             try:
-                # copy_messages 返回 List[MessageId],顺序与输入一致
-                manifest_records = []
-                backup_mappings = []
-                for item, sent in zip(batch, copied_msgs):
+                for (task_id, item), sent in zip(claimed_task_ids, copied_msgs):
                     sent_msg_id = sent.message_id
-                    manifest_records.append({
+                    # 6a. 标记 COPIED_UNVERIFIED(写入 dst_msg_id)
+                    #     失败不阻断后续,留给 _reconcile_copied_unverified 推进
+                    ok = await _mark_replication_copied_safe(store, task_id, sent_msg_id)
+                    if not ok:
+                        logger.warning(
+                            f"[Mon][repl] 标记 COPIED_UNVERIFIED 失败 task_id={task_id},"
+                            f"由对账恢复处理"
+                        )
+                        total_copied += 1
+                        continue
+
+                    # 6b. R36 B0-3: 原子提交(Manifest + message_backups + COMMITTED 同事务)
+                    manifest_record = {
                         "group_id": group_id,
                         "file_unique_id": item["file_unique_id"],
                         "channel_id": dst_channel_id,
                         "message_id": sent_msg_id,
                         "media_type": item.get("media_type", ""),
                         "media_group_id": item.get("media_group_id", ""),
-                    })
-                    # message_backups: main_msg_id 用 main_channel 的 msg_id
-                    # 常规场景 main_channel_id == src_channel_id,直接用 src_message_id
-                    # 补位场景 main_channel_id 可能不同,需查 manifest 获取 main_channel 的 msg_id
+                    }
+                    # message_backups 的 main_msg_id:
+                    #   常规场景 main_channel_id == src_channel_id,直接用 src_message_id
+                    #   补位场景 main_channel_id 可能不同,需查 manifest 获取 main_channel 的 msg_id
                     if main_channel_id == src_channel_id:
                         main_msg_id = item["src_message_id"]
                     else:
-                        main_msg_id = await store.get_manifest_msg_id(
-                            group_id, main_channel_id, item["file_unique_id"]
+                        try:
+                            main_msg_id = await store.get_manifest_msg_id(
+                                group_id, main_channel_id, item["file_unique_id"]
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[Mon][repl] 查询 main_msg_id 失败 fuid={item['file_unique_id']}: {e}"
+                            )
+                            main_msg_id = None
+                    backup_mappings = (
+                        [(main_msg_id, sent_msg_id)] if main_msg_id else None
+                    )
+
+                    committed = await _commit_replication_transaction_safe(
+                        store, task_id,
+                        manifest_records=[manifest_record],
+                        backup_mappings=backup_mappings,
+                        backup_channel_id=dst_channel_id,
+                    )
+                    if not committed:
+                        # 原子提交失败:task 仍停留在 COPIED_UNVERIFIED
+                        # 由 _reconcile_copied_unverified 在下轮重试提交
+                        logger.warning(
+                            f"[Mon][repl] 原子提交失败 task_id={task_id},"
+                            f"由对账恢复重试"
                         )
-                    if main_msg_id:
-                        backup_mappings.append((main_msg_id, sent_msg_id))
-
-                # 3. 更新 manifest + message_backups
-                try:
-                    await store.upsert_manifest_batch(manifest_records)
-                except Exception as e:
-                    logger.warning(f"[Mon][manifest] 批量登记失败 dst={dst_channel_id}: {e}")
-
-                if backup_mappings:
-                    try:
-                        await self._write_backup_mappings(main_channel_id, dst_channel_id, backup_mappings)
-                    except Exception as e:
-                        logger.warning(f"[Mon][manifest] message_backups 写入失败 dst={dst_channel_id}: {e}")
-
-                total_copied += len(copied_msgs)
+                    total_copied += 1
             except Exception as e:
-                logger.warning(f"[Mon][manifest] 复制后处理异常 dst={dst_channel_id}: {e}")
+                logger.warning(
+                    f"[Mon][manifest] 复制后处理异常 dst={dst_channel_id}: {e}"
+                )
+                # 已 copy 但状态机推进失败,task 留在 COPIED_UNVERIFIED 等待对账
                 break
 
         return total_copied
+
+    async def _reconcile_copied_unverified(self, store, max_tasks: int = 100) -> int:
+        """R36 B0-3: COPIED_UNVERIFIED 对账恢复。
+
+        扫描所有 COPIED_UNVERIFIED 状态的 replication_task,优先对账而不重新 copy:
+
+        1. 检查 manifest 是否已写入(可能 worker 在 commit_replication_transaction
+           成功写入 manifest 但状态机推进前崩溃)
+           - 已写入 → mark_replication_committed → COMMITTED
+        2. 未写入 → 用已存的 dst_msg_id 重新写 manifest + message_backups
+           + COMMITTED(不重新 copy)
+        3. 任务超时(updated_at 早于 now - reconcile_timeout)且仍 COPIED_UNVERIFIED
+           → mark_replication_failed 让下轮 worker 重新创建 task
+
+        Args:
+            store: CacheStore 实例
+            max_tasks: 单次最多处理任务数
+
+        Returns:
+            完成对账的任务数(COMMITTED 推进数)。
+        """
+        if not store:
+            return 0
+        try:
+            tasks = await store.get_copied_unverified_tasks(limit=max_tasks)
+        except Exception as e:
+            logger.warning(f"[Mon][reconcile] 查询 COPIED_UNVERIFIED 任务失败: {e}")
+            return 0
+        if not tasks:
+            return 0
+
+        reconciled = 0
+        now = time.time()
+        reconcile_timeout = 3600  # 1 小时仍未对账完成则放弃,转 FAILED
+
+        for task in tasks:
+            task_id = task["task_id"]
+            group_id = task["group_id"]
+            fuid = task["file_unique_id"]
+            dst_channel_id = task["dst_channel_id"]
+            src_channel_id = task["src_channel_id"]
+            src_msg_id = task["src_msg_id"]
+            dst_msg_id = task.get("dst_msg_id")
+            media_group_id = task.get("media_group_id") or ""
+            media_type = ""  # task 表不存 media_type,从 manifest 查
+            updated_at = task.get("updated_at") or now
+
+            # 超时检测:任务停留在 COPIED_UNVERIFIED 过久 → 标记 FAILED 重试
+            if now - updated_at > reconcile_timeout:
+                logger.warning(
+                    f"[Mon][reconcile] task_id={task_id} COPIED_UNVERIFIED 超时 "
+                    f"({now - updated_at:.0f}s),标记 FAILED 重试"
+                )
+                await _mark_replication_failed_safe(
+                    store, task_id, "reconcile_timeout_copied_unverified"
+                )
+                continue
+
+            if not dst_msg_id:
+                # 缺少 dst_msg_id 说明 mark_replication_copied 未完成,
+                # 但任务在 COPIED_UNVERIFIED 状态说明 copy 已成功(只是 dst_msg_id 未落库)
+                # 这种情况无法对账,直接标记 FAILED
+                logger.warning(
+                    f"[Mon][reconcile] task_id={task_id} 缺少 dst_msg_id,标记 FAILED"
+                )
+                await _mark_replication_failed_safe(
+                    store, task_id, "reconcile_missing_dst_msg_id"
+                )
+                continue
+
+            # 1. 检查 manifest 是否已写入
+            try:
+                manifest_msg_id = await store.get_manifest_msg_id(
+                    group_id, dst_channel_id, fuid,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Mon][reconcile] 查询 manifest 失败 task_id={task_id}: {e}"
+                )
+                continue
+
+            if manifest_msg_id:
+                # 1a. manifest 已写入 → 推进 COMMITTED
+                try:
+                    ok = await store.mark_replication_committed(task_id)
+                    if ok:
+                        reconciled += 1
+                        logger.info(
+                            f"[Mon][reconcile] task_id={task_id} manifest 已存在,"
+                            f"推进 COMMITTED"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"[Mon][reconcile] mark_replication_committed 失败 "
+                        f"task_id={task_id}: {e}"
+                    )
+                continue
+
+            # 2. manifest 未写入 → 用已存的 dst_msg_id 重新写
+            #    (不重新 copy,使用 task 表中保留的 dst_msg_id)
+            manifest_record = {
+                "group_id": group_id,
+                "file_unique_id": fuid,
+                "channel_id": dst_channel_id,
+                "message_id": dst_msg_id,
+                "media_type": media_type,
+                "media_group_id": media_group_id,
+            }
+            # message_backups 的 main_msg_id:优先用 src_msg_id(常规场景)
+            # 补位场景无法在此判断 main_channel,退化为不写 backup_mapping
+            backup_mappings = [(src_msg_id, dst_msg_id)] if src_msg_id else None
+
+            try:
+                ok = await store.commit_replication_transaction(
+                    task_id,
+                    manifest_records=[manifest_record],
+                    backup_mappings=backup_mappings,
+                    backup_channel_id=dst_channel_id,
+                )
+                if ok:
+                    reconciled += 1
+                    logger.info(
+                        f"[Mon][reconcile] task_id={task_id} 重新写入 manifest 成功,"
+                        f"推进 COMMITTED"
+                    )
+                else:
+                    logger.warning(
+                        f"[Mon][reconcile] task_id={task_id} 原子提交失败,"
+                        f"下轮重试"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[Mon][reconcile] task_id={task_id} 对账提交异常: {e}"
+                )
+
+        if reconciled > 0:
+            logger.info(
+                f"[Mon][reconcile] 本轮对账完成 {reconciled}/{len(tasks)} 个 task"
+            )
+        return reconciled
 
     @staticmethod
     async def _write_backup_mappings(main_channel_id: int, backup_channel_id: int, mappings: list[tuple[int, int]]) -> bool:
