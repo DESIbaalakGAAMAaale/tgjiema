@@ -3,6 +3,7 @@
 如果首选频道不可达,自动降级到 Shadow1→Shadow2→下一环。
 """
 import asyncio
+import hashlib
 import re
 import time
 from loguru import logger
@@ -12,6 +13,68 @@ from database import (
 )
 from utils.flood_waiter import safe_copy_message
 from utils.per_channel_limiter import acquire_channel_limit
+
+
+# ──────────────────────────────────────────────
+# R37 P2-5: Delivery Token (effectively-once)
+# ──────────────────────────────────────────────
+# 外部 Telegram 副作用(copy_message)只能做到 effectively-once:
+#   - 投递成功 → 记录稳定的 delivery_token 到 delivery_receipts 表
+#   - 重试时先检查 token 是否已存在,存在则跳过(避免重复通知)
+# token = SHA-256(file_code + target_user_id + job_id) 前 32 字节 hex
+# 选择 SHA-256 而非 UUID: 同一 (file_code, target_user_id, job_id) 三元组
+# 永远生成相同 token,即使重启 / 跨进程也一致。
+def compute_delivery_token(file_code: str, target_user_id: int, job_id: int) -> str:
+    """计算稳定的 delivery token。
+
+    Args:
+        file_code: 文件码(业务唯一标识)
+        target_user_id: 目标用户 Telegram ID
+        job_id: 派工表 job 主键
+
+    Returns:
+        64 字符 hex 字符串(SHA-256)
+    """
+    raw = f"{file_code or ''}|{int(target_user_id)}|{int(job_id)}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+async def is_delivery_already_done(
+    store, file_code: str, target_user_id: int, job_id: int,
+) -> bool:
+    """检查给定 (file_code, target_user_id, job_id) 是否已成功投递过。
+
+    通过 delivery_token 查询 delivery_receipts 表:
+    - 存在 status IN ('SENT', 'CONFIRMED') 且 delivery_token 匹配的记录 → 已投递
+    - 否则 → 未投递,允许继续
+
+    Args:
+        store: CacheStore 实例(若为 None 直接返回 False)
+        file_code: 文件码
+        target_user_id: 目标用户 ID
+        job_id: job ID
+
+    Returns:
+        True = 已投递过(跳过), False = 未投递(可继续)
+    """
+    if store is None:
+        return False
+    token = compute_delivery_token(file_code, target_user_id, job_id)
+    try:
+        # 优先用 store 提供的 is_delivery_already_done(新接口)
+        if hasattr(store, "is_delivery_already_done"):
+            return await store.is_delivery_already_done(token)
+        # 回退: 用 get_delivery_receipts_by_job 查 SENT/CONFIRMED 状态
+        existing = await store.get_delivery_receipts_by_job(job_id)
+        return any(
+            r.get("status") in ("SENT", "CONFIRMED")
+            and r.get("delivery_token") == token
+            for r in existing
+        )
+    except Exception as e:
+        logger.warning(f"[delivery] 检查 delivery_token 幂等失败(忽略,继续投递): {e}")
+        return False
+
 
 # 模块级缓存:避免每次 resolve_delivery_channel() 都查询 CRDB
 # 使用 per-entry 时间戳,避免新条目加入时延长整个缓存的生命周期

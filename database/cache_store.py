@@ -606,6 +606,7 @@ class CacheStore:
 
         # ─── M1-4: delivery_receipts 投递回执(替代 _sent_msg_tracker 内存态) ───
         # 状态: SENT → CONFIRMED / FAILED / PARTIAL
+        # R37 P2-5: 新增 delivery_token 列(effectively-once 幂等)
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS delivery_receipts (
                 receipt_id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -620,6 +621,7 @@ class CacheStore:
                 error_reason       TEXT,
                 created_at         REAL NOT NULL,
                 confirmed_at       REAL,
+                delivery_token     TEXT,
                 UNIQUE(job_id, source_msg_id)
             )"""
         )
@@ -629,6 +631,19 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_delivery_receipts_target ON delivery_receipts(target_user_id)"
         )
+        # R37 P2-5: delivery_token 索引(快速查询 token 是否已存在)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_receipts_token ON delivery_receipts(delivery_token)"
+        )
+        # 幂等迁移: 为已存在的表补充 delivery_token 列(CREATE TABLE IF NOT EXISTS 不会添加新列)
+        try:
+            await self._db.execute(
+                "ALTER TABLE delivery_receipts ADD COLUMN delivery_token TEXT"
+            )
+        except Exception as _e:
+            # 列已存在时 SQLite 抛 OperationalError "duplicate column",属正常,可忽略
+            if "duplicate column" not in str(_e).lower():
+                logger.warning(f"[CacheStore] ALTER TABLE delivery_receipts 失败(非预期): {_e}")
 
         # ─── M1-5: replication_tasks 副本复制任务 ───
         # 状态机: PLANNED → COPYING → COPIED_UNVERIFIED → COMMITTED / FAILED
@@ -2100,11 +2115,14 @@ class CacheStore:
         self, job_id: int, source_msg_id: int, target_user_id: int,
         sent_msg_id: int | None = None, media_group_id: str = "",
         group_receipt_id: str = "", status: str = "SENT",
+        delivery_token: str = "",
     ) -> None:
         """写入或更新投递回执(基于 UNIQUE(job_id, source_msg_id))。
 
         INSERT OR REPLACE 会删除旧记录并插入新记录(自增 receipt_id 会变)。
         若需保留 receipt_id,应改用 UPDATE。本方法用于首次写入和重试场景。
+
+        R37 P2-5: delivery_token 参数支持 effectively-once 幂等。
         """
         if not self._db:
             return
@@ -2115,10 +2133,11 @@ class CacheStore:
                     "INSERT OR REPLACE INTO delivery_receipts "
                     "(job_id, source_msg_id, target_user_id, sent_msg_id, "
                     " media_group_id, group_receipt_id, status, attempts, "
-                    " error_reason, created_at, confirmed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL)",
+                    " error_reason, created_at, confirmed_at, delivery_token) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, NULL, ?)",
                     (job_id, source_msg_id, target_user_id, sent_msg_id,
-                     media_group_id or "", group_receipt_id or "", status, now),
+                     media_group_id or "", group_receipt_id or "", status, now,
+                     delivery_token or ""),
                 )
                 await self._db.commit()
                 return
@@ -2130,6 +2149,33 @@ class CacheStore:
                     raise
                 return
 
+    async def is_delivery_already_done(self, delivery_token: str) -> bool:
+        """R37 P2-5: 检查 delivery_token 是否已有成功投递记录。
+
+        通过 token 查询 delivery_receipts 表,若存在 status IN ('SENT', 'CONFIRMED')
+        且 delivery_token 匹配的记录,则视为已投递(effectively-once 跳过)。
+
+        Args:
+            delivery_token: SHA-256(file_code | target_user_id | job_id) hex
+
+        Returns:
+            True = 已投递过(跳过), False = 未投递或 token 为空
+        """
+        if not self._db or not delivery_token:
+            return False
+        try:
+            async with self._db.execute(
+                "SELECT 1 FROM delivery_receipts "
+                "WHERE delivery_token = ? AND status IN ('SENT', 'CONFIRMED') "
+                "LIMIT 1",
+                (delivery_token,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return row is not None
+        except Exception as e:
+            logger.warning(f"[CacheStore] is_delivery_already_done 异常: {e}")
+            return False
+
     async def get_delivery_receipts_by_job(self, job_id: int) -> list[dict]:
         """查询某 job 的所有投递回执。"""
         if not self._db:
@@ -2138,7 +2184,7 @@ class CacheStore:
             rows = await self._db.execute_fetchall(
                 "SELECT receipt_id, job_id, source_msg_id, target_user_id, "
                 "sent_msg_id, media_group_id, group_receipt_id, status, "
-                "attempts, error_reason, created_at, confirmed_at "
+                "attempts, error_reason, created_at, confirmed_at, delivery_token "
                 "FROM delivery_receipts WHERE job_id = ? "
                 "ORDER BY source_msg_id",
                 (job_id,),
@@ -2148,7 +2194,8 @@ class CacheStore:
             return []
         cols = ["receipt_id", "job_id", "source_msg_id", "target_user_id",
                 "sent_msg_id", "media_group_id", "group_receipt_id", "status",
-                "attempts", "error_reason", "created_at", "confirmed_at"]
+                "attempts", "error_reason", "created_at", "confirmed_at",
+                "delivery_token"]
         return [dict(zip(cols, r)) for r in rows]
 
     async def confirm_delivery_receipt(

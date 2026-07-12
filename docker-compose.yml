@@ -21,11 +21,24 @@ services:
       - redis_data:/data
     ports:
       - "127.0.0.1:6379:6379"
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
 
   # ── migration (oneshot,DDL 执行) ──
   # R37 P0-1: migration 必须加载 .env.secrets.migration(含 COCKROACHDB_URL)
@@ -47,6 +60,19 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
 
   # ── db_writer (Redis Stream 消费 → CRDB 写入) ──
   db_writer:
@@ -67,6 +93,25 @@ services:
         condition: service_healthy
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── crdb_sync (单一 CRDB 同步服务) ──
   # R37 P0-1: 使用标准 env_file 字段加载 secrets(不再使用非标准字段)
@@ -87,6 +132,25 @@ services:
     depends_on:
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── up (上传接收 Bot) ──
   up:
@@ -111,6 +175,25 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── idx (解码索引 Bot) ──
   idx:
@@ -135,6 +218,25 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── dsp (派送分发 Bot) ──
   dsp:
@@ -159,6 +261,25 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── mon (监控管理 Bot) ──
   mon:
@@ -183,6 +304,25 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── admin_bot (管理员 Bot) ──
   admin_bot:
@@ -207,6 +347,25 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
 
   # ── admin (Web 管理后台) ──
   admin:
@@ -233,8 +392,14 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固(read_only + tmpfs + security_opt + 资源限制)
+    read_only: true
+    tmpfs:
+      - /tmp
     cap_drop:
       - ALL
+    security_opt:
+      - no-new-privileges:true
     deploy:
       resources:
         limits:
@@ -271,6 +436,19 @@ services:
     depends_on:
       migration:
         condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
 
 volumes:
   redis_data:

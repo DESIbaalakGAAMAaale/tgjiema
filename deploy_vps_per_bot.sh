@@ -114,6 +114,68 @@ configure_redis_persistence() {
 }
 configure_redis_persistence
 
+# ──────────────────────────────────────────────
+# R37 P2-3: Redis ACL 初始化(最小权限 + 禁用 default 用户)
+# 参考文档: docs/redis-security.md
+# ──────────────────────────────────────────────
+init_redis_acl() {
+    if ! command -v redis-cli &> /dev/null; then
+        warn "未找到 redis-cli,跳过 ACL 初始化"
+        return 0
+    fi
+    info "R37 P2-3: 初始化 Redis ACL(独立用户 + 最小权限)..."
+
+    # 从 .env 读取(若已配置) REDIS_WRITER_PWD / REDIS_READER_PWD;
+    # 否则生成随机密码并回写 .env(供业务 Bot 通过 ACL 用户连接)
+    local env_file="$DEPLOY_DIR/.env"
+    local writer_pwd reader_pwd
+    writer_pwd=$(grep -E '^REDIS_WRITER_PWD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    reader_pwd=$(grep -E '^REDIS_READER_PWD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
+    if [[ -z "$writer_pwd" ]]; then
+        writer_pwd=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | xxd -p)
+        echo "REDIS_WRITER_PWD=${writer_pwd}" >> "$env_file"
+        success "已生成 REDIS_WRITER_PWD 并写入 .env"
+    fi
+    if [[ -z "$reader_pwd" ]]; then
+        reader_pwd=$(openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | xxd -p)
+        echo "REDIS_READER_PWD=${reader_pwd}" >> "$env_file"
+        success "已生成 REDIS_READER_PWD 并写入 .env"
+    fi
+
+    # 创建 writer 用户(允许 XADD/XREADGROUP/XACK/XLEN/XPENDING/XCLAIM/XTRIM/XINFO/XDEL,
+    # 仅 ~tgjiema:* 前缀 key;禁用危险命令 -@all)
+    if redis-cli ACL SETUSER tgjiema_writer on >"${writer_pwd}" ~tgjiema:* \
+            +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XTRIM +XINFO +XDEL -@all 2>/dev/null; then
+        success "Redis ACL 用户 tgjiema_writer 已创建(写权限)"
+    else
+        warn "Redis ACL SETUSER tgjiema_writer 失败(可能 Redis 未启用 ACL,≥6.0 支持)"
+    fi
+
+    # 创建 reader 用户(只读消费组)
+    if redis-cli ACL SETUSER tgjiema_reader on >"${reader_pwd}" ~tgjiema:* \
+            +XREADGROUP +XINFO +XLEN +XPENDING -@all 2>/dev/null; then
+        success "Redis ACL 用户 tgjiema_reader 已创建(只读)"
+    else
+        warn "Redis ACL SETUSER tgjiema_reader 失败"
+    fi
+
+    # 禁用 default 无密码用户(防止无密码裸登录)
+    # 注意: 禁用前必须确认业务已切换到 ACL 用户连接,否则会丢失连接
+    if redis-cli ACL SETUSER default off 2>/dev/null; then
+        success "Redis default 用户已禁用(防止无密码登录)"
+    else
+        warn "Redis 禁用 default 失败(可手动: redis-cli ACL SETUSER default off)"
+    fi
+
+    # 持久化 ACL 到 /etc/redis/users.acl(重启不丢)
+    local acl_file="/etc/redis/users.acl"
+    redis-cli ACL SAVE 2>/dev/null && success "Redis ACL 已持久化"
+
+    info "  R37 P2-3: 业务 Bot 应使用 redis://tgjiema_writer:<pwd>@127.0.0.1:6379/0 连接"
+    info "  db_writer 用 writer,其它 Bot 用 reader"
+}
+init_redis_acl
+
 success "系统依赖安装完成"
 
 # ──────────────────────────────────────────────
@@ -409,9 +471,27 @@ TimeoutStopSec=${stop_timeout}
 LimitNOFILE=65536
 LimitNPROC=4096
 
-# 安全加固
+# R37 P2-2: 最小权限沙箱(NoNewPrivileges + ProtectSystem + CapabilityBoundingSet 等)
+# 参考文档: docs/least-privilege.md
 NoNewPrivileges=true
 PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${DEPLOY_DIR}/data ${DEPLOY_DIR}/logs
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+PrivateDevices=true
 
 [Install]
 WantedBy=multi-user.target
@@ -455,6 +535,25 @@ SyslogIdentifier=${SVC_PREFIX}-migration
 # 安全加固
 NoNewPrivileges=true
 PrivateTmp=true
+
+# R37 P2-2: migration oneshot 也加最小权限沙箱
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=${DEPLOY_DIR}/data ${DEPLOY_DIR}/logs
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+PrivateDevices=true
 
 [Install]
 WantedBy=multi-user.target

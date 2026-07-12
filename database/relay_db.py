@@ -98,6 +98,24 @@ def decrypt(cipher_text: str) -> str:
 DB_PATH = Path(__file__).parent.parent / "data" / "relay_pool.db"
 
 
+# ──────────────────────────────────────────────
+# R37 P2-6: Relay spool 磁盘配额 / 高低水位
+# ──────────────────────────────────────────────
+# 高水位(80%): 触达后停止接收新 spool,只允许 INDEXED 清理
+# 低水位(60%): 清理足够后恢复接收
+# 配额 0 = 不限制(本地开发默认);生产环境应配置 RELAY_SPOOL_MAX_BYTES
+RELAY_SPOOL_HIGH_WATER_MARK = 0.80
+RELAY_SPOOL_LOW_WATER_MARK = 0.60
+# 从环境变量读取 spool 目录最大字节数(默认 5GB)
+_spool_max_bytes_env = os.getenv("RELAY_SPOOL_MAX_BYTES", str(5 * 1024 * 1024 * 1024))
+try:
+    RELAY_SPOOL_MAX_BYTES = int(_spool_max_bytes_env)
+except (TypeError, ValueError):
+    RELAY_SPOOL_MAX_BYTES = 5 * 1024 * 1024 * 1024
+# spool 临时文件目录(buffered_files 实际落盘位置)
+RELAY_SPOOL_DIR = Path(os.getenv("RELAY_SPOOL_DIR", str(DB_PATH.parent / "relay_spool_files")))
+
+
 async def _sync_relay_to_crdb(api_id: int, api_hash: str, phone: str):
     """异步同步中继账号到 CRDB（不阻塞主流程）。
     S-1: api_hash 在落云前加密，与本地 SQLite 保持一致的安全级别。
@@ -1101,6 +1119,136 @@ class RelayDB:
                 "acked_at": row[16],
             })
         return result
+
+    # ── R37 P2-6: Relay spool 磁盘配额 / 高低水位 ──
+
+    async def get_spool_disk_usage(self) -> dict:
+        """返回 spool 目录磁盘使用情况。
+
+        Returns:
+            {
+                "current_bytes": int,   # 当前 spool 目录字节数
+                "max_bytes": int,      # 配额上限
+                "usage_ratio": float,  # 当前 / 上限 (0.0-1.0+)
+                "high_water_exceeded": bool,  # 是否超过高水位(80%)
+                "low_water_recovered": bool,  # 是否回到低水位以下(60%)
+            }
+        """
+        current_bytes = 0
+        # 优先用 SUM(buffered_files) 估算(SQLite 角度),无记录时回退到 du 目录
+        try:
+            async with self._db.execute(
+                "SELECT buffered_files FROM relay_spool "
+                "WHERE status NOT IN ('ACKED', 'FAILED')"
+            ) as cursor:
+                rows = await cursor.fetchall()
+            for (bf_json,) in rows:
+                if bf_json:
+                    try:
+                        files = json.loads(bf_json)
+                        # 假设每个 buffered_file 路径指向一个实际文件,统计其大小
+                        for f in files:
+                            if isinstance(f, str):
+                                p = Path(f)
+                                if p.exists():
+                                    try:
+                                        current_bytes += p.stat().st_size
+                                    except OSError:
+                                        pass
+                            elif isinstance(f, dict) and "path" in f:
+                                p = Path(f["path"])
+                                if p.exists():
+                                    try:
+                                        current_bytes += p.stat().st_size
+                                    except OSError:
+                                        pass
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+        except Exception as e:
+            logger.debug(f"[RelayDB] get_spool_disk_usage SQL 异常(忽略): {e}")
+
+        # 补充: 扫描 spool 目录(防止有遗漏文件未在 DB 中记录)
+        try:
+            if RELAY_SPOOL_DIR.exists():
+                for p in RELAY_SPOOL_DIR.rglob("*"):
+                    if p.is_file():
+                        try:
+                            current_bytes += p.stat().st_size
+                        except OSError:
+                            pass
+        except Exception as e:
+            logger.debug(f"[RelayDB] 扫描 spool 目录异常: {e}")
+
+        max_bytes = RELAY_SPOOL_MAX_BYTES if RELAY_SPOOL_MAX_BYTES > 0 else 1
+        usage_ratio = current_bytes / max_bytes if max_bytes > 0 else 0.0
+        return {
+            "current_bytes": current_bytes,
+            "max_bytes": RELAY_SPOOL_MAX_BYTES,
+            "usage_ratio": usage_ratio,
+            "high_water_exceeded": usage_ratio >= RELAY_SPOOL_HIGH_WATER_MARK,
+            "low_water_recovered": usage_ratio <= RELAY_SPOOL_LOW_WATER_MARK,
+        }
+
+    async def should_accept_new_spool(self) -> bool:
+        """R37 P2-6: 检查是否可以接收新的 spool 任务。
+
+        - 高水位(80%)以上 → 拒绝新 spool,只允许 INDEXED 清理
+        - 否则 → 允许接收
+
+        Returns:
+            True = 可接收新 spool, False = 拒绝(已达高水位)
+        """
+        usage = await self.get_spool_disk_usage()
+        if usage["high_water_exceeded"]:
+            logger.warning(
+                f"[RelayDB] spool 磁盘已达高水位 "
+                f"(usage={usage['usage_ratio']:.2%}, "
+                f"current={usage['current_bytes']}B, "
+                f"max={usage['max_bytes']}B),拒绝新 spool"
+            )
+            return False
+        return True
+
+    async def cleanup_indexed_spools_only(self) -> int:
+        """R37 P2-6: 仅清理已 INDEXED 的 spool 临时文件。
+
+        严格策略: 未 INDEXED 的文件**禁止自动删除**,即使 TTL 过期也只置 FAILED,
+        保留临时文件供运维手动恢复。
+
+        返回清理的 spool 数量。
+        """
+        cleaned = 0
+        # 查询所有账号的 INDEXED 待清理 spool
+        async with self._db.execute(
+            "SELECT spool_id, relay_account_id, buffered_files "
+            "FROM relay_spool "
+            "WHERE status = 'INDEXED' AND acked_at IS NULL "
+            "ORDER BY updated_at LIMIT 100"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        for spool_id, account_id, bf_json in rows:
+            buffered_files = json.loads(bf_json) if bf_json else []
+            for f in buffered_files:
+                if isinstance(f, str):
+                    p = Path(f)
+                elif isinstance(f, dict) and "path" in f:
+                    p = Path(f["path"])
+                else:
+                    continue
+                try:
+                    if p.exists():
+                        p.unlink()
+                        logger.debug(f"[RelayDB] 已清理 INDEXED spool 文件: {p}")
+                except OSError as e:
+                    logger.warning(f"[RelayDB] 删除文件失败 {p}: {e}")
+            # 标记 spool 为 ACKED(清理完成)
+            await self.update_spool_status(spool_id, "ACKED", acked_at=time.time())
+            cleaned += 1
+
+        if cleaned > 0:
+            logger.info(f"[RelayDB] R37 P2-6: 清理 {cleaned} 条 INDEXED spool 临时文件")
+        return cleaned
 
 
 def date_today() -> str:

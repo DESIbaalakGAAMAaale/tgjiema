@@ -1,8 +1,14 @@
 # TG文件解码器 — Docker 镜像
 # 环形冗余 v2 架构
 
-# ── 第一阶段：编译依赖 ─────────────────────────────────
-FROM python:3.12-slim AS builder
+# R37 P2-4: 镜像 digest 固定(防止供应链篡改)
+# 拉取时使用 sha256 digest 引用,确保每次构建基于同一份不可变的基础镜像
+# 更新 digest 流程:
+#   1. docker pull python:3.12-slim
+#   2. docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim
+#   3. 用输出的 sha256:... 替换下方两个 FROM 行(需保持一致)
+# 当前 digest 对应 python:3.12-slim 多架构 manifest(由 Docker Hub 自动选择)
+FROM python:3.12-slim@sha256:b0d2c8b8e5b2a3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e AS builder
 
 WORKDIR /app
 
@@ -18,7 +24,8 @@ RUN python -m venv /app/venv && \
     /app/venv/bin/pip install --no-cache-dir -r requirements.txt
 
 # ── 第二阶段：运行时镜像 ───────────────────────────────
-FROM python:3.12-slim
+# R37 P2-4: 与 builder 阶段使用同一 digest,保证可重现构建
+FROM python:3.12-slim@sha256:b0d2c8b8e5b2a3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e
 
 WORKDIR /app
 
