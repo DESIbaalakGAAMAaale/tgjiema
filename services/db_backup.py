@@ -534,11 +534,15 @@ async def _run_backup_loop():
 
             # 更新 manifest 中的加密信息
             if enc_result["encrypted"]:
+                # R37 P1-6: manifest 记录 key_id(KEK 标识符,不可逆)
+                # 用于追溯使用哪个 KEK 加密,支持密钥轮转期间定位备份对应的 KEK
+                from services.backup_crypto import get_key_id
                 data["manifest"]["encryption"] = {
                     "encrypted": True,
                     "algorithm": enc_result["algorithm"],
                     "wrapped_dek": enc_result["wrapped_dek"],
                     "nonce": enc_result["nonce"],
+                    "key_id": enc_result.get("key_id") or get_key_id(),
                 }
                 # 重新序列化 manifest 部分(加密信息需要随 manifest 一起存储)
                 # 注意: ciphertext 已加密, manifest 单独存储

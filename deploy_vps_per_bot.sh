@@ -444,9 +444,9 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="SERVICE_ROLE=migration"
 EnvironmentFile=-${DEPLOY_DIR}/.env.shared
 EnvironmentFile=-${DEPLOY_DIR}/.env.secrets.migration
-# 调用 init_db() 完成 DDL: 创建表/索引/迁移 + 写入 ddl_version 到 SQLite 缓存
-# 业务 Bot 启动时 SQLite 缓存命中,跳过 DDL(不再触发 CRDB DDL 兜底查询)
-ExecStart=${DEPLOY_DIR}/venv/bin/python -c "import asyncio; from database import init_db, close_db; asyncio.run(init_db()); asyncio.run(close_db())"
+# R37 P1-8: 调用 migration_runner 执行 DDL(唯一允许的 DDL/TTL/版本写入入口)
+# 业务 Bot 调用 init_db() 仅做 runtime 连接,不执行 DDL/bootstrap
+ExecStart=${DEPLOY_DIR}/venv/bin/python -m services.migration_runner
 RemainAfterExit=yes
 StandardOutput=journal
 StandardError=journal

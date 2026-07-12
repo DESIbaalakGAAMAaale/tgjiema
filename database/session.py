@@ -303,7 +303,23 @@ class CockroachDBClient:
     def configure(self, url: str):
         self._url = url
 
-    async def connect(self):
+    async def connect_runtime_only(self):
+        """R37 P1-8: runtime_client 专用连接 — 只创建连接池 + 初始化 SQLite 缓存。
+
+        职责边界(P1-8 拆分):
+          - 不执行 DDL_STATEMENTS / MIGRATION_STATEMENTS(migration_runner 专属)
+          - 不执行 TTL 修改(migration_runner 专属)
+          - 不写入 ddl_version(migration_runner 专属)
+          - 不预填充 cells / 全表 bootstrap(bootstrap_runner 专属)
+
+        适用场景:
+          - 所有业务 Bot / crdb_sync / db_writer / admin / db_backup 的运行时连接
+          - migration_runner 调用此方法获取连接池后执行 DDL
+          - bootstrap_runner 调用此方法获取连接池后全量加载
+
+        若 DDL 未执行(migration 未运行),业务查询会失败 — 由部署流程保证
+        migration oneshot 先于业务 Bot 启动(systemd After= 依赖)。
+        """
         # R36 §6.4.1: min_size=0 允许空闲时关闭所有连接(不再强制 max(1, ...))
         # R36 §6.4.2: application_name 用于按服务追踪 RU 消耗
         from config import settings as _settings
@@ -340,167 +356,32 @@ class CockroachDBClient:
         await store.init()
         await load_cache_from_disk()
 
-        # ─── DDL 版本检查：优先用 SQLite 缓存，避免每次 init_db 查 CRDB ───
-        need_ddl = True
-        try:
-            # 优先级 1: SQLite 本地缓存（0 CRDB RU）
-            ddl_version = await store.get_kv("ddl_version")
-            if ddl_version == str(DDL_VERSION):
-                need_ddl = False
-            else:
-                logger.info(f"DDL 版本变更(SQLite): {ddl_version} → {DDL_VERSION}，执行升级")
-        except Exception as e:
-            logger.debug(f"[DB] DDL版本SQLite检查跳过: {e}")
+        logger.info(
+            f"[DB] R37 P1-8: runtime_client 已连接(role={role}, "
+            f"pool={min_size}-{max_size}, app_name={app_name})。"
+            f"不执行 DDL/bootstrap(由 migration_runner / bootstrap_runner 专属负责)。"
+        )
 
-        if need_ddl:
-            # 优先级 2: CRDB 兜底查询（仅 SQLite 无缓存时）
-            try:
-                current_version = await self._pool.fetchval(
-                    "SELECT config_value FROM rotation_config WHERE config_key = 'ddl_version'"
-                )
-                if current_version == str(DDL_VERSION):
-                    need_ddl = False
-                    # 回填 SQLite 缓存
-                    await store.set_kv("ddl_version", str(DDL_VERSION))
-                    logger.info(f"DDL 版本 {DDL_VERSION} 已是最新，跳过（CRDB 兜底）")
-                else:
-                    logger.info(f"DDL 版本变更(CRDB): {current_version} → {DDL_VERSION}，执行升级")
-            except Exception:
-                logger.info("首次运行或 rotation_config 表不存在，执行 DDL 初始化")
+    async def connect(self):
+        """R37 P1-8: 兼容旧调用方 — 等价于 connect_runtime_only()。
 
-        if need_ddl:
-            try:
-                for sql in DDL_STATEMENTS:
-                    try:
-                        await self.execute(sql)
-                    except Exception as e:
-                        logger.warning(f"[DB] DDL SQL 执行失败（可忽略）：{e}")
-                for sql in MIGRATION_STATEMENTS:
-                    try:
-                        await self.execute(sql)
-                    except Exception as e:
-                        err_msg = str(e).lower()
-                        # 只忽略"列已存在"或"关系已存在"错误，这些是预期的（因为没有 IF NOT EXISTS）
-                        if "already exists" in err_msg or "duplicate" in err_msg:
-                            logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略，已存在）：{sql[:60]}... → {e}")
-                        else:
-                            logger.error(f"[DB] 迁移 SQL 执行失败（严重）：{sql} → {e}")
-                            raise
-                # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
-                # 等待前面的 ADD COLUMN 等 schema change 完成，否则 CRDB 报
-                # "cannot modify TTL settings while another schema change is being processed"
-                await asyncio.sleep(3)
-                for ttl_sql in (
-                    "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
-                    "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
-                ):
-                    for attempt in range(3):
-                        try:
-                            await self.execute(ttl_sql)
-                            break
-                        except Exception as e:
-                            if "another schema change" in str(e).lower() and attempt < 2:
-                                logger.warning(f"[DB] TTL 设置等待 schema change 完成，重试 {attempt + 1}/3: {e}")
-                                await asyncio.sleep(5)
-                            else:
-                                logger.warning(f"[DB] TTL设置失败: {e}")
-                                break
-                await self.execute(
-                    "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
-                    str(DDL_VERSION),
-                )
-            except Exception:
-                logger.exception("[DB] DDL 迁移整体失败")
-                raise
-            # 写入 SQLite 缓存版本号（后续启动 0 CRDB RU）
-            await store.set_kv("ddl_version", str(DDL_VERSION))
-            logger.info(f"DDL 升级完成，版本 {DDL_VERSION}")
+        历史上 connect() 同时执行 DDL + bootstrap + runtime 连接,
+        违反 P1-8 职责拆分。现在 connect() 仅做 runtime 连接。
 
-        # ─── 启动时预填充 cells 快照到 SQLite ───
-        # 避免 Mon Bot 首次运行时回退到 CRDB（SELECT * FROM cells）
-        try:
-            cells = await store.get_all_cells_local()
-            if not cells:
-                snap_cells, _ = await store.load_cells_snapshot()
-                if snap_cells:
-                    await store.bulk_upsert_cells_local(snap_cells)
-                    cells = snap_cells
-            if not cells:
-                col = D1Collection("cells")
-                all_cells = await col.find({}, projection=[
-                    "slot_id", "channel_id", "status", "next_active_chat_id",
-                    "prev_slot_id", "account_name", "is_r100",
-                    "file_count", "rotation_started_at", "last_heartbeat",
-                ])
-                if all_cells:
-                    await store.bulk_upsert_cells_local(all_cells)
-                    logger.info(f"[DB] 预填充 cells 到本地 SQLite: {len(all_cells)} 条")
-        except Exception as e:
-            logger.debug(f"[DB] cells预填充SQLite失败: {e}")
+        若需在本地开发时自动执行 DDL + bootstrap(避免手动调用 migration),
+        设置环境变量 DB_AUTO_MIGRATE=true(init_db_legacy 会自动触发)。
+        """
+        await self.connect_runtime_only()
 
-        # ─── Phase 3: 全表缓存热路径到 SQLite（0 CRDB RU）─────
-        # 启动时从 CRDB 全量加载 users / codes / file_records / external_code_mapping
-        # 之后所有读操作走 SQLite，写操作双写+异步批量同步到 CRDB
-        try:
-            # 检查是否已经存在完整缓存（根据表行数判断）
-            from database.cache_store import get_cache_store
-            store = get_cache_store()
-            
-            # 1. file_records: 跳过如果已有（已bootstrap）
-            fr_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM file_records_local")
-            if fr_count[0][0] == 0:
-                fr_col = get_file_records_col()
-                all_fr = await fr_col.find({}, projection=[
-                    "file_code", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
-                    "file_types", "backup_channel_msg_ids", "batch_msg_ids", "batch_file_meta",
-                    "file_ids", "status", "request_count", "protect_content", "file_ttl_days",
-                    "note", "expire_time", "blocked_users", "create_time", "updated_at",
-                    "max_requests", "is_collection", "collection_codes",
-                ])
-                if all_fr:
-                    await store.bootstrap_file_records(all_fr)
-                    logger.info(f"[DB] 预填充 file_records 到本地 SQLite: {len(all_fr)} 条")
-            
-            # 2. codes: 跳过如果已有
-            codes_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM codes_local")
-            if codes_count[0][0] == 0:
-                codes_col = get_codes_col()
-                all_codes = await codes_col.find({}, projection=[
-                    "code", "file_record_code", "uploader_id", "file_types",
-                    "batch_msg_ids", "batch_file_meta", "primary_channel_id",
-                    "status", "created_at", "expire_time", "note",
-                ])
-                if all_codes:
-                    await store.bootstrap_codes(all_codes)
-                    logger.info(f"[DB] 预填充 codes 到本地 SQLite: {len(all_codes)} 条")
-            
-            # 3. users: 跳过如果已有
-            users_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM users_local")
-            if users_count[0][0] == 0:
-                users_col = get_users_col()
-                all_users = await users_col.find({}, projection=[
-                    "user_id", "username", "first_name", "membership_level",
-                    "daily_decode_quota", "quota_used_today", "quota_date",
-                    "can_upload", "external_decode_quota", "external_used_today",
-                    "external_quota_date", "is_banned", "created_at", "updated_at",
-                ])
-                if all_users:
-                    await store.bootstrap_users(all_users)
-                    logger.info(f"[DB] 预填充 users 到本地 SQLite: {len(all_users)} 条")
-            
-            # 4. external_code_mapping: 跳过如果已有
-            ec_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM external_code_mapping_local")
-            if ec_count[0][0] == 0:
-                ec_col = get_external_code_mapping_col()
-                all_ec = await ec_col.find({}, projection=[
-                    "external_code", "system_code", "bot_username", "created_at", "updated_at",
-                ])
-                if all_ec:
-                    await store.bootstrap_external_mappings(all_ec)
-                    logger.info(f"[DB] 预填充 external_code_mapping 到本地 SQLite: {len(all_ec)} 条")
-
-        except Exception as e:
-            logger.warning(f"[DB] 预填充热表到本地SQLite失败（可忽略）: {e}")
+        # R37 P1-8: 本地开发便利模式(DB_AUTO_MIGRATE=true 自动执行 DDL + bootstrap)
+        # 生产环境必须由 migration oneshot 服务显式调用,不依赖此分支
+        import os as _os_mod
+        if _os_mod.environ.get("DB_AUTO_MIGRATE", "").lower() in ("true", "1", "yes"):
+            logger.warning(
+                "[DB] R37 P1-8: DB_AUTO_MIGRATE=true,本地开发模式自动执行 "
+                "DDL + bootstrap(生产环境应通过 migration_runner 显式执行)"
+            )
+            await _legacy_run_ddl_and_bootstrap(self)
 
     async def close(self):
         if self._pool:
@@ -551,10 +432,230 @@ _client: CockroachDBClient = CockroachDBClient()
 _pending_sync_tasks: set[asyncio.Task] = set()
 
 
+async def _legacy_run_ddl_and_bootstrap(client: CockroachDBClient):
+    """R37 P1-8: 旧版 DDL + bootstrap 执行逻辑(仅 DB_AUTO_MIGRATE=true 时触发)。
+
+    本函数保留了历史上 connect() 中的 DDL + bootstrap 逻辑,
+    仅供本地开发便利模式使用,生产环境应通过 migration_runner + bootstrap_runner 显式调用。
+
+    包含:
+      1. DDL 版本检查(优先 SQLite kv_store,CRDB 兜底)
+      2. DDL_STATEMENTS 执行(CREATE TABLE / CREATE INDEX)
+      3. MIGRATION_STATEMENTS 执行(ALTER TABLE / DROP INDEX)
+      4. CRDB TTL 设置(decode_logs / jobs 100 年过期)
+      5. ddl_version 写入 CRDB rotation_config + SQLite kv_store
+      6. cells 预填充到 SQLite
+      7. 全表缓存 bootstrap(users / codes / file_records / external_code_mapping)
+    """
+    from .cache_store import get_cache_store
+    store = get_cache_store()
+
+    # ─── DDL 版本检查：优先用 SQLite 缓存，避免每次 init_db 查 CRDB ───
+    need_ddl = True
+    try:
+        # 优先级 1: SQLite 本地缓存（0 CRDB RU）
+        ddl_version = await store.get_kv("ddl_version")
+        if ddl_version == str(DDL_VERSION):
+            need_ddl = False
+        else:
+            logger.info(f"DDL 版本变更(SQLite): {ddl_version} → {DDL_VERSION}，执行升级")
+    except Exception as e:
+        logger.debug(f"[DB] DDL版本SQLite检查跳过: {e}")
+
+    if need_ddl:
+        # 优先级 2: CRDB 兜底查询（仅 SQLite 无缓存时）
+        try:
+            current_version = await client._pool.fetchval(
+                "SELECT config_value FROM rotation_config WHERE config_key = 'ddl_version'"
+            )
+            if current_version == str(DDL_VERSION):
+                need_ddl = False
+                # 回填 SQLite 缓存
+                await store.set_kv("ddl_version", str(DDL_VERSION))
+                logger.info(f"DDL 版本 {DDL_VERSION} 已是最新，跳过（CRDB 兜底）")
+            else:
+                logger.info(f"DDL 版本变更(CRDB): {current_version} → {DDL_VERSION}，执行升级")
+        except Exception:
+            logger.info("首次运行或 rotation_config 表不存在，执行 DDL 初始化")
+
+    if need_ddl:
+        try:
+            for sql in DDL_STATEMENTS:
+                try:
+                    await client.execute(sql)
+                except Exception as e:
+                    logger.warning(f"[DB] DDL SQL 执行失败（可忽略）：{e}")
+            for sql in MIGRATION_STATEMENTS:
+                try:
+                    await client.execute(sql)
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    # 只忽略"列已存在"或"关系已存在"错误，这些是预期的（因为没有 IF NOT EXISTS）
+                    if "already exists" in err_msg or "duplicate" in err_msg:
+                        logger.warning(f"[DB] 迁移 SQL 执行失败（可忽略，已存在）：{sql[:60]}... → {e}")
+                    else:
+                        logger.error(f"[DB] 迁移 SQL 执行失败（严重）：{sql} → {e}")
+                        raise
+            # ─── CRDB 行级 TTL 已废弃：用 SET @yearly + 100年过期 彻底禁用 ───
+            # 等待前面的 ADD COLUMN 等 schema change 完成，否则 CRDB 报
+            # "cannot modify TTL settings while another schema change is being processed"
+            await asyncio.sleep(3)
+            for ttl_sql in (
+                "ALTER TABLE decode_logs SET (ttl_expiration_expression = 'CAST(request_time AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
+                "ALTER TABLE jobs SET (ttl_expiration_expression = 'CAST(created_at AS TIMESTAMPTZ) + INTERVAL ''100 years''', ttl_job_cron = '@yearly')",
+            ):
+                for attempt in range(3):
+                    try:
+                        await client.execute(ttl_sql)
+                        break
+                    except Exception as e:
+                        if "another schema change" in str(e).lower() and attempt < 2:
+                            logger.warning(f"[DB] TTL 设置等待 schema change 完成，重试 {attempt + 1}/3: {e}")
+                            await asyncio.sleep(5)
+                        else:
+                            logger.warning(f"[DB] TTL设置失败: {e}")
+                            break
+            await client.execute(
+                "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
+                str(DDL_VERSION),
+            )
+        except Exception:
+            logger.exception("[DB] DDL 迁移整体失败")
+            raise
+        # 写入 SQLite 缓存版本号（后续启动 0 CRDB RU）
+        await store.set_kv("ddl_version", str(DDL_VERSION))
+        logger.info(f"DDL 升级完成，版本 {DDL_VERSION}")
+
+    # ─── 启动时预填充 cells 快照到 SQLite ───
+    # 避免 Mon Bot 首次运行时回退到 CRDB（SELECT * FROM cells）
+    try:
+        cells = await store.get_all_cells_local()
+        if not cells:
+            snap_cells, _ = await store.load_cells_snapshot()
+            if snap_cells:
+                await store.bulk_upsert_cells_local(snap_cells)
+                cells = snap_cells
+        if not cells:
+            col = D1Collection("cells")
+            all_cells = await col.find({}, projection=[
+                "slot_id", "channel_id", "status", "next_active_chat_id",
+                "prev_slot_id", "account_name", "is_r100",
+                "file_count", "rotation_started_at", "last_heartbeat",
+            ])
+            if all_cells:
+                await store.bulk_upsert_cells_local(all_cells)
+                logger.info(f"[DB] 预填充 cells 到本地 SQLite: {len(all_cells)} 条")
+    except Exception as e:
+        logger.debug(f"[DB] cells预填充SQLite失败: {e}")
+
+    # ─── Phase 3: 全表缓存热路径到 SQLite（0 CRDB RU）─────
+    # 启动时从 CRDB 全量加载 users / codes / file_records / external_code_mapping
+    # 之后所有读操作走 SQLite，写操作双写+异步批量同步到 CRDB
+    try:
+        # 检查是否已经存在完整缓存（根据表行数判断）
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+
+        # 1. file_records: 跳过如果已有（已bootstrap）
+        fr_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM file_records_local")
+        if fr_count[0][0] == 0:
+            fr_col = get_file_records_col()
+            all_fr = await fr_col.find({}, projection=[
+                "file_code", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
+                "file_types", "backup_channel_msg_ids", "batch_msg_ids", "batch_file_meta",
+                "file_ids", "status", "request_count", "protect_content", "file_ttl_days",
+                "note", "expire_time", "blocked_users", "create_time", "updated_at",
+                "max_requests", "is_collection", "collection_codes",
+            ])
+            if all_fr:
+                await store.bootstrap_file_records(all_fr)
+                logger.info(f"[DB] 预填充 file_records 到本地 SQLite: {len(all_fr)} 条")
+
+        # 2. codes: 跳过如果已有
+        codes_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM codes_local")
+        if codes_count[0][0] == 0:
+            codes_col = get_codes_col()
+            all_codes = await codes_col.find({}, projection=[
+                "code", "file_record_code", "uploader_id", "file_types",
+                "batch_msg_ids", "batch_file_meta", "primary_channel_id",
+                "status", "created_at", "expire_time", "note",
+            ])
+            if all_codes:
+                await store.bootstrap_codes(all_codes)
+                logger.info(f"[DB] 预填充 codes 到本地 SQLite: {len(all_codes)} 条")
+
+        # 3. users: 跳过如果已有
+        users_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM users_local")
+        if users_count[0][0] == 0:
+            users_col = get_users_col()
+            all_users = await users_col.find({}, projection=[
+                "user_id", "username", "first_name", "membership_level",
+                "daily_decode_quota", "quota_used_today", "quota_date",
+                "can_upload", "external_decode_quota", "external_used_today",
+                "external_quota_date", "is_banned", "created_at", "updated_at",
+            ])
+            if all_users:
+                await store.bootstrap_users(all_users)
+                logger.info(f"[DB] 预填充 users 到本地 SQLite: {len(all_users)} 条")
+
+        # 4. external_code_mapping: 跳过如果已有
+        ec_count = await store._db.execute_fetchall("SELECT COUNT(*) FROM external_code_mapping_local")
+        if ec_count[0][0] == 0:
+            ec_col = get_external_code_mapping_col()
+            all_ec = await ec_col.find({}, projection=[
+                "external_code", "system_code", "bot_username", "created_at", "updated_at",
+            ])
+            if all_ec:
+                await store.bootstrap_external_mappings(all_ec)
+                logger.info(f"[DB] 预填充 external_code_mapping 到本地 SQLite: {len(all_ec)} 条")
+
+    except Exception as e:
+        logger.warning(f"[DB] 预填充热表到本地SQLite失败（可忽略）: {e}")
+
+
 async def init_db():
+    """R37 P1-8: 初始化数据库(runtime_client 模式)。
+
+    本函数只做:
+      1. 配置 CRDB URL
+      2. 调用 connect_runtime_only() 创建连接池 + 初始化 SQLite 缓存
+
+    本函数不再做(P1-8 拆分):
+      - DDL / MIGRATION 执行(由 services.migration_runner 专属)
+      - TTL 修改(由 services.migration_runner 专属)
+      - ddl_version 写入(由 services.migration_runner 专属)
+      - cells / 全表 bootstrap(由 services.bootstrap_runner 专属)
+
+    本地开发模式:
+      设置 DB_AUTO_MIGRATE=true 环境变量,connect() 会自动调用
+      _legacy_run_ddl_and_bootstrap() 完成迁移和 bootstrap。
+
+    生产部署:
+      systemd migration oneshot 服务先执行 services.migration_runner.run_migration(),
+      (可选)bootstrap oneshot 服务执行 services.bootstrap_runner.run_bootstrap(),
+      然后业务 Bot 调用 init_db()(仅 runtime 连接)。
+    """
     from config import settings as _settings
     _client.configure(_settings.COCKROACHDB_URL)
     await _client.connect()
+
+
+async def init_db_with_migration():
+    """R37 P1-8: 迁移 + 初始化(本地开发便利函数)。
+
+    等价于:
+      1. await services.migration_runner.run_migration()
+      2. await services.bootstrap_runner.run_bootstrap()
+      3. await init_db()
+
+    本地开发可用此函数一次性完成所有初始化。
+    生产环境应通过独立服务显式调用各阶段。
+    """
+    from services.migration_runner import run_migration
+    from services.bootstrap_runner import run_bootstrap
+    await run_migration()
+    await run_bootstrap()
+    await init_db()
 
 
 async def close_db():

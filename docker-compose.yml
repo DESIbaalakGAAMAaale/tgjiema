@@ -42,7 +42,8 @@ services:
     volumes:
       - ./data:/app/data
       - ./config:/app/config
-    command: python -c "import asyncio; from database.session import init_db; asyncio.run(init_db())"
+    # R37 P1-8: 调用 migration_runner 执行 DDL(唯一允许的 DDL/TTL/版本写入入口)
+    command: python -m services.migration_runner
     depends_on:
       redis:
         condition: service_healthy
