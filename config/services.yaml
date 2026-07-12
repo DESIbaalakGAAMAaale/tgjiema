@@ -209,6 +209,25 @@ services:
     depends_on:
       - migration
 
+  # ── prometheus_exporter (指标导出,R38 P1-9) ──
+  - name: prometheus_exporter
+    description: "Prometheus 指标导出(独立 HTTP server,只读 SQLite)"
+    role: prometheus_exporter
+    timeout_stop_sec: 10
+    restart: always
+    restart_sec: 10
+    needs_redis: false
+    needs_crdb: false
+    secrets: []  # 无 secrets,只用 .env.shared
+    depends_on:
+      - migration
+    health_check:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; r=urllib.request.urlopen('http://localhost:9100/health'); exit(0 if r.status==200 else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
 # ── 共享基础设施服务(compose 专用,systemd 通过 apt 装原生包) ──
 infrastructure:
   redis:

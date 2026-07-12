@@ -8,8 +8,13 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
+    # ── R38 P1-4 / P2-2: 环境标识(production / development / staging) ──
+    # production: 强制备份加密 + 未知 SERVICE_ROLE fail-fast(ValueError)
+    # development(默认): 宽松校验,允许明文备份降级,未知 role 仅 warning
+    ENVIRONMENT: str = "development"
+
     # ── R35 P0-1: 服务角色(用于分服务校验 secrets) ──
-    # 取值: "up" / "idx" / "dsp" / "mon" / "admin_bot" / "admin" / "db_writer" / "db_backup" / ""
+    # 取值: "up" / "idx" / "dsp" / "mon" / "admin_bot" / "admin" / "db_writer" / ""
     # 空字符串(默认)→ 校验全部字段(向后兼容老部署模式)
     # 部署脚本通过 systemd Environment=SERVICE_ROLE=up 注入
     SERVICE_ROLE: str = ""
@@ -96,9 +101,13 @@ class Settings(BaseSettings):
     # R36 H7: 备份 AES-256-GCM 信封加密 KEK(base64, 32 字节)
     # 未配置时备份降级为明文(商用环境必须配置)
     BACKUP_KEK: str = ""
+    # R38 P1-4: 备份 KEK 文件路径(与 BACKUP_KEK 二选一,生产环境推荐用文件避免命令行泄漏)
+    # 优先级: BACKUP_KEK > BACKUP_KEK_FILE(直接值优先于文件路径)
+    BACKUP_KEK_FILE: str = ""
     # R37 P1-4: 备份强制加密开关
     # True(生产默认建议): KEK 不可用时停止备份任务并告警,绝不上传明文
     # False(本地开发): 允许明文降级(仅 warning)
+    # R38 P1-4: ENVIRONMENT=production 时此字段强制为 true(无视 .env 配置)
     BACKUP_ENCRYPTION_REQUIRED: bool = False
 
     ADMIN_WEB_PORT: int = 8080
@@ -318,7 +327,19 @@ class Settings(BaseSettings):
         不再强制所有服务都拥有全部 5 个 Bot Token + CRDB URL + Admin 凭证。
 
         SERVICE_ROLE 为空时(向后兼容)校验全部字段(老部署模式)。
+
+        R38 P1-4: ENVIRONMENT=production 时强制 BACKUP_ENCRYPTION_REQUIRED=true。
+        R38 P2-2: ENVIRONMENT=production 时未知 SERVICE_ROLE → raise ValueError(fail-fast)。
         """
+        # R38 P1-4: 生产环境强制加密(无视 .env 中的 false 配置)
+        if self.ENVIRONMENT == "production":
+            if not self.BACKUP_ENCRYPTION_REQUIRED:
+                logger.warning(
+                    "[Settings] R38 P1-4: ENVIRONMENT=production, "
+                    "强制 BACKUP_ENCRYPTION_REQUIRED=true(原值=false)"
+                )
+                self.BACKUP_ENCRYPTION_REQUIRED = True
+
         role = self.SERVICE_ROLE
 
         # 向后兼容: SERVICE_ROLE 为空时,校验全部字段(老部署模式)
@@ -339,13 +360,24 @@ class Settings(BaseSettings):
             "crdb_sync": self._validate_crdb_sync_fields,
             # R37 P1-8: migration 角色注册 validator(oneshot DDL 执行需要 CRDB URL)
             "migration": self._validate_migration_fields,
+            # R38 P1-9: prometheus_exporter 角色注册 validator(无 secrets 依赖)
+            "prometheus_exporter": self._validate_prometheus_exporter_fields,
         }
         validator = role_validators.get(role)
         if validator:
             validator()
-        # 未知 role 不校验(只记录警告)
+        # R38 P2-2: 未知 role 处理 — production fail-fast,其他环境仅 warning
         elif role:
-            logger.warning(f"[Settings] 未知 SERVICE_ROLE={role},跳过必填字段校验")
+            if self.ENVIRONMENT == "production":
+                raise ValueError(
+                    f"[Settings] R38 P2-2: 未知 SERVICE_ROLE={role} "
+                    f"(ENVIRONMENT=production, fail-fast)。"
+                    f"已知角色: {sorted(role_validators.keys())}"
+                )
+            logger.warning(
+                f"[Settings] R38 P2-2: 未知 SERVICE_ROLE={role},"
+                f"跳过必填字段校验(ENVIRONMENT={self.ENVIRONMENT},非 production 仅 warning)"
+            )
 
         return self
 
@@ -378,9 +410,8 @@ class Settings(BaseSettings):
         """Idx Bot 必填字段"""
         if not self.DECODER_BOT_TOKEN:
             raise ValueError("[Settings][idx] DECODER_BOT_TOKEN 未配置")
-        # Idx 需要 CRDB URL(读写 file_records/codes/jobs)
-        if not self.COCKROACHDB_URL:
-            raise ValueError("[Settings][idx] COCKROACHDB_URL 未配置")
+        # R38 P0-2: Idx 不直连 CRDB,通过 dirty_outbox + crdb_sync 间接同步。
+        # CRDB URL 不再注入 idx 服务(原 COCKROACHDB_URL 校验已删除)。
         # Idx Bot 使用 relay_db 加解密 API_HASH,需要 RELAY_ENCRYPTION_KEY
         self._validate_relay_key()
 
@@ -412,7 +443,12 @@ class Settings(BaseSettings):
         # db_writer 不需要任何 Bot Token、CRDB URL、Admin 凭证
 
     def _validate_backup_fields(self):
-        """DB Backup 必填字段"""
+        """DB Backup 必填字段
+
+        R38 P1-4: 接受 BACKUP_KEK 或 BACKUP_KEK_FILE 任一即可(不只检查 BACKUP_KEK);
+        生产环境(ENVIRONMENT=production)无 KEK 或 cryptography 时 raise ValueError
+        (非 sys.exit(0),让 Settings 加载失败阻止进程启动)。
+        """
         if not self.COCKROACHDB_URL:
             raise ValueError("[Settings][db_backup] COCKROACHDB_URL 未配置")
         if self.DB_BACKUP_ENABLED:
@@ -420,14 +456,42 @@ class Settings(BaseSettings):
                 raise ValueError("[Settings][db_backup] DB_BACKUP_ENABLED=true 但 R2_ACCESS_KEY_ID 未配置")
             if not self.R2_SECRET_ACCESS_KEY:
                 raise ValueError("[Settings][db_backup] DB_BACKUP_ENABLED=true 但 R2_SECRET_ACCESS_KEY 未配置")
-            # R37 P1-4: 生产强制加密检查
-            # 启用备份且 BACKUP_ENCRYPTION_REQUIRED=true 时,KEK 必须配置
-            if self.BACKUP_ENCRYPTION_REQUIRED and not self.BACKUP_KEK:
-                raise ValueError(
-                    "[Settings][db_backup] BACKUP_ENCRYPTION_REQUIRED=true 但 BACKUP_KEK 未配置"
-                    "(生产环境必须配置加密 KEK,否则不会启动备份服务)"
-                )
+            # R38 P1-4: 接受 BACKUP_KEK 或 BACKUP_KEK_FILE(任一即可)
+            has_kek_value = bool(self.BACKUP_KEK)
+            has_kek_file = bool(self.BACKUP_KEK_FILE)
+            # R37 P1-4 + R38 P1-4: 生产强制加密检查
+            # ENVIRONMENT=production 时 BACKUP_ENCRYPTION_REQUIRED 已被强制为 true(见 validate_required_fields)
+            if self.BACKUP_ENCRYPTION_REQUIRED:
+                if not has_kek_value and not has_kek_file:
+                    raise ValueError(
+                        "[Settings][db_backup] R38 P1-4: BACKUP_ENCRYPTION_REQUIRED=true "
+                        "但 BACKUP_KEK 和 BACKUP_KEK_FILE 均未配置"
+                        "(生产环境必须配置加密 KEK,否则不会启动备份服务)"
+                    )
+                # R38 P1-4: 校验 cryptography 可用(生产环境强制,不可降级)
+                try:
+                    import cryptography  # noqa: F401
+                except ImportError:
+                    raise ValueError(
+                        "[Settings][db_backup] R38 P1-4: BACKUP_ENCRYPTION_REQUIRED=true "
+                        "但 cryptography 库未安装(生产环境必须安装 cryptography,无法降级为明文备份)"
+                    )
+                # R38 P1-4: 若用 BACKUP_KEK_FILE,校验文件可读
+                if not has_kek_value and has_kek_file:
+                    import os
+                    if not os.path.exists(self.BACKUP_KEK_FILE):
+                        raise ValueError(
+                            f"[Settings][db_backup] R38 P1-4: BACKUP_KEK_FILE 指向的文件不存在: "
+                            f"{self.BACKUP_KEK_FILE}"
+                        )
         # db_backup 需要 CRDB URL 和 R2 凭证,但不需要 Bot Token
+
+    def _validate_prometheus_exporter_fields(self):
+        """R38 P1-9: prometheus_exporter 必填字段 — 无 secrets 依赖,
+        只读 SQLite cache_store / relay_pool 暴露 metrics。"""
+        # prometheus_exporter 不需要任何 secrets(无 Bot Token / CRDB / R2 / Admin 凭证)
+        # 仅依赖本地 SQLite 文件,故无必填字段校验
+        pass
 
     def _validate_crdb_sync_fields(self):
         """R37 P0-3: crdb_sync 必填字段 — 独占 CRDB 同步,需要 COCKROACHDB_URL"""

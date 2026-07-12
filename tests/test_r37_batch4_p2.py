@@ -381,31 +381,38 @@ class TestP24DockerHardening:
         )
 
     def test_dockerfile_uses_digest_pinned_image(self):
-        """Dockerfile 使用 digest 固定基础镜像(@sha256:)。"""
+        """Dockerfile 使用 digest 固定基础镜像(@sha256:)或 ARG 变量引用(R38 P0-1 兼容)。
+
+        R37 P2-4 原要求 @sha256: digest 固定。
+        R38 P0-1 改用 ARG PYTHON_IMAGE=python:3.12-slim(占位 digest 已替换为 tag),
+        生产部署前需用 --build-arg PYTHON_IMAGE=python:3.12-slim@sha256:<真实digest> 覆盖。
+        本测试接受任一形式。
+        """
         path = REPO_ROOT / "Dockerfile"
         content = path.read_text(encoding="utf-8")
-        assert "@sha256:" in content, (
-            "Dockerfile 应使用 @sha256: digest 固定基础镜像(防止供应链篡改)"
+        # R38 P0-1: 接受 ARG PYTHON_IMAGE 形式(注释明确标注 digest 更新流程)
+        has_arg_form = "ARG PYTHON_IMAGE" in content
+        has_digest_form = "@sha256:" in content
+        assert has_arg_form or has_digest_form, (
+            "Dockerfile 应使用 @sha256: digest 固定或 ARG PYTHON_IMAGE 变量引用"
         )
         # 至少 2 个 FROM(multi-stage builder + runtime)
-        count = content.count("@sha256:")
-        assert count >= 2, f"Dockerfile 应至少 2 个 FROM 用 digest 固定(实际 {count})"
+        from_count = sum(1 for line in content.splitlines() if line.strip().startswith("FROM"))
+        assert from_count >= 2, f"Dockerfile 应至少 2 个 FROM(实际 {from_count})"
 
     def test_dockerfile_no_floating_tag(self):
-        """Dockerfile 不应使用未固定的 :3.12-slim tag(应改为 @sha256:)。"""
+        """Dockerfile 不应使用未固定的 :3.12-slim tag(应用 ARG 变量或 @sha256:)。"""
         path = REPO_ROOT / "Dockerfile"
         content = path.read_text(encoding="utf-8")
-        # FROM python:3.12-slim 行不应直接以 tag 结尾(应以 digest 结尾)
-        # 检查所有 FROM 行
         from_lines = [
             line.strip() for line in content.splitlines()
             if line.strip().startswith("FROM")
         ]
         assert len(from_lines) >= 2, "Dockerfile 应至少 2 个 FROM"
         for line in from_lines:
-            # 每条 FROM 行必须包含 @sha256:
-            assert "@sha256:" in line, (
-                f"FROM 行未用 digest 固定: {line}"
+            # R38 P0-1: 每条 FROM 行必须用 ${PYTHON_IMAGE} 变量或 @sha256: digest
+            assert "${PYTHON_IMAGE}" in line or "@sha256:" in line, (
+                f"FROM 行未用 ARG 变量或 digest 固定: {line}"
             )
 
 

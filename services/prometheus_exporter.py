@@ -18,6 +18,17 @@ R37 P2-7: 运行时 Prometheus exporter 必须是真实代码(非文档)。
 - relay_spool_usage_ratio relay spool 使用率(0.0-1.0+)
 - relay_spool_high_water  relay spool 是否达高水位(0/1)
 
+R38 P2-7: 高基数 label 禁止规则
+  本 exporter 的所有指标均为 gauge 类型,不带高基数 label(如 user_id / file_code /
+  message_id / chat_id)。高基数 label 会导致 Prometheus 时间序列爆炸(TSDB 膨胀),
+  每个唯一 label 组合创建一条新的时间序列。
+  允许的低基数 label:
+    - status (relay_spool_status_count{status="..."} — 枚举值,通常 <20 种)
+  禁止的高基数 label(不可出现在任何指标中):
+    - user_id / chat_id / message_id / file_code / job_id / phone / token
+  如需按用户/文件维度排查,应通过结构化日志(loguru)或追踪系统(Jaeger)查询,
+  而非 Prometheus 指标 label。
+
 启动:
   python -m services.prometheus_exporter
   或:
@@ -137,9 +148,43 @@ def _get_relay_spool_disk_usage() -> int:
 
 # ── 指标采集 ────────────────────────────────────────────
 
+# R38 P2-7: 高基数 label 黑名单 — 不可出现在任何指标的 label 中
+# 这些 label 的值空间随用户/消息增长,会导致 Prometheus TSDB 时间序列爆炸
+_HIGH_CARDINALITY_LABELS = frozenset({
+    "user_id", "chat_id", "message_id", "file_code",
+    "job_id", "phone", "token", "spool_id", "msg_id",
+})
+
+
+def _check_no_high_cardinality_labels(metric_line: str) -> None:
+    """R38 P2-7: 检查指标行不含高基数 label。
+
+    在 collect_metrics() 输出前调用,发现违规 label 时记录警告(不阻断输出,
+    避免 exporter 不可用导致监控盲区),但会在日志中留下审计痕迹。
+
+    Args:
+        metric_line: 单行 Prometheus 指标文本(如 'relay_spool_status_count{status="RECEIVED"} 5')
+    """
+    # 提取 {...} 内的 label 部分
+    if "{" not in metric_line or "}" not in metric_line:
+        return
+    label_section = metric_line[metric_line.index("{") + 1: metric_line.index("}")]
+    for pair in label_section.split(","):
+        if "=" not in pair:
+            continue
+        label_name = pair.split("=")[0].strip()
+        if label_name in _HIGH_CARDINALITY_LABELS:
+            logger.warning(
+                f"[R38-P2-7] 检测到高基数 label '{label_name}' 在指标行: "
+                f"{metric_line[:80]}... — 高基数 label 会导致 TSDB 膨胀,应移除"
+            )
+
 
 def collect_metrics() -> str:
     """采集所有指标并格式化为 Prometheus text format。
+
+    R38 P2-7: 所有指标均不带高基数 label(user_id/file_code/message_id 等),
+    collect_metrics() 输出前会调用 _check_no_high_cardinality_labels() 审计。
 
     参考: https://prometheus.io/docs/instrumenting/exposition_formats/
     """
@@ -258,6 +303,11 @@ def collect_metrics() -> str:
     else:
         # 无数据时输出 0,保证指标存在(避免 Prometheus 误判服务不可用)
         lines.append('relay_spool_status_count{status="unknown"} 0')
+
+    # R38 P2-7: 输出前审计高基数 label(仅日志告警,不阻断输出)
+    for line in lines:
+        if not line.startswith("#"):
+            _check_no_high_cardinality_labels(line)
 
     return "\n".join(lines) + "\n"
 

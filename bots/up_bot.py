@@ -102,16 +102,17 @@ def _extract_file_unique_id(msg) -> str:
 # 这些函数将 _pending_upload_meta(内存)与 upload_sessions(SQLite 权威)双写,
 # 失败时仅记录日志,不影响主上传流程(渐进式接线)。
 
-async def _create_upload_session_for_upload(
+async def create_upload_session_strict(
     user_id: int,
     source_msg_ids: list | None = None,
     options: dict | None = None,
 ) -> str:
-    """创建上传会话(upload_sessions 表),返回 upload_id(UUID)。
+    """R38 P0-3: 严格创建上传会话(upload_sessions 表),返回 upload_id(UUID)。
 
-    失败时返回空串(主流程继续,upload_session 仅作为权威持久化层,
-    缺失不会阻塞上传,但会影响状态可观测性)。
+    失败时抛 DurabilityError,由调用方决定是否回滚主流程。
+    不返回空字符串(避免主流程误以为已创建会话而继续推进状态机)。
     """
+    from utils.exceptions import DurabilityError
     upload_id = str(uuid.uuid4())
     try:
         store = get_cache_store()
@@ -122,9 +123,29 @@ async def _create_upload_session_for_upload(
             trace_id=f"up_bot:{upload_id[:8]}",
         )
     except Exception as e:
-        logger.warning(f"[Up] 创建 upload_session 失败(不影响主流程): {e}")
-        return ""
+        # R38 P0-3: 创建失败抛 DurabilityError,不返回空串
+        raise DurabilityError(
+            f"create upload session returned false / failed: {e}"
+        ) from e
     return upload_id
+
+
+async def _create_upload_session_for_upload(
+    user_id: int,
+    source_msg_ids: list | None = None,
+    options: dict | None = None,
+) -> str:
+    """创建上传会话(upload_sessions 表),返回 upload_id(UUID)。
+
+    R38 P0-3: 改为调用 strict 版本(不捕获异常),让异常传播到上传主流程,
+    由主流程决定是否回滚。原版本捕获异常返回空串会导致后续状态机推进
+    失败但被静默吞掉,造成数据丢失。
+    """
+    return await create_upload_session_strict(
+        user_id,
+        source_msg_ids=source_msg_ids,
+        options=options,
+    )
 
 
 async def _transition_upload_session_safe(
@@ -150,19 +171,26 @@ async def _transition_upload_session_safe(
 async def _transition_upload_session_strict(
     upload_id: str, new_status: str, reason: str = "", **update_fields,
 ) -> None:
-    """R37 P1-3: 权威推进 upload_session 状态(失败抛 DurabilityError)。
+    """R37 P1-3 / R38 P0-3: 权威推进 upload_session 状态(失败抛 DurabilityError)。
 
     与 _safe 版本的区别: 异常向上传播,由调用方决定是否中断主流程。
     用于权威状态写入(如 MANIFEST_PENDING → READY 等关键状态迁移)。
+
+    R38 P0-3: upload_id 为空抛 DurabilityError(原版本静默 return 会导致
+    会话从未创建却被视为已推进,掩盖上游 create_upload_session 失败)。
     """
+    from utils.exceptions import DurabilityError
     if not upload_id:
-        return
+        # R38 P0-3: upload_id 为空抛 DurabilityError,不再静默 return
+        raise DurabilityError(
+            f"upload_session 状态推进失败: missing upload_id "
+            f"(target_status={new_status})"
+        )
     try:
         await get_cache_store().transition_upload_session(
             upload_id, new_status, reason=reason, **update_fields,
         )
     except Exception as e:
-        from utils.exceptions import DurabilityError
         raise DurabilityError(
             f"upload_session 状态推进失败 upload_id={upload_id} "
             f"-> {new_status}: {e}"
@@ -204,14 +232,22 @@ async def _create_outbox_entry_strict(
     file_meta: list | None = None, event_type: str = "REGISTER_MANIFEST",
     protect: int = 0,
 ) -> None:
-    """R37 P1-3: 权威创建 upload_outbox 条目(失败抛 DurabilityError)。
+    """R37 P1-3 / R38 P0-3: 权威创建 upload_outbox 条目(失败抛 DurabilityError)。
 
     用于权威状态写入(REGISTER_MANIFEST / ARCHIVE_R100 等业务事件)。
     outbox 条目缺失会导致 OutboxWorker 无法消费该事件,造成永久数据丢失
     (如 manifest 未登记 → 文件已复制但无法被 Resolver 找到)。
+
+    R38 P0-3: upload_id 为空抛 DurabilityError("missing upload_id"),
+    不再静默 return(原版本会让文件已复制但 manifest 未登记的 silent 数据丢失)。
+    store 返回 False 抛 DurabilityError("create outbox returned false")。
     """
+    from utils.exceptions import DurabilityError
     if not upload_id:
-        return
+        # R38 P0-3: upload_id 为空抛 DurabilityError("missing upload_id")
+        raise DurabilityError(
+            f"missing upload_id (event={event_type}, outbox_id={outbox_id})"
+        )
     try:
         await get_cache_store().create_outbox_entry(
             outbox_id, upload_id, "", user_id, channel_id,
@@ -222,9 +258,10 @@ async def _create_outbox_entry_strict(
             event_type=event_type,
         )
     except Exception as e:
-        from utils.exceptions import DurabilityError
+        # R38 P0-3: store 返回 False / 抛异常 → DurabilityError("create outbox returned false")
         raise DurabilityError(
-            f"创建 outbox 条目失败 upload_id={upload_id} event={event_type}: {e}"
+            f"create outbox returned false: upload_id={upload_id} "
+            f"event={event_type}: {e}"
         ) from e
 
 

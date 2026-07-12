@@ -292,6 +292,8 @@ split_env_per_service() {
         [db_writer]=""  # 无 secrets,只用 REDIS_URL(来自 .env.shared)
         # R36 §6.3: crdb_sync 需要连接 CRDB
         [crdb_sync]="COCKROACHDB_URL"
+        # R38 P1-9: prometheus_exporter 无 secrets
+        [prometheus_exporter]=""
     )
 
     # 共享变量(所有服务都需要,写入 .env.shared)
@@ -393,6 +395,8 @@ SERVICES=(
     "db_writer:数据库写入:40:on-failure:10"
     # R36 §6.3: 单一 crdb_sync 服务(独占 CRDB 同步事实源)
     "crdb_sync:CRDB同步服务:40:on-failure:10"
+    # R38 P1-9: prometheus exporter(metrics 暴露)
+    "prometheus_exporter:Prometheus exporter:15:always:10"
 )
 
 # 生成 systemd 模板函数
@@ -513,7 +517,7 @@ cat > "/etc/systemd/system/${SVC_PREFIX}-migration.service" << EOF
 [Unit]
 Description=TG文件解码器 — DDL 迁移(oneshot)
 After=network.target
-Before=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service ${SVC_PREFIX}-crdb_sync.service
+Before=${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service ${SVC_PREFIX}-crdb_sync.service ${SVC_PREFIX}-prometheus_exporter.service
 PartOf=${SVC_PREFIX}.target
 
 [Service]
@@ -581,7 +585,7 @@ info "创建聚合 target..."
 cat > "/etc/systemd/system/${SVC_PREFIX}.target" << EOF
 [Unit]
 Description=TG文件解码器 — 全部服务
-Wants=${SVC_PREFIX}-migration.service ${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service ${SVC_PREFIX}-crdb_sync.service
+Wants=${SVC_PREFIX}-migration.service ${SVC_PREFIX}-up.service ${SVC_PREFIX}-idx.service ${SVC_PREFIX}-dsp.service ${SVC_PREFIX}-mon.service ${SVC_PREFIX}-admin_bot.service ${SVC_PREFIX}-admin.service ${SVC_PREFIX}-db_backup.service ${SVC_PREFIX}-db_writer.service ${SVC_PREFIX}-crdb_sync.service ${SVC_PREFIX}-prometheus_exporter.service
 After=network.target
 
 [Install]

@@ -332,11 +332,15 @@ async def _compute_watermark(all_tables: dict) -> str:
 
 
 async def backup_all_tables(watermark: str | None = None, backup_type: str = "full") -> dict:
-    """备份所有核心表(按 source 分组,R35 P1-5/P1-7, R36 H7 增量)。
+    """备份所有核心表(按 source 分组,R35 P1-5/P1-7, R36 H7 增量, R38 P1-5 顺序修正)。
 
     R35 P1-5: 按 source 分组执行备份
     R35 P1-7: 生成 bundle manifest
     R36 H7: 支持 watermark 增量备份(仅备份 updated_at > watermark 的行)
+    R38 P1-5: 修正 manifest/checksum 顺序 —
+      采集 → 脱敏 → 序列化 plaintext → 生成最终 manifest(含 checksum)→
+      返回 backup_data(由调用方加密 + 上传 manifest)
+      原 R35 实现 manifest 在脱敏前构建,导致 checksum 不匹配脱敏后数据。
 
     Args:
         watermark: 上次备份的 watermark(增量模式),None 表示全量
@@ -391,16 +395,18 @@ async def backup_all_tables(watermark: str | None = None, backup_type: str = "fu
         "tables": all_tables,
     }
 
-    # R35 P1-7 + R36 H7: 构建 bundle manifest(含 backup_type/watermark)
-    tables_content = json.dumps(all_tables, default=str, ensure_ascii=False).encode("utf-8")
-    manifest = _build_bundle_manifest(
-        backup_data, tables_content, start_time, end_time,
-        backup_type=backup_type,
-        watermark=current_watermark,
-        prev_watermark=watermark,
-    )
-    backup_data["manifest"] = manifest
-
+    # R38 P1-5: 顺序修正 — 脱敏在 manifest 构建之前
+    # 原 R35 实现在此处直接构建 manifest(checksum 基于未脱敏的 tables_content),
+    # 然后 _run_backup_loop() 再调 _redact_secrets(),导致 checksum 与实际 plaintext 不匹配。
+    # 新顺序:此处返回未带 manifest 的 backup_data,
+    # 由 _run_backup_loop() 完成:脱敏 → 序列化 → checksum → manifest → 加密 → 上传
+    backup_data["_r38_p1_5_metadata"] = {
+        "start_time": start_time,
+        "end_time": end_time,
+        "backup_type": backup_type,
+        "watermark": current_watermark,
+        "prev_watermark": watermark,
+    }
     return backup_data
 
 
@@ -524,42 +530,64 @@ async def _run_backup_loop():
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             key = f"db_backup/db_backup_{timestamp}_{backup_type}.json"
             data = await backup_all_tables(watermark=watermark, backup_type=backup_type)
-            # N-M9: 脱敏备份数据中的敏感字段
+
+            # R38 P1-5: 顺序修正 — 采集 → 脱敏 → 序列化 plaintext → checksum → manifest → 加密 → 上传
+            # 原 R35 实现的 manifest 在 backup_all_tables 内构建(checksum 基于未脱敏数据),
+            # 然后 _run_backup_loop 才调 _redact_secrets,导致 checksum 与实际 plaintext 不匹配。
+            # 新顺序:1) 提取 metadata(不写入 payload) 2) 脱敏 3) 序列化 4) manifest(含 checksum)
+            #         5) 加密 6) manifest envelope 补充加密元信息 7) 原子上传
+            r38_metadata = data.pop("_r38_p1_5_metadata", {})
+
+            # N-M9 + R38 P1-5: 脱敏备份数据中的敏感字段(在序列化和 checksum 之前)
             data = _redact_secrets(data)
 
-            # R36 H7: 序列化 + 加密
+            # R38 P1-5: 序列化 plaintext(checksum 基于此脱敏后的数据)
             plaintext = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
+
+            # R38 P1-5: 生成最终 manifest(checksum 基于已脱敏的 plaintext)
+            # manifest 含 key_id 标识(不含 wrapped_dek/nonce 明文,这些放 envelope 字段)
+            manifest = _build_bundle_manifest(
+                backup_data=data,
+                content=plaintext,
+                start_time=r38_metadata.get("start_time", datetime.now(timezone.utc)),
+                end_time=r38_metadata.get("end_time", datetime.now(timezone.utc)),
+                backup_type=r38_metadata.get("backup_type", backup_type),
+                watermark=r38_metadata.get("watermark"),
+                prev_watermark=r38_metadata.get("prev_watermark"),
+            )
+
+            # R36 H7 + R38 P1-5: 加密 plaintext
             enc_result = encrypt_payload(plaintext)
             upload_content = enc_result["ciphertext"]
 
-            # 更新 manifest 中的加密信息
+            # R38 P1-5: 将加密元信息写入 manifest envelope(含 wrapped_dek/nonce/key_id)
             if enc_result["encrypted"]:
                 # R37 P1-6: manifest 记录 key_id(KEK 标识符,不可逆)
-                # 用于追溯使用哪个 KEK 加密,支持密钥轮转期间定位备份对应的 KEK
                 from services.backup_crypto import get_key_id
-                data["manifest"]["encryption"] = {
+                manifest["encryption"] = {
                     "encrypted": True,
                     "algorithm": enc_result["algorithm"],
                     "wrapped_dek": enc_result["wrapped_dek"],
                     "nonce": enc_result["nonce"],
                     "key_id": enc_result.get("key_id") or get_key_id(),
                 }
-                # 重新序列化 manifest 部分(加密信息需要随 manifest 一起存储)
-                # 注意: ciphertext 已加密, manifest 单独存储
-                manifest_content = json.dumps(data["manifest"], default=str, ensure_ascii=False).encode("utf-8")
-                await r2_storage.upload(
-                    f"db_backup/manifest_{timestamp}_{backup_type}.json",
-                    manifest_content,
-                    "application/json",
-                )
             else:
-                # 未加密:manifest 随 backup 一起存储(向后兼容)
-                pass
+                manifest["encryption"] = {"encrypted": False, "algorithm": "none"}
 
-            await r2_storage.upload(key, upload_content, "application/octet-stream" if enc_result["encrypted"] else "application/json")
+            # R38 P1-5: 原子上传 — manifest 单独存储,ciphertext 单独存储
+            manifest_content = json.dumps(manifest, default=str, ensure_ascii=False).encode("utf-8")
+            await r2_storage.upload(
+                f"db_backup/manifest_{timestamp}_{backup_type}.json",
+                manifest_content,
+                "application/json",
+            )
+            await r2_storage.upload(
+                key, upload_content,
+                "application/octet-stream" if enc_result["encrypted"] else "application/json",
+            )
+
             total_rows = sum(len(v) for v in data["tables"].values())
-            # R35 P1-7 + R36 H7: 日志中包含 bundle manifest 摘要
-            manifest = data.get("manifest", {})
+            # R35 P1-7 + R36 H7 + R38 P1-5: 日志中包含 bundle manifest 摘要
             logger.info(
                 f"数据库已备份到 R2: {key} ({len(upload_content)} 字节, "
                 f"{len(data['tables'])} 表, {total_rows} 行, "

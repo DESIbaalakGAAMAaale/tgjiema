@@ -191,7 +191,20 @@ class TestCrdbSyncService:
             if sleep_count >= 2:
                 raise asyncio.CancelledError()
 
-        with patch.object(svc.asyncio, "sleep", mock_sleep):
+        # R38 P0-4: _sync_loop 现在每批前调用 _renew_leader_lease()(async,返回 bool)
+        # 还会调用 _close_crdb_only / _acquire_leader_lease 等 R38 新增函数,
+        # 全部 patch 成 no-op 协程,让 _sync_loop 顺利走到 sync_func 调用
+        async def mock_true():
+            return True
+
+        async def mock_noop():
+            return None
+
+        with patch.object(svc.asyncio, "sleep", mock_sleep), \
+             patch.object(svc, "_renew_leader_lease", mock_true), \
+             patch.object(svc, "_acquire_leader_lease", mock_true), \
+             patch.object(svc, "_close_crdb_only", mock_noop), \
+             patch.object(svc, "_lazy_connect_crdb", mock_noop):
             try:
                 await svc._sync_loop("test", mock_sync, mock_get_dirty, None)
             except asyncio.CancelledError:

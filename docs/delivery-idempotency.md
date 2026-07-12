@@ -204,3 +204,64 @@ except Exception:
 - `storage/delivery_resolver.py` — `compute_delivery_token()` + `is_delivery_already_done()`
 - `database/cache_store.py` — `delivery_receipts.delivery_token` 列 + `is_delivery_already_done()` 方法
 - `bots/dsp_bot.py` — 投递流程调用方
+
+---
+
+## 8. R38 P2-5: Effectively-Once SLO 标注
+
+### 8.1 SLO 定义
+
+投递系统达到 **effectively-once** 语义,SLI/SLO 如下:
+
+| 指标 | SLI 定义 | SLO 目标 | 测量窗口 |
+| ---- | ------- | -------- | -------- |
+| 重复投递率 | `duplicate_delivery_count / total_delivery_count` | < 0.01% (99.99% 不重复) | 30 天滚动 |
+| 漏投率 | `missing_delivery_count / total_delivery_count` | < 0.001% (99.999% 不漏投) | 30 天滚动 |
+| 投递延迟 P99 | `delivery_latency_p99` | < 5s | 5 分钟窗口 |
+| token 检查成功率 | `token_check_success_count / token_check_total` | > 99.9% | 1 小时窗口 |
+
+### 8.2 Effectively-Once 语义保证
+
+**"Effectively-once"** 而非 "exactly-once" 的原因:
+
+- Telegram Bot API 的 `copy_message` 是外部副作用,不可回滚
+- 网络超时/进程崩溃可能导致"已发但未记录 receipt",重试时会重复发送
+- 严格 exactly-once 需要两阶段提交(2PC),Telegram API 不支持
+
+**保证机制**(四层防线):
+
+1. **投递前检查** — `is_delivery_already_done(token)` 拦截 99%+ 的重复
+2. **投递后记录** — `upsert_delivery_receipt(token)` 持久化已投递状态
+3. **重复检测** — 同一 token 出现多条 receipt 时自动告警
+4. **自动撤回** — 检测到重复后 `bot.delete_message()` 撤回多余消息(48h 内)
+
+### 8.3 降级场景
+
+| 场景 | 行为 | SLO 影响 |
+| ---- | ---- | -------- |
+| token 检查网络异常 | 保守投递(宁可重复不漏投) | 重复率可能短暂升高,撤回流程兜底 |
+| receipt 写入失败 | 投递已成功但未记录,重试时会重复 | 重复率升高,撤回流程兜底 |
+| 撤回失败(超 48h) | 用户收到重复消息 + 道歉消息 | 用户体验降级,触发运维告警 |
+| db_writer 崩溃 | Redis Stream PEL 未 ACK,重放后 token 检查拦截 | 无 SLO 影响(effectively-once 生效) |
+
+### 8.4 监控指标(Prometheus)
+
+```prometheus
+# 重复投递计数(应接近 0)
+duplicate_delivery_count_total
+
+# 投递总量(用于计算重复率)
+delivery_total_total
+
+# token 检查失败计数
+delivery_token_check_fail_total
+
+# 投递延迟分布(histogram)
+delivery_latency_seconds_bucket{le="1"}
+delivery_latency_seconds_bucket{le="5"}
+delivery_latency_seconds_bucket{le="10"}
+```
+
+告警规则:
+- `rate(duplicate_delivery_count_total[1h]) > 0` → 立即告警(重复投递发生)
+- `rate(delivery_token_check_fail_total[5m]) / rate(delivery_total_total[5m]) > 0.01` → token 检查失败率告警

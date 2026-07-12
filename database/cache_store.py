@@ -309,9 +309,17 @@ class CacheStore:
                 file_count INTEGER DEFAULT 0,
                 rotation_started_at TEXT,
                 updated_at REAL NOT NULL,
+                deleted_at TEXT,
                 crdb_synced INTEGER DEFAULT 1
             )"""
         )
+        # R38 P1-3: cells_local 补 deleted_at 列(tombstone soft-delete)
+        try:
+            await self._db.execute(
+                "ALTER TABLE cells_local ADD COLUMN deleted_at TEXT"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] cells_local ADD deleted_at (幂等,可忽略): {e}")
         # PRE-04 / PRE-01: 为已存在的数据库补字段（CRDB/SQLite 不支持 ADD COLUMN IF NOT EXISTS，用 try-except 兼容）
         for _col_ddl in [
             "ALTER TABLE cells_local ADD COLUMN prev_slot_id TEXT",
@@ -429,9 +437,17 @@ class CacheStore:
                 max_requests         INTEGER DEFAULT 0,
                 is_collection        INTEGER DEFAULT 0,
                 collection_codes     TEXT DEFAULT '[]',
+                deleted_at           TEXT,
                 crdb_synced          INTEGER DEFAULT 1
             )"""
         )
+        # R38 P1-3: 为已存在的 file_records_local 补 deleted_at 列(tombstone soft-delete)
+        try:
+            await self._db.execute(
+                "ALTER TABLE file_records_local ADD COLUMN deleted_at TEXT"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] file_records_local ADD deleted_at (幂等,可忽略): {e}")
         # 为已存在的 file_records_local 补字段（SQLite 不支持 ADD COLUMN IF NOT EXISTS，用 try-except 兼容）
         try:
             await self._db.execute("ALTER TABLE file_records_local ADD COLUMN max_requests INTEGER DEFAULT 0")
@@ -459,9 +475,17 @@ class CacheStore:
                 created_at           TEXT,
                 expire_time          TEXT,
                 note                 TEXT DEFAULT '',
+                deleted_at           TEXT,
                 crdb_synced          INTEGER DEFAULT 1
             )"""
         )
+        # R38 P1-3: codes_local 补 deleted_at 列(tombstone soft-delete)
+        try:
+            await self._db.execute(
+                "ALTER TABLE codes_local ADD COLUMN deleted_at TEXT"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] codes_local ADD deleted_at (幂等,可忽略): {e}")
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS users_local (
                 user_id              BIGINT PRIMARY KEY,
@@ -478,9 +502,17 @@ class CacheStore:
                 is_banned            INTEGER DEFAULT 0,
                 created_at           TEXT,
                 updated_at           TEXT,
+                deleted_at           TEXT,
                 crdb_synced          INTEGER DEFAULT 1
             )"""
         )
+        # R38 P1-3: users_local 补 deleted_at 列(tombstone soft-delete)
+        try:
+            await self._db.execute(
+                "ALTER TABLE users_local ADD COLUMN deleted_at TEXT"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] users_local ADD deleted_at (幂等,可忽略): {e}")
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS external_code_mapping_local (
                 external_code        TEXT PRIMARY KEY,
@@ -488,9 +520,17 @@ class CacheStore:
                 bot_username         TEXT,
                 created_at           TEXT,
                 updated_at           TEXT,
+                deleted_at           TEXT,
                 crdb_synced          INTEGER DEFAULT 1
             )"""
         )
+        # R38 P1-3: external_code_mapping_local 补 deleted_at 列(tombstone soft-delete)
+        try:
+            await self._db.execute(
+                "ALTER TABLE external_code_mapping_local ADD COLUMN deleted_at TEXT"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] external_code_mapping_local ADD deleted_at (幂等,可忽略): {e}")
         # R33: Writer 幂等表 — 每条消息的 message_id 记录在此表,
         # db_writer 崩溃恢复后通过此表跳过已处理的消息,实现 exactly-once
         await self._db.execute(
@@ -678,11 +718,135 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_replication_tasks_group ON replication_tasks(group_id)"
         )
 
+        # ─── R38 P1-2: 统一 dirty_outbox,所有 Bot 只写本地事务,
+        # crdb_sync 批量 UPSERT/tombstone。替代分散的 *_local.crdb_synced=0 标记模式。 ───
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS dirty_outbox (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name  TEXT NOT NULL,
+                pk          TEXT NOT NULL,
+                version     INTEGER DEFAULT 0,
+                operation   TEXT DEFAULT 'upsert',
+                payload     TEXT,
+                created_at  TEXT,
+                processed   INTEGER DEFAULT 0
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
+        )
+
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
         _code_change_buffer.set_db(self._db)
         logger.debug(f"[CacheStore] 初始化完成: {DB_PATH}")
+
+    # ─── R38 P1-2: dirty_outbox 统一事务发件箱方法 ───
+    # 所有 Bot 只写本地 SQLite 事务后,调用 add_dirty_outbox() 记录变更,
+    # crdb_sync 通过 get_dirty_outbox_batch() 批量拉取并 UPSERT/tombstone 到 CRDB,
+    # 处理完成后 mark_dirty_processed() 标记已处理。
+    async def add_dirty_outbox(
+        self, table_name: str, pk: str, operation: str = "upsert",
+        payload: str | None = None, version: int = 0,
+    ) -> int:
+        """R38 P1-2: 写入 dirty_outbox 一条变更记录。
+
+        Args:
+            table_name: 受影响表名(如 file_records_local / codes_local)
+            pk: 行主键值(字符串)
+            operation: 'upsert'(默认) 或 'tombstone'(软删除)
+            payload: 可选 JSON 序列化后的载荷(行快照或变更字段)
+            version: 单调递增版本号(用于 CRDB UPSERT 条件)
+
+        Returns:
+            新插入行 id;失败返回 0
+        """
+        if not self._db:
+            return 0
+        try:
+            cursor = await self._db.execute(
+                """INSERT INTO dirty_outbox
+                   (table_name, pk, version, operation, payload, created_at, processed)
+                   VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                (
+                    table_name, pk, version, operation, payload,
+                    datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
+                ),
+            )
+            await self._db.commit()
+            return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+        except Exception as e:
+            logger.warning(f"[CacheStore] add_dirty_outbox 失败: {e}")
+            return 0
+
+    async def get_dirty_outbox_batch(self, limit: int = 100) -> list[dict]:
+        """R38 P1-2: 拉取一批未处理的 dirty_outbox 记录(processed=0)。
+
+        Args:
+            limit: 单批最大条数
+
+        Returns:
+            [{id, table_name, pk, version, operation, payload, created_at}, ...]
+        """
+        if not self._db:
+            return []
+        try:
+            cursor = await self._db.execute(
+                """SELECT id, table_name, pk, version, operation, payload, created_at
+                   FROM dirty_outbox WHERE processed = 0
+                   ORDER BY id ASC LIMIT ?""",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": r[0], "table_name": r[1], "pk": r[2],
+                    "version": r[3], "operation": r[4],
+                    "payload": r[5], "created_at": r[6],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_dirty_outbox_batch 失败: {e}")
+            return []
+
+    async def mark_dirty_processed(self, ids: list[int]) -> int:
+        """R38 P1-2: 标记 dirty_outbox 记录为已处理(processed=1)。
+
+        Args:
+            ids: 已处理成功的 dirty_outbox.id 列表
+
+        Returns:
+            实际标记的行数
+        """
+        if not self._db or not ids:
+            return 0
+        try:
+            placeholders = ",".join("?" * len(ids))
+            cursor = await self._db.execute(
+                f"UPDATE dirty_outbox SET processed = 1 WHERE id IN ({placeholders})",
+                ids,
+            )
+            await self._db.commit()
+            return cursor.rowcount if cursor else 0
+        except Exception as e:
+            logger.warning(f"[CacheStore] mark_dirty_processed 失败: {e}")
+            return 0
+
+    async def count_unprocessed_dirty_outbox(self) -> int:
+        """R38 P1-2: 统计未处理的 dirty_outbox 行数(供 crdb_sync 懒加载判断)。"""
+        if not self._db:
+            return 0
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM dirty_outbox WHERE processed = 0"
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row and row[0] else 0
+        except Exception as e:
+            logger.debug(f"[CacheStore] count_unprocessed_dirty_outbox 异常: {e}")
+            return 0
 
     async def dump(self, cache_entries: list[tuple[str, dict, float]]):
         """批量写入 [(key, data, timestamp), ...]"""
@@ -3605,10 +3769,13 @@ class CacheStore:
                     "UPDATE cells_local SET prev_slot_id = ?, updated_at = ? WHERE slot_id = ?",
                     (new_prev, time.time(), next_slot_id),
                 )
-            # 删除目标 cell
+            # R38 P1-3: 删除目标 cell 改为软删除(tombstone),保留行供 CRDB 同步
+            # 原 DELETE FROM 会让 crdb_sync 检测不到删除事件,
+            # 改为 UPDATE SET deleted_at, status='deleted' 让 crdb_sync 发送 tombstone
             await self._db.execute(
-                "DELETE FROM cells_local WHERE slot_id = ?",
-                (slot_id,),
+                "UPDATE cells_local SET deleted_at = ?, status = 'deleted', "
+                "crdb_synced = 0 WHERE slot_id = ?",
+                (datetime.datetime.now().isoformat(), slot_id),  # type: ignore[attr-defined]
             )
             if not self._in_writer_tx:
                 await self._db.commit()
@@ -4228,12 +4395,19 @@ class CacheStore:
         await self._db.commit()
 
     async def delete_file_record_local(self, file_code: str):
-        """从 SQLite 本地缓存中删除 file_record（N-M13: deliver_cached 过期清理）"""
+        """R38 P1-3: 从 SQLite 本地缓存中软删除 file_record(tombstone)。
+
+        原 N-M13 实现用 DELETE FROM,会丢失行用于 CRDB tombstone 同步的依据。
+        新实现用 UPDATE ... SET deleted_at=?, status='deleted',
+        crdb_sync 通过 dirty_outbox / crdb_synced=0 检测到 tombstone 后,
+        向 CRDB 发送对应 DELETE 或 status='deleted' 更新,保证跨节点一致。
+        """
         if not self._db:
             return
         await self._db.execute(
-            "DELETE FROM file_records_local WHERE file_code = ?",
-            (file_code,),
+            "UPDATE file_records_local SET deleted_at = ?, status = 'deleted', "
+            "crdb_synced = 0 WHERE file_code = ?",
+            (datetime.datetime.now().isoformat(), file_code),  # type: ignore[attr-defined]
         )
         await self._db.commit()
 

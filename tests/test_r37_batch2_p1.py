@@ -144,15 +144,17 @@ class TestP14BackupEncryptionRequired:
         assert "BACKUP_ENCRYPTION_REQUIRED: bool = False" in content
 
     def test_validator_checks_encryption_required(self):
-        """_validate_backup_fields 在 BACKUP_ENCRYPTION_REQUIRED=true 时检查 BACKUP_KEK。"""
+        """_validate_backup_fields 在 BACKUP_ENCRYPTION_REQUIRED=true 时检查 BACKUP_KEK/BACKUP_KEK_FILE。"""
         settings_path = Path(__file__).resolve().parent.parent / "config" / "settings.py"
         content = settings_path.read_text(encoding="utf-8")
         # 找到 _validate_backup_fields 函数
         idx = content.find("def _validate_backup_fields")
         assert idx > 0
-        snippet = content[idx:idx + 2000]
+        snippet = content[idx:idx + 2500]
         assert "BACKUP_ENCRYPTION_REQUIRED" in snippet
-        assert "BACKUP_KEK 未配置" in snippet
+        # R38 P1-4: 接受 BACKUP_KEK 或 BACKUP_KEK_FILE 任一即可
+        assert "BACKUP_KEK" in snippet
+        assert "BACKUP_KEK_FILE" in snippet
 
     def test_db_backup_loop_stops_on_required_encryption_failure(self):
         """db_backup._run_backup_loop 在 BACKUP_ENCRYPTION_REQUIRED=true 且加密不可用时 return。"""

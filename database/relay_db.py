@@ -152,7 +152,8 @@ CREATE TABLE IF NOT EXISTS relay_accounts (
     relay_user_id BIGINT,
     created_at   TEXT DEFAULT (datetime('now')),
     last_login_at TEXT,
-    status_updated_at TEXT
+    status_updated_at TEXT,
+    deleted_at   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS relay_usage (
@@ -448,7 +449,17 @@ class RelayDB:
         return result
 
     async def remove_account(self, phone: str) -> bool:
-        cur = await self._db.execute("DELETE FROM relay_accounts WHERE phone=?", (phone,))
+        # R38 P1-3: 改为 soft-delete(tombstone),保留行用于审计/CRDB 同步
+        # 原 DELETE FROM relay_accounts WHERE phone=? 会丢失行,
+        # 改为 UPDATE SET deleted_at, is_active=0, status='deleted',
+        # 仍触发 CRDB 同步删除(由 _delete_relay_from_crdb 完成)。
+        import datetime as _dt
+        now_iso = _dt.datetime.now().isoformat()
+        cur = await self._db.execute(
+            "UPDATE relay_accounts SET deleted_at = ?, is_active = 0, "
+            "status = 'deleted', status_updated_at = ? WHERE phone = ?",
+            (now_iso, now_iso, phone),
+        )
         await self._db.commit()
         deleted = cur.rowcount > 0
         if deleted:

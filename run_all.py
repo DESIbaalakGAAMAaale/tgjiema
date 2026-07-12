@@ -8,6 +8,15 @@
 支持两种运行模式:
   python run_all.py               → 多进程模式(所有 Bot,内部监控重启)
   python run_all.py --standalone up  → 独立模式(单 Bot 直接运行,交给 systemd 管理)
+
+R38 P2-1: 多进程模式(python run_all.py 无 --standalone)仅用于本地开发。
+  生产环境必须使用 systemd + --standalone 模式,每个 Bot 作为独立 systemd unit 运行,
+  原因:
+    1. 多进程模式共享一个 Python 进程的 GIL/信号处理,单 Bot 崩溃会影响其他 Bot
+    2. systemd 提供独立的资源限制/日志/重启策略 per Bot
+    3. Telegram Bot API 要求每个 token 独占 getUpdates 连接,多进程模式下
+       子进程通过 multiprocessing.Process 启动,信号传播不完善可能导致 polling 残留
+  当 ENVIRONMENT=production 时,多进程模式将被拒绝启动(见 main() 中的检查)。
 """
 
 import multiprocessing
@@ -353,9 +362,28 @@ def main():
 
     args = sys.argv[1:]
 
+    # R38 P2-1: 多进程模式仅用于本地开发,生产环境必须用 systemd + --standalone
+    # 多进程模式共享信号处理/资源限制,单 Bot 崩溃影响其他 Bot,且 Telegram Bot API
+    # 要求每个 token 独占 getUpdates 连接,多进程模式信号传播不完善可能导致 polling 残留
+    is_standalone = bool(args and args[0] == "--standalone")
+    if not is_standalone:
+        env = os.environ.get("ENVIRONMENT", "development").strip().lower()
+        if env == "production":
+            logger.error(
+                "[R38-P2-1] 拒绝在 ENVIRONMENT=production 下启动多进程模式。"
+                "生产环境必须使用 systemd + --standalone 模式运行各 Bot,"
+                "例如: python run_all.py --standalone up。"
+                "多进程模式仅用于本地开发(共享信号/GIL,单 Bot 崩溃影响其他 Bot)。"
+            )
+            sys.exit(1)
+        logger.warning(
+            "[R38-P2-1] 多进程模式仅用于本地开发。"
+            "生产环境请使用 systemd + --standalone 模式。"
+        )
+
     # ── 启动前自动初始化拓扑（仅多进程模式需要）──
     # 独立模式下各 Bot 自行调用 init_db()，拓扑已预初始化
-    if not (args and args[0] == "--standalone"):
+    if not is_standalone:
         _auto_seed()
 
     # ── 独立模式:--standalone <bot_name> ──

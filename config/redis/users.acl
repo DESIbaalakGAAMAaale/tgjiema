@@ -1,0 +1,41 @@
+# R38 P1-8: Redis ACL 配置 — 按服务角色最小权限
+#
+# 禁用 default 用户(默认无密码全权限,安全风险)
+# 每个服务使用独立用户,仅授予所需命令权限
+#
+# 用户名:密码 对应 .env.shared 中的 REDIS_URL
+# 格式: redis://<user>:<password>@redis:6379/0
+#
+# 更新密码后需重启 redis 容器(docker compose restart redis)
+
+# ── default 用户: 禁用(不允许任何连接) ──
+user default off
+
+# ── db_writer: Redis Stream 消费 + 写入 ──
+# 需要: XADD/XREADGROUP/XACK/XLEN/XPENDING/XCLAIM/XAUTOCLAIM/XINFO/XTRIM
+#       DEL/EXISTS/EXPIRE/TTL(leader lease + kv_store)
+user db_writer on >db_writer_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+
+# ── up_bot: 上传接收,写 Redis Stream + 读 kv_store ──
+user up_bot on >up_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+
+# ── idx_bot: 解码索引,读写 Redis ──
+user idx_bot on >idx_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+
+# ── dsp_bot: 派送分发,读写 Redis ──
+user dsp_bot on >dsp_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+
+# ── mon_bot: 监控管理,读 Redis 指标 + 写告警 ──
+user mon_bot on >mon_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+
+# ── admin_bot: 管理 Bot,读写 Redis ──
+user admin_bot on >admin_bot_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+
+# ── admin: Web 管理后台,读 Redis ──
+user admin on >admin_changeme_password ~* &* +@all -@dangerous -flushall -flushdb -keys -config -debug -shutdown -monitor -client
+
+# ── db_backup: 备份服务,不需要 Redis(仅连 CRDB + R2) ──
+# 不创建 Redis 用户,backup 服务不连 Redis
+
+# ── prometheus_exporter: 不需要 Redis(只读 SQLite) ──
+# 不创建 Redis 用户

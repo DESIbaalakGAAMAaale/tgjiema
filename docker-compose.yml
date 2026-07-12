@@ -16,9 +16,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction
+    # R38 P1-8: 启用 ACL(--aclfile),各服务使用独立用户连接 Redis
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction --aclfile /etc/redis/users.acl
     volumes:
       - redis_data:/data
+      - ./config/redis/users.acl:/etc/redis/users.acl:ro  # R38 P1-8: 挂载 ACL 文件(只读)
     ports:
       - "127.0.0.1:6379:6379"
     # R37 P2-4: 镜像安全加固
@@ -30,7 +32,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "--user", "default", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -87,6 +89,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./config:/app/config
+      - ./logs:/app/logs  # R38 P2-4: 只读容器需要可写日志挂载
     command: python run_all.py --standalone db_writer
     depends_on:
       redis:
@@ -106,8 +109,9 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 cache_store.db 近 10 分钟有写入(活跃写入证明进程存活)
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import os,time; f='/app/data/cache_store.db'; exit(0 if os.path.exists(f) and (time.time()-os.path.getmtime(f))<600 else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -128,6 +132,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./config:/app/config
+      - ./logs:/app/logs  # R38 P2-4: 只读容器需要可写日志挂载
     command: python run_all.py --standalone crdb_sync
     depends_on:
       migration:
@@ -145,8 +150,9 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 crdb_sync 进程在运行(cmdline 含 crdb_sync)
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'crdb_sync' in cmd else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -188,8 +194,9 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 up Bot 进程在运行(cmdline 含 up)
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone up' in cmd else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -231,8 +238,9 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 idx Bot 进程在运行(cmdline 含 idx)
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone idx' in cmd else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -274,8 +282,9 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 dsp Bot 进程在运行(cmdline 含 dsp)
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone dsp' in cmd else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -317,8 +326,9 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 mon Bot 进程在运行(cmdline 含 mon)
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone mon' in cmd else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -360,8 +370,9 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 admin_bot 进程在运行(cmdline 含 admin_bot)
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; exit(0 if os.path.exists('/app/data/cache_store.db') else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone admin_bot' in cmd else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -449,6 +460,57 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
+    # R38 P1-7: 角色专属 healthcheck — 检查 db_backup 进程在运行(cmdline 含 db_backup)
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone db_backup' in cmd else 1)\" || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+  # ── prometheus_exporter (指标导出,R38 P1-9) ──
+  # 独立 HTTP server,监听 0.0.0.0:9100/metrics
+  # 从 SQLite cache_store / relay_pool 读取指标,不依赖 Redis/CRDB
+  prometheus_exporter:
+    build: .
+    container_name: tgjiema-prometheus_exporter
+    restart: always
+    env_file:
+      - .env.shared
+    environment:
+      - SERVICE_ROLE=prometheus_exporter
+      - PYTHONUNBUFFERED=1
+      - PROMETHEUS_EXPORTER_HOST=0.0.0.0
+      - PROMETHEUS_EXPORTER_PORT=9100
+    volumes:
+      - ./data:/app/data:ro  # 只读挂载(exporter 不写数据)
+      - ./config:/app/config
+    command: python -m services.prometheus_exporter
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+    # R37 P2-4: 镜像安全加固
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "127.0.0.1:9100:9100"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 64M
+    # R38 P1-7: 角色专属 healthcheck — 检查 /metrics 端点可访问
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; r=urllib.request.urlopen('http://localhost:9100/health'); exit(0 if r.status==200 else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 volumes:
   redis_data:

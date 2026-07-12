@@ -182,3 +182,146 @@ cosign sign-blob --key yubikey:///<slot> file.txt
 - [ ] Rekor 检索记录与 Git commit SHA 一致
 
 任意一项失败 → 拒绝部署,触发事件响应。
+
+---
+
+## 8. R38 P2-6: 真实签名执行清单
+
+R38 P2-6 要求 release 的 commit / tag / image 三类制品**真实签名**(非文档描述),
+以下清单为每次 release 必须执行的步骤,由 release 负责人逐项确认。
+
+### 8.1 Commit 签名(源码 tarball)
+
+```bash
+# 1. 确认 HEAD commit(必须与即将发布的 tag 指向同一 commit)
+git fetch origin
+HEAD_SHA=$(git rev-parse HEAD)
+echo "HEAD commit: $HEAD_SHA"
+
+# 2. 创建源码 tarball(从 HEAD,不包含 .git 目录)
+git archive --format=tar.gz --prefix=tgjiema-$HEAD_SHA/ HEAD -o tgjiema-$HEAD_SHA.tar.gz
+
+# 3. 生成 SHA256 摘要
+sha256sum tgjiema-$HEAD_SHA.tar.gz > tgjiema-$HEAD_SHA.tar.gz.sha256
+
+# 4. cosign keyless 签名(GitHub Actions 中自动执行,或本地手动)
+cosign sign-blob --yes \
+  --output-certificate tgjiema-$HEAD_SHA.pem \
+  --output-signature tgjiema-$HEAD_SHA.sig \
+  tgjiema-$HEAD_SHA.tar.gz.sha256
+
+# 5. 验证签名
+cosign verify-blob \
+  --certificate tgjiema-$HEAD_SHA.pem \
+  --signature tgjiema-$HEAD_SHA.sig \
+  --certificate-identity https://github.com/<org>/<repo>/.github/workflows/ci.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  tgjiema-$HEAD_SHA.tar.gz.sha256
+
+# 6. 校验 tarball SHA256
+sha256sum -c tgjiema-$HEAD_SHA.tar.gz.sha256
+```
+
+**确认项**:
+- [ ] `git rev-parse HEAD` 输出与 tag 指向的 commit 一致
+- [ ] `cosign verify-blob` 返回 `Verified OK`
+- [ ] `sha256sum -c` 返回 `OK`
+
+### 8.2 Tag 签名(Git annotated tag)
+
+```bash
+# 1. 创建 annotated tag(带签名,使用 GPG key)
+git tag -s v<version> -m "Release v<version>" $HEAD_SHA
+
+# 2. 验证 tag 签名
+git verify-tag v<version>
+
+# 3. 推送签名 tag 到远程
+git push origin v<version>
+
+# 4. (可选)用 cosign 签名 tag 对应的 tarball
+# tag 签名用 GPG,tarball 签名用 cosign,两者互补
+```
+
+**确认项**:
+- [ ] `git tag -s` 使用已配置的 GPG key(非 `-a` 轻量 tag)
+- [ ] `git verify-tag` 输出 `Good signature from ...`
+- [ ] tag 已推送到远程(`git ls-remote --tags origin` 可见)
+
+### 8.3 Image 签名(容器镜像)
+
+```bash
+# 1. 构建镜像(使用 HEAD SHA 作为 tag,不用 latest)
+docker build -t ghcr.io/<org>/tgjiema:$HEAD_SHA .
+
+# 2. 推送镜像(获取 digest)
+docker push ghcr.io/<org>/tgjiema:$HEAD_SHA
+# 从 push 输出获取 digest: sha256:abc123...
+
+# 3. cosign keyless 签名镜像(引用 digest,不引用 tag)
+cosign sign --yes \
+  ghcr.io/<org>/tgjiema:$HEAD_SHA@sha256:abc123...
+
+# 4. 验证镜像签名
+cosign verify \
+  --certificate-identity https://github.com/<org>/<repo>/.github/workflows/ci.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/<org>/tgjiema:$HEAD_SHA@sha256:abc123...
+```
+
+**确认项**:
+- [ ] 镜像 tag 使用 HEAD SHA(不用 `latest` / `stable`)
+- [ ] `cosign sign` 引用 `@sha256:<digest>`,不引用 `:tag`
+- [ ] `cosign verify` 返回 `Verified OK`
+- [ ] 多架构镜像用 `--recursive` 签名 manifest list
+
+### 8.4 三类签名一致性校验
+
+```bash
+# 最终校验:commit / tag / image 三者指向同一 HEAD
+COMMIT_SHA=$HEAD_SHA
+TAG_COMMIT=$(git rev-list -n 1 v<version>)
+IMAGE_LABEL=$(docker inspect ghcr.io/<org>/tgjiema:$HEAD_SHA --format '{{.Config.Labels.git_commit_sha}}')
+
+echo "Commit SHA:   $COMMIT_SHA"
+echo "Tag points:   $TAG_COMMIT"
+echo "Image label:  $IMAGE_LABEL"
+
+if [ "$COMMIT_SHA" = "$TAG_COMMIT" ] && [ "$COMMIT_SHA" = "$IMAGE_LABEL" ]; then
+  echo "✓ 三类制品签名绑定同一 commit"
+else
+  echo "✗ 签名不一致,拒绝发布"
+  exit 1
+fi
+```
+
+### 8.5 Rekor 透明日志验证
+
+```bash
+# 查询 Rekor 是否记录了本次签名
+cosign verify-blob --rekor-url https://rekor.sigstore.dev \
+  --certificate tgjiema-$HEAD_SHA.pem \
+  --signature tgjiema-$HEAD_SHA.sig \
+  tgjiema-$HEAD_SHA.tar.gz.sha256
+
+# Rekor 记录包含:
+# - 签名时间戳
+# - OIDC 身份(GitHub workflow 路径 + ref)
+# - 证书指纹
+# 运维应确认 Rekor 记录的签名时间与 release 时间一致
+```
+
+### 8.6 签名失败处理
+
+- **cosign keyless 失败**(OIDC token 获取失败):
+  1. 检查 GitHub Actions `id-token: write` 权限
+  2. 检查 cosign 版本(固定 `v2.2.3`)
+  3. 手动用 KMS / GPG key 签名作为兜底
+- **GPG tag 签名失败**:
+  1. 检查 GPG key 已导入 + 信任
+  2. 检查 git config `user.signingkey` 已设置
+  3. 用 `git tag -f -s` 重新签名(未推送时)
+- **镜像签名失败**:
+  1. 检查 GHCR PAT 有 `packages:write` 权限
+  2. 检查 cosign 已登录(`cosign login`)
+  3. 签名失败时镜像不可发布(无签名 = 不可部署)
