@@ -374,8 +374,8 @@ class TestBundleManifest:
 
         manifest = _build_bundle_manifest(backup_data, content, start, end)
 
-        # 验证所有必填字段
-        assert manifest["version"] == "2.0"
+        # 验证所有必填字段(R36 H7: manifest version 升级到 3.0)
+        assert manifest["version"] == "3.0"
         assert "commit_sha" in manifest
         assert "schema_version" in manifest
         assert "checksum_sha256" in manifest

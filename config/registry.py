@@ -604,6 +604,17 @@ class ConfigRegistry:
             services=["db_backup"],
             validation_regex=r"^(true|false|1|0|on|off|yes|no)$",
         ))
+        self.register(ConfigMetadata(
+            key="BACKUP_KEK",
+            category=ConfigCategory.BACKUP,
+            reload_policy=ReloadPolicy.COLD_RELOAD,
+            sensitivity=SensitivityLevel.SECRET,
+            description="R36 H7: 备份 AES-256-GCM 信封加密 KEK(base64, 32 字节);空则降级为明文",
+            default_value="",
+            env_var="BACKUP_KEK",
+            services=["db_backup"],
+            validation_regex=r"^[A-Za-z0-9+/=]*$",
+        ))
 
         # ── Admin Web 服务参数 ──
         self.register(ConfigMetadata(

@@ -93,6 +93,9 @@ class Settings(BaseSettings):
     # 间隔从 14400(10天) 改为 360(6小时)，与原 get_config_default 一致，更符合备份预期。
     DB_BACKUP_INTERVAL_MINUTES: int = 360
     DB_BACKUP_ENABLED: bool = False
+    # R36 H7: 备份 AES-256-GCM 信封加密 KEK(base64, 32 字节)
+    # 未配置时备份降级为明文(商用环境必须配置)
+    BACKUP_KEK: str = ""
 
     ADMIN_WEB_PORT: int = 8080
     ADMIN_WEB_HOST: str = "127.0.0.1"

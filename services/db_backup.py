@@ -16,6 +16,10 @@ from services.backup_schema import (
     BACKUP_SCHEMA, get_backup_tables, get_conflict_col,
     get_tables_by_source,
 )
+from services.backup_crypto import (
+    encrypt_payload,
+    is_encryption_available,
+)
 
 # ─── 表清单(单一事实源: services/backup_schema.py) ───
 # 保留向后兼容的别名,等价于原 SMALL_TABLES / _LARGE_TABLES / _TABLE_WHERE
@@ -31,7 +35,11 @@ _TABLE_WHERE = {t.name: t.where_clause for t in BACKUP_SCHEMA.values() if t.wher
 MAX_BACKUP_RETENTION = 168  # 7天 × 24小时 / 1小时间隔 ≈ 168 份
 
 # R35 P1-7: Schema 版本(从 backup_schema 的表数量派生,用于 bundle manifest)
-_BACKUP_SCHEMA_VERSION = f"r35_batch3_{len(BACKUP_SCHEMA)}tables"
+_BACKUP_SCHEMA_VERSION = f"r36_{len(BACKUP_SCHEMA)}tables"
+
+# R36 H7: 增量备份 watermark 配置
+_WATERMARK_KEY = "db_backup/watermark.json"  # R2 中的 watermark 存储路径
+_FULL_BACKUP_INTERVAL = 24  # 每 24 次增量后做一次全量(如每小时备份 = 每天一次全量)
 
 # P0-3: 备份中不再脱敏敏感字段 (api_hash / r2_secret_key / r2_access_key)。
 # 备份仅存储在运维自有 R2 桶内(需可信环境),若替换为 ***REDACTED*** 占位符,
@@ -97,8 +105,12 @@ def _build_bundle_manifest(
     content: bytes,
     start_time: datetime,
     end_time: datetime,
+    backup_type: str = "full",
+    watermark: str | None = None,
+    prev_watermark: str | None = None,
+    encryption_info: dict | None = None,
 ) -> dict:
-    """构建 bundle manifest(R35 P1-7)。
+    """构建 bundle manifest(R35 P1-7, R36 H7 增强)。
 
     Bundle 包含:
     - commit SHA(git rev-parse HEAD 或环境变量)
@@ -107,6 +119,9 @@ def _build_bundle_manifest(
     - SHA-256 checksum(整个 backup JSON 的校验和)
     - 开始/结束时间
     - source 标记(crdb/sqlite/relay_sqlite)
+    - R36 H7: backup_type (full/incremental)
+    - R36 H7: watermark (本次备份的 updated_at 上界)
+    - R36 H7: encryption (加密元数据)
     """
     tables = backup_data.get("tables", {})
     table_stats = {}
@@ -119,8 +134,8 @@ def _build_bundle_manifest(
             "source": source,
         }
 
-    return {
-        "version": "2.0",  # R35: bundle manifest v2(含 source 标记)
+    manifest = {
+        "version": "3.0",  # R36: manifest v3(含 backup_type/watermark/encryption)
         "commit_sha": _get_commit_sha(),
         "schema_version": _BACKUP_SCHEMA_VERSION,
         "checksum_sha256": _compute_sha256(content),
@@ -130,31 +145,56 @@ def _build_bundle_manifest(
         "table_stats": table_stats,
         "total_tables": len(tables),
         "total_rows": sum(len(v) for v in tables.values()),
+        # R36 H7: 增量备份元数据
+        "backup_type": backup_type,  # "full" 或 "incremental"
+        "watermark": watermark,       # 本次备份的 updated_at 上界(ISO 格式)
+        "prev_watermark": prev_watermark,  # 上次备份的 watermark(增量时使用)
+        # R36 H7: 加密元数据
+        "encryption": encryption_info or {"encrypted": False, "algorithm": "none"},
     }
+    return manifest
 
 
 # ═══════════════════════════════════════════════════════════════
 #  R35 P1-5: 按 source 分组的备份快照器
 # ═══════════════════════════════════════════════════════════════
 
-async def _backup_crdb_tables(tables: list[str]) -> dict:
+async def _backup_crdb_tables(tables: list[str], watermark: str | None = None) -> dict:
     """备份 CRDB 表(走 CockroachDB SELECT *)。
 
     R35 P1-5: 仅备份 source="crdb" 的表,避免对 SQLite-only 表执行 CRDB 查询。
+    R36 H7: 支持 watermark 增量备份(只查 updated_at > watermark 的行)。
     """
     results = {}
     for table in sorted(tables):
         try:
             safe_name = _validate_identifier(table)
-            where = _TABLE_WHERE.get(table)
-            if where:
-                sql = f'SELECT * FROM "{safe_name}" WHERE {where}'
+            conditions = []
+            # 表级 WHERE 条件(如 status = 'active')
+            table_where = _TABLE_WHERE.get(table)
+            if table_where:
+                conditions.append(table_where)
+            # R36 H7: 增量 watermark 条件
+            if watermark:
+                # 仅对有 updated_at 列的表应用 watermark
+                # (backup_schema 中所有 CRDB 核心表都有 updated_at 或 created_at)
+                ts_col = "updated_at" if table in BACKUP_SCHEMA and "updated_at" in BACKUP_SCHEMA[table].columns else None
+                if ts_col:
+                    conditions.append(f'"{ts_col}" > $1')
+
+            if conditions:
+                where_clause = " AND ".join(conditions)
+                if watermark and "$1" in where_clause:
+                    sql = f'SELECT * FROM "{safe_name}" WHERE {where_clause}'
+                    records = await db_client.fetch(sql, watermark)
+                else:
+                    sql = f'SELECT * FROM "{safe_name}" WHERE {where_clause}'
+                    records = await db_client.fetch(sql)
             else:
                 sql = f'SELECT * FROM "{safe_name}"'
-            # 使用公共 fetch API,避免访问 _pool 私有属性
-            records = await db_client.fetch(sql)
+                records = await db_client.fetch(sql)
             results[table] = [dict(r) for r in records]
-            logger.debug(f"[Backup][CRDB] {table}: {len(records)} 行")
+            logger.debug(f"[Backup][CRDB] {table}: {len(records)} 行(watermark={watermark or 'none'})")
         except Exception as e:
             # 表不存在时降级为 DEBUG(如 kv_config 在部分部署中不存在)
             if "does not exist" in str(e):
@@ -215,16 +255,82 @@ async def _backup_relay_sqlite_tables(tables: list[str]) -> dict:
     return await _backup_sqlite_tables(tables, RELAY_DB_PATH)
 
 
-async def backup_all_tables() -> dict:
-    """备份所有核心表(按 source 分组,R35 P1-5/P1-7)。
+# ═══════════════════════════════════════════════════════════════
+#  R36 H7: 增量备份 watermark 管理
+# ═══════════════════════════════════════════════════════════════
 
-    R35 P1-5: 按 source 分组执行备份:
-    - source="crdb":        走 CRDB SELECT *
-    - source="sqlite":       走 SQLite SELECT *(从 cache_store.db)
-    - source="relay_sqlite": 走 relay SQLite SELECT *(从 relay_pool.db)
-    - source="redis":        跳过(暂不支持快照)
+async def _get_last_watermark() -> dict | None:
+    """从 R2 读取上一次备份的 watermark。
 
-    R35 P1-7: 生成 bundle manifest(commit SHA, schema version, 行数, SHA-256, 时间戳)。
+    Returns:
+        watermark dict(含 updated_at, backup_type, count)或 None(首次备份)
+    """
+    try:
+        content = await r2_storage.download(_WATERMARK_KEY)
+        return json.loads(content.decode("utf-8"))
+    except Exception:
+        return None
+
+
+async def _save_watermark(watermark: str, backup_type: str, incremental_count: int) -> None:
+    """保存当前备份的 watermark 到 R2。
+
+    Args:
+        watermark: 本次备份的 updated_at 上界(ISO 格式)
+        backup_type: "full" 或 "incremental"
+        incremental_count: 自上次全量以来的增量次数
+    """
+    data = {
+        "updated_at": watermark,
+        "backup_type": backup_type,
+        "incremental_count": incremental_count,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+    }
+    content = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
+    try:
+        await r2_storage.upload(_WATERMARK_KEY, content, "application/json")
+        logger.debug(f"[Backup] watermark 已保存: {watermark} (type={backup_type}, count={incremental_count})")
+    except Exception as e:
+        logger.warning(f"[Backup] 保存 watermark 失败(下次备份将做全量): {e}")
+
+
+async def _compute_watermark(all_tables: dict) -> str:
+    """计算本次备份的 watermark(所有表中最大的 updated_at)。
+
+    遍历所有表的行,找最大的 updated_at 或 created_at 值。
+    """
+    max_ts = datetime.now(timezone.utc).isoformat()
+    for table_name, rows in all_tables.items():
+        ts_col = None
+        if table_name in BACKUP_SCHEMA:
+            cols = BACKUP_SCHEMA[table_name].columns
+            if "updated_at" in cols:
+                ts_col = "updated_at"
+            elif "created_at" in cols:
+                ts_col = "created_at"
+        if not ts_col:
+            continue
+        for row in rows:
+            val = row.get(ts_col)
+            if val and isinstance(val, str) and val > max_ts:
+                max_ts = val
+            elif val and hasattr(val, "isoformat"):
+                iso = val.isoformat()
+                if iso > max_ts:
+                    max_ts = iso
+    return max_ts
+
+
+async def backup_all_tables(watermark: str | None = None, backup_type: str = "full") -> dict:
+    """备份所有核心表(按 source 分组,R35 P1-5/P1-7, R36 H7 增量)。
+
+    R35 P1-5: 按 source 分组执行备份
+    R35 P1-7: 生成 bundle manifest
+    R36 H7: 支持 watermark 增量备份(仅备份 updated_at > watermark 的行)
+
+    Args:
+        watermark: 上次备份的 watermark(增量模式),None 表示全量
+        backup_type: "full" 或 "incremental"(仅影响 manifest 标记)
 
     大表(decode_logs/jobs/pending_uploads/rotate_log)跳过：
     - decode_logs/jobs 是短期流水数据，无需长期备份
@@ -242,13 +348,13 @@ async def backup_all_tables() -> dict:
     logger.info(
         f"[Backup] 按 source 分组: CRDB={len(crdb_tables)}表, "
         f"SQLite={len(sqlite_tables)}表, relay_sqlite={len(relay_sqlite_tables)}表, "
-        f"redis={len(redis_tables)}表(跳过)"
+        f"redis={len(redis_tables)}表(跳过), type={backup_type}, watermark={watermark or 'none'}"
     )
 
-    # 1. CRDB 表备份
-    crdb_data = await _backup_crdb_tables(crdb_tables)
+    # 1. CRDB 表备份(R36 H7: 传入 watermark 做增量查询)
+    crdb_data = await _backup_crdb_tables(crdb_tables, watermark=watermark)
 
-    # 2. SQLite 表备份(从 cache_store.db)
+    # 2. SQLite 表备份(从 cache_store.db) — SQLite 表不做增量,每次全量(数据量小)
     from database.cache_store import DB_PATH as CACHE_DB_PATH
     sqlite_data = await _backup_sqlite_tables(sqlite_tables, CACHE_DB_PATH)
 
@@ -267,15 +373,22 @@ async def backup_all_tables() -> dict:
 
     end_time = datetime.now(timezone.utc)
 
+    # R36 H7: 计算本次备份的 watermark(用于下次增量)
+    current_watermark = await _compute_watermark(all_tables)
+
     backup_data = {
         "backup_time": start_time.isoformat(),
         "tables": all_tables,
     }
 
-    # R35 P1-7: 构建 bundle manifest 并附加到备份数据
-    # 先序列化表数据计算 checksum,再附加 manifest
+    # R35 P1-7 + R36 H7: 构建 bundle manifest(含 backup_type/watermark)
     tables_content = json.dumps(all_tables, default=str, ensure_ascii=False).encode("utf-8")
-    manifest = _build_bundle_manifest(backup_data, tables_content, start_time, end_time)
+    manifest = _build_bundle_manifest(
+        backup_data, tables_content, start_time, end_time,
+        backup_type=backup_type,
+        watermark=current_watermark,
+        prev_watermark=watermark,
+    )
     backup_data["manifest"] = manifest
 
     return backup_data
@@ -308,7 +421,12 @@ async def run_db_backup():
 
 
 async def _run_backup_loop():
-    """备份主循环(由 run_db_backup 调用,确保 finally 中清理资源)。"""
+    """备份主循环(由 run_db_backup 调用,确保 finally 中清理资源)。
+
+    R36 H7:
+    - 增量 watermark 备份(首次全量,后续增量,每 _FULL_BACKUP_INTERVAL 次全量一次)
+    - AES-256-GCM 信封加密(如配置了 BACKUP_KEK)
+    """
     enabled_cfg = await get_config("db_backup_enabled")
     if enabled_cfg is None:
         enabled = settings.DB_BACKUP_ENABLED
@@ -323,10 +441,21 @@ async def _run_backup_loop():
         )
         return
 
-    # R35 P1-7: 启用自建备份时,日志警告商用建议
+    # R36 H7: 检查加密可用性
+    encryption_enabled = is_encryption_available()
+    if encryption_enabled:
+        logger.info("[R36-H7] 备份加密已启用(AES-256-GCM 信封加密)")
+    else:
+        logger.warning(
+            "[R36-H7] 备份加密未启用(BACKUP_KEK 未配置或 cryptography 不可用),"
+            "备份将以明文存储。商用环境必须配置 BACKUP_KEK。"
+        )
+
+    # R35 P1-7 + R36 H7: 启用自建备份时,日志说明增量模式
     logger.warning(
-        "[R35-P1-7] 自建备份已启用。商用环境建议优先使用 CRDB Basic 托管备份,"
-        "自建全量 SELECT * 会产生额外 RU 开销。当前模式: 增量 journal + 低频完整校验(待实现)。"
+        "[R36-H7] 自建备份已启用(增量 watermark 模式)。"
+        "商用环境建议优先使用 CRDB Basic 托管备份。"
+        f"增量配置: 每 {_FULL_BACKUP_INTERVAL} 次增量后做一次全量。"
     )
 
     # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
@@ -344,36 +473,94 @@ async def _run_backup_loop():
         except (ValueError, TypeError):
             logger.warning(f"[db_backup] db_backup_interval 配置值 '{interval_cfg}' 无效,使用默认值 {settings.DB_BACKUP_INTERVAL_MINUTES}")
             interval = settings.DB_BACKUP_INTERVAL_MINUTES
-    logger.info("CockroachDB 数据库备份服务启动,间隔 {} 分钟", interval)
+    logger.info("CockroachDB 数据库备份服务启动,间隔 {} 分钟(增量 watermark 模式)", interval)
 
     while True:
         try:
+            # R36 H7: 读取上次 watermark,决定全量还是增量
+            last_wm = await _get_last_watermark()
+            if last_wm is None:
+                # 首次备份:全量
+                backup_type = "full"
+                watermark = None
+                incremental_count = 0
+                logger.info("[Backup] 首次备份(无 watermark),执行全量备份")
+            elif last_wm.get("incremental_count", 0) >= _FULL_BACKUP_INTERVAL:
+                # 达到全量间隔:做一次全量
+                backup_type = "full"
+                watermark = None
+                incremental_count = 0
+                logger.info(
+                    f"[Backup] 增量次数 {last_wm.get('incremental_count')} "
+                    f">= {_FULL_BACKUP_INTERVAL},执行全量备份"
+                )
+            else:
+                # 增量备份
+                backup_type = "incremental"
+                watermark = last_wm.get("updated_at")
+                incremental_count = last_wm.get("incremental_count", 0) + 1
+                logger.info(f"[Backup] 增量备份 #{incremental_count}, watermark={watermark}")
+
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            key = f"db_backup/db_backup_{timestamp}.json"
-            data = await backup_all_tables()
+            key = f"db_backup/db_backup_{timestamp}_{backup_type}.json"
+            data = await backup_all_tables(watermark=watermark, backup_type=backup_type)
             # N-M9: 脱敏备份数据中的敏感字段
             data = _redact_secrets(data)
-            content = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
-            await r2_storage.upload(key, content, "application/json")
-            total_rows = sum(len(v) for v in data["tables"].values())
-            # R35 P1-7: 日志中包含 bundle manifest 摘要
-            manifest = data.get("manifest", {})
-            logger.info(
-                f"数据库已备份到 R2: {key} ({len(content)} 字节, "
-                f"{len(data['tables'])} 表, {total_rows} 行, "
-                f"commit={manifest.get('commit_sha', 'unknown')}, "
-                f"checksum={manifest.get('checksum_sha256', 'unknown')[:16]}...)"
-            )
 
-            for table in data["tables"]:
-                t_content = json.dumps(
-                    data["tables"][table], default=str, ensure_ascii=False
-                ).encode("utf-8")
+            # R36 H7: 序列化 + 加密
+            plaintext = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
+            enc_result = encrypt_payload(plaintext)
+            upload_content = enc_result["ciphertext"]
+
+            # 更新 manifest 中的加密信息
+            if enc_result["encrypted"]:
+                data["manifest"]["encryption"] = {
+                    "encrypted": True,
+                    "algorithm": enc_result["algorithm"],
+                    "wrapped_dek": enc_result["wrapped_dek"],
+                    "nonce": enc_result["nonce"],
+                }
+                # 重新序列化 manifest 部分(加密信息需要随 manifest 一起存储)
+                # 注意: ciphertext 已加密, manifest 单独存储
+                manifest_content = json.dumps(data["manifest"], default=str, ensure_ascii=False).encode("utf-8")
                 await r2_storage.upload(
-                    f"db_backup/latest_{table}.json",
-                    t_content,
+                    f"db_backup/manifest_{timestamp}_{backup_type}.json",
+                    manifest_content,
                     "application/json",
                 )
+            else:
+                # 未加密:manifest 随 backup 一起存储(向后兼容)
+                pass
+
+            await r2_storage.upload(key, upload_content, "application/octet-stream" if enc_result["encrypted"] else "application/json")
+            total_rows = sum(len(v) for v in data["tables"].values())
+            # R35 P1-7 + R36 H7: 日志中包含 bundle manifest 摘要
+            manifest = data.get("manifest", {})
+            logger.info(
+                f"数据库已备份到 R2: {key} ({len(upload_content)} 字节, "
+                f"{len(data['tables'])} 表, {total_rows} 行, "
+                f"type={backup_type}, "
+                f"commit={manifest.get('commit_sha', 'unknown')}, "
+                f"checksum={manifest.get('checksum_sha256', 'unknown')[:16]}..., "
+                f"encrypted={enc_result['encrypted']})"
+            )
+
+            # R36 H7: 保存 watermark(用于下次增量)
+            current_wm = manifest.get("watermark")
+            if current_wm:
+                await _save_watermark(current_wm, backup_type, incremental_count)
+
+            # 逐表上传 latest(仅全量备份时更新 latest,避免增量覆盖)
+            if backup_type == "full":
+                for table in data["tables"]:
+                    t_content = json.dumps(
+                        data["tables"][table], default=str, ensure_ascii=False
+                    ).encode("utf-8")
+                    await r2_storage.upload(
+                        f"db_backup/latest_{table}.json",
+                        t_content,
+                        "application/json",
+                    )
 
             # 清理旧备份，仅保留最近 MAX_BACKUP_RETENTION 份
             try:

@@ -1,0 +1,229 @@
+# R36 H8: 统一服务清单 — 单一事实源(single source of truth)
+#
+# 用于生成 systemd 单元和 docker-compose.yml,消除两套交付模型的漂移。
+# 生成器:
+#   - config/generate_systemd.py: 从此文件生成 deploy_vps_per_bot.sh 的服务定义
+#   - config/generate_compose.py:  从此文件生成 docker-compose.yml
+#
+# 字段说明:
+#   name:        服务名(systemd: tgjiema-<name>,compose: <name>)
+#   description: 服务描述
+#   role:        SERVICE_ROLE 环境变量值
+#   runner:      run_all.py BOT_RUNNERS 中的键名
+#   timeout_stop_sec: systemd TimeoutStopSec(秒)
+#   restart:     systemd Restart 策略(always/on-failure/no)
+#   restart_sec: 重启间隔(秒)
+#   needs_redis: 是否依赖 Redis(db_backup 不依赖)
+#   needs_crdb:  是否直接连接 CRDB(crdb_sync/migration/db_backup 直连,其他通过 crdb_sync 间接)
+#   secrets:     该服务需要的 secret 变量列表(从 .env 提取到 .env.secrets.<name>)
+#   health_check: 健康检查命令(compose 用)
+#   depends_on:  compose 依赖的其他服务(启动顺序)
+#   migration_dep: 是否依赖 migration oneshot 服务(业务 Bot 需要)
+
+services:
+  # ── migration oneshot (DDL 执行,业务 Bot 启动前必须完成) ──
+  - name: migration
+    description: "数据库迁移(DDL 执行,oneshot)"
+    role: migration
+    timeout_stop_sec: 120
+    restart: "no"
+    restart_sec: 0
+    needs_redis: false
+    needs_crdb: true
+    is_oneshot: true
+    secrets:
+      - COCKROACHDB_URL
+
+  # ── db_writer (Redis Stream 消费,CRDB 写入) ──
+  - name: db_writer
+    description: "数据库写入(Redis Stream 消费)"
+    role: db_writer
+    timeout_stop_sec: 40
+    restart: on-failure
+    restart_sec: 10
+    needs_redis: true
+    needs_crdb: false
+    secrets: []  # 无 secrets,只用 REDIS_URL(来自 .env.shared)
+    depends_on:
+      - redis
+
+  # ── crdb_sync (单一 CRDB 同步服务) ──
+  - name: crdb_sync
+    description: "CRDB 同步服务(独占 dirty → CRDB UPSERT)"
+    role: crdb_sync
+    timeout_stop_sec: 40
+    restart: on-failure
+    restart_sec: 10
+    needs_redis: false
+    needs_crdb: true
+    secrets:
+      - COCKROACHDB_URL
+    depends_on:
+      - migration
+
+  # ── up (上传接收 Bot) ──
+  - name: up
+    description: "上传接收Bot"
+    role: up
+    timeout_stop_sec: 40
+    restart: always
+    restart_sec: 10
+    needs_redis: true
+    needs_crdb: false
+    migration_dep: true
+    secrets:
+      - UPLOAD_BOT_TOKEN
+      - RELAY_API_ID
+      - RELAY_API_HASH
+      - RELAY_ENCRYPTION_KEY
+      - RELAY_ACCOUNT_IDS
+      - COLLECTOR_ACCOUNT_IDS
+    depends_on:
+      - redis
+      - db_writer
+      - migration
+
+  # ── idx (解码索引 Bot) ──
+  - name: idx
+    description: "解码索引Bot"
+    role: idx
+    timeout_stop_sec: 40
+    restart: always
+    restart_sec: 10
+    needs_redis: true
+    needs_crdb: false
+    migration_dep: true
+    secrets:
+      - DECODER_BOT_TOKEN
+      - RELAY_API_ID
+      - RELAY_API_HASH
+      - RELAY_ENCRYPTION_KEY
+      - RELAY_ACCOUNT_IDS
+      - ALLOWED_DECODER_BOTS
+    depends_on:
+      - redis
+      - db_writer
+      - migration
+
+  # ── dsp (派送分发 Bot) ──
+  - name: dsp
+    description: "派送分发Bot"
+    role: dsp
+    timeout_stop_sec: 40
+    restart: always
+    restart_sec: 10
+    needs_redis: true
+    needs_crdb: false
+    migration_dep: true
+    secrets:
+      - SENDER_BOT_TOKEN
+    depends_on:
+      - redis
+      - db_writer
+      - migration
+
+  # ── mon (监控管理 Bot) ──
+  - name: mon
+    description: "监控管理Bot"
+    role: mon
+    timeout_stop_sec: 40
+    restart: always
+    restart_sec: 10
+    needs_redis: true
+    needs_crdb: false
+    migration_dep: true
+    secrets:
+      - MON_BOT_TOKEN
+      - ADMIN_BOT_TOKEN
+      - ADMIN_TELEGRAM_ID
+      - DB_WRITER_SERVICE_NAME
+    depends_on:
+      - redis
+      - db_writer
+      - migration
+
+  # ── admin_bot (管理员 Bot) ──
+  - name: admin_bot
+    description: "管理员Bot"
+    role: admin_bot
+    timeout_stop_sec: 40
+    restart: always
+    restart_sec: 10
+    needs_redis: true
+    needs_crdb: false
+    migration_dep: true
+    secrets:
+      - ADMIN_BOT_TOKEN
+      - ADMIN_TELEGRAM_ID
+    depends_on:
+      - redis
+      - db_writer
+      - migration
+
+  # ── admin (Web 管理后台) ──
+  - name: admin
+    description: "Web管理后台"
+    role: admin
+    timeout_stop_sec: 40
+    restart: always
+    restart_sec: 10
+    needs_redis: true
+    needs_crdb: false
+    migration_dep: true
+    secrets:
+      - ADMIN_USERNAME
+      - ADMIN_PASSWORD
+      - ADMIN_WEB_PORT
+      - ADMIN_WEB_HOST
+      - CSRF_COOKIE_SECURE
+    depends_on:
+      - redis
+      - db_writer
+      - migration
+    health_check:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; r=urllib.request.urlopen('http://localhost:8080/health'); exit(0 if r.status==200 else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── db_backup (数据库备份) ──
+  - name: db_backup
+    description: "数据库备份(增量 watermark + 加密)"
+    role: db_backup
+    timeout_stop_sec: 15
+    restart: on-failure
+    restart_sec: 60
+    needs_redis: false
+    needs_crdb: true
+    secrets:
+      - R2_ACCOUNT_ID
+      - R2_ACCESS_KEY_ID
+      - R2_SECRET_ACCESS_KEY
+      - R2_BUCKET_NAME
+      - R2_ENDPOINT
+      - DB_BACKUP_ENABLED
+      - DB_BACKUP_INTERVAL_MINUTES
+      - COCKROACHDB_URL
+      - BACKUP_KEK
+    depends_on:
+      - migration
+
+# ── 共享基础设施服务(compose 专用,systemd 通过 apt 装原生包) ──
+infrastructure:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  redis_data:

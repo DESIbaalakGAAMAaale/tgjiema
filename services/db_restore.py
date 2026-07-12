@@ -32,6 +32,12 @@ from services.backup_schema import (
     BACKUP_SCHEMA, get_restore_tables, is_table_allowed, ALLOWED_COLUMNS,
     get_table_source, validate_columns_for_table,
 )
+from services.backup_crypto import (
+    decrypt_payload,
+    validate_manifest_on_restore,
+    verify_checksum,
+    is_encryption_available,
+)
 
 # ─── 表清单(单一事实源: services/backup_schema.py) ───
 # 保留向后兼容的别名,等价于原 ALL_TABLES / TABLE_PK
@@ -69,32 +75,103 @@ def _sanitize_column(name: str) -> str:
 
 
 async def get_latest_backup() -> dict:
-    """从 R2 下载最新的全量备份 JSON 文件并解析。"""
+    """从 R2 下载最新的全量备份 JSON 文件并解析。
+
+    R36 H7: 恢复前校验 manifest(checksum/schema_version/encryption)并解密。
+    优先选择 full 备份;若无 full 则取最新 incremental。
+    """
     # 列出所有备份文件
     objects = await r2_storage.list_objects(prefix="db_backup/db_backup_")
     if not objects:
         logger.error("R2 上未找到任何备份文件 (prefix: db_backup/db_backup_)")
         sys.exit(1)
 
-    # 按 key 排序（文件名含时间戳），取最新的
-    objects.sort(key=lambda o: o["key"], reverse=True)
-    latest_key = objects[0]["key"]
-    logger.info(f"找到最新备份: {latest_key} ({objects[0]['size']} 字节)")
+    # R36 H7: 优先全量备份,若无全量则取最新增量
+    full_backups = [o for o in objects if "_full.json" in o["key"]]
+    incremental_backups = [o for o in objects if "_incremental.json" in o["key"]]
+    if full_backups:
+        full_backups.sort(key=lambda o: o["key"], reverse=True)
+        latest_key = full_backups[0]["key"]
+        logger.info(f"找到最新全量备份: {latest_key}")
+    else:
+        objects.sort(key=lambda o: o["key"], reverse=True)
+        latest_key = objects[0]["key"]
+        logger.warning(f"未找到全量备份,使用最新备份(可能为增量): {latest_key}")
 
-    content = await r2_storage.download(latest_key)
-    data = json.loads(content.decode("utf-8"))
+    raw_content = await r2_storage.download(latest_key)
+
+    # R36 H7: 尝试解析为 JSON(未加密)或解密(已加密)
+    try:
+        data = json.loads(raw_content.decode("utf-8"))
+        manifest = data.get("manifest", {})
+        encryption_info = manifest.get("encryption", {})
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # 加密的备份:尝试查找对应的 manifest 文件
+        timestamp_part = latest_key.split("db_backup_")[1]  # e.g. "20260712_120000_full.json"
+        manifest_key = f"db_backup/manifest_{timestamp_part}"
+        logger.info(f"备份可能已加密,尝试加载 manifest: {manifest_key}")
+        try:
+            manifest_content = await r2_storage.download(manifest_key)
+            manifest = json.loads(manifest_content.decode("utf-8"))
+            encryption_info = manifest.get("encryption", {})
+        except Exception as e:
+            logger.error(f"备份无法解析且 manifest 不可用: {e}")
+            sys.exit(1)
+
+        # R36 H7: 校验 manifest
+        is_valid, reason = validate_manifest_on_restore(manifest)
+        if not is_valid:
+            logger.error(f"manifest 校验失败: {reason}")
+            sys.exit(1)
+        logger.info(f"manifest 校验通过: {reason}")
+
+        # R36 H7: 解密 payload
+        if encryption_info.get("encrypted"):
+            if not is_encryption_available():
+                logger.error("备份已加密但 BACKUP_KEK 未配置,无法解密")
+                sys.exit(1)
+            logger.info("备份已加密,正在解密(AES-256-GCM)...")
+            plaintext = decrypt_payload(
+                raw_content,
+                wrapped_dek=encryption_info.get("wrapped_dek"),
+                nonce_b64=encryption_info.get("nonce"),
+            )
+        else:
+            plaintext = raw_content
+
+        data = json.loads(plaintext.decode("utf-8"))
+        data["manifest"] = manifest
+
+    # R36 H7: 对未加密的备份也校验 manifest
+    if not encryption_info.get("encrypted"):
+        is_valid, reason = validate_manifest_on_restore(manifest)
+        if not is_valid:
+            logger.warning(f"manifest 校验警告: {reason}(继续恢复)")
+        else:
+            logger.info(f"manifest 校验通过: {reason}")
+
+        # 校验 checksum
+        if manifest.get("checksum_sha256"):
+            tables_content = json.dumps(data.get("tables", {}), default=str, ensure_ascii=False).encode("utf-8")
+            if not verify_checksum(tables_content, manifest["checksum_sha256"]):
+                logger.error("checksum 校验失败:备份数据可能已损坏")
+                sys.exit(1)
+            logger.info("checksum 校验通过")
+
     logger.info(
         f"备份时间: {data.get('backup_time', '未知')}, "
         f"表: {', '.join(data.get('tables', {}).keys())}"
     )
-    # R35 P1-7: 打印 bundle manifest 摘要(如果存在)
-    manifest = data.get("manifest")
+    # R35 P1-7 + R36 H7: 打印 bundle manifest 摘要
+    manifest = data.get("manifest", {})
     if manifest:
         logger.info(
             f"Bundle manifest: commit={manifest.get('commit_sha', 'unknown')}, "
             f"schema={manifest.get('schema_version', 'unknown')}, "
             f"checksum={manifest.get('checksum_sha256', 'unknown')[:16]}..., "
-            f"tables={manifest.get('total_tables', '?')}, rows={manifest.get('total_rows', '?')}"
+            f"tables={manifest.get('total_tables', '?')}, rows={manifest.get('total_rows', '?')}, "
+            f"type={manifest.get('backup_type', 'unknown')}, "
+            f"encrypted={encryption_info.get('encrypted', False)}"
         )
     return data
 

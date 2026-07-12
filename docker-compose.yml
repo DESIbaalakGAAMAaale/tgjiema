@@ -1,31 +1,235 @@
-# TG文件解码器 — Docker Compose 一键部署
-# 环形冗余 v2 架构（up / idx / dsp / mon / admin_bot）
-# file_bot 已独立部署至 CF Workers
+# TG文件解码器 — Docker Compose 多服务部署
+# R36 H8: 从 config/services.yaml 派生,与 systemd 一致的服务清单
+# 环形冗余 v2 架构(up / idx / dsp / mon / admin_bot / admin / db_writer / crdb_sync / db_backup)
 #
 # 部署步骤:
-#   1. 创建 .env 文件（从 .env.example 复制并填写）
-#   2. 编辑 config/groups.yaml（填写 15 组的 channel_id）
+#   1. 创建 .env 文件(从 .env.example 复制并填写)
+#   2. 编辑 config/groups.yaml(填写 15 组的 channel_id)
 #   3. docker-compose up -d --build
-#   4. 拓扑已自动初始化（run_all.py 启动时自动执行 seed_topology）
+#   4. 拓扑已自动初始化(run_all.py 启动时自动执行 seed_topology)
+#
+# R36 H8: 每个服务使用最小 secrets 注入(.env.secrets.<service>),
+#         不再共享完整 .env,与 systemd 模型一致。
 
 services:
-  app:
-    build: .
-    container_name: tgjiema
+  # ── Redis (基础设施) ──
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── migration (oneshot,DDL 执行) ──
+  migration:
+    build: .
+    container_name: tgjiema-migration
+    restart: "no"
+    env_file:
+      - .env.shared
+    environment:
+      - SERVICE_ROLE=migration
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    command: python -c "import asyncio; from database.session import init_db; asyncio.run(init_db())"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── db_writer (Redis Stream 消费 → CRDB 写入) ──
+  db_writer:
+    build: .
+    container_name: tgjiema-db_writer
+    restart: on-failure
+    env_file:
+      - .env.shared
+    environment:
+      - SERVICE_ROLE=db_writer
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    command: python run_all.py --standalone db_writer
+    depends_on:
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+
+  # ── crdb_sync (单一 CRDB 同步服务) ──
+  crdb_sync:
+    build: .
+    container_name: tgjiema-crdb_sync
+    restart: on-failure
+    env_file:
+      - .env.shared
+    env_file_secrets:
+      - .env.secrets.crdb_sync
+    environment:
+      - SERVICE_ROLE=crdb_sync
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    command: python run_all.py --standalone crdb_sync
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+
+  # ── up (上传接收 Bot) ──
+  up:
+    build: .
+    container_name: tgjiema-up
+    restart: always
+    env_file:
+      - .env.shared
+      - .env.secrets.up
+    environment:
+      - SERVICE_ROLE=up
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    command: python run_all.py --standalone up
+    depends_on:
+      redis:
+        condition: service_healthy
+      db_writer:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
+
+  # ── idx (解码索引 Bot) ──
+  idx:
+    build: .
+    container_name: tgjiema-idx
+    restart: always
+    env_file:
+      - .env.shared
+      - .env.secrets.idx
+    environment:
+      - SERVICE_ROLE=idx
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    command: python run_all.py --standalone idx
+    depends_on:
+      redis:
+        condition: service_healthy
+      db_writer:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
+
+  # ── dsp (派送分发 Bot) ──
+  dsp:
+    build: .
+    container_name: tgjiema-dsp
+    restart: always
+    env_file:
+      - .env.shared
+      - .env.secrets.dsp
+    environment:
+      - SERVICE_ROLE=dsp
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    command: python run_all.py --standalone dsp
+    depends_on:
+      redis:
+        condition: service_healthy
+      db_writer:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
+
+  # ── mon (监控管理 Bot) ──
+  mon:
+    build: .
+    container_name: tgjiema-mon
+    restart: always
+    env_file:
+      - .env.shared
+      - .env.secrets.mon
+    environment:
+      - SERVICE_ROLE=mon
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    command: python run_all.py --standalone mon
+    depends_on:
+      redis:
+        condition: service_healthy
+      db_writer:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
+
+  # ── admin_bot (管理员 Bot) ──
+  admin_bot:
+    build: .
+    container_name: tgjiema-admin_bot
+    restart: always
+    env_file:
+      - .env.shared
+      - .env.secrets.admin_bot
+    environment:
+      - SERVICE_ROLE=admin_bot
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    command: python run_all.py --standalone admin_bot
+    depends_on:
+      redis:
+        condition: service_healthy
+      db_writer:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
+
+  # ── admin (Web 管理后台) ──
+  admin:
+    build: .
+    container_name: tgjiema-admin
+    restart: always
     ports:
       - "127.0.0.1:8080:8080"
     env_file:
-      - .env
+      - .env.shared
+      - .env.secrets.admin
     environment:
+      - SERVICE_ROLE=admin
       - PYTHONUNBUFFERED=1
     volumes:
-      - ./data:/app/data        # SQLite relay_pool.db 持久化
-      - ./logs:/app/logs        # 日志持久化
-      - ./config:/app/config    # 配置文件挂载（方便修改）
-    # 可选：单独启动某个组件
-    # command: python run_all.py up idx dsp mon admin_bot
-    command: python run_all.py
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    command: python run_all.py --standalone admin
+    depends_on:
+      redis:
+        condition: service_healthy
+      db_writer:
+        condition: service_started
+      migration:
+        condition: service_completed_successfully
     cap_drop:
       - ALL
     deploy:
@@ -33,7 +237,6 @@ services:
         limits:
           cpus: '4.0'
           memory: 2G
-    # 健康检查: 通过 admin web 的 /health 端点验证整体服务状态
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; r=urllib.request.urlopen('http://localhost:8080/health'); exit(0 if r.status==200 else 1)\" || exit 1"]
       interval: 30s
@@ -45,3 +248,26 @@ services:
       options:
         max-size: "10m"
         max-file: "7"
+
+  # ── db_backup (数据库备份,增量 watermark + 加密) ──
+  db_backup:
+    build: .
+    container_name: tgjiema-db_backup
+    restart: on-failure
+    env_file:
+      - .env.shared
+      - .env.secrets.db_backup
+    environment:
+      - SERVICE_ROLE=db_backup
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+      - ./logs:/app/logs
+    command: python run_all.py --standalone db_backup
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+
+volumes:
+  redis_data:

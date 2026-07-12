@@ -58,6 +58,7 @@ def _install_fake_config() -> None:
     settings.CRDB_POOL_MIN_SIZE = 0  # R36 §6.4.1: 默认 0(空闲时关闭连接)
     settings.CRDB_POOL_MAX_SIZE = 2  # R36 §6.4.1: 默认 2(业务 Bot ≤2)
     settings.CRDB_APPLICATION_NAME_PREFIX = "tgjiema"  # R36 §6.4.2
+    settings.BACKUP_KEK = ""  # R36 H7: 默认空(未配置加密)
 
     fake_config = types.ModuleType("config")
     fake_config.settings = settings
