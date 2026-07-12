@@ -2038,13 +2038,14 @@ class CacheStore:
         self, group_id: int, file_unique_id: str, src_channel_id: int,
         dst_channel_id: int, src_msg_id: int, media_group_id: str = "",
         task_type: str = "replica", priority: int = 5,
-    ) -> None:
-        """创建副本复制任务(INSERT OR IGNORE 幂等)。
+    ) -> int:
+        """创建副本复制任务(INSERT OR IGNORE 幂等),返回 task_id(0 表示失败或已存在)。
 
         基于 UNIQUE(group_id, file_unique_id, src_channel_id, dst_channel_id) 去重。
+        若任务已存在(INSERT OR IGNORE 跳过),返回已有记录的 task_id。
         """
         if not self._db or not file_unique_id:
-            return
+            return 0
         now = time.time()
         for attempt in range(3):
             try:
@@ -2060,14 +2061,21 @@ class CacheStore:
                      src_msg_id, media_group_id or "", task_type, priority, now, now),
                 )
                 await self._db.commit()
-                return
+                # 获取 task_id(新插入的用 lastrowid,已存在的用 SELECT)
+                cursor = await self._db.execute(
+                    "SELECT task_id FROM replication_tasks "
+                    "WHERE group_id=? AND file_unique_id=? AND src_channel_id=? AND dst_channel_id=?",
+                    (group_id, file_unique_id, src_channel_id, dst_channel_id),
+                )
+                row = await cursor.fetchone()
+                return row[0] if row else 0
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
                 if self._in_writer_tx:
                     raise
-                return
+                return 0
 
     async def get_pending_replication_tasks(
         self, limit: int = 10, priority_max: int = 10,

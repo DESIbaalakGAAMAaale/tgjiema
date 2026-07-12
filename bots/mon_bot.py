@@ -147,6 +147,56 @@ class MonBot:
                     c[k] = v
                 break
 
+    # ─── R35 P0-4 §23: CAS/fencing 接线 — 拓扑变更使用租约 + CAS ───
+    # 防止双控制面(Mon/Dsp)同时改写同一 cell,通过 topology_version 递增 + 租约互斥实现并发安全。
+    # 异常安全: 租约/CAS 失败只记录 warning,不阻塞拓扑变更(降级到原有 update_cell_fields_local)。
+
+    async def _acquire_cell_lease_safe(self, slot_id: str, lease_seconds: int = 300) -> bool:
+        """安全获取 cell 租约(异常不传播)。
+
+        Returns: True 表示获取成功, False 表示被其他控制面持有或出错。
+        """
+        try:
+            store = get_cache_store()
+            return await store.acquire_cell_lease(slot_id, owner="mon_bot", lease_seconds=lease_seconds)
+        except Exception as e:
+            logger.warning(f"[Mon][CAS] 获取租约失败 (slot={slot_id}): {e}")
+            return False
+
+    async def _release_cell_lease_safe(self, slot_id: str):
+        """安全释放 cell 租约(异常不传播)。"""
+        try:
+            store = get_cache_store()
+            await store.release_cell_lease(slot_id, owner="mon_bot")
+        except Exception as e:
+            logger.warning(f"[Mon][CAS] 释放租约失败 (slot={slot_id}): {e}")
+
+    async def _cas_transition_cell_safe(
+        self, slot_id: str, expected_status: str, new_status: str,
+        **update_fields,
+    ) -> bool:
+        """安全 CAS 转换 cell 状态(异常不传播)。
+
+        使用 cas_transition_cell 实现 Compare-And-Swap:
+        - 仅当当前 status == expected_status 时才更新
+        - 成功时 topology_version 递增(fencing token)
+        - **update_fields 支持附加字段(如 channel_id, account_name)
+
+        Returns: True 表示 CAS 成功, False 表示状态已被其他控制面改写或出错。
+        """
+        try:
+            store = get_cache_store()
+            import uuid as _uuid
+            transition_id = f"mon_{_uuid.uuid4().hex[:8]}"
+            return await store.cas_transition_cell(
+                slot_id, expected_status, new_status,
+                lease_owner="mon_bot", transition_id=transition_id,
+                lease_seconds=60, **update_fields,
+            )
+        except Exception as e:
+            logger.warning(f"[Mon][CAS] CAS 转换失败 (slot={slot_id}, {expected_status}→{new_status}): {e}")
+            return False
+
     async def _watch_cells_change_loop(self):
         """C3: 每 5 秒检查 cells_change_notify,发现外部变更(admin_bot 增减槽位)
         立即失效内存缓存,将感知延迟从 ~10 分钟降到 ~5 秒。
@@ -484,14 +534,28 @@ class MonBot:
                 return
             new_status = status if status in ("active", "shadow1", "shadow2", "r100") else "active"
             now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-            await store.update_cell_fields_local(slot_id, {
-                "channel_id": spare_ch,
-                "status": new_status,
-                "account_name": account_name,
-                "file_count": 0,
-                "last_synced_msg_id": 0,  # 归零触发 auto_fill_new_channels 补齐存量
-                "rotation_started_at": now_iso,
-            }, mark_dirty=True)
+            # R35 P0-4 §23: 拓扑变更前获取租约 + CAS 转换(防止双控制面并发改写)
+            await self._acquire_cell_lease_safe(slot_id, lease_seconds=300)
+            try:
+                cas_ok = await self._cas_transition_cell_safe(
+                    slot_id, status, new_status,
+                    channel_id=spare_ch, account_name=account_name,
+                    file_count=0, last_synced_msg_id=0,
+                    rotation_started_at=now_iso,
+                )
+                if not cas_ok:
+                    # CAS 失败(状态已被其他控制面改写),降级到原有 update_cell_fields_local
+                    logger.warning(f"[Mon][CAS] 封禁替换 CAS 失败,降级到 update_cell_fields_local (slot={slot_id})")
+                    await store.update_cell_fields_local(slot_id, {
+                        "channel_id": spare_ch,
+                        "status": new_status,
+                        "account_name": account_name,
+                        "file_count": 0,
+                        "last_synced_msg_id": 0,  # 归零触发 auto_fill_new_channels 补齐存量
+                        "rotation_started_at": now_iso,
+                    }, mark_dirty=True)
+            finally:
+                await self._release_cell_lease_safe(slot_id)
             self._update_cell_in_cache(slot_id, {
                 "channel_id": spare_ch, "status": new_status,
                 "file_count": 0, "last_synced_msg_id": 0,
@@ -534,7 +598,19 @@ class MonBot:
                 "/spare_add <频道ID> [账号名]\n"
             )
             if status in ("active", "shadow1", "shadow2"):
-                await store.update_cell_fields_local(slot_id, {"status": "lost", "next_active_chat_id": None}, mark_dirty=True)
+                # R35 P0-4 §23: 拓扑变更前获取租约 + CAS 转换(降级为 lost)
+                await self._acquire_cell_lease_safe(slot_id, lease_seconds=300)
+                try:
+                    cas_ok = await self._cas_transition_cell_safe(
+                        slot_id, status, "lost",
+                        next_active_chat_id=None,
+                    )
+                    if not cas_ok:
+                        # CAS 失败,降级到原有 update_cell_fields_local
+                        logger.warning(f"[Mon][CAS] 降级 lost CAS 失败,降级到 update_cell_fields_local (slot={slot_id})")
+                        await store.update_cell_fields_local(slot_id, {"status": "lost", "next_active_chat_id": None}, mark_dirty=True)
+                finally:
+                    await self._release_cell_lease_safe(slot_id)
                 self._update_cell_in_cache(slot_id, {"status": "lost", "next_active_chat_id": None})
                 await log_rotate(
                     from_slot_id=slot_id, to_slot_id="NONE",
@@ -565,13 +641,26 @@ class MonBot:
             try:
                 await self.bot.get_chat(channel_id)
                 # 频道可访问，恢复为 shadow2
-                await store.update_cell_fields_local(slot_id, {
-                    "status": "shadow2",
-                    "next_active_chat_id": None,
-                    "degrade_count": 0,
-                    "file_count": 0,
-                    "demoted_to_channel_id": None,
-                }, mark_dirty=True)
+                # R35 P0-4 §23: 拓扑变更前获取租约 + CAS 转换(lost → shadow2)
+                await self._acquire_cell_lease_safe(slot_id, lease_seconds=300)
+                try:
+                    cas_ok = await self._cas_transition_cell_safe(
+                        slot_id, "lost", "shadow2",
+                        next_active_chat_id=None, degrade_count=0,
+                        file_count=0, demoted_to_channel_id=None,
+                    )
+                    if not cas_ok:
+                        # CAS 失败,降级到原有 update_cell_fields_local
+                        logger.warning(f"[Mon][CAS] lost 恢复 CAS 失败,降级到 update_cell_fields_local (slot={slot_id})")
+                        await store.update_cell_fields_local(slot_id, {
+                            "status": "shadow2",
+                            "next_active_chat_id": None,
+                            "degrade_count": 0,
+                            "file_count": 0,
+                            "demoted_to_channel_id": None,
+                        }, mark_dirty=True)
+                finally:
+                    await self._release_cell_lease_safe(slot_id)
                 self._update_cell_in_cache(slot_id, {
                     "status": "shadow2", "next_active_chat_id": None,
                     "degrade_count": 0, "file_count": 0,
@@ -780,7 +869,16 @@ class MonBot:
             self._update_cell_in_cache(prev_slot_id, {"next_active_chat_id": new_next})
 
         store = get_cache_store()
-        await store.batch_update_cells_local(batch_updates)
+        # R35 P0-4 §23: 批量轮转前获取所有受影响 cell 的租约(防止 Dsp 并发改写)
+        _rotation_slot_ids = [sid for sid, _, _ in batch_updates if sid]
+        for _sid in _rotation_slot_ids:
+            await self._acquire_cell_lease_safe(_sid, lease_seconds=120)
+        try:
+            await store.batch_update_cells_local(batch_updates)
+        finally:
+            # 轮转完成后释放所有租约
+            for _sid in _rotation_slot_ids:
+                await self._release_cell_lease_safe(_sid)
 
         # ── 轮转后重建环指针:确保所有 active 槽位形成闭环 ──
         # 轮转可能导致 next 指针指向非 active 频道(如 a 槽位是 shadow1),

@@ -169,6 +169,71 @@ async def _create_outbox_entry_safe(
         logger.warning(f"[Up] 创建 outbox 条目失败 upload_id={upload_id} event={event_type}: {e}")
 
 
+# ─── R35 P0-4 §24: replication_tasks 副本复制任务接线 ───
+# 在 copy_messages 调用点创建/推进 replication_tasks 状态机:
+# PLANNED → COPYING → COPIED_UNVERIFIED → COMMITTED / FAILED
+# 异常安全: 所有 replication_tasks 写入失败只记录 warning,不传播到主流程。
+
+async def _create_replication_task_safe(
+    group_id: int, file_unique_id: str, src_channel_id: int,
+    dst_channel_id: int, src_msg_id: int, media_group_id: str = "",
+) -> int:
+    """安全创建 replication_task(PLANNED),返回 task_id(0 表示失败)。
+
+    异常安全: 失败只记录 warning,不传播到主流程。
+    """
+    if not file_unique_id or not group_id:
+        return 0
+    try:
+        return await get_cache_store().create_replication_task(
+            group_id, file_unique_id, src_channel_id, dst_channel_id,
+            src_msg_id, media_group_id=media_group_id,
+        )
+    except Exception as e:
+        logger.warning(f"[Up] 创建 replication_task 失败(不影响主流程, fuid={file_unique_id}): {e}")
+        return 0
+
+
+async def _mark_replication_copying_safe(task_id: int) -> None:
+    """安全标记 replication_task 为 COPYING。"""
+    if not task_id:
+        return
+    try:
+        await get_cache_store().mark_replication_copying(task_id)
+    except Exception as e:
+        logger.warning(f"[Up] 标记 replication COPYING 失败(不影响主流程, task_id={task_id}): {e}")
+
+
+async def _mark_replication_copied_safe(task_id: int, dst_msg_id: int) -> None:
+    """安全标记 replication_task 为 COPIED_UNVERIFIED。"""
+    if not task_id:
+        return
+    try:
+        await get_cache_store().mark_replication_copied(task_id, dst_msg_id)
+    except Exception as e:
+        logger.warning(f"[Up] 标记 replication COPIED_UNVERIFIED 失败(不影响主流程, task_id={task_id}): {e}")
+
+
+async def _mark_replication_committed_safe(task_id: int) -> None:
+    """安全标记 replication_task 为 COMMITTED。"""
+    if not task_id:
+        return
+    try:
+        await get_cache_store().mark_replication_committed(task_id)
+    except Exception as e:
+        logger.warning(f"[Up] 标记 replication COMMITTED 失败(不影响主流程, task_id={task_id}): {e}")
+
+
+async def _mark_replication_failed_safe(task_id: int, reason: str) -> None:
+    """安全标记 replication_task 为 FAILED/PLANNED(重试)。"""
+    if not task_id:
+        return
+    try:
+        await get_cache_store().mark_replication_failed(task_id, reason)
+    except Exception as e:
+        logger.warning(f"[Up] 标记 replication FAILED 失败(不影响主流程, task_id={task_id}): {e}")
+
+
 def _build_input_media(file_meta: dict):
     """从 file_meta 构造 InputMedia* 对象(用于 send_media_group)。
     返回 None 表示该类型不支持媒体组(animation/sticker/voice)。
@@ -1094,6 +1159,17 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     if not dedup_hit:
         batch_success = False
+        # R35 P0-4 §24: 复制前为每个文件创建 replication_task(PLANNED)
+        _mg_task_ids: list[int] = []
+        for up in updates:
+            _mg_fuid = _extract_file_unique_id(up.message)
+            _tid = await _create_replication_task_safe(
+                group_id or 0, _mg_fuid, src_chat_id, target_ch,
+                up.message.message_id, media_group_id=media_group_id,
+            )
+            _mg_task_ids.append(_tid)
+        for _tid in _mg_task_ids:
+            await _mark_replication_copying_safe(_tid)
         try:
             copied = await safe_copy_messages(context.bot, target_ch, src_chat_id, src_msg_ids)
             if copied and len(copied) == total_count:
@@ -1109,6 +1185,11 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                 for up in updates:
                     asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
                 batch_success = True
+                # R35 P0-4 §24: 批量 copy 成功,标记每个任务 COPIED_UNVERIFIED → COMMITTED
+                for idx, _tid in enumerate(_mg_task_ids):
+                    if idx < len(all_mids):
+                        await _mark_replication_copied_safe(_tid, all_mids[idx])
+                        await _mark_replication_committed_safe(_tid)
                 try:
                     await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
                 except Exception:
@@ -1122,6 +1203,9 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                 )
         except Exception as e:
             logger.warning(f"[Up] copy_messages 批量复制失败,回退逐条: {e}")
+            # R35 P0-4 §24: 批量失败,标记所有任务 FAILED
+            for _tid in _mg_task_ids:
+                await _mark_replication_failed_safe(_tid, f"mg_batch_copy_failed: {e}")
 
         if not batch_success:
             # 回退逐条 copy_message
@@ -1135,9 +1219,16 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                         target_ch, forwarded.message_id, up.message, detect_file_type(up),
                     ))
                     asyncio.create_task(_forward_to_r100(context, up.effective_chat.id, up.message.message_id))
+                    # R35 P0-4 §24: 逐条回退成功,标记 COPIED_UNVERIFIED → COMMITTED
+                    if i < len(_mg_task_ids):
+                        await _mark_replication_copied_safe(_mg_task_ids[i], forwarded.message_id)
+                        await _mark_replication_committed_safe(_mg_task_ids[i])
                 except Exception as e:
                     logger.error(f"[Up] media group copy failed: {e}")
                     failed_count += 1
+                    # R35 P0-4 §24: 逐条也失败,标记 FAILED
+                    if i < len(_mg_task_ids):
+                        await _mark_replication_failed_safe(_mg_task_ids[i], f"mg_single_copy_failed: {e}")
                 if (i + 1) % 3 == 0 or i == total_count - 1:
                     try:
                         await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
@@ -1228,17 +1319,32 @@ async def _process_upload(
             primary_msg_ids=[channel_msg_id],
         )
     else:
+        # R35 P0-4 §24: 复制前创建 replication_task(PLANNED)
+        _fuid = _extract_file_unique_id(update.message)
+        await _ensure_channel_group_map()
+        _group_id = _channel_to_group.get(main_channel, 0)
+        _repl_task_id = await _create_replication_task_safe(
+            _group_id, _fuid, update.effective_chat.id,
+            main_channel, update.message.message_id,
+        )
+        await _mark_replication_copying_safe(_repl_task_id)
         try:
             forwarded = await safe_copy_message(context.bot, main_channel, update.effective_chat.id, update.message.message_id)
             channel_msg_id = forwarded.message_id
+            # R35 P0-4 §24: copy 返回 dst_msg_id 后先写任务(COPIED_UNVERIFIED)
+            await _mark_replication_copied_safe(_repl_task_id, channel_msg_id)
             # Manifest 登记(异步,失败不影响主流程)
             asyncio.create_task(_register_manifest(
                 main_channel, channel_msg_id, update.message,
                 next(iter(file_types.keys()), "") if file_types else "",
             ))
+            # R35 P0-4 §24: manifest 写入后标记 COMMITTED
+            await _mark_replication_committed_safe(_repl_task_id)
         except Exception as e:
             logger.error(f"[Up] 转发文件到存储频道失败 {e}")
             await metrics.record_error("up_bot")
+            # R35 P0-4 §24: 复制失败,标记 replication_task FAILED
+            await _mark_replication_failed_safe(_repl_task_id, f"copy_failed: {e}")
             # R35 P0-4: Telegram copy 失败,推进到 FAILED_RETRYABLE
             await _transition_upload_session_safe(
                 upload_id, "FAILED_RETRYABLE", reason=f"copy_failed: {e}",
@@ -1860,6 +1966,19 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         from utils.flood_waiter import safe_copy_messages
         from_chat = pending_copies[0][0]
         copy_msg_ids = [pc[1] for pc in pending_copies]
+        # R35 P0-4 §24: 复制前为每个文件创建 replication_task(PLANNED)
+        await _ensure_channel_group_map()
+        _ext_group_id = _channel_to_group.get(target_ch, 0)
+        _ext_task_ids: list[int] = []
+        for pc in pending_copies:
+            _pc_fuid = pc[3].get("file_unique_id", "") if isinstance(pc[3], dict) else ""
+            _tid = await _create_replication_task_safe(
+                _ext_group_id, _pc_fuid, pc[0], target_ch, pc[1],
+            )
+            _ext_task_ids.append(_tid)
+        # 标记 COPYING
+        for _tid in _ext_task_ids:
+            await _mark_replication_copying_safe(_tid)
         try:
             if len(copy_msg_ids) == 1:
                 from utils.flood_waiter import safe_copy_message
@@ -1876,10 +1995,16 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
                     files_meta.append(fm)
                     file_types[ft] += 1
                     copied_map[src_mid] = new_mid
+                    # R35 P0-4 §24: copy 返回 dst_msg_id 后标记 COPIED_UNVERIFIED
+                    if i < len(_ext_task_ids):
+                        await _mark_replication_copied_safe(_ext_task_ids[i], new_mid)
         except Exception as e:
             logger.error(f"[Up][ext_relay] 批量 copy 失败,回退逐条 (code={external_code}): {e}")
+            # R35 P0-4 §24: 批量失败,标记所有任务 FAILED
+            for _tid in _ext_task_ids:
+                await _mark_replication_failed_safe(_tid, f"ext_batch_copy_failed: {e}")
             from utils.flood_waiter import safe_copy_message
-            for from_chat, msg_id, ft, fm in pending_copies:
+            for idx, (from_chat, msg_id, ft, fm) in enumerate(pending_copies):
                 try:
                     forwarded = await safe_copy_message(_bot, target_ch, from_chat, msg_id)
                     new_mid = forwarded.message_id
@@ -1887,8 +2012,14 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
                     files_meta.append(fm)
                     file_types[ft] += 1
                     copied_map[msg_id] = new_mid
+                    # R35 P0-4 §24: 逐条回退成功,标记 COPIED_UNVERIFIED
+                    if idx < len(_ext_task_ids):
+                        await _mark_replication_copied_safe(_ext_task_ids[idx], new_mid)
                 except Exception as e2:
                     logger.error(f"[Up][ext_relay] 逐条 copy 也失败 (msg={msg_id}): {e2}")
+                    # R35 P0-4 §24: 逐条也失败,标记 FAILED
+                    if idx < len(_ext_task_ids):
+                        await _mark_replication_failed_safe(_ext_task_ids[idx], f"ext_single_copy_failed: {e2}")
 
     if not msg_ids:
         logger.warning(f"[Up][ext_relay] 外部文件缓冲区为空，跳过 (code={external_code})")
@@ -1974,6 +2105,9 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         file_meta=files_meta, event_type="ARCHIVE_R100",
         protect=0,
     )
+    # R35 P0-4 §24: pending_uploads + outbox 写入成功,标记 replication_tasks COMMITTED
+    for _tid in _ext_task_ids:
+        await _mark_replication_committed_safe(_tid)
 
     try:
         await get_cache_store().notify_new_upload()

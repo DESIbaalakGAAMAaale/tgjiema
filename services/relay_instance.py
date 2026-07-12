@@ -86,6 +86,8 @@ class RelayInstance:
         self._download_buffers: dict[str, list] = {}
         # P3-2: 消息引用缓冲 — 所有文件先缓冲,最后统一批量作为媒体组发送(避免逐个发送破坏相册格式)
         self._pending_msgs: dict[str, list] = {}
+        # R35 P0-4 §25: relay_spool 接线 — code → spool_id 映射,用于跟踪临时文件生命周期
+        self._spool_ids: dict[str, int] = {}
         # B1: 指数退避 — bot 级别连续限速计数,等待时间指数递增
         # bot_username_lower -> {"count": N, "next_backoff": seconds, "last_at": ts}
         self._bot_backoff: dict[str, dict] = {}
@@ -615,10 +617,65 @@ class RelayInstance:
                 "orig_caption": orig_caption,
             })
             logger.info(f"[RelayInstance:{self.phone}] 下载并缓冲到临时文件 (code={code}, 已缓冲{len(buf)}个, path={tmp_path})")
+            # R35 P0-4 §25: 收到第三方 Bot 媒体时立即创建 spool 记录(状态 RECEIVED)
+            # 异常安全: spool 写入失败不传播到主流程,只记录 warning
+            await self._ensure_spool_for_code(code, user_id_buf=0, tmp_path=tmp_path)
         except Exception as e2:
             if _is_ban_error(e2):
                 self.record_ban(str(e2))
             logger.error(f"[RelayInstance:{self.phone}] 下载缓冲失败 (code={code}): {e2}")
+
+    async def _ensure_spool_for_code(self, code: str, user_id_buf: int = 0, tmp_path: str = ""):
+        """R35 P0-4 §25: 确保 relay_spool 记录存在(幂等创建)。
+
+        - 若 self._spool_ids[code] 已存在,更新 buffered_files 列表
+        - 否则创建新 spool 记录(status=RECEIVED),记录 spool_id
+        - 异常安全: 失败只记录 warning,不传播到主流程
+        """
+        try:
+            from database.relay_db import get_relay_db
+            import json as _json
+            db = await get_relay_db()
+            existing_spool_id = self._spool_ids.get(code)
+            if existing_spool_id:
+                # 已有 spool,更新 buffered_files 列表(追加新文件路径)
+                spool = await db.get_relay_spool(existing_spool_id)
+                if spool and spool.get("status") not in ("ACKED", "FAILED"):
+                    buffered_files = spool.get("buffered_files") or []
+                    if tmp_path and tmp_path not in buffered_files:
+                        buffered_files.append(tmp_path)
+                    await db.transition_spool_status(
+                        existing_spool_id, "BUFFERED",
+                        buffered_files=_json.dumps(buffered_files),
+                    )
+                return
+            # 创建新 spool 记录
+            buffered_files = [tmp_path] if tmp_path else []
+            spool_id = await db.create_relay_spool(
+                relay_account_id=self.account_id,
+                code=code,
+                user_id=user_id_buf,
+                external_code=code,
+                buffered_files=buffered_files,
+                ttl_seconds=3600,  # 1 小时 TTL,留足 Up Bot 恢复时间
+            )
+            if spool_id:
+                self._spool_ids[code] = spool_id
+                logger.info(f"[RelayInstance:{self.phone}] 已创建 relay_spool (code={code}, spool_id={spool_id})")
+        except Exception as e:
+            logger.warning(f"[RelayInstance:{self.phone}] relay_spool 创建/更新失败(不影响主流程, code={code}): {e}")
+
+    async def _transition_spool_safe(self, code: str, new_status: str, reason: str = ""):
+        """R35 P0-4 §25: 安全推进 relay_spool 状态(异常不传播)。"""
+        try:
+            spool_id = self._spool_ids.get(code)
+            if not spool_id:
+                return
+            from database.relay_db import get_relay_db
+            db = await get_relay_db()
+            await db.transition_spool_status(spool_id, new_status, reason=reason)
+        except Exception as e:
+            logger.warning(f"[RelayInstance:{self.phone}] relay_spool 状态推进失败(不影响主流程, code={code}, status={new_status}): {e}")
 
     async def _flush_download_buffer(self, user_id: int, code: str):
         """统一批量发送所有缓冲文件给 Up Bot(保持媒体组格式)。
@@ -632,8 +689,15 @@ class RelayInstance:
         if not pending and not downloads:
             return
         if not self._up_bot_entity:
-            logger.warning(f"[RelayInstance:{self.phone}] Up Bot 不可用,丢弃缓冲 (code={code}, pending={len(pending)}, downloads={len(downloads)})")
-            self._cleanup_tmp_files(downloads)
+            # R35 P0-4 §25: Up Bot 不可用时保留临时文件,不得删除!
+            # 将 downloads 放回 _download_buffers,spool 状态保持 BUFFERED
+            if downloads:
+                self._download_buffers[code] = downloads
+            logger.warning(
+                f"[RelayInstance:{self.phone}] Up Bot 不可用,文件保留在 spool 中 "
+                f"(code={code}, pending={len(pending)}, downloads={len(downloads)})"
+            )
+            await self._transition_spool_safe(code, "BUFFERED", reason="Up Bot 不可用,文件保留")
             return
         _code_hex = code.encode('utf-8').hex()
         # 找到第一个非空 orig_caption(pending 和 downloads 都检查)
@@ -654,10 +718,14 @@ class RelayInstance:
             media_list = [item["msg"].media for item in pending
                          if item["msg"].media and not isinstance(item["msg"].media, MessageMediaWebPage)]
             if media_list:
+                # R35 P0-4 §25: 推进 spool 状态 FORWARDING(正在转发)
+                await self._transition_spool_safe(code, "FORWARDING", reason="引用批量发送")
                 sent = await self._send_batch_as_album(media_list, first_caption, code, "引用")
                 if sent:
-                    # 引用发送成功,清理 downloads(如果有)并返回
+                    # R35 P0-4 §25: Up Bot 接收成功,推进 ACKED 后才删除临时文件
+                    await self._transition_spool_safe(code, "ACKED", reason="引用发送成功")
                     self._cleanup_tmp_files(downloads)
+                    self._spool_ids.pop(code, None)
                     return
                 # 引用发送失败(可能是 protected chat),下载所有 pending 到临时文件
                 logger.warning(f"[RelayInstance:{self.phone}] 引用批量发送失败,下载到临时文件 (code={code})")
@@ -670,8 +738,13 @@ class RelayInstance:
         # 2. 用临时文件批量发送(downloads)
         if downloads:
             path_list = [item["path"] for item in downloads]
+            # R35 P0-4 §25: 推进 spool 状态 FORWARDING(正在转发)
+            await self._transition_spool_safe(code, "FORWARDING", reason="临时文件批量发送")
             await self._send_batch_as_album(path_list, first_caption, code, "临时文件")
+            # R35 P0-4 §25: Up Bot 接收成功,推进 ACKED 后才删除临时文件
+            await self._transition_spool_safe(code, "ACKED", reason="临时文件发送成功")
             self._cleanup_tmp_files(downloads)
+            self._spool_ids.pop(code, None)
 
     async def _send_batch_as_album(self, media_list: list, first_caption: str, code: str, mode: str) -> bool:
         """将 media_list 分批作为媒体组相册发送给 Up Bot。
@@ -1469,6 +1542,9 @@ class RelayInstance:
             buf = self._download_buffers.pop(code, None)
             if buf:
                 self._cleanup_tmp_files(buf)
+            # R35 P0-4 §25: 异常路径清理时移除 spool_id 映射
+            # (spool 记录本身保留在 DB 中,可通过 cleanup_expired_spool 或人工排查处理)
+            self._spool_ids.pop(code, None)
 
     async def _mark_code_mapped(self, code: str):
         """标记码已成功映射到本地缓存，避免重复查询 CRDB。"""
@@ -1584,5 +1660,7 @@ class RelayInstance:
         for code, buf in list(self._download_buffers.items()):
             self._cleanup_tmp_files(buf)
         self._download_buffers.clear()
+        # R35 P0-4 §25: 清理 spool_id 映射(spool 记录保留在 DB 中,由 TTL 清理)
+        self._spool_ids.clear()
         if self._client:
             await self._client.disconnect()
