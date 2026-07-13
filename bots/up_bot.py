@@ -1,6 +1,7 @@
 """Up Bot - 上传机器人(环形冗余架构)
 职责:接收用户文件 -> 轮转分发到活跃窗口内的 3 个 A 槽 (round-robin)
 """
+from __future__ import annotations
 
 import asyncio
 import datetime
@@ -71,8 +72,25 @@ _CHANNEL_GROUP_CACHE_TTL: float = 300.0  # 缓存 300 秒
 _pending_upload_meta: dict[str, dict] = {}
 _active_slot_index: int = 0
 _external_buffers: dict[str, dict] = {}
-_mg_lock = asyncio.Lock()  # 保护 _pending_media_groups 和 _external_buffers
-_pending_lock = asyncio.Lock()  # 保护 _active_slot_index 和 dict 操作
+# R45: 懒加载 Lock,避免模块导入时 Python 3.9 要求事件循环存在
+_mg_lock: asyncio.Lock | None = None
+_pending_lock: asyncio.Lock | None = None
+
+
+def _get_mg_lock() -> asyncio.Lock:
+    """懒加载 media group lock。"""
+    global _mg_lock
+    if _mg_lock is None:
+        _mg_lock = asyncio.Lock()
+    return _mg_lock
+
+
+def _get_pending_lock() -> asyncio.Lock:
+    """懒加载 pending upload lock。"""
+    global _pending_lock
+    if _pending_lock is None:
+        _pending_lock = asyncio.Lock()
+    return _pending_lock
 # PRE-15: 追踪已完成的 _finalize_upload 消息 ID，防止 Telegram 重复回调覆盖成功消息
 _finalized_msg_ids: set[int] = set()
 # 模块级 bot 引用,供 _flush_external_buffer 等非 handler 函数使用
@@ -84,6 +102,10 @@ _bot = None
 _external_mgid_map: dict[str, tuple[str, float]] = {}
 # 内存级 file_unique_id 去重：external_code -> (set of file_unique_id, created_at)
 _external_fuid_dedup: dict[str, tuple[set[str], float]] = {}
+# R45: 媒体组 group-level aggregate — 跟踪每个媒体组内所有文件的状态,
+# 只有所有文件都 READY 时才标记 group READY(禁止只按单文件状态判断)。
+# 结构: {media_group_id: {"files": {file_unique_id: {state, message_id, channel_id, ...}}, ...}}
+_media_group_states: dict[str, dict] = {}
 
 
 def _decode_external_code(code_part: str) -> str:
@@ -301,6 +323,94 @@ async def _create_outbox_entry_strict(
         ) from e
 
 
+# ─── R45: 媒体组 group-level aggregate + COPIED_UNREGISTERED ───
+# R42 终审报告第 9 节整改:
+# - Telegram copy 成功但 outbox 写失败时记录 COPIED_UNREGISTERED,不遗失目标 message_id
+# - 媒体组要有 group-level aggregate,禁止只按单文件状态判断 READY
+
+
+async def _mark_copied_unregistered(
+    upload_id: str,
+    media_group_id: str,
+    file_unique_id: str,
+    message_id: int,
+    channel_id: int,
+    reason: str = "",
+) -> None:
+    """R45: 记录 Telegram copy 成功但 outbox 写失败的情况(COPIED_UNREGISTERED)。
+
+    当 safe_copy_message/copy_messages 成功返回 message_id,但后续
+    add_dirty_outbox / create_outbox_entry 写入失败时调用此方法。
+    保留目标 message_id,使后续恢复流程可重新注册 manifest 而不需重新 copy。
+
+    Args:
+        upload_id: 上传会话 ID
+        media_group_id: 媒体组 ID(单文件时可用 file_unique_id 代替)
+        file_unique_id: 文件唯一标识
+        message_id: Telegram copy 成功返回的存储频道消息 ID
+        channel_id: 存储频道 ID
+        reason: 失败原因(如 "outbox_write_failed")
+    """
+    if not media_group_id:
+        media_group_id = file_unique_id or upload_id
+    mg_state = _media_group_states.get(media_group_id)
+    if mg_state is None:
+        mg_state = {
+            "files": {},
+            "upload_id": upload_id,
+            "user_id": 0,
+            "created_at": time.time(),
+            "group_state": "pending",
+        }
+        _media_group_states[media_group_id] = mg_state
+    files = mg_state.setdefault("files", {})
+    files[file_unique_id] = {
+        "state": "COPIED_UNREGISTERED",
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "reason": reason,
+        "marked_at": time.time(),
+    }
+    logger.warning(
+        f"[Up][R45] COPIED_UNREGISTERED: upload_id={upload_id} "
+        f"mg={media_group_id} fuid={file_unique_id} "
+        f"msg_id={message_id} ch={channel_id} reason={reason}"
+    )
+
+
+def _evaluate_media_group_state(media_group_id: str) -> str:
+    """R45: 根据媒体组内所有文件状态判定 group 级状态(group-level aggregate)。
+
+    禁止只按单文件状态判断 READY — 必须所有文件都 READY 才标记 group READY。
+
+    Returns:
+        'ready'   — 所有文件都 READY
+        'failed'  — 所有文件都 FAILED
+        'partial' — 部分文件 FAILED(但非全部)
+        'pending' — 无失败,但仍有文件未 READY(PENDING/COPIED_UNREGISTERED)
+    """
+    mg_state = _media_group_states.get(media_group_id)
+    if not mg_state or not mg_state.get("files"):
+        return "pending"
+    files = mg_state["files"]
+    total = len(files)
+    ready_count = 0
+    failed_count = 0
+    for fuid, fstate in files.items():
+        state = fstate.get("state", "PENDING") if isinstance(fstate, dict) else "PENDING"
+        if state == "READY":
+            ready_count += 1
+        elif state == "FAILED":
+            failed_count += 1
+    if ready_count == total:
+        return "ready"
+    if failed_count == total:
+        return "failed"
+    if failed_count > 0:
+        return "partial"
+    return "pending"
+
+
 # ─── R35 P0-4 §24: replication_tasks 副本复制任务接线 ───
 # 在 copy_messages 调用点创建/推进 replication_tasks 状态机:
 # PLANNED → COPYING → COPIED_UNVERIFIED → COMMITTED / FAILED
@@ -507,7 +617,7 @@ async def _cleanup_pending():
     while True:
         try:
             now = time.time()
-            async with _mg_lock:
+            async with _get_mg_lock():
                 # 清理超时的 media group (>30s)
                 expired_mg = [k for k, v in _pending_media_groups.items() if now - v.get("created_at", 0) > 30]
                 for k in expired_mg:
@@ -673,7 +783,7 @@ async def _get_upload_target_channel() -> int:
     # 轮转:每次取下一个活跃频道
     # P1-7: 在锁内同时完成取列表引用+取模+读 channel_id,
     # 避免 _refresh_active_slots 替换列表后 idx 越界。
-    async with _pending_lock:
+    async with _get_pending_lock():
         idx = _active_slot_index % len(_active_a_slots)
         _active_slot_index += 1
         channel_id = _active_a_slots[idx]["channel_id"]
@@ -942,7 +1052,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # PRE-13: 仅 flush 当前用户的 media group，避免清掉其他用户正在进行中的批次
-    async with _mg_lock:
+    async with _get_mg_lock():
         pending_mgids = [
             mgid for mgid, grp in _pending_media_groups.items()
             if grp.get("user_id") == user.id
@@ -1152,7 +1262,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if update.message.media_group_id:
         mgid = update.message.media_group_id
-        async with _mg_lock:
+        async with _get_mg_lock():
             if mgid not in _pending_media_groups:
                 _pending_media_groups[mgid] = {
                     "user_id": user.id,  # PRE-13: 标记所属用户，end_upload 仅 flush 本人的
@@ -1189,7 +1299,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE, batch: dict):
     """聚合批次中的媒体组消息到缓存,不立即复制(end_upload 时批量复制保持相册)。"""
-    async with _mg_lock:
+    async with _get_mg_lock():
         grp = _pending_media_groups.pop(mgid, None)
     if grp is None or not grp.get("updates"):
         return
@@ -1255,7 +1365,7 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     file_type = detect_file_type(update)
 
-    async with _mg_lock:
+    async with _get_mg_lock():
         if update.message.media_group_id not in _pending_media_groups:
             _pending_media_groups[update.message.media_group_id] = {
                 "user_id": user.id,
@@ -1278,7 +1388,7 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
-    async with _mg_lock:
+    async with _get_mg_lock():
         group = _pending_media_groups.pop(media_group_id, None)
     if group is None:
         return
@@ -2066,7 +2176,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         # 媒体组后续消息:从已有 buffer 获取 user_id,external_code 由参数提供
         external_code = ext_code_override
         orig_caption = ""  # 后续消息无 caption
-        async with _mg_lock:
+        async with _get_mg_lock():
             buf = _external_buffers.get(external_code)
             external_user_id = buf["user_id"] if buf else 0
             target_ch = buf["channel_id"] if buf else 0
@@ -2092,7 +2202,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
     caption_src_msg_id = update.message.message_id if orig_caption else None
 
     # 同一 external_code 的所有文件必须 copy 到同一存储频道
-    async with _mg_lock:
+    async with _get_mg_lock():
         buf = _external_buffers.get(external_code)
         if buf is not None and buf.get("channel_id"):
             target_ch = buf["channel_id"]
@@ -2127,7 +2237,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         media_group_id=update.message.media_group_id or "",
     )
     if fuid:
-        async with _mg_lock:
+        async with _get_mg_lock():
             # P2: 惰性清理超 300s 的旧去重集合
             now = time.time()
             if external_code in _external_fuid_dedup:
@@ -2149,7 +2259,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         channel_msg_id = existing["message_id"]
         logger.info(f"[Up][ext_relay] 秒传去重命中: reuse msg_id={channel_msg_id} (code={external_code})")
         await metrics.increment("up.dedup_hit")
-        async with _mg_lock:
+        async with _get_mg_lock():
             buf = _external_buffers.get(external_code)
             if buf is None:
                 return
@@ -2165,7 +2275,7 @@ async def _handle_external_relay_file(update: Update, context: ContextTypes.DEFA
         logger.debug(f"[Up][ext_relay] 外部文件已缓存(去重) (code={external_code}), 共{msg_count}个文件")
     else:
         # 未命中去重:缓存消息引用,flush 时批量 copy 保持媒体组
-        async with _mg_lock:
+        async with _get_mg_lock():
             buf = _external_buffers.get(external_code)
             if buf is None:
                 # buffer 被安全超时 flush 清理了,重新创建
@@ -2219,7 +2329,7 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
     """刷新外部文件缓冲:先批量 copy 到存储频道,再写入 pending_uploads。
     如果 safe_mode=True，则 flush 已执行，EXTERNAL_DONE 到达时不应重复处理。
     """
-    async with _mg_lock:
+    async with _get_mg_lock():
         buf = _external_buffers.get(external_code)
         if buf is None:
             return

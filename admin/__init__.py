@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time as _time
 import re as _re
 import hashlib
@@ -191,6 +193,135 @@ async def require_readiness() -> None:
         )
 
 
+# ─── R45 §7.1: readiness 强制调用 + 进程退出 ──────────────────────
+
+async def ensure_readiness_or_exit() -> None:
+    """R45 §7.1: 在 app lifespan startup 阶段强制调用 readiness 检查。
+
+    未 bootstrap 时调用 sys.exit(1) 退出 Web 进程(非零退出码),
+    避免无权限时所有操作 fail-closed 阻塞业务,同时让 systemd/k8s
+    能通过非零退出码感知到启动失败并触发重启策略。
+
+    调用位置: startup() 事件处理器中,init_db() 之后、_load_state_from_cache() 之前。
+    """
+    try:
+        ok = await verify_admin_bootstrap()
+    except Exception as e:
+        from loguru import logger
+        logger.error(
+            f"[ensure_readiness_or_exit] verify_admin_bootstrap 抛异常(退出 1): {e}"
+        )
+        import sys
+        sys.exit(1)
+    if not ok:
+        from loguru import logger
+        logger.error(
+            "[ensure_readiness_or_exit] admin bootstrap 未完成,Web 进程退出(代码 1)。"
+            "请先运行 `python -c \"import asyncio; from admin import bootstrap_admin_principal; "
+            "asyncio.run(bootstrap_admin_principal())\"` 初始化管理员身份。"
+        )
+        import sys
+        sys.exit(1)
+
+
+async def bootstrap_admin_principal(
+    principal_id: int | None = None,
+    username: str | None = None,
+    roles: list[str] | None = None,
+) -> bool:
+    """R45 §7.1: 原子 bootstrap 管理员 principal(包装 CacheStore.bootstrap_admin_principal)。
+
+    将以下操作封装为单一 SQLite 事务(由 CacheStore.bootstrap_admin_principal 实现,
+    任一步骤失败则回滚):
+      1. UPSERT admin_principals 记录(id, username)
+      2. 清除旧 admin_principal_roles 映射
+      3. 插入新角色映射(默认 super_admin)
+      4. 写 audit_log(action=bootstrap_admin_principal)
+
+    参数优先级:
+      - principal_id: 显式传入 > settings.ADMIN_PRINCIPAL_ID > 0(否则报错)
+      - username: 显式传入 > settings.ADMIN_PRINCIPAL_USERNAME > settings.ADMIN_USERNAME
+      - roles: 显式传入 > settings.ADMIN_PRINCIPAL_BOOTSTRAP_ROLES 解析 > ["super_admin"]
+
+    幂等: 已 bootstrap 时直接返回 True(由 INSERT OR REPLACE 保证)。
+
+    Args:
+        principal_id: 管理员主体 ID(>0);None 时从 settings 读取
+        username: 管理员用户名;None 时从 settings 读取
+        roles: 角色列表;None 时从 settings.ADMIN_PRINCIPAL_BOOTSTRAP_ROLES 解析
+
+    Returns:
+        True 表示 bootstrap 成功;False 表示失败(参数无效或 DB 异常)
+    """
+    from loguru import logger
+
+    # 1. 解析 principal_id(显式 > settings > 报错)
+    if principal_id is None:
+        try:
+            principal_id = int(getattr(settings, "ADMIN_PRINCIPAL_ID", 0) or 0)
+        except (TypeError, ValueError):
+            principal_id = 0
+    if not principal_id or principal_id <= 0:
+        logger.error(
+            "[bootstrap_admin_principal] principal_id 未配置(ADMIN_PRINCIPAL_ID<=0),"
+            "请在 .env 中设置 ADMIN_PRINCIPAL_ID 为正整数"
+        )
+        return False
+
+    # 2. 解析 username(显式 > settings.ADMIN_PRINCIPAL_USERNAME > settings.ADMIN_USERNAME)
+    if username is None:
+        username = (
+            getattr(settings, "ADMIN_PRINCIPAL_USERNAME", "") or ""
+        )
+    if not username:
+        username = getattr(settings, "ADMIN_USERNAME", "") or ""
+    if not username:
+        logger.error(
+            "[bootstrap_admin_principal] username 未配置,"
+            "请设置 ADMIN_PRINCIPAL_USERNAME 或 ADMIN_USERNAME"
+        )
+        return False
+
+    # 3. 解析 roles(显式 > settings.ADMIN_PRINCIPAL_BOOTSTRAP_ROLES 解析 > ["super_admin"])
+    if roles is None:
+        raw_roles = getattr(settings, "ADMIN_PRINCIPAL_BOOTSTRAP_ROLES", "") or ""
+        if raw_roles:
+            roles = [r.strip() for r in raw_roles.split(",") if r.strip()]
+        else:
+            roles = ["super_admin"]
+    if not roles:
+        roles = ["super_admin"]
+
+    # 4. 委托 CacheStore.bootstrap_admin_principal 执行原子事务
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if not store._db:
+            logger.error("[bootstrap_admin_principal] CacheStore DB 未初始化")
+            return False
+        ok = await store.bootstrap_admin_principal(
+            principal_id=principal_id,
+            username=username,
+            roles=roles,
+        )
+        if ok:
+            logger.info(
+                f"[bootstrap_admin_principal] 原子 bootstrap 成功 "
+                f"id={principal_id} user={username} roles={roles}"
+            )
+        else:
+            logger.error(
+                f"[bootstrap_admin_principal] 原子 bootstrap 失败 "
+                f"id={principal_id} user={username}"
+            )
+        return ok
+    except Exception as e:
+        logger.error(
+            f"[bootstrap_admin_principal] 异常 id={principal_id} user={username}: {e}"
+        )
+        return False
+
+
 # ─── R39 P2-8: CSP nonce + 点击劫持防护 ──────────────────────────
 # 通过中间件为每个 HTML 响应注入 Content-Security-Policy 头,
 # 使用 per-request nonce 防止 inline script 注入(防 XSS)。
@@ -379,7 +510,12 @@ def _is_trusted_proxy(peer_host: str) -> bool:
 
 @app.on_event("startup")
 async def startup():
-    """启动时初始化数据库连接并从 SQLite 恢复 CSRF token 和登录失败计数。"""
+    """启动时初始化数据库连接并从 SQLite 恢复 CSRF token 和登录失败计数。
+
+    R45 §7.1: 启动阶段强制调用 ensure_readiness_or_exit() 验证 admin bootstrap
+    已完成;未 bootstrap 时 Web 进程退出非零(sys.exit(1)),
+    让 systemd/k8s 感知到启动失败并触发重启策略。
+    """
     # R39 P1-12: 启动时检测明文密码并告警
     _warn_if_plaintext_password()
     try:
@@ -395,6 +531,9 @@ async def startup():
         except Exception:
             pass
         sys.exit(1)
+    # R45 §7.1: 强制 readiness 检查 — 未 bootstrap 时退出非零
+    # 放在 init_db 之后、_load_state_from_cache 之前,确保 DB 已就绪再校验
+    await ensure_readiness_or_exit()
     await _load_state_from_cache()
 
 

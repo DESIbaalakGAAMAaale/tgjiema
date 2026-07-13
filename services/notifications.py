@@ -1,13 +1,26 @@
-"""R40 §9.1.4: 可靠通知 — 跨 Bot 推送给用户。
+"""R40 §9.1.4 + R45 第 16 节: 可靠通知 — 跨 Bot 推送给用户。
 
 为系统事件(文件就绪、R100 延迟、副本不足、过期前提醒、恢复完成等)
 提供可靠通知能力,通知先落库,由各 Bot 异步推送。
+
+R45 第 16 节 Notifications 整改:
+- notification_outbox 模式:通知先写 outbox(pending),由各 Bot 异步投递,
+  投递成功后写 delivery_receipt 并将 outbox 状态置为 delivered
+- delivery_receipt:记录每条通知的实际投递结果(channel/bot/delivered_at),
+  支持失败重试(outbox 中 status=failed 的记录可被重新处理)
+- dedup_key 已在 R41 P1-12 实现(dispatch_notification 基于 dedup_key
+  1 小时窗口去重),R45 在 outbox 模式下也保留 dedup_key 字段,
+  避免 outbox 层重复入队
 
 设计要点:
 - payload 存 JSON 字符串(如 {"file_code": "ABC123", "delay_minutes": 30})
 - format_notification 按类型返回不同文案(含图标 + 操作建议)
 - 通过 get_cache_store() 获取 CacheStore 单例
 - 每次写入后调用 add_dirty_outbox(table_name="notifications", pk=str(notif_id))
+- R45:notification_outbox / notification_receipts 表通过幂等 CREATE TABLE IF NOT EXISTS
+  在 _ensure_outbox_schema() 中创建(避免修改 cache_store.py)
+  注:使用 notification_receipts 而非 delivery_receipts,因为后者已被
+  cache_store.py M1-4 投递回执表占用(不同 schema,无 notif_id 列)
 """
 from __future__ import annotations
 
@@ -39,6 +52,114 @@ _NOTIF_ICONS = {
     NOTIF_TYPE_BAN: "🔨",
 }
 
+# R45:outbox 状态常量
+OUTBOX_STATUS_PENDING = "pending"      # 待投递
+OUTBOX_STATUS_DELIVERED = "delivered"  # 已投递成功
+OUTBOX_STATUS_FAILED = "failed"        # 投递失败(可重试)
+OUTBOX_STATUS_SKIPPED = "skipped"      # 跳过(如 dedup 命中)
+
+# R45:outbox schema 是否已初始化(进程级标记,避免每次调用都尝试 CREATE)
+_outbox_schema_initialized: bool = False
+
+
+async def _ensure_outbox_schema() -> bool:
+    """R45 第 16 节: 幂等创建 notification_outbox / notification_receipts 表。
+
+    由于 cache_store.py 不在本任务文件范围内,通过模块级幂等 CREATE TABLE
+    在首次访问时创建所需表。多次调用安全(已创建则忽略错误)。
+
+    注:使用 notification_receipts 而非 delivery_receipts,因后者已被
+        cache_store.py M1-4 投递回执表占用(不同 schema,无 notif_id 列)。
+
+    表结构:
+        notification_outbox:
+            - id INTEGER PRIMARY KEY AUTOINCREMENT
+            - notif_id INTEGER NOT NULL     # 关联 notifications.id
+            - user_id INTEGER NOT NULL
+            - notif_type TEXT NOT NULL
+            - dedup_key TEXT DEFAULT ''       # 去重键(可空)
+            - payload TEXT                    # 通知内容快照(JSON)
+            - status TEXT DEFAULT 'pending'   # pending/delivered/failed/skipped
+            - attempts INTEGER DEFAULT 0      # 投递尝试次数
+            - max_attempts INTEGER DEFAULT 3
+            - last_error TEXT DEFAULT ''
+            - created_at TEXT
+            - delivered_at TEXT               # 投递成功时间
+            - updated_at TEXT
+        notification_receipts:
+            - id INTEGER PRIMARY KEY AUTOINCREMENT
+            - notif_id INTEGER NOT NULL
+            - outbox_id INTEGER               # 关联 notification_outbox.id(可空)
+            - user_id INTEGER NOT NULL
+            - channel TEXT                    # 投递渠道(如 telegram/dsp_bot)
+            - status TEXT NOT NULL            # delivered/failed
+            - error TEXT DEFAULT ''
+            - delivered_at TEXT
+            - created_at TEXT
+    """
+    global _outbox_schema_initialized
+    if _outbox_schema_initialized:
+        return True
+    store = get_cache_store()
+    if not store._db:
+        return False
+    try:
+        await store._db.execute(
+            """CREATE TABLE IF NOT EXISTS notification_outbox (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                notif_id     INTEGER NOT NULL,
+                user_id      INTEGER NOT NULL,
+                notif_type   TEXT NOT NULL,
+                dedup_key    TEXT DEFAULT '',
+                payload      TEXT,
+                status       TEXT DEFAULT 'pending',
+                attempts     INTEGER DEFAULT 0,
+                max_attempts INTEGER DEFAULT 3,
+                last_error   TEXT DEFAULT '',
+                created_at   TEXT,
+                delivered_at TEXT,
+                updated_at   TEXT
+            )"""
+        )
+        await store._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notif_outbox_status "
+            "ON notification_outbox(status, created_at)"
+        )
+        await store._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notif_outbox_user "
+            "ON notification_outbox(user_id, status)"
+        )
+        await store._db.execute(
+            """CREATE TABLE IF NOT EXISTS notification_receipts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                notif_id     INTEGER NOT NULL,
+                outbox_id    INTEGER,
+                user_id      INTEGER NOT NULL,
+                channel      TEXT,
+                status       TEXT NOT NULL,
+                error        TEXT DEFAULT '',
+                delivered_at TEXT,
+                created_at   TEXT
+            )"""
+        )
+        await store._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_receipts_notif "
+            "ON notification_receipts(notif_id)"
+        )
+        await store._db.commit()
+        _outbox_schema_initialized = True
+        logger.debug("[notifications] outbox schema 初始化完成")
+        return True
+    except Exception as e:
+        logger.warning(f"[notifications] _ensure_outbox_schema 失败(忽略): {e}")
+        return False
+
+
+def _reset_outbox_schema_for_test() -> None:
+    """测试辅助函数:重置 schema 初始化标记(用于测试隔离)。"""
+    global _outbox_schema_initialized
+    _outbox_schema_initialized = False
+
 
 def _safe_json_loads(val) -> Any:
     """安全反序列化 JSON 字符串,失败返回 None。"""
@@ -62,6 +183,9 @@ def _safe_json_dumps(val) -> str:
 async def send(user_id: int, notif_type: str, payload: dict) -> int:
     """发送通知给用户,返回 notif_id。
 
+    R45 第 16 节: 同事务写入 notification_outbox(pending),供各 Bot 异步投递。
+    outbox 写入失败不阻塞主流程(notifications 表写入仍成功),仅记录 warning。
+
     Args:
         user_id: 用户 ID
         notif_type: 通知类型(NOTIF_TYPE_*)
@@ -76,6 +200,12 @@ async def send(user_id: int, notif_type: str, payload: dict) -> int:
         return 0
     now = _dt.datetime.now().isoformat()
     payload_json = _safe_json_dumps(payload)
+    # R45: 预先确保 outbox 表存在(幂等)
+    await _ensure_outbox_schema()
+    # 提取 dedup_key(若 payload 中包含,用于 outbox 去重)
+    dedup_key = ""
+    if isinstance(payload, dict):
+        dedup_key = str(payload.get("_dedup_key", "")) or ""
     # R40 P0-5: 业务表 + dirty_outbox 同事务
     try:
         async with store.transaction() as tx:
@@ -91,6 +221,26 @@ async def send(user_id: int, notif_type: str, payload: dict) -> int:
                     f"[notifications] 发送通知 id={notif_id} "
                     f"user_id={user_id} type={notif_type}"
                 )
+                # R45: 同事务写入 notification_outbox(pending)
+                # outbox 写入失败仅记 warning,不影响 notifications 主表
+                try:
+                    await tx.execute(
+                        """INSERT INTO notification_outbox
+                           (notif_id, user_id, notif_type, dedup_key, payload,
+                            status, attempts, max_attempts, last_error,
+                            created_at, delivered_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, '', ?, NULL, ?)""",
+                        (notif_id, user_id, notif_type, dedup_key,
+                         payload_json, now, now),
+                    )
+                    await store.add_dirty_outbox(
+                        "notification_outbox", str(notif_id), connection=tx,
+                    )
+                except Exception as outbox_err:
+                    logger.warning(
+                        f"[notifications] outbox 写入失败(不影响主表) "
+                        f"notif_id={notif_id}: {outbox_err}"
+                    )
         return notif_id
     except Exception as e:
         logger.warning(f"[notifications] send 失败: {e}")
@@ -485,3 +635,243 @@ async def dispatch_notification(
             f"id={notif_id} user_id={user_id} type={type} dedup_key={dedup_key}"
         )
     return notif_id
+
+
+# ─── R45 第 16 节: notification_outbox + delivery_receipt 管理 ───
+
+
+async def record_notification_receipt(
+    notif_id: int,
+    user_id: int,
+    channel: str,
+    status: str,
+    error: str = "",
+    outbox_id: int | None = None,
+) -> int:
+    """R45 第 16 节: 记录通知投递回执(delivery_receipt)。
+
+    各 Bot 在实际投递后(无论成功/失败)调用本函数:
+        - 成功投递:status='delivered',error='',写 delivered_at
+        - 投递失败:status='failed',error=失败原因,触发后续重试
+
+    同时联动 notification_outbox 表:
+        - status='delivered' → outbox.status='delivered' + delivered_at
+        - status='failed'    → outbox.status='failed' + attempts += 1 + last_error
+          (attempts 达到 max_attempts 时不再重试,标记为 skipped)
+
+    Args:
+        notif_id: notifications.id
+        user_id: 用户 ID
+        channel: 投递渠道(如 "telegram" / "dsp_bot" / "admin_bot")
+        status: delivered / failed
+        error: 失败原因(delivered 时为空)
+        outbox_id: notification_outbox.id(可选,无则按 notif_id 查找最新 pending/failed)
+
+    Returns:
+        receipt_id(>0 成功);0 失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return 0
+    await _ensure_outbox_schema()
+    now = _dt.datetime.now().isoformat()
+    try:
+        async with store.transaction() as tx:
+            # 1. 写 notification_receipts
+            cursor = await tx.execute(
+                """INSERT INTO notification_receipts
+                   (notif_id, outbox_id, user_id, channel, status,
+                    error, delivered_at, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (notif_id, outbox_id, user_id, channel, status,
+                 error, now if status == "delivered" else None, now),
+            )
+            receipt_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            # 2. 联动 notification_outbox(若未指定 outbox_id,按 notif_id 查找最新)
+            if not outbox_id:
+                ob_cur = await tx.execute(
+                    """SELECT id, attempts, max_attempts FROM notification_outbox
+                       WHERE notif_id = ?
+                       ORDER BY id DESC LIMIT 1""",
+                    (notif_id,),
+                )
+                ob_row = await ob_cur.fetchone()
+                if ob_row:
+                    outbox_id = int(ob_row[0])
+            if outbox_id:
+                if status == "delivered":
+                    await tx.execute(
+                        """UPDATE notification_outbox
+                           SET status = 'delivered', delivered_at = ?,
+                               updated_at = ?, last_error = ''
+                           WHERE id = ?""",
+                        (now, now, outbox_id),
+                    )
+                else:
+                    # status == 'failed' → 增加 attempts,判断是否超限
+                    await tx.execute(
+                        """UPDATE notification_outbox
+                           SET attempts = attempts + 1,
+                               last_error = ?, updated_at = ?,
+                               status = CASE
+                                   WHEN attempts + 1 >= max_attempts
+                                   THEN 'skipped'
+                                   ELSE 'failed'
+                               END
+                           WHERE id = ?""",
+                        (error[:500], now, outbox_id),
+                    )
+                await store.add_dirty_outbox(
+                    "notification_outbox", str(outbox_id), connection=tx,
+                )
+            # 3. dirty_outbox for notification_receipts
+            if receipt_id:
+                await store.add_dirty_outbox(
+                    "notification_receipts", str(receipt_id), connection=tx,
+                )
+        logger.info(
+            f"[notifications] record_notification_receipt "
+            f"notif_id={notif_id} channel={channel} status={status} "
+            f"receipt_id={receipt_id}"
+        )
+        return receipt_id
+    except Exception as e:
+        logger.warning(f"[notifications] record_notification_receipt 失败: {e}")
+        return 0
+
+
+async def get_pending_outbox(limit: int = 50) -> list[dict]:
+    """R45 第 16 节: 获取待投递(pending/failed)的 outbox 记录。
+
+    供各 Bot 拉取需要投递的通知。failed 状态记录可被重新投递(只要未超 max_attempts)。
+
+    Args:
+        limit: 最多返回条数(1-200)
+
+    Returns:
+        [{id, notif_id, user_id, notif_type, dedup_key, payload,
+          status, attempts, max_attempts, last_error,
+          created_at, delivered_at, updated_at}, ...]
+    """
+    store = get_cache_store()
+    if not store._db:
+        return []
+    await _ensure_outbox_schema()
+    limit = max(1, min(200, int(limit)))
+    try:
+        rows = await store._db.execute_fetchall(
+            """SELECT id, notif_id, user_id, notif_type, dedup_key, payload,
+                      status, attempts, max_attempts, last_error,
+                      created_at, delivered_at, updated_at
+               FROM notification_outbox
+               WHERE status IN ('pending', 'failed')
+               ORDER BY created_at ASC LIMIT ?""",
+            (limit,),
+        )
+        return [
+            {
+                "id": r[0], "notif_id": r[1], "user_id": r[2],
+                "notif_type": r[3], "dedup_key": r[4] or "",
+                "payload": _safe_json_loads(r[5]),
+                "status": r[6], "attempts": int(r[7] or 0),
+                "max_attempts": int(r[8] or 3),
+                "last_error": r[9] or "",
+                "created_at": r[10], "delivered_at": r[11],
+                "updated_at": r[12],
+            }
+            for r in rows if r
+        ]
+    except Exception as e:
+        logger.warning(f"[notifications] get_pending_outbox 失败: {e}")
+        return []
+
+
+async def mark_outbox_skipped(outbox_id: int, reason: str = "") -> bool:
+    """R45 第 16 节: 标记 outbox 记录为跳过(不再投递)。
+
+    用于人工干预或检测到通知已无意义(如用户已注销)时跳过投递。
+
+    Args:
+        outbox_id: notification_outbox.id
+        reason: 跳过原因(记入 last_error)
+
+    Returns:
+        True 成功;False 失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+    now = _dt.datetime.now().isoformat()
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE notification_outbox
+                   SET status = 'skipped', last_error = ?, updated_at = ?
+                   WHERE id = ?""",
+                (reason[:500], now, outbox_id),
+            )
+            ok = bool(cursor and cursor.rowcount > 0)
+            if ok:
+                await store.add_dirty_outbox(
+                    "notification_outbox", str(outbox_id), connection=tx,
+                )
+        return ok
+    except Exception as e:
+        logger.warning(f"[notifications] mark_outbox_skipped 失败: {e}")
+        return False
+
+
+async def get_outbox_stats() -> dict:
+    """R45 第 16 节: 获取 outbox 统计信息(供监控/Prometheus)。
+
+    Returns:
+        {pending, delivered, failed, skipped, total,
+         oldest_pending_age_seconds, delivery_success_rate}
+    """
+    store = get_cache_store()
+    default = {
+        "pending": 0, "delivered": 0, "failed": 0, "skipped": 0,
+        "total": 0, "oldest_pending_age_seconds": 0,
+        "delivery_success_rate": 0.0,
+    }
+    if not store._db:
+        return default
+    await _ensure_outbox_schema()
+    try:
+        rows = await store._db.execute_fetchall(
+            """SELECT status, COUNT(*) FROM notification_outbox
+               GROUP BY status"""
+        )
+        stats = dict(default)
+        total = 0
+        for r in rows:
+            if not r:
+                continue
+            status, count = r[0], int(r[1])
+            if status in stats:
+                stats[status] = count
+            total += count
+        stats["total"] = total
+        # 最早的 pending 记录存在时间
+        oldest_rows = await store._db.execute_fetchall(
+            """SELECT created_at FROM notification_outbox
+               WHERE status = 'pending'
+               ORDER BY created_at ASC LIMIT 1"""
+        )
+        if oldest_rows and oldest_rows[0] and oldest_rows[0][0]:
+            try:
+                oldest_dt = _dt.datetime.fromisoformat(oldest_rows[0][0])
+                stats["oldest_pending_age_seconds"] = int(
+                    (_dt.datetime.now() - oldest_dt).total_seconds()
+                )
+            except (ValueError, TypeError):
+                pass
+        # 投递成功率 = delivered / (delivered + failed + skipped)
+        denom = stats["delivered"] + stats["failed"] + stats["skipped"]
+        stats["delivery_success_rate"] = (
+            round(stats["delivered"] / denom, 4) if denom > 0 else 0.0
+        )
+        return stats
+    except Exception as e:
+        logger.warning(f"[notifications] get_outbox_stats 失败: {e}")
+        return default

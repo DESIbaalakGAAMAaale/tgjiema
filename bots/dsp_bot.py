@@ -2,6 +2,7 @@
 职责: 从 jobs 表轮询任务, 通过 delivery_resolver 解析最佳频道, 以媒体组发送给用户
 替代: sender_bot,数据源从 send_queue 改为 jobs 表
 """
+from __future__ import annotations
 
 import asyncio
 import datetime
@@ -22,7 +23,7 @@ from config import settings
 from database import get_file_record_cached, get_pending_jobs_count_local
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver, try_deliver_batch, invalidate_cell_cache
 from services import upload_receipt, notifications, task_center
-from utils.per_channel_limiter import _channel_limiter
+from utils.per_channel_limiter import _channel_limiter, PerChannelRateLimiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
 from utils.force_join import check_force_join, three_bot_reminder, common_faq
@@ -59,24 +60,107 @@ PAGE_SIZE = settings.PAGE_SIZE
 # ─── 4 worker 并发控制 ───
 # 最大并发发送数(25 个余量给 copy_message 等其他 API 调用)
 _SEND_CONCURRENCY = settings.SEND_CONCURRENCY
-_send_semaphore = asyncio.Semaphore(_SEND_CONCURRENCY)
+# R45: 懒加载 asyncio 原语,避免模块导入时 Python 3.9 要求事件循环存在
+_send_semaphore: asyncio.Semaphore | None = None
+
+def _get_send_semaphore() -> asyncio.Semaphore:
+    """懒加载 Semaphore(首次调用时事件循环已就绪)。"""
+    global _send_semaphore
+    if _send_semaphore is None:
+        _send_semaphore = asyncio.Semaphore(_SEND_CONCURRENCY)
+    return _send_semaphore
 
 # ─── Dsp 侧频道路由降级(Mon Bot 补充机制)───
 # 当 Mon Bot 不可用时,Dsp 通过发送失败率自动触发降级,作为兜底方案
 # 阈值比 Mon 更保守,仅窗口内多次失败才触发,避免误判
 _channel_failures: dict[int, list[float]] = {}  # channel_id -> [failure_timestamps]
-_cf_lock = asyncio.Lock()
+_cf_lock: asyncio.Lock | None = None
 _CHANNEL_FAILURE_THRESHOLD = settings.CHANNEL_FAILURE_THRESHOLD  # 60 秒内失败 N 次触发降级
 _CHANNEL_FAILURE_WINDOW = settings.CHANNEL_FAILURE_WINDOW  # 统计窗口(秒)
 
+def _get_cf_lock() -> asyncio.Lock:
+    """懒加载 channel failures lock。"""
+    global _cf_lock
+    if _cf_lock is None:
+        _cf_lock = asyncio.Lock()
+    return _cf_lock
+
 _pagination_states: dict[str, dict] = {}
-_pg_lock = asyncio.Lock()
+_pg_lock: asyncio.Lock | None = None
 _PAGE_STATE_TTL = 300  # 5 分钟过期清理
+
+def _get_pg_lock() -> asyncio.Lock:
+    """懒加载 pagination states lock。"""
+    global _pg_lock
+    if _pg_lock is None:
+        _pg_lock = asyncio.Lock()
+    return _pg_lock
 
 # P1-2: 已成功投递的 msg_id 跟踪,避免重试时重复投递
 # job_id -> set(storage_msg_id),job 完成或死信时清理
 # R35 §21.2: 保留为内存缓存层,delivery_receipts 表为权威持久化层(双写)
 _sent_msg_tracker: dict[int, set[int]] = {}
+
+
+# ─── R45 §11: 三层令牌桶(动态限速)— Bot / 频道 / 用户 ───
+# Telegram API 限制:同一 Bot 全局 ~30 msg/s,同一频道 ~20 msg/min,同一用户 ~20 msg/min
+# _channel_limiter 已存在(15 msg/min,留余量给 copy_message)
+# 新增 _user_limiter 和 _bot_limiter,在 send 前检查三层令牌桶
+_user_limiter = PerChannelRateLimiter(max_per_minute=20)   # 按用户:20 msg/min
+_bot_limiter = PerChannelRateLimiter(max_per_minute=25)    # 按 Bot:25 msg/min(整个 Dsp Bot 共享)
+
+
+def classify_delivery_error(exc: Exception) -> str:
+    """R45 §11: 分类投递错误,返回错误类型字符串。
+
+    用于失败分类,支持差异化重试策略:
+        - 'flood_wait': Telegram FloodWait / RetryAfter(限速,可延迟重试)
+        - 'forbidden': 权限被拒绝(Forbidden / ChatForbidden / 被踢出,不可恢复)
+        - 'message_missing': 消息不存在(MESSAGE_ID_INVALID / message not found,不可恢复)
+        - 'temporary_network': 临时网络错误(TimedOut / NetworkError,可立即重试)
+        - 'permanent_invalid': 永久性无效错误(BadRequest / 其他不可分类错误)
+
+    Args:
+        exc: 投递过程中捕获的异常
+
+    Returns:
+        错误分类字符串(上述 5 种之一)
+    """
+    exc_msg = str(exc).lower()
+    exc_type = type(exc).__name__
+
+    # 1. FloodWait / RetryAfter(可延迟重试)
+    if exc_type in ("RetryAfter", "FloodWait", "FloodWaitError"):
+        return "flood_wait"
+    if "flood" in exc_msg or "retry after" in exc_msg or "too many requests" in exc_msg:
+        return "flood_wait"
+
+    # 2. Forbidden(权限被拒绝,不可恢复)
+    if exc_type in ("Forbidden", "ChatForbidden", "ChatForbiddenError", "Unauthorized"):
+        return "forbidden"
+    if "forbidden" in exc_msg or "chat_forbidden" in exc_msg or "kicked" in exc_msg:
+        return "forbidden"
+    if "chat not found" in exc_msg or "channel not found" in exc_msg or "chat_private" in exc_msg:
+        return "forbidden"
+    if "peer_id_invalid" in exc_msg or "user is deactivated" in exc_msg:
+        return "forbidden"
+
+    # 3. message_missing(消息不存在,不可恢复)
+    if "message" in exc_msg and ("not found" in exc_msg or "not modified" in exc_msg):
+        return "message_missing"
+    if "message_id_invalid" in exc_msg or "message to copy not found" in exc_msg:
+        return "message_missing"
+    if "message to edit not found" in exc_msg or "message can't be edited" in exc_msg:
+        return "message_missing"
+
+    # 4. temporary_network(临时网络错误,可立即重试)
+    if exc_type in ("TimedOut", "NetworkError", "ConnectionError", "TimeoutError", "OSError"):
+        return "temporary_network"
+    if "timeout" in exc_msg or "network" in exc_msg or "connection" in exc_msg:
+        return "temporary_network"
+
+    # 5. permanent_invalid(默认:永久性无效错误)
+    return "permanent_invalid"
 
 
 # ─── R35 §21.2 / §22: delivery_receipts 持久化 + ReplicaAwareResolver 接线 ───
@@ -279,7 +363,7 @@ async def _cleanup_page_states():
     while True:
         try:
             now = time.time()
-            async with _pg_lock:
+            async with _get_pg_lock():
                 expired = [k for k, v in _pagination_states.items() if now - v.get("created_at", 0) > _PAGE_STATE_TTL]
                 for k in expired:
                     _pagination_states.pop(k, None)
@@ -293,7 +377,7 @@ async def _cleanup_channel_failures():
     while True:
         try:
             now = time.time()
-            async with _cf_lock:
+            async with _get_cf_lock():
                 stale = [
                     ch_id for ch_id, timestamps in _channel_failures.items()
                     if not timestamps or now - max(timestamps) > 600
@@ -383,7 +467,7 @@ async def _watch_cells_change():
 async def _record_channel_failure(channel_id: int):
     """记录频道路由发送失败时间戳,用于 Dsp 侧降级检测"""
     now = time.time()
-    async with _cf_lock:
+    async with _get_cf_lock():
         if channel_id not in _channel_failures:
             _channel_failures[channel_id] = []
         _channel_failures[channel_id].append(now)
@@ -396,7 +480,7 @@ async def _check_channel_degrade(channel_id: int):
     作为 Mon Bot 的补充,仅在 Mon 不可用时作为兜底
     阈值设置更保守(3次/60秒),避免误触发短暂网络波动
     """
-    async with _cf_lock:
+    async with _get_cf_lock():
         if channel_id not in _channel_failures:
             return
 
@@ -418,19 +502,19 @@ async def _check_channel_degrade(channel_id: int):
         cell = await get_cell_by_channel_local(channel_id)
         if not cell:
             logger.warning(f"[Dsp] 降级失败: 频道 {channel_id} 不在 cells 中")
-            async with _cf_lock:
+            async with _get_cf_lock():
                 _channel_failures.pop(channel_id, None)
             return
 
         slot_id = cell.get("slot_id")
         current_status = cell.get("status", "")
         if current_status in ("lost", "shadow2"):
-            async with _cf_lock:
+            async with _get_cf_lock():
                 _channel_failures.pop(channel_id, None)
             return
         if current_status == "r100":
             logger.warning(f"[Dsp] 频道 {channel_id} 为 R100 槽位,跳过降级")
-            async with _cf_lock:
+            async with _get_cf_lock():
                 _channel_failures.pop(channel_id, None)
             return
 
@@ -450,7 +534,7 @@ async def _check_channel_degrade(channel_id: int):
             f"[Dsp] 频道降级触发(兜底): {slot_id} (channel={channel_id}) "
             f"status={current_status}→lost, fail={fail_count}"
         )
-        async with _cf_lock:
+        async with _get_cf_lock():
             _channel_failures.pop(channel_id, None)
     except Exception as e:
         logger.error(f"[Dsp] 频道降级异常 (channel={channel_id}): {e}")
@@ -655,7 +739,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
 
     # 等待 semaphore
     try:
-        await asyncio.wait_for(_send_semaphore.acquire(), timeout=10.0)
+        await asyncio.wait_for(_get_send_semaphore().acquire(), timeout=10.0)
     except asyncio.TimeoutError:
         # P2: 信号量超时后显式重试入队,避免 job 滞留 dispatched 最多 600s
         logger.warning(f"[Dsp-{worker_id}] 信号量获取超时,重试入队: job={job.job_id}")
@@ -674,6 +758,20 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
 
     send_ok = False
     try:
+        # R45 §11: 三层令牌桶检查(Bot / 用户 / 频道)
+        # 频道层限速在 try_deliver 内部通过 _channel_limiter 实现
+        # 这里补充 Bot 层和用户层限速,防止触发 Telegram 全局限制
+        # Bot 层:整个 Dsp Bot 共享一个令牌桶(bot_id=1 固定)
+        wait_bot = await _bot_limiter.acquire(1)
+        if wait_bot > 0:
+            logger.debug(f"[Dsp-{worker_id}] Bot 层限速等待 {wait_bot:.1f}s: job={job.job_id}")
+            await asyncio.sleep(wait_bot)
+        # 用户层:按 target_user_id 限速
+        wait_user = await _user_limiter.acquire(job.target_user_id)
+        if wait_user > 0:
+            logger.debug(f"[Dsp-{worker_id}] 用户层限速等待 {wait_user:.1f}s: user={job.target_user_id}")
+            await asyncio.sleep(wait_user)
+
         if job.task_type == "batch":
             send_ok = await _process_batch_job(bot, job, bot_id=worker_id)
         else:
@@ -694,8 +792,34 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
             await _send_report_button(bot, job.target_user_id, job.code)
     except Exception as e:
         logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
+        # R45 §11: 失败分类 — 记录错误类型,供差异化重试策略使用
+        error_class = classify_delivery_error(e)
+        logger.warning(
+            f"[Dsp-{worker_id}] R45 失败分类: job={job.job_id}, "
+            f"class={error_class}, exc={type(e).__name__}: {e}"
+        )
+        # R45 §11: 不可恢复错误(forbidden / message_missing)直接死信,不浪费重试次数
+        # finally 块会统一 release semaphore,此处不再手动 release
+        if error_class in ("forbidden", "message_missing", "permanent_invalid"):
+            try:
+                _sent_msg_tracker.pop(job.job_id, None)
+                await store.update_local_job_status(
+                    job.job_id, "dead",
+                    dead_reason=f"不可恢复错误({error_class}): {type(e).__name__}: {e}",
+                )
+                logger.warning(
+                    f"[Dsp-{worker_id}] R45 不可恢复错误直接死信: "
+                    f"job={job.job_id}, class={error_class}"
+                )
+            except Exception as dead_err:
+                logger.error(
+                    f"[Dsp-{worker_id}] 标记死信失败: {dead_err}"
+                )
+            # 已标记 dead,跳过下方重试逻辑
+            # finally 块会自动 release semaphore,无需在此手动 release
+            return False
     finally:
-        _send_semaphore.release()
+        _get_send_semaphore().release()
 
     if not send_ok:
         new_retry = job.retry_count + 1
@@ -713,7 +837,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
             logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{new_retry}")
 
         # Dsp 侧降级检查
-        async with _cf_lock:
+        async with _get_cf_lock():
             ch_ids = list(_channel_failures.keys())
         for ch_id in ch_ids:
             await _check_channel_degrade(ch_id)
@@ -863,132 +987,162 @@ async def _process_single_job(bot, job, bot_id: int = 1):
         await _pause_job_for_receipt_failure(store, job.job_id)
         return False
 
-    # R35 §22: 优先尝试 ReplicaAwareResolver(按 manifest 副本解析,fail-closed)
-    # R36 B0-1: 优先从结构化字段读取,使 Resolver 成为真实投递主路径
-    fuid, gid, mgid, is_structured_new = _extract_replica_info(job)
-    sent_msg_id: int | None = None
-    tried: set[int] = set()
-    if fuid and gid is not None:
-        replica = await _try_replica_aware_resolve(
-            store, fuid, gid,
-            preferred_channels=[job.storage_channel_id],
-        )
-        if replica is not None:
-            replica_channel, replica_msg_id = replica
+    # R45: EffectReceiptContext 包装 Telegram 发送动作(command_bus 层级 receipt,
+    # 与 delivery_receipts 互补)。崩溃重试时通过 receipt 判断是否已完成,
+    # 已完成则跳过 Telegram 副作用。
+    from services.effect_receipts_integration import EffectReceiptContext
+    receipt_action_id = f"dsp_job_{job.job_id}"
+    receipt_target = f"chat:{job.target_user_id}"
+    async with EffectReceiptContext(
+        action_id=receipt_action_id,
+        effect_type="telegram_send",
+        target=receipt_target,
+    ) as receipt:
+        if receipt.skipped:
+            # effect receipt 已 completed(崩溃前已成功发送),跳过 Telegram 副作用
             logger.info(
-                f"[Dsp] ReplicaAwareResolver 命中 "
-                f"ch={replica_channel}, msg={replica_msg_id}, fuid={fuid}"
+                f"[Dsp] effect receipt 已完成,跳过 Telegram 发送 job={job.job_id} "
+                f"external_id={receipt.external_id}"
             )
-            tried.add(replica_channel)
-            sent_msg_id = await try_deliver(
-                bot, job.target_user_id, replica_channel, replica_msg_id,
-                protect_content=protect_content, bot_id=bot_id,
-                original_channel_id=job.storage_channel_id,
-            )
-        else:
-            # R36 B0-1: Resolver 查询失败(无副本/manifest 不可达),
-            # 对新格式 job(fuid 已知)严格 fail-closed: 进入 retry 等待 manifest 同步,
-            # 不静默 fallback 到拓扑猜测(避免投递到无副本的频道导致用户收到错误文件)
-            if is_structured_new:
-                logger.error(
-                    f"[Dsp] new job Resolver failed (fail-closed), enter retry: "
-                    f"job={job.job_id}, code={job.code}, fuid={fuid}, gid={gid}"
-                )
-                await _mark_delivery_failed_safe(
-                    store, job.job_id, msg_id,
-                    reason=f"resolver_failed_fail_closed fuid={fuid} gid={gid}",
-                )
-                return False  # 触发 retry_local_job,不 fallback 到拓扑猜测
+            # 已通过 delivery_receipts 写入投递记录时,跳过后续动作
+            _sent_msg_tracker.setdefault(job.job_id, set()).add(msg_id)
+            await _send_report_button(bot, job.target_user_id, job.code)
+            return True
 
-    # R36 B0-1: 新 job 缺 group_id(数据不完整),进入 retry/reconciliation
-    # 不静默走旧拓扑猜测,避免投递到无副本的频道
-    if is_structured_new and fuid and gid is None:
-        logger.error(
-            f"[Dsp] 新 job 缺 group_id(数据不完整),进入 retry: "
-            f"job={job.job_id}, code={job.code}, fuid={fuid}"
-        )
+        # R35 §22: 优先尝试 ReplicaAwareResolver(按 manifest 副本解析,fail-closed)
+        # R36 B0-1: 优先从结构化字段读取,使 Resolver 成为真实投递主路径
+        fuid, gid, mgid, is_structured_new = _extract_replica_info(job)
+        sent_msg_id: int | None = None
+        tried: set[int] = set()
+        if fuid and gid is not None:
+            replica = await _try_replica_aware_resolve(
+                store, fuid, gid,
+                preferred_channels=[job.storage_channel_id],
+            )
+            if replica is not None:
+                replica_channel, replica_msg_id = replica
+                logger.info(
+                    f"[Dsp] ReplicaAwareResolver 命中 "
+                    f"ch={replica_channel}, msg={replica_msg_id}, fuid={fuid}"
+                )
+                tried.add(replica_channel)
+                sent_msg_id = await try_deliver(
+                    bot, job.target_user_id, replica_channel, replica_msg_id,
+                    protect_content=protect_content, bot_id=bot_id,
+                    original_channel_id=job.storage_channel_id,
+                )
+            else:
+                # R36 B0-1: Resolver 查询失败(无副本/manifest 不可达),
+                # 对新格式 job(fuid 已知)严格 fail-closed: 进入 retry 等待 manifest 同步,
+                # 不静默 fallback 到拓扑猜测(避免投递到无副本的频道导致用户收到错误文件)
+                if is_structured_new:
+                    logger.error(
+                        f"[Dsp] new job Resolver failed (fail-closed), enter retry: "
+                        f"job={job.job_id}, code={job.code}, fuid={fuid}, gid={gid}"
+                    )
+                    await _mark_delivery_failed_safe(
+                        store, job.job_id, msg_id,
+                        reason=f"resolver_failed_fail_closed fuid={fuid} gid={gid}",
+                    )
+                    # 未实际发送 Telegram → 跳过 effect receipt 记录,允许重试
+                    receipt.mark_no_record()
+                    return False  # 触发 retry_local_job,不 fallback 到拓扑猜测
+
+        # R36 B0-1: 新 job 缺 group_id(数据不完整),进入 retry/reconciliation
+        # 不静默走旧拓扑猜测,避免投递到无副本的频道
+        if is_structured_new and fuid and gid is None:
+            logger.error(
+                f"[Dsp] 新 job 缺 group_id(数据不完整),进入 retry: "
+                f"job={job.job_id}, code={job.code}, fuid={fuid}"
+            )
+            await _mark_delivery_failed_safe(
+                store, job.job_id, msg_id,
+                reason=f"missing_group_id fuid={fuid}",
+            )
+            # 未实际发送 Telegram → 跳过 effect receipt 记录,允许重试
+            receipt.mark_no_record()
+            return False  # 触发 retry_local_job,等待数据修复
+
+        # ── 使用 copy_message 发送(fallback 路径,仅用于旧 job 或 Resolver 命中失败时)──
+        resolved = None
+        if not sent_msg_id:
+            resolved = await resolve_delivery_channel(job.storage_channel_id)
+            sent_msg_id = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+
+        if not sent_msg_id and resolved is not None:
+            await _record_channel_failure(resolved.channel_id)
+            # 环形降级:沿环找下一个可用频道,避免重复尝试同一频道
+            from storage.delivery_resolver import _walk_ring_for_channel
+            tried.add(resolved.channel_id)
+            current_id = resolved.channel_id
+            for _ in range(10):  # 最多尝试 10 个降级槽位
+                next_resolved = await _walk_ring_for_channel(current_id)
+                if next_resolved.channel_id in tried:
+                    break
+                tried.add(next_resolved.channel_id)
+                sent_msg_id = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+                if sent_msg_id:
+                    break
+                await _record_channel_failure(next_resolved.channel_id)
+                current_id = next_resolved.channel_id
+
+            # C3: 环形降级耗尽后,尝试原始存储频道(消息实际存储位置,即使已降级消息仍存在)
+            if not sent_msg_id and job.storage_channel_id not in tried:
+                logger.info(f"[Dsp] 环形降级耗尽,尝试原始存储频道: {job.storage_channel_id}")
+                sent_msg_id = await try_deliver(bot, job.target_user_id, job.storage_channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
+
+        if sent_msg_id:
+            logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
+            # R45: 设置 external_id 给 effect receipt(record_completed 时携带)
+            receipt.set_external_id(str(sent_msg_id))
+            # R35 §21.2: 双写 — 内存缓存层(_sent_msg_tracker) + 持久化权威层(delivery_receipts)
+            _sent_msg_tracker.setdefault(job.job_id, set()).add(msg_id)
+            await _confirm_delivery_receipt_safe(store, job.job_id, msg_id, sent_msg_id)
+            # 第三方 Bot 原始 caption 需原样保留，不覆盖为标准模板
+            if not await _should_preserve_caption(job.code):
+                caption = await _build_delivery_caption(job.code, total_count=1)
+                await _edit_sent_caption(bot, job.target_user_id, sent_msg_id, caption)
+            await metrics.record_send_success()
+            await metrics.record_processed("dsp_bot")
+            # R41 P1-12: 派送成功后记录到 TaskCenter
+            try:
+                await task_center.record_task(
+                    user_id=job.target_user_id,
+                    task_type="delivery",
+                    status="completed",
+                    metadata={
+                        "file_code": job.code,
+                        "channel_id": job.storage_channel_id,
+                        "job_id": job.job_id,
+                        "sent_msg_id": sent_msg_id,
+                    },
+                )
+            except Exception as task_err:
+                logger.warning(
+                    f"[Dsp] R41 P1-12: record_task 失败(不影响派送): {task_err}"
+                )
+            return True
+
+        # 所有槽位均不可用,记录失败
+        logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried) or 1}")
+        # R35 §21.2: 持久化失败回执(status=PENDING → FAILED)
         await _mark_delivery_failed_safe(
             store, job.job_id, msg_id,
-            reason=f"missing_group_id fuid={fuid}",
+            reason=f"all_channels_unavailable tried={len(tried) or 1}",
         )
-        return False  # 触发 retry_local_job,等待数据修复
-
-    # ── 使用 copy_message 发送(fallback 路径,仅用于旧 job 或 Resolver 命中失败时)──
-    resolved = None
-    if not sent_msg_id:
-        resolved = await resolve_delivery_channel(job.storage_channel_id)
-        sent_msg_id = await try_deliver(bot, job.target_user_id, resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
-
-    if not sent_msg_id and resolved is not None:
-        await _record_channel_failure(resolved.channel_id)
-        # 环形降级:沿环找下一个可用频道,避免重复尝试同一频道
-        from storage.delivery_resolver import _walk_ring_for_channel
-        tried.add(resolved.channel_id)
-        current_id = resolved.channel_id
-        for _ in range(10):  # 最多尝试 10 个降级槽位
-            next_resolved = await _walk_ring_for_channel(current_id)
-            if next_resolved.channel_id in tried:
-                break
-            tried.add(next_resolved.channel_id)
-            sent_msg_id = await try_deliver(bot, job.target_user_id, next_resolved.channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
-            if sent_msg_id:
-                break
-            await _record_channel_failure(next_resolved.channel_id)
-            current_id = next_resolved.channel_id
-
-        # C3: 环形降级耗尽后,尝试原始存储频道(消息实际存储位置,即使已降级消息仍存在)
-        if not sent_msg_id and job.storage_channel_id not in tried:
-            logger.info(f"[Dsp] 环形降级耗尽,尝试原始存储频道: {job.storage_channel_id}")
-            sent_msg_id = await try_deliver(bot, job.target_user_id, job.storage_channel_id, msg_id, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
-
-    if sent_msg_id:
-        logger.info(f"[Dsp] 发送成功: 用户 {job.target_user_id}, 码:{job.code}")
-        # R35 §21.2: 双写 — 内存缓存层(_sent_msg_tracker) + 持久化权威层(delivery_receipts)
-        _sent_msg_tracker.setdefault(job.job_id, set()).add(msg_id)
-        await _confirm_delivery_receipt_safe(store, job.job_id, msg_id, sent_msg_id)
-        # 第三方 Bot 原始 caption 需原样保留，不覆盖为标准模板
-        if not await _should_preserve_caption(job.code):
-            caption = await _build_delivery_caption(job.code, total_count=1)
-            await _edit_sent_caption(bot, job.target_user_id, sent_msg_id, caption)
-        await metrics.record_send_success()
-        await metrics.record_processed("dsp_bot")
-        # R41 P1-12: 派送成功后记录到 TaskCenter
+        await metrics.record_send_fail()
+        await metrics.record_error("dsp_bot")
         try:
-            await task_center.record_task(
-                user_id=job.target_user_id,
-                task_type="delivery",
-                status="completed",
-                metadata={
-                    "file_code": job.code,
-                    "channel_id": job.storage_channel_id,
-                    "job_id": job.job_id,
-                    "sent_msg_id": sent_msg_id,
-                },
+            # R41 i18n: 文件发送失败提示走 locale 翻译(用 job.target_user_id 作为 locale 来源)
+            await safe_send_message(
+                bot, chat_id=job.target_user_id,
+                text="❌ " + _t(job.target_user_id, "bot.file_send_failed"),
             )
-        except Exception as task_err:
-            logger.warning(
-                f"[Dsp] R41 P1-12: record_task 失败(不影响派送): {task_err}"
-            )
-        return True
-
-    # 所有槽位均不可用,记录失败
-    logger.error(f"[Dsp] 发送失败(所有槽位不可用): 码{job.code}, 尝试频道数{len(tried) or 1}")
-    # R35 §21.2: 持久化失败回执(status=PENDING → FAILED)
-    await _mark_delivery_failed_safe(
-        store, job.job_id, msg_id,
-        reason=f"all_channels_unavailable tried={len(tried) or 1}",
-    )
-    await metrics.record_send_fail()
-    await metrics.record_error("dsp_bot")
-    try:
-        # R41 i18n: 文件发送失败提示走 locale 翻译(用 job.target_user_id 作为 locale 来源)
-        await safe_send_message(
-            bot, chat_id=job.target_user_id,
-            text="❌ " + _t(job.target_user_id, "bot.file_send_failed"),
-        )
-    except Exception:
-        pass
-    return False
+        except Exception:
+            pass
+        # R45: 实际尝试发送但所有频道均不可用 → 不记录 completed(允许下轮重试)
+        receipt.mark_no_record()
+        return False
 
 
 async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
@@ -1016,7 +1170,7 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
     if total_pages > 1:
         # 加 user_id 避免多用户同码键冲突
         page_key = f"{job.code}:{job.target_user_id}"
-        async with _pg_lock:
+        async with _get_pg_lock():
             _pagination_states[page_key] = {
                 "channel_msg_ids": job.storage_msg_ids,
                 "batch_file_meta": file_meta_list,
@@ -1029,17 +1183,40 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
                 "protect_content": getattr(job, "protect_content", False),
             }
 
-    result = await _send_page(
-        bot, job.target_user_id, job.code,
-        file_meta_list, page=1, total_pages=total_pages,
-        storage_channel_id=job.storage_channel_id,
-        page_key=page_key if total_pages > 1 else None,
-        storage_msg_ids=job.storage_msg_ids,
-        protect_content=getattr(job, "protect_content", False),
-        bot_id=bot_id,
-        job_id=job.job_id,
-    )
-    return result
+    # R45: EffectReceiptContext 包装批量发送动作(command_bus 层级 receipt)
+    from services.effect_receipts_integration import EffectReceiptContext
+    receipt_action_id = f"dsp_job_{job.job_id}"
+    receipt_target = f"chat:{job.target_user_id}"
+    async with EffectReceiptContext(
+        action_id=receipt_action_id,
+        effect_type="telegram_send",
+        target=receipt_target,
+    ) as receipt:
+        if receipt.skipped:
+            # effect receipt 已 completed(崩溃前已成功发送),跳过 Telegram 副作用
+            logger.info(
+                f"[Dsp] effect receipt 已完成,跳过批量发送 job={job.job_id} "
+                f"external_id={receipt.external_id}"
+            )
+            return True
+
+        result = await _send_page(
+            bot, job.target_user_id, job.code,
+            file_meta_list, page=1, total_pages=total_pages,
+            storage_channel_id=job.storage_channel_id,
+            page_key=page_key if total_pages > 1 else None,
+            storage_msg_ids=job.storage_msg_ids,
+            protect_content=getattr(job, "protect_content", False),
+            bot_id=bot_id,
+            job_id=job.job_id,
+        )
+        if result:
+            # 发送成功 → 设置 external_id(批量发送 external_id 不可单独提取,留空即可)
+            receipt.set_external_id(f"batch:{job.job_id}")
+        else:
+            # 发送失败 → 不记录 completed,允许下轮重试
+            receipt.mark_no_record()
+        return result
 
 
 async def _fallback_single_send(bot, job, bot_id: int = 1):
@@ -1057,9 +1234,14 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     store = _get_store_safe()
     for i, mid in enumerate(job.storage_msg_ids):
         # R35 §21.2: 投递前写 PENDING receipt(异常安全)
-        await _upsert_delivery_receipt_safe(
+        # R45 §11: receipt 写失败必须停止发送,不降级为内存继续
+        _receipt_ok = await _upsert_delivery_receipt_safe(
             store, job.job_id, mid, job.target_user_id, status="PENDING"
         )
+        if not _receipt_ok:
+            # receipt 写失败 → 暂停 job,停止发送
+            await _pause_job_for_receipt_failure(store, job.job_id)
+            return False
         try:
             resolved = await resolve_delivery_channel(job.storage_channel_id)
             sent_mid = await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
@@ -1145,10 +1327,15 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             store = _get_store_safe() if job_id is not None else None
             for i, mid in enumerate(page_msg_ids):
                 # R35 §21.2: 投递前写 PENDING receipt(仅 job 调用路径)
+                # R45 §11: receipt 写失败必须停止发送,不降级为内存继续
                 if job_id is not None:
-                    await _upsert_delivery_receipt_safe(
+                    _receipt_ok = await _upsert_delivery_receipt_safe(
                         store, job_id, mid, chat_id, status="PENDING"
                     )
+                    if not _receipt_ok:
+                        # receipt 写失败 → 暂停 job,停止发送(防止进程崩溃后重复发送)
+                        await _pause_job_for_receipt_failure(store, job_id)
+                        return False
                 try:
                     sent_mid = await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id)
                     if sent_mid:
@@ -1237,7 +1424,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             text=f"[{page}/{total_pages} 页] 共{total_files} 个文件",
             reply_markup=keyboard,
         )
-        async with _pg_lock:
+        async with _get_pg_lock():
             state = _pagination_states.get(pk)
             if state and sent_msg:
                 state["last_pagination_msg_id"] = sent_msg.message_id
@@ -1415,7 +1602,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # 使用 get 保留状态（支持多页翻页），结束或过期时才清理
-    async with _pg_lock:
+    async with _get_pg_lock():
         state = _pagination_states.get(page_key)
     if not state:
         await query.answer("会话已过期，请重新发送文件码。", show_alert=True)
@@ -1423,7 +1610,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 检查 TTL
     if time.time() - state.get("created_at", 0) > _PAGE_STATE_TTL:
-        async with _pg_lock:
+        async with _get_pg_lock():
             _pagination_states.pop(page_key, None)
         await query.answer("会话已过期，请重新发送文件码。", show_alert=True)
         return
@@ -1446,7 +1633,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if status in ("detached", "offline"):
             await query.answer("该文件已下架，无法继续浏览", show_alert=True)
             # 清理会话,避免后续翻页继续触发
-            async with _pg_lock:
+            async with _get_pg_lock():
                 _pagination_states.pop(page_key, None)
             return
     except Exception as e:
@@ -1471,7 +1658,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     if page >= total_pages:
-        async with _pg_lock:
+        async with _get_pg_lock():
             _pagination_states.pop(page_key, None)
 
     await query.answer()

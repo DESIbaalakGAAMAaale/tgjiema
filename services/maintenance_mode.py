@@ -1,4 +1,4 @@
-"""R40 §9.3: 维护模式 — 停止新上传 + 排空队列 + 备份 + 迁移 + 验证 + 恢复。
+"""R40 §9.3 + R45 第 16 节: 维护模式 — 停止新上传 + 排空队列 + 备份 + 迁移 + 验证 + 恢复。
 
 职责:
     一键式维护模式,按顺序执行:
@@ -17,6 +17,18 @@ R40 P1-6 / P1-7 / P1-8 修复:
     - disable() 增加前置检查(队列排空 + 备份最新),不满足则拒绝。
     - 新增 require_maintenance_check 装饰器,供 Bot 入口统一中间件使用。
     - 新增 get_maintenance_state() 返回结构化状态 + 缓存信息。
+
+R45 第 16 节 Maintenance 整改:
+    - execute_maintenance_workflow 在 drain/backup/migration/verify 任一步失败时
+      保持 maintenance enabled + 设置 recover_status='pending'(R42 P1-12 已实现,
+      R45 验证并补充文档)。
+    - 新增 check_maintenance_at_entry(action) 统一入口检查函数:
+      与 require_maintenance_check 装饰器的差异:
+        * 装饰器只适用于 Telegram handler(依赖 update.message.reply_text)
+        * check_maintenance_at_entry 返回结构化结果 {allowed, reason, source},
+          适用于内部服务调用 / API 路由 / 周期任务等非 Telegram 场景
+      - fail-closed:DB 异常时返回 allowed=False(拒绝请求)
+      - 缓存降级:DB 不可达时使用 kv_store 缓存的最后已知状态
 
 设计原则:
     - 纯函数式 + async
@@ -1248,3 +1260,123 @@ def require_maintenance_check(action: str = "operation"):
         return wrapper
 
     return decorator
+
+
+# ─── R45 第 16 节: 统一入口检查(非 Telegram 场景) ────────────────
+
+
+async def check_maintenance_at_entry(action: str = "operation") -> dict:
+    """R45 第 16 节: 统一入口检查(供内部服务 / API 路由 / 周期任务使用)。
+
+    与 ``require_maintenance_check`` 装饰器的差异:
+        - 装饰器仅适用于 Telegram handler(依赖 ``update.message.reply_text``)
+        - 本函数返回结构化结果,适用于:
+            * 内部服务调用(如 CRDB 同步、备份引擎、复制任务调度)
+            * Admin Web API 路由(Flask/FastAPI handler)
+            * 周期任务(scheduler / cron job)
+            * 非 Telegram Bot 入口(如 CLI 工具)
+
+    fail-closed 原则:
+        - DB 异常 / 缓存为空 → 返回 allowed=False(拒绝请求,安全优先)
+        - DB 正常 + 维护开启 → 返回 allowed=False + reason="维护中"
+        - DB 正常 + 维护关闭 → 返回 allowed=True(允许执行)
+        - DB 不可达 + 有缓存 → 使用缓存值判定
+
+    Args:
+        action: 操作描述(用于日志和返回结果的 reason 字段),
+            如 "上传文件" / "解码文件" / "CRDB 同步" / "备份"
+
+    Returns:
+        {
+            "allowed": bool,           # 是否允许执行该 action
+            "maintenance_enabled": bool,  # 维护模式是否开启
+            "reason": str,             # 拒绝原因(allowed=False 时填充)
+            "source": str,             # 状态来源:db / cache / unknown
+            "action": str,             # 入参 action(用于日志追踪)
+            "last_checked": str|None,  # 最后检查时间(ISO)
+            "error": str,              # 错误信息(空字符串表示无错误)
+        }
+
+    Example:
+        # 在 API 路由中使用
+        result = await check_maintenance_at_entry("CRDB 同步")
+        if not result["allowed"]:
+            return jsonify({"error": result["reason"]}), 503
+        # 继续执行业务逻辑
+    """
+    # 优先尝试 DB 权威查询
+    try:
+        state = await get_maintenance_state()
+        enabled = state.get("enabled")
+        source = state.get("source", "unknown")
+        error = state.get("error", "")
+        last_checked = state.get("last_checked")
+        if enabled is None:
+            # DB 不可达且无缓存 → fail-closed
+            logger.warning(
+                f"[Maintenance] check_maintenance_at_entry fail-closed "
+                f"action={action} (无法判定状态): {error}"
+            )
+            return {
+                "allowed": False,
+                "maintenance_enabled": False,
+                "reason": f"服务暂不可用,无法判定维护状态: {error}",
+                "source": source,
+                "action": action,
+                "last_checked": last_checked,
+                "error": error or "无法判定维护状态",
+            }
+        if enabled:
+            logger.info(
+                f"[Maintenance] check_maintenance_at_entry 拒绝"
+                f"(维护中) action={action}"
+            )
+            return {
+                "allowed": False,
+                "maintenance_enabled": True,
+                "reason": f"系统维护中,{action}暂不可用",
+                "source": source,
+                "action": action,
+                "last_checked": last_checked,
+                "error": "",
+            }
+        # 维护关闭 → 允许执行
+        return {
+            "allowed": True,
+            "maintenance_enabled": False,
+            "reason": "",
+            "source": source,
+            "action": action,
+            "last_checked": last_checked,
+            "error": "",
+        }
+    except MaintenanceCheckError as e:
+        # fail-closed — 异常时拒绝
+        logger.warning(
+            f"[Maintenance] check_maintenance_at_entry fail-closed "
+            f"action={action} (MaintenanceCheckError): {e}"
+        )
+        return {
+            "allowed": False,
+            "maintenance_enabled": False,
+            "reason": "服务暂不可用,请稍后再试",
+            "source": "unknown",
+            "action": action,
+            "last_checked": _last_checked_ts,
+            "error": str(e),
+        }
+    except Exception as e:
+        # 兜底:其他异常也 fail-closed
+        logger.warning(
+            f"[Maintenance] check_maintenance_at_entry 异常 "
+            f"action={action}: {e}"
+        )
+        return {
+            "allowed": False,
+            "maintenance_enabled": False,
+            "reason": "服务暂不可用,请稍后再试",
+            "source": "unknown",
+            "action": action,
+            "last_checked": _last_checked_ts,
+            "error": str(e),
+        }

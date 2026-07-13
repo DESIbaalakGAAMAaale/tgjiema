@@ -107,6 +107,16 @@ def _ensure_tested_modules_importable() -> None:
     db_pkg = types.ModuleType("database")
     db_pkg.__path__ = [str(db_dir)]
     sys.modules["database"] = db_pkg
+    # R45: 注入 bots/* 需要的顶层属性(避免 ImportError)
+    from unittest.mock import MagicMock as _MM
+    for _attr in ("get_file_record_cached", "get_pending_jobs_count_local",
+                  "get_cells_col", "get_codes_col", "get_jobs_col",
+                  "get_rotate_log_col", "enqueue_job", "dequeue_jobs",
+                  "dequeue_job", "get_pending_jobs_count", "reenqueue_job",
+                  "reenqueue_job_no_retry", "JobResult", "mark_job_dead",
+                  "get_user_cached", "update_user_and_invalidate",
+                  "update_file_record_and_invalidate"):
+        setattr(db_pkg, _attr, _MM(name=f"database.{_attr}"))
 
     # 按依赖顺序直接加载子模块:redis_queue 在前(write_router 依赖它)
     for mod_name, file_name in (
@@ -181,6 +191,13 @@ def _install_telegram_mock_if_missing() -> None:
     _sys.modules["telegram.ext"] = _MM(name="mock_telegram_ext")
     # 关键:为 Update 类提供可调用构造器,避免 isinstance() 检查失败
     _sys.modules["telegram"].Update = type("Update", (), {})
+    # R45: mock telegram.error 子模块(mon_bot 从中导入 TelegramError/RetryAfter)
+    _telegram_err_mod = _MM(name="mock_telegram_error")
+    for _err_name in ("BadRequest", "Forbidden", "RetryAfter", "NetworkError",
+                       "TimedOut", "ChatMigrated", "MessageNotModified",
+                       "TelegramError", "Conflict", "BadRequest"):
+        setattr(_telegram_err_mod, _err_name, type(_err_name, (Exception,), {}))
+    _sys.modules["telegram.error"] = _telegram_err_mod
 
 
 # 收集阶段即注入(早于任何 test 模块 import 被测代码)

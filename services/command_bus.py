@@ -107,6 +107,8 @@ class Result:
         approval_id: 需要审批时返回的 approval_id(>0 表示已创建审批)
         approval_required: 是否需要等待审批
         action_id: 幂等 ID(用于去重)
+        effect_receipts: R45 — 外部副作用 receipt 状态清单,记录每个副作用的
+            status / external_id / skipped 字段,便于调用方判断是否被跳过
     """
     success: bool
     data: Any = None
@@ -114,6 +116,7 @@ class Result:
     approval_id: int = 0
     approval_required: bool = False
     action_id: str = ""
+    effect_receipts: dict = field(default_factory=dict)
 
 
 # ─── R41 P0-5: 幂等执行追踪(SQLite 持久化) ───────────────────
@@ -1094,16 +1097,23 @@ class CommandBus:
     ) -> Result:
         """R41 P0-5: 执行 handler,使用 SQLite CAS 保证幂等。
 
+        R45: 接入 EffectReceiptManager,在 handler 执行前后包装 effect receipt:
+            - 执行前:检查 receipt 是否 completed(崩溃重试时跳过 handler);
+            - 执行前:record_pending 标记开始执行;
+            - 执行后(成功):record_completed 记录 external_id;
+            - 执行后(失败):record_failed;
+            - Result.effect_receipts 字段返回 receipt 状态清单。
+
         流程:
         1. 计算 request_hash = SHA256(payload)
         2. CAS INSERT INTO command_executions(status='pending')
            - UNIQUE 冲突 → 查询现有状态返回缓存 Result
         3. CAS UPDATE status='executing' WHERE action_id=? AND status='pending'
            - rowcount=0 → 被其他 worker 抢占
-        4. 执行 handler
+        4. R45: effect receipt 检查 → record_pending → 执行 handler → record_completed/failed
         5. UPDATE status='executed', result=JSON
 
-        无 DB 时降级为直接执行(无幂等保护,仅用于测试)。
+        无 DB 时降级为直接执行(无幂等保护,仅用于测试),仍会执行 effect receipt 包装。
         """
         # R41 P0-5: 无 DB 降级模式 — 直接执行 handler(仅测试/开发用)
         store = _get_store()
@@ -1112,10 +1122,34 @@ class CommandBus:
                 f"[CommandBus] 数据库未初始化,降级模式(无幂等保护) "
                 f"action={command.action} action_id={action_id}"
             )
+            # R45: 即使无 DB 仍尝试接入 effect receipt(manager 可能可用)
+            effect_receipts = await self._wrap_with_effect_receipt(
+                action_id, command, on_no_db=True,
+            )
+            if effect_receipts.get("skipped"):
+                # 副作用已完成 → 直接返回成功(幂等)
+                return Result(
+                    success=True,
+                    data={"skipped_by_receipt": True,
+                          "external_id": effect_receipts.get("external_id", "")},
+                    action_id=action_id,
+                    effect_receipts=effect_receipts,
+                )
             try:
                 data = await command.handler(command.params)
-                return Result(success=True, data=data, action_id=action_id)
+                await self._finalize_effect_receipt(
+                    action_id, command, success=True, data=data,
+                )
+                return Result(
+                    success=True,
+                    data=data,
+                    action_id=action_id,
+                    effect_receipts=effect_receipts,
+                )
             except Exception as e:
+                await self._finalize_effect_receipt(
+                    action_id, command, success=False, error=str(e),
+                )
                 return Result(
                     success=False,
                     error=f"执行失败: {e}",
@@ -1151,16 +1185,41 @@ class CommandBus:
                 action_id=action_id,
             )
 
-        # 4. 执行 handler
+        # 4. R45: effect receipt 检查 → record_pending
+        effect_receipts = await self._wrap_with_effect_receipt(
+            action_id, command, on_no_db=False,
+        )
+        if effect_receipts.get("skipped"):
+            # 副作用已完成 → 跳过 handler,直接 mark_executed
+            logger.info(
+                f"[CommandBus] effect receipt 已完成,跳过 handler "
+                f"action_id={action_id} action={command.action}"
+            )
+            result = Result(
+                success=True,
+                data={"skipped_by_receipt": True,
+                      "external_id": effect_receipts.get("external_id", "")},
+                action_id=action_id,
+                effect_receipts=effect_receipts,
+            )
+            await _mark_executed(action_id, result)
+            return result
+
+        # 5. 执行 handler
         try:
             data = await command.handler(command.params)
             result = Result(
                 success=True,
                 data=data,
                 action_id=action_id,
+                effect_receipts=effect_receipts,
             )
-            # 5. UPDATE status='executed', result=JSON
+            # 6. UPDATE status='executed', result=JSON
             await _mark_executed(action_id, result)
+            # 7. R45: effect receipt record_completed
+            await self._finalize_effect_receipt(
+                action_id, command, success=True, data=data,
+            )
             logger.info(
                 f"[CommandBus] 命令执行成功 action={command.action} "
                 f"principal={principal.id} action_id={action_id}"
@@ -1174,11 +1233,121 @@ class CommandBus:
             )
             # 失败也持久化(防止无脑重试,可通过 release_execution 释放后重试)
             await _mark_failed(action_id, result)
+            # R45: effect receipt record_failed
+            await self._finalize_effect_receipt(
+                action_id, command, success=False, error=str(e),
+            )
             logger.error(
                 f"[CommandBus] 命令执行失败 action={command.action} "
                 f"principal={principal.id} action_id={action_id}: {e}"
             )
             return result
+
+    # ─── R45: effect receipt 包装辅助方法 ────────────────────
+
+    async def _wrap_with_effect_receipt(
+        self,
+        action_id: str,
+        command: Command,
+        on_no_db: bool = False,
+    ) -> dict:
+        """R45: handler 执行前检查 effect receipt,若已完成则跳过 handler。
+
+        Args:
+            action_id: 幂等 ID
+            command: Command 对象
+            on_no_db: 是否在无 DB 降级模式下调用
+
+        Returns:
+            dict: {"skipped": bool, "external_id": str, "effect_type": str, "target": str}
+            - skipped=True 表示已完成,调用方应跳过 handler
+            - skipped=False 表示需执行 handler,本函数已 record_pending
+            - 任何异常都 fail-open 返回 skipped=False
+        """
+        effect_type = "command_handler"
+        target = command.action
+        result_info = {
+            "skipped": False,
+            "external_id": "",
+            "effect_type": effect_type,
+            "target": target,
+            "status": "pending",
+        }
+        try:
+            from services.effect_receipts import get_receipt_manager
+            manager = get_receipt_manager()
+            if manager is None:
+                logger.debug(
+                    f"[CommandBus] effect_receipt manager 不可用,跳过 receipt 包装 "
+                    f"action_id={action_id}"
+                )
+                return result_info
+            # 检查是否已完成(崩溃重试场景)
+            receipt = await manager.check_receipt(action_id, effect_type, target)
+            if receipt is not None and receipt.get("status") == "completed":
+                result_info["skipped"] = True
+                result_info["external_id"] = receipt.get("external_id", "") or ""
+                result_info["status"] = "completed"
+                logger.info(
+                    f"[CommandBus] effect receipt 已 completed,跳过 handler "
+                    f"action_id={action_id} action={command.action}"
+                )
+                return result_info
+            # 记录 pending
+            await manager.record_pending(action_id, effect_type, target)
+            result_info["status"] = "pending"
+            return result_info
+        except Exception as e:
+            # receipt 检查/记录失败不应阻塞 handler 执行
+            logger.warning(
+                f"[CommandBus] effect receipt 检查失败(降级执行) "
+                f"action_id={action_id}: {e}"
+            )
+            return result_info
+
+    async def _finalize_effect_receipt(
+        self,
+        action_id: str,
+        command: Command,
+        success: bool,
+        data: Any = None,
+        error: str = "",
+    ) -> None:
+        """R45: handler 执行后写入 effect receipt(completed/failed)。
+
+        Args:
+            action_id: 幂等 ID
+            command: Command 对象
+            success: True=handler 成功;False=handler 失败
+            data: handler 返回的数据(用于提取 external_id)
+            error: 失败时的错误信息
+        """
+        effect_type = "command_handler"
+        target = command.action
+        try:
+            from services.effect_receipts import get_receipt_manager
+            manager = get_receipt_manager()
+            if manager is None:
+                return
+            if success:
+                # 从 data 中提取 external_id(如有)
+                external_id = ""
+                if isinstance(data, dict):
+                    external_id = str(
+                        data.get("external_id")
+                        or data.get("message_id")
+                        or ""
+                    )
+                await manager.record_completed(
+                    action_id, effect_type, target, external_id,
+                )
+            else:
+                await manager.record_failed(action_id, effect_type, target)
+        except Exception as e:
+            logger.warning(
+                f"[CommandBus] effect receipt record_final 失败(非致命) "
+                f"action_id={action_id}: {e}"
+            )
 
 
 # ════════════════════════════════════════════════════════════════

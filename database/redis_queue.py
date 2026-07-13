@@ -178,13 +178,22 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
     Returns:
         True 推入成功, False 降级到 SQLite 直写
     """
+    # R45 §13: 提前生成 message_id,供 durable outbox 使用(Redis 不可达时不丢失)
+    if not message_id:
+        message_id = str(uuid.uuid4())
     redis = await get_redis()
     if not redis:
+        # R45 §13: Redis 不可用时写入本地 durable producer outbox
+        # write_router 仍会降级到 SQLite 直写,但消息也缓冲在 outbox 中
+        # 供 Redis 恢复后 replay_durable_outbox() 重放到 Stream
+        await write_durable_outbox(
+            op_type=op_type, table=table, method_name=method_name,
+            data=data, redis_key=redis_key, message_id=message_id,
+            attempts=attempts,
+        )
         return False
     try:
         from config import settings
-        if not message_id:
-            message_id = str(uuid.uuid4())
         msg = {
             "op_type": op_type,
             "table": table,
@@ -206,6 +215,12 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
         return True
     except Exception as e:
         logger.warning(f"[RedisQueue] push 失败(降级到 SQLite): {e}")
+        # R45 §13: Redis 运行时异常也写入 durable outbox
+        await write_durable_outbox(
+            op_type=op_type, table=table, method_name=method_name,
+            data=data, redis_key=redis_key, message_id=message_id,
+            attempts=attempts,
+        )
         return False
 
 
@@ -895,3 +910,250 @@ async def close_redis():
     _redis_init_attempted = False
     _redis_last_attempt_ts = 0
     _consumer_group_ensured = False
+    # R45 §13: 同时关闭 durable outbox 专用连接
+    await close_durable_outbox()
+
+
+# ─── R45 §13: Durable Producer Outbox ──────────────────────────────────────
+# Redis 不可用时,producer 消息写入本地 SQLite durable outbox,
+# 供 Redis 恢复后 replay_durable_outbox() 重放到 Stream。
+#
+# 设计要点:
+# 1. 专用 SQLite connection(data/redis_outbox.db),不复用 cache_store 连接
+#    — 避免 cache_store 的 monkey-patch commit 干扰 outbox 事务
+# 2. transaction-aware: 每条消息在独立事务中写入(BEGIN IMMEDIATE / COMMIT)
+# 3. WAL 模式支持并发写(producer 与 replayer 可能同时访问)
+# 4. 幂等: message_id 唯一约束,重放不会产生重复消息
+
+_durable_conn: Any = None
+_durable_conn_lock = None
+_DURABLE_DB_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "redis_outbox.db",
+)
+
+
+def _get_durable_init_lock():
+    """延迟获取 asyncio.Lock(避免模块加载时创建事件循环)。"""
+    global _durable_conn_lock
+    if _durable_conn_lock is None:
+        _durable_conn_lock = __import__("asyncio").Lock()
+    return _durable_conn_lock
+
+
+async def _get_dedicated_connection() -> Any:
+    """R45 §13: 获取专用 SQLite connection(不复用 cache_store 连接)。
+
+    使用独立的 data/redis_outbox.db 数据库文件,避免 cache_store 的
+    monkey-patch commit 干扰 outbox 事务。WAL 模式支持并发写。
+
+    Returns:
+        aiosqlite.Connection,初始化失败返回 None
+    """
+    global _durable_conn
+    if _durable_conn is not None:
+        return _durable_conn
+    async with _get_durable_init_lock():
+        if _durable_conn is not None:
+            return _durable_conn
+        try:
+            import aiosqlite
+            os.makedirs(os.path.dirname(_DURABLE_DB_PATH), exist_ok=True)
+            conn = await aiosqlite.connect(_DURABLE_DB_PATH, timeout=10)
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute("PRAGMA wal_autocheckpoint=1000")
+            await conn.execute("PRAGMA synchronous=NORMAL")
+            # R45 §13: durable_outbox 表 — 缓冲 Redis 不可达时的 producer 消息
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS durable_outbox ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "message_id TEXT NOT NULL UNIQUE, "
+                "op_type TEXT NOT NULL, "
+                "table_name TEXT NOT NULL, "
+                "method_name TEXT NOT NULL, "
+                "data_json TEXT NOT NULL, "
+                "redis_key TEXT DEFAULT '', "
+                "attempts INTEGER DEFAULT 0, "
+                "created_at REAL NOT NULL, "
+                "replayed_at REAL, "
+                "status TEXT DEFAULT 'pending'"
+                ")"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_durable_outbox_status "
+                "ON durable_outbox(status) WHERE status = 'pending'"
+            )
+            await conn.commit()
+            _durable_conn = conn
+            logger.info(
+                f"[RedisQueue] R45 §13: durable outbox 已初始化 "
+                f"(path={_DURABLE_DB_PATH})"
+            )
+        except Exception as e:
+            logger.error(f"[RedisQueue] R45 §13: durable outbox 初始化失败: {e}")
+            _durable_conn = None
+    return _durable_conn
+
+
+async def write_durable_outbox(
+    op_type: str, table: str, method_name: str, data: dict,
+    redis_key: str = "", message_id: str = "", attempts: int = 0,
+) -> bool:
+    """R45 §13: Redis 不可用时将 producer 消息写入本地 durable outbox。
+
+    使用专用 SQLite connection 和独立事务(BEGIN IMMEDIATE / COMMIT),
+    不受 cache_store monkey-patch 影响。每条消息在独立事务中写入,
+    确保 transaction-aware。
+
+    幂等: message_id 唯一约束,重复写入会被忽略(INSERT OR IGNORE)。
+
+    Args:
+        op_type: 操作类型(upsert/update/delete/insert)
+        table: 目标 SQLite 表名
+        method_name: 调用的 cache_store 方法名
+        data: 方法参数字典
+        redis_key: 关联的 Redis 缓存 key
+        message_id: 幂等键(UUID)
+        attempts: 重试次数
+
+    Returns:
+        True 写入成功, False 写入失败(已降级,不阻塞主流程)
+    """
+    conn = await _get_dedicated_connection()
+    if conn is None:
+        logger.warning("[RedisQueue] R45 §13: durable outbox 连接不可用,消息可能丢失")
+        return False
+    try:
+        data_json = json.dumps(data, default=str, ensure_ascii=False)
+        # R45 §13: 独立事务写入(transaction-aware Command)
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            await conn.execute(
+                "INSERT OR IGNORE INTO durable_outbox "
+                "(message_id, op_type, table_name, method_name, data_json, "
+                "redis_key, attempts, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+                (message_id, op_type, table, method_name, data_json,
+                 redis_key, int(attempts) if attempts else 0, time.time()),
+            )
+            await conn.execute("COMMIT")
+        except Exception:
+            try:
+                await conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        return True
+    except Exception as e:
+        logger.warning(f"[RedisQueue] R45 §13: durable outbox 写入失败: {e}")
+        return False
+
+
+async def replay_durable_outbox(batch_size: int = 100) -> int:
+    """R45 §13: Redis 恢复后将 durable outbox 中 pending 消息重放到 Stream。
+
+    由 db_writer 启动时或 mon_bot 检测到 Redis 恢复后调用。
+    重放成功后标记为 'replayed',不删除(保留审计痕迹)。
+
+    Args:
+        batch_size: 单次重放的最大消息数
+
+    Returns:
+        成功重放的消息数
+    """
+    redis = await get_redis()
+    if not redis:
+        logger.debug("[RedisQueue] R45 §13: replay — Redis 仍不可达,跳过")
+        return 0
+    conn = await _get_dedicated_connection()
+    if conn is None:
+        return 0
+    try:
+        from config import settings
+        # 拉取 pending 消息
+        cursor = await conn.execute(
+            "SELECT id, message_id, op_type, table_name, method_name, "
+            "data_json, redis_key, attempts, created_at "
+            "FROM durable_outbox WHERE status = 'pending' "
+            "ORDER BY created_at ASC LIMIT ?",
+            (batch_size,),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if not rows:
+            return 0
+        replayed = 0
+        for row in rows:
+            row_id, msg_id, op_type, table_name, method_name, \
+                data_json, redis_key, attempts, created_at = row
+            try:
+                msg = {
+                    "op_type": op_type,
+                    "table": table_name,
+                    "method_name": method_name,
+                    "data": json.loads(data_json),
+                    "redis_key": redis_key or "",
+                    "message_id": msg_id,
+                    "created_at": created_at,
+                    "attempts": attempts or 0,
+                }
+                await redis.xadd(
+                    settings.WRITER_STREAM_KEY,
+                    {"data": json.dumps(msg, default=str)},
+                    id="*",
+                )
+                # 标记为已重放
+                await conn.execute(
+                    "UPDATE durable_outbox SET status = 'replayed', "
+                    "replayed_at = ? WHERE id = ?",
+                    (time.time(), row_id),
+                )
+                replayed += 1
+            except Exception as e:
+                logger.warning(
+                    f"[RedisQueue] R45 §13: replay 消息 id={row_id} 失败: {e}"
+                )
+                # 单条失败不影响其他消息重放
+                continue
+        if replayed > 0:
+            await conn.commit()
+            logger.info(
+                f"[RedisQueue] R45 §13: durable outbox 重放 "
+                f"{replayed}/{len(rows)} 条消息到 Stream"
+            )
+        return replayed
+    except Exception as e:
+        logger.warning(f"[RedisQueue] R45 §13: replay_durable_outbox 异常: {e}")
+        return 0
+
+
+async def get_durable_outbox_count() -> int:
+    """R45 §13: 获取 durable outbox 中 pending 消息数(mon_bot 监控用)。
+
+    Returns:
+        pending 消息数,-1 表示连接不可用
+    """
+    conn = await _get_dedicated_connection()
+    if conn is None:
+        return -1
+    try:
+        cursor = await conn.execute(
+            "SELECT COUNT(*) FROM durable_outbox WHERE status = 'pending'"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return row[0] if row else 0
+    except Exception as e:
+        logger.debug(f"[RedisQueue] R45 §13: get_durable_outbox_count 异常: {e}")
+        return -1
+
+
+async def close_durable_outbox():
+    """R45 §13: 关闭 durable outbox 连接(进程退出时调用)。"""
+    global _durable_conn
+    if _durable_conn is not None:
+        try:
+            await _durable_conn.close()
+        except Exception:
+            pass
+        _durable_conn = None

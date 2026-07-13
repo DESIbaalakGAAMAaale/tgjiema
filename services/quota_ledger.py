@@ -492,3 +492,135 @@ async def admin_adjust(user_id: int, amount: int, reason: str, admin_id: int) ->
     except Exception as e:
         logger.error(f"[QuotaLedger] admin_adjust 失败 user={user_id} amount={amount}: {e}")
         return False
+
+
+# ════════════════════════════════════════════════════════════════
+# R45 §9-10 整改: RESERVE/SETTLE/RELEASE 语义化别名
+#
+# R42 终审报告要求 Quota 使用 RESERVE→SETTLE/RELEASE ledger 模式:
+# - reserve_quota: 上传开始时预扣配额(等同于 reserve,action_id 作为 reason)
+# - settle_quota: 上传成功后确认配额(等同于 settle,action_id 即 reservation_id)
+# - release_quota: 上传失败或取消时释放配额(等同于 refund,action_id 即 reservation_id)
+#
+# 这些别名函数是对现有 reserve/settle/refund 的语义化包装,
+# 使调用方代码更清晰地表达 RESERVE→SETTLE/RELEASE 状态机。
+# ════════════════════════════════════════════════════════════════
+
+
+async def reserve_quota(user_id: int, amount: int, action_id: str) -> str:
+    """R45: 预扣配额(上传/解码开始时调用)。
+
+    语义化别名,内部委托给 reserve()。
+    action_id 作为 reason 写入 quota_ledger,便于追踪业务流。
+
+    Args:
+        user_id: Telegram 用户 ID
+        amount: 预扣数量(正整数)
+        action_id: 业务动作标识(如 "upload:r45-upload-001"),
+                   写入 ledger.reason 用于审计追踪
+
+    Returns:
+        reservation_id(UUID);余额不足或失败时返回空字符串
+    """
+    return await reserve(user_id, amount, reason=action_id)
+
+
+async def settle_quota(action_id: str) -> bool:
+    """R45: 确认配额(上传/解码成功后调用)。
+
+    语义化别名,内部委托给 settle()。
+    action_id 即 reservation_id(由 reserve_quota 返回)。
+
+    Args:
+        action_id: reservation_id(由 reserve_quota 返回)
+
+    Returns:
+        True 表示成功;False 表示预留不存在或状态非 reserved
+    """
+    return await settle(action_id)
+
+
+async def release_quota(action_id: str, reason: str = "") -> bool:
+    """R45: 释放配额(上传/解码失败或取消时调用)。
+
+    语义化别名,内部委托给 refund()。
+    action_id 即 reservation_id(由 reserve_quota 返回)。
+
+    Args:
+        action_id: reservation_id(由 reserve_quota 返回)
+        reason: 释放原因(可选,写入 ledger 审计)
+
+    Returns:
+        True 表示成功;False 表示预留不存在或状态非 reserved
+    """
+    return await refund(action_id, reason=reason)
+
+
+async def force_release_quota(action_id: str, reason: str = "") -> bool:
+    """R45: 强制释放配额(绕过 dirty_outbox 的兜底路径)。
+
+    当 release_quota → refund() 因 dirty_outbox 故障失败时使用此兜底函数。
+    直接 UPDATE quota_reservations SET status='refunded',不调用 add_dirty_outbox,
+    避免"dirty_outbox 故障 → refund 失败 → 配额无法释放"的死循环。
+
+    场景:
+    - finalize_upload 主事务因 dirty_outbox 故障 ROLLBACK,
+      后续 release_quota 又因同样 dirty_outbox 故障失败,
+      需要绕过 dirty_outbox 强制释放配额,防止配额泄漏(用户配额被永久占用)。
+
+    副作用:
+    - 不写 dirty_outbox,跨机同步延迟(由后续 cleanup_expired_reservations 兜底)
+    - 不写 quota_ledger 流水(避免事务二次失败)
+    - 日志记录原因,便于人工审计
+
+    Args:
+        action_id: reservation_id(由 reserve_quota 返回)
+        reason: 强制释放原因(写入日志)
+
+    Returns:
+        True 表示成功;False 表示预留不存在或数据库未初始化
+    """
+    store = get_cache_store()
+    if not store._db:
+        logger.warning("[QuotaLedger] force_release_quota 数据库未初始化")
+        return False
+
+    reservation = await get_reservation(action_id)
+    if reservation is None:
+        logger.warning(f"[QuotaLedger] force_release_quota 预留不存在: {action_id}")
+        return False
+
+    # 已 refunded/settled 的不重复 release(幂等)
+    if reservation["status"] != RESERVATION_STATUS_RESERVED:
+        logger.info(
+            f"[QuotaLedger] force_release_quota 跳过(状态非 reserved) "
+            f"res_id={action_id} status={reservation['status']}"
+        )
+        return True
+
+    now = datetime.datetime.now().isoformat()
+    reserved_amount = int(reservation["amount"])
+    user_id = int(reservation["user_id"])
+    release_reason = f"force_release: {reason}" if reason else "force_release: dirty_outbox 故障兜底"
+
+    try:
+        # 直接 UPDATE(不调用 add_dirty_outbox,不写 quota_ledger 流水)
+        # 避免 dirty_outbox 故障导致配额永久泄漏
+        await store._db.execute(
+            "UPDATE quota_reservations SET status = 'refunded', settled_at = ? "
+            "WHERE id = ? AND status = 'reserved'",
+            (now, action_id),
+        )
+        await store._db.commit()
+
+        logger.warning(
+            f"[QuotaLedger] force_release_quota 成功(绕过 dirty_outbox) "
+            f"res_id={action_id} user={user_id} amount={reserved_amount} "
+            f"reason={release_reason}"
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            f"[QuotaLedger] force_release_quota 失败 res_id={action_id}: {e}"
+        )
+        return False

@@ -296,18 +296,30 @@ class ApprovalExecutor:
 
         # 分支 4: claimed → 执行 handler
         # R44 G0-2: EffectReceipts effectively-once 保护
+        # R45: 重构为使用 EffectReceiptContext 包装(check→pending→completed/failed)
         # 在 handler 调用前检查 receipt,若已 completed 则跳过 handler 直接 mark_executed
-        # 在 handler 调用后写入 completed receipt,崩溃重试时通过 receipt 跳过
+        # 在 handler 调用后通过 EffectReceiptContext 自动写入 completed/failed
+        from services.effect_receipts_integration import EffectReceiptContext
+        handler_effect_type = "handler_execute"
+        handler_target = entry.get("command_type", "") or "unknown"
+
+        # 确保 receipt_manager 已初始化(EffectReceiptContext 内部会调用 get_receipt_manager)
         try:
             from services.effect_receipts import get_receipt_manager
-            receipt_mgr = get_receipt_manager(store)
-            handler_effect_type = "handler_execute"
-            handler_target = entry.get("command_type", "") or "unknown"
-            # 检查是否已 completed(崩溃重试场景)
-            existing_receipt = await receipt_mgr.check_receipt(
-                action_id, handler_effect_type, handler_target,
+            get_receipt_manager(store)
+        except Exception as e:
+            logger.warning(
+                f"[ApprovalExecutor] effect_receipts manager 初始化失败(降级执行) "
+                f"entry id={entry['id']}: {e}"
             )
-            if existing_receipt is not None:
+
+        async with EffectReceiptContext(
+            action_id=action_id,
+            effect_type=handler_effect_type,
+            target=handler_target,
+        ) as receipt:
+            if receipt.skipped:
+                # 已 completed(崩溃重试场景),跳过 handler 直接 mark_executed
                 logger.info(
                     f"[ApprovalExecutor] entry id={entry['id']} action_id={action_id} "
                     f"effect receipt 已 completed(跳过 handler 直接 mark_executed)"
@@ -317,7 +329,7 @@ class ApprovalExecutor:
                     "success": True,
                     "data": {
                         "skipped_by_receipt": True,
-                        "external_id": existing_receipt.get("external_id", ""),
+                        "external_id": receipt.external_id,
                     },
                     "error": "",
                 }
@@ -328,86 +340,52 @@ class ApprovalExecutor:
                     approval_id=approval_id if approval_id > 0 else None,
                 )
                 return "success"
-            # 记录 pending receipt(标明开始执行)
-            await receipt_mgr.record_pending(
-                action_id, handler_effect_type, handler_target,
-            )
-        except Exception as e:
-            # receipt 检查/记录失败不应阻塞 handler 执行
-            logger.warning(
-                f"[ApprovalExecutor] effect_receipts 检查失败(降级执行) "
-                f"entry id={entry['id']}: {e}"
-            )
 
-        # 2b. 调用 CommandBus 执行 handler(完全独立的事务边界)
-        try:
-            result = await cb.execute_command_outbox_entry(entry)
-        except Exception as e:
-            logger.error(
-                f"[ApprovalExecutor] CommandBus 执行异常 entry id={entry['id']}: {e}"
-            )
-            # R44 G0-2: 失败时记录 failed receipt(便于排查)
+            # 2b. 调用 CommandBus 执行 handler(完全独立的事务边界)
             try:
-                from services.effect_receipts import get_receipt_manager
-                receipt_mgr = get_receipt_manager(store)
-                await receipt_mgr.record_failed(
-                    action_id, "handler_execute",
-                    entry.get("command_type", "") or "unknown",
+                result = await cb.execute_command_outbox_entry(entry)
+            except Exception as e:
+                logger.error(
+                    f"[ApprovalExecutor] CommandBus 执行异常 entry id={entry['id']}: {e}"
                 )
-            except Exception as receipt_err:
-                logger.warning(
-                    f"[ApprovalExecutor] record_failed receipt 失败: {receipt_err}"
-                )
-            # R42 P0-2: 释放 lease + 安排重试
-            await _cb_mod.release_lease(action_id)
-            return await self._handle_failure(entry, f"CommandBus 异常: {e}")
+                # EffectReceiptContext 异常退出会自动 record_failed
+                # R42 P0-2: 释放 lease + 安排重试
+                await _cb_mod.release_lease(action_id)
+                return await self._handle_failure(entry, f"CommandBus 异常: {e}")
 
-        # R44 G0-2: handler 成功 → 记录 completed receipt(effectively-once 保证)
-        if result.success:
-            try:
-                from services.effect_receipts import get_receipt_manager
-                receipt_mgr = get_receipt_manager(store)
-                # external_id 可从 result.data 中提取(若有),否则留空
-                external_id = ""
-                if hasattr(result, "data") and isinstance(result.data, dict):
-                    external_id = str(result.data.get("external_id", "") or "")
-                await receipt_mgr.record_completed(
-                    action_id, "handler_execute",
-                    entry.get("command_type", "") or "unknown",
-                    external_id=external_id,
-                )
-            except Exception as receipt_err:
-                # receipt 记录失败不影响主流程(已执行成功)
-                logger.warning(
-                    f"[ApprovalExecutor] record_completed receipt 失败(非致命): {receipt_err}"
-                )
+            # R45: 设置 external_id(若有),EffectReceiptContext 正常退出时会 record_completed
+            if result.success and hasattr(result, "data") and isinstance(result.data, dict):
+                external_id = str(result.data.get("external_id", "") or "")
+                if external_id:
+                    receipt.set_external_id(external_id)
 
-        # 2c. 更新三处状态
-        if result.success:
-            # R42 P0-2: 同一事务内更新 command_executions=executed + command_outbox=executed
-            # + approval=executed
-            await _cb_mod.mark_outbox_executed(
-                action_id,
-                result=result,
-                approval_id=approval_id if approval_id > 0 else None,
-            )
-            return "success"
-        else:
-            # R44 G0-2: 失败 → 记录 failed receipt + 释放 lease + 安排重试
-            try:
-                from services.effect_receipts import get_receipt_manager
-                receipt_mgr = get_receipt_manager(store)
-                await receipt_mgr.record_failed(
-                    action_id, "handler_execute",
-                    entry.get("command_type", "") or "unknown",
+            # 2c. 更新三处状态
+            if result.success:
+                # R42 P0-2: 同一事务内更新 command_executions=executed + command_outbox=executed
+                # + approval=executed
+                await _cb_mod.mark_outbox_executed(
+                    action_id,
+                    result=result,
+                    approval_id=approval_id if approval_id > 0 else None,
                 )
-            except Exception as receipt_err:
-                logger.warning(
-                    f"[ApprovalExecutor] record_failed receipt 失败: {receipt_err}"
-                )
-            # R42 P0-2: 失败 → 释放 lease + 安排重试
-            await _cb_mod.release_lease(action_id)
-            return await self._handle_failure(entry, result.error)
+                return "success"
+            else:
+                # R45: handler 返回 success=False → 标记 no_record 避免 EffectReceiptContext
+                # 自动 record_completed,然后手动 record_failed 保持原行为
+                receipt.mark_no_record()
+                try:
+                    from services.effect_receipts import get_receipt_manager
+                    receipt_mgr = get_receipt_manager(store)
+                    await receipt_mgr.record_failed(
+                        action_id, handler_effect_type, handler_target,
+                    )
+                except Exception as receipt_err:
+                    logger.warning(
+                        f"[ApprovalExecutor] record_failed receipt 失败: {receipt_err}"
+                    )
+                # R42 P0-2: 失败 → 释放 lease + 安排重试
+                await _cb_mod.release_lease(action_id)
+                return await self._handle_failure(entry, result.error)
 
     async def _mark_executed(self, entry_id: int) -> None:
         """标记 entry 为 executed。"""

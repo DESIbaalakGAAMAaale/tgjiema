@@ -17,7 +17,30 @@
     "no_data": "暂无数据",
     "page_prev": "上一页",
     "page_next": "下一页",
-    "logout": "退出登录"
+    "logout": "退出登录",
+    "error": {
+      "generic": "操作失败,请稍后重试",
+      "permission_denied": "权限不足",
+      "not_found": "资源不存在",
+      "rate_limited": "操作过于频繁,请稍后重试"
+    },
+    "success": {
+      "saved": "保存成功",
+      "deleted": "删除成功"
+    },
+    "files": {
+      "count": {
+        "one": "{count} 个文件",
+        "other": "{count} 个文件"
+      }
+    }
+  },
+  "button": {
+    "confirm": "确认",
+    "cancel": "取消",
+    "retry": "重试",
+    "appeal": "申诉",
+    "language_switch": "切换语言"
   },
   "errors": {
     "quota.decode.exceeded": "今日解码次数已达上限",

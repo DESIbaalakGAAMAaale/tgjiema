@@ -26,7 +26,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 10  # R44 7.2: 权威表增加 is_tombstone 列(tombstone soft_delete 路径)
+DDL_VERSION = 11  # R45: pending_uploads 部分索引 + decode_logs 7天保留
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -95,7 +95,7 @@ DDL_STATEMENTS = [
         processed INTEGER DEFAULT 0,
         claimed_at REAL DEFAULT 0
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_pending_uploads_unprocessed ON pending_uploads(processed)",
+    "CREATE INDEX IF NOT EXISTS idx_pending_uploads_pending_created ON pending_uploads (created_at) WHERE processed = 0",
     # 已废弃(v2 环形冗余架构用 jobs 表替代 send_queue)
     """CREATE TABLE IF NOT EXISTS send_queue (
         id SERIAL PRIMARY KEY,
@@ -303,6 +303,16 @@ MIGRATION_STATEMENTS = [
     # TTL 设置不在此处执行 — ADD COLUMN 是异步 schema change，
     # 紧跟 TTL 修改会报 "cannot modify TTL settings while another schema change
     # is being processed"。改为在下方单独循环中带等待执行。
+    # ─── CRDB RU 优化: 部分索引改造 ──────────────────────────────
+    # 评估报告 4.3: pending_uploads(processed) 是低基数二值字段,
+    # 普通索引会长期收录已处理记录。改为部分索引,仅收录 processed=0 的待处理记录。
+    "DROP INDEX IF EXISTS idx_pending_uploads_unprocessed",
+    "CREATE INDEX IF NOT EXISTS idx_pending_uploads_pending_created "
+    "ON pending_uploads (created_at) WHERE processed = 0",
+    "CREATE INDEX IF NOT EXISTS idx_pending_uploads_reclaim "
+    "ON pending_uploads (claimed_at, created_at) WHERE processed = 0",
+    # 评估报告 5.1: decode_logs 7 天短期保留,保留 request_time 索引用于过期清理
+    # (idx_decode_logs_request_time 已在 DDL_STATEMENTS 中创建,这里无需重复)
 ]
 
 
@@ -1395,7 +1405,16 @@ async def _invalidate_config_caches(key: str):
 # 优先从 DB 读取（支持热修改），DB 未配置时回退到 settings 环境变量
 
 # 进程内互斥锁：防止并发 add/remove 导致读-改-写竞态（覆盖丢失）
-_whitelist_modify_lock = asyncio.Lock()
+# R45: 懒加载 Lock,避免模块导入时 Python 3.9 要求事件循环存在
+_whitelist_modify_lock: asyncio.Lock | None = None
+
+
+def _get_whitelist_modify_lock() -> asyncio.Lock:
+    """懒加载 whitelist modify lock。"""
+    global _whitelist_modify_lock
+    if _whitelist_modify_lock is None:
+        _whitelist_modify_lock = asyncio.Lock()
+    return _whitelist_modify_lock
 
 
 async def get_relay_whitelist() -> set[int]:
@@ -1416,7 +1435,7 @@ async def get_relay_whitelist() -> set[int]:
 
 async def add_relay_whitelist(user_id: int) -> bool:
     """添加中继账号到白名单。返回 True 表示新增，False 表示已存在。"""
-    async with _whitelist_modify_lock:
+    async with _get_whitelist_modify_lock():
         current = await get_relay_whitelist()
         if user_id in current:
             return False
@@ -1427,7 +1446,7 @@ async def add_relay_whitelist(user_id: int) -> bool:
 
 async def remove_relay_whitelist(user_id: int) -> bool:
     """从中继账号白名单移除。返回 True 表示已移除，False 表示不存在。"""
-    async with _whitelist_modify_lock:
+    async with _get_whitelist_modify_lock():
         current = await get_relay_whitelist()
         if user_id not in current:
             return False
@@ -1454,7 +1473,7 @@ async def get_collector_whitelist() -> set[int]:
 
 async def add_collector_whitelist(user_id: int) -> bool:
     """添加采集器账号到白名单。返回 True 表示新增，False 表示已存在。"""
-    async with _whitelist_modify_lock:
+    async with _get_whitelist_modify_lock():
         current = await get_collector_whitelist()
         if user_id in current:
             return False
@@ -1465,7 +1484,7 @@ async def add_collector_whitelist(user_id: int) -> bool:
 
 async def remove_collector_whitelist(user_id: int) -> bool:
     """从采集器账号白名单移除。返回 True 表示已移除，False 表示不存在。"""
-    async with _whitelist_modify_lock:
+    async with _get_whitelist_modify_lock():
         current = await get_collector_whitelist()
         if user_id not in current:
             return False

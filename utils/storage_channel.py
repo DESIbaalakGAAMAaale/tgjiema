@@ -1,3 +1,4 @@
+from __future__ import annotations
 import asyncio
 import time
 from loguru import logger
@@ -6,14 +7,23 @@ from loguru import logger
 _cache_active_channel: int | None = None
 _cache_ts: float = 0
 _CACHE_TTL = 60.0  # 60 秒自动过期
-_cache_lock = asyncio.Lock()
+# R45: 懒加载 Lock,避免模块导入时 Python 3.9 要求事件循环存在
+_cache_lock: asyncio.Lock | None = None
+
+
+def _get_cache_lock() -> asyncio.Lock:
+    """懒加载 cache lock(首次调用时事件循环已就绪)。"""
+    global _cache_lock
+    if _cache_lock is None:
+        _cache_lock = asyncio.Lock()
+    return _cache_lock
 
 
 async def get_active_storage_channel_id() -> int:
     global _cache_active_channel, _cache_ts
     now = time.monotonic()
     # 快速路径:锁内仅检查缓存,命中则立即返回,避免阻塞
-    async with _cache_lock:
+    async with _get_cache_lock():
         if _cache_active_channel is not None and (now - _cache_ts) < _CACHE_TTL:
             return _cache_active_channel
 
@@ -28,7 +38,7 @@ async def get_active_storage_channel_id() -> int:
         logger.warning(f"[storage_channel] 读取DB配置失败: {e}")
 
     # 锁内更新缓存,避免并发写竞争
-    async with _cache_lock:
+    async with _get_cache_lock():
         # double-check:可能在等待锁期间其他协程已更新缓存
         now2 = time.monotonic()
         if _cache_active_channel is not None and (now2 - _cache_ts) < _CACHE_TTL:

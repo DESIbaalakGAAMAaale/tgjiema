@@ -380,6 +380,15 @@ async def check_permission(user_id: int, permission: str) -> bool:
     若该表不存在或查询失败,fallback 到旧 _DEFAULT_ROLE_PERMISSIONS
     (仅当角色在默认映射中存在时,保证向后兼容)。
 
+    R45 §7.3: Principal ID 一致性 — user_id 参数应与 AdminPrincipal.id
+    一致(由 session.validate_session 从 admin_principals 表读取并返回)。
+    这样 RBAC 的 user_id、Session 的 principal_id、AdminPrincipal.id
+    三者使用同一身份主键,避免不同模块各自生成不同 ID 导致越权。
+
+    R45 §7.3: 缓存失效安全 — 本函数无显式缓存层,直接查询 DB。
+    若未来引入权限缓存,缓存读取失败时必须回退到 DB 查询,
+    DB 查询失败时返回 False(fail-closed),不应凭借缓存残留权限放行。
+
     判定逻辑:
     1. 获取用户角色(优先 admin_principal_roles,其次 rbac_user_roles)
     2. 获取角色权限列表
@@ -387,7 +396,7 @@ async def check_permission(user_id: int, permission: str) -> bool:
     4. 检查 permission 是否在权限列表中
 
     Args:
-        user_id: Telegram 用户 ID 或 AdminPrincipal.id
+        user_id: Telegram 用户 ID 或 AdminPrincipal.id(必须与 session 一致)
         permission: 权限标识(如 "users:ban")
 
     Returns:
@@ -423,15 +432,57 @@ async def check_permission(user_id: int, permission: str) -> bool:
     except Exception as e:
         # R40 P0-8: fail-closed — 异常时一律拒绝,防止 DB 故障导致越权
         # R41 P1-3: 记录到 audit_log(但不返回任何默认权限)
+        # R45 §7.3: 强化日志,记录 principal_id + permission + 异常类型
         logger.warning(
             f"[RBAC] check_permission 异常(fail-closed 拒绝) "
-            f"user={user_id} perm={permission}: {e}"
+            f"user={user_id} perm={permission} error_type={type(e).__name__}: {e}"
         )
         await _write_rbac_failure_audit_log(
             user_id, "check_permission",
-            f"perm={permission} error={e}",
+            f"perm={permission} error_type={type(e).__name__} error={e}",
         )
         return False
+
+
+async def require_permission(principal_id: int, permission: str) -> None:
+    """R45 §7.3: 强制权限校验 — 无权限时抛 HTTPException(403)。
+
+    所有 Web/Bot 高风险入口应统一调用此函数(或通过 CommandBus 间接调用),
+    确保 RBAC 校验不遗漏。
+
+    用法:
+        # Web 路由中
+        from services.rbac import require_permission
+        await require_permission(admin.id, "users:ban")
+        # 执行高风险操作...
+
+        # 或作为 FastAPI 依赖
+        async def require_ban_perm(admin=Depends(require_session)):
+            await require_permission(admin.id, "users:ban")
+            return admin
+
+    与 check_permission 的区别:
+    - check_permission 返回 bool(由调用方决定如何处理)
+    - require_permission 直接抛 HTTPException(403),适合路由入口强制门禁
+
+    Args:
+        principal_id: AdminPrincipal.id(必须与 session 一致)
+        permission: 权限标识(如 "users:ban")
+
+    Raises:
+        HTTPException: 403(无权限或校验异常 fail-closed)
+    """
+    from fastapi import HTTPException
+    ok = await check_permission(principal_id, permission)
+    if not ok:
+        logger.warning(
+            f"[RBAC] require_permission 拒绝 principal={principal_id} "
+            f"perm={permission}(fail-closed: 无权限或 DB 异常)"
+        )
+        raise HTTPException(
+            status_code=403,
+            detail=f"权限不足: 缺少 {permission} 权限",
+        )
 
 
 # ─── R42 P0-3: AdminPrincipal 持久化身份角色查询 ─────────────────

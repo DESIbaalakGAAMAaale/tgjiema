@@ -3,6 +3,8 @@
 - 支持并发处理解码任务
 - session 文件持久化，VPS 重启后自动恢复
 """
+from __future__ import annotations
+
 import asyncio
 import re
 import time

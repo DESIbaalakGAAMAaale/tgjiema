@@ -125,6 +125,11 @@ from admin import (  # noqa: E402
     app,
     generate_password_hash,
 )
+# R45: mock verify_admin_bootstrap 仅在 _client() 上下文中(startup 中
+# ensure_readiness_or_exit 会调用,真实 CacheStore 在测试环境为 MagicMock,
+# async 查询会失败导致 CancelledError)。使用 fixture 避免污染其他测试模块。
+import admin as _admin_module
+_orig_verify_admin_bootstrap = _admin_module.verify_admin_bootstrap
 
 from fastapi.testclient import TestClient  # noqa: E402
 
@@ -243,14 +248,23 @@ def _build_service_mocks():
 
 @pytest.fixture(autouse=True)
 def _install_service_mocks():
-    """每个用例前注入 services.* mock 模块,用例后还原。"""
+    """每个用例前注入 services.* mock 模块,用例后还原。
+
+    R45: 同时 mock verify_admin_bootstrap 为 True(仅在 autouse fixture 作用域内),
+    避免 startup 中 ensure_readiness_or_exit 调用真实 verify_admin_bootstrap
+    导致 CancelledError。用例结束后还原原始函数,不污染其他测试模块。
+    """
     mods = _build_service_mocks()
     saved = {}
     for name, mod in mods.items():
         saved[name] = sys.modules.get(name)
         sys.modules[name] = mod
         # 也挂到 services 包上(lazy import 走 sys.modules 即可)
+    # R45: mock verify_admin_bootstrap(startup 阶段调用,避免 CancelledError)
+    _admin_module.verify_admin_bootstrap = AsyncMock(return_value=True)
     yield
+    # 还原原始 verify_admin_bootstrap,避免污染其他测试模块
+    _admin_module.verify_admin_bootstrap = _orig_verify_admin_bootstrap
     for name, prev in saved.items():
         if prev is None:
             sys.modules.pop(name, None)

@@ -17,7 +17,30 @@
     "no_data": "No data",
     "page_prev": "Previous",
     "page_next": "Next",
-    "logout": "Logout"
+    "logout": "Logout",
+    "error": {
+      "generic": "Operation failed, please try again later",
+      "permission_denied": "Permission denied",
+      "not_found": "Resource not found",
+      "rate_limited": "Too many requests, please try again later"
+    },
+    "success": {
+      "saved": "Saved successfully",
+      "deleted": "Deleted successfully"
+    },
+    "files": {
+      "count": {
+        "one": "{count} file",
+        "other": "{count} files"
+      }
+    }
+  },
+  "button": {
+    "confirm": "Confirm",
+    "cancel": "Cancel",
+    "retry": "Retry",
+    "appeal": "Appeal",
+    "language_switch": "Switch Language"
   },
   "errors": {
     "quota.decode.exceeded": "Daily decode quota exceeded",

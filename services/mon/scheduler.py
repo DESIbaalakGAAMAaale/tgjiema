@@ -1,4 +1,5 @@
 """Mon 调度器:心跳检测、自动降级、环形推进、智能补齐"""
+from __future__ import annotations
 
 import os
 import re

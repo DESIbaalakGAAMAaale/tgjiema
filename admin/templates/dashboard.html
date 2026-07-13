@@ -1,5 +1,6 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<!-- R45 17.3: lang 属性支持 locale 动态注入(默认 zh-CN,由 Jinja2 上下文提供) -->
+<html lang="{{ locale | default('zh-CN') }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -19,8 +20,9 @@
         .card .label { font-size: 14px; color: #8c8c8c; margin-bottom: 8px; }
         .card .value { font-size: 30px; font-weight: 600; color: #1890ff; }
         .section { background: #fff; border-radius: 8px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
-        .section h3 { font-size: 16px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; }
+        .section h2 { font-size: 16px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; }
         table { width: 100%; border-collapse: collapse; }
+        caption { caption-side: top; text-align: left; padding: 8px 0; font-size: 13px; color: #8c8c8c; }
         th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
         th { background: #fafafa; font-weight: 600; }
         .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
@@ -37,20 +39,42 @@
         .search-box { display: flex; gap: 8px; margin-bottom: 16px; }
         .search-box input { flex: 1; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; }
         .search-box button { padding: 8px 16px; }
+        /* R45 17.3: 视觉隐藏但屏幕阅读器可读(WCAG 2.2 AA) */
+        .visually-hidden {
+            position: absolute !important; width: 1px !important; height: 1px !important;
+            padding: 0 !important; margin: -1px !important; overflow: hidden !important;
+            clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important;
+        }
+        /* R45 17.3: skip-link 键盘用户跳过导航(WCAG 2.4.1 Bypass Blocks) */
+        .skip-link {
+            position: absolute; top: -40px; left: 0; background: #000; color: #fff;
+            padding: 8px 16px; z-index: 100; transition: top 0.3s; font-size: 14px;
+            text-decoration: none; border-radius: 0 0 4px 0;
+        }
+        .skip-link:focus { top: 0; outline: 2px solid #1890ff; outline-offset: 2px; }
+        /* R45 17.3: focus-visible 增强(WCAG 2.2 AA 2.4.7 Focus Visible / 2.4.11 Focus Not Obscured) */
+        a:focus, button:focus, input:focus, select:focus, textarea:focus {
+            outline: 2px solid #1890ff; outline-offset: 2px;
+        }
+        :focus-visible { outline: 3px solid #1890ff !important; outline-offset: 2px !important; }
     </style>
 </head>
 <body>
-    <div class="sidebar">
+    <!-- R45 17.3: skip-link 键盘用户跳过导航直奔主内容 -->
+    <a href="#main-content" class="skip-link">跳到主要内容</a>
+    <!-- R45 17.3: aria-live 动态消息区 — 屏幕阅读器播报异步状态变化(WCAG 2.2 AA 4.1.3) -->
+    <div id="aria-live-region" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <nav class="sidebar" aria-label="主导航 / Main navigation">
         <h2>TG解码器管理</h2>
-        <a href="/" class="active">看板</a>
+        <a href="/" class="active" aria-current="page">看板</a>
         <a href="/users">用户管理</a>
         <a href="/files">文件管理</a>
         <a href="/logs">解码日志</a>
         <a href="/health-page">系统健康</a>
-    </div>
-    <div class="main">
-        <div class="header"><h1>系统看板</h1></div>
-        <div class="cards">
+    </nav>
+    <main class="main" id="main-content" role="main">
+        <header class="header"><h1>系统看板</h1></header>
+        <section class="cards" aria-label="系统概览指标 / System overview metrics">
             <div class="card">
                 <div class="label">总用户数</div>
                 <div class="value">{{ total_users }}</div>
@@ -83,16 +107,18 @@
                 <div class="label">备份失败</div>
                 <div class="value">{{ backup_fail }}</div>
             </div>
-        </div>
-        <div class="section">
-            <h3>机器人运行状态</h3>
+        </section>
+        <section class="section" aria-labelledby="bot-status-heading">
+            <h2 id="bot-status-heading">机器人运行状态</h2>
             <table>
+                <!-- R45 17.3: table caption — 数据表标题(WCAG 2.2 AA 1.3.1 Info and Relationships) -->
+                <caption>各机器人实例的实时运行状态、已处理任务数与错误数统计</caption>
                 <thead>
                     <tr>
-                        <th>机器人名称</th>
-                        <th>运行状态</th>
-                        <th>已处理任务</th>
-                        <th>错误数</th>
+                        <th scope="col">机器人名称</th>
+                        <th scope="col">运行状态</th>
+                        <th scope="col">已处理任务</th>
+                        <th scope="col">错误数</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -101,9 +127,10 @@
                         <td>{{ bot.name }}</td>
                         <td>
                             {% if bot.is_running %}
-                            <span class="tag tag-green">运行中</span>
+                            <!-- R45 17.3: 状态不仅用颜色,同时提供文字描述(WCAG 1.4.1 Use of Color) -->
+                            <span class="tag tag-green" role="status" aria-label="运行中">● 运行中</span>
                             {% else %}
-                            <span class="tag tag-red">停止</span>
+                            <span class="tag tag-red" role="status" aria-label="已停止">○ 已停止</span>
                             {% endif %}
                         </td>
                         <td>{{ bot.total_processed }}</td>
@@ -112,7 +139,7 @@
                     {% endfor %}
                 </tbody>
             </table>
-        </div>
-    </div>
+        </section>
+    </main>
 </body>
 </html>

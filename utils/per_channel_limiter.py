@@ -2,6 +2,7 @@
 Telegram 对同一频道的操作限制约为 20 msg/min，留 5 个余量，
 安全阈值设为 15 次/分钟。
 """
+from __future__ import annotations
 
 import time
 import asyncio
@@ -13,7 +14,15 @@ class PerChannelRateLimiter:
     def __init__(self, max_per_minute: int = 15):
         self.max_per_minute = max_per_minute
         self._channels: dict[int, list[float]] = defaultdict(list)
-        self._lock = asyncio.Lock()
+        # R45: 懒加载 Lock,避免模块导入时 asyncio.Lock() 在 Python 3.9
+        # 要求事件循环存在(否则抛 RuntimeError: There is no current event loop)
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        """懒加载 Lock,首次调用时创建(此时事件循环已就绪)。"""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def acquire(self, channel_id: int) -> float:
         """检查频道限流，返回需要等待的秒数（0 表示立即通过）。
@@ -23,7 +32,7 @@ class PerChannelRateLimiter:
             >0  — 需要等待这么多秒后再发送
         """
         now = time.monotonic()
-        async with self._lock:
+        async with self._get_lock():
             # 清理过期条目（>60秒）
             self._channels[channel_id] = [
                 t for t in self._channels[channel_id] if now - t < 60.0
@@ -40,7 +49,7 @@ class PerChannelRateLimiter:
     async def cleanup_stale(self):
         """清理超过 5 分钟未访问的频道条目,防止内存泄漏。"""
         now = time.monotonic()
-        async with self._lock:
+        async with self._get_lock():
             stale = []
             for ch_id, timestamps in list(self._channels.items()):
                 # 保留最近 5 分钟内有请求的频道

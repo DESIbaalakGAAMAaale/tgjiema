@@ -345,16 +345,18 @@ class I18nManager:
     #                                  format_datetime / format_file_size) ──
 
     def format_message(self, key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
-        """R41/R42 P1-8: 显式格式化接口 — 翻译 key 并用 {var} 占位符插值。
+        """R41/R42/R45: 显式格式化接口 — 翻译 key 并用 {var} 占位符插值。
 
         与 translate() 的区别:
         - 显式语义: 调用方明确知道这是一个"格式化"操作,而非简单翻译查找
         - 支持任意 {var} 占位符(如 "上传成功,文件码: {code}")
         - kwargs 中的 None 值会被转为空字符串,避免 'None' 字面量泄漏到用户消息
-        - 找不到 key 时回退到默认 locale 再回退到 key 本身(与 translate 一致)
+        - 找不到 key 时回退到默认 locale 再回退到 fallback locale
 
-        R42 P1-8 变更:
-        - 缺失 key 时返回 key 本身(不抛异常,由 translate() 兜底保证)
+        R45 17.1 安全整改:
+        - 缺失 key 时返回安全通用文案(由 translate() → _get_safe_fallback_message 兜底),
+          禁止向用户暴露内部 key;同时累计 i18n_missing_key_total 指标
+          (供 Prometheus exporter 采集为 tgjiema_i18n_missing_key_total)
         - 若 locale 不存在(文件未加载且加载失败),直接 fallback 到 en-US
           (避免回退到 default_locale 导致的语言错位)
 
@@ -364,7 +366,7 @@ class I18nManager:
             **kwargs: 插值参数(如 code="ABC123" → 替换 {code})
 
         Returns:
-            格式化后的字符串(占位符已替换);缺失 key 时返回 key 本身
+            格式化后的字符串(占位符已替换);缺失 key 时返回安全通用文案
         """
         # R42 P1-8: 若 locale 不存在(文件未加载且加载失败),直接 fallback 到 en-US
         target_locale = locale or self.default_locale
@@ -413,18 +415,22 @@ class I18nManager:
         dt: datetime.datetime,
         locale: Optional[str] = None,
         timezone: Optional[str] = None,
+        format: str = "short",
     ) -> str:
-        """R41: 日期时间本地化格式化。
+        """R41/R45 17.1: 日期时间本地化格式化。
 
         根据 locale 选择日期格式,根据 timezone 进行时区转换。
-        - zh-CN: "2024年1月15日 14:30"
-        - en-US: "Jan 15, 2024 02:30 PM"
+        - zh-CN short: "2024年1月15日 14:30"
+        - zh-CN long: "2024年1月15日 星期一 下午 02:30"
+        - en-US short: "Jan 15, 2024 02:30 PM"
+        - en-US long: "Monday, January 15, 2024 02:30 PM"
 
         Args:
             dt: 待格式化的 datetime 对象(naive 视为 UTC)
             locale: 目标 locale(默认 self.default_locale)
             timezone: 目标时区名(如 "Asia/Shanghai" / "UTC"),
                       None 时使用 locale 对应的默认时区
+            format: 格式类型, "short"(紧凑,默认)或 "long"(含星期/完整月份)
 
         Returns:
             本地化日期时间字符串
@@ -451,17 +457,36 @@ class I18nManager:
                 dt = dt.astimezone(tz)
             except Exception as e:
                 logger.debug(f"[i18n] format_datetime 时区转换失败 {timezone}: {e}")
-        # 按 locale 选择格式
+        # 按 locale + format 选择格式
         # 注意: strftime 的 %-m / %-d 仅 Linux 支持,Windows 不支持
         # 改为跨平台方案: 先 strftime 再字符串替换去除前导零
+        use_long = format == "long"
         if target_locale.startswith("zh"):
-            # 中文格式: 2024年1月15日 14:30
-            formatted = dt.strftime("%Y年%m月%d日 %H:%M")
+            # 中文格式
+            if use_long:
+                # 长格式: 2024年1月15日 星期一 下午 02:30
+                formatted = dt.strftime("%Y年%m月%d日 %A %p %I:%M")
+                # 中文本地化星期/上下午
+                weekday_map = {
+                    "Monday": "星期一", "Tuesday": "星期二", "Wednesday": "星期三",
+                    "Thursday": "星期四", "Friday": "星期五", "Saturday": "星期六",
+                    "Sunday": "星期日",
+                }
+                for en_w, zh_w in weekday_map.items():
+                    formatted = formatted.replace(en_w, zh_w)
+                formatted = formatted.replace("AM", "上午").replace("PM", "下午")
+            else:
+                # 短格式: 2024年1月15日 14:30
+                formatted = dt.strftime("%Y年%m月%d日 %H:%M")
             # 去除月/日的前导零(跨平台方案,兼容 Windows 与 Linux)
             formatted = formatted.replace("年0", "年").replace("月0", "月")
             return formatted
         elif target_locale.startswith("en"):
-            # 英文格式: Jan 15, 2024 02:30 PM
+            # 英文格式
+            if use_long:
+                # 长格式: Monday, January 15, 2024 02:30 PM
+                return dt.strftime("%A, %B %d, %Y %I:%M %p").replace(" 0", " ")
+            # 短格式: Jan 15, 2024 02:30 PM
             # 用 %d(带前导零)再去除,保证跨平台一致性
             formatted = dt.strftime("%b %d, %Y %I:%M %p")
             # 去除日的前导零(如 "Jan 05" → "Jan 5")
@@ -501,6 +526,154 @@ class I18nManager:
             return f"{int(size)} {units[unit_idx]}"
         # 中文 locale 用小数点(与英文一致,避免全角句号)
         return f"{size:.1f} {units[unit_idx]}"
+
+    def format_plural(
+        self,
+        key: str,
+        locale: Optional[str] = None,
+        count: int = 0,
+        **kwargs: Any,
+    ) -> str:
+        """R45 17.1: CLDR 风格复数格式化 — 按 key.one / key.other 选择复数形式。
+
+        locale JSON 中 key 对应一个 dict:
+            "common": {"files": {"count": {
+                "one": "{count} 个文件",
+                "other": "{count} 个文件"
+            }}}
+        扁平化后为 "common.files.count.one" / "common.files.count.other"。
+
+        复数规则(简化 CLDR):
+            - zh-*: 始终使用 "other"(中文不区分单复数)
+            - en-*: count == 1 用 "one",其他(含 0)用 "other"
+            - 其他 locale: 默认按英文规则
+
+        若 key.one/key.other 均缺失,回退到 key 本身(若有),
+        再回退到安全通用文案(并累计 missing_key_count, R44 6.2)。
+
+        Args:
+            key: 复数翻译 key 前缀(如 "common.files.count")
+            locale: 目标 locale(默认 self.default_locale)
+            count: 数量(用于选择复数形式 + 插值 {count})
+            **kwargs: 额外插值参数
+
+        Returns:
+            本地化复数消息(已替换 {count} 等占位符)
+        """
+        target_locale = locale or self.default_locale
+        # 确保目标 locale 已加载
+        if target_locale not in self._translations:
+            self.load_locale(target_locale)
+        # 选择复数形式
+        if target_locale.startswith("zh"):
+            form = "other"
+        else:
+            form = "one" if count == 1 else "other"
+        sub_key = f"{key}.{form}"
+        # 合并插值参数
+        interp = {"count": count, **kwargs}
+        # 先尝试指定 locale 的子 key
+        candidates = [target_locale, self.default_locale, _FALLBACK_LOCALE]
+        seen: set[str] = set()
+        text = None
+        for loc in candidates:
+            if loc in seen:
+                continue
+            seen.add(loc)
+            if loc not in self._translations:
+                self.load_locale(loc)
+            translations = self._translations.get(loc)
+            if translations and sub_key in translations:
+                text = translations[sub_key]
+                break
+        if text is None:
+            # 回退:尝试 key 本身(非复数形式)
+            for loc in candidates:
+                if loc not in self._translations:
+                    self.load_locale(loc)
+                translations = self._translations.get(loc)
+                if translations and key in translations and isinstance(
+                    translations[key], str
+                ):
+                    text = translations[key]
+                    break
+        if text is None:
+            # 最终回退:安全通用文案 + 累计 missing key
+            logger.debug(
+                f"[i18n] format_plural key 未找到: {key}(locale={target_locale})"
+            )
+            text = self._get_safe_fallback_message(key, target_locale)
+            self._missing_key_count += 1
+        # 插值
+        if interp and "{" in text and "}" in text:
+            try:
+                text = text.format(**interp)
+            except (KeyError, IndexError, ValueError) as e:
+                logger.debug(f"[i18n] format_plural 插值失败 key={key}: {e}")
+        return text
+
+    def parse_accept_language(self, header: Optional[str]) -> str:
+        """R45 17.1: 解析 HTTP Accept-Language header,返回最佳匹配 locale。
+
+        解析 RFC 7231 格式:
+            "zh-CN,zh;q=0.9,en;q=0.8" → 优先 zh-CN
+            "en-US,en;q=0.9" → en-US
+            "" 或 None → 默认 locale(zh-CN)
+
+        匹配规则:
+            1. 按 q 值降序排序
+            2. 优先精确匹配(如 zh-CN == zh-CN)
+            3. 其次前缀匹配(如 zh 匹配 zh-CN)
+            4. 无匹配返回默认 locale
+
+        Args:
+            header: Accept-Language header 值(如 "zh-CN,zh;q=0.9,en;q=0.8")
+
+        Returns:
+            匹配的 locale 标识符(如 "zh-CN" / "en-US");无匹配返回默认 locale
+        """
+        if not header:
+            return _DEFAULT_LOCALE
+        available = self.get_available_locales()
+        if not available:
+            return _DEFAULT_LOCALE
+        # 解析 <lang>;q=<value> 列表
+        parsed: list[tuple[str, float]] = []
+        for part in header.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            # 分离语言和 q 参数
+            segments = part.split(";")
+            lang = segments[0].strip()
+            if not lang:
+                continue
+            q = 1.0
+            for seg in segments[1:]:
+                seg = seg.strip()
+                if seg.startswith("q="):
+                    try:
+                        q = float(seg[2:])
+                    except ValueError:
+                        q = 0.0
+            # q=0 表示不接收
+            if q > 0:
+                parsed.append((lang, q))
+        if not parsed:
+            return _DEFAULT_LOCALE
+        # 按 q 降序排序(稳定排序保持原顺序)
+        parsed.sort(key=lambda x: -x[1])
+        # 精确匹配
+        for lang, _ in parsed:
+            if lang in available:
+                return lang
+        # 前缀匹配(如 "zh" 匹配 "zh-CN","en" 匹配 "en-US")
+        for lang, _ in parsed:
+            base = lang.split("-")[0].lower()
+            for avail in available:
+                if avail.lower().startswith(base):
+                    return avail
+        return _DEFAULT_LOCALE
 
     def get_user_locale(self, user_id: int) -> str:
         """R41: 从 users_local 表读取用户 locale(默认 zh-CN)。
@@ -761,3 +934,18 @@ def get_principal_locale(principal_id: int) -> str:
         return locale
     # 默认 zh-CN(principal 通常无 users_local 记录)
     return _DEFAULT_LOCALE
+
+
+def parse_accept_language(header: Optional[str]) -> str:
+    """R45 17.1: 模块级便捷函数 — 解析 Accept-Language header。
+
+    等价于 I18nManager.parse_accept_language()。
+
+    Args:
+        header: Accept-Language header 值(如 "zh-CN,zh;q=0.9,en;q=0.8")
+
+    Returns:
+        匹配的 locale 标识符(如 "zh-CN" / "en-US");无匹配返回默认 locale
+    """
+    manager = get_i18n_manager()
+    return manager.parse_accept_language(header)

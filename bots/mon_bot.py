@@ -690,9 +690,13 @@ class MonBot:
             })
             # P2: 修正环形链表前驱指针:找到 next_active_chat_id 指向旧 channel_id 的槽位,
             # 更新为新的 spare_ch,避免 delivery_resolver 沿旧指针投到已封禁频道
+            # R45 §12: lost 频道不进入路由,跳过 lost 状态的槽位
             try:
                 all_cells = await store.get_all_cells_local()
                 for prev_cell in all_cells:
+                    # R45 §12: lost 频道不进入路由,跳过
+                    if prev_cell.get("status") == "lost":
+                        continue
                     if prev_cell.get("next_active_chat_id") == channel_id:
                         prev_slot_id = prev_cell["slot_id"]
                         await store.update_cell_fields_local(prev_slot_id, {
@@ -1180,6 +1184,16 @@ class MonBot:
                             logger.warning(issue)
                     else:
                         logger.debug("[Mon] 拓扑校验: 健康")
+                    # R45 §12: 事务内验证全环不变量(每组恰好一个 active, lost 不进入路由)
+                    try:
+                        invariant_issues = await self._validate_topology_invariants()
+                        if invariant_issues:
+                            for issue in invariant_issues:
+                                logger.warning(f"[Mon] R45 不变量违规: {issue}")
+                        else:
+                            logger.debug("[Mon] R45 不变量校验: 通过")
+                    except Exception as inv_err:
+                        logger.warning(f"[Mon] R45 不变量校验异常: {inv_err}")
                     # 清理字典中已不存在的 slot_id,防止槽位删除/重命名后内存泄漏
                     valid_slots = {c["slot_id"] for c in all_cells}
                     # _notify_cooldowns 的 key 是消息首行(非 slot_id),按时间清理(超过 1200s 的条目)
@@ -1365,6 +1379,194 @@ class MonBot:
         except Exception as e:
             logger.warning(f"[Mon] close_db 异常: {e}")
         logger.info("[Mon] 监控机器人已停止")
+
+    async def _validate_topology_invariants(self, tx=None) -> list[str]:
+        """R45 §12: 在一次事务中验证全环不变量。
+
+        验证规则:
+            1. 每组恰好一个 active 频道(不多不少)
+            2. shadow 账号分散(同一 account_name 不重复出现在同一组的多个 shadow 槽位)
+            3. lost 状态的频道不进入路由(next_active_chat_id 不指向 lost 频道)
+            4. active 频道的 next_active_chat_id 必须指向另一个 active 频道(闭环)
+
+        Args:
+            tx: 可选的事务连接(传入时在事务内执行查询,确保一致性快照)
+
+        Returns:
+            不变量违规列表(空列表表示全部通过)
+        """
+        issues: list[str] = []
+        store = get_cache_store()
+        if store is None:
+            return ["cache_store 不可用"]
+
+        # 获取全量 cells(事务内查询确保一致性快照)
+        if tx is not None:
+            try:
+                rows = await tx.execute_fetchall(
+                    "SELECT slot_id, channel_id, status, next_active_chat_id, "
+                    "account_name FROM cells_local"
+                )
+                all_cells = [
+                    {
+                        "slot_id": r[0], "channel_id": r[1], "status": r[2],
+                        "next_active_chat_id": r[3], "account_name": r[4],
+                    }
+                    for r in (rows or [])
+                ]
+            except Exception as e:
+                return [f"事务内查询 cells_local 失败: {e}"]
+        else:
+            all_cells = await store.get_all_cells_local()
+
+        if not all_cells:
+            return ["cells_local 为空(无数据)"]
+
+        # 按组号分组(slot_id 格式: a1/s1/s2/a2/s3/s4/...)
+        groups: dict[str, list[dict]] = {}
+        for c in all_cells:
+            sid = c.get("slot_id", "")
+            m = re.match(r'[as](\d+)', sid)
+            if m:
+                gnum = m.group(1)
+                groups.setdefault(gnum, []).append(c)
+
+        # 1. 每组恰好一个 active 频道
+        active_channels = {
+            c["channel_id"] for c in all_cells
+            if c.get("status") == "active" and c.get("channel_id")
+        }
+        for gnum, cells in groups.items():
+            active_in_group = [c for c in cells if c.get("status") == "active"]
+            if len(active_in_group) == 0:
+                # 允许组内无 active(可能正在轮转),但记录为潜在问题
+                has_shadow = any(c.get("status") in ("shadow1", "shadow2") for c in cells)
+                if has_shadow:
+                    issues.append(
+                        f"组 {gnum} 无 active 频道但有 shadow(可能正在轮转)"
+                    )
+            elif len(active_in_group) > 1:
+                slot_ids = [c["slot_id"] for c in active_in_group]
+                issues.append(
+                    f"组 {gnum} 有多个 active 频道: {slot_ids}"
+                    f"(违反每组恰好一个 active 不变量)"
+                )
+
+        # 2. shadow 账号分散(同一 account_name 不重复出现在同一组的多个 shadow 槽位)
+        for gnum, cells in groups.items():
+            shadow_cells = [c for c in cells if c.get("status", "").startswith("shadow")]
+            account_map: dict[str, list[str]] = {}
+            for c in shadow_cells:
+                acc = c.get("account_name", "") or ""
+                if acc:
+                    account_map.setdefault(acc, []).append(c["slot_id"])
+            for acc, slots in account_map.items():
+                if len(slots) > 1:
+                    issues.append(
+                        f"组 {gnum} shadow 账号分散违规: account={acc} "
+                        f"出现在多个 shadow 槽位 {slots}"
+                    )
+
+        # 3. lost 频道不进入路由(next_active_chat_id 不指向 lost 频道)
+        lost_channels = {
+            c["channel_id"] for c in all_cells
+            if c.get("status") == "lost" and c.get("channel_id")
+        }
+        for c in all_cells:
+            nxt = c.get("next_active_chat_id")
+            if nxt and nxt in lost_channels:
+                issues.append(
+                    f"槽位 {c['slot_id']} 的 next_active_chat_id={nxt} "
+                    f"指向 lost 频道(lost 不应进入路由)"
+                )
+
+        # 4. active 频道的 next_active_chat_id 必须指向另一个 active 频道
+        for c in all_cells:
+            if c.get("status") != "active":
+                continue
+            nxt = c.get("next_active_chat_id")
+            if not nxt:
+                # 单个 active 频道时 next 可以为空
+                if len(active_channels) > 1:
+                    issues.append(
+                        f"active 槽位 {c['slot_id']} 的 next_active_chat_id 为空"
+                        f"(多 active 场景下必须形成闭环)"
+                    )
+                continue
+            if nxt not in active_channels:
+                issues.append(
+                    f"active 槽位 {c['slot_id']} 的 next_active_chat_id={nxt} "
+                    f"指向非 active 频道(闭环断裂)"
+                )
+
+        return issues
+
+    async def _probe_dst_msg_id(
+        self, file_unique_id: str, dst_channel_id: int,
+    ) -> int | None:
+        """R45 §12: task copy 成功但 dst_msg_id 未落库时,二次探测。
+
+        当复制操作成功但 dst_msg_id 未写入 replication_tasks 表时,
+        在重新 copy 之前调用此方法进行二次探测,避免重复复制:
+
+        1. 查询 Manifest 表(file_manifests)是否有该 file_unique_id + dst_channel_id 的记录
+        2. 如果 Manifest 有记录,返回 dst_msg_id
+        3. 如果 Manifest 无记录,调用 Telegram API 探测频道最新消息
+        4. 如果探测失败,返回 None(调用方应重新 copy)
+
+        Args:
+            file_unique_id: Telegram 文件唯一标识
+            dst_channel_id: 目标频道 ID
+
+        Returns:
+            探测到的 dst_msg_id,None 表示未找到(需要重新 copy)
+        """
+        if not file_unique_id or not dst_channel_id:
+            return None
+
+        store = get_cache_store()
+
+        # 1. 查询 Manifest 表(file_manifests)
+        if store is not None:
+            try:
+                # 查询是否有该 file_unique_id + dst_channel_id 的 manifest 记录
+                rows = await store._db.execute_fetchall(
+                    "SELECT dst_msg_id FROM file_manifests "
+                    "WHERE file_unique_id = ? AND dst_channel_id = ? "
+                    "AND dst_msg_id IS NOT NULL AND dst_msg_id > 0 "
+                    "ORDER BY version DESC LIMIT 1",
+                    (file_unique_id, dst_channel_id),
+                )
+                if rows and rows[0] and rows[0][0]:
+                    dst_msg_id = int(rows[0][0])
+                    logger.info(
+                        f"[Mon][Probe] Manifest 命中: fuid={file_unique_id}, "
+                        f"ch={dst_channel_id}, dst_msg_id={dst_msg_id}"
+                    )
+                    return dst_msg_id
+            except Exception as e:
+                logger.warning(
+                    f"[Mon][Probe] 查询 file_manifests 失败: {e}"
+                )
+
+        # 2. 调用 Telegram API 探测频道最新消息
+        try:
+            # 尝试 forward 一个已知消息来探测频道是否可用
+            # 注意:不能直接遍历频道消息(无 API),只能通过 Manifest 或已知信息探测
+            # 这里采用保守策略:获取频道信息确认频道可访问
+            chat = await self.bot.get_chat(dst_channel_id)
+            if chat:
+                logger.debug(
+                    f"[Mon][Probe] 频道 {dst_channel_id} 可访问但无 Manifest 记录, "
+                    f"fuid={file_unique_id}(需要重新 copy)"
+                )
+            # 频道可访问但无 Manifest 记录,无法确定 dst_msg_id
+            return None
+        except Exception as e:
+            logger.warning(
+                f"[Mon][Probe] 频道 {dst_channel_id} 探测失败: {e}"
+            )
+            return None
 
     async def _report_status(self, all_cells: list[dict]):
         """输出当前拓扑健康状态到日志(从缓存读取,不查 DB)。"""

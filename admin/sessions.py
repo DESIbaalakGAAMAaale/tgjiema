@@ -133,7 +133,9 @@ class SessionManager:
         """
         self.ttl_seconds = max(60, int(ttl_seconds))
 
-    async def create_session(self, principal, mfa_verified: bool = True) -> str:
+    async def create_session(
+        self, principal, mfa_verified: bool = True, csrf_token: str = ""
+    ) -> str:
         """为登录的管理员创建 session。
 
         R41 P1-2: 新增 mfa_verified 参数,记录 MFA 验证状态。
@@ -141,9 +143,14 @@ class SessionManager:
         - MFA 已启用并完成验证:mfa_verified=True
         - MFA 已启用但未完成验证:不应调用此函数(应先走 /login/mfa)
 
+        R45 §7.2: 新增 csrf_token 参数,将 CSRF token 绑定到 session,
+        后续 POST/PUT/DELETE 请求通过 validate_csrf_token() 校验
+        token 与 session 一致(防止 CSRF 攻击者使用窃取的 token)。
+
         Args:
             principal: AdminPrincipal 对象(需有 id/username/roles 属性)
             mfa_verified: MFA 是否已验证(默认 True,兼容旧调用方)
+            csrf_token: 绑定到 session 的 CSRF token(可选,空字符串表示不绑定)
 
         Returns:
             session_id(43 字符 URL-safe base64);失败返回空字符串
@@ -168,6 +175,12 @@ class SessionManager:
             "expires_at_ts": expires_at_ts,
             # R41 P1-2: MFA 验证状态(MFA middleware 校验此字段)
             "mfa_verified": bool(mfa_verified),
+            # R45 §7.2: CSRF token 绑定(空字符串表示未绑定,校验时拒绝)
+            "csrf_token": str(csrf_token or ""),
+            # R45 §7.2: 撤销标记(destroy_session 主动设置,validate 校验时拒绝)
+            "revoked": False,
+            # R45 §7.2: 撤销时间(用于审计)
+            "revoked_at": None,
         }
         ok = await _save_session_data(session_id, data)
         if not ok:
@@ -186,22 +199,39 @@ class SessionManager:
         确保 session/RBAC/CommandBus 使用同一身份表读取的 ID 和角色,
         而非各自从 session 数据中生成不同的 ID。
 
+        R45 §7.2: 新增 revoked 字段校验 — session 被主动撤销(destroy_session
+        或 rotate_session 标记)后,即使 kv_store 中记录仍存在也返回 None。
+        覆盖以下失效场景(均返回 None → 调用方返回 401):
+          - cookie 不存在(session_id 为空)
+          - 伪造 cookie(kv_store 中无对应记录)
+          - 过期 session(expires_at_ts 已过)
+          - 撤销 session(revoked=True,如 logout / rotate / 安全事件)
+
         流程:
-          1. 从 kv_store 读取 session 数据并校验过期时间
-          2. 若 ADMIN_PRINCIPAL_ID 配置存在且 session.principal_id 匹配,
+          1. 从 kv_store 读取 session 数据(不存在 → None,对应"伪造 cookie")
+          2. 校验 revoked 标记(撤销 → None)
+          3. 校验过期时间(过期 → None 并清理)
+          4. 若 ADMIN_PRINCIPAL_ID 配置存在且 session.principal_id 匹配,
              从 admin_principals 表读取权威身份(含最新角色)
-          3. 若配置不存在或持久化记录不存在,fallback 到 session 中的 principal_id/username/roles
+          5. 若配置不存在或持久化记录不存在,fallback 到 session 中的 principal_id/username/roles
 
         Args:
             session_id: 待验证的 session ID
 
         Returns:
-            AdminPrincipal 对象(有效);None(无效或过期)
+            AdminPrincipal 对象(有效);None(无效或过期或已撤销)
         """
         if not session_id:
             return None
         data = await _load_session_data(session_id)
         if data is None:
+            # kv_store 中无记录:伪造 cookie 或已被清理
+            return None
+        # R45 §7.2: 校验 revoked 标记(destroy_session / rotate_session 主动撤销)
+        if data.get("revoked", False):
+            logger.debug(
+                f"[admin.sessions] session 已被撤销,拒绝: {session_id[:8]}..."
+            )
             return None
         # 检查过期时间
         expires_at_ts = data.get("expires_at_ts", 0)
@@ -294,13 +324,138 @@ class SessionManager:
     async def destroy_session(self, session_id: str) -> None:
         """销毁 session(注销)。
 
+        R45 §7.2: 改为标记 revoked=True 而非立即物理删除,
+        便于审计追踪 logout 事件 + 防止"已删除但 validate 仍命中"的竞态。
+        validate_session 校验到 revoked=True 时返回 None(等效于已删除)。
+
+        后续 cleanup_expired_sessions 会物理清理已过期的 revoked 记录。
+
         Args:
             session_id: 待销毁的 session ID
         """
         if not session_id:
             return
+        # R45 §7.2: 标记 revoked 而非立即删除,保留审计痕迹
+        data = await _load_session_data(session_id)
+        if data is not None:
+            data["revoked"] = True
+            data["revoked_at"] = _now_iso()
+            await _save_session_data(session_id, data)
+        # 兜底:也尝试物理删除(双保险,即使标记失败也已删除)
+        # 注:保留上面 revoked 标记是为了在并发场景下,标记写入成功但删除尚未执行时,
+        # validate_session 仍能通过 revoked 字段拒绝。
         await _delete_session_data(session_id)
-        logger.info(f"[admin.sessions] 销毁 session: {session_id[:8]}...")
+        logger.info(f"[admin.sessions] 销毁 session(标记 revoked + 物理删除): {session_id[:8]}...")
+
+    async def rotate_session(
+        self, old_session_id: str, principal=None, mfa_verified: bool = True,
+        csrf_token: str = "",
+    ) -> str:
+        """R45 §7.2: 轮换 session_id(登录后或敏感操作后调用)。
+
+        安全场景:
+          - 登录成功后生成新 session_id,撤销旧 session(防止 session fixation)
+          - 提权/降权后轮换(防止旧权限缓存)
+          - 安全事件后强制轮换(疑似泄露)
+
+        流程:
+          1. 读取旧 session 数据(获取 principal_id/username/roles)
+          2. 撤销旧 session(revoked=True)
+          3. 用相同 principal 创建新 session(新 session_id)
+          4. 返回新 session_id(失败返回空字符串)
+
+        Args:
+            old_session_id: 旧 session ID(将被撤销)
+            principal: 新 session 使用的 principal;None 时从旧 session 读取
+            mfa_verified: 新 session 的 MFA 验证状态(默认 True)
+            csrf_token: 绑定到新 session 的 CSRF token
+
+        Returns:
+            新 session_id;失败返回空字符串
+        """
+        if not old_session_id:
+            return ""
+        # 1. 读取旧 session 数据
+        old_data = await _load_session_data(old_session_id)
+        if old_data is None:
+            logger.warning(
+                f"[admin.sessions] rotate_session 旧 session 不存在: {old_session_id[:8]}..."
+            )
+            return ""
+        # 2. 若未提供 principal,从旧 session 构造
+        if principal is None:
+            from admin import AdminPrincipal
+            try:
+                principal = AdminPrincipal(
+                    id=int(old_data.get("principal_id", 0) or 0),
+                    username=str(old_data.get("username", "") or ""),
+                    roles=list(old_data.get("roles", []) or []),
+                )
+            except (TypeError, ValueError) as e:
+                logger.warning(f"[admin.sessions] rotate_session 旧 session 数据损坏: {e}")
+                return ""
+        # 3. 撤销旧 session(标记 revoked,保留审计)
+        old_data["revoked"] = True
+        old_data["revoked_at"] = _now_iso()
+        old_data["rotate_to"] = "(pending)"  # 占位,新 session 创建后回填
+        await _save_session_data(old_session_id, old_data)
+        # 4. 创建新 session
+        new_session_id = await self.create_session(
+            principal, mfa_verified=mfa_verified, csrf_token=csrf_token,
+        )
+        if not new_session_id:
+            logger.error(
+                f"[admin.sessions] rotate_session 新 session 创建失败 "
+                f"old={old_session_id[:8]}..."
+            )
+            return ""
+        # 5. 回填 rotate_to 指向新 session(审计链)
+        old_data["rotate_to"] = new_session_id
+        await _save_session_data(old_session_id, old_data)
+        logger.info(
+            f"[admin.sessions] rotate_session old={old_session_id[:8]}... "
+            f"new={new_session_id[:8]}... user={principal.username}"
+        )
+        return new_session_id
+
+    async def validate_csrf_token(self, session_id: str, token: str) -> bool:
+        """R45 §7.2: 校验 CSRF token 是否与 session 绑定的 token 一致。
+
+        防御场景:
+          - 攻击者窃取 cookie 后,无对应 CSRF token 仍无法发起 POST 请求
+          - 双重提交 cookie 校验:cookie 中的 session_id + 表单中的 csrf_token
+            必须与 session 中绑定的 csrf_token 三方一致
+
+        fail-closed: session 不存在/已撤销/已过期/csrf_token 未绑定 → False
+        (fail-closed 防止 session 异常时绕过 CSRF 校验)
+
+        Args:
+            session_id: 当前请求的 session ID
+            token: 表单提交的 CSRF token
+
+        Returns:
+            True 表示 token 与 session 绑定的 token 一致;
+            False 表示不一致或 session 无效(fail-closed)
+        """
+        if not session_id or not token:
+            return False
+        data = await _load_session_data(session_id)
+        if data is None:
+            return False
+        # 校验 revoked 标记
+        if data.get("revoked", False):
+            return False
+        # 校验过期时间
+        expires_at_ts = data.get("expires_at_ts", 0)
+        if not expires_at_ts or int(time.time()) >= int(expires_at_ts):
+            return False
+        # 校验 csrf_token 绑定
+        bound_token = str(data.get("csrf_token", "") or "")
+        if not bound_token:
+            # session 未绑定 CSRF token(fail-closed 拒绝)
+            return False
+        # 常量时间比较(防止时序攻击)
+        return secrets.compare_digest(bound_token, token)
 
     async def cleanup_expired_sessions(self) -> int:
         """清理所有过期 session。

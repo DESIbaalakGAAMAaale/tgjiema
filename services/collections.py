@@ -1,7 +1,14 @@
-"""R40 §9.1.3: 文件集合 — 合集码 + 批量下载 + 版本管理。
+"""R40 §9.1.3 + R45 第 16 节: 文件集合 — 合集码 + 批量下载 + 版本管理。
 
 为用户提供文件合集功能,可批量管理和下载多个文件。
 支持集合更新版本号、部分失效提示等。
+
+R45 第 16 节 Collections 整改:
+- 修改集合必须使用乐观锁(CAS):UPDATE ... WHERE version = ? AND id = ?
+  冲突时返回 conflict 错误,由调用方决定重试或放弃
+- 批量取件前逐项校验权限与副本状态:batch_retrieve 返回部分结果,
+  不因个别项失败导致整体失败(部分失效处理)
+- list_collections 支持 cursor 分页(基于 id 游标,避免 OFFSET 性能问题)
 
 设计要点:
 - create_collection 调用 code_generator.build_collection_code() 生成唯一集合码
@@ -285,21 +292,36 @@ async def get_collection(code: str) -> dict | None:
         return None
 
 
-async def list_collections(owner_id: int, page: int = 1, page_size: int = 10) -> dict:
-    """分页列出用户的集合。
+async def list_collections(
+    owner_id: int,
+    page: int = 1,
+    page_size: int = 10,
+    cursor: int = 0,
+) -> dict:
+    """分页列出用户的集合(支持 R45 cursor 分页,向后兼容 page/page_size)。
+
+    R45 第 16 节:cursor 分页基于 id 游标(避免 OFFSET 性能问题)。
+    - cursor=0(默认):返回第一页,按 created_at DESC + id DESC 排序
+    - cursor>0:返回 id < cursor 的下一页(向前翻页)
+    - 当提供 cursor 时,page 参数被忽略
 
     Args:
         owner_id: 所有者用户 ID
-        page: 页码(从 1 开始)
+        page: 页码(从 1 开始,cursor 模式下被忽略)
         page_size: 每页条数(1-100)
+        cursor: 上一页最后一条 id(0=首页,>0=取该 id 之前的记录)
 
     Returns:
-        {items, total, page, page_size, total_pages}
+        {items, total, page, page_size, total_pages,
+         next_cursor, has_more}
+        - next_cursor: 下一页起始 id(用于继续翻页);无更多数据时为 0
+        - has_more: 是否还有更多数据
     """
     store = get_cache_store()
     default = {
         "items": [], "total": 0,
         "page": page, "page_size": page_size, "total_pages": 0,
+        "next_cursor": 0, "has_more": False,
     }
     if not store._db:
         return default
@@ -314,15 +336,34 @@ async def list_collections(owner_id: int, page: int = 1, page_size: int = 10) ->
         c_row = await c_cursor.fetchone()
         total = int(c_row[0]) if c_row else 0
         total_pages = (total + page_size - 1) // page_size if page_size > 0 else 0
-        offset = (page - 1) * page_size
-        cursor = await store._db.execute(
-            """SELECT id, name, code, owner_id, description, version,
-                      item_count, status, created_at, updated_at
-               FROM collections WHERE owner_id = ?
-               ORDER BY created_at DESC LIMIT ? OFFSET ?""",
-            (owner_id, page_size, offset),
-        )
-        rows = await cursor.fetchall()
+
+        # R45: cursor 分页模式 — 多取 1 条用于判断 has_more
+        # 注:created_at DESC 排序下,id < cursor 表示"更早创建"的记录
+        if cursor and cursor > 0:
+            fetch_size = page_size + 1
+            q_cursor = await store._db.execute(
+                """SELECT id, name, code, owner_id, description, version,
+                          item_count, status, created_at, updated_at
+                   FROM collections
+                   WHERE owner_id = ? AND id < ?
+                   ORDER BY id DESC LIMIT ?""",
+                (owner_id, cursor, fetch_size),
+            )
+        else:
+            # 首页或 page 模式
+            fetch_size = page_size + 1 if cursor == 0 and page == 1 else page_size
+            offset = (page - 1) * page_size if cursor == 0 else 0
+            q_cursor = await store._db.execute(
+                """SELECT id, name, code, owner_id, description, version,
+                          item_count, status, created_at, updated_at
+                   FROM collections WHERE owner_id = ?
+                   ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (owner_id, fetch_size, offset),
+            )
+        rows = await q_cursor.fetchall()
+        has_more = len(rows) > page_size
+        # 截断到 page_size 条
+        rows_page = rows[:page_size]
         items = [
             {
                 "id": r[0], "name": r[1], "code": r[2], "owner_id": r[3],
@@ -330,14 +371,18 @@ async def list_collections(owner_id: int, page: int = 1, page_size: int = 10) ->
                 "item_count": int(r[6] or 0), "status": r[7],
                 "created_at": r[8], "updated_at": r[9],
             }
-            for r in rows
+            for r in rows_page
         ]
+        # 计算 next_cursor:本页最后一条的 id
+        next_cursor = items[-1]["id"] if items and has_more else 0
         return {
             "items": items,
             "total": total,
             "page": page,
             "page_size": page_size,
             "total_pages": total_pages,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
         }
     except Exception as e:
         logger.warning(f"[collections] list_collections 失败: {e}")
@@ -647,4 +692,368 @@ async def resolve_collection(user_id: int, collection_id: int) -> dict:
             "collection_code": "", "collection_name": "",
             "owner_id": 0, "items": [], "denied_items": [],
             "error": f"解析失败: {e}",
+        }
+
+
+# ─── R45 第 16 节: 集合乐观锁(CAS)+ 批量取件 ───────────────────
+
+
+async def update_collection(
+    collection_id: int,
+    name: str | None = None,
+    description: str | None = None,
+    expected_version: int | None = None,
+) -> dict:
+    """R45 第 16 节: 修改集合元数据(乐观锁 CAS)。
+
+    使用 ``WHERE version = ? AND id = ?`` 进行 CAS 更新:
+        - expected_version 匹配成功 → 更新 + 版本号 +1,返回 success
+        - expected_version 不匹配(被其他写入抢占)→ 不更新,返回 conflict
+        - expected_version 为 None → 跳过乐观锁,直接更新(向后兼容)
+
+    并发安全:
+        - 单个 UPDATE 语句原子完成 CAS 检查 + 版本递增
+        - 失败时不写 dirty_outbox(避免无变更触发同步)
+        - 调用方收到 conflict 时应重新读取最新版本后重试(由调用方决策)
+
+    Args:
+        collection_id: 集合 ID
+        name: 新名称(None=不修改)
+        description: 新描述(None=不修改)
+        expected_version: 调用方读取时的版本号(乐观锁校验)
+            None=跳过乐观锁(向后兼容旧调用)
+            >0=必须等于当前 DB 中的 version 才更新
+
+    Returns:
+        {success: bool, conflict: bool, new_version: int,
+         current_version: int, message: str}
+        - success=True & conflict=False:更新成功
+        - success=False & conflict=True:版本冲突,调用方应重试
+        - success=False & conflict=False:其他失败(如集合不存在)
+    """
+    store = get_cache_store()
+    if not store._db:
+        return {
+            "success": False, "conflict": False,
+            "new_version": 0, "current_version": 0,
+            "message": "数据库未初始化",
+        }
+    now = _dt.datetime.now().isoformat()
+
+    # 构造 SET 子句(只更新非 None 字段)
+    set_clauses: list[str] = []
+    params: list[Any] = []
+    if name is not None:
+        set_clauses.append("name = ?")
+        params.append(name)
+    if description is not None:
+        set_clauses.append("description = ?")
+        params.append(description)
+    if not set_clauses:
+        # 无字段需更新 — 直接读取当前版本
+        try:
+            cur = await store._db.execute(
+                "SELECT version FROM collections WHERE id = ?",
+                (collection_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return {
+                    "success": False, "conflict": False,
+                    "new_version": 0, "current_version": 0,
+                    "message": "集合不存在",
+                }
+            return {
+                "success": True, "conflict": False,
+                "new_version": int(row[0] or 1),
+                "current_version": int(row[0] or 1),
+                "message": "无字段需更新",
+            }
+        except Exception as e:
+            return {
+                "success": False, "conflict": False,
+                "new_version": 0, "current_version": 0,
+                "message": f"查询版本失败: {e}",
+            }
+
+    # 加入 version 递增 + updated_at
+    set_clauses.append("version = version + 1")
+    set_clauses.append("updated_at = ?")
+    params.append(now)
+
+    # WHERE 条件:必含 id = ?;若提供 expected_version 则加 version = ?
+    where_clauses = ["id = ?"]
+    params.append(collection_id)
+    if expected_version is not None and int(expected_version) > 0:
+        where_clauses.append("version = ?")
+        params.append(int(expected_version))
+
+    set_sql = ", ".join(set_clauses)
+    where_sql = " AND ".join(where_clauses)
+    sql = f"UPDATE collections SET {set_sql} WHERE {where_sql}"
+
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(sql, tuple(params))
+            affected = cursor.rowcount if cursor else 0
+            if affected == 0:
+                # 区分"集合不存在"与"版本冲突"
+                check_cur = await tx.execute(
+                    "SELECT version FROM collections WHERE id = ?",
+                    (collection_id,),
+                )
+                check_row = await check_cur.fetchone()
+                if not check_row:
+                    return {
+                        "success": False, "conflict": False,
+                        "new_version": 0, "current_version": 0,
+                        "message": "集合不存在",
+                    }
+                # 集合存在但 affected=0 → 版本冲突
+                current_v = int(check_row[0] or 1)
+                logger.info(
+                    f"[collections] update_collection CAS 冲突 "
+                    f"coll_id={collection_id} expected_v={expected_version} "
+                    f"current_v={current_v}"
+                )
+                return {
+                    "success": False, "conflict": True,
+                    "new_version": 0, "current_version": current_v,
+                    "message": (
+                        f"版本冲突:expected={expected_version},"
+                        f"current={current_v},请重试"
+                    ),
+                }
+            # 更新成功 → 写 dirty_outbox + 读取新版本
+            await store.add_dirty_outbox(
+                "collections", str(collection_id), connection=tx,
+            )
+            v_cur = await tx.execute(
+                "SELECT version FROM collections WHERE id = ?",
+                (collection_id,),
+            )
+            v_row = await v_cur.fetchone()
+            new_v = int(v_row[0]) if v_row else 0
+        logger.info(
+            f"[collections] update_collection CAS 成功 "
+            f"coll_id={collection_id} v{expected_version}→v{new_v}"
+        )
+        return {
+            "success": True, "conflict": False,
+            "new_version": new_v, "current_version": new_v,
+            "message": "更新成功",
+        }
+    except Exception as e:
+        logger.warning(f"[collections] update_collection 失败: {e}")
+        return {
+            "success": False, "conflict": False,
+            "new_version": 0, "current_version": 0,
+            "message": f"更新失败: {e}",
+        }
+
+
+async def batch_retrieve(collection_id: int, user_id: int) -> dict:
+    """R45 第 16 节: 批量取件 — 逐项校验权限与副本状态,返回部分结果。
+
+    与 ``resolve_collection`` 的差异:
+        - ``resolve_collection`` 仅返回校验结果(是否允许),不区分"项可取"vs"项存在"
+        - ``batch_retrieve`` 显式区分每项的 retrieval_status:
+            * ``retrievable`` — 权限通过 + 文件 active + 副本就绪
+            * ``denied`` — 权限不通过(owner 不匹配 + uploader 不匹配)
+            * ``expired`` — 文件已过期(权限可能通过,但无法取件)
+            * ``deleted`` — 文件已删除(权限可能通过,但无法取件)
+            * ``missing`` — 文件记录不存在(数据异常)
+        - 不因个别项失败导致整体失败,调用方按 retrieval_status 决策
+
+    权限规则(同 resolve_collection):
+        - owner_id == user_id → 所有项 allowed
+        - 其他用户 → 校验 file_records_local.uploader_id == user_id
+
+    Args:
+        collection_id: 集合 ID
+        user_id: 当前访问用户 ID
+
+    Returns:
+        {
+            "collection_id": int,
+            "collection_code": str,
+            "collection_name": str,
+            "owner_id": int,
+            "is_owner": bool,             # user_id 是否为集合 owner
+            "items": [                    # 所有项的详细状态
+                {
+                    "file_code": str,
+                    "added_at": str,
+                    "retrieval_status": str,  # retrievable/denied/expired/deleted/missing
+                    "uploader_id": int,
+                    "has_access": bool,       # 权限是否通过
+                    "reason": str,             # 失败原因(可读)
+                },
+                ...
+            ],
+            "retrievable_count": int,    # 可取件数量
+            "denied_count": int,
+            "expired_count": int,
+            "deleted_count": int,
+            "missing_count": int,
+            "total_count": int,
+            "all_retrievable": bool,     # 所有项均可取件
+            "error": str,                 # 集合不存在/数据库错误
+        }
+    """
+    store = get_cache_store()
+    if not store._db:
+        return {
+            "collection_id": collection_id,
+            "collection_code": "", "collection_name": "",
+            "owner_id": 0, "is_owner": False,
+            "items": [], "retrievable_count": 0,
+            "denied_count": 0, "expired_count": 0,
+            "deleted_count": 0, "missing_count": 0,
+            "total_count": 0, "all_retrievable": False,
+            "error": "数据库未初始化",
+        }
+    try:
+        # 查询集合信息
+        coll_cur = await store._db.execute(
+            """SELECT id, name, code, owner_id, status, item_count
+               FROM collections WHERE id = ?""",
+            (collection_id,),
+        )
+        coll_row = await coll_cur.fetchone()
+        if not coll_row:
+            return {
+                "collection_id": collection_id,
+                "collection_code": "", "collection_name": "",
+                "owner_id": 0, "is_owner": False,
+                "items": [], "retrievable_count": 0,
+                "denied_count": 0, "expired_count": 0,
+                "deleted_count": 0, "missing_count": 0,
+                "total_count": 0, "all_retrievable": False,
+                "error": "集合不存在",
+            }
+        coll_id = int(coll_row[0])
+        coll_name = coll_row[1] or ""
+        coll_code = coll_row[2] or ""
+        owner_id = int(coll_row[3]) if coll_row[3] else 0
+        coll_status = coll_row[4] or "active"
+        is_owner = (owner_id == user_id)
+
+        # 集合本身已禁用 → 全部不可取件
+        if coll_status != "active":
+            return {
+                "collection_id": coll_id,
+                "collection_code": coll_code,
+                "collection_name": coll_name,
+                "owner_id": owner_id, "is_owner": is_owner,
+                "items": [], "retrievable_count": 0,
+                "denied_count": 0, "expired_count": 0,
+                "deleted_count": 0, "missing_count": 0,
+                "total_count": 0, "all_retrievable": False,
+                "error": "集合已禁用,无法取件",
+            }
+
+        # 查询集合项 + 关联文件状态
+        items_cur = await store._db.execute(
+            """SELECT ci.file_code, ci.added_at,
+                      fr.uploader_id, fr.status, fr.deleted_at, fr.expire_time
+               FROM collection_items ci
+               LEFT JOIN file_records_local fr ON ci.file_code = fr.file_code
+               WHERE ci.collection_id = ?
+               ORDER BY ci.added_at ASC""",
+            (coll_id,),
+        )
+        items_rows = await items_cur.fetchall()
+
+        items: list[dict] = []
+        retrievable_count = 0
+        denied_count = 0
+        expired_count = 0
+        deleted_count = 0
+        missing_count = 0
+
+        for r in items_rows:
+            file_code = r[0] or ""
+            added_at = r[1] or ""
+            uploader_id = int(r[2]) if r[2] else 0
+            file_status = (r[3] or "missing").lower()
+            deleted_at = r[4]
+            expire_time = r[5]
+
+            # 1. 权限校验
+            if is_owner:
+                has_access = True
+            elif uploader_id == user_id and uploader_id != 0:
+                has_access = True
+            else:
+                has_access = False
+
+            # 2. 文件状态判定
+            if not file_code or file_status == "missing":
+                retrieval_status = "missing"
+                reason = "文件记录不存在"
+                missing_count += 1
+            elif deleted_at or file_status == "deleted":
+                retrieval_status = "deleted"
+                reason = "文件已删除"
+                deleted_count += 1
+            elif file_status == "expired" or _is_expired(expire_time):
+                retrieval_status = "expired"
+                reason = "文件已过期"
+                expired_count += 1
+            elif not has_access:
+                retrieval_status = "denied"
+                reason = "无访问权限(uploader 不匹配)"
+                denied_count += 1
+            elif file_status in ("active", "ready"):
+                retrieval_status = "retrievable"
+                reason = ""
+                retrievable_count += 1
+            else:
+                # 其他异常状态(如 corrupted)→ 视为不可取件
+                retrieval_status = "deleted"
+                reason = f"文件状态异常: {file_status}"
+                deleted_count += 1
+
+            items.append({
+                "file_code": file_code,
+                "added_at": added_at,
+                "retrieval_status": retrieval_status,
+                "uploader_id": uploader_id,
+                "has_access": has_access,
+                "reason": reason,
+            })
+
+        total_count = len(items)
+        all_retrievable = (
+            total_count > 0
+            and retrievable_count == total_count
+        )
+        return {
+            "collection_id": coll_id,
+            "collection_code": coll_code,
+            "collection_name": coll_name,
+            "owner_id": owner_id,
+            "is_owner": is_owner,
+            "items": items,
+            "retrievable_count": retrievable_count,
+            "denied_count": denied_count,
+            "expired_count": expired_count,
+            "deleted_count": deleted_count,
+            "missing_count": missing_count,
+            "total_count": total_count,
+            "all_retrievable": all_retrievable,
+            "error": "",
+        }
+    except Exception as e:
+        logger.warning(f"[collections] batch_retrieve 失败: {e}")
+        return {
+            "collection_id": collection_id,
+            "collection_code": "", "collection_name": "",
+            "owner_id": 0, "is_owner": False,
+            "items": [], "retrievable_count": 0,
+            "denied_count": 0, "expired_count": 0,
+            "deleted_count": 0, "missing_count": 0,
+            "total_count": 0, "all_retrievable": False,
+            "error": f"批量取件失败: {e}",
         }

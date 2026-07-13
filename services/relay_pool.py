@@ -4,6 +4,8 @@
 - 智能负载均衡（三维度打分）
 - 支持并发处理解码任务
 """
+from __future__ import annotations
+
 import asyncio
 from datetime import datetime, timezone
 

@@ -293,14 +293,14 @@ class TestP15TombstoneColumns:
 # ─────────────────────────────────────────────────────────────
 
 class TestDDLVersionBump:
-    """R37 P1-5: DDL_VERSION 应升级。R44 7.2: 升级到 10(is_tombstone 列)。"""
+    """R37 P1-5: DDL_VERSION 应升级。R45 §1: 升级到 11(pending_uploads 部分索引)。"""
 
-    def test_ddl_version_is_10(self):
-        """DDL_VERSION = 10(R44 7.2: 添加 is_tombstone 列)。"""
+    def test_ddl_version_is_11(self):
+        """DDL_VERSION = 11(R45 §1: pending_uploads 部分索引优化)。"""
         session_path = Path(__file__).resolve().parent.parent / "database" / "session.py"
         content = session_path.read_text(encoding="utf-8")
-        assert "DDL_VERSION = 10" in content
-        # 注释应提及 R44 7.2
-        idx = content.find("DDL_VERSION = 10")
+        assert "DDL_VERSION = 11" in content
+        # 注释应提及 R45
+        idx = content.find("DDL_VERSION = 11")
         snippet = content[idx:idx + 200]
-        assert "R44" in snippet or "is_tombstone" in snippet
+        assert "R45" in snippet or "pending_uploads" in snippet

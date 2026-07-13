@@ -1184,14 +1184,30 @@ async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col:
             continue
         try:
             if supports_soft_delete:
-                # R42 P1-5: soft_delete 路径 — UPDATE deleted_at + is_tombstone=1
+                # R42 P1-5 / R45 §14: soft_delete 路径 — UPDATE deleted_at + is_tombstone + version
+                # R45 §14: tombstone 同步 deleted_at/version,不立即 DELETE
                 # 从 payload / created_at 中提取 deleted_at 时间戳
                 deleted_at = _extract_deleted_at_from_record(r)
-                sql = (
-                    f"UPDATE {crdb_table} SET deleted_at = $1, "
-                    f"is_tombstone = 1 WHERE {pk_col} = $2"
-                )
-                await col.execute_raw(sql, [deleted_at, pk])
+                # R45 §14: 先尝试带 version 的 UPDATE(version = COALESCE(version, 0) + 1)
+                # 如果表无 version 字段,SQL 失败则 fallback 到不带 version 的 UPDATE
+                try:
+                    sql = (
+                        f"UPDATE {crdb_table} SET deleted_at = $1, "
+                        f"is_tombstone = 1, version = COALESCE(version, 0) + 1 "
+                        f"WHERE {pk_col} = $2"
+                    )
+                    await col.execute_raw(sql, [deleted_at, pk])
+                except Exception as ver_err:
+                    # 表无 version 字段,fallback 到不带 version 的 UPDATE
+                    logger.debug(
+                        f"[crdb_sync] R45 §14: tombstone 带 version UPDATE 失败"
+                        f"(表可能无 version 字段),fallback: {ver_err}"
+                    )
+                    sql = (
+                        f"UPDATE {crdb_table} SET deleted_at = $1, "
+                        f"is_tombstone = 1 WHERE {pk_col} = $2"
+                    )
+                    await col.execute_raw(sql, [deleted_at, pk])
             else:
                 # R42 P1-5: fallback 路径 — DELETE + audit_log
                 # (表不支持 soft_delete,或 CRDB schema 查询失败)
@@ -1544,7 +1560,10 @@ async def _sync_dirty_outbox():
     for r in batch:
         tn = r.get("table_name", "") or ""
         pk = str(r.get("pk", "") or "")
-        version = r.get("version", 0) or 0
+        # R45 §14: version 单调递增,禁止默认 0 — 每个远端实体 version >= 1
+        version = r.get("version") or 1
+        if not isinstance(version, int) or version < 1:
+            version = 1
         # R42 P1-4: dirty_outbox 的 created_at 作为 updated_at 代理
         # (dirty_outbox 记录的 created_at 即变更检测时间,接近实体 updated_at)
         updated_at = r.get("created_at", "") or ""
@@ -1554,7 +1573,10 @@ async def _sync_dirty_outbox():
             merged_records.append(r)
         else:
             existing = version_map[key]
-            existing_version = existing.get("version", 0) or 0
+            # R45 §14: existing_version 也确保 >= 1(禁止默认 0)
+            existing_version = existing.get("version") or 1
+            if not isinstance(existing_version, int) or existing_version < 1:
+                existing_version = 1
             existing_updated_at = existing.get("created_at", "") or ""
             # R42 P1-4: 使用 _resolve_version_conflict 决定保留哪个版本
             # (同时考虑 version 和 updated_at)

@@ -97,13 +97,40 @@
             border-color: #91d5ff;
             font-weight: 600;
         }
+        /* R45 17.3: 视觉隐藏但屏幕阅读器可读(WCAG 2.2 AA — 用于 aria-live 动态消息区) */
+        .visually-hidden {
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            padding: 0 !important;
+            margin: -1px !important;
+            overflow: hidden !important;
+            clip: rect(0, 0, 0, 0) !important;
+            white-space: nowrap !important;
+            border: 0 !important;
+        }
+        /* R45 17.3: 错误提示不能只用颜色(WCAG 2.2 AA 1.4.1 Use of Color) — 添加图标 + 文字 */
+        .alert::before {
+            margin-right: 6px;
+            font-weight: 600;
+        }
+        .alert-warning::before { content: "⚠"; }
+        .alert-danger::before { content: "✕"; }
+        .alert-info::before { content: "ℹ"; }
+        /* R45 17.3: focus-visible 增强(WCAG 2.2 AA 2.4.11 Focus Not Obscured) */
+        :focus-visible {
+            outline: 3px solid #1890ff !important;
+            outline-offset: 2px !important;
+        }
     </style>
     {% block head_extra %}{% endblock %}
 </head>
 <body role="document">
     <!-- R44 6.4: 无障碍 skip-link,键盘用户可跳过导航直奔主内容(WCAG 2.4.1 Bypass Blocks) -->
     <a href="#main-content" class="skip-link">跳到主要内容</a>
-    <div class="sidebar">
+    <!-- R45 17.3: aria-live 动态消息区 — 屏幕阅读器播报异步状态变化(WCAG 2.2 AA 4.1.3 Status Messages) -->
+    <div id="aria-live-region" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+    <nav class="sidebar" aria-label="主导航 / Main navigation">
         <h2>TG解码器管理</h2>
         <div class="nav-group">基础</div>
         <a href="/" aria-label="看板" {% if request.url.path == '/' %}class="active"{% endif %}>看板</a>
@@ -124,9 +151,9 @@
         <a href="/ru-cost" aria-label="RU 成本中心" {% if request.url.path == '/ru-cost' %}class="active"{% endif %}>RU成本</a>
         <a href="/maintenance" aria-label="维护模式" {% if request.url.path == '/maintenance' %}class="active"{% endif %}>维护模式</a>
         <a href="/disaster-recovery" aria-label="灾备控制台" {% if request.url.path == '/disaster-recovery' %}class="active"{% endif %}>灾备控制台</a>
-    </div>
-    <div class="main" id="main-content" role="main">
-        <div class="header">
+    </nav>
+    <main class="main" id="main-content" role="main">
+        <header class="header">
             <h1>{% block page_title %}管理后台{% endblock %}</h1>
             <div class="admin-info">
                 {% if admin %}管理员: {{ admin.username if admin is mapping or admin is not string else admin }}{% endif %}
@@ -136,8 +163,8 @@
                     <a href="/locale?lang=en-US" {% if locale | default('zh-CN') == 'en-US' %}class="current" aria-current="true"{% endif %}>English</a>
                 </span>
             </div>
-        </div>
+        </header>
         {% block content %}{% endblock %}
-    </div>
+    </main>
 </body>
 </html>

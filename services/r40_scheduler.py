@@ -1,4 +1,4 @@
-"""R40 + R41 + R42: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理 + 备份孤儿 GC。
+"""R40 + R41 + R42 + R45: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理 + 备份孤儿 GC + decode_logs 7天保留清理。
 
 职责:
     1. 每小时清理过期配额预留(超过 1 小时未结算的自动退款)
@@ -7,6 +7,8 @@
     4. 每小时执行临时封禁自动解封(P1-11: 委托 content_reports.cleanup_expired_bans)
     5. R41 P0-5: 每 60 秒清理过期命令执行租约(委托 command_bus.cleanup_stale_leases)
     6. R42 P1-2: 每小时执行备份孤儿对象 GC(委托 backup_gc.run_backup_gc_job)
+    7. R45: 每天 3:00 清理 decode_logs 过期记录(7 天保留,委托 decode_logs_cleanup)
+       + 启动 run_daily_cleanup_loop 后台兜底任务(create_safe_task)
 
 设计原则:
     - 纯 async,通过 run_all.py BOT_RUNNERS 注册为独立进程
@@ -117,6 +119,29 @@ async def retention_cleanup_job() -> None:
         logger.warning(f"[R42] tombstone retention 清理异常: {e}")
 
 
+async def cleanup_expired_decode_logs_job() -> None:
+    """R45: 每天清理 decode_logs 过期记录(7 天保留,凌晨低峰期主路径)。
+
+    委托 services.decode_logs_cleanup.cleanup_expired_decode_logs:
+    - 批量删除 request_time < now - 7 days 的记录
+    - 每批 500 行,避免一次性大删除造成 RU 峰值
+    - 本地 SQLite 清理(零 CRDB RU)
+    - 幂等:与 run_daily_cleanup_loop 后台兜底任务重复执行无副作用
+    """
+    try:
+        from services.decode_logs_cleanup import cleanup_expired_decode_logs
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        result = await cleanup_expired_decode_logs(store, retention_days=7)
+        if result["deleted_count"] > 0:
+            logger.info(
+                f"[R45] decode_logs 清理: 删除 {result['deleted_count']} 条, "
+                f"保留 {result['retention_days']} 天, 截止 {result['cutoff_time']}"
+            )
+    except Exception as e:
+        logger.warning(f"[R45] decode_logs 清理异常: {e}")
+
+
 async def _run_lease_cleanup_loop() -> None:
     """R41 P0-5: 命令租约清理子循环(每 60 秒执行一次)。
 
@@ -198,6 +223,20 @@ async def run_scheduler() -> None:
         _run_lease_cleanup_loop(),
         name="lease-cleanup-loop",
     )
+    # R45: 启动 decode_logs 每日清理后台兜底任务(24h 间隔,create_safe_task 防异常静默)
+    # 主路径由主循环每天 3:00 调用 cleanup_expired_decode_logs_job,此为兜底
+    decode_logs_cleanup_task = None
+    try:
+        from database.cache_store import get_cache_store as _get_store
+        from services.decode_logs_cleanup import run_daily_cleanup_loop
+        from utils.task_utils import create_safe_task
+        _decode_logs_store = _get_store()
+        decode_logs_cleanup_task = create_safe_task(
+            run_daily_cleanup_loop(_decode_logs_store, retention_days=7),
+            name="decode-logs-cleanup-loop",
+        )
+    except Exception as _e:
+        logger.warning(f"[R45] decode_logs 后台清理任务启动失败(主循环兜底仍可用): {_e}")
     # 周期计数器:每 12 个周期(12 * 5 分钟 = 1 小时)执行一次临时封禁解封
     _cycle_count = 0
     # R42 P1-5: tombstone retention 清理执行日期标记(避免同一天重复执行)
@@ -219,6 +258,8 @@ async def run_scheduler() -> None:
                 # 每天 3:00 清理过期数据(分钟 < 5 避免重复执行)
                 if now.hour == 3 and now.minute < 5:
                     await cleanup_expired_data_job()
+                    # R45: 同期清理 decode_logs 过期记录(7 天保留,凌晨低峰期)
+                    await cleanup_expired_decode_logs_job()
                 # R42 P1-5: 每天 4:00-4:05 执行 tombstone retention 物理清理
                 # (在备份通常完成后,避免与 3:00 数据清理争用资源)
                 if (
@@ -240,7 +281,11 @@ async def run_scheduler() -> None:
         # 主调度器退出时取消所有子协程
         approval_exec_task.cancel()
         lease_cleanup_task.cancel()
-        for _task in (approval_exec_task, lease_cleanup_task):
+        if decode_logs_cleanup_task is not None:
+            decode_logs_cleanup_task.cancel()
+        for _task in (approval_exec_task, lease_cleanup_task, decode_logs_cleanup_task):
+            if _task is None:
+                continue
             try:
                 await _task
             except (asyncio.CancelledError, Exception):

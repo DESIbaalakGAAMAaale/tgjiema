@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import time
 import asyncio
@@ -195,15 +196,24 @@ def invalidate_user_codes(user_id: int):
 # ─── request_count 本地累积:批量写 CRDB ──────────────────
 
 _request_count_buffer: dict[str, int] = {}
-_request_count_lock = asyncio.Lock()
+# R45: 懒加载 Lock,避免模块导入时 Python 3.9 要求事件循环存在
+_request_count_lock: asyncio.Lock | None = None
 _REQUEST_COUNT_FLUSH_INTERVAL = settings.CACHE_REQUEST_COUNT_FLUSH
+
+
+def _get_request_count_lock() -> asyncio.Lock:
+    """懒加载 request count lock。"""
+    global _request_count_lock
+    if _request_count_lock is None:
+        _request_count_lock = asyncio.Lock()
+    return _request_count_lock
 
 
 async def incr_request_count(file_code: str):
     """本地累积 request_count,避免每次解码写一次 CRDB。
     同时更新 file_record 缓存中的 request_count,防止 max_requests 检查 TOCTOU 竞态。
     """
-    async with _request_count_lock:
+    async with _get_request_count_lock():
         _request_count_buffer[file_code] = _request_count_buffer.get(file_code, 0) + 1
     # 同步递增 file_record 内存缓存中的 request_count,使后续 check_decode_permission 读到最新值
     cache = get_file_record_cache()
@@ -225,7 +235,7 @@ async def _flush_request_count_loop():
     while True:
         await asyncio.sleep(_REQUEST_COUNT_FLUSH_INTERVAL)
         try:
-            async with _request_count_lock:
+            async with _get_request_count_lock():
                 if not _request_count_buffer:
                     continue
                 batch = dict(_request_count_buffer)
@@ -241,7 +251,7 @@ async def _flush_request_count_loop():
         except Exception as e:
             logger.error(f"[request_count] flush failed: {e}")
             # 失败时将 batch 合并回缓冲,防止计数永久丢失
-            async with _request_count_lock:
+            async with _get_request_count_lock():
                 for code, cnt in batch.items():
                     _request_count_buffer[code] = _request_count_buffer.get(code, 0) + cnt
 

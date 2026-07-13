@@ -2,6 +2,7 @@
 职责:生成文件码 + 解码(内部/外部) -> 写 jobs 派工表
 与原来的 decoder_bot 功能一致,区别是解码后调用 enqueue_job() 而非 queue_manager
 """
+from __future__ import annotations
 
 import asyncio
 import datetime
@@ -12,6 +13,7 @@ except ImportError:
 import re
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
@@ -70,8 +72,17 @@ def _t(user_id: int, key: str, **kwargs) -> str:
 TOKEN = settings.DECODER_BOT_TOKEN
 
 _pending_external: dict[str, deque[tuple[int, str, float]]] = defaultdict(deque)
-_ext_lock = asyncio.Lock()
+# R45: 懒加载 Lock,避免模块导入时 Python 3.9 要求事件循环存在
+_ext_lock: asyncio.Lock | None = None
 _PENDING_TTL = settings.PENDING_TTL
+
+
+def _get_ext_lock() -> asyncio.Lock:
+    """懒加载 external pending lock。"""
+    global _ext_lock
+    if _ext_lock is None:
+        _ext_lock = asyncio.Lock()
+    return _ext_lock
 
 # ─── Quota 同步至 CRDB（SQLite First，每 6h 批量写入）─────────
 _QUOTA_SYNC_INTERVAL = 21600  # 6 小时
@@ -89,12 +100,12 @@ async def _quota_sync_loop():
 
 
 async def _enqueue_external(bot_username: str, user_id: int, code: str):
-    async with _ext_lock:
+    async with _get_ext_lock():
         _pending_external[bot_username].append((user_id, code, time.time()))
 
 
 async def _dequeue_external(bot_username: str) -> tuple[int, str]:
-    async with _ext_lock:
+    async with _get_ext_lock():
         q = _pending_external.get(bot_username)
         while q:
             entry = q.popleft()
@@ -106,7 +117,7 @@ async def _dequeue_external(bot_username: str) -> tuple[int, str]:
 async def _cleanup_stale_pending():
     now = time.time()
     stale_entries = []
-    async with _ext_lock:
+    async with _get_ext_lock():
         stale = []
         for bot, q in _pending_external.items():
             while q and now - q[0][2] >= _PENDING_TTL:
@@ -187,7 +198,16 @@ def _decode_external_code(code_part: str) -> str:
 # ─── 活跃频道本地缓存(避免每次解码都查询 cells) ───
 _active_channels_cache: list[dict] = []
 _active_channels_index = 0
-_ch_lock = asyncio.Lock()
+# R45: 懒加载 Lock,避免模块导入时 Python 3.9 要求事件循环存在
+_ch_lock: asyncio.Lock | None = None
+
+
+def _get_ch_lock() -> asyncio.Lock:
+    """懒加载 channels lock。"""
+    global _ch_lock
+    if _ch_lock is None:
+        _ch_lock = asyncio.Lock()
+    return _ch_lock
 
 
 async def _refresh_active_channels():
@@ -207,7 +227,7 @@ async def _get_storage_channel() -> int:
     if _active_channels_cache:
         # P1-7: 在锁内同时完成取模+读 channel_id,
         # 避免 _refresh_active_channels 替换列表后 idx 越界。
-        async with _ch_lock:
+        async with _get_ch_lock():
             idx = _active_channels_index % len(_active_channels_cache)
             _active_channels_index += 1
             return _active_channels_cache[idx]["channel_id"]
@@ -582,6 +602,211 @@ async def _idx_transition_upload_session_safe(
         )
     except Exception as e:
         logger.warning(f"[Idx] 推进 upload_session 状态失败 upload_id={upload_id} -> {new_status}: {e}")
+
+
+# ─── R45: FinalizeUpload 原子提交 ──────────────────────────────
+
+@dataclass
+class FinalizeUploadCommand:
+    """R45: 封装 FinalizeUpload 原子提交所需的所有字段。
+
+    file_records + codes + pending_uploads + dirty_outbox + quota
+    在同一 SQLite 事务中原子提交,任一失败全部 ROLLBACK。
+    """
+    file_record: dict          # file_records_local 记录
+    code_entry: dict           # codes_local 记录
+    pending_upload_id: int     # pending_uploads_local.id
+    upload_id: str             # upload_session ID(用于状态推进)
+    storage_msg_ids: list      # 存储频道消息 ID 列表
+    file_meta_list: list       # 文件元数据列表
+    channel_id: int            # 存储频道 ID
+    protect_content: bool      # 是否保护内容
+    quota_reservation_id: str = ""  # 配额预留 ID(空串=无配额预留)
+
+
+async def _generate_unique_code_with_retry(
+    file_types: dict, max_retries: int = 3,
+) -> str:
+    """R45: 生成唯一文件码,冲突时重试(最多 max_retries 次)。
+
+    使用 DB unique constraint 原子检测冲突(INSERT OR IGNORE),
+    不依赖先 SELECT 后 INSERT 的两步模式(避免竞态)。
+
+    Args:
+        file_types: 文件类型字典(如 {"document": 1})
+        max_retries: 最大重试次数(默认 3)
+
+    Returns:
+        唯一文件码字符串
+
+    Raises:
+        RuntimeError: 超过最大重试次数仍冲突
+    """
+    # 通过模块访问 build_file_code(而非 from ... import),
+    # 使测试 monkeypatch.setattr("services.code_generator.build_file_code", ...) 生效
+    from services import code_generator
+    from database.cache_store import get_cache_store
+
+    store = get_cache_store()
+    if not store._db:
+        raise RuntimeError("[Idx][R45] _generate_unique_code_with_retry: 数据库未初始化")
+
+    for attempt in range(max_retries):
+        code = code_generator.build_file_code(file_types)
+        try:
+            # INSERT OR IGNORE 原子检测: 若 code 已存在(PK 冲突)则 rowcount=0
+            cursor = await store._db.execute(
+                "INSERT OR IGNORE INTO codes_local (code, status) VALUES (?, 'pending')",
+                (code,),
+            )
+            if cursor.rowcount > 0:
+                # 码唯一 → 保留占位记录(status='pending'),finalize_upload 时
+                # upsert_code_local 会用 INSERT OR REPLACE 覆盖为完整记录
+                if not getattr(store, "_in_writer_tx", False):
+                    await store._db.commit()
+                logger.debug(f"[Idx][R45] 生成唯一码成功 attempt={attempt+1} code={code}")
+                return code
+            # rowcount=0 → 码冲突,重试
+            logger.debug(f"[Idx][R45] 码冲突 attempt={attempt+1} code={code}")
+        except Exception as e:
+            logger.warning(f"[Idx][R45] 码冲突检测异常 attempt={attempt+1}: {e}")
+
+    raise RuntimeError(
+        f"码生成冲突,已重试 {max_retries} 次仍失败"
+    )
+
+
+async def finalize_upload(command: FinalizeUploadCommand) -> None:
+    """R45: FinalizeUpload 原子提交。
+
+    在单一 SQLite 事务中原子提交:
+    - file_records_local (upsert)
+    - codes_local (upsert)
+    - dirty_outbox (file_records + codes)
+    - pending_uploads_local (complete)
+
+    R45 整改要点:
+    1. dirty_outbox 失败必须抛异常(不 warning 后 continue)
+    2. quota: 成功 → SETTLE,失败 → RELEASE
+    3. 任一步骤失败整体 ROLLBACK(writer_transaction 保证)
+
+    Args:
+        command: FinalizeUploadCommand 封装所有原子提交字段
+
+    Raises:
+        Exception: 任一写入步骤失败(事务自动 ROLLBACK)
+    """
+    from database.cache_store import get_cache_store
+
+    store = get_cache_store()
+    if not store._db:
+        raise RuntimeError("[Idx][R45] finalize_upload: 数据库未初始化")
+
+    # 序列化 payload(事务外纯计算,不涉及 DB 状态)
+    record_payload = json.dumps(command.file_record, default=str)
+    if isinstance(record_payload, bytes):
+        record_payload = record_payload.decode()
+    ce_payload = json.dumps(command.code_entry, default=str)
+    if isinstance(ce_payload, bytes):
+        ce_payload = ce_payload.decode()
+
+    file_code = command.file_record.get("file_code", "")
+    code_value = command.code_entry.get("code", "")
+
+    try:
+        # R45: 原子事务 — 所有写入在同一 writer_transaction 中
+        # dirty_outbox 失败会抛异常,触发整体 ROLLBACK(不 warning 后 continue)
+        async with store.writer_transaction():
+            # 写 file_records_local(mark_dirty=False → 不自动写 dirty_outbox,
+            # 由下方显式 add_dirty_outbox 调用,确保失败可抛异常)
+            await store.upsert_file_record_local(command.file_record, mark_dirty=False)
+            # 写 dirty_outbox(file_records) — 显式调用,失败即抛(不 try/except)
+            await store.add_dirty_outbox(
+                "file_records", file_code, "upsert", record_payload,
+            )
+            # 写 codes_local(mark_dirty=False → 不自动写 dirty_outbox)
+            await store.upsert_code_local(command.code_entry, mark_dirty=False)
+            # 写 dirty_outbox(codes) — 显式调用,失败即抛(不 try/except)
+            await store.add_dirty_outbox(
+                "codes", code_value, "upsert", ce_payload,
+            )
+            # 标记 pending_upload 完成(processed=1)
+            await store.complete_pending_upload(command.pending_upload_id)
+    except Exception:
+        # 事务已 ROLLBACK,释放预扣配额(若存在)
+        # R45 整改: dirty_outbox 故障时 release_quota(走 refund)也会失败,
+        # 需要 force_release_quota 兜底绕过 dirty_outbox,防止配额泄漏
+        if command.quota_reservation_id:
+            from services.quota_ledger import release_quota, force_release_quota
+            release_ok = False
+            release_err: Exception | None = None
+            try:
+                release_ok = await release_quota(
+                    command.quota_reservation_id,
+                    reason="finalize_upload_failed",
+                )
+                if release_ok:
+                    logger.info(
+                        f"[Idx][R45] 配额已 RELEASE res_id={command.quota_reservation_id} "
+                        f"(finalize_upload 失败 ROLLBACK)"
+                    )
+            except Exception as err:
+                # release_quota 抛异常(理论兜底,refund 通常 return False 不抛)
+                release_err = err
+                logger.warning(
+                    f"[Idx][R45] release_quota 抛异常 res_id="
+                    f"{command.quota_reservation_id}: {err}"
+                )
+            # release_quota 返回 False 或抛异常 → 走 force_release_quota 兜底
+            if not release_ok:
+                logger.warning(
+                    f"[Idx][R45] release_quota 失败(returned False / exception="
+                    f"{release_err}),尝试 force_release_quota 兜底绕过 dirty_outbox "
+                    f"res_id={command.quota_reservation_id}"
+                )
+                try:
+                    force_ok = await force_release_quota(
+                        command.quota_reservation_id,
+                        reason="finalize_upload_failed_force",
+                    )
+                    if force_ok:
+                        logger.info(
+                            f"[Idx][R45] 配额已 force_release res_id="
+                            f"{command.quota_reservation_id} "
+                            f"(finalize_upload 失败 + dirty_outbox 故障兜底)"
+                        )
+                    else:
+                        logger.error(
+                            f"[Idx][R45] force_release_quota 也失败 res_id="
+                            f"{command.quota_reservation_id}(需人工排查配额泄漏)"
+                        )
+                except Exception as force_err:
+                    logger.error(
+                        f"[Idx][R45] force_release_quota 异常 res_id="
+                        f"{command.quota_reservation_id}: {force_err}"
+                    )
+        # 重新抛出原始异常(不吞掉)
+        raise
+
+    # 事务提交成功 → SETTLE 配额(确认消耗)
+    if command.quota_reservation_id:
+        try:
+            from services.quota_ledger import settle_quota
+            await settle_quota(command.quota_reservation_id)
+            logger.debug(
+                f"[Idx][R45] 配额已 SETTLE res_id={command.quota_reservation_id}"
+            )
+        except Exception as settle_err:
+            # SETTLE 失败不影响已提交的数据(配额预留超时会自动 release)
+            logger.warning(
+                f"[Idx][R45] SETTLE 配额失败 res_id={command.quota_reservation_id}: "
+                f"{settle_err}"
+            )
+
+    logger.info(
+        f"[Idx][R45] finalize_upload 成功 file_code={file_code} "
+        f"pend_id={command.pending_upload_id} upload_id={command.upload_id}"
+    )
 
 
 async def _process_one_pending(app: Application, row: dict):
@@ -2909,7 +3134,7 @@ async def _async_main():
                     if not user_id or not code:
                         return
                     # I-3: 用锁保护 check-then-act，防止同组消息并发创建多个 buffer/timer
-                    async with _ext_lock:
+                    async with _get_ext_lock():
                         buf = _media_group_buffer.get(mg_id)
                         if buf is None:
                             timer = create_safe_task(_flush_media_group_buffer(mg_id), name=f"flush-mg-{mg_id}")
