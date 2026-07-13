@@ -15,10 +15,10 @@ jobs:
   verify-deploy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
 

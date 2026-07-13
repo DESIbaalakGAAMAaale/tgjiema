@@ -29,6 +29,24 @@ from database import (
 from database.cache_store import get_cache_store
 from services.mon import MonScheduler
 from utils.monitor import metrics
+# R44 6.2: i18n 国际化翻译(管理员可见告警文案)
+from services.i18n import get_i18n_manager
+
+
+def _t(user_id: int, key: str, **kwargs) -> str:
+    """R44 6.2: 获取管理员 locale 并翻译 key(带插值)。
+
+    Args:
+        user_id: Telegram 管理员用户 ID(用于查询 locale 偏好)
+        key: 翻译 key(如 "bot.mon.alert.delivery_rate_critical")
+        **kwargs: 插值参数
+
+    Returns:
+        本地化字符串
+    """
+    manager = get_i18n_manager()
+    locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
+    return manager.format_message(key, locale=locale, **kwargs)
 
 TOKEN = settings.MON_BOT_TOKEN
 if not TOKEN:
@@ -591,13 +609,14 @@ class MonBot:
         status = cell.get("status", "?")
         store = get_cache_store()
 
-        notify_msg = (
-            f"🚨 频道封禁告警\n\n"
-            f"槽位: {slot_id}\n"
-            f"频道 ID: {channel_id}\n"
-            f"所属账号: {account_name}\n"
-            f"状态: {status}\n"
-            f"错误: {error}\n\n"
+        notify_msg = _t(
+            self._admin_chat_id,
+            "bot.mon.channel_ban_alert",
+            slot_id=slot_id,
+            channel_id=channel_id,
+            account_name=account_name,
+            status=status,
+            error=error,
         )
 
         spare = None
@@ -619,7 +638,11 @@ class MonBot:
                 logger.error(f"[Mon] consume_spare 失败 (channel={spare_ch}): {e}")
                 # consume_spare 失败意味着该 spare 在 DB 中仍 is_used=0,
                 # 继续替换会导致同一 spare 被双重分配。必须中止替换。
-                notify_msg += f"⚠️ 备用池标记失败，已跳过替换: {e}"
+                notify_msg += _t(
+                    self._admin_chat_id,
+                    "bot.mon.spare_mark_failed",
+                    error=str(e),
+                )
                 await self._notify_admin(notify_msg)
                 return
             new_status = status if status in ("active", "shadow1", "shadow2", "r100") else "active"
@@ -653,7 +676,10 @@ class MonBot:
                 await self._release_cell_lease_safe(slot_id)
             if not topology_applied:
                 # fail-closed: 拓扑变更被拒绝,跳过后续环指针修正 / log_rotate / 缓存更新
-                notify_msg += "⚠️ 拓扑变更被拒绝(CAS 失败,等待重试)\n"
+                notify_msg += _t(
+                    self._admin_chat_id,
+                    "bot.mon.topology_rejected",
+                )
                 await self._notify_admin(notify_msg)
                 self._invalidate_cells_cache()
                 return
@@ -685,18 +711,18 @@ class MonBot:
                 reason=f"封禁替换: old={channel_id} → new={spare_ch} ({spare_source})",
                 triggered_by="mon",
             )
-            notify_msg += (
-                f"✅ 已自动从{spare_source}补充\n"
-                f"新频道 ID: {spare_ch}\n"
-                f"操作: 直接替换,无需降级"
+            notify_msg += _t(
+                self._admin_chat_id,
+                "bot.mon.spare_pool_replaced",
+                spare_source=spare_source,
+                spare_ch=spare_ch,
             )
             logger.info(f"[Mon][Ban] {slot_id} 封禁 → 备用池 {spare_ch} 替换")
             # Manifest 驱动:新频道无 manifest 记录,auto_fill_new_channels 会自动从 Active 补齐
         else:
-            notify_msg += (
-                "⚠️ 备用池无可用频道!\n"
-                "请通过管理员 Bot 添加备用频道:\n"
-                "/spare_add <频道ID> [账号名]\n"
+            notify_msg += _t(
+                self._admin_chat_id,
+                "bot.mon.spare_pool_empty",
             )
             if status in ("active", "shadow1", "shadow2"):
                 # R35 P0-4 §23: 拓扑变更前获取租约 + CAS 转换(降级为 lost)
@@ -719,7 +745,10 @@ class MonBot:
                     await self._release_cell_lease_safe(slot_id)
                 if not topology_applied:
                     # fail-closed: 拓扑变更被拒绝,跳过 log_rotate 和缓存更新
-                    notify_msg += "⚠️ lost 降级被拒绝(CAS 失败,等待重试)\n"
+                    notify_msg += _t(
+                        self._admin_chat_id,
+                        "bot.mon.lost_degrade_rejected",
+                    )
                     await self._notify_admin(notify_msg)
                     self._invalidate_cells_cache()
                     return
@@ -796,11 +825,12 @@ class MonBot:
 
         if recovered > 0:
             # N21-2: 移除冗余 _bump_cells_version()，update_cell_fields_local 已内部 bump
-            await self._notify_admin(
-                f"🔄 lost 频道恢复\n\n"
-                f"共恢复 {recovered} 个频道为 shadow2\n"
-                f"已重新加入环形拓扑，后续轮转将自然提升"
+            recover_msg = _t(
+                self._admin_chat_id,
+                "bot.mon.recovered_lost",
+                recovered=recovered,
             )
+            await self._notify_admin(recover_msg)
         return recovered
 
     async def _check_rotation(self, all_cells: list[dict]):
@@ -1131,12 +1161,14 @@ class MonBot:
                     # 轮转通知频率控制: 每 3600 秒最多通知一次
                     now = time.time()
                     if now - self._last_rotation_notify_ts > 3600:
-                        if await self._notify_admin(
-                            f"🔄 频道轮转完成\n\n"
-                            f"当前窗口已推进，新窗口已激活\n"
-                            f"参数: {self._rotation['active_window_size']}活态 / "
-                            f"{self._rotation['files_per_slot']}文件/{self._rotation['time_per_slot']}秒"
-                        ):
+                        rotation_msg = _t(
+                            self._admin_chat_id,
+                            "bot.mon.rotation_complete",
+                            active_window_size=self._rotation['active_window_size'],
+                            files_per_slot=self._rotation['files_per_slot'],
+                            time_per_slot=self._rotation['time_per_slot'],
+                        )
+                        if await self._notify_admin(rotation_msg):
                             self._last_rotation_notify_ts = now
 
                 # 6. 定期拓扑校验(每 10 轮一次)

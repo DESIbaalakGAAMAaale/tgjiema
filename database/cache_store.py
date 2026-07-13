@@ -1260,6 +1260,28 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_cmd_exec_status ON command_executions(status)"
         )
 
+        # ─── R44 G0-2: effect_receipts 表 — 外部副作用 receipt 持久化,保证 effectively-once ───
+        # 用于幂等控制:action_id + effect_type + target 唯一标识一个外部副作用,
+        # 执行前检查 receipt 是否已 completed,避免重复触发外部副作用。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS effect_receipts (
+                action_id     TEXT NOT NULL,
+                effect_type   TEXT NOT NULL,
+                target        TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                external_id   TEXT,
+                created_at    TEXT NOT NULL,
+                completed_at  TEXT,
+                PRIMARY KEY (action_id, effect_type, target)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_effect_receipts_action ON effect_receipts(action_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_effect_receipts_status ON effect_receipts(status)"
+        )
+
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -1333,8 +1355,29 @@ class CacheStore:
         # R42 P1-4: 若 version=0,自动从 payload 中的 updated_at 字段生成时间戳版本
         # (避免多调用方使用默认 version=0 时,合并顺序依赖插入 ID 并吞掉真正新状态)
         # 优先级: payload.version > payload.<version_field> > 当前时间戳
+        # R44 7.2: version 优先用 SQLite 原子递增(MAX+1),避免并发碰撞
         if version == 0:
-            version = _generate_version_from_payload(table_name, payload)
+            # 先尝试从 dirty_outbox 表 MAX(version)+1(原子递增,避免时间戳碰撞)
+            try:
+                _query_conn = connection if connection is not None else self._db
+                if _query_conn is not None:
+                    cursor = await _query_conn.execute(
+                        "SELECT MAX(version) FROM dirty_outbox "
+                        "WHERE table_name = ? AND pk = ?",
+                        (table_name, pk),
+                    )
+                    row = await cursor.fetchone()
+                    if row and row[0] is not None and row[0] > 0:
+                        version = int(row[0]) + 1
+                    else:
+                        # fallback 到时间戳生成
+                        version = _generate_version_from_payload(table_name, payload)
+                else:
+                    # 无可用连接,fallback 到时间戳生成
+                    version = _generate_version_from_payload(table_name, payload)
+            except Exception:
+                # 查询失败时 fallback 到时间戳生成(保证不阻塞主流程)
+                version = _generate_version_from_payload(table_name, payload)
 
         # R39 P0-4 + R40 P0-5: 事务发件箱模式 — 若调用方传入 connection/tx,
         # 则使用该连接(不自动 commit),确保 dirty_outbox 写入与业务表更新

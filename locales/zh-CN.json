@@ -38,7 +38,10 @@
     "system.rate_limited": "请求过于频繁,请稍后再试",
     "system.maintenance": "系统维护中,请稍后再试",
     "validation.failed": "参数校验失败",
-    "validation.missing_field": "缺少必填字段"
+    "validation.missing_field": "缺少必填字段",
+    "generic": {
+      "fallback": "操作失败,请稍后重试"
+    }
   },
   "ui": {
     "admin_login_title": "管理后台登录",
@@ -105,7 +108,27 @@
     "session_renewed": "会话已续期",
     "maintenance_in_progress": "系统维护中,请稍后再试",
     "file_count_singular": "{count} 个文件",
-    "file_count_plural": "{count} 个文件"
+    "file_count_plural": "{count} 个文件",
+    "mon": {
+      "rotation_complete": "🔄 频道轮转完成\n\n当前窗口已推进，新窗口已激活\n参数: {active_window_size}活态 / {files_per_slot}文件/{time_per_slot}秒",
+      "recovered_lost": "🔄 lost 频道恢复\n\n共恢复 {recovered} 个频道为 shadow2\n已重新加入环形拓扑，后续轮转将自然提升",
+      "channel_ban_alert": "🚨 频道封禁告警\n\n槽位: {slot_id}\n频道 ID: {channel_id}\n所属账号: {account_name}\n状态: {status}\n错误: {error}\n\n",
+      "spare_pool_replaced": "✅ 已自动从{spare_source}补充\n新频道 ID: {spare_ch}\n操作: 直接替换,无需降级",
+      "spare_pool_empty": "⚠️ 备用池无可用频道!\n请通过管理员 Bot 添加备用频道:\n/spare_add <频道ID> [账号名]\n",
+      "spare_mark_failed": "⚠️ 备用池标记失败，已跳过替换: {error}",
+      "topology_rejected": "⚠️ 拓扑变更被拒绝(CAS 失败,等待重试)\n",
+      "lost_degrade_rejected": "⚠️ lost 降级被拒绝(CAS 失败,等待重试)\n"
+    },
+    "admin_bot": {
+      "usage_user_command": "用法:/user <用户ID>",
+      "user_id_must_be_number": "❌ 用户ID必须是数字",
+      "seq_must_be_number": "❌ 序号必须是数字。使用 /restore 查看备份列表。",
+      "ban_success_permanent": "✅ 用户 {user_id} 已封禁(永久)",
+      "ban_failed_retry": "❌ 封禁失败,请稍后重试",
+      "ban_failed_with_error": "❌ 封禁失败: {error}",
+      "usage_unban_command": "用法:/unban <用户ID>",
+      "ban_success_duration": "✅ 用户 {user_id} 已封禁({duration_days}天)"
+    }
   },
   "accessibility": {
     "skip_to_content": "跳到主要内容",
@@ -135,7 +158,14 @@
       "too_many_requests": "请求过于频繁",
       "internal_server_error": "内部服务器错误",
       "service_unavailable": "服务暂时不可用",
-      "gateway_timeout": "网关超时"
+      "gateway_timeout": "网关超时",
+      "login_failed": "用户名或密码错误",
+      "csrf_failed": "CSRF token 验证失败",
+      "rate_limited": "登录尝试过于频繁,请 {minutes} 分钟后再试",
+      "admin_not_configured": "管理员账号未配置,请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD"
+    },
+    "generic": {
+      "fallback": "操作失败,请稍后重试"
     }
   }
 }

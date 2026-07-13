@@ -17,9 +17,27 @@ import datetime
 from database import get_users_col, get_file_records_col, get_decode_logs_col
 from utils.monitor import metrics
 from config import settings
+# R44 6.2: i18n 国际化翻译(管理员可见错误文案 / 模板 locale 注入)
+from services.i18n import get_i18n_manager, set_user_locale as _i18n_set_user_locale
 
 app = FastAPI(title="TG解码器管理后台")
 security = HTTPBasic()
+
+
+def _t(principal_or_user_id: int, key: str, **kwargs) -> str:
+    """R44 6.2: 获取 admin principal 的 locale 并翻译 key(带插值)。
+
+    Args:
+        principal_or_user_id: AdminPrincipal.id 或 Telegram 用户 ID(用于查询 locale)
+        key: 翻译 key(如 "admin.errors.unauthorized")
+        **kwargs: 插值参数
+
+    Returns:
+        本地化字符串
+    """
+    manager = get_i18n_manager()
+    locale = manager.get_principal_locale(principal_or_user_id) if principal_or_user_id else "zh-CN"
+    return manager.format_message(key, locale=locale, **kwargs)
 
 
 # ─── R40 P0-2: 管理员身份模型 ──────────────────────────────────
@@ -590,7 +608,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     进行审计/RBAC,使用 principal.username 进行显示。
     """
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
-        raise HTTPException(status_code=503, detail="管理员账号未配置,请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD")
+        raise HTTPException(status_code=503, detail=_t(0, "admin.errors.admin_not_configured"))
 
     # 速率限制检查
     client_ip = _get_client_ip(request)
@@ -608,7 +626,11 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     elif len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
-            detail=f"登录尝试过于频繁,请 {_LOGIN_LIMIT_WINDOW // 60} 分钟后再试",
+            detail=_t(
+                0,
+                "admin.errors.rate_limited",
+                minutes=_LOGIN_LIMIT_WINDOW // 60,
+            ),
         )
 
     # 用户名常量时间比较
@@ -627,7 +649,7 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
         # RFC 7235: 401 必须带 WWW-Authenticate 头，提示浏览器弹出认证框
         raise HTTPException(
             status_code=401,
-            detail="未授权访问",
+            detail=_t(0, "admin.errors.unauthorized"),
             headers={"WWW-Authenticate": 'Basic realm="TG解码器管理后台", charset="UTF-8"'},
         )
 
@@ -884,10 +906,10 @@ async def login_submit(
     # CSRF 验证(cookie 中的 token 与表单中的 token 必须一致)
     cookie_csrf = request.cookies.get("csrf_token", "")
     if not cookie_csrf or not csrf_token or not secrets.compare_digest(cookie_csrf, csrf_token):
-        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+        raise HTTPException(status_code=403, detail=_t(0, "admin.errors.csrf_failed"))
 
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
-        raise HTTPException(status_code=503, detail="管理员账号未配置")
+        raise HTTPException(status_code=503, detail=_t(0, "admin.errors.admin_not_configured"))
 
     # 速率限制检查(与 verify_admin 逻辑一致)
     client_ip = _get_client_ip(request)
@@ -904,7 +926,11 @@ async def login_submit(
     elif len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
         raise HTTPException(
             status_code=429,
-            detail=f"登录尝试过于频繁,请 {_LOGIN_LIMIT_WINDOW // 60} 分钟后再试",
+            detail=_t(
+                0,
+                "admin.errors.rate_limited",
+                minutes=_LOGIN_LIMIT_WINDOW // 60,
+            ),
         )
 
     # 用户名常量时间比较
@@ -917,7 +943,7 @@ async def login_submit(
         _login_failures.setdefault(client_ip, []).append(now)
         _fire_and_forget(_persist_login_failures())
         # 返回登录页并显示错误信息(简化:返回 401)
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
+        raise HTTPException(status_code=401, detail=_t(0, "admin.errors.login_failed"))
 
     # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)
@@ -1344,6 +1370,7 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
 
     R40 P1-13: 注入 csp_nonce 到模板上下文,供 inline <script>/<style> 标签使用。
     CSP 中间件已将 per-request nonce 写入 request.state.csp_nonce。
+    R44 6.2: 注入 locale 到模板上下文,供 base.html 的 <html lang> 与语言切换器使用。
     """
     token = _get_csrf_token(username)
     context["csrf_token"] = token
@@ -1353,6 +1380,26 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
     if req is not None:
         csp_nonce = getattr(req.state, "csp_nonce", "") or ""
     context["csp_nonce"] = csp_nonce
+    # R44 6.2: 注入 locale 到模板上下文(从 cookie 读取,默认 zh-CN)
+    # 若 username 存在,优先读取该 principal 的 locale;否则读 cookie;最后回退默认
+    locale_value = "zh-CN"
+    try:
+        if req is not None:
+            # 优先从 query param 或 cookie 读取(供 base.html 的语言切换器使用)
+            cookie_locale = req.cookies.get("locale", "") if hasattr(req, "cookies") else ""
+            if cookie_locale:
+                locale_value = cookie_locale
+        # 若有 username,尝试从 principal locale 读取(覆盖 cookie)
+        if username:
+            principal_id = _get_admin_principal_id(username)
+            i18n_manager = get_i18n_manager()
+            principal_locale = i18n_manager.get_principal_locale(principal_id)
+            if principal_locale:
+                locale_value = principal_locale
+    except Exception:
+        # 出错时保持默认 zh-CN,避免影响模板渲染
+        pass
+    context["locale"] = locale_value
     # R43: Starlette 1.x 改变 TemplateResponse 签名,从 (name, context) 改为 (request, name, context)
     #   旧: TemplateResponse(name, {"request": request, ...})
     #   新: TemplateResponse(request, name, {"key": value, ...})
@@ -1506,6 +1553,63 @@ async def readiness_check(response: Response):
         "last_crdb_sync_age": dep.get("last_crdb_sync_age", -1.0),
         "last_r2_collect_age": dep.get("last_r2_collect_age", -1.0),
     }
+
+
+@app.get("/locale")
+async def set_locale_endpoint(
+    request: Request,
+    lang: str = Query(..., description="目标 locale(如 zh-CN / en-US)"),
+    admin=Depends(require_session),
+):
+    """R44 6.2: 语言切换端点。
+
+    功能:
+        1. 校验 lang 在支持列表中(否则 400)
+        2. 持久化到 users_local(若 principal 对应 user_id 存在)+ dirty_outbox
+        3. 设置 locale cookie(供后续页面渲染时读取)
+        4. 重定向回来源页(Referer)或 /dashboard
+
+    Args:
+        request: FastAPI Request
+        lang: 目标 locale(如 zh-CN / en-US)
+        admin: AdminPrincipal(由 require_session 注入)
+
+    Returns:
+        RedirectResponse 到来源页或 /dashboard
+    """
+    manager = get_i18n_manager()
+    available_locales = manager.get_available_locales()
+    if lang not in available_locales:
+        raise HTTPException(
+            status_code=400,
+            detail=_t(admin.id, "bot.locale_invalid", locale=lang),
+        )
+    # 持久化 locale(若 principal 在 users_local 中有记录则更新)
+    try:
+        _i18n_set_user_locale(admin.id, lang)
+    except ValueError:
+        # locale 不在支持列表(理论上前面已拦截,此处兜底)
+        raise HTTPException(
+            status_code=400,
+            detail=_t(admin.id, "bot.locale_invalid", locale=lang),
+        )
+    except Exception as locale_err:
+        # 持久化失败不阻断切换(cookie 仍生效),仅记录日志
+        from loguru import logger as _logger
+        _logger.warning(f"[Admin][Locale] 持久化失败 admin={admin.id} lang={lang}: {locale_err}")
+    # 重定向回来源页或 /dashboard
+    referer = request.headers.get("referer", "") or "/dashboard"
+    response = RedirectResponse(url=referer, status_code=303)
+    # 设置 locale cookie(供 _make_csrf_response 读取)
+    response.set_cookie(
+        key="locale",
+        value=lang,
+        httponly=False,  # 允许前端 JS 读取以切换显示
+        samesite="strict",
+        secure=getattr(settings, "CSRF_COOKIE_SECURE", False),
+        max_age=30 * 24 * 3600,  # 30 天
+    )
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)

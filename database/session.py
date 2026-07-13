@@ -26,7 +26,7 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-DDL_VERSION = 9  # R37 P1-5: 权威表增加 deleted_at tombstone 列(捕捉软删除用于增量备份)
+DDL_VERSION = 10  # R44 7.2: 权威表增加 is_tombstone 列(tombstone soft_delete 路径)
 
 DDL_STATEMENTS = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -44,7 +44,8 @@ DDL_STATEMENTS = [
         is_banned INTEGER DEFAULT 0,
         created_at TEXT,
         updated_at TEXT,
-        deleted_at TEXT
+        deleted_at TEXT,
+        is_tombstone INTEGER DEFAULT 0  -- R44 7.2: tombstone 标记列,使 _is_crdb_table_supports_soft_delete() 返回 True
     )""",
     """CREATE TABLE IF NOT EXISTS file_records (
         file_code TEXT PRIMARY KEY,
@@ -61,7 +62,8 @@ DDL_STATEMENTS = [
         create_time TEXT,
         expire_time TEXT,
         blocked_users JSONB DEFAULT '[]',
-        deleted_at TEXT
+        deleted_at TEXT,
+        is_tombstone INTEGER DEFAULT 0  -- R44 7.2: tombstone 标记列,使 _is_crdb_table_supports_soft_delete() 返回 True
     )""",
     """CREATE TABLE IF NOT EXISTS decode_logs (
         id SERIAL PRIMARY KEY,
@@ -136,7 +138,8 @@ DDL_STATEMENTS = [
         rotation_started_at TEXT,
         created_at TEXT,
         updated_at TEXT,
-        deleted_at TEXT
+        deleted_at TEXT,
+        is_tombstone INTEGER DEFAULT 0  -- R44 7.2: tombstone 标记列,使 _is_crdb_table_supports_soft_delete() 返回 True
     )""",
     """CREATE TABLE IF NOT EXISTS codes (
         code TEXT PRIMARY KEY,
@@ -149,7 +152,8 @@ DDL_STATEMENTS = [
         status TEXT DEFAULT 'active',
         created_at TEXT,
         expire_time TEXT,
-        deleted_at TEXT
+        deleted_at TEXT,
+        is_tombstone INTEGER DEFAULT 0  -- R44 7.2: tombstone 标记列,使 _is_crdb_table_supports_soft_delete() 返回 True
     )""",
     """CREATE TABLE IF NOT EXISTS jobs (
         id SERIAL PRIMARY KEY,
@@ -286,6 +290,12 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS deleted_at TEXT",
     "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS deleted_at TEXT",
     "ALTER TABLE IF EXISTS cells ADD COLUMN IF NOT EXISTS deleted_at TEXT",
+    # R44 7.2: 添加 is_tombstone 列,使 _is_crdb_table_supports_soft_delete() 返回 True,
+    # tombstone 走 soft_delete 路径(UPDATE deleted_at + is_tombstone=1)而非 DELETE fallback
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS is_tombstone INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS is_tombstone INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS is_tombstone INTEGER DEFAULT 0",
+    "ALTER TABLE IF EXISTS cells ADD COLUMN IF NOT EXISTS is_tombstone INTEGER DEFAULT 0",
     # R40 P1-11: users 表增加 ban_expires_at 列(临时封禁到期自动解封依据)
     # ban_user 写入,check_user_banned/cleanup_expired_bans 读取判定。
     # NULL 表示永久封禁;非空 ISO 时间字符串表示临时封禁到期时间。

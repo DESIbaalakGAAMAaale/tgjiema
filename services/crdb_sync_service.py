@@ -1013,6 +1013,10 @@ async def _is_crdb_table_supports_soft_delete(table_name: str) -> bool:
     结果缓存到 _CRDB_SOFT_DELETE_CACHE 避免重复查询。
     查询失败或 CRDB 未连接时 fail-safe 返回 False(fallback 到 hard delete + audit_log)。
 
+    R44 7.2: database/session.py 已为 users/file_records/codes/cells 表添加 is_tombstone 列
+    (DDL_VERSION=10 + MIGRATION_STATEMENTS ALTER TABLE),迁移执行后此函数返回 True,
+    tombstone 走 soft_delete 路径(UPDATE deleted_at + is_tombstone=1)而非 DELETE fallback。
+
     Args:
         table_name: CRDB 表名
 

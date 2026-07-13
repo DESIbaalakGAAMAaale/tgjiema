@@ -57,10 +57,10 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@c00f4eadedb4425fdb99ca4a61a8d41d305f9e8e
 
     - name: Parse PYTHON_IMAGE from Dockerfile
       id: parse
@@ -71,7 +71,7 @@ jobs:
         echo "解析到 PYTHON_IMAGE: ${IMAGE_REF}"
 
     - name: Build Docker image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@ca052bb21890e5b8935ab15b5b5d2d803b96555e
       with:
         context: .
         push: false
@@ -93,7 +93,7 @@ jobs:
   docker-digest-verify:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Verify Docker digest pullability
       run: |
@@ -107,7 +107,7 @@ jobs:
   compose-config:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Generate minimal secrets placeholders
       run: |
@@ -149,10 +149,10 @@ jobs:
   redis-acl-matrix:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
 
@@ -179,10 +179,10 @@ jobs:
   schema-diff:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
 
@@ -202,10 +202,10 @@ jobs:
   backup-restore-drill:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
 
@@ -233,10 +233,10 @@ jobs:
   sbom:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
 
@@ -261,7 +261,7 @@ jobs:
         "
 
     - name: Upload SBOM artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@6f51ac03b9289b47c7d4e1ce4c0bae89999e5c4a
       with:
         name: release-gates-sbom
         path: sbom.json
@@ -272,10 +272,10 @@ jobs:
   pip-audit:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
 
@@ -294,12 +294,12 @@ jobs:
   trivy:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
       with:
         fetch-depth: 0
 
     - name: Run Trivy filesystem scan
-      uses: aquasecurity/trivy-action@master
+      uses: aquasecurity/trivy-action@0cdd7f323fe21d00d79ec6e8c0a6d5d8d1e8c5b3
       with:
         scan-type: fs
         scan-ref: .
@@ -311,6 +311,8 @@ jobs:
 
   # ─── 10. sign-image (R43 P0-2: 真实签名,移除 placeholder) ─────────
   # R43 P0-2: cosign 镜像签名必须真实执行,不允许占位通过
+  # R44: 升级为真实镜像签名(GHCR 推送 + cosign sign + SLSA attestation),
+  #      保留源 tarball 签名作为补充
   sign-image:
     runs-on: ubuntu-latest
     needs: [docker-build]
@@ -318,18 +320,51 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      packages: write   # R44: 推送 OCI 镜像到 GHCR 必需
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Install cosign
-      uses: sigstore/cosign-installer@v3
+      uses: sigstore/cosign-installer@d5a1f6b4e13a0ea7e9a9c6cb6a0e1ecf6abc3fa2
       with:
         cosign-release: 'v2.2.3'
 
+    # R44: 真实 OCI 镜像签名流水线(替代占位步骤)
+    - name: Login to GHCR
+      uses: docker/login-action@5e57cd0e98cb3fe2d6a0d32ab78c4e58b41a472d
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push OCI image
+      id: build
+      uses: docker/build-push-action@ca052bb21890e5b8935ab15b5b5d2d803b96555e
+      with:
+        context: .
+        push: true
+        tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+        provenance: true
+        sbom: true
+
+    - name: Sign OCI image with cosign (keyless)
+      run: |
+        cosign sign --yes ghcr.io/${{ github.repository }}:${{ github.sha }}
+      env:
+        COSIGN_EXPERIMENTAL: 1
+
+    - name: Generate SLSA build provenance attestation
+      uses: actions/attest-build-provenance@9fb5471c3ec986f524cffa6dbb9b54b3f4d12b3a
+      with:
+        subject-name: ghcr.io/${{ github.repository }}
+        subject-digest: sha256:${{ steps.build.outputs.digest }}
+        push-to-registry: true
+
+    # R44: 保留源 tarball 签名作为补充(与镜像签名独立)
     - name: Sign source artifact with cosign (keyless)
       run: |
         # R43 P0-2: 真实 cosign 签名(不再占位通过)
-        # 签名源代码 tarball(镜像推送流水线启用后再加镜像签名)
+        # 签名源代码 tarball 作为补充签名制品
         git archive --format=tar.gz --prefix=tgjiema-${{ github.sha }}/ HEAD -o tgjiema-${{ github.sha }}.tar.gz
         sha256sum tgjiema-${{ github.sha }}.tar.gz > tgjiema-${{ github.sha }}.tar.gz.sha256
         # Sigstore keyless 签名(使用 GitHub OIDC 身份)
@@ -341,7 +376,7 @@ jobs:
 
     - name: Upload signed artifacts
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@6f51ac03b9289b47c7d4e1ce4c0bae89999e5c4a
       with:
         name: release-gates-signed-${{ github.sha }}
         path: |
@@ -350,3 +385,23 @@ jobs:
           tgjiema-${{ github.sha }}.pem
           tgjiema-${{ github.sha }}.sig
         retention-days: 90
+
+  # ─── R44: branch protection 审计 ─────────────────────────────
+  # 验证 master 分支已配置 branch protection(必需 status checks + PR review)
+  verify-branch-protection:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
+    - name: Verify branch protection is configured
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # 检查 master 分支是否启用了 branch protection
+        RESPONSE=$(gh api repos/${{ github.repository }}/branches/master/protection 2>&1) || true
+        if echo "$RESPONSE" | grep -q "Branch not protected"; then
+          echo "::warning::Branch protection 未配置,请运行 scripts/configure_branch_protection.sh"
+          exit 1
+        else
+          echo "Branch protection 已配置"
+          echo "$RESPONSE" | jq '.required_status_checks.contexts'
+        fi

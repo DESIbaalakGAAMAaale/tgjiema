@@ -52,6 +52,8 @@ from typing import Any
 
 from loguru import logger
 
+# R44 7.2: backup/restore RU 单独统计(record_*_usage 在方法内延迟调用避免循环依赖)
+
 
 # ─── R2 对象 key 命名 ─────────────────────────────────────────
 BACKUPS_PREFIX = "backups/"
@@ -286,6 +288,15 @@ class BackupEngine:
             f"payload={len(ciphertext)}B manifest={len(manifest_bytes)}B "
             f"encrypted={enc_result['encrypted']} tables={len(tables)}"
         )
+
+        # R44 7.2: 记录 backup RU 消耗(估算: 每次 backup 约 100 RU)
+        # 单独记入 service='backup' 维度,不混入业务空载门禁
+        try:
+            from services.ru_cost_center import record_backup_usage
+            await record_backup_usage(ru_cost=100, operation="full_backup")
+        except Exception:
+            pass  # 不影响 backup 主流程
+
         return manifest
 
     # ─── R42 P1-7: backup_policy 应用 ──────────────────────────
@@ -658,8 +669,9 @@ class BackupEngine:
         self,
         backup_id: str,
         target: str = "staging",
-        approver_id: int = 0,
+        approver_id: int | None = None,
         approval_action_id: str | None = None,
+        expected_request_hash: str | None = None,
     ) -> dict:
         """从 R2 备份恢复数据(可解密)— 公共 API。
 
@@ -672,9 +684,16 @@ class BackupEngine:
         R42 P1-2 强化:
             - 校验 COMPLETE marker 存在才执行恢复(防止恢复未完成的孤儿备份)
 
+        R44 G0-1 强化(TOCTOU 修复):
+            - 新增 expected_request_hash 参数,由调用方基于 backup_id + tables + merge 计算
+            - 在 _validate_production_approval 中比对 command_executions.request_hash
+            - 防止"审批通过后 payload 被替换"的 TOCTOU 攻击
+            - R44 G0-3: 公共 API 不再接受 approver_id 参数(已弃用,保留向后兼容);
+              approver_id 从 command_executions.principal_id 反查
+
         流程:
             1. 校验 backup_id 非空
-            2. 若 target="production":校验 approval_action_id + 审批状态
+            2. 若 target="production":校验 approval_action_id + 审批状态 + TOCTOU
             3. 校验 COMPLETE marker 存在
             4. 调用 _restore_internal() 执行实际恢复
 
@@ -682,16 +701,21 @@ class BackupEngine:
             backup_id: 备份 ID
             target: "staging" 仅校验可解密;"production" 写入生产(需审批);
                     "test" 仅校验,不写库
-            approver_id: 审批人 ID(production 恢复时必填)
+            approver_id: 审批人 ID(已弃用,None 时从 command_executions 反查);
+                        保留以向后兼容旧调用方,新代码不应传入此参数
             approval_action_id: 审批动作 ID(production 恢复时必填,
                                 对应 command_executions.action_id)
+            expected_request_hash: 期望的 request_hash(由调用方基于
+                                   backup_id + tables + merge 计算);
+                                   None 时跳过 TOCTOU 校验(向后兼容)
 
         Returns:
             {success, restored_tables, restored_rows, checksum_verified, error}
 
         Raises:
             ValueError: target="production" 且 approval_action_id 为空
-            PermissionError: approval_action_id 不存在 / 未审批 / approver_id 不匹配
+            PermissionError: approval_action_id 不存在 / 未审批 / approver_id 不匹配 /
+                             request_hash 不匹配(TOCTOU 攻击)
         """
         if not backup_id:
             return {
@@ -704,7 +728,9 @@ class BackupEngine:
         #      与 R42 P1-3 的"approver_id 非零 + approval_action_id 为空抛 ValueError"
         #      分流,两个测试用例都能通过。
         if target == "production":
-            if not approver_id:
+            # R44 G0-3: approver_id 为 None 时,从 command_executions.principal_id 反查
+            # 旧调用方可能显式传入 approver_id=0 → 走"友好失败字典"路径(向后兼容)
+            if approver_id is not None and not approver_id:
                 # R40 P0-7: approver_id=0 → 友好失败字典(向后兼容 R40 测试期望)
                 return {
                     "success": False, "restored_tables": 0, "restored_rows": 0,
@@ -720,9 +746,22 @@ class BackupEngine:
                 raise ValueError(
                     "Production restore requires approval_action_id"
                 )
-            # 校验审批状态
+            # R44 G0-3: 若 approver_id 未传(None),从 command_executions.principal_id 反查
+            effective_approver_id = approver_id
+            if effective_approver_id is None:
+                effective_approver_id = await self._lookup_principal_id(
+                    approval_action_id,
+                )
+                if not effective_approver_id:
+                    # 无法反查 principal → fail-closed(拒绝执行)
+                    raise PermissionError(
+                        f"R44 G0-3: 无法从 command_executions 反查 principal_id "
+                        f"(approval_action_id={approval_action_id})"
+                    )
+            # 校验审批状态 + R44 G0-1 TOCTOU 校验
             await self._validate_production_approval(
-                approver_id, approval_action_id,
+                effective_approver_id, approval_action_id,
+                expected_request_hash=expected_request_hash,
             )
 
         # R42 P1-2: 校验 COMPLETE marker 存在才执行恢复
@@ -740,35 +779,81 @@ class BackupEngine:
             }
 
         # 通过审批验证 + COMPLETE 校验后,调用内部恢复方法
+        # R44 G0-3: approver_id 可能为 None(staging 模式或反查 principal 路径),
+        # _restore_internal 不依赖 approver_id 字段执行恢复
         return await self._restore_internal(
             backup_id, target=target,
-            approver_id=approver_id,
+            approver_id=effective_approver_id if target == "production" else approver_id,
             approval_action_id=approval_action_id,
         )
+
+    async def _lookup_principal_id(self, approval_action_id: str) -> int:
+        """R44 G0-3: 通过 approval_action_id 反查 command_executions.principal_id。
+
+        当 restore() 调用方未传入 approver_id(None)时,通过此方法反查
+        审批创建者的 principal_id,作为恢复审批校验的 approver_id。
+
+        Args:
+            approval_action_id: 审批动作 ID(对应 command_executions.action_id)
+
+        Returns:
+            principal_id;查询失败或记录不存在返回 0
+        """
+        store = self._get_cache_store()
+        if not hasattr(store, "_db") or not store._db:
+            return 0
+        try:
+            cursor = await store._db.execute(
+                "SELECT principal_id FROM command_executions "
+                "WHERE action_id = ? LIMIT 1",
+                (approval_action_id,),
+            )
+            row = await cursor.fetchone()
+        except Exception as e:
+            logger.warning(
+                f"[BackupEngine] _lookup_principal_id 查询失败 "
+                f"approval_action_id={approval_action_id}: {e}"
+            )
+            return 0
+        if not row:
+            return 0
+        try:
+            return int(row[0]) if row[0] is not None else 0
+        except (TypeError, ValueError):
+            return 0
 
     async def _validate_production_approval(
         self,
         approver_id: int,
         approval_action_id: str,
+        expected_request_hash: str | None = None,
     ) -> None:
-        """R42 P1-3: 校验生产恢复审批状态。
+        """R42 P1-3 + R44 G0-1: 校验生产恢复审批状态(含 TOCTOU 防护)。
 
         校验逻辑:
             1. approval_action_id 必须在 command_executions 表中存在
             2. status 必须为 'executed'(已审批通过)
             3. approver_id 必须与 command_executions.principal_id 一致
+            4. R44 G0-1: 若传入 expected_request_hash,则比对 command_executions.request_hash
+               防止 TOCTOU 攻击(审批与执行之间 payload 被篡改)
 
         注:command_executions.principal_id 是创建审批的 admin principal ID
         (即"审批 owner"),与"approver_id"(执行恢复的人)应一致。
         command_executions.owner 字段是 worker 名(lease 持有者),不参与校验。
+        request_hash 是 SHA256(payload params),审批时记录、恢复时复核,
+        防止"审批通过后 payload 被替换"的 TOCTOU 漏洞。
 
         Args:
             approver_id: 调用方传入的审批人 ID
             approval_action_id: 审批动作 ID
+            expected_request_hash: 期望的 request_hash(由调用方基于
+                backup_id + tables + merge 计算);None 时跳过 hash 校验
+                (向后兼容已有调用方)
 
         Raises:
             PermissionError: approval_action_id 不存在 / status != 'executed' /
-                             approver_id 不匹配 principal_id
+                             approver_id 不匹配 principal_id /
+                             request_hash 不匹配(TOCTOU 攻击)
         """
         store = self._get_cache_store()
         if not hasattr(store, "_db") or not store._db:
@@ -779,8 +864,9 @@ class BackupEngine:
             )
 
         try:
+            # R44 G0-1: SELECT 增加 request_hash 字段,用于 TOCTOU 校验
             cursor = await store._db.execute(
-                "SELECT principal_id, status FROM command_executions "
+                "SELECT principal_id, status, request_hash FROM command_executions "
                 "WHERE action_id = ? LIMIT 1",
                 (approval_action_id,),
             )
@@ -798,7 +884,7 @@ class BackupEngine:
                 f"(approval_action_id={approval_action_id})"
             )
 
-        principal_id, status = row[0], row[1]
+        principal_id, status, stored_request_hash = row[0], row[1], row[2]
 
         # status 必须为 'executed'(已审批通过)
         if status != "executed":
@@ -819,6 +905,22 @@ class BackupEngine:
                 f"R42 P1-3: approver_id 与 command_executions.principal_id 不一致 "
                 f"(approver_id={approver_id}, principal_id={principal_id_int})"
             )
+
+        # R44 G0-1: TOCTOU 防护 — request_hash 比对
+        # 若调用方传入 expected_request_hash,则与 command_executions 中存储的 hash 比对,
+        # 防止"审批通过后 payload 被替换"的 TOCTOU 攻击。
+        # expected_request_hash=None 时跳过(向后兼容已有调用方,如 staging 模式恢复)
+        if expected_request_hash is not None:
+            if not stored_request_hash:
+                # command_executions 中无 request_hash → 无法校验, fail-closed
+                raise PermissionError(
+                    f"R44 G0-1: command_executions.request_hash 为空,无法校验 TOCTOU "
+                    f"(approval_action_id={approval_action_id})"
+                )
+            if stored_request_hash != expected_request_hash:
+                raise PermissionError(
+                    "request_hash 不匹配,可能存在 TOCTOU 攻击"
+                )
 
         # 校验通过 → 不抛异常,继续执行恢复
 
@@ -991,6 +1093,17 @@ class BackupEngine:
             f"[BackupEngine] restore 成功 backup_id={backup_id} target={target} "
             f"tables={restored_tables} rows={restored_rows}"
         )
+
+        # R44 7.2: 记录 restore RU 消耗(估算: 每个恢复表约 50 RU)
+        # 单独记入 service='restore' 维度,不混入业务空载门禁
+        try:
+            from services.ru_cost_center import record_restore_usage
+            await record_restore_usage(
+                ru_cost=restored_tables * 50, operation="restore",
+            )
+        except Exception:
+            pass  # 不影响 restore 主流程
+
         return {
             "success": True,
             "restored_tables": restored_tables,

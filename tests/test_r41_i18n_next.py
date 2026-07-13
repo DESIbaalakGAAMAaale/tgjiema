@@ -177,11 +177,12 @@ class TestFormatMessage:
         assert "None" not in result, f"format_message 应将 None 转为空字符串,实际: {result}"
 
     def test_format_message_missing_key_returns_key(self):
-        """format_message 找不到 key 时应回退到 key 本身(与 translate 一致)。"""
+        """R44 6.2: format_message 找不到 key 时应返回安全通用文案(不暴露内部 key)。"""
         manager = self._get_manager()
         result = manager.format_message("nonexistent.key.path", locale="zh-CN", var="x")
-        # 找不到 key 时返回 key 本身(无占位符可替换)
-        assert "nonexistent.key.path" in result
+        # R44 6.2: 行为变更 - 不再返回 key 本身,改为安全通用文案
+        assert "nonexistent.key.path" not in result, f"不应暴露内部 key,实际: {result}"
+        assert len(result) > 0, "应返回非空安全文案"
 
     def test_format_message_no_kwargs(self):
         """format_message 无 kwargs 时应等价于 translate。"""

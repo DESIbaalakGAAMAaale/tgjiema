@@ -336,11 +336,24 @@ class TestFormatMessage:
     """R42 P1-8: format_message 显式格式化接口。"""
 
     def test_missing_key_returns_key_itself(self, i18n_module):
-        """缺失 key 时返回 key 本身。"""
-        result = i18n_module.get_i18n_manager().format_message(
+        """R44 6.2: 缺失 key 时返回安全通用文案(不暴露内部 key)。
+
+        旧行为: 返回 key 本身(暴露内部 key 给用户)
+        新行为(R44 6.2): 按 key 前缀返回安全通用文案 + 增加 missing_key 计数
+        """
+        manager = i18n_module.get_i18n_manager()
+        # 重置计数器,验证本次调用会触发计数
+        manager.reset_missing_key_count()
+        result = manager.format_message(
             "nonexistent.key.xyz", locale="zh-CN"
         )
-        assert result == "nonexistent.key.xyz"
+        # R44 6.2: 不再返回 key 本身,而是返回安全通用文案
+        assert result != "nonexistent.key.xyz"
+        # 应返回非空的安全文案
+        assert isinstance(result, str)
+        assert len(result) > 0
+        # missing_key 计数应已递增
+        assert manager.get_missing_key_count() >= 1
 
     def test_locale_not_exist_fallback_to_en_us(self, i18n_module):
         """locale 不存在时 fallback 到 en-US。"""

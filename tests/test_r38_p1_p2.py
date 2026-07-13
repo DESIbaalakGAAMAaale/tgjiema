@@ -363,9 +363,10 @@ class TestP1_9PrometheusExporter:
         )
 
     def test_ci_includes_prometheus_exporter(self):
-        content = _read_file(".github/workflows/ci.yml")
+        # R44: prometheus_exporter 服务在 release-gates.yml 的 docker-compose 校验中
+        content = _read_file(".github/workflows/release-gates.yml")
         assert "prometheus_exporter" in content, (
-            "P1-9: ci.yml 缺少 prometheus_exporter 服务"
+            "P1-9: release-gates.yml 缺少 prometheus_exporter 服务"
         )
 
     def test_settings_has_prometheus_role(self):

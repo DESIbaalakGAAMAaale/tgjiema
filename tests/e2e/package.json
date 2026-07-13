@@ -1,0 +1,15 @@
+{
+  "name": "tgjiema-e2e",
+  "version": "1.0.0",
+  "description": "R44 G0-4: Admin bootstrap/Session/MFA Playwright E2E + WCAG 2.2 AA 无障碍测试",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.0",
+    "@axe-core/playwright": "^0.1.0"
+  }
+}

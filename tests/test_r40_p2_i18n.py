@@ -290,13 +290,15 @@ class TestI18nManagerRuntime:
         assert "5" in msg, f"插值应替换 {{count}} 为 5,实际: {msg}"
 
     def test_translate_missing_key_returns_key(self):
-        """找不到 key 时应返回 key 本身。"""
+        """R44 6.2: 找不到 key 时应返回安全通用文案,不暴露内部 key。"""
         manager = self._try_init_manager()
         if manager is None:
             return
         manager.load_locale("zh-CN")
         msg = manager.translate("nonexistent.key.path", locale="zh-CN")
-        assert msg == "nonexistent.key.path", f"找不到的 key 应返回本身,实际: {msg}"
+        # R44 6.2: 行为变更 - 不再返回 key 本身,改为安全通用文案
+        assert msg != "nonexistent.key.path", f"不应返回 key 本身,实际: {msg}"
+        assert len(msg) > 0, "应返回非空安全文案"
 
     def test_translate_empty_key_returns_empty(self):
         """空 key 应返回空字符串。"""

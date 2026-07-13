@@ -18,19 +18,31 @@
 - services/command_bus.py         (CommandBus 本身)
 - services/approval_workflow.py   (审批后入队 command_outbox)
 - services/backup_engine.py       (高风险 API 的定义文件)
+- services/effect_receipts.py     (R44 新增:外部副作用 receipt 管理器)
 - services/content_reports.py     (高风险 API 的定义文件)
 - services/rbac.py                (高风险 API 的定义文件)
 - services/maintenance_mode.py    (高风险 API 的定义文件)
-- services/disaster_recovery.py   (灾备恢复执行器,合法调用)
-- services/db_restore.py          (数据库恢复执行器,合法调用)
-- services/db_backup.py           (数据库备份执行器,合法调用)
 - tests/                          (测试代码)
 - scripts/                        (运维脚本)
+
+R44 G0-3: backup_engine.restore 白名单收紧
+- 不再允许 services/disaster_recovery.py / services/db_restore.py /
+  services/db_backup.py 直接调用 backup_engine.restore(必须通过
+  ApprovalExecutor → CommandBus 调度链,统一审批 + 审计)
+- 仅允许以下文件直接调用 backup_engine.restore:
+  * services/approval_executor.py  (执行 CommandBus 调度的高风险操作)
+  * services/command_bus.py         (CommandBus 本身,通过 handler 调用)
+  * services/approval_workflow.py   (审批后入队 command_outbox)
+  * services/backup_engine.py       (定义文件本身)
+  * services/effect_receipts.py     (新文件,通过 receipt 跟踪副作用)
 
 禁止的调用方(必须检测):
 - bots/                  (Bot handler 不能直接调用高风险 API)
 - admin/                 (Admin Web 不能直接调用)
 - services/r40_scheduler.py (定时任务不能直接调用)
+- services/disaster_recovery.py (R44 G0-3: 必须通过 ApprovalExecutor)
+- services/db_restore.py          (R44 G0-3: 必须通过 ApprovalExecutor)
+- services/db_backup.py           (R44 G0-3: 必须通过 ApprovalExecutor)
 
 CI 调用方式(在 .github/workflows/release-gates.yml 中添加):
     - name: CommandBus 静态门禁
@@ -66,6 +78,9 @@ HIGH_RISK_PATTERNS: list[tuple[str, str]] = [
 
 # 允许的调用方路径前缀(相对 REPO_ROOT,使用 POSIX 路径)
 # 命中任一前缀的文件将被跳过(允许直接调用高风险 API)
+# R44 G0-3: 收紧白名单,强制 production restore 走 ApprovalExecutor 调度链。
+# 移除了 services/disaster_recovery.py / services/db_restore.py / services/db_backup.py
+# — 这些模块只能通过 ApprovalExecutor → CommandBus 调度链间接触发 restore。
 ALLOWED_PREFIXES: list[str] = [
     # CommandBus 调度链(任务明确允许)
     "services/approval_executor.py",
@@ -73,13 +88,10 @@ ALLOWED_PREFIXES: list[str] = [
     "services/approval_workflow.py",
     # 高风险 API 的定义文件自身(允许定义 + 内部实现调用)
     "services/backup_engine.py",
+    "services/effect_receipts.py",  # R44 新增:effect_receipts 副作用跟踪
     "services/content_reports.py",
     "services/rbac.py",
     "services/maintenance_mode.py",
-    # 灾备 / 数据库恢复执行器(合法调用高风险 API)
-    "services/disaster_recovery.py",
-    "services/db_restore.py",
-    "services/db_backup.py",
     # 测试与运维脚本
     "tests/",
     "scripts/",

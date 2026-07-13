@@ -276,7 +276,12 @@ async def verify_backup(backup_id: str) -> dict:
 
 # ─── 4. 恢复备份 ──────────────────────────────────────────────
 
-async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> dict:
+async def restore(
+    backup_id: str,
+    admin_id: int = 0,
+    approver_id: int = 0,
+    approval_action_id: str | None = None,
+) -> dict:
     """恢复备份(R40 P0-7: 调用 BackupEngine.restore 可解密加密备份)。
 
     R40 P0-7 修复:
@@ -287,13 +292,24 @@ async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> di
     R40 P0-8: 生产恢复必须审批(approver_id 非零),由 CommandBus 调用本函数。
     旧调用方仍可传 admin_id,本函数将 admin_id 透传给 approver_id 以保持向后兼容。
 
+    R44 G0-3 整改: 灾备恢复必须通过 ApprovalExecutor 调用,不接受任意 approver_id。
+    - 新增 ``approval_action_id`` 参数(必填),对应 command_executions.action_id
+    - BackupEngine.restore() 通过 approval_action_id 反查 principal_id 并校验审批状态
+    - 不传 approval_action_id → 抛 ValueError(强制走审批流)
+    - approver_id 参数保留向后兼容,但优先使用 approval_action_id 反查的 principal
+
     Args:
         backup_id: 备份 ID(R40 P0-7 格式 backup_YYYYMMDD_HHMMSS_xxxxxxxx)
         admin_id: 操作者 admin_id(向后兼容)
-        approver_id: 审批人 ID(生产恢复必填;为 0 时回退到 admin_id)
+        approver_id: 审批人 ID(已弃用,保留向后兼容;优先用 approval_action_id 反查)
+        approval_action_id: 审批动作 ID(必填,对应 command_executions.action_id,
+                            必须由审批流通过 ApprovalExecutor 调用恢复时注入)
 
     Returns:
         {success, restored_tables, duration_seconds, error}
+
+    Raises:
+        ValueError: approval_action_id 为空(灾备恢复必须通过审批流)
     """
     if not backup_id:
         return {
@@ -301,7 +317,17 @@ async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> di
             "duration_seconds": 0, "error": "backup_id 为空",
         }
 
+    # R44 G0-3: 灾备恢复必须通过 ApprovalExecutor 调用,不接受任意 approver_id
+    # approval_action_id 必须由审批流通过 ApprovalExecutor 调用恢复时注入
+    if not approval_action_id:
+        raise ValueError(
+            "disaster_recovery production restore requires approval_action_id "
+            "from approval workflow"
+        )
+
     # 审批人 ID:优先 approver_id,fallback admin_id(向后兼容旧调用方)
+    # R44 G0-3: 仅用于审计日志,审批校验由 BackupEngine.restore 通过
+    # approval_action_id 反查 principal_id 完成
     effective_approver = approver_id or admin_id
 
     start_ts = _time.time()
@@ -309,9 +335,11 @@ async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> di
         from services.backup_engine import BackupEngine
         engine = BackupEngine()
 
-        # 生产恢复(target=production)需要审批人
+        # R44 G0-3: 生产恢复必须传 approval_action_id,不传 approver_id
+        # 让 BackupEngine.restore 从 command_executions.principal_id 反查
         result = await engine.restore(
-            backup_id, target="production", approver_id=effective_approver,
+            backup_id, target="production",
+            approval_action_id=approval_action_id,
         )
 
         success = result.get("success", False)
@@ -324,7 +352,7 @@ async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> di
             action="restore_backup",
             target_type="backup",
             target_id=backup_id,
-            details=f"restored_tables={restored_tables} checksum_verified={result.get('checksum_verified')} error={error}",
+            details=f"restored_tables={restored_tables} checksum_verified={result.get('checksum_verified')} error={error} approval_action_id={approval_action_id}",
         )
 
         # 记录到 recovery_history
@@ -332,6 +360,7 @@ async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> di
             "backup_id": backup_id,
             "admin_id": admin_id or effective_approver,
             "approver_id": effective_approver,
+            "approval_action_id": approval_action_id,
             "executed_at": _dt.datetime.now().isoformat(),
             "success": success,
             "restored_tables": restored_tables,
@@ -360,6 +389,7 @@ async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> di
             "backup_id": backup_id,
             "admin_id": admin_id or effective_approver,
             "approver_id": effective_approver,
+            "approval_action_id": approval_action_id,
             "executed_at": _dt.datetime.now().isoformat(),
             "success": False,
             "restored_tables": 0,

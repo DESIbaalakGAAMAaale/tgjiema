@@ -49,10 +49,60 @@
         .alert-warning { background: #fffbe6; border: 1px solid #ffe58f; color: #ad6800; }
         .alert-danger { background: #fff2f0; border: 1px solid #ffccc7; color: #a8071a; }
         .alert-info { background: #e6f7ff; border: 1px solid #91d5ff; color: #003a8c; }
+        /* R44 6.4: 无障碍 skip-link,键盘 Tab 跳到主内容(WCAG 2.2 AA 2.4.1 Bypass Blocks) */
+        .skip-link {
+            position: absolute;
+            top: -40px;
+            left: 0;
+            background: #000;
+            color: #fff;
+            padding: 8px 16px;
+            z-index: 100;
+            transition: top 0.3s;
+            font-size: 14px;
+            text-decoration: none;
+            border-radius: 0 0 4px 0;
+        }
+        .skip-link:focus {
+            top: 0;
+            outline: 2px solid #1890ff;
+            outline-offset: 2px;
+        }
+        /* 焦点可见性增强(WCAG 2.2 AA 2.4.7 Focus Visible / 2.4.11 Focus Not Obscured) */
+        a:focus, button:focus, input:focus, select:focus, textarea:focus {
+            outline: 2px solid #1890ff;
+            outline-offset: 2px;
+        }
+        /* R44 6.2: 语言切换器样式 */
+        .locale-switcher {
+            display: inline-flex;
+            gap: 4px;
+            margin-left: 12px;
+            font-size: 12px;
+        }
+        .locale-switcher a {
+            padding: 2px 8px;
+            border-radius: 3px;
+            color: #8c8c8c;
+            text-decoration: none;
+            border: 1px solid transparent;
+        }
+        .locale-switcher a:hover {
+            color: #1890ff;
+            border-color: #91d5ff;
+        }
+        .locale-switcher a.current {
+            color: #1890ff;
+            background: #e6f7ff;
+            border-color: #91d5ff;
+            font-weight: 600;
+        }
     </style>
     {% block head_extra %}{% endblock %}
 </head>
-<body>
+<body role="document">
+    <!-- R44 6.4: 无障碍 skip-link,键盘用户可跳过导航直奔主内容(WCAG 2.4.1 Bypass Blocks) -->
+    <a href="#main-content" class="skip-link">跳到主要内容</a>
     <div class="sidebar">
         <h2>TG解码器管理</h2>
         <div class="nav-group">基础</div>
@@ -75,11 +125,16 @@
         <a href="/maintenance" aria-label="维护模式" {% if request.url.path == '/maintenance' %}class="active"{% endif %}>维护模式</a>
         <a href="/disaster-recovery" aria-label="灾备控制台" {% if request.url.path == '/disaster-recovery' %}class="active"{% endif %}>灾备控制台</a>
     </div>
-    <div class="main">
+    <div class="main" id="main-content" role="main">
         <div class="header">
             <h1>{% block page_title %}管理后台{% endblock %}</h1>
             <div class="admin-info">
                 {% if admin %}管理员: {{ admin.username if admin is mapping or admin is not string else admin }}{% endif %}
+                <!-- R44 6.2: 语言切换器 — 调用 /locale?lang=xx 端点持久化 locale -->
+                <span class="locale-switcher" role="group" aria-label="语言切换 / Language switcher">
+                    <a href="/locale?lang=zh-CN" {% if locale | default('zh-CN') == 'zh-CN' %}class="current" aria-current="true"{% endif %}>中文</a>
+                    <a href="/locale?lang=en-US" {% if locale | default('zh-CN') == 'en-US' %}class="current" aria-current="true"{% endif %}>English</a>
+                </span>
             </div>
         </div>
         {% block content %}{% endblock %}

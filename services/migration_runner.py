@@ -37,6 +37,8 @@ from typing import Any
 
 from loguru import logger
 
+# R44 7.2: 延迟导入避免循环依赖(record_migration_usage 在函数内调用)
+
 
 # R38 P0-5: DDL/MIGRATION 可忽略错误白名单(精确匹配,防止误吞严重错误)
 # - "already exists": CREATE TABLE/INDEX 已存在(CRDB/PostgreSQL 标准 message)
@@ -274,6 +276,20 @@ async def run_migration(
             f"(版本 {DDL_VERSION}, 总语句 {result['statements_total']}, "
             f"失败 {result['statements_failed']}, 严重错误 {len(result['errors'])})"
         )
+
+        # R44 7.2: 记录 migration RU 消耗(估算: 每个 DDL/MIGRATION 语句约 5 RU)
+        # 单独记入 service='migration' 维度,不混入业务空载门禁
+        try:
+            from services.ru_cost_center import record_migration_usage
+            await record_migration_usage(
+                ru_cost=result["statements_total"] * 5,
+                operation="ddl_migration",
+            )
+        except Exception as _ru_err:
+            logger.warning(
+                f"[migration] R44 7.2: record_migration_usage 失败(不影响迁移): {_ru_err}"
+            )
+
         return result
 
     finally:

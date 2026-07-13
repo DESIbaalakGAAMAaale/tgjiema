@@ -17,7 +17,7 @@
     - locale 文件存放于 locales/ 目录(zh-CN.json / en-US.json)
     - 翻译 key 采用点分命名空间(errors.xxx / ui.xxx / bot.xxx)
     - 支持 {placeholder} 插值(如 "quota_remaining": "剩余 {count} 次")
-    - 找不到 key 时回退到默认 locale,再回退到 key 本身
+    - 找不到 key 时回退到默认 locale,再回退到安全通用文案(R44 6.2)
     - 模块加载时缓存 locale 文件(避免重复磁盘读取)
     - 中文注释,loguru 日志
 """
@@ -67,6 +67,8 @@ class I18nManager:
         self._meta: dict[str, dict] = {}
         # 已加载的 locale 文件路径
         self._loaded_files: set[Path] = set()
+        # R44 6.2: missing key 计数器(供 Prometheus 采集)
+        self._missing_key_count: int = 0
 
     def load_locale(self, locale: str) -> bool:
         """加载指定 locale 的 JSON 文件。
@@ -147,7 +149,7 @@ class I18nManager:
         1. 指定 locale 的翻译
         2. 默认 locale 的翻译
         3. fallback locale 的翻译
-        4. key 本身(最后的兜底)
+        4. 安全通用文案(按 key 前缀选择,R44 6.2)
 
         Args:
             key: 翻译 key(如 "errors.quota.decode.exceeded")
@@ -181,9 +183,11 @@ class I18nManager:
                 text = translations[key]
                 break
         if text is None:
-            # 找不到翻译,返回 key 本身
+            # R44 6.2: 找不到翻译时返回安全通用文案,不暴露内部 key
             logger.debug(f"[i18n] 翻译 key 未找到: {key}(locale={target_locale})")
-            text = key
+            text = self._get_safe_fallback_message(key, target_locale)
+            # R44 6.2: 累计 missing key 计数(供 Prometheus 采集)
+            self._missing_key_count += 1
         # 插值(支持 {placeholder} 格式)
         if kwargs and "{" in text and "}" in text:
             try:
@@ -254,6 +258,71 @@ class I18nManager:
             self.load_locale(target_locale)
         translations = self._translations.get(target_locale, {})
         return key in translations
+
+    def _get_safe_fallback_message(self, key: str, locale: str) -> str:
+        """R44 6.2: key 缺失时返回安全通用文案,不暴露内部 key。
+
+        回退策略:
+            1. 按 key 前缀(errors./bot./ui./admin./common.)选择通用 fallback key
+            2. 尝试从目标 locale 读取 fallback key 翻译
+            3. 失败则尝试默认 locale 与 fallback locale
+            4. 最终兜底为硬编码安全文案(中英文双语)
+
+        Args:
+            key: 原始翻译 key(用于判断前缀)
+            locale: 目标 locale
+
+        Returns:
+            安全通用文案字符串
+        """
+        # 按 key 前缀选择通用 fallback key
+        prefix_map = {
+            "errors.": "errors.generic.fallback",
+            "bot.": "bot.unknown_error",
+            "ui.": "common.no_data",
+            "admin.": "admin.generic.fallback",
+            "common.": "common.no_data",
+            "accessibility.": "common.no_data",
+        }
+        fallback_key = "errors.generic.fallback"
+        for prefix, fk in prefix_map.items():
+            if key.startswith(prefix):
+                fallback_key = fk
+                break
+        # 尝试从目标/默认/fallback locale 读取 fallback key
+        candidates = [locale, self.default_locale, _FALLBACK_LOCALE]
+        seen: set[str] = set()
+        for loc in candidates:
+            if loc in seen:
+                continue
+            seen.add(loc)
+            if loc not in self._translations:
+                self.load_locale(loc)
+            translations = self._translations.get(loc)
+            if translations and fallback_key in translations:
+                return translations[fallback_key]
+        # 最终兜底:硬编码安全文案(中英文双语)
+        if locale and locale.startswith("en"):
+            return "An error occurred. Please try again later."
+        return "操作失败,请稍后重试。"
+
+    def get_missing_key_count(self) -> int:
+        """R44 6.2: 返回 missing key 累计计数。
+
+        供 Prometheus exporter 采集为 tgjiema_i18n_missing_key_total 指标。
+
+        Returns:
+            累计 missing key 次数
+        """
+        return self._missing_key_count
+
+    def reset_missing_key_count(self) -> None:
+        """R44 6.2: 重置 missing key 计数为 0。
+
+        供运维巡检或单元测试在重置后重新统计使用。
+        """
+        self._missing_key_count = 0
+        logger.debug("[i18n] missing key 计数器已重置")
 
     def reload_all(self) -> int:
         """重新加载所有已加载的 locale 文件(用于开发期热更新)。
@@ -588,8 +657,11 @@ def set_user_locale(user_id: int, locale: str) -> bool:
         db_path = str(_cs.DB_PATH)
         if not Path(db_path).exists():
             return False
-        conn = sqlite3.connect(db_path, timeout=2)
+        # R44 6.2: timeout 2→15 秒,与主 CacheStore busy_timeout=15000 一致,避免 SQLITE_BUSY
+        conn = sqlite3.connect(db_path, timeout=15)
         try:
+            # R44 6.2: 设置 busy_timeout PRAGMA,与其他 SQLite 连接协调写锁争用
+            conn.execute("PRAGMA busy_timeout=15000")
             # UPDATE users_local SET locale=? WHERE user_id=?
             conn.execute(
                 "UPDATE users_local SET locale=? WHERE user_id=?",
@@ -650,7 +722,7 @@ def format_plural(
         locale: 目标 locale(默认 zh-CN)
 
     Returns:
-        本地化消息(已替换 {count} 占位符);key 缺失时返回 key 本身
+        本地化消息(已替换 {count} 占位符);key 缺失时返回安全通用文案(R44 6.2)
     """
     manager = get_i18n_manager()
     target_locale = locale or _DEFAULT_LOCALE

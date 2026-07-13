@@ -393,14 +393,17 @@ class TestP17CICDWorkflow:
     """P1-7: CI/CD workflow 包含商用发布门禁。"""
 
     def test_ci_workflow_has_release_gates_job(self):
-        """ci.yml 包含 release-gates job(Compose config + migration dry-run + SBOM + 依赖扫描)。"""
+        """R44: release-gates 独立为 release-gates.yml,Migration dry-run 在 ci.yml。"""
         ci_path = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
-        content = ci_path.read_text(encoding="utf-8")
-        assert "release-gates:" in content
-        assert "docker compose config" in content
-        assert "Migration dry-run" in content
-        assert "SBOM" in content or "sbom" in content.lower()
-        assert "pip-audit" in content
+        ci_content = ci_path.read_text(encoding="utf-8")
+        # R44: Migration dry-run 在 ci.yml 的 migration-dry-run job 中
+        assert "Migration dry-run" in ci_content
+        # R44: docker compose config / SBOM / pip-audit 在 release-gates.yml 中
+        rg_path = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "release-gates.yml"
+        rg_content = rg_path.read_text(encoding="utf-8")
+        assert "docker compose config" in rg_content
+        assert "SBOM" in rg_content or "sbom" in rg_content.lower()
+        assert "pip-audit" in rg_content
 
     def test_ci_workflow_has_artifact_signing(self):
         """ci.yml 包含制品签名(Sigstore cosign)。"""

@@ -38,7 +38,10 @@
     "system.rate_limited": "Too many requests, please try again later",
     "system.maintenance": "System under maintenance, please try again later",
     "validation.failed": "Validation failed",
-    "validation.missing_field": "Missing required field"
+    "validation.missing_field": "Missing required field",
+    "generic": {
+      "fallback": "An error occurred. Please try again later."
+    }
   },
   "ui": {
     "admin_login_title": "Admin Login",
@@ -105,7 +108,27 @@
     "session_renewed": "Session renewed",
     "maintenance_in_progress": "System under maintenance, please try again later",
     "file_count_singular": "{count} file",
-    "file_count_plural": "{count} files"
+    "file_count_plural": "{count} files",
+    "mon": {
+      "rotation_complete": "🔄 Channel rotation complete\n\nCurrent window advanced, new window activated\nParams: {active_window_size} active / {files_per_slot} files/{time_per_slot} seconds",
+      "recovered_lost": "🔄 lost channel recovery\n\nRecovered {recovered} channels to shadow2\nRe-joined ring topology, will be promoted in subsequent rotations",
+      "channel_ban_alert": "🚨 Channel ban alert\n\nSlot: {slot_id}\nChannel ID: {channel_id}\nAccount: {account_name}\nStatus: {status}\nError: {error}\n\n",
+      "spare_pool_replaced": "✅ Auto-replaced from {spare_source}\nNew channel ID: {spare_ch}\nAction: direct replacement, no degradation required",
+      "spare_pool_empty": "⚠️ Spare pool has no available channels!\nPlease add spare channels via admin bot:\n/spare_add <channel_id> [account_name]\n",
+      "spare_mark_failed": "⚠️ Spare pool marking failed, replacement skipped: {error}",
+      "topology_rejected": "⚠️ Topology change rejected (CAS failed, awaiting retry)\n",
+      "lost_degrade_rejected": "⚠️ lost degradation rejected (CAS failed, awaiting retry)\n"
+    },
+    "admin_bot": {
+      "usage_user_command": "Usage: /user <user_id>",
+      "user_id_must_be_number": "❌ User ID must be a number",
+      "seq_must_be_number": "❌ Sequence number must be a number. Use /restore to view backup list.",
+      "ban_success_permanent": "✅ User {user_id} banned (permanent)",
+      "ban_failed_retry": "❌ Ban failed, please try again later",
+      "ban_failed_with_error": "❌ Ban failed: {error}",
+      "usage_unban_command": "Usage: /unban <user_id>",
+      "ban_success_duration": "✅ User {user_id} banned ({duration_days} days)"
+    }
   },
   "accessibility": {
     "skip_to_content": "Skip to main content",
@@ -135,7 +158,14 @@
       "too_many_requests": "Too many requests",
       "internal_server_error": "Internal server error",
       "service_unavailable": "Service unavailable",
-      "gateway_timeout": "Gateway timeout"
+      "gateway_timeout": "Gateway timeout",
+      "login_failed": "Invalid username or password",
+      "csrf_failed": "CSRF token verification failed",
+      "rate_limited": "Too many login attempts, please try again in {minutes} minutes",
+      "admin_not_configured": "Admin account not configured. Please set ADMIN_USERNAME and ADMIN_PASSWORD in .env"
+    },
+    "generic": {
+      "fallback": "An error occurred. Please try again later."
     }
   }
 }

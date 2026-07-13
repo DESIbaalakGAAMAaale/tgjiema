@@ -17,6 +17,7 @@ R37 P2-7: 运行时 Prometheus exporter 必须是真实代码(非文档)。
 - relay_spool_disk_usage  relay spool 目录当前字节数
 - relay_spool_usage_ratio relay spool 使用率(0.0-1.0+)
 - relay_spool_high_water  relay spool 是否达高水位(0/1)
+- tgjiema_i18n_missing_key_total i18n key 缺失累计计数(R44 6.2,I18nManager.get_missing_key_count)
 
 R38 P2-7: 高基数 label 禁止规则
   本 exporter 的所有指标均为 gauge 类型,不带高基数 label(如 user_id / file_code /
@@ -628,6 +629,36 @@ def collect_metrics() -> str:
     )
     lines.append("# TYPE tgjiema_readiness_status gauge")
     lines.append(f"tgjiema_readiness_status {1 if readiness['ready'] else 0}")
+
+    # R44 6.2: tgjiema_i18n_missing_key_total — i18n key 缺失累计计数(Counter)
+    # 用于告警:i18n key 缺失可能暴露内部 key 给用户(违反 R44 6.2 安全要求)
+    # 数据来源: services.i18n.I18nManager.get_missing_key_count()
+    # label: locale(低基数,通常 zh-CN / en-US 两种)
+    try:
+        from services.i18n import get_i18n_manager
+
+        i18n_manager = get_i18n_manager()
+        missing_key_total = i18n_manager.get_missing_key_count()
+        # 按当前已加载 locale 拆分(简化为单值,因计数器未按 locale 区分)
+        # 这里输出总计数,label=total 表示聚合值
+        lines.append(
+            "# HELP tgjiema_i18n_missing_key_total Total number of missing "
+            "i18n keys encountered (high values indicate missing translations)"
+        )
+        lines.append("# TYPE tgjiema_i18n_missing_key_total counter")
+        lines.append(
+            f'tgjiema_i18n_missing_key_total{{locale="total"}} '
+            f'{missing_key_total}'
+        )
+    except Exception as e:
+        # i18n 模块未初始化时输出 0,避免 exporter 崩溃
+        logger.debug(f"[R44] i18n missing_key metric 采集失败: {e}")
+        lines.append(
+            "# HELP tgjiema_i18n_missing_key_total Total number of missing "
+            "i18n keys encountered (high values indicate missing translations)"
+        )
+        lines.append("# TYPE tgjiema_i18n_missing_key_total counter")
+        lines.append('tgjiema_i18n_missing_key_total{locale="total"} 0')
 
     return "\n".join(lines) + "\n"
 

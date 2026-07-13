@@ -30,6 +30,24 @@ from services import (
 )
 # R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
 from services.maintenance_mode import require_maintenance_check
+# R44 6.2: i18n 国际化翻译(管理员可见错误文案)
+from services.i18n import get_i18n_manager
+
+
+def _t(user_id: int, key: str, **kwargs) -> str:
+    """R44 6.2: 获取管理员 locale 并翻译 key(带插值)。
+
+    Args:
+        user_id: Telegram 管理员用户 ID(用于查询 locale 偏好)
+        key: 翻译 key(如 "bot.admin_bot.usage_user_command")
+        **kwargs: 插值参数
+
+    Returns:
+        本地化字符串
+    """
+    manager = get_i18n_manager()
+    locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
+    return manager.format_message(key, locale=locale, **kwargs)
 
 
 @_auth_required
@@ -53,12 +71,14 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text("用法:/user <用户ID>")
+        admin_id = update.effective_user.id if update.effective_user else 0
+        await update.message.reply_text(_t(admin_id, "bot.admin_bot.usage_user_command"))
         return
     try:
         user_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ 用户ID必须是数字")
+        admin_id = update.effective_user.id if update.effective_user else 0
+        await update.message.reply_text(_t(admin_id, "bot.admin_bot.user_id_must_be_number"))
         return
 
     user = await _ensure_user(user_id)
@@ -182,11 +202,18 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif cb_result.success:
         ok = cb_result.data.get("ban_ok", False) if cb_result.data else False
         if ok:
-            await update.message.reply_text(f"✅ 用户 {user_id} 已封禁(永久)")
+            admin_id = update.effective_user.id if update.effective_user else 0
+            await update.message.reply_text(
+                _t(admin_id, "bot.admin_bot.ban_success_permanent", user_id=user_id)
+            )
         else:
-            await update.message.reply_text("❌ 封禁失败,请稍后重试")
+            admin_id = update.effective_user.id if update.effective_user else 0
+            await update.message.reply_text(_t(admin_id, "bot.admin_bot.ban_failed_retry"))
     else:
-        await update.message.reply_text(f"❌ 封禁失败: {cb_result.error}")
+        admin_id = update.effective_user.id if update.effective_user else 0
+        await update.message.reply_text(
+            _t(admin_id, "bot.admin_bot.ban_failed_with_error", error=cb_result.error)
+        )
 
 
 @_auth_required
@@ -194,12 +221,14 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """R41 P1-8: /unban 快捷命令 — 走 CommandBus 强制 RBAC(不需审批)。"""
     args = context.args
     if not args:
-        await update.message.reply_text("用法:/unban <用户ID>")
+        admin_id = update.effective_user.id if update.effective_user else 0
+        await update.message.reply_text(_t(admin_id, "bot.admin_bot.usage_unban_command"))
         return
     try:
         user_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ 用户ID必须是数字")
+        admin_id = update.effective_user.id if update.effective_user else 0
+        await update.message.reply_text(_t(admin_id, "bot.admin_bot.user_id_must_be_number"))
         return
 
     from services.command_bus import (
@@ -1604,7 +1633,8 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         seq = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ 序号必须是数字。使用 /restore 查看备份列表。")
+        admin_id = update.effective_user.id if update.effective_user else 0
+        await update.message.reply_text(_t(admin_id, "bot.admin_bot.seq_must_be_number"))
         return
 
     # 解析可选参数 table: 和 merge:
@@ -1903,7 +1933,15 @@ async def cmd_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif result.success:
             ok = result.data.get("ban_ok", False) if result.data else False
             if ok:
-                await update.message.reply_text(f"✅ 用户 {user_id} 已封禁({duration_days}天)")
+                admin_id = update.effective_user.id if update.effective_user else 0
+                await update.message.reply_text(
+                    _t(
+                        admin_id,
+                        "bot.admin_bot.ban_success_duration",
+                        user_id=user_id,
+                        duration_days=duration_days,
+                    )
+                )
             else:
                 await update.message.reply_text("❌ 封禁失败,请稍后重试")
         else:

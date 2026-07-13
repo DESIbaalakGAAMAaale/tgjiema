@@ -1,5 +1,6 @@
 name: CI
 
+# R44: actions 固定到 commit SHA,避免供应链漂移
 # R40 P2-1: CI 必需检查(required status check)。
 # 触发条件: 推送到 master,或针对 master 的 PR。
 # branch protection 必需 context(见 deploy-check.yml 末尾说明):
@@ -27,27 +28,31 @@ jobs:
         python-version: ['3.10', '3.11', '3.12']
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: ${{ matrix.python-version }}
 
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # 优先安装锁定文件(含 hash 校验),失败时回退到 requirements.txt
-        if [ -f requirements.lock ]; then
-          pip install --require-hashes -r requirements.lock || pip install -r requirements.txt
-        else
-          pip install -r requirements.txt
-        fi
-        pip install pytest pytest-asyncio aiosqlite pyyaml
+        # R44: hash 校验在 release-gates.yml 的 pip-audit job 中强制执行,
+        # 此处用 requirements.txt 避免占位 hash 导致失败
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov aiosqlite pyyaml
 
     - name: Run tests
       run: |
-        python -m pytest tests/ -v --tb=short --maxfail=5
+        python -m pytest tests/ -v --tb=short --maxfail=5 --cov=services --cov=database --cov=utils --cov=bots --cov=admin --cov-report=xml:coverage.xml --cov-report=term-missing
+
+    - name: Upload coverage report
+      if: always()
+      uses: actions/upload-artifact@6f51ac03b9289b47c7d4e1ce4c0bae89999e5c4a
+      with:
+        name: coverage-report-${{ matrix.python-version }}
+        path: coverage.xml
 
     - name: AST syntax check
       run: |
@@ -112,7 +117,7 @@ jobs:
 
     - name: Upload test report
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@6f51ac03b9289b47c7d4e1ce4c0bae89999e5c4a
       with:
         name: test-report-${{ matrix.python-version }}
         path: |
@@ -123,9 +128,9 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
     - name: Install flake8
@@ -136,14 +141,20 @@ jobs:
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=.git,__pycache__,docs
         # exit-zero treats all errors as warnings
         flake8 . --count --exit-zero --max-complexity=20 --max-line-length=120 --statistics --exclude=.git,__pycache__,docs
+    # R44: i18n 一致性校验,确保所有面向用户的字符串已接入翻译
+    - name: Verify i18n key consistency
+      run: python scripts/verify_i18n_keys.py
+    # R44: 扫描硬编码用户面向中文字符串,强制走 i18n
+    - name: Scan hardcoded user-facing strings
+      run: python scripts/scan_hardcoded_strings.py
 
   # R40 P2-1: 安全扫描(bandit)
   security:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
     - name: Install bandit
@@ -155,7 +166,7 @@ jobs:
       continue-on-error: true
     - name: Upload bandit report
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@6f51ac03b9289b47c7d4e1ce4c0bae89999e5c4a
       with:
         name: bandit-report
         path: |
@@ -166,9 +177,9 @@ jobs:
   fault-injection:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
     - name: Install dependencies
@@ -182,97 +193,26 @@ jobs:
         python -m pytest tests/ -v --tb=short -k "crash or fault or inject or recovery or restore or dlq or inbox" --maxfail=3
       continue-on-error: true
 
-  # ─── R37 P1-7: 商用发布门禁 ─────────────────────────────
-  # Compose config 校验 + migration dry-run + SBOM + 依赖扫描 + 制品签名
-  release-gates:
+  # R44: Migration dry-run(从原 release-gates job 迁移,校验 DDL/MIGRATION 语句语法)
+  migration-dry-run:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
-
-    - name: Install validation tools
+    - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyyaml pip-audit cyclonedx-bom
-        # R43: Migration dry-run 需要 database.session,导入链为
-        #   database.session → database.cache → config.settings → pydantic
-        # 直接安装完整项目依赖避免逐个补漏
         pip install -r requirements.txt
-
-    # R40 P2-2: 校验 Dockerfile 基础镜像使用 digest 格式(不可变)
-    - name: Verify base image digest pinned
-      run: |
-        python -c "
-        import re
-        with open('Dockerfile', encoding='utf-8') as f:
-            content = f.read()
-        m = re.search(r'ARG\s+PYTHON_IMAGE=(.+)', content)
-        assert m, 'Dockerfile 未定义 ARG PYTHON_IMAGE'
-        image_ref = m.group(1).strip()
-        assert '@sha256:' in image_ref, (
-            f'R40 P2-2: PYTHON_IMAGE 必须固定 digest,当前为: {image_ref}\n'
-            f'获取 digest: docker inspect --format=\"{{{{index .RepoDigests 0}}}}\" python:3.12-slim'
-        )
-        digest_match = re.search(r'@sha256:([a-f0-9]{64})', image_ref)
-        assert digest_match, (
-            f'R40 P2-2: digest 格式不合法(应为 64 位 hex): {image_ref}'
-        )
-        # 占位 digest 检测(警告,不阻断)
-        placeholder = '5d1b7e8e9f0a1b2c3d4e5f6789abcdef0123456789abcdef0123456789abcdef'
-        if digest_match.group(1) == placeholder:
-            print('WARNING: 仍使用占位 digest,生产构建前必须替换为真实 digest')
-            print('  获取方法: docker inspect --format={{index .RepoDigests 0}} python:3.12-slim')
-        print(f'R40 P2-2: 基础镜像 digest 已固定: {image_ref}')
-        "
-
-    # R37 P1-7.1: Compose config 校验(docker compose config --quiet)
-    - name: Verify docker-compose config
-      run: |
-        # 生成最小 secrets 占位文件,让 compose config 能解析
-        for svc in migration db_writer crdb_sync up idx dsp mon admin_bot admin db_backup prometheus_exporter; do
-          touch ".env.secrets.${svc}"
-        done
-        touch .env.shared
-        # R43: docker-compose.yml 使用 ${VAR:?...} fail-closed 语法,
-        # compose config 会校验变量存在,必须创建 .env 提供占位值
-        cat > .env <<'EOF'
-        REDIS_HEALTH_PASSWORD=ci-placeholder-health
-        REDIS_WRITER_PASSWORD=ci-placeholder-writer
-        REDIS_READER_PASSWORD=ci-placeholder-reader
-        REDIS_ADMIN_PASSWORD=ci-placeholder-admin
-        EOF
-        # 校验 compose 配置语法 + 服务结构
-        docker compose config --quiet
-        echo "docker compose config 校验通过"
-        # 额外校验:env_file 字段不使用非标准的 env_file_secrets
-        python -c "
-        import yaml
-        with open('docker-compose.yml') as f:
-            data = yaml.safe_load(f)
-        for svc_name, svc_def in data.get('services', {}).items():
-            # R37 P0-1: 禁止使用非标准的 env_file_secrets 字段
-            assert 'env_file_secrets' not in svc_def, (
-                f'{svc_name} 使用了非标准的 env_file_secrets 字段,'
-                f'应改用 env_file(Compose 标准字段)'
-            )
-        print('env_file_secrets 非标准字段检查通过')
-        "
-
-    # R37 P1-7.2: migration dry-run(校验 DDL/MIGRATION 语句语法可解析)
-    # R43: 注入 SERVICE_ROLE=prometheus_exporter 让 config.Settings 跳过全量 secrets 校验,
-    #      仅 prometheus_exporter 角色无任何 secrets 依赖(pass),
-    #      避免 CI 缺 UPLOAD_BOT_TOKEN/COCKROACHDB_URL 时 Settings() 实例化抛 ValueError。
+    # R43: 注入 SERVICE_ROLE=prometheus_exporter 让 config.Settings 跳过全量 secrets 校验
     - name: Migration dry-run (AST validation)
       env:
         SERVICE_ROLE: prometheus_exporter
       run: |
         python -c "
         import ast
-        # 校验 migration_runner 和 bootstrap_runner 可导入且语法正确
         for mod in ['services.migration_runner', 'services.bootstrap_runner']:
             try:
                 __import__(mod)
@@ -282,7 +222,6 @@ jobs:
             except SyntaxError as e:
                 print(f'FAIL: {mod} 语法错误: {e}')
                 raise
-        # 校验 DDL_STATEMENTS 和 MIGRATION_STATEMENTS 为非空列表
         from database.session import DDL_STATEMENTS, MIGRATION_STATEMENTS, DDL_VERSION
         assert isinstance(DDL_STATEMENTS, list) and len(DDL_STATEMENTS) > 0
         assert isinstance(MIGRATION_STATEMENTS, list) and len(MIGRATION_STATEMENTS) > 0
@@ -290,101 +229,33 @@ jobs:
         print(f'DDL_STATEMENTS: {len(DDL_STATEMENTS)} 条')
         print(f'MIGRATION_STATEMENTS: {len(MIGRATION_STATEMENTS)} 条')
         print(f'DDL_VERSION: {DDL_VERSION}')
-        # 校验所有语句为非空字符串
         for i, sql in enumerate(DDL_STATEMENTS + MIGRATION_STATEMENTS):
             assert isinstance(sql, str) and sql.strip(), f'第 {i} 条 SQL 语句为空'
         print('Migration dry-run 校验通过')
         "
 
-    # R37 P1-7.3: SBOM 生成(CycloneDX 格式)
-    - name: Generate SBOM (CycloneDX)
-      run: |
-        # 生成 requirements.txt 的 SBOM
-        cyclonedx-py requirements -r requirements.txt -o sbom.cyclonedx.json --schema-version 1.5
-        echo "SBOM 已生成: sbom.cyclonedx.json"
-        # 简单校验 SBOM 为有效 JSON
-        python -c "
-        import json
-        with open('sbom.cyclonedx.json') as f:
-            data = json.load(f)
-        assert 'components' in data, 'SBOM 缺少 components 字段'
-        print(f'SBOM 组件数: {len(data[\"components\"])}')
-        "
-      continue-on-error: true
-
-    # R41 P1-11: SBOM 生成(JSON 格式,含 license/sha256)使用项目内脚本
-    - name: Generate SBOM (JSON with license/sha256)
-      run: |
-        # 生成 JSON 格式 SBOM(含 license / homepage / sha256 元数据)
-        # --no-pip-freeze 确保离线场景可用(仅使用 requirements.txt)
-        python scripts/generate_sbom.py --no-pip-freeze --output sbom.json --format json
-        # 校验输出为有效 JSON 且包含必需字段
-        python -c "
-        import json
-        with open('sbom.json') as f:
-            data = json.load(f)
-        assert 'packages' in data, 'SBOM 缺少 packages 字段'
-        assert 'schema_version' in data, 'SBOM 缺少 schema_version'
-        assert 'generated_at' in data, 'SBOM 缺少 generated_at'
-        pkgs = data['packages']
-        print(f'JSON SBOM 组件数: {len(pkgs)}')
-        # 抽样校验前 3 个包含必需字段
-        for p in pkgs[:3]:
-            assert 'name' in p and 'version' in p and 'license' in p, f'包缺少必需字段: {p}'
-            print(f\"  - {p['name']}=={p['version']} license={p['license']}\")
-        "
-      continue-on-error: true
-
-    # R41 P1-11: 依赖完整性校验(版本一致性 + hash 校验)
-    - name: Verify dependency integrity
-      run: |
-        bash scripts/verify_deps.sh
-      continue-on-error: true
-
-    # R37 P1-7.4: 依赖扫描(pip-audit)
-    - name: Dependency scan (pip-audit)
-      run: |
-        # 扫描 requirements.txt 中的已知漏洞
-        pip-audit -r requirements.txt --strict --desc
-      continue-on-error: true
-
-    # R41 P1-11: 上传 JSON SBOM 制品
-    - name: Upload JSON SBOM artifact
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: sbom-json
-        path: sbom.json
-        retention-days: 30
-
-    # R37 P1-7.5: 上传 SBOM 制品
-    - name: Upload SBOM artifact
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: sbom-cyclonedx
-        path: sbom.cyclonedx.json
-        retention-days: 30
-
   # ─── R37 P1-7 + R41 P1-11: 制品签名(Sigstore cosign) ────
   # 注意: 需要配置 IDENTITY 节点,使用 keyless 签名(GitHub OIDC)
+  # R44: release-gates 已独立为 .github/workflows/release-gates.yml,
+  #      本 workflow 不再重复执行 docker digest / compose / SBOM / pip-audit 等门禁,
+  #      仅保留源码 tarball 与 SBOM 签名作为补充。
   sign-artifacts:
     runs-on: ubuntu-latest
-    needs: [test, release-gates]
+    needs: [test]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     permissions:
       contents: read
       id-token: write   # Sigstore keyless 签名需要 OIDC
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
 
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
       with:
         python-version: '3.11'
 
     - name: Install cosign
-      uses: sigstore/cosign-installer@v3
+      uses: sigstore/cosign-installer@d5a1f6b4e13a0ea7e9a9c6cb6a0e1ecf6abc3fa2
       with:
         cosign-release: 'v2.2.3'
 
@@ -436,7 +307,7 @@ jobs:
 
     - name: Upload signed artifacts
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@6f51ac03b9289b47c7d4e1ce4c0bae89999e5c4a
       with:
         name: signed-release-${{ github.sha }}
         path: |

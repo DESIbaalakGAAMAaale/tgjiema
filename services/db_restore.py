@@ -40,6 +40,8 @@ from services.backup_crypto import (
     is_encryption_available,
 )
 
+# R44 7.2: record_restore_usage 在函数内延迟导入(避免循环依赖)
+
 # ─── 表清单(单一事实源: services/backup_schema.py) ───
 # 保留向后兼容的别名,等价于原 ALL_TABLES / TABLE_PK
 # 新增表时只需在 backup_schema.BACKUP_SCHEMA 中添加条目,无需修改本文件
@@ -490,6 +492,18 @@ async def restore_from_backup_data(
         f"[db_restore] 恢复完成: {sum(result['restored'].values())} 行, "
         f"{len(result['errors'])} 个错误, 模式={'merge' if merge else 'overwrite'}"
     )
+
+    # R44 7.2: 记录 restore RU 消耗(估算: 每个恢复表约 50 RU)
+    # 单独记入 service='restore' 维度,不混入业务空载门禁
+    try:
+        from services.ru_cost_center import record_restore_usage
+        await record_restore_usage(
+            ru_cost=len(result["restored"]) * 50,
+            operation="restore_from_backup_data",
+        )
+    except Exception:
+        pass  # 不影响 restore 主流程
+
     return result
 
 

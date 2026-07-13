@@ -1017,6 +1017,12 @@ class CommandBus:
         if not command_action:
             command_action = payload_data.get("command_action", "")
 
+        # R44 G0-3: 将 action_id 注入 params 作为 approval_action_id,
+        # 使 restore_backup 等 handler 能将其传给 BackupEngine.restore() 进行审批校验
+        # (BackupEngine.restore 通过 approval_action_id 反查 command_executions.principal_id)
+        if "approval_action_id" not in params:
+            params["approval_action_id"] = action_id
+
         # 重建 command(从已注册的 handler 工厂中查找)
         command = _resolve_command_for_action(command_action, params)
         if command is None:
@@ -1229,8 +1235,12 @@ def _resolve_command_for_action(action: str, params: dict) -> Command | None:
             role_name=params.get("role_name", ""),
         )
     if action == "restore_backup":
+        # R44 G0-3: 传递 approval_action_id(由 ApprovalExecutor 在执行时注入 params)
         return make_restore_backup_command(
             backup_id=str(params.get("backup_id", "")),
+            tables=params.get("tables"),
+            merge=params.get("merge", False),
+            approval_action_id=params.get("approval_action_id"),
         )
     if action == "enable_maintenance":
         return make_enable_maintenance_command(
@@ -1337,16 +1347,28 @@ def make_restore_backup_command(
     backup_id: str,
     tables: list[str] | None = None,
     merge: bool = False,
+    approval_action_id: str | None = None,
 ) -> Command:
     """构造恢复备份命令(必须审批)。
+
+    R44 G0-3: 公共 API restore() 不再接受 approver_id 参数,
+    改为通过 approval_action_id 从 command_executions 反查 principal_id。
+    ApprovalExecutor 调用此 handler 时通过 params 传入 approval_action_id,
+    BackupEngine.restore() 内部使用该 action_id 查询审批状态 + principal_id。
 
     Args:
         backup_id: 备份文件 key(R2 对象 key)
         tables: 仅恢复指定表(None=全部)
         merge: True=增量补充(不删除现有数据);False=覆盖恢复
+        approval_action_id: 审批动作 ID(对应 command_executions.action_id,
+                            由 ApprovalExecutor 在执行时注入 params)
     """
     async def _handler(params: dict) -> dict:
         # R40 P0-8 + P0-7: 审批通过后执行实际恢复
+        # R44 G0-3: 从 params 获取 approval_action_id,传入 BackupEngine.restore
+        # 让 restore() 通过 approval_action_id 反查 principal_id 并校验审批状态
+        approval_action_id = params.get("approval_action_id")
+
         # 优先使用 services.db_backup.restore_from_backup(支持 tables/merge 选择性恢复)
         try:
             from services.db_backup import restore_from_backup
@@ -1357,11 +1379,13 @@ def make_restore_backup_command(
             )
         except ImportError:
             # 降级到 BackupEngine.restore(不支持选择性恢复)
+            # R44 G0-3: 不传 approver_id,让 restore 从 command_executions 反查 principal_id
+            # approval_action_id 必传(production 恢复),否则 restore 抛 ValueError
             from services.backup_engine import BackupEngine
             engine = BackupEngine()
             return await engine.restore(
                 params["backup_id"], target="production",
-                approver_id=params.get("approver_id", 0),
+                approval_action_id=approval_action_id,
             )
 
     return Command(
@@ -1372,6 +1396,7 @@ def make_restore_backup_command(
             "backup_id": backup_id,
             "tables": tables,
             "merge": merge,
+            "approval_action_id": approval_action_id,
         },
         requires_approval=True,
         approval_action=APPROVAL_ACTION_RESTORE,

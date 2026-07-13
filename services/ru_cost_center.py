@@ -44,6 +44,8 @@ SERVICES = [
     "admin_bot",   # 管理机器人
     "crdb_sync",   # CRDB 同步服务
     "migration",   # 迁移工具
+    "backup",      # R44 7.2: 备份服务(单独统计,不混入业务空载)
+    "restore",     # R44 7.2: 恢复服务(单独统计,不混入业务空载)
 ]
 
 # ─── 预算与告警阈值 ────────────────────────────────────────────
@@ -356,3 +358,53 @@ async def generate_cost_report(start_date: str, end_date: str) -> str:
     lines.append(f"[告警] {alert['alert_level'].upper()}: {alert['message']}")
     lines.append("═══════════════════════════════════════════════════════════")
     return "\n".join(lines)
+
+
+# ─── R44 7.2: migration/backup/restore RU 单独统计(不混入业务空载) ────
+
+async def record_migration_usage(ru_cost: int, operation: str = "migration") -> bool:
+    """R44 7.2: 记录 migration RU 消耗,单独统计不混入业务空载。
+
+    migration 是一次性运维操作,其 RU 消耗不应计入业务角色的日常空载门禁。
+    通过单独的 service='migration' 维度记录,可在 72h 空载报告中剔除。
+
+    Args:
+        ru_cost: RU 消耗量(估算值,如 DDL 语句数 * 5)
+        operation: 操作类型(默认 'migration')
+
+    Returns:
+        True 记录成功, False 失败
+    """
+    return await record_usage("migration", operation, ru_cost)
+
+
+async def record_backup_usage(ru_cost: int, operation: str = "backup") -> bool:
+    """R44 7.2: 记录 backup RU 消耗,单独统计不混入业务空载。
+
+    backup 涉及全表扫描 + R2 上传,CRDB 端 RU 消耗较大,
+    但属于运维操作不应计入业务空载门禁。
+
+    Args:
+        ru_cost: RU 消耗量(估算值,默认每次 backup 约 100 RU)
+        operation: 操作类型(默认 'backup')
+
+    Returns:
+        True 记录成功, False 失败
+    """
+    return await record_usage("backup", operation, ru_cost)
+
+
+async def record_restore_usage(ru_cost: int, operation: str = "restore") -> bool:
+    """R44 7.2: 记录 restore RU 消耗,单独统计不混入业务空载。
+
+    restore 涉及批量 UPSERT,CRDB 端 RU 消耗较大,
+    但属于灾备恢复操作不应计入业务空载门禁。
+
+    Args:
+        ru_cost: RU 消耗量(估算值,如恢复表数 * 50)
+        operation: 操作类型(默认 'restore')
+
+    Returns:
+        True 记录成功, False 失败
+    """
+    return await record_usage("restore", operation, ru_cost)

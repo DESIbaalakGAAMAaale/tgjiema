@@ -19,6 +19,10 @@
 #   requirements.txt(仅锁定版本,无 hash 校验)。
 #   生产部署前必须用真实 hash 替换,完整流程见 docs/dependency-lock-hash.md。
 #
+# R44: 此文件需要运维在 Linux 环境用 `pip-compile --generate-hashes requirements.txt -o requirements.lock` 重新生成真实 hash
+# 当前 hash 仍为占位,hash 校验在 release-gates.yml 的 pip-audit job 中通过 --strict 强制执行
+# CI 中 ci.yml 直接用 requirements.txt 安装,不使用此 lock 文件
+#
 
 python-telegram-bot==21.6 \
     --hash=sha256:0000000000000000000000000000000000000000000000000000000000000000
