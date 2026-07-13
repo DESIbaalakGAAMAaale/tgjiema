@@ -166,8 +166,9 @@ class TestP16DualKeyDecryptWindow:
             encrypt_payload, decrypt_payload, get_kek, get_previous_kek,
         )
         # 场景:旧 KEK 加密的备份,新 KEK 配置为 BACKUP_KEK,旧 KEK 配置为 PREVIOUS
-        old_kek = b"old-kek-32-bytes-pad!!!!!!!!!!!"
-        new_kek = b"new-kek-32-bytes-pad!!!!!!!!!!!"
+        # R43: 修正 KEK 长度为 32 字节(原为 31 字节,本地因 cryptography 未安装跳过未暴露)
+        old_kek = b"old-kek-32-bytes-pad!!!!!!!!!!!!"
+        new_kek = b"new-kek-32-bytes-pad!!!!!!!!!!!!"
         assert len(old_kek) == 32 and len(new_kek) == 32
         # 用旧 KEK 加密
         plaintext = b'{"backup": "data", "version": 3}'

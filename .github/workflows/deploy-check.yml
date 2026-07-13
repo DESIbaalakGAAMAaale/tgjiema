@@ -81,14 +81,32 @@ jobs:
 
     - name: Verify systemd services
       run: |
-        # 验证 deploy_vps_per_bot.sh 包含所有必需服务
-        for svc in migration db_writer crdb_sync up idx dsp mon admin_bot admin db_backup; do
-          if ! grep -q "tgjiema-${svc}" deploy_vps_per_bot.sh; then
-            echo "ERROR: Missing systemd service tgjiema-${svc}"
+        # R43: 验证 deploy_vps_per_bot.sh 包含所有必需服务
+        # deploy_vps_per_bot.sh 使用 SVC_PREFIX="tgjiema" 变量 + ${SVC_PREFIX}-${svc} 引用,
+        # 不能简单 grep "tgjiema-${svc}",否则会因变量展开不匹配。
+        # 因此本检查改为识别 SERVICES 数组中的 "${svc}:" 条目(服务定义入口),
+        # 同时验证 SVC_PREFIX 已定义为 "tgjiema"。
+        # migration 是 oneshot,独立在脚本中定义,不在 SERVICES 数组中。
+        for svc in db_writer crdb_sync up idx dsp mon admin_bot admin db_backup; do
+          # R43: 匹配 SERVICES 数组中 "<svc>:..." 条目(grep 模式展开为字面 "up: 等)
+          if grep -q "\"${svc}:" deploy_vps_per_bot.sh; then
+            echo "OK: ${svc} found in SERVICES array"
+          else
+            echo "ERROR: Missing service definition for ${svc} in SERVICES array"
             exit 1
           fi
-          echo "OK: tgjiema-${svc} found"
         done
+        # migration 是 oneshot 服务,通过 ${SVC_PREFIX}-migration.service 定义
+        if ! grep -q 'migration.service' deploy_vps_per_bot.sh; then
+          echo "ERROR: Missing migration.service definition"
+          exit 1
+        fi
+        echo "OK: migration found in oneshot definition"
+        # 验证 SVC_PREFIX 已定义
+        if ! grep -qE '^SVC_PREFIX="tgjiema"' deploy_vps_per_bot.sh; then
+          echo "ERROR: SVC_PREFIX must be set to 'tgjiema'"
+          exit 1
+        fi
         # 验证 migration 是 oneshot
         if ! grep -q "Type=oneshot" deploy_vps_per_bot.sh; then
           echo "ERROR: migration service must be Type=oneshot"
@@ -110,9 +128,20 @@ jobs:
             compose_data = yaml.safe_load(f)
         compose_services = set(compose_data.get('services', {}).keys())
         # 3. deploy_vps_per_bot.sh systemd 服务清单
+        # R43: deploy 脚本使用 SVC_PREFIX='tgjiema' 变量,需要兼容多种引用方式:
+        #   - 字面 tgjiema-<svc> (echo 帮助信息)
+        #   - \${SVC_PREFIX}-<svc> (systemd 单元定义)
+        #   - \"<svc>:<desc>:...\" (SERVICES 数组定义,例如 \"up:上传接收Bot:...\")
+        #   - migration 在 oneshot cat 块中定义
         with open('deploy_vps_per_bot.sh', encoding='utf-8') as f:
             deploy_script = f.read()
         systemd_services = set(re.findall(r'tgjiema-(\w+)', deploy_script))
+        # 补充从 SERVICES 数组中识别 (e.g. \"db_writer:数据库写入:...\")
+        svc_array_matches = re.findall(r'\"(\w+):[^\"]+:', deploy_script)
+        systemd_services.update(svc_array_matches)
+        # migration 通过 oneshot 定义,识别 \${SVC_PREFIX}-migration 引用
+        if re.search(r'\$\{SVC_PREFIX\}-migration\.service', deploy_script):
+            systemd_services.add('migration')
         # 比较: services.yaml 与 docker-compose 应一致
         missing_in_compose = yaml_services - compose_services
         assert not missing_in_compose, (
@@ -149,7 +178,7 @@ jobs:
     # R37 P1-7 / R40 P2-1: Branch protection 配置说明
     # 注意: branch protection 必须通过 GitHub API/UI 配置,无法在 workflow 中定义
     # 必需检查(required checks):
-    #   - test (矩阵 3.9/3.10/3.11) — 至少一个 context 通过即可,建议三个全 required
+    #   - test (矩阵 3.10/3.11/3.12) — 至少一个 context 通过即可,建议三个全 required
     #   - lint
     #   - security (bandit)  ← R40 P2-1 新增
     #   - deploy-check / verify-deploy
@@ -157,9 +186,9 @@ jobs:
     # 配置命令(需管理员 PAT):
     #   gh api repos/:owner/:repo/branches/master/protection -X PUT \
     #     -f required_status_checks[strict]=true \
-    #     -f required_status_checks[contexts][]="test (3.9)" \
     #     -f required_status_checks[contexts][]="test (3.10)" \
     #     -f required_status_checks[contexts][]="test (3.11)" \
+    #     -f required_status_checks[contexts][]="test (3.12)" \
     #     -f required_status_checks[contexts][]="lint" \
     #     -f required_status_checks[contexts][]="security" \
     #     -f required_status_checks[contexts][]="deploy-check / verify-deploy" \
@@ -170,7 +199,7 @@ jobs:
       run: |
         echo "R37 P1-7 / R40 P2-1: Branch protection 配置说明"
         echo "必需检查(required checks):"
-        echo "  - test (矩阵 3.9/3.10/3.11)"
+        echo "  - test (矩阵 3.10/3.11/3.12)"
         echo "  - lint"
         echo "  - security (bandit)  ← R40 P2-1 新增"
         echo "  - deploy-check / verify-deploy"

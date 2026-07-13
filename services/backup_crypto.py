@@ -306,6 +306,8 @@ def encrypt_payload(
         aad_str = f"{backup_id}|{schema_version}|{key_id}"
         aad_bytes = aad_str.encode("utf-8")
     else:
+        # R43: 向后兼容路径,使用固定 AAD 字符串
+        aad_str = "backup-payload"
         aad_bytes = b"backup-payload"
 
     # 信封加密: 随机 DEK 加密 payload,KEK 包装 DEK

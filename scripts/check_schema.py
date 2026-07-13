@@ -151,9 +151,12 @@ def main() -> int:
         return 1
 
     # 检查关键表是否在 DDL 中定义
+    # R43: session.py 定义 CRDB 共享表;SQLite 本地表(upload_sessions/outbox/dlq 等)
+    # 在 database/cache_store.py 中定义,不在此校验范围
     expected_tables = [
-        "users", "decode_logs", "upload_sessions", "outbox",
-        "relay_spool", "relay_ack", "dlq", "cells",
+        "users", "file_records", "decode_logs", "pending_uploads",
+        "send_queue", "cells", "codes", "jobs",
+        "backup_config", "message_backups", "relay_accounts",
     ]
     all_sql = "\n".join(ddl).upper()
     missing_tables = [t for t in expected_tables if f"CREATE TABLE" in all_sql and t.upper() not in all_sql]

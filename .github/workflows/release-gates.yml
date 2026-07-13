@@ -218,9 +218,10 @@ jobs:
     - name: Run backup restore drill tests
       run: |
         # R42 P1-2/3/7/9: backup 恢复演练
-        # 测试文件由其他 agent 创建,本 agent 仅引用
+        # R43: 修正 -k 过滤器,匹配测试文件中实际存在的测试名
+        # (test_restore_*/test_cleanup_orphans*/test_backup_gc*/test_rpo* 等)
         if [ -f tests/test_r42_p1_2_3_7_9_backup_rpo.py ]; then
-          python -m pytest tests/test_r42_p1_2_3_7_9_backup_rpo.py -k test_restore_drill -v --tb=short
+          python -m pytest tests/test_r42_p1_2_3_7_9_backup_rpo.py -k "restore or backup_gc or rpo or cleanup_orphans or backup_policy" -v --tb=short
         else
           echo "WARN: tests/test_r42_p1_2_3_7_9_backup_rpo.py 不存在(由其他 agent 创建)"
           echo "     若该 agent 已完成整改,请检查测试文件路径"

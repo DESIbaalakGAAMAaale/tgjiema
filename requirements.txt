@@ -2,16 +2,20 @@ python-telegram-bot==21.6
 httpx==0.27.2
 asyncpg==0.30.0
 pydantic-settings==2.6.1
-fastapi==0.115.6
+# R43: 升级 FastAPI 到 0.137.1 以兼容 starlette 1.3.1(修复 CVE-2026-48710 Host 头注入等 9 个漏洞)
+fastapi==0.137.1
 uvicorn[standard]==0.34.0
 jinja2==3.1.6
 loguru==0.7.3
-python-multipart==0.0.20
+# R43: 升级 python-multipart 到 0.0.32(修复路径遍历/DoS 等 5 个漏洞)
+python-multipart==0.0.32
 telethon==1.38.0
 aiosqlite==0.22.1
 pyyaml==6.0.2
-cryptography==44.0.0
+# R43: 升级 cryptography 到 49.0.0(修复 OpenSSL 子群攻击等 5 个漏洞)
+cryptography==49.0.0
 uvloop==0.19.0; sys_platform != 'win32'
-orjson==3.9.0
+# R43: 升级 orjson 到 3.11.9(修复递归 DoS 等 4 个漏洞,且 3.10+ 提供预编译 wheel 免编译)
+orjson==3.11.9
 redis==5.0.8
 pyotp>=2.9.0
