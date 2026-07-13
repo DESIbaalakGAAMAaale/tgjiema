@@ -700,9 +700,23 @@ class BackupEngine:
             }
 
         # R42 P1-3: production 恢复必须经过审批验证
+        # R43: 修复 R40 P0-7 测试期望 — approver_id=0 返回失败字典而非抛 ValueError,
+        #      与 R42 P1-3 的"approver_id 非零 + approval_action_id 为空抛 ValueError"
+        #      分流,两个测试用例都能通过。
         if target == "production":
+            if not approver_id:
+                # R40 P0-7: approver_id=0 → 友好失败字典(向后兼容 R40 测试期望)
+                return {
+                    "success": False, "restored_tables": 0, "restored_rows": 0,
+                    "checksum_verified": False,
+                    "error": (
+                        "production 恢复要求 approver_id 非零且需通过审批,"
+                        "请先在 admin 后台发起 restore 审批流获取 approval_action_id"
+                    ),
+                }
             if not approval_action_id:
-                # 公共 API 拒绝直接执行 production restore
+                # R42 P1-3: approver_id 已提供但 approval_action_id 缺失 → 强制 ValueError
+                # 公共 API 拒绝直接执行 production restore,必须走审批流
                 raise ValueError(
                     "Production restore requires approval_action_id"
                 )

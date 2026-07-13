@@ -1,3 +1,5 @@
+import functools
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
@@ -16,6 +18,9 @@ LEVEL_ALIAS = {
 
 
 def _auth_required(func):
+    # R43: 加 functools.wraps 保留原函数元数据(__wrapped__/__name__/__doc__),
+    # 让外层装饰器(maintenance_middleware)的内省检测能识别到内层装饰器标记。
+    @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if not user or user.id != AUTHORIZED_USER_ID:

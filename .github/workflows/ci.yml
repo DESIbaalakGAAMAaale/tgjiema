@@ -263,7 +263,12 @@ jobs:
         "
 
     # R37 P1-7.2: migration dry-run(校验 DDL/MIGRATION 语句语法可解析)
+    # R43: 注入 SERVICE_ROLE=prometheus_exporter 让 config.Settings 跳过全量 secrets 校验,
+    #      仅 prometheus_exporter 角色无任何 secrets 依赖(pass),
+    #      避免 CI 缺 UPLOAD_BOT_TOKEN/COCKROACHDB_URL 时 Settings() 实例化抛 ValueError。
     - name: Migration dry-run (AST validation)
+      env:
+        SERVICE_ROLE: prometheus_exporter
       run: |
         python -c "
         import ast
