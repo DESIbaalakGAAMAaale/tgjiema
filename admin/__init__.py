@@ -1353,7 +1353,18 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
     if req is not None:
         csp_nonce = getattr(req.state, "csp_nonce", "") or ""
     context["csp_nonce"] = csp_nonce
-    response = templates.TemplateResponse(template_name, context)
+    # R43: Starlette 1.x 改变 TemplateResponse 签名,从 (name, context) 改为 (request, name, context)
+    #   旧: TemplateResponse(name, {"request": request, ...})
+    #   新: TemplateResponse(request, name, {"key": value, ...})
+    # context 中已包含 "request" key(由调用方注入),取出后作为第一参数传给新签名。
+    req_for_resp = context.get("request")
+    if req_for_resp is not None:
+        # 新签名: (request, name, context_without_request)
+        ctx_for_resp = {k: v for k, v in context.items() if k != "request"}
+        response = templates.TemplateResponse(req_for_resp, template_name, ctx_for_resp)
+    else:
+        # 向后兼容(测试 mock 中可能未注入 request):回退到旧签名
+        response = templates.TemplateResponse(template_name, context)
     response.set_cookie(
         key="csrf_token",
         value=token,

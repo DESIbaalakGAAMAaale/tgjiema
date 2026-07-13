@@ -568,7 +568,16 @@ class TestCspNonceInjection:
         orig = _admin_mod.templates.TemplateResponse
         try:
             captured = {}
-            def fake_tr(name, context):
+            # R43: Starlette 1.x 改变签名 (request, name, context),mock 兼容新旧两种调用
+            def fake_tr(*args, **kwargs):
+                # 兼容旧签名 (name, context) 和新签名 (request, name, context)
+                if len(args) == 2:
+                    name, context = args
+                elif len(args) == 3:
+                    _req, name, context = args
+                else:
+                    name = kwargs.get("name")
+                    context = kwargs.get("context", {})
                 captured["name"] = name
                 captured["context"] = context
                 resp = MagicMock()
@@ -586,7 +595,15 @@ class TestCspNonceInjection:
         orig = _admin_mod.templates.TemplateResponse
         try:
             captured = {}
-            def fake_tr(name, context):
+            # R43: Starlette 1.x 改变签名 (request, name, context),mock 兼容新旧两种调用
+            def fake_tr(*args, **kwargs):
+                if len(args) == 2:
+                    name, context = args
+                elif len(args) == 3:
+                    _req, name, context = args
+                else:
+                    name = kwargs.get("name")
+                    context = kwargs.get("context", {})
                 captured["context"] = context
                 resp = MagicMock()
                 resp.set_cookie = MagicMock()

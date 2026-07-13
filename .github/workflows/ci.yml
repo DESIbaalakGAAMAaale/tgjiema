@@ -198,8 +198,10 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install pyyaml pip-audit cyclonedx-bom
-        # R43: Migration dry-run 需要导入 database.session,需安装项目依赖(loguru/asyncpg)
-        pip install loguru asyncpg
+        # R43: Migration dry-run 需要 database.session,导入链为
+        #   database.session → database.cache → config.settings → pydantic
+        # 直接安装完整项目依赖避免逐个补漏
+        pip install -r requirements.txt
 
     # R40 P2-2: 校验 Dockerfile 基础镜像使用 digest 格式(不可变)
     - name: Verify base image digest pinned
