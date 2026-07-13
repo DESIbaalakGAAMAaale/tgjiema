@@ -601,7 +601,7 @@ class TestP13ProductionRestoreApproval:
         fake_db = _FakeDB()
         fake_db.set_query_result(
             "command_executions",
-            [(999, "pending")],  # (principal_id, status)
+            [(999, "pending", None)],  # R44: (principal_id, status, request_hash)
         )
         cache._db = fake_db
 
@@ -625,7 +625,7 @@ class TestP13ProductionRestoreApproval:
         fake_db = _FakeDB()
         fake_db.set_query_result(
             "command_executions",
-            [(888, "executed")],  # (principal_id=888, status=executed)
+            [(888, "executed", None)],  # R44: (principal_id=888, status=executed, request_hash)
         )
         cache._db = fake_db
 
@@ -649,7 +649,7 @@ class TestP13ProductionRestoreApproval:
         fake_db = _FakeDB()
         fake_db.set_query_result(
             "command_executions",
-            [(999, "executed")],  # (principal_id=999, status=executed)
+            [(999, "executed", None)],  # R44: (principal_id=999, status=executed, request_hash)
         )
         cache._db = fake_db
 

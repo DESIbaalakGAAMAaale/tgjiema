@@ -739,7 +739,7 @@ class MonBot:
                             slot_id, status, "lost",
                             fallback_fields={"status": "lost", "next_active_chat_id": None},
                             fallback_mark_dirty=True,
-                            reason=f"降级 lost CAS 失败(无备用): {error}",
+                            reason=f"degrade lost CAS failed (no fallback): {error}",
                         )
                 finally:
                     await self._release_cell_lease_safe(slot_id)
@@ -756,7 +756,7 @@ class MonBot:
                 await log_rotate(
                     from_slot_id=slot_id, to_slot_id="NONE",
                     from_status=status, to_status="lost",
-                    reason=f"频道封禁且无备用: {error}",
+                    reason=f"channel banned and no spare available: {error}",
                     triggered_by="mon",
                 )
 

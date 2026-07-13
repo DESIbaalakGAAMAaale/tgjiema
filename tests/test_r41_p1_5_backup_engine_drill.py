@@ -467,7 +467,8 @@ class TestScenario8StagingRestoreNoDbWrite:
         )
 
         # R42 P1-3: mock _validate_production_approval 通过(不抛异常)
-        async def _noop_validate(approver_id, approval_action_id):
+        # R44 fixup: 添加 **kwargs 兼容 expected_request_hash 新参数
+        async def _noop_validate(approver_id, approval_action_id, **kwargs):
             return None
         monkeypatch.setattr(engine, "_validate_production_approval", _noop_validate)
 

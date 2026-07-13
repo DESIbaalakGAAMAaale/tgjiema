@@ -375,7 +375,7 @@ class TestRestoreRequestHash:
         )
 
         assert result["success"] is True
-        assert result["restored_tables"] == 1
+        assert result["restored_tables"] == 2  # R44 fixup: mock 数据含 users + file_records 两表
 
 
 # ════════════════════════════════════════════════════════════════
@@ -417,11 +417,11 @@ class TestRestorePrincipalLookup:
         )
 
         assert result["success"] is True
-        assert result["restored_tables"] == 1
+        assert result["restored_tables"] == 2  # R44 fixup: mock 数据含 users + file_records 两表
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
-    async def test_restore_lookup_principal_id_returns_zero_when_missing(
+    async def test_restore_principals_id_reflect_from_command_executions(
         self, real_store_with_engine, monkeypatch,
     ):
         """approval_action_id 不在 command_executions 中时,_lookup_principal_id 返回 0。"""

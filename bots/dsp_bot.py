@@ -172,7 +172,7 @@ async def _mark_delivery_failed_safe(
         await store.mark_delivery_failed(job_id, source_msg_id, reason)
     except Exception as e:
         logger.warning(
-            f"[Dsp] mark_delivery_failed 失败(忽略) "
+            f"[Dsp] mark_delivery_failed failed (ignored) "
             f"job={job_id}, msg={source_msg_id}: {e}"
         )
 
@@ -891,7 +891,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             # 不静默 fallback 到拓扑猜测(避免投递到无副本的频道导致用户收到错误文件)
             if is_structured_new:
                 logger.error(
-                    f"[Dsp] 新 job Resolver 失败(fail-closed),进入 retry: "
+                    f"[Dsp] new job Resolver failed (fail-closed), enter retry: "
                     f"job={job.job_id}, code={job.code}, fuid={fuid}, gid={gid}"
                 )
                 await _mark_delivery_failed_safe(
