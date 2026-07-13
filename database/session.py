@@ -1612,7 +1612,7 @@ async def delete_code_bot_route(prefix: str):
 
 async def get_all_code_bot_routes() -> dict[str, str]:
     """获取所code_bot_route,走内存缓存0 分钟 TTL)"""
-    global _code_bot_routes_cache, _code_bot_routes_cache_ts
+    # R43: read-only global,无需 global 声明(F824)
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
     return _code_bot_routes_cache
@@ -1620,7 +1620,7 @@ async def get_all_code_bot_routes() -> dict[str, str]:
 
 async def resolve_bot_for_code(code: str, default_bot: str) -> str:
     """根据文件码前缀匹配配置的路由，无匹配则返回 default_bot。"""
-    global _code_bot_routes_cache, _code_bot_routes_cache_ts
+    # R43: read-only global,无需 global 声明(F824)
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
     best_prefix = ""
@@ -1724,7 +1724,7 @@ async def delete_code_bot_route_regex(route_id: int) -> bool:
 
 async def get_all_code_bot_routes_regex() -> list[tuple[int, str, str]]:
     """获取所有正则路由: [(id, bot_username, pattern), ...]"""
-    global _code_bot_routes_regex_cache, _code_bot_routes_cache_ts
+    # R43: read-only global,无需 global 声明(F824)
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
     result: list[tuple[int, str, str]] = []
@@ -1751,7 +1751,7 @@ async def resolve_bot_for_code_regex(code: str) -> str | None:
     遍历顺序按 id 升序（先添加的优先）。
     """
     import re as _re
-    global _code_bot_routes_regex_cache, _code_bot_routes_cache_ts
+    # R43: read-only global,无需 global 声明(F824)
     if _time.time() - _code_bot_routes_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
     for bot_username, pattern in _code_bot_routes_regex_cache:
@@ -1774,7 +1774,7 @@ async def set_bot_decode_interval(bot_username: str, interval_seconds: int):
 
 async def get_bot_decode_interval(bot_username: str) -> int:
     """获取 bot 解码间隔，走内存缓存(10 分钟 TTL)"""
-    global _bot_decode_interval_cache, _bot_decode_interval_cache_ts
+    # R43: read-only global,无需 global 声明(F824)
     if _time.time() - _bot_decode_interval_cache_ts > _BOT_CONFIG_TTL:
         await _refresh_bot_config_cache()
     return _bot_decode_interval_cache.get(bot_username, 0)
@@ -1876,7 +1876,7 @@ async def _refresh_external_code_mapping_cache():
 
 async def get_system_code_for_external(external_code: str) -> str | None:
     """查询外部码对应的系统码,走 SQLite 全表缓存（0 CRDB RU）"""
-    global _external_code_mapping_cache, _external_code_mapping_cache_ts
+    # R43: read-only global,无需 global 声明(F824)
     # 检查缓存是否过期
     if _time.time() - _external_code_mapping_cache_ts > _EXTERNAL_CODE_MAPPING_TTL:
         await _refresh_external_code_mapping_cache()

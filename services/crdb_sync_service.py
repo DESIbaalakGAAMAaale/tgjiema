@@ -419,7 +419,7 @@ async def _should_connect() -> bool:
         True: 应该建立 CRDB 连接(调用 _lazy_connect_crdb)
         False: 不需要连接(继续走 SQLite 退避)
     """
-    global _last_pool_close_ts
+    # R43: read-only global,无需 global 声明(F824)
     if _crdb_pool_connected:
         return False  # 已连接,无需重复
     # cooldown 检查:刚关闭的 pool 至少 30s 后才允许重新连接

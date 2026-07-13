@@ -69,9 +69,12 @@ jobs:
 
     - name: Verify secrets isolation
       run: |
-        # 验证 deploy_vps_per_bot.sh 不加载完整 .env
-        if grep -qE 'EnvironmentFile=.*\.env[^.]' deploy_vps_per_bot.sh; then
+        # R43: 验证 deploy_vps_per_bot.sh 不加载完整 .env
+        # 过滤注释行后检测,避免注释中的 EnvironmentFile=-.env 误报
+        # 仅匹配 .env 后面是行尾或空白(不匹配 .env.shared / .env.secrets.xxx)
+        if grep -v '^#' deploy_vps_per_bot.sh | grep -qE 'EnvironmentFile=.*\.env($|\s)'; then
           echo "ERROR: Found complete .env loading in service file"
+          grep -v '^#' deploy_vps_per_bot.sh | grep -nE 'EnvironmentFile=.*\.env($|\s)'
           exit 1
         fi
         echo "Secrets isolation OK"

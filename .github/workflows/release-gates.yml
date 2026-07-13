@@ -116,6 +116,14 @@ jobs:
           touch ".env.secrets.${svc}"
         done
         touch .env.shared
+        # R43: docker-compose.yml 使用 ${VAR:?...} fail-closed 语法,
+        # compose config 会校验变量存在,必须创建 .env 提供占位值
+        cat > .env <<'EOF'
+        REDIS_HEALTH_PASSWORD=ci-placeholder-health
+        REDIS_WRITER_PASSWORD=ci-placeholder-writer
+        REDIS_READER_PASSWORD=ci-placeholder-reader
+        REDIS_ADMIN_PASSWORD=ci-placeholder-admin
+        EOF
 
     - name: Validate docker-compose config
       run: |
@@ -258,11 +266,10 @@ jobs:
         path: sbom.json
         retention-days: 30
 
-  # ─── 8. pip-audit ────────────────────────────────────────────
-  # 漏洞扫描(失败时 warning 不阻断,因 pip-audit 可能未安装)
+  # ─── 8. pip-audit (R43 P0-2: 阻断式漏洞扫描,移除 continue-on-error) ──
+  # R43 P0-2: 安全任务不允许降级为 warning,必须阻断发布
   pip-audit:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
     - uses: actions/checkout@v4
 
@@ -278,15 +285,13 @@ jobs:
 
     - name: Run pip-audit
       run: |
-        # 扫描 requirements.txt 中的已知漏洞
-        # 失败时 continue-on-error=true 仅警告,不阻断 release-gates
-        pip-audit -r requirements.txt --strict --desc || true
+        # R43 P0-2: 失败必须阻断 release-gates,不再降级为 warning
+        # 安全例外必须有期限、负责人、风险接受记录,不能静默通过
+        pip-audit -r requirements.txt --strict --desc
 
-  # ─── 9. trivy ───────────────────────────────────────────────
-  # 文件系统漏洞扫描(失败时 warning 不阻断)
+  # ─── 9. trivy (R43 P0-2: 阻断式漏洞扫描,移除 continue-on-error) ──
   trivy:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
     - uses: actions/checkout@v4
       with:
@@ -297,13 +302,14 @@ jobs:
       with:
         scan-type: fs
         scan-ref: .
-        exit-code: '0'
+        # R43 P0-2: exit-code=1 让 CRITICAL/HIGH 漏洞阻断发布
+        exit-code: '1'
         ignore-unfixed: true
         severity: CRITICAL,HIGH
         format: table
 
-  # ─── 10. sign-image ─────────────────────────────────────────
-  # cosign 镜像签名(占位,生产环境需配置 cosign keyless / KMS)
+  # ─── 10. sign-image (R43 P0-2: 真实签名,移除 placeholder) ─────────
+  # R43 P0-2: cosign 镜像签名必须真实执行,不允许占位通过
   sign-image:
     runs-on: ubuntu-latest
     needs: [docker-build]
@@ -319,16 +325,27 @@ jobs:
       with:
         cosign-release: 'v2.2.3'
 
-    - name: Sign image placeholder
+    - name: Sign source artifact with cosign (keyless)
       run: |
-        # R42 P0-1: 镜像签名占位步骤
-        # 当前 docker-build job 未推送镜像到 registry,
-        # 此步骤在镜像推送流水线启用后激活。
-        # 预期用法:
-        #   docker tag tgjiema:ci-build ghcr.io/${{ github.repository }}:${{ github.sha }}
-        #   docker push ghcr.io/${{ github.repository }}:${{ github.sha }}
-        #   cosign sign --yes ghcr.io/${{ github.repository }}:${{ github.sha }}
-        echo "signing placeholder - configure cosign in production"
-        echo "当前步骤:验证 cosign 可用,记录签名意图"
-        cosign version || echo "WARN: cosign 不可用,生产环境必须安装"
-        echo "镜像签名步骤已就绪(待 registry 推送流水线激活)"
+        # R43 P0-2: 真实 cosign 签名(不再占位通过)
+        # 签名源代码 tarball(镜像推送流水线启用后再加镜像签名)
+        git archive --format=tar.gz --prefix=tgjiema-${{ github.sha }}/ HEAD -o tgjiema-${{ github.sha }}.tar.gz
+        sha256sum tgjiema-${{ github.sha }}.tar.gz > tgjiema-${{ github.sha }}.tar.gz.sha256
+        # Sigstore keyless 签名(使用 GitHub OIDC 身份)
+        cosign sign-blob --yes \
+          --output-certificate tgjiema-${{ github.sha }}.pem \
+          --output-signature tgjiema-${{ github.sha }}.sig \
+          tgjiema-${{ github.sha }}.tar.gz.sha256
+        echo "源代码制品已用 Sigstore keyless 签名"
+
+    - name: Upload signed artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-gates-signed-${{ github.sha }}
+        path: |
+          tgjiema-${{ github.sha }}.tar.gz
+          tgjiema-${{ github.sha }}.tar.gz.sha256
+          tgjiema-${{ github.sha }}.pem
+          tgjiema-${{ github.sha }}.sig
+        retention-days: 90

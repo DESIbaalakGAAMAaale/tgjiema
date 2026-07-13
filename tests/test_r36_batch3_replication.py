@@ -521,12 +521,50 @@ class TestReconcileCopiedUnverified:
 
     @pytest.mark.asyncio
     async def test_reconcile_timeout_marks_failed(self, store, scheduler):
-        """COPIED_UNVERIFIED 超时 → 标记 FAILED 让下轮重试。"""
+        """COPIED_UNVERIFIED 超时且 dst_msg_id 缺失 → 标记 FAILED 让下轮重试。
+
+        R37 P1-2: 超时但 dst_msg_id 存在时优先 commit,不走 FAILED 路径。
+        本测试验证 dst_msg_id 缺失场景才标记 FAILED。
+        """
         group_id = 3203
         src_ch = 4203
         dst_ch = 5203
         tid = await store.create_replication_task(
             group_id, "fuid-rec-3", src_ch, dst_ch, 100,
+        )
+        await store.mark_replication_copying(tid)
+        await store.mark_replication_copied(tid, 200)
+        # R43: 模拟 dst_msg_id 丢失(无法二次探测,必须走 FAILED 让下轮重新 copy)
+        await store._db.execute(
+            "UPDATE replication_tasks SET dst_msg_id = NULL WHERE task_id = ?",
+            (tid,),
+        )
+        # 把 updated_at 改为 4000 秒前(超过 reconcile_timeout=3600)
+        old_ts = time.time() - 4000
+        await store._db.execute(
+            "UPDATE replication_tasks SET updated_at = ? WHERE task_id = ?",
+            (old_ts, tid),
+        )
+        await store._db.commit()
+
+        with patch("database.session.save_message_backup", new=AsyncMock()):
+            reconciled = await scheduler._reconcile_copied_unverified(store)
+
+        assert reconciled == 0, "超时且 dst_msg_id 缺失应标记 FAILED,不计入 reconciled"
+        # 验证 task 状态(attempts=1,回到 PLANNED 等重试)
+        task = await store.get_replication_task_by_unique_key(
+            group_id, "fuid-rec-3", src_ch, dst_ch,
+        )
+        assert task["status"] == "PLANNED", "超时后应回 PLANNED 等重试"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_timeout_with_dst_msg_id_commits(self, store, scheduler):
+        """R37 P1-2: COPIED_UNVERIFIED 超时但 dst_msg_id 存在 → 二次写入 manifest 推进 COMMITTED。"""
+        group_id = 3204
+        src_ch = 4204
+        dst_ch = 5204
+        tid = await store.create_replication_task(
+            group_id, "fuid-rec-4", src_ch, dst_ch, 100,
         )
         await store.mark_replication_copying(tid)
         await store.mark_replication_copied(tid, 200)
@@ -541,12 +579,11 @@ class TestReconcileCopiedUnverified:
         with patch("database.session.save_message_backup", new=AsyncMock()):
             reconciled = await scheduler._reconcile_copied_unverified(store)
 
-        assert reconciled == 0, "超时应标记 FAILED,不计入 reconciled"
-        # 验证 task 状态(attempts=1,回到 PLANNED 等重试)
+        assert reconciled == 1, "超时但 dst_msg_id 存在应二次 commit,计入 reconciled"
         task = await store.get_replication_task_by_unique_key(
-            group_id, "fuid-rec-3", src_ch, dst_ch,
+            group_id, "fuid-rec-4", src_ch, dst_ch,
         )
-        assert task["status"] == "PLANNED", "超时后应回 PLANNED 等重试"
+        assert task["status"] == "COMMITTED", "超时但 dst_msg_id 存在应推进 COMMITTED"
 
     @pytest.mark.asyncio
     async def test_reconcile_no_tasks_returns_zero(self, store, scheduler):

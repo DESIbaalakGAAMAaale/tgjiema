@@ -384,15 +384,16 @@ class TestUpBotHelpers:
         assert session["options_json"]["protect_content"] is True
 
     @pytest.mark.asyncio
-    async def test_create_upload_session_failure_returns_empty(self, real_store):
-        """get_cache_store 抛异常时,_create_upload_session_for_upload 返回空串。"""
+    async def test_create_upload_session_failure_raises_durability_error(self, real_store):
+        """R38 P0-3: get_cache_store 抛异常时,_create_upload_session_for_upload 抛 DurabilityError。"""
+        from utils.exceptions import DurabilityError
         mock_failing_store = MagicMock()
         mock_failing_store.create_upload_session = AsyncMock(side_effect=RuntimeError("DB locked"))
         with patch.object(up_bot_module, 'get_cache_store', return_value=mock_failing_store):
-            upload_id = await up_bot_module._create_upload_session_for_upload(
-                user_id=10051,
-            )
-        assert upload_id == ""  # 失败时返回空串
+            with pytest.raises(DurabilityError):
+                await up_bot_module._create_upload_session_for_upload(
+                    user_id=10051,
+                )
 
     @pytest.mark.asyncio
     async def test_transition_upload_session_safe_success(self, real_store):

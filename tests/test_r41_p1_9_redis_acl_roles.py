@@ -569,7 +569,7 @@ class TestComposeRedisUsers:
             assert "tgjiema_writer" in block, \
                 f"{service_name} 应使用 tgjiema_writer 用户"
             assert "REDIS_WRITER_PASSWORD" in block, \
-                f"{service_name} 应使用 ${REDIS_WRITER_PASSWORD}"
+                f"{service_name} 应使用 ${{REDIS_WRITER_PASSWORD}}"
 
     def test_compose_header_mentions_four_passwords(self):
         """R41 P1-9: docker-compose.yml 顶部注释应提及 4 个 REDIS_*_PASSWORD。"""

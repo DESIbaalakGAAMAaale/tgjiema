@@ -1555,7 +1555,7 @@ async def _process_upload(
                 upload_id, "FAILED_RETRYABLE", reason=f"copy_failed: {e}",
                 last_error=str(e),
             )
-            await update.message.reply_text("⚠️ " + _t(user.id, "bot.file_processing_failed"))
+            await update.message.reply_text("⚠️ " + _t(user_id, "bot.file_processing_failed"))
             return
 
         # R36 B0-2: R100 归档改由 OutboxWorker 消费 upload_outbox 表完成(不再 fire-and-forget)

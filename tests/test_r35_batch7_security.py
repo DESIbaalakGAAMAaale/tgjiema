@@ -407,10 +407,19 @@ class TestApiHashFingerprint:
 
         try:
             # 运行 start()(会在 TelegramClient 构造前抛异常,因为我们没有 mock)
+            # R43: Python 3.11+ 中 asyncio.get_event_loop() 无运行循环时弃用,
+            # 显式创建新事件循环避免 DeprecationWarning/RuntimeError
             try:
-                asyncio.get_event_loop().run_until_complete(instance.start())
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(instance.start())
             except Exception:
                 pass  # 预期会失败,我们只关心日志
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
 
             # 验证日志中包含指纹而非原值
             start_logs = [m for m in messages if "启动登录" in m]

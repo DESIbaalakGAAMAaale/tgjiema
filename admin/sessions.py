@@ -21,9 +21,13 @@ import datetime as _dt
 import json
 import secrets
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    # R43: 仅用于类型注解,避免运行时循环导入(flake8 F821)
+    from admin import AdminPrincipal
 
 # session 在 kv_store 中的 key 前缀
 _SESSION_KEY_PREFIX = "admin:session:"

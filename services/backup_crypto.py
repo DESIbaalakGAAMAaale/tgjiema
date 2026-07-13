@@ -300,8 +300,13 @@ def encrypt_payload(
 
     # R40 P0-6: AAD 绑定 {backup_id, schema_version, key_id}
     # 防止密文被替换到不同备份上下文(重放攻击)
-    aad_str = f"{backup_id}|{schema_version}|{key_id}"
-    aad_bytes = aad_str.encode("utf-8")
+    # R43 修复:仅当 backup_id/schema_version 至少一个非空时才用新 AAD,
+    # 否则回退到向后兼容的 b"backup-payload"(解密侧未传 key_id 时也能匹配)
+    if backup_id or schema_version:
+        aad_str = f"{backup_id}|{schema_version}|{key_id}"
+        aad_bytes = aad_str.encode("utf-8")
+    else:
+        aad_bytes = b"backup-payload"
 
     # 信封加密: 随机 DEK 加密 payload,KEK 包装 DEK
     dek = _generate_dek()

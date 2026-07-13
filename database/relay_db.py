@@ -1279,7 +1279,7 @@ async def get_relay_db() -> RelayDB:
 
 def _get_relay_db_sync() -> RelayDB:
     """同步获取（用于 admin bot 回调中，此时 DB 已初始化）"""
-    global _relay_db
+    # R43: read-only global,无需 global 声明(F824)
     if _relay_db is None:
         raise RuntimeError("RelayDB not initialized. Call init_db() first.")
     return _relay_db
