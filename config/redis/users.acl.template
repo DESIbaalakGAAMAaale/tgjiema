@@ -38,3 +38,15 @@ user tgjiema_writer on ><REDIS_WRITER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XAD
 # R39 P0-2: 正向白名单,仅允许读命令;key 限制到 tgjiema:* 命名空间
 # 用途: 仅需读取的服务(如 prometheus_exporter)或调试用途
 user tgjiema_reader on ><REDIS_READER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XREADGROUP +XINFO +XLEN +XPENDING +PING +GET +TTL
+
+# ── tgjiema_admin: 管理员用户(mon_bot/admin_bot/admin 后台使用) ──
+# R41 P1-9: 拆分 writer 用户为 4 个角色,管理员需要额外权限:
+#   - XAUTOCLAIM: 自动认领超时未确认的 pending 消息(leader lease 切换时)
+#   - EVAL: 执行 Lua 脚本(原子操作:多 key CAS / fencing token)
+#   - XTRIM: 主动裁剪 Stream(超出保留窗口的旧消息)
+#   - 全部 Stream + KV 命令(管理操作:重置消费组 / 修复卡住的 PEL)
+#   - CONFIG GET: 读取运行时配置(用于监控/诊断,不含 SET 防止误操作)
+#   - CLUSTER NODES / INFO: 集群状态查询(单机模式下也兼容)
+# 用途: mon_bot / admin_bot / admin 后台服务,需要管理 Redis 状态
+# 安全: 仍限制在 tgjiema:* 命名空间,不能访问其他业务的 key
+user tgjiema_admin on ><REDIS_ADMIN_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XAUTOCLAIM +XTRIM +XINFO +XDEL +PING +EXPIRE +TTL +SET +GET +DEL +EVAL +CONFIG +CLUSTER +INFO +CLIENT +TIME +MEMORY +SLOWLOG +LATENCY

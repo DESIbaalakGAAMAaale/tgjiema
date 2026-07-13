@@ -393,3 +393,95 @@ async def format_notification(notif: dict) -> str:
     # 未知类型,展示原始内容(截断避免消息过长)
     payload_str = json.dumps(payload, ensure_ascii=False, default=str)[:200]
     return f"{icon} 通知\n类型: {ntype}\n内容: {payload_str}"
+
+
+# R41 P1-12: 幂等通知投递 — 同一 dedup_key 1 小时内不重复投递
+# 用于 TaskCenter / 内容安全等模块在事件触发后通知用户,
+# 避免短时间内重复触发同一通知(如重试任务多次完成)。
+_NOTIF_DEDUP_TTL_SECONDS = 3600  # 去重窗口 1 小时
+
+
+async def dispatch_notification(
+    user_id: int,
+    type: str,
+    content: dict,
+    dedup_key: str = "",
+) -> int:
+    """R41 P1-12: 幂等通知投递(基于 dedup_key 1 小时去重)。
+
+    与 ``send()`` 的区别:
+        - ``send()`` 无去重,每次调用都会插入新通知
+        - ``dispatch_notification()`` 基于 dedup_key 去重:
+          同一 dedup_key 在最近 1 小时内已投递过 → 跳过(返回 0)
+          未投递 → 写入通知并记录 dedup_key + 投递时间
+
+    Args:
+        user_id: 用户 ID
+        type: 通知类型(NOTIF_TYPE_*)
+        content: 通知内容(等同于 send() 的 payload)
+        dedup_key: 去重键(为空时不进行去重,等同 send())
+
+    Returns:
+        notif_id(>0 投递成功);0 表示因去重跳过或失败
+
+    Example:
+        # TaskCenter 完成任务后触发通知(同 dedup_key 1 小时内不重复)
+        await notifications.dispatch_notification(
+            user_id=12345,
+            type="ready",
+            content={"file_code": "ABC123"},
+            dedup_key=f"task_complete:{task_id}",
+        )
+    """
+    if not dedup_key:
+        # 无 dedup_key,直接调用 send()(不进行去重)
+        return await send(user_id, type, content)
+
+    store = get_cache_store()
+    if not store._db:
+        logger.warning("[notifications] dispatch_notification CacheStore 未初始化")
+        return 0
+
+    # 计算去重窗口起始时间(1 小时前)
+    now_dt = _dt.datetime.now()
+    window_start_iso = (now_dt - _dt.timedelta(seconds=_NOTIF_DEDUP_TTL_SECONDS)).isoformat()
+
+    # 查询 notifications 表中同一 dedup_key + user_id 是否在窗口内已存在
+    # 注:dedup_key 存储在 payload 中(避免修改 schema),格式: {"_dedup_key": "..."}
+    try:
+        cursor = await store._db.execute(
+            """SELECT id FROM notifications
+               WHERE user_id = ?
+                 AND payload LIKE ?
+                 AND created_at >= ?
+               ORDER BY id DESC LIMIT 1""",
+            (user_id, f'%"_dedup_key": "{dedup_key}"%', window_start_iso),
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            # 已在窗口内投递过,跳过(幂等去重)
+            logger.info(
+                f"[notifications] dispatch_notification 去重命中 "
+                f"user_id={user_id} dedup_key={dedup_key} existing_id={row[0]}"
+            )
+            return 0
+    except Exception as e:
+        # 查询失败时降级为直接发送(fail-open,不阻塞业务)
+        logger.warning(
+            f"[notifications] dispatch_notification 去重查询失败,降级为 send(): {e}"
+        )
+        return await send(user_id, type, content)
+
+    # 注入 dedup_key 到 content,以便后续去重查询
+    enriched_content = dict(content) if content else {}
+    enriched_content["_dedup_key"] = dedup_key
+    enriched_content["_dedup_window"] = _NOTIF_DEDUP_TTL_SECONDS
+
+    # 调用 send() 写入通知(同事务模式)
+    notif_id = await send(user_id, type, enriched_content)
+    if notif_id:
+        logger.info(
+            f"[notifications] dispatch_notification 投递成功 "
+            f"id={notif_id} user_id={user_id} type={type} dedup_key={dedup_key}"
+        )
+    return notif_id

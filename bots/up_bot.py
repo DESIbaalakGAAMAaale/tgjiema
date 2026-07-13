@@ -39,6 +39,24 @@ from utils.file_utils import detect_file_type, extract_file_meta
 from utils.relay_auth import is_relay_sender_allowed
 # R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
 from services.maintenance_mode import require_maintenance_check
+# R41 i18n: 国际化翻译(用户可见文本)
+from services.i18n import translate as _i18n_t, get_i18n_manager
+
+
+def _t(user_id: int, key: str, **kwargs) -> str:
+    """R41 i18n: 获取用户 locale 并翻译 key(带插值)。
+
+    Args:
+        user_id: Telegram 用户 ID(用于查询 locale 偏好)
+        key: 翻译 key(如 "bot.upload_banned")
+        **kwargs: 插值参数
+
+    Returns:
+        本地化字符串
+    """
+    manager = get_i18n_manager()
+    locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
+    return manager.format_message(key, locale=locale, **kwargs)
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
 
@@ -672,22 +690,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     from services.permission import get_or_create_user
     await get_or_create_user(user.id, user.username, user.first_name)
+    # R41 i18n: 欢迎语文本走 locale 翻译
     await safe_reply_text(update.message,
-        "📤 欢迎使用上传机器人\n\n"
-        "1. 单次上传：直接发送文件，立即生成文件码\n\n"
-        "2. 批次上传（所有文件共用一个文件码）：\n"
-        "  /start_upload — 开始批次上传\n"
-        "  发送多个文件...\n"
-        "  /end_upload — 结束批次，生成文件码\n\n"
-        "3. 合集打包（多个文件码打包成一个合集码）：\n"
-        "  /new_collection — 开始合集打包\n"
-        "  发送文件码（可多次追加）...\n"
-        "  /end_collection — 生成合集码\n"
-        "  /cancel_collection — 取消合集打包\n"
-        "  /note_collection 文字 — 添加备注\n\n"
-        "所有用户均可免费上传文件\n"
-        "发送 /help 查看完整帮助\n"
-        + three_bot_reminder()
+        "📤 " + _t(user.id, "bot.upload_start_welcome")
+        + "\n" + three_bot_reminder()
     )
 
 
@@ -723,7 +729,8 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     if not await check_upload_permission(user.id):
-        await update.message.reply_text("您被禁止使用上传功能")
+        # R41 i18n: 上传禁用文本走 locale 翻译
+        await update.message.reply_text("🚫 " + _t(user.id, "bot.upload_banned"))
         return
 
     target_channel_id = await _get_upload_target_channel()
@@ -735,11 +742,9 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "target_channel_id": target_channel_id,
         "src_messages": [],
     }
+    # R41 i18n: 批次上传模式提示走 locale 翻译
     await update.message.reply_text(
-        "📦 已进入批次上传模式，请发送文件。\n"
-        "发送 /end_upload 结束并生成文件码。\n"
-        "发送 /cancel_upload 取消本次上传。\n\n"
-        "💬 可使用 /note 文字 为本次批次添加备注"
+        "📦 " + _t(user.id, "bot.batch_upload_started")
     )
 
 
@@ -776,7 +781,8 @@ async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     if not await check_upload_permission(user.id):
-        await update.message.reply_text("您被禁止使用上传功能")
+        # R41 i18n: 上传禁用文本走 locale 翻译
+        await update.message.reply_text("🚫 " + _t(user.id, "bot.upload_banned"))
         return
     if "batch" in context.user_data:
         await update.message.reply_text("当前正在进行批次上传，请先 /end_upload 或 /cancel_upload")
@@ -785,13 +791,9 @@ async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "codes": [],
         "note": "",
     }
+    # R41 i18n: 合集打包模式提示走 locale 翻译
     await update.message.reply_text(
-        "📦 已进入合集打包模式。\n\n"
-        "请发送要打包的文件码(每行一个或空格分隔),\n"
-        "可多次发送以追加文件码。\n\n"
-        "发 /end_collection 完成打包并生成合集码。\n"
-        "发 /cancel_collection 取消本次合集打包。\n"
-        "发 /note_collection 文字 为合集添加备注"
+        "📦 " + _t(user.id, "bot.collection_packing_started")
     )
 
 
@@ -1070,7 +1072,8 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     logger.error(f"[Up] 单文件复制失败: {e}")
 
     if not channel_msg_ids:
-        await update.message.reply_text("文件处理失败，请稍后重试")
+        # R41 i18n: 文件处理失败提示走 locale 翻译
+        await update.message.reply_text("⚠️ " + _t(user.id, "bot.file_processing_failed"))
         await metrics.record_error("up_bot")
         # R35 P0-4: 批次全部文件复制失败,推进 FAILED_RETRYABLE
         await _transition_upload_session_safe(
@@ -1217,13 +1220,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not await global_rate_limiter.acquire():
-        await update.message.reply_text("系统繁忙，请稍后重试")
+        # R41 i18n: 限速提示走 locale 翻译
+        await update.message.reply_text("⚠️ " + _t(user.id, "bot.system_busy"))
         return
     if not await user_rate_limiter.acquire(user.id):
-        await update.message.reply_text("操作过于频繁，请稍后重试")
+        # R41 i18n: 用户限速提示走 locale 翻译
+        await update.message.reply_text("⚠️ " + _t(user.id, "bot.rate_limited"))
         return
     if not await check_upload_permission(user.id):
-        await update.message.reply_text("您没有上传权限")
+        # R41 i18n: 上传权限提示走 locale 翻译
+        await update.message.reply_text("🚫 " + _t(user.id, "bot.no_upload_permission"))
         return
 
     file_type = detect_file_type(update)
@@ -1235,13 +1241,16 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user = update.effective_user
     # P2: 媒体组上传同样需要限速,防止数十文件洪泛
     if not await global_rate_limiter.acquire():
-        await update.message.reply_text("系统繁忙，请稍后重试")
+        # R41 i18n: 限速提示走 locale 翻译
+        await update.message.reply_text("⚠️ " + _t(user.id, "bot.system_busy"))
         return
     if not await user_rate_limiter.acquire(user.id):
-        await update.message.reply_text("操作过于频繁，请稍后重试")
+        # R41 i18n: 用户限速提示走 locale 翻译
+        await update.message.reply_text("⚠️ " + _t(user.id, "bot.rate_limited"))
         return
     if not await check_upload_permission(user.id):
-        await update.message.reply_text("您没有上传权限")
+        # R41 i18n: 上传权限提示走 locale 翻译
+        await update.message.reply_text("🚫 " + _t(user.id, "bot.no_upload_permission"))
         return
 
     file_type = detect_file_type(update)
@@ -1439,7 +1448,8 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             last_error="media_group all copies failed",
         )
         try:
-            await progress_msg.edit_text("文件处理失败，请稍后重试")
+            # R41 i18n: 文件处理失败提示走 locale 翻译
+            await progress_msg.edit_text("⚠️ " + _t(user_id, "bot.file_processing_failed"))
         except Exception:
             pass
         return
@@ -1545,7 +1555,7 @@ async def _process_upload(
                 upload_id, "FAILED_RETRYABLE", reason=f"copy_failed: {e}",
                 last_error=str(e),
             )
-            await update.message.reply_text("文件处理失败，请稍后重试")
+            await update.message.reply_text("⚠️ " + _t(user.id, "bot.file_processing_failed"))
             return
 
         # R36 B0-2: R100 归档改由 OutboxWorker 消费 upload_outbox 表完成(不再 fire-and-forget)
@@ -1875,9 +1885,36 @@ async def _finalize_upload(query, context, user_id: int):
         metrics.upload_count += 1
         await metrics.record_processed("up_bot")
 
+        # R41 P1-12: 上传成功后记录到 TaskCenter(便于用户查看任务进度)
+        # 注:此时 file_code 尚未生成(由 idx_bot 后续生成),
+        # 这里记录 upload_id + 文件数,作为上传事件的任务追踪
+        try:
+            _upload_count_meta = 1
+            if pending_batch:
+                _upload_count_meta = int(pending_batch.get("total_count", 1) or 1)
+            elif pending_mg:
+                _upload_count_meta = len(
+                    [x for x in (pending_mg.get("batch_msg_ids", "") or "").split(",") if x.strip().isdigit()]
+                ) or 1
+            await task_center.record_task(
+                user_id=user_id,
+                task_type="upload",
+                status="completed",
+                metadata={
+                    "upload_id": upload_id,
+                    "file_count": _upload_count_meta,
+                    "channel_id": _outbox_channel_id,
+                    "note": "pending_file_code_generation",
+                },
+            )
+        except Exception as task_err:
+            logger.warning(f"[Up] R41 P1-12: record_task 失败(不影响上传): {task_err}")
+
         # 清除按钮，显示确认消息
+        # R41 i18n: 文件接收确认走 locale 翻译
         await query.edit_message_text(
-            text=f"文件已接收，文件码将由 @{settings.DECODER_BOT_USERNAME} 发送给你",
+            text="📦 " + _t(user_id, "bot.file_received_pending",
+                            bot_username=settings.DECODER_BOT_USERNAME),
             reply_markup=None,
         )
     except Exception as e:
@@ -1889,7 +1926,10 @@ async def _finalize_upload(query, context, user_id: int):
             last_error=str(e),
         )
         try:
-            await query.edit_message_text(text="文件处理失败，请稍后重试")
+            # R41 i18n: 文件处理失败提示走 locale 翻译
+            await query.edit_message_text(
+                text="⚠️ " + _t(user_id, "bot.file_processing_failed")
+            )
         except Exception:
             pass
 

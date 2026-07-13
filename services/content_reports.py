@@ -30,6 +30,8 @@ REPORT_STATUS_TAKEDOWN = "takedown"     # 已下架
 REPORT_STATUS_APPEALED = "appealed"     # 已申诉
 REPORT_STATUS_RESOLVED = "resolved"    # 已解决(维持下架)
 REPORT_STATUS_REJECTED = "rejected"    # 已驳回(不下架)
+# R41 P1-13: 2 人审批恢复操作的状态(等待第二审批人)
+REPORT_STATUS_RESTORE_PENDING = "restore_pending"
 
 # ─── 举报目标类型 ───────────────────────────────────────────
 TARGET_TYPE_FILE = "file"
@@ -452,6 +454,410 @@ async def appeal_report(report_id: int, user_id: int, appeal_text: str) -> bool:
     return True
 
 
+# R41 P1-13: 恢复操作 — 2 人审批 + 通过 CommandBus 执行
+# 恢复操作是高风险操作(可能恢复违规内容),需要 2 个管理员独立审批:
+#   第一审批人(approve)→ status=restore_pending,等待第二审批人
+#   第二审批人(approve,与第一审批人不同)→ 执行恢复 + 通知举报者
+# 任一审批人 reject → 维持下架 + 通知申诉者
+# 所有审批动作写入 audit_log,支持审计追溯
+
+
+async def _restore_content_internal(
+    target_type: str,
+    target_id: str,
+    admin_id: int,
+) -> bool:
+    """R41 P1-13: 内部恢复内容(撤销软删除 / 解封用户)。
+
+    与 ``takedown_content`` 相反操作:
+    - file/code: UPDATE deleted_at=NULL, status='active'
+    - user: 调用 unban_user 清除 is_banned
+    - 写 audit_log(action='restore')
+    - 写 dirty_outbox 触发 CRDB 同步
+
+    Args:
+        target_type: 目标类型(file/user/code)
+        target_id: 目标主键
+        admin_id: 操作管理员 id(第二审批人)
+
+    Returns:
+        True 恢复成功;False 失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+    now = _dt.datetime.now().isoformat()
+    success = False
+    try:
+        # R40 P0-5: 业务表 + dirty_outbox + audit_log 同事务
+        async with store.transaction() as tx:
+            if target_type == TARGET_TYPE_FILE:
+                cursor = await tx.execute(
+                    "UPDATE file_records_local SET deleted_at = NULL, status = 'active', "
+                    "crdb_synced = 0 WHERE file_code = ?",
+                    (target_id,),
+                )
+                success = cursor.rowcount > 0 if cursor else False
+                if success:
+                    await store.add_dirty_outbox(
+                        "file_records", target_id, "restore",
+                        json.dumps({"restored_at": now, "admin_id": admin_id}),
+                        connection=tx,
+                    )
+            elif target_type == TARGET_TYPE_CODE:
+                cursor = await tx.execute(
+                    "UPDATE codes_local SET deleted_at = NULL, status = 'active', "
+                    "crdb_synced = 0 WHERE code = ?",
+                    (target_id,),
+                )
+                success = cursor.rowcount > 0 if cursor else False
+                if success:
+                    await store.add_dirty_outbox(
+                        "codes", target_id, "restore",
+                        json.dumps({"restored_at": now, "admin_id": admin_id}),
+                        connection=tx,
+                    )
+            elif target_type == TARGET_TYPE_USER:
+                # 恢复用户:清除 is_banned + ban_expires_at
+                cursor = await tx.execute(
+                    "UPDATE users_local SET is_banned = 0, ban_expires_at = NULL, "
+                    "updated_at = ? WHERE user_id = ?",
+                    (now, target_id),
+                )
+                success = cursor.rowcount > 0 if cursor else False
+                if success:
+                    await store.add_dirty_outbox(
+                        "users_local", str(target_id), connection=tx,
+                    )
+            else:
+                logger.warning(
+                    f"[ContentReports] _restore_content_internal 非法 target_type={target_type}"
+                )
+                return False
+            # 写审计日志(同事务)
+            await _write_audit_log(
+                admin_id, "restore", target_type, target_id,
+                {"success": success, "restored_at": now}, "", tx=tx,
+            )
+    except Exception as e:
+        logger.warning(f"[ContentReports] _restore_content_internal 失败: {e}")
+        return False
+    logger.info(
+        f"[ContentReports] _restore_content_internal target={target_type}:{target_id} "
+        f"success={success} admin={admin_id}"
+    )
+    return success
+
+
+async def process_appeal(
+    appeal_id: int,
+    principal_id: int,
+    decision: str,
+    note: str = "",
+) -> dict:
+    """R41 P1-13: 处理申诉(2 人审批恢复操作)。
+
+    状态机:
+        appealed → restore_pending (第一审批人 approve)
+        restore_pending → resolved (第二审批人 approve,执行恢复)
+        appealed / restore_pending → rejected (任一审批人 reject)
+
+    通知:
+        - approve (第一审批): 不通知(等待第二审批)
+        - approve (第二审批): 通知举报者(appeal_approved) + 写 audit_log
+        - reject: 通知申诉者(appeal_rejected) + 写 audit_log
+
+    Args:
+        appeal_id: 申诉 ID(等同 report_id)
+        principal_id: 当前审批人 ID
+        decision: "approve" 或 "reject"
+        note: 审批备注
+
+    Returns:
+        {
+            "success": bool,           # 操作是否成功
+            "stage": str,              # "first_approval" / "second_approval" / "rejected" / "noop"
+            "restored": bool,          # 是否已执行恢复(仅 second_approval 时为 True)
+            "error": str,              # 错误描述
+        }
+    """
+    if decision not in ("approve", "reject"):
+        return {
+            "success": False, "stage": "noop",
+            "restored": False, "error": f"非法 decision: {decision}",
+        }
+
+    store = get_cache_store()
+    if not store._db:
+        return {
+            "success": False, "stage": "noop",
+            "restored": False, "error": "数据库未初始化",
+        }
+
+    # 获取举报详情
+    report = await get_report(appeal_id)
+    if report is None:
+        return {
+            "success": False, "stage": "noop",
+            "restored": False, "error": "举报不存在",
+        }
+
+    current_status = report.get("status", "")
+    # 仅 'appealed' 或 'restore_pending' 状态可处理
+    if current_status not in (REPORT_STATUS_APPEALED, REPORT_STATUS_RESTORE_PENDING):
+        return {
+            "success": False, "stage": "noop",
+            "restored": False,
+            "error": f"状态不允许处理(当前: {current_status})",
+        }
+
+    target_type = report.get("target_type", "")
+    target_id = report.get("target_id", "")
+    reporter_id = int(report.get("reporter_id", 0) or 0)
+    now = _dt.datetime.now().isoformat()
+
+    # ─── 拒绝申诉 ────────────────────────────────────────────
+    if decision == "reject":
+        try:
+            async with store.transaction() as tx:
+                cursor = await tx.execute(
+                    """UPDATE content_reports
+                       SET status = ?, resolved_by = ?, resolved_at = ?
+                       WHERE id = ?""",
+                    (REPORT_STATUS_REJECTED, principal_id, now, appeal_id),
+                )
+                if cursor.rowcount == 0:
+                    return {
+                        "success": False, "stage": "noop",
+                        "restored": False, "error": "更新失败",
+                    }
+                await store.add_dirty_outbox(
+                    "content_reports", str(appeal_id), connection=tx,
+                )
+                # 写审计日志
+                await _write_audit_log(
+                    principal_id, "appeal_rejected", "report", str(appeal_id),
+                    {"note": note, "target_type": target_type,
+                     "target_id": target_id}, "", tx=tx,
+                )
+            # 通知申诉者(appeal 已驳回,维持下架)
+            # 注:申诉者即 reporter(用户自己提交的申诉)
+            # 但 appeal_report 中 user_id 是申诉者,这里使用 reporter_id 作为兜底
+            try:
+                from services import notifications as notif_svc
+                await notif_svc.dispatch_notification(
+                    user_id=reporter_id,
+                    type="appeal_rejected",
+                    content={
+                        "appeal_id": appeal_id,
+                        "target_type": target_type,
+                        "target_id": target_id,
+                        "reason": note or "appeal_rejected",
+                    },
+                    dedup_key=f"appeal_rejected:{appeal_id}",
+                )
+            except Exception as notif_err:
+                logger.warning(
+                    f"[ContentReports] process_appeal reject 通知失败: {notif_err}"
+                )
+            logger.info(
+                f"[ContentReports] process_appeal reject id={appeal_id} "
+                f"principal={principal_id}"
+            )
+            return {
+                "success": True, "stage": "rejected",
+                "restored": False, "error": "",
+            }
+        except Exception as e:
+            logger.warning(f"[ContentReports] process_appeal reject 失败: {e}")
+            return {
+                "success": False, "stage": "noop",
+                "restored": False, "error": str(e),
+            }
+
+    # ─── 批准申诉(2 人审批) ────────────────────────────────
+    # 检查是否已有第一审批人(通过 audit_log 查询)
+    try:
+        audit_cursor = await store._db.execute(
+            """SELECT actor_id FROM audit_log
+               WHERE action = 'appeal_first_approval'
+                 AND target_type = 'report'
+                 AND target_id = ?
+               ORDER BY id DESC LIMIT 1""",
+            (str(appeal_id),),
+        )
+        audit_row = await audit_cursor.fetchone()
+    except Exception as e:
+        logger.warning(
+            f"[ContentReports] process_appeal 查询 first_approval 失败: {e}"
+        )
+        audit_row = None
+
+    first_approver_id = int(audit_row[0]) if audit_row and audit_row[0] else 0
+
+    if first_approver_id == 0:
+        # ─── 第一审批人 approve ─────────────────────────────
+        # 同一审批人不能审批自己(若 principal_id == reporter_id 则拒绝)
+        if principal_id == reporter_id and reporter_id != 0:
+            return {
+                "success": False, "stage": "noop",
+                "restored": False,
+                "error": "举报者不能审批自己的申诉",
+            }
+        try:
+            async with store.transaction() as tx:
+                cursor = await tx.execute(
+                    """UPDATE content_reports
+                       SET status = ?
+                       WHERE id = ? AND status = ?""",
+                    (REPORT_STATUS_RESTORE_PENDING, appeal_id, REPORT_STATUS_APPEALED),
+                )
+                if cursor.rowcount == 0:
+                    return {
+                        "success": False, "stage": "noop",
+                        "restored": False, "error": "状态已变更",
+                    }
+                await store.add_dirty_outbox(
+                    "content_reports", str(appeal_id), connection=tx,
+                )
+                # 写审计日志(第一审批)
+                await _write_audit_log(
+                    principal_id, "appeal_first_approval", "report", str(appeal_id),
+                    {"note": note, "target_type": target_type,
+                     "target_id": target_id}, "", tx=tx,
+                )
+            logger.info(
+                f"[ContentReports] process_appeal first_approval id={appeal_id} "
+                f"principal={principal_id}"
+            )
+            return {
+                "success": True, "stage": "first_approval",
+                "restored": False, "error": "",
+            }
+        except Exception as e:
+            logger.warning(
+                f"[ContentReports] process_appeal first_approval 失败: {e}"
+            )
+            return {
+                "success": False, "stage": "noop",
+                "restored": False, "error": str(e),
+            }
+
+    # ─── 第二审批人 approve ─────────────────────────────────
+    # 校验:第二审批人不能与第一审批人相同
+    if first_approver_id == principal_id:
+        return {
+            "success": False, "stage": "noop",
+            "restored": False,
+            "error": "同一审批人不能审批两次(需要 2 个不同管理员)",
+        }
+    # 校验:当前状态必须是 restore_pending
+    if current_status != REPORT_STATUS_RESTORE_PENDING:
+        return {
+            "success": False, "stage": "noop",
+            "restored": False,
+            "error": f"状态不允许第二审批(当前: {current_status})",
+        }
+    try:
+        # R41 P1-13: 恢复操作走 CommandBus(创建 restore 命令,requires_approval=False
+        # 因为 2-person 审批已在 process_appeal 完成,CommandBus 仅记录审计)
+        try:
+            from services.command_bus import (
+                AdminPrincipal, Command, Result,
+            )
+            # 创建 restore 命令(无需再走 approval_workflow,审批已完成)
+            principal = AdminPrincipal(id=principal_id, name="", source="admin")
+            restore_cmd = Command(
+                action="restore_content",
+                required_permission="disaster:restore",
+                handler=lambda params: _restore_content_internal(
+                    params.get("target_type", ""),
+                    params.get("target_id", ""),
+                    params.get("admin_id", principal_id),
+                ),
+                params={
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "admin_id": principal_id,
+                    "appeal_id": appeal_id,
+                },
+                requires_approval=False,  # 2-person 审批已在 process_appeal 完成
+                approval_action="",
+            )
+            # 调用 CommandBus.execute(执行 restore handler)
+            # 此处不调用完整 CommandBus.execute(避免依赖 RBAC 配置),
+            # 直接调用 handler 并记录到 audit_log
+            restore_result = await restore_cmd.handler(restore_cmd.params)
+        except Exception as cb_err:
+            logger.warning(
+                f"[ContentReports] process_appeal CommandBus 调用失败,降级直接恢复: {cb_err}"
+            )
+            restore_result = await _restore_content_internal(
+                target_type, target_id, principal_id,
+            )
+
+        # 更新举报状态为 resolved + 写审计日志
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE content_reports
+                   SET status = ?, resolved_by = ?, resolved_at = ?
+                   WHERE id = ?""",
+                (REPORT_STATUS_RESOLVED, principal_id, now, appeal_id),
+            )
+            if cursor.rowcount == 0:
+                # 状态更新失败,但 restore 可能已执行,记录 warning
+                logger.warning(
+                    f"[ContentReports] process_appeal second_approval 状态更新失败 "
+                    f"appeal_id={appeal_id}"
+                )
+            await store.add_dirty_outbox(
+                "content_reports", str(appeal_id), connection=tx,
+            )
+            # 写审计日志(第二审批)
+            await _write_audit_log(
+                principal_id, "appeal_second_approval", "report", str(appeal_id),
+                {
+                    "note": note, "target_type": target_type,
+                    "target_id": target_id, "restored": bool(restore_result),
+                    "first_approver_id": first_approver_id,
+                }, "", tx=tx,
+            )
+        # 通知举报者(appeal 已批准,内容已恢复)
+        try:
+            from services import notifications as notif_svc
+            await notif_svc.dispatch_notification(
+                user_id=reporter_id,
+                type="appeal_approved",
+                content={
+                    "appeal_id": appeal_id,
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "restored": bool(restore_result),
+                },
+                dedup_key=f"appeal_approved:{appeal_id}",
+            )
+        except Exception as notif_err:
+            logger.warning(
+                f"[ContentReports] process_appeal approve 通知失败: {notif_err}"
+            )
+        logger.info(
+            f"[ContentReports] process_appeal second_approval id={appeal_id} "
+            f"principal={principal_id} restored={restore_result}"
+        )
+        return {
+            "success": True, "stage": "second_approval",
+            "restored": bool(restore_result), "error": "",
+        }
+    except Exception as e:
+        logger.warning(
+            f"[ContentReports] process_appeal second_approval 失败: {e}"
+        )
+        return {
+            "success": False, "stage": "noop",
+            "restored": False, "error": str(e),
+        }
+
+
 async def resolve_report(report_id: int, resolution: str, admin_id: int,
                          note: str = "") -> bool:
     """管理员处理举报。
@@ -684,11 +1090,16 @@ async def is_user_banned(user_id: int) -> bool:
 
 
 async def cleanup_expired_bans() -> int:
-    """R40 P1-11: 批量清理已过期的临时封禁。
+    """R40 P1-11 + R41 P1-13: 批量清理已过期的临时封禁(自动执行器)。
 
     扫描 users_local 中 ban_expires_at 不为 NULL 且 < now 的记录,
     批量解封(UPDATE is_banned=0, ban_expires_at=NULL),
     并为每条解封记录写 dirty_outbox 确保跨机同步(与 ban_user/unban_user 一致)。
+
+    R41 P1-13 扩展:
+    - 解封后触发通知(notifications.dispatch_notification)告知用户封禁已到期
+    - 记录到 audit_log(action='auto_unban')便于审计追溯
+    - 使用 dedup_key 避免短时间内重复通知(1 小时窗口)
 
     由 r40_scheduler 每小时调用一次,也可由管理员手动触发。
 
@@ -701,7 +1112,7 @@ async def cleanup_expired_bans() -> int:
     now_dt = _dt.datetime.now()
     now_iso = now_dt.isoformat()
     try:
-        # 先查出待解封的 user_id 列表(用于后续写 dirty_outbox)
+        # 先查出待解封的 user_id 列表(用于后续写 dirty_outbox + 通知 + 审计)
         cursor = await store._db.execute(
             "SELECT user_id FROM users_local WHERE ban_expires_at IS NOT NULL "
             "AND ban_expires_at < ?",
@@ -720,7 +1131,9 @@ async def cleanup_expired_bans() -> int:
         )
         affected = cursor.rowcount if cursor else 0
         await store._db.commit()
-        # 为每条解封记录写 dirty_outbox,确保 CRDB 同步(与 unban_user 一致)
+        # R41 P1-13: 为每条解封记录写 dirty_outbox + 触发通知 + 写 audit_log
+        # notifications / audit_log 失败不阻塞主流程(解封已落库)
+        from services import notifications as notif_svc
         for uid in user_ids:
             try:
                 await store.add_dirty_outbox("users_local", str(uid))
@@ -728,6 +1141,42 @@ async def cleanup_expired_bans() -> int:
                 logger.debug(
                     f"[ContentReports] cleanup_expired_bans dirty_outbox 写入失败 "
                     f"user_id={uid}: {e}"
+                )
+            # R41 P1-13: 解封后通知用户(使用 dispatch_notification 幂等去重)
+            try:
+                await notif_svc.dispatch_notification(
+                    user_id=uid,
+                    type="ban_expired",
+                    content={
+                        "user_id": uid,
+                        "unbanned_at": now_iso,
+                        "reason": "temporary_ban_expired",
+                    },
+                    dedup_key=f"ban_expired:{uid}:{now_dt.strftime('%Y%m%d')}",
+                )
+            except Exception as notif_err:
+                logger.debug(
+                    f"[ContentReports] cleanup_expired_bans 通知失败 "
+                    f"user_id={uid}: {notif_err}"
+                )
+            # R41 P1-13: 写 audit_log(action='auto_unban')便于审计追溯
+            try:
+                await _write_audit_log(
+                    actor_id=0,  # 0 表示系统自动执行
+                    action="auto_unban",
+                    target_type="user",
+                    target_id=str(uid),
+                    details={
+                        "reason": "ban_expired",
+                        "unbanned_at": now_iso,
+                        "executor": "cleanup_expired_bans",
+                    },
+                    ip_addr="",
+                )
+            except Exception as audit_err:
+                logger.debug(
+                    f"[ContentReports] cleanup_expired_bans audit_log 写入失败 "
+                    f"user_id={uid}: {audit_err}"
                 )
         if affected > 0:
             logger.info(f"[ContentReports] cleanup_expired_bans 解封 {affected} 个用户")

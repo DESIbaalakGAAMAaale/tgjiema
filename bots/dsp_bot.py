@@ -21,7 +21,7 @@ from loguru import logger
 from config import settings
 from database import get_file_record_cached, get_pending_jobs_count_local
 from storage.delivery_resolver import resolve_delivery_channel, try_deliver, try_deliver_batch, invalidate_cell_cache
-from services import upload_receipt, notifications
+from services import upload_receipt, notifications, task_center
 from utils.per_channel_limiter import _channel_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
@@ -34,6 +34,24 @@ from utils.flood_waiter import (
 from utils.task_utils import create_safe_task
 # R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
 from services.maintenance_mode import require_maintenance_check
+# R41 i18n: 国际化翻译(用户可见文本)
+from services.i18n import get_i18n_manager
+
+
+def _t(user_id: int, key: str, **kwargs) -> str:
+    """R41 i18n: 获取用户 locale 并翻译 key(带插值)。
+
+    Args:
+        user_id: Telegram 用户 ID(用于查询 locale 偏好)
+        key: 翻译 key(如 "bot.file_send_failed")
+        **kwargs: 插值参数
+
+    Returns:
+        本地化字符串
+    """
+    manager = get_i18n_manager()
+    locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
+    return manager.format_message(key, locale=locale, **kwargs)
 
 TOKEN = settings.SENDER_BOT_TOKEN
 PAGE_SIZE = settings.PAGE_SIZE
@@ -934,6 +952,23 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             await _edit_sent_caption(bot, job.target_user_id, sent_msg_id, caption)
         await metrics.record_send_success()
         await metrics.record_processed("dsp_bot")
+        # R41 P1-12: 派送成功后记录到 TaskCenter
+        try:
+            await task_center.record_task(
+                user_id=job.target_user_id,
+                task_type="delivery",
+                status="completed",
+                metadata={
+                    "file_code": job.code,
+                    "channel_id": job.storage_channel_id,
+                    "job_id": job.job_id,
+                    "sent_msg_id": sent_msg_id,
+                },
+            )
+        except Exception as task_err:
+            logger.warning(
+                f"[Dsp] R41 P1-12: record_task 失败(不影响派送): {task_err}"
+            )
         return True
 
     # 所有槽位均不可用,记录失败
@@ -946,7 +981,11 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     await metrics.record_send_fail()
     await metrics.record_error("dsp_bot")
     try:
-        await safe_send_message(bot, chat_id=job.target_user_id, text="文件发送失败，请稍后重试或联系管理员")
+        # R41 i18n: 文件发送失败提示走 locale 翻译(用 job.target_user_id 作为 locale 来源)
+        await safe_send_message(
+            bot, chat_id=job.target_user_id,
+            text="❌ " + _t(job.target_user_id, "bot.file_send_failed"),
+        )
     except Exception:
         pass
     return False
@@ -1151,7 +1190,11 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                 await metrics.record_send_fail()
                 await metrics.record_error("dsp_bot")
                 try:
-                    await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
+                    # R41 i18n: 文件发送失败提示走 locale 翻译
+                    await safe_send_message(
+                        bot, chat_id=chat_id,
+                        text="❌ " + _t(chat_id, "bot.file_send_failed"),
+                    )
                 except Exception:
                     pass
                 return False
@@ -1171,7 +1214,11 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             await metrics.record_send_fail()
             await metrics.record_error("dsp_bot")
             try:
-                await safe_send_message(bot, chat_id=chat_id, text="文件发送失败，请稍后重试或联系管理员")
+                # R41 i18n: 文件发送失败提示走 locale 翻译
+                await safe_send_message(
+                    bot, chat_id=chat_id,
+                    text="❌ " + _t(chat_id, "bot.file_send_failed"),
+                )
             except Exception:
                 pass
             return False
@@ -1252,11 +1299,13 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # A2: 走缓存,避免每次直查 CRDB
         file_record = await get_file_record_cached(file_code)
         if not file_record:
-            await query.answer("文件记录不存在", show_alert=True)
+            # R41 i18n: 文件不存在提示走 locale 翻译
+            await query.answer(_t(reporter.id, "errors.file.not_found"), show_alert=True)
             return
     except Exception as e:
         logger.error(f"[Dsp][report] 查询文件失败: {e}")
-        await query.answer("系统繁忙，请稍后重试", show_alert=True)
+        # R41 i18n: 系统繁忙提示走 locale 翻译
+        await query.answer(_t(reporter.id, "bot.system_busy"), show_alert=True)
         return
 
     uploader_id = file_record.get("uploader_id", 0)
@@ -1314,12 +1363,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     logger.info(f"[Dsp][start] 用户 {user.id} 已启动，waiting_start jobs 已恢复({len(reactivated_ids)}个)")
 
+    # R41 i18n: 欢迎语文本走 locale 翻译
     await safe_reply_text(update.message,
-        "📥 欢迎使用文件发送机器人！\n\n"
-        "此机器人用于接收解码后的文件，无需手动操作。\n"
-        "当您通过解码机器人获取文件码后，文件会自动发送给您。\n"
-        "发送 /help 查看帮助信息"
-        + three_bot_reminder()
+        "📥 " + _t(user.id, "bot.dsp_start_welcome")
+        + "\n" + three_bot_reminder()
     )
 
 

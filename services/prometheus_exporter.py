@@ -86,6 +86,20 @@ _scrape_errors: int = 0
 # R39 P1-8: 数据新鲜度告警阈值(秒) — 超过此值认为数据陈旧
 _DATA_AGE_ALERT_THRESHOLD = 300  # 5 分钟无成功采集 → 不 ready
 
+# R41 P1-10: 依赖状态跟踪(由 check_readiness 汇总,暴露到 /readiness 与指标)
+# _last_crdb_sync_ts: 最近一次成功 CRDB 同步时间戳(从 kv_store.crdb_sync_last_success 读取)
+# _last_r2_collect_ts: 最近一次 R2 指标采集时间戳(从 kv_store.r2_last_collect_time 读取)
+# _acl_configured: ACL 是否完整配置(REDIS_*_PASSWORD 4 个变量均存在)
+# _schema_valid: backup_schema.validate_schema() 是否通过
+_last_crdb_sync_ts: float = 0.0
+_last_r2_collect_ts: float = 0.0
+_acl_configured: bool = False
+_schema_valid: bool = False
+# R41 P1-10: 依赖新鲜度阈值(秒)
+# CRDB 同步与 R2 采集为周期任务,允许较长间隔(默认 1 小时)
+_CRDB_SYNC_FRESH_THRESHOLD = 3600  # 1 小时无成功同步 → 不 ready
+_R2_COLLECT_FRESH_THRESHOLD = 3600  # 1 小时无 R2 采集 → 不 ready
+
 # ── R40: 新增指标状态(模块级缓存,由后台采集线程更新) ──────
 # 采集由独立守护线程(独立事件循环)周期性执行,HTTP handler 只读取缓存,
 # 避免 /metrics 请求阻塞在异步采集上。采集失败时保持上一次的值(降级)。
@@ -248,6 +262,38 @@ def collect_metrics() -> str:
     lines.append("# TYPE crdb_ru_daily gauge")
     lines.append(f"crdb_ru_daily {crdb_ru}")
 
+    # R41 RU 门禁: tgjiema_crdb_idle_ru_daily — 业务 Bot 空载 RU 每日消耗
+    # 业务 Bot(up/idx/dsp/admin)应只读 SQLite,不触发 CRDB RU。
+    # 理想值 ≤20 RU/天,上限 ≤100 RU/天,超过阈值告警(由 Alertmanager 触发)。
+    # 数据来源: kv_store.crdb_idle_ru_daily(crdb_ru_collector 采集)
+    idle_ru_str = _read_kv_value("crdb_idle_ru_daily", "0")
+    try:
+        idle_ru = float(idle_ru_str)
+    except (TypeError, ValueError):
+        idle_ru = 0.0
+    lines.append(
+        "# HELP tgjiema_crdb_idle_ru_daily 业务 Bot 空载 RU 每日消耗"
+        "(理想 ≤20,上限 ≤100,超阈值告警)"
+    )
+    lines.append("# TYPE tgjiema_crdb_idle_ru_daily gauge")
+    lines.append(f"tgjiema_crdb_idle_ru_daily {idle_ru}")
+
+    # R41 RU 门禁: tgjiema_crdb_idle_ru_alert — 空载 RU 是否超阈值(0/1)
+    # 阈值从环境变量 CRDB_IDLE_RU_DAILY_ALERT_THRESHOLD 读取(默认 100)
+    try:
+        idle_threshold = float(
+            os.getenv("CRDB_IDLE_RU_DAILY_ALERT_THRESHOLD", "100")
+        )
+    except (TypeError, ValueError):
+        idle_threshold = 100.0
+    idle_alert = 1 if idle_ru > idle_threshold else 0
+    lines.append(
+        "# HELP tgjiema_crdb_idle_ru_alert 业务 Bot 空载 RU 是否超阈值告警"
+        "(1=超阈值, 0=正常)"
+    )
+    lines.append("# TYPE tgjiema_crdb_idle_ru_alert gauge")
+    lines.append(f"tgjiema_crdb_idle_ru_alert {idle_alert}")
+
     # 2. redis_pel_depth — Redis Stream pending entries 长度
     pel_str = _read_kv_value("redis_pel_depth", "0")
     try:
@@ -390,18 +436,47 @@ def collect_metrics() -> str:
     lines.append("# TYPE readiness_checks gauge")
     lines.append(f"readiness_checks {readiness['passed']}")
 
+    # R41 P1-10: tgjiema_readiness_status — 整体就绪状态(1=ready, 0=not ready)
+    # 用于 Prometheus 告警规则:readiness_status == 0 → 告警
+    lines.append(
+        "# HELP tgjiema_readiness_status Overall readiness status "
+        "(1=ready, 0=not ready)"
+    )
+    lines.append("# TYPE tgjiema_readiness_status gauge")
+    lines.append(f"tgjiema_readiness_status {1 if readiness['ready'] else 0}")
+
     return "\n".join(lines) + "\n"
 
 
 def check_readiness() -> dict:
-    """R39 P1-8: readiness 检查 — 数据库可读 + 最近采集成功 + 关键 schema 存在。
+    """R39 P1-8 + R41 P1-10: readiness 检查 — 报告真实依赖状态。
 
-    供 /health 端点调用,不满足时返回 503 Service Unavailable。
+    检查项:
+      1. sqlite_readable — cache_store.db 存在且可查询
+      2. recent_scrape — 最近采集成功(_last_scrape_ok + data_age 未超阈值)
+      3. key_schema_exists — 关键业务表存在(file_records_local 等)
+      4. schema_valid — backup_schema.validate_schema() 通过(R41 P1-10)
+      5. crdb_sync_fresh — CRDB 同步最近成功(kv_store.crdb_sync_last_success)
+      6. r2_collector_fresh — R2 指标采集最近成功(kv_store.r2_last_collect_time)
+      7. acl_configured — REDIS_*_PASSWORD 4 个变量均存在(R41 P1-10)
+
+    供 /health 与 /readiness 端点调用,不满足时返回 503 Service Unavailable。
 
     Returns:
-        {"ready": bool, "passed": int, "checks": {name: bool}}
+        {
+            "ready": bool,
+            "passed": int,
+            "checks": {name: bool},
+            "details": {name: str},          # R41 P1-10: 各检查项详细信息
+            "ru_daily_usage": str,           # R41 P1-10: "unknown" if 采集失败,否则数字
+            "last_crdb_sync_age": float,     # R41 P1-10: CRDB 同步距今秒数(-1=从未)
+            "last_r2_collect_age": float,     # R41 P1-10: R2 采集距今秒数(-1=从未)
+        }
     """
+    global _last_crdb_sync_ts, _last_r2_collect_ts, _acl_configured, _schema_valid
     checks: dict[str, bool] = {}
+    details: dict[str, str] = {}
+
     # 1. SQLite 可读(cache_store.db 存在且可查询)
     sqlite_ok = False
     if CACHE_STORE_DB.exists():
@@ -412,8 +487,11 @@ def check_readiness() -> dict:
             conn.execute("SELECT 1 FROM kv_store LIMIT 1")
             conn.close()
             sqlite_ok = True
-        except Exception:
-            sqlite_ok = False
+            details["sqlite_readable"] = f"OK: {CACHE_STORE_DB}"
+        except Exception as e:
+            details["sqlite_readable"] = f"FAIL: {e}"
+    else:
+        details["sqlite_readable"] = f"FAIL: 文件不存在 {CACHE_STORE_DB}"
     checks["sqlite_readable"] = sqlite_ok
 
     # 2. 最近采集成功(_last_scrape_ok + data_age 未超阈值)
@@ -424,6 +502,10 @@ def check_readiness() -> dict:
         and data_age < _DATA_AGE_ALERT_THRESHOLD
     )
     checks["recent_scrape"] = scrape_recent
+    details["recent_scrape"] = (
+        f"OK: data_age={data_age:.1f}s" if scrape_recent
+        else f"FAIL: _last_scrape_ok={_last_scrape_ok}, data_age={data_age:.1f}s"
+    )
 
     # 3. 关键 schema 存在(kv_store 表存在,且至少有一个业务表)
     schema_ok = False
@@ -441,13 +523,142 @@ def check_readiness() -> dict:
             row = cursor.fetchone()
             conn.close()
             schema_ok = row is not None
-        except Exception:
-            schema_ok = False
+            details["key_schema_exists"] = (
+                f"OK: {row[0]}" if row else "FAIL: 无关键业务表"
+            )
+        except Exception as e:
+            details["key_schema_exists"] = f"FAIL: {e}"
+    else:
+        details["key_schema_exists"] = "SKIP: sqlite 不可读"
     checks["key_schema_exists"] = schema_ok
+
+    # 4. R41 P1-10: backup_schema.validate_schema() 校验
+    # validate_schema 返回 {is_valid, missing_tables, extra_tables, source_mismatches, ...}
+    # 这里只检查 is_valid,不阻塞(SQLite-only 部署中部分 CRDB 表可能不适用)
+    try:
+        from services.backup_schema import validate_schema
+        result = validate_schema()
+        _schema_valid = bool(result.get("is_valid", False))
+        # 缺失表与 source 错配为非致命问题(部分部署可能裁剪表),
+        # 但 empty_columns 必须为空(列定义为代码生成的硬要求)
+        empty_cols = result.get("empty_columns", [])
+        # 只要 empty_columns 为空即认为 schema_valid 通过(允许 missing/extra)
+        schema_valid_ok = (not empty_cols)
+        _schema_valid = schema_valid_ok
+        checks["schema_valid"] = schema_valid_ok
+        details["schema_valid"] = (
+            f"OK: empty_columns=[]" if schema_valid_ok
+            else f"FAIL: empty_columns={empty_cols[:5]}"
+        )
+    except Exception as e:
+        _schema_valid = False
+        checks["schema_valid"] = False
+        details["schema_valid"] = f"FAIL: {e}"
+
+    # 5. R41 P1-10: CRDB 同步新鲜度(kv_store.crdb_sync_last_success)
+    # crdb_sync 服务每次成功同步后写入 kv_store.crdb_sync_last_success = ISO 时间戳
+    crdb_sync_age = -1.0
+    if sqlite_ok:
+        try:
+            val = _read_kv_value("crdb_sync_last_success", "")
+            if val:
+                # 尝试解析 ISO 时间戳
+                try:
+                    sync_dt = _dt.datetime.fromisoformat(val)
+                    _last_crdb_sync_ts = sync_dt.timestamp()
+                    crdb_sync_age = time.time() - _last_crdb_sync_ts
+                except (ValueError, TypeError):
+                    # 兼容数字时间戳
+                    try:
+                        _last_crdb_sync_ts = float(val)
+                        crdb_sync_age = time.time() - _last_crdb_sync_ts
+                    except (ValueError, TypeError):
+                        crdb_sync_age = -1.0
+        except Exception:
+            pass
+    crdb_sync_fresh = (
+        crdb_sync_age >= 0
+        and crdb_sync_age < _CRDB_SYNC_FRESH_THRESHOLD
+    )
+    checks["crdb_sync_fresh"] = crdb_sync_fresh
+    details["crdb_sync_fresh"] = (
+        f"OK: age={crdb_sync_age:.1f}s" if crdb_sync_fresh
+        else f"FAIL: age={crdb_sync_age:.1f}s, last_ts={_last_crdb_sync_ts}"
+    )
+
+    # 6. R41 P1-10: R2 采集新鲜度(kv_store.r2_last_collect_time)
+    # r2_collector 服务每次成功采集后写入 kv_store.r2_last_collect_time = ISO 时间戳
+    r2_collect_age = -1.0
+    if sqlite_ok:
+        try:
+            val = _read_kv_value("r2_last_collect_time", "")
+            if val:
+                try:
+                    collect_dt = _dt.datetime.fromisoformat(val)
+                    _last_r2_collect_ts = collect_dt.timestamp()
+                    r2_collect_age = time.time() - _last_r2_collect_ts
+                except (ValueError, TypeError):
+                    try:
+                        _last_r2_collect_ts = float(val)
+                        r2_collect_age = time.time() - _last_r2_collect_ts
+                    except (ValueError, TypeError):
+                        r2_collect_age = -1.0
+        except Exception:
+            pass
+    r2_collector_fresh = (
+        r2_collect_age >= 0
+        and r2_collect_age < _R2_COLLECT_FRESH_THRESHOLD
+    )
+    checks["r2_collector_fresh"] = r2_collector_fresh
+    details["r2_collector_fresh"] = (
+        f"OK: age={r2_collect_age:.1f}s" if r2_collector_fresh
+        else f"FAIL: age={r2_collect_age:.1f}s, last_ts={_last_r2_collect_ts}"
+    )
+
+    # 7. R41 P1-10: ACL 配置完整性(REDIS_*_PASSWORD 4 个变量)
+    # 注意:仅检查环境变量是否设置,不读取密码值(避免日志泄漏)
+    required_redis_envs = [
+        "REDIS_HEALTH_PASSWORD",
+        "REDIS_WRITER_PASSWORD",
+        "REDIS_READER_PASSWORD",
+        "REDIS_ADMIN_PASSWORD",  # R41 P1-9 新增
+    ]
+    missing_envs = [
+        name for name in required_redis_envs
+        if not os.getenv(name, "").strip()
+    ]
+    _acl_configured = (not missing_envs)
+    checks["acl_configured"] = _acl_configured
+    details["acl_configured"] = (
+        "OK: 4 个 REDIS_*_PASSWORD 均配置" if _acl_configured
+        else f"FAIL: 缺失 {missing_envs}"
+    )
+
+    # R41 P1-10: RU 采集状态(unknown vs 数字)
+    # kv_store 中 crdb_ru_daily 不存在或 SQLite 不可读时显示 "unknown"
+    # (避免误报 0 RU — 0 可能是真实值,unknown 表示采集失败)
+    ru_daily_usage = "unknown"
+    if sqlite_ok:
+        try:
+            ru_val = _read_kv_value("crdb_ru_daily", "")
+            if ru_val:
+                # 校验为有效数字
+                float(ru_val)
+                ru_daily_usage = ru_val
+        except (ValueError, TypeError):
+            ru_daily_usage = "unknown"
 
     passed = sum(1 for v in checks.values() if v)
     ready = all(checks.values())
-    return {"ready": ready, "passed": passed, "checks": checks}
+    return {
+        "ready": ready,
+        "passed": passed,
+        "checks": checks,
+        "details": details,
+        "ru_daily_usage": ru_daily_usage,
+        "last_crdb_sync_age": crdb_sync_age,
+        "last_r2_collect_age": r2_collect_age,
+    }
 
 
 # ── R40: 新增指标采集 ────────────────────────────────────
@@ -954,10 +1165,11 @@ class MetricsHTTPRequestHandler(BaseHTTPRequestHandler):
     """Prometheus metrics HTTP handler。
 
     路由:
-      GET /metrics → Prometheus text format 指标
-      GET /health   → "OK"(供 Docker healthcheck / k8s liveness)
-      GET /         → 简单介绍页
-      其他          → 404
+      GET /metrics   → Prometheus text format 指标
+      GET /health    → "OK"(供 Docker healthcheck / k8s liveness;返回 503 if 不就绪)
+      GET /readiness → 详细依赖状态 JSON(R41 P1-10:200 if all ready, 503 if any not ready)
+      GET /          → 简单介绍页
+      其他           → 404
     """
 
     # 关闭默认 stderr 日志(改用 loguru)
@@ -975,7 +1187,8 @@ class MetricsHTTPRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path == "/health":
             # R39 P1-8: readiness 增强 — 不再永远返回 OK
-            # 检查: SQLite 可读 + 最近采集成功 + 关键 schema 存在
+            # R41 P1-10: /health 仍为 liveness 端点(快速检查),
+            # 详细依赖状态请见 /readiness
             readiness = check_readiness()
             if readiness["ready"]:
                 body = b"OK"
@@ -991,12 +1204,28 @@ class MetricsHTTPRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/readiness":
+            # R41 P1-10: 详细依赖状态报告(200 if all ready, 503 if any not ready)
+            # 返回 JSON 包含:checks / details / ru_daily_usage / last_*_age
+            readiness = check_readiness()
+            import json as _json_mod
+            body = _json_mod.dumps(readiness, ensure_ascii=False).encode("utf-8")
+            if readiness["ready"]:
+                self.send_response(200)
+            else:
+                self.send_response(503)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/" or self.path == "/index":
             body = (
                 b"TGJiema Prometheus Exporter\n"
                 b"\nEndpoints:\n"
-                b"  /metrics  - Prometheus metrics (text format)\n"
-                b"  /health   - Health check\n"
+                b"  /metrics   - Prometheus metrics (text format)\n"
+                b"  /health    - Liveness check (200 OK / 503 Service Unavailable)\n"
+                b"  /readiness - Readiness check with dependency details (JSON)\n"
             )
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")

@@ -1,4 +1,4 @@
-"""R40 P2-8: 国际化(i18n)管理器。
+"""R40 P2-8 / R41 i18n 下一阶段: 国际化(i18n)管理器。
 
 职责:
     为系统提供多语言支持,从 JSON locale 文件加载翻译:
@@ -7,6 +7,11 @@
     3. load_locale(locale) — 加载 locale JSON 文件
     4. get_available_locales() — 列出可用 locale
     5. set_default_locale(locale) — 设置默认 locale
+    6. format_message(key, locale, **kwargs) — R41: 显式格式化接口(支持 {var} 占位符)
+    7. format_error_code(domain, operation, reason) — R41: 三段式错误码格式化
+    8. format_datetime(dt, locale, timezone) — R41: 日期时间本地化格式化
+    9. format_file_size(bytes, locale) — R41: 文件大小格式化(B/KB/MB/GB)
+    10. get_user_locale(user_id) — R41: 从 users_local 表读取用户语言偏好(默认 zh-CN)
 
 设计原则:
     - locale 文件存放于 locales/ 目录(zh-CN.json / en-US.json)
@@ -18,6 +23,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 from pathlib import Path
 from typing import Any, Optional
@@ -265,6 +271,193 @@ class I18nManager:
                 count += 1
         logger.info(f"[i18n] 重新加载 {count}/{len(loaded_locales)} locale 文件")
         return count
+
+    # ── R41 i18n 下一阶段: 格式化层(format_message / format_error_code /
+    #                                  format_datetime / format_file_size) ──
+
+    def format_message(self, key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
+        """R41: 显式格式化接口 — 翻译 key 并用 {var} 占位符插值。
+
+        与 translate() 的区别:
+        - 显式语义: 调用方明确知道这是一个"格式化"操作,而非简单翻译查找
+        - 支持任意 {var} 占位符(如 "上传成功,文件码: {code}")
+        - kwargs 中的 None 值会被转为空字符串,避免 'None' 字面量泄漏到用户消息
+        - 找不到 key 时回退到默认 locale 再回退到 key 本身(与 translate 一致)
+
+        Args:
+            key: 翻译 key(如 "bot.upload_success")
+            locale: 目标 locale(默认 self.default_locale)
+            **kwargs: 插值参数(如 code="ABC123" → 替换 {code})
+
+        Returns:
+            格式化后的字符串(占位符已替换)
+        """
+        text = self.translate(key, locale=locale)
+        if not text or not kwargs:
+            return text
+        # 将 None 值转为空字符串,避免 'None' 字面量泄漏
+        safe_kwargs = {
+            k: ("" if v is None else str(v))
+            for k, v in kwargs.items()
+        }
+        if "{" in text and "}" in text:
+            try:
+                return text.format(**safe_kwargs)
+            except (KeyError, IndexError, ValueError) as e:
+                logger.debug(f"[i18n] format_message 插值失败 key={key}: {e}")
+                return text
+        return text
+
+    def format_error_code(self, domain: str, operation: str, reason: str) -> str:
+        """R41: 三段式错误码格式化 — domain.operation.reason → "errors.{domain}.{operation}.{reason}"。
+
+        用于生成统一的错误码键,便于 Bot 端通过 translate() 查找本地化错误消息。
+
+        Args:
+            domain: 错误域(如 "quota" / "file" / "user" / "system")
+            operation: 触发操作(如 "decode" / "upload" / "ban")
+            reason: 失败原因(如 "exceeded" / "not_found" / "expired")
+
+        Returns:
+            点分错误码键(如 "errors.quota.decode.exceeded"),
+            可直接传给 translate() 查找本地化消息
+        """
+        # 规范化各段: 去除首尾空格 + 转为小写(避免大小写不一致导致 key 查找失败)
+        d = (domain or "").strip().lower()
+        o = (operation or "").strip().lower()
+        r = (reason or "").strip().lower()
+        # 拼接为 "errors.{domain}.{operation}.{reason}"
+        return f"errors.{d}.{o}.{r}"
+
+    def format_datetime(
+        self,
+        dt: datetime.datetime,
+        locale: Optional[str] = None,
+        timezone: Optional[str] = None,
+    ) -> str:
+        """R41: 日期时间本地化格式化。
+
+        根据 locale 选择日期格式,根据 timezone 进行时区转换。
+        - zh-CN: "2024年1月15日 14:30"
+        - en-US: "Jan 15, 2024 02:30 PM"
+
+        Args:
+            dt: 待格式化的 datetime 对象(naive 视为 UTC)
+            locale: 目标 locale(默认 self.default_locale)
+            timezone: 目标时区名(如 "Asia/Shanghai" / "UTC"),
+                      None 时使用 locale 对应的默认时区
+
+        Returns:
+            本地化日期时间字符串
+        """
+        if dt is None:
+            return ""
+        target_locale = locale or self.default_locale
+        # 若 dt 为 naive datetime,视为 UTC
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        # 时区转换
+        if timezone:
+            try:
+                tz = datetime.timezone(datetime.timedelta(0)) if timezone.upper() == "UTC" else None
+                # 优先用 zoneinfo(Python 3.9+),失败时用固定偏移
+                if tz is None:
+                    try:
+                        from zoneinfo import ZoneInfo
+                        tz = ZoneInfo(timezone)
+                    except Exception:
+                        # 降级: 不做时区转换,保留原时区
+                        logger.debug(f"[i18n] format_datetime 无法解析时区 {timezone},保留原时区")
+                        tz = dt.tzinfo
+                dt = dt.astimezone(tz)
+            except Exception as e:
+                logger.debug(f"[i18n] format_datetime 时区转换失败 {timezone}: {e}")
+        # 按 locale 选择格式
+        # 注意: strftime 的 %-m / %-d 仅 Linux 支持,Windows 不支持
+        # 改为跨平台方案: 先 strftime 再字符串替换去除前导零
+        if target_locale.startswith("zh"):
+            # 中文格式: 2024年1月15日 14:30
+            formatted = dt.strftime("%Y年%m月%d日 %H:%M")
+            # 去除月/日的前导零(跨平台方案,兼容 Windows 与 Linux)
+            formatted = formatted.replace("年0", "年").replace("月0", "月")
+            return formatted
+        elif target_locale.startswith("en"):
+            # 英文格式: Jan 15, 2024 02:30 PM
+            # 用 %d(带前导零)再去除,保证跨平台一致性
+            formatted = dt.strftime("%b %d, %Y %I:%M %p")
+            # 去除日的前导零(如 "Jan 05" → "Jan 5")
+            parts = formatted.split(" ", 1)
+            if len(parts) == 2 and parts[1].startswith("0"):
+                parts[1] = parts[1][1:]
+            return " ".join(parts)
+        else:
+            # 其他 locale: ISO 8601 紧凑格式(可读且无歧义)
+            return dt.strftime("%Y-%m-%d %H:%M")
+
+    def format_file_size(self, size_bytes: int, locale: Optional[str] = None) -> str:
+        """R41: 文件大小格式化(B/KB/MB/GB)。
+
+        按 locale 选择单位显示(zh-CN: "1.5 MB",en-US: "1.5 MB")。
+        小于 1024 字节时显示 B,否则递进到 KB/MB/GB。
+
+        Args:
+            size_bytes: 文件字节数
+            locale: 目标 locale(默认 self.default_locale)
+
+        Returns:
+            本地化文件大小字符串(如 "1.5 MB" / "1024 B")
+        """
+        if size_bytes is None or size_bytes < 0:
+            size_bytes = 0
+        target_locale = locale or self.default_locale
+        # 单位列表(zh-CN 和 en-US 单位相同,仅小数点分隔符不同)
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = float(size_bytes)
+        unit_idx = 0
+        while size >= 1024.0 and unit_idx < len(units) - 1:
+            size /= 1024.0
+            unit_idx += 1
+        # B 整数显示,KB/MB/GB 保留 1 位小数
+        if unit_idx == 0:
+            return f"{int(size)} {units[unit_idx]}"
+        # 中文 locale 用小数点(与英文一致,避免全角句号)
+        return f"{size:.1f} {units[unit_idx]}"
+
+    def get_user_locale(self, user_id: int) -> str:
+        """R41: 从 users_local 表读取用户 locale(默认 zh-CN)。
+
+        从 SQLite cache_store 同步读取(不触发 CRDB RU 消耗)。
+        用户未设置或读取失败时返回默认 locale 'zh-CN'。
+
+        Args:
+            user_id: Telegram 用户 ID
+
+        Returns:
+            用户 locale 字符串(如 "zh-CN" / "en-US")
+        """
+        if not user_id:
+            return _DEFAULT_LOCALE
+        try:
+            # 同步读取 SQLite(避免在 Bot handler 中引入 async 复杂性)
+            import sqlite3
+            from database.cache_store import DB_PATH
+            if not Path(DB_PATH).exists():
+                return _DEFAULT_LOCALE
+            conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=2)
+            cursor = conn.execute(
+                "SELECT locale FROM users_local WHERE user_id = ? LIMIT 1",
+                (int(user_id),),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if row and row[0]:
+                locale_val = str(row[0]).strip()
+                # 校验 locale 格式(避免脏数据)
+                if locale_val and len(locale_val) <= 10:
+                    return locale_val
+        except Exception as e:
+            logger.debug(f"[i18n] get_user_locale 读取失败 user={user_id}: {e}")
+        return _DEFAULT_LOCALE
 
 
 # 模块级单例

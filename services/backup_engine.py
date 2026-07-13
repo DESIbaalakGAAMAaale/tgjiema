@@ -498,7 +498,7 @@ class BackupEngine:
 
         # 3. 解密 → 校验 plaintext_sha256
         # R40 P0-7: 传入 backup_id/schema_version/key_id 重建 AAD(与 encrypt_payload 对称)
-        from services.backup_crypto import decrypt_payload
+        from services.backup_crypto import decrypt_payload, get_previous_kek
         enc_info = manifest.get("encryption", {})
         try:
             plaintext = decrypt_payload(
@@ -510,9 +510,38 @@ class BackupEngine:
                 key_id=enc_info.get("key_id", ""),
             )
         except Exception as e:
+            # R41 P1-5: KEK 轮换场景提示 — 若 manifest 中 key_id 与当前 KEK 不匹配,
+            # 提示运维配置 BACKUP_KEK_PREVIOUS 以恢复旧备份
+            manifest_key_id = enc_info.get("key_id", "")
+            hint = ""
+            if manifest_key_id:
+                # 获取当前 KEK 的 key_id 比对
+                try:
+                    from services.backup_crypto import get_key_id
+                    current_key_id = get_key_id()
+                    if current_key_id and current_key_id != manifest_key_id:
+                        # 当前 KEK 与备份用的 KEK 不一致 → 提示配置旧 KEK
+                        prev_kek = get_previous_kek()
+                        if prev_kek is None:
+                            hint = (
+                                f"(R41 P1-5 提示:备份使用 key_id={manifest_key_id[:8]}... 加密,"
+                                f"当前 KEK key_id={current_key_id[:8]}... 不匹配,"
+                                f"且 BACKUP_KEK_PREVIOUS 未配置。"
+                                f"请配置 BACKUP_KEK_PREVIOUS 环境变量为旧 KEK 后重试恢复)"
+                            )
+                        else:
+                            hint = (
+                                f"(R41 P1-5 提示:备份使用 key_id={manifest_key_id[:8]}... 加密,"
+                                f"当前 KEK key_id={current_key_id[:8]}... 不匹配,"
+                                f"BACKUP_KEK_PREVIOUS 已配置但仍无法解密,"
+                                f"请检查 BACKUP_KEK_PREVIOUS 是否为正确的旧 KEK)"
+                            )
+                except Exception:
+                    pass
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
-                "checksum_verified": False, "error": f"解密失败: {e}",
+                "checksum_verified": False,
+                "error": f"解密失败: {e}{hint}",
             }
 
         actual_pt_sha = _compute_sha256(plaintext)

@@ -1,5 +1,6 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<!-- R41 i18n: lang 属性支持 locale 动态注入(默认 zh-CN,由 Jinja2 上下文提供) -->
+<html lang="{{ locale | default('zh-CN') }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -55,24 +56,24 @@
     <div class="sidebar">
         <h2>TG解码器管理</h2>
         <div class="nav-group">基础</div>
-        <a href="/" {% if request.url.path == '/' %}class="active"{% endif %}>看板</a>
-        <a href="/users" {% if request.url.path == '/users' %}class="active"{% endif %}>用户管理</a>
-        <a href="/files" {% if request.url.path == '/files' %}class="active"{% endif %}>文件管理</a>
-        <a href="/logs" {% if request.url.path == '/logs' %}class="active"{% endif %}>解码日志</a>
-        <a href="/health-page" {% if request.url.path == '/health-page' %}class="active"{% endif %}>系统健康</a>
+        <a href="/" aria-label="看板" {% if request.url.path == '/' %}class="active"{% endif %}>看板</a>
+        <a href="/users" aria-label="用户管理" {% if request.url.path == '/users' %}class="active"{% endif %}>用户管理</a>
+        <a href="/files" aria-label="文件管理" {% if request.url.path == '/files' %}class="active"{% endif %}>文件管理</a>
+        <a href="/logs" aria-label="解码日志" {% if request.url.path == '/logs' %}class="active"{% endif %}>解码日志</a>
+        <a href="/health-page" aria-label="系统健康" {% if request.url.path == '/health-page' %}class="active"{% endif %}>系统健康</a>
         <div class="nav-group">R40 运营</div>
-        <a href="/tasks" {% if request.url.path == '/tasks' %}class="active"{% endif %}>任务中心</a>
-        <a href="/reports" {% if request.url.path == '/reports' %}class="active"{% endif %}>举报管理</a>
-        <a href="/collections" {% if request.url.path == '/collections' %}class="active"{% endif %}>集合管理</a>
-        <a href="/notifications" {% if request.url.path == '/notifications' %}class="active"{% endif %}>通知中心</a>
-        <a href="/approvals" {% if request.url.path == '/approvals' %}class="active"{% endif %}>审批管理</a>
-        <a href="/rbac" {% if request.url.path == '/rbac' %}class="active"{% endif %}>RBAC</a>
+        <a href="/tasks" aria-label="任务中心" {% if request.url.path == '/tasks' %}class="active"{% endif %}>任务中心</a>
+        <a href="/reports" aria-label="举报管理" {% if request.url.path == '/reports' %}class="active"{% endif %}>举报管理</a>
+        <a href="/collections" aria-label="集合管理" {% if request.url.path == '/collections' %}class="active"{% endif %}>集合管理</a>
+        <a href="/notifications" aria-label="通知中心" {% if request.url.path == '/notifications' %}class="active"{% endif %}>通知中心</a>
+        <a href="/approvals" aria-label="审批管理" {% if request.url.path == '/approvals' %}class="active"{% endif %}>审批管理</a>
+        <a href="/rbac" aria-label="RBAC 角色管理" {% if request.url.path == '/rbac' %}class="active"{% endif %}>RBAC</a>
         <div class="nav-group">运维</div>
-        <a href="/repair-console" {% if request.url.path == '/repair-console' %}class="active"{% endif %}>修复控制台</a>
-        <a href="/topology" {% if request.url.path == '/topology' %}class="active"{% endif %}>拓扑可视化</a>
-        <a href="/ru-cost" {% if request.url.path == '/ru-cost' %}class="active"{% endif %}>RU成本</a>
-        <a href="/maintenance" {% if request.url.path == '/maintenance' %}class="active"{% endif %}>维护模式</a>
-        <a href="/disaster-recovery" {% if request.url.path == '/disaster-recovery' %}class="active"{% endif %}>灾备控制台</a>
+        <a href="/repair-console" aria-label="修复控制台" {% if request.url.path == '/repair-console' %}class="active"{% endif %}>修复控制台</a>
+        <a href="/topology" aria-label="拓扑可视化" {% if request.url.path == '/topology' %}class="active"{% endif %}>拓扑可视化</a>
+        <a href="/ru-cost" aria-label="RU 成本中心" {% if request.url.path == '/ru-cost' %}class="active"{% endif %}>RU成本</a>
+        <a href="/maintenance" aria-label="维护模式" {% if request.url.path == '/maintenance' %}class="active"{% endif %}>维护模式</a>
+        <a href="/disaster-recovery" aria-label="灾备控制台" {% if request.url.path == '/disaster-recovery' %}class="active"{% endif %}>灾备控制台</a>
     </div>
     <div class="main">
         <div class="header">

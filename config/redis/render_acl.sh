@@ -1,10 +1,12 @@
 #!/bin/sh
-# R40 P0-3: Redis ACL 渲染脚本(容器入口初始化)
+# R41 P0-3: Redis ACL 渲染脚本(容器入口初始化) — fail-closed
 #
 # 作用:
-#   从环境变量读取 REDIS_HEALTH_PASSWORD / REDIS_WRITER_PASSWORD / REDIS_READER_PASSWORD,
-#   缺失时用 openssl rand -hex 24 随机生成并打印警告(不写入 .env,容器场景使用 Docker secrets)。
+#   从环境变量读取 REDIS_HEALTH_PASSWORD / REDIS_WRITER_PASSWORD / REDIS_READER_PASSWORD /
+#   REDIS_ADMIN_PASSWORD,任一缺失立即 exit 1(fail-closed:不再生成随机密码,
+#   避免静默启动后密码不一致)。
 #   将 users.acl.template 中的 <REDIS_*_PASSWORD> 占位符替换为真实密码,输出到 /data/users.acl。
+#   R41 P1-9: 新增 REDIS_ADMIN_PASSWORD 校验(tgjiema_admin 用户所需)。
 #
 # 调用方:
 #   1. docker-compose 的 redis-acl-init 一次性服务(挂载 /data 卷,生成 /data/users.acl)
@@ -39,42 +41,42 @@ if [ ! -f "$TEMPLATE_PATH" ]; then
     exit 1
 fi
 
-# ── 1. 读取或生成密码 ──
-# 容器场景:密码由 .env -> docker-compose environment 注入(或 Docker secrets)
-# 缺失时生成随机密码,但仅打印到 stderr(不回写 .env,因为只读挂载)
-
-gen_password() {
-    # 优先使用 openssl,fallback 到 /dev/urandom
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 24 2>/dev/null || head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'
-    else
-        head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n'
-    fi
-}
+# ── 1. 读取密码(fail-closed:缺失即 exit 1) ──
+# R41 P0-3: 四个 REDIS_*_PASSWORD 环境变量任一为空,立即退出失败。
+# 此前 R40 实现"缺失时随机生成并打印警告"会导致 redis-acl-init 与 redis 主容器、
+# 各业务容器(用 ${REDIS_WRITER_PASSWORD} 拼 REDIS_URL)使用不一致的密码 → 全部连接失败。
+# fail-closed 强制 .env 显式配置,杜绝静默故障。
+# R41 P1-9: 新增 REDIS_ADMIN_PASSWORD(tgjiema_admin 用户用于 mon_bot/admin_bot/admin)。
 
 HEALTH_PWD="${REDIS_HEALTH_PASSWORD:-}"
 WRITER_PWD="${REDIS_WRITER_PASSWORD:-}"
 READER_PWD="${REDIS_READER_PASSWORD:-}"
+ADMIN_PWD="${REDIS_ADMIN_PASSWORD:-}"
 
 if [ -z "$HEALTH_PWD" ]; then
-    HEALTH_PWD=$(gen_password)
-    echo "[render_acl] WARN: REDIS_HEALTH_PASSWORD 未设置,已生成随机密码(health 用户仅 PING 权限)" >&2
-    echo "[render_acl] INFO: 容器场景请通过 docker-compose environment 或 Docker secrets 注入" >&2
+    echo "[render_acl] ERROR: REDIS_HEALTH_PASSWORD 未设置,refusing to render ACL (fail-closed)" >&2
+    echo "[render_acl] HINT: 请在 .env 中显式配置 REDIS_HEALTH_PASSWORD 后再启动" >&2
+    exit 1
 fi
 if [ -z "$WRITER_PWD" ]; then
-    WRITER_PWD=$(gen_password)
-    echo "[render_acl] WARN: REDIS_WRITER_PASSWORD 未设置,已生成随机密码(tgjiema_writer 用户)" >&2
-    echo "[render_acl] INFO: 容器场景请通过 docker-compose environment 或 Docker secrets 注入" >&2
+    echo "[render_acl] ERROR: REDIS_WRITER_PASSWORD 未设置,refusing to render ACL (fail-closed)" >&2
+    echo "[render_acl] HINT: 请在 .env 中显式配置 REDIS_WRITER_PASSWORD 后再启动" >&2
+    exit 1
 fi
 if [ -z "$READER_PWD" ]; then
-    READER_PWD=$(gen_password)
-    echo "[render_acl] WARN: REDIS_READER_PASSWORD 未设置,已生成随机密码(tgjiema_reader 用户)" >&2
-    echo "[render_acl] INFO: 容器场景请通过 docker-compose environment 或 Docker secrets 注入" >&2
+    echo "[render_acl] ERROR: REDIS_READER_PASSWORD 未设置,refusing to render ACL (fail-closed)" >&2
+    echo "[render_acl] HINT: 请在 .env 中显式配置 REDIS_READER_PASSWORD 后再启动" >&2
+    exit 1
+fi
+if [ -z "$ADMIN_PWD" ]; then
+    echo "[render_acl] ERROR: REDIS_ADMIN_PASSWORD 未设置,refusing to render ACL (fail-closed)" >&2
+    echo "[render_acl] HINT: 请在 .env 中显式配置 REDIS_ADMIN_PASSWORD 后再启动(R41 P1-9: tgjiema_admin 用户所需)" >&2
+    exit 1
 fi
 
 # ── 2. 校验密码不含 sed 特殊字符(|) ──
 # 使用 | 作为 sed 分隔符,密码含 | 会导致解析错误
-for pwd in "$HEALTH_PWD" "$WRITER_PWD" "$READER_PWD"; do
+for pwd in "$HEALTH_PWD" "$WRITER_PWD" "$READER_PWD" "$ADMIN_PWD"; do
     if echo "$pwd" | grep -q '|'; then
         echo "[render_acl] ERROR: 密码含 sed 分隔符 '|',拒绝渲染" >&2
         exit 1
@@ -86,12 +88,14 @@ OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
 mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
 
 # ── 4. sed 替换占位符,输出到目标文件 ──
-# 占位符格式: <REDIS_HEALTH_PASSWORD> / <REDIS_WRITER_PASSWORD> / <REDIS_READER_PASSWORD>
+# 占位符格式: <REDIS_HEALTH_PASSWORD> / <REDIS_WRITER_PASSWORD> /
+#             <REDIS_READER_PASSWORD> / <REDIS_ADMIN_PASSWORD>
 # 使用 | 作为分隔符避免密码中可能的 / 冲突
 sed \
     -e "s|<REDIS_HEALTH_PASSWORD>|${HEALTH_PWD}|g" \
     -e "s|<REDIS_WRITER_PASSWORD>|${WRITER_PWD}|g" \
     -e "s|<REDIS_READER_PASSWORD>|${READER_PWD}|g" \
+    -e "s|<REDIS_ADMIN_PASSWORD>|${ADMIN_PWD}|g" \
     "$TEMPLATE_PATH" > "$OUTPUT_PATH"
 
 # ── 5. 校验输出文件 ──
@@ -116,5 +120,5 @@ chown redis:redis "$OUTPUT_PATH" 2>/dev/null || \
     chown 999:999 "$OUTPUT_PATH" 2>/dev/null || true
 
 echo "[render_acl] OK: ACL 文件已生成: $OUTPUT_PATH"
-echo "[render_acl] INFO: 3 个用户(health/writer/reader)密码已注入,占位符已全部替换"
+echo "[render_acl] INFO: 4 个用户(health/writer/reader/admin)密码已注入,占位符已全部替换"
 echo "[render_acl] INFO: redis-server 启动时通过 --aclfile $OUTPUT_PATH 加载"

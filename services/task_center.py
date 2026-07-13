@@ -448,3 +448,89 @@ async def format_task_status(task: dict) -> str:
             for k, v in list(result.items())[:3]:
                 lines.append(f"  {k}: {v}")
     return "\n".join(lines)
+
+
+# R41 P1-12: Bot 任务接线 — 一站式任务记录方法
+# 上传/解码/派送等关键操作完成时,Bot 调用 record_task 即可记录到 tasks 表,
+# 无需分别调用 create_task + update_progress + complete_task。
+# status='completed' 时自动 progress=100 + result=metadata;
+# status='failed' 时自动 error=metadata.get('error')。
+
+
+async def record_task(
+    user_id: int,
+    task_type: str,
+    status: str,
+    metadata: dict | None = None,
+) -> int:
+    """R41 P1-12: 一站式任务记录(创建 + 直接进入指定状态)。
+
+    适用于 Bot 在关键操作完成时(如上传成功、解码成功、派送成功)
+    一次性记录任务,无需创建后多次更新。
+
+    Args:
+        user_id: 用户 ID
+        task_type: 任务类型("upload"/"index"/"copy"/"delivery"/"repair");
+                   未知类型会被规范化为 "index" 兜底(避免数据库约束失败)
+        status: 任务状态(STATUS_PENDING / STATUS_RUNNING /
+                  STATUS_COMPLETED / STATUS_FAILED / STATUS_CANCELLED)
+        metadata: 任务元数据(写入 payload,完成时合并到 result,失败时取 error 字段)
+
+    Returns:
+        task_id;失败返回 0
+
+    Example:
+        # 上传成功后记录
+        await task_center.record_task(
+            user_id=12345, task_type="upload", status="completed",
+            metadata={"file_code": "ABC123", "file_size": 1024},
+        )
+        # 派送失败后记录
+        await task_center.record_task(
+            user_id=12345, task_type="delivery", status="failed",
+            metadata={"file_code": "ABC123", "error": "channel_unavailable"},
+        )
+    """
+    if not metadata:
+        metadata = {}
+    # 规范化 task_type(未知类型回退到 index)
+    if task_type not in TASK_TYPES:
+        logger.warning(
+            f"[task_center] record_task 未知 task_type={task_type},回退到 'index'"
+        )
+        task_type = "index"
+    # 规范化 status(未知状态回退到 pending)
+    if status not in (
+        STATUS_PENDING, STATUS_RUNNING, STATUS_COMPLETED,
+        STATUS_FAILED, STATUS_CANCELLED,
+    ):
+        logger.warning(
+            f"[task_center] record_task 未知 status={status},回退到 'pending'"
+        )
+        status = STATUS_PENDING
+
+    # 先创建 pending 任务
+    payload = dict(metadata) if metadata else {}
+    task_id = await create_task(task_type, user_id, payload)
+    if not task_id:
+        return 0
+
+    # 按目标状态推进
+    if status == STATUS_PENDING:
+        return task_id
+    if status == STATUS_RUNNING:
+        await update_progress(task_id, progress=50, eta_seconds=0)
+        return task_id
+    if status == STATUS_COMPLETED:
+        result = dict(metadata) if metadata else {}
+        await complete_task(task_id, result)
+        return task_id
+    if status == STATUS_FAILED:
+        error_msg = str(metadata.get("error") or "操作失败")
+        await fail_task(task_id, error_msg)
+        return task_id
+    if status == STATUS_CANCELLED:
+        await cancel_task(task_id)
+        return task_id
+    # 兜底(理论上不会到达,前面 status 已规范化)
+    return task_id

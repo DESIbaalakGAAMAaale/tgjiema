@@ -155,8 +155,33 @@ def _ensure_tested_modules_importable() -> None:
         pass  # dlq_worker 加载失败时,importorskip 会优雅跳过
 
 
+def _install_telegram_mock_if_missing() -> None:
+    """R41 修复: telegram 未安装时注入 MagicMock,避免 file_utils/code_generator 等模块 ImportError。
+
+    全量测试中,部分服务模块通过 utils.file_utils → `from telegram import Update`
+    间接依赖 telegram。测试环境未安装 python-telegram-bot 时,真实 import 会失败
+    并在 sys.modules 留下失败缓存,导致后续 MagicMock 无法生效。
+
+    本函数在收集阶段最早期注入 telegram / telegram.ext 的 MagicMock,确保所有
+    依赖 telegram 的模块都能在测试环境中正常加载(仅在 telegram 真实模块不可导入时生效)。
+    """
+    try:
+        importlib.import_module("telegram")
+        return  # telegram 真实可用,无需 mock
+    except ImportError:
+        pass
+    # telegram 不可用 → 注入 MagicMock
+    import sys as _sys
+    from unittest.mock import MagicMock as _MM
+    _sys.modules["telegram"] = _MM(name="mock_telegram")
+    _sys.modules["telegram.ext"] = _MM(name="mock_telegram_ext")
+    # 关键:为 Update 类提供可调用构造器,避免 isinstance() 检查失败
+    _sys.modules["telegram"].Update = type("Update", (), {})
+
+
 # 收集阶段即注入(早于任何 test 模块 import 被测代码)
 _install_fake_config()
+_install_telegram_mock_if_missing()
 _ensure_tested_modules_importable()
 
 

@@ -38,7 +38,7 @@ from database import (
 from services.code_generator import generate_unique_code, is_valid_code_format, extract_code_and_bot_from_message
 from services.permission import check_decode_permission, get_or_create_user
 from services.relay_pool import relay_pool
-from services import content_reports, user_repair
+from services import content_reports, user_repair, task_center
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
@@ -48,6 +48,24 @@ from utils.flood_waiter import safe_send_message, safe_reply_text
 from utils.relay_auth import is_relay_sender_allowed
 # R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
 from services.maintenance_mode import require_maintenance_check
+# R41 i18n: 国际化翻译(用户可见文本)
+from services.i18n import get_i18n_manager
+
+
+def _t(user_id: int, key: str, **kwargs) -> str:
+    """R41 i18n: 获取用户 locale 并翻译 key(带插值)。
+
+    Args:
+        user_id: Telegram 用户 ID(用于查询 locale 偏好)
+        key: 翻译 key(如 "bot.decode_failed")
+        **kwargs: 插值参数
+
+    Returns:
+        本地化字符串
+    """
+    manager = get_i18n_manager()
+    locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
+    return manager.format_message(key, locale=locale, **kwargs)
 
 TOKEN = settings.DECODER_BOT_TOKEN
 
@@ -416,7 +434,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
     except Exception as e:
         logger.error(f"[Idx][start] 创建用户失败 (user={user.id}): {e}")
-        await safe_reply_text(update.message, "系统繁忙，请稍后重试")
+        # R41 i18n: 系统繁忙提示走 locale 翻译
+        await safe_reply_text(update.message, "⚠️ " + _t(user.id, "bot.system_busy"))
         return
 
     # 标记用户已启动 idx bot
@@ -424,12 +443,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store = get_cache_store()
     await store.mark_user_started(user.id, "idx")
 
+    # R41 i18n: 欢迎语文本走 locale 翻译
     await safe_reply_text(update.message,
-        "👋 欢迎使用文件解码机器人\n\n"
-        "发送文件码即可获取对应文件。\n"
-        "发送 /status 查看您的会员状态和今日剩余解码次数。\n"
-        "发送 /help 查看帮助信息\n"
-        + three_bot_reminder()
+        "👋 " + _t(user.id, "bot.idx_start_welcome")
+        + "\n" + three_bot_reminder()
     )
 
     # 补发用户启动前暂存的文件码（发送成功一条才删一条，避免发送失败丢码）
@@ -489,7 +506,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_user = await get_or_create_user(user.id)
     except Exception as e:
         logger.error(f"[Idx][status] 获取用户信息失败: {e}")
-        await safe_reply_text(update.message, "系统繁忙，无法获取用户信息，请稍后重试")
+        # R41 i18n: 系统繁忙提示走 locale 翻译
+        await safe_reply_text(update.message, "⚠️ " + _t(user.id, "bot.system_busy"))
         return
     level_map = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
     level_name = level_map.get(db_user.get("membership_level"), "未知")
@@ -535,12 +553,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         ext_str = f"{max(0, ext_quota - ext_used)}/{ext_quota}"
 
+    # R41 i18n: 用户状态文本走 locale 翻译(支持中英文 locale)
+    upload_perm = "✅" if db_user.get("can_upload") else "❌"
     await safe_reply_text(update.message,
-        f"📊 用户状态\n"
-        f"会员等级：{level_name}\n"
-        f"今日剩余解码次数：{quota_str}\n"
-        f"上传权限：{'有' if db_user.get('can_upload') else '无'}\n"
-        f"外部码解码配额：{ext_str}"
+        "📊 " + _t(user.id, "bot.status_user_info") + "\n"
+        + _t(user.id, "bot.status_membership_level", level=level_name) + "\n"
+        + _t(user.id, "bot.status_quota_remaining", quota=quota_str) + "\n"
+        + _t(user.id, "bot.status_upload_permission", permission=upload_perm) + "\n"
+        + _t(user.id, "bot.status_external_quota", quota=ext_str)
     )
 
 
@@ -922,6 +942,24 @@ async def _process_one_pending(app: Application, row: dict):
     metrics.decode_count += 1
     await metrics.record_processed("idx_bot")
 
+    # R41 P1-12: 解码(文件码生成)成功后记录到 TaskCenter
+    # uploader_id 在 _process_one_pending 开头从 row 中提取
+    try:
+        await task_center.record_task(
+            user_id=int(uploader_id) if uploader_id else 0,
+            task_type="index",
+            status="completed",
+            metadata={
+                "file_code": file_code,
+                "upload_id": upload_id,
+                "channel_id": channel_id,
+            },
+        )
+    except Exception as task_err:
+        logger.warning(
+            f"[Idx] R41 P1-12: record_task 失败(不影响解码): {task_err}"
+        )
+
 
 async def _process_pending_uploads(app: Application):
     """处理 pending_uploads: 从 SQLite 本地读取(0 RU),并发处理多条。
@@ -1028,14 +1066,17 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = code
                 is_external = True
             else:
-                await safe_reply_text(update.message, "消息格式不正确，请发送文件码或包含 bot 用户名的消息")
+                # R41 i18n: 消息格式不正确提示走 locale 翻译
+                await safe_reply_text(update.message, "⚠️ " + _t(user.id, "bot.invalid_message_format"))
                 return
 
     if not await global_rate_limiter.acquire():
-        await safe_reply_text(update.message, "系统繁忙，请稍后重试")
+        # R41 i18n: 限速提示走 locale 翻译
+        await safe_reply_text(update.message, "⚠️ " + _t(user.id, "bot.system_busy"))
         return
     if not await user_rate_limiter.acquire(user.id):
-        await safe_reply_text(update.message, "操作过于频繁，请稍后重试")
+        # R41 i18n: 用户限速提示走 locale 翻译
+        await safe_reply_text(update.message, "⚠️ " + _t(user.id, "bot.rate_limited"))
         return
 
     # ── 动态限速：根据 jobs 队列长度自动调节 ──
@@ -1128,9 +1169,11 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         metrics.decode_count += 1
         await metrics.record_processed("idx_bot")
         if sub_ok == 0:
-            await safe_reply_text(update.message, f"❌ 合集中 {sub_fail} 个文件全部失败，已退回配额")
+            # R41 i18n: 合集全部失败提示走 locale 翻译
+            await safe_reply_text(update.message, "❌ " + _t(user.id, "bot.collection_all_failed", count=sub_fail))
         else:
-            await safe_reply_text(update.message, f"📦 合集发送完成：成功 {sub_ok} 个，失败 {sub_fail} 个")
+            # R41 i18n: 合集部分成功提示走 locale 翻译
+            await safe_reply_text(update.message, "📦 " + _t(user.id, "bot.collection_partial_success", success=sub_ok, failed=sub_fail))
         return
 
     storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
@@ -1179,14 +1222,17 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.quota_consumed:
             from services.permission import refund_user_quota
             await refund_user_quota(user.id, is_external=False)
-        await safe_reply_text(update.message, "系统繁忙，文件发送请求失败，请稍后重试")
+        # R41 i18n: 系统繁忙提示走 locale 翻译
+        await safe_reply_text(update.message, "⚠️ " + _t(user.id, "bot.system_busy"))
         return
 
     # 配额已在 check_decode_permission 中预扣(原子条件递增),投递成功无需再递增
 
+    # R41 i18n: 文件发送中提示走 locale 翻译(带 bot 用户名插值)
     await safe_reply_text(
         update.message,
-        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+        "📤 " + _t(user.id, "bot.file_send_pending",
+                    bot_username=settings.SENDER_BOT_USERNAME),
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{text}")
         ]])

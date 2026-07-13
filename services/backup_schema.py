@@ -32,6 +32,13 @@ class TableSchema:
 
     R40 P1-9: local_only 字段标记纯本地状态表(不参与 CRDB 同步),
       例如 maintenance_state/admin_access_log 仅本地有效,跨机同步无意义。
+
+    R41 P1-6: backup_order / restore_policy 字段明确每张表的备份/恢复策略:
+      - backup_order: 恢复顺序(按外键依赖排序,数字小的先恢复,默认 100)
+      - restore_policy: 恢复时的写入策略
+        * "skip"               — 不恢复(纯本地状态,如 maintenance_state)
+        * "truncate_and_insert" — 清空后写入(默认,保证幂等)
+        * "insert_if_not_exists" — 仅在不存在时插入(避免覆盖现有多行)
     """
     name: str                          # 表名
     pk_columns: tuple[str, ...]        # 主键列(复合主键用元组)
@@ -43,6 +50,8 @@ class TableSchema:
     note: str = ""                     # 备注
     source: str = "crdb"               # R35 P1-5: 表所在数据库(crdb/sqlite/relay_sqlite/redis)
     local_only: bool = False           # R40 P1-9: 纯本地表(不参与 CRDB 同步,如 maintenance_state)
+    backup_order: int = 100            # R41 P1-6: 恢复顺序(小数字先恢复,按外键依赖排序)
+    restore_policy: str = "truncate_and_insert"  # R41 P1-6: 恢复写入策略
 
 
 # ─── 唯一事实源: 所有可备份/恢复的表 ───
@@ -358,6 +367,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="sqlite",
+        backup_order=10,  # R41 P1-6: 父表先恢复(在 collection_items 之前)
         note="R40 文件集合(主键 id 自增;SQLite-only;UNIQUE code;在 collection_items 之前恢复)",
     ),
     "collection_items": TableSchema(
@@ -366,6 +376,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("id", "collection_id", "file_code", "added_at"),
         conflict_col="",
         source="sqlite",
+        backup_order=11,  # R41 P1-6: 子表后恢复(FK collection_id→collections.id)
         note="R40 集合项目(主键 id 自增;SQLite-only;FK collection_id→collections.id)",
     ),
     "notifications": TableSchema(
@@ -419,6 +430,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("id", "name", "description", "permissions", "created_at"),
         conflict_col="name",
         source="sqlite",
+        backup_order=10,  # R41 P1-6: 父表先恢复(在 rbac_user_roles 之前)
         note="R40 RBAC 角色表(主键 id 自增;SQLite-only;UNIQUE name;在 rbac_user_roles 之前恢复)",
     ),
     "rbac_user_roles": TableSchema(
@@ -427,6 +439,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("user_id", "role_id", "assigned_at", "assigned_by"),
         conflict_col="user_id",
         source="sqlite",
+        backup_order=11,  # R41 P1-6: 子表后恢复(FK role_id→rbac_roles.id)
         note="R40 RBAC 用户角色关联(主键 user_id;SQLite-only;FK role_id→rbac_roles.id)",
     ),
     "approvals": TableSchema(
@@ -450,7 +463,9 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         conflict_col="",
         source="sqlite",
         local_only=True,  # R40 P1-9: 纯本地状态,不参与 CRDB 同步
-        note="R40 维护模式状态(主键 id CHECK=1;SQLite-only;local_only=True 不跨机同步)",
+        backup_order=200,  # R41 P1-6: 本地状态最后恢复
+        restore_policy="skip",  # R41 P1-6: 不恢复(避免覆盖本机维护状态)
+        note="R40 维护模式状态(主键 id CHECK=1;SQLite-only;local_only=True 不跨机同步;R41 P1-6 restore_policy=skip)",
     ),
     "admin_access_log": TableSchema(
         name="admin_access_log",
@@ -462,7 +477,100 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         conflict_col="",
         source="sqlite",
         local_only=True,  # R40 P1-9: 本地访问日志,不参与 CRDB 同步
-        note="R40 管理员访问日志(主键 id 自增;SQLite-only;local_only=True 不跨机同步)",
+        backup_order=201,  # R41 P1-6: 本地审计日志最后恢复
+        restore_policy="insert_if_not_exists",  # R41 P1-6: 追加式恢复(不覆盖现有日志)
+        note="R40 管理员访问日志(主键 id 自增;SQLite-only;local_only=True 不跨机同步;R41 P1-6 insert_if_not_exists)",
+    ),
+
+    # ─── R41 P1-6: 6 张新业务表(均为 SQLite-only) ───
+    # mfa_secrets: 用户 TOTP 密钥,跨实例需要(用户登录凭证)
+    # sessions: 服务端 session 令牌,纯本地状态(恢复会创建过期 session)
+    # command_outbox: 事务发件箱,需备份(命令可能未执行完)
+    # command_executions: 命令执行记录,需备份(关联 outbox)
+    # dlq_records: 死信队列记录,需备份(用于审计)
+    # ban_state: 用户封禁状态,需备份(跨实例一致)
+    "mfa_secrets": TableSchema(
+        name="mfa_secrets",
+        pk_columns=("user_id",),
+        columns=(
+            "user_id", "secret", "enabled", "backup_codes",
+            "created_at", "updated_at",
+        ),
+        conflict_col="user_id",
+        source="sqlite",
+        backup_order=80,  # R41 P1-6: 在用户表后恢复
+        restore_policy="truncate_and_insert",  # R41 P1-6: 覆盖恢复(凭证以备份为准)
+        note="R41 P1-6 MFA TOTP 密钥表(主键 user_id;SQLite-only;需跨实例同步;secret 为加密存储)",
+    ),
+    "sessions": TableSchema(
+        name="sessions",
+        pk_columns=("session_id",),
+        columns=(
+            "session_id", "user_id", "principal_id", "username",
+            "created_at", "expires_at", "last_activity_at",
+            "ip_addr", "user_agent",
+        ),
+        conflict_col="session_id",
+        source="sqlite",
+        local_only=True,  # R41 P1-6: 纯本地状态(session 不可跨实例共享)
+        backup_order=210,  # R41 P1-6: 本地状态最后恢复
+        restore_policy="skip",  # R41 P1-6: 不恢复(避免过期 session 重新激活)
+        note="R41 P1-6 服务端 session 表(主键 session_id TEXT;SQLite-only;local_only=True;restore_policy=skip)",
+    ),
+    "command_outbox": TableSchema(
+        name="command_outbox",
+        pk_columns=("id",),
+        columns=(
+            "id", "command_type", "target_type", "target_id",
+            "payload", "status", "priority", "created_by",
+            "created_at", "processed_at", "attempts", "last_error",
+        ),
+        conflict_col="",
+        source="sqlite",
+        backup_order=50,  # R41 P1-6: 命令发件箱先恢复(在 command_executions 之前)
+        restore_policy="insert_if_not_exists",  # R41 P1-6: 不覆盖进行中的命令
+        note="R41 P1-6 命令发件箱(主键 id 自增;SQLite-only;事务性发件箱模式;在 command_executions 之前恢复)",
+    ),
+    "command_executions": TableSchema(
+        name="command_executions",
+        pk_columns=("id",),
+        columns=(
+            "id", "outbox_id", "executor", "status",
+            "started_at", "finished_at", "result", "error",
+            "attempts",
+        ),
+        conflict_col="",
+        source="sqlite",
+        backup_order=51,  # R41 P1-6: 命令执行记录后恢复(FK outbox_id→command_outbox.id)
+        restore_policy="insert_if_not_exists",  # R41 P1-6: 不覆盖执行记录
+        note="R41 P1-6 命令执行记录(主键 id 自增;SQLite-only;FK outbox_id→command_outbox.id)",
+    ),
+    "dlq_records": TableSchema(
+        name="dlq_records",
+        pk_columns=("id",),
+        columns=(
+            "id", "source", "original_payload", "error",
+            "failed_at", "attempts", "last_attempt_at",
+            "resolved", "resolved_at", "resolved_by",
+        ),
+        conflict_col="",
+        source="sqlite",
+        backup_order=60,  # R41 P1-6: 死信队列后恢复
+        restore_policy="insert_if_not_exists",  # R41 P1-6: 追加式恢复(不覆盖)
+        note="R41 P1-6 死信队列记录(主键 id 自增;SQLite-only;含 resolved/resolved_by 审计字段)",
+    ),
+    "ban_state": TableSchema(
+        name="ban_state",
+        pk_columns=("user_id",),
+        columns=(
+            "user_id", "is_banned", "banned_at", "banned_by",
+            "reason", "expires_at", "unbanned_at", "unbanned_by",
+        ),
+        conflict_col="user_id",
+        source="sqlite",
+        backup_order=70,  # R41 P1-6: 用户封禁状态后恢复
+        restore_policy="truncate_and_insert",  # R41 P1-6: 覆盖恢复(最新封禁状态以备份为准)
+        note="R41 P1-6 用户封禁状态(主键 user_id;SQLite-only;跨实例一致;含 expires_at/unbanned_at)",
     ),
 
     # ─── SQLite 本地缓存表(热路径零 CRDB,部分需要备份) ───
@@ -737,6 +845,79 @@ def get_restore_tables_by_source(source: str) -> list[str]:
     ]
 
 
+# ─── R41 P1-6: 按依赖排序的恢复顺序 ───────────────────────────
+
+# restore_policy 允许值(用于校验输入)
+RESTORE_POLICY_SKIP = "skip"
+RESTORE_POLICY_TRUNCATE_AND_INSERT = "truncate_and_insert"
+RESTORE_POLICY_INSERT_IF_NOT_EXISTS = "insert_if_not_exists"
+_VALID_RESTORE_POLICIES = frozenset({
+    RESTORE_POLICY_SKIP,
+    RESTORE_POLICY_TRUNCATE_AND_INSERT,
+    RESTORE_POLICY_INSERT_IF_NOT_EXISTS,
+})
+
+
+def get_restore_order(include_local_only: bool = True) -> list[str]:
+    """R41 P1-6: 返回按 backup_order 排序的恢复顺序表列表。
+
+    按外键依赖排序:backup_order 数字小的先恢复(父表 → 子表)。
+    同一 backup_order 内按 BACKUP_SCHEMA 字典序保持稳定。
+
+    Args:
+        include_local_only: 是否包含 local_only=True 的表
+            - True(默认):包含所有表(用于完整恢复计划)
+            - False:排除 local_only 表(用于跨机同步场景)
+
+    Returns:
+        按恢复顺序排序的表名列表
+    """
+    candidates = [
+        t for t in BACKUP_SCHEMA.values()
+        if include_local_only or not t.local_only
+    ]
+    # 按 (backup_order, name) 排序,保证稳定顺序
+    candidates.sort(key=lambda t: (t.backup_order, t.name))
+    return [t.name for t in candidates]
+
+
+def get_restore_policy(table: str) -> str:
+    """R41 P1-6: 返回表的恢复写入策略。
+
+    Returns:
+        "skip" / "truncate_and_insert" / "insert_if_not_exists"
+
+    Raises:
+        ValueError: 表名不在 BACKUP_SCHEMA 中
+    """
+    if table not in BACKUP_SCHEMA:
+        raise ValueError(f"表 {table} 不在 BACKUP_SCHEMA 中")
+    return BACKUP_SCHEMA[table].restore_policy
+
+
+def get_skip_restore_tables() -> list[str]:
+    """R41 P1-6: 返回 restore_policy=skip 的表列表(恢复时跳过)。
+
+    这些表通常是纯本地状态(maintenance_state/sessions),
+    恢复会覆盖本机运行时状态,因此跳过。
+    """
+    return [
+        t.name for t in BACKUP_SCHEMA.values()
+        if t.restore_policy == RESTORE_POLICY_SKIP
+    ]
+
+
+def get_backup_order(table: str) -> int:
+    """R41 P1-6: 返回表的恢复顺序数字(小数字先恢复)。
+
+    Raises:
+        ValueError: 表名不在 BACKUP_SCHEMA 中
+    """
+    if table not in BACKUP_SCHEMA:
+        raise ValueError(f"表 {table} 不在 BACKUP_SCHEMA 中")
+    return BACKUP_SCHEMA[table].backup_order
+
+
 def _build_allowed_columns() -> set[str]:
     """聚合所有表的列 + 向后兼容列,生成全局列白名单。
 
@@ -796,6 +977,8 @@ _CRDB_DDL_TABLES: frozenset[str] = frozenset({
 # R40 P1-9: 补齐 12 张新业务表(tasks/collections/collection_items/notifications/
 #           content_reports/audit_log/quota_reservations/rbac_roles/rbac_user_roles/
 #           approvals/maintenance_state/admin_access_log)
+# R41 P1-6: 补齐 6 张新业务表(mfa_secrets/sessions/command_outbox/
+#           command_executions/dlq_records/ban_state)
 _CACHE_STORE_DDL_TABLES: frozenset[str] = frozenset({
     "cache_backup", "pending_notify", "dsp_notify", "heartbeat_local",
     "bot_heartbeat", "user_quota", "local_job_queue", "counter_snapshot",
@@ -811,6 +994,9 @@ _CACHE_STORE_DDL_TABLES: frozenset[str] = frozenset({
     "content_reports", "audit_log", "quota_reservations",
     "rbac_roles", "rbac_user_roles", "approvals",
     "maintenance_state", "admin_access_log",
+    # R41 P1-6: 6 张新业务表
+    "mfa_secrets", "sessions", "command_outbox",
+    "command_executions", "dlq_records", "ban_state",
 })
 
 # 已知的 relay_pool.db 表(从 database/relay_db.py DDL 派生)

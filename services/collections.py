@@ -503,3 +503,148 @@ async def format_collection_info(collection: dict) -> str:
         if len(items) > 10:
             lines.append(f"  ... 还有 {len(items) - 10} 个文件")
     return "\n".join(lines)
+
+
+# R41 P1-12: 集合解析与权限校验
+# 用于用户访问集合时(批量下载/分享),验证对集合中所有文件的访问权限,
+# 并返回文件码列表 + 元数据(供 dsp_bot 派送)。
+
+
+async def resolve_collection(user_id: int, collection_id: int) -> dict:
+    """R41 P1-12: 解析集合并校验用户对集合中所有文件的访问权限。
+
+    权限规则:
+        - 集合 owner_id == user_id → 拥有所有文件的访问权限
+        - 其他用户 → 校验每个文件的 file_record.uploader_id:
+            * uploader_id == user_id → 允许
+            * uploader_id != user_id → 拒绝(返回 allowed=False)
+        - 任一文件被下架/删除 → 跳过该文件,但不阻塞整个集合解析
+
+    Args:
+        user_id: 当前访问用户 ID
+        collection_id: 集合 ID
+
+    Returns:
+        {
+            "allowed": bool,           # 是否允许访问(权限校验)
+            "collection_id": int,      # 集合 ID
+            "collection_code": str,    # 集合码
+            "collection_name": str,    # 集合名称
+            "owner_id": int,           # 集合所有者 ID
+            "items": [                 # 文件项列表
+                {
+                    "file_code": str,
+                    "added_at": str,
+                    "status": str,         # active / deleted / expired
+                    "uploader_id": int,    # 文件上传者 ID
+                    "has_access": bool,    # 当前用户是否有访问权限
+                },
+                ...
+            ],
+            "denied_items": [          # 无权限的文件码列表
+                {"file_code": str, "uploader_id": int},
+                ...
+            ],
+            "error": str,              # 错误描述(集合不存在/数据库未就绪)
+        }
+    """
+    store = get_cache_store()
+    if not store._db:
+        return {
+            "allowed": False, "collection_id": collection_id,
+            "collection_code": "", "collection_name": "",
+            "owner_id": 0, "items": [], "denied_items": [],
+            "error": "数据库未初始化",
+        }
+    try:
+        # 查询集合信息(校验所有权)
+        cursor = await store._db.execute(
+            """SELECT id, name, code, owner_id, status, item_count
+               FROM collections WHERE id = ?""",
+            (collection_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return {
+                "allowed": False, "collection_id": collection_id,
+                "collection_code": "", "collection_name": "",
+                "owner_id": 0, "items": [], "denied_items": [],
+                "error": "集合不存在",
+            }
+        coll_id = int(row[0])
+        coll_name = row[1] or ""
+        coll_code = row[2] or ""
+        owner_id = int(row[3]) if row[3] else 0
+        coll_status = row[4] or "active"
+        # 查询集合项 + 关联文件的 uploader_id
+        items_cursor = await store._db.execute(
+            """SELECT ci.file_code, ci.added_at,
+                      fr.uploader_id, fr.status, fr.deleted_at, fr.expire_time
+               FROM collection_items ci
+               LEFT JOIN file_records_local fr ON ci.file_code = fr.file_code
+               WHERE ci.collection_id = ?
+               ORDER BY ci.added_at ASC""",
+            (coll_id,),
+        )
+        items_rows = await items_cursor.fetchall()
+        items: list[dict] = []
+        denied_items: list[dict] = []
+        for r in items_rows:
+            file_code = r[0] or ""
+            added_at = r[1] or ""
+            uploader_id = int(r[2]) if r[2] else 0
+            file_status = (r[3] or "missing").lower()
+            deleted_at = r[4]
+            expire_time = r[5]
+            # 判断文件状态(对外可见性)
+            if deleted_at or file_status == "deleted":
+                external_status = "deleted"
+            elif file_status == "expired" or _is_expired(expire_time):
+                external_status = "expired"
+            elif file_status in ("active", "ready"):
+                external_status = "active"
+            else:
+                external_status = "deleted" if file_status == "missing" else file_status
+            # 权限校验:owner 直通;其他用户校验 uploader_id
+            if owner_id == user_id:
+                has_access = True
+            elif uploader_id == user_id and uploader_id != 0:
+                has_access = True
+            else:
+                has_access = False
+                denied_items.append({
+                    "file_code": file_code,
+                    "uploader_id": uploader_id,
+                })
+            items.append({
+                "file_code": file_code,
+                "added_at": added_at,
+                "status": external_status,
+                "uploader_id": uploader_id,
+                "has_access": has_access,
+            })
+        # 整体权限:owner 或所有项都有访问权限
+        allowed = (owner_id == user_id) or (
+            len(denied_items) == 0 and len(items) > 0
+        )
+        # 集合本身已被软删除/禁用 → 拒绝访问
+        if coll_status != "active":
+            allowed = False
+        return {
+            "allowed": allowed,
+            "collection_id": coll_id,
+            "collection_code": coll_code,
+            "collection_name": coll_name,
+            "owner_id": owner_id,
+            "items": items,
+            "denied_items": denied_items,
+            "error": "" if allowed else "无访问权限" if coll_status == "active" else "集合已禁用",
+        }
+    except Exception as e:
+        logger.warning(f"[collections] resolve_collection 失败: {e}")
+        return {
+            "allowed": False, "collection_id": collection_id,
+            "collection_code": "", "collection_name": "",
+            "owner_id": 0, "items": [], "denied_items": [],
+            "error": f"解析失败: {e}",
+        }

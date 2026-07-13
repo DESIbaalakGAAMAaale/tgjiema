@@ -3,17 +3,19 @@
 # 环形冗余 v2 架构(up / idx / dsp / mon / admin_bot / admin / db_writer / crdb_sync / db_backup)
 #
 # ┌──────────────────────────────────────────────────────────────────────┐
-# │ R40 P0-3 醒目说明: 首次启动前必须准备 .env 中的 REDIS_*_PASSWORD   │
+# │ R41 P0-3 醒目说明: 首次启动前必须准备 .env 中的 REDIS_*_PASSWORD   │
 # │ ─────────────────────────────────────────────────────────────────── │
-# │   首次 `docker compose up` 前,需在 .env 中配置以下 3 个变量:       │
+# │   首次 `docker compose up` 前,需在 .env 中配置以下 4 个变量:       │
 # │     REDIS_HEALTH_PASSWORD=...   (healthcheck 用户,仅 PING 权限)     │
 # │     REDIS_WRITER_PASSWORD=...   (tgjiema_writer 用户,业务写权限)    │
 # │     REDIS_READER_PASSWORD=...   (tgjiema_reader 用户,只读权限)      │
-# │   未配置时 redis-acl-init 容器会用 openssl rand 随机生成并打印警告,│
-# │   但生成的密码不会回写 .env(容器场景建议使用 Docker secrets 注入)。│
+# │     REDIS_ADMIN_PASSWORD=...     (tgjiema_admin 用户,管理权限)       │
+# │   R41 P0-3 fail-closed: 任一变量缺失 → docker compose 启动失败,    │
+# │   redis-acl-init/render_acl.sh 也会 exit 1(不再随机生成密码)。     │
+# │   R41 P1-9: mon_bot / admin_bot / admin 后台使用 tgjiema_admin。     │
 # │   ACL 模板: config/redis/users.acl.template                         │
 # │   渲染脚本: config/redis/render_acl.sh                               │
-# │   校验: render_acl.sh 拒绝含 '<' / 'changeme' 的输出,失败 exit 1    │
+# │   校验: render_acl.sh 拒绝含 '<' 或默认密码占位符的输出,失败 exit 1│
 # └──────────────────────────────────────────────────────────────────────┘
 #
 # 部署步骤:
@@ -31,15 +33,17 @@ services:
   # ── redis-acl-init (一次性,渲染 ACL 文件到共享卷) ──
   # R40 P0-3: 先于 redis 启动,从 REDIS_*_PASSWORD 环境变量渲染 users.acl
   # 渲染流程: sed 替换 <REDIS_*_PASSWORD> 占位符 → /data/users.acl
-  # 校验: 输出文件不得含 '<' 或 'changeme',否则 exit 1
+  # 校验: 输出文件不得含 '<' 或未替换的默认密码,否则 exit 1
   redis-acl-init:
     image: redis:7-alpine
     container_name: tgjiema-redis-acl-init
     restart: "no"
     environment:
-      - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:-}
-      - REDIS_WRITER_PASSWORD=${REDIS_WRITER_PASSWORD:-}
-      - REDIS_READER_PASSWORD=${REDIS_READER_PASSWORD:-}
+      - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:?REDIS_HEALTH_PASSWORD must be set in .env}
+      - REDIS_WRITER_PASSWORD=${REDIS_WRITER_PASSWORD:?REDIS_WRITER_PASSWORD must be set in .env}
+      - REDIS_READER_PASSWORD=${REDIS_READER_PASSWORD:?REDIS_READER_PASSWORD must be set in .env}
+      # R41 P1-9: tgjiema_admin 用户密码(mon_bot/admin_bot/admin 后台使用)
+      - REDIS_ADMIN_PASSWORD=${REDIS_ADMIN_PASSWORD:?REDIS_ADMIN_PASSWORD must be set in .env}
       - ACL_TEMPLATE_PATH=/app/config/redis/users.acl.template
       - ACL_OUTPUT_PATH=/data/users.acl
     volumes:
@@ -82,9 +86,10 @@ services:
     # R39 P0-1: healthcheck 改用专用 health 用户(仅允许 PING),
     # 不再使用被禁用的 default 用户导致认证失败。
     # R40 P0-3: REDIS_HEALTH_PASSWORD 由 .env 顶层注入(由 redis-acl-init 同样读取)。
+    # R41 P0-3: fail-closed — 缺失 REDIS_HEALTH_PASSWORD 时 compose 启动失败(不再回退默认健康密码)。
     # 注意: $$ 转义避免 Compose 插值,运行时由 shell 展开 $REDIS_HEALTH_PASSWORD。
     environment:
-      - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:-changeme_health_ping}
+      - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:?REDIS_HEALTH_PASSWORD must be set in .env}
     depends_on:
       redis-acl-init:
         condition: service_completed_successfully
@@ -366,8 +371,9 @@ services:
     environment:
       - SERVICE_ROLE=mon
       - PYTHONUNBUFFERED=1
-      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
-      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      # R41 P1-9: mon 需要管理权限(XAUTOCLAIM/XTRIM/EVAL)→ 改用 tgjiema_admin 用户
+      # tgjiema_writer 缺少 XAUTOCLAIM/EVAL,mon 切换 leader lease / 修复 PEL 时需要
+      - REDIS_URL=redis://tgjiema_admin:${REDIS_ADMIN_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -412,6 +418,8 @@ services:
     environment:
       - SERVICE_ROLE=admin_bot
       - PYTHONUNBUFFERED=1
+      # R41 P1-9: admin_bot 需要管理权限(管理消费组/重置 PEL)→ 改用 tgjiema_admin
+      - REDIS_URL=redis://tgjiema_admin:${REDIS_ADMIN_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -458,8 +466,8 @@ services:
     environment:
       - SERVICE_ROLE=admin
       - PYTHONUNBUFFERED=1
-      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
-      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      # R41 P1-9: admin 后台需要管理权限(管理消费组/EVAL Lua)→ 改用 tgjiema_admin
+      - REDIS_URL=redis://tgjiema_admin:${REDIS_ADMIN_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config

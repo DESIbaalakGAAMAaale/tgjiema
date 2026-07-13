@@ -50,6 +50,26 @@ MAX_BATCH_TIME_BUDGET = 30    # 单轮最多 30s
 # R38 P1-1: CRDB pool 空闲关闭阈值(秒),连续 5 分钟无 dirty 主动 close_db()
 CRDB_IDLE_CLOSE_THRESHOLD = 300  # 5 分钟
 
+# R41 RU 门禁: dirty_outbox 批量 UPSERT 大小(从环境变量读取,范围 100-500)
+# 合并最高 version 后批量 UPSERT 到 CRDB,降低单行 UPSERT 的 RU 消耗
+def _parse_batch_size(default: int = 100, min_v: int = 100, max_v: int = 500) -> int:
+    """从 CRDB_SYNC_BATCH_SIZE 环境变量解析批量大写,限制在 [min_v, max_v] 范围内。"""
+    raw = os.environ.get("CRDB_SYNC_BATCH_SIZE", str(default))
+    try:
+        size = int(raw)
+    except (TypeError, ValueError):
+        return default
+    if size < min_v:
+        return min_v
+    if size > max_v:
+        return max_v
+    return size
+
+
+CRDB_SYNC_BATCH_SIZE = _parse_batch_size()
+# R41 RU 门禁: CRDB pool 空闲后再次关闭前的最小间隔(秒),避免频繁 connect/close
+_CRDB_CLOSE_COOLDOWN = 30  # 关闭后至少 30s 才允许重新 connect
+
 
 # ── R37 P0-3 / R38 P0-4: sync_leader 租约 fencing ──
 
@@ -379,8 +399,76 @@ def _get_cache_store_safe():
 # ── R38 P1-1: CRDB 懒加载状态 ──
 # _crdb_pool_connected: CRDB pool 是否已建立(懒加载,初始 False)
 # _last_dirty_seen_ts: 上次检测到 dirty 的时间戳(用于空闲关闭判断)
+# _last_pool_close_ts: R41 RU 门禁: 上次 CRDB pool 关闭时间戳(用于 cooldown 控制)
 _crdb_pool_connected: bool = False
 _last_dirty_seen_ts: float = 0.0
+_last_pool_close_ts: float = 0.0
+
+
+async def _should_connect() -> bool:
+    """R41 RU 门禁: 判断是否应该建立 CRDB 连接。
+
+    判断条件:
+        1. dirty_outbox 中存在未处理记录(SQLite 本地查询,0 RU)
+        2. 当前 pool 未连接
+        3. 距上次关闭已超过 cooldown(避免频繁 connect/close)
+
+    Returns:
+        True: 应该建立 CRDB 连接(调用 _lazy_connect_crdb)
+        False: 不需要连接(继续走 SQLite 退避)
+    """
+    global _last_pool_close_ts
+    if _crdb_pool_connected:
+        return False  # 已连接,无需重复
+    # cooldown 检查:刚关闭的 pool 至少 30s 后才允许重新连接
+    if _last_pool_close_ts > 0:
+        elapsed = time.time() - _last_pool_close_ts
+        if elapsed < _CRDB_CLOSE_COOLDOWN:
+            logger.debug(
+                f"[crdb_sync] R41: 距上次关闭 {elapsed:.1f}s < cooldown "
+                f"{_CRDB_CLOSE_COOLDOWN}s,跳过连接"
+            )
+            return False
+    # 检查 dirty_outbox 是否有未处理记录(SQLite 本地查询,0 RU)
+    store = _get_cache_store_safe()
+    if store is None:
+        return False
+    try:
+        # 直接查询 dirty_outbox 表的未处理行数(走 SQLite,不触发 CRDB)
+        if store._db is None:
+            return False
+        rows = await store._db.execute_fetchall(
+            "SELECT COUNT(*) FROM dirty_outbox WHERE processed = 0 LIMIT 1"
+        )
+        count = rows[0][0] if rows and rows[0] else 0
+        return count > 0
+    except Exception as e:
+        logger.debug(f"[crdb_sync] R41: _should_connect 查询 dirty_outbox 失败: {e}")
+        return False
+
+
+async def _close_pool_if_idle():
+    """R41 RU 门禁: 检测 CRDB pool 是否空闲,空闲超过阈值则主动关闭。
+
+    与 _close_crdb_only 的区别:
+        - _close_crdb_only(): 立即关闭(由调用方决定时机)
+        - _close_pool_if_idle(): 智能判断是否需要关闭(基于空闲时长)
+
+    R38 P1-1 已实现基础逻辑(_sync_loop 中调用),R41 提取为独立方法便于测试。
+    """
+    global _last_pool_close_ts
+    if not _crdb_pool_connected:
+        return  # 未连接,无需关闭
+    if _last_dirty_seen_ts <= 0:
+        return  # 从未检测到 dirty,不主动关闭(等待首次 dirty 触发连接)
+    idle_seconds = time.time() - _last_dirty_seen_ts
+    if idle_seconds >= CRDB_IDLE_CLOSE_THRESHOLD:
+        await _close_crdb_only()
+        _last_pool_close_ts = time.time()
+        logger.info(
+            f"[crdb_sync] R41: CRDB pool 已空闲关闭(idle={idle_seconds:.1f}s, "
+            f"cooldown={_CRDB_CLOSE_COOLDOWN}s)"
+        )
 
 
 async def _init_sqlite_only():
@@ -736,42 +824,239 @@ async def _dispatch_users_upsert(records: list[dict]) -> list[int]:
     return processed_ids
 
 
-# R39 P0-4: table_name → dispatcher 映射 (jobs/cells 由专用循环处理, 此处跳过)
-# 未知 table 不在此映射中 → 走 DEAD 分支 (保留不标记 processed)
+# ──────────────────────────────────────────────────────────────
+# R41 P0-6: jobs / cells upsert handler — 此前依赖专用循环(sync_local_jobs_to_crdb
+# / sync_dirty_cells_to_crdb),但 dirty_outbox 路径的记录无人消费会堆积。
+# 此处新增 upsert handler,保证 dirty_outbox 闭环。
+# ──────────────────────────────────────────────────────────────
+
+
+async def _dispatch_jobs_upsert(records: list[dict]) -> list[int]:
+    """R41 P0-6: 将 jobs 的 dirty_outbox 记录 UPSERT 到 CRDB。
+
+    之前由 _sync_jobs (sync_local_jobs_to_crdb) 专用循环处理,
+    但若 jobs 表通过 dirty_outbox 路径写入,必须能消费,否则会堆积。
+
+    Args:
+        records: dirty_outbox 行列表(含 payload JSON 行快照)
+
+    Returns:
+        成功处理的 dirty_outbox.id 列表
+    """
+    from database.session import get_jobs_col
+
+    col = get_jobs_col()
+    processed_ids: list[int] = []
+    # jobs 表字段(与 DDL 对齐,排除 id 作为 conflict key,因 id 由 CRDB SERIAL 生成)
+    _UPSERT_COLS = [
+        "code", "target_user_id", "storage_channel_id",
+        "storage_msg_ids", "batch_file_meta", "task_type",
+        "status", "created_at", "dispatched_at",
+    ]
+    for r in records:
+        rid = r.get("id")
+        payload = r.get("payload")
+        if not payload:
+            logger.warning(f"[crdb_sync] R41 P0-6: dirty_outbox id={rid} 无 payload, 跳过")
+            continue
+        try:
+            row = json.loads(payload) if isinstance(payload, str) else payload
+            values = [row.get(c) for c in _UPSERT_COLS]
+            placeholders = [f"${i + 1}" for i in range(len(_UPSERT_COLS))]
+            # jobs.id 是 SERIAL,无法用 ON CONFLICT;改用 INSERT,主键冲突时跳过
+            # 注: jobs 表通常由 SQLite 写入 crdb_id 关联,此处 INSERT 失败被视为已存在
+            sql = (
+                f"INSERT INTO jobs ({', '.join(_UPSERT_COLS)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"ON CONFLICT (id) DO UPDATE SET "
+                + ", ".join(f"{c} = EXCLUDED.{c}" for c in _UPSERT_COLS)
+            )
+            await col.execute_raw(sql, values)
+            processed_ids.append(rid)
+        except Exception as e:
+            logger.warning(f"[crdb_sync] R41 P0-6: jobs UPSERT 失败 id={rid}: {e}")
+    return processed_ids
+
+
+async def _dispatch_cells_upsert(records: list[dict]) -> list[int]:
+    """R41 P0-6: 将 cells 的 dirty_outbox 记录 UPSERT 到 CRDB。
+
+    之前由 _sync_cells (sync_dirty_cells_to_crdb) 专用循环处理,
+    但若 cells 表通过 dirty_outbox 路径写入,必须能消费。
+
+    Args:
+        records: dirty_outbox 行列表(含 payload JSON 行快照)
+
+    Returns:
+        成功处理的 dirty_outbox.id 列表
+    """
+    from database.session import get_cells_col
+
+    col = get_cells_col()
+    processed_ids: list[int] = []
+    # cells 表字段(与 DDL 对齐,排除 slot_id 作为 conflict key)
+    _UPSERT_COLS = [
+        "slot_id", "channel_id", "status", "next_active_chat_id",
+        "prev_slot_id", "demoted_to_channel_id", "account_name",
+        "is_r100", "last_heartbeat", "last_synced_msg_id",
+        "degrade_count", "file_count", "rotation_started_at",
+        "created_at", "updated_at",
+    ]
+    for r in records:
+        rid = r.get("id")
+        payload = r.get("payload")
+        if not payload:
+            logger.warning(f"[crdb_sync] R41 P0-6: dirty_outbox id={rid} 无 payload, 跳过")
+            continue
+        try:
+            row = json.loads(payload) if isinstance(payload, str) else payload
+            values = [row.get(c) for c in _UPSERT_COLS]
+            placeholders = [f"${i + 1}" for i in range(len(_UPSERT_COLS))]
+            update_cols = [c for c in _UPSERT_COLS if c != "slot_id"]
+            set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+            sql = (
+                f"INSERT INTO cells ({', '.join(_UPSERT_COLS)}) "
+                f"VALUES ({', '.join(placeholders)}) "
+                f"ON CONFLICT (slot_id) DO UPDATE SET {set_clause}"
+            )
+            await col.execute_raw(sql, values)
+            processed_ids.append(rid)
+        except Exception as e:
+            logger.warning(f"[crdb_sync] R41 P0-6: cells UPSERT 失败 id={rid}: {e}")
+    return processed_ids
+
+
+async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col: str) -> list[int]:
+    """R41 P0-6: 将 tombstone 记录同步到 CRDB — 执行 DELETE FROM <crdb_table> WHERE <pk_col> = ?。
+
+    Args:
+        records: dirty_outbox 行列表(operation=tombstone)
+        crdb_table: CRDB 中实际表名(如 "users" / "file_records")
+        pk_col: 主键列名(如 "user_id" / "file_code")
+
+    Returns:
+        成功处理的 dirty_outbox.id 列表
+    """
+    from database.session import (
+        get_users_col, get_file_records_col, get_codes_col,
+        get_jobs_col, get_cells_col,
+    )
+    # R41 P0-6: 按 crdb_table 路由到对应的 D1Collection
+    _COL_LOOKUP = {
+        "users": get_users_col,
+        "file_records": get_file_records_col,
+        "codes": get_codes_col,
+        "jobs": get_jobs_col,
+        "cells": get_cells_col,
+    }
+    col_fn = _COL_LOOKUP.get(crdb_table)
+    if col_fn is None:
+        logger.error(
+            f"[crdb_sync] R41 P0-6: tombstone 找不到 CRDB collection crdb_table={crdb_table}"
+        )
+        return []
+    col = col_fn()
+    processed_ids: list[int] = []
+    for r in records:
+        rid = r.get("id")
+        pk = r.get("pk")
+        if not pk:
+            logger.warning(f"[crdb_sync] R41 P0-6: tombstone id={rid} 无 pk, 跳过")
+            continue
+        try:
+            # DELETE FROM <crdb_table> WHERE <pk_col> = $1
+            # 注: tombstone 是幂等的(行已不存在时 DELETE 不报错)
+            sql = f"DELETE FROM {crdb_table} WHERE {pk_col} = $1"
+            await col.execute_raw(sql, [pk])
+            processed_ids.append(rid)
+        except Exception as e:
+            logger.warning(
+                f"[crdb_sync] R41 P0-6: tombstone 失败 crdb_table={crdb_table} "
+                f"pk={pk} id={rid}: {e}"
+            )
+    return processed_ids
+
+
+# R39 P0-4: table_name → upsert dispatcher 映射
+# R41 P0-6: 补充 jobs/cells 的 upsert handler(此前依赖专用循环,但若 dirty_outbox
+# 已有记录则必须能消费,避免记录堆积)。
 _DIRTY_OUTBOX_TABLE_HANDLERS = {
     "file_records": _dispatch_file_records_upsert,
     "codes": _dispatch_codes_upsert,
     "users": _dispatch_users_upsert,
+    # R41 P0-6: 新增 jobs/cells 的 upsert handler(覆盖 dirty_outbox 路径)
+    "jobs": _dispatch_jobs_upsert,
+    "cells": _dispatch_cells_upsert,
 }
-# 已由专用同步循环覆盖的表 (dirty_outbox 记录直接标记 processed, 避免重复处理)
-_DIRTY_OUTBOX_TABLES_DELEGATED = {"jobs", "cells"}
 
-# R40 P0-5: local_only 表 — 仅存在于 SQLite 本地,不需要同步到 CRDB
-# 这些表的 dirty_outbox 记录直接标记 processed + local_only=1
-_LOCAL_ONLY_TABLES = {
-    "tasks",
-    "collections",
-    "collection_items",
-    "notifications",
-    "content_reports",
-    "audit_log",
-    "quota_reservations",
-    "quota_ledger",
-    "rbac_roles",
-    "rbac_user_roles",
-    "approvals",
-    "maintenance_state",
-    "admin_access_log",
+# R41 P0-6: table_name → tombstone dispatcher 映射(DELETE FROM crdb_table WHERE pk=?)
+# 每个 CRDB 表都必须在此映射中提供 tombstone handler,
+# 否则软删除记录会落入 DLQ(handler_missing)。
+# _tombstone handler 接收 (crdb_col, pk, payload) 并执行 DELETE。
+_DIRTY_OUTBOX_TOMBSTONE_HANDLERS: dict[str, str] = {
+    # value 为 CRDB 中实际表名,用于构造 "DELETE FROM <table> WHERE <pk_col> = $1"
+    # pk 列名默认与逻辑表名同名(在 _TOMBSTONE_PK_COLUMNS 中声明)
+    "file_records": "file_records",
+    "codes": "codes",
+    "users": "users",
+    "jobs": "jobs",
+    "cells": "cells",
 }
+
+# R41 P0-6: 各 CRDB 表的主键列名(用于 tombstone DELETE WHERE 子句)
+_TOMBSTONE_PK_COLUMNS: dict[str, str] = {
+    "file_records": "file_code",
+    "codes": "code",
+    "users": "user_id",
+    "jobs": "id",
+    "cells": "slot_id",
+}
+
+# 已由专用同步循环覆盖的表 (dirty_outbox 记录直接标记 processed, 避免重复处理)
+# R41 P0-6: 此集合保留用于兼容旧日志路径,但实际 dispatcher 已通过 _DIRTY_OUTBOX_TABLE_HANDLERS
+# 为 jobs/cells 提供 upsert handler,不再需要"专用循环兜底"语义。
+_DIRTY_OUTBOX_TABLES_DELEGATED: set[str] = set()
+
+# R40 P0-5 / R41 P0-6: local_only 表 — 仅存在于 SQLite 本地,不需要同步到 CRDB
+# 这些表的 dirty_outbox 记录直接标记 processed + local_only=1
+# R41 P0-6: 从 services.replication_policy 派生,集中维护,避免双处声明漂移
+try:
+    from services.replication_policy import (
+        all_local_only_tables as _all_local_only_tables,
+        all_crdb_tables as _all_crdb_tables,
+        is_local_only as _policy_is_local_only,
+        is_crdb as _policy_is_crdb,
+    )
+    _LOCAL_ONLY_TABLES: set[str] = _all_local_only_tables()
+    _CRDB_TABLES: set[str] = _all_crdb_tables()
+except Exception:
+    # 极端情况(replication_policy 模块异常)降级到旧硬编码集合,保证服务可启动
+    _LOCAL_ONLY_TABLES = {
+        "tasks", "collections", "collection_items", "notifications",
+        "content_reports", "audit_log", "quota_reservations", "quota_ledger",
+        "rbac_roles", "rbac_user_roles", "approvals", "maintenance_state",
+        "admin_access_log", "command_outbox", "command_executions",
+        "mfa_secrets", "sessions", "kv_store", "ttl_cache",
+        "pending_uploads", "dirty_outbox", "dlq", "dlq_records", "ban_state",
+    }
+    _CRDB_TABLES = {
+        "users", "file_records", "codes", "decode_logs",
+        "relay_whitelist", "collector_whitelist", "spare_pool",
+        "channels", "cells", "jobs",
+    }
 
 
 async def _route_dirty_outbox_to_dlq(
     table_name: str, records: list[dict], error_msg: str,
 ) -> None:
-    """R40 P0-5: 将处理失败的 dirty_outbox 记录路由到死信队列(DLQ)。
+    """R40 P0-5 / R41 P0-6: 将处理失败的 dirty_outbox 记录路由到死信队列(DLQ)。
 
-    写入 data/dead_letter.jsonl 文件,供 repair_console.list_dlq() 读取。
-    每条记录包含: message_id, reason, attempts, max_attempts, failed_at, original。
+    R41 P0-6 增强:
+      - DLQ 记录写入 SQLite dlq_records 表(权威存储,字段完整):
+        status / retry_count / max_retries / next_retry_at / last_error /
+        created_at / updated_at
+      - 同时镜像写入 data/dead_letter.jsonl(向后兼容 repair_console.list_dlq())
+      - max_retries=5,达到上限后 cleanup_dlq() 标记 permanently_failed,不再重试。
 
     Args:
         table_name: 受影响表名
@@ -782,22 +1067,56 @@ async def _route_dirty_outbox_to_dlq(
     import os as _os
     import datetime as _dt
 
+    now_str = _dt.datetime.now().isoformat()
+    # R41 P0-6: max_retries 提升至 5(原 R40 默认 3),允许更多暂时性故障恢复
+    max_retries = 5
+    # R41 P0-6: 下次重试时间(默认 60s 后,与 dlq_worker 的 base_delay 对齐)
+    next_retry_at_str = (
+        _dt.datetime.now() + _dt.timedelta(seconds=60)
+    ).isoformat()
+
+    # ── 1. 写 SQLite dlq_records 表(权威存储) ──
+    store = _get_cache_store_safe()
+    if store is not None:
+        try:
+            for r in records:
+                original_payload = {
+                    "id": r.get("id"),
+                    "table_name": table_name,
+                    "pk": r.get("pk"),
+                    "operation": r.get("operation"),
+                    "payload": r.get("payload"),
+                    "created_at": r.get("created_at"),
+                }
+                await store.insert_dlq_record(
+                    message_id=f"dirty_outbox:{r.get('id', '')}",
+                    table_name=table_name,
+                    reason=f"crdb_sync dispatch 失败: {error_msg}",
+                    original=original_payload,
+                    max_retries=max_retries,
+                    next_retry_at=next_retry_at_str,
+                )
+        except Exception as sqlite_err:
+            logger.warning(
+                f"[crdb_sync] R41 P0-6: SQLite dlq_records 写入失败,降级 jsonl: {sqlite_err}"
+            )
+
+    # ── 2. 镜像写入 data/dead_letter.jsonl(向后兼容 repair_console.list_dlq) ──
     dead_file = _os.path.join(
         _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
         "data", "dead_letter.jsonl",
     )
     try:
         _os.makedirs(_os.path.dirname(dead_file), exist_ok=True)
-        now_str = _dt.datetime.now().isoformat()
         with open(dead_file, "a", encoding="utf-8") as f:
             for r in records:
                 dead_entry = {
                     "message_id": f"dirty_outbox:{r.get('id', '')}",
                     "reason": f"crdb_sync dispatch 失败 table={table_name}: {error_msg}",
                     "attempts": 1,
-                    "max_attempts": 3,
+                    "max_attempts": max_retries,
                     "failed_at": now_str,
-                    "next_retry_at": None,
+                    "next_retry_at": next_retry_at_str,
                     "original": {
                         "id": r.get("id"),
                         "table_name": table_name,
@@ -819,14 +1138,17 @@ async def _route_dirty_outbox_to_dlq(
 async def _dispatch_dirty_outbox_to_crdb(
     table_name: str, records: list[dict],
 ) -> list[int]:
-    """R39 P0-4: 按 table_name 分发 dirty_outbox 记录到 CRDB。
+    """R39 P0-4 / R41 P0-6: 按 table_name 分发 dirty_outbox 记录到 CRDB。
 
     分发规则:
-        - file_records / codes / users → UPSERT 到对应 CRDB 表
-        - jobs / cells → 已由专用同步循环 (_sync_jobs / _sync_cells) 处理,
-          此处直接标记为 processed (避免重复 UPSERT)
-        - 未知 table_name → DEAD: 不标记 processed, 保留供人工检查
-          (避免静默丢弃变更, 违反"不能丢弃"原则)
+        - local_only 表(tasks / approvals / RBAC / maintenance ...) → 直接标记
+          processed + local_only=1, 不调用 CRDB
+        - ARCHIVE_ONLY 表(audit_log_archive)→ 直接标记 processed, 不调用 CRDB
+        - CRDB 表:
+            * upsert operation → 调用对应 upsert handler(_DIRTY_OUTBOX_TABLE_HANDLERS)
+            * tombstone operation → 调用对应 tombstone handler(_DIRTY_OUTBOX_TOMBSTONE_HANDLERS)
+            * 缺失 handler → 进入 DLQ(标记错误,不静默丢弃)
+        - 未知 table_name → DEAD: 不标记 processed, 路由到 DLQ 供人工检查
         - 未知 operation (非 upsert/tombstone) → DEAD: 同上
 
     Args:
@@ -834,9 +1156,9 @@ async def _dispatch_dirty_outbox_to_crdb(
         records: 该表的 dirty_outbox 行列表
 
     Returns:
-        成功处理的 dirty_outbox.id 列表 (DEAD 分支返回空列表)
+        成功处理的 dirty_outbox.id 列表(DEAD 分支返回空列表)
     """
-    # R40 P0-5: local_only 表 — 仅存在于 SQLite,不需要同步到 CRDB
+    # R40 P0-5 / R41 P0-6: local_only 表 — 仅存在于 SQLite,不需要同步到 CRDB
     # 直接标记为 processed + local_only=1
     if table_name in _LOCAL_ONLY_TABLES:
         logger.debug(
@@ -845,32 +1167,84 @@ async def _dispatch_dirty_outbox_to_crdb(
         )
         return [r.get("id") for r in records if r.get("id") is not None]
 
-    # 已由专用循环覆盖的表: 直接标记 processed
-    if table_name in _DIRTY_OUTBOX_TABLES_DELEGATED:
-        logger.debug(
-            f"[crdb_sync] R39 P0-4: {table_name} 由专用同步循环处理, "
-            f"dirty_outbox {len(records)} 条直接标记 processed"
-        )
-        return [r.get("id") for r in records if r.get("id") is not None]
+    # R41 P0-6: ARCHIVE_ONLY 表(audit_log_archive)→ 直接标记 processed, 不进 CRDB
+    # (冷归档到 R2 由独立 backup job 负责,与 crdb_sync 解耦)
+    try:
+        from services.replication_policy import is_archive_only as _policy_is_archive_only
+        if _policy_is_archive_only(table_name):
+            logger.debug(
+                f"[crdb_sync] R41 P0-6: {table_name} 为 archive_only 表, "
+                f"dirty_outbox {len(records)} 条直接标记 processed(走 R2 归档)"
+            )
+            return [r.get("id") for r in records if r.get("id") is not None]
+    except Exception:
+        pass  # 模块异常时降级,继续走下方 CRDB 分支
 
-    # 已知 table: 调用对应 dispatcher
-    handler = _DIRTY_OUTBOX_TABLE_HANDLERS.get(table_name)
-    if handler is not None:
-        # 检查 operation: 仅处理 upsert, tombstone 暂走 DEAD (待后续实现)
-        valid_ops = {"upsert"}
+    # R41 P0-6: 校验该表是否声明为 CRDB 策略
+    is_crdb_table = table_name in _CRDB_TABLES
+
+    # 已知 CRDB table: 按 operation(upsert / tombstone)路由到对应 handler
+    upsert_handler = _DIRTY_OUTBOX_TABLE_HANDLERS.get(table_name)
+    tombstone_table = _DIRTY_OUTBOX_TOMBSTONE_HANDLERS.get(table_name)
+    pk_col = _TOMBSTONE_PK_COLUMNS.get(table_name)
+
+    # R41 P0-6: 校验 handler 覆盖完整性 — CRDB 表必须同时有 upsert + tombstone handler
+    if is_crdb_table:
+        if upsert_handler is None:
+            logger.error(
+                f"[crdb_sync] R41 P0-6: CRDB 表 {table_name} 缺失 upsert handler, "
+                f"{len(records)} 条 → DLQ(不静默丢弃)"
+            )
+            await _route_dirty_outbox_to_dlq(
+                table_name, records,
+                f"CRDB 表缺失 upsert handler(策略={table_name} → CRDB)",
+            )
+            # R41 P0-6: 返回所有 id 让 _sync_dirty_outbox 标记为 processed,
+            # 避免重复 dispatch 同一记录(已在 DLQ,无需再走 dispatch)
+            return [r.get("id") for r in records if r.get("id") is not None]
+        if tombstone_table is None or pk_col is None:
+            logger.error(
+                f"[crdb_sync] R41 P0-6: CRDB 表 {table_name} 缺失 tombstone handler, "
+                f"{len(records)} 条 → DLQ(不静默丢弃)"
+            )
+            await _route_dirty_outbox_to_dlq(
+                table_name, records,
+                f"CRDB 表缺失 tombstone handler(策略={table_name} → CRDB)",
+            )
+            return [r.get("id") for r in records if r.get("id") is not None]
+
+    # 已知 table 且 handler 就绪: 按 operation 分流
+    if upsert_handler is not None:
+        # R41 P0-6: tombstone 与 upsert 都是合法 operation
+        valid_ops = {"upsert", "tombstone"}
         valid_records = [r for r in records if r.get("operation") in valid_ops]
         dead_records = [r for r in records if r.get("operation") not in valid_ops]
         if dead_records:
             logger.error(
-                f"[crdb_sync] R39 P0-4: table={table_name} 含未知 operation "
-                f"{len(dead_records)} 条 → DEAD (不标记 processed): "
+                f"[crdb_sync] R41 P0-6: table={table_name} 含未知 operation "
+                f"{len(dead_records)} 条 → DLQ(不标记 processed): "
                 f"ops={[r.get('operation') for r in dead_records]}"
             )
-        if not valid_records:
-            return []
-        return await handler(valid_records)
+            await _route_dirty_outbox_to_dlq(
+                table_name, dead_records,
+                f"未知 operation(合法: upsert/tombstone)",
+            )
+        # 按 operation 二次分组
+        upsert_records = [r for r in valid_records if r.get("operation") == "upsert"]
+        tombstone_records = [r for r in valid_records if r.get("operation") == "tombstone"]
+        processed: list[int] = []
+        if upsert_records:
+            processed.extend(await upsert_handler(upsert_records))
+        if tombstone_records and tombstone_table is not None and pk_col is not None:
+            processed.extend(
+                await _dispatch_crdb_tombstone(tombstone_records, tombstone_table, pk_col)
+            )
+        # R41 P0-6: dead_records 已路由到 DLQ,加入 processed 列表避免重复 dispatch
+        processed.extend(r.get("id") for r in dead_records if r.get("id") is not None)
+        return processed
 
-    # 未知 table → DEAD: 不标记 processed, 保留供人工检查
+    # 未知 table(未在 TABLE_REPLICATION_POLICY 中声明) → DEAD
+    # 不返回 id,_sync_dirty_outbox 会路由到 DLQ 并保留记录供人工检查
     logger.error(
         f"[crdb_sync] R39 P0-4: 未知 table_name={table_name}, "
         f"records={len(records)} 条 → DEAD (不标记 processed, 保留供人工检查)"
@@ -879,26 +1253,81 @@ async def _dispatch_dirty_outbox_to_crdb(
 
 
 async def _sync_dirty_outbox():
-    """R39 P0-4: 消费 dirty_outbox — 按 table_name 分组 dispatch 到 CRDB。
+    """R39 P0-4 / R41 RU 门禁: 消费 dirty_outbox — 按 table_name 分组 dispatch 到 CRDB。
 
     流程:
-        1. get_dirty_outbox_batch(100): 拉取未处理记录
-        2. 按 table_name 分组
-        3. 调用 _dispatch_dirty_outbox_to_crdb(table, records)
-        4. mark_dirty_processed(ids): 标记成功处理的记录
+        1. _should_connect(): 检查 dirty_outbox 是否有未处理记录(0 RU)
+        2. _lazy_connect_crdb(): dirty 存在时才连接 CRDB pool
+        3. get_dirty_outbox_batch(CRDB_SYNC_BATCH_SIZE): 拉取未处理记录
+        4. R41: 合并最高 version — 同一 (table_name, pk) 仅保留 version 最大的记录
+           (降低 CRDB UPSERT 次数,RU 消耗随合并比例下降)
+        5. 按 table_name 分组 dispatch 到 CRDB
+        6. mark_dirty_processed(ids): 标记成功处理的记录(含被合并的旧版本)
+        7. 末尾调用 _close_pool_if_idle(): 空闲超阈值时关闭 CRDB pool
 
     幂等: dispatcher 使用 INSERT ON CONFLICT DO UPDATE, 重复处理不会产生副作用。
     """
     store = _get_cache_store_safe()
     if store is None:
         return
-    batch = await store.get_dirty_outbox_batch(limit=100)
-    if not batch:
+
+    # R41 RU 门禁: 先用 _should_connect() 判断是否需要连接 CRDB(0 RU)
+    if not await _should_connect():
+        # dirty_outbox 为空且 pool 未连接 → 直接返回(零 CRDB RU)
+        # 若 pool 已连接但无 dirty,则由 _close_pool_if_idle() 在末尾关闭
+        if _crdb_pool_connected:
+            await _close_pool_if_idle()
         return
 
-    # 按 table_name 分组
-    groups: dict[str, list[dict]] = {}
+    # R41: dirty 存在,懒加载 CRDB pool(若未连接)
+    await _lazy_connect_crdb()
+
+    # R41 RU 门禁: 使用 CRDB_SYNC_BATCH_SIZE(默认 100,范围 100-500)
+    batch = await store.get_dirty_outbox_batch(limit=CRDB_SYNC_BATCH_SIZE)
+    if not batch:
+        # dirty_outbox 为空(可能在 _should_connect 之后被另一轮消费了)
+        # 仍然调用 _close_pool_if_idle() 释放空闲连接
+        await _close_pool_if_idle()
+        return
+
+    # R41 RU 门禁: 合并最高 version — 同一 (table_name, pk) 仅保留 version 最大的记录
+    # 合并后,被合并的旧版本记录也标记为 processed(避免重复 dispatch),
+    # 从而降低 CRDB UPSERT 次数与 RU 消耗
+    merged_records: list[dict] = []
+    merged_old_ids: list[int] = []  # 被合并掉的旧版本 id(需标记为 processed)
+    version_map: dict[tuple[str, str], dict] = {}  # (table_name, pk) → 最新记录
     for r in batch:
+        tn = r.get("table_name", "") or ""
+        pk = str(r.get("pk", "") or "")
+        version = r.get("version", 0) or 0
+        key = (tn, pk)
+        if key not in version_map:
+            version_map[key] = r
+            merged_records.append(r)
+        else:
+            existing = version_map[key]
+            existing_version = existing.get("version", 0) or 0
+            if version > existing_version:
+                # 当前记录 version 更大 → 替换
+                merged_old_ids.append(existing["id"])
+                # 在 merged_records 中替换
+                idx = merged_records.index(existing)
+                merged_records[idx] = r
+                version_map[key] = r
+            else:
+                # 已有记录 version 更大 → 当前记录被合并
+                merged_old_ids.append(r["id"])
+
+    if merged_old_ids:
+        logger.debug(
+            f"[crdb_sync] R41: 合并最高 version 后, "
+            f"原始 {len(batch)} 条 → 保留 {len(merged_records)} 条, "
+            f"被合并 {len(merged_old_ids)} 条旧版本(仍标记 processed)"
+        )
+
+    # 按 table_name 分组(基于合并后的记录)
+    groups: dict[str, list[dict]] = {}
+    for r in merged_records:
         tn = r.get("table_name", "") or ""
         groups.setdefault(tn, []).append(r)
 
@@ -925,6 +1354,10 @@ async def _sync_dirty_outbox():
             # R40 P0-5: 异常时整批路由到 DLQ
             await _route_dirty_outbox_to_dlq(table_name, records, str(e))
 
+    # R41: 被合并的旧版本 id 也标记为 processed(已包含在最新版本中)
+    # 避免下一轮重复 dispatch 同一 (table_name, pk) 的旧版本
+    all_processed.extend(merged_old_ids)
+
     # R40 P0-5: 标记已处理(区分 local_only 和普通)
     if all_processed:
         await store.mark_dirty_processed(all_processed)
@@ -935,8 +1368,21 @@ async def _sync_dirty_outbox():
         logger.debug(
             f"[crdb_sync] R40 P0-5: dirty_outbox 已处理 "
             f"{total_marked}/{len(batch)} 条"
-            f"(local_only={len(local_only_processed)}, crdb={len(all_processed)})"
+            f"(local_only={len(local_only_processed)}, crdb={len(all_processed)}, "
+            f"merged_old={len(merged_old_ids)})"
         )
+
+    # R41 P0-6: 清理 DLQ — 达到 max_retries 的记录标记为 permanently_failed
+    # 避免无限积压(max_retries=5 后停止重试)
+    try:
+        await store.cleanup_dlq()
+    except Exception as cleanup_err:
+        logger.debug(
+            f"[crdb_sync] R41 P0-6: cleanup_dlq 异常(可忽略): {cleanup_err}"
+        )
+
+    # R41 RU 门禁: 处理完毕后检查空闲,超阈值则关闭 CRDB pool
+    await _close_pool_if_idle()
 
 
 async def main():
