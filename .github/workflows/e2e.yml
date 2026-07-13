@@ -11,15 +11,15 @@ jobs:
   playwright-e2e:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@8e5e7e5cb8c3157c4e73086e37156b7f4c5984b4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Set up Python
-        uses: actions/setup-python@0b93614531b8e4e9d3f74f4a7c76b09f2cd5e7d8
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.11'
 
       - name: Set up Node
-        uses: actions/setup-node@39370e3977a6e5bfb88f5f4e7f4c5e3a7c5b3b1f
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '20'
 
@@ -39,7 +39,7 @@ jobs:
 
       - name: Upload Playwright report
         if: always()
-        uses: actions/upload-artifact@6f51ac03b9289b47c7d4e1ce4c0bae89999e5c4a
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: playwright-report
           path: tests/e2e/playwright-report/
