@@ -15,13 +15,18 @@
 测试策略:
 - 使用 CommandBus 构造函数注入 mock rbac/approval 模块(隔离 DB 依赖)
 - 使用 AsyncMock 模拟异步函数
-- 每个用例前重置 _EXECUTED_ACTIONS 幂等缓存
+- R41 P0-5: 幂等缓存迁移到 SQLite command_executions 表,
+  需要数据库初始化的测试通过 ``real_store`` fixture 注入临时 SQLite 数据库
 """
 from __future__ import annotations
 
+import shutil
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 # 延迟导入,确保 conftest 已注入 fake config
 from services.command_bus import (
@@ -56,6 +61,8 @@ from services.command_bus import (
     make_disable_maintenance_command,
     make_purge_data_command,
 )
+from database import cache_store as _cs_module
+from database.cache_store import CacheStore
 
 
 # ════════════════════════════════════════════════════════════════
@@ -100,10 +107,40 @@ def _make_mock_approval(create_approval_id: int = 100):
 
 @pytest.fixture(autouse=True)
 def _reset_idempotency():
-    """每个用例前重置幂等缓存,避免跨用例污染。"""
+    """每个用例前重置幂等缓存,避免跨用例污染。
+
+    R41 P0-5: reset_idempotency_cache 已弃用(幂等改用 SQLite command_executions 表),
+    此 fixture 保留为兼容点;真正需要幂等保护的测试应使用 ``real_store`` fixture
+    提供临时 SQLite 数据库。
+    """
     reset_idempotency_cache()
     yield
     reset_idempotency_cache()
+
+
+@pytest_asyncio.fixture
+async def real_store():
+    """创建一个使用临时文件数据库的 CacheStore 实例(隔离生产数据)。
+
+    R41 P0-5: 幂等缓存迁移到 SQLite command_executions 表后,
+    需要数据库初始化才能进行幂等检查。此 fixture 提供临时 SQLite 数据库,
+    并设置 ``_cs_module._store`` 使 ``get_cache_store()`` 返回测试 store。
+    """
+    tmpdir = tempfile.mkdtemp(prefix="r40_p0_8_test_")
+    db_path = Path(tmpdir) / "test_cache.db"
+    original_path = _cs_module.DB_PATH
+    original_store = getattr(_cs_module, "_store", None)
+    _cs_module.DB_PATH = db_path
+    try:
+        s = CacheStore()
+        await s.init()
+        _cs_module._store = s  # 让 get_cache_store() 返回测试 store
+        yield s
+        await s.close()
+    finally:
+        _cs_module.DB_PATH = original_path
+        _cs_module._store = original_store
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -235,8 +272,12 @@ class TestCommandBusExecute:
         assert "DB connection lost" in result.error
 
     @pytest.mark.asyncio
-    async def test_idempotency_duplicate_action_id(self):
-        """相同 action_id 第二次执行直接返回缓存结果,不重复执行 handler。"""
+    async def test_idempotency_duplicate_action_id(self, real_store):
+        """相同 action_id 第二次执行直接返回缓存结果,不重复执行 handler。
+
+        R41 P0-5: 幂等缓存迁移到 SQLite command_executions 表,
+        需要通过 ``real_store`` fixture 提供临时 SQLite 数据库。
+        """
         call_count = {"n": 0}
 
         async def _handler(params):
@@ -261,7 +302,7 @@ class TestCommandBusExecute:
         assert result1.success is True
         assert result2.success is True
         assert result2.action_id == fixed_action_id
-        # handler 只被调用一次
+        # handler 只被调用一次(SQLite command_executions 表幂等命中)
         assert call_count["n"] == 1
 
     @pytest.mark.asyncio
@@ -370,8 +411,12 @@ class TestExecuteApprovedAction:
         mock_approval.mark_failed.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_execute_approved_action_idempotent(self, monkeypatch):
-        """对已执行的 action_id 再次调用,返回缓存结果不重复执行。"""
+    async def test_execute_approved_action_idempotent(self, real_store, monkeypatch):
+        """对已执行的 action_id 再次调用,返回缓存结果不重复执行。
+
+        R41 P0-5: 幂等缓存迁移到 SQLite command_executions 表,
+        需要通过 ``real_store`` fixture 提供临时 SQLite 数据库。
+        """
         import services.content_reports as cr_mod
         call_count = {"n": 0}
 
@@ -409,7 +454,7 @@ class TestExecuteApprovedAction:
 
         assert result1.success is True
         assert result2.success is True
-        # handler 只被调用一次(幂等)
+        # handler 只被调用一次(SQLite command_executions 表幂等命中)
         assert call_count["n"] == 1
 
     @pytest.mark.asyncio
@@ -1090,15 +1135,27 @@ class TestRbacPermissionConstants:
 # ════════════════════════════════════════════════════════════════
 
 class TestApproveAutoExecution:
-    """R40 P0-8: approve() 自动触发 CommandBus.execute_approved_action 集成测试。"""
+    """R40 P0-8 + R41 P0-4: approve() 写入 command_outbox 集成测试。
+
+    R41 P0-4 变更:
+        approve() 不再直接调用 CommandBus.execute_approved_action() 执行 handler,
+        而是将命令写入 ``command_outbox`` 表(独立事务),由 ApprovalExecutor 异步消费。
+        这样可消除嵌套 SQLite transaction(BEGIN within BEGIN)的风险。
+    """
 
     @pytest.mark.asyncio
-    async def test_approve_triggers_command_execution_for_commandbus_approval(self, monkeypatch):
-        """approve() 对 CommandBus 创建的审批(含 command_action)自动执行命令。"""
+    async def test_approve_writes_command_outbox_for_commandbus_approval(self, monkeypatch):
+        """approve() 对 CommandBus 创建的审批(含 command_action)写入 command_outbox。
+
+        验证:
+        - approve() 返回 True(审批已批准)
+        - takedown_content 不被直接调用(由 ApprovalExecutor 异步消费)
+        - mock_tx.execute 至少一次调用包含 INSERT INTO command_outbox SQL
+        """
         from services import approval_workflow
         import services.content_reports as cr_mod
 
-        # Mock content_reports.takedown_content
+        # Mock content_reports.takedown_content(用于断言未被调用)
         takedown_called = {"n": 0}
 
         async def _fake_takedown(target_type, target_id, reason, admin_id):
@@ -1112,7 +1169,11 @@ class TestApproveAutoExecution:
         mock_store._db = MagicMock()
         mock_tx = AsyncMock()
         mock_tx.execute = AsyncMock(return_value=MagicMock(rowcount=1))
+        # transaction() 返回 mock_tx,且 __aenter__ 返回 mock_tx 自身
+        # (确保 `async with store.transaction() as tx:` 中的 tx 是 mock_tx)
         mock_store.transaction = MagicMock(return_value=mock_tx)
+        mock_tx.__aenter__.return_value = mock_tx
+        mock_tx.__aexit__.return_value = None
         mock_store.add_dirty_outbox = AsyncMock(return_value=None)
         monkeypatch.setattr(approval_workflow, "get_cache_store", lambda: mock_store)
 
@@ -1136,18 +1197,10 @@ class TestApproveAutoExecution:
             "resolved_at": None,
         }
 
-        # get_approval 在 approve() 中调用(返回 pending),也在 execute_approved_action 中调用(返回 approved)
-        call_count = {"n": 0}
-
-        async def _get_approval(approval_id):
-            call_count["n"] += 1
-            # 第一次调用(approve 内部检查)返回 pending
-            if call_count["n"] == 1:
-                return approval_record
-            # 后续调用(execute_approved_action 内部)返回 approved
-            return {**approval_record, "status": "approved"}
-
-        monkeypatch.setattr(approval_workflow, "get_approval", _get_approval)
+        monkeypatch.setattr(
+            approval_workflow, "get_approval",
+            AsyncMock(return_value=approval_record),
+        )
 
         # Mock rbac.check_permission 让审批人有权限
         monkeypatch.setattr(
@@ -1162,13 +1215,20 @@ class TestApproveAutoExecution:
 
         # approve 应成功(已批准)
         assert ok is True
-        # CommandBus 应被触发,takedown_content 应被调用
-        assert takedown_called["n"] == 1, \
-            "approve() 通过后应自动触发 CommandBus 执行 takedown_content"
+        # R41 P0-4: handler 不应被直接调用(由 ApprovalExecutor 异步消费)
+        assert takedown_called["n"] == 0, \
+            "approve() 不应直接调用 takedown_content,应通过 command_outbox 异步消费"
+        # 验证至少一次 INSERT INTO command_outbox 调用
+        insert_calls = [
+            c for c in mock_tx.execute.call_args_list
+            if c.args and "INSERT INTO command_outbox" in str(c.args[0])
+        ]
+        assert len(insert_calls) >= 1, \
+            "approve() 应通过 mock_tx.execute 写入 command_outbox"
 
     @pytest.mark.asyncio
     async def test_approve_skips_auto_execution_for_non_commandbus_approval(self, monkeypatch):
-        """approve() 对非 CommandBus 创建的审批(无 command_action)不触发自动执行。"""
+        """approve() 对非 CommandBus 创建的审批(无 command_action)不写 command_outbox。"""
         from services import approval_workflow
 
         # Mock get_cache_store
@@ -1208,7 +1268,13 @@ class TestApproveAutoExecution:
         )
 
         assert ok is True
-        # 由于无 command_action,不会触发 CommandBus(不会报错)
+        # 由于无 command_action,不会写 command_outbox
+        insert_calls = [
+            c for c in mock_tx.execute.call_args_list
+            if c.args and "INSERT INTO command_outbox" in str(c.args[0])
+        ]
+        assert len(insert_calls) == 0, \
+            "无 command_action 时不应写 command_outbox"
 
 
 # ════════════════════════════════════════════════════════════════

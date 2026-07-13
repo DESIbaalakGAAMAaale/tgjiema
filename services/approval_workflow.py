@@ -217,8 +217,12 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
 
         logger.info(f"[Approval] approve 审批已批准 id={approval_id} approver={approver_id}")
 
-        # R40 P0-8: 审批通过后自动执行命令(仅对 CommandBus 创建的审批)
-        # payload 中含 command_action 字段表示该审批由 CommandBus 创建
+        # R41 P0-4: 审批通过后写入 command_outbox(独立事务),由 ApprovalExecutor 异步消费。
+        # 不再在 approve() 中直接调用 cb.execute_approved_action() —— 后者会调用
+        # mark_executing() 开启 store.transaction(),与 approve 的事务上下文可能嵌套
+        # (SQLite 不支持 BEGIN 嵌套,抛 "cannot start a transaction within a transaction")。
+        # 通过 command_outbox 解耦:approve 只做 CAS PENDING → APPROVED + 审计 + 写入 outbox,
+        # 真正的 handler 执行由 ApprovalExecutor 在独立事务中完成,支持重试与失败隔离。
         payload_data = approval.get("payload", {}) or {}
         if isinstance(payload_data, str):
             try:
@@ -226,29 +230,72 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
             except (json.JSONDecodeError, TypeError):
                 payload_data = {}
         if payload_data.get("command_action"):
-            try:
-                from services.command_bus import CommandBus
-                cb = CommandBus()
-                exec_result = await cb.execute_approved_action(approval_id)
-                if exec_result.success:
-                    logger.info(
-                        f"[Approval] 自动执行命令成功 approval_id={approval_id} "
-                        f"action={payload_data.get('command_action')}"
-                    )
-                else:
-                    logger.warning(
-                        f"[Approval] 自动执行命令失败 approval_id={approval_id} "
-                        f"error={exec_result.error}"
-                    )
-            except Exception as exec_err:
-                # 命令执行失败不影响审批已批准的状态
-                # 审批仍为 APPROVED,可通过手动调用 execute_approved_action 重试
-                logger.warning(
-                    f"[Approval] 自动执行命令异常 approval_id={approval_id}: {exec_err}"
-                )
+            await _enqueue_command_outbox(
+                approval_id=approval_id,
+                action_id=payload_data.get("action_id", ""),
+                command_type=payload_data.get("command_action", ""),
+                payload=payload_data,
+            )
         return True
     except Exception as e:
         logger.error(f"[Approval] approve 失败 id={approval_id}: {e}")
+        return False
+
+
+async def _enqueue_command_outbox(
+    approval_id: int,
+    action_id: str,
+    command_type: str,
+    payload: dict,
+) -> bool:
+    """R41 P0-4: 审批通过后写入 command_outbox(独立事务)。
+
+    ApprovalExecutor 会异步消费此表,调用 CommandBus.execute_command_outbox_entry()
+    执行实际 handler,完全独立的事务,避免嵌套 BEGIN。
+
+    Args:
+        approval_id: 关联审批 ID
+        action_id: 幂等 action_id(从 approval payload 中提取)
+        command_type: 命令类型(如 "takedown_report" / "ban_user")
+        payload: 完整 payload(含 command_action / params / principal_* 等)
+
+    Returns:
+        True 表示写入成功;False 表示失败(审批状态已 APPROVED,可通过手动重试补救)
+    """
+    store = get_cache_store()
+    if not store._db:
+        logger.warning(
+            f"[Approval] _enqueue_command_outbox 数据库未初始化 approval_id={approval_id}"
+        )
+        return False
+
+    now = datetime.datetime.now().isoformat()
+    if not action_id:
+        # 兜底:action_id 缺失时使用 approval_id 作为唯一标识
+        action_id = f"approval_{approval_id}_{now}"
+    payload_str = json.dumps(payload, ensure_ascii=False, default=str)
+
+    try:
+        async with store.transaction() as tx:
+            await tx.execute(
+                "INSERT INTO command_outbox "
+                "(action_id, approval_id, command_type, payload, status, "
+                " retry_count, max_retries, next_retry_at, last_error, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'pending', 0, 3, NULL, NULL, ?, ?)",
+                (action_id, approval_id, command_type, payload_str, now, now),
+            )
+        logger.info(
+            f"[Approval] command_outbox 已写入 approval_id={approval_id} "
+            f"action_id={action_id} command_type={command_type}"
+        )
+        return True
+    except Exception as e:
+        # 写入失败不影响审批已批准的状态(APPROVED 已落库),
+        # 可通过手动调用 CommandBus.execute_approved_action(approval_id) 兜底执行
+        logger.error(
+            f"[Approval] command_outbox 写入失败 approval_id={approval_id}: {e}"
+        )
         return False
 
 

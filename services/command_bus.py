@@ -1,4 +1,4 @@
-"""R40 P0-8: 命令总线 — RBAC + 审批强制门禁。
+"""R40 P0-8 + R41 P0-5: 命令总线 — RBAC + 审批强制门禁 + 持久化幂等。
 
 职责:
     解决原 Web 路由仅依赖 Basic Auth、Bot 命令依赖旧 ``_auth_required`` 的问题。
@@ -8,6 +8,13 @@
        等待审批通过后才执行 handler)
     3. 审计日志(记录 principal.id / action / params / result)
     4. 幂等(基于 action_id 防重复执行)
+
+R41 P0-5 整改:
+    - 移除进程内 ``_EXECUTED_ACTIONS`` dict,改为 SQLite ``command_executions`` 表持久化。
+    - 重启、多 worker、故障恢复后 action_id 仍可见,避免重复执行。
+    - "执行中"状态由 ``claim_execution`` + ``lease_until`` 实现持久租约。
+    - ``request_hash`` 防篡改:相同 action_id 不同 payload → 拒绝执行。
+    - ``cleanup_stale_leases`` 清理过期租约(executing + lease_until < now → pending)。
 
 设计要点:
     - 命令对象(Command dataclass)描述所需的权限、审批策略、handler、参数
@@ -19,8 +26,12 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
+import os
 import secrets as _secrets
+import socket
+import sqlite3
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -105,13 +116,20 @@ class Result:
     action_id: str = ""
 
 
-# ─── 幂等执行追踪(进程内) ───────────────────────────────────
-# action_id → 上次执行结果(防止重复执行)
-_EXECUTED_ACTIONS: dict[str, Result] = {}
+# ─── R41 P0-5: 幂等执行追踪(SQLite 持久化) ───────────────────
+# 替代原 _EXECUTED_ACTIONS 进程内 dict,改为 command_executions 表 CAS。
+# 状态机: pending → executing → executed/failed
+CMD_STATUS_PENDING = "pending"
+CMD_STATUS_EXECUTING = "executing"
+CMD_STATUS_EXECUTED = "executed"
+CMD_STATUS_FAILED = "failed"
 
 
-def _generate_action_id(principal: AdminPrincipal, action: str) -> str:
+def _generate_action_id(principal: "AdminPrincipal", action: str) -> str:
     """生成幂等 action_id(基于 principal + action + 时间戳 + 随机)。
+
+    R41 P0-5 说明:此函数保留用于向后兼容(旧测试和 approval payload 重建)。
+    新代码应使用 ``_compute_action_id`` 基于 SHA256 生成确定性 ID。
 
     同一 principal 多次发起相同 action,每次生成不同 action_id;
     但调用方可以通过传入相同 action_id(从 approval 记录中取)实现幂等。
@@ -119,9 +137,361 @@ def _generate_action_id(principal: AdminPrincipal, action: str) -> str:
     return f"{action}_{principal.id}_{_dt.datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{_secrets.token_hex(4)}"
 
 
+def _compute_action_id(command_type: str, payload: dict, principal_id: int) -> str:
+    """R41 P0-5: 计算确定性 action_id = SHA256(command_type + payload + principal_id)。
+
+    同一 principal 对同一命令(相同参数)多次发起 → 相同 action_id → 自动幂等。
+    不同参数 → 不同 action_id → 视为不同操作。
+    """
+    payload_str = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    raw = f"{command_type}|{payload_str}|{principal_id}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _compute_request_hash(payload: dict) -> str:
+    """R41 P0-5: 计算 payload 的 SHA256(防篡改)。
+
+    当外部传入 action_id(如从 approval payload 恢复)时,通过 request_hash
+    校验 payload 是否与首次执行一致,防止篡改。
+    """
+    payload_str = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+
+def _get_worker_owner() -> str:
+    """R41 P0-5: 获取当前 worker 标识(hostname:pid),用于执行租约 owner。"""
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _now_iso() -> str:
+    """R41 P0-5: 当前 UTC 时间 ISO8601 字符串。"""
+    return _dt.datetime.utcnow().isoformat()
+
+
+def _lease_until_iso(lease_seconds: int) -> str:
+    """R41 P0-5: 计算租约过期时间(UTC ISO8601)。"""
+    return (_dt.datetime.utcnow() + _dt.timedelta(seconds=lease_seconds)).isoformat()
+
+
+def _get_store():
+    """R41 P0-5: 懒加载获取 CacheStore 单例(避免循环导入)。"""
+    from database.cache_store import get_cache_store
+    return get_cache_store()
+
+
 def reset_idempotency_cache() -> None:
-    """重置进程内幂等缓存(测试用例间隔离)。"""
-    _EXECUTED_ACTIONS.clear()
+    """R41 P0-5: 重置幂等缓存(兼容旧测试 fixture,同步无操作)。
+
+    旧实现清空进程内 ``_EXECUTED_ACTIONS`` dict。R41 P0-5 改为 SQLite 持久化后,
+    同步函数无法执行异步 DELETE。测试间隔离请使用 ``clear_command_executions()``
+    (异步)或为每个测试创建独立的临时数据库(``real_store`` fixture)。
+    """
+    logger.debug("[CommandBus] reset_idempotency_cache 已弃用(R41 P0-5 改用 SQLite),无操作")
+
+
+async def clear_command_executions() -> None:
+    """R41 P0-5: 清空 command_executions 表(测试用例间隔离)。
+
+    若数据库未初始化,无操作(兼容无 DB 的单元测试)。
+    """
+    store = _get_store()
+    if not store._db:
+        return
+    try:
+        await store._db.execute("DELETE FROM command_executions")
+        await store._db.commit()
+    except Exception as e:
+        logger.warning(f"[CommandBus] clear_command_executions 失败: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# R41 P0-5: 持久化幂等 — 模块级 CAS 操作函数
+# ════════════════════════════════════════════════════════════════
+
+
+async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -> bool:
+    """R41 P0-5: CAS 认领 — 将 status='pending' 转为 'executing',设置 owner 和 lease_until。
+
+    多 worker 并发时,只有一个 worker 的 CAS UPDATE 会命中(rowcount=1),
+    其他 worker rowcount=0 → 抢占失败。
+
+    Args:
+        action_id: 命令幂等 ID
+        owner: 执行 worker 标识(如 hostname:pid)
+        lease_seconds: 租约时长(秒),过期后可被 cleanup_stale_leases 回收
+
+    Returns:
+        True 表示认领成功;False 表示已被其他 worker 抢占或状态不符
+    """
+    store = _get_store()
+    if not store._db:
+        return False
+    lease_until = _lease_until_iso(lease_seconds)
+    now = _now_iso()
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, owner = ?, lease_until = ?, updated_at = ? "
+            "WHERE action_id = ? AND status = ?",
+            (CMD_STATUS_EXECUTING, owner, lease_until, now, action_id, CMD_STATUS_PENDING),
+        )
+        await store._db.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"[CommandBus] claim_execution 失败 action_id={action_id}: {e}")
+        return False
+
+
+async def renew_lease(action_id: str, lease_seconds: int = 60) -> bool:
+    """R41 P0-5: 续租 — 延长 lease_until(仅 status='executing' 的记录可续租)。
+
+    Args:
+        action_id: 命令幂等 ID
+        lease_seconds: 新的租约时长(秒)
+
+    Returns:
+        True 表示续租成功;False 表示记录不存在或状态不符
+    """
+    store = _get_store()
+    if not store._db:
+        return False
+    lease_until = _lease_until_iso(lease_seconds)
+    now = _now_iso()
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET lease_until = ?, updated_at = ? "
+            "WHERE action_id = ? AND status = ?",
+            (lease_until, now, action_id, CMD_STATUS_EXECUTING),
+        )
+        await store._db.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"[CommandBus] renew_lease 失败 action_id={action_id}: {e}")
+        return False
+
+
+async def release_execution(action_id: str) -> bool:
+    """R41 P0-5: 释放 — 将状态回退到 'pending'(owner/lease 清空),允许重新认领。
+
+    用于执行失败后手动重置,或外部干预释放僵死任务。
+
+    Args:
+        action_id: 命令幂等 ID
+
+    Returns:
+        True 表示释放成功;False 表示记录不存在
+    """
+    store = _get_store()
+    if not store._db:
+        return False
+    now = _now_iso()
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, owner = NULL, lease_until = NULL, updated_at = ? "
+            "WHERE action_id = ?",
+            (CMD_STATUS_PENDING, now, action_id),
+        )
+        await store._db.commit()
+        return cursor.rowcount > 0
+    except Exception as e:
+        logger.error(f"[CommandBus] release_execution 失败 action_id={action_id}: {e}")
+        return False
+
+
+async def cleanup_stale_leases() -> int:
+    """R41 P0-5: 清理过期租约 — status='executing' 且 lease_until < now → status='pending'。
+
+    被 r40_scheduler 每 60 秒调用一次。将过期租约回退到 pending,
+    允许其他 worker 重新认领(防止 worker 崩溃后任务永久卡在 executing)。
+
+    Returns:
+        清理的记录数
+    """
+    store = _get_store()
+    if not store._db:
+        return 0
+    now = _now_iso()
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, owner = NULL, lease_until = NULL, updated_at = ? "
+            "WHERE status = ? AND lease_until < ?",
+            (CMD_STATUS_PENDING, now, CMD_STATUS_EXECUTING, now),
+        )
+        await store._db.commit()
+        return cursor.rowcount
+    except Exception as e:
+        logger.warning(f"[CommandBus] cleanup_stale_leases 失败: {e}")
+        return 0
+
+
+async def _try_insert_or_get_cached(
+    action_id: str,
+    command_type: str,
+    principal_id: int,
+    request_hash: str,
+) -> "Result | None":
+    """R41 P0-5: 尝试 INSERT 新记录(status='pending')。
+
+    - INSERT 成功 → 返回 None(调用方继续执行 handler)。
+    - UNIQUE 冲突(已存在)→ 查询现有记录并返回缓存 Result。
+    - 其他 DB 异常 → 返回 None(降级执行,无幂等保护)。
+
+    Args:
+        action_id: 命令幂等 ID
+        command_type: 命令类型(如 "takedown_report")
+        principal_id: 操作者 ID
+        request_hash: SHA256(payload),防篡改
+
+    Returns:
+        None 表示新记录(继续执行);Result 表示已存在(返回缓存)。
+    """
+    store = _get_store()
+    if not store._db:
+        logger.warning("[CommandBus] 数据库未初始化,跳过幂等 INSERT(降级模式)")
+        return None
+    now = _now_iso()
+    try:
+        await store._db.execute(
+            "INSERT INTO command_executions "
+            "(action_id, command_type, principal_id, status, owner, lease_until, "
+            "request_hash, result, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?)",
+            (action_id, command_type, principal_id, CMD_STATUS_PENDING,
+             request_hash, now, now),
+        )
+        await store._db.commit()
+        return None  # INSERT 成功,新记录
+    except sqlite3.IntegrityError:
+        # UNIQUE 冲突 — action_id 已存在,查询并返回缓存
+        logger.debug(f"[CommandBus] INSERT 冲突(已存在)action_id={action_id}")
+        return await _get_cached_result(action_id, request_hash)
+    except Exception as e:
+        # 其他 DB 异常 — 降级执行(无幂等保护)
+        logger.warning(
+            f"[CommandBus] 幂等 INSERT 异常,降级执行 action_id={action_id}: {e}"
+        )
+        return None
+
+
+async def _get_cached_result(action_id: str, request_hash: str) -> "Result | None":
+    """R41 P0-5: 查询现有执行记录,返回缓存 Result。
+
+    - request_hash 不匹配 → 返回失败(防篡改)。
+    - status='executed' → 返回缓存的成功 Result。
+    - status='failed' → 返回缓存的失败 Result。
+    - status='pending'/'executing' → 返回"操作已存在"。
+
+    Args:
+        action_id: 命令幂等 ID
+        request_hash: 当前请求的 SHA256(payload)
+
+    Returns:
+        缓存 Result;记录不存在返回 None。
+    """
+    store = _get_store()
+    if not store._db:
+        return None
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT status, request_hash, result FROM command_executions "
+            "WHERE action_id = ?",
+            (action_id,),
+        )
+    except Exception as e:
+        logger.warning(f"[CommandBus] _get_cached_result 查询失败 action_id={action_id}: {e}")
+        return None
+    if not rows:
+        return None
+    status, stored_hash, result_json = rows[0]
+    # request_hash 校验(防篡改)
+    if stored_hash != request_hash:
+        logger.warning(
+            f"[CommandBus] request_hash 不匹配 action_id={action_id} "
+            f"(可能 payload 被篡改)"
+        )
+        return Result(
+            success=False,
+            error="请求参数与上次执行不一致(防篡改拒绝)",
+            action_id=action_id,
+        )
+    # 已执行 → 返回缓存的成功结果
+    if status == CMD_STATUS_EXECUTED and result_json:
+        try:
+            data = json.loads(result_json)
+            return Result(
+                success=bool(data.get("success", True)),
+                data=data.get("data"),
+                error=data.get("error", ""),
+                action_id=action_id,
+            )
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # 已失败 → 返回缓存的失败结果
+    if status == CMD_STATUS_FAILED and result_json:
+        try:
+            data = json.loads(result_json)
+            return Result(
+                success=False,
+                error=data.get("error", "上次执行失败"),
+                action_id=action_id,
+            )
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # 正在执行或排队中
+    return Result(
+        success=False,
+        error=f"操作已存在,当前状态: {status}",
+        action_id=action_id,
+    )
+
+
+async def _mark_executed(action_id: str, result: "Result") -> None:
+    """R41 P0-5: 标记为已执行,存储结果 JSON。"""
+    store = _get_store()
+    if not store._db:
+        return
+    now = _now_iso()
+    result_json = json.dumps(
+        {"success": result.success, "data": result.data, "error": result.error},
+        ensure_ascii=False,
+        default=str,
+    )
+    try:
+        await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, result = ?, updated_at = ? "
+            "WHERE action_id = ?",
+            (CMD_STATUS_EXECUTED, result_json, now, action_id),
+        )
+        await store._db.commit()
+    except Exception as e:
+        logger.error(f"[CommandBus] _mark_executed 失败 action_id={action_id}: {e}")
+
+
+async def _mark_failed(action_id: str, result: "Result") -> None:
+    """R41 P0-5: 标记为失败,存储错误信息 JSON。"""
+    store = _get_store()
+    if not store._db:
+        return
+    now = _now_iso()
+    result_json = json.dumps(
+        {"success": result.success, "data": result.data, "error": result.error},
+        ensure_ascii=False,
+        default=str,
+    )
+    try:
+        await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, result = ?, updated_at = ? "
+            "WHERE action_id = ?",
+            (CMD_STATUS_FAILED, result_json, now, action_id),
+        )
+        await store._db.commit()
+    except Exception as e:
+        logger.error(f"[CommandBus] _mark_failed 失败 action_id={action_id}: {e}")
 
 
 class CommandBus:
@@ -161,26 +531,21 @@ class CommandBus:
     ) -> Result:
         """执行命令,完整流程:RBAC → 审批 → 执行 → 审计。
 
+        R41 P0-5: 幂等由 SQLite ``command_executions`` 表 CAS 保证(替代进程内 dict)。
+        当 ``action_id`` 为 None 时,基于 ``SHA256(command_type + payload + principal_id)``
+        生成确定性 ID,同一 principal 对同一命令(相同参数)多次发起 → 自动幂等。
+
         Args:
             command: 命令对象
             principal: 操作者身份
-            action_id: 幂等 ID(可选,None 时自动生成;传入相同 ID 触发幂等去重)
+            action_id: 幂等 ID(可选,None 时基于 SHA256 自动生成;传入相同 ID 触发幂等去重)
 
         Returns:
             Result 标准化返回
         """
-        # 生成或复用 action_id(幂等追踪)
+        # R41 P0-5: 计算确定性 action_id(SHA256)
         if not action_id:
-            action_id = _generate_action_id(principal, command.action)
-
-        # 幂等检查:已成功执行的 action_id 直接返回缓存结果
-        if action_id in _EXECUTED_ACTIONS:
-            cached = _EXECUTED_ACTIONS[action_id]
-            logger.info(
-                f"[CommandBus] 幂等命中 action_id={action_id} action={command.action} "
-                f"跳过重复执行(success={cached.success})"
-            )
-            return cached
+            action_id = _compute_action_id(command.action, command.params, principal.id)
 
         # 1. RBAC 权限校验(fail-closed:异常时拒绝)
         rbac = self._get_rbac()
@@ -297,19 +662,11 @@ class CommandBus:
         principal_id = int(payload.get("principal_id", 0))
         principal_name = payload.get("principal_name", "")
         principal_source = payload.get("principal_source", "web")
+        # R41 P0-5: action_id 优先从 payload 恢复,否则基于 SHA256 计算
         if not action_id:
-            action_id = payload.get("action_id", _generate_action_id(
-                AdminPrincipal(id=principal_id, name=principal_name, source=principal_source),
-                command_action,
-            ))
-
-        # 幂等检查
-        if action_id in _EXECUTED_ACTIONS:
-            cached = _EXECUTED_ACTIONS[action_id]
-            logger.info(
-                f"[CommandBus] 幂等命中 approval_id={approval_id} action_id={action_id}"
+            action_id = payload.get("action_id") or _compute_action_id(
+                command_action, params, principal_id,
             )
-            return cached
 
         # 重建 command(从已注册的 handler 中查找)
         command = _resolve_command_for_action(command_action, params)
@@ -344,6 +701,116 @@ class CommandBus:
 
         return result
 
+    # ─── 2b. R41 P0-4: 由 ApprovalExecutor 调用,从 command_outbox 条目执行 ──
+
+    async def execute_command_outbox_entry(self, entry: dict) -> Result:
+        """R41 P0-4: 执行 command_outbox 中的条目(由 ApprovalExecutor 调用)。
+
+        与 ``execute_approved_action`` 的差异:
+        - 不查询 approval_record(payload 已在 entry 中,避免重复 DB 读)
+        - 不走 SQLite ``command_executions`` 幂等缓存,允许 ApprovalExecutor 重试
+          (幂等由 command_outbox.action_id UNIQUE 约束 + handler 自身保证)
+        - 仍调用 ``mark_executing`` / ``mark_executed`` / ``mark_failed`` 维护审批状态机
+
+        Args:
+            entry: command_outbox 行字典,字段包含:
+                - id / action_id / approval_id / command_type / payload(JSON 字符串) /
+                  status / retry_count / max_retries / next_retry_at / last_error /
+                  created_at / updated_at
+
+        Returns:
+            Result 标准化返回
+        """
+        import json as _json_ox
+
+        approval = self._get_approval()
+        approval_id = int(entry.get("approval_id", 0) or 0)
+        action_id = entry.get("action_id", "") or ""
+        command_action = entry.get("command_type", "") or ""
+
+        # 解析 payload(JSON 字符串 → dict)
+        payload_data = entry.get("payload") or "{}"
+        if isinstance(payload_data, str):
+            try:
+                payload_data = _json_ox.loads(payload_data)
+            except (ValueError, TypeError):
+                payload_data = {}
+        if not isinstance(payload_data, dict):
+            payload_data = {}
+
+        params = payload_data.get("params", {}) or {}
+        principal_id = int(payload_data.get("principal_id", 0) or 0)
+        principal_name = payload_data.get("principal_name", "") or ""
+        principal_source = payload_data.get("principal_source", "web") or "web"
+        if not action_id:
+            action_id = payload_data.get("action_id", _generate_action_id(
+                AdminPrincipal(id=principal_id, name=principal_name, source=principal_source),
+                command_action,
+            ))
+        if not command_action:
+            command_action = payload_data.get("command_action", "")
+
+        # 重建 command(从已注册的 handler 工厂中查找)
+        command = _resolve_command_for_action(command_action, params)
+        if command is None:
+            error_msg = f"无法解析命令 handler: {command_action}"
+            logger.warning(
+                f"[CommandBus] execute_command_outbox_entry {error_msg} "
+                f"approval_id={approval_id} action_id={action_id}"
+            )
+            return Result(success=False, error=error_msg, action_id=action_id)
+
+        # 标记审批状态为 EXECUTING(独立事务,不与外层 ApprovalExecutor 事务嵌套)
+        try:
+            await approval.mark_executing(approval_id)
+        except Exception as e:
+            logger.warning(
+                f"[CommandBus] execute_command_outbox_entry mark_executing 失败 "
+                f"approval_id={approval_id}: {e}"
+            )
+
+        principal = AdminPrincipal(
+            id=principal_id, name=principal_name, source=principal_source,
+        )
+
+        # 直接执行 handler(不走 SQLite command_executions 幂等缓存,允许 ApprovalExecutor 重试)
+        try:
+            data = await command.handler(command.params)
+            result = Result(success=True, data=data, action_id=action_id)
+            logger.info(
+                f"[CommandBus] execute_command_outbox_entry 成功 "
+                f"approval_id={approval_id} action_id={action_id} action={command_action}"
+            )
+            # 更新审批状态为 EXECUTED
+            try:
+                await approval.mark_executed(approval_id)
+            except Exception as e:
+                logger.warning(
+                    f"[CommandBus] execute_command_outbox_entry mark_executed 失败 "
+                    f"approval_id={approval_id}: {e}"
+                )
+            return result
+        except Exception as e:
+            result = Result(
+                success=False,
+                error=f"执行失败: {e}",
+                action_id=action_id,
+            )
+            logger.error(
+                f"[CommandBus] execute_command_outbox_entry 失败 "
+                f"approval_id={approval_id} action_id={action_id} "
+                f"action={command_action}: {e}"
+            )
+            # 更新审批状态为 FAILED
+            try:
+                await approval.mark_failed(approval_id, result.error)
+            except Exception as me:
+                logger.warning(
+                    f"[CommandBus] execute_command_outbox_entry mark_failed 失败 "
+                    f"approval_id={approval_id}: {me}"
+                )
+            return result
+
     # ─── 3. 实际执行 handler + 审计 ──────────────────────────────
 
     async def _execute_handler(
@@ -352,13 +819,66 @@ class CommandBus:
         principal: AdminPrincipal,
         action_id: str,
     ) -> Result:
-        """执行 handler 并记录审计日志(幂等缓存)。"""
-        # 标记 action_id 为执行中(写入占位,防止并发重复)
-        # 实际结果在执行完成后覆盖
-        _EXECUTED_ACTIONS[action_id] = Result(
-            success=False, error="执行中", action_id=action_id,
-        )
+        """R41 P0-5: 执行 handler,使用 SQLite CAS 保证幂等。
 
+        流程:
+        1. 计算 request_hash = SHA256(payload)
+        2. CAS INSERT INTO command_executions(status='pending')
+           - UNIQUE 冲突 → 查询现有状态返回缓存 Result
+        3. CAS UPDATE status='executing' WHERE action_id=? AND status='pending'
+           - rowcount=0 → 被其他 worker 抢占
+        4. 执行 handler
+        5. UPDATE status='executed', result=JSON
+
+        无 DB 时降级为直接执行(无幂等保护,仅用于测试)。
+        """
+        # R41 P0-5: 无 DB 降级模式 — 直接执行 handler(仅测试/开发用)
+        store = _get_store()
+        if not store._db:
+            logger.warning(
+                f"[CommandBus] 数据库未初始化,降级模式(无幂等保护) "
+                f"action={command.action} action_id={action_id}"
+            )
+            try:
+                data = await command.handler(command.params)
+                return Result(success=True, data=data, action_id=action_id)
+            except Exception as e:
+                return Result(
+                    success=False,
+                    error=f"执行失败: {e}",
+                    action_id=action_id,
+                )
+
+        # 1. 计算 request_hash(防篡改)
+        request_hash = _compute_request_hash(command.params)
+
+        # 2. CAS INSERT (status='pending') — 若已存在返回缓存
+        cached = await _try_insert_or_get_cached(
+            action_id, command.action, principal.id, request_hash,
+        )
+        if cached is not None:
+            logger.info(
+                f"[CommandBus] 幂等命中 action_id={action_id} action={command.action} "
+                f"跳过重复执行(success={cached.success})"
+            )
+            return cached
+
+        # 3. CAS claim (pending → executing)
+        owner = _get_worker_owner()
+        claimed = await claim_execution(action_id, owner, lease_seconds=60)
+        if not claimed:
+            # 被其他 worker 抢占或状态已变
+            logger.warning(
+                f"[CommandBus] CAS claim 失败 action_id={action_id} "
+                f"action={command.action}(可能被其他 worker 抢占)"
+            )
+            return Result(
+                success=False,
+                error="操作已被其他 worker 抢占或状态已变更",
+                action_id=action_id,
+            )
+
+        # 4. 执行 handler
         try:
             data = await command.handler(command.params)
             result = Result(
@@ -366,7 +886,8 @@ class CommandBus:
                 data=data,
                 action_id=action_id,
             )
-            _EXECUTED_ACTIONS[action_id] = result
+            # 5. UPDATE status='executed', result=JSON
+            await _mark_executed(action_id, result)
             logger.info(
                 f"[CommandBus] 命令执行成功 action={command.action} "
                 f"principal={principal.id} action_id={action_id}"
@@ -378,8 +899,8 @@ class CommandBus:
                 error=f"执行失败: {e}",
                 action_id=action_id,
             )
-            # 失败也缓存(防止无脑重试,但可通过 execute_approved_action 重新触发)
-            _EXECUTED_ACTIONS[action_id] = result
+            # 失败也持久化(防止无脑重试,可通过 release_execution 释放后重试)
+            await _mark_failed(action_id, result)
             logger.error(
                 f"[CommandBus] 命令执行失败 action={command.action} "
                 f"principal={principal.id} action_id={action_id}: {e}"

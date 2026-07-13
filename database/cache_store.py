@@ -767,6 +767,47 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
         )
 
+        # ─── R41 P0-6: dlq_records 死信队列权威存储表 ───
+        # crdb_sync 处理失败的 dirty_outbox 记录路由到此表(替代/补充 jsonl 文件)。
+        # 字段: status / retry_count / max_retries / next_retry_at / last_error /
+        #       created_at / updated_at / message_id(去重键) / table_name / reason / original
+        # 状态机: pending(可重试) → retrying(重试中) → done(成功) /
+        #         permanently_failed(达到 max_retries,停止重试)
+        # cleanup_dlq() 周期性将 retry_count >= max_retries 的记录标记为 permanently_failed。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS dlq_records (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id     TEXT NOT NULL,
+                table_name     TEXT NOT NULL,
+                reason         TEXT,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                retry_count    INTEGER NOT NULL DEFAULT 0,
+                max_retries    INTEGER NOT NULL DEFAULT 5,
+                next_retry_at  TEXT,
+                last_error     TEXT,
+                original       TEXT,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dlq_records_status ON dlq_records(status, next_retry_at)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_dlq_records_table ON dlq_records(table_name)"
+        )
+        # 幂等迁移: 为已存在的 dlq_records 补充列(可忽略 duplicate column 错误)
+        for _col_ddl_p0_6 in [
+            "ALTER TABLE dlq_records ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE dlq_records ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 5",
+            "ALTER TABLE dlq_records ADD COLUMN next_retry_at TEXT",
+            "ALTER TABLE dlq_records ADD COLUMN last_error TEXT",
+        ]:
+            try:
+                await self._db.execute(_col_ddl_p0_6)
+            except Exception:
+                pass  # 列已存在,忽略
+
         # ─── R40 P0-4: pending_uploads SQLite 本地权威表 ───
         # Up Bot 双写(CRDB + SQLite local),Idx Bot 仅从 SQLite 读取,
         # 消除 Idx Bot 对 CRDB 凭证的依赖(无 CRDB 凭证时主循环仍可工作)。
@@ -1004,6 +1045,30 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status)"
         )
 
+        # ─── R41 P0-4: command_outbox(审批通过后异步执行的高风险命令) ───
+        # approve() 审批通过后,将高风险命令写入此表(独立事务),
+        # ApprovalExecutor 异步消费并执行 handler,避免在 approve 事务内
+        # 嵌套 BEGIN(mark_executing/mark_executed 各自开启事务)。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS command_outbox (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id     TEXT NOT NULL UNIQUE,
+                approval_id   INTEGER NOT NULL,
+                command_type  TEXT NOT NULL,
+                payload       TEXT,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                retry_count   INTEGER NOT NULL DEFAULT 0,
+                max_retries   INTEGER NOT NULL DEFAULT 3,
+                next_retry_at TEXT,
+                last_error    TEXT,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_command_outbox_status ON command_outbox(status)"
+        )
+
         # ─── R40: 维护模式状态(maintenance_state) ───
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS maintenance_state (
@@ -1036,6 +1101,30 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_admin_access_log_created ON admin_access_log(created_at)"
         )
 
+        # ─── R41 P0-5: 命令执行持久化(幂等缓存 + 租约) ───
+        # 替代原 CommandBus._EXECUTED_ACTIONS 进程内 dict,支持:
+        # - 重启后 action_id 仍可见(持久化)
+        # - 多 worker CAS 互斥(避免重复执行)
+        # - 执行租约(executing + lease_until)防止僵死
+        # - request_hash 防篡改(相同 action_id 不同 payload → 拒绝)
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS command_executions (
+                action_id     TEXT PRIMARY KEY,
+                command_type  TEXT NOT NULL,
+                principal_id  INTEGER NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                owner         TEXT,
+                lease_until   TEXT,
+                request_hash  TEXT NOT NULL,
+                result        TEXT,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cmd_exec_status ON command_executions(status)"
+        )
+
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -1051,12 +1140,18 @@ class CacheStore:
         payload: str | None = None, version: int = 0,
         connection: Any = None, tx: Any = None,
     ) -> int:
-        """R38 P1-2 + R39 P0-4 + R40 P0-5: 写入 dirty_outbox 一条变更记录。
+        """R38 P1-2 + R39 P0-4 + R40 P0-5 + R41 P0-6: 写入 dirty_outbox 一条变更记录。
 
         R40 P0-5 变更:
           - 失败时抛出异常(不再仅 warning),让上层 UnitOfWork 捕获并回滚整个事务,
             避免业务表已提交但 dirty_outbox 写入丢失的"半提交"问题。
           - 新增 tx 别名参数(等价于 connection),便于与 UnitOfWork.transaction() 配合。
+
+        R41 P0-6 变更:
+          - 若 table_name 在 replication_policy 中声明为 LOCAL_ONLY,
+            则写入时预设 processed=1 + local_only=1(预标记为已处理),
+            crdb_sync dispatcher 不会重复拉取,避免无意义堆积。
+            记录仍保留在 dirty_outbox 表中以便审计,但不参与 CRDB 同步。
 
         Args:
             table_name: 受影响表名(如 file_records_local / codes_local / tasks / approvals)
@@ -1078,6 +1173,28 @@ class CacheStore:
         # R40 P0-5: tx 别名,优先使用 tx(向后兼容 connection 参数)
         if tx is not None:
             connection = tx
+
+        # R41 P0-6: 检查表是否为 LOCAL_ONLY 策略
+        # 若是,预设 processed=1 + local_only=1,避免 crdb_sync dispatcher 重复拉取
+        # (记录仍写入 dirty_outbox 供审计/mark_dirty_local_only 等方法使用,但不参与同步)
+        _is_local_only_table = False
+        try:
+            from services.replication_policy import is_local_only as _policy_is_local_only
+            _is_local_only_table = _policy_is_local_only(table_name)
+        except Exception:
+            # replication_policy 模块不可用时降级,按普通表处理(不预标记)
+            pass
+
+        # R41 P0-6: 预设 processed + local_only 列值
+        # local_only 表: processed=1, local_only=1(预标记为已处理)
+        # 普通 / CRDB 表: processed=0, local_only=0(待 crdb_sync 处理)
+        if _is_local_only_table:
+            _processed_init = 1
+            _local_only_init = 1
+        else:
+            _processed_init = 0
+            _local_only_init = 0
+
         # R39 P0-4 + R40 P0-5: 事务发件箱模式 — 若调用方传入 connection/tx,
         # 则使用该连接(不自动 commit),确保 dirty_outbox 写入与业务表更新
         # 在同一事务内原子提交/回滚,避免半提交导致数据不一致。
@@ -1086,11 +1203,12 @@ class CacheStore:
             # 不调用 commit,由调用方控制事务;失败抛异常让上层回滚
             cursor = await connection.execute(
                 """INSERT INTO dirty_outbox
-                   (table_name, pk, version, operation, payload, created_at, processed)
-                   VALUES (?, ?, ?, ?, ?, ?, 0)""",
+                   (table_name, pk, version, operation, payload, created_at, processed, local_only)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     table_name, pk, version, operation, payload,
                     datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
+                    _processed_init, _local_only_init,
                 ),
             )
             return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
@@ -1102,11 +1220,12 @@ class CacheStore:
             )
         cursor = await self._db.execute(
             """INSERT INTO dirty_outbox
-               (table_name, pk, version, operation, payload, created_at, processed)
-               VALUES (?, ?, ?, ?, ?, ?, 0)""",
+               (table_name, pk, version, operation, payload, created_at, processed, local_only)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 table_name, pk, version, operation, payload,
                 datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
+                _processed_init, _local_only_init,
             ),
         )
         await self._db.commit()
@@ -1501,6 +1620,174 @@ class CacheStore:
         except Exception as e:
             logger.debug(f"[CacheStore] count_unprocessed_dirty_outbox 异常: {e}")
             return 0
+
+    # ─── R41 P0-6: DLQ 死信队列 SQLite 权威存储 ───
+    # crdb_sync 处理失败的 dirty_outbox 记录路由到 dlq_records 表,
+    # 字段: status / retry_count / max_retries / next_retry_at / last_error /
+    #       created_at / updated_at / message_id(去重键) / table_name / reason / original
+    # 状态机: pending(可重试) → retrying(重试中) → done(成功) /
+    #         permanently_failed(达到 max_retries,停止重试)
+
+    async def insert_dlq_record(
+        self, message_id: str, table_name: str, reason: str,
+        original: dict | None = None, max_retries: int = 5,
+        next_retry_at: str | None = None,
+    ) -> int:
+        """R41 P0-6: 写入一条 DLQ 记录到 dlq_records 表。
+
+        若 message_id 已存在(同一条 dirty_outbox 记录重复失败),
+        则累加 retry_count 并更新 last_error / next_retry_at;
+        否则插入新记录。
+
+        Args:
+            message_id: 去重键(如 "dirty_outbox:42"),同一记录重复失败时累加重试次数
+            table_name: 受影响表名
+            reason: 失败原因
+            original: 原始 dirty_outbox 记录(可选,JSON 序列化后存储)
+            max_retries: 最大重试次数(默认 5),达到后标记 permanently_failed
+            next_retry_at: 下次重试时间(ISO 字符串),None 表示不重试
+
+        Returns:
+            新插入或更新的 dlq_records.id;失败返回 0
+        """
+        if not self._db:
+            return 0
+        import json as _json_dlq
+        import datetime as _dt_dlq
+        now_str = _dt_dlq.datetime.now().isoformat()
+        original_json = _json_dlq.dumps(original, ensure_ascii=False, default=str) if original else None
+        try:
+            # 检查是否已存在相同 message_id 的记录(幂等去重)
+            cursor = await self._db.execute(
+                "SELECT id, retry_count, max_retries FROM dlq_records WHERE message_id = ?",
+                (message_id,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                # 已存在: 累加 retry_count,更新 last_error / next_retry_at / updated_at
+                existing_id = int(row[0])
+                new_retry_count = int(row[1]) + 1
+                existing_max_retries = int(row[2])
+                # 若达到 max_retries,标记为 permanently_failed(停止重试)
+                if new_retry_count >= existing_max_retries:
+                    new_status = "permanently_failed"
+                    new_next_retry = None
+                else:
+                    new_status = "pending"
+                    new_next_retry = next_retry_at
+                await self._db.execute(
+                    """UPDATE dlq_records
+                       SET retry_count = ?, last_error = ?, next_retry_at = ?,
+                           status = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (new_retry_count, reason, new_next_retry, new_status, now_str, existing_id),
+                )
+                if not self._in_writer_tx:
+                    await self._db.commit()
+                return existing_id
+            # 不存在: 插入新记录
+            cursor = await self._db.execute(
+                """INSERT INTO dlq_records
+                   (message_id, table_name, reason, status, retry_count,
+                    max_retries, next_retry_at, last_error, original,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?)""",
+                (
+                    message_id, table_name, reason,
+                    max_retries, next_retry_at, reason, original_json,
+                    now_str, now_str,
+                ),
+            )
+            new_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if not self._in_writer_tx:
+                await self._db.commit()
+            return new_id
+        except Exception as e:
+            logger.warning(f"[CacheStore] R41 P0-6: insert_dlq_record 失败: {e}")
+            return 0
+
+    async def cleanup_dlq(self) -> int:
+        """R41 P0-6: 清理 DLQ — 将 retry_count >= max_retries 的记录标记为 permanently_failed。
+
+        达到 max_retries 的记录不再重试,避免无限积压。
+        此方法由 crdb_sync 周期性调用(每轮 _sync_dirty_outbox 末尾)。
+
+        Returns:
+            标记为 permanently_failed 的记录数
+        """
+        if not self._db:
+            return 0
+        try:
+            cursor = await self._db.execute(
+                """UPDATE dlq_records
+                   SET status = 'permanently_failed',
+                       next_retry_at = NULL,
+                       updated_at = ?
+                   WHERE status != 'permanently_failed'
+                     AND retry_count >= max_retries""",
+                (datetime.datetime.now().isoformat(),),  # type: ignore[attr-defined]
+            )
+            affected = cursor.rowcount if cursor else 0
+            if affected > 0 and not self._in_writer_tx:
+                await self._db.commit()
+            if affected > 0:
+                logger.info(
+                    f"[CacheStore] R41 P0-6: cleanup_dlq 标记 {affected} 条 "
+                    f"DLQ 记录为 permanently_failed(达到 max_retries)"
+                )
+            return affected
+        except Exception as e:
+            logger.warning(f"[CacheStore] R41 P0-6: cleanup_dlq 失败: {e}")
+            return 0
+
+    async def list_dlq_records(
+        self, status: str | None = None, limit: int = 100,
+    ) -> list[dict]:
+        """R41 P0-6: 查询 DLQ 记录(供 repair_console / 监控使用)。
+
+        Args:
+            status: 可选状态过滤('pending' / 'retrying' / 'permanently_failed' / 'done')
+            limit: 返回最大条数
+
+        Returns:
+            [{id, message_id, table_name, reason, status, retry_count, max_retries,
+              next_retry_at, last_error, original, created_at, updated_at}, ...]
+        """
+        if not self._db:
+            return []
+        try:
+            if status:
+                cursor = await self._db.execute(
+                    """SELECT id, message_id, table_name, reason, status,
+                              retry_count, max_retries, next_retry_at, last_error,
+                              original, created_at, updated_at
+                       FROM dlq_records WHERE status = ?
+                       ORDER BY id DESC LIMIT ?""",
+                    (status, limit),
+                )
+            else:
+                cursor = await self._db.execute(
+                    """SELECT id, message_id, table_name, reason, status,
+                              retry_count, max_retries, next_retry_at, last_error,
+                              original, created_at, updated_at
+                       FROM dlq_records
+                       ORDER BY id DESC LIMIT ?""",
+                    (limit,),
+                )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": r[0], "message_id": r[1], "table_name": r[2],
+                    "reason": r[3], "status": r[4], "retry_count": r[5],
+                    "max_retries": r[6], "next_retry_at": r[7],
+                    "last_error": r[8], "original": r[9],
+                    "created_at": r[10], "updated_at": r[11],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"[CacheStore] R41 P0-6: list_dlq_records 失败: {e}")
+            return []
 
     # ─── R39 P1-5: 统一软删除 API(tombstone 贯穿删除路径) ───
 
