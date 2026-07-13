@@ -132,8 +132,11 @@ def scan_html_file(path: Path) -> list[tuple[int, str, str]]:
 
 
 def _violation_key(file: str, content: str) -> str:
-    """生成违规唯一键(基于文件路径和内容,不依赖行号)。"""
-    return f"{file}::{content}"
+    """生成违规唯一键(基于文件路径和内容,不依赖行号)。
+
+    路径分隔符归一化为 /,确保 Windows 生成的 baseline 在 Linux CI 中可用。
+    """
+    return f"{file.replace(chr(92), '/')}::{content}"
 
 
 def _load_baseline() -> set[str]:
