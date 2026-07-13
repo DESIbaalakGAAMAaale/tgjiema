@@ -65,6 +65,10 @@ def _install_fake_config() -> None:
     settings.CRDB_SYNC_DIRTY_INTERVAL = 2  # 有 dirty 时 cadence(秒)
     # R37 P1-4: 备份强制加密开关(默认 False 兼容本地开发)
     settings.BACKUP_ENCRYPTION_REQUIRED = False
+    # R42 P0-3: ADMIN_PRINCIPAL_ID 默认 0(未配置),避免 MagicMock int() 返回 1 干扰
+    settings.ADMIN_PRINCIPAL_ID = 0
+    settings.ADMIN_PRINCIPAL_USERNAME = ""
+    settings.ADMIN_PRINCIPAL_BOOTSTRAP_ROLES = "super_admin"
 
     fake_config = types.ModuleType("config")
     fake_config.settings = settings

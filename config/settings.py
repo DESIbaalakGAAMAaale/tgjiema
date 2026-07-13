@@ -276,6 +276,17 @@ class Settings(BaseSettings):
     ADMIN_FILES_PAGE_SIZE: int = 50             # 文件列表分页大小
     CSRF_COOKIE_SECURE: bool = False            # CSRF Cookie Secure 标志；部署 TLS 后设为 1/true
 
+    # ── R42 P0-3: AdminPrincipal 持久化身份配置 ──
+    # 问题: 旧实现 AdminPrincipal.id 由 username hash 生成,CommandBus 按此 ID 调用 RBAC,
+    # 若 bootstrap 阶段未给该 hash ID 分配 super_admin,所有高风险操作会被 fail-closed 拒绝。
+    # 整改: 显式配置 ADMIN_PRINCIPAL_ID,bootstrap 时原子分配 super_admin 角色。
+    # 0 表示未配置(向后兼容,回退到 username hash 生成 ID)。
+    ADMIN_PRINCIPAL_ID: int = 0
+    # bootstrap 默认管理员用户名(ADMIN_PRINCIPAL_ID > 0 时使用)
+    ADMIN_PRINCIPAL_USERNAME: str = "admin"
+    # bootstrap 分配的角色列表(逗号分隔),默认 super_admin
+    ADMIN_PRINCIPAL_BOOTSTRAP_ROLES: str = "super_admin"
+
     # ─── 管理员 Bot 配置键名映射 ──────────────────────────
     @property
     def db_backup_interval(self) -> int:

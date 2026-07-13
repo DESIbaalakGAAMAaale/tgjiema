@@ -33,10 +33,38 @@ class AdminPrincipal:
     - id: 稳定的整数 ID(基于 username 哈希生成),用于审计日志和 RBAC
     - username: 显示用用户名(来自 ADMIN_USERNAME)
     - roles: 角色列表(单管理员默认超级管理员)
+
+    R42 P0-3: 新增 from_persistent_record 类方法,从 admin_principals 表行构造对象,
+    避免不同模块自行生成不同 ID 导致 RBAC 失效。
     """
     id: int
     username: str
     roles: list = field(default_factory=list)
+
+    @classmethod
+    def from_persistent_record(cls, record: dict) -> "AdminPrincipal":
+        """R42 P0-3: 从 admin_principals 持久化记录构造 AdminPrincipal。
+
+        确保 session/RBAC/CommandBus 使用同一身份表读取的 ID,而非各自生成不同 ID。
+
+        Args:
+            record: get_admin_principal_record() 返回的字典,需包含 id/username/roles
+
+        Returns:
+            AdminPrincipal 对象;record 为空时返回 id=0 的占位对象
+        """
+        if not record or not isinstance(record, dict):
+            return cls(id=0, username="", roles=[])
+        try:
+            return cls(
+                id=int(record.get("id", 0)),
+                username=str(record.get("username", "")),
+                roles=list(record.get("roles", []) or []),
+            )
+        except (TypeError, ValueError) as e:
+            from loguru import logger as _logger
+            _logger.warning(f"[AdminPrincipal] from_persistent_record 数据损坏: {e}")
+            return cls(id=0, username="", roles=[])
 
 
 def _get_admin_principal_id(username: str) -> int:
@@ -45,11 +73,104 @@ def _get_admin_principal_id(username: str) -> int:
     使用 SHA256 前 8 字节的正整数表示,保证同一 username 始终映射到同一 id,
     避免路由中 admin.id 对字符串用户名抛 ValueError。
     取模 2^31 防止溢出常见 INT 字段。
+
+    R42 P0-3: 若配置了 ADMIN_PRINCIPAL_ID(>0),优先使用配置值,
+    避免不同模块对同一 username 生成不同 hash 导致 RBAC 失效。
     """
+    # R42 P0-3: 若配置了 ADMIN_PRINCIPAL_ID(>0),优先使用配置值,
+    # 避免不同模块对同一 username 生成不同 hash 导致 RBAC 失效。
+    # 空用户名始终返回 0(无法 hash,也不应使用配置值)。
     if not username:
         return 0
+    try:
+        configured_id = int(getattr(settings, "ADMIN_PRINCIPAL_ID", 0) or 0)
+    except (TypeError, ValueError):
+        configured_id = 0
+    if configured_id > 0:
+        return configured_id
     digest = hashlib.sha256(username.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], byteorder="big") & 0x7FFFFFFF
+
+
+# ─── R42 P0-3: Admin Bootstrap 验证 + 启动 readiness ──────────────
+
+async def verify_admin_bootstrap() -> bool:
+    """R42 P0-3: 验证 admin bootstrap 是否完成。
+
+    检查项:
+      1. admin_principals 表存在且至少有一条活跃记录
+      2. 至少有一条记录拥有 super_admin 角色(admin_principal_roles 表)
+      3. 若 ADMIN_PRINCIPAL_ID > 0: 验证该 ID 对应的记录存在且活跃
+
+    Returns:
+        True: bootstrap 验证通过,可启动 Web 服务
+        False: 验证失败,应拒绝启动 Web(避免无权限时 fail-closed 阻塞所有操作)
+    """
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if not store._db:
+            return False
+
+        # 1. 查询所有活跃的 admin_principals 记录
+        rows = await store._db.execute_fetchall(
+            "SELECT id FROM admin_principals WHERE is_active = 1"
+        )
+        if not rows:
+            from loguru import logger
+            logger.warning("[verify_admin_bootstrap] 无活跃 admin_principals 记录")
+            return False
+
+        # 2. 验证至少有一条记录拥有 super_admin 角色
+        super_admin_found = False
+        for row in rows:
+            pid = int(row[0])
+            roles = await store.list_admin_principal_roles(pid)
+            if "super_admin" in roles:
+                super_admin_found = True
+                break
+        if not super_admin_found:
+            from loguru import logger
+            logger.warning("[verify_admin_bootstrap] 无任何 principal 拥有 super_admin 角色")
+            return False
+
+        # 3. 若配置了 ADMIN_PRINCIPAL_ID,验证该 ID 的记录存在且活跃
+        try:
+            configured_id = int(getattr(settings, "ADMIN_PRINCIPAL_ID", 0) or 0)
+        except (TypeError, ValueError):
+            configured_id = 0
+        if configured_id > 0:
+            record = await store.get_admin_principal_record(configured_id)
+            if record is None or not record.get("is_active", False):
+                from loguru import logger
+                logger.warning(
+                    f"[verify_admin_bootstrap] ADMIN_PRINCIPAL_ID={configured_id} "
+                    f"对应的记录不存在或未激活"
+                )
+                return False
+
+        return True
+    except Exception as e:
+        from loguru import logger
+        logger.error(f"[verify_admin_bootstrap] 验证异常(返回 False): {e}")
+        return False
+
+
+async def require_readiness() -> None:
+    """R42 P0-3: FastAPI 启动依赖 — 验证 admin bootstrap 完成。
+
+    用法:
+        # 在 FastAPI startup 事件中调用
+        await require_readiness()
+
+    失败时 raise RuntimeError,阻止 Web 服务启动(避免无权限时所有操作 fail-closed)。
+    """
+    ok = await verify_admin_bootstrap()
+    if not ok:
+        raise RuntimeError(
+            "admin bootstrap not verified — "
+            "请运行 bootstrap_admin_principal() 初始化管理员身份后再启动 Web 服务"
+        )
 
 
 # ─── R39 P2-8: CSP nonce + 点击劫持防护 ──────────────────────────
@@ -446,15 +567,18 @@ def _get_client_ip(request: Request) -> str:
     if peer_host and _is_trusted_proxy(peer_host):
         forwarded = request.headers.get("X-Forwarded-For", "")
         if forwarded:
-            # P1-10: X-Forwarded-For 格式: "client, proxy1, proxy2"
-            # Caddy/Nginx 反向代理会向已有 XFF 追加真实客户端 IP(在最右),
-            # 攻击者自带伪造的 XFF 最左段会保留在头部左侧。
-            # 因此取最右段(可信代理追加的真实客户端),而非最左段(可能被伪造)。
+            # P1-10 / R42 P1-6: X-Forwarded-For 格式: "client, proxy1, proxy2"
+            # 可信代理链:Caddy/Nginx 收到请求后追加直连对端 IP 到 XFF 最右段。
+            # 攻击者可伪造请求自带的 XFF(出现在最左段),代理会在右侧追加真实客户端。
+            # 因此从右往左扫描,跳过可信代理自己的 IP,第一个非可信代理 IP 即真实客户端。
+            # 这避免了攻击者在 XFF 最左段伪造 IP 绕过登录速率限制。
             parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            for ip in reversed(parts):
+                if ip and not _is_trusted_proxy(ip):
+                    return ip
+            # 全部都是可信代理 IP(罕见,如多层代理场景)→ 返回最左段
             if parts:
-                client_ip = parts[-1]
-                if client_ip:
-                    return client_ip
+                return parts[0]
     return peer_host if peer_host else "unknown"
 
 

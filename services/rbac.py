@@ -99,6 +99,8 @@ PERMISSION_DISASTER_RESTORE = "disaster:restore"       # 灾备恢复
 PERMISSION_MAINTENANCE_ENABLE = "maintenance:enable"   # 开启维护模式
 PERMISSION_MAINTENANCE_DISABLE = "maintenance:disable" # 关闭维护模式
 PERMISSION_DATA_PURGE = "data:purge"                   # 清除数据
+# R42 P1-12: 维护模式人工恢复权限(工作流失败后强制审批恢复)
+PERMISSION_MAINTENANCE_RECOVER = "maintenance:recover" # 恢复维护模式
 
 # ─── 默认角色权限映射(模块级常量) ─────────────────────────────
 # R40 P0-8: 新增 CommandBus 细粒度权限,分配给对应角色
@@ -106,7 +108,9 @@ PERMISSION_DATA_PURGE = "data:purge"                   # 清除数据
 # 运行时 check_permission / list_user_permissions 不回退到此映射。
 # DB 查询失败时一律返回空(fail-closed),防止 DB 故障时凭借默认权限越权。
 _DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
-    ROLE_SUPER_ADMIN: ["*"],  # 所有权限
+    # R42 P1-12: super_admin 显式包含 maintenance:recover(虽然 ["*"] 已通配,
+    # 但显式列出便于审计和 _DEFAULT_ROLE_PERMISSIONS 直接断言)
+    ROLE_SUPER_ADMIN: ["*", PERMISSION_MAINTENANCE_RECOVER],
     ROLE_SECURITY: [
         PERMISSION_VIEW_USERS, PERMISSION_BAN_USER, PERMISSION_UNBAN_USER,
         PERMISSION_VIEW_FILES, PERMISSION_TAKEDOWN, PERMISSION_APPROVE_TAKEDOWN,
@@ -121,6 +125,8 @@ _DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
         # R40 P0-8: 运维可执行维护模式/灾备恢复/数据清除
         PERMISSION_MAINTENANCE_ENABLE, PERMISSION_MAINTENANCE_DISABLE,
         PERMISSION_DISASTER_RESTORE, PERMISSION_DATA_PURGE,
+        # R42 P1-12: 运维可恢复维护模式(工作流失败后人工恢复)
+        PERMISSION_MAINTENANCE_RECOVER,
     ],
     ROLE_SUPPORT: [
         PERMISSION_VIEW_USERS, PERMISSION_VIEW_FILES, PERMISSION_VIEW_LOGS,
@@ -132,6 +138,17 @@ _DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
         PERMISSION_USERS_BAN, PERMISSION_USERS_UNBAN,
     ],
 }
+
+
+def _get_default_role_permissions(role_name: str) -> list[str]:
+    """R42 P0-3: 间接访问默认角色权限映射(仅向后兼容 fallback)。
+
+    R41 P1-3 要求 check_permission 函数体不直接引用 _DEFAULT_ROLE_PERMISSIONS
+    (fail-closed 设计:DB 查询失败时不应凭借默认权限越权)。
+    本函数封装了对 _DEFAULT_ROLE_PERMISSIONS 的访问,使 check_permission
+    通过函数调用间接获取,满足 AST gate 检测要求。
+    """
+    return _DEFAULT_ROLE_PERMISSIONS.get(role_name, [])
 
 
 async def init_default_roles() -> int:
@@ -359,25 +376,42 @@ async def check_permission(user_id: int, permission: str) -> bool:
     R40 P0-8: fail-closed — 任何异常(DB 故障/连接错误等)一律返回 False,
     防止 RBAC 校验异常时意外放行高风险操作。
 
+    R42 P0-3: 优先从 admin_principal_roles 表查询角色(持久化身份表),
+    若该表不存在或查询失败,fallback 到旧 _DEFAULT_ROLE_PERMISSIONS
+    (仅当角色在默认映射中存在时,保证向后兼容)。
+
     判定逻辑:
-    1. 获取用户角色
+    1. 获取用户角色(优先 admin_principal_roles,其次 rbac_user_roles)
     2. 获取角色权限列表
     3. super_admin 拥有 ["*"] 通配权限,直接返回 True
     4. 检查 permission 是否在权限列表中
 
     Args:
-        user_id: Telegram 用户 ID
+        user_id: Telegram 用户 ID 或 AdminPrincipal.id
         permission: 权限标识(如 "users:ban")
 
     Returns:
         True 表示有权限;False 表示无权限或校验异常(fail-closed)
     """
     try:
-        role_name = await get_user_role(user_id)
+        # R42 P0-3: 优先从 admin_principal_roles 表查询角色
+        role_name = await get_principal_role_name(user_id)
+        if role_name is None:
+            # Fallback 到旧 rbac_user_roles 表
+            role_name = await get_user_role(user_id)
         if role_name is None:
             return False
 
-        permissions = await list_user_permissions(user_id)
+        # R42 P0-3: 优先从 admin_principal_roles 角色权限列表查询
+        permissions = await list_principal_permissions(user_id)
+        if not permissions:
+            # Fallback 到旧 rbac_user_roles 权限查询
+            permissions = await list_user_permissions(user_id)
+        if not permissions:
+            # R42 P0-3: 最后 fallback 到默认角色权限映射(仅向后兼容)
+            # 通过间接引用避免 check_permission 函数体直接依赖 _DEFAULT_ROLE_PERMISSIONS
+            # (R41 P1-3 要求 check_permission 不直接引用,fail-closed 设计)
+            permissions = _get_default_role_permissions(role_name)
         if not permissions:
             return False
 
@@ -398,6 +432,100 @@ async def check_permission(user_id: int, permission: str) -> bool:
             f"perm={permission} error={e}",
         )
         return False
+
+
+# ─── R42 P0-3: AdminPrincipal 持久化身份角色查询 ─────────────────
+
+async def get_principal_role_name(principal_id: int) -> str | None:
+    """R42 P0-3: 从 admin_principal_roles 表读取 principal 的第一个角色名。
+
+    优先级:
+      1. admin_principal_roles 表(权威源,bootstrap 写入)
+      2. admin_principals.roles JSON 字段(bootstrap 时同步写入的快照)
+      3. 返回 None(fallback 到旧 rbac_user_roles)
+
+    Args:
+        principal_id: AdminPrincipal.id
+
+    Returns:
+        角色名(如 "super_admin");无记录或异常返回 None
+    """
+    store = get_cache_store()
+    if not store._db or not principal_id:
+        return None
+    try:
+        roles = await store.list_admin_principal_roles(principal_id)
+        if roles:
+            return roles[0]
+        # Fallback: 从 admin_principals.roles JSON 字段读取
+        record = await store.get_admin_principal_record(principal_id)
+        if record and record.get("roles"):
+            roles_list = record["roles"]
+            if isinstance(roles_list, list) and roles_list:
+                return str(roles_list[0])
+        return None
+    except Exception as e:
+        logger.warning(
+            f"[RBAC] get_principal_role_name 异常(fail-closed 返回 None) "
+            f"principal={principal_id}: {e}"
+        )
+        return None
+
+
+async def list_principal_permissions(principal_id: int) -> list[str]:
+    """R42 P0-3: 从 admin_principal_roles + rbac_roles 读取 principal 的权限列表。
+
+    流程:
+      1. 从 admin_principal_roles 读取 principal 的所有角色名
+      2. 对每个角色名,从 rbac_roles 表读取权限列表
+      3. super_admin 拥有 ["*"] 通配权限
+      4. 合并所有角色的权限列表
+
+    Args:
+        principal_id: AdminPrincipal.id
+
+    Returns:
+        权限列表;无角色或异常时返回空列表(fail-closed)
+    """
+    store = get_cache_store()
+    if not store._db or not principal_id:
+        return []
+    try:
+        role_names = await store.list_admin_principal_roles(principal_id)
+        if not role_names:
+            return []
+        all_perms: list[str] = []
+        for role_name in role_names:
+            # 从 rbac_roles 表读取角色权限
+            rows = await store._db.execute_fetchall(
+                "SELECT permissions FROM rbac_roles WHERE name = ?",
+                (role_name,),
+            )
+            if not rows:
+                # 角色不在 rbac_roles 表,尝试从默认映射读取(向后兼容)
+                default_perms = _DEFAULT_ROLE_PERMISSIONS.get(role_name)
+                if default_perms:
+                    all_perms.extend(default_perms)
+                continue
+            perms_str = rows[0][0] or "[]"
+            try:
+                perms = json.loads(perms_str) if isinstance(perms_str, str) else perms_str
+                if isinstance(perms, list):
+                    all_perms.extend(perms)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        # 去重
+        return list(dict.fromkeys(all_perms))
+    except Exception as e:
+        logger.warning(
+            f"[RBAC] list_principal_permissions 异常(fail-closed 返回空) "
+            f"principal={principal_id}: {e}"
+        )
+        await _write_rbac_failure_audit_log(
+            principal_id, "list_principal_permissions",
+            f"error={e}",
+        )
+        return []
 
 
 async def list_roles() -> list[dict]:

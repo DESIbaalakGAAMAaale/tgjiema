@@ -1,4 +1,4 @@
-"""R40 + R41: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理。
+"""R40 + R41 + R42: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理 + 备份孤儿 GC。
 
 职责:
     1. 每小时清理过期配额预留(超过 1 小时未结算的自动退款)
@@ -6,6 +6,7 @@
     3. 每 5 分钟采集 RU 使用指标(委托 prometheus_exporter.collect_r40_metrics)
     4. 每小时执行临时封禁自动解封(P1-11: 委托 content_reports.cleanup_expired_bans)
     5. R41 P0-5: 每 60 秒清理过期命令执行租约(委托 command_bus.cleanup_stale_leases)
+    6. R42 P1-2: 每小时执行备份孤儿对象 GC(委托 backup_gc.run_backup_gc_job)
 
 设计原则:
     - 纯 async,通过 run_all.py BOT_RUNNERS 注册为独立进程
@@ -86,6 +87,36 @@ async def cleanup_stale_command_leases_job() -> None:
         logger.warning(f"[R41] 清理命令执行租约异常: {e}")
 
 
+async def backup_gc_job() -> None:
+    """R42 P1-2: 执行备份孤儿对象 GC(每小时)。
+
+    委托 services.backup_gc.run_backup_gc_job:
+    - 清理 R2 中 payload+manifest 已上传但 COMPLETE marker 缺失的孤儿对象
+    - 仅清理超时孤儿(默认 1 小时未完成 COMPLETE 的备份)
+    - 写 audit_log 记录清理结果
+    """
+    try:
+        from services.backup_gc import run_backup_gc_job
+        await run_backup_gc_job()
+    except Exception as e:
+        logger.warning(f"[R42] 备份孤儿 GC 异常: {e}")
+
+
+async def retention_cleanup_job() -> None:
+    """R42 P1-5: 每天执行 tombstone 物理清理(已备份 + 超 retention_days)。
+
+    委托 services.retention_worker.retention_cleanup_job:
+    - 扫描所有 is_tombstone=1 且 deleted_at < now - 30 天的记录
+    - 已备份的 tombstone 物理删除 + 写 audit_log
+    - 未备份的 tombstone 拒绝删除(等待下次备份后再清理)
+    """
+    try:
+        from services.retention_worker import retention_cleanup_job as _do_retention
+        await _do_retention()
+    except Exception as e:
+        logger.warning(f"[R42] tombstone retention 清理异常: {e}")
+
+
 async def _run_lease_cleanup_loop() -> None:
     """R41 P0-5: 命令租约清理子循环(每 60 秒执行一次)。
 
@@ -151,6 +182,8 @@ async def run_scheduler() -> None:
         - 每个周期(5 分钟)执行:清理配额预留 + 采集指标
         - 每小时执行:临时封禁自动解封(P1-11,周期计数器 mod 12 == 0)
         - 每天 3:00-3:05 执行:清理过期数据
+        - R42 P1-5: 每天 4:00-4:05 执行 tombstone retention 物理清理
+        - R42 P1-2: 每小时执行一次备份孤儿 GC(与临时封禁解封同期)
         - R41 P0-4: 启动 ApprovalExecutor 独立协程(每 30 秒消费 command_outbox)
         - 收到 CancelledError 时优雅退出(同时取消 ApprovalExecutor 协程)
     """
@@ -167,6 +200,8 @@ async def run_scheduler() -> None:
     )
     # 周期计数器:每 12 个周期(12 * 5 分钟 = 1 小时)执行一次临时封禁解封
     _cycle_count = 0
+    # R42 P1-5: tombstone retention 清理执行日期标记(避免同一天重复执行)
+    _retention_executed_date: str = ""
     try:
         while True:
             try:
@@ -179,9 +214,20 @@ async def run_scheduler() -> None:
                 # 每小时执行临时封禁自动解封(P1-11)
                 if _cycle_count % 12 == 0:
                     await cleanup_expired_bans_job()
+                    # R42 P1-2: 同期执行备份孤儿 GC(每小时一次)
+                    await backup_gc_job()
                 # 每天 3:00 清理过期数据(分钟 < 5 避免重复执行)
                 if now.hour == 3 and now.minute < 5:
                     await cleanup_expired_data_job()
+                # R42 P1-5: 每天 4:00-4:05 执行 tombstone retention 物理清理
+                # (在备份通常完成后,避免与 3:00 数据清理争用资源)
+                if (
+                    now.hour == 4
+                    and now.minute < 5
+                    and now.strftime("%Y-%m-%d") != _retention_executed_date
+                ):
+                    await retention_cleanup_job()
+                    _retention_executed_date = now.strftime("%Y-%m-%d")
                 # 等待 5 分钟
                 await asyncio.sleep(300)
             except asyncio.CancelledError:

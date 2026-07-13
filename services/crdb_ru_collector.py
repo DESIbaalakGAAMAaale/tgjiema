@@ -1,4 +1,4 @@
-"""R39 P1-9 / R41 RU 门禁: CRDB RU 指标采集器。
+"""R39 P1-9 / R41 RU 门禁 / R42 P1-10: CRDB RU 指标采集器。
 
 职责:
     周期性从 CockroachDB Cloud Metrics API / Datadog / PromQL 拉取
@@ -11,6 +11,16 @@ R41 RU 门禁新增:
     - 静态扫描门禁: COCKROACHDB_URL 仅 crdb_sync/migration/disaster_recovery 可读
       其他业务服务读取 COCKROACHDB_URL 视为违规(由测试 test_r41_ru_gate 验证)
 
+R42 P1-10 新增(unknown 状态):
+    - ``get_ru_status()`` 返回结构化状态(ru_value/freshness_seconds/source)
+      source 取值:
+        * "official" — CRDB API 成功且数据新鲜(< 1 小时)
+        * "unknown"  — CRDB API 成功但数据陈旧(≥ 1 小时,可能 collector 中断)
+        * "failed"   — CRDB API 调用失败(ru_value=None)
+    - ``is_data_fresh(max_age_seconds)`` 判断数据是否新鲜(默认 1 小时)
+    - prometheus_exporter 据此输出 tgjiema_crdb_ru_source gauge(0/1/2)
+      与 tgjiema_crdb_ru_freshness_seconds gauge
+
 背景(R39 P1-9):
     原 prometheus_exporter 读取 kv_store.crdb_ru_daily,但无人写入该值,
     导致指标长期显示 0。本模块填补"采集闭环"缺失环节。
@@ -18,6 +28,7 @@ R41 RU 门禁新增:
 实现状态:
     R39 P1-9 提供占位骨架 + 文档说明。
     R41 改进:新增业务 Bot 空载 RU 采集路径 + 静态门禁辅助。
+    R42 P1-10:新增 unknown 状态识别,区分"采集失败" vs "数据陈旧"。
     真正的 CRDB Cloud API 调用需运维提供 API Key 并按官方文档实现:
         https://www.cockroachlabs.com/docs/cockroachcloud/metrics-summary.html
 
@@ -220,11 +231,205 @@ async def fetch_idle_ru_from_local() -> float:
         return 0.0
 
 
+# ════════════════════════════════════════════════════════════════
+#  R42 P1-10: unknown 状态识别(get_ru_status / is_data_fresh)
+# ════════════════════════════════════════════════════════════════
+
+
+# R42 P1-10: 数据新鲜度阈值(秒)— 超过此值认为数据陈旧(source="unknown")
+RU_DATA_FRESH_THRESHOLD = 3600  # 1 小时
+
+
+async def get_ru_status() -> dict:
+    """R42 P1-10: 获取 CRDB RU 指标的结构化状态。
+
+    返回 dict 包含:
+        - ru_value: int | None
+            None 表示采集失败(CRDB API 不可用)
+            非 None 表示 kv_store.crdb_ru_daily 的最新值
+        - freshness_seconds: int | None
+            None 表示从未采集或时间戳解析失败
+            非 None 表示距上次成功采集的秒数
+        - source: "official" | "unknown" | "failed"
+            "official": CRDB API 调用成功且数据新鲜(< RU_DATA_FRESH_THRESHOLD)
+            "unknown" : 数据存在但陈旧(≥ RU_DATA_FRESH_THRESHOLD),可能 collector 中断
+            "failed"  : CRDB API 调用失败(ru_value=None,freshness_seconds=None)
+
+    本函数区分 "采集失败" 与 "数据陈旧" 两种场景:
+        - "failed"  → 修复 collector(API Key / 网络 / CRDB 状态)
+        - "unknown" → 检查 collector 是否在运行,或调高采集频率
+
+    Returns:
+        {
+            "ru_value": int | None,
+            "freshness_seconds": int | None,
+            "source": "official" | "unknown" | "failed",
+            "last_collected_at": str,   # ISO 时间戳,失败时为空字符串
+            "details": str,
+        }
+    """
+    # 1. 调用 CRDB API 获取最新 RU 值
+    try:
+        api_ru_value = await fetch_ru_from_crdb_cloud()
+    except Exception as e:
+        # API 调用本身异常 → failed
+        logger.warning(f"[CRDB-RU] R42 P1-10: fetch_ru_from_crdb_cloud 异常: {e}")
+        api_ru_value = None
+
+    # 2. 读取 kv_store 中的最新采集记录
+    kv_ru_value: float | None = None
+    last_collected_at: str = ""
+    freshness_seconds: int | None = None
+
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if store and getattr(store, "_db", None):
+            raw = await store.get_kv(KV_KEY_CRDB_RU_DAILY)
+            if raw:
+                try:
+                    kv_ru_value = float(raw)
+                except (TypeError, ValueError):
+                    kv_ru_value = None
+            # 也读取上次成功采集的时间戳(kv_store.crdb_ru_last_collected_at)
+            ts_raw = await store.get_kv("crdb_ru_last_collected_at")
+            if ts_raw:
+                last_collected_at = str(ts_raw)
+                # 解析 ISO 时间戳并计算 freshness_seconds
+                try:
+                    # 尝试 ISO 8601
+                    dt = _parse_iso_datetime(ts_raw)
+                    if dt is not None:
+                        # 转 epoch(秒)
+                        # datetime.timestamp() 在 aware datetime 上返回 POSIX 时间戳;
+                        # 在 naive datetime 上视为本地时间(应避免)
+                        if dt.tzinfo is None:
+                            # naive datetime → 视为 UTC(因为 collector 用 utcnow 写入)
+                            import datetime as _dt2
+                            dt = dt.replace(tzinfo=_dt2.timezone.utc)
+                        freshness_seconds = int(time.time() - dt.timestamp())
+                        if freshness_seconds < 0:
+                            # 时间戳在未来(时钟漂移),视为 0
+                            freshness_seconds = 0
+                except (ValueError, TypeError):
+                    # 尝试解析为 epoch 数字
+                    try:
+                        ts_num = float(ts_raw)
+                        freshness_seconds = int(time.time() - ts_num)
+                        if freshness_seconds < 0:
+                            freshness_seconds = 0
+                    except (ValueError, TypeError):
+                        freshness_seconds = None
+    except Exception as e:
+        logger.debug(f"[CRDB-RU] R42 P1-10: 读取 kv_store 失败: {e}")
+
+    # 3. 决定 source 与 ru_value
+    if api_ru_value is None and kv_ru_value is None:
+        # 采集失败且无历史数据 → failed
+        return {
+            "ru_value": None,
+            "freshness_seconds": None,
+            "source": "failed",
+            "last_collected_at": "",
+            "details": "CRDB API 调用失败且 kv_store 无历史数据",
+        }
+
+    # 优先使用 API 最新值,否则用 kv_store 历史值
+    ru_value = api_ru_value if api_ru_value is not None else kv_ru_value
+
+    # 判断新鲜度
+    if freshness_seconds is None:
+        # 时间戳缺失 → 视为 unknown(数据存在但无法判断新鲜度)
+        source = "unknown"
+        details = (
+            "RU 值存在但采集时间戳缺失,无法判断数据新鲜度(可能 collector 异常)"
+        )
+    elif freshness_seconds >= RU_DATA_FRESH_THRESHOLD:
+        # 数据陈旧 → unknown
+        source = "unknown"
+        details = (
+            f"RU 数据陈旧:距上次采集 {freshness_seconds}s "
+            f"(阈值 {RU_DATA_FRESH_THRESHOLD}s),可能 collector 中断"
+        )
+    else:
+        # 数据新鲜 → official
+        source = "official"
+        details = (
+            f"RU 数据新鲜:距上次采集 {freshness_seconds}s "
+            f"(阈值 {RU_DATA_FRESH_THRESHOLD}s)"
+        )
+
+    return {
+        "ru_value": int(ru_value) if ru_value is not None else None,
+        "freshness_seconds": freshness_seconds,
+        "source": source,
+        "last_collected_at": last_collected_at,
+        "details": details,
+    }
+
+
+def _parse_iso_datetime(ts_str: str):
+    """解析 ISO 8601 时间字符串为 datetime 对象。
+
+    支持以下格式:
+        - "2026-07-13T10:00:00"
+        - "2026-07-13T10:00:00.123456"
+        - "2026-07-13T10:00:00Z"
+        - "2026-07-13T10:00:00+00:00"
+
+    失败时返回 None。
+    """
+    import datetime as _dt
+    if not ts_str:
+        return None
+    s = ts_str.strip()
+    # 替换 Z 为 +00:00 以便 fromisoformat 解析
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return _dt.datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+async def is_data_fresh(max_age_seconds: int = RU_DATA_FRESH_THRESHOLD) -> bool:
+    """R42 P1-10: 判断 kv_store 中的 RU 数据是否新鲜。
+
+    Args:
+        max_age_seconds: 新鲜度阈值(秒),默认 3600(1 小时)
+
+    Returns:
+        True: 数据存在且距上次采集 < max_age_seconds
+        False: 数据不存在、时间戳缺失或陈旧(≥ max_age_seconds)
+    """
+    try:
+        status = await get_ru_status()
+        if status.get("source") != "official":
+            return False
+        fresh = status.get("freshness_seconds")
+        if fresh is None:
+            return False
+        return fresh < max_age_seconds
+    except Exception:
+        return False
+
+
+async def fetch_idle_ru_from_local_legacy() -> float:
+    """占位:R42 P1-10 之前已存在 fetch_idle_ru_from_local(已重命名前缀)。
+
+    为向后兼容保留对原 fetch_idle_ru_from_local 的调用入口。
+    """
+    return await fetch_idle_ru_from_local()
+
+
 async def write_ru_to_kv_store(ru_value: float) -> bool:
     """R39 P1-9: 将当日 RU 消耗写入 kv_store.crdb_ru_daily。
 
     写入成功后,prometheus_exporter 下次 scrape 会暴露更新后的 crdb_ru_daily 指标。
     kv_store 写入零 CRDB RU(SQLite 本地存储)。
+
+    R42 P1-10: 同时写入 kv_store.crdb_ru_last_collected_at(ISO 时间戳),
+    供 get_ru_status() 计算数据新鲜度(freshness_seconds)。
 
     Returns:
         True: 写入成功
@@ -234,6 +439,15 @@ async def write_ru_to_kv_store(ru_value: float) -> bool:
         from database.cache_store import get_cache_store
         store = get_cache_store()
         await store.set_kv(KV_KEY_CRDB_RU_DAILY, str(ru_value))
+        # R42 P1-10: 同时写入采集时间戳(UTC ISO 8601)
+        # 用于 get_ru_status() 计算数据新鲜度
+        try:
+            collected_at = datetime.now(timezone.utc).isoformat()
+            await store.set_kv("crdb_ru_last_collected_at", collected_at)
+        except Exception as ts_err:
+            logger.debug(
+                f"[CRDB-RU] R42 P1-10: 写入 crdb_ru_last_collected_at 失败: {ts_err}"
+            )
         logger.info(
             f"[CRDB-RU] R39 P1-9: kv_store.crdb_ru_daily 已更新 → {ru_value:.0f} RU"
         )

@@ -98,6 +98,92 @@ def _next_cells_version() -> int:
     return _cells_version_counter
 
 
+# ─── R42 P1-4: dirty_outbox version 单调来源 ───
+# 问题: 同 (table, pk) 合并最高 version 时,若多调用方使用默认 version=0,
+#   顺序可能依赖插入 ID 并吞掉真正新状态。
+# 整改: add_dirty_outbox version=0 时自动从 updated_at 字段生成时间戳版本,
+#   保证每个可同步实体使用 monotonic version。
+# _TABLE_VERSION_FIELDS: 表名 → 用于生成 version 的时间戳字段名
+# (与表的实际 schema 对齐,优先使用 updated_at,无则使用 create_time/created_at)
+_TABLE_VERSION_FIELDS: dict[str, str] = {
+    "users": "updated_at",
+    "file_records": "create_time",
+    "codes": "created_at",
+    "cells": "updated_at",
+    "jobs": "created_at",
+    "decode_logs": "request_time",
+    "relay_whitelist": "updated_at",
+    "collector_whitelist": "updated_at",
+    "spare_pool": "updated_at",
+    "channels": "updated_at",
+}
+
+
+def _get_table_version_field(table_name: str) -> str:
+    """R42 P1-4: 返回该表的 version 字段名。
+
+    用于在 add_dirty_outbox version=0 时从 payload 中提取时间戳生成 version。
+    默认返回 'updated_at'(若表无此字段,使用当前时间戳)。
+
+    Args:
+        table_name: 逻辑表名(与 dirty_outbox.table_name 对齐)
+
+    Returns:
+        该表用于生成 version 的时间戳字段名(如 'updated_at' / 'created_at' / 'create_time')
+    """
+    return _TABLE_VERSION_FIELDS.get(table_name, "updated_at")
+
+
+def _generate_version_from_payload(table_name: str, payload) -> int:
+    """R42 P1-4: 从 payload 中提取时间戳生成 monotonic version。
+
+    优先级:
+        1. payload 中的 version 字段(若有且 > 0)
+        2. payload 中 _get_table_version_field() 返回的字段(如 updated_at)
+           转为 Unix 时间戳(秒)
+        3. 当前 Unix 时间戳(秒,最后兜底)
+
+    Args:
+        table_name: 逻辑表名(用于查找 version 字段映射)
+        payload: JSON 字符串或 dict(行快照)
+
+    Returns:
+        int 类型的 version(Unix 时间戳,秒)
+    """
+    if not payload:
+        return int(time.time())
+    try:
+        row = json.loads(payload) if isinstance(payload, str) else payload
+        if isinstance(row, dict):
+            # 优先用 payload 中的显式 version 字段
+            if "version" in row and row["version"]:
+                try:
+                    v = int(row["version"])
+                    if v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+            # 从时间戳字段生成 version
+            field = _get_table_version_field(table_name)
+            ts_val = row.get(field)
+            if ts_val:
+                try:
+                    if isinstance(ts_val, str):
+                        # ISO 格式: 2026-07-13T12:00:00(.ffffff)
+                        # 兼容带 Z / 带时区 / 不带时区
+                        normalized = ts_val.replace("Z", "+00:00")
+                        dt = datetime.datetime.fromisoformat(normalized)
+                        return int(dt.timestamp())
+                    elif isinstance(ts_val, (int, float)):
+                        return int(ts_val)
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+    # fallback 到当前时间戳(秒)
+    return int(time.time())
+
+
 def _next_relay_version() -> int:
     global _relay_version_counter
     _relay_version_counter += 1
@@ -1070,16 +1156,27 @@ class CacheStore:
         )
 
         # ─── R40: 维护模式状态(maintenance_state) ───
+        # R42 P1-12: 新增 recover_status 字段(workflow 失败时设为 'pending',
+        # 强制 recover_maintenance 审批才能 disable)
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS maintenance_state (
-                id          INTEGER PRIMARY KEY CHECK(id = 1),
-                enabled     INTEGER DEFAULT 0,
-                reason      TEXT DEFAULT '',
-                started_by  INTEGER,
-                started_at  TEXT,
-                ended_at    TEXT
+                id            INTEGER PRIMARY KEY CHECK(id = 1),
+                enabled       INTEGER DEFAULT 0,
+                reason        TEXT DEFAULT '',
+                started_by    INTEGER,
+                started_at    TEXT,
+                ended_at      TEXT,
+                recover_status TEXT DEFAULT 'completed'
             )"""
         )
+        # R42 P1-12: 旧表升级 — 幂等添加 recover_status 列(已存在则忽略)
+        try:
+            await self._db.execute(
+                "ALTER TABLE maintenance_state ADD COLUMN recover_status TEXT DEFAULT 'completed'"
+            )
+        except Exception as _alter_e:
+            # SQLite 重复列错误是预期的(幂等升级),仅 debug 记录
+            logger.debug(f"[CacheStore] maintenance_state ALTER TABLE 升级(可忽略): {_alter_e}")
 
         # ─── R40: 管理员访问日志(admin_access_log) ───
         await self._db.execute(
@@ -1099,6 +1196,44 @@ class CacheStore:
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_admin_access_log_created ON admin_access_log(created_at)"
+        )
+
+        # ─── R42 P0-3: 管理员持久化身份表(admin_principals) ───
+        # 替代 username hash 生成 ID 的方式,显式配置 ADMIN_PRINCIPAL_ID 并原子分配角色。
+        # bootstrap_admin_principal() 在单事务中 UPSERT 记录 + 分配角色 + 写审计日志。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS admin_principals (
+                id            INTEGER PRIMARY KEY,
+                username      TEXT UNIQUE NOT NULL,
+                password_hash TEXT DEFAULT '',
+                roles         TEXT DEFAULT '[]',
+                is_active     INTEGER NOT NULL DEFAULT 1,
+                created_at    TEXT,
+                updated_at    TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_principals_username ON admin_principals(username)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_principals_active ON admin_principals(is_active)"
+        )
+
+        # ─── R42 P0-3: 管理员角色多对多映射(admin_principal_roles) ───
+        # 一个 principal 可拥有多个角色,一个角色可分配给多个 principal。
+        # check_permission 优先从此表查询角色,fallback 到 rbac_user_roles。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS admin_principal_roles (
+                principal_id INTEGER NOT NULL,
+                role_name    TEXT NOT NULL,
+                granted_by   INTEGER DEFAULT 0,
+                granted_at   TEXT,
+                PRIMARY KEY (principal_id, role_name),
+                FOREIGN KEY (principal_id) REFERENCES admin_principals(id)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_principal_roles_pid ON admin_principal_roles(principal_id)"
         )
 
         # ─── R41 P0-5: 命令执行持久化(幂等缓存 + 租约) ───
@@ -1194,6 +1329,12 @@ class CacheStore:
         else:
             _processed_init = 0
             _local_only_init = 0
+
+        # R42 P1-4: 若 version=0,自动从 payload 中的 updated_at 字段生成时间戳版本
+        # (避免多调用方使用默认 version=0 时,合并顺序依赖插入 ID 并吞掉真正新状态)
+        # 优先级: payload.version > payload.<version_field> > 当前时间戳
+        if version == 0:
+            version = _generate_version_from_payload(table_name, payload)
 
         # R39 P0-4 + R40 P0-5: 事务发件箱模式 — 若调用方传入 connection/tx,
         # 则使用该连接(不自动 commit),确保 dirty_outbox 写入与业务表更新
@@ -5263,6 +5404,199 @@ class CacheStore:
                 if self._in_writer_tx:
                     raise
                 return  # 锁冲突静默跳过,KV 缓存下一轮会重新写入
+
+    # ─── R42 P0-3: AdminPrincipal 持久化身份 + bootstrap ───
+
+    async def get_admin_principal_record(self, principal_id: int) -> dict | None:
+        """R42 P0-3: 根据 principal_id 读取 admin_principals 记录。
+
+        Args:
+            principal_id: 管理员主体 ID
+
+        Returns:
+            {id, username, password_hash, roles, is_active, created_at, updated_at};
+            不存在或 DB 不可用时返回 None
+        """
+        if not self._db or not principal_id:
+            return None
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT id, username, password_hash, roles, is_active, created_at, updated_at "
+                "FROM admin_principals WHERE id = ?",
+                (principal_id,),
+            )
+            if not rows:
+                return None
+            r = rows[0]
+            import json as _json_ap
+            try:
+                roles = _json_ap.loads(r[3]) if r[3] else []
+            except (ValueError, TypeError):
+                roles = []
+            return {
+                "id": int(r[0]),
+                "username": str(r[1] or ""),
+                "password_hash": str(r[2] or ""),
+                "roles": roles,
+                "is_active": bool(r[4]),
+                "created_at": str(r[5] or ""),
+                "updated_at": str(r[6] or ""),
+            }
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_admin_principal_record 失败 id={principal_id}: {e}")
+            return None
+
+    async def get_admin_principal_by_username(self, username: str) -> dict | None:
+        """R42 P0-3: 根据 username 读取 admin_principals 记录。"""
+        if not self._db or not username:
+            return None
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT id, username, password_hash, roles, is_active, created_at, updated_at "
+                "FROM admin_principals WHERE username = ?",
+                (username,),
+            )
+            if not rows:
+                return None
+            r = rows[0]
+            import json as _json_ap
+            try:
+                roles = _json_ap.loads(r[3]) if r[3] else []
+            except (ValueError, TypeError):
+                roles = []
+            return {
+                "id": int(r[0]),
+                "username": str(r[1] or ""),
+                "password_hash": str(r[2] or ""),
+                "roles": roles,
+                "is_active": bool(r[4]),
+                "created_at": str(r[5] or ""),
+                "updated_at": str(r[6] or ""),
+            }
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_admin_principal_by_username 失败 user={username}: {e}")
+            return None
+
+    async def list_admin_principal_roles(self, principal_id: int) -> list[str]:
+        """R42 P0-3: 读取 principal 的所有角色名(从 admin_principal_roles 表)。
+
+        Args:
+            principal_id: 管理员主体 ID
+
+        Returns:
+            角色名列表(如 ["super_admin"]);无记录或异常时返回空列表
+        """
+        if not self._db or not principal_id:
+            return []
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT role_name FROM admin_principal_roles WHERE principal_id = ?",
+                (principal_id,),
+            )
+            return [str(r[0]) for r in rows] if rows else []
+        except Exception as e:
+            logger.warning(f"[CacheStore] list_admin_principal_roles 失败 id={principal_id}: {e}")
+            return []
+
+    async def bootstrap_admin_principal(
+        self,
+        principal_id: int,
+        username: str,
+        roles: list[str] | None = None,
+        password_hash: str = "",
+    ) -> bool:
+        """R42 P0-3: 原子 bootstrap 管理员身份(单事务 UPSERT + 分配角色 + 写审计)。
+
+        步骤(全部在单 transaction 中,失败回滚):
+          1. UPSERT admin_principals 记录(id=principal_id, username=username)
+          2. 清除该 principal 的旧角色映射(admin_principal_roles)
+          3. 为该 principal 分配 roles 中的角色
+          4. 写 audit_log(action="bootstrap_admin_principal", actor_id=0)
+
+        幂等:重复调用不报错,角色映射会被覆盖为新值。
+
+        Args:
+            principal_id: 管理员主体 ID(必须 > 0)
+            username: 管理员用户名
+            roles: 角色列表(默认 ["super_admin"])
+            password_hash: 密码哈希(可选,bootstrap 阶段通常为空)
+
+        Returns:
+            True 表示成功;False 表示失败(principal_id <= 0 或 DB 异常)
+        """
+        if not principal_id or principal_id <= 0:
+            logger.warning("[CacheStore] bootstrap_admin_principal principal_id 必须 > 0")
+            return False
+        if not username:
+            logger.warning("[CacheStore] bootstrap_admin_principal username 不能为空")
+            return False
+        if roles is None:
+            roles = ["super_admin"]
+
+        if not self._db:
+            logger.warning("[CacheStore] bootstrap_admin_principal DB 未初始化")
+            return False
+
+        import json as _json_bp
+        now = datetime.datetime.now().isoformat()
+        roles_json = _json_bp.dumps(roles)
+
+        try:
+            async with self.transaction() as tx:
+                # 1. UPSERT admin_principals 记录
+                await tx.execute(
+                    "INSERT OR REPLACE INTO admin_principals "
+                    "(id, username, password_hash, roles, is_active, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (principal_id, username, password_hash, roles_json, now, now),
+                )
+                # 2. 清除旧角色映射(幂等:重复 bootstrap 覆盖角色)
+                await tx.execute(
+                    "DELETE FROM admin_principal_roles WHERE principal_id = ?",
+                    (principal_id,),
+                )
+                # 3. 分配新角色
+                for role_name in roles:
+                    role_name = role_name.strip()
+                    if not role_name:
+                        continue
+                    await tx.execute(
+                        "INSERT OR IGNORE INTO admin_principal_roles "
+                        "(principal_id, role_name, granted_by, granted_at) "
+                        "VALUES (?, ?, ?, ?)",
+                        (principal_id, role_name, 0, now),
+                    )
+                # 4. 写审计日志(action=bootstrap_admin_principal, actor_id=0)
+                await tx.execute(
+                    "INSERT INTO audit_log (actor_id, actor_type, action, target_type, "
+                    "target_id, details, ip_addr, created_at) "
+                    "VALUES (?, 'system', 'bootstrap_admin_principal', 'admin_principal', ?, ?, '', ?)",
+                    (
+                        0,
+                        str(principal_id),
+                        _json_bp.dumps({"username": username, "roles": roles}),
+                        now,
+                    ),
+                )
+                # dirty_outbox 标记(admin_principals 为本地表,但仍记录以供审计)
+                try:
+                    await self.add_dirty_outbox(
+                        "admin_principals", str(principal_id),
+                        operation="upsert", connection=tx,
+                    )
+                except Exception as de:
+                    logger.debug(f"[CacheStore] bootstrap dirty_outbox 标记失败(可忽略): {de}")
+            logger.info(
+                f"[CacheStore] bootstrap_admin_principal 成功 id={principal_id} "
+                f"user={username} roles={roles}"
+            )
+            return True
+        except Exception as e:
+            logger.error(
+                f"[CacheStore] bootstrap_admin_principal 失败 id={principal_id} "
+                f"user={username}: {e}"
+            )
+            return False
 
     async def cache_get(self, key: str, ttl: float):
         """C2: 读取 TTL 缓存。如果缓存不存在或已过期,返回 None。

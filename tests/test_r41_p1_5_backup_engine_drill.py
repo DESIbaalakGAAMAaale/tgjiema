@@ -442,7 +442,12 @@ class TestScenario8StagingRestoreNoDbWrite:
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
     async def test_production_restore_calls_db_restore_with_approver(self, monkeypatch):
-        """production 模式 + approver_id 非零 → 应调用 db_restore。"""
+        """production 模式 + approver_id 非零 + approval_action_id → 应调用 db_restore。
+
+        R42 P1-3: restore(target="production") 必须提供 approval_action_id,
+        否则抛 ValueError。本用例提供合法 approval_action_id 并 mock 审批校验通过,
+        验证 production restore 仍能正确委托 db_restore。
+        """
         _patch_backup_all_tables(monkeypatch)
         engine, storage, cache, _ = _build_engine_with_kek(monkeypatch)
 
@@ -461,8 +466,16 @@ class TestScenario8StagingRestoreNoDbWrite:
             _spy_restore_from_backup_data,
         )
 
-        # production 模式 + approver_id=999(通过审批)
-        result = await engine.restore(backup_id, target="production", approver_id=999)
+        # R42 P1-3: mock _validate_production_approval 通过(不抛异常)
+        async def _noop_validate(approver_id, approval_action_id):
+            return None
+        monkeypatch.setattr(engine, "_validate_production_approval", _noop_validate)
+
+        # R42 P1-3: production restore 必须提供 approval_action_id
+        result = await engine.restore(
+            backup_id, target="production", approver_id=999,
+            approval_action_id="approval_test_id",
+        )
 
         assert result["success"] is True
         assert call_count["n"] == 1, \

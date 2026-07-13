@@ -327,6 +327,273 @@ async def cleanup_stale_leases() -> int:
         return 0
 
 
+# ════════════════════════════════════════════════════════════════
+# R42 P0-2: ApprovalExecutor 持久幂等 — command_executions + command_outbox + approval 三态一致
+# ════════════════════════════════════════════════════════════════
+
+
+async def claim_execution_for_outbox(
+    action_id: str,
+    request_hash: str,
+    owner: str,
+    lease_seconds: int = 60,
+) -> dict:
+    """R42 P0-2: ApprovalExecutor 专用 claim — 与 command_outbox 共享同一 action_id。
+
+    幂等状态机:
+        - 已 executed → 返回 already_executed(调用方应直接 mark_executed 跳过)
+        - executing 且 lease 未过期 → claimed_by_other(跳过本轮)
+        - request_hash 不匹配 → hash_mismatch(防篡改,路由到 DLQ)
+        - 否则 CAS claim(INSERT or UPDATE → executing) → claimed
+
+    与 ``claim_execution`` 的差异:
+        - ``claim_execution`` 假设记录已存在(由 ``_try_insert_or_get_cached`` 预先 INSERT pending)
+        - 本函数自包含:若记录不存在,直接 INSERT 为 executing(因 outbox 已 CAS 认领,
+          无需再走 pending 状态)
+        - 返回 dict 而非 bool,携带 status / result / owner 等元信息
+
+    Args:
+        action_id: 命令幂等 ID(与 command_outbox.action_id 一致)
+        request_hash: SHA256(payload params),防篡改
+        owner: 执行 worker 标识(如 hostname:pid)
+        lease_seconds: 租约时长(秒)
+
+    Returns:
+        {"status": "already_executed", "result": <json str or None>}
+        {"status": "claimed_by_other", "owner": ..., "lease_until": ...}
+        {"status": "hash_mismatch", "stored_hash": ..., "request_hash": ...}
+        {"status": "claimed"}
+        DB 未初始化时返回 {"status": "claimed"}(降级执行,无幂等保护)
+    """
+    store = _get_store()
+    if not store._db:
+        logger.warning(
+            f"[CommandBus] claim_execution_for_outbox DB 未初始化(降级执行)"
+            f"action_id={action_id}"
+        )
+        return {"status": "claimed"}
+
+    now = _now_iso()
+    lease_until = _lease_until_iso(lease_seconds)
+
+    # 1. 查询现有记录
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT status, owner, lease_until, request_hash, result "
+            "FROM command_executions WHERE action_id = ?",
+            (action_id,),
+        )
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] claim_execution_for_outbox 查询失败 action_id={action_id}: {e}"
+        )
+        return {"status": "claimed"}  # 降级执行
+
+    if rows and rows[0]:
+        status, stored_owner, stored_lease, stored_hash, result_json = rows[0]
+        # 校验 request_hash(防篡改)
+        if stored_hash and stored_hash != request_hash:
+            logger.warning(
+                f"[CommandBus] claim_execution_for_outbox hash_mismatch "
+                f"action_id={action_id} stored={stored_hash} request={request_hash}"
+            )
+            return {
+                "status": "hash_mismatch",
+                "stored_hash": stored_hash,
+                "request_hash": request_hash,
+            }
+        # 已执行 → 返回缓存结果(幂等跳过)
+        if status == CMD_STATUS_EXECUTED:
+            logger.info(
+                f"[CommandBus] claim_execution_for_outbox already_executed "
+                f"action_id={action_id}"
+            )
+            return {"status": "already_executed", "result": result_json}
+        # 执行中且 lease 未过期 → 被其他 worker 占用
+        if status == CMD_STATUS_EXECUTING and stored_lease and stored_lease > now:
+            logger.debug(
+                f"[CommandBus] claim_execution_for_outbox claimed_by_other "
+                f"action_id={action_id} owner={stored_owner} lease_until={stored_lease}"
+            )
+            return {
+                "status": "claimed_by_other",
+                "owner": stored_owner,
+                "lease_until": stored_lease,
+            }
+        # 执行中但 lease 已过期 OR pending 状态 → CAS claim
+        try:
+            cursor = await store._db.execute(
+                "UPDATE command_executions "
+                "SET status = ?, owner = ?, lease_until = ?, request_hash = ?, updated_at = ? "
+                "WHERE action_id = ? AND (status = ? OR (status = ? AND (lease_until IS NULL OR lease_until < ?)))",
+                (CMD_STATUS_EXECUTING, owner, lease_until, request_hash, now,
+                 action_id, CMD_STATUS_PENDING, CMD_STATUS_EXECUTING, now),
+            )
+            await store._db.commit()
+            if cursor.rowcount > 0:
+                logger.info(
+                    f"[CommandBus] claim_execution_for_outbox claimed(CAS UPDATE) "
+                    f"action_id={action_id} owner={owner}"
+                )
+                return {"status": "claimed"}
+            # CAS 未命中:可能其他 worker 抢先
+            logger.debug(
+                f"[CommandBus] claim_execution_for_outbox CAS 未命中 "
+                f"action_id={action_id}(其他 worker 抢先)"
+            )
+            return {"status": "claimed_by_other"}
+        except Exception as e:
+            logger.error(
+                f"[CommandBus] claim_execution_for_outbox CAS UPDATE 失败 "
+                f"action_id={action_id}: {e}"
+            )
+            return {"status": "claimed_by_other"}
+
+    # 2. 行不存在 — INSERT 新记录(status='executing',直接进入执行态)
+    try:
+        await store._db.execute(
+            "INSERT INTO command_executions "
+            "(action_id, command_type, principal_id, status, owner, lease_until, "
+            " request_hash, result, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (action_id, "outbox", 0, CMD_STATUS_EXECUTING, owner, lease_until,
+             request_hash, now, now),
+        )
+        await store._db.commit()
+        logger.info(
+            f"[CommandBus] claim_execution_for_outbox claimed(INSERT) "
+            f"action_id={action_id} owner={owner}"
+        )
+        return {"status": "claimed"}
+    except sqlite3.IntegrityError:
+        # UNIQUE 冲突 — 并发竞态,其他 worker 抢先 INSERT
+        logger.debug(
+            f"[CommandBus] claim_execution_for_outbox INSERT 冲突 "
+            f"action_id={action_id}(其他 worker 抢先)"
+        )
+        return {"status": "claimed_by_other"}
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] claim_execution_for_outbox INSERT 失败 "
+            f"action_id={action_id}: {e}"
+        )
+        return {"status": "claimed_by_other"}
+
+
+async def mark_outbox_executed(
+    action_id: str,
+    result: Any,
+    approval_id: int | None = None,
+) -> bool:
+    """R42 P0-2: 同一事务内更新三处状态(command_executions + command_outbox + approval)。
+
+    在 ``store.transaction()`` 内原子完成:
+        1. UPDATE command_executions SET status='executed', result=<json>
+        2. UPDATE command_outbox SET status='executed'
+        3. 若 approval_id 存在,UPDATE approvals SET status='executed', resolved_at=now
+
+    Args:
+        action_id: 幂等 action_id
+        result: 执行结果,支持 Result dataclass 或 dict
+        approval_id: 关联审批 ID(None 时跳过 approval 更新)
+
+    Returns:
+        True 成功;False 失败
+    """
+    store = _get_store()
+    if not store._db:
+        return False
+
+    now = _now_iso()
+    # 序列化 result(兼容 Result dataclass 与 dict)
+    if hasattr(result, "success") and (hasattr(result, "data") or hasattr(result, "error")):
+        result_json = json.dumps(
+            {"success": result.success, "data": result.data, "error": result.error},
+            ensure_ascii=False, default=str,
+        )
+    elif isinstance(result, dict):
+        result_json = json.dumps(result, ensure_ascii=False, default=str)
+    elif result is None:
+        result_json = json.dumps(
+            {"success": True, "data": None, "error": ""},
+            ensure_ascii=False, default=str,
+        )
+    else:
+        result_json = json.dumps(
+            {"success": True, "data": str(result), "error": ""},
+            ensure_ascii=False, default=str,
+        )
+
+    try:
+        async with store.transaction() as tx:
+            # 1. command_executions: status='executed' + result
+            await tx.execute(
+                "UPDATE command_executions "
+                "SET status = ?, result = ?, updated_at = ? "
+                "WHERE action_id = ?",
+                (CMD_STATUS_EXECUTED, result_json, now, action_id),
+            )
+            # 2. command_outbox: status='executed'
+            await tx.execute(
+                "UPDATE command_outbox SET status = 'executed', updated_at = ? "
+                "WHERE action_id = ?",
+                (now, action_id),
+            )
+            # 3. approvals: status='executed'(若 approval_id 存在)
+            if approval_id:
+                await tx.execute(
+                    "UPDATE approvals SET status = 'executed', resolved_at = ? "
+                    "WHERE id = ?",
+                    (now, approval_id),
+                )
+                await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
+        logger.info(
+            f"[CommandBus] mark_outbox_executed 完成 action_id={action_id} "
+            f"approval_id={approval_id}"
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] mark_outbox_executed 失败 action_id={action_id}: {e}"
+        )
+        return False
+
+
+async def release_lease(action_id: str) -> bool:
+    """R42 P0-2: 释放 command_executions lease(handler 失败后由 ApprovalExecutor 调用)。
+
+    将 status 回退到 'pending',清空 owner/lease_until,允许下一轮重新 claim。
+    与 ``release_execution`` 语义相同,但专用于 ApprovalExecutor 失败重试场景。
+
+    Args:
+        action_id: 命令幂等 ID
+
+    Returns:
+        True 释放成功;False 失败或记录不存在
+    """
+    store = _get_store()
+    if not store._db:
+        return False
+    now = _now_iso()
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, owner = NULL, lease_until = NULL, updated_at = ? "
+            "WHERE action_id = ?",
+            (CMD_STATUS_PENDING, now, action_id),
+        )
+        await store._db.commit()
+        released = cursor.rowcount > 0
+        if released:
+            logger.info(
+                f"[CommandBus] release_lease 释放 action_id={action_id}(回退到 pending)"
+            )
+        return released
+    except Exception as e:
+        logger.error(f"[CommandBus] release_lease 失败 action_id={action_id}: {e}")
+        return False
+
+
 async def _try_insert_or_get_cached(
     action_id: str,
     command_type: str,

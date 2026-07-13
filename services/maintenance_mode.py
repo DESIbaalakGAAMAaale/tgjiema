@@ -205,14 +205,16 @@ async def enable(reason: str, started_by: int = 0) -> bool:
     now_iso = _dt.datetime.now().isoformat()
     try:
         # UPSERT maintenance_state(id=1)
+        # R42 P1-12: 重置 recover_status='completed'(新维护周期开始)
         await store._db.execute(
-            """INSERT INTO maintenance_state (id, enabled, reason, started_by, started_at, ended_at)
-               VALUES (?, 1, ?, ?, ?, NULL)
+            """INSERT INTO maintenance_state (id, enabled, reason, started_by, started_at, ended_at, recover_status)
+               VALUES (?, 1, ?, ?, ?, NULL, 'completed')
                ON CONFLICT(id) DO UPDATE SET
                    enabled = 1, reason = excluded.reason,
                    started_by = excluded.started_by,
                    started_at = excluded.started_at,
-                   ended_at = NULL""",
+                   ended_at = NULL,
+                   recover_status = 'completed'""",
             (MAINTENANCE_STATE_ID, reason, started_by, now_iso),
         )
         await store._db.commit()
@@ -241,27 +243,82 @@ async def enable(reason: str, started_by: int = 0) -> bool:
         return False
 
 
-async def disable(ended_by: int = 0, force: bool = False) -> bool:
-    """R40 P1-6: 关闭维护模式(带前置检查)。
+async def disable(ended_by: int = 0, force: bool = False, approval_action_id: str = None) -> bool:
+    """R40 P1-6 + R42 P1-12: 关闭维护模式(带前置检查 + recover_status 校验)。
 
     前置条件(默认 force=False 时检查):
         - 队列已排空(dirty_outbox + local_job_queue)
         - 备份存在(backup_history 表非空)
       不满足时抛 MaintenancePreconditionError(不调用 disable_maintenance)。
 
+    R42 P1-12 新增 recover_status 校验:
+        - 若 maintenance_state.recover_status='pending'(workflow 失败):
+          - approval_action_id 为 None → 抛 MaintenancePreconditionError
+          - approval_action_id 有效(在 command_executions 中 status='executed')
+            → 允许关闭
+        - 否则正常流程
+
     Args:
         ended_by: 操作者 admin_id
-        force: True=跳过前置检查(仅人工 rollback 场景使用)
+        force: True=跳过常规前置检查(仅人工 rollback / recover 场景使用)
+        approval_action_id: recover_maintenance 审批 action_id(recover_status='pending' 时必需)
 
     Returns:
         True 关闭成功, False 失败
 
     Raises:
-        MaintenancePreconditionError: 前置条件不满足
+        MaintenancePreconditionError: 前置条件不满足 / 需要 recover_maintenance 审批
     """
     store = get_cache_store()
     if not store._db:
         return False
+
+    # R42 P1-12: 检查 recover_status
+    recover_status = "completed"
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT recover_status FROM maintenance_state WHERE id = ?",
+            (MAINTENANCE_STATE_ID,),
+        )
+        if rows and rows[0]:
+            recover_status = rows[0][0] or "completed"
+    except Exception as e:
+        logger.warning(
+            f"[Maintenance] disable 查询 recover_status 失败(降级为 completed): {e}"
+        )
+
+    if recover_status == "pending":
+        if not approval_action_id:
+            logger.warning(
+                "[Maintenance] disable 拒绝(recover_status=pending 但未提供 approval_action_id)"
+            )
+            raise MaintenancePreconditionError(
+                "维护工作流失败后需要 recover_maintenance 审批才能关闭"
+            )
+        # 验证 approval_action_id 在 command_executions 中 status='executed'
+        try:
+            exec_rows = await store._db.execute_fetchall(
+                "SELECT status FROM command_executions WHERE action_id = ?",
+                (approval_action_id,),
+            )
+        except Exception as e:
+            raise MaintenancePreconditionError(
+                f"验证 approval_action_id 失败: {e}"
+            )
+        if not exec_rows or not exec_rows[0]:
+            raise MaintenancePreconditionError(
+                f"approval_action_id 不存在于 command_executions: {approval_action_id}"
+            )
+        exec_status = exec_rows[0][0]
+        if exec_status != "executed":
+            raise MaintenancePreconditionError(
+                f"approval_action_id 状态非 executed(当前: {exec_status}): "
+                f"{approval_action_id}"
+            )
+        logger.info(
+            f"[Maintenance] disable recover_status=pending,approval_action_id={approval_action_id} "
+            f"已验证 executed,允许关闭"
+        )
 
     # R40 P1-6: 前置检查
     if not force:
@@ -906,6 +963,23 @@ async def execute_maintenance_workflow(reason: str,
         logger.warning(
             f"[Maintenance] workflow 失败,保持 enabled: reason={failure_reason}"
         )
+        # R42 P1-12: 设置 recover_status='pending'(强制 recover_maintenance 审批才能关闭)
+        try:
+            _recover_store = get_cache_store()
+            async with _recover_store.transaction() as _recover_tx:
+                await _recover_tx.execute(
+                    "UPDATE maintenance_state SET recover_status = 'pending' "
+                    "WHERE id = ?",
+                    (MAINTENANCE_STATE_ID,),
+                )
+                await _recover_store.add_dirty_outbox(
+                    "maintenance_state", str(MAINTENANCE_STATE_ID),
+                    connection=_recover_tx,
+                )
+        except Exception as _recover_err:
+            logger.warning(
+                f"[Maintenance] 设置 recover_status=pending 失败: {_recover_err}"
+            )
         try:
             await _write_audit_log(
                 actor_id=started_by,
@@ -978,6 +1052,135 @@ async def rollback_maintenance(reason: str, ended_by: int = 0) -> bool:
         f"[Maintenance] rollback_maintenance: reason={reason} ended_by={ended_by}"
     )
     return await disable(ended_by=ended_by, force=True)
+
+
+async def recover_maintenance(
+    principal_id: int,
+    reason: str,
+    approval_action_id: str = None,
+) -> bool:
+    """R42 P1-12: 人工恢复维护模式(需 CommandBus 审批 + maintenance:recover 权限)。
+
+    与 ``rollback_maintenance`` 的差异:
+        - rollback_maintenance 跳过所有检查(仅运维紧急恢复)
+        - recover_maintenance 强制要求:
+          1. approval_action_id 由 CommandBus 预先审批生成(非 None)
+          2. approval_action_id 在 command_executions 中 status='executed'
+          3. principal_id 拥有 ``maintenance:recover`` 权限
+        - 通过验证后调用 ``disable(force=True, approval_action_id=...)`` 关闭
+        - 成功后重置 recover_status='completed',写 audit_log(action="recover_maintenance")
+
+    Args:
+        principal_id: 操作者 admin_id(必须拥有 maintenance:recover 权限)
+        reason: 恢复原因(记入 audit_log)
+        approval_action_id: CommandBus 预先审批生成的 action_id(必须)
+
+    Returns:
+        True 关闭成功, False 失败
+
+    Raises:
+        PermissionError: approval_action_id 缺失 / 未审批通过 / principal 无权限
+    """
+    # 1. approval_action_id 必须提供
+    if not approval_action_id:
+        logger.warning(
+            f"[Maintenance] recover_maintenance 拒绝(未提供 approval_action_id) "
+            f"principal={principal_id}"
+        )
+        raise PermissionError("recover_maintenance requires approval_action_id")
+
+    store = get_cache_store()
+    if not store._db:
+        raise PermissionError("数据库未初始化,无法验证 approval_action_id")
+
+    # 2. 验证 approval_action_id 在 command_executions 中 status='executed'
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT status FROM command_executions WHERE action_id = ?",
+            (approval_action_id,),
+        )
+    except Exception as e:
+        raise PermissionError(f"查询 approval_action_id 失败: {e}")
+
+    if not rows or not rows[0]:
+        raise PermissionError(
+            f"approval_action_id 不存在: {approval_action_id}"
+        )
+    exec_status = rows[0][0]
+    if exec_status != "executed":
+        raise PermissionError(
+            f"approval_action_id 状态非 executed(当前: {exec_status}): "
+            f"{approval_action_id}"
+        )
+
+    # 3. 验证 principal_id 拥有 maintenance:recover 权限
+    from services.rbac import check_permission
+    has_perm = False
+    try:
+        has_perm = await check_permission(principal_id, "maintenance:recover")
+    except Exception as e:
+        # RBAC 校验异常时 fail-closed(拒绝恢复)
+        logger.warning(
+            f"[Maintenance] recover_maintenance RBAC 异常(fail-closed 拒绝) "
+            f"principal={principal_id}: {e}"
+        )
+        raise PermissionError(
+            f"RBAC 权限校验异常,拒绝恢复维护模式: {e}"
+        )
+    if not has_perm:
+        logger.warning(
+            f"[Maintenance] recover_maintenance 拒绝"
+            f"(无 maintenance:recover 权限) principal={principal_id}"
+        )
+        # 记录未授权尝试到 audit_log
+        await _write_audit_log(
+            actor_id=principal_id,
+            action="recover_maintenance_unauthorized",
+            target_type="maintenance_state",
+            target_id=str(MAINTENANCE_STATE_ID),
+            details=f"未授权恢复维护模式尝试: reason={reason}",
+        )
+        raise PermissionError(
+            f"principal {principal_id} 无 maintenance:recover 权限"
+        )
+
+    # 4. 通过验证 → 调用 disable(force=True, approval_action_id=...)
+    logger.info(
+        f"[Maintenance] recover_maintenance 验证通过,关闭维护模式: "
+        f"principal={principal_id} reason={reason} "
+        f"approval_action_id={approval_action_id}"
+    )
+    ok = await disable(
+        ended_by=principal_id,
+        force=True,
+        approval_action_id=approval_action_id,
+    )
+    if ok:
+        # 重置 recover_status='completed'(允许后续正常 disable)
+        try:
+            await store._db.execute(
+                "UPDATE maintenance_state SET recover_status = 'completed' "
+                "WHERE id = ?",
+                (MAINTENANCE_STATE_ID,),
+            )
+            await store._db.commit()
+            await store.add_dirty_outbox(
+                "maintenance_state", str(MAINTENANCE_STATE_ID)
+            )
+        except Exception as reset_err:
+            logger.warning(
+                f"[Maintenance] recover_maintenance 重置 recover_status 失败: {reset_err}"
+            )
+        # 写 audit_log
+        await _write_audit_log(
+            actor_id=principal_id,
+            action="recover_maintenance",
+            target_type="maintenance_state",
+            target_id=str(MAINTENANCE_STATE_ID),
+            details=f"恢复维护模式(审批通过): reason={reason} "
+                    f"approval_action_id={approval_action_id}",
+        )
+    return ok
 
 
 # ─── R40 P1-8: Bot 入口统一维护检查装饰器 ──────────────────────────

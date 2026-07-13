@@ -29,6 +29,8 @@ CRDB 连接者仅允许:crdb_sync、migration、restore、低频备份和受控 
   systemd: tgjiema-crdb_sync.service
   手动: python -m services.crdb_sync_service
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -926,8 +928,206 @@ async def _dispatch_cells_upsert(records: list[dict]) -> list[int]:
     return processed_ids
 
 
+# ──────────────────────────────────────────────────────────────
+# R42 P1-4: dirty_outbox 合并版本冲突解决 — 单调版本来源
+#
+# 问题: 同 (table,pk) 合并最高 version 时,若多调用方使用默认 version=0,
+#   顺序可能依赖插入 ID 并吞掉真正新状态。
+# 整改: 每个可同步实体使用 monotonic version 或 updated sequence,
+#   合并时同时考虑 version 和 updated_at (ORDER BY version DESC, updated_at DESC)。
+# ──────────────────────────────────────────────────────────────
+
+
+def _resolve_version_conflict(
+    table: str, pk: str,
+    current_version: int, new_version: int,
+    current_updated_at: str | None = None,
+    new_updated_at: str | None = None,
+) -> int:
+    """R42 P1-4: 解决版本冲突,返回应保留的版本号。
+
+    决胜规则:
+        - new > current → 使用 new_version
+        - new == current → 用 updated_at 时间戳作为决胜(后者覆盖前者)
+        - new < current → 丢弃旧版本(new),记录 warning
+
+    Args:
+        table: 表名(用于日志)
+        pk: 主键(用于日志)
+        current_version: 当前已选定的版本号
+        new_version: 新候选版本号
+        current_updated_at: 当前记录的 updated_at(ISO 字符串)
+        new_updated_at: 新记录的 updated_at(ISO 字符串)
+
+    Returns:
+        应保留的版本号(new_version 或 current_version)
+    """
+    if new_version > current_version:
+        return new_version
+    if new_version == current_version:
+        # 用 updated_at 决胜(后者覆盖前者)
+        # ISO 字符串可直接字典序比较(空值视为最旧)
+        if (new_updated_at or "") >= (current_updated_at or ""):
+            return new_version
+        # new_updated_at 更早 → 丢弃 new
+        logger.warning(
+            f"[crdb_sync] R42 P1-4: version 冲突丢弃旧版本 "
+            f"table={table} pk={pk} "
+            f"(version={new_version}, new_updated_at={new_updated_at} "
+            f"< current_updated_at={current_updated_at})"
+        )
+        return current_version
+    # new_version < current_version → 丢弃 new
+    logger.warning(
+        f"[crdb_sync] R42 P1-4: version 冲突丢弃旧版本 "
+        f"table={table} pk={pk} "
+        f"(new_version={new_version} < current_version={current_version})"
+    )
+    return current_version
+
+
+# ──────────────────────────────────────────────────────────────
+# R42 P1-5: Tombstone soft_delete schema 探测与缓存
+#
+# 问题: CRDB tombstone dispatcher 对远端表执行 DELETE,
+#   但备份和跨机恢复依赖 deleted_at。
+# 整改: mirror 保留 tombstone,使用 soft-delete(version+deleted_at),
+#   不要立即 DELETE; 物理清理由 retention_worker 在备份保留后执行。
+# ──────────────────────────────────────────────────────────────
+
+
+# R42 P1-5: CRDB 表 soft_delete schema 缓存
+# 缓存 table_name → bool(是否支持 deleted_at + is_tombstone 字段)
+# 避免每次 tombstone dispatch 都查询 information_schema
+_CRDB_SOFT_DELETE_CACHE: dict[str, bool] = {}
+
+
+def _reset_soft_delete_cache() -> None:
+    """R42 P1-5: 重置 soft_delete schema 缓存(测试用)。"""
+    _CRDB_SOFT_DELETE_CACHE.clear()
+
+
+async def _is_crdb_table_supports_soft_delete(table_name: str) -> bool:
+    """R42 P1-5: 检查 CRDB 表是否支持 soft_delete(有 deleted_at + is_tombstone 字段)。
+
+    结果缓存到 _CRDB_SOFT_DELETE_CACHE 避免重复查询。
+    查询失败或 CRDB 未连接时 fail-safe 返回 False(fallback 到 hard delete + audit_log)。
+
+    Args:
+        table_name: CRDB 表名
+
+    Returns:
+        True 若表同时有 deleted_at 和 is_tombstone 字段;False otherwise
+    """
+    if table_name in _CRDB_SOFT_DELETE_CACHE:
+        return _CRDB_SOFT_DELETE_CACHE[table_name]
+    supports = False
+    try:
+        from database.session import _client
+        # 检查 _client 是否真实连接(避免 mock 环境误判)
+        if not getattr(_client, "is_connected", False):
+            # CRDB 未连接,无法查询 schema → fail-safe 返回 False(不缓存,
+            # 下次连接后重新查询)
+            return False
+        # 查询 information_schema.columns 判断是否有 deleted_at / is_tombstone
+        rows = await _client.fetch(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = $1 "
+            "AND column_name IN ('deleted_at', 'is_tombstone')",
+            [table_name],
+        )
+        cols = {r[0] for r in rows} if rows else set()
+        # 必须同时有 deleted_at 和 is_tombstone 才支持 soft_delete
+        supports = "deleted_at" in cols and "is_tombstone" in cols
+    except Exception as e:
+        logger.warning(
+            f"[crdb_sync] R42 P1-5: 查询 CRDB schema 失败 "
+            f"table={table_name}: {e}"
+        )
+        supports = False
+    _CRDB_SOFT_DELETE_CACHE[table_name] = supports
+    return supports
+
+
+def _extract_deleted_at_from_record(record: dict) -> str:
+    """R42 P1-5: 从 dirty_outbox 记录中提取 deleted_at 时间戳。
+
+    优先级:
+        1. payload 中的 deleted_at 字段
+        2. payload 中的 updated_at 字段
+        3. 记录的 created_at 字段
+        4. 当前时间(最后兜底)
+
+    Args:
+        record: dirty_outbox 行字典(含 payload / created_at)
+
+    Returns:
+        ISO 格式时间字符串
+    """
+    import datetime as _dt
+    payload = record.get("payload")
+    if payload:
+        try:
+            row = json.loads(payload) if isinstance(payload, str) else payload
+            if isinstance(row, dict):
+                for field in ("deleted_at", "updated_at"):
+                    val = row.get(field)
+                    if val:
+                        return str(val)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    # fallback 到记录的 created_at
+    created_at = record.get("created_at")
+    if created_at:
+        return str(created_at)
+    return _dt.datetime.now().isoformat()
+
+
+async def _write_tombstone_audit_log(
+    table_name: str, pk: str, action: str, details: str,
+) -> None:
+    """R42 P1-5: 写入 audit_log 记录 tombstone 操作。
+
+    用于 hard_delete fallback 路径(表不支持 soft_delete)和 retention hard delete。
+    写入失败时静默记录 debug 日志,不影响主流程。
+
+    Args:
+        table_name: 受影响表名
+        pk: 主键值
+        action: 审计动作(如 "tombstone_hard_delete_fallback" / "retention_hard_delete")
+        details: 详细说明
+    """
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if not store or not getattr(store, "_db", None):
+            return
+        import datetime as _dt
+        await store._db.execute(
+            """INSERT INTO audit_log (actor_id, actor_type, action, target_type,
+               target_id, details, ip_addr, created_at)
+               VALUES (?, 'system', ?, ?, ?, ?, '', ?)""",
+            (0, action, table_name, str(pk), details,
+             _dt.datetime.now().isoformat()),
+        )
+        if not getattr(store, "_in_writer_tx", False):
+            await store._db.commit()
+    except Exception as e:
+        logger.debug(
+            f"[crdb_sync] R42 P1-5: audit_log 写入失败(忽略): {e}"
+        )
+
+
 async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col: str) -> list[int]:
-    """R41 P0-6: 将 tombstone 记录同步到 CRDB — 执行 DELETE FROM <crdb_table> WHERE <pk_col> = ?。
+    """R41 P0-6 / R42 P1-5: 将 tombstone 记录同步到 CRDB。
+
+    R42 P1-5 变更(soft_delete 优先):
+        - 不再立即 DELETE FROM crdb_table WHERE pk_col=?
+        - 改为 UPDATE crdb_table SET deleted_at=?, is_tombstone=1 WHERE pk_col=?
+          (mirror 保留 tombstone,供备份和跨机恢复使用)
+        - 若 crdb 表无 deleted_at 字段(不支持 soft_delete),
+          fallback 到 DELETE(但记 audit_log 标记 fallback 路径)
+        - 物理清理由 retention_worker 在备份保留后执行(默认 30 天后)
 
     Args:
         records: dirty_outbox 行列表(operation=tombstone)
@@ -956,6 +1156,21 @@ async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col:
         )
         return []
     col = col_fn()
+
+    # R42 P1-5: 检查 CRDB 表是否支持 soft_delete(有 deleted_at + is_tombstone 字段)
+    supports_soft_delete = await _is_crdb_table_supports_soft_delete(crdb_table)
+    if supports_soft_delete:
+        logger.debug(
+            f"[crdb_sync] R42 P1-5: {crdb_table} 支持 soft_delete, "
+            f"tombstone 将 UPDATE deleted_at + is_tombstone=1"
+        )
+    else:
+        logger.warning(
+            f"[crdb_sync] R42 P1-5: {crdb_table} 不支持 soft_delete "
+            f"(无 deleted_at/is_tombstone 字段或 CRDB 未连接), "
+            f"fallback 到 DELETE + audit_log"
+        )
+
     processed_ids: list[int] = []
     for r in records:
         rid = r.get("id")
@@ -964,10 +1179,27 @@ async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col:
             logger.warning(f"[crdb_sync] R41 P0-6: tombstone id={rid} 无 pk, 跳过")
             continue
         try:
-            # DELETE FROM <crdb_table> WHERE <pk_col> = $1
-            # 注: tombstone 是幂等的(行已不存在时 DELETE 不报错)
-            sql = f"DELETE FROM {crdb_table} WHERE {pk_col} = $1"
-            await col.execute_raw(sql, [pk])
+            if supports_soft_delete:
+                # R42 P1-5: soft_delete 路径 — UPDATE deleted_at + is_tombstone=1
+                # 从 payload / created_at 中提取 deleted_at 时间戳
+                deleted_at = _extract_deleted_at_from_record(r)
+                sql = (
+                    f"UPDATE {crdb_table} SET deleted_at = $1, "
+                    f"is_tombstone = 1 WHERE {pk_col} = $2"
+                )
+                await col.execute_raw(sql, [deleted_at, pk])
+            else:
+                # R42 P1-5: fallback 路径 — DELETE + audit_log
+                # (表不支持 soft_delete,或 CRDB schema 查询失败)
+                sql = f"DELETE FROM {crdb_table} WHERE {pk_col} = $1"
+                await col.execute_raw(sql, [pk])
+                # 写 audit_log 标记 fallback 路径(便于审计追溯)
+                await _write_tombstone_audit_log(
+                    crdb_table, str(pk),
+                    "tombstone_hard_delete_fallback",
+                    f"CRDB 表 {crdb_table} 不支持 soft_delete "
+                    f"(无 deleted_at/is_tombstone 字段),fallback 到 DELETE",
+                )
             processed_ids.append(rid)
         except Exception as e:
             logger.warning(
@@ -1290,9 +1522,18 @@ async def _sync_dirty_outbox():
         await _close_pool_if_idle()
         return
 
-    # R41 RU 门禁: 合并最高 version — 同一 (table_name, pk) 仅保留 version 最大的记录
+    # R41 RU 门禁 / R42 P1-4: 合并最高 version — 同一 (table_name, pk) 仅保留
+    # version 最大且 updated_at 最新的记录(ORDER BY version DESC, updated_at DESC LIMIT 1)。
     # 合并后,被合并的旧版本记录也标记为 processed(避免重复 dispatch),
-    # 从而降低 CRDB UPSERT 次数与 RU 消耗
+    # 从而降低 CRDB UPSERT 次数与 RU 消耗。
+    #
+    # R42 P1-4 修复:
+    #   旧逻辑仅比较 version,若多调用方使用默认 version=0,
+    #   顺序可能依赖插入 ID 并吞掉真正新状态。
+    #   新逻辑使用 _resolve_version_conflict 同时考虑 version 和 updated_at:
+    #     - new_version > current → 使用 new
+    #     - new_version == current → 用 updated_at 决胜(后者覆盖前者)
+    #     - new_version < current → 丢弃旧版本(new),记录 warning
     merged_records: list[dict] = []
     merged_old_ids: list[int] = []  # 被合并掉的旧版本 id(需标记为 processed)
     version_map: dict[tuple[str, str], dict] = {}  # (table_name, pk) → 最新记录
@@ -1300,6 +1541,9 @@ async def _sync_dirty_outbox():
         tn = r.get("table_name", "") or ""
         pk = str(r.get("pk", "") or "")
         version = r.get("version", 0) or 0
+        # R42 P1-4: dirty_outbox 的 created_at 作为 updated_at 代理
+        # (dirty_outbox 记录的 created_at 即变更检测时间,接近实体 updated_at)
+        updated_at = r.get("created_at", "") or ""
         key = (tn, pk)
         if key not in version_map:
             version_map[key] = r
@@ -1307,15 +1551,30 @@ async def _sync_dirty_outbox():
         else:
             existing = version_map[key]
             existing_version = existing.get("version", 0) or 0
-            if version > existing_version:
-                # 当前记录 version 更大 → 替换
+            existing_updated_at = existing.get("created_at", "") or ""
+            # R42 P1-4: 使用 _resolve_version_conflict 决定保留哪个版本
+            # (同时考虑 version 和 updated_at)
+            chosen_version = _resolve_version_conflict(
+                tn, pk, existing_version, version,
+                existing_updated_at, updated_at,
+            )
+            # 判定新记录是否被选中(替换 existing)
+            new_selected = (
+                chosen_version == version and (
+                    version > existing_version
+                    or (version == existing_version
+                        and updated_at > existing_updated_at)
+                )
+            )
+            if new_selected:
+                # 新记录被选中 → 替换 existing
                 merged_old_ids.append(existing["id"])
-                # 在 merged_records 中替换
                 idx = merged_records.index(existing)
                 merged_records[idx] = r
                 version_map[key] = r
             else:
-                # 已有记录 version 更大 → 当前记录被合并
+                # 旧版本被丢弃(new < current 或 new == current 但 new_updated_at 更早
+                # 或 version + updated_at 完全相同 → 保留 existing)
                 merged_old_ids.append(r["id"])
 
     if merged_old_ids:

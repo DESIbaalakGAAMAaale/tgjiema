@@ -141,6 +141,18 @@ class ApprovalExecutor:
                     f"[ApprovalExecutor] 处理 entry id={entry['id']} "
                     f"action_id={entry['action_id']} 顶层异常: {e}"
                 )
+                # R42 P0-2: 顶层异常时释放 command_executions lease,
+                # 避免记录卡在 executing 状态(下一轮可重新 claim)
+                try:
+                    from services import command_bus as _cb_mod_top
+                    _top_action_id = entry.get("action_id", "") or ""
+                    if _top_action_id:
+                        await _cb_mod_top.release_lease(_top_action_id)
+                except Exception as _release_err:
+                    logger.warning(
+                        f"[ApprovalExecutor] 顶层异常后 release_lease 失败 "
+                        f"entry id={entry['id']}: {_release_err}"
+                    )
                 await self._handle_failure(entry, f"顶层异常: {e}")
                 stats["failed"] += 1
 
@@ -152,6 +164,16 @@ class ApprovalExecutor:
 
     async def _process_entry(self, entry: dict) -> str:
         """处理单个 entry。
+
+        R42 P0-2 整改流程:
+            1. CAS claim ``command_outbox`` (pending → executing)
+            2. 调用 ``command_bus.claim_execution_for_outbox(action_id, request_hash, owner)``
+               - already_executed → mark_executed 并返回 success(幂等跳过)
+               - claimed_by_other → 回退 outbox 到 pending,跳过本轮
+               - hash_mismatch → 路由到 DLQ(标记 failed,不重试)
+               - claimed → 执行 handler
+            3. handler 成功 → ``command_bus.mark_outbox_executed`` 同事务更新三处状态
+            4. handler 失败 → ``command_bus.release_lease`` 释放 + 安排重试
 
         Args:
             entry: command_outbox 行字典
@@ -186,21 +208,117 @@ class ApprovalExecutor:
             )
             return "skipped"
 
-        # 2b. 调用 CommandBus 执行 handler(完全独立的事务边界)
+        # R42 P0-2: claim command_executions(与 outbox 共享同一 action_id)
         cb = self._get_command_bus()
+        # 从 entry 中解析 params,计算 request_hash(防篡改)
+        import json as _json_pe
+        from services import command_bus as _cb_mod
+
+        payload_data = entry.get("payload") or "{}"
+        if isinstance(payload_data, str):
+            try:
+                payload_data = _json_pe.loads(payload_data)
+            except (ValueError, TypeError):
+                payload_data = {}
+        if not isinstance(payload_data, dict):
+            payload_data = {}
+        params = payload_data.get("params", {}) or {}
+        request_hash = _cb_mod._compute_request_hash(params)
+        action_id = entry.get("action_id", "") or ""
+        approval_id = int(entry.get("approval_id", 0) or 0)
+        owner = _cb_mod._get_worker_owner()
+
+        claim_result = await _cb_mod.claim_execution_for_outbox(
+            action_id, request_hash, owner, lease_seconds=60,
+        )
+        claim_status = claim_result.get("status")
+
+        # 分支 1: 幂等跳过(已执行)
+        if claim_status == "already_executed":
+            logger.info(
+                f"[ApprovalExecutor] entry id={entry['id']} action_id={action_id} "
+                f"已执行(幂等跳过),直接 mark_executed"
+            )
+            cached_result_json = claim_result.get("result")
+            cached_result_dict = None
+            if cached_result_json:
+                try:
+                    cached_result_dict = _json_pe.loads(cached_result_json)
+                except (ValueError, TypeError):
+                    cached_result_dict = None
+            # 同事务更新三处状态(outbox=executed + command_executions=executed + approval=executed)
+            await _cb_mod.mark_outbox_executed(
+                action_id,
+                result=cached_result_dict or {"success": True, "data": None, "error": ""},
+                approval_id=approval_id if approval_id > 0 else None,
+            )
+            return "success"
+
+        # 分支 2: 被其他 worker 占用 → 回退 outbox 到 pending,跳过本轮
+        if claim_status == "claimed_by_other":
+            logger.debug(
+                f"[ApprovalExecutor] entry id={entry['id']} action_id={action_id} "
+                f"command_executions 被其他 worker 占用,跳过本轮"
+            )
+            try:
+                async with store.transaction() as tx:
+                    await tx.execute(
+                        "UPDATE command_outbox SET status = 'pending', updated_at = ? "
+                        "WHERE id = ?",
+                        (now, entry["id"]),
+                    )
+            except Exception as revert_err:
+                logger.warning(
+                    f"[ApprovalExecutor] entry id={entry['id']} 回退 outbox 到 pending 失败: "
+                    f"{revert_err}"
+                )
+            return "skipped"
+
+        # 分支 3: request_hash 不匹配(防篡改) → 路由到 DLQ(标记 failed,不重试)
+        if claim_status == "hash_mismatch":
+            logger.error(
+                f"[ApprovalExecutor] entry id={entry['id']} action_id={action_id} "
+                f"request_hash 不匹配(防篡改拒绝),路由到 DLQ"
+            )
+            try:
+                async with store.transaction() as tx:
+                    await tx.execute(
+                        "UPDATE command_outbox "
+                        "SET status = 'failed', last_error = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        ("request_hash 不匹配(防篡改拒绝,路由到 DLQ)", now, entry["id"]),
+                    )
+            except Exception as dlq_err:
+                logger.warning(
+                    f"[ApprovalExecutor] entry id={entry['id']} DLQ 标记失败: {dlq_err}"
+                )
+            return "failed"
+
+        # 分支 4: claimed → 执行 handler
+        # 2b. 调用 CommandBus 执行 handler(完全独立的事务边界)
         try:
             result = await cb.execute_command_outbox_entry(entry)
         except Exception as e:
             logger.error(
                 f"[ApprovalExecutor] CommandBus 执行异常 entry id={entry['id']}: {e}"
             )
+            # R42 P0-2: 释放 lease + 安排重试
+            await _cb_mod.release_lease(action_id)
             return await self._handle_failure(entry, f"CommandBus 异常: {e}")
 
-        # 2c. 更新 outbox 状态
+        # 2c. 更新三处状态
         if result.success:
-            await self._mark_executed(entry["id"])
+            # R42 P0-2: 同一事务内更新 command_executions=executed + command_outbox=executed
+            # + approval=executed
+            await _cb_mod.mark_outbox_executed(
+                action_id,
+                result=result,
+                approval_id=approval_id if approval_id > 0 else None,
+            )
             return "success"
         else:
+            # R42 P0-2: 失败 → 释放 lease + 安排重试
+            await _cb_mod.release_lease(action_id)
             return await self._handle_failure(entry, result.error)
 
     async def _mark_executed(self, entry_id: int) -> None:

@@ -276,7 +276,7 @@ class I18nManager:
     #                                  format_datetime / format_file_size) ──
 
     def format_message(self, key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
-        """R41: 显式格式化接口 — 翻译 key 并用 {var} 占位符插值。
+        """R41/R42 P1-8: 显式格式化接口 — 翻译 key 并用 {var} 占位符插值。
 
         与 translate() 的区别:
         - 显式语义: 调用方明确知道这是一个"格式化"操作,而非简单翻译查找
@@ -284,15 +284,25 @@ class I18nManager:
         - kwargs 中的 None 值会被转为空字符串,避免 'None' 字面量泄漏到用户消息
         - 找不到 key 时回退到默认 locale 再回退到 key 本身(与 translate 一致)
 
+        R42 P1-8 变更:
+        - 缺失 key 时返回 key 本身(不抛异常,由 translate() 兜底保证)
+        - 若 locale 不存在(文件未加载且加载失败),直接 fallback 到 en-US
+          (避免回退到 default_locale 导致的语言错位)
+
         Args:
             key: 翻译 key(如 "bot.upload_success")
             locale: 目标 locale(默认 self.default_locale)
             **kwargs: 插值参数(如 code="ABC123" → 替换 {code})
 
         Returns:
-            格式化后的字符串(占位符已替换)
+            格式化后的字符串(占位符已替换);缺失 key 时返回 key 本身
         """
-        text = self.translate(key, locale=locale)
+        # R42 P1-8: 若 locale 不存在(文件未加载且加载失败),直接 fallback 到 en-US
+        target_locale = locale or self.default_locale
+        if target_locale not in self._translations:
+            if not self.load_locale(target_locale):
+                target_locale = _FALLBACK_LOCALE  # en-US
+        text = self.translate(key, locale=target_locale)
         if not text or not kwargs:
             return text
         # 将 None 值转为空字符串,避免 'None' 字面量泄漏
@@ -488,3 +498,194 @@ def translate(key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
     """
     manager = get_i18n_manager()
     return manager.translate(key, locale=locale, **kwargs)
+
+
+# ── R42 P1-8: i18n 完整接入 — 错误响应结构 / 用户 locale 写入 /
+#                复数规则 / Admin principal locale ──────────────────
+
+
+def format_error_response(
+    code: str,
+    message_key: str,
+    params: Optional[dict] = None,
+    trace_id: Optional[str] = None,
+) -> dict:
+    """R42 P1-8: 格式化错误响应结构。
+
+    返回统一的错误响应 dict,前端/Bot 拿到 message_key 后,
+    根据用户 locale 调用 format_message() / translate() 进行本地化渲染。
+    这样错误码与文案解耦,前端可自由切换语言而无需后端重新生成。
+
+    Args:
+        code: 稳定的错误码(如 "QUOTA_DECODE_EXCEEDED" / "FILE_NOT_FOUND")
+        message_key: 翻译 key(如 "errors.quota.decode.exceeded"),
+                     前端用此 key 查找 locale 文件中的本地化消息
+        params: 插值参数(如 {"count": 5}),用于替换消息中的 {count} 占位符;
+                None 时返回空 dict
+        trace_id: 链路追踪 ID(用于跨服务日志关联);None 时返回空字符串
+
+    Returns:
+        {"code": code, "message_key": message_key, "params": params or {},
+         "trace_id": trace_id or ""}
+    """
+    return {
+        "code": code,
+        "message_key": message_key,
+        "params": params or {},
+        "trace_id": trace_id or "",
+    }
+
+
+def get_user_locale_sync(user_id: int) -> str:
+    """R42 P1-8: 同步从 users_local 表读取用户 locale(默认 zh-CN)。
+
+    模块级便捷函数,等价于 I18nManager.get_user_locale()。
+    从 SQLite cache_store 同步读取(不触发 CRDB RU 消耗)。
+    用户未设置或读取失败时返回默认 locale 'zh-CN'。
+
+    Args:
+        user_id: Telegram 用户 ID
+
+    Returns:
+        用户 locale 字符串(如 "zh-CN" / "en-US");失败返回 "zh-CN"
+    """
+    manager = get_i18n_manager()
+    return manager.get_user_locale(user_id)
+
+
+def set_user_locale(user_id: int, locale: str) -> bool:
+    """R42 P1-8: 设置用户 locale 并写 dirty_outbox(同步)。
+
+    流程:
+        1. 验证 locale 在支持列表中(否则抛 ValueError)
+        2. UPDATE users_local SET locale=? WHERE user_id=?
+        3. 写 dirty_outbox 一条 upsert 记录(供 crdb_sync 同步)
+
+    Args:
+        user_id: Telegram 用户 ID
+        locale: 目标 locale(必须在 get_available_locales() 返回的列表中)
+
+    Returns:
+        True=成功;False=失败(DB 不可用 / 用户不存在 / IO 异常)
+
+    Raises:
+        ValueError: locale 不在支持列表中
+    """
+    if not user_id:
+        return False
+    # 1. 验证 locale 在支持列表中
+    manager = get_i18n_manager()
+    available = manager.get_available_locales()
+    if locale not in available:
+        raise ValueError(
+            f"不支持的 locale: {locale},当前支持列表: {available}"
+        )
+    # 2. 同步写入 SQLite + dirty_outbox
+    try:
+        import sqlite3
+        # 动态导入 DB_PATH(便于测试 monkeypatch)
+        from database import cache_store as _cs
+        db_path = str(_cs.DB_PATH)
+        if not Path(db_path).exists():
+            return False
+        conn = sqlite3.connect(db_path, timeout=2)
+        try:
+            # UPDATE users_local SET locale=? WHERE user_id=?
+            conn.execute(
+                "UPDATE users_local SET locale=? WHERE user_id=?",
+                (locale, int(user_id)),
+            )
+            # 写 dirty_outbox(供 crdb_sync 同步到 CRDB)
+            conn.execute(
+                """INSERT INTO dirty_outbox
+                   (table_name, pk, version, operation, payload,
+                    created_at, processed, local_only)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "users_local",
+                    str(int(user_id)),
+                    0,
+                    "upsert",
+                    json.dumps(
+                        {"user_id": int(user_id), "locale": locale},
+                        ensure_ascii=False,
+                    ),
+                    datetime.datetime.now().isoformat(),
+                    0,
+                    0,
+                ),
+            )
+            conn.commit()
+            logger.info(
+                f"[i18n] set_user_locale 成功 user={user_id} locale={locale}"
+            )
+            return True
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(
+            f"[i18n] set_user_locale 失败 user={user_id} locale={locale}: {e}"
+        )
+        return False
+
+
+def format_plural(
+    count: int,
+    singular_key: str,
+    plural_key: str,
+    locale: Optional[str] = None,
+) -> str:
+    """R42 P1-8: 根据语言规则返回单数/复数形式的本地化消息。
+
+    语言规则:
+        - 中文(zh-*):不区分单复数,始终使用 singular_key
+        - 英文(en-*):count == 1 用 singular_key,count != 1 用 plural_key
+          (count=0 用 plural,符合英文 "0 items" 习惯)
+        - 其他语言:默认按英文规则
+
+    Args:
+        count: 数量(用于选择单复数形式 + 插值)
+        singular_key: 单数形式的翻译 key(如 "bot.file_count_singular")
+        plural_key: 复数形式的翻译 key(如 "bot.file_count_plural")
+        locale: 目标 locale(默认 zh-CN)
+
+    Returns:
+        本地化消息(已替换 {count} 占位符);key 缺失时返回 key 本身
+    """
+    manager = get_i18n_manager()
+    target_locale = locale or _DEFAULT_LOCALE
+    # 中文不区分单复数
+    if target_locale.startswith("zh"):
+        return manager.translate(singular_key, locale=target_locale, count=count)
+    # 英文规则: count == 1 用 singular, 其他用 plural (包括 0)
+    if count == 1:
+        return manager.translate(singular_key, locale=target_locale, count=count)
+    return manager.translate(plural_key, locale=target_locale, count=count)
+
+
+def get_principal_locale(principal_id: int) -> str:
+    """R42 P1-8: 获取 admin principal 的 locale(默认 zh-CN)。
+
+    Admin 后台调用此函数获取当前登录管理员的 locale,
+    用于本地化后台错误消息 / 通知文案。
+
+    设计说明:
+        - principal_id 是 admin 的整数 ID(基于 username 哈希生成),
+          通常不在 users_local 表中(管理员非普通 Telegram 用户);
+        - 先尝试从 users_local 读取(支持管理员同时也是普通用户的场景);
+        - 读取失败或无记录时返回默认 locale 'zh-CN'。
+
+    Args:
+        principal_id: admin 的整数 ID(AdminPrincipal.id)
+
+    Returns:
+        principal 的 locale(默认 zh-CN)
+    """
+    if not principal_id:
+        return _DEFAULT_LOCALE
+    # 先尝试从 users_local 读取(principal 可能也是普通用户)
+    locale = get_user_locale_sync(principal_id)
+    if locale and locale != _DEFAULT_LOCALE:
+        return locale
+    # 默认 zh-CN(principal 通常无 users_local 记录)
+    return _DEFAULT_LOCALE

@@ -178,6 +178,16 @@ class SessionManager:
     async def validate_session(self, session_id: str):
         """验证 session 有效性。
 
+        R42 P0-3: 返回的 AdminPrincipal 从持久化身份表(admin_principals)读取,
+        确保 session/RBAC/CommandBus 使用同一身份表读取的 ID 和角色,
+        而非各自从 session 数据中生成不同的 ID。
+
+        流程:
+          1. 从 kv_store 读取 session 数据并校验过期时间
+          2. 若 ADMIN_PRINCIPAL_ID 配置存在且 session.principal_id 匹配,
+             从 admin_principals 表读取权威身份(含最新角色)
+          3. 若配置不存在或持久化记录不存在,fallback 到 session 中的 principal_id/username/roles
+
         Args:
             session_id: 待验证的 session ID
 
@@ -198,11 +208,40 @@ class SessionManager:
             return None
         # 延迟导入避免循环依赖
         from admin import AdminPrincipal
+        session_principal_id = int(data.get("principal_id", 0) or 0)
+        session_username = str(data.get("username", "") or "")
+        session_roles = list(data.get("roles", []) or [])
+
+        # R42 P0-3: 优先从持久化身份表读取 AdminPrincipal
+        # 确保返回的 principal_id 与 RBAC/CommandBus 使用同一身份源
+        try:
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            if store._db and session_principal_id > 0:
+                record = await store.get_admin_principal_record(session_principal_id)
+                if record is not None and record.get("is_active", False):
+                    # 从持久化记录构造 AdminPrincipal(使用 from_persistent_record 类方法)
+                    # 角色从 admin_principal_roles 表读取(权威源)
+                    persistent_roles = await store.list_admin_principal_roles(
+                        session_principal_id
+                    )
+                    if persistent_roles:
+                        record["roles"] = persistent_roles
+                    return AdminPrincipal.from_persistent_record(record)
+                # 持久化记录不存在或不活跃 → fallback 到 session 数据
+                logger.debug(
+                    f"[admin.sessions] 持久化记录不存在/不活跃 principal_id={session_principal_id},"
+                    f"fallback 到 session 数据"
+                )
+        except Exception as e:
+            logger.debug(f"[admin.sessions] 读取持久化身份失败,fallback 到 session 数据: {e}")
+
+        # Fallback: 使用 session 中的 principal_id/username/roles
         try:
             return AdminPrincipal(
-                id=int(data.get("principal_id", 0)),
-                username=str(data.get("username", "")),
-                roles=list(data.get("roles", [])),
+                id=session_principal_id,
+                username=session_username,
+                roles=session_roles,
             )
         except (TypeError, ValueError) as e:
             logger.warning(f"[admin.sessions] session 数据损坏: {e}")

@@ -213,3 +213,150 @@ def all_declared_tables() -> set[str]:
         所有已声明表名集合(str)
     """
     return set(TABLE_REPLICATION_POLICY.keys())
+
+
+# ════════════════════════════════════════════════════════════════
+#  R42 P1-5: Tombstone soft-delete 策略
+# ════════════════════════════════════════════════════════════════
+
+
+# R42 P1-5: Tombstone 策略枚举字符串常量
+# - soft_delete: CRDB 表保留 tombstone(UPDATE deleted_at + is_tombstone=1),
+#   物理清理由 retention_worker 在备份保留后执行(默认 30 天)。
+# - hard_delete: 表不支持 soft_delete(无 deleted_at 字段),fallback 到 DELETE,
+#   并写 audit_log 标记 fallback 路径(便于审计追溯)。
+# - no_tombstone: LOCAL_ONLY 表不需要 tombstone(仅本地,不同步到 CRDB)。
+TOMBSTONE_POLICY_SOFT_DELETE = "soft_delete"
+TOMBSTONE_POLICY_HARD_DELETE = "hard_delete"
+TOMBSTONE_POLICY_NO_TOMBSTONE = "no_tombstone"
+
+
+def get_tombstone_policy(table_name: str) -> str:
+    """R42 P1-5: 查询表的 tombstone 处理策略。
+
+    决策规则:
+        - CRDB 同步表 → soft_delete(默认保留 tombstone,供备份恢复使用)
+        - LOCAL_ONLY 表 → no_tombstone(仅本地存在,不需要 CRDB tombstone)
+        - ARCHIVE_ONLY 表 → no_tombstone(冷归档,不进 CRDB)
+        - 未知表(fail-closed) → no_tombstone(默认 LOCAL_ONLY,不产生 tombstone)
+
+    返回值:
+        - "soft_delete": UPDATE deleted_at + is_tombstone=1
+        - "hard_delete": DELETE FROM <table> WHERE pk=? + audit_log(此值不会
+          由 get_tombstone_policy 直接返回,仅作为运行时 fallback 标记)
+        - "no_tombstone": 跳过 tombstone 处理(LOCAL_ONLY / 未知表)
+
+    与 _is_crdb_table_supports_soft_delete 的区别:
+        - get_tombstone_policy 是基于 replication_policy 的逻辑策略
+          (该表"应该"走什么 tombstone 路径)
+        - _is_crdb_table_supports_soft_delete 是 CRDB schema 探测
+          (该表实际是否支持 deleted_at + is_tombstone 字段)
+        - 运行时优先用 _is_crdb_table_supports_soft_delete 探测实际能力;
+          get_tombstone_policy 用于诊断 / 监控 / 默认策略推断
+
+    Args:
+        table_name: 逻辑表名(与 dirty_outbox.table_name 对齐)
+
+    Returns:
+        tombstone 策略字符串(soft_delete / no_tombstone)
+    """
+    policy = get_policy(table_name)
+    if policy is ReplicationPolicy.CRDB:
+        # CRDB 同步表默认 soft_delete
+        # (实际是否支持取决于 CRDB 表 schema,_is_crdb_table_supports_soft_delete 探测)
+        return TOMBSTONE_POLICY_SOFT_DELETE
+    # LOCAL_ONLY / ARCHIVE_ONLY / 未知表 → no_tombstone
+    return TOMBSTONE_POLICY_NO_TOMBSTONE
+
+
+# ════════════════════════════════════════════════════════════════
+#  R42 P1-7: backup_policy 与 replication_policy 一致性校验
+# ════════════════════════════════════════════════════════════════
+
+
+def _validate_backup_replication_consistency() -> dict:
+    """R42 P1-7: 校验 backup_policy 与 replication_policy 不冲突。
+
+    一致性规则:
+        1. NO_EXPORT_PLAINTEXT 的表(敏感数据)不能是 CRDB 同步策略
+           (避免明文跨节点复制到 CRDB)
+        2. LOCAL_ONLY backup_policy 的表不应是 CRDB 同步策略
+           (本地不备份,但跨节点同步 — 数据可能在其他节点备份;允许但不推荐)
+        3. MUST_RESTORE 的 CRDB 同步表 — 一致(无冲突)
+        4. REBUILDABLE 的 CRDB 同步表 — 一致(无冲突;CRDB 是权威,可重建本地缓存)
+
+    本函数供 CI / 启动时调用,发现冲突时记录警告或抛 ValueError。
+
+    Returns:
+        {
+            "is_valid": bool,
+            "no_export_crdb_conflicts": [表名],   # NO_EXPORT_PLAINTEXT + CRDB(严重)
+            "local_only_crdb_conflicts": [表名],  # LOCAL_ONLY backup + CRDB(警告)
+            "details": str,
+        }
+
+    Raises:
+        ValueError: 当存在 NO_EXPORT_PLAINTEXT + CRDB 冲突时(is_valid=False)
+    """
+    # 懒加载 backup_schema(避免循环 import)
+    from services.backup_schema import (
+        BackupPolicy,
+        BACKUP_POLICY,
+        get_backup_policy,
+        is_no_export,
+        is_local_only_backup,
+    )
+
+    no_export_conflicts: list[str] = []
+    local_only_crdb_conflicts: list[str] = []
+
+    # 检查所有声明的 backup_policy 表
+    for table_name, backup_p in BACKUP_POLICY.items():
+        repl_p = get_policy(table_name)
+        # 规则 1: NO_EXPORT_PLAINTEXT 不能是 CRDB 同步
+        if backup_p is BackupPolicy.NO_EXPORT_PLAINTEXT and repl_p is ReplicationPolicy.CRDB:
+            no_export_conflicts.append(table_name)
+        # 规则 2: LOCAL_ONLY backup 不应是 CRDB 同步(允许但警告)
+        elif backup_p is BackupPolicy.LOCAL_ONLY and repl_p is ReplicationPolicy.CRDB:
+            local_only_crdb_conflicts.append(table_name)
+
+    # 也检查所有 CRDB 同步表的 backup_policy
+    for table_name in all_crdb_tables():
+        bkp = get_backup_policy(table_name)
+        if bkp is BackupPolicy.NO_EXPORT_PLAINTEXT:
+            if table_name not in no_export_conflicts:
+                no_export_conflicts.append(table_name)
+        elif bkp is BackupPolicy.LOCAL_ONLY:
+            if table_name not in local_only_crdb_conflicts:
+                local_only_crdb_conflicts.append(table_name)
+
+    is_valid = not no_export_conflicts
+
+    details_parts: list[str] = []
+    if no_export_conflicts:
+        details_parts.append(
+            f"严重冲突 NO_EXPORT_PLAINTEXT + CRDB: {sorted(no_export_conflicts)}"
+        )
+    if local_only_crdb_conflicts:
+        details_parts.append(
+            f"警告 LOCAL_ONLY backup + CRDB: {sorted(local_only_crdb_conflicts)}"
+        )
+    if not details_parts:
+        details_parts.append("backup_policy 与 replication_policy 无冲突")
+
+    result = {
+        "is_valid": is_valid,
+        "no_export_crdb_conflicts": sorted(no_export_conflicts),
+        "local_only_crdb_conflicts": sorted(local_only_crdb_conflicts),
+        "details": "; ".join(details_parts),
+    }
+
+    # 严重冲突抛 ValueError(阻止启动 / CI 失败)
+    if not is_valid:
+        raise ValueError(
+            f"R42 P1-7: backup_policy 与 replication_policy 冲突 — "
+            f"NO_EXPORT_PLAINTEXT 表不能是 CRDB 同步表: "
+            f"{sorted(no_export_conflicts)}"
+        )
+
+    return result

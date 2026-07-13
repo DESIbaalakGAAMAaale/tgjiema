@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TG解码器 i18n locale 文件 schema",
+  "description": "R42 P1-8: 定义翻译 key 的结构,确保 zh-CN.json 与 en-US.json 命名空间与 key 完全一致。前端/Bot 通过 services/i18n.py 的 translate() / format_message() 查找扁平化后的点分 key。",
+  "type": "object",
+  "properties": {
+    "meta": {
+      "type": "object",
+      "description": "locale 元信息(版本/回退/语言名),两个文件可不同",
+      "properties": {
+        "locale": {"type": "string", "description": "locale 标识符(如 zh-CN / en-US)"},
+        "name": {"type": "string", "description": "语言显示名"},
+        "version": {"type": "string", "description": "schema 版本号"},
+        "fallback": {"type": "string", "description": "缺失 key 时回退到的 locale"}
+      },
+      "required": ["locale", "name", "version", "fallback"]
+    },
+    "common": {
+      "type": "object",
+      "description": "通用 UI 文案(ok / cancel / submit 等)"
+    },
+    "errors": {
+      "type": "object",
+      "description": "错误消息翻译,扁平 key(如 quota.decode.exceeded)或嵌套结构"
+    },
+    "ui": {
+      "type": "object",
+      "description": "管理后台与前端 UI 标题/按钮文案"
+    },
+    "bot": {
+      "type": "object",
+      "description": "Bot 用户可见消息(欢迎语 / 提示 / 错误反馈)"
+    },
+    "accessibility": {
+      "type": "object",
+      "description": "无障碍相关文案(aria-label / 高对比度 / 屏幕阅读器)"
+    },
+    "admin": {
+      "type": "object",
+      "description": "R42 P1-8 新增: admin 后台专属翻译(错误码 / 操作反馈)",
+      "properties": {
+        "errors": {"type": "object"}
+      }
+    }
+  },
+  "required": ["common", "errors", "ui"]
+}

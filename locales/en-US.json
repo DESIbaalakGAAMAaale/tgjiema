@@ -93,13 +93,49 @@
     "idx_start_welcome": "Welcome to the File Decode Bot\n\nSend a file code to get the corresponding file.\nSend /status to view your membership status and remaining decodes today.\nSend /help for help",
     "dsp_start_welcome": "Welcome to the File Send Bot!\n\nThis bot is used to receive decoded files. No manual operation required.\nAfter you obtain a file code via the decode bot, files will be sent to you automatically.\nSend /help for help",
     "permission_denied": "You do not have permission to perform this operation",
-    "unknown_error": "An unknown error occurred. Please try again later"
+    "unknown_error": "An unknown error occurred. Please try again later",
+    "locale_changed": "Language changed to {locale}",
+    "locale_invalid": "Unsupported locale: {locale}",
+    "locale_set_success": "Language set successfully",
+    "command_cancelled": "Operation cancelled",
+    "command_unknown": "Unknown command, send /help for help",
+    "help_text": "Help",
+    "no_active_session": "No active session, please restart",
+    "session_expired": "Session expired, please retry",
+    "session_renewed": "Session renewed",
+    "maintenance_in_progress": "System under maintenance, please try again later",
+    "file_count_singular": "{count} file",
+    "file_count_plural": "{count} files"
   },
   "accessibility": {
     "skip_to_content": "Skip to main content",
     "form_required_field": "Required field",
     "form_validation_error": "Form validation failed",
     "table_sortable_column": "Sortable column",
-    "loading_indicator": "Loading indicator"
+    "loading_indicator": "Loading indicator",
+    "high_contrast": "High contrast mode",
+    "large_text": "Large text mode",
+    "screen_reader_friendly": "Screen reader friendly",
+    "keyboard_navigation": "Keyboard navigation",
+    "focus_visible": "Focus visible",
+    "image_alt_text": "Image alternative text",
+    "form_label_associated": "Form label associated",
+    "button_name_descriptive": "Descriptive button name",
+    "skip_to_main": "Skip to main content",
+    "region_landmark": "Region landmark"
+  },
+  "admin": {
+    "errors": {
+      "unauthorized": "Unauthorized access",
+      "forbidden": "Forbidden access",
+      "not_found": "Resource not found",
+      "method_not_allowed": "Method not allowed",
+      "conflict": "Resource conflict",
+      "unprocessable_entity": "Unprocessable entity",
+      "too_many_requests": "Too many requests",
+      "internal_server_error": "Internal server error",
+      "service_unavailable": "Service unavailable",
+      "gateway_timeout": "Gateway timeout"
+    }
   }
 }

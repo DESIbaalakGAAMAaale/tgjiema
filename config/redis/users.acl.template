@@ -1,10 +1,12 @@
 # R40 P0-3: Redis ACL 模板(由 render_acl.sh 渲染为最终 ACL 文件)
 #
-# 此文件是 users.acl 的规范模板,包含 <REDIS_*_PASSWORD> 占位符。
+# 此文件是 users.acl 的规范模板,包含 [REDIS_*_PASSWORD] 形式占位符
+# (实际为 [REDIS_HEALTH_PASSWORD] / [REDIS_WRITER_PASSWORD] / [REDIS_READER_PASSWORD]
+#  / [REDIS_ADMIN_PASSWORD],render_acl.sh 用 sed 全名替换)。
 # 渲染流程:
 #   1. docker-compose 启动 redis-acl-init 一次性服务,执行 config/redis/render_acl.sh
 #   2. render_acl.sh 从 REDIS_*_PASSWORD 环境变量读取密码(缺失时 openssl rand 随机生成)
-#   3. sed 替换占位符 → /data/users.acl(校验无 '<' / 'changeme' 后 chmod 600 + chown redis:redis)
+#   3. sed 替换占位符 → /data/users.acl(校验无尖括号 / 默认密码占位符 后 chmod 600 + chown redis:redis)
 #   4. redis 主容器以 --aclfile /data/users.acl 加载最终 ACL
 #
 # 兼容性:
@@ -32,12 +34,23 @@ user health on ><REDIS_HEALTH_PASSWORD> ~* &* -@all +PING
 # R39 P0-2: 正向白名单,仅允许业务所需命令;key 限制到 tgjiema:* 命名空间
 # 用途: db_writer / up_bot / idx_bot / dsp_bot / mon_bot / admin_bot / admin
 #       共享此用户(写权限),由 REDIS_URL 中嵌入凭证实现单一连接点
-user tgjiema_writer on ><REDIS_WRITER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XTRIM +XINFO +XDEL +PING +EXPIRE +TTL +SET +GET +DEL
+# R42 P0-4: 补充 crdb_sync lease 与 mon leader 切换所需命令:
+#   - XAUTOCLAIM: 回收 pending >30s 的消息(原仅 admin 有,现 writer 也允许用于
+#                 crdb_sync/db_writer 自恢复,不破坏白名单语义)
+#   - XGROUP: 创建/销毁消费组(部署期 / 修复卡住的 PEL)
+#   - XRANGE: 读取历史消息(诊断 / 修复 PEL 时遍历)
+#   - EVAL: crdb_sync lease 原子操作(SET NX PX + Lua fencing token CAS)
+#   - PEXPIRE: lease 续期(毫秒级 TTL,SET NX PX 后 PEXPIRE 续约)
+#   - EXISTS: kv_store CAS 前置存在性检查(幂等判定)
+# 安全: 仍是 -@all + 显式白名单,自动拒绝 FLUSHALL/FLUSHDB/CONFIG/KEYS/SHUTDOWN/DEBUG
+user tgjiema_writer on ><REDIS_WRITER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XAUTOCLAIM +XGROUP +XTRIM +XRANGE +XINFO +XDEL +PING +EXPIRE +PEXPIRE +TTL +SET +GET +DEL +EXISTS +EVAL
 
 # ── tgjiema_reader: 只读用户(消费组读取 + kv_store 只读) ──
 # R39 P0-2: 正向白名单,仅允许读命令;key 限制到 tgjiema:* 命名空间
 # 用途: 仅需读取的服务(如 prometheus_exporter)或调试用途
-user tgjiema_reader on ><REDIS_READER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XREADGROUP +XINFO +XLEN +XPENDING +PING +GET +TTL
+# R42 P0-4: 补充 XRANGE(诊断时遍历历史消息;无 XADD/XACK/XAUTOCLAIM/XGROUP/XTRIM
+#           等写命令,严格只读)
+user tgjiema_reader on ><REDIS_READER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XREADGROUP +XINFO +XLEN +XPENDING +XRANGE +PING +GET +TTL
 
 # ── tgjiema_admin: 管理员用户(mon_bot/admin_bot/admin 后台使用) ──
 # R41 P1-9: 拆分 writer 用户为 4 个角色,管理员需要额外权限:
@@ -47,6 +60,7 @@ user tgjiema_reader on ><REDIS_READER_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XRE
 #   - 全部 Stream + KV 命令(管理操作:重置消费组 / 修复卡住的 PEL)
 #   - CONFIG GET: 读取运行时配置(用于监控/诊断,不含 SET 防止误操作)
 #   - CLUSTER NODES / INFO: 集群状态查询(单机模式下也兼容)
+# R42 P0-4: 补充 XGROUP/XRANGE(权限矩阵要求 admin ⊇ writer,管理消费组 + 遍历历史)
 # 用途: mon_bot / admin_bot / admin 后台服务,需要管理 Redis 状态
 # 安全: 仍限制在 tgjiema:* 命名空间,不能访问其他业务的 key
-user tgjiema_admin on ><REDIS_ADMIN_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XAUTOCLAIM +XTRIM +XINFO +XDEL +PING +EXPIRE +TTL +SET +GET +DEL +EVAL +CONFIG +CLUSTER +INFO +CLIENT +TIME +MEMORY +SLOWLOG +LATENCY
+user tgjiema_admin on ><REDIS_ADMIN_PASSWORD> ~tgjiema:* &tgjiema:* -@all +XADD +XREADGROUP +XACK +XLEN +XPENDING +XCLAIM +XAUTOCLAIM +XGROUP +XTRIM +XRANGE +XINFO +XDEL +PING +EXPIRE +PEXPIRE +TTL +SET +GET +DEL +EXISTS +EVAL +CONFIG +CLUSTER +INFO +CLIENT +TIME +MEMORY +SLOWLOG +LATENCY

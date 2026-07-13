@@ -93,13 +93,49 @@
     "idx_start_welcome": "欢迎使用文件解码机器人\n\n发送文件码即可获取对应文件。\n发送 /status 查看您的会员状态和今日剩余解码次数。\n发送 /help 查看帮助信息",
     "dsp_start_welcome": "欢迎使用文件发送机器人!\n\n此机器人用于接收解码后的文件,无需手动操作。\n当您通过解码机器人获取文件码后,文件会自动发送给您。\n发送 /help 查看帮助信息",
     "permission_denied": "您没有权限执行此操作",
-    "unknown_error": "发生未知错误,请稍后重试"
+    "unknown_error": "发生未知错误,请稍后重试",
+    "locale_changed": "语言已切换为 {locale}",
+    "locale_invalid": "不支持的语言: {locale}",
+    "locale_set_success": "语言设置成功",
+    "command_cancelled": "操作已取消",
+    "command_unknown": "未知命令,发送 /help 查看帮助",
+    "help_text": "帮助信息",
+    "no_active_session": "无活动会话,请重新开始",
+    "session_expired": "会话已过期,请重新操作",
+    "session_renewed": "会话已续期",
+    "maintenance_in_progress": "系统维护中,请稍后再试",
+    "file_count_singular": "{count} 个文件",
+    "file_count_plural": "{count} 个文件"
   },
   "accessibility": {
     "skip_to_content": "跳到主要内容",
     "form_required_field": "必填字段",
     "form_validation_error": "表单校验失败",
     "table_sortable_column": "可排序列",
-    "loading_indicator": "加载指示器"
+    "loading_indicator": "加载指示器",
+    "high_contrast": "高对比度模式",
+    "large_text": "大字体模式",
+    "screen_reader_friendly": "屏幕阅读器友好",
+    "keyboard_navigation": "键盘导航",
+    "focus_visible": "焦点可见",
+    "image_alt_text": "图像替代文本",
+    "form_label_associated": "表单标签已关联",
+    "button_name_descriptive": "按钮名称描述性",
+    "skip_to_main": "跳转到主内容",
+    "region_landmark": "区域地标"
+  },
+  "admin": {
+    "errors": {
+      "unauthorized": "未授权访问",
+      "forbidden": "禁止访问",
+      "not_found": "资源不存在",
+      "method_not_allowed": "方法不允许",
+      "conflict": "资源冲突",
+      "unprocessable_entity": "请求格式无法处理",
+      "too_many_requests": "请求过于频繁",
+      "internal_server_error": "内部服务器错误",
+      "service_unavailable": "服务暂时不可用",
+      "gateway_timeout": "网关超时"
+    }
   }
 }

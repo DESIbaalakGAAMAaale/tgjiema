@@ -253,16 +253,26 @@ class TestTgjiemaWriterPermissions:
         return line
 
     def test_writer_does_not_have_xautoclaim(self, writer_acl_line):
-        """tgjiema_writer 不应有 +XAUTOCLAIM(管理操作)。"""
+        """R42 P0-4: tgjiema_writer 现在允许 +XAUTOCLAIM(crdb_sync lease 与 mon leader 切换所需)。
+
+        R41 要求 writer 不应有 XAUTOCLAIM,但 R42 P0-4 整改要求 writer 包含
+        XAUTOCLAIM/XGROUP/XTRIM/EVAL 等命令(Redis Streams 恢复 + DLQ Lua + leader lease)。
+        本测试已更新为验证 writer 确实包含这些命令(R42 要求)。
+        """
         cmds = _extract_commands(writer_acl_line)
-        assert "XAUTOCLAIM" not in cmds, \
-            f"tgjiema_writer 不应有 +XAUTOCLAIM(应留给 admin): {writer_acl_line}"
+        assert "XAUTOCLAIM" in cmds, \
+            f"R42 P0-4 要求 tgjiema_writer 包含 +XAUTOCLAIM: {writer_acl_line}"
 
     def test_writer_does_not_have_eval(self, writer_acl_line):
-        """tgjiema_writer 不应有 +EVAL(管理操作)。"""
+        """R42 P0-4: tgjiema_writer 现在允许 +EVAL(DLQ Lua 脚本所需)。
+
+        R41 要求 writer 不应有 EVAL,但 R42 P0-4 整改要求 writer 包含 EVAL
+        (Redis Streams DLQ 重试逻辑使用 Lua 脚本)。
+        本测试已更新为验证 writer 确实包含 EVAL(R42 要求)。
+        """
         cmds = _extract_commands(writer_acl_line)
-        assert "EVAL" not in cmds, \
-            f"tgjiema_writer 不应有 +EVAL: {writer_acl_line}"
+        assert "EVAL" in cmds, \
+            f"R42 P0-4 要求 tgjiema_writer 包含 +EVAL: {writer_acl_line}"
 
     def test_writer_does_not_have_config(self, writer_acl_line):
         """tgjiema_writer 不应有 +CONFIG(管理操作)。"""

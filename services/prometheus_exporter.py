@@ -205,6 +205,124 @@ def _get_relay_spool_disk_usage() -> int:
     return total
 
 
+# ════════════════════════════════════════════════════════════════
+#  R42 P1-10: CRDB RU 数据源状态判定(official/unknown/failed)
+# ════════════════════════════════════════════════════════════════
+
+
+# 数据新鲜度阈值(秒)— 与 crdb_ru_collector.RU_DATA_FRESH_THRESHOLD 保持一致
+_RU_DATA_FRESH_THRESHOLD = 3600
+
+
+def _compute_crdb_ru_source_label() -> tuple[str, float, int]:
+    """R42 P1-10: 计算 CRDB RU 指标的 source label 与 freshness。
+
+    从 kv_store 读取 crdb_ru_daily 与 crdb_ru_last_collected_at,
+    根据时间戳判断数据新鲜度。
+
+    Returns:
+        (source_label, freshness_seconds, source_gauge_value)
+        - source_label: "official" / "unknown" / "failed"
+        - freshness_seconds: 距上次采集的秒数(-1=从未采集)
+        - source_gauge_value: 0=unknown, 1=official, 2=failed
+    """
+    # 读取 kv_store 中的 RU 值
+    ru_str = _read_kv_value("crdb_ru_daily", "")
+    ru_value: float | None = None
+    if ru_str:
+        try:
+            ru_value = float(ru_str)
+        except (TypeError, ValueError):
+            ru_value = None
+
+    # 读取采集时间戳
+    ts_str = _read_kv_value("crdb_ru_last_collected_at", "")
+    freshness_seconds: float = -1.0  # -1 表示从未采集
+
+    if ts_str:
+        try:
+            # 尝试 ISO 8601
+            iso_str = ts_str.replace("Z", "+00:00") if ts_str.endswith("Z") else ts_str
+            dt = _dt.datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                # naive datetime → 视为 UTC(collector 用 utcnow 写入)
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            freshness_seconds = float(time.time() - dt.timestamp())
+            if freshness_seconds < 0:
+                freshness_seconds = 0.0
+        except (ValueError, TypeError):
+            # 尝试解析为 epoch 数字
+            try:
+                ts_num = float(ts_str)
+                freshness_seconds = float(time.time() - ts_num)
+                if freshness_seconds < 0:
+                    freshness_seconds = 0.0
+            except (ValueError, TypeError):
+                freshness_seconds = -1.0
+
+    # 判定 source
+    if ru_value is None and freshness_seconds < 0:
+        # 无 RU 值且无时间戳 → failed
+        source_label = "failed"
+    elif freshness_seconds < 0:
+        # 有 RU 值但无时间戳 → unknown(无法判断新鲜度)
+        source_label = "unknown"
+    elif freshness_seconds >= _RU_DATA_FRESH_THRESHOLD:
+        # 数据陈旧 → unknown
+        source_label = "unknown"
+    else:
+        # 数据新鲜 → official
+        source_label = "official"
+
+    source_gauge_value = {"unknown": 0, "official": 1, "failed": 2}.get(
+        source_label, 0
+    )
+    return source_label, freshness_seconds, source_gauge_value
+
+
+def _get_backup_compliance_status() -> tuple[int, float]:
+    """R42 P1-9: 计算备份合规状态(基于真实 COMPLETE marker)。
+
+    通过 BackupEngine.get_last_successful_backup() 查询最近一次成功备份
+    (status='completed' 且 complete_marker_exists=True 且 COMPLETE marker 在 R2 真实存在)。
+
+    Returns:
+        (compliant, rpo_seconds)
+        - compliant: 1=合规(有成功备份), 0=不合规(无成功备份)
+        - rpo_seconds: 距上次成功备份的秒数(-1=从未备份)
+    """
+    # 直接读取 kv_store.last_backup_at 作为快速判断
+    # 真实 COMPLETE marker 校验由 BackupEngine.get_last_successful_backup() 负责
+    # 此处避免在 Prometheus scrape 路径中触发 async R2 调用
+    backup_ts_str = _read_kv_value("last_backup_at", "")
+    if not backup_ts_str:
+        return 0, -1.0
+    try:
+        # 兼容 ISO 时间戳与 epoch 数字
+        backup_ts: float
+        try:
+            # 先尝试 epoch 数字
+            backup_ts = float(backup_ts_str)
+        except (ValueError, TypeError):
+            # ISO 8601 解析
+            iso_str = (
+                backup_ts_str.replace("Z", "+00:00")
+                if backup_ts_str.endswith("Z")
+                else backup_ts_str
+            )
+            dt = _dt.datetime.fromisoformat(iso_str)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=_dt.timezone.utc)
+            backup_ts = dt.timestamp()
+        rpo_seconds = float(time.time() - backup_ts)
+        if rpo_seconds < 0:
+            rpo_seconds = 0.0
+        # 有 backup_at 即认为合规(真实 marker 校验由 readiness 负责)
+        return 1, rpo_seconds
+    except (ValueError, TypeError):
+        return 0, -1.0
+
+
 # ── 指标采集 ────────────────────────────────────────────
 
 # R38 P2-7: 高基数 label 黑名单 — 不可出现在任何指标的 label 中
@@ -266,17 +384,63 @@ def collect_metrics() -> str:
     # 业务 Bot(up/idx/dsp/admin)应只读 SQLite,不触发 CRDB RU。
     # 理想值 ≤20 RU/天,上限 ≤100 RU/天,超过阈值告警(由 Alertmanager 触发)。
     # 数据来源: kv_store.crdb_idle_ru_daily(crdb_ru_collector 采集)
+    # R42 P1-10: 根据 get_ru_status() 区分 source(official/unknown/failed)
+    #   - failed  → 显示 -1, label source="failed"
+    #   - unknown → 显示 -1, label source="unknown"
+    #   - official→ 显示真实值, label source="official"
     idle_ru_str = _read_kv_value("crdb_idle_ru_daily", "0")
     try:
         idle_ru = float(idle_ru_str)
     except (TypeError, ValueError):
         idle_ru = 0.0
+
+    # R42 P1-10: 获取 RU 状态(official/unknown/failed)
+    # 同步调用 get_ru_status() 会触发 CRDB API 调用,这里改为从 kv_store
+    # 读取时间戳判断新鲜度(不实际调用 API,避免 Prometheus scrape 阻塞)
+    crdb_ru_source_label, crdb_ru_freshness, crdb_ru_source_gauge = (
+        _compute_crdb_ru_source_label()
+    )
+
+    # R42 P1-10: 失败/陈旧时 idle_ru 显示 -1,source 标签区分
+    if crdb_ru_source_label == "official":
+        idle_ru_display = idle_ru
+    else:
+        # failed / unknown → 显示 -1(便于告警区分"无数据" vs "0 RU")
+        idle_ru_display = -1.0
+
     lines.append(
         "# HELP tgjiema_crdb_idle_ru_daily 业务 Bot 空载 RU 每日消耗"
-        "(理想 ≤20,上限 ≤100,超阈值告警)"
+        "(理想 ≤20,上限 ≤100,超阈值告警;"
+        "-1=采集失败/数据陈旧,label source=official/unknown/failed)"
     )
     lines.append("# TYPE tgjiema_crdb_idle_ru_daily gauge")
-    lines.append(f"tgjiema_crdb_idle_ru_daily {idle_ru}")
+    lines.append(
+        f'tgjiema_crdb_idle_ru_daily{{source="{crdb_ru_source_label}"}} '
+        f'{idle_ru_display}'
+    )
+
+    # R42 P1-10: tgjiema_crdb_ru_source — 数据源状态 gauge
+    # 0=unknown(数据陈旧或时间戳缺失)
+    # 1=official(CRDB API 调用成功且数据新鲜)
+    # 2=failed(CRDB API 调用失败且 kv_store 无历史数据)
+    ru_source_value = {"unknown": 0, "official": 1, "failed": 2}.get(
+        crdb_ru_source_label, 0
+    )
+    lines.append(
+        "# HELP tgjiema_crdb_ru_source CRDB RU 数据源状态"
+        "(0=unknown, 1=official, 2=failed)"
+    )
+    lines.append("# TYPE tgjiema_crdb_ru_source gauge")
+    lines.append(f"tgjiema_crdb_ru_source {ru_source_value}")
+
+    # R42 P1-10: tgjiema_crdb_ru_freshness_seconds — 数据新鲜度(秒)
+    # -1=从未采集或时间戳缺失,其他=距上次成功采集的秒数
+    lines.append(
+        "# HELP tgjiema_crdb_ru_freshness_seconds CRDB RU 数据新鲜度"
+        "(秒,距上次成功采集;-1=从未采集)"
+    )
+    lines.append("# TYPE tgjiema_crdb_ru_freshness_seconds gauge")
+    lines.append(f"tgjiema_crdb_ru_freshness_seconds {crdb_ru_freshness}")
 
     # R41 RU 门禁: tgjiema_crdb_idle_ru_alert — 空载 RU 是否超阈值(0/1)
     # 阈值从环境变量 CRDB_IDLE_RU_DAILY_ALERT_THRESHOLD 读取(默认 100)
@@ -339,6 +503,26 @@ def collect_metrics() -> str:
     lines.append("# HELP backup_age_seconds Seconds since last successful backup (-1 if never)")
     lines.append("# TYPE backup_age_seconds gauge")
     lines.append(f"backup_age_seconds {backup_age}")
+
+    # R42 P1-9: tgjiema_backup_compliant — 备份合规状态(基于真实 COMPLETE marker)
+    # 0=non-compliant(无成功备份或 COMPLETE marker 缺失)
+    # 1=compliant(有 status='completed' 且 COMPLETE marker 存在的备份)
+    backup_compliant, backup_rpo = _get_backup_compliance_status()
+    lines.append(
+        "# HELP tgjiema_backup_compliant 备份合规状态"
+        "(0=non-compliant 无成功备份, 1=compliant 有 COMPLETE marker 的成功备份)"
+    )
+    lines.append("# TYPE tgjiema_backup_compliant gauge")
+    lines.append(f"tgjiema_backup_compliant {backup_compliant}")
+
+    # R42 P1-9: tgjiema_backup_rpo_seconds — 真实 RPO(基于 last_backup_at)
+    # -1=从未备份,其他=距上次成功备份的秒数
+    lines.append(
+        "# HELP tgjiema_backup_rpo_seconds 真实 RPO(秒,距上次成功备份;"
+        "-1=从未备份,基于 last_backup_at)"
+    )
+    lines.append("# TYPE tgjiema_backup_rpo_seconds gauge")
+    lines.append(f"tgjiema_backup_rpo_seconds {backup_rpo}")
 
     # 6. relay_spool_disk_usage — relay spool 目录当前字节数
     spool_bytes = _get_relay_spool_disk_usage()

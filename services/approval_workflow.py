@@ -570,6 +570,54 @@ async def mark_failed(approval_id: int, error: str = "") -> bool:
         return False
 
 
+async def mark_approval_executed(approval_id: int, action_id: str = "") -> bool:
+    """R42 P0-2: 标记审批为已执行(基于 approval_id,可选 action_id 用于审计)。
+
+    与 ``mark_executed`` 的差异:
+        - ``mark_executed`` 要求当前状态为 EXECUTING(状态机严格转换)
+        - 本函数直接 UPDATE 到 EXECUTED(用于 ApprovalExecutor 同事务内幂等标记,
+          已通过 ``mark_outbox_executed`` 完成主流程,此处仅作冗余更新兜底)
+
+    Args:
+        approval_id: 审批 ID
+        action_id: 关联的命令幂等 ID(仅用于日志审计,不参与 WHERE 过滤)
+
+    Returns:
+        True 表示更新成功;False 表示未更新(记录不存在或已为 executed)
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+
+    now = datetime.datetime.now().isoformat()
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE approvals SET status = ?, resolved_at = ? "
+                "WHERE id = ? AND status != ?",
+                (APPROVAL_STATUS_EXECUTED, now, approval_id, APPROVAL_STATUS_EXECUTED),
+            )
+            await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
+        affected = cursor.rowcount if cursor else 0
+        if affected == 0:
+            logger.debug(
+                f"[Approval] mark_approval_executed 未更新(已 executed 或不存在): "
+                f"id={approval_id} action_id={action_id}"
+            )
+            return False
+        logger.info(
+            f"[Approval] mark_approval_executed id={approval_id} "
+            f"action_id={action_id} → EXECUTED"
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            f"[Approval] mark_approval_executed 失败 id={approval_id} "
+            f"action_id={action_id}: {e}"
+        )
+        return False
+
+
 async def get_approval(approval_id: int) -> dict | None:
     """获取审批详情。
 

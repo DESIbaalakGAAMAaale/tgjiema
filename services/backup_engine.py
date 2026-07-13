@@ -1,4 +1,4 @@
-"""R40 P0-7: 统一备份引擎 — 真实 R2 上传 + 可解密恢复。
+"""R40 P0-7 + R42 P1-2/P1-3/P1-7/P1-9: 统一备份引擎 — 真实 R2 上传 + 可解密恢复。
 
 职责:
     解决原 ``disaster_recovery.trigger_backup`` 只采集数据不上传 R2、
@@ -10,10 +10,35 @@
     3. ``verify_backup`` — HEAD 三个对象 + 下载 manifest 校验(不下载 payload,节省带宽)
     4. ``restore`` — 下载 manifest → 校验 ciphertext_sha256 → 解密 → 校验 plaintext_sha256 → 写隔离环境
 
+R42 P1-2 跨对象原子提交 + 孤儿 GC:
+    - 维持现有 payload → manifest → COMPLETE 流程
+    - 新增 ``cleanup_orphans(timeout_seconds)`` 方法清理超时孤儿对象
+    - 新增 ``enable_object_lock(bucket_name, retention_days)`` 占位
+    - ``restore()`` 校验 COMPLETE marker 存在才执行恢复
+
+R42 P1-3 生产恢复审批强化:
+    - ``restore(target="production", approver_id, approval_action_id=None)``
+    - production 恢复必须提供 ``approval_action_id``,否则抛 ``ValueError``
+    - 校验 ``approval_action_id`` 在 ``command_executions`` 表中 status='executed'
+    - 校验 ``approver_id`` 与 ``command_executions.principal_id`` 一致
+    - 公共 API ``restore()`` 不直接执行恢复,必须经过审批验证后调用 ``_restore_internal()``
+
+R42 P1-7 逐表 Backup/Restore Policy:
+    - ``backup()`` 根据 backup_policy 决定是否包含表数据:
+      * MUST_RESTORE         — 完整备份
+      * REBUILDABLE           — 仅备份 schema,不备份数据
+      * NO_EXPORT_PLAINTEXT  — 仅备份 schema,数据用 <<REDACTED>> 占位
+      * LOCAL_ONLY           — 不备份
+    - ``restore()`` 根据 backup_policy 决定恢复策略
+
+R42 P1-9 RPO/RTO 真实 COMPLETE 状态:
+    - ``backup()`` 在 COMPLETE marker 写入成功后才更新 ``backup_history`` 的 completed_at
+    - 新增 ``get_last_successful_backup()`` 查询 status='completed' 且 COMPLETE marker 存在的最新记录
+
 设计要点:
     - COMPLETE marker 三阶段提交:payload → manifest → COMPLETE,任一缺失视为备份失败
     - manifest 包含 backup_id/created_at/双 checksum(plaintext+ciphertext)/encryption/size
-    - 生产恢复必须审批(approver_id 非零),staging 恢复可免审批
+    - 生产恢复必须审批(approval_action_id 必填,需通过审批验证)
     - last_backup_at 仅在 COMPLETE marker 上传成功后更新(避免 RPO 假合规)
     - 失败时不更新 last_backup_at,记录失败原因到 backup_history
 """
@@ -37,6 +62,10 @@ COMPLETE_SUFFIX = ".complete"
 # ─── manifest schema 版本 ──────────────────────────────────────
 MANIFEST_SCHEMA_VERSION = "r40_p0_7_v1"
 
+# ─── NO_EXPORT_PLAINTEXT 占位符 ────────────────────────────────
+# R42 P1-7: 敏感字段在备份中以占位符替代明文,防止明文泄漏
+_REDACTED_PLACEHOLDER = "<<REDACTED>>"
+
 
 def _utcnow_iso() -> str:
     """当前 UTC 时间 ISO 字符串。"""
@@ -49,7 +78,7 @@ def _compute_sha256(content: bytes) -> str:
 
 
 class BackupEngine:
-    """R40 P0-7: 统一备份引擎。
+    """R40 P0-7 + R42 P1-2/P1-3/P1-7/P1-9: 统一备份引擎。
 
     所有方法均为 async。R2 storage、CRDB/SQLite 通过依赖注入或 lazy import,
     便于测试时 mock。
@@ -88,14 +117,16 @@ class BackupEngine:
 
         流程:
             1. 调用 ``backup_all_tables`` 采集数据(明文 JSON)
-            2. 计算 plaintext_sha256
-            3. 调用 ``backup_crypto.encrypt_payload`` 加密,得到 ciphertext + wrapped_dek + nonce + key_id
-            4. 计算 ciphertext_sha256
-            5. 生成 backup_id(含时间戳 + 短随机后缀)
-            6. 上传 payload(.enc) → manifest(.manifest.json) → COMPLETE marker(.complete)
-            7. HEAD 三个对象验证全部存在
-            8. 全部成功后更新 last_backup_at(写入 kv_config/kv_store)
-            9. 返回完整 manifest(包含 backup_id 与所有元信息)
+            2. R42 P1-7: 根据 ``backup_policy`` 过滤/脱敏表数据
+            3. 计算 plaintext_sha256
+            4. 调用 ``backup_crypto.encrypt_payload`` 加密,得到 ciphertext + wrapped_dek + nonce + key_id
+            5. 计算 ciphertext_sha256
+            6. 生成 backup_id(含时间戳 + 短随机后缀)
+            7. 上传 payload(.enc) → manifest(.manifest.json) → COMPLETE marker(.complete)
+            8. HEAD 三个对象验证全部存在
+            9. 全部成功后更新 last_backup_at(写入 kv_config/kv_store)
+            10. R42 P1-9: 写入 backup_history(status='completed')
+            11. 返回完整 manifest(包含 backup_id 与所有元信息)
 
         Args:
             backup_type: "full" 或 "incremental"
@@ -113,6 +144,9 @@ class BackupEngine:
         backup_data = await backup_all_tables(watermark=None, backup_type=backup_type)
         # 弹出内部元数据(不写入 payload)
         metadata = backup_data.pop("_r38_p1_5_metadata", {})
+
+        # R42 P1-7: 根据 backup_policy 过滤/脱敏表数据
+        backup_data = self._apply_backup_policy(backup_data)
 
         # 2. 序列化明文 + 计算 plaintext_sha256
         plaintext = json.dumps(
@@ -143,7 +177,8 @@ class BackupEngine:
         # R40 P0-7: created_at 只调用一次 _utcnow_iso(),保证 manifest 与 last_backup_at 一致
         tables = backup_data.get("tables", {})
         table_stats = {
-            name: {"row_count": len(rows)} for name, rows in tables.items()
+            name: {"row_count": len(rows) if isinstance(rows, list) else 0}
+            for name, rows in tables.items()
         }
         created_at = _utcnow_iso()
         manifest: dict[str, Any] = {
@@ -165,7 +200,10 @@ class BackupEngine:
             "payload_key": payload_key,
             "table_stats": table_stats,
             "total_tables": len(tables),
-            "total_rows": sum(len(rows) for rows in tables.values()),
+            "total_rows": sum(
+                len(rows) if isinstance(rows, list) else 0
+                for rows in tables.values()
+            ),
             "backup_started_at": metadata.get("start_time", created_at),
             "backup_finished_at": metadata.get("end_time", created_at),
         }
@@ -236,12 +274,223 @@ class BackupEngine:
             # last_backup_at 更新失败不影响备份完整性,只记录警告
             logger.warning(f"[BackupEngine] 更新 last_backup_at 失败(非致命): {e}")
 
+        # R42 P1-9: 写入 backup_history(status='completed', complete_marker_exists=True)
+        # 真实 COMPLETE marker 已写入,get_last_successful_backup() 据此判断 RPO 合规
+        try:
+            await self._append_backup_history_completed(backup_id, manifest)
+        except Exception as e:
+            logger.warning(f"[BackupEngine] 写入 backup_history 失败(非致命): {e}")
+
         logger.info(
             f"[BackupEngine] 备份成功 backup_id={backup_id} "
             f"payload={len(ciphertext)}B manifest={len(manifest_bytes)}B "
             f"encrypted={enc_result['encrypted']} tables={len(tables)}"
         )
         return manifest
+
+    # ─── R42 P1-7: backup_policy 应用 ──────────────────────────
+
+    def _apply_backup_policy(self, backup_data: dict) -> dict:
+        """R42 P1-7: 根据 backup_policy 过滤/脱敏 backup_data。
+
+        策略应用规则:
+            - MUST_RESTORE        :完整保留(无操作)
+            - REBUILDABLE         :仅保留 schema,清空 rows(替换为空列表)
+            - NO_EXPORT_PLAINTEXT :仅保留 schema,数据用 <<REDACTED>> 占位
+            - LOCAL_ONLY          :从 backup_data 中移除该表
+
+        Args:
+            backup_data: backup_all_tables() 返回的数据 dict
+
+        Returns:
+            处理后的 backup_data(原地修改并返回)
+        """
+        from services.backup_schema import (
+            BackupPolicy,
+            get_backup_policy,
+        )
+
+        tables = backup_data.get("tables", {})
+        if not isinstance(tables, dict):
+            return backup_data
+
+        removed_tables: list[str] = []
+        redacted_tables: list[str] = []
+        schema_only_tables: list[str] = []
+
+        for table_name in list(tables.keys()):
+            policy = get_backup_policy(table_name)
+            if policy is BackupPolicy.LOCAL_ONLY:
+                # 不备份,从 backup_data 中移除
+                tables.pop(table_name, None)
+                removed_tables.append(table_name)
+            elif policy is BackupPolicy.REBUILDABLE:
+                # 仅备份 schema,清空 rows
+                rows = tables.get(table_name, [])
+                if isinstance(rows, list) and rows:
+                    tables[table_name] = []  # 保留 schema 标记(空列表)
+                    schema_only_tables.append(table_name)
+            elif policy is BackupPolicy.NO_EXPORT_PLAINTEXT:
+                # 仅备份 schema,数据用 <<REDACTED>> 占位
+                rows = tables.get(table_name, [])
+                if isinstance(rows, list) and rows:
+                    # 用占位符替换实际数据
+                    tables[table_name] = [
+                        {"_redacted": _REDACTED_PLACEHOLDER}
+                        for _ in rows
+                    ]
+                    redacted_tables.append(table_name)
+            # MUST_RESTORE: 不做处理
+
+        if removed_tables or redacted_tables or schema_only_tables:
+            logger.info(
+                f"[BackupEngine] R42 P1-7 backup_policy 应用: "
+                f"removed={len(removed_tables)} redacted={len(redacted_tables)} "
+                f"schema_only={len(schema_only_tables)}"
+            )
+
+        return backup_data
+
+    def _apply_restore_policy(self, data: dict) -> dict:
+        """R42 P1-7: 根据 backup_policy 决定恢复策略。
+
+        恢复策略应用规则:
+            - MUST_RESTORE        :完整恢复数据(无操作)
+            - REBUILDABLE         :仅恢复 schema,数据由系统重建(清空 rows)
+            - NO_EXPORT_PLAINTEXT :恢复 schema,但 secret 字段保持初始值(清空 rows)
+            - LOCAL_ONLY          :不恢复(从 data 中移除)
+
+        Args:
+            data: restore 解密后的 plaintext dict
+
+        Returns:
+            处理后的 data(原地修改并返回)
+        """
+        from services.backup_schema import (
+            BackupPolicy,
+            get_backup_policy,
+        )
+
+        tables = data.get("tables", {})
+        if not isinstance(tables, dict):
+            return data
+
+        for table_name in list(tables.keys()):
+            policy = get_backup_policy(table_name)
+            if policy is BackupPolicy.LOCAL_ONLY:
+                # 不恢复
+                tables.pop(table_name, None)
+            elif policy is BackupPolicy.REBUILDABLE:
+                # 仅恢复 schema,数据由系统重建
+                tables[table_name] = []
+            elif policy is BackupPolicy.NO_EXPORT_PLAINTEXT:
+                # 恢复 schema,但 secret 字段保持初始值(强制用户重新设置)
+                tables[table_name] = []
+            # MUST_RESTORE: 完整恢复(无操作)
+
+        return data
+
+    # ─── R42 P1-9: backup_history 状态管理 ──────────────────────
+
+    async def _append_backup_history_completed(
+        self, backup_id: str, manifest: dict,
+    ) -> None:
+        """R42 P1-9: 写入 backup_history(status='completed', complete_marker_exists=True)。
+
+        备份 COMPLETE marker 上传成功后调用此方法,记录到 kv_store.backup_history。
+        get_last_successful_backup() 据此判断 RPO 合规状态。
+
+        Args:
+            backup_id: 备份 ID
+            manifest: create_backup 返回的 manifest dict
+        """
+        try:
+            store = self._get_cache_store()
+            record = {
+                "backup_id": backup_id,
+                "created_at": manifest.get("created_at", _utcnow_iso()),
+                "completed_at": _utcnow_iso(),
+                "size": manifest.get("ciphertext_size_bytes", 0),
+                "encrypted": manifest.get("encryption", {}).get("encrypted", False),
+                "key_id": manifest.get("encryption", {}).get("key_id", ""),
+                "checksum": manifest.get("ciphertext_sha256", ""),
+                "status": "completed",
+                "complete_marker_exists": True,
+                "backup_type": manifest.get("backup_type", "full"),
+                "tables": manifest.get("total_tables", 0),
+                "total_rows": manifest.get("total_rows", 0),
+            }
+            # 读取现有 history(JSON list)
+            raw = await store.get_kv("backup_history")
+            history = json.loads(raw) if raw else []
+            if not isinstance(history, list):
+                history = []
+            history.append(record)
+            # 限制最多 200 条
+            if len(history) > 200:
+                history = history[-200:]
+            await store.set_kv(
+                "backup_history",
+                json.dumps(history, ensure_ascii=False, default=str),
+            )
+        except Exception as e:
+            logger.warning(f"[BackupEngine] _append_backup_history_completed 失败: {e}")
+
+    async def get_last_successful_backup(self) -> dict | None:
+        """R42 P1-9: 查询最近一次成功备份的记录。
+
+        成功备份定义:
+            - backup_history 中 status='completed'
+            - complete_marker_exists=True
+            - COMPLETE marker 在 R2 中真实存在(防 backup_history 与 R2 不一致)
+
+        若无符合条件的备份,返回 None(表示无成功备份,RPO 不合规)。
+
+        Returns:
+            备份记录 dict({backup_id, created_at, completed_at, ...});
+            无成功备份时返回 None
+        """
+        try:
+            store = self._get_cache_store()
+            raw = await store.get_kv("backup_history")
+            if not raw:
+                return None
+            history = json.loads(raw)
+            if not isinstance(history, list):
+                return None
+            # 过滤出 status='completed' 且 complete_marker_exists=True 的记录
+            candidates = [
+                r for r in history
+                if isinstance(r, dict)
+                and r.get("status") == "completed"
+                and r.get("complete_marker_exists", False) is True
+            ]
+            if not candidates:
+                return None
+            # 按 completed_at 倒序取最新
+            candidates.sort(
+                key=lambda r: r.get("completed_at", ""),
+                reverse=True,
+            )
+            latest = candidates[0]
+            # 二次校验:COMPLETE marker 是否真实存在于 R2
+            backup_id = latest.get("backup_id", "")
+            if backup_id:
+                storage = self._get_storage()
+                complete_key = f"{BACKUPS_PREFIX}{backup_id}{COMPLETE_SUFFIX}"
+                try:
+                    await storage.download(complete_key)
+                except Exception as e:
+                    logger.warning(
+                        f"[BackupEngine] R42 P1-9: backup_history 显示已完成但 "
+                        f"COMPLETE marker 不存在 backup_id={backup_id}: {e}"
+                    )
+                    # marker 丢失 → 视为未完成
+                    return None
+            return latest
+        except Exception as e:
+            logger.warning(f"[BackupEngine] get_last_successful_backup 失败: {e}")
+            return None
 
     async def _verify_objects_exist(self, storage, *keys: str) -> None:
         """HEAD 校验多个对象存在(通过 list_objects 前缀过滤避免误判 download 异常)。"""
@@ -410,23 +659,39 @@ class BackupEngine:
         backup_id: str,
         target: str = "staging",
         approver_id: int = 0,
+        approval_action_id: str | None = None,
     ) -> dict:
-        """从 R2 备份恢复数据(可解密)。
+        """从 R2 备份恢复数据(可解密)— 公共 API。
+
+        R42 P1-3 强化:
+            - target="production" 时 approval_action_id 必填,否则抛 ValueError
+            - approval_action_id 必须在 command_executions 表中 status='executed'
+            - approver_id 必须与 command_executions.principal_id 一致
+            - 公共 API 不直接执行恢复,必须经过审批验证后调用 _restore_internal()
+
+        R42 P1-2 强化:
+            - 校验 COMPLETE marker 存在才执行恢复(防止恢复未完成的孤儿备份)
 
         流程:
-            1. 下载 manifest → 校验 schema_version / backup_id
-            2. 下载 ciphertext → 计算 ciphertext_sha256 → 与 manifest 对比
-            3. 解密 → 计算 plaintext_sha256 → 与 manifest 对比
-            4. 写入隔离环境(target="staging" 时仅校验,不覆盖生产)
-            5. 生产恢复必须 approver_id 非零(由 CommandBus 审批门禁保证)
+            1. 校验 backup_id 非空
+            2. 若 target="production":校验 approval_action_id + 审批状态
+            3. 校验 COMPLETE marker 存在
+            4. 调用 _restore_internal() 执行实际恢复
 
         Args:
             backup_id: 备份 ID
-            target: "staging" 仅校验可解密;"production" 写入生产(需 approver_id != 0)
-            approver_id: 审批人 ID(生产恢复时必填)
+            target: "staging" 仅校验可解密;"production" 写入生产(需审批);
+                    "test" 仅校验,不写库
+            approver_id: 审批人 ID(production 恢复时必填)
+            approval_action_id: 审批动作 ID(production 恢复时必填,
+                                对应 command_executions.action_id)
 
         Returns:
             {success, restored_tables, restored_rows, checksum_verified, error}
+
+        Raises:
+            ValueError: target="production" 且 approval_action_id 为空
+            PermissionError: approval_action_id 不存在 / 未审批 / approver_id 不匹配
         """
         if not backup_id:
             return {
@@ -434,14 +699,134 @@ class BackupEngine:
                 "checksum_verified": False, "error": "backup_id 为空",
             }
 
-        # 生产恢复必须审批
-        if target == "production" and not approver_id:
+        # R42 P1-3: production 恢复必须经过审批验证
+        if target == "production":
+            if not approval_action_id:
+                # 公共 API 拒绝直接执行 production restore
+                raise ValueError(
+                    "Production restore requires approval_action_id"
+                )
+            # 校验审批状态
+            await self._validate_production_approval(
+                approver_id, approval_action_id,
+            )
+
+        # R42 P1-2: 校验 COMPLETE marker 存在才执行恢复
+        storage = self._get_storage()
+        complete_key = f"{BACKUPS_PREFIX}{backup_id}{COMPLETE_SUFFIX}"
+        try:
+            await storage.download(complete_key)
+        except Exception as e:
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
-                "error": "生产恢复必须 approver_id 非零(需通过审批)",
+                "error": (
+                    f"COMPLETE marker 缺失,无法恢复(backup_id={backup_id}): {e}"
+                ),
             }
 
+        # 通过审批验证 + COMPLETE 校验后,调用内部恢复方法
+        return await self._restore_internal(
+            backup_id, target=target,
+            approver_id=approver_id,
+            approval_action_id=approval_action_id,
+        )
+
+    async def _validate_production_approval(
+        self,
+        approver_id: int,
+        approval_action_id: str,
+    ) -> None:
+        """R42 P1-3: 校验生产恢复审批状态。
+
+        校验逻辑:
+            1. approval_action_id 必须在 command_executions 表中存在
+            2. status 必须为 'executed'(已审批通过)
+            3. approver_id 必须与 command_executions.principal_id 一致
+
+        注:command_executions.principal_id 是创建审批的 admin principal ID
+        (即"审批 owner"),与"approver_id"(执行恢复的人)应一致。
+        command_executions.owner 字段是 worker 名(lease 持有者),不参与校验。
+
+        Args:
+            approver_id: 调用方传入的审批人 ID
+            approval_action_id: 审批动作 ID
+
+        Raises:
+            PermissionError: approval_action_id 不存在 / status != 'executed' /
+                             approver_id 不匹配 principal_id
+        """
+        store = self._get_cache_store()
+        if not hasattr(store, "_db") or not store._db:
+            # CacheStore 不可用,无法校验审批 → fail-closed
+            raise PermissionError(
+                f"R42 P1-3: CacheStore 不可用,无法校验审批状态 "
+                f"(approval_action_id={approval_action_id})"
+            )
+
+        try:
+            cursor = await store._db.execute(
+                "SELECT principal_id, status FROM command_executions "
+                "WHERE action_id = ? LIMIT 1",
+                (approval_action_id,),
+            )
+            row = await cursor.fetchone()
+        except Exception as e:
+            # 查询失败 → fail-closed(不允许恢复)
+            raise PermissionError(
+                f"R42 P1-3: 查询 command_executions 失败 "
+                f"(approval_action_id={approval_action_id}): {e}"
+            ) from e
+
+        if not row:
+            raise PermissionError(
+                f"R42 P1-3: approval_action_id 不存在 "
+                f"(approval_action_id={approval_action_id})"
+            )
+
+        principal_id, status = row[0], row[1]
+
+        # status 必须为 'executed'(已审批通过)
+        if status != "executed":
+            raise PermissionError(
+                f"R42 P1-3: approval_action_id 状态非 executed "
+                f"(approval_action_id={approval_action_id}, status={status})"
+            )
+
+        # approver_id 必须与 principal_id 一致
+        # (principal_id 是创建审批的 admin principal,即审批 owner)
+        try:
+            principal_id_int = int(principal_id) if principal_id is not None else 0
+        except (TypeError, ValueError):
+            principal_id_int = 0
+
+        if approver_id != principal_id_int:
+            raise PermissionError(
+                f"R42 P1-3: approver_id 与 command_executions.principal_id 不一致 "
+                f"(approver_id={approver_id}, principal_id={principal_id_int})"
+            )
+
+        # 校验通过 → 不抛异常,继续执行恢复
+
+    async def _restore_internal(
+        self,
+        backup_id: str,
+        target: str = "staging",
+        approver_id: int = 0,
+        approval_action_id: str | None = None,
+    ) -> dict:
+        """R42 P1-3: 内部恢复逻辑(私有,由 restore() 在审批验证后调用)。
+
+        流程:
+            1. 下载 manifest → 校验 schema_version / backup_id
+            2. 下载 ciphertext → 计算 ciphertext_sha256 → 与 manifest 对比
+            3. 解密 → 计算 plaintext_sha256 → 与 manifest 对比
+            4. R42 P1-7: 根据 backup_policy 决定恢复策略
+            5. 写入隔离环境(target="staging" 时仅校验,不覆盖生产)
+
+        注意:本方法为私有方法,不应被外部直接调用。
+        外部调用方应使用 ``restore()`` 公共 API,经过审批验证后才会调用本方法。
+        """
         storage = self._get_storage()
         payload_key = f"{BACKUPS_PREFIX}{backup_id}{PAYLOAD_SUFFIX}"
         manifest_key = f"{BACKUPS_PREFIX}{backup_id}{MANIFEST_SUFFIX}"
@@ -566,9 +951,15 @@ class BackupEngine:
                 "error": f"解析 plaintext JSON 失败: {e}",
             }
 
+        # R42 P1-7: 根据 backup_policy 决定恢复策略(过滤/脱敏)
+        data = self._apply_restore_policy(data)
+
         tables = data.get("tables", {})
         restored_tables = len(tables)
-        restored_rows = sum(len(rows) for rows in tables.values())
+        restored_rows = sum(
+            len(rows) if isinstance(rows, list) else 0
+            for rows in tables.values()
+        )
 
         # 5. 写入隔离环境(staging 模式仅校验,不写库;production 委托 db_restore)
         if target == "production":
@@ -592,4 +983,252 @@ class BackupEngine:
             "restored_rows": restored_rows,
             "checksum_verified": True,
             "error": "",
+        }
+
+    # ─── R42 P1-2: 跨对象原子提交 + 孤儿 GC ─────────────────────
+
+    async def cleanup_orphans(self, timeout_seconds: int = 3600) -> dict:
+        """R42 P1-2: 清理孤儿对象(payload/manifest 已上传但 COMPLETE marker 缺失)。
+
+        场景:备份过程中 manifest 上传成功后 COMPLETE marker 上传失败,
+        导致 payload + manifest 已存在于 R2 但 COMPLETE marker 缺失。
+        这些对象属于"孤儿",需要周期性清理以免占用 R2 存储。
+
+        策略:
+            1. list_objects 列出 BACKUPS_PREFIX 下所有对象
+            2. 按 backup_id 聚合 payload/manifest/COMPLETE 三件套
+            3. 对每个 backup_id:
+               - 若 COMPLETE marker 存在 → 跳过(完整备份)
+               - 若 COMPLETE marker 缺失但 manifest 存在 → 检查创建时间,
+                 超过 timeout_seconds 才删除(防止正在进行的备份被误删)
+               - 若仅有 payload 无 manifest → 直接删除(明显失败)
+            4. 写 audit_log 记录清理操作
+
+        Args:
+            timeout_seconds: 孤儿对象存活时间阈值(秒),默认 3600(1 小时)
+
+        Returns:
+            {
+                "scanned": int,    # 扫描的 backup_id 总数
+                "deleted": int,    # 已删除的孤儿对象数(payload + manifest + marker)
+                "errors": int,     # 删除失败的对象数
+                "details": str,    # 文本摘要
+            }
+        """
+        import time as _time
+
+        storage = self._get_storage()
+        scanned = 0
+        deleted = 0
+        errors = 0
+        now_ts = _time.time()
+
+        try:
+            objects = await storage.list_objects(prefix=BACKUPS_PREFIX, max_keys=1000)
+        except Exception as e:
+            logger.error(f"[BackupEngine] cleanup_orphans list_objects 失败: {e}")
+            return {
+                "scanned": 0, "deleted": 0, "errors": 0,
+                "details": f"list_objects 失败: {e}",
+            }
+
+        # 按 backup_id 聚合对象
+        backup_objects: dict[str, dict[str, str]] = {}
+        for obj in objects:
+            key = obj.get("key", "")
+            if not key.startswith(BACKUPS_PREFIX):
+                continue
+            # 解析 backup_id 与对象类型
+            suffix = ""
+            if key.endswith(PAYLOAD_SUFFIX):
+                suffix = "payload"
+            elif key.endswith(MANIFEST_SUFFIX):
+                suffix = "manifest"
+            elif key.endswith(COMPLETE_SUFFIX):
+                suffix = "complete"
+            else:
+                continue
+            # 提取 backup_id(去掉前缀和后缀)
+            if suffix == "payload":
+                bid = key[len(BACKUPS_PREFIX):-len(PAYLOAD_SUFFIX)]
+            elif suffix == "manifest":
+                bid = key[len(BACKUPS_PREFIX):-len(MANIFEST_SUFFIX)]
+            else:
+                bid = key[len(BACKUPS_PREFIX):-len(COMPLETE_SUFFIX)]
+            if not bid:
+                continue
+            backup_objects.setdefault(bid, {})[suffix] = key
+            # 记录 last_modified 用于判断超时
+            lm_str = obj.get("last_modified", "")
+            try:
+                # 尝试解析 ISO 8601 时间戳
+                lm_dt = _dt.datetime.fromisoformat(
+                    lm_str.replace("Z", "+00:00")
+                ) if lm_str else None
+                if lm_dt:
+                    backup_objects[bid]["last_modified_ts"] = (
+                        lm_dt.timestamp()
+                    )
+            except (ValueError, TypeError):
+                pass
+
+        scanned = len(backup_objects)
+
+        # 逐个检查并清理孤儿
+        for bid, parts in backup_objects.items():
+            has_complete = "complete" in parts
+            has_manifest = "manifest" in parts
+            has_payload = "payload" in parts
+
+            if has_complete:
+                # 完整备份,跳过
+                continue
+
+            # 孤儿对象 — 检查是否超时
+            last_ts = parts.get("last_modified_ts", 0.0)
+            age_seconds = now_ts - last_ts if last_ts else 0
+
+            # last_modified 缺失时也尝试清理(可能元数据丢失)
+            should_delete = (age_seconds >= timeout_seconds) or (last_ts == 0.0)
+
+            if not should_delete:
+                # 未超时,跳过(可能正在备份中)
+                continue
+
+            # 删除孤儿对象
+            for part_name in ("payload", "manifest"):
+                obj_key = parts.get(part_name)
+                if not obj_key:
+                    continue
+                try:
+                    await storage.delete(obj_key)
+                    deleted += 1
+                    logger.info(
+                        f"[BackupEngine] cleanup_orphans 删除孤儿对象 "
+                        f"backup_id={bid} part={part_name} key={obj_key} "
+                        f"age={age_seconds:.0f}s"
+                    )
+                except Exception as e:
+                    errors += 1
+                    logger.warning(
+                        f"[BackupEngine] cleanup_orphans 删除失败 "
+                        f"key={obj_key}: {e}"
+                    )
+
+        # 写 audit_log(尝试,失败不阻塞)
+        try:
+            await self._write_cleanup_audit_log(scanned, deleted, errors)
+        except Exception as e:
+            logger.debug(f"[BackupEngine] cleanup_orphans audit_log 写入失败: {e}")
+
+        details = (
+            f"扫描 {scanned} 个 backup_id,删除 {deleted} 个孤儿对象,"
+            f"{errors} 个删除失败"
+        )
+        logger.info(f"[BackupEngine] cleanup_orphans 完成: {details}")
+        return {
+            "scanned": scanned,
+            "deleted": deleted,
+            "errors": errors,
+            "details": details,
+        }
+
+    async def _write_cleanup_audit_log(
+        self, scanned: int, deleted: int, errors: int,
+    ) -> None:
+        """R42 P1-2: 写 audit_log 记录 cleanup_orphans 操作。
+
+        audit_log 表由 SQLite cache_store 维护,记录管理员/系统的关键操作。
+        cleanup_orphans 是后台维护操作,需记录以便审计追溯。
+        """
+        try:
+            store = self._get_cache_store()
+            # 尝试写入 audit_log 表(若表不存在则降级到 kv_store)
+            try:
+                if hasattr(store, "_db") and store._db:
+                    cursor = await store._db.execute(
+                        "INSERT INTO audit_log "
+                        "(actor_id, actor_type, action, target_type, "
+                        " target_id, details, ip_addr, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            0,  # actor_id=0 表示系统
+                            "system",
+                            "backup_gc_cleanup_orphans",
+                            "backup_orphans",
+                            "",
+                            f"scanned={scanned}, deleted={deleted}, errors={errors}",
+                            "",
+                            _utcnow_iso(),
+                        ),
+                    )
+                    await store._db.commit()
+            except Exception:
+                # audit_log 表可能不存在,降级到 kv_store
+                log_entry = {
+                    "action": "backup_gc_cleanup_orphans",
+                    "scanned": scanned,
+                    "deleted": deleted,
+                    "errors": errors,
+                    "timestamp": _utcnow_iso(),
+                }
+                # 追加到 kv_store.backup_gc_audit_log
+                raw = await store.get_kv("backup_gc_audit_log")
+                log_list = []
+                if raw:
+                    try:
+                        log_list = json.loads(raw)
+                        if not isinstance(log_list, list):
+                            log_list = []
+                    except (ValueError, TypeError):
+                        log_list = []
+                log_list.append(log_entry)
+                # 限制 200 条
+                if len(log_list) > 200:
+                    log_list = log_list[-200:]
+                await store.set_kv(
+                    "backup_gc_audit_log",
+                    json.dumps(log_list, ensure_ascii=False, default=str),
+                )
+        except Exception as e:
+            logger.debug(f"[BackupEngine] _write_cleanup_audit_log 失败: {e}")
+
+    async def enable_object_lock(
+        self, bucket_name: str, retention_days: int = 30,
+    ) -> dict:
+        """R42 P1-2: 启用 R2 对象锁定(Object Lock)— 占位实现。
+
+        Object Lock 是 R2/S3 的 WORM(Write Once Read Many)功能,
+        可防止备份对象在 retention 期内被删除/覆盖,符合合规要求。
+
+        占位说明:
+            真正的 Object Lock 配置需要通过 R2 控制台或 Admin API 启用,
+            且必须在 bucket 创建时启用(无法事后启用)。
+            本方法仅返回当前配置状态,实际配置由运维通过 R2 控制台完成。
+
+        Args:
+            bucket_name: R2 bucket 名称
+            retention_days: 保留天数(默认 30 天)
+
+        Returns:
+            {
+                "enabled": bool,         # 是否已启用(本占位始终返回 False)
+                "bucket_name": str,      # bucket 名称
+                "retention_days": int,   # 保留天数
+                "details": str,          # 详细说明
+            }
+        """
+        logger.info(
+            f"[BackupEngine] enable_object_lock 占位调用 "
+            f"bucket={bucket_name} retention={retention_days}d "
+            f"(实际配置需通过 R2 控制台)"
+        )
+        return {
+            "enabled": False,
+            "bucket_name": bucket_name,
+            "retention_days": retention_days,
+            "details": (
+                "Object Lock 占位:实际配置需通过 R2 控制台在 bucket 创建时启用。"
+                "本方法仅作为代码层提醒,确保备份设计考虑 Object Lock 合规要求。"
+            ),
         }

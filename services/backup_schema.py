@@ -11,6 +11,15 @@ R35 Batch 3 P1-5/P1-6 修复:
 - 新增 get_tables_by_source() 按 source 分组查询。
 - 新增 validate_schema() 供 CI 比较 DDL 与 BACKUP_SCHEMA。
 
+R42 P1-7 新增:
+- BackupPolicy 枚举:逐表定义 backup/restore 策略
+  * MUST_RESTORE         — 必须完整备份与恢复(RBAC/Approval/Audit/Maintenance/Ban/Collections)
+  * REBUILDABLE          — 可重建,仅备份 schema 不备份数据(Task/Notification/KV)
+  * NO_EXPORT_PLAINTEXT  — 仅备份 schema,数据用 <<REDACTED>> 占位(MFA/Session secret)
+  * LOCAL_ONLY           — 不备份,纯本地状态(瞬时缓存)
+- BACKUP_POLICY 字典:每张表的 backup_policy 声明
+- get_backup_policy / is_must_restore / is_rebuildable / is_no_export 函数
+
 变更检查清单:
 1. 新增表时,在此模块的 BACKUP_SCHEMA 字典中添加条目
 2. db_backup.py 和 db_restore.py 无需修改(自动从 BACKUP_SCHEMA 生成)
@@ -18,6 +27,33 @@ R35 Batch 3 P1-5/P1-6 修复:
 """
 
 from dataclasses import dataclass
+from enum import Enum
+
+
+class BackupPolicy(str, Enum):
+    """R42 P1-7: 表级 backup/restore 策略枚举。
+
+    继承 str + Enum 使其可直接作为字符串比较(如 policy == "MUST_RESTORE"),
+    便于在 SQL / 日志 / 序列化场景使用。
+
+    取值:
+        MUST_RESTORE         — 必须完整备份与恢复(RBAC/Approval/Audit 等核心业务表)
+        REBUILDABLE          — 可重建,仅备份 schema 不备份数据(Task projection/Notification cache)
+        NO_EXPORT_PLAINTEXT  — 仅备份 schema,数据用 <<REDACTED>> 占位(MFA/session secret)
+        LOCAL_ONLY           — 不备份,纯本地状态(瞬时缓存/心跳)
+    """
+
+    MUST_RESTORE = "must_restore"
+    """必须完整备份与恢复:核心业务数据,丢失会导致数据损坏。"""
+
+    REBUILDABLE = "rebuildable"
+    """可重建:仅备份 schema,数据由系统运行时重建(如任务投影、通知缓存)。"""
+
+    NO_EXPORT_PLAINTEXT = "no_export_plaintext"
+    """不得导出明文:仅备份 schema,数据用 <<REDACTED>> 占位(MFA/session secret)。"""
+
+    LOCAL_ONLY = "local_only"
+    """纯本地:不备份,瞬时状态(心跳/缓存)。"""
 
 
 @dataclass(frozen=True)
@@ -738,6 +774,192 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         note="中继任务池(relay_sqlite;持久化中继代发任务;主键 spool_id 自增)",
     ),
 }
+
+
+# ════════════════════════════════════════════════════════════════
+#  R42 P1-7: 逐表 Backup/Restore Policy 声明
+# ════════════════════════════════════════════════════════════════
+#
+# 设计原则:
+#   - MUST_RESTORE         核心业务数据(RBAC/Approval/Audit/Maintenance/Ban/Collections):
+#                          丢失会破坏系统完整性,必须完整备份与恢复
+#   - REBUILDABLE          可重建数据(Task projection/Notification cache):
+#                          schema 备份,数据由系统运行时重建(避免备份大量瞬时数据)
+#   - NO_EXPORT_PLAINTEXT  敏感数据(MFA secret/Session secret/Password hash):
+#                          schema 备份,数据用 <<REDACTED>> 占位
+#                          恢复时保持初始值,强制用户重新设置(防止明文泄漏)
+#   - LOCAL_ONLY           瞬时状态(心跳/缓存/计数器):不备份
+#
+# 与 TABLE_REPLICATION_POLICY(replication_policy.py)协调:
+#   - NO_EXPORT_PLAINTEXT 的表不能是 CRDB 同步表(避免明文跨节点复制)
+#   - LOCAL_ONLY 的表可以与 ReplicationPolicy.LOCAL_ONLY 重合
+BACKUP_POLICY: dict[str, "BackupPolicy"] = {
+    # ── MUST_RESTORE:核心业务表(完整备份与恢复)──
+    # 用户/取件码/文件(权威业务数据)
+    "users": BackupPolicy.MUST_RESTORE,
+    "users_local": BackupPolicy.MUST_RESTORE,
+    "file_records": BackupPolicy.MUST_RESTORE,
+    "file_records_local": BackupPolicy.MUST_RESTORE,
+    "codes": BackupPolicy.MUST_RESTORE,
+    "codes_local": BackupPolicy.MUST_RESTORE,
+    # 频道/槽位/轮转(拓扑核心)
+    "cells": BackupPolicy.MUST_RESTORE,
+    "cells_local": BackupPolicy.MUST_RESTORE,
+    "spare_pool": BackupPolicy.MUST_RESTORE,
+    "backup_config": BackupPolicy.MUST_RESTORE,
+    "rotation_config": BackupPolicy.MUST_RESTORE,
+    "code_bot_mapping": BackupPolicy.MUST_RESTORE,
+    "external_code_mapping": BackupPolicy.MUST_RESTORE,
+    "external_code_mapping_local": BackupPolicy.MUST_RESTORE,
+    "kv_config": BackupPolicy.MUST_RESTORE,
+    "message_backups": BackupPolicy.MUST_RESTORE,
+    "relay_accounts": BackupPolicy.MUST_RESTORE,
+    "mapped_codes": BackupPolicy.MUST_RESTORE,
+    "relay_spool": BackupPolicy.MUST_RESTORE,
+    # RBAC(权限核心)
+    "rbac_roles": BackupPolicy.MUST_RESTORE,
+    "rbac_user_roles": BackupPolicy.MUST_RESTORE,
+    # 审批/命令(管理面核心)
+    "approvals": BackupPolicy.MUST_RESTORE,
+    "command_outbox": BackupPolicy.MUST_RESTORE,
+    "command_executions": BackupPolicy.MUST_RESTORE,
+    # 审计/封禁/维护(合规核心)
+    "audit_log": BackupPolicy.MUST_RESTORE,
+    "maintenance_state": BackupPolicy.MUST_RESTORE,
+    "content_reports": BackupPolicy.MUST_RESTORE,
+    "ban_state": BackupPolicy.MUST_RESTORE,
+    # 文件集合(用户数据)
+    "collections": BackupPolicy.MUST_RESTORE,
+    "collection_items": BackupPolicy.MUST_RESTORE,
+    # 配额预留(业务事务)
+    "quota_reservations": BackupPolicy.MUST_RESTORE,
+    "quota_ledger": BackupPolicy.MUST_RESTORE,
+    "delivery_receipts": BackupPolicy.MUST_RESTORE,
+    "replication_tasks": BackupPolicy.MUST_RESTORE,
+    # 副本元数据
+    "manifest": BackupPolicy.MUST_RESTORE,
+    "writer_inbox": BackupPolicy.MUST_RESTORE,
+    "upload_sessions": BackupPolicy.MUST_RESTORE,
+    "upload_outbox": BackupPolicy.MUST_RESTORE,
+    # 死信队列(审计需要)
+    "dlq_records": BackupPolicy.MUST_RESTORE,
+    "admin_access_log": BackupPolicy.MUST_RESTORE,
+
+    # ── REBUILDABLE:可重建数据(仅备份 schema)──
+    "tasks": BackupPolicy.REBUILDABLE,                # 任务投影,可由 outbox 重建
+    "notifications": BackupPolicy.REBUILDABLE,        # 通知缓存,可由 outbox 重建
+    "task_progress": BackupPolicy.REBUILDABLE,         # 任务进度(预留)
+    "kv_store": BackupPolicy.REBUILDABLE,              # KV 缓存,可由业务重建
+    "user_quota": BackupPolicy.REBUILDABLE,            # 用户配额,可由 CRDB 重建
+    "pending_file_codes": BackupPolicy.REBUILDABLE,    # 待发送文件码,瞬时状态
+    "cache_backup": BackupPolicy.REBUILDABLE,          # 内存缓存持久化
+    "counter_snapshot": BackupPolicy.REBUILDABLE,       # 计数器快照
+    "ttl_cache": BackupPolicy.REBUILDABLE,              # TTL 缓存
+
+    # ── NO_EXPORT_PLAINTEXT:敏感数据(schema 备份,数据 <<REDACTED>>)──
+    "mfa_secrets": BackupPolicy.NO_EXPORT_PLAINTEXT,         # MFA TOTP 密钥
+    "sessions": BackupPolicy.NO_EXPORT_PLAINTEXT,            # 服务端 session 令牌
+    "admin_password_hashes": BackupPolicy.NO_EXPORT_PLAINTEXT,  # 管理员密码哈希
+
+    # ── LOCAL_ONLY:瞬时状态,不备份 ──
+    "heartbeat_local": BackupPolicy.LOCAL_ONLY,        # 心跳本地表(瞬时)
+    "bot_heartbeat": BackupPolicy.LOCAL_ONLY,           # Bot 心跳(瞬时)
+    "decode_logs": BackupPolicy.LOCAL_ONLY,             # 解码日志(短期流水)
+    "jobs": BackupPolicy.LOCAL_ONLY,                    # 异步任务(短期流水)
+    "rotate_log": BackupPolicy.LOCAL_ONLY,              # 轮转审计日志(流水)
+    "pending_uploads": BackupPolicy.LOCAL_ONLY,         # 待上传队列(瞬时)
+}
+
+
+# R42 P1-7: 默认 backup_policy — 未在 BACKUP_POLICY 中声明的表
+# 默认 LOCAL_ONLY(fail-closed,避免误备份未知/拼写错误的表)
+_DEFAULT_BACKUP_POLICY: "BackupPolicy" = BackupPolicy.LOCAL_ONLY
+
+
+def get_backup_policy(table_name: str) -> "BackupPolicy":
+    """R42 P1-7: 查询表的 backup/restore policy。
+
+    未声明的表返回 LOCAL_ONLY(fail-closed,避免误备份未知表)。
+
+    Args:
+        table_name: 逻辑表名(与 BACKUP_SCHEMA 对齐)
+
+    Returns:
+        BackupPolicy 枚举(MUST_RESTORE / REBUILDABLE / NO_EXPORT_PLAINTEXT / LOCAL_ONLY)
+    """
+    return BACKUP_POLICY.get(table_name, _DEFAULT_BACKUP_POLICY)
+
+
+def is_must_restore(table_name: str) -> bool:
+    """R42 P1-7: 判断表是否为 MUST_RESTORE 策略。
+
+    MUST_RESTORE 表必须完整备份与恢复,丢失会导致数据损坏。
+
+    Args:
+        table_name: 逻辑表名
+
+    Returns:
+        True 若该表必须完整备份与恢复
+    """
+    return get_backup_policy(table_name) is BackupPolicy.MUST_RESTORE
+
+
+def is_rebuildable(table_name: str) -> bool:
+    """R42 P1-7: 判断表是否为 REBUILDABLE 策略。
+
+    REBUILDABLE 表仅备份 schema,数据由系统运行时重建。
+
+    Args:
+        table_name: 逻辑表名
+
+    Returns:
+        True 若该表可重建(仅备份 schema)
+    """
+    return get_backup_policy(table_name) is BackupPolicy.REBUILDABLE
+
+
+def is_no_export(table_name: str) -> bool:
+    """R42 P1-7: 判断表是否为 NO_EXPORT_PLAINTEXT 策略。
+
+    NO_EXPORT_PLAINTEXT 表仅备份 schema,数据用 <<REDACTED>> 占位。
+    恢复时保持初始值,强制用户重新设置(防止明文泄漏)。
+
+    Args:
+        table_name: 逻辑表名
+
+    Returns:
+        True 若该表不得导出明文
+    """
+    return get_backup_policy(table_name) is BackupPolicy.NO_EXPORT_PLAINTEXT
+
+
+def is_local_only_backup(table_name: str) -> bool:
+    """R42 P1-7: 判断表是否为 LOCAL_ONLY backup 策略。
+
+    LOCAL_ONLY 表不参与备份,纯本地瞬时状态。
+
+    Args:
+        table_name: 逻辑表名
+
+    Returns:
+        True 若该表不备份
+    """
+    return get_backup_policy(table_name) is BackupPolicy.LOCAL_ONLY
+
+
+def get_tables_by_backup_policy(policy: "BackupPolicy") -> list[str]:
+    """R42 P1-7: 返回指定 policy 的所有表名列表(用于按 policy 分组备份/恢复)。
+
+    Args:
+        policy: BackupPolicy 枚举值
+
+    Returns:
+        该 policy 下所有显式声明的表名列表(不含默认 LOCAL_ONLY 的表)
+    """
+    return [
+        table for table, p in BACKUP_POLICY.items()
+        if p is policy
+    ]
 
 
 # ─── 向后兼容: 旧备份可能包含的列(不属于任何特定表) ───
