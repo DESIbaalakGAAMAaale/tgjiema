@@ -146,28 +146,52 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_auth_required
 async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """R41 P1-8: /ban 快捷命令 — 走 CommandBus 强制 RBAC + 审批门禁。
+
+    复用 make_ban_user_command(永久封禁),与 /ban_user 命令逻辑一致。
+    """
     args = context.args
     if not args:
-        await update.message.reply_text("用法:/ban <用户ID>")
+        await update.message.reply_text("用法:/ban <用户ID> [原因]")
         return
     try:
         user_id = int(args[0])
     except ValueError:
         await update.message.reply_text("❌ 用户ID必须是数字")
         return
+    reason = args[1] if len(args) > 1 else ""
 
-    users_col = get_users_col()
-    await _ensure_user(user_id)
-    await users_col.update_one(
-        {"user_id": user_id},
-        {"$set": {"is_banned": True, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_ban_user_command,
     )
-    await update_user_and_invalidate(user_id)
-    await update.message.reply_text(f"✅ 用户 {user_id} 已封禁")
+    admin = update.effective_user
+    admin_id = admin.id if admin else 0
+    admin_name = admin.username if admin else ""
+    cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+    command = make_ban_user_command(
+        user_id=user_id, reason=reason, duration_days=0,
+    )
+    bus = CommandBus()
+    cb_result = await bus.execute(command, cb_principal)
+
+    if cb_result.approval_required:
+        await update.message.reply_text(
+            f"⏳ 封禁请求已提交审批\n审批 ID: {cb_result.approval_id}\n"
+            f"用户: {user_id}\n审批通过后自动执行。"
+        )
+    elif cb_result.success:
+        ok = cb_result.data.get("ban_ok", False) if cb_result.data else False
+        if ok:
+            await update.message.reply_text(f"✅ 用户 {user_id} 已封禁(永久)")
+        else:
+            await update.message.reply_text("❌ 封禁失败,请稍后重试")
+    else:
+        await update.message.reply_text(f"❌ 封禁失败: {cb_result.error}")
 
 
 @_auth_required
 async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """R41 P1-8: /unban 快捷命令 — 走 CommandBus 强制 RBAC(不需审批)。"""
     args = context.args
     if not args:
         await update.message.reply_text("用法:/unban <用户ID>")
@@ -178,14 +202,25 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ 用户ID必须是数字")
         return
 
-    users_col = get_users_col()
-    await _ensure_user(user_id)
-    await users_col.update_one(
-        {"user_id": user_id},
-        {"$set": {"is_banned": False, "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}},
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_unban_user_command,
     )
-    await update_user_and_invalidate(user_id)
-    await update.message.reply_text(f"✅ 用户 {user_id} 已解封")
+    admin = update.effective_user
+    admin_id = admin.id if admin else 0
+    admin_name = admin.username if admin else ""
+    cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+    command = make_unban_user_command(user_id=user_id)
+    bus = CommandBus()
+    cb_result = await bus.execute(command, cb_principal)
+
+    if cb_result.success:
+        ok = cb_result.data.get("unban_ok", False) if cb_result.data else False
+        if ok:
+            await update.message.reply_text(f"✅ 用户 {user_id} 已解封")
+        else:
+            await update.message.reply_text("❌ 解封失败,请稍后重试")
+    else:
+        await update.message.reply_text(f"❌ 解封失败: {cb_result.error}")
 
 
 @_auth_required
@@ -735,19 +770,44 @@ async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(args) < 3:
         await update.message.reply_text("用法:/set_r2 <账号ID> <AccessKey> <SecretKey> [桶名]")
         return
-    await set_config("r2_account_id", args[0])
-    await set_config("r2_access_key", args[1])
-    # P2-4: R2 Secret Key 比照 relay api_hash 做 Fernet 加密存储
-    from database.relay_db import encrypt as _encrypt_secret
-    await set_config("r2_secret_key", _encrypt_secret(args[2]))
-    if len(args) >= 4:
-        await set_config("r2_bucket", args[3])
 
-    # P1-13: 回显时掩码密钥,避免明文泄露到聊天记录
+    # R41 P1-8: R2 凭证变更属高风险操作,必须走 CommandBus(强制 RBAC + 审批门禁)
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_set_r2_command,
+    )
+    account_id = args[0]
+    access_key = args[1]
+    secret_key = args[2]
+    bucket = args[3] if len(args) >= 4 else ""
+
+    admin = update.effective_user
+    admin_id = admin.id if admin else 0
+    admin_name = admin.username if admin else ""
+    cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+    command = make_set_r2_command(
+        account_id=account_id, access_key=access_key,
+        secret_key=secret_key, bucket=bucket,
+    )
+    bus = CommandBus()
+    cb_result = await bus.execute(command, cb_principal)
+
+    if cb_result.approval_required:
+        await update.message.reply_text(
+            f"⏳ R2 凭证变更已提交审批\n审批 ID: {cb_result.approval_id}\n"
+            f"🔑 AccessKey: {_mask_secret(access_key)}\n"
+            f"🔒 SecretKey: {_mask_secret(secret_key)}\n"
+            "审批通过后自动写入配置,届时需重启服务生效。"
+        )
+        return
+    if not cb_result.success:
+        await update.message.reply_text(f"❌ R2 配置失败: {cb_result.error}")
+        return
+
+    # handler 已在审批通过后写入配置,此处仅回显
     await update.message.reply_text(
         "✅ R2 配置已保存\n"
-        f"🔑 AccessKey: {_mask_secret(args[1])}\n"
-        f"🔒 SecretKey: {_mask_secret(args[2])}\n"
+        f"🔑 AccessKey: {_mask_secret(access_key)}\n"
+        f"🔒 SecretKey: {_mask_secret(secret_key)}\n"
         "⚠️ 需重启服务后生效\n"
         "🔐 建议在配置完成后立即删除本聊天记录中的密钥信息。"
     )
@@ -818,6 +878,32 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/factory_reset confirm I_UNDERSTAND\n\n"
             "此操作不可撤销!所有用户数据、文件码、配置将被永久清空。\n"
             "频道消息需要手动删除。"
+        )
+        return
+
+    # R41 P1-8: 工厂重置属最高风险操作,必须走 CommandBus(强制 RBAC + 审批门禁)
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_factory_reset_command,
+    )
+    admin = update.effective_user
+    admin_id = admin.id if admin else 0
+    admin_name = admin.username if admin else ""
+    cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+    command = make_factory_reset_command(tables=_FACTORY_RESET_TABLES)
+    bus = CommandBus()
+    cb_result = await bus.execute(command, cb_principal)
+
+    if cb_result.approval_required:
+        await update.message.reply_text(
+            f"⏳ 工厂重置已提交审批\n审批 ID: {cb_result.approval_id}\n"
+            f"目标表: {', '.join(_FACTORY_RESET_TABLES)}\n"
+            "审批通过后自动执行,届时将清空 CRDB + 本地缓存 + 内存缓存。"
+        )
+        return
+    if not cb_result.success:
+        await update.message.reply_text(
+            f"❌ 工厂重置被拒绝: {cb_result.error}\n"
+            "请检查 RBAC 权限或审批状态。"
         )
         return
 

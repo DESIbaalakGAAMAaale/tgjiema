@@ -637,15 +637,29 @@ async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAU
         return
     file_code = parts[1]
 
-    files_col = get_file_records_col()
-    result = await files_col.update_one(
-        {"file_code": file_code},
-        {"$set": {"status": "deleted"}},
+    # R41 P1-8: 高风险操作必须走 CommandBus(强制 RBAC + 审计 + 幂等)
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_delete_file_command,
     )
-    if result.matched_count == 0:
-        await query.edit_message_text(f"❌ 文件码 {file_code} 不存在", reply_markup=back_kb)
+    cb_principal = CBPrincipal(id=user.id, name=user.username or "", source="bot")
+    command = make_delete_file_command(file_code=file_code)
+    bus = CommandBus()
+    cb_result = await bus.execute(command, cb_principal)
+
+    if cb_result.approval_required:
+        await query.edit_message_text(
+            f"⏳ 文件删除请求已提交审批\n审批 ID: {cb_result.approval_id}\n"
+            f"文件码: {file_code}\n审批通过后自动执行。",
+            reply_markup=back_kb,
+        )
         return
-    # 失效缓存
+    if not cb_result.success:
+        await query.edit_message_text(
+            f"❌ 删除失败: {cb_result.error}",
+            reply_markup=back_kb,
+        )
+        return
+    # 失效缓存(handler 已更新 CRDB,此处仅清进程内缓存)
     try:
         invalidate_file_record(file_code)
     except Exception:

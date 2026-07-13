@@ -129,11 +129,17 @@ class SessionManager:
         """
         self.ttl_seconds = max(60, int(ttl_seconds))
 
-    async def create_session(self, principal) -> str:
+    async def create_session(self, principal, mfa_verified: bool = True) -> str:
         """为登录的管理员创建 session。
+
+        R41 P1-2: 新增 mfa_verified 参数,记录 MFA 验证状态。
+        - MFA 未启用时:mfa_verified=True(无需 MFA)
+        - MFA 已启用并完成验证:mfa_verified=True
+        - MFA 已启用但未完成验证:不应调用此函数(应先走 /login/mfa)
 
         Args:
             principal: AdminPrincipal 对象(需有 id/username/roles 属性)
+            mfa_verified: MFA 是否已验证(默认 True,兼容旧调用方)
 
         Returns:
             session_id(43 字符 URL-safe base64);失败返回空字符串
@@ -156,6 +162,8 @@ class SessionManager:
             "created_at": now,
             "expires_at": expires_at_iso,
             "expires_at_ts": expires_at_ts,
+            # R41 P1-2: MFA 验证状态(MFA middleware 校验此字段)
+            "mfa_verified": bool(mfa_verified),
         }
         ok = await _save_session_data(session_id, data)
         if not ok:
@@ -199,6 +207,46 @@ class SessionManager:
         except (TypeError, ValueError) as e:
             logger.warning(f"[admin.sessions] session 数据损坏: {e}")
             return None
+
+    async def validate_or_raise(self, request) -> "AdminPrincipal":
+        """R41 P1-1: 从 Request 中提取 session_id 并验证,失败时抛 HTTPException(401)。
+
+        作为 async FastAPI 依赖使用:
+            @app.get("/users")
+            async def users_page(request: Request, admin=Depends(require_session)):
+                ...
+
+        与 validate_session 的区别:
+        - validate_session 返回 None 表示无效(调用方需自行处理)
+        - validate_or_raise 直接抛 HTTPException(401),适合作为 Depends 依赖
+
+        Args:
+            request: FastAPI Request 对象(从 cookie 读取 session_id)
+
+        Returns:
+            AdminPrincipal 对象(有效时)
+
+        Raises:
+            HTTPException: 401(无 session cookie / session 无效 / session 过期)
+        """
+        from fastapi import HTTPException
+        session_id = ""
+        if request is not None:
+            session_id = request.cookies.get("session_id", "")
+        if not session_id:
+            raise HTTPException(
+                status_code=401,
+                detail="未登录或会话已过期",
+                headers={"Location": "/login"},
+            )
+        principal = await self.validate_session(session_id)
+        if principal is None:
+            raise HTTPException(
+                status_code=401,
+                detail="会话无效或已过期,请重新登录",
+                headers={"Location": "/login"},
+            )
+        return principal
 
     async def destroy_session(self, session_id: str) -> None:
         """销毁 session(注销)。

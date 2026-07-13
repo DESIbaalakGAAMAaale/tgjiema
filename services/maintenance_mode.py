@@ -369,6 +369,106 @@ async def check_disable_preconditions() -> dict:
     return result
 
 
+# ─── R41 P1-7: 带授权的维护模式 API ────────────────────────────
+
+
+async def enable_with_reason(reason: str, principal_id: int) -> bool:
+    """R41 P1-7: 开启维护模式并记录启用原因和操作者。
+
+    在 enable() 基础上增加:
+    - 显式记录 principal_id 到 audit_log(actor_id)
+    - 记录启用原因到 maintenance_state.reason
+    - 操作者 ID 通过 started_by 字段持久化
+
+    Args:
+        reason: 维护原因(记入 audit_log.details + maintenance_state.reason)
+        principal_id: 操作者 admin_id(记入 audit_log.actor_id + maintenance_state.started_by)
+
+    Returns:
+        True 开启成功, False 失败
+    """
+    logger.info(
+        f"[Maintenance] enable_with_reason: reason={reason} "
+        f"principal_id={principal_id}"
+    )
+    # 调用 enable(),传递 principal_id 作为 started_by
+    ok = await enable(reason, started_by=principal_id)
+    if ok:
+        # 额外记录一条专门的 audit_log(标记为带授权的启用)
+        await _write_audit_log(
+            actor_id=principal_id,
+            action="enable_maintenance_with_reason",
+            target_type="maintenance_state",
+            target_id=str(MAINTENANCE_STATE_ID),
+            details=f"带授权启用维护模式: reason={reason}",
+        )
+    return ok
+
+
+async def disable_with_authorization(principal_id: int, reason: str = "") -> bool:
+    """R41 P1-7: 关闭维护模式(需授权)。
+
+    要求 principal 拥有 maintenance:disable 权限才能关闭维护模式。
+    无授权时抛 PermissionError,不调用 disable()。
+
+    Args:
+        principal_id: 操作者 admin_id
+        reason: 关闭原因(记入 audit_log)
+
+    Returns:
+        True 关闭成功, False 失败
+
+    Raises:
+        PermissionError: principal 无 maintenance:disable 权限
+    """
+    # 1. RBAC 授权校验
+    from services.rbac import check_permission
+    has_perm = False
+    try:
+        has_perm = await check_permission(principal_id, "maintenance:disable")
+    except Exception as e:
+        # RBAC 校验异常时 fail-closed(拒绝关闭)
+        logger.warning(
+            f"[Maintenance] disable_with_authorization RBAC 异常"
+            f"(fail-closed 拒绝) principal={principal_id}: {e}"
+        )
+        raise PermissionError(
+            f"RBAC 权限校验异常,拒绝关闭维护模式: {e}"
+        )
+    if not has_perm:
+        logger.warning(
+            f"[Maintenance] disable_with_authorization 拒绝"
+            f"(无 maintenance:disable 权限) principal={principal_id}"
+        )
+        # 记录未授权尝试到 audit_log
+        await _write_audit_log(
+            actor_id=principal_id,
+            action="disable_maintenance_unauthorized",
+            target_type="maintenance_state",
+            target_id=str(MAINTENANCE_STATE_ID),
+            details=f"未授权关闭维护模式尝试: reason={reason}",
+        )
+        raise PermissionError(
+            f"principal {principal_id} 无 maintenance:disable 权限"
+        )
+    # 2. 授权通过,执行关闭(force=True 跳过前置检查,由授权决定)
+    logger.info(
+        f"[Maintenance] disable_with_authorization: 授权通过, "
+        f"principal={principal_id} reason={reason}"
+    )
+    ok = await disable(ended_by=principal_id, force=True)
+    if ok:
+        # 记录带授权的关闭到 audit_log
+        await _write_audit_log(
+            actor_id=principal_id,
+            action="disable_maintenance_with_authorization",
+            target_type="maintenance_state",
+            target_id=str(MAINTENANCE_STATE_ID),
+            details=f"带授权关闭维护模式: reason={reason}",
+        )
+    return ok
+
+
 async def is_enabled() -> bool:
     """R40 P1-7: 检查是否处于维护模式(fail-closed)。
 

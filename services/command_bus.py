@@ -1207,3 +1207,84 @@ def make_delete_file_command(file_code: str) -> Command:
         params={"file_code": file_code},
         requires_approval=False,
     )
+
+
+# ─── R41 P1-8: factory_reset / set_r2 命令(强制 RBAC + 审批门禁) ──
+
+# R41 P1-8: 配置变更权限(用于 R2 凭证变更等高风险配置操作)
+PERM_CONFIG_CHANGE = "config:change"
+
+
+def make_factory_reset_command(tables: list[str] | None = None) -> Command:
+    """R41 P1-8: 构造工厂重置命令(必须审批,最高风险等级)。
+
+    复用 data:purge 权限和 factory_reset 审批 action。
+    handler 仅标记执行,实际重置逻辑由调用方在审批通过后执行。
+
+    Args:
+        tables: 要清空的表列表(None=全部)
+
+    Returns:
+        Command 对象(必须审批)
+    """
+    async def _handler(params: dict) -> dict:
+        # handler 仅返回标记,实际重置逻辑在审批通过后由调用方执行
+        # (factory_reset 涉及 CRDB + SQLite + 内存缓存,逻辑复杂,
+        #  由 handlers.py 中的 factory_reset 函数在审批通过后执行)
+        return {"factory_reset_ok": True, "tables": params.get("tables", [])}
+
+    return Command(
+        action="factory_reset",
+        required_permission=PERM_DATA_PURGE,
+        handler=_handler,
+        params={"tables": tables or []},
+        requires_approval=True,
+        approval_action=APPROVAL_ACTION_FACTORY_RESET,
+    )
+
+
+def make_set_r2_command(
+    account_id: str = "", access_key: str = "",
+    secret_key: str = "", bucket: str = "",
+) -> Command:
+    """R41 P1-8: 构造 R2 凭证变更命令(必须审批)。
+
+    R2 凭证变更是高风险操作(影响备份/存储),必须通过 CommandBus RBAC + 审批。
+    handler 在审批通过后执行实际配置写入。
+
+    Args:
+        account_id: R2 账号 ID
+        access_key: R2 Access Key
+        secret_key: R2 Secret Key(加密存储)
+        bucket: R2 桶名
+
+    Returns:
+        Command 对象(必须审批)
+    """
+    async def _handler(params: dict) -> dict:
+        # 在审批通过后执行实际配置写入
+        from database import set_config
+        from database.relay_db import encrypt as _encrypt_secret
+        await set_config("r2_account_id", params.get("account_id", ""))
+        await set_config("r2_access_key", params.get("access_key", ""))
+        secret = params.get("secret_key", "")
+        if secret:
+            await set_config("r2_secret_key", _encrypt_secret(secret))
+        bucket = params.get("bucket", "")
+        if bucket:
+            await set_config("r2_bucket", bucket)
+        return {"r2_config_ok": True}
+
+    return Command(
+        action="set_r2",
+        required_permission=PERM_CONFIG_CHANGE,
+        handler=_handler,
+        params={
+            "account_id": account_id,
+            "access_key": access_key,
+            "secret_key": secret_key,
+            "bucket": bucket,
+        },
+        requires_approval=True,
+        approval_action=APPROVAL_ACTION_CONFIG_CHANGE,
+    )

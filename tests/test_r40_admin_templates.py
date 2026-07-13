@@ -263,9 +263,31 @@ def _install_service_mocks():
 AUTH = ("admin", "testpass")
 
 
+# R41 P1-2: 所有路由从 Depends(verify_admin) 迁移到 Depends(require_session)。
+# 测试中通过 dependency_overrides 注入 mock AdminPrincipal,绕过 session 存储。
+_TEST_PRINCIPAL = AdminPrincipal(
+    id=_get_admin_principal_id("admin"),
+    username="admin",
+    roles=["super_admin"],
+)
+
+
+def _mock_require_session():
+    """返回测试用 AdminPrincipal(替代真实 session 校验)。"""
+    return _TEST_PRINCIPAL
+
+
 def _client():
-    """返回 TestClient(已进入 context,触发 startup)。"""
-    return TestClient(app)
+    """返回 TestClient(已进入 context,触发 startup)。
+
+    R41 P1-2: 通过 app.dependency_overrides 覆盖 require_session,
+    使所有路由的认证依赖返回测试 AdminPrincipal(无需 HTTP Basic Auth)。
+    """
+    # 覆盖 require_session 依赖
+    from admin import require_session as _req_session
+    app.dependency_overrides[_req_session] = _mock_require_session
+    tc = TestClient(app)
+    return tc
 
 
 # ════════════════════════════════════════════════════════════════

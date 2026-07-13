@@ -29,6 +29,42 @@ from loguru import logger
 from database.cache_store import get_cache_store
 
 
+# ─── R41 P1-3: RBAC 异常 audit_log 记录 ─────────────────────────
+# check_permission / list_user_permissions 异常时记录到 audit_log,
+# 但不返回任何默认权限(fail-closed)。
+async def _write_rbac_failure_audit_log(
+    user_id: int, operation: str, error: str,
+) -> None:
+    """R41 P1-3: RBAC 查询失败时记录 audit_log(不抛异常,fire-and-forget)。
+
+    Args:
+        user_id: 查询的用户 ID
+        operation: 操作名(如 check_permission / list_user_permissions)
+        error: 异常信息
+    """
+    store = get_cache_store()
+    if not store._db:
+        return
+    try:
+        cursor = await store._db.execute(
+            """INSERT INTO audit_log (actor_id, actor_type, action, target_type,
+               target_id, details, ip_addr, created_at)
+               VALUES (?, 'system', 'rbac_check_failed', 'rbac', ?, ?, '')""",
+            (
+                0,  # system actor
+                str(user_id),
+                json.dumps({"operation": operation, "error": error}),
+                datetime.datetime.now().isoformat(),
+            ),
+        )
+        await store._db.commit()
+        if cursor and cursor.lastrowid:
+            await store.add_dirty_outbox("audit_log", str(cursor.lastrowid))
+    except Exception as e:
+        # audit_log 写入失败不影响主流程(fail-closed 已在调用方处理)
+        logger.debug(f"[RBAC] _write_rbac_failure_audit_log 写入失败: {e}")
+
+
 # ─── 预定义角色 ────────────────────────────────────────────────
 ROLE_SUPER_ADMIN = "super_admin"   # 超级管理员
 ROLE_SECURITY = "security"         # 安全管理员
@@ -66,6 +102,9 @@ PERMISSION_DATA_PURGE = "data:purge"                   # 清除数据
 
 # ─── 默认角色权限映射(模块级常量) ─────────────────────────────
 # R40 P0-8: 新增 CommandBus 细粒度权限,分配给对应角色
+# R41 P1-3: 此映射仅用于 init_default_roles() 初始化角色到 DB,
+# 运行时 check_permission / list_user_permissions 不回退到此映射。
+# DB 查询失败时一律返回空(fail-closed),防止 DB 故障时凭借默认权限越权。
 _DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
     ROLE_SUPER_ADMIN: ["*"],  # 所有权限
     ROLE_SECURITY: [
@@ -349,9 +388,14 @@ async def check_permission(user_id: int, permission: str) -> bool:
         return permission in permissions
     except Exception as e:
         # R40 P0-8: fail-closed — 异常时一律拒绝,防止 DB 故障导致越权
+        # R41 P1-3: 记录到 audit_log(但不返回任何默认权限)
         logger.warning(
             f"[RBAC] check_permission 异常(fail-closed 拒绝) "
             f"user={user_id} perm={permission}: {e}"
+        )
+        await _write_rbac_failure_audit_log(
+            user_id, "check_permission",
+            f"perm={permission} error={e}",
         )
         return False
 
@@ -436,9 +480,14 @@ async def list_user_permissions(user_id: int) -> list[str]:
         return perms
     except Exception as e:
         # R40 P0-8: fail-closed — 异常时返回空列表(无权限)
+        # R41 P1-3: 记录到 audit_log(不回退到 _DEFAULT_ROLE_PERMISSIONS)
         logger.warning(
             f"[RBAC] list_user_permissions 异常(fail-closed 返回空) "
             f"user={user_id} role={role_name}: {e}"
+        )
+        await _write_rbac_failure_audit_log(
+            user_id, "list_user_permissions",
+            f"role={role_name} error={e}",
         )
         return []
 

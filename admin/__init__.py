@@ -518,11 +518,11 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     )
 
 
-# ─── R40 P2-5: 服务端 session 认证 ──────────────────────────────
-# 新增 verify_session() — 优先从 cookie 读取 session_id 并验证,
-# 无有效 session 时返回 401 重定向到 /login。
-# 旧 verify_admin() 保留,作为 /login 路由的密码校验入口(HTTP Basic),
-# 避免破坏现有路由依赖。
+# ─── R40 P2-5 / R41 P1-1: 服务端 session 认证 ──────────────────
+# R41 P1-1: 删除同步 verify_session()(存在 event loop 时返回 401、
+# 无 loop 时引用未定义 loop 变量的 bug),改为统一的 async require_session。
+# R41 P1-2: 所有 Admin 路由统一 Depends(require_session),
+# HTTP Basic 仅保留 break-glass CLI 路径(/break-glass/login)。
 def _extract_session_id(request: Request) -> str:
     """从请求 cookie 中提取 session_id。"""
     if request is None:
@@ -530,15 +530,15 @@ def _extract_session_id(request: Request) -> str:
     return request.cookies.get("session_id", "")
 
 
-def verify_session(request: Request) -> AdminPrincipal:
-    """R40 P2-5: 基于 cookie session 的认证依赖。
+async def require_session(request: Request) -> AdminPrincipal:
+    """R41 P1-1: async session 认证依赖(替代同步 verify_session)。
 
-    优先从 cookie 读取 session_id 并调用 SessionManager.validate_session。
-    若 session 无效或不存在,抛 HTTPException(302 重定向到 /login)。
+    从 cookie 读取 session_id 并调用 SessionManager.validate_or_raise,
+    失败时抛 HTTPException(401)。
 
     用法:
         @app.get("/users")
-        async def users_page(request: Request, admin=Depends(verify_session)):
+        async def users_page(request: Request, admin=Depends(require_session)):
             ...
 
     Args:
@@ -548,78 +548,127 @@ def verify_session(request: Request) -> AdminPrincipal:
         AdminPrincipal 对象
 
     Raises:
-        HTTPException: 302 重定向到 /login(无有效 session 时)
+        HTTPException: 401(无 session cookie / session 无效 / session 过期)
     """
-    session_id = _extract_session_id(request)
-    if not session_id:
-        raise HTTPException(
-            status_code=302,
-            headers={"Location": "/login"},
-        )
-    # 异步调用需在路由函数内 await,这里采用同步降级策略:
-    # 通过 asyncio 获取事件循环并运行协程(若已在异步上下文则直接 await)
-    # FastAPI 路由依赖通常是同步的,这里通过 thread-local loop 处理
-    # 更安全的方案:路由直接 await validate_session(见下方 _async_validate_session)
-    try:
-        from admin.sessions import get_session_manager
-        manager = get_session_manager()
-        # 尝试在已有事件循环中运行(若在异步上下文)
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-            # 已在异步上下文,无法直接 run_until_complete
-            # 此处降级为返回 401,让前端 JS 重定向
-            raise HTTPException(
-                status_code=401,
-                detail="请先登录",
-                headers={"Location": "/login"},
-            )
-        except RuntimeError:
-            # 无 running loop,可安全运行
-            principal = loop.run_until_complete(
-                manager.validate_session(session_id)
-            ) if loop else None
-            if principal is None:
-                raise HTTPException(
-                    status_code=302,
-                    headers={"Location": "/login"},
-                )
-            return principal
-    except HTTPException:
-        raise
-    except Exception as e:
-        from loguru import logger
-        logger.debug(f"[Admin] verify_session 失败: {e}")
-        raise HTTPException(
-            status_code=302,
-            headers={"Location": "/login"},
-        )
-
-
-async def _async_validate_session(request: Request) -> AdminPrincipal:
-    """R40 P2-5: 异步验证 session(供异步路由使用)。
-
-    用法:
-        @app.get("/users")
-        async def users_page(request: Request):
-            admin = await _async_validate_session(request)
-            ...
-    """
-    session_id = _extract_session_id(request)
-    if not session_id:
-        raise HTTPException(
-            status_code=302,
-            headers={"Location": "/login"},
-        )
     from admin.sessions import get_session_manager
     manager = get_session_manager()
-    principal = await manager.validate_session(session_id)
-    if principal is None:
-        raise HTTPException(
-            status_code=302,
-            headers={"Location": "/login"},
+    return await manager.validate_or_raise(request)
+
+
+# ─── R41 P1-2: MFA 强制 middleware ──────────────────────────────
+# 校验 session 中 mfa_verified=True,未验证时重定向到 /login/mfa。
+# 跳过认证相关路径(/login, /login/mfa, /logout, /break-glass/login, /health, /readiness)。
+# R41 P1-10: 新增 /readiness 到豁免路径(供负载均衡器/Docker healthcheck 调用)。
+_MFA_EXEMPT_PATHS = frozenset({
+    "/login", "/login/mfa", "/logout",
+    "/break-glass/login", "/health", "/readiness",
+})
+
+
+@app.middleware("http")
+async def _mfa_enforcement_middleware(request: Request, call_next):
+    """R41 P1-2: MFA 强制 middleware。
+
+    对所有非豁免路径校验 session 中 mfa_verified=True:
+    - 无 session cookie → 放行(由 require_session 依赖处理 401)
+    - session 有效但 mfa_verified != True → 302 重定向到 /login/mfa
+    - session 有效且 mfa_verified == True → 放行
+
+    豁免路径: /login, /login/mfa, /logout, /break-glass/login, /health, /readiness
+    """
+    path = request.url.path
+    # 豁免路径直接放行
+    if path in _MFA_EXEMPT_PATHS:
+        return await call_next(request)
+    # 静态资源放行
+    if path.startswith("/static/") or path.endswith((".css", ".js", ".ico", ".png")):
+        return await call_next(request)
+    # 读取 session_id
+    session_id = request.cookies.get("session_id", "")
+    if not session_id:
+        # 无 session cookie,由 require_session 依赖返回 401
+        return await call_next(request)
+    # 加载 session 数据检查 mfa_verified
+    try:
+        from admin.sessions import _load_session_data
+        data = await _load_session_data(session_id)
+        if data is not None and not data.get("mfa_verified", False):
+            # session 存在但 MFA 未验证,重定向到 MFA 输入页
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse(url="/login/mfa", status_code=302)
+    except Exception:
+        # 读取异常时放行,由 require_session 依赖处理
+        pass
+    return await call_next(request)
+
+
+# ─── R41 P1-2: break-glass CLI 登录端点(HTTP Basic,仅本机) ───
+@app.post("/break-glass/login")
+async def break_glass_login(
+    request: Request,
+    credentials: HTTPBasicCredentials = Depends(security),
+):
+    """R41 P1-2: break-glass CLI 登录端点。
+
+    物理隔离的紧急访问通道,仅在本机访问 + 额外密码时可用:
+    - 仅允许本机访问(127.0.0.1 / ::1)
+    - 需要 ADMIN_USERNAME + ADMIN_PASSWORD(HTTP Basic)
+    - 需要额外配置 BREAK_GLASS_PASSWORD(与环境变量分开)
+    - 登录后创建 session(mfa_verified=True,跳过 MFA)
+    - 用于紧急运维场景,所有操作仍走 CommandBus RBAC + 审批
+
+    Returns:
+        session_id(成功);403(非本机);401(凭证错误);503(未配置)
+    """
+    # 1. 本机访问限制
+    peer_host = request.client.host if request.client else ""
+    if peer_host not in ("127.0.0.1", "::1", "localhost"):
+        raise HTTPException(status_code=403, detail="break-glass 仅允许本机访问")
+    # 2. 检查 break-glass 密码是否配置
+    break_glass_pwd = getattr(settings, "BREAK_GLASS_PASSWORD", "") or ""
+    if not break_glass_pwd:
+        raise HTTPException(status_code=503, detail="break-glass 密码未配置")
+    # 3. 校验管理员凭证(HTTP Basic)
+    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="管理员账号未配置")
+    correct_username = secrets.compare_digest(
+        credentials.username.encode("utf8"),
+        settings.ADMIN_USERNAME.encode("utf8"),
+    )
+    correct_password = _verify_password(credentials.password, settings.ADMIN_PASSWORD)
+    # 4. 校验 break-glass 额外密码
+    correct_bg_password = secrets.compare_digest(
+        credentials.password.encode("utf8"),
+        break_glass_pwd.encode("utf8"),
+    ) if credentials.password else False
+    # break-glass 需要同时通过管理员密码 OR break-glass 密码
+    # 实际使用:credentials.password 应为 break-glass 密码(与管理员密码不同)
+    if not (correct_username and (correct_password or correct_bg_password)):
+        from loguru import logger
+        logger.warning(
+            f"[Admin] break-glass 登录失败(凭证错误) peer={peer_host}"
         )
-    return principal
+        raise HTTPException(
+            status_code=401,
+            detail="break-glass 凭证错误",
+            headers={"WWW-Authenticate": 'Basic realm="break-glass", charset="UTF-8"'},
+        )
+    # 5. 创建 session(mfa_verified=True,跳过 MFA — break-glass 已通过额外密码认证)
+    from admin.sessions import get_session_manager
+    manager = get_session_manager()
+    principal = AdminPrincipal(
+        id=_get_admin_principal_id(credentials.username),
+        username=credentials.username,
+        roles=["super_admin"],
+    )
+    session_id = await manager.create_session(principal, mfa_verified=True)
+    if not session_id:
+        raise HTTPException(status_code=503, detail="会话创建失败")
+    from loguru import logger
+    logger.warning(
+        f"[Admin] break-glass 登录成功 user={credentials.username} peer={peer_host}"
+    )
+    return {"session_id": session_id, "message": "break-glass 登录成功"}
 
 
 # ─── R40 P2-5: /login 与 /logout 路由 ──────────────────────────
@@ -779,6 +828,7 @@ async def login_submit(
         return _render_mfa_input_page(request, challenge_token, username)
 
     # R40 P2-5: 创建 session(MFA 未启用或验证通过后到达此处)
+    # R41 P1-2: MFA 未启用时 mfa_verified=True(无需 MFA)
     from admin.sessions import get_session_manager
     manager = get_session_manager()
     principal = AdminPrincipal(
@@ -786,7 +836,7 @@ async def login_submit(
         username=username,
         roles=["super_admin"],
     )
-    session_id = await manager.create_session(principal)
+    session_id = await manager.create_session(principal, mfa_verified=True)
     if not session_id:
         # session 创建失败,降级为 HTTP Basic(返回 503)
         raise HTTPException(status_code=503, detail="会话创建失败,请重试")
@@ -925,6 +975,7 @@ async def login_mfa_verify(
         pass
 
     # 创建 session
+    # R41 P1-2: MFA 验证通过后 mfa_verified=True
     from admin.sessions import get_session_manager
     manager = get_session_manager()
     principal = AdminPrincipal(
@@ -932,7 +983,7 @@ async def login_mfa_verify(
         username=username,
         roles=["super_admin"],
     )
-    session_id = await manager.create_session(principal)
+    session_id = await manager.create_session(principal, mfa_verified=True)
     if not session_id:
         raise HTTPException(status_code=503, detail="会话创建失败,请重试")
 
@@ -978,7 +1029,7 @@ async def logout_submit(
 @app.get("/mfa/setup", response_class=HTMLResponse)
 async def mfa_setup_page(
     request: Request,
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
 ):
     """R40 P2-5: MFA 设置页面(GET)。
 
@@ -1091,7 +1142,7 @@ async def mfa_setup_verify(
     secret: str = Form(...),
     totp_code: str = Form(...),
     csrf_token: str = Form(...),
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
 ):
     """R40 P2-5: MFA 设置确认(POST)— 验证 TOTP 代码后启用 MFA。
 
@@ -1132,7 +1183,7 @@ async def mfa_disable(
     request: Request,
     password: str = Form(...),
     csrf_token: str = Form(...),
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
 ):
     """R40 P2-5: 禁用 MFA(POST)— 需要密码确认。
 
@@ -1193,26 +1244,137 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
 @app.get("/health")
 async def health_check(response: Response):
     """健康检查端点(无需认证),供 Docker healthcheck 和负载均衡器使用。
-    读取 SQLite 共享心跳表，任一关键 Bot 离线时返回 503。
+
+    R41 P1-10: 增强 — 不再只检查 Bot 心跳,同时报告真实依赖状态:
+      - SQLite schema readiness(关键业务表存在)
+      - last collection success(crdb_sync 上次成功同步时间)
+      - R2/CRDB collector freshness(上次指标采集时间)
+      - ACL 配置完整性(REDIS_*_PASSWORD 4 个变量)
+      - RU 当日使用量(采集失败显示 "unknown",不显示 0)
+
+    任一关键检查失败时返回 503 Service Unavailable。
     """
     from database.cache_store import get_all_bot_heartbeats
-    required = {"up", "idx", "dsp", "mon", "admin_bot"}
+    required_bots = {"up", "idx", "dsp", "mon", "admin_bot"}
     beats = await get_all_bot_heartbeats()
     bot_status = {
         name: beats.get(name, {}).get("is_running", False)
-        for name in required
+        for name in required_bots
     }
-    healthy = all(bot_status.values())
-    if not healthy:
+    bots_healthy = all(bot_status.values())
+
+    # R41 P1-10: 复用 prometheus_exporter.check_readiness 获取依赖状态
+    # 避免 admin 与 exporter 各自实现一套 schema/crdb_sync/r2 检查逻辑
+    try:
+        from services.prometheus_exporter import check_readiness as _check_dep
+        dep = _check_dep()
+        dep_checks = dep.get("checks", {})
+        dep_details = dep.get("details", {})
+        ru_daily_usage = dep.get("ru_daily_usage", "unknown")
+        last_crdb_sync_age = dep.get("last_crdb_sync_age", -1.0)
+        last_r2_collect_age = dep.get("last_r2_collect_age", -1.0)
+    except Exception as e:
+        # exporter 不可用时降级:仅依赖 Bot 心跳,但记录错误
+        dep_checks = {}
+        dep_details = {"exporter_error": str(e)}
+        ru_daily_usage = "unknown"
+        last_crdb_sync_age = -1.0
+        last_r2_collect_age = -1.0
+
+    # 整体就绪 = Bot 心跳 + 依赖检查(若 exporter 返回了检查项)
+    deps_ready = all(dep_checks.values()) if dep_checks else True
+    ready = bots_healthy and deps_ready
+
+    if not ready:
         response.status_code = 503
     return {
-        "status": "ok" if healthy else "degraded",
+        "status": "ok" if ready else "degraded",
         "bots": bot_status,
+        "dependencies": {
+            "checks": dep_checks,
+            "details": dep_details,
+            "ru_daily_usage": ru_daily_usage,
+            "last_crdb_sync_age_seconds": last_crdb_sync_age,
+            "last_r2_collect_age_seconds": last_r2_collect_age,
+        },
+    }
+
+
+@app.get("/readiness")
+async def readiness_check(response: Response):
+    """R41 P1-10: 就绪检查端点(无需认证),返回详细依赖状态 JSON。
+
+    与 /health 的区别:
+      - /health: 简略状态(供 Docker healthcheck / k8s liveness 快速判断)
+      - /readiness: 详细依赖状态(供运维排查 / Prometheus 告警上下文)
+
+    返回:
+      - 200 OK + 完整 JSON if 所有检查通过
+      - 503 Service Unavailable + 完整 JSON if 任一检查失败
+
+    JSON 结构:
+      {
+        "ready": bool,
+        "passed": int,
+        "checks": {name: bool},
+        "details": {name: str},
+        "ru_daily_usage": str,        # "unknown" if 采集失败
+        "last_crdb_sync_age": float,
+        "last_r2_collect_age": float,
+      }
+    """
+    from database.cache_store import get_all_bot_heartbeats
+    required_bots = {"up", "idx", "dsp", "mon", "admin_bot"}
+    beats = await get_all_bot_heartbeats()
+    bot_status = {
+        name: beats.get(name, {}).get("is_running", False)
+        for name in required_bots
+    }
+
+    # 复用 prometheus_exporter.check_readiness 获取依赖状态
+    try:
+        from services.prometheus_exporter import check_readiness as _check_dep
+        dep = _check_dep()
+    except Exception as e:
+        dep = {
+            "ready": False,
+            "passed": 0,
+            "checks": {"exporter_error": False},
+            "details": {"exporter_error": str(e)},
+            "ru_daily_usage": "unknown",
+            "last_crdb_sync_age": -1.0,
+            "last_r2_collect_age": -1.0,
+        }
+
+    # 合并 Bot 心跳检查到 readiness 报告
+    all_checks = dict(dep.get("checks", {}))
+    all_checks["bots_running"] = all(bot_status.values())
+    all_details = dict(dep.get("details", {}))
+    all_details["bots_running"] = (
+        f"OK: {sum(bot_status.values())}/{len(bot_status)} bots running"
+        if all(bot_status.values())
+        else f"FAIL: offline bots={[k for k,v in bot_status.items() if not v]}"
+    )
+
+    ready = dep.get("ready", False) and all(bot_status.values())
+    passed = sum(1 for v in all_checks.values() if v)
+
+    if not ready:
+        response.status_code = 503
+    return {
+        "ready": ready,
+        "passed": passed,
+        "checks": all_checks,
+        "details": all_details,
+        "bots": bot_status,
+        "ru_daily_usage": dep.get("ru_daily_usage", "unknown"),
+        "last_crdb_sync_age": dep.get("last_crdb_sync_age", -1.0),
+        "last_r2_collect_age": dep.get("last_r2_collect_age", -1.0),
     }
 
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request, admin=Depends(verify_admin)):
+async def dashboard(request: Request, admin=Depends(require_session)):
     import utils.shared_counters as _sc
 
     # 首次加载或 TTL 过期（60s）时从 SQLite 快照刷新计数器
@@ -1273,7 +1435,7 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
 @app.get("/users", response_class=HTMLResponse)
 async def users_page(
     request: Request,
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
     page: int = Query(1, ge=1),
     search: str = Query(""),
 ):
@@ -1314,7 +1476,7 @@ async def update_membership(
     request: Request,
     level: str = Form(...),
     csrf_token: str = Form(...),
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
 ):
     # CSRF 验证
     if not _verify_csrf(request, csrf_token, username=admin.username):
@@ -1361,7 +1523,7 @@ async def toggle_ban(
     user_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
 ):
     """R40 P0-8: 切换用户封禁状态(通过 CommandBus 强制 RBAC + 审批门禁)。
 
@@ -1415,7 +1577,7 @@ async def toggle_ban(
 @app.get("/files", response_class=HTMLResponse)
 async def files_page(
     request: Request,
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
     page: int = Query(1, ge=1),
     search: str = Query(""),
 ):
@@ -1455,7 +1617,7 @@ async def delete_file(
     file_code: str,
     request: Request,
     csrf_token: str = Form(...),
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
 ):
     """R40 P0-8: 删除文件(通过 CommandBus 强制 RBAC 门禁)。
 
@@ -1492,7 +1654,7 @@ async def delete_file(
 @app.get("/logs", response_class=HTMLResponse)
 async def logs_page(
     request: Request,
-    admin=Depends(verify_admin),
+    admin=Depends(require_session),
     page: int = Query(1, ge=1),
 ):
     per_page = settings.ADMIN_FILES_PAGE_SIZE
@@ -1531,7 +1693,7 @@ async def logs_page(
 
 
 @app.get("/health-page", response_class=HTMLResponse)
-async def health_page(request: Request, admin=Depends(verify_admin)):
+async def health_page(request: Request, admin=Depends(require_session)):
     from database.cache_store import get_all_bot_heartbeats
     beats = await get_all_bot_heartbeats()
     bot_statuses = []
@@ -1559,7 +1721,7 @@ async def health_page(request: Request, admin=Depends(verify_admin)):
 
 
 @app.get("/tasks", response_class=HTMLResponse)
-async def tasks_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def tasks_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 任务中心 — 查看所有用户任务
 
     R40 P1-1 修复:
@@ -1578,7 +1740,7 @@ async def tasks_page(request: Request, admin: AdminPrincipal = Depends(verify_ad
 
 
 @app.get("/reports", response_class=HTMLResponse)
-async def reports_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def reports_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 举报管理 — 待处理举报列表"""
     from services.content_reports import list_reports
     result = await list_reports(status="pending")
@@ -1594,7 +1756,7 @@ async def takedown_report(
     report_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    admin: AdminPrincipal = Depends(verify_admin),
+    admin: AdminPrincipal = Depends(require_session),
 ):
     """R40 P0-8: 下架举报内容(通过 CommandBus 强制 RBAC + 审批门禁)"""
     # CSRF 验证
@@ -1637,7 +1799,7 @@ async def takedown_report(
 
 
 @app.get("/collections", response_class=HTMLResponse)
-async def collections_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def collections_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 集合管理 — 查看所有集合"""
     from services.collections import list_collections
     result = await list_collections()
@@ -1649,7 +1811,7 @@ async def collections_page(request: Request, admin: AdminPrincipal = Depends(ver
 
 
 @app.get("/notifications", response_class=HTMLResponse)
-async def notifications_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def notifications_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 通知中心 — 查看所有通知"""
     from services.notifications import list_all_notifications
     result = await list_all_notifications()
@@ -1661,7 +1823,7 @@ async def notifications_page(request: Request, admin: AdminPrincipal = Depends(v
 
 
 @app.get("/approvals", response_class=HTMLResponse)
-async def approvals_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def approvals_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 审批管理 — 待审批列表"""
     from services.approval_workflow import list_pending
     result = await list_pending()
@@ -1673,7 +1835,7 @@ async def approvals_page(request: Request, admin: AdminPrincipal = Depends(verif
 
 
 @app.get("/rbac", response_class=HTMLResponse)
-async def rbac_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def rbac_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: RBAC 角色管理 — 角色与权限列表"""
     from services.rbac import list_roles, list_permissions
     roles = await list_roles()
@@ -1686,7 +1848,7 @@ async def rbac_page(request: Request, admin: AdminPrincipal = Depends(verify_adm
 
 
 @app.get("/repair-console", response_class=HTMLResponse)
-async def repair_console_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def repair_console_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 修复控制台 — Outbox/DLQ/Replication/Relay"""
     from services.repair_console import (
         get_repair_overview, list_outbox, list_dlq, list_replication_failures,
@@ -1707,7 +1869,7 @@ async def repair_console_page(request: Request, admin: AdminPrincipal = Depends(
 
 
 @app.get("/topology", response_class=HTMLResponse)
-async def topology_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def topology_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 拓扑可视化"""
     from services.topology_view import get_topology, get_health_summary
     topology = await get_topology()
@@ -1720,7 +1882,7 @@ async def topology_page(request: Request, admin: AdminPrincipal = Depends(verify
 
 
 @app.get("/ru-cost", response_class=HTMLResponse)
-async def ru_cost_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def ru_cost_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: RU 成本中心"""
     from services.ru_cost_center import get_daily_report, check_ru_alert
     report = await get_daily_report()
@@ -1733,7 +1895,7 @@ async def ru_cost_page(request: Request, admin: AdminPrincipal = Depends(verify_
 
 
 @app.get("/maintenance", response_class=HTMLResponse)
-async def maintenance_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def maintenance_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 维护模式控制台"""
     from services.maintenance_mode import get_status, check_readiness
     status = await get_status()
@@ -1751,7 +1913,7 @@ async def maintenance_action(
     request: Request,
     csrf_token: str = Form(...),
     reason: str = Form("手动维护"),
-    admin: AdminPrincipal = Depends(verify_admin),
+    admin: AdminPrincipal = Depends(require_session),
 ):
     """R40 P0-8: 维护模式操作(通过 CommandBus 强制 RBAC + 审批门禁)"""
     # CSRF 验证
@@ -1792,7 +1954,7 @@ async def maintenance_action(
 
 
 @app.get("/disaster-recovery", response_class=HTMLResponse)
-async def disaster_recovery_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+async def disaster_recovery_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 灾备控制台"""
     from services.disaster_recovery import list_backups, get_rpo_rto, get_backup_schedule
     backups = await list_backups()

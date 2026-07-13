@@ -261,20 +261,31 @@ class TestAdminRoutes:
         assert "logout_submit" in async_funcs, "应定义 logout_submit 异步路由(POST /logout)"
 
     def test_has_verify_session_function(self):
-        """应定义 verify_session 同步函数(依赖注入入口)。"""
-        tree = _parse_ast(ADMIN_DIR / "__init__.py")
-        if tree is None:
-            pytest.skip("AST 解析失败")
-        sync_funcs = _get_sync_funcs(tree)
-        assert "verify_session" in sync_funcs, "应定义 verify_session 同步函数"
+        """R41 P1-1: 应定义 async require_session(替代同步 verify_session)。
 
-    def test_has_async_validate_session_function(self):
-        """应定义 _async_validate_session 异步辅助函数。"""
+        旧版同步 verify_session 在有 event loop 时返回 401、无 loop 时引用
+        未定义变量,P1-1 整改后改为 async require_session。
+        """
         tree = _parse_ast(ADMIN_DIR / "__init__.py")
         if tree is None:
             pytest.skip("AST 解析失败")
         async_funcs = _get_async_funcs(tree)
-        assert "_async_validate_session" in async_funcs, "应定义 _async_validate_session 异步辅助函数"
+        assert "require_session" in async_funcs, (
+            "应定义 require_session async 函数(P1-1: 替代同步 verify_session)"
+        )
+
+    def test_has_async_validate_session_function(self):
+        """R41 P1-1: SessionManager.validate_or_raise 为 async 方法(替代 _async_validate_session)。
+
+        旧版 _async_validate_session 辅助函数已整合到 SessionManager.validate_or_raise。
+        """
+        tree = _parse_ast(ADMIN_DIR / "sessions.py")
+        if tree is None:
+            pytest.skip("AST 解析失败")
+        async_funcs = _get_async_funcs(tree)
+        assert "validate_or_raise" in async_funcs, (
+            "SessionManager 应定义 validate_or_raise async 方法(P1-1)"
+        )
 
     def test_has_extract_session_id_function(self):
         """应定义 _extract_session_id 辅助函数。"""
