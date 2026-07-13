@@ -48,8 +48,10 @@ DEFAULT_RTO_SECONDS = 30 * 60
 async def list_backups(limit: int = 20) -> list[dict]:
     """列出最近备份。
 
-    从 kv_store 读取 'backup_history'(JSON list),也合并查询
-    R2 中的实际备份文件列表(委托 services/db_backup.py::list_backups)。
+    R40 P0-7: 合并三个来源:
+    1. kv_store 中的 'backup_history'(JSON list)
+    2. BackupEngine.list_backups() — 仅返回 complete marker 存在的备份(R40 P0-7 新格式)
+    3. db_backup.list_backups() — 历史格式 db_backup_*
 
     Args:
         limit: 最多返回数量
@@ -70,7 +72,16 @@ async def list_backups(limit: int = 20) -> list[dict]:
     except Exception as e:
         logger.debug(f"[DisasterRecovery] 读取 {KV_BACKUP_HISTORY} 失败: {e}")
 
-    # 2. 合并 R2 中的备份列表(如有)
+    # 2. R40 P0-7: BackupEngine 新格式 backups/<id>.*
+    try:
+        from services.backup_engine import BackupEngine
+        engine = BackupEngine()
+        new_backups = await engine.list_backups()
+        backups.extend(new_backups)
+    except Exception as e:
+        logger.debug(f"[DisasterRecovery] BackupEngine.list_backups 失败: {e}")
+
+    # 3. 历史格式 db_backup_*
     try:
         from services import db_backup
         r2_objects = await db_backup.list_backups()
@@ -129,51 +140,61 @@ async def get_backup_info(backup_id: str) -> dict | None:
 # ─── 2. 触发备份 ───────────────────────────────────────────────
 
 async def trigger_backup() -> str:
-    """触发立即备份(调用 services/db_backup.py)。
+    """触发立即备份(R40 P0-7: 调用 BackupEngine 真实上传 R2)。
+
+    R40 P0-7 修复:
+        原 ``trigger_backup`` 仅采集数据不上传 R2,却更新 last_backup_at
+        导致 RPO 假合规。现改为调用 ``BackupEngine.create_backup``,
+        真实完成 payload+manifest+COMPLETE marker 三阶段上传 + 校验。
+        失败时不更新 last_backup_at(由 BackupEngine 内部保证)。
 
     Returns:
-        backup_id(R2 对象 key);失败返回空字符串
+        backup_id(R2 对象 backup_id);失败返回空字符串
     """
     try:
-        from services import db_backup
-        # 备份所有表(全量)
-        backup_data = await db_backup.backup_all_tables(
-            watermark=None, backup_type="full"
-        )
+        from services.backup_engine import BackupEngine
+        engine = BackupEngine()
+        manifest = await engine.create_backup(backup_type="full")
+        backup_id = manifest.get("backup_id", "")
+        if not backup_id:
+            logger.error("[DisasterRecovery] trigger_backup: BackupEngine 未返回 backup_id")
+            return ""
 
-        # 生成 backup_id(时间戳格式)
-        timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_id = f"db_backup/db_backup_{timestamp}_full.json"
-
-        # R38 P1-5: backup_all_tables 返回 backup_data + _r38_p1_5_metadata
-        # 此处简化:不实际上传(避免重复实现 _run_backup_loop 逻辑)
-        # 实际生产环境应通过 systemd 触发独立 db_backup 进程,
-        # 此处仅记录到 kv_store 备份历史
-
-        # 更新 backup_history
+        # 写入 backup_history(成功)
         await _append_backup_history({
             "backup_id": backup_id,
-            "created_at": _dt.datetime.now().isoformat(),
-            "size": 0,  # 实际大小由 R2 上传后填充
-            "encrypted": True,
-            "key_id": "",
-            "checksum": "",
-            "status": "triggered",
-            "backup_type": "full",
-            "tables": len(backup_data.get("tables", {})),
-            "total_rows": sum(
-                len(rows) for rows in backup_data.get("tables", {}).values()
-            ),
+            "created_at": manifest.get("created_at", _dt.datetime.now().isoformat()),
+            "size": manifest.get("ciphertext_size_bytes", 0),
+            "encrypted": manifest.get("encryption", {}).get("encrypted", False),
+            "key_id": manifest.get("encryption", {}).get("key_id", ""),
+            "checksum": manifest.get("ciphertext_sha256", ""),
+            "status": "completed",
+            "backup_type": manifest.get("backup_type", "full"),
+            "tables": manifest.get("total_tables", 0),
+            "total_rows": manifest.get("total_rows", 0),
         })
 
-        # 更新 last_backup_at
-        store = get_cache_store()
-        await store.set_kv(KV_LAST_BACKUP_AT, _dt.datetime.now().isoformat())
-
-        logger.info(f"[DisasterRecovery] 备份已触发: {backup_id}")
+        logger.info(f"[DisasterRecovery] 备份已上传 R2: {backup_id}")
         return backup_id
     except Exception as e:
-        logger.error(f"[DisasterRecovery] trigger_backup 失败: {e}")
+        logger.error(f"[DisasterRecovery] trigger_backup 失败(不更新 last_backup_at): {e}")
+        # 记录失败到 backup_history(便于排查)
+        try:
+            await _append_backup_history({
+                "backup_id": "",
+                "created_at": _dt.datetime.now().isoformat(),
+                "size": 0,
+                "encrypted": False,
+                "key_id": "",
+                "checksum": "",
+                "status": "failed",
+                "backup_type": "full",
+                "tables": 0,
+                "total_rows": 0,
+                "error": str(e),
+            })
+        except Exception:
+            pass
         return ""
 
 
@@ -255,18 +276,21 @@ async def verify_backup(backup_id: str) -> dict:
 
 # ─── 4. 恢复备份 ──────────────────────────────────────────────
 
-async def restore(backup_id: str, admin_id: int = 0) -> dict:
-    """恢复备份(调用 services/db_restore.py)。
+async def restore(backup_id: str, admin_id: int = 0, approver_id: int = 0) -> dict:
+    """恢复备份(R40 P0-7: 调用 BackupEngine.restore 可解密加密备份)。
 
-    恢复是高风险操作,需要审批(approval_workflow)。本函数:
-    1. 检查审批状态(简化:这里直接执行,生产环境应先创建 approval)
-    2. 下载备份并委托 db_restore.restore_from_backup_data
-    3. 写 audit_log
-    4. 记录到 recovery_history
+    R40 P0-7 修复:
+        原 ``restore`` 直接 ``json.loads(ciphertext)`` 无法解密 AES-GCM 备份。
+        现改为调用 ``BackupEngine.restore`` 完成:
+        manifest 校验 → ciphertext_sha256 → 解密 → plaintext_sha256 → 写入。
+
+    R40 P0-8: 生产恢复必须审批(approver_id 非零),由 CommandBus 调用本函数。
+    旧调用方仍可传 admin_id,本函数将 admin_id 透传给 approver_id 以保持向后兼容。
 
     Args:
-        backup_id: 备份 ID(R2 对象 key)
-        admin_id: 操作者 admin_id
+        backup_id: 备份 ID(R40 P0-7 格式 backup_YYYYMMDD_HHMMSS_xxxxxxxx)
+        admin_id: 操作者 admin_id(向后兼容)
+        approver_id: 审批人 ID(生产恢复必填;为 0 时回退到 admin_id)
 
     Returns:
         {success, restored_tables, duration_seconds, error}
@@ -277,59 +301,65 @@ async def restore(backup_id: str, admin_id: int = 0) -> dict:
             "duration_seconds": 0, "error": "backup_id 为空",
         }
 
+    # 审批人 ID:优先 approver_id,fallback admin_id(向后兼容旧调用方)
+    effective_approver = approver_id or admin_id
+
     start_ts = _time.time()
     try:
-        from services import db_backup, db_restore
+        from services.backup_engine import BackupEngine
+        engine = BackupEngine()
 
-        # 下载备份
-        content = await db_backup.r2_storage.download(backup_id)
-        data = json.loads(content)
-
-        # 委托恢复
-        result = await db_restore.restore_from_backup_data(
-            data, tables=None, merge=False
+        # 生产恢复(target=production)需要审批人
+        result = await engine.restore(
+            backup_id, target="production", approver_id=effective_approver,
         )
 
-        restored_tables = len(result.get("restored", {}))
-        errors = result.get("errors", [])
-        success = len(errors) == 0
+        success = result.get("success", False)
+        restored_tables = result.get("restored_tables", 0)
+        error = result.get("error", "")
 
         # 写 audit_log
         await _write_audit_log(
-            actor_id=admin_id,
+            actor_id=admin_id or effective_approver,
             action="restore_backup",
             target_type="backup",
             target_id=backup_id,
-            details=f"restored_tables={restored_tables} errors={errors}",
+            details=f"restored_tables={restored_tables} checksum_verified={result.get('checksum_verified')} error={error}",
         )
 
         # 记录到 recovery_history
         await _append_recovery_history({
             "backup_id": backup_id,
-            "admin_id": admin_id,
+            "admin_id": admin_id or effective_approver,
+            "approver_id": effective_approver,
             "executed_at": _dt.datetime.now().isoformat(),
             "success": success,
             "restored_tables": restored_tables,
-            "errors": errors,
+            "restored_rows": result.get("restored_rows", 0),
+            "checksum_verified": result.get("checksum_verified", False),
+            "errors": [error] if error else [],
             "duration_seconds": _time.time() - start_ts,
         })
 
         logger.info(
             f"[DisasterRecovery] restore 完成: backup_id={backup_id} "
-            f"restored={restored_tables} success={success}"
+            f"restored={restored_tables} success={success} checksum_verified={result.get('checksum_verified')}"
         )
         return {
             "success": success,
             "restored_tables": restored_tables,
+            "restored_rows": result.get("restored_rows", 0),
+            "checksum_verified": result.get("checksum_verified", False),
             "duration_seconds": _time.time() - start_ts,
-            "error": "; ".join(errors) if errors else "",
+            "error": error,
         }
     except Exception as e:
         logger.error(f"[DisasterRecovery] restore 失败: {e}")
         # 仍记录到 recovery_history
         await _append_recovery_history({
             "backup_id": backup_id,
-            "admin_id": admin_id,
+            "admin_id": admin_id or effective_approver,
+            "approver_id": effective_approver,
             "executed_at": _dt.datetime.now().isoformat(),
             "success": False,
             "restored_tables": 0,
@@ -367,8 +397,8 @@ async def get_rpo_rto() -> dict:
         rpo_seconds = DEFAULT_RPO_SECONDS
         rto_seconds = DEFAULT_RTO_SECONDS
 
-    # 计算最近备份距今的秒数
-    last_backup_age = 0
+    # 计算最近备份距今的秒数(R40 P0-7: 无备份时返回 None,UI 显示"无备份")
+    last_backup_age: int | None = None
     try:
         raw = await store.get_kv(KV_LAST_BACKUP_AT)
         if raw:
@@ -389,14 +419,34 @@ async def get_rpo_rto() -> dict:
     except Exception:
         pass
 
+    # RPO 合规判定:无备份时返回 False(违规)
+    rpo_compliant = (
+        last_backup_age is not None and last_backup_age <= rpo_seconds
+    )
     return {
         "rpo_seconds": rpo_seconds,
         "rto_seconds": rto_seconds,
         "last_backup_age": last_backup_age,
         "estimated_recovery_time": estimated_recovery_time,
-        "rpo_compliant": last_backup_age <= rpo_seconds,
+        "rpo_compliant": rpo_compliant,
         "rto_compliant": estimated_recovery_time <= rto_seconds,
     }
+
+
+async def get_last_backup_age() -> int | None:
+    """R40 P0-7: 获取最近备份距今的秒数,无备份返回 None。
+
+    供 UI 显示"无备份"提示,避免误显示 RPO 合规(0 ≤ rpo_seconds 永真)。
+    """
+    store = get_cache_store()
+    try:
+        raw = await store.get_kv(KV_LAST_BACKUP_AT)
+        if not raw:
+            return None
+        last_dt = _dt.datetime.fromisoformat(raw)
+        return int((_dt.datetime.now() - last_dt).total_seconds())
+    except Exception:
+        return None
 
 
 # ─── 6. 恢复演练(非破坏性) ───────────────────────────────────
@@ -443,7 +493,14 @@ async def run_recovery_drill() -> dict:
     step_start = _time.time()
     if backup_id:
         try:
-            verify_result = await verify_backup(backup_id)
+            # R40 P0-7: 优先使用 BackupEngine.verify_backup(基于 manifest + COMPLETE marker)
+            # 旧 verify_backup 函数保留以兼容历史 db_backup_* key,新格式 backups/<id>.* 走 BackupEngine
+            if backup_id.startswith("backup_"):
+                from services.backup_engine import BackupEngine
+                engine = BackupEngine()
+                verify_result = await engine.verify_backup(backup_id)
+            else:
+                verify_result = await verify_backup(backup_id)
             ok = verify_result.get("valid", False)
             steps.append({
                 "name": "verify_backup", "success": ok,
@@ -467,23 +524,29 @@ async def run_recovery_drill() -> dict:
             "error": "skip (无 backup_id)",
         })
 
-    # 步骤 3: 模拟恢复(不实际覆盖,仅下载并解析)
+    # 步骤 3: 模拟恢复(R40 P0-7: 通过 BackupEngine.restore staging 模式校验可解密)
     step_start = _time.time()
     if backup_id:
         try:
-            from storage.r2 import _r2 as r2_storage
-            content = await r2_storage.download(backup_id)
-            data = json.loads(content)
-            tables_count = len(data.get("tables", {}))
-            total_rows = sum(len(rows) for rows in data.get("tables", {}).values())
-            ok = tables_count > 0
+            from services.backup_engine import BackupEngine
+            engine = BackupEngine()
+            # staging 模式仅校验可解密 + 统计行数,不写库
+            staging_result = await engine.restore(
+                backup_id, target="staging", approver_id=0,
+            )
+            ok = staging_result.get("success", False)
+            tables_count = staging_result.get("restored_tables", 0)
+            total_rows = staging_result.get("restored_rows", 0)
             steps.append({
                 "name": "simulate_restore", "success": ok,
                 "duration_seconds": _time.time() - step_start,
                 "tables_count": tables_count,
                 "total_rows": total_rows,
-                "error": "" if ok else "无表数据",
+                "checksum_verified": staging_result.get("checksum_verified", False),
+                "error": staging_result.get("error", "") or ("" if ok else "无表数据"),
             })
+            if not ok:
+                overall_success = False
         except Exception as e:
             overall_success = False
             steps.append({
@@ -620,14 +683,22 @@ async def format_disaster_status(status: dict) -> str:
     # RPO/RTO
     rpo = status.get("rpo_seconds", DEFAULT_RPO_SECONDS)
     rto = status.get("rto_seconds", DEFAULT_RTO_SECONDS)
-    last_age = status.get("last_backup_age", 0)
+    # R40 P1-10: last_backup_age 可能为 None(无备份),
+    # 不能默认 0(会显示"距今=0s"与违规判定矛盾,易误导管理员)
+    last_age = status.get("last_backup_age")
     est_recover = status.get("estimated_recovery_time", 0)
     rpo_ok = status.get("rpo_compliant", False)
     rto_ok = status.get("rto_compliant", False)
 
+    # R40 P1-10: None 时输出"无备份",而非误导性的"0s"
+    if last_age is None:
+        last_age_text = "无备份"
+    else:
+        last_age_text = f"{last_age}s"
+
     lines.append("")
     lines.append(f"[RPO] 目标={rpo}s ({rpo // 3600}h)  "
-                f"最近备份距今={last_age}s  "
+                f"最近备份距今={last_age_text}  "
                 f"{'✓ 合规' if rpo_ok else '✗ 违规'}")
     lines.append(f"[RTO] 目标={rto}s ({rto // 60}min)  "
                 f"估算恢复时间={est_recover}s  "

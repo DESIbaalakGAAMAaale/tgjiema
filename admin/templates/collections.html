@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}集合管理{% endblock %}
+{% block page_title %}集合管理{% endblock %}
+
+{% block content %}
+<div class="section">
+    <h2>文件集合列表</h2>
+    <table>
+        <caption>所有文件集合</caption>
+        <thead>
+            <tr>
+                <th>集合ID</th>
+                <th>集合码</th>
+                <th>名称</th>
+                <th>所有者</th>
+                <th>版本</th>
+                <th>文件数</th>
+                <th>状态</th>
+                <th>创建时间</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for col in collections %}
+            <tr>
+                <td>{{ col.get('id', '') }}</td>
+                <td><code>{{ col.get('code', '') }}</code></td>
+                <td>{{ col.get('name', '') }}</td>
+                <td>{{ col.get('owner_id', '') }}</td>
+                <td>{{ col.get('version', 1) }}</td>
+                <td>{{ col.get('item_count', 0) }}</td>
+                <td>
+                    {% set st = col.get('status', '') %}
+                    {% if st == 'active' %}
+                    <span class="tag tag-green">活跃</span>
+                    {% elif st == 'archived' %}
+                    <span class="tag tag-orange">已归档</span>
+                    {% else %}
+                    <span class="tag">{{ st }}</span>
+                    {% endif %}
+                </td>
+                <td>{{ col.get('created_at', 'N/A') }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

@@ -71,16 +71,18 @@ async def create_collection(name: str, owner_id: int, description: str = "") -> 
     # 复用 code_generator 生成集合码
     code = build_collection_code()
     try:
-        cursor = await store._db.execute(
-            """INSERT INTO collections (name, code, owner_id, description, version,
-                                         item_count, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 1, 0, 'active', ?, ?)""",
-            (name, code, owner_id, description, now, now),
-        )
-        await store._db.commit()
-        coll_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+        # R40 P0-5: 业务表 + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """INSERT INTO collections (name, code, owner_id, description, version,
+                                             item_count, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 1, 0, 'active', ?, ?)""",
+                (name, code, owner_id, description, now, now),
+            )
+            coll_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if coll_id:
+                await store.add_dirty_outbox("collections", str(coll_id), connection=tx)
         if coll_id:
-            await store.add_dirty_outbox("collections", str(coll_id))
             logger.info(
                 f"[collections] 创建集合 id={coll_id} code={code} owner={owner_id}"
             )
@@ -113,41 +115,42 @@ async def add_files(collection_id: int, file_codes: list[str]) -> int:
     now = _dt.datetime.now().isoformat()
     added = 0
     try:
-        # 使用 INSERT OR IGNORE 去重(collection_items 表有唯一索引更好,
-        # 当前 schema 无唯一约束,先查再插避免重复)
-        for code in file_codes:
-            # 检查是否已存在
-            chk = await store._db.execute(
-                "SELECT id FROM collection_items WHERE collection_id = ? AND file_code = ?",
-                (collection_id, code),
-            )
-            existing = await chk.fetchone()
-            if existing:
-                continue
-            cursor = await store._db.execute(
-                """INSERT INTO collection_items (collection_id, file_code, added_at)
-                   VALUES (?, ?, ?)""",
-                (collection_id, code, now),
-            )
-            if cursor and cursor.rowcount > 0:
-                added += 1
-        # 更新 item_count + updated_at
-        if added > 0:
-            await store._db.execute(
-                """UPDATE collections
-                   SET item_count = (
-                        SELECT COUNT(*) FROM collection_items WHERE collection_id = ?
-                       ),
-                       updated_at = ?
-                   WHERE id = ?""",
-                (collection_id, now, collection_id),
-            )
-            await store._db.commit()
-            await store.add_dirty_outbox("collections", str(collection_id))
-            # collection_items 变更通过 collections pk 同步(简化)
-            await store.add_dirty_outbox("collection_items", str(collection_id))
-            # 调用 update_version 升级版本号
-            await update_version(collection_id)
+        # R40 P0-5: collection_items + collections + dirty_outbox + version 同事务
+        async with store.transaction() as tx:
+            # 使用 INSERT OR IGNORE 去重(collection_items 表有唯一索引更好,
+            # 当前 schema 无唯一约束,先查再插避免重复)
+            for code in file_codes:
+                # 检查是否已存在
+                chk = await tx.execute(
+                    "SELECT id FROM collection_items WHERE collection_id = ? AND file_code = ?",
+                    (collection_id, code),
+                )
+                existing = await chk.fetchone()
+                if existing:
+                    continue
+                cursor = await tx.execute(
+                    """INSERT INTO collection_items (collection_id, file_code, added_at)
+                       VALUES (?, ?, ?)""",
+                    (collection_id, code, now),
+                )
+                if cursor and cursor.rowcount > 0:
+                    added += 1
+            # 更新 item_count + updated_at
+            if added > 0:
+                await tx.execute(
+                    """UPDATE collections
+                       SET item_count = (
+                            SELECT COUNT(*) FROM collection_items WHERE collection_id = ?
+                           ),
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (collection_id, now, collection_id),
+                )
+                await store.add_dirty_outbox("collections", str(collection_id), connection=tx)
+                # collection_items 变更通过 collections pk 同步(简化)
+                await store.add_dirty_outbox("collection_items", str(collection_id), connection=tx)
+                # 升级版本号(同事务内)
+                await _update_version_in_tx(tx, store, collection_id, now)
         logger.info(
             f"[collections] 添加 {added}/{len(file_codes)} 文件到集合 {collection_id}"
         )
@@ -173,30 +176,31 @@ async def remove_files(collection_id: int, file_codes: list[str]) -> int:
     now = _dt.datetime.now().isoformat()
     removed = 0
     try:
-        for code in file_codes:
-            cursor = await store._db.execute(
-                """DELETE FROM collection_items
-                   WHERE collection_id = ? AND file_code = ?""",
-                (collection_id, code),
-            )
-            if cursor and cursor.rowcount > 0:
-                removed += 1
-        if removed > 0:
-            # 更新 item_count + updated_at
-            await store._db.execute(
-                """UPDATE collections
-                   SET item_count = (
-                        SELECT COUNT(*) FROM collection_items WHERE collection_id = ?
-                       ),
-                       updated_at = ?
-                   WHERE id = ?""",
-                (collection_id, now, collection_id),
-            )
-            await store._db.commit()
-            await store.add_dirty_outbox("collections", str(collection_id))
-            await store.add_dirty_outbox("collection_items", str(collection_id))
-            # 升级版本号
-            await update_version(collection_id)
+        # R40 P0-5: collection_items + collections + dirty_outbox + version 同事务
+        async with store.transaction() as tx:
+            for code in file_codes:
+                cursor = await tx.execute(
+                    """DELETE FROM collection_items
+                       WHERE collection_id = ? AND file_code = ?""",
+                    (collection_id, code),
+                )
+                if cursor and cursor.rowcount > 0:
+                    removed += 1
+            if removed > 0:
+                # 更新 item_count + updated_at
+                await tx.execute(
+                    """UPDATE collections
+                       SET item_count = (
+                            SELECT COUNT(*) FROM collection_items WHERE collection_id = ?
+                           ),
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (collection_id, now, collection_id),
+                )
+                await store.add_dirty_outbox("collections", str(collection_id), connection=tx)
+                await store.add_dirty_outbox("collection_items", str(collection_id), connection=tx)
+                # 升级版本号(同事务内)
+                await _update_version_in_tx(tx, store, collection_id, now)
         logger.info(
             f"[collections] 从集合 {collection_id} 移除 {removed}/{len(file_codes)} 文件"
         )
@@ -340,6 +344,33 @@ async def list_collections(owner_id: int, page: int = 1, page_size: int = 10) ->
         return default
 
 
+async def _update_version_in_tx(tx, store, collection_id: int, now: str) -> int:
+    """在给定事务内递增集合版本号(R40 P0-5 内部辅助函数)。
+
+    不调用 commit(由外层 UnitOfWork 控制),失败抛异常让外层回滚。
+    """
+    cursor = await tx.execute(
+        """UPDATE collections
+           SET version = version + 1, updated_at = ?
+           WHERE id = ?""",
+        (now, collection_id),
+    )
+    if cursor and cursor.rowcount > 0:
+        await store.add_dirty_outbox("collections", str(collection_id), connection=tx)
+        # 查询新版本号(同事务内读取)
+        v_cursor = await tx.execute(
+            "SELECT version FROM collections WHERE id = ?",
+            (collection_id,),
+        )
+        v_row = await v_cursor.fetchone()
+        new_version = int(v_row[0]) if v_row else 0
+        logger.info(
+            f"[collections] 集合 {collection_id} 版本升级到 v{new_version}"
+        )
+        return new_version
+    return 0
+
+
 async def update_version(collection_id: int) -> int:
     """集合更新版本号(添加/删除文件后调用)。
 
@@ -354,28 +385,10 @@ async def update_version(collection_id: int) -> int:
         return 0
     now = _dt.datetime.now().isoformat()
     try:
-        # 原子递增 version + 更新 updated_at
-        cursor = await store._db.execute(
-            """UPDATE collections
-               SET version = version + 1, updated_at = ?
-               WHERE id = ?""",
-            (now, collection_id),
-        )
-        await store._db.commit()
-        if cursor and cursor.rowcount > 0:
-            await store.add_dirty_outbox("collections", str(collection_id))
-            # 查询新版本号
-            v_cursor = await store._db.execute(
-                "SELECT version FROM collections WHERE id = ?",
-                (collection_id,),
-            )
-            v_row = await v_cursor.fetchone()
-            new_version = int(v_row[0]) if v_row else 0
-            logger.info(
-                f"[collections] 集合 {collection_id} 版本升级到 v{new_version}"
-            )
-            return new_version
-        return 0
+        # R40 P0-5: 业务表 + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            new_version = await _update_version_in_tx(tx, store, collection_id, now)
+        return new_version
     except Exception as e:
         logger.warning(f"[collections] update_version 失败: {e}")
         return 0

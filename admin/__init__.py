@@ -3,6 +3,7 @@ import re as _re
 import hashlib
 import hmac as _hmac
 import ipaddress as _ipaddr
+from dataclasses import dataclass, field
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Form
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
@@ -19,6 +20,36 @@ from config import settings
 
 app = FastAPI(title="TG解码器管理后台")
 security = HTTPBasic()
+
+
+# ─── R40 P0-2: 管理员身份模型 ──────────────────────────────────
+# 旧实现 verify_admin() 返回 ADMIN_USERNAME 字符串,新路由在 takedown/maintenance
+# 等路径调用 admin.id,对 "admin" 等用户名会抛 ValueError 产生 500。
+# 改为返回 AdminPrincipal 对象:审计/RBAC 用 principal.id,显示用 principal.username。
+@dataclass
+class AdminPrincipal:
+    """R40 P0-2: 管理员身份主体。
+
+    - id: 稳定的整数 ID(基于 username 哈希生成),用于审计日志和 RBAC
+    - username: 显示用用户名(来自 ADMIN_USERNAME)
+    - roles: 角色列表(单管理员默认超级管理员)
+    """
+    id: int
+    username: str
+    roles: list = field(default_factory=list)
+
+
+def _get_admin_principal_id(username: str) -> int:
+    """R40 P0-2: 基于 username 生成稳定的管理员整数 ID。
+
+    使用 SHA256 前 8 字节的正整数表示,保证同一 username 始终映射到同一 id,
+    避免路由中 admin.id 对字符串用户名抛 ValueError。
+    取模 2^31 防止溢出常见 INT 字段。
+    """
+    if not username:
+        return 0
+    digest = hashlib.sha256(username.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") & 0x7FFFFFFF
 
 
 # ─── R39 P2-8: CSP nonce + 点击劫持防护 ──────────────────────────
@@ -427,7 +458,13 @@ def _get_client_ip(request: Request) -> str:
     return peer_host if peer_host else "unknown"
 
 
-def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request: Request = None):
+def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request: Request = None) -> AdminPrincipal:
+    """R40 P0-2: 校验管理员凭证,返回 AdminPrincipal 身份对象。
+
+    旧实现返回 username 字符串,新路由调用 admin.id 对 "admin" 等用户名
+    会抛 ValueError 产生 500。现改为返回 AdminPrincipal,路由使用 principal.id
+    进行审计/RBAC,使用 principal.username 进行显示。
+    """
     if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
         raise HTTPException(status_code=503, detail="管理员账号未配置,请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD")
 
@@ -458,8 +495,10 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     # R39 P1-12: 密码强制哈希格式（Argon2id 或 PBKDF2），明文一律拒绝
     correct_password = _verify_password(credentials.password, settings.ADMIN_PASSWORD)
     if not (correct_username and correct_password):
-        # 记录失败
-        _login_failures[client_ip].append(now)
+        # R40 P0-2: 记录失败。使用 setdefault 防止 KeyError:
+        # 上面的清理逻辑在列表为空时会 del key,首次失败登录会触发该路径,
+        # 若直接 _login_failures[client_ip].append(now) 会抛 KeyError 产生 500。
+        _login_failures.setdefault(client_ip, []).append(now)
         _fire_and_forget(_persist_login_failures())
         # RFC 7235: 401 必须带 WWW-Authenticate 头，提示浏览器弹出认证框
         raise HTTPException(
@@ -471,13 +510,674 @@ def verify_admin(credentials: HTTPBasicCredentials = Depends(security), request:
     # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)
     _fire_and_forget(_persist_login_failures())
-    return credentials.username
+    # R40 P0-2: 返回 AdminPrincipal 而非字符串,避免路由中 admin.id 抛 ValueError
+    return AdminPrincipal(
+        id=_get_admin_principal_id(credentials.username),
+        username=credentials.username,
+        roles=["super_admin"],  # 单管理员默认超级管理员
+    )
+
+
+# ─── R40 P2-5: 服务端 session 认证 ──────────────────────────────
+# 新增 verify_session() — 优先从 cookie 读取 session_id 并验证,
+# 无有效 session 时返回 401 重定向到 /login。
+# 旧 verify_admin() 保留,作为 /login 路由的密码校验入口(HTTP Basic),
+# 避免破坏现有路由依赖。
+def _extract_session_id(request: Request) -> str:
+    """从请求 cookie 中提取 session_id。"""
+    if request is None:
+        return ""
+    return request.cookies.get("session_id", "")
+
+
+def verify_session(request: Request) -> AdminPrincipal:
+    """R40 P2-5: 基于 cookie session 的认证依赖。
+
+    优先从 cookie 读取 session_id 并调用 SessionManager.validate_session。
+    若 session 无效或不存在,抛 HTTPException(302 重定向到 /login)。
+
+    用法:
+        @app.get("/users")
+        async def users_page(request: Request, admin=Depends(verify_session)):
+            ...
+
+    Args:
+        request: FastAPI Request 对象
+
+    Returns:
+        AdminPrincipal 对象
+
+    Raises:
+        HTTPException: 302 重定向到 /login(无有效 session 时)
+    """
+    session_id = _extract_session_id(request)
+    if not session_id:
+        raise HTTPException(
+            status_code=302,
+            headers={"Location": "/login"},
+        )
+    # 异步调用需在路由函数内 await,这里采用同步降级策略:
+    # 通过 asyncio 获取事件循环并运行协程(若已在异步上下文则直接 await)
+    # FastAPI 路由依赖通常是同步的,这里通过 thread-local loop 处理
+    # 更安全的方案:路由直接 await validate_session(见下方 _async_validate_session)
+    try:
+        from admin.sessions import get_session_manager
+        manager = get_session_manager()
+        # 尝试在已有事件循环中运行(若在异步上下文)
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            # 已在异步上下文,无法直接 run_until_complete
+            # 此处降级为返回 401,让前端 JS 重定向
+            raise HTTPException(
+                status_code=401,
+                detail="请先登录",
+                headers={"Location": "/login"},
+            )
+        except RuntimeError:
+            # 无 running loop,可安全运行
+            principal = loop.run_until_complete(
+                manager.validate_session(session_id)
+            ) if loop else None
+            if principal is None:
+                raise HTTPException(
+                    status_code=302,
+                    headers={"Location": "/login"},
+                )
+            return principal
+    except HTTPException:
+        raise
+    except Exception as e:
+        from loguru import logger
+        logger.debug(f"[Admin] verify_session 失败: {e}")
+        raise HTTPException(
+            status_code=302,
+            headers={"Location": "/login"},
+        )
+
+
+async def _async_validate_session(request: Request) -> AdminPrincipal:
+    """R40 P2-5: 异步验证 session(供异步路由使用)。
+
+    用法:
+        @app.get("/users")
+        async def users_page(request: Request):
+            admin = await _async_validate_session(request)
+            ...
+    """
+    session_id = _extract_session_id(request)
+    if not session_id:
+        raise HTTPException(
+            status_code=302,
+            headers={"Location": "/login"},
+        )
+    from admin.sessions import get_session_manager
+    manager = get_session_manager()
+    principal = await manager.validate_session(session_id)
+    if principal is None:
+        raise HTTPException(
+            status_code=302,
+            headers={"Location": "/login"},
+        )
+    return principal
+
+
+# ─── R40 P2-5: /login 与 /logout 路由 ──────────────────────────
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    """R40 P2-5: 渲染登录表单(GET)。
+
+    无需认证,展示用户名/密码表单。
+    若已存在有效 session,重定向到首页。
+    """
+    # 检查是否已登录
+    session_id = _extract_session_id(request)
+    if session_id:
+        from admin.sessions import get_session_manager
+        manager = get_session_manager()
+        existing = await manager.validate_session(session_id)
+        if existing is not None:
+            return RedirectResponse(url="/", status_code=302)
+    # 渲染登录表单(简化:返回内联 HTML,避免新增模板文件)
+    csp_nonce = getattr(request.state, "csp_nonce", "") or ""
+    csrf_token = _get_csrf_token("__login__")
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>登录 - TG解码器管理后台</title>
+<style nonce="{csp_nonce}">
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       background: #f5f5f5; margin: 0; padding: 40px 20px; }}
+.login-container {{ max-width: 400px; margin: 60px auto; background: #fff;
+                    padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+h1 {{ margin: 0 0 24px 0; font-size: 24px; color: #333; }}
+label {{ display: block; margin-bottom: 8px; font-weight: 500; color: #555; }}
+input[type="text"], input[type="password"] {{ width: 100%; padding: 10px 12px;
+     border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
+input[type="text"]:focus, input[type="password"]:focus {{ outline: none;
+     border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
+button {{ width: 100%; padding: 12px; background: #4a90e2; color: #fff;
+        border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
+button:hover {{ background: #357abd; }}
+.error {{ color: #d32f2f; font-size: 13px; margin-top: 12px; min-height: 18px; }}
+</style>
+</head>
+<body>
+<div class="login-container">
+<h1>管理后台登录</h1>
+<form method="POST" action="/login">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div>
+<label for="username">用户名</label>
+<input type="text" id="username" name="username" autocomplete="username" required>
+</div>
+<div style="margin-top: 16px;">
+<label for="password">密码</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required>
+</div>
+<button type="submit">登录</button>
+<div class="error"></div>
+</form>
+</div>
+</body>
+</html>"""
+    response = HTMLResponse(content=html)
+    response.set_cookie(
+        key="csrf_token", value=csrf_token,
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+    )
+    return response
+
+
+@app.post("/login")
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    csrf_token: str = Form(...),
+):
+    """R40 P2-5: 处理登录表单提交(POST)。
+
+    1. CSRF 验证
+    2. 速率限制检查(复用 _login_failures)
+    3. 用户名密码校验(复用 _verify_password)
+    4. 创建 session 并设置 cookie
+    5. 重定向到首页
+    """
+    # CSRF 验证(cookie 中的 token 与表单中的 token 必须一致)
+    cookie_csrf = request.cookies.get("csrf_token", "")
+    if not cookie_csrf or not csrf_token or not secrets.compare_digest(cookie_csrf, csrf_token):
+        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+
+    if not settings.ADMIN_USERNAME or not settings.ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="管理员账号未配置")
+
+    # 速率限制检查(与 verify_admin 逻辑一致)
+    client_ip = _get_client_ip(request)
+    now = _time.time()
+    if client_ip not in _login_failures:
+        _login_failures[client_ip] = []
+    _login_failures[client_ip] = [
+        ts for ts in _login_failures[client_ip]
+        if now - ts < _LOGIN_LIMIT_WINDOW
+    ]
+    if not _login_failures[client_ip]:
+        del _login_failures[client_ip]
+        _fire_and_forget(_persist_login_failures())
+    elif len(_login_failures[client_ip]) >= _LOGIN_LIMIT_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail=f"登录尝试过于频繁,请 {_LOGIN_LIMIT_WINDOW // 60} 分钟后再试",
+        )
+
+    # 用户名常量时间比较
+    correct_username = secrets.compare_digest(
+        username.encode("utf8"),
+        settings.ADMIN_USERNAME.encode("utf8"),
+    )
+    correct_password = _verify_password(password, settings.ADMIN_PASSWORD)
+    if not (correct_username and correct_password):
+        _login_failures.setdefault(client_ip, []).append(now)
+        _fire_and_forget(_persist_login_failures())
+        # 返回登录页并显示错误信息(简化:返回 401)
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    # 登录成功,清除该 IP 的失败记录
+    _login_failures.pop(client_ip, None)
+    _fire_and_forget(_persist_login_failures())
+
+    # R40 P2-5: MFA 二步验证 — 检查用户是否已启用 MFA
+    principal_id = _get_admin_principal_id(username)
+    from admin.mfa import get_mfa_manager
+    mfa_manager = get_mfa_manager()
+    mfa_enabled = await mfa_manager.is_mfa_enabled(principal_id)
+    if mfa_enabled:
+        # 生成短时 MFA challenge token,5 分钟有效
+        challenge_token = secrets.token_urlsafe(32)
+        try:
+            from database.cache_store import get_cache_store
+            import json as _json
+            import time as _time_mod
+            await get_cache_store().set_kv(
+                f"admin:mfa:challenge:{challenge_token}",
+                _json.dumps({
+                    "username": username,
+                    "principal_id": principal_id,
+                    "expires_at": _time_mod.time() + 300,
+                }),
+            )
+        except Exception as e:
+            # challenge 写入失败,fail-closed:拒绝登录
+            import logging as _logging
+            _logging.getLogger("admin").error(f"MFA challenge 写入失败: {e}")
+            raise HTTPException(status_code=503, detail="MFA 会话创建失败,请重试")
+        # 返回 MFA 输入页面(显示 6 位 TOTP 输入框)
+        return _render_mfa_input_page(request, challenge_token, username)
+
+    # R40 P2-5: 创建 session(MFA 未启用或验证通过后到达此处)
+    from admin.sessions import get_session_manager
+    manager = get_session_manager()
+    principal = AdminPrincipal(
+        id=principal_id,
+        username=username,
+        roles=["super_admin"],
+    )
+    session_id = await manager.create_session(principal)
+    if not session_id:
+        # session 创建失败,降级为 HTTP Basic(返回 503)
+        raise HTTPException(status_code=503, detail="会话创建失败,请重试")
+
+    # 设置 session cookie 并重定向到首页
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        key="session_id", value=session_id,
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=8 * 3600,
+    )
+    return response
+
+
+def _render_mfa_input_page(request: Request, challenge_token: str, username: str) -> HTMLResponse:
+    """R40 P2-5: 渲染 MFA 二步验证输入页面(显示 6 位 TOTP 输入框)。"""
+    csp_nonce = getattr(request.state, "csp_nonce", "") or ""
+    csrf_token = _get_csrf_token("__login__")
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MFA 验证 - TG解码器管理后台</title>
+<style nonce="{csp_nonce}">
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       background: #f5f5f5; margin: 0; padding: 40px 20px; }}
+.login-container {{ max-width: 400px; margin: 60px auto; background: #fff;
+                    padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+h1 {{ margin: 0 0 24px 0; font-size: 24px; color: #333; }}
+label {{ display: block; margin-bottom: 8px; font-weight: 500; color: #555; }}
+input[type="text"] {{ width: 100%; padding: 10px 12px;
+     border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box;
+     letter-spacing: 4px; text-align: center; }}
+input[type="text"]:focus {{ outline: none;
+     border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
+button {{ width: 100%; padding: 12px; background: #4a90e2; color: #fff;
+        border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
+button:hover {{ background: #357abd; }}
+.hint {{ color: #888; font-size: 12px; margin-top: 12px; }}
+</style>
+</head>
+<body>
+<div class="login-container">
+<h1>MFA 二步验证</h1>
+<p style="color:#555; font-size:14px;">用户 {username} 已启用 MFA,请输入身份验证器 App 中的 6 位代码</p>
+<form method="POST" action="/login/mfa">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<input type="hidden" name="challenge_token" value="{challenge_token}">
+<div style="margin-top: 16px;">
+<label for="totp_code">6 位验证码</label>
+<input type="text" id="totp_code" name="totp_code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" required>
+</div>
+<button type="submit">验证</button>
+<div class="hint">验证码每 30 秒更新一次,允许 ±30s 时间漂移</div>
+</form>
+</div>
+</body>
+</html>"""
+    response = HTMLResponse(content=html)
+    response.set_cookie(
+        key="csrf_token", value=csrf_token,
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+    )
+    return response
+
+
+@app.post("/login/mfa")
+async def login_mfa_verify(
+    request: Request,
+    challenge_token: str = Form(...),
+    totp_code: str = Form(...),
+    csrf_token: str = Form(...),
+):
+    """R40 P2-5: MFA 二步验证 — 校验 TOTP 代码并创建 session。
+
+    流程:
+    1. CSRF 验证
+    2. 从 kv_store 读取 challenge_token 关联的 username(5 分钟内有效)
+    3. 校验 TOTP 6 位代码
+    4. 验证通过 → 创建 session,重定向到首页
+    5. 验证失败 → 返回 401
+    """
+    # CSRF 验证
+    cookie_csrf = request.cookies.get("csrf_token", "")
+    if not cookie_csrf or not csrf_token or not secrets.compare_digest(cookie_csrf, csrf_token):
+        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+
+    if not challenge_token or not totp_code:
+        raise HTTPException(status_code=400, detail="缺少 challenge_token 或 totp_code")
+
+    # 从 kv_store 读取 challenge 数据
+    import json as _json
+    import time as _time_mod
+    from database.cache_store import get_cache_store
+    try:
+        store = get_cache_store()
+        raw = await store.get_kv(f"admin:mfa:challenge:{challenge_token}")
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger("admin").error(f"MFA challenge 读取失败: {e}")
+        raise HTTPException(status_code=503, detail="MFA 会话读取失败")
+    if not raw:
+        raise HTTPException(status_code=401, detail="MFA 会话已过期,请重新登录")
+    try:
+        challenge_data = _json.loads(raw)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="MFA 会话数据无效")
+
+    # 检查过期时间
+    expires_at = challenge_data.get("expires_at", 0)
+    if _time_mod.time() > expires_at:
+        raise HTTPException(status_code=401, detail="MFA 会话已过期,请重新登录")
+
+    username = challenge_data.get("username", "")
+    principal_id = int(challenge_data.get("principal_id", 0))
+    if not username or principal_id <= 0:
+        raise HTTPException(status_code=401, detail="MFA 会话数据无效")
+
+    # 校验 TOTP 代码
+    from admin.mfa import get_mfa_manager
+    mfa_manager = get_mfa_manager()
+    ok = await mfa_manager.verify_totp_code(principal_id, totp_code)
+    if not ok:
+        raise HTTPException(status_code=401, detail="MFA 验证码错误")
+
+    # 验证通过,删除 challenge token(防止重放)
+    try:
+        await store._db.execute(
+            "DELETE FROM kv_store WHERE key = ?",
+            (f"admin:mfa:challenge:{challenge_token}",),
+        )
+        await store._db.commit()
+    except Exception:
+        pass
+
+    # 创建 session
+    from admin.sessions import get_session_manager
+    manager = get_session_manager()
+    principal = AdminPrincipal(
+        id=principal_id,
+        username=username,
+        roles=["super_admin"],
+    )
+    session_id = await manager.create_session(principal)
+    if not session_id:
+        raise HTTPException(status_code=503, detail="会话创建失败,请重试")
+
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        key="session_id", value=session_id,
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=8 * 3600,
+    )
+    return response
+
+
+@app.post("/logout")
+async def logout_submit(
+    request: Request,
+    csrf_token: str = Form(...),
+):
+    """R40 P2-5: 注销路由(POST)。
+
+    1. CSRF 验证
+    2. 销毁 session
+    3. 清除 cookie
+    4. 重定向到 /login
+    """
+    # CSRF 验证
+    cookie_csrf = request.cookies.get("csrf_token", "")
+    if not cookie_csrf or not csrf_token or not secrets.compare_digest(cookie_csrf, csrf_token):
+        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+
+    session_id = _extract_session_id(request)
+    if session_id:
+        from admin.sessions import get_session_manager
+        manager = get_session_manager()
+        await manager.destroy_session(session_id)
+
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie(key="session_id")
+    return response
+
+
+# ─── R40 P2-5: MFA 管理路由(/mfa/setup, /mfa/disable) ──────────
+
+@app.get("/mfa/setup", response_class=HTMLResponse)
+async def mfa_setup_page(
+    request: Request,
+    admin=Depends(verify_admin),
+):
+    """R40 P2-5: MFA 设置页面(GET)。
+
+    - 若已启用 MFA → 提示已启用,提供禁用入口
+    - 若未启用 → 生成新 secret,展示 otpauth URI 供用户扫描/手动输入
+    """
+    from admin.mfa import get_mfa_manager
+    principal_id = admin.id
+    mfa_manager = get_mfa_manager()
+    mfa_enabled = await mfa_manager.is_mfa_enabled(principal_id)
+
+    # 若未启用,生成新 secret(覆盖旧的未确认 secret)
+    secret = ""
+    provisioning_uri = ""
+    if not mfa_enabled:
+        secret = await mfa_manager.generate_totp_secret(principal_id)
+        try:
+            import pyotp
+            totp = pyotp.TOTP(secret)
+            # provisioning_uri 包含 secret + issuer + account(可被 Authenticator 扫描)
+            issuer = "TG解码器管理后台"
+            account = admin.username or "admin"
+            provisioning_uri = totp.provisioning_uri(name=account, issuer_name=issuer)
+        except ImportError:
+            provisioning_uri = ""
+
+    csp_nonce = getattr(request.state, "csp_nonce", "") or ""
+    csrf_token = _get_csrf_token(admin.username)
+    if mfa_enabled:
+        body_html = f"""
+<div class="mfa-container">
+<h1>MFA 已启用</h1>
+<p style="color:#555; font-size:14px;">您的账户已启用多因素认证。</p>
+<p style="color:#888; font-size:13px;">如需禁用,请使用下方表单(需要密码确认)。</p>
+<form method="POST" action="/mfa/disable" style="margin-top:24px;">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<div style="margin-top: 16px;">
+<label for="password">密码确认</label>
+<input type="password" id="password" name="password" required>
+</div>
+<button type="submit">禁用 MFA</button>
+</form>
+</div>"""
+    else:
+        # 显示 QR URI 和 secret(用户可手动输入或扫描 QR 生成工具)
+        secret_display = secret or ""
+        uri_display = provisioning_uri or "(pyotp 未安装,无法生成 URI)"
+        body_html = f"""
+<div class="mfa-container">
+<h1>设置 MFA</h1>
+<p style="color:#555; font-size:14px;">扫描下方 otpauth URI 或手动输入 secret 到身份验证器 App</p>
+<div style="margin-top:16px; padding:12px; background:#f5f5f5; border-radius:4px; word-break:break-all;">
+<strong>Secret:</strong><br>
+<code>{secret_display}</code>
+</div>
+<div style="margin-top:12px; padding:12px; background:#f5f5f5; border-radius:4px; word-break:break-all;">
+<strong>otpauth URI:</strong><br>
+<code>{uri_display}</code>
+</div>
+<form method="POST" action="/mfa/setup" style="margin-top:24px;">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
+<input type="hidden" name="secret" value="{secret_display}">
+<div style="margin-top: 16px;">
+<label for="totp_code">输入身份验证器中的 6 位代码以确认</label>
+<input type="text" id="totp_code" name="totp_code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" required>
+</div>
+<button type="submit">确认启用</button>
+</form>
+</div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MFA 设置 - TG解码器管理后台</title>
+<style nonce="{csp_nonce}">
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       background: #f5f5f5; margin: 0; padding: 40px 20px; }}
+.mfa-container {{ max-width: 600px; margin: 40px auto; background: #fff;
+                  padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
+h1 {{ margin: 0 0 24px 0; font-size: 22px; color: #333; }}
+label {{ display: block; margin-bottom: 8px; font-weight: 500; color: #555; }}
+input[type="text"], input[type="password"] {{ width: 100%; padding: 10px 12px;
+     border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
+input[type="text"]:focus, input[type="password"]:focus {{ outline: none;
+     border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
+button {{ padding: 12px 24px; background: #4a90e2; color: #fff;
+        border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
+button:hover {{ background: #357abd; }}
+code {{ font-family: "Courier New", monospace; font-size: 13px; color: #333; }}
+</style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"""
+    response = HTMLResponse(content=html)
+    response.set_cookie(
+        key="csrf_token", value=csrf_token,
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+    )
+    return response
+
+
+@app.post("/mfa/setup")
+async def mfa_setup_verify(
+    request: Request,
+    secret: str = Form(...),
+    totp_code: str = Form(...),
+    csrf_token: str = Form(...),
+    admin=Depends(verify_admin),
+):
+    """R40 P2-5: MFA 设置确认(POST)— 验证 TOTP 代码后启用 MFA。
+
+    流程:
+    1. CSRF 验证
+    2. 校验 secret 与表单中的 totp_code
+    3. 验证通过 → 启用 MFA(标记 enabled=1)
+    4. 重定向到首页
+    """
+    if not _verify_csrf(request, csrf_token, username=admin.username):
+        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+
+    if not secret or not totp_code:
+        raise HTTPException(status_code=400, detail="缺少 secret 或 totp_code")
+
+    from admin.mfa import _verify_totp, get_mfa_manager
+    # 直接验证表单提交的 secret(尚未启用,不走 MFAManager.verify_totp_code)
+    if not _verify_totp(secret, totp_code):
+        raise HTTPException(status_code=401, detail="TOTP 验证码错误,请重试")
+
+    # 验证通过,启用 MFA(写入 enabled=1)
+    mfa_manager = get_mfa_manager()
+    ok = await mfa_manager.enable_mfa(admin.id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="启用 MFA 失败,请重试")
+
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        key="csrf_token", value=_get_csrf_token(admin.username),
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+    )
+    return response
+
+
+@app.post("/mfa/disable")
+async def mfa_disable(
+    request: Request,
+    password: str = Form(...),
+    csrf_token: str = Form(...),
+    admin=Depends(verify_admin),
+):
+    """R40 P2-5: 禁用 MFA(POST)— 需要密码确认。
+
+    流程:
+    1. CSRF 验证
+    2. 密码确认(防止会话被劫持后禁用 MFA)
+    3. 删除 secret + enabled 标记
+    4. 重定向到首页
+    """
+    if not _verify_csrf(request, csrf_token, username=admin.username):
+        raise HTTPException(status_code=403, detail="CSRF token 验证失败")
+
+    # 密码确认(防止会话劫持后禁用 MFA)
+    if not _verify_password(password, settings.ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="密码确认失败")
+
+    from admin.mfa import get_mfa_manager
+    mfa_manager = get_mfa_manager()
+    ok = await mfa_manager.disable_mfa(admin.id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="禁用 MFA 失败,请重试")
+
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        key="csrf_token", value=_get_csrf_token(admin.username),
+        httponly=True, samesite="strict",
+        secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+    )
+    return response
 
 
 def _make_csrf_response(template_name: str, context: dict, username: str = "") -> HTMLResponse:
-    """生成带 CSRF cookie 的 HTML 响应。"""
+    """生成带 CSRF cookie 的 HTML 响应。
+
+    R40 P1-13: 注入 csp_nonce 到模板上下文,供 inline <script>/<style> 标签使用。
+    CSP 中间件已将 per-request nonce 写入 request.state.csp_nonce。
+    """
     token = _get_csrf_token(username)
     context["csrf_token"] = token
+    # R40 P1-13: 从 request.state 提取 csp_nonce 注入模板上下文
+    req = context.get("request")
+    csp_nonce = ""
+    if req is not None:
+        csp_nonce = getattr(req.state, "csp_nonce", "") or ""
+    context["csp_nonce"] = csp_nonce
     response = templates.TemplateResponse(template_name, context)
     response.set_cookie(
         key="csrf_token",
@@ -566,7 +1266,7 @@ async def dashboard(request: Request, admin=Depends(verify_admin)):
             "backup_count": metrics.backup_count,
             "backup_fail": metrics.backup_fail_count,
         },
-        username=admin,
+        username=admin.username,
     )
 
 
@@ -604,7 +1304,7 @@ async def users_page(
             "search": search,
             "total_pages": max(1, (total + per_page - 1) // per_page),
         },
-        username=admin,
+        username=admin.username,
     )
 
 
@@ -617,7 +1317,7 @@ async def update_membership(
     admin=Depends(verify_admin),
 ):
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token, username=admin):
+    if not _verify_csrf(request, csrf_token, username=admin.username):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
     if level not in ("free", "basic", "premium"):
@@ -652,7 +1352,7 @@ async def update_membership(
 
     await users_col.update_one({"user_id": user_id}, update)
     response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin.username), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
     return response
 
 
@@ -663,21 +1363,52 @@ async def toggle_ban(
     csrf_token: str = Form(...),
     admin=Depends(verify_admin),
 ):
+    """R40 P0-8: 切换用户封禁状态(通过 CommandBus 强制 RBAC + 审批门禁)。
+
+    根据当前 is_banned 状态决定 ban 还是 unban:
+    - 未封禁 → make_ban_user_command(需审批)
+    - 已封禁 → make_unban_user_command(不需审批)
+    """
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token, username=admin):
+    if not _verify_csrf(request, csrf_token, username=admin.username):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
+    # 先查询当前状态决定 ban 还是 unban
     users_col = get_users_col()
     user = await users_col.find_one({"user_id": user_id})
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
-    new_ban = not user.get("is_banned", False)
-    await users_col.update_one(
-        {"user_id": user_id},
-        {"$set": {"is_banned": new_ban, "updated_at": datetime.datetime.now(datetime.timezone.utc)}},
+    is_currently_banned = bool(user.get("is_banned", False))
+
+    # R40 P0-8: 通过 CommandBus 强制 RBAC + 审批门禁
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal,
+        make_ban_user_command, make_unban_user_command,
     )
-    response = RedirectResponse(url="/users", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
+    cb_principal = CBPrincipal(id=admin.id, name=admin.username, source="web")
+    bus = CommandBus()
+    if is_currently_banned:
+        # 已封禁 → 解封(不需审批)
+        command = make_unban_user_command(user_id=user_id)
+    else:
+        # 未封禁 → 封禁(需审批)
+        command = make_ban_user_command(
+            user_id=user_id, reason="admin_web_toggle", duration_days=0,
+        )
+    result = await bus.execute(command, cb_principal)
+
+    if result.approval_required:
+        # 封禁需审批,重定向到审批列表页
+        response = RedirectResponse(
+            url=f"/approvals?approval_id={result.approval_id}", status_code=303,
+        )
+    elif result.success:
+        response = RedirectResponse(url="/users", status_code=303)
+    else:
+        # 权限不足 / 执行失败
+        raise HTTPException(status_code=403, detail=result.error)
+
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin.username), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
     return response
 
 
@@ -715,7 +1446,7 @@ async def files_page(
             "search": search,
             "total_pages": max(1, (total + per_page - 1) // per_page),
         },
-        username=admin,
+        username=admin.username,
     )
 
 
@@ -726,33 +1457,35 @@ async def delete_file(
     csrf_token: str = Form(...),
     admin=Depends(verify_admin),
 ):
+    """R40 P0-8: 删除文件(通过 CommandBus 强制 RBAC 门禁)。
+
+    软删除(requires_approval=False) — 可立即执行,但 RBAC 权限校验仍强制。
+    """
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token, username=admin):
+    if not _verify_csrf(request, csrf_token, username=admin.username):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
 
-    # R39 P1-5: 使用 tombstone 软删除 — 同时设置 deleted_at + status='deleted',
-    # 并通过 cache_store.soft_delete 写入 dirty_outbox tombstone(供 crdb_sync 同步到 CRDB)
-    import datetime as _dt
-    deleted_at = _dt.datetime.now().isoformat()
-    files_col = get_file_records_col()
-    result = await files_col.update_one(
-        {"file_code": file_code},
-        {"$set": {"status": "deleted", "deleted_at": deleted_at}},
+    # R40 P0-8: 通过 CommandBus 强制 RBAC 门禁(软删除不需审批,可立即执行)
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_delete_file_command,
     )
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="文件不存在")
-    # R39 P1-5: 写本地 SQLite tombstone + dirty_outbox(保证 CRDB 同步删除事件)
-    try:
-        from database.cache_store import get_cache_store
-        await get_cache_store().soft_delete("file_records", file_code, deleted_at)
-    except Exception as e:
-        # CRDB 已更新,本地 tombstone 失败仅记录(下次 crdb_sync 会通过 status='deleted' 补偿)
-        import logging as _logging
-        _logging.getLogger("admin").warning(
-            f"R39 P1-5: soft_delete 本地 tombstone 失败(已更新 CRDB): {e}"
-        )
-    response = RedirectResponse(url="/files", status_code=303)
-    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
+    cb_principal = CBPrincipal(id=admin.id, name=admin.username, source="web")
+    command = make_delete_file_command(file_code=file_code)
+    bus = CommandBus()
+    result = await bus.execute(command, cb_principal)
+
+    if result.success:
+        response = RedirectResponse(url="/files", status_code=303)
+    else:
+        # 区分文件不存在(404) / 权限不足(403) / 其他失败(500)
+        err = result.error or ""
+        if "不存在" in err:
+            raise HTTPException(status_code=404, detail=err)
+        if "权限" in err:
+            raise HTTPException(status_code=403, detail=err)
+        raise HTTPException(status_code=500, detail=err)
+
+    response.set_cookie(key="csrf_token", value=_get_csrf_token(admin.username), httponly=True, samesite="strict", secure=settings.CSRF_COOKIE_SECURE, max_age=3600)
     return response
 
 
@@ -793,7 +1526,7 @@ async def logs_page(
             "per_page": per_page,
             "total_pages": max(1, (total + per_page - 1) // per_page),
         },
-        username=admin,
+        username=admin.username,
     )
 
 
@@ -818,7 +1551,7 @@ async def health_page(request: Request, admin=Depends(verify_admin)):
             "request": request,
             "bot_statuses": bot_statuses,
         },
-        username=admin,
+        username=admin.username,
     )
 
 
@@ -826,27 +1559,33 @@ async def health_page(request: Request, admin=Depends(verify_admin)):
 
 
 @app.get("/tasks", response_class=HTMLResponse)
-async def tasks_page(request: Request, admin: str = Depends(verify_admin)):
-    """R40: 任务中心 — 查看所有任务"""
-    from services.task_center import list_user_tasks
-    # 查询最近 100 条任务(user_id=0 表示所有用户)
-    tasks = await list_user_tasks(0, limit=100)
+async def tasks_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
+    """R40: 任务中心 — 查看所有用户任务
+
+    R40 P1-1 修复:
+        原实现调用 list_user_tasks(0, limit=100),意图是"查询所有用户",
+        但实际执行 WHERE user_id=0,仅返回 user_id=0 的任务(通常为空)。
+        现改用 list_all_tasks 不带 user_id 过滤,真正查询所有用户任务。
+    """
+    from services.task_center import list_all_tasks
+    # 查询最近 100 条所有用户任务(不带 user_id 过滤)
+    tasks = await list_all_tasks(limit=100, offset=0)
     return _make_csrf_response(
         "tasks.html",
         {"request": request, "admin": admin, "tasks": tasks},
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/reports", response_class=HTMLResponse)
-async def reports_page(request: Request, admin: str = Depends(verify_admin)):
+async def reports_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 举报管理 — 待处理举报列表"""
     from services.content_reports import list_reports
     result = await list_reports(status="pending")
     return _make_csrf_response(
         "reports.html",
         {"request": request, "admin": admin, "reports": result.get("items", [])},
-        username=admin,
+        username=admin.username,
     )
 
 
@@ -855,23 +1594,42 @@ async def takedown_report(
     report_id: int,
     request: Request,
     csrf_token: str = Form(...),
-    admin: str = Depends(verify_admin),
+    admin: AdminPrincipal = Depends(verify_admin),
 ):
-    """R40: 下架举报内容"""
+    """R40 P0-8: 下架举报内容(通过 CommandBus 强制 RBAC + 审批门禁)"""
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token, username=admin):
+    if not _verify_csrf(request, csrf_token, username=admin.username):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
-    from services.content_reports import get_report, takedown_content
+    from services.content_reports import get_report
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_takedown_command,
+    )
     report = await get_report(report_id)
     if not report:
         raise HTTPException(status_code=404, detail="举报不存在")
-    await takedown_content(
-        report["target_type"], report["target_id"],
-        report["reason"], admin_id=int(admin),
+
+    # R40 P0-8: 通过 CommandBus 执行(RBAC 权限校验 + 审批强制门禁)
+    cb_principal = CBPrincipal(id=admin.id, name=admin.username, source="web")
+    command = make_takedown_command(
+        target_type=report["target_type"],
+        target_id=str(report["target_id"]),
+        reason=report.get("reason", ""),
     )
-    response = RedirectResponse(url="/reports", status_code=303)
+    bus = CommandBus()
+    result = await bus.execute(command, cb_principal)
+
+    if result.approval_required:
+        # 高风险操作需审批,重定向到审批列表页
+        response = RedirectResponse(
+            url=f"/approvals?approval_id={result.approval_id}", status_code=303,
+        )
+    elif result.success:
+        response = RedirectResponse(url="/reports", status_code=303)
+    else:
+        raise HTTPException(status_code=403, detail=result.error)
+
     response.set_cookie(
-        key="csrf_token", value=_get_csrf_token(admin),
+        key="csrf_token", value=_get_csrf_token(admin.username),
         httponly=True, samesite="strict",
         secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
     )
@@ -879,43 +1637,43 @@ async def takedown_report(
 
 
 @app.get("/collections", response_class=HTMLResponse)
-async def collections_page(request: Request, admin: str = Depends(verify_admin)):
+async def collections_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 集合管理 — 查看所有集合"""
     from services.collections import list_collections
     result = await list_collections()
     return _make_csrf_response(
         "collections.html",
         {"request": request, "admin": admin, "collections": result.get("items", [])},
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/notifications", response_class=HTMLResponse)
-async def notifications_page(request: Request, admin: str = Depends(verify_admin)):
+async def notifications_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 通知中心 — 查看所有通知"""
     from services.notifications import list_all_notifications
     result = await list_all_notifications()
     return _make_csrf_response(
         "notifications.html",
         {"request": request, "admin": admin, "notifications": result.get("items", [])},
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/approvals", response_class=HTMLResponse)
-async def approvals_page(request: Request, admin: str = Depends(verify_admin)):
+async def approvals_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 审批管理 — 待审批列表"""
     from services.approval_workflow import list_pending
     result = await list_pending()
     return _make_csrf_response(
         "approvals.html",
         {"request": request, "admin": admin, "approvals": result.get("items", [])},
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/rbac", response_class=HTMLResponse)
-async def rbac_page(request: Request, admin: str = Depends(verify_admin)):
+async def rbac_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: RBAC 角色管理 — 角色与权限列表"""
     from services.rbac import list_roles, list_permissions
     roles = await list_roles()
@@ -923,12 +1681,12 @@ async def rbac_page(request: Request, admin: str = Depends(verify_admin)):
     return _make_csrf_response(
         "rbac.html",
         {"request": request, "admin": admin, "roles": roles, "permissions": permissions},
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/repair-console", response_class=HTMLResponse)
-async def repair_console_page(request: Request, admin: str = Depends(verify_admin)):
+async def repair_console_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 修复控制台 — Outbox/DLQ/Replication/Relay"""
     from services.repair_console import (
         get_repair_overview, list_outbox, list_dlq, list_replication_failures,
@@ -944,12 +1702,12 @@ async def repair_console_page(request: Request, admin: str = Depends(verify_admi
             "overview": overview, "outbox": outbox,
             "dlq": dlq, "replication": repl,
         },
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/topology", response_class=HTMLResponse)
-async def topology_page(request: Request, admin: str = Depends(verify_admin)):
+async def topology_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 拓扑可视化"""
     from services.topology_view import get_topology, get_health_summary
     topology = await get_topology()
@@ -957,12 +1715,12 @@ async def topology_page(request: Request, admin: str = Depends(verify_admin)):
     return _make_csrf_response(
         "topology.html",
         {"request": request, "admin": admin, "topology": topology, "summary": summary},
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/ru-cost", response_class=HTMLResponse)
-async def ru_cost_page(request: Request, admin: str = Depends(verify_admin)):
+async def ru_cost_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: RU 成本中心"""
     from services.ru_cost_center import get_daily_report, check_ru_alert
     report = await get_daily_report()
@@ -970,12 +1728,12 @@ async def ru_cost_page(request: Request, admin: str = Depends(verify_admin)):
     return _make_csrf_response(
         "ru_cost.html",
         {"request": request, "admin": admin, "report": report, "alert": alert},
-        username=admin,
+        username=admin.username,
     )
 
 
 @app.get("/maintenance", response_class=HTMLResponse)
-async def maintenance_page(request: Request, admin: str = Depends(verify_admin)):
+async def maintenance_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 维护模式控制台"""
     from services.maintenance_mode import get_status, check_readiness
     status = await get_status()
@@ -983,7 +1741,7 @@ async def maintenance_page(request: Request, admin: str = Depends(verify_admin))
     return _make_csrf_response(
         "maintenance.html",
         {"request": request, "admin": admin, "status": status, "readiness": readiness},
-        username=admin,
+        username=admin.username,
     )
 
 
@@ -993,22 +1751,40 @@ async def maintenance_action(
     request: Request,
     csrf_token: str = Form(...),
     reason: str = Form("手动维护"),
-    admin: str = Depends(verify_admin),
+    admin: AdminPrincipal = Depends(verify_admin),
 ):
-    """R40: 维护模式操作(enable/disable)"""
+    """R40 P0-8: 维护模式操作(通过 CommandBus 强制 RBAC + 审批门禁)"""
     # CSRF 验证
-    if not _verify_csrf(request, csrf_token, username=admin):
+    if not _verify_csrf(request, csrf_token, username=admin.username):
         raise HTTPException(status_code=403, detail="CSRF token 验证失败")
-    from services.maintenance_mode import enable, disable
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal,
+        make_enable_maintenance_command, make_disable_maintenance_command,
+    )
+    cb_principal = CBPrincipal(id=admin.id, name=admin.username, source="web")
+    bus = CommandBus()
+
     if action == "enable":
-        await enable(reason, started_by=int(admin))
+        command = make_enable_maintenance_command(reason=reason)
+        result = await bus.execute(command, cb_principal)
     elif action == "disable":
-        await disable(ended_by=int(admin))
+        command = make_disable_maintenance_command()
+        result = await bus.execute(command, cb_principal)
     else:
         raise HTTPException(status_code=400, detail="无效的操作类型")
-    response = RedirectResponse(url="/maintenance", status_code=303)
+
+    if result.approval_required:
+        # 高风险操作需审批,重定向到审批列表页
+        response = RedirectResponse(
+            url=f"/approvals?approval_id={result.approval_id}", status_code=303,
+        )
+    elif result.success:
+        response = RedirectResponse(url="/maintenance", status_code=303)
+    else:
+        raise HTTPException(status_code=403, detail=result.error)
+
     response.set_cookie(
-        key="csrf_token", value=_get_csrf_token(admin),
+        key="csrf_token", value=_get_csrf_token(admin.username),
         httponly=True, samesite="strict",
         secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
     )
@@ -1016,7 +1792,7 @@ async def maintenance_action(
 
 
 @app.get("/disaster-recovery", response_class=HTMLResponse)
-async def disaster_recovery_page(request: Request, admin: str = Depends(verify_admin)):
+async def disaster_recovery_page(request: Request, admin: AdminPrincipal = Depends(verify_admin)):
     """R40: 灾备控制台"""
     from services.disaster_recovery import list_backups, get_rpo_rto, get_backup_schedule
     backups = await list_backups()
@@ -1028,5 +1804,5 @@ async def disaster_recovery_page(request: Request, admin: str = Depends(verify_a
             "request": request, "admin": admin,
             "backups": backups, "rpo_rto": rpo_rto, "schedule": schedule,
         },
-        username=admin,
+        username=admin.username,
     )

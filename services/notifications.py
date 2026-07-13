@@ -76,20 +76,21 @@ async def send(user_id: int, notif_type: str, payload: dict) -> int:
         return 0
     now = _dt.datetime.now().isoformat()
     payload_json = _safe_json_dumps(payload)
+    # R40 P0-5: 业务表 + dirty_outbox 同事务
     try:
-        cursor = await store._db.execute(
-            """INSERT INTO notifications (user_id, type, payload, is_read, created_at)
-               VALUES (?, ?, ?, 0, ?)""",
-            (user_id, notif_type, payload_json, now),
-        )
-        await store._db.commit()
-        notif_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-        if notif_id:
-            await store.add_dirty_outbox("notifications", str(notif_id))
-            logger.info(
-                f"[notifications] 发送通知 id={notif_id} "
-                f"user_id={user_id} type={notif_type}"
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """INSERT INTO notifications (user_id, type, payload, is_read, created_at)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (user_id, notif_type, payload_json, now),
             )
+            notif_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if notif_id:
+                await store.add_dirty_outbox("notifications", str(notif_id), connection=tx)
+                logger.info(
+                    f"[notifications] 发送通知 id={notif_id} "
+                    f"user_id={user_id} type={notif_type}"
+                )
         return notif_id
     except Exception as e:
         logger.warning(f"[notifications] send 失败: {e}")
@@ -109,14 +110,17 @@ async def mark_read(notif_id: int) -> bool:
     if not store._db:
         return False
     try:
-        cursor = await store._db.execute(
-            "UPDATE notifications SET is_read = 1 WHERE id = ?",
-            (notif_id,),
-        )
-        await store._db.commit()
-        ok = bool(cursor and cursor.rowcount > 0)
-        if ok:
-            await store.add_dirty_outbox("notifications", str(notif_id))
+        # R40 P0-5: 业务表 + dirty_outbox 同事务
+        # R40 P2-4: 同时写入 read_at,供 Prometheus 通知投递延迟指标采集
+        now = _dt.datetime.now().isoformat()
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE notifications SET is_read = 1, read_at = ? WHERE id = ?",
+                (now, notif_id),
+            )
+            ok = bool(cursor and cursor.rowcount > 0)
+            if ok:
+                await store.add_dirty_outbox("notifications", str(notif_id), connection=tx)
         return ok
     except Exception as e:
         logger.warning(f"[notifications] mark_read 失败: {e}")
@@ -136,18 +140,24 @@ async def mark_all_read(user_id: int) -> int:
     if not store._db:
         return 0
     try:
-        cursor = await store._db.execute(
-            "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
-            (user_id,),
-        )
-        await store._db.commit()
-        count = int(cursor.rowcount) if cursor else 0
-        if count > 0:
-            # 用 user:<id> 作为 pk 范围标记,触发批量同步
-            await store.add_dirty_outbox("notifications", f"user:{user_id}")
-            logger.info(
-                f"[notifications] 标记 {count} 条已读 user_id={user_id}"
+        # R40 P0-5: 业务表 + dirty_outbox 同事务
+        # R40 P2-4: 同时写入 read_at,供 Prometheus 通知投递延迟指标采集
+        now = _dt.datetime.now().isoformat()
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE notifications SET is_read = 1, read_at = ? "
+                "WHERE user_id = ? AND is_read = 0",
+                (now, user_id),
             )
+            count = int(cursor.rowcount) if cursor else 0
+            if count > 0:
+                # 用 user:<id> 作为 pk 范围标记,触发批量同步
+                await store.add_dirty_outbox(
+                    "notifications", f"user:{user_id}", connection=tx,
+                )
+                logger.info(
+                    f"[notifications] 标记 {count} 条已读 user_id={user_id}"
+                )
         return count
     except Exception as e:
         logger.warning(f"[notifications] mark_all_read 失败: {e}")
@@ -276,23 +286,26 @@ async def broadcast(notif_type: str, payload: dict,
         if not user_ids:
             return 0
         sent = 0
-        for uid in user_ids:
-            try:
-                cur = await store._db.execute(
-                    """INSERT INTO notifications
-                       (user_id, type, payload, is_read, created_at)
-                       VALUES (?, ?, ?, 0, ?)""",
-                    (uid, notif_type, payload_json, now),
-                )
-                if cur and cur.lastrowid:
-                    nid = int(cur.lastrowid)
-                    await store.add_dirty_outbox("notifications", str(nid))
-                    sent += 1
-            except Exception as inner_e:
-                logger.warning(
-                    f"[notifications] broadcast 单条失败 user_id={uid}: {inner_e}"
-                )
-        await store._db.commit()
+        # R40 P0-5: 批量写入 + dirty_outbox 同事务(任一失败回滚整批)
+        async with store.transaction() as tx:
+            for uid in user_ids:
+                try:
+                    cur = await tx.execute(
+                        """INSERT INTO notifications
+                           (user_id, type, payload, is_read, created_at)
+                           VALUES (?, ?, ?, 0, ?)""",
+                        (uid, notif_type, payload_json, now),
+                    )
+                    if cur and cur.lastrowid:
+                        nid = int(cur.lastrowid)
+                        await store.add_dirty_outbox(
+                            "notifications", str(nid), connection=tx,
+                        )
+                        sent += 1
+                except Exception as inner_e:
+                    logger.warning(
+                        f"[notifications] broadcast 单条失败 user_id={uid}: {inner_e}"
+                    )
         logger.info(
             f"[notifications] broadcast 发送 {sent}/{len(user_ids)} type={notif_type}"
         )

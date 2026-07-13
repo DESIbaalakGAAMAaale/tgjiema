@@ -88,21 +88,22 @@ async def create_task(task_type: str, user_id: int, payload: dict, trace_id: str
     tid = trace_id or (get_trace_id() or "")
     now = _dt.datetime.now().isoformat()
     payload_json = _safe_json_dumps(payload)
+    # R40 P0-5: 业务表 + dirty_outbox 同事务,失败整体回滚
     try:
-        cursor = await store._db.execute(
-            """INSERT INTO tasks (task_type, user_id, status, progress, eta_seconds,
-                                   payload, trace_id, created_at, updated_at)
-               VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)""",
-            (task_type, user_id, STATUS_PENDING, payload_json, tid, now, now),
-        )
-        await store._db.commit()
-        task_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-        if task_id:
-            # 写 dirty_outbox 触发 CRDB 同步
-            await store.add_dirty_outbox("tasks", str(task_id))
-            logger.info(
-                f"[task_center] 创建任务 task_id={task_id} type={task_type} user_id={user_id}"
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """INSERT INTO tasks (task_type, user_id, status, progress, eta_seconds,
+                                       payload, trace_id, created_at, updated_at)
+                   VALUES (?, ?, ?, 0, 0, ?, ?, ?, ?)""",
+                (task_type, user_id, STATUS_PENDING, payload_json, tid, now, now),
             )
+            task_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if task_id:
+                # 写 dirty_outbox 触发 CRDB 同步(同一事务,失败回滚)
+                await store.add_dirty_outbox("tasks", str(task_id), connection=tx)
+                logger.info(
+                    f"[task_center] 创建任务 task_id={task_id} type={task_type} user_id={user_id}"
+                )
         return task_id
     except Exception as e:
         logger.warning(f"[task_center] create_task 失败: {e}")
@@ -128,18 +129,19 @@ async def update_progress(task_id: int, progress: int, eta_seconds: int = 0) -> 
     now = _dt.datetime.now().isoformat()
     # 进度 > 0 时自动切到 running
     new_status = STATUS_RUNNING if progress > 0 else STATUS_PENDING
+    # R40 P0-5: 业务表 + dirty_outbox 同事务
     try:
-        cursor = await store._db.execute(
-            """UPDATE tasks
-               SET progress = ?, eta_seconds = ?, status = ?, updated_at = ?
-               WHERE id = ? AND status NOT IN (?, ?, ?)""",
-            (progress, max(0, int(eta_seconds)), new_status, now,
-             task_id, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED),
-        )
-        await store._db.commit()
-        ok = bool(cursor and cursor.rowcount > 0)
-        if ok:
-            await store.add_dirty_outbox("tasks", str(task_id))
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE tasks
+                   SET progress = ?, eta_seconds = ?, status = ?, updated_at = ?
+                   WHERE id = ? AND status NOT IN (?, ?, ?)""",
+                (progress, max(0, int(eta_seconds)), new_status, now,
+                 task_id, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED),
+            )
+            ok = bool(cursor and cursor.rowcount > 0)
+            if ok:
+                await store.add_dirty_outbox("tasks", str(task_id), connection=tx)
         return ok
     except Exception as e:
         logger.warning(f"[task_center] update_progress 失败: {e}")
@@ -161,19 +163,20 @@ async def complete_task(task_id: int, result: dict) -> bool:
         return False
     now = _dt.datetime.now().isoformat()
     result_json = _safe_json_dumps(result)
+    # R40 P0-5: 业务表 + dirty_outbox 同事务
     try:
-        cursor = await store._db.execute(
-            """UPDATE tasks
-               SET status = ?, progress = 100, result = ?, updated_at = ?
-               WHERE id = ? AND status NOT IN (?, ?)""",
-            (STATUS_COMPLETED, result_json, now,
-             task_id, STATUS_COMPLETED, STATUS_CANCELLED),
-        )
-        await store._db.commit()
-        ok = bool(cursor and cursor.rowcount > 0)
-        if ok:
-            await store.add_dirty_outbox("tasks", str(task_id))
-            logger.info(f"[task_center] 任务完成 task_id={task_id}")
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE tasks
+                   SET status = ?, progress = 100, result = ?, updated_at = ?
+                   WHERE id = ? AND status NOT IN (?, ?)""",
+                (STATUS_COMPLETED, result_json, now,
+                 task_id, STATUS_COMPLETED, STATUS_CANCELLED),
+            )
+            ok = bool(cursor and cursor.rowcount > 0)
+            if ok:
+                await store.add_dirty_outbox("tasks", str(task_id), connection=tx)
+                logger.info(f"[task_center] 任务完成 task_id={task_id}")
         return ok
     except Exception as e:
         logger.warning(f"[task_center] complete_task 失败: {e}")
@@ -194,19 +197,20 @@ async def fail_task(task_id: int, error: str) -> bool:
     if not store._db:
         return False
     now = _dt.datetime.now().isoformat()
+    # R40 P0-5: 业务表 + dirty_outbox 同事务
     try:
-        cursor = await store._db.execute(
-            """UPDATE tasks
-               SET status = ?, error = ?, updated_at = ?
-               WHERE id = ? AND status NOT IN (?, ?)""",
-            (STATUS_FAILED, error, now,
-             task_id, STATUS_COMPLETED, STATUS_CANCELLED),
-        )
-        await store._db.commit()
-        ok = bool(cursor and cursor.rowcount > 0)
-        if ok:
-            await store.add_dirty_outbox("tasks", str(task_id))
-            logger.warning(f"[task_center] 任务失败 task_id={task_id} error={error}")
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE tasks
+                   SET status = ?, error = ?, updated_at = ?
+                   WHERE id = ? AND status NOT IN (?, ?)""",
+                (STATUS_FAILED, error, now,
+                 task_id, STATUS_COMPLETED, STATUS_CANCELLED),
+            )
+            ok = bool(cursor and cursor.rowcount > 0)
+            if ok:
+                await store.add_dirty_outbox("tasks", str(task_id), connection=tx)
+                logger.warning(f"[task_center] 任务失败 task_id={task_id} error={error}")
         return ok
     except Exception as e:
         logger.warning(f"[task_center] fail_task 失败: {e}")
@@ -226,19 +230,20 @@ async def cancel_task(task_id: int) -> bool:
     if not store._db:
         return False
     now = _dt.datetime.now().isoformat()
+    # R40 P0-5: 业务表 + dirty_outbox 同事务
     try:
-        cursor = await store._db.execute(
-            """UPDATE tasks
-               SET status = ?, updated_at = ?
-               WHERE id = ? AND status NOT IN (?, ?, ?)""",
-            (STATUS_CANCELLED, now,
-             task_id, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED),
-        )
-        await store._db.commit()
-        ok = bool(cursor and cursor.rowcount > 0)
-        if ok:
-            await store.add_dirty_outbox("tasks", str(task_id))
-            logger.info(f"[task_center] 任务取消 task_id={task_id}")
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE tasks
+                   SET status = ?, updated_at = ?
+                   WHERE id = ? AND status NOT IN (?, ?, ?)""",
+                (STATUS_CANCELLED, now,
+                 task_id, STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED),
+            )
+            ok = bool(cursor and cursor.rowcount > 0)
+            if ok:
+                await store.add_dirty_outbox("tasks", str(task_id), connection=tx)
+                logger.info(f"[task_center] 任务取消 task_id={task_id}")
         return ok
     except Exception as e:
         logger.warning(f"[task_center] cancel_task 失败: {e}")
@@ -334,6 +339,66 @@ async def list_user_tasks(user_id: int, status: str | None = None, limit: int = 
         ]
     except Exception as e:
         logger.warning(f"[task_center] list_user_tasks 失败: {e}")
+        return []
+
+
+async def list_all_tasks(
+    limit: int = 50,
+    offset: int = 0,
+    status_filter: str | None = None,
+) -> list[dict]:
+    """R40 P1-1: 列出所有用户的任务(管理后台用),支持分页与状态过滤。
+
+    与 ``list_user_tasks`` 的区别:
+        - 不带 user_id 过滤,返回所有用户的任务
+        - 支持 offset 分页(管理后台按页浏览)
+        - 支持 status_filter 过滤特定状态
+
+    Args:
+        limit: 返回条数上限(1-200,管理后台需要更大窗口)
+        offset: 偏移量(分页用,0 表示从头开始)
+        status_filter: 可选状态过滤(pending/running/completed/failed/cancelled)
+
+    Returns:
+        任务字典列表(按 created_at 倒序,最新在前)
+    """
+    store = get_cache_store()
+    if not store._db:
+        return []
+    # clamp limit 到 [1, 200],offset 到 [0, +∞)
+    limit = max(1, min(200, int(limit)))
+    offset = max(0, int(offset))
+    try:
+        if status_filter:
+            cursor = await store._db.execute(
+                """SELECT id, task_type, user_id, status, progress, eta_seconds,
+                          payload, result, error, trace_id, created_at, updated_at
+                   FROM tasks WHERE status = ?
+                   ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+                (status_filter, limit, offset),
+            )
+        else:
+            cursor = await store._db.execute(
+                """SELECT id, task_type, user_id, status, progress, eta_seconds,
+                          payload, result, error, trace_id, created_at, updated_at
+                   FROM tasks
+                   ORDER BY created_at DESC LIMIT ? OFFSET ?""",
+                (limit, offset),
+            )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r[0], "task_type": r[1], "user_id": r[2], "status": r[3],
+                "progress": int(r[4] or 0), "eta_seconds": int(r[5] or 0),
+                "payload": _safe_json_loads(r[6]),
+                "result": _safe_json_loads(r[7]),
+                "error": r[8], "trace_id": r[9] or "",
+                "created_at": r[10], "updated_at": r[11],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning(f"[task_center] list_all_tasks 失败: {e}")
         return []
 
 

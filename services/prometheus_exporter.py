@@ -102,6 +102,16 @@ _r40_state: dict[str, Any] = {
     "outbox_unprocessed": 0,
     "audit_log_events_total": {},   # {action: count}
     "ru_operations_total": {},      # {(service, operation): count}
+    # R40 P2-4: 功能成功率与延迟指标
+    "approval_execution_success_rate": 0.0,        # Gauge: 0.0-1.0
+    "approval_execution_total": 0,                 # Counter: 审批执行总数
+    "approval_execution_success": 0,                # Counter: 审批执行成功数
+    "notification_delivery_latency_samples": [],   # Histogram: 通知投递延迟样本(秒)
+    "repair_success_rate": 0.0,                     # Gauge: 0.0-1.0
+    "repair_total": 0,                              # Counter: 修复操作总数
+    "repair_success": 0,                            # Counter: 修复成功数
+    "real_rpo_seconds": -1.0,                       # Gauge: 真实 RPO(秒),-1=未计算
+    "real_rto_seconds": -1.0,                       # Gauge: 真实 RTO(秒),-1=未计算
 }
 _r40_state_lock = threading.Lock()
 _r40_last_collect_ts: float = 0.0
@@ -448,6 +458,12 @@ async def collect_r40_metrics() -> None:
 
     所有采集失败均静默降级为 0(保持上一次值),不影响 exporter 可用性。
     cache_store._db 为 aiosqlite.Connection,使用 execute_fetchall 而非 asyncpg fetchval。
+
+    R40 P2-4: 新增功能成功率与延迟指标采集:
+    - approval_execution_success_rate: 审批执行成功率(executed/(executed+failed))
+    - notification_delivery_latency_samples: 通知投递延迟样本(created_at → is_read_at)
+    - repair_success_rate: 修复成功率(success/total)
+    - real_rpo_seconds / real_rto_seconds: 真实 RPO/RTO(从灾备模块读取)
     """
     global _r40_state, _r40_last_collect_ts
     new_state: dict[str, Any] = {
@@ -463,6 +479,16 @@ async def collect_r40_metrics() -> None:
         "outbox_unprocessed": 0,
         "audit_log_events_total": {},
         "ru_operations_total": {},
+        # R40 P2-4: 功能成功率与延迟指标
+        "approval_execution_success_rate": 0.0,
+        "approval_execution_total": 0,
+        "approval_execution_success": 0,
+        "notification_delivery_latency_samples": [],
+        "repair_success_rate": 0.0,
+        "repair_total": 0,
+        "repair_success": 0,
+        "real_rpo_seconds": -1.0,
+        "real_rto_seconds": -1.0,
     }
 
     # 1. maintenance_enabled — 维护模式是否开启
@@ -552,6 +578,79 @@ async def collect_r40_metrics() -> None:
             )
             for action, count in rows:
                 new_state["audit_log_events_total"][str(action)] = int(count)
+
+            # R40 P2-4: 审批执行成功率
+            # APPROVAL_STATUS_EXECUTED='executed', APPROVAL_STATUS_FAILED='failed'
+            rows = await store._db.execute_fetchall(
+                "SELECT status, COUNT(*) FROM approvals "
+                "WHERE status IN ('executed', 'failed') GROUP BY status"
+            )
+            executed = 0
+            failed = 0
+            for status, count in rows:
+                if status == "executed":
+                    executed = int(count)
+                elif status == "failed":
+                    failed = int(count)
+            total_exec = executed + failed
+            new_state["approval_execution_total"] = total_exec
+            new_state["approval_execution_success"] = executed
+            if total_exec > 0:
+                new_state["approval_execution_success_rate"] = float(executed) / float(total_exec)
+            else:
+                new_state["approval_execution_success_rate"] = 0.0
+
+            # R40 P2-4: 通知投递延迟样本(从已读通知的 created_at → read_at 计算)
+            # notifications 表 read_at 字段由 mark_read / mark_all_read 写入(R40 P2-4 新增)
+            rows = await store._db.execute_fetchall(
+                "SELECT created_at, read_at FROM notifications "
+                "WHERE is_read = 1 AND created_at IS NOT NULL "
+                "AND read_at IS NOT NULL AND read_at > created_at "
+                "ORDER BY id DESC LIMIT 100"
+            )
+            latency_samples: list[float] = []
+            for created_str, read_str in rows:
+                try:
+                    created_dt = _dt.datetime.fromisoformat(str(created_str))
+                    read_dt = _dt.datetime.fromisoformat(str(read_str))
+                    delta = (read_dt - created_dt).total_seconds()
+                    if delta >= 0:
+                        latency_samples.append(float(delta))
+                except (ValueError, TypeError):
+                    continue
+            new_state["notification_delivery_latency_samples"] = latency_samples
+
+            # R40 P2-4: 修复操作成功率(从 repair_console 审计日志中提取)
+            # 修复操作以 action IN ('repair_outbox', 'repair_dlq',
+            #                       'repair_replication', 'repair_relay') 记录
+            rows = await store._db.execute_fetchall(
+                "SELECT details, COUNT(*) FROM audit_log "
+                "WHERE action IN ('repair_outbox', 'repair_dlq', "
+                "                 'repair_replication', 'repair_relay') "
+                "GROUP BY details"
+            )
+            repair_total = 0
+            repair_success = 0
+            for details_json, count in rows:
+                try:
+                    import json as _json_mod
+                    details = _json_mod.loads(details_json) if details_json else {}
+                    success = bool(details.get("success", False))
+                    cnt = int(count)
+                    repair_total += cnt
+                    if success:
+                        repair_success += cnt
+                except (ValueError, TypeError):
+                    continue
+                except Exception:
+                    # JSONDecodeError 等其他异常,跳过该行
+                    continue
+            new_state["repair_total"] = repair_total
+            new_state["repair_success"] = repair_success
+            if repair_total > 0:
+                new_state["repair_success_rate"] = float(repair_success) / float(repair_total)
+            else:
+                new_state["repair_success_rate"] = 0.0
     except Exception as e:
         logger.debug(f"[R40] 采集 R40 SQLite 指标失败: {e}")
 
@@ -562,6 +661,34 @@ async def collect_r40_metrics() -> None:
         new_state["dlq_depth"] = overview.get("dlq_count", 0)
     except Exception as e:
         logger.debug(f"[R40] 采集 dlq_depth 失败: {e}")
+
+    # R40 P2-4: 真实 RPO/RTO(从灾备模块读取)
+    try:
+        from services.disaster_recovery import get_rpo_rto
+        rpo_rto = await get_rpo_rto()
+        # 真实 RPO: 距离最近一次成功备份的秒数(last_backup_age, None → -1)
+        last_backup_age = rpo_rto.get("last_backup_age")
+        if last_backup_age is not None:
+            new_state["real_rpo_seconds"] = float(last_backup_age)
+        else:
+            new_state["real_rpo_seconds"] = -1.0
+        # 真实 RTO: 估算恢复时间(estimated_recovery_time,基于历史恢复记录)
+        new_state["real_rto_seconds"] = float(
+            rpo_rto.get("estimated_recovery_time", -1.0)
+        )
+    except Exception as e:
+        logger.debug(f"[R40] 采集 real_rpo/rto 失败: {e}")
+        # 降级: 尝试从 kv_store 读取 last_backup_at 计算 RPO
+        try:
+            backup_ts_str = _read_kv_value("last_backup_at", "0")
+            try:
+                last_backup_ts = float(backup_ts_str)
+                if last_backup_ts > 0:
+                    new_state["real_rpo_seconds"] = time.time() - last_backup_ts
+            except (TypeError, ValueError):
+                pass
+        except Exception:
+            pass
 
     # 原子更新状态(拷贝替换,避免读取期间部分更新)
     with _r40_state_lock:
@@ -665,6 +792,107 @@ def _format_r40_metrics() -> list[str]:
         lines.append(
             'tgjiema_ru_operations_total{service="unknown",operation="none"} 0'
         )
+
+    # ── R40 P2-4: 功能成功率与延迟指标 ──────────────────────
+
+    # tgjiema_approval_execution_success_rate (Gauge, 0.0-1.0)
+    lines.append(
+        "# HELP tgjiema_approval_execution_success_rate 审批执行成功率 "
+        "(executed / (executed + failed), 0.0-1.0)"
+    )
+    lines.append("# TYPE tgjiema_approval_execution_success_rate gauge")
+    lines.append(
+        f"tgjiema_approval_execution_success_rate "
+        f"{state.get('approval_execution_success_rate', 0.0):.6f}"
+    )
+
+    # tgjiema_approval_execution_total (Counter)
+    lines.append(
+        "# HELP tgjiema_approval_execution_total 审批执行总次数(含成功+失败)"
+    )
+    lines.append("# TYPE tgjiema_approval_execution_total counter")
+    lines.append(
+        f"tgjiema_approval_execution_total {state.get('approval_execution_total', 0)}"
+    )
+
+    # tgjiema_approval_execution_success (Counter)
+    lines.append(
+        "# HELP tgjiema_approval_execution_success 审批执行成功次数"
+    )
+    lines.append("# TYPE tgjiema_approval_execution_success counter")
+    lines.append(
+        f"tgjiema_approval_execution_success {state.get('approval_execution_success', 0)}"
+    )
+
+    # tgjiema_notification_delivery_latency_seconds (Histogram)
+    # 通知投递延迟(秒),从 created_at → read_at 计算
+    # 输出: count + sum + bucket(le=0.5/1/5/10/30/60/300/Inf)
+    latency_samples = state.get("notification_delivery_latency_samples", [])
+    lines.append(
+        "# HELP tgjiema_notification_delivery_latency_seconds "
+        "通知投递延迟(秒,从 created_at 到 read_at)"
+    )
+    lines.append("# TYPE tgjiema_notification_delivery_latency_seconds histogram")
+    buckets = [0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0]
+    cumulative = 0
+    sorted_samples = sorted(latency_samples)
+    for le in buckets:
+        count = sum(1 for s in sorted_samples if s <= le)
+        lines.append(
+            f'tgjiema_notification_delivery_latency_seconds_bucket{{le="{le}"}} {count}'
+        )
+    # +Inf bucket
+    total_count = len(sorted_samples)
+    lines.append(
+        f'tgjiema_notification_delivery_latency_seconds_bucket{{le="+Inf"}} {total_count}'
+    )
+    lines.append(
+        f"tgjiema_notification_delivery_latency_seconds_count {total_count}"
+    )
+    latency_sum = sum(sorted_samples) if sorted_samples else 0.0
+    lines.append(
+        f"tgjiema_notification_delivery_latency_seconds_sum {latency_sum:.6f}"
+    )
+
+    # tgjiema_repair_success_rate (Gauge, 0.0-1.0)
+    lines.append(
+        "# HELP tgjiema_repair_success_rate 修复操作成功率 "
+        "(success / total, 0.0-1.0)"
+    )
+    lines.append("# TYPE tgjiema_repair_success_rate gauge")
+    lines.append(
+        f"tgjiema_repair_success_rate {state.get('repair_success_rate', 0.0):.6f}"
+    )
+
+    # tgjiema_repair_total (Counter)
+    lines.append("# HELP tgjiema_repair_total 修复操作总次数")
+    lines.append("# TYPE tgjiema_repair_total counter")
+    lines.append(f"tgjiema_repair_total {state.get('repair_total', 0)}")
+
+    # tgjiema_repair_success (Counter)
+    lines.append("# HELP tgjiema_repair_success 修复操作成功次数")
+    lines.append("# TYPE tgjiema_repair_success counter")
+    lines.append(f"tgjiema_repair_success {state.get('repair_success', 0)}")
+
+    # tgjiema_real_rpo_seconds (Gauge, -1=未计算/无备份)
+    lines.append(
+        "# HELP tgjiema_real_rpo_seconds 真实 RPO(秒,距上次成功备份的时间,"
+        "-1=从未备份)"
+    )
+    lines.append("# TYPE tgjiema_real_rpo_seconds gauge")
+    lines.append(
+        f"tgjiema_real_rpo_seconds {state.get('real_rpo_seconds', -1.0):.2f}"
+    )
+
+    # tgjiema_real_rto_seconds (Gauge, -1=未计算/无恢复)
+    lines.append(
+        "# HELP tgjiema_real_rto_seconds 真实 RTO(秒,距上次成功恢复的时间,"
+        "-1=从未恢复)"
+    )
+    lines.append("# TYPE tgjiema_real_rto_seconds gauge")
+    lines.append(
+        f"tgjiema_real_rto_seconds {state.get('real_rto_seconds', -1.0):.2f}"
+    )
 
     return lines
 

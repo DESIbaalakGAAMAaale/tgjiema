@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+
+{% block title %}通知中心{% endblock %}
+{% block page_title %}通知中心{% endblock %}
+
+{% block content %}
+<div class="section">
+    <h2>通知列表</h2>
+    <table>
+        <caption>系统通知记录</caption>
+        <thead>
+            <tr>
+                <th>通知ID</th>
+                <th>接收用户</th>
+                <th>类型</th>
+                <th>内容</th>
+                <th>已读</th>
+                <th>创建时间</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for n in notifications %}
+            <tr>
+                <td>{{ n.get('id', '') }}</td>
+                <td>{{ n.get('user_id', '') }}</td>
+                <td>{{ n.get('type', '') }}</td>
+                <td>{{ n.get('payload', '') }}</td>
+                <td>
+                    {% if n.get('is_read') %}
+                    <span class="tag tag-blue">已读</span>
+                    {% else %}
+                    <span class="tag tag-orange">未读</span>
+                    {% endif %}
+                </td>
+                <td>{{ n.get('created_at', 'N/A') }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

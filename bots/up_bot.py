@@ -37,6 +37,8 @@ from utils.force_join import check_force_join, three_bot_reminder, common_faq
 from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text, safe_send_media_group
 from utils.file_utils import detect_file_type, extract_file_meta
 from utils.relay_auth import is_relay_sender_allowed
+# R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
+from services.maintenance_mode import require_maintenance_check
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
 
@@ -715,6 +717,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@require_maintenance_check(action="批次上传")
 async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_force_join(update, context):
@@ -766,6 +769,7 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ 备注已设置为：{note_text}")
 
 
+@require_maintenance_check(action="合集打包")
 async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """开始合集打包模式:用户后续发送的文件码将被收集进合集。"""
     user = update.effective_user
@@ -1105,6 +1109,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@require_maintenance_check(action="上传文件")
 async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 外部中继文件优先路由:caption 以 EXTERNAL_RELAY: 开头,或 media_group_id 已登记为外部组
     caption = update.message.caption or ""
@@ -1665,6 +1670,17 @@ async def _finalize_upload(query, context, user_id: int):
         protect = context.user_data.pop("protect_content", str(settings.DEFAULT_PROTECT_CONTENT))
         note = context.user_data.pop("_note", "")
 
+        # R40 P0-4: 双写 pending_uploads_local 到 SQLite(Idx Bot 从 SQLite 读取,不再依赖 CRDB 凭证)
+        # 失败时仅记录 warning,不影响主流程(CRDB 写入仍为权威源,SQLite 为 Idx Bot 读取源)
+        async def _dual_write_pending_local(record: dict):
+            try:
+                from database.cache_store import get_cache_store
+                # mark_dirty=False: Up Bot 直写 CRDB,SQLite 行 crdb_synced=1 表示已同步
+                await get_cache_store().insert_pending_upload_local(record, mark_dirty=False)
+                logger.debug(f"[Up] R40 P0-4: pending_uploads_local 双写成功 user={record.get('uploader_id')}")
+            except Exception as sqlite_err:
+                logger.warning(f"[Up] R40 P0-4: pending_uploads_local 双写失败(不影响主流程): {sqlite_err}")
+
         protect_bool = protect.lower() == "true"
         # P2: -1=永久有效哨兵,0=使用默认值,正数=指定天数
         try:
@@ -1682,7 +1698,7 @@ async def _finalize_upload(query, context, user_id: int):
             # ── 批次上传 ──
             note = note or pending_batch.get("note", "")
             upload_id = pending_batch.get("upload_id", "")
-            await pending_col.insert_one({
+            _batch_record = {
                 "uploader_id": user_id,
                 "primary_channel_id": pending_batch["primary_channel_id"],
                 "primary_channel_msg_id": pending_batch["primary_channel_msg_id"],
@@ -1696,14 +1712,17 @@ async def _finalize_upload(query, context, user_id: int):
                 "protect_content": protect_bool,
                 "file_ttl_days": ttl_days,
                 "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
-            })
+            }
+            await pending_col.insert_one(_batch_record)
+            # R40 P0-4: 同步双写 SQLite local(Idx Bot 读取源)
+            await _dual_write_pending_local(_batch_record)
             logger.info(f"[Up] 批次写入pending_uploads: user={user_id}, {pending_batch['total_count']}个文件")
             _finalized_msg_ids.add(msg_id)
 
         elif pending_mg:
             # ── 媒体组上传 ──
             upload_id = pending_mg.get("upload_id", "")
-            await pending_col.insert_one({
+            _mg_record = {
                 "uploader_id": user_id,
                 "primary_channel_id": pending_mg["primary_channel_id"],
                 "primary_channel_msg_id": pending_mg["primary_channel_msg_id"],
@@ -1717,7 +1736,10 @@ async def _finalize_upload(query, context, user_id: int):
                 "protect_content": protect_bool,
                 "file_ttl_days": ttl_days,
                 "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
-            })
+            }
+            await pending_col.insert_one(_mg_record)
+            # R40 P0-4: 同步双写 SQLite local(Idx Bot 读取源)
+            await _dual_write_pending_local(_mg_record)
             logger.info(f"[Up] 媒体组写入pending_uploads: user={user_id}")
             _finalized_msg_ids.add(msg_id)
 
@@ -1772,6 +1794,22 @@ async def _finalize_upload(query, context, user_id: int):
                 "protect_content": protect_bool,
                 "file_ttl_days": ttl_days,
                 "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
+            })
+            # R40 P0-4: 同步双写 SQLite local(Idx Bot 读取源)
+            await _dual_write_pending_local({
+                "uploader_id": user_id,
+                "primary_channel_id": main_channel,
+                "primary_channel_msg_id": channel_msg_id,
+                "file_types": _json_dumps(file_types),
+                "batch_msg_ids": "",
+                "batch_file_meta": _json_dumps([file_meta]),
+                "note": note,
+                "status_msg_id": 0,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "processed": 0,
+                "protect_content": protect_bool,
+                "file_ttl_days": ttl_days,
+                "upload_id": upload_id,
             })
             logger.info(f"[Up] 单文件写入pending_uploads: user={user_id}")
             _finalized_msg_ids.add(msg_id)
@@ -2282,7 +2320,7 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
 
     try:
         pending_col = get_pending_uploads_col()
-        await pending_col.insert_one({
+        _ext_record = {
             "uploader_id": ext_user_id,
             "primary_channel_id": target_ch,
             "primary_channel_msg_id": msg_ids[0],
@@ -2296,7 +2334,15 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
             "protect_content": False,
             "file_ttl_days": 0,
             "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
-        })
+        }
+        await pending_col.insert_one(_ext_record)
+        # R40 P0-4: 同步双写 SQLite local(Idx Bot 读取源)
+        try:
+            from database.cache_store import get_cache_store
+            await get_cache_store().insert_pending_upload_local(_ext_record, mark_dirty=False)
+            logger.debug(f"[Up][ext_relay] R40 P0-4: pending_uploads_local 双写成功 code={external_code}")
+        except Exception as sqlite_err:
+            logger.warning(f"[Up][ext_relay] R40 P0-4: pending_uploads_local 双写失败(非致命): {sqlite_err}")
         logger.info(f"[Up][ext_relay] 外部文件已写入pending_uploads: code={external_code}, {len(msg_ids)}个文件")
     except Exception as e:
         logger.error(f"[Up][ext_relay] 写入pending_uploads失败 (code={external_code}): {e}")

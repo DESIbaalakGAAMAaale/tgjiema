@@ -14,3 +14,4 @@ cryptography==44.0.0
 uvloop==0.19.0; sys_platform != 'win32'
 orjson==3.9.0
 redis==5.0.8
+pyotp>=2.9.0

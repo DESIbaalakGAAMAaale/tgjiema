@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+
+{% block title %}RU 成本{% endblock %}
+{% block page_title %}RU 成本中心{% endblock %}
+
+{% block content %}
+{% if alert %}
+{% set alert_level = alert.get('level', '') if alert is mapping else '' %}
+{% if alert_level == 'critical' %}
+<div class="alert alert-danger">RU 告警(严重):{{ alert.get('message', '') }}</div>
+{% elif alert_level == 'warning' %}
+<div class="alert alert-warning">RU 告警(警告):{{ alert.get('message', '') }}</div>
+{% endif %}
+{% endif %}
+
+<div class="metric-grid">
+    <div class="metric-card">
+        <div class="label">今日总 RU</div>
+        <div class="value">{{ report.get('total_ru', 0) if report else 0 }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">读取 RU</div>
+        <div class="value">{{ report.get('read_ru', 0) if report else 0 }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">写入 RU</div>
+        <div class="value">{{ report.get('write_ru', 0) if report else 0 }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">RU 预算</div>
+        <div class="value">{{ report.get('budget', 0) if report else 0 }}</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>按服务拆分</h2>
+    <table>
+        <caption>各服务 RU 消耗</caption>
+        <thead>
+            <tr>
+                <th>服务名</th>
+                <th>RU 消耗</th>
+                <th>占比</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set by_service = report.get('by_service', {}) if report else {} %}
+            {% for svc, ru in by_service.items() %}
+            <tr>
+                <td><code>{{ svc }}</code></td>
+                <td>{{ ru }}</td>
+                <td>{{ ru }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="section">
+    <h2>每千次操作成本</h2>
+    <table>
+        <caption>各操作类型每千次 RU 成本</caption>
+        <thead>
+            <tr>
+                <th>操作类型</th>
+                <th>RU/千次</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set cost_per_1k = report.get('cost_per_1k', {}) if report else {} %}
+            {% for op, cost in cost_per_1k.items() %}
+            <tr>
+                <td><code>{{ op }}</code></td>
+                <td>{{ cost }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="2" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

@@ -245,25 +245,35 @@ def _unwrap_dek(wrapped_dek_b64: str, kek: bytes) -> bytes:
     return dek
 
 
-def encrypt_payload(plaintext: bytes, kek: bytes | None = None) -> dict:
+def encrypt_payload(
+    plaintext: bytes, kek: bytes | None = None,
+    backup_id: str = "", schema_version: str = "",
+) -> dict:
     """加密备份 payload,返回加密元数据。
 
     R37 P1-6: 返回值新增 key_id 字段(写入 manifest 用于追溯,不可逆)。
+    R40 P0-6: 返回值新增 ciphertext_sha256 字段;AAD 绑定 {backup_id, schema_version, key_id}。
 
     Args:
         plaintext: 原始 backup JSON 字节
         kek: KEK 字节(None 则从受控 secret provider 读取)
+        backup_id: 备份标识(如时间戳),用于 AAD 绑定
+        schema_version: schema 版本,用于 AAD 绑定
 
     Returns:
         {
             "encrypted": bool,        # 是否已加密
             "ciphertext": bytes,      # 加密后的 payload(或原始 plaintext,如果未加密)
+            "ciphertext_sha256": str,  # R40 P0-6: 密文的 SHA-256 校验和
             "wrapped_dek": str,       # 包装的 DEK(base64,仅加密时有)
             "nonce": str,             # GCM nonce(base64,仅加密时有)
             "algorithm": str,         # 加密算法标识
             "key_id": str,             # R37 P1-6: KEK 标识符(sha256 前 16 字符,仅加密时有)
+            "aad": str,                # R40 P0-6: AAD 绑定信息(用于解密时重建)
         }
     """
+    import hashlib
+
     if kek is None:
         kek = get_kek()
 
@@ -272,6 +282,7 @@ def encrypt_payload(plaintext: bytes, kek: bytes | None = None) -> dict:
         return {
             "encrypted": False,
             "ciphertext": plaintext,
+            "ciphertext_sha256": hashlib.sha256(plaintext).hexdigest(),
             "algorithm": "none",
         }
 
@@ -280,27 +291,37 @@ def encrypt_payload(plaintext: bytes, kek: bytes | None = None) -> dict:
         return {
             "encrypted": False,
             "ciphertext": plaintext,
+            "ciphertext_sha256": hashlib.sha256(plaintext).hexdigest(),
             "algorithm": "none",
         }
+
+    # R37 P1-6: 生成 key_id(KEK 的 sha256 前 16 字符,不可逆)
+    key_id = hashlib.sha256(kek).hexdigest()[:16]
+
+    # R40 P0-6: AAD 绑定 {backup_id, schema_version, key_id}
+    # 防止密文被替换到不同备份上下文(重放攻击)
+    aad_str = f"{backup_id}|{schema_version}|{key_id}"
+    aad_bytes = aad_str.encode("utf-8")
 
     # 信封加密: 随机 DEK 加密 payload,KEK 包装 DEK
     dek = _generate_dek()
     aesgcm_dek = AESGCM(dek)
     nonce = secrets.token_bytes(_NONCE_SIZE)
-    ciphertext = aesgcm_dek.encrypt(nonce, plaintext, associated_data=b"backup-payload")
+    ciphertext = aesgcm_dek.encrypt(nonce, plaintext, associated_data=aad_bytes)
     wrapped_dek = _wrap_dek(dek, kek)
 
-    # R37 P1-6: 生成 key_id(KEK 的 sha256 前 16 字符,不可逆)
-    import hashlib
-    key_id = hashlib.sha256(kek).hexdigest()[:16]
+    # R40 P0-6: 计算密文的 SHA-256 校验和
+    ciphertext_sha256 = hashlib.sha256(ciphertext).hexdigest()
 
     return {
         "encrypted": True,
         "ciphertext": ciphertext,
+        "ciphertext_sha256": ciphertext_sha256,
         "wrapped_dek": wrapped_dek,
         "nonce": base64.b64encode(nonce).decode("ascii"),
         "algorithm": "AES-256-GCM",
         "key_id": key_id,
+        "aad": aad_str,
     }
 
 
@@ -309,6 +330,10 @@ def decrypt_payload(
     wrapped_dek: str | None = None,
     nonce_b64: str | None = None,
     kek: bytes | None = None,
+    expected_plaintext_sha256: str | None = None,
+    backup_id: str = "",
+    schema_version: str = "",
+    key_id: str = "",
 ) -> bytes:
     """解密备份 payload。
 
@@ -317,21 +342,41 @@ def decrypt_payload(
       1. 当前 KEK(get_kek)
       2. 旧 KEK(get_previous_kek,用于密钥轮转期间解密旧备份)
 
+    R40 P0-6:
+      - AAD 绑定 {backup_id, schema_version, key_id},防止密文重放
+      - 支持 expected_plaintext_sha256 校验,解密后验证明文完整性
+      - 向后兼容:旧备份使用 b"backup-payload" 作为 AAD,自动回退
+
     Args:
         ciphertext: 加密的 payload(或明文,如果未加密)
         wrapped_dek: 包装的 DEK(base64,仅加密时有)
         nonce_b64: GCM nonce(base64,仅加密时有)
         kek: KEK 字节(None 则从受控 secret provider 读取,并尝试双 key 窗口)
+        expected_plaintext_sha256: R40 P0-6 期望的明文 SHA-256(可选,用于解密后校验)
+        backup_id: R40 P0-6 备份标识(用于重建 AAD)
+        schema_version: R40 P0-6 schema 版本(用于重建 AAD)
+        key_id: R40 P0-6 KEK 标识符(用于重建 AAD,从 manifest 读取)
 
     Returns:
         原始 backup JSON 字节
 
     Raises:
         RuntimeError: cryptography 未安装 或 KEK 均不可用
-        ValueError: 解密失败(KEK 不匹配或数据损坏)
+        ValueError: 解密失败(KEK 不匹配或数据损坏)或明文 checksum 校验失败
     """
+    import hashlib
+
     # 未加密的 payload 直接返回
     if not wrapped_dek or not nonce_b64:
+        # R40 P0-6: 即使未加密也校验明文 checksum(如果提供)
+        if expected_plaintext_sha256:
+            actual_sha = hashlib.sha256(ciphertext).hexdigest()
+            if actual_sha != expected_plaintext_sha256:
+                raise ValueError(
+                    f"R40 P0-6: 明文 checksum 校验失败"
+                    f"(expected={expected_plaintext_sha256[:16]}, "
+                    f"actual={actual_sha[:16]})"
+                )
         return ciphertext
 
     if not _CRYPTO_AVAILABLE:
@@ -353,22 +398,43 @@ def decrypt_payload(
     if not candidate_keks:
         raise RuntimeError("BACKUP_KEK 未配置,无法解密备份(当前 + 历史 KEK 均不可用)")
 
+    # R40 P0-6: 构建 AAD 候选列表
+    # 新备份: AAD = f"{backup_id}|{schema_version}|{key_id}"
+    # 旧备份: AAD = b"backup-payload" (向后兼容)
+    aad_candidates: list[bytes] = []
+    if backup_id or schema_version or key_id:
+        new_aad = f"{backup_id}|{schema_version}|{key_id}".encode("utf-8")
+        aad_candidates.append(new_aad)
+    aad_candidates.append(b"backup-payload")  # 向后兼容
+
     nonce = base64.b64decode(nonce_b64)
     last_error: Exception | None = None
     for candidate in candidate_keks:
-        try:
-            dek = _unwrap_dek(wrapped_dek, candidate)
-            aesgcm = AESGCM(dek)
-            plaintext = aesgcm.decrypt(nonce, ciphertext, associated_data=b"backup-payload")
-            return plaintext
-        except Exception as e:
-            last_error = e
-            continue
+        # R40 P0-6: 对每个 KEK 尝试所有 AAD 候选
+        for aad in aad_candidates:
+            try:
+                dek = _unwrap_dek(wrapped_dek, candidate)
+                aesgcm = AESGCM(dek)
+                plaintext = aesgcm.decrypt(nonce, ciphertext, associated_data=aad)
 
-    # 所有候选 KEK 均失败
+                # R40 P0-6: 解密成功后校验明文 checksum
+                if expected_plaintext_sha256:
+                    actual_sha = hashlib.sha256(plaintext).hexdigest()
+                    if actual_sha != expected_plaintext_sha256:
+                        raise ValueError(
+                            f"R40 P0-6: 解密后明文 checksum 校验失败"
+                            f"(expected={expected_plaintext_sha256[:16]}, "
+                            f"actual={actual_sha[:16]})"
+                        )
+                return plaintext
+            except Exception as e:
+                last_error = e
+                continue
+
+    # 所有候选 KEK + AAD 均失败
     raise ValueError(
-        f"解密失败:所有候选 KEK 均无法解密(尝试了 {len(candidate_keks)} 个 KEK)。"
-        f"最后错误: {last_error}"
+        f"解密失败:所有候选 KEK({len(candidate_keks)}) + AAD({len(aad_candidates)}) "
+        f"组合均无法解密。最后错误: {last_error}"
     )
 
 

@@ -28,6 +28,8 @@ from services import (
     content_reports, approval_workflow, rbac, maintenance_mode,
     repair_console, disaster_recovery, ru_cost_center,
 )
+# R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
+from services.maintenance_mode import require_maintenance_check
 
 
 @_auth_required
@@ -1494,6 +1496,7 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ─── 帮助命令 ──────────────────────────────────────────────────
 
 @_auth_required
+@require_maintenance_check(action="数据库恢复")
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """数据库恢复命令。
 
@@ -1722,8 +1725,11 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @_auth_required
+@require_maintenance_check(action="内容下架")
 async def cmd_takedown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """内容下架: /takedown <target_type> <target_id> [reason]"""
+    """R40 P0-8: 内容下架(通过 CommandBus 强制 RBAC + 审批门禁)。
+    用法: /takedown <target_type> <target_id> [reason]
+    """
     try:
         if len(context.args) < 2:
             await update.message.reply_text("用法:/takedown <target_type> <target_id> [原因]\ntarget_type: file_code/user")
@@ -1733,19 +1739,44 @@ async def cmd_takedown(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reason = " ".join(context.args[2:]) if len(context.args) > 2 else ""
         user = update.effective_user
         admin_id = user.id if user else 0
-        ok = await content_reports.takedown_content(target_type, target_id, reason, admin_id)
-        if ok:
-            await update.message.reply_text(f"✅ 已下架 {target_type}:{target_id}")
+        admin_name = user.username if user else ""
+
+        # R40 P0-8: 通过 CommandBus 执行,强制 RBAC 权限校验 + 审批门禁
+        from services.command_bus import (
+            CommandBus, AdminPrincipal as CBPrincipal, make_takedown_command,
+        )
+        cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+        command = make_takedown_command(
+            target_type=target_type, target_id=str(target_id), reason=reason,
+        )
+        bus = CommandBus()
+        result = await bus.execute(command, cb_principal)
+
+        if result.approval_required:
+            await update.message.reply_text(
+                f"⏳ 下架请求已提交审批\n审批 ID: {result.approval_id}\n"
+                f"目标: {target_type}:{target_id}\n"
+                f"审批通过后自动执行。"
+            )
+        elif result.success:
+            ok = result.data.get("takedown_ok", False) if result.data else False
+            if ok:
+                await update.message.reply_text(f"✅ 已下架 {target_type}:{target_id}")
+            else:
+                await update.message.reply_text("❌ 下架失败,请检查参数或目标是否存在")
         else:
-            await update.message.reply_text("❌ 下架失败,请检查参数或目标是否存在")
+            await update.message.reply_text(f"❌ 下架失败: {result.error}")
     except Exception as e:
         logger.exception(f"[Admin][takedown] 内容下架失败: {e}")
         await update.message.reply_text("❌ 操作失败,请稍后重试")
 
 
 @_auth_required
+@require_maintenance_check(action="封禁用户")
 async def cmd_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """R40 封禁用户: /ban_user <user_id> [reason] [duration_days]"""
+    """R40 P0-8: 封禁用户(通过 CommandBus 强制 RBAC + 审批门禁)。
+    用法: /ban_user <user_id> [reason] [duration_days(0=永久)]
+    """
     try:
         if not context.args:
             await update.message.reply_text("用法:/ban_user <用户ID> [原因] [天数(0=永久)]")
@@ -1764,19 +1795,44 @@ async def cmd_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 duration_days = 0
         admin = update.effective_user
         admin_id = admin.id if admin else 0
-        ok = await content_reports.ban_user(user_id, reason, duration_days=duration_days, admin_id=admin_id)
-        if ok:
-            await update.message.reply_text(f"✅ 用户 {user_id} 已封禁({duration_days}天)")
+        admin_name = admin.username if admin else ""
+
+        # R40 P0-8: 通过 CommandBus 执行,强制 RBAC 权限校验 + 审批门禁
+        from services.command_bus import (
+            CommandBus, AdminPrincipal as CBPrincipal, make_ban_user_command,
+        )
+        cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+        command = make_ban_user_command(
+            user_id=user_id, reason=reason, duration_days=duration_days,
+        )
+        bus = CommandBus()
+        result = await bus.execute(command, cb_principal)
+
+        if result.approval_required:
+            await update.message.reply_text(
+                f"⏳ 封禁请求已提交审批\n审批 ID: {result.approval_id}\n"
+                f"用户: {user_id}  时长: {duration_days} 天\n"
+                f"审批通过后自动执行。"
+            )
+        elif result.success:
+            ok = result.data.get("ban_ok", False) if result.data else False
+            if ok:
+                await update.message.reply_text(f"✅ 用户 {user_id} 已封禁({duration_days}天)")
+            else:
+                await update.message.reply_text("❌ 封禁失败,请稍后重试")
         else:
-            await update.message.reply_text("❌ 封禁失败,请稍后重试")
+            await update.message.reply_text(f"❌ 封禁失败: {result.error}")
     except Exception as e:
         logger.exception(f"[Admin][ban_user] 封禁用户失败: {e}")
         await update.message.reply_text("❌ 操作失败,请稍后重试")
 
 
 @_auth_required
+@require_maintenance_check(action="解封用户")
 async def cmd_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """R40 解封用户: /unban_user <user_id>"""
+    """R40 P0-8: 解封用户(通过 CommandBus 强制 RBAC;不需审批)。
+    用法: /unban_user <user_id>
+    """
     try:
         if not context.args:
             await update.message.reply_text("用法:/unban_user <用户ID>")
@@ -1788,11 +1844,25 @@ async def cmd_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         admin = update.effective_user
         admin_id = admin.id if admin else 0
-        ok = await content_reports.unban_user(user_id, admin_id=admin_id)
-        if ok:
-            await update.message.reply_text(f"✅ 用户 {user_id} 已解封")
+        admin_name = admin.username if admin else ""
+
+        # R40 P0-8: 通过 CommandBus 执行(解封不需审批,但仍强制 RBAC 校验)
+        from services.command_bus import (
+            CommandBus, AdminPrincipal as CBPrincipal, make_unban_user_command,
+        )
+        cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+        command = make_unban_user_command(user_id=user_id)
+        bus = CommandBus()
+        result = await bus.execute(command, cb_principal)
+
+        if result.success:
+            ok = result.data.get("unban_ok", False) if result.data else False
+            if ok:
+                await update.message.reply_text(f"✅ 用户 {user_id} 已解封")
+            else:
+                await update.message.reply_text("❌ 解封失败,请稍后重试")
         else:
-            await update.message.reply_text("❌ 解封失败,请稍后重试")
+            await update.message.reply_text(f"❌ 解封失败: {result.error}")
     except Exception as e:
         logger.exception(f"[Admin][unban_user] 解封用户失败: {e}")
         await update.message.reply_text("❌ 操作失败,请稍后重试")
@@ -1892,7 +1962,9 @@ async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_auth_required
 async def cmd_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """分配角色: /assign_role <user_id> <role_name>"""
+    """R40 P0-8: 分配角色(通过 CommandBus 强制 RBAC + 审批门禁)。
+    用法: /assign_role <user_id> <role_name>
+    """
     try:
         if len(context.args) < 2:
             await update.message.reply_text("用法:/assign_role <用户ID> <角色名>\n角色: super_admin/security/ops/support/operator")
@@ -1905,11 +1977,31 @@ async def cmd_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
         role_name = context.args[1]
         admin = update.effective_user
         admin_id = admin.id if admin else 0
-        ok = await rbac.assign_role(user_id, role_name, assigned_by=admin_id)
-        if ok:
-            await update.message.reply_text(f"✅ 用户 {user_id} 已分配角色 {role_name}")
+        admin_name = admin.username if admin else ""
+
+        # R40 P0-8: 通过 CommandBus 执行,强制 RBAC 权限校验 + 审批门禁
+        from services.command_bus import (
+            CommandBus, AdminPrincipal as CBPrincipal, make_assign_role_command,
+        )
+        cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+        command = make_assign_role_command(user_id=user_id, role_name=role_name)
+        bus = CommandBus()
+        result = await bus.execute(command, cb_principal)
+
+        if result.approval_required:
+            await update.message.reply_text(
+                f"⏳ 角色分配已提交审批\n审批 ID: {result.approval_id}\n"
+                f"用户: {user_id}  角色: {role_name}\n"
+                f"审批通过后自动执行。"
+            )
+        elif result.success:
+            ok = result.data.get("assign_ok", False) if result.data else False
+            if ok:
+                await update.message.reply_text(f"✅ 用户 {user_id} 已分配角色 {role_name}")
+            else:
+                await update.message.reply_text("❌ 分配失败(角色不存在)")
         else:
-            await update.message.reply_text("❌ 分配失败(角色不存在)")
+            await update.message.reply_text(f"❌ 分配失败: {result.error}")
     except Exception as e:
         logger.exception(f"[Admin][assign_role] 分配角色失败: {e}")
         await update.message.reply_text("❌ 操作失败,请稍后重试")
@@ -1917,7 +2009,9 @@ async def cmd_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @_auth_required
 async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """维护模式: /maintenance <on|off|status> [reason]"""
+    """R40 P0-8: 维护模式(通过 CommandBus 强制 RBAC + 审批门禁)。
+    用法: /maintenance <on|off|status> [reason]
+    """
     try:
         if not context.args:
             await update.message.reply_text("用法:/maintenance <on|off|status> [原因]")
@@ -1925,14 +2019,47 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = context.args[0].lower()
         admin = update.effective_user
         admin_id = admin.id if admin else 0
+        admin_name = admin.username if admin else ""
+
+        # R40 P0-8: on/off 走 CommandBus 强制 RBAC + 审批门禁;status 仅查询不走 CommandBus
+        from services.command_bus import (
+            CommandBus, AdminPrincipal as CBPrincipal,
+            make_enable_maintenance_command, make_disable_maintenance_command,
+        )
+
         if action == "on":
             reason = " ".join(context.args[1:]) if len(context.args) > 1 else "manual"
-            ok = await maintenance_mode.enable(reason, started_by=admin_id)
-            await update.message.reply_text("✅ 维护模式已开启" if ok else "❌ 开启失败")
+            cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+            command = make_enable_maintenance_command(reason=reason)
+            bus = CommandBus()
+            result = await bus.execute(command, cb_principal)
+            if result.approval_required:
+                await update.message.reply_text(
+                    f"⏳ 开启维护模式已提交审批\n审批 ID: {result.approval_id}\n"
+                    f"原因: {reason}\n审批通过后自动执行。"
+                )
+            elif result.success:
+                ok = result.data.get("enable_ok", False) if result.data else False
+                await update.message.reply_text("✅ 维护模式已开启" if ok else "❌ 开启失败")
+            else:
+                await update.message.reply_text(f"❌ 开启失败: {result.error}")
         elif action == "off":
-            ok = await maintenance_mode.disable(ended_by=admin_id)
-            await update.message.reply_text("✅ 维护模式已关闭" if ok else "❌ 关闭失败")
+            cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
+            command = make_disable_maintenance_command()
+            bus = CommandBus()
+            result = await bus.execute(command, cb_principal)
+            if result.approval_required:
+                await update.message.reply_text(
+                    f"⏳ 关闭维护模式已提交审批\n审批 ID: {result.approval_id}\n"
+                    f"审批通过后自动执行。"
+                )
+            elif result.success:
+                ok = result.data.get("disable_ok", False) if result.data else False
+                await update.message.reply_text("✅ 维护模式已关闭" if ok else "❌ 关闭失败")
+            else:
+                await update.message.reply_text(f"❌ 关闭失败: {result.error}")
         elif action == "status":
+            # status 仅查询,不修改状态,不走 CommandBus
             status = await maintenance_mode.get_status()
             lines = [
                 "🔧 维护模式状态",
@@ -2011,3 +2138,75 @@ async def cmd_ru_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception(f"[Admin][ru_report] 生成 RU 报告失败: {e}")
         await update.message.reply_text("❌ 生成报告失败,请稍后重试")
+
+
+@_auth_required
+async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """查看任务中心(所有用户): /tasks [status] [limit]
+
+    R40 P1-1:
+        管理员查看所有用户任务,不再过滤 user_id=0。
+        可选参数:
+            status: pending/running/completed/failed/cancelled
+            limit: 返回条数(默认 20,上限 100)
+
+    用法示例:
+        /tasks              # 最近 20 条所有任务
+        /tasks pending      # 仅 pending 状态
+        /tasks running 50   # 50 条 running 任务
+    """
+    try:
+        from services.task_center import list_all_tasks
+        status_filter = None
+        limit = 20
+        if len(context.args) >= 1:
+            arg = context.args[0].strip().lower()
+            valid_statuses = {"pending", "running", "completed", "failed", "cancelled"}
+            if arg in valid_statuses:
+                status_filter = arg
+            else:
+                # 第一个参数不是状态,尝试解析为 limit
+                try:
+                    limit = max(1, min(100, int(arg)))
+                except ValueError:
+                    await update.message.reply_text(
+                        "用法:/tasks [status] [limit]\n"
+                        "status: pending/running/completed/failed/cancelled"
+                    )
+                    return
+        if len(context.args) >= 2:
+            try:
+                limit = max(1, min(100, int(context.args[1])))
+            except ValueError:
+                pass
+
+        tasks = await list_all_tasks(limit=limit, offset=0, status_filter=status_filter)
+        if not tasks:
+            filter_text = f" (status={status_filter})" if status_filter else ""
+            await update.message.reply_text(f"📭 暂无任务{filter_text}")
+            return
+
+        lines = [
+            f"📋 任务中心 — 共 {len(tasks)} 条"
+            + (f" (status={status_filter})" if status_filter else ""),
+            "",
+        ]
+        for t in tasks[:limit]:
+            icon_map = {
+                "pending": "⏳", "running": "🔄",
+                "completed": "✅", "failed": "❌", "cancelled": "🚫",
+            }
+            icon = icon_map.get(t.get("status", ""), "❓")
+            type_map = {
+                "upload": "上传", "index": "索引", "copy": "复制",
+                "delivery": "取件", "repair": "修复",
+            }
+            type_name = type_map.get(t.get("task_type", ""), t.get("task_type", ""))
+            lines.append(
+                f"{icon} #{t.get('id', '')} [{type_name}] user={t.get('user_id', '')} "
+                f"{t.get('status', '')} ({t.get('progress', 0)}%)"
+            )
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        logger.exception(f"[Admin][tasks] 查询任务失败: {e}")
+        await update.message.reply_text("❌ 查询失败,请稍后重试")

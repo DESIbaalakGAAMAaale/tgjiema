@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}拓扑可视化{% endblock %}
+{% block page_title %}拓扑可视化{% endblock %}
+
+{% block content %}
+{% if summary %}
+<div class="metric-grid">
+    <div class="metric-card">
+        <div class="label">账号总数</div>
+        <div class="value">{{ summary.get('accounts_total', 0) }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">频道总数</div>
+        <div class="value">{{ summary.get('channels_total', 0) }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">健康频道</div>
+        <div class="value">{{ summary.get('channels_healthy', 0) }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">副本因子</div>
+        <div class="value">{{ summary.get('replication_factor', {}).get('current', 0) if summary.get('replication_factor') is mapping else 0 }}</div>
+    </div>
+</div>
+{% endif %}
+
+<div class="section">
+    <h2>账号与频道映射</h2>
+    <table>
+        <caption>账号 → 频道拓扑结构</caption>
+        <thead>
+            <tr>
+                <th>账号名称</th>
+                <th>状态</th>
+                <th>频道列表</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set accounts = topology.get('accounts', []) if topology else [] %}
+            {% for acc in accounts %}
+            <tr>
+                <td>{{ acc.get('name', '') }}</td>
+                <td>
+                    {% if acc.get('is_active') %}
+                    <span class="tag tag-green">活跃</span>
+                    {% else %}
+                    <span class="tag tag-red">停用</span>
+                    {% endif %}
+                </td>
+                <td>{{ acc.get('channels', []) | join(', ') }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="section">
+    <h2>频道健康状态</h2>
+    <table>
+        <caption>各频道健康度</caption>
+        <thead>
+            <tr>
+                <th>槽位</th>
+                <th>频道ID</th>
+                <th>账号</th>
+                <th>角色</th>
+                <th>健康度</th>
+                <th>文件数</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set channels = topology.get('channels', []) if topology else [] %}
+            {% for ch in channels %}
+            <tr>
+                <td>{{ ch.get('slot_id', '') }}</td>
+                <td><code>{{ ch.get('channel_id', '') }}</code></td>
+                <td>{{ ch.get('account_name', '') }}</td>
+                <td>{{ ch.get('role', '') }}</td>
+                <td>
+                    {% set h = ch.get('health', '') %}
+                    {% if h == 'healthy' %}
+                    <span class="tag tag-green">健康</span>
+                    {% elif h == 'degraded' %}
+                    <span class="tag tag-orange">降级</span>
+                    {% else %}
+                    <span class="tag tag-red">{{ h }}</span>
+                    {% endif %}
+                </td>
+                <td>{{ ch.get('file_count', 0) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

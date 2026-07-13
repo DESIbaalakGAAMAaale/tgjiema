@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}管理后台{% endblock %} - TG文件解码器</title>
+    <style nonce="{{ csp_nonce if csp_nonce else '' }}">
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #333; }
+        .sidebar { position: fixed; left: 0; top: 0; width: 220px; height: 100vh; background: #001529; padding-top: 20px; overflow-y: auto; }
+        .sidebar h2 { color: #fff; text-align: center; font-size: 18px; padding: 0 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+        .sidebar a { display: block; color: rgba(255,255,255,0.65); padding: 12px 24px; text-decoration: none; font-size: 14px; transition: all 0.2s; }
+        .sidebar a:hover, .sidebar a.active { color: #fff; background: #1890ff; }
+        .sidebar .nav-group { padding: 8px 16px; color: rgba(255,255,255,0.35); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+        .main { margin-left: 220px; padding: 24px; }
+        .header { background: #fff; padding: 16px 24px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); display: flex; justify-content: space-between; align-items: center; }
+        .header h1 { font-size: 22px; }
+        .header .admin-info { font-size: 13px; color: #8c8c8c; }
+        .section { background: #fff; border-radius: 8px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+        .section h2 { font-size: 16px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; }
+        table { width: 100%; border-collapse: collapse; }
+        caption { caption-side: top; text-align: left; padding: 8px 0; font-size: 13px; color: #8c8c8c; }
+        th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+        th { background: #fafafa; font-weight: 600; }
+        .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #f5f5f5; }
+        .tag-green { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
+        .tag-red { background: #fff2f0; color: #ff4d4f; border: 1px solid #ffccc7; }
+        .tag-blue { background: #e6f7ff; color: #1890ff; border: 1px solid #91d5ff; }
+        .tag-orange { background: #fff7e6; color: #fa8c16; border: 1px solid #ffd591; }
+        .tag-gold { background: #fffbe6; color: #faad14; border: 1px solid #ffe58f; }
+        .btn { display: inline-block; padding: 6px 16px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; cursor: pointer; text-decoration: none; background: #fff; color: #333; transition: all 0.2s; }
+        .btn-primary { background: #1890ff; color: #fff; border-color: #1890ff; }
+        .btn-danger { color: #ff4d4f; border-color: #ff4d4f; }
+        .btn-warning { color: #faad14; border-color: #faad14; }
+        .btn:hover { opacity: 0.85; }
+        .pagination { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
+        .pagination a { padding: 6px 12px; border: 1px solid #d9d9d9; border-radius: 4px; text-decoration: none; color: #333; font-size: 13px; }
+        .pagination a.active { background: #1890ff; color: #fff; border-color: #1890ff; }
+        .empty-state { text-align: center; padding: 48px 16px; color: #8c8c8c; font-size: 14px; }
+        .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 16px; }
+        .metric-card { background: #fff; padding: 16px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
+        .metric-card .label { font-size: 12px; color: #8c8c8c; margin-bottom: 4px; }
+        .metric-card .value { font-size: 24px; font-weight: 600; color: #1890ff; }
+        .actions { display: flex; gap: 6px; }
+        .actions form { display: inline; }
+        code { background: #f5f5f5; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+        .alert { padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; font-size: 13px; }
+        .alert-warning { background: #fffbe6; border: 1px solid #ffe58f; color: #ad6800; }
+        .alert-danger { background: #fff2f0; border: 1px solid #ffccc7; color: #a8071a; }
+        .alert-info { background: #e6f7ff; border: 1px solid #91d5ff; color: #003a8c; }
+    </style>
+    {% block head_extra %}{% endblock %}
+</head>
+<body>
+    <div class="sidebar">
+        <h2>TG解码器管理</h2>
+        <div class="nav-group">基础</div>
+        <a href="/" {% if request.url.path == '/' %}class="active"{% endif %}>看板</a>
+        <a href="/users" {% if request.url.path == '/users' %}class="active"{% endif %}>用户管理</a>
+        <a href="/files" {% if request.url.path == '/files' %}class="active"{% endif %}>文件管理</a>
+        <a href="/logs" {% if request.url.path == '/logs' %}class="active"{% endif %}>解码日志</a>
+        <a href="/health-page" {% if request.url.path == '/health-page' %}class="active"{% endif %}>系统健康</a>
+        <div class="nav-group">R40 运营</div>
+        <a href="/tasks" {% if request.url.path == '/tasks' %}class="active"{% endif %}>任务中心</a>
+        <a href="/reports" {% if request.url.path == '/reports' %}class="active"{% endif %}>举报管理</a>
+        <a href="/collections" {% if request.url.path == '/collections' %}class="active"{% endif %}>集合管理</a>
+        <a href="/notifications" {% if request.url.path == '/notifications' %}class="active"{% endif %}>通知中心</a>
+        <a href="/approvals" {% if request.url.path == '/approvals' %}class="active"{% endif %}>审批管理</a>
+        <a href="/rbac" {% if request.url.path == '/rbac' %}class="active"{% endif %}>RBAC</a>
+        <div class="nav-group">运维</div>
+        <a href="/repair-console" {% if request.url.path == '/repair-console' %}class="active"{% endif %}>修复控制台</a>
+        <a href="/topology" {% if request.url.path == '/topology' %}class="active"{% endif %}>拓扑可视化</a>
+        <a href="/ru-cost" {% if request.url.path == '/ru-cost' %}class="active"{% endif %}>RU成本</a>
+        <a href="/maintenance" {% if request.url.path == '/maintenance' %}class="active"{% endif %}>维护模式</a>
+        <a href="/disaster-recovery" {% if request.url.path == '/disaster-recovery' %}class="active"{% endif %}>灾备控制台</a>
+    </div>
+    <div class="main">
+        <div class="header">
+            <h1>{% block page_title %}管理后台{% endblock %}</h1>
+            <div class="admin-info">
+                {% if admin %}管理员: {{ admin.username if admin is mapping or admin is not string else admin }}{% endif %}
+            </div>
+        </div>
+        {% block content %}{% endblock %}
+    </div>
+</body>
+</html>

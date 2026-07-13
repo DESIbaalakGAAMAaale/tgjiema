@@ -77,22 +77,22 @@ async def reserve(user_id: int, amount: int, reason: str) -> str:
     now = datetime.datetime.now().isoformat()
 
     try:
-        # 写入预留记录
-        await store._db.execute(
-            "INSERT INTO quota_reservations (id, user_id, amount, reason, status, actual_amount, created_at, settled_at, expired_at) "
-            "VALUES (?, ?, ?, ?, 'reserved', 0, ?, NULL, NULL)",
-            (reservation_id, user_id, amount, reason, now),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("quota_reservations", reservation_id)
-
-        # 写入配额变更流水
-        await store.append_quota_ledger(
-            user_id=user_id,
-            event_type=LEDGER_TYPE_RESERVATION,
-            request_id=reservation_id,
-            reason=f"reserve: {reason} (amount={amount})",
-        )
+        # R40 P0-5: 预留记录 + dirty_outbox + 流水 同事务
+        async with store.transaction() as tx:
+            await tx.execute(
+                "INSERT INTO quota_reservations (id, user_id, amount, reason, status, actual_amount, created_at, settled_at, expired_at) "
+                "VALUES (?, ?, ?, ?, 'reserved', 0, ?, NULL, NULL)",
+                (reservation_id, user_id, amount, reason, now),
+            )
+            await store.add_dirty_outbox("quota_reservations", reservation_id, connection=tx)
+            # 写入配额变更流水(同事务)
+            await store.append_quota_ledger(
+                user_id=user_id,
+                event_type=LEDGER_TYPE_RESERVATION,
+                request_id=reservation_id,
+                reason=f"reserve: {reason} (amount={amount})",
+                tx=tx,
+            )
 
         logger.debug(f"[QuotaLedger] reserve 成功 user={user_id} res_id={reservation_id} amount={amount}")
         return reservation_id
@@ -139,33 +139,35 @@ async def settle(reservation_id: str, actual_amount: int | None = None) -> bool:
     now = datetime.datetime.now().isoformat()
 
     try:
-        # 更新预留状态为已结算
-        await store._db.execute(
-            "UPDATE quota_reservations SET status = 'settled', actual_amount = ?, settled_at = ? "
-            "WHERE id = ? AND status = 'reserved'",
-            (actual_amount, now, reservation_id),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("quota_reservations", reservation_id)
+        # R40 P0-5: 预留更新 + dirty_outbox + 流水 同事务
+        async with store.transaction() as tx:
+            await tx.execute(
+                "UPDATE quota_reservations SET status = 'settled', actual_amount = ?, settled_at = ? "
+                "WHERE id = ? AND status = 'reserved'",
+                (actual_amount, now, reservation_id),
+            )
+            await store.add_dirty_outbox("quota_reservations", reservation_id, connection=tx)
 
-        # 写入结算流水
-        user_id = int(reservation["user_id"])
-        refund_amount = reserved_amount - actual_amount
-        await store.append_quota_ledger(
-            user_id=user_id,
-            event_type=LEDGER_TYPE_SETTLEMENT,
-            request_id=reservation_id,
-            reason=f"settle: actual={actual_amount}, reserved={reserved_amount}, refund_diff={refund_amount}",
-        )
-
-        # 差额退款(如果实际消耗 < 预留)
-        if refund_amount > 0:
+            # 写入结算流水(同事务)
+            user_id = int(reservation["user_id"])
+            refund_amount = reserved_amount - actual_amount
             await store.append_quota_ledger(
                 user_id=user_id,
-                event_type=LEDGER_TYPE_REFUND,
+                event_type=LEDGER_TYPE_SETTLEMENT,
                 request_id=reservation_id,
-                reason=f"settle_refund: 差额退款 {refund_amount}",
+                reason=f"settle: actual={actual_amount}, reserved={reserved_amount}, refund_diff={refund_amount}",
+                tx=tx,
             )
+
+            # 差额退款(如果实际消耗 < 预留)
+            if refund_amount > 0:
+                await store.append_quota_ledger(
+                    user_id=user_id,
+                    event_type=LEDGER_TYPE_REFUND,
+                    request_id=reservation_id,
+                    reason=f"settle_refund: 差额退款 {refund_amount}",
+                    tx=tx,
+                )
 
         logger.debug(f"[QuotaLedger] settle 成功 res_id={reservation_id} actual={actual_amount}")
         return True
@@ -207,22 +209,23 @@ async def refund(reservation_id: str, reason: str = "") -> bool:
     refund_reason = f"refund: {reason}" if reason else "refund: 操作失败退款"
 
     try:
-        # 更新预留状态为已退款
-        await store._db.execute(
-            "UPDATE quota_reservations SET status = 'refunded', settled_at = ? "
-            "WHERE id = ? AND status = 'reserved'",
-            (now, reservation_id),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("quota_reservations", reservation_id)
+        # R40 P0-5: 预留更新 + dirty_outbox + 流水 同事务
+        async with store.transaction() as tx:
+            await tx.execute(
+                "UPDATE quota_reservations SET status = 'refunded', settled_at = ? "
+                "WHERE id = ? AND status = 'reserved'",
+                (now, reservation_id),
+            )
+            await store.add_dirty_outbox("quota_reservations", reservation_id, connection=tx)
 
-        # 写入退款流水
-        await store.append_quota_ledger(
-            user_id=user_id,
-            event_type=LEDGER_TYPE_REFUND,
-            request_id=reservation_id,
-            reason=f"{refund_reason} (amount={reserved_amount})",
-        )
+            # 写入退款流水(同事务)
+            await store.append_quota_ledger(
+                user_id=user_id,
+                event_type=LEDGER_TYPE_REFUND,
+                request_id=reservation_id,
+                reason=f"{refund_reason} (amount={reserved_amount})",
+                tx=tx,
+            )
 
         logger.debug(f"[QuotaLedger] refund 成功 res_id={reservation_id} amount={reserved_amount}")
         return True
@@ -398,30 +401,32 @@ async def cleanup_expired_reservations() -> int:
             return 0
 
         count = 0
-        for r in rows:
-            reservation_id = r[0]
-            user_id = int(r[1])
-            amount = int(r[2])
-            now = datetime.datetime.now().isoformat()
+        # R40 P0-5: 所有过期预留的更新 + dirty_outbox + 流水 在同一事务内
+        async with store.transaction() as tx:
+            for r in rows:
+                reservation_id = r[0]
+                user_id = int(r[1])
+                amount = int(r[2])
+                now = datetime.datetime.now().isoformat()
 
-            # 更新状态为已退款
-            await store._db.execute(
-                "UPDATE quota_reservations SET status = 'refunded', expired_at = ? "
-                "WHERE id = ? AND status = 'reserved'",
-                (now, reservation_id),
-            )
-            await store.add_dirty_outbox("quota_reservations", reservation_id)
+                # 更新状态为已退款
+                await tx.execute(
+                    "UPDATE quota_reservations SET status = 'refunded', expired_at = ? "
+                    "WHERE id = ? AND status = 'reserved'",
+                    (now, reservation_id),
+                )
+                await store.add_dirty_outbox("quota_reservations", reservation_id, connection=tx)
 
-            # 写入退款流水
-            await store.append_quota_ledger(
-                user_id=user_id,
-                event_type=LEDGER_TYPE_REFUND,
-                request_id=reservation_id,
-                reason=f"expired_refund: 预留超时自动退款 (amount={amount})",
-            )
-            count += 1
+                # 写入退款流水(同事务)
+                await store.append_quota_ledger(
+                    user_id=user_id,
+                    event_type=LEDGER_TYPE_REFUND,
+                    request_id=reservation_id,
+                    reason=f"expired_refund: 预留超时自动退款 (amount={amount})",
+                    tx=tx,
+                )
+                count += 1
 
-        await store._db.commit()
         if count > 0:
             logger.info(f"[QuotaLedger] cleanup_expired_reservations 清理 {count} 条过期预留")
         return count

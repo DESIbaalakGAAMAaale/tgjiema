@@ -286,6 +286,10 @@ MIGRATION_STATEMENTS = [
     "ALTER TABLE IF EXISTS file_records ADD COLUMN IF NOT EXISTS deleted_at TEXT",
     "ALTER TABLE IF EXISTS codes ADD COLUMN IF NOT EXISTS deleted_at TEXT",
     "ALTER TABLE IF EXISTS cells ADD COLUMN IF NOT EXISTS deleted_at TEXT",
+    # R40 P1-11: users 表增加 ban_expires_at 列(临时封禁到期自动解封依据)
+    # ban_user 写入,check_user_banned/cleanup_expired_bans 读取判定。
+    # NULL 表示永久封禁;非空 ISO 时间字符串表示临时封禁到期时间。
+    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS ban_expires_at TEXT",
     # TTL 设置不在此处执行 — ADD COLUMN 是异步 schema change，
     # 紧跟 TTL 修改会报 "cannot modify TTL settings while another schema change
     # is being processed"。改为在下方单独循环中带等待执行。

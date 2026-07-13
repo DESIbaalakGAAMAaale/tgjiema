@@ -1,0 +1,123 @@
+{% extends "base.html" %}
+
+{% block title %}修复控制台{% endblock %}
+{% block page_title %}修复控制台{% endblock %}
+
+{% block content %}
+<div class="metric-grid">
+    <div class="metric-card">
+        <div class="label">Outbox 待处理</div>
+        <div class="value">{{ overview.get('outbox_pending', 0) if overview else 0 }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">DLQ 死信</div>
+        <div class="value">{{ overview.get('dlq_count', 0) if overview else 0 }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">复制失败</div>
+        <div class="value">{{ overview.get('replication_failed', 0) if overview else 0 }}</div>
+    </div>
+    <div class="metric-card">
+        <div class="label">Relay 异常</div>
+        <div class="value">{{ overview.get('relay_issues', 0) if overview else 0 }}</div>
+    </div>
+</div>
+
+<div class="section">
+    <h2>Outbox 记录</h2>
+    <table>
+        <caption>dirty_outbox 未处理/死信记录</caption>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>表名</th>
+                <th>主键</th>
+                <th>版本</th>
+                <th>操作</th>
+                <th>创建时间</th>
+                <th>已处理</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set outbox_items = outbox.get('items', []) if outbox else [] %}
+            {% for item in outbox_items %}
+            <tr>
+                <td>{{ item.get('id', '') }}</td>
+                <td>{{ item.get('table_name', '') }}</td>
+                <td><code>{{ item.get('pk', '') }}</code></td>
+                <td>{{ item.get('version', 0) }}</td>
+                <td>{{ item.get('operation', '') }}</td>
+                <td>{{ item.get('created_at', 'N/A') }}</td>
+                <td>
+                    {% if item.get('processed') %}
+                    <span class="tag tag-green">是</span>
+                    {% else %}
+                    <span class="tag tag-red">否</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="section">
+    <h2>DLQ 死信队列</h2>
+    <table>
+        <caption>死信记录</caption>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>载荷</th>
+                <th>错误</th>
+                <th>重试次数</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set dlq_items = dlq.get('items', []) if dlq else [] %}
+            {% for item in dlq_items %}
+            <tr>
+                <td>{{ item.get('id', '') }}</td>
+                <td><code>{{ item.get('payload', '') | truncate(60) }}</code></td>
+                <td>{{ item.get('error', '') }}</td>
+                <td>{{ item.get('attempts', 0) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="4" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="section">
+    <h2>复制失败任务</h2>
+    <table>
+        <caption>replication_tasks 失败任务</caption>
+        <thead>
+            <tr>
+                <th>ID</th>
+                <th>源</th>
+                <th>目标</th>
+                <th>状态</th>
+                <th>尝试次数</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% set repl_items = replication.get('items', []) if replication else [] %}
+            {% for item in repl_items %}
+            <tr>
+                <td>{{ item.get('id', '') }}</td>
+                <td><code>{{ item.get('source', '') }}</code></td>
+                <td><code>{{ item.get('target', '') }}</code></td>
+                <td>{{ item.get('status', '') }}</td>
+                <td>{{ item.get('attempts', 0) }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

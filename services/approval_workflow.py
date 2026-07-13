@@ -42,12 +42,20 @@ APPROVAL_ACTION_RESTORE = "restore"                 # 恢复删除
 APPROVAL_ACTION_CONFIG_CHANGE = "config_change"     # 配置变更
 APPROVAL_ACTION_DELETE_DATA = "delete_data"          # 删除数据
 APPROVAL_ACTION_FACTORY_RESET = "factory_reset"     # 恢复出厂设置
+# R40 P0-8: 新增高风险 action(与 command_bus 中常量一致)
+APPROVAL_ACTION_MAINTENANCE_ENABLE = "maintenance_enable"     # 开启维护模式
+APPROVAL_ACTION_MAINTENANCE_DISABLE = "maintenance_disable"   # 关闭维护模式
+APPROVAL_ACTION_RBAC_ASSIGN = "rbac_assign"                  # 分配角色
 
 # ─── 审批状态 ──────────────────────────────────────────────────
+# R40 P0-8: 状态机扩展为 PENDING → APPROVED → EXECUTING → EXECUTED/FAILED
 APPROVAL_STATUS_PENDING = "pending"
 APPROVAL_STATUS_APPROVED = "approved"
 APPROVAL_STATUS_REJECTED = "rejected"
 APPROVAL_STATUS_CANCELLED = "cancelled"
+APPROVAL_STATUS_EXECUTING = "executing"   # R40 P0-8: 命令正在执行
+APPROVAL_STATUS_EXECUTED = "executed"      # R40 P0-8: 命令执行成功
+APPROVAL_STATUS_FAILED = "failed"           # R40 P0-8: 命令执行失败
 
 # ─── 需要审批的操作集合 ────────────────────────────────────────
 _ACTIONS_REQUIRING_APPROVAL = {
@@ -57,6 +65,9 @@ _ACTIONS_REQUIRING_APPROVAL = {
     APPROVAL_ACTION_CONFIG_CHANGE,
     APPROVAL_ACTION_DELETE_DATA,
     APPROVAL_ACTION_FACTORY_RESET,
+    APPROVAL_ACTION_MAINTENANCE_ENABLE,
+    APPROVAL_ACTION_MAINTENANCE_DISABLE,
+    APPROVAL_ACTION_RBAC_ASSIGN,
 }
 
 # ─── 操作中文描述(用于格式化展示) ─────────────────────────────
@@ -67,6 +78,9 @@ _ACTION_LABELS = {
     APPROVAL_ACTION_CONFIG_CHANGE: "配置变更",
     APPROVAL_ACTION_DELETE_DATA: "删除数据",
     APPROVAL_ACTION_FACTORY_RESET: "恢复出厂设置",
+    APPROVAL_ACTION_MAINTENANCE_ENABLE: "开启维护模式",
+    APPROVAL_ACTION_MAINTENANCE_DISABLE: "关闭维护模式",
+    APPROVAL_ACTION_RBAC_ASSIGN: "分配角色",
 }
 
 
@@ -94,30 +108,30 @@ async def create_approval(action: str, payload: dict, created_by: int) -> int:
 
     try:
         payload_str = json.dumps(payload, ensure_ascii=False, default=str)
-        cursor = await store._db.execute(
-            "INSERT INTO approvals (action, payload, status, approver_id, approver_note, created_by, created_at, resolved_at) "
-            "VALUES (?, ?, 'pending', NULL, '', ?, ?, NULL)",
-            (action, payload_str, created_by, now),
-        )
-        await store._db.commit()
-        approval_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-
-        if approval_id > 0:
-            await store.add_dirty_outbox("approvals", str(approval_id))
-
-            # 写审计日志
-            await store._db.execute(
-                "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
-                "VALUES (?, 'admin', 'create_approval', 'approval', ?, ?, ?)",
-                (
-                    created_by,
-                    str(approval_id),
-                    json.dumps({"action": action, "payload": payload}, ensure_ascii=False, default=str),
-                    now,
-                ),
+        # R40 P0-5: 业务表 + audit_log + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "INSERT INTO approvals (action, payload, status, approver_id, approver_note, created_by, created_at, resolved_at) "
+                "VALUES (?, ?, 'pending', NULL, '', ?, ?, NULL)",
+                (action, payload_str, created_by, now),
             )
-            await store._db.commit()
-            await store.add_dirty_outbox("audit_log", "last")
+            approval_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+
+            if approval_id > 0:
+                await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
+
+                # 写审计日志(同事务)
+                await tx.execute(
+                    "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
+                    "VALUES (?, 'admin', 'create_approval', 'approval', ?, ?, ?)",
+                    (
+                        created_by,
+                        str(approval_id),
+                        json.dumps({"action": action, "payload": payload}, ensure_ascii=False, default=str),
+                        now,
+                    ),
+                )
+                await store.add_dirty_outbox("audit_log", "last", connection=tx)
 
         logger.info(f"[Approval] create_approval 创建审批 id={approval_id} action={action} by={created_by}")
         return approval_id
@@ -169,29 +183,69 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
     now = datetime.datetime.now().isoformat()
 
     try:
-        await store._db.execute(
-            "UPDATE approvals SET status = 'approved', approver_id = ?, approver_note = ?, resolved_at = ? "
-            "WHERE id = ? AND status = 'pending'",
-            (approver_id, note, now, approval_id),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("approvals", str(approval_id))
+        # R40 P1-4: CAS UPDATE — 单条 UPDATE 同时完成状态判定与状态变更,
+        # 通过 rowcount 检测并发竞争(0=已被处理或不存在,1=本调用成功)。
+        # R40 P0-5: 业务表 + audit_log + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE approvals SET status = 'approved', approver_id = ?, approver_note = ?, resolved_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (approver_id, note, now, approval_id),
+            )
+            affected = cursor.rowcount if cursor else 0
+            if affected == 0:
+                # CAS 失败:审批已被其他审批人处理或不存在
+                logger.warning(
+                    f"[Approval] approve CAS UPDATE 未命中(id={approval_id}): "
+                    f"已被处理或不存在"
+                )
+                return False
+            await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
 
-        # 写审计日志
-        await store._db.execute(
-            "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
-            "VALUES (?, 'admin', 'approve', 'approval', ?, ?, ?)",
-            (
-                approver_id,
-                str(approval_id),
-                json.dumps({"note": note, "action_type": approval["action"]}, ensure_ascii=False),
-                now,
-            ),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("audit_log", "last")
+            # 写审计日志(同事务)
+            await tx.execute(
+                "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
+                "VALUES (?, 'admin', 'approve', 'approval', ?, ?, ?)",
+                (
+                    approver_id,
+                    str(approval_id),
+                    json.dumps({"note": note, "action_type": approval["action"]}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            await store.add_dirty_outbox("audit_log", "last", connection=tx)
 
         logger.info(f"[Approval] approve 审批已批准 id={approval_id} approver={approver_id}")
+
+        # R40 P0-8: 审批通过后自动执行命令(仅对 CommandBus 创建的审批)
+        # payload 中含 command_action 字段表示该审批由 CommandBus 创建
+        payload_data = approval.get("payload", {}) or {}
+        if isinstance(payload_data, str):
+            try:
+                payload_data = json.loads(payload_data)
+            except (json.JSONDecodeError, TypeError):
+                payload_data = {}
+        if payload_data.get("command_action"):
+            try:
+                from services.command_bus import CommandBus
+                cb = CommandBus()
+                exec_result = await cb.execute_approved_action(approval_id)
+                if exec_result.success:
+                    logger.info(
+                        f"[Approval] 自动执行命令成功 approval_id={approval_id} "
+                        f"action={payload_data.get('command_action')}"
+                    )
+                else:
+                    logger.warning(
+                        f"[Approval] 自动执行命令失败 approval_id={approval_id} "
+                        f"error={exec_result.error}"
+                    )
+            except Exception as exec_err:
+                # 命令执行失败不影响审批已批准的状态
+                # 审批仍为 APPROVED,可通过手动调用 execute_approved_action 重试
+                logger.warning(
+                    f"[Approval] 自动执行命令异常 approval_id={approval_id}: {exec_err}"
+                )
         return True
     except Exception as e:
         logger.error(f"[Approval] approve 失败 id={approval_id}: {e}")
@@ -235,27 +289,36 @@ async def reject(approval_id: int, approver_id: int, reason: str = "") -> bool:
     now = datetime.datetime.now().isoformat()
 
     try:
-        await store._db.execute(
-            "UPDATE approvals SET status = 'rejected', approver_id = ?, approver_note = ?, resolved_at = ? "
-            "WHERE id = ? AND status = 'pending'",
-            (approver_id, reason, now, approval_id),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("approvals", str(approval_id))
+        # R40 P1-4: CAS UPDATE — 通过 rowcount 检测并发竞争
+        # R40 P0-5: 业务表 + audit_log + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE approvals SET status = 'rejected', approver_id = ?, approver_note = ?, resolved_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (approver_id, reason, now, approval_id),
+            )
+            affected = cursor.rowcount if cursor else 0
+            if affected == 0:
+                # CAS 失败:审批已被其他审批人处理或不存在
+                logger.warning(
+                    f"[Approval] reject CAS UPDATE 未命中(id={approval_id}): "
+                    f"已被处理或不存在"
+                )
+                return False
+            await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
 
-        # 写审计日志
-        await store._db.execute(
-            "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
-            "VALUES (?, 'admin', 'reject', 'approval', ?, ?, ?)",
-            (
-                approver_id,
-                str(approval_id),
-                json.dumps({"reason": reason, "action_type": approval["action"]}, ensure_ascii=False),
-                now,
-            ),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("audit_log", "last")
+            # 写审计日志(同事务)
+            await tx.execute(
+                "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
+                "VALUES (?, 'admin', 'reject', 'approval', ?, ?, ?)",
+                (
+                    approver_id,
+                    str(approval_id),
+                    json.dumps({"reason": reason, "action_type": approval["action"]}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            await store.add_dirty_outbox("audit_log", "last", connection=tx)
 
         logger.info(f"[Approval] reject 审批已驳回 id={approval_id} approver={approver_id}")
         return True
@@ -295,32 +358,168 @@ async def cancel(approval_id: int, user_id: int) -> bool:
     now = datetime.datetime.now().isoformat()
 
     try:
-        await store._db.execute(
-            "UPDATE approvals SET status = 'cancelled', resolved_at = ? "
-            "WHERE id = ? AND status = 'pending'",
-            (now, approval_id),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("approvals", str(approval_id))
+        # R40 P0-5: 业务表 + audit_log + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            await tx.execute(
+                "UPDATE approvals SET status = 'cancelled', resolved_at = ? "
+                "WHERE id = ? AND status = 'pending'",
+                (now, approval_id),
+            )
+            await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
 
-        # 写审计日志
-        await store._db.execute(
-            "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
-            "VALUES (?, 'admin', 'cancel_approval', 'approval', ?, ?, ?)",
-            (
-                user_id,
-                str(approval_id),
-                json.dumps({"action_type": approval["action"]}, ensure_ascii=False),
-                now,
-            ),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("audit_log", "last")
+            # 写审计日志(同事务)
+            await tx.execute(
+                "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
+                "VALUES (?, 'admin', 'cancel_approval', 'approval', ?, ?, ?)",
+                (
+                    user_id,
+                    str(approval_id),
+                    json.dumps({"action_type": approval["action"]}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            await store.add_dirty_outbox("audit_log", "last", connection=tx)
 
         logger.info(f"[Approval] cancel 审批已取消 id={approval_id} user={user_id}")
         return True
     except Exception as e:
         logger.error(f"[Approval] cancel 失败 id={approval_id}: {e}")
+        return False
+
+
+# ─── R40 P0-8: 命令执行状态管理 ─────────────────────────────────
+
+
+async def mark_executing(approval_id: int) -> bool:
+    """R40 P0-8: 将审批状态从 APPROVED 标记为 EXECUTING(命令开始执行)。
+
+    仅当当前状态为 approved 时才允许转换,防止重复执行。
+
+    Args:
+        approval_id: 审批 ID
+
+    Returns:
+        True 表示标记成功;False 表示状态不符或失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+
+    now = datetime.datetime.now().isoformat()
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE approvals SET status = ?, resolved_at = ? "
+                "WHERE id = ? AND status = ?",
+                (APPROVAL_STATUS_EXECUTING, now, approval_id, APPROVAL_STATUS_APPROVED),
+            )
+            await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
+            # EXECUTING 状态不写 audit_log(执行结果在 mark_executed/mark_failed 中记录)
+        affected = cursor.rowcount if cursor else 0
+        if affected == 0:
+            logger.warning(
+                f"[Approval] mark_executing 未更新(状态非 approved 或不存在): id={approval_id}"
+            )
+            return False
+        logger.info(f"[Approval] mark_executing id={approval_id} 状态 → EXECUTING")
+        return True
+    except Exception as e:
+        logger.error(f"[Approval] mark_executing 失败 id={approval_id}: {e}")
+        return False
+
+
+async def mark_executed(approval_id: int) -> bool:
+    """R40 P0-8: 将审批状态从 EXECUTING 标记为 EXECUTED(命令执行成功)。
+
+    Args:
+        approval_id: 审批 ID
+
+    Returns:
+        True 表示标记成功;False 表示状态不符或失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+
+    now = datetime.datetime.now().isoformat()
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE approvals SET status = ?, resolved_at = ? "
+                "WHERE id = ? AND status = ?",
+                (APPROVAL_STATUS_EXECUTED, now, approval_id, APPROVAL_STATUS_EXECUTING),
+            )
+            await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
+
+            # 写审计日志
+            await tx.execute(
+                "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
+                "VALUES (?, 'system', 'mark_executed', 'approval', ?, ?, ?)",
+                (0, str(approval_id), json.dumps({"status": "executed"}, ensure_ascii=False), now),
+            )
+            await store.add_dirty_outbox("audit_log", "last", connection=tx)
+
+        affected = cursor.rowcount if cursor else 0
+        if affected == 0:
+            logger.warning(
+                f"[Approval] mark_executed 未更新(状态非 executing 或不存在): id={approval_id}"
+            )
+            return False
+        logger.info(f"[Approval] mark_executed id={approval_id} 状态 → EXECUTED")
+        return True
+    except Exception as e:
+        logger.error(f"[Approval] mark_executed 失败 id={approval_id}: {e}")
+        return False
+
+
+async def mark_failed(approval_id: int, error: str = "") -> bool:
+    """R40 P0-8: 将审批状态从 EXECUTING 标记为 FAILED(命令执行失败)。
+
+    错误信息写入 approver_note 字段(前缀 "ERROR: ")。
+
+    Args:
+        approval_id: 审批 ID
+        error: 错误信息
+
+    Returns:
+        True 表示标记成功;False 表示状态不符或失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+
+    now = datetime.datetime.now().isoformat()
+    error_note = f"ERROR: {error}"[:500] if error else "ERROR: unknown"
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE approvals SET status = ?, approver_note = ?, resolved_at = ? "
+                "WHERE id = ? AND status = ?",
+                (APPROVAL_STATUS_FAILED, error_note, now, approval_id, APPROVAL_STATUS_EXECUTING),
+            )
+            await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
+
+            # 写审计日志
+            await tx.execute(
+                "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
+                "VALUES (?, 'system', 'mark_failed', 'approval', ?, ?, ?)",
+                (0, str(approval_id),
+                 json.dumps({"status": "failed", "error": error}, ensure_ascii=False), now),
+            )
+            await store.add_dirty_outbox("audit_log", "last", connection=tx)
+
+        affected = cursor.rowcount if cursor else 0
+        if affected == 0:
+            logger.warning(
+                f"[Approval] mark_failed 未更新(状态非 executing 或不存在): id={approval_id}"
+            )
+            return False
+        logger.warning(
+            f"[Approval] mark_failed id={approval_id} 状态 → FAILED error={error[:200]}"
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[Approval] mark_failed 失败 id={approval_id}: {e}")
         return False
 
 
@@ -460,6 +659,9 @@ async def format_approval(approval: dict) -> str:
         APPROVAL_STATUS_APPROVED: "✅ 已批准",
         APPROVAL_STATUS_REJECTED: "❌ 已驳回",
         APPROVAL_STATUS_CANCELLED: "🚫 已取消",
+        APPROVAL_STATUS_EXECUTING: "🔄 执行中",
+        APPROVAL_STATUS_EXECUTED: "✅ 已执行",
+        APPROVAL_STATUS_FAILED: "⚠️ 执行失败",
     }
     status_text = status_labels.get(status, status)
 

@@ -67,16 +67,19 @@ async def create_report(reporter_id: int, target_type: str, target_id: str,
         return 0
     now = _dt.datetime.now().isoformat()
     try:
-        cursor = await store._db.execute(
-            """INSERT INTO content_reports
-               (reporter_id, target_type, target_id, reason, description,
-                status, appeal_text, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, '', ?)""",
-            (reporter_id, target_type, target_id, reason, description,
-             REPORT_STATUS_PENDING, now),
-        )
-        await store._db.commit()
-        report_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+        # R40 P0-5: 业务表 + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """INSERT INTO content_reports
+                   (reporter_id, target_type, target_id, reason, description,
+                    status, appeal_text, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, '', ?)""",
+                (reporter_id, target_type, target_id, reason, description,
+                 REPORT_STATUS_PENDING, now),
+            )
+            report_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if report_id:
+                await store.add_dirty_outbox("content_reports", str(report_id), connection=tx)
         if report_id:
             logger.info(
                 f"[ContentReports] 创建举报 id={report_id} reporter={reporter_id} "
@@ -90,25 +93,30 @@ async def create_report(reporter_id: int, target_type: str, target_id: str,
 
 async def _write_audit_log(actor_id: int, action: str, target_type: str,
                            target_id: str, details: dict,
-                           ip_addr: str = "") -> int:
+                           ip_addr: str = "", tx=None) -> int:
     """内部: 写入审计日志(audit_log 表)。
 
-    Args:
-        actor_id: 操作者 id(管理员)
-        action: 动作描述(如 takedown/ban/unban/resolve)
-        target_type: 目标类型
-        target_id: 目标主键
-        details: 详情字典(序列化为 JSON)
-        ip_addr: 操作来源 IP(可选)
-
-    Returns:
-        新日志 id;失败返回 0
+    R40 P0-5: 支持 tx 参数(同事务写入),不自动 commit。
     """
     store = get_cache_store()
     if not store._db:
         return 0
     now = _dt.datetime.now().isoformat()
     try:
+        if tx is not None:
+            cursor = await tx.execute(
+                """INSERT INTO audit_log
+                   (actor_id, actor_type, action, target_type, target_id,
+                    details, ip_addr, created_at)
+                   VALUES (?, 'admin', ?, ?, ?, ?, ?, ?)""",
+                (actor_id, action, target_type, target_id,
+                 json.dumps(details, ensure_ascii=False), ip_addr, now),
+            )
+            log_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if log_id:
+                await store.add_dirty_outbox("audit_log", "last", connection=tx)
+            return log_id
+        # 兼容模式: 无 tx 时自动 commit
         cursor = await store._db.execute(
             """INSERT INTO audit_log
                (actor_id, actor_type, action, target_type, target_id,
@@ -118,35 +126,47 @@ async def _write_audit_log(actor_id: int, action: str, target_type: str,
              json.dumps(details, ensure_ascii=False), ip_addr, now),
         )
         await store._db.commit()
-        return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+        log_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+        if log_id:
+            await store.add_dirty_outbox("audit_log", "last")
+        return log_id
     except Exception as e:
         logger.warning(f"[ContentReports] _write_audit_log 失败: {e}")
         return 0
 
 
-async def _notify_user(user_id: int, ntype: str, payload: dict) -> bool:
+async def _notify_user(user_id: int, ntype: str, payload: dict, tx=None) -> bool:
     """内部: 向 notifications 表写入一条用户通知。
 
-    Args:
-        user_id: 接收用户 id
-        ntype: 通知类型(如 takedown/ban/unban/appeal)
-        payload: 通知载荷(序列化为 JSON)
-
-    Returns:
-        True 写入成功;False 失败
+    R40 P0-5: 支持 tx 参数(同事务写入),不自动 commit。
     """
     store = get_cache_store()
     if not store._db:
         return False
     now = _dt.datetime.now().isoformat()
     try:
-        await store._db.execute(
+        if tx is not None:
+            cursor = await tx.execute(
+                """INSERT INTO notifications
+                   (user_id, type, payload, is_read, created_at)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (user_id, ntype, json.dumps(payload, ensure_ascii=False), now),
+            )
+            nid = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if nid:
+                await store.add_dirty_outbox("notifications", str(nid), connection=tx)
+            return True
+        # 兼容模式: 无 tx 时自动 commit
+        cursor = await store._db.execute(
             """INSERT INTO notifications
                (user_id, type, payload, is_read, created_at)
                VALUES (?, ?, ?, 0, ?)""",
             (user_id, ntype, json.dumps(payload, ensure_ascii=False), now),
         )
         await store._db.commit()
+        nid = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+        if nid:
+            await store.add_dirty_outbox("notifications", str(nid))
         return True
     except Exception as e:
         logger.warning(f"[ContentReports] _notify_user 失败: {e}")
@@ -172,65 +192,85 @@ async def takedown_content(target_type: str, target_id: str, reason: str,
     store = get_cache_store()
     if not store._db:
         return False
+    now = _dt.datetime.now().isoformat()
     success = False
     owner_id = 0
-    if target_type == TARGET_TYPE_FILE:
-        # 软删除文件记录(同时写 dirty_outbox tombstone)
-        success = await store.soft_delete("file_records", target_id)
-        # 查询文件所有者用于通知
-        try:
-            cursor = await store._db.execute(
-                "SELECT uploader_id FROM file_records_local WHERE file_code = ?",
-                (target_id,),
+    # R40 P0-5: 软删除/封禁 + dirty_outbox + audit_log + notification 同事务
+    try:
+        async with store.transaction() as tx:
+            if target_type == TARGET_TYPE_FILE:
+                # 软删除文件记录(UPDATE deleted_at + status='deleted' + dirty_outbox tombstone)
+                cursor = await tx.execute(
+                    "UPDATE file_records_local SET deleted_at = ?, status = 'deleted', "
+                    "crdb_synced = 0 WHERE file_code = ?",
+                    (now, target_id),
+                )
+                success = cursor.rowcount > 0 if cursor else False
+                if success:
+                    await store.add_dirty_outbox(
+                        "file_records", target_id, "tombstone",
+                        json.dumps({"deleted_at": now}), connection=tx,
+                    )
+                # 查询文件所有者用于通知
+                try:
+                    cur = await tx.execute(
+                        "SELECT uploader_id FROM file_records_local WHERE file_code = ?",
+                        (target_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        owner_id = int(row[0])
+                except Exception as e:
+                    logger.debug(f"[ContentReports] takedown 查询所有者失败: {e}")
+            elif target_type == TARGET_TYPE_CODE:
+                # 软删除文件码
+                cursor = await tx.execute(
+                    "UPDATE codes_local SET deleted_at = ?, status = 'deleted', "
+                    "crdb_synced = 0 WHERE code = ?",
+                    (now, target_id),
+                )
+                success = cursor.rowcount > 0 if cursor else False
+                if success:
+                    await store.add_dirty_outbox(
+                        "codes", target_id, "tombstone",
+                        json.dumps({"deleted_at": now}), connection=tx,
+                    )
+                try:
+                    cur = await tx.execute(
+                        "SELECT uploader_id FROM codes_local WHERE code = ?",
+                        (target_id,),
+                    )
+                    row = await cur.fetchone()
+                    if row and row[0]:
+                        owner_id = int(row[0])
+                except Exception as e:
+                    logger.debug(f"[ContentReports] takedown 查询所有者失败: {e}")
+            elif target_type == TARGET_TYPE_USER:
+                # 标记用户 banned(is_banned=1)
+                cursor = await tx.execute(
+                    "UPDATE users_local SET is_banned = 1, updated_at = ? WHERE user_id = ?",
+                    (now, target_id),
+                )
+                success = cursor.rowcount > 0 if cursor else False
+                owner_id = int(target_id) if success else 0
+                if success:
+                    await store.add_dirty_outbox("users_local", str(target_id), connection=tx)
+            else:
+                logger.warning(f"[ContentReports] takedown 非法 target_type={target_type}")
+                return False
+            # 写审计日志(同事务)
+            await _write_audit_log(
+                admin_id, "takedown", target_type, target_id,
+                {"reason": reason, "success": success}, "", tx=tx,
             )
-            row = await cursor.fetchone()
-            if row and row[0]:
-                owner_id = int(row[0])
-        except Exception as e:
-            logger.debug(f"[ContentReports] takedown 查询所有者失败: {e}")
-    elif target_type == TARGET_TYPE_CODE:
-        # 软删除文件码
-        success = await store.soft_delete("codes", target_id)
-        try:
-            cursor = await store._db.execute(
-                "SELECT uploader_id FROM codes_local WHERE code = ?",
-                (target_id,),
-            )
-            row = await cursor.fetchone()
-            if row and row[0]:
-                owner_id = int(row[0])
-        except Exception as e:
-            logger.debug(f"[ContentReports] takedown 查询所有者失败: {e}")
-    elif target_type == TARGET_TYPE_USER:
-        # 标记用户 banned(is_banned=1)
-        try:
-            cursor = await store._db.execute(
-                "UPDATE users_local SET is_banned = 1, updated_at = ? "
-                "WHERE user_id = ?",
-                (_dt.datetime.now().isoformat(), target_id),
-            )
-            await store._db.commit()
-            success = cursor.rowcount > 0 if cursor else False
-            owner_id = int(target_id)
-            # 写 dirty_outbox 确保跨机同步
-            await store.add_dirty_outbox("users_local", str(target_id))
-        except Exception as e:
-            logger.warning(f"[ContentReports] takedown 标记用户 banned 失败: {e}")
-            success = False
-    else:
-        logger.warning(f"[ContentReports] takedown 非法 target_type={target_type}")
+            # 通知所有者(同事务)
+            if success and owner_id:
+                await _notify_user(owner_id, "takedown", {
+                    "target_type": target_type, "target_id": target_id, "reason": reason,
+                }, tx=tx)
+    except Exception as e:
+        logger.warning(f"[ContentReports] takedown_content 失败: {e}")
         return False
-
-    # 写审计日志
-    await _write_audit_log(
-        admin_id, "takedown", target_type, target_id,
-        {"reason": reason, "success": success}, "",
-    )
-    # 通知所有者
-    if success and owner_id:
-        await _notify_user(owner_id, "takedown", {
-            "target_type": target_type, "target_id": target_id, "reason": reason,
-        })
     logger.info(
         f"[ContentReports] takedown target={target_type}:{target_id} "
         f"success={success} admin={admin_id}"
@@ -243,6 +283,7 @@ async def ban_user(user_id: int, reason: str, duration_days: int = 0,
     """封禁用户(duration_days=0 永久)。
 
     - 更新 users_local.is_banned=1(实际封禁状态字段)
+    - R40 P1-11: 持久化 ban_expires_at(duration_days>0 写到期 ISO 时间,永久写 NULL)
     - 写 audit_log + dirty_outbox
     - 发送 ban 通知给用户
 
@@ -259,39 +300,44 @@ async def ban_user(user_id: int, reason: str, duration_days: int = 0,
     if not store._db:
         return False
     now = _dt.datetime.now().isoformat()
-    # 计算封禁到期时间(永久封禁不设置到期)
-    expires_at = ""
+    # R40 P1-11: 计算封禁到期时间(永久封禁写 NULL,临时封禁写 ISO 时间字符串)
+    # 用 None 表示永久,非空字符串表示临时封禁到期时间(供 check_user_banned 自动解封)
+    ban_expires_at: str | None = None
+    expires_at_for_log = ""
     if duration_days > 0:
         try:
             expires_dt = _dt.datetime.now() + _dt.timedelta(days=duration_days)
-            expires_at = expires_dt.isoformat()
+            ban_expires_at = expires_dt.isoformat()
+            expires_at_for_log = ban_expires_at
         except Exception:
-            expires_at = ""
+            ban_expires_at = None
     try:
-        cursor = await store._db.execute(
-            "UPDATE users_local SET is_banned = 1, updated_at = ? WHERE user_id = ?",
-            (now, user_id),
-        )
-        await store._db.commit()
-        if cursor.rowcount == 0:
-            logger.warning(f"[ContentReports] ban_user 未命中用户 user_id={user_id}")
-            return False
+        # R40 P0-5: users_local + dirty_outbox + audit_log + notifications 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE users_local SET is_banned = 1, ban_expires_at = ?, "
+                "updated_at = ? WHERE user_id = ?",
+                (ban_expires_at, now, user_id),
+            )
+            if cursor.rowcount == 0:
+                logger.warning(f"[ContentReports] ban_user 未命中用户 user_id={user_id}")
+                return False
+            # 写 dirty_outbox 确保跨机同步(同事务)
+            await store.add_dirty_outbox("users_local", str(user_id), connection=tx)
+            # 写审计日志(同事务)
+            await _write_audit_log(
+                admin_id, "ban", "user", str(user_id),
+                {"reason": reason, "duration_days": duration_days,
+                 "expires_at": expires_at_for_log}, "", tx=tx,
+            )
+            # 发送封禁通知给用户(同事务)
+            await _notify_user(user_id, "ban", {
+                "reason": reason, "duration_days": duration_days,
+                "expires_at": expires_at_for_log, "admin_id": admin_id,
+            }, tx=tx)
     except Exception as e:
         logger.warning(f"[ContentReports] ban_user 更新失败: {e}")
         return False
-    # 写 dirty_outbox 确保跨机同步
-    await store.add_dirty_outbox("users_local", str(user_id))
-    # 写审计日志
-    await _write_audit_log(
-        admin_id, "ban", "user", str(user_id),
-        {"reason": reason, "duration_days": duration_days,
-         "expires_at": expires_at}, "",
-    )
-    # 发送封禁通知给用户
-    await _notify_user(user_id, "ban", {
-        "reason": reason, "duration_days": duration_days,
-        "expires_at": expires_at, "admin_id": admin_id,
-    })
     logger.info(
         f"[ContentReports] ban_user user={user_id} reason={reason} "
         f"duration={duration_days} admin={admin_id}"
@@ -314,25 +360,28 @@ async def unban_user(user_id: int, admin_id: int = 0) -> bool:
         return False
     now = _dt.datetime.now().isoformat()
     try:
-        cursor = await store._db.execute(
-            "UPDATE users_local SET is_banned = 0, updated_at = ? WHERE user_id = ?",
-            (now, user_id),
-        )
-        await store._db.commit()
-        if cursor.rowcount == 0:
-            logger.warning(f"[ContentReports] unban_user 未命中用户 user_id={user_id}")
-            return False
+        # R40 P0-5: users_local + dirty_outbox + audit_log + notifications 同事务
+        # R40 P1-11: 解封时清除 ban_expires_at(NULL),避免残留到期时间
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "UPDATE users_local SET is_banned = 0, ban_expires_at = NULL, "
+                "updated_at = ? WHERE user_id = ?",
+                (now, user_id),
+            )
+            if cursor.rowcount == 0:
+                logger.warning(f"[ContentReports] unban_user 未命中用户 user_id={user_id}")
+                return False
+            # 写 dirty_outbox 确保跨机同步(同事务)
+            await store.add_dirty_outbox("users_local", str(user_id), connection=tx)
+            # 写审计日志(同事务)
+            await _write_audit_log(
+                admin_id, "unban", "user", str(user_id), {}, "", tx=tx,
+            )
+            # 通知用户已解封(同事务)
+            await _notify_user(user_id, "unban", {"admin_id": admin_id}, tx=tx)
     except Exception as e:
         logger.warning(f"[ContentReports] unban_user 更新失败: {e}")
         return False
-    # 写 dirty_outbox 确保跨机同步
-    await store.add_dirty_outbox("users_local", str(user_id))
-    # 写审计日志
-    await _write_audit_log(
-        admin_id, "unban", "user", str(user_id), {}, "",
-    )
-    # 通知用户已解封
-    await _notify_user(user_id, "unban", {"admin_id": admin_id})
     logger.info(f"[ContentReports] unban_user user={user_id} admin={admin_id}")
     return True
 
@@ -377,26 +426,26 @@ async def appeal_report(report_id: int, user_id: int, appeal_text: str) -> bool:
         logger.warning(f"[ContentReports] appeal_report 查询失败: {e}")
         return False
     try:
-        cursor = await store._db.execute(
-            """UPDATE content_reports
-               SET status = ?, appeal_text = ?, appealed_at = ?
-               WHERE id = ?""",
-            (REPORT_STATUS_APPEALED, appeal_text, now, report_id),
-        )
-        await store._db.commit()
-        if cursor.rowcount == 0:
-            return False
+        # R40 P0-5: UPDATE + dirty_outbox + notification 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE content_reports
+                   SET status = ?, appeal_text = ?, appealed_at = ?
+                   WHERE id = ?""",
+                (REPORT_STATUS_APPEALED, appeal_text, now, report_id),
+            )
+            if cursor.rowcount == 0:
+                return False
+            await store.add_dirty_outbox("content_reports", str(report_id), connection=tx)
+            # 通知管理员有新申诉(写入管理员通知,使用 user_id=0 表示系统管理员)
+            await _notify_user(0, "appeal", {
+                "report_id": report_id, "user_id": user_id,
+                "appeal_text": appeal_text, "target_type": target_type,
+                "target_id": target_id,
+            }, tx=tx)
     except Exception as e:
         logger.warning(f"[ContentReports] appeal_report 更新失败: {e}")
         return False
-    # 写 dirty_outbox 确保跨机同步
-    await store.add_dirty_outbox("content_reports", str(report_id))
-    # 通知管理员有新申诉(写入管理员通知,使用 user_id=0 表示系统管理员)
-    await _notify_user(0, "appeal", {
-        "report_id": report_id, "user_id": user_id,
-        "appeal_text": appeal_text, "target_type": target_type,
-        "target_id": target_id,
-    })
     logger.info(
         f"[ContentReports] appeal_report id={report_id} user={user_id}"
     )
@@ -424,26 +473,26 @@ async def resolve_report(report_id: int, resolution: str, admin_id: int,
         return False
     now = _dt.datetime.now().isoformat()
     try:
-        cursor = await store._db.execute(
-            """UPDATE content_reports
-               SET status = ?, resolved_by = ?, resolved_at = ?
-               WHERE id = ?""",
-            (resolution, admin_id, now, report_id),
-        )
-        await store._db.commit()
-        if cursor.rowcount == 0:
-            logger.warning(f"[ContentReports] resolve_report 未命中举报 id={report_id}")
-            return False
+        # R40 P0-5: UPDATE + dirty_outbox + audit_log 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """UPDATE content_reports
+                   SET status = ?, resolved_by = ?, resolved_at = ?
+                   WHERE id = ?""",
+                (resolution, admin_id, now, report_id),
+            )
+            if cursor.rowcount == 0:
+                logger.warning(f"[ContentReports] resolve_report 未命中举报 id={report_id}")
+                return False
+            await store.add_dirty_outbox("content_reports", str(report_id), connection=tx)
+            # 写审计日志(同事务)
+            await _write_audit_log(
+                admin_id, "resolve", "report", str(report_id),
+                {"resolution": resolution, "note": note}, "", tx=tx,
+            )
     except Exception as e:
         logger.warning(f"[ContentReports] resolve_report 更新失败: {e}")
         return False
-    # 写 dirty_outbox 确保跨机同步
-    await store.add_dirty_outbox("content_reports", str(report_id))
-    # 写审计日志
-    await _write_audit_log(
-        admin_id, "resolve", "report", str(report_id),
-        {"resolution": resolution, "note": note}, "",
-    )
     logger.info(
         f"[ContentReports] resolve_report id={report_id} "
         f"resolution={resolution} admin={admin_id}"
@@ -555,29 +604,137 @@ async def get_report(report_id: int) -> dict | None:
 
 
 async def check_user_banned(user_id: int) -> bool:
-    """检查用户是否被封禁。
+    """检查用户是否被封禁(R40 P1-11: 临时封禁到期自动解封 + P1-12: fail-closed)。
+
+    检查逻辑:
+    1. 查询 users_local.is_banned + ban_expires_at
+    2. 若 is_banned=0 → 未封禁,返回 False
+    3. 若 ban_expires_at 不为 NULL 且 < now → 临时封禁已到期,
+       自动解封(UPDATE is_banned=0, ban_expires_at=NULL)并返回 False
+    4. 否则返回 is_banned 状态(永久封禁或未到期临时封禁)
+
+    R40 P1-12: fail-closed 策略 — 数据库未就绪或查询异常时返回 True
+    (保守视为已封禁,拒绝操作而非放行)。
 
     Args:
         user_id: 用户 id
 
     Returns:
-        True 已封禁;False 未封禁或查询失败(失败按未封禁处理)
+        True 已封禁;False 未封禁或已自动解封
     """
     store = get_cache_store()
     if not store._db:
-        return False
+        # R40 P1-12: fail-closed — 数据库未就绪时保守视为已封禁
+        logger.warning(
+            f"[ContentReports] check_user_banned 数据库未就绪 user_id={user_id},"
+            f"按 fail-closed 返回 True"
+        )
+        return True
     try:
         cursor = await store._db.execute(
-            "SELECT is_banned FROM users_local WHERE user_id = ?",
+            "SELECT is_banned, ban_expires_at FROM users_local WHERE user_id = ?",
             (user_id,),
         )
         row = await cursor.fetchone()
         if not row:
             return False
-        return bool(row[0])
+        is_banned = bool(row[0])
+        ban_expires_at = row[1]
+        if not is_banned:
+            return False
+        # R40 P1-11: 临时封禁到期自动解封
+        if ban_expires_at is not None:
+            try:
+                expires_dt = _dt.datetime.fromisoformat(str(ban_expires_at))
+            except (ValueError, TypeError):
+                # 到期时间格式损坏,视为永久封禁(保守 fail-closed)
+                return True
+            if expires_dt <= _dt.datetime.now():
+                # 已到期,自动解封
+                now = _dt.datetime.now().isoformat()
+                await store._db.execute(
+                    "UPDATE users_local SET is_banned = 0, ban_expires_at = NULL, "
+                    "updated_at = ? WHERE user_id = ?",
+                    (now, user_id),
+                )
+                await store._db.commit()
+                # 写 dirty_outbox 确保跨机同步
+                await store.add_dirty_outbox("users_local", str(user_id))
+                logger.info(
+                    f"[ContentReports] 临时封禁到期自动解封 user_id={user_id} "
+                    f"expires_at={ban_expires_at}"
+                )
+                return False
+        return True
     except Exception as e:
-        logger.debug(f"[ContentReports] check_user_banned 异常: {e}")
-        return False
+        # R40 P1-12: fail-closed — 查询异常时保守视为已封禁
+        logger.warning(
+            f"[ContentReports] check_user_banned 查询异常 user_id={user_id}: {e},"
+            f"按 fail-closed 返回 True"
+        )
+        return True
+
+
+async def is_user_banned(user_id: int) -> bool:
+    """检查用户是否被封禁(check_user_banned 的语义别名,推荐新代码使用)。
+
+    R40 P1-11: 与 check_user_banned 行为一致(含临时封禁到期自动解封)。
+    """
+    return await check_user_banned(user_id)
+
+
+async def cleanup_expired_bans() -> int:
+    """R40 P1-11: 批量清理已过期的临时封禁。
+
+    扫描 users_local 中 ban_expires_at 不为 NULL 且 < now 的记录,
+    批量解封(UPDATE is_banned=0, ban_expires_at=NULL),
+    并为每条解封记录写 dirty_outbox 确保跨机同步(与 ban_user/unban_user 一致)。
+
+    由 r40_scheduler 每小时调用一次,也可由管理员手动触发。
+
+    Returns:
+        本次解封的用户数量
+    """
+    store = get_cache_store()
+    if not store._db:
+        return 0
+    now_dt = _dt.datetime.now()
+    now_iso = now_dt.isoformat()
+    try:
+        # 先查出待解封的 user_id 列表(用于后续写 dirty_outbox)
+        cursor = await store._db.execute(
+            "SELECT user_id FROM users_local WHERE ban_expires_at IS NOT NULL "
+            "AND ban_expires_at < ?",
+            (now_iso,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return 0
+        user_ids = [int(r[0]) for r in rows if r[0]]
+        # 批量解封
+        cursor = await store._db.execute(
+            "UPDATE users_local SET is_banned = 0, ban_expires_at = NULL, "
+            "updated_at = ? WHERE ban_expires_at IS NOT NULL "
+            "AND ban_expires_at < ?",
+            (now_iso, now_iso),
+        )
+        affected = cursor.rowcount if cursor else 0
+        await store._db.commit()
+        # 为每条解封记录写 dirty_outbox,确保 CRDB 同步(与 unban_user 一致)
+        for uid in user_ids:
+            try:
+                await store.add_dirty_outbox("users_local", str(uid))
+            except Exception as e:
+                logger.debug(
+                    f"[ContentReports] cleanup_expired_bans dirty_outbox 写入失败 "
+                    f"user_id={uid}: {e}"
+                )
+        if affected > 0:
+            logger.info(f"[ContentReports] cleanup_expired_bans 解封 {affected} 个用户")
+        return affected
+    except Exception as e:
+        logger.warning(f"[ContentReports] cleanup_expired_bans 异常: {e}")
+        return 0
 
 
 async def format_report(report: dict) -> str:

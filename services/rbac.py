@@ -53,17 +53,35 @@ PERMISSION_RESTORE = "backup:restore"
 PERMISSION_MAINTENANCE = "system:maintenance"
 PERMISSION_MANAGE_ROLES = "rbac:manage"
 
+# R40 P0-8: CommandBus 高风险命令所需的细粒度权限(与 command_bus 中常量一致)
+# 这些权限用于 RBAC check_permission 校验,必须出现在 rbac_roles 表的 permissions 中
+PERMISSION_CONTENT_TAKEDOWN = "content:takedown"       # 内容下架(同 PERMISSION_TAKEDOWN)
+PERMISSION_USERS_BAN = "users:ban"                     # 封禁用户(同 PERMISSION_BAN_USER)
+PERMISSION_USERS_UNBAN = "users:unban"                 # 解封用户(同 PERMISSION_UNBAN_USER)
+PERMISSION_RBAC_ASSIGN = "rbac:assign"                  # 分配角色(细粒度,不同于 rbac:manage)
+PERMISSION_DISASTER_RESTORE = "disaster:restore"       # 灾备恢复
+PERMISSION_MAINTENANCE_ENABLE = "maintenance:enable"   # 开启维护模式
+PERMISSION_MAINTENANCE_DISABLE = "maintenance:disable" # 关闭维护模式
+PERMISSION_DATA_PURGE = "data:purge"                   # 清除数据
+
 # ─── 默认角色权限映射(模块级常量) ─────────────────────────────
+# R40 P0-8: 新增 CommandBus 细粒度权限,分配给对应角色
 _DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
     ROLE_SUPER_ADMIN: ["*"],  # 所有权限
     ROLE_SECURITY: [
         PERMISSION_VIEW_USERS, PERMISSION_BAN_USER, PERMISSION_UNBAN_USER,
         PERMISSION_VIEW_FILES, PERMISSION_TAKEDOWN, PERMISSION_APPROVE_TAKEDOWN,
         PERMISSION_VIEW_LOGS, PERMISSION_VIEW_AUDIT,
+        # R40 P0-8: 安全管理员可执行内容下架/封禁/分配角色
+        PERMISSION_CONTENT_TAKEDOWN, PERMISSION_USERS_BAN, PERMISSION_USERS_UNBAN,
+        PERMISSION_RBAC_ASSIGN,
     ],
     ROLE_OPS: [
         PERMISSION_VIEW_USERS, PERMISSION_VIEW_FILES, PERMISSION_VIEW_LOGS,
         PERMISSION_BACKUP, PERMISSION_RESTORE, PERMISSION_MAINTENANCE,
+        # R40 P0-8: 运维可执行维护模式/灾备恢复/数据清除
+        PERMISSION_MAINTENANCE_ENABLE, PERMISSION_MAINTENANCE_DISABLE,
+        PERMISSION_DISASTER_RESTORE, PERMISSION_DATA_PURGE,
     ],
     ROLE_SUPPORT: [
         PERMISSION_VIEW_USERS, PERMISSION_VIEW_FILES, PERMISSION_VIEW_LOGS,
@@ -71,6 +89,8 @@ _DEFAULT_ROLE_PERMISSIONS: dict[str, list[str]] = {
     ROLE_OPERATOR: [
         PERMISSION_VIEW_USERS, PERMISSION_BAN_USER, PERMISSION_VIEW_FILES,
         PERMISSION_DELETE_FILE,
+        # R40 P0-8: 运营可执行封禁/解封
+        PERMISSION_USERS_BAN, PERMISSION_USERS_UNBAN,
     ],
 }
 
@@ -109,17 +129,18 @@ async def init_default_roles() -> int:
                 ROLE_OPERATOR: "运营,负责日常运营操作",
             }.get(role_name, "")
 
-            await store._db.execute(
-                "INSERT INTO rbac_roles (name, description, permissions, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (role_name, desc, json.dumps(permissions), now),
-            )
-            await store.add_dirty_outbox("rbac_roles", role_name)
-            created += 1
+            # R40 P0-5: 业务表 + dirty_outbox 同事务
+            async with store.transaction() as tx:
+                await tx.execute(
+                    "INSERT INTO rbac_roles (name, description, permissions, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (role_name, desc, json.dumps(permissions), now),
+                )
+                await store.add_dirty_outbox("rbac_roles", role_name, connection=tx)
+                created += 1
         except Exception as e:
             logger.warning(f"[RBAC] init_default_roles 创建角色 {role_name} 失败: {e}")
 
-    await store._db.commit()
     if created > 0:
         logger.info(f"[RBAC] init_default_roles 创建了 {created} 个默认角色")
     return created
@@ -156,15 +177,16 @@ async def create_role(name: str, permissions: list[str], description: str = "") 
             logger.warning(f"[RBAC] create_role 角色已存在: {name}")
             return -1
 
-        cursor = await store._db.execute(
-            "INSERT INTO rbac_roles (name, description, permissions, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (name, description, json.dumps(permissions), now),
-        )
-        await store._db.commit()
-        role_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-        if role_id > 0:
-            await store.add_dirty_outbox("rbac_roles", str(role_id))
+        # R40 P0-5: 业务表 + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                "INSERT INTO rbac_roles (name, description, permissions, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (name, description, json.dumps(permissions), now),
+            )
+            role_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if role_id > 0:
+                await store.add_dirty_outbox("rbac_roles", str(role_id), connection=tx)
         logger.info(f"[RBAC] create_role 创建角色 {name} (id={role_id})")
         return role_id
     except Exception as e:
@@ -204,27 +226,27 @@ async def assign_role(user_id: int, role_name: str, assigned_by: int = 0) -> boo
 
         role_id = int(rows[0][0])
 
-        await store._db.execute(
-            "INSERT OR REPLACE INTO rbac_user_roles (user_id, role_id, assigned_at, assigned_by) "
-            "VALUES (?, ?, ?, ?)",
-            (user_id, role_id, now, assigned_by),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("rbac_user_roles", str(user_id))
+        # R40 P0-5: 业务表 + audit_log + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            await tx.execute(
+                "INSERT OR REPLACE INTO rbac_user_roles (user_id, role_id, assigned_at, assigned_by) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, role_id, now, assigned_by),
+            )
+            await store.add_dirty_outbox("rbac_user_roles", str(user_id), connection=tx)
 
-        # 写审计日志
-        await store._db.execute(
-            "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
-            "VALUES (?, 'admin', 'assign_role', 'user', ?, ?, ?)",
-            (
-                assigned_by,
-                str(user_id),
-                json.dumps({"role": role_name}),
-                now,
-            ),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("audit_log", "last")
+            # 写审计日志(同事务)
+            await tx.execute(
+                "INSERT INTO audit_log (actor_id, actor_type, action, target_type, target_id, details, created_at) "
+                "VALUES (?, 'admin', 'assign_role', 'user', ?, ?, ?)",
+                (
+                    assigned_by,
+                    str(user_id),
+                    json.dumps({"role": role_name}),
+                    now,
+                ),
+            )
+            await store.add_dirty_outbox("audit_log", "last", connection=tx)
 
         logger.info(f"[RBAC] assign_role user={user_id} role={role_name} by={assigned_by}")
         return True
@@ -247,12 +269,16 @@ async def revoke_role(user_id: int) -> bool:
         return False
 
     try:
-        await store._db.execute(
-            "DELETE FROM rbac_user_roles WHERE user_id = ?",
-            (user_id,),
-        )
-        await store._db.commit()
-        await store.add_dirty_outbox("rbac_user_roles", str(user_id), operation="tombstone")
+        # R40 P0-5: 业务表 + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            await tx.execute(
+                "DELETE FROM rbac_user_roles WHERE user_id = ?",
+                (user_id,),
+            )
+            await store.add_dirty_outbox(
+                "rbac_user_roles", str(user_id),
+                operation="tombstone", connection=tx,
+            )
         logger.info(f"[RBAC] revoke_role user={user_id} 角色已撤销")
         return True
     except Exception as e:
@@ -291,6 +317,9 @@ async def get_user_role(user_id: int) -> str | None:
 async def check_permission(user_id: int, permission: str) -> bool:
     """检查用户是否有指定权限。
 
+    R40 P0-8: fail-closed — 任何异常(DB 故障/连接错误等)一律返回 False,
+    防止 RBAC 校验异常时意外放行高风险操作。
+
     判定逻辑:
     1. 获取用户角色
     2. 获取角色权限列表
@@ -302,21 +331,29 @@ async def check_permission(user_id: int, permission: str) -> bool:
         permission: 权限标识(如 "users:ban")
 
     Returns:
-        True 表示有权限
+        True 表示有权限;False 表示无权限或校验异常(fail-closed)
     """
-    role_name = await get_user_role(user_id)
-    if role_name is None:
+    try:
+        role_name = await get_user_role(user_id)
+        if role_name is None:
+            return False
+
+        permissions = await list_user_permissions(user_id)
+        if not permissions:
+            return False
+
+        # super_admin 通配
+        if "*" in permissions:
+            return True
+
+        return permission in permissions
+    except Exception as e:
+        # R40 P0-8: fail-closed — 异常时一律拒绝,防止 DB 故障导致越权
+        logger.warning(
+            f"[RBAC] check_permission 异常(fail-closed 拒绝) "
+            f"user={user_id} perm={permission}: {e}"
+        )
         return False
-
-    permissions = await list_user_permissions(user_id)
-    if not permissions:
-        return False
-
-    # super_admin 通配
-    if "*" in permissions:
-        return True
-
-    return permission in permissions
 
 
 async def list_roles() -> list[dict]:
@@ -357,11 +394,15 @@ async def list_roles() -> list[dict]:
 async def list_user_permissions(user_id: int) -> list[str]:
     """列出用户所有权限。
 
+    R40 P0-8: fail-closed — 移除 _DEFAULT_ROLE_PERMISSIONS 回退,
+    DB 不可用或查询异常时返回空列表(无权限),防止 DB 故障时
+    凭借内存中的默认权限映射意外放行高风险操作。
+
     Args:
         user_id: Telegram 用户 ID
 
     Returns:
-        权限列表;无角色返回空列表
+        权限列表;无角色或 DB 异常时返回空列表
     """
     role_name = await get_user_role(user_id)
     if role_name is None:
@@ -369,8 +410,12 @@ async def list_user_permissions(user_id: int) -> list[str]:
 
     store = get_cache_store()
     if not store._db:
-        # 数据库不可用时,尝试从默认权限映射中读取
-        return _DEFAULT_ROLE_PERMISSIONS.get(role_name, [])
+        # R40 P0-8: fail-closed — DB 不可用时返回空列表(无权限)
+        logger.warning(
+            f"[RBAC] list_user_permissions DB 未初始化(fail-closed 返回空) "
+            f"user={user_id} role={role_name}"
+        )
+        return []
 
     try:
         rows = await store._db.execute_fetchall(
@@ -380,8 +425,8 @@ async def list_user_permissions(user_id: int) -> list[str]:
             (user_id,),
         )
         if not rows:
-            # DB 中无记录,回退到默认权限映射
-            return _DEFAULT_ROLE_PERMISSIONS.get(role_name, [])
+            # R40 P0-8: fail-closed — DB 中无记录时返回空列表
+            return []
 
         perms_str = rows[0][0] or "[]"
         try:
@@ -390,8 +435,12 @@ async def list_user_permissions(user_id: int) -> list[str]:
             perms = []
         return perms
     except Exception as e:
-        logger.warning(f"[RBAC] list_user_permissions 失败 user={user_id}: {e}")
-        return _DEFAULT_ROLE_PERMISSIONS.get(role_name, [])
+        # R40 P0-8: fail-closed — 异常时返回空列表(无权限)
+        logger.warning(
+            f"[RBAC] list_user_permissions 异常(fail-closed 返回空) "
+            f"user={user_id} role={role_name}: {e}"
+        )
+        return []
 
 
 async def format_role_info(role: dict) -> str:
@@ -419,3 +468,71 @@ async def format_role_info(role: dict) -> str:
         f"权限: {perm_text}",
     ]
     return "\n".join(lines)
+
+
+# ─── R40 P0-8: CommandBus 支持函数 ─────────────────────────────
+
+
+async def get_principal_permissions(principal_id: int) -> set[str]:
+    """R40 P0-8: 获取 principal 的所有权限(返回 set,供 CommandBus 使用)。
+
+    与 list_user_permissions 功能相同,但返回 set 类型,
+    便于 CommandBus 进行权限集合操作。
+
+    Args:
+        principal_id: 操作者 ID(Telegram user_id 或 admin_id)
+
+    Returns:
+        权限集合;无角色或异常时返回空集合(fail-closed)
+    """
+    try:
+        perms = await list_user_permissions(principal_id)
+        return set(perms)
+    except Exception as e:
+        logger.warning(
+            f"[RBAC] get_principal_permissions 异常(fail-closed 返回空集) "
+            f"principal={principal_id}: {e}"
+        )
+        return set()
+
+
+# ─── 所有权限定义(供 admin 页面展示) ─────────────────────────────
+
+# 权限名称 → 中文描述
+_PERMISSION_DESCRIPTIONS: dict[str, str] = {
+    PERMISSION_VIEW_USERS: "查看用户列表",
+    PERMISSION_BAN_USER: "封禁用户",
+    PERMISSION_UNBAN_USER: "解封用户",
+    PERMISSION_VIEW_FILES: "查看文件列表",
+    PERMISSION_DELETE_FILE: "删除文件",
+    PERMISSION_RESTORE_FILE: "恢复文件",
+    PERMISSION_TAKEDOWN: "内容下架",
+    PERMISSION_APPROVE_TAKEDOWN: "审批下架请求",
+    PERMISSION_VIEW_LOGS: "查看日志",
+    PERMISSION_VIEW_AUDIT: "查看审计日志",
+    PERMISSION_CONFIG_CHANGE: "修改配置",
+    PERMISSION_BACKUP: "备份管理",
+    PERMISSION_RESTORE: "恢复备份",
+    PERMISSION_MAINTENANCE: "系统维护",
+    PERMISSION_MANAGE_ROLES: "角色管理",
+    # R40 P0-8: CommandBus 细粒度权限
+    PERMISSION_RBAC_ASSIGN: "分配角色(CommandBus)",
+    PERMISSION_DISASTER_RESTORE: "灾备恢复(CommandBus)",
+    PERMISSION_MAINTENANCE_ENABLE: "开启维护模式(CommandBus)",
+    PERMISSION_MAINTENANCE_DISABLE: "关闭维护模式(CommandBus)",
+    PERMISSION_DATA_PURGE: "清除数据(CommandBus)",
+}
+
+
+async def list_permissions() -> list[dict]:
+    """列出所有已定义的权限。
+
+    R40 P0-8: 供 admin RBAC 页面展示所有可用权限。
+
+    Returns:
+        权限列表 [{name, description}, ...]
+    """
+    return [
+        {"name": name, "description": desc}
+        for name, desc in _PERMISSION_DESCRIPTIONS.items()
+    ]

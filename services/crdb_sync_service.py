@@ -746,6 +746,75 @@ _DIRTY_OUTBOX_TABLE_HANDLERS = {
 # 已由专用同步循环覆盖的表 (dirty_outbox 记录直接标记 processed, 避免重复处理)
 _DIRTY_OUTBOX_TABLES_DELEGATED = {"jobs", "cells"}
 
+# R40 P0-5: local_only 表 — 仅存在于 SQLite 本地,不需要同步到 CRDB
+# 这些表的 dirty_outbox 记录直接标记 processed + local_only=1
+_LOCAL_ONLY_TABLES = {
+    "tasks",
+    "collections",
+    "collection_items",
+    "notifications",
+    "content_reports",
+    "audit_log",
+    "quota_reservations",
+    "quota_ledger",
+    "rbac_roles",
+    "rbac_user_roles",
+    "approvals",
+    "maintenance_state",
+    "admin_access_log",
+}
+
+
+async def _route_dirty_outbox_to_dlq(
+    table_name: str, records: list[dict], error_msg: str,
+) -> None:
+    """R40 P0-5: 将处理失败的 dirty_outbox 记录路由到死信队列(DLQ)。
+
+    写入 data/dead_letter.jsonl 文件,供 repair_console.list_dlq() 读取。
+    每条记录包含: message_id, reason, attempts, max_attempts, failed_at, original。
+
+    Args:
+        table_name: 受影响表名
+        records: 失败的 dirty_outbox 行列表
+        error_msg: 失败原因
+    """
+    import json as _json
+    import os as _os
+    import datetime as _dt
+
+    dead_file = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "data", "dead_letter.jsonl",
+    )
+    try:
+        _os.makedirs(_os.path.dirname(dead_file), exist_ok=True)
+        now_str = _dt.datetime.now().isoformat()
+        with open(dead_file, "a", encoding="utf-8") as f:
+            for r in records:
+                dead_entry = {
+                    "message_id": f"dirty_outbox:{r.get('id', '')}",
+                    "reason": f"crdb_sync dispatch 失败 table={table_name}: {error_msg}",
+                    "attempts": 1,
+                    "max_attempts": 3,
+                    "failed_at": now_str,
+                    "next_retry_at": None,
+                    "original": {
+                        "id": r.get("id"),
+                        "table_name": table_name,
+                        "pk": r.get("pk"),
+                        "operation": r.get("operation"),
+                        "payload": r.get("payload"),
+                        "created_at": r.get("created_at"),
+                    },
+                }
+                f.write(_json.dumps(dead_entry, ensure_ascii=False, default=str) + "\n")
+        logger.warning(
+            f"[crdb_sync] R40 P0-5: {len(records)} 条 dirty_outbox 记录 "
+            f"已路由到 DLQ(table={table_name}, reason={error_msg})"
+        )
+    except Exception as dlq_err:
+        logger.error(f"[crdb_sync] R40 P0-5: DLQ 写入失败: {dlq_err}")
+
 
 async def _dispatch_dirty_outbox_to_crdb(
     table_name: str, records: list[dict],
@@ -767,6 +836,15 @@ async def _dispatch_dirty_outbox_to_crdb(
     Returns:
         成功处理的 dirty_outbox.id 列表 (DEAD 分支返回空列表)
     """
+    # R40 P0-5: local_only 表 — 仅存在于 SQLite,不需要同步到 CRDB
+    # 直接标记为 processed + local_only=1
+    if table_name in _LOCAL_ONLY_TABLES:
+        logger.debug(
+            f"[crdb_sync] R40 P0-5: {table_name} 为 local_only 表, "
+            f"dirty_outbox {len(records)} 条直接标记 processed + local_only=1"
+        )
+        return [r.get("id") for r in records if r.get("id") is not None]
+
     # 已由专用循环覆盖的表: 直接标记 processed
     if table_name in _DIRTY_OUTBOX_TABLES_DELEGATED:
         logger.debug(
@@ -825,21 +903,39 @@ async def _sync_dirty_outbox():
         groups.setdefault(tn, []).append(r)
 
     all_processed: list[int] = []
+    local_only_processed: list[int] = []
     for table_name, records in groups.items():
         try:
             ids = await _dispatch_dirty_outbox_to_crdb(table_name, records)
-            all_processed.extend(ids)
+            # R40 P0-5: 区分 local_only 和普通表
+            if table_name in _LOCAL_ONLY_TABLES:
+                local_only_processed.extend(ids)
+            else:
+                all_processed.extend(ids)
+            # R40 P0-5: 处理失败的记录(未返回 id)路由到 DLQ
+            failed_records = [r for r in records if r.get("id") not in ids]
+            if failed_records:
+                await _route_dirty_outbox_to_dlq(
+                    table_name, failed_records, "dispatch 返回未处理 id",
+                )
         except Exception as e:
             logger.warning(
-                f"[crdb_sync] R39 P0-4: dispatch table={table_name} 异常: {e}"
+                f"[crdb_sync] R40 P0-5: dispatch table={table_name} 异常: {e}"
             )
+            # R40 P0-5: 异常时整批路由到 DLQ
+            await _route_dirty_outbox_to_dlq(table_name, records, str(e))
 
-    # 标记已处理 (仅成功 dispatch 的记录)
+    # R40 P0-5: 标记已处理(区分 local_only 和普通)
     if all_processed:
         await store.mark_dirty_processed(all_processed)
+    if local_only_processed:
+        await store.mark_dirty_local_only(local_only_processed)
+    total_marked = len(all_processed) + len(local_only_processed)
+    if total_marked > 0:
         logger.debug(
-            f"[crdb_sync] R39 P0-4: dirty_outbox 已处理 "
-            f"{len(all_processed)}/{len(batch)} 条"
+            f"[crdb_sync] R40 P0-5: dirty_outbox 已处理 "
+            f"{total_marked}/{len(batch)} 条"
+            f"(local_only={len(local_only_processed)}, crdb={len(all_processed)})"
         )
 
 

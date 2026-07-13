@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -125,16 +126,55 @@ async def get_latest_backup() -> dict:
             sys.exit(1)
         logger.info(f"manifest 校验通过: {reason}")
 
+        # R40 P0-6: 下载密文后校验 ciphertext_sha256(传输完整性)
+        # 任一不匹配则中止恢复,防止使用损坏/篡改的密文
+        _expected_cipher_sha = manifest.get("ciphertext_sha256")
+        if _expected_cipher_sha:
+            _actual_cipher_sha = hashlib.sha256(raw_content).hexdigest()
+            if _actual_cipher_sha != _expected_cipher_sha:
+                logger.error(
+                    f"R40 P0-6: 密文 checksum 校验失败,中止恢复"
+                    f"(expected={_expected_cipher_sha[:16]}, "
+                    f"actual={_actual_cipher_sha[:16]})"
+                )
+                sys.exit(1)
+            logger.info(
+                f"R40 P0-6: 密文 checksum 校验通过 (sha256={_actual_cipher_sha[:16]}...)"
+            )
+        else:
+            logger.warning("R40 P0-6: manifest 缺少 ciphertext_sha256 字段(旧备份?),跳过密文校验")
+
         # R36 H7: 解密 payload
         if encryption_info.get("encrypted"):
             if not is_encryption_available():
                 logger.error("备份已加密但 BACKUP_KEK 未配置,无法解密")
                 sys.exit(1)
             logger.info("备份已加密,正在解密(AES-256-GCM)...")
+            # R40 P0-6: 传 backup_id/schema_version/key_id 重建 AAD,
+            # 传 expected_plaintext_sha256 校验解密后明文完整性
             plaintext = decrypt_payload(
                 raw_content,
                 wrapped_dek=encryption_info.get("wrapped_dek"),
                 nonce_b64=encryption_info.get("nonce"),
+                expected_plaintext_sha256=manifest.get("plaintext_sha256"),
+                backup_id=manifest.get("backup_id", ""),
+                schema_version=manifest.get("schema_version", ""),
+                key_id=encryption_info.get("key_id", ""),
+            )
+            # R40 P0-6: decrypt_payload 已内部校验 plaintext_sha256;
+            # 此处补一次显式校验(双保险,防 decrypt_payload 实现遗漏)
+            _expected_plain_sha = manifest.get("plaintext_sha256")
+            if _expected_plain_sha:
+                _actual_plain_sha = hashlib.sha256(plaintext).hexdigest()
+                if _actual_plain_sha != _expected_plain_sha:
+                    logger.error(
+                        f"R40 P0-6: 明文 checksum 校验失败,中止恢复"
+                        f"(expected={_expected_plain_sha[:16]}, "
+                        f"actual={_actual_plain_sha[:16]})"
+                    )
+                    sys.exit(1)
+            logger.info(
+                f"R40 P0-6: 明文 checksum 校验通过"
             )
         else:
             plaintext = raw_content
@@ -150,25 +190,32 @@ async def get_latest_backup() -> dict:
         else:
             logger.info(f"manifest 校验通过: {reason}")
 
-        # 校验 checksum
-        if manifest.get("checksum_sha256"):
-            tables_content = json.dumps(data.get("tables", {}), default=str, ensure_ascii=False).encode("utf-8")
-            if not verify_checksum(tables_content, manifest["checksum_sha256"]):
-                logger.error("checksum 校验失败:备份数据可能已损坏")
+        # R40 P0-6: 未加密备份中 ciphertext == plaintext,
+        # 双 checksum 应相等;优先用 plaintext_sha256(回退到 checksum_sha256 兼容旧备份)
+        _expected_sha = (
+            manifest.get("plaintext_sha256")
+            or manifest.get("checksum_sha256")
+        )
+        if _expected_sha:
+            # 未加密时 raw_content 即为 plaintext,直接对其校验
+            if not verify_checksum(raw_content, _expected_sha):
+                logger.error("R40 P0-6: 未加密备份 checksum 校验失败:备份数据可能已损坏")
                 sys.exit(1)
-            logger.info("checksum 校验通过")
+            logger.info("R40 P0-6: 未加密备份 checksum 校验通过")
 
     logger.info(
         f"备份时间: {data.get('backup_time', '未知')}, "
         f"表: {', '.join(data.get('tables', {}).keys())}"
     )
-    # R35 P1-7 + R36 H7: 打印 bundle manifest 摘要
+    # R35 P1-7 + R36 H7 + R40 P0-6: 打印 bundle manifest 摘要(含双 checksum)
     manifest = data.get("manifest", {})
     if manifest:
         logger.info(
             f"Bundle manifest: commit={manifest.get('commit_sha', 'unknown')}, "
             f"schema={manifest.get('schema_version', 'unknown')}, "
-            f"checksum={manifest.get('checksum_sha256', 'unknown')[:16]}..., "
+            f"plain_sha={manifest.get('plaintext_sha256', manifest.get('checksum_sha256', 'unknown'))[:16]}..., "
+            f"cipher_sha={manifest.get('ciphertext_sha256', 'unknown')[:16]}..., "
+            f"backup_id={manifest.get('backup_id', '')}, "
             f"tables={manifest.get('total_tables', '?')}, rows={manifest.get('total_rows', '?')}, "
             f"type={manifest.get('backup_type', 'unknown')}, "
             f"encrypted={encryption_info.get('encrypted', False)}"

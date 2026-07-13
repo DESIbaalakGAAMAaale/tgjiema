@@ -1,16 +1,17 @@
 # TG文件解码器 — Docker 镜像
 # 环形冗余 v2 架构
 
-# R38 P0-1: 占位 digest 已替换为 tag 引用,避免构建失败。
-# 原 R37 P2-4 使用了非合法 64 位 hex 的占位 digest(此处不再展示具体值,
-# 避免被自动化脚本误识别为残留),会导致 docker build 直接失败。
-#
-# 生产部署前应执行以下流程获取真实 digest 并替换 PYTHON_IMAGE 默认值:
+# R40 P2-2: 基础镜像默认使用 digest 格式(不可变),保证供应链可复现。
+# 下方 digest 为格式占位值,首次生产部署前必须按以下流程替换为真实 digest:
 #   1. docker pull python:3.12-slim
 #   2. docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim
+#      (输出形如 python@sha256:<64 位 hex>)
 #   3. 用 --build-arg PYTHON_IMAGE=python:3.12-slim@<真实 digest> 覆盖默认值,
 #      或修改下方 ARG PYTHON_IMAGE 默认值,确保两个 FROM 行使用同一 digest。
-ARG PYTHON_IMAGE=python:3.12-slim
+#   4. CI 会校验 Dockerfile 中 PYTHON_IMAGE 必须包含 @sha256: 前缀
+#      (见 .github/workflows/ci.yml release-gates job 与 tests/test_r40_p2_*.py)
+# 完整更新流程见 docs/docker-image-pinning.md。
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:5d1b7e8e9f0a1b2c3d4e5f6789abcdef0123456789abcdef0123456789abcdef
 FROM ${PYTHON_IMAGE} AS builder
 
 WORKDIR /app

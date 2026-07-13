@@ -1,0 +1,81 @@
+{
+  "meta": {
+    "locale": "en-US",
+    "name": "English (United States)",
+    "version": "1.0.0",
+    "fallback": "zh-CN"
+  },
+  "common": {
+    "ok": "OK",
+    "cancel": "Cancel",
+    "submit": "Submit",
+    "save": "Save",
+    "delete": "Delete",
+    "edit": "Edit",
+    "search": "Search",
+    "loading": "Loading...",
+    "no_data": "No data",
+    "page_prev": "Previous",
+    "page_next": "Next",
+    "logout": "Logout"
+  },
+  "errors": {
+    "quota.decode.exceeded": "Daily decode quota exceeded",
+    "quota.upload.exceeded": "Daily upload quota exceeded",
+    "quota.external.exceeded": "Daily external decode quota exceeded",
+    "quota.balance.insufficient": "Insufficient quota",
+    "file.not_found": "File not found",
+    "file.expired": "File expired",
+    "file.deleted": "File has been deleted",
+    "file.too_large": "File size exceeds limit",
+    "file.code.invalid": "Invalid file code",
+    "file.code.used": "File code already used",
+    "user.not_found": "User not found",
+    "user.banned": "User has been banned",
+    "user.unauthorized": "Unauthorized access",
+    "user.forbidden": "Forbidden access",
+    "system.internal": "Internal server error",
+    "system.rate_limited": "Too many requests, please try again later",
+    "system.maintenance": "System under maintenance, please try again later",
+    "validation.failed": "Validation failed",
+    "validation.missing_field": "Missing required field"
+  },
+  "ui": {
+    "admin_login_title": "Admin Login",
+    "admin_dashboard_title": "Dashboard",
+    "admin_users_title": "Users",
+    "admin_files_title": "Files",
+    "admin_logs_title": "Logs",
+    "admin_health_title": "Health",
+    "admin_tasks_title": "Tasks",
+    "admin_reports_title": "Reports",
+    "admin_collections_title": "Collections",
+    "admin_notifications_title": "Notifications",
+    "admin_approvals_title": "Approvals",
+    "admin_rbac_title": "RBAC Roles",
+    "admin_repair_title": "Repair Console",
+    "admin_topology_title": "Topology",
+    "admin_ru_cost_title": "RU Cost Center",
+    "admin_maintenance_title": "Maintenance Mode",
+    "admin_disaster_recovery_title": "Disaster Recovery"
+  },
+  "bot": {
+    "start_welcome": "Welcome to TG Decoder",
+    "send_file_code": "Please send the file code",
+    "decode_in_progress": "Decoding, please wait...",
+    "decode_success": "Decode successful",
+    "decode_failed": "Decode failed",
+    "quota_remaining": "{count} decodes remaining today",
+    "quota_exhausted": "Daily quota exhausted",
+    "upload_started": "Upload started",
+    "upload_success": "Upload successful, file code: {code}",
+    "upload_failed": "Upload failed"
+  },
+  "accessibility": {
+    "skip_to_content": "Skip to main content",
+    "form_required_field": "Required field",
+    "form_validation_error": "Form validation failed",
+    "table_sortable_column": "Sortable column",
+    "loading_indicator": "Loading indicator"
+  }
+}

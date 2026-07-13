@@ -179,10 +179,26 @@ class TestP1_5_SoftDeleteTombstone:
         assert "_SOFT_DELETE_TABLES" in content, "缺少 _SOFT_DELETE_TABLES 映射(P1-5)"
 
     def test_admin_delete_file_uses_tombstone(self):
-        """admin/__init__.py 的 delete_file 使用 soft_delete + deleted_at。"""
-        content = _read_file(ADMIN_DIR / "__init__.py")
-        assert "soft_delete" in content or "deleted_at" in content, \
-            "admin delete_file 未使用 tombstone(P1-5)"
+        """R40 P0-8: admin delete_file 通过 CommandBus 执行软删除,handler 包含 tombstone。
+
+        架构变更:R40 P0-8 将高风险操作(含文件删除)迁移到 CommandBus 强制
+        RBAC 门禁。admin/__init__.py 的 delete_file 路由不再直接写 tombstone,
+        而是调用 make_delete_file_command(file_code) 走 CommandBus 执行。
+        实际的 soft_delete + deleted_at tombstone 逻辑位于
+        services/command_bus.py 的 make_delete_file_command handler 中。
+        """
+        admin_content = _read_file(ADMIN_DIR / "__init__.py")
+        cb_content = _read_file(SERVICES_DIR / "command_bus.py")
+        # admin 路由必须通过 CommandBus 执行删除(走 RBAC 门禁)
+        assert "make_delete_file_command" in admin_content, \
+            "admin delete_file 未走 CommandBus(R40 P0-8)"
+        # CommandBus handler 必须包含 tombstone 双写(CRDB deleted_at + 本地 soft_delete)
+        assert "soft_delete" in cb_content, \
+            "command_bus.py 缺少 soft_delete tombstone(P1-5)"
+        assert "deleted_at" in cb_content, \
+            "command_bus.py 缺少 deleted_at 字段(P1-5)"
+        assert "make_delete_file_command" in cb_content, \
+            "command_bus.py 缺少 make_delete_file_command 工厂(P1-5)"
 
     def test_tombstone_paths_doc_exists(self):
         """docs/tombstone-paths.md 存在。"""

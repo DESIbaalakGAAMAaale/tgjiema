@@ -29,6 +29,9 @@ class TableSchema:
       - "sqlite":       cache_store.db 本地表(走 SQLite SELECT *)
       - "relay_sqlite": relay_pool.db 中继库(走 relay SQLite SELECT *)
       - "redis":        Redis(暂不支持快照,标记用)
+
+    R40 P1-9: local_only 字段标记纯本地状态表(不参与 CRDB 同步),
+      例如 maintenance_state/admin_access_log 仅本地有效,跨机同步无意义。
     """
     name: str                          # 表名
     pk_columns: tuple[str, ...]        # 主键列(复合主键用元组)
@@ -39,6 +42,7 @@ class TableSchema:
     sync_column: str = "crdb_synced"   # 同步状态列名(空表示无同步列)
     note: str = ""                     # 备注
     source: str = "crdb"               # R35 P1-5: 表所在数据库(crdb/sqlite/relay_sqlite/redis)
+    local_only: bool = False           # R40 P1-9: 纯本地表(不参与 CRDB 同步,如 maintenance_state)
 
 
 # ─── 唯一事实源: 所有可备份/恢复的表 ───
@@ -328,6 +332,137 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         conflict_col="",  # 自增主键,merge 模式退化为普通 INSERT
         source="sqlite",
         note="副本复制任务(主键 task_id INTEGER 自增;SQLite-only;含 group_id/file_unique_id 等列)",
+    ),
+
+    # ─── R40 P1-9: 12 张新业务表(均为 SQLite-only) ───
+    # 注意:依赖顺序需保证父表在子表之前(rbac_roles → rbac_user_roles,
+    #       collections → collection_items),便于 db_restore 按列表顺序恢复。
+    "tasks": TableSchema(
+        name="tasks",
+        pk_columns=("id",),
+        columns=(
+            "id", "task_type", "user_id", "status", "progress",
+            "eta_seconds", "payload", "result", "error", "trace_id",
+            "created_at", "updated_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        note="R40 统一任务中心(主键 id 自增;SQLite-only;含 user_id/status/payload 等列)",
+    ),
+    "collections": TableSchema(
+        name="collections",
+        pk_columns=("id",),
+        columns=(
+            "id", "name", "code", "owner_id", "description",
+            "version", "item_count", "status", "created_at", "updated_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        note="R40 文件集合(主键 id 自增;SQLite-only;UNIQUE code;在 collection_items 之前恢复)",
+    ),
+    "collection_items": TableSchema(
+        name="collection_items",
+        pk_columns=("id",),
+        columns=("id", "collection_id", "file_code", "added_at"),
+        conflict_col="",
+        source="sqlite",
+        note="R40 集合项目(主键 id 自增;SQLite-only;FK collection_id→collections.id)",
+    ),
+    "notifications": TableSchema(
+        name="notifications",
+        pk_columns=("id",),
+        columns=(
+            "id", "user_id", "type", "payload", "is_read",
+            "created_at", "read_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        note="R40 用户通知(主键 id 自增;SQLite-only;含 read_at 已读时间)",
+    ),
+    "content_reports": TableSchema(
+        name="content_reports",
+        pk_columns=("id",),
+        columns=(
+            "id", "reporter_id", "target_type", "target_id", "reason",
+            "description", "status", "appeal_text", "appealed_at",
+            "resolved_by", "resolved_at", "created_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        note="R40 内容举报(主键 id 自增;SQLite-only;含 appeal/appealed_at 申诉字段)",
+    ),
+    "audit_log": TableSchema(
+        name="audit_log",
+        pk_columns=("id",),
+        columns=(
+            "id", "actor_id", "actor_type", "action", "target_type",
+            "target_id", "details", "ip_addr", "created_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        note="R40 审计日志(主键 id 自增;SQLite-only;跨机审计需同步,非 local_only)",
+    ),
+    "quota_reservations": TableSchema(
+        name="quota_reservations",
+        pk_columns=("id",),
+        columns=(
+            "id", "user_id", "amount", "reason", "status",
+            "actual_amount", "created_at", "settled_at", "expired_at",
+        ),
+        conflict_col="id",
+        source="sqlite",
+        note="R40 配额预留(主键 id TEXT;SQLite-only;含 status/settled_at/expired_at)",
+    ),
+    "rbac_roles": TableSchema(
+        name="rbac_roles",
+        pk_columns=("id",),
+        columns=("id", "name", "description", "permissions", "created_at"),
+        conflict_col="name",
+        source="sqlite",
+        note="R40 RBAC 角色表(主键 id 自增;SQLite-only;UNIQUE name;在 rbac_user_roles 之前恢复)",
+    ),
+    "rbac_user_roles": TableSchema(
+        name="rbac_user_roles",
+        pk_columns=("user_id",),
+        columns=("user_id", "role_id", "assigned_at", "assigned_by"),
+        conflict_col="user_id",
+        source="sqlite",
+        note="R40 RBAC 用户角色关联(主键 user_id;SQLite-only;FK role_id→rbac_roles.id)",
+    ),
+    "approvals": TableSchema(
+        name="approvals",
+        pk_columns=("id",),
+        columns=(
+            "id", "action", "payload", "status", "approver_id",
+            "approver_note", "created_by", "created_at", "resolved_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        note="R40 审批流(主键 id 自增;SQLite-only;含 status/approver_id/resolved_at)",
+    ),
+    "maintenance_state": TableSchema(
+        name="maintenance_state",
+        pk_columns=("id",),
+        columns=(
+            "id", "enabled", "reason", "started_by",
+            "started_at", "ended_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        local_only=True,  # R40 P1-9: 纯本地状态,不参与 CRDB 同步
+        note="R40 维护模式状态(主键 id CHECK=1;SQLite-only;local_only=True 不跨机同步)",
+    ),
+    "admin_access_log": TableSchema(
+        name="admin_access_log",
+        pk_columns=("id",),
+        columns=(
+            "id", "admin_id", "action", "target_type", "target_id",
+            "details", "ip_addr", "created_at",
+        ),
+        conflict_col="",
+        source="sqlite",
+        local_only=True,  # R40 P1-9: 本地访问日志,不参与 CRDB 同步
+        note="R40 管理员访问日志(主键 id 自增;SQLite-only;local_only=True 不跨机同步)",
     ),
 
     # ─── SQLite 本地缓存表(热路径零 CRDB,部分需要备份) ───
@@ -658,6 +793,9 @@ _CRDB_DDL_TABLES: frozenset[str] = frozenset({
 })
 
 # 已知的 SQLite cache_store.db 表(从 database/cache_store.py 派生)
+# R40 P1-9: 补齐 12 张新业务表(tasks/collections/collection_items/notifications/
+#           content_reports/audit_log/quota_reservations/rbac_roles/rbac_user_roles/
+#           approvals/maintenance_state/admin_access_log)
 _CACHE_STORE_DDL_TABLES: frozenset[str] = frozenset({
     "cache_backup", "pending_notify", "dsp_notify", "heartbeat_local",
     "bot_heartbeat", "user_quota", "local_job_queue", "counter_snapshot",
@@ -668,6 +806,11 @@ _CACHE_STORE_DDL_TABLES: frozenset[str] = frozenset({
     "external_code_mapping_local", "writer_inbox",
     "upload_sessions", "upload_outbox", "quota_ledger",
     "delivery_receipts", "replication_tasks",
+    # R40 P1-9: 12 张新业务表
+    "tasks", "collections", "collection_items", "notifications",
+    "content_reports", "audit_log", "quota_reservations",
+    "rbac_roles", "rbac_user_roles", "approvals",
+    "maintenance_state", "admin_access_log",
 })
 
 # 已知的 relay_pool.db 表(从 database/relay_db.py DDL 派生)

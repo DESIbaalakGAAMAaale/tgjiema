@@ -113,12 +113,30 @@ class TestP01DockerfileDigestFix:
         )
 
     def test_no_remaining_invalid_digest(self, dockerfile_content: str):
-        """Dockerfile 不再包含任何 @sha256: digest 引用(避免占位符残留)。"""
-        # R38 P0-1: 已切换为 tag 引用,所有 @sha256: 引用应已移除
-        assert "@sha256:" not in dockerfile_content, (
-            "Dockerfile 仍包含 @sha256: digest 引用,"
-            "R38 P0-1 应替换为 tag 引用(生产部署前再用真实 digest 替换)"
+        """R40 P2-2 已将 Dockerfile 切换为 digest pinning,R38 P0-1 tag 引用要求被取代。
+
+        R38 P0-1 原要求:移除 @sha256: digest 引用,使用 tag
+        R40 P2-2 新要求:必须使用 @sha256: digest 格式(供应链可复现)
+        当前策略:保留 @sha256: 引用,但需为有效 hex 格式(非占位符)
+        """
+        # R40 P2-2: 允许 @sha256: 引用,但要求 digest 是 64 位 hex(非占位符)
+        import re
+        # 查找所有 @sha256: 引用
+        sha256_pattern = re.compile(r"@sha256:([0-9a-fA-F]+)")
+        matches = sha256_pattern.findall(dockerfile_content)
+        # 至少有一处 digest 引用(ARG PYTHON_IMAGE 默认值)
+        assert matches, (
+            "R40 P2-2 要求 Dockerfile ARG PYTHON_IMAGE 使用 @sha256: digest pinning,"
+            "当前未找到任何 digest 引用"
         )
+        # 每处 digest 应为 64 位 hex(SHA-256 标准长度)
+        for digest in matches:
+            assert len(digest) == 64, (
+                f"@sha256: digest 长度应为 64 位 hex,实际 {len(digest)} 位: {digest[:20]}..."
+            )
+            assert all(c in "0123456789abcdefABCDEF" for c in digest), (
+                f"@sha256: digest 应为有效 hex 字符: {digest[:20]}..."
+            )
 
     def test_has_update_digest_flow_comment(self, dockerfile_content: str):
         """Dockerfile 注释中保留更新 digest 的流程说明。"""

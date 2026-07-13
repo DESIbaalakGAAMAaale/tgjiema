@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block title %}举报管理{% endblock %}
+{% block page_title %}举报管理{% endblock %}
+
+{% block content %}
+<div class="section">
+    <h2>待处理举报列表</h2>
+    <table>
+        <caption>状态为 pending 的举报</caption>
+        <thead>
+            <tr>
+                <th>举报ID</th>
+                <th>举报人</th>
+                <th>目标类型</th>
+                <th>目标ID</th>
+                <th>原因</th>
+                <th>描述</th>
+                <th>创建时间</th>
+                <th>操作</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for report in reports %}
+            <tr>
+                <td>{{ report.get('id', '') }}</td>
+                <td>{{ report.get('reporter_id', '') }}</td>
+                <td>{{ report.get('target_type', '') }}</td>
+                <td><code>{{ report.get('target_id', '') }}</code></td>
+                <td>{{ report.get('reason', '') }}</td>
+                <td>{{ report.get('description', '') or '-' }}</td>
+                <td>{{ report.get('created_at', 'N/A') }}</td>
+                <td>
+                    <form method="post" action="/reports/{{ report.get('id', '') }}/takedown" class="actions">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit" class="btn btn-danger" onclick="return confirm('确认下架此内容?')">下架</button>
+                    </form>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="8" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+<script nonce="{{ csp_nonce if csp_nonce else '' }}">
+    // 仅用于验证 nonce 注入,无副作用
+</script>
+{% endblock %}

@@ -155,9 +155,14 @@ init_redis_acl() {
         success "已生成 REDIS_HEALTH_PASSWORD 并写入 .env(healthcheck 用户专用)"
     fi
 
-    # R39 P0-2: 从仓库 ACL 模板 sed 替换占位符后部署到 /etc/redis/users.acl
+    # R40 P0-3: 优先使用 users.acl.template(render_acl.sh 规范模板),
+    # 缺失时回退到 users.acl(向后兼容)。两文件内容相同,均为占位符模板。
     # 占位符格式: <REDIS_WRITER_PASSWORD> / <REDIS_READER_PASSWORD> / <REDIS_HEALTH_PASSWORD>
-    local acl_template="$DEPLOY_DIR/config/redis/users.acl"
+    local acl_template="$DEPLOY_DIR/config/redis/users.acl.template"
+    if [[ ! -f "$acl_template" ]]; then
+        # 回退兼容: 旧版 deploy 脚本读取 config/redis/users.acl
+        acl_template="$DEPLOY_DIR/config/redis/users.acl"
+    fi
     local acl_target="/etc/redis/users.acl"
     if [[ ! -f "$acl_template" ]]; then
         warn "未找到 ACL 模板 $acl_template,回退到旧 redis-cli ACL SETUSER 模式"

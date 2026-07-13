@@ -30,8 +30,10 @@ from utils.flood_waiter import (
     safe_reply_text,
     safe_send_message,
     safe_send_media_group,
-) 
+)
 from utils.task_utils import create_safe_task
+# R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
+from services.maintenance_mode import require_maintenance_check
 
 TOKEN = settings.SENDER_BOT_TOKEN
 PAGE_SIZE = settings.PAGE_SIZE
@@ -1288,6 +1290,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── 命令处理 ───
 
+@require_maintenance_check(action="启动派送机器人")
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return

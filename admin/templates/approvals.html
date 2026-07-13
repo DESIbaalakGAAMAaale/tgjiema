@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}审批管理{% endblock %}
+{% block page_title %}审批管理{% endblock %}
+
+{% block content %}
+<div class="section">
+    <h2>待审批列表</h2>
+    <table>
+        <caption>状态为 pending 的审批请求</caption>
+        <thead>
+            <tr>
+                <th>审批ID</th>
+                <th>动作</th>
+                <th>载荷</th>
+                <th>发起人</th>
+                <th>发起时间</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for ap in approvals %}
+            <tr>
+                <td>{{ ap.get('id', '') }}</td>
+                <td>{{ ap.get('action', '') }}</td>
+                <td><code>{{ ap.get('payload', '') }}</code></td>
+                <td>{{ ap.get('created_by', '') }}</td>
+                <td>{{ ap.get('created_at', 'N/A') }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="5" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

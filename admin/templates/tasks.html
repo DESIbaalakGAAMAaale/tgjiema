@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+
+{% block title %}任务中心{% endblock %}
+{% block page_title %}任务中心{% endblock %}
+
+{% block content %}
+<div class="section">
+    <h2>任务列表</h2>
+    <table>
+        <caption>显示最近 100 条任务</caption>
+        <thead>
+            <tr>
+                <th>任务ID</th>
+                <th>用户ID</th>
+                <th>类型</th>
+                <th>状态</th>
+                <th>进度</th>
+                <th>预计剩余(秒)</th>
+                <th>创建时间</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for task in tasks %}
+            <tr>
+                <td>{{ task.get('id', '') }}</td>
+                <td>{{ task.get('user_id', '') }}</td>
+                <td>{{ task.get('task_type', '') }}</td>
+                <td>
+                    {% set s = task.get('status', '') %}
+                    {% if s == 'completed' %}
+                    <span class="tag tag-green">已完成</span>
+                    {% elif s == 'running' %}
+                    <span class="tag tag-blue">运行中</span>
+                    {% elif s == 'failed' %}
+                    <span class="tag tag-red">失败</span>
+                    {% elif s == 'cancelled' %}
+                    <span class="tag tag-orange">已取消</span>
+                    {% else %}
+                    <span class="tag">待处理</span>
+                    {% endif %}
+                </td>
+                <td>{{ task.get('progress', 0) }}%</td>
+                <td>{{ task.get('eta_seconds', 0) }}</td>
+                <td>{{ task.get('created_at', 'N/A') }}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="empty-state">暂无数据</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

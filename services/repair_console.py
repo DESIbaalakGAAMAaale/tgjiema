@@ -113,12 +113,21 @@ async def retry_outbox(ids: list[int]) -> int:
 
     placeholders = ",".join("?" * len(ids))
     try:
-        cursor = await store._db.execute(
-            f"UPDATE dirty_outbox SET processed = 0 WHERE id IN ({placeholders})",
-            tuple(ids),
-        )
-        await store._db.commit()
-        affected = cursor.rowcount if cursor else 0
+        # R40 P0-5: retry_outbox + audit_log 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                f"UPDATE dirty_outbox SET processed = 0 WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            affected = cursor.rowcount if cursor else 0
+            # 写 audit_log(同事务)
+            import datetime as _dt
+            await tx.execute(
+                """INSERT INTO audit_log (actor_id, actor_type, action, target_type,
+                   target_id, details, ip_addr, created_at)
+                   VALUES (?, 'admin', 'retry_outbox', 'dirty_outbox', ?, ?, '', ?)""",
+                (0, json.dumps(ids), "retry", _dt.datetime.now().isoformat()),
+            )
         logger.info(f"[RepairConsole] retry_outbox 重置 {affected} 条记录(ids={ids})")
         return affected
     except Exception as e:
@@ -144,22 +153,22 @@ async def skip_outbox(ids: list[int], reason: str = "") -> int:
 
     placeholders = ",".join("?" * len(ids))
     try:
-        cursor = await store._db.execute(
-            f"UPDATE dirty_outbox SET processed = 1 WHERE id IN ({placeholders})",
-            tuple(ids),
-        )
-        await store._db.commit()
-        affected = cursor.rowcount if cursor else 0
-
-        # 写 audit_log
+        # R40 P0-5: skip_outbox + audit_log 同事务
         import datetime as _dt
-        await store._db.execute(
-            """INSERT INTO audit_log (actor_id, actor_type, action, target_type,
-               target_id, details, ip_addr, created_at)
-               VALUES (?, 'admin', 'skip_outbox', 'dirty_outbox', ?, ?, '', ?)""",
-            (0, json.dumps(ids), reason, _dt.datetime.now().isoformat()),
-        )
-        await store._db.commit()
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                f"UPDATE dirty_outbox SET processed = 1 WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            affected = cursor.rowcount if cursor else 0
+
+            # 写 audit_log(同事务)
+            await tx.execute(
+                """INSERT INTO audit_log (actor_id, actor_type, action, target_type,
+                   target_id, details, ip_addr, created_at)
+                   VALUES (?, 'admin', 'skip_outbox', 'dirty_outbox', ?, ?, '', ?)""",
+                (0, json.dumps(ids), reason, _dt.datetime.now().isoformat()),
+            )
 
         logger.info(
             f"[RepairConsole] skip_outbox 跳过 {affected} 条记录(ids={ids}, reason={reason})"
@@ -385,20 +394,21 @@ async def retry_replication(task_ids: list[int]) -> int:
     import time as _time
     placeholders = ",".join("?" * len(task_ids))
     try:
-        cursor = await store._db.execute(
-            f"""UPDATE replication_tasks
-                SET status = 'PLANNED', prev_status = status,
-                    attempts = 0, next_retry_at = ?, last_error = '',
-                    updated_at = ?
-                WHERE task_id IN ({placeholders})""",
-            (_time.time(), _time.time(), *task_ids),
-        )
-        await store._db.commit()
-        affected = cursor.rowcount if cursor else 0
+        # R40 P0-5: UPDATE + dirty_outbox 同事务
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                f"""UPDATE replication_tasks
+                    SET status = 'PLANNED', prev_status = status,
+                        attempts = 0, next_retry_at = ?, last_error = '',
+                        updated_at = ?
+                    WHERE task_id IN ({placeholders})""",
+                (_time.time(), _time.time(), *task_ids),
+            )
+            affected = cursor.rowcount if cursor else 0
 
-        # 写 dirty_outbox 同步到 CRDB
-        for tid in task_ids:
-            await store.add_dirty_outbox("replication_tasks", str(tid))
+            # 写 dirty_outbox 同步到 CRDB(同事务)
+            for tid in task_ids:
+                await store.add_dirty_outbox("replication_tasks", str(tid), connection=tx)
 
         logger.info(
             f"[RepairConsole] retry_replication 重置 {affected} 个任务(ids={task_ids})"

@@ -22,7 +22,6 @@ from database import (
     get_file_records_col,
     get_file_record_cached,
     get_decode_logs_col,
-    get_pending_uploads_col,
     get_codes_col,
     make_file_record,
     make_decode_log,
@@ -47,6 +46,8 @@ from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder, common_faq
 from utils.flood_waiter import safe_send_message, safe_reply_text
 from utils.relay_auth import is_relay_sender_allowed
+# R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
+from services.maintenance_mode import require_maintenance_check
 
 TOKEN = settings.DECODER_BOT_TOKEN
 
@@ -622,7 +623,10 @@ async def _process_one_pending(app: Application, row: dict):
     protect_content = row.get("protect_content", settings.DEFAULT_PROTECT_CONTENT)
     file_ttl_days = row.get("file_ttl_days", settings.DEFAULT_FILE_TTL_DAYS)
 
-    pending_col = get_pending_uploads_col()
+    # R40 P0-4: 不再调用 get_pending_uploads_col() (CRDB Collection)。
+    # pending_uploads_local 表由 SQLite CacheStore 管理,完全消除对 CRDB 凭证的依赖。
+    from database.cache_store import get_cache_store
+    store = get_cache_store()
 
     if not uploader_id or not channel_id or not message_id:
         # 数据残缺，重试无意义，标记完成避免无限循环
@@ -635,7 +639,7 @@ async def _process_one_pending(app: Application, row: dict):
                 )
             except Exception as e:
                 logger.warning(f"[Idx] 通知上传者数据残缺失败: {e}")
-        await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1, "claimed_at": 0}})
+        await store.complete_pending_upload(pend_id)
         # R35 P0-4: 数据残缺不可恢复,推进 FAILED_PERMANENT
         await _idx_transition_upload_session_safe(
             upload_id, "FAILED_PERMANENT", reason="data_incomplete",
@@ -652,8 +656,8 @@ async def _process_one_pending(app: Application, row: dict):
         except Exception as e:
             logger.warning(f"[Idx] 通知用户处理失败: {e}")
             pass
-        # I-1: 瞬时失败，重置 claimed_at 让下轮重领（at-least-once）
-        await pending_col.update_one({"id": pend_id}, {"$set": {"claimed_at": 0}})
+        # I-1: 瞬时失败,回滚 claimed 状态让下轮重领(at-least-once)
+        await store.fail_pending_upload(pend_id, f"code_gen_failed: {e}")
         # R35 P0-4: 文件码生成失败,推进 FAILED_RETRYABLE
         await _idx_transition_upload_session_safe(
             upload_id, "FAILED_RETRYABLE", reason=f"code_gen_failed: {e}",
@@ -661,15 +665,9 @@ async def _process_one_pending(app: Application, row: dict):
         )
         return
 
-    # 写入 file_records
+    # R40 P0-4: 构造 file_record 和 code_entry(事务外,纯计算)
+    # 构造失败属于代码 bug,不需要重试,直接 fail_pending_upload。
     try:
-        # R39 P0-3: 不再直连 CRDB files_col.insert_one(record)
-        # 原版本直写 CRDB + 写 SQLite 镜像(mark_dirty=False),
-        # 但 CRDB 直写会消耗 RU 且 SQLite mirror 失败时数据不一致。
-        # 新版本只写 SQLite 本地权威 + dirty_outbox,
-        # crdb_sync 服务消费 dirty_outbox 后批量 UPSERT 到 CRDB。
-        # 历史数据读取:Bot 读 SQLite 本地缓存(0 RU),如本地数据缺失
-        # 由 bootstrap_runner 显式恢复,不允许运行时隐式访问 CRDB。
         record = make_file_record(
             file_code=file_code,
             uploader_id=uploader_id,
@@ -682,49 +680,12 @@ async def _process_one_pending(app: Application, row: dict):
             protect_content=protect_content,
             file_ttl_days=file_ttl_days,
         )
-        from database.cache_store import get_cache_store
-        # mark_dirty=True:写 SQLite 后立即入 dirty_outbox,
-        # crdb_sync dispatcher 消费时 UPSERT 到 CRDB file_records 表
-        await get_cache_store().upsert_file_record_local(record, mark_dirty=True)
-        # R39 P0-3: 显式 add_dirty_outbox 确保 dirty_outbox 表有变更记录
-        # (upsert_file_record_local 通过 crdb_synced=0 间接标记,
-        # 但 dirty_outbox 提供通用 dispatcher 路径,与 P0-4 配套)
-        try:
-            record_payload = json.dumps(record, default=str)
-            if isinstance(record_payload, bytes):
-                record_payload = record_payload.decode()
-            await get_cache_store().add_dirty_outbox(
-                "file_records", record["file_code"], "upsert", record_payload
-            )
-        except Exception as outbox_err:
-            # dirty_outbox 写失败不影响主流程(crdb_synced=0 兜底)
-            logger.warning(f"[Idx][poll] add_dirty_outbox(file_records) 失败 code={file_code}: {outbox_err}")
-    except Exception as e:
-        logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
-        try:
-            await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试")
-        except Exception:
-            pass
-        # I-1: 瞬时失败，重置 claimed_at 让下轮重领（at-least-once）
-        await pending_col.update_one({"id": pend_id}, {"$set": {"claimed_at": 0}})
-        # R35 P0-4: file_records 写入失败,推进 FAILED_RETRYABLE
-        await _idx_transition_upload_session_safe(
-            upload_id, "FAILED_RETRYABLE", reason=f"file_records_write_failed: {e}",
-            last_error=str(e),
-        )
-        return
-
-    # 写入 codes 表（含 expire_time，省一次 UPDATE）
-    try:
         actual_ttl_days = file_ttl_days if file_ttl_days else settings.DEFAULT_FILE_TTL_DAYS
         if actual_ttl_days == 0:
             # 0 = 永久有效，设置远期过期时间
             expire_dt = datetime.datetime(2099, 12, 31, 23, 59, 59, tzinfo=datetime.timezone.utc)
         else:
             expire_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=actual_ttl_days)
-        # R39 P0-3: 不再直连 CRDB codes_col.insert_one(ce)
-        # 改为只写 SQLite 本地权威 + dirty_outbox,
-        # crdb_sync dispatcher 消费 dirty_outbox 后 UPSERT 到 CRDB codes 表
         ce = make_code_entry(
             code=file_code,
             uploader_id=uploader_id,
@@ -735,34 +696,86 @@ async def _process_one_pending(app: Application, row: dict):
             note=note,
             expire_time=expire_dt.isoformat(),
         )
-        from database.cache_store import get_cache_store
-        # mark_dirty=True:写 SQLite 后立即入 dirty_outbox
-        await get_cache_store().upsert_code_local(ce, mark_dirty=True)
-        # R39 P0-3: 显式 add_dirty_outbox 通用 dispatcher 路径(与 P0-4 配套)
+    except Exception as e:
+        logger.error(f"[Idx][poll] 构造 file_record/code_entry 失败 (code={file_code}): {e}")
+        await store.fail_pending_upload(pend_id, f"record_build_failed: {e}")
+        await _idx_transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason=f"record_build_failed: {e}",
+            last_error=str(e),
+        )
+        return
+
+    # R40 P0-4: 原子事务 — file_records_local + codes_local + dirty_outbox + complete_pending_upload
+    # 全部在同一 SQLite 事务中提交,失败时整体 ROLLBACK(避免半写状态)。
+    # R39 P0-3: 显式 add_dirty_outbox 供 crdb_sync dispatcher 消费。
+    try:
+        record_payload = json.dumps(record, default=str)
+        if isinstance(record_payload, bytes):
+            record_payload = record_payload.decode()
+        ce_payload = json.dumps(ce, default=str)
+        if isinstance(ce_payload, bytes):
+            ce_payload = ce_payload.decode()
+    except Exception as e:
+        logger.error(f"[Idx][poll] 序列化 record/ce 失败 (code={file_code}): {e}")
+        await store.fail_pending_upload(pend_id, f"serialize_failed: {e}")
+        return
+
+    try:
+        async with store.writer_transaction():
+            # 写 file_records_local(mark_dirty=True → crdb_synced=0)
+            await store.upsert_file_record_local(record, mark_dirty=True)
+            # 写 dirty_outbox(file_records)供 crdb_sync 消费
+            try:
+                await store.add_dirty_outbox(
+                    "file_records", record["file_code"], "upsert", record_payload
+                )
+            except Exception as outbox_err:
+                logger.warning(f"[Idx][poll] add_dirty_outbox(file_records) 失败 code={file_code}: {outbox_err}")
+            # 写 codes_local(mark_dirty=True → crdb_synced=0)
+            await store.upsert_code_local(ce, mark_dirty=True)
+            # 写 dirty_outbox(codes)供 crdb_sync 消费
+            try:
+                await store.add_dirty_outbox(
+                    "codes", ce["code"], "upsert", ce_payload
+                )
+            except Exception as outbox_err:
+                logger.warning(f"[Idx][poll] add_dirty_outbox(codes) 失败 code={file_code}: {outbox_err}")
+            # 标记 pending_upload 完成(processed=1, claimed_at=0)
+            await store.complete_pending_upload(pend_id)
+    except Exception as e:
+        # 事务已 ROLLBACK,file_records / codes / pending_uploads 全部回滚。
+        # 显式调用 fail_pending_upload 重置 claimed 状态(独立事务),
+        # 让该记录立即可被下轮重领(无需等待 _CLAIM_TIMEOUT 超时)。
+        logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
         try:
-            ce_payload = json.dumps(ce, default=str)
-            if isinstance(ce_payload, bytes):
-                ce_payload = ce_payload.decode()
-            await get_cache_store().add_dirty_outbox(
-                "codes", ce["code"], "upsert", ce_payload
-            )
-        except Exception as outbox_err:
-            logger.warning(f"[Idx][poll] add_dirty_outbox(codes) 失败 code={file_code}: {outbox_err}")
-        # 同时写入 code_cache,后续解码查缓存即
+            await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试")
+        except Exception:
+            pass
+        try:
+            await store.fail_pending_upload(pend_id, f"db_write_failed: {e}")
+        except Exception as fail_err:
+            logger.warning(f"[Idx][poll] fail_pending_upload 也失败 id={pend_id}: {fail_err}")
+        await _idx_transition_upload_session_safe(
+            upload_id, "FAILED_RETRYABLE", reason=f"db_write_failed: {e}",
+            last_error=str(e),
+        )
+        return
+
+    # 事务外: 写 code_cache + 清除负缓存 + 递增用户码计数(best-effort,失败只 log)
+    # 这些是非关键操作,不影响 file_records / codes 已提交的数据。
+    try:
         from database.cache import get_code_cache
         get_code_cache().set(f"code:{file_code}", ce)
-        # 清除该文件码的负缓存（防止先生成前有人查过一次，负缓存挡住后续解码）
         from database.cache import clear_negative_file
         clear_negative_file(file_code)
         logger.info(f"[Idx][poll] 已清除负缓存并写入本地镜像: code={file_code}")
-        # E2: 递增用户码计数
         try:
             from utils.shared_counters import incr_user_code_count
             incr_user_code_count(uploader_id, 1)
         except Exception as counter_err:
             logger.debug(f"[Idx][poll] incr_user_code_count 失败 user={uploader_id}: {counter_err}")
     except Exception as e:
-        logger.error(f"[Idx][poll] codes表写入失败(code={file_code}): {e}")
+        logger.error(f"[Idx][poll] code_cache 写入失败(code={file_code}): {e}")
 
     # ── 外部文件:写入外部码映射 + 直接调度 dsp 发送 ──
     ext_code = None
@@ -896,8 +909,8 @@ async def _process_one_pending(app: Application, row: dict):
     except Exception as e:
         logger.error(f"[Idx][poll] 发送文件码失败 (code={file_code}): {e}")
 
-    # I-1: 处理成功，置 processed=1 并清除 claimed_at
-    await pending_col.update_one({"id": pend_id}, {"$set": {"processed": 1, "claimed_at": 0}})
+    # R40 P0-4: complete_pending_upload 已在 writer_transaction 中完成,
+    # 无需再调用 pending_col.update_one(CRDB Collection 已废弃)。
     # R35 P0-4: 文件码生成 + file_records + codes 全部写入成功,
     # 推进 upload_session: MANIFEST_PENDING → MANIFESTED → READY
     await _idx_transition_upload_session_safe(
@@ -911,34 +924,43 @@ async def _process_one_pending(app: Application, row: dict):
 
 
 async def _process_pending_uploads(app: Application):
-    """处理 pending_uploads: 先查本地 SQLite 通知(0 RU),有信号才查 CRDB,并发处理多条。
-    I-1: at-least-once 语义。用 claimed_at 认领（不置 processed=1），
+    """处理 pending_uploads: 从 SQLite 本地读取(0 RU),并发处理多条。
+
+    R40 P0-4: 完全迁移到 SQLite,不再调用 get_pending_uploads_col() (CRDB Collection)。
+    Idx Bot 无 CRDB 凭证时主循环仍可工作。
+
+    I-1: at-least-once 语义。用 claimed_at 认领(processed=2,不置 processed=1),
     处理成功后才置 processed=1。认领后崩溃的记录由 _CLAIM_TIMEOUT 回收重领。
     """
     from database.cache_store import get_cache_store
     store = get_cache_store()
 
-    _CLAIM_TIMEOUT = 300.0  # 认领超 5 分钟未完成视为崩溃，可被重领
+    _CLAIM_TIMEOUT = 300.0  # 认领超 5 分钟未完成视为崩溃,可被重领
+    _stale_reset_counter = 0  # 每 N 轮执行一次 stale claims 重置
 
     while True:
         try:
             if not await store.wait_for_new_upload(timeout=30.0):
                 continue
 
-            pending_col = get_pending_uploads_col()
+            # R40 P0-4: 每 10 轮重置一次超时的 claimed 记录(claimed_at 过期 → 回到 pending)
+            _stale_reset_counter += 1
+            if _stale_reset_counter >= 10:
+                _stale_reset_counter = 0
+                try:
+                    reset_count = await store.reset_stale_claims(_CLAIM_TIMEOUT)
+                    if reset_count > 0:
+                        logger.info(f"[Idx][poll] R40 P0-4: 重置 {reset_count} 条超时 claimed 记录回 pending")
+                except Exception as reset_err:
+                    logger.debug(f"[Idx][poll] reset_stale_claims 失败(非致命): {reset_err}")
+
             processed_any = False
             while True:
-                # 查询未处理候选行：processed=0 且 claimed_at <= cutoff
-                # (claimed_at=0 未认领 → 0<=cutoff 恒真；已认领 → 仅超时才可重领)
+                # R40 P0-4: 单事务 CAS 认领 — SQLite RETURNING 语法原子认领多条记录
+                # 不再调用 get_pending_uploads_col().find() / update_one()(CRDB Collection)
                 now = time.time()
                 cutoff = now - _CLAIM_TIMEOUT
-                candidates = await pending_col.find(
-                    {"processed": 0, "claimed_at": {"$lte": cutoff}},
-                    limit=10,
-                    projection=["id", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
-                                "file_types", "batch_msg_ids", "batch_file_meta", "note",
-                                "protect_content", "file_ttl_days", "upload_id"],
-                )
+                candidates = await store.claim_pending_uploads(cutoff_ts=cutoff, limit=10)
 
                 if not candidates:
                     break
@@ -946,15 +968,9 @@ async def _process_pending_uploads(app: Application):
                 processed_any = True
                 tasks = []
                 for row in candidates:
-                    pend_id = row["id"]
-                    # I-1: CAS 原子认领：仅当 claimed_at 仍 <= cutoff，才设置 claimed_at=now
-                    result = await pending_col.update_one(
-                        {"id": pend_id, "processed": 0, "claimed_at": {"$lte": cutoff}},
-                        {"$set": {"claimed_at": now}}
-                    )
-                    # 认领成功才处理
-                    if result and result.matched_count > 0:
-                        tasks.append(asyncio.create_task(_process_one_pending(app, row)))
+                    # claim_pending_uploads 已原子认领(processed=2, claimed_at=now),
+                    # 此处只需异步处理每条记录
+                    tasks.append(asyncio.create_task(_process_one_pending(app, row)))
 
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
@@ -969,6 +985,7 @@ async def _process_pending_uploads(app: Application):
 
 # ─── 内部码解───
 
+@require_maintenance_check(action="解码文件")
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_force_join(update, context):
@@ -2570,6 +2587,7 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
     await metrics.record_processed("idx_bot")
 
 
+@require_maintenance_check(action="解码文件")
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
 

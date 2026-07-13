@@ -109,14 +109,18 @@ def _build_bundle_manifest(
     watermark: str | None = None,
     prev_watermark: str | None = None,
     encryption_info: dict | None = None,
+    ciphertext_sha256: str | None = None,
+    backup_id: str = "",
 ) -> dict:
-    """构建 bundle manifest(R35 P1-7, R36 H7 增强)。
+    """构建 bundle manifest(R35 P1-7, R36 H7 增强, R40 P0-6 双 checksum)。
 
     Bundle 包含:
     - commit SHA(git rev-parse HEAD 或环境变量)
     - schema version(backup_schema 版本)
     - 每表行数
-    - SHA-256 checksum(整个 backup JSON 的校验和)
+    - SHA-256 checksum(整个 backup JSON 的校验和,向后兼容)
+    - R40 P0-6: plaintext_sha256(明文校验和) + ciphertext_sha256(密文校验和)
+    - R40 P0-6: backup_id(用于 AAD 绑定)
     - 开始/结束时间
     - source 标记(crdb/sqlite/relay_sqlite)
     - R36 H7: backup_type (full/incremental)
@@ -134,11 +138,18 @@ def _build_bundle_manifest(
             "source": source,
         }
 
+    # R40 P0-6: plaintext_sha256 = 对明文 content 的 SHA-256
+    plaintext_sha = _compute_sha256(content)
+
     manifest = {
         "version": "3.0",  # R36: manifest v3(含 backup_type/watermark/encryption)
         "commit_sha": _get_commit_sha(),
         "schema_version": _BACKUP_SCHEMA_VERSION,
-        "checksum_sha256": _compute_sha256(content),
+        # R40 P0-6: 双 checksum 分离
+        "plaintext_sha256": plaintext_sha,  # 明文校验和(解密后校验)
+        "ciphertext_sha256": ciphertext_sha256 or plaintext_sha,  # 密文校验和(下载后校验)
+        "checksum_sha256": plaintext_sha,  # 向后兼容(等价于 plaintext_sha256)
+        "backup_id": backup_id,  # R40 P0-6: AAD 绑定标识
         "content_size_bytes": len(content),
         "backup_started_at": start_time.isoformat(),
         "backup_finished_at": end_time.isoformat(),
@@ -548,8 +559,20 @@ async def _run_backup_loop():
             # R38 P1-5: 序列化 plaintext(checksum 基于此脱敏后的数据)
             plaintext = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
 
-            # R38 P1-5: 生成最终 manifest(checksum 基于已脱敏的 plaintext)
-            # manifest 含 key_id 标识(不含 wrapped_dek/nonce 明文,这些放 envelope 字段)
+            # R40 P0-6: 先加密 plaintext,获取 ciphertext_sha256,再构建 manifest(双 checksum)
+            # R36 H7 + R38 P1-5: 加密 plaintext
+            # R40 P0-6: 传 backup_id(=timestamp) + schema_version 绑定 AAD,防密文重放
+            enc_result = encrypt_payload(
+                plaintext,
+                backup_id=timestamp,
+                schema_version=_BACKUP_SCHEMA_VERSION,
+            )
+            upload_content = enc_result["ciphertext"]
+
+            # R38 P1-5 + R40 P0-6: 生成最终 manifest
+            # - plaintext_sha256: 对明文 plaintext 的 SHA-256(解密后校验)
+            # - ciphertext_sha256: 对密文 ciphertext 的 SHA-256(下载后校验,来自 enc_result)
+            # - backup_id: 用于 AAD 绑定(=timestamp,解密时需回传)
             manifest = _build_bundle_manifest(
                 backup_data=data,
                 content=plaintext,
@@ -558,11 +581,9 @@ async def _run_backup_loop():
                 backup_type=r38_metadata.get("backup_type", backup_type),
                 watermark=r38_metadata.get("watermark"),
                 prev_watermark=r38_metadata.get("prev_watermark"),
+                ciphertext_sha256=enc_result.get("ciphertext_sha256"),
+                backup_id=timestamp,
             )
-
-            # R36 H7 + R38 P1-5: 加密 plaintext
-            enc_result = encrypt_payload(plaintext)
-            upload_content = enc_result["ciphertext"]
 
             # R38 P1-5: 将加密元信息写入 manifest envelope(含 wrapped_dek/nonce/key_id)
             if enc_result["encrypted"]:
@@ -592,13 +613,15 @@ async def _run_backup_loop():
             _tmp_key = f"db_backup/.tmp_{timestamp}_{_tmp_suffix}_{backup_type}.bin"
             await r2_storage.upload(_tmp_key, upload_content, payload_ct)
             # 2. 校验:重新下载并校验 checksum(R39 P1-6: 防止静默上传失败/截断)
+            # R40 P0-6: 校验对象是密文,应使用 ciphertext_sha256(而非 plaintext_sha256)
             try:
                 _verify_bytes = await r2_storage.download(_tmp_key)
                 _verify_sha = _compute_sha256(_verify_bytes)
-                if _verify_sha != manifest.get("checksum_sha256"):
+                _expected_cipher_sha = manifest.get("ciphertext_sha256")
+                if _verify_sha != _expected_cipher_sha:
                     raise RuntimeError(
-                        f"R39 P1-6: 临时 payload checksum 不匹配"
-                        f"(expected={manifest.get('checksum_sha256','')[:16]}, "
+                        f"R39 P1-6 + R40 P0-6: 临时 payload 密文 checksum 不匹配"
+                        f"(expected_cipher={str(_expected_cipher_sha)[:16]}, "
                         f"actual={_verify_sha[:16]})"
                     )
                 if len(_verify_bytes) != len(upload_content):
@@ -607,8 +630,8 @@ async def _run_backup_loop():
                         f"(expected={len(upload_content)}, actual={len(_verify_bytes)})"
                     )
                 logger.debug(
-                    f"[Backup] R39 P1-6: 临时 payload 校验通过"
-                    f"(key={_tmp_key}, sha256={_verify_sha[:16]}...)"
+                    f"[Backup] R39 P1-6 + R40 P0-6: 临时 payload 密文校验通过"
+                    f"(key={_tmp_key}, cipher_sha256={_verify_sha[:16]}...)"
                 )
             except Exception as verify_err:
                 # 校验失败:清理临时 payload,本次备份失败(不写 manifest,不留坏指针)
@@ -638,13 +661,15 @@ async def _run_backup_loop():
             )
 
             total_rows = sum(len(v) for v in data["tables"].values())
-            # R35 P1-7 + R36 H7 + R38 P1-5 + R39 P1-6: 日志中包含 bundle manifest 摘要
+            # R35 P1-7 + R36 H7 + R38 P1-5 + R39 P1-6 + R40 P0-6: 日志中包含 bundle manifest 摘要
             logger.info(
                 f"数据库已备份到 R2: {key} ({len(upload_content)} 字节, "
                 f"{len(data['tables'])} 表, {total_rows} 行, "
                 f"type={backup_type}, "
                 f"commit={manifest.get('commit_sha', 'unknown')}, "
-                f"checksum={manifest.get('checksum_sha256', 'unknown')[:16]}..., "
+                f"plain_sha={manifest.get('plaintext_sha256', 'unknown')[:16]}..., "
+                f"cipher_sha={manifest.get('ciphertext_sha256', 'unknown')[:16]}..., "
+                f"backup_id={manifest.get('backup_id', '')}, "
                 f"encrypted={enc_result['encrypted']})"
             )
 

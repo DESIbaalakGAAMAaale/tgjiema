@@ -2,25 +2,73 @@
 # R36 H8: 从 config/services.yaml 派生,与 systemd 一致的服务清单
 # 环形冗余 v2 架构(up / idx / dsp / mon / admin_bot / admin / db_writer / crdb_sync / db_backup)
 #
+# ┌──────────────────────────────────────────────────────────────────────┐
+# │ R40 P0-3 醒目说明: 首次启动前必须准备 .env 中的 REDIS_*_PASSWORD   │
+# │ ─────────────────────────────────────────────────────────────────── │
+# │   首次 `docker compose up` 前,需在 .env 中配置以下 3 个变量:       │
+# │     REDIS_HEALTH_PASSWORD=...   (healthcheck 用户,仅 PING 权限)     │
+# │     REDIS_WRITER_PASSWORD=...   (tgjiema_writer 用户,业务写权限)    │
+# │     REDIS_READER_PASSWORD=...   (tgjiema_reader 用户,只读权限)      │
+# │   未配置时 redis-acl-init 容器会用 openssl rand 随机生成并打印警告,│
+# │   但生成的密码不会回写 .env(容器场景建议使用 Docker secrets 注入)。│
+# │   ACL 模板: config/redis/users.acl.template                         │
+# │   渲染脚本: config/redis/render_acl.sh                               │
+# │   校验: render_acl.sh 拒绝含 '<' / 'changeme' 的输出,失败 exit 1    │
+# └──────────────────────────────────────────────────────────────────────┘
+#
 # 部署步骤:
-#   1. 创建 .env 文件(从 .env.example 复制并填写)
+#   1. 创建 .env 文件(从 .env.example 复制并填写,务必设置 REDIS_*_PASSWORD)
 #   2. 编辑 config/groups.yaml(填写 15 组的 channel_id)
 #   3. docker-compose up -d --build
+#      - redis-acl-init 先于 redis 启动,渲染 /data/users.acl
+#      - redis 主容器以 --aclfile /data/users.acl 加载渲染后的 ACL
 #   4. 拓扑已自动初始化(run_all.py 启动时自动执行 seed_topology)
 #
 # R36 H8: 每个服务使用最小 secrets 注入(.env.secrets.<service>),
 #         不再共享完整 .env,与 systemd 模型一致。
 
 services:
+  # ── redis-acl-init (一次性,渲染 ACL 文件到共享卷) ──
+  # R40 P0-3: 先于 redis 启动,从 REDIS_*_PASSWORD 环境变量渲染 users.acl
+  # 渲染流程: sed 替换 <REDIS_*_PASSWORD> 占位符 → /data/users.acl
+  # 校验: 输出文件不得含 '<' 或 'changeme',否则 exit 1
+  redis-acl-init:
+    image: redis:7-alpine
+    container_name: tgjiema-redis-acl-init
+    restart: "no"
+    environment:
+      - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:-}
+      - REDIS_WRITER_PASSWORD=${REDIS_WRITER_PASSWORD:-}
+      - REDIS_READER_PASSWORD=${REDIS_READER_PASSWORD:-}
+      - ACL_TEMPLATE_PATH=/app/config/redis/users.acl.template
+      - ACL_OUTPUT_PATH=/data/users.acl
+    volumes:
+      - redis_data:/data
+      - ./config/redis:/app/config/redis:ro
+    entrypoint: ["/bin/sh", "/app/config/redis/render_acl.sh"]
+    # R37 P2-4: 镜像安全加固(init 容器短任务,资源限制放宽)
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 64M
+
   # ── Redis (基础设施) ──
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # R40 P0-3: 从 redis_data 共享卷加载渲染后的 ACL(/data/users.acl 由 redis-acl-init 生成)
     # R38 P1-8: 启用 ACL(--aclfile),各服务使用独立用户连接 Redis
-    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction --aclfile /etc/redis/users.acl
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction --aclfile /data/users.acl
     volumes:
       - redis_data:/data
-      - ./config/redis/users.acl:/etc/redis/users.acl:ro  # R38 P1-8: 挂载 ACL 文件(只读)
     ports:
       - "127.0.0.1:6379:6379"
     # R37 P2-4: 镜像安全加固
@@ -33,10 +81,13 @@ services:
       - no-new-privileges:true
     # R39 P0-1: healthcheck 改用专用 health 用户(仅允许 PING),
     # 不再使用被禁用的 default 用户导致认证失败。
-    # REDIS_HEALTH_PASSWORD 由 .env.secrets.redis 注入(或 redis 服务的 environment 字段)。
+    # R40 P0-3: REDIS_HEALTH_PASSWORD 由 .env 顶层注入(由 redis-acl-init 同样读取)。
     # 注意: $$ 转义避免 Compose 插值,运行时由 shell 展开 $REDIS_HEALTH_PASSWORD。
     environment:
       - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:-changeme_health_ping}
+    depends_on:
+      redis-acl-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "redis-cli --user health -a $$REDIS_HEALTH_PASSWORD --no-auth-warning ping || exit 1"]
       interval: 10s
@@ -135,6 +186,8 @@ services:
     environment:
       - SERVICE_ROLE=crdb_sync
       - PYTHONUNBUFFERED=1
+      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -175,6 +228,8 @@ services:
     environment:
       - SERVICE_ROLE=up
       - PYTHONUNBUFFERED=1
+      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -219,6 +274,8 @@ services:
     environment:
       - SERVICE_ROLE=idx
       - PYTHONUNBUFFERED=1
+      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -263,6 +320,8 @@ services:
     environment:
       - SERVICE_ROLE=dsp
       - PYTHONUNBUFFERED=1
+      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -307,6 +366,8 @@ services:
     environment:
       - SERVICE_ROLE=mon
       - PYTHONUNBUFFERED=1
+      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -397,6 +458,8 @@ services:
     environment:
       - SERVICE_ROLE=admin
       - PYTHONUNBUFFERED=1
+      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config
@@ -445,6 +508,8 @@ services:
     environment:
       - SERVICE_ROLE=db_backup
       - PYTHONUNBUFFERED=1
+      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
     volumes:
       - ./data:/app/data
       - ./config:/app/config

@@ -1,0 +1,81 @@
+{
+  "meta": {
+    "locale": "zh-CN",
+    "name": "简体中文",
+    "version": "1.0.0",
+    "fallback": "en-US"
+  },
+  "common": {
+    "ok": "确定",
+    "cancel": "取消",
+    "submit": "提交",
+    "save": "保存",
+    "delete": "删除",
+    "edit": "编辑",
+    "search": "搜索",
+    "loading": "加载中...",
+    "no_data": "暂无数据",
+    "page_prev": "上一页",
+    "page_next": "下一页",
+    "logout": "退出登录"
+  },
+  "errors": {
+    "quota.decode.exceeded": "今日解码次数已达上限",
+    "quota.upload.exceeded": "今日上传次数已达上限",
+    "quota.external.exceeded": "今日外部解码次数已达上限",
+    "quota.balance.insufficient": "配额不足",
+    "file.not_found": "文件不存在",
+    "file.expired": "文件已过期",
+    "file.deleted": "文件已被删除",
+    "file.too_large": "文件大小超过限制",
+    "file.code.invalid": "文件码无效",
+    "file.code.used": "文件码已被使用",
+    "user.not_found": "用户不存在",
+    "user.banned": "用户已被封禁",
+    "user.unauthorized": "未授权访问",
+    "user.forbidden": "禁止访问",
+    "system.internal": "内部服务器错误",
+    "system.rate_limited": "请求过于频繁,请稍后再试",
+    "system.maintenance": "系统维护中,请稍后再试",
+    "validation.failed": "参数校验失败",
+    "validation.missing_field": "缺少必填字段"
+  },
+  "ui": {
+    "admin_login_title": "管理后台登录",
+    "admin_dashboard_title": "仪表板",
+    "admin_users_title": "用户管理",
+    "admin_files_title": "文件管理",
+    "admin_logs_title": "日志查看",
+    "admin_health_title": "健康检查",
+    "admin_tasks_title": "任务中心",
+    "admin_reports_title": "举报管理",
+    "admin_collections_title": "集合管理",
+    "admin_notifications_title": "通知中心",
+    "admin_approvals_title": "审批管理",
+    "admin_rbac_title": "RBAC 角色",
+    "admin_repair_title": "修复控制台",
+    "admin_topology_title": "拓扑可视化",
+    "admin_ru_cost_title": "RU 成本中心",
+    "admin_maintenance_title": "维护模式",
+    "admin_disaster_recovery_title": "灾备控制台"
+  },
+  "bot": {
+    "start_welcome": "欢迎使用 TG解码器",
+    "send_file_code": "请发送文件码",
+    "decode_in_progress": "解码中,请稍候...",
+    "decode_success": "解码成功",
+    "decode_failed": "解码失败",
+    "quota_remaining": "今日剩余配额 {count} 次",
+    "quota_exhausted": "今日配额已用完",
+    "upload_started": "上传已开始",
+    "upload_success": "上传成功,文件码: {code}",
+    "upload_failed": "上传失败"
+  },
+  "accessibility": {
+    "skip_to_content": "跳到主要内容",
+    "form_required_field": "必填字段",
+    "form_validation_error": "表单校验失败",
+    "table_sortable_column": "可排序列",
+    "loading_indicator": "加载指示器"
+  }
+}

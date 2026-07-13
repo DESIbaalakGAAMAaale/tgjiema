@@ -170,7 +170,7 @@ class TestServiceConsistency:
         # 读取 docker-compose.yml
         dc_path = Path(__file__).parent.parent / "docker-compose.yml"
         dc_data = yaml.safe_load(dc_path.read_text(encoding="utf-8"))
-        dc_names = set(dc_data.get("services", {}).keys()) - {"redis"}  # 排除基础设施
+        dc_names = set(dc_data.get("services", {}).keys()) - {"redis", "redis-acl-init"}  # 排除基础设施 + init container
 
         assert sy_names == dc_names, (
             f"服务清单不一致: services.yaml={sy_names}, docker-compose={dc_names}"

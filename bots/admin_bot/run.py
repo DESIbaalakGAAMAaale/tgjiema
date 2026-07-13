@@ -20,7 +20,7 @@ from .handlers import (
     cmd_reports, cmd_takedown, cmd_ban_user, cmd_unban_user,
     cmd_pending_approvals, cmd_approve, cmd_reject, cmd_roles,
     cmd_assign_role, cmd_maintenance, cmd_repair_console, cmd_backups,
-    cmd_ru_report,
+    cmd_ru_report, cmd_tasks,
 )
 from .callback import menu_callback
 from .conversation import handle_conversation
@@ -113,6 +113,8 @@ async def _async_main():
     app.add_handler(CommandHandler("repair_console", cmd_repair_console))
     app.add_handler(CommandHandler("backups", cmd_backups))
     app.add_handler(CommandHandler("ru_report", cmd_ru_report))
+    # R40 P1-1: 任务中心(查看所有用户任务)
+    app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_conversation))
     app.add_handler(CallbackQueryHandler(menu_callback, pattern=r"^(menu:|action:|usage:|interactive:|conv:|report:|restore:)"))
 

@@ -9,6 +9,15 @@
     5. verify() — 验证系统就绪
     6. disable() — 关闭维护模式
 
+R40 P1-6 / P1-7 / P1-8 修复:
+    - is_enabled() 改为 fail-closed:无法判定时抛 MaintenanceCheckError,
+      并缓存最后已知状态(内存 + kv_store 持久化)。
+    - workflow 失败时保持 maintenance enabled,不自动 disable。
+    - 新增 rollback_maintenance(reason) 人工恢复 API(需审批)。
+    - disable() 增加前置检查(队列排空 + 备份最新),不满足则拒绝。
+    - 新增 require_maintenance_check 装饰器,供 Bot 入口统一中间件使用。
+    - 新增 get_maintenance_state() 返回结构化状态 + 缓存信息。
+
 设计原则:
     - 纯函数式 + async
     - 通过 database.cache_store.get_cache_store() 获取单例
@@ -23,7 +32,8 @@ import asyncio
 import datetime as _dt
 import json
 import time as _time
-from typing import Any
+from functools import wraps
+from typing import Any, Callable
 
 from loguru import logger
 
@@ -32,6 +42,101 @@ from database.cache_store import get_cache_store
 
 MAINTENANCE_KEY = "maintenance_mode"
 MAINTENANCE_STATE_ID = 1  # maintenance_state 表单行 id
+
+# R40 P1-7: 缓存最后已知状态(模块级内存)
+_KV_LAST_KNOWN_KEY = "maintenance_last_known"  # kv_store 持久化键
+_KV_LAST_CHECKED_KEY = "maintenance_last_checked"
+_last_known_enabled: bool | None = None  # None=未知,True=开启,False=关闭
+_last_checked_ts: str | None = None
+_last_error: str = ""
+
+
+class MaintenanceCheckError(Exception):
+    """R40 P1-7: 维护模式状态检查异常(fail-closed 触发条件)。
+
+    当 is_enabled() 无法判定当前状态(DB 异常 / 无缓存)时抛出,
+    高风险入口必须捕获此异常并拒绝请求。
+    """
+    pass
+
+
+class MaintenancePreconditionError(Exception):
+    """R40 P1-6: 关闭维护模式前置条件不满足(队列未排空 / 备份过期等)。"""
+    pass
+
+
+# ─── R40 P1-7: 缓存读写辅助函数 ─────────────────────────────────
+
+async def _persist_cache(last_known: bool | None, error: str = "") -> None:
+    """R40 P1-7: 将最后已知状态持久化到 kv_store(跨进程共享)。
+
+    失败仅记录 warning,不抛异常(缓存是 best-effort,不影响 DB 权威)。
+    """
+    global _last_known_enabled, _last_checked_ts, _last_error
+    _last_known_enabled = last_known
+    _last_checked_ts = _dt.datetime.now().isoformat()
+    _last_error = error
+    store = get_cache_store()
+    if not store._db:
+        return
+    try:
+        await store._db.execute(
+            "INSERT INTO kv_store (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_KV_LAST_KNOWN_KEY, "1" if last_known else "0" if last_known is False else ""),
+        )
+        await store._db.execute(
+            "INSERT INTO kv_store (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_KV_LAST_CHECKED_KEY, _last_checked_ts),
+        )
+        await store._db.commit()
+    except Exception as e:
+        logger.warning(f"[Maintenance] 持久化缓存失败(不影响权威状态): {e}")
+
+
+async def _load_persisted_cache() -> None:
+    """R40 P1-7: 启动时从 kv_store 加载最后已知状态到内存缓存。"""
+    global _last_known_enabled, _last_checked_ts
+    store = get_cache_store()
+    if not store._db:
+        return
+    try:
+        # 分别查询两个键,避免依赖 IN 子句的返回顺序
+        rows_known = await store._db.execute_fetchall(
+            "SELECT value FROM kv_store WHERE key = ?",
+            (_KV_LAST_KNOWN_KEY,),
+        )
+        last_known_val: bool | None = None
+        if rows_known and rows_known[0]:
+            v = rows_known[0][0]
+            if v == "1":
+                last_known_val = True
+            elif v == "0":
+                last_known_val = False
+            else:
+                last_known_val = None
+        rows_checked = await store._db.execute_fetchall(
+            "SELECT value FROM kv_store WHERE key = ?",
+            (_KV_LAST_CHECKED_KEY,),
+        )
+        last_checked_val = rows_checked[0][0] if rows_checked and rows_checked[0] else None
+        _last_known_enabled = last_known_val
+        _last_checked_ts = last_checked_val
+        logger.debug(
+            f"[Maintenance] 加载缓存: last_known={last_known_val} "
+            f"last_checked={last_checked_val}"
+        )
+    except Exception as e:
+        logger.warning(f"[Maintenance] 加载持久化缓存失败: {e}")
+
+
+def _reset_cache_for_test() -> None:
+    """R40 P1-7: 测试辅助函数 — 重置模块级缓存(仅用于测试隔离)。"""
+    global _last_known_enabled, _last_checked_ts, _last_error
+    _last_known_enabled = None
+    _last_checked_ts = None
+    _last_error = ""
 
 
 # ─── 内联 audit_log 实现(services/audit_log.py 不存在) ─────────
@@ -84,6 +189,7 @@ async def enable(reason: str, started_by: int = 0) -> bool:
         2. 写 audit_log
         3. 通知所有 Bot 停止接受新请求(通过 maintenance_state 状态,
            Bot 在每次请求前调用 is_enabled() 检查)
+        4. R40 P1-7: 更新内存 + kv_store 缓存
 
     Args:
         reason: 维护原因(记入 audit_log.details)
@@ -123,6 +229,9 @@ async def enable(reason: str, started_by: int = 0) -> bool:
             details=reason,
         )
 
+        # R40 P1-7: 更新缓存(权威状态变更后,缓存同步更新)
+        await _persist_cache(True)
+
         logger.warning(
             f"[Maintenance] 维护模式已开启: reason={reason} started_by={started_by}"
         )
@@ -132,18 +241,37 @@ async def enable(reason: str, started_by: int = 0) -> bool:
         return False
 
 
-async def disable(ended_by: int = 0) -> bool:
-    """关闭维护模式。
+async def disable(ended_by: int = 0, force: bool = False) -> bool:
+    """R40 P1-6: 关闭维护模式(带前置检查)。
+
+    前置条件(默认 force=False 时检查):
+        - 队列已排空(dirty_outbox + local_job_queue)
+        - 备份存在(backup_history 表非空)
+      不满足时抛 MaintenancePreconditionError(不调用 disable_maintenance)。
 
     Args:
         ended_by: 操作者 admin_id
+        force: True=跳过前置检查(仅人工 rollback 场景使用)
 
     Returns:
         True 关闭成功, False 失败
+
+    Raises:
+        MaintenancePreconditionError: 前置条件不满足
     """
     store = get_cache_store()
     if not store._db:
         return False
+
+    # R40 P1-6: 前置检查
+    if not force:
+        preconditions = await check_disable_preconditions()
+        if not preconditions["ok"]:
+            reason = preconditions.get("reason", "前置条件不满足")
+            logger.warning(
+                f"[Maintenance] disable 拒绝(前置检查未通过): {reason}"
+            )
+            raise MaintenancePreconditionError(reason)
 
     now_iso = _dt.datetime.now().isoformat()
     try:
@@ -164,36 +292,187 @@ async def disable(ended_by: int = 0) -> bool:
             action="disable_maintenance",
             target_type="maintenance_state",
             target_id=str(MAINTENANCE_STATE_ID),
-            details=f"维护模式已关闭 at {now_iso}",
+            details=f"维护模式已关闭 at {now_iso}" + (" (force)" if force else ""),
         )
 
+        # R40 P1-7: 更新缓存
+        await _persist_cache(False)
+
         logger.info(
-            f"[Maintenance] 维护模式已关闭: ended_by={ended_by}"
+            f"[Maintenance] 维护模式已关闭: ended_by={ended_by} force={force}"
         )
         return True
+    except MaintenancePreconditionError:
+        raise
     except Exception as e:
         logger.error(f"[Maintenance] disable 失败: {e}")
         return False
 
 
+async def check_disable_preconditions() -> dict:
+    """R40 P1-6: 关闭维护模式前置检查。
+
+    检查:
+        - dirty_outbox 已排空(processed=0 行数为 0)
+        - local_job_queue 已排空(pending 行数为 0)
+        - backup_history 非空(至少有 1 次成功备份)
+
+    Returns:
+        {ok: bool, reason: str, dirty_outbox_remaining: int,
+         jobs_remaining: int, backup_count: int}
+    """
+    store = get_cache_store()
+    result = {
+        "ok": True,
+        "reason": "",
+        "dirty_outbox_remaining": 0,
+        "jobs_remaining": 0,
+        "backup_count": 0,
+    }
+    if not store._db:
+        result["ok"] = False
+        result["reason"] = "数据库未初始化"
+        return result
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT COUNT(*) FROM dirty_outbox WHERE processed = 0"
+        )
+        result["dirty_outbox_remaining"] = rows[0][0] if rows else 0
+    except Exception as e:
+        logger.warning(f"[Maintenance] check_disable_preconditions dirty_outbox: {e}")
+        result["dirty_outbox_remaining"] = -1
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT COUNT(*) FROM local_job_queue WHERE status = 'pending'"
+        )
+        result["jobs_remaining"] = rows[0][0] if rows else 0
+    except Exception as e:
+        logger.warning(f"[Maintenance] check_disable_preconditions jobs: {e}")
+        result["jobs_remaining"] = -1
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT COUNT(*) FROM backup_history"
+        )
+        result["backup_count"] = rows[0][0] if rows else 0
+    except Exception as e:
+        # backup_history 表可能不存在(测试环境),不阻塞 disable
+        logger.debug(f"[Maintenance] backup_history 查询失败(忽略): {e}")
+        result["backup_count"] = 0
+
+    # 判定
+    if result["dirty_outbox_remaining"] > 0:
+        result["ok"] = False
+        result["reason"] = f"dirty_outbox 还有 {result['dirty_outbox_remaining']} 条未处理"
+    elif result["jobs_remaining"] > 0:
+        result["ok"] = False
+        result["reason"] = f"local_job_queue 还有 {result['jobs_remaining']} 条 pending"
+    return result
+
+
 async def is_enabled() -> bool:
-    """检查是否处于维护模式。
+    """R40 P1-7: 检查是否处于维护模式(fail-closed)。
 
     Bot 在每次请求前调用此函数,返回 True 时拒绝新请求。
+
+    异常处理:
+        - DB 异常时:更新缓存错误信息,然后抛 MaintenanceCheckError
+          (高风险入口必须捕获此异常并拒绝请求)。
+        - DB 未初始化时:同样抛 MaintenanceCheckError(无法判定状态)。
+
+    Returns:
+        True 表示维护模式开启;False 表示关闭
+
+    Raises:
+        MaintenanceCheckError: DB 异常或无缓存,无法判定当前状态
     """
     store = get_cache_store()
     if not store._db:
-        return False
+        # DB 未初始化 — 检查是否有缓存
+        if _last_known_enabled is not None:
+            logger.warning(
+                "[Maintenance] is_enabled DB 未初始化,使用缓存值 "
+                f"last_known={_last_known_enabled}"
+            )
+            return _last_known_enabled
+        raise MaintenanceCheckError("数据库未初始化,无法判定维护状态")
     try:
         rows = await store._db.execute_fetchall(
             "SELECT enabled FROM maintenance_state WHERE id = ?",
             (MAINTENANCE_STATE_ID,),
         )
         if rows and rows[0]:
-            return bool(rows[0][0])
+            enabled = bool(rows[0][0])
+            # 更新缓存(成功查询后)
+            await _persist_cache(enabled)
+            return enabled
+        # maintenance_state 表为空(尚未初始化)— 视为未开启
+        await _persist_cache(False)
         return False
-    except Exception:
-        return False
+    except Exception as e:
+        # R40 P1-7: fail-closed — 异常时不返回 False
+        # 更新错误信息到缓存
+        await _persist_cache(_last_known_enabled, error=str(e))
+        # 若有缓存,降级使用缓存(只读查询场景可使用)
+        # 但函数签名返回 bool,这里仍抛异常让高风险入口捕获
+        # (调用方可显式调用 get_maintenance_state() 拿缓存)
+        raise MaintenanceCheckError(
+            f"数据库查询异常,无法判定维护状态: {e}"
+        )
+
+
+async def get_maintenance_state() -> dict:
+    """R40 P1-7: 获取维护模式结构化状态(含缓存信息)。
+
+    高风险入口在 is_enabled() 抛异常时可调用此函数获取缓存状态。
+
+    Returns:
+        {enabled: bool|None, last_checked: str|None,
+         last_known: bool|None, error: str, source: str}
+        - enabled: 当前 DB 权威状态;异常时为 None
+        - source: "db" / "cache" / "unknown"
+    """
+    store = get_cache_store()
+    if not store._db:
+        return {
+            "enabled": _last_known_enabled,
+            "last_checked": _last_checked_ts,
+            "last_known": _last_known_enabled,
+            "error": "数据库未初始化",
+            "source": "cache" if _last_known_enabled is not None else "unknown",
+        }
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT enabled FROM maintenance_state WHERE id = ?",
+            (MAINTENANCE_STATE_ID,),
+        )
+        if rows and rows[0]:
+            enabled = bool(rows[0][0])
+            await _persist_cache(enabled)
+            return {
+                "enabled": enabled,
+                "last_checked": _last_checked_ts,
+                "last_known": enabled,
+                "error": "",
+                "source": "db",
+            }
+        await _persist_cache(False)
+        return {
+            "enabled": False,
+            "last_checked": _last_checked_ts,
+            "last_known": False,
+            "error": "",
+            "source": "db",
+        }
+    except Exception as e:
+        # DB 异常 — 返回缓存信息(不抛异常)
+        await _persist_cache(_last_known_enabled, error=str(e))
+        return {
+            "enabled": _last_known_enabled,
+            "last_checked": _last_checked_ts,
+            "last_known": _last_known_enabled,
+            "error": str(e),
+            "source": "cache" if _last_known_enabled is not None else "unknown",
+        }
 
 
 async def get_status() -> dict:
@@ -372,8 +651,9 @@ async def check_readiness() -> dict:
 # ─── 完整维护工作流 ────────────────────────────────────────────
 
 async def execute_maintenance_workflow(reason: str,
-                                      started_by: int = 0) -> dict:
-    """执行完整维护工作流。
+                                      started_by: int = 0,
+                                      auto_disable: bool = False) -> dict:
+    """R40 P1-6: 执行完整维护工作流(失败保持 enabled)。
 
     步骤:
         1. enable(reason) — 开启维护模式
@@ -381,19 +661,28 @@ async def execute_maintenance_workflow(reason: str,
         3. trigger_backup() — 触发立即备份
         4. run_migration() (可选,占位) — 执行迁移
         5. verify() — 验证系统就绪
-        6. disable() — 关闭维护模式
+        6. disable() — 仅当 auto_disable=True 且全部成功时关闭
+
+    P1-6 修复:
+        - 任何步骤失败时不调用 disable_maintenance,保持 enabled 状态。
+        - 失败原因记录到 maintenance_state.reason + audit_log。
+        - 抛出 RuntimeError 让上层处理(不再静默继续)。
+        - 默认 auto_disable=False,即使全成功也保持 enabled,等待人工确认。
+        - 提供 rollback_maintenance(reason) 人工恢复 API。
 
     Args:
         reason: 维护原因
         started_by: 操作者 admin_id
+        auto_disable: True=全成功时自动 disable;False=保持 enabled 等待人工
 
     Returns:
         {steps: [{name, success, duration_seconds, error}],
-         success: bool, duration_seconds}
+         success: bool, duration_seconds, maintenance_kept_enabled: bool}
     """
     workflow_start = _time.time()
     steps: list[dict] = []
     overall_success = True
+    failure_reason = ""
 
     # 步骤 1: enable
     step_start = _time.time()
@@ -406,57 +695,69 @@ async def execute_maintenance_workflow(reason: str,
         })
         if not ok:
             overall_success = False
+            failure_reason = "enable() 失败"
     except Exception as e:
         overall_success = False
+        failure_reason = f"enable 异常: {e}"
         steps.append({
             "name": "enable", "success": False,
             "duration_seconds": _time.time() - step_start,
             "error": str(e),
         })
 
-    # 步骤 2: drain_queues
-    step_start = _time.time()
-    try:
-        drain_result = await drain_queues(timeout_seconds=300)
-        drained = drain_result.get("drained", False)
-        steps.append({
-            "name": "drain_queues", "success": drained,
-            "duration_seconds": _time.time() - step_start,
-            "error": ("超时未排空" if drain_result.get("timeout")
-                      else ""),
-        })
-        if not drained:
+    # 步骤 2: drain_queues(仅当 enable 成功)
+    if overall_success:
+        step_start = _time.time()
+        try:
+            drain_result = await drain_queues(timeout_seconds=300)
+            drained = drain_result.get("drained", False)
+            steps.append({
+                "name": "drain_queues", "success": drained,
+                "duration_seconds": _time.time() - step_start,
+                "error": ("超时未排空" if drain_result.get("timeout")
+                           else ""),
+            })
+            if not drained:
+                overall_success = False
+                failure_reason = (
+                    f"drain_queues 失败: outbox="
+                    f"{drain_result.get('remaining_outbox', '?')}, "
+                    f"jobs={drain_result.get('remaining_jobs', '?')}"
+                )
+        except Exception as e:
             overall_success = False
-    except Exception as e:
-        overall_success = False
-        steps.append({
-            "name": "drain_queues", "success": False,
-            "duration_seconds": _time.time() - step_start,
-            "error": str(e),
-        })
+            failure_reason = f"drain_queues 异常: {e}"
+            steps.append({
+                "name": "drain_queues", "success": False,
+                "duration_seconds": _time.time() - step_start,
+                "error": str(e),
+            })
 
-    # 步骤 3: trigger_backup
-    step_start = _time.time()
-    try:
-        # 委托给 disaster_recovery 模块(避免循环依赖,延迟导入)
-        from services import disaster_recovery
-        backup_id = await disaster_recovery.trigger_backup()
-        ok = bool(backup_id)
-        steps.append({
-            "name": "trigger_backup", "success": ok,
-            "duration_seconds": _time.time() - step_start,
-            "error": "" if ok else "trigger_backup() 返回空",
-            "backup_id": backup_id,
-        })
-        if not ok:
+    # 步骤 3: trigger_backup(仅当排空成功)
+    if overall_success:
+        step_start = _time.time()
+        try:
+            # 委托给 disaster_recovery 模块(避免循环依赖,延迟导入)
+            from services import disaster_recovery
+            backup_id = await disaster_recovery.trigger_backup()
+            ok = bool(backup_id)
+            steps.append({
+                "name": "trigger_backup", "success": ok,
+                "duration_seconds": _time.time() - step_start,
+                "error": "" if ok else "trigger_backup() 返回空",
+                "backup_id": backup_id,
+            })
+            if not ok:
+                overall_success = False
+                failure_reason = "trigger_backup 失败: 返回空 backup_id"
+        except Exception as e:
             overall_success = False
-    except Exception as e:
-        overall_success = False
-        steps.append({
-            "name": "trigger_backup", "success": False,
-            "duration_seconds": _time.time() - step_start,
-            "error": str(e),
-        })
+            failure_reason = f"trigger_backup 异常: {e}"
+            steps.append({
+                "name": "trigger_backup", "success": False,
+                "duration_seconds": _time.time() - step_start,
+                "error": str(e),
+            })
 
     # 步骤 4: run_migration(占位,可由运维后续扩展)
     step_start = _time.time()
@@ -474,43 +775,173 @@ async def execute_maintenance_workflow(reason: str,
             "error": str(e),
         })
 
-    # 步骤 5: verify
-    step_start = _time.time()
-    try:
-        readiness = await check_readiness()
-        ok = readiness.get("ready", False)
-        steps.append({
-            "name": "verify", "success": ok,
-            "duration_seconds": _time.time() - step_start,
-            "error": "" if ok else f"就绪检查未通过: {readiness}",
-            "readiness": readiness,
-        })
-    except Exception as e:
-        steps.append({
-            "name": "verify", "success": False,
-            "duration_seconds": _time.time() - step_start,
-            "error": str(e),
-        })
+    # 步骤 5: verify(仅当备份成功)
+    if overall_success:
+        step_start = _time.time()
+        try:
+            readiness = await check_readiness()
+            ok = readiness.get("ready", False)
+            steps.append({
+                "name": "verify", "success": ok,
+                "duration_seconds": _time.time() - step_start,
+                "error": "" if ok else f"就绪检查未通过: {readiness}",
+                "readiness": readiness,
+            })
+            if not ok:
+                overall_success = False
+                failure_reason = "verify 就绪检查未通过"
+        except Exception as e:
+            overall_success = False
+            failure_reason = f"verify 异常: {e}"
+            steps.append({
+                "name": "verify", "success": False,
+                "duration_seconds": _time.time() - step_start,
+                "error": str(e),
+            })
 
-    # 步骤 6: disable(无论前面步骤是否成功,都尝试关闭维护模式)
-    step_start = _time.time()
-    try:
-        ok = await disable(ended_by=started_by)
-        steps.append({
-            "name": "disable", "success": ok,
-            "duration_seconds": _time.time() - step_start,
-            "error": "" if ok else "disable() 返回 False",
-        })
-    except Exception as e:
-        steps.append({
-            "name": "disable", "success": False,
-            "duration_seconds": _time.time() - step_start,
-            "error": str(e),
-        })
+    # R40 P1-6: 失败时保持 maintenance enabled
+    maintenance_kept_enabled = False
+    if not overall_success:
+        # 失败 — 不调用 disable,记录失败原因到 audit_log
+        logger.warning(
+            f"[Maintenance] workflow 失败,保持 enabled: reason={failure_reason}"
+        )
+        try:
+            await _write_audit_log(
+                actor_id=started_by,
+                action="maintenance_workflow_failed",
+                target_type="maintenance_state",
+                target_id=str(MAINTENANCE_STATE_ID),
+                details=f"维护工作流失败,保持 enabled: {failure_reason}",
+            )
+        except Exception as log_err:
+            logger.warning(f"[Maintenance] 记录失败原因异常: {log_err}")
+        maintenance_kept_enabled = True
+    else:
+        # 全部成功 — 根据 auto_disable 决定是否关闭
+        if auto_disable:
+            step_start = _time.time()
+            try:
+                ok = await disable(ended_by=started_by)
+                steps.append({
+                    "name": "disable", "success": ok,
+                    "duration_seconds": _time.time() - step_start,
+                    "error": "" if ok else "disable() 返回 False",
+                })
+            except MaintenancePreconditionError as e:
+                # 前置检查未通过(异常情况,workflow 后队列应已排空)
+                steps.append({
+                    "name": "disable", "success": False,
+                    "duration_seconds": _time.time() - step_start,
+                    "error": f"前置检查未通过: {e}",
+                })
+                maintenance_kept_enabled = True
+            except Exception as e:
+                steps.append({
+                    "name": "disable", "success": False,
+                    "duration_seconds": _time.time() - step_start,
+                    "error": str(e),
+                })
+                maintenance_kept_enabled = True
+        else:
+            # 默认保持 enabled,等待人工确认后调用 disable 或 rollback
+            logger.info(
+                "[Maintenance] workflow 全部成功,保持 enabled 等待人工确认 "
+                "(使用 rollback_maintenance 或 disable(force=True) 关闭)"
+            )
+            maintenance_kept_enabled = True
 
     total_duration = _time.time() - workflow_start
     return {
         "steps": steps,
         "success": overall_success,
         "duration_seconds": total_duration,
+        "maintenance_kept_enabled": maintenance_kept_enabled,
+        "failure_reason": failure_reason,
     }
+
+
+async def rollback_maintenance(reason: str, ended_by: int = 0) -> bool:
+    """R40 P1-6: 人工恢复 API — 强制关闭维护模式(跳过前置检查)。
+
+    用于维护工作流失败后,运维确认系统状态后人工恢复。
+    调用方应通过 CommandBus 强制审批门禁(本函数不重复审批)。
+
+    Args:
+        reason: 回滚原因(记入 audit_log)
+        ended_by: 操作者 admin_id
+
+    Returns:
+        True 关闭成功, False 失败
+    """
+    logger.warning(
+        f"[Maintenance] rollback_maintenance: reason={reason} ended_by={ended_by}"
+    )
+    return await disable(ended_by=ended_by, force=True)
+
+
+# ─── R40 P1-8: Bot 入口统一维护检查装饰器 ──────────────────────────
+
+def require_maintenance_check(action: str = "operation"):
+    """R40 P1-8: Bot 高风险入口统一维护模式检查装饰器。
+
+    在命令 handler 入口最外层包装,确保维护模式开启或检查异常时拒绝请求。
+
+    使用方式:
+        @require_maintenance_check(action="上传文件")
+        async def cmd_upload(update, context):
+            ...
+
+    Args:
+        action: 操作描述(用于用户提示消息),如 "上传文件"、"解码文件"
+
+    装饰器行为:
+        - 维护模式开启(is_enabled 返回 True):回复 "系统维护中,{action}暂不可用"
+        - 检查异常(MaintenanceCheckError):回复 "服务暂不可用,请稍后再试"
+        - 维护模式关闭:正常执行原函数
+    """
+
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        async def wrapper(update, context, *args, **kwargs):
+            # R40 P1-7 / P1-8: fail-closed — 维护检查异常时拒绝
+            try:
+                enabled = await is_enabled()
+            except MaintenanceCheckError as e:
+                logger.warning(
+                    f"[Maintenance] require_maintenance_check 拒绝"
+                    f"(check 异常, action={action}): {e}"
+                )
+                try:
+                    await update.message.reply_text(
+                        "服务暂不可用,请稍后再试"
+                    )
+                except Exception:
+                    pass
+                return
+            except Exception as e:
+                # 兜底:其他异常也 fail-closed
+                logger.warning(
+                    f"[Maintenance] require_maintenance_check 异常"
+                    f"(action={action}): {e}"
+                )
+                try:
+                    await update.message.reply_text(
+                        "服务暂不可用,请稍后再试"
+                    )
+                except Exception:
+                    pass
+                return
+            if enabled:
+                try:
+                    await update.message.reply_text(
+                        f"系统维护中,{action}暂不可用"
+                    )
+                except Exception:
+                    pass
+                return
+            return await func(update, context, *args, **kwargs)
+
+        return wrapper
+
+    return decorator

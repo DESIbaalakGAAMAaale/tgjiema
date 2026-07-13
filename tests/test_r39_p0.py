@@ -287,8 +287,11 @@ class TestP04DirtyOutboxTransactional:
     def test_add_dirty_outbox_no_auto_commit_with_connection(self, cache_store_content: str):
         """传入 connection 时不自动 commit(由调用方控制事务)。"""
         # 检查事务模式分支存在
-        assert "connection is not None" in cache_store_content, (
-            "R39 P0-4: add_dirty_outbox 应有 connection 传入时的分支(不自动 commit)"
+        # R40 P0-5: 代码引入 active_tx = tx if tx is not None else connection,
+        # 分支条件改为 active_tx is not None(等价行为,兼容旧 connection 参数)
+        assert "connection is not None" in cache_store_content or \
+               "active_tx is not None" in cache_store_content, (
+            "R39 P0-4: add_dirty_outbox 应有 connection/tx 传入时的分支(不自动 commit)"
         )
         # 检查注释说明
         assert "不自动 commit" in cache_store_content or \

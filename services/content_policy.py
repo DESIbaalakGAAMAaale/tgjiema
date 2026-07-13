@@ -136,8 +136,8 @@ async def check_file(file_meta: FileMeta) -> PolicyResult:
     """检查文件是否符合策略(运行所有已注册插件,任一拒绝即拒绝)。
 
     策略串行执行,首个拒绝立即返回(fail-fast)。
-    插件异常视为允许通过(避免单插件 bug 阻塞全部上传),
-    并记录 warning 日志便于排查。
+    R40 P1-12: 插件异常时按 fail-closed 处理(拒绝上传,而非放行),
+    避免恶意文件因插件 bug 绕过安全检查。
 
     Args:
         file_meta: 待检查文件元数据
@@ -152,11 +152,15 @@ async def check_file(file_meta: FileMeta) -> PolicyResult:
         try:
             result = handler(file_meta)
         except Exception as e:
-            # 插件异常不阻塞上传,记录 warning 便于排查
+            # R40 P1-12: fail-closed — 插件异常时拒绝上传,而非放行
             logger.warning(
-                f"[ContentPolicy] 插件 {name} 异常(忽略,按放行处理): {e}"
+                f"[ContentPolicy] 插件 {name} 异常(按 fail-closed 拒绝): {e}"
             )
-            continue
+            return PolicyResult(
+                allowed=False, policy_name=name,
+                reason="policy_check_failed",
+                metadata={"error": str(e), "plugin": name},
+            )
         if not result.allowed:
             logger.info(
                 f"[ContentPolicy] 文件被拒 file={file_meta.file_name} "
@@ -164,6 +168,38 @@ async def check_file(file_meta: FileMeta) -> PolicyResult:
             )
             return result
     return PolicyResult(allowed=True, policy_name="all_passed")
+
+
+async def check_content_policy(file_meta: FileMeta) -> dict:
+    """R40 P1-12: 检查文件内容策略,返回 dict 格式(fail-closed)。
+
+    包装 check_file 并转换为 dict 格式,便于调用方结构化处理。
+    任何异常(包括 check_file 内部未预期的错误)均按 fail-closed 处理:
+    返回 {"allowed": False, "reason": "policy_check_failed"}。
+
+    Args:
+        file_meta: 待检查文件元数据
+
+    Returns:
+        dict: {
+            "allowed": bool,         # 是否允许通过
+            "reason": str,           # 拒绝原因(allowed=False 时填写)
+            "policy_name": str,      # 拒绝策略名称或 "all_passed"
+            "metadata": dict,        # 附加元数据
+        }
+    """
+    try:
+        result = await check_file(file_meta)
+        return {
+            "allowed": result.allowed,
+            "reason": result.reason,
+            "policy_name": result.policy_name,
+            "metadata": result.metadata,
+        }
+    except Exception as e:
+        # R40 P1-12: fail-closed — 任何未预期异常均拒绝
+        logger.warning(f"[ContentPolicy] check_content_policy 异常: {e}")
+        return {"allowed": False, "reason": "policy_check_failed"}
 
 
 # ─── 内置策略插件 ────────────────────────────────────────────

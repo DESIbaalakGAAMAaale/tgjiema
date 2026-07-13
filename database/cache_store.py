@@ -520,6 +520,22 @@ class CacheStore:
             )
         except Exception as e:
             logger.debug(f"[CacheStore] users_local ADD deleted_at (幂等,可忽略): {e}")
+        # R40 P1-11: users_local 补 ban_expires_at 列(临时封禁自动解封依据)
+        # NULL=永久封禁;非空 ISO 时间=临时封禁到期时间。
+        try:
+            await self._db.execute(
+                "ALTER TABLE users_local ADD COLUMN ban_expires_at TEXT"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] users_local ADD ban_expires_at (幂等,可忽略): {e}")
+        # R40 P2-9: users_local 补 locale 列(用户语言偏好,默认 zh-CN)
+        # 用于 i18n 翻译查找与 Bot 多语言回复
+        try:
+            await self._db.execute(
+                "ALTER TABLE users_local ADD COLUMN locale TEXT DEFAULT 'zh-CN'"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] users_local ADD locale (幂等,可忽略): {e}")
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS external_code_mapping_local (
                 external_code        TEXT PRIMARY KEY,
@@ -736,12 +752,65 @@ class CacheStore:
                 operation   TEXT DEFAULT 'upsert',
                 payload     TEXT,
                 created_at  TEXT,
-                processed   INTEGER DEFAULT 0
+                processed   INTEGER DEFAULT 0,
+                local_only  INTEGER DEFAULT 0
             )"""
         )
+        # R40 P0-5: 为已存在的 dirty_outbox 表添加 local_only 列(幂等)
+        try:
+            await self._db.execute(
+                "ALTER TABLE dirty_outbox ADD COLUMN local_only INTEGER DEFAULT 0"
+            )
+        except Exception:
+            pass  # 列已存在,忽略
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
         )
+
+        # ─── R40 P0-4: pending_uploads SQLite 本地权威表 ───
+        # Up Bot 双写(CRDB + SQLite local),Idx Bot 仅从 SQLite 读取,
+        # 消除 Idx Bot 对 CRDB 凭证的依赖(无 CRDB 凭证时主循环仍可工作)。
+        # processed 状态机: 0=pending(待处理), 1=completed(已完成), 2=claimed(认领中,处理中)
+        # claimed_at: 认领时间戳(0=未认领),用于 CAS 重领(超过 _CLAIM_TIMEOUT 视为崩溃可重领)
+        # dead_reason + dead_count: 失败诊断信息(失败次数 + 原因)
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS pending_uploads_local (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                uploader_id BIGINT,
+                primary_channel_id BIGINT,
+                primary_channel_msg_id BIGINT,
+                file_types  TEXT,
+                batch_msg_ids TEXT,
+                batch_file_meta TEXT,
+                status_msg_id BIGINT DEFAULT 0,
+                created_at  TEXT,
+                processed   INTEGER DEFAULT 0,
+                claimed_at  REAL DEFAULT 0,
+                note        TEXT DEFAULT '',
+                protect_content INTEGER DEFAULT 0,
+                file_ttl_days INTEGER DEFAULT 0,
+                upload_id   TEXT DEFAULT '',
+                dead_reason TEXT DEFAULT '',
+                dead_count  INTEGER DEFAULT 0,
+                crdb_id     INTEGER DEFAULT 0,
+                crdb_synced INTEGER DEFAULT 1
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_uploads_unprocessed ON pending_uploads_local(processed, claimed_at)"
+        )
+        # 为已存在的 pending_uploads_local 补字段(幂等,重复执行报错可忽略)
+        for _col_ddl_p0_4 in [
+            "ALTER TABLE pending_uploads_local ADD COLUMN dead_reason TEXT DEFAULT ''",
+            "ALTER TABLE pending_uploads_local ADD COLUMN dead_count INTEGER DEFAULT 0",
+            "ALTER TABLE pending_uploads_local ADD COLUMN upload_id TEXT DEFAULT ''",
+            "ALTER TABLE pending_uploads_local ADD COLUMN crdb_id INTEGER DEFAULT 0",
+            "ALTER TABLE pending_uploads_local ADD COLUMN crdb_synced INTEGER DEFAULT 1",
+        ]:
+            try:
+                await self._db.execute(_col_ddl_p0_4)
+            except Exception as _e_p0_4:
+                logger.debug(f"[CacheStore] pending_uploads_local ALTER 升级(可忽略): {_e_p0_4}")
 
         # ─── R40: 统一任务中心(tasks) ───
         await self._db.execute(
@@ -814,9 +883,17 @@ class CacheStore:
                 type       TEXT NOT NULL,
                 payload    TEXT,
                 is_read    INTEGER DEFAULT 0,
-                created_at TEXT
+                created_at TEXT,
+                read_at    TEXT
             )"""
         )
+        # R40 P2-4: 旧库补 read_at 列(用于 Prometheus 通知投递延迟指标)
+        try:
+            await self._db.execute(
+                "ALTER TABLE notifications ADD COLUMN read_at TEXT"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] notifications ADD read_at (幂等,可忽略): {e}")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, is_read)"
         )
@@ -972,46 +1049,42 @@ class CacheStore:
     async def add_dirty_outbox(
         self, table_name: str, pk: str, operation: str = "upsert",
         payload: str | None = None, version: int = 0,
-        connection: Any = None,
+        connection: Any = None, tx: Any = None,
     ) -> int:
-        """R38 P1-2 + R39 P0-4: 写入 dirty_outbox 一条变更记录。
+        """R38 P1-2 + R39 P0-4 + R40 P0-5: 写入 dirty_outbox 一条变更记录。
+
+        R40 P0-5 变更:
+          - 失败时抛出异常(不再仅 warning),让上层 UnitOfWork 捕获并回滚整个事务,
+            避免业务表已提交但 dirty_outbox 写入丢失的"半提交"问题。
+          - 新增 tx 别名参数(等价于 connection),便于与 UnitOfWork.transaction() 配合。
 
         Args:
-            table_name: 受影响表名(如 file_records_local / codes_local)
+            table_name: 受影响表名(如 file_records_local / codes_local / tasks / approvals)
             pk: 行主键值(字符串)
             operation: 'upsert'(默认) 或 'tombstone'(软删除)
             payload: 可选 JSON 序列化后的载荷(行快照或变更字段)
             version: 单调递增版本号(用于 CRDB UPSERT 条件)
             connection: R39 P0-4 可选事务连接,传入时不自动 commit
                 (由调用方在同一事务内控制 commit/rollback,确保与业务表更新原子性)
+            tx: R40 P0-5 connection 的别名(与 connection 等价,优先使用 tx)
 
         Returns:
-            新插入行 id;失败返回 0
+            新插入行 id;失败抛出异常(不再返回 0)
+
+        Raises:
+            RuntimeError: CacheStore 未初始化
+            Exception: INSERT 失败时透传底层异常,由上层事务回滚
         """
-        # R39 P0-4: 事务发件箱模式 — 若调用方传入 connection,
+        # R40 P0-5: tx 别名,优先使用 tx(向后兼容 connection 参数)
+        if tx is not None:
+            connection = tx
+        # R39 P0-4 + R40 P0-5: 事务发件箱模式 — 若调用方传入 connection/tx,
         # 则使用该连接(不自动 commit),确保 dirty_outbox 写入与业务表更新
         # 在同一事务内原子提交/回滚,避免半提交导致数据不一致。
+        # R40 P0-5: 失败时抛异常(而非仅 warning),让上层 UnitOfWork 回滚。
         if connection is not None:
-            try:
-                cursor = await connection.execute(
-                    """INSERT INTO dirty_outbox
-                       (table_name, pk, version, operation, payload, created_at, processed)
-                       VALUES (?, ?, ?, ?, ?, ?, 0)""",
-                    (
-                        table_name, pk, version, operation, payload,
-                        datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
-                    ),
-                )
-                # 不调用 commit,由调用方控制事务
-                return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-            except Exception as e:
-                logger.warning(f"[CacheStore] add_dirty_outbox(事务模式) 失败: {e}")
-                return 0
-        # 兼容模式: 无 connection 时自动 commit(向后兼容旧调用方)
-        if not self._db:
-            return 0
-        try:
-            cursor = await self._db.execute(
+            # 不调用 commit,由调用方控制事务;失败抛异常让上层回滚
+            cursor = await connection.execute(
                 """INSERT INTO dirty_outbox
                    (table_name, pk, version, operation, payload, created_at, processed)
                    VALUES (?, ?, ?, ?, ?, ?, 0)""",
@@ -1020,11 +1093,57 @@ class CacheStore:
                     datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
                 ),
             )
-            await self._db.commit()
             return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-        except Exception as e:
-            logger.warning(f"[CacheStore] add_dirty_outbox 失败: {e}")
-            return 0
+        # 兼容模式: 无 connection/tx 时自动 commit(向后兼容旧调用方)
+        # R40 P0-5: 失败时抛异常,而非返回 0 让调用方误以为成功
+        if not self._db:
+            raise RuntimeError(
+                "[CacheStore] add_dirty_outbox 失败: CacheStore 未初始化(_db is None)"
+            )
+        cursor = await self._db.execute(
+            """INSERT INTO dirty_outbox
+               (table_name, pk, version, operation, payload, created_at, processed)
+               VALUES (?, ?, ?, ?, ?, ?, 0)""",
+            (
+                table_name, pk, version, operation, payload,
+                datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
+            ),
+        )
+        await self._db.commit()
+        return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+
+    @asynccontextmanager
+    async def transaction(self):
+        """R40 P0-5: 事务上下文管理器 — 业务表 + audit_log + dirty_outbox 同事务。
+
+        用法:
+            async with store.transaction() as tx:
+                await tx.execute("INSERT INTO ...")
+                await store.add_dirty_outbox("table", "pk", connection=tx)
+            # 退出时自动 COMMIT(或异常时 ROLLBACK)
+
+        内部基于 aiosqlite.Connection 的 BEGIN/COMMIT/ROLLBACK。
+        业务代码在事务上下文中不得再调用 store._db.commit()(由本管理器统一控制)。
+        """
+        if not self._db:
+            raise RuntimeError("[CacheStore] transaction 失败: _db 未初始化")
+        try:
+            await self._db.execute("BEGIN")
+        except Exception as begin_err:
+            # 已处于事务中: 复用现有事务(不重新 BEGIN,也不主动 COMMIT)
+            logger.debug(
+                f"[CacheStore] transaction BEGIN 失败(复用现有事务): {begin_err}"
+            )
+        try:
+            yield self._db
+        except Exception:
+            try:
+                await self._db.rollback()
+            except Exception as rollback_err:
+                logger.warning(f"[CacheStore] transaction rollback 失败: {rollback_err}")
+            raise
+        else:
+            await self._db.commit()
 
     async def get_dirty_outbox_batch(self, limit: int = 100) -> list[dict]:
         """R38 P1-2: 拉取一批未处理的 dirty_outbox 记录(processed=0)。
@@ -1057,6 +1176,269 @@ class CacheStore:
             logger.warning(f"[CacheStore] get_dirty_outbox_batch 失败: {e}")
             return []
 
+    # ─── R40 P0-4: pending_uploads_local SQLite 权威方法 ───
+    # Up Bot 调用 insert_pending_upload_local 双写(CRDB + SQLite local),
+    # Idx Bot 调用 claim_pending_uploads CAS 认领 + complete/fail 推进状态。
+    # 消除 Idx Bot 对 CRDB 凭证的依赖(无 CRDB 时主循环仍可工作)。
+
+    async def insert_pending_upload_local(self, record: dict, mark_dirty: bool = False) -> int:
+        """R40 P0-4: 写入 pending_uploads_local(Up Bot 双写时调用)。
+
+        Args:
+            record: pending_upload 字段字典,需包含 uploader_id / primary_channel_id /
+                    primary_channel_msg_id / file_types / batch_msg_ids / batch_file_meta /
+                    note / protect_content / file_ttl_days / upload_id
+            mark_dirty: 是否标记需要同步到 CRDB。默认 False(Up Bot 直写 CRDB,
+                        crdb_synced=1 表示已同步);True 则入 dirty_outbox 由 crdb_sync 同步
+
+        Returns:
+            新插入行的 id;失败返回 0
+        """
+        if not self._db:
+            return 0
+        import json as _json_pu
+        from datetime import datetime as _dt_pu
+        def _serialize_pu(val):
+            if val is None:
+                return None
+            if isinstance(val, _dt_pu):
+                return val.isoformat()
+            if isinstance(val, (list, dict)):
+                return _json_pu.dumps(val, default=str)
+            return val
+        try:
+            cursor = await self._db.execute(
+                """INSERT INTO pending_uploads_local
+                   (uploader_id, primary_channel_id, primary_channel_msg_id,
+                    file_types, batch_msg_ids, batch_file_meta, status_msg_id,
+                    created_at, processed, claimed_at, note, protect_content,
+                    file_ttl_days, upload_id, dead_reason, dead_count,
+                    crdb_id, crdb_synced)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, '', 0, 0, ?)""",
+                (
+                    record.get("uploader_id"),
+                    record.get("primary_channel_id"),
+                    record.get("primary_channel_msg_id"),
+                    _serialize_pu(record.get("file_types")),
+                    record.get("batch_msg_ids", ""),
+                    _serialize_pu(record.get("batch_file_meta")),
+                    int(record.get("status_msg_id", 0) or 0),
+                    record.get("created_at") or _dt_pu.now().isoformat(),
+                    record.get("note", ""),
+                    int(bool(record.get("protect_content", False))),
+                    int(record.get("file_ttl_days", 0) or 0),
+                    record.get("upload_id", ""),
+                    1 if not mark_dirty else 0,
+                ),
+            )
+            new_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            if not self._in_writer_tx:
+                await self._db.commit()
+            if mark_dirty and new_id:
+                # 通过 dirty_outbox 让 crdb_sync 同步到 CRDB
+                try:
+                    payload = _json_pu.dumps(record, default=str)
+                    if isinstance(payload, bytes):
+                        payload = payload.decode()
+                    await self.add_dirty_outbox(
+                        "pending_uploads", str(new_id), "upsert", payload,
+                    )
+                except Exception as outbox_err:
+                    logger.warning(
+                        f"[CacheStore] insert_pending_upload_local add_dirty_outbox 失败 id={new_id}: {outbox_err}"
+                    )
+            return new_id
+        except Exception as e:
+            logger.warning(f"[CacheStore] insert_pending_upload_local 失败: {e}")
+            if self._in_writer_tx:
+                raise
+            return 0
+
+    async def claim_pending_uploads(self, cutoff_ts: float, limit: int = 10) -> list[dict]:
+        """R40 P0-4: CAS 认领一批未处理的 pending_uploads 记录。
+
+        在 BEGIN IMMEDIATE 事务中执行 SELECT + UPDATE,
+        保证多 worker 并发时每条记录只被一个 worker 认领。
+        不依赖 SQLite 3.35+ 的 RETURNING 语法,兼容所有 SQLite 版本。
+
+        Args:
+            cutoff_ts: 时间戳,claimed_at 早于此值(或为 0)的记录才能被认领。
+                常用 time.time() - 300(5 分钟超时)。
+            limit: 单批最大认领数,默认 10。
+
+        Returns:
+            认领成功的记录列表(已设置 processed=2, claimed_at=now)。
+        """
+        if not self._db:
+            return []
+        now = time.time()
+        # pending_uploads_local 列名(用于 SELECT 结果转 dict)
+        col_names = [
+            "id", "uploader_id", "primary_channel_id", "primary_channel_msg_id",
+            "file_types", "batch_msg_ids", "batch_file_meta", "status_msg_id",
+            "created_at", "processed", "claimed_at", "note", "protect_content",
+            "file_ttl_days", "upload_id", "dead_reason", "dead_count",
+        ]
+        for attempt in range(3):
+            try:
+                # 如果不在 writer_transaction 中,自己开启 BEGIN IMMEDIATE
+                # 保证 SELECT + UPDATE 原子性(其他写操作会等待)
+                own_tx = False
+                if not self._in_writer_tx:
+                    await self._db.execute("BEGIN IMMEDIATE")
+                    own_tx = True
+                try:
+                    # SELECT 待认领的记录(获取完整字段)
+                    cursor = await self._db.execute(
+                        f"""SELECT {', '.join(col_names)}
+                           FROM pending_uploads_local
+                           WHERE processed = 0 AND (claimed_at < ? OR claimed_at = 0)
+                           ORDER BY id ASC LIMIT ?""",
+                        (cutoff_ts, limit),
+                    )
+                    rows = await cursor.fetchall()
+                    if not rows:
+                        if own_tx:
+                            await self._db.execute("COMMIT")
+                        return []
+                    # UPDATE 认领状态(processed=2, claimed_at=now)
+                    ids = [r[0] for r in rows]  # id 是第一列
+                    placeholders = ",".join("?" * len(ids))
+                    await self._db.execute(
+                        f"UPDATE pending_uploads_local SET processed = 2, claimed_at = ? "
+                        f"WHERE id IN ({placeholders})",
+                        (now, *ids),
+                    )
+                    if own_tx:
+                        await self._db.execute("COMMIT")
+                    # 转换为 dict 列表,手动更新 processed 和 claimed_at
+                    # (SELECT 返回的是旧值 processed=0,UPDATE 后才是 processed=2)
+                    import json as _json_claim
+                    result: list[dict] = []
+                    for r in rows:
+                        row_dict = dict(zip(col_names, r))
+                        row_dict["processed"] = 2
+                        row_dict["claimed_at"] = now
+                        # 反序列化 JSON 字段(与 _deserialize_sqlite_row 行为一致)
+                        if row_dict.get("file_types") and isinstance(row_dict["file_types"], str):
+                            try:
+                                row_dict["file_types"] = _json_claim.loads(row_dict["file_types"])
+                            except Exception:
+                                pass
+                        if row_dict.get("batch_file_meta") and isinstance(row_dict["batch_file_meta"], str):
+                            try:
+                                row_dict["batch_file_meta"] = _json_claim.loads(row_dict["batch_file_meta"])
+                            except Exception:
+                                pass
+                        result.append(row_dict)
+                    return result
+                except Exception:
+                    if own_tx:
+                        try:
+                            await self._db.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                    raise
+            except Exception as e:
+                if "locked" in str(e).lower() and attempt < 2:
+                    await asyncio.sleep(0.3)
+                    continue
+                if self._in_writer_tx:
+                    raise
+                logger.warning(f"[CacheStore] claim_pending_uploads 失败: {e}")
+                return []
+
+    async def complete_pending_upload(self, upload_id: int) -> bool:
+        """R40 P0-4: 标记 pending_upload 为已完成(processed=1, claimed_at=0)。
+
+        应在 file_records_local + codes_local + dirty_outbox 全部成功写入后调用,
+        与上述写入在同事务(writer_transaction 上下文)中执行以确保原子性。
+
+        Args:
+            upload_id: pending_uploads_local.id
+
+        Returns:
+            True 表示标记成功(rowcount>0);False 表示未匹配到行(已被其他 worker 处理或不存在)。
+        """
+        if not self._db:
+            return False
+        try:
+            cursor = await self._db.execute(
+                "UPDATE pending_uploads_local SET processed = 1, claimed_at = 0 WHERE id = ?",
+                (upload_id,),
+            )
+            if not self._in_writer_tx:
+                await self._db.commit()
+            return bool(cursor and cursor.rowcount > 0)
+        except Exception as e:
+            if self._in_writer_tx:
+                raise
+            logger.warning(f"[CacheStore] complete_pending_upload 失败 id={upload_id}: {e}")
+            return False
+
+    async def fail_pending_upload(self, upload_id: int, reason: str = "") -> bool:
+        """R40 P0-4: 标记 pending_upload 处理失败,回滚到 processed=0 允许下轮重领。
+
+        应在 file_records_local + codes_local 写入失败时调用(事务中),让整个事务 ROLLBACK
+        会自动回滚 claimed_at=now 的更新;但若事务外调用,本方法独立回滚状态。
+
+        记录 dead_reason + dead_count++ 便于诊断连续失败的记录。
+
+        Args:
+            upload_id: pending_uploads_local.id
+            reason: 失败原因(可选,用于诊断)
+
+        Returns:
+            True 表示回滚成功;False 表示未匹配到行或失败。
+        """
+        if not self._db:
+            return False
+        try:
+            cursor = await self._db.execute(
+                "UPDATE pending_uploads_local SET processed = 0, claimed_at = 0, "
+                "dead_reason = ?, dead_count = dead_count + 1 WHERE id = ?",
+                (reason, upload_id),
+            )
+            if not self._in_writer_tx:
+                await self._db.commit()
+            return bool(cursor and cursor.rowcount > 0)
+        except Exception as e:
+            if self._in_writer_tx:
+                raise
+            logger.warning(f"[CacheStore] fail_pending_upload 失败 id={upload_id}: {e}")
+            return False
+
+    async def reset_stale_claims(self, claim_timeout_seconds: float = 300.0) -> int:
+        """R40 P0-4: 重置超时的 claimed(processed=2)记录回 pending(processed=0)。
+
+        场景: Idx Bot worker 崩溃后,claimed_at 已过期的记录需要被重新认领。
+        由 _process_pending_uploads 调用(或独立维护任务定期清理)。
+
+        Args:
+            claim_timeout_seconds: 认领超过此秒数视为崩溃,默认 300(5 分钟)。
+
+        Returns:
+            被重置的记录数。
+        """
+        if not self._db:
+            return 0
+        now = time.time()
+        cutoff = now - claim_timeout_seconds
+        try:
+            cursor = await self._db.execute(
+                "UPDATE pending_uploads_local SET processed = 0, claimed_at = 0 "
+                "WHERE processed = 2 AND claimed_at < ? AND claimed_at > 0",
+                (cutoff,),
+            )
+            if not self._in_writer_tx:
+                await self._db.commit()
+            return cursor.rowcount if cursor else 0
+        except Exception as e:
+            if self._in_writer_tx:
+                raise
+            logger.warning(f"[CacheStore] reset_stale_claims 失败: {e}")
+            return 0
+
     async def mark_dirty_processed(self, ids: list[int]) -> int:
         """R38 P1-2: 标记 dirty_outbox 记录为已处理(processed=1)。
 
@@ -1078,6 +1460,32 @@ class CacheStore:
             return cursor.rowcount if cursor else 0
         except Exception as e:
             logger.warning(f"[CacheStore] mark_dirty_processed 失败: {e}")
+            return 0
+
+    async def mark_dirty_local_only(self, ids: list[int]) -> int:
+        """R40 P0-5: 标记 dirty_outbox 记录为 local_only + processed(跳过 CRDB 同步)。
+
+        用于 local_only 表(tasks/collections/notifications/audit_log 等),
+        这些表仅存在于 SQLite 本地,不需要同步到 CRDB。
+
+        Args:
+            ids: 已处理的 dirty_outbox.id 列表
+
+        Returns:
+            实际标记的行数
+        """
+        if not self._db or not ids:
+            return 0
+        try:
+            placeholders = ",".join("?" * len(ids))
+            cursor = await self._db.execute(
+                f"UPDATE dirty_outbox SET processed = 1, local_only = 1 WHERE id IN ({placeholders})",
+                ids,
+            )
+            await self._db.commit()
+            return cursor.rowcount if cursor else 0
+        except Exception as e:
+            logger.warning(f"[CacheStore] mark_dirty_local_only 失败: {e}")
             return 0
 
     async def count_unprocessed_dirty_outbox(self) -> int:
@@ -1729,29 +2137,50 @@ class CacheStore:
     # ─── 用户配额本地存储：Idx Bot 读写零 RU ───
 
     async def get_user_quota(self, user_id: int) -> dict | None:
-        """从 SQLite 读取用户配额。未找到返回 None。"""
+        """从 SQLite 读取用户配额。未找到返回 None。
+
+        R40 P1-12: 查询异常时 fail-closed 返回 0 配额 dict(拒绝操作,而非放行)。
+        """
         if not self._db:
             return None
-        rows = await self._db.execute_fetchall(
-            "SELECT user_id, level, daily_quota, used_today, quota_date, "
-            "ext_quota, ext_used_today, ext_quota_date, synced_at "
-            "FROM user_quota WHERE user_id = ?",
-            (user_id,),
-        )
-        if not rows:
-            return None
-        r = rows[0]
-        return {
-            "user_id": r[0],
-            "level": r[1],
-            "daily_quota": r[2],
-            "used_today": r[3],
-            "quota_date": r[4],
-            "ext_quota": r[5],
-            "ext_used_today": r[6],
-            "ext_quota_date": r[7],
-            "synced_at": r[8],
-        }
+        try:
+            rows = await self._db.execute_fetchall(
+                "SELECT user_id, level, daily_quota, used_today, quota_date, "
+                "ext_quota, ext_used_today, ext_quota_date, synced_at "
+                "FROM user_quota WHERE user_id = ?",
+                (user_id,),
+            )
+            if not rows:
+                return None
+            r = rows[0]
+            return {
+                "user_id": r[0],
+                "level": r[1],
+                "daily_quota": r[2],
+                "used_today": r[3],
+                "quota_date": r[4],
+                "ext_quota": r[5],
+                "ext_used_today": r[6],
+                "ext_quota_date": r[7],
+                "synced_at": r[8],
+            }
+        except Exception as e:
+            # R40 P1-12: fail-closed — 查询异常时返回 0 配额 dict,拒绝操作
+            logger.warning(
+                f"[CacheStore] get_user_quota 查询异常 user_id={user_id}: {e},"
+                f"按 fail-closed 返回 0 配额"
+            )
+            return {
+                "user_id": user_id,
+                "level": "free",
+                "daily_quota": 0,
+                "used_today": 0,
+                "quota_date": "",
+                "ext_quota": 0,
+                "ext_used_today": 0,
+                "ext_quota_date": "",
+                "synced_at": 0,
+            }
 
     async def upsert_user_quota(self, user_id: int, data: dict):
         """写入或更新用户配额到 SQLite。"""
@@ -2572,17 +3001,35 @@ class CacheStore:
     async def append_quota_ledger(
         self, user_id: int, event_type: str, is_external: int = 0,
         quota_before: int | None = None, quota_after: int | None = None,
-        request_id: str = "", reason: str = "",
+        request_id: str = "", reason: str = "", tx=None,
     ) -> None:
         """追加配额变更流水(INSERT,自增主键)。
+
+        R40 P0-5: 支持 tx 参数(同事务写入),不自动 commit。
 
         Args:
             event_type: consume/refund/sync/reset/expire
             request_id: 业务幂等键(可选,用于去重检查)
+            tx: 事务连接(aiosqlite.Connection),传入时不自动 commit
         """
         if not self._db:
             return
         now = time.time()
+        # R40 P0-5: 有 tx 时直接写入,不自动 commit(由外层事务统一控制)
+        if tx is not None:
+            try:
+                await tx.execute(
+                    "INSERT INTO quota_ledger "
+                    "(user_id, event_type, is_external, quota_before, quota_after, "
+                    " request_id, reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, event_type, is_external, quota_before, quota_after,
+                     request_id or None, reason or None, now),
+                )
+            except Exception as e:
+                logger.warning(f"[CacheStore] append_quota_ledger(tx) 失败: {e}")
+                raise
+            return
         for attempt in range(3):
             try:
                 await self._db.execute(
@@ -4731,6 +5178,17 @@ class CacheStore:
              int(record.get("is_collection", 0) or 0), record.get("collection_codes", "[]") or "[]",
              synced),
         )
+        # R40 P0-5: dirty_outbox 写入同事务(在 commit 之前,确保原子性)
+        if mark_dirty:
+            try:
+                _fr_payload = _json.dumps(record, default=str)
+                if isinstance(_fr_payload, bytes):
+                    _fr_payload = _fr_payload.decode()
+                await self.add_dirty_outbox(
+                    "file_records", record.get("file_code", ""), "upsert", _fr_payload,
+                )
+            except Exception as _e:
+                logger.warning(f"[CacheStore] upsert_file_record_local dirty_outbox 失败: {_e}")
         if not _batch:
             await self._db.commit()
 
@@ -4855,6 +5313,17 @@ class CacheStore:
              record.get("created_at"), record.get("expire_time"), record.get("note", ""),
              synced),
         )
+        # R40 P0-5: dirty_outbox 写入同事务(在 commit 之前,确保原子性)
+        if mark_dirty:
+            try:
+                _ce_payload = _json.dumps(record, default=str)
+                if isinstance(_ce_payload, bytes):
+                    _ce_payload = _ce_payload.decode()
+                await self.add_dirty_outbox(
+                    "codes", record.get("code", ""), "upsert", _ce_payload,
+                )
+            except Exception as _e:
+                logger.warning(f"[CacheStore] upsert_code_local dirty_outbox 失败: {_e}")
         if not _batch:
             await self._db.commit()
 
@@ -4899,14 +5368,15 @@ class CacheStore:
                 r.get("external_used_today", 0), r.get("external_quota_date"),
                 r.get("is_banned", 0), r.get("created_at"), r.get("updated_at"),
                 1,  # crdb_synced=1
+                r.get("ban_expires_at"),
             ))
         await self._db.executemany(
             """INSERT OR REPLACE INTO users_local
             (user_id, username, first_name, membership_level, daily_decode_quota,
              quota_used_today, quota_date, can_upload, external_decode_quota,
              external_used_today, external_quota_date, is_banned,
-             created_at, updated_at, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             created_at, updated_at, crdb_synced, ban_expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             records,
         )
         await self._db.commit()
@@ -4918,7 +5388,7 @@ class CacheStore:
             """SELECT user_id, username, first_name, membership_level,
                       daily_decode_quota, quota_used_today, quota_date, can_upload,
                       external_decode_quota, external_used_today, external_quota_date,
-                      is_banned, created_at, updated_at
+                      is_banned, created_at, updated_at, ban_expires_at
                FROM users_local WHERE user_id = ?""",
             (user_id,),
         )
@@ -4932,6 +5402,7 @@ class CacheStore:
             "external_decode_quota": r[8], "external_used_today": r[9],
             "external_quota_date": r[10], "is_banned": r[11],
             "created_at": r[12], "updated_at": r[13],
+            "ban_expires_at": r[14],
         }
 
     async def upsert_user_local(self, user: dict, mark_dirty: bool = True, _batch: bool = False):
@@ -4943,15 +5414,15 @@ class CacheStore:
             (user_id, username, first_name, membership_level, daily_decode_quota,
              quota_used_today, quota_date, can_upload, external_decode_quota,
              external_used_today, external_quota_date, is_banned,
-             created_at, updated_at, crdb_synced)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             created_at, updated_at, crdb_synced, ban_expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (user.get("user_id"), user.get("username"), user.get("first_name"),
              user.get("membership_level", "free"), user.get("daily_decode_quota", 3),
              user.get("quota_used_today", 0), user.get("quota_date"),
              user.get("can_upload", 0), user.get("external_decode_quota", 0),
              user.get("external_used_today", 0), user.get("external_quota_date"),
              user.get("is_banned", 0), user.get("created_at"), user.get("updated_at"),
-             synced),
+             synced, user.get("ban_expires_at")),
         )
         if not _batch:
             await self._db.commit()
@@ -4963,7 +5434,7 @@ class CacheStore:
             """SELECT user_id, username, first_name, membership_level,
                       daily_decode_quota, quota_used_today, quota_date, can_upload,
                       external_decode_quota, external_used_today, external_quota_date,
-                      is_banned, created_at, updated_at
+                      is_banned, created_at, updated_at, ban_expires_at
                FROM users_local WHERE crdb_synced = 0 LIMIT ?""",
             (limit,),
         )
@@ -4974,6 +5445,7 @@ class CacheStore:
             "external_decode_quota": r[8], "external_used_today": r[9],
             "external_quota_date": r[10], "is_banned": r[11],
             "created_at": r[12], "updated_at": r[13],
+            "ban_expires_at": r[14],
         } for r in rows]
 
     async def mark_user_synced(self, user_id: int):

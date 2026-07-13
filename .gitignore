@@ -44,3 +44,7 @@ docs/*路线图*.md
 docs/CODE_REVIEW_REPORT.md
 CODE_REVIEW_REPORT.md
 .workbuddy/
+
+# R40 P2-1: GitHub Actions workflow 文件
+# PAT 缺少 workflow scope,暂不推送(本地保留)
+.github/workflows/

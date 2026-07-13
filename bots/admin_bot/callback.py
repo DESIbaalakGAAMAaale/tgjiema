@@ -553,9 +553,9 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
 
     # 先给用户一个"正在恢复"的反馈
     mode_label = "增量补充" if merge else "覆盖恢复"
-    await query.edit_message_text(f"⏳ 正在从 R2 下载备份并{mode_label}数据库,请稍候...")
+    await query.edit_message_text(f"⏳ 正在提交{mode_label}恢复请求,请稍候...")
 
-    from services.db_backup import list_backups, restore_from_backup
+    from services.db_backup import list_backups
     try:
         backups = await list_backups()
     except Exception as e:
@@ -567,48 +567,51 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     key = backups[seq - 1].get("key", "")
-    logger.info(f"[Admin][restore] 开始恢复: key={key}, tables={tables}, merge={merge}, 操作者={user.id}")
+    logger.info(f"[Admin][restore] 开始提交恢复审批: key={key}, tables={tables}, merge={merge}, 操作者={user.id}")
 
+    # R40 P0-8: 通过 CommandBus 强制 RBAC + 审批门禁(灾备恢复必须审批)
+    # 审批通过后,approval_workflow 会自动触发 execute_approved_action 执行实际恢复
+    from services.command_bus import (
+        CommandBus, AdminPrincipal as CBPrincipal, make_restore_backup_command,
+    )
+    cb_principal = CBPrincipal(id=user.id, name=user.username or "", source="bot")
+    command = make_restore_backup_command(
+        backup_id=key, tables=tables, merge=merge,
+    )
+    bus = CommandBus()
     try:
-        result = await restore_from_backup(key, tables, merge=merge)
+        result = await bus.execute(command, cb_principal)
     except Exception as e:
-        logger.error(f"[Admin][restore] 恢复失败: {e}")
+        logger.error(f"[Admin][restore] 提交恢复审批失败: {e}")
         await query.edit_message_text(
-            f"❌ 恢复失败: {e}\n\n备份文件: `{key}`",
+            f"❌ 提交恢复审批失败: {e}\n\n备份文件: `{key}`",
             reply_markup=back_kb,
         )
         return
 
-    # 构造恢复结果摘要
-    restored = result.get("restored", {})
-    skipped = result.get("skipped", [])
-    errors = result.get("errors", [])
+    if result.approval_required:
+        # 灾备恢复必须审批,告知用户审批 ID
+        await query.edit_message_text(
+            f"⏳ {mode_label}恢复已提交审批,审批通过后自动执行\n\n"
+            f"审批 ID: {result.approval_id}\n"
+            f"备份文件: `{key}`\n"
+            f"恢复模式: {mode_label}\n"
+            f"操作者: {user.id}",
+            reply_markup=back_kb,
+        )
+        return
 
-    lines = ["✅ 数据库恢复完成\n"]
-    lines.append(f"📁 备份文件: `{key}`\n")
-
-    if restored:
-        lines.append("恢复的表:")
-        total_rows = 0
-        for tbl, cnt in restored.items():
-            lines.append(f"  • {tbl}: {cnt} 行")
-            total_rows += cnt
-        lines.append(f"\n共恢复 {len(restored)} 个表, {total_rows} 行")
-
-    if skipped:
-        lines.append(f"\n⚠️ 跳过的表: {', '.join(skipped)}")
-
-    if errors:
-        lines.append(f"\n❌ 错误 ({len(errors)} 个):")
-        for err in errors[:5]:  # 只显示前5个错误
-            lines.append(f"  • {err}")
-        if len(errors) > 5:
-            lines.append(f"  ...等 {len(errors)} 个错误")
-
-    lines.append("\n💡 建议:重启相关 Bot 服务以加载恢复的数据")
-    lines.append(f"  systemctl restart tgjiema.target")
-
-    await query.edit_message_text("\n".join(lines), reply_markup=back_kb)
+    if result.success:
+        # 不应到达此处(restore_backup 必须审批),但保持健壮性
+        await query.edit_message_text(
+            f"✅ 恢复已执行\n\n备份文件: `{key}`",
+            reply_markup=back_kb,
+        )
+    else:
+        await query.edit_message_text(
+            f"❌ 提交恢复审批失败: {result.error}\n\n备份文件: `{key}`",
+            reply_markup=back_kb,
+        )
 
 
 # ─── 文件删除二次确认处理 ──────────────────────────────────────────
