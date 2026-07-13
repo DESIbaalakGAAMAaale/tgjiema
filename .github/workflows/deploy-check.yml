@@ -1,0 +1,176 @@
+name: Deploy Check
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'deploy_vps_per_bot.sh'
+      - 'docker-compose.yml'
+      - 'config/services.yaml'
+      - '.github/workflows/**'
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  verify-deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install PyYAML
+      run: pip install pyyaml
+
+    - name: Verify services.yaml consistency
+      run: |
+        python -c "
+        import yaml
+        with open('config/services.yaml') as f:
+            data = yaml.safe_load(f)
+        services = data.get('services', [])
+        names = [s['name'] for s in services]
+        print('services.yaml 服务清单:', names)
+        # 必需服务
+        required = {'migration', 'db_writer', 'crdb_sync', 'up', 'idx', 'dsp', 'mon', 'admin_bot', 'admin', 'db_backup'}
+        missing = required - set(names)
+        assert not missing, f'services.yaml 缺少服务: {missing}'
+        # crdb_sync 必须存在(R36 §6.3)
+        assert 'crdb_sync' in names, 'services.yaml 必须包含 crdb_sync 服务(R36 §6.3)'
+        # migration 必须是 oneshot
+        migration = [s for s in services if s['name'] == 'migration'][0]
+        assert migration.get('is_oneshot') is True, 'migration 必须是 oneshot'
+        print('services.yaml 校验通过')
+        "
+
+    - name: Verify docker-compose services
+      run: |
+        python -c "
+        import yaml
+        with open('docker-compose.yml') as f:
+            data = yaml.safe_load(f)
+        compose_services = set(data.get('services', {}).keys())
+        print('docker-compose 服务清单:', sorted(compose_services))
+        # 必需服务(不含 redis 基础设施)
+        required = {'migration', 'db_writer', 'crdb_sync', 'up', 'idx', 'dsp', 'mon', 'admin_bot', 'admin', 'db_backup'}
+        missing = required - compose_services
+        assert not missing, f'docker-compose.yml 缺少服务: {missing}'
+        # 每个业务服务必须使用最小 secrets(env_file 包含 .env.secrets.<name>)
+        for svc in ['up', 'idx', 'dsp', 'mon', 'admin_bot', 'admin', 'db_backup', 'crdb_sync']:
+            svc_def = data['services'][svc]
+            env_files = svc_def.get('env_file', [])
+            has_shared = any('.env.shared' in ef for ef in env_files)
+            assert has_shared, f'{svc} 必须加载 .env.shared'
+        print('docker-compose.yml 校验通过')
+        "
+
+    - name: Verify secrets isolation
+      run: |
+        # 验证 deploy_vps_per_bot.sh 不加载完整 .env
+        if grep -qE 'EnvironmentFile=.*\.env[^.]' deploy_vps_per_bot.sh; then
+          echo "ERROR: Found complete .env loading in service file"
+          exit 1
+        fi
+        echo "Secrets isolation OK"
+
+    - name: Verify systemd services
+      run: |
+        # 验证 deploy_vps_per_bot.sh 包含所有必需服务
+        for svc in migration db_writer crdb_sync up idx dsp mon admin_bot admin db_backup; do
+          if ! grep -q "tgjiema-${svc}" deploy_vps_per_bot.sh; then
+            echo "ERROR: Missing systemd service tgjiema-${svc}"
+            exit 1
+          fi
+          echo "OK: tgjiema-${svc} found"
+        done
+        # 验证 migration 是 oneshot
+        if ! grep -q "Type=oneshot" deploy_vps_per_bot.sh; then
+          echo "ERROR: migration service must be Type=oneshot"
+          exit 1
+        fi
+        echo "All systemd services verified"
+
+    # R37 P1-7: 三方一致性校验(services.yaml ↔ docker-compose ↔ systemd)
+    - name: Cross-verify service consistency (yaml ↔ compose ↔ systemd)
+      run: |
+        python -c "
+        import yaml, re
+        # 1. services.yaml 服务清单
+        with open('config/services.yaml') as f:
+            svc_yaml_data = yaml.safe_load(f)
+        yaml_services = {s['name'] for s in svc_yaml_data.get('services', [])}
+        # 2. docker-compose.yml 服务清单
+        with open('docker-compose.yml') as f:
+            compose_data = yaml.safe_load(f)
+        compose_services = set(compose_data.get('services', {}).keys())
+        # 3. deploy_vps_per_bot.sh systemd 服务清单
+        with open('deploy_vps_per_bot.sh', encoding='utf-8') as f:
+            deploy_script = f.read()
+        systemd_services = set(re.findall(r'tgjiema-(\w+)', deploy_script))
+        # 比较: services.yaml 与 docker-compose 应一致
+        missing_in_compose = yaml_services - compose_services
+        assert not missing_in_compose, (
+            f'services.yaml 中的服务未在 docker-compose.yml 找到: {missing_in_compose}'
+        )
+        # 比较: services.yaml 与 systemd 应一致
+        missing_in_systemd = yaml_services - systemd_services
+        assert not missing_in_systemd, (
+            f'services.yaml 中的服务未在 deploy_vps_per_bot.sh 找到: {missing_in_systemd}'
+        )
+        print(f'三方一致性校验通过: {len(yaml_services)} 个服务')
+        print(f'  services.yaml: {sorted(yaml_services)}')
+        print(f'  docker-compose: {sorted(compose_services & yaml_services)}')
+        print(f'  systemd: {sorted(systemd_services & yaml_services)}')
+        "
+
+    # R37 P1-7: Compose config 标准校验(禁用 env_file_secrets 非标准字段)
+    - name: Verify Compose standard fields
+      run: |
+        docker compose config --quiet 2>/dev/null || true
+        python -c "
+        import yaml
+        with open('docker-compose.yml') as f:
+            data = yaml.safe_load(f)
+        for svc_name, svc_def in data.get('services', {}).items():
+            # R37 P0-1: 禁止使用非标准的 env_file_secrets 字段
+            assert 'env_file_secrets' not in svc_def, (
+                f'{svc_name} 使用了非标准的 env_file_secrets 字段,'
+                f'应改用 env_file(Compose 标准字段)'
+            )
+        print('Compose 标准字段校验通过(无 env_file_secrets)')
+        "
+
+    # R37 P1-7 / R40 P2-1: Branch protection 配置说明
+    # 注意: branch protection 必须通过 GitHub API/UI 配置,无法在 workflow 中定义
+    # 必需检查(required checks):
+    #   - test (矩阵 3.9/3.10/3.11) — 至少一个 context 通过即可,建议三个全 required
+    #   - lint
+    #   - security (bandit)  ← R40 P2-1 新增
+    #   - deploy-check / verify-deploy
+    #   - release-gates (Compose config + migration dry-run + SBOM + 依赖扫描)
+    # 配置命令(需管理员 PAT):
+    #   gh api repos/:owner/:repo/branches/master/protection -X PUT \
+    #     -f required_status_checks[strict]=true \
+    #     -f required_status_checks[contexts][]="test (3.9)" \
+    #     -f required_status_checks[contexts][]="test (3.10)" \
+    #     -f required_status_checks[contexts][]="test (3.11)" \
+    #     -f required_status_checks[contexts][]="lint" \
+    #     -f required_status_checks[contexts][]="security" \
+    #     -f required_status_checks[contexts][]="deploy-check / verify-deploy" \
+    #     -f required_status_checks[contexts][]="release-gates" \
+    #     -f enforce_admins=true \
+    #     -f required_pull_request_reviews[required_approving_review_count]=1
+    - name: Document branch protection requirements
+      run: |
+        echo "R37 P1-7 / R40 P2-1: Branch protection 配置说明"
+        echo "必需检查(required checks):"
+        echo "  - test (矩阵 3.9/3.10/3.11)"
+        echo "  - lint"
+        echo "  - security (bandit)  ← R40 P2-1 新增"
+        echo "  - deploy-check / verify-deploy"
+        echo "  - release-gates (Compose config + migration dry-run + SBOM + 依赖扫描)"
+        echo "配置方法: 使用 GitHub API/UI 设置 branch protection rules"
+        echo "参考: https://docs.github.com/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches"
