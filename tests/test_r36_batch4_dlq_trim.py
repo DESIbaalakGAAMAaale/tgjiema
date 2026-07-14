@@ -374,11 +374,13 @@ class TestDlqWorkerRetryMessage:
 
     @pytest.mark.asyncio
     async def test_requeue_failure_returns_false(self, monkeypatch):
-        """requeue_from_dlq 返回 False → 保留死信(返回 False)。"""
+        """requeue_from_dlq 返回 False 且降级 push 也失败 → 保留死信(返回 False)。"""
         from database import dlq_worker
 
         mock_requeue = AsyncMock(return_value=False)
         monkeypatch.setattr(redis_queue, "requeue_from_dlq", mock_requeue)
+        # R51: 降级路径 push 也需 mock 为失败(模拟 Redis 完全不可达)
+        monkeypatch.setattr(redis_queue, "push", AsyncMock(return_value=False))
 
         worker = dlq_worker.DLQWorker()
         dead_msg = {
@@ -399,11 +401,13 @@ class TestDlqWorkerRetryMessage:
 
     @pytest.mark.asyncio
     async def test_requeue_exception_returns_false(self, monkeypatch):
-        """requeue_from_dlq 抛异常 → 保留死信(返回 False)。"""
+        """requeue_from_dlq 抛异常且降级 push 也失败 → 保留死信(返回 False)。"""
         from database import dlq_worker
 
         mock_requeue = AsyncMock(side_effect=RuntimeError("Redis down"))
         monkeypatch.setattr(redis_queue, "requeue_from_dlq", mock_requeue)
+        # R51: 降级路径 push 也需 mock 为失败(模拟 Redis 完全不可达)
+        monkeypatch.setattr(redis_queue, "push", AsyncMock(return_value=False))
 
         worker = dlq_worker.DLQWorker()
         dead_msg = {

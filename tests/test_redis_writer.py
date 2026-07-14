@@ -12,6 +12,10 @@ R33 修复: 从 Redis List (LPUSH/BRPOP/LPOP) 改为 Streams Consumer Group。
   - push_dead: RPUSH → XADD 到死信 Stream(带 attempts/max_attempts)
   - length/get_pending_info/get_dlq_length: 监控适配 Streams
 
+R51 P0-4 修复: push() 新返回契约(Redis 不可用时只写 durable outbox,
+  返回 ``{"status": "persisted_pending", ...}``,不再返回 False 让上层
+  直写 SQLite,避免双写)。
+
 测试策略:
 - 使用 ``unittest.mock.AsyncMock`` 模拟 ``redis.asyncio`` 客户端,不依赖真实 Redis。
 - 通过 patch ``redis_queue.get_redis`` 注入模拟客户端,隔离 Redis 连接初始化逻辑。
@@ -19,12 +23,33 @@ R33 修复: 从 Redis List (LPUSH/BRPOP/LPOP) 改为 Streams Consumer Group。
 - settings 通过 conftest 注入的模拟对象提供,用 monkeypatch 覆盖属性控制 WRITER_MODE/REDIS_URL。
 """
 import json
+import os
+import shutil
+import tempfile
 import uuid
 from unittest.mock import AsyncMock
 
 import pytest
 
 from database import redis_queue, write_router
+
+
+# ───────────────────────── R51 P0-4: durable outbox 测试隔离 ─────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def reset_durable_outbox_state():
+    """每个用例前重置 redis_queue durable outbox 全局状态,避免上一个用例的连接缓存影响下一个。
+
+    R51 P0-4: push() 在 Redis 不可用时调用 write_durable_outbox(),
+    需要重置 _durable_conn / _durable_conn_lock 以避免跨用例污染。
+    """
+    rq = redis_queue
+    rq._durable_conn = None
+    rq._durable_conn_lock = None
+    yield
+    rq._durable_conn = None
+    rq._durable_conn_lock = None
 
 
 # ───────────────────────── RedisQueue ─────────────────────────
@@ -80,18 +105,55 @@ class TestRedisQueue:
 
     @pytest.mark.asyncio
     async def test_push_redis_unavailable(self, monkeypatch):
-        """Redis 不可用时(get_redis 返回 None)push 返回 False,触发降级到 SQLite 直写。"""
-        monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=None))
-        ok = await redis_queue.push("upsert", "user_quota", "upsert_user_quota", {"user_id": 1})
-        assert ok is False
+        """R51 P0-4: Redis 不可用时(get_redis 返回 None)push 写 durable outbox
+        并返回 ``{"status": "persisted_pending", ...}``,不再返回 False 让上层直写 SQLite。
+        """
+        # 使用临时 durable outbox 路径,避免污染生产 data/redis_outbox.db
+        tmpdir = tempfile.mkdtemp(prefix="r51_push_unavail_")
+        original_path = redis_queue._DURABLE_DB_PATH
+        redis_queue._DURABLE_DB_PATH = os.path.join(tmpdir, "redis_outbox.db")
+        try:
+            monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=None))
+            result = await redis_queue.push(
+                "upsert", "user_quota", "upsert_user_quota", {"user_id": 1}
+            )
+            # R51 P0-4: 新契约 — 返回 persisted_pending 字典(不再返回 False)
+            assert isinstance(result, dict)
+            assert result["status"] == "persisted_pending"
+            assert "outbox_id" in result
+            assert "message_id" in result
+            # durable outbox 应有 1 条 pending 消息
+            count = await redis_queue.get_durable_outbox_count()
+            assert count == 1
+        finally:
+            await redis_queue.close_durable_outbox()
+            redis_queue._DURABLE_DB_PATH = original_path
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     @pytest.mark.asyncio
-    async def test_push_xadd_exception_returns_false(self, mock_redis, monkeypatch):
-        """XADD 抛异常:push 捕获并返回 False(降级到 SQLite)。"""
-        mock_redis.xadd = AsyncMock(side_effect=Exception("redis write error"))
-        monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=mock_redis))
-        ok = await redis_queue.push("upsert", "t", "m", {})
-        assert ok is False
+    async def test_push_xadd_exception_returns_persisted(self, mock_redis, monkeypatch):
+        """R51 P0-4: XADD 抛异常时 push 写 durable outbox 并返回 persisted_pending 字典。
+
+        原 test_push_xadd_exception_returns_false 验证旧契约(返回 False),
+        新契约禁止返回 False 让上层直写 SQLite(会导致 Redis 恢复后双写)。
+        """
+        tmpdir = tempfile.mkdtemp(prefix="r51_push_xadd_")
+        original_path = redis_queue._DURABLE_DB_PATH
+        redis_queue._DURABLE_DB_PATH = os.path.join(tmpdir, "redis_outbox.db")
+        try:
+            mock_redis.xadd = AsyncMock(side_effect=Exception("redis write error"))
+            monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=mock_redis))
+            result = await redis_queue.push("upsert", "t", "m", {})
+            # R51 P0-4: 新契约 — 返回 persisted_pending 字典(不再返回 False)
+            assert isinstance(result, dict)
+            assert result["status"] == "persisted_pending"
+            # durable outbox 应有 1 条 pending 消息
+            count = await redis_queue.get_durable_outbox_count()
+            assert count == 1
+        finally:
+            await redis_queue.close_durable_outbox()
+            redis_queue._DURABLE_DB_PATH = original_path
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     @pytest.mark.asyncio
     async def test_pop_success(self, mock_redis, monkeypatch):
@@ -606,13 +668,23 @@ class TestWriteRouter:
         mock_push.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_route_write_redis_push_fail_fallback(self, mock_settings, monkeypatch):
-        """Redis 推入失败(push 返回 False)时降级到 fallback。"""
+    async def test_route_write_redis_push_persisted_pending_no_fallback(self, mock_settings, monkeypatch):
+        """R51 P0-4: push 返回 persisted_pending 时,route_write 不调用 fallback(禁止双写)。
+
+        原 test_route_write_redis_push_fail_fallback 验证 push 返回 False 时降级到
+        fallback 直写 SQLite,这会导致 Redis 恢复后 outbox 重放时业务操作二次执行
+        (double-write)。新契约禁止此降级路径。
+        """
         monkeypatch.setattr(mock_settings, "WRITER_MODE", "redis")
         monkeypatch.setattr(mock_settings, "REDIS_URL", "redis://localhost:6379/0")
-        mock_push = AsyncMock(return_value=False)
+        # 模拟 push 返回 persisted_pending(消息已持久化到 durable outbox)
+        mock_push = AsyncMock(return_value={
+            "status": "persisted_pending",
+            "outbox_id": "msg-uuid-123",
+            "message_id": "msg-uuid-123",
+        })
         monkeypatch.setattr(redis_queue, "push", mock_push)
-        fallback = AsyncMock(return_value="degraded_ok")
+        fallback = AsyncMock(return_value="should_not_be_called")
 
         result = await write_router.route_write(
             method_name="write_heartbeat",
@@ -623,9 +695,13 @@ class TestWriteRouter:
             fallback=fallback,
         )
 
-        assert result == "degraded_ok"
+        # route_write 返回 push 的结果(persisted_pending 字典),不调用 fallback
+        assert isinstance(result, dict)
+        assert result["status"] == "persisted_pending"
+        assert result["outbox_id"] == "msg-uuid-123"
         mock_push.assert_awaited_once()
-        fallback.assert_awaited_once()
+        # 关键断言:fallback 没有被调用(禁止直写 SQLite,避免双写)
+        fallback.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_route_write_cas_direct(self, mock_settings, monkeypatch):

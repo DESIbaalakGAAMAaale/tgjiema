@@ -168,31 +168,31 @@ class TestRecordTask:
 
     @pytest.mark.asyncio
     async def test_unknown_task_type_fallback(self, store):
-        """未知 task_type 回退到 'index'。"""
+        """R51 P1-4: 未知 task_type 不再静默回退,改为 raise AppError(TASK_CENTER_UNKNOWN_TYPE)。"""
         from services import task_center
-        task_id = await task_center.record_task(
-            user_id=1004,
-            task_type="unknown_type",
-            status="completed",
-            metadata={"key": "value"},
-        )
-        assert task_id > 0
-        task = await task_center.get_task(task_id)
-        assert task["task_type"] == "index"
+        from services.error_codes import AppError, ErrorCodes
+        with pytest.raises(AppError) as exc_info:
+            await task_center.record_task(
+                user_id=1004,
+                task_type="unknown_type",
+                status="completed",
+                metadata={"key": "value"},
+            )
+        assert exc_info.value.code == ErrorCodes.TASK_CENTER_UNKNOWN_TYPE
 
     @pytest.mark.asyncio
     async def test_unknown_status_fallback(self, store):
-        """未知 status 回退到 'pending'。"""
+        """R51 P1-4: 未知 status 不再静默回退,改为 raise AppError(TASK_CENTER_UNKNOWN_STATUS)。"""
         from services import task_center
-        task_id = await task_center.record_task(
-            user_id=1005,
-            task_type="upload",
-            status="invalid_status",
-            metadata={},
-        )
-        assert task_id > 0
-        task = await task_center.get_task(task_id)
-        assert task["status"] == "pending"
+        from services.error_codes import AppError, ErrorCodes
+        with pytest.raises(AppError) as exc_info:
+            await task_center.record_task(
+                user_id=1005,
+                task_type="upload",
+                status="invalid_status",
+                metadata={},
+            )
+        assert exc_info.value.code == ErrorCodes.TASK_CENTER_UNKNOWN_STATUS
 
     @pytest.mark.asyncio
     async def test_record_cancelled_task(self, store):

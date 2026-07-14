@@ -340,8 +340,9 @@ class TestCollectionsOptimisticLock:
 
     @pytest.mark.asyncio
     async def test_update_collection_stale_version_conflict(self, store):
-        """使用过期的 expected_version → 冲突,不更新。"""
+        """R51 P1-3: 使用过期的 expected_version → raise AppError(COLLECTION_CAS_CONFLICT)。"""
         from services import collections
+        from services.error_codes import AppError, ErrorCodes
         coll = await collections.create_collection("冲突测试", owner_id=5002)
         coll_id = coll["id"]
         coll_info = await collections.get_collection(coll["code"])
@@ -351,41 +352,43 @@ class TestCollectionsOptimisticLock:
             collection_id=coll_id, name="第一次更新",
             expected_version=actual_version,
         )
-        # 第二次使用旧版本号 → 冲突
-        result = await collections.update_collection(
-            collection_id=coll_id, name="第二次更新(冲突)",
-            expected_version=actual_version,  # 旧版本号
-        )
-        assert result["success"] is False
-        assert result["conflict"] is True
-        assert "版本冲突" in result["message"]
+        # 第二次使用旧版本号 → raise AppError(COLLECTION_CAS_CONFLICT)
+        with pytest.raises(AppError) as exc_info:
+            await collections.update_collection(
+                collection_id=coll_id, name="第二次更新(冲突)",
+                expected_version=actual_version,  # 旧版本号
+            )
+        assert exc_info.value.code == ErrorCodes.COLLECTION_CAS_CONFLICT
         # 当前版本应该是 actual_version + 1(第一次更新后)
-        assert result["current_version"] == actual_version + 1
+        assert exc_info.value.params.get("current_version") == actual_version + 1
+        assert exc_info.value.params.get("expected_version") == actual_version
 
     @pytest.mark.asyncio
     async def test_update_collection_without_expected_version(self, store):
-        """不传 expected_version → 跳过乐观锁,直接更新(向后兼容)。"""
+        """R51 P1-3: 不传 expected_version 必须显式 bypass_cas=True 才能更新。"""
         from services import collections
         coll = await collections.create_collection("兼容模式", owner_id=5003)
         coll_id = coll["id"]
+        # 显式 bypass_cas=True(运维/迁移场景)→ 跳过 CAS,直接更新
         result = await collections.update_collection(
             collection_id=coll_id, description="新描述",
             expected_version=None,
+            bypass_cas=True,
         )
         assert result["success"] is True
         assert result["conflict"] is False
 
     @pytest.mark.asyncio
     async def test_update_collection_not_exists(self, store):
-        """更新不存在的集合 → success=False, conflict=False。"""
+        """R51 P1-3: 更新不存在的集合 → raise AppError(COLLECTION_CAS_VERSION_REQUIRED)。"""
         from services import collections
-        result = await collections.update_collection(
-            collection_id=99999, name="不存在",
-            expected_version=1,
-        )
-        assert result["success"] is False
-        assert result["conflict"] is False
-        assert "不存在" in result["message"]
+        from services.error_codes import AppError, ErrorCodes
+        with pytest.raises(AppError) as exc_info:
+            await collections.update_collection(
+                collection_id=99999, name="不存在",
+                expected_version=1,
+            )
+        assert exc_info.value.code == ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED
 
     @pytest.mark.asyncio
     async def test_update_collection_no_fields(self, store):
@@ -866,7 +869,7 @@ class TestRepairConsoleSafeActions:
 
     @pytest.mark.asyncio
     async def test_execute_repair_skip_outbox(self, store):
-        """白名单动作 skip_outbox 成功执行。"""
+        """白名单动作 skip_outbox 成功执行(R51 P1-5: HIGH 风险需有效审批)。"""
         from services import repair_console
         # 先创建 dirty_outbox 记录
         await store._db.execute(
@@ -882,24 +885,31 @@ class TestRepairConsoleSafeActions:
         )
         ids = [r[0] for r in rows if r]
         assert len(ids) >= 1
+        # R51 P1-5: skip_outbox 是 HIGH 风险动作,必须提供有效 approval_action_id
+        params = {"ids": ids, "reason": "测试跳过"}
+        expected_hash = repair_console.compute_repair_request_hash(
+            "skip_outbox", params,
+        )
+        await _insert_command_execution(
+            store, action_id="approval_skip_001", status="executed",
+            request_hash=expected_hash,
+        )
         result = await repair_console.execute_repair(
             action="skip_outbox",
-            params={"ids": ids, "reason": "测试跳过"},
+            params=params,
             principal_id=100,
+            approval_action_id="approval_skip_001",
         )
         assert result["success"] is True
         assert result["action"] == "skip_outbox"
         assert result["affected_count"] >= 1
         assert result["audit_log_id"] > 0
+        assert result["approval_verified"] is True
 
     @pytest.mark.asyncio
     async def test_execute_repair_with_valid_approval(self, store):
         """提供有效 approval_action_id → approval_verified=True。"""
         from services import repair_console
-        # 创建 command_executions 记录
-        await _insert_command_execution(
-            store, action_id="approval_001", status="executed",
-        )
         # 先创建 dirty_outbox 记录
         await store._db.execute(
             """INSERT INTO dirty_outbox (table_name, pk, version, operation,
@@ -912,9 +922,18 @@ class TestRepairConsoleSafeActions:
             "SELECT id FROM dirty_outbox WHERE processed = 0"
         )
         ids = [r[0] for r in rows if r]
+        # R51 P1-5: 计算与 execute_repair 内部一致的 request_hash
+        params = {"ids": ids}
+        expected_hash = repair_console.compute_repair_request_hash(
+            "retry_outbox", params,
+        )
+        await _insert_command_execution(
+            store, action_id="approval_001", status="executed",
+            request_hash=expected_hash,
+        )
         result = await repair_console.execute_repair(
             action="retry_outbox",
-            params={"ids": ids},
+            params=params,
             principal_id=100,
             approval_action_id="approval_001",
         )
@@ -923,31 +942,37 @@ class TestRepairConsoleSafeActions:
 
     @pytest.mark.asyncio
     async def test_execute_repair_rejects_invalid_approval(self, store):
-        """无效 approval_action_id(未审批) → 抛 PermissionError。"""
+        """无效 approval_action_id(未审批) → 抛 AppError(REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH)。"""
         from services import repair_console
+        from services.error_codes import AppError, ErrorCodes
         # 创建 status='executing'(未 executed)的 command_executions
         await _insert_command_execution(
             store, action_id="approval_002", status="executing",
         )
-        with pytest.raises(PermissionError, match="未通过验证"):
+        with pytest.raises(AppError) as exc_info:
             await repair_console.execute_repair(
                 action="skip_outbox",
                 params={"ids": [1], "reason": "test"},
                 principal_id=100,
                 approval_action_id="approval_002",
             )
+        # R51 P1-5: 审批未通过应抛 REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH
+        assert exc_info.value.code == ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH
 
     @pytest.mark.asyncio
     async def test_execute_repair_rejects_nonexistent_approval(self, store):
-        """不存在的 approval_action_id → 抛 PermissionError。"""
+        """不存在的 approval_action_id → 抛 AppError(REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH)。"""
         from services import repair_console
-        with pytest.raises(PermissionError, match="未通过验证"):
+        from services.error_codes import AppError, ErrorCodes
+        with pytest.raises(AppError) as exc_info:
             await repair_console.execute_repair(
                 action="skip_outbox",
                 params={"ids": [1], "reason": "test"},
                 principal_id=100,
                 approval_action_id="nonexistent_approval_xxx",
             )
+        # R51 P1-5: 审批不存在应抛 REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH
+        assert exc_info.value.code == ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH
 
 
 # ════════════════════════════════════════════════════════════════

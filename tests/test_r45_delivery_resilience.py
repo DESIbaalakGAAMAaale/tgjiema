@@ -316,11 +316,16 @@ class TestWriteDurableOutbox:
 # ════════════════════════════════════════════════════════════════
 
 class TestPushFallbackToDurableOutbox:
-    """R42 §13: push() 在 Redis 不可用时写入 durable outbox。"""
+    """R42 §13: push() 在 Redis 不可用时写入 durable outbox。
+
+    R51 P0-4 修复: push() 新契约 — Redis 不可用时只写 durable outbox
+    并返回 ``{"status": "persisted_pending", ...}``,不再返回 False
+    让上层 route_write 直写 SQLite(避免 Redis 恢复后 outbox 重放双写)。
+    """
 
     @pytest.mark.asyncio
     async def test_push_redis_unavailable_writes_outbox(self):
-        """Redis 不可用时 push() 返回 False 并写入 durable outbox。"""
+        """R51 P0-4: Redis 不可用时 push() 写 durable outbox 并返回 persisted_pending 字典。"""
         import database.redis_queue as rq
         tmpdir = tempfile.mkdtemp(prefix="r45_push_test_")
         original_path = rq._DURABLE_DB_PATH
@@ -332,7 +337,11 @@ class TestPushFallbackToDurableOutbox:
                 method_name="upsert_user_quota",
                 data={"user_id": 99999},
             )
-            assert result is False
+            # R51 P0-4: 新契约 — 返回 persisted_pending 字典(不再返回 False)
+            assert isinstance(result, dict)
+            assert result["status"] == "persisted_pending"
+            assert "outbox_id" in result
+            assert "message_id" in result
             # durable outbox 应有 1 条 pending 消息
             count = await rq.get_durable_outbox_count()
             assert count == 1
@@ -505,10 +514,11 @@ class TestUnknownTableOpDLQ:
         """未知 table_name 返回空列表(不标记 processed,进入 DLQ)。"""
         from services.crdb_sync_service import _dispatch_dirty_outbox_to_crdb
         records = [{"id": 1, "pk": "x", "operation": "upsert"}]
-        # Mock DLQ 路由
+        # Mock DLQ 路由 — 未知表不会进入 _route_dirty_outbox_to_dlq(早期 return []),
+        # 但仍提供 mock 以防代码路径变更
         with patch(
             "services.crdb_sync_service._route_dirty_outbox_to_dlq",
-            AsyncMock(return_value=None),
+            AsyncMock(return_value={"success": True, "failed_ids": [], "error": ""}),
         ):
             ids = await _dispatch_dirty_outbox_to_crdb("__unknown_table__", records)
         assert ids == []
@@ -531,6 +541,8 @@ class TestUnknownTableOpDLQ:
         dlq_calls = []
         async def mock_dlq(table, recs, reason):
             dlq_calls.append((table, recs, reason))
+            # R51 P0-9: 返回 durable success/failed 字典
+            return {"success": True, "failed_ids": [], "error": ""}
 
         # 需要 mock upsert handler(否则会因 CRDB 连接失败而异常)
         mock_handler = AsyncMock(return_value=[])
@@ -645,6 +657,8 @@ class TestTombstoneSoftDelete:
 
         async def mock_route_dlq(table_name, recs, error_msg):
             dlq_calls.append((table_name, recs, error_msg))
+            # R51 P0-9: 返回 durable success/failed 字典
+            return {"success": True, "failed_ids": [], "error": ""}
 
         with patch(
             "services.crdb_sync_service._is_crdb_table_supports_soft_delete",

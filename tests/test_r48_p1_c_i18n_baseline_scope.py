@@ -15,6 +15,7 @@
 """
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -304,7 +305,9 @@ class TestAllowScopeChange:
         """main(argv) 接受 --allow-scope-change 参数(argparse 识别)。"""
         monkeypatch.setattr(scan, "_git_current_branch", lambda: "master")
         _patch_collect_and_classify(monkeypatch)
-        monkeypatch.setattr(scan, "MODULE_BASELINE_FILE", Path("/tmp/test_baseline_dummy"))
+        # 使用 tempfile.mkdtemp 创建跨平台可写的临时目录(避免 /tmp 在 Windows 上权限拒绝)
+        tmp_dir = tempfile.mkdtemp(prefix="r48_p1_c_argparse_")
+        monkeypatch.setattr(scan, "MODULE_BASELINE_FILE", Path(tmp_dir) / "test_baseline_dummy.json")
         # 若 argparse 不识别 --allow-scope-change,会 SystemExit(2)
         rc = scan.main(argv=[
             "--generate-baseline", "--reason", "argparse_test",

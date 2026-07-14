@@ -106,6 +106,16 @@ async def create_approval(action: str, payload: dict, created_by: int) -> int:
 
     now = datetime.datetime.now().isoformat()
 
+    # R51 P0-7: 若 payload 含 command_action(CommandBus 创建的审批),
+    # 则必须确保 action_id 非空 — 缺失时使用审批创建时已固定的确定性 ID
+    # `f"approval_{approval_id}_{action}"`,approve() 时直接读取,禁止用含当前时间的临时 ID。
+    # 由于 approval_id 在 INSERT 后才可知,先记录是否需要回填,INSERT 后再 UPDATE payload。
+    payload_copy = dict(payload) if isinstance(payload, dict) else {}
+    _needs_action_id_backfill = (
+        bool(payload_copy.get("command_action"))
+        and not (payload_copy.get("action_id") or "").strip()
+    )
+
     try:
         payload_str = json.dumps(payload, ensure_ascii=False, default=str)
         # R40 P0-5: 业务表 + audit_log + dirty_outbox 同事务
@@ -118,6 +128,20 @@ async def create_approval(action: str, payload: dict, created_by: int) -> int:
             approval_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
 
             if approval_id > 0:
+                # R51 P0-7: 回填确定性 action_id 到 payload 并 UPDATE approvals.payload
+                if _needs_action_id_backfill:
+                    deterministic_action_id = f"approval_{approval_id}_{action}"
+                    payload_copy["action_id"] = deterministic_action_id
+                    new_payload_str = json.dumps(payload_copy, ensure_ascii=False, default=str)
+                    await tx.execute(
+                        "UPDATE approvals SET payload = ? WHERE id = ?",
+                        (new_payload_str, approval_id),
+                    )
+                    logger.info(
+                        f"[Approval] create_approval 回填确定性 action_id={deterministic_action_id} "
+                        f"id={approval_id}"
+                    )
+
                 await store.add_dirty_outbox("approvals", str(approval_id), connection=tx)
 
                 # 写审计日志(同事务)
@@ -127,7 +151,7 @@ async def create_approval(action: str, payload: dict, created_by: int) -> int:
                     (
                         created_by,
                         str(approval_id),
-                        json.dumps({"action": action, "payload": payload}, ensure_ascii=False, default=str),
+                        json.dumps({"action": action, "payload": payload_copy}, ensure_ascii=False, default=str),
                         now,
                     ),
                 )
@@ -148,6 +172,11 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
     - 不能审批自己创建的请求(created_by != approver_id)
     - 审批状态必须为 pending
 
+    R51 P0-7 修复: PENDING→APPROVED + audit_log + dirty_outbox + command_outbox
+    必须在**同一事务**内原子完成。任一步骤失败(含 command_outbox UNIQUE 冲突)
+    整个事务回滚,审批状态保持 PENDING,避免出现"审批已 APPROVED 但 outbox 未写入"
+    的半提交状态(此前实现 approve 通过后再开独立事务写 outbox,只能人工补偿)。
+
     Args:
         approval_id: 审批 ID
         approver_id: 审批人 ID
@@ -155,6 +184,10 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
 
     Returns:
         True 表示成功
+
+    Raises:
+        AppError: 当 payload 含 command_action 但 action_id 缺失时
+            (ErrorCodes.APPROVAL_STATE_INVALID),由调用方捕获处理。
     """
     approval = await get_approval(approval_id)
     if approval is None:
@@ -176,6 +209,36 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
         logger.warning(f"[Approval] approve 不能审批自己创建的请求: approver={approver_id} created_by={approval['created_by']}")
         return False
 
+    # R51 P0-7: 提前解析 payload,校验 action_id 必须非空(CommandBus 类型审批)
+    payload_data = approval.get("payload", {}) or {}
+    if isinstance(payload_data, str):
+        try:
+            payload_data = json.loads(payload_data)
+        except (json.JSONDecodeError, TypeError):
+            payload_data = {}
+    if not isinstance(payload_data, dict):
+        payload_data = {}
+
+    command_action = payload_data.get("command_action") or ""
+    action_id = (payload_data.get("action_id") or "").strip()
+
+    # R51 P0-7: command_action 存在但 action_id 缺失 → 拒绝执行(不再用含当前时间的临时 ID)
+    # 必须使用审批创建时已固定的确定性 ID(create_approval 已回填)
+    if command_action and not action_id:
+        # 引入 AppError 协议化错误,延迟 import 避免循环依赖
+        from services.error_codes import AppError, ErrorCodes
+        logger.error(
+            f"[Approval] approve 拒绝执行:payload 含 command_action={command_action} "
+            f"但 action_id 缺失(approval_id={approval_id})"
+        )
+        raise AppError(
+            ErrorCodes.APPROVAL_STATE_INVALID,
+            params={
+                "approval_id": approval_id,
+                "current_status": approval["status"],
+            },
+        )
+
     store = get_cache_store()
     if not store._db:
         return False
@@ -185,7 +248,8 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
     try:
         # R40 P1-4: CAS UPDATE — 单条 UPDATE 同时完成状态判定与状态变更,
         # 通过 rowcount 检测并发竞争(0=已被处理或不存在,1=本调用成功)。
-        # R40 P0-5: 业务表 + audit_log + dirty_outbox 同事务
+        # R51 P0-7: 业务表 + audit_log + dirty_outbox + command_outbox 同事务,
+        # 任一步骤失败整体回滚,审批状态保持 PENDING。
         async with store.transaction() as tx:
             cursor = await tx.execute(
                 "UPDATE approvals SET status = 'approved', approver_id = ?, approver_note = ?, resolved_at = ? "
@@ -215,27 +279,24 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
             )
             await store.add_dirty_outbox("audit_log", "last", connection=tx)
 
-        logger.info(f"[Approval] approve 审批已批准 id={approval_id} approver={approver_id}")
+            # R51 P0-7: command_outbox 同事务写入(不再开独立事务)
+            # 任一失败(含 UNIQUE 冲突)→ 整个事务回滚 → approval 仍 PENDING
+            if command_action:
+                payload_str = json.dumps(payload_data, ensure_ascii=False, default=str)
+                await tx.execute(
+                    "INSERT INTO command_outbox "
+                    "(action_id, approval_id, command_type, payload, status, "
+                    " retry_count, max_retries, next_retry_at, last_error, "
+                    " created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, 'pending', 0, 3, NULL, NULL, ?, ?)",
+                    (action_id, approval_id, command_action, payload_str, now, now),
+                )
+                logger.info(
+                    f"[Approval] command_outbox 已写入(同事务) approval_id={approval_id} "
+                    f"action_id={action_id} command_type={command_action}"
+                )
 
-        # R41 P0-4: 审批通过后写入 command_outbox(独立事务),由 ApprovalExecutor 异步消费。
-        # 不再在 approve() 中直接调用 cb.execute_approved_action() —— 后者会调用
-        # mark_executing() 开启 store.transaction(),与 approve 的事务上下文可能嵌套
-        # (SQLite 不支持 BEGIN 嵌套,抛 "cannot start a transaction within a transaction")。
-        # 通过 command_outbox 解耦:approve 只做 CAS PENDING → APPROVED + 审计 + 写入 outbox,
-        # 真正的 handler 执行由 ApprovalExecutor 在独立事务中完成,支持重试与失败隔离。
-        payload_data = approval.get("payload", {}) or {}
-        if isinstance(payload_data, str):
-            try:
-                payload_data = json.loads(payload_data)
-            except (json.JSONDecodeError, TypeError):
-                payload_data = {}
-        if payload_data.get("command_action"):
-            await _enqueue_command_outbox(
-                approval_id=approval_id,
-                action_id=payload_data.get("action_id", ""),
-                command_type=payload_data.get("command_action", ""),
-                payload=payload_data,
-            )
+        logger.info(f"[Approval] approve 审批已批准 id={approval_id} approver={approver_id}")
         return True
     except Exception as e:
         logger.error(f"[Approval] approve 失败 id={approval_id}: {e}")
@@ -250,17 +311,22 @@ async def _enqueue_command_outbox(
 ) -> bool:
     """R41 P0-4: 审批通过后写入 command_outbox(独立事务)。
 
+    R51 P0-7 后: ``approve()`` 已将 command_outbox 写入合并到主事务中,
+    本函数保留作为**幂等补偿 worker** 入口 — 当 approval 已 APPROVED 但
+    command_outbox 缺失(异常场景,如旧版本数据迁移)时,可调用本函数补写,
+    借助 UNIQUE(approval_id, action_id) 约束保证幂等(冲突即视为已写入)。
+
     ApprovalExecutor 会异步消费此表,调用 CommandBus.execute_command_outbox_entry()
     执行实际 handler,完全独立的事务,避免嵌套 BEGIN。
 
     Args:
         approval_id: 关联审批 ID
-        action_id: 幂等 action_id(从 approval payload 中提取)
+        action_id: 幂等 action_id(从 approval payload 中提取,必须非空)
         command_type: 命令类型(如 "takedown_report" / "ban_user")
         payload: 完整 payload(含 command_action / params / principal_* 等)
 
     Returns:
-        True 表示写入成功;False 表示失败(审批状态已 APPROVED,可通过手动重试补救)
+        True 表示写入成功(或已存在,幂等);False 表示失败
     """
     store = get_cache_store()
     if not store._db:
@@ -269,10 +335,15 @@ async def _enqueue_command_outbox(
         )
         return False
 
-    now = datetime.datetime.now().isoformat()
+    # R51 P0-7: action_id 必须非空(不再用含当前时间的临时 ID 兜底)
     if not action_id:
-        # 兜底:action_id 缺失时使用 approval_id 作为唯一标识
-        action_id = f"approval_{approval_id}_{now}"
+        logger.error(
+            f"[Approval] _enqueue_command_outbox 拒绝执行:action_id 缺失 "
+            f"approval_id={approval_id}"
+        )
+        return False
+
+    now = datetime.datetime.now().isoformat()
     payload_str = json.dumps(payload, ensure_ascii=False, default=str)
 
     try:
@@ -291,8 +362,15 @@ async def _enqueue_command_outbox(
         )
         return True
     except Exception as e:
-        # 写入失败不影响审批已批准的状态(APPROVED 已落库),
-        # 可通过手动调用 CommandBus.execute_approved_action(approval_id) 兜底执行
+        # R51 P0-7: UNIQUE(approval_id, action_id) 冲突 → 视为已写入,幂等返回 True
+        # (补偿 worker 重试场景:同一 approval+action 已存在,无需重复写入)
+        err_msg = str(e).lower()
+        if "unique" in err_msg or "constraint" in err_msg:
+            logger.info(
+                f"[Approval] command_outbox UNIQUE 冲突(视为幂等成功) "
+                f"approval_id={approval_id} action_id={action_id}"
+            )
+            return True
         logger.error(
             f"[Approval] command_outbox 写入失败 approval_id={approval_id}: {e}"
         )

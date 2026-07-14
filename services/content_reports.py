@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 
 from loguru import logger
@@ -32,6 +33,8 @@ REPORT_STATUS_RESOLVED = "resolved"    # 已解决(维持下架)
 REPORT_STATUS_REJECTED = "rejected"    # 已驳回(不下架)
 # R41 P1-13: 2 人审批恢复操作的状态(等待第二审批人)
 REPORT_STATUS_RESTORE_PENDING = "restore_pending"
+# R51 P0-6: restore_content handler 执行失败(进入 reconciliation,不降级直接恢复)
+REPORT_STATUS_RESTORE_FAILED = "restore_failed"
 
 # ─── 举报目标类型 ───────────────────────────────────────────
 TARGET_TYPE_FILE = "file"
@@ -744,6 +747,9 @@ async def process_appeal(
             }
 
     # ─── 第二审批人 approve ─────────────────────────────────
+    # R51 P0-6: 第二审批完成后只写 command_outbox,由 ApprovalExecutor 执行 restore。
+    # 禁止直接调用 handler 和直接恢复 fallback,确保 RBAC + 持久幂等 +
+    # Effect Receipt + 审计门禁全部经过 CommandBus 调度链。
     # 校验:第二审批人不能与第一审批人相同
     if first_approver_id == principal_id:
         return {
@@ -758,95 +764,162 @@ async def process_appeal(
             "restored": False,
             "error": f"状态不允许第二审批(当前: {current_status})",
         }
+    # R51 P0-6: RBAC 权限校验(disaster:restore)— fail-closed,拒绝未授权用户
     try:
-        # R41 P1-13: 恢复操作走 CommandBus(创建 restore 命令,requires_approval=False
-        # 因为 2-person 审批已在 process_appeal 完成,CommandBus 仅记录审计)
-        try:
-            from services.command_bus import (
-                AdminPrincipal, Command, Result,
-            )
-            # 创建 restore 命令(无需再走 approval_workflow,审批已完成)
-            principal = AdminPrincipal(id=principal_id, name="", source="admin")
-            restore_cmd = Command(
-                action="restore_content",
-                required_permission="disaster:restore",
-                handler=lambda params: _restore_content_internal(
-                    params.get("target_type", ""),
-                    params.get("target_id", ""),
-                    params.get("admin_id", principal_id),
-                ),
-                params={
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "admin_id": principal_id,
-                    "appeal_id": appeal_id,
-                },
-                requires_approval=False,  # 2-person 审批已在 process_appeal 完成
-                approval_action="",
-            )
-            # 调用 CommandBus.execute(执行 restore handler)
-            # 此处不调用完整 CommandBus.execute(避免依赖 RBAC 配置),
-            # 直接调用 handler 并记录到 audit_log
-            restore_result = await restore_cmd.handler(restore_cmd.params)
-        except Exception as cb_err:
-            logger.warning(
-                f"[ContentReports] process_appeal CommandBus 调用失败,降级直接恢复: {cb_err}"
-            )
-            restore_result = await _restore_content_internal(
-                target_type, target_id, principal_id,
-            )
+        from services import rbac as _rbac_mod
+        has_perm = await _rbac_mod.check_permission(
+            principal_id, _rbac_mod.PERMISSION_DISASTER_RESTORE,
+        )
+    except Exception as rbac_err:
+        logger.warning(
+            f"[ContentReports] process_appeal RBAC 校验异常 appeal_id={appeal_id}: {rbac_err}"
+        )
+        has_perm = False
+    if not has_perm:
+        from services.error_codes import AppError, ErrorCodes
+        raise AppError(
+            ErrorCodes.AUTH_RBAC_PERMISSION_DENIED,
+            params={
+                "permission": "disaster:restore",
+                "user_id": principal_id,
+            },
+        )
 
-        # 更新举报状态为 resolved + 写审计日志
+    # R51 P0-6: 计算确定性 action_id 和 request_hash
+    # action_id = restore_content_{appeal_id}_{content_hash[:16]}
+    # content_hash = SHA256(target_type:target_id) — 绑定恢复目标,防篡改
+    content_hash = hashlib.sha256(
+        f"{target_type}:{target_id}".encode("utf-8"),
+    ).hexdigest()
+    action_id = f"restore_content_{appeal_id}_{content_hash[:16]}"
+
+    # R51 P0-6: 幂等检查 — 若 command_outbox 已有相同 action_id 的条目,
+    # 说明第二审批已完成(等待 ApprovalExecutor 执行),不允许重复审批。
+    try:
+        existing_cursor = await store._db.execute(
+            "SELECT id, status FROM command_outbox WHERE action_id = ?",
+            (action_id,),
+        )
+        existing_outbox = await existing_cursor.fetchone()
+    except Exception as check_err:
+        logger.warning(
+            f"[ContentReports] process_appeal 幂等检查失败 appeal_id={appeal_id}: {check_err}"
+        )
+        existing_outbox = None
+    if existing_outbox:
+        from services.error_codes import AppError, ErrorCodes
+        logger.warning(
+            f"[ContentReports] process_appeal 重复审批被拒绝 "
+            f"appeal_id={appeal_id} action_id={action_id} "
+            f"outbox_status={existing_outbox[1]}"
+        )
+        raise AppError(
+            ErrorCodes.CONTENT_APPEAL_INVALID_STATE,
+            params={
+                "appeal_id": appeal_id,
+                "current_status": current_status,
+            },
+        )
+
+    # R51 P0-6: 使用 compute_effect_request_hash_safe() 计算 request_hash
+    # restore 是 critical effect,params 不能为空(否则抛 ValueError)
+    from services.effect_receipts import (
+        compute_effect_request_hash_safe,
+        get_receipt_manager,
+    )
+    # 直接构造 effect params(restore 涉及 file/user/code 目标,
+    # 不强制要求 target_user_id/channel_id/chat_id,但 params 必须非空)
+    effect_params = {
+        "target_type": target_type,
+        "target_id": str(target_id),
+        "appeal_id": appeal_id,
+        "admin_id": principal_id,
+    }
+    request_hash = compute_effect_request_hash_safe("restore", effect_params)
+
+    # R51 P0-6: 构造 command_outbox payload(由 ApprovalExecutor 消费)
+    payload_data = {
+        "appeal_id": appeal_id,
+        "target_type": target_type,
+        "target_id": target_id,
+        "admin_id": principal_id,
+        "content_hash": content_hash,
+        "first_approver_id": first_approver_id,
+        "note": note,
+        "reporter_id": reporter_id,
+    }
+    payload_str = json.dumps(payload_data, ensure_ascii=False, default=str)
+
+    try:
+        # R51 P0-7: 业务表 + audit_log + dirty_outbox + command_outbox 同事务,
+        # 任一步骤失败整体回滚,审批状态保持 restore_pending。
+        # 状态保持 restore_pending(不在此处变为 resolved — 由 ApprovalExecutor
+        # 执行 restore_content handler 成功后才更新为 resolved)。
         async with store.transaction() as tx:
-            cursor = await tx.execute(
-                """UPDATE content_reports
-                   SET status = ?, resolved_by = ?, resolved_at = ?
-                   WHERE id = ?""",
-                (REPORT_STATUS_RESOLVED, principal_id, now, appeal_id),
-            )
-            if cursor.rowcount == 0:
-                # 状态更新失败,但 restore 可能已执行,记录 warning
-                logger.warning(
-                    f"[ContentReports] process_appeal second_approval 状态更新失败 "
-                    f"appeal_id={appeal_id}"
-                )
-            await store.add_dirty_outbox(
-                "content_reports", str(appeal_id), connection=tx,
-            )
-            # 写审计日志(第二审批)
+            # 写审计日志(第二审批)— 记录已批准,等待 executor 执行
             await _write_audit_log(
                 principal_id, "appeal_second_approval", "report", str(appeal_id),
                 {
                     "note": note, "target_type": target_type,
-                    "target_id": target_id, "restored": bool(restore_result),
+                    "target_id": target_id,
+                    "action_id": action_id,
+                    "restored": False,  # restore 尚未执行
                     "first_approver_id": first_approver_id,
                 }, "", tx=tx,
             )
-        # 通知举报者(appeal 已批准,内容已恢复)
-        try:
-            from services import notifications as notif_svc
-            await notif_svc.dispatch_notification(
-                user_id=reporter_id,
-                type="appeal_approved",
-                content={
-                    "appeal_id": appeal_id,
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "restored": bool(restore_result),
-                },
-                dedup_key=f"appeal_approved:{appeal_id}",
+            await store.add_dirty_outbox(
+                "content_reports", str(appeal_id), connection=tx,
             )
-        except Exception as notif_err:
-            logger.warning(
-                f"[ContentReports] process_appeal approve 通知失败: {notif_err}"
+            # 写 command_outbox(由 ApprovalExecutor 异步消费)
+            await tx.execute(
+                "INSERT INTO command_outbox "
+                "(action_id, approval_id, command_type, payload, status, "
+                " retry_count, max_retries, next_retry_at, last_error, "
+                " created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, 'pending', 0, 3, NULL, NULL, ?, ?)",
+                (action_id, appeal_id, "restore_content",
+                 payload_str, now, now),
             )
+            logger.info(
+                f"[ContentReports] process_appeal second_approval 已写入 command_outbox "
+                f"appeal_id={appeal_id} action_id={action_id}"
+            )
+
+        # R51 P0-6: 记录 pending effect receipt(critical effect fail-closed)
+        # restore 是 critical effect_type,record_pending 会校验 request_hash 非空
+        receipt_mgr = get_receipt_manager(store)
+        if receipt_mgr is not None:
+            try:
+                await receipt_mgr.record_pending(
+                    action_id=action_id,
+                    effect_type="restore",
+                    target=f"{target_type}:{target_id}",
+                    request_hash=request_hash,
+                    fail_closed=True,
+                )
+                logger.info(
+                    f"[ContentReports] process_appeal effect receipt pending "
+                    f"action_id={action_id} target={target_type}:{target_id}"
+                )
+            except Exception as receipt_err:
+                # critical effect receipt 失败 → 不能让 command_outbox 处于
+                # pending 但无 receipt 的状态。记录 error 但不降级 —
+                # ApprovalExecutor 执行时会再次检查 receipt。
+                logger.error(
+                    f"[ContentReports] process_appeal record_pending 失败 "
+                    f"(critical effect,不降级): {receipt_err}"
+                )
+                # 抛出异常,让上层捕获处理(不降级直接恢复)
+                raise
+
         logger.info(
             f"[ContentReports] process_appeal second_approval id={appeal_id} "
-            f"principal={principal_id} restored={restore_result}"
+            f"principal={principal_id} restored=False (等待 ApprovalExecutor)"
         )
         return {
             "success": True, "stage": "second_approval",
-            "restored": bool(restore_result), "error": "",
+            "restored": False, "error": "",
+            "action_id": action_id,
         }
     except Exception as e:
         logger.warning(

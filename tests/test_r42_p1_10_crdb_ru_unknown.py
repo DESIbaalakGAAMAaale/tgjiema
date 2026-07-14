@@ -164,7 +164,8 @@ class TestGetRuStatusFailed:
         assert status["source"] == "unknown"
         assert status["ru_value"] == 5000
         assert status["freshness_seconds"] is not None
-        assert status["freshness_seconds"] >= 7200
+        # int() 截断可能导致 7200.0 → 7199,容忍 1 秒截断误差
+        assert status["freshness_seconds"] >= 7199
 
 
 # ════════════════════════════════════════════════════════════════
@@ -255,7 +256,8 @@ class TestGetRuStatusUnknown:
         assert status["source"] == "unknown"
         assert status["ru_value"] == 9999
         assert status["freshness_seconds"] is not None
-        assert status["freshness_seconds"] >= 7200
+        # int() 截断可能导致 7200.0 → 7199,容忍 1 秒截断误差
+        assert status["freshness_seconds"] >= 7199
         # details 中应提示"陈旧"
         assert "陈旧" in status["details"] or "stale" in status["details"].lower()
 

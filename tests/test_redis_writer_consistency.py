@@ -218,13 +218,25 @@ class TestConsistency:
         mock_push2.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_redis_unavailable_degrades_gracefully(self, mock_settings, monkeypatch):
-        """Redis 不可用时(push 返回 False)自动降级到 SQLite 直写 fallback。"""
+    async def test_redis_unavailable_persists_to_outbox_no_fallback(self, mock_settings, monkeypatch):
+        """R51 P0-4: Redis 不可用时 push 返回 persisted_pending 字典,
+        route_write 不调用 fallback(禁止双写 SQLite)。
+
+        旧契约(push 返回 False → 自动降级到 SQLite 直写)已被废弃,
+        因为 Redis 恢复后 outbox 重放会导致同一业务操作二次执行(double-write)。
+        新契约:push 返回 ``{"status": "persisted_pending", ...}``,
+        route_write 收到后直接返回该字典,等待 Redis 恢复后由 replayer 重放。
+        """
         monkeypatch.setattr(mock_settings, "WRITER_MODE", "redis")
         monkeypatch.setattr(mock_settings, "REDIS_URL", "redis://localhost:6379/0")
-        mock_push = AsyncMock(return_value=False)
+        persisted_dict = {
+            "status": "persisted_pending",
+            "outbox_id": "msg-uuid-consistency-1",
+            "message_id": "msg-uuid-consistency-1",
+        }
+        mock_push = AsyncMock(return_value=persisted_dict)
         monkeypatch.setattr(redis_queue, "push", mock_push)
-        fallback = AsyncMock(return_value="degraded_ok")
+        fallback = AsyncMock(return_value="should_not_be_called")
 
         result = await write_router.route_write(
             method_name="write_heartbeat",
@@ -235,9 +247,12 @@ class TestConsistency:
             fallback=fallback,
         )
 
-        assert result == "degraded_ok"
+        # 新契约:route_write 返回 persisted_pending 字典,不调用 fallback
+        assert isinstance(result, dict)
+        assert result["status"] == "persisted_pending"
         mock_push.assert_awaited_once()
-        fallback.assert_awaited_once()
+        # 关键断言:fallback 未被调用(禁止双写 SQLite)
+        fallback.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_xack_failure_message_stays_in_pending(self, mock_redis, monkeypatch):

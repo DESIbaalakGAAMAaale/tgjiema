@@ -195,9 +195,10 @@ class TestValidateProductionApprovalRequestHash:
         approval_action_id = "toctou_action_001"
         principal_id = 999
         stored_hash = "stored_hash_abc"
+        # R51 P0-8: status='approved' 表示审批通过等待执行(非 executed)
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="executed", request_hash=stored_hash,
+            status="approved", request_hash=stored_hash,
         )
 
         # 1. expected_request_hash 与 stored_hash 一致 → 校验通过(不抛异常)
@@ -207,13 +208,14 @@ class TestValidateProductionApprovalRequestHash:
             expected_request_hash=stored_hash,
         )
 
-        # 2. expected_request_hash 与 stored_hash 不一致 → 抛 PermissionError(TOCTOU)
-        with pytest.raises(PermissionError, match="request_hash 不匹配"):
+        # 2. expected_request_hash 与 stored_hash 不一致 → 抛 AppError(TOCTOU, R51 P0-8 协议化)
+        with pytest.raises(AppError) as exc_info:
             await engine._validate_production_approval(
                 approver_id=principal_id,
                 approval_action_id=approval_action_id,
                 expected_request_hash="tampered_hash_xyz",
             )
+        assert exc_info.value.code == ErrorCodes.PRODUCTION_RESTORE_HASH_MISMATCH
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
@@ -224,9 +226,10 @@ class TestValidateProductionApprovalRequestHash:
         store, engine, _, _ = real_store_with_engine
         approval_action_id = "toctou_skip_001"
         principal_id = 888
+        # R51 P0-8: status='approved' 表示审批通过等待执行
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="executed", request_hash="any_hash",
+            status="approved", request_hash="any_hash",
         )
 
         # 不传 expected_request_hash → 跳过 TOCTOU 校验,应通过
@@ -246,9 +249,10 @@ class TestValidateProductionApprovalRequestHash:
         approval_action_id = "toctou_empty_stored_001"
         principal_id = 777
         # request_hash 存空字符串(模拟旧记录无 hash 字段)
+        # R51 P0-8: status='approved' 表示审批通过等待执行
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="executed", request_hash="",
+            status="approved", request_hash="",
         )
 
         # expected_request_hash 非空,但 stored_hash 为空 → fail-closed
@@ -280,9 +284,10 @@ class TestRestoreRequestHash:
         approval_action_id = "restore_match_001"
         principal_id = 123
         request_hash = "matching_hash_001"
+        # R51 P0-8: status='approved' 表示审批通过等待执行
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="executed", request_hash=request_hash,
+            status="approved", request_hash=request_hash,
         )
 
         # mock db_restore 避免真实写库
@@ -317,9 +322,10 @@ class TestRestoreRequestHash:
         approval_action_id = "restore_mismatch_001"
         principal_id = 456
         stored_hash = "stored_hash_001"
+        # R51 P0-8: status='approved' 表示审批通过等待执行
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="executed", request_hash=stored_hash,
+            status="approved", request_hash=stored_hash,
         )
 
         # mock db_restore(不应被调用,因为校验失败)
@@ -332,24 +338,25 @@ class TestRestoreRequestHash:
             _spy_restore,
         )
 
-        # 传入不匹配的 expected_request_hash → 抛 PermissionError
-        with pytest.raises(PermissionError, match="request_hash 不匹配"):
+        # 传入不匹配的 expected_request_hash → 抛 AppError(R51 P0-8 协议化)
+        with pytest.raises(AppError) as exc_info:
             await engine.restore(
                 backup_id, target="production",
                 approver_id=principal_id,
                 approval_action_id=approval_action_id,
                 expected_request_hash="tampered_hash_999",
             )
+        assert exc_info.value.code == ErrorCodes.PRODUCTION_RESTORE_HASH_MISMATCH
 
         # 校验 db_restore 未被调用
         assert call_count["n"] == 0, "TOCTOU 校验失败时不应调用 db_restore"
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
-    async def test_restore_without_request_hash_still_works(
+    async def test_restore_without_request_hash_now_required(
         self, real_store_with_engine, monkeypatch,
     ):
-        """不传 expected_request_hash 时应跳过 TOCTOU 校验(向后兼容)。"""
+        """R51 P0-8: production 恢复不传 expected_request_hash 时应抛 AppError(TOCTOU 防护不可绕过)。"""
         store, engine, fake_storage, _ = real_store_with_engine
         _patch_backup_all_tables(monkeypatch)
         backup_id = await _make_backup(engine)
@@ -358,26 +365,17 @@ class TestRestoreRequestHash:
         principal_id = 789
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="executed", request_hash="any_hash",
+            status="approved", request_hash="any_hash",
         )
 
-        # mock db_restore
-        async def _fake_restore(*args, **kwargs):
-            return {"restored_tables": 1, "restored_rows": 1}
-        monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data",
-            _fake_restore,
-        )
-
-        # 不传 expected_request_hash → 跳过 TOCTOU 校验,应成功
-        result = await engine.restore(
-            backup_id, target="production",
-            approver_id=principal_id,
-            approval_action_id=approval_action_id,
-        )
-
-        assert result["success"] is True
-        assert result["restored_tables"] == 2  # R44 fixup: mock 数据含 users + file_records 两表
+        # R51 P0-8: 不传 expected_request_hash → 抛 AppError(PRODUCTION_RESTORE_HASH_REQUIRED)
+        with pytest.raises(AppError) as exc_info:
+            await engine.restore(
+                backup_id, target="production",
+                approver_id=principal_id,
+                approval_action_id=approval_action_id,
+            )
+        assert exc_info.value.code == ErrorCodes.PRODUCTION_RESTORE_HASH_REQUIRED
 
 
 # ════════════════════════════════════════════════════════════════
@@ -399,9 +397,10 @@ class TestRestorePrincipalLookup:
 
         approval_action_id = "restore_lookup_001"
         principal_id = 555
+        # R51 P0-8: status='approved' + 传 expected_request_hash
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="executed", request_hash="any_hash",
+            status="approved", request_hash="any_hash",
         )
 
         # mock db_restore
@@ -413,9 +412,11 @@ class TestRestorePrincipalLookup:
         )
 
         # 不传 approver_id(None),让 restore 通过 _lookup_principal_id 反查
+        # R51 P0-8: 传 expected_request_hash 与 stored hash 一致
         result = await engine.restore(
             backup_id, target="production",
             approval_action_id=approval_action_id,
+            expected_request_hash="any_hash",
         )
 
         assert result["success"] is True
@@ -423,7 +424,7 @@ class TestRestorePrincipalLookup:
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
-    async def test_restore_principals_id_reflect_from_command_executions(
+    async def test_lookup_principal_id_returns_zero_for_nonexistent(
         self, real_store_with_engine, monkeypatch,
     ):
         """approval_action_id 不在 command_executions 中时,_lookup_principal_id 返回 0。"""
@@ -443,11 +444,13 @@ class TestRestorePrincipalLookup:
         backup_id = await _make_backup(engine)
 
         # 不在 command_executions 中插入记录 → _lookup_principal_id 返回 0
+        # R51 P0-8: 需传 expected_request_hash 才能到达 principal 反查路径
         # restore 应抛 PermissionError(fail-closed)
         with pytest.raises(PermissionError, match="无法从 command_executions 反查 principal_id"):
             await engine.restore(
                 backup_id, target="production",
                 approval_action_id="missing_action_id_001",
+                expected_request_hash="some_hash_for_principal_lookup_test",
             )
 
 

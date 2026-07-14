@@ -25,6 +25,7 @@ from typing import Any
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.error_codes import AppError, ErrorCodes
 from utils.trace_context import get_trace_id
 
 # 任务状态枚举
@@ -361,12 +362,13 @@ async def list_user_tasks(
     limit: int = 20,
     cursor: int = 0,
 ) -> dict:
-    """R45 第 16 节: 列出用户任务(强制 user_id 过滤,支持 cursor 分页)。
+    """R45 第 16 节 + R51 P1-4: 列出用户任务(强制 user_id 过滤,支持 cursor 分页)。
 
     整改要点:
         - 强制按 user_id 过滤(用户只能看自己的任务)
         - 使用 cursor 分页(基于 id,避免 OFFSET 性能问题)
         - 返回结构化为 dict(含 items + next_cursor + has_more)
+        - R51 P1-4: DB 异常不再返回空 list(fail-silent),改为 raise AppError
 
     Args:
         user_id: 用户 ID(强制过滤)
@@ -380,11 +382,18 @@ async def list_user_tasks(
             "next_cursor": int,       # 下一页游标(0 表示无更多)
             "has_more": bool,          # 是否还有更多数据
         }
+
+    Raises:
+        AppError(TASK_CENTER_LIST_DB_ERROR): DB 查询异常(fail-closed 拒绝)
     """
     store = get_cache_store()
     default = {"items": [], "next_cursor": 0, "has_more": False}
     if not store._db:
-        return default
+        # R51 P1-4: CacheStore 未初始化视为 DB 异常,raise AppError
+        raise AppError(
+            ErrorCodes.TASK_CENTER_LIST_DB_ERROR,
+            params={"user_id": user_id, "reason": "cache_store_unavailable"},
+        )
     limit = max(1, min(100, int(limit)))
     cursor = max(0, int(cursor))
     try:
@@ -426,9 +435,21 @@ async def list_user_tasks(
             "next_cursor": next_cursor if has_more else 0,
             "has_more": has_more,
         }
+    except AppError:
+        raise
     except Exception as e:
-        logger.warning(f"[task_center] list_user_tasks 失败: {e}")
-        return default
+        # R51 P1-4: DB 异常不再返回空 list(fail-silent),
+        # 改为 raise AppError 让上层显式处理(避免误判为"用户无任务")
+        logger.error(
+            f"[task_center] list_user_tasks DB 异常 user={user_id}(fail-closed 拒绝): {e}"
+        )
+        raise AppError(
+            ErrorCodes.TASK_CENTER_LIST_DB_ERROR,
+            params={
+                "user_id": user_id,
+                "reason": f"{type(e).__name__}: {e}",
+            },
+        ) from e
 
 
 async def list_all_tasks(
@@ -437,11 +458,15 @@ async def list_all_tasks(
     status_filter: str | None = None,
     filters: dict | None = None,
 ) -> list:
-    """R40 P1-1 + R45 第 16 节: Admin 列出所有用户的任务(管理后台用)。
+    """R40 P1-1 + R45 第 16 节 + R51 P1-4: Admin 列出所有用户的任务(管理后台用)。
 
     R45 整改:
         - 新增 filters 参数,支持 user_id / task_type / trace_id 多维过滤
         - 保持返回 list[dict] 的旧契约(向后兼容 admin 路由和 bot 命令)
+
+    R51 P1-4 整改:
+        - DB 异常不再返回空 list(fail-silent),改为 raise AppError
+        - 避免管理后台误判"系统无任何任务"导致监控盲区
 
     与 ``list_user_tasks`` 的区别:
         - 不强制 user_id 过滤(Admin 可看所有用户)
@@ -462,10 +487,17 @@ async def list_all_tasks(
         list[dict]: 任务字典列表(按 created_at 倒序),每项含 id/task_type/
         user_id/status/progress/eta_seconds/payload/result/error/trace_id/
         created_at/updated_at 字段。
+
+    Raises:
+        AppError(TASK_CENTER_LIST_DB_ERROR): DB 查询异常(fail-closed 拒绝)
     """
     store = get_cache_store()
     if not store._db:
-        return []
+        # R51 P1-4: CacheStore 未初始化视为 DB 异常
+        raise AppError(
+            ErrorCodes.TASK_CENTER_LIST_DB_ERROR,
+            params={"reason": "cache_store_unavailable"},
+        )
     # clamp limit 到 [1, 200],offset 到 [0, +∞)
     limit = max(1, min(200, int(limit)))
     offset = max(0, int(offset))
@@ -508,9 +540,17 @@ async def list_all_tasks(
             }
             for r in rows
         ]
+    except AppError:
+        raise
     except Exception as e:
-        logger.warning(f"[task_center] list_all_tasks 失败: {e}")
-        return []
+        # R51 P1-4: DB 异常不再返回空 list,改为 raise AppError
+        logger.error(
+            f"[task_center] list_all_tasks DB 异常(fail-closed 拒绝): {e}"
+        )
+        raise AppError(
+            ErrorCodes.TASK_CENTER_LIST_DB_ERROR,
+            params={"reason": f"{type(e).__name__}: {e}"},
+        ) from e
 
 
 async def format_task_status(task: dict) -> str:
@@ -574,21 +614,29 @@ async def record_task(
     status: str,
     metadata: dict | None = None,
 ) -> int:
-    """R41 P1-12: 一站式任务记录(创建 + 直接进入指定状态)。
+    """R41 P1-12 + R51 P1-4: 一站式任务记录(创建 + 直接进入指定状态)。
 
     适用于 Bot 在关键操作完成时(如上传成功、解码成功、派送成功)
     一次性记录任务,无需创建后多次更新。
 
+    R51 P1-4 整改要点:
+    - 未知 task_type 不再静默回退到 "index",改为 raise AppError
+    - 未知 status 不再静默回退到 "pending",改为 raise AppError
+    - 避免错误数据被默默写入,污染任务历史
+
     Args:
         user_id: 用户 ID
-        task_type: 任务类型("upload"/"index"/"copy"/"delivery"/"repair");
-                   未知类型会被规范化为 "index" 兜底(避免数据库约束失败)
+        task_type: 任务类型(必须是 TASK_TYPES 之一:upload/index/copy/delivery/repair)
         status: 任务状态(STATUS_PENDING / STATUS_RUNNING /
                   STATUS_COMPLETED / STATUS_FAILED / STATUS_CANCELLED)
         metadata: 任务元数据(写入 payload,完成时合并到 result,失败时取 error 字段)
 
     Returns:
         task_id;失败返回 0
+
+    Raises:
+        AppError(TASK_CENTER_UNKNOWN_TYPE): 未知 task_type
+        AppError(TASK_CENTER_UNKNOWN_STATUS): 未知 status
 
     Example:
         # 上传成功后记录
@@ -604,21 +652,34 @@ async def record_task(
     """
     if not metadata:
         metadata = {}
-    # 规范化 task_type(未知类型回退到 index)
+    # R51 P1-4: 未知 task_type 拒绝(不再回退到 index)
     if task_type not in TASK_TYPES:
-        logger.warning(
-            f"[task_center] record_task 未知 task_type={task_type},回退到 'index'"
+        logger.error(
+            f"[task_center] record_task 未知 task_type={task_type},拒绝记录"
         )
-        task_type = "index"
-    # 规范化 status(未知状态回退到 pending)
-    if status not in (
+        raise AppError(
+            ErrorCodes.TASK_CENTER_UNKNOWN_TYPE,
+            params={
+                "user_id": user_id, "task_type": task_type,
+                "allowed_types": list(TASK_TYPES),
+            },
+        )
+    # R51 P1-4: 未知 status 拒绝(不再回退到 pending)
+    _ALLOWED_STATUSES = (
         STATUS_PENDING, STATUS_RUNNING, STATUS_COMPLETED,
         STATUS_FAILED, STATUS_CANCELLED,
-    ):
-        logger.warning(
-            f"[task_center] record_task 未知 status={status},回退到 'pending'"
+    )
+    if status not in _ALLOWED_STATUSES:
+        logger.error(
+            f"[task_center] record_task 未知 status={status},拒绝记录"
         )
-        status = STATUS_PENDING
+        raise AppError(
+            ErrorCodes.TASK_CENTER_UNKNOWN_STATUS,
+            params={
+                "user_id": user_id, "status": status,
+                "allowed_statuses": list(_ALLOWED_STATUSES),
+            },
+        )
 
     # 先创建 pending 任务
     payload = dict(metadata) if metadata else {}
@@ -643,5 +704,5 @@ async def record_task(
     if status == STATUS_CANCELLED:
         await cancel_task(task_id)
         return task_id
-    # 兜底(理论上不会到达,前面 status 已规范化)
+    # 兜底(理论上不会到达,前面 status 已校验)
     return task_id

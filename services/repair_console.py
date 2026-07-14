@@ -36,6 +36,7 @@ from typing import Any
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.error_codes import AppError, ErrorCodes
 
 
 # ─── R45 第 16 节: 安全动作白名单 ──────────────────────────────
@@ -60,6 +61,68 @@ _ACTION_DESCRIPTIONS: dict[str, str] = {
     "repair_relay": "修复 relay 账号状态",
     "mark_outbox_skipped": "跳过通知投递",
 }
+
+# R51 P1-5: 动作风险等级映射
+# HIGH: 不可逆/有副作用,必须强制审批(approval_action_id 必填)
+# LOW:  可恢复/可重试,审批可选(但若传了 approval_action_id 仍会校验)
+RISK_LEVEL_HIGH = "high"
+RISK_LEVEL_LOW = "low"
+
+_ACTION_RISK_MAP: dict[str, str] = {
+    "retry_outbox": RISK_LEVEL_LOW,        # 可重试,失败可再次 retry
+    "retry_replication": RISK_LEVEL_LOW,   # 可重试
+    "mark_outbox_skipped": RISK_LEVEL_LOW, # 跳过通知(低影响)
+    "skip_outbox": RISK_LEVEL_HIGH,        # 跳过 dirty_outbox = 数据丢失风险
+    "replay_dlq": RISK_LEVEL_HIGH,         # 重放死信 = 可能产生重复副作用
+    "repair_relay": RISK_LEVEL_HIGH,       # 修改 relay 账号状态 = 影响外发能力
+}
+
+
+def get_action_risk(action: str) -> str:
+    """R51 P1-5: 查询动作风险等级(默认 HIGH,未知动作一律视为高风险)。
+
+    Args:
+        action: 动作名称
+
+    Returns:
+        RISK_LEVEL_HIGH / RISK_LEVEL_LOW
+    """
+    return _ACTION_RISK_MAP.get(action, RISK_LEVEL_HIGH)
+
+
+def is_high_risk_action(action: str) -> bool:
+    """R51 P1-5: 判断动作是否高风险(高风险动作必须强制审批)。
+
+    Args:
+        action: 动作名称
+
+    Returns:
+        True 高风险(必须审批);False 低风险(审批可选)
+    """
+    return get_action_risk(action) == RISK_LEVEL_HIGH
+
+
+def compute_repair_request_hash(
+    action: str, params: dict, target_version: str = "",
+) -> str:
+    """R51 P1-5: 计算修复请求的哈希(绑定 action + params + target_version)。
+
+    用于审批校验:approval_action_id 对应的 command_executions.request_hash
+    必须与此哈希一致,防止审批后被替换参数(anti-tamper)。
+
+    Args:
+        action: 动作名称
+        params: 动作参数
+        target_version: 可选目标版本(如集合 version / 记录 version)
+
+    Returns:
+        64 字符 SHA-256 哈希
+    """
+    payload = json.dumps(
+        {"action": action, "params": params, "target_version": target_version},
+        sort_keys=True, default=str, ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def is_safe_action(action: str) -> bool:
@@ -658,14 +721,21 @@ async def execute_repair(
     params: dict,
     principal_id: int,
     approval_action_id: str = "",
+    target_version: str = "",
 ) -> dict:
-    """R45 第 16 节: 统一修复入口(白名单 + 审批 + 审计一体化)。
+    """R45 第 16 节 + R51 P1-5: 统一修复入口(白名单 + 审批 + 审计一体化)。
 
     所有 Repair Console 的修复操作必须通过此入口执行:
         1. 校验 action 是否在 SAFE_ACTIONS 白名单中(拒绝任意 SQL/Python)
-        2. 若提供 approval_action_id,验证其已在 command_executions 中 executed
-        3. 路由到对应的修复函数(retry_outbox/skip_outbox/...)
-        4. 写 audit_log(action="repair_<action>")记录操作者 + 参数摘要
+        2. R51 P1-5: 按 _ACTION_RISK_MAP 判定风险等级
+            - HIGH 风险动作必须提供 approval_action_id(否则 raise AppError)
+            - LOW 风险动作 approval_action_id 可选(传了仍会校验)
+        3. R51 P1-5: 审批验证三要素:
+            - status == "executed"
+            - command_executions.principal_id == 当前 principal_id
+            - command_executions.request_hash == compute_repair_request_hash(action, params)
+        4. 路由到对应的修复函数(retry_outbox/skip_outbox/...)
+        5. 写 audit_log(action="repair_<action>")记录操作者 + 参数摘要
 
     安全铁律:
         - 严禁添加 "execute_sql" / "execute_python" / "eval" 等动作
@@ -676,8 +746,9 @@ async def execute_repair(
         action: 动作名称(必须在 SAFE_ACTIONS 中)
         params: 动作参数(如 {"ids": [1,2,3]} / {"account_id": 100})
         principal_id: 操作者 admin_id(写入 audit_log.actor_id)
-        approval_action_id: CommandBus 预审批的 action_id(可选,
-            高危动作要求必须提供)
+        approval_action_id: CommandBus 预审批的 action_id
+            高风险动作必填;低风险动作可选
+        target_version: 可选目标版本(参与 request_hash 计算,如集合 version)
 
     Returns:
         {
@@ -690,8 +761,10 @@ async def execute_repair(
         }
 
     Raises:
-        ValueError: action 不在白名单中
-        PermissionError: approval_action_id 无效或未通过
+        AppError(REPAIR_CONSOLE_APPROVAL_REQUIRED): 高风险动作未提供 approval_action_id
+        AppError(REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH): 审批 principal 不匹配
+        AppError(REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH): 审批 request_hash 不匹配(参数被篡改)
+        ValueError: action 不在白名单中(向后兼容旧错误类型)
     """
     # 1. 白名单校验(铁律)
     if not is_safe_action(action):
@@ -710,26 +783,71 @@ async def execute_repair(
             f"动作 '{action}' 不在白名单中,禁止执行(安全铁律)"
         )
 
-    # 2. 审批验证(若提供 approval_action_id)
-    approval_verified = False
-    if approval_action_id:
-        approval_verified = await _verify_approval(approval_action_id)
-        if not approval_verified:
-            logger.warning(
-                f"[RepairConsole] execute_repair 拒绝(审批未通过) "
-                f"action={action} approval_action_id={approval_action_id}"
+    # 2. R51 P1-5: 风险等级判定 + 高风险强制审批
+    expected_hash = compute_repair_request_hash(action, params, target_version)
+    if is_high_risk_action(action):
+        if not approval_action_id:
+            logger.error(
+                f"[RepairConsole] 高风险动作缺少 approval_action_id "
+                f"action={action} principal={principal_id}"
             )
             await _write_repair_audit(
                 principal_id=principal_id,
                 action=f"repair_rejected_{action}",
-                details=f"审批未通过: approval_action_id={approval_action_id}",
-                approval_action_id=approval_action_id,
+                details=(
+                    f"高风险动作缺少 approval_action_id; "
+                    f"params_hash={compute_payload_hash(params)}; "
+                    f"expected_request_hash={expected_hash}"
+                ),
+                approval_action_id="",
             )
-            raise PermissionError(
-                f"approval_action_id 未通过验证: {approval_action_id}"
+            raise AppError(
+                ErrorCodes.REPAIR_CONSOLE_APPROVAL_REQUIRED,
+                params={
+                    "action": action, "principal_id": principal_id,
+                    "risk_level": RISK_LEVEL_HIGH,
+                    "reason": "approval_action_id_required_for_high_risk",
+                },
             )
 
-    # 3. 路由到对应修复函数
+    # 3. R51 P1-5: 审批验证三要素(status + principal + hash)
+    approval_verified = False
+    if approval_action_id:
+        # 验证 status='executed' + principal_id 一致 + request_hash 一致
+        approval_verified = await _verify_approval(
+            approval_action_id,
+            expected_principal_id=principal_id,
+            expected_request_hash=expected_hash,
+        )
+        if not approval_verified:
+            logger.warning(
+                f"[RepairConsole] execute_repair 拒绝(审批未通过) "
+                f"action={action} approval_action_id={approval_action_id} "
+                f"principal={principal_id} expected_hash={expected_hash}"
+            )
+            await _write_repair_audit(
+                principal_id=principal_id,
+                action=f"repair_rejected_{action}",
+                details=(
+                    f"审批未通过: approval_action_id={approval_action_id}; "
+                    f"expected_hash={expected_hash}"
+                ),
+                approval_action_id=approval_action_id,
+            )
+            # 区分具体失败原因(便于排障)
+            # _verify_approval 内部已校验三要素,这里统一抛 principal/hash 不匹配
+            # (status 不符的极少见,归到 hash_mismatch 便于统一处理)
+            raise AppError(
+                ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
+                params={
+                    "action": action, "principal_id": principal_id,
+                    "approval_action_id": approval_action_id,
+                    "expected_request_hash": expected_hash,
+                    "reason": "approval_verification_failed",
+                },
+            )
+
+    # 4. 路由到对应修复函数
     affected_count = 0
     message = ""
     try:
@@ -787,13 +905,14 @@ async def execute_repair(
             "approval_verified": approval_verified,
         }
 
-    # 4. 写审计日志(成功)
+    # 5. 写审计日志(成功)
     audit_id = await _write_repair_audit(
         principal_id=principal_id,
         action=f"repair_{action}",
         details=(
             f"{message}; params_hash={compute_payload_hash(params)}; "
-            f"approval_verified={approval_verified}"
+            f"approval_verified={approval_verified}; "
+            f"request_hash={expected_hash}"
         ),
         approval_action_id=approval_action_id,
     )
@@ -812,26 +931,68 @@ async def execute_repair(
     }
 
 
-async def _verify_approval(approval_action_id: str) -> bool:
-    """R45 内部辅助: 验证 approval_action_id 在 command_executions 中 status='executed'。
+async def _verify_approval(
+    approval_action_id: str,
+    expected_principal_id: int | None = None,
+    expected_request_hash: str | None = None,
+) -> bool:
+    """R45 + R51 P1-5 内部辅助: 验证 approval_action_id 的三要素一致性。
+
+    R51 P1-5 整改要点:
+    - 不再仅校验 status='executed'(原校验不足以防止越权/篡改)
+    - 三要素全部一致才返回 True:
+        1. status == 'executed'
+        2. principal_id == expected_principal_id(审批人 == 操作人)
+        3. request_hash == expected_request_hash(防参数篡改)
+    - 任一不一致返回 False(由调用方抛 AppError)
 
     Args:
         approval_action_id: CommandBus 预审批的 action_id
+        expected_principal_id: 期望的审批人 ID(必须与操作人一致)
+        expected_request_hash: 期望的 request_hash(action + params + target_version 的 SHA-256)
 
     Returns:
-        True 已审批通过;False 未审批 / 状态非 executed / 不存在 / 查询失败
+        True 三要素全部一致;False 任一不一致 / 不存在 / 查询失败
     """
     store = get_cache_store()
     if not store._db or not approval_action_id:
         return False
     try:
         rows = await store._db.execute_fetchall(
-            "SELECT status FROM command_executions WHERE action_id = ?",
+            "SELECT status, principal_id, request_hash "
+            "FROM command_executions WHERE action_id = ?",
             (approval_action_id,),
         )
         if not rows or not rows[0]:
             return False
-        return rows[0][0] == "executed"
+        status, principal_id, request_hash = rows[0][0], rows[0][1], rows[0][2]
+        # 1. status 必须为 'executed'
+        if status != "executed":
+            logger.warning(
+                f"[RepairConsole] _verify_approval 状态非 executed "
+                f"approval_action_id={approval_action_id} status={status}"
+            )
+            return False
+        # 2. R51 P1-5: principal_id 必须一致(防越权使用他人审批)
+        if expected_principal_id is not None:
+            if int(principal_id or 0) != int(expected_principal_id):
+                logger.warning(
+                    f"[RepairConsole] _verify_approval principal 不匹配 "
+                    f"approval_action_id={approval_action_id} "
+                    f"expected={expected_principal_id} actual={principal_id}"
+                )
+                return False
+        # 3. R51 P1-5: request_hash 必须一致(防参数篡改)
+        if expected_request_hash is not None:
+            actual_hash = request_hash or ""
+            if actual_hash != expected_request_hash:
+                logger.warning(
+                    f"[RepairConsole] _verify_approval request_hash 不匹配 "
+                    f"approval_action_id={approval_action_id} "
+                    f"expected={expected_request_hash} actual={actual_hash}"
+                )
+                return False
+        return True
     except Exception as e:
         logger.warning(
             f"[RepairConsole] _verify_approval 查询失败 "

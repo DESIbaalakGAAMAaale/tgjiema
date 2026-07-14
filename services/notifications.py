@@ -78,6 +78,7 @@ async def _ensure_outbox_schema() -> bool:
             - user_id INTEGER NOT NULL
             - notif_type TEXT NOT NULL
             - dedup_key TEXT DEFAULT ''       # 去重键(可空)
+            - window_start TEXT               # R51 P0-5: 去重窗口起始时间(整点对齐)
             - payload TEXT                    # 通知内容快照(JSON)
             - status TEXT DEFAULT 'pending'   # pending/delivered/failed/skipped
             - attempts INTEGER DEFAULT 0      # 投递尝试次数
@@ -111,6 +112,7 @@ async def _ensure_outbox_schema() -> bool:
                 user_id      INTEGER NOT NULL,
                 notif_type   TEXT NOT NULL,
                 dedup_key    TEXT DEFAULT '',
+                window_start TEXT,
                 payload      TEXT,
                 status       TEXT DEFAULT 'pending',
                 attempts     INTEGER DEFAULT 0,
@@ -121,6 +123,13 @@ async def _ensure_outbox_schema() -> bool:
                 updated_at   TEXT
             )"""
         )
+        # R51 P0-5: 旧库补 window_start 列(幂等,已存在则忽略)
+        try:
+            await store._db.execute(
+                "ALTER TABLE notification_outbox ADD COLUMN window_start TEXT"
+            )
+        except Exception:
+            pass  # 列已存在,忽略
         await store._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_notif_outbox_status "
             "ON notification_outbox(status, created_at)"
@@ -128,6 +137,12 @@ async def _ensure_outbox_schema() -> bool:
         await store._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_notif_outbox_user "
             "ON notification_outbox(user_id, status)"
+        )
+        # R51 P0-5: (user_id, dedup_key, window_start) 唯一约束 — 防并发重复投递
+        await store._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_dedup "
+            "ON notification_outbox(user_id, dedup_key, window_start) "
+            "WHERE dedup_key IS NOT NULL AND dedup_key != ''"
         )
         await store._db.execute(
             """CREATE TABLE IF NOT EXISTS notification_receipts (
@@ -180,16 +195,41 @@ def _safe_json_dumps(val) -> str:
     return json.dumps(val, ensure_ascii=False, default=str)
 
 
-async def send(user_id: int, notif_type: str, payload: dict) -> int:
+def _compute_window_start(now: _dt.datetime | None = None) -> str:
+    """R51 P0-5: 计算去重窗口起始时间(整点对齐,1 小时窗口)。
+
+    将当前时间向下取整到整点,作为 dedup 窗口的起始时间。
+    同一小时内多次调用返回相同的 window_start,配合唯一约束防并发重复。
+
+    Args:
+        now: 当前时间(可选,默认 datetime.now())
+
+    Returns:
+        整点对齐的 ISO 格式时间字符串
+    """
+    dt = now or _dt.datetime.now()
+    return dt.replace(minute=0, second=0, microsecond=0).isoformat()
+
+
+async def send(
+    user_id: int,
+    notif_type: str,
+    payload: dict,
+    *,
+    persist_only: bool = False,
+) -> int:
     """发送通知给用户,返回 notif_id。
 
     R45 第 16 节: 同事务写入 notification_outbox(pending),供各 Bot 异步投递。
-    outbox 写入失败不阻塞主流程(notifications 表写入仍成功),仅记录 warning。
+    R51 P0-5: outbox 写入失败必须抛出并回滚整个 transaction(避免孤儿通知)。
+              仅历史型通知可设 persist_only=True 跳过 outbox。
 
     Args:
         user_id: 用户 ID
         notif_type: 通知类型(NOTIF_TYPE_*)
         payload: 通知载荷(JSON 序列化存储)
+        persist_only: True=仅写 notifications 表(历史型通知,不投递);
+                      False=同事务写 notifications + notification_outbox(默认,可投递)
 
     Returns:
         notif_id;失败返回 0
@@ -206,6 +246,8 @@ async def send(user_id: int, notif_type: str, payload: dict) -> int:
     dedup_key = ""
     if isinstance(payload, dict):
         dedup_key = str(payload.get("_dedup_key", "")) or ""
+    # R51 P0-5: 计算 dedup 窗口起始时间(仅当有 dedup_key 时)
+    window_start = _compute_window_start() if dedup_key else None
     # R40 P0-5: 业务表 + dirty_outbox 同事务
     try:
         async with store.transaction() as tx:
@@ -221,29 +263,44 @@ async def send(user_id: int, notif_type: str, payload: dict) -> int:
                     f"[notifications] 发送通知 id={notif_id} "
                     f"user_id={user_id} type={notif_type}"
                 )
-                # R45: 同事务写入 notification_outbox(pending)
-                # outbox 写入失败仅记 warning,不影响 notifications 主表
-                try:
+                # R51 P0-5: persist_only=True 时跳过 outbox(仅历史型通知)
+                if persist_only:
+                    logger.info(
+                        f"[notifications] persist_only=True 跳过 outbox "
+                        f"notif_id={notif_id} user_id={user_id}"
+                    )
+                else:
+                    # R45/R51 P0-5: 同事务写入 notification_outbox(pending)
+                    # outbox 写入失败必须抛出 → 触发 transaction rollback(避免孤儿)
                     await tx.execute(
                         """INSERT INTO notification_outbox
-                           (notif_id, user_id, notif_type, dedup_key, payload,
-                            status, attempts, max_attempts, last_error,
+                           (notif_id, user_id, notif_type, dedup_key, window_start,
+                            payload, status, attempts, max_attempts, last_error,
                             created_at, delivered_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, 'pending', 0, 3, '', ?, NULL, ?)""",
-                        (notif_id, user_id, notif_type, dedup_key,
+                           VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, 3, '', ?, NULL, ?)""",
+                        (notif_id, user_id, notif_type, dedup_key, window_start,
                          payload_json, now, now),
                     )
                     await store.add_dirty_outbox(
                         "notification_outbox", str(notif_id), connection=tx,
                     )
-                except Exception as outbox_err:
-                    logger.warning(
-                        f"[notifications] outbox 写入失败(不影响主表) "
-                        f"notif_id={notif_id}: {outbox_err}"
-                    )
         return notif_id
     except Exception as e:
-        logger.warning(f"[notifications] send 失败: {e}")
+        # R51 P0-5: outbox 写入失败已触发 transaction rollback,无孤儿状态
+        # 使用 ErrorCodes 协议化错误码记录日志(便于审计追踪)
+        from services.error_codes import ErrorCodes
+        # R51 P0-5: 区分唯一约束冲突(并发重复)与其他写入失败
+        err_msg = str(e).lower()
+        if "unique" in err_msg or "constraint" in err_msg:
+            logger.info(
+                f"[notifications] send 去重命中 code={ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE} "
+                f"user_id={user_id} dedup_key={dedup_key}: {e}"
+            )
+        else:
+            logger.warning(
+                f"[notifications] send 失败 code={ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED} "
+                f"user_id={user_id} type={notif_type}: {e}"
+            )
         return 0
 
 
@@ -700,16 +757,21 @@ async def record_notification_receipt(
                     outbox_id = int(ob_row[0])
             if outbox_id:
                 if status == "delivered":
-                    await tx.execute(
+                    # R51 P0-5: CAS — 仅当当前状态为 pending/sending/failed 时才更新
+                    # 若 affected_rows=0,说明已被其他 worker 处理为终态(delivered/skipped),跳过
+                    cas_cur = await tx.execute(
                         """UPDATE notification_outbox
                            SET status = 'delivered', delivered_at = ?,
                                updated_at = ?, last_error = ''
-                           WHERE id = ?""",
+                           WHERE id = ?
+                             AND status IN ('pending', 'sending', 'failed')""",
                         (now, now, outbox_id),
                     )
+                    cas_affected = int(cas_cur.rowcount) if cas_cur else 0
                 else:
                     # status == 'failed' → 增加 attempts,判断是否超限
-                    await tx.execute(
+                    # R51 P0-5: CAS — 仅当当前状态为 pending/sending/failed 时才更新
+                    cas_cur = await tx.execute(
                         """UPDATE notification_outbox
                            SET attempts = attempts + 1,
                                last_error = ?, updated_at = ?,
@@ -718,12 +780,20 @@ async def record_notification_receipt(
                                    THEN 'skipped'
                                    ELSE 'failed'
                                END
-                           WHERE id = ?""",
+                           WHERE id = ?
+                             AND status IN ('pending', 'sending', 'failed')""",
                         (error[:500], now, outbox_id),
                     )
-                await store.add_dirty_outbox(
-                    "notification_outbox", str(outbox_id), connection=tx,
-                )
+                    cas_affected = int(cas_cur.rowcount) if cas_cur else 0
+                if cas_affected > 0:
+                    await store.add_dirty_outbox(
+                        "notification_outbox", str(outbox_id), connection=tx,
+                    )
+                else:
+                    logger.info(
+                        f"[notifications] CAS 跳过 outbox_id={outbox_id} "
+                        f"(已被其他 worker 处理或终态)"
+                    )
             # 3. dirty_outbox for notification_receipts
             if receipt_id:
                 await store.add_dirty_outbox(
@@ -804,16 +874,24 @@ async def mark_outbox_skipped(outbox_id: int, reason: str = "") -> bool:
     now = _dt.datetime.now().isoformat()
     try:
         async with store.transaction() as tx:
+            # R51 P0-5: CAS — 仅当当前状态为 pending/failed 时才标记 skipped
+            # 若 affected_rows=0,说明已被其他 worker 处理为终态(delivered/skipped),跳过
             cursor = await tx.execute(
                 """UPDATE notification_outbox
                    SET status = 'skipped', last_error = ?, updated_at = ?
-                   WHERE id = ?""",
+                   WHERE id = ?
+                     AND status IN ('pending', 'failed')""",
                 (reason[:500], now, outbox_id),
             )
             ok = bool(cursor and cursor.rowcount > 0)
             if ok:
                 await store.add_dirty_outbox(
                     "notification_outbox", str(outbox_id), connection=tx,
+                )
+            else:
+                logger.info(
+                    f"[notifications] mark_outbox_skipped CAS 跳过 "
+                    f"outbox_id={outbox_id}(已为终态)"
                 )
         return ok
     except Exception as e:

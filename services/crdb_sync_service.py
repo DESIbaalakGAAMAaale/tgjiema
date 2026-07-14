@@ -1186,7 +1186,7 @@ async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col:
                 f"[crdb_sync] R46 P1: tombstone schema probe failed, routing to DLQ "
                 f"table={crdb_table} records={len(records)}"
             )
-            await _route_dirty_outbox_to_dlq(
+            dlq_result = await _route_dirty_outbox_to_dlq(
                 crdb_table, records,
                 "tombstone schema probe failed, routing to DLQ",
             )
@@ -1197,13 +1197,24 @@ async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col:
                 f"routing to DLQ (hard delete only by retention worker) "
                 f"records={len(records)}"
             )
-            await _route_dirty_outbox_to_dlq(
+            dlq_result = await _route_dirty_outbox_to_dlq(
                 crdb_table, records,
                 f"table {crdb_table} does not support soft_delete, "
                 f"hard delete only by retention worker",
             )
-        # R46 P1: 返回所有 id 让 _sync_dirty_outbox 标记为 processed(已在 DLQ)
-        return [r.get("id") for r in records if r.get("id") is not None]
+        # R51 P0-9: 只有 SQLite DLQ 权威写入成功才标记 dirty processed
+        # DLQ 写入失败时返回空列表,保持 dirty pending(下次轮询重试,指数退避)
+        if dlq_result.get("success"):
+            # DLQ 写入成功 → 返回所有 id 让 _sync_dirty_outbox 标记为 processed
+            return [r.get("id") for r in records if r.get("id") is not None]
+        else:
+            # DLQ 写入失败 → 保持 dirty pending,不标记 processed
+            logger.error(
+                f"[crdb_sync] R51 P0-9: tombstone DLQ 写入失败,保持 dirty pending "
+                f"table={crdb_table} failed_ids={dlq_result.get('failed_ids')} "
+                f"error={dlq_result.get('error')}"
+            )
+            return []
 
     logger.debug(
         f"[crdb_sync] R46 P1: {crdb_table} 支持 soft_delete, "
@@ -1332,8 +1343,8 @@ except Exception:
 
 async def _route_dirty_outbox_to_dlq(
     table_name: str, records: list[dict], error_msg: str,
-) -> None:
-    """R40 P0-5 / R41 P0-6: 将处理失败的 dirty_outbox 记录路由到死信队列(DLQ)。
+) -> dict:
+    """R40 P0-5 / R41 P0-6 / R51 P0-9: 将处理失败的 dirty_outbox 记录路由到死信队列(DLQ)。
 
     R41 P0-6 增强:
       - DLQ 记录写入 SQLite dlq_records 表(权威存储,字段完整):
@@ -1342,10 +1353,25 @@ async def _route_dirty_outbox_to_dlq(
       - 同时镜像写入 data/dead_letter.jsonl(向后兼容 repair_console.list_dlq())
       - max_retries=5,达到上限后 cleanup_dlq() 标记 permanently_failed,不再重试。
 
+    R51 P0-9 修复(DLQ 持久性 ACK):
+      - 返回 durable success/failed 字典,只有 SQLite DLQ 权威写入成功才视为 success
+      - JSONL 仅作为镜像,不可决定成功(即使 JSONL 写成功但 SQLite 失败 → success=False)
+      - 调用方根据返回值决定是否标记 dirty_outbox processed:
+        * success=True → 标记 dirty processed(删除事件已安全持久化到 DLQ)
+        * success=False → 保持 dirty pending(下次轮询重试,指数退避)
+      - 返回 failed_ids 列表(写入 SQLite 失败的记录 id)
+
     Args:
         table_name: 受影响表名
         records: 失败的 dirty_outbox 行列表
         error_msg: 失败原因
+
+    Returns:
+        {
+            "success": bool,         # SQLite DLQ 权威写入是否全部成功
+            "failed_ids": list[int], # 写入失败的 dirty_outbox.id 列表
+            "error": str,            # 失败原因(成功时为空字符串)
+        }
     """
     import json as _json
     import os as _os
@@ -1359,9 +1385,22 @@ async def _route_dirty_outbox_to_dlq(
         _dt.datetime.now() + _dt.timedelta(seconds=60)
     ).isoformat()
 
+    # R51 P0-9: 跟踪 SQLite DLQ 写入失败的记录 id
+    sqlite_failed_ids: list[int] = []
+    sqlite_error_msg = ""
+
     # ── 1. 写 SQLite dlq_records 表(权威存储) ──
+    # R51 P0-9: 只有 SQLite DLQ 写入成功才视为 durable success
     store = _get_cache_store_safe()
-    if store is not None:
+    if store is None:
+        # CacheStore 不可用 → SQLite DLQ 无法写入 → fail(不依赖 JSONL)
+        sqlite_failed_ids = [r.get("id") for r in records if r.get("id") is not None]
+        sqlite_error_msg = "CacheStore 不可用,SQLite DLQ 无法写入"
+        logger.error(
+            f"[crdb_sync] R51 P0-9: CacheStore 不可用,SQLite DLQ 写入失败 "
+            f"table={table_name} records={len(records)}"
+        )
+    else:
         try:
             for r in records:
                 original_payload = {
@@ -1372,7 +1411,7 @@ async def _route_dirty_outbox_to_dlq(
                     "payload": r.get("payload"),
                     "created_at": r.get("created_at"),
                 }
-                await store.insert_dlq_record(
+                dlq_id = await store.insert_dlq_record(
                     message_id=f"dirty_outbox:{r.get('id', '')}",
                     table_name=table_name,
                     reason=f"crdb_sync dispatch 失败: {error_msg}",
@@ -1380,12 +1419,21 @@ async def _route_dirty_outbox_to_dlq(
                     max_retries=max_retries,
                     next_retry_at=next_retry_at_str,
                 )
+                # R51 P0-9: insert_dlq_record 返回 0 表示写入失败
+                if dlq_id == 0:
+                    rid = r.get("id")
+                    if rid is not None:
+                        sqlite_failed_ids.append(rid)
         except Exception as sqlite_err:
+            # SQLite DLQ 写入异常 → 所有记录视为失败
+            sqlite_failed_ids = [r.get("id") for r in records if r.get("id") is not None]
+            sqlite_error_msg = f"SQLite dlq_records 写入异常: {sqlite_err}"
             logger.warning(
                 f"[crdb_sync] R41 P0-6: SQLite dlq_records 写入失败,降级 jsonl: {sqlite_err}"
             )
 
     # ── 2. 镜像写入 data/dead_letter.jsonl(向后兼容 repair_console.list_dlq) ──
+    # R51 P0-9: JSONL 仅作为镜像,不影响 success 判定
     dead_file = _os.path.join(
         _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
         "data", "dead_letter.jsonl",
@@ -1416,7 +1464,16 @@ async def _route_dirty_outbox_to_dlq(
             f"已路由到 DLQ(table={table_name}, reason={error_msg})"
         )
     except Exception as dlq_err:
-        logger.error(f"[crdb_sync] R40 P0-5: DLQ 写入失败: {dlq_err}")
+        logger.error(f"[crdb_sync] R40 P0-5: DLQ JSONL 镜像写入失败: {dlq_err}")
+
+    # R51 P0-9: 返回 durable success/failed 字典
+    # success = SQLite DLQ 权威写入全部成功(JSONL 不影响)
+    success = len(sqlite_failed_ids) == 0
+    return {
+        "success": success,
+        "failed_ids": sqlite_failed_ids,
+        "error": sqlite_error_msg if not success else "",
+    }
 
 
 async def _dispatch_dirty_outbox_to_crdb(
@@ -1479,23 +1536,37 @@ async def _dispatch_dirty_outbox_to_crdb(
                 f"[crdb_sync] R41 P0-6: CRDB 表 {table_name} 缺失 upsert handler, "
                 f"{len(records)} 条 → DLQ(不静默丢弃)"
             )
-            await _route_dirty_outbox_to_dlq(
+            dlq_result = await _route_dirty_outbox_to_dlq(
                 table_name, records,
                 f"CRDB 表缺失 upsert handler(策略={table_name} → CRDB)",
             )
-            # R41 P0-6: 返回所有 id 让 _sync_dirty_outbox 标记为 processed,
-            # 避免重复 dispatch 同一记录(已在 DLQ,无需再走 dispatch)
-            return [r.get("id") for r in records if r.get("id") is not None]
+            # R51 P0-9: 只有 DLQ 写入成功才标记 processed
+            if dlq_result.get("success"):
+                return [r.get("id") for r in records if r.get("id") is not None]
+            else:
+                logger.error(
+                    f"[crdb_sync] R51 P0-9: DLQ 写入失败,保持 dirty pending "
+                    f"table={table_name} error={dlq_result.get('error')}"
+                )
+                return []
         if tombstone_table is None or pk_col is None:
             logger.error(
                 f"[crdb_sync] R41 P0-6: CRDB 表 {table_name} 缺失 tombstone handler, "
                 f"{len(records)} 条 → DLQ(不静默丢弃)"
             )
-            await _route_dirty_outbox_to_dlq(
+            dlq_result = await _route_dirty_outbox_to_dlq(
                 table_name, records,
                 f"CRDB 表缺失 tombstone handler(策略={table_name} → CRDB)",
             )
-            return [r.get("id") for r in records if r.get("id") is not None]
+            # R51 P0-9: 只有 DLQ 写入成功才标记 processed
+            if dlq_result.get("success"):
+                return [r.get("id") for r in records if r.get("id") is not None]
+            else:
+                logger.error(
+                    f"[crdb_sync] R51 P0-9: DLQ 写入失败,保持 dirty pending "
+                    f"table={table_name} error={dlq_result.get('error')}"
+                )
+                return []
 
     # 已知 table 且 handler 就绪: 按 operation 分流
     if upsert_handler is not None:
@@ -1509,10 +1580,16 @@ async def _dispatch_dirty_outbox_to_crdb(
                 f"{len(dead_records)} 条 → DLQ(不标记 processed): "
                 f"ops={[r.get('operation') for r in dead_records]}"
             )
-            await _route_dirty_outbox_to_dlq(
+            dead_dlq_result = await _route_dirty_outbox_to_dlq(
                 table_name, dead_records,
                 f"未知 operation(合法: upsert/tombstone)",
             )
+            # R51 P0-9: 只有 DLQ 写入成功才将 dead_records 加入 processed 列表
+            if not dead_dlq_result.get("success"):
+                logger.error(
+                    f"[crdb_sync] R51 P0-9: dead_records DLQ 写入失败,保持 pending "
+                    f"table={table_name} error={dead_dlq_result.get('error')}"
+                )
         # 按 operation 二次分组
         upsert_records = [r for r in valid_records if r.get("operation") == "upsert"]
         tombstone_records = [r for r in valid_records if r.get("operation") == "tombstone"]
@@ -1523,8 +1600,14 @@ async def _dispatch_dirty_outbox_to_crdb(
             processed.extend(
                 await _dispatch_crdb_tombstone(tombstone_records, tombstone_table, pk_col)
             )
-        # R41 P0-6: dead_records 已路由到 DLQ,加入 processed 列表避免重复 dispatch
-        processed.extend(r.get("id") for r in dead_records if r.get("id") is not None)
+        # R41 P0-6 + R51 P0-9: dead_records 已路由到 DLQ
+        # R51 P0-9: 只有 DLQ 写入成功才加入 processed 列表(避免重复 dispatch)
+        # DLQ 写入失败时 dead_records 不加入 processed,保持 dirty pending 重试
+        if dead_records:
+            if dead_dlq_result.get("success"):
+                processed.extend(
+                    r.get("id") for r in dead_records if r.get("id") is not None
+                )
         return processed
 
     # 未知 table(未在 TABLE_REPLICATION_POLICY 中声明) → DEAD
@@ -1650,6 +1733,8 @@ async def _sync_dirty_outbox():
 
     all_processed: list[int] = []
     local_only_processed: list[int] = []
+    # R51 P0-9: 收集 DLQ 写入失败的 dirty_outbox.id,用于 mark_dirty_retry(指数退避)
+    retry_failed_ids: list[int] = []
     for table_name, records in groups.items():
         try:
             ids = await _dispatch_dirty_outbox_to_crdb(table_name, records)
@@ -1659,17 +1744,59 @@ async def _sync_dirty_outbox():
             else:
                 all_processed.extend(ids)
             # R40 P0-5: 处理失败的记录(未返回 id)路由到 DLQ
+            # R51 P0-9: 只有 DLQ 写入成功才将 failed_records 加入 processed
             failed_records = [r for r in records if r.get("id") not in ids]
             if failed_records:
-                await _route_dirty_outbox_to_dlq(
+                failed_dlq_result = await _route_dirty_outbox_to_dlq(
                     table_name, failed_records, "dispatch 返回未处理 id",
                 )
+                # R51 P0-9: DLQ 写入成功 → failed_records 已在 DLQ,无需再 dispatch
+                # DLQ 写入失败 → 保持 dirty pending(不加入 processed,下次重试)
+                if failed_dlq_result.get("success"):
+                    all_processed.extend(
+                        r.get("id") for r in failed_records
+                        if r.get("id") is not None
+                        and table_name not in _LOCAL_ONLY_TABLES
+                    )
+                else:
+                    logger.error(
+                        f"[crdb_sync] R51 P0-9: failed_records DLQ 写入失败,"
+                        f"保持 dirty pending table={table_name} "
+                        f"error={failed_dlq_result.get('error')}"
+                    )
+                    # R51 P0-9: 收集失败 id 用于 mark_dirty_retry(指数退避)
+                    retry_failed_ids.extend(
+                        r.get("id") for r in failed_records
+                        if r.get("id") is not None
+                    )
         except Exception as e:
             logger.warning(
                 f"[crdb_sync] R40 P0-5: dispatch table={table_name} 异常: {e}"
             )
             # R40 P0-5: 异常时整批路由到 DLQ
-            await _route_dirty_outbox_to_dlq(table_name, records, str(e))
+            # R51 P0-9: 只有 DLQ 写入成功才标记 processed
+            except_dlq_result = await _route_dirty_outbox_to_dlq(
+                table_name, records, str(e),
+            )
+            if except_dlq_result.get("success"):
+                # DLQ 写入成功 → 标记 processed(已在 DLQ,避免重复 dispatch)
+                if table_name in _LOCAL_ONLY_TABLES:
+                    local_only_processed.extend(
+                        r.get("id") for r in records if r.get("id") is not None
+                    )
+                else:
+                    all_processed.extend(
+                        r.get("id") for r in records if r.get("id") is not None
+                    )
+            else:
+                logger.error(
+                    f"[crdb_sync] R51 P0-9: 异常批 DLQ 写入失败,保持 dirty pending "
+                    f"table={table_name} error={except_dlq_result.get('error')}"
+                )
+                # R51 P0-9: 收集失败 id 用于 mark_dirty_retry(指数退避)
+                retry_failed_ids.extend(
+                    r.get("id") for r in records if r.get("id") is not None
+                )
 
     # R41: 被合并的旧版本 id 也标记为 processed(已包含在最新版本中)
     # 避免下一轮重复 dispatch 同一 (table_name, pk) 的旧版本
@@ -1680,6 +1807,21 @@ async def _sync_dirty_outbox():
         await store.mark_dirty_processed(all_processed)
     if local_only_processed:
         await store.mark_dirty_local_only(local_only_processed)
+    # R51 P0-9: DLQ 写入失败的记录设置 last_error + next_retry_at(指数退避)
+    if retry_failed_ids:
+        try:
+            await store.mark_dirty_retry(
+                retry_failed_ids,
+                error_msg="R51 P0-9: DLQ SQLite 写入失败,等待重试",
+            )
+            logger.info(
+                f"[crdb_sync] R51 P0-9: {len(retry_failed_ids)} 条 dirty_outbox "
+                f"DLQ 写入失败,已设置 last_error + next_retry_at(指数退避)"
+            )
+        except Exception as retry_err:
+            logger.warning(
+                f"[crdb_sync] R51 P0-9: mark_dirty_retry 异常(可忽略): {retry_err}"
+            )
     total_marked = len(all_processed) + len(local_only_processed)
     if total_marked > 0:
         logger.debug(

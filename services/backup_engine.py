@@ -848,7 +848,8 @@ class BackupEngine:
 
         R42 P1-3 强化:
             - target="production" 时 approval_action_id 必填,否则抛 ValueError
-            - approval_action_id 必须在 command_executions 表中 status='executed'
+            - approval_action_id 必须在 command_executions 表中 status='approved'
+              (R51 P0-8: 状态语义区分 approved 与 executed,恢复前不应要求已 executed)
             - approver_id 必须与 command_executions.principal_id 一致
             - 公共 API 不直接执行恢复,必须经过审批验证后调用 _restore_internal()
 
@@ -862,9 +863,17 @@ class BackupEngine:
             - R44 G0-3: 公共 API 不再接受 approver_id 参数(已弃用,保留向后兼容);
               approver_id 从 command_executions.principal_id 反查
 
+        R51 P0-8 强化(production restore hash 强制):
+            - production 模式强制 expected_request_hash 非空(TOCTOU 防护不可绕过)
+            - hash 必须绑定 backup_id、target、schema_version、requested_by、approval_id
+            - command_executions.status='approved' 表示审批通过等待执行;
+              status='executed' 表示恢复已完成(拒绝重复执行)
+            - 恢复成功后 _restore_internal 将 status 更新为 'executed'
+
         流程:
             1. 校验 backup_id 非空
-            2. 若 target="production":校验 approval_action_id + 审批状态 + TOCTOU
+            2. 若 target="production":校验 approval_action_id + expected_request_hash
+               非空 + 审批状态 + TOCTOU
             3. 校验 COMPLETE marker 存在
             4. 调用 _restore_internal() 执行实际恢复
 
@@ -877,14 +886,19 @@ class BackupEngine:
             approval_action_id: 审批动作 ID(production 恢复时必填,
                                 对应 command_executions.action_id)
             expected_request_hash: 期望的 request_hash(由调用方基于
-                                   backup_id + tables + merge 计算);
-                                   None 时跳过 TOCTOU 校验(向后兼容)
+                                   backup_id + target + schema_version + requested_by +
+                                   approval_id 计算,使用 _compute_restore_request_hash);
+                                   R51 P0-8: production 模式必填,不可为空
 
         Returns:
             {success, restored_tables, restored_rows, checksum_verified, error}
 
         Raises:
-            ValueError: target="production" 且 approval_action_id 为空
+            AppError: target="production" 且 approval_action_id 为空
+                      (BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED);
+                      target="production" 且 expected_request_hash 为空
+                      (PRODUCTION_RESTORE_HASH_REQUIRED);
+                      command_executions.status='executed'(RESTORE_ALREADY_EXECUTED)
             PermissionError: approval_action_id 不存在 / 未审批 / approver_id 不匹配 /
                              request_hash 不匹配(TOCTOU 攻击)
         """
@@ -918,6 +932,13 @@ class BackupEngine:
                 raise AppError(
                     ErrorCodes.BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED,
                     params={"backup_id": backup_id},
+                )
+            # R51 P0-8: production 模式强制 expected_request_hash 非空
+            # 防止 TOCTOU 校验被绕过(hash 为空时跳过校验的旧逻辑已废弃)
+            if not expected_request_hash:
+                raise AppError(
+                    ErrorCodes.PRODUCTION_RESTORE_HASH_REQUIRED,
+                    params={"backup_id": backup_id, "target": target},
                 )
             # R44 G0-3: 若 approver_id 未传(None),从 command_executions.principal_id 反查
             effective_approver_id = approver_id
@@ -995,20 +1016,63 @@ class BackupEngine:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _compute_restore_request_hash(
+        backup_id: str,
+        target: str,
+        schema_version: str,
+        requested_by: int,
+        approval_id: str,
+    ) -> str:
+        """R51 P0-8: 计算 production restore 的 request_hash(绑定关键参数)。
+
+        hash 绑定字段(防止 TOCTOU 攻击 — 审批通过后任一字段被篡改都会导致 hash 不匹配):
+            - backup_id: 恢复的备份 ID
+            - target: 恢复目标(production / staging)
+            - schema_version: manifest schema 版本(MANIFEST_SCHEMA_VERSION)
+            - requested_by: 审批人 principal_id(来自 command_executions.principal_id)
+            - approval_id: 审批动作 ID(approval_action_id)
+
+        使用 compute_effect_request_hash_safe(effect_type='restore', params) 计算,
+        'restore' 属于 CRITICAL_EFFECT_TYPES,params 为空时 fail-closed。
+
+        Args:
+            backup_id: 备份 ID
+            target: 恢复目标
+            schema_version: manifest schema 版本
+            requested_by: 审批人 principal_id
+            approval_id: 审批动作 ID
+
+        Returns:
+            SHA256 hex 字符串(64 字符)
+        """
+        from services.effect_receipts import compute_effect_request_hash_safe
+        params = {
+            "backup_id": str(backup_id),
+            "target": str(target),
+            "schema_version": str(schema_version),
+            "requested_by": int(requested_by),
+            "approval_id": str(approval_id),
+        }
+        return compute_effect_request_hash_safe("restore", params)
+
     async def _validate_production_approval(
         self,
         approver_id: int,
         approval_action_id: str,
         expected_request_hash: str | None = None,
     ) -> None:
-        """R42 P1-3 + R44 G0-1: 校验生产恢复审批状态(含 TOCTOU 防护)。
+        """R42 P1-3 + R44 G0-1 + R51 P0-8: 校验生产恢复审批状态(含 TOCTOU 防护)。
 
         校验逻辑:
             1. approval_action_id 必须在 command_executions 表中存在
-            2. status 必须为 'executed'(已审批通过)
+            2. R51 P0-8: status 必须为 'approved'(审批通过等待执行);
+               status='executed' 表示恢复已完成 → 拒绝重复执行(RESTORE_ALREADY_EXECUTED)
             3. approver_id 必须与 command_executions.principal_id 一致
-            4. R44 G0-1: 若传入 expected_request_hash,则比对 command_executions.request_hash
-               防止 TOCTOU 攻击(审批与执行之间 payload 被篡改)
+            4. R44 G0-1 + R51 P0-8: 若传入 expected_request_hash,则比对
+               command_executions.request_hash 防止 TOCTOU 攻击;
+               R51 P0-8: production 模式下 expected_request_hash 在 restore() 中
+               已强制非空,此处不再跳过空 hash
 
         注:command_executions.principal_id 是创建审批的 admin principal ID
         (即"审批 owner"),与"approver_id"(执行恢复的人)应一致。
@@ -1016,15 +1080,23 @@ class BackupEngine:
         request_hash 是 SHA256(payload params),审批时记录、恢复时复核,
         防止"审批通过后 payload 被替换"的 TOCTOU 漏洞。
 
+        R51 P0-8 状态语义:
+            - 'pending':  审批待处理(未通过)
+            - 'approved': 审批通过,等待执行 restore
+            - 'executed': restore 已完成(拒绝重复执行)
+            - 其他:      未知状态(fail-closed 拒绝)
+
         Args:
             approver_id: 调用方传入的审批人 ID
             approval_action_id: 审批动作 ID
             expected_request_hash: 期望的 request_hash(由调用方基于
-                backup_id + tables + merge 计算);None 时跳过 hash 校验
-                (向后兼容已有调用方)
+                backup_id + target + schema_version + requested_by + approval_id
+                计算,使用 _compute_restore_request_hash);
+                R51 P0-8: production 模式下必填(在 restore() 中已强制)
 
         Raises:
-            PermissionError: approval_action_id 不存在 / status != 'executed' /
+            AppError: status='executed'(RESTORE_ALREADY_EXECUTED,恢复已完成)
+            PermissionError: approval_action_id 不存在 / status != 'approved' /
                              approver_id 不匹配 principal_id /
                              request_hash 不匹配(TOCTOU 攻击)
         """
@@ -1059,10 +1131,20 @@ class BackupEngine:
 
         principal_id, status, stored_request_hash = row[0], row[1], row[2]
 
-        # status 必须为 'executed'(已审批通过)
-        if status != "executed":
+        # R51 P0-8: 状态语义区分 approved 与 executed
+        # - 'approved': 审批通过,等待执行 restore → 允许继续
+        # - 'executed': restore 已完成 → 拒绝重复执行(RESTORE_ALREADY_EXECUTED)
+        # - 其他(pending/未知): fail-closed 拒绝
+        if status == "executed":
+            # 恢复已完成,禁止重复执行
+            raise AppError(
+                ErrorCodes.RESTORE_ALREADY_EXECUTED,
+                params={"approval_action_id": approval_action_id},
+            )
+        if status != "approved":
+            # 非 approved 状态(pending/未知)→ fail-closed
             raise PermissionError(
-                f"R42 P1-3: approval_action_id 状态非 executed "
+                f"R42 P1-3: approval_action_id 状态非 approved "
                 f"(approval_action_id={approval_action_id}, status={status})"
             )
 
@@ -1079,10 +1161,10 @@ class BackupEngine:
                 f"(approver_id={approver_id}, principal_id={principal_id_int})"
             )
 
-        # R44 G0-1: TOCTOU 防护 — request_hash 比对
-        # 若调用方传入 expected_request_hash,则与 command_executions 中存储的 hash 比对,
-        # 防止"审批通过后 payload 被替换"的 TOCTOU 攻击。
-        # expected_request_hash=None 时跳过(向后兼容已有调用方,如 staging 模式恢复)
+        # R44 G0-1 + R51 P0-8: TOCTOU 防护 — request_hash 比对
+        # R51 P0-8: production 模式下 expected_request_hash 在 restore() 中已强制非空,
+        # 此处不再跳过空 hash(若直接调用 _validate_production_approval 且 hash 为空,
+        # 仍跳过以保持方法级向后兼容,但 production 路径不会出现 hash=None)
         if expected_request_hash is not None:
             if not stored_request_hash:
                 # command_executions 中无 request_hash → 无法校验, fail-closed
@@ -1091,8 +1173,13 @@ class BackupEngine:
                     f"(approval_action_id={approval_action_id})"
                 )
             if stored_request_hash != expected_request_hash:
-                raise PermissionError(
-                    "request_hash 不匹配,可能存在 TOCTOU 攻击"
+                # R51 P0-8: 协议化为 PRODUCTION_RESTORE_HASH_MISMATCH
+                raise AppError(
+                    ErrorCodes.PRODUCTION_RESTORE_HASH_MISMATCH,
+                    params={
+                        "backup_id": "",
+                        "approval_action_id": approval_action_id,
+                    },
                 )
 
         # 校验通过 → 不抛异常,继续执行恢复
@@ -1301,6 +1388,29 @@ class BackupEngine:
             )
         except Exception:
             pass  # 不影响 restore 主流程
+
+        # R51 P0-8: 恢复成功后将 command_executions.status 从 'approved' 更新为 'executed'
+        # 确保恢复完成后审批状态标记为已执行,防止重复执行(RESTORE_ALREADY_EXECUTED)
+        if approval_action_id and target == "production":
+            try:
+                store = self._get_cache_store()
+                if hasattr(store, "_db") and store._db:
+                    await store._db.execute(
+                        "UPDATE command_executions SET status = 'executed', "
+                        "updated_at = ? WHERE action_id = ? AND status = 'approved'",
+                        (_utcnow_iso(), approval_action_id),
+                    )
+                    await store._db.commit()
+                    logger.info(
+                        f"[BackupEngine] R51 P0-8: command_executions.status "
+                        f"approved→executed (approval_action_id={approval_action_id})"
+                    )
+            except Exception as e:
+                # 状态更新失败不影响恢复结果(数据已恢复),但记录警告
+                logger.warning(
+                    f"[BackupEngine] R51 P0-8: 更新 command_executions.status 失败 "
+                    f"(approval_action_id={approval_action_id}): {e}"
+                )
 
         return {
             "success": True,

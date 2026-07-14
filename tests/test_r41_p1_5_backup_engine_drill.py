@@ -473,9 +473,11 @@ class TestScenario8StagingRestoreNoDbWrite:
         monkeypatch.setattr(engine, "_validate_production_approval", _noop_validate)
 
         # R42 P1-3: production restore 必须提供 approval_action_id
+        # R51 P0-8: production restore 必须传 expected_request_hash
         result = await engine.restore(
             backup_id, target="production", approver_id=999,
             approval_action_id="approval_test_id",
+            expected_request_hash="test_hash_for_drill",
         )
 
         assert result["success"] is True

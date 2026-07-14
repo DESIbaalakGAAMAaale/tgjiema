@@ -584,16 +584,18 @@ class TestP13ProductionRestoreApproval:
         fake_db.set_query_result("command_executions", [])  # fetchone 返回 None
         cache._db = fake_db
 
+        # R51 P0-8: production restore 必须传 expected_request_hash
         with pytest.raises(PermissionError, match="不存在"):
             await engine.restore(
                 backup_id, target="production", approver_id=999,
                 approval_action_id="nonexistent_id",
+                expected_request_hash="some_hash",
             )
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
     async def test_production_restore_approval_not_executed_raises(self, monkeypatch):
-        """approval_action_id status != 'executed' → PermissionError。"""
+        """approval_action_id status != 'approved' → PermissionError(R51 P0-8 状态语义)。"""
         _patch_backup_all_tables(monkeypatch)
         engine, storage, cache, _ = _build_engine_with_kek(monkeypatch)
 
@@ -608,10 +610,13 @@ class TestP13ProductionRestoreApproval:
         )
         cache._db = fake_db
 
-        with pytest.raises(PermissionError, match="非 executed"):
+        # R51 P0-8: production restore 必须传 expected_request_hash
+        # R51 P0-8: status='pending' 非 'approved' → PermissionError "非 approved"
+        with pytest.raises(PermissionError, match="非 approved"):
             await engine.restore(
                 backup_id, target="production", approver_id=999,
                 approval_action_id="approval_pending_id",
+                expected_request_hash="some_hash",
             )
 
     @pytest.mark.asyncio
@@ -625,10 +630,12 @@ class TestP13ProductionRestoreApproval:
         backup_id = manifest["backup_id"]
 
         # mock _db 返回 principal_id=888,与 approver_id=999 不匹配
+        # R51 P0-8: status='approved'(通过状态检查),hash 匹配(通过 hash 检查)
+        # 但 approver_id=999 ≠ principal_id=888 → PermissionError "不一致"
         fake_db = _FakeDB()
         fake_db.set_query_result(
             "command_executions",
-            [(888, "executed", None)],  # R44: (principal_id=888, status=executed, request_hash)
+            [(888, "approved", "stored_hash")],  # R51: status=approved, request_hash=stored_hash
         )
         cache._db = fake_db
 
@@ -636,12 +643,13 @@ class TestP13ProductionRestoreApproval:
             await engine.restore(
                 backup_id, target="production", approver_id=999,
                 approval_action_id="approval_mismatch_id",
+                expected_request_hash="stored_hash",
             )
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
     async def test_production_restore_with_valid_approval_succeeds(self, monkeypatch):
-        """approver_id 与 principal_id 一致 + status='executed' → 恢复成功。"""
+        """approver_id 与 principal_id 一致 + status='approved' + hash 匹配 → 恢复成功。"""
         _patch_backup_all_tables(monkeypatch)
         engine, storage, cache, _ = _build_engine_with_kek(monkeypatch)
 
@@ -649,10 +657,11 @@ class TestP13ProductionRestoreApproval:
         backup_id = manifest["backup_id"]
 
         # mock _db 返回匹配的审批记录
+        # R51 P0-8: status='approved'(审批通过等待执行),request_hash 与传入值一致
         fake_db = _FakeDB()
         fake_db.set_query_result(
             "command_executions",
-            [(999, "executed", None)],  # R44: (principal_id=999, status=executed, request_hash)
+            [(999, "approved", "stored_hash")],  # R51: status=approved, request_hash=stored_hash
         )
         cache._db = fake_db
 
@@ -667,6 +676,7 @@ class TestP13ProductionRestoreApproval:
         result = await engine.restore(
             backup_id, target="production", approver_id=999,
             approval_action_id="approval_valid_id",
+            expected_request_hash="stored_hash",
         )
 
         assert result["success"] is True

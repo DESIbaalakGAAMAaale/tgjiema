@@ -162,7 +162,7 @@ class ErrorCodes:
     # production 恢复 expected_request_hash 与存储 hash 不匹配(TOCTOU 攻击或 payload 被篡改)
     PRODUCTION_RESTORE_HASH_MISMATCH = "PRODUCTION.RESTORE.HASH_MISMATCH"
     # command_executions 已 executed,禁止重复执行 restore
-    RESTORE_ALREADY_EXECUTED = "RESTORE.ALREADY_EXECUTED"
+    RESTORE_ALREADY_EXECUTED = "RESTORE.EXECUTE.ALREADY_EXECUTED"
 
     # ── R51 P0-5: notification_outbox 异常 ──
     # notification_outbox 写入失败(必须回滚事务,避免孤儿通知)
@@ -1161,7 +1161,7 @@ def _register_defaults() -> None:
     # command_executions 已 executed,禁止重复执行 restore
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.RESTORE_ALREADY_EXECUTED,
-        message_key="errors.restore.already_executed",
+        message_key="errors.restore.execute.already_executed",
         http_status=409,
         retryable=False,
         severity="error",

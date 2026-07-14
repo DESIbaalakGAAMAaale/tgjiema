@@ -506,6 +506,8 @@ class TestCrdbTombstoneHandler:
 
         async def mock_route_dlq(table_name, recs, error_msg):
             dlq_calls.append((table_name, recs, error_msg))
+            # R51 P0-9: _route_dirty_outbox_to_dlq 返回 dict(非 list/None)
+            return {"success": True, "failed_ids": [], "error": ""}
 
         try:
             # 重新导入 crdb_sync_service(若已导入则用现有模块)
@@ -667,7 +669,13 @@ class TestDispatcherTombstoneIntegration:
             ]
             # R46 P1: mock 环境 _client.is_connected=False,schema 探测返回 None,
             # _dispatch_crdb_tombstone 走 DLQ 路径,返回所有 id 标记为 processed
-            ids = await css._dispatch_dirty_outbox_to_crdb("file_records", records)
+            # R51 P0-9: mock _route_dirty_outbox_to_dlq 返回 dict(非 None)
+            async def mock_route_dlq(table, recs, reason):
+                return {"success": True, "failed_ids": [], "error": ""}
+            with patch.object(
+                css, "_route_dirty_outbox_to_dlq", side_effect=mock_route_dlq,
+            ):
+                ids = await css._dispatch_dirty_outbox_to_crdb("file_records", records)
             # 应返回成功处理的 id(已 dispatch 到 tombstone handler,handler 路由到 DLQ)
             assert 101 in ids, "tombstone 记录 id=101 应被处理(路由到 DLQ)"
             assert 102 in ids, "tombstone 记录 id=102 应被处理(路由到 DLQ)"
@@ -715,7 +723,14 @@ class TestDispatcherTombstoneIntegration:
                 },
                 {"id": 2, "pk": "file-2", "operation": "tombstone"},
             ]
-            ids = await css._dispatch_dirty_outbox_to_crdb("file_records", records)
+            # R51 P0-9: mock _route_dirty_outbox_to_dlq 返回 dict(非 None)
+            # tombstone 记录在 mock 环境 schema 探测失败时走 DLQ 路径
+            async def mock_route_dlq(table, recs, reason):
+                return {"success": True, "failed_ids": [], "error": ""}
+            with patch.object(
+                css, "_route_dirty_outbox_to_dlq", side_effect=mock_route_dlq,
+            ):
+                ids = await css._dispatch_dirty_outbox_to_crdb("file_records", records)
             # 两条记录都应被处理
             assert 1 in ids, "upsert 记录应被处理"
             assert 2 in ids, "tombstone 记录应被处理"

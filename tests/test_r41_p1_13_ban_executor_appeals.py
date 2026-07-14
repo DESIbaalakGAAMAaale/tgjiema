@@ -64,11 +64,20 @@ async def store():
         s = CacheStore()
         await s.init()
         _cs_module._store = s
+        # R51 P0-6: 初始化 RBAC 默认角色(第二审批需要 disaster:restore 权限)
+        from services import rbac as _rbac_mod
+        await _rbac_mod.init_default_roles()
+        # 重置 effect_receipts manager 单例(确保使用新 store)
+        from services import effect_receipts as _er_mod
+        _er_mod._receipt_manager = None
         yield s
         await s.close()
     finally:
         _cs_module.DB_PATH = original_path
         _cs_module._store = original_store
+        # 重置 effect_receipts manager 单例
+        from services import effect_receipts as _er_mod
+        _er_mod._receipt_manager = None
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -396,13 +405,17 @@ class TestProcessAppealTwoPersonApproval:
 
     @pytest.mark.asyncio
     async def test_second_approval_restores_content(self, store):
-        """第二审批人 approve(不同人)→ 恢复内容 + status=resolved + 通知举报者。"""
+        """第二审批人 approve(不同人)→ 写 command_outbox + restored=False(R51 P0-6: 由 ApprovalExecutor 异步执行)。"""
         from services.content_reports import process_appeal
+        from services import rbac as _rbac_mod
         await _insert_file_record(store, "APPEAL004", uploader_id=6004, deleted=True)
         report_id = await _insert_report(
             store, reporter_id=6004, target_type="file",
             target_id="APPEAL004", status="appealed",
         )
+        # R51 P0-6: 第二审批需要 disaster:restore 权限,给审批人分配 ops 角色
+        await _rbac_mod.assign_role(8002, "ops", assigned_by=0)
+        await _rbac_mod.assign_role(8003, "ops", assigned_by=0)
         # 第一审批人
         r1 = await process_appeal(report_id, principal_id=8002, decision="approve")
         assert r1["stage"] == "first_approval"
@@ -410,23 +423,30 @@ class TestProcessAppealTwoPersonApproval:
         r2 = await process_appeal(report_id, principal_id=8003, decision="approve")
         assert r2["success"] is True
         assert r2["stage"] == "second_approval"
-        assert r2["restored"] is True
-        # 验证状态
-        assert await _get_report_status(store, report_id) == "resolved"
-        # 验证文件已恢复
+        # R51 P0-6: restored=False(restore 由 ApprovalExecutor 异步执行)
+        assert r2["restored"] is False
+        # 验证状态保持 restore_pending(不在此处变为 resolved)
+        assert await _get_report_status(store, report_id) == "restore_pending"
+        # 验证文件尚未恢复(restore 由 executor 执行)
         rows = await store._db.execute_fetchall(
             "SELECT status, deleted_at FROM file_records_local WHERE file_code = ?",
             ("APPEAL004",),
         )
-        assert rows[0][0] == "active"
-        assert rows[0][1] is None
+        assert rows[0][0] == "deleted"
+        assert rows[0][1] is not None
         # 验证审计日志(第二审批)
         logs = await _get_audit_logs(store, "appeal_second_approval")
         assert len(logs) >= 1
         assert logs[-1]["actor_id"] == 8003
-        # 验证通知举报者(appeal_approved)
-        notifs = await _get_notifications(store, 6004, "appeal_approved")
-        assert len(notifs) >= 1
+        # 验证 command_outbox 已写入(由 ApprovalExecutor 消费)
+        outbox_rows = await store._db.execute_fetchall(
+            "SELECT command_type, status FROM command_outbox "
+            "WHERE approval_id = ? AND command_type = 'restore_content'",
+            (report_id,),
+        )
+        assert len(outbox_rows) >= 1
+        assert outbox_rows[0][0] == "restore_content"
+        assert outbox_rows[0][1] == "pending"
 
     @pytest.mark.asyncio
     async def test_same_approver_twice_rejected(self, store):

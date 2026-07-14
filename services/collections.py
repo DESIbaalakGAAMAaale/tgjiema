@@ -29,6 +29,7 @@ from loguru import logger
 
 from database.cache_store import get_cache_store
 from services.code_generator import build_collection_code
+from services.error_codes import AppError, ErrorCodes
 
 
 def _safe_json_loads(val) -> Any:
@@ -703,41 +704,68 @@ async def update_collection(
     name: str | None = None,
     description: str | None = None,
     expected_version: int | None = None,
+    bypass_cas: bool = False,
 ) -> dict:
-    """R45 第 16 节: 修改集合元数据(乐观锁 CAS)。
+    """R45 第 16 节 + R51 P1-3: 修改集合元数据(乐观锁 CAS,强制 expected_version)。
+
+    R51 P1-3 整改要点:
+    - 移除 ``expected_version=None → 跳过 CAS`` 的旧兼容路径(默认拒绝)
+    - 生产路径必须显式提供 ``expected_version``(否则 raise AppError)
+    - 仅运维/迁移场景显式传 ``bypass_cas=True`` 才能跳过 CAS 校验
+    - CAS 冲突从"返回 conflict=True"改为 raise AppError(COLLECTION_CAS_CONFLICT)
 
     使用 ``WHERE version = ? AND id = ?`` 进行 CAS 更新:
         - expected_version 匹配成功 → 更新 + 版本号 +1,返回 success
-        - expected_version 不匹配(被其他写入抢占)→ 不更新,返回 conflict
-        - expected_version 为 None → 跳过乐观锁,直接更新(向后兼容)
+        - expected_version 不匹配(被其他写入抢占)→ raise AppError(COLLECTION_CAS_CONFLICT)
+        - bypass_cas=True 且 expected_version=None → 跳过 CAS(仅限运维/迁移)
 
     并发安全:
         - 单个 UPDATE 语句原子完成 CAS 检查 + 版本递增
         - 失败时不写 dirty_outbox(避免无变更触发同步)
-        - 调用方收到 conflict 时应重新读取最新版本后重试(由调用方决策)
+        - 调用方收到 AppError(COLLECTION_CAS_CONFLICT)时应重新读取最新版本后重试
 
     Args:
         collection_id: 集合 ID
         name: 新名称(None=不修改)
         description: 新描述(None=不修改)
         expected_version: 调用方读取时的版本号(乐观锁校验)
-            None=跳过乐观锁(向后兼容旧调用)
-            >0=必须等于当前 DB 中的 version 才更新
+            生产路径必填(>0),None 时必须同时传 bypass_cas=True
+        bypass_cas: 是否显式跳过 CAS(仅运维/迁移使用,默认 False)
 
     Returns:
         {success: bool, conflict: bool, new_version: int,
          current_version: int, message: str}
         - success=True & conflict=False:更新成功
-        - success=False & conflict=True:版本冲突,调用方应重试
-        - success=False & conflict=False:其他失败(如集合不存在)
+
+    Raises:
+        AppError(COLLECTION_CAS_VERSION_REQUIRED): 未传 expected_version 且未 bypass_cas
+        AppError(COLLECTION_CAS_BYPASS_NOT_ALLOWED): expected_version 与 bypass_cas 同时设置
+        AppError(COLLECTION_CAS_CONFLICT): 版本冲突(expected_version 不匹配)
     """
     store = get_cache_store()
     if not store._db:
-        return {
-            "success": False, "conflict": False,
-            "new_version": 0, "current_version": 0,
-            "message": "数据库未初始化",
-        }
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+            params={"collection_id": collection_id, "reason": "cache_store_unavailable"},
+        )
+    # R51 P1-3: bypass_cas 与 expected_version 不可同时设置(避免歧义)
+    if bypass_cas and expected_version is not None and int(expected_version) > 0:
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_BYPASS_NOT_ALLOWED,
+            params={
+                "collection_id": collection_id,
+                "reason": "bypass_cas_and_expected_version_mutually_exclusive",
+            },
+        )
+    # R51 P1-3: 生产路径必须传 expected_version(否则显式 bypass_cas=True)
+    if (expected_version is None or int(expected_version) <= 0) and not bypass_cas:
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+            params={
+                "collection_id": collection_id,
+                "reason": "expected_version_required_or_bypass_cas_explicit",
+            },
+        )
     now = _dt.datetime.now().isoformat()
 
     # 构造 SET 子句(只更新非 None 字段)
@@ -758,23 +786,29 @@ async def update_collection(
             )
             row = await cur.fetchone()
             if not row:
-                return {
-                    "success": False, "conflict": False,
-                    "new_version": 0, "current_version": 0,
-                    "message": "集合不存在",
-                }
+                raise AppError(
+                    ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+                    params={
+                        "collection_id": collection_id,
+                        "reason": "collection_not_found",
+                    },
+                )
             return {
                 "success": True, "conflict": False,
                 "new_version": int(row[0] or 1),
                 "current_version": int(row[0] or 1),
                 "message": "无字段需更新",
             }
+        except AppError:
+            raise
         except Exception as e:
-            return {
-                "success": False, "conflict": False,
-                "new_version": 0, "current_version": 0,
-                "message": f"查询版本失败: {e}",
-            }
+            raise AppError(
+                ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+                params={
+                    "collection_id": collection_id,
+                    "reason": f"query_version_failed: {e}",
+                },
+            )
 
     # 加入 version 递增 + updated_at
     set_clauses.append("version = version + 1")
@@ -784,7 +818,7 @@ async def update_collection(
     # WHERE 条件:必含 id = ?;若提供 expected_version 则加 version = ?
     where_clauses = ["id = ?"]
     params.append(collection_id)
-    if expected_version is not None and int(expected_version) > 0:
+    if not bypass_cas and expected_version is not None and int(expected_version) > 0:
         where_clauses.append("version = ?")
         params.append(int(expected_version))
 
@@ -804,11 +838,13 @@ async def update_collection(
                 )
                 check_row = await check_cur.fetchone()
                 if not check_row:
-                    return {
-                        "success": False, "conflict": False,
-                        "new_version": 0, "current_version": 0,
-                        "message": "集合不存在",
-                    }
+                    raise AppError(
+                        ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+                        params={
+                            "collection_id": collection_id,
+                            "reason": "collection_not_found",
+                        },
+                    )
                 # 集合存在但 affected=0 → 版本冲突
                 current_v = int(check_row[0] or 1)
                 logger.info(
@@ -816,14 +852,14 @@ async def update_collection(
                     f"coll_id={collection_id} expected_v={expected_version} "
                     f"current_v={current_v}"
                 )
-                return {
-                    "success": False, "conflict": True,
-                    "new_version": 0, "current_version": current_v,
-                    "message": (
-                        f"版本冲突:expected={expected_version},"
-                        f"current={current_v},请重试"
-                    ),
-                }
+                raise AppError(
+                    ErrorCodes.COLLECTION_CAS_CONFLICT,
+                    params={
+                        "collection_id": collection_id,
+                        "expected_version": int(expected_version) if expected_version else 0,
+                        "current_version": current_v,
+                    },
+                )
             # 更新成功 → 写 dirty_outbox + 读取新版本
             await store.add_dirty_outbox(
                 "collections", str(collection_id), connection=tx,
@@ -836,20 +872,25 @@ async def update_collection(
             new_v = int(v_row[0]) if v_row else 0
         logger.info(
             f"[collections] update_collection CAS 成功 "
-            f"coll_id={collection_id} v{expected_version}→v{new_v}"
+            f"coll_id={collection_id} v{expected_version}→v{new_v} "
+            f"bypass_cas={bypass_cas}"
         )
         return {
             "success": True, "conflict": False,
             "new_version": new_v, "current_version": new_v,
             "message": "更新成功",
         }
+    except AppError:
+        raise
     except Exception as e:
         logger.warning(f"[collections] update_collection 失败: {e}")
-        return {
-            "success": False, "conflict": False,
-            "new_version": 0, "current_version": 0,
-            "message": f"更新失败: {e}",
-        }
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+            params={
+                "collection_id": collection_id,
+                "reason": f"update_failed: {e}",
+            },
+        )
 
 
 async def batch_retrieve(collection_id: int, user_id: int) -> dict:

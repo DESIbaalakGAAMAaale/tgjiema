@@ -13,6 +13,13 @@
     9. format_file_size(bytes, locale) — R41: 文件大小格式化(B/KB/MB/GB)
     10. get_user_locale(user_id) — R41: 从 users_local 表读取用户语言偏好(默认 zh-CN)
 
+R51 P1-9 增强(异步缓存):
+    - get_user_locale(user_id) 添加内存 LRU 缓存(5 分钟 TTL),减少 SQLite 阻塞读
+    - 缓存 miss 时同步加载并填充缓存(后续命中直接返回,不触发 SQLite)
+    - 缓存失效后回退到默认语言(zh-CN)
+    - 新增 get_user_locale_async(user_id) 异步版本(在 executor 中加载,不阻塞事件循环)
+    - 新增 invalidate_user_locale_cache(user_id) 主动失效缓存(set_user_locale 时自动调用)
+
 设计原则:
     - locale 文件存放于 locales/ 目录(zh-CN.json / en-US.json)
     - 翻译 key 采用点分命名空间(errors.xxx / ui.xxx / bot.xxx)
@@ -23,8 +30,11 @@
 """
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +46,17 @@ _LOCALES_DIR = Path(__file__).resolve().parent.parent / "locales"
 _DEFAULT_LOCALE = "zh-CN"
 # 备用 locale(找不到 key 时回退)
 _FALLBACK_LOCALE = "en-US"
+
+# ── R51 P1-9: 用户 locale LRU 缓存配置 ──────────────────────────
+# 缓存 TTL(秒,默认 5 分钟):超过后缓存条目视为过期,下次访问重新加载
+_USER_LOCALE_CACHE_TTL_SECONDS: int = 300
+# 缓存容量上限(LRU 淘汰):防止活跃用户数过多导致内存膨胀
+_USER_LOCALE_CACHE_MAX_SIZE: int = 1024
+# 模块级缓存:OrderedDict 维护 LRU 顺序(user_id → (expire_ts, locale))
+# 注意:跨进程不共享(每个 Bot 进程独立缓存),写穿透到 SQLite 由 set_user_locale 负责
+_user_locale_cache: "OrderedDict[int, tuple[float, str]]" = OrderedDict()
+# 异步加载时的 executor(惰性创建,避免事件循环未启动时创建失败)
+_locale_cache_lock: Optional[asyncio.Lock] = None
 
 
 class I18nManager:
@@ -676,7 +697,13 @@ class I18nManager:
         return _DEFAULT_LOCALE
 
     def get_user_locale(self, user_id: int) -> str:
-        """R41: 从 users_local 表读取用户 locale(默认 zh-CN)。
+        """R41/R51 P1-9: 从 users_local 表读取用户 locale(默认 zh-CN)。
+
+        R51 P1-9 缓存增强:
+            - 优先从内存 LRU 缓存读取(5 分钟 TTL),命中直接返回,不触发 SQLite
+            - 缓存 miss 或过期时同步从 SQLite 加载,并回填缓存
+            - 加载失败时回退到默认 locale 'zh-CN'(缓存失败结果避免短期内重复穿透)
+            - LRU 容量上限 1024(超过后淘汰最久未访问的条目)
 
         从 SQLite cache_store 同步读取(不触发 CRDB RU 消耗)。
         用户未设置或读取失败时返回默认 locale 'zh-CN'。
@@ -689,6 +716,36 @@ class I18nManager:
         """
         if not user_id:
             return _DEFAULT_LOCALE
+        # R51 P1-9: 优先查缓存(命中则直接返回,不触发 SQLite)
+        now = time.time()
+        cached = _user_locale_cache.get(int(user_id))
+        if cached is not None:
+            expire_ts, locale_val = cached
+            if now < expire_ts:
+                # 缓存命中且未过期:LRU move-to-end(标记为最近访问)
+                _user_locale_cache.move_to_end(int(user_id))
+                return locale_val
+            # 缓存过期:移除条目,继续走 SQLite 加载路径
+            _user_locale_cache.pop(int(user_id), None)
+
+        # 缓存 miss / 过期:从 SQLite 加载
+        locale_val = self._load_user_locale_from_sqlite(user_id)
+        # R51 P1-9: 回填缓存(即使返回默认 locale 也缓存,避免短期内重复穿透 SQLite)
+        _cache_user_locale(int(user_id), locale_val)
+        return locale_val
+
+    def _load_user_locale_from_sqlite(self, user_id: int) -> str:
+        """R51 P1-9: 直接从 SQLite 同步加载用户 locale(内部方法,不带缓存)。
+
+        与 get_user_locale 的区别:本方法不查缓存,直接读 SQLite。
+        供 get_user_locale(缓存 miss 时)和 get_user_locale_async(executor 中)调用。
+
+        Args:
+            user_id: Telegram 用户 ID
+
+        Returns:
+            用户 locale 字符串;失败返回 _DEFAULT_LOCALE
+        """
         try:
             # 同步读取 SQLite(避免在 Bot handler 中引入 async 复杂性)
             import sqlite3
@@ -708,7 +765,7 @@ class I18nManager:
                 if locale_val and len(locale_val) <= 10:
                     return locale_val
         except Exception as e:
-            logger.debug(f"[i18n] get_user_locale 读取失败 user={user_id}: {e}")
+            logger.debug(f"[i18n] _load_user_locale_from_sqlite 读取失败 user={user_id}: {e}")
         return _DEFAULT_LOCALE
 
 
@@ -785,6 +842,8 @@ def get_user_locale_sync(user_id: int) -> str:
     从 SQLite cache_store 同步读取(不触发 CRDB RU 消耗)。
     用户未设置或读取失败时返回默认 locale 'zh-CN'。
 
+    R51 P1-9: 已接入 LRU 缓存(5 分钟 TTL),命中时不触发 SQLite。
+
     Args:
         user_id: Telegram 用户 ID
 
@@ -795,6 +854,123 @@ def get_user_locale_sync(user_id: int) -> str:
     return manager.get_user_locale(user_id)
 
 
+# ── R51 P1-9: 用户 locale LRU 缓存辅助函数 ──────────────────────
+
+
+def _cache_user_locale(user_id: int, locale_val: str) -> None:
+    """R51 P1-9: 将 user_id → locale 写入模块级 LRU 缓存。
+
+    若缓存超过 _USER_LOCALE_CACHE_MAX_SIZE,淘汰最久未访问的条目(LRU)。
+    TTL 由 _USER_LOCALE_CACHE_TTL_SECONDS 控制,过期后下次访问触发重新加载。
+
+    Args:
+        user_id: 用户 ID(已 int 化)
+        locale_val: locale 字符串(如 "zh-CN")
+    """
+    if not user_id or not locale_val:
+        return
+    now = time.time()
+    expire_ts = now + _USER_LOCALE_CACHE_TTL_SECONDS
+    # 若已存在,先移除再插入(move-to-end 效果)
+    if user_id in _user_locale_cache:
+        _user_locale_cache.pop(user_id, None)
+    _user_locale_cache[user_id] = (expire_ts, locale_val)
+    # LRU 淘汰:超过容量时移除最旧的条目(OrderedDict 最早插入的)
+    while len(_user_locale_cache) > _USER_LOCALE_CACHE_MAX_SIZE:
+        _user_locale_cache.popitem(last=False)
+
+
+def invalidate_user_locale_cache(user_id: Optional[int] = None) -> int:
+    """R51 P1-9: 主动失效用户 locale 缓存。
+
+    使用场景:
+        - set_user_locale 写入新 locale 后,主动失效旧缓存(下次访问重新加载)
+        - 管理员手动重置某用户 locale 后调用
+        - 测试用例间隔离
+
+    Args:
+        user_id: 指定用户 ID 时仅失效该用户;None 时清空整个缓存
+
+    Returns:
+        被移除的缓存条目数
+    """
+    global _user_locale_cache
+    if user_id is None:
+        removed = len(_user_locale_cache)
+        _user_locale_cache.clear()
+        logger.debug(f"[i18n] 用户 locale 缓存已全部清空(共 {removed} 条)")
+        return removed
+    if user_id in _user_locale_cache:
+        _user_locale_cache.pop(user_id, None)
+        logger.debug(f"[i18n] 用户 locale 缓存已失效: user_id={user_id}")
+        return 1
+    return 0
+
+
+async def get_user_locale_async(user_id: int) -> str:
+    """R51 P1-9: 异步获取用户 locale(带 LRU 缓存,不阻塞事件循环)。
+
+    与 get_user_locale_sync 的区别:
+        - 缓存命中:直接返回(与 sync 版本一致,无 SQLite IO)
+        - 缓存 miss / 过期:在默认 executor 中执行 SQLite 同步读取,
+          不阻塞 asyncio 事件循环(适合在 Bot handler 中 await 调用)
+
+    并发安全:
+        - 使用 asyncio.Lock 防止同一 user_id 并发 miss 时多次穿透 SQLite
+        - 第一个 miss 协程加载并填充缓存,后续协程直接读缓存
+
+    缓存失效后回退到默认语言 'zh-CN'(由 _load_user_locale_from_sqlite 保证)。
+
+    Args:
+        user_id: Telegram 用户 ID
+
+    Returns:
+        用户 locale 字符串(如 "zh-CN" / "en-US");失败返回 "zh-CN"
+    """
+    if not user_id:
+        return _DEFAULT_LOCALE
+    global _locale_cache_lock
+    # R51 P1-9: 优先查缓存(无锁快速路径,命中直接返回)
+    now = time.time()
+    cached = _user_locale_cache.get(int(user_id))
+    if cached is not None:
+        expire_ts, locale_val = cached
+        if now < expire_ts:
+            _user_locale_cache.move_to_end(int(user_id))
+            return locale_val
+        # 缓存过期:移除条目,继续走 SQLite 加载路径
+        _user_locale_cache.pop(int(user_id), None)
+
+    # R51 P1-9: 缓存 miss,加锁防止并发穿透(Lock 惰性创建)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        # 无事件循环(不应发生在 async 上下文中),fallback 到 sync 加载
+        manager = get_i18n_manager()
+        locale_val = manager._load_user_locale_from_sqlite(user_id)
+        _cache_user_locale(int(user_id), locale_val)
+        return locale_val
+
+    if _locale_cache_lock is None:
+        _locale_cache_lock = asyncio.Lock()
+    async with _locale_cache_lock:
+        # double-check:可能在等锁期间已被其他协程填充
+        cached = _user_locale_cache.get(int(user_id))
+        if cached is not None:
+            expire_ts, locale_val = cached
+            if time.time() < expire_ts:
+                _user_locale_cache.move_to_end(int(user_id))
+                return locale_val
+
+        # R51 P1-9: 在默认 executor 中执行同步 SQLite 读取(不阻塞事件循环)
+        manager = get_i18n_manager()
+        locale_val = await loop.run_in_executor(
+            None, manager._load_user_locale_from_sqlite, user_id,
+        )
+        _cache_user_locale(int(user_id), locale_val)
+        return locale_val
+
+
 def set_user_locale(user_id: int, locale: str) -> bool:
     """R42 P1-8: 设置用户 locale 并写 dirty_outbox(同步)。
 
@@ -802,6 +978,7 @@ def set_user_locale(user_id: int, locale: str) -> bool:
         1. 验证 locale 在支持列表中(否则抛 ValueError)
         2. UPDATE users_local SET locale=? WHERE user_id=?
         3. 写 dirty_outbox 一条 upsert 记录(供 crdb_sync 同步)
+        4. R51 P1-9: 主动失效该用户的 locale 缓存(下次访问重新加载新值)
 
     Args:
         user_id: Telegram 用户 ID
@@ -864,6 +1041,8 @@ def set_user_locale(user_id: int, locale: str) -> bool:
             logger.info(
                 f"[i18n] set_user_locale 成功 user={user_id} locale={locale}"
             )
+            # R51 P1-9: 写入成功后主动失效缓存(下次访问重新加载新值)
+            invalidate_user_locale_cache(int(user_id))
             return True
         finally:
             conn.close()

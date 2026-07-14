@@ -13,15 +13,26 @@
 - 物理删除仅在 retention job 中执行(已备份 + 已过保留期)
 - 时间戳统一使用 datetime.datetime.now().isoformat()
 - 保留期表(user_data_retention)由本服务惰性创建
+
+R51 P1-1 整改要点(数据生命周期事务化):
+- 删除请求改为状态机 deletion_requests(pending → processing → completed/failed)
+- 每类数据删除独立 step receipt(step_files/step_codes/step_collections/
+  step_notifications/step_tasks/step_users_local)
+- 任一 step 失败 → 整个 deletion_request 标记 failed,不允许局部成功
+- 物理删除前必须验证 backup marker(无 marker 拒绝物理删除)
+- 不再"warning 后返回 success",所有失败显式 raise AppError 或返回 failed 状态
 """
 from __future__ import annotations
 
 import datetime as _dt
 import json
+import uuid
+from typing import Any
 
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.error_codes import AppError, ErrorCodes
 
 
 # ─── 默认保留期(天) ──────────────────────────────────────────
@@ -31,6 +42,25 @@ RETENTION_PERMANENT = 0
 
 # 保留期配置表名(本服务惰性创建)
 _RETENTION_TABLE = "user_data_retention"
+
+# R51 P1-1: 删除请求状态表
+_DELETION_REQUESTS_TABLE = "deletion_requests"
+
+# 删除请求状态枚举
+DELETE_STATUS_PENDING = "pending"
+DELETE_STATUS_PROCESSING = "processing"
+DELETE_STATUS_COMPLETED = "completed"
+DELETE_STATUS_FAILED = "failed"
+
+# 删除步骤(顺序执行,每步生成独立 receipt)
+DELETE_STEPS = (
+    "step_files",         # file_records 软删除
+    "step_codes",         # codes 软删除
+    "step_collections",   # collections 软删除
+    "step_notifications", # notifications 物理删除
+    "step_tasks",         # tasks 标记 cancelled
+    "step_users_local",   # users_local 标记删除 + dirty_outbox
+)
 
 
 async def _ensure_retention_table() -> bool:
@@ -240,111 +270,434 @@ async def _write_audit_log(actor_id: int, action: str, target_type: str,
         return 0
 
 
-async def delete_user_data(user_id: int, admin_id: int = 0) -> bool:
-    """删除用户所有数据(软删除 + 写 audit_log)。
+# ─── R51 P1-1: 删除请求状态机 ─────────────────────────────
 
-    执行步骤:
-    - file_records: 逐条 soft_delete(R39 P1-5)
-    - codes: 逐条 soft_delete
-    - collections: 逐条 soft_delete
-    - notifications: 物理删除(通知无需保留)
-    - tasks: 标记 cancelled
-    - users_local: is_banned=1 + deleted_at(标记删除)
+
+async def _ensure_deletion_requests_table() -> bool:
+    """R51 P1-1: 惰性创建 deletion_requests 表(状态机持久化)。
+
+    表结构:
+        request_id      TEXT PRIMARY KEY(UUID)
+        user_id         BIGINT
+        admin_id        BIGINT
+        status          TEXT(pending/processing/completed/failed)
+        current_step    TEXT(当前执行中的 step)
+        step_receipts   TEXT(JSON: 各 step 的 receipt)
+        started_at      TEXT
+        completed_at    TEXT
+        failed_at       TEXT
+        failure_reason  TEXT
+        failed_step     TEXT
+        created_at      TEXT
+
+    Returns:
+        True 表就绪;False 创建失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+    try:
+        await store._db.execute(
+            f"""CREATE TABLE IF NOT EXISTS {_DELETION_REQUESTS_TABLE} (
+                request_id      TEXT PRIMARY KEY,
+                user_id         BIGINT NOT NULL,
+                admin_id        BIGINT NOT NULL DEFAULT 0,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                current_step    TEXT,
+                step_receipts   TEXT,
+                started_at      TEXT,
+                completed_at    TEXT,
+                failed_at       TEXT,
+                failure_reason  TEXT,
+                failed_step     TEXT,
+                created_at      TEXT NOT NULL
+            )"""
+        )
+        # 状态查询索引(按 user_id + status)
+        try:
+            await store._db.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_deletion_requests_user_status "
+                f"ON {_DELETION_REQUESTS_TABLE}(user_id, status)"
+            )
+        except Exception:
+            pass  # 幂等,索引已存在
+        await store._db.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"[DataLifecycle] 创建 deletion_requests 表失败: {e}")
+        return False
+
+
+async def _create_deletion_request(user_id: int, admin_id: int) -> str:
+    """R51 P1-1: 创建 pending 状态的删除请求。
 
     Args:
         user_id: 被删除用户 id
         admin_id: 操作管理员 id(0=用户自删)
 
     Returns:
-        True 删除成功;False 失败
+        request_id(UUID);失败返回 ""
+    """
+    store = get_cache_store()
+    if not store._db:
+        return ""
+    request_id = str(uuid.uuid4())
+    now = _dt.datetime.now().isoformat()
+    try:
+        # 注意: step_receipts 默认 '{}' — 末段为普通字符串,避免 f-string 解析 '{}'
+        await store._db.execute(
+            f"INSERT INTO {_DELETION_REQUESTS_TABLE} "
+            f"(request_id, user_id, admin_id, status, current_step, "
+            f"step_receipts, started_at, completed_at, failed_at, "
+            f"failure_reason, failed_step, created_at) "
+            "VALUES (?, ?, ?, ?, NULL, '{}', NULL, NULL, NULL, NULL, NULL, ?)",
+            (request_id, user_id, admin_id, DELETE_STATUS_PENDING, now),
+        )
+        await store._db.commit()
+        logger.info(
+            f"[DataLifecycle] 创建删除请求 request_id={request_id} "
+            f"user={user_id} admin={admin_id}"
+        )
+        return request_id
+    except Exception as e:
+        logger.warning(f"[DataLifecycle] 创建删除请求失败: {e}")
+        return ""
+
+
+async def _transition_request_status(
+    request_id: str, new_status: str,
+    step_receipts: dict | None = None,
+    current_step: str | None = None,
+    failure_reason: str = "",
+    failed_step: str = "",
+) -> bool:
+    """R51 P1-1: 状态机迁移(pending→processing→completed/failed)。
+
+    Args:
+        request_id: 请求 id
+        new_status: 目标状态(processing/completed/failed)
+        step_receipts: 当前的 step receipts(全量更新)
+        current_step: 当前执行中的 step(仅 processing 时填)
+        failure_reason: 失败原因(仅 failed 时填)
+        failed_step: 失败的 step 名称(仅 failed 时填)
+
+    Returns:
+        True 迁移成功;False 失败
     """
     store = get_cache_store()
     if not store._db:
         return False
     now = _dt.datetime.now().isoformat()
-    deleted_files = 0
-    deleted_codes = 0
-    deleted_collections = 0
-    # 1. file_records 软删除
-    try:
-        cursor = await store._db.execute(
-            "SELECT file_code FROM file_records_local WHERE uploader_id = ?",
-            (user_id,),
-        )
-        rows = await cursor.fetchall()
-        for r in rows:
-            if await store.soft_delete("file_records", r[0]):
-                deleted_files += 1
-    except Exception as e:
-        logger.warning(f"[DataLifecycle] delete file_records 失败: {e}")
-    # 2. codes 软删除
-    try:
-        cursor = await store._db.execute(
-            "SELECT code FROM codes_local WHERE uploader_id = ?",
-            (user_id,),
-        )
-        rows = await cursor.fetchall()
-        for r in rows:
-            if await store.soft_delete("codes", r[0]):
-                deleted_codes += 1
-    except Exception as e:
-        logger.warning(f"[DataLifecycle] delete codes 失败: {e}")
-    # 3. collections 软删除
-    try:
-        cursor = await store._db.execute(
-            "SELECT id FROM collections WHERE owner_id = ?",
-            (user_id,),
-        )
-        rows = await cursor.fetchall()
-        for r in rows:
-            if await store.soft_delete("collections", str(r[0])):
-                deleted_collections += 1
-    except Exception as e:
-        logger.warning(f"[DataLifecycle] delete collections 失败: {e}")
-    # 4. notifications 物理删除(通知无需保留)
+    sets = ["status = ?", "current_step = ?"]
+    params: list[Any] = [new_status, current_step]
+    if step_receipts is not None:
+        sets.append("step_receipts = ?")
+        params.append(json.dumps(step_receipts, ensure_ascii=False))
+    if new_status == DELETE_STATUS_PROCESSING:
+        sets.append("started_at = COALESCE(started_at, ?)")
+        params.append(now)
+    elif new_status == DELETE_STATUS_COMPLETED:
+        sets.append("completed_at = ?")
+        params.append(now)
+    elif new_status == DELETE_STATUS_FAILED:
+        sets.append("failed_at = ?")
+        params.append(now)
+        sets.append("failure_reason = ?")
+        params.append(failure_reason)
+        sets.append("failed_step = ?")
+        params.append(failed_step)
+    params.append(request_id)
     try:
         await store._db.execute(
-            "DELETE FROM notifications WHERE user_id = ?",
-            (user_id,),
+            f"UPDATE {_DELETION_REQUESTS_TABLE} SET "
+            + ", ".join(sets)
+            + " WHERE request_id = ?",
+            tuple(params),
         )
         await store._db.commit()
+        logger.info(
+            f"[DataLifecycle] 状态迁移 request_id={request_id} "
+            f"new_status={new_status}"
+        )
+        return True
     except Exception as e:
-        logger.warning(f"[DataLifecycle] delete notifications 失败: {e}")
-    # 5. tasks 标记 cancelled
+        logger.warning(f"[DataLifecycle] 状态迁移失败: {e}")
+        return False
+
+
+async def _get_deletion_request(request_id: str) -> dict | None:
+    """R51 P1-1: 查询删除请求详情。"""
+    store = get_cache_store()
+    if not store._db:
+        return None
     try:
-        await store._db.execute(
-            "UPDATE tasks SET status = 'cancelled', updated_at = ? "
-            "WHERE user_id = ? AND status NOT IN ('cancelled', 'done')",
-            (now, user_id),
+        cursor = await store._db.execute(
+            f"SELECT request_id, user_id, admin_id, status, current_step, "
+            f"step_receipts, started_at, completed_at, failed_at, "
+            f"failure_reason, failed_step, created_at "
+            f"FROM {_DELETION_REQUESTS_TABLE} WHERE request_id = ?",
+            (request_id,),
         )
-        await store._db.commit()
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        receipts_raw = row[5] or "{}"
+        try:
+            receipts = json.loads(receipts_raw) if isinstance(receipts_raw, str) else receipts_raw
+        except Exception:
+            receipts = {}
+        return {
+            "request_id": row[0], "user_id": row[1], "admin_id": row[2],
+            "status": row[3], "current_step": row[4],
+            "step_receipts": receipts, "started_at": row[6],
+            "completed_at": row[7], "failed_at": row[8],
+            "failure_reason": row[9], "failed_step": row[10],
+            "created_at": row[11],
+        }
     except Exception as e:
-        logger.warning(f"[DataLifecycle] update tasks 失败: {e}")
-    # 6. users_local 标记删除(is_banned=1 + deleted_at,无 status 列故用 is_banned)
+        logger.warning(f"[DataLifecycle] 查询删除请求失败: {e}")
+        return None
+
+
+async def _execute_step_in_tx(
+    tx: Any, store: Any, step_name: str, user_id: int, now: str,
+) -> dict:
+    """R51 P1-1: 在事务中执行单个删除 step。
+
+    所有 step 共享同一个 tx(store.transaction() 上下文),
+    任一 step 抛异常 → 整个事务回滚。
+
+    Returns:
+        receipt dict: {status: success/failed, rows_affected: int,
+                       started_at, finished_at, error: str}
+    """
+    receipt: dict = {
+        "status": "success",
+        "rows_affected": 0,
+        "started_at": now,
+        "finished_at": now,
+        "error": "",
+    }
     try:
-        await store._db.execute(
-            "UPDATE users_local SET is_banned = 1, deleted_at = ?, updated_at = ? "
-            "WHERE user_id = ?",
-            (now, now, user_id),
-        )
-        await store._db.commit()
-        # 写 dirty_outbox 确保跨机同步
-        await store.add_dirty_outbox("users_local", str(user_id))
+        if step_name == "step_files":
+            cursor = await tx.execute(
+                "UPDATE file_records_local "
+                "SET deleted_at = ?, status = 'deleted', crdb_synced = 0 "
+                "WHERE uploader_id = ? AND deleted_at IS NULL",
+                (now, user_id),
+            )
+            receipt["rows_affected"] = int(cursor.rowcount or 0)
+            # 写 dirty_outbox tombstone(同事务)
+            cursor = await tx.execute(
+                "SELECT file_code FROM file_records_local "
+                "WHERE uploader_id = ? AND deleted_at = ?",
+                (user_id, now),
+            )
+            rows = await cursor.fetchall()
+            for r in rows:
+                await store.add_dirty_outbox(
+                    "file_records_local", str(r[0]),
+                    operation="tombstone", connection=tx,
+                )
+        elif step_name == "step_codes":
+            cursor = await tx.execute(
+                "UPDATE codes_local "
+                "SET deleted_at = ?, status = 'deleted', crdb_synced = 0 "
+                "WHERE uploader_id = ? AND deleted_at IS NULL",
+                (now, user_id),
+            )
+            receipt["rows_affected"] = int(cursor.rowcount or 0)
+            cursor = await tx.execute(
+                "SELECT code FROM codes_local "
+                "WHERE uploader_id = ? AND deleted_at = ?",
+                (user_id, now),
+            )
+            rows = await cursor.fetchall()
+            for r in rows:
+                await store.add_dirty_outbox(
+                    "codes_local", str(r[0]),
+                    operation="tombstone", connection=tx,
+                )
+        elif step_name == "step_collections":
+            # 注意: collections 表无 deleted_at/crdb_synced 列,
+            # 只更新 status='deleted'(collections 表已有 status 列)
+            cursor = await tx.execute(
+                "UPDATE collections "
+                "SET status = 'deleted', updated_at = ? "
+                "WHERE owner_id = ? AND status != 'deleted'",
+                (now, user_id),
+            )
+            receipt["rows_affected"] = int(cursor.rowcount or 0)
+            cursor = await tx.execute(
+                "SELECT id FROM collections "
+                "WHERE owner_id = ? AND status = 'deleted' AND updated_at = ?",
+                (user_id, now),
+            )
+            rows = await cursor.fetchall()
+            for r in rows:
+                await store.add_dirty_outbox(
+                    "collections", str(r[0]),
+                    operation="tombstone", connection=tx,
+                )
+        elif step_name == "step_notifications":
+            cursor = await tx.execute(
+                "DELETE FROM notifications WHERE user_id = ?",
+                (user_id,),
+            )
+            receipt["rows_affected"] = int(cursor.rowcount or 0)
+        elif step_name == "step_tasks":
+            cursor = await tx.execute(
+                "UPDATE tasks SET status = 'cancelled', updated_at = ? "
+                "WHERE user_id = ? AND status NOT IN ('cancelled', 'done')",
+                (now, user_id),
+            )
+            receipt["rows_affected"] = int(cursor.rowcount or 0)
+        elif step_name == "step_users_local":
+            # 注意: users_local 表无 status 列,使用 is_banned=1 + deleted_at 标记删除
+            cursor = await tx.execute(
+                "UPDATE users_local "
+                "SET is_banned = 1, deleted_at = ?, "
+                "crdb_synced = 0, updated_at = ? "
+                "WHERE user_id = ?",
+                (now, now, user_id),
+            )
+            receipt["rows_affected"] = int(cursor.rowcount or 0)
+            # 写 dirty_outbox upsert(标记用户为 deleted,需同步到 CRDB)
+            await store.add_dirty_outbox(
+                "users_local", str(user_id),
+                operation="upsert", connection=tx,
+            )
+        else:
+            receipt["status"] = "failed"
+            receipt["error"] = f"unknown_step:{step_name}"
+        receipt["finished_at"] = _dt.datetime.now().isoformat()
     except Exception as e:
-        logger.warning(f"[DataLifecycle] delete users_local 失败: {e}")
-    # 写审计日志
+        receipt["status"] = "failed"
+        receipt["error"] = f"{type(e).__name__}: {e}"
+        receipt["finished_at"] = _dt.datetime.now().isoformat()
+        # 重新抛出让事务回滚
+        raise
+    return receipt
+
+
+async def delete_user_data(user_id: int, admin_id: int = 0) -> bool:
+    """R51 P1-1: 删除用户所有数据(状态机 + step receipts + 事务化)。
+
+    改造要点:
+    - 创建 deletion_requests 行(pending)
+    - 状态迁移: pending → processing → completed/failed
+    - 所有 step 在同一 transaction 内执行,任一失败 → 整个事务回滚
+    - 失败时标记 deletion_requests 为 failed + 记录 failed_step + failure_reason
+    - 成功时标记 completed
+    - 不再"warning 后返回 success",失败显式 raise AppError
+
+    Args:
+        user_id: 被删除用户 id
+        admin_id: 操作管理员 id(0=用户自删)
+
+    Returns:
+        True 删除成功(全部 step 完成)
+
+    Raises:
+        AppError(DATA_LIFECYCLE_DELETE_REQUEST_FAILED): 状态机初始化/迁移失败
+        AppError(DATA_LIFECYCLE_DELETE_STEP_FAILED): 任一 step 失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_DELETE_REQUEST_FAILED,
+            params={"user_id": user_id, "reason": "cache_store_unavailable"},
+        )
+    # 确保状态机表存在
+    if not await _ensure_deletion_requests_table():
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_DELETE_REQUEST_FAILED,
+            params={"user_id": user_id, "reason": "table_init_failed"},
+        )
+    # 创建 pending 请求
+    request_id = await _create_deletion_request(user_id, admin_id)
+    if not request_id:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_DELETE_REQUEST_FAILED,
+            params={"user_id": user_id, "reason": "create_request_failed"},
+        )
+    # 迁移到 processing
+    await _transition_request_status(
+        request_id, DELETE_STATUS_PROCESSING,
+        current_step=DELETE_STEPS[0] if DELETE_STEPS else None,
+    )
+
+    # 在同一事务内顺序执行所有 step
+    step_receipts: dict[str, dict] = {}
+    failed_step: str = ""
+    failure_reason: str = ""
+    current_step_name: str = ""  # 跟踪当前执行的 step(异常时用于识别失败步骤)
+    try:
+        async with store.transaction() as tx:
+            for step_name in DELETE_STEPS:
+                # 更新 current_step(在事务内,但用 tx 直接更新避免额外 commit)
+                await tx.execute(
+                    f"UPDATE {_DELETION_REQUESTS_TABLE} "
+                    f"SET current_step = ? WHERE request_id = ?",
+                    (step_name, request_id),
+                )
+                # 提前记录当前 step 名(以防 _execute_step_in_tx 抛异常时能识别)
+                current_step_name = step_name
+                receipt = await _execute_step_in_tx(
+                    tx, store, step_name, user_id,
+                    _dt.datetime.now().isoformat(),
+                )
+                step_receipts[step_name] = receipt
+                if receipt["status"] != "success":
+                    failed_step = step_name
+                    failure_reason = receipt.get("error", "")
+                    # 抛异常触发事务回滚
+                    raise RuntimeError(
+                        f"step {step_name} failed: {failure_reason}"
+                    )
+            # 全部成功 → 事务自动 COMMIT(store.transaction 退出时)
+    except Exception as tx_err:
+        # 事务已回滚,标记 deletion_requests 为 failed
+        # (failed 标记本身用独立连接,不影响已回滚的事务)
+        if not failed_step:
+            # _execute_step_in_tx 抛出但未填充 failed_step,使用当前 step 名
+            failed_step = current_step_name or "unknown"
+            failure_reason = f"{type(tx_err).__name__}: {tx_err}"
+        await _transition_request_status(
+            request_id, DELETE_STATUS_FAILED,
+            step_receipts=step_receipts,
+            failure_reason=failure_reason,
+            failed_step=failed_step,
+        )
+        logger.error(
+            f"[DataLifecycle] delete_user_data 失败 request_id={request_id} "
+            f"user={user_id} failed_step={failed_step} reason={failure_reason}"
+        )
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_DELETE_STEP_FAILED,
+            params={
+                "user_id": user_id, "request_id": request_id,
+                "step": failed_step, "step_error": failure_reason,
+            },
+        ) from tx_err
+
+    # 全部成功 → 标记 completed
+    await _transition_request_status(
+        request_id, DELETE_STATUS_COMPLETED,
+        step_receipts=step_receipts,
+    )
+    # 写审计日志(独立事务)
     await _write_audit_log(
         admin_id, "delete_user_data", "user", str(user_id),
         {
-            "deleted_files": deleted_files,
-            "deleted_codes": deleted_codes,
-            "deleted_collections": deleted_collections,
+            "request_id": request_id,
+            "step_receipts": step_receipts,
         },
         "",
     )
     logger.info(
-        f"[DataLifecycle] delete_user_data user={user_id} admin={admin_id} "
-        f"files={deleted_files} codes={deleted_codes} collections={deleted_collections}"
+        f"[DataLifecycle] delete_user_data 完成 user={user_id} admin={admin_id} "
+        f"request_id={request_id} receipts={step_receipts}"
     )
     return True
 
@@ -416,23 +769,75 @@ async def get_retention(user_id: int) -> int:
         return DEFAULT_RETENTION_DAYS
 
 
-async def cleanup_expired_data(batch_size: int = 1000) -> int:
-    """清理过期数据(物理删除已过保留期且已备份的数据)。
+async def _verify_backup_marker() -> bool:
+    """R51 P1-1: 物理删除前验证 backup marker。
 
-    遍历设置了保留期的用户,物理删除其超过保留期的已软删数据。
-    本方法仅执行物理删除(独立 retention job,符合 R39 P1-5 铁律)。
+    调用 BackupEngine.get_last_successful_backup() 检查最近一次成功备份:
+    - 返回非 None → 存在成功备份 → 允许物理删除
+    - 返回 None → 无成功备份 → 拒绝物理删除(避免删后无法恢复)
+
+    失败原因(返回 None 的场景):
+    - backup_history 为空(从未备份)
+    - 最近成功备份 COMPLETE marker 在 R2 中丢失(RPO 不合规)
+    - R2 storage 不可达
+
+    Returns:
+        True 允许物理删除;False 拒绝
+    """
+    try:
+        from services.backup_engine import BackupEngine
+        engine = BackupEngine()
+        latest = await engine.get_last_successful_backup()
+        if latest is None:
+            logger.warning(
+                "[DataLifecycle] backup marker 验证失败: 无成功备份记录,拒绝物理删除"
+            )
+            return False
+        logger.info(
+            f"[DataLifecycle] backup marker 验证通过 backup_id={latest.get('backup_id')} "
+            f"completed_at={latest.get('completed_at')}"
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            f"[DataLifecycle] backup marker 验证异常,拒绝物理删除(失败即拒绝): {e}"
+        )
+        return False
+
+
+async def cleanup_expired_data(
+    batch_size: int = 1000,
+    skip_backup_check: bool = False,
+) -> int:
+    """R51 P1-1: 清理过期数据(物理删除已过保留期且已备份的数据)。
+
+    改造要点:
+    - 物理删除前必须验证 backup marker(无 marker 拒绝物理删除)
+    - skip_backup_check=True 仅用于测试场景或运维显式绕过(默认 False)
+    - 无 marker 时 raise AppError(DATA_LIFECYCLE_BACKUP_MARKER_MISSING)
 
     Args:
         batch_size: 单批最大清理条数
+        skip_backup_check: 跳过 backup marker 验证(仅测试/运维绕过)
 
     Returns:
         清理的总行数
+
+    Raises:
+        AppError(DATA_LIFECYCLE_BACKUP_MARKER_MISSING): 无 backup marker
     """
     if not await _ensure_retention_table():
         return 0
     store = get_cache_store()
     if not store._db:
         return 0
+    # R51 P1-1: 物理删除前必须验证 backup marker
+    if not skip_backup_check:
+        if not await _verify_backup_marker():
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BACKUP_MARKER_MISSING,
+                params={"reason": "no_successful_backup_found"},
+            )
     total_cleaned = 0
     now_dt = _dt.datetime.now()
     # 拉取所有设置了保留期(非永久)的用户

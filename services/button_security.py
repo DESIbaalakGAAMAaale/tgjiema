@@ -177,8 +177,21 @@ def generate_signed_callback(
     R47 P1-a: nonce 熵提升到 128 bit(32 hex chars)。
     R48 P1-b: 添加 resource_version 参数,绑定资源版本(防止旧按钮操作已更新资源)。
 
-    注意:本函数不持久化 nonce 到 callback_nonces 表,
-    高风险 action 应改用 sign_button_token_with_nonce(异步,持久化 nonce)。
+    ── R51 P1-10 使用约束(重要)────────────────────────────────────
+    本函数为**只读操作**专用(如 view / cancel / close / refresh / info / help /
+    back / menu / page / next / prev / language 等无副作用 action)。
+
+    **变更型按钮**(ban / takedown / purge / restore / delete_file / admin_grant /
+    reset_quota / approve_appeal 等修改状态或影响权益的操作)必须改用
+    ``sign_button_token_with_nonce()``(持久化 nonce + 原子消费,防重放)。
+    原因:
+        - 本函数生成的 nonce 不持久化到 callback_nonces 表,
+          verify_signed_callback 不会消费 nonce,无法防止重放攻击
+        - 多 isolate / 多 worker 环境下,内存中的 nonce 校验不可靠
+
+    若本函数被传入 HIGH_RISK_ACTIONS 中的 action,会记录 warning 日志(不拒绝,
+    以保持向后兼容;但 verify_signed_callback 会拒绝高风险 action 的旧 5 段格式)。
+    新代码应改用 sign_button_token_with_nonce。
 
     格式: {user_id}:{action}:{data}:{expire_ts}:{nonce}:{signature}
     (resource_version 不出现在 callback_data 中,仅参与签名计算,
@@ -186,7 +199,7 @@ def generate_signed_callback(
 
     Args:
         user_id: 用户 ID(必须为整数)
-        action: 动作标识(如 "confirm", "cancel", "retry", "appeal")
+        action: 动作标识(只读操作,如 "view", "cancel", "refresh")
         data: 附加数据(如 file_code,可为空字符串)
         ttl: 有效期(秒,默认 1 小时)
         nonce: 随机串(默认自动生成 32 hex chars = 128 bit 熵)
@@ -197,6 +210,15 @@ def generate_signed_callback(
     Returns:
         签名后的 callback_data 字符串(6 段格式)
     """
+    # R51 P1-10: 高风险 action 使用旧 sync API 警告(不拒绝,保持向后兼容)
+    # 新代码应改用 sign_button_token_with_nonce(持久化 nonce + 原子消费)
+    if _is_high_risk_action(action):
+        logger.warning(
+            f"[button_security] R51 P1-10: 高风险 action={action} 通过 "
+            f"generate_signed_callback(只读 API)签名,建议改用 "
+            f"sign_button_token_with_nonce(持久化 nonce + 原子消费防重放)。"
+            f"user_id={user_id}"
+        )
     expire_ts = int(time.time()) + ttl
     if not nonce:
         # R47 P1-a: 128 bit 熵(原 32 bit 不足)

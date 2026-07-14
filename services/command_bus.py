@@ -1426,6 +1426,18 @@ def _resolve_command_for_action(action: str, params: dict) -> Command | None:
         return make_delete_file_command(
             file_code=str(params.get("file_code", "")),
         )
+    if action == "restore_content":
+        # R51 P0-6: 内容申诉恢复命令(由 ApprovalExecutor 消费 command_outbox 调度)
+        return make_restore_content_command(
+            appeal_id=int(params.get("appeal_id", 0)),
+            target_type=params.get("target_type", ""),
+            target_id=str(params.get("target_id", "")),
+            admin_id=int(params.get("admin_id", 0)),
+            content_hash=params.get("content_hash", ""),
+            reporter_id=int(params.get("reporter_id", 0)),
+            first_approver_id=int(params.get("first_approver_id", 0)),
+            note=params.get("note", ""),
+        )
     # 未注册的 action
     logger.warning(f"[CommandBus] _resolve_command_for_action 未知 action: {action}")
     return None
@@ -1667,6 +1679,221 @@ def make_delete_file_command(file_code: str) -> Command:
         handler=_handler,
         params={"file_code": file_code},
         requires_approval=False,
+    )
+
+
+def make_restore_content_command(
+    appeal_id: int,
+    target_type: str,
+    target_id: str,
+    admin_id: int,
+    content_hash: str = "",
+    reporter_id: int = 0,
+    first_approver_id: int = 0,
+    note: str = "",
+) -> Command:
+    """R51 P0-6: 构造内容申诉恢复命令(由 ApprovalExecutor 消费 command_outbox 调度)。
+
+    2-person 审批已在 process_appeal 完成,此处 requires_approval=False。
+    handler 执行流程:
+    1. 调用 _restore_content_internal() 恢复内容(撤销软删除)
+    2. restore 成功 → UPDATE content_reports SET status='resolved' + 通知举报者
+    3. restore 失败 → UPDATE content_reports SET status='restore_failed' +
+       记录 effect receipt failed(reconciliation)
+    4. restore 成功但状态更新失败 → 记录 effect receipt + reconciliation
+       (不降级,不仅 warning)
+
+    Args:
+        appeal_id: 申诉 ID(等同 report_id)
+        target_type: 恢复目标类型(file/user/code)
+        target_id: 恢复目标 ID
+        admin_id: 第二审批人 ID(执行恢复的管理员)
+        content_hash: 内容 hash(用于 action_id 确定性)
+        reporter_id: 举报者 ID(用于通知)
+        first_approver_id: 第一审批人 ID(用于审计)
+        note: 审批备注
+
+    Returns:
+        Command 对象(由 ApprovalExecutor 调度执行)
+    """
+    async def _handler(params: dict) -> dict:
+        import datetime as _dt_h
+        from services import content_reports as _cr_mod
+        from services import notifications as _notif_svc
+        from database.cache_store import get_cache_store as _get_store
+        from services.error_codes import AppError, ErrorCodes
+        from services.effect_receipts import get_receipt_manager
+
+        _appeal_id = int(params.get("appeal_id", 0))
+        _target_type = params.get("target_type", "")
+        _target_id = str(params.get("target_id", ""))
+        _admin_id = int(params.get("admin_id", 0))
+        _reporter_id = int(params.get("reporter_id", 0))
+
+        # 1. 执行恢复(撤销软删除)
+        restore_ok = await _cr_mod._restore_content_internal(
+            _target_type, _target_id, _admin_id,
+        )
+
+        _store = _get_store()
+        _now = _dt_h.datetime.now().isoformat()
+
+        if not restore_ok:
+            # 3. restore 失败 → 状态变为 restore_failed + effect receipt failed
+            logger.error(
+                f"[CommandBus] restore_content handler 恢复失败 "
+                f"appeal_id={_appeal_id} target={_target_type}:{_target_id}"
+            )
+            if _store and _store._db:
+                try:
+                    async with _store.transaction() as tx:
+                        await tx.execute(
+                            "UPDATE content_reports "
+                            "SET status = ?, resolved_by = ?, resolved_at = ? "
+                            "WHERE id = ?",
+                            (_cr_mod.REPORT_STATUS_RESTORE_FAILED,
+                             _admin_id, _now, _appeal_id),
+                        )
+                        await _store.add_dirty_outbox(
+                            "content_reports", str(_appeal_id), connection=tx,
+                        )
+                except Exception as status_err:
+                    logger.error(
+                        f"[CommandBus] restore_content 状态更新到 restore_failed 失败: {status_err}"
+                    )
+            # 记录 effect receipt failed(reconciliation)
+            receipt_mgr = get_receipt_manager(_store)
+            if receipt_mgr is not None:
+                try:
+                    await receipt_mgr.record_failed(
+                        action_id=f"restore_content_{_appeal_id}_{params.get('content_hash', '')[:16]}",
+                        effect_type="restore",
+                        target=f"{_target_type}:{_target_id}",
+                        error_msg="restore_content handler failed",
+                    )
+                except Exception as receipt_err:
+                    logger.error(
+                        f"[CommandBus] restore_content record_failed 失败: {receipt_err}"
+                    )
+            raise AppError(
+                ErrorCodes.CONTENT_APPEAL_RESTORE_FAILED,
+                params={
+                    "appeal_id": _appeal_id,
+                    "target_type": _target_type,
+                    "target_id": _target_id,
+                },
+            )
+
+        # 2. restore 成功 → 状态变为 resolved + 通知举报者
+        status_update_ok = False
+        if _store and _store._db:
+            try:
+                async with _store.transaction() as tx:
+                    cursor = await tx.execute(
+                        "UPDATE content_reports "
+                        "SET status = ?, resolved_by = ?, resolved_at = ? "
+                        "WHERE id = ?",
+                        (_cr_mod.REPORT_STATUS_RESOLVED,
+                         _admin_id, _now, _appeal_id),
+                    )
+                    if cursor and cursor.rowcount > 0:
+                        status_update_ok = True
+                    await _store.add_dirty_outbox(
+                        "content_reports", str(_appeal_id), connection=tx,
+                    )
+            except Exception as status_err:
+                logger.error(
+                    f"[CommandBus] restore_content 状态更新到 resolved 失败 "
+                    f"(restore 已执行,进入 reconciliation): {status_err}"
+                )
+
+        if not status_update_ok:
+            # 4. restore 成功但状态更新失败 → effect receipt + reconciliation
+            # 不降级,不仅 warning — 记录 reconciliation 等待人工处理
+            logger.error(
+                f"[CommandBus] restore_content 恢复成功但状态更新失败 "
+                f"appeal_id={_appeal_id}(进入 reconciliation)"
+            )
+            receipt_mgr = get_receipt_manager(_store)
+            if receipt_mgr is not None:
+                try:
+                    # 标记为 completed(restore 已执行)但 reconcile_status=needs_reconcile
+                    await receipt_mgr.record_completed(
+                        action_id=f"restore_content_{_appeal_id}_{params.get('content_hash', '')[:16]}",
+                        effect_type="restore",
+                        target=f"{_target_type}:{_target_id}",
+                        external_id=f"restored_but_status_unsynced:{_appeal_id}",
+                    )
+                    # 手动标记 reconcile_status 为 needs_reconcile
+                    if _store and _store._db:
+                        await _store._db.execute(
+                            "UPDATE effect_receipts "
+                            "SET reconcile_status = 'needs_reconcile', "
+                            "last_error = ? "
+                            "WHERE action_id = ? AND effect_type = 'restore'",
+                            ("restore succeeded but report status update failed",
+                             f"restore_content_{_appeal_id}_{params.get('content_hash', '')[:16]}"),
+                        )
+                        await _store._db.commit()
+                except Exception as receipt_err:
+                    logger.error(
+                        f"[CommandBus] restore_content reconciliation 记录失败: {receipt_err}"
+                    )
+            raise AppError(
+                ErrorCodes.CONTENT_APPEAL_RESTORE_FAILED,
+                params={
+                    "appeal_id": _appeal_id,
+                    "target_type": _target_type,
+                    "target_id": _target_id,
+                },
+            )
+
+        # 通知举报者(appeal 已批准,内容已恢复)
+        if _reporter_id > 0:
+            try:
+                await _notif_svc.dispatch_notification(
+                    user_id=_reporter_id,
+                    type="appeal_approved",
+                    content={
+                        "appeal_id": _appeal_id,
+                        "target_type": _target_type,
+                        "target_id": _target_id,
+                        "restored": True,
+                    },
+                    dedup_key=f"appeal_approved:{_appeal_id}",
+                )
+            except Exception as notif_err:
+                logger.warning(
+                    f"[CommandBus] restore_content 通知失败(不阻塞): {notif_err}"
+                )
+
+        logger.info(
+            f"[CommandBus] restore_content handler 成功 "
+            f"appeal_id={_appeal_id} target={_target_type}:{_target_id}"
+        )
+        return {
+            "restore_ok": True,
+            "appeal_id": _appeal_id,
+            "target_type": _target_type,
+            "target_id": _target_id,
+        }
+
+    return Command(
+        action="restore_content",
+        required_permission=PERM_DISASTER_RESTORE,
+        handler=_handler,
+        params={
+            "appeal_id": appeal_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "admin_id": admin_id,
+            "content_hash": content_hash,
+            "reporter_id": reporter_id,
+            "first_approver_id": first_approver_id,
+            "note": note,
+        },
+        requires_approval=False,  # 2-person 审批已在 process_appeal 完成
+        approval_action="",
     )
 
 

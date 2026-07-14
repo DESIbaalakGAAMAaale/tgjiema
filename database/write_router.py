@@ -71,17 +71,31 @@ async def route_write(
 ) -> Any:
     """路由写操作。
 
+    R51 P0-4 修复(方案 A: 只写 durable outbox,禁止双写):
+        - push() 返回 ``{"status": "persisted_pending", ...}`` 时,表示消息
+          已持久化到 durable outbox,等待 Redis 恢复后由 replayer 重放。
+          此时禁止调用 fallback 直写 SQLite,避免 Redis 恢复后 outbox 重放
+          导致同一业务操作二次执行(double-write)。
+        - push() 抛 AppError 时(Redis 与 outbox 双双不可用),异常向上传播,
+          由调用方决定是否重试或返回错误响应,不再静默降级。
+
     Args:
         method_name: cache_store 方法名(Writer 用于分派)
         table: 目标 SQLite 表名
         op_type: 操作类型(upsert/update/delete/insert)
         data: 方法参数字典
         redis_key: 关联的 Redis 缓存 key(Writer 写完后 DEL)
-        fallback: 降级回调(降级到 SQLite 直写时调用)
+        fallback: 降级回调(仅在显式 SQLite 模式或 CAS/事务写时调用,
+            Redis 模式下 push 失败不再调用,避免双写)
 
     Returns:
-        Redis 模式返回 True/False(推入成功与否)
-        降级模式返回 fallback() 的结果
+        Redis 模式 + XADD 成功: True
+        Redis 模式 + Redis 不可用但 outbox 持久化成功:
+            ``{"status": "persisted_pending", "outbox_id": ..., "message_id": ...}``
+        SQLite 模式 / CAS / 非幂等: fallback() 的结果
+
+    Raises:
+        AppError: Redis 与 durable outbox 双双不可用时由 push() 抛出
     """
     # CAS/事务写:直写 SQLite
     if is_direct_write(method_name):
@@ -95,20 +109,35 @@ async def route_write(
             return await fallback()
         return None
 
-    # Redis 模式:推入队列
-    ok = await redis_queue.push(
+    # Redis 模式:推入队列(push 可能返回 True / persisted_pending 字典 / 抛 AppError)
+    result = await redis_queue.push(
         op_type=op_type,
         table=table,
         method_name=method_name,
         data=data,
         redis_key=redis_key,
     )
-    if not ok:
-        # Redis 推入失败,降级到 SQLite
-        logger.debug(f"[WriteRouter] {method_name} Redis 推入失败,降级直写")
-        if fallback is not None:
-            return await fallback()
-    return ok
+    # R51 P0-4: push 新契约:
+    # - True: XADD 成功
+    # - dict ({"status": "persisted_pending", ...}): durable outbox 已持久化,
+    #   Redis 恢复后由 replayer 重放(禁止降级直写 SQLite,避免双写)
+    # - 抛 AppError: durable outbox 也失败,异常向上传播(已在 push 内抛出)
+    if result is True:
+        return True
+    if isinstance(result, dict) and result.get("status") == "persisted_pending":
+        logger.info(
+            f"[WriteRouter] {method_name} 已持久化到 durable outbox "
+            f"(outbox_id={result.get('outbox_id')}),"
+            f"等待 Redis 恢复后重放(禁止直写 SQLite 避免双写)"
+        )
+        return result
+    # 兜底:理论上不会走到此处(push 新契约只返回 True/dict/抛异常)
+    # 仍然不调用 fallback,避免双写;返回原值让调用方处理
+    logger.warning(
+        f"[WriteRouter] {method_name} push 返回非预期值 {result!r},"
+        f"不降级直写 SQLite(避免双写)"
+    )
+    return result
 
 
 async def invalidate_cache(redis_key: str) -> None:

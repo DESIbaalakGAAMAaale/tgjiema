@@ -29,7 +29,7 @@ import json
 import os
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from loguru import logger
 
@@ -159,12 +159,20 @@ async def ensure_consumer_group() -> bool:
 
 async def push(op_type: str, table: str, method_name: str, data: dict,
                redis_key: str = "", message_id: str = "",
-               attempts: int = 0) -> bool:
+               attempts: int = 0) -> Union[bool, dict]:
     """推入写操作到 Redis Stream(XADD)。
 
     R33修复: 每条消息携带 message_id (UUID),用于幂等去重。
     R35 P1-1修复: 消息体携带 attempts 字段,DLQ 重试回主 Stream 时
     递增 attempts,避免每次重试都从 0 开始导致无限重试。
+
+    R51 P0-4 修复(方案 A: 只写 durable outbox,禁止双写):
+        - Redis 不可用或 XADD 失败时,写入 durable producer outbox
+        - outbox 写入成功 → 返回 ``{"status": "persisted_pending", ...}``
+          (上层 route_write 收到后不再直写 SQLite,避免 Redis 恢复后
+          outbox 重放导致业务操作二次执行)
+        - outbox 写入失败 → raise AppError(关键业务必须抛异常,
+          不能只返回 False 后继续,否则会导致数据丢失)
 
     Args:
         op_type: 操作类型(upsert/update/delete/insert)
@@ -176,22 +184,36 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
         attempts: 当前重试次数(0=首次入队,>0 表示从 DLQ 重试回主 Stream 的次数)
 
     Returns:
-        True 推入成功, False 降级到 SQLite 直写
+        True: XADD 成功(消息已入 Redis Stream)
+        dict: durable outbox 持久化成功,格式为
+            ``{"status": "persisted_pending", "outbox_id": <message_id>, "message_id": <message_id>}``
+            Redis 恢复后由 replay_durable_outbox() 重放到 Stream
+
+    Raises:
+        AppError: durable outbox 写入失败(Redis 与 outbox 双双不可用,
+            关键业务必须抛异常,禁止降级到 SQLite 直写)
     """
     # R45 §13: 提前生成 message_id,供 durable outbox 使用(Redis 不可达时不丢失)
     if not message_id:
         message_id = str(uuid.uuid4())
     redis = await get_redis()
     if not redis:
-        # R45 §13: Redis 不可用时写入本地 durable producer outbox
-        # write_router 仍会降级到 SQLite 直写,但消息也缓冲在 outbox 中
-        # 供 Redis 恢复后 replay_durable_outbox() 重放到 Stream
+        # R51 P0-4: Redis 不可用时只写 durable outbox(不再返回 False 让上层写 SQLite)
+        # write_durable_outbox 失败时会 raise AppError,异常向上传播
         await write_durable_outbox(
             op_type=op_type, table=table, method_name=method_name,
             data=data, redis_key=redis_key, message_id=message_id,
             attempts=attempts,
         )
-        return False
+        logger.info(
+            f"[RedisQueue] Redis 不可用,消息已持久化到 durable outbox "
+            f"(等待恢复后重放): message_id={message_id}, method={method_name}"
+        )
+        return {
+            "status": "persisted_pending",
+            "outbox_id": message_id,
+            "message_id": message_id,
+        }
     try:
         from config import settings
         msg = {
@@ -214,14 +236,19 @@ async def push(op_type: str, table: str, method_name: str, data: dict,
         )
         return True
     except Exception as e:
-        logger.warning(f"[RedisQueue] push 失败(降级到 SQLite): {e}")
-        # R45 §13: Redis 运行时异常也写入 durable outbox
+        logger.warning(f"[RedisQueue] push XADD 失败,改写 durable outbox: {e}")
+        # R51 P0-4: Redis 运行时异常也写入 durable outbox(不再返回 False)
+        # write_durable_outbox 失败时会 raise AppError,异常向上传播
         await write_durable_outbox(
             op_type=op_type, table=table, method_name=method_name,
             data=data, redis_key=redis_key, message_id=message_id,
             attempts=attempts,
         )
-        return False
+        return {
+            "status": "persisted_pending",
+            "outbox_id": message_id,
+            "message_id": message_id,
+        }
 
 
 async def pop(timeout: int = 1, count: int = 10) -> list[dict]:
@@ -1007,6 +1034,11 @@ async def write_durable_outbox(
 
     幂等: message_id 唯一约束,重复写入会被忽略(INSERT OR IGNORE)。
 
+    R51 P0-4 修复(方案 A: 只写 durable outbox,禁止双写):
+        失败时必须向关键业务抛 AppError,不能只返回 False 后继续。
+        原因:上层 push() 依赖此函数持久化消息,若返回 False 静默失败,
+        会导致数据丢失(Redis 不可用 + outbox 不可用 = 消息消失)。
+
     Args:
         op_type: 操作类型(upsert/update/delete/insert)
         table: 目标 SQLite 表名
@@ -1017,12 +1049,30 @@ async def write_durable_outbox(
         attempts: 重试次数
 
     Returns:
-        True 写入成功, False 写入失败(已降级,不阻塞主流程)
+        True 写入成功
+
+    Raises:
+        AppError: 写入失败(ErrorCodes.DB_CACHE_UNAVAILABLE),
+            包含 cause 原始异常与 message_id 上下文
     """
+    # R51 P0-4: 延迟导入 AppError 避免模块循环依赖
+    from services.error_codes import AppError, ErrorCodes
+
     conn = await _get_dedicated_connection()
     if conn is None:
-        logger.warning("[RedisQueue] R45 §13: durable outbox 连接不可用,消息可能丢失")
-        return False
+        # R51 P0-4: durable outbox 连接不可用 → 抛异常,不再返回 False
+        logger.error(
+            f"[RedisQueue] R45 §13: durable outbox 连接不可用,关键业务失败 "
+            f"(抛 AppError): message_id={message_id}, method={method_name}"
+        )
+        raise AppError(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={
+                "component": "durable_outbox",
+                "method": method_name,
+                "message_id": message_id,
+            },
+        )
     try:
         data_json = json.dumps(data, default=str, ensure_ascii=False)
         # R45 §13: 独立事务写入(transaction-aware Command)
@@ -1045,8 +1095,19 @@ async def write_durable_outbox(
             raise
         return True
     except Exception as e:
-        logger.warning(f"[RedisQueue] R45 §13: durable outbox 写入失败: {e}")
-        return False
+        # R51 P0-4: durable outbox 写入失败 → 抛 AppError,不再返回 False
+        logger.error(
+            f"[RedisQueue] R45 §13: durable outbox 写入失败(抛 AppError): "
+            f"message_id={message_id}, method={method_name}, error={e}"
+        )
+        raise AppError(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={
+                "component": "durable_outbox",
+                "method": method_name,
+                "message_id": message_id,
+            },
+        ) from e
 
 
 async def replay_durable_outbox(batch_size: int = 100) -> int:

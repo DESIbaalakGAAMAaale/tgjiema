@@ -266,6 +266,8 @@ class TestDispatchCrdbTombstoneFallback:
 
         async def mock_route_dlq(table_name, recs, error_msg):
             dlq_calls.append((table_name, recs, error_msg))
+            # R51 P0-9: _route_dirty_outbox_to_dlq 返回 dict(非 None)
+            return {"success": True, "failed_ids": [], "error": ""}
 
         try:
             import importlib

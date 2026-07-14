@@ -284,6 +284,7 @@ async def restore(
     admin_id: int = 0,
     approver_id: int = 0,
     approval_action_id: str | None = None,
+    expected_request_hash: str | None = None,
 ) -> dict:
     """恢复备份(R40 P0-7: 调用 BackupEngine.restore 可解密加密备份)。
 
@@ -301,18 +302,28 @@ async def restore(
     - 不传 approval_action_id → 抛 ValueError(强制走审批流)
     - approver_id 参数保留向后兼容,但优先使用 approval_action_id 反查的 principal
 
+    R51 P0-8 整改: production restore 必须传 expected_request_hash(TOCTOU 防护)。
+    - 新增 ``expected_request_hash`` 参数(可选,由审批流计算后注入)
+    - 若调用方未传,则从 command_executions 反查 principal_id 后用
+      BackupEngine._compute_restore_request_hash 计算(绑定 backup_id + target +
+      schema_version + requested_by + approval_id)
+    - 计算后透传给 BackupEngine.restore 进行 TOCTOU 校验
+
     Args:
         backup_id: 备份 ID(R40 P0-7 格式 backup_YYYYMMDD_HHMMSS_xxxxxxxx)
         admin_id: 操作者 admin_id(向后兼容)
         approver_id: 审批人 ID(已弃用,保留向后兼容;优先用 approval_action_id 反查)
         approval_action_id: 审批动作 ID(必填,对应 command_executions.action_id,
                             必须由审批流通过 ApprovalExecutor 调用恢复时注入)
+        expected_request_hash: 期望的 request_hash(由审批流基于 backup_id +
+                               target + schema_version + requested_by + approval_id
+                               计算;None 时本函数自动反查 principal_id 后计算)
 
     Returns:
         {success, restored_tables, duration_seconds, error}
 
     Raises:
-        ValueError: approval_action_id 为空(灾备恢复必须通过审批流)
+        AppError: approval_action_id 为空(BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED)
     """
     if not backup_id:
         return {
@@ -334,6 +345,43 @@ async def restore(
     # approval_action_id 反查 principal_id 完成
     effective_approver = approver_id or admin_id
 
+    # R51 P0-8: 若调用方未传 expected_request_hash,从 command_executions 反查
+    # principal_id 后计算(绑定 backup_id + target + schema_version + requested_by +
+    # approval_id),确保 TOCTOU 校验不可绕过
+    if not expected_request_hash:
+        try:
+            from services.backup_engine import (
+                BackupEngine as _BE,
+                MANIFEST_SCHEMA_VERSION,
+            )
+            store = get_cache_store()
+            if hasattr(store, "_db") and store._db:
+                cursor = await store._db.execute(
+                    "SELECT principal_id FROM command_executions "
+                    "WHERE action_id = ? LIMIT 1",
+                    (approval_action_id,),
+                )
+                row = await cursor.fetchone()
+                if row and row[0]:
+                    try:
+                        _principal_id = int(row[0])
+                    except (TypeError, ValueError):
+                        _principal_id = 0
+                    if _principal_id:
+                        expected_request_hash = _BE._compute_restore_request_hash(
+                            backup_id=backup_id,
+                            target="production",
+                            schema_version=MANIFEST_SCHEMA_VERSION,
+                            requested_by=_principal_id,
+                            approval_id=approval_action_id,
+                        )
+        except Exception as e:
+            logger.warning(
+                f"[DisasterRecovery] R51 P0-8: 反查 principal_id 计算 "
+                f"expected_request_hash 失败 (approval_action_id="
+                f"{approval_action_id}): {e}"
+            )
+
     start_ts = _time.time()
     try:
         from services.backup_engine import BackupEngine
@@ -341,9 +389,11 @@ async def restore(
 
         # R44 G0-3: 生产恢复必须传 approval_action_id,不传 approver_id
         # 让 BackupEngine.restore 从 command_executions.principal_id 反查
+        # R51 P0-8: 透传 expected_request_hash 进行 TOCTOU 校验
         result = await engine.restore(
             backup_id, target="production",
             approval_action_id=approval_action_id,
+            expected_request_hash=expected_request_hash,
         )
 
         success = result.get("success", False)

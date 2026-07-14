@@ -879,6 +879,20 @@ class CacheStore:
             )
         except Exception:
             pass  # 列已存在,忽略
+        # R51 P0-9: 为 dirty_outbox 表添加 last_error + next_retry_at 列(指数退避)
+        # DLQ 写入失败时记录错误信息并设置下次重试时间,支持指数退避重试
+        try:
+            await self._db.execute(
+                "ALTER TABLE dirty_outbox ADD COLUMN last_error TEXT"
+            )
+        except Exception:
+            pass  # 列已存在,忽略
+        try:
+            await self._db.execute(
+                "ALTER TABLE dirty_outbox ADD COLUMN next_retry_at TEXT"
+            )
+        except Exception:
+            pass  # 列已存在,忽略
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
         )
@@ -1083,6 +1097,70 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_notifications_user_unread ON notifications(user_id, is_read)"
         )
 
+        # ─── R45/R51 P0-5: 通知投递 outbox(notification_outbox) ───
+        # R45 第 16 节: 通知先写 outbox(pending),由各 Bot 异步投递
+        # R51 P0-5: 新增 window_start 列 + 唯一约束,防并发重复插入
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS notification_outbox (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                notif_id     INTEGER NOT NULL,
+                user_id      INTEGER NOT NULL,
+                notif_type   TEXT NOT NULL,
+                dedup_key    TEXT DEFAULT '',
+                window_start TEXT,                 -- R51 P0-5: 去重窗口起始时间(整点对齐)
+                payload      TEXT,
+                status       TEXT DEFAULT 'pending',
+                attempts     INTEGER DEFAULT 0,
+                max_attempts INTEGER DEFAULT 3,
+                last_error   TEXT DEFAULT '',
+                created_at   TEXT,
+                delivered_at TEXT,
+                updated_at   TEXT
+            )"""
+        )
+        # R51 P0-5: 旧库补 window_start 列(幂等,已存在则忽略)
+        try:
+            await self._db.execute(
+                "ALTER TABLE notification_outbox ADD COLUMN window_start TEXT"
+            )
+        except Exception as e:
+            logger.debug(
+                f"[CacheStore] notification_outbox ADD window_start (幂等,可忽略): {e}"
+            )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notif_outbox_status "
+            "ON notification_outbox(status, created_at)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notif_outbox_user "
+            "ON notification_outbox(user_id, status)"
+        )
+        # R51 P0-5: (user_id, dedup_key, window_start) 唯一约束 — 防并发重复投递
+        # 仅对 dedup_key 非空且非空字符串的记录生效(部分索引)
+        await self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_outbox_dedup "
+            "ON notification_outbox(user_id, dedup_key, window_start) "
+            "WHERE dedup_key IS NOT NULL AND dedup_key != ''"
+        )
+        # R45: 通知投递回执(notification_receipts)
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS notification_receipts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                notif_id     INTEGER NOT NULL,
+                outbox_id    INTEGER,
+                user_id      INTEGER NOT NULL,
+                channel      TEXT,
+                status       TEXT NOT NULL,
+                error        TEXT DEFAULT '',
+                delivered_at TEXT,
+                created_at   TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_receipts_notif "
+            "ON notification_receipts(notif_id)"
+        )
+
         # ─── R40: 内容举报(content_reports) ───
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS content_reports (
@@ -1211,6 +1289,15 @@ class CacheStore:
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_command_outbox_status ON command_outbox(status)"
+        )
+        # R51 P0-7: UNIQUE(approval_id, action_id) — 防止 approve() 重试或补偿 worker
+        # 重复写入 command_outbox 条目,支持幂等补偿(UNIQUE 冲突即视为已写入,跳过即可)。
+        # 注意: action_id 列本身已有 UNIQUE 约束,此复合唯一索引作为防御性冗余 +
+        # 显式语义标识(approval_id, action_id) 二元组的唯一性。
+        await self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_command_outbox_approval_action "
+            "ON command_outbox(approval_id, action_id) "
+            "WHERE approval_id IS NOT NULL"
         )
 
         # ─── R40: 维护模式状态(maintenance_state) ───
@@ -2092,6 +2179,44 @@ class CacheStore:
             return cursor.rowcount if cursor else 0
         except Exception as e:
             logger.warning(f"[CacheStore] mark_dirty_local_only 失败: {e}")
+            return 0
+
+    async def mark_dirty_retry(
+        self, ids: list[int], error_msg: str,
+        next_retry_at: str | None = None,
+    ) -> int:
+        """R51 P0-9: 标记 dirty_outbox 记录的错误信息和下次重试时间(指数退避)。
+
+        DLQ 写入失败时,保持 dirty_outbox.processed=0(未处理),
+        记录 last_error 和 next_retry_at,支持指数退避重试。
+        下一轮 _sync_dirty_outbox 会重新拉取这些记录并重试。
+
+        Args:
+            ids: 需要重试的 dirty_outbox.id 列表
+            error_msg: 失败原因(DLQ 写入失败的原因)
+            next_retry_at: 下次重试时间(ISO 字符串),None 时自动计算 60s 后
+
+        Returns:
+            实际更新的行数
+        """
+        if not self._db or not ids:
+            return 0
+        import datetime as _dt_retry
+        if next_retry_at is None:
+            next_retry_at = (
+                _dt_retry.datetime.now() + _dt_retry.timedelta(seconds=60)
+            ).isoformat()
+        try:
+            placeholders = ",".join("?" * len(ids))
+            cursor = await self._db.execute(
+                f"UPDATE dirty_outbox SET last_error = ?, next_retry_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [error_msg, next_retry_at] + list(ids),
+            )
+            await self._db.commit()
+            return cursor.rowcount if cursor else 0
+        except Exception as e:
+            logger.warning(f"[CacheStore] mark_dirty_retry 失败: {e}")
             return 0
 
     async def count_unprocessed_dirty_outbox(self) -> int:
