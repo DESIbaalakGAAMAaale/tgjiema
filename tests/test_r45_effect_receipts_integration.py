@@ -232,19 +232,23 @@ class TestWithEffectReceiptDecorator:
 
     @pytest.mark.asyncio
     async def test_decorator_backward_compat_without_action_id(self, receipt_manager, clean_tables):
-        """测试 4:无 action_id 时直接执行原函数(向后兼容)。"""
+        """测试 4:无 action_id 时直接执行原函数(向后兼容)。
+
+        R47 P0-4: critical effect 无 action_id 现已拒绝执行(抛 EffectReceiptError),
+        此处改用非 critical effect_type 'r2_upload' 验证向后兼容路径。
+        """
         from services.effect_receipts_integration import with_effect_receipt
 
         store = clean_tables
         called = False
 
-        @with_effect_receipt("telegram_send", lambda *a, **kw: f"chat:{a[0]}")
+        @with_effect_receipt("r2_upload", lambda *a, **kw: f"chat:{a[0]}")
         async def send_message(chat_id, text):
             nonlocal called
             called = True
             return {"message_id": 1}
 
-        # 不传 action_id
+        # 不传 action_id(非 critical → 直执)
         result = await send_message(42, "hi")
 
         assert called is True
@@ -253,7 +257,7 @@ class TestWithEffectReceiptDecorator:
         # 验证未写入 effect_receipts(因为未传 action_id,直接执行)
         cursor = await store._db.execute(
             "SELECT COUNT(*) FROM effect_receipts "
-            "WHERE effect_type = 'telegram_send' AND target = 'chat:42'"
+            "WHERE effect_type = 'r2_upload' AND target = 'chat:42'"
         )
         row = await cursor.fetchone()
         assert row[0] == 0

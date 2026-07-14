@@ -1,0 +1,22 @@
+{
+  "description": "R47 P1-c: 已知裸字符串错误 baseline",
+  "note": "修复已知违规后运行 --generate-baseline 更新此文件",
+  "violation_count": 15,
+  "violations": [
+    "admin/__init__.py::raise ValueError(\"密码不能为空\")",
+    "admin/seed_topology.py::raise RuntimeError(\"topology.yaml 中没有槽位配置\")",
+    "bots/idx_bot.py::raise RuntimeError(\"[Idx][R45] _generate_unique_code_with_retry: 数据库未初始化\")",
+    "bots/idx_bot.py::raise RuntimeError(\"[Idx][R45] finalize_upload: 数据库未初始化\")",
+    "bots/idx_bot.py::raise RuntimeError(\"无可用存储频道,请检查 cells 表配置\")",
+    "bots/mon_bot.py::raise RuntimeError(\"MON_BOT_TOKEN 未配置,监控机器人必须有独立的 Bot Token\")",
+    "bots/up_bot.py::raise RuntimeError(\"_bot 全局引用未初始化(OutboxWorker 无法调用 Telegram API)\")",
+    "bots/up_bot.py::raise RuntimeError(\"无可用活跃槽位，请检查拓扑配置\")",
+    "services/backup_crypto.py::raise RuntimeError(\"BACKUP_KEK 未配置,无法解密备份(当前 + 历史 KEK 均不可用)\")",
+    "services/backup_crypto.py::raise RuntimeError(\"cryptography 未安装,无法解密备份\")",
+    "services/crdb_sync_service.py::raise RuntimeError(\"cache_store unavailable for SQLite-only init\")",
+    "services/db_backup.py::raise RuntimeError(\"R2 凭证未配置(.env 和 config 表均无)，无法恢复\")",
+    "services/relay_instance.py::raise RuntimeError(\"二步验证密码获取超时\")",
+    "services/relay_instance.py::raise RuntimeError(\"验证码获取失败\")",
+    "services/relay_pool.py::raise RuntimeError(\"api_hash 不能为空且必须是字符串\")"
+  ]
+}

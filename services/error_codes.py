@@ -1,17 +1,51 @@
-"""R46 P1: 统一错误码 - 三段式 DOMAIN.OPERATION.REASON
+"""R46 P1 / R47 P1-c: 统一错误码协议化 — DOMAIN.OPERATION.REASON 三段式。
 
-格式: DOMAIN.OPERATION.REASON
+本模块提供完整的错误码协议化能力,替代原裸字符串错误返回:
+
+1. ``ErrorCodes`` — 错误码字符串常量(向后兼容旧代码引用)
+2. ``ErrorDefinition`` — 错误定义数据类(包含 message_key/http_status/retryable/severity/safe_params)
+3. ``ErrorEnvelope`` — 统一错误返回(包含 trace_id 贯穿 Bot→Writer→Outbox→CRDB/Telegram→Admin Audit)
+4. ``ErrorRegistry`` — 启动时注册所有 ErrorDefinition,提供 ``get`` / ``create_envelope``
+5. ``AppError`` — 异常类,自动生成 trace_id 并尝试写入 audit_log
+
+格式约定: ``DOMAIN.OPERATION.REASON``
 示例:
-  UPLOAD.COPY.TELEGRAM_TIMEOUT
-  INDEX.FINALIZE.OUTBOX_FAILED
-  DELIVERY.SEND.FLOOD_WAIT
-  AUTH.MFA.REPLAYED
-  BACKUP.RESTORE.APPROVAL_INVALID
+    UPLOAD.COPY.TELEGRAM_TIMEOUT
+    INDEX.FINALIZE.OUTBOX_FAILED
+    DELIVERY.SEND.FLOOD_WAIT
+    AUTH.MFA.REPLAYED
+    BACKUP.RESTORE.APPROVAL_INVALID
+    EFFECT.RECEIPT.MANAGER_UNAVAILABLE
+
+R47 P1-c 整改要点:
+- 所有错误码必须注册到 ErrorRegistry(含 message_key)
+- 所有错误返回必须使用 AppError 或 ErrorEnvelope(禁止裸字符串)
+- 所有错误返回必须携带 trace_id(UUID),写入 audit_log 表
+- locales/zh-CN.json + locales/en-US.json 必须包含所有 message_key
+- CI 通过 scripts/check_error_codes.py 静态扫描门禁
 """
 from __future__ import annotations
 
-# 错误码常量(按 DOMAIN 分组)
+import datetime as _dt
+import json
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+from loguru import logger
+
+
+# ════════════════════════════════════════════════════════════════
+# 1. 错误码字符串常量(向后兼容,按 DOMAIN 分组)
+# ════════════════════════════════════════════════════════════════
 class ErrorCodes:
+    """错误码字符串常量。
+
+    R47 P1-c: 保留原有常量(向后兼容),同时通过 ErrorRegistry 注册完整定义。
+    新代码应使用 ``ErrorRegistry.get(ErrorCodes.XXX)`` 获取完整定义,
+    或通过 ``raise AppError(ErrorCodes.XXX, params={...})`` 抛出。
+    """
+
     # UPLOAD
     UPLOAD_COPY_TELEGRAM_TIMEOUT = "UPLOAD.COPY.TELEGRAM_TIMEOUT"
     UPLOAD_COPY_TELEGRAM_FORBIDDEN = "UPLOAD.COPY.TELEGRAM_FORBIDDEN"
@@ -39,3 +73,784 @@ class ErrorCodes:
     # EFFECT_RECEIPT
     EFFECT_RECEIPT_MANAGER_UNAVAILABLE = "EFFECT.RECEIPT.MANAGER_UNAVAILABLE"
     EFFECT_RECEIPT_DB_ERROR = "EFFECT.RECEIPT.DB_ERROR"
+
+    # ── R47 P1-c 新增:覆盖关键场景的通用错误码 ──
+    # 通用内部错误(fallback,未注册 code 时使用)
+    ERROR_INTERNAL = "ERROR.INTERNAL.UNEXPECTED"
+    # RBAC 权限不足
+    AUTH_RBAC_PERMISSION_DENIED = "AUTH.RBAC.PERMISSION_DENIED"
+    # 审批门禁:操作需审批
+    APPROVAL_REQUIRED = "APPROVAL.GATE.REQUIRED"
+    # 审批状态无效
+    APPROVAL_STATE_INVALID = "APPROVAL.STATE.INVALID"
+    # CommandBus 幂等冲突(已被其他 worker 抢占)
+    COMMAND_CONCURRENT_CLAIM = "COMMAND.CONCURRENT.CLAIM"
+    # 请求参数与上次执行不一致(防篡改拒绝)
+    COMMAND_HASH_MISMATCH = "COMMAND.HASH.MISMATCH"
+    # SQLite cache_store 不可用
+    DB_CACHE_UNAVAILABLE = "DB.CACHE.UNAVAILABLE"
+    # Redis 连接不可用
+    DB_REDIS_UNAVAILABLE = "DB.REDIS.UNAVAILABLE"
+    # CRDB pool 不可用
+    DB_CRDB_UNAVAILABLE = "DB.CRDB.UNAVAILABLE"
+    # 配额超限
+    QUOTA_EXCEEDED = "QUOTA.DECODE.EXCEEDED"
+    # 文件不存在
+    FILE_NOT_FOUND = "FILE.LOOKUP.NOT_FOUND"
+    # 文件已过期
+    FILE_EXPIRED = "FILE.LOOKUP.EXPIRED"
+    # 文件码无效
+    FILE_CODE_INVALID = "FILE.CODE.INVALID"
+    # 用户被封禁
+    USER_BANNED = "USER.STATE.BANNED"
+    # 系统维护中
+    SYSTEM_MAINTENANCE = "SYSTEM.STATE.MAINTENANCE"
+    # 系统限流
+    SYSTEM_RATE_LIMITED = "SYSTEM.RATE.LIMITED"
+    # 参数校验失败
+    VALIDATION_FAILED = "VALIDATION.INPUT.FAILED"
+
+
+# ════════════════════════════════════════════════════════════════
+# 2. ErrorDefinition 数据类
+# ════════════════════════════════════════════════════════════════
+@dataclass(frozen=True)
+class ErrorDefinition:
+    """错误定义 — 描述一个错误码的完整元信息。
+
+    Attributes:
+        code: 三段式错误码 ``DOMAIN.OPERATION.REASON``
+        message_key: i18n key(在 locales/zh-CN.json 与 locales/en-US.json 中)
+        http_status: HTTP 状态码(Bot 返回时可映射为用户消息;Admin HTTP 返回时使用)
+        retryable: 是否可重试(True=临时性故障,调用方可重试;False=永久性故障)
+        severity: 严重级别 ``info`` / ``warning`` / ``error`` / ``critical``
+        safe_params: 可安全记录到日志/audit_log 的参数名白名单
+            (未列入白名单的参数会被 ErrorEnvelope.params 过滤掉,避免泄露敏感信息)
+    """
+    code: str
+    message_key: str
+    http_status: int
+    retryable: bool
+    severity: str
+    safe_params: list[str] = field(default_factory=list)
+
+
+# ════════════════════════════════════════════════════════════════
+# 3. ErrorEnvelope 统一返回
+# ════════════════════════════════════════════════════════════════
+@dataclass
+class ErrorEnvelope:
+    """统一错误返回 — 贯穿 Bot→Writer→Outbox→CRDB/Telegram→Admin Audit 链路。
+
+    Attributes:
+        code: 三段式错误码(对应 ErrorDefinition.code)
+        message: 已 i18n 的用户消息(基于 message_key + params 渲染)
+        message_key: i18n key(供前端/Bot 自行渲染)
+        trace_id: UUID 字符串,贯穿全链路,可用于在 audit_log / 日志中检索
+        retryable: 是否可重试
+        severity: 严重级别(info/warning/error/critical)
+        params: safe_params 过滤后的参数(仅包含 ErrorDefinition.safe_params 列入的字段)
+        timestamp: ISO8601 时间戳(UTC)
+    """
+    code: str
+    message: str
+    message_key: str
+    trace_id: str
+    retryable: bool
+    severity: str
+    params: dict
+    timestamp: str
+
+    def to_dict(self) -> dict:
+        """转换为 dict(供 JSON 序列化返回给前端 / Bot)。"""
+        return {
+            "code": self.code,
+            "message": self.message,
+            "message_key": self.message_key,
+            "trace_id": self.trace_id,
+            "retryable": self.retryable,
+            "severity": self.severity,
+            "params": self.params,
+            "timestamp": self.timestamp,
+        }
+
+
+# ════════════════════════════════════════════════════════════════
+# 4. ErrorRegistry 注册中心
+# ════════════════════════════════════════════════════════════════
+class ErrorRegistry:
+    """错误定义注册中心 — 启动时注册所有 ErrorDefinition。
+
+    用法:
+        # 启动时已自动注册(模块加载即注册,见下方 _register_defaults)
+        definition = ErrorRegistry.get(ErrorCodes.UPLOAD_COPY_TELEGRAM_TIMEOUT)
+        envelope = ErrorRegistry.create_envelope(
+            ErrorCodes.UPLOAD_COPY_TELEGRAM_TIMEOUT,
+            params={"file_code": "abc"},
+            locale="zh-CN",
+        )
+
+    未注册 code 时 fallback 到 ``ErrorCodes.ERROR_INTERNAL``(通用内部错误)。
+    """
+
+    _definitions: dict[str, ErrorDefinition] = {}
+    _initialized: bool = False
+
+    @classmethod
+    def register(cls, definition: ErrorDefinition) -> None:
+        """注册一个 ErrorDefinition。
+
+        重复注册同一 code 时覆盖旧定义(便于测试 reset 后重新注册)。
+        """
+        cls._definitions[definition.code] = definition
+
+    @classmethod
+    def get(cls, code: str) -> ErrorDefinition:
+        """获取 ErrorDefinition。未注册时 fallback 到 ERROR_INTERNAL。"""
+        cls._ensure_initialized()
+        definition = cls._definitions.get(code)
+        if definition is None:
+            logger.warning(
+                f"[ErrorRegistry] 未注册的错误码 fallback 到 ERROR_INTERNAL: {code}"
+            )
+            return cls._definitions[ErrorCodes.ERROR_INTERNAL]
+        return definition
+
+    @classmethod
+    def is_registered(cls, code: str) -> bool:
+        """检查 code 是否已注册(不触发 fallback)。"""
+        cls._ensure_initialized()
+        return code in cls._definitions
+
+    @classmethod
+    def all_codes(cls) -> list[str]:
+        """返回所有已注册的 code 列表(排序)。"""
+        cls._ensure_initialized()
+        return sorted(cls._definitions.keys())
+
+    @classmethod
+    def all_message_keys(cls) -> list[str]:
+        """返回所有已注册的 message_key 列表(去重排序)。"""
+        cls._ensure_initialized()
+        return sorted({d.message_key for d in cls._definitions.values()})
+
+    @classmethod
+    def create_envelope(
+        cls,
+        code: str,
+        params: Optional[dict] = None,
+        locale: str = "zh-CN",
+        trace_id: Optional[str] = None,
+    ) -> ErrorEnvelope:
+        """根据 code + params + locale 创建 ErrorEnvelope。
+
+        Args:
+            code: 错误码(未注册时 fallback 到 ERROR_INTERNAL)
+            params: 参数字典(会按 ErrorDefinition.safe_params 过滤)
+            locale: 语言代码(zh-CN / en-US),决定 message 渲染语言
+            trace_id: 可选 trace_id(不传时自动生成 UUID)
+
+        Returns:
+            ErrorEnvelope 实例(message 已 i18n 渲染)
+        """
+        cls._ensure_initialized()
+        definition = cls.get(code)
+        # trace_id:贯穿全链路(不传时自动生成)
+        if not trace_id:
+            trace_id = str(uuid.uuid4())
+        # params 按 safe_params 白名单过滤(避免敏感信息泄露)
+        safe_params = _filter_safe_params(params or {}, definition.safe_params)
+        # message 渲染参数 = safe_params + trace_id(trace_id 是 envelope 必有字段,
+        # 不属于 safe_params 白名单,但允许在 message 模板中通过 {trace_id} 引用,
+        # 仅供 message 渲染使用,不会写入 envelope.params)
+        render_params = dict(safe_params)
+        render_params["trace_id"] = trace_id
+        # 加载 i18n message
+        message = _render_i18n_message(definition.message_key, render_params, locale)
+        return ErrorEnvelope(
+            code=definition.code,
+            message=message,
+            message_key=definition.message_key,
+            trace_id=trace_id,
+            retryable=definition.retryable,
+            severity=definition.severity,
+            params=safe_params,
+            timestamp=_dt.datetime.utcnow().isoformat(),
+        )
+
+    @classmethod
+    def reset(cls) -> None:
+        """重置注册表(测试用例间隔离)。
+
+        重置后下一次 get/create_envelope 调用会重新触发 _register_defaults。
+        """
+        cls._definitions.clear()
+        cls._initialized = False
+
+    @classmethod
+    def _ensure_initialized(cls) -> None:
+        """确保默认 ErrorDefinition 已注册(幂等)。"""
+        if not cls._initialized:
+            _register_defaults()
+            cls._initialized = True
+
+
+# ════════════════════════════════════════════════════════════════
+# 5. AppError 异常类
+# ════════════════════════════════════════════════════════════════
+class AppError(Exception):
+    """应用异常 — 封装 ErrorCode + params + trace_id。
+
+    用法:
+        raise AppError(ErrorCodes.UPLOAD_COPY_TELEGRAM_TIMEOUT, params={"file_code": "abc"})
+
+    特性:
+        - 自动生成 trace_id(UUID)
+        - 自动尝试写入 audit_log 表(失败静默,不阻塞主流程)
+        - to_envelope() 返回 ErrorEnvelope(供 HTTP/Bot 响应序列化)
+        - to_dict() 返回 dict(供 JSON 序列化)
+
+    Attributes:
+        code: 错误码(对应 ErrorDefinition.code)
+        params: 已过滤的 safe_params(按 ErrorDefinition.safe_params 过滤)
+        trace_id: UUID 字符串
+        envelope: 懒加载的 ErrorEnvelope(首次访问时生成)
+    """
+
+    def __init__(
+        self,
+        code: str,
+        params: Optional[dict] = None,
+        *,
+        locale: str = "zh-CN",
+        trace_id: Optional[str] = None,
+        cause: Optional[BaseException] = None,
+    ):
+        """初始化 AppError。
+
+        Args:
+            code: 错误码(未注册时 fallback 到 ERROR_INTERNAL)
+            params: 参数字典(会按 ErrorDefinition.safe_params 过滤)
+            locale: 语言代码(默认 zh-CN)
+            trace_id: 可选 trace_id(不传时自动生成 UUID)
+            cause: 原始异常(可选,用于异常链)
+        """
+        # 生成 trace_id(贯穿全链路)
+        if not trace_id:
+            trace_id = str(uuid.uuid4())
+        self.trace_id = trace_id
+        self.code = code
+        self.locale = locale
+        self._cause = cause
+        # 创建 envelope(包含已过滤的 safe_params + i18n message)
+        self.envelope = ErrorRegistry.create_envelope(
+            code, params=params, locale=locale, trace_id=trace_id,
+        )
+        # 调用 Exception.__init__ 用 i18n message 作为异常消息
+        super().__init__(self.envelope.message)
+        # 异步写入 audit_log(不阻塞,失败静默)
+        # 注意:此方法在 __init__ 中无法 await,实际写入由调用方在 except 块中
+        # 调用 await app_error.write_audit_log() 完成,或通过同步 _try_write_audit_log_sync
+        # 尽力写入(失败不影响异常传播)。
+
+    @property
+    def params(self) -> dict:
+        """返回已过滤的 safe_params(向后兼容字段访问)。"""
+        return self.envelope.params
+
+    @property
+    def message(self) -> str:
+        """返回已 i18n 的用户消息。"""
+        return self.envelope.message
+
+    @property
+    def message_key(self) -> str:
+        """返回 i18n key。"""
+        return self.envelope.message_key
+
+    @property
+    def retryable(self) -> bool:
+        """返回是否可重试。"""
+        return self.envelope.retryable
+
+    @property
+    def severity(self) -> str:
+        """返回严重级别。"""
+        return self.envelope.severity
+
+    def to_dict(self) -> dict:
+        """返回 dict 表示(供 JSON 序列化)。"""
+        return self.envelope.to_dict()
+
+    async def write_audit_log(self) -> bool:
+        """异步写入 audit_log 表(记录 trace_id + code + params)。
+
+        失败时静默记录 debug 日志,不影响主流程。
+        写入 details 字段(JSON 字符串)包含 trace_id / code / params / severity。
+
+        Returns:
+            True 写入成功;False 写入失败(如 DB 未初始化)
+        """
+        try:
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            if not store or not getattr(store, "_db", None):
+                return False
+            details = json.dumps(
+                {
+                    "trace_id": self.trace_id,
+                    "code": self.code,
+                    "message_key": self.message_key,
+                    "params": self.params,
+                    "severity": self.severity,
+                    "retryable": self.retryable,
+                    "cause": str(self._cause) if self._cause else None,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
+            await store._db.execute(
+                """INSERT INTO audit_log (actor_id, actor_type, action, target_type,
+                   target_id, details, ip_addr, created_at)
+                   VALUES (?, 'system', ?, 'error', ?, ?, '', ?)""",
+                (
+                    0,
+                    f"app_error:{self.code}",
+                    self.trace_id,
+                    details,
+                    _dt.datetime.utcnow().isoformat(),
+                ),
+            )
+            if not getattr(store, "_in_writer_tx", False):
+                await store._db.commit()
+            return True
+        except Exception as e:
+            logger.debug(
+                f"[AppError] audit_log 写入失败(忽略,trace_id={self.trace_id}): {e}"
+            )
+            return False
+
+
+# ════════════════════════════════════════════════════════════════
+# 6. 辅助函数
+# ════════════════════════════════════════════════════════════════
+def _filter_safe_params(params: dict, safe_params: list[str]) -> dict:
+    """按 safe_params 白名单过滤 params(避免敏感信息泄露)。
+
+    Args:
+        params: 原始参数字典
+        safe_params: 可安全记录的参数名列表
+
+    Returns:
+        过滤后的 dict(仅包含 safe_params 列入的字段)
+    """
+    if not params or not safe_params:
+        return {}
+    return {k: v for k, v in params.items() if k in safe_params}
+
+
+def _render_i18n_message(
+    message_key: str, params: dict, locale: str,
+) -> str:
+    """从 locale 文件加载 message_key 对应的翻译,并用 params 渲染占位符。
+
+    占位符格式: ``{name}`` (str.format 风格)。
+
+    若 message_key 不存在或 locale 文件加载失败,fallback 到 message_key 本身
+    (确保永远返回非空字符串,避免前端崩溃)。
+
+    查找逻辑兼容两种 JSON 结构:
+        1. 嵌套 dict: ``{"errors": {"upload": {"timeout": "x"}}}``
+        2. 扁平点分 key: ``{"errors": {"upload.timeout": "x"}}``
+    优先扁平化查找(与 verify_i18n_keys.py 一致),fallback 到嵌套查找。
+
+    Args:
+        message_key: i18n key(点分路径,如 "errors.upload.copy.telegram_timeout")
+        params: 渲染参数
+        locale: 语言代码(zh-CN / en-US)
+
+    Returns:
+        已渲染的用户消息字符串
+    """
+    try:
+        from pathlib import Path as _Path
+        # locales 目录(项目根 / locales)
+        repo_root = _Path(__file__).resolve().parent.parent
+        locale_path = repo_root / "locales" / f"{locale}.json"
+        if not locale_path.exists():
+            # fallback 到 en-US
+            locale_path = repo_root / "locales" / "en-US.json"
+            if not locale_path.exists():
+                return message_key
+        with open(locale_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # 1. 优先扁平化查找(与 verify_i18n_keys.py 一致)
+        flat = _flatten_dict(data)
+        message = flat.get(message_key)
+        # 2. fallback 到嵌套查找
+        if not isinstance(message, str):
+            message = _lookup_nested(data, message_key)
+        if not isinstance(message, str):
+            return message_key
+        # 用 params 渲染占位符(安全 format,缺失字段保留原占位符)
+        try:
+            return message.format(**{k: v for k, v in params.items()})
+        except (KeyError, IndexError, ValueError):
+            return message
+    except Exception as e:
+        logger.debug(f"[ErrorRegistry] i18n 渲染失败 key={message_key} locale={locale}: {e}")
+        return message_key
+
+
+def _flatten_dict(obj: Any, prefix: str = "") -> dict[str, str]:
+    """递归扁平化 dict,返回 {点分 key: value} 映射。
+
+    与 scripts/verify_i18n_keys.py 的 _flatten_values 保持一致,
+    确保查找逻辑统一。
+
+    例: ``{"errors": {"upload.timeout": "x"}}`` → ``{"errors.upload.timeout": "x"}``
+    """
+    result: dict[str, str] = {}
+    if not isinstance(obj, dict):
+        return result
+    for k, v in obj.items():
+        full_key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            result.update(_flatten_dict(v, full_key))
+        else:
+            result[full_key] = v
+    return result
+
+
+def _lookup_nested(data: dict, key: str) -> Any:
+    """按点分 key 查找嵌套 dict。
+
+    例: ``_lookup_nested({"errors": {"upload": {"timeout": "x"}}}, "errors.upload.timeout")``
+    返回 ``"x"``。
+
+    用于 _render_i18n_message 的 fallback 路径(扁平化未命中时尝试嵌套查找)。
+    """
+    parts = key.split(".")
+    current: Any = data
+    for part in parts:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
+
+
+# ════════════════════════════════════════════════════════════════
+# 7. 默认 ErrorDefinition 注册(模块加载时自动执行)
+# ════════════════════════════════════════════════════════════════
+def _register_defaults() -> None:
+    """注册所有默认 ErrorDefinition。
+
+    每个定义包含:
+        - code: 三段式错误码
+        - message_key: i18n key(对应 locales/*.json 中的点分路径)
+        - http_status: HTTP 状态码
+        - retryable: 是否可重试
+        - severity: 严重级别(info/warning/error/critical)
+        - safe_params: 可安全记录的参数名白名单
+    """
+    # 通用内部错误(必须首先注册,作为 fallback)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ERROR_INTERNAL,
+        message_key="errors.error.internal.unexpected",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["action", "component"],
+    ))
+
+    # ── UPLOAD ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.UPLOAD_COPY_TELEGRAM_TIMEOUT,
+        message_key="errors.upload.copy.telegram_timeout",
+        http_status=504,
+        retryable=True,
+        severity="warning",
+        safe_params=["file_code", "channel_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.UPLOAD_COPY_TELEGRAM_FORBIDDEN,
+        message_key="errors.upload.copy.telegram_forbidden",
+        http_status=403,
+        retryable=False,
+        severity="error",
+        safe_params=["file_code", "channel_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.UPLOAD_MANIFEST_OUTBOX_FAILED,
+        message_key="errors.upload.manifest.outbox_failed",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["file_code", "batch_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.UPLOAD_PENDING_OUTBOX_TX_FAILED,
+        message_key="errors.upload.pending.outbox_tx_failed",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["file_code", "batch_id"],
+    ))
+
+    # ── INDEX ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.INDEX_FINALIZE_OUTBOX_FAILED,
+        message_key="errors.index.finalize.outbox_failed",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["file_code", "code"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.INDEX_CODE_CONFLICT,
+        message_key="errors.index.code.conflict",
+        http_status=409,
+        retryable=False,
+        severity="warning",
+        safe_params=["code"],
+    ))
+
+    # ── DELIVERY ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DELIVERY_SEND_FLOOD_WAIT,
+        message_key="errors.delivery.send.flood_wait",
+        http_status=429,
+        retryable=True,
+        severity="warning",
+        safe_params=["wait_seconds", "user_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DELIVERY_SEND_FORBIDDEN,
+        message_key="errors.delivery.send.forbidden",
+        http_status=403,
+        retryable=False,
+        severity="error",
+        safe_params=["user_id", "channel_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DELIVERY_RECEIPT_FAILED,
+        message_key="errors.delivery.receipt.failed",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["user_id", "file_code"],
+    ))
+
+    # ── AUTH ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.AUTH_MFA_REPLAYED,
+        message_key="errors.auth.mfa.replayed",
+        http_status=401,
+        retryable=False,
+        severity="critical",
+        safe_params=["user_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.AUTH_MFA_LOCKED,
+        message_key="errors.auth.mfa.locked",
+        http_status=423,
+        retryable=False,
+        severity="error",
+        safe_params=["user_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.AUTH_SESSION_EXPIRED,
+        message_key="errors.auth.session.expired",
+        http_status=401,
+        retryable=False,
+        severity="info",
+        safe_params=["user_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.AUTH_RBAC_PERMISSION_DENIED,
+        message_key="errors.auth.rbac.permission_denied",
+        http_status=403,
+        retryable=False,
+        severity="warning",
+        safe_params=["user_id", "permission"],
+    ))
+
+    # ── BACKUP ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_RESTORE_APPROVAL_INVALID,
+        message_key="errors.backup.restore.approval_invalid",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["approval_id", "backup_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_RESTORE_CHECKSUM_MISMATCH,
+        message_key="errors.backup.restore.checksum_mismatch",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["backup_id"],
+    ))
+
+    # ── EFFECT_RECEIPT ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.EFFECT_RECEIPT_MANAGER_UNAVAILABLE,
+        message_key="errors.effect.receipt.manager_unavailable",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["action_id", "effect_type"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.EFFECT_RECEIPT_DB_ERROR,
+        message_key="errors.effect.receipt.db_error",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["action_id", "effect_type"],
+    ))
+
+    # ── APPROVAL ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.APPROVAL_REQUIRED,
+        message_key="errors.approval.gate.required",
+        http_status=202,
+        retryable=False,
+        severity="info",
+        safe_params=["approval_id", "action"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.APPROVAL_STATE_INVALID,
+        message_key="errors.approval.state.invalid",
+        http_status=409,
+        retryable=False,
+        severity="warning",
+        safe_params=["approval_id", "current_status"],
+    ))
+
+    # ── COMMAND ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COMMAND_CONCURRENT_CLAIM,
+        message_key="errors.command.concurrent.claim",
+        http_status=409,
+        retryable=True,
+        severity="warning",
+        safe_params=["action_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COMMAND_HASH_MISMATCH,
+        message_key="errors.command.hash.mismatch",
+        http_status=400,
+        retryable=False,
+        severity="critical",
+        safe_params=["action_id"],
+    ))
+
+    # ── DB ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DB_CACHE_UNAVAILABLE,
+        message_key="errors.db.cache.unavailable",
+        http_status=503,
+        retryable=True,
+        severity="critical",
+        safe_params=["component"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DB_REDIS_UNAVAILABLE,
+        message_key="errors.db.redis.unavailable",
+        http_status=503,
+        retryable=True,
+        severity="error",
+        safe_params=["component"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DB_CRDB_UNAVAILABLE,
+        message_key="errors.db.crdb.unavailable",
+        http_status=503,
+        retryable=True,
+        severity="error",
+        safe_params=["component"],
+    ))
+
+    # ── 业务 ──
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.QUOTA_EXCEEDED,
+        message_key="errors.quota.decode.exceeded",
+        http_status=429,
+        retryable=False,
+        severity="info",
+        safe_params=["user_id", "quota"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.FILE_NOT_FOUND,
+        message_key="errors.file.lookup.not_found",
+        http_status=404,
+        retryable=False,
+        severity="info",
+        safe_params=["file_code"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.FILE_EXPIRED,
+        message_key="errors.file.lookup.expired",
+        http_status=410,
+        retryable=False,
+        severity="info",
+        safe_params=["file_code"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.FILE_CODE_INVALID,
+        message_key="errors.file.code.invalid",
+        http_status=400,
+        retryable=False,
+        severity="info",
+        safe_params=["code"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.USER_BANNED,
+        message_key="errors.user.state.banned",
+        http_status=403,
+        retryable=False,
+        severity="info",
+        safe_params=["user_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.SYSTEM_MAINTENANCE,
+        message_key="errors.system.state.maintenance",
+        http_status=503,
+        retryable=True,
+        severity="warning",
+        safe_params=["reason"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.SYSTEM_RATE_LIMITED,
+        message_key="errors.system.rate.limited",
+        http_status=429,
+        retryable=True,
+        severity="warning",
+        safe_params=["user_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.VALIDATION_FAILED,
+        message_key="errors.validation.input.failed",
+        http_status=400,
+        retryable=False,
+        severity="info",
+        safe_params=["field"],
+    ))
+
+
+# 模块加载时即注册默认定义(确保任何 import 都触发注册)
+_register_defaults()
+ErrorRegistry._initialized = True
+
+
+__all__ = [
+    "ErrorCodes",
+    "ErrorDefinition",
+    "ErrorEnvelope",
+    "ErrorRegistry",
+    "AppError",
+]

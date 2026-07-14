@@ -515,22 +515,41 @@ async def startup():
     R45 §7.1: 启动阶段强制调用 ensure_readiness_or_exit() 验证 admin bootstrap
     已完成;未 bootstrap 时 Web 进程退出非零(sys.exit(1)),
     让 systemd/k8s 感知到启动失败并触发重启策略。
+
+    R47 P0-3: ENVIRONMENT=test 时跳过 CRDB 连接(E2E 测试无 CRDB),
+    仅初始化 SQLite cache_store + 验证 bootstrap,使 Web 服务可在
+    纯 SQLite 环境下启动用于 Playwright E2E 测试。
     """
     # R39 P1-12: 启动时检测明文密码并告警
     _warn_if_plaintext_password()
-    try:
-        from database import init_db
-        await init_db()
-    except Exception as e:
-        import sys
+
+    # R47 P0-3: 测试模式跳过 CRDB,仅初始化 SQLite cache_store
+    _is_test_env = getattr(settings, "ENVIRONMENT", "") == "test"
+    if _is_test_env:
         from loguru import logger
-        logger.error(f"[Admin] 数据库初始化失败，退出: {e}")
+        logger.info("[Admin] R47 P0-3: ENVIRONMENT=test,跳过 CRDB,仅初始化 SQLite cache_store")
         try:
-            from database import close_db
-            await close_db()
-        except Exception:
-            pass
-        sys.exit(1)
+            from database.cache_store import get_cache_store
+            await get_cache_store().init()
+        except Exception as e:
+            import sys
+            from loguru import logger as _logger
+            _logger.error(f"[Admin] SQLite cache_store 初始化失败,退出: {e}")
+            sys.exit(1)
+    else:
+        try:
+            from database import init_db
+            await init_db()
+        except Exception as e:
+            import sys
+            from loguru import logger
+            logger.error(f"[Admin] 数据库初始化失败，退出: {e}")
+            try:
+                from database import close_db
+                await close_db()
+            except Exception:
+                pass
+            sys.exit(1)
     # R45 §7.1: 强制 readiness 检查 — 未 bootstrap 时退出非零
     # 放在 init_db 之后、_load_state_from_cache 之前,确保 DB 已就绪再校验
     await ensure_readiness_or_exit()
@@ -1629,6 +1648,10 @@ async def readiness_check(response: Response):
       - /health: 简略状态(供 Docker healthcheck / k8s liveness 快速判断)
       - /readiness: 详细依赖状态(供运维排查 / Prometheus 告警上下文)
 
+    R47 P0-3: 真实检查关键依赖(DB 已初始化 + bootstrap 完成)。
+    ENVIRONMENT=test 时跳过 Bot 心跳/Prometheus 检查(E2E 测试无真实 Bot),
+    仅校验 SQLite cache_store 已初始化 + admin bootstrap 已完成。
+
     返回:
       - 200 OK + 完整 JSON if 所有检查通过
       - 503 Service Unavailable + 完整 JSON if 任一检查失败
@@ -1644,6 +1667,45 @@ async def readiness_check(response: Response):
         "last_r2_collect_age": float,
       }
     """
+    # R47 P0-3: 关键依赖检查 — SQLite cache_store 已初始化 + admin bootstrap 完成
+    # 这两项是 Web 服务能正常处理请求的真实前置条件(非占位)
+    db_initialized = False
+    try:
+        from database.cache_store import get_cache_store
+        db_initialized = get_cache_store()._db is not None
+    except Exception:
+        db_initialized = False
+
+    bootstrap_ok = await verify_admin_bootstrap()
+
+    # R47 P0-3: 测试模式 — 仅校验关键依赖(DB + bootstrap),跳过 Bot/Prometheus
+    # E2E 测试环境无真实 Telegram Bot,无法满足 Bot 心跳检查
+    _is_test_env = getattr(settings, "ENVIRONMENT", "") == "test"
+    if _is_test_env:
+        checks = {
+            "db_initialized": db_initialized,
+            "admin_bootstrap": bootstrap_ok,
+        }
+        details = {
+            "db_initialized": "OK: SQLite cache_store 已连接" if db_initialized else "FAIL: cache_store._db is None",
+            "admin_bootstrap": "OK: super_admin 已 bootstrap" if bootstrap_ok else "FAIL: 无活跃 super_admin principal",
+        }
+        ready = db_initialized and bootstrap_ok
+        passed = sum(1 for v in checks.values() if v)
+        if not ready:
+            response.status_code = 503
+        return {
+            "ready": ready,
+            "passed": passed,
+            "checks": checks,
+            "details": details,
+            "bots": {},
+            "ru_daily_usage": "unknown",
+            "last_crdb_sync_age": -1.0,
+            "last_r2_collect_age": -1.0,
+        }
+
+    # 非测试模式: 完整检查(Bot 心跳 + Prometheus 依赖)
     from database.cache_store import get_all_bot_heartbeats
     required_bots = {"up", "idx", "dsp", "mon", "admin_bot"}
     beats = await get_all_bot_heartbeats()
@@ -1670,14 +1732,18 @@ async def readiness_check(response: Response):
     # 合并 Bot 心跳检查到 readiness 报告
     all_checks = dict(dep.get("checks", {}))
     all_checks["bots_running"] = all(bot_status.values())
+    all_checks["db_initialized"] = db_initialized
+    all_checks["admin_bootstrap"] = bootstrap_ok
     all_details = dict(dep.get("details", {}))
     all_details["bots_running"] = (
         f"OK: {sum(bot_status.values())}/{len(bot_status)} bots running"
         if all(bot_status.values())
         else f"FAIL: offline bots={[k for k,v in bot_status.items() if not v]}"
     )
+    all_details["db_initialized"] = "OK" if db_initialized else "FAIL"
+    all_details["admin_bootstrap"] = "OK" if bootstrap_ok else "FAIL"
 
-    ready = dep.get("ready", False) and all(bot_status.values())
+    ready = dep.get("ready", False) and all(bot_status.values()) and db_initialized and bootstrap_ok
     passed = sum(1 for v in all_checks.values() if v)
 
     if not ready:

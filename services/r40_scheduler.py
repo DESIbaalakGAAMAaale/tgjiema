@@ -1,4 +1,4 @@
-"""R40 + R41 + R42 + R45: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理 + 备份孤儿 GC + decode_logs 7天保留清理。
+"""R40 + R41 + R42 + R45 + R47: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理 + 备份孤儿 GC + decode_logs 7天保留清理 + MFA 记录 retention。
 
 职责:
     1. 每小时清理过期配额预留(超过 1 小时未结算的自动退款)
@@ -9,6 +9,8 @@
     6. R42 P1-2: 每小时执行备份孤儿对象 GC(委托 backup_gc.run_backup_gc_job)
     7. R45: 每天 3:00 清理 decode_logs 过期记录(7 天保留,委托 decode_logs_cleanup)
        + 启动 run_daily_cleanup_loop 后台兜底任务(create_safe_task)
+    8. R47 P1-b: 每天 3:00 清理 MFA 过期记录(24h 保留,
+       委托 admin.mfa.cleanup_expired_mfa_records)
 
 设计原则:
     - 纯 async,通过 run_all.py BOT_RUNNERS 注册为独立进程
@@ -142,6 +144,27 @@ async def cleanup_expired_decode_logs_job() -> None:
         logger.warning(f"[R45] decode_logs 清理异常: {e}")
 
 
+async def cleanup_expired_mfa_records_job() -> None:
+    """R47 P1-b: 每天清理 MFA 过期记录(24h 保留)。
+
+    委托 admin.mfa.cleanup_expired_mfa_records:
+    - 删除 mfa_used_totp 中 used_at < (now - 24h) 的记录
+    - 删除 mfa_failures 中 failed_at_ms < (now_ms - 24h) 的记录
+    - 本地 SQLite 清理(零 CRDB RU)
+    - 幂等:重复执行无副作用
+    """
+    try:
+        from admin.mfa import cleanup_expired_mfa_records
+        result = await cleanup_expired_mfa_records(retention_hours=24)
+        if result["deleted_used_totp"] > 0 or result["deleted_failures"] > 0:
+            logger.info(
+                f"[R47] MFA 记录清理: used_totp={result['deleted_used_totp']}, "
+                f"failures={result['deleted_failures']}"
+            )
+    except Exception as e:
+        logger.warning(f"[R47] MFA 记录清理异常: {e}")
+
+
 async def _run_lease_cleanup_loop() -> None:
     """R41 P0-5: 命令租约清理子循环(每 60 秒执行一次)。
 
@@ -260,6 +283,8 @@ async def run_scheduler() -> None:
                     await cleanup_expired_data_job()
                     # R45: 同期清理 decode_logs 过期记录(7 天保留,凌晨低峰期)
                     await cleanup_expired_decode_logs_job()
+                    # R47 P1-b: 同期清理 MFA 过期记录(24h 保留)
+                    await cleanup_expired_mfa_records_job()
                 # R42 P1-5: 每天 4:00-4:05 执行 tombstone retention 物理清理
                 # (在备份通常完成后,避免与 3:00 数据清理争用资源)
                 if (

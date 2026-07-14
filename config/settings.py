@@ -287,6 +287,10 @@ class Settings(BaseSettings):
     # bootstrap 分配的角色列表(逗号分隔),默认 super_admin
     ADMIN_PRINCIPAL_BOOTSTRAP_ROLES: str = "super_admin"
 
+    # R47 P0-3: break-glass 紧急访问密码(本机 CLI 登录,跳过 MFA)
+    # 与 ADMIN_PASSWORD 分开,需同时通过管理员凭证 + break-glass 密码
+    BREAK_GLASS_PASSWORD: str = ""
+
     # ─── 管理员 Bot 配置键名映射 ──────────────────────────
     @property
     def db_backup_interval(self) -> int:

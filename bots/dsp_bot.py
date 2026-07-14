@@ -261,6 +261,64 @@ async def _mark_delivery_failed_safe(
         )
 
 
+class DeliveryError(Exception):
+    """R47 P0-5: 投递异常,需要暂停整个 group 投递并让上层重试逻辑处理。
+
+    用于幂等读取异常等场景:不应"忽略"后继续,而应暂停 job 防止重复投递。
+    """
+    pass
+
+
+async def _verify_skipped_receipt(
+    store, job_id: int, source_msg_id: int, effect_external_id: str,
+) -> bool:
+    """R47 P0-5: 核对 skipped effect receipt 与 delivery_receipts 一致性。
+
+    当 effect receipt 显示 skipped(已完成)时,不能直接视为完整成功,
+    必须核对 delivery_receipts 表的 sent_msg_id 是否与 effect external_id 一致。
+    不一致则触发 reconcile,不直接视为 completed。
+
+    Args:
+        store: cache_store 实例
+        job_id: job ID
+        source_msg_id: 源消息 ID
+        effect_external_id: effect receipt 中记录的 external_id(即发送返回的 message_id)
+
+    Returns:
+        True = 一致(可安全跳过); False = 不一致(需 reconcile)
+    """
+    if store is None:
+        # store 不可用时无法核对,保守视为不一致(触发 reconcile)
+        return False
+    if not effect_external_id:
+        # effect external_id 为空,无法核对
+        return False
+    try:
+        receipts = await store.get_delivery_receipts_by_job(job_id)
+        for r in receipts:
+            if r.get("source_msg_id") == source_msg_id:
+                sent_msg_id = r.get("sent_msg_id")
+                if sent_msg_id is not None and str(sent_msg_id) == str(effect_external_id):
+                    return True
+                # 找到记录但 external_id 不匹配
+                logger.warning(
+                    f"[Dsp] R47 P0-5: skipped receipt 核对不一致 "
+                    f"job={job_id}, msg={source_msg_id}, "
+                    f"delivery sent_msg_id={sent_msg_id}, "
+                    f"effect external_id={effect_external_id}"
+                )
+                return False
+        # delivery_receipts 中无此 source_msg_id 的记录
+        logger.warning(
+            f"[Dsp] R47 P0-5: skipped receipt 无对应 delivery_receipt "
+            f"job={job_id}, msg={source_msg_id}"
+        )
+        return False
+    except Exception as e:
+        logger.error(f"[Dsp] R47 P0-5: 核对 skipped receipt 异常: {e}")
+        return False
+
+
 def _extract_replica_info(job) -> tuple[str, int | None, str, bool]:
     """从 job 提取 (file_unique_id, group_id, media_group_id, is_structured_new_job) 供 ReplicaAwareResolver 使用。
 
@@ -574,12 +632,49 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
     return "\n".join(lines)
 
 
-async def _edit_sent_caption(bot: Any, chat_id: int, message_id: int, caption: str):
-    """给已发送的消息/媒体组第一条消息编辑 caption，失败静默。"""
-    try:
-        await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption)
-    except Exception as e:
-        logger.debug(f"[Dsp] edit_caption 失败(非致命, msg={message_id}): {e}")
+async def _edit_sent_caption(
+    bot: Any, chat_id: int, message_id: int, caption: str,
+    job_id: int | None = None,
+):
+    """R47 P0-5: 编辑 caption,可选使用独立 effect receipt 防止重复编辑。
+
+    job_id 非 None 时使用 effect receipt 包裹(防止重复编辑同一消息);
+    job_id 为 None 时(如分页回调)直接编辑(向后兼容)。
+
+    effect_type = 'telegram_edit_caption'(非 critical,允许 best_effort)。
+    action_id 维度: dsp:{job_id}:{msg_id}:edit_caption。
+    """
+    if job_id is not None:
+        # R47 P0-5: caption edit 独立 receipt,防止重复编辑同一消息
+        from services.effect_receipts_integration import EffectReceiptContext
+        _edit_action_id = f"dsp:{job_id}:{message_id}:edit_caption"
+        _edit_target = f"chat:{chat_id}"
+        try:
+            async with EffectReceiptContext(
+                action_id=_edit_action_id,
+                effect_type="telegram_edit_caption",
+                target=_edit_target,
+            ) as _edit_receipt:
+                if _edit_receipt.skipped:
+                    logger.info(
+                        f"[Dsp] R47 P0-5: caption edit 已完成,跳过 "
+                        f"job={job_id}, msg={message_id}"
+                    )
+                    return
+                await bot.edit_message_caption(
+                    chat_id=chat_id, message_id=message_id, caption=caption,
+                )
+                _edit_receipt.set_external_id(str(message_id))
+        except Exception as e:
+            logger.debug(
+                f"[Dsp] R47 P0-5: edit_caption 失败(非致命, msg={message_id}): {e}"
+            )
+    else:
+        # 无 job_id(分页回调等),直接编辑(向后兼容)
+        try:
+            await bot.edit_message_caption(chat_id=chat_id, message_id=message_id, caption=caption)
+        except Exception as e:
+            logger.debug(f"[Dsp] edit_caption 失败(非致命, msg={message_id}): {e}")
 
 
 async def _should_preserve_caption(file_code: str) -> bool:
@@ -790,6 +885,16 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
                 raise
             _sent_msg_tracker.pop(job.job_id, None)
             await _send_report_button(bot, job.target_user_id, job.code)
+    except DeliveryError as de:
+        # R47 P0-5 #5: 幂等读取异常暂停 — 不死信,走重试逻辑(让上层重试逻辑处理)
+        # DeliveryError 表示 receipt 读取异常(无法判断是否已发送),
+        # 不应 classify 为 permanent_invalid 导致死信,而应走重试入队逻辑。
+        # send_ok 保持 False,finally 释放 semaphore,下方重试逻辑会处理
+        # (increment retry_count + retry_local_job + xadd_job)
+        logger.warning(
+            f"[Dsp-{worker_id}] R47 P0-5: DeliveryError(幂等读取异常,走重试): "
+            f"job={job.job_id}, retry={job.retry_count}: {de}"
+        )
     except Exception as e:
         logger.error(f"[Dsp-{worker_id}] 发送异常(retry={job.retry_count}): {e}")
         # R45 §11: 失败分类 — 记录错误类型,供差异化重试策略使用
@@ -977,7 +1082,11 @@ async def _process_single_job(bot, job, bot_id: int = 1):
                 _sent_msg_tracker.setdefault(job.job_id, set()).add(msg_id)
                 return True
         except Exception as e:
-            logger.warning(f"[Dsp] 检查 delivery_receipt 幂等失败(忽略): {e}")
+            # R47 P0-5: 幂等读取异常不应"忽略",应暂停整个 group 投递
+            logger.error(
+                f"[Dsp] R47 P0-5: 检查 delivery_receipt 幂等失败(暂停投递): {e}"
+            )
+            raise DeliveryError(f"幂等读取异常: {e}") from e
     # R39 P1-11: PENDING receipt 写失败时暂停 job,不继续 Telegram 副作用
     _receipt_ok = await _upsert_delivery_receipt_safe(
         store, job.job_id, msg_id, job.target_user_id, status="PENDING"
@@ -1000,6 +1109,18 @@ async def _process_single_job(bot, job, bot_id: int = 1):
         target=receipt_target,
     ) as receipt:
         if receipt.skipped:
+            # R47 P0-5: skipped receipt 核对 — 不能直接视为完整成功,
+            # 必须核对 delivery_receipts 的 sent_msg_id 是否与 effect external_id 一致
+            if not await _verify_skipped_receipt(
+                store, job.job_id, msg_id, receipt.external_id,
+            ):
+                logger.warning(
+                    f"[Dsp] R47 P0-5: skipped receipt 核对不一致,触发 reconcile "
+                    f"job={job.job_id}, msg={msg_id}, external_id={receipt.external_id}"
+                )
+                # 不直接视为 completed,标记 no_record 允许重试
+                receipt.mark_no_record()
+                return False
             # effect receipt 已 completed(崩溃前已成功发送),跳过 Telegram 副作用
             logger.info(
                 f"[Dsp] effect receipt 已完成,跳过 Telegram 发送 job={job.job_id} "
@@ -1102,7 +1223,11 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             # 第三方 Bot 原始 caption 需原样保留，不覆盖为标准模板
             if not await _should_preserve_caption(job.code):
                 caption = await _build_delivery_caption(job.code, total_count=1)
-                await _edit_sent_caption(bot, job.target_user_id, sent_msg_id, caption)
+                # R47 P0-5: caption edit 独立 receipt(防止重复编辑)
+                await _edit_sent_caption(
+                    bot, job.target_user_id, sent_msg_id, caption,
+                    job_id=job.job_id,
+                )
             await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
             # R41 P1-12: 派送成功后记录到 TaskCenter
@@ -1184,41 +1309,54 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
                 "protect_content": getattr(job, "protect_content", False),
             }
 
-    # R45/R46 P0-2: EffectReceiptContext 包装批量发送动作
-    # R46 P0-2: action_id 粒度细化到 batch 级别(含 source_channel_id)
-    from services.effect_receipts_integration import EffectReceiptContext
-    receipt_action_id = f"dsp_batch:{job.job_id}:{job.storage_channel_id}:{job.target_user_id}"
-    receipt_target = f"chat:{job.target_user_id}"
-    async with EffectReceiptContext(
-        action_id=receipt_action_id,
-        effect_type="telegram_send",
-        target=receipt_target,
-    ) as receipt:
-        if receipt.skipped:
-            # effect receipt 已 completed(崩溃前已成功发送),跳过 Telegram 副作用
-            logger.info(
-                f"[Dsp] effect receipt 已完成,跳过批量发送 job={job.job_id} "
-                f"external_id={receipt.external_id}"
-            )
-            return True
-
-        result = await _send_page(
-            bot, job.target_user_id, job.code,
-            file_meta_list, page=1, total_pages=total_pages,
-            storage_channel_id=job.storage_channel_id,
-            page_key=page_key if total_pages > 1 else None,
-            storage_msg_ids=job.storage_msg_ids,
-            protect_content=getattr(job, "protect_content", False),
-            bot_id=bot_id,
-            job_id=job.job_id,
+    # R47 P0-5: 媒体组投递使用单条 group receipt
+    # 使用确定性 group_id(基于 job_id),保证重试时可查询到同一 group receipt。
+    # delivery_group_receipt_create 为 INSERT OR IGNORE,幂等。
+    store = _get_store_safe()
+    group_id = f"dsp_batch:{job.job_id}:{job.storage_channel_id}:{job.target_user_id}"
+    group_action_id = group_id
+    if store is not None:
+        await store.delivery_group_receipt_create(
+            group_id=group_id,
+            expected_count=len(job.storage_msg_ids),
+            source_ids=list(job.storage_msg_ids),
+            target_ids=[job.target_user_id] * len(job.storage_msg_ids),
+            action_id=group_action_id,
         )
-        if result:
-            # 发送成功 → 设置 external_id(批量发送 external_id 不可单独提取,留空即可)
-            receipt.set_external_id(f"batch:{job.job_id}")
-        else:
-            # 发送失败 → 不记录 completed,允许下轮重试
-            receipt.mark_no_record()
-        return result
+        # 检查 group receipt 是否已 completed(全部 child CONFIRMED)
+        group_receipt = await store.delivery_group_receipt_get(group_id)
+        if group_receipt and group_receipt["status"] == "completed":
+            logger.info(
+                f"[Dsp] R47 P0-5: group receipt 已完成,跳过 job={job.job_id} "
+                f"group={group_id}, confirmed={group_receipt['confirmed_count']}/"
+                f"{group_receipt['expected_count']}"
+            )
+            _sent_msg_tracker.setdefault(job.job_id, set()).update(job.storage_msg_ids)
+            await _send_report_button(bot, job.target_user_id, job.code)
+            return True
+        # 部分成功重试:confirmed_count < expected_count,只发送缺失 child
+        # (job 级过滤已在 _send_one_job 中通过 delivery_receipts 完成,
+        #  job.storage_msg_ids 仅含未投递的 msg_id)
+        if group_receipt and group_receipt["confirmed_count"] > 0:
+            logger.info(
+                f"[Dsp] R47 P0-5: 部分成功重试 job={job.job_id} "
+                f"group={group_id}, confirmed={group_receipt['confirmed_count']}/"
+                f"{group_receipt['expected_count']}, 剩余 {len(job.storage_msg_ids)} 个"
+            )
+
+    # _send_page 内部为每个 child 使用独立 EffectReceiptContext 并 confirm group receipt
+    result = await _send_page(
+        bot, job.target_user_id, job.code,
+        file_meta_list, page=1, total_pages=total_pages,
+        storage_channel_id=job.storage_channel_id,
+        page_key=page_key if total_pages > 1 else None,
+        storage_msg_ids=job.storage_msg_ids,
+        protect_content=getattr(job, "protect_content", False),
+        bot_id=bot_id,
+        job_id=job.job_id,
+        group_id=group_id,
+    )
+    return result
 
 
 async def _fallback_single_send(bot, job, bot_id: int = 1):
@@ -1229,11 +1367,48 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
     S-4: 返回值反映实际发送结果，不再恒为 True。
     P1-2: 成功投递的 msg_id 记入 _sent_msg_tracker,重试时跳过。
     R35 §21.2: 同时双写 delivery_receipts(PENDING/CONFIRMED/FAILED)。
+    R47 P0-5 #2: fallback 单发独立 EffectReceipt — 每条发送 claim 独立 child receipt,
+                 失败记录到 group receipt 的 failed children,重试时跳过已 confirmed。
     """
     protect_content = getattr(job, "protect_content", False)
     all_success = True
     first_sent_mid: int | None = None
     store = _get_store_safe()
+
+    # R47 P0-5 #2: 创建 group receipt(确定性 group_id,保证重试时可查询同一 receipt)
+    # 使用 dsp_fallback 前缀区分 batch 路径(避免 group_id 冲突)
+    group_id = f"dsp_fallback:{job.job_id}:{job.storage_channel_id}:{job.target_user_id}"
+    group_action_id = group_id
+    if store is not None and job.storage_msg_ids:
+        await store.delivery_group_receipt_create(
+            group_id=group_id,
+            expected_count=len(job.storage_msg_ids),
+            source_ids=list(job.storage_msg_ids),
+            target_ids=[job.target_user_id] * len(job.storage_msg_ids),
+            action_id=group_action_id,
+        )
+        # 检查 group receipt 是否已 completed(全部 child CONFIRMED)
+        group_receipt = await store.delivery_group_receipt_get(group_id)
+        if group_receipt and group_receipt["status"] == "completed":
+            logger.info(
+                f"[Dsp] R47 P0-5: fallback group receipt 已完成,跳过 job={job.job_id} "
+                f"group={group_id}, confirmed={group_receipt['confirmed_count']}/"
+                f"{group_receipt['expected_count']}"
+            )
+            _sent_msg_tracker.setdefault(job.job_id, set()).update(job.storage_msg_ids)
+            await _send_report_button(bot, job.target_user_id, job.code)
+            return True
+        # 部分成功重试:confirmed_count > 0 时记录日志
+        if group_receipt and group_receipt["confirmed_count"] > 0:
+            logger.info(
+                f"[Dsp] R47 P0-5: fallback 部分成功重试 job={job.job_id} "
+                f"group={group_id}, confirmed={group_receipt['confirmed_count']}/"
+                f"{group_receipt['expected_count']}, 剩余 {len(job.storage_msg_ids)} 个"
+            )
+
+    # R47 P0-5 #2: 导入 EffectReceiptContext 用于 per-child receipt
+    from services.effect_receipts_integration import EffectReceiptContext
+
     for i, mid in enumerate(job.storage_msg_ids):
         # R35 §21.2: 投递前写 PENDING receipt(异常安全)
         # R45 §11: receipt 写失败必须停止发送,不降级为内存继续
@@ -1244,43 +1419,108 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
             # receipt 写失败 → 暂停 job,停止发送
             await _pause_job_for_receipt_failure(store, job.job_id)
             return False
+        # R47 P0-5 #2: per-child EffectReceiptContext(action_id 含 child_index)
+        # 默认 fail-closed(send 尚未发生,receipt 失败应中断)
+        _child_action_id = f"dsp_fb:{job.job_id}:{job.storage_channel_id}:{mid}:{job.target_user_id}:{i}"
+        _child_target = f"chat:{job.target_user_id}"
+        _sent_mid: int | None = None
         try:
-            resolved = await resolve_delivery_channel(job.storage_channel_id)
-            sent_mid = await try_deliver(bot, job.target_user_id, resolved.channel_id, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=job.storage_channel_id)
-            if sent_mid:
-                # R35 §21.2: 双写 — 内存缓存 + 持久化权威层
-                _sent_msg_tracker.setdefault(job.job_id, set()).add(mid)
-                await _confirm_delivery_receipt_safe(store, job.job_id, mid, sent_mid)
-                await metrics.record_send_success()
-                if first_sent_mid is None:
-                    first_sent_mid = sent_mid
-            else:
-                # R35 §21.2: 持久化失败回执
-                await _mark_delivery_failed_safe(
-                    store, job.job_id, mid,
-                    reason=f"fallback_copy_failed ch={resolved.channel_id}",
+            async with EffectReceiptContext(
+                action_id=_child_action_id,
+                effect_type="telegram_send",
+                target=_child_target,
+            ) as _child_receipt:
+                if _child_receipt.skipped:
+                    # R47 P0-5: 核对 skipped receipt 一致性
+                    if store is not None:
+                        if await _verify_skipped_receipt(
+                            store, job.job_id, mid, _child_receipt.external_id,
+                        ):
+                            # 核对一致,跳过此 child(已 confirmed)
+                            logger.info(
+                                f"[Dsp] R47 P0-5: fallback child skipped 且核对一致,跳过 "
+                                f"job={job.job_id}, msg={mid}"
+                            )
+                            _sent_msg_tracker.setdefault(job.job_id, set()).add(mid)
+                            if first_sent_mid is None and _child_receipt.external_id:
+                                try:
+                                    first_sent_mid = int(_child_receipt.external_id)
+                                except (TypeError, ValueError):
+                                    pass
+                            # R47 P0-5: confirm skipped child in group receipt
+                            if store is not None:
+                                try:
+                                    await store.delivery_group_receipt_confirm_child(group_id, mid)
+                                except Exception:
+                                    pass
+                            continue
+                        else:
+                            # 核对不一致 → 不跳过,继续发送(re-claim 后发送)
+                            logger.warning(
+                                f"[Dsp] R47 P0-5: fallback child skipped 核对不一致,re-claim "
+                                f"job={job.job_id}, msg={mid}"
+                            )
+                            _child_receipt.mark_no_record()
+                    else:
+                        # store 不可用,保守跳过(避免重复发送)
+                        continue
+                # 实际发送
+                resolved = await resolve_delivery_channel(job.storage_channel_id)
+                sent_mid = await try_deliver(
+                    bot, job.target_user_id, resolved.channel_id, mid,
+                    protect_content=protect_content, bot_id=bot_id,
+                    original_channel_id=job.storage_channel_id,
                 )
-                await metrics.record_send_fail()
-                all_success = False
+                _sent_mid = sent_mid
+                if sent_mid:
+                    # R47 P0-5: 设置 external_id 给 effect receipt
+                    _child_receipt.set_external_id(str(sent_mid))
+                    # R35 §21.2: 双写 — 内存缓存 + 持久化权威层
+                    _sent_msg_tracker.setdefault(job.job_id, set()).add(mid)
+                    await _confirm_delivery_receipt_safe(store, job.job_id, mid, sent_mid)
+                    await metrics.record_send_success()
+                    if first_sent_mid is None:
+                        first_sent_mid = sent_mid
+                else:
+                    # R47 P0-5: 发送失败 → 不记录 completed(允许重试)
+                    _child_receipt.mark_no_record()
+                    # R35 §21.2: 持久化失败回执(记录到 group receipt 的 failed children)
+                    await _mark_delivery_failed_safe(
+                        store, job.job_id, mid,
+                        reason=f"fallback_copy_failed ch={resolved.channel_id}",
+                    )
+                    await metrics.record_send_fail()
+                    all_success = False
         except Exception as e:
             logger.error(f"[Dsp] 兜底发送异常 (msg={mid}): {e}")
+            # R47 P0-5: 异常时也持久化失败回执(记录到 failed children)
             await _mark_delivery_failed_safe(
                 store, job.job_id, mid, reason=f"exception:{type(e).__name__}"
             )
             await metrics.record_send_fail()
             all_success = False
+        # R47 P0-5 #2: confirm child in group receipt(成功时)
+        if _sent_mid is not None and store is not None:
+            try:
+                await store.delivery_group_receipt_confirm_child(group_id, _sent_mid)
+            except Exception as _confirm_err:
+                logger.warning(
+                    f"[Dsp] R47 P0-5: fallback group receipt confirm 失败(非致命) "
+                    f"group={group_id}, msg={mid}: {_confirm_err}"
+                )
         # 每条消息之间间隔 0.15s,避免同一个频道/同用户超过限制
         if i < len(job.storage_msg_ids) - 1:
             await asyncio.sleep(0.15)
     # 第一条消息添加 caption（第三方原始 caption 保留时跳过）
+    # R47 P0-5 #3: caption edit 独立 receipt(传入 job_id 启用)
     if first_sent_mid and not await _should_preserve_caption(job.code):
         caption = await _build_delivery_caption(job.code, total_count=len(job.storage_msg_ids))
-        await _edit_sent_caption(bot, job.target_user_id, first_sent_mid, caption)
+        await _edit_sent_caption(bot, job.target_user_id, first_sent_mid, caption, job_id=job.job_id)
     await metrics.record_processed("dsp_bot")
     return all_success
 
 
-async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None, storage_msg_ids=None, protect_content=False, bot_id=1, job_id: int | None = None) -> bool:
+async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages, storage_channel_id=None, page_key=None, storage_msg_ids=None, protect_content=False, bot_id=1, job_id: int | None = None, group_id: str | None = None) -> bool:
     start = (page - 1) * PAGE_SIZE
     end = start + PAGE_SIZE
 
@@ -1310,11 +1550,54 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         if batch_copied_ids:
             logger.info(f"[Dsp] 分页发送成功(批量相册): {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(page_msg_ids)}个文件)")
             # P1-2 + R35 §21.2: 双写 — 内存缓存 + 持久化权威层(仅 job 调用路径)
+            # R47 P0-5: 每个 child 使用独立 EffectReceiptContext + confirm group receipt
             if job_id is not None:
                 store = _get_store_safe()
+                from services.effect_receipts_integration import EffectReceiptContext
                 for idx, mid in enumerate(page_msg_ids):
-                    _sent_msg_tracker.setdefault(job_id, set()).add(mid)
                     sent_mid_for_receipt = batch_copied_ids[idx] if idx < len(batch_copied_ids) else None
+                    # R47 P0-5: per-child EffectReceiptContext(action_id 含 child_index)
+                    # best_effort=True: send 已完成,不因 receipt 失败而中断
+                    _child_action_id = f"dsp:{job_id}:{storage_channel_id}:{mid}:{chat_id}:{idx}"
+                    _child_target = f"chat:{chat_id}"
+                    try:
+                        async with EffectReceiptContext(
+                            action_id=_child_action_id,
+                            effect_type="telegram_send",
+                            target=_child_target,
+                            best_effort=True,
+                        ) as _child_receipt:
+                            if _child_receipt.skipped:
+                                # R47 P0-5: 核对 skipped receipt
+                                if not await _verify_skipped_receipt(
+                                    store, job_id, mid, _child_receipt.external_id,
+                                ):
+                                    logger.warning(
+                                        f"[Dsp] R47 P0-5: batch child skipped receipt 核对不一致 "
+                                        f"job={job_id}, msg={mid}"
+                                    )
+                                # 已 completed,跳过
+                            else:
+                                if sent_mid_for_receipt:
+                                    _child_receipt.set_external_id(str(sent_mid_for_receipt))
+                    except Exception as _child_err:
+                        logger.warning(
+                            f"[Dsp] R47 P0-5: batch child effect receipt 失败(非致命) "
+                            f"job={job_id}, msg={mid}: {_child_err}"
+                        )
+                    # R47 P0-5: confirm child in group receipt
+                    if store is not None and group_id:
+                        try:
+                            await store.delivery_group_receipt_confirm_child(
+                                group_id, sent_mid_for_receipt or mid
+                            )
+                        except Exception as _confirm_err:
+                            logger.warning(
+                                f"[Dsp] R47 P0-5: group receipt confirm 失败(非致命) "
+                                f"group={group_id}, msg={mid}: {_confirm_err}"
+                            )
+                    # P1-2 + R35 §21.2: 双写 delivery receipt
+                    _sent_msg_tracker.setdefault(job_id, set()).add(mid)
                     await _confirm_delivery_receipt_safe(store, job_id, mid, sent_mid_for_receipt or 0)
             first_sent_msg_id = batch_copied_ids[0]
             await metrics.record_send_success()
@@ -1327,6 +1610,8 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             success_count = 0
             fail_details = []
             store = _get_store_safe() if job_id is not None else None
+            # R47 P0-5: 导入 EffectReceiptContext 用于 per-child receipt
+            from services.effect_receipts_integration import EffectReceiptContext
             for i, mid in enumerate(page_msg_ids):
                 # R35 §21.2: 投递前写 PENDING receipt(仅 job 调用路径)
                 # R45 §11: receipt 写失败必须停止发送,不降级为内存继续
@@ -1338,25 +1623,65 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                         # receipt 写失败 → 暂停 job,停止发送(防止进程崩溃后重复发送)
                         await _pause_job_for_receipt_failure(store, job_id)
                         return False
+                # R47 P0-5: per-child EffectReceiptContext(action_id 含 child_index)
+                _child_action_id = f"dsp:{job_id}:{storage_channel_id}:{mid}:{chat_id}:{i}" if job_id else ""
+                _child_target = f"chat:{chat_id}"
+                _sent_mid: int | None = None
                 try:
-                    sent_mid = await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id)
-                    if sent_mid:
-                        success_count += 1
-                        # P1-2 + R35 §21.2: 双写
-                        if job_id is not None:
-                            _sent_msg_tracker.setdefault(job_id, set()).add(mid)
-                            await _confirm_delivery_receipt_safe(store, job_id, mid, sent_mid)
-                        if first_sent_msg_id is None:
-                            first_sent_msg_id = sent_mid
-                    else:
-                        # R35 §21.2: 持久化失败回执
-                        if job_id is not None:
-                            await _mark_delivery_failed_safe(
-                                store, job_id, mid,
-                                reason=f"page_copy_failed ch={fallback_channel}/{fallback_status}",
-                            )
-                        fail_details.append(f"msg={mid}(channel={fallback_channel}/{fallback_status})")
-                        logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={fallback_channel}/{fallback_status}, original_channel={storage_channel_id})")
+                    async with EffectReceiptContext(
+                        action_id=_child_action_id,
+                        effect_type="telegram_send",
+                        target=_child_target,
+                    ) as _child_receipt:
+                        if _child_receipt.skipped:
+                            # R47 P0-5: 核对 skipped receipt
+                            if job_id is not None and store is not None:
+                                if not await _verify_skipped_receipt(
+                                    store, job_id, mid, _child_receipt.external_id,
+                                ):
+                                    logger.warning(
+                                        f"[Dsp] R47 P0-5: fallback child skipped receipt 核对不一致 "
+                                        f"job={job_id}, msg={mid}"
+                                    )
+                                    # 不一致 → 不跳过,继续发送(re-claim 后发送)
+                                    _child_receipt.mark_no_record()
+                                else:
+                                    # 核对一致,跳过此 child
+                                    success_count += 1
+                                    if job_id is not None:
+                                        _sent_msg_tracker.setdefault(job_id, set()).add(mid)
+                                    if first_sent_msg_id is None:
+                                        first_sent_msg_id = int(_child_receipt.external_id) if _child_receipt.external_id else None
+                                    # R47 P0-5: confirm skipped child in group receipt
+                                    if store is not None and group_id:
+                                        try:
+                                            await store.delivery_group_receipt_confirm_child(group_id, mid)
+                                        except Exception:
+                                            pass
+                                    continue
+                            else:
+                                continue
+                        sent_mid = await try_deliver(bot, chat_id, fallback_channel, mid, protect_content=protect_content, bot_id=bot_id, original_channel_id=storage_channel_id)
+                        _sent_mid = sent_mid
+                        if sent_mid:
+                            success_count += 1
+                            _child_receipt.set_external_id(str(sent_mid))
+                            # P1-2 + R35 §21.2: 双写
+                            if job_id is not None:
+                                _sent_msg_tracker.setdefault(job_id, set()).add(mid)
+                                await _confirm_delivery_receipt_safe(store, job_id, mid, sent_mid)
+                            if first_sent_msg_id is None:
+                                first_sent_msg_id = sent_mid
+                        else:
+                            # R35 §21.2: 持久化失败回执
+                            _child_receipt.mark_no_record()
+                            if job_id is not None:
+                                await _mark_delivery_failed_safe(
+                                    store, job_id, mid,
+                                    reason=f"page_copy_failed ch={fallback_channel}/{fallback_status}",
+                                )
+                            fail_details.append(f"msg={mid}(channel={fallback_channel}/{fallback_status})")
+                            logger.warning(f"[Dsp] _send_page copy 失败 (msg={mid}, resolved_channel={fallback_channel}/{fallback_status}, original_channel={storage_channel_id})")
                 except Exception as e:
                     # R35 §21.2: 异常时也持久化失败回执
                     if job_id is not None:
@@ -1365,6 +1690,15 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                         )
                     fail_details.append(f"msg={mid}(exc={type(e).__name__})")
                     logger.error(f"[Dsp] _send_page copy 异常 (msg={mid}): {e}")
+                # R47 P0-5: confirm child in group receipt(成功时)
+                if _sent_mid is not None and store is not None and group_id:
+                    try:
+                        await store.delivery_group_receipt_confirm_child(group_id, _sent_mid)
+                    except Exception as _confirm_err:
+                        logger.warning(
+                            f"[Dsp] R47 P0-5: group receipt confirm 失败(非致命) "
+                            f"group={group_id}, msg={mid}: {_confirm_err}"
+                        )
                 if i < len(page_msg_ids) - 1:
                     await asyncio.sleep(0.15)
             if success_count > 0:
@@ -1396,6 +1730,17 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             if sent_msgs:
                 first_sent_msg_id = sent_msgs[0].message_id
             logger.info(f"[Dsp] 媒体组发送成功: {chat_id}, 码:{file_code}, 第{page}/{total_pages}页({len(input_media)}张)")
+            # R47 P0-5: 媒体组发送成功后 confirm group receipt(每个 sent_msg 一个 child)
+            if job_id is not None and group_id:
+                store = _get_store_safe()
+                if store is not None:
+                    for _sent in (sent_msgs or []):
+                        try:
+                            await store.delivery_group_receipt_confirm_child(
+                                group_id, _sent.message_id
+                            )
+                        except Exception:
+                            pass
             await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
         except Exception as e:
@@ -1413,8 +1758,9 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
             return False
 
     # 第一页发送成功后，给第一条消息编辑 caption（显示文件总数+备注+文件码）
+    # R47 P0-5: caption edit 独立 receipt(传入 job_id 时启用)
     if caption and first_sent_msg_id:
-        await _edit_sent_caption(bot, chat_id, first_sent_msg_id, caption)
+        await _edit_sent_caption(bot, chat_id, first_sent_msg_id, caption, job_id=job_id)
 
     if total_pages > 1 and page < total_pages:
         # 使用 page_key 避免多用户同码键冲突

@@ -271,31 +271,48 @@ class TestGenerateVersionFromPayload:
 # ════════════════════════════════════════════════════════════════
 
 class TestAddDirtyOutboxVersionAutoGen:
-    """R42 P1-4: add_dirty_outbox version 自动生成测试。"""
+    """R42 P1-4 / R47 P0-6: add_dirty_outbox version 自动生成测试。
+
+    R47 P0-6 变更: version=0 时改为调用 allocate_version 原子分配递增 version,
+    不再从 payload 时间戳生成。测试已更新以反映新行为。
+    """
 
     @pytest.mark.asyncio
     async def test_add_dirty_outbox_version_zero_auto_generates(self, cache_store):
-        """add_dirty_outbox version=0 时应自动从 payload 生成时间戳版本。"""
+        """R47 P0-6: add_dirty_outbox version=0 时应通过 allocate_version 分配递增 version。"""
         store = cache_store
-        # users 表的 version 字段为 updated_at
-        # payload 含 updated_at = "2026-07-13T12:00:00"
-        rid = await store.add_dirty_outbox(
+        # 第一次调用 version=0 → allocate_version 返回 1
+        rid1 = await store.add_dirty_outbox(
             "users", "user-001", "upsert",
             payload=json.dumps({"user_id": 1, "updated_at": "2026-07-13T12:00:00"}),
-            version=0,  # 触发自动生成
+            version=0,  # 触发 allocate_version
         )
-        assert rid > 0
+        assert rid1 > 0
 
         cursor = await store._db.execute(
-            "SELECT version FROM dirty_outbox WHERE id = ?", (rid,)
+            "SELECT version FROM dirty_outbox WHERE id = ?", (rid1,)
         )
         row = await cursor.fetchone()
         assert row is not None
-        # version 应为 2026-07-13T12:00:00 的 Unix 时间戳
-        import datetime as _dt
-        expected = int(_dt.datetime.fromisoformat("2026-07-13T12:00:00").timestamp())
-        assert row[0] == expected, (
-            f"version=0 时应自动生成,期望 {expected},实际 {row[0]}"
+        # R47 P0-6: version 应为 allocate_version 分配的递增值(首次为 1)
+        assert row[0] == 1, (
+            f"version=0 时应通过 allocate_version 分配,期望 1,实际 {row[0]}"
+        )
+
+        # 第二次调用同 (table, pk) → allocate_version 返回 2
+        rid2 = await store.add_dirty_outbox(
+            "users", "user-001", "upsert",
+            payload=json.dumps({"user_id": 1, "updated_at": "2026-07-13T13:00:00"}),
+            version=0,
+        )
+        assert rid2 > 0
+        cursor = await store._db.execute(
+            "SELECT version FROM dirty_outbox WHERE id = ?", (rid2,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row[0] == 2, (
+            f"同 (table, pk) 第二次调用 version 应递增到 2,实际 {row[0]}"
         )
 
     @pytest.mark.asyncio
@@ -317,18 +334,16 @@ class TestAddDirtyOutboxVersionAutoGen:
         assert row[0] == 999, "显式 version 应被保留"
 
     @pytest.mark.asyncio
-    async def test_add_dirty_outbox_no_payload_uses_current_timestamp(
+    async def test_add_dirty_outbox_no_payload_uses_allocate_version(
         self, cache_store,
     ):
-        """add_dirty_outbox 无 payload 时 version 应为当前时间戳。"""
+        """R47 P0-6: add_dirty_outbox 无 payload 且 version=0 时通过 allocate_version 分配。"""
         store = cache_store
-        before = int(time.time())
         rid = await store.add_dirty_outbox(
             "users", "user-003", "upsert",
             payload=None,
             version=0,
         )
-        after = int(time.time())
         assert rid > 0
 
         cursor = await store._db.execute(
@@ -336,8 +351,9 @@ class TestAddDirtyOutboxVersionAutoGen:
         )
         row = await cursor.fetchone()
         assert row is not None
-        assert before <= row[0] <= after, (
-            f"无 payload 时 version 应为当前时间戳 [{before}, {after}],实际 {row[0]}"
+        # R47 P0-6: version 应为 allocate_version 分配的递增值(首次为 1)
+        assert row[0] == 1, (
+            f"无 payload 时 version 应通过 allocate_version 分配,期望 1,实际 {row[0]}"
         )
 
     @pytest.mark.asyncio
@@ -535,11 +551,16 @@ class TestSyncDirtyOutboxMerge:
 
     @pytest.mark.asyncio
     async def test_sync_keeps_latest_updated_at_when_version_equal(self, cache_store):
-        """version 相同时 updated_at(以 created_at 代理)决定顺序,保留最新。"""
+        """R47 P0-6: UNIQUE(table_name, pk, version) 约束防止相同 (table, pk, version) 重复。
+
+        旧测试验证 version 相同时按 created_at 决胜合并;
+        R47 P0-6 后 dirty_outbox 表增加 UNIQUE(table_name, pk, version) 约束,
+        同 (table, pk, version) 重复 INSERT 会触发 IntegrityError,
+        由 _add_dirty_outbox_with_retry 自动重新分配 version 重试。
+        本测试验证: UNIQUE 约束生效,重复 INSERT 被拒绝。
+        """
         store = cache_store
-        # 写入 2 条 version 相同但 created_at 不同的记录
-        # 通过直接 INSERT 控制 created_at(避免 add_dirty_outbox 用当前时间)
-        import datetime as _dt
+        # 写入第一条 (users, user-test, 5)
         await store._db.execute(
             "INSERT INTO dirty_outbox (table_name, pk, version, operation, payload, "
             "created_at, processed, local_only) "
@@ -547,68 +568,27 @@ class TestSyncDirtyOutboxMerge:
             (
                 "users", "user-test", 5, "upsert",
                 json.dumps({"user_id": 1, "version": 5}),
-                "2026-07-01T00:00:00",  # 较早
-            ),
-        )
-        await store._db.commit()
-        await store._db.execute(
-            "INSERT INTO dirty_outbox (table_name, pk, version, operation, payload, "
-            "created_at, processed, local_only) "
-            "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
-            (
-                "users", "user-test", 5, "upsert",
-                json.dumps({"user_id": 1, "version": 5}),
-                "2026-07-13T00:00:00",  # 较新
+                "2026-07-01T00:00:00",
             ),
         )
         await store._db.commit()
 
-        mock_col = MagicMock(name="mock_col")
-        mock_col.execute_raw = AsyncMock(return_value=None)
-        mock_session = types.ModuleType("database.session")
-        mock_session.get_users_col = MagicMock(return_value=mock_col)
-        mock_session.get_file_records_col = MagicMock(return_value=mock_col)
-        mock_session.get_codes_col = MagicMock(return_value=mock_col)
-        mock_session.get_jobs_col = MagicMock(return_value=mock_col)
-        mock_session.get_cells_col = MagicMock(return_value=mock_col)
-
-        original_session = sys.modules.get("database.session")
-        sys.modules["database.session"] = mock_session
-        try:
-            import importlib
-            import services.crdb_sync_service as css
-            importlib.reload(css)
-
-            captured_records: list[dict] = []
-
-            async def _capture_dispatch(table_name, records):
-                captured_records.extend(records)
-                return [r.get("id") for r in records]
-
-            original_dispatch = css._dispatch_dirty_outbox_to_crdb
-            css._dispatch_dirty_outbox_to_crdb = _capture_dispatch
-            css._should_connect = AsyncMock(return_value=True)
-            css._lazy_connect_crdb = AsyncMock(return_value=None)
-            css._close_pool_if_idle = AsyncMock(return_value=None)
-
-            try:
-                await css._sync_dirty_outbox()
-            finally:
-                css._dispatch_dirty_outbox_to_crdb = original_dispatch
-
-            # 合并后应只保留 1 条,且 created_at 为较新的 2026-07-13
-            assert len(captured_records) == 1, (
-                f"version 相同应合并为 1 条,实际 {len(captured_records)}"
+        # 尝试写入相同 (table, pk, version) 应抛出 IntegrityError (UNIQUE 冲突)
+        import sqlite3 as _sqlite3_mod
+        with pytest.raises(_sqlite3_mod.IntegrityError):
+            await store._db.execute(
+                "INSERT INTO dirty_outbox (table_name, pk, version, operation, payload, "
+                "created_at, processed, local_only) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+                (
+                    "users", "user-test", 5, "upsert",
+                    json.dumps({"user_id": 1, "version": 5}),
+                    "2026-07-13T00:00:00",
+                ),
             )
-            assert captured_records[0]["created_at"] == "2026-07-13T00:00:00", (
-                f"应保留 created_at 较新的记录,实际 "
-                f"{captured_records[0]['created_at']}"
-            )
-        finally:
-            if original_session is not None:
-                sys.modules["database.session"] = original_session
-            else:
-                sys.modules.pop("database.session", None)
+            await store._db.commit()
+        # 回滚事务以清除错误状态
+        await store._db.rollback()
 
     @pytest.mark.asyncio
     async def test_sync_marks_merged_old_records_as_processed(self, cache_store):

@@ -18,6 +18,20 @@ R46 P1 整改:
     8. 内存字典作为 L1 缓存,SQLite 作为权威层
     9. store 不可用或 DB 写入失败时 fail-closed(返回 False)
 
+R47 P1-b 整改:
+    10. mfa_failures 表 schema 变更 — 旧 (principal_id, failed_at REAL, PRIMARY KEY(principal_id, failed_at))
+        存在同秒/同毫秒碰撞导致 INSERT OR IGNORE 丢失记录。
+        新 schema: id INTEGER AUTOINCREMENT 主键 + failed_at_ms INTEGER 毫秒时间戳,
+        彻底消除碰撞。旧表保留为 mfa_failures_old 备份,数据迁移到新表。
+    11. TOTP timestep 原子消费 — 使用 INSERT OR IGNORE + rowcount 判定重放,
+        消除"先查询再插入"的竞态窗口(原 _is_totp_replayed 只查询不消费)。
+    12. valid_window=1 记录实际匹配 timestep — 遍历 [current-1, current, current+1]
+        对每个 timestep 精确 verify(valid_window=0),记录实际匹配的 timestep,
+        防止同一 code 在 prev/next timestep 可重用。
+    13. _record_mfa_failure 不阻塞 — DB 写入失败仅 warning,不 fail-closed
+        (避免因记录失败而锁定用户)。
+    14. cleanup_expired_mfa_records — retention 24h 清理 mfa_used_totp / mfa_failures。
+
 设计原则:
     - 真实实现使用 pyotp.TOTP 验证 6 位 TOTP 代码
     - fail-closed:pyotp 未安装或异常时返回 False(拒绝验证)
@@ -112,6 +126,44 @@ def _verify_totp(secret: str, code: str) -> bool:
         return False
 
 
+def _find_matching_timestep(secret: str, code: str) -> Optional[int]:
+    """R47 P1-b: 查找 code 实际匹配的 timestep(遍历 [current-1, current, current+1])。
+
+    pyotp.TOTP(secret).verify(code, valid_window=1) 可能匹配 current/prev/next
+    三个 timestep 中的任意一个,但无法告知具体匹配了哪个。若总用当前 timestep 记录,
+    同一 code 在 prev/next timestep 仍可重用。
+
+    本函数对每个 timestep 单独 verify(valid_window=0),返回实际匹配的 timestep,
+    供 _consume_totp_timestep 做原子消费。
+
+    Args:
+        secret: TOTP 密钥(base32 编码的 32 字符)
+        code: 用户输入的 6 位验证码
+
+    Returns:
+        匹配的 timestep(int);无匹配返回 None
+    """
+    if not secret or not code:
+        return None
+    try:
+        import pyotp
+        totp = pyotp.TOTP(secret)
+        current_timestep = int(time.time() // 30)
+        # 遍历 [current-1, current, current+1],对每个 timestep 精确匹配
+        for offset in (-1, 0, 1):
+            timestep = current_timestep + offset
+            # for_time 接受 Unix 时间戳;timestep * 30 是该 timestep 的起始时间戳
+            if totp.verify(code, for_time=timestep * 30, valid_window=0):
+                return timestep
+        return None
+    except ImportError:
+        logger.error("[admin.mfa] pyotp 未安装,_find_matching_timestep 失败(fail-closed)")
+        return None
+    except Exception as e:
+        logger.warning(f"[admin.mfa] _find_matching_timestep 异常: {e}")
+        return None
+
+
 # ─── R45 §7.2 / R46 P1: TOTP 重放保护 + 错误限流辅助函数 ─────────
 
 
@@ -125,13 +177,18 @@ def _get_store():
 
 
 async def _is_totp_replayed(principal_id: int, code: str) -> bool:
-    """R46 P1: 检查 TOTP 是否已被使用(重放检测)— SQLite 权威查询。
+    """R46 P1: 检查 TOTP 是否已被使用(重放检测)— 只读查询。
 
     R46 P1 变更:
         - 从 SQLite mfa_used_totp 表查询(跨进程共享)
         - 使用 timestep = int(time.time() // 30) 而非明文 code
         - L1 缓存:先查内存,未命中查 SQLite
         - store 不可用时 fail-closed(返回 True,视为重放,拒绝验证)
+
+    R47 P1-b 变更:
+        - 此函数仅作只读查询(向后兼容 + 测试用)。
+        - verify_totp_code 不再调用此函数,改用 _consume_totp_timestep
+          (INSERT OR IGNORE + rowcount)做原子消费,消除竞态窗口。
 
     Args:
         principal_id: 管理员 principal ID
@@ -171,6 +228,53 @@ async def _is_totp_replayed(principal_id: int, code: str) -> bool:
         return True
 
 
+async def _consume_totp_timestep(principal_id: int, timestep: int) -> bool:
+    """R47 P1-b: 原子消费 TOTP timestep(INSERT OR IGNORE + rowcount 判定)。
+
+    使用 UNIQUE(principal_id, timestep) 约束作为原子消费原语,消除
+    "先查询再插入"的竞态窗口:
+        - rowcount=1 → 首次使用,返回 True(消费成功)
+        - rowcount=0 → UNIQUE 冲突,已被消费(重放),返回 False
+        - store 不可用或异常 → fail-closed(返回 False,拒绝验证)
+
+    同时更新 L1 缓存(_used_totp_codes),保持与 _is_totp_replayed 一致。
+
+    Args:
+        principal_id: 管理员 principal ID
+        timestep: 实际匹配的 timestep(由 _find_matching_timestep 返回)
+
+    Returns:
+        True=首次使用(消费成功);False=重放或 fail-closed
+    """
+    if not principal_id or timestep is None:
+        return False
+    store = _get_store()
+    if not store or not getattr(store, "_db", None):
+        # store 不可用,fail-closed(视为已消费,拒绝验证)
+        logger.warning("[admin.mfa] _consume_totp_timestep: store 不可用,fail-closed")
+        return False
+    try:
+        cursor = await store._db.execute(
+            "INSERT OR IGNORE INTO mfa_used_totp "
+            "(principal_id, timestep, used_at) VALUES (?, ?, ?)",
+            (principal_id, timestep, time.time()),
+        )
+        await store._db.commit()
+        # rowcount=1 → 插入成功(首次使用);rowcount=0 → UNIQUE 冲突(重放)
+        rowcount = cursor.rowcount if cursor is not None else 0
+        # 更新 L1 缓存(无论首次还是重放,该 timestep 都已标记为已用)
+        if principal_id not in _used_totp_codes:
+            _used_totp_codes[principal_id] = set()
+        _used_totp_codes[principal_id].add(timestep)
+        if rowcount >= 1:
+            return True
+        # rowcount=0 → 重放(已被消费)
+        return False
+    except Exception as e:
+        logger.warning(f"[admin.mfa] _consume_totp_timestep 原子消费失败,fail-closed: {e}")
+        return False
+
+
 def _record_totp_usage(principal_id: int, code: str) -> None:
     """R46 P1: 记录 TOTP timestep 已使用(L1 缓存更新)。
 
@@ -192,52 +296,64 @@ def _record_totp_usage(principal_id: int, code: str) -> None:
 
 
 async def _record_mfa_failure(principal_id: int) -> bool:
-    """R46 P1: 记录一次 MFA 验证失败(写入 SQLite + L1 缓存)。
+    """R46 P1 / R47 P1-b: 记录一次 MFA 验证失败(写入 SQLite + L1 缓存)。
 
     R46 P1 变更:
         - 写入 SQLite mfa_failures 表(跨进程共享)
         - 同时更新 L1 缓存
-        - DB 写入失败时返回 False(fail-closed 信号)
+
+    R47 P1-b 变更:
+        - mfa_failures 表 schema 改为 (id AUTOINCREMENT, principal_id, failed_at_ms INTEGER, created_at)
+        - 时间戳用整数毫秒(failed_at_ms)替代浮点秒(failed_at),消除同毫秒碰撞
+        - 不阻塞:DB 写入失败仅记录 warning,不返回 False(避免因记录失败而锁定用户)
 
     Args:
         principal_id: 管理员 principal ID
 
     Returns:
-        True=写入成功;False=写入失败(调用方应 fail-closed)
+        总是返回 True(不阻塞调用方);store 不可用时仅 warning
     """
     if not principal_id:
-        return False
+        return True
     now = time.time()
+    now_ms = int(now * 1000)
     # 更新 L1 缓存
     if principal_id not in _mfa_failures:
         _mfa_failures[principal_id] = []
     _mfa_failures[principal_id].append(now)
     cutoff = now - _MFA_LOCK_DURATION_SECONDS
     _mfa_failures[principal_id] = [ts for ts in _mfa_failures[principal_id] if ts > cutoff]
-    # 写入 SQLite 权威层
+    # 写入 SQLite 权威层(R47 P1-b: 新 schema 使用 failed_at_ms 毫秒整数)
     store = _get_store()
     if not store or not getattr(store, "_db", None):
-        logger.warning("[admin.mfa] _record_mfa_failure: store 不可用,fail-closed")
-        return False
+        # R47 P1-b: store 不可用时不阻塞(仅 warning,不 fail-closed)
+        logger.warning("[admin.mfa] _record_mfa_failure: store 不可用(忽略,不阻塞)")
+        return True
     try:
+        import datetime as _dt
         await store._db.execute(
-            "INSERT OR IGNORE INTO mfa_failures (principal_id, failed_at) VALUES (?, ?)",
-            (principal_id, now),
+            "INSERT INTO mfa_failures (principal_id, failed_at_ms, created_at) "
+            "VALUES (?, ?, ?)",
+            (principal_id, now_ms, _dt.datetime.now().isoformat()),
         )
         await store._db.commit()
         return True
     except Exception as e:
-        logger.warning(f"[admin.mfa] _record_mfa_failure 写入 SQLite 失败: {e}")
-        return False
+        # R47 P1-b: DB 写入失败不阻塞(仅 warning,避免因记录失败而锁定用户)
+        logger.warning(f"[admin.mfa] _record_mfa_failure 写入 SQLite 失败(忽略,不阻塞): {e}")
+        return True
 
 
 async def _is_locked(principal_id: int) -> bool:
-    """R46 P1: 检查 principal 是否因连续错误 TOTP 被锁定 — SQLite 权威查询。
+    """R46 P1 / R47 P1-b: 检查 principal 是否因连续错误 TOTP 被锁定 — SQLite 权威查询。
 
     R46 P1 变更:
         - 从 SQLite mfa_failures 表查询最近 5 分钟失败次数
         - L1 缓存:先查内存,未命中或未达阈值时查 SQLite
         - store 不可用时 fail-closed(返回 True,视为已锁定)
+
+    R47 P1-b 变更:
+        - 查询条件改为 failed_at_ms > cutoff_ms(毫秒整数)
 
     Args:
         principal_id: 管理员 principal ID
@@ -249,6 +365,7 @@ async def _is_locked(principal_id: int) -> bool:
         return False
     now = time.time()
     cutoff = now - _MFA_LOCK_DURATION_SECONDS
+    cutoff_ms = int(cutoff * 1000)
     # L1 缓存:先查内存
     failures = _mfa_failures.get(principal_id)
     if failures:
@@ -263,8 +380,8 @@ async def _is_locked(principal_id: int) -> bool:
         return True
     try:
         cursor = await store._db.execute(
-            "SELECT COUNT(*) FROM mfa_failures WHERE principal_id = ? AND failed_at > ?",
-            (principal_id, cutoff),
+            "SELECT COUNT(*) FROM mfa_failures WHERE principal_id = ? AND failed_at_ms > ?",
+            (principal_id, cutoff_ms),
         )
         row = await cursor.fetchone()
         count = int(row[0]) if row else 0
@@ -307,6 +424,55 @@ async def _clear_mfa_failures(principal_id: int) -> bool:
     except Exception as e:
         logger.warning(f"[admin.mfa] _clear_mfa_failures 删除 SQLite 失败: {e}")
         return False
+
+
+async def cleanup_expired_mfa_records(retention_hours: int = 24) -> dict:
+    """R47 P1-b: 清理过期的 MFA 记录(retention 默认 24 小时)。
+
+    删除:
+        - mfa_used_totp 中 used_at < (now - retention_hours * 3600) 的记录
+        - mfa_failures 中 failed_at_ms < (now_ms - retention_hours * 3600 * 1000) 的记录
+
+    由 retention worker 定期调用(r40_scheduler 每天执行),防止表无限增长。
+
+    Args:
+        retention_hours: 保留时长(小时),默认 24
+
+    Returns:
+        {"deleted_used_totp": int, "deleted_failures": int}
+    """
+    result = {"deleted_used_totp": 0, "deleted_failures": 0}
+    store = _get_store()
+    if not store or not getattr(store, "_db", None):
+        logger.warning("[admin.mfa] cleanup_expired_mfa_records: store 不可用,跳过清理")
+        return result
+    try:
+        now = time.time()
+        now_ms = int(now * 1000)
+        cutoff_used_at = now - retention_hours * 3600
+        cutoff_failed_ms = now_ms - retention_hours * 3600 * 1000
+        # 清理 mfa_used_totp(used_at 是浮点秒)
+        cursor = await store._db.execute(
+            "DELETE FROM mfa_used_totp WHERE used_at < ?",
+            (cutoff_used_at,),
+        )
+        result["deleted_used_totp"] = cursor.rowcount if cursor is not None else 0
+        # 清理 mfa_failures(failed_at_ms 是整数毫秒)
+        cursor = await store._db.execute(
+            "DELETE FROM mfa_failures WHERE failed_at_ms < ?",
+            (cutoff_failed_ms,),
+        )
+        result["deleted_failures"] = cursor.rowcount if cursor is not None else 0
+        await store._db.commit()
+        if result["deleted_used_totp"] > 0 or result["deleted_failures"] > 0:
+            logger.info(
+                f"[R47] MFA 记录清理: used_totp={result['deleted_used_totp']}, "
+                f"failures={result['deleted_failures']}"
+            )
+        return result
+    except Exception as e:
+        logger.warning(f"[admin.mfa] cleanup_expired_mfa_records 清理失败: {e}")
+        return result
 
 
 def reset_mfa_state_for_testing() -> None:
@@ -372,12 +538,21 @@ class MFAManager:
           4. 重放保护 + 失败计数持久化到 SQLite(跨进程共享)
           5. store 不可用或 DB 写入失败时 fail-closed(返回 False)
 
+        R47 P1-b 整改:
+          6. 原子消费 timestep — 使用 INSERT OR IGNORE + rowcount 判定重放,
+             消除"先查询再插入"竞态(原 _is_totp_replayed 只查询不消费)。
+          7. valid_window=1 记录实际匹配 timestep — 遍历 [current-1, current, current+1]
+             对每个 timestep 精确 verify,记录实际匹配的 timestep。
+          8. _record_mfa_failure 不阻塞 — DB 写入失败仅 warning。
+
         流程:
           1. 检查锁定状态(锁定中直接返回 False)
-          2. 检查重放(timestep 已使用过 → 记录失败 + 返回 False)
-          3. 校验 TOTP(pyotp)
-          4. 成功:写入 mfa_used_totp(防重放)+ 清除失败计数
-          5. 失败:记录失败次数到 mfa_failures(可能触发锁定)
+          2. 获取 secret
+          3. 查找实际匹配的 timestep(_find_matching_timestep)
+          4. 原子消费 timestep(_consume_totp_timestep:INSERT OR IGNORE + rowcount)
+             - rowcount=1 → 首次使用,清除失败计数,返回 True
+             - rowcount=0 → 重放,记录失败,返回 False
+          5. 无匹配 timestep → 记录失败,返回 False
 
         Args:
             user_id: 用户 ID
@@ -395,13 +570,6 @@ class MFAManager:
                 f"≥{_MFA_FAIL_MAX_ATTEMPTS} 次,锁定 {_MFA_LOCK_DURATION_SECONDS}s)"
             )
             return False
-        # R45 §7.2: 2. 检查重放(timestep 已使用过 → 拒绝 + 记录失败)
-        if await _is_totp_replayed(user_id, code):
-            logger.warning(
-                f"[admin.mfa] TOTP code 重放被拒绝 principal={user_id}"
-            )
-            await _record_mfa_failure(user_id)
-            return False
         try:
             from database.cache_store import get_cache_store
             store = get_cache_store()
@@ -410,45 +578,41 @@ class MFAManager:
             secret = await store.get_kv(_make_secret_key(user_id))
             if not secret:
                 return False
-            ok = _verify_totp(secret, code)
-            if ok:
-                # R46 P1: 验证成功 — 写入 mfa_used_totp(防重放,SQLite 权威)
-                timestep = int(time.time() // 30)
-                try:
-                    await store._db.execute(
-                        "INSERT OR IGNORE INTO mfa_used_totp "
-                        "(principal_id, timestep, used_at) VALUES (?, ?, ?)",
-                        (user_id, timestep, time.time()),
-                    )
-                    await store._db.commit()
-                except Exception as e:
-                    # R46 P1: DB 写入失败 → fail-closed(防重放记录丢失,拒绝验证)
-                    logger.warning(
-                        f"[admin.mfa] 写入 mfa_used_totp 失败,fail-closed: {e}"
-                    )
-                    return False
-                # R45 §7.2: 记录 code 已用(L1 缓存)+ 清除失败计数
-                _record_totp_usage(user_id, code)
-                if not await _clear_mfa_failures(user_id):
-                    # R46 P1: 清除失败 → fail-closed(失败计数残留可能导致误锁定)
-                    logger.warning(
-                        f"[admin.mfa] 清除 mfa_failures 失败,fail-closed"
-                    )
-                    return False
-            else:
-                # R45 §7.2: 验证失败 — 记录失败次数(可能触发锁定)
-                if not await _record_mfa_failure(user_id):
-                    # R46 P1: DB 写入失败 → fail-closed
-                    logger.warning(
-                        f"[admin.mfa] 记录 mfa_failure 失败,fail-closed"
-                    )
-                    return False
+            # R47 P1-b: 2. 查找实际匹配的 timestep(遍历 [current-1, current, current+1])
+            matched_timestep = _find_matching_timestep(secret, code)
+            if matched_timestep is None:
+                # 无匹配 → 验证失败,记录失败次数(不阻塞)
+                await _record_mfa_failure(user_id)
                 if await _is_locked(user_id):
                     logger.warning(
                         f"[admin.mfa] principal={user_id} 因连续错误 TOTP "
                         f"被锁定 {_MFA_LOCK_DURATION_SECONDS}s"
                     )
-            return ok
+                return False
+            # R47 P1-b: 3. 原子消费 timestep(INSERT OR IGNORE + rowcount 判定重放)
+            consumed = await _consume_totp_timestep(user_id, matched_timestep)
+            if not consumed:
+                # rowcount=0 → 重放(已被消费),记录失败(不阻塞)
+                logger.warning(
+                    f"[admin.mfa] TOTP timestep={matched_timestep} 重放被拒绝 "
+                    f"principal={user_id}"
+                )
+                await _record_mfa_failure(user_id)
+                if await _is_locked(user_id):
+                    logger.warning(
+                        f"[admin.mfa] principal={user_id} 因连续错误 TOTP "
+                        f"被锁定 {_MFA_LOCK_DURATION_SECONDS}s"
+                    )
+                return False
+            # R47 P1-b: 4. 首次使用 → 清除失败计数
+            # (L1 缓存已由 _consume_totp_timestep 更新,无需调用 _record_totp_usage)
+            if not await _clear_mfa_failures(user_id):
+                # R46 P1: 清除失败 → fail-closed(失败计数残留可能导致误锁定)
+                logger.warning(
+                    f"[admin.mfa] 清除 mfa_failures 失败,fail-closed"
+                )
+                return False
+            return True
         except Exception as e:
             logger.debug(f"[admin.mfa] 校验 TOTP 失败: {e}")
             # 异常时也记录失败(fail-closed 倾向,防止通过制造异常绕过限流)

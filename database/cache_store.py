@@ -20,7 +20,14 @@ from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 from loguru import logger
 
-DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
+# R47 P0-3: 支持 DATABASE_URL 环境变量指定 SQLite 路径(E2E 测试每个 run 独立 DB)
+# 格式: sqlite:///path/to/db.db → 解析为 Path("/path/to/db.db")
+# 未设置或非 sqlite 协议时回退到默认路径
+_db_url_env = os.environ.get("DATABASE_URL", "")
+if _db_url_env.startswith("sqlite:///"):
+    DB_PATH = Path(_db_url_env[len("sqlite:///"):])
+else:
+    DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
 
 
 # ─── R35 P1-2: WriterCommand Protocol(类型提示,不强制现有方法迁移) ───
@@ -852,6 +859,20 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
         )
+        # R47 P0-6: dirty_outbox 增加 UNIQUE 约束 (table_name, pk, version)
+        # 防止并发写入时 (table, pk, version) 重复,配合 allocate_version 原子递增使用。
+        # 采用 CREATE UNIQUE INDEX IF NOT EXISTS 实现幂等升级(老库已存在表时也能补约束)。
+        try:
+            await self._db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_dirty_outbox_table_pk_version "
+                "ON dirty_outbox(table_name, pk, version)"
+            )
+        except Exception as _e_dirty_unique:
+            # 老库可能已存在重复行导致创建 UNIQUE INDEX 失败,记录警告但不阻塞 init
+            # (后续 add_dirty_outbox 会通过 allocate_version 避免新增重复)
+            logger.warning(
+                f"[CacheStore] dirty_outbox UNIQUE INDEX 创建失败(可能存在历史重复行): {_e_dirty_unique}"
+            )
 
         # ─── R41 P0-6: dlq_records 死信队列权威存储表 ───
         # crdb_sync 处理失败的 dirty_outbox 记录路由到此表(替代/补充 jsonl 文件)。
@@ -1325,15 +1346,73 @@ class CacheStore:
             )"""
         )
 
-        # ─── R46 P1: mfa_failures 表 — MFA 错误限流持久化(跨进程共享) ───
-        # R46 P1: 存储连续 TOTP 验证失败记录,用于跨进程限流(锁定 5 分钟)。
+        # ─── R46 P1 / R47 P1-b: mfa_failures 表 — MFA 错误限流持久化(跨进程共享) ───
+        # R47 P1-b: 旧 schema (principal_id, failed_at REAL, PRIMARY KEY(principal_id, failed_at))
+        #   同秒/同毫秒多次失败会碰撞导致 INSERT OR IGNORE 丢失记录。
+        # 新 schema: id INTEGER AUTOINCREMENT 主键 + failed_at_ms INTEGER 毫秒时间戳,
+        #   彻底消除碰撞。老表保留为 mfa_failures_old 备份,数据迁移到新表。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS mfa_failures (
-                principal_id  INTEGER NOT NULL,
-                failed_at     REAL NOT NULL,
-                PRIMARY KEY (principal_id, failed_at)
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                principal_id   INTEGER NOT NULL,
+                failed_at_ms   INTEGER NOT NULL,
+                created_at     TEXT NOT NULL
             )"""
         )
+        # 幂等迁移: 检测旧 schema mfa_failures 表并迁移到新表
+        # 旧表特征: PRIMARY KEY (principal_id, failed_at) 且无 failed_at_ms 列
+        try:
+            cursor_old_check = await self._db.execute("PRAGMA table_info(mfa_failures)")
+            cols_info = await cursor_old_check.fetchall()
+            col_names = {row[1] for row in cols_info} if cols_info else set()
+            # 新表应有 failed_at_ms 列,旧表应有 failed_at 列且无 failed_at_ms
+            # 若检测到旧表(有 failed_at 无 failed_at_ms),执行迁移
+            if "failed_at" in col_names and "failed_at_ms" not in col_names:
+                # 1. 重命名旧表为 mfa_failures_old(若已存在则跳过)
+                try:
+                    await self._db.execute(
+                        "ALTER TABLE mfa_failures RENAME TO mfa_failures_old"
+                    )
+                except Exception:
+                    pass  # mfa_failures_old 已存在或重命名失败,忽略
+                # 2. 创建新 schema 的 mfa_failures 表
+                await self._db.execute(
+                    """CREATE TABLE IF NOT EXISTS mfa_failures (
+                        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                        principal_id   INTEGER NOT NULL,
+                        failed_at_ms   INTEGER NOT NULL,
+                        created_at     TEXT NOT NULL
+                    )"""
+                )
+                # 3. 迁移数据(failed_at REAL 秒 → failed_at_ms 毫秒)
+                try:
+                    await self._db.execute(
+                        "INSERT INTO mfa_failures (principal_id, failed_at_ms, created_at) "
+                        "SELECT principal_id, "
+                        "CAST(failed_at * 1000 AS INTEGER), "
+                        "datetime(failed_at, 'unixepoch') "
+                        "FROM mfa_failures_old"
+                    )
+                    logger.info("[CacheStore] mfa_failures 旧表数据迁移到新表完成")
+                except Exception as _e_migrate:
+                    logger.warning(
+                        f"[CacheStore] mfa_failures 数据迁移失败(可忽略): {_e_migrate}"
+                    )
+                # 4. 创建新索引(替换旧的 PRIMARY KEY 索引)
+                await self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mfa_failures_principal_time "
+                    "ON mfa_failures(principal_id, failed_at_ms)"
+                )
+            else:
+                # 新表已存在,确保索引存在
+                await self._db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mfa_failures_principal_time "
+                    "ON mfa_failures(principal_id, failed_at_ms)"
+                )
+        except Exception as _e_mfa_migrate:
+            logger.warning(
+                f"[CacheStore] mfa_failures schema 迁移检测失败(可忽略): {_e_mfa_migrate}"
+            )
 
         # ─── R46 P0-3: unregistered_copies 表 — 持久化 COPIED_UNREGISTERED 状态 ───
         # Telegram copy 成功但 outbox 写失败时,持久化目标 channel/message_id,
@@ -1371,6 +1450,54 @@ class CacheStore:
             )"""
         )
 
+        # ─── R47 P0-5: delivery_group_receipts 表 — 群发回执聚合 ───
+        # 跟踪群发任务(group_id)的子任务确认状态,源消息 IDs → 目标用户 IDs
+        # 状态机: pending(待确认) → partial(部分确认) → completed(全部确认) /
+        #         failed(失败/超时)
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS delivery_group_receipts (
+                group_id         TEXT PRIMARY KEY,
+                expected_count   INTEGER NOT NULL,
+                confirmed_count  INTEGER NOT NULL DEFAULT 0,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                source_ids       TEXT NOT NULL,
+                target_ids       TEXT NOT NULL,
+                action_id        TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_group_receipts_action_id "
+            "ON delivery_group_receipts(action_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_delivery_group_receipts_status "
+            "ON delivery_group_receipts(status)"
+        )
+
+        # ─── R47 P1-a: callback_nonces 表 — 回调 nonce 原子消费 ───
+        # 防止回调 URL 被重放(如审批回调、支付回调),nonce 一次性消费
+        # consumed_at IS NULL 表示未消费,UPDATE WHERE consumed_at IS NULL RETURNING 原子消费
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS callback_nonces (
+                nonce         TEXT PRIMARY KEY,
+                principal_id  INTEGER NOT NULL,
+                action        TEXT NOT NULL,
+                expires_at    TEXT NOT NULL,
+                consumed_at   TEXT,
+                created_at    TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_callback_nonces_principal "
+            "ON callback_nonces(principal_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_callback_nonces_expires "
+            "ON callback_nonces(expires_at)"
+        )
+
         await self._db.commit()
         # ─── 注入 db 连接给 Buffer ───
         _decode_log_buffer.set_db(self._db)
@@ -1386,7 +1513,7 @@ class CacheStore:
         payload: str | None = None, version: int = 0,
         connection: Any = None, tx: Any = None,
     ) -> int:
-        """R38 P1-2 + R39 P0-4 + R40 P0-5 + R41 P0-6: 写入 dirty_outbox 一条变更记录。
+        """R38 P1-2 + R39 P0-4 + R40 P0-5 + R41 P0-6 + R47 P0-6: 写入 dirty_outbox 一条变更记录。
 
         R40 P0-5 变更:
           - 失败时抛出异常(不再仅 warning),让上层 UnitOfWork 捕获并回滚整个事务,
@@ -1399,12 +1526,18 @@ class CacheStore:
             crdb_sync dispatcher 不会重复拉取,避免无意义堆积。
             记录仍保留在 dirty_outbox 表中以便审计,但不参与 CRDB 同步。
 
+        R47 P0-6 变更:
+          - version=0 时改为调用 allocate_version(connection, table_name, pk)
+            原子分配递增 version(替代旧的 MAX(version)+1 模式,消除并发竞态)。
+          - 配合 dirty_outbox UNIQUE(table_name, pk, version) 约束,
+            UNIQUE 冲突时自动重新分配 version 重试(最多 5 次),不回退时间戳。
+
         Args:
             table_name: 受影响表名(如 file_records_local / codes_local / tasks / approvals)
             pk: 行主键值(字符串)
             operation: 'upsert'(默认) 或 'tombstone'(软删除)
             payload: 可选 JSON 序列化后的载荷(行快照或变更字段)
-            version: 单调递增版本号(用于 CRDB UPSERT 条件)
+            version: 单调递增版本号(用于 CRDB UPSERT 条件);0 表示自动分配
             connection: R39 P0-4 可选事务连接,传入时不自动 commit
                 (由调用方在同一事务内控制 commit/rollback,确保与业务表更新原子性)
             tx: R40 P0-5 connection 的别名(与 connection 等价,优先使用 tx)
@@ -1441,68 +1574,54 @@ class CacheStore:
             _processed_init = 0
             _local_only_init = 0
 
-        # R42 P1-4: 若 version=0,自动从 payload 中的 updated_at 字段生成时间戳版本
-        # (避免多调用方使用默认 version=0 时,合并顺序依赖插入 ID 并吞掉真正新状态)
-        # 优先级: payload.version > payload.<version_field> > 当前时间戳
-        # R44 7.2: version 优先用 SQLite 原子递增(MAX+1),避免并发碰撞
+        # R47 P0-6: version=0 时调用 allocate_version 原子分配递增 version
+        # 替代旧的 MAX(version)+1 模式(存在并发竞态)和 payload 时间戳模式(可能碰撞)
+        # allocate_version 通过 entity_versions 表 UPSERT + RETURNING 保证原子性
         if version == 0:
-            # 先尝试从 dirty_outbox 表 MAX(version)+1(原子递增,避免时间戳碰撞)
             try:
-                _query_conn = connection if connection is not None else self._db
-                if _query_conn is not None:
-                    cursor = await _query_conn.execute(
-                        "SELECT MAX(version) FROM dirty_outbox "
-                        "WHERE table_name = ? AND pk = ?",
-                        (table_name, pk),
-                    )
-                    row = await cursor.fetchone()
-                    if row and row[0] is not None and row[0] > 0:
-                        version = int(row[0]) + 1
-                    else:
-                        # fallback 到时间戳生成
-                        version = _generate_version_from_payload(table_name, payload)
-                else:
-                    # 无可用连接,fallback 到时间戳生成
-                    version = _generate_version_from_payload(table_name, payload)
-            except Exception:
-                # 查询失败时 fallback 到时间戳生成(保证不阻塞主流程)
+                version = await self.allocate_version(
+                    table_name, pk, connection=connection
+                )
+            except Exception as _e_alloc:
+                # allocate_version 失败时 fallback 到时间戳生成(保证不阻塞主流程)
+                logger.warning(
+                    f"[CacheStore] add_dirty_outbox allocate_version 失败,fallback 时间戳: {_e_alloc}"
+                )
                 version = _generate_version_from_payload(table_name, payload)
 
-        # R39 P0-4 + R40 P0-5: 事务发件箱模式 — 若调用方传入 connection/tx,
+        # R39 P0-4 + R40 P0-5 + R47 P0-6: 事务发件箱模式 — 若调用方传入 connection/tx,
         # 则使用该连接(不自动 commit),确保 dirty_outbox 写入与业务表更新
         # 在同一事务内原子提交/回滚,避免半提交导致数据不一致。
+        # R47 P0-6: 通过 _add_dirty_outbox_with_retry 处理 UNIQUE 冲突重试。
         # R40 P0-5: 失败时抛异常(而非仅 warning),让上层 UnitOfWork 回滚。
         if connection is not None:
             # 不调用 commit,由调用方控制事务;失败抛异常让上层回滚
-            cursor = await connection.execute(
-                """INSERT INTO dirty_outbox
-                   (table_name, pk, version, operation, payload, created_at, processed, local_only)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    table_name, pk, version, operation, payload,
-                    datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
-                    _processed_init, _local_only_init,
-                ),
+            # R47 P0-6: UNIQUE 冲突时重试(最多 5 次)
+            return await self._add_dirty_outbox_with_retry(
+                connection, table_name, pk, version, operation, payload,
+                _processed_init, _local_only_init,
             )
-            return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
         # 兼容模式: 无 connection/tx 时自动 commit(向后兼容旧调用方)
         # R40 P0-5: 失败时抛异常,而非返回 0 让调用方误以为成功
         if not self._db:
             raise RuntimeError(
                 "[CacheStore] add_dirty_outbox 失败: CacheStore 未初始化(_db is None)"
             )
-        cursor = await self._db.execute(
-            """INSERT INTO dirty_outbox
-               (table_name, pk, version, operation, payload, created_at, processed, local_only)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                table_name, pk, version, operation, payload,
-                datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
+        # R47 P0-6: 自动 commit 模式也使用重试逻辑
+        try:
+            _rid = await self._add_dirty_outbox_with_retry(
+                self._db, table_name, pk, version, operation, payload,
                 _processed_init, _local_only_init,
-            ),
-        )
-        await self._db.commit()
-        return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            )
+            await self._db.commit()
+            return _rid
+        except Exception:
+            # 自动 commit 模式下失败时回滚并抛出
+            try:
+                await self._db.rollback()
+            except Exception:
+                pass
+            raise
 
     @asynccontextmanager
     async def transaction(self):
@@ -2129,11 +2248,16 @@ class CacheStore:
             if not self._in_writer_tx:
                 await self._db.commit()
             # 2. 写 dirty_outbox tombstone(供 crdb_sync 同步到 CRDB)
+            # R47 P0-6: 使用 allocate_version 分配唯一 version,避免 UNIQUE 约束冲突
+            _tombstone_version = await self.allocate_version(
+                sqlite_table, pk, connection=self._db
+            )
             await self._db.execute(
                 """INSERT INTO dirty_outbox
-                   (table_name, pk, version, operation, payload, created_at, processed)
-                   VALUES (?, ?, ?, 'tombstone', ?, ?, 0)""",
-                (sqlite_table, pk, 0, f'{{"deleted_at":"{deleted_at}"}}',
+                   (table_name, pk, version, operation, payload, created_at, processed, local_only)
+                   VALUES (?, ?, ?, 'tombstone', ?, ?, 0, 0)""",
+                (sqlite_table, pk, _tombstone_version,
+                 f'{{"deleted_at":"{deleted_at}"}}',
                  _dt.datetime.now().isoformat()),
             )
             if not self._in_writer_tx:
@@ -6484,30 +6608,399 @@ class CacheStore:
 
     # ─── R46 P1: entity_versions 原子 version 分配 ──────────────
 
-    async def allocate_version(self, table_name: str, pk: str) -> int:
-        """R46 P1: 原子分配递增 version,解决 MAX+1 并发竞态。
+    async def allocate_version(self, table_name: str, pk: str, connection: Any = None) -> int:
+        """R46 P1 / R47 P0-6: 原子分配递增 version,解决 MAX+1 并发竞态。
 
-        使用 BEGIN IMMEDIATE + UPSERT + RETURNING 保证原子性。
-        必须在事务中调用。
+        R47 P0-6 变更:
+            - 新增 connection 参数,允许在调用方事务内执行(保证与 dirty_outbox INSERT 同事务原子)
+            - 使用 INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING 单语句原子分配
+              (SQLite 3.35+ 支持 RETURNING;若 RETURNING 不可用则 fallback 到两步查询)
+            - 调用方未传 connection 时,使用 self._db 并自动 commit
+
+        Args:
+            table_name: 逻辑表名(如 users / file_records / codes_local)
+            pk: 行主键值(字符串)
+            connection: 可选事务连接,传入时不自动 commit(由调用方控制事务)
+
+        Returns:
+            分配的新 version(int,从 1 开始单调递增);失败时返回 1(不阻塞主流程)
         """
-        if not self._db:
+        # R47 P0-6: 优先使用调用方传入的事务连接
+        _conn = connection if connection is not None else self._db
+        if not _conn:
             return 1
         try:
-            await self._db.execute(
+            # 优先尝试 RETURNING 子句(SQLite 3.35+),单语句原子分配
+            try:
+                cursor = await _conn.execute(
+                    "INSERT INTO entity_versions (table_name, pk, version) "
+                    "VALUES (?, ?, 1) "
+                    "ON CONFLICT(table_name, pk) DO UPDATE SET version = version + 1 "
+                    "RETURNING version",
+                    (table_name, pk),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    return int(row[0])
+            except Exception as _e_returning:
+                # RETURNING 不可用(SQLite < 3.35),fallback 到两步查询
+                logger.debug(
+                    f"[CacheStore] allocate_version RETURNING 不可用,fallback 两步: {_e_returning}"
+                )
+            # Fallback: INSERT/UPDATE 后再 SELECT(非原子,但兼容旧 SQLite)
+            await _conn.execute(
                 "INSERT INTO entity_versions (table_name, pk, version) "
                 "VALUES (?, ?, 1) "
                 "ON CONFLICT(table_name, pk) DO UPDATE SET version = version + 1",
                 (table_name, pk),
             )
-            cursor = await self._db.execute(
+            cursor = await _conn.execute(
                 "SELECT version FROM entity_versions WHERE table_name = ? AND pk = ?",
                 (table_name, pk),
             )
             row = await cursor.fetchone()
+            # 调用方未传 connection 时自动 commit;传 connection 时由调用方控制
+            if connection is None and self._db:
+                await self._db.commit()
             return int(row[0]) if row else 1
         except Exception as e:
             logger.error(f"[CacheStore] allocate_version 失败: {e}")
             return 1
+
+    # ─── R47 P0-6: dirty_outbox 唯一冲突重试辅助 ──────────────
+
+    async def _add_dirty_outbox_with_retry(
+        self,
+        conn: Any,
+        table_name: str,
+        pk: str,
+        version: int,
+        operation: str,
+        payload: str | None,
+        processed_init: int,
+        local_only_init: int,
+        max_retries: int = 5,
+    ) -> int:
+        """R47 P0-6: 在指定事务连接上 INSERT dirty_outbox,UNIQUE 冲突时重试。
+
+        UNIQUE(table_name, pk, version) 冲突时:
+            - 重新调用 allocate_version 获取新 version
+            - 最多重试 max_retries 次
+            - 不回退时间戳(version 由 allocate_version 单调递增保证)
+
+        Args:
+            conn: 事务连接(由调用方控制 commit/rollback)
+            table_name / pk / operation / payload: dirty_outbox 字段
+            version: 初始 version(若冲突会重新分配)
+            processed_init / local_only_init: processed / local_only 初始值
+            max_retries: UNIQUE 冲突最大重试次数
+
+        Returns:
+            新插入行 id;失败抛异常让上层事务回滚
+        """
+        _current_version = version
+        _last_err: Exception | None = None
+        for _attempt in range(max_retries + 1):
+            try:
+                cursor = await conn.execute(
+                    """INSERT INTO dirty_outbox
+                       (table_name, pk, version, operation, payload, created_at, processed, local_only)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        table_name, pk, _current_version, operation, payload,
+                        datetime.datetime.now().isoformat(),  # type: ignore[attr-defined]
+                        processed_init, local_only_init,
+                    ),
+                )
+                return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            except Exception as _e_insert:
+                _last_err = _e_insert
+                # 检测 UNIQUE 冲突(SQLite ConstraintException 文本含 UNIQUE)
+                _err_msg = str(_e_insert).lower()
+                if "unique" in _err_msg and _attempt < max_retries:
+                    # UNIQUE 冲突,重新分配 version 重试
+                    _current_version = await self.allocate_version(
+                        table_name, pk, connection=conn
+                    )
+                    logger.debug(
+                        f"[CacheStore] dirty_outbox UNIQUE 冲突,重试 "
+                        f"attempt={_attempt + 1} new_version={_current_version}"
+                    )
+                    continue
+                # 非 UNIQUE 冲突或重试次数用尽,抛出异常让上层回滚
+                raise
+        # 理论上不会到达(循环内必 return 或 raise)
+        raise _last_err if _last_err else RuntimeError(
+            "[CacheStore] _add_dirty_outbox_with_retry: 重试次数用尽"
+        )
+
+    # ─── R47 P0-5: delivery_group_receipts 群发回执聚合方法 ──────────────
+
+    async def delivery_group_receipt_create(
+        self,
+        group_id: str,
+        expected_count: int,
+        source_ids: list,
+        target_ids: list,
+        action_id: str,
+    ) -> bool:
+        """R47 P0-5: 创建群发回执记录(若 group_id 已存在则忽略,幂等)。
+
+        Args:
+            group_id: 群发任务唯一 ID
+            expected_count: 预期子任务总数
+            source_ids: 源消息 ID 列表(JSON 序列化存储)
+            target_ids: 目标用户 ID 列表(JSON 序列化存储)
+            action_id: 关联动作 ID(如审批 action_id)
+
+        Returns:
+            True=创建成功(或已存在);False=创建失败
+        """
+        if not self._db:
+            return False
+        import datetime as _dt
+        _now = _dt.datetime.now().isoformat()
+        _source_json = _m1_json_dumps(source_ids) or "[]"
+        _target_json = _m1_json_dumps(target_ids) or "[]"
+        try:
+            await self._db.execute(
+                """INSERT OR IGNORE INTO delivery_group_receipts
+                   (group_id, expected_count, confirmed_count, status,
+                    source_ids, target_ids, action_id, created_at, updated_at)
+                   VALUES (?, ?, 0, 'pending', ?, ?, ?, ?, ?)""",
+                (group_id, expected_count, _source_json, _target_json,
+                 action_id, _now, _now),
+            )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[CacheStore] delivery_group_receipt_create 失败: {e}")
+            return False
+
+    async def delivery_group_receipt_confirm_child(
+        self, group_id: str, child_msg_id: Any
+    ) -> int | None:
+        """R47 P0-5: 确认群发子任务完成,递增 confirmed_count 并返回新值。
+
+        状态机迁移:
+            - confirmed_count < expected_count → status='partial'
+            - confirmed_count >= expected_count → status='completed'
+
+        Args:
+            group_id: 群发任务唯一 ID
+            child_msg_id: 子任务消息 ID(保留参数,目前仅用于日志;
+
+        Returns:
+            新的 confirmed_count;group_id 不存在时返回 None
+        """
+        if not self._db:
+            return None
+        import datetime as _dt
+        _now = _dt.datetime.now().isoformat()
+        try:
+            # 原子递增 confirmed_count 并读取新值 + expected_count
+            cursor = await self._db.execute(
+                """UPDATE delivery_group_receipts
+                   SET confirmed_count = confirmed_count + 1,
+                       updated_at = ?
+                   WHERE group_id = ?""",
+                (_now, group_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            # 查询新 confirmed_count + expected_count 决定状态迁移
+            cursor = await self._db.execute(
+                "SELECT confirmed_count, expected_count FROM delivery_group_receipts "
+                "WHERE group_id = ?",
+                (group_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            _confirmed, _expected = int(row[0]), int(row[1])
+            _new_status = "completed" if _confirmed >= _expected else "partial"
+            await self._db.execute(
+                "UPDATE delivery_group_receipts SET status = ?, updated_at = ? "
+                "WHERE group_id = ?",
+                (_new_status, _now, group_id),
+            )
+            await self._db.commit()
+            return _confirmed
+        except Exception as e:
+            logger.error(f"[CacheStore] delivery_group_receipt_confirm_child 失败: {e}")
+            return None
+
+    async def delivery_group_receipt_get(self, group_id: str) -> dict | None:
+        """R47 P0-5: 查询群发回执详情。
+
+        Returns:
+            回执 dict(含 source_ids/target_ids 反序列化为 list);不存在返回 None
+        """
+        if not self._db:
+            return None
+        try:
+            cursor = await self._db.execute(
+                "SELECT group_id, expected_count, confirmed_count, status, "
+                "source_ids, target_ids, action_id, created_at, updated_at "
+                "FROM delivery_group_receipts WHERE group_id = ?",
+                (group_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return {
+                "group_id": row[0],
+                "expected_count": int(row[1]),
+                "confirmed_count": int(row[2]),
+                "status": row[3],
+                "source_ids": _m1_json_loads(row[4]) or [],
+                "target_ids": _m1_json_loads(row[5]) or [],
+                "action_id": row[6],
+                "created_at": row[7],
+                "updated_at": row[8],
+            }
+        except Exception as e:
+            logger.error(f"[CacheStore] delivery_group_receipt_get 失败: {e}")
+            return None
+
+    async def delivery_group_receipt_list_pending(self, limit: int = 100) -> list[dict]:
+        """R47 P0-5: 列出未完成的群发回执(status=pending 或 partial)。
+
+        供后台扫描器周期性检查超时/失败任务。
+
+        Returns:
+            回执 dict 列表(按 created_at 升序)
+        """
+        if not self._db:
+            return []
+        try:
+            cursor = await self._db.execute(
+                "SELECT group_id, expected_count, confirmed_count, status, "
+                "source_ids, target_ids, action_id, created_at, updated_at "
+                "FROM delivery_group_receipts "
+                "WHERE status IN ('pending', 'partial') "
+                "ORDER BY created_at ASC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "group_id": r[0],
+                    "expected_count": int(r[1]),
+                    "confirmed_count": int(r[2]),
+                    "status": r[3],
+                    "source_ids": _m1_json_loads(r[4]) or [],
+                    "target_ids": _m1_json_loads(r[5]) or [],
+                    "action_id": r[6],
+                    "created_at": r[7],
+                    "updated_at": r[8],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"[CacheStore] delivery_group_receipt_list_pending 失败: {e}")
+            return []
+
+    # ─── R47 P1-a: callback_nonces 回调 nonce 原子消费方法 ──────────────
+
+    async def callback_nonce_create(
+        self,
+        nonce: str,
+        principal_id: int,
+        action: str,
+        expires_at: str,
+    ) -> bool:
+        """R47 P1-a: 创建回调 nonce(若已存在则忽略,幂等)。
+
+        Args:
+            nonce: 唯一 nonce 字符串(由调用方生成,如 UUID4)
+            principal_id: 关联主体 ID(管理员 principal_id)
+            action: 关联动作(如 'approval_callback')
+            expires_at: 过期时间(ISO 字符串)
+
+        Returns:
+            True=创建成功(或已存在);False=创建失败
+        """
+        if not self._db:
+            return False
+        import datetime as _dt
+        _now = _dt.datetime.now().isoformat()
+        try:
+            await self._db.execute(
+                """INSERT OR IGNORE INTO callback_nonces
+                   (nonce, principal_id, action, expires_at, consumed_at, created_at)
+                   VALUES (?, ?, ?, ?, NULL, ?)""",
+                (nonce, principal_id, action, expires_at, _now),
+            )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[CacheStore] callback_nonce_create 失败: {e}")
+            return False
+
+    async def callback_nonce_consume(self, nonce: str) -> bool:
+        """R47 P1-a: 原子消费 nonce(UPDATE WHERE consumed_at IS NULL RETURNING)。
+
+        防止回调 URL 重放:同一 nonce 只能被消费一次。
+
+        Args:
+            nonce: 唯一 nonce 字符串
+
+        Returns:
+            True=消费成功(首次调用);False=已消费/不存在/已过期(调用方应拒绝回调)
+        """
+        if not self._db:
+            return False
+        import datetime as _dt
+        _now = _dt.datetime.now().isoformat()
+        try:
+            # 优先尝试 RETURNING 子句(SQLite 3.35+)
+            try:
+                cursor = await self._db.execute(
+                    "UPDATE callback_nonces SET consumed_at = ? "
+                    "WHERE nonce = ? AND consumed_at IS NULL "
+                    "RETURNING nonce",
+                    (_now, nonce),
+                )
+                row = await cursor.fetchone()
+                await self._db.commit()
+                return row is not None
+            except Exception:
+                # RETURNING 不可用,fallback 到 rowcount 检查
+                pass
+            cursor = await self._db.execute(
+                "UPDATE callback_nonces SET consumed_at = ? "
+                "WHERE nonce = ? AND consumed_at IS NULL",
+                (_now, nonce),
+            )
+            _affected = cursor.rowcount or 0
+            await self._db.commit()
+            return _affected > 0
+        except Exception as e:
+            logger.error(f"[CacheStore] callback_nonce_consume 失败: {e}")
+            return False
+
+    async def callback_nonce_exists(self, nonce: str) -> bool:
+        """R47 P1-a: 检查 nonce 是否存在(无论是否已消费)。
+
+        Args:
+            nonce: 唯一 nonce 字符串
+
+        Returns:
+            True=存在;False=不存在
+        """
+        if not self._db:
+            return False
+        try:
+            cursor = await self._db.execute(
+                "SELECT 1 FROM callback_nonces WHERE nonce = ? LIMIT 1",
+                (nonce,),
+            )
+            row = await cursor.fetchone()
+            return row is not None
+        except Exception as e:
+            logger.error(f"[CacheStore] callback_nonce_exists 失败: {e}")
+            return False
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────

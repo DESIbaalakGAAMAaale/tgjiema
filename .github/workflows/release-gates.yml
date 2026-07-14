@@ -22,29 +22,28 @@ name: Release Gates
 #   9. trivy                    — trivy 文件系统扫描(失败仅警告)
 #   10. sign-image              — cosign 镜像签名(占位)
 #
-# branch protection 必需 context:
-#   - release-gates / docker-build
-#   - release-gates / docker-digest-verify
-#   - release-gates / compose-config
-#   - release-gates / redis-acl-matrix
-#   - release-gates / schema-diff
-#   - release-gates / backup-restore-drill
-#   - release-gates / sbom
-# (sign-image / verify-branch-protection 因 continue-on-error 不强制 required;
-#  pip-audit / trivy 在 R43 P0-2 升级为阻断式,必须通过)
+# branch protection 必需 context (R47 P0-1/P0-2 整改后统一为 4 个核心 context):
+#   - CI
+#   - Deploy Check
+#   - Release Gates
+#   - E2E
+# R47 P0-1/P0-2: 所有 job 阻断式,无 continue-on-error,无 `|| true` 兜底;
+#                 verify-branch-protection 严格断言所有 BP 属性(strict /
+#                 enforce_admins / review>=1 / allow_force_pushes=false /
+#                 allow_deletions=false)并逐个断言 contexts 集合
 #
 # 配置命令(管理员 PAT):
 #   gh api repos/:owner/:repo/branches/master/protection -X PUT \
 #     -f required_status_checks[strict]=true \
-#     -f required_status_checks[contexts][]="release-gates / docker-build" \
-#     -f required_status_checks[contexts][]="release-gates / docker-digest-verify" \
-#     -f required_status_checks[contexts][]="release-gates / compose-config" \
-#     -f required_status_checks[contexts][]="release-gates / redis-acl-matrix" \
-#     -f required_status_checks[contexts][]="release-gates / schema-diff" \
-#     -f required_status_checks[contexts][]="release-gates / backup-restore-drill" \
-#     -f required_status_checks[contexts][]="release-gates / sbom" \
+#     -f required_status_checks[contexts][]=CI \
+#     -f required_status_checks[contexts][]="Deploy Check" \
+#     -f required_status_checks[contexts][]="Release Gates" \
+#     -f required_status_checks[contexts][]=E2E \
 #     -f enforce_admins=true \
-#     -f required_pull_request_reviews[required_approving_review_count]=1
+#     -f required_pull_request_reviews[required_approving_review_count]=1 \
+#     -f allow_force_pushes=false \
+#     -f allow_deletions=false
+# 或直接运行: bash scripts/configure_branch_protection.sh
 
 on:
   push:
@@ -388,27 +387,94 @@ jobs:
           tgjiema-${{ github.sha }}.sig
         retention-days: 90
 
-  # ─── R44: branch protection 审计 ─────────────────────────────
+  # ─── R44/R46/R47: branch protection 审计 ─────────────────────
   # 验证 master 分支已配置 branch protection(必需 status checks + PR review)
+  # R47 P0-1/P0-2: 严格断言所有 BP 属性,不允许 continue-on-error,
+  #                不允许 `|| true` 兜底,失败必须阻断并输出当前配置供调试
   verify-branch-protection:
     runs-on: ubuntu-latest
-    # R46 P0-5: 删除 continue-on-error,branch protection 未配置必须阻断
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
     - name: Verify branch protection is configured
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # R46 P0-5: gh api 非零立即失败,不吞错误
-        RESPONSE=$(gh api repos/${{ github.repository }}/branches/master/protection)
-        if echo "$RESPONSE" | grep -q "Branch not protected"; then
-          echo "::error::Branch protection 未配置,请运行 scripts/configure_branch_protection.sh"
+        # R47 P0-2: 严格断言所有 Branch Protection 属性,任何失败必须阻断
+        set -euo pipefail
+
+        # R47 整改后统一要求的 4 个核心 status check context
+        REQUIRED_CONTEXTS=("CI" "Deploy Check" "Release Gates" "E2E")
+
+        # 1. 拉取 branch protection 配置(gh api 失败立即捕获,不吞错误)
+        if ! RESPONSE=$(gh api "repos/${{ github.repository }}/branches/master/protection" 2>&1); then
+          echo "::error::无法获取 branch protection 配置(可能未配置或 token 权限不足)"
+          echo "::error::gh api 输出: $RESPONSE"
+          echo ""
+          echo "Branch Protection 未正确配置,请运行:"
+          echo "  bash scripts/configure_branch_protection.sh"
+          echo "或手动执行:"
+          echo "  gh api repos/${{ github.repository }}/branches/master/protection -X PUT \\"
+          echo "    -f required_status_checks[strict]=true \\"
+          echo "    -f required_status_checks[contexts][]=CI \\"
+          echo "    -f required_status_checks[contexts][]=\"Deploy Check\" \\"
+          echo "    -f required_status_checks[contexts][]=\"Release Gates\" \\"
+          echo "    -f required_status_checks[contexts][]=E2E \\"
+          echo "    -f enforce_admins=true \\"
+          echo "    -f required_pull_request_reviews[required_approving_review_count]=1 \\"
+          echo "    -f allow_force_pushes=false \\"
+          echo "    -f allow_deletions=false"
           exit 1
         fi
-        echo "Branch protection 已配置"
-        # R46 P0-5: 使用 jq -e 验证关键字段
-        echo "$RESPONSE" | jq -e '.required_status_checks.contexts'
-        echo "$RESPONSE" | jq -e '.required_pull_request_reviews.required_approving_review_count // 0'
-        echo "$RESPONSE" | jq -e '.enforce_admins.enabled'
-        echo "$RESPONSE" | jq -e '.allow_force_pushes.enabled' | grep -q 'false'
-        echo "Branch protection 验证通过"
+
+        # 2. 检查是否未配置(Branch not protected 错误响应)
+        if echo "$RESPONSE" | grep -q "Branch not protected"; then
+          echo "::error::Branch protection 未配置"
+          echo ""
+          echo "Branch Protection 未正确配置,请运行:"
+          echo "  bash scripts/configure_branch_protection.sh"
+          exit 1
+        fi
+
+        BP_JSON="$RESPONSE"
+
+        # 3. 输出当前配置供调试(R47 P0-2 要求失败时输出 JSON)
+        echo "=== 当前 Branch Protection 配置 ==="
+        echo "$BP_JSON" | jq '.'
+        echo "==================================="
+
+        # 4. R47 P0-2: 严格断言所有必需属性
+        # 4.1 strict=true (status check 必须针对最新提交)
+        echo "Assert: required_status_checks.strict == true"
+        echo "$BP_JSON" | jq -e '.required_status_checks.strict == true' > /dev/null \
+          || { echo "::error::required_status_checks.strict != true"; exit 1; }
+
+        # 4.2 enforce_admins=true (管理员也受规则约束)
+        echo "Assert: enforce_admins.enabled == true"
+        echo "$BP_JSON" | jq -e '.enforce_admins.enabled == true' > /dev/null \
+          || { echo "::error::enforce_admins.enabled != true"; exit 1; }
+
+        # 4.3 至少 1 个 approving review (R47 P0-2: 必须 >= 1)
+        echo "Assert: required_approving_review_count >= 1"
+        echo "$BP_JSON" | jq -e '.required_pull_request_reviews.required_approving_review_count >= 1' > /dev/null \
+          || { echo "::error::required_approving_review_count < 1"; exit 1; }
+
+        # 4.4 allow_force_pushes=false (禁止 force push)
+        echo "Assert: allow_force_pushes.enabled == false"
+        echo "$BP_JSON" | jq -e '.allow_force_pushes.enabled == false' > /dev/null \
+          || { echo "::error::allow_force_pushes.enabled != false"; exit 1; }
+
+        # 4.5 allow_deletions=false (禁止删除分支)
+        echo "Assert: allow_deletions.enabled == false"
+        echo "$BP_JSON" | jq -e '.allow_deletions.enabled == false' > /dev/null \
+          || { echo "::error::allow_deletions.enabled != false"; exit 1; }
+
+        # 5. R47 P0-2: 逐个断言必需 context 必须存在于 required_status_checks.contexts
+        for ctx in "${REQUIRED_CONTEXTS[@]}"; do
+          echo "Assert: required context '$ctx' present"
+          echo "$BP_JSON" | jq -e --arg ctx "$ctx" \
+            '.required_status_checks.contexts | index($ctx) != null' > /dev/null \
+            || { echo "::error::required context '$ctx' missing"; exit 1; }
+        done
+
+        echo ""
+        echo "✓ Branch protection 验证通过,所有 R47 P0-2 断言均满足"

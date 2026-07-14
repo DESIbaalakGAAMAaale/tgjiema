@@ -1,0 +1,15 @@
+{
+  "_description": "R47 P1-d: 模块化 i18n 硬编码字符串 baseline(逐模块下降门禁,清零目标 0)",
+  "_note": "由 --generate-baseline / --ratchet 维护;total 只允许非增加(下降或持平)。原 R44 baseline 954 仅覆盖 bots/+admin;纳入 services/ 后真实基线见 total。",
+  "_original_r44_baseline": 954,
+  "bots/up_bot.py": 46,
+  "bots/idx_bot.py": 97,
+  "bots/dsp_bot.py": 28,
+  "bots/mon_bot.py": 26,
+  "bots/admin_bot/": 425,
+  "admin/": 24,
+  "admin/templates/": 309,
+  "admin/static/": 0,
+  "services/": 309,
+  "total": 1264
+}

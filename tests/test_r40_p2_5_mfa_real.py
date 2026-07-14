@@ -167,6 +167,8 @@ def _make_mock_cache_store():
     store = MagicMock()
     store._db = MagicMock()  # 非 None,通过 `if not store._db` 检查
     kv_data = {}
+    # R47 P1-b: 跟踪已消费的 (principal_id, timestep) 对,模拟 UNIQUE 约束
+    used_totp_set: set[tuple[int, int]] = set()
 
     async def _get_kv(key):
         return kv_data.get(key)
@@ -180,6 +182,20 @@ def _make_mock_cache_store():
             if len(params) >= 1:
                 key_to_delete = params[0]
                 kv_data.pop(key_to_delete, None)
+        # R47 P1-b: 处理 INSERT OR IGNORE INTO mfa_used_totp(原子消费 timestep)
+        # rowcount=1 → 首次插入;rowcount=0 → UNIQUE 冲突(重放)
+        if isinstance(sql, str) and "INSERT OR IGNORE INTO mfa_used_totp" in sql:
+            cursor = MagicMock()
+            if len(params) >= 2:
+                pair = (params[0], params[1])
+                if pair not in used_totp_set:
+                    used_totp_set.add(pair)
+                    cursor.rowcount = 1  # 首次插入成功
+                else:
+                    cursor.rowcount = 0  # UNIQUE 冲突(重放)
+            else:
+                cursor.rowcount = 1
+            return cursor
         # R46 P1: 处理 mfa_used_totp / mfa_failures 表查询
         # SELECT 1 FROM mfa_used_totp WHERE principal_id = ? AND timestep = ? → 返回空结果(无重放)
         if isinstance(sql, str) and "SELECT 1 FROM mfa_used_totp" in sql:

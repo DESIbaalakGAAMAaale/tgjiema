@@ -329,6 +329,44 @@ async def _create_outbox_entry_strict(
 # - 媒体组要有 group-level aggregate,禁止只按单文件状态判断 READY
 
 
+async def _append_audit_log_for_unregistered_failure(
+    upload_id: str,
+    file_unique_id: str,
+    channel_id: int,
+    message_id: int,
+    reason: str,
+    error: str,
+) -> None:
+    """R47 P1-E: 将 unregistered_copies 持久化失败写入 audit_log。
+
+    当 copy 成功但 unregistered_copies 写入失败时,数据可能遗失
+    (无 reconciled 行可供启动扫描发现),需写 audit_log 供运维人工 reconcile。
+    """
+    store = get_cache_store()
+    if not store or not store._db:
+        return
+    from datetime import datetime as _dt
+    now_iso = _dt.utcnow().isoformat()
+    details = _json_dumps({
+        "upload_id": upload_id,
+        "file_unique_id": file_unique_id,
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "reason": reason,
+        "error": error,
+        "action": "unregistered_copy_persist_failed",
+    })
+    await store._db.execute(
+        "INSERT INTO audit_log (actor_id, actor_type, action, target_type, "
+        "target_id, details, ip_addr, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (0, "system", "unregistered_copy_persist_failed",
+         "unregistered_copy", f"{upload_id}:{file_unique_id}",
+         details, "", now_iso),
+    )
+    await store._db.commit()
+
+
 async def _mark_copied_unregistered(
     upload_id: str,
     media_group_id: str,
@@ -336,7 +374,7 @@ async def _mark_copied_unregistered(
     message_id: int,
     channel_id: int,
     reason: str = "",
-) -> None:
+) -> str:
     """R45/R46 P0-3: 记录 Telegram copy 成功但 outbox 写失败的情况(COPIED_UNREGISTERED)。
 
     R46 P0-3 整改:
@@ -345,6 +383,12 @@ async def _mark_copied_unregistered(
         优先补 Manifest 而非重新 copy。
       - Manifest outbox 成功后调用 mark_unregistered_copy_reconciled() 标记完成。
 
+    R47 P1-E 整改(Up Bot 终审报告 17 节):
+      - 持久化失败时不静默吞异常,改为 fail-closed:
+        - 写入 audit_log(供运维感知 + 人工 reconcile,因启动扫描无法发现此行)
+        - 返回 "partial_success" 让上层决定是否重试/reconcile
+      - 不允许静默失败 — copy 成功但 unregistered record 写入失败时必须可感知
+
     Args:
         upload_id: 上传会话 ID
         media_group_id: 媒体组 ID(单文件时可用 file_unique_id 代替)
@@ -352,6 +396,11 @@ async def _mark_copied_unregistered(
         message_id: Telegram copy 成功返回的存储频道消息 ID
         channel_id: 存储频道 ID
         reason: 失败原因(如 "outbox_write_failed")
+
+    Returns:
+        "persisted": 内存 + SQLite 均成功
+        "partial_success": 仅内存成功,SQLite 持久化失败(已写 audit_log,
+                          下次启动扫描无法发现此行 — 需运维通过 audit_log 人工处理)
     """
     if not media_group_id:
         media_group_id = file_unique_id or upload_id
@@ -375,6 +424,9 @@ async def _mark_copied_unregistered(
         "marked_at": time.time(),
     }
     # 2. R46 P0-3: 写入持久表 unregistered_copies
+    # R47 P1-E: 持久化失败时 fail-closed(写 audit_log + 返回 partial_success)
+    persist_ok = True
+    persist_err: Exception | None = None
     try:
         from database.cache_store import get_cache_store
         store = get_cache_store()
@@ -387,15 +439,40 @@ async def _mark_copied_unregistered(
                 media_group_id=media_group_id,
                 reason=reason,
             )
-    except Exception as persist_err:
+        else:
+            persist_ok = False
+            persist_err = RuntimeError("cache_store or _db not initialized")
+    except Exception as err:
+        persist_ok = False
+        persist_err = err
+
+    if not persist_ok:
+        # R47 P1-E: fail-closed — 持久化失败不静默
+        # 写入 audit_log(供运维感知 + 人工 reconcile,因启动扫描无法发现此行)
+        try:
+            await _append_audit_log_for_unregistered_failure(
+                upload_id=upload_id,
+                file_unique_id=file_unique_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                reason=reason,
+                error=str(persist_err),
+            )
+        except Exception as audit_err:
+            logger.error(
+                f"[Up][R47] audit_log 写入也失败(双故障,需人工检查): {audit_err}"
+            )
         logger.error(
-            f"[Up][R46] unregistered_copies 持久化失败(仅内存): {persist_err}"
+            f"[Up][R47] unregistered_copies 持久化失败(partial_success,已写 audit_log): "
+            f"upload_id={upload_id} fuid={file_unique_id} "
+            f"ch={channel_id} msg_id={message_id}: {persist_err}"
         )
     logger.warning(
         f"[Up][R46] COPIED_UNREGISTERED: upload_id={upload_id} "
         f"mg={media_group_id} fuid={file_unique_id} "
         f"msg_id={message_id} ch={channel_id} reason={reason}"
     )
+    return "persisted" if persist_ok else "partial_success"
 
 
 def _evaluate_media_group_state(media_group_id: str) -> str:
@@ -576,13 +653,26 @@ async def _enrich_file_meta_for_replica(
     return enriched
 
 
-async def _register_manifest(channel_id: int, message_id: int, msg, media_type: str = "", file_unique_id_override: str = "", media_group_id: str = ""):
+async def _register_manifest(channel_id: int, message_id: int, msg, media_type: str = "", file_unique_id_override: str = "", media_group_id: str = "", upload_id_override: str = ""):
     """写入 Active 频道后登记 manifest。
 
-    R46 P1 整改:
-      - 异常不再被静默吞掉,改为记录 COPIED_UNREGISTERED 持久化状态,
-        使后续恢复流程可重新注册 Manifest 而不需重新 copy。
-      - 保留 try/except 防止主流程崩溃,但确保状态被持久化。
+    R47 P1-E 整改(Up Bot 终审报告 17 节):
+      - 删除吞异常兼容路径,异常向上传播让上层处理。
+      - 不允许静默失败 — Manifest 写入失败时 raise,由调用方决定
+        是否记录到 unregistered_copies 错误字段或触发重试。
+      - 启动扫描 _reconcile_unregistered_copies() 依赖此方法抛异常
+        以决定是否标记 reconciled(失败则不标记,下次启动重试)。
+      - 删除的旧逻辑:外层 try/except 捕获后调用 _mark_copied_unregistered
+        记录 COPIED_UNREGISTERED(吞异常),以及 mark_unregistered_copy_reconciled
+        的 `except Exception: pass` 静默吞异常。
+
+    R47 P1-E 修复:新增 upload_id_override 参数。
+      - 旧版 `mark_unregistered_copy_reconciled(upload_id=mgid or fuid, ...)` 在
+        media_group_id 为空且 upload_id != fuid 时无法匹配持久化行的 PK,
+        导致 reconciled_at 永不更新(行持续出现在未对账列表,启动扫描重复补写)。
+      - 新版:启动扫描 _reconcile_unregistered_copies 从持久化行读取真实 upload_id
+        并通过 upload_id_override 传入,确保 PK 精确匹配。
+      - 旧调用方不传此参数时,fallback 为 `mgid or fuid`(保持向后兼容)。
 
     Args:
         channel_id: 存储频道 ID
@@ -592,6 +682,13 @@ async def _register_manifest(channel_id: int, message_id: int, msg, media_type: 
         file_unique_id_override: 直接提供 file_unique_id(优先于 msg 提取,用于 copy_messages 返回 MessageId 无 fuid 的场景)
         media_group_id: 媒体组分组键(空串表示独立文件)。mon_bot 据此避免跨批次拆散相册。
                        可传源 media_group_id 或 send_media_group 返回的 media_group_id。
+        upload_id_override: 显式提供 upload_id(优先于 mgid/fuid fallback),
+                            用于精确匹配 unregistered_copies 表 PK。
+                            启动扫描必须传入,否则 PK 不匹配会导致行永不 reconciled。
+
+    Raises:
+        RuntimeError: 频道未映射到 group_id(_channel_to_group 映射未刷新)
+        Exception: upsert_manifest / mark_unregistered_copy_reconciled 失败时向上传播
     """
     fuid = file_unique_id_override or (_extract_file_unique_id(msg) if msg else "")
     if not fuid:
@@ -600,41 +697,104 @@ async def _register_manifest(channel_id: int, message_id: int, msg, media_type: 
     mgid = media_group_id or ""
     if not mgid and msg is not None:
         mgid = getattr(msg, "media_group_id", "") or ""
-    try:
-        await _ensure_channel_group_map()
-        group_id = _channel_to_group.get(channel_id)
-        if group_id is None:
-            logger.warning(f"[Up] 无法解析频道 {channel_id} 的 group_id,跳过 manifest 登记")
-            return
-        store = get_cache_store()
-        await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type, mgid)
-        # R46 P0-3: Manifest 成功后标记 unregistered_copies reconciled
-        try:
-            await store.mark_unregistered_copy_reconciled(
-                upload_id=mgid or fuid,
-                file_unique_id=fuid,
-                channel_id=channel_id,
-                message_id=message_id,
-            )
-        except Exception:
-            pass  # reconciled 标记失败不影响主流程
-    except Exception as e:
-        logger.error(
-            f"[Up][R46] 登记 manifest 失败,记录 COPIED_UNREGISTERED "
-            f"(channel={channel_id}, msg_id={message_id}, fuid={fuid}): {e}"
+    # R47 P1-E: 删除吞异常兼容路径 — 异常向上传播让上层处理(不静默失败)
+    await _ensure_channel_group_map()
+    group_id = _channel_to_group.get(channel_id)
+    if group_id is None:
+        raise RuntimeError(
+            f"无法解析频道 {channel_id} 的 group_id(可能 _channel_to_group 映射未刷新)"
         )
-        # R46 P0-3: 持久化 COPIED_UNREGISTERED 状态,启动时可恢复
+    store = get_cache_store()
+    await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type, mgid)
+    # R47 P1-E: Manifest 成功后标记 unregistered_copies reconciled
+    # 异常向上传播(不吞异常) — 调用方可知 reconciled 标记是否成功,
+    # 失败时下次启动扫描会发现行仍存在并重试(manifest upsert 幂等)
+    # R47 P1-E 修复:优先使用 upload_id_override 精确匹配持久化行 PK,
+    # fallback 为 mgid 或 fuid(向后兼容旧调用方)
+    await store.mark_unregistered_copy_reconciled(
+        upload_id=upload_id_override or mgid or fuid,
+        file_unique_id=fuid,
+        channel_id=channel_id,
+        message_id=message_id,
+    )
+
+
+async def _reconcile_unregistered_copies() -> dict:
+    """R47 P1-E: 启动扫描 — 实际补写 Manifest 并标记 reconciled。
+
+    扫描 unregistered_copies 表中所有未对账(reconciled_at IS NULL)行,
+    对每行调用 _register_manifest 补写 Manifest,成功后由 _register_manifest
+    内部调用 mark_unregistered_copy_reconciled 标记完成。
+    失败的行不标记,下次启动重试(_register_manifest 抛异常时不捕获,
+    仅记录错误日志,继续处理下一行)。
+
+    与旧版"只 list 不补写"的区别:
+      - 旧版:仅调用 list_unreconciled_copies() 列出未对账行,不实际补写 Manifest
+      - 新版:对每行实际调用 _register_manifest 补写 Manifest,并标记 reconciled
+
+    Returns:
+        统计字典 {"total": N, "reconciled": M, "failed": K}
+    """
+    store = get_cache_store()
+    if not store or not store._db:
+        logger.warning("[Up][R47] 启动扫描: cache_store 未就绪,跳过")
+        return {"total": 0, "reconciled": 0, "failed": 0}
+    try:
+        copies = await store.list_unreconciled_copies(limit=500)
+    except Exception as e:
+        logger.error(f"[Up][R47] 启动扫描 list_unreconciled_copies 失败: {e}")
+        return {"total": 0, "reconciled": 0, "failed": 0}
+    total = len(copies)
+    if total == 0:
+        logger.info("[Up][R47] 启动扫描: 无未对账副本")
+        return {"total": 0, "reconciled": 0, "failed": 0}
+    reconciled = 0
+    failed = 0
+    logger.info(f"[Up][R47] 启动扫描: 发现 {total} 条未对账副本,开始补写 Manifest")
+    for cp in copies:
+        upload_id = cp.get("upload_id", "") or ""
+        fuid = cp.get("file_unique_id", "") or ""
+        mgid = cp.get("media_group_id") or ""
         try:
-            await _mark_copied_unregistered(
-                upload_id=mgid or fuid,
-                media_group_id=mgid,
-                file_unique_id=fuid,
-                message_id=message_id,
+            channel_id = int(cp.get("channel_id", 0) or 0)
+            message_id = int(cp.get("message_id", 0) or 0)
+        except (ValueError, TypeError):
+            logger.warning(f"[Up][R47] 跳过无效行(channel/message 非数字): {cp}")
+            failed += 1
+            continue
+        if not fuid or not channel_id or not message_id:
+            logger.warning(f"[Up][R47] 跳过无效行(关键字段缺失): {cp}")
+            failed += 1
+            continue
+        try:
+            # R47 P1-E: 实际补写 Manifest(_register_manifest 不吞异常,失败则 raise)
+            # msg=None,file_unique_id_override/media_group_id/upload_id_override 从持久化行读取
+            # upload_id_override 必须传入:持久化行 PK 使用真实 upload_id(如 "r47-001"),
+            # 若 fallback 为 mgid 或 fuid 将导致 PK 不匹配、reconciled_at 永不更新
+            await _register_manifest(
                 channel_id=channel_id,
-                reason=f"manifest_register_failed: {type(e).__name__}: {e}",
+                message_id=message_id,
+                msg=None,
+                media_type="",  # unregistered_copies 未存储 media_type,留空
+                file_unique_id_override=fuid,
+                media_group_id=mgid,
+                upload_id_override=upload_id,
             )
-        except Exception as mark_err:
-            logger.error(f"[Up][R46] _mark_copied_unregistered 也失败: {mark_err}")
+            reconciled += 1
+            logger.info(
+                f"[Up][R47] 补写 Manifest 成功并标记 reconciled: "
+                f"fuid={fuid} ch={channel_id} msg_id={message_id}"
+            )
+        except Exception as e:
+            failed += 1
+            logger.error(
+                f"[Up][R47] 补写 Manifest 失败(不标记 reconciled,下次启动重试): "
+                f"fuid={fuid} ch={channel_id} msg_id={message_id}: {e}"
+            )
+    logger.info(
+        f"[Up][R47] 启动扫描完成: total={total} reconciled={reconciled} failed={failed}"
+    )
+    return {"total": total, "reconciled": reconciled, "failed": failed}
 
 
 async def _check_dedup(target_channel: int, msg) -> dict | None:
@@ -2666,6 +2826,15 @@ async def _init():
     from database import init_db
     await init_db()
     await _refresh_active_slots()
+    # R47 P1-E: 启动扫描 — 补写未对账副本的 Manifest(实际补写,不只是 list)
+    # 扫描 unregistered_copies 表,对每条未对账行调用 _register_manifest 补写 Manifest,
+    # 成功后标记 reconciled;失败则不标记,下次启动重试
+    try:
+        stats = await _reconcile_unregistered_copies()
+        if stats.get("total", 0) > 0:
+            logger.info(f"[Up][R47] 启动扫描统计: {stats}")
+    except Exception as e:
+        logger.error(f"[Up][R47] 启动扫描异常(不阻塞启动): {e}")
 
 
 async def _async_main():

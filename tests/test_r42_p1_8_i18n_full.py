@@ -494,6 +494,9 @@ class TestVerifyI18nKeys:
         )
         mod = _load_verify_module()
         monkeypatch.setattr(mod, "LOCALES_DIR", locales_dir)
+        # R47 P1-c: step 7 校验 ErrorCodes message_key,测试 fixture 无完整 key,
+        # mock 为空列表避免干扰基础 key 一致性校验
+        monkeypatch.setattr(mod, "_verify_error_code_message_keys", lambda zh, en: [])
         assert mod.verify() == 0
 
     def test_exits_1_when_zh_cn_missing_key(self, tmp_path, monkeypatch):

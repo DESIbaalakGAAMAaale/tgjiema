@@ -2,6 +2,7 @@ name: E2E Tests
 
 # R44: 端到端测试(Playwright),SHA pin 所有 actions 引用避免供应链漂移
 # R46 P0-6: 增加 push 触发 + 并发控制 + 超时
+# R47 P0-3: 修复 Playwright 环境 + Admin bootstrap + 临时 SQLite + readiness 检查
 
 on:
   push:
@@ -18,6 +19,25 @@ jobs:
   playwright-e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # R47 P0-3: 测试环境变量(每个 run 独立,不污染)
+      ENVIRONMENT: test
+      DATABASE_URL: sqlite:///tmp/e2e_${{ github.run_id }}.db
+      BOT_TOKEN: test_token
+      ADMIN_BOOTSTRAP_PASSWORD: test_bootstrap_pw
+      SECRET_KEY: test_secret_key_for_e2e_only
+      # Admin 凭证配置(SERVICE_ROLE=admin 跳过其他 Bot Token 校验)
+      ADMIN_USERNAME: admin
+      ADMIN_PRINCIPAL_ID: "1"
+      ADMIN_PRINCIPAL_USERNAME: admin
+      ADMIN_PRINCIPAL_BOOTSTRAP_ROLES: super_admin
+      SERVICE_ROLE: admin
+      CSRF_COOKIE_SECURE: "false"
+      BREAK_GLASS_PASSWORD: test_bootstrap_pw
+      ADMIN_WEB_HOST: "127.0.0.1"
+      ADMIN_WEB_PORT: "8080"
+      # Playwright 测试用登录密码(明文,对应 ADMIN_PASSWORD 哈希前的值)
+      ADMIN_TEST_PASSWORD: test_bootstrap_pw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -40,14 +60,67 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
+      # R47 P0-3: 生成 ADMIN_PASSWORD 的 PBKDF2 哈希(与 admin._verify_password 兼容)
+      # 不导入项目代码,避免 Settings 校验;仅用标准库生成哈希
+      - name: Generate admin password hash
+        run: |
+          HASH=$(python -c "
+          import hashlib, secrets
+          salt = secrets.token_bytes(16)
+          h = hashlib.pbkdf2_hmac('sha256', b'test_bootstrap_pw', salt, 200000)
+          print(f'\$pbkdf2-sha256\$200000\${salt.hex()}\${h.hex()}')
+          ")
+          echo "ADMIN_PASSWORD=$HASH" >> "$GITHUB_ENV"
+
+      # R47 P0-3: 初始化临时 SQLite + bootstrap admin principal
+      # 必须在 Web 服务启动前完成,否则 startup 的 ensure_readiness_or_exit 会退出
+      - name: Bootstrap admin principal
+        run: |
+          python -c "
+          import asyncio, os
+          from database.cache_store import get_cache_store
+          from admin import bootstrap_admin_principal
+
+          async def main():
+              store = get_cache_store()
+              await store.init()
+              ok = await bootstrap_admin_principal()
+              if not ok:
+                  raise RuntimeError('bootstrap_admin_principal 失败')
+              print(f'[E2E bootstrap] OK: principal_id={os.environ.get(\"ADMIN_PRINCIPAL_ID\")} db={os.environ.get(\"DATABASE_URL\")}')
+              await store.close()
+
+          asyncio.run(main())
+          "
+
+      # R47 P0-3: 运行 Playwright E2E 测试
+      # webServer(在 playwright.config.ts 中定义)会自动启动 admin 服务并轮询 /readiness
       - name: Run Playwright E2E tests
         run: |
           cd tests/e2e
           npx playwright test
 
+      # R47 P0-3: 失败时保留 trace、video、screenshot、axe JSON artifact
       - name: Upload Playwright report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: playwright-report
           path: tests/e2e/playwright-report/
+
+      - name: Upload Playwright test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: playwright-test-results
+          path: |
+            tests/e2e/test-results/
+            tests/e2e/e2e-results/
+
+      - name: Upload axe accessibility reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: axe-accessibility-reports
+          path: tests/e2e/e2e-results/axe-*.json
+          if-no-files-found: warn

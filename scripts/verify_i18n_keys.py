@@ -141,7 +141,11 @@ def verify() -> int:
             f"en-US 空翻译 key(共 {len(en_empty)} 个): {en_empty}"
         )
 
-    # 7. 输出结果
+    # 7. R47 P1-c: 校验所有 ErrorCodes 的 message_key 都在 locale 文件中
+    error_code_errors = _verify_error_code_message_keys(zh_keys, en_keys)
+    errors.extend(error_code_errors)
+
+    # 8. 输出结果
     if errors:
         print("[FAIL] i18n key 校验失败:")
         for e in errors:
@@ -154,6 +158,64 @@ def verify() -> int:
         f"两文件 key 集合完全一致且无空翻译)"
     )
     return 0
+
+
+def _verify_error_code_message_keys(zh_keys: set[str], en_keys: set[str]) -> list[str]:
+    """R47 P1-c: 校验所有 ErrorCodes.message_key 都在 zh-CN 和 en-US locale 文件中。
+
+    从 services.error_codes 模块导入 ErrorRegistry,获取所有已注册的 message_key,
+    检查每个 key 是否同时存在于 zh_keys 和 en_keys 集合中。
+
+    Args:
+        zh_keys: zh-CN.json 扁平化后的 key 集合
+        en_keys: en-US.json 扁平化后的 key 集合
+
+    Returns:
+        错误消息列表(空列表表示通过)
+    """
+    errors: list[str] = []
+    try:
+        # 添加项目根到 sys.path(确保能 import services.error_codes)
+        import sys
+        repo_root = Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from services.error_codes import ErrorRegistry
+    except Exception as e:
+        errors.append(
+            f"R47 P1-c: 无法导入 services.error_codes.ErrorRegistry: {e}"
+        )
+        return errors
+
+    try:
+        all_message_keys = ErrorRegistry.all_message_keys()
+    except Exception as e:
+        errors.append(
+            f"R47 P1-c: ErrorRegistry.all_message_keys() 调用失败: {e}"
+        )
+        return errors
+
+    if not all_message_keys:
+        errors.append(
+            "R47 P1-c: ErrorRegistry 中未注册任何 message_key"
+            "(应至少包含 ErrorCodes.ERROR_INTERNAL 的 message_key)"
+        )
+        return errors
+
+    zh_missing = sorted(k for k in all_message_keys if k not in zh_keys)
+    en_missing = sorted(k for k in all_message_keys if k not in en_keys)
+    if zh_missing:
+        errors.append(
+            f"R47 P1-c: zh-CN.json 缺失 ErrorCodes message_key "
+            f"(共 {len(zh_missing)} 个): {zh_missing}"
+        )
+    if en_missing:
+        errors.append(
+            f"R47 P1-c: en-US.json 缺失 ErrorCodes message_key "
+            f"(共 {len(en_missing)} 个): {en_missing}"
+        )
+
+    return errors
 
 
 def main() -> None:
