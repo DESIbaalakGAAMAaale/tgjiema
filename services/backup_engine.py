@@ -65,6 +65,9 @@ from typing import Any
 
 from loguru import logger
 
+# R50 P1-1: 统一错误码协议化(替代裸字符串 ValueError)
+from services.error_codes import AppError, ErrorCodes
+
 # R44 7.2: backup/restore RU 单独统计(record_*_usage 在方法内延迟调用避免循环依赖)
 
 
@@ -909,10 +912,12 @@ class BackupEngine:
                     ),
                 }
             if not approval_action_id:
-                # R42 P1-3: approver_id 已提供但 approval_action_id 缺失 → 强制 ValueError
+                # R42 P1-3: approver_id 已提供但 approval_action_id 缺失 → 强制 AppError
                 # 公共 API 拒绝直接执行 production restore,必须走审批流
-                raise ValueError(
-                    "Production restore requires approval_action_id"
+                # R50 P1-1: 协议化为 BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED,
+                    params={"backup_id": backup_id},
                 )
             # R44 G0-3: 若 approver_id 未传(None),从 command_executions.principal_id 反查
             effective_approver_id = approver_id

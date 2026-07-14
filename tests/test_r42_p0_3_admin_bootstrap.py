@@ -42,6 +42,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import pytest_asyncio
 
+from services.error_codes import AppError, ErrorCodes
+
 # 延迟导入,确保 conftest 已注入 fake config
 from database import cache_store as _cs_module
 from database.cache_store import CacheStore
@@ -368,10 +370,11 @@ class TestVerifyAdminBootstrap:
 
     @pytest.mark.asyncio
     async def test_require_readiness_raises_runtime_error_on_failure(self, real_store):
-        """用例 12: require_readiness 在 verify 失败时抛 RuntimeError。"""
+        """用例 12: require_readiness 在 verify 失败时抛 AppError(ADMIN_BOOTSTRAP_NOT_VERIFIED)。"""
         from admin import require_readiness
-        with pytest.raises(RuntimeError, match="admin bootstrap not verified"):
+        with pytest.raises(AppError) as exc_info:
             await require_readiness()
+        assert exc_info.value.envelope.code == ErrorCodes.ADMIN_BOOTSTRAP_NOT_VERIFIED
 
     @pytest.mark.asyncio
     async def test_require_readiness_passes_when_bootstrap_done(

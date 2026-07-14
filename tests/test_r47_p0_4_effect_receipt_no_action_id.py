@@ -367,7 +367,12 @@ class TestRequestHashBinding:
     async def test_check_receipt_hash_mismatch_returns_none(
         self, receipt_manager, clean_tables,
     ):
-        """check_receipt: request_hash 不匹配 → 返回 None(不视为 completed)。"""
+        """check_receipt: request_hash 不匹配 → 返回 hash_mismatch 标记(不视为 completed)。
+
+        R50 P0-3 行为变更:hash mismatch 不再返回 None,而是返回特殊标记 dict
+        `{"status": "hash_mismatch", ...}` 并将 DB 中 reconcile_status 标记为
+        'hash_mismatch_needs_reconcile'(进入 DLQ,防止调用方重试外部副作用)。
+        """
         from services.effect_receipts import compute_effect_request_hash
 
         store = clean_tables
@@ -396,7 +401,14 @@ class TestRequestHashBinding:
         result_mismatch = await receipt_manager.check_receipt(
             action_id, effect_type, target, expected_request_hash=hash_b,
         )
-        assert result_mismatch is None, "request_hash 不匹配应返回 None"
+        # R50 P0-3: hash mismatch 返回特殊标记 dict(不是 None,也不是 completed)
+        assert result_mismatch is not None, "hash mismatch 应返回特殊标记 dict,不是 None"
+        assert result_mismatch.get("status") == "hash_mismatch", (
+            "request_hash 不匹配应返回 status='hash_mismatch'"
+        )
+        assert result_mismatch.get("reconcile_status") == "hash_mismatch_needs_reconcile", (
+            "hash mismatch 应标记为 hash_mismatch_needs_reconcile(进入 DLQ)"
+        )
 
     @pytest.mark.asyncio
     async def test_check_receipt_no_expected_hash_skips_validation(
@@ -482,8 +494,13 @@ class TestRequestHashBinding:
     async def test_context_params_mismatch_does_not_skip(
         self, receipt_manager, clean_tables,
     ):
-        """EffectReceiptContext: 同 action_id 不同 params → 不跳过(重新执行)。"""
+        """EffectReceiptContext: 同 action_id 不同 params → hash mismatch raise(进入 DLQ)。
+
+        R50 P0-3: hash mismatch 不再静默跳过或重新执行,而是标记 hash_mismatch_needs_reconcile
+        并 raise EffectReceiptError,防止外部副作用被错误重放(防篡改拒绝)。
+        """
         from services.effect_receipts_integration import EffectReceiptContext
+        from services.effect_receipts import EffectReceiptError
 
         store = clean_tables
         action_id = "act_ctx_mismatch"
@@ -500,14 +517,16 @@ class TestRequestHashBinding:
             assert receipt.skipped is False
             receipt.set_external_id("msg_a")
 
-        # 第二次: params B → 不应跳过(request_hash 不匹配)
-        async with EffectReceiptContext(
-            action_id=action_id,
-            effect_type="telegram_send",
-            target="chat:77",
-            params=params_b,
-        ) as receipt:
-            assert receipt.skipped is False, "params 不同时不应跳过"
+        # 第二次: params B → R50 P0-3 hash mismatch 拒绝重试(raise EffectReceiptError)
+        with pytest.raises(EffectReceiptError, match="hash mismatch"):
+            async with EffectReceiptContext(
+                action_id=action_id,
+                effect_type="telegram_send",
+                target="chat:77",
+                params=params_b,
+            ) as receipt:
+                # 进入 __aenter__ 时即 raise,不会到达这里
+                assert False, "hash mismatch 应在 __aenter__ 阶段 raise"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -786,7 +805,7 @@ class TestR48CriticalEffectParamsEnforcement:
         """R48: record_pending critical effect 空 request_hash → raise ValueError。"""
         from services.effect_receipts import EffectReceiptManager
 
-        with pytest.raises(ValueError, match="request_hash 为空"):
+        with pytest.raises(ValueError, match="request_hash is empty"):
             await receipt_manager.record_pending(
                 "act_r48_6", "telegram_send", "chat:1",
                 request_hash="",  # 空 hash

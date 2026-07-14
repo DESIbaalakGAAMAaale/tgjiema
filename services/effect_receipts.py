@@ -62,6 +62,109 @@ class EffectReceiptError(Exception):
     """R46 P0-1: Effect Receipt 持久化失败,critical 副作用必须中止。"""
 
 
+def build_canonical_effect_params(
+    effect_type: str,
+    *,
+    target_user_id: Optional[int] = None,
+    target_channel_id: Optional[int] = None,
+    chat_id: Optional[int] = None,
+    message_id: Optional[int] = None,
+    file_id: Optional[str] = None,
+    key: Optional[str] = None,
+    resource_version: Optional[str] = None,
+    text: Optional[str] = None,
+    extra: Optional[dict] = None,
+) -> dict:
+    """R50 P0-3: 业务层统一构造 canonical effect params。
+
+    所有 critical effect 调用方必须使用本函数构造 params,确保:
+    - 字段稳定排序(json.dumps sort_keys=True)
+    - UTC 时间统一格式(由调用方传入,本函数不自动加时间戳)
+    - None 值明确策略:不包含在 params 中(避免 None 字段差异)
+    - 资源 version 绑定(防止旧 callback 操作已更新资源)
+
+    Args:
+        effect_type: 副作用类型(用于校验)
+        target_user_id/target_channel_id/chat_id: 目标标识(至少一个)
+        message_id/file_id/key: 关键业务参数
+        resource_version: 资源版本标识(如 file_code + version)
+        text: 文本内容(用于 telegram_send)
+        extra: 额外参数(合并到结果)
+
+    Returns:
+        canonical params dict(已去除 None 值,字段稳定)
+
+    Raises:
+        ValueError: target 标识全部为空(critical effect 必须有明确 target)
+    """
+    params: dict = {}
+    # 必须至少有一个 target 标识
+    if target_user_id is not None:
+        params["target_user_id"] = int(target_user_id)
+    if target_channel_id is not None:
+        params["target_channel_id"] = int(target_channel_id)
+    if chat_id is not None:
+        params["chat_id"] = int(chat_id)
+    if not params:
+        raise ValueError(
+            f"critical effect '{effect_type}' requires at least one target id"
+            f"(target_user_id/target_channel_id/chat_id)"
+        )
+    # 关键业务参数
+    if message_id is not None:
+        params["message_id"] = int(message_id)
+    if file_id is not None:
+        params["file_id"] = str(file_id)
+    if key is not None:
+        params["key"] = str(key)
+    if resource_version is not None:
+        params["resource_version"] = str(resource_version)
+    if text is not None:
+        params["text"] = str(text)
+    # 额外参数(合并)
+    if extra:
+        for k, v in extra.items():
+            if v is not None:
+                params[str(k)] = v
+    return params
+
+
+def compute_effect_request_hash_safe(
+    effect_type: str,
+    params: Optional[dict] = None,
+) -> str:
+    """R50 P0-3: 安全计算 effect request hash(params 异常时不降级为空 hash)。
+
+    与 compute_effect_request_hash 的区别:
+    - params 为 None 或空 dict 时,对 critical effect 抛 ValueError(不降级为空)
+    - params 序列化失败时,对 critical effect 抛 ValueError(不降级为空);
+      非 critical effect 兜底为 effect_type-only hash(向后兼容)
+    - 非 critical effect 允许空 params(向后兼容)
+
+    Returns:
+        SHA256 hex 字符串(64 字符)
+
+    Raises:
+        ValueError: critical effect 的 params 为空或序列化失败
+    """
+    if effect_type in CRITICAL_EFFECT_TYPES:
+        if not params:
+            raise ValueError(
+                f"critical effect '{effect_type}' params is empty,"
+                f"refuse to compute hash (prevent downgrade to empty hash bypassing receipt)"
+            )
+    try:
+        return compute_effect_request_hash(effect_type, params or {})
+    except Exception as e:
+        if effect_type in CRITICAL_EFFECT_TYPES:
+            raise ValueError(
+                f"critical effect '{effect_type}' params serialization failed,"
+                f"refuse downgrade to empty hash: {e}"
+            ) from e
+        # 非 critical 兜底:返回 effect_type-only hash(向后兼容)
+        return compute_effect_request_hash(effect_type, {})
+
+
 def compute_effect_request_hash(effect_type: str, params: dict) -> str:
     """R47 P0-4 / R48 P0-4: 计算 effect 副作用的 request_hash(绑定 effect_type + params)。
 
@@ -135,7 +238,16 @@ class EffectReceiptManager:
                                    不匹配则视为不同 payload,返回 None(不视为 completed)。
 
         Returns:
-            已 completed 的 receipt 字典(含 request_hash 字段),或 None。
+            completed receipt dict (with request_hash field), or None.
+            R50 P0-3: when expected_request_hash does not match stored, returns special marker
+            ``{"status": "hash_mismatch", "reconcile_status":
+            "hash_mismatch_needs_reconcile", ...}``, and synchronously updates the DB
+            receipt's reconcile_status to 'hash_mismatch_needs_reconcile' (enters DLQ).
+            Callers should distinguish three cases:
+              - None: no receipt, safe to execute side effect;
+              - {"status": "completed", ...}: already done, skip side effect;
+              - {"status": "hash_mismatch", ...}: payload mismatch, refuse retry,
+                enter reconciliation flow.
         """
         if not self._store._db:
             if fail_closed:
@@ -156,16 +268,44 @@ class EffectReceiptManager:
             row = await cursor.fetchone()
             if row and row[0] == "completed":
                 stored_hash = row[5] or ""
-                # R47 P0-4: request_hash 不匹配 → 视为不同 payload,不视为 completed
+                # R47 P0-4 / R50 P0-3: request_hash 不匹配 → 不同 payload,
+                # 进入 reconciliation/DLQ,不简单视为 completed 也不允许调用方
+                # 直接重试外部副作用(防止 completed 阶段被替换 payload 绕过)。
                 if (expected_request_hash and stored_hash
                         and expected_request_hash != stored_hash):
                     logger.warning(
-                        f"[effect_receipts] request_hash 不匹配,视为未完成 "
+                        f"[effect_receipts] request_hash mismatch, mark as hash_mismatch "
                         f"action={action_id} type={effect_type} target={target} "
                         f"expected={expected_request_hash[:16]}... "
                         f"stored={stored_hash[:16]}..."
                     )
-                    return None
+                    # R50 P0-3: hash mismatch → 进入 reconciliation/DLQ
+                    # 同步更新 reconcile_status 防止调用方重试外部副作用
+                    try:
+                        await self._store._db.execute(
+                            "UPDATE effect_receipts "
+                            "SET reconcile_status='hash_mismatch_needs_reconcile', "
+                            "last_error=? "
+                            "WHERE action_id=? AND effect_type=? AND target=?",
+                            (f"hash_mismatch: expected="
+                             f"{expected_request_hash[:16]}... "
+                             f"stored={stored_hash[:16]}...",
+                             action_id, effect_type, target),
+                        )
+                        await self._store._db.commit()
+                    except Exception as up_err:
+                        logger.error(
+                            f"[effect_receipts] failed to mark hash_mismatch: {up_err}"
+                        )
+                    # 返回特殊标记,调用方可区分 hash_mismatch vs 无 receipt
+                    return {
+                        "status": "hash_mismatch",
+                        "external_id": row[1],
+                        "completed_at": row[2],
+                        "attempt": row[3],
+                        "reconcile_status": "hash_mismatch_needs_reconcile",
+                        "request_hash": stored_hash,
+                    }
                 return {
                     "status": row[0],
                     "external_id": row[1],
@@ -208,8 +348,8 @@ class EffectReceiptManager:
         # R48 P0-4: 应用层校验 critical effect 的 request_hash 必须非空
         if effect_type in CRITICAL_EFFECT_TYPES and not request_hash:
             raise ValueError(
-                f"critical effect '{effect_type}' 的 request_hash 为空,"
-                f"拒绝记录 pending(action_id={action_id})"
+                f"critical effect '{effect_type}' request_hash is empty,"
+                f"refuse to record pending (action_id={action_id})"
             )
 
         if not self._store._db:
@@ -361,7 +501,13 @@ class EffectReceiptManager:
                 raise EffectReceiptError(f"record_failed DB 错误: {e}") from e
 
     async def list_pending_reconcile(self, limit: int = 100) -> list[dict]:
-        """R46 P0-1: 列出需要 reconciliation 的 receipt(status=failed/needs_reconcile)。"""
+        """R46 P0-1 / R50 P0-3: 列出需要 reconciliation 的 receipt。
+
+        包含两类:
+        - ``reconcile_status = 'needs_reconcile'``:执行失败需重试(R46 P0-1);
+        - ``reconcile_status = 'hash_mismatch_needs_reconcile'``:payload 不一致,
+          禁止自动重试,需人工 reconcile(R50 P0-3)。
+        """
         if not self._store._db:
             return []
         try:
@@ -369,7 +515,8 @@ class EffectReceiptManager:
                 "SELECT action_id, effect_type, target, status, attempt, "
                 "last_error, reconcile_status "
                 "FROM effect_receipts "
-                "WHERE reconcile_status = 'needs_reconcile' "
+                "WHERE reconcile_status IN "
+                "('needs_reconcile', 'hash_mismatch_needs_reconcile') "
                 "ORDER BY created_at ASC LIMIT ?",
                 (limit,),
             )

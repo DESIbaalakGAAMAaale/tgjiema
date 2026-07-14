@@ -53,6 +53,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from services.error_codes import AppError, ErrorCodes
+
 # 测试文件顶部 mock telegram 模块(避免 import 失败)
 sys.modules.setdefault("telegram", MagicMock())
 sys.modules.setdefault("telegram.ext", MagicMock())
@@ -553,7 +555,7 @@ class TestP13ProductionRestoreApproval:
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")
     async def test_production_restore_without_approval_action_id_raises(self, monkeypatch):
-        """production restore 无 approval_action_id 应抛 ValueError。"""
+        """production restore 无 approval_action_id 应抛 AppError(BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED)。"""
         _patch_backup_all_tables(monkeypatch)
         engine, storage, cache, _ = _build_engine_with_kek(monkeypatch)
 
@@ -561,10 +563,11 @@ class TestP13ProductionRestoreApproval:
         backup_id = manifest["backup_id"]
 
         # production restore 必须提供 approval_action_id
-        with pytest.raises(ValueError, match="approval_action_id"):
+        with pytest.raises(AppError) as exc_info:
             await engine.restore(
                 backup_id, target="production", approver_id=999,
             )
+        assert exc_info.value.envelope.code == ErrorCodes.BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(not _ENCRYPT_AVAILABLE, reason="cryptography 不可用")

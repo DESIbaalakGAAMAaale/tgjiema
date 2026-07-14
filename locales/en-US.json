@@ -109,7 +109,11 @@
     "backup.restore.r2_credential_missing": "R2 credentials are not configured (both .env and config table are empty), cannot restore",
     "relay.auth.code_failed": "Relay account verification code retrieval failed (phone={phone})",
     "relay.auth.password_timeout": "Relay account 2FA password retrieval timed out (phone={phone})",
-    "relay.config.api_hash_invalid": "api_hash cannot be empty and must be a string"
+    "relay.config.api_hash_invalid": "api_hash cannot be empty and must be a string",
+    "callback.action.not_allowed": "Callback action not in runtime allowlist (action={action}). To add new actions, call register_runtime_action and record an audit log entry.",
+    "admin.bootstrap.not_verified": "Admin bootstrap not verified. Please run bootstrap_admin_principal() to initialize the admin principal before starting the web service.",
+    "production.bot_token.missing": "Production environment requires BOT_TOKEN (ADMIN_BOT_TOKEN or SENDER_BOT_TOKEN) for button signing; default_secret fallback is disabled (environment={environment}).",
+    "backup.restore.approval_action_id_required": "Disaster recovery restore must be invoked via ApprovalExecutor approval workflow; approval_action_id is required (backup_id={backup_id})."
   },
   "ui": {
     "admin_login_title": "Admin Login",

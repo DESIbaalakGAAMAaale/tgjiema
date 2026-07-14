@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 
+from services.error_codes import AppError, ErrorCodes
+
 # ── 模块级 skip 检查 ────────────────────────────────────────────
 from database import cache_store as _cs_module
 
@@ -458,14 +460,15 @@ class TestDisasterRestoreApprovalGate:
 
     @pytest.mark.asyncio
     async def test_disaster_restore_raises_without_approval_action_id(self, monkeypatch):
-        """不传 approval_action_id 时,disaster_recovery.restore 应抛 ValueError。"""
+        """不传 approval_action_id 时,disaster_recovery.restore 应抛 AppError。"""
         from services import disaster_recovery
 
-        with pytest.raises(ValueError, match="approval_action_id"):
+        with pytest.raises(AppError) as exc_info:
             await disaster_recovery.restore(
                 backup_id="backup_20260713_120000_abcd1234",
                 approver_id=999,
             )
+        assert exc_info.value.envelope.code == ErrorCodes.BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED
 
     @pytest.mark.asyncio
     async def test_disaster_restore_raises_with_empty_backup_id(self, monkeypatch):

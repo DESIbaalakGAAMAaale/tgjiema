@@ -109,7 +109,11 @@
     "backup.restore.r2_credential_missing": "R2 凭证未配置(.env 和 config 表均无),无法恢复",
     "relay.auth.code_failed": "中继账号验证码获取失败(phone={phone})",
     "relay.auth.password_timeout": "中继账号二步验证密码获取超时(phone={phone})",
-    "relay.config.api_hash_invalid": "api_hash 不能为空且必须是字符串"
+    "relay.config.api_hash_invalid": "api_hash 不能为空且必须是字符串",
+    "callback.action.not_allowed": "callback action 不在运行时 allowlist 内(action={action}),如需新增请调用 register_runtime_action 并记录审计日志",
+    "admin.bootstrap.not_verified": "admin bootstrap 未完成,请运行 bootstrap_admin_principal() 初始化管理员身份后再启动 Web 服务",
+    "production.bot_token.missing": "production 环境必须配置 BOT_TOKEN(ADMIN_BOT_TOKEN 或 SENDER_BOT_TOKEN)用于按钮签名,禁止回退 default_secret(environment={environment})",
+    "backup.restore.approval_action_id_required": "灾备恢复必须通过审批流 ApprovalExecutor 调用,需提供 approval_action_id(backup_id={backup_id})"
   },
   "ui": {
     "admin_login_title": "管理后台登录",

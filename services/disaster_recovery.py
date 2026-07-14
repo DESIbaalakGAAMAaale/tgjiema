@@ -30,6 +30,9 @@ from loguru import logger
 
 from database.cache_store import get_cache_store
 
+# R50 P1-1: 统一错误码协议化(替代裸字符串 ValueError)
+from services.error_codes import AppError, ErrorCodes
+
 
 # ─── kv_store 键名 ─────────────────────────────────────────────
 KV_BACKUP_HISTORY = "backup_history"
@@ -320,9 +323,10 @@ async def restore(
     # R44 G0-3: 灾备恢复必须通过 ApprovalExecutor 调用,不接受任意 approver_id
     # approval_action_id 必须由审批流通过 ApprovalExecutor 调用恢复时注入
     if not approval_action_id:
-        raise ValueError(
-            "disaster_recovery production restore requires approval_action_id "
-            "from approval workflow"
+        # R50 P1-1: 协议化为 BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED,
+            params={"backup_id": backup_id},
         )
 
     # 审批人 ID:优先 approver_id,fallback admin_id(向后兼容旧调用方)

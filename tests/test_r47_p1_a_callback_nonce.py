@@ -34,6 +34,8 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from services.error_codes import AppError, ErrorCodes
+
 # ── 模块级 skip 检查:cache_store 必须是真实类(非 conftest 降级 MagicMock)──
 from database import cache_store as _cs_module
 
@@ -376,15 +378,16 @@ class TestProductionFailClosed:
     """R47 P1-a: production 环境缺 BOT_TOKEN 必须 fail-closed。"""
 
     def test_production_missing_both_tokens_raises(self, monkeypatch):
-        """production + ADMIN_BOT_TOKEN 和 SENDER_BOT_TOKEN 均空 → RuntimeError。"""
+        """production + ADMIN_BOT_TOKEN 和 SENDER_BOT_TOKEN 均空 → AppError(PRODUCTION_BOT_TOKEN_MISSING)。"""
         import config
         from services.button_security import _check_production_secret
 
         monkeypatch.setattr(config.settings, "ENVIRONMENT", "production")
         monkeypatch.setattr(config.settings, "ADMIN_BOT_TOKEN", "")
         monkeypatch.setattr(config.settings, "SENDER_BOT_TOKEN", "")
-        with pytest.raises(RuntimeError, match="production requires BOT_TOKEN"):
+        with pytest.raises(AppError) as exc_info:
             _check_production_secret()
+        assert exc_info.value.envelope.code == ErrorCodes.PRODUCTION_BOT_TOKEN_MISSING
 
     def test_production_missing_admin_token_only_passes(self, monkeypatch):
         """production + 仅 SENDER_BOT_TOKEN 配置 → 通过(至少一个 token 即可)。"""

@@ -140,6 +140,16 @@ class ErrorCodes:
     # 中继账号 api_hash 校验失败(services/relay_pool.py)
     RELAY_CONFIG_API_HASH_INVALID = "RELAY.CONFIG.API_HASH_INVALID"
 
+    # ── R50 P1-1 新增:覆盖最后 5 处裸字符串 raise ──
+    # callback allowlist action 为空或不在 allowlist 内(services/callback_allowlist.py)
+    CALLBACK_ACTION_NOT_ALLOWED = "CALLBACK.ACTION.NOT_ALLOWED"
+    # admin bootstrap 未完成,Web 进程应退出(admin/__init__.py:require_readiness)
+    ADMIN_BOOTSTRAP_NOT_VERIFIED = "ADMIN.BOOTSTRAP.NOT_VERIFIED"
+    # production 环境必须配置 BOT_TOKEN(services/button_security.py:_check_production_secret)
+    PRODUCTION_BOT_TOKEN_MISSING = "PRODUCTION.BOT_TOKEN.MISSING"
+    # 灾备恢复必须传 approval_action_id(services/backup_engine.py + services/disaster_recovery.py)
+    BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED = "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED"
+
 
 # ════════════════════════════════════════════════════════════════
 # 2. ErrorDefinition 数据类
@@ -997,6 +1007,44 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=[],
+    ))
+
+    # ── R50 P1-1: 覆盖最后 5 处裸字符串 raise ──
+    # callback allowlist action 为空或不在 allowlist 内
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.CALLBACK_ACTION_NOT_ALLOWED,
+        message_key="errors.callback.action.not_allowed",
+        http_status=403,
+        retryable=False,
+        severity="warning",
+        safe_params=["action", "high_risk_count", "low_risk_count"],
+    ))
+    # admin bootstrap 未完成,Web 进程应退出
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ADMIN_BOOTSTRAP_NOT_VERIFIED,
+        message_key="errors.admin.bootstrap.not_verified",
+        http_status=503,
+        retryable=False,
+        severity="critical",
+        safe_params=[],
+    ))
+    # production 环境必须配置 BOT_TOKEN
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.PRODUCTION_BOT_TOKEN_MISSING,
+        message_key="errors.production.bot_token.missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["environment"],
+    ))
+    # 灾备恢复必须传 approval_action_id
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED,
+        message_key="errors.backup.restore.approval_action_id_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["backup_id"],
     ))
 
 

@@ -189,10 +189,8 @@ async def require_readiness() -> None:
     """
     ok = await verify_admin_bootstrap()
     if not ok:
-        raise RuntimeError(
-            "admin bootstrap not verified — "
-            "请运行 bootstrap_admin_principal() 初始化管理员身份后再启动 Web 服务"
-        )
+        # R50 P1-1: 协议化为 ADMIN_BOOTSTRAP_NOT_VERIFIED
+        raise AppError(ErrorCodes.ADMIN_BOOTSTRAP_NOT_VERIFIED)
 
 
 # ─── R45 §7.1: readiness 强制调用 + 进程退出 ──────────────────────

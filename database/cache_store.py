@@ -1408,8 +1408,11 @@ class CacheStore:
                         f"[CacheStore] effect_receipts ALTER TABLE失败(非预期): {_e}"
                     )
         await self._db.execute(
+            # R50 P0-3: 扩展 partial index 覆盖 hash_mismatch_needs_reconcile 状态
+            # 原 R46 仅覆盖 needs_reconcile,R50 P0-3 新增 hash_mismatch_needs_reconcile
             "CREATE INDEX IF NOT EXISTS idx_effect_receipts_reconcile "
-            "ON effect_receipts(reconcile_status) WHERE reconcile_status = 'needs_reconcile'"
+            "ON effect_receipts(reconcile_status) "
+            "WHERE reconcile_status IN ('needs_reconcile', 'hash_mismatch_needs_reconcile')"
         )
 
         # ─── R46 P1: mfa_used_totp 表 — TOTP 重放防护持久化(跨进程共享) ───

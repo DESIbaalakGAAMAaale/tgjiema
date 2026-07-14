@@ -45,6 +45,8 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 
+from services.error_codes import AppError, ErrorCodes
+
 # mock telegram(避免 ImportError,conftest 已处理,此处兜底)
 sys.modules.setdefault("telegram", MagicMock())
 sys.modules.setdefault("telegram.ext", MagicMock())
@@ -553,15 +555,16 @@ class TestValidateProductionConfig:
     """
 
     def test_production_missing_both_tokens_raises(self, monkeypatch):
-        """production + ADMIN_BOT_TOKEN 和 SENDER_BOT_TOKEN 均空 → RuntimeError。"""
+        """production + ADMIN_BOT_TOKEN 和 SENDER_BOT_TOKEN 均空 → AppError(PRODUCTION_BOT_TOKEN_MISSING)。"""
         import config
         from services.button_security import validate_production_config
 
         monkeypatch.setattr(config.settings, "ENVIRONMENT", "production")
         monkeypatch.setattr(config.settings, "ADMIN_BOT_TOKEN", "")
         monkeypatch.setattr(config.settings, "SENDER_BOT_TOKEN", "")
-        with pytest.raises(RuntimeError, match="production requires BOT_TOKEN"):
+        with pytest.raises(AppError) as exc_info:
             validate_production_config()
+        assert exc_info.value.envelope.code == ErrorCodes.PRODUCTION_BOT_TOKEN_MISSING
 
     def test_production_with_admin_token_passes(self, monkeypatch):
         """production + 仅 ADMIN_BOT_TOKEN 配置 → 通过。"""
@@ -605,12 +608,14 @@ class TestValidateProductionConfig:
         monkeypatch.setattr(config.settings, "ADMIN_BOT_TOKEN", "")
         monkeypatch.setattr(config.settings, "SENDER_BOT_TOKEN", "")
 
-        # 两者都应抛 RuntimeError
-        with pytest.raises(RuntimeError):
+        # 两者都应抛 AppError(PRODUCTION_BOT_TOKEN_MISSING)
+        with pytest.raises(AppError) as exc_info:
             _check_production_secret()
+        assert exc_info.value.envelope.code == ErrorCodes.PRODUCTION_BOT_TOKEN_MISSING
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(AppError) as exc_info:
             validate_production_config()
+        assert exc_info.value.envelope.code == ErrorCodes.PRODUCTION_BOT_TOKEN_MISSING
 
 
 # ════════════════════════════════════════════════════════════════

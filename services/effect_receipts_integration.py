@@ -157,6 +157,17 @@ def with_effect_receipt(
                     "skipped": True,
                     "external_id": receipt.get("external_id", ""),
                 }
+            # R50 P0-3: hash mismatch → enter DLQ, refuse to retry external side effects
+            if receipt is not None and receipt.get("status") == "hash_mismatch":
+                logger.error(
+                    f"[effect_receipt] hash mismatch, refuse retry (enter DLQ): "
+                    f"action={action_id}, type={effect_type}, target={target}"
+                )
+                raise EffectReceiptError(
+                    f"effect receipt hash mismatch for action={action_id} "
+                    f"type={effect_type} target={target} — "
+                    f"marked hash_mismatch_needs_reconcile, refuse to retry external side effects"
+                )
 
             # 2. 记录 pending(开始执行) — CAS claim
             claim_ok = await manager.record_pending(
@@ -299,6 +310,18 @@ class EffectReceiptContext:
                 f"target={self.target}"
             )
             return self
+        # R50 P0-3: hash mismatch → enter DLQ, refuse to retry external side effects
+        if receipt is not None and receipt.get("status") == "hash_mismatch":
+            logger.error(
+                f"[effect_receipt] hash mismatch, refuse retry (enter DLQ): "
+                f"action={self.action_id}, type={self.effect_type}, "
+                f"target={self.target}"
+            )
+            raise EffectReceiptError(
+                f"effect receipt hash mismatch for action={self.action_id} "
+                f"type={self.effect_type} target={self.target} — "
+                f"marked hash_mismatch_needs_reconcile, refuse to retry external side effects"
+            )
 
         # 记录 pending — CAS claim
         claim_ok = await self.manager.record_pending(

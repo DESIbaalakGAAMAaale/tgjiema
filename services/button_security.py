@@ -35,6 +35,9 @@ from loguru import logger
 
 from config import settings
 
+# R50 P1-1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
+
 
 # ── R47 P1-a: 签名长度(32 hex chars = 128 bit)──────────────────
 SIGNATURE_LENGTH: int = 32
@@ -87,9 +90,10 @@ def _check_production_secret() -> None:
     admin_token = str(getattr(settings, "ADMIN_BOT_TOKEN", "") or "")
     sender_token = str(getattr(settings, "SENDER_BOT_TOKEN", "") or "")
     if not admin_token and not sender_token:
-        raise RuntimeError(
-            "R47 P1-a: production requires BOT_TOKEN for button signing "
-            "(ADMIN_BOT_TOKEN or SENDER_BOT_TOKEN must be configured)"
+        # R50 P1-1: 协议化为 PRODUCTION_BOT_TOKEN_MISSING
+        raise AppError(
+            ErrorCodes.PRODUCTION_BOT_TOKEN_MISSING,
+            params={"environment": env},
         )
 
 
