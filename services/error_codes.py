@@ -150,6 +150,78 @@ class ErrorCodes:
     # 灾备恢复必须传 approval_action_id(services/backup_engine.py + services/disaster_recovery.py)
     BACKUP_RESTORE_APPROVAL_ACTION_ID_REQUIRED = "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED"
 
+    # ── R51 P0-6 新增:内容申诉恢复相关错误码 ──
+    # 内容申诉恢复操作失败(restore_content handler 执行失败,进入 reconciliation)
+    CONTENT_APPEAL_RESTORE_FAILED = "CONTENT.APPEAL.RESTORE_FAILED"
+    # 内容申诉状态无效(如重复审批 / 已在 restore_pending 等待 executor)
+    CONTENT_APPEAL_INVALID_STATE = "CONTENT.APPEAL.INVALID_STATE"
+
+    # ── R51 P0-8: production restore hash 强制 ──
+    # production 恢复必须传 expected_request_hash(TOCTOU 防护)
+    PRODUCTION_RESTORE_HASH_REQUIRED = "PRODUCTION.RESTORE.HASH_REQUIRED"
+    # production 恢复 expected_request_hash 与存储 hash 不匹配(TOCTOU 攻击或 payload 被篡改)
+    PRODUCTION_RESTORE_HASH_MISMATCH = "PRODUCTION.RESTORE.HASH_MISMATCH"
+    # command_executions 已 executed,禁止重复执行 restore
+    RESTORE_ALREADY_EXECUTED = "RESTORE.ALREADY_EXECUTED"
+
+    # ── R51 P0-5: notification_outbox 异常 ──
+    # notification_outbox 写入失败(必须回滚事务,避免孤儿通知)
+    NOTIFICATION_OUTBOX_WRITE_FAILED = "NOTIFICATION.OUTBOX.WRITE_FAILED"
+    # notification_outbox 重复插入(dedup_key + window 唯一约束冲突)
+    NOTIFICATION_OUTBOX_DUPLICATE = "NOTIFICATION.OUTBOX.DUPLICATE"
+
+    # ── R51 P1-1: Data Lifecycle 事务化 ──
+    # 删除请求步骤失败(任一 step 失败 → 整个 deletion_request 标记 failed)
+    DATA_LIFECYCLE_DELETE_STEP_FAILED = "DATA.LIFECYCLE.DELETE_STEP_FAILED"
+    # 删除请求失败(局部失败导致整个请求未 completed)
+    DATA_LIFECYCLE_DELETE_REQUEST_FAILED = "DATA.LIFECYCLE.DELETE_REQUEST_FAILED"
+    # 物理删除前验证 backup marker 失败(无备份标记)
+    DATA_LIFECYCLE_BACKUP_MARKER_MISSING = "DATA.LIFECYCLE.BACKUP_MARKER_MISSING"
+
+    # ── R51 P1-2: Entitlements 事务化 ──
+    # 配额查询失败(fail-closed 拒绝放行,不允许默认 used=0)
+    ENTITLEMENT_QUOTA_QUERY_FAILED = "ENTITLEMENT.QUOTA.QUERY_FAILED"
+    # set_user_plan 事务失败(套餐/配额/audit/dirty_outbox 任一失败)
+    ENTITLEMENT_SET_PLAN_TX_FAILED = "ENTITLEMENT.SET_PLAN.TX_FAILED"
+
+    # ── R51 P1-3: Collections CAS ──
+    # 生产修改集合必须传 expected_version(乐观锁不可绕过)
+    COLLECTION_CAS_VERSION_REQUIRED = "COLLECTION.CAS.VERSION_REQUIRED"
+    # 集合 CAS 版本冲突
+    COLLECTION_CAS_CONFLICT = "COLLECTION.CAS.CONFLICT"
+    # bypass_cas 必须显式声明并审计
+    COLLECTION_CAS_BYPASS_NOT_ALLOWED = "COLLECTION.CAS.BYPASS_NOT_ALLOWED"
+
+    # ── R51 P1-4: Task Center 错误处理 ──
+    # 未知 task_type 拒绝(不再静默回退)
+    TASK_CENTER_UNKNOWN_TYPE = "TASK.CENTER.UNKNOWN_TYPE"
+    # 未知 task status 拒绝(不再静默回退)
+    TASK_CENTER_UNKNOWN_STATUS = "TASK.CENTER.UNKNOWN_STATUS"
+    # 列表查询 DB 异常(返回错误 envelope,不返回空列表伪装"无任务")
+    TASK_CENTER_LIST_DB_ERROR = "TASK.CENTER.LIST_DB_ERROR"
+
+    # ── R51 P1-5: Repair Console 审批 ──
+    # 高风险修复动作必须强制审批(approval_action_id 不可缺省)
+    REPAIR_CONSOLE_APPROVAL_REQUIRED = "REPAIR.CONSOLE.APPROVAL_REQUIRED"
+    # 审批 hash/owner 校验失败(不仅校验 status,必须校验 request_hash + principal_id)
+    REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH = "REPAIR.CONSOLE.APPROVAL_HASH_MISMATCH"
+    # 审批 principal 不匹配(approval_action_id 关联的 principal 与当前 principal 不一致)
+    REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH = "REPAIR.CONSOLE.APPROVAL_PRINCIPAL_MISMATCH"
+
+    # ── R51 P1-6: 维护模式 fail-closed ──
+    # 维护工作流失败但 recover_status='pending' 持久化失败(严重告警,必须 fail-closed)
+    MAINTENANCE_RECOVER_STATUS_PERSIST_FAILED = "MAINTENANCE.WORKFLOW.PERSIST_FAILED"
+    # disable/recover 操作必须绑定 request_hash + principal + approval_action_id
+    MAINTENANCE_RECOVER_BINDING_REQUIRED = "MAINTENANCE.RECOVER.BINDING_REQUIRED"
+
+    # ── R51 P1-7: Prometheus 指标完善 ──
+    # 高基数 label 违规(CI/测试中 fail,运行时丢弃违规 metric)
+    METRICS_HIGH_CARDINALITY_LABEL = "METRICS.LABEL.HIGH_CARDINALITY"
+    # 指标采集器失败(输出 collector_success=0,不输出 0 伪装健康)
+    METRICS_COLLECTOR_FAILED = "METRICS.COLLECTOR.FAILED"
+    # RU 估算值标记(非官方 CockroachDB Cloud Metrics)
+    METRICS_RU_ESTIMATED = "METRICS.RU.ESTIMATED"
+
 
 # ════════════════════════════════════════════════════════════════
 # 2. ErrorDefinition 数据类
@@ -1045,6 +1117,260 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["backup_id"],
+    ))
+
+    # ── R51 P0-5: notification_outbox 异常 ──
+    # notification_outbox 写入失败(必须回滚事务,避免孤儿通知)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED,
+        message_key="errors.notification.outbox.write_failed",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["user_id", "notif_type"],
+    ))
+    # notification_outbox 重复插入(dedup_key + window 唯一约束冲突)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE,
+        message_key="errors.notification.outbox.duplicate",
+        http_status=409,
+        retryable=False,
+        severity="info",
+        safe_params=["user_id", "dedup_key"],
+    ))
+
+    # ── R51 P0-8: production restore hash 强制 ──
+    # production 恢复必须传 expected_request_hash(TOCTOU 防护)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.PRODUCTION_RESTORE_HASH_REQUIRED,
+        message_key="errors.production.restore.hash_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["backup_id", "target"],
+    ))
+    # production 恢复 expected_request_hash 与存储 hash 不匹配
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.PRODUCTION_RESTORE_HASH_MISMATCH,
+        message_key="errors.production.restore.hash_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["backup_id", "approval_action_id"],
+    ))
+    # command_executions 已 executed,禁止重复执行 restore
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_ALREADY_EXECUTED,
+        message_key="errors.restore.already_executed",
+        http_status=409,
+        retryable=False,
+        severity="error",
+        safe_params=["approval_action_id"],
+    ))
+
+    # ── R51 P0-6: 内容申诉恢复相关 ──
+    # 内容申诉恢复操作失败(restore_content handler 执行失败,进入 reconciliation)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.CONTENT_APPEAL_RESTORE_FAILED,
+        message_key="errors.content.appeal.restore_failed",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["appeal_id", "target_type", "target_id"],
+    ))
+    # 内容申诉状态无效(如重复审批 / 已在 restore_pending 等待 executor)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.CONTENT_APPEAL_INVALID_STATE,
+        message_key="errors.content.appeal.invalid_state",
+        http_status=409,
+        retryable=False,
+        severity="warning",
+        safe_params=["appeal_id", "current_status"],
+    ))
+
+    # ── R51 P1-6: 维护模式 fail-closed ──
+    # 维护工作流失败但 recover_status 持久化失败(严重告警,必须 fail-closed)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MAINTENANCE_RECOVER_STATUS_PERSIST_FAILED,
+        message_key="errors.maintenance.workflow.persist_failed",
+        http_status=503,
+        retryable=True,
+        severity="critical",
+        safe_params=["reason", "workflow_step"],
+    ))
+    # disable/recover 操作必须绑定 request_hash + principal + approval_action_id
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MAINTENANCE_RECOVER_BINDING_REQUIRED,
+        message_key="errors.maintenance.recover.binding_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["approval_action_id", "principal_id"],
+    ))
+
+    # ── R51 P1-7: Prometheus 指标完善 ──
+    # 高基数 label 违规(CI/测试中 fail,运行时丢弃违规 metric)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.METRICS_HIGH_CARDINALITY_LABEL,
+        message_key="errors.metrics.label.high_cardinality",
+        http_status=500,
+        retryable=False,
+        severity="error",
+        safe_params=["label", "metric"],
+    ))
+    # 指标采集器失败(输出 collector_success=0,不输出 0 伪装健康)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.METRICS_COLLECTOR_FAILED,
+        message_key="errors.metrics.collector.failed",
+        http_status=503,
+        retryable=True,
+        severity="warning",
+        safe_params=["collector"],
+    ))
+    # RU 估算值标记(非官方 CockroachDB Cloud Metrics)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.METRICS_RU_ESTIMATED,
+        message_key="errors.metrics.ru.estimated",
+        http_status=200,
+        retryable=False,
+        severity="info",
+        safe_params=["service"],
+    ))
+
+    # ── R51 P1-1: Data Lifecycle 事务化 ──
+    # 删除请求步骤失败(任一 step 失败 → 整个 deletion_request 标记 failed)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DATA_LIFECYCLE_DELETE_STEP_FAILED,
+        message_key="errors.data.lifecycle.delete_step_failed",
+        http_status=500,
+        retryable=False,
+        severity="error",
+        safe_params=["user_id", "step", "step_error"],
+    ))
+    # 删除请求失败(局部失败导致整个请求未 completed)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DATA_LIFECYCLE_DELETE_REQUEST_FAILED,
+        message_key="errors.data.lifecycle.delete_request_failed",
+        http_status=500,
+        retryable=False,
+        severity="error",
+        safe_params=["user_id", "request_id", "failed_steps"],
+    ))
+    # 物理删除前验证 backup marker 失败(无备份标记)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DATA_LIFECYCLE_BACKUP_MARKER_MISSING,
+        message_key="errors.data.lifecycle.backup_marker_missing",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["user_id", "table_name", "pk"],
+    ))
+
+    # ── R51 P1-2: Entitlements 事务化 ──
+    # 配额查询失败(fail-closed 拒绝放行,不允许默认 used=0)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ENTITLEMENT_QUOTA_QUERY_FAILED,
+        message_key="errors.entitlement.quota.query_failed",
+        http_status=503,
+        retryable=True,
+        severity="critical",
+        safe_params=["user_id"],
+    ))
+    # set_user_plan 事务失败(套餐/配额/audit/dirty_outbox 任一失败)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ENTITLEMENT_SET_PLAN_TX_FAILED,
+        message_key="errors.entitlement.set_plan.tx_failed",
+        http_status=500,
+        retryable=False,
+        severity="error",
+        safe_params=["user_id", "plan_name"],
+    ))
+
+    # ── R51 P1-3: Collections CAS ──
+    # 生产修改集合必须传 expected_version(乐观锁不可绕过)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+        message_key="errors.collection.cas.version_required",
+        http_status=400,
+        retryable=False,
+        severity="warning",
+        safe_params=["collection_id"],
+    ))
+    # 集合 CAS 版本冲突
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COLLECTION_CAS_CONFLICT,
+        message_key="errors.collection.cas.conflict",
+        http_status=409,
+        retryable=True,
+        severity="info",
+        safe_params=["collection_id", "expected_version", "current_version"],
+    ))
+    # bypass_cas 必须显式声明并审计
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COLLECTION_CAS_BYPASS_NOT_ALLOWED,
+        message_key="errors.collection.cas.bypass_not_allowed",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["collection_id", "caller"],
+    ))
+
+    # ── R51 P1-4: Task Center 错误处理 ──
+    # 未知 task_type 拒绝(不再静默回退)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.TASK_CENTER_UNKNOWN_TYPE,
+        message_key="errors.task.center.unknown_type",
+        http_status=400,
+        retryable=False,
+        severity="warning",
+        safe_params=["task_type"],
+    ))
+    # 未知 task status 拒绝(不再静默回退)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.TASK_CENTER_UNKNOWN_STATUS,
+        message_key="errors.task.center.unknown_status",
+        http_status=400,
+        retryable=False,
+        severity="warning",
+        safe_params=["status"],
+    ))
+    # 列表查询 DB 异常(返回错误 envelope,不返回空列表伪装"无任务")
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.TASK_CENTER_LIST_DB_ERROR,
+        message_key="errors.task.center.list_db_error",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=["scope"],
+    ))
+
+    # ── R51 P1-5: Repair Console 审批 ──
+    # 高风险修复动作必须强制审批(approval_action_id 不可缺省)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.REPAIR_CONSOLE_APPROVAL_REQUIRED,
+        message_key="errors.repair.console.approval_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "principal_id"],
+    ))
+    # 审批 hash/owner 校验失败(不仅校验 status,必须校验 request_hash + principal_id)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
+        message_key="errors.repair.console.approval_hash_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["approval_action_id", "expected_hash", "actual_hash"],
+    ))
+    # 审批 principal 不匹配(approval_action_id 关联的 principal 与当前 principal 不一致)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH,
+        message_key="errors.repair.console.approval_principal_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["approval_action_id", "expected_principal", "actual_principal"],
     ))
 
 

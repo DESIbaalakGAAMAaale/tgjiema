@@ -255,8 +255,9 @@ async def enable(reason: str, started_by: int = 0) -> bool:
         return False
 
 
-async def disable(ended_by: int = 0, force: bool = False, approval_action_id: str = None) -> bool:
-    """R40 P1-6 + R42 P1-12: 关闭维护模式(带前置检查 + recover_status 校验)。
+async def disable(ended_by: int = 0, force: bool = False, approval_action_id: str = None,
+                  request_hash: str = None) -> bool:
+    """R40 P1-6 + R42 P1-12 + R51 P1-6: 关闭维护模式(带前置检查 + recover_status 校验 + 绑定校验)。
 
     前置条件(默认 force=False 时检查):
         - 队列已排空(dirty_outbox + local_job_queue)
@@ -270,16 +271,22 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             → 允许关闭
         - 否则正常流程
 
+    R51 P1-6 新增绑定校验(recover_status='pending' 时强制):
+        - 必须同时提供 request_hash + approval_action_id(ended_by 即 principal)
+        - 三者缺一不可,确保审批动作与请求来源可审计追溯
+        - 缺失时抛 MaintenancePreconditionError(协议化错误 MAINTENANCE_RECOVER_BINDING_REQUIRED)
+
     Args:
-        ended_by: 操作者 admin_id
+        ended_by: 操作者 admin_id(即 principal)
         force: True=跳过常规前置检查(仅人工 rollback / recover 场景使用)
         approval_action_id: recover_maintenance 审批 action_id(recover_status='pending' 时必需)
+        request_hash: R51 P1-6 请求哈希(recover_status='pending' 时必需,绑定审批与请求)
 
     Returns:
         True 关闭成功, False 失败
 
     Raises:
-        MaintenancePreconditionError: 前置条件不满足 / 需要 recover_maintenance 审批
+        MaintenancePreconditionError: 前置条件不满足 / 需要 recover_maintenance 审批 / R51 P1-6 绑定缺失
     """
     store = get_cache_store()
     if not store._db:
@@ -307,6 +314,31 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             raise MaintenancePreconditionError(
                 "维护工作流失败后需要 recover_maintenance 审批才能关闭"
             )
+        # R51 P1-6: 强制要求 request_hash(绑定审批动作 + principal + 请求来源)
+        # ended_by 即 principal,三者齐全才允许关闭
+        if not request_hash:
+            logger.warning(
+                f"[Maintenance] R51 P1-6 disable 拒绝"
+                f"(recover_status=pending 但未提供 request_hash, "
+                f"principal={ended_by}, approval_action_id={approval_action_id})"
+            )
+            # 协议化错误:写入 audit_log + 抛 MaintenancePreconditionError
+            try:
+                from services.error_codes import AppError, ErrorCodes
+                app_err = AppError(
+                    ErrorCodes.MAINTENANCE_RECOVER_BINDING_REQUIRED,
+                    params={
+                        "approval_action_id": approval_action_id,
+                        "principal_id": ended_by,
+                    },
+                )
+                await app_err.write_audit_log()
+            except Exception:
+                pass  # audit_log 写入失败不影响主流程拒绝
+            raise MaintenancePreconditionError(
+                "R51 P1-6: recover_status=pending 时 disable 必须绑定 request_hash + "
+                "principal + approval_action_id(三者缺一不可)"
+            )
         # 验证 approval_action_id 在 command_executions 中 status='executed'
         try:
             exec_rows = await store._db.execute_fetchall(
@@ -329,7 +361,7 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             )
         logger.info(
             f"[Maintenance] disable recover_status=pending,approval_action_id={approval_action_id} "
-            f"已验证 executed,允许关闭"
+            f"request_hash={request_hash} principal={ended_by} 已验证 executed,允许关闭"
         )
 
     # R40 P1-6: 前置检查
@@ -976,6 +1008,9 @@ async def execute_maintenance_workflow(reason: str,
             f"[Maintenance] workflow 失败,保持 enabled: reason={failure_reason}"
         )
         # R42 P1-12: 设置 recover_status='pending'(强制 recover_maintenance 审批才能关闭)
+        # R51 P1-6: 持久化失败必须 fail-closed + 严重告警(不能只 warning)
+        recover_persist_failed = False
+        recover_persist_error = ""
         try:
             _recover_store = get_cache_store()
             async with _recover_store.transaction() as _recover_tx:
@@ -989,20 +1024,52 @@ async def execute_maintenance_workflow(reason: str,
                     connection=_recover_tx,
                 )
         except Exception as _recover_err:
-            logger.warning(
-                f"[Maintenance] 设置 recover_status=pending 失败: {_recover_err}"
+            # R51 P1-6: recover_status 持久化失败 → 严重告警,服务保持 fail-closed
+            recover_persist_failed = True
+            recover_persist_error = str(_recover_err)
+            logger.error(
+                f"[Maintenance] R51 P1-6 设置 recover_status=pending 失败,"
+                f"服务保持 fail-closed(严重告警): {_recover_err}"
             )
+            # 通过 AppError 写入 audit_log(协议化错误,含 trace_id)
+            try:
+                from services.error_codes import AppError, ErrorCodes
+                app_err = AppError(
+                    ErrorCodes.MAINTENANCE_RECOVER_STATUS_PERSIST_FAILED,
+                    params={
+                        "reason": failure_reason,
+                        "workflow_step": "set_recover_status_pending",
+                    },
+                )
+                await app_err.write_audit_log()
+            except Exception as audit_err:
+                logger.error(
+                    f"[Maintenance] R51 P1-6 写入 recover_status 持久化失败 audit_log 异常: {audit_err}"
+                )
         try:
             await _write_audit_log(
                 actor_id=started_by,
                 action="maintenance_workflow_failed",
                 target_type="maintenance_state",
                 target_id=str(MAINTENANCE_STATE_ID),
-                details=f"维护工作流失败,保持 enabled: {failure_reason}",
+                details=f"维护工作流失败,保持 enabled: {failure_reason}"
+                        + (f" | recover_status 持久化失败: {recover_persist_error}"
+                           if recover_persist_failed else ""),
             )
         except Exception as log_err:
             logger.warning(f"[Maintenance] 记录失败原因异常: {log_err}")
         maintenance_kept_enabled = True
+        # R51 P1-6: 持久化失败时记录到返回结果,便于上层处理
+        if recover_persist_failed:
+            return {
+                "steps": steps,
+                "success": False,
+                "duration_seconds": _time.time() - workflow_start,
+                "maintenance_kept_enabled": True,
+                "failure_reason": failure_reason,
+                "recover_status_persist_failed": True,
+                "recover_persist_error": recover_persist_error,
+            }
     else:
         # 全部成功 — 根据 auto_disable 决定是否关闭
         if auto_disable:
@@ -1070,8 +1137,9 @@ async def recover_maintenance(
     principal_id: int,
     reason: str,
     approval_action_id: str = None,
+    request_hash: str = None,
 ) -> bool:
-    """R42 P1-12: 人工恢复维护模式(需 CommandBus 审批 + maintenance:recover 权限)。
+    """R42 P1-12 + R51 P1-6: 人工恢复维护模式(需 CommandBus 审批 + maintenance:recover 权限 + request_hash 绑定)。
 
     与 ``rollback_maintenance`` 的差异:
         - rollback_maintenance 跳过所有检查(仅运维紧急恢复)
@@ -1079,19 +1147,21 @@ async def recover_maintenance(
           1. approval_action_id 由 CommandBus 预先审批生成(非 None)
           2. approval_action_id 在 command_executions 中 status='executed'
           3. principal_id 拥有 ``maintenance:recover`` 权限
-        - 通过验证后调用 ``disable(force=True, approval_action_id=...)`` 关闭
+          4. R51 P1-6: request_hash 必须提供(绑定审批动作 + principal + 请求来源)
+        - 通过验证后调用 ``disable(force=True, approval_action_id=..., request_hash=...)`` 关闭
         - 成功后重置 recover_status='completed',写 audit_log(action="recover_maintenance")
 
     Args:
         principal_id: 操作者 admin_id(必须拥有 maintenance:recover 权限)
         reason: 恢复原因(记入 audit_log)
         approval_action_id: CommandBus 预先审批生成的 action_id(必须)
+        request_hash: R51 P1-6 请求哈希(必须,绑定审批与请求来源)
 
     Returns:
         True 关闭成功, False 失败
 
     Raises:
-        PermissionError: approval_action_id 缺失 / 未审批通过 / principal 无权限
+        PermissionError: approval_action_id 缺失 / 未审批通过 / principal 无权限 / R51 P1-6 request_hash 缺失
     """
     # 1. approval_action_id 必须提供
     if not approval_action_id:
@@ -1100,6 +1170,30 @@ async def recover_maintenance(
             f"principal={principal_id}"
         )
         raise PermissionError("recover_maintenance requires approval_action_id")
+
+    # R51 P1-6: request_hash 必须提供(绑定审批动作 + principal + 请求来源)
+    if not request_hash:
+        logger.warning(
+            f"[Maintenance] R51 P1-6 recover_maintenance 拒绝"
+            f"(未提供 request_hash, principal={principal_id}, "
+            f"approval_action_id={approval_action_id})"
+        )
+        # 协议化错误:写入 audit_log + 抛 PermissionError
+        try:
+            from services.error_codes import AppError, ErrorCodes
+            app_err = AppError(
+                ErrorCodes.MAINTENANCE_RECOVER_BINDING_REQUIRED,
+                params={
+                    "approval_action_id": approval_action_id,
+                    "principal_id": principal_id,
+                },
+            )
+            await app_err.write_audit_log()
+        except Exception:
+            pass  # audit_log 写入失败不影响主流程拒绝
+        raise PermissionError(
+            "R51 P1-6: recover_maintenance requires request_hash"
+        )
 
     store = get_cache_store()
     if not store._db:
@@ -1156,16 +1250,17 @@ async def recover_maintenance(
             f"principal {principal_id} 无 maintenance:recover 权限"
         )
 
-    # 4. 通过验证 → 调用 disable(force=True, approval_action_id=...)
+    # 4. 通过验证 → 调用 disable(force=True, approval_action_id=..., request_hash=...)
     logger.info(
         f"[Maintenance] recover_maintenance 验证通过,关闭维护模式: "
         f"principal={principal_id} reason={reason} "
-        f"approval_action_id={approval_action_id}"
+        f"approval_action_id={approval_action_id} request_hash={request_hash}"
     )
     ok = await disable(
         ended_by=principal_id,
         force=True,
         approval_action_id=approval_action_id,
+        request_hash=request_hash,
     )
     if ok:
         # 重置 recover_status='completed'(允许后续正常 disable)

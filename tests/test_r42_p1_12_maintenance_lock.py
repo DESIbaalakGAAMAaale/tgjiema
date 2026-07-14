@@ -4,8 +4,13 @@
 - ``services.maintenance_mode.execute_maintenance_workflow`` 失败分支设置 recover_status='pending'
 - ``services.maintenance_mode.disable`` 增加 approval_action_id 参数(recover_status='pending' 时校验)
 - ``services.maintenance_mode.enable`` 重置 recover_status='completed'(新维护周期开始)
-- ``services.maintenance_mode.recover_maintenance(principal_id, reason, approval_action_id)``
+- ``services.maintenance_mode.recover_maintenance(principal_id, reason, approval_action_id, request_hash)``
 - ``services.rbac.PERMISSION_MAINTENANCE_RECOVER`` 权限常量 + 角色映射
+
+R51 P1-6 适配:
+    disable / recover_maintenance 在 recover_status='pending' 时新增 request_hash 强制绑定,
+    所有调用必须同时提供 request_hash + approval_action_id + principal(ended_by)。
+    本测试已更新所有调用点以适配此要求。
 
 测试场景(15 个用例):
  1. workflow 失败时 maintenance_kept_enabled=True
@@ -29,6 +34,7 @@
 - Mock drain_queues / trigger_backup / check_readiness 模拟 workflow 各步骤
 - Mock services.rbac.check_permission 控制权限放行/拒绝
 - 通过直接 INSERT command_executions 模拟 CommandBus 审批结果
+- R51 P1-6: 所有 disable / recover_maintenance 调用传入 request_hash="test_hash_001"
 """
 import inspect
 import shutil
@@ -39,6 +45,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+
+# R51 P1-6 适配: 全测试统一的 request_hash 值(与 _insert_command_execution 默认值一致)
+_TEST_REQUEST_HASH = "test_hash_001"
 
 # ── Mock telegram 模块(避免依赖真实 telegram 库) ───────────────
 sys.modules.setdefault("telegram", MagicMock())
@@ -300,13 +309,15 @@ class TestDisableRejectsWhenRecoverPending:
             real_store, approval_action_id, status="executed",
         )
 
-        # 调用 disable(带 approval_action_id)应成功
+        # 调用 disable(带 approval_action_id + request_hash)应成功
+        # R51 P1-6: recover_status=pending 时必须同时提供 request_hash + approval_action_id + principal
         result = await maintenance_mode.disable(
             ended_by=100,
             approval_action_id=approval_action_id,
+            request_hash=_TEST_REQUEST_HASH,
         )
         assert result is True, \
-            "recover_status=pending + 有效 approval_action_id 时 disable 应成功"
+            "recover_status=pending + 有效 approval_action_id + request_hash 时 disable 应成功"
 
         # 验证:maintenance_state 已关闭
         enabled = await maintenance_mode.is_enabled()
@@ -330,10 +341,12 @@ class TestDisableRejectsWhenRecoverPending:
             real_store, approval_action_id, status="executing",
         )
 
+        # R51 P1-6: 必须传 request_hash,否则会在 approval 状态检查之前就抛 request_hash 异常
         with pytest.raises(maintenance_mode.MaintenancePreconditionError) as exc_info:
             await maintenance_mode.disable(
                 ended_by=100,
                 approval_action_id=approval_action_id,
+                request_hash=_TEST_REQUEST_HASH,
             )
 
         assert "executed" in str(exc_info.value).lower() or \
@@ -358,10 +371,12 @@ class TestDisableRejectsWhenRecoverPending:
         # 不插入任何 command_executions 记录,直接使用不存在的 action_id
         nonexistent_action_id = "nonexistent_recover_action"
 
+        # R51 P1-6: 必须传 request_hash,否则会在 approval 不存在检查之前就抛 request_hash 异常
         with pytest.raises(maintenance_mode.MaintenancePreconditionError) as exc_info:
             await maintenance_mode.disable(
                 ended_by=100,
                 approval_action_id=nonexistent_action_id,
+                request_hash=_TEST_REQUEST_HASH,
             )
 
         assert "不存在" in str(exc_info.value) or \
@@ -410,11 +425,13 @@ class TestRecoverMaintenanceValidation:
             real_store, approval_action_id, status="executing",
         )
 
+        # R51 P1-6: 必须传 request_hash,否则会在 approval 状态检查之前就抛 request_hash 异常
         with pytest.raises(PermissionError) as exc_info:
             await maintenance_mode.recover_maintenance(
                 principal_id=100,
                 reason="尝试未完成审批恢复",
                 approval_action_id=approval_action_id,
+                request_hash=_TEST_REQUEST_HASH,
             )
 
         assert "executed" in str(exc_info.value).lower() or \
@@ -430,11 +447,13 @@ class TestRecoverMaintenanceValidation:
 
         await maintenance_mode.enable("测试 approval 不存在", started_by=100)
 
+        # R51 P1-6: 必须传 request_hash,否则会在 approval 不存在检查之前就抛 request_hash 异常
         with pytest.raises(PermissionError) as exc_info:
             await maintenance_mode.recover_maintenance(
                 principal_id=100,
                 reason="尝试不存在的 approval 恢复",
                 approval_action_id="nonexistent_action_id_xxx",
+                request_hash=_TEST_REQUEST_HASH,
             )
 
         assert "不存在" in str(exc_info.value) or \
@@ -462,11 +481,13 @@ class TestRecoverMaintenanceValidation:
             "services.rbac.check_permission",
             new=AsyncMock(return_value=False),
         ):
+            # R51 P1-6: 必须传 request_hash,否则会在 RBAC 权限校验之前就抛 request_hash 异常
             with pytest.raises(PermissionError) as exc_info:
                 await maintenance_mode.recover_maintenance(
                     principal_id=100,
                     reason="无权限恢复",
                     approval_action_id=approval_action_id,
+                    request_hash=_TEST_REQUEST_HASH,
                 )
 
         assert "maintenance:recover" in str(exc_info.value) or \
@@ -511,10 +532,12 @@ class TestRecoverMaintenanceSuccess:
             "services.rbac.check_permission",
             new=AsyncMock(return_value=True),
         ):
+            # R51 P1-6: 必须传 request_hash 绑定审批动作 + principal + 请求来源
             ok = await maintenance_mode.recover_maintenance(
                 principal_id=100,
                 reason="审批通过后恢复",
                 approval_action_id=approval_action_id,
+                request_hash=_TEST_REQUEST_HASH,
             )
 
         assert ok is True, "通过验证后 recover_maintenance 应返回 True"
@@ -544,10 +567,12 @@ class TestRecoverMaintenanceSuccess:
             "services.rbac.check_permission",
             new=AsyncMock(return_value=True),
         ):
+            # R51 P1-6: 必须传 request_hash 绑定审批动作 + principal + 请求来源
             await maintenance_mode.recover_maintenance(
                 principal_id=100,
                 reason="审批通过写审计",
                 approval_action_id=approval_action_id,
+                request_hash=_TEST_REQUEST_HASH,
             )
 
         # 验证:audit_log 中有 action='recover_maintenance' 记录
@@ -584,10 +609,12 @@ class TestRecoverMaintenanceSuccess:
             "services.rbac.check_permission",
             new=AsyncMock(return_value=True),
         ):
+            # R51 P1-6: 必须传 request_hash 绑定审批动作 + principal + 请求来源
             await maintenance_mode.recover_maintenance(
                 principal_id=100,
                 reason="恢复后重置状态",
                 approval_action_id=approval_action_id,
+                request_hash=_TEST_REQUEST_HASH,
             )
 
         # recover_status 应被重置为 completed

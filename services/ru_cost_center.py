@@ -18,6 +18,20 @@ RU 单价参考(CockroachDB Cloud 定价):
     - 每次读 1 RU
     - 每次写 2 RU
     - 每次查询 3 RU(含网络/计算)
+
+R51 P1-7: 估算 RU vs 官方 CockroachDB Cloud Metrics 区分
+    本模块存在两种 RU 数据来源:
+    1. **估算值**(ru_estimated=1):
+       由 record_usage() / record_migration_usage() / record_backup_usage() /
+       record_restore_usage() 记录,基于 RU_PER_READ/WRITE/QUERY 常量估算。
+       适用于业务侧自统计(如 Bot 内部操作计数),不依赖 CRDB Cloud API。
+       缺点:无法反映真实 CRDB 负载(如网络/重试/事务回滚导致的额外 RU)。
+    2. **官方值**(ru_estimated=0):
+       由 record_official_usage() 记录,数据来源为 CockroachDB Cloud 官方 Metrics
+       (通过 crdb_ru_collector.fetch_ru_from_crdb_cloud() 采集)。
+       适用于精准成本核算与预算告警,但需要 CRDB Cloud API 凭证。
+    两者不能互相替代:估算值用于业务自省,官方值用于成本核算。
+    Prometheus 指标 tgjiema_ru_daily_usage{service,ru_estimated} 通过 label 区分。
 """
 from __future__ import annotations
 
@@ -56,14 +70,30 @@ CRITICAL_THRESHOLD = 0.95  # 95% 严重
 
 
 async def record_usage(service: str, operation: str, ru_amount: int,
-                       user_id: int = 0) -> bool:
+                       user_id: int = 0,
+                       ru_estimated: bool = True) -> bool:
     """记录 RU 使用。
+
+    R51 P1-7: 新增 ``ru_estimated`` 参数区分估算值与官方值。
+    - 估算值(``ru_estimated=True``,默认):基于 RU_PER_READ/WRITE/QUERY 常量估算,
+      适用于业务侧自统计。
+    - 官方值(``ru_estimated=False``):由 CockroachDB Cloud 官方 Metrics 采集,
+      应通过 ``record_official_usage()`` 调用以确保语义清晰。
+
+    数据格式(kv_store JSON):
+        {
+            "total_ru": int,
+            "by_operation": {op: amount},
+            "events": [...],
+            "ru_estimated": int,   # R51 P1-7: 1=估算, 0=官方
+        }
 
     Args:
         service: 服务名(必须在 SERVICES 列表中)
         operation: 操作类型 read/write/query/sync/migration
         ru_amount: RU 消耗量(必须 > 0)
         user_id: 触发用户(可选,记入明细)
+        ru_estimated: R51 P1-7 是否为估算值(True=估算, False=官方)
 
     Returns:
         True 记录成功, False 失败
@@ -95,6 +125,21 @@ async def record_usage(service: str, operation: str, ru_amount: int,
         ops[operation] = ops.get(operation, 0) + ru_amount
         data["by_operation"] = ops
 
+        # R51 P1-7: 记录 ru_estimated 标记(1=估算, 0=官方)
+        # 保守策略:一旦服务被标记为估算(ru_estimated=1),后续官方值不覆盖该标记
+        # (因为估算值与官方值混合时,整体仍应视为估算,避免误信精度)
+        # 新数据(无 ru_estimated 字段)按入参设置
+        has_existing_estimated = "ru_estimated" in data
+        if ru_estimated:
+            # 估算值:强制标记为 1(无论是否已有官方值)
+            data["ru_estimated"] = 1
+        else:
+            # 官方值:若已有估算标记(1)则保留(保守);否则设为 0
+            if has_existing_estimated and data.get("ru_estimated") == 1:
+                data["ru_estimated"] = 1  # 保留已有估算标记
+            else:
+                data["ru_estimated"] = 0  # 新数据或已有官方值 → 设为官方
+
         # 事件明细(限制最多 100 条,避免 JSON 膨胀)
         events = data.get("events", [])
         events.append({
@@ -102,6 +147,7 @@ async def record_usage(service: str, operation: str, ru_amount: int,
             "operation": operation,
             "ru": ru_amount,
             "user_id": user_id,
+            "ru_estimated": 1 if ru_estimated else 0,
         })
         if len(events) > 100:
             events = events[-100:]
@@ -110,7 +156,8 @@ async def record_usage(service: str, operation: str, ru_amount: int,
         await store.set_kv(key, json.dumps(data, ensure_ascii=False))
         logger.debug(
             f"[RUCostCenter] 记录 RU: service={service} op={operation} "
-            f"ru={ru_amount} total={data['total_ru']}"
+            f"ru={ru_amount} total={data['total_ru']} "
+            f"ru_estimated={data['ru_estimated']}"
         )
         return True
     except Exception as e:
@@ -118,14 +165,57 @@ async def record_usage(service: str, operation: str, ru_amount: int,
         return False
 
 
+async def record_official_usage(service: str, ru_amount: int,
+                                operation: str = "official_metric") -> bool:
+    """R51 P1-7: 记录 CockroachDB Cloud 官方 Metrics RU 消耗。
+
+    与 ``record_usage`` 的差异:
+        - 数据来源:CockroachDB Cloud 官方 API(非估算)
+        - ``ru_estimated=False``(标记为官方值)
+        - 用于精准成本核算与预算告警
+
+    数据来源建议:
+        通过 ``services.crdb_ru_collector.fetch_ru_from_crdb_cloud()`` 采集,
+        采集成功后调用本函数持久化到 kv_store。
+
+    Args:
+        service: 服务名(必须在 SERVICES 列表中)
+        ru_amount: 官方 RU 消耗量(必须 > 0)
+        operation: 操作类型(默认 'official_metric')
+
+    Returns:
+        True 记录成功, False 失败
+    """
+    if not service or service not in SERVICES:
+        logger.warning(f"[RUCostCenter] record_official_usage 未知服务: {service}")
+        return False
+    if ru_amount <= 0:
+        return False
+    # 调用 record_usage 并显式标记 ru_estimated=False
+    return await record_usage(
+        service=service,
+        operation=operation,
+        ru_amount=ru_amount,
+        ru_estimated=False,
+    )
+
+
 async def get_daily_report(date: str | None = None) -> dict:
     """获取某日 RU 报告。
+
+    R51 P1-7: 返回结果新增 ``by_service_estimated`` 字段,标注每个服务的 RU 是否为估算值。
 
     Args:
         date: 日期字符串 YYYYMMDD,None 表示今天
 
     Returns:
-        {date, total_ru, by_service: {service: amount}, by_operation: {op: amount}}
+        {
+            date: str,
+            total_ru: int,
+            by_service: {service: amount},
+            by_operation: {op: amount},
+            by_service_estimated: {service: int},  # R51 P1-7: 1=估算, 0=官方
+        }
     """
     store = get_cache_store()
     if date is None:
@@ -134,6 +224,8 @@ async def get_daily_report(date: str | None = None) -> dict:
     total_ru = 0
     by_service: dict[str, int] = {}
     by_operation: dict[str, int] = {}
+    # R51 P1-7: 每个服务的 ru_estimated 标记(1=估算, 0=官方)
+    by_service_estimated: dict[str, int] = {}
 
     for service in SERVICES:
         key = f"ru_usage:{date}:{service}"
@@ -145,6 +237,9 @@ async def get_daily_report(date: str | None = None) -> dict:
             svc_total = data.get("total_ru", 0)
             by_service[service] = svc_total
             total_ru += svc_total
+
+            # R51 P1-7: 提取 ru_estimated 标记(默认 1=估算,兼容旧数据)
+            by_service_estimated[service] = data.get("ru_estimated", 1)
 
             # 聚合操作类型
             ops = data.get("by_operation", {})
@@ -158,6 +253,7 @@ async def get_daily_report(date: str | None = None) -> dict:
         "total_ru": total_ru,
         "by_service": by_service,
         "by_operation": by_operation,
+        "by_service_estimated": by_service_estimated,
     }
 
 

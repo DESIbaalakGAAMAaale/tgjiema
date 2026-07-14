@@ -107,6 +107,8 @@ _R2_COLLECT_FRESH_THRESHOLD = 3600  # 1 小时无 R2 采集 → 不 ready
 _r40_state: dict[str, Any] = {
     "maintenance_enabled": 0,
     "ru_daily_usage": {},           # {service: amount}
+    # R51 P1-7: 每个服务的 RU 是否为估算值(1=估算, 0=官方 CockroachDB Cloud Metrics)
+    "ru_daily_usage_estimated": {},  # {service: int}
     "replica_missing_count": 0,
     "quota_reservations_active": 0,
     "content_reports_pending": 0,
@@ -333,29 +335,60 @@ _HIGH_CARDINALITY_LABELS = frozenset({
     "job_id", "phone", "token", "spool_id", "msg_id",
 })
 
+# R51 P1-7: 高基数 label 处理模式
+# - "ci":在 CI/测试环境中 fail(raise AppError,用于门禁)
+# - "runtime":运行时丢弃违规 metric(不输出该行,避免 TSDB 膨胀)
+# 通过环境变量 PROMETHEUS_HIGH_CARDINALITY_MODE 控制(默认 runtime)
+_HIGH_CARDINALITY_MODE = os.getenv("PROMETHEUS_HIGH_CARDINALITY_MODE", "runtime").lower()
 
-def _check_no_high_cardinality_labels(metric_line: str) -> None:
-    """R38 P2-7: 检查指标行不含高基数 label。
 
-    在 collect_metrics() 输出前调用,发现违规 label 时记录警告(不阻断输出,
-    避免 exporter 不可用导致监控盲区),但会在日志中留下审计痕迹。
+def _check_no_high_cardinality_labels(metric_line: str) -> bool:
+    """R38 P2-7 + R51 P1-7: 检查指标行不含高基数 label。
+
+    R51 P1-7 行为变更:
+        - CI/测试模式(PROMETHEUS_HIGH_CARDINALITY_MODE=ci):
+          发现违规 label 时 raise AppError(METRICS_HIGH_CARDINALITY_LABEL),
+          用于 CI 门禁阻断(防止违规代码合入)
+        - 运行时模式(默认 runtime):
+          发现违规 label 时返回 False(指示丢弃该 metric 行),
+          不输出该行以避免 Prometheus TSDB 时间序列爆炸;
+          同时记录 warning 日志保留审计痕迹
 
     Args:
         metric_line: 单行 Prometheus 指标文本(如 'relay_spool_status_count{status="RECEIVED"} 5')
+
+    Returns:
+        True 表示指标行安全(可输出);False 表示含高基数 label(应丢弃)
     """
     # 提取 {...} 内的 label 部分
     if "{" not in metric_line or "}" not in metric_line:
-        return
+        return True
     label_section = metric_line[metric_line.index("{") + 1: metric_line.index("}")]
     for pair in label_section.split(","):
         if "=" not in pair:
             continue
         label_name = pair.split("=")[0].strip()
         if label_name in _HIGH_CARDINALITY_LABELS:
+            # R51 P1-7: 提取 metric 名(行首到 { 之间)
+            metric_name = metric_line.split("{")[0].strip()
+            if _HIGH_CARDINALITY_MODE == "ci":
+                # CI 模式:raise AppError 阻断
+                from services.error_codes import AppError, ErrorCodes
+                logger.error(
+                    f"[R51-P1-7] CI 模式检测到高基数 label '{label_name}' "
+                    f"在指标行: {metric_line[:80]}... — 阻断输出"
+                )
+                raise AppError(
+                    ErrorCodes.METRICS_HIGH_CARDINALITY_LABEL,
+                    params={"label": label_name, "metric": metric_name},
+                )
+            # 运行时模式:记录 warning + 返回 False(丢弃该行)
             logger.warning(
-                f"[R38-P2-7] 检测到高基数 label '{label_name}' 在指标行: "
-                f"{metric_line[:80]}... — 高基数 label 会导致 TSDB 膨胀,应移除"
+                f"[R51-P1-7] 运行时检测到高基数 label '{label_name}' "
+                f"在指标行: {metric_line[:80]}... — 已丢弃该 metric(避免 TSDB 膨胀)"
             )
+            return False
+    return True
 
 
 def collect_metrics() -> str:
@@ -460,24 +493,53 @@ def collect_metrics() -> str:
     lines.append(f"tgjiema_crdb_idle_ru_alert {idle_alert}")
 
     # 2. redis_pel_depth — Redis Stream pending entries 长度
-    pel_str = _read_kv_value("redis_pel_depth", "0")
+    # R51 P1-7: 采集失败时输出 collector_success=0 + collector_status="error",
+    # 不输出 0 伪装健康(0 可能是真实值,无法区分)
+    pel_str = _read_kv_value("redis_pel_depth", "")
+    pel_collector_ok = True
     try:
         pel_depth = float(pel_str)
     except (TypeError, ValueError):
-        pel_depth = 0.0
+        # 解析失败 → 标记 collector 失败,不输出 0
+        pel_depth = None
+        pel_collector_ok = False
+        logger.warning(
+            "[R51-P1-7] redis_pel_depth 采集失败(无法解析为 float),"
+            "输出 collector_success=0"
+        )
     lines.append("# HELP redis_pel_depth Redis Stream pending entries length")
     lines.append("# TYPE redis_pel_depth gauge")
-    lines.append(f"redis_pel_depth {pel_depth}")
+    if pel_depth is not None:
+        lines.append(f"redis_pel_depth {pel_depth}")
+    else:
+        # R51 P1-7: 采集失败时输出 collector_success=0 + collector_status=error
+        lines.append('redis_pel_depth{collector_status="error"} 0')
+        lines.append('redis_pel_depth_collector_success{collector="redis_pel"} 0')
+        lines.append("# HELP redis_pel_depth_collector_success redis_pel_depth 采集器状态(1=ok, 0=failed)")
+        lines.append("# TYPE redis_pel_depth_collector_success gauge")
 
     # 3. dlq_depth — 死信队列深度
-    dlq_str = _read_kv_value("dlq_depth", "0")
+    # R51 P1-7: 采集失败时输出 collector_success=0,不输出 0 伪装健康
+    dlq_str = _read_kv_value("dlq_depth", "")
+    dlq_collector_ok = True
     try:
         dlq_depth = float(dlq_str)
     except (TypeError, ValueError):
-        dlq_depth = 0.0
+        dlq_depth = None
+        dlq_collector_ok = False
+        logger.warning(
+            "[R51-P1-7] dlq_depth 采集失败(无法解析为 float),"
+            "输出 collector_success=0"
+        )
     lines.append("# HELP dlq_depth Dead letter queue depth")
     lines.append("# TYPE dlq_depth gauge")
-    lines.append(f"dlq_depth {dlq_depth}")
+    if dlq_depth is not None:
+        lines.append(f"dlq_depth {dlq_depth}")
+    else:
+        lines.append('dlq_depth{collector_status="error"} 0')
+        lines.append('dlq_depth_collector_success{collector="dlq"} 0')
+        lines.append("# HELP dlq_depth_collector_success dlq_depth 采集器状态(1=ok, 0=failed)")
+        lines.append("# TYPE dlq_depth_collector_success gauge")
 
     # 4. dirty_outbox_rows — upload_outbox 表未完成行数
     dirty = _read_sqlite_single(
@@ -586,10 +648,19 @@ def collect_metrics() -> str:
     # R40: 追加 R40 新增指标(在高基数审计前加入,使 R38 P2-7 检查覆盖 R40)
     lines.extend(_format_r40_metrics())
 
-    # R38 P2-7: 输出前审计高基数 label(仅日志告警,不阻断输出)
+    # R38 P2-7 + R51 P1-7: 输出前审计高基数 label
+    # - CI 模式:发现违规 raise AppError(阻断)
+    # - 运行时模式:丢弃违规 metric 行(不输出)
+    filtered_lines: list[str] = []
     for line in lines:
-        if not line.startswith("#"):
-            _check_no_high_cardinality_labels(line)
+        if line.startswith("#"):
+            # HELP/TYPE 注释行保留(不影响高基数检查)
+            filtered_lines.append(line)
+            continue
+        # 检查数据行,违规则丢弃(运行时)或 raise(CI)
+        if _check_no_high_cardinality_labels(line):
+            filtered_lines.append(line)
+    lines = filtered_lines
 
     # R39 P1-8: 新增 readiness 指标 — scrape_errors / data_age_seconds / readiness_checks
     global _last_scrape_ok, _last_scrape_ts, _scrape_errors
@@ -630,35 +701,52 @@ def collect_metrics() -> str:
     lines.append("# TYPE tgjiema_readiness_status gauge")
     lines.append(f"tgjiema_readiness_status {1 if readiness['ready'] else 0}")
 
-    # R44 6.2: tgjiema_i18n_missing_key_total — i18n key 缺失累计计数(Counter)
+    # R44 6.2 + R51 P1-7: tgjiema_i18n_missing_key_total — i18n key 缺失累计计数(Counter)
     # 用于告警:i18n key 缺失可能暴露内部 key 给用户(违反 R44 6.2 安全要求)
     # 数据来源: services.i18n.I18nManager.get_missing_key_count()
     # label: locale(低基数,通常 zh-CN / en-US 两种)
+    # R51 P1-7: 采集失败时输出 collector_success=0 + collector_status="error",
+    # 不输出 0(0 可能是真实值,无法区分;unknown 不应伪装为健康)
+    i18n_collector_ok = False
+    i18n_missing_key_total: int | None = None
     try:
         from services.i18n import get_i18n_manager
 
         i18n_manager = get_i18n_manager()
-        missing_key_total = i18n_manager.get_missing_key_count()
-        # 按当前已加载 locale 拆分(简化为单值,因计数器未按 locale 区分)
-        # 这里输出总计数,label=total 表示聚合值
-        lines.append(
-            "# HELP tgjiema_i18n_missing_key_total Total number of missing "
-            "i18n keys encountered (high values indicate missing translations)"
+        i18n_missing_key_total = i18n_manager.get_missing_key_count()
+        i18n_collector_ok = True
+    except Exception as e:
+        # R51 P1-7: i18n 模块未初始化或采集失败 → 输出 collector_success=0
+        logger.warning(
+            f"[R51-P1-7] i18n missing_key metric 采集失败,输出 collector_success=0: {e}"
         )
-        lines.append("# TYPE tgjiema_i18n_missing_key_total counter")
+        i18n_collector_ok = False
+
+    lines.append(
+        "# HELP tgjiema_i18n_missing_key_total Total number of missing "
+        "i18n keys encountered (high values indicate missing translations)"
+    )
+    lines.append("# TYPE tgjiema_i18n_missing_key_total counter")
+    if i18n_collector_ok and i18n_missing_key_total is not None:
+        # 采集成功:输出真实计数
         lines.append(
             f'tgjiema_i18n_missing_key_total{{locale="total"}} '
-            f'{missing_key_total}'
+            f'{i18n_missing_key_total}'
         )
-    except Exception as e:
-        # i18n 模块未初始化时输出 0,避免 exporter 崩溃
-        logger.debug(f"[R44] i18n missing_key metric 采集失败: {e}")
+    else:
+        # R51 P1-7: 采集失败 → 输出 collector_success=0 + collector_status=error
+        # 不输出 0 伪装健康(0 可能是真实值)
         lines.append(
-            "# HELP tgjiema_i18n_missing_key_total Total number of missing "
-            "i18n keys encountered (high values indicate missing translations)"
+            'tgjiema_i18n_missing_key_total{locale="total", collector_status="error"} 0'
         )
-        lines.append("# TYPE tgjiema_i18n_missing_key_total counter")
-        lines.append('tgjiema_i18n_missing_key_total{locale="total"} 0')
+        lines.append(
+            'tgjiema_i18n_collector_success{collector="i18n_missing_key"} 0'
+        )
+        lines.append(
+            "# HELP tgjiema_i18n_collector_success i18n missing_key 采集器状态"
+            "(1=ok, 0=failed)"
+        )
+        lines.append("# TYPE tgjiema_i18n_collector_success gauge")
 
     return "\n".join(lines) + "\n"
 
@@ -895,6 +983,8 @@ async def collect_r40_metrics() -> None:
     new_state: dict[str, Any] = {
         "maintenance_enabled": 0,
         "ru_daily_usage": {},
+        # R51 P1-7: 每个服务的 RU 估算标记(1=估算, 0=官方)
+        "ru_daily_usage_estimated": {},
         "replica_missing_count": 0,
         "quota_reservations_active": 0,
         "content_reports_pending": 0,
@@ -925,11 +1015,15 @@ async def collect_r40_metrics() -> None:
         logger.debug(f"[R40] 采集 maintenance_enabled 失败: {e}")
 
     # 2. ru_daily_usage + ru_operations_total — RU 当日使用量(按服务/操作)
+    # R51 P1-7: 同时采集 ru_estimated 标记,区分估算值与官方 CockroachDB Cloud Metrics
     try:
         from services.ru_cost_center import get_daily_report, SERVICES
         report = await get_daily_report()
         for service, amount in report.get("by_service", {}).items():
             new_state["ru_daily_usage"][service] = amount
+        # R51 P1-7: 采集每个服务的 ru_estimated 标记(1=估算, 0=官方)
+        for service, estimated in report.get("by_service_estimated", {}).items():
+            new_state["ru_daily_usage_estimated"][service] = int(estimated)
         # ru_operations_total: 按服务维度解析 kv_store 中的 by_operation
         today = _dt.datetime.now().strftime("%Y%m%d")
         from database.cache_store import get_cache_store as _get_store
@@ -1142,15 +1236,28 @@ def _format_r40_metrics() -> list[str]:
     lines.append("# TYPE tgjiema_maintenance_enabled gauge")
     lines.append(f"tgjiema_maintenance_enabled {state.get('maintenance_enabled', 0)}")
 
-    # tgjiema_ru_daily_usage{service} (Gauge)
-    lines.append("# HELP tgjiema_ru_daily_usage 当日 RU 使用量(按服务)")
+    # tgjiema_ru_daily_usage{service,ru_estimated} (Gauge)
+    # R51 P1-7: 新增 ru_estimated label 区分估算值(1)与官方 CockroachDB Cloud Metrics(0)
+    # - ru_estimated=1: 基于 RU_PER_READ/WRITE/QUERY 常量估算(业务自统计)
+    # - ru_estimated=0: 来自 CockroachDB Cloud 官方 API(crdb_ru_collector 采集)
+    # 两者不能互相替代:估算值用于业务自省,官方值用于成本核算
+    lines.append(
+        "# HELP tgjiema_ru_daily_usage 当日 RU 使用量(按服务,"
+        "label ru_estimated: 1=估算值, 0=官方 CockroachDB Cloud Metrics)"
+    )
     lines.append("# TYPE tgjiema_ru_daily_usage gauge")
     ru_usage = state.get("ru_daily_usage", {})
+    # R51 P1-7: 每个服务的 ru_estimated 标记(默认 1=估算,兼容旧数据)
+    ru_estimated_map = state.get("ru_daily_usage_estimated", {})
     if ru_usage:
         for service, amount in sorted(ru_usage.items()):
-            lines.append(f'tgjiema_ru_daily_usage{{service="{_escape(service)}"}} {amount}')
+            estimated_flag = ru_estimated_map.get(service, 1)
+            lines.append(
+                f'tgjiema_ru_daily_usage{{service="{_escape(service)}",'
+                f'ru_estimated="{estimated_flag}"}} {amount}'
+            )
     else:
-        lines.append('tgjiema_ru_daily_usage{service="unknown"} 0')
+        lines.append('tgjiema_ru_daily_usage{service="unknown",ru_estimated="1"} 0')
 
     # tgjiema_replica_missing_count (Gauge)
     lines.append("# HELP tgjiema_replica_missing_count 缺失副本数量")
