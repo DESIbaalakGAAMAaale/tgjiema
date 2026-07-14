@@ -894,7 +894,6 @@ def invalidate_user_locale_cache(user_id: Optional[int] = None) -> int:
     Returns:
         被移除的缓存条目数
     """
-    global _user_locale_cache
     if user_id is None:
         removed = len(_user_locale_cache)
         _user_locale_cache.clear()
