@@ -141,12 +141,17 @@ async def _seed_completed_receipt(
     store, action_id: str, effect_type: str, target: str,
     external_id: str = "msg_42",
 ):
-    """预置一条 status='completed' 的 receipt(模拟崩溃前已完成的场景)。"""
+    """预置一条 status='completed' 的 receipt(模拟崩溃前已完成的场景)。
+
+    R48 P0-4: request_hash 设为空字符串(非 NULL)以满足 CHECK 约束,
+    同时保持 check_receipt 的向后兼容行为(stored_hash 为空时跳过 hash 校验)。
+    """
     now = datetime.datetime.utcnow().isoformat()
     await store._db.execute(
         "INSERT OR REPLACE INTO effect_receipts "
-        "(action_id, effect_type, target, status, external_id, created_at, completed_at) "
-        "VALUES (?, ?, ?, 'completed', ?, ?, ?)",
+        "(action_id, effect_type, target, status, external_id, created_at, "
+        " completed_at, request_hash) "
+        "VALUES (?, ?, ?, 'completed', ?, ?, ?, '')",
         (action_id, effect_type, target, external_id, now, now),
     )
     await store._db.commit()
@@ -173,7 +178,10 @@ class TestWithEffectReceiptDecorator:
 
         call_count = 0
 
-        @with_effect_receipt("telegram_send", lambda *a, **kw: "chat:42")
+        @with_effect_receipt(
+            "telegram_send", lambda *a, **kw: "chat:42",
+            params_fn=lambda *a, **kw: {"chat_id": a[0], "text": a[1]},
+        )
         async def send_message(chat_id, text):
             nonlocal call_count
             call_count += 1
@@ -194,7 +202,10 @@ class TestWithEffectReceiptDecorator:
 
         store = clean_tables
 
-        @with_effect_receipt("telegram_send", lambda *a, **kw: f"chat:{a[0]}")
+        @with_effect_receipt(
+            "telegram_send", lambda *a, **kw: f"chat:{a[0]}",
+            params_fn=lambda *a, **kw: {"chat_id": a[0], "text": a[1]},
+        )
         async def send_message(chat_id, text):
             return {"message_id": 12345, "text": text}
 
@@ -304,6 +315,7 @@ class TestEffectReceiptContext:
                 action_id="act_6",
                 effect_type="telegram_send",
                 target="chat:99",
+                params={"chat_id": 99, "text": "test"},
             ) as receipt:
                 assert receipt.skipped is False
                 raise ValueError("simulated failure")
@@ -329,6 +341,7 @@ class TestEffectReceiptContext:
             action_id="act_7",
             effect_type="telegram_send",
             target="chat:77",
+            params={"chat_id": 77, "text": "skip_test"},
         ) as receipt:
             assert receipt.skipped is True
             assert receipt.external_id == "msg_77"
@@ -351,6 +364,7 @@ class TestEffectReceiptContext:
             action_id="act_8",
             effect_type="telegram_send",
             target="chat:88",
+            params={"chat_id": 88, "text": "no_record_test"},
         ) as receipt:
             receipt.mark_no_record()
             # 模拟早返回(未实际发送)

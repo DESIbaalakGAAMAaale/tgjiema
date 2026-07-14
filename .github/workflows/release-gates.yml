@@ -22,28 +22,30 @@ name: Release Gates
 #   9. trivy                    — trivy 文件系统扫描(失败仅警告)
 #   10. sign-image              — cosign 镜像签名(占位)
 #
-# branch protection 必需 context (R47 P0-1/P0-2 整改后统一为 4 个核心 context):
-#   - CI
-#   - Deploy Check
-#   - Release Gates
-#   - E2E
+# branch protection 必需 context(R48 P0-2 整改后改为动态检测,不再硬编码):
+#   旧版本硬编码 ("CI" "Deploy Check" "Release Gates" "E2E"),
+#   但实际 check run 名称是 "{workflow_name} / {job_name}",
+#   如 "CI / test (3.11)" / "Release Gates / docker-build" / "E2E Tests / playwright-e2e",
+#   导致 BP context 与实际 check-runs 错配,PR 永久阻塞。
+#   R48 整改:verify-branch-protection 通过 gh api 读取最新 master commit 的
+#   check-runs,与 BP 中的 required_status_checks.contexts 做集合比对,
+#   并断言 CI / Deploy Check / Release Gates / E2E Tests 四个 workflow 前缀
+#   至少各有一个 context 覆盖。
+#
 # R47 P0-1/P0-2: 所有 job 阻断式,无 continue-on-error,无 `|| true` 兜底;
 #                 verify-branch-protection 严格断言所有 BP 属性(strict /
 #                 enforce_admins / review>=1 / allow_force_pushes=false /
-#                 allow_deletions=false)并逐个断言 contexts 集合
+#                 allow_deletions=false)并断言 contexts 集合与实际 check-runs 一致
 #
 # 配置命令(管理员 PAT):
-#   gh api repos/:owner/:repo/branches/master/protection -X PUT \
-#     -f required_status_checks[strict]=true \
-#     -f required_status_checks[contexts][]=CI \
-#     -f required_status_checks[contexts][]="Deploy Check" \
-#     -f required_status_checks[contexts][]="Release Gates" \
-#     -f required_status_checks[contexts][]=E2E \
-#     -f enforce_admins=true \
-#     -f required_pull_request_reviews[required_approving_review_count]=1 \
-#     -f allow_force_pushes=false \
-#     -f allow_deletions=false
-# 或直接运行: bash scripts/configure_branch_protection.sh
+#   # 推荐:自动检测实际 check-runs 名称后再配置
+#   bash scripts/detect_branch_protection_contexts.sh > contexts.json
+#   bash scripts/configure_branch_protection.sh
+#   # 或手动指定 contexts(JSON 数组)
+#   CONTEXTS_JSON='["CI / test (3.11)","Deploy Check / verify-deploy", \
+#                   "Release Gates / verify-branch-protection", \
+#                   "E2E Tests / playwright-e2e"]' \
+#     bash scripts/configure_branch_protection.sh
 
 on:
   push:
@@ -387,10 +389,16 @@ jobs:
           tgjiema-${{ github.sha }}.sig
         retention-days: 90
 
-  # ─── R44/R46/R47: branch protection 审计 ─────────────────────
+  # ─── R44/R46/R47/R48: branch protection 审计 ─────────────────
   # 验证 master 分支已配置 branch protection(必需 status checks + PR review)
   # R47 P0-1/P0-2: 严格断言所有 BP 属性,不允许 continue-on-error,
   #                不允许 `|| true` 兜底,失败必须阻断并输出当前配置供调试
+  # R48 P0-2: 修复 context 名称错配 —— 不再硬编码 "CI"/"Deploy Check" 等,
+  #           改为读取最新 master commit 的 check-runs,断言 BP contexts 与
+  #           实际 check-runs 集合一致,并断言四个核心 workflow 前缀
+  #           (CI / / Deploy Check / / Release Gates / / E2E Tests /)各至少
+  #           有一个 context 覆盖。失败时输出完整诊断(BP JSON、check-runs、
+  #           差异、修复命令)。
   verify-branch-protection:
     runs-on: ubuntu-latest
     steps:
@@ -399,11 +407,55 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # R47 P0-2: 严格断言所有 Branch Protection 属性,任何失败必须阻断
+        # R47/R48 P0-2: 严格断言所有 Branch Protection 属性,任何失败必须阻断
         set -euo pipefail
 
-        # R47 整改后统一要求的 4 个核心 status check context
-        REQUIRED_CONTEXTS=("CI" "Deploy Check" "Release Gates" "E2E")
+        # R48 P0-2: 四个核心 workflow 前缀,BP contexts 中必须至少各有一个覆盖
+        REQUIRED_PREFIXES=("CI /" "Deploy Check /" "Release Gates /" "E2E Tests /")
+
+        # 工具函数:任意失败时输出完整诊断后退出
+        # 用法: fail_diag "错误消息"
+        fail_diag() {
+          local msg="$1"
+          echo "::error::${msg}"
+          echo ""
+          echo "================ 诊断信息 ================"
+          echo ""
+          echo "----- 当前 Branch Protection 配置(BP JSON)-----"
+          if [ -n "${BP_JSON:-}" ]; then
+            echo "$BP_JSON" | jq '.' 2>/dev/null || echo "$BP_JSON"
+          else
+            echo "(未获取到 BP_JSON)"
+          fi
+          echo ""
+          echo "----- 最新 master commit 的实际 check-runs 名称 -----"
+          if [ -n "${ACTUAL_CONTEXTS_JSON:-}" ]; then
+            echo "$ACTUAL_CONTEXTS_JSON" | jq '.' 2>/dev/null || echo "$ACTUAL_CONTEXTS_JSON"
+          else
+            echo "(未获取到 check-runs)"
+          fi
+          echo ""
+          echo "----- BP contexts vs 实际 check-runs 差异 -----"
+          if [ -n "${DIFF_JSON:-}" ]; then
+            echo "$DIFF_JSON" | jq '.' 2>/dev/null || echo "$DIFF_JSON"
+          else
+            echo "(未生成差异)"
+          fi
+          echo ""
+          echo "================ 修复建议 ================"
+          echo "1. 自动检测当前实际 check-runs 并配置 BP:"
+          echo "     bash scripts/detect_branch_protection_contexts.sh > contexts.json"
+          echo "     bash scripts/configure_branch_protection.sh"
+          echo "2. 或手动指定 contexts(JSON 数组):"
+          echo "     CONTEXTS_JSON='[\"CI / test (3.11)\",\"Deploy Check / verify-deploy\",\\"
+          echo "                     \"Release Gates / verify-branch-protection\",\\"
+          echo "                     \"E2E Tests / playwright-e2e\"]' \\"
+          echo "       bash scripts/configure_branch_protection.sh"
+          echo "3. 注意:context 名称格式为 '{workflow_name} / {job_name}',"
+          echo "   矩阵 job 还会带 ' ({matrix_label})' 后缀。"
+          echo "   需先在 master 分支触发过相关 workflow 才能检测到 check-runs。"
+          exit 1
+        }
 
         # 1. 拉取 branch protection 配置(gh api 失败立即捕获,不吞错误)
         if ! RESPONSE=$(gh api "repos/${{ github.repository }}/branches/master/protection" 2>&1); then
@@ -411,18 +463,8 @@ jobs:
           echo "::error::gh api 输出: $RESPONSE"
           echo ""
           echo "Branch Protection 未正确配置,请运行:"
+          echo "  bash scripts/detect_branch_protection_contexts.sh > contexts.json"
           echo "  bash scripts/configure_branch_protection.sh"
-          echo "或手动执行:"
-          echo "  gh api repos/${{ github.repository }}/branches/master/protection -X PUT \\"
-          echo "    -f required_status_checks[strict]=true \\"
-          echo "    -f required_status_checks[contexts][]=CI \\"
-          echo "    -f required_status_checks[contexts][]=\"Deploy Check\" \\"
-          echo "    -f required_status_checks[contexts][]=\"Release Gates\" \\"
-          echo "    -f required_status_checks[contexts][]=E2E \\"
-          echo "    -f enforce_admins=true \\"
-          echo "    -f required_pull_request_reviews[required_approving_review_count]=1 \\"
-          echo "    -f allow_force_pushes=false \\"
-          echo "    -f allow_deletions=false"
           exit 1
         fi
 
@@ -430,14 +472,15 @@ jobs:
         if echo "$RESPONSE" | grep -q "Branch not protected"; then
           echo "::error::Branch protection 未配置"
           echo ""
-          echo "Branch Protection 未正确配置,请运行:"
+          echo "请运行:"
+          echo "  bash scripts/detect_branch_protection_contexts.sh > contexts.json"
           echo "  bash scripts/configure_branch_protection.sh"
           exit 1
         fi
 
         BP_JSON="$RESPONSE"
 
-        # 3. 输出当前配置供调试(R47 P0-2 要求失败时输出 JSON)
+        # 3. 输出当前 BP 配置供调试
         echo "=== 当前 Branch Protection 配置 ==="
         echo "$BP_JSON" | jq '.'
         echo "==================================="
@@ -446,35 +489,139 @@ jobs:
         # 4.1 strict=true (status check 必须针对最新提交)
         echo "Assert: required_status_checks.strict == true"
         echo "$BP_JSON" | jq -e '.required_status_checks.strict == true' > /dev/null \
-          || { echo "::error::required_status_checks.strict != true"; exit 1; }
+          || fail_diag "required_status_checks.strict != true"
 
         # 4.2 enforce_admins=true (管理员也受规则约束)
         echo "Assert: enforce_admins.enabled == true"
         echo "$BP_JSON" | jq -e '.enforce_admins.enabled == true' > /dev/null \
-          || { echo "::error::enforce_admins.enabled != true"; exit 1; }
+          || fail_diag "enforce_admins.enabled != true"
 
         # 4.3 至少 1 个 approving review (R47 P0-2: 必须 >= 1)
         echo "Assert: required_approving_review_count >= 1"
         echo "$BP_JSON" | jq -e '.required_pull_request_reviews.required_approving_review_count >= 1' > /dev/null \
-          || { echo "::error::required_approving_review_count < 1"; exit 1; }
+          || fail_diag "required_approving_review_count < 1"
 
         # 4.4 allow_force_pushes=false (禁止 force push)
         echo "Assert: allow_force_pushes.enabled == false"
         echo "$BP_JSON" | jq -e '.allow_force_pushes.enabled == false' > /dev/null \
-          || { echo "::error::allow_force_pushes.enabled != false"; exit 1; }
+          || fail_diag "allow_force_pushes.enabled != false"
 
         # 4.5 allow_deletions=false (禁止删除分支)
         echo "Assert: allow_deletions.enabled == false"
         echo "$BP_JSON" | jq -e '.allow_deletions.enabled == false' > /dev/null \
-          || { echo "::error::allow_deletions.enabled != false"; exit 1; }
+          || fail_diag "allow_deletions.enabled != false"
 
-        # 5. R47 P0-2: 逐个断言必需 context 必须存在于 required_status_checks.contexts
-        for ctx in "${REQUIRED_CONTEXTS[@]}"; do
-          echo "Assert: required context '$ctx' present"
-          echo "$BP_JSON" | jq -e --arg ctx "$ctx" \
-            '.required_status_checks.contexts | index($ctx) != null' > /dev/null \
-            || { echo "::error::required context '$ctx' missing"; exit 1; }
-        done
+        # ════════════════════════════════════════════════════════════════
+        # 5. R48 P0-2: 动态读取实际 check-runs,与 BP contexts 比对
+        # ════════════════════════════════════════════════════════════════
+
+        # 5.1 获取最新 master commit SHA(注意:此处用 github.repository 上下文)
+        echo ""
+        echo "=== R48 P0-2: 动态读取实际 check-runs ==="
+        LATEST_SHA=$(gh api "repos/${{ github.repository }}/commits/master" --jq '.sha')
+        if [ -z "$LATEST_SHA" ] || [ "$LATEST_SHA" = "null" ]; then
+          fail_diag "无法获取 master 最新 commit SHA"
+        fi
+        echo "最新 master commit: ${LATEST_SHA}"
+
+        # 5.2 拉取该 commit 的 check-runs
+        CHECK_RUNS_JSON=$(gh api "repos/${{ github.repository }}/commits/${LATEST_SHA}/check-runs")
+        CHECK_RUNS_TOTAL=$(echo "$CHECK_RUNS_JSON" | jq -r '.total_count // 0')
+        echo "check-runs 总数: ${CHECK_RUNS_TOTAL}"
+
+        if [ "$CHECK_RUNS_TOTAL" -eq 0 ]; then
+          fail_diag "最新 master commit 没有 check-runs,无法验证 BP contexts 与实际匹配"
+        fi
+
+        # 5.3 提取实际 check-runs 名称(去重 + 排序,输出 JSON 数组)
+        #     check run 的 name 字段就是 BP 中的 context 名称
+        ACTUAL_CONTEXTS_JSON=$(echo "$CHECK_RUNS_JSON" \
+          | jq -r '.check_runs[].name' \
+          | sort -u \
+          | jq -R . | jq -s .)
 
         echo ""
-        echo "✓ Branch protection 验证通过,所有 R47 P0-2 断言均满足"
+        echo "----- 实际 check-runs 名称(去重) -----"
+        echo "$ACTUAL_CONTEXTS_JSON" | jq -r '.[]' | sed 's/^/  - /'
+        echo "---------------------------------------"
+
+        # 5.4 提取 BP 中配置的 contexts
+        BP_CONTEXTS_JSON=$(echo "$BP_JSON" \
+          | jq -c '.required_status_checks.contexts // []')
+
+        echo ""
+        echo "----- BP required_status_checks.contexts -----"
+        echo "$BP_CONTEXTS_JSON" | jq -r '.[]' | sed 's/^/  - /'
+        echo "---------------------------------------------"
+
+        # 5.5 R48 P0-2 核心断言 A:BP 中的每个 context 必须在实际 check-runs 中存在
+        #     (允许 BP 是 check-runs 的子集,但 BP 中的 context 不能是凭空捏造的)
+        echo ""
+        echo "Assert A: BP contexts 中每一项都必须在实际 check-runs 中存在"
+        ORPHAN_CONTEXTS=$(jq -n \
+          --argjson bp "$BP_CONTEXTS_JSON" \
+          --argjson actual "$ACTUAL_CONTEXTS_JSON" \
+          '($bp - $actual)')
+        ORPHAN_COUNT=$(echo "$ORPHAN_CONTEXTS" | jq 'length')
+        if [ "$ORPHAN_COUNT" -gt 0 ]; then
+          DIFF_JSON=$(jq -n \
+            --argjson bp "$BP_CONTEXTS_JSON" \
+            --argjson actual "$ACTUAL_CONTEXTS_JSON" \
+            '{bp_contexts: $bp, actual_check_runs: $actual, only_in_bp_orphan: ($bp - $actual), only_in_actual: ($actual - $bp)}')
+          fail_diag "BP 中存在 ${ORPHAN_COUNT} 个 context 在实际 check-runs 中找不到(可能 context 名称错配,如把 'CI / test (3.11)' 误写为 'CI')"
+        fi
+        echo "  ✓ BP contexts 全部在实际 check-runs 中存在"
+
+        # 5.6 R48 P0-2 核心断言 B:四个核心 workflow 前缀各至少有一个 context 覆盖
+        #     (CI / Deploy Check / Release Gates / E2E Tests)
+        echo ""
+        echo "Assert B: 四个核心 workflow 前缀各至少有一个 context 覆盖"
+        MISSING_COVERAGE=()
+        for prefix in "${REQUIRED_PREFIXES[@]}"; do
+          if echo "$BP_CONTEXTS_JSON" | jq -e --arg p "$prefix" \
+                'any(.[]; startswith($p))' > /dev/null; then
+            echo "  ✓ 覆盖: ${prefix}*"
+          else
+            echo "  ✗ 缺失: ${prefix}*"
+            MISSING_COVERAGE+=("$prefix")
+          fi
+        done
+        if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
+          DIFF_JSON=$(jq -n \
+            --argjson bp "$BP_CONTEXTS_JSON" \
+            --argjson actual "$ACTUAL_CONTEXTS_JSON" \
+            --arg missing "${MISSING_COVERAGE[*]}" \
+            '{bp_contexts: $bp, actual_check_runs: $actual, missing_workflow_prefixes: ($missing | split(" "))}')
+          fail_diag "BP contexts 未覆盖以下 workflow 前缀: ${MISSING_COVERAGE[*]}"
+        fi
+
+        # 5.7 R48 P0-2 核心断言 C:BP contexts 集合应与实际 check-runs 集合一致
+        #     (推荐完全一致,避免遗漏任何 job 的状态检查)
+        #     注意:verify-branch-protection 自身在 PR 触发时可能尚未完成,
+        #     因此允许 "Release Gates / verify-branch-protection" 不在 BP 中
+        #     (这是合理的,因为 BP 不能要求自身阻断自己)
+        echo ""
+        echo "Assert C: BP contexts 集合应与实际 check-runs 集合一致"
+        DIFF_JSON=$(jq -n \
+          --argjson bp "$BP_CONTEXTS_JSON" \
+          --argjson actual "$ACTUAL_CONTEXTS_JSON" \
+          '{only_in_bp_orphan: ($bp - $actual),
+            only_in_actual_missing_in_bp: ($actual - $bp)}')
+
+        ONLY_IN_ACTUAL=$(echo "$DIFF_JSON" | jq -c '.only_in_actual_missing_in_bp')
+        ONLY_IN_ACTUAL_COUNT=$(echo "$DIFF_JSON" | jq '.only_in_actual_missing_in_bp | length')
+
+        if [ "$ONLY_IN_ACTUAL_COUNT" -gt 0 ]; then
+          echo "  WARN: 以下实际 check-runs 未在 BP contexts 中(仅警告,不阻断):"
+          echo "$ONLY_IN_ACTUAL" | jq -r '.[]' | sed 's/^/    - /'
+          echo "  这些 job 的失败不会阻断合并。如需启用,请重新运行配置脚本。"
+          echo "  (此为软警告,BP 允许是 check-runs 的子集)"
+        fi
+
+        echo ""
+        echo "✓ Branch protection 验证通过,所有 R47/R48 P0-2 断言均满足"
+        echo "  - 所有 BP 属性(strict / enforce_admins / review>=1 /"
+        echo "    allow_force_pushes=false / allow_deletions=false)正确"
+        echo "  - BP contexts 全部在实际 check-runs 中存在(无错配)"
+        echo "  - 四个核心 workflow 前缀(CI / / Deploy Check / /"
+        echo "    Release Gates / / E2E Tests /)均已覆盖"

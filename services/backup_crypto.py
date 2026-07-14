@@ -45,6 +45,9 @@ except ImportError:
     _CRYPTO_AVAILABLE = False
     AESGCM = None  # type: ignore
 
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
+
 
 # KEK 长度: AES-256 需要 32 字节密钥
 _KEK_SIZE = 32
@@ -387,7 +390,11 @@ def decrypt_payload(
         return ciphertext
 
     if not _CRYPTO_AVAILABLE:
-        raise RuntimeError("cryptography 未安装,无法解密备份")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(
+            ErrorCodes.BACKUP_DECRYPT_DEP_MISSING,
+            params={"dep_name": "cryptography"},
+        )
 
     # R37 P1-6: 双 key 解密窗口
     # 显式传入 kek 时只用该 key;否则按优先级尝试 current → previous
@@ -403,7 +410,8 @@ def decrypt_payload(
             candidate_keks.append(previous)
 
     if not candidate_keks:
-        raise RuntimeError("BACKUP_KEK 未配置,无法解密备份(当前 + 历史 KEK 均不可用)")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(ErrorCodes.BACKUP_DECRYPT_KEK_MISSING)
 
     # R40 P0-6: 构建 AAD 候选列表
     # 新备份: AAD = f"{backup_id}|{schema_version}|{key_id}"

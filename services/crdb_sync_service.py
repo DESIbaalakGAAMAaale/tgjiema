@@ -41,6 +41,9 @@ import uuid
 
 from loguru import logger
 
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
+
 
 # 默认同步间隔(秒)
 DEFAULT_SYNC_INTERVAL = 60   # 无 dirty 时基础间隔
@@ -485,7 +488,11 @@ async def _init_sqlite_only():
     store = _get_cache_store_safe()
     if store is None:
         logger.error("[crdb_sync] R38 P1-1: cache_store 不可用,无法初始化 SQLite")
-        raise RuntimeError("cache_store unavailable for SQLite-only init")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError(复用 DB_CACHE_UNAVAILABLE)
+        raise AppError(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={"component": "cache_store"},
+        )
     await store.init()
     logger.info("[crdb_sync] R38 P1-1: SQLite cache_store 已初始化(CRDB pool 暂不连接)")
 

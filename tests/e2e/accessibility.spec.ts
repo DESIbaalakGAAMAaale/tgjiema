@@ -19,8 +19,11 @@ import * as path from 'path';
  * axe JSON artifact 保存到 e2e-results/ 目录,供 CI upload-artifact 收集
  */
 
-// R47 P0-3: axe JSON artifact 输出目录
-const AXE_RESULTS_DIR = path.join(__dirname, '..', 'e2e-results');
+// R47/R48 P0-3: axe JSON artifact 输出目录
+// R48 修复: 原路径 path.join(__dirname, '..', 'e2e-results') 解析为 tests/e2e-results/,
+//           但 e2e.yml upload-artifact 期望 tests/e2e/e2e-results/axe-*.json。
+//           改为 path.join(__dirname, 'e2e-results') → tests/e2e/e2e-results/
+const AXE_RESULTS_DIR = path.join(__dirname, 'e2e-results');
 
 /** R47 P0-3: 将 axe 扫描结果序列化为 JSON 并保存到 e2e-results/axe-{pageName}.json */
 function saveAxeResults(pageName: string, results: any): void {
@@ -87,8 +90,9 @@ test.describe('Accessibility (WCAG 2.2 AA)', () => {
     await page.fill('input[name="username"]', 'admin');
     await page.fill('input[name="password"]', ADMIN_PASSWORD);
     await page.click('button[type="submit"]');
-    // 等待重定向到首页(dashboard)
-    await page.waitForURL('**/', { timeout: 10_000 }).catch(() => {});
+    // R48: 等待重定向到首页(dashboard),使用 function matcher 替代 glob
+    await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+    await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 10_000 }).catch(() => {});
 
     const accessibilityScanResults = await new AxeBuilder({ page })
       .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])

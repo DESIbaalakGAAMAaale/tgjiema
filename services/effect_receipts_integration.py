@@ -1,4 +1,4 @@
-"""R44 G0-2 / R46 P0-1 / R47 P0-4: Effect Receipts 集成辅助函数。
+"""R44 G0-2 / R46 P0-1 / R47 P0-4 / R48 P0-4: Effect Receipts 集成辅助函数。
 
 R46 P0-1 整改:
 - critical effect 类型(telegram_send/copy/r2_put/restore/ban/takedown/purge) fail-closed:
@@ -12,6 +12,13 @@ R47 P0-4 整改:
 - 非关键 effect 无 action_id 时仍允许直执(向后兼容,仅记录 warning 日志)。
 - 装饰器新增 params_fn 参数,上下文管理器新增 params 参数,
   用于计算 request_hash 绑定 effect 参数,防止同 action_id 不同 payload 绕过。
+
+R48 P0-4 整改:
+- critical effect 必须提供 params(上下文)或 params_fn(装饰器),
+  否则 raise EffectReceiptError(防止 request_hash 为空时同 action_id 不同参数共用 receipt)。
+- params_fn 调用异常时:critical effect 直接 raise EffectReceiptError;
+  非 critical effect warning 并继续(允许 request_hash 为空)。
+- compute_effect_request_hash 返回空时:critical effect 拒绝执行;非 critical 允许。
 """
 from __future__ import annotations
 
@@ -53,6 +60,12 @@ def with_effect_receipt(
     R47 P0-4:
         - critical effect 无 action_id → raise EffectReceiptError(拒绝执行)。
         - 非关键 effect 无 action_id → 直执(向后兼容,warning 日志)。
+
+    R48 P0-4:
+        - critical effect 无 params_fn → raise EffectReceiptError(拒绝执行),
+          防止 request_hash 为空时同 action_id 不同参数共用 receipt。
+        - params_fn 异常:critical → raise;非 critical → warning 并继续。
+        - request_hash 为空:critical → raise;非 critical → 允许。
     """
     def decorator(func: Callable[..., Awaitable[Any]]):
         @functools.wraps(func)
@@ -71,6 +84,13 @@ def with_effect_receipt(
                     f"{func.__name__}(effect_type={effect_type})"
                 )
                 return await func(*args, **kwargs)
+
+            # R48 P0-4: critical effect 必须提供 params_fn 用于 request_hash 绑定
+            if is_critical and params_fn is None:
+                raise EffectReceiptError(
+                    f"critical effect '{effect_type}' requires params or params_fn "
+                    f"for request_hash binding"
+                )
 
             # R46 P0-1: critical 副作用且非 best_effort → fail-closed
             fail_closed = is_critical and not best_effort
@@ -96,14 +116,31 @@ def with_effect_receipt(
                 except Exception:
                     target = func.__name__
 
-            # R47 P0-4: 计算 request_hash(绑定 effect 参数)
+            # R47 P0-4 / R48 P0-4: 计算 request_hash(绑定 effect 参数)
             request_hash = ""
             if params_fn is not None:
                 try:
                     params_dict = params_fn(*args, **kwargs) or {}
                     request_hash = compute_effect_request_hash(effect_type, params_dict)
-                except Exception:
+                except EffectReceiptError:
+                    raise
+                except Exception as e:
+                    # R48 P0-4: params_fn 异常 — critical 拒绝,非 critical 继续
+                    if is_critical:
+                        raise EffectReceiptError(
+                            f"critical effect params_fn failed: {e}"
+                        ) from e
+                    logger.warning(
+                        f"[effect_receipt] params_fn 异常(非关键,继续执行) "
+                        f"{func.__name__}: {e}"
+                    )
                     request_hash = ""
+
+            # R48 P0-4: critical effect 必须有非空 request_hash
+            if is_critical and not request_hash:
+                raise EffectReceiptError(
+                    f"critical effect '{effect_type}' request_hash 为空,拒绝执行"
+                )
 
             # 1. 检查是否已完成 → 跳过(幂等)
             receipt = await manager.check_receipt(
@@ -171,6 +208,11 @@ class EffectReceiptContext:
         - critical effect 无 action_id → raise EffectReceiptError(拒绝执行)。
         - 非关键 effect 无 action_id → 不记录 receipt,直接执行(向后兼容)。
         - params 参数用于计算 request_hash,绑定 effect 参数防篡改。
+
+    R48 P0-4:
+        - critical effect 无 params → raise EffectReceiptError(拒绝执行),
+          防止 request_hash 为空时同 action_id 不同参数共用 receipt。
+        - request_hash 为空:critical → raise;非 critical → 允许。
     """
 
     def __init__(
@@ -192,6 +234,8 @@ class EffectReceiptContext:
         self.skipped: bool = False
         self.external_id: str = ""
         self._no_record: bool = False
+        # R48 P0-4: 保存 params 供 __aenter__ 校验
+        self._params: Optional[dict] = params
         # R47 P0-4: 计算 request_hash 绑定 effect 参数
         self.request_hash: str = ""
         if params is not None:
@@ -203,6 +247,20 @@ class EffectReceiptContext:
             raise EffectReceiptError(
                 f"critical effect '{self.effect_type}' requires action_id, got empty"
             )
+
+        # R48 P0-4: critical effect 必须提供 params 用于 request_hash 绑定
+        if self.is_critical and self._params is None:
+            raise EffectReceiptError(
+                f"critical effect '{self.effect_type}' requires params or params_fn "
+                f"for request_hash binding"
+            )
+
+        # R48 P0-4: critical effect 必须有非空 request_hash
+        if self.is_critical and not self.request_hash:
+            raise EffectReceiptError(
+                f"critical effect '{self.effect_type}' request_hash 为空,拒绝执行"
+            )
+
         if not self.action_id:
             # 非关键 + 无 action_id → 不记录 receipt(向后兼容)
             self._no_record = True

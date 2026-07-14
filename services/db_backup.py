@@ -20,6 +20,8 @@ from services.backup_crypto import (
     encrypt_payload,
     is_encryption_available,
 )
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 
 # ─── 表清单(单一事实源: services/backup_schema.py) ───
 # 保留向后兼容的别名,等价于原 SMALL_TABLES / _LARGE_TABLES / _TABLE_WHERE
@@ -785,7 +787,8 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
     # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
     await configure_r2_dynamic()
     if not r2_storage._access_key:
-        raise RuntimeError("R2 凭证未配置(.env 和 config 表均无)，无法恢复")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(ErrorCodes.BACKUP_RESTORE_R2_CREDENTIAL_MISSING)
 
     # 下载备份
     content = await r2_storage.download(key)

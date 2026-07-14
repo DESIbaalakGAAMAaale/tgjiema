@@ -1,15 +1,81 @@
 {
-  "_description": "R47 P1-d: 模块化 i18n 硬编码字符串 baseline(逐模块下降门禁,清零目标 0)",
-  "_note": "由 --generate-baseline / --ratchet 维护;total 只允许非增加(下降或持平)。原 R44 baseline 954 仅覆盖 bots/+admin;纳入 services/ 后真实基线见 total。",
+  "_description": "R48 P1-c: 模块化 i18n 硬编码字符串 baseline(scope 审批 + delta + classify)",
+  "_note": "由 --generate-baseline / --ratchet 维护;total 只允许非增加(下降或持平)。R48: scope 变化需 --allow-scope-change;CI 用 --delta 比对 base/head;--classify 区分 user_visible(清零目标 0) 与 log_only(鼓励减少)。",
   "_original_r44_baseline": 954,
-  "bots/up_bot.py": 46,
-  "bots/idx_bot.py": 97,
-  "bots/dsp_bot.py": 28,
-  "bots/mon_bot.py": 26,
-  "bots/admin_bot/": 425,
-  "admin/": 24,
-  "admin/templates/": 309,
-  "admin/static/": 0,
-  "services/": 309,
-  "total": 1264
+  "scanner_version": "2.0",
+  "included_paths": [
+    "bots/up_bot.py",
+    "bots/idx_bot.py",
+    "bots/dsp_bot.py",
+    "bots/mon_bot.py",
+    "bots/admin_bot/",
+    "admin/",
+    "admin/templates/",
+    "admin/static/",
+    "services/"
+  ],
+  "modules": {
+    "bots/up_bot.py": {
+      "baseline": 46,
+      "target": 0,
+      "user_visible": 42,
+      "log_only": 4
+    },
+    "bots/idx_bot.py": {
+      "baseline": 97,
+      "target": 0,
+      "user_visible": 82,
+      "log_only": 15
+    },
+    "bots/dsp_bot.py": {
+      "baseline": 28,
+      "target": 0,
+      "user_visible": 23,
+      "log_only": 5
+    },
+    "bots/mon_bot.py": {
+      "baseline": 26,
+      "target": 0,
+      "user_visible": 26,
+      "log_only": 0
+    },
+    "bots/admin_bot/": {
+      "baseline": 425,
+      "target": 0,
+      "user_visible": 400,
+      "log_only": 25
+    },
+    "admin/": {
+      "baseline": 24,
+      "target": 0,
+      "user_visible": 23,
+      "log_only": 1
+    },
+    "admin/templates/": {
+      "baseline": 309,
+      "target": 0,
+      "user_visible": 309,
+      "log_only": 0
+    },
+    "admin/static/": {
+      "baseline": 0,
+      "target": 0,
+      "user_visible": 0,
+      "log_only": 0
+    },
+    "services/": {
+      "baseline": 310,
+      "target": 0,
+      "user_visible": 287,
+      "log_only": 23
+    }
+  },
+  "total": {
+    "baseline": 1265,
+    "target": 0,
+    "user_visible": 1192,
+    "log_only": 73
+  },
+  "last_updated": "2026-07-14",
+  "last_updated_by": "r48_p1_c_initial"
 }

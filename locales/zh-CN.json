@@ -95,7 +95,21 @@
     "user.state.banned": "用户已被封禁(user_id={user_id})",
     "system.state.maintenance": "系统维护中,请稍后再试(reason={reason})",
     "system.rate.limited": "请求过于频繁,请稍后再试(user_id={user_id})",
-    "validation.input.failed": "参数校验失败(field={field})"
+    "validation.input.failed": "参数校验失败(field={field})",
+    "admin.validation.password_empty": "密码不能为空",
+    "topology.load.no_slots": "topology.yaml 中没有槽位配置",
+    "index.generate.db_uninitialized": "[Idx] 生成唯一文件码失败:数据库未初始化(action={action})",
+    "index.finalize.db_uninitialized": "[Idx] finalize_upload 失败:数据库未初始化(action={action})",
+    "index.storage.no_channel": "无可用存储频道,请检查 cells 表配置",
+    "bot.mon.token_missing": "MON_BOT_TOKEN 未配置,监控机器人必须有独立的 Bot Token",
+    "upload.outbox.bot_uninitialized": "_bot 全局引用未初始化(OutboxWorker 无法调用 Telegram API)",
+    "upload.slot.none_active": "无可用活跃槽位,请检查拓扑配置",
+    "backup.decrypt.dep_missing": "cryptography 未安装,无法解密备份(dep_name={dep_name})",
+    "backup.decrypt.kek_missing": "BACKUP_KEK 未配置,无法解密备份(当前 + 历史 KEK 均不可用)",
+    "backup.restore.r2_credential_missing": "R2 凭证未配置(.env 和 config 表均无),无法恢复",
+    "relay.auth.code_failed": "中继账号验证码获取失败(phone={phone})",
+    "relay.auth.password_timeout": "中继账号二步验证密码获取超时(phone={phone})",
+    "relay.config.api_hash_invalid": "api_hash 不能为空且必须是字符串"
   },
   "ui": {
     "admin_login_title": "管理后台登录",

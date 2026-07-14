@@ -40,6 +40,10 @@ async def _async_main():
         logger.warning("管理员 Telegram ID 未配置（ADMIN_TELEGRAM_ID），跳过启动")
         return
 
+    # R48 P1-b: 每次 Bot 启动时显式触发 production secret 检查(fail-closed)
+    from services.button_security import validate_production_config
+    validate_production_config()
+
     logger.info("启动管理员机器人...")
 
     await _init()

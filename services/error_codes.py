@@ -110,6 +110,36 @@ class ErrorCodes:
     # 参数校验失败
     VALIDATION_FAILED = "VALIDATION.INPUT.FAILED"
 
+    # ── R48 P1 新增:覆盖 baseline 中 15 处裸字符串错误的场景 ──
+    # 管理员密码为空(admin/__init__.py:generate_password_hash)
+    ADMIN_VALIDATION_PASSWORD_EMPTY = "ADMIN.VALIDATION.PASSWORD_EMPTY"
+    # topology.yaml 中没有槽位配置(admin/seed_topology.py)
+    TOPOLOGY_LOAD_NO_SLOTS = "TOPOLOGY.LOAD.NO_SLOTS"
+    # 索引生成码时数据库未初始化(bots/idx_bot.py:_generate_unique_code_with_retry)
+    INDEX_GENERATE_DB_UNINITIALIZED = "INDEX.GENERATE.DB_UNINITIALIZED"
+    # 索引 finalize_upload 时数据库未初始化(bots/idx_bot.py:finalize_upload)
+    INDEX_FINALIZE_DB_UNINITIALIZED = "INDEX.FINALIZE.DB_UNINITIALIZED"
+    # 无可用存储频道(bots/idx_bot.py:_get_storage_channel_id)
+    INDEX_STORAGE_NO_CHANNEL = "INDEX.STORAGE.NO_CHANNEL"
+    # MON_BOT_TOKEN 未配置(bots/mon_bot.py)
+    BOT_MON_TOKEN_MISSING = "BOT.MON.TOKEN_MISSING"
+    # _bot 全局引用未初始化(bots/up_bot.py:_outbox_archive_to_r100_strict)
+    UPLOAD_OUTBOX_BOT_UNINITIALIZED = "UPLOAD.OUTBOX.BOT_UNINITIALIZED"
+    # 无可用活跃槽位(bots/up_bot.py:_get_upload_target_channel)
+    UPLOAD_SLOT_NONE_ACTIVE = "UPLOAD.SLOT.NONE_ACTIVE"
+    # cryptography 未安装(services/backup_crypto.py)
+    BACKUP_DECRYPT_DEP_MISSING = "BACKUP.DECRYPT.DEP_MISSING"
+    # BACKUP_KEK 未配置(services/backup_crypto.py)
+    BACKUP_DECRYPT_KEK_MISSING = "BACKUP.DECRYPT.KEK_MISSING"
+    # R2 凭证未配置(services/db_backup.py)
+    BACKUP_RESTORE_R2_CREDENTIAL_MISSING = "BACKUP.RESTORE.R2_CREDENTIAL_MISSING"
+    # 中继账号验证码获取失败(services/relay_instance.py)
+    RELAY_AUTH_CODE_FAILED = "RELAY.AUTH.CODE_FAILED"
+    # 中继账号二步验证密码获取超时(services/relay_instance.py)
+    RELAY_AUTH_PASSWORD_TIMEOUT = "RELAY.AUTH.PASSWORD_TIMEOUT"
+    # 中继账号 api_hash 校验失败(services/relay_pool.py)
+    RELAY_CONFIG_API_HASH_INVALID = "RELAY.CONFIG.API_HASH_INVALID"
+
 
 # ════════════════════════════════════════════════════════════════
 # 2. ErrorDefinition 数据类
@@ -839,6 +869,134 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["field"],
+    ))
+
+    # ── R48 P1: baseline 中 15 处裸字符串错误对应的 ErrorDefinition ──
+    # 管理员密码为空(admin/__init__.py:generate_password_hash)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ADMIN_VALIDATION_PASSWORD_EMPTY,
+        message_key="errors.admin.validation.password_empty",
+        http_status=400,
+        retryable=False,
+        severity="info",
+        safe_params=[],
+    ))
+    # topology.yaml 中没有槽位配置(admin/seed_topology.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.TOPOLOGY_LOAD_NO_SLOTS,
+        message_key="errors.topology.load.no_slots",
+        http_status=500,
+        retryable=False,
+        severity="error",
+        safe_params=[],
+    ))
+    # 索引生成码时数据库未初始化(bots/idx_bot.py:_generate_unique_code_with_retry)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.INDEX_GENERATE_DB_UNINITIALIZED,
+        message_key="errors.index.generate.db_uninitialized",
+        http_status=503,
+        retryable=True,
+        severity="critical",
+        safe_params=["action"],
+    ))
+    # 索引 finalize_upload 时数据库未初始化(bots/idx_bot.py:finalize_upload)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.INDEX_FINALIZE_DB_UNINITIALIZED,
+        message_key="errors.index.finalize.db_uninitialized",
+        http_status=503,
+        retryable=True,
+        severity="critical",
+        safe_params=["action"],
+    ))
+    # 无可用存储频道(bots/idx_bot.py:_get_storage_channel_id)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.INDEX_STORAGE_NO_CHANNEL,
+        message_key="errors.index.storage.no_channel",
+        http_status=503,
+        retryable=True,
+        severity="error",
+        safe_params=[],
+    ))
+    # MON_BOT_TOKEN 未配置(bots/mon_bot.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BOT_MON_TOKEN_MISSING,
+        message_key="errors.bot.mon.token_missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=[],
+    ))
+    # _bot 全局引用未初始化(bots/up_bot.py:_outbox_archive_to_r100_strict)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.UPLOAD_OUTBOX_BOT_UNINITIALIZED,
+        message_key="errors.upload.outbox.bot_uninitialized",
+        http_status=500,
+        retryable=True,
+        severity="error",
+        safe_params=[],
+    ))
+    # 无可用活跃槽位(bots/up_bot.py:_get_upload_target_channel)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.UPLOAD_SLOT_NONE_ACTIVE,
+        message_key="errors.upload.slot.none_active",
+        http_status=503,
+        retryable=True,
+        severity="error",
+        safe_params=[],
+    ))
+    # cryptography 未安装(services/backup_crypto.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_DECRYPT_DEP_MISSING,
+        message_key="errors.backup.decrypt.dep_missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["dep_name"],
+    ))
+    # BACKUP_KEK 未配置(services/backup_crypto.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_DECRYPT_KEK_MISSING,
+        message_key="errors.backup.decrypt.kek_missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=[],
+    ))
+    # R2 凭证未配置(services/db_backup.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_RESTORE_R2_CREDENTIAL_MISSING,
+        message_key="errors.backup.restore.r2_credential_missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=[],
+    ))
+    # 中继账号验证码获取失败(services/relay_instance.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RELAY_AUTH_CODE_FAILED,
+        message_key="errors.relay.auth.code_failed",
+        http_status=401,
+        retryable=True,
+        severity="warning",
+        safe_params=["phone"],
+    ))
+    # 中继账号二步验证密码获取超时(services/relay_instance.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RELAY_AUTH_PASSWORD_TIMEOUT,
+        message_key="errors.relay.auth.password_timeout",
+        http_status=401,
+        retryable=True,
+        severity="warning",
+        safe_params=["phone"],
+    ))
+    # 中继账号 api_hash 校验失败(services/relay_pool.py)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RELAY_CONFIG_API_HASH_INVALID,
+        message_key="errors.relay.config.api_hash_invalid",
+        http_status=400,
+        retryable=False,
+        severity="info",
+        safe_params=[],
     ))
 
 

@@ -13,6 +13,8 @@ from loguru import logger
 
 from services.relay_instance import RelayInstance
 from database.relay_db import get_relay_db
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 
 
 def _normalize_phone(phone: str) -> str:
@@ -227,7 +229,8 @@ class RelayPool:
         except (TypeError, ValueError):
             raise RuntimeError(f"api_id 必须是数字,当前值: {api_id}")
         if not api_hash or not isinstance(api_hash, str):
-            raise RuntimeError("api_hash 不能为空且必须是字符串")
+            # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+            raise AppError(ErrorCodes.RELAY_CONFIG_API_HASH_INVALID)
 
         # 手机号规范化:确保以 + 开头
         phone = _normalize_phone(phone)

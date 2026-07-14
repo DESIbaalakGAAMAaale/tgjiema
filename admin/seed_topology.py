@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database import init_db, close_db, get_cells_col
 from database import set_rotation_config
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 
 
 async def seed(dry_run: bool = False, force: bool = False):
@@ -37,7 +39,8 @@ async def seed(dry_run: bool = False, force: bool = False):
     slots = config.get("slots", [])
     if not slots:
         print("[错误] topology.yaml 中没有槽位配置")
-        raise RuntimeError("topology.yaml 中没有槽位配置")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(ErrorCodes.TOPOLOGY_LOAD_NO_SLOTS)
 
     print(f"\n拓扑概况: {len(slots)} 个槽位 ({len(slots)//3} 组)")
     active_count = len([s for s in slots if s["status"] in ("active", "r100")])

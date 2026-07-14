@@ -24,10 +24,14 @@ import scan_hardcoded_strings as scan  # noqa: E402
 # 辅助:构造合成 baseline(不依赖真实 baseline.json 的具体数值,避免债务清还后失效)
 # ---------------------------------------------------------------------------
 def _synthetic_baseline(**overrides) -> dict:
-    """返回每模块 baseline=10 的合成 dict;可按需覆盖。"""
+    """返回每模块 baseline=10 的合成 dict;可按需覆盖。
+
+    R48: 包含 included_paths 字段,避免 _check_scope_change 误报 scope 变化。
+    """
     base = {m: 10 for m in scan.MODULE_KEYS}
     base["_original_r44_baseline"] = 954
     base["total"] = sum(base[m] for m in scan.MODULE_KEYS)
+    base["included_paths"] = list(scan.INCLUDED_PATHS)  # R48: scope 不变
     base.update(overrides)
     return base
 
@@ -78,15 +82,21 @@ def test_module_for_file_mapping():
 
 
 def test_real_baseline_file_loads_and_consistent():
-    """真实 locales/baseline.json 可读取,且 total == 各模块之和。"""
+    """真实 locales/baseline.json 可读取,且 total == 各模块之和。
+
+    R48: baseline 格式迁移到嵌套结构(modules/total 为 dict),通过 _baseline_module_count
+    和 _baseline_total 访问器兼容新旧格式。
+    """
     baseline = scan._load_module_baseline()
     assert baseline, "locales/baseline.json 未生成或为空(请先运行 --generate-baseline)"
     assert baseline.get("_original_r44_baseline") == 954
+    # R48: modules 在 baseline["modules"] 下(新格式);兼容旧格式顶层键
+    modules_dict = baseline.get("modules", baseline)
     for m in scan.MODULE_KEYS:
-        assert m in baseline, f"baseline 缺少模块键: {m}"
+        assert m in modules_dict, f"baseline 缺少模块键: {m}"
     total = sum(scan._baseline_module_count(baseline, m) for m in scan.MODULE_KEYS)
-    assert total == baseline["total"], (
-        f"baseline.total({baseline['total']}) != 各模块之和({total})"
+    assert total == scan._baseline_total(baseline), (
+        f"baseline.total({scan._baseline_total(baseline)}) != 各模块之和({total})"
     )
 
 
@@ -125,14 +135,17 @@ def test_check_fails_when_total_exceeds_only():
 
 
 def test_check_hints_ratchet_when_module_decreased(capsys):
-    """模块下降时 --check 不失败,但提示运行 --ratchet。"""
+    """模块下降时 --check 不失败,但提示运行 --ratchet。
+
+    R48: 输出含 '距target' 列(target=0);R47 的 '距清零' 改为 '距target'。
+    """
     baseline = _synthetic_baseline()
     counts = _counts_from_baseline(baseline)
     counts["bots/up_bot.py"] -= 1
     assert scan.cmd_check(counts, baseline) == 0
     out = capsys.readouterr().out
     assert "--ratchet" in out
-    assert "距清零" in out  # 额外输出距清零目标差距
+    assert "距target" in out  # R48: 输出距 target(0)的差距
 
 
 def test_check_fails_when_baseline_missing(capsys):
@@ -164,9 +177,10 @@ def test_ratchet_updates_when_total_decreases(monkeypatch, tmp_path):
     counts = {m: 8 for m in scan.MODULE_KEYS}  # 每模块降 2
     assert scan.cmd_ratchet(counts, baseline) == 0
     saved = json.loads(tmp_baseline.read_text(encoding="utf-8"))
+    # R48: 新格式 modules 在 "modules" 下,total 为 dict
     for m in scan.MODULE_KEYS:
-        assert saved[m] == 8
-    assert saved["total"] == 8 * len(scan.MODULE_KEYS)
+        assert saved["modules"][m]["baseline"] == 8
+    assert saved["total"]["baseline"] == 8 * len(scan.MODULE_KEYS)
     assert saved["_original_r44_baseline"] == 954  # 元数据保留
 
 
@@ -180,9 +194,10 @@ def test_ratchet_allows_module_rise_when_total_non_increasing(monkeypatch, tmp_p
     counts["services/"] = 5          # 降 5 → total 净降 3
     assert scan.cmd_ratchet(counts, baseline) == 0
     saved = json.loads(tmp_baseline.read_text(encoding="utf-8"))
-    assert saved["bots/up_bot.py"] == 12   # 上升被接受
-    assert saved["services/"] == 5
-    assert saved["total"] == sum(counts.values())
+    # R48: 新格式 modules 在 "modules" 下
+    assert saved["modules"]["bots/up_bot.py"]["baseline"] == 12   # 上升被接受
+    assert saved["modules"]["services/"]["baseline"] == 5
+    assert saved["total"]["baseline"] == sum(counts.values())
 
 
 def test_ratchet_allows_rebalance_when_total_equal(monkeypatch, tmp_path):
@@ -270,7 +285,10 @@ def test_file_counts_sorted_desc():
 # 5. --generate-baseline 写入
 # ---------------------------------------------------------------------------
 def test_save_module_baseline_writes_json(monkeypatch, tmp_path):
-    """_save_module_baseline 写入可序列化 JSON,total = 各模块之和。"""
+    """_save_module_baseline 写入可序列化 JSON,total = 各模块之和。
+
+    R48: 新格式 modules 在 "modules" 下,total 为 dict(含 baseline/target/user_visible/log_only)。
+    """
     tmp_baseline = tmp_path / "baseline.json"
     monkeypatch.setattr(scan, "MODULE_BASELINE_FILE", tmp_baseline)
     counts = {m: 0 for m in scan.MODULE_KEYS}
@@ -278,8 +296,14 @@ def test_save_module_baseline_writes_json(monkeypatch, tmp_path):
     counts["services/"] = 7
     scan._save_module_baseline(counts)
     saved = json.loads(tmp_baseline.read_text(encoding="utf-8"))
-    assert saved["bots/up_bot.py"] == 3
-    assert saved["services/"] == 7
-    assert saved["total"] == 10
+    # R48: 新格式 modules 嵌套在 "modules" 下
+    assert saved["modules"]["bots/up_bot.py"]["baseline"] == 3
+    assert saved["modules"]["services/"]["baseline"] == 7
+    assert saved["total"]["baseline"] == 10
     assert saved["_original_r44_baseline"] == 954
     assert saved["_description"]  # 元数据存在
+    # R48: 新增字段
+    assert saved["scanner_version"] == scan.SCANNER_VERSION
+    assert saved["included_paths"] == scan.INCLUDED_PATHS
+    assert "last_updated" in saved
+    assert "last_updated_by" in saved

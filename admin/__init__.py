@@ -8,7 +8,7 @@ import ipaddress as _ipaddr
 from dataclasses import dataclass, field
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Query, Form
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
@@ -21,6 +21,8 @@ from utils.monitor import metrics
 from config import settings
 # R44 6.2: i18n 国际化翻译(管理员可见错误文案 / 模板 locale 注入)
 from services.i18n import get_i18n_manager, set_user_locale as _i18n_set_user_locale
+# R48 P1: 统一错误码协议化(替代裸字符串 ValueError/RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 
 app = FastAPI(title="TG解码器管理后台")
 security = HTTPBasic()
@@ -479,7 +481,8 @@ def generate_password_hash(password: str, iterations: int = _PBKDF2_ITERATIONS) 
         python -c "from admin import generate_password_hash; print(generate_password_hash('YOUR_PASSWORD'))"
     """
     if not password:
-        raise ValueError("密码不能为空")
+        # R48 P1: 协议化错误码替代裸字符串 ValueError
+        raise AppError(ErrorCodes.ADMIN_VALIDATION_PASSWORD_EMPTY)
     # R39 P1-12: 优先 Argon2id
     if _ARGON2_AVAILABLE:
         return _argon2_hasher.hash(password)
@@ -1012,9 +1015,9 @@ input[type="text"], input[type="password"] {{ width: 100%; padding: 10px 12px;
      border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
 input[type="text"]:focus, input[type="password"]:focus {{ outline: none;
      border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
-button {{ width: 100%; padding: 12px; background: #4a90e2; color: #fff;
+button {{ width: 100%; padding: 12px; background: #1565c0; color: #fff;
         border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
-button:hover {{ background: #357abd; }}
+button:hover {{ background: #0d47a1; }}
 .error {{ color: #d32f2f; font-size: 13px; margin-top: 12px; min-height: 18px; }}
 </style>
 </head>
@@ -1181,9 +1184,9 @@ input[type="text"] {{ width: 100%; padding: 10px 12px;
      letter-spacing: 4px; text-align: center; }}
 input[type="text"]:focus {{ outline: none;
      border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
-button {{ width: 100%; padding: 12px; background: #4a90e2; color: #fff;
+button {{ width: 100%; padding: 12px; background: #1565c0; color: #fff;
         border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
-button:hover {{ background: #357abd; }}
+button:hover {{ background: #0d47a1; }}
 .hint {{ color: #888; font-size: 12px; margin-top: 12px; }}
 </style>
 </head>
@@ -1425,9 +1428,9 @@ input[type="text"], input[type="password"] {{ width: 100%; padding: 10px 12px;
      border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
 input[type="text"]:focus, input[type="password"]:focus {{ outline: none;
      border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
-button {{ padding: 12px 24px; background: #4a90e2; color: #fff;
+button {{ padding: 12px 24px; background: #1565c0; color: #fff;
         border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
-button:hover {{ background: #357abd; }}
+button:hover {{ background: #0d47a1; }}
 code {{ font-family: "Courier New", monospace; font-size: 13px; color: #333; }}
 </style>
 </head>
@@ -1641,8 +1644,8 @@ async def health_check(response: Response):
 
 
 @app.get("/readiness")
-async def readiness_check(response: Response):
-    """R41 P1-10: 就绪检查端点(无需认证),返回详细依赖状态 JSON。
+async def readiness_check():
+    """R41 P1-10 / R48 P0-3: 就绪检查端点(无需认证),返回详细依赖状态 JSON。
 
     与 /health 的区别:
       - /health: 简略状态(供 Docker healthcheck / k8s liveness 快速判断)
@@ -1652,13 +1655,22 @@ async def readiness_check(response: Response):
     ENVIRONMENT=test 时跳过 Bot 心跳/Prometheus 检查(E2E 测试无真实 Bot),
     仅校验 SQLite cache_store 已初始化 + admin bootstrap 已完成。
 
+    R48 P0-3 整改:
+      - 使用显式 JSONResponse 返回,确保 HTTP status code 与业务 JSON 一致
+        (就绪 → 200,未就绪 → 503,而非 200 + ready=false)
+      - db_initialized / admin_bootstrap 提升到顶层字段,
+        便于 Playwright webServer.url 轮询时直接断言
+      - webServer.url=/readiness 在 HTTP 2xx 时才继续执行测试
+
     返回:
-      - 200 OK + 完整 JSON if 所有检查通过
-      - 503 Service Unavailable + 完整 JSON if 任一检查失败
+      - 200 OK + JSON(ready=true, db_initialized=true, admin_bootstrap=true, ...)
+      - 503 Service Unavailable + JSON(ready=false, ...) if 任一检查失败
 
     JSON 结构:
       {
         "ready": bool,
+        "db_initialized": bool,      # R48: 顶层字段(便于断言)
+        "admin_bootstrap": bool,    # R48: 顶层字段(便于断言)
         "passed": int,
         "checks": {name: bool},
         "details": {name: str},
@@ -1692,18 +1704,24 @@ async def readiness_check(response: Response):
         }
         ready = db_initialized and bootstrap_ok
         passed = sum(1 for v in checks.values() if v)
-        if not ready:
-            response.status_code = 503
-        return {
-            "ready": ready,
-            "passed": passed,
-            "checks": checks,
-            "details": details,
-            "bots": {},
-            "ru_daily_usage": "unknown",
-            "last_crdb_sync_age": -1.0,
-            "last_r2_collect_age": -1.0,
-        }
+        # R48 P0-3: 显式 JSONResponse,确保 HTTP status 与业务 JSON 一致
+        # 就绪 → 200,未就绪 → 503(Playwright webServer 轮询 /readiness 仅在 2xx 时继续)
+        status_code = 200 if ready else 503
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "ready": ready,
+                "db_initialized": db_initialized,
+                "admin_bootstrap": bootstrap_ok,
+                "passed": passed,
+                "checks": checks,
+                "details": details,
+                "bots": {},
+                "ru_daily_usage": "unknown",
+                "last_crdb_sync_age": -1.0,
+                "last_r2_collect_age": -1.0,
+            },
+        )
 
     # 非测试模式: 完整检查(Bot 心跳 + Prometheus 依赖)
     from database.cache_store import get_all_bot_heartbeats
@@ -1746,18 +1764,23 @@ async def readiness_check(response: Response):
     ready = dep.get("ready", False) and all(bot_status.values()) and db_initialized and bootstrap_ok
     passed = sum(1 for v in all_checks.values() if v)
 
-    if not ready:
-        response.status_code = 503
-    return {
-        "ready": ready,
-        "passed": passed,
-        "checks": all_checks,
-        "details": all_details,
-        "bots": bot_status,
-        "ru_daily_usage": dep.get("ru_daily_usage", "unknown"),
-        "last_crdb_sync_age": dep.get("last_crdb_sync_age", -1.0),
-        "last_r2_collect_age": dep.get("last_r2_collect_age", -1.0),
-    }
+    # R48 P0-3: 显式 JSONResponse,确保 HTTP status 与业务 JSON 一致
+    status_code = 200 if ready else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ready": ready,
+            "db_initialized": db_initialized,
+            "admin_bootstrap": bootstrap_ok,
+            "passed": passed,
+            "checks": all_checks,
+            "details": all_details,
+            "bots": bot_status,
+            "ru_daily_usage": dep.get("ru_daily_usage", "unknown"),
+            "last_crdb_sync_age": dep.get("last_crdb_sync_age", -1.0),
+            "last_r2_collect_age": dep.get("last_r2_collect_age", -1.0),
+        },
+    )
 
 
 @app.get("/locale")

@@ -93,6 +93,25 @@ def _check_production_secret() -> None:
         )
 
 
+def validate_production_config() -> None:
+    """R48 P1-b: 供每个 Bot 启动时显式调用的 production 配置校验。
+
+    R48 终审整改:production secret 检查必须在每个 Bot 启动时实际触发,
+    而不是仅依赖模块被导入时偶然执行。各 Bot 的 _async_main / run 函数
+    应在启动时调用本函数,确保 fail-closed。
+
+    与 _check_production_secret 的区别:
+        - _check_production_secret 在模块导入时自动调用(可能因 conftest MagicMock
+          settings 而不触发)
+        - validate_production_config 供 Bot 启动时显式调用,确保每次启动都检查
+        - 内部调用 _check_production_secret,行为一致
+
+    Raises:
+        RuntimeError: production 环境且 BOT_TOKEN 缺失时
+    """
+    _check_production_secret()
+
+
 # 模块初始化时检查 production 配置(fail-closed)
 _check_production_secret()
 
@@ -146,16 +165,20 @@ def generate_signed_callback(
     data: str = "",
     ttl: int = 3600,
     nonce: str = "",
+    resource_version: str = "",
 ) -> str:
     """生成签名 callback_data(向后兼容旧接口,不持久化 nonce)。
 
     R46 P1: 添加 nonce 防重放。
     R47 P1-a: nonce 熵提升到 128 bit(32 hex chars)。
+    R48 P1-b: 添加 resource_version 参数,绑定资源版本(防止旧按钮操作已更新资源)。
 
     注意:本函数不持久化 nonce 到 callback_nonces 表,
     高风险 action 应改用 sign_button_token_with_nonce(异步,持久化 nonce)。
 
     格式: {user_id}:{action}:{data}:{expire_ts}:{nonce}:{signature}
+    (resource_version 不出现在 callback_data 中,仅参与签名计算,
+     验证时调用方需传入相同的 resource_version 才能通过签名校验)
 
     Args:
         user_id: 用户 ID(必须为整数)
@@ -163,6 +186,9 @@ def generate_signed_callback(
         data: 附加数据(如 file_code,可为空字符串)
         ttl: 有效期(秒,默认 1 小时)
         nonce: 随机串(默认自动生成 32 hex chars = 128 bit 熵)
+        resource_version: 资源版本标识(如 file_code + version),绑定到签名中。
+            传入后验证方必须提供相同的 resource_version 才能通过签名校验,
+            防止使用旧按钮操作已更新的资源。为空时不绑定(向后兼容)。
 
     Returns:
         签名后的 callback_data 字符串(6 段格式)
@@ -171,14 +197,20 @@ def generate_signed_callback(
     if not nonce:
         # R47 P1-a: 128 bit 熵(原 32 bit 不足)
         nonce = secrets.token_hex(NONCE_BYTES)  # 32 hex chars
-    payload = f"{user_id}:{action}:{data}:{expire_ts}:{nonce}"
-    signature = _sign(payload)
-    return f"{payload}:{signature}"
+    # R48 P1-b: resource_version 参与签名(非空时绑定资源版本)
+    if resource_version:
+        sig_payload = f"{user_id}:{action}:{data}:{resource_version}:{expire_ts}:{nonce}"
+    else:
+        sig_payload = f"{user_id}:{action}:{data}:{expire_ts}:{nonce}"
+    signature = _sign(sig_payload)
+    # callback_data 格式不变(6 段),resource_version 仅在签名 payload 中
+    return f"{user_id}:{action}:{data}:{expire_ts}:{nonce}:{signature}"
 
 
 def verify_signed_callback(
     callback_data: str,
     current_user_id: int,
+    resource_version: str = "",
 ) -> Tuple[bool, str, str]:
     """验证签名 callback_data(同步,向后兼容,不消费 nonce)。
 
@@ -186,6 +218,10 @@ def verify_signed_callback(
     R47 P1-a 增强:
         - 高风险 action 必须使用 6 段格式(含 nonce),旧 5 段格式直接拒绝
         - 签名长度必须 ≥ 32 hex chars(128 bit)
+    R48 P1-b: 添加 resource_version 参数,验证资源版本绑定。
+        - 签名时绑定了 resource_version 的 callback,验证时必须传入相同值
+        - 防止使用旧按钮操作已更新的资源(资源版本不匹配 → 签名不匹配 → 拒绝)
+        - 为空时不检查 resource_version(向后兼容旧 callback)
 
     注意:本函数为同步 legacy 接口,不执行 nonce 原子消费。
     高风险 action 应改用 verify_button_token(异步,原子消费 nonce)。
@@ -196,11 +232,15 @@ def verify_signed_callback(
         3. 验证未过期(expire_ts > now)
         4. R47 P1-a: 高风险 action 必须为 6 段格式(含 nonce)
         5. R47 P1-a: 验证签名长度 ≥ 32 hex chars(128 bit)
-        6. 验证签名匹配(常量时间比较)
+        6. R48 P1-b: 根据 resource_version 是否传入,构造对应的签名 payload
+        7. 验证签名匹配(常量时间比较)
 
     Args:
         callback_data: 待验证的 callback_data
         current_user_id: 当前用户 ID(必须匹配签名中的 user_id)
+        resource_version: 资源版本标识(如 file_code + version)。
+            签名时绑定了 resource_version 的 callback 必须传入相同值才能通过。
+            为空时不检查(向后兼容)。
 
     Returns:
         (valid, action, data): valid=True 时 action/data 可用;
@@ -222,13 +262,12 @@ def verify_signed_callback(
             expire_ts = int(parts[-3])
             nonce = parts[-2]
             has_nonce = True
-            payload = f"{user_id}:{action}:{data}:{expire_ts}:{nonce}"
         else:
             # 旧格式(向后兼容): {user_id}:{action}:{data}:{expire_ts}:{signature}
             data = ":".join(parts[2:-2])
             expire_ts = int(parts[-2])
             has_nonce = False
-            payload = f"{user_id}:{action}:{data}:{expire_ts}"
+            nonce = ""
         # 验证用户 ID(防止跨用户伪造)
         if user_id != current_user_id:
             logger.debug(
@@ -253,10 +292,23 @@ def verify_signed_callback(
                 f"[button_security] 签名长度不足: {len(signature)} < {SIGNATURE_LENGTH}"
             )
             return False, "", ""
+        # R48 P1-b: 根据 resource_version 构造签名 payload
+        # 签名时若绑定了 resource_version,payload 中包含该字段;
+        # 验证时必须传入相同值才能通过签名校验
+        if has_nonce:
+            if resource_version:
+                expected_payload = f"{user_id}:{action}:{data}:{resource_version}:{expire_ts}:{nonce}"
+            else:
+                expected_payload = f"{user_id}:{action}:{data}:{expire_ts}:{nonce}"
+        else:
+            if resource_version:
+                expected_payload = f"{user_id}:{action}:{data}:{resource_version}:{expire_ts}"
+            else:
+                expected_payload = f"{user_id}:{action}:{data}:{expire_ts}"
         # 验证签名(常量时间比较,防止时序攻击)
-        expected_sig = _sign(payload)
+        expected_sig = _sign(expected_payload)
         if not hmac.compare_digest(signature, expected_sig):
-            logger.debug("[button_security] 签名不匹配")
+            logger.debug("[button_security] 签名不匹配(可能 resource_version 不匹配)")
             return False, "", ""
         return True, action, data
     except (ValueError, IndexError) as e:

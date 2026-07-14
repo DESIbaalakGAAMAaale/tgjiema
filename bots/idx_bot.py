@@ -41,6 +41,8 @@ from services.code_generator import generate_unique_code, is_valid_code_format, 
 from services.permission import check_decode_permission, get_or_create_user
 from services.relay_pool import relay_pool
 from services import content_reports, user_repair, task_center
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.dynamic_rate_limiter import dynamic_rate_limiter
@@ -240,7 +242,8 @@ async def _get_storage_channel() -> int:
         logger.warning(f"[Idx] 获取存储频道失败: {e}")
         pass
     # P2: 所有渠道失败时抛异常而非返回 0,避免后续写入无效记录
-    raise RuntimeError("无可用存储频道,请检查 cells 表配置")
+    # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+    raise AppError(ErrorCodes.INDEX_STORAGE_NO_CHANNEL)
 
 
 # ─── 入队新方jobs ───
@@ -649,7 +652,11 @@ async def _generate_unique_code_with_retry(
 
     store = get_cache_store()
     if not store._db:
-        raise RuntimeError("[Idx][R45] _generate_unique_code_with_retry: 数据库未初始化")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(
+            ErrorCodes.INDEX_GENERATE_DB_UNINITIALIZED,
+            params={"action": "_generate_unique_code_with_retry"},
+        )
 
     for attempt in range(max_retries):
         code = code_generator.build_file_code(file_types)
@@ -700,7 +707,11 @@ async def finalize_upload(command: FinalizeUploadCommand) -> None:
 
     store = get_cache_store()
     if not store._db:
-        raise RuntimeError("[Idx][R45] finalize_upload: 数据库未初始化")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(
+            ErrorCodes.INDEX_FINALIZE_DB_UNINITIALIZED,
+            params={"action": "finalize_upload"},
+        )
 
     # 序列化 payload(事务外纯计算,不涉及 DB 状态)
     record_payload = json.dumps(command.file_record, default=str)
@@ -3064,6 +3075,10 @@ async def _init():
 
 
 async def _async_main():
+    # R48 P1-b: 每次 Bot 启动时显式触发 production secret 检查(fail-closed)
+    from services.button_security import validate_production_config
+    validate_production_config()
+
     await _init()
     from database.cache_store import report_bot_heartbeat
     await report_bot_heartbeat("idx_bot")

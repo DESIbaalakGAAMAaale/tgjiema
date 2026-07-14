@@ -17,6 +17,8 @@ from utils.task_utils import create_safe_task
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 from config import settings
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 
 _SETTLE_WAIT = 1.5
 _INITIAL_SETTLE_WAIT = 3
@@ -516,14 +518,22 @@ class RelayInstance:
             await self._client.send_code_request(phone)
             code = await self._wait_for_admin_code()
             if not code:
-                raise RuntimeError("验证码获取失败")
+                # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+                raise AppError(
+                    ErrorCodes.RELAY_AUTH_CODE_FAILED,
+                    params={"phone": self.phone},
+                )
             try:
                 await self._client.sign_in(self.phone, code)
             except SessionPasswordNeededError:
                 logger.info(f"[RelayInstance:{self.phone}] 该账号开启了二步验证,等待密码")
                 password = await self._wait_for_admin_password()
                 if not password:
-                    raise RuntimeError("二步验证密码获取超时")
+                    # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+                    raise AppError(
+                        ErrorCodes.RELAY_AUTH_PASSWORD_TIMEOUT,
+                        params={"phone": self.phone},
+                    )
                 try:
                     await self._client.sign_in(password=password)
                 except Exception as e:

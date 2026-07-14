@@ -1,4 +1,4 @@
-"""R40 + R41 + R42 + R45 + R47: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理 + 备份孤儿 GC + decode_logs 7天保留清理 + MFA 记录 retention。
+"""R40 + R41 + R42 + R45 + R47 + R48: 定时任务调度器 — 清理过期数据 + 配额预留 + 指标采集 + 临时封禁自动解封 + 命令租约清理 + 备份孤儿 GC + decode_logs 7天保留清理 + MFA 记录 retention + callback_nonces 过期清理。
 
 职责:
     1. 每小时清理过期配额预留(超过 1 小时未结算的自动退款)
@@ -11,6 +11,8 @@
        + 启动 run_daily_cleanup_loop 后台兜底任务(create_safe_task)
     8. R47 P1-b: 每天 3:00 清理 MFA 过期记录(24h 保留,
        委托 admin.mfa.cleanup_expired_mfa_records)
+    9. R48 P1-b: 每天 3:00 清理 callback_nonces 过期记录
+       (过期未消费 + 已消费超 24h,委托 cache_store.callback_nonce_cleanup)
 
 设计原则:
     - 纯 async,通过 run_all.py BOT_RUNNERS 注册为独立进程
@@ -165,6 +167,35 @@ async def cleanup_expired_mfa_records_job() -> None:
         logger.warning(f"[R47] MFA 记录清理异常: {e}")
 
 
+async def cleanup_expired_callback_nonces_job() -> None:
+    """R48 P1-b: 每天清理 callback_nonces 过期记录。
+
+    清理策略:
+    - 删除 expires_at < now 的记录(已过期但未消费的 nonce)
+    - 删除 consumed_at < (now - 24h) 的记录(已消费超过 24h 的 nonce)
+
+    防止 callback_nonces 表无限增长,定期清理过期和已消费的 nonce。
+    本地 SQLite 清理(零 CRDB RU),幂等:重复执行无副作用。
+    """
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        now = _dt.datetime.now().isoformat()
+        cutoff_24h = (_dt.datetime.now() - _dt.timedelta(hours=24)).isoformat()
+        result = await store.callback_nonce_cleanup(
+            expired_before=now,
+            consumed_before=cutoff_24h,
+        )
+        if result["deleted_expired"] > 0 or result["deleted_consumed"] > 0:
+            logger.info(
+                f"[R48] callback_nonces 清理: "
+                f"expired={result['deleted_expired']}, "
+                f"consumed={result['deleted_consumed']}"
+            )
+    except Exception as e:
+        logger.warning(f"[R48] callback_nonces 清理异常: {e}")
+
+
 async def _run_lease_cleanup_loop() -> None:
     """R41 P0-5: 命令租约清理子循环(每 60 秒执行一次)。
 
@@ -285,6 +316,8 @@ async def run_scheduler() -> None:
                     await cleanup_expired_decode_logs_job()
                     # R47 P1-b: 同期清理 MFA 过期记录(24h 保留)
                     await cleanup_expired_mfa_records_job()
+                    # R48 P1-b: 同期清理 callback_nonces 过期记录
+                    await cleanup_expired_callback_nonces_job()
                 # R42 P1-5: 每天 4:00-4:05 执行 tombstone retention 物理清理
                 # (在备份通常完成后,避免与 3:00 数据清理争用资源)
                 if (

@@ -127,8 +127,12 @@ class TestCheckReceipt:
         effect_type = "telegram_send"
         target = "chat_456"
         external_id = "msg_789"
+        # R48 P0-4: critical effect 必须传非空 request_hash
+        request_hash = "hash_done_001"
 
-        await mgr.record_pending(action_id, effect_type, target)
+        await mgr.record_pending(
+            action_id, effect_type, target, request_hash=request_hash,
+        )
         await mgr.record_completed(action_id, effect_type, target, external_id=external_id)
 
         result = await mgr.check_receipt(action_id, effect_type, target)
@@ -244,8 +248,12 @@ class TestRecordCompleted:
         action_id = "act_no_ext_001"
         effect_type = "crdb_delete"
         target = "file_records:abc123"
+        # R48 P0-4: critical effect 必须传非空 request_hash
+        request_hash = "hash_no_ext_001"
 
-        await mgr.record_pending(action_id, effect_type, target)
+        await mgr.record_pending(
+            action_id, effect_type, target, request_hash=request_hash,
+        )
         await mgr.record_completed(action_id, effect_type, target)
 
         cursor = await real_store._db.execute(
@@ -303,9 +311,13 @@ class TestEndToEnd:
         action_id = "act_e2e_fail"
         effect_type = "telegram_send"
         target = "chat_999"
+        # R48 P0-4: critical effect 必须传非空 request_hash
+        request_hash = "hash_e2e_fail"
 
         # 1. 记录 pending
-        await mgr.record_pending(action_id, effect_type, target)
+        await mgr.record_pending(
+            action_id, effect_type, target, request_hash=request_hash,
+        )
 
         # 2. 记录 failed
         await mgr.record_failed(action_id, effect_type, target)
@@ -314,7 +326,9 @@ class TestEndToEnd:
         assert await mgr.check_receipt(action_id, effect_type, target) is None
 
         # 4. 重试场景: 重新 record_pending → record_completed
-        await mgr.record_pending(action_id, effect_type, target)
+        await mgr.record_pending(
+            action_id, effect_type, target, request_hash=request_hash,
+        )
         await mgr.record_completed(action_id, effect_type, target, external_id="msg_retry")
         result = await mgr.check_receipt(action_id, effect_type, target)
         assert result is not None

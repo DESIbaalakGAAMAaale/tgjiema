@@ -38,6 +38,8 @@ from utils.force_join import check_force_join, three_bot_reminder, common_faq
 from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text, safe_send_media_group
 from utils.file_utils import detect_file_type, extract_file_meta
 from utils.relay_auth import is_relay_sender_allowed
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 # R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
 from services.maintenance_mode import require_maintenance_check
 # R41 i18n: 国际化翻译(用户可见文本)
@@ -969,7 +971,8 @@ async def _outbox_archive_to_r100_strict(
     - 异常向上传播(不吞异常),让 OutboxWorker 触发重试
     """
     if not _bot:
-        raise RuntimeError("_bot 全局引用未初始化(OutboxWorker 无法调用 Telegram API)")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(ErrorCodes.UPLOAD_OUTBOX_BOT_UNINITIALIZED)
     r100_ch = await _get_r100_channel()
     if not r100_ch:
         # R100 频道未配置,视为完成(不阻塞,日志已记录)
@@ -989,7 +992,8 @@ async def _get_upload_target_channel() -> int:
         await _refresh_active_slots()
     if not _active_a_slots:
         logger.error("[Up] 无可用活跃槽位，无法处理上传请求")
-        raise RuntimeError("无可用活跃槽位，请检查拓扑配置")
+        # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+        raise AppError(ErrorCodes.UPLOAD_SLOT_NONE_ACTIVE)
     # 轮转:每次取下一个活跃频道
     # P1-7: 在锁内同时完成取列表引用+取模+读 channel_id,
     # 避免 _refresh_active_slots 替换列表后 idx 越界。
@@ -2838,6 +2842,10 @@ async def _init():
 
 
 async def _async_main():
+    # R48 P1-b: 每次 Bot 启动时显式触发 production secret 检查(fail-closed)
+    from services.button_security import validate_production_config
+    validate_production_config()
+
     await _init()
     from database.cache_store import report_bot_heartbeat
     await report_bot_heartbeat("up_bot")

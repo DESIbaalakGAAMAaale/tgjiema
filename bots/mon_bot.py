@@ -31,6 +31,8 @@ from services.mon import MonScheduler
 from utils.monitor import metrics
 # R44 6.2: i18n 国际化翻译(管理员可见告警文案)
 from services.i18n import get_i18n_manager
+# R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
+from services.error_codes import AppError, ErrorCodes
 
 
 def _t(user_id: int, key: str, **kwargs) -> str:
@@ -50,7 +52,8 @@ def _t(user_id: int, key: str, **kwargs) -> str:
 
 TOKEN = settings.MON_BOT_TOKEN
 if not TOKEN:
-    raise RuntimeError("MON_BOT_TOKEN 未配置,监控机器人必须有独立的 Bot Token")
+    # R48 P1: 协议化错误码替代裸字符串 RuntimeError
+    raise AppError(ErrorCodes.BOT_MON_TOKEN_MISSING)
 RECOVERY_INTERVAL = getattr(settings, "MON_CHECK_INTERVAL", 60)
 
 # ─── 封禁关键词(Telegram API 错误消息匹配) ───
@@ -1589,6 +1592,10 @@ class MonBot:
 
 async def run_mon():
     """启动 Mon 监控机器人。"""
+    # R48 P1-b: 每次 Bot 启动时显式触发 production secret 检查(fail-closed)
+    from services.button_security import validate_production_config
+    validate_production_config()
+
     # P1-15:创建并注册全局停止事件,让 run_all 的 SIGTERM/SIGINT handler 能 set 它,
     # 触发 mon_bot 优雅退出,与其它 4 个 bot 行为一致。
     from run_all import _set_stop_event

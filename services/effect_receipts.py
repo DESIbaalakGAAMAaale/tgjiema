@@ -50,17 +50,23 @@ class EffectReceiptError(Exception):
 
 
 def compute_effect_request_hash(effect_type: str, params: dict) -> str:
-    """R47 P0-4: 计算 effect 副作用的 request_hash(绑定 effect_type + params)。
+    """R47 P0-4 / R48 P0-4: 计算 effect 副作用的 request_hash(绑定 effect_type + params)。
 
     用于防止同 action_id 不同 payload 绕过 effect receipt:
     相同 action_id 但参数不同时,request_hash 不匹配,不视为已完成。
+
+    R48 P0-4: hash 覆盖完整字段 — 调用方应在 params 中包含:
+    - target 相关字段(target_user_id / target_channel_id / chat_id)
+    - 关键业务参数(message_id / file_id / key 等)
+    - 资源 version(如有)
+    使用 SHA256 + json.dumps(sort_keys=True, default=str) 确保确定性与字段无关顺序。
 
     Args:
         effect_type: 副作用类型(如 'telegram_send')
         params: 副作用参数字典
 
     Returns:
-        SHA256 十六进制摘要字符串
+        SHA256 十六进制摘要字符串(64 字符)
     """
     payload_str = json.dumps(
         params or {}, sort_keys=True, ensure_ascii=False, default=str,
@@ -178,8 +184,18 @@ class EffectReceiptManager:
         R47 P0-4: 若已存在 completed 行但 request_hash 不匹配(不同 payload),
                    视为不同副作用,重新 claim(UPDATE 为 pending)而非跳过。
 
+        R48 P0-4: 应用层校验 — critical effect_type 的 request_hash 必须非空,
+                   否则抛 ValueError(防止同 action_id 不同参数共用 receipt)。
+
         Returns True 表示 claim 成功,False 表示已有相同 payload completed(应跳过)。
         """
+        # R48 P0-4: 应用层校验 critical effect 的 request_hash 必须非空
+        if effect_type in CRITICAL_EFFECT_TYPES and not request_hash:
+            raise ValueError(
+                f"critical effect '{effect_type}' 的 request_hash 为空,"
+                f"拒绝记录 pending(action_id={action_id})"
+            )
+
         if not self._store._db:
             if fail_closed:
                 raise EffectReceiptError(
@@ -378,16 +394,17 @@ def _ast_is_empty_value(node) -> bool:
 
 def _ast_extract_call_arg(
     call_node: ast.Call,
-    keyword: str,
-    position: int,
+    keyword: Optional[str],
+    position: Optional[int],
 ) -> Optional[ast.AST]:
     """从 Call 节点提取指定参数(优先关键字参数,其次按位置)。"""
     # 先查关键字参数
-    for kw in call_node.keywords:
-        if kw.arg == keyword:
-            return kw.value
-    # 再查位置参数
-    if position < len(call_node.args):
+    if keyword is not None:
+        for kw in call_node.keywords:
+            if kw.arg == keyword:
+                return kw.value
+    # 再查位置参数(position=None 时跳过)
+    if position is not None and position < len(call_node.args):
         return call_node.args[position]
     return None
 
@@ -395,13 +412,19 @@ def _ast_extract_call_arg(
 def validate_critical_effects_have_action_id(
     root_dir: str = ".",
 ) -> list[dict]:
-    """R47 P0-4: 静态扫描所有 EffectReceiptContext/with_effect_receipt 调用点。
+    """R47 P0-4 / R48 P0-4: 静态扫描所有 EffectReceiptContext/with_effect_receipt 调用点。
 
     扫描 services/、bots/、admin/ 下所有 .py 文件,检测:
     1. EffectReceiptContext(...) 调用中 effect_type 为 critical 类型时,
        action_id 必须为非空值(不能是 None / 空字符串字面量 / 缺失)。
     2. with_effect_receipt(...) 装饰器中 effect_type 为 critical 类型时,
        标记为违规(装饰器模式无法在静态阶段保证调用点传入 action_id)。
+
+    R48 P0-4 新增:
+    3. EffectReceiptContext(...) 调用中 effect_type 为 critical 类型时,
+       params 参数必须存在且非空(用于计算 request_hash 绑定 effect 参数)。
+    4. with_effect_receipt(...) 装饰器工厂中 effect_type 为 critical 类型时,
+       params_fn 参数必须存在且非空。
 
     测试目录 tests/ 与脚本目录 scripts/ 不在扫描范围内。
 
@@ -456,6 +479,21 @@ def validate_critical_effects_have_action_id(
                                     "未显式传入非空 action_id"
                                 ),
                             })
+                        # R48 P0-4: critical effect 必须传入非空 params
+                        params_node = _ast_extract_call_arg(
+                            node, "params", position=None,
+                        )
+                        if _ast_is_empty_value(params_node):
+                            violations.append({
+                                "file": rel_path,
+                                "line": node.lineno,
+                                "call": "EffectReceiptContext",
+                                "effect_type": effect_type_val,
+                                "reason": (
+                                    "critical effect 的 EffectReceiptContext "
+                                    "未显式传入非空 params(用于 request_hash 绑定)"
+                                ),
+                            })
                     elif func_name == "with_effect_receipt":
                         effect_type_node = _ast_extract_call_arg(
                             node, None, position=0,
@@ -477,4 +515,19 @@ def validate_critical_effects_have_action_id(
                                 "应改用 EffectReceiptContext 显式传参"
                             ),
                         })
+                        # R48 P0-4: critical effect 装饰器必须传入非空 params_fn
+                        params_fn_node = _ast_extract_call_arg(
+                            node, "params_fn", position=None,
+                        )
+                        if _ast_is_empty_value(params_fn_node):
+                            violations.append({
+                                "file": rel_path,
+                                "line": node.lineno,
+                                "call": "with_effect_receipt",
+                                "effect_type": effect_type_val,
+                                "reason": (
+                                    "critical effect 的 with_effect_receipt 装饰器 "
+                                    "未显式传入非空 params_fn(用于 request_hash 绑定)"
+                                ),
+                            })
     return violations

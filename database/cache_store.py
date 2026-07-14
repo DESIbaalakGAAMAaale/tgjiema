@@ -21,11 +21,34 @@ from typing import Any, Optional, Protocol, runtime_checkable
 from loguru import logger
 
 # R47 P0-3: 支持 DATABASE_URL 环境变量指定 SQLite 路径(E2E 测试每个 run 独立 DB)
-# 格式: sqlite:///path/to/db.db → 解析为 Path("/path/to/db.db")
-# 未设置或非 sqlite 协议时回退到默认路径
+# R48 P0-3: 修正解析 — sqlite:///tmp/x.db → Path("/tmp/x.db") (绝对路径)
+# 之前用 len("sqlite:///") 会吃掉路径首个 /,导致 /tmp/... 被误解析为相对路径 tmp/...
+# 改为 len("sqlite://") 保留路径开头的 /,与 CI 断言 str(DB_PATH) == '/tmp/...' 一致
+# R48 P0-3: 添加 .resolve() — Windows 上 Path("/tmp/...") 是驱动器相对路径,
+# .resolve() 将其解析为绝对路径(如 F:\tmp\...),避免 webServer 子进程驱动器不同导致路径错误
+#
+# R48 P0-3: 新增相对路径支持 — sqlite://tmp/e2e_local.db (两个斜杠)
+# 相对路径基于项目根目录(cache_store.py 的两级父目录),确保 DB 文件在项目目录内,
+# 避免 Windows 沙箱/权限限制阻止 webServer 子进程访问系统 /tmp 目录。
+# CI(Linux) 仍用 sqlite:///tmp/e2e_local.db (绝对路径);本地 Windows 测试用相对路径。
+#
+# 格式:
+#   sqlite:///path/to/db.db → Path("/path/to/db.db") (绝对路径, Linux CI)
+#   sqlite://tmp/e2e.db     → <项目根>/tmp/e2e.db (相对路径, 本地 Windows)
+#   sqlite:///F:/path.db    → Path("F:/path.db") (Windows 驱动器绝对路径)
+# 未设置或非 sqlite 协议时回退到默认路径 data/cache_store.db
 _db_url_env = os.environ.get("DATABASE_URL", "")
 if _db_url_env.startswith("sqlite:///"):
-    DB_PATH = Path(_db_url_env[len("sqlite:///"):])
+    _path_part = _db_url_env[len("sqlite://"):]  # "/tmp/x.db" 或 "/F:/path"
+    # Windows 驱动器路径: /F:/path → F:/path (strip leading / before drive letter)
+    if len(_path_part) > 2 and _path_part[0] == '/' and _path_part[1].isalpha() and _path_part[2] == ':':
+        DB_PATH = Path(_path_part[1:]).resolve()
+    else:
+        DB_PATH = Path(_path_part).resolve()
+elif _db_url_env.startswith("sqlite://"):
+    # 相对路径: sqlite://tmp/e2e.db → <项目根>/tmp/e2e.db
+    _rel_path = _db_url_env[len("sqlite://"):]
+    DB_PATH = (Path(__file__).parent.parent / _rel_path).resolve()
 else:
     DB_PATH = Path(__file__).parent.parent / "data" / "cache_store.db"
 
@@ -859,20 +882,48 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
         )
-        # R47 P0-6: dirty_outbox 增加 UNIQUE 约束 (table_name, pk, version)
+        # R48 P0-5: dirty_outbox 增加 UNIQUE 约束 (table_name, pk, version)
         # 防止并发写入时 (table, pk, version) 重复,配合 allocate_version 原子递增使用。
-        # 采用 CREATE UNIQUE INDEX IF NOT EXISTS 实现幂等升级(老库已存在表时也能补约束)。
+        # 老库可能存在历史重复行,R48 要求 fail-fast(不允许只 warning 后继续):
+        #   1. 先扫描重复行并归档到 migration_conflicts(保留权威记录)
+        #   2. 创建 UNIQUE INDEX IF NOT EXISTS
+        #   3. PRAGMA 验证 index 存在且为 UNIQUE,失败则 raise RuntimeError 拒绝启动
+        # (R47 只 warning 不阻塞的旧逻辑已废弃,违反 fail-fast 要求)
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS migration_conflicts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                table_name    TEXT NOT NULL,
+                conflict_type TEXT NOT NULL,
+                record_id     INTEGER NOT NULL,
+                record_data   TEXT NOT NULL,
+                resolved_at   TEXT,
+                created_at    TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_migration_conflicts_unresolved "
+            "ON migration_conflicts(resolved_at) WHERE resolved_at IS NULL"
+        )
+        # 归档并清理 dirty_outbox 历史重复行(保留 created_at 最新/id 最大者为权威)
+        await self._archive_conflicts_to_migration_conflicts(
+            "dirty_outbox", ["table_name", "pk", "version"]
+        )
+        # 创建 UNIQUE INDEX(清理重复后应成功;IF NOT EXISTS 保证幂等)
         try:
             await self._db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_dirty_outbox_table_pk_version "
                 "ON dirty_outbox(table_name, pk, version)"
             )
         except Exception as _e_dirty_unique:
-            # 老库可能已存在重复行导致创建 UNIQUE INDEX 失败,记录警告但不阻塞 init
-            # (后续 add_dirty_outbox 会通过 allocate_version 避免新增重复)
-            logger.warning(
-                f"[CacheStore] dirty_outbox UNIQUE INDEX 创建失败(可能存在历史重复行): {_e_dirty_unique}"
-            )
+            # 清理重复后仍失败,说明存在其他约束冲突原因,必须 fail-fast
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE INDEX 创建失败(清理重复后仍失败),拒绝启动: {_e_dirty_unique}"
+            ) from _e_dirty_unique
+        # PRAGMA 验证 UNIQUE INDEX 确实存在且为 UNIQUE,失败则拒绝启动
+        await self._verify_unique_constraint_or_fail(
+            "dirty_outbox", "idx_dirty_outbox_table_pk_version",
+            ["table_name", "pk", "version"],
+        )
 
         # ─── R41 P0-6: dlq_records 死信队列权威存储表 ───
         # crdb_sync 处理失败的 dirty_outbox 记录路由到此表(替代/补充 jsonl 文件)。
@@ -1281,10 +1332,13 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_cmd_exec_status ON command_executions(status)"
         )
 
-        # ─── R44 G0-2 / R46 P0-1: effect_receipts 表 — 外部副作用 receipt 持久化 ───
+        # ─── R44 G0-2 / R46 P0-1 / R48 P0-4: effect_receipts 表 — 外部副作用 receipt 持久化 ───
         # R46 P0-1: 增加 request_hash/attempt/lease_owner/lease_until/last_error/reconcile_status
         # 用于幂等控制:action_id + effect_type + target 唯一标识一个外部副作用,
         # 执行前检查 receipt 是否已 completed,避免重复触发外部副作用。
+        # R48 P0-4: 增加 CHECK 约束 — critical effect_type 行的 request_hash 必须非 NULL,
+        # 防止同 action_id 不同参数共用 receipt(仅对新建表生效;
+        # 旧表无法 ALTER ADD CHECK,由应用层 record_pending 校验兜底)。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS effect_receipts (
                 action_id          TEXT NOT NULL,
@@ -1300,7 +1354,10 @@ class CacheStore:
                 lease_until        TEXT,
                 last_error         TEXT,
                 reconcile_status   TEXT,
-                PRIMARY KEY (action_id, effect_type, target)
+                PRIMARY KEY (action_id, effect_type, target),
+                CHECK (request_hash IS NOT NULL OR effect_type NOT IN
+                       ('telegram_send','telegram_copy','r2_put','r2_download',
+                        'restore','ban','takedown','purge','crdb_delete'))
             )"""
         )
         await self._db.execute(
@@ -6667,6 +6724,141 @@ class CacheStore:
             logger.error(f"[CacheStore] allocate_version 失败: {e}")
             return 1
 
+    # ─── R48 P0-5: 迁移冲突处理框架(fail-fast) ──────────────
+
+    async def _archive_conflicts_to_migration_conflicts(
+        self, table_name: str, columns: list[str],
+    ) -> int:
+        """R48 P0-5: 通用迁移冲突归档 — 清理表中重复行并归档到 migration_conflicts。
+
+        对指定表的 columns 组合扫描重复行,每组保留 created_at 最新(或 id 最大)的
+        权威记录,其余记录序列化为 JSON 存入 migration_conflicts 后从原表删除。
+
+        幂等:重复行清理后再次调用无副作用(无重复行可清理)。
+        fail-fast:归档过程异常时 raise RuntimeError,不允许只 warning 后继续。
+
+        Args:
+            table_name: 目标表名(如 dirty_outbox)
+            columns: 重复判定列(如 ["table_name", "pk", "version"])
+
+        Returns:
+            归档的冲突记录数(int)
+        """
+        if not self._db:
+            return 0
+        _cols_csv = ", ".join(columns)
+        try:
+            # 1. 扫描重复行组(列组合相同且 COUNT > 1)
+            cursor = await self._db.execute(
+                f"SELECT {_cols_csv}, COUNT(*) AS cnt "
+                f"FROM {table_name} "
+                f"GROUP BY {_cols_csv} "
+                f"HAVING COUNT(*) > 1"
+            )
+            dup_groups = await cursor.fetchall()
+            if not dup_groups:
+                return 0
+            import datetime as _dt
+            import json as _json
+            _now = _dt.datetime.now().isoformat()
+            # 获取列名(用于 JSON 序列化),只查一次
+            cur_cols = await self._db.execute(f"PRAGMA table_info({table_name})")
+            col_names = [c[1] for c in await cur_cols.fetchall()]
+            archived = 0
+            for _row in dup_groups:
+                # _row: (col1, col2, ..., cnt)
+                _where = " AND ".join([f"{c} = ?" for c in columns])
+                _params = list(_row[:len(columns)])
+                # 拉取该组所有行,按 created_at DESC, id DESC 排序(权威记录排第一)
+                cur_rows = await self._db.execute(
+                    f"SELECT * FROM {table_name} WHERE {_where} "
+                    f"ORDER BY created_at DESC, id DESC",
+                    _params,
+                )
+                rows_all = await cur_rows.fetchall()
+                if len(rows_all) < 2:
+                    continue
+                # 第一行为权威记录(最新 created_at 或最大 id),其余归档后删除
+                for r in rows_all[1:]:
+                    _rid = int(r[0])
+                    _record_data = _json.dumps(
+                        {col_names[i]: r[i] for i in range(len(col_names))},
+                        ensure_ascii=False, default=str,
+                    )
+                    await self._db.execute(
+                        "INSERT INTO migration_conflicts "
+                        "(table_name, conflict_type, record_id, record_data, resolved_at, created_at) "
+                        "VALUES (?, ?, ?, ?, NULL, ?)",
+                        (table_name, f"{table_name}_duplicate", _rid, _record_data, _now),
+                    )
+                    await self._db.execute(
+                        f"DELETE FROM {table_name} WHERE id = ?",
+                        (_rid,),
+                    )
+                    archived += 1
+            await self._db.commit()
+            if archived > 0:
+                logger.warning(
+                    f"[CacheStore] {table_name} 迁移冲突归档: "
+                    f"清理 {archived} 条重复行到 migration_conflicts"
+                )
+            return archived
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(f"[CacheStore] _archive_conflicts_to_migration_conflicts 失败: {e}")
+            raise RuntimeError(
+                f"{table_name} 重复行归档失败,拒绝启动: {e}"
+            ) from e
+
+    async def _verify_unique_constraint_or_fail(
+        self, table_name: str, index_name: str, columns: list[str],
+    ) -> None:
+        """R48 P0-5: 通用 UNIQUE 约束验证 — PRAGMA 验证索引存在且为 UNIQUE,失败 raise RuntimeError。
+
+        CREATE UNIQUE INDEX IF NOT EXISTS 在同名索引已存在时会静默跳过(即使该索引
+        非 UNIQUE),因此必须通过 PRAGMA index_list 二次验证 unique 标志位。
+
+        Args:
+            table_name: 目标表名
+            index_name: 期望存在的 UNIQUE 索引名
+            columns: 索引列(用于错误日志)
+
+        Raises:
+            RuntimeError: 索引不存在或非 UNIQUE(fail-fast,拒绝启动)
+        """
+        if not self._db:
+            raise RuntimeError(
+                f"无法验证 {table_name} UNIQUE 约束: 数据库连接未初始化"
+            )
+        try:
+            cursor = await self._db.execute(
+                f"PRAGMA index_list('{table_name}')"
+            )
+            indexes = await cursor.fetchall()
+        except Exception as e:
+            raise RuntimeError(
+                f"{table_name} UNIQUE 约束验证失败(PRAGMA index_list 异常),拒绝启动: {e}"
+            ) from e
+        # PRAGMA index_list 返回: (seq, name, unique, origin, partial)
+        _found = False
+        _is_unique = False
+        for _idx in indexes:
+            if len(_idx) >= 3 and _idx[1] == index_name:
+                _found = True
+                _is_unique = bool(_idx[2])
+                break
+        if not _found:
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE index 创建失败,拒绝启动: "
+                f"索引 {index_name} 不存在于 {table_name} 表(PRAGMA 验证未发现)"
+            )
+        if not _is_unique:
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE index 创建失败,拒绝启动: "
+                f"索引 {index_name} 存在但非 UNIQUE(PRAGMA 验证 unique=0)"
+            )
+
     # ─── R47 P0-6: dirty_outbox 唯一冲突重试辅助 ──────────────
 
     async def _add_dirty_outbox_with_retry(
@@ -7001,6 +7193,60 @@ class CacheStore:
         except Exception as e:
             logger.error(f"[CacheStore] callback_nonce_exists 失败: {e}")
             return False
+
+    async def callback_nonce_cleanup(
+        self,
+        expired_before: str | None = None,
+        consumed_before: str | None = None,
+    ) -> dict:
+        """R48 P1-b: 清理 callback_nonces 表中的过期/已消费记录。
+
+        清理策略:
+        1. 删除 expires_at < expired_before 的记录(已过期但未消费)
+        2. 删除 consumed_at < consumed_before 的记录(已消费超过保留期)
+
+        典型用法:
+        - expired_before = now (删除所有过期未消费的 nonce)
+        - consumed_before = now - 24h (删除 24h 前已消费的 nonce)
+
+        Args:
+            expired_before: ISO 时间字符串,删除 expires_at < 此值的记录。
+                None 时不清理过期记录。
+            consumed_before: ISO 时间字符串,删除 consumed_at < 此值(且非 NULL)的记录。
+                None 时不清理已消费记录。
+
+        Returns:
+            {"deleted_expired": int, "deleted_consumed": int}
+        """
+        if not self._db:
+            return {"deleted_expired": 0, "deleted_consumed": 0}
+        deleted_expired = 0
+        deleted_consumed = 0
+        try:
+            if expired_before:
+                cursor = await self._db.execute(
+                    "DELETE FROM callback_nonces "
+                    "WHERE expires_at < ? AND consumed_at IS NULL",
+                    (expired_before,),
+                )
+                deleted_expired = cursor.rowcount or 0
+                await self._db.commit()
+            if consumed_before:
+                cursor = await self._db.execute(
+                    "DELETE FROM callback_nonces "
+                    "WHERE consumed_at IS NOT NULL AND consumed_at < ?",
+                    (consumed_before,),
+                )
+                deleted_consumed = cursor.rowcount or 0
+                await self._db.commit()
+            if deleted_expired > 0 or deleted_consumed > 0:
+                logger.info(
+                    f"[CacheStore] callback_nonce_cleanup: "
+                    f"expired={deleted_expired}, consumed={deleted_consumed}"
+                )
+        except Exception as e:
+            logger.error(f"[CacheStore] callback_nonce_cleanup 失败: {e}")
+        return {"deleted_expired": deleted_expired, "deleted_consumed": deleted_consumed}
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────

@@ -3,6 +3,8 @@ name: E2E Tests
 # R44: 端到端测试(Playwright),SHA pin 所有 actions 引用避免供应链漂移
 # R46 P0-6: 增加 push 触发 + 并发控制 + 超时
 # R47 P0-3: 修复 Playwright 环境 + Admin bootstrap + 临时 SQLite + readiness 检查
+# R48 P0-3: 整改 readiness 显式 JSONResponse(200/503) + 显式 webServer env
+#           + CI 失败排查辅助(curl readiness / ls sqlite / 查询 admin_principals)
 
 on:
   push:
@@ -21,6 +23,8 @@ jobs:
     timeout-minutes: 30
     env:
       # R47 P0-3: 测试环境变量(每个 run 独立,不污染)
+      # R48 P0-3: DATABASE_URL 在 job 级别设置,确保 bootstrap 步骤和
+      #           webServer(通过 playwright.config.ts env)连接同一 SQLite 文件
       ENVIRONMENT: test
       DATABASE_URL: sqlite:///tmp/e2e_${{ github.run_id }}.db
       BOT_TOKEN: test_token
@@ -60,8 +64,10 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
-      # R47 P0-3: 生成 ADMIN_PASSWORD 的 PBKDF2 哈希(与 admin._verify_password 兼容)
-      # 不导入项目代码,避免 Settings 校验;仅用标准库生成哈希
+      # R47/R48 P0-3: 生成 ADMIN_PASSWORD 的 PBKDF2 哈希(与 admin._verify_password 兼容)
+      # 不导入项目代码,避免 Settings 校验(此时 ADMIN_PASSWORD 尚未设置);仅用标准库生成哈希
+      # R48 验证: hash 格式 $pbkdf2-sha256$200000$<salt_hex>$<hash_hex>(split by $ → 5 parts)
+      #           _verify_password 解析: parts[2]=iterations, parts[3]=salt, parts[4]=hash
       - name: Generate admin password hash
         run: |
           HASH=$(python -c "
@@ -71,15 +77,34 @@ jobs:
           print(f'\$pbkdf2-sha256\$200000\${salt.hex()}\${h.hex()}')
           ")
           echo "ADMIN_PASSWORD=$HASH" >> "$GITHUB_ENV"
+          # R48: 验证 hash 格式正确(5 parts,iterations=200000)
+          python -c "
+          import os
+          h = os.environ['ADMIN_PASSWORD']
+          parts = h.split('\$')
+          assert len(parts) == 5, f'hash parts count != 5: {len(parts)}'
+          assert parts[1] == 'pbkdf2-sha256', f'wrong algorithm: {parts[1]}'
+          assert int(parts[2]) == 200000, f'wrong iterations: {parts[2]}'
+          print(f'[R48] hash format OK: algo={parts[1]} iter={parts[2]} salt_len={len(parts[3])} hash_len={len(parts[4])}')
+          "
 
-      # R47 P0-3: 初始化临时 SQLite + bootstrap admin principal
+      # R47/R48 P0-3: 初始化临时 SQLite + bootstrap admin principal
       # 必须在 Web 服务启动前完成,否则 startup 的 ensure_readiness_or_exit 会退出
+      # R48: 显式传递 DATABASE_URL(与 job env 一致,确保连接同一 SQLite 文件)
       - name: Bootstrap admin principal
+        env:
+          DATABASE_URL: sqlite:///tmp/e2e_${{ github.run_id }}.db
         run: |
           python -c "
           import asyncio, os
-          from database.cache_store import get_cache_store
+          from database.cache_store import get_cache_store, DB_PATH
           from admin import bootstrap_admin_principal
+
+          # R48: 验证 DB_PATH 解析自 DATABASE_URL
+          print(f'[E2E bootstrap] DATABASE_URL={os.environ.get(\"DATABASE_URL\")}')
+          print(f'[E2E bootstrap] DB_PATH={DB_PATH}')
+          assert str(DB_PATH) == '/tmp/e2e_${{ github.run_id }}.db', \
+              f'DB_PATH mismatch: {DB_PATH} != /tmp/e2e_${{ github.run_id }}.db'
 
           async def main():
               store = get_cache_store()
@@ -93,14 +118,97 @@ jobs:
           asyncio.run(main())
           "
 
-      # R47 P0-3: 运行 Playwright E2E 测试
+      # R48 P0-3: 验证 SQLite 文件存在 + admin_principals 表有记录
+      - name: Verify bootstrap persisted
+        env:
+          DATABASE_URL: sqlite:///tmp/e2e_${{ github.run_id }}.db
+        run: |
+          echo "[R48] 验证 SQLite 文件存在:"
+          ls -la /tmp/e2e_${{ github.run_id }}.db
+          echo ""
+          echo "[R48] 查询 admin_principals 表:"
+          python -c "
+          import sqlite3
+          conn = sqlite3.connect('/tmp/e2e_${{ github.run_id }}.db')
+          rows = conn.execute('SELECT id, username, is_active FROM admin_principals').fetchall()
+          print(f'admin_principals: {rows}')
+          roles = conn.execute('SELECT principal_id, role FROM admin_principal_roles').fetchall()
+          print(f'admin_principal_roles: {roles}')
+          assert len(rows) > 0, 'admin_principals 表为空'
+          assert any('super_admin' in r[1] for r in roles), '无 super_admin 角色'
+          print('[R48] bootstrap 验证通过')
+          conn.close()
+          "
+
+      # R47/R48 P0-3: 运行 Playwright E2E 测试
       # webServer(在 playwright.config.ts 中定义)会自动启动 admin 服务并轮询 /readiness
+      # R48: playwright.config.ts 显式传递 DATABASE_URL 等 env 给 webServer 子进程
       - name: Run Playwright E2E tests
+        id: playwright
         run: |
           cd tests/e2e
           npx playwright test
 
-      # R47 P0-3: 失败时保留 trace、video、screenshot、axe JSON artifact
+      # R48 P0-3: CI 失败排查辅助 — 在 Playwright 步骤失败时输出诊断信息
+      - name: Debug - readiness response on failure
+        if: failure() && steps.playwright.outcome == 'failure'
+        run: |
+          echo "=== [R48 Debug] curl /readiness (尝试连接 admin 服务) ==="
+          curl -v -sS --max-time 10 http://127.0.0.1:8080/readiness || echo "(curl 失败,服务可能未启动)"
+          echo ""
+          echo "=== [R48 Debug] 检查 admin 进程 ==="
+          ps aux | grep -E "uvicorn|admin:app" | grep -v grep || echo "(无 uvicorn 进程)"
+          echo ""
+          echo "=== [R48 Debug] 检查端口 8080 监听 ==="
+          ss -tlnp | grep 8080 || echo "(端口 8080 未监听)"
+
+      - name: Debug - SQLite file on failure
+        if: failure() && steps.playwright.outcome == 'failure'
+        run: |
+          echo "=== [R48 Debug] SQLite 文件存在性 ==="
+          ls -la /tmp/e2e_*.db 2>/dev/null || echo "(无 e2e SQLite 文件)"
+          echo ""
+          echo "=== [R48 Debug] SQLite admin_principals 内容 ==="
+          python -c "
+          import sqlite3, glob, os
+          files = glob.glob('/tmp/e2e_*.db')
+          if not files:
+              print('(无 SQLite 文件)')
+          for f in files:
+              print(f'\n--- {f} ---')
+              try:
+                  conn = sqlite3.connect(f)
+                  tables = conn.execute(\"SELECT name FROM sqlite_master WHERE type='table'\").fetchall()
+                  print(f'tables: {[t[0] for t in tables]}')
+                  if any('admin_principals' in t[0] for t in tables):
+                      rows = conn.execute('SELECT id, username, is_active FROM admin_principals').fetchall()
+                      print(f'admin_principals: {rows}')
+                      roles = conn.execute('SELECT principal_id, role FROM admin_principal_roles').fetchall()
+                      print(f'admin_principal_roles: {roles}')
+                  conn.close()
+              except Exception as e:
+                  print(f'查询失败: {e}')
+          " || echo "(Python 查询失败)"
+
+      - name: Debug - admin log on failure
+        if: failure() && steps.playwright.outcome == 'failure'
+        run: |
+          echo "=== [R48 Debug] admin 日志(stderr 输出) ==="
+          # Playwright webServer 的 stdout/stderr 会被捕获到 test-results 中
+          if [ -f tests/e2e/test-results/.web-server-stdout.txt ]; then
+            echo "--- webServer stdout ---"
+            cat tests/e2e/test-results/.web-server-stdout.txt | tail -100
+          fi
+          if [ -f tests/e2e/test-results/.web-server-stderr.txt ]; then
+            echo "--- webServer stderr ---"
+            cat tests/e2e/test-results/.web-server-stderr.txt | tail -100
+          fi
+          # Playwright 的 webServer 日志也可能在 playwright-report 中
+          echo ""
+          echo "=== [R48 Debug] 检查 Playwright webServer 日志 ==="
+          find tests/e2e -name "*.txt" -path "*web-server*" -exec echo "--- {} ---" \; -exec tail -50 {} \; 2>/dev/null || echo "(无 webServer 日志文件)"
+
+      # R47/R48 P0-3: 失败时保留 trace、video、screenshot、axe JSON artifact
       - name: Upload Playwright report
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

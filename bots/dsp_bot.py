@@ -1103,10 +1103,18 @@ async def _process_single_job(bot, job, bot_id: int = 1):
     _single_msg_id = msg_id if isinstance(msg_id, int) else (msg_id[0] if msg_id else 0)
     receipt_action_id = f"dsp:{job.job_id}:{job.storage_channel_id}:{_single_msg_id}:{job.target_user_id}"
     receipt_target = f"chat:{job.target_user_id}"
+    # R48 P0-4: critical effect 必须传入 params 用于 request_hash 绑定
+    receipt_params = {
+        "target_user_id": job.target_user_id,
+        "source_channel_id": job.storage_channel_id,
+        "message_id": _single_msg_id,
+        "job_id": job.job_id,
+    }
     async with EffectReceiptContext(
         action_id=receipt_action_id,
         effect_type="telegram_send",
         target=receipt_target,
+        params=receipt_params,
     ) as receipt:
         if receipt.skipped:
             # R47 P0-5: skipped receipt 核对 — 不能直接视为完整成功,
@@ -1425,10 +1433,19 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
         _child_target = f"chat:{job.target_user_id}"
         _sent_mid: int | None = None
         try:
+            # R48 P0-4: critical effect 必须传入 params 用于 request_hash 绑定
+            _child_params = {
+                "target_user_id": job.target_user_id,
+                "source_channel_id": job.storage_channel_id,
+                "message_id": mid,
+                "job_id": job.job_id,
+                "child_index": i,
+            }
             async with EffectReceiptContext(
                 action_id=_child_action_id,
                 effect_type="telegram_send",
                 target=_child_target,
+                params=_child_params,
             ) as _child_receipt:
                 if _child_receipt.skipped:
                     # R47 P0-5: 核对 skipped receipt 一致性
@@ -1561,11 +1578,20 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                     _child_action_id = f"dsp:{job_id}:{storage_channel_id}:{mid}:{chat_id}:{idx}"
                     _child_target = f"chat:{chat_id}"
                     try:
+                        # R48 P0-4: critical effect 必须传入 params 用于 request_hash 绑定
+                        _child_params = {
+                            "target_chat_id": chat_id,
+                            "storage_channel_id": storage_channel_id,
+                            "message_id": mid,
+                            "job_id": job_id,
+                            "child_index": idx,
+                        }
                         async with EffectReceiptContext(
                             action_id=_child_action_id,
                             effect_type="telegram_send",
                             target=_child_target,
                             best_effort=True,
+                            params=_child_params,
                         ) as _child_receipt:
                             if _child_receipt.skipped:
                                 # R47 P0-5: 核对 skipped receipt
@@ -1628,10 +1654,19 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                 _child_target = f"chat:{chat_id}"
                 _sent_mid: int | None = None
                 try:
+                    # R48 P0-4: critical effect 必须传入 params 用于 request_hash 绑定
+                    _child_params = {
+                        "target_chat_id": chat_id,
+                        "storage_channel_id": storage_channel_id,
+                        "message_id": mid,
+                        "job_id": job_id,
+                        "child_index": i,
+                    }
                     async with EffectReceiptContext(
                         action_id=_child_action_id,
                         effect_type="telegram_send",
                         target=_child_target,
+                        params=_child_params,
                     ) as _child_receipt:
                         if _child_receipt.skipped:
                             # R47 P0-5: 核对 skipped receipt
@@ -2057,6 +2092,10 @@ async def _init():
 
 
 async def _async_main():
+    # R48 P1-b: 每次 Bot 启动时显式触发 production secret 检查(fail-closed)
+    from services.button_security import validate_production_config
+    validate_production_config()
+
     await _init()
     from database.cache_store import report_bot_heartbeat
     await report_bot_heartbeat("dsp_bot")

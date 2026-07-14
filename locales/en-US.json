@@ -95,7 +95,21 @@
     "user.state.banned": "User has been banned (user_id={user_id})",
     "system.state.maintenance": "System under maintenance, please try again later (reason={reason})",
     "system.rate.limited": "Too many requests, please try again later (user_id={user_id})",
-    "validation.input.failed": "Validation failed (field={field})"
+    "validation.input.failed": "Validation failed (field={field})",
+    "admin.validation.password_empty": "Password cannot be empty",
+    "topology.load.no_slots": "No slot configuration found in topology.yaml",
+    "index.generate.db_uninitialized": "[Idx] Failed to generate unique file code: database not initialized (action={action})",
+    "index.finalize.db_uninitialized": "[Idx] finalize_upload failed: database not initialized (action={action})",
+    "index.storage.no_channel": "No storage channel available, please check the cells table configuration",
+    "bot.mon.token_missing": "MON_BOT_TOKEN is not configured, monitoring bot requires an independent Bot Token",
+    "upload.outbox.bot_uninitialized": "_bot global reference not initialized (OutboxWorker cannot call Telegram API)",
+    "upload.slot.none_active": "No active slot available, please check the topology configuration",
+    "backup.decrypt.dep_missing": "cryptography is not installed, cannot decrypt backup (dep_name={dep_name})",
+    "backup.decrypt.kek_missing": "BACKUP_KEK is not configured, cannot decrypt backup (current + historical KEKs are both unavailable)",
+    "backup.restore.r2_credential_missing": "R2 credentials are not configured (both .env and config table are empty), cannot restore",
+    "relay.auth.code_failed": "Relay account verification code retrieval failed (phone={phone})",
+    "relay.auth.password_timeout": "Relay account 2FA password retrieval timed out (phone={phone})",
+    "relay.config.api_hash_invalid": "api_hash cannot be empty and must be a string"
   },
   "ui": {
     "admin_login_title": "Admin Login",
