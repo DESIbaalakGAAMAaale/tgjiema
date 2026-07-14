@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R47 P0-4 / R48 P0-4: Effect Receipt 覆盖率静态门禁 — critical effect 必须显式传入 action_id + params。
+"""R47 P0-4 / R48 P0-4 / R49 P0-4: Effect Receipt 覆盖率静态门禁 — critical effect 必须显式传入 action_id + params。
 
 扫描 services/、bots/、admin/ 下所有 .py 文件,检测:
 1. EffectReceiptContext(...) 调用中 effect_type 为 critical 类型时,
@@ -12,6 +12,11 @@ R48 P0-4 新增:
    params 参数必须存在且非空(用于计算 request_hash 绑定 effect 参数)。
 4. with_effect_receipt(...) 装饰器工厂中 effect_type 为 critical 类型时,
    params_fn 参数必须存在且非空。
+
+R49 P0-4 新增:
+5. generate_signed_callback(...) 旧 sync API(不持久化 nonce) 用于高风险 action
+   时标记为违规。高风险 action 通过 callback_data 字符串模式识别(包含
+   'delete'/'ban'/'purge'/'takedown'/'force_join'/'rotate'/'demote' 等)。
 
 critical effect_type 集合(CRITICAL_EFFECT_TYPES):
     telegram_send / telegram_copy / r2_put / r2_download /
@@ -37,6 +42,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from services.effect_receipts import (  # noqa: E402
     CRITICAL_EFFECT_TYPES,
+    HIGH_RISK_CALLBACK_PATTERNS,
     validate_critical_effects_have_action_id,
 )
 
@@ -48,8 +54,10 @@ def main() -> int:
     if not violations:
         print(
             f"[check_effect_receipt_coverage] PASS — "
-            f"critical effect 调用点均显式传入 action_id + params/params_fn "
-            f"(critical types: {sorted(CRITICAL_EFFECT_TYPES)})"
+            f"critical effect 调用点均显式传入 action_id + params/params_fn,"
+            f"且无高风险 action 使用旧 sync API generate_signed_callback "
+            f"(critical types: {sorted(CRITICAL_EFFECT_TYPES)}, "
+            f"high-risk patterns: {list(HIGH_RISK_CALLBACK_PATTERNS)})"
         )
         return 0
 
@@ -65,9 +73,12 @@ def main() -> int:
         )
     print()
     print(
-        "修复建议:critical effect 必须通过 EffectReceiptContext 显式传入非空 "
+        "修复建议:\n"
+        "  - critical effect 必须通过 EffectReceiptContext 显式传入非空 "
         "action_id 和 params(用于 request_hash 绑定),不应使用 with_effect_receipt "
-        "装饰器(装饰器无法静态保证调用点传入 action_id)。"
+        "装饰器(装饰器无法静态保证调用点传入 action_id)。\n"
+        "  - 高风险 action 不应使用旧 sync API generate_signed_callback(不持久化 nonce),"
+        "应改用 sign_button_token_with_nonce(异步,持久化 nonce)。"
     )
     return 1
 

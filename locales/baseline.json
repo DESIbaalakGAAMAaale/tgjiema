@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 310,
+      "baseline": 312,
       "target": 0,
-      "user_visible": 287,
+      "user_visible": 289,
       "log_only": 23
     }
   },
   "total": {
-    "baseline": 1265,
+    "baseline": 1267,
     "target": 0,
-    "user_visible": 1192,
+    "user_visible": 1194,
     "log_only": 73
   },
   "last_updated": "2026-07-14",
-  "last_updated_by": "r48_p1_c_initial"
+  "last_updated_by": "R49 P0-4 critical effect hash enforcement: 新增 record_completed request_hash 一致性校验 + sync generate_signed_callback 高风险检测"
 }

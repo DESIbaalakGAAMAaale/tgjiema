@@ -140,19 +140,29 @@ async def _get_receipt_external_id(store, action_id: str, effect_type: str, targ
 async def _seed_completed_receipt(
     store, action_id: str, effect_type: str, target: str,
     external_id: str = "msg_42",
+    params: Optional[dict] = None,
 ):
     """预置一条 status='completed' 的 receipt(模拟崩溃前已完成的场景)。
 
-    R48 P0-4: request_hash 设为空字符串(非 NULL)以满足 CHECK 约束,
-    同时保持 check_receipt 的向后兼容行为(stored_hash 为空时跳过 hash 校验)。
+    R49 P0-4: request_hash 必须非空以满足 NOT NULL + CHECK 约束
+    (critical effect_type 不允许空字符串)。
+
+    如果提供 params,用 compute_effect_request_hash 计算真实 hash
+    (使 check_receipt 的 request_hash 对比通过,模拟真实已完成场景)。
+    否则使用固定 hash(用于不关心 hash 对比的测试)。
     """
+    from services.effect_receipts import compute_effect_request_hash
+    if params is not None:
+        request_hash = compute_effect_request_hash(effect_type, params)
+    else:
+        request_hash = f"seed_hash_{action_id}"
     now = datetime.datetime.utcnow().isoformat()
     await store._db.execute(
         "INSERT OR REPLACE INTO effect_receipts "
         "(action_id, effect_type, target, status, external_id, created_at, "
         " completed_at, request_hash) "
-        "VALUES (?, ?, ?, 'completed', ?, ?, ?, '')",
-        (action_id, effect_type, target, external_id, now, now),
+        "VALUES (?, ?, ?, 'completed', ?, ?, ?, ?)",
+        (action_id, effect_type, target, external_id, now, now, request_hash),
     )
     await store._db.commit()
 
@@ -169,11 +179,13 @@ class TestWithEffectReceiptDecorator:
         """测试 1:已完成时跳过(返回 skipped=True)。"""
         from services.effect_receipts_integration import with_effect_receipt
 
-        # 预置一条 completed receipt
+        # 预置一条 completed receipt(R49 P0-4: 用真实 params 计算 hash 以匹配)
         store = clean_tables
+        seed_params = {"chat_id": 42, "text": "hi"}
         await _seed_completed_receipt(
             store, "act_1", "telegram_send", "chat:42",
             external_id="msg_42",
+            params=seed_params,
         )
 
         call_count = 0
@@ -330,10 +342,12 @@ class TestEffectReceiptContext:
         from services.effect_receipts_integration import EffectReceiptContext
 
         store = clean_tables
-        # 预置 completed receipt
+        # 预置 completed receipt(R49 P0-4: 用真实 params 计算 hash 以匹配)
+        seed_params = {"chat_id": 77, "text": "skip_test"}
         await _seed_completed_receipt(
             store, "act_7", "telegram_send", "chat:77",
             external_id="msg_77",
+            params=seed_params,
         )
 
         side_effect_called = False

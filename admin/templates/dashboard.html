@@ -11,14 +11,14 @@
         .sidebar { position: fixed; left: 0; top: 0; width: 220px; height: 100vh; background: #001529; padding-top: 20px; }
         .sidebar h2 { color: #fff; text-align: center; font-size: 18px; padding: 0 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.1); }
         .sidebar a { display: block; color: rgba(255,255,255,0.65); padding: 14px 24px; text-decoration: none; font-size: 14px; transition: all 0.2s; }
-        .sidebar a:hover, .sidebar a.active { color: #fff; background: #1890ff; }
+        .sidebar a:hover, .sidebar a.active { color: #fff; background: #0066cc; }
         .main { margin-left: 220px; padding: 24px; }
         .header { background: #fff; padding: 16px 24px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
         .header h1 { font-size: 22px; }
         .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
         .card { background: #fff; padding: 24px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
         .card .label { font-size: 14px; color: #595959; margin-bottom: 8px; }
-        .card .value { font-size: 30px; font-weight: 600; color: #1890ff; }
+        .card .value { font-size: 30px; font-weight: 600; color: #0066cc; }
         .section { background: #fff; border-radius: 8px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
         .section h2 { font-size: 16px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; }
         table { width: 100%; border-collapse: collapse; }
@@ -26,16 +26,16 @@
         th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
         th { background: #fafafa; font-weight: 600; }
         .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
-        .tag-green { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
-        .tag-red { background: #fff2f0; color: #ff4d4f; border: 1px solid #ffccc7; }
-        .tag-blue { background: #e6f7ff; color: #1890ff; border: 1px solid #91d5ff; }
+        .tag-green { background: #f6ffed; color: #237804; border: 1px solid #b7eb8f; }
+        .tag-red { background: #fff2f0; color: #cf1322; border: 1px solid #ffccc7; }
+        .tag-blue { background: #e6f7ff; color: #0066cc; border: 1px solid #91d5ff; }
         .btn { display: inline-block; padding: 6px 16px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; cursor: pointer; text-decoration: none; background: #fff; color: #333; transition: all 0.2s; }
-        .btn-primary { background: #1890ff; color: #fff; border-color: #1890ff; }
+        .btn-primary { background: #0066cc; color: #fff; border-color: #0066cc; }
         .btn-danger { color: #ff4d4f; border-color: #ff4d4f; }
         .btn:hover { opacity: 0.85; }
         .pagination { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
         .pagination a { padding: 6px 12px; border: 1px solid #d9d9d9; border-radius: 4px; text-decoration: none; color: #333; font-size: 13px; }
-        .pagination a.active { background: #1890ff; color: #fff; border-color: #1890ff; }
+        .pagination a.active { background: #0066cc; color: #fff; border-color: #0066cc; }
         .search-box { display: flex; gap: 8px; margin-bottom: 16px; }
         .search-box input { flex: 1; padding: 8px 12px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 14px; }
         .search-box button { padding: 8px 16px; }
@@ -51,12 +51,12 @@
             padding: 8px 16px; z-index: 100; transition: top 0.3s; font-size: 14px;
             text-decoration: none; border-radius: 0 0 4px 0;
         }
-        .skip-link:focus { top: 0; outline: 2px solid #1890ff; outline-offset: 2px; }
+        .skip-link:focus { top: 0; outline: 2px solid #0066cc; outline-offset: 2px; }
         /* R45 17.3: focus-visible 增强(WCAG 2.2 AA 2.4.7 Focus Visible / 2.4.11 Focus Not Obscured) */
         a:focus, button:focus, input:focus, select:focus, textarea:focus {
-            outline: 2px solid #1890ff; outline-offset: 2px;
+            outline: 2px solid #0066cc; outline-offset: 2px;
         }
-        :focus-visible { outline: 3px solid #1890ff !important; outline-offset: 2px !important; }
+        :focus-visible { outline: 3px solid #0066cc !important; outline-offset: 2px !important; }
     </style>
 </head>
 <body>

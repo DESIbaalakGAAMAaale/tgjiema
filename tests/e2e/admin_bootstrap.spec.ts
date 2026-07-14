@@ -21,11 +21,14 @@ const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD || 'test_bootstrap_pw';
 
 test.describe('Admin Bootstrap', () => {
   test('/readiness 返回 200 表示服务就绪', async ({ request }) => {
-    // R48 P0-3: readiness 端点真实检查 DB 初始化 + bootstrap 完成
+    // R48/R49 P0-3: readiness 端点真实检查 DB 初始化 + bootstrap 完成
     // HTTP status 200 表示就绪,503 表示未就绪(显式 JSONResponse)
     const response = await request.get('/readiness');
     expect(response.status()).toBe(200);
     const body = await response.json();
+    // R49: 顶层 status / reason 字段(便于 webServer 轮询断言)
+    expect(body.status).toBe('ok');
+    expect(body.reason).toBe('');
     // R48: 顶层字段断言(便于 webServer 轮询和测试直接检查)
     expect(body.ready).toBe(true);
     expect(body.db_initialized).toBe(true);

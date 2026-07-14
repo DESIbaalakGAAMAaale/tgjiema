@@ -1,12 +1,14 @@
 import { defineConfig, devices } from '@playwright/test';
 import * as path from 'path';
+import * as crypto from 'crypto';
 
 /**
- * R44 G0-4: Playwright E2E 测试配置
- * R47 P0-3: 修复 webServer readiness 检查 + 临时 SQLite + artifact 保留
- * R48 P0-3: 显式传递 DATABASE_URL 等环境变量给 webServer,确保 bootstrap 与
- *           webServer 连接同一 SQLite 文件;webServer.url=/readiness 仅在
- *           HTTP 2xx(就绪)时继续测试。
+ * R44 G0-4 / R47-R49 P0-3: Playwright E2E 测试配置
+ *
+ * R49 P0-3 整改:
+ * - 添加 generateDefaultPasswordHash() 用于本地测试(无 CI 注入 ADMIN_PASSWORD 时)
+ * - 确保 ADMIN_PASSWORD 以 PBKDF2 hash 格式传递给 webServer 子进程
+ * - admin startup() 在 test 环境自动 bootstrap,webServer 可直接启动
  *
  * 测试目标:
  * - Admin bootstrap 首次初始化
@@ -14,29 +16,34 @@ import * as path from 'path';
  * - MFA TOTP 启用/验证/break-glass
  * - WCAG 2.2 AA 无障碍（axe-core）
  *
- * 前置条件:
- * - Admin Web 服务通过 webServer 自动启动
- * - 临时 SQLite 已由 CI bootstrap 步骤初始化(DATABASE_URL 指定)
- * - admin principal 已 bootstrap(super_admin 角色)
- *
  * webServer 轮询 /readiness 端点,返回 200 表示:
  * - SQLite cache_store 已初始化
- * - admin bootstrap 已完成
+ * - admin bootstrap 已完成(R49: startup 自动 bootstrap 兜底)
  */
 
+// R49 P0-3: 生成默认 PBKDF2 hash(本地测试用,CI 中由 process.env.ADMIN_PASSWORD 覆盖)
+// 格式: $pbkdf2-sha256$200000$<salt_hex>$<hash_hex>
+// 与 admin._verify_password / generate_password_hash 兼容
+function generateDefaultPasswordHash(password: string = 'test_bootstrap_pw'): string {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.pbkdf2Sync(password, salt, 200000, 32, 'sha256');
+  return `$pbkdf2-sha256$200000$${salt.toString('hex')}$${hash.toString('hex')}`;
+}
+
 // R48 P0-3: webServer 必须显式继承的关键环境变量
-// Playwright webServer.env 会覆盖父进程环境,因此需要把 CI 注入的关键变量
-// 显式传递,避免 webServer 启动的 uvicorn 进程读到错误的默认值。
-// DATABASE_URL 尤为关键 — 决定 bootstrap 与 webServer 是否连接同一 SQLite 文件。
+// R49 P0-3: ADMIN_PASSWORD 若未设置,自动生成 hash(本地测试)
 const WEB_SERVER_ENV: Record<string, string> = {
   // 数据库路径(必须与 bootstrap 步骤一致)
   DATABASE_URL: process.env.DATABASE_URL || 'sqlite://tmp/e2e_default.db',
-  // 测试环境标识(跳过 CRDB/Bot 心跳)
+  // 测试环境标识(跳过 CRDB/Bot 心跳;R49: startup 自动 bootstrap)
   ENVIRONMENT: process.env.ENVIRONMENT || 'test',
   SERVICE_ROLE: process.env.SERVICE_ROLE || 'admin',
   // Admin 凭证(必须与 bootstrap 步骤一致)
   ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'admin',
-  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || '',
+  // R49 P0-3: ADMIN_PASSWORD 必须是 PBKDF2 hash 格式
+  // CI 中由 e2e.yml "Generate admin password hash" 步骤注入
+  // 本地无 CI 时自动生成 test_bootstrap_pw 的 hash
+  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || generateDefaultPasswordHash('test_bootstrap_pw'),
   ADMIN_PRINCIPAL_ID: process.env.ADMIN_PRINCIPAL_ID || '1',
   ADMIN_PRINCIPAL_USERNAME: process.env.ADMIN_PRINCIPAL_USERNAME || 'admin',
   ADMIN_PRINCIPAL_BOOTSTRAP_ROLES: process.env.ADMIN_PRINCIPAL_BOOTSTRAP_ROLES || 'super_admin',

@@ -539,6 +539,18 @@ async def startup():
             from loguru import logger as _logger
             _logger.error(f"[Admin] SQLite cache_store 初始化失败,退出: {e}")
             sys.exit(1)
+        # R49 P0-3: test 环境自动 bootstrap super_admin(幂等),
+        # 确保 webServer 启动时不需要 CI 先运行 bootstrap 步骤。
+        # bootstrap_admin_principal() 使用 INSERT OR REPLACE,重复调用安全。
+        # 这样 Playwright webServer 可直接启动 admin 服务,无需额外 bootstrap 命令。
+        try:
+            ok = await bootstrap_admin_principal()
+            if ok:
+                logger.info("[Admin] R49 P0-3: test 环境自动 bootstrap super_admin 成功")
+            else:
+                logger.warning("[Admin] R49 P0-3: test 环境自动 bootstrap 失败(继续启动,由 readiness 检查兜底)")
+        except Exception as e:
+            logger.warning(f"[Admin] R49 P0-3: test 环境自动 bootstrap 异常(继续启动): {e}")
     else:
         try:
             from database import init_db
@@ -1014,7 +1026,7 @@ label {{ display: block; margin-bottom: 8px; font-weight: 500; color: #555; }}
 input[type="text"], input[type="password"] {{ width: 100%; padding: 10px 12px;
      border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
 input[type="text"]:focus, input[type="password"]:focus {{ outline: none;
-     border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
+     border-color: #1565c0; box-shadow: 0 0 0 3px rgba(21,101,192,0.1); }}
 button {{ width: 100%; padding: 12px; background: #1565c0; color: #fff;
         border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
 button:hover {{ background: #0d47a1; }}
@@ -1183,11 +1195,11 @@ input[type="text"] {{ width: 100%; padding: 10px 12px;
      border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box;
      letter-spacing: 4px; text-align: center; }}
 input[type="text"]:focus {{ outline: none;
-     border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
+     border-color: #1565c0; box-shadow: 0 0 0 3px rgba(21,101,192,0.1); }}
 button {{ width: 100%; padding: 12px; background: #1565c0; color: #fff;
         border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
 button:hover {{ background: #0d47a1; }}
-.hint {{ color: #888; font-size: 12px; margin-top: 12px; }}
+.hint {{ color: #595959; font-size: 12px; margin-top: 12px; }}
 </style>
 </head>
 <body>
@@ -1427,7 +1439,7 @@ label {{ display: block; margin-bottom: 8px; font-weight: 500; color: #555; }}
 input[type="text"], input[type="password"] {{ width: 100%; padding: 10px 12px;
      border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}
 input[type="text"]:focus, input[type="password"]:focus {{ outline: none;
-     border-color: #4a90e2; box-shadow: 0 0 0 3px rgba(74,144,226,0.1); }}
+     border-color: #1565c0; box-shadow: 0 0 0 3px rgba(21,101,192,0.1); }}
 button {{ padding: 12px 24px; background: #1565c0; color: #fff;
         border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}
 button:hover {{ background: #0d47a1; }}
@@ -1706,10 +1718,20 @@ async def readiness_check():
         passed = sum(1 for v in checks.values() if v)
         # R48 P0-3: 显式 JSONResponse,确保 HTTP status 与业务 JSON 一致
         # 就绪 → 200,未就绪 → 503(Playwright webServer 轮询 /readiness 仅在 2xx 时继续)
+        # R49 P0-3: 添加顶层 status / reason 字段,便于 webServer 轮询断言
         status_code = 200 if ready else 503
+        if ready:
+            status_value = "ok"
+            reason = ""
+        else:
+            failed_checks = [k for k, v in checks.items() if not v]
+            status_value = "not_ready"
+            reason = f"checks failed: {', '.join(failed_checks)}" if failed_checks else "unknown"
         return JSONResponse(
             status_code=status_code,
             content={
+                "status": status_value,
+                "reason": reason,
                 "ready": ready,
                 "db_initialized": db_initialized,
                 "admin_bootstrap": bootstrap_ok,
@@ -1765,10 +1787,20 @@ async def readiness_check():
     passed = sum(1 for v in all_checks.values() if v)
 
     # R48 P0-3: 显式 JSONResponse,确保 HTTP status 与业务 JSON 一致
+    # R49 P0-3: 添加顶层 status / reason 字段
     status_code = 200 if ready else 503
+    if ready:
+        status_value = "ok"
+        reason = ""
+    else:
+        failed_checks = [k for k, v in all_checks.items() if not v]
+        status_value = "not_ready"
+        reason = f"checks failed: {', '.join(failed_checks)}" if failed_checks else "unknown"
     return JSONResponse(
         status_code=status_code,
         content={
+            "status": status_value,
+            "reason": reason,
             "ready": ready,
             "db_initialized": db_initialized,
             "admin_bootstrap": bootstrap_ok,

@@ -905,25 +905,11 @@ class CacheStore:
             "ON migration_conflicts(resolved_at) WHERE resolved_at IS NULL"
         )
         # 归档并清理 dirty_outbox 历史重复行(保留 created_at 最新/id 最大者为权威)
-        await self._archive_conflicts_to_migration_conflicts(
-            "dirty_outbox", ["table_name", "pk", "version"]
-        )
-        # 创建 UNIQUE INDEX(清理重复后应成功;IF NOT EXISTS 保证幂等)
-        try:
-            await self._db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_dirty_outbox_table_pk_version "
-                "ON dirty_outbox(table_name, pk, version)"
-            )
-        except Exception as _e_dirty_unique:
-            # 清理重复后仍失败,说明存在其他约束冲突原因,必须 fail-fast
-            raise RuntimeError(
-                f"dirty_outbox UNIQUE INDEX 创建失败(清理重复后仍失败),拒绝启动: {_e_dirty_unique}"
-            ) from _e_dirty_unique
-        # PRAGMA 验证 UNIQUE INDEX 确实存在且为 UNIQUE,失败则拒绝启动
-        await self._verify_unique_constraint_or_fail(
-            "dirty_outbox", "idx_dirty_outbox_table_pk_version",
-            ["table_name", "pk", "version"],
-        )
+        # R49 P0-5: 完整 7 步迁移方案(preflight → 选定权威 → 归档 → 删除 →
+        #          创建索引 → PRAGMA 验证 → fail-closed),替代 R48 的 3 步序列。
+        # 旧方法 _archive_conflicts_to_migration_conflicts / _verify_unique_constraint_or_fail
+        # 保留供 R48 测试使用,但 init() 现在统一调用 7 步迁移方法。
+        await self._migrate_dirty_outbox_unique_constraint()
 
         # ─── R41 P0-6: dlq_records 死信队列权威存储表 ───
         # crdb_sync 处理失败的 dirty_outbox 记录路由到此表(替代/补充 jsonl 文件)。
@@ -1332,13 +1318,17 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_cmd_exec_status ON command_executions(status)"
         )
 
-        # ─── R44 G0-2 / R46 P0-1 / R48 P0-4: effect_receipts 表 — 外部副作用 receipt 持久化 ───
+        # ─── R44 G0-2 / R46 P0-1 / R48 P0-4 / R49 P0-4: effect_receipts 表 — 外部副作用 receipt 持久化 ───
         # R46 P0-1: 增加 request_hash/attempt/lease_owner/lease_until/last_error/reconcile_status
         # 用于幂等控制:action_id + effect_type + target 唯一标识一个外部副作用,
         # 执行前检查 receipt 是否已 completed,避免重复触发外部副作用。
         # R48 P0-4: 增加 CHECK 约束 — critical effect_type 行的 request_hash 必须非 NULL,
         # 防止同 action_id 不同参数共用 receipt(仅对新建表生效;
         # 旧表无法 ALTER ADD CHECK,由应用层 record_pending 校验兜底)。
+        # R49 P0-4: request_hash 升级为 TEXT NOT NULL(全表非 NULL),
+        # CHECK 约束改为 `request_hash != ''`(critical effect_type 不能为空字符串,
+        # 非 critical 允许空串)。旧表无法加 NOT NULL/CHECK,用 PRAGMA table_info
+        # 检测并记录 warning,应用层 record_pending 校验已兜底。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS effect_receipts (
                 action_id          TEXT NOT NULL,
@@ -1348,18 +1338,49 @@ class CacheStore:
                 external_id        TEXT,
                 created_at         TEXT NOT NULL,
                 completed_at       TEXT,
-                request_hash       TEXT,
+                request_hash       TEXT NOT NULL,
                 attempt            INTEGER NOT NULL DEFAULT 0,
                 lease_owner        TEXT,
                 lease_until        TEXT,
                 last_error         TEXT,
                 reconcile_status   TEXT,
                 PRIMARY KEY (action_id, effect_type, target),
-                CHECK (request_hash IS NOT NULL OR effect_type NOT IN
+                CHECK (request_hash != '' OR effect_type NOT IN
                        ('telegram_send','telegram_copy','r2_put','r2_download',
                         'restore','ban','takedown','purge','crdb_delete'))
             )"""
         )
+        # R49 P0-4: 检测旧表 schema(无 NOT NULL / 无 CHECK 约束)。
+        # SQLite 不能 ALTER TABLE 加 CHECK 约束,旧表只能记录 warning,
+        # 应用层 record_pending 校验已能阻断 critical effect 空 request_hash。
+        try:
+            cursor = await self._db.execute(
+                "PRAGMA table_info(effect_receipts)"
+            )
+            _er_cols = await cursor.fetchall()
+            # (cid, name, type, notnull, dflt_value, pk)
+            _rh_col = [c for c in _er_cols if c[1] == "request_hash"]
+            if _rh_col and _rh_col[0][3] == 0:
+                logger.warning(
+                    "[CacheStore] effect_receipts.request_hash 缺少 NOT NULL 约束"
+                    "(旧表 schema),应用层 record_pending 校验已兜底,"
+                    "建议重建表以启用 DDL 约束"
+                )
+            cursor = await self._db.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='effect_receipts'"
+            )
+            _er_tbl = await cursor.fetchone()
+            if _er_tbl and _er_tbl[0] and "CHECK" not in _er_tbl[0].upper():
+                logger.warning(
+                    "[CacheStore] effect_receipts 表缺少 CHECK 约束"
+                    "(旧表 schema),应用层 record_pending 校验已兜底,"
+                    "建议重建表以启用 DDL 约束"
+                )
+        except Exception as _e:
+            logger.debug(
+                f"[CacheStore] effect_receipts schema 检测(可忽略): {_e}"
+            )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_effect_receipts_action ON effect_receipts(action_id)"
         )
@@ -6858,6 +6879,254 @@ class CacheStore:
                 f"dirty_outbox UNIQUE index 创建失败,拒绝启动: "
                 f"索引 {index_name} 存在但非 UNIQUE(PRAGMA 验证 unique=0)"
             )
+
+    # ─── R49 P0-5: dirty_outbox UNIQUE 约束完整 7 步迁移方案 ──────────────
+
+    async def _migrate_dirty_outbox_unique_constraint(self) -> None:
+        """R49 P0-5: dirty_outbox UNIQUE 约束完整 7 步迁移方案。
+
+        完整 7 步流程(每步含详细日志,任一步失败 raise RuntimeError 拒绝启动):
+          1. preflight 查询重复行(SELECT GROUP BY HAVING COUNT > 1)
+          2. 选定权威行(每组按 created_at DESC, id DESC,第一行为权威)
+          3. 归档冲突行到 migration_conflicts(conflict_type='dirty_outbox_duplicate')
+          4. 删除冲突行(从 dirty_outbox 表)
+          5. 创建 UNIQUE INDEX IF NOT EXISTS
+          6. PRAGMA index_list + index_info 验证索引存在且 unique=1
+          7. fail-closed(已通过上述 raise RuntimeError 实现)
+
+        权威行选择说明:
+          R49 任务描述原文为 "created_at ASC, id ASC",但 R48 已有的集成测试
+          (test_init_archives_old_duplicates_and_succeeds) 断言保留 created_at 最新者。
+          为满足 "R48 测试不破" 约束,本实现沿用 R48 的 DESC 语义
+          (最新 created_at + 最大 id 为权威)。
+
+        幂等性:
+          - 步骤 1 无重复行时,步骤 2-4 跳过(无副作用)
+          - 步骤 5 使用 CREATE UNIQUE INDEX IF NOT EXISTS(已存在则跳过)
+          - 步骤 6 PRAGMA 只读验证(无副作用)
+          - 重复运行 migration 应全部成功,无新副作用
+
+        Raises:
+            RuntimeError: 任一步失败(数据库连接未初始化、查询异常、
+                          CREATE UNIQUE INDEX 异常、PRAGMA 验证索引缺失或非 UNIQUE)
+        """
+        _table = "dirty_outbox"
+        _index_name = "idx_dirty_outbox_table_pk_version"
+        _cols = ["table_name", "pk", "version"]
+        _cols_csv = ", ".join(_cols)
+
+        # ─── 步骤 0: 前置检查 ───
+        if not self._db:
+            logger.error("[R49 P0-5] 步骤 0 失败: 数据库连接未初始化")
+            raise RuntimeError(
+                "dirty_outbox UNIQUE 迁移失败: 数据库连接未初始化"
+            )
+        logger.info("[R49 P0-5] 开始 dirty_outbox UNIQUE 约束 7 步迁移")
+
+        # ─── 步骤 1: preflight 查询重复行 ───
+        logger.info("[R49 P0-5] 步骤 1/7: preflight 查询 dirty_outbox 重复行组")
+        try:
+            cursor = await self._db.execute(
+                f"SELECT {_cols_csv}, COUNT(*) AS cnt "
+                f"FROM {_table} "
+                f"GROUP BY {_cols_csv} "
+                f"HAVING COUNT(*) > 1"
+            )
+            dup_groups = await cursor.fetchall()
+        except Exception as e:
+            logger.error(f"[R49 P0-5] 步骤 1 失败: preflight 查询异常: {e}")
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE 迁移步骤 1 失败(preflight 查询): {e}"
+            ) from e
+
+        _total_conflicts = sum(max(0, int(g[-1]) - 1) for g in dup_groups)
+        logger.info(
+            f"[R49 P0-5] 步骤 1 完成: 发现 {len(dup_groups)} 个重复组, "
+            f"预计归档 {_total_conflicts} 条冲突行"
+        )
+
+        # ─── 步骤 2-4: 选定权威行 + 归档冲突 + 删除冲突 ───
+        if dup_groups:
+            import json as _json
+            _now = datetime.datetime.now().isoformat()
+            # 获取列名(用于 JSON 序列化完整 payload)
+            cur_cols = await self._db.execute(f"PRAGMA table_info({_table})")
+            col_names = [c[1] for c in await cur_cols.fetchall()]
+            _n_cols = len(col_names)
+
+            archived = 0
+            for _row in dup_groups:
+                _where = " AND ".join([f"{c} = ?" for c in _cols])
+                _params = list(_row[:len(_cols)])
+
+                # 步骤 2: 拉取该组所有行,按 created_at DESC, id DESC 排序
+                # (第一行为权威:最新 created_at 或最大 id;与 R48 语义一致)
+                logger.debug(
+                    f"[R49 P0-5] 步骤 2: 处理重复组 {_cols}={_params}"
+                )
+                cur_rows = await self._db.execute(
+                    f"SELECT * FROM {_table} WHERE {_where} "
+                    f"ORDER BY created_at DESC, id DESC",
+                    _params,
+                )
+                rows_all = await cur_rows.fetchall()
+                if len(rows_all) < 2:
+                    continue
+
+                # 第一行为权威,其余为冲突
+                for r in rows_all[1:]:
+                    _rid = int(r[0])
+                    _record_data = _json.dumps(
+                        {col_names[i]: r[i] for i in range(_n_cols)},
+                        ensure_ascii=False, default=str,
+                    )
+                    # 步骤 3: 归档冲突行到 migration_conflicts
+                    # (conflict_type='dirty_outbox_duplicate',含完整 payload JSON)
+                    logger.debug(
+                        f"[R49 P0-5] 步骤 3: 归档冲突行 id={_rid} 到 migration_conflicts"
+                    )
+                    await self._db.execute(
+                        "INSERT INTO migration_conflicts "
+                        "(table_name, conflict_type, record_id, record_data, resolved_at, created_at) "
+                        "VALUES (?, ?, ?, ?, NULL, ?)",
+                        (_table, "dirty_outbox_duplicate", _rid, _record_data, _now),
+                    )
+                    # 步骤 4: 删除冲突行(只保留权威行)
+                    logger.debug(
+                        f"[R49 P0-5] 步骤 4: 删除 dirty_outbox 冲突行 id={_rid}"
+                    )
+                    await self._db.execute(
+                        f"DELETE FROM {_table} WHERE id = ?",
+                        (_rid,),
+                    )
+                    archived += 1
+
+            await self._db.commit()
+            logger.info(
+                f"[R49 P0-5] 步骤 2-4 完成: 归档并删除 {archived} 条冲突行 "
+                f"(权威行保留:最新 created_at 或最大 id)"
+            )
+        else:
+            logger.info("[R49 P0-5] 步骤 2-4 跳过: 无重复行,无需归档")
+
+        # ─── 步骤 5: 创建 UNIQUE INDEX ───
+        logger.info(f"[R49 P0-5] 步骤 5/7: 创建 UNIQUE INDEX {_index_name}")
+        try:
+            await self._db.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS {_index_name} "
+                f"ON {_table}({_cols_csv})"
+            )
+            await self._db.commit()
+        except Exception as e:
+            # 清理重复后仍失败,说明存在其他约束冲突原因(如非 UNIQUE 同名索引),
+            # 必须 fail-fast 拒绝启动
+            logger.error(
+                f"[R49 P0-5] 步骤 5 失败: CREATE UNIQUE INDEX 异常: {e}"
+            )
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE 迁移步骤 5 失败"
+                f"(CREATE UNIQUE INDEX 创建失败): {e}"
+            ) from e
+        logger.info(
+            f"[R49 P0-5] 步骤 5 完成: UNIQUE INDEX 已创建或已存在(IF NOT EXISTS 幂等)"
+        )
+
+        # ─── 步骤 6: PRAGMA 验证 ───
+        # CREATE UNIQUE INDEX IF NOT EXISTS 在同名索引已存在时会静默跳过
+        # (即使该索引非 UNIQUE),因此必须通过 PRAGMA index_list 二次验证 unique 标志位。
+        # PRAGMA index_list 返回: (seq, name, unique, origin, partial)
+        #   - unique=1 表示索引是 UNIQUE 索引
+        #   - origin: 'c'=CREATE INDEX 创建, 'u'=UNIQUE 约束, 'pk'=主键
+        #   (CREATE UNIQUE INDEX 产生 origin='c' + unique=1;
+        #    任务描述 "origin='u'(unique)" 实指 unique 标志位,此处验证 unique=1)
+        logger.info(
+            f"[R49 P0-5] 步骤 6/7: PRAGMA 验证 {_index_name} 存在且 unique=1"
+        )
+        try:
+            cursor = await self._db.execute(
+                f"PRAGMA index_list('{_table}')"
+            )
+            indexes = await cursor.fetchall()
+        except Exception as e:
+            logger.error(
+                f"[R49 P0-5] 步骤 6 失败: PRAGMA index_list 异常: {e}"
+            )
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE 迁移步骤 6 失败(PRAGMA index_list): {e}"
+            ) from e
+
+        _found = False
+        _is_unique = False
+        for _idx in indexes:
+            # _idx: (seq, name, unique, origin, partial)
+            if len(_idx) >= 3 and _idx[1] == _index_name:
+                _found = True
+                _is_unique = bool(_idx[2])
+                _origin = _idx[3] if len(_idx) >= 4 else "?"
+                logger.debug(
+                    f"[R49 P0-5] 步骤 6: 找到索引 {_index_name} "
+                    f"unique={_idx[2]} origin={_origin}"
+                )
+                break
+
+        if not _found:
+            logger.error(
+                f"[R49 P0-5] 步骤 6 失败: 索引 {_index_name} 不存在于 {_table} 表"
+            )
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE 迁移步骤 6 失败: "
+                f"索引 {_index_name} 不存在于 {_table} 表(PRAGMA 验证未发现)"
+            )
+        if not _is_unique:
+            logger.error(
+                f"[R49 P0-5] 步骤 6 失败: 索引 {_index_name} 存在但非 UNIQUE"
+            )
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE 迁移步骤 6 失败: "
+                f"索引 {_index_name} 存在但非 UNIQUE(PRAGMA 验证 unique=0)"
+            )
+
+        # 额外验证 index_info:索引列应匹配 [table_name, pk, version]
+        try:
+            cur_info = await self._db.execute(
+                f"PRAGMA index_info('{_index_name}')"
+            )
+            idx_cols = await cur_info.fetchall()
+            _actual_cols = [c[2] for c in idx_cols]  # (seqno, cid, name)
+            logger.debug(
+                f"[R49 P0-5] 步骤 6: index_info 列 = {_actual_cols}"
+            )
+            if _actual_cols != _cols:
+                logger.error(
+                    f"[R49 P0-5] 步骤 6 失败: 索引列不匹配, "
+                    f"期望 {_cols}, 实际 {_actual_cols}"
+                )
+                raise RuntimeError(
+                    f"dirty_outbox UNIQUE 迁移步骤 6 失败: "
+                    f"索引 {_index_name} 列不匹配"
+                    f"(期望 {_cols}, 实际 {_actual_cols})"
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            logger.error(
+                f"[R49 P0-5] 步骤 6 失败: PRAGMA index_info 异常: {e}"
+            )
+            raise RuntimeError(
+                f"dirty_outbox UNIQUE 迁移步骤 6 失败(PRAGMA index_info): {e}"
+            ) from e
+
+        logger.info(
+            f"[R49 P0-5] 步骤 6 完成: 索引 {_index_name} 验证通过"
+            f"(存在 + unique=1 + 列匹配 {_cols})"
+        )
+
+        # ─── 步骤 7: fail-closed ───
+        # 已通过上述各步 raise RuntimeError 实现:
+        # 任一步失败 → raise → init() 失败 → Web/Writer/DB 全部拒绝启动
+        logger.info(
+            "[R49 P0-5] 步骤 7/7: fail-closed 检查通过 — 所有步骤成功,migration 完成"
+        )
 
     # ─── R47 P0-6: dirty_outbox 唯一冲突重试辅助 ──────────────
 

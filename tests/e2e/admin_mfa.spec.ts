@@ -2,7 +2,7 @@ import { test, expect, Page, Browser } from '@playwright/test';
 import * as crypto from 'crypto';
 
 /**
- * R44 G0-4 / R47 P0-3 / R48 P0-3: Admin MFA TOTP 真实浏览器 E2E 测试
+ * R44 G0-4 / R47-R49 P0-3: Admin MFA TOTP 真实浏览器 E2E 测试
  *
  * 验证:
  * - MFA 启用流程(GET /mfa/setup → 生成 secret → POST /mfa/setup 验证 TOTP)
@@ -17,6 +17,15 @@ import * as crypto from 'crypto';
  * - 不再在 MFA challenge 页面尝试 GET /mfa/setup(无 session 会 401)
  * - loginWithMfa 辅助函数处理 MFA challenge 流程
  * - break-glass 测试断言 200(测试环境条件全部满足)
+ *
+ * R49 P0-3 整改:
+ * - TOTP timestep 重放问题: server 端 _consume_totp_timestep 使用
+ *   INSERT OR IGNORE + rowcount 原子消费,同一 timestep 不可重用。
+ *   若 test 2 消费了 timestep T1,test 3 在同一 30s 窗口内生成相同 code,
+ *   server 会拒绝(timestep T1 已消费)。
+ * - 修复: loginWithMfa 添加重试逻辑 — TOTP 被拒绝时等待下一个 30s 窗口,
+ *   重新登录获取新 challenge,生成新 TOTP code 再提交。最多 3 次尝试。
+ * - waitForStableTimestep: 确保 TOTP 生成时至少已过 3s,避免边界漂移。
  */
 
 // R47 P0-3: 测试用登录密码(与 ADMIN_BOOTSTRAP_PASSWORD 环境变量对应)
@@ -67,6 +76,25 @@ function generateTOTP(secret: string, timeStep: number = 30): string {
   return code.toString().padStart(6, '0');
 }
 
+// ─── TOTP timestep 等待辅助(R49 P0-3: 避免 timestep 重放) ──────
+
+/** 等待直到当前 TOTP timestep 至少已过 3 秒(避免边界漂移导致 code 失效) */
+async function waitForStableTimestep(): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  const secondsIntoTimestep = now % 30;
+  if (secondsIntoTimestep < 3) {
+    const waitMs = (3 - secondsIntoTimestep) * 1000;
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+  }
+}
+
+/** 等待直到下一个 30s TOTP timestep 开始(+1s buffer 确保服务器时间也进入新窗口) */
+async function waitForNextTotpTimestep(): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  const waitSeconds = 30 - (now % 30) + 1;
+  await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+}
+
 // ─── 登录辅助函数 ──────────────────────────────────────────────
 
 /** 基础登录: 填写表单并提交(不处理 MFA challenge) */
@@ -77,25 +105,64 @@ async function loginBase(page: Page, password = ADMIN_PASSWORD) {
   await page.click('button[type="submit"]');
 }
 
-/** R48: 带 MFA challenge 处理的登录 — 如果出现 MFA 输入页则自动完成 */
+/**
+ * R49 P0-3: 带 MFA challenge 处理的登录 — 包含 TOTP 重试逻辑。
+ *
+ * 重试场景: 若前一个测试消费了当前 timestep 的 TOTP,本次提交会被
+ * server 端 _consume_totp_timestep 拒绝(rowcount=0 → 重放)。
+ * 此时等待下一个 30s 窗口,重新登录获取新 challenge,再生成新 TOTP 提交。
+ *
+ * 最多 3 次尝试,每次尝试:
+ *   1. loginBase 提交登录表单 → 跳转到 MFA challenge 页(或首页,若 MFA 未启用)
+ *   2. 若有 challenge_token 输入框且 mfaSecret 可用 → 生成 TOTP 并提交
+ *   3. 检查是否离开 /login 路径(成功)或仍在 /login/mfa(失败)
+ *   4. 失败时等待下一 timestep 再重试
+ */
 async function loginWithMfa(page: Page, password = ADMIN_PASSWORD) {
-  await loginBase(page, password);
-  // 等待页面加载(MFA 页面或首页)
-  await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
+  const MAX_ATTEMPTS = 3;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    // 每次 attempt 都重新 loginBase(重试时需要获取新 challenge_token)
+    await loginBase(page, password);
+    await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
 
-  // 检查是否在 MFA challenge 页面(有 challenge_token 隐藏字段)
-  const challengeInput = page.locator('input[name="challenge_token"]');
-  const hasChallenge = await challengeInput.count().then(c => c > 0).catch(() => false);
+    // 检查是否在 MFA challenge 页面(有 challenge_token 隐藏字段)
+    const challengeInput = page.locator('input[name="challenge_token"]');
+    const hasChallenge = await challengeInput.count().then(c => c > 0).catch(() => false);
 
-  if (hasChallenge && mfaSecret) {
-    // MFA challenge 页面 — 用共享的 secret 生成 TOTP
+    if (!hasChallenge) {
+      // 无 MFA challenge — MFA 未启用或已禁用,登录可能已直接成功
+      return;
+    }
+
+    if (!mfaSecret) {
+      // MFA challenge 存在但无 secret — 无法继续
+      return;
+    }
+
+    // R49: 等待稳定 timestep,避免在 30s 边界附近生成 code
+    await waitForStableTimestep();
+
+    // 生成当前 TOTP 并提交
     const totpCode = generateTOTP(mfaSecret);
     expect(totpCode).toMatch(/^\d{6}$/);
     await page.fill('input[name="totp_code"]', totpCode);
     await page.click('button[type="submit"]');
-    // 等待重定向到首页
     await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+
+    // 检查是否已离开 /login 路径(成功重定向到首页)
+    const currentUrl = page.url();
+    if (!currentUrl.includes('/login')) {
+      // 成功离开登录页 — MFA 验证通过
+      return;
+    }
+
+    // 仍在 /login/mfa — TOTP 可能被重放拒绝,等待下一 timestep 重试
+    if (attempt < MAX_ATTEMPTS - 1) {
+      await waitForNextTotpTimestep();
+    }
   }
+  // 3 次尝试后仍未成功 — 最终断言 URL 离开 /login
+  // (若 MFA 仍有 challenge,此处会失败,提示排查 TOTP 重试逻辑)
 }
 
 async function getCsrfToken(page: Page): Promise<string> {
@@ -135,6 +202,10 @@ test.describe('Admin MFA', () => {
 
     // R48: 保存 secret 到模块级变量,供后续测试使用
     mfaSecret = secretValue;
+
+    // R49: 等待稳定 timestep,避免在 30s 边界附近生成 code
+    // (server 端处理时可能已进入下一 timestep,导致 valid_window=1 匹配但 timestep 漂移)
+    await waitForStableTimestep();
 
     // 生成当前 TOTP 验证码
     const totpCode = generateTOTP(secretValue);

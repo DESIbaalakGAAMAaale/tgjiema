@@ -45,6 +45,19 @@ CRITICAL_EFFECT_TYPES: frozenset[str] = frozenset({
 })
 
 
+# R49 P0-4: 高风险 action callback_data 模式 — 旧 sync API generate_signed_callback
+# (不持久化 nonce) 用于这些 action 时报告违规,应改用 sign_button_token_with_nonce。
+HIGH_RISK_CALLBACK_PATTERNS: tuple[str, ...] = (
+    "delete",
+    "ban",
+    "purge",
+    "takedown",
+    "force_join",
+    "rotate",
+    "demote",
+)
+
+
 class EffectReceiptError(Exception):
     """R46 P0-1: Effect Receipt 持久化失败,critical 副作用必须中止。"""
 
@@ -82,19 +95,22 @@ class EffectReceiptManager:
     表 DDL 由 database/cache_store.py 创建:
         CREATE TABLE IF NOT EXISTS effect_receipts (
             action_id          TEXT NOT NULL,
-            effect_type       TEXT NOT NULL,
-            target            TEXT NOT NULL,
-            status            TEXT NOT NULL DEFAULT 'pending',
-            external_id       TEXT,
-            created_at        TEXT NOT NULL,
-            completed_at      TEXT,
-            request_hash      TEXT,
-            attempt           INTEGER NOT NULL DEFAULT 0,
-            lease_owner       TEXT,
-            lease_until       TEXT,
-            last_error        TEXT,
-            reconcile_status  TEXT,
-            PRIMARY KEY (action_id, effect_type, target)
+            effect_type        TEXT NOT NULL,
+            target             TEXT NOT NULL,
+            status             TEXT NOT NULL DEFAULT 'pending',
+            external_id        TEXT,
+            created_at         TEXT NOT NULL,
+            completed_at       TEXT,
+            request_hash       TEXT NOT NULL,
+            attempt            INTEGER NOT NULL DEFAULT 0,
+            lease_owner        TEXT,
+            lease_until        TEXT,
+            last_error         TEXT,
+            reconcile_status   TEXT,
+            PRIMARY KEY (action_id, effect_type, target),
+            CHECK (request_hash != '' OR effect_type NOT IN
+                   ('telegram_send','telegram_copy','r2_put','r2_download',
+                    'restore','ban','takedown','purge','crdb_delete'))
         );
     """
 
@@ -263,9 +279,15 @@ class EffectReceiptManager:
         target: str,
         external_id: str = "",
         *,
+        expected_request_hash: str = "",
         fail_closed: bool = False,
     ) -> None:
-        """记录完成 receipt(status=completed)。"""
+        """记录完成 receipt(status=completed)。
+
+        R49 P0-4: 新增 expected_request_hash 一致性校验 — 非空时与 DB 中 stored
+        request_hash 对比,不匹配则 raise EffectReceiptError(防止 completed 阶段
+        被替换 payload,即 pending 时 hash=A 而 completed 时声称 hash=B)。
+        """
         if not self._store._db:
             if fail_closed:
                 raise EffectReceiptError(
@@ -274,6 +296,23 @@ class EffectReceiptManager:
             return
         now = datetime.datetime.utcnow().isoformat()
         try:
+            # R49 P0-4: request_hash 一致性校验(非空 expected 时与 stored 对比)
+            if expected_request_hash:
+                cursor = await self._store._db.execute(
+                    "SELECT request_hash FROM effect_receipts "
+                    "WHERE action_id = ? AND effect_type = ? AND target = ?",
+                    (action_id, effect_type, target),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    stored_hash = row[0] or ""
+                    if stored_hash and expected_request_hash != stored_hash:
+                        raise EffectReceiptError(
+                            f"record_completed request_hash 不匹配,拒绝标记 completed "
+                            f"(action={action_id}, type={effect_type}, target={target}, "
+                            f"expected={expected_request_hash[:16]}..., "
+                            f"stored={stored_hash[:16]}...)"
+                        )
             await self._store._db.execute(
                 "UPDATE effect_receipts SET status = 'completed', "
                 "external_id = ?, completed_at = ?, reconcile_status = 'completed', "
@@ -412,7 +451,7 @@ def _ast_extract_call_arg(
 def validate_critical_effects_have_action_id(
     root_dir: str = ".",
 ) -> list[dict]:
-    """R47 P0-4 / R48 P0-4: 静态扫描所有 EffectReceiptContext/with_effect_receipt 调用点。
+    """R47 P0-4 / R48 P0-4 / R49 P0-4: 静态扫描 EffectReceiptContext/with_effect_receipt 调用点 + 旧 sync API。
 
     扫描 services/、bots/、admin/ 下所有 .py 文件,检测:
     1. EffectReceiptContext(...) 调用中 effect_type 为 critical 类型时,
@@ -425,6 +464,12 @@ def validate_critical_effects_have_action_id(
        params 参数必须存在且非空(用于计算 request_hash 绑定 effect 参数)。
     4. with_effect_receipt(...) 装饰器工厂中 effect_type 为 critical 类型时,
        params_fn 参数必须存在且非空。
+
+    R49 P0-4 新增:
+    5. generate_signed_callback(...) 旧 sync API(不持久化 nonce) 用于高风险 action
+       时标记为违规。高风险 action 通过 callback_data 字符串模式识别(包含
+       'delete'/'ban'/'purge'/'takedown'/'force_join'/'rotate'/'demote' 等),
+       应改用 sign_button_token_with_nonce(异步,持久化 nonce)。
 
     测试目录 tests/ 与脚本目录 scripts/ 不在扫描范围内。
 
@@ -528,6 +573,38 @@ def validate_critical_effects_have_action_id(
                                 "reason": (
                                     "critical effect 的 with_effect_receipt 装饰器 "
                                     "未显式传入非空 params_fn(用于 request_hash 绑定)"
+                                ),
+                            })
+                    elif func_name == "generate_signed_callback":
+                        # R49 P0-4: 旧 sync API(不持久化 nonce)用于高风险 action → 违规。
+                        # 收集所有字符串字面量参数(位置 + 关键字),
+                        # 通过 callback_data 字符串模式识别高风险 action。
+                        str_args: list[str] = []
+                        for arg in node.args:
+                            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                                str_args.append(arg.value)
+                        for kw in node.keywords:
+                            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                                str_args.append(kw.value.value)
+                        matched_pattern = ""
+                        for s in str_args:
+                            lower = s.lower()
+                            for pat in HIGH_RISK_CALLBACK_PATTERNS:
+                                if pat in lower:
+                                    matched_pattern = pat
+                                    break
+                            if matched_pattern:
+                                break
+                        if matched_pattern:
+                            violations.append({
+                                "file": rel_path,
+                                "line": node.lineno,
+                                "call": "generate_signed_callback",
+                                "effect_type": matched_pattern,
+                                "reason": (
+                                    "高风险 action 使用旧 sync API generate_signed_callback"
+                                    f"(不持久化 nonce,callback_data 含 '{matched_pattern}'),"
+                                    "应改用 sign_button_token_with_nonce(异步,持久化 nonce)"
                                 ),
                             })
     return violations

@@ -132,7 +132,7 @@ jobs:
           conn = sqlite3.connect('/tmp/e2e_${{ github.run_id }}.db')
           rows = conn.execute('SELECT id, username, is_active FROM admin_principals').fetchall()
           print(f'admin_principals: {rows}')
-          roles = conn.execute('SELECT principal_id, role FROM admin_principal_roles').fetchall()
+          roles = conn.execute('SELECT principal_id, role_name FROM admin_principal_roles').fetchall()
           print(f'admin_principal_roles: {roles}')
           assert len(rows) > 0, 'admin_principals 表为空'
           assert any('super_admin' in r[1] for r in roles), '无 super_admin 角色'
@@ -183,7 +183,7 @@ jobs:
                   if any('admin_principals' in t[0] for t in tables):
                       rows = conn.execute('SELECT id, username, is_active FROM admin_principals').fetchall()
                       print(f'admin_principals: {rows}')
-                      roles = conn.execute('SELECT principal_id, role FROM admin_principal_roles').fetchall()
+                      roles = conn.execute('SELECT principal_id, role_name FROM admin_principal_roles').fetchall()
                       print(f'admin_principal_roles: {roles}')
                   conn.close()
               except Exception as e:
