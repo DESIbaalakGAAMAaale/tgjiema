@@ -127,6 +127,369 @@ CMD_STATUS_EXECUTING = "executing"
 CMD_STATUS_EXECUTED = "executed"
 CMD_STATUS_FAILED = "failed"
 
+# ─── R52 P0-5: 统一高风险动作状态机 ───────────────────────────
+# 所有高风险动作(Repair/Maintenance/Restore)共用统一状态机:
+#   pending → approved → executing → executed/failed/retryable
+# - pending:   审批待处理(等待 approve)
+# - approved:  审批通过,等待执行(执行前必须验证此状态)
+# - executing: 执行中(CAS 防并发,rowcount=0 表示冲突)
+# - executed:  执行成功(终态,不可重复执行)
+# - failed:    执行失败(可重新审批后重试)
+# - retryable: 执行失败(可重试,用于瞬时故障区分)
+CMD_STATUS_APPROVED = "approved"
+CMD_STATUS_RETRYABLE = "retryable"
+
+# 状态转换合法性表(用于 is_valid_transition 校验)
+# failed/retryable 可重新进入 approved(重新审批后重试)
+VALID_TRANSITIONS: dict[str, set[str]] = {
+    CMD_STATUS_PENDING: {CMD_STATUS_APPROVED},
+    CMD_STATUS_APPROVED: {CMD_STATUS_EXECUTING},
+    CMD_STATUS_EXECUTING: {CMD_STATUS_EXECUTED, CMD_STATUS_FAILED, CMD_STATUS_RETRYABLE},
+    CMD_STATUS_FAILED: {CMD_STATUS_APPROVED},
+    CMD_STATUS_RETRYABLE: {CMD_STATUS_APPROVED},
+    CMD_STATUS_EXECUTED: set(),  # 终态,不可再转换
+}
+
+
+def is_valid_transition(from_status: str, to_status: str) -> bool:
+    """R52 P0-5: 校验状态转换是否合法。
+
+    Args:
+        from_status: 当前状态
+        to_status: 目标状态
+
+    Returns:
+        True 表示转换合法;False 表示非法
+    """
+    allowed = VALID_TRANSITIONS.get(from_status, set())
+    return to_status in allowed
+
+
+async def get_command_status(action_id: str) -> str | None:
+    """R52 P0-5: 查询 command_executions 当前状态。
+
+    Args:
+        action_id: 命令幂等 ID
+
+    Returns:
+        当前状态字符串;记录不存在或 DB 不可用时返回 None
+    """
+    store = _get_store()
+    if not store._db:
+        return None
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT status FROM command_executions WHERE action_id = ?",
+            (action_id,),
+        )
+    except Exception as e:
+        logger.warning(
+            f"[CommandBus] get_command_status 查询失败 action_id={action_id}: {e}"
+        )
+        return None
+    if not rows:
+        return None
+    return rows[0][0]
+
+
+async def claim_execution_approved(
+    action_id: str,
+    owner: str,
+    request_hash: str | None = None,
+    lease_seconds: int = 60,
+) -> bool:
+    """R52 P0-5: CAS 认领 — 将 status='approved' 转为 'executing'。
+
+    统一高风险动作执行入口,Repair/Maintenance/Restore 共用此函数:
+    - 执行前必须验证 approved 状态(避免"执行前已执行"语义冲突)
+    - CAS UPDATE 保证只有一个 worker 能进入 executing
+    - 失败时由调用方决定是否重试(approved 状态未改变,可再次尝试)
+
+    Args:
+        action_id: 命令幂等 ID
+        owner: 执行 worker 标识(如 hostname:pid)
+        request_hash: 可选,SHA256(payload),防篡改校验
+        lease_seconds: 租约时长(秒),过期后可被 cleanup_stale_leases 回收
+
+    Returns:
+        True 表示认领成功;False 表示已被其他 worker 抢占或状态不符
+    """
+    store = _get_store()
+    if not store._db:
+        logger.warning(
+            f"[CommandBus] claim_execution_approved DB 未初始化(降级执行)"
+            f"action_id={action_id}"
+        )
+        return True  # 降级模式允许执行(无并发保护)
+    lease_until = _lease_until_iso(lease_seconds)
+    now = _now_iso()
+    try:
+        # 可选校验 request_hash(防篡改)
+        if request_hash:
+            rows = await store._db.execute_fetchall(
+                "SELECT request_hash FROM command_executions WHERE action_id = ?",
+                (action_id,),
+            )
+            if rows and rows[0]:
+                stored_hash = rows[0][0]
+                if stored_hash and stored_hash != request_hash:
+                    logger.warning(
+                        f"[CommandBus] claim_execution_approved hash_mismatch "
+                        f"action_id={action_id} stored={stored_hash} request={request_hash}"
+                    )
+                    return False
+        # CAS: approved → executing
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, owner = ?, lease_until = ?, updated_at = ? "
+            "WHERE action_id = ? AND status = ?",
+            (CMD_STATUS_EXECUTING, owner, lease_until, now,
+             action_id, CMD_STATUS_APPROVED),
+        )
+        await store._db.commit()
+        claimed = cursor.rowcount > 0
+        if claimed:
+            logger.info(
+                f"[CommandBus] claim_execution_approved 成功 "
+                f"action_id={action_id} owner={owner}"
+            )
+        else:
+            logger.warning(
+                f"[CommandBus] claim_execution_approved CAS 未命中 "
+                f"action_id={action_id}(状态非 approved 或已被抢占)"
+            )
+        return claimed
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] claim_execution_approved 失败 action_id={action_id}: {e}"
+        )
+        return False
+
+
+async def mark_approved_executed(
+    action_id: str,
+    result: Any = None,
+) -> bool:
+    """R52 P0-5: 标记执行成功 — 将 status='executing' 转为 'executed'。
+
+    Args:
+        action_id: 命令幂等 ID
+        result: 执行结果(可选,序列化为 JSON 存储)
+
+    Returns:
+        True 成功;False 失败
+    """
+    store = _get_store()
+    if not store._db:
+        return False
+    now = _now_iso()
+    # 序列化 result
+    if result is None:
+        result_json = json.dumps(
+            {"success": True, "data": None, "error": ""},
+            ensure_ascii=False, default=str,
+        )
+    elif hasattr(result, "success") and (hasattr(result, "data") or hasattr(result, "error")):
+        result_json = json.dumps(
+            {"success": result.success, "data": result.data, "error": result.error},
+            ensure_ascii=False, default=str,
+        )
+    elif isinstance(result, dict):
+        result_json = json.dumps(result, ensure_ascii=False, default=str)
+    else:
+        result_json = json.dumps(
+            {"success": True, "data": str(result), "error": ""},
+            ensure_ascii=False, default=str,
+        )
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, result = ?, owner = NULL, lease_until = NULL, updated_at = ? "
+            "WHERE action_id = ? AND status = ?",
+            (CMD_STATUS_EXECUTED, result_json, now,
+             action_id, CMD_STATUS_EXECUTING),
+        )
+        await store._db.commit()
+        success = cursor.rowcount > 0
+        if success:
+            logger.info(
+                f"[CommandBus] mark_approved_executed 成功 action_id={action_id}"
+            )
+        else:
+            logger.warning(
+                f"[CommandBus] mark_approved_executed CAS 未命中 "
+                f"action_id={action_id}(状态非 executing)"
+            )
+        return success
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] mark_approved_executed 失败 action_id={action_id}: {e}"
+        )
+        return False
+
+
+async def mark_approved_failed(
+    action_id: str,
+    error: str = "",
+    retryable: bool = False,
+) -> bool:
+    """R52 P0-5: 标记执行失败 — 将 status='executing' 转为 'failed' 或 'retryable'。
+
+    Args:
+        action_id: 命令幂等 ID
+        error: 错误信息(序列化为 JSON 存储)
+        retryable: True → status='retryable'(可重试);False → status='failed'(永久失败)
+
+    Returns:
+        True 成功;False 失败
+    """
+    store = _get_store()
+    if not store._db:
+        return False
+    now = _now_iso()
+    target_status = CMD_STATUS_RETRYABLE if retryable else CMD_STATUS_FAILED
+    result_json = json.dumps(
+        {"success": False, "data": None, "error": error},
+        ensure_ascii=False, default=str,
+    )
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, result = ?, owner = NULL, lease_until = NULL, updated_at = ? "
+            "WHERE action_id = ? AND status = ?",
+            (target_status, result_json, now,
+             action_id, CMD_STATUS_EXECUTING),
+        )
+        await store._db.commit()
+        success = cursor.rowcount > 0
+        if success:
+            logger.info(
+                f"[CommandBus] mark_approved_failed 标记为 {target_status} "
+                f"action_id={action_id} error={error[:200]}"
+            )
+        else:
+            logger.warning(
+                f"[CommandBus] mark_approved_failed CAS 未命中 "
+                f"action_id={action_id}(状态非 executing)"
+            )
+        return success
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] mark_approved_failed 失败 action_id={action_id}: {e}"
+        )
+        return False
+
+
+async def verify_command_approved(
+    action_id: str,
+    expected_principal_id: int | None = None,
+    expected_request_hash: str | None = None,
+) -> dict:
+    """R52 P0-5: 验证 command_executions 处于 'approved' 状态(执行前置校验)。
+
+    Repair/Maintenance/Restore 在执行高风险动作前必须调用此函数,
+    确保审批已通过(避免"执行前已执行"语义冲突)。
+
+    Args:
+        action_id: 命令幂等 ID
+        expected_principal_id: 期望的 principal_id(防越权,None 跳过校验)
+        expected_request_hash: 期望的 request_hash(防篡改,None 跳过校验)
+
+    Returns:
+        dict 包含 status / principal_id / request_hash(记录元信息)
+
+    Raises:
+        AppError(COMMAND_NOT_APPROVED): 记录不存在或状态非 approved
+        AppError(COMMAND_HASH_MISMATCH): request_hash 不匹配
+        AppError(COMMAND_STATUS_CONFLICT): principal_id 不匹配
+    """
+    from services.error_codes import AppError, ErrorCodes
+
+    store = _get_store()
+    if not store._db:
+        # DB 未初始化(降级模式),返回 approved 假设
+        logger.warning(
+            f"[CommandBus] verify_command_approved DB 未初始化(降级放行)"
+            f"action_id={action_id}"
+        )
+        return {
+            "status": CMD_STATUS_APPROVED,
+            "principal_id": expected_principal_id or 0,
+            "request_hash": expected_request_hash or "",
+        }
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT status, principal_id, request_hash "
+            "FROM command_executions WHERE action_id = ?",
+            (action_id,),
+        )
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] verify_command_approved 查询失败 action_id={action_id}: {e}"
+        )
+        raise AppError(
+            ErrorCodes.COMMAND_NOT_APPROVED,
+            params={"action_id": action_id, "reason": f"db_error: {e}"},
+        )
+    if not rows:
+        raise AppError(
+            ErrorCodes.COMMAND_NOT_APPROVED,
+            params={"action_id": action_id, "reason": "not_found"},
+        )
+    status, principal_id, request_hash = rows[0]
+    # 状态校验:必须为 approved
+    if status != CMD_STATUS_APPROVED:
+        logger.warning(
+            f"[CommandBus] verify_command_approved 状态非 approved "
+            f"action_id={action_id} status={status}"
+        )
+        raise AppError(
+            ErrorCodes.COMMAND_NOT_APPROVED,
+            params={
+                "action_id": action_id,
+                "current_status": status,
+                "expected_status": CMD_STATUS_APPROVED,
+            },
+        )
+    # principal_id 校验(防越权)
+    if expected_principal_id is not None and principal_id != expected_principal_id:
+        logger.warning(
+            f"[CommandBus] verify_command_approved principal 不匹配 "
+            f"action_id={action_id} stored={principal_id} expected={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.COMMAND_STATUS_CONFLICT,
+            params={
+                "action_id": action_id,
+                "reason": "principal_mismatch",
+                "stored_principal_id": principal_id,
+                "expected_principal_id": expected_principal_id,
+            },
+        )
+    # request_hash 校验(防篡改)
+    if (
+        expected_request_hash is not None
+        and request_hash
+        and request_hash != expected_request_hash
+    ):
+        logger.warning(
+            f"[CommandBus] verify_command_approved hash 不匹配 "
+            f"action_id={action_id} stored={request_hash} expected={expected_request_hash}"
+        )
+        raise AppError(
+            ErrorCodes.COMMAND_HASH_MISMATCH,
+            params={
+                "action_id": action_id,
+                "stored_hash": request_hash,
+                "expected_hash": expected_request_hash,
+            },
+        )
+    return {
+        "status": status,
+        "principal_id": principal_id,
+        "request_hash": request_hash,
+    }
+
 
 def _generate_action_id(principal: "AdminPrincipal", action: str) -> str:
     """生成幂等 action_id(基于 principal + action + 时间戳 + 随机)。

@@ -673,6 +673,24 @@ class TestP13ProductionRestoreApproval:
             _fake_restore_from_backup_data,
         )
 
+        # R52 P0-5: mock claim_execution_approved 通过(CAS approved→executing)
+        # _FakeDB 不支持 cursor.rowcount 和 execute_fetchall,需 mock CAS 绕过
+        async def _noop_claim(action_id, owner, request_hash=None, lease_seconds=None):
+            return True
+        monkeypatch.setattr(
+            "services.command_bus.claim_execution_approved", _noop_claim,
+        )
+        async def _noop_mark_executed(action_id, result=None):
+            return True
+        async def _noop_mark_failed(action_id, error="", retryable=False):
+            return True
+        monkeypatch.setattr(
+            "services.command_bus.mark_approved_executed", _noop_mark_executed,
+        )
+        monkeypatch.setattr(
+            "services.command_bus.mark_approved_failed", _noop_mark_failed,
+        )
+
         result = await engine.restore(
             backup_id, target="production", approver_id=999,
             approval_action_id="approval_valid_id",

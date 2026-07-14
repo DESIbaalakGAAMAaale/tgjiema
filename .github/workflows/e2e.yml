@@ -64,29 +64,35 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
-      # R47/R48 P0-3: 生成 ADMIN_PASSWORD 的 PBKDF2 哈希(与 admin._verify_password 兼容)
-      # 不导入项目代码,避免 Settings 校验(此时 ADMIN_PASSWORD 尚未设置);仅用标准库生成哈希
-      # R48 验证: hash 格式 $pbkdf2-sha256$200000$<salt_hex>$<hash_hex>(split by $ → 5 parts)
-      #           _verify_password 解析: parts[2]=iterations, parts[3]=salt, parts[4]=hash
-      # R50 P0-1: 修复 $ 在 shell/GITHUB_ENV 中被变量展开的问题
-      #           改用临时 Python 脚本文件 + heredoc 'PYEOF'(单引号防 shell 展开 $)
-      #           仅输出格式元数据,不暴露完整 hash;printf 写入 GITHUB_ENV 避免 echo 解析
+      # R52 P0-1: 生成 ADMIN_PASSWORD 的 PBKDF2 哈希(与 admin.passwords.verify_password 兼容)
+      # 修复根因: 原实现在同一 step 内 printf 写入 $GITHUB_ENV 后立即用 Python 读取
+      #   os.environ['ADMIN_PASSWORD'],但 $GITHUB_ENV 只对后续 steps 生效,
+      #   当前 step 读取不到变量,导致格式校验失败。
+      # 方案: export 让当前 step 后续命令可用 + 写入 $GITHUB_ENV 让后续 steps 可用;
+      #   格式校验移到独立 step;不输出 hash 任何部分(安全考虑)。
       - name: Generate admin password hash
         run: |
-          # R50 P0-1: 把 Python 脚本写入临时文件,避免 python -c 多层引号 + $ 转义
           cat > /tmp/gen_admin_hash.py <<'PYEOF'
-          import hashlib, secrets, sys
+          import hashlib, secrets
           PASSWORD = "test_bootstrap_pw"
           ITERATIONS = 200000
           salt = secrets.token_bytes(16)
           h = hashlib.pbkdf2_hmac("sha256", PASSWORD.encode("utf-8"), salt, ITERATIONS)
-          # 输出 hash 到 stdout(只输出 hash,不含其他内容)
           print(f"$pbkdf2-sha256${ITERATIONS}${salt.hex()}${h.hex()}")
           PYEOF
           HASH=$(python /tmp/gen_admin_hash.py)
-          # R50 P0-1: 用 printf 写入 GITHUB_ENV,避免 echo 解析 $ 等特殊字符
-          printf 'ADMIN_PASSWORD=%s\n' "$HASH" >> "$GITHUB_ENV"
-          # R50 P0-1: 验证 hash 格式元数据(不输出完整 hash,只输出前 32 字符前缀)
+          # R52 P0-1: export 让当前 step 后续命令可用
+          export ADMIN_PASSWORD="$HASH"
+          # R52 P0-1: 写入 $GITHUB_ENV 让后续 steps 可用
+          echo "ADMIN_PASSWORD=$HASH" >> "$GITHUB_ENV"
+          # R52 P0-1: 不输出 hash 任何部分(安全考虑)
+          echo "[R52 P0-1] admin password hash generated successfully"
+
+      # R52 P0-1: 格式校验独立 step(读取上一 step 写入 $GITHUB_ENV 的 ADMIN_PASSWORD)
+      - name: Verify password hash format
+        env:
+          ADMIN_PASSWORD: ${{ env.ADMIN_PASSWORD }}
+        run: |
           python -c "
           import os, re
           h = os.environ['ADMIN_PASSWORD']
@@ -94,51 +100,27 @@ jobs:
           assert len(parts) == 5, f'hash parts count != 5: {len(parts)}'
           assert parts[1] == 'pbkdf2-sha256', f'wrong algorithm: {parts[1]}'
           assert int(parts[2]) == 200000, f'wrong iterations: {parts[2]}'
-          salt_len = len(parts[3])
-          hash_len = len(parts[4])
-          assert salt_len == 32, f'salt_hex length != 32: {salt_len}'
-          assert hash_len == 64, f'hash_hex length != 64: {hash_len}'
-          print(f'[R50 P0-1] hash format OK: algo={parts[1]} iter={parts[2]} salt_hex_len={salt_len} hash_hex_len={hash_len}')
-          print(f'[R50 P0-1] hash prefix (first 32 chars only): {h[:32]}...')
+          assert len(parts[3]) == 32, f'salt_hex length != 32: {len(parts[3])}'
+          assert len(parts[4]) == 64, f'hash_hex length != 64: {len(parts[4])}'
+          print('[R52 P0-1] hash format OK')
           "
 
-      # R50 P0-1: 独立验证步骤 — 使用项目 admin._verify_password() 对 hash 做正向 + 反向断言
-      # 位于 hash 生成之后、Bootstrap 之前;若此步失败,后续 Bootstrap/Playwright 不应执行
-      - name: Verify password hash with _verify_password
+      # R52 P0-1: 用纯模块 admin.passwords.verify_password 做正向 + 反向断言
+      # passwords.py 无 Settings 依赖,避免 import 整个 admin/__init__.py 的副作用
+      - name: Verify password with admin.passwords module
         env:
           ADMIN_PASSWORD: ${{ env.ADMIN_PASSWORD }}
         run: |
-          cat > /tmp/verify_admin_hash.py <<'PYEOF'
-          import sys, os
-          sys.path.insert(0, ".")
-          # 仅导入 _verify_password,避免触发 Settings 完整校验
-          # 用 importlib 防止 admin 模块初始化副作用
-          import importlib.util
-          spec = importlib.util.spec_from_file_location("admin_verify", "admin/__init__.py")
-          mod = importlib.util.module_from_spec(spec)
-          try:
-              spec.loader.exec_module(mod)
-          except Exception as e:
-              print(f"[WARN] admin 模块导入失败(可能因 Settings 校验,改用纯 PBKDF2 验证): {e}")
-              # 退化路径:直接用 hashlib 验证 hash 格式正确性
-              import hashlib
-              h = os.environ["ADMIN_PASSWORD"]
-              parts = h.split("$")
-              assert len(parts) == 5
-              salt = bytes.fromhex(parts[3])
-              expected = bytes.fromhex(parts[4])
-              actual = hashlib.pbkdf2_hmac("sha256", b"test_bootstrap_pw", salt, int(parts[2]))
-              assert actual == expected, "PBKDF2 hash mismatch"
-              print("[R50 P0-1] PBKDF2 hash verified via fallback (admin module import failed)")
-              sys.exit(0)
-          # 主路径:使用 admin._verify_password
-          ok = mod._verify_password("test_bootstrap_pw", os.environ["ADMIN_PASSWORD"])
-          assert ok, "_verify_password should accept test_bootstrap_pw"
-          bad = mod._verify_password("wrong_password", os.environ["ADMIN_PASSWORD"])
-          assert not bad, "_verify_password should reject wrong_password"
-          print("[R50 P0-1] _verify_password 验证通过: correct pw=ok, wrong pw=rejected")
-          PYEOF
-          python /tmp/verify_admin_hash.py
+          python -c "
+          import os, sys
+          sys.path.insert(0, '.')
+          from admin.passwords import verify_password
+          ok = verify_password('test_bootstrap_pw', os.environ['ADMIN_PASSWORD'])
+          assert ok, 'verify_password should accept test_bootstrap_pw'
+          bad = verify_password('wrong_password', os.environ['ADMIN_PASSWORD'])
+          assert not bad, 'verify_password should reject wrong_password'
+          print('[R52 P0-1] verify_password passed')
+          "
 
       # R47/R48 P0-3: 初始化临时 SQLite + bootstrap admin principal
       # 必须在 Web 服务启动前完成,否则 startup 的 ensure_readiness_or_exit 会退出

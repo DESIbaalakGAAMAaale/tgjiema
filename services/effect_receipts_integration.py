@@ -69,7 +69,7 @@ def with_effect_receipt(
     """
     def decorator(func: Callable[..., Awaitable[Any]]):
         @functools.wraps(func)
-        async def wrapper(*args, action_id: Optional[str] = None, **kwargs):
+        async def wrapper(*args, action_id: Optional[str] = None, tx=None, **kwargs):
             is_critical = _is_critical(effect_type)
 
             # R47 P0-4: critical effect 无 action_id → 拒绝执行
@@ -147,6 +147,7 @@ def with_effect_receipt(
                 action_id, effect_type, target,
                 fail_closed=fail_closed,
                 expected_request_hash=request_hash,
+                tx=tx,  # R52 P0-4: 传递外层事务连接
             )
             if receipt is not None and receipt.get("status") == "completed":
                 logger.info(
@@ -174,6 +175,7 @@ def with_effect_receipt(
                 action_id, effect_type, target,
                 request_hash=request_hash,
                 fail_closed=fail_closed,
+                tx=tx,  # R52 P0-4: 传递外层事务连接
             )
             if not claim_ok:
                 # 已 completed(竞态),跳过
@@ -234,6 +236,7 @@ class EffectReceiptContext:
         *,
         best_effort: bool = False,
         params: Optional[dict] = None,
+        tx=None,  # R52 P0-4: 可选事务连接(aiosqlite.Connection),传入时不自行 commit
     ):
         self.action_id = action_id or ""
         self.effect_type = effect_type
@@ -247,6 +250,8 @@ class EffectReceiptContext:
         self._no_record: bool = False
         # R48 P0-4: 保存 params 供 __aenter__ 校验
         self._params: Optional[dict] = params
+        # R52 P0-4: 保存外层事务连接,传递给 check_receipt / record_pending
+        self._tx = tx
         # R47 P0-4: 计算 request_hash 绑定 effect 参数
         self.request_hash: str = ""
         if params is not None:
@@ -300,6 +305,7 @@ class EffectReceiptContext:
             self.action_id, self.effect_type, self.target,
             fail_closed=self.fail_closed,
             expected_request_hash=self.request_hash,
+            tx=self._tx,  # R52 P0-4: 传递外层事务连接
         )
         if receipt is not None and receipt.get("status") == "completed":
             self.skipped = True
@@ -328,6 +334,7 @@ class EffectReceiptContext:
             self.action_id, self.effect_type, self.target,
             request_hash=self.request_hash,
             fail_closed=self.fail_closed,
+            tx=self._tx,  # R52 P0-4: 传递外层事务连接
         )
         if not claim_ok:
             self.skipped = True

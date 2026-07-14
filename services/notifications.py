@@ -196,19 +196,29 @@ def _safe_json_dumps(val) -> str:
 
 
 def _compute_window_start(now: _dt.datetime | None = None) -> str:
-    """R51 P0-5: 计算去重窗口起始时间(整点对齐,1 小时窗口)。
+    """R51 P0-5 + R52 P1-2: 计算去重窗口起始时间(整点对齐,1 小时窗口,UTC)。
 
     将当前时间向下取整到整点,作为 dedup 窗口的起始时间。
     同一小时内多次调用返回相同的 window_start,配合唯一约束防并发重复。
 
+    R52 P1-2 改造: 使用明确 UTC bucket(原 local time 在跨时区机器间不一致,
+    导致 dedup window 边界漂移)。改为 UTC 整点对齐,bucket 标签带 +00:00 后缀
+    便于审计追溯。
+
     Args:
-        now: 当前时间(可选,默认 datetime.now())
+        now: 当前时间(可选,默认 datetime.utcnow())
 
     Returns:
-        整点对齐的 ISO 格式时间字符串
+        整点对齐的 ISO 格式时间字符串(UTC,带 +00:00 后缀)
     """
-    dt = now or _dt.datetime.now()
-    return dt.replace(minute=0, second=0, microsecond=0).isoformat()
+    # R52 P1-2: 使用 UTC 时间(若调用方传入 naive datetime,视为 UTC)
+    dt = now or _dt.datetime.utcnow()
+    if dt.tzinfo is not None:
+        # 转为 UTC(若已带时区)
+        dt = dt.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+    # 整点对齐 + 显式 UTC 后缀(便于跨时区一致性)
+    aligned = dt.replace(minute=0, second=0, microsecond=0)
+    return aligned.isoformat() + "+00:00"
 
 
 async def send(
@@ -302,6 +312,171 @@ async def send(
                 f"user_id={user_id} type={notif_type}: {e}"
             )
         return 0
+
+
+async def send_with_dedup_contract(
+    user_id: int,
+    notif_type: str,
+    payload: dict,
+    *,
+    persist_only: bool = False,
+) -> dict:
+    """R52 P1-2: 发送通知并返回结构化 dedup 契约(明确区分 sent/deduplicated/error)。
+
+    与 ``send()`` 的区别:
+        - ``send()`` 返回 ``int``(notif_id 或 0),调用方无法区分"去重命中"
+          与"真实写失败"(都返回 0)
+        - ``send_with_dedup_contract()`` 返回结构化 dict,明确区分三种状态:
+            * ``{status: "sent", notif_id, outbox_id}`` — 新写入成功
+            * ``{status: "deduplicated", notif_id, outbox_id}`` — 命中去重,
+              返回现有权威记录(notif_id/outbox_id 来自已存在的记录)
+            * ``{status: "error", notif_id: 0, outbox_id: 0, error_code, error_msg}`` —
+              真实写失败(非去重),调用方可安全重试
+
+    R52 P1-2 改造要点:
+        1. 返回结构 ``{status, notif_id, outbox_id}``
+        2. 去重命中时查询并返回现有权威记录(notif_id/outbox_id)
+        3. 只有真实写失败返回 error(区分去重与失败)
+        4. dedup window 使用明确 UTC bucket(见 _compute_window_start)
+
+    Args:
+        user_id: 用户 ID
+        notif_type: 通知类型(NOTIF_TYPE_*)
+        payload: 通知载荷(JSON 序列化存储)
+        persist_only: True=仅写 notifications 表(历史型通知,不投递)
+
+    Returns:
+        结构化 dedup 契约 dict:
+            - 成功: ``{status: "sent", notif_id: >0, outbox_id: >0 或 0}``
+            - 去重: ``{status: "deduplicated", notif_id: >0, outbox_id: >0 或 0,
+                     dedup_key: str}``
+            - 失败: ``{status: "error", notif_id: 0, outbox_id: 0,
+                     error_code: str, error_msg: str}``
+    """
+    from services.error_codes import ErrorCodes
+
+    store = get_cache_store()
+    if not store._db:
+        logger.warning("[notifications] send_with_dedup_contract CacheStore 未初始化")
+        return {
+            "status": "error", "notif_id": 0, "outbox_id": 0,
+            "error_code": ErrorCodes.DB_CACHE_UNAVAILABLE,
+            "error_msg": "CacheStore 未初始化",
+        }
+    now = _dt.datetime.now().isoformat()
+    payload_json = _safe_json_dumps(payload)
+    await _ensure_outbox_schema()
+    # 提取 dedup_key
+    dedup_key = ""
+    if isinstance(payload, dict):
+        dedup_key = str(payload.get("_dedup_key", "")) or ""
+    # R52 P1-2: UTC bucket
+    window_start = _compute_window_start() if dedup_key else None
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(
+                """INSERT INTO notifications (user_id, type, payload, is_read, created_at)
+                   VALUES (?, ?, ?, 0, ?)""",
+                (user_id, notif_type, payload_json, now),
+            )
+            notif_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+            outbox_id = 0
+            if notif_id:
+                await store.add_dirty_outbox("notifications", str(notif_id), connection=tx)
+                logger.info(
+                    f"[notifications] send_with_dedup_contract 发送通知 id={notif_id} "
+                    f"user_id={user_id} type={notif_type}"
+                )
+                if persist_only:
+                    logger.info(
+                        f"[notifications] persist_only=True 跳过 outbox "
+                        f"notif_id={notif_id} user_id={user_id}"
+                    )
+                else:
+                    ob_cur = await tx.execute(
+                        """INSERT INTO notification_outbox
+                           (notif_id, user_id, notif_type, dedup_key, window_start,
+                            payload, status, attempts, max_attempts, last_error,
+                            created_at, delivered_at, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, 3, '', ?, NULL, ?)""",
+                        (notif_id, user_id, notif_type, dedup_key, window_start,
+                         payload_json, now, now),
+                    )
+                    outbox_id = int(ob_cur.lastrowid) if ob_cur and ob_cur.lastrowid else 0
+                    await store.add_dirty_outbox(
+                        "notification_outbox", str(notif_id), connection=tx,
+                    )
+        return {
+            "status": "sent", "notif_id": notif_id,
+            "outbox_id": outbox_id,
+        }
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "unique" in err_msg or "constraint" in err_msg:
+            # R52 P1-2: 去重命中 → 查询并返回现有权威记录
+            logger.info(
+                f"[notifications] send_with_dedup_contract 去重命中 "
+                f"user_id={user_id} dedup_key={dedup_key}: {e}"
+            )
+            try:
+                # 查询最新的同 dedup_key + window_start 的 outbox 记录(权威)
+                cur = await store._db.execute(
+                    """SELECT id, notif_id FROM notification_outbox
+                       WHERE user_id = ? AND dedup_key = ? AND window_start = ?
+                       ORDER BY id DESC LIMIT 1""",
+                    (user_id, dedup_key, window_start),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if row:
+                    return {
+                        "status": "deduplicated",
+                        "notif_id": int(row[1] or 0),
+                        "outbox_id": int(row[0] or 0),
+                        "dedup_key": dedup_key,
+                    }
+                # outbox 查不到(可能 persist_only 路径)→ 查 notifications
+                cur2 = await store._db.execute(
+                    """SELECT id FROM notifications
+                       WHERE user_id = ?
+                         AND payload LIKE ?
+                         AND created_at >= ?
+                       ORDER BY id DESC LIMIT 1""",
+                    (user_id, f'%"_dedup_key": "{dedup_key}"%',
+                     window_start or ""),
+                )
+                row2 = await cur2.fetchone()
+                await cur2.close()
+                if row2:
+                    return {
+                        "status": "deduplicated",
+                        "notif_id": int(row2[0]),
+                        "outbox_id": 0,
+                        "dedup_key": dedup_key,
+                    }
+                # 唯一约束冲突但查不到权威记录 → 视为 error(理论不应发生)
+                return {
+                    "status": "error", "notif_id": 0, "outbox_id": 0,
+                    "error_code": ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE,
+                    "error_msg": f"dedup conflict but no authoritative record found: {e}",
+                }
+            except Exception as query_err:
+                return {
+                    "status": "error", "notif_id": 0, "outbox_id": 0,
+                    "error_code": ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE,
+                    "error_msg": f"authoritative record query failed: {query_err}",
+                }
+        # 真实写失败 → 返回 error
+        logger.warning(
+            f"[notifications] send_with_dedup_contract 失败 "
+            f"code={ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED} "
+            f"user_id={user_id} type={notif_type}: {e}"
+        )
+        return {
+            "status": "error", "notif_id": 0, "outbox_id": 0,
+            "error_code": ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED,
+            "error_msg": str(e),
+        }
 
 
 async def mark_read(notif_id: int) -> bool:

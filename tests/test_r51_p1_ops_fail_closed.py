@@ -114,11 +114,15 @@ def _reset_command_bus_idempotency():
 async def _insert_command_execution(
     store,
     action_id: str,
-    status: str = "executed",
+    status: str = "approved",
     request_hash: str = "test_hash_001",
     result_json: str = '{"success": true}',
 ):
-    """直接插入一条 command_executions 记录(模拟 CommandBus 审批结果)。"""
+    """直接插入一条 command_executions 记录(模拟 CommandBus 审批结果)。
+
+    R52 P0-5: 状态机统一为 pending → approved → executing → executed/failed,
+    审批通过后执行前的状态为 'approved'(旧版 'executed' 语义冲突已废弃)。
+    """
     import datetime as _dt
     now = _dt.datetime.now().isoformat()
     await store._db.execute(
@@ -234,10 +238,10 @@ class TestDisableRequiresRequestHashWhenRecoverPending:
         await real_store._db.execute("UPDATE dirty_outbox SET processed = 1")
         await real_store._db.commit()
 
-        # 插入一条 command_executions 记录(status='executed')
+        # 插入一条 command_executions 记录(status='approved')
         approval_action_id = "recover_action_r51_001"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
         )
 
         # 调用 disable(有 approval_action_id 但无 request_hash)应抛异常
@@ -277,10 +281,10 @@ class TestRecoverMaintenanceBindingRequired:
         await maintenance_mode.enable("测试 recover_maintenance 无 request_hash", started_by=100)
         await _set_recover_status(real_store, "pending")
 
-        # 插入一条 executed 状态的审批记录
+        # 插入一条 approved 状态的审批记录
         approval_action_id = "recover_action_r51_002"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
         )
 
         # 调用 recover_maintenance 无 request_hash → PermissionError
@@ -340,11 +344,11 @@ class TestRecoverMaintenanceBindingRequired:
         await real_store._db.execute("UPDATE dirty_outbox SET processed = 1")
         await real_store._db.commit()
 
-        # 插入一条 executed 状态的审批记录
+        # 插入一条 approved 状态的审批记录
         approval_action_id = "recover_action_r51_003"
         request_hash = "r51_test_hash_003"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
             request_hash=request_hash,
         )
 
@@ -475,9 +479,8 @@ class TestPrometheusCollectorFailureHandling:
     def test_pel_collector_failure_outputs_collector_success_zero(self, monkeypatch):
         """PEL 采集失败(无法解析为 float)→ 输出 collector_success=0。
 
-        场景:kv_store.redis_pel_depth 返回空字符串或非数字字符串,
-        collect_metrics 应输出 redis_pel_depth_collector_success=0,
-        而非直接输出 redis_pel_depth 0(0 可能是真实值,无法区分)。
+        R52 P1-7: 采集失败时不输出 0 值带 error label(0 可能是真实值,无法区分;
+        改为完全不输出主数值,仅输出统一的 tgjiema_collector_success=0)。
         """
         from services import prometheus_exporter as pe
 
@@ -492,30 +495,16 @@ class TestPrometheusCollectorFailureHandling:
         pe_patched = _patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
         output = pe_patched.collect_metrics()
 
-        # 应输出 collector_success=0(而非伪装为 0)
-        assert "redis_pel_depth_collector_success" in output, \
-            "PEL 采集失败时应输出 redis_pel_depth_collector_success 指标"
-        # 找到 collector_success 行,值应为 0
-        found_zero = False
-        for line in output.split("\n"):
-            if "redis_pel_depth_collector_success" in line and not line.startswith("#"):
-                assert line.endswith(" 0"), \
-                    f"PEL 采集失败时 collector_success 应为 0,实际: {line}"
-                found_zero = True
-                break
-        assert found_zero, \
-            "PEL 采集失败时应输出 redis_pel_depth_collector_success{collector=\"redis_pel\"} 0"
-        # 应包含 collector_status="error" label
-        assert 'collector_status="error"' in output, \
-            "PEL 采集失败时 redis_pel_depth 行应包含 collector_status=\"error\" label"
+        # R52 P1-7: 应输出统一 tgjiema_collector_success{collector="redis_pel"} 0
+        assert 'tgjiema_collector_success{collector="redis_pel"} 0' in output, \
+            "PEL 采集失败时应输出 tgjiema_collector_success{collector=\"redis_pel\"} 0"
 
     def test_dlq_depth_collector_failure_outputs_collector_success_zero(
         self, monkeypatch
     ):
         """dlq_depth 采集失败(无法解析为 float)→ 输出 collector_success=0。
 
-        场景:kv_store.dlq_depth 返回非数字字符串,
-        collect_metrics 应输出 dlq_depth_collector_success=0。
+        R52 P1-7: 采集失败时不输出 0 值带 error label,仅输出统一 collector_success=0。
         """
         from services import prometheus_exporter as pe
 
@@ -530,27 +519,16 @@ class TestPrometheusCollectorFailureHandling:
         pe_patched = _patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
         output = pe_patched.collect_metrics()
 
-        # 应输出 collector_success=0
-        assert "dlq_depth_collector_success" in output, \
-            "dlq_depth 采集失败时应输出 dlq_depth_collector_success 指标"
-        found_zero = False
-        for line in output.split("\n"):
-            if "dlq_depth_collector_success" in line and not line.startswith("#"):
-                assert line.endswith(" 0"), \
-                    f"dlq_depth 采集失败时 collector_success 应为 0,实际: {line}"
-                found_zero = True
-                break
-        assert found_zero, \
-            "dlq_depth 采集失败时应输出 dlq_depth_collector_success{collector=\"dlq\"} 0"
+        # R52 P1-7: 应输出统一 tgjiema_collector_success{collector="dlq"} 0
+        assert 'tgjiema_collector_success{collector="dlq"} 0' in output, \
+            "dlq_depth 采集失败时应输出 tgjiema_collector_success{collector=\"dlq\"} 0"
 
     def test_i18n_missing_key_collector_failure_outputs_collector_success_zero(
         self, monkeypatch
     ):
         """i18n missing-key 采集失败 → 输出 collector_success=0。
 
-        场景:services.i18n.get_i18n_manager() 抛异常(模块未初始化),
-        collect_metrics 应输出 tgjiema_i18n_collector_success=0,
-        而非直接输出 tgjiema_i18n_missing_key_total 0(0 可能是真实值)。
+        R52 P1-7: 采集失败时不输出 0 值带 error label,仅输出统一 collector_success=0。
         """
         from services import prometheus_exporter as pe
 
@@ -565,21 +543,9 @@ class TestPrometheusCollectorFailureHandling:
 
         output = pe_patched.collect_metrics()
 
-        # 应输出 collector_success=0
-        assert "tgjiema_i18n_collector_success" in output, \
-            "i18n 采集失败时应输出 tgjiema_i18n_collector_success 指标"
-        found_zero = False
-        for line in output.split("\n"):
-            if "tgjiema_i18n_collector_success" in line and not line.startswith("#"):
-                assert line.endswith(" 0"), \
-                    f"i18n 采集失败时 collector_success 应为 0,实际: {line}"
-                found_zero = True
-                break
-        assert found_zero, \
-            "i18n 采集失败时应输出 tgjiema_i18n_collector_success{collector=\"i18n_missing_key\"} 0"
-        # 应包含 collector_status="error" label
-        assert 'collector_status="error"' in output, \
-            "i18n 采集失败时 tgjiema_i18n_missing_key_total 行应包含 collector_status=\"error\""
+        # R52 P1-7: 应输出统一 tgjiema_collector_success{collector="i18n_missing_key"} 0
+        assert 'tgjiema_collector_success{collector="i18n_missing_key"} 0' in output, \
+            "i18n 采集失败时应输出 tgjiema_collector_success{collector=\"i18n_missing_key\"} 0"
 
 
 # ════════════════════════════════════════════════════════════════

@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 312,
+      "baseline": 315,
       "target": 0,
-      "user_visible": 289,
-      "log_only": 23
+      "user_visible": 291,
+      "log_only": 24
     }
   },
   "total": {
-    "baseline": 1267,
+    "baseline": 1270,
     "target": 0,
-    "user_visible": 1194,
-    "log_only": 73
+    "user_visible": 1196,
+    "log_only": 74
   },
-  "last_updated": "2026-07-14",
-  "last_updated_by": "R49 P0-4 critical effect hash enforcement: 新增 record_completed request_hash 一致性校验 + sync generate_signed_callback 高风险检测"
+  "last_updated": "2026-07-15",
+  "last_updated_by": "R52 P0-5/P1-1/P1-4/P1-5/P1-7/P1-8 整改: 新增 CommandBus 状态机/entitlements/collections/CF Worker 两阶段去重相关日志字符串"
 }

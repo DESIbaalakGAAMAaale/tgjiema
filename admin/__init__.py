@@ -398,44 +398,12 @@ def _is_hashed_password(stored: str) -> bool:
     return stored.startswith(_PBKDF2_PREFIX) or stored.startswith(_ARGON2ID_PREFIX)
 
 
-def _verify_password(plaintext: str, stored: str) -> bool:
-    """R39 P1-12: 校验密码（仅接受哈希格式，明文一律拒绝）。
-
-    支持格式（按优先级）:
-    - Argon2id:   $argon2id$v=19$m=...,t=...,p=...$<salt_b64>$<hash_b64>
-    - PBKDF2:     $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
-
-    明文密码不再被接受，调用方应在启动时通过 _warn_if_plaintext_password() 提示。
-    """
-    if not stored or not plaintext:
-        return False
-    # R39 P1-12: Argon2id 优先（若 argon2-cffi 已安装）
-    if _ARGON2_AVAILABLE and stored.startswith(_ARGON2ID_PREFIX):
-        try:
-            return _argon2_hasher.verify(stored, plaintext)
-        except _Argon2Mismatch:
-            return False
-        except Exception:
-            return False
-    # R39 P1-12: PBKDF2 哈希校验
-    if stored.startswith(_PBKDF2_PREFIX):
-        try:
-            parts = stored.split("$")
-            # parts: ['', 'pbkdf2-sha256', '<iter>', '<salt_hex>', '<hash_hex>']
-            if len(parts) != 5:
-                return False
-            iterations = int(parts[2])
-            if iterations < 10_000:  # 防御：拒绝过低的迭代次数
-                return False
-            salt = bytes.fromhex(parts[3])
-            expected_hash = bytes.fromhex(parts[4])
-            # 对输入密码做同样的 PBKDF2 派生
-            actual_hash = hashlib.pbkdf2_hmac("sha256", plaintext.encode("utf-8"), salt, iterations)
-            return _hmac.compare_digest(actual_hash, expected_hash)
-        except (ValueError, TypeError):
-            return False
-    # R39 P1-12: 明文密码一律拒绝（不再向后兼容）
-    return False
+# R52 P0-1: 从纯模块导入(避免 Settings 副作用)
+# _verify_password 保留原函数名(向后兼容,签名 (plaintext, stored) 不变);
+# hash_password 为纯 PBKDF2 生成函数。
+# 注:argon2-cffi 未列入 requirements.txt,原 Argon2id 分支为死代码,
+# 故纯 PBKDF2 实现与原行为等价;iterations<10_000 防御已在 passwords.py 中保留。
+from admin.passwords import verify_password as _verify_password, hash_password
 
 
 # R39 P1-12: 启动时检测明文密码，仅告警一次（避免日志爆炸）

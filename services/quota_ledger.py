@@ -265,7 +265,11 @@ async def get_balance(user_id: int) -> int:
             "ELSE 0 END), 0) "
             "FROM quota_reservations "
             "WHERE user_id = ? AND status != 'refunded' "
-            "AND date(created_at) = date('now')",
+            # created_at 由 datetime.now() 写入(本地时区),
+            # 查询须用 date('now', 'localtime') 取本地日期匹配,
+            # 否则 UTC+8 00:00-08:00 时段本地日期与 UTC 日期错位,
+            # 导致 get_balance 返回满额误判(超额放行)。
+            "AND date(created_at) = date('now', 'localtime')",
             (user_id,),
         )
         used_today = int(rows[0][0] or 0) if rows else 0

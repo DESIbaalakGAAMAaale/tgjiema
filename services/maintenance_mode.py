@@ -257,7 +257,7 @@ async def enable(reason: str, started_by: int = 0) -> bool:
 
 async def disable(ended_by: int = 0, force: bool = False, approval_action_id: str = None,
                   request_hash: str = None) -> bool:
-    """R40 P1-6 + R42 P1-12 + R51 P1-6: 关闭维护模式(带前置检查 + recover_status 校验 + 绑定校验)。
+    """R40 P1-6 + R42 P1-12 + R51 P1-6 + R52 P0-5: 关闭维护模式(带前置检查 + recover_status 校验 + 绑定校验 + 统一状态机)。
 
     前置条件(默认 force=False 时检查):
         - 队列已排空(dirty_outbox + local_job_queue)
@@ -267,7 +267,7 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
     R42 P1-12 新增 recover_status 校验:
         - 若 maintenance_state.recover_status='pending'(workflow 失败):
           - approval_action_id 为 None → 抛 MaintenancePreconditionError
-          - approval_action_id 有效(在 command_executions 中 status='executed')
+          - approval_action_id 有效(在 command_executions 中 status='approved')
             → 允许关闭
         - 否则正常流程
 
@@ -275,6 +275,12 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
         - 必须同时提供 request_hash + approval_action_id(ended_by 即 principal)
         - 三者缺一不可,确保审批动作与请求来源可审计追溯
         - 缺失时抛 MaintenancePreconditionError(协议化错误 MAINTENANCE_RECOVER_BINDING_REQUIRED)
+
+    R52 P0-5 新增统一状态机(recover_status='pending' 时强制):
+        - status 从 'executed' 改为 'approved'(执行前置校验,避免语义冲突)
+        - CAS: approved → executing(防并发执行同一审批)
+        - 成功后: executing → executed
+        - 失败后: executing → failed
 
     Args:
         ended_by: 操作者 admin_id(即 principal)
@@ -292,8 +298,18 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
     if not store._db:
         return False
 
+    # R52 P0-5: 引入统一状态机辅助函数(延迟导入避免循环依赖)
+    from services.command_bus import (
+        claim_execution_approved,
+        mark_approved_executed,
+        mark_approved_failed,
+    )
+
     # R42 P1-12: 检查 recover_status
+    # R52 P1-6: 查询失败必须 fail-closed(不允许降级为 completed,否则可能在
+    #   recover_status='pending' 时绕过审批关闭维护模式)
     recover_status = "completed"
+    _recover_status_query_failed = False
     try:
         rows = await store._db.execute_fetchall(
             "SELECT recover_status FROM maintenance_state WHERE id = ?",
@@ -302,8 +318,24 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
         if rows and rows[0]:
             recover_status = rows[0][0] or "completed"
     except Exception as e:
-        logger.warning(
-            f"[Maintenance] disable 查询 recover_status 失败(降级为 completed): {e}"
+        _recover_status_query_failed = True
+        # R52 P1-6: fail-closed — 查询失败时拒绝 disable,不允许降级为 completed
+        from services.error_codes import AppError, ErrorCodes
+        logger.error(
+            f"[Maintenance] R52 P1-6: disable 查询 recover_status 失败,"
+            f"fail-closed 拒绝关闭(不允许降级为 completed): {e}"
+        )
+        # 写 audit_log 记录 fail-closed 拒绝(便于事后追溯)
+        try:
+            app_err = AppError(
+                ErrorCodes.MAINTENANCE_DISABLE_RECOVER_QUERY_FAILED,
+                params={"reason": f"{type(e).__name__}: {e}"},
+            )
+            await app_err.write_audit_log()
+        except Exception:
+            pass  # audit_log 写入失败不影响主流程拒绝
+        raise MaintenancePreconditionError(
+            f"R52 P1-6: disable recover_status query failed, fail-closed denying shutdown: {e}"
         )
 
     if recover_status == "pending":
@@ -339,7 +371,9 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
                 "R51 P1-6: recover_status=pending 时 disable 必须绑定 request_hash + "
                 "principal + approval_action_id(三者缺一不可)"
             )
-        # 验证 approval_action_id 在 command_executions 中 status='executed'
+        # 验证 approval_action_id 在 command_executions 中 status='approved'
+        # R52 P0-5: 状态从 'executed' 改为 'approved'(执行前置校验,
+        # 避免"执行前已执行"语义冲突)
         try:
             exec_rows = await store._db.execute_fetchall(
                 "SELECT status FROM command_executions WHERE action_id = ?",
@@ -354,15 +388,44 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
                 f"approval_action_id 不存在于 command_executions: {approval_action_id}"
             )
         exec_status = exec_rows[0][0]
-        if exec_status != "executed":
+        if exec_status != "approved":
             raise MaintenancePreconditionError(
-                f"approval_action_id 状态非 executed(当前: {exec_status}): "
+                f"approval_action_id status not approved (current: {exec_status}): "
                 f"{approval_action_id}"
             )
         logger.info(
             f"[Maintenance] disable recover_status=pending,approval_action_id={approval_action_id} "
-            f"request_hash={request_hash} principal={ended_by} 已验证 executed,允许关闭"
+            f"request_hash={(request_hash or '')[:16]} principal={ended_by} 已验证 approved,允许关闭"
         )
+
+        # R52 P0-5: CAS approved → executing(防并发执行同一审批)
+        # 失败时表示已被其他 worker 抢占,或状态已从 approved 流转
+        import socket as _socket
+        import os as _os
+        _owner = f"{_socket.gethostname()}:{_os.getpid()}"
+        try:
+            claimed = await claim_execution_approved(
+                action_id=approval_action_id,
+                owner=_owner,
+                request_hash=request_hash,
+            )
+        except Exception as cas_err:
+            logger.error(
+                f"[Maintenance] disable CAS approved→executing 异常 "
+                f"approval_action_id={approval_action_id}: {cas_err}"
+            )
+            raise MaintenancePreconditionError(
+                f"CAS approved->executing error: {cas_err}"
+            )
+        if not claimed:
+            logger.error(
+                f"[Maintenance] disable CAS 失败(已被抢占或状态非 approved) "
+                f"approval_action_id={approval_action_id} principal={ended_by}"
+            )
+            raise MaintenancePreconditionError(
+                f"CAS approved->executing failed (preempted or status not approved): "
+                f"{approval_action_id}"
+            )
 
     # R40 P1-6: 前置检查
     if not force:
@@ -375,6 +438,9 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             raise MaintenancePreconditionError(reason)
 
     now_iso = _dt.datetime.now().isoformat()
+    # R52 P0-5: 跟踪是否已执行 CAS(仅在 recover_status=pending + approval_action_id 场景)
+    # 用于在 disable 成功/失败后回写状态机 executing → executed/failed
+    _cas_done = recover_status == "pending" and approval_action_id is not None
     try:
         await store._db.execute(
             """UPDATE maintenance_state
@@ -399,14 +465,58 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
         # R40 P1-7: 更新缓存
         await _persist_cache(False)
 
+        # R52 P0-5: 成功时回写状态机 executing → executed
+        if _cas_done:
+            try:
+                await mark_approved_executed(
+                    action_id=approval_action_id,
+                    result={
+                        "success": True,
+                        "action": "disable_maintenance",
+                        "ended_by": ended_by,
+                    },
+                )
+            except Exception as mark_err:
+                logger.error(
+                    f"[Maintenance] mark_approved_executed 失败 "
+                    f"approval_action_id={approval_action_id}: {mark_err}"
+                )
+
         logger.info(
             f"[Maintenance] 维护模式已关闭: ended_by={ended_by} force={force}"
         )
         return True
     except MaintenancePreconditionError:
+        # R52 P0-5: 前置条件失败时回写状态机 executing → failed
+        # (仅在已 CAS 成功的场景;前置条件失败发生在 CAS 之前时无需回写)
+        if _cas_done:
+            try:
+                await mark_approved_failed(
+                    action_id=approval_action_id,
+                    error=f"disable precondition failed",
+                    retryable=False,
+                )
+            except Exception as mark_err:
+                logger.error(
+                    f"[Maintenance] mark_approved_failed 失败 "
+                    f"approval_action_id={approval_action_id}: {mark_err}"
+                )
         raise
     except Exception as e:
         logger.error(f"[Maintenance] disable 失败: {e}")
+        # R52 P0-5: 失败时回写状态机 executing → failed
+        if _cas_done:
+            try:
+                await mark_approved_failed(
+                    action_id=approval_action_id,
+                    error=f"disable maintenance failed: {e}",
+                    retryable=False,
+                )
+            except Exception as mark_err:
+                logger.error(
+                    f"[Maintenance] mark_approved_failed 失败 "
+                    f"approval_action_id={approval_action_id}: {mark_err}"
+                )
         return False
 
 
@@ -1139,16 +1249,18 @@ async def recover_maintenance(
     approval_action_id: str = None,
     request_hash: str = None,
 ) -> bool:
-    """R42 P1-12 + R51 P1-6: 人工恢复维护模式(需 CommandBus 审批 + maintenance:recover 权限 + request_hash 绑定)。
+    """R42 P1-12 + R51 P1-6 + R52 P0-5: 人工恢复维护模式(需 CommandBus 审批 + maintenance:recover 权限 + request_hash 绑定)。
 
     与 ``rollback_maintenance`` 的差异:
         - rollback_maintenance 跳过所有检查(仅运维紧急恢复)
         - recover_maintenance 强制要求:
           1. approval_action_id 由 CommandBus 预先审批生成(非 None)
-          2. approval_action_id 在 command_executions 中 status='executed'
+          2. R52 P0-5: approval_action_id 在 command_executions 中 status='approved'
+             (旧版 'executed' 语义冲突;统一为 approved → executing → executed/failed 状态机)
           3. principal_id 拥有 ``maintenance:recover`` 权限
           4. R51 P1-6: request_hash 必须提供(绑定审批动作 + principal + 请求来源)
         - 通过验证后调用 ``disable(force=True, approval_action_id=..., request_hash=...)`` 关闭
+          (CAS approved→executing + 状态机回写在 disable 内完成)
         - 成功后重置 recover_status='completed',写 audit_log(action="recover_maintenance")
 
     Args:
@@ -1199,7 +1311,9 @@ async def recover_maintenance(
     if not store._db:
         raise PermissionError("数据库未初始化,无法验证 approval_action_id")
 
-    # 2. 验证 approval_action_id 在 command_executions 中 status='executed'
+    # 2. R52 P0-5: 验证 approval_action_id 在 command_executions 中 status='approved'
+    #    (旧版 'executed' 语义冲突:表示"已完成"但 recover_maintenance 即将执行;
+    #     统一为 approved → executing → executed/failed 状态机)
     try:
         rows = await store._db.execute_fetchall(
             "SELECT status FROM command_executions WHERE action_id = ?",
@@ -1213,9 +1327,9 @@ async def recover_maintenance(
             f"approval_action_id 不存在: {approval_action_id}"
         )
     exec_status = rows[0][0]
-    if exec_status != "executed":
+    if exec_status != "approved":
         raise PermissionError(
-            f"approval_action_id 状态非 executed(当前: {exec_status}): "
+            f"approval_action_id status not approved (current: {exec_status}): "
             f"{approval_action_id}"
         )
 
@@ -1251,10 +1365,11 @@ async def recover_maintenance(
         )
 
     # 4. 通过验证 → 调用 disable(force=True, approval_action_id=..., request_hash=...)
+    # R52 P1-6: request_hash 只记录短指纹(前 16 字符),避免完整 hash 泄露
     logger.info(
         f"[Maintenance] recover_maintenance 验证通过,关闭维护模式: "
         f"principal={principal_id} reason={reason} "
-        f"approval_action_id={approval_action_id} request_hash={request_hash}"
+        f"approval_action_id={approval_action_id} request_hash={(request_hash or '')[:16]}"
     )
     ok = await disable(
         ended_by=principal_id,

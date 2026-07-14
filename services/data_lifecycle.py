@@ -270,6 +270,41 @@ async def _write_audit_log(actor_id: int, action: str, target_type: str,
         return 0
 
 
+async def _write_audit_log_in_tx(tx, actor_id: int, action: str,
+                                  target_type: str, target_id: str,
+                                  details: dict,
+                                  ip_addr: str = "") -> int:
+    """R52 P1-3: 在指定事务连接内写入 audit_log(原子性保障)。
+
+    与 ``_write_audit_log`` 的区别:
+        - ``_write_audit_log`` 使用 store._db.execute + commit(独立事务)
+        - ``_write_audit_log_in_tx`` 复用调用方的 tx,不单独 commit,
+          确保审计日志与业务变更在同一事务内原子提交
+
+    Args:
+        tx: 事务连接(store.transaction() 返回的 tx)
+        actor_id: 操作者 id(管理员)
+        action: 动作描述
+        target_type: 目标类型
+        target_id: 目标主键
+        details: 详情字典(序列化为 JSON)
+        ip_addr: 操作来源 IP(可选)
+
+    Returns:
+        新日志 id;失败返回 0(异常会向上传播,由调用方决定是否回滚)
+    """
+    now = _dt.datetime.now().isoformat()
+    cursor = await tx.execute(
+        """INSERT INTO audit_log
+           (actor_id, actor_type, action, target_type, target_id,
+            details, ip_addr, created_at)
+           VALUES (?, 'admin', ?, ?, ?, ?, ?, ?)""",
+        (actor_id, action, target_type, target_id,
+         json.dumps(details, ensure_ascii=False), ip_addr, now),
+    )
+    return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+
+
 # ─── R51 P1-1: 删除请求状态机 ─────────────────────────────
 
 
@@ -423,6 +458,63 @@ async def _transition_request_status(
     except Exception as e:
         logger.warning(f"[DataLifecycle] 状态迁移失败: {e}")
         return False
+
+
+async def _transition_request_status_in_tx(
+    tx, request_id: str, new_status: str,
+    step_receipts: dict | None = None,
+    current_step: str | None = None,
+    failure_reason: str = "",
+    failed_step: str = "",
+) -> None:
+    """R52 P1-3: 在指定事务连接内执行状态机迁移(原子性保障)。
+
+    与 ``_transition_request_status`` 的区别:
+        - 复用调用方的事务连接,不单独 commit
+        - 失败时抛异常(由调用方决定回滚),不再返回 False
+
+    Args:
+        tx: 事务连接(store.transaction() 返回的 tx)
+        request_id: 请求 id
+        new_status: 目标状态(processing/completed/failed)
+        step_receipts: 当前的 step receipts(全量更新)
+        current_step: 当前执行中的 step(仅 processing 时填)
+        failure_reason: 失败原因(仅 failed 时填)
+        failed_step: 失败的 step 名称(仅 failed 时填)
+
+    Raises:
+        Exception: 状态迁移失败(由调用方捕获并回滚事务)
+    """
+    now = _dt.datetime.now().isoformat()
+    sets = ["status = ?", "current_step = ?"]
+    params: list[Any] = [new_status, current_step]
+    if step_receipts is not None:
+        sets.append("step_receipts = ?")
+        params.append(json.dumps(step_receipts, ensure_ascii=False))
+    if new_status == DELETE_STATUS_PROCESSING:
+        sets.append("started_at = COALESCE(started_at, ?)")
+        params.append(now)
+    elif new_status == DELETE_STATUS_COMPLETED:
+        sets.append("completed_at = ?")
+        params.append(now)
+    elif new_status == DELETE_STATUS_FAILED:
+        sets.append("failed_at = ?")
+        params.append(now)
+        sets.append("failure_reason = ?")
+        params.append(failure_reason)
+        sets.append("failed_step = ?")
+        params.append(failed_step)
+    params.append(request_id)
+    await tx.execute(
+        f"UPDATE {_DELETION_REQUESTS_TABLE} SET "
+        + ", ".join(sets)
+        + " WHERE request_id = ?",
+        tuple(params),
+    )
+    logger.info(
+        f"[DataLifecycle] R52 P1-3: 状态迁移(in_tx) request_id={request_id} "
+        f"new_status={new_status}"
+    )
 
 
 async def _get_deletion_request(request_id: str) -> dict | None:
@@ -681,24 +773,61 @@ async def delete_user_data(user_id: int, admin_id: int = 0) -> bool:
             },
         ) from tx_err
 
-    # 全部成功 → 标记 completed
-    await _transition_request_status(
-        request_id, DELETE_STATUS_COMPLETED,
-        step_receipts=step_receipts,
-    )
-    # 写审计日志(独立事务)
-    await _write_audit_log(
-        admin_id, "delete_user_data", "user", str(user_id),
-        {
-            "request_id": request_id,
-            "step_receipts": step_receipts,
-        },
-        "",
-    )
-    logger.info(
-        f"[DataLifecycle] delete_user_data 完成 user={user_id} admin={admin_id} "
-        f"request_id={request_id} receipts={step_receipts}"
-    )
+    # R52 P1-3: 全部成功 → completed 状态迁移 + audit_log 在同一事务内(原子性)
+    # 原实现使用独立事务写 audit,若 audit 失败会出现"已删除但无审计"的不一致状态。
+    # 现在合并到同一 transaction: completed + audit + dirty_outbox 任一失败 → 整体回滚
+    try:
+        async with store.transaction() as tx:
+            # 1. 状态迁移 pending → completed(在 tx 内)
+            await _transition_request_status_in_tx(
+                tx, request_id, DELETE_STATUS_COMPLETED,
+                step_receipts=step_receipts,
+            )
+            # 2. 写审计日志(在 tx 内,与状态迁移原子提交)
+            await _write_audit_log_in_tx(
+                tx, admin_id, "delete_user_data", "user", str(user_id),
+                {
+                    "request_id": request_id,
+                    "step_receipts": step_receipts,
+                    "user_id": user_id,
+                    "admin_id": admin_id,
+                },
+                "",
+            )
+            # 3. 写 dirty_outbox(audit_log 同步到 CRDB)
+            await store.add_dirty_outbox(
+                "audit_log", "last",
+                operation="upsert", connection=tx,
+            )
+            # 4. 写 dirty_outbox(deletion_requests 同步到 CRDB)
+            await store.add_dirty_outbox(
+                _DELETION_REQUESTS_TABLE, request_id,
+                operation="upsert", connection=tx,
+            )
+        # 事务自动 COMMIT
+        logger.info(
+            f"[DataLifecycle] R52 P1-3: delete_user_data 完成(同事务原子审计) "
+            f"user={user_id} admin={admin_id} request_id={request_id}"
+        )
+    except Exception as audit_err:
+        # audit/completed 失败 → 整体事务回滚,数据未删除,标记 failed
+        logger.error(
+            f"[DataLifecycle] R52 P1-3: completed+audit 事务失败 "
+            f"user={user_id} request_id={request_id}: {audit_err}"
+        )
+        await _transition_request_status(
+            request_id, DELETE_STATUS_FAILED,
+            step_receipts=step_receipts,
+            failure_reason=f"audit_tx_failed: {audit_err}",
+            failed_step="audit_log",
+        )
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_DELETE_REQUEST_FAILED,
+            params={
+                "user_id": user_id, "request_id": request_id,
+                "reason": f"audit_tx_failed: {audit_err}",
+            },
+        ) from audit_err
     return True
 
 
@@ -769,8 +898,13 @@ async def get_retention(user_id: int) -> int:
         return DEFAULT_RETENTION_DAYS
 
 
-async def _verify_backup_marker() -> bool:
-    """R51 P1-1: 物理删除前验证 backup marker。
+async def _verify_backup_marker(
+    user_id: int | None = None,
+    *,
+    require_user_scope: bool = False,
+    require_checksum: bool = False,
+) -> bool:
+    """R51 P1-1 + R52 P1-3: 物理删除前验证 backup marker。
 
     调用 BackupEngine.get_last_successful_backup() 检查最近一次成功备份:
     - 返回非 None → 存在成功备份 → 允许物理删除
@@ -780,6 +914,18 @@ async def _verify_backup_marker() -> bool:
     - backup_history 为空(从未备份)
     - 最近成功备份 COMPLETE marker 在 R2 中丢失(RPO 不合规)
     - R2 storage 不可达
+
+    R52 P1-3 增强(绑定用户范围 + 时间 + checksum):
+        - require_user_scope=True: 备份记录必须含 user_id 字段且匹配
+          (防止"备份存在但被删用户不在备份范围内"的假阳性)
+        - require_checksum=True: 备份记录必须含 checksum 字段
+          (确保备份内容完整性可校验,防备份被篡改)
+        - 时间字段 completed_at 必须存在(已隐含在 get_last_successful_backup)
+
+    Args:
+        user_id: 被删除用户 ID(require_user_scope=True 时校验)
+        require_user_scope: 是否要求备份绑定用户范围(R52 P1-3)
+        require_checksum: 是否要求备份含 checksum(R52 P1-3)
 
     Returns:
         True 允许物理删除;False 拒绝
@@ -793,9 +939,46 @@ async def _verify_backup_marker() -> bool:
                 "[DataLifecycle] backup marker 验证失败: 无成功备份记录,拒绝物理删除"
             )
             return False
+        # R52 P1-3: completed_at 必须存在(时间绑定)
+        completed_at = latest.get("completed_at")
+        if not completed_at:
+            logger.warning(
+                f"[DataLifecycle] R52 P1-3: backup marker 缺少 completed_at,"
+                f"拒绝物理删除 backup_id={latest.get('backup_id')}"
+            )
+            return False
+        # R52 P1-3: 用户范围绑定
+        if require_user_scope:
+            backup_user_id = latest.get("user_id")
+            if backup_user_id is None:
+                logger.warning(
+                    f"[DataLifecycle] R52 P1-3: backup marker 缺少 user_id 字段,"
+                    f"拒绝物理删除(require_user_scope=True) "
+                    f"backup_id={latest.get('backup_id')}"
+                )
+                return False
+            if user_id is not None and int(backup_user_id) != int(user_id):
+                logger.warning(
+                    f"[DataLifecycle] R52 P1-3: backup marker user_id 不匹配,"
+                    f"拒绝物理删除 backup_user_id={backup_user_id} "
+                    f"target_user_id={user_id}"
+                )
+                return False
+        # R52 P1-3: checksum 完整性绑定
+        if require_checksum:
+            checksum = latest.get("checksum") or latest.get("sha256")
+            if not checksum:
+                logger.warning(
+                    f"[DataLifecycle] R52 P1-3: backup marker 缺少 checksum,"
+                    f"拒绝物理删除(require_checksum=True) "
+                    f"backup_id={latest.get('backup_id')}"
+                )
+                return False
         logger.info(
             f"[DataLifecycle] backup marker 验证通过 backup_id={latest.get('backup_id')} "
-            f"completed_at={latest.get('completed_at')}"
+            f"completed_at={completed_at} "
+            f"user_scope_checked={require_user_scope} "
+            f"checksum_checked={require_checksum}"
         )
         return True
     except Exception as e:

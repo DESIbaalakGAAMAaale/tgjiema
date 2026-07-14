@@ -951,6 +951,12 @@ async def close_redis():
 # 2. transaction-aware: 每条消息在独立事务中写入(BEGIN IMMEDIATE / COMMIT)
 # 3. WAL 模式支持并发写(producer 与 replayer 可能同时访问)
 # 4. 幂等: message_id 唯一约束,重放不会产生重复消息
+#
+# R52 P1-1 整改:
+# 5. request_hash 列: 同一 message_id 携带不同 payload 时不再静默忽略,
+#    改为读取旧 hash 比对: 相同 → 幂等成功;不同 → raise AppError
+# 6. lease 列(lease_owner / lease_until): replay 前抢占 lease,
+#    状态机 pending → publishing → replayed,崩溃后可回收 publishing lease
 
 _durable_conn: Any = None
 _durable_conn_lock = None
@@ -958,6 +964,36 @@ _DURABLE_DB_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data", "redis_outbox.db",
 )
+
+# R52 P1-1: lease 超时阈值(秒) — publishing 状态超过此时间视为崩溃残留,可被回收
+_DURABLE_LEASE_TIMEOUT_SECONDS = 60.0
+
+
+def _compute_request_hash(op_type: str, table: str, method_name: str,
+                          data: dict, redis_key: str = "") -> str:
+    """R52 P1-1: 计算 producer 请求的 payload hash(SHA256 hex 前 16 字符)。
+
+    用于检测同一 message_id 是否携带不同 payload(防篡改/防静默忽略)。
+
+    Args:
+        op_type: 操作类型
+        table: 目标表名
+        method_name: 调用的 cache_store 方法名
+        data: 方法参数字典
+        redis_key: 关联的 Redis 缓存 key
+
+    Returns:
+        SHA256 hex 字符串前 16 字符(短指纹,够用且节省存储)
+    """
+    import hashlib
+    canonical = json.dumps({
+        "op_type": op_type,
+        "table": table,
+        "method_name": method_name,
+        "data": data,
+        "redis_key": redis_key or "",
+    }, sort_keys=True, default=str, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def _get_durable_init_lock():
@@ -991,6 +1027,7 @@ async def _get_dedicated_connection() -> Any:
             await conn.execute("PRAGMA wal_autocheckpoint=1000")
             await conn.execute("PRAGMA synchronous=NORMAL")
             # R45 §13: durable_outbox 表 — 缓冲 Redis 不可达时的 producer 消息
+            # R52 P1-1: 新增 request_hash / lease_owner / lease_until 列
             await conn.execute(
                 "CREATE TABLE IF NOT EXISTS durable_outbox ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -1003,12 +1040,32 @@ async def _get_dedicated_connection() -> Any:
                 "attempts INTEGER DEFAULT 0, "
                 "created_at REAL NOT NULL, "
                 "replayed_at REAL, "
-                "status TEXT DEFAULT 'pending'"
+                "status TEXT DEFAULT 'pending', "
+                "request_hash TEXT, "
+                "lease_owner TEXT, "
+                "lease_until REAL"
                 ")"
             )
+            # R52 P1-1: 旧库幂等补列(已存在则忽略)
+            for col_def in (
+                ("request_hash", "TEXT"),
+                ("lease_owner", "TEXT"),
+                ("lease_until", "REAL"),
+            ):
+                try:
+                    await conn.execute(
+                        f"ALTER TABLE durable_outbox ADD COLUMN {col_def[0]} {col_def[1]}"
+                    )
+                except Exception:
+                    pass  # 列已存在
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_durable_outbox_status "
                 "ON durable_outbox(status) WHERE status = 'pending'"
+            )
+            # R52 P1-1: publishing 状态索引(lease 回收扫描用)
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_durable_outbox_publishing "
+                "ON durable_outbox(status, lease_until) WHERE status = 'publishing'"
             )
             await conn.commit()
             _durable_conn = conn
@@ -1039,6 +1096,13 @@ async def write_durable_outbox(
         原因:上层 push() 依赖此函数持久化消息,若返回 False 静默失败,
         会导致数据丢失(Redis 不可用 + outbox 不可用 = 消息消失)。
 
+    R52 P1-1 修复(request_hash 强校验):
+        原 INSERT OR IGNORE 在同 message_id 携带不同 payload 时静默忽略,
+        并返回 True(假装成功)。改造为:
+        1. 计算 request_hash(SHA256 短指纹)并写入
+        2. 唯一约束冲突时读取旧 hash;相同视为幂等成功,不同抛 AppError
+        3. 防止 payload 被静默替换/丢失
+
     Args:
         op_type: 操作类型(upsert/update/delete/insert)
         table: 目标 SQLite 表名
@@ -1049,11 +1113,13 @@ async def write_durable_outbox(
         attempts: 重试次数
 
     Returns:
-        True 写入成功
+        True 写入成功(或幂等命中)
 
     Raises:
         AppError: 写入失败(ErrorCodes.DB_CACHE_UNAVAILABLE),
             包含 cause 原始异常与 message_id 上下文
+        AppError: hash 不匹配(ErrorCodes.COMMAND_HASH_MISMATCH),
+            同 message_id 携带不同 payload(防篡改)
     """
     # R51 P0-4: 延迟导入 AppError 避免模块循环依赖
     from services.error_codes import AppError, ErrorCodes
@@ -1073,19 +1139,63 @@ async def write_durable_outbox(
                 "message_id": message_id,
             },
         )
+    # R52 P1-1: 计算请求 hash(防 payload 篡改)
+    new_request_hash = _compute_request_hash(
+        op_type, table, method_name, data, redis_key,
+    )
     try:
         data_json = json.dumps(data, default=str, ensure_ascii=False)
         # R45 §13: 独立事务写入(transaction-aware Command)
         await conn.execute("BEGIN IMMEDIATE")
         try:
-            await conn.execute(
-                "INSERT OR IGNORE INTO durable_outbox "
-                "(message_id, op_type, table_name, method_name, data_json, "
-                "redis_key, attempts, created_at, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
-                (message_id, op_type, table, method_name, data_json,
-                 redis_key, int(attempts) if attempts else 0, time.time()),
-            )
+            try:
+                await conn.execute(
+                    "INSERT INTO durable_outbox "
+                    "(message_id, op_type, table_name, method_name, data_json, "
+                    "redis_key, attempts, created_at, status, request_hash) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                    (message_id, op_type, table, method_name, data_json,
+                     redis_key, int(attempts) if attempts else 0, time.time(),
+                     new_request_hash),
+                )
+            except Exception as insert_err:
+                # R52 P1-1: 唯一约束冲突 → 读取旧 hash 比对
+                err_msg = str(insert_err).lower()
+                if "unique" not in err_msg and "constraint" not in err_msg:
+                    # 非唯一约束异常,正常向上抛
+                    raise
+                # 读取已存在记录的 request_hash
+                cur = await conn.execute(
+                    "SELECT request_hash FROM durable_outbox WHERE message_id = ?",
+                    (message_id,),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if not row:
+                    # 唯一约束冲突但查不到记录(理论上不应发生)→ 抛异常
+                    raise
+                old_hash = row[0]
+                if old_hash and old_hash != new_request_hash:
+                    # R52 P1-1: hash 不匹配 → payload 被篡改,抛 AppError
+                    logger.error(
+                        f"[RedisQueue] R52 P1-1: durable outbox hash 不匹配 "
+                        f"message_id={message_id} method={method_name} "
+                        f"old_hash={old_hash} new_hash={new_request_hash}"
+                    )
+                    raise AppError(
+                        ErrorCodes.COMMAND_HASH_MISMATCH,
+                        params={
+                            "message_id": message_id,
+                            "method": method_name,
+                            "expected_hash": old_hash,
+                            "actual_hash": new_request_hash,
+                        },
+                    )
+                # hash 相同 → 幂等成功,正常 COMMIT(无新数据写入)
+                logger.info(
+                    f"[RedisQueue] R52 P1-1: durable outbox 幂等命中 "
+                    f"message_id={message_id} hash={new_request_hash}"
+                )
             await conn.execute("COMMIT")
         except Exception:
             try:
@@ -1094,6 +1204,9 @@ async def write_durable_outbox(
                 pass
             raise
         return True
+    except AppError:
+        # R52 P1-1: hash 不匹配的 AppError 直接透传
+        raise
     except Exception as e:
         # R51 P0-4: durable outbox 写入失败 → 抛 AppError,不再返回 False
         logger.error(
@@ -1111,10 +1224,16 @@ async def write_durable_outbox(
 
 
 async def replay_durable_outbox(batch_size: int = 100) -> int:
-    """R45 §13: Redis 恢复后将 durable outbox 中 pending 消息重放到 Stream。
+    """R45 §13 + R52 P1-1: Redis 恢复后将 durable outbox 中 pending/publishing 消息重放到 Stream。
 
     由 db_writer 启动时或 mon_bot 检测到 Redis 恢复后调用。
     重放成功后标记为 'replayed',不删除(保留审计痕迹)。
+
+    R52 P1-1 改造(lease + hash 校验):
+        1. 重放前回收 publishing 状态超过 _DURABLE_LEASE_TIMEOUT_SECONDS 的崩溃残留
+        2. 抢占 lease: pending → publishing + lease_owner + lease_until
+        3. 重放前验证 payload hash(防篡改): 计算 hash 与 request_hash 比对
+        4. 成功 → publishing → replayed;失败 → 回滚到 pending(释放 lease)
 
     Args:
         batch_size: 单次重放的最大消息数
@@ -1131,10 +1250,20 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
         return 0
     try:
         from config import settings
-        # 拉取 pending 消息
+        now = time.time()
+        # R52 P1-1: 回收 publishing 状态的崩溃残留(lease 超时)
+        await conn.execute(
+            "UPDATE durable_outbox SET status = 'pending', "
+            "lease_owner = NULL, lease_until = NULL "
+            "WHERE status = 'publishing' AND lease_until IS NOT NULL "
+            "AND lease_until < ?",
+            (now,),
+        )
+        await conn.commit()
+        # 拉取 pending 消息(含 request_hash 列)
         cursor = await conn.execute(
             "SELECT id, message_id, op_type, table_name, method_name, "
-            "data_json, redis_key, attempts, created_at "
+            "data_json, redis_key, attempts, created_at, request_hash "
             "FROM durable_outbox WHERE status = 'pending' "
             "ORDER BY created_at ASC LIMIT ?",
             (batch_size,),
@@ -1144,15 +1273,46 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
         if not rows:
             return 0
         replayed = 0
+        lease_owner = f"replayer-{os.getpid()}"
+        lease_until = now + _DURABLE_LEASE_TIMEOUT_SECONDS
         for row in rows:
-            row_id, msg_id, op_type, table_name, method_name, \
-                data_json, redis_key, attempts, created_at = row
+            (row_id, msg_id, op_type, table_name, method_name,
+             data_json, redis_key, attempts, created_at,
+             stored_hash) = row
             try:
+                # R52 P1-1: 重放前验证 payload hash(防篡改)
+                # data_json 已是序列化字符串,反序列化后重新计算 hash
+                parsed_data = json.loads(data_json)
+                recomputed_hash = _compute_request_hash(
+                    op_type, table_name, method_name, parsed_data,
+                    redis_key or "",
+                )
+                if stored_hash and recomputed_hash != stored_hash:
+                    logger.error(
+                        f"[RedisQueue] R52 P1-1: replay hash 校验失败 "
+                        f"row_id={row_id} message_id={msg_id} "
+                        f"stored={stored_hash} recomputed={recomputed_hash} "
+                        f"— 跳过该消息(payload 可能被篡改)"
+                    )
+                    continue  # 跳过此消息,继续重放下一条
+                # R52 P1-1: 抢占 lease(pending → publishing)
+                cur = await conn.execute(
+                    "UPDATE durable_outbox SET status = 'publishing', "
+                    "lease_owner = ?, lease_until = ? "
+                    "WHERE id = ? AND status = 'pending'",
+                    (lease_owner, lease_until, row_id),
+                )
+                if cur.rowcount == 0:
+                    # 已被其他 replayer 抢占,跳过
+                    await cur.close()
+                    continue
+                await cur.close()
+                await conn.commit()
                 msg = {
                     "op_type": op_type,
                     "table": table_name,
                     "method_name": method_name,
-                    "data": json.loads(data_json),
+                    "data": parsed_data,
                     "redis_key": redis_key or "",
                     "message_id": msg_id,
                     "created_at": created_at,
@@ -1163,21 +1323,33 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
                     {"data": json.dumps(msg, default=str)},
                     id="*",
                 )
-                # 标记为已重放
+                # 标记为已重放 + 释放 lease
                 await conn.execute(
                     "UPDATE durable_outbox SET status = 'replayed', "
-                    "replayed_at = ? WHERE id = ?",
+                    "replayed_at = ?, lease_owner = NULL, lease_until = NULL "
+                    "WHERE id = ?",
                     (time.time(), row_id),
                 )
+                await conn.commit()
                 replayed += 1
             except Exception as e:
                 logger.warning(
                     f"[RedisQueue] R45 §13: replay 消息 id={row_id} 失败: {e}"
                 )
+                # R52 P1-1: 失败时回滚到 pending(释放 lease,允许下次重试)
+                try:
+                    await conn.execute(
+                        "UPDATE durable_outbox SET status = 'pending', "
+                        "lease_owner = NULL, lease_until = NULL "
+                        "WHERE id = ? AND status = 'publishing'",
+                        (row_id,),
+                    )
+                    await conn.commit()
+                except Exception:
+                    pass
                 # 单条失败不影响其他消息重放
                 continue
         if replayed > 0:
-            await conn.commit()
             logger.info(
                 f"[RedisQueue] R45 §13: durable outbox 重放 "
                 f"{replayed}/{len(rows)} 条消息到 Stream"

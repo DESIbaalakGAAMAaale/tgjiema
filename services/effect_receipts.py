@@ -228,6 +228,7 @@ class EffectReceiptManager:
         *,
         fail_closed: bool = False,
         expected_request_hash: str = "",
+        tx=None,  # R52 P0-4: 可选事务连接(aiosqlite.Connection),传入时不自行 commit
     ) -> Optional[dict]:
         """检查是否已有 receipt。
 
@@ -248,8 +249,13 @@ class EffectReceiptManager:
               - {"status": "completed", ...}: already done, skip side effect;
               - {"status": "hash_mismatch", ...}: payload mismatch, refuse retry,
                 enter reconciliation flow.
+
+        R52 P0-4: 若传入 tx,则使用 tx 执行 SQL 且不自行 commit(由外层事务管理);
+                  否则使用全局 store._db 并 commit(向后兼容)。
         """
-        if not self._store._db:
+        # R52 P0-4: 优先使用外层事务连接 tx,否则使用全局 store._db
+        db = tx if tx is not None else self._store._db
+        if db is None:
             if fail_closed:
                 raise EffectReceiptError(
                     f"effect_receipts DB 未初始化,无法检查 receipt "
@@ -257,7 +263,7 @@ class EffectReceiptManager:
                 )
             return None
         try:
-            cursor = await self._store._db.execute(
+            cursor = await db.execute(
                 "SELECT status, external_id, completed_at, attempt, reconcile_status, "
                 "request_hash "
                 "FROM effect_receipts "
@@ -282,7 +288,7 @@ class EffectReceiptManager:
                     # R50 P0-3: hash mismatch → 进入 reconciliation/DLQ
                     # 同步更新 reconcile_status 防止调用方重试外部副作用
                     try:
-                        await self._store._db.execute(
+                        await db.execute(
                             "UPDATE effect_receipts "
                             "SET reconcile_status='hash_mismatch_needs_reconcile', "
                             "last_error=? "
@@ -292,7 +298,9 @@ class EffectReceiptManager:
                              f"stored={stored_hash[:16]}...",
                              action_id, effect_type, target),
                         )
-                        await self._store._db.commit()
+                        # R52 P0-4: 仅在无外层事务时自行 commit
+                        if tx is None:
+                            await db.commit()
                     except Exception as up_err:
                         logger.error(
                             f"[effect_receipts] failed to mark hash_mismatch: {up_err}"
@@ -333,6 +341,7 @@ class EffectReceiptManager:
         lease_owner: str = "",
         lease_until: str = "",
         fail_closed: bool = False,
+        tx=None,  # R52 P0-4: 可选事务连接(aiosqlite.Connection),传入时不自行 commit
     ) -> bool:
         """记录开始执行 receipt(status=pending)。
 
@@ -343,6 +352,9 @@ class EffectReceiptManager:
         R48 P0-4: 应用层校验 — critical effect_type 的 request_hash 必须非空,
                    否则抛 ValueError(防止同 action_id 不同参数共用 receipt)。
 
+        R52 P0-4: 若传入 tx,则使用 tx 执行 SQL 且不自行 commit(由外层事务管理);
+                   否则使用全局 store._db 并 commit(向后兼容)。
+
         Returns True 表示 claim 成功,False 表示已有相同 payload completed(应跳过)。
         """
         # R48 P0-4: 应用层校验 critical effect 的 request_hash 必须非空
@@ -352,7 +364,9 @@ class EffectReceiptManager:
                 f"refuse to record pending (action_id={action_id})"
             )
 
-        if not self._store._db:
+        # R52 P0-4: 优先使用外层事务连接 tx,否则使用全局 store._db
+        db = tx if tx is not None else self._store._db
+        if db is None:
             if fail_closed:
                 raise EffectReceiptError(
                     f"effect_receipts DB 未初始化,无法记录 pending "
@@ -362,7 +376,7 @@ class EffectReceiptManager:
         now = datetime.datetime.utcnow().isoformat()
         try:
             # 先检查是否已 completed(同时取 request_hash 用于 R47 P0-4 对比)
-            cursor = await self._store._db.execute(
+            cursor = await db.execute(
                 "SELECT status, request_hash FROM effect_receipts "
                 "WHERE action_id = ? AND effect_type = ? AND target = ?",
                 (action_id, effect_type, target),
@@ -384,7 +398,7 @@ class EffectReceiptManager:
 
             # CAS claim: INSERT OR IGNORE,已存在则 attempt+1
             if existing:
-                await self._store._db.execute(
+                await db.execute(
                     "UPDATE effect_receipts SET status='pending', attempt=attempt+1, "
                     "lease_owner=?, lease_until=?, last_error=NULL, "
                     "reconcile_status='pending', created_at=?, request_hash=? "
@@ -393,7 +407,7 @@ class EffectReceiptManager:
                      action_id, effect_type, target),
                 )
             else:
-                await self._store._db.execute(
+                await db.execute(
                     "INSERT OR IGNORE INTO effect_receipts "
                     "(action_id, effect_type, target, status, external_id, "
                     " created_at, completed_at, request_hash, attempt, "
@@ -402,7 +416,9 @@ class EffectReceiptManager:
                     (action_id, effect_type, target, now, request_hash,
                      lease_owner, lease_until),
                 )
-            await self._store._db.commit()
+            # R52 P0-4: 仅在无外层事务时自行 commit(由外层 transaction 统一管理)
+            if tx is None:
+                await db.commit()
             return True
         except EffectReceiptError:
             raise

@@ -128,13 +128,24 @@ const MAX_BODY_BYTES = 1 * 1024 * 1024;
 // 注:CF Worker KV 默认 60 秒传播延迟,极端情况下仍可能重复(可接受)。
 //     如需强一致去重,应改用 Durable Object(本引导 bot 不需要)。
 const UPDATE_ID_KV_TTL_SECONDS = 86400; // 24 小时
+// R52 P1-8: processing 状态 TTL(较短,崩溃后可快速回收重试)
+const UPDATE_ID_PROCESSING_TTL_SECONDS = 300; // 5 分钟
 
 /**
- * 检查 update_id 是否已处理过(基于 KV)。
+ * R52 P1-8: 检查 update_id 是否已"completed"(基于 KV 两阶段去重)。
+ *
+ * 两阶段去重状态机:
+ *   未处理 → processing → completed
+ *   - processing: handler 正在执行(崩溃后 TTL 过期可重试)
+ *   - completed: handler 执行成功(跳过重复)
+ *
+ * 注意:仅 "completed" 状态视为已处理;"processing" 状态视为未完成(允许重试,
+ *   因为前一次执行可能已崩溃)。KV 最终一致性可能导致极端情况重复(可接受,
+ *   如需强一致应改用 Durable Object)。
  *
  * @param {number} updateId - Telegram update_id
  * @param {object} env - Worker env(含 UPDATE_ID_KV 绑定)
- * @returns {Promise<boolean>} true=已处理过(应跳过);false=未处理(继续)
+ * @returns {Promise<boolean>} true=已 completed(应跳过);false=未完成(继续)
  */
 async function isUpdateIdProcessed(updateId, env) {
   if (!env || !env.UPDATE_ID_KV) {
@@ -144,7 +155,8 @@ async function isUpdateIdProcessed(updateId, env) {
   try {
     const key = `tg_update:${updateId}`;
     const existing = await env.UPDATE_ID_KV.get(key);
-    return existing !== null;
+    // R52 P1-8: 仅 "completed" 状态视为已处理
+    return existing === "completed";
   } catch (e) {
     // KV 读失败:不阻塞流程,按"未处理"继续(可能重复,可接受)
     console.warn(`[FileBot] KV get update_id failed: ${e?.message || "unknown"}`);
@@ -153,20 +165,66 @@ async function isUpdateIdProcessed(updateId, env) {
 }
 
 /**
- * 标记 update_id 为已处理(写入 KV)。
+ * R52 P1-8: 标记 update_id 为 "processing"(handler 执行前)。
+ *
+ * processing 状态使用较短 TTL(5 分钟),崩溃后自动过期允许重试。
  *
  * @param {number} updateId - Telegram update_id
  * @param {object} env - Worker env
  * @returns {Promise<void>}
  */
-async function markUpdateIdProcessed(updateId, env) {
+async function markUpdateIdProcessing(updateId, env) {
   if (!env || !env.UPDATE_ID_KV) return;
   try {
     const key = `tg_update:${updateId}`;
-    await env.UPDATE_ID_KV.put(key, "1", { expirationTtl: UPDATE_ID_KV_TTL_SECONDS });
+    await env.UPDATE_ID_KV.put(key, "processing", {
+      expirationTtl: UPDATE_ID_PROCESSING_TTL_SECONDS,
+    });
   } catch (e) {
     // KV 写失败:仅日志,不阻塞(下次可能重复处理,可接受)
-    console.warn(`[FileBot] KV put update_id failed: ${e?.message || "unknown"}`);
+    console.warn(`[FileBot] KV put update_id (processing) failed: ${e?.message || "unknown"}`);
+  }
+}
+
+/**
+ * R52 P1-8: 标记 update_id 为 "completed"(handler 执行成功后)。
+ *
+ * completed 状态使用较长 TTL(24 小时),防止 Telegram 重发同一 update_id。
+ *
+ * @param {number} updateId - Telegram update_id
+ * @param {object} env - Worker env
+ * @returns {Promise<void>}
+ */
+async function markUpdateIdCompleted(updateId, env) {
+  if (!env || !env.UPDATE_ID_KV) return;
+  try {
+    const key = `tg_update:${updateId}`;
+    await env.UPDATE_ID_KV.put(key, "completed", {
+      expirationTtl: UPDATE_ID_KV_TTL_SECONDS,
+    });
+  } catch (e) {
+    // KV 写失败:仅日志,不阻塞(下次可能重复处理,可接受)
+    console.warn(`[FileBot] KV put update_id (completed) failed: ${e?.message || "unknown"}`);
+  }
+}
+
+/**
+ * R52 P1-8: 清除 update_id 的 processing 标记(handler 失败后)。
+ *
+ * handler 失败时删除 processing 标记,允许后续重试。
+ *
+ * @param {number} updateId - Telegram update_id
+ * @param {object} env - Worker env
+ * @returns {Promise<void>}
+ */
+async function clearUpdateIdProcessing(updateId, env) {
+  if (!env || !env.UPDATE_ID_KV) return;
+  try {
+    const key = `tg_update:${updateId}`;
+    await env.UPDATE_ID_KV.delete(key);
+  } catch (e) {
+    // KV 删除失败:仅日志,不阻塞(processing TTL 会自动过期)
+    console.warn(`[FileBot] KV delete update_id (processing) failed: ${e?.message || "unknown"}`);
   }
 }
 
@@ -409,17 +467,31 @@ export default {
       return new Response("Bad Request", { status: 400 });
     }
 
-    // R51 P1-8: update_id 持久去重(若绑定 UPDATE_ID_KV)
+    // R51 P1-8 + R52 P1-8: update_id 两阶段持久去重(processing → completed)
+    // R52 P1-8 改造:先标记 processing → 执行 handler → 成功标 completed / 失败删 processing
+    //   避免"先标记 completed 再执行 handler"导致 handler 失败时永久丢失
+    // R52 P1-8: production 环境必须配置 UPDATE_ID_KV(否则无法持久去重,
+    //   Telegram 重发同一 update_id 时会重复执行 handler)
+    if (!env || !env.UPDATE_ID_KV) {
+      console.error(
+        "[FileBot] R52 P1-8: UPDATE_ID_KV 未配置,production 环境必须配置" +
+          "两阶段去重 KV(当前请求将无持久去重,可能重复处理)"
+      );
+    }
+    let _dedup_update_id = null;
     if (body.update_id !== undefined) {
       const processed = await isUpdateIdProcessed(body.update_id, env);
       if (processed) {
-        // 已处理过,返回 OK 不再触发 handler
+        // 已 completed,返回 OK 不再触发 handler
         return new Response("OK");
       }
-      await markUpdateIdProcessed(body.update_id, env);
+      // R52 P1-8: 标记 processing(handler 执行前)
+      await markUpdateIdProcessing(body.update_id, env);
+      _dedup_update_id = body.update_id;
     }
 
     // 处理消息(仅处理 message 类型,其他类型忽略)
+    let _handler_succeeded = true;
     if (body.message) {
       try {
         await handleMessage(
@@ -432,7 +504,20 @@ export default {
         );
       } catch (e) {
         // R51 P1-8: catch 块添加日志(仅 error.message,不含敏感信息)
+        // R52 P1-8: handler 失败 → 标记未成功,稍后清除 processing 标记
+        _handler_succeeded = false;
         console.warn(`[FileBot] top-level handler error: ${e?.message || "unknown"}`);
+      }
+    }
+
+    // R52 P1-8: 两阶段去重收尾
+    if (_dedup_update_id !== null) {
+      if (_handler_succeeded) {
+        // handler 成功 → 标记 completed(后续重发将跳过)
+        await markUpdateIdCompleted(_dedup_update_id, env);
+      } else {
+        // handler 失败 → 删除 processing 标记(允许后续重试)
+        await clearUpdateIdProcessing(_dedup_update_id, env);
       }
     }
     return new Response("OK");

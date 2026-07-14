@@ -885,32 +885,33 @@ async def process_appeal(
                 f"appeal_id={appeal_id} action_id={action_id}"
             )
 
-        # R51 P0-6: 记录 pending effect receipt(critical effect fail-closed)
-        # restore 是 critical effect_type,record_pending 会校验 request_hash 非空
-        receipt_mgr = get_receipt_manager(store)
-        if receipt_mgr is not None:
-            try:
-                await receipt_mgr.record_pending(
-                    action_id=action_id,
-                    effect_type="restore",
-                    target=f"{target_type}:{target_id}",
-                    request_hash=request_hash,
-                    fail_closed=True,
-                )
-                logger.info(
-                    f"[ContentReports] process_appeal effect receipt pending "
-                    f"action_id={action_id} target={target_type}:{target_id}"
-                )
-            except Exception as receipt_err:
-                # critical effect receipt 失败 → 不能让 command_outbox 处于
-                # pending 但无 receipt 的状态。记录 error 但不降级 —
-                # ApprovalExecutor 执行时会再次检查 receipt。
-                logger.error(
-                    f"[ContentReports] process_appeal record_pending 失败 "
-                    f"(critical effect,不降级): {receipt_err}"
-                )
-                # 抛出异常,让上层捕获处理(不降级直接恢复)
-                raise
+            # R52 P0-4: 记录 pending effect receipt(critical effect fail-closed)
+            # 必须在事务内写入:command_outbox + audit + dirty_outbox + effect_receipt
+            # 同事务原子提交,任一步骤失败整体回滚,审批状态保持 restore_pending。
+            # restore 是 critical effect_type,record_pending 会校验 request_hash 非空。
+            receipt_mgr = get_receipt_manager(store)
+            if receipt_mgr is not None:
+                try:
+                    await receipt_mgr.record_pending(
+                        action_id=action_id,
+                        effect_type="restore",
+                        target=f"{target_type}:{target_id}",
+                        request_hash=request_hash,
+                        fail_closed=True,
+                        tx=tx,  # R52 P0-4: 使用外层事务,不自行 commit
+                    )
+                    logger.info(
+                        f"[ContentReports] process_appeal effect receipt pending "
+                        f"action_id={action_id} target={target_type}:{target_id}"
+                    )
+                except Exception as receipt_err:
+                    # critical effect receipt 失败 → 抛出异常让外层 transaction 回滚,
+                    # command_outbox + audit + dirty 全部回滚,不降级直接恢复。
+                    logger.error(
+                        f"[ContentReports] process_appeal record_pending 失败 "
+                        f"(critical effect,不降级,事务回滚): {receipt_err}"
+                    )
+                    raise
 
         logger.info(
             f"[ContentReports] process_appeal second_approval id={appeal_id} "

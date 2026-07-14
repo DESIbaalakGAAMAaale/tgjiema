@@ -126,9 +126,13 @@ async def _insert_file_record(store, file_code: str, uploader_id: int = 0,
     await store._db.commit()
 
 
-async def _insert_command_execution(store, action_id: str, status: str = "executed",
+async def _insert_command_execution(store, action_id: str, status: str = "approved",
                                      request_hash: str = "test_hash"):
-    """插入 command_executions 记录。"""
+    """插入 command_executions 记录。
+
+    R52 P0-5: 状态机统一为 pending → approved → executing → executed/failed,
+    审批通过后执行前的状态为 'approved'(旧版 'executed' 语义冲突已废弃)。
+    """
     now = datetime.now().isoformat()
     await store._db.execute(
         """INSERT INTO command_executions
@@ -365,15 +369,18 @@ class TestCollectionsOptimisticLock:
 
     @pytest.mark.asyncio
     async def test_update_collection_without_expected_version(self, store):
-        """R51 P1-3: 不传 expected_version 必须显式 bypass_cas=True 才能更新。"""
+        """R51 P1-3 + R52 P1-5: 不传 expected_version 必须显式 bypass_cas=True + approval_action_id 才能更新。"""
         from services import collections
         coll = await collections.create_collection("兼容模式", owner_id=5003)
         coll_id = coll["id"]
+        # R52 P1-5: bypass_cas=True 必须提供 approval_action_id(审计要求)
         # 显式 bypass_cas=True(运维/迁移场景)→ 跳过 CAS,直接更新
         result = await collections.update_collection(
             collection_id=coll_id, description="新描述",
             expected_version=None,
             bypass_cas=True,
+            approval_action_id="approval_bypass_001",
+            caller="test_migration",
         )
         assert result["success"] is True
         assert result["conflict"] is False
@@ -886,12 +893,13 @@ class TestRepairConsoleSafeActions:
         ids = [r[0] for r in rows if r]
         assert len(ids) >= 1
         # R51 P1-5: skip_outbox 是 HIGH 风险动作,必须提供有效 approval_action_id
+        # R52 P0-5: 审批状态必须为 'approved'(非 'executed')
         params = {"ids": ids, "reason": "测试跳过"}
         expected_hash = repair_console.compute_repair_request_hash(
             "skip_outbox", params,
         )
         await _insert_command_execution(
-            store, action_id="approval_skip_001", status="executed",
+            store, action_id="approval_skip_001", status="approved",
             request_hash=expected_hash,
         )
         result = await repair_console.execute_repair(
@@ -923,12 +931,13 @@ class TestRepairConsoleSafeActions:
         )
         ids = [r[0] for r in rows if r]
         # R51 P1-5: 计算与 execute_repair 内部一致的 request_hash
+        # R52 P0-5: 审批状态必须为 'approved'(非 'executed')
         params = {"ids": ids}
         expected_hash = repair_console.compute_repair_request_hash(
             "retry_outbox", params,
         )
         await _insert_command_execution(
-            store, action_id="approval_001", status="executed",
+            store, action_id="approval_001", status="approved",
             request_hash=expected_hash,
         )
         result = await repair_console.execute_repair(

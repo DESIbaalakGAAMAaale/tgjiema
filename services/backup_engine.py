@@ -958,12 +958,66 @@ class BackupEngine:
                 expected_request_hash=expected_request_hash,
             )
 
+            # R52 P0-5: CAS approved → executing(防并发执行同一审批)
+            # 统一状态机: pending → approved → executing → executed/failed
+            # 失败时表示已被其他 worker 抢占,或状态已从 approved 流转
+            from services.command_bus import claim_execution_approved
+            import socket as _socket
+            import os as _os
+            _owner = f"{_socket.gethostname()}:{_os.getpid()}"
+            try:
+                claimed = await claim_execution_approved(
+                    action_id=approval_action_id,
+                    owner=_owner,
+                    request_hash=expected_request_hash,
+                )
+            except Exception as cas_err:
+                logger.error(
+                    f"[BackupEngine] R52 P0-5 CAS approved→executing 异常 "
+                    f"approval_action_id={approval_action_id}: {cas_err}"
+                )
+                raise AppError(
+                    ErrorCodes.COMMAND_STATUS_CONFLICT,
+                    params={
+                        "action_id": approval_action_id,
+                        "reason": f"cas_exception: {cas_err}",
+                    },
+                )
+            if not claimed:
+                logger.error(
+                    f"[BackupEngine] R52 P0-5 CAS 失败(已被抢占或状态非 approved) "
+                    f"approval_action_id={approval_action_id} "
+                    f"principal={effective_approver_id}"
+                )
+                raise AppError(
+                    ErrorCodes.COMMAND_STATUS_CONFLICT,
+                    params={
+                        "action_id": approval_action_id,
+                        "reason": "cas_approved_to_executing_failed",
+                    },
+                )
+
         # R42 P1-2: 校验 COMPLETE marker 存在才执行恢复
         storage = self._get_storage()
         complete_key = f"{BACKUPS_PREFIX}{backup_id}{COMPLETE_SUFFIX}"
         try:
             await storage.download(complete_key)
         except Exception as e:
+            # R52 P0-5: COMPLETE marker 校验失败时回写状态机 executing → failed
+            # (仅在 production 模式下,且已通过 CAS)
+            if target == "production" and approval_action_id:
+                try:
+                    from services.command_bus import mark_approved_failed
+                    await mark_approved_failed(
+                        action_id=approval_action_id,
+                        error=f"COMPLETE marker missing: {e}",
+                        retryable=False,
+                    )
+                except Exception as mark_err:
+                    logger.error(
+                        f"[BackupEngine] mark_approved_failed 失败 "
+                        f"approval_action_id={approval_action_id}: {mark_err}"
+                    )
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
@@ -975,11 +1029,52 @@ class BackupEngine:
         # 通过审批验证 + COMPLETE 校验后,调用内部恢复方法
         # R44 G0-3: approver_id 可能为 None(staging 模式或反查 principal 路径),
         # _restore_internal 不依赖 approver_id 字段执行恢复
-        return await self._restore_internal(
-            backup_id, target=target,
-            approver_id=effective_approver_id if target == "production" else approver_id,
-            approval_action_id=approval_action_id,
-        )
+        # R52 P0-5: 失败时(异常或返回 success=False)回写状态机 executing → failed
+        try:
+            result = await self._restore_internal(
+                backup_id, target=target,
+                approver_id=effective_approver_id if target == "production" else approver_id,
+                approval_action_id=approval_action_id,
+            )
+        except Exception as restore_err:
+            # R52 P0-5: 恢复失败时回写状态机 executing → failed
+            if target == "production" and approval_action_id:
+                try:
+                    from services.command_bus import mark_approved_failed
+                    await mark_approved_failed(
+                        action_id=approval_action_id,
+                        error=f"restore failed: {restore_err}",
+                        retryable=False,
+                    )
+                except Exception as mark_err:
+                    logger.error(
+                        f"[BackupEngine] mark_approved_failed 失败 "
+                        f"approval_action_id={approval_action_id}: {mark_err}"
+                    )
+            raise
+
+        # R52 P0-5: _restore_internal 返回 success=False 时回写状态机 executing → failed
+        # (非异常的失败路径,如 manifest 校验失败、checksum 不匹配等)
+        if (
+            target == "production"
+            and approval_action_id
+            and isinstance(result, dict)
+            and not result.get("success", True)
+        ):
+            try:
+                from services.command_bus import mark_approved_failed
+                await mark_approved_failed(
+                    action_id=approval_action_id,
+                    error=f"restore failed: {result.get('error', 'unknown')}",
+                    retryable=False,
+                )
+            except Exception as mark_err:
+                logger.error(
+                    f"[BackupEngine] mark_approved_failed 失败 "
+                    f"approval_action_id={approval_action_id}: {mark_err}"
+                )
+
+        return result
 
     async def _lookup_principal_id(self, approval_action_id: str) -> int:
         """R44 G0-3: 通过 approval_action_id 反查 command_executions.principal_id。
@@ -1389,26 +1484,29 @@ class BackupEngine:
         except Exception:
             pass  # 不影响 restore 主流程
 
-        # R51 P0-8: 恢复成功后将 command_executions.status 从 'approved' 更新为 'executed'
+        # R51 P0-8 + R52 P0-5: 恢复成功后将 command_executions.status 从 'executing' 更新为 'executed'
+        # R52 P0-5: 统一状态机使用 mark_approved_executed 辅助函数(CAS: executing → executed)
         # 确保恢复完成后审批状态标记为已执行,防止重复执行(RESTORE_ALREADY_EXECUTED)
         if approval_action_id and target == "production":
             try:
-                store = self._get_cache_store()
-                if hasattr(store, "_db") and store._db:
-                    await store._db.execute(
-                        "UPDATE command_executions SET status = 'executed', "
-                        "updated_at = ? WHERE action_id = ? AND status = 'approved'",
-                        (_utcnow_iso(), approval_action_id),
-                    )
-                    await store._db.commit()
-                    logger.info(
-                        f"[BackupEngine] R51 P0-8: command_executions.status "
-                        f"approved→executed (approval_action_id={approval_action_id})"
-                    )
+                from services.command_bus import mark_approved_executed
+                await mark_approved_executed(
+                    action_id=approval_action_id,
+                    result={
+                        "success": True,
+                        "restored_tables": restored_tables,
+                        "restored_rows": restored_rows,
+                        "backup_id": backup_id,
+                    },
+                )
+                logger.info(
+                    f"[BackupEngine] R52 P0-5: command_executions.status "
+                    f"executing→executed (approval_action_id={approval_action_id})"
+                )
             except Exception as e:
                 # 状态更新失败不影响恢复结果(数据已恢复),但记录警告
                 logger.warning(
-                    f"[BackupEngine] R51 P0-8: 更新 command_executions.status 失败 "
+                    f"[BackupEngine] R52 P0-5: 更新 command_executions.status 失败 "
                     f"(approval_action_id={approval_action_id}): {e}"
                 )
 

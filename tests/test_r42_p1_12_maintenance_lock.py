@@ -118,11 +118,15 @@ def _reset_command_bus_idempotency():
 async def _insert_command_execution(
     store,
     action_id: str,
-    status: str = "executed",
+    status: str = "approved",
     request_hash: str = "test_hash_001",
     result_json: str = '{"success": true}',
 ):
-    """直接插入一条 command_executions 记录(模拟 CommandBus 审批结果)。"""
+    """直接插入一条 command_executions 记录(模拟 CommandBus 审批结果)。
+
+    R52 P0-5: 状态机统一为 pending → approved → executing → executed/failed,
+    审批通过后执行前的状态为 'approved'(旧版 'executed' 语义冲突已废弃)。
+    """
     import datetime as _dt
     now = _dt.datetime.now().isoformat()
     await store._db.execute(
@@ -303,10 +307,11 @@ class TestDisableRejectsWhenRecoverPending:
         await real_store._db.execute("UPDATE dirty_outbox SET processed = 1")
         await real_store._db.commit()
 
-        # 插入一条 command_executions 记录(status='executed')
+        # 插入一条 command_executions 记录(status='approved')
+        # R52 P0-5: 审批通过待执行的状态为 'approved'(非 'executed')
         approval_action_id = "recover_action_001"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
         )
 
         # 调用 disable(带 approval_action_id + request_hash)应成功
@@ -349,9 +354,10 @@ class TestDisableRejectsWhenRecoverPending:
                 request_hash=_TEST_REQUEST_HASH,
             )
 
-        assert "executed" in str(exc_info.value).lower() or \
+        assert "not approved" in str(exc_info.value).lower() or \
+               "executed" in str(exc_info.value).lower() or \
                "状态非" in str(exc_info.value), \
-            f"异常消息应提示状态非 executed,实际: {exc_info.value}"
+            f"异常消息应提示状态非 approved,实际: {exc_info.value}"
 
         # 未关闭
         assert await maintenance_mode.is_enabled() is True
@@ -434,9 +440,10 @@ class TestRecoverMaintenanceValidation:
                 request_hash=_TEST_REQUEST_HASH,
             )
 
-        assert "executed" in str(exc_info.value).lower() or \
+        assert "not approved" in str(exc_info.value).lower() or \
+               "executed" in str(exc_info.value).lower() or \
                "状态非" in str(exc_info.value), \
-            f"异常应提示状态非 executed,实际: {exc_info.value}"
+            f"异常应提示状态非 approved,实际: {exc_info.value}"
 
     @pytest.mark.asyncio
     async def test_recover_maintenance_approval_not_exists_raises(
@@ -470,10 +477,11 @@ class TestRecoverMaintenanceValidation:
         await maintenance_mode.enable("测试无权限 recover", started_by=100)
         await _set_recover_status(real_store, "pending")
 
-        # 插入 status='executed' 的 approval(满足前置条件)
+        # 插入 status='approved' 的 approval(满足前置条件)
+        # R52 P0-5: 审批通过待执行的状态为 'approved'(非 'executed')
         approval_action_id = "recover_action_004"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
         )
 
         # Mock check_permission 返回 False(无权限)
@@ -524,7 +532,7 @@ class TestRecoverMaintenanceSuccess:
 
         approval_action_id = "recover_action_success_001"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
         )
 
         # Mock check_permission 返回 True
@@ -560,7 +568,7 @@ class TestRecoverMaintenanceSuccess:
 
         approval_action_id = "recover_action_audit_001"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
         )
 
         with patch(
@@ -602,7 +610,7 @@ class TestRecoverMaintenanceSuccess:
 
         approval_action_id = "recover_action_reset_001"
         await _insert_command_execution(
-            real_store, approval_action_id, status="executed",
+            real_store, approval_action_id, status="approved",
         )
 
         with patch(

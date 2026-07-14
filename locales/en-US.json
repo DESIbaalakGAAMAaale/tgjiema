@@ -139,7 +139,15 @@
     "task.center.list_db_error": "Task list query DB error, returning error envelope (no empty list masquerading as no tasks, scope={scope}, trace_id={trace_id})",
     "repair.console.approval_required": "High-risk repair action requires approval (approval_action_id is mandatory, action={action}, principal_id={principal_id}, trace_id={trace_id})",
     "repair.console.approval_hash_mismatch": "Approval hash/owner verification failed (must verify request_hash + principal_id, not only status, approval_action_id={approval_action_id}, expected_hash={expected_hash}, actual_hash={actual_hash}, trace_id={trace_id})",
-    "repair.console.approval_principal_mismatch": "Approval principal mismatch (approval_action_id bound principal differs from current principal, approval_action_id={approval_action_id}, expected_principal={expected_principal}, actual_principal={actual_principal}, trace_id={trace_id})"
+    "repair.console.approval_principal_mismatch": "Approval principal mismatch (approval_action_id bound principal differs from current principal, approval_action_id={approval_action_id}, expected_principal={expected_principal}, actual_principal={actual_principal}, trace_id={trace_id})",
+    "command.status.conflict": "Command status conflict (CAS missed or principal mismatch, action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, stored_principal_id={stored_principal_id}, expected_principal_id={expected_principal_id}, trace_id={trace_id})",
+    "command.status.not_approved": "Command not approved, execution rejected (must approve first to transition status to approved, action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, trace_id={trace_id})",
+    "entitlement.set_plan.cas_conflict": "Set user plan CAS version conflict (concurrent modification, please retry, user_id={user_id}, plan_name={plan_name}, expected_version={expected_version}, current_version={current_version}, trace_id={trace_id})",
+    "entitlement.plan.requires_command_bus": "Plan change must go through CommandBus (direct set_user_plan for production changes is forbidden, user_id={user_id}, plan_name={plan_name}, caller={caller}, trace_id={trace_id})",
+    "maintenance.disable.recover_query_failed": "Maintenance disable recover_status query failed, fail-closed (refused to degrade to completed, reason={reason}, trace_id={trace_id})",
+    "maintenance.recover.persist_critical": "recover_status persistence failed, critical alert triggered and fail-closed (reason={reason}, trace_id={trace_id})",
+    "metrics.collector.output_invalid": "Metrics collector emitted 0 value with error label on failure (should emit nothing or NaN, collector={collector}, reason={reason}, trace_id={trace_id})",
+    "cf.worker.update_id_kv_unconfigured": "UPDATE_ID_KV not configured, production environment must configure two-phase dedup KV (environment={environment}, trace_id={trace_id})"
   },
   "ui": {
     "admin_login_title": "Admin Login",

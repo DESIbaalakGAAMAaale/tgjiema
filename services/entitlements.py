@@ -142,6 +142,11 @@ async def get_quota(user_id: int) -> Quota:
       改为 raise AppError(ENTITLEMENT_QUOTA_QUERY_FAILED)
     - 防止 DB 异常时被误判为"今日未消耗"导致超额放行
 
+    R52 P1-4 改造:
+    - 提供 transaction-aware 版本 get_quota(tx=...)(见 get_user_quota)
+    - 本函数保持无 tx 调用兼容(内部使用 store._db 直读)
+    - 在外层 transaction 内调用本函数不会触发额外 commit
+
     Args:
         user_id: Telegram 用户 ID
 
@@ -166,7 +171,11 @@ async def get_quota(user_id: int) -> Quota:
                 "ELSE 0 END), 0) "
                 "FROM quota_reservations "
                 "WHERE user_id = ? AND status != 'refunded' "
-                "AND date(created_at) = date('now')",
+                # created_at 由 datetime.now() 写入(本地时区),
+                # 查询须用 date('now', 'localtime') 取本地日期匹配,
+                # 否则 UTC+8 00:00-08:00 时段本地日期与 UTC 日期错位,
+                # 导致 used_today=0 误判(超额放行)。
+                "AND date(created_at) = date('now', 'localtime')",
                 (user_id,),
             )
             if rows:
@@ -211,6 +220,93 @@ async def get_quota(user_id: int) -> Quota:
         external_limit=external_limit,
         external_used=external_used,
     )
+
+
+async def get_user_quota(
+    user_id: int, *, tx=None,
+) -> dict | None:
+    """R52 P1-4: 读取用户配额(transaction-aware 版本)。
+
+    与 store.get_user_quota() 的区别:
+        - 显式接受可选的 tx 参数,在外层 transaction 内调用时
+          复用 tx 的连接(不会触发额外 commit,避免破坏事务边界)
+        - tx=None 时退化为 store.get_user_quota()(向后兼容)
+
+    Args:
+        user_id: 用户 ID
+        tx: 可选的事务连接(store.transaction() 返回的 tx)
+
+    Returns:
+        用户配额 dict;未找到返回 None
+    """
+    store = get_cache_store()
+    if tx is not None:
+        # R52 P1-4: 复用外层事务连接(不触发额外 commit)
+        try:
+            cur = await tx.execute(
+                "SELECT user_id, level, daily_quota, used_today, quota_date, "
+                "ext_quota, ext_used_today, ext_quota_date, synced_at "
+                "FROM user_quota WHERE user_id = ?",
+                (user_id,),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            if not rows:
+                return None
+            r = rows[0]
+            return {
+                "user_id": r[0],
+                "level": r[1],
+                "daily_quota": r[2],
+                "used_today": r[3],
+                "quota_date": r[4],
+                "ext_quota": r[5],
+                "ext_used_today": r[6],
+                "ext_quota_date": r[7],
+                "synced_at": r[8],
+            }
+        except Exception as e:
+            logger.warning(
+                f"[Entitlements] R52 P1-4: get_user_quota(tx) 查询失败 "
+                f"user_id={user_id}: {e}"
+            )
+            return None
+    # tx=None → 退化为 store.get_user_quota()
+    return await store.get_user_quota(user_id)
+
+
+async def get_user_version(user_id: int, *, tx=None) -> int:
+    """R52 P1-4: 读取用户记录的 version 字段(用于 CAS 并发套餐修改)。
+
+    users_local 表含 version 列(乐观锁),并发 set_user_plan 时通过
+    expected_version 进行 CAS 防止 lost update。
+
+    Args:
+        user_id: 用户 ID
+        tx: 可选的事务连接
+
+    Returns:
+        当前 version;用户不存在或表无 version 列时返回 0
+    """
+    store = get_cache_store()
+    conn = tx if tx is not None else store._db
+    if conn is None:
+        return 0
+    try:
+        cur = await conn.execute(
+            "SELECT version FROM users_local WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row and row[0] is not None else 0
+    except Exception as e:
+        # version 列可能不存在(老库)→ 退化为 0(无 CAS)
+        logger.debug(
+            f"[Entitlements] R52 P1-4: get_user_version 失败 "
+            f"user_id={user_id}: {e}"
+        )
+        return 0
 
 
 async def get_limits(user_id: int) -> Limits:
@@ -364,7 +460,15 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
     )
 
 
-async def set_user_plan(user_id: int, plan_name: str, admin_id: int = 0) -> bool:
+async def set_user_plan(
+    user_id: int,
+    plan_name: str,
+    admin_id: int = 0,
+    *,
+    expected_version: int | None = None,
+    request_hash: str = "",
+    via_command_bus: bool = False,
+) -> bool:
     """设置用户套餐(管理员操作)。
 
     更新 users_local.membership_level 和 user_quota 表的配额上限,
@@ -376,16 +480,27 @@ async def set_user_plan(user_id: int, plan_name: str, admin_id: int = 0) -> bool
     - 失败时 raise AppError(ENTITLEMENT_SET_PLAN_TX_FAILED)(不再返回 False 静默)
     - 保持 API 签名兼容(只新增异常,不破坏现有调用)
 
+    R52 P1-4 改造:
+    - 支持 CAS 并发套餐修改(expected_version 提供且 > 0 时启用乐观锁)
+    - 审计日志包含 old_plan / new_plan / request_hash(短指纹前 16 字符)
+    - 生产环境套餐变更应通过 set_user_plan_via_command_bus(via_command_bus=True
+      表示调用方已通过 CommandBus 审批;False 时仍允许调用以保持向后兼容,
+      但生产入口建议改用 CommandBus 路径)
+
     Args:
         user_id: 目标用户 ID
         plan_name: 套餐名(free/basic/premium)
         admin_id: 操作管理员 ID
+        expected_version: 可选,CAS 期望版本号(并发套餐修改乐观锁)
+        request_hash: 可选,请求指纹(记录到 audit_log,前 16 字符短指纹)
+        via_command_bus: 是否经 CommandBus 审批入口调用(True=已审批)
 
     Returns:
         True 表示成功
 
     Raises:
         AppError(ENTITLEMENT_SET_PLAN_TX_FAILED): 事务失败
+        AppError(ENTITLEMENT_SET_PLAN_CAS_CONFLICT): CAS 版本冲突
     """
     if plan_name not in _PLANS:
         logger.warning(f"[Entitlements] set_user_plan 无效套餐名: {plan_name}")
@@ -410,15 +525,62 @@ async def set_user_plan(user_id: int, plan_name: str, admin_id: int = 0) -> bool
             },
         )
 
+    # R52 P1-4: 短指纹(前 16 字符)用于审计日志,避免完整 hash 泄露
+    short_hash = (request_hash or "")[:16]
+
     # R51 P1-2: 单一事务包裹所有写入(users_local + user_quota + audit_log + dirty_outbox)
     try:
         async with store.transaction() as tx:
-            # 1. 更新 users_local.membership_level(同事务)
-            await tx.execute(
-                "UPDATE users_local SET membership_level = ?, updated_at = ? "
-                "WHERE user_id = ?",
-                (plan_name, now, user_id),
-            )
+            # R52 P1-4: 读取旧套餐(用于审计日志)
+            old_plan = ""
+            try:
+                cur = await tx.execute(
+                    "SELECT membership_level FROM users_local WHERE user_id = ?",
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+                await cur.close()
+                if row and row[0]:
+                    old_plan = str(row[0])
+            except Exception as e:
+                logger.debug(
+                    f"[Entitlements] R52 P1-4: 读取旧套餐失败 user={user_id}: {e}"
+                )
+
+            # R52 P1-4: CAS 并发套餐修改(expected_version > 0 时启用乐观锁)
+            if expected_version is not None and expected_version > 0:
+                # CAS: UPDATE users_local SET ... WHERE user_id = ? AND version = ?
+                # rowcount=0 表示版本冲突(已被其他 worker 修改)
+                cursor = await tx.execute(
+                    "UPDATE users_local SET membership_level = ?, updated_at = ?, "
+                    "version = version + 1 "
+                    "WHERE user_id = ? AND version = ?",
+                    (plan_name, now, user_id, expected_version),
+                )
+                if cursor.rowcount == 0:
+                    # CAS 冲突 — 查询当前版本以便诊断
+                    current_version = await get_user_version(user_id, tx=tx)
+                    logger.warning(
+                        f"[Entitlements] R52 P1-4: set_user_plan CAS 冲突 "
+                        f"user={user_id} expected_version={expected_version} "
+                        f"current_version={current_version}"
+                    )
+                    raise AppError(
+                        ErrorCodes.ENTITLEMENT_SET_PLAN_CAS_CONFLICT,
+                        params={
+                            "user_id": user_id,
+                            "plan_name": plan_name,
+                            "expected_version": expected_version,
+                            "current_version": current_version,
+                        },
+                    )
+            else:
+                # 无 CAS(向后兼容,默认路径)
+                await tx.execute(
+                    "UPDATE users_local SET membership_level = ?, updated_at = ? "
+                    "WHERE user_id = ?",
+                    (plan_name, now, user_id),
+                )
             # 写 dirty_outbox upsert(同事务,确保跨机同步)
             await store.add_dirty_outbox(
                 "users_local", str(user_id),
@@ -426,7 +588,7 @@ async def set_user_plan(user_id: int, plan_name: str, admin_id: int = 0) -> bool
             )
 
             # 2. 更新 user_quota 配额上限(若记录存在则更新,不存在则创建)
-            quota_data = await store.get_user_quota(user_id)
+            quota_data = await get_user_quota(user_id, tx=tx)
             if quota_data:
                 new_quota = {
                     "level": plan_name,
@@ -474,14 +636,24 @@ async def set_user_plan(user_id: int, plan_name: str, admin_id: int = 0) -> bool
                 operation="upsert", connection=tx,
             )
 
-            # 3. 写入审计日志(同事务)
+            # 3. 写入审计日志(同事务)— R52 P1-4: 包含 old_plan/new_plan/request_hash
+            audit_details = {
+                "plan": plan_name,
+                "admin_id": admin_id,
+                "old_plan": old_plan,
+                "new_plan": plan_name,
+                "request_hash": short_hash,
+                "via_command_bus": via_command_bus,
+            }
+            if expected_version is not None and expected_version > 0:
+                audit_details["expected_version"] = expected_version
             await tx.execute(
                 "INSERT INTO audit_log "
                 "(actor_id, actor_type, action, target_type, target_id, "
                 "details, created_at) "
                 "VALUES (?, 'admin', 'set_plan', 'user', ?, ?, ?)",
                 (admin_id, str(user_id),
-                 json.dumps({"plan": plan_name, "admin_id": admin_id}), now),
+                 json.dumps(audit_details, ensure_ascii=False), now),
             )
             # 写 dirty_outbox upsert(同事务)
             await store.add_dirty_outbox(
@@ -490,7 +662,9 @@ async def set_user_plan(user_id: int, plan_name: str, admin_id: int = 0) -> bool
             )
         # 事务自动 COMMIT(store.transaction 退出时)
         logger.info(
-            f"[Entitlements] 用户 {user_id} 套餐已设置为 {plan_name}(操作人: {admin_id})"
+            f"[Entitlements] 用户 {user_id} 套餐已设置为 {plan_name}"
+            f"(操作人: {admin_id}, old_plan: {old_plan}, "
+            f"via_command_bus: {via_command_bus}, hash: {short_hash})"
         )
         return True
     except AppError:
@@ -499,6 +673,122 @@ async def set_user_plan(user_id: int, plan_name: str, admin_id: int = 0) -> bool
     except Exception as e:
         logger.error(
             f"[Entitlements] set_user_plan 事务失败 user={user_id} plan={plan_name}: {e}"
+        )
+        raise AppError(
+            ErrorCodes.ENTITLEMENT_SET_PLAN_TX_FAILED,
+            params={
+                "user_id": user_id, "plan": plan_name,
+                "reason": f"{type(e).__name__}: {e}",
+            },
+        ) from e
+
+
+async def set_user_plan_via_command_bus(
+    user_id: int,
+    plan_name: str,
+    principal,
+    *,
+    action_id: str = "",
+    request_hash: str = "",
+    expected_version: int | None = None,
+) -> dict:
+    """R52 P1-4: 通过 CommandBus 审批入口修改用户套餐(生产推荐入口)。
+
+    套餐变更为高风险操作(影响用户配额/计费),生产环境必须通过 CommandBus:
+    1. 调用 ``claim_execution_approved`` 验证 approval_action_id 处于 approved 状态
+    2. 校验 request_hash 防篡改
+    3. 通过后调用 ``set_user_plan(via_command_bus=True)``
+    4. 标记 executed/failed
+
+    Args:
+        user_id: 目标用户 ID
+        plan_name: 套餐名(free/basic/premium)
+        principal: AdminPrincipal 对象(操作者身份)
+        action_id: 幂等 ID(approval_action_id)
+        request_hash: 请求指纹(防篡改)
+        expected_version: 可选,CAS 期望版本号
+
+    Returns:
+        dict: {"success": bool}(成功时无 error 键)
+
+    Raises:
+        AppError(ENTITLEMENT_PLAN_REQUIRES_COMMAND_BUS): action_id 为空
+        AppError(ENTITLEMENT_SET_PLAN_TX_FAILED): 事务失败
+        AppError(ENTITLEMENT_SET_PLAN_CAS_CONFLICT): CAS 冲突
+    """
+    from services.command_bus import claim_execution_approved, mark_approved_executed, mark_approved_failed
+
+    if not action_id:
+        # action_id 为空 — 调用方未通过 CommandBus,拒绝执行
+        logger.warning(
+            f"[Entitlements] R52 P1-4: set_user_plan_via_command_bus 缺少 action_id "
+            f"user={user_id} plan={plan_name}"
+        )
+        raise AppError(
+            ErrorCodes.ENTITLEMENT_PLAN_REQUIRES_COMMAND_BUS,
+            params={
+                "user_id": user_id,
+                "plan_name": plan_name,
+                "caller": "set_user_plan_via_command_bus",
+            },
+        )
+
+    principal_id = getattr(principal, "id", 0) or 0
+    principal_name = getattr(principal, "name", "") or ""
+    owner = f"entitlements:{principal_id}:{principal_name}"
+
+    # 1. 验证审批已通过 + hash 防篡改
+    claimed = await claim_execution_approved(
+        action_id=action_id,
+        owner=owner,
+        request_hash=request_hash or None,
+    )
+    if not claimed:
+        logger.warning(
+            f"[Entitlements] R52 P1-4: CommandBus 认领失败 action_id={action_id} "
+            f"user={user_id} plan={plan_name}"
+        )
+        raise AppError(
+            ErrorCodes.ENTITLEMENT_PLAN_REQUIRES_COMMAND_BUS,
+            params={
+                "user_id": user_id,
+                "plan_name": plan_name,
+                "caller": "claim_execution_failed",
+            },
+        )
+
+    # 2. 通过审批,执行套餐变更
+    try:
+        await set_user_plan(
+            user_id, plan_name, admin_id=principal_id,
+            expected_version=expected_version,
+            request_hash=request_hash,
+            via_command_bus=True,
+        )
+        await mark_approved_executed(action_id, result={"success": True})
+        logger.info(
+            f"[Entitlements] R52 P1-4: 套餐变更经 CommandBus 完成 "
+            f"action_id={action_id} user={user_id} plan={plan_name}"
+        )
+        return {"success": True}
+    except AppError as e:
+        # CAS 冲突为可重试,标记 retryable;其他失败标记 failed
+        retryable = (
+            e.code == ErrorCodes.ENTITLEMENT_SET_PLAN_CAS_CONFLICT
+        )
+        await mark_approved_failed(
+            action_id, error=str(e), retryable=retryable,
+        )
+        logger.warning(
+            f"[Entitlements] R52 P1-4: 套餐变更经 CommandBus 失败 "
+            f"action_id={action_id} retryable={retryable}: {e}"
+        )
+        raise
+    except Exception as e:
+        await mark_approved_failed(action_id, error=str(e), retryable=False)
+        logger.error(
+            f"[Entitlements] R52 P1-4: 套餐变更经 CommandBus 异常 "
+            f"action_id={action_id}: {e}"
         )
         raise AppError(
             ErrorCodes.ENTITLEMENT_SET_PLAN_TX_FAILED,

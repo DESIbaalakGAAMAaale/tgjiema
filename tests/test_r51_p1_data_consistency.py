@@ -185,10 +185,14 @@ async def _insert_task(store, task_type: str, user_id: int, status: str = "pendi
 
 
 async def _insert_command_execution(
-    store, action_id: str, principal_id: int, status: str = "executed",
+    store, action_id: str, principal_id: int, status: str = "approved",
     request_hash: str = "",
 ):
-    """插入测试 command_executions 记录(用于审批验证)。"""
+    """插入测试 command_executions 记录(用于审批验证)。
+
+    R52 P0-5: 状态机统一为 pending → approved → executing → executed/failed,
+    审批通过后执行前的状态为 'approved'(旧版 'executed' 语义冲突已废弃)。
+    """
     import datetime as _dt
     now = _dt.datetime.now().isoformat()
     await store._db.execute(
@@ -620,15 +624,21 @@ class TestP1_3_CollectionsCasEnforcement:
 
     @pytest.mark.asyncio
     async def test_p1_3_update_bypass_cas_allows_admin(self, real_store):
-        """测试: bypass_cas=True 允许运维/迁移绕过 CAS(显式 opt-in)。"""
+        """测试: bypass_cas=True + approval_action_id 允许运维/迁移绕过 CAS(显式 opt-in)。
+
+        R52 P1-5: bypass_cas=True 必须提供 approval_action_id(审计要求),
+        否则 raise AppError(COLLECTION_CAS_BYPASS_NOT_ALLOWED)。
+        """
         from services import collections
 
         user_id = 30003
         coll_id = await _insert_collection(real_store, user_id, "coll_bypass")
 
-        # bypass_cas=True 应允许更新(模拟运维迁移场景)
+        # R52 P1-5: bypass_cas=True 必须提供 approval_action_id
         result = await collections.update_collection(
             coll_id, name="migrated_name", bypass_cas=True,
+            approval_action_id="approval_bypass_p1_3",
+            caller="test_migration",
         )
         assert result["success"] is True, "bypass_cas=True 应更新成功"
         assert result["new_version"] >= 2, "version 应递增"
@@ -838,11 +848,12 @@ class TestP1_5_RepairConsoleApprovalEnforcement:
 
         principal_id = 50003
         # 插入一条 command_executions 记录,request_hash 故意写错
+        # R52 P0-5: 审批状态为 'approved'(非 'executed')
         await _insert_command_execution(
             real_store,
             action_id="approval_hash_mismatch",
             principal_id=principal_id,
-            status="executed",
+            status="approved",
             request_hash="wrong_hash_value",
         )
 
@@ -871,11 +882,12 @@ class TestP1_5_RepairConsoleApprovalEnforcement:
             "skip_outbox", {"ids": [1], "reason": "test"},
         )
         # 插入审批记录,principal_id=approver_id(与操作人不同)
+        # R52 P0-5: 审批状态为 'approved'(非 'executed')
         await _insert_command_execution(
             real_store,
             action_id="approval_principal_mismatch",
             principal_id=approver_id,
-            status="executed",
+            status="approved",
             request_hash=expected_hash,
         )
 
@@ -902,11 +914,12 @@ class TestP1_5_RepairConsoleApprovalEnforcement:
         expected_hash = repair_console.compute_repair_request_hash("skip_outbox", params)
 
         # 插入审批记录,三要素全部一致
+        # R52 P0-5: 审批状态为 'approved'(非 'executed')
         await _insert_command_execution(
             real_store,
             action_id="approval_valid_high_risk",
             principal_id=principal_id,
-            status="executed",
+            status="approved",
             request_hash=expected_hash,
         )
 

@@ -3,18 +3,17 @@
 
 # R40 P2-2 / R41 P0-1: 基础镜像使用真实 digest pinning(不可变),保证供应链可复现。
 # digest 来源: Docker Hub API https://hub.docker.com/v2/repositories/library/python/tags/3.12-slim
-#   查询时间: 2026-07-13
+#   查询时间: 2026-07-14
 #   tag: 3.12-slim
-#   last_updated: 2026-06-29T02:07:23Z
-#   python 版本: 3.12.13
-#   manifest digest (multi-arch list): sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
+#   last_updated: 2026-07-14T08:11:01Z
+#   manifest digest (multi-arch list): sha256:c3d81d25b3154142b0b42eb1e61300024426268edeb5b5a26dd7ddf64d9daf28
 # 校验命令:
-#   docker pull python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
+#   docker pull python:3.12-slim@sha256:c3d81d25b3154142b0b42eb1e61300024426268edeb5b5a26dd7ddf64d9daf28
 #   docker inspect --format='{{index .RepoDigests 0}}' python:3.12-slim
 # 更新流程见 docs/docker-image-pinning.md。
 # CI 会校验 Dockerfile 中 PYTHON_IMAGE 必须包含 @sha256: 前缀 + 64 位 hex
 #   (见 .github/workflows/ci.yml release-gates job 与 tests/test_r38_p0.py)
-ARG PYTHON_IMAGE=python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:c3d81d25b3154142b0b42eb1e61300024426268edeb5b5a26dd7ddf64d9daf28
 FROM ${PYTHON_IMAGE} AS builder
 
 WORKDIR /app

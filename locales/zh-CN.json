@@ -139,7 +139,15 @@
     "task.center.list_db_error": "任务列表查询数据库异常,返回错误 envelope(不返回空列表伪装无任务,scope={scope}, trace_id={trace_id})",
     "repair.console.approval_required": "高风险修复动作必须强制审批(approval_action_id 不可缺省,action={action}, principal_id={principal_id}, trace_id={trace_id})",
     "repair.console.approval_hash_mismatch": "审批 hash/owner 校验失败(不仅校验 status,必须校验 request_hash + principal_id,approval_action_id={approval_action_id}, expected_hash={expected_hash}, actual_hash={actual_hash}, trace_id={trace_id})",
-    "repair.console.approval_principal_mismatch": "审批 principal 不匹配(approval_action_id 关联的 principal 与当前 principal 不一致,approval_action_id={approval_action_id}, expected_principal={expected_principal}, actual_principal={actual_principal}, trace_id={trace_id})"
+    "repair.console.approval_principal_mismatch": "审批 principal 不匹配(approval_action_id 关联的 principal 与当前 principal 不一致,approval_action_id={approval_action_id}, expected_principal={expected_principal}, actual_principal={actual_principal}, trace_id={trace_id})",
+    "command.status.conflict": "命令状态冲突(CAS 未命中或 principal 不匹配,action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, stored_principal_id={stored_principal_id}, expected_principal_id={expected_principal_id}, trace_id={trace_id})",
+    "command.status.not_approved": "命令未审批通过,拒绝执行(必须先经审批将 status 转为 approved,action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, trace_id={trace_id})",
+    "entitlement.set_plan.cas_conflict": "设置用户套餐 CAS 版本冲突(并发修改,请重试,user_id={user_id}, plan_name={plan_name}, expected_version={expected_version}, current_version={current_version}, trace_id={trace_id})",
+    "entitlement.plan.requires_command_bus": "套餐变更必须通过 CommandBus(禁止直接调用 set_user_plan 进行生产变更,user_id={user_id}, plan_name={plan_name}, caller={caller}, trace_id={trace_id})",
+    "maintenance.disable.recover_query_failed": "维护 disable 查询 recover_status 失败,已 fail-closed 拒绝降级为 completed(reason={reason}, trace_id={trace_id})",
+    "maintenance.recover.persist_critical": "recover_status 持久化失败,已触发 critical alert 并 fail-closed(reason={reason}, trace_id={trace_id})",
+    "metrics.collector.output_invalid": "指标采集失败时输出 0 值带 error label(应改为不输出或 NaN,collector={collector}, reason={reason}, trace_id={trace_id})",
+    "cf.worker.update_id_kv_unconfigured": "UPDATE_ID_KV 未配置,production 环境必须配置两阶段去重 KV(environment={environment}, trace_id={trace_id})"
   },
   "ui": {
     "admin_login_title": "管理后台登录",

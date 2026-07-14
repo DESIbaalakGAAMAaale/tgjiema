@@ -472,6 +472,25 @@ class TestScenario8StagingRestoreNoDbWrite:
             return None
         monkeypatch.setattr(engine, "_validate_production_approval", _noop_validate)
 
+        # R52 P0-5: mock claim_execution_approved 通过(CAS approved→executing)
+        # 测试使用 _FakeDB 不支持 cursor.rowcount,需 mock CAS 绕过
+        async def _noop_claim(action_id, owner, request_hash=None, lease_seconds=None):
+            return True
+        monkeypatch.setattr(
+            "services.command_bus.claim_execution_approved", _noop_claim,
+        )
+        # mock mark_approved_executed / mark_approved_failed 避免真实 DB 写入
+        async def _noop_mark_executed(action_id, result=None):
+            return True
+        async def _noop_mark_failed(action_id, error="", retryable=False):
+            return True
+        monkeypatch.setattr(
+            "services.command_bus.mark_approved_executed", _noop_mark_executed,
+        )
+        monkeypatch.setattr(
+            "services.command_bus.mark_approved_failed", _noop_mark_failed,
+        )
+
         # R42 P1-3: production restore 必须提供 approval_action_id
         # R51 P0-8: production restore 必须传 expected_request_hash
         result = await engine.restore(

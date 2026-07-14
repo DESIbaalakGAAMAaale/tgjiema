@@ -673,33 +673,38 @@ class TestConcurrentPushRedisDown:
     async def test_concurrent_push_duplicate_message_id_idempotent(
         self, monkeypatch, durable_outbox_tmpdir,
     ):
-        """并发 push 传入相同 message_id 时,因 UNIQUE 约束 + INSERT OR IGNORE,
-        outbox 中只有 1 条消息(幂等),不会抛 IntegrityError。
+        """并发 push 传入相同 message_id + 相同 payload 时,因 UNIQUE 约束 +
+        request_hash 匹配,outbox 中只有 1 条消息(幂等),不会抛异常。
 
         场景:理论上的并发 race(实践中不应发生,但验证 outbox 的幂等性)。
+
+        R52 P1-1: 相同 message_id 但不同 payload 视为篡改,抛
+        AppError(COMMAND_HASH_MISMATCH)。本测试验证相同 payload 的幂等行为
+        (同一操作被并发重试,hash 匹配 → 幂等成功)。
         """
         monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=None))
         self._install_serialized_write_durable_outbox(monkeypatch)
 
-        # 5 个 push 传入相同 message_id(模拟并发 race)
+        # 5 个 push 传入相同 message_id + 相同 payload(模拟并发 race 重试)
         same_msg_id = "uuid-duplicate-race-0001"
+        same_payload = {"user_id": 8000}
         tasks = [
             redis_queue.push(
                 op_type="upsert", table="user_quota",
                 method_name="upsert_user_quota",
-                data={"user_id": 8000 + i},
+                data=same_payload,
                 message_id=same_msg_id,
             )
             for i in range(5)
         ]
         results = await asyncio.gather(*tasks)
 
-        # 所有 push 都返回 persisted_pending(不会抛 IntegrityError)
+        # 所有 push 都返回 persisted_pending(不会抛 IntegrityError / AppError)
         assert all(isinstance(r, dict) and r["status"] == "persisted_pending" for r in results)
         # 所有返回的 message_id 都是同一个
         for r in results:
             assert r["message_id"] == same_msg_id
 
-        # outbox 中只有 1 条消息(UNIQUE 约束 + INSERT OR IGNORE 保证幂等)
+        # outbox 中只有 1 条消息(UNIQUE 约束 + request_hash 匹配保证幂等)
         count = await redis_queue.get_durable_outbox_count()
         assert count == 1

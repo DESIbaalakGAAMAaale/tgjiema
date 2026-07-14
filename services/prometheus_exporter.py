@@ -493,33 +493,34 @@ def collect_metrics() -> str:
     lines.append(f"tgjiema_crdb_idle_ru_alert {idle_alert}")
 
     # 2. redis_pel_depth — Redis Stream pending entries 长度
-    # R51 P1-7: 采集失败时输出 collector_success=0 + collector_status="error",
-    # 不输出 0 伪装健康(0 可能是真实值,无法区分)
+    # R52 P1-7: 采集失败时不输出 0 值带 error label(0 可能是真实值,无法区分;
+    #   改为完全不输出主数值,仅输出统一的 tgjiema_collector_success=0)
     pel_str = _read_kv_value("redis_pel_depth", "")
     pel_collector_ok = True
     try:
         pel_depth = float(pel_str)
     except (TypeError, ValueError):
-        # 解析失败 → 标记 collector 失败,不输出 0
+        # 解析失败 → 标记 collector 失败,不输出主数值
         pel_depth = None
         pel_collector_ok = False
         logger.warning(
-            "[R51-P1-7] redis_pel_depth 采集失败(无法解析为 float),"
-            "输出 collector_success=0"
+            "[R52-P1-7] redis_pel_depth 采集失败(无法解析为 float),"
+            "不输出主数值,仅输出 tgjiema_collector_success=0"
         )
     lines.append("# HELP redis_pel_depth Redis Stream pending entries length")
     lines.append("# TYPE redis_pel_depth gauge")
     if pel_depth is not None:
         lines.append(f"redis_pel_depth {pel_depth}")
     else:
-        # R51 P1-7: 采集失败时输出 collector_success=0 + collector_status=error
-        lines.append('redis_pel_depth{collector_status="error"} 0')
-        lines.append('redis_pel_depth_collector_success{collector="redis_pel"} 0')
-        lines.append("# HELP redis_pel_depth_collector_success redis_pel_depth 采集器状态(1=ok, 0=failed)")
-        lines.append("# TYPE redis_pel_depth_collector_success gauge")
+        # R52 P1-7: 采集失败时不输出 0 值(避免伪装健康),
+        # 仅输出统一 collector_success metric
+        lines.append("# redis_pel_depth 采集失败,主数值不输出(避免 0 伪装健康)")
+        lines.append('tgjiema_collector_success{collector="redis_pel"} 0')
+        lines.append("# HELP tgjiema_collector_success 采集器状态(1=ok, 0=failed)")
+        lines.append("# TYPE tgjiema_collector_success gauge")
 
     # 3. dlq_depth — 死信队列深度
-    # R51 P1-7: 采集失败时输出 collector_success=0,不输出 0 伪装健康
+    # R52 P1-7: 采集失败时不输出 0 值带 error label,仅输出统一 collector_success=0
     dlq_str = _read_kv_value("dlq_depth", "")
     dlq_collector_ok = True
     try:
@@ -528,18 +529,17 @@ def collect_metrics() -> str:
         dlq_depth = None
         dlq_collector_ok = False
         logger.warning(
-            "[R51-P1-7] dlq_depth 采集失败(无法解析为 float),"
-            "输出 collector_success=0"
+            "[R52-P1-7] dlq_depth 采集失败(无法解析为 float),"
+            "不输出主数值,仅输出 tgjiema_collector_success=0"
         )
     lines.append("# HELP dlq_depth Dead letter queue depth")
     lines.append("# TYPE dlq_depth gauge")
     if dlq_depth is not None:
         lines.append(f"dlq_depth {dlq_depth}")
     else:
-        lines.append('dlq_depth{collector_status="error"} 0')
-        lines.append('dlq_depth_collector_success{collector="dlq"} 0')
-        lines.append("# HELP dlq_depth_collector_success dlq_depth 采集器状态(1=ok, 0=failed)")
-        lines.append("# TYPE dlq_depth_collector_success gauge")
+        # R52 P1-7: 采集失败时不输出 0 值(避免伪装健康)
+        lines.append("# dlq_depth 采集失败,主数值不输出(避免 0 伪装健康)")
+        lines.append('tgjiema_collector_success{collector="dlq"} 0')
 
     # 4. dirty_outbox_rows — upload_outbox 表未完成行数
     dirty = _read_sqlite_single(
@@ -701,12 +701,12 @@ def collect_metrics() -> str:
     lines.append("# TYPE tgjiema_readiness_status gauge")
     lines.append(f"tgjiema_readiness_status {1 if readiness['ready'] else 0}")
 
-    # R44 6.2 + R51 P1-7: tgjiema_i18n_missing_key_total — i18n key 缺失累计计数(Counter)
+    # R44 6.2 + R51 P1-7 + R52 P1-7: tgjiema_i18n_missing_key_total — i18n key 缺失累计计数(Counter)
     # 用于告警:i18n key 缺失可能暴露内部 key 给用户(违反 R44 6.2 安全要求)
     # 数据来源: services.i18n.I18nManager.get_missing_key_count()
     # label: locale(低基数,通常 zh-CN / en-US 两种)
-    # R51 P1-7: 采集失败时输出 collector_success=0 + collector_status="error",
-    # 不输出 0(0 可能是真实值,无法区分;unknown 不应伪装为健康)
+    # R52 P1-7: 采集失败时不输出 0 值带 error label(0 可能是真实值,无法区分;
+    #   改为完全不输出主数值,仅输出统一的 tgjiema_collector_success=0)
     i18n_collector_ok = False
     i18n_missing_key_total: int | None = None
     try:
@@ -716,9 +716,10 @@ def collect_metrics() -> str:
         i18n_missing_key_total = i18n_manager.get_missing_key_count()
         i18n_collector_ok = True
     except Exception as e:
-        # R51 P1-7: i18n 模块未初始化或采集失败 → 输出 collector_success=0
+        # R52 P1-7: i18n 模块未初始化或采集失败 → 不输出主数值,仅输出 collector_success=0
         logger.warning(
-            f"[R51-P1-7] i18n missing_key metric 采集失败,输出 collector_success=0: {e}"
+            f"[R52-P1-7] i18n missing_key metric 采集失败,"
+            f"不输出主数值,仅输出 tgjiema_collector_success=0: {e}"
         )
         i18n_collector_ok = False
 
@@ -734,19 +735,14 @@ def collect_metrics() -> str:
             f'{i18n_missing_key_total}'
         )
     else:
-        # R51 P1-7: 采集失败 → 输出 collector_success=0 + collector_status=error
-        # 不输出 0 伪装健康(0 可能是真实值)
+        # R52 P1-7: 采集失败时不输出 0 值(避免伪装健康),
+        # 仅输出统一 collector_success metric
         lines.append(
-            'tgjiema_i18n_missing_key_total{locale="total", collector_status="error"} 0'
+            "# tgjiema_i18n_missing_key_total 采集失败,主数值不输出(避免 0 伪装健康)"
         )
         lines.append(
-            'tgjiema_i18n_collector_success{collector="i18n_missing_key"} 0'
+            'tgjiema_collector_success{collector="i18n_missing_key"} 0'
         )
-        lines.append(
-            "# HELP tgjiema_i18n_collector_success i18n missing_key 采集器状态"
-            "(1=ok, 0=failed)"
-        )
-        lines.append("# TYPE tgjiema_i18n_collector_success gauge")
 
     return "\n".join(lines) + "\n"
 

@@ -37,6 +37,16 @@ from loguru import logger
 
 from database.cache_store import get_cache_store
 from services.error_codes import AppError, ErrorCodes
+# R52 P0-5: 引入统一状态机辅助函数
+from services.command_bus import (
+    CMD_STATUS_APPROVED,
+    CMD_STATUS_EXECUTING,
+    CMD_STATUS_EXECUTED,
+    CMD_STATUS_FAILED,
+    claim_execution_approved,
+    mark_approved_executed,
+    mark_approved_failed,
+)
 
 
 # ─── R45 第 16 节: 安全动作白名单 ──────────────────────────────
@@ -723,19 +733,23 @@ async def execute_repair(
     approval_action_id: str = "",
     target_version: str = "",
 ) -> dict:
-    """R45 第 16 节 + R51 P1-5: 统一修复入口(白名单 + 审批 + 审计一体化)。
+    """R45 第 16 节 + R51 P1-5 + R52 P0-5: 统一修复入口(白名单 + 审批 + 审计一体化)。
 
     所有 Repair Console 的修复操作必须通过此入口执行:
         1. 校验 action 是否在 SAFE_ACTIONS 白名单中(拒绝任意 SQL/Python)
         2. R51 P1-5: 按 _ACTION_RISK_MAP 判定风险等级
             - HIGH 风险动作必须提供 approval_action_id(否则 raise AppError)
             - LOW 风险动作 approval_action_id 可选(传了仍会校验)
-        3. R51 P1-5: 审批验证三要素:
-            - status == "executed"
+        3. R52 P0-5: 审批验证三要素 + 统一状态机:
+            - status == "approved"(执行前置校验,旧版 'executed' 语义冲突)
             - command_executions.principal_id == 当前 principal_id
             - command_executions.request_hash == compute_repair_request_hash(action, params)
+            - CAS: approved → executing(失败时 raise COMMAND_STATUS_CONFLICT)
         4. 路由到对应的修复函数(retry_outbox/skip_outbox/...)
-        5. 写 audit_log(action="repair_<action>")记录操作者 + 参数摘要
+        5. R52 P0-5: 执行结果回写状态机:
+            - 成功: executing → executed
+            - 失败: executing → failed
+        6. 写 audit_log(action="repair_<action>")记录操作者 + 参数摘要
 
     安全铁律:
         - 严禁添加 "execute_sql" / "execute_python" / "eval" 等动作
@@ -764,6 +778,8 @@ async def execute_repair(
         AppError(REPAIR_CONSOLE_APPROVAL_REQUIRED): 高风险动作未提供 approval_action_id
         AppError(REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH): 审批 principal 不匹配
         AppError(REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH): 审批 request_hash 不匹配(参数被篡改)
+        AppError(COMMAND_STATUS_CONFLICT): R52 P0-5 CAS approved→executing 失败(已被抢占)
+        AppError(COMMAND_NOT_APPROVED): R52 P0-5 状态非 approved(未审批或已完成)
         ValueError: action 不在白名单中(向后兼容旧错误类型)
     """
     # 1. 白名单校验(铁律)
@@ -810,10 +826,11 @@ async def execute_repair(
                 },
             )
 
-    # 3. R51 P1-5: 审批验证三要素(status + principal + hash)
+    # 3. R51 P1-5 + R52 P0-5: 审批验证三要素(status + principal + hash)
+    #    R52 P0-5: status 必须为 'approved'(执行前置校验)
     approval_verified = False
     if approval_action_id:
-        # 验证 status='executed' + principal_id 一致 + request_hash 一致
+        # 验证 status='approved' + principal_id 一致 + request_hash 一致
         approval_verified = await _verify_approval(
             approval_action_id,
             expected_principal_id=principal_id,
@@ -844,6 +861,40 @@ async def execute_repair(
                     "approval_action_id": approval_action_id,
                     "expected_request_hash": expected_hash,
                     "reason": "approval_verification_failed",
+                },
+            )
+
+        # R52 P0-5: CAS approved → executing(防并发执行同一审批)
+        # 失败时表示已被其他 worker 抢占,或状态已从 approved 流转
+        import socket as _socket
+        import os as _os
+        _owner = f"{_socket.gethostname()}:{_os.getpid()}"
+        claimed = await claim_execution_approved(
+            action_id=approval_action_id,
+            owner=_owner,
+            request_hash=expected_hash,
+        )
+        if not claimed:
+            logger.error(
+                f"[RepairConsole] execute_repair CAS 失败(已被抢占或状态非 approved) "
+                f"action={action} approval_action_id={approval_action_id} "
+                f"principal={principal_id}"
+            )
+            await _write_repair_audit(
+                principal_id=principal_id,
+                action=f"repair_cas_conflict_{action}",
+                details=(
+                    f"CAS approved->executing failed (preempted or status not approved); "
+                    f"approval_action_id={approval_action_id}"
+                ),
+                approval_action_id=approval_action_id,
+            )
+            raise AppError(
+                ErrorCodes.COMMAND_STATUS_CONFLICT,
+                params={
+                    "action_id": approval_action_id,
+                    "reason": "cas_approved_to_executing_failed",
+                    "expected_status": CMD_STATUS_EXECUTING,
                 },
             )
 
@@ -889,6 +940,19 @@ async def execute_repair(
             f"[RepairConsole] execute_repair 执行失败 "
             f"action={action} params={params}: {e}"
         )
+        # R52 P0-5: 失败时回写状态机 executing → failed
+        if approval_action_id:
+            try:
+                await mark_approved_failed(
+                    action_id=approval_action_id,
+                    error=f"repair action '{action}' failed: {e}",
+                    retryable=False,
+                )
+            except Exception as mark_err:
+                logger.error(
+                    f"[RepairConsole] mark_approved_failed 失败 "
+                    f"approval_action_id={approval_action_id}: {mark_err}"
+                )
         # 写失败审计
         audit_id = await _write_repair_audit(
             principal_id=principal_id,
@@ -905,7 +969,24 @@ async def execute_repair(
             "approval_verified": approval_verified,
         }
 
-    # 5. 写审计日志(成功)
+    # 5. R52 P0-5: 成功时回写状态机 executing → executed
+    if approval_action_id:
+        try:
+            await mark_approved_executed(
+                action_id=approval_action_id,
+                result={
+                    "success": True,
+                    "action": action,
+                    "affected_count": affected_count,
+                },
+            )
+        except Exception as mark_err:
+            logger.error(
+                f"[RepairConsole] mark_approved_executed 失败 "
+                f"approval_action_id={approval_action_id}: {mark_err}"
+            )
+
+    # 6. 写审计日志(成功)
     audit_id = await _write_repair_audit(
         principal_id=principal_id,
         action=f"repair_{action}",
@@ -936,12 +1017,17 @@ async def _verify_approval(
     expected_principal_id: int | None = None,
     expected_request_hash: str | None = None,
 ) -> bool:
-    """R45 + R51 P1-5 内部辅助: 验证 approval_action_id 的三要素一致性。
+    """R45 + R51 P1-5 + R52 P0-5 内部辅助: 验证 approval_action_id 的三要素一致性。
+
+    R52 P0-5 整改要点:
+    - status 必须为 'approved'(执行前置校验,避免"执行前已执行"语义冲突)
+    - 旧逻辑校验 status='executed'(表示已完成)导致语义冲突,
+      现统一为 approved → executing → executed/failed 状态机
 
     R51 P1-5 整改要点:
-    - 不再仅校验 status='executed'(原校验不足以防止越权/篡改)
+    - 不再仅校验 status(原校验不足以防止越权/篡改)
     - 三要素全部一致才返回 True:
-        1. status == 'executed'
+        1. status == 'approved'(R52 P0-5:从 executed 改为 approved)
         2. principal_id == expected_principal_id(审批人 == 操作人)
         3. request_hash == expected_request_hash(防参数篡改)
     - 任一不一致返回 False(由调用方抛 AppError)
@@ -966,10 +1052,10 @@ async def _verify_approval(
         if not rows or not rows[0]:
             return False
         status, principal_id, request_hash = rows[0][0], rows[0][1], rows[0][2]
-        # 1. status 必须为 'executed'
-        if status != "executed":
+        # 1. R52 P0-5: status 必须为 'approved'(执行前置校验)
+        if status != CMD_STATUS_APPROVED:
             logger.warning(
-                f"[RepairConsole] _verify_approval 状态非 executed "
+                f"[RepairConsole] _verify_approval 状态非 approved "
                 f"approval_action_id={approval_action_id} status={status}"
             )
             return False

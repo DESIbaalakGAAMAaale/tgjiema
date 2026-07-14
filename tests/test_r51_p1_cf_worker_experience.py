@@ -223,22 +223,39 @@ class TestCfWorkerStaticChecks:
         assert "function t(" in content, "应定义 t() locale 消息查找函数"
 
     def test_cf_worker_contains_update_id_kv_dedup(self):
-        """A3: 包含 UPDATE_ID_KV 持久去重逻辑(替代内存 debounce)。"""
+        """A3: 包含 UPDATE_ID_KV 持久去重逻辑(替代内存 debounce)。
+
+        R52 P1-8: 两阶段去重(processing → completed)替代单阶段标记。
+        - markUpdateIdProcessing: handler 执行前标记 processing(TTL 5min,
+          崩溃后可快速回收重试)
+        - markUpdateIdCompleted: handler 成功后标记 completed(TTL 24h,
+          防止 Telegram 重发)
+        """
         content = CF_WORKER_PATH.read_text(encoding="utf-8")
         # KV 绑定引用
         assert "UPDATE_ID_KV" in content, (
             "应引用 env.UPDATE_ID_KV(R51 P1-8: 使用 KV 持久去重 update_id)"
         )
-        # 去重函数
+        # 去重函数:检查 update_id 是否已 completed
         assert "isUpdateIdProcessed" in content, (
-            "应定义 isUpdateIdProcessed 函数(检查 update_id 是否已处理)"
+            "应定义 isUpdateIdProcessed 函数(检查 update_id 是否已 completed)"
         )
-        assert "markUpdateIdProcessed" in content, (
-            "应定义 markUpdateIdProcessed 函数(标记 update_id 为已处理)"
+        # R52 P1-8: 两阶段去重函数(processing + completed)
+        assert "markUpdateIdProcessing" in content, (
+            "应定义 markUpdateIdProcessing 函数"
+            "(R52 P1-8: handler 执行前标记 processing,TTL 5min)"
+        )
+        assert "markUpdateIdCompleted" in content, (
+            "应定义 markUpdateIdCompleted 函数"
+            "(R52 P1-8: handler 成功后标记 completed,TTL 24h)"
         )
         # KV TTL 常量
         assert "UPDATE_ID_KV_TTL_SECONDS" in content, (
             "应定义 UPDATE_ID_KV_TTL_SECONDS(KV 过期时间)"
+        )
+        # R52 P1-8: processing 状态 TTL 常量(较短,崩溃后可快速回收)
+        assert "UPDATE_ID_PROCESSING_TTL_SECONDS" in content, (
+            "应定义 UPDATE_ID_PROCESSING_TTL_SECONDS(R52 P1-8: processing TTL)"
         )
 
     def test_cf_worker_contains_max_body_bytes(self):

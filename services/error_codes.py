@@ -222,6 +222,34 @@ class ErrorCodes:
     # RU 估算值标记(非官方 CockroachDB Cloud Metrics)
     METRICS_RU_ESTIMATED = "METRICS.RU.ESTIMATED"
 
+    # ── R52 P0-5: 统一高风险动作状态机 ──
+    # command_executions 状态冲突(CAS 未命中,如 approved→executing 时已被其他 worker 抢占)
+    COMMAND_STATUS_CONFLICT = "COMMAND.STATUS.CONFLICT"
+    # command_executions 未处于 approved 状态(执行前必须审批通过)
+    COMMAND_NOT_APPROVED = "COMMAND.STATUS.NOT_APPROVED"
+
+    # ── R52 P1-1: Durable Outbox hash mismatch(复用 COMMAND_HASH_MISMATCH) ──
+
+    # ── R52 P1-4: Entitlements CAS + CommandBus ──
+    # set_user_plan CAS 版本冲突(并发套餐修改,expected_version 不匹配 current version)
+    ENTITLEMENT_SET_PLAN_CAS_CONFLICT = "ENTITLEMENT.SET_PLAN.CAS_CONFLICT"
+    # 套餐变更必须通过 CommandBus(禁止直接调用 set_user_plan 进行生产变更)
+    ENTITLEMENT_PLAN_REQUIRES_COMMAND_BUS = "ENTITLEMENT.PLAN.REQUIRES_COMMAND_BUS"
+
+    # ── R52 P1-6: Maintenance fail-closed ──
+    # disable() 查询 recover_status 失败(fail-closed,不允许降级为 completed)
+    MAINTENANCE_DISABLE_RECOVER_QUERY_FAILED = "MAINTENANCE.DISABLE.QUERY_FAILED"
+    # recover_status 持久化失败(触发 critical alert,不允许 fail-open)
+    MAINTENANCE_RECOVER_PERSIST_CRITICAL = "MAINTENANCE.RECOVER.PERSIST_CRITICAL"
+
+    # ── R52 P1-7: Metrics unknown 语义 ──
+    # 指标采集失败但已输出 0 值带 error label(应改为不输出或 NaN)
+    METRICS_COLLECTOR_OUTPUT_INVALID = "METRICS.COLLECTOR.OUTPUT_INVALID"
+
+    # ── R52 P1-8: CF Worker 两阶段去重 ──
+    # UPDATE_ID_KV 未配置(production 必须配置)
+    CF_WORKER_UPDATE_ID_KV_UNCONFIGURED = "CF.WORKER.UPDATE_ID_KV_UNCONFIGURED"
+
 
 # ════════════════════════════════════════════════════════════════
 # 2. ErrorDefinition 数据类
@@ -1371,6 +1399,89 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["approval_action_id", "expected_principal", "actual_principal"],
+    ))
+
+    # ── R52 P0-5: 统一高风险动作状态机 ──
+    # command_executions 状态冲突(CAS 未命中,如 approved→executing 时已被其他 worker 抢占)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COMMAND_STATUS_CONFLICT,
+        message_key="errors.command.status.conflict",
+        http_status=409,
+        retryable=True,
+        severity="warning",
+        safe_params=["action_id", "reason", "current_status", "expected_status",
+                     "stored_principal_id", "expected_principal_id"],
+    ))
+    # command_executions 未处于 approved 状态(执行前必须审批通过)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COMMAND_NOT_APPROVED,
+        message_key="errors.command.status.not_approved",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action_id", "reason", "current_status", "expected_status"],
+    ))
+
+    # ── R52 P1-4: Entitlements CAS + CommandBus ──
+    # set_user_plan CAS 版本冲突(并发套餐修改,expected_version 不匹配 current version)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ENTITLEMENT_SET_PLAN_CAS_CONFLICT,
+        message_key="errors.entitlement.set_plan.cas_conflict",
+        http_status=409,
+        retryable=True,
+        severity="warning",
+        safe_params=["user_id", "plan_name", "expected_version", "current_version"],
+    ))
+    # 套餐变更必须通过 CommandBus(禁止直接调用 set_user_plan 进行生产变更)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ENTITLEMENT_PLAN_REQUIRES_COMMAND_BUS,
+        message_key="errors.entitlement.plan.requires_command_bus",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["user_id", "plan_name", "caller"],
+    ))
+
+    # ── R52 P1-6: Maintenance fail-closed ──
+    # disable() 查询 recover_status 失败(fail-closed,不允许降级为 completed)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MAINTENANCE_DISABLE_RECOVER_QUERY_FAILED,
+        message_key="errors.maintenance.disable.recover_query_failed",
+        http_status=500,
+        retryable=True,
+        severity="critical",
+        safe_params=["reason"],
+    ))
+    # recover_status 持久化失败(触发 critical alert,不允许 fail-open)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MAINTENANCE_RECOVER_PERSIST_CRITICAL,
+        message_key="errors.maintenance.recover.persist_critical",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason"],
+    ))
+
+    # ── R52 P1-7: Metrics unknown 语义 ──
+    # 指标采集失败但已输出 0 值带 error label(应改为不输出或 NaN)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.METRICS_COLLECTOR_OUTPUT_INVALID,
+        message_key="errors.metrics.collector.output_invalid",
+        http_status=500,
+        retryable=False,
+        severity="error",
+        safe_params=["collector", "reason"],
+    ))
+
+    # ── R52 P1-8: CF Worker 两阶段去重 ──
+    # UPDATE_ID_KV 未配置(production 必须配置)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.CF_WORKER_UPDATE_ID_KV_UNCONFIGURED,
+        message_key="errors.cf.worker.update_id_kv_unconfigured",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["environment"],
     ))
 
 

@@ -705,8 +705,11 @@ async def update_collection(
     description: str | None = None,
     expected_version: int | None = None,
     bypass_cas: bool = False,
+    *,
+    approval_action_id: str = "",
+    caller: str = "",
 ) -> dict:
-    """R45 第 16 节 + R51 P1-3: 修改集合元数据(乐观锁 CAS,强制 expected_version)。
+    """R45 第 16 节 + R51 P1-3 + R52 P1-5: 修改集合元数据(乐观锁 CAS,强制 expected_version)。
 
     R51 P1-3 整改要点:
     - 移除 ``expected_version=None → 跳过 CAS`` 的旧兼容路径(默认拒绝)
@@ -714,10 +717,17 @@ async def update_collection(
     - 仅运维/迁移场景显式传 ``bypass_cas=True`` 才能跳过 CAS 校验
     - CAS 冲突从"返回 conflict=True"改为 raise AppError(COLLECTION_CAS_CONFLICT)
 
+    R52 P1-5 整改要点:
+    - ``bypass_cas=True`` 不再在公共 API 内直接执行,而是委托给私有
+      ``_update_collection_without_cas()``,后者要求 approval_action_id + caller 审计
+    - 公共 API 永远要求 expected_version(>0);bypass 路径需通过私有方法 + 审批
+    - ``bypass_cas=True`` 但未提供 ``approval_action_id`` → raise AppError
+      (COLLECTION_CAS_BYPASS_NOT_ALLOWED),引导调用方使用私有方法 + 审批
+
     使用 ``WHERE version = ? AND id = ?`` 进行 CAS 更新:
         - expected_version 匹配成功 → 更新 + 版本号 +1,返回 success
         - expected_version 不匹配(被其他写入抢占)→ raise AppError(COLLECTION_CAS_CONFLICT)
-        - bypass_cas=True 且 expected_version=None → 跳过 CAS(仅限运维/迁移)
+        - bypass_cas=True 且 approval_action_id 非空 → 委托 _update_collection_without_cas
 
     并发安全:
         - 单个 UPDATE 语句原子完成 CAS 检查 + 版本递增
@@ -729,8 +739,12 @@ async def update_collection(
         name: 新名称(None=不修改)
         description: 新描述(None=不修改)
         expected_version: 调用方读取时的版本号(乐观锁校验)
-            生产路径必填(>0),None 时必须同时传 bypass_cas=True
+            生产路径必填(>0),None 时必须同时传 bypass_cas=True + approval_action_id
         bypass_cas: 是否显式跳过 CAS(仅运维/迁移使用,默认 False)
+            R52 P1-5: bypass_cas=True 时必须同时提供 approval_action_id,
+            否则 raise AppError(COLLECTION_CAS_BYPASS_NOT_ALLOWED)
+        approval_action_id: R52 P1-5 新增,bypass_cas=True 时必填(审批 action_id)
+        caller: R52 P1-5 新增,调用方标识(如 "migration"/"repair_console"),用于审计
 
     Returns:
         {success: bool, conflict: bool, new_version: int,
@@ -740,6 +754,7 @@ async def update_collection(
     Raises:
         AppError(COLLECTION_CAS_VERSION_REQUIRED): 未传 expected_version 且未 bypass_cas
         AppError(COLLECTION_CAS_BYPASS_NOT_ALLOWED): expected_version 与 bypass_cas 同时设置
+            或 bypass_cas=True 但未提供 approval_action_id
         AppError(COLLECTION_CAS_CONFLICT): 版本冲突(expected_version 不匹配)
     """
     store = get_cache_store()
@@ -757,6 +772,16 @@ async def update_collection(
                 "reason": "bypass_cas_and_expected_version_mutually_exclusive",
             },
         )
+    # R52 P1-5: bypass_cas=True 必须提供 approval_action_id(否则拒绝)
+    if bypass_cas and not approval_action_id:
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_BYPASS_NOT_ALLOWED,
+            params={
+                "collection_id": collection_id,
+                "reason": "bypass_cas_requires_approval_action_id",
+                "caller": caller or "unknown",
+            },
+        )
     # R51 P1-3: 生产路径必须传 expected_version(否则显式 bypass_cas=True)
     if (expected_version is None or int(expected_version) <= 0) and not bypass_cas:
         raise AppError(
@@ -766,6 +791,15 @@ async def update_collection(
                 "reason": "expected_version_required_or_bypass_cas_explicit",
             },
         )
+
+    # R52 P1-5: bypass_cas=True 时委托给私有方法(带审批 + 审计)
+    if bypass_cas:
+        return await _update_collection_without_cas(
+            collection_id, name, description,
+            approval_action_id=approval_action_id,
+            caller=caller or "update_collection_bypass",
+        )
+
     now = _dt.datetime.now().isoformat()
 
     # 构造 SET 子句(只更新非 None 字段)
@@ -889,6 +923,191 @@ async def update_collection(
             params={
                 "collection_id": collection_id,
                 "reason": f"update_failed: {e}",
+            },
+        )
+
+
+async def _update_collection_without_cas(
+    collection_id: int,
+    name: str | None = None,
+    description: str | None = None,
+    *,
+    approval_action_id: str = "",
+    caller: str = "",
+) -> dict:
+    """R52 P1-5: 私有方法 — 跳过 CAS 修改集合元数据(仅 migration/Repair Console)。
+
+    此方法是 ``update_collection(bypass_cas=True)`` 的私有替代,
+    强制要求 ``approval_action_id`` + ``caller`` 审计:
+
+    - 调用前必须通过 CommandBus 审批(approval_action_id 关联审批记录)
+    - 执行后写 audit_log 记录 caller / approval_action_id / 变更内容
+    - 公共 API ``update_collection`` 的 bypass 路径会委托到此方法
+
+    安全约束:
+        - 此方法不校验 expected_version(故意跳过 CAS)
+        - 调用方必须确保 approval_action_id 已通过审批
+        - audit_log 中标记 ``bypass_cas=True`` 便于事后追溯
+
+    Args:
+        collection_id: 集合 ID
+        name: 新名称(None=不修改)
+        description: 新描述(None=不修改)
+        approval_action_id: 审批 action_id(必填,空则拒绝)
+        caller: 调用方标识(如 "migration"/"repair_console",用于审计)
+
+    Returns:
+        {success: bool, conflict: bool, new_version: int,
+         current_version: int, message: str}
+
+    Raises:
+        AppError(COLLECTION_CAS_BYPASS_NOT_ALLOWED): approval_action_id 为空
+        AppError(COLLECTION_CAS_VERSION_REQUIRED): 集合不存在
+    """
+    if not approval_action_id:
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_BYPASS_NOT_ALLOWED,
+            params={
+                "collection_id": collection_id,
+                "reason": "approval_action_id_required_for_bypass",
+                "caller": caller or "unknown",
+            },
+        )
+
+    store = get_cache_store()
+    if not store._db:
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+            params={"collection_id": collection_id, "reason": "cache_store_unavailable"},
+        )
+
+    now = _dt.datetime.now().isoformat()
+
+    # 构造 SET 子句(只更新非 None 字段)
+    set_clauses: list[str] = []
+    params: list[Any] = []
+    if name is not None:
+        set_clauses.append("name = ?")
+        params.append(name)
+    if description is not None:
+        set_clauses.append("description = ?")
+        params.append(description)
+    if not set_clauses:
+        # 无字段需更新 — 直接读取当前版本
+        try:
+            cur = await store._db.execute(
+                "SELECT version FROM collections WHERE id = ?",
+                (collection_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                raise AppError(
+                    ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+                    params={
+                        "collection_id": collection_id,
+                        "reason": "collection_not_found",
+                    },
+                )
+            return {
+                "success": True, "conflict": False,
+                "new_version": int(row[0] or 1),
+                "current_version": int(row[0] or 1),
+                "message": "无字段需更新(bypass)",
+            }
+        except AppError:
+            raise
+        except Exception as e:
+            raise AppError(
+                ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+                params={
+                    "collection_id": collection_id,
+                    "reason": f"query_version_failed: {e}",
+                },
+            )
+
+    # 加入 version 递增 + updated_at(bypass 路径仍递增版本号,便于后续 CAS 恢复)
+    set_clauses.append("version = version + 1")
+    set_clauses.append("updated_at = ?")
+    params.append(now)
+
+    # WHERE 条件:仅 id = ?(bypass 不校验 version)
+    where_sql = "id = ?"
+    params.append(collection_id)
+
+    set_sql = ", ".join(set_clauses)
+    sql = f"UPDATE collections SET {set_sql} WHERE {where_sql}"
+
+    try:
+        async with store.transaction() as tx:
+            cursor = await tx.execute(sql, tuple(params))
+            affected = cursor.rowcount if cursor else 0
+            if affected == 0:
+                raise AppError(
+                    ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+                    params={
+                        "collection_id": collection_id,
+                        "reason": "collection_not_found",
+                    },
+                )
+            # 更新成功 → 写 dirty_outbox + audit_log + 读取新版本
+            await store.add_dirty_outbox(
+                "collections", str(collection_id), connection=tx,
+            )
+            # R52 P1-5: 写审计日志记录 bypass 调用(便于事后追溯)
+            audit_details = {
+                "action": "update_collection_bypass_cas",
+                "collection_id": collection_id,
+                "name": name,
+                "description": description,
+                "approval_action_id": approval_action_id,
+                "caller": caller or "unknown",
+                "bypass_cas": True,
+            }
+            try:
+                import json as _json
+                await tx.execute(
+                    "INSERT INTO audit_log "
+                    "(actor_id, actor_type, action, target_type, target_id, "
+                    "details, created_at) "
+                    "VALUES (?, 'system', 'update_collection_bypass', 'collection', ?, ?, ?)",
+                    (0, str(collection_id),
+                     _json.dumps(audit_details, ensure_ascii=False), now),
+                )
+                await store.add_dirty_outbox(
+                    "audit_log", "last", connection=tx,
+                )
+            except Exception as audit_err:
+                logger.warning(
+                    f"[collections] R52 P1-5: bypass audit_log 写入失败 "
+                    f"coll_id={collection_id}: {audit_err}"
+                )
+            v_cur = await tx.execute(
+                "SELECT version FROM collections WHERE id = ?",
+                (collection_id,),
+            )
+            v_row = await v_cur.fetchone()
+            new_v = int(v_row[0]) if v_row else 0
+        logger.info(
+            f"[collections] R52 P1-5: _update_collection_without_cas 成功 "
+            f"coll_id={collection_id} new_v={new_v} "
+            f"caller={caller} approval={approval_action_id}"
+        )
+        return {
+            "success": True, "conflict": False,
+            "new_version": new_v, "current_version": new_v,
+            "message": "更新成功(bypass,已审计)",
+        }
+    except AppError:
+        raise
+    except Exception as e:
+        logger.warning(
+            f"[collections] R52 P1-5: _update_collection_without_cas 失败: {e}"
+        )
+        raise AppError(
+            ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED,
+            params={
+                "collection_id": collection_id,
+                "reason": f"bypass_update_failed: {e}",
             },
         )
 
