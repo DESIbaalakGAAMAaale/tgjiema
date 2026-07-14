@@ -1,18 +1,10 @@
-"""R45: Effect Receipts 集成辅助函数。
+"""R44 G0-2 / R46 P0-1: Effect Receipts 集成辅助函数。
 
-提供装饰器和上下文管理器,简化外部副作用接入 effect receipt。
-
-设计目标:
-    - **不破坏现有 CommandBus 的 RBAC/审批/审计/幂等逻辑**;
-    - 仅在"外部副作用执行环节"添加 effect receipt 包装(check→pending→completed/failed);
-    - 已完成(completed)的副作用被跳过,实现 effectively-once 语义;
-    - manager 不可用时 fail-open(记录 warning 后直接执行),不影响主流程。
-
-依赖:
-    - services.effect_receipts.EffectReceiptManager(check_receipt / record_pending /
-      record_completed / record_failed)
-    - manager 由 ``get_receipt_manager(cache_store)`` 单例化,首次调用时 cache_store
-      必须已初始化;后续调用可不传 cache_store。
+R46 P0-1 整改:
+- critical effect 类型(telegram_send/copy/r2_put/restore/ban/takedown/purge) fail-closed:
+  manager 不可用或读写失败时直接 raise EffectReceiptError,拒绝执行外部副作用。
+- 非关键通知允许显式 best_effort=True(向后兼容)。
+- 装饰器/上下文管理器接收 best_effort 参数。
 """
 from __future__ import annotations
 
@@ -21,25 +13,31 @@ from typing import Any, Awaitable, Callable, Optional
 
 from loguru import logger
 
-from services.effect_receipts import get_receipt_manager
+from services.effect_receipts import (
+    CRITICAL_EFFECT_TYPES,
+    EffectReceiptError,
+    get_receipt_manager,
+)
 
 
-def with_effect_receipt(effect_type: str, target_fn: Optional[Callable] = None):
+def _is_critical(effect_type: str) -> bool:
+    """判断是否为 critical effect 类型。"""
+    return effect_type in CRITICAL_EFFECT_TYPES
+
+
+def with_effect_receipt(
+    effect_type: str,
+    target_fn: Optional[Callable] = None,
+    *,
+    best_effort: bool = False,
+):
     """装饰器:为外部副作用函数自动添加 effect receipt 包装。
 
     Args:
-        effect_type: 副作用类型('telegram_send' / 'r2_upload' / 'crdb_upsert' 等)
-        target_fn: 返回 target 字符串的可调用对象(默认用函数名)
-
-    用法:
-        @with_effect_receipt("telegram_send", lambda self, chat_id, **kw: f"chat:{chat_id}")
-        async def send_message(self, chat_id, text, **kwargs):
-            ...
-
-    调用时通过 ``action_id=`` 关键字参数传入幂等 ID:
-        await obj.send_message(chat_id, text, action_id="dsp_job_42")
-
-    若未传 ``action_id``(向后兼容),则直接执行原函数,不进行 receipt 包装。
+        effect_type: 副作用类型('telegram_send' / 'r2_upload' 等)
+        target_fn: 返回 target 字符串的可调用对象
+        best_effort: True 时 manager 不可用也执行(仅用于非关键通知);
+                     False 时 critical 类型 manager 不可用直接 raise。
     """
     def decorator(func: Callable[..., Awaitable[Any]]):
         @functools.wraps(func)
@@ -48,15 +46,24 @@ def with_effect_receipt(effect_type: str, target_fn: Optional[Callable] = None):
             if not action_id:
                 return await func(*args, **kwargs)
 
+            is_critical = _is_critical(effect_type)
+            # R46 P0-1: critical 副作用且非 best_effort → fail-closed
+            fail_closed = is_critical and not best_effort
+
             manager = get_receipt_manager()
             if manager is None:
-                # manager 不可用 → fail-open(记录 warning 后直接执行)
+                if fail_closed:
+                    raise EffectReceiptError(
+                        f"[effect_receipt] manager 不可用,critical 副作用拒绝执行 "
+                        f"{func.__name__}(effect_type={effect_type})"
+                    )
+                # 非关键或 best_effort → fail-open
                 logger.warning(
                     f"[effect_receipt] manager 不可用,直接执行 {func.__name__}"
                 )
                 return await func(*args, **kwargs)
 
-            # 计算 target(优先 target_fn,失败则用函数名)
+            # 计算 target
             target = func.__name__
             if target_fn is not None:
                 try:
@@ -65,7 +72,9 @@ def with_effect_receipt(effect_type: str, target_fn: Optional[Callable] = None):
                     target = func.__name__
 
             # 1. 检查是否已完成 → 跳过(幂等)
-            receipt = await manager.check_receipt(action_id, effect_type, target)
+            receipt = await manager.check_receipt(
+                action_id, effect_type, target, fail_closed=fail_closed,
+            )
             if receipt is not None and receipt.get("status") == "completed":
                 logger.info(
                     f"[effect_receipt] 跳过已完成副作用: "
@@ -76,11 +85,17 @@ def with_effect_receipt(effect_type: str, target_fn: Optional[Callable] = None):
                     "external_id": receipt.get("external_id", ""),
                 }
 
-            # 2. 记录 pending(开始执行)
-            await manager.record_pending(action_id, effect_type, target)
+            # 2. 记录 pending(开始执行) — CAS claim
+            claim_ok = await manager.record_pending(
+                action_id, effect_type, target, fail_closed=fail_closed,
+            )
+            if not claim_ok:
+                # 已 completed(竞态),跳过
+                return {"skipped": True, "external_id": ""}
+
             try:
                 result = await func(*args, **kwargs)
-                # 3. 提取 external_id(支持 dict 形式的返回值)
+                # 3. 提取 external_id
                 external_id = ""
                 if isinstance(result, dict):
                     external_id = str(
@@ -90,11 +105,18 @@ def with_effect_receipt(effect_type: str, target_fn: Optional[Callable] = None):
                     )
                 await manager.record_completed(
                     action_id, effect_type, target, external_id,
+                    fail_closed=fail_closed,
                 )
                 return result
             except Exception as e:
                 # 4. 异常 → 记录 failed 后重新抛出
-                await manager.record_failed(action_id, effect_type, target)
+                try:
+                    await manager.record_failed(
+                        action_id, effect_type, target,
+                        error_msg=str(e), fail_closed=fail_closed,
+                    )
+                except EffectReceiptError:
+                    pass  # record_failed 失败不掩盖原异常
                 raise
 
         return wrapper
@@ -104,38 +126,37 @@ def with_effect_receipt(effect_type: str, target_fn: Optional[Callable] = None):
 class EffectReceiptContext:
     """上下文管理器:为代码块添加 effect receipt 包装。
 
-    用法:
-        async with EffectReceiptContext(
-            action_id="dsp_job_42",
-            effect_type="telegram_send",
-            target=f"chat:{chat_id}",
-        ) as receipt:
-            if receipt.skipped:
-                return receipt.external_id  # 已完成,跳过
-            result = await bot.send_message(chat_id, text)
-            receipt.set_external_id(str(result.message_id))
-
-    特性:
-        - manager 不可用时 fail-open,skipped 永远为 False(继续执行原逻辑);
-        - 已 completed 时 skipped=True,调用方应检查并跳过副作用;
-        - 异常退出时自动 record_failed;正常退出时 record_completed。
+    R46 P0-1: critical 副作用 manager 不可用时 raise EffectReceiptError,
+    非关键或 best_effort=True 时 fail-open(继续执行)。
     """
 
-    def __init__(self, action_id: str, effect_type: str, target: str):
+    def __init__(
+        self,
+        action_id: str,
+        effect_type: str,
+        target: str,
+        *,
+        best_effort: bool = False,
+    ):
         self.action_id = action_id
         self.effect_type = effect_type
         self.target = target
+        self.best_effort = best_effort
+        self.is_critical = _is_critical(effect_type)
+        self.fail_closed = self.is_critical and not best_effort
         self.manager: Optional[Any] = None
         self.skipped: bool = False
         self.external_id: str = ""
-        # R45-dsp_bot: 标记 with 块内未实际执行副作用(早返回场景),
-        # __aexit__ 时跳过 record_completed/record_failed,允许下一轮重试
         self._no_record: bool = False
 
     async def __aenter__(self) -> "EffectReceiptContext":
         self.manager = get_receipt_manager()
         if self.manager is None:
-            # manager 不可用 → fail-open,直接进入 with 块
+            if self.fail_closed:
+                raise EffectReceiptError(
+                    f"[effect_receipt] manager 不可用,critical 副作用拒绝执行 "
+                    f"action={self.action_id} type={self.effect_type}"
+                )
             logger.warning(
                 f"[effect_receipt] manager 不可用,直接执行 "
                 f"action={self.action_id} type={self.effect_type}"
@@ -145,6 +166,7 @@ class EffectReceiptContext:
         # 检查是否已完成 → 跳过
         receipt = await self.manager.check_receipt(
             self.action_id, self.effect_type, self.target,
+            fail_closed=self.fail_closed,
         )
         if receipt is not None and receipt.get("status") == "completed":
             self.skipped = True
@@ -156,46 +178,46 @@ class EffectReceiptContext:
             )
             return self
 
-        # 记录 pending
-        await self.manager.record_pending(
+        # 记录 pending — CAS claim
+        claim_ok = await self.manager.record_pending(
             self.action_id, self.effect_type, self.target,
+            fail_closed=self.fail_closed,
         )
+        if not claim_ok:
+            self.skipped = True
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
-        # manager 不可用 / 已跳过 / 标记 no_record → 不写入
         if self.manager is None or self.skipped or self._no_record:
             return False
 
         if exc_type is None:
             # 正常退出 → 记录 completed
-            await self.manager.record_completed(
-                self.action_id, self.effect_type, self.target,
-                self.external_id,
-            )
+            try:
+                await self.manager.record_completed(
+                    self.action_id, self.effect_type, self.target,
+                    self.external_id, fail_closed=self.fail_closed,
+                )
+            except EffectReceiptError:
+                if self.fail_closed:
+                    raise
+                logger.warning("[effect_receipt] record_completed 失败(fail-open)")
         else:
             # 异常退出 → 记录 failed(不吞异常)
-            await self.manager.record_failed(
-                self.action_id, self.effect_type, self.target,
-            )
-        return False  # 不吞异常,继续向上抛
+            try:
+                await self.manager.record_failed(
+                    self.action_id, self.effect_type, self.target,
+                    error_msg=str(exc_val) if exc_val else "",
+                    fail_closed=self.fail_closed,
+                )
+            except EffectReceiptError:
+                if self.fail_closed:
+                    raise
+                logger.warning("[effect_receipt] record_failed 失败(fail-open)")
+        return False  # 不吞异常
 
     def set_external_id(self, external_id: str) -> None:
-        """设置 external_id(在 with 块内调用,用于 record_completed 时携带)。
-
-        Args:
-            external_id: 外部系统返回的 ID(如 Telegram message_id)
-        """
         self.external_id = str(external_id) if external_id is not None else ""
 
     def mark_no_record(self) -> None:
-        """标记 with 块内未实际执行副作用(早返回场景)。
-
-        调用后 ``__aexit__`` 会跳过 record_completed/record_failed,
-        允许下一轮重试时重新进入 pending 状态。
-
-        适用场景:
-            - dsp_bot 中 msg_id 为 0、Resolver fail-closed 等早返回;
-            - 已通过 delivery_receipts 幂等命中,无需再写 effect receipt。
-        """
         self._no_record = True

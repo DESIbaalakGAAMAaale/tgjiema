@@ -1,13 +1,13 @@
-"""R45 17.2: 按钮 callback 签名验证,防止伪造 user_id/role/action。
+"""R45 17.2 / R46 P1: 按钮 callback 签名验证,防止伪造 user_id/role/action。
 
-按钮 callback_data 携带签名 token,服务端验证签名后才执行操作。
-不信任客户端传入的 user_id/role/action,所有身份信息以签名为准。
+R46 P1 增强:
+    - 添加 nonce 防重放(短随机串)
+    - callback_data 格式: {user_id}:{action}:{data}:{expire_ts}:{nonce}:{signature}
+    - 服务端重新加载权限与资源状态,不信任 callback 内 user_id/role
 
 设计要点:
-    - callback_data 格式: {user_id}:{action}:{data}:{expire_ts}:{signature}
     - 签名密钥使用 BOT_TOKEN(每个 bot 唯一,不对外暴露)
     - HMAC-SHA256 截断 16 字符(64 bit),平衡安全与 callback_data 长度限制
-      (Telegram callback_data 上限 64 字节)
     - TTL 默认 1 小时,过期后按钮失效需重新生成
     - 使用 hmac.compare_digest 进行常量时间比较,防止时序攻击
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import secrets
 import time
 from typing import Tuple
 
@@ -28,22 +29,28 @@ def generate_signed_callback(
     action: str,
     data: str = "",
     ttl: int = 3600,
+    nonce: str = "",
 ) -> str:
     """生成签名 callback_data。
 
-    格式: {user_id}:{action}:{data}:{expire_ts}:{signature}
+    R46 P1: 添加 nonce 防重放。
+
+    格式: {user_id}:{action}:{data}:{expire_ts}:{nonce}:{signature}
 
     Args:
         user_id: 用户 ID(必须为整数)
         action: 动作标识(如 "confirm", "cancel", "retry", "appeal")
         data: 附加数据(如 file_code,可为空字符串)
         ttl: 有效期(秒,默认 1 小时)
+        nonce: 随机串(默认自动生成 8 字符)
 
     Returns:
         签名后的 callback_data 字符串
     """
     expire_ts = int(time.time()) + ttl
-    payload = f"{user_id}:{action}:{data}:{expire_ts}"
+    if not nonce:
+        nonce = secrets.token_hex(4)  # 8 字符 nonce
+    payload = f"{user_id}:{action}:{data}:{expire_ts}:{nonce}"
     signature = _sign(payload)
     return f"{payload}:{signature}"
 
@@ -53,6 +60,8 @@ def verify_signed_callback(
     current_user_id: int,
 ) -> Tuple[bool, str, str]:
     """验证签名 callback_data。
+
+    R46 P1: 支持 nonce 字段(向后兼容无 nonce 的旧格式)。
 
     验证流程:
         1. 解析 callback_data 各字段
@@ -70,15 +79,25 @@ def verify_signed_callback(
     """
     try:
         parts = callback_data.split(":")
+        # R46 P1: 支持 5 段(旧格式)和 6 段(新格式带 nonce)
         if len(parts) < 5:
             logger.debug(f"[button_security] callback_data 字段不足: {callback_data}")
             return False, "", ""
         user_id = int(parts[0])
         action = parts[1]
-        # data 可能包含冒号,合并中间所有段
-        data = ":".join(parts[2:-2])
-        expire_ts = int(parts[-2])
         signature = parts[-1]
+        # 判断是否为新的 6 段格式(含 nonce)
+        if len(parts) >= 6:
+            # 新格式: {user_id}:{action}:{data}:{expire_ts}:{nonce}:{signature}
+            data = ":".join(parts[2:-3])
+            expire_ts = int(parts[-3])
+            nonce = parts[-2]
+            payload = f"{user_id}:{action}:{data}:{expire_ts}:{nonce}"
+        else:
+            # 旧格式(向后兼容): {user_id}:{action}:{data}:{expire_ts}:{signature}
+            data = ":".join(parts[2:-2])
+            expire_ts = int(parts[-2])
+            payload = f"{user_id}:{action}:{data}:{expire_ts}"
         # 验证用户 ID(防止跨用户伪造)
         if user_id != current_user_id:
             logger.debug(
@@ -91,7 +110,6 @@ def verify_signed_callback(
             logger.debug(f"[button_security] callback_data 已过期: expire_ts={expire_ts}")
             return False, "", ""
         # 验证签名(常量时间比较,防止时序攻击)
-        payload = f"{user_id}:{action}:{data}:{expire_ts}"
         expected_sig = _sign(payload)
         if not hmac.compare_digest(signature, expected_sig):
             logger.debug("[button_security] 签名不匹配")

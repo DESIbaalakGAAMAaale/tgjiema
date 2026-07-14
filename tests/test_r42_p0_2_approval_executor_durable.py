@@ -116,6 +116,21 @@ def _reset_command_bus_idempotency():
     command_bus.reset_idempotency_cache()
 
 
+@pytest.fixture(autouse=True)
+def _reset_receipt_manager_singleton():
+    """R46 P0-1: 每个用例前重置 EffectReceiptManager 单例,避免跨用例持有已关闭 store。
+
+    real_store fixture 每次创建新的临时 SQLite,但 services.effect_receipts._receipt_manager
+    是模块级单例,会持有旧 store 引用,导致 check_receipt/record_pending 在旧 store 上
+    操作(返回 False 被 EffectReceiptContext 误判为 skipped),进而跳过 handler 调用。
+    """
+    from services import effect_receipts
+    original = effect_receipts._receipt_manager
+    effect_receipts._receipt_manager = None
+    yield
+    effect_receipts._receipt_manager = original
+
+
 @pytest_asyncio.fixture
 async def clean_tables(real_store):
     """每个用例前清空 command_executions / command_outbox / approvals 表。"""

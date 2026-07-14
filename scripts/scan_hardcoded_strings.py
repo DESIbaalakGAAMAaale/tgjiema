@@ -4,9 +4,17 @@
 R44 6.3: CI 扫描 Python/HTML 中**新增的**硬编码用户文案。
 使用 baseline 机制:已知违规记录在 baseline 文件中,仅新增违规导致 CI 失败。
 
+R46 P1 整改:
+    - 新增 --ratchet 模式:比较 base/head violation_count,head > base 立即失败。
+      baseline 只允许减少,不允许增加。CI 中使用此模式。
+    - --generate-baseline 添加警告:仅用于初始基线生成,不应在 PR 中使用。
+
 用法:
     # 扫描(默认,与 baseline 比对)
     python scripts/scan_hardcoded_strings.py
+
+    # CI ratchet 模式(违规数只能减不能增)
+    python scripts/scan_hardcoded_strings.py --ratchet
 
     # 重新生成 baseline(修复已知违规后更新)
     python scripts/scan_hardcoded_strings.py --generate-baseline
@@ -191,10 +199,16 @@ def collect_findings(root: Path) -> list[tuple[str, int, str, str]]:
 def main():
     root = Path(__file__).parent.parent
     generate_baseline = '--generate-baseline' in sys.argv
+    ratchet = '--ratchet' in sys.argv
 
     findings = collect_findings(root)
 
     if generate_baseline:
+        # R46 P1: 添加警告 — 仅用于初始基线生成,不应在 PR 中使用
+        print("⚠️  警告: --generate-baseline 仅用于初始基线生成,不应在 PR 中使用。")
+        print("   PR 中新增违规应修复后接入 i18n,而非纳入基线。")
+        print("   CI 中应使用 --ratchet 模式确保违规数只减不增。")
+        print()
         # 生成 baseline 模式
         violations = set()
         for file, line, ptype, content in findings:
@@ -203,6 +217,34 @@ def main():
         print(f"✓ Baseline 已生成: {BASELINE_FILE.name}")
         print(f"  已知违规: {len(violations)} 处")
         return 0
+
+    if ratchet:
+        # R46 P1: ratchet 模式 — baseline 只允许减少,不允许增加
+        # 比较 base(baseline violation_count)与 head(当前扫描 violation_count)
+        baseline = _load_baseline()
+        base_count = len(baseline)
+        head_violations = set()
+        for file, line, ptype, content in findings:
+            head_violations.add(_violation_key(file, content))
+        head_count = len(head_violations)
+
+        if head_count > base_count:
+            print(f"❌ R46 P1 ratchet 检查失败: 违规数 {head_count} > baseline {base_count}")
+            print(f"   baseline 只允许减少,不允许增加。")
+            # 找出新增的违规(head 有但 base 没有)
+            new_violations = head_violations - baseline
+            print(f"   新增违规 {len(new_violations)} 处:")
+            for v in sorted(new_violations)[:50]:
+                print(f"     {v}")
+            if len(new_violations) > 50:
+                print(f"     ... 还有 {len(new_violations) - 50} 处")
+            print(f"\n   请修复新增的硬编码字符串并接入 i18n,而非扩大基线。")
+            return 1
+        else:
+            print(f"✓ R46 P1 ratchet 检查通过: 违规数 {head_count} <= baseline {base_count}")
+            if head_count < base_count:
+                print(f"   违规数已减少 ({base_count} → {head_count}),建议运行 --generate-baseline 更新基线。")
+            return 0
 
     # 正常扫描模式:与 baseline 比对
     baseline = _load_baseline()

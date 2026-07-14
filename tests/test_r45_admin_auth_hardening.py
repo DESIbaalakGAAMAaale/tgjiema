@@ -183,20 +183,32 @@ class TestStaticChecks:
         )
 
     def test_mfa_has_replay_protection_helpers(self):
-        """admin/mfa.py 应定义 TOTP 重放保护 + 限流辅助函数。"""
+        """admin/mfa.py 应定义 TOTP 重放保护 + 限流辅助函数。
+
+        R46 P1: _is_totp_replayed / _record_mfa_failure / _is_locked /
+        _clear_mfa_failures 已改为 async(读写 SQLite); _record_totp_usage /
+        reset_mfa_state_for_testing 保持 sync(仅 L1 缓存)。
+        """
         tree = _parse_ast(MFA_FILE)
         assert tree is not None
         sync_funcs = _get_sync_funcs(tree)
-        required = {
-            "_is_totp_replayed",
+        async_funcs = _get_async_funcs(tree)
+        # sync 辅助函数(仅 L1 缓存操作)
+        sync_required = {
             "_record_totp_usage",
+            "reset_mfa_state_for_testing",
+        }
+        sync_missing = sync_required - sync_funcs
+        assert not sync_missing, f"admin/mfa.py 缺少 sync 辅助函数: {sync_missing}"
+        # async 辅助函数(读写 SQLite 权威层)
+        async_required = {
+            "_is_totp_replayed",
             "_record_mfa_failure",
             "_is_locked",
             "_clear_mfa_failures",
-            "reset_mfa_state_for_testing",
         }
-        missing = required - sync_funcs
-        assert not missing, f"admin/mfa.py 缺少辅助函数: {missing}"
+        async_missing = async_required - async_funcs
+        assert not async_missing, f"admin/mfa.py 缺少 async 辅助函数: {async_missing}"
 
     def test_rbac_has_require_permission(self):
         """services/rbac.py 应定义 require_permission async 函数。"""
@@ -601,10 +613,13 @@ class TestMFATOTPReplayProtection:
             get_mfa_manager, _is_totp_replayed, _record_totp_usage, _is_locked,
         )
         principal_id = 16016
-        # 直接调用辅助函数测试
+        # R46 P1: _is_totp_replayed 改用 timestep 查询,同一 timestep 内任意 code
+        # 都被视为重放(防 TOTP 重放攻击);不同 timestep 才返回 False。
+        # 此处直接验证:记录当前 timestep 后,查询同一 timestep 应返回 True。
         _record_totp_usage(principal_id, "123456")
-        assert _is_totp_replayed(principal_id, "123456") is True
-        assert _is_totp_replayed(principal_id, "789012") is False
+        assert await _is_totp_replayed(principal_id, "123456") is True
+        # 同一 timestep 内不同 code 仍视为重放(timestep 维度的防重放)
+        assert await _is_totp_replayed(principal_id, "789012") is True
 
 
 # ════════════════════════════════════════════════════════════════
@@ -626,13 +641,13 @@ class TestMFALockout:
         # 生成 secret 并启用(用于 verify_totp_code 测试)
         await get_mfa_manager().generate_totp_secret(principal_id)
         await get_mfa_manager().enable_mfa(principal_id)
-        # 记录 4 次失败(未达阈值)
+        # 记录 4 次失败(未达阈值)— R46 P1: _record_mfa_failure / _is_locked 改为 async
         for i in range(_MFA_FAIL_MAX_ATTEMPTS - 1):
-            _record_mfa_failure(principal_id)
-            assert not _is_locked(principal_id), f"第 {i+1} 次失败后不应锁定"
+            await _record_mfa_failure(principal_id)
+            assert not await _is_locked(principal_id), f"第 {i+1} 次失败后不应锁定"
         # 第 5 次失败触发锁定
-        _record_mfa_failure(principal_id)
-        assert _is_locked(principal_id) is True, "5 次失败后应锁定"
+        await _record_mfa_failure(principal_id)
+        assert await _is_locked(principal_id) is True, "5 次失败后应锁定"
 
     @pytest.mark.asyncio
     async def test_lockout_rejects_verification(self, real_store):
@@ -646,9 +661,9 @@ class TestMFALockout:
         manager = get_mfa_manager()
         secret = await manager.generate_totp_secret(principal_id)
         await manager.enable_mfa(principal_id)
-        # 触发锁定
+        # 触发锁定 — R46 P1: _record_mfa_failure 改为 async
         for _ in range(_MFA_FAIL_MAX_ATTEMPTS):
-            _record_mfa_failure(principal_id)
+            await _record_mfa_failure(principal_id)
         # 即使传入正确的 code,锁定状态下也应返回 False
         totp = pyotp.TOTP(secret)
         correct_code = totp.now()
@@ -669,24 +684,29 @@ class TestMFALockout:
         manager = get_mfa_manager()
         secret = await manager.generate_totp_secret(principal_id)
         await manager.enable_mfa(principal_id)
-        # 记录 3 次失败(未锁定)
+        # 记录 3 次失败(未锁定)— R46 P1: 改为 async 调用
         for _ in range(3):
-            _record_mfa_failure(principal_id)
-        assert not _is_locked(principal_id)
+            await _record_mfa_failure(principal_id)
+        assert not await _is_locked(principal_id)
         # 验证成功(使用正确的 code)
         totp = pyotp.TOTP(secret)
         code = totp.now()
         ok = await manager.verify_totp_code(principal_id, code)
         assert ok is True
         # 失败计数应已清除
-        _clear_mfa_failures(principal_id)
+        await _clear_mfa_failures(principal_id)
         # 再次验证同一 code 应被拒绝(重放),但可用新 code
         # (此处仅验证失败计数已清除)
 
-    def test_is_locked_no_failures(self):
-        """无失败记录时 _is_locked 返回 False。"""
+    @pytest.mark.asyncio
+    async def test_is_locked_no_failures(self, real_store):
+        """无失败记录时 _is_locked 返回 False。
+
+        R46 P1: _is_locked 改为 async(查询 SQLite),需 real_store fixture
+        确保 store 已初始化(否则 fail-closed 返回 True)。
+        """
         from admin.mfa import _is_locked
-        assert _is_locked(99999) is False
+        assert await _is_locked(99999) is False
 
 
 # ════════════════════════════════════════════════════════════════

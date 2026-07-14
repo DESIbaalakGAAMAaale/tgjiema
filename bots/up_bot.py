@@ -337,11 +337,13 @@ async def _mark_copied_unregistered(
     channel_id: int,
     reason: str = "",
 ) -> None:
-    """R45: 记录 Telegram copy 成功但 outbox 写失败的情况(COPIED_UNREGISTERED)。
+    """R45/R46 P0-3: 记录 Telegram copy 成功但 outbox 写失败的情况(COPIED_UNREGISTERED)。
 
-    当 safe_copy_message/copy_messages 成功返回 message_id,但后续
-    add_dirty_outbox / create_outbox_entry 写入失败时调用此方法。
-    保留目标 message_id,使后续恢复流程可重新注册 manifest 而不需重新 copy。
+    R46 P0-3 整改:
+      - 同时写入内存字典(_media_group_states)和持久表(unregistered_copies)。
+      - 进程重启后可通过 list_unreconciled_copies() 扫描未 reconciled 行,
+        优先补 Manifest 而非重新 copy。
+      - Manifest outbox 成功后调用 mark_unregistered_copy_reconciled() 标记完成。
 
     Args:
         upload_id: 上传会话 ID
@@ -353,6 +355,7 @@ async def _mark_copied_unregistered(
     """
     if not media_group_id:
         media_group_id = file_unique_id or upload_id
+    # 1. 写入内存字典(向后兼容)
     mg_state = _media_group_states.get(media_group_id)
     if mg_state is None:
         mg_state = {
@@ -371,8 +374,25 @@ async def _mark_copied_unregistered(
         "reason": reason,
         "marked_at": time.time(),
     }
+    # 2. R46 P0-3: 写入持久表 unregistered_copies
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if store and store._db:
+            await store.insert_unregistered_copy(
+                upload_id=upload_id,
+                file_unique_id=file_unique_id,
+                channel_id=channel_id,
+                message_id=message_id,
+                media_group_id=media_group_id,
+                reason=reason,
+            )
+    except Exception as persist_err:
+        logger.error(
+            f"[Up][R46] unregistered_copies 持久化失败(仅内存): {persist_err}"
+        )
     logger.warning(
-        f"[Up][R45] COPIED_UNREGISTERED: upload_id={upload_id} "
+        f"[Up][R46] COPIED_UNREGISTERED: upload_id={upload_id} "
         f"mg={media_group_id} fuid={file_unique_id} "
         f"msg_id={message_id} ch={channel_id} reason={reason}"
     )
@@ -557,7 +577,12 @@ async def _enrich_file_meta_for_replica(
 
 
 async def _register_manifest(channel_id: int, message_id: int, msg, media_type: str = "", file_unique_id_override: str = "", media_group_id: str = ""):
-    """写入 Active 频道后登记 manifest(异步,失败不影响主流程)。
+    """写入 Active 频道后登记 manifest。
+
+    R46 P1 整改:
+      - 异常不再被静默吞掉,改为记录 COPIED_UNREGISTERED 持久化状态,
+        使后续恢复流程可重新注册 Manifest 而不需重新 copy。
+      - 保留 try/except 防止主流程崩溃,但确保状态被持久化。
 
     Args:
         channel_id: 存储频道 ID
@@ -568,14 +593,14 @@ async def _register_manifest(channel_id: int, message_id: int, msg, media_type: 
         media_group_id: 媒体组分组键(空串表示独立文件)。mon_bot 据此避免跨批次拆散相册。
                        可传源 media_group_id 或 send_media_group 返回的 media_group_id。
     """
+    fuid = file_unique_id_override or (_extract_file_unique_id(msg) if msg else "")
+    if not fuid:
+        return
+    # 若未显式传入,尝试从 msg 提取 media_group_id
+    mgid = media_group_id or ""
+    if not mgid and msg is not None:
+        mgid = getattr(msg, "media_group_id", "") or ""
     try:
-        fuid = file_unique_id_override or (_extract_file_unique_id(msg) if msg else "")
-        if not fuid:
-            return
-        # 若未显式传入,尝试从 msg 提取 media_group_id
-        mgid = media_group_id or ""
-        if not mgid and msg is not None:
-            mgid = getattr(msg, "media_group_id", "") or ""
         await _ensure_channel_group_map()
         group_id = _channel_to_group.get(channel_id)
         if group_id is None:
@@ -583,8 +608,33 @@ async def _register_manifest(channel_id: int, message_id: int, msg, media_type: 
             return
         store = get_cache_store()
         await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type, mgid)
+        # R46 P0-3: Manifest 成功后标记 unregistered_copies reconciled
+        try:
+            await store.mark_unregistered_copy_reconciled(
+                upload_id=mgid or fuid,
+                file_unique_id=fuid,
+                channel_id=channel_id,
+                message_id=message_id,
+            )
+        except Exception:
+            pass  # reconciled 标记失败不影响主流程
     except Exception as e:
-        logger.warning(f"[Up] 登记 manifest 失败 (channel={channel_id}, msg_id={message_id}): {e}")
+        logger.error(
+            f"[Up][R46] 登记 manifest 失败,记录 COPIED_UNREGISTERED "
+            f"(channel={channel_id}, msg_id={message_id}, fuid={fuid}): {e}"
+        )
+        # R46 P0-3: 持久化 COPIED_UNREGISTERED 状态,启动时可恢复
+        try:
+            await _mark_copied_unregistered(
+                upload_id=mgid or fuid,
+                media_group_id=mgid,
+                file_unique_id=fuid,
+                message_id=message_id,
+                channel_id=channel_id,
+                reason=f"manifest_register_failed: {type(e).__name__}: {e}",
+            )
+        except Exception as mark_err:
+            logger.error(f"[Up][R46] _mark_copied_unregistered 也失败: {mark_err}")
 
 
 async def _check_dedup(target_channel: int, msg) -> dict | None:

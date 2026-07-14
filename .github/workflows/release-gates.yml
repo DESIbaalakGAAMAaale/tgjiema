@@ -318,7 +318,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [docker-build]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
-    continue-on-error: true  # R44: 非 required check,GHCR/cosign 配置完成前不阻塞 CI
+    # R46 P0-5: 删除 continue-on-error,签名失败必须阻断发布
     permissions:
       contents: read
       id-token: write
@@ -392,19 +392,23 @@ jobs:
   # 验证 master 分支已配置 branch protection(必需 status checks + PR review)
   verify-branch-protection:
     runs-on: ubuntu-latest
-    continue-on-error: true  # R44: 非 required check,branch protection 配置完成前不阻塞 CI
+    # R46 P0-5: 删除 continue-on-error,branch protection 未配置必须阻断
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
     - name: Verify branch protection is configured
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        # 检查 master 分支是否启用了 branch protection
-        RESPONSE=$(gh api repos/${{ github.repository }}/branches/master/protection 2>&1) || true
+        # R46 P0-5: gh api 非零立即失败,不吞错误
+        RESPONSE=$(gh api repos/${{ github.repository }}/branches/master/protection)
         if echo "$RESPONSE" | grep -q "Branch not protected"; then
-          echo "::warning::Branch protection 未配置,请运行 scripts/configure_branch_protection.sh"
+          echo "::error::Branch protection 未配置,请运行 scripts/configure_branch_protection.sh"
           exit 1
-        else
-          echo "Branch protection 已配置"
-          echo "$RESPONSE" | jq '.required_status_checks.contexts'
         fi
+        echo "Branch protection 已配置"
+        # R46 P0-5: 使用 jq -e 验证关键字段
+        echo "$RESPONSE" | jq -e '.required_status_checks.contexts'
+        echo "$RESPONSE" | jq -e '.required_pull_request_reviews.required_approving_review_count // 0'
+        echo "$RESPONSE" | jq -e '.enforce_admins.enabled'
+        echo "$RESPONSE" | jq -e '.allow_force_pushes.enabled' | grep -q 'false'
+        echo "Branch protection 验证通过"

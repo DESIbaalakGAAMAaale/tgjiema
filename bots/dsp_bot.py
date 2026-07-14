@@ -987,11 +987,12 @@ async def _process_single_job(bot, job, bot_id: int = 1):
         await _pause_job_for_receipt_failure(store, job.job_id)
         return False
 
-    # R45: EffectReceiptContext 包装 Telegram 发送动作(command_bus 层级 receipt,
-    # 与 delivery_receipts 互补)。崩溃重试时通过 receipt 判断是否已完成,
-    # 已完成则跳过 Telegram 副作用。
+    # R45/R46 P0-2: EffectReceiptContext 包装 Telegram 发送动作。
+    # R46 P0-2: action_id 粒度细化到单条消息,避免部分发送后崩溃无法判断状态。
+    # 格式: dsp:{job_id}:{source_channel_id}:{source_msg_id}:{target_user_id}
     from services.effect_receipts_integration import EffectReceiptContext
-    receipt_action_id = f"dsp_job_{job.job_id}"
+    _single_msg_id = msg_id if isinstance(msg_id, int) else (msg_id[0] if msg_id else 0)
+    receipt_action_id = f"dsp:{job.job_id}:{job.storage_channel_id}:{_single_msg_id}:{job.target_user_id}"
     receipt_target = f"chat:{job.target_user_id}"
     async with EffectReceiptContext(
         action_id=receipt_action_id,
@@ -1183,9 +1184,10 @@ async def _process_batch_job(bot, job, bot_id: int = 1) -> bool:
                 "protect_content": getattr(job, "protect_content", False),
             }
 
-    # R45: EffectReceiptContext 包装批量发送动作(command_bus 层级 receipt)
+    # R45/R46 P0-2: EffectReceiptContext 包装批量发送动作
+    # R46 P0-2: action_id 粒度细化到 batch 级别(含 source_channel_id)
     from services.effect_receipts_integration import EffectReceiptContext
-    receipt_action_id = f"dsp_job_{job.job_id}"
+    receipt_action_id = f"dsp_batch:{job.job_id}:{job.storage_channel_id}:{job.target_user_id}"
     receipt_target = f"chat:{job.target_user_id}"
     async with EffectReceiptContext(
         action_id=receipt_action_id,

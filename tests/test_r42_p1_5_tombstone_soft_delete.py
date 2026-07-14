@@ -21,7 +21,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -175,13 +175,20 @@ class TestDispatchCrdbTombstoneSoftDelete:
                 f"SQL 应包含 'is_tombstone = 1',实际: {sql}"
             )
 
-            # 验证参数:[deleted_at, pk]
+            # R46 P1: 验证参数:[deleted_at, version, pk] — R46 P1 整改后 UPDATE 携带 version
+            # (store.allocate_version 分配,通过 INSERT ON CONFLICT 原子递增)
             args = mock_col.execute_raw.call_args[0][1]
-            assert len(args) == 2
+            assert len(args) == 3, (
+                f"R46 P1: UPDATE 应携带 3 个参数 [deleted_at, version, pk],实际 {len(args)} 个: {args}"
+            )
             # 第一个参数为 deleted_at 时间戳(从 payload 提取)
             assert "2026-07-13" in str(args[0])
-            # 第二个参数为 pk
-            assert args[1] == "user-101"
+            # 第二个参数为 version(R46 P1: store.allocate_version 分配)
+            assert isinstance(args[1], (int, str)), (
+                f"version 应为 int 或 str,实际: {type(args[1])}"
+            )
+            # 第三个参数为 pk
+            assert args[2] == "user-101"
         finally:
             if original_session is not None:
                 sys.modules["database.session"] = original_session
@@ -242,12 +249,24 @@ class TestDispatchCrdbTombstoneFallback:
     async def test_dispatch_tombstone_fallback_to_delete_when_unsupported(
         self, cache_store,
     ):
-        """表不支持 soft_delete 时应 fallback 到 DELETE + audit_log。"""
+        """R46 P1-c: 表不支持 soft_delete 时 fail-closed 路由到 DLQ(不执行 hard delete)。
+
+        整改前: fallback 立即执行 DELETE FROM + audit_log
+        整改后: hard delete 只能由 retention worker 在备份保留窗口后执行,
+                crdb_sync 直接路由到 DLQ,避免数据不可恢复
+        """
         store = cache_store
         mock_session, mock_col = _setup_mock_session_with_soft_delete(supports=False)
 
         original_session = sys.modules.get("database.session")
         sys.modules["database.session"] = mock_session
+
+        # R46 P1: mock _route_dirty_outbox_to_dlq 验证 DLQ 路由
+        dlq_calls = []
+
+        async def mock_route_dlq(table_name, recs, error_msg):
+            dlq_calls.append((table_name, recs, error_msg))
+
         try:
             import importlib
             import services.crdb_sync_service as css
@@ -260,18 +279,22 @@ class TestDispatchCrdbTombstoneFallback:
                     "payload": None, "created_at": "2026-07-13T00:00:00",
                 },
             ]
-            ids = await css._dispatch_crdb_tombstone(records, "users", "user_id")
+            with patch.object(
+                css, "_route_dirty_outbox_to_dlq",
+                side_effect=mock_route_dlq,
+            ):
+                ids = await css._dispatch_crdb_tombstone(records, "users", "user_id")
 
+            # R46 P1: 返回所有 id 让 _sync_dirty_outbox 标记为 processed(已在 DLQ)
             assert ids == [1]
-            # 验证 SQL 为 DELETE
-            assert mock_col.execute_raw.call_count == 1
-            sql = mock_col.execute_raw.call_args[0][0]
-            assert "DELETE FROM users" in sql, (
-                f"应 fallback 到 DELETE,实际: {sql}"
-            )
-            assert "WHERE user_id" in sql
-
-            # 验证 audit_log 写入了一条 fallback 记录
+            # R46 P1: 应路由到 DLQ(1 次,表名匹配,记录数匹配)
+            assert len(dlq_calls) == 1
+            assert dlq_calls[0][0] == "users"
+            assert dlq_calls[0][1] == records
+            assert "does not support soft_delete" in dlq_calls[0][2]
+            # R46 P1: 不应执行任何 DELETE FROM(fail-closed,hard delete 由 retention worker 执行)
+            assert mock_col.execute_raw.call_count == 0
+            # R46 P1: 不应写 hard_delete_fallback audit_log(已废弃,改由 retention worker)
             cursor = await store._db.execute(
                 "SELECT action, target_type, target_id FROM audit_log "
                 "WHERE action = 'tombstone_hard_delete_fallback' "
@@ -279,10 +302,9 @@ class TestDispatchCrdbTombstoneFallback:
                 "ORDER BY id DESC LIMIT 1"
             )
             row = await cursor.fetchone()
-            assert row is not None, (
-                "fallback 路径应写 audit_log(action=tombstone_hard_delete_fallback)"
+            assert row is None, (
+                "R46 P1: 不应写 hard_delete_fallback audit_log(hard delete 由 retention worker 执行)"
             )
-            assert row[2] == "user-001"
         finally:
             if original_session is not None:
                 sys.modules["database.session"] = original_session

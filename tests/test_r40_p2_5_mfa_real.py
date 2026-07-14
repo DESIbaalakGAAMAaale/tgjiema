@@ -180,6 +180,22 @@ def _make_mock_cache_store():
             if len(params) >= 1:
                 key_to_delete = params[0]
                 kv_data.pop(key_to_delete, None)
+        # R46 P1: 处理 mfa_used_totp / mfa_failures 表查询
+        # SELECT 1 FROM mfa_used_totp WHERE principal_id = ? AND timestep = ? → 返回空结果(无重放)
+        if isinstance(sql, str) and "SELECT 1 FROM mfa_used_totp" in sql:
+            cursor = MagicMock()
+            cursor.fetchone = AsyncMock(return_value=None)
+            cursor.fetchall = AsyncMock(return_value=[])
+            return cursor
+        # SELECT COUNT(*) FROM mfa_failures WHERE principal_id = ? AND failed_at > ? → 返回 0
+        if isinstance(sql, str) and "SELECT COUNT(*) FROM mfa_failures" in sql:
+            cursor = MagicMock()
+            cursor.fetchone = AsyncMock(return_value=(0,))
+            cursor.fetchall = AsyncMock(return_value=[])
+            return cursor
+        # DELETE FROM mfa_failures → 静默成功
+        if isinstance(sql, str) and "DELETE FROM mfa_failures" in sql:
+            return MagicMock()
         return MagicMock()  # 模拟 cursor 返回
 
     async def _db_commit():

@@ -996,8 +996,9 @@ def _resolve_version_conflict(
 # ──────────────────────────────────────────────────────────────
 
 
-# R42 P1-5: CRDB 表 soft_delete schema 缓存
-# 缓存 table_name → bool(是否支持 deleted_at + is_tombstone 字段)
+# R42 P1-5 / R46 P1: CRDB 表 soft_delete schema 缓存
+# 缓存 table_name → bool(True=支持, False=确认不支持)
+# None(探测失败)不缓存,下次重试
 # 避免每次 tombstone dispatch 都查询 information_schema
 _CRDB_SOFT_DELETE_CACHE: dict[str, bool] = {}
 
@@ -1007,32 +1008,30 @@ def _reset_soft_delete_cache() -> None:
     _CRDB_SOFT_DELETE_CACHE.clear()
 
 
-async def _is_crdb_table_supports_soft_delete(table_name: str) -> bool:
-    """R42 P1-5: 检查 CRDB 表是否支持 soft_delete(有 deleted_at + is_tombstone 字段)。
+async def _is_crdb_table_supports_soft_delete(table_name: str) -> bool | None:
+    """R46 P1: 检查 CRDB 表是否支持 soft_delete(有 deleted_at + is_tombstone 字段)— tri-state。
 
-    结果缓存到 _CRDB_SOFT_DELETE_CACHE 避免重复查询。
-    查询失败或 CRDB 未连接时 fail-safe 返回 False(fallback 到 hard delete + audit_log)。
-
-    R44 7.2: database/session.py 已为 users/file_records/codes/cells 表添加 is_tombstone 列
-    (DDL_VERSION=10 + MIGRATION_STATEMENTS ALTER TABLE),迁移执行后此函数返回 True,
-    tombstone 走 soft_delete 路径(UPDATE deleted_at + is_tombstone=1)而非 DELETE fallback。
+    R46 P1 变更(fail-closed):
+        - 返回 None 表示探测失败(CRDB 未连接或查询异常),
+          调用方应 fail-closed(路由到 DLQ,不执行 hard delete)。
+        - 仅 True/False 缓存;None 不缓存(下次重试)。
 
     Args:
         table_name: CRDB 表名
 
     Returns:
-        True 若表同时有 deleted_at 和 is_tombstone 字段;False otherwise
+        True: 表同时有 deleted_at 和 is_tombstone 字段(支持 soft_delete)
+        False: 表确认缺少这些字段(不支持 soft_delete)
+        None: 探测失败(CRDB 未连接或查询异常)
     """
     if table_name in _CRDB_SOFT_DELETE_CACHE:
         return _CRDB_SOFT_DELETE_CACHE[table_name]
-    supports = False
     try:
         from database.session import _client
         # 检查 _client 是否真实连接(避免 mock 环境误判)
         if not getattr(_client, "is_connected", False):
-            # CRDB 未连接,无法查询 schema → fail-safe 返回 False(不缓存,
-            # 下次连接后重新查询)
-            return False
+            # R46 P1: CRDB 未连接,无法确认 schema → 返回 None(不缓存,下次重试)
+            return None
         # 查询 information_schema.columns 判断是否有 deleted_at / is_tombstone
         rows = await _client.fetch(
             "SELECT column_name FROM information_schema.columns "
@@ -1043,14 +1042,15 @@ async def _is_crdb_table_supports_soft_delete(table_name: str) -> bool:
         cols = {r[0] for r in rows} if rows else set()
         # 必须同时有 deleted_at 和 is_tombstone 才支持 soft_delete
         supports = "deleted_at" in cols and "is_tombstone" in cols
+        _CRDB_SOFT_DELETE_CACHE[table_name] = supports
+        return supports
     except Exception as e:
         logger.warning(
-            f"[crdb_sync] R42 P1-5: 查询 CRDB schema 失败 "
+            f"[crdb_sync] R46 P1: tombstone schema probe 失败 "
             f"table={table_name}: {e}"
         )
-        supports = False
-    _CRDB_SOFT_DELETE_CACHE[table_name] = supports
-    return supports
+        # R46 P1: 探测失败返回 None(不缓存,下次重试)
+        return None
 
 
 def _extract_deleted_at_from_record(record: dict) -> str:
@@ -1123,14 +1123,21 @@ async def _write_tombstone_audit_log(
 
 
 async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col: str) -> list[int]:
-    """R41 P0-6 / R42 P1-5: 将 tombstone 记录同步到 CRDB。
+    """R41 P0-6 / R42 P1-5 / R46 P1: 将 tombstone 记录同步到 CRDB。
+
+    R46 P1 变更(fail-closed):
+        - schema 探测失败(返回 None)→ fail-closed: 不执行 hard delete,
+          路由到 DLQ,记录日志 "tombstone schema probe failed, routing to DLQ"
+        - 表确认不支持 soft_delete(返回 False)→ 同样路由到 DLQ,
+          hard delete 只能由 retention worker 在备份保留窗口后执行,
+          不允许 crdb_sync 直接 hard delete
+        - tombstone UPDATE 使用 outbox version(store.allocate_version)
+          而非 COALESCE(version,0)+1
 
     R42 P1-5 变更(soft_delete 优先):
         - 不再立即 DELETE FROM crdb_table WHERE pk_col=?
         - 改为 UPDATE crdb_table SET deleted_at=?, is_tombstone=1 WHERE pk_col=?
           (mirror 保留 tombstone,供备份和跨机恢复使用)
-        - 若 crdb 表无 deleted_at 字段(不支持 soft_delete),
-          fallback 到 DELETE(但记 audit_log 标记 fallback 路径)
         - 物理清理由 retention_worker 在备份保留后执行(默认 30 天后)
 
     Args:
@@ -1161,19 +1168,40 @@ async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col:
         return []
     col = col_fn()
 
-    # R42 P1-5: 检查 CRDB 表是否支持 soft_delete(有 deleted_at + is_tombstone 字段)
+    # R46 P1: tri-state schema 探测(True/False/None)
     supports_soft_delete = await _is_crdb_table_supports_soft_delete(crdb_table)
-    if supports_soft_delete:
-        logger.debug(
-            f"[crdb_sync] R42 P1-5: {crdb_table} 支持 soft_delete, "
-            f"tombstone 将 UPDATE deleted_at + is_tombstone=1"
-        )
-    else:
-        logger.warning(
-            f"[crdb_sync] R42 P1-5: {crdb_table} 不支持 soft_delete "
-            f"(无 deleted_at/is_tombstone 字段或 CRDB 未连接), "
-            f"fallback 到 DELETE + audit_log"
-        )
+
+    # R46 P1: fail-closed — 探测失败或不支持 soft_delete 时路由到 DLQ,不执行 hard delete
+    if supports_soft_delete is not True:
+        if supports_soft_delete is None:
+            # 探测失败(CRDB 未连接或查询异常)
+            logger.error(
+                f"[crdb_sync] R46 P1: tombstone schema probe failed, routing to DLQ "
+                f"table={crdb_table} records={len(records)}"
+            )
+            await _route_dirty_outbox_to_dlq(
+                crdb_table, records,
+                "tombstone schema probe failed, routing to DLQ",
+            )
+        else:
+            # 确认不支持 soft_delete(无 deleted_at/is_tombstone 字段)
+            logger.error(
+                f"[crdb_sync] R46 P1: table {crdb_table} does not support soft_delete, "
+                f"routing to DLQ (hard delete only by retention worker) "
+                f"records={len(records)}"
+            )
+            await _route_dirty_outbox_to_dlq(
+                crdb_table, records,
+                f"table {crdb_table} does not support soft_delete, "
+                f"hard delete only by retention worker",
+            )
+        # R46 P1: 返回所有 id 让 _sync_dirty_outbox 标记为 processed(已在 DLQ)
+        return [r.get("id") for r in records if r.get("id") is not None]
+
+    logger.debug(
+        f"[crdb_sync] R46 P1: {crdb_table} 支持 soft_delete, "
+        f"tombstone 将 UPDATE deleted_at + is_tombstone=1"
+    )
 
     processed_ids: list[int] = []
     for r in records:
@@ -1183,43 +1211,40 @@ async def _dispatch_crdb_tombstone(records: list[dict], crdb_table: str, pk_col:
             logger.warning(f"[crdb_sync] R41 P0-6: tombstone id={rid} 无 pk, 跳过")
             continue
         try:
-            if supports_soft_delete:
-                # R42 P1-5 / R45 §14: soft_delete 路径 — UPDATE deleted_at + is_tombstone + version
-                # R45 §14: tombstone 同步 deleted_at/version,不立即 DELETE
-                # 从 payload / created_at 中提取 deleted_at 时间戳
-                deleted_at = _extract_deleted_at_from_record(r)
-                # R45 §14: 先尝试带 version 的 UPDATE(version = COALESCE(version, 0) + 1)
-                # 如果表无 version 字段,SQL 失败则 fallback 到不带 version 的 UPDATE
-                try:
-                    sql = (
-                        f"UPDATE {crdb_table} SET deleted_at = $1, "
-                        f"is_tombstone = 1, version = COALESCE(version, 0) + 1 "
-                        f"WHERE {pk_col} = $2"
-                    )
-                    await col.execute_raw(sql, [deleted_at, pk])
-                except Exception as ver_err:
-                    # 表无 version 字段,fallback 到不带 version 的 UPDATE
-                    logger.debug(
-                        f"[crdb_sync] R45 §14: tombstone 带 version UPDATE 失败"
-                        f"(表可能无 version 字段),fallback: {ver_err}"
-                    )
-                    sql = (
-                        f"UPDATE {crdb_table} SET deleted_at = $1, "
-                        f"is_tombstone = 1 WHERE {pk_col} = $2"
-                    )
-                    await col.execute_raw(sql, [deleted_at, pk])
-            else:
-                # R42 P1-5: fallback 路径 — DELETE + audit_log
-                # (表不支持 soft_delete,或 CRDB schema 查询失败)
-                sql = f"DELETE FROM {crdb_table} WHERE {pk_col} = $1"
-                await col.execute_raw(sql, [pk])
-                # 写 audit_log 标记 fallback 路径(便于审计追溯)
-                await _write_tombstone_audit_log(
-                    crdb_table, str(pk),
-                    "tombstone_hard_delete_fallback",
-                    f"CRDB 表 {crdb_table} 不支持 soft_delete "
-                    f"(无 deleted_at/is_tombstone 字段),fallback 到 DELETE",
+            # R42 P1-5 / R45 §14: soft_delete 路径 — UPDATE deleted_at + is_tombstone + version
+            # 从 payload / created_at 中提取 deleted_at 时间戳
+            deleted_at = _extract_deleted_at_from_record(r)
+
+            # R46 P1: 使用 outbox version(store.allocate_version)而非 COALESCE(version,0)+1
+            store = _get_cache_store_safe()
+            if store is None:
+                logger.error(
+                    f"[crdb_sync] R46 P1: store 不可用,无法 allocate_version "
+                    f"crdb_table={crdb_table} pk={pk} id={rid}"
                 )
+                continue
+            version = await store.allocate_version(crdb_table, str(pk))
+
+            # R45 §14: 先尝试带 version 的 UPDATE
+            # 如果表无 version 字段,SQL 失败则 fallback 到不带 version 的 UPDATE
+            try:
+                sql = (
+                    f"UPDATE {crdb_table} SET deleted_at = $1, "
+                    f"is_tombstone = 1, version = $2 "
+                    f"WHERE {pk_col} = $3"
+                )
+                await col.execute_raw(sql, [deleted_at, version, pk])
+            except Exception as ver_err:
+                # 表无 version 字段,fallback 到不带 version 的 UPDATE
+                logger.debug(
+                    f"[crdb_sync] R45 §14: tombstone 带 version UPDATE 失败"
+                    f"(表可能无 version 字段),fallback: {ver_err}"
+                )
+                sql = (
+                    f"UPDATE {crdb_table} SET deleted_at = $1, "
+                    f"is_tombstone = 1 WHERE {pk_col} = $2"
+                )
+                await col.execute_raw(sql, [deleted_at, pk])
             processed_ids.append(rid)
         except Exception as e:
             logger.warning(

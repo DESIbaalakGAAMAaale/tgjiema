@@ -620,7 +620,12 @@ class TestTombstoneSoftDelete:
 
     @pytest.mark.asyncio
     async def test_tombstone_fallback_delete_when_no_soft_delete(self):
-        """不支持 soft_delete 时 fallback 到 DELETE + audit_log。"""
+        """R46 P1: 不支持 soft_delete 时 fail-closed 路由到 DLQ(不执行 hard delete)。
+
+        整改前: fallback 立即执行 DELETE FROM + audit_log
+        整改后: hard delete 只能由 retention worker 在备份保留窗口后执行,
+                crdb_sync 直接路由到 DLQ,避免数据不可恢复
+        """
         from services.crdb_sync_service import _dispatch_crdb_tombstone
 
         mock_col = MagicMock()
@@ -636,18 +641,29 @@ class TestTombstoneSoftDelete:
             {"id": 1, "pk": "user-1", "payload": {}, "created_at": time.time()},
         ]
 
+        dlq_calls = []
+
+        async def mock_route_dlq(table_name, recs, error_msg):
+            dlq_calls.append((table_name, recs, error_msg))
+
         with patch(
             "services.crdb_sync_service._is_crdb_table_supports_soft_delete",
             AsyncMock(return_value=False),
         ), patch(
-            "services.crdb_sync_service._write_tombstone_audit_log",
-            AsyncMock(return_value=None),
+            "services.crdb_sync_service._route_dirty_outbox_to_dlq",
+            side_effect=mock_route_dlq,
         ), patch(
             "database.session.get_users_col",
             return_value=mock_col,
         ):
             ids = await _dispatch_crdb_tombstone(records, "users", "user_id")
 
+        # R46 P1: 返回所有 id 让 _sync_dirty_outbox 标记为 processed(已在 DLQ)
         assert ids == [1]
-        # 应执行 DELETE
-        assert any("DELETE FROM" in sql for sql in executed_sqls)
+        # R46 P1: 应路由到 DLQ(1 次,表名匹配,记录数匹配)
+        assert len(dlq_calls) == 1
+        assert dlq_calls[0][0] == "users"
+        assert dlq_calls[0][1] == records
+        assert "does not support soft_delete" in dlq_calls[0][2]
+        # R46 P1: 不应执行任何 DELETE FROM(fail-closed,hard delete 由 retention worker 执行)
+        assert not any("DELETE FROM" in sql for sql in executed_sqls)

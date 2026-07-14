@@ -1260,18 +1260,25 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_cmd_exec_status ON command_executions(status)"
         )
 
-        # ─── R44 G0-2: effect_receipts 表 — 外部副作用 receipt 持久化,保证 effectively-once ───
+        # ─── R44 G0-2 / R46 P0-1: effect_receipts 表 — 外部副作用 receipt 持久化 ───
+        # R46 P0-1: 增加 request_hash/attempt/lease_owner/lease_until/last_error/reconcile_status
         # 用于幂等控制:action_id + effect_type + target 唯一标识一个外部副作用,
         # 执行前检查 receipt 是否已 completed,避免重复触发外部副作用。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS effect_receipts (
-                action_id     TEXT NOT NULL,
-                effect_type   TEXT NOT NULL,
-                target        TEXT NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'pending',
-                external_id   TEXT,
-                created_at    TEXT NOT NULL,
-                completed_at  TEXT,
+                action_id          TEXT NOT NULL,
+                effect_type        TEXT NOT NULL,
+                target             TEXT NOT NULL,
+                status             TEXT NOT NULL DEFAULT 'pending',
+                external_id        TEXT,
+                created_at         TEXT NOT NULL,
+                completed_at       TEXT,
+                request_hash       TEXT,
+                attempt            INTEGER NOT NULL DEFAULT 0,
+                lease_owner        TEXT,
+                lease_until        TEXT,
+                last_error         TEXT,
+                reconcile_status   TEXT,
                 PRIMARY KEY (action_id, effect_type, target)
             )"""
         )
@@ -1280,6 +1287,88 @@ class CacheStore:
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_effect_receipts_status ON effect_receipts(status)"
+        )
+        # R46 P0-1: 幂等升级旧表 — 添加新列(已存在则忽略)
+        for _col_ddl in (
+            "ALTER TABLE effect_receipts ADD COLUMN request_hash TEXT",
+            "ALTER TABLE effect_receipts ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE effect_receipts ADD COLUMN lease_owner TEXT",
+            "ALTER TABLE effect_receipts ADD COLUMN lease_until TEXT",
+            "ALTER TABLE effect_receipts ADD COLUMN last_error TEXT",
+            "ALTER TABLE effect_receipts ADD COLUMN reconcile_status TEXT",
+        ):
+            try:
+                await self._db.execute(_col_ddl)
+            except Exception as _e:
+                if "duplicate column name" in str(_e).lower():
+                    logger.debug(
+                        f"[CacheStore] effect_receipts ALTER 升级(可忽略): {_e}"
+                    )
+                else:
+                    logger.warning(
+                        f"[CacheStore] effect_receipts ALTER TABLE失败(非预期): {_e}"
+                    )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_effect_receipts_reconcile "
+            "ON effect_receipts(reconcile_status) WHERE reconcile_status = 'needs_reconcile'"
+        )
+
+        # ─── R46 P1: mfa_used_totp 表 — TOTP 重放防护持久化(跨进程共享) ───
+        # R46 P1: 存储已使用的 TOTP timestep(principal_id, timestep)防重放,
+        # 替代进程内字典,确保多进程间共享重放检测状态。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS mfa_used_totp (
+                principal_id  INTEGER NOT NULL,
+                timestep      INTEGER NOT NULL,
+                used_at       REAL NOT NULL,
+                PRIMARY KEY (principal_id, timestep)
+            )"""
+        )
+
+        # ─── R46 P1: mfa_failures 表 — MFA 错误限流持久化(跨进程共享) ───
+        # R46 P1: 存储连续 TOTP 验证失败记录,用于跨进程限流(锁定 5 分钟)。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS mfa_failures (
+                principal_id  INTEGER NOT NULL,
+                failed_at     REAL NOT NULL,
+                PRIMARY KEY (principal_id, failed_at)
+            )"""
+        )
+
+        # ─── R46 P0-3: unregistered_copies 表 — 持久化 COPIED_UNREGISTERED 状态 ───
+        # Telegram copy 成功但 outbox 写失败时,持久化目标 channel/message_id,
+        # 进程重启后可扫描未 reconciled 行,优先补 Manifest 而非重新 copy。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS unregistered_copies (
+                upload_id       TEXT NOT NULL,
+                file_unique_id  TEXT NOT NULL,
+                media_group_id  TEXT,
+                channel_id      INTEGER NOT NULL,
+                message_id      INTEGER NOT NULL,
+                state           TEXT NOT NULL,
+                reason          TEXT,
+                created_at      TEXT NOT NULL,
+                reconciled_at   TEXT,
+                PRIMARY KEY (upload_id, file_unique_id, channel_id, message_id)
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_unreg_copies_state "
+            "ON unregistered_copies(state) WHERE reconciled_at IS NULL"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_unreg_copies_upload ON unregistered_copies(upload_id)"
+        )
+
+        # ─── R46 P1: entity_versions 表 — 原子 version 分配 ───
+        # 解决 dirty_outbox version 的 MAX+1 并发竞态
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS entity_versions (
+                table_name  TEXT NOT NULL,
+                pk          TEXT NOT NULL,
+                version     INTEGER NOT NULL,
+                PRIMARY KEY (table_name, pk)
+            )"""
         )
 
         await self._db.commit()
@@ -1485,14 +1574,16 @@ class CacheStore:
     # 消除 Idx Bot 对 CRDB 凭证的依赖(无 CRDB 时主循环仍可工作)。
 
     async def insert_pending_upload_local(self, record: dict, mark_dirty: bool = False) -> int:
-        """R40 P0-4: 写入 pending_uploads_local(Up Bot 双写时调用)。
+        """R40 P0-4 / R46 P0-4: 写入 pending_uploads_local(Up Bot 双写时调用)。
+
+        R46 P0-4 整改:
+          - pending_upload insert 和 dirty_outbox insert 使用同一个事务,
+            任一步失败全部 rollback(不再 warning-and-continue)。
+          - outbox 写失败时抛异常,让上层 UnitOfWork 回滚。
 
         Args:
-            record: pending_upload 字段字典,需包含 uploader_id / primary_channel_id /
-                    primary_channel_msg_id / file_types / batch_msg_ids / batch_file_meta /
-                    note / protect_content / file_ttl_days / upload_id
-            mark_dirty: 是否标记需要同步到 CRDB。默认 False(Up Bot 直写 CRDB,
-                        crdb_synced=1 表示已同步);True 则入 dirty_outbox 由 crdb_sync 同步
+            record: pending_upload 字段字典
+            mark_dirty: True 则入 dirty_outbox 由 crdb_sync 同步
 
         Returns:
             新插入行的 id;失败返回 0
@@ -1509,50 +1600,62 @@ class CacheStore:
             if isinstance(val, (list, dict)):
                 return _json_pu.dumps(val, default=str)
             return val
-        try:
-            cursor = await self._db.execute(
-                """INSERT INTO pending_uploads_local
-                   (uploader_id, primary_channel_id, primary_channel_msg_id,
-                    file_types, batch_msg_ids, batch_file_meta, status_msg_id,
-                    created_at, processed, claimed_at, note, protect_content,
-                    file_ttl_days, upload_id, dead_reason, dead_count,
-                    crdb_id, crdb_synced)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, '', 0, 0, ?)""",
-                (
-                    record.get("uploader_id"),
-                    record.get("primary_channel_id"),
-                    record.get("primary_channel_msg_id"),
-                    _serialize_pu(record.get("file_types")),
-                    record.get("batch_msg_ids", ""),
-                    _serialize_pu(record.get("batch_file_meta")),
-                    int(record.get("status_msg_id", 0) or 0),
-                    record.get("created_at") or _dt_pu.now().isoformat(),
-                    record.get("note", ""),
-                    int(bool(record.get("protect_content", False))),
-                    int(record.get("file_ttl_days", 0) or 0),
-                    record.get("upload_id", ""),
-                    1 if not mark_dirty else 0,
-                ),
-            )
-            new_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-            if not self._in_writer_tx:
+        # R46 P0-4: 统一事务 — BEGIN → insert pending → insert outbox → COMMIT
+        # 任一步失败全部 rollback
+        from contextlib import asynccontextmanager as _acm
+        @_acm
+        async def _tx_scope():
+            if self._in_writer_tx:
+                # 已在外层事务中,直接 yield
+                yield self._db
+                return
+            await self._db.execute("BEGIN")
+            try:
+                yield self._db
                 await self._db.commit()
-            if mark_dirty and new_id:
-                # 通过 dirty_outbox 让 crdb_sync 同步到 CRDB
-                try:
+            except Exception:
+                await self._db.rollback()
+                raise
+        try:
+            async with _tx_scope() as _tx:
+                cursor = await _tx.execute(
+                    """INSERT INTO pending_uploads_local
+                       (uploader_id, primary_channel_id, primary_channel_msg_id,
+                        file_types, batch_msg_ids, batch_file_meta, status_msg_id,
+                        created_at, processed, claimed_at, note, protect_content,
+                        file_ttl_days, upload_id, dead_reason, dead_count,
+                        crdb_id, crdb_synced)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, '', 0, 0, ?)""",
+                    (
+                        record.get("uploader_id"),
+                        record.get("primary_channel_id"),
+                        record.get("primary_channel_msg_id"),
+                        _serialize_pu(record.get("file_types")),
+                        record.get("batch_msg_ids", ""),
+                        _serialize_pu(record.get("batch_file_meta")),
+                        int(record.get("status_msg_id", 0) or 0),
+                        record.get("created_at") or _dt_pu.now().isoformat(),
+                        record.get("note", ""),
+                        int(bool(record.get("protect_content", False))),
+                        int(record.get("file_ttl_days", 0) or 0),
+                        record.get("upload_id", ""),
+                        1 if not mark_dirty else 0,
+                    ),
+                )
+                new_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+                if mark_dirty and new_id:
+                    # R46 P0-4: dirty_outbox insert 与 pending_upload 在同一事务
+                    # 失败时整个事务 rollback,不再 warning-and-continue
                     payload = _json_pu.dumps(record, default=str)
                     if isinstance(payload, bytes):
                         payload = payload.decode()
                     await self.add_dirty_outbox(
                         "pending_uploads", str(new_id), "upsert", payload,
+                        tx=_tx,
                     )
-                except Exception as outbox_err:
-                    logger.warning(
-                        f"[CacheStore] insert_pending_upload_local add_dirty_outbox 失败 id={new_id}: {outbox_err}"
-                    )
-            return new_id
+                return new_id
         except Exception as e:
-            logger.warning(f"[CacheStore] insert_pending_upload_local 失败: {e}")
+            logger.error(f"[CacheStore] insert_pending_upload_local 失败(事务回滚): {e}")
             if self._in_writer_tx:
                 raise
             return 0
@@ -6302,6 +6405,109 @@ class CacheStore:
         )
         return [{"external_code": r[0], "system_code": r[1], "bot_username": r[2],
                  "created_at": r[3], "updated_at": r[4]} for r in rows]
+
+    # ─── R46 P0-3: unregistered_copies 持久化操作 ──────────────
+
+    async def insert_unregistered_copy(
+        self, upload_id: str, file_unique_id: str, channel_id: int,
+        message_id: int, media_group_id: str = "", reason: str = "",
+    ) -> bool:
+        """R46 P0-3: 持久化 COPIED_UNREGISTERED 记录。
+
+        Telegram copy 成功但 outbox 写失败时调用,持久化目标 channel/message_id,
+        进程重启后可扫描未 reconciled 行优先补 Manifest。
+        """
+        if not self._db:
+            return False
+        from datetime import datetime as _dt
+        now = _dt.utcnow().isoformat()
+        try:
+            await self._db.execute(
+                "INSERT OR IGNORE INTO unregistered_copies "
+                "(upload_id, file_unique_id, media_group_id, channel_id, "
+                " message_id, state, reason, created_at, reconciled_at) "
+                "VALUES (?, ?, ?, ?, ?, 'COPIED_UNREGISTERED', ?, ?, NULL)",
+                (upload_id, file_unique_id, media_group_id or None,
+                 channel_id, message_id, reason, now),
+            )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[CacheStore] insert_unregistered_copy 失败: {e}")
+            return False
+
+    async def mark_unregistered_copy_reconciled(
+        self, upload_id: str, file_unique_id: str, channel_id: int,
+        message_id: int,
+    ) -> bool:
+        """R46 P0-3: Manifest outbox 成功后标记 reconciled。"""
+        if not self._db:
+            return False
+        from datetime import datetime as _dt
+        now = _dt.utcnow().isoformat()
+        try:
+            cursor = await self._db.execute(
+                "UPDATE unregistered_copies SET reconciled_at = ? "
+                "WHERE upload_id = ? AND file_unique_id = ? "
+                "AND channel_id = ? AND message_id = ?",
+                (now, upload_id, file_unique_id, channel_id, message_id),
+            )
+            await self._db.commit()
+            return bool(cursor and cursor.rowcount > 0)
+        except Exception as e:
+            logger.error(f"[CacheStore] mark_unregistered_copy_reconciled 失败: {e}")
+            return False
+
+    async def list_unreconciled_copies(self, limit: int = 100) -> list[dict]:
+        """R46 P0-3: 启动时扫描未 reconciled 行,优先补 Manifest。"""
+        if not self._db:
+            return []
+        try:
+            cursor = await self._db.execute(
+                "SELECT upload_id, file_unique_id, media_group_id, "
+                "channel_id, message_id, state, reason, created_at "
+                "FROM unregistered_copies WHERE reconciled_at IS NULL "
+                "ORDER BY created_at ASC LIMIT ?",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            return [
+                {"upload_id": r[0], "file_unique_id": r[1],
+                 "media_group_id": r[2], "channel_id": r[3],
+                 "message_id": r[4], "state": r[5], "reason": r[6],
+                 "created_at": r[7]}
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"[CacheStore] list_unreconciled_copies 失败: {e}")
+            return []
+
+    # ─── R46 P1: entity_versions 原子 version 分配 ──────────────
+
+    async def allocate_version(self, table_name: str, pk: str) -> int:
+        """R46 P1: 原子分配递增 version,解决 MAX+1 并发竞态。
+
+        使用 BEGIN IMMEDIATE + UPSERT + RETURNING 保证原子性。
+        必须在事务中调用。
+        """
+        if not self._db:
+            return 1
+        try:
+            await self._db.execute(
+                "INSERT INTO entity_versions (table_name, pk, version) "
+                "VALUES (?, ?, 1) "
+                "ON CONFLICT(table_name, pk) DO UPDATE SET version = version + 1",
+                (table_name, pk),
+            )
+            cursor = await self._db.execute(
+                "SELECT version FROM entity_versions WHERE table_name = ? AND pk = ?",
+                (table_name, pk),
+            )
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 1
+        except Exception as e:
+            logger.error(f"[CacheStore] allocate_version 失败: {e}")
+            return 1
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────

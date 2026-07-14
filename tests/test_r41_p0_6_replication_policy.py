@@ -23,7 +23,7 @@ import sys
 import tempfile
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
@@ -480,7 +480,13 @@ class TestCrdbTombstoneHandler:
 
     @pytest.mark.asyncio
     async def test_dispatch_crdb_tombstone_deletes_by_pk(self):
-        """_dispatch_crdb_tombstone 通过 DELETE FROM <table> WHERE <pk_col>=$1 删除。"""
+        """R46 P1: _dispatch_crdb_tombstone 在 schema 探测失败(mock 环境 _client.is_connected=False)
+        时 fail-closed 路由到 DLQ,不执行 hard delete。
+
+        R46 P1-c 整改前: fallback 立即执行 DELETE FROM <table> WHERE <pk_col>=$1
+        R46 P1-c 整改后: schema 未确认时 fail-closed 路由到 DLQ,hard delete 只能由
+                        retention worker 在备份保留窗口后执行
+        """
         # Mock database.session 提供 D1Collection
         mock_col = MagicMock(name="mock_users_col")
         mock_col.execute_raw = AsyncMock(return_value=None)
@@ -494,6 +500,13 @@ class TestCrdbTombstoneHandler:
         # 注入 sys.modules
         original_session = sys.modules.get("database.session")
         sys.modules["database.session"] = mock_session
+
+        # R46 P1: mock _route_dirty_outbox_to_dlq 验证 DLQ 路由
+        dlq_calls = []
+
+        async def mock_route_dlq(table_name, recs, error_msg):
+            dlq_calls.append((table_name, recs, error_msg))
+
         try:
             # 重新导入 crdb_sync_service(若已导入则用现有模块)
             import importlib
@@ -504,16 +517,21 @@ class TestCrdbTombstoneHandler:
                 {"id": 1, "pk": "user-123", "operation": "tombstone"},
                 {"id": 2, "pk": "user-456", "operation": "tombstone"},
             ]
-            ids = await css._dispatch_crdb_tombstone(records, "users", "user_id")
-            assert ids == [1, 2], f"应返回成功处理的 id 列表,实际 {ids}"
+            with patch.object(
+                css, "_route_dirty_outbox_to_dlq",
+                side_effect=mock_route_dlq,
+            ):
+                ids = await css._dispatch_crdb_tombstone(records, "users", "user_id")
+            # R46 P1: 返回所有 id 让 _sync_dirty_outbox 标记为 processed(已在 DLQ)
+            assert ids == [1, 2], f"应返回所有 id(已路由到 DLQ),实际 {ids}"
 
-            # 验证 execute_raw 被调用 2 次,每次 DELETE FROM users WHERE user_id = $1
-            assert mock_col.execute_raw.call_count == 2
-            for call in mock_col.execute_raw.call_args_list:
-                args = call[0]
-                sql = args[0]
-                assert "DELETE FROM users" in sql
-                assert "WHERE user_id" in sql
+            # R46 P1: 应路由到 DLQ 1 次,表名匹配,记录数匹配
+            assert len(dlq_calls) == 1
+            assert dlq_calls[0][0] == "users"
+            assert dlq_calls[0][1] == records
+            assert "tombstone schema probe failed" in dlq_calls[0][2]
+            # R46 P1: 不应执行任何 DELETE FROM(fail-closed,hard delete 由 retention worker 执行)
+            assert mock_col.execute_raw.call_count == 0
         finally:
             if original_session is not None:
                 sys.modules["database.session"] = original_session
@@ -620,7 +638,11 @@ class TestDispatcherTombstoneIntegration:
 
     @pytest.mark.asyncio
     async def test_dispatcher_routes_tombstone_to_tombstone_handler(self):
-        """dispatcher 应将 tombstone operation 记录路由到 _dispatch_crdb_tombstone。"""
+        """R46 P1: dispatcher 应将 tombstone operation 路由到 _dispatch_crdb_tombstone。
+
+        R46 P1-c 整改后,_dispatch_crdb_tombstone 在 mock 环境(schema 探测失败)会
+        fail-closed 路由到 DLQ;返回 id 列表让 _sync_dirty_outbox 标记为 processed。
+        """
         # Mock database.session 提供所有 D1Collection
         mock_col = MagicMock(name="mock_col")
         mock_col.execute_raw = AsyncMock(return_value=None)
@@ -643,16 +665,14 @@ class TestDispatcherTombstoneIntegration:
                 {"id": 101, "pk": "file-code-001", "operation": "tombstone"},
                 {"id": 102, "pk": "file-code-002", "operation": "tombstone"},
             ]
+            # R46 P1: mock 环境 _client.is_connected=False,schema 探测返回 None,
+            # _dispatch_crdb_tombstone 走 DLQ 路径,返回所有 id 标记为 processed
             ids = await css._dispatch_dirty_outbox_to_crdb("file_records", records)
-            # 应返回成功处理的 id(已 dispatch 到 tombstone handler)
-            assert 101 in ids, "tombstone 记录 id=101 应被处理"
-            assert 102 in ids, "tombstone 记录 id=102 应被处理"
-            # 验证 execute_raw 被调用(DELETE FROM file_records WHERE file_code = $1)
-            assert mock_col.execute_raw.call_count >= 2
-            for call in mock_col.execute_raw.call_args_list:
-                sql = call[0][0]
-                assert "DELETE FROM file_records" in sql
-                assert "WHERE file_code" in sql
+            # 应返回成功处理的 id(已 dispatch 到 tombstone handler,handler 路由到 DLQ)
+            assert 101 in ids, "tombstone 记录 id=101 应被处理(路由到 DLQ)"
+            assert 102 in ids, "tombstone 记录 id=102 应被处理(路由到 DLQ)"
+            # R46 P1: 不应执行任何 DELETE FROM(fail-closed)
+            assert mock_col.execute_raw.call_count == 0
         finally:
             if original_session is not None:
                 sys.modules["database.session"] = original_session
