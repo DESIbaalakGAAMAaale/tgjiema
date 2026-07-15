@@ -409,17 +409,17 @@ jobs:
   #           差异、修复命令)。
   verify-branch-protection:
     runs-on: ubuntu-latest
-    # R53 P0-1: GITHUB_TOKEN 默认无 administration 权限,导致 gh api
-    # /branches/master/protection 返回 403 "Resource not accessible by integration"。
-    # 必须显式授予 administration: read 才能读取 BP 配置做断言。
+    # R53 P0-1: GITHUB_TOKEN 无 administration 权限(读 BP 返回 403
+    # "Resource not accessible by integration")。
+    # administration 不是 GITHUB_TOKEN 的有效 permission scope,必须用 PAT。
+    # 使用 repo secret BP_PAT_TOKEN(存储有 administration: read 权限的 PAT)。
     permissions:
       contents: read
-      administration: read
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
     - name: Verify branch protection is configured
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.BP_PAT_TOKEN }}
       run: |
         # R47/R48 P0-2: 严格断言所有 Branch Protection 属性,任何失败必须阻断
         set -euo pipefail
