@@ -340,6 +340,14 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
+    # R53: buildx 默认 docker driver 不支持 provenance/sbom attestation,
+    # 必须切换到 docker-container driver,否则 build-push-action 报错:
+    # "Attestation is not supported for the docker driver"
+    - name: Set up Docker Buildx (docker-container driver for attestation)
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      with:
+        driver: docker-container
+
     - name: Build and push OCI image
       id: build
       uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
@@ -401,6 +409,12 @@ jobs:
   #           差异、修复命令)。
   verify-branch-protection:
     runs-on: ubuntu-latest
+    # R53 P0-1: GITHUB_TOKEN 默认无 administration 权限,导致 gh api
+    # /branches/master/protection 返回 403 "Resource not accessible by integration"。
+    # 必须显式授予 administration: read 才能读取 BP 配置做断言。
+    permissions:
+      contents: read
+      administration: read
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
     - name: Verify branch protection is configured
