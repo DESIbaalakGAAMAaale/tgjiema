@@ -428,8 +428,17 @@ jobs:
         # R47/R48 P0-2: 严格断言所有 Branch Protection 属性,任何失败必须阻断
         set -euo pipefail
 
-        # R48 P0-2: 四个核心 workflow 前缀,BP contexts 中必须至少各有一个覆盖
-        REQUIRED_PREFIXES=("CI /" "Deploy Check /" "Release Gates /" "E2E Tests /")
+        # R53: GitHub Actions check-run 的 name 字段就是 job 名(无 "CI /" 前缀),
+        # 不是 "{workflow_name} / {job_name}"。原 REQUIRED_PREFIXES=("CI /" ...)
+        # 永远匹配不到实际 context(如 "test (3.11)"),导致 Assert B 永远失败。
+        # 改为按 workflow 分组列出代表 job,检查 BP 至少包含每组中一个 job。
+        # 格式: "workflow_name|job1,job2,job3"
+        WORKFLOW_JOBS=(
+          "CI|test (3.10),test (3.11),test (3.12),lint,i18n-check,static-gates,security,fault-injection,migration-dry-run"
+          "Deploy Check|verify-deploy"
+          "Release Gates|docker-build,docker-digest-verify,compose-config,redis-acl-matrix,schema-diff,backup-restore-drill,sbom,pip-audit,trivy,verify-branch-protection"
+          "E2E Tests|playwright-e2e"
+        )
 
         # 工具函数:任意失败时输出完整诊断后退出
         # 用法: fail_diag "错误消息"
@@ -590,18 +599,30 @@ jobs:
         fi
         echo "  ✓ BP contexts 全部在实际 check-runs 中存在"
 
-        # 5.6 R48 P0-2 核心断言 B:四个核心 workflow 前缀各至少有一个 context 覆盖
+        # 5.6 R53: 核心断言 B — 四个核心 workflow 各至少有一个代表 job 在 BP contexts 中
         #     (CI / Deploy Check / Release Gates / E2E Tests)
+        #     原实现用 "CI /" 前缀匹配,但实际 check-run name 就是 job 名(无前缀),
+        #     永远匹配不到。改为直接按 job 名检查。
         echo ""
-        echo "Assert B: 四个核心 workflow 前缀各至少有一个 context 覆盖"
+        echo "Assert B: 四个核心 workflow 各至少有一个 job 在 BP contexts 中覆盖"
         MISSING_COVERAGE=()
-        for prefix in "${REQUIRED_PREFIXES[@]}"; do
-          if echo "$BP_CONTEXTS_JSON" | jq -e --arg p "$prefix" \
-                'any(.[]; startswith($p))' > /dev/null; then
-            echo "  ✓ 覆盖: ${prefix}*"
+        for entry in "${WORKFLOW_JOBS[@]}"; do
+          workflow="${entry%%|*}"
+          jobs_csv="${entry##*|}"
+          IFS=',' read -ra jobs <<< "$jobs_csv"
+          covered_job=""
+          for job in "${jobs[@]}"; do
+            if echo "$BP_CONTEXTS_JSON" | jq -e --arg j "$job" \
+                  'any(.[]; . == $j)' > /dev/null 2>&1; then
+              covered_job="$job"
+              break
+            fi
+          done
+          if [ -n "$covered_job" ]; then
+            echo "  ✓ ${workflow}: ${covered_job}"
           else
-            echo "  ✗ 缺失: ${prefix}*"
-            MISSING_COVERAGE+=("$prefix")
+            echo "  ✗ ${workflow}: 缺失(候选: ${jobs[*]})"
+            MISSING_COVERAGE+=("$workflow")
           fi
         done
         if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
@@ -609,8 +630,8 @@ jobs:
             --argjson bp "$BP_CONTEXTS_JSON" \
             --argjson actual "$ACTUAL_CONTEXTS_JSON" \
             --arg missing "${MISSING_COVERAGE[*]}" \
-            '{bp_contexts: $bp, actual_check_runs: $actual, missing_workflow_prefixes: ($missing | split(" "))}')
-          fail_diag "BP contexts 未覆盖以下 workflow 前缀: ${MISSING_COVERAGE[*]}"
+            '{bp_contexts: $bp, actual_check_runs: $actual, missing_workflows: ($missing | split(" "))}')
+          fail_diag "BP contexts 未覆盖以下 workflow: ${MISSING_COVERAGE[*]}"
         fi
 
         # 5.7 R48 P0-2 核心断言 C:BP contexts 集合应与实际 check-runs 集合一致
