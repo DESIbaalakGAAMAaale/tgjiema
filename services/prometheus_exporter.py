@@ -348,10 +348,13 @@ _RU_DATA_FRESH_THRESHOLD = 3600
 
 
 def _compute_crdb_ru_source_label() -> tuple[str, float, int]:
-    """R42 P1-10: 计算 CRDB RU 指标的 source label 与 freshness。
+    """R42 P1-10 + R54 P1-1: 计算 CRDB RU 指标的 source label 与 freshness。
 
-    从 kv_store 读取 crdb_ru_daily 与 crdb_ru_last_collected_at,
-    根据时间戳判断数据新鲜度。
+    R54 P1-1 整改: Exporter 只读取显式 source,不得通过 freshness 推断。
+    - 从 kv_store.crdb_ru_source 读取 Collector 写入的不可伪造来源标记
+    - "official_cloud_api" → "official"(仅 crdb_ru_collector.write_ru_to_kv_store 写入)
+    - 空值/其他值 + 数据陈旧 → "unknown"
+    - 无 RU 值且无时间戳 → "failed"
 
     Returns:
         (source_label, freshness_seconds, source_gauge_value)
@@ -393,19 +396,27 @@ def _compute_crdb_ru_source_label() -> tuple[str, float, int]:
             except (ValueError, TypeError):
                 freshness_seconds = -1.0
 
-    # 判定 source
+    # R54 P1-1: 读取不可伪造的显式 source(由 crdb_ru_collector 写入)
+    # 估算器使用独立 key,不会写入 "official_cloud_api"
+    explicit_source = _read_kv_value("crdb_ru_source", "").strip()
+
+    # 判定 source:优先使用显式 source,不通过 freshness 推断
     if ru_value is None and freshness_seconds < 0:
         # 无 RU 值且无时间戳 → failed
         source_label = "failed"
+    elif explicit_source == "official_cloud_api" and freshness_seconds >= 0:
+        # R54 P1-1: 有显式官方来源标记 + 有效时间戳 → official
+        # 但数据陈旧仍降级为 unknown(collector 可能已停止)
+        if freshness_seconds >= _RU_DATA_FRESH_THRESHOLD:
+            source_label = "unknown"
+        else:
+            source_label = "official"
     elif freshness_seconds < 0:
-        # 有 RU 值但无时间戳 → unknown(无法判断新鲜度)
-        source_label = "unknown"
-    elif freshness_seconds >= _RU_DATA_FRESH_THRESHOLD:
-        # 数据陈旧 → unknown
+        # 有 RU 值但无时间戳 → unknown
         source_label = "unknown"
     else:
-        # 数据新鲜 → official
-        source_label = "official"
+        # 有数据但无显式 official source → unknown(估算值或未知来源)
+        source_label = "unknown"
 
     source_gauge_value = {"unknown": 0, "official": 1, "failed": 2}.get(
         source_label, 0

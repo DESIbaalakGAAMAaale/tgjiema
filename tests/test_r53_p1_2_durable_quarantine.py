@@ -32,15 +32,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
 import tempfile
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from database import redis_queue
+from database import cache_store as _cs_module
 from services.error_codes import AppError, ErrorCodes
 
 
@@ -77,6 +81,78 @@ def durable_outbox_tmpdir():
         redis_queue._durable_conn_lock = None
         redis_queue._DURABLE_DB_PATH = original_path
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@pytest_asyncio.fixture
+async def real_cache_store():
+    """每个用例使用独立的临时 cache_store 数据库,隔离生产数据。
+
+    创建带 command_executions 表的真实 CacheStore,供 quarantine_repair()
+    内部审批校验使用。用例结束自动清理。
+    """
+    tmpdir = tempfile.mkdtemp(prefix="r53_p1_2_cache_")
+    db_path = os.path.join(tmpdir, "test_cache.db")
+    original_path = _cs_module.DB_PATH
+    original_store = getattr(_cs_module, "_store", None)
+    _cs_module.DB_PATH = db_path
+    try:
+        s = _cs_module.CacheStore(db_path)
+        await s.init()
+        _cs_module._store = s
+        yield s
+        await s.close()
+    finally:
+        _cs_module.DB_PATH = original_path
+        _cs_module._store = original_store
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _compute_approval_request_hash(
+    row_id: int, action: str, new_data: dict | None,
+) -> str:
+    """计算与 quarantine_repair() 内部一致的审批 request_hash。
+
+    必须与 redis_queue.quarantine_repair() 中的 hash 计算逻辑保持一致,
+    否则审批校验会因 request_hash 不匹配而失败。
+    """
+    import hashlib
+    payload_str = json.dumps(
+        {"row_id": row_id, "action": action,
+         "new_data_hash": hashlib.sha256(
+             json.dumps(new_data, sort_keys=True, default=str).encode()
+         ).hexdigest() if new_data else ""},
+        sort_keys=True, default=str,
+    )
+    return hashlib.sha256(payload_str.encode()).hexdigest()
+
+
+async def _insert_approved_execution(
+    store, action_id: str, row_id: int, action: str,
+    new_data: dict | None = None, principal_id: int = 1,
+) -> str:
+    """向 command_executions 表插入一条 status='approved' 的审批记录。
+
+    返回计算出的 request_hash,供断言使用。
+    """
+    request_hash = _compute_approval_request_hash(row_id, action, new_data)
+    now = time.time()
+    await store._db.execute(
+        "INSERT INTO command_executions "
+        "(action_id, command_type, principal_id, status, request_hash, "
+        "created_at, updated_at, requires_approval, approved_at) "
+        "VALUES (?, ?, ?, 'approved', ?, ?, ?, 1, ?)",
+        (
+            action_id,
+            f"quarantine_repair:{action}",
+            principal_id,
+            request_hash,
+            now,
+            now,
+            now,
+        ),
+    )
+    await store._db.commit()
+    return request_hash
 
 
 async def _get_row_id_by_message_id(message_id: str) -> int:
@@ -248,7 +324,7 @@ class TestQuarantineRepair:
 
     @pytest.mark.asyncio
     async def test_quarantine_repair_rehash_restores_pending(
-        self, mock_redis, monkeypatch, durable_outbox_tmpdir,
+        self, mock_redis, monkeypatch, durable_outbox_tmpdir, real_cache_store,
     ):
         """quarantine_repair(rehash) → 重新计算 hash,状态从 quarantined 恢复为 pending。"""
         monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=mock_redis))
@@ -270,6 +346,14 @@ class TestQuarantineRepair:
 
         # 通过 quarantine_repair 修复(用原始正确 payload 重新计算 hash)
         row_id = await _get_row_id_by_message_id(msg_id)
+        # R54 P0-4: 插入审批记录,使 quarantine_repair() 内部审批校验通过
+        await _insert_approved_execution(
+            real_cache_store,
+            action_id="approval-rehash-001",
+            row_id=row_id,
+            action="rehash",
+            new_data=original_data,
+        )
         result = await redis_queue.quarantine_repair(
             row_id=row_id,
             action="rehash",
@@ -298,7 +382,7 @@ class TestQuarantineRepair:
 
     @pytest.mark.asyncio
     async def test_quarantine_repair_delete_removes_record(
-        self, mock_redis, monkeypatch, durable_outbox_tmpdir,
+        self, mock_redis, monkeypatch, durable_outbox_tmpdir, real_cache_store,
     ):
         """quarantine_repair(delete) → 物理删除 quarantined 记录。"""
         monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=mock_redis))
@@ -319,6 +403,14 @@ class TestQuarantineRepair:
 
         # 通过 quarantine_repair 删除
         row_id = await _get_row_id_by_message_id(msg_id)
+        # R54 P0-4: 插入审批记录,使 quarantine_repair() 内部审批校验通过
+        await _insert_approved_execution(
+            real_cache_store,
+            action_id="approval-delete-001",
+            row_id=row_id,
+            action="delete",
+            new_data=None,
+        )
         result = await redis_queue.quarantine_repair(
             row_id=row_id,
             action="delete",
@@ -370,7 +462,7 @@ class TestQuarantineRepair:
 
     @pytest.mark.asyncio
     async def test_quarantine_repair_rejects_non_quarantined(
-        self, mock_redis, monkeypatch, durable_outbox_tmpdir,
+        self, mock_redis, monkeypatch, durable_outbox_tmpdir, real_cache_store,
     ):
         """quarantine_repair 对非 quarantined 状态记录 → AppError(APPROVAL_STATE_INVALID)。"""
         monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=mock_redis))
@@ -387,6 +479,15 @@ class TestQuarantineRepair:
         status = await _get_status_by_message_id(msg_id)
         assert status == "pending"
 
+        # R54 P0-4: 插入审批记录,使审批校验通过,后续检查状态才到 APPROVAL_STATE_INVALID
+        await _insert_approved_execution(
+            real_cache_store,
+            action_id="approval-test-002",
+            row_id=row_id,
+            action="delete",
+            new_data=None,
+        )
+
         # 对 pending 状态调用 quarantine_repair → AppError
         with pytest.raises(AppError) as exc_info:
             await redis_queue.quarantine_repair(
@@ -399,7 +500,7 @@ class TestQuarantineRepair:
 
     @pytest.mark.asyncio
     async def test_quarantine_repair_rejects_invalid_action(
-        self, mock_redis, monkeypatch, durable_outbox_tmpdir,
+        self, mock_redis, monkeypatch, durable_outbox_tmpdir, real_cache_store,
     ):
         """quarantine_repair action 非法 → AppError(VALIDATION_FAILED)。"""
         monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=mock_redis))
@@ -416,6 +517,14 @@ class TestQuarantineRepair:
         await redis_queue.replay_durable_outbox(batch_size=100)
 
         row_id = await _get_row_id_by_message_id(msg_id)
+        # R54 P0-4: 插入审批记录(审批校验先于 action 校验,必须通过)
+        await _insert_approved_execution(
+            real_cache_store,
+            action_id="approval-test-003",
+            row_id=row_id,
+            action="invalid_action",
+            new_data=None,
+        )
         with pytest.raises(AppError) as exc_info:
             await redis_queue.quarantine_repair(
                 row_id=row_id,
@@ -426,7 +535,7 @@ class TestQuarantineRepair:
 
     @pytest.mark.asyncio
     async def test_quarantine_repair_rehash_requires_new_data(
-        self, mock_redis, monkeypatch, durable_outbox_tmpdir,
+        self, mock_redis, monkeypatch, durable_outbox_tmpdir, real_cache_store,
     ):
         """quarantine_repair(rehash) 缺少 new_data → AppError(VALIDATION_FAILED)。"""
         monkeypatch.setattr(redis_queue, "get_redis", AsyncMock(return_value=mock_redis))
@@ -443,6 +552,14 @@ class TestQuarantineRepair:
         await redis_queue.replay_durable_outbox(batch_size=100)
 
         row_id = await _get_row_id_by_message_id(msg_id)
+        # R54 P0-4: 插入审批记录(审批校验先于 new_data 校验,必须通过)
+        await _insert_approved_execution(
+            real_cache_store,
+            action_id="approval-test-004",
+            row_id=row_id,
+            action="rehash",
+            new_data=None,  # 与 quarantine_repair 调用一致
+        )
         with pytest.raises(AppError) as exc_info:
             await redis_queue.quarantine_repair(
                 row_id=row_id,

@@ -668,12 +668,8 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
     store = _get_store()
     if not store._db:
         return False
-    # R53 P1-5: 双状态机类型边界校验
-    # 先查询 command_type 与 requires_approval,如果是高风险动作且 requires_approval=1,
-    # 必须改走 claim_execution_approved 审批路径,抛 AppError 阻断旧入口执行。
-    # _auto_approve 标记:requires_approval=1 但不在 HIGH_RISK_ACTIONS registry 中时,
-    # 同步写入 approved_at 满足 SQL CHECK 约束(自动批准,允许走旧入口)。
-    _auto_approve = False
+    # R54 P0-1: requires_approval=1 一律禁止旧入口,fail-closed
+    # _auto_approve 已移除:不再允许未注册命令自动批准
     try:
         rows = await store._db.execute_fetchall(
             "SELECT command_type, requires_approval FROM command_executions "
@@ -688,12 +684,15 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
         return False
     if rows and rows[0]:
         command_type, requires_approval = rows[0]
-        # 高风险动作 + requires_approval=1 → 必须走审批路径
-        if requires_approval == 1 and command_type in HIGH_RISK_ACTIONS:
+        # R54 P0-1: requires_approval=1 一律禁止走旧入口,fail-closed
+        # 无论 command_type 是否在 HIGH_RISK_ACTIONS registry 中,
+        # 只要 requires_approval=1 就必须走 claim_execution_approved 审批路径。
+        # registry 漏项不得变成审批绕过,未知 command_type fail-closed。
+        if requires_approval == 1:
             logger.error(
-                f"[CommandBus] claim_execution 拒绝高风险动作走旧入口 "
+                f"[CommandBus] claim_execution 拒绝:requires_approval=1 "
                 f"action_id={action_id} command_type={command_type} "
-                f"requires_approval={requires_approval}"
+                f"in_registry={command_type in HIGH_RISK_ACTIONS}"
                 f"(必须改走 claim_execution_approved 审批路径)"
             )
             raise AppError(
@@ -701,41 +700,20 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
                 params={
                     "action_id": action_id,
                     "command_type": command_type,
-                    "reason": "high_risk_action_requires_approval_path",
+                    "reason": "requires_approval_must_use_approval_path",
                 },
             )
-        # 不在 HIGH_RISK_ACTIONS 中但 requires_approval=1 → 警告但不阻断
-        # (调用方可能误标记 requires_approval,允许走旧入口但记录 warning)
-        # R53 P1-5: 同步写入 approved_at 满足 SQL CHECK 约束
-        # (requires_approval=1 时必须有 approved_at 才能转 executing)
-        if requires_approval == 1 and command_type not in HIGH_RISK_ACTIONS:
-            logger.warning(
-                f"[CommandBus] claim_execution 警告:requires_approval=1 但 "
-                f"command_type={command_type} 不在 HIGH_RISK_ACTIONS registry 中 "
-                f"action_id={action_id}(允许走旧入口,自动设置 approved_at,建议补充 registry)"
-            )
-            _auto_approve = True
     lease_until = _lease_until_iso(lease_seconds)
     now = _now_iso()
     try:
-        # R53 P1-5: _auto_approve=True 时同步写入 approved_at 满足 SQL CHECK 约束
-        if _auto_approve:
-            cursor = await store._db.execute(
-                "UPDATE command_executions "
-                "SET status = ?, owner = ?, lease_until = ?, "
-                "approved_at = COALESCE(approved_at, ?), updated_at = ? "
-                "WHERE action_id = ? AND status = ?",
-                (CMD_STATUS_EXECUTING, owner, lease_until, now, now,
-                 action_id, CMD_STATUS_PENDING),
-            )
-        else:
-            cursor = await store._db.execute(
-                "UPDATE command_executions "
-                "SET status = ?, owner = ?, lease_until = ?, updated_at = ? "
-                "WHERE action_id = ? AND status = ?",
-                (CMD_STATUS_EXECUTING, owner, lease_until, now,
-                 action_id, CMD_STATUS_PENDING),
-            )
+        # R54 P0-1: _auto_approve 已移除,requires_approval=1 一律必须走审批路径
+        cursor = await store._db.execute(
+            "UPDATE command_executions "
+            "SET status = ?, owner = ?, lease_until = ?, updated_at = ? "
+            "WHERE action_id = ? AND status = ?",
+            (CMD_STATUS_EXECUTING, owner, lease_until, now,
+             action_id, CMD_STATUS_PENDING),
+        )
         await store._db.commit()
         return cursor.rowcount > 0
     except AppError:

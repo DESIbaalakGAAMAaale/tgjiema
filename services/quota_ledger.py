@@ -1,4 +1,4 @@
-"""R40 §9.2: Quota Ledger — 预留/结算/退款流水。
+"""R40 §9.2 + R54 P1-4: Quota Ledger — 预留/结算/退款流水 + naive timestamp 迁移。
 
 职责:
 - reserve(): 预留配额(上传/解码前预扣,防止并发超额)
@@ -6,6 +6,7 @@
 - refund(): 退款(操作失败时回滚预留)
 - admin_adjust(): 管理员手动调整配额
 - cleanup_expired_reservations(): 清理超时未结算的预留
+- migrate_naive_timestamps(): R54 P1-4 迁移旧 naive timestamp → UTC aware
 
 数据表:
 - quota_reservations: 预留记录(id/user_id/amount/status/actual_amount/...)
@@ -640,3 +641,112 @@ async def force_release_quota(action_id: str, reason: str = "") -> bool:
             f"[QuotaLedger] force_release_quota 失败 res_id={action_id}: {e}"
         )
         return False
+
+
+# R54 P1-4: naive timestamp 迁移
+# 旧记录使用 datetime.now().isoformat() 写入(无时区信息,即 naive 本地时间)
+# 新记录使用 datetime.now(timezone.utc).isoformat() 写入(UTC aware ISO)
+# SQLite 文本比较不同格式时可能在日边界漏算或重复计算
+
+# 迁移时假定的旧部署时区(中国标准时间 UTC+8)
+_MIGRATION_ASSUME_TZ_OFFSET_HOURS = 8
+
+# 需要迁移的时间戳列(表名 → 列名列表)
+_NAIVE_TS_COLUMNS: dict[str, list[str]] = {
+    "quota_reservations": ["created_at", "settled_at", "expires_at"],
+    "quota_ledger": ["created_at"],
+}
+
+
+async def migrate_naive_timestamps(
+    assume_tz_offset_hours: int = _MIGRATION_ASSUME_TZ_OFFSET_HOURS,
+    batch_size: int = 1000,
+) -> dict:
+    """R54 P1-4: 迁移 quota 相关表中的 naive timestamp 为 UTC aware ISO。
+
+    识别规则: ISO 字符串中不含 '+' 或 '-' 时区偏移后缀的视为 naive。
+    按旧部署时区(默认 UTC+8)转为 UTC aware,格式为 YYYY-MM-DDTHH:MM:SS+00:00。
+
+    Args:
+        assume_tz_offset_hours: 旧部署时区偏移(小时,默认 +8 即 CST)
+        batch_size: 每批处理行数
+
+    Returns:
+        {"migrated_tables": int, "total_rows_migrated": int, "errors": list[str]}
+    """
+    from database.cache_store import get_cache_store as _get_store
+    store = _get_store()
+    if not store._db:
+        return {"migrated_tables": 0, "total_rows_migrated": 0, "errors": ["DB unavailable"]}
+
+    import re
+    # naive ISO 模式: 2024-01-15T10:30:00.123456 或 2024-01-15 10:30:00
+    # aware ISO 模式: ...+00:00 或 ...+08:00 或 ...Z
+    _NAIVE_PATTERN = re.compile(
+        r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+        r"(?:\.\d+)?$"
+    )
+
+    total_migrated = 0
+    migrated_tables = 0
+    errors: list[str] = []
+
+    offset_td = datetime.timedelta(hours=assume_tz_offset_hours)
+
+    for table_name, columns in _NAIVE_TS_COLUMNS.items():
+        table_count = 0
+        for col_name in columns:
+            try:
+                # 拉取所有可能是 naive 的记录
+                cursor = await store._db.execute(
+                    f"SELECT rowid, {col_name} FROM {table_name} "
+                    f"WHERE {col_name} IS NOT NULL AND {col_name} != '' "
+                    f"LIMIT ?",
+                    (batch_size,),
+                )
+                rows = await cursor.fetchall()
+                for row in rows:
+                    rowid, ts_val = row[0], str(row[1])
+                    if not ts_val or not _NAIVE_PATTERN.match(ts_val):
+                        continue
+                    # 将 naive 时间字符串解析为 datetime,按旧时区转 UTC
+                    try:
+                        naive_dt = datetime.datetime.fromisoformat(ts_val)
+                    except (ValueError, TypeError):
+                        continue
+                    # 假定旧时区为 UTC+offset → 转为 UTC
+                    # naive_dt 被视为旧本地时间,减去 offset 得到 UTC
+                    utc_dt = naive_dt - offset_td
+                    aware_iso = utc_dt.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                    try:
+                        await store._db.execute(
+                            f"UPDATE {table_name} SET {col_name} = ? WHERE rowid = ?",
+                            (aware_iso, rowid),
+                        )
+                        table_count += 1
+                    except Exception as e:
+                        errors.append(f"{table_name}.{col_name} rowid={rowid}: {e}")
+                # 提交本列的迁移
+                if table_count > 0:
+                    await store._db.commit()
+            except Exception as e:
+                errors.append(f"{table_name}.{col_name} query failed: {e}")
+        if table_count > 0:
+            migrated_tables += 1
+            total_migrated += table_count
+            logger.info(
+                f"[QuotaLedger] R54 P1-4: {table_name} 迁移 "
+                f"{table_count} 行 naive → UTC aware"
+            )
+
+    # 写入 schema 版本标记
+    try:
+        await store.set_kv("quota_timestamp_format_version", "2")
+    except Exception:
+        pass
+
+    return {
+        "migrated_tables": migrated_tables,
+        "total_rows_migrated": total_migrated,
+        "errors": errors,
+    }

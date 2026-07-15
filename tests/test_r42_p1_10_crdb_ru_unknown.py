@@ -483,7 +483,7 @@ class TestComputeCrdbRuSourceLabel:
     """R42 P1-10: prometheus_exporter._compute_crdb_ru_source_label 状态判定。"""
 
     def test_official_when_data_fresh(self, monkeypatch):
-        """新鲜数据(时间戳 < 阈值)→ source="official", gauge=1。"""
+        """R54 P1-1: 新鲜数据 + 显式 source=official_cloud_api → source="official", gauge=1。"""
         from services import prometheus_exporter as pe
 
         recent_ts = _make_iso(120)  # 2 分钟前
@@ -492,6 +492,9 @@ class TestComputeCrdbRuSourceLabel:
                 return "5000"
             if key == "crdb_ru_last_collected_at":
                 return recent_ts
+            # R54 P1-1: 显式 source 由 crdb_ru_collector 写入
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         monkeypatch.setattr(pe, "_read_kv_value", _mock_kv)
 
@@ -502,7 +505,7 @@ class TestComputeCrdbRuSourceLabel:
         assert gauge == 1
 
     def test_unknown_when_data_stale(self, monkeypatch):
-        """陈旧数据(时间戳 ≥ 阈值)→ source="unknown", gauge=0。"""
+        """R54 P1-1: 有显式 source 但数据陈旧 → source="unknown", gauge=0。"""
         from services import prometheus_exporter as pe
 
         stale_ts = _make_iso(7200)  # 2 小时前
@@ -511,6 +514,9 @@ class TestComputeCrdbRuSourceLabel:
                 return "5000"
             if key == "crdb_ru_last_collected_at":
                 return stale_ts
+            # R54 P1-1: 即使有显式 source,数据陈旧也降级为 unknown
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         monkeypatch.setattr(pe, "_read_kv_value", _mock_kv)
 
@@ -623,7 +629,7 @@ class TestPrometheusRuMetrics:
         pytest.fail("未找到 tgjiema_crdb_ru_source 指标行")
 
     def test_collect_metrics_ru_source_value_official_when_fresh(self, monkeypatch):
-        """数据新鲜时 tgjiema_crdb_ru_source=1(official)。"""
+        """R54 P1-1: 显式 source=official_cloud_api + 数据新鲜 → tgjiema_crdb_ru_source=1(official)。"""
         recent_ts = _make_iso(120)
         def _mock_kv(key, default="0"):
             if key == "crdb_ru_daily":
@@ -632,6 +638,9 @@ class TestPrometheusRuMetrics:
                 return recent_ts
             if key == "crdb_idle_ru_daily":
                 return "50"
+            # R54 P1-1: 显式 source 由 crdb_ru_collector 写入
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         pe = self._patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
 
@@ -644,13 +653,16 @@ class TestPrometheusRuMetrics:
         pytest.fail("未找到 tgjiema_crdb_ru_source 指标行")
 
     def test_collect_metrics_ru_source_value_unknown_when_stale(self, monkeypatch):
-        """数据陈旧时 tgjiema_crdb_ru_source=0(unknown)。"""
+        """R54 P1-1: 有显式 source 但数据陈旧 → tgjiema_crdb_ru_source=0(unknown)。"""
         stale_ts = _make_iso(7200)
         def _mock_kv(key, default="0"):
             if key == "crdb_ru_daily":
                 return "12345"
             if key == "crdb_ru_last_collected_at":
                 return stale_ts
+            # R54 P1-1: 即使有显式 source,数据陈旧也降级为 unknown
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         pe = self._patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
 
@@ -702,7 +714,7 @@ class TestPrometheusRuMetrics:
         pytest.fail("未找到 tgjiema_crdb_idle_ru_daily 指标行")
 
     def test_collect_metrics_idle_ru_real_value_when_official(self, monkeypatch):
-        """source="official" 时 tgjiema_crdb_idle_ru_daily 应显示真实值。"""
+        """R54 P1-1: 显式 source=official_cloud_api + 数据新鲜 → source="official"。"""
         recent_ts = _make_iso(120)
         def _mock_kv(key, default="0"):
             if key == "crdb_ru_daily":
@@ -711,6 +723,9 @@ class TestPrometheusRuMetrics:
                 return recent_ts
             if key == "crdb_idle_ru_daily":
                 return "42"
+            # R54 P1-1: 显式 source
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         pe = self._patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
 
@@ -725,13 +740,16 @@ class TestPrometheusRuMetrics:
         pytest.fail("未找到 tgjiema_crdb_idle_ru_daily 指标行")
 
     def test_collect_metrics_freshness_seconds_correct_when_official(self, monkeypatch):
-        """数据新鲜时 tgjiema_crdb_ru_freshness_seconds 应为非负数(< 阈值)。"""
+        """R54 P1-1: 数据新鲜 + 显式 source → freshness 应为非负数(< 阈值)。"""
         recent_ts = _make_iso(120)
         def _mock_kv(key, default="0"):
             if key == "crdb_ru_daily":
                 return "12345"
             if key == "crdb_ru_last_collected_at":
                 return recent_ts
+            # R54 P1-1: 显式 source
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         pe = self._patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
 

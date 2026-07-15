@@ -341,6 +341,9 @@ class TestRuGoSignalMetric:
                 return recent_ts
             if key == "crdb_idle_ru_daily":
                 return "42"
+            # R54 P1-1: crdb_ru_source 必须为 official_cloud_api 才标记为 official
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         pe = _patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
 
@@ -420,6 +423,9 @@ class TestRuGoSignalMetric:
                 return recent_ts
             if key == "crdb_idle_ru_daily":
                 return "200"  # 超过阈值 100
+            # R54 P1-1: crdb_ru_source 必须为 official_cloud_api 才标记为 official
+            if key == "crdb_ru_source":
+                return "official_cloud_api"
             return default
         pe = _patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
 

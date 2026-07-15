@@ -416,20 +416,42 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
     async def test_skip_backup_check_with_env_break_glass_allowed(
         self, real_store, monkeypatch,
     ):
-        """测试: skip_backup_check=True + BREAK_GLASS_APPROVED 环境变量 →
-        允许清理 + 写审计日志。"""
+        """R54 P0-3: skip_backup_check=True + BREAK_GLASS_APPROVED 环境变量
+        不再被接受,必须走真实 CommandBus 审批路径。
+        本测试改用真实审批:插入 approved 状态的 command_executions 记录,
+        调用 cleanup_expired_data(skip_backup_check=True, approval_action_id=...),
+        claim_execution_approved CAS approved→executing 成功 → 允许清理 + 写审计日志。"""
         from services import data_lifecycle
+        from services import command_bus
 
         user_id = 53007
         await _setup_retention_and_soft_delete(real_store, user_id)
 
-        # 设置 BREAK_GLASS_APPROVED 环境变量
-        monkeypatch.setenv("BREAK_GLASS_APPROVED", "1")
+        # R54 P0-3: 删除环境变量授权路径,改用真实 CommandBus 审批
+        # 确保 BREAK_GLASS_APPROVED 环境变量不存在(验证不再走 env 路径)
+        monkeypatch.delenv("BREAK_GLASS_APPROVED", raising=False)
+
+        # 插入 approved 状态的 command_executions 记录(真实审批)
+        action_id = "approval_break_glass_env_r54_p0_3"
+        now = command_bus._now_iso()
+        await real_store._db.execute(
+            "INSERT INTO command_executions "
+            "(action_id, command_type, principal_id, status, owner, lease_until, "
+            "request_hash, result, created_at, updated_at, requires_approval, approved_at) "
+            "VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?)",
+            (
+                action_id, "break_glass_cleanup", 0,
+                command_bus.CMD_STATUS_APPROVED,
+                "test_request_hash", now, now, 1, now,
+            ),
+        )
+        await real_store._db.commit()
 
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
+            approval_action_id=action_id,
         )
-        assert cleaned >= 1, "break-glass 审批后应清理至少 1 条记录"
+        assert cleaned >= 1, "真实审批后应清理至少 1 条记录"
 
         # 验证记录已物理删除
         cursor = await real_store._db.execute(
@@ -437,7 +459,7 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             (f"FC_R53_P1_3_U{user_id}",),
         )
         row = await cursor.fetchone()
-        assert row[0] == 0, "break-glass 审批后 file_records_local 应已物理删除"
+        assert row[0] == 0, "真实审批后 file_records_local 应已物理删除"
 
         # 验证审计日志已写入(break_glass_skip_backup_check)
         cursor = await real_store._db.execute(
@@ -448,17 +470,24 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         arow = await cursor.fetchone()
         assert arow is not None, "应写入 break_glass_skip_backup_check 审计日志"
         details = json.loads(arow[1]) if arow[1] else {}
-        assert details.get("break_glass_source", "").startswith("env:"), (
-            f"break_glass_source 应以 env: 开头,实际: {details.get('break_glass_source')}"
+        assert details.get("reason") == "skip_backup_check_with_commandbus_approval", (
+            f"reason 应为 skip_backup_check_with_commandbus_approval,实际: {details.get('reason')}"
+        )
+        assert details.get("approval_action_id") == action_id, (
+            f"approval_action_id 应为 {action_id},实际: {details.get('approval_action_id')}"
         )
 
     @pytest.mark.asyncio
     async def test_skip_backup_check_with_approval_action_id_allowed(
         self, real_store, monkeypatch,
     ):
-        """测试: skip_backup_check=True + approval_action_id →
+        """R54 P0-3: skip_backup_check=True + approval_action_id →
+        必须通过 claim_execution_approved CAS 真实审批。
+        本测试先插入 approved 状态的 command_executions 记录,
+        调用 cleanup_expired_data 时 claim_execution_approved CAS approved→executing 成功 →
         允许清理 + 写审计日志。"""
         from services import data_lifecycle
+        from services import command_bus
 
         user_id = 53008
         await _setup_retention_and_soft_delete(real_store, user_id)
@@ -466,9 +495,26 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         # 确保没有 BREAK_GLASS_APPROVED 环境变量(强制走 approval_action_id 路径)
         monkeypatch.delenv("BREAK_GLASS_APPROVED", raising=False)
 
+        # R54 P0-3: 插入 approved 状态的 command_executions 记录(真实审批)
+        # claim_execution_approved 会 CAS approved→executing,记录必须处于 approved 状态
+        action_id = "approval_break_glass_r53_p1_3"
+        now = command_bus._now_iso()
+        await real_store._db.execute(
+            "INSERT INTO command_executions "
+            "(action_id, command_type, principal_id, status, owner, lease_until, "
+            "request_hash, result, created_at, updated_at, requires_approval, approved_at) "
+            "VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?)",
+            (
+                action_id, "break_glass_cleanup", 0,
+                command_bus.CMD_STATUS_APPROVED,
+                "test_request_hash", now, now, 1, now,
+            ),
+        )
+        await real_store._db.commit()
+
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
-            approval_action_id="approval_break_glass_r53_p1_3",
+            approval_action_id=action_id,
         )
         assert cleaned >= 1, "approval_action_id 审批后应清理至少 1 条记录"
 
@@ -489,11 +535,11 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         arow = await cursor.fetchone()
         assert arow is not None, "应写入 break_glass_skip_backup_check 审计日志"
         details = json.loads(arow[1]) if arow[1] else {}
-        assert "approval_action_id:approval_break_glass_r53_p1_3" in (
-            details.get("break_glass_source", "")
-        ), (
-            f"break_glass_source 应包含 approval_action_id,"
-            f"实际: {details.get('break_glass_source')}"
+        assert details.get("reason") == "skip_backup_check_with_commandbus_approval", (
+            f"reason 应为 skip_backup_check_with_commandbus_approval,实际: {details.get('reason')}"
+        )
+        assert details.get("approval_action_id") == action_id, (
+            f"approval_action_id 应为 {action_id},实际: {details.get('approval_action_id')}"
         )
 
 
@@ -643,11 +689,11 @@ class TestBatchFullBackupUserCoverage:
         # 验证绑定审计日志已写入
         cursor = await real_store._db.execute(
             "SELECT action, details FROM audit_log "
-            "WHERE action = 'physical_delete_with_backup_marker' "
+            "WHERE action = 'physical_delete_per_user' "
             "ORDER BY id DESC LIMIT 1",
         )
         arow = await cursor.fetchone()
-        assert arow is not None, "应写入 physical_delete_with_backup_marker 审计日志"
+        assert arow is not None, "应写入 physical_delete_per_user 审计日志"
         details = json.loads(arow[1]) if arow[1] else {}
 
         # 验证绑定字段都存在

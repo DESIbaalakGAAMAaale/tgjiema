@@ -21,6 +21,7 @@ import json
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -392,8 +393,8 @@ class TestP1_1_DataLifecycleStateMachine:
     async def test_p1_1_cleanup_expired_allows_with_backup_marker(self, real_store, monkeypatch):
         """测试: cleanup_expired_data 有 backup marker 时正常执行(skip_backup_check 兜底)。
 
-        R53 P1-3: skip_backup_check=True 必须有 break-glass 审批,
-        测试通过 BREAK_GLASS_APPROVED 环境变量授权。
+        R54 P0-3: skip_backup_check=True 必须有真实 CommandBus 审批,
+        测试通过 approval_action_id + 预创建 approved command_executions 记录授权。
         """
         from services import data_lifecycle
 
@@ -412,11 +413,23 @@ class TestP1_1_DataLifecycleStateMachine:
         )
         await real_store._db.commit()
 
-        # R53 P1-3: skip_backup_check=True 需要 break-glass 审批
-        # 测试场景: 设置 BREAK_GLASS_APPROVED 环境变量
-        monkeypatch.setenv("BREAK_GLASS_APPROVED", "1")
+        # R54 P0-3: 预创建 approved command_executions 记录
+        approval_action_id = f"test-break-glass-{uuid.uuid4().hex[:8]}"
+        now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        request_hash = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        await real_store._db.execute(
+            "INSERT INTO command_executions "
+            "(action_id, command_type, status, request_hash, "
+            " principal_id, created_at, approved_at, updated_at, requires_approval) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (approval_action_id, "data_lifecycle_cleanup", "approved",
+             request_hash, 1, now_iso, now_iso, now_iso, 1),
+        )
+        await real_store._db.commit()
+
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
+            approval_action_id=approval_action_id,
         )
         assert cleaned >= 1, "应清理至少 1 条 file_records_local"
 

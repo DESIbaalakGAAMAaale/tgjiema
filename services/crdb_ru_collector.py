@@ -423,13 +423,17 @@ async def fetch_idle_ru_from_local_legacy() -> float:
 
 
 async def write_ru_to_kv_store(ru_value: float) -> bool:
-    """R39 P1-9: 将当日 RU 消耗写入 kv_store.crdb_ru_daily。
+    """R39 P1-9 + R54 P1-1: 将当日 RU 消耗写入 kv_store.crdb_ru_daily。
 
     写入成功后,prometheus_exporter 下次 scrape 会暴露更新后的 crdb_ru_daily 指标。
     kv_store 写入零 CRDB RU(SQLite 本地存储)。
 
     R42 P1-10: 同时写入 kv_store.crdb_ru_last_collected_at(ISO 时间戳),
     供 get_ru_status() 计算数据新鲜度(freshness_seconds)。
+
+    R54 P1-1: 同时写入不可伪造的 kv_store.crdb_ru_source,
+    值为 "official_cloud_api"(仅本函数写入此值,估算器使用独立 key)。
+    prometheus_exporter 只读取显式 source,不得通过 freshness 推断。
 
     Returns:
         True: 写入成功
@@ -447,6 +451,14 @@ async def write_ru_to_kv_store(ru_value: float) -> bool:
         except Exception as ts_err:
             logger.debug(
                 f"[CRDB-RU] R42 P1-10: 写入 crdb_ru_last_collected_at 失败: {ts_err}"
+            )
+        # R54 P1-1: 写入不可伪造的 source 标记
+        # 值为 "official_cloud_api"(仅本函数写入,估算器使用独立 key)
+        try:
+            await store.set_kv("crdb_ru_source", "official_cloud_api")
+        except Exception as src_err:
+            logger.debug(
+                f"[CRDB-RU] R54 P1-1: 写入 crdb_ru_source 失败: {src_err}"
             )
         logger.info(
             f"[CRDB-RU] R39 P1-9: kv_store.crdb_ru_daily 已更新 → {ru_value:.0f} RU"

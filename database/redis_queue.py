@@ -1421,10 +1421,17 @@ async def quarantine_repair(
     new_data: Optional[dict] = None,
     expected_principal_id: Optional[int] = None,
 ) -> dict:
-    """R53 P1-2: 经审批的 quarantined 记录修复/删除流程。
+    """R53 P1-2 + R54 P0-4: 经审批的 quarantined 记录修复/删除流程。
 
     quarantined 记录代表 payload 可能被篡改,不可自动重放。
     必须通过人工审批后才能修复(重新计算 hash 并恢复 pending)或删除。
+
+    R54 P0-4 整改:
+        - 函数内部强制查询 command_executions 验证审批
+        - 校验 approved、principal、完整 request_hash
+        - CAS approved→executing(防并发)
+        - 执行成功标记 executed,失败标记 failed
+        - 不再依赖外层调用方保证审批校验
 
     支持的 action:
         - ``"rehash"``: 用 new_data 重新计算 hash,将 status 从 quarantined
@@ -1435,8 +1442,7 @@ async def quarantine_repair(
 
     安全约束:
         1. approval_action_id 不可为空(必须经审批)
-        2. 调用方需在外层校验 approval_action_id 的状态/principal/request_hash
-           (与 REPAIR_CONSOLE_APPROVAL_REQUIRED 同一审批流)
+        2. R54 P0-4: 函数内部验证 approval 状态/principal/request_hash
         3. 仅 quarantined 状态可被修复/删除(其他状态拒绝)
         4. expected_principal_id 用于二次校验审批归属(防越权)
 
@@ -1453,8 +1459,8 @@ async def quarantine_repair(
             - ``{"status": "deleted", "row_id": <id>}``
 
     Raises:
-        AppError: approval_action_id 为空 / action 非法 / 记录非 quarantined /
-            rehash 缺少 new_data / 数据库操作失败
+        AppError: approval_action_id 为空 / 审批未通过 / action 非法 /
+            记录非 quarantined / rehash 缺少 new_data / 数据库操作失败
     """
     from services.error_codes import AppError, ErrorCodes
 
@@ -1467,7 +1473,110 @@ async def quarantine_repair(
                 "principal_id": expected_principal_id or 0,
             },
         )
-    # 2. 校验 action 取值
+
+    # R54 P0-4: 内部强制验证审批 + CAS
+    # 查询 command_executions 验证 status=approved + principal + request_hash
+    from database.cache_store import get_cache_store as _get_cache_store
+    _store = _get_cache_store()
+    if not _store or not _store._db:
+        raise AppError(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={
+                "component": "command_executions",
+                "method": f"quarantine_repair:{action}",
+            },
+        )
+    # 计算预期 request_hash(绑定 row_id + action + new_data hash)
+    import hashlib as _hashlib
+    import hmac as _hmac
+    _payload_str = json.dumps(
+        {"row_id": row_id, "action": action,
+         "new_data_hash": _hashlib.sha256(
+             json.dumps(new_data, sort_keys=True, default=str).encode()
+         ).hexdigest() if new_data else ""},
+        sort_keys=True, default=str,
+    )
+    _expected_request_hash = _hashlib.sha256(_payload_str.encode()).hexdigest()
+    try:
+        _rows = await _store._db.execute_fetchall(
+            "SELECT status, principal_id, request_hash "
+            "FROM command_executions WHERE action_id = ?",
+            (approval_action_id,),
+        )
+    except Exception as e:
+        raise AppError(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={
+                "component": "command_executions",
+                "method": f"quarantine_repair:query_{e}",
+            },
+        )
+    if not _rows or not _rows[0]:
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "approval_action_id": approval_action_id,
+                "reason": "approval_record_not_found",
+            },
+        )
+    _stored_status, _stored_principal, _stored_hash = _rows[0]
+    # status 必须为 approved
+    if _stored_status != "approved":
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "approval_action_id": approval_action_id,
+                "reason": f"status_not_approved:{_stored_status}",
+            },
+        )
+    # principal_id 必须一致
+    if expected_principal_id is not None:
+        if int(_stored_principal or 0) != int(expected_principal_id):
+            raise AppError(
+                ErrorCodes.REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH,
+                params={
+                    "action": f"quarantine_repair:{action}",
+                    "approval_action_id": approval_action_id,
+                    "expected_principal_id": expected_principal_id,
+                    "actual_principal_id": int(_stored_principal or 0),
+                },
+            )
+    # request_hash 必须一致(恒定时间比较)
+    if _stored_hash and not _hmac.compare_digest(_stored_hash, _expected_request_hash):
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "approval_action_id": approval_action_id,
+                "reason": "request_hash_mismatch",
+            },
+        )
+
+    # R54 P0-4: CAS approved→executing
+    from services.command_bus import claim_execution_approved, mark_approved_executed, mark_approved_failed
+    import socket as _socket
+    import os as _os
+    _owner = f"{_socket.gethostname()}:{_os.getpid()}"
+    _cas_claimed = False
+    try:
+        claimed = await claim_execution_approved(
+            action_id=approval_action_id,
+            owner=_owner,
+            request_hash=_expected_request_hash,
+        )
+        if not claimed:
+            raise AppError(
+                ErrorCodes.COMMAND_STATUS_CONFLICT,
+                params={
+                    "action_id": approval_action_id,
+                    "reason": "cas_approved_to_executing_failed",
+                },
+            )
+        _cas_claimed = True
+    except AppError:
+        raise
     if action not in ("rehash", "delete"):
         raise AppError(
             ErrorCodes.VALIDATION_FAILED,
@@ -1543,10 +1652,22 @@ async def quarantine_repair(
                     pass
                 raise
             logger.info(
-                f"[RedisQueue] R53 P1-2: quarantined 记录已修复(经审批 "
+                f"[RedisQueue] R54 P0-4: quarantined 记录已修复(经审批 "
                 f"approval_action_id={approval_action_id}, row_id={row_id}, "
                 f"message_id={msg_id}, new_hash={new_hash})"
             )
+            # R54 P0-4: 成功标记 executed
+            if _cas_claimed:
+                try:
+                    await mark_approved_executed(
+                        action_id=approval_action_id,
+                        result={"status": "rehashed", "row_id": row_id},
+                    )
+                except Exception as mark_err:
+                    logger.error(
+                        f"[RedisQueue] mark_approved_executed 失败 "
+                        f"approval_action_id={approval_action_id}: {mark_err}"
+                    )
             return {
                 "status": "rehashed",
                 "row_id": row_id,
@@ -1568,17 +1689,49 @@ async def quarantine_repair(
                     pass
                 raise
             logger.info(
-                f"[RedisQueue] R53 P1-2: quarantined 记录已删除(经审批 "
+                f"[RedisQueue] R54 P0-4: quarantined 记录已删除(经审批 "
                 f"approval_action_id={approval_action_id}, row_id={row_id})"
             )
+            # R54 P0-4: 成功标记 executed
+            if _cas_claimed:
+                try:
+                    await mark_approved_executed(
+                        action_id=approval_action_id,
+                        result={"status": "deleted", "row_id": row_id},
+                    )
+                except Exception as mark_err:
+                    logger.error(
+                        f"[RedisQueue] mark_approved_executed 失败 "
+                        f"approval_action_id={approval_action_id}: {mark_err}"
+                    )
             return {"status": "deleted", "row_id": row_id}
     except AppError:
+        # R54 P0-4: 失败标记 failed
+        if _cas_claimed:
+            try:
+                await mark_approved_failed(
+                    action_id=approval_action_id,
+                    error=f"quarantine_repair_{action}_failed",
+                    retryable=False,
+                )
+            except Exception:
+                pass
         raise
     except Exception as e:
         logger.error(
-            f"[RedisQueue] R53 P1-2: quarantine_repair 异常 "
+            f"[RedisQueue] R54 P0-4: quarantine_repair 异常 "
             f"row_id={row_id} action={action}: {e}"
         )
+        # R54 P0-4: 失败标记 failed
+        if _cas_claimed:
+            try:
+                await mark_approved_failed(
+                    action_id=approval_action_id,
+                    error=f"quarantine_repair_{action}_exception: {e}",
+                    retryable=False,
+                )
+            except Exception:
+                pass
         raise AppError(
             ErrorCodes.DB_CACHE_UNAVAILABLE,
             params={

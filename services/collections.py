@@ -22,6 +22,7 @@ R45 第 16 节 Collections 整改:
 from __future__ import annotations
 
 import datetime as _dt
+import hmac
 import json
 from typing import Any
 
@@ -1037,10 +1038,37 @@ async def _update_collection_without_cas(
             },
         )
 
-    # principal_id 校验(防越权,他人审批不允许使用)
-    if principal_id and stored_principal_id_int and principal_id != stored_principal_id_int:
+    # R54 P0-2: principal_id 强制非空校验(防越权,他人审批不允许使用)
+    # 审批记录本身缺 principal 也必须拒绝(fail-closed)
+    if not principal_id:
+        logger.error(
+            f"[collections] R54 P0-2: principal_id 为空,拒绝执行 "
+            f"action_id={approval_action_id} collection_id={collection_id}"
+        )
+        raise AppError(
+            ErrorCodes.COLLECTION_APPROVAL_PRINCIPAL_MISMATCH,
+            params={
+                "collection_id": collection_id,
+                "approval_action_id": approval_action_id,
+                "reason": "principal_id_required_but_empty",
+            },
+        )
+    if not stored_principal_id_int:
+        logger.error(
+            f"[collections] R54 P0-2: 审批记录缺少 principal_id,拒绝执行 "
+            f"action_id={approval_action_id} collection_id={collection_id}"
+        )
+        raise AppError(
+            ErrorCodes.COLLECTION_APPROVAL_PRINCIPAL_MISMATCH,
+            params={
+                "collection_id": collection_id,
+                "approval_action_id": approval_action_id,
+                "reason": "approval_record_missing_principal_id",
+            },
+        )
+    if principal_id != stored_principal_id_int:
         logger.warning(
-            f"[collections] R53 P0-4: principal_id 不匹配 "
+            f"[collections] R54 P0-2: principal_id 不匹配 "
             f"action_id={approval_action_id} expected={principal_id} "
             f"stored={stored_principal_id_int}"
         )
@@ -1054,23 +1082,47 @@ async def _update_collection_without_cas(
             },
         )
 
-    # request_hash 校验(防篡改,完整匹配或前 16 字符匹配)
-    if request_hash and stored_request_hash:
-        if (request_hash != stored_request_hash
-                and request_hash[:16] != stored_request_hash[:16]):
-            logger.warning(
-                f"[collections] R53 P0-4: request_hash 不匹配 "
-                f"action_id={approval_action_id} "
-                f"stored_prefix={stored_request_hash[:16]} "
-                f"request_prefix={request_hash[:16]}"
-            )
-            raise AppError(
-                ErrorCodes.COLLECTION_APPROVAL_HASH_MISMATCH,
-                params={
-                    "collection_id": collection_id,
-                    "approval_action_id": approval_action_id,
-                },
-            )
+    # R54 P0-2: request_hash 强制非空 + 完整 64 位恒定时间比较
+    # 禁止 16 位前缀匹配,审批记录本身缺 hash 也必须拒绝
+    if not request_hash:
+        logger.error(
+            f"[collections] R54 P0-2: request_hash 为空,拒绝执行 "
+            f"action_id={approval_action_id} collection_id={collection_id}"
+        )
+        raise AppError(
+            ErrorCodes.COLLECTION_APPROVAL_HASH_MISMATCH,
+            params={
+                "collection_id": collection_id,
+                "approval_action_id": approval_action_id,
+                "reason": "request_hash_required_but_empty",
+            },
+        )
+    if not stored_request_hash:
+        logger.error(
+            f"[collections] R54 P0-2: 审批记录缺少 request_hash,拒绝执行 "
+            f"action_id={approval_action_id} collection_id={collection_id}"
+        )
+        raise AppError(
+            ErrorCodes.COLLECTION_APPROVAL_HASH_MISMATCH,
+            params={
+                "collection_id": collection_id,
+                "approval_action_id": approval_action_id,
+                "reason": "approval_record_missing_request_hash",
+            },
+        )
+    # 恒定时间比较(防时序攻击),完整 64 位 SHA-256 匹配
+    if not hmac.compare_digest(request_hash, stored_request_hash):
+        logger.warning(
+            f"[collections] R54 P0-2: request_hash 不匹配(完整 64 位比较) "
+            f"action_id={approval_action_id} collection_id={collection_id}"
+        )
+        raise AppError(
+            ErrorCodes.COLLECTION_APPROVAL_HASH_MISMATCH,
+            params={
+                "collection_id": collection_id,
+                "approval_action_id": approval_action_id,
+            },
+        )
 
     # ── 阶段 3: 调用 claim_execution_approved 进行 CAS approved→executing ──
     # R53 P0-2 已修改为 fail-closed:DB 故障抛 COMMAND_EXECUTION_STORE_UNAVAILABLE

@@ -230,29 +230,32 @@ async def test_low_risk_action_claim_execution_success(real_store):
 
 
 @pytest.mark.asyncio
-async def test_requires_approval_but_not_in_high_risk_registry_warns(real_store, caplog):
-    """R53 P1-5: 高风险 action 不在 registry 中 → 警告(但不阻断)。
+async def test_requires_approval_but_not_in_high_risk_registry_warns(real_store):
+    """R54 P0-1: requires_approval=1 一律禁止旧入口,fail-closed。
 
     场景:command_type='unknown_action' 不在 HIGH_RISK_ACTIONS 中,
-    但 requires_approval=1(误标记) → claim_execution 应记录 warning,
-    但允许走旧入口(不阻断),CAS claim 成功。
+    但 requires_approval=1 → claim_execution 必须 fail-closed 抛 AppError
+    (COMMAND_MUST_USE_APPROVAL_PATH),无论 command_type 是否在 registry 中。
 
-    这覆盖"高风险 action 不在 registry 中"的边界场景:registry 是不完整的,
-    但调用方误标记 requires_approval=1,系统应警告但允许执行(防止单测 registry
-    缺失阻塞业务)。
+    R54 P0-1 整改:requires_approval=1 不再区分 registry 内外,
+    未知 command_type 也必须走审批路径(fail-closed,防止 registry 漏项
+    变成审批绕过)。
     """
     await _insert_execution(
         real_store, "action_unknown_high_risk", "unknown_action",
         CMD_STATUS_PENDING, requires_approval=1,
     )
-    # 应该不抛错,而是记录 warning 后继续 claim
-    claimed = await claim_execution("action_unknown_high_risk", "test_owner")
-    assert claimed is True
-    # 状态应为 executing(允许走旧入口)
+    # R54 P0-1: requires_approval=1 一律抛 AppError,不再允许走旧入口
+    with pytest.raises(AppError) as exc_info:
+        await claim_execution("action_unknown_high_risk", "test_owner")
+    assert exc_info.value.code == ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH
+    # 验证 safe_params 包含 action_id / command_type / reason
+    assert exc_info.value.params.get("action_id") == "action_unknown_high_risk"
+    assert exc_info.value.params.get("command_type") == "unknown_action"
+    assert "reason" in exc_info.value.params
+    # 状态应保持 pending(未被 CAS UPDATE 修改)
     status = await _get_status(real_store, "action_unknown_high_risk")
-    assert status == CMD_STATUS_EXECUTING
-    # 验证日志中存在 warning(记录 registry 缺失)
-    # caplog 默认捕获 WARNING 级别;loguru 集成需通过 propagation,这里仅校验不抛错
+    assert status == CMD_STATUS_PENDING
 
 
 @pytest.mark.asyncio

@@ -363,9 +363,12 @@ async def bad_call():
         # 应检测到 2 处违规(notif_svc.send 和 notifications.send)
         assert len(violations) == 2, \
             f"应检测到 2 处 legacy send 调用,实际: {len(violations)}"
-        # send_with_dedup_contract 不应被检测
-        for _, _, alias in violations:
-            assert alias in ("notifications", "notif_svc")
+        # R54 P1-3: violations 第三元素为 description(如 "notif_svc.send(...)"),
+        # 不再是纯 alias 名。检查 description 包含合法 alias 前缀。
+        valid_descriptions = {"notif_svc.send(...)", "notifications.send(...)"}
+        for _, _, desc in violations:
+            assert desc in valid_descriptions, \
+                f"violation description 应为合法格式,实际: {desc}"
 
 
 # ════════════════════════════════════════════════════════════════

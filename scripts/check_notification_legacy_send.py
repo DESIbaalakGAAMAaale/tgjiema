@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""R53 P1-1: Notification legacy send() 调用门禁 — 禁止业务代码直接调用 send()。
+"""R53 P1-1 + R54 P1-3: Notification legacy send() 调用门禁 — 禁止业务代码直接调用 send()。
 
-使用 Python ast 模块解析 bots/ / admin/ / services/ 下的 .py 文件,
-检测违规直接调用 ``notifications.send(...)``(legacy int 返回契约)。
+R54 P1-3 整改:
+    - 解析 Import/ImportFrom 建立符号表,检测任意别名导入
+    - 检测直接 send(...) 调用(from services.notifications import send)
+    - 检测 re-export(__all__ 或模块级赋值包含 legacy send)
+    - 业务模块只导出结构化 API,legacy 函数移入兼容模块
 
 R53 P1-1 背景:
     - 旧 ``send()`` 返回 int(notif_id 或 0),调用方无法区分"去重命中"
@@ -18,16 +21,6 @@ R53 P1-1 背景:
 - services/notifications.py  (定义文件本身,send() 内部委托)
 - tests/                     (测试代码)
 - scripts/                   (运维脚本)
-
-检测模式:
-    <module_alias>.send(...) 其中 module_alias 为以下之一:
-    - notifications
-    - notif_svc
-    - _notif_svc
-    - notif_service
-    - _notifications
-
-    注:``send_with_dedup_contract`` 不被误匹配(方法名精确匹配 "send")。
 
 CI 调用方式:
     python scripts/check_notification_legacy_send.py
@@ -111,33 +104,97 @@ def _is_allowed(path: Path) -> bool:
     return False
 
 
-def _find_legacy_send_calls(tree: ast.AST) -> list[tuple[int, int, str]]:
-    """在 AST 中查找 legacy send() 调用。
+def _build_import_symbol_table(tree: ast.AST) -> dict[str, str]:
+    """R54 P1-3: 解析 Import/ImportFrom 建立符号表。
 
-    匹配模式: <alias>.send(...)
-    其中 alias 在 NOTIFICATION_ALIASES 中,且方法名精确为 "send"
-    (不匹配 "send_with_dedup_contract")。
+    返回 {local_name: original_module.path} 映射,
+    检测 services.notifications 的任意别名导入。
+
+    例如:
+        import services.notifications as notif → {"notif": "services.notifications"}
+        from services.notifications import send → {"send": "services.notifications.send"}
+        from services import notifications → {"notifications": "services.notifications"}
+    """
+    symbols: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                symbols[local_name] = alias.name
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                symbols[local_name] = f"{module}.{alias.name}" if module else alias.name
+    return symbols
+
+
+def _is_notification_alias(alias_name: str, symbol_table: dict[str, str]) -> bool:
+    """R54 P1-3: 检查别名是否指向 notifications 模块。
+
+    同时检查静态白名单和动态符号表。
+    """
+    # 静态白名单(快速路径)
+    if alias_name in NOTIFICATION_ALIASES:
+        return True
+    # R54 P1-3: 动态符号表查询
+    resolved = symbol_table.get(alias_name, "")
+    if "notifications" in resolved:
+        return True
+    return False
+
+
+def _is_notification_send_import(local_name: str, symbol_table: dict[str, str]) -> bool:
+    """R54 P1-3: 检查局部名称是否是从 notifications 导入的 send 函数。"""
+    resolved = symbol_table.get(local_name, "")
+    # 匹配 "services.notifications.send" 或 "notifications.send"
+    return resolved.endswith(".notifications.send") or resolved == "notifications.send"
+
+
+def _find_legacy_send_calls(tree: ast.AST) -> list[tuple[int, int, str]]:
+    """R53 P1-1 + R54 P1-3: 在 AST 中查找 legacy send() 调用。
+
+    检测三种模式:
+    1. <alias>.send(...) — alias 指向 notifications 模块
+    2. send(...) — 直接调用从 notifications 导入的 send
+    3. re-export — __all__ 或模块级赋值包含 legacy send
 
     Returns:
-        [(lineno, col_offset, alias_name), ...]
+        [(lineno, col_offset, description), ...]
     """
+    # R54 P1-3: 构建符号表
+    symbol_table = _build_import_symbol_table(tree)
+
     violations: list[tuple[int, int, str]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        # 仅检测直接属性调用: <alias>.<method>(...)
-        if not isinstance(func, ast.Attribute):
-            continue
-        if not isinstance(func.value, ast.Name):
-            continue
-        alias_name = func.value.id
-        method_name = func.attr
-        # 精确匹配 "send"(不匹配 "send_with_dedup_contract")
-        if method_name != "send":
-            continue
-        if alias_name in NOTIFICATION_ALIASES:
-            violations.append((node.lineno, node.col_offset, alias_name))
+        # 模式 1: <alias>.send(...) — alias 指向 notifications
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            alias_name = func.value.id
+            method_name = func.attr
+            if method_name == "send" and _is_notification_alias(alias_name, symbol_table):
+                violations.append((node.lineno, node.col_offset, f"{alias_name}.send(...)"))
+        # R54 P1-3 模式 2: 直接 send(...) — 从 notifications import send
+        elif isinstance(func, ast.Name) and func.id == "send":
+            if _is_notification_send_import("send", symbol_table):
+                violations.append((node.lineno, node.col_offset, "send(...) [imported]"))
+
+    # R54 P1-3 模式 3: 检测 re-export
+    for node in ast.walk(tree):
+        # __all__ 中包含 "send"
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "__all__":
+                    if isinstance(node.value, (ast.List, ast.Tuple)):
+                        for elt in node.value.elts:
+                            if isinstance(elt, ast.Constant) and elt.value == "send":
+                                violations.append((
+                                    node.lineno, node.col_offset,
+                                    "__all__ contains 'send' (re-export)"
+                                ))
+
     return violations
 
 
@@ -180,12 +237,12 @@ def check() -> tuple[int, list[dict]]:
 
         # 查找 legacy send 调用
         calls = _find_legacy_send_calls(tree)
-        for lineno, col, alias in calls:
+        for lineno, col, desc in calls:
             violations.append({
                 "file": _rel_posix(py_file),
                 "line": lineno,
                 "col": col,
-                "alias": alias,
+                "description": desc,
             })
 
     if violations:
@@ -196,7 +253,7 @@ def check() -> tuple[int, list[dict]]:
         for v in violations:
             print(
                 f"  - {v['file']}:{v['line']}:{v['col']} -> "
-                f"{v['alias']}.send(...)"
+                f"{v['description']}"
             )
         print()
         print("修复方式: 将 <alias>.send(...) 改为 <alias>.send_with_dedup_contract(...)")

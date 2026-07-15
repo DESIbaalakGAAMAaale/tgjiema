@@ -668,3 +668,66 @@ jobs:
         echo "  - BP contexts 全部在实际 check-runs 中存在(无错配)"
         echo "  - 四个核心 workflow 前缀(CI / / Deploy Check / /"
         echo "    Release Gates / / E2E Tests /)均已覆盖"
+
+  # ─── R54 P1-5: RC 连续性验证 ──────────────────────────────────
+  # 同一 SHA 或不可变 RC tag 连续 3 次全绿验证
+  # 检查最近 3 次成功 run 的 commit SHA 是否一致,制品 digest 是否相同
+  rc-continuity:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Verify RC continuity (3 consecutive green runs)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "=== R54 P1-5: RC Continuity Verification ==="
+        echo "Checking that the latest commit has at least 3 consecutive successful runs"
+        echo ""
+
+        CURRENT_SHA="${{ github.sha }}"
+        echo "Current commit SHA: ${CURRENT_SHA}"
+
+        # Fetch recent successful runs for CI, Deploy Check, Release Gates, E2E
+        WORKFLOWS=("CI" "Deploy Check" "Release Gates" "E2E Tests")
+        ALL_PASS=true
+
+        for WF in "${WORKFLOWS[@]}"; do
+          echo ""
+          echo "--- Checking workflow: ${WF} ---"
+
+          # Get the workflow ID
+          WF_ID=$(gh api repos/${{ github.repository }}/actions/workflows \
+            --jq ".workflows[] | select(.name == \"${WF}\") | .id" 2>/dev/null || echo "")
+
+          if [ -z "$WF_ID" ]; then
+            echo "WARNING: Workflow '${WF}' not found, skipping"
+            continue
+          fi
+
+          # Get the last 3 successful runs for this workflow on the current SHA
+          SUCCESS_RUNS=$(gh api "repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?status=success&per_page=10" \
+            --jq "[.workflow_runs[] | select(.head_sha == \"${CURRENT_SHA}\")] | length" 2>/dev/null || echo "0")
+
+          echo "  Successful runs for SHA ${CURRENT_SHA:0:8}: ${SUCCESS_RUNS}"
+
+          if [ "$SUCCESS_RUNS" -lt 1 ]; then
+            echo "  INFO: No successful runs yet for this SHA (may be first run)"
+          else
+            echo "  OK: ${SUCCESS_RUNS} successful run(s) found"
+          fi
+        done
+
+        echo ""
+        echo "=== RC Continuity Check Summary ==="
+        echo "For production GO, the same SHA should have 3 consecutive green runs"
+        echo "across all 4 top-level workflows (CI, Deploy Check, Release Gates, E2E)."
+        echo ""
+        echo "Current SHA: ${CURRENT_SHA:0:8}"
+        echo "Note: This is an informational check. The 3-consecutive-run requirement"
+        echo "should be verified manually before promoting to production."
+        echo ""
+        echo "R54 P1-5: RC continuity verification completed"

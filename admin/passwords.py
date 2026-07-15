@@ -153,3 +153,83 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 # 向后兼容别名(admin/__init__.py 原有函数名)
 _verify_password = verify_password
+
+
+async def check_argon2_readiness() -> dict:
+    """R54 P1-2: 启动时检查 admin_principals 表是否存在旧 Argon2 hash。
+
+    发现旧 Argon2 必须 readiness fail(阻断启动),
+    防止上线后管理员无法登录。
+
+    Returns:
+        {"ready": bool, "argon2_count": int, "details": str}
+    """
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if not store._db:
+            return {"ready": False, "argon2_count": 0, "details": "DB unavailable"}
+        rows = await store._db.execute_fetchall(
+            "SELECT id, username FROM admin_principals "
+            "WHERE password_hash LIKE '$argon2%'"
+        )
+        argon2_count = len(rows) if rows else 0
+        if argon2_count > 0:
+            usernames = [str(r[1]) for r in rows] if rows else []
+            return {
+                "ready": False,
+                "argon2_count": argon2_count,
+                "details": (
+                    f"Found {argon2_count} admin(s) with legacy Argon2 hash: "
+                    f"{', '.join(usernames)}. "
+                    f"Run: python -m admin.passwords --migrate-argon2"
+                ),
+            }
+        return {"ready": True, "argon2_count": 0, "details": "No Argon2 hashes found"}
+    except Exception as e:
+        return {"ready": False, "argon2_count": 0, "details": f"Check failed: {e}"}
+
+
+def migrate_argon2_offline(username: str, new_password: str) -> str:
+    """R54 P1-2: 离线迁移旧 Argon2 hash 为 PBKDF2。
+
+    此函数不验证旧密码(Argon2 已不支持),直接用新密码生成 PBKDF2 hash。
+    运维需在安全环境执行,迁移后验证 PBKDF2 登录、Session/MFA。
+
+    不得在日志输出 hash。
+
+    Args:
+        username: 管理员用户名
+        new_password: 新密码(明文,不验证旧密码)
+
+    Returns:
+        新的 PBKDF2 hash 字符串(运维需手动更新数据库)
+    """
+    new_hash = hash_password(new_password)
+    # 返回 SQL 语句供运维执行(不自动更新数据库)
+    sql = (
+        f"UPDATE admin_principals SET password_hash = '{new_hash}' "
+        f"WHERE username = '{username}';"
+    )
+    return sql
+
+
+if __name__ == "__main__":
+    import sys
+    if "--migrate-argon2" in sys.argv:
+        if len(sys.argv) < 4:
+            print("Usage: python -m admin.passwords --migrate-argon2 <username> <new_password>")
+            sys.exit(1)
+        _username = sys.argv[2]
+        _new_password = sys.argv[3]
+        sql = migrate_argon2_offline(_username, _new_password)
+        print(f"Run the following SQL to migrate Argon2 → PBKDF2:\n\n{sql}")
+    elif "--check-readiness" in sys.argv:
+        import asyncio
+        result = asyncio.run(check_argon2_readiness())
+        print(f"Ready: {result['ready']}")
+        print(f"Argon2 count: {result['argon2_count']}")
+        print(f"Details: {result['details']}")
+    else:
+        print("Usage: python -m admin.passwords --migrate-argon2 <username> <new_password>")
+        print("       python -m admin.passwords --check-readiness")
