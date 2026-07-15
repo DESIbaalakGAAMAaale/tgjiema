@@ -324,6 +324,10 @@ jobs:
       contents: read
       id-token: write
       packages: write   # R44: 推送 OCI 镜像到 GHCR 必需
+      # R53: actions/attest-build-provenance 创建 attestation 需要此权限,
+      # 否则报 "Failed to persist attestation: Resource not accessible by
+      # integration" (REST API /repos/.../attestations 返回 403)
+      attestations: write
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
