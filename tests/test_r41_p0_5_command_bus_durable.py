@@ -233,10 +233,10 @@ class TestLeaseExpiry:
 
     @pytest.mark.asyncio
     async def test_expired_lease_cleaned_and_reclaimed(self, clean_executions):
-        """claim_execution 后 lease 过期 → cleanup → status 回到 pending → 可重新认领。"""
+        """claim_execution 后 lease 过期 → cleanup → status 回到 retryable → 可重新认领。"""
         from services.command_bus import (
             claim_execution, release_execution, cleanup_stale_leases,
-            CMD_STATUS_PENDING, CMD_STATUS_EXECUTING,
+            CMD_STATUS_PENDING, CMD_STATUS_EXECUTING, CMD_STATUS_RETRYABLE,
         )
         from services.command_bus import _try_insert_or_get_cached, _compute_request_hash
 
@@ -257,7 +257,7 @@ class TestLeaseExpiry:
         cleaned = await cleanup_stale_leases()
         assert cleaned >= 1, "应清理至少 1 个过期租约"
 
-        # 5. 验证状态已回退到 pending
+        # 5. 验证状态已回退到 pending(R53 P1-5: 低风险动作 lease 过期 → pending)
         rows = await clean_executions._db.execute_fetchall(
             "SELECT status FROM command_executions WHERE action_id = ?",
             (action_id,),

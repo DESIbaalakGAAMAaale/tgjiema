@@ -313,8 +313,10 @@ class TestDedupUniqueConstraint:
             user_id=5009, notif_type="ready",
             payload={"file_code": "R51_DEDUP_2", "_dedup_key": "task_complete:5009"},
         )
-        # send() 应返回 0(唯一约束冲突 → 事务回滚)
-        assert id2 == 0, "同一 dedup_key + window 的重复插入应被阻止(send 返回 0)"
+        # R53 P1-1: send() 委托 send_with_dedup_contract(),dedup 命中时
+        # 返回现有权威记录的 notif_id(>0),而非 0(旧行为返回 0 无法区分 dedup/error)
+        assert id2 == id1, \
+            "同一 dedup_key + window 的重复插入应返回现有 notif_id(去重命中)"
         # outbox 表仍只有 1 条记录(第二次被阻止)
         assert await _count_outbox(store, 5009) == 1
         # notifications 表也只有 1 条记录(事务回滚)

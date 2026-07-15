@@ -652,6 +652,15 @@ class CacheStore:
             )
         except Exception as e:
             logger.debug(f"[CacheStore] users_local ADD locale (幂等,可忽略): {e}")
+        # R53 P0-5: users_local 补 version 列(CAS 乐观锁)
+        # production 环境强制 expected_version,_set_user_plan_internal 通过
+        # version 列实现 Compare-And-Swap 防止 lost update
+        try:
+            await self._db.execute(
+                "ALTER TABLE users_local ADD COLUMN version INTEGER DEFAULT 0"
+            )
+        except Exception as e:
+            logger.debug(f"[CacheStore] users_local ADD version (幂等,可忽略): {e}")
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS external_code_mapping_local (
                 external_code        TEXT PRIMARY KEY,
@@ -1387,23 +1396,71 @@ class CacheStore:
         # - 多 worker CAS 互斥(避免重复执行)
         # - 执行租约(executing + lease_until)防止僵死
         # - request_hash 防篡改(相同 action_id 不同 payload → 拒绝)
+        # R53 P1-5: 新增 requires_approval 列(BOOLEAN,默认 0)+ CHECK 约束
+        # - requires_approval=1 表示该命令必须经过审批路径(approved → executing)
+        # - CHECK 约束 1: requires_approval 仅允许 0 / 1
+        # - CHECK 约束 2: 高风险动作(requires_approval=1)status='executing' 时
+        #   必须存在 approved_at(防止 pending → executing 直接转换,绕过审批)
+        #   注:SQLite CHECK 不能跨行校验状态转换历史,approved_at 列由
+        #   claim_execution_approved 在 CAS UPDATE 时同步写入,作为"已审批"标记。
+        #   应用层 claim_execution 会在 UPDATE 前校验 HIGH_RISK_ACTIONS +
+        #   requires_approval,SQL CHECK 仅作兜底保护。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS command_executions (
-                action_id     TEXT PRIMARY KEY,
-                command_type  TEXT NOT NULL,
-                principal_id  INTEGER NOT NULL,
-                status        TEXT NOT NULL DEFAULT 'pending',
-                owner         TEXT,
-                lease_until   TEXT,
-                request_hash  TEXT NOT NULL,
-                result        TEXT,
-                created_at    TEXT NOT NULL,
-                updated_at    TEXT NOT NULL
+                action_id        TEXT PRIMARY KEY,
+                command_type     TEXT NOT NULL,
+                principal_id     INTEGER NOT NULL,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                owner            TEXT,
+                lease_until      TEXT,
+                request_hash     TEXT NOT NULL,
+                result           TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                requires_approval INTEGER NOT NULL DEFAULT 0,
+                approved_at      TEXT,
+                CHECK (requires_approval IN (0, 1)),
+                CHECK (requires_approval = 0 OR status != 'executing' OR approved_at IS NOT NULL)
             )"""
         )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_cmd_exec_status ON command_executions(status)"
         )
+        # R53 P1-5: 幂等迁移 — 为旧表添加 requires_approval / approved_at 列(已存在则忽略)
+        # SQLite 旧表无法 ALTER ADD CHECK,通过 PRAGMA table_info 检测并记录 warning,
+        # 应用层 claim_execution 已在 UPDATE 前校验 HIGH_RISK_ACTIONS,SQL 约束仅对新表生效。
+        for _col_ddl_cmd in (
+            "ALTER TABLE command_executions ADD COLUMN requires_approval INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE command_executions ADD COLUMN approved_at TEXT",
+        ):
+            try:
+                await self._db.execute(_col_ddl_cmd)
+            except Exception as _e_cmd:
+                if "duplicate column name" in str(_e_cmd).lower():
+                    logger.debug(
+                        f"[CacheStore] command_executions ALTER 升级(可忽略): {_e_cmd}"
+                    )
+                else:
+                    logger.warning(
+                        f"[CacheStore] command_executions ALTER TABLE失败(非预期): {_e_cmd}"
+                    )
+        # R53 P1-5: 检测旧表 schema 是否缺少 CHECK 约束(仅记录 warning,应用层兜底)
+        try:
+            cursor_cmd_tbl = await self._db.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type='table' AND name='command_executions'"
+            )
+            _cmd_tbl_row = await cursor_cmd_tbl.fetchone()
+            if _cmd_tbl_row and _cmd_tbl_row[0] and "CHECK" not in _cmd_tbl_row[0].upper():
+                logger.warning(
+                    "[CacheStore] command_executions 表缺少 CHECK 约束"
+                    "(旧表 schema),应用层 claim_execution 校验已兜底,"
+                    "建议重建表以启用 DDL 约束"
+                )
+        except Exception as _e_cmd_check:
+            logger.debug(
+                f"[CacheStore] command_executions schema 检测(可忽略): {_e_cmd_check}"
+            )
 
         # ─── R44 G0-2 / R46 P0-1 / R48 P0-4 / R49 P0-4: effect_receipts 表 — 外部副作用 receipt 持久化 ───
         # R46 P0-1: 增加 request_hash/attempt/lease_owner/lease_until/last_error/reconcile_status

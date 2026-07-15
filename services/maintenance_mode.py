@@ -400,6 +400,8 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
 
         # R52 P0-5: CAS approved → executing(防并发执行同一审批)
         # 失败时表示已被其他 worker 抢占,或状态已从 approved 流转
+        # R53 P0-2: DB 不可用时 claim_execution_approved 抛 AppError(
+        # COMMAND_EXECUTION_STORE_UNAVAILABLE),必须原样向上传播,禁止降级执行
         import socket as _socket
         import os as _os
         _owner = f"{_socket.gethostname()}:{_os.getpid()}"
@@ -410,6 +412,15 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
                 request_hash=request_hash,
             )
         except Exception as cas_err:
+            # R53 P0-2: 若是 AppError(COMMAND_EXECUTION_STORE_UNAVAILABLE 等)
+            # 原样向上传播,保留原始错误码;其他异常包装为 MaintenancePreconditionError
+            from services.error_codes import AppError as _AppError
+            if isinstance(cas_err, _AppError):
+                logger.error(
+                    f"[Maintenance] disable CAS approved→executing fail-closed "
+                    f"approval_action_id={approval_action_id}: {cas_err}"
+                )
+                raise
             logger.error(
                 f"[Maintenance] disable CAS approved→executing 异常 "
                 f"approval_action_id={approval_action_id}: {cas_err}"

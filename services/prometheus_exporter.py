@@ -188,6 +188,136 @@ def _read_kv_value(key: str, default: str = "0") -> str:
     return str(val) if val is not None else default
 
 
+# ── R53 P1-6: 底层读取函数(返回 (value, valid, timestamp, source) 元组) ──
+# 采集失败时 valid=False,调用方可选择不输出该 metric(避免 0 伪装健康)。
+
+
+def _read_sqlite_single_with_meta(
+    db_path: Path, query: str
+) -> tuple[Any, bool, float, str]:
+    """R53 P1-6: 以只读方式打开 SQLite,执行查询并返回 (value, valid, timestamp, source) 元组。
+
+    与 ``_read_sqlite_single`` 的差异:
+        - 不再返回默认 0,采集失败时 valid=False
+        - 调用方可据 valid 决定是否输出 metric(避免 0 伪装健康)
+
+    Args:
+        db_path: SQLite 文件路径
+        query: SQL 查询语句
+
+    Returns:
+        (value, valid, timestamp, source)
+        - value: 查询结果首行首列(失败时为 None)
+        - valid: True=采集成功, False=失败(文件不存在/查询异常/无数据)
+        - timestamp: 采集时间戳(epoch 秒,失败时为 0.0)
+        - source: "sqlite"(成功) / "failed"(失败)
+    """
+    if not db_path.exists():
+        return None, False, 0.0, "failed"
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        cursor = conn.execute(query)
+        row = cursor.fetchone()
+        conn.close()
+        if row is None:
+            return None, False, time.time(), "failed"
+        return row[0], True, time.time(), "sqlite"
+    except sqlite3.Error as e:
+        logger.debug(f"[prometheus_exporter] SQLite 查询失败 ({db_path}): {e}")
+        return None, False, 0.0, "failed"
+    except Exception as e:
+        logger.debug(f"[prometheus_exporter] 查询异常 ({db_path}): {e}")
+        return None, False, 0.0, "failed"
+
+
+def _read_kv_value_with_meta(
+    key: str,
+) -> tuple[str, bool, float, str]:
+    """R53 P1-6: 从 cache_store 的 kv_store 表读取 value,返回 (value, valid, timestamp, source) 元组。
+
+    与 ``_read_kv_value`` 的差异:
+        - 不再返回默认 "0",采集失败时 valid=False
+        - 内部调用 ``_read_kv_value(key, "")``,空字符串表示缺失/失败
+        - 调用方可据 valid 决定是否输出 metric(避免 0 伪装健康)
+
+    Args:
+        key: kv_store.key(来自代码常量,非用户输入)
+
+    Returns:
+        (value, valid, timestamp, source)
+        - value: kv_store.value 字符串(失败时为 "")
+        - valid: True=采集成功(值非空), False=失败/缺失
+        - timestamp: 采集时间戳(epoch 秒)
+        - source: "sqlite"(成功) / "failed"(失败)
+    """
+    # 使用空字符串作为 default,以便区分"真实值 0"与"缺失"
+    val = _read_kv_value(key, "")
+    if val == "" or val is None:
+        return "", False, time.time(), "failed"
+    return val, True, time.time(), "sqlite"
+
+
+def _emit_metric_or_skip(
+    metric_name: str,
+    value: Any,
+    valid: bool,
+    labels: dict[str, str] | None = None,
+) -> list[str]:
+    """R53 P1-6: 生成 metric 行,valid=False 时不输出该 metric(避免 0 伪装健康)。
+
+    采集失败时调用方应同时输出 ``tgjiema_collector_success{collector="..."} 0``。
+
+    Args:
+        metric_name: 指标名(如 "crdb_ru_daily")
+        value: 指标值(数值,失败时可为 None)
+        valid: True=采集成功,输出该 metric;False=采集失败,不输出
+        labels: label 字典(如 {"source": "official"}),可选
+
+    Returns:
+        Prometheus text format 行列表(valid=False 时返回空列表)
+    """
+    if not valid:
+        return []
+    # 构建 label 部分(按 key 排序保证输出稳定)
+    if labels:
+        label_str = ",".join(
+            f'{k}="{v}"' for k, v in sorted(labels.items())
+        )
+        return [f"{metric_name}{{{label_str}}} {value}"]
+    return [f"{metric_name} {value}"]
+
+
+def _compute_ru_go_signal(
+    collector_success: bool,
+    source_label: str,
+    freshness_seconds: float,
+) -> int:
+    """R53 P1-6: 计算生产 GO 判定信号。
+
+    告警规则必须同时要求 ``tgjiema_ru_go_signal == 1`` 才触发,
+    确保 only official + fresh + success 的 CRDB RU 参与门禁。
+    估算 RU(ru_estimated=1)只用于归因,不参与 GO 判定。
+
+    Args:
+        collector_success: 采集器是否成功(crdb_ru_daily 可读且可解析)
+        source_label: 数据源标签("official" / "unknown" / "failed")
+        freshness_seconds: 数据新鲜度(秒,-1=从未采集)
+
+    Returns:
+        1=可触发告警, 0=不可触发
+    """
+    # 1. collector_success=1
+    if not collector_success:
+        return 0
+    # 2. source=official(来自 CockroachDB Cloud 官方 API)
+    if source_label != "official":
+        return 0
+    # 3. fresh=1(freshness >= 0 且 < 阈值)
+    if freshness_seconds < 0 or freshness_seconds >= _RU_DATA_FRESH_THRESHOLD:
+        return 0
+    return 1
+
+
 def _get_relay_spool_disk_usage() -> int:
     """扫描 relay spool 目录返回总字节数。
 
@@ -403,16 +533,33 @@ def collect_metrics() -> str:
     _start_r40_collector()
 
     lines: list[str] = []
+    # R53 P1-6: 统一收集 collector_success 条目,最后一次性输出(避免 HELP/TYPE 重复)
+    _collector_success_lines: list[str] = []
 
     # 1. crdb_ru_daily — CRDB 当日 RU 消耗
-    crdb_ru_str = _read_kv_value("crdb_ru_daily", "0")
-    try:
-        crdb_ru = float(crdb_ru_str)
-    except (TypeError, ValueError):
-        crdb_ru = 0.0
+    # R53 P1-6: 使用 _read_kv_value_with_meta,采集失败时不输出主 metric(避免 0 伪装健康)
+    crdb_ru_str, crdb_ru_valid, _, _ = _read_kv_value_with_meta("crdb_ru_daily")
+    crdb_ru: float | None = None
+    if crdb_ru_valid:
+        try:
+            crdb_ru = float(crdb_ru_str)
+        except (TypeError, ValueError):
+            crdb_ru_valid = False
+            crdb_ru = None
+    if crdb_ru_valid:
+        _collector_success_lines.append(
+            'tgjiema_collector_success{collector="crdb_ru"} 1'
+        )
+    else:
+        _collector_success_lines.append(
+            'tgjiema_collector_success{collector="crdb_ru"} 0'
+        )
+        logger.warning(
+            "[R53-P1-6] crdb_ru_daily 采集失败,不输出主 metric(避免 0 伪装健康)"
+        )
     lines.append("# HELP crdb_ru_daily CockroachDB daily Request Units consumed")
     lines.append("# TYPE crdb_ru_daily gauge")
-    lines.append(f"crdb_ru_daily {crdb_ru}")
+    lines.extend(_emit_metric_or_skip("crdb_ru_daily", crdb_ru, crdb_ru_valid))
 
     # R41 RU 门禁: tgjiema_crdb_idle_ru_daily — 业务 Bot 空载 RU 每日消耗
     # 业务 Bot(up/idx/dsp/admin)应只读 SQLite,不触发 CRDB RU。
@@ -422,10 +569,16 @@ def collect_metrics() -> str:
     #   - failed  → 显示 -1, label source="failed"
     #   - unknown → 显示 -1, label source="unknown"
     #   - official→ 显示真实值, label source="official"
-    idle_ru_str = _read_kv_value("crdb_idle_ru_daily", "0")
-    try:
-        idle_ru = float(idle_ru_str)
-    except (TypeError, ValueError):
+    # R53 P1-6: 使用 _read_kv_value_with_meta 区分采集成功/失败
+    idle_ru_str, idle_ru_valid, _, _ = _read_kv_value_with_meta("crdb_idle_ru_daily")
+    idle_ru: float = 0.0
+    if idle_ru_valid:
+        try:
+            idle_ru = float(idle_ru_str)
+        except (TypeError, ValueError):
+            idle_ru_valid = False
+            idle_ru = 0.0
+    else:
         idle_ru = 0.0
 
     # R42 P1-10: 获取 RU 状态(official/unknown/failed)
@@ -435,11 +588,20 @@ def collect_metrics() -> str:
         _compute_crdb_ru_source_label()
     )
 
+    # R53 P1-6: 计算 GO 判定信号(collector_success=1 AND source=official AND fresh=1)
+    # 告警规则必须同时要求 tgjiema_ru_go_signal == 1 才触发
+    # 估算 RU(ru_estimated=1)只用于归因,不参与 GO 判定
+    ru_go_signal = _compute_ru_go_signal(
+        collector_success=crdb_ru_valid,
+        source_label=crdb_ru_source_label,
+        freshness_seconds=crdb_ru_freshness,
+    )
+
     # R42 P1-10: 失败/陈旧时 idle_ru 显示 -1,source 标签区分
-    if crdb_ru_source_label == "official":
+    if crdb_ru_source_label == "official" and idle_ru_valid:
         idle_ru_display = idle_ru
     else:
-        # failed / unknown → 显示 -1(便于告警区分"无数据" vs "0 RU")
+        # failed / unknown / 采集失败 → 显示 -1(便于告警区分"无数据" vs "0 RU")
         idle_ru_display = -1.0
 
     lines.append(
@@ -476,15 +638,29 @@ def collect_metrics() -> str:
     lines.append("# TYPE tgjiema_crdb_ru_freshness_seconds gauge")
     lines.append(f"tgjiema_crdb_ru_freshness_seconds {crdb_ru_freshness}")
 
+    # R53 P1-6: tgjiema_ru_go_signal — 生产 GO 判定信号
+    # =1 当且仅当:collector_success=1 AND source=official AND fresh=1
+    # 估算 RU(ru_estimated=1)不参与 GO 判定(仅用于归因)
+    # 告警规则必须同时要求 tgjiema_ru_go_signal == 1 才触发,例如:
+    #   expr: tgjiema_crdb_idle_ru_daily > 100 and on() tgjiema_ru_go_signal == 1
+    lines.append(
+        "# HELP tgjiema_ru_go_signal 生产 GO 判定信号"
+        "(1=可触发告警: collector_success=1 AND source=official AND fresh=1; "
+        "0=不可触发: 采集失败/数据陈旧/估算值)"
+    )
+    lines.append("# TYPE tgjiema_ru_go_signal gauge")
+    lines.append(f"tgjiema_ru_go_signal {ru_go_signal}")
+
     # R41 RU 门禁: tgjiema_crdb_idle_ru_alert — 空载 RU 是否超阈值(0/1)
     # 阈值从环境变量 CRDB_IDLE_RU_DAILY_ALERT_THRESHOLD 读取(默认 100)
+    # R53 P1-6: 告警必须同时满足 GO 信号(collector_success=1 AND source=official AND fresh=1)
     try:
         idle_threshold = float(
             os.getenv("CRDB_IDLE_RU_DAILY_ALERT_THRESHOLD", "100")
         )
     except (TypeError, ValueError):
         idle_threshold = 100.0
-    idle_alert = 1 if idle_ru > idle_threshold else 0
+    idle_alert = 1 if (idle_ru > idle_threshold and ru_go_signal == 1) else 0
     lines.append(
         "# HELP tgjiema_crdb_idle_ru_alert 业务 Bot 空载 RU 是否超阈值告警"
         "(1=超阈值, 0=正常)"
@@ -493,7 +669,7 @@ def collect_metrics() -> str:
     lines.append(f"tgjiema_crdb_idle_ru_alert {idle_alert}")
 
     # 2. redis_pel_depth — Redis Stream pending entries 长度
-    # R52 P1-7: 采集失败时不输出 0 值带 error label(0 可能是真实值,无法区分;
+    # R52 P1-7 + R53 P1-6: 采集失败时不输出 0 值带 error label(0 可能是真实值,无法区分;
     #   改为完全不输出主数值,仅输出统一的 tgjiema_collector_success=0)
     pel_str = _read_kv_value("redis_pel_depth", "")
     pel_collector_ok = True
@@ -511,16 +687,19 @@ def collect_metrics() -> str:
     lines.append("# TYPE redis_pel_depth gauge")
     if pel_depth is not None:
         lines.append(f"redis_pel_depth {pel_depth}")
+        _collector_success_lines.append(
+            'tgjiema_collector_success{collector="redis_pel"} 1'
+        )
     else:
         # R52 P1-7: 采集失败时不输出 0 值(避免伪装健康),
         # 仅输出统一 collector_success metric
         lines.append("# redis_pel_depth 采集失败,主数值不输出(避免 0 伪装健康)")
-        lines.append('tgjiema_collector_success{collector="redis_pel"} 0')
-        lines.append("# HELP tgjiema_collector_success 采集器状态(1=ok, 0=failed)")
-        lines.append("# TYPE tgjiema_collector_success gauge")
+        _collector_success_lines.append(
+            'tgjiema_collector_success{collector="redis_pel"} 0'
+        )
 
     # 3. dlq_depth — 死信队列深度
-    # R52 P1-7: 采集失败时不输出 0 值带 error label,仅输出统一 collector_success=0
+    # R52 P1-7 + R53 P1-6: 采集失败时不输出 0 值带 error label,仅输出统一 collector_success=0
     dlq_str = _read_kv_value("dlq_depth", "")
     dlq_collector_ok = True
     try:
@@ -536,10 +715,15 @@ def collect_metrics() -> str:
     lines.append("# TYPE dlq_depth gauge")
     if dlq_depth is not None:
         lines.append(f"dlq_depth {dlq_depth}")
+        _collector_success_lines.append(
+            'tgjiema_collector_success{collector="dlq"} 1'
+        )
     else:
         # R52 P1-7: 采集失败时不输出 0 值(避免伪装健康)
         lines.append("# dlq_depth 采集失败,主数值不输出(避免 0 伪装健康)")
-        lines.append('tgjiema_collector_success{collector="dlq"} 0')
+        _collector_success_lines.append(
+            'tgjiema_collector_success{collector="dlq"} 0'
+        )
 
     # 4. dirty_outbox_rows — upload_outbox 表未完成行数
     dirty = _read_sqlite_single(
@@ -734,15 +918,24 @@ def collect_metrics() -> str:
             f'tgjiema_i18n_missing_key_total{{locale="total"}} '
             f'{i18n_missing_key_total}'
         )
+        _collector_success_lines.append(
+            'tgjiema_collector_success{collector="i18n_missing_key"} 1'
+        )
     else:
         # R52 P1-7: 采集失败时不输出 0 值(避免伪装健康),
         # 仅输出统一 collector_success metric
         lines.append(
             "# tgjiema_i18n_missing_key_total 采集失败,主数值不输出(避免 0 伪装健康)"
         )
-        lines.append(
+        _collector_success_lines.append(
             'tgjiema_collector_success{collector="i18n_missing_key"} 0'
         )
+
+    # R53 P1-6: 统一输出 tgjiema_collector_success(所有 collector 的成功/失败状态)
+    # 告警规则可通过 collector_success == 0 发现采集失败
+    lines.append("# HELP tgjiema_collector_success 采集器状态(1=ok, 0=failed)")
+    lines.append("# TYPE tgjiema_collector_success gauge")
+    lines.extend(_collector_success_lines)
 
     return "\n".join(lines) + "\n"
 
@@ -1254,6 +1447,30 @@ def _format_r40_metrics() -> list[str]:
             )
     else:
         lines.append('tgjiema_ru_daily_usage{service="unknown",ru_estimated="1"} 0')
+
+    # R53 P1-6: tgjiema_ru_official_daily_usage{service} — 仅官方值(ru_estimated=0)
+    # 估算 RU(ru_estimated=1)只用于归因,不参与生产 GO 判定。
+    # 告警规则应基于本指标(而非 tgjiema_ru_daily_usage)触发,例如:
+    #   expr: sum(tgjiema_ru_official_daily_usage) by (service) > threshold
+    lines.append(
+        "# HELP tgjiema_ru_official_daily_usage 当日官方 RU 使用量"
+        "(仅 ru_estimated=0 的服务,用于告警门禁;估算值不参与 GO 判定)"
+    )
+    lines.append("# TYPE tgjiema_ru_official_daily_usage gauge")
+    if ru_usage:
+        has_official = False
+        for service, amount in sorted(ru_usage.items()):
+            estimated_flag = ru_estimated_map.get(service, 1)
+            if estimated_flag == 0:
+                lines.append(
+                    f'tgjiema_ru_official_daily_usage{{service="{_escape(service)}"}} '
+                    f'{amount}'
+                )
+                has_official = True
+        if not has_official:
+            lines.append('tgjiema_ru_official_daily_usage{service="none"} 0')
+    else:
+        lines.append('tgjiema_ru_official_daily_usage{service="none"} 0')
 
     # tgjiema_replica_missing_count (Gauge)
     lines.append("# HELP tgjiema_replica_missing_count 缺失副本数量")

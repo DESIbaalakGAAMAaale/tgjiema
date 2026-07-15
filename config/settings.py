@@ -212,6 +212,14 @@ class Settings(BaseSettings):
     BASIC_EXTERNAL_DAILY_QUOTA: int = -1
     PREMIUM_EXTERNAL_DAILY_QUOTA: int = -1
 
+    # ── R53 P1-4: 计费时区(配额按此时区的 0 点重置) ──
+    # Docker 默认 UTC,若依赖宿主机 localtime 无法保证 Asia/Shanghai,
+    # 也无法支持用户或套餐时区。此设置独立于宿主机时区,由 Python 计算
+    # 当日 BILLING_TIMEZONE 边界后转成 UTC start/end 参数化查询,
+    # 替代 SQLite 的 date('now', 'localtime')。
+    # 取值:任意 IANA 时区名(如 "Asia/Shanghai" / "UTC" / "America/New_York")
+    BILLING_TIMEZONE: str = "Asia/Shanghai"
+
     RATE_LIMIT_GLOBAL_PER_SECOND: int = 30
     RATE_LIMIT_PER_USER_PER_MINUTE: int = 10
 

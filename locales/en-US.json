@@ -129,6 +129,7 @@
     "data.lifecycle.delete_step_failed": "Data lifecycle delete step failed, request marked as failed (user_id={user_id}, step={step}, step_error={step_error}, trace_id={trace_id})",
     "data.lifecycle.delete_request_failed": "Data lifecycle delete request failed (partial failure prevented completion, user_id={user_id}, request_id={request_id}, failed_steps={failed_steps}, trace_id={trace_id})",
     "data.lifecycle.backup_marker_missing": "Backup marker verification failed before physical delete, no backup marker (user_id={user_id}, table_name={table_name}, pk={pk}, trace_id={trace_id})",
+    "data.lifecycle.break_glass_approval_required": "skip_backup_check=True requires break-glass approval (BREAK_GLASS_APPROVED env var or approval_action_id, reason={reason}, approval_action_id={approval_action_id}, trace_id={trace_id})",
     "entitlement.quota.query_failed": "User quota query failed, fail-closed (user_id={user_id}, trace_id={trace_id})",
     "entitlement.set_plan.tx_failed": "Set user plan transaction failed (any of plan/quota/audit/dirty_outbox failed, user_id={user_id}, plan_name={plan_name}, trace_id={trace_id})",
     "collection.cas.version_required": "Modifying collection requires expected_version (CAS lock cannot be bypassed, collection_id={collection_id}, trace_id={trace_id})",
@@ -142,12 +143,21 @@
     "repair.console.approval_principal_mismatch": "Approval principal mismatch (approval_action_id bound principal differs from current principal, approval_action_id={approval_action_id}, expected_principal={expected_principal}, actual_principal={actual_principal}, trace_id={trace_id})",
     "command.status.conflict": "Command status conflict (CAS missed or principal mismatch, action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, stored_principal_id={stored_principal_id}, expected_principal_id={expected_principal_id}, trace_id={trace_id})",
     "command.status.not_approved": "Command not approved, execution rejected (must approve first to transition status to approved, action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, trace_id={trace_id})",
+    "command.status.store_unavailable": "CommandBus state store unavailable, fail-closed refusing high-risk action (database uninitialized or access error, degraded execution is forbidden, action_id={action_id}, reason={reason}, trace_id={trace_id})",
     "entitlement.set_plan.cas_conflict": "Set user plan CAS version conflict (concurrent modification, please retry, user_id={user_id}, plan_name={plan_name}, expected_version={expected_version}, current_version={current_version}, trace_id={trace_id})",
     "entitlement.plan.requires_command_bus": "Plan change must go through CommandBus (direct set_user_plan for production changes is forbidden, user_id={user_id}, plan_name={plan_name}, caller={caller}, trace_id={trace_id})",
+    "entitlement.plan.direct_mutation_forbidden": "Direct plan mutation forbidden in production environment, must go through CommandBus (user_id={user_id}, plan_name={plan_name}, environment={environment}, trace_id={trace_id})",
+    "entitlement.plan.expected_version_required": "expected_version is required for plan modification (production enforces CAS, None is forbidden, user_id={user_id}, plan_name={plan_name}, environment={environment}, trace_id={trace_id})",
     "maintenance.disable.recover_query_failed": "Maintenance disable recover_status query failed, fail-closed (refused to degrade to completed, reason={reason}, trace_id={trace_id})",
     "maintenance.recover.persist_critical": "recover_status persistence failed, critical alert triggered and fail-closed (reason={reason}, trace_id={trace_id})",
     "metrics.collector.output_invalid": "Metrics collector emitted 0 value with error label on failure (should emit nothing or NaN, collector={collector}, reason={reason}, trace_id={trace_id})",
-    "cf.worker.update_id_kv_unconfigured": "UPDATE_ID_KV not configured, production environment must configure two-phase dedup KV (environment={environment}, trace_id={trace_id})"
+    "cf.worker.update_id_kv_unconfigured": "UPDATE_ID_KV not configured, production environment must configure two-phase dedup KV (environment={environment}, trace_id={trace_id})",
+    "collection.approval.invalid": "Collection bypass approval invalid (approval_action_id empty/record not found/status not approved, execution rejected, collection_id={collection_id}, approval_action_id={approval_action_id}, reason={reason}, trace_id={trace_id})",
+    "collection.approval.hash_mismatch": "Collection bypass approval request_hash mismatch (anti-tamper rejected, first 16 chars also mismatch, collection_id={collection_id}, approval_action_id={approval_action_id}, trace_id={trace_id})",
+    "collection.approval.principal_mismatch": "Collection bypass approval principal_id mismatch (approval by other principal, anti-privilege-escalation rejected, collection_id={collection_id}, approval_action_id={approval_action_id}, expected_principal_id={expected_principal_id}, actual_principal_id={actual_principal_id}, trace_id={trace_id})",
+    "collection.approval.already_executed": "Collection bypass approval already executed (status=executed, repeated execution forbidden, collection_id={collection_id}, approval_action_id={approval_action_id}, trace_id={trace_id})",
+    "durable.outbox.quarantined": "Durable Outbox message hash verification failed, quarantined (payload may have been tampered, requires approved quarantine_repair to fix, message_id={message_id}, method={method}, expected_hash={expected_hash}, actual_hash={actual_hash}, trace_id={trace_id})",
+    "command.approval.must_use_approval_path": "High-risk action must go through approval path, rejected legacy claim_execution entry (action_id={action_id}, command_type={command_type}, reason={reason}, trace_id={trace_id})"
   },
   "ui": {
     "admin_login_title": "Admin Login",
@@ -269,6 +279,10 @@
       "csrf_failed": "CSRF token verification failed",
       "rate_limited": "Too many login attempts, please try again in {minutes} minutes",
       "admin_not_configured": "Admin account not configured. Please set ADMIN_USERNAME and ADMIN_PASSWORD in .env"
+    },
+    "auth": {
+      "legacy_argon2_detected": "Detected {count} legacy Argon2 password hash(es). Argon2 is no longer supported. Affected admins cannot log in. Please regenerate PBKDF2 hashes and migrate.",
+      "invalid_pbkdf2_iterations": "PBKDF2 iterations out of allowed range. Please check hash configuration."
     },
     "generic": {
       "fallback": "An error occurred. Please try again later."

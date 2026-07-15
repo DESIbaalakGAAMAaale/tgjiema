@@ -69,6 +69,8 @@ def _install_fake_config() -> None:
     settings.ADMIN_PRINCIPAL_ID = 0
     settings.ADMIN_PRINCIPAL_USERNAME = ""
     settings.ADMIN_PRINCIPAL_BOOTSTRAP_ROLES = "super_admin"
+    # R53 P1-4: 计费时区(ZoneInfo 需要 IANA 时区名,MagicMock 会导致 ZoneInfo 失败)
+    settings.BILLING_TIMEZONE = "Asia/Shanghai"
 
     fake_config = types.ModuleType("config")
     fake_config.settings = settings

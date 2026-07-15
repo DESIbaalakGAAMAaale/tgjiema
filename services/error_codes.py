@@ -177,6 +177,8 @@ class ErrorCodes:
     DATA_LIFECYCLE_DELETE_REQUEST_FAILED = "DATA.LIFECYCLE.DELETE_REQUEST_FAILED"
     # 物理删除前验证 backup marker 失败(无备份标记)
     DATA_LIFECYCLE_BACKUP_MARKER_MISSING = "DATA.LIFECYCLE.BACKUP_MARKER_MISSING"
+    # R53 P1-3: skip_backup_check=True 无 break-glass 审批(只允许审批后绕过)
+    DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED = "DATA.LIFECYCLE.BREAK_GLASS_APPROVAL_REQUIRED"
 
     # ── R51 P1-2: Entitlements 事务化 ──
     # 配额查询失败(fail-closed 拒绝放行,不允许默认 used=0)
@@ -249,6 +251,36 @@ class ErrorCodes:
     # ── R52 P1-8: CF Worker 两阶段去重 ──
     # UPDATE_ID_KV 未配置(production 必须配置)
     CF_WORKER_UPDATE_ID_KV_UNCONFIGURED = "CF.WORKER.UPDATE_ID_KV_UNCONFIGURED"
+
+    # ── R53 P0-2: CommandBus fail-closed ──
+    # claim_execution_approved 在数据库不可用时必须 fail-closed(禁止降级执行)
+    COMMAND_EXECUTION_STORE_UNAVAILABLE = "COMMAND.EXECUTE.STORE_UNAVAILABLE"
+
+    # ── R53 P0-4: Collections bypass 真实审批校验 ──
+    # 审批无效(approval_action_id 为空/查不到记录/状态非 approved)
+    COLLECTION_APPROVAL_INVALID = "COLLECTION.APPROVAL.INVALID"
+    # 审批 request_hash 不匹配(防篡改,前 16 字符也不匹配)
+    COLLECTION_APPROVAL_HASH_MISMATCH = "COLLECTION.APPROVAL.HASH_MISMATCH"
+    # 审批 principal_id 不匹配(他人审批,防越权)
+    COLLECTION_APPROVAL_PRINCIPAL_MISMATCH = "COLLECTION.APPROVAL.PRINCIPAL_MISMATCH"
+    # 审批已被执行(状态='executed',禁止重复执行)
+    COLLECTION_APPROVAL_ALREADY_EXECUTED = "COLLECTION.APPROVAL.ALREADY_EXECUTED"
+
+    # ── R53 P0-5: Entitlements 移除生产绕过路径 ──
+    # production 环境禁止直接调用 _set_user_plan_internal 修改套餐(必须通过 CommandBus)
+    ENTITLEMENTS_DIRECT_MUTATION_FORBIDDEN = "ENTITLEMENT.PLAN.DIRECT_MUTATION_FORBIDDEN"
+    # 修改套餐必须提供 expected_version(production 强制 CAS,禁止 None)
+    ENTITLEMENTS_EXPECTED_VERSION_REQUIRED = "ENTITLEMENT.PLAN.EXPECTED_VERSION_REQUIRED"
+
+    # ── R53 P1-2: Durable Outbox Hash 不匹配隔离 ──
+    # durable outbox 重放时 payload hash 校验失败,记录被标记为 quarantined,
+    # 终止永久热循环(原 continue 保持 pending 导致下一轮再次校验报错)
+    DURABLE_OUTBOX_QUARANTINED = "DURABLE.OUTBOX.QUARANTINED"
+
+    # ── R53 P1-5: CommandBus 双状态机类型边界 ──
+    # 高风险动作(action ∈ HIGH_RISK_ACTIONS 且 requires_approval=1)误走旧
+    # claim_execution 入口,必须改走 claim_execution_approved 审批路径
+    COMMAND_MUST_USE_APPROVAL_PATH = "COMMAND.APPROVAL.MUST_USE_APPROVAL_PATH"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1293,6 +1325,15 @@ def _register_defaults() -> None:
         severity="critical",
         safe_params=["user_id", "table_name", "pk"],
     ))
+    # R53 P1-3: skip_backup_check=True 无 break-glass 审批(只允许审批后绕过)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+        message_key="errors.data.lifecycle.break_glass_approval_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "approval_action_id"],
+    ))
 
     # ── R51 P1-2: Entitlements 事务化 ──
     # 配额查询失败(fail-closed 拒绝放行,不允许默认 used=0)
@@ -1482,6 +1523,98 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["environment"],
+    ))
+
+    # ── R53 P0-2: CommandBus fail-closed ──
+    # claim_execution_approved 在数据库不可用时必须 fail-closed(503 可重试,critical 严重级别)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COMMAND_EXECUTION_STORE_UNAVAILABLE,
+        message_key="errors.command.status.store_unavailable",
+        http_status=503,
+        retryable=True,
+        severity="critical",
+        safe_params=["action_id", "reason"],
+    ))
+
+    # ── R53 P0-4: Collections bypass 真实审批校验 ──
+    # 审批无效(approval_action_id 为空/查不到记录/状态非 approved)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COLLECTION_APPROVAL_INVALID,
+        message_key="errors.collection.approval.invalid",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["collection_id", "approval_action_id", "reason"],
+    ))
+    # 审批 request_hash 不匹配(防篡改,前 16 字符也不匹配)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COLLECTION_APPROVAL_HASH_MISMATCH,
+        message_key="errors.collection.approval.hash_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["collection_id", "approval_action_id"],
+    ))
+    # 审批 principal_id 不匹配(他人审批,防越权)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COLLECTION_APPROVAL_PRINCIPAL_MISMATCH,
+        message_key="errors.collection.approval.principal_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["collection_id", "approval_action_id", "expected_principal_id", "actual_principal_id"],
+    ))
+    # 审批已被执行(状态='executed',禁止重复执行)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COLLECTION_APPROVAL_ALREADY_EXECUTED,
+        message_key="errors.collection.approval.already_executed",
+        http_status=409,
+        retryable=True,
+        severity="warning",
+        safe_params=["collection_id", "approval_action_id"],
+    ))
+
+    # ── R53 P0-5: Entitlements 移除生产绕过路径 ──
+    # production 环境禁止直接修改套餐(必须通过 CommandBus,403 不可重试 critical)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ENTITLEMENTS_DIRECT_MUTATION_FORBIDDEN,
+        message_key="errors.entitlement.plan.direct_mutation_forbidden",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["user_id", "plan_name", "environment"],
+    ))
+    # 修改套餐必须提供 expected_version(production 强制 CAS,400 critical)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ENTITLEMENTS_EXPECTED_VERSION_REQUIRED,
+        message_key="errors.entitlement.plan.expected_version_required",
+        http_status=400,
+        retryable=False,
+        severity="critical",
+        safe_params=["user_id", "plan_name", "environment"],
+    ))
+
+    # ── R53 P1-2: Durable Outbox Hash 不匹配隔离 ──
+    # 409 non_retryable — payload 可能被篡改,需经审批 quarantine_repair 修复
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DURABLE_OUTBOX_QUARANTINED,
+        message_key="errors.durable.outbox.quarantined",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["message_id", "method", "expected_hash", "actual_hash"],
+    ))
+
+    # ── R53 P1-5: CommandBus 双状态机类型边界 ──
+    # 高风险动作误走旧 claim_execution 入口,必须改走审批路径
+    # 403 critical — 阻断执行,调用方必须改用 claim_execution_approved
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH,
+        message_key="errors.command.approval.must_use_approval_path",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action_id", "command_type", "reason"],
     ))
 
 

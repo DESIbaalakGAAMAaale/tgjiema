@@ -129,6 +129,7 @@
     "data.lifecycle.delete_step_failed": "数据删除步骤失败,整个请求标记为 failed(user_id={user_id}, step={step}, step_error={step_error}, trace_id={trace_id})",
     "data.lifecycle.delete_request_failed": "数据删除请求失败(局部失败导致未 completed,user_id={user_id}, request_id={request_id}, failed_steps={failed_steps}, trace_id={trace_id})",
     "data.lifecycle.backup_marker_missing": "物理删除前验证 backup marker 失败,无备份标记拒绝物理删除(user_id={user_id}, table_name={table_name}, pk={pk}, trace_id={trace_id})",
+    "data.lifecycle.break_glass_approval_required": "skip_backup_check=True 需要 break-glass 审批(环境变量 BREAK_GLASS_APPROVED 或 approval_action_id,reason={reason}, approval_action_id={approval_action_id}, trace_id={trace_id})",
     "entitlement.quota.query_failed": "用户配额查询失败,按 fail-closed 拒绝放行(user_id={user_id}, trace_id={trace_id})",
     "entitlement.set_plan.tx_failed": "设置用户套餐事务失败(套餐/配额/audit/dirty_outbox 任一失败,user_id={user_id}, plan_name={plan_name}, trace_id={trace_id})",
     "collection.cas.version_required": "修改集合必须传 expected_version(乐观锁不可绕过,collection_id={collection_id}, trace_id={trace_id})",
@@ -142,12 +143,21 @@
     "repair.console.approval_principal_mismatch": "审批 principal 不匹配(approval_action_id 关联的 principal 与当前 principal 不一致,approval_action_id={approval_action_id}, expected_principal={expected_principal}, actual_principal={actual_principal}, trace_id={trace_id})",
     "command.status.conflict": "命令状态冲突(CAS 未命中或 principal 不匹配,action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, stored_principal_id={stored_principal_id}, expected_principal_id={expected_principal_id}, trace_id={trace_id})",
     "command.status.not_approved": "命令未审批通过,拒绝执行(必须先经审批将 status 转为 approved,action_id={action_id}, reason={reason}, current_status={current_status}, expected_status={expected_status}, trace_id={trace_id})",
+    "command.status.store_unavailable": "CommandBus 状态存储不可用,已 fail-closed 拒绝执行高风险动作(数据库未初始化或访问异常,禁止降级执行,action_id={action_id}, reason={reason}, trace_id={trace_id})",
     "entitlement.set_plan.cas_conflict": "设置用户套餐 CAS 版本冲突(并发修改,请重试,user_id={user_id}, plan_name={plan_name}, expected_version={expected_version}, current_version={current_version}, trace_id={trace_id})",
     "entitlement.plan.requires_command_bus": "套餐变更必须通过 CommandBus(禁止直接调用 set_user_plan 进行生产变更,user_id={user_id}, plan_name={plan_name}, caller={caller}, trace_id={trace_id})",
+    "entitlement.plan.direct_mutation_forbidden": "production 环境禁止直接修改套餐,必须通过 CommandBus(user_id={user_id}, plan_name={plan_name}, environment={environment}, trace_id={trace_id})",
+    "entitlement.plan.expected_version_required": "修改套餐必须提供 expected_version(production 强制 CAS,禁止 None,user_id={user_id}, plan_name={plan_name}, environment={environment}, trace_id={trace_id})",
     "maintenance.disable.recover_query_failed": "维护 disable 查询 recover_status 失败,已 fail-closed 拒绝降级为 completed(reason={reason}, trace_id={trace_id})",
     "maintenance.recover.persist_critical": "recover_status 持久化失败,已触发 critical alert 并 fail-closed(reason={reason}, trace_id={trace_id})",
     "metrics.collector.output_invalid": "指标采集失败时输出 0 值带 error label(应改为不输出或 NaN,collector={collector}, reason={reason}, trace_id={trace_id})",
-    "cf.worker.update_id_kv_unconfigured": "UPDATE_ID_KV 未配置,production 环境必须配置两阶段去重 KV(environment={environment}, trace_id={trace_id})"
+    "cf.worker.update_id_kv_unconfigured": "UPDATE_ID_KV 未配置,production 环境必须配置两阶段去重 KV(environment={environment}, trace_id={trace_id})",
+    "collection.approval.invalid": "集合 bypass 审批无效(approval_action_id 为空/查不到记录/状态非 approved,拒绝执行,collection_id={collection_id}, approval_action_id={approval_action_id}, reason={reason}, trace_id={trace_id})",
+    "collection.approval.hash_mismatch": "集合 bypass 审批 request_hash 不匹配(防篡改拒绝,前 16 字符也不匹配,collection_id={collection_id}, approval_action_id={approval_action_id}, trace_id={trace_id})",
+    "collection.approval.principal_mismatch": "集合 bypass 审批 principal_id 不匹配(他人审批,防越权拒绝,collection_id={collection_id}, approval_action_id={approval_action_id}, expected_principal_id={expected_principal_id}, actual_principal_id={actual_principal_id}, trace_id={trace_id})",
+    "collection.approval.already_executed": "集合 bypass 审批已被执行(状态=executed,禁止重复执行,collection_id={collection_id}, approval_action_id={approval_action_id}, trace_id={trace_id})",
+    "durable.outbox.quarantined": "Durable Outbox 消息 hash 校验失败,已隔离为 quarantined(payload 可能被篡改,需经审批 quarantine_repair 修复,message_id={message_id}, method={method}, expected_hash={expected_hash}, actual_hash={actual_hash}, trace_id={trace_id})",
+    "command.approval.must_use_approval_path": "高风险动作必须通过审批路径,已拒绝走旧 claim_execution 入口(action_id={action_id}, command_type={command_type}, reason={reason}, trace_id={trace_id})"
   },
   "ui": {
     "admin_login_title": "管理后台登录",
@@ -269,6 +279,10 @@
       "csrf_failed": "CSRF token 验证失败",
       "rate_limited": "登录尝试过于频繁,请 {minutes} 分钟后再试",
       "admin_not_configured": "管理员账号未配置,请在 .env 中设置 ADMIN_USERNAME 和 ADMIN_PASSWORD"
+    },
+    "auth": {
+      "legacy_argon2_detected": "检测到 {count} 条旧 Argon2 密码哈希,Argon2 已不再受支持,相关管理员将无法登录,请重新生成 PBKDF2 哈希并迁移",
+      "invalid_pbkdf2_iterations": "PBKDF2 迭代次数超出允许范围,请检查哈希配置"
     },
     "generic": {
       "fallback": "操作失败,请稍后重试"

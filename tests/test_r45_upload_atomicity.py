@@ -406,7 +406,9 @@ class TestQuotaTimeoutAutoRelease:
         assert action_id
 
         # 手动修改 created_at 为 2 小时前,模拟超时
-        old_time = (datetime.now() - timedelta(hours=2)).isoformat()
+        # R53 P1-4: created_at 使用 UTC aware timestamp,
+        # 与 reserve() 写入和 cleanup_expired_reservations 比较格式一致
+        old_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
         await store._db.execute(
             "UPDATE quota_reservations SET created_at = ? WHERE id = ?",
             (old_time, action_id),

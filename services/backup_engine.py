@@ -198,6 +198,25 @@ class BackupEngine:
             name: {"row_count": len(rows) if isinstance(rows, list) else 0}
             for name, rows in tables.items()
         }
+        # R53 P1-3: 提取 user_coverage(全库备份覆盖的用户 ID 列表)
+        # 用于物理删除前 backup marker 校验(require_user_scope=True),
+        # 替代单一 user_id 字段,支持批量全库备份场景下的用户范围绑定
+        user_coverage: list[int] = []
+        for _user_table in ("users", "users_local"):
+            _rows = tables.get(_user_table)
+            if isinstance(_rows, list):
+                for _row in _rows:
+                    if isinstance(_row, dict) and _row.get("user_id") is not None:
+                        try:
+                            user_coverage.append(int(_row["user_id"]))
+                        except (TypeError, ValueError):
+                            pass
+        # 去重保留顺序(避免重复用户 ID)
+        _seen: set[int] = set()
+        user_coverage = [
+            uid for uid in user_coverage
+            if not (uid in _seen or _seen.add(uid))
+        ]
         created_at = _utcnow_iso()
         manifest: dict[str, Any] = {
             "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -224,6 +243,9 @@ class BackupEngine:
             ),
             "backup_started_at": metadata.get("start_time", created_at),
             "backup_finished_at": metadata.get("end_time", created_at),
+            # R53 P1-3: 用户覆盖范围(全库备份覆盖的 user_id 列表),
+            # 供 data_lifecycle._verify_backup_marker 校验物理删除的用户范围
+            "user_coverage": user_coverage,
         }
 
         storage = self._get_storage()
@@ -601,6 +623,8 @@ class BackupEngine:
                 "backup_type": manifest.get("backup_type", "full"),
                 "tables": manifest.get("total_tables", 0),
                 "total_rows": manifest.get("total_rows", 0),
+                # R53 P1-3: 用户覆盖范围(供 _verify_backup_marker 校验物理删除范围)
+                "user_coverage": manifest.get("user_coverage", []),
             }
             # 读取现有 history(JSON list)
             raw = await store.get_kv("backup_history")
@@ -961,6 +985,8 @@ class BackupEngine:
             # R52 P0-5: CAS approved → executing(防并发执行同一审批)
             # 统一状态机: pending → approved → executing → executed/failed
             # 失败时表示已被其他 worker 抢占,或状态已从 approved 流转
+            # R53 P0-2: DB 不可用时 claim_execution_approved 抛 AppError(
+            # COMMAND_EXECUTION_STORE_UNAVAILABLE),必须原样向上传播,禁止降级执行
             from services.command_bus import claim_execution_approved
             import socket as _socket
             import os as _os
@@ -971,6 +997,10 @@ class BackupEngine:
                     owner=_owner,
                     request_hash=expected_request_hash,
                 )
+            except AppError:
+                # 协议化错误(如 COMMAND_EXECUTION_STORE_UNAVAILABLE)原样传播,
+                # 保留原始错误码,禁止降级执行
+                raise
             except Exception as cas_err:
                 logger.error(
                     f"[BackupEngine] R52 P0-5 CAS approved→executing 异常 "

@@ -53,3 +53,11 @@ CODE_REVIEW_REPORT.md
 .workbuddy/
 
 # R41 P0-2: 已恢复推送 .github/workflows/(PAT workflow scope 已补齐)
+
+# R53: E2E 测试产物（node_modules / playwright report / 临时测试结果）
+tests/e2e/node_modules/
+tests/e2e/playwright-report/
+tests/e2e/test-results/
+tests/e2e/e2e-results/
+tests/e2e/package-lock.json
+tmp/

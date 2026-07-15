@@ -228,7 +228,13 @@ async def send(
     *,
     persist_only: bool = False,
 ) -> int:
-    """发送通知给用户,返回 notif_id。
+    """发送通知给用户,返回 notif_id(向后兼容 int 返回)。
+
+    R53 P1-1 改造: 内部委托 send_with_dedup_contract()(单一权威函数),
+    不再保留独立事务实现。本函数仅作为向后兼容入口,返回 notif_id(int)。
+    新业务代码应直接使用 send_with_dedup_contract() 获取结构化 dedup 契约
+    (可区分 sent/deduplicated/error 三种状态),由 AST 门禁
+    scripts/check_notification_legacy_send.py 强制约束。
 
     R45 第 16 节: 同事务写入 notification_outbox(pending),供各 Bot 异步投递。
     R51 P0-5: outbox 写入失败必须抛出并回滚整个 transaction(避免孤儿通知)。
@@ -242,76 +248,12 @@ async def send(
                       False=同事务写 notifications + notification_outbox(默认,可投递)
 
     Returns:
-        notif_id;失败返回 0
+        notif_id(>0 成功);0 表示去重跳过或失败(无法区分,见 send_with_dedup_contract)
     """
-    store = get_cache_store()
-    if not store._db:
-        logger.warning("[notifications] CacheStore 未初始化")
-        return 0
-    now = _dt.datetime.now().isoformat()
-    payload_json = _safe_json_dumps(payload)
-    # R45: 预先确保 outbox 表存在(幂等)
-    await _ensure_outbox_schema()
-    # 提取 dedup_key(若 payload 中包含,用于 outbox 去重)
-    dedup_key = ""
-    if isinstance(payload, dict):
-        dedup_key = str(payload.get("_dedup_key", "")) or ""
-    # R51 P0-5: 计算 dedup 窗口起始时间(仅当有 dedup_key 时)
-    window_start = _compute_window_start() if dedup_key else None
-    # R40 P0-5: 业务表 + dirty_outbox 同事务
-    try:
-        async with store.transaction() as tx:
-            cursor = await tx.execute(
-                """INSERT INTO notifications (user_id, type, payload, is_read, created_at)
-                   VALUES (?, ?, ?, 0, ?)""",
-                (user_id, notif_type, payload_json, now),
-            )
-            notif_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
-            if notif_id:
-                await store.add_dirty_outbox("notifications", str(notif_id), connection=tx)
-                logger.info(
-                    f"[notifications] 发送通知 id={notif_id} "
-                    f"user_id={user_id} type={notif_type}"
-                )
-                # R51 P0-5: persist_only=True 时跳过 outbox(仅历史型通知)
-                if persist_only:
-                    logger.info(
-                        f"[notifications] persist_only=True 跳过 outbox "
-                        f"notif_id={notif_id} user_id={user_id}"
-                    )
-                else:
-                    # R45/R51 P0-5: 同事务写入 notification_outbox(pending)
-                    # outbox 写入失败必须抛出 → 触发 transaction rollback(避免孤儿)
-                    await tx.execute(
-                        """INSERT INTO notification_outbox
-                           (notif_id, user_id, notif_type, dedup_key, window_start,
-                            payload, status, attempts, max_attempts, last_error,
-                            created_at, delivered_at, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, 3, '', ?, NULL, ?)""",
-                        (notif_id, user_id, notif_type, dedup_key, window_start,
-                         payload_json, now, now),
-                    )
-                    await store.add_dirty_outbox(
-                        "notification_outbox", str(notif_id), connection=tx,
-                    )
-        return notif_id
-    except Exception as e:
-        # R51 P0-5: outbox 写入失败已触发 transaction rollback,无孤儿状态
-        # 使用 ErrorCodes 协议化错误码记录日志(便于审计追踪)
-        from services.error_codes import ErrorCodes
-        # R51 P0-5: 区分唯一约束冲突(并发重复)与其他写入失败
-        err_msg = str(e).lower()
-        if "unique" in err_msg or "constraint" in err_msg:
-            logger.info(
-                f"[notifications] send 去重命中 code={ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE} "
-                f"user_id={user_id} dedup_key={dedup_key}: {e}"
-            )
-        else:
-            logger.warning(
-                f"[notifications] send 失败 code={ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED} "
-                f"user_id={user_id} type={notif_type}: {e}"
-            )
-        return 0
+    result = await send_with_dedup_contract(
+        user_id, notif_type, payload, persist_only=persist_only,
+    )
+    return int(result.get("notif_id", 0))
 
 
 async def send_with_dedup_contract(
@@ -353,15 +295,20 @@ async def send_with_dedup_contract(
             - 失败: ``{status: "error", notif_id: 0, outbox_id: 0,
                      error_code: str, error_msg: str}``
     """
-    from services.error_codes import ErrorCodes
+    from services.error_codes import ErrorCodes, ErrorRegistry
 
     store = get_cache_store()
     if not store._db:
         logger.warning("[notifications] send_with_dedup_contract CacheStore 未初始化")
+        # R53 P1-1: error_msg 使用 ErrorCodes + i18n(禁止裸字符串)
+        _envelope = ErrorRegistry.create_envelope(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={"component": "notifications"},
+        )
         return {
             "status": "error", "notif_id": 0, "outbox_id": 0,
             "error_code": ErrorCodes.DB_CACHE_UNAVAILABLE,
-            "error_msg": "CacheStore 未初始化",
+            "error_msg": _envelope.message,
         }
     now = _dt.datetime.now().isoformat()
     payload_json = _safe_json_dumps(payload)
@@ -455,16 +402,26 @@ async def send_with_dedup_contract(
                         "dedup_key": dedup_key,
                     }
                 # 唯一约束冲突但查不到权威记录 → 视为 error(理论不应发生)
+                # R53 P1-1: error_msg 使用 ErrorCodes + i18n(禁止 str(e))
+                _envelope = ErrorRegistry.create_envelope(
+                    ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE,
+                    params={"user_id": user_id, "dedup_key": dedup_key},
+                )
                 return {
                     "status": "error", "notif_id": 0, "outbox_id": 0,
                     "error_code": ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE,
-                    "error_msg": f"dedup conflict but no authoritative record found: {e}",
+                    "error_msg": _envelope.message,
                 }
             except Exception as query_err:
+                # R53 P1-1: error_msg 使用 ErrorCodes + i18n(禁止 str(query_err))
+                _envelope = ErrorRegistry.create_envelope(
+                    ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE,
+                    params={"user_id": user_id, "dedup_key": dedup_key},
+                )
                 return {
                     "status": "error", "notif_id": 0, "outbox_id": 0,
                     "error_code": ErrorCodes.NOTIFICATION_OUTBOX_DUPLICATE,
-                    "error_msg": f"authoritative record query failed: {query_err}",
+                    "error_msg": _envelope.message,
                 }
         # 真实写失败 → 返回 error
         logger.warning(
@@ -472,10 +429,15 @@ async def send_with_dedup_contract(
             f"code={ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED} "
             f"user_id={user_id} type={notif_type}: {e}"
         )
+        # R53 P1-1: error_msg 使用 ErrorCodes + i18n(禁止 str(e) 作为用户可见消息)
+        _envelope = ErrorRegistry.create_envelope(
+            ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED,
+            params={"user_id": user_id, "notif_type": notif_type},
+        )
         return {
             "status": "error", "notif_id": 0, "outbox_id": 0,
             "error_code": ErrorCodes.NOTIFICATION_OUTBOX_WRITE_FAILED,
-            "error_msg": str(e),
+            "error_msg": _envelope.message,
         }
 
 
@@ -791,10 +753,14 @@ async def dispatch_notification(
 ) -> int:
     """R41 P1-12: 幂等通知投递(基于 dedup_key 1 小时去重)。
 
+    R53 P1-1 改造: 内部委托 send_with_dedup_contract(),利用 outbox
+    (user_id, dedup_key, window_start) 唯一约束去重,不再保留独立查询逻辑。
+    返回 int(向后兼容调用方),内部通过结构化契约区分 sent/deduplicated/error。
+
     与 ``send()`` 的区别:
         - ``send()`` 无去重,每次调用都会插入新通知
         - ``dispatch_notification()`` 基于 dedup_key 去重:
-          同一 dedup_key 在最近 1 小时内已投递过 → 跳过(返回 0)
+          同一 dedup_key 在当前 UTC 整点窗口内已投递过 → 跳过(返回 0)
           未投递 → 写入通知并记录 dedup_key + 投递时间
 
     Args:
@@ -815,58 +781,37 @@ async def dispatch_notification(
             dedup_key=f"task_complete:{task_id}",
         )
     """
-    if not dedup_key:
-        # 无 dedup_key,直接调用 send()(不进行去重)
-        return await send(user_id, type, content)
-
-    store = get_cache_store()
-    if not store._db:
-        logger.warning("[notifications] dispatch_notification CacheStore 未初始化")
-        return 0
-
-    # 计算去重窗口起始时间(1 小时前)
-    now_dt = _dt.datetime.now()
-    window_start_iso = (now_dt - _dt.timedelta(seconds=_NOTIF_DEDUP_TTL_SECONDS)).isoformat()
-
-    # 查询 notifications 表中同一 dedup_key + user_id 是否在窗口内已存在
-    # 注:dedup_key 存储在 payload 中(避免修改 schema),格式: {"_dedup_key": "..."}
-    try:
-        cursor = await store._db.execute(
-            """SELECT id FROM notifications
-               WHERE user_id = ?
-                 AND payload LIKE ?
-                 AND created_at >= ?
-               ORDER BY id DESC LIMIT 1""",
-            (user_id, f'%"_dedup_key": "{dedup_key}"%', window_start_iso),
-        )
-        row = await cursor.fetchone()
-        if row and row[0]:
-            # 已在窗口内投递过,跳过(幂等去重)
-            logger.info(
-                f"[notifications] dispatch_notification 去重命中 "
-                f"user_id={user_id} dedup_key={dedup_key} existing_id={row[0]}"
-            )
-            return 0
-    except Exception as e:
-        # 查询失败时降级为直接发送(fail-open,不阻塞业务)
-        logger.warning(
-            f"[notifications] dispatch_notification 去重查询失败,降级为 send(): {e}"
-        )
-        return await send(user_id, type, content)
-
-    # 注入 dedup_key 到 content,以便后续去重查询
+    # 注入 dedup_key 到 content(供 outbox 唯一约束使用)
     enriched_content = dict(content) if content else {}
-    enriched_content["_dedup_key"] = dedup_key
-    enriched_content["_dedup_window"] = _NOTIF_DEDUP_TTL_SECONDS
+    if dedup_key:
+        enriched_content["_dedup_key"] = dedup_key
+        enriched_content["_dedup_window"] = _NOTIF_DEDUP_TTL_SECONDS
 
-    # 调用 send() 写入通知(同事务模式)
-    notif_id = await send(user_id, type, enriched_content)
-    if notif_id:
+    # R53 P1-1: 委托 send_with_dedup_contract()(单一权威函数)
+    result = await send_with_dedup_contract(user_id, type, enriched_content)
+    status = result.get("status", "error")
+    if status == "sent":
+        notif_id = int(result.get("notif_id", 0))
         logger.info(
             f"[notifications] dispatch_notification 投递成功 "
             f"id={notif_id} user_id={user_id} type={type} dedup_key={dedup_key}"
         )
-    return notif_id
+        return notif_id
+    if status == "deduplicated":
+        # R53 P1-1: 正确处理 deduplicated 状态(返回 0,表示去重跳过)
+        logger.info(
+            f"[notifications] dispatch_notification 去重命中 "
+            f"user_id={user_id} dedup_key={dedup_key} "
+            f"existing_notif_id={result.get('notif_id', 0)}"
+        )
+        return 0
+    # error 状态
+    logger.warning(
+        f"[notifications] dispatch_notification 失败 "
+        f"user_id={user_id} type={type} dedup_key={dedup_key} "
+        f"error_code={result.get('error_code', '')}"
+    )
+    return 0
 
 
 # ─── R45 第 16 节: notification_outbox + delivery_receipt 管理 ───

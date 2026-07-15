@@ -98,7 +98,12 @@ def test_verify_password_backward_compat_alias(pw):
     assert pw._verify_password("compat_pw", h) is True
     assert pw._verify_password("nope", h) is False
     # 静态校验: admin/__init__.py 已将 _verify_password 从 passwords.py 导入(向后兼容)
+    # R53 P0-3: 导入改为多行 from admin.passwords import (...) 形式
     init_src = _INIT_PY.read_text(encoding="utf-8")
-    assert "from admin.passwords import verify_password as _verify_password" in init_src, (
-        "admin/__init__.py 必须从 passwords.py 导入 _verify_password 以保持向后兼容"
-    )
+    assert (
+        "from admin.passwords import verify_password as _verify_password" in init_src
+        or (
+            "from admin.passwords import (" in init_src
+            and "verify_password as _verify_password" in init_src
+        )
+    ), "admin/__init__.py 必须从 passwords.py 导入 _verify_password 以保持向后兼容"

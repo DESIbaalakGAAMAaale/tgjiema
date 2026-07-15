@@ -74,7 +74,9 @@ async def reserve(user_id: int, amount: int, reason: str) -> str:
         return ""
 
     reservation_id = f"res-{uuid.uuid4().hex[:12]}"
-    now = datetime.datetime.now().isoformat()
+    # R53 P1-4: 统一存 UTC aware timestamp(ISO 带 +00:00),
+    # 与 BILLING_TIMEZONE 当日 UTC 边界参数化查询匹配
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     try:
         # R40 P0-5: 预留记录 + dirty_outbox + 流水 同事务
@@ -136,7 +138,8 @@ async def settle(reservation_id: str, actual_amount: int | None = None) -> bool:
         actual_amount = reserved_amount
     actual_amount = max(0, int(actual_amount))
 
-    now = datetime.datetime.now().isoformat()
+    # R53 P1-4: 统一存 UTC aware timestamp(ISO 带 +00:00)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     try:
         # R40 P0-5: 预留更新 + dirty_outbox + 流水 同事务
@@ -203,7 +206,8 @@ async def refund(reservation_id: str, reason: str = "") -> bool:
         logger.warning(f"[QuotaLedger] refund 预留状态非 reserved: {reservation_id} status={reservation['status']}")
         return False
 
-    now = datetime.datetime.now().isoformat()
+    # R53 P1-4: 统一存 UTC aware timestamp(ISO 带 +00:00)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     reserved_amount = int(reservation["amount"])
     user_id = int(reservation["user_id"])
     refund_reason = f"refund: {reason}" if reason else "refund: 操作失败退款"
@@ -258,6 +262,10 @@ async def get_balance(user_id: int) -> int:
         return 0
 
     try:
+        # R53 P1-4: 不再依赖 SQLite date('now', 'localtime')(受宿主机时区影响),
+        # 改用 Python 计算 BILLING_TIMEZONE 当日 0 点对应的 UTC 边界,参数化查询
+        from services.entitlements import _get_billing_day_utc_bounds
+        start_utc_iso, end_utc_iso = _get_billing_day_utc_bounds()
         rows = await store._db.execute_fetchall(
             "SELECT COALESCE(SUM(CASE "
             "WHEN status='settled' THEN actual_amount "
@@ -265,12 +273,10 @@ async def get_balance(user_id: int) -> int:
             "ELSE 0 END), 0) "
             "FROM quota_reservations "
             "WHERE user_id = ? AND status != 'refunded' "
-            # created_at 由 datetime.now() 写入(本地时区),
-            # 查询须用 date('now', 'localtime') 取本地日期匹配,
-            # 否则 UTC+8 00:00-08:00 时段本地日期与 UTC 日期错位,
-            # 导致 get_balance 返回满额误判(超额放行)。
-            "AND date(created_at) = date('now', 'localtime')",
-            (user_id,),
+            # created_at 由 datetime.now(timezone.utc) 写入(UTC aware ISO),
+            # 查询用参数化 UTC 边界匹配 BILLING_TIMEZONE 当日 0 点窗口
+            "AND created_at >= ? AND created_at < ?",
+            (user_id, start_utc_iso, end_utc_iso),
         )
         used_today = int(rows[0][0] or 0) if rows else 0
         return max(0, plan.daily_quota - used_today)
@@ -390,8 +396,11 @@ async def cleanup_expired_reservations() -> int:
     if not store._db:
         return 0
 
-    # 计算超时时间点(ISO 格式)
-    timeout_dt = datetime.datetime.now() - datetime.timedelta(seconds=RESERVATION_TIMEOUT_SECONDS)
+    # R53 P1-4: 统一用 UTC aware timestamp 计算,与 created_at 写入时区一致
+    # (created_at 由 reserve() 写入 UTC aware ISO,这里也用 UTC aware 比较)
+    timeout_dt = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+        seconds=RESERVATION_TIMEOUT_SECONDS
+    )
     timeout_str = timeout_dt.isoformat()
 
     try:
@@ -411,7 +420,8 @@ async def cleanup_expired_reservations() -> int:
                 reservation_id = r[0]
                 user_id = int(r[1])
                 amount = int(r[2])
-                now = datetime.datetime.now().isoformat()
+                # R53 P1-4: UTC aware timestamp
+                now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
                 # 更新状态为已退款
                 await tx.execute(
@@ -467,7 +477,8 @@ async def admin_adjust(user_id: int, amount: int, reason: str, admin_id: int) ->
     if not store._db:
         return False
 
-    now = datetime.datetime.now().isoformat()
+    # R53 P1-4: 统一存 UTC aware timestamp(ISO 带 +00:00)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     try:
         # 写入审计日志
@@ -602,7 +613,8 @@ async def force_release_quota(action_id: str, reason: str = "") -> bool:
         )
         return True
 
-    now = datetime.datetime.now().isoformat()
+    # R53 P1-4: 统一存 UTC aware timestamp(ISO 带 +00:00)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
     reserved_amount = int(reservation["amount"])
     user_id = int(reservation["user_id"])
     release_reason = f"force_release: {reason}" if reason else "force_release: dirty_outbox 故障兜底"

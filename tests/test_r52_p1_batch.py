@@ -104,6 +104,28 @@ async def reset_cache():
     maintenance_mode._reset_cache_for_test()
 
 
+# ── R53 P0-4: 辅助函数 — 插入 command_executions 审批记录 ──
+async def _insert_command_execution(
+    store, action_id: str, principal_id: int = 0, status: str = "approved",
+    request_hash: str = "",
+):
+    """插入测试 command_executions 记录(用于审批验证)。
+
+    R53 P0-4: collections._update_collection_without_cas 严格校验
+    command_executions 表中的 status / principal_id / request_hash。
+    """
+    import datetime as _dt
+    now = _dt.datetime.now().isoformat()
+    await store._db.execute(
+        """INSERT OR REPLACE INTO command_executions
+           (action_id, command_type, principal_id, status, owner,
+            lease_until, request_hash, result, created_at, updated_at)
+           VALUES (?, 'collection_bypass', ?, ?, NULL, NULL, ?, '', ?, ?)""",
+        (action_id, principal_id, status, request_hash, now, now),
+    )
+    await store._db.commit()
+
+
 @pytest.fixture(autouse=True)
 def _reset_command_bus_idempotency():
     """每个用例前重置 CommandBus 幂等缓存,避免跨用例污染。"""
@@ -395,7 +417,7 @@ class TestP1_3DataLifecycleAuditAtomicity:
                 require_user_scope=True,
                 require_checksum=True,
             )
-        assert ok is True, "user scope + checksum 匹配时应通过校验"
+        assert ok is not None, "user scope + checksum 匹配时应通过校验(R53 P1-3 返回 dict)"
 
     @pytest.mark.asyncio
     async def test_verify_backup_marker_rejects_wrong_user(self, real_store):
@@ -420,7 +442,7 @@ class TestP1_3DataLifecycleAuditAtomicity:
                 require_user_scope=True,
                 require_checksum=True,
             )
-        assert ok is False, "user scope 不匹配时应拒绝"
+        assert ok is None, "user scope 不匹配时应拒绝(R53 P1-3 返回 None)"
 
     @pytest.mark.asyncio
     async def test_verify_backup_marker_rejects_missing_checksum(self, real_store):
@@ -445,7 +467,7 @@ class TestP1_3DataLifecycleAuditAtomicity:
                 require_user_scope=True,
                 require_checksum=True,
             )
-        assert ok is False, "checksum 缺失时应拒绝"
+        assert ok is None, "checksum 缺失时应拒绝(R53 P1-3 返回 None)"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -475,13 +497,13 @@ class TestP1_4EntitlementsTransactionAwareAndRBAC:
 
     @pytest.mark.asyncio
     async def test_set_user_plan_cas_conflict_raises(self, real_store):
-        """set_user_plan CAS 版本冲突 → AppError(ENTITLEMENT_SET_PLAN_CAS_CONFLICT)。
+        """_set_user_plan_internal CAS 版本冲突 → AppError(ENTITLEMENT_SET_PLAN_CAS_CONFLICT)。
 
         场景:
             1. 用户 version=1
-            2. set_user_plan(expected_version=999) → CAS 冲突
+            2. _set_user_plan_internal(expected_version=999) → CAS 冲突
         """
-        from services.entitlements import set_user_plan
+        from services.entitlements import _set_user_plan_internal
         from services.error_codes import AppError, ErrorCodes
 
         # 确保 users_local 表有 version 列(插入测试用户)
@@ -499,7 +521,7 @@ class TestP1_4EntitlementsTransactionAwareAndRBAC:
 
         # CAS 冲突:expected_version=999 但实际 version=1
         with pytest.raises(AppError) as exc_info:
-            await set_user_plan(
+            await _set_user_plan_internal(
                 user_id=800,
                 plan_name="basic",
                 admin_id=900,
@@ -510,8 +532,8 @@ class TestP1_4EntitlementsTransactionAwareAndRBAC:
 
     @pytest.mark.asyncio
     async def test_set_user_plan_audit_contains_old_new_plan(self, real_store):
-        """set_user_plan 审计日志包含 old_plan/new_plan/request_hash。"""
-        from services.entitlements import set_user_plan, _PLANS, Plan
+        """_set_user_plan_internal 审计日志包含 old_plan/new_plan/request_hash。"""
+        from services.entitlements import _set_user_plan_internal, _PLANS, Plan
 
         # Patch _PLANS 使用真实 Plan 实例(避免 MagicMock 配额值干扰 SQL 绑定)
         # conftest.py 中的 MagicMock settings 未设置 BASIC_DAILY_QUOTA 等属性,
@@ -546,8 +568,8 @@ class TestP1_4EntitlementsTransactionAwareAndRBAC:
             )
             await real_store._db.commit()
 
-            # 设置套餐为 basic(带 request_hash)
-            await set_user_plan(
+            # 设置套餐为 basic(带 request_hash)— R53 P0-5: development 环境允许直接调用
+            await _set_user_plan_internal(
                 user_id=801,
                 plan_name="basic",
                 admin_id=901,
@@ -595,27 +617,28 @@ class TestP1_4EntitlementsTransactionAwareAndRBAC:
 # ════════════════════════════════════════════════════════════════
 
 class TestP1_5RemovePublicCasBypass:
-    """R52 P1-5: collections.py bypass_cas 私有化 + approval 审批。"""
+    """R52 P1-5 + R53 P0-4: collections.py bypass_cas 私有化 + 真实审批校验。"""
 
     @pytest.mark.asyncio
     async def test_bypass_cas_without_approval_rejected(self, real_store):
-        """bypass_cas=True 但无 approval_action_id → AppError(COLLECTION_CAS_BYPASS_NOT_ALLOWED)。"""
-        from services.collections import update_collection
+        """R53 P0-4: 私有方法 approval_action_id 为空 → AppError(COLLECTION_APPROVAL_INVALID)。"""
+        from services.collections import _update_collection_without_cas
         from services.error_codes import AppError, ErrorCodes
 
         with pytest.raises(AppError) as exc_info:
-            await update_collection(
+            await _update_collection_without_cas(
                 collection_id=999,
                 name="test",
-                bypass_cas=True,
+                principal_id=950,
+                request_hash="hash_001",
                 # 无 approval_action_id
             )
-        assert exc_info.value.code == ErrorCodes.COLLECTION_CAS_BYPASS_NOT_ALLOWED, \
-            f"应抛 BYPASS_NOT_ALLOWED,实际: {exc_info.value.code}"
+        assert exc_info.value.code == ErrorCodes.COLLECTION_APPROVAL_INVALID, \
+            f"应抛 APPROVAL_INVALID,实际: {exc_info.value.code}"
 
     @pytest.mark.asyncio
     async def test_public_api_requires_expected_version(self, real_store):
-        """公共 API 未传 expected_version 且未 bypass_cas → AppError(VERSION_REQUIRED)。"""
+        """公共 API 未传 expected_version → AppError(VERSION_REQUIRED)。"""
         from services.collections import update_collection
         from services.error_codes import AppError, ErrorCodes
 
@@ -623,10 +646,23 @@ class TestP1_5RemovePublicCasBypass:
             await update_collection(
                 collection_id=999,
                 name="test",
-                # 无 expected_version, 无 bypass_cas
+                # 无 expected_version(R53 P0-4: 公共 API 不再有 bypass_cas 通道)
             )
         assert exc_info.value.code == ErrorCodes.COLLECTION_CAS_VERSION_REQUIRED, \
             f"应抛 VERSION_REQUIRED,实际: {exc_info.value.code}"
+
+    @pytest.mark.asyncio
+    async def test_public_api_rejects_bypass_cas_param(self, real_store):
+        """R53 P0-4: 公共 API 不再接受 bypass_cas 参数(传参应抛 TypeError)。"""
+        from services.collections import update_collection
+
+        with pytest.raises(TypeError):
+            await update_collection(
+                collection_id=999,
+                name="test",
+                expected_version=1,
+                bypass_cas=True,  # R53 P0-4: 参数已移除,应抛 TypeError
+            )
 
     @pytest.mark.asyncio
     async def test_private_update_without_cas_function_exists(self):
@@ -637,21 +673,26 @@ class TestP1_5RemovePublicCasBypass:
 
     @pytest.mark.asyncio
     async def test_bypass_cas_with_approval_delegates_to_private(self, real_store):
-        """bypass_cas=True + approval_action_id → 委托 _update_collection_without_cas。"""
-        from services.collections import update_collection
-        from services.error_codes import AppError, ErrorCodes
+        """R53 P0-4: 私有方法 + 真实审批记录 → 成功更新(状态 approved→executed)。"""
+        from services.collections import _update_collection_without_cas, create_collection
 
         # 先创建集合
-        from services.collections import create_collection
         coll = await create_collection("test_bypass_coll", owner_id=950)
         coll_id = coll.get("id", 0)
 
-        # bypass_cas=True + approval_action_id → 成功更新
-        result = await update_collection(
+        # R53 P0-4: 插入真实审批记录(status=approved)
+        await _insert_command_execution(
+            real_store, "approval_r52_p1_5_001", principal_id=950,
+            status="approved", request_hash="hash_r52_p1_5_001",
+        )
+
+        # 私有方法 + 真实审批 → 成功更新
+        result = await _update_collection_without_cas(
             collection_id=coll_id,
             name="updated_name",
-            bypass_cas=True,
-            approval_action_id="approval_001",
+            principal_id=950,
+            request_hash="hash_r52_p1_5_001",
+            approval_action_id="approval_r52_p1_5_001",
             caller="test_migration",
         )
         assert result["success"] is True, f"bypass 更新应成功,实际: {result}"

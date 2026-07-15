@@ -206,9 +206,13 @@ async def _insert_command_execution(
 
 
 async def _insert_quota_reservation(store, user_id: int, amount: int = 1):
-    """插入测试 quota_reservations 记录(用于配额消耗统计)。"""
+    """插入测试 quota_reservations 记录(用于配额消耗统计)。
+
+    R53 P1-4: created_at 使用 UTC aware timestamp(ISO 带 +00:00),
+    与生产代码 reserve() 的写入格式一致,匹配 BILLING_TIMEZONE UTC 边界查询。
+    """
     import datetime as _dt
-    now = _dt.datetime.now().isoformat()
+    now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     await store._db.execute(
         """INSERT INTO quota_reservations
            (id, user_id, amount, reason, status, actual_amount,
@@ -385,8 +389,12 @@ class TestP1_1_DataLifecycleStateMachine:
         assert exc_info.value.code == ErrorCodes.DATA_LIFECYCLE_BACKUP_MARKER_MISSING
 
     @pytest.mark.asyncio
-    async def test_p1_1_cleanup_expired_allows_with_backup_marker(self, real_store):
-        """测试: cleanup_expired_data 有 backup marker 时正常执行(skip_backup_check 兜底)。"""
+    async def test_p1_1_cleanup_expired_allows_with_backup_marker(self, real_store, monkeypatch):
+        """测试: cleanup_expired_data 有 backup marker 时正常执行(skip_backup_check 兜底)。
+
+        R53 P1-3: skip_backup_check=True 必须有 break-glass 审批,
+        测试通过 BREAK_GLASS_APPROVED 环境变量授权。
+        """
         from services import data_lifecycle
 
         # 设置保留期
@@ -404,7 +412,9 @@ class TestP1_1_DataLifecycleStateMachine:
         )
         await real_store._db.commit()
 
-        # 使用 skip_backup_check=True 绕过(测试场景)
+        # R53 P1-3: skip_backup_check=True 需要 break-glass 审批
+        # 测试场景: 设置 BREAK_GLASS_APPROVED 环境变量
+        monkeypatch.setenv("BREAK_GLASS_APPROVED", "1")
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
         )
@@ -428,7 +438,7 @@ class TestP1_2_EntitlementsTransactional:
 
     @pytest.mark.asyncio
     async def test_p1_2_set_user_plan_transactional_success(self, real_store, monkeypatch):
-        """测试: set_user_plan 成功 → users_local + user_quota + audit_log 同事务写入。"""
+        """测试: _set_user_plan_internal 成功 → users_local + user_quota + audit_log 同事务写入。"""
         from services import entitlements
 
         # 替换 _PLANS 为真实 int 值(避免 conftest MagicMock settings 干扰)
@@ -438,8 +448,8 @@ class TestP1_2_EntitlementsTransactional:
         admin_id = 888
         await _insert_user(real_store, user_id, level="free")
 
-        result = await entitlements.set_user_plan(user_id, "premium", admin_id=admin_id)
-        assert result is True, "set_user_plan 应返回 True"
+        result = await entitlements._set_user_plan_internal(user_id, "premium", admin_id=admin_id)
+        assert result is True, "_set_user_plan_internal 应返回 True"
 
         # 验证 users_local.membership_level 已更新
         cursor = await real_store._db.execute(
@@ -483,7 +493,7 @@ class TestP1_2_EntitlementsTransactional:
 
     @pytest.mark.asyncio
     async def test_p1_2_set_user_plan_transactional_rollback(self, real_store, monkeypatch):
-        """测试: set_user_plan 中途失败 → 整个事务回滚,users_local 未更新。"""
+        """测试: _set_user_plan_internal 中途失败 → 整个事务回滚,users_local 未更新。"""
         from services import entitlements
         from services.error_codes import AppError, ErrorCodes
 
@@ -506,7 +516,7 @@ class TestP1_2_EntitlementsTransactional:
 
         with patch.object(real_store, "add_dirty_outbox", _failing_add_dirty):
             with pytest.raises(AppError) as exc_info:
-                await entitlements.set_user_plan(user_id, "premium", admin_id=admin_id)
+                await entitlements._set_user_plan_internal(user_id, "premium", admin_id=admin_id)
 
         assert exc_info.value.code == ErrorCodes.ENTITLEMENT_SET_PLAN_TX_FAILED
 
@@ -533,9 +543,12 @@ class TestP1_2_EntitlementsTransactional:
         """测试: get_quota 查询失败时 raise AppError(QUOTA_QUERY_FAILED)(fail-closed)。"""
         from services import entitlements
         from services.error_codes import AppError, ErrorCodes
+        from config import settings
 
         # 替换 _PLANS 为真实 int 值(避免 conftest MagicMock settings 干扰)
         monkeypatch.setattr(entitlements, "_PLANS", _make_real_plans())
+        # R53 P1-4: 设置真实 BILLING_TIMEZONE(避免 ZoneInfo 解析 MagicMock 失败)
+        monkeypatch.setattr(settings, "BILLING_TIMEZONE", "Asia/Shanghai")
 
         user_id = 20003
         await _insert_user(real_store, user_id)
@@ -565,9 +578,12 @@ class TestP1_2_EntitlementsTransactional:
     async def test_p1_2_get_quota_normal_returns_quota(self, real_store, monkeypatch):
         """测试: get_quota 正常情况返回 Quota 对象(回归测试)。"""
         from services import entitlements
+        from config import settings
 
         # 替换 _PLANS 为真实 int 值(避免 conftest MagicMock settings 干扰)
         monkeypatch.setattr(entitlements, "_PLANS", _make_real_plans())
+        # R53 P1-4: 设置真实 BILLING_TIMEZONE(避免 ZoneInfo 解析 MagicMock 失败)
+        monkeypatch.setattr(settings, "BILLING_TIMEZONE", "Asia/Shanghai")
 
         user_id = 20004
         await _insert_user(real_store, user_id, level="basic")
@@ -624,23 +640,31 @@ class TestP1_3_CollectionsCasEnforcement:
 
     @pytest.mark.asyncio
     async def test_p1_3_update_bypass_cas_allows_admin(self, real_store):
-        """测试: bypass_cas=True + approval_action_id 允许运维/迁移绕过 CAS(显式 opt-in)。
+        """测试: 私有方法 + 真实审批记录 允许运维/迁移绕过 CAS(显式 opt-in)。
 
-        R52 P1-5: bypass_cas=True 必须提供 approval_action_id(审计要求),
-        否则 raise AppError(COLLECTION_CAS_BYPASS_NOT_ALLOWED)。
+        R53 P0-4: bypass 路径必须通过 _update_collection_without_cas 私有方法,
+        严格校验 command_executions 表中的 status / principal_id / request_hash。
         """
         from services import collections
 
         user_id = 30003
         coll_id = await _insert_collection(real_store, user_id, "coll_bypass")
 
-        # R52 P1-5: bypass_cas=True 必须提供 approval_action_id
-        result = await collections.update_collection(
-            coll_id, name="migrated_name", bypass_cas=True,
+        # R53 P0-4: 插入真实审批记录(status=approved)
+        await _insert_command_execution(
+            real_store, "approval_bypass_p1_3", principal_id=user_id,
+            status="approved", request_hash="hash_p1_3_bypass",
+        )
+
+        # R53 P0-4: 调用私有方法 + 真实审批 → 成功更新
+        result = await collections._update_collection_without_cas(
+            coll_id, name="migrated_name",
+            principal_id=user_id,
+            request_hash="hash_p1_3_bypass",
             approval_action_id="approval_bypass_p1_3",
             caller="test_migration",
         )
-        assert result["success"] is True, "bypass_cas=True 应更新成功"
+        assert result["success"] is True, "私有方法 + 真实审批应更新成功"
         assert result["new_version"] >= 2, "version 应递增"
 
         # 验证 name 已更新
@@ -670,19 +694,18 @@ class TestP1_3_CollectionsCasEnforcement:
 
     @pytest.mark.asyncio
     async def test_p1_3_bypass_cas_with_expected_version_rejected(self, real_store):
-        """测试: bypass_cas=True 与 expected_version 同时传 → raise AppError(BYPASS_NOT_ALLOWED)。"""
+        """R53 P0-4: 公共 API 不再接受 bypass_cas 参数(传参应抛 TypeError)。"""
         from services import collections
-        from services.error_codes import AppError, ErrorCodes
 
         user_id = 30005
         coll_id = await _insert_collection(real_store, user_id, "coll_both")
 
-        with pytest.raises(AppError) as exc_info:
+        # R53 P0-4: 公共 API 已移除 bypass_cas 参数,传参应抛 TypeError
+        with pytest.raises(TypeError):
             await collections.update_collection(
                 coll_id, name="new_name",
                 expected_version=1, bypass_cas=True,
             )
-        assert exc_info.value.code == ErrorCodes.COLLECTION_CAS_BYPASS_NOT_ALLOWED
 
 
 # ════════════════════════════════════════════════════════════════

@@ -151,6 +151,32 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+# ─── R53 P1-5: 高风险动作 registry(action 级别,与 HIGH_RISK_COMMAND_REGISTRY 区分) ───
+# 这里的 action 名对应 command_executions.command_type 列(命令的"动作类型"),
+# 用于 claim_execution 旧入口的拦截:当 action ∈ HIGH_RISK_ACTIONS 且
+# requires_approval=1 时,必须改走 claim_execution_approved 审批路径,
+# 防止高风险动作误走 pending → executing 旧状态机绕过审批。
+# 注:HIGH_RISK_COMMAND_REGISTRY 是 command 级别的注册表(action 字符串如
+# "takedown_report"),而 HIGH_RISK_ACTIONS 是底层 effect_type / action 名(如
+# "takedown"),两者协同工作:
+#   - HIGH_RISK_COMMAND_REGISTRY 决定 Command.requires_approval 是否为 True
+#   - HIGH_RISK_ACTIONS 决定 claim_execution 是否拦截(防止误走旧入口)
+HIGH_RISK_ACTIONS: set[str] = {
+    "ban",
+    "purge",
+    "takedown",
+    "restore",
+    "crdb_delete",
+    "r2_put",
+    "r2_download",
+    "telegram_copy",
+    "telegram_send",
+    "force_join",
+    "rotate",
+    "demote",
+}
+
+
 def is_valid_transition(from_status: str, to_status: str) -> bool:
     """R52 P0-5: 校验状态转换是否合法。
 
@@ -205,6 +231,14 @@ async def claim_execution_approved(
     - CAS UPDATE 保证只有一个 worker 能进入 executing
     - 失败时由调用方决定是否重试(approved 状态未改变,可再次尝试)
 
+    R53 P0-2: fail-closed 整改
+    - ``store._db`` 不可用(DB 未初始化 / 连接异常 / commit 失败)时
+      **必须**抛 ``AppError(COMMAND_EXECUTION_STORE_UNAVAILABLE)``,禁止降级执行。
+      旧逻辑记录"降级执行"并返回 True,导致 Repair/Maintenance/Restore/Entitlements
+      在 DB 故障时可能在没有审批状态下执行高风险动作,严重违反 fail-closed 原则。
+    - 调用方必须传播异常或返回失败,**不得**捕获后继续执行。
+    - CAS rowcount=0 表示已被其他 worker 抢占或状态非 approved,返回 False(非异常路径)。
+
     Args:
         action_id: 命令幂等 ID
         owner: 执行 worker 标识(如 hostname:pid)
@@ -212,15 +246,28 @@ async def claim_execution_approved(
         lease_seconds: 租约时长(秒),过期后可被 cleanup_stale_leases 回收
 
     Returns:
-        True 表示认领成功;False 表示已被其他 worker 抢占或状态不符
+        True 表示认领成功;False 表示已被其他 worker 抢占或状态不符(rowcount=0)
+
+    Raises:
+        AppError(COMMAND_EXECUTION_STORE_UNAVAILABLE): DB 不可用 / 访问异常 / commit 失败
     """
+    from services.error_codes import AppError, ErrorCodes
+
     store = _get_store()
     if not store._db:
-        logger.warning(
-            f"[CommandBus] claim_execution_approved DB 未初始化(降级执行)"
-            f"action_id={action_id}"
+        # R53 P0-2: fail-closed — DB 未初始化时禁止降级执行高风险动作
+        logger.error(
+            f"[CommandBus] claim_execution_approved fail-closed: "
+            f"DB 未初始化,拒绝认领 action_id={action_id} owner={owner}"
+            f"(高风险动作必须有状态机保护,禁止降级执行)"
         )
-        return True  # 降级模式允许执行(无并发保护)
+        raise AppError(
+            ErrorCodes.COMMAND_EXECUTION_STORE_UNAVAILABLE,
+            params={
+                "action_id": action_id,
+                "reason": "db_not_initialized",
+            },
+        )
     lease_until = _lease_until_iso(lease_seconds)
     now = _now_iso()
     try:
@@ -239,11 +286,14 @@ async def claim_execution_approved(
                     )
                     return False
         # CAS: approved → executing
+        # R53 P1-5: 同步写入 approved_at(now),满足 SQL CHECK 约束
+        # (requires_approval=1 AND status='executing' AND approved_at IS NOT NULL)
+        # approved_at 作为"已审批"标记,即使旧表无 CHECK 约束,应用层逻辑也保持一致。
         cursor = await store._db.execute(
             "UPDATE command_executions "
-            "SET status = ?, owner = ?, lease_until = ?, updated_at = ? "
+            "SET status = ?, owner = ?, lease_until = ?, approved_at = COALESCE(approved_at, ?), updated_at = ? "
             "WHERE action_id = ? AND status = ?",
-            (CMD_STATUS_EXECUTING, owner, lease_until, now,
+            (CMD_STATUS_EXECUTING, owner, lease_until, now, now,
              action_id, CMD_STATUS_APPROVED),
         )
         await store._db.commit()
@@ -259,11 +309,23 @@ async def claim_execution_approved(
                 f"action_id={action_id}(状态非 approved 或已被抢占)"
             )
         return claimed
+    except AppError:
+        # 已是协议化错误,直接向上传播(保留原始 code)
+        raise
     except Exception as e:
+        # R53 P0-2: fail-closed — DB 访问/commit 异常时禁止降级执行
         logger.error(
-            f"[CommandBus] claim_execution_approved 失败 action_id={action_id}: {e}"
+            f"[CommandBus] claim_execution_approved fail-closed: "
+            f"DB 访问异常,拒绝认领 action_id={action_id} owner={owner}: {e}"
+            f"(高风险动作必须有状态机保护,禁止降级执行)"
         )
-        return False
+        raise AppError(
+            ErrorCodes.COMMAND_EXECUTION_STORE_UNAVAILABLE,
+            params={
+                "action_id": action_id,
+                "reason": f"db_access_error: {type(e).__name__}: {e}",
+            },
+        ) from e
 
 
 async def mark_approved_executed(
@@ -581,6 +643,14 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
     多 worker 并发时,只有一个 worker 的 CAS UPDATE 会命中(rowcount=1),
     其他 worker rowcount=0 → 抢占失败。
 
+    R53 P1-5: 双状态机类型边界校验
+    - 旧入口(pending → executing)仅允许低风险动作走
+    - 高风险动作(action ∈ HIGH_RISK_ACTIONS 且 requires_approval=1)必须走
+      ``claim_execution_approved``(approved → executing)审批路径
+    - 若高风险动作误走本入口,抛 ``AppError(COMMAND_MUST_USE_APPROVAL_PATH)``
+      fail-closed 阻断执行(防止绕过审批)
+    - 低风险动作或 requires_approval=0 的记录正常 CAS claim
+
     Args:
         action_id: 命令幂等 ID
         owner: 执行 worker 标识(如 hostname:pid)
@@ -588,21 +658,89 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
 
     Returns:
         True 表示认领成功;False 表示已被其他 worker 抢占或状态不符
+
+    Raises:
+        AppError(COMMAND_MUST_USE_APPROVAL_PATH): 高风险动作(requires_approval=1
+            且 command_type ∈ HIGH_RISK_ACTIONS)误走旧入口,必须改走审批路径
     """
+    from services.error_codes import AppError, ErrorCodes
+
     store = _get_store()
     if not store._db:
         return False
+    # R53 P1-5: 双状态机类型边界校验
+    # 先查询 command_type 与 requires_approval,如果是高风险动作且 requires_approval=1,
+    # 必须改走 claim_execution_approved 审批路径,抛 AppError 阻断旧入口执行。
+    # _auto_approve 标记:requires_approval=1 但不在 HIGH_RISK_ACTIONS registry 中时,
+    # 同步写入 approved_at 满足 SQL CHECK 约束(自动批准,允许走旧入口)。
+    _auto_approve = False
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT command_type, requires_approval FROM command_executions "
+            "WHERE action_id = ?",
+            (action_id,),
+        )
+    except Exception as e:
+        logger.error(
+            f"[CommandBus] claim_execution 查询 command_type 失败 "
+            f"action_id={action_id}: {e}"
+        )
+        return False
+    if rows and rows[0]:
+        command_type, requires_approval = rows[0]
+        # 高风险动作 + requires_approval=1 → 必须走审批路径
+        if requires_approval == 1 and command_type in HIGH_RISK_ACTIONS:
+            logger.error(
+                f"[CommandBus] claim_execution 拒绝高风险动作走旧入口 "
+                f"action_id={action_id} command_type={command_type} "
+                f"requires_approval={requires_approval}"
+                f"(必须改走 claim_execution_approved 审批路径)"
+            )
+            raise AppError(
+                ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH,
+                params={
+                    "action_id": action_id,
+                    "command_type": command_type,
+                    "reason": "high_risk_action_requires_approval_path",
+                },
+            )
+        # 不在 HIGH_RISK_ACTIONS 中但 requires_approval=1 → 警告但不阻断
+        # (调用方可能误标记 requires_approval,允许走旧入口但记录 warning)
+        # R53 P1-5: 同步写入 approved_at 满足 SQL CHECK 约束
+        # (requires_approval=1 时必须有 approved_at 才能转 executing)
+        if requires_approval == 1 and command_type not in HIGH_RISK_ACTIONS:
+            logger.warning(
+                f"[CommandBus] claim_execution 警告:requires_approval=1 但 "
+                f"command_type={command_type} 不在 HIGH_RISK_ACTIONS registry 中 "
+                f"action_id={action_id}(允许走旧入口,自动设置 approved_at,建议补充 registry)"
+            )
+            _auto_approve = True
     lease_until = _lease_until_iso(lease_seconds)
     now = _now_iso()
     try:
-        cursor = await store._db.execute(
-            "UPDATE command_executions "
-            "SET status = ?, owner = ?, lease_until = ?, updated_at = ? "
-            "WHERE action_id = ? AND status = ?",
-            (CMD_STATUS_EXECUTING, owner, lease_until, now, action_id, CMD_STATUS_PENDING),
-        )
+        # R53 P1-5: _auto_approve=True 时同步写入 approved_at 满足 SQL CHECK 约束
+        if _auto_approve:
+            cursor = await store._db.execute(
+                "UPDATE command_executions "
+                "SET status = ?, owner = ?, lease_until = ?, "
+                "approved_at = COALESCE(approved_at, ?), updated_at = ? "
+                "WHERE action_id = ? AND status = ?",
+                (CMD_STATUS_EXECUTING, owner, lease_until, now, now,
+                 action_id, CMD_STATUS_PENDING),
+            )
+        else:
+            cursor = await store._db.execute(
+                "UPDATE command_executions "
+                "SET status = ?, owner = ?, lease_until = ?, updated_at = ? "
+                "WHERE action_id = ? AND status = ?",
+                (CMD_STATUS_EXECUTING, owner, lease_until, now,
+                 action_id, CMD_STATUS_PENDING),
+            )
         await store._db.commit()
         return cursor.rowcount > 0
+    except AppError:
+        # 已是协议化错误,直接向上传播
+        raise
     except Exception as e:
         logger.error(f"[CommandBus] claim_execution 失败 action_id={action_id}: {e}")
         return False
@@ -667,10 +805,18 @@ async def release_execution(action_id: str) -> bool:
 
 
 async def cleanup_stale_leases() -> int:
-    """R41 P0-5: 清理过期租约 — status='executing' 且 lease_until < now → status='pending'。
+    """R41 P0-5: 清理过期租约 — status='executing' 且 lease_until < now → status='retryable'。
 
-    被 r40_scheduler 每 60 秒调用一次。将过期租约回退到 pending,
-    允许其他 worker 重新认领(防止 worker 崩溃后任务永久卡在 executing)。
+    被 r40_scheduler 每 60 秒调用一次。将过期租约转 retryable,
+    防止 worker 崩溃后任务永久卡在 executing。
+
+    R53 P1-5: lease 过期只能转 ``retryable``(不可直接 pending)
+    - 原行为(executing → pending)会绕过状态机,允许其他 worker 通过
+      ``claim_execution`` 旧入口重新认领,可能让高风险动作绕过审批路径
+    - 新行为(executing → retryable)强制走 VALID_TRANSITIONS 状态机:
+      retryable → approved(重新审批)→ executing(claim_execution_approved)
+    - 低风险动作(requires_approval=0)lease 过期后由 ``release_execution``
+      显式释放回 pending(由调用方决定),cleanup_stale_leases 不再隐式回退
 
     Returns:
         清理的记录数
@@ -680,17 +826,100 @@ async def cleanup_stale_leases() -> int:
         return 0
     now = _now_iso()
     try:
+        # R53 P1-5: 高风险动作(requires_approval=1)lease 过期 → retryable(需重新审批)
+        # 低风险动作(requires_approval=0)lease 过期 → pending(可直接重新认领)
         cursor = await store._db.execute(
             "UPDATE command_executions "
-            "SET status = ?, owner = NULL, lease_until = NULL, updated_at = ? "
+            "SET status = CASE WHEN requires_approval = 1 THEN ? ELSE ? END, "
+            "owner = NULL, lease_until = NULL, updated_at = ? "
             "WHERE status = ? AND lease_until < ?",
-            (CMD_STATUS_PENDING, now, CMD_STATUS_EXECUTING, now),
+            (CMD_STATUS_RETRYABLE, CMD_STATUS_PENDING, now, CMD_STATUS_EXECUTING, now),
         )
         await store._db.commit()
-        return cursor.rowcount
+        cleaned = cursor.rowcount
+        if cleaned > 0:
+            logger.info(
+                f"[CommandBus] cleanup_stale_leases 清理过期租约 "
+                f"{cleaned} 条(executing → retryable)"
+            )
+        return cleaned
     except Exception as e:
         logger.warning(f"[CommandBus] cleanup_stale_leases 失败: {e}")
         return 0
+
+
+# ════════════════════════════════════════════════════════════════
+# R53 P1-5: 外部副作用恢复 — lease 过期后先查 Receipt 再决定是否重新执行
+# ════════════════════════════════════════════════════════════════
+
+
+async def check_receipt_before_resume(
+    action_id: str,
+    effect_type: str,
+    target: str,
+) -> dict:
+    """R53 P1-5: lease 过期恢复执行前查询 effect_receipts,决定是否跳过 handler。
+
+    当 ``cleanup_stale_leases`` 将 status='executing' 转 'retryable' 后,
+    重新执行 handler 前必须先查 Receipt:
+    - Receipt 存在且 status='completed' → 外部副作用已成功执行,跳过 handler
+      (避免重复执行幂等性不保证的外部副作用,如 Telegram 发消息、R2 上传等)
+    - Receipt 不存在或非 completed → 重新执行副作用(handler 正常调用)
+
+    与 ``EffectReceiptManager.check_receipt`` 的差异:
+    - 本函数为辅助函数,封装"恢复决策"语义,返回 ``{"resume": bool, ...}``
+    - 调用方只需根据 ``resume`` 字段决定是否调用 handler
+    - 任何异常都 fail-open 返回 ``resume=True``(重新执行副作用,
+      保证至少一次执行;若副作用本身幂等,重复执行无副作用)
+
+    Args:
+        action_id: 幂等 action_id
+        effect_type: 副作用类型(如 "telegram_send"/"r2_put"/"command_handler")
+        target: 副作用目标(如 command.action)
+
+    Returns:
+        {"resume": False, "reason": "receipt_completed", "external_id": str,
+         "receipt": dict} — Receipt 已 completed,跳过 handler
+        {"resume": True, "reason": "no_completed_receipt"} — 无 Receipt 或非 completed,
+          调用方应重新执行 handler
+        {"resume": True, "reason": "manager_unavailable"} — manager 不可用,重新执行
+        {"resume": True, "reason": "error: ..."} — 查询异常,重新执行(fail-open)
+    """
+    try:
+        from services.effect_receipts import get_receipt_manager
+        manager = get_receipt_manager()
+        if manager is None:
+            logger.debug(
+                f"[CommandBus] check_receipt_before_resume manager 不可用 "
+                f"action_id={action_id}(重新执行副作用)"
+            )
+            return {"resume": True, "reason": "manager_unavailable"}
+        receipt = await manager.check_receipt(action_id, effect_type, target)
+        if receipt is not None and receipt.get("status") == "completed":
+            logger.info(
+                f"[CommandBus] check_receipt_before_resume Receipt 已 completed "
+                f"action_id={action_id} effect_type={effect_type} target={target}"
+                f"(跳过 handler,外部副作用已执行)"
+            )
+            return {
+                "resume": False,
+                "reason": "receipt_completed",
+                "external_id": receipt.get("external_id", "") or "",
+                "receipt": receipt,
+            }
+        logger.info(
+            f"[CommandBus] check_receipt_before_resume 无 completed Receipt "
+            f"action_id={action_id} effect_type={effect_type} target={target}"
+            f"(重新执行副作用)"
+        )
+        return {"resume": True, "reason": "no_completed_receipt"}
+    except Exception as e:
+        # 查询异常 → fail-open 重新执行(保证至少一次执行)
+        logger.warning(
+            f"[CommandBus] check_receipt_before_resume 查询异常(重新执行副作用) "
+            f"action_id={action_id}: {e}"
+        )
+        return {"resume": True, "reason": f"error: {e}"}
 
 
 # ════════════════════════════════════════════════════════════════

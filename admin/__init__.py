@@ -367,43 +367,51 @@ async def _csp_and_clickjacking_middleware(request: Request, call_next):
 
 
 # ─── 密码哈希支持（R39 P1-12: 强制哈希格式，移除明文兼容）──────────────
-# 哈希格式（按优先级）:
-#   1. Argon2id:   $argon2id$v=<ver>$m=<mem>,t=<iter>,p=<par>$<salt_b64>$<hash_b64>  (需 argon2-cffi)
-#   2. PBKDF2:     $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
-# 明文密码已被 R39 P1-12 移除，启动时若 ADMIN_PASSWORD 不以哈希前缀开头，
+# R53 P0-3: 彻底移除 Argon2 生成与识别,统一用 PBKDF2。
+#   旧实现 _is_hashed_password 会将 $argon2id$ 识别为受支持哈希,且当
+#   argon2-cffi 存在时 generate_password_hash() 生成 Argon2id。但新的
+#   admin/passwords.verify_password() 只接受 PBKDF2,导致已有 Argon2 管理员
+#   密码或新生成的 Argon2 密码被识别为"合法哈希",实际登录却永久失败。
+#   现统一:生成/校验均走 PBKDF2,Argon2 仅作为"已知但不支持,需迁移"识别。
+#
+# 哈希格式:
+#   1. PBKDF2(受支持):  $pbkdf2-sha256$<iterations>$<salt_hex>$<hash_hex>
+#   2. Argon2(已知但不支持,需迁移):  $argon2id$...  (由 is_argon2_hash 识别)
+# 明文密码已被 R39 P1-12 移除，启动时若 ADMIN_PASSWORD 不以 PBKDF2 前缀开头，
 # 将拒绝登录并打印强制告警，要求运维重新生成哈希。
 _PBKDF2_PREFIX = "$pbkdf2-sha256$"
 _ARGON2ID_PREFIX = "$argon2id$"
 _PBKDF2_ITERATIONS = 200_000  # OWASP 2023 推荐 ≥ 600k，平衡部署机器性能取 200k
 
-# R39 P1-12: 尝试导入 argon2-cffi（可选，未安装时降级到 PBKDF2-only）
+# R53 P0-3: 检测 argon2-cffi 是否安装(仅用于迁移诊断,不再用于生成/校验)
+# 保留 _ARGON2_AVAILABLE 标志供启动自检提供更精确的迁移指引。
 try:
-    from argon2 import PasswordHasher as _Argon2Hasher
-    from argon2.exceptions import VerifyMismatchError as _Argon2Mismatch
-    _argon2_hasher = _Argon2Hasher(
-        time_cost=3, memory_cost=65536, parallelism=4,  # OWASP 2023 推荐
-        hash_len=32, salt_len=16,
-    )
+    import argon2 as _argon2_module  # noqa: F401
     _ARGON2_AVAILABLE = True
 except ImportError:
-    _argon2_hasher = None
-    _Argon2Mismatch = Exception
     _ARGON2_AVAILABLE = False
 
 
 def _is_hashed_password(stored: str) -> bool:
-    """R39 P1-12: 判断密码是否为受支持的哈希格式。"""
+    """R53 P0-3: Check if password is a supported hash format (PBKDF2 only).
+
+    Argon2 hash is no longer supported (must migrate to PBKDF2).
+    Use is_argon2_hash() to identify legacy Argon2 hash for migration.
+    """
     if not stored:
         return False
-    return stored.startswith(_PBKDF2_PREFIX) or stored.startswith(_ARGON2ID_PREFIX)
+    return stored.startswith(_PBKDF2_PREFIX)
 
 
-# R52 P0-1: 从纯模块导入(避免 Settings 副作用)
+# R52 P0-1 / R53 P0-3: 从纯模块导入(避免 Settings 副作用)
 # _verify_password 保留原函数名(向后兼容,签名 (plaintext, stored) 不变);
 # hash_password 为纯 PBKDF2 生成函数。
-# 注:argon2-cffi 未列入 requirements.txt,原 Argon2id 分支为死代码,
-# 故纯 PBKDF2 实现与原行为等价;iterations<10_000 防御已在 passwords.py 中保留。
-from admin.passwords import verify_password as _verify_password, hash_password
+# is_argon2_hash 用于启动自检识别旧 Argon2 hash(迁移诊断)。
+from admin.passwords import (
+    verify_password as _verify_password,
+    hash_password,
+    is_argon2_hash,
+)
 
 
 # R39 P1-12: 启动时检测明文密码，仅告警一次（避免日志爆炸）
@@ -411,10 +419,11 @@ _plaintext_password_warned = False
 
 
 def _warn_if_plaintext_password() -> None:
-    """R39 P1-12: 启动时若 ADMIN_PASSWORD 为明文，打印强制告警并标记。
+    """R39 P1-12 / R53 P0-3: Warn at startup if ADMIN_PASSWORD is not a supported format.
 
-    明文密码将被 _verify_password 拒绝，所有登录都会失败。
-    运维需使用 generate_password_hash() 生成哈希值写入 .env。
+    R53 P0-3: Only PBKDF2 is supported. If legacy Argon2 hash is detected,
+    migration is required; if plaintext, hash generation is required.
+    _verify_password rejects login in both cases.
     """
     global _plaintext_password_warned
     if _plaintext_password_warned:
@@ -424,22 +433,33 @@ def _warn_if_plaintext_password() -> None:
         _plaintext_password_warned = True
         try:
             from loguru import logger
-            logger.error(
-                "[Admin] R39 P1-12: ADMIN_PASSWORD 为明文格式，已被禁用！"
-                "请使用以下命令生成哈希后写入 .env:\n"
-                "  python -c \"from admin import generate_password_hash; "
-                "print(generate_password_hash('YOUR_PASSWORD'))\"\n"
-                "在修复前所有登录尝试将返回 401。"
-            )
+            # R53 P0-3: 区分旧 Argon2 hash 和明文,提供不同迁移指引
+            if is_argon2_hash(pwd):
+                logger.critical(
+                    "[Admin] R53 P0-3: ADMIN_PASSWORD is legacy Argon2 format, no longer supported!"
+                    " verify_password only accepts PBKDF2, all logins will return 401."
+                    " Regenerate PBKDF2 hash and update .env:\n"
+                    "  python -c \"from admin import generate_password_hash; "
+                    "print(generate_password_hash('YOUR_PASSWORD'))\"\n"
+                )
+            else:
+                logger.error(
+                    "[Admin] R39 P1-12: ADMIN_PASSWORD 为明文格式，已被禁用！"
+                    "请使用以下命令生成哈希后写入 .env:\n"
+                    "  python -c \"from admin import generate_password_hash; "
+                    "print(generate_password_hash('YOUR_PASSWORD'))\"\n"
+                    "在修复前所有登录尝试将返回 401。"
+                )
         except Exception:
             pass
 
 
 def generate_password_hash(password: str, iterations: int = _PBKDF2_ITERATIONS) -> str:
-    """R39 P1-12: 生成哈希密码（优先 Argon2id，降级 PBKDF2）。
+    """R53 P0-3: Generate PBKDF2 hash (unified format, no longer generates Argon2).
 
-    - 若已安装 argon2-cffi，生成 Argon2id 哈希（推荐，抗 GPU/ASIC 攻击）
-    - 否则生成 PBKDF2-HMAC-SHA256 哈希（无需额外依赖）
+    R53 P0-3: Removed Argon2 generation branch, always generates PBKDF2-HMAC-SHA256.
+    This is consistent with admin/passwords.verify_password() validation path,
+    avoiding "generate Argon2 but verify only PBKDF2" contract break.
 
     可在外部脚本中调用以生成 .env 中的 ADMIN_PASSWORD 值。
 
@@ -449,13 +469,66 @@ def generate_password_hash(password: str, iterations: int = _PBKDF2_ITERATIONS) 
     if not password:
         # R48 P1: 协议化错误码替代裸字符串 ValueError
         raise AppError(ErrorCodes.ADMIN_VALIDATION_PASSWORD_EMPTY)
-    # R39 P1-12: 优先 Argon2id
-    if _ARGON2_AVAILABLE:
-        return _argon2_hasher.hash(password)
-    # 降级 PBKDF2
-    salt = secrets.token_bytes(16)
-    hash_bytes = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return f"{_PBKDF2_PREFIX}{iterations}${salt.hex()}${hash_bytes.hex()}"
+    # R53 P0-3: 统一用 PBKDF2(委托 admin.passwords.hash_password)
+    return hash_password(password, iterations=iterations)
+
+
+# ─── R53 P0-3: 启动自检 — 检测 admin_principals 表中的旧 Argon2 hash ──
+
+async def detect_legacy_argon2_hashes() -> list[dict]:
+    """R53 P0-3: Startup self-check — scan admin_principals for legacy Argon2 hashes.
+
+    If any Argon2 hash is detected, logs a critical warning with migration guidance.
+    Argon2 hash is no longer supported by verify_password; admins with Argon2 hash
+    cannot login and must regenerate PBKDF2 hash.
+
+    Returns:
+        List of records with Argon2 hash, each containing id / username / hash prefix.
+        Empty list means no Argon2 hash (all PBKDF2 or empty).
+        Returns empty list if DB unavailable (does not block startup).
+    """
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if not store._db:
+            return []
+        # 查询所有活跃 admin_principals 的 password_hash
+        rows = await store._db.execute_fetchall(
+            "SELECT id, username, password_hash FROM admin_principals "
+            "WHERE is_active = 1 AND password_hash != ''"
+        )
+        legacy_hashes: list[dict] = []
+        for row in rows:
+            principal_id = int(row[0])
+            username = str(row[1])
+            password_hash = str(row[2]) if row[2] else ""
+            if is_argon2_hash(password_hash):
+                legacy_hashes.append({
+                    "id": principal_id,
+                    "username": username,
+                    "hash_prefix": password_hash[:20] + "...",
+                })
+        if legacy_hashes:
+            from loguru import logger
+            # 加载 i18n 警告文案
+            warning_msg = _t(0, "admin.auth.legacy_argon2_detected",
+                             count=len(legacy_hashes))
+            logger.critical(
+                f"[Admin] R53 P0-3: {warning_msg} "
+                f"Detected {len(legacy_hashes)} legacy Argon2 hash records: "
+                f"{[h['username'] for h in legacy_hashes]}. "
+                f"These admins cannot login. Regenerate PBKDF2 hash via: "
+                f"python -c \"from admin import generate_password_hash; "
+                f"print(generate_password_hash('YOUR_PASSWORD'))\" "
+                f"and update password_hash in admin_principals table."
+            )
+        return legacy_hashes
+    except Exception as e:
+        from loguru import logger
+        logger.warning(
+            f"[Admin] R53 P0-3: detect_legacy_argon2_hashes scan error (skipped): {e}"
+        )
+        return []
 
 
 # ─── 可信代理集合：仅这些来源的 X-Forwarded-For 才被信任 ─────────────
@@ -534,6 +607,9 @@ async def startup():
     # R45 §7.1: 强制 readiness 检查 — 未 bootstrap 时退出非零
     # 放在 init_db 之后、_load_state_from_cache 之前,确保 DB 已就绪再校验
     await ensure_readiness_or_exit()
+    # R53 P0-3: 启动自检 — 检测 admin_principals 表中的旧 Argon2 hash
+    # 不阻塞启动(检测到仅记录 critical 警告,由运维手动迁移)
+    await detect_legacy_argon2_hashes()
     await _load_state_from_cache()
 
 

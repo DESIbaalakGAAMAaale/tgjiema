@@ -1224,7 +1224,7 @@ async def write_durable_outbox(
 
 
 async def replay_durable_outbox(batch_size: int = 100) -> int:
-    """R45 §13 + R52 P1-1: Redis 恢复后将 durable outbox 中 pending/publishing 消息重放到 Stream。
+    """R45 §13 + R52 P1-1 + R53 P1-2: Redis 恢复后将 durable outbox 中 pending 消息重放到 Stream。
 
     由 db_writer 启动时或 mon_bot 检测到 Redis 恢复后调用。
     重放成功后标记为 'replayed',不删除(保留审计痕迹)。
@@ -1234,6 +1234,18 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
         2. 抢占 lease: pending → publishing + lease_owner + lease_until
         3. 重放前验证 payload hash(防篡改): 计算 hash 与 request_hash 比对
         4. 成功 → publishing → replayed;失败 → 回滚到 pending(释放 lease)
+
+    R53 P1-2 修复(终止永久热循环):
+        5. hash 不匹配时 CAS 标记 ``quarantined`` 状态(原 ``continue`` 会让记录
+           保持 pending,下一轮 replay 再次读取、再次校验、再次报错,形成
+           永久日志风暴和 CPU/磁盘消耗)
+        6. 写权威 DLQ(dead letter queue)携带安全摘要(仅 hash 指纹,
+           不含原始 payload,避免敏感数据泄露),``permanent=True`` 标记
+           永久死信,等待人工审核
+        7. ``quarantined`` 状态在 SELECT ``WHERE status='pending'`` 中自动过滤,
+           下一轮 replay 不会再读取该记录
+        8. 长批次按行续租 lease(每行抢占前重新计算 lease_until),
+           防止 lease 过期后被其他 replayer 重放同一行
 
     Args:
         batch_size: 单次重放的最大消息数
@@ -1261,6 +1273,7 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
         )
         await conn.commit()
         # 拉取 pending 消息(含 request_hash 列)
+        # 注:quarantined 状态会被 WHERE status='pending' 自动过滤(R53 P1-2)
         cursor = await conn.execute(
             "SELECT id, message_id, op_type, table_name, method_name, "
             "data_json, redis_key, attempts, created_at, request_hash "
@@ -1273,8 +1286,10 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
         if not rows:
             return 0
         replayed = 0
+        quarantined_count = 0
         lease_owner = f"replayer-{os.getpid()}"
-        lease_until = now + _DURABLE_LEASE_TIMEOUT_SECONDS
+        # R53 P1-2: lease_until 在循环内按行续租(原代码在循环外一次性计算,
+        # 长批次下 lease 可能提前过期,导致其他 replayer 重放同一行)
         for row in rows:
             (row_id, msg_id, op_type, table_name, method_name,
              data_json, redis_key, attempts, created_at,
@@ -1288,13 +1303,51 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
                     redis_key or "",
                 )
                 if stored_hash and recomputed_hash != stored_hash:
+                    # R53 P1-2: hash 不匹配 → CAS 标记 quarantined(终止热循环)
+                    # 原 continue 保持 pending,下一轮 replay 会再次读取、
+                    # 再次校验、再次报错,形成永久日志风暴和 CPU/磁盘消耗
                     logger.error(
-                        f"[RedisQueue] R52 P1-1: replay hash 校验失败 "
+                        f"[RedisQueue] R53 P1-2: replay hash 校验失败 "
                         f"row_id={row_id} message_id={msg_id} "
                         f"stored={stored_hash} recomputed={recomputed_hash} "
-                        f"— 跳过该消息(payload 可能被篡改)"
+                        f"— 标记 quarantined(终止热循环,等待 quarantine_repair)"
                     )
-                    continue  # 跳过此消息,继续重放下一条
+                    # CAS: 仅 pending 状态可转为 quarantined,
+                    # 避免与其他 replayer 竞争同一行
+                    qcur = await conn.execute(
+                        "UPDATE durable_outbox SET status = 'quarantined', "
+                        "lease_owner = NULL, lease_until = NULL "
+                        "WHERE id = ? AND status = 'pending'",
+                        (row_id,),
+                    )
+                    quarantined_rowcount = qcur.rowcount
+                    await qcur.close()
+                    await conn.commit()
+                    # 写权威 DLQ(安全摘要,仅含 hash 指纹,不含原始 payload,
+                    # 避免敏感数据泄露;permanent=True 标记永久死信等待人工审核)
+                    if quarantined_rowcount > 0:
+                        quarantined_count += 1
+                        await push_dead(
+                            {
+                                "message_id": msg_id,
+                                "method": method_name,
+                                "op_type": op_type,
+                                "table": table_name,
+                                "expected_hash": stored_hash,
+                                "actual_hash": recomputed_hash,
+                            },
+                            reason=(
+                                f"R53 P1-2: durable outbox hash mismatch "
+                                f"quarantined (message_id={msg_id})"
+                            ),
+                            message_id=msg_id,
+                            permanent=True,
+                        )
+                    # quarantined 状态在 SELECT WHERE status='pending' 自动过滤,
+                    # 下一轮 replay 不会再读取该记录
+                    continue
+                # R53 P1-2: 每行抢占 lease 前续租(防长批次 lease 过期被其他 replayer 重放)
+                lease_until = time.time() + _DURABLE_LEASE_TIMEOUT_SECONDS
                 # R52 P1-1: 抢占 lease(pending → publishing)
                 cur = await conn.execute(
                     "UPDATE durable_outbox SET status = 'publishing', "
@@ -1349,15 +1402,190 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
                     pass
                 # 单条失败不影响其他消息重放
                 continue
-        if replayed > 0:
+        if replayed > 0 or quarantined_count > 0:
             logger.info(
                 f"[RedisQueue] R45 §13: durable outbox 重放 "
-                f"{replayed}/{len(rows)} 条消息到 Stream"
+                f"{replayed}/{len(rows)} 条消息到 Stream "
+                f"(R53 P1-2: quarantined {quarantined_count} 条 hash 不匹配)"
             )
         return replayed
     except Exception as e:
         logger.warning(f"[RedisQueue] R45 §13: replay_durable_outbox 异常: {e}")
         return 0
+
+
+async def quarantine_repair(
+    row_id: int,
+    action: str,
+    approval_action_id: str = "",
+    new_data: Optional[dict] = None,
+    expected_principal_id: Optional[int] = None,
+) -> dict:
+    """R53 P1-2: 经审批的 quarantined 记录修复/删除流程。
+
+    quarantined 记录代表 payload 可能被篡改,不可自动重放。
+    必须通过人工审批后才能修复(重新计算 hash 并恢复 pending)或删除。
+
+    支持的 action:
+        - ``"rehash"``: 用 new_data 重新计算 hash,将 status 从 quarantined
+          恢复为 pending,让下一轮 replay 重新尝试投递。
+          必须提供 new_data(否则抛 AppError)。
+        - ``"delete"``: 永久删除该 quarantined 记录(物理删除,不可恢复)。
+          用于确认 payload 已无效或被恶意篡改需要清除的场景。
+
+    安全约束:
+        1. approval_action_id 不可为空(必须经审批)
+        2. 调用方需在外层校验 approval_action_id 的状态/principal/request_hash
+           (与 REPAIR_CONSOLE_APPROVAL_REQUIRED 同一审批流)
+        3. 仅 quarantined 状态可被修复/删除(其他状态拒绝)
+        4. expected_principal_id 用于二次校验审批归属(防越权)
+
+    Args:
+        row_id: durable_outbox.id(quarantined 记录主键)
+        action: 修复动作 ``"rehash"`` 或 ``"delete"``
+        approval_action_id: 审批动作 ID(必须经审批,不可为空)
+        new_data: action="rehash" 时的新 payload(用于重新计算 hash)
+        expected_principal_id: 审批归属 principal_id(可选,二次校验)
+
+    Returns:
+        操作结果 dict:
+            - ``{"status": "rehashed", "row_id": <id>, "new_hash": <hash>}``
+            - ``{"status": "deleted", "row_id": <id>}``
+
+    Raises:
+        AppError: approval_action_id 为空 / action 非法 / 记录非 quarantined /
+            rehash 缺少 new_data / 数据库操作失败
+    """
+    from services.error_codes import AppError, ErrorCodes
+
+    # 1. 校验 approval_action_id(强制审批)
+    if not approval_action_id:
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_REQUIRED,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "principal_id": expected_principal_id or 0,
+            },
+        )
+    # 2. 校验 action 取值
+    if action not in ("rehash", "delete"):
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": f"action(必须为 rehash 或 delete,实际: {action})"},
+        )
+    # 3. rehash 必须提供 new_data
+    if action == "rehash" and not isinstance(new_data, dict):
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": "new_data(rehash 动作必须提供 dict 类型新 payload)"},
+        )
+
+    conn = await _get_dedicated_connection()
+    if conn is None:
+        raise AppError(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={
+                "component": "durable_outbox",
+                "method": f"quarantine_repair:{action}",
+            },
+        )
+
+    try:
+        # 4. 拉取当前记录(仅 quarantined 状态可被修复/删除)
+        cursor = await conn.execute(
+            "SELECT id, message_id, op_type, table_name, method_name, "
+            "data_json, redis_key, status FROM durable_outbox WHERE id = ?",
+            (row_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if not row:
+            raise AppError(
+                ErrorCodes.FILE_NOT_FOUND,
+                params={"file_code": f"durable_outbox.id={row_id}"},
+            )
+        current_status = row[7]
+        if current_status != "quarantined":
+            # 状态非 quarantined,拒绝修复(防越权修改已 replayed/pending 记录)
+            raise AppError(
+                ErrorCodes.APPROVAL_STATE_INVALID,
+                params={
+                    "approval_id": approval_action_id,
+                    "current_status": current_status,
+                },
+            )
+
+        if action == "rehash":
+            # 5. 重新计算 hash + 恢复 pending 状态
+            msg_id = row[1]
+            op_type = row[2]
+            table_name = row[3]
+            method_name = row[4]
+            redis_key = row[6] or ""
+            new_data_json = json.dumps(new_data, default=str, ensure_ascii=False)
+            new_hash = _compute_request_hash(
+                op_type, table_name, method_name, new_data, redis_key,
+            )
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await conn.execute(
+                    "UPDATE durable_outbox SET status = 'pending', "
+                    "data_json = ?, request_hash = ?, "
+                    "lease_owner = NULL, lease_until = NULL "
+                    "WHERE id = ? AND status = 'quarantined'",
+                    (new_data_json, new_hash, row_id),
+                )
+                await conn.commit()
+            except Exception:
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            logger.info(
+                f"[RedisQueue] R53 P1-2: quarantined 记录已修复(经审批 "
+                f"approval_action_id={approval_action_id}, row_id={row_id}, "
+                f"message_id={msg_id}, new_hash={new_hash})"
+            )
+            return {
+                "status": "rehashed",
+                "row_id": row_id,
+                "new_hash": new_hash,
+            }
+        else:  # action == "delete"
+            # 6. 物理删除 quarantined 记录
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await conn.execute(
+                    "DELETE FROM durable_outbox WHERE id = ? AND status = 'quarantined'",
+                    (row_id,),
+                )
+                await conn.commit()
+            except Exception:
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            logger.info(
+                f"[RedisQueue] R53 P1-2: quarantined 记录已删除(经审批 "
+                f"approval_action_id={approval_action_id}, row_id={row_id})"
+            )
+            return {"status": "deleted", "row_id": row_id}
+    except AppError:
+        raise
+    except Exception as e:
+        logger.error(
+            f"[RedisQueue] R53 P1-2: quarantine_repair 异常 "
+            f"row_id={row_id} action={action}: {e}"
+        )
+        raise AppError(
+            ErrorCodes.DB_CACHE_UNAVAILABLE,
+            params={
+                "component": "durable_outbox",
+                "method": f"quarantine_repair:{action}",
+            },
+        ) from e
 
 
 async def get_durable_outbox_count() -> int:

@@ -19,3 +19,5 @@ uvloop==0.19.0; sys_platform != 'win32'
 orjson==3.11.9
 redis==5.0.8
 pyotp>=2.9.0
+# R53 P1-4: zoneinfo 在 Windows 上需要 tzdata 包提供 IANA 时区数据(Linux 自带)
+tzdata>=2024.1

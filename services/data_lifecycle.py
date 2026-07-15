@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import uuid
 from typing import Any
 
@@ -903,8 +904,8 @@ async def _verify_backup_marker(
     *,
     require_user_scope: bool = False,
     require_checksum: bool = False,
-) -> bool:
-    """R51 P1-1 + R52 P1-3: 物理删除前验证 backup marker。
+) -> dict | None:
+    """R51 P1-1 + R52 P1-3 + R53 P1-3: 物理删除前验证 backup marker。
 
     调用 BackupEngine.get_last_successful_backup() 检查最近一次成功备份:
     - 返回非 None → 存在成功备份 → 允许物理删除
@@ -922,13 +923,20 @@ async def _verify_backup_marker(
           (确保备份内容完整性可校验,防备份被篡改)
         - 时间字段 completed_at 必须存在(已隐含在 get_last_successful_backup)
 
+    R53 P1-3 增强(严格绑定 + user_coverage):
+        - backup_id 必须存在(绑定具体备份实例,防止"有备份但不指定哪个"的模糊授权)
+        - 批量全库备份优先使用 manifest 中的 user_coverage(用户 ID 列表),
+          而非单一 user_id 字段;user_id 在 user_coverage 中即视为覆盖
+        - 返回 dict(含 backup_id/checksum/completed_at/user_coverage)供调用方绑定审计
+
     Args:
         user_id: 被删除用户 ID(require_user_scope=True 时校验)
         require_user_scope: 是否要求备份绑定用户范围(R52 P1-3)
         require_checksum: 是否要求备份含 checksum(R52 P1-3)
 
     Returns:
-        True 允许物理删除;False 拒绝
+        成功: dict({backup_id, checksum, completed_at, user_coverage});
+        失败: None
     """
     try:
         from services.backup_engine import BackupEngine
@@ -938,88 +946,176 @@ async def _verify_backup_marker(
             logger.warning(
                 "[DataLifecycle] backup marker 验证失败: 无成功备份记录,拒绝物理删除"
             )
-            return False
+            return None
+        # R53 P1-3: backup_id 必须存在(绑定具体备份实例)
+        backup_id = latest.get("backup_id")
+        if not backup_id:
+            logger.warning(
+                "[DataLifecycle] R53 P1-3: backup marker 缺少 backup_id,"
+                "拒绝物理删除(无法绑定具体备份实例)"
+            )
+            return None
         # R52 P1-3: completed_at 必须存在(时间绑定)
         completed_at = latest.get("completed_at")
         if not completed_at:
             logger.warning(
                 f"[DataLifecycle] R52 P1-3: backup marker 缺少 completed_at,"
-                f"拒绝物理删除 backup_id={latest.get('backup_id')}"
+                f"拒绝物理删除 backup_id={backup_id}"
             )
-            return False
-        # R52 P1-3: 用户范围绑定
+            return None
+        # R52 P1-3 + R53 P1-3: 用户范围绑定
+        # 优先使用 manifest 中的 user_coverage(全库备份覆盖的用户列表),
+        # 其次回退到单一 user_id 字段(单用户备份场景)
         if require_user_scope:
-            backup_user_id = latest.get("user_id")
-            if backup_user_id is None:
-                logger.warning(
-                    f"[DataLifecycle] R52 P1-3: backup marker 缺少 user_id 字段,"
-                    f"拒绝物理删除(require_user_scope=True) "
-                    f"backup_id={latest.get('backup_id')}"
-                )
-                return False
-            if user_id is not None and int(backup_user_id) != int(user_id):
-                logger.warning(
-                    f"[DataLifecycle] R52 P1-3: backup marker user_id 不匹配,"
-                    f"拒绝物理删除 backup_user_id={backup_user_id} "
-                    f"target_user_id={user_id}"
-                )
-                return False
+            user_coverage = latest.get("user_coverage")
+            if isinstance(user_coverage, list) and len(user_coverage) > 0:
+                # 全库备份: 校验 target user_id 在 user_coverage 中
+                if user_id is not None:
+                    try:
+                        target_uid = int(user_id)
+                    except (TypeError, ValueError):
+                        target_uid = None
+                    covered = False
+                    if target_uid is not None:
+                        for uid in user_coverage:
+                            try:
+                                if int(uid) == target_uid:
+                                    covered = True
+                                    break
+                            except (TypeError, ValueError):
+                                continue
+                    if not covered:
+                        logger.warning(
+                            f"[DataLifecycle] R53 P1-3: backup marker user_coverage "
+                            f"未覆盖目标用户,拒绝物理删除 "
+                            f"backup_id={backup_id} target_user_id={user_id} "
+                            f"coverage_size={len(user_coverage)}"
+                        )
+                        return None
+            else:
+                # 单用户备份: 校验 user_id 字段匹配
+                backup_user_id = latest.get("user_id")
+                if backup_user_id is None:
+                    logger.warning(
+                        f"[DataLifecycle] R52 P1-3: backup marker 缺少 user_id 字段,"
+                        f"拒绝物理删除(require_user_scope=True) "
+                        f"backup_id={backup_id}"
+                    )
+                    return None
+                if user_id is not None and int(backup_user_id) != int(user_id):
+                    logger.warning(
+                        f"[DataLifecycle] R52 P1-3: backup marker user_id 不匹配,"
+                        f"拒绝物理删除 backup_user_id={backup_user_id} "
+                        f"target_user_id={user_id}"
+                    )
+                    return None
         # R52 P1-3: checksum 完整性绑定
+        checksum = latest.get("checksum") or latest.get("sha256")
         if require_checksum:
-            checksum = latest.get("checksum") or latest.get("sha256")
             if not checksum:
                 logger.warning(
                     f"[DataLifecycle] R52 P1-3: backup marker 缺少 checksum,"
                     f"拒绝物理删除(require_checksum=True) "
-                    f"backup_id={latest.get('backup_id')}"
+                    f"backup_id={backup_id}"
                 )
-                return False
+                return None
         logger.info(
-            f"[DataLifecycle] backup marker 验证通过 backup_id={latest.get('backup_id')} "
+            f"[DataLifecycle] backup marker 验证通过 backup_id={backup_id} "
             f"completed_at={completed_at} "
             f"user_scope_checked={require_user_scope} "
             f"checksum_checked={require_checksum}"
         )
-        return True
+        return {
+            "backup_id": backup_id,
+            "checksum": checksum or "",
+            "completed_at": completed_at,
+            "user_coverage": latest.get("user_coverage", []),
+        }
     except Exception as e:
         logger.warning(
             f"[DataLifecycle] backup marker 验证异常,拒绝物理删除(失败即拒绝): {e}"
         )
-        return False
+        return None
 
 
 async def cleanup_expired_data(
     batch_size: int = 1000,
     skip_backup_check: bool = False,
+    *,
+    approval_action_id: str | None = None,
 ) -> int:
-    """R51 P1-1: 清理过期数据(物理删除已过保留期且已备份的数据)。
+    """R51 P1-1 + R53 P1-3: 清理过期数据(物理删除已过保留期且已备份的数据)。
 
-    改造要点:
-    - 物理删除前必须验证 backup marker(无 marker 拒绝物理删除)
-    - skip_backup_check=True 仅用于测试场景或运维显式绕过(默认 False)
-    - 无 marker 时 raise AppError(DATA_LIFECYCLE_BACKUP_MARKER_MISSING)
+    R53 P1-3 改造要点:
+    - 物理删除强制 _verify_backup_marker(require_user_scope=True, require_checksum=True)
+    - 批量全库备份使用 manifest 中的 user_coverage 校验用户覆盖范围
+    - 绑定 backup_id、manifest checksum、completed_at、retention cutoff 到审计日志
+    - skip_backup_check=True 必须有 break-glass 审批(环境变量 BREAK_GLASS_APPROVED
+      或 approval_action_id),普通调用方禁止绕过
 
     Args:
         batch_size: 单批最大清理条数
-        skip_backup_check: 跳过 backup marker 验证(仅测试/运维绕过)
+        skip_backup_check: 跳过 backup marker 验证(需 break-glass 审批)
+        approval_action_id: break-glass 审批 action ID(skip_backup_check=True 时必填)
 
     Returns:
         清理的总行数
 
     Raises:
-        AppError(DATA_LIFECYCLE_BACKUP_MARKER_MISSING): 无 backup marker
+        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): skip_backup_check=True
+            无 break-glass 审批
+        AppError(DATA_LIFECYCLE_BACKUP_MARKER_MISSING): backup marker 校验失败
     """
     if not await _ensure_retention_table():
         return 0
     store = get_cache_store()
     if not store._db:
         return 0
-    # R51 P1-1: 物理删除前必须验证 backup marker
+    # R53 P1-3: skip_backup_check=True 必须有 break-glass 审批
+    # 只允许环境变量 BREAK_GLASS_APPROVED 或 approval_action_id 通过
+    if skip_backup_check:
+        break_glass_approved = False
+        break_glass_source = ""
+        # 检查环境变量 BREAK_GLASS_APPROVED(truthy 值: 1/true/yes)
+        env_val = os.environ.get("BREAK_GLASS_APPROVED", "").strip()
+        if env_val.lower() in ("1", "true", "yes"):
+            break_glass_approved = True
+            break_glass_source = "env:BREAK_GLASS_APPROVED"
+        # 检查 approval_action_id(非空即视为审批通过,具体审批状态由调用方保证)
+        elif approval_action_id:
+            break_glass_approved = True
+            break_glass_source = f"approval_action_id:{approval_action_id}"
+        if not break_glass_approved:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "skip_backup_check_without_break_glass",
+                    "approval_action_id": approval_action_id or "",
+                },
+            )
+        # 写审计日志(break-glass 绕过 backup marker 检查)
+        await _write_audit_log(
+            0, "break_glass_skip_backup_check", "data_lifecycle",
+            "cleanup_expired_data",
+            {
+                "reason": "skip_backup_check_with_break_glass",
+                "approval_action_id": approval_action_id or "",
+                "break_glass_source": break_glass_source,
+            },
+        )
+    # R53 P1-3: 物理删除前强制严格 backup marker 校验
+    # require_user_scope=True: 校验用户覆盖范围(全库备份用 user_coverage)
+    # require_checksum=True: 校验 manifest checksum(完整性绑定)
+    backup_info: dict | None = None
     if not skip_backup_check:
-        if not await _verify_backup_marker():
+        backup_info = await _verify_backup_marker(
+            require_user_scope=True,
+            require_checksum=True,
+        )
+        if backup_info is None:
             raise AppError(
                 ErrorCodes.DATA_LIFECYCLE_BACKUP_MARKER_MISSING,
-                params={"reason": "no_successful_backup_found"},
+                params={"reason": "strict_backup_marker_verification_failed"},
             )
     total_cleaned = 0
     now_dt = _dt.datetime.now()
@@ -1038,6 +1134,34 @@ async def cleanup_expired_data(
         user_id, retention_days = r[0], int(r[1])
         cutoff_dt = now_dt - _dt.timedelta(days=retention_days)
         cutoff_iso = cutoff_dt.isoformat()
+        # R53 P1-3: 校验该用户在 backup marker 的 user_coverage 中
+        # 批量全库备份使用 manifest 中的 user_coverage,而非单一 user_id 字段
+        if not skip_backup_check and backup_info is not None:
+            user_coverage = backup_info.get("user_coverage", [])
+            if isinstance(user_coverage, list) and len(user_coverage) > 0:
+                # 全库备份: 校验 user_id 在 user_coverage 中
+                covered = False
+                try:
+                    target_uid = int(user_id)
+                except (TypeError, ValueError):
+                    target_uid = None
+                if target_uid is not None:
+                    for uid in user_coverage:
+                        try:
+                            if int(uid) == target_uid:
+                                covered = True
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                if not covered:
+                    logger.warning(
+                        f"[DataLifecycle] R53 P1-3: user_id={user_id} 不在 backup "
+                        f"user_coverage 中,跳过物理删除 "
+                        f"backup_id={backup_info.get('backup_id')}"
+                    )
+                    continue
+            # user_coverage 为空时(单用户备份)不适用于批量清理,
+            # _verify_backup_marker 已通过 require_user_scope 校验存在性
         # 物理删除该用户已软删(deleted_at < cutoff)的 file_records
         try:
             cursor = await store._db.execute(
@@ -1070,6 +1194,20 @@ async def cleanup_expired_data(
             await store._db.commit()
         except Exception as e:
             logger.debug(f"[DataLifecycle] cleanup 更新 last_purged_at 失败: {e}")
+        # R53 P1-3: 绑定 backup_id、manifest checksum、completed_at、retention cutoff
+        # 写入审计日志,建立物理删除与具体备份实例的绑定关系
+        if not skip_backup_check and backup_info is not None:
+            await _write_audit_log(
+                0, "physical_delete_with_backup_marker", "user", str(user_id),
+                {
+                    "user_id": user_id,
+                    "backup_id": backup_info.get("backup_id"),
+                    "checksum": backup_info.get("checksum"),
+                    "completed_at": backup_info.get("completed_at"),
+                    "retention_cutoff": cutoff_iso,
+                    "retention_days": retention_days,
+                },
+            )
         if total_cleaned >= batch_size:
             break
     logger.info(

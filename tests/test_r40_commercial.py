@@ -75,9 +75,12 @@ class TestEntitlements:
         if tree is None:
             pytest.skip("AST 解析失败")
         funcs = _get_async_funcs(tree)
+        # R53 P0-5: set_user_plan 已私有化为 _set_user_plan_internal,
+        # 公共生产 API 为 set_user_plan_via_command_bus
         required = {
             "get_plan", "get_quota", "get_limits", "check",
-            "set_user_plan", "get_plan_features",
+            "_set_user_plan_internal", "set_user_plan_via_command_bus",
+            "get_plan_features",
         }
         missing = required - funcs
         assert not missing, f"entitlements.py 缺少方法: {missing}"

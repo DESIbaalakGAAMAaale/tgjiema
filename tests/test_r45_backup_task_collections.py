@@ -369,16 +369,20 @@ class TestCollectionsOptimisticLock:
 
     @pytest.mark.asyncio
     async def test_update_collection_without_expected_version(self, store):
-        """R51 P1-3 + R52 P1-5: 不传 expected_version 必须显式 bypass_cas=True + approval_action_id 才能更新。"""
+        """R51 P1-3 + R53 P0-4: bypass 路径需通过私有方法 + 真实审批记录。"""
         from services import collections
         coll = await collections.create_collection("兼容模式", owner_id=5003)
         coll_id = coll["id"]
-        # R52 P1-5: bypass_cas=True 必须提供 approval_action_id(审计要求)
-        # 显式 bypass_cas=True(运维/迁移场景)→ 跳过 CAS,直接更新
-        result = await collections.update_collection(
+        # R53 P0-4: 插入真实审批记录(status=approved)
+        await _insert_command_execution(
+            store, "approval_bypass_001", status="approved",
+            request_hash="hash_r45_bypass",
+        )
+        # R53 P0-4: 调用私有方法 + 真实审批 → 跳过 CAS,直接更新
+        result = await collections._update_collection_without_cas(
             collection_id=coll_id, description="新描述",
-            expected_version=None,
-            bypass_cas=True,
+            principal_id=100,  # _insert_command_execution 默认 principal_id=100
+            request_hash="hash_r45_bypass",
             approval_action_id="approval_bypass_001",
             caller="test_migration",
         )

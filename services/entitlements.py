@@ -3,7 +3,8 @@
 职责:
 - 根据用户会员等级(free/basic/premium)判定可用配额、文件大小、并发数、保留期、队列优先级
 - 统一入口 check() 供 Up/Idx/Dsp Bot 在上传/解码/合集等操作前调用
-- 管理员可通过 set_user_plan() 动态调整用户套餐
+- 管理员可通过 set_user_plan_via_command_bus() 动态调整用户套餐(R53 P0-5:
+  底层事务函数 _set_user_plan_internal 已私有化,production 环境必须经 CommandBus)
 
 数据来源:
 - users_local.membership_level: 用户会员等级
@@ -32,6 +33,47 @@ from services.error_codes import AppError, ErrorCodes
 MEMBERSHIP_FREE = "free"
 MEMBERSHIP_BASIC = "basic"
 MEMBERSHIP_PREMIUM = "premium"
+
+
+def _get_billing_day_utc_bounds() -> tuple[str, str]:
+    """R53 P1-4: 计算当日 ``BILLING_TIMEZONE`` 边界对应的 UTC 时间区间。
+
+    以 ``settings.BILLING_TIMEZONE``(默认 Asia/Shanghai)为基准,
+    取当日 00:00:00 到次日 00:00:00 的本地时间区间,
+    转换为 UTC ISO 8601 字符串(带 +00:00 后缀)。
+
+    用途:
+        - 替代 SQLite 的 ``date('now', 'localtime')``,
+          避免依赖容器/宿主机时区(Docker 默认 UTC)
+        - 用于参数化查询 ``created_at >= ? AND created_at < ?``
+
+    Returns:
+        (start_utc_iso, end_utc_iso):
+            start_utc_iso: 当日 BILLING_TIMEZONE 0 点对应的 UTC ISO 字符串
+            end_utc_iso:   次日 BILLING_TIMEZONE 0 点对应的 UTC ISO 字符串
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(str(getattr(settings, "BILLING_TIMEZONE", "Asia/Shanghai")))
+    now_local = datetime.datetime.now(tz)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + datetime.timedelta(days=1)
+    start_utc = start_local.astimezone(datetime.timezone.utc)
+    end_utc = end_local.astimezone(datetime.timezone.utc)
+    return (start_utc.isoformat(), end_utc.isoformat())
+
+
+def _get_billing_today_date() -> datetime.date:
+    """R53 P1-4: 获取 ``BILLING_TIMEZONE`` 当地今日日期。
+
+    用于 ``ext_quota_date`` 等按本地日期比较的场景,
+    替代 ``datetime.datetime.now().date()``(依赖宿主机时区)。
+
+    Returns:
+        BILLING_TIMEZONE 当地今日 date 对象
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(str(getattr(settings, "BILLING_TIMEZONE", "Asia/Shanghai")))
+    return datetime.datetime.now(tz).date()
 
 
 # ─── 数据结构定义 ──────────────────────────────────────────────
@@ -161,9 +203,13 @@ async def get_quota(user_id: int) -> Quota:
 
     # 统计今日配额消耗: settled 用 actual_amount, reserved 用 amount
     # R51 P1-2: fail-closed — DB 异常时 raise AppError(不再默认 used=0)
+    # R53 P1-4: 不再依赖 SQLite date('now', 'localtime')(受宿主机时区影响),
+    # 改用 Python 计算 BILLING_TIMEZONE 当日 0 点对应的 UTC 边界,参数化查询
     used_today = 0
     if store._db:
         try:
+            # R53 P1-4: BILLING_TIMEZONE 当日 UTC 边界
+            start_utc_iso, end_utc_iso = _get_billing_day_utc_bounds()
             rows = await store._db.execute_fetchall(
                 "SELECT COALESCE(SUM(CASE "
                 "WHEN status='settled' THEN actual_amount "
@@ -171,12 +217,12 @@ async def get_quota(user_id: int) -> Quota:
                 "ELSE 0 END), 0) "
                 "FROM quota_reservations "
                 "WHERE user_id = ? AND status != 'refunded' "
-                # created_at 由 datetime.now() 写入(本地时区),
-                # 查询须用 date('now', 'localtime') 取本地日期匹配,
-                # 否则 UTC+8 00:00-08:00 时段本地日期与 UTC 日期错位,
-                # 导致 used_today=0 误判(超额放行)。
-                "AND date(created_at) = date('now', 'localtime')",
-                (user_id,),
+                # created_at 由 datetime.now(timezone.utc) 写入(UTC aware ISO),
+                # 查询用参数化 UTC 边界匹配 BILLING_TIMEZONE 当日 0 点窗口:
+                #   start_utc_iso <= created_at < end_utc_iso
+                # 例如 BILLING_TIMEZONE=Asia/Shanghai 时,本地 0 点 = UTC 前一日 16:00
+                "AND created_at >= ? AND created_at < ?",
+                (user_id, start_utc_iso, end_utc_iso),
             )
             if rows:
                 used_today = int(rows[0][0] or 0)
@@ -204,8 +250,15 @@ async def get_quota(user_id: int) -> Quota:
         ext_date = quota_data.get("ext_quota_date")
         if ext_date:
             try:
-                ext_dt = datetime.datetime.fromisoformat(str(ext_date)).date()
-                if ext_dt == datetime.datetime.now().date():
+                # R53 P1-4: ext_quota_date 按 BILLING_TIMEZONE 当地日期比较,
+                # 替代 datetime.datetime.now().date()(依赖宿主机时区)
+                ext_dt = datetime.datetime.fromisoformat(str(ext_date))
+                # 兼容 naive timestamp(旧数据):视为 UTC
+                if ext_dt.tzinfo is None:
+                    ext_dt = ext_dt.replace(tzinfo=datetime.timezone.utc)
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo(str(getattr(settings, "BILLING_TIMEZONE", "Asia/Shanghai")))
+                if ext_dt.astimezone(tz).date() == _get_billing_today_date():
                     external_used = int(quota_data.get("ext_used_today", 0) or 0)
             except (ValueError, TypeError):
                 pass
@@ -278,7 +331,7 @@ async def get_user_quota(
 async def get_user_version(user_id: int, *, tx=None) -> int:
     """R52 P1-4: 读取用户记录的 version 字段(用于 CAS 并发套餐修改)。
 
-    users_local 表含 version 列(乐观锁),并发 set_user_plan 时通过
+    users_local 表含 version 列(乐观锁),并发 _set_user_plan_internal 时通过
     expected_version 进行 CAS 防止 lost update。
 
     Args:
@@ -460,7 +513,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
     )
 
 
-async def set_user_plan(
+async def _set_user_plan_internal(
     user_id: int,
     plan_name: str,
     admin_id: int = 0,
@@ -469,7 +522,17 @@ async def set_user_plan(
     request_hash: str = "",
     via_command_bus: bool = False,
 ) -> bool:
-    """设置用户套餐(管理员操作)。
+    """设置用户套餐(底层事务实现,私有)。
+
+    R53 P0-5 整改:
+    - 原 ``set_user_plan`` 重命名为 ``_set_user_plan_internal``,作为**私有**底层事务函数,
+      不再作为公共生产 API。
+    - 公共生产入口为 ``set_user_plan_via_command_bus``,必须经 CommandBus 审批。
+    - production 环境禁止 ``via_command_bus=False`` 直接修改套餐
+      → 抛 ``AppError(ENTITLEMENTS_DIRECT_MUTATION_FORBIDDEN)``。
+    - production 环境禁止 ``expected_version=None``
+      → 抛 ``AppError(ENTITLEMENTS_EXPECTED_VERSION_REQUIRED)``。
+    - development / test 环境保留向后兼容(允许直接调用,允许 ``expected_version=None``)。
 
     更新 users_local.membership_level 和 user_quota 表的配额上限,
     并写入 audit_log 审计记录。
@@ -483,27 +546,60 @@ async def set_user_plan(
     R52 P1-4 改造:
     - 支持 CAS 并发套餐修改(expected_version 提供且 > 0 时启用乐观锁)
     - 审计日志包含 old_plan / new_plan / request_hash(短指纹前 16 字符)
-    - 生产环境套餐变更应通过 set_user_plan_via_command_bus(via_command_bus=True
-      表示调用方已通过 CommandBus 审批;False 时仍允许调用以保持向后兼容,
-      但生产入口建议改用 CommandBus 路径)
 
     Args:
         user_id: 目标用户 ID
         plan_name: 套餐名(free/basic/premium)
         admin_id: 操作管理员 ID
-        expected_version: 可选,CAS 期望版本号(并发套餐修改乐观锁)
+        expected_version: 可选,CAS 期望版本号(并发套餐修改乐观锁);
+            production 环境下不允许 None
         request_hash: 可选,请求指纹(记录到 audit_log,前 16 字符短指纹)
-        via_command_bus: 是否经 CommandBus 审批入口调用(True=已审批)
+        via_command_bus: 是否经 CommandBus 审批入口调用(True=已审批);
+            production 环境下 False 时直接抛 AppError
 
     Returns:
         True 表示成功
 
     Raises:
+        AppError(ENTITLEMENTS_DIRECT_MUTATION_FORBIDDEN): production 环境下
+            via_command_bus=False 直接调用(绕过 CommandBus)
+        AppError(ENTITLEMENTS_EXPECTED_VERSION_REQUIRED): production 环境下
+            expected_version=None(必须 CAS)
         AppError(ENTITLEMENT_SET_PLAN_TX_FAILED): 事务失败
         AppError(ENTITLEMENT_SET_PLAN_CAS_CONFLICT): CAS 版本冲突
     """
+    # R53 P0-5: production 环境强制守卫 — 必须经 CommandBus + 必须 CAS
+    environment = _get_environment()
+    if environment == "production":
+        if not via_command_bus:
+            logger.error(
+                f"[Entitlements] R53 P0-5: production 环境禁止直接修改套餐 "
+                f"user={user_id} plan={plan_name}(必须通过 set_user_plan_via_command_bus)"
+            )
+            raise AppError(
+                ErrorCodes.ENTITLEMENTS_DIRECT_MUTATION_FORBIDDEN,
+                params={
+                    "user_id": user_id,
+                    "plan_name": plan_name,
+                    "environment": environment,
+                },
+            )
+        if expected_version is None:
+            logger.error(
+                f"[Entitlements] R53 P0-5: production 环境修改套餐必须提供 expected_version "
+                f"user={user_id} plan={plan_name}"
+            )
+            raise AppError(
+                ErrorCodes.ENTITLEMENTS_EXPECTED_VERSION_REQUIRED,
+                params={
+                    "user_id": user_id,
+                    "plan_name": plan_name,
+                    "environment": environment,
+                },
+            )
+
     if plan_name not in _PLANS:
-        logger.warning(f"[Entitlements] set_user_plan 无效套餐名: {plan_name}")
+        logger.warning(f"[Entitlements] _set_user_plan_internal 无效套餐名: {plan_name}")
         raise AppError(
             ErrorCodes.ENTITLEMENT_SET_PLAN_TX_FAILED,
             params={
@@ -514,7 +610,10 @@ async def set_user_plan(
 
     plan = _PLANS[plan_name]
     store = get_cache_store()
-    now = datetime.datetime.now().isoformat()
+    # R53 P1-4: 统一存 UTC aware timestamp(ISO 带 +00:00),
+    # 替代 datetime.datetime.now().isoformat()(naive 本地时间),
+    # 与配额查询的 UTC 边界参数化匹配
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     if not store._db:
         raise AppError(
@@ -561,7 +660,7 @@ async def set_user_plan(
                     # CAS 冲突 — 查询当前版本以便诊断
                     current_version = await get_user_version(user_id, tx=tx)
                     logger.warning(
-                        f"[Entitlements] R52 P1-4: set_user_plan CAS 冲突 "
+                        f"[Entitlements] R52 P1-4: _set_user_plan_internal CAS 冲突 "
                         f"user={user_id} expected_version={expected_version} "
                         f"current_version={current_version}"
                     )
@@ -575,7 +674,7 @@ async def set_user_plan(
                         },
                     )
             else:
-                # 无 CAS(向后兼容,默认路径)
+                # 无 CAS(向后兼容,仅 development/test 允许)
                 await tx.execute(
                     "UPDATE users_local SET membership_level = ?, updated_at = ? "
                     "WHERE user_id = ?",
@@ -672,7 +771,8 @@ async def set_user_plan(
         raise
     except Exception as e:
         logger.error(
-            f"[Entitlements] set_user_plan 事务失败 user={user_id} plan={plan_name}: {e}"
+            f"[Entitlements] _set_user_plan_internal 事务失败 "
+            f"user={user_id} plan={plan_name}: {e}"
         )
         raise AppError(
             ErrorCodes.ENTITLEMENT_SET_PLAN_TX_FAILED,
@@ -681,6 +781,18 @@ async def set_user_plan(
                 "reason": f"{type(e).__name__}: {e}",
             },
         ) from e
+
+
+def _get_environment() -> str:
+    """R53 P0-5: 读取当前运行环境(production / development / test)。
+
+    用于 ``_set_user_plan_internal`` 守卫,production 环境下禁止直接修改套餐。
+    与 ``services.crdb_sync_service._is_production`` 保持一致的取值逻辑。
+    """
+    try:
+        return str(getattr(settings, "ENVIRONMENT", "development"))
+    except Exception:
+        return "development"
 
 
 async def set_user_plan_via_command_bus(
@@ -692,13 +804,19 @@ async def set_user_plan_via_command_bus(
     request_hash: str = "",
     expected_version: int | None = None,
 ) -> dict:
-    """R52 P1-4: 通过 CommandBus 审批入口修改用户套餐(生产推荐入口)。
+    """R52 P1-4 + R53 P0-5: 通过 CommandBus 审批入口修改用户套餐(唯一公共生产 API)。
 
     套餐变更为高风险操作(影响用户配额/计费),生产环境必须通过 CommandBus:
     1. 调用 ``claim_execution_approved`` 验证 approval_action_id 处于 approved 状态
     2. 校验 request_hash 防篡改
-    3. 通过后调用 ``set_user_plan(via_command_bus=True)``
+    3. 通过后调用 ``_set_user_plan_internal(via_command_bus=True)``
     4. 标记 executed/failed
+
+    R53 P0-5 整改:
+    - 此函数是**唯一**的公共生产入口,底层 ``_set_user_plan_internal`` 已私有化。
+    - production 环境下调用方必须传 ``expected_version``(非 None),否则由
+      ``_set_user_plan_internal`` 抛 ``AppError(ENTITLEMENTS_EXPECTED_VERSION_REQUIRED)``。
+    - ``via_command_bus=True`` 由本函数内部传入,绕过 DIRECT_MUTATION_FORBIDDEN 守卫。
 
     Args:
         user_id: 目标用户 ID
@@ -706,13 +824,16 @@ async def set_user_plan_via_command_bus(
         principal: AdminPrincipal 对象(操作者身份)
         action_id: 幂等 ID(approval_action_id)
         request_hash: 请求指纹(防篡改)
-        expected_version: 可选,CAS 期望版本号
+        expected_version: 可选,CAS 期望版本号;
+            production 环境下必须提供(非 None),否则抛 AppError
 
     Returns:
         dict: {"success": bool}(成功时无 error 键)
 
     Raises:
         AppError(ENTITLEMENT_PLAN_REQUIRES_COMMAND_BUS): action_id 为空
+        AppError(ENTITLEMENTS_EXPECTED_VERSION_REQUIRED): production 环境下
+            expected_version=None(必须 CAS)
         AppError(ENTITLEMENT_SET_PLAN_TX_FAILED): 事务失败
         AppError(ENTITLEMENT_SET_PLAN_CAS_CONFLICT): CAS 冲突
     """
@@ -748,6 +869,18 @@ async def set_user_plan_via_command_bus(
             f"[Entitlements] R52 P1-4: CommandBus 认领失败 action_id={action_id} "
             f"user={user_id} plan={plan_name}"
         )
+        # 审批无效 → 回写 failed(若已 claim 成功状态机推进,则标记 failed)
+        try:
+            await mark_approved_failed(
+                action_id,
+                error="claim_execution_approved returned False",
+                retryable=False,
+            )
+        except Exception as mark_err:
+            logger.debug(
+                f"[Entitlements] R53 P0-5: 审批无效时 mark_approved_failed 失败 "
+                f"action_id={action_id}: {mark_err}"
+            )
         raise AppError(
             ErrorCodes.ENTITLEMENT_PLAN_REQUIRES_COMMAND_BUS,
             params={
@@ -757,9 +890,9 @@ async def set_user_plan_via_command_bus(
             },
         )
 
-    # 2. 通过审批,执行套餐变更
+    # 2. 通过审批,执行套餐变更(via_command_bus=True 绕过 DIRECT_MUTATION_FORBIDDEN 守卫)
     try:
-        await set_user_plan(
+        await _set_user_plan_internal(
             user_id, plan_name, admin_id=principal_id,
             expected_version=expected_version,
             request_hash=request_hash,
