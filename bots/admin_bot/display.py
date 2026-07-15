@@ -16,6 +16,15 @@ from utils.time_utils import format_datetime
 from .menus import _quota_display
 from utils.shared_counters import status_counters as _status_counters
 import utils.shared_counters as _shared_counters
+from .menus import AUTHORIZED_USER_ID
+
+from services.i18n import get_i18n_manager
+
+def _t(user_id: int, key: str, **kwargs) -> str:
+    manager = get_i18n_manager()
+    locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
+    return manager.format_message(key, locale=locale, **kwargs)
+
 
 # ── cells 缓存：admin 面板频繁刷新，加 60s 缓存避免每次点按钮都查 CRDB ──
 # N-M12: 缓存键包含 status_filter + sort_key，避免不同视图共享错误缓存
@@ -123,9 +132,9 @@ async def _get_status_text() -> str:
             # H-1: 仅非陈旧的 online 才计入正常
             online = sum(1 for p in pool_status if p.get("status") == "online" and not p.get("stale", False))
             stale_count = sum(1 for p in pool_status if p.get("stale", False))
-            relay_status = f"⚪ {online}/{len(pool_status)} 正常"
+            relay_status = _t(AUTHORIZED_USER_ID, "bot.admin_bot.m346", online=online, var0=len(pool_status))
             if stale_count:
-                relay_status += f" ({stale_count}个陈旧)"
+                relay_status += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m347", stale_count=stale_count)
         else:
             relay_status = "✅ 就绪/未配置"
     except Exception:
@@ -140,25 +149,16 @@ async def _get_status_text() -> str:
             active_cells_text = ", ".join(slots)
     except Exception:
         active_cells_text = "读取失败"
-    msg = (
-        f"📊 系统概览\n\n"
-        f"👤 总用户数:{_status_counters['total_users']}\n"
-        f"📁 总文件数:{_status_counters['total_files']}\n"
-        f"✅ 活跃文件:{_status_counters['active_files']}\n"
-        f"🔄 今日解码:{_status_counters['today_decodes']}\n"
-        f"\n🔄 活跃槽位:{active_cells_text}\n"
-        f"\n🔐 用户中继:{relay_status}\n"
-        f"\n🤖 机器人状态:\n"
-    )
+    msg = _t(AUTHORIZED_USER_ID, "bot.admin_bot.m348", var0=_status_counters['total_users'], var1=_status_counters['total_files'], var2=_status_counters['active_files'], var3=_status_counters['today_decodes'], active_cells_text=active_cells_text, relay_status=relay_status)
     from database.cache_store import get_all_bot_heartbeats
     hb_map = await get_all_bot_heartbeats()
     now = time.time()
     for _name in ["up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot"]:
         hb = hb_map.get(_name)
         if hb and (now - hb.get("last_ping", 0)) < 120:
-            msg += f"  ✅ {_name}: {hb.get('total_processed', 0)}次/ {hb.get('total_errors', 0)}次错误\n"
+            msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m349", _name=_name, var0=hb.get('total_processed', 0), var1=hb.get('total_errors', 0))
         else:
-            msg += f"  ⏳ {_name}: 未上报\n"
+            msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m350", _name=_name)
     return msg
 
 
@@ -172,14 +172,9 @@ async def _get_health_text() -> str:
         hb = heartbeats.get(name)
         if hb and (now - hb.get("last_ping", 0)) < 120:
             last_ping = format_datetime(hb.get("last_ping", 0))
-            msg += (
-                f"✅ {name}\n"
-                f"  最后活跃:{last_ping}\n"
-                f"  处理次数:{hb.get('total_processed', 0)}\n"
-                f"  错误次数:{hb.get('total_errors', 0)}\n"
-            )
+            msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m351", name=name, last_ping=last_ping, var0=hb.get('total_processed', 0), var1=hb.get('total_errors', 0))
         else:
-            msg += f"⏳ {name}: 未上报/离线\n"
+            msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m352", name=name)
     return msg
 
 
@@ -195,19 +190,19 @@ async def _get_topology_text() -> str:
     # 环形架构无主频道概念,显示第一个 active 槽位作为当前活跃频道
     active_cells = [c for c in cells if c.get("status") == "active"]
     if active_cells:
-        msg += f"📌 活跃频道数: {len(active_cells)}\n"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m353", var0=len(active_cells))
     else:
         msg += "📌 活跃频道数: 0 (系统不可用)\n"
-    msg += f"📊 总槽位数: {len(cells)}\n"
+    msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m354", var0=len(cells))
 
     # 统计
     active_count = len([c for c in cells if c.get("status") == "active"])
     lost_count = len([c for c in cells if c.get("status") == "lost"])
     shadow_count = len([c for c in cells if c.get("status") in ("shadow1", "shadow2")])
     r100_count = len([c for c in cells if c.get("status") == "r100"])
-    msg += f"  🟢活跃: {active_count} | 🟡Shadow: {shadow_count} | 🔴R100: {r100_count}"
+    msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m355", active_count=active_count, shadow_count=shadow_count, r100_count=r100_count)
     if lost_count:
-        msg += f" | ⚫失联: {lost_count}"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m356", lost_count=lost_count)
     msg += "\n\n"
 
     if cells:
@@ -231,7 +226,7 @@ async def _get_topology_text() -> str:
             msg += "👤 账号分布:\n"
             for acc, acc_cells in sorted(by_account.items()):
                 a_count = len([c for c in acc_cells if c.get("status") == "active"])
-                msg += f"  {acc}: {len(acc_cells)}个频道 (活跃: {a_count})\n"
+                msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m357", acc=acc, var0=len(acc_cells), a_count=a_count)
             msg += "\n"
 
         for gn in sorted(by_group.keys()):
@@ -242,7 +237,7 @@ async def _get_topology_text() -> str:
                 st = c.get("status", "?")
                 icon = status_icons.get(st, "⚪")
                 parts.append(f"{icon}{c.get('slot_id')}: {c.get('channel_id')}")
-            msg += f"  组{gn}: {' | '.join(parts)}\n"
+            msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m358", gn=gn, var0=' | '.join(parts))
     else:
         msg += "  (未加载拓扑,请运行 seed_topology.py)\n"
 
@@ -252,7 +247,7 @@ async def _get_topology_text() -> str:
         aws = await get_rotation_config("rotation_active_window_size") or "3"
         fps = await get_rotation_config("rotation_files_per_slot") or "500"
         tps = await get_rotation_config("rotation_time_per_slot") or "3600"
-        msg += f"\n⏳ 轮转配置: {aws}活态 | {fps}文件 | {tps}秒"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m359", aws=aws, fps=fps, tps=tps)
     except Exception:
         pass
 
@@ -266,15 +261,15 @@ async def _get_logs_page_text(page: int = 1) -> str:
     skip = (page - 1) * per_page
     logs_data = await logs_col.find(sort=("request_time", -1), skip=skip, limit=per_page)
     total_pages = max(1, (total + per_page - 1) // per_page)
-    msg = f"📋 解码日志 (第{page}/{total_pages}页)\n\n"
+    msg = _t(AUTHORIZED_USER_ID, "bot.admin_bot.m360", page=page, total_pages=total_pages)
     for log in logs_data:
         status_icon = "✅" if log.get("status") == "success" else "⏳" if log.get("status") == "queued" else "❌"
         fc = (log.get("file_code") or "")[:30]
         requester = log.get("requester_id", "?")
         t = format_datetime(log.get("request_time"))
-        msg += f"{status_icon} [{t}] {fc} - 用户{requester}\n"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m361", status_icon=status_icon, t=t, fc=fc, requester=requester)
     if total_pages > 1:
-        msg += f"\n使用 /logs {page+1} 查看下一页"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m362", var0=page+1)
     return msg
 
 
@@ -294,9 +289,9 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
     skip = (page - 1) * per_page
     users = await users_col.find(query, sort=("created_at", -1), skip=skip, limit=per_page)
     total_pages = max(1, (total + per_page - 1) // per_page)
-    msg = f"👤 用户列表 (第{page}/{total_pages}页,共{total}人)\n"
+    msg = _t(AUTHORIZED_USER_ID, "bot.admin_bot.m363", page=page, total_pages=total_pages, total=total)
     if search:
-        msg += f"🔍 搜索:{search}\n"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m022", search=search)
     msg += "\n"
     for u in users:
         level_icon = {"free": "🆓", "basic": "🥇", "premium": "👑"}.get(u.get("membership_level", "free"), "🆓")
@@ -304,9 +299,9 @@ async def _get_users_page_text(search: str = "", page: int = 1) -> str:
         name = u.get("username") or u.get("first_name") or f"ID:{u.get('user_id')}"
         msg += f"{level_icon}{ban_icon} {u.get('user_id')} - @{name}\n"
     if total_pages > 1 and search:
-        msg += f"\n使用 /users {search} {page+1} 查看下一页"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m364", search=search, var0=page+1)
     elif total_pages > 1:
-        msg += f"\n使用 /users {page+1} 查看下一页"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m365", var0=page+1)
     return msg
 
 
@@ -338,7 +333,7 @@ async def _get_relay_status_text() -> str:
         # H-1: 陈旧状态降级显示为 ⚪,避免 idx_bot 崩溃后误显「正常」
         if stale and status in ("online", "connecting"):
             icon = "⚪"
-            display_status = f"{status}(陈旧)"
+            display_status = _t(AUTHORIZED_USER_ID, "bot.admin_bot.m366", status=status)
         else:
             icon = STATUS_ICON.get(status, "⚪")
             display_status = status
@@ -347,17 +342,17 @@ async def _get_relay_status_text() -> str:
         info = ps.get("status_info", "")
         updated = ps.get("status_updated_at", "")
         msg += f"{i}. {icon} {masked}\n"
-        msg += f"   状态: {display_status}"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m367", display_status=display_status)
         if info:
             msg += f" — {info}"
         msg += "\n"
-        msg += f"   今日: {ps['today_requests']}, 累计: {ps['total_requests']}, 均耗: {ps['avg_wait_ms']:.0f}ms\n"
+        msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m368", var0=ps['today_requests'], var1=ps['total_requests'], var2=ps['avg_wait_ms'])
         if updated:
-            msg += f"   更新: {updated}\n"
+            msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m369", updated=updated)
 
     # H-1: 仅非陈旧的 online 才计入「正常」
     online_count = sum(1 for p in pool_status if p.get("status") == "online" and not p.get("stale", False))
-    msg += f"\n正常: {online_count}/{len(pool_status)}"
+    msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m370", online_count=online_count, var0=len(pool_status))
     return msg
 
 
@@ -447,7 +442,7 @@ async def _get_configs_text() -> str:
     if not r2_configured:
         r2_check = lambda k: _config_fallback(k) != settings.get_config_default(k)
         r2_configured = any(r2_check(k) for k in r2_keys_to_check)
-    msg += f"\n☁️ R2 备份:{'✅ 已配置' if r2_configured else '❌ 未配置'} ⚠️需重启\n"
+    msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m371", var0='✅ 已配置' if r2_configured else '❌ 未配置')
 
     for key, label, indicator in backup_keys:
         val = await get_config(key)
