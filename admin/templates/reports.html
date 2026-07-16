@@ -5,19 +5,19 @@
 
 {% block content %}
 <div class="section">
-    <h2>待处理举报列表</h2>
+    <h2>{{ t("ui.admin.reports.s1") }}</h2>
     <table>
-        <caption>状态为 pending 的举报</caption>
+        <caption>{{ t("ui.admin.reports.s2") }}</caption>
         <thead>
             <tr>
-                <th>举报ID</th>
-                <th>举报人</th>
-                <th>目标类型</th>
-                <th>目标ID</th>
-                <th>原因</th>
-                <th>描述</th>
-                <th>创建时间</th>
-                <th>操作</th>
+                <th>{{ t("ui.admin.reports.s3") }}</th>
+                <th>{{ t("ui.admin.reports.s4") }}</th>
+                <th>{{ t("ui.admin.reports.s5") }}</th>
+                <th>{{ t("ui.admin.reports.s6") }}</th>
+                <th>{{ t("ui.admin.reports.s7") }}</th>
+                <th>{{ t("ui.admin.reports.s8") }}</th>
+                <th>{{ t("ui.admin.reports.s9") }}</th>
+                <th>{{ t("ui.admin.reports.s10") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -33,12 +33,12 @@
                 <td>
                     <form method="post" action="/reports/{{ report.get('id', '') }}/takedown" class="actions">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                        <button type="submit" class="btn btn-danger" onclick="return confirm('确认下架此内容?')">下架</button>
+                        <button type="submit" class="btn btn-danger" onclick="return confirm('确认下架此内容?')">{{ t("ui.admin.reports.s11") }}</button>
                     </form>
                 </td>
             </tr>
             {% else %}
-            <tr><td colspan="8" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="8" class="empty-state">{{ t("ui.admin.reports.s12") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>

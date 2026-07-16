@@ -29,6 +29,7 @@ import os
 from typing import Any, Optional
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 
 # R46 P0-1: critical effect 类型集合 — manager 不可用或读写失败时 fail-closed
@@ -258,8 +259,7 @@ class EffectReceiptManager:
         if db is None:
             if fail_closed:
                 raise EffectReceiptError(
-                    f"effect_receipts DB 未初始化,无法检查 receipt "
-                    f"(action={action_id}, type={effect_type}, target={target})"
+                    _i18n_t('services.effect_receipts.s1', action_id=action_id, effect_type=effect_type, target=target)
                 )
             return None
         try:
@@ -369,8 +369,7 @@ class EffectReceiptManager:
         if db is None:
             if fail_closed:
                 raise EffectReceiptError(
-                    f"effect_receipts DB 未初始化,无法记录 pending "
-                    f"(action={action_id})"
+                    _i18n_t('services.effect_receipts.s2', action_id=action_id)
                 )
             return False
         now = datetime.datetime.utcnow().isoformat()
@@ -447,7 +446,7 @@ class EffectReceiptManager:
         if not self._store._db:
             if fail_closed:
                 raise EffectReceiptError(
-                    f"effect_receipts DB 未初始化,无法记录 completed"
+                    _i18n_t('services.effect_receipts.s3')
                 )
             return
         now = datetime.datetime.utcnow().isoformat()
@@ -464,10 +463,7 @@ class EffectReceiptManager:
                     stored_hash = row[0] or ""
                     if stored_hash and expected_request_hash != stored_hash:
                         raise EffectReceiptError(
-                            f"record_completed request_hash 不匹配,拒绝标记 completed "
-                            f"(action={action_id}, type={effect_type}, target={target}, "
-                            f"expected={expected_request_hash[:16]}..., "
-                            f"stored={stored_hash[:16]}...)"
+                            _i18n_t('services.effect_receipts.s5', action_id=action_id, effect_type=effect_type, target=target, expected_request_hash_16=expected_request_hash[:16], stored_hash_16=stored_hash[:16])
                         )
             await self._store._db.execute(
                 "UPDATE effect_receipts SET status = 'completed', "
@@ -497,7 +493,7 @@ class EffectReceiptManager:
         if not self._store._db:
             if fail_closed:
                 raise EffectReceiptError(
-                    f"effect_receipts DB 未初始化,无法记录 failed"
+                    _i18n_t('services.effect_receipts.s4')
                 )
             return
         try:
@@ -683,8 +679,7 @@ def validate_critical_effects_have_action_id(
                                 "call": "EffectReceiptContext",
                                 "effect_type": effect_type_val,
                                 "reason": (
-                                    "critical effect 的 EffectReceiptContext "
-                                    "未显式传入非空 action_id"
+                                    _i18n_t('services.effect_receipts.s6')
                                 ),
                             })
                         # R48 P0-4: critical effect 必须传入非空 params
@@ -698,8 +693,7 @@ def validate_critical_effects_have_action_id(
                                 "call": "EffectReceiptContext",
                                 "effect_type": effect_type_val,
                                 "reason": (
-                                    "critical effect 的 EffectReceiptContext "
-                                    "未显式传入非空 params(用于 request_hash 绑定)"
+                                    _i18n_t('services.effect_receipts.s7')
                                 ),
                             })
                     elif func_name == "with_effect_receipt":
@@ -718,9 +712,7 @@ def validate_critical_effects_have_action_id(
                             "call": "with_effect_receipt",
                             "effect_type": effect_type_val,
                             "reason": (
-                                "critical effect 使用 with_effect_receipt 装饰器,"
-                                "无法静态保证调用点传入 action_id,"
-                                "应改用 EffectReceiptContext 显式传参"
+                                _i18n_t('services.effect_receipts.s8')
                             ),
                         })
                         # R48 P0-4: critical effect 装饰器必须传入非空 params_fn
@@ -734,8 +726,7 @@ def validate_critical_effects_have_action_id(
                                 "call": "with_effect_receipt",
                                 "effect_type": effect_type_val,
                                 "reason": (
-                                    "critical effect 的 with_effect_receipt 装饰器 "
-                                    "未显式传入非空 params_fn(用于 request_hash 绑定)"
+                                    _i18n_t('services.effect_receipts.s9')
                                 ),
                             })
                     elif func_name == "generate_signed_callback":
@@ -765,9 +756,7 @@ def validate_critical_effects_have_action_id(
                                 "call": "generate_signed_callback",
                                 "effect_type": matched_pattern,
                                 "reason": (
-                                    "高风险 action 使用旧 sync API generate_signed_callback"
-                                    f"(不持久化 nonce,callback_data 含 '{matched_pattern}'),"
-                                    "应改用 sign_button_token_with_nonce(异步,持久化 nonce)"
+                                    _i18n_t('services.effect_receipts.s10', matched_pattern=matched_pattern)
                                 ),
                             })
     return violations

@@ -12,6 +12,7 @@ P0 修复对应:
 - P0-3: Bot 直连兜底 → 默认禁用(SYNC_BACK_OFF=0); crdb_sync leader 租约 + 节流
 """
 import inspect
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -103,8 +104,15 @@ class TestP02OutboxFileUniqueIdFailClosed:
         assert "DurabilityError" in content, (
             "up_bot.py 未抛出 DurabilityError(file_unique_id 缺失时)"
         )
-        assert "manifest event missing file_unique_id" in content, (
+        # R55 i18n: 错误消息已迁移到 locale 文件,检查源码含 i18n key 或 locale 含消息
+        locale_path = Path(__file__).parent.parent / "locales" / "zh-CN.json"
+        locale_data = json.loads(locale_path.read_text(encoding="utf-8"))
+        locale_msg = locale_data.get("bot", {}).get("up", {}).get("s6", "")
+        assert "manifest event missing file_unique_id" in content or (
+            "_i18n_t('bot.up.s6'" in content and "manifest event missing file_unique_id" in locale_msg
+        ), (
             "up_bot.py 缺少 file_unique_id 缺失的 DurabilityError 消息"
+            "(源码和 locale 文件均未找到)"
         )
 
     def test_strict_manifest_does_not_silently_return(self):

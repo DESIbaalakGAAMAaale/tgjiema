@@ -23,6 +23,7 @@ from loguru import logger
 from database.cache_store import get_cache_store
 from services.task_center import create_task, update_progress, complete_task, fail_task
 from services.code_generator import build_file_code, build_collection_code
+from services.i18n import translate as _i18n_t
 
 
 # 失败原因枚举
@@ -34,11 +35,11 @@ REASON_UNKNOWN = "unknown"            # 未知原因
 
 # 失败原因中文名
 _REASON_LABELS = {
-    REASON_EXPIRED: "文件已过期",
-    REASON_DELETED: "文件已被删除",
-    REASON_CHANNEL_LOST: "存储位置不可用",
-    REASON_CORRUPTED: "文件数据异常",
-    REASON_UNKNOWN: "未知原因",
+    REASON_EXPIRED: _i18n_t('services.user_repair.s1'),
+    REASON_DELETED: _i18n_t('services.user_repair.s2'),
+    REASON_CHANNEL_LOST: _i18n_t('services.user_repair.s3'),
+    REASON_CORRUPTED: _i18n_t('services.user_repair.s4'),
+    REASON_UNKNOWN: _i18n_t('services.user_repair.s5'),
 }
 
 
@@ -235,7 +236,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
                 "status": "missing",
                 "reason": REASON_UNKNOWN,
                 "can_repair": False,
-                "suggested_action": "文件记录不存在,请联系管理员",
+                "suggested_action": _i18n_t('services.user_repair.s15'),
             }
         status = (row[0] or "active").lower()
         deleted_at = row[1]
@@ -247,7 +248,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
                 "status": status,
                 "reason": REASON_DELETED,
                 "can_repair": False,
-                "suggested_action": "文件已被删除,无法修复",
+                "suggested_action": _i18n_t('services.user_repair.s16'),
             }
         if status == "expired" or _is_expired(expire_time):
             return {
@@ -255,7 +256,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
                 "status": status,
                 "reason": REASON_EXPIRED,
                 "can_repair": True,
-                "suggested_action": "文件已过期,可尝试重新索引",
+                "suggested_action": _i18n_t('services.user_repair.s17'),
             }
         if status in ("channel_lost", "channel_unavailable"):
             return {
@@ -263,7 +264,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
                 "status": status,
                 "reason": REASON_CHANNEL_LOST,
                 "can_repair": True,
-                "suggested_action": "存储频道不可用,可尝试重新索引或联系管理员",
+                "suggested_action": _i18n_t('services.user_repair.s18'),
             }
         if status in ("corrupted", "invalid"):
             return {
@@ -271,7 +272,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
                 "status": status,
                 "reason": REASON_CORRUPTED,
                 "can_repair": False,
-                "suggested_action": "文件数据损坏,请联系管理员",
+                "suggested_action": _i18n_t('services.user_repair.s19'),
             }
         if status == "deprecated":
             return {
@@ -279,7 +280,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
                 "status": status,
                 "reason": REASON_UNKNOWN,
                 "can_repair": False,
-                "suggested_action": "文件码已弃用,请使用新码",
+                "suggested_action": _i18n_t('services.user_repair.s20'),
             }
         if status in ("active", "ready"):
             # 文件正常,不需要修复
@@ -288,7 +289,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
                 "status": status,
                 "reason": REASON_UNKNOWN,
                 "can_repair": False,
-                "suggested_action": "文件状态正常,无需修复",
+                "suggested_action": _i18n_t('services.user_repair.s21'),
             }
         # 其他未知状态,默认可尝试修复
         return {
@@ -296,7 +297,7 @@ async def get_failure_reason(file_code: str) -> dict | None:
             "status": status,
             "reason": REASON_UNKNOWN,
             "can_repair": True,
-            "suggested_action": "可尝试重新索引",
+            "suggested_action": _i18n_t('services.user_repair.s11'),
         }
     except Exception as e:
         logger.warning(f"[user_repair] get_failure_reason 失败: {e}")
@@ -314,7 +315,7 @@ async def check_repair_eligibility(file_code: str, user_id: int) -> dict:
         {eligible, reason, file_owner_id}
     """
     store = get_cache_store()
-    default = {"eligible": False, "reason": "未知错误", "file_owner_id": 0}
+    default = {"eligible": False, "reason": _i18n_t('services.user_repair.s6'), "file_owner_id": 0}
     if not store._db:
         return default
     try:
@@ -327,7 +328,7 @@ async def check_repair_eligibility(file_code: str, user_id: int) -> dict:
         if not row:
             return {
                 "eligible": False,
-                "reason": "文件记录不存在",
+                "reason": _i18n_t('services.user_repair.s22'),
                 "file_owner_id": 0,
             }
         uploader_id = row[0]
@@ -337,14 +338,14 @@ async def check_repair_eligibility(file_code: str, user_id: int) -> dict:
         if deleted_at or status == "deleted":
             return {
                 "eligible": False,
-                "reason": "文件已被删除,无法修复",
+                "reason": _i18n_t('services.user_repair.s23'),
                 "file_owner_id": uploader_id or 0,
             }
         # 只有文件所有者可修复(安全:防止跨用户修复)
         if uploader_id != user_id:
             return {
                 "eligible": False,
-                "reason": "无权修复他人文件",
+                "reason": _i18n_t('services.user_repair.s24'),
                 "file_owner_id": uploader_id or 0,
             }
         return {
@@ -367,23 +368,23 @@ async def format_failure_reason(reason: dict) -> str:
         多行纯文本(避免 Telegram markdown 解析问题)
     """
     if not reason:
-        return "无法获取失败原因"
+        return _i18n_t('services.user_repair.s7')
     file_code = reason.get("file_code", "")
     # 脱敏文件码,只显示前 4 字符
     masked_code = _mask_code(file_code)
     reason_enum = reason.get("reason", REASON_UNKNOWN)
-    reason_text = _REASON_LABELS.get(reason_enum, "未知原因")
+    reason_text = _REASON_LABELS.get(reason_enum, _i18n_t('services.user_repair.s8'))
     can_repair = bool(reason.get("can_repair", False))
     suggested = reason.get("suggested_action", "")
     icon = "🔧" if can_repair else "🚫"
     lines = [
-        f"{icon} 文件码: {masked_code}",
-        f"失败原因: {reason_text}",
+        _i18n_t('services.user_repair.s9', icon=icon, masked_code=masked_code),
+        _i18n_t('services.user_repair.s10', reason_text=reason_text),
     ]
     if suggested:
-        lines.append(f"建议操作: {suggested}")
+        lines.append(_i18n_t('services.user_repair.s12', suggested=suggested))
     if can_repair:
-        lines.append(f"可使用 /repair reindex {masked_code} 修复")
+        lines.append(_i18n_t('services.user_repair.s13', masked_code=masked_code))
     else:
-        lines.append("此文件无法自助修复")
+        lines.append(_i18n_t('services.user_repair.s14'))
     return "\n".join(lines)

@@ -27,6 +27,7 @@ import json
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.i18n import translate as _i18n_t
 
 
 # ─── R41 P1-3: RBAC 异常 audit_log 记录 ─────────────────────────
@@ -178,11 +179,11 @@ async def init_default_roles() -> int:
                 continue
 
             desc = {
-                ROLE_SUPER_ADMIN: "超级管理员,拥有所有权限",
-                ROLE_SECURITY: "安全管理员,负责内容审核和用户封禁",
-                ROLE_OPS: "运维,负责系统维护和备份",
-                ROLE_SUPPORT: "客服,负责用户支持和查看",
-                ROLE_OPERATOR: "运营,负责日常运营操作",
+                ROLE_SUPER_ADMIN: _i18n_t('services.rbac.s29'),
+                ROLE_SECURITY: _i18n_t('services.rbac.s30'),
+                ROLE_OPS: _i18n_t('services.rbac.s31'),
+                ROLE_SUPPORT: _i18n_t('services.rbac.s32'),
+                ROLE_OPERATOR: _i18n_t('services.rbac.s33'),
             }.get(role_name, "")
 
             # R40 P0-5: 业务表 + dirty_outbox 同事务
@@ -481,7 +482,7 @@ async def require_permission(principal_id: int, permission: str) -> None:
         )
         raise HTTPException(
             status_code=403,
-            detail=f"权限不足: 缺少 {permission} 权限",
+            detail=_i18n_t('services.rbac.s28', permission=permission),
         )
 
 
@@ -680,20 +681,20 @@ async def format_role_info(role: dict) -> str:
     Returns:
         格式化的角色信息字符串
     """
-    name = role.get("name", "未知")
+    name = role.get("name", _i18n_t('services.rbac.s21'))
     description = role.get("description", "")
     permissions = role.get("permissions", [])
 
     # 通配权限
     if "*" in permissions:
-        perm_text = "所有权限(超级管理员)"
+        perm_text = _i18n_t('services.rbac.s22')
     else:
-        perm_text = ", ".join(permissions) if permissions else "无"
+        perm_text = ", ".join(permissions) if permissions else _i18n_t('services.rbac.s25')
 
     lines = [
-        f"角色: {name}",
-        f"描述: {description}" if description else "描述: 无",
-        f"权限: {perm_text}",
+        _i18n_t('services.rbac.s23', name=name),
+        _i18n_t('services.rbac.s26', description=description) if description else _i18n_t('services.rbac.s27'),
+        _i18n_t('services.rbac.s24', perm_text=perm_text),
     ]
     return "\n".join(lines)
 
@@ -728,27 +729,27 @@ async def get_principal_permissions(principal_id: int) -> set[str]:
 
 # 权限名称 → 中文描述
 _PERMISSION_DESCRIPTIONS: dict[str, str] = {
-    PERMISSION_VIEW_USERS: "查看用户列表",
-    PERMISSION_BAN_USER: "封禁用户",
-    PERMISSION_UNBAN_USER: "解封用户",
-    PERMISSION_VIEW_FILES: "查看文件列表",
-    PERMISSION_DELETE_FILE: "删除文件",
-    PERMISSION_RESTORE_FILE: "恢复文件",
-    PERMISSION_TAKEDOWN: "内容下架",
-    PERMISSION_APPROVE_TAKEDOWN: "审批下架请求",
-    PERMISSION_VIEW_LOGS: "查看日志",
-    PERMISSION_VIEW_AUDIT: "查看审计日志",
-    PERMISSION_CONFIG_CHANGE: "修改配置",
-    PERMISSION_BACKUP: "备份管理",
-    PERMISSION_RESTORE: "恢复备份",
-    PERMISSION_MAINTENANCE: "系统维护",
-    PERMISSION_MANAGE_ROLES: "角色管理",
+    PERMISSION_VIEW_USERS: _i18n_t('services.rbac.s1'),
+    PERMISSION_BAN_USER: _i18n_t('services.rbac.s2'),
+    PERMISSION_UNBAN_USER: _i18n_t('services.rbac.s3'),
+    PERMISSION_VIEW_FILES: _i18n_t('services.rbac.s4'),
+    PERMISSION_DELETE_FILE: _i18n_t('services.rbac.s5'),
+    PERMISSION_RESTORE_FILE: _i18n_t('services.rbac.s6'),
+    PERMISSION_TAKEDOWN: _i18n_t('services.rbac.s7'),
+    PERMISSION_APPROVE_TAKEDOWN: _i18n_t('services.rbac.s8'),
+    PERMISSION_VIEW_LOGS: _i18n_t('services.rbac.s9'),
+    PERMISSION_VIEW_AUDIT: _i18n_t('services.rbac.s10'),
+    PERMISSION_CONFIG_CHANGE: _i18n_t('services.rbac.s11'),
+    PERMISSION_BACKUP: _i18n_t('services.rbac.s12'),
+    PERMISSION_RESTORE: _i18n_t('services.rbac.s13'),
+    PERMISSION_MAINTENANCE: _i18n_t('services.rbac.s14'),
+    PERMISSION_MANAGE_ROLES: _i18n_t('services.rbac.s15'),
     # R40 P0-8: CommandBus 细粒度权限
-    PERMISSION_RBAC_ASSIGN: "分配角色(CommandBus)",
-    PERMISSION_DISASTER_RESTORE: "灾备恢复(CommandBus)",
-    PERMISSION_MAINTENANCE_ENABLE: "开启维护模式(CommandBus)",
-    PERMISSION_MAINTENANCE_DISABLE: "关闭维护模式(CommandBus)",
-    PERMISSION_DATA_PURGE: "清除数据(CommandBus)",
+    PERMISSION_RBAC_ASSIGN: _i18n_t('services.rbac.s16'),
+    PERMISSION_DISASTER_RESTORE: _i18n_t('services.rbac.s17'),
+    PERMISSION_MAINTENANCE_ENABLE: _i18n_t('services.rbac.s18'),
+    PERMISSION_MAINTENANCE_DISABLE: _i18n_t('services.rbac.s19'),
+    PERMISSION_DATA_PURGE: _i18n_t('services.rbac.s20'),
 }
 
 

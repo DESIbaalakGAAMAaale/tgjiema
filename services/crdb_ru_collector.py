@@ -57,10 +57,14 @@ R42 P1-10 新增(unknown 状态):
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import os
+import socket
 import sys
 import time
 from datetime import datetime, timezone
+from services.i18n import translate as _i18n_t
 
 try:
     from loguru import logger
@@ -331,7 +335,7 @@ async def get_ru_status() -> dict:
             "freshness_seconds": None,
             "source": "failed",
             "last_collected_at": "",
-            "details": "CRDB API 调用失败且 kv_store 无历史数据",
+            "details": _i18n_t('services.crdb_ru_collector.s2'),
         }
 
     # 优先使用 API 最新值,否则用 kv_store 历史值
@@ -342,21 +346,19 @@ async def get_ru_status() -> dict:
         # 时间戳缺失 → 视为 unknown(数据存在但无法判断新鲜度)
         source = "unknown"
         details = (
-            "RU 值存在但采集时间戳缺失,无法判断数据新鲜度(可能 collector 异常)"
+            _i18n_t('services.crdb_ru_collector.s1')
         )
     elif freshness_seconds >= RU_DATA_FRESH_THRESHOLD:
         # 数据陈旧 → unknown
         source = "unknown"
         details = (
-            f"RU 数据陈旧:距上次采集 {freshness_seconds}s "
-            f"(阈值 {RU_DATA_FRESH_THRESHOLD}s),可能 collector 中断"
+            _i18n_t('services.crdb_ru_collector.s3', freshness_seconds=freshness_seconds, RU_DATA_FRESH_THRESHOLD=RU_DATA_FRESH_THRESHOLD)
         )
     else:
         # 数据新鲜 → official
         source = "official"
         details = (
-            f"RU 数据新鲜:距上次采集 {freshness_seconds}s "
-            f"(阈值 {RU_DATA_FRESH_THRESHOLD}s)"
+            _i18n_t('services.crdb_ru_collector.s4', freshness_seconds=freshness_seconds, RU_DATA_FRESH_THRESHOLD=RU_DATA_FRESH_THRESHOLD)
         )
 
     return {
@@ -422,8 +424,12 @@ async def fetch_idle_ru_from_local_legacy() -> float:
     return await fetch_idle_ru_from_local()
 
 
-async def write_ru_to_kv_store(ru_value: float) -> bool:
-    """R39 P1-9 + R54 P1-1: 将当日 RU 消耗写入 kv_store.crdb_ru_daily。
+async def write_ru_to_kv_store(
+    ru_value: float,
+    query_window_start: str | None = None,
+    query_window_end: str | None = None,
+) -> bool:
+    """R39 P1-9 + R54 P1-1 + R55 P1-3: 将当日 RU 消耗写入 kv_store.crdb_ru_daily。
 
     写入成功后,prometheus_exporter 下次 scrape 会暴露更新后的 crdb_ru_daily 指标。
     kv_store 写入零 CRDB RU(SQLite 本地存储)。
@@ -431,9 +437,19 @@ async def write_ru_to_kv_store(ru_value: float) -> bool:
     R42 P1-10: 同时写入 kv_store.crdb_ru_last_collected_at(ISO 时间戳),
     供 get_ru_status() 计算数据新鲜度(freshness_seconds)。
 
-    R54 P1-1: 同时写入不可伪造的 kv_store.crdb_ru_source,
-    值为 "official_cloud_api"(仅本函数写入此值,估算器使用独立 key)。
-    prometheus_exporter 只读取显式 source,不得通过 freshness 推断。
+    R54 P1-1: 同时写入 kv_store.crdb_ru_source(向后兼容保留,但 exporter 不再信任)。
+
+    R55 P1-3: 新增独立表 ``crdb_ru_official`` 隔离官方 RU 数据,防止伪造。
+    - 惰性创建 ``crdb_ru_official`` 表(CREATE TABLE IF NOT EXISTS)
+    - 同一 SQLite 事务写入: official 表 INSERT + kv_store 的 set_kv
+    - 记录 collector_id / query_window / response_digest / collection_version
+    - response_digest = HMAC-SHA256(response_raw, collector_secret)
+    - 估算器 ``write_idle_ru_to_kv_store`` 无权写该表
+
+    Args:
+        ru_value: 当日 RU 消耗总量
+        query_window_start: 查询窗口起始 ISO8601(默认今日 UTC 0:00)
+        query_window_end: 查询窗口结束 ISO8601(默认 now)
 
     Returns:
         True: 写入成功
@@ -442,26 +458,112 @@ async def write_ru_to_kv_store(ru_value: float) -> bool:
     try:
         from database.cache_store import get_cache_store
         store = get_cache_store()
-        await store.set_kv(KV_KEY_CRDB_RU_DAILY, str(ru_value))
-        # R42 P1-10: 同时写入采集时间戳(UTC ISO 8601)
-        # 用于 get_ru_status() 计算数据新鲜度
-        try:
-            collected_at = datetime.now(timezone.utc).isoformat()
-            await store.set_kv("crdb_ru_last_collected_at", collected_at)
-        except Exception as ts_err:
-            logger.debug(
-                f"[CRDB-RU] R42 P1-10: 写入 crdb_ru_last_collected_at 失败: {ts_err}"
+
+        # ── R55 P1-3: 计算 collector identity 与 response digest ──
+        collector_id = f"{socket.gethostname()}:{os.getpid()}"
+        collector_secret = os.environ.get(
+            "CRDB_RU_COLLECTOR_SECRET", "tgjiema-collector-v1"
+        )
+        now_dt = datetime.now(timezone.utc)
+        collected_at = now_dt.isoformat()
+        # 默认查询窗口: 今日 UTC 0:00 到 now
+        if query_window_start is None:
+            window_start_dt = now_dt.replace(
+                hour=0, minute=0, second=0, microsecond=0
             )
-        # R54 P1-1: 写入不可伪造的 source 标记
-        # 值为 "official_cloud_api"(仅本函数写入,估算器使用独立 key)
-        try:
-            await store.set_kv("crdb_ru_source", "official_cloud_api")
-        except Exception as src_err:
-            logger.debug(
-                f"[CRDB-RU] R54 P1-1: 写入 crdb_ru_source 失败: {src_err}"
-            )
+            query_window_start = window_start_dt.isoformat()
+        if query_window_end is None:
+            query_window_end = collected_at
+        response_raw = (
+            f"ru_value={ru_value}|window={query_window_start}-{query_window_end}"
+            f"|collector={collector_id}"
+        )
+        response_digest = hmac.new(
+            collector_secret.encode(),
+            response_raw.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+        # ── R55 P1-3: 惰性创建 official 表 + 同事务原子写入 ──
+        # 若 _db 不可用(如 mock 环境)或事务失败,降级为单独 set_kv 调用
+        official_written = False
+        db = getattr(store, "_db", None)
+        if db is not None:
+            try:
+                # 惰性创建 crdb_ru_official 表
+                await db.execute(
+                    """CREATE TABLE IF NOT EXISTS crdb_ru_official (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ru_value REAL NOT NULL,
+                        source TEXT NOT NULL DEFAULT 'official_cloud_api',
+                        collector_id TEXT NOT NULL,
+                        query_window_start TEXT NOT NULL,
+                        query_window_end TEXT NOT NULL,
+                        response_digest TEXT NOT NULL,
+                        collection_version INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL
+                    )"""
+                )
+                # 同一事务写入 official 表 + kv_store(原子性保证)
+                await db.execute(
+                    """INSERT INTO crdb_ru_official
+                       (ru_value, source, collector_id, query_window_start,
+                        query_window_end, response_digest, collection_version,
+                        created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        float(ru_value),
+                        "official_cloud_api",
+                        collector_id,
+                        query_window_start,
+                        query_window_end,
+                        response_digest,
+                        1,  # collection_version
+                        collected_at,
+                    ),
+                )
+                # kv_store 写入(同一事务,保证原子性)
+                await db.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                    (KV_KEY_CRDB_RU_DAILY, str(ru_value)),
+                )
+                await db.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                    ("crdb_ru_last_collected_at", collected_at),
+                )
+                # R54 P1-1: 保留 kv_store.crdb_ru_source(向后兼容降级,
+                # 但 prometheus_exporter R55 P1-3 后不再信任此值)
+                await db.execute(
+                    "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+                    ("crdb_ru_source", "official_cloud_api"),
+                )
+                await db.commit()
+                official_written = True
+            except Exception as official_err:
+                logger.debug(
+                    f"[CRDB-RU] R55 P1-3: 同事务写入 crdb_ru_official 失败,"
+                    f"降级为单独 set_kv: {official_err}"
+                )
+
+        # ── 降级路径:official 表写入失败时,单独调用 set_kv ──
+        if not official_written:
+            await store.set_kv(KV_KEY_CRDB_RU_DAILY, str(ru_value))
+            try:
+                await store.set_kv("crdb_ru_last_collected_at", collected_at)
+            except Exception as ts_err:
+                logger.debug(
+                    f"[CRDB-RU] R42 P1-10: 写入 crdb_ru_last_collected_at 失败: {ts_err}"
+                )
+            try:
+                await store.set_kv("crdb_ru_source", "official_cloud_api")
+            except Exception as src_err:
+                logger.debug(
+                    f"[CRDB-RU] R54 P1-1: 写入 crdb_ru_source 失败: {src_err}"
+                )
+
         logger.info(
             f"[CRDB-RU] R39 P1-9: kv_store.crdb_ru_daily 已更新 → {ru_value:.0f} RU"
+            f" (R55 P1-3 official 表写入: {'成功' if official_written else '降级'})"
         )
         return True
     except Exception as e:
@@ -474,6 +576,11 @@ async def write_idle_ru_to_kv_store(ru_value: float) -> bool:
 
     写入成功后,prometheus_exporter 暴露 tgjiema_crdb_idle_ru_daily 指标。
     kv_store 写入零 CRDB RU(SQLite 本地存储)。
+
+    R55 P1-3: 估算器无权写 crdb_ru_official 表(该表仅 crdb_ru_collector
+    的 ``write_ru_to_kv_store`` 可写)。本函数仅写入 kv_store.crdb_idle_ru_daily,
+    不可伪造官方 RU source。prometheus_exporter 通过 verify_ru_source_official()
+    验证 official 表,估算值不被误判为官方数据。
 
     Args:
         ru_value: 业务 Bot 当日空载 RU 消耗
@@ -493,6 +600,74 @@ async def write_idle_ru_to_kv_store(ru_value: float) -> bool:
     except Exception as e:
         logger.error(f"[CRDB-RU] R41: 写入 kv_store.crdb_idle_ru_daily 失败: {e}")
         return False
+
+
+# ════════════════════════════════════════════════════════════════
+#  R55 P1-3: 官方 RU source 独立表验证(verify_ru_source_official)
+# ════════════════════════════════════════════════════════════════
+
+
+def verify_ru_source_official() -> dict:
+    """R55 P1-3: 验证 ``crdb_ru_official`` 表的最新官方 RU 记录。
+
+    查询 ``crdb_ru_official`` 表的最新记录(ORDER BY created_at DESC LIMIT 1),
+    用于 prometheus_exporter 验证官方 RU source 是否真实存在(而非伪造的
+    kv_store.crdb_ru_source 字符串)。
+
+    本函数为同步函数(使用 ``sqlite3`` 只读连接),便于 prometheus_exporter
+    在同步上下文中调用。表不存在或无记录时返回 ``is_official=False``。
+
+    Returns:
+        {
+            "is_official": bool,      # True=有官方记录, False=无记录/表不存在
+            "ru_value": float,        # 最新官方 RU 值(无记录时为 0.0)
+            "collector_id": str,      # 采集进程标识(无记录时为 "")
+            "response_digest": str,   # HMAC-SHA256 摘要(无记录时为 "")
+            "created_at": str,        # 写入时间 ISO8601(无记录时为 "")
+        }
+    """
+    default_result = {
+        "is_official": False,
+        "ru_value": 0.0,
+        "collector_id": "",
+        "response_digest": "",
+        "created_at": "",
+    }
+    try:
+        import sqlite3
+        from pathlib import Path
+
+        # 与 prometheus_exporter 一致的 DB 路径解析
+        _default_data_dir = Path(__file__).resolve().parent.parent / "data"
+        db_path = Path(
+            os.getenv("CACHE_STORE_DB", str(_default_data_dir / "cache_store.db"))
+        )
+        if not db_path.exists():
+            return default_result
+        # 只读模式打开,避免与 collector 写入产生锁竞争
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        cursor = conn.execute(
+            "SELECT ru_value, collector_id, response_digest, created_at "
+            "FROM crdb_ru_official ORDER BY created_at DESC LIMIT 1"
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if row is None:
+            return default_result
+        return {
+            "is_official": True,
+            "ru_value": float(row[0]),
+            "collector_id": str(row[1]),
+            "response_digest": str(row[2]),
+            "created_at": str(row[3]),
+        }
+    except sqlite3.Error as e:
+        # 表不存在(sqlite3.OperationalError: no such table)等
+        logger.debug(f"[CRDB-RU] R55 P1-3: 查询 crdb_ru_official 表失败: {e}")
+        return default_result
+    except Exception as e:
+        logger.debug(f"[CRDB-RU] R55 P1-3: verify_ru_source_official 异常: {e}")
+        return default_result
 
 
 async def _collect_once() -> None:

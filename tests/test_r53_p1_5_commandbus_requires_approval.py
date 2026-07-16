@@ -68,7 +68,7 @@ async def _insert_execution(
         "VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
         (
             action_id, command_type, 0, status, owner, lease_until,
-            "test_request_hash", now, now, requires_approval, approved_at,
+            "a" * 64, now, now, requires_approval, approved_at,
         ),
     )
     await store._db.commit()
@@ -199,7 +199,7 @@ async def test_high_risk_action_claim_execution_approved_success(real_store):
         CMD_STATUS_APPROVED, requires_approval=1,
     )
     claimed = await claim_execution_approved(
-        "action_high_risk_approved", "test_owner", request_hash="test_request_hash",
+        "action_high_risk_approved", "test_owner", request_hash="a" * 64,
     )
     assert claimed is True
     # 状态应为 executing
@@ -209,6 +209,46 @@ async def test_high_risk_action_claim_execution_approved_success(real_store):
     approved_at = await _get_field(real_store, "action_high_risk_approved", "approved_at")
     assert approved_at is not None
     assert approved_at != ""
+
+
+@pytest.mark.asyncio
+async def test_claim_execution_approved_rejects_empty_request_hash(real_store):
+    """R55 P0-2: request_hash 为空 → raise AppError(COMMAND_MUST_USE_APPROVAL_PATH)。
+
+    场景:高风险 action + requires_approval=1,调用 claim_execution_approved
+    但不传 request_hash(默认空字符串)→ 必须在格式校验阶段即被拒绝,
+    不应访问数据库(fail-closed at parameter validation)。
+    """
+    await _insert_execution(
+        real_store, "action_empty_hash_rejected", "ban",
+        CMD_STATUS_APPROVED, requires_approval=1,
+    )
+    with pytest.raises(AppError) as exc_info:
+        await claim_execution_approved(
+            "action_empty_hash_rejected", "test_owner", request_hash="",
+        )
+    assert exc_info.value.code == ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH
+    assert exc_info.value.params.get("action_id") == "action_empty_hash_rejected"
+    assert "request_hash_required_64_hex" in exc_info.value.params.get("reason", "")
+    # 状态应保持 approved(未执行 CAS)
+    status = await _get_status(real_store, "action_empty_hash_rejected")
+    assert status == CMD_STATUS_APPROVED
+
+
+@pytest.mark.asyncio
+async def test_claim_execution_approved_rejects_non_64_char_hash(real_store):
+    """R55 P0-2: request_hash 非 64 位 hex → raise AppError(COMMAND_MUST_USE_APPROVAL_PATH)。"""
+    await _insert_execution(
+        real_store, "action_short_hash_rejected", "ban",
+        CMD_STATUS_APPROVED, requires_approval=1,
+    )
+    with pytest.raises(AppError) as exc_info:
+        await claim_execution_approved(
+            "action_short_hash_rejected", "test_owner",
+            request_hash="short_hash",
+        )
+    assert exc_info.value.code == ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH
+    assert "request_hash_required_64_hex" in exc_info.value.params.get("reason", "")
 
 
 @pytest.mark.asyncio

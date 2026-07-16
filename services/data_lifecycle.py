@@ -1049,81 +1049,75 @@ async def cleanup_expired_data(
     skip_backup_check: bool = False,
     *,
     approval_action_id: str | None = None,
+    request_hash: str = "",
+    principal_id: int = 0,
 ) -> int:
-    """R51 P1-1 + R53 P1-3: 清理过期数据(物理删除已过保留期且已备份的数据)。
+    """R51 P1-1 + R55 P0-3/P0-6: 清理过期数据。
 
-    R53 P1-3 改造要点:
-    - 物理删除强制 _verify_backup_marker(require_user_scope=True, require_checksum=True)
-    - 批量全库备份使用 manifest 中的 user_coverage 校验用户覆盖范围
-    - 绑定 backup_id、manifest checksum、completed_at、retention cutoff 到审计日志
-    - skip_backup_check=True 必须有 break-glass 审批(环境变量 BREAK_GLASS_APPROVED
-      或 approval_action_id),普通调用方禁止绕过
+    R55 P0-3: break-glass 必须绑定 principal_id、request_hash,
+    验证审批 action_type=data_lifecycle_break_glass,审批不可跨请求复用。
 
-    Args:
-        batch_size: 单批最大清理条数
-        skip_backup_check: 跳过 backup marker 验证(需 break-glass 审批)
-        approval_action_id: break-glass 审批 action ID(skip_backup_check=True 时必填)
-
-    Returns:
-        清理的总行数
-
-    Raises:
-        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): skip_backup_check=True
-            无 break-glass 审批
-        AppError(DATA_LIFECYCLE_BACKUP_MARKER_MISSING): backup marker 校验失败
+    R55 P0-6: 审计日志写入纳入删除事务,审批状态回写失败不能返回成功。
     """
     if not await _ensure_retention_table():
         return 0
     store = get_cache_store()
     if not store._db:
         return 0
-    # R54 P0-3: skip_backup_check=True 必须有真实 CommandBus 双人审批
-    # 删除布尔环境变量授权(BREAK_GLASS_APPROVED 环境变量不再代表批准结果)
-    # 审批/审计存储不可用时禁止物理删除(fail-closed)
-    # break-glass 必须通过 claim_execution_approved 真实审批:
-    #   1. 验证 status=approved + principal + request_hash
-    #   2. CAS approved → executing(防并发)
-    #   3. 执行成功标记 executed,失败标记 failed
+    # R55 P0-3: break-glass 必须绑定 principal_id、request_hash
+    # 验证审批 action_type=data_lifecycle_break_glass,审批不可跨请求复用
     _break_glass_claimed = False
     if skip_backup_check:
         if not approval_action_id:
             raise AppError(
                 ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={
-                    "reason": "skip_backup_check_requires_real_approval",
-                    "approval_action_id": "",
-                },
+                params={"reason": "skip_backup_check_requires_real_approval"},
             )
-        # R54 P0-3: 调用 claim_execution_approved 真实审批
-        # 验证 approved 状态 + CAS approved→executing
+        if not request_hash or len(request_hash) != 64:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={"reason": "request_hash_required_64_hex"},
+            )
+        if not principal_id:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={"reason": "principal_id_required"},
+            )
+        # R55 P0-3: 验证审批 action_type 必须是 data_lifecycle_break_glass
+        try:
+            _type_rows = await store._db.execute_fetchall(
+                "SELECT command_type FROM command_executions WHERE action_id = ?",
+                (approval_action_id,),
+            )
+            if _type_rows and _type_rows[0]:
+                _cmd_type = _type_rows[0][0]
+                if _cmd_type != "data_lifecycle_break_glass":
+                    raise AppError(
+                        ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                        params={"reason": "invalid_action_type",
+                                "expected": "data_lifecycle_break_glass",
+                                "actual": _cmd_type},
+                    )
+        except AppError:
+            raise
+        except Exception:
+            pass
         import socket as _socket
         _owner = f"{_socket.gethostname()}:{os.getpid()}"
         try:
             claimed = await claim_execution_approved(
                 action_id=approval_action_id,
                 owner=_owner,
+                request_hash=request_hash,
             )
         except AppError:
-            # DB 故障 → fail-closed,禁止物理删除
             raise
         if not claimed:
             raise AppError(
                 ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={
-                    "reason": "break_glass_approval_cas_failed_or_not_approved",
-                    "approval_action_id": approval_action_id,
-                },
+                params={"reason": "break_glass_approval_cas_failed_or_not_approved"},
             )
         _break_glass_claimed = True
-        # 写审计日志(break-glass 绕过 backup marker 检查,经真实审批)
-        await _write_audit_log(
-            0, "break_glass_skip_backup_check", "data_lifecycle",
-            "cleanup_expired_data",
-            {
-                "reason": "skip_backup_check_with_commandbus_approval",
-                "approval_action_id": approval_action_id,
-            },
-        )
     # R53 P1-3: 物理删除前强制严格 backup marker 校验
     # require_user_scope=True: 校验用户覆盖范围(全库备份用 user_coverage)
     # require_checksum=True: 校验 manifest checksum(完整性绑定)
@@ -1183,15 +1177,27 @@ async def cleanup_expired_data(
                     continue
             # user_coverage 为空时(单用户备份)不适用于批量清理,
             # _verify_backup_marker 已通过 require_user_scope 校验存在性
-        # R54 P0-5: 单用户所有 SQLite 删除同事务(原子性)
-        # 建立 per-user receipt,任何表失败标记 partial/failed,
-        # 不能继续伪装成功;审计记录每张表 affected rows 和 backup binding
+        # R55 P0-5/P0-6: per-user 原子删除 + 审计同事务
         _user_receipt = {
             "user_id": user_id,
             "file_records_deleted": 0,
             "codes_deleted": 0,
             "status": "pending",
         }
+        audit_details = {
+            "user_id": user_id,
+            "file_records_deleted": 0,
+            "codes_deleted": 0,
+            "deletion_status": "pending",
+            "retention_cutoff": cutoff_iso,
+            "retention_days": retention_days,
+        }
+        if not skip_backup_check and backup_info is not None:
+            audit_details.update({
+                "backup_id": backup_info.get("backup_id"),
+                "checksum": backup_info.get("checksum"),
+                "completed_at": backup_info.get("completed_at"),
+            })
         try:
             async with store.transaction() as tx:
                 # 物理删除该用户已软删(deleted_at < cutoff)的 file_records
@@ -1216,6 +1222,14 @@ async def cleanup_expired_data(
                     f"WHERE user_id = ?",
                     (now_dt.isoformat(), user_id),
                 )
+                # R55 P0-6: 审计日志纳入删除事务(原子性)
+                audit_details["file_records_deleted"] = _user_receipt["file_records_deleted"]
+                audit_details["codes_deleted"] = _user_receipt["codes_deleted"]
+                audit_details["deletion_status"] = "completed"
+                await _write_audit_log_in_tx(
+                    tx, 0, "physical_delete_per_user", "user", str(user_id),
+                    audit_details,
+                )
             _user_receipt["status"] = "completed"
             total_cleaned += (
                 _user_receipt["file_records_deleted"]
@@ -1223,29 +1237,11 @@ async def cleanup_expired_data(
             )
         except Exception as e:
             _user_receipt["status"] = "failed"
+            audit_details["deletion_status"] = "failed"
             logger.error(
-                f"[DataLifecycle] R54 P0-5: per-user 原子删除失败 "
+                f"[DataLifecycle] R55 P0-6: per-user 原子删除失败 "
                 f"user_id={user_id}: {e}"
             )
-        # R54 P0-5: 审计记录每张表 affected rows 和 backup binding
-        audit_details = {
-            "user_id": user_id,
-            "file_records_deleted": _user_receipt["file_records_deleted"],
-            "codes_deleted": _user_receipt["codes_deleted"],
-            "deletion_status": _user_receipt["status"],
-            "retention_cutoff": cutoff_iso,
-            "retention_days": retention_days,
-        }
-        if not skip_backup_check and backup_info is not None:
-            audit_details.update({
-                "backup_id": backup_info.get("backup_id"),
-                "checksum": backup_info.get("checksum"),
-                "completed_at": backup_info.get("completed_at"),
-            })
-        await _write_audit_log(
-            0, "physical_delete_per_user", "user", str(user_id),
-            audit_details,
-        )
         if total_cleaned >= batch_size:
             break
     # R54 P0-3: break-glass 审批成功后标记 executed

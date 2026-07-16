@@ -16,45 +16,45 @@
   ],
   "modules": {
     "bots/up_bot.py": {
-      "baseline": 46,
+      "baseline": 4,
       "target": 0,
-      "user_visible": 42,
-      "log_only": 4
+      "user_visible": 4,
+      "log_only": 0
     },
     "bots/idx_bot.py": {
-      "baseline": 97,
+      "baseline": 15,
       "target": 0,
-      "user_visible": 82,
-      "log_only": 15
+      "user_visible": 15,
+      "log_only": 0
     },
     "bots/dsp_bot.py": {
-      "baseline": 28,
+      "baseline": 5,
       "target": 0,
-      "user_visible": 23,
-      "log_only": 5
+      "user_visible": 5,
+      "log_only": 0
     },
     "bots/mon_bot.py": {
-      "baseline": 26,
+      "baseline": 0,
       "target": 0,
-      "user_visible": 26,
+      "user_visible": 0,
       "log_only": 0
     },
     "bots/admin_bot/": {
-      "baseline": 425,
-      "target": 0,
-      "user_visible": 400,
-      "log_only": 25
-    },
-    "admin/": {
-      "baseline": 24,
+      "baseline": 23,
       "target": 0,
       "user_visible": 23,
-      "log_only": 1
+      "log_only": 0
+    },
+    "admin/": {
+      "baseline": 1,
+      "target": 0,
+      "user_visible": 1,
+      "log_only": 0
     },
     "admin/templates/": {
-      "baseline": 309,
+      "baseline": 0,
       "target": 0,
-      "user_visible": 309,
+      "user_visible": 0,
       "log_only": 0
     },
     "admin/static/": {
@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 315,
+      "baseline": 24,
       "target": 0,
-      "user_visible": 291,
-      "log_only": 24
+      "user_visible": 24,
+      "log_only": 0
     }
   },
   "total": {
-    "baseline": 1270,
+    "baseline": 72,
     "target": 0,
-    "user_visible": 1196,
-    "log_only": 74
+    "user_visible": 72,
+    "log_only": 0
   },
-  "last_updated": "2026-07-15",
+  "last_updated": "2026-07-16",
   "last_updated_by": "R52 P0-5/P1-1/P1-4/P1-5/P1-7/P1-8 整改: 新增 CommandBus 状态机/entitlements/collections/CF Worker 两阶段去重相关日志字符串"
 }

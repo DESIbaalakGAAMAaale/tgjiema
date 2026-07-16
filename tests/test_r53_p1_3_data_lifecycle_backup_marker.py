@@ -440,9 +440,9 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             "request_hash, result, created_at, updated_at, requires_approval, approved_at) "
             "VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?)",
             (
-                action_id, "break_glass_cleanup", 0,
+                action_id, "data_lifecycle_break_glass", 1,
                 command_bus.CMD_STATUS_APPROVED,
-                "test_request_hash", now, now, 1, now,
+                "a" * 64, now, now, 1, now,
             ),
         )
         await real_store._db.commit()
@@ -450,6 +450,8 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
             approval_action_id=action_id,
+            request_hash="a" * 64,
+            principal_id=1,
         )
         assert cleaned >= 1, "真实审批后应清理至少 1 条记录"
 
@@ -461,20 +463,17 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         row = await cursor.fetchone()
         assert row[0] == 0, "真实审批后 file_records_local 应已物理删除"
 
-        # 验证审计日志已写入(break_glass_skip_backup_check)
+        # 验证审计日志已写入(R55 P0-6: action=physical_delete_per_user,同事务原子写入)
         cursor = await real_store._db.execute(
             "SELECT action, details FROM audit_log "
-            "WHERE action = 'break_glass_skip_backup_check' "
+            "WHERE action = 'physical_delete_per_user' "
             "ORDER BY id DESC LIMIT 1",
         )
         arow = await cursor.fetchone()
-        assert arow is not None, "应写入 break_glass_skip_backup_check 审计日志"
+        assert arow is not None, "应写入 physical_delete_per_user 审计日志"
         details = json.loads(arow[1]) if arow[1] else {}
-        assert details.get("reason") == "skip_backup_check_with_commandbus_approval", (
-            f"reason 应为 skip_backup_check_with_commandbus_approval,实际: {details.get('reason')}"
-        )
-        assert details.get("approval_action_id") == action_id, (
-            f"approval_action_id 应为 {action_id},实际: {details.get('approval_action_id')}"
+        assert details.get("deletion_status") == "completed", (
+            f"deletion_status 应为 completed,实际: {details.get('deletion_status')}"
         )
 
     @pytest.mark.asyncio
@@ -505,9 +504,9 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             "request_hash, result, created_at, updated_at, requires_approval, approved_at) "
             "VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, ?, ?)",
             (
-                action_id, "break_glass_cleanup", 0,
+                action_id, "data_lifecycle_break_glass", 1,
                 command_bus.CMD_STATUS_APPROVED,
-                "test_request_hash", now, now, 1, now,
+                "a" * 64, now, now, 1, now,
             ),
         )
         await real_store._db.commit()
@@ -515,6 +514,8 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
             approval_action_id=action_id,
+            request_hash="a" * 64,
+            principal_id=1,
         )
         assert cleaned >= 1, "approval_action_id 审批后应清理至少 1 条记录"
 
@@ -526,20 +527,17 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         row = await cursor.fetchone()
         assert row[0] == 0, "approval_action_id 审批后 file_records_local 应已物理删除"
 
-        # 验证审计日志已写入
+        # 验证审计日志已写入(R55 P0-6: action=physical_delete_per_user,同事务原子写入)
         cursor = await real_store._db.execute(
             "SELECT action, details FROM audit_log "
-            "WHERE action = 'break_glass_skip_backup_check' "
+            "WHERE action = 'physical_delete_per_user' "
             "ORDER BY id DESC LIMIT 1",
         )
         arow = await cursor.fetchone()
-        assert arow is not None, "应写入 break_glass_skip_backup_check 审计日志"
+        assert arow is not None, "应写入 physical_delete_per_user 审计日志"
         details = json.loads(arow[1]) if arow[1] else {}
-        assert details.get("reason") == "skip_backup_check_with_commandbus_approval", (
-            f"reason 应为 skip_backup_check_with_commandbus_approval,实际: {details.get('reason')}"
-        )
-        assert details.get("approval_action_id") == action_id, (
-            f"approval_action_id 应为 {action_id},实际: {details.get('approval_action_id')}"
+        assert details.get("deletion_status") == "completed", (
+            f"deletion_status 应为 completed,实际: {details.get('deletion_status')}"
         )
 
 

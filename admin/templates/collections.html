@@ -5,19 +5,19 @@
 
 {% block content %}
 <div class="section">
-    <h2>文件集合列表</h2>
+    <h2>{{ t("ui.admin.collections.s1") }}</h2>
     <table>
-        <caption>所有文件集合</caption>
+        <caption>{{ t("ui.admin.collections.s2") }}</caption>
         <thead>
             <tr>
-                <th>集合ID</th>
-                <th>集合码</th>
-                <th>名称</th>
-                <th>所有者</th>
-                <th>版本</th>
-                <th>文件数</th>
-                <th>状态</th>
-                <th>创建时间</th>
+                <th>{{ t("ui.admin.collections.s3") }}</th>
+                <th>{{ t("ui.admin.collections.s4") }}</th>
+                <th>{{ t("ui.admin.collections.s5") }}</th>
+                <th>{{ t("ui.admin.collections.s6") }}</th>
+                <th>{{ t("ui.admin.collections.s7") }}</th>
+                <th>{{ t("ui.admin.collections.s8") }}</th>
+                <th>{{ t("ui.admin.collections.s9") }}</th>
+                <th>{{ t("ui.admin.collections.s10") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -32,9 +32,9 @@
                 <td>
                     {% set st = col.get('status', '') %}
                     {% if st == 'active' %}
-                    <span class="tag tag-green">活跃</span>
+                    <span class="tag tag-green">{{ t("ui.admin.collections.s11") }}</span>
                     {% elif st == 'archived' %}
-                    <span class="tag tag-orange">已归档</span>
+                    <span class="tag tag-orange">{{ t("ui.admin.collections.s12") }}</span>
                     {% else %}
                     <span class="tag">{{ st }}</span>
                     {% endif %}
@@ -42,7 +42,7 @@
                 <td>{{ col.get('created_at', 'N/A') }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="8" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="8" class="empty-state">{{ t("ui.admin.collections.s13") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>

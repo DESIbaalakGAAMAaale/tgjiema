@@ -127,7 +127,7 @@ async def _insert_file_record(store, file_code: str, uploader_id: int = 0,
 
 
 async def _insert_command_execution(store, action_id: str, status: str = "approved",
-                                     request_hash: str = "test_hash"):
+                                     request_hash: str = "a" * 64):
     """插入 command_executions 记录。
 
     R52 P0-5: 状态机统一为 pending → approved → executing → executed/failed,
@@ -374,15 +374,17 @@ class TestCollectionsOptimisticLock:
         coll = await collections.create_collection("兼容模式", owner_id=5003)
         coll_id = coll["id"]
         # R53 P0-4: 插入真实审批记录(status=approved)
+        # R55 P0-2: request_hash 必须为 64 位 hex
         await _insert_command_execution(
             store, "approval_bypass_001", status="approved",
-            request_hash="hash_r45_bypass",
+            request_hash="a" * 64,
         )
         # R53 P0-4: 调用私有方法 + 真实审批 → 跳过 CAS,直接更新
         result = await collections._update_collection_without_cas(
             collection_id=coll_id, description="新描述",
             principal_id=100,  # _insert_command_execution 默认 principal_id=100
-            request_hash="hash_r45_bypass",
+            request_hash="a" * 64,
+            target_version=1,
             approval_action_id="approval_bypass_001",
             caller="test_migration",
         )

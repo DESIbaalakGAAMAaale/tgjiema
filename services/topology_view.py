@@ -23,6 +23,7 @@ from typing import Any
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.i18n import translate as _i18n_t
 
 
 # ─── 副本因子目标值(可被 settings 覆盖) ────────────────────────
@@ -373,20 +374,18 @@ async def format_topology(topology: dict) -> str:
     """
     lines: list[str] = []
     lines.append("═══════════════════════════════════════════════════════════")
-    lines.append("                  拓扑可视化 (R40 §9.3)")
+    lines.append(_i18n_t('services.topology_view.s1'))
     lines.append("═══════════════════════════════════════════════════════════")
 
     # 副本因子
     rf = topology.get("replication_factor", {})
     lines.append(
-        f"\n[副本因子] current={rf.get('current', 0)} "
-        f"target={rf.get('target', 0)} "
-        f"healthy={'YES' if rf.get('healthy') else 'NO'}"
+        _i18n_t('services.topology_view.s2', rf_get_current_0=rf.get('current', 0), rf_get_target_0=rf.get('target', 0), YES_if_rf_get_healthy_else_NO='YES' if rf.get('healthy') else 'NO')
     )
 
     # 账号 → 频道
     accounts = topology.get("accounts", [])
-    lines.append(f"\n[账号] 共 {len(accounts)} 个")
+    lines.append(_i18n_t('services.topology_view.s3', len_accounts=len(accounts)))
     for acc in accounts:
         status_mark = "✓" if acc.get("is_active") else "✗"
         lines.append(
@@ -397,7 +396,7 @@ async def format_topology(topology: dict) -> str:
 
     # 频道列表
     channels = topology.get("channels", [])
-    lines.append(f"\n[频道] 共 {len(channels)} 个")
+    lines.append(_i18n_t('services.topology_view.s4', len_channels=len(channels)))
     for ch in channels:
         r100_mark = " [R100]" if ch.get("is_r100") else ""
         lines.append(

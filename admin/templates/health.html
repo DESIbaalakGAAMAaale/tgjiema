@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>系统健康 - TG文件解码器</title>
+    <title>{{ t("ui.admin.health.s1") }}</title>
     <style nonce="{{ csp_nonce if csp_nonce else '' }}">
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #333; }
         .sidebar { position: fixed; left: 0; top: 0; width: 220px; height: 100vh; background: #001529; padding-top: 20px; }
         .sidebar h2 { color: #fff; text-align: center; font-size: 18px; padding: 0 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.1); }
         .sidebar a { display: block; color: rgba(255,255,255,0.65); padding: 14px 24px; text-decoration: none; font-size: 14px; transition: all 0.2s; }
-        .sidebar a:hover, .sidebar a.active { color: #fff; background: #1890ff; }
+        .sidebar a:hover, .sidebar a.active { color: #fff; background: #0066cc; }
         .main { margin-left: 220px; padding: 24px; }
         .header { background: #fff; padding: 16px 24px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
         .header h1 { font-size: 22px; }
@@ -20,36 +20,36 @@
         th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
         th { background: #fafafa; font-weight: 600; }
         .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
-        .tag-green { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
-        .tag-red { background: #fff2f0; color: #ff4d4f; border: 1px solid #ffccc7; }
+        .tag-green { background: #f6ffed; color: #237804; border: 1px solid #b7eb8f; }
+        .tag-red { background: #fff2f0; color: #cf1322; border: 1px solid #ffccc7; }
         .metric-box { display: flex; gap: 8px; margin-top: 8px; }
-        .metric-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #8c8c8c; }
-        .dot-green { width: 8px; height: 8px; border-radius: 50%; background: #52c41a; }
-        .dot-red { width: 8px; height: 8px; border-radius: 50%; background: #ff4d4f; }
+        .metric-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #595959; }
+        .dot-green { width: 8px; height: 8px; border-radius: 50%; background: #237804; }
+        .dot-red { width: 8px; height: 8px; border-radius: 50%; background: #cf1322; }
     </style>
 </head>
 <body>
     <div class="sidebar">
-        <h2>TG解码器管理</h2>
-        <a href="/">看板</a>
-        <a href="/users">用户管理</a>
-        <a href="/files">文件管理</a>
-        <a href="/logs">解码日志</a>
-        <a href="/health-page" class="active">系统健康</a>
+        <h2>{{ t("ui.admin.health.s2") }}</h2>
+        <a href="/">{{ t("ui.admin.health.s3") }}</a>
+        <a href="/users">{{ t("ui.admin.health.s4") }}</a>
+        <a href="/files">{{ t("ui.admin.health.s5") }}</a>
+        <a href="/logs">{{ t("ui.admin.health.s6") }}</a>
+        <a href="/health-page" class="active">{{ t("ui.admin.health.s7") }}</a>
     </div>
     <div class="main">
-        <div class="header"><h1>系统健康监控</h1></div>
+        <div class="header"><h1>{{ t("ui.admin.health.s8") }}</h1></div>
         <div class="section">
-            <h3>机器人运行状态</h3>
+            <h3>{{ t("ui.admin.health.s9") }}</h3>
             <table>
                 <thead>
                     <tr>
-                        <th>机器人</th>
-                        <th>运行状态</th>
-                        <th>最后心跳</th>
-                        <th>已处理</th>
-                        <th>错误数</th>
-                        <th>健康度</th>
+                        <th>{{ t("ui.admin.health.s10") }}</th>
+                        <th>{{ t("ui.admin.health.s11") }}</th>
+                        <th>{{ t("ui.admin.health.s12") }}</th>
+                        <th>{{ t("ui.admin.health.s13") }}</th>
+                        <th>{{ t("ui.admin.health.s14") }}</th>
+                        <th>{{ t("ui.admin.health.s15") }}</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -58,9 +58,9 @@
                         <td><strong>{{ bot.name }}</strong></td>
                         <td>
                             {% if bot.is_running %}
-                            <span class="tag tag-green">运行中</span>
+                            <span class="tag tag-green">{{ t("ui.admin.health.s16") }}</span>
                             {% else %}
-                            <span class="tag tag-red">已停止</span>
+                            <span class="tag tag-red">{{ t("ui.admin.health.s17") }}</span>
                             {% endif %}
                         </td>
                         <td>{{ bot.last_ping }}</td>
@@ -76,7 +76,7 @@
                                 <span class="tag {% if rate > 95 %}tag-green{% else %}tag-red{% endif %}">{{ rate }}%</span>
                                 {% endif %}
                             {% else %}
-                            <span class="tag tag-red">离线</span>
+                            <span class="tag tag-red">{{ t("ui.admin.health.s18") }}</span>
                             {% endif %}
                         </td>
                     </tr>

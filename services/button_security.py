@@ -37,6 +37,7 @@ from config import settings
 
 # R50 P1-1: 统一错误码协议化(替代裸字符串 RuntimeError)
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 
 # ── R47 P1-a: 签名长度(32 hex chars = 128 bit)──────────────────
@@ -397,8 +398,7 @@ async def sign_button_token_with_nonce(
     )
     if not ok:
         raise RuntimeError(
-            f"R47 P1-a: callback_nonce_create 失败"
-            f"(action={action}, principal_id={principal_id})"
+            _i18n_t('services.button_security.s1', action=action, principal_id=principal_id)
         )
 
     # 签名(含 nonce)

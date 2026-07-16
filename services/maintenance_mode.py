@@ -50,6 +50,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.i18n import translate as _i18n_t
 
 
 MAINTENANCE_KEY = "maintenance_mode"
@@ -344,7 +345,7 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
                 "[Maintenance] disable 拒绝(recover_status=pending 但未提供 approval_action_id)"
             )
             raise MaintenancePreconditionError(
-                "维护工作流失败后需要 recover_maintenance 审批才能关闭"
+                _i18n_t('services.maintenance_mode.s12')
             )
         # R51 P1-6: 强制要求 request_hash(绑定审批动作 + principal + 请求来源)
         # ended_by 即 principal,三者齐全才允许关闭
@@ -368,8 +369,7 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             except Exception:
                 pass  # audit_log 写入失败不影响主流程拒绝
             raise MaintenancePreconditionError(
-                "R51 P1-6: recover_status=pending 时 disable 必须绑定 request_hash + "
-                "principal + approval_action_id(三者缺一不可)"
+                _i18n_t('services.maintenance_mode.s13')
             )
         # 验证 approval_action_id 在 command_executions 中 status='approved'
         # R52 P0-5: 状态从 'executed' 改为 'approved'(执行前置校验,
@@ -381,11 +381,11 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             )
         except Exception as e:
             raise MaintenancePreconditionError(
-                f"验证 approval_action_id 失败: {e}"
+                _i18n_t('services.maintenance_mode.s30', e=e)
             )
         if not exec_rows or not exec_rows[0]:
             raise MaintenancePreconditionError(
-                f"approval_action_id 不存在于 command_executions: {approval_action_id}"
+                _i18n_t('services.maintenance_mode.s14', approval_action_id=approval_action_id)
             )
         exec_status = exec_rows[0][0]
         if exec_status != "approved":
@@ -470,7 +470,7 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             action="disable_maintenance",
             target_type="maintenance_state",
             target_id=str(MAINTENANCE_STATE_ID),
-            details=f"维护模式已关闭 at {now_iso}" + (" (force)" if force else ""),
+            details=_i18n_t('services.maintenance_mode.s38', now_iso=now_iso) + (" (force)" if force else ""),
         )
 
         # R40 P1-7: 更新缓存
@@ -553,7 +553,7 @@ async def check_disable_preconditions() -> dict:
     }
     if not store._db:
         result["ok"] = False
-        result["reason"] = "数据库未初始化"
+        result["reason"] = _i18n_t('services.maintenance_mode.s1')
         return result
     try:
         rows = await store._db.execute_fetchall(
@@ -584,10 +584,10 @@ async def check_disable_preconditions() -> dict:
     # 判定
     if result["dirty_outbox_remaining"] > 0:
         result["ok"] = False
-        result["reason"] = f"dirty_outbox 还有 {result['dirty_outbox_remaining']} 条未处理"
+        result["reason"] = _i18n_t('services.maintenance_mode.s2', result_dirty_outbox_remaining=result['dirty_outbox_remaining'])
     elif result["jobs_remaining"] > 0:
         result["ok"] = False
-        result["reason"] = f"local_job_queue 还有 {result['jobs_remaining']} 条 pending"
+        result["reason"] = _i18n_t('services.maintenance_mode.s3', result_jobs_remaining=result['jobs_remaining'])
     return result
 
 
@@ -622,7 +622,7 @@ async def enable_with_reason(reason: str, principal_id: int) -> bool:
             action="enable_maintenance_with_reason",
             target_type="maintenance_state",
             target_id=str(MAINTENANCE_STATE_ID),
-            details=f"带授权启用维护模式: reason={reason}",
+            details=_i18n_t('services.maintenance_mode.s31', reason=reason),
         )
     return ok
 
@@ -655,7 +655,7 @@ async def disable_with_authorization(principal_id: int, reason: str = "") -> boo
             f"(fail-closed 拒绝) principal={principal_id}: {e}"
         )
         raise PermissionError(
-            f"RBAC 权限校验异常,拒绝关闭维护模式: {e}"
+            _i18n_t('services.maintenance_mode.s15', e=e)
         )
     if not has_perm:
         logger.warning(
@@ -668,10 +668,10 @@ async def disable_with_authorization(principal_id: int, reason: str = "") -> boo
             action="disable_maintenance_unauthorized",
             target_type="maintenance_state",
             target_id=str(MAINTENANCE_STATE_ID),
-            details=f"未授权关闭维护模式尝试: reason={reason}",
+            details=_i18n_t('services.maintenance_mode.s32', reason=reason),
         )
         raise PermissionError(
-            f"principal {principal_id} 无 maintenance:disable 权限"
+            _i18n_t('services.maintenance_mode.s4', principal_id=principal_id)
         )
     # 2. 授权通过,执行关闭(force=True 跳过前置检查,由授权决定)
     logger.info(
@@ -686,7 +686,7 @@ async def disable_with_authorization(principal_id: int, reason: str = "") -> boo
             action="disable_maintenance_with_authorization",
             target_type="maintenance_state",
             target_id=str(MAINTENANCE_STATE_ID),
-            details=f"带授权关闭维护模式: reason={reason}",
+            details=_i18n_t('services.maintenance_mode.s33', reason=reason),
         )
     return ok
 
@@ -716,7 +716,7 @@ async def is_enabled() -> bool:
                 f"last_known={_last_known_enabled}"
             )
             return _last_known_enabled
-        raise MaintenanceCheckError("数据库未初始化,无法判定维护状态")
+        raise MaintenanceCheckError(_i18n_t('services.maintenance_mode.s5'))
     try:
         rows = await store._db.execute_fetchall(
             "SELECT enabled FROM maintenance_state WHERE id = ?",
@@ -738,7 +738,7 @@ async def is_enabled() -> bool:
         # 但函数签名返回 bool,这里仍抛异常让高风险入口捕获
         # (调用方可显式调用 get_maintenance_state() 拿缓存)
         raise MaintenanceCheckError(
-            f"数据库查询异常,无法判定维护状态: {e}"
+            _i18n_t('services.maintenance_mode.s16', e=e)
         )
 
 
@@ -759,7 +759,7 @@ async def get_maintenance_state() -> dict:
             "enabled": _last_known_enabled,
             "last_checked": _last_checked_ts,
             "last_known": _last_known_enabled,
-            "error": "数据库未初始化",
+            "error": _i18n_t('services.maintenance_mode.s6'),
             "source": "cache" if _last_known_enabled is not None else "unknown",
         }
     try:
@@ -1013,14 +1013,14 @@ async def execute_maintenance_workflow(reason: str,
         steps.append({
             "name": "enable", "success": ok,
             "duration_seconds": _time.time() - step_start,
-            "error": "" if ok else "enable() 返回 False",
+            "error": "" if ok else _i18n_t('services.maintenance_mode.s34'),
         })
         if not ok:
             overall_success = False
-            failure_reason = "enable() 失败"
+            failure_reason = _i18n_t('services.maintenance_mode.s7')
     except Exception as e:
         overall_success = False
-        failure_reason = f"enable 异常: {e}"
+        failure_reason = _i18n_t('services.maintenance_mode.s8', e=e)
         steps.append({
             "name": "enable", "success": False,
             "duration_seconds": _time.time() - step_start,
@@ -1036,19 +1036,17 @@ async def execute_maintenance_workflow(reason: str,
             steps.append({
                 "name": "drain_queues", "success": drained,
                 "duration_seconds": _time.time() - step_start,
-                "error": ("超时未排空" if drain_result.get("timeout")
+                "error": (_i18n_t('services.maintenance_mode.s39') if drain_result.get("timeout")
                            else ""),
             })
             if not drained:
                 overall_success = False
                 failure_reason = (
-                    f"drain_queues 失败: outbox="
-                    f"{drain_result.get('remaining_outbox', '?')}, "
-                    f"jobs={drain_result.get('remaining_jobs', '?')}"
+                    _i18n_t('services.maintenance_mode.s17', drain_result_get_remaining_outbox=drain_result.get('remaining_outbox', '?'), drain_result_get_remaining_jobs=drain_result.get('remaining_jobs', '?'))
                 )
         except Exception as e:
             overall_success = False
-            failure_reason = f"drain_queues 异常: {e}"
+            failure_reason = _i18n_t('services.maintenance_mode.s18', e=e)
             steps.append({
                 "name": "drain_queues", "success": False,
                 "duration_seconds": _time.time() - step_start,
@@ -1066,15 +1064,15 @@ async def execute_maintenance_workflow(reason: str,
             steps.append({
                 "name": "trigger_backup", "success": ok,
                 "duration_seconds": _time.time() - step_start,
-                "error": "" if ok else "trigger_backup() 返回空",
+                "error": "" if ok else _i18n_t('services.maintenance_mode.s40'),
                 "backup_id": backup_id,
             })
             if not ok:
                 overall_success = False
-                failure_reason = "trigger_backup 失败: 返回空 backup_id"
+                failure_reason = _i18n_t('services.maintenance_mode.s19')
         except Exception as e:
             overall_success = False
-            failure_reason = f"trigger_backup 异常: {e}"
+            failure_reason = _i18n_t('services.maintenance_mode.s20', e=e)
             steps.append({
                 "name": "trigger_backup", "success": False,
                 "duration_seconds": _time.time() - step_start,
@@ -1088,7 +1086,7 @@ async def execute_maintenance_workflow(reason: str,
         steps.append({
             "name": "run_migration", "success": True,
             "duration_seconds": _time.time() - step_start,
-            "error": "skipped (运维单独执行)",
+            "error": _i18n_t('services.maintenance_mode.s21'),
         })
     except Exception as e:
         steps.append({
@@ -1106,15 +1104,15 @@ async def execute_maintenance_workflow(reason: str,
             steps.append({
                 "name": "verify", "success": ok,
                 "duration_seconds": _time.time() - step_start,
-                "error": "" if ok else f"就绪检查未通过: {readiness}",
+                "error": "" if ok else _i18n_t('services.maintenance_mode.s41', readiness=readiness),
                 "readiness": readiness,
             })
             if not ok:
                 overall_success = False
-                failure_reason = "verify 就绪检查未通过"
+                failure_reason = _i18n_t('services.maintenance_mode.s22')
         except Exception as e:
             overall_success = False
-            failure_reason = f"verify 异常: {e}"
+            failure_reason = _i18n_t('services.maintenance_mode.s23', e=e)
             steps.append({
                 "name": "verify", "success": False,
                 "duration_seconds": _time.time() - step_start,
@@ -1173,8 +1171,8 @@ async def execute_maintenance_workflow(reason: str,
                 action="maintenance_workflow_failed",
                 target_type="maintenance_state",
                 target_id=str(MAINTENANCE_STATE_ID),
-                details=f"维护工作流失败,保持 enabled: {failure_reason}"
-                        + (f" | recover_status 持久化失败: {recover_persist_error}"
+                details=_i18n_t('services.maintenance_mode.s42', failure_reason=failure_reason)
+                        + (_i18n_t('services.maintenance_mode.s46', recover_persist_error=recover_persist_error)
                            if recover_persist_failed else ""),
             )
         except Exception as log_err:
@@ -1200,14 +1198,14 @@ async def execute_maintenance_workflow(reason: str,
                 steps.append({
                     "name": "disable", "success": ok,
                     "duration_seconds": _time.time() - step_start,
-                    "error": "" if ok else "disable() 返回 False",
+                    "error": "" if ok else _i18n_t('services.maintenance_mode.s43'),
                 })
             except MaintenancePreconditionError as e:
                 # 前置检查未通过(异常情况,workflow 后队列应已排空)
                 steps.append({
                     "name": "disable", "success": False,
                     "duration_seconds": _time.time() - step_start,
-                    "error": f"前置检查未通过: {e}",
+                    "error": _i18n_t('services.maintenance_mode.s44', e=e),
                 })
                 maintenance_kept_enabled = True
             except Exception as e:
@@ -1320,7 +1318,7 @@ async def recover_maintenance(
 
     store = get_cache_store()
     if not store._db:
-        raise PermissionError("数据库未初始化,无法验证 approval_action_id")
+        raise PermissionError(_i18n_t('services.maintenance_mode.s9'))
 
     # 2. R52 P0-5: 验证 approval_action_id 在 command_executions 中 status='approved'
     #    (旧版 'executed' 语义冲突:表示"已完成"但 recover_maintenance 即将执行;
@@ -1331,11 +1329,11 @@ async def recover_maintenance(
             (approval_action_id,),
         )
     except Exception as e:
-        raise PermissionError(f"查询 approval_action_id 失败: {e}")
+        raise PermissionError(_i18n_t('services.maintenance_mode.s24', e=e))
 
     if not rows or not rows[0]:
         raise PermissionError(
-            f"approval_action_id 不存在: {approval_action_id}"
+            _i18n_t('services.maintenance_mode.s10', approval_action_id=approval_action_id)
         )
     exec_status = rows[0][0]
     if exec_status != "approved":
@@ -1356,7 +1354,7 @@ async def recover_maintenance(
             f"principal={principal_id}: {e}"
         )
         raise PermissionError(
-            f"RBAC 权限校验异常,拒绝恢复维护模式: {e}"
+            _i18n_t('services.maintenance_mode.s25', e=e)
         )
     if not has_perm:
         logger.warning(
@@ -1369,10 +1367,10 @@ async def recover_maintenance(
             action="recover_maintenance_unauthorized",
             target_type="maintenance_state",
             target_id=str(MAINTENANCE_STATE_ID),
-            details=f"未授权恢复维护模式尝试: reason={reason}",
+            details=_i18n_t('services.maintenance_mode.s35', reason=reason),
         )
         raise PermissionError(
-            f"principal {principal_id} 无 maintenance:recover 权限"
+            _i18n_t('services.maintenance_mode.s11', principal_id=principal_id)
         )
 
     # 4. 通过验证 → 调用 disable(force=True, approval_action_id=..., request_hash=...)
@@ -1410,8 +1408,7 @@ async def recover_maintenance(
             action="recover_maintenance",
             target_type="maintenance_state",
             target_id=str(MAINTENANCE_STATE_ID),
-            details=f"恢复维护模式(审批通过): reason={reason} "
-                    f"approval_action_id={approval_action_id}",
+            details=_i18n_t('services.maintenance_mode.s36', reason=reason, approval_action_id=approval_action_id),
         )
     return ok
 
@@ -1450,7 +1447,7 @@ def require_maintenance_check(action: str = "operation"):
                 )
                 try:
                     await update.message.reply_text(
-                        "服务暂不可用,请稍后再试"
+                        _i18n_t('services.maintenance_mode.s47')
                     )
                 except Exception:
                     pass
@@ -1463,7 +1460,7 @@ def require_maintenance_check(action: str = "operation"):
                 )
                 try:
                     await update.message.reply_text(
-                        "服务暂不可用,请稍后再试"
+                        _i18n_t('services.maintenance_mode.s48')
                     )
                 except Exception:
                     pass
@@ -1471,7 +1468,7 @@ def require_maintenance_check(action: str = "operation"):
             if enabled:
                 try:
                     await update.message.reply_text(
-                        f"系统维护中,{action}暂不可用"
+                        _i18n_t('services.maintenance_mode.s45', action=action)
                     )
                 except Exception:
                     pass
@@ -1541,11 +1538,11 @@ async def check_maintenance_at_entry(action: str = "operation") -> dict:
             return {
                 "allowed": False,
                 "maintenance_enabled": False,
-                "reason": f"服务暂不可用,无法判定维护状态: {error}",
+                "reason": _i18n_t('services.maintenance_mode.s26', error=error),
                 "source": source,
                 "action": action,
                 "last_checked": last_checked,
-                "error": error or "无法判定维护状态",
+                "error": error or _i18n_t('services.maintenance_mode.s37'),
             }
         if enabled:
             logger.info(
@@ -1555,7 +1552,7 @@ async def check_maintenance_at_entry(action: str = "operation") -> dict:
             return {
                 "allowed": False,
                 "maintenance_enabled": True,
-                "reason": f"系统维护中,{action}暂不可用",
+                "reason": _i18n_t('services.maintenance_mode.s27', action=action),
                 "source": source,
                 "action": action,
                 "last_checked": last_checked,
@@ -1580,7 +1577,7 @@ async def check_maintenance_at_entry(action: str = "operation") -> dict:
         return {
             "allowed": False,
             "maintenance_enabled": False,
-            "reason": "服务暂不可用,请稍后再试",
+            "reason": _i18n_t('services.maintenance_mode.s28'),
             "source": "unknown",
             "action": action,
             "last_checked": _last_checked_ts,
@@ -1595,7 +1592,7 @@ async def check_maintenance_at_entry(action: str = "operation") -> dict:
         return {
             "allowed": False,
             "maintenance_enabled": False,
-            "reason": "服务暂不可用,请稍后再试",
+            "reason": _i18n_t('services.maintenance_mode.s29'),
             "source": "unknown",
             "action": action,
             "last_checked": _last_checked_ts,

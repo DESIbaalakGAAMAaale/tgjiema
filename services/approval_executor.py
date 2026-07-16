@@ -30,6 +30,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.i18n import translate as _i18n_t
 
 
 # ─── 默认参数 ─────────────────────────────────────────────
@@ -153,7 +154,7 @@ class ApprovalExecutor:
                         f"[ApprovalExecutor] 顶层异常后 release_lease 失败 "
                         f"entry id={entry['id']}: {_release_err}"
                     )
-                await self._handle_failure(entry, f"顶层异常: {e}")
+                await self._handle_failure(entry, _i18n_t('services.approval_executor.s1', e=e))
                 stats["failed"] += 1
 
         if stats["total"] > 0:
@@ -286,7 +287,7 @@ class ApprovalExecutor:
                         "UPDATE command_outbox "
                         "SET status = 'failed', last_error = ?, updated_at = ? "
                         "WHERE id = ?",
-                        ("request_hash 不匹配(防篡改拒绝,路由到 DLQ)", now, entry["id"]),
+                        (_i18n_t('services.approval_executor.s3'), now, entry["id"]),
                     )
             except Exception as dlq_err:
                 logger.warning(
@@ -351,7 +352,7 @@ class ApprovalExecutor:
                 # EffectReceiptContext 异常退出会自动 record_failed
                 # R42 P0-2: 释放 lease + 安排重试
                 await _cb_mod.release_lease(action_id)
-                return await self._handle_failure(entry, f"CommandBus 异常: {e}")
+                return await self._handle_failure(entry, _i18n_t('services.approval_executor.s2', e=e))
 
             # R45: 设置 external_id(若有),EffectReceiptContext 正常退出时会 record_completed
             if result.success and hasattr(result, "data") and isinstance(result.data, dict):

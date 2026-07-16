@@ -187,7 +187,7 @@ async def _insert_task(store, task_type: str, user_id: int, status: str = "pendi
 
 async def _insert_command_execution(
     store, action_id: str, principal_id: int, status: str = "approved",
-    request_hash: str = "",
+    request_hash: str = "a" * 64,
 ):
     """插入测试 command_executions 记录(用于审批验证)。
 
@@ -414,15 +414,16 @@ class TestP1_1_DataLifecycleStateMachine:
         await real_store._db.commit()
 
         # R54 P0-3: 预创建 approved command_executions 记录
+        # R55 P0-3: command_type 必须为 "data_lifecycle_break_glass"(源码校验)
         approval_action_id = f"test-break-glass-{uuid.uuid4().hex[:8]}"
         now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        request_hash = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        request_hash = "a" * 64  # R55 P0-2: 64 位 hex(满足 claim_execution_approved 校验)
         await real_store._db.execute(
             "INSERT INTO command_executions "
             "(action_id, command_type, status, request_hash, "
             " principal_id, created_at, approved_at, updated_at, requires_approval) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (approval_action_id, "data_lifecycle_cleanup", "approved",
+            (approval_action_id, "data_lifecycle_break_glass", "approved",
              request_hash, 1, now_iso, now_iso, now_iso, 1),
         )
         await real_store._db.commit()
@@ -430,6 +431,8 @@ class TestP1_1_DataLifecycleStateMachine:
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
             approval_action_id=approval_action_id,
+            request_hash="a" * 64,
+            principal_id=1,
         )
         assert cleaned >= 1, "应清理至少 1 条 file_records_local"
 
@@ -666,14 +669,15 @@ class TestP1_3_CollectionsCasEnforcement:
         # R53 P0-4: 插入真实审批记录(status=approved)
         await _insert_command_execution(
             real_store, "approval_bypass_p1_3", principal_id=user_id,
-            status="approved", request_hash="hash_p1_3_bypass",
+            status="approved", request_hash="a" * 64,
         )
 
         # R53 P0-4: 调用私有方法 + 真实审批 → 成功更新
         result = await collections._update_collection_without_cas(
             coll_id, name="migrated_name",
             principal_id=user_id,
-            request_hash="hash_p1_3_bypass",
+            request_hash="a" * 64,
+            target_version=1,
             approval_action_id="approval_bypass_p1_3",
             caller="test_migration",
         )
@@ -890,7 +894,7 @@ class TestP1_5_RepairConsoleApprovalEnforcement:
             action_id="approval_hash_mismatch",
             principal_id=principal_id,
             status="approved",
-            request_hash="wrong_hash_value",
+            request_hash="b" * 64,  # 合法 64 位 hex 但与 expected_hash 不匹配
         )
 
         with pytest.raises(AppError) as exc_info:

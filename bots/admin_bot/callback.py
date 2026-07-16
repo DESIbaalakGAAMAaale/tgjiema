@@ -11,6 +11,7 @@ from database import (
     get_rotation_config,
     update_file_record_and_invalidate,
 )
+from services.i18n import translate as _i18n_t
 from database.cache import invalidate_file_record
 from config import settings
 
@@ -32,7 +33,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     if not user or user.id != AUTHORIZED_USER_ID:
-        await query.answer("⛔ 无权限", show_alert=True)
+        await query.answer(_i18n_t('bot.admin_bot.callback.s5'), show_alert=True)
         return
 
     await query.answer()
@@ -71,14 +72,14 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = status_counters.get("total_files", 0)
         files = await files_col.find(sort=("create_time", -1), limit=10)
         total_pages = max(1, (total + 10 - 1) // 10)
-        text = f"📁 文件列表 (第1/{total_pages}页，共{total}个)\n\n"
+        text = _i18n_t('bot.admin_bot.callback.s25', total_pages=total_pages, total=total)
         for f in files:
             status_icon = "✅" if f.get("status") == "active" else "🗑️"
             fc = f.get("file_code", "N/A")
             uploader = f.get("uploader_id", "?")
-            text += f"{status_icon} {fc} (上传者:{uploader})\n"
+            text += _i18n_t('bot.admin_bot.callback.s28', status_icon=status_icon, fc=fc, uploader=uploader)
         if total_pages > 1:
-            text += "\n使用 /files 2 查看下一页"
+            text += _i18n_t('bot.admin_bot.callback.s29')
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:relay_status":
@@ -99,27 +100,27 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pending_found = await _get_cfg("relay_auth_pending") == "1"
         if pending_found:
-            text = "⏳ 中继正在等待验证码\n\nTelegram 已发送 6 位验证码到中继账号的已登录客户端，请查看并使用 /relay_code 提交。"
+            text = _i18n_t('bot.admin_bot.callback.s31')
         else:
-            text = "✅ 中继当前不需要验证码。"
+            text = _i18n_t('bot.admin_bot.callback.s32')
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:relay_whitelist":
         from database import get_relay_whitelist
         wl = await get_relay_whitelist()
         if wl:
-            text = "🔐 中继白名单\n\n" + "\n".join(f"  • {uid}" for uid in sorted(wl))
+            text = _i18n_t('bot.admin_bot.callback.s34') + "\n".join(f"  • {uid}" for uid in sorted(wl))
         else:
-            text = "🔐 中继白名单\n\n❌ 白名单为空（添加中继账号时会自动加入）\n\n可通过 /relay_whitelist add <用户ID> 手动添加"
+            text = _i18n_t('bot.admin_bot.callback.s33')
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:collector_whitelist":
         from database import get_collector_whitelist
         wl = await get_collector_whitelist()
         if wl:
-            text = "📦 采集器白名单\n\n" + "\n".join(f"  • {uid}" for uid in sorted(wl))
+            text = _i18n_t('bot.admin_bot.callback.s36') + "\n".join(f"  • {uid}" for uid in sorted(wl))
         else:
-            text = "📦 采集器白名单\n\n❌ 白名单为空\n\n点击下方「➕ 添加采集器」按钮添加"
+            text = _i18n_t('bot.admin_bot.callback.s35')
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:settings":
@@ -130,17 +131,17 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         routes = await get_all_code_bot_routes()
         regex_routes = await get_all_code_bot_routes_regex()
         if not routes and not regex_routes:
-            text = "📭 尚未配置文件码路由。"
+            text = _i18n_t('bot.admin_bot.callback.s37')
         else:
-            text = "🗺️ 文件码路由表\n\n"
+            text = _i18n_t('bot.admin_bot.callback.s38')
             if routes:
-                text += "【前缀路由】\n"
+                text += _i18n_t('bot.admin_bot.callback.s39')
                 for prefix in sorted(routes.keys()):
                     text += f"  • `{prefix}` → @{routes[prefix]}\n"
             if regex_routes:
                 if routes:
                     text += "\n"
-                text += "【正则路由】\n"
+                text += _i18n_t('bot.admin_bot.callback.s40')
                 for rid, bot, pattern in regex_routes:
                     text += f"  • [{rid}] `{pattern}` → @{bot}\n"
         await query.edit_message_text(text, reply_markup=back_kb)
@@ -148,11 +149,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "action:bot_intervals":
         intervals = await get_all_bot_decode_intervals()
         if not intervals:
-            text = "📭 尚未配置 Bot 解码间隔。"
+            text = _i18n_t('bot.admin_bot.callback.s41')
         else:
-            text = "⏱️ Bot 解码间隔配置\n\n"
+            text = _i18n_t('bot.admin_bot.callback.s42')
             for bot in sorted(intervals.keys()):
-                text += f"  • @{bot} → {intervals[bot]} 秒\n"
+                text += _i18n_t('bot.admin_bot.callback.s43', bot=bot, intervals_bot=intervals[bot])
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:topology":
@@ -162,29 +163,29 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "action:spare_list":
         spares = await list_spare_pool()
         if not spares:
-            text = "📭 备用池为空\n\n使用 /spare_add 添加备用频道。"
+            text = _i18n_t('bot.admin_bot.callback.s44')
         else:
-            text = "🔄 备用池频道列表\n\n"
+            text = _i18n_t('bot.admin_bot.callback.s45')
             for s in spares:
-                used = "🔴已用" if s.get("is_used") else "🟢可用"
-                acc = s.get("account_name") or "通用"
+                used = _i18n_t('bot.admin_bot.callback.s49') if s.get("is_used") else _i18n_t('bot.admin_bot.callback.s50')
+                acc = s.get("account_name") or _i18n_t('bot.admin_bot.callback.s51')
                 text += f"  {used} {s['channel_id']} — {acc}\n"
-            text += f"\n共 {len(spares)} 个备用频道"
+            text += _i18n_t('bot.admin_bot.callback.s46', len_spares=len(spares))
         await query.edit_message_text(text, reply_markup=back_kb)
 
     elif data == "action:rotation_view":
         keys = [
-            ("rotation_active_window_size", "active_window_size", "活跃窗口大小"),
-            ("rotation_files_per_slot", "files_per_slot", "每频道文件数"),
-            ("rotation_time_per_slot", "time_per_slot", "每频道时间(秒)"),
+            ("rotation_active_window_size", "active_window_size", _i18n_t('bot.admin_bot.callback.s52')),
+            ("rotation_files_per_slot", "files_per_slot", _i18n_t('bot.admin_bot.callback.s53')),
+            ("rotation_time_per_slot", "time_per_slot", _i18n_t('bot.admin_bot.callback.s54')),
         ]
-        text = "🔄 轮转配置\n\n"
+        text = _i18n_t('bot.admin_bot.callback.s47')
         for db_key, fallback_key, label in keys:
             val = await get_rotation_config(db_key)
             if val is None:
                 val = str(getattr(settings, f"ROTATION_{fallback_key.upper()}", "—"))
             text += f"  {label}: {val}\n"
-        text += "\n使用 /rotation_set 修改配置"
+        text += _i18n_t('bot.admin_bot.callback.s48')
         await query.edit_message_text(text, reply_markup=back_kb)
 
     # ─── 交互式操作入口 ──────────────────────────────────────────
@@ -198,150 +199,138 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 文件码路由
             "add_code_route": (
                 "add_code_route:prefix",
-                "🗺️ 新增文件码前缀路由\n\n请输入文件码前缀（例如：qqfile）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s55')
             ),
             "remove_code_route": (
                 "remove_code_route:prefix",
-                "🗺️ 删除文件码前缀路由\n\n请输入要删除的路由前缀（例如：qqfile）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s56')
             ),
             "add_code_route_regex": (
                 "add_code_route_regex:pattern",
-                "🗺️ 新增文件码正则路由\n\n"
-                "用于 40位hash / emoji 等非前缀式第三方码。\n\n"
-                "请输入正则表达式：\n\n"
-                "示例：\n"
-                "• 40位hex码：^[a-f0-9]{40}$\n"
-                "• emoji码：^[\\U0001F000-\\U0001FAFF]+$\n"
-                "• 自定义长度：^[a-zA-Z0-9]{32}$\n\n"
-                "支持 \\Uxxxxxxxx 和 \\uxxxx 转义序列。\n\n"
-                "❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s57')
             ),
             "remove_code_route_regex": (
                 "remove_code_route_regex:id",
-                "🗺️ 删除文件码正则路由\n\n请输入要删除的路由 ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s58')
             ),
             # Bot限流
             "set_bot_interval": (
                 "set_bot_interval:bot",
-                "⏱️ 新增 Bot 解码间隔限流\n\n请输入目标机器人用户名（不需要 @，例如：qqfile_bot）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s59')
             ),
             "remove_bot_interval": (
                 "remove_bot_interval:bot",
-                "⏱️ 删除 Bot 解码间隔限流\n\n请输入要删除限流的机器人用户名（例如：qqfile_bot）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s60')
             ),
             # 用户管理
             "user_detail": (
                 "user_detail:id",
-                "👤 查询用户\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s61')
             ),
             "set_level": (
                 "set_level:user_id",
-                "🏅 设置会员等级\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s62')
             ),
             "ban": (
                 "ban:user_id",
-                "🔒 封禁用户\n\n请输入要封禁的用户ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s63')
             ),
             "unban": (
                 "unban:user_id",
-                "🔓 解封用户\n\n请输入要解封的用户ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s64')
             ),
             "set_quota": (
                 "set_quota:user_id",
-                "📤 设置解码配额\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s65')
             ),
             "set_external_quota": (
                 "set_external_quota:user_id",
-                "🌐 设置外部码配额\n\n请输入用户ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s66')
             ),
             # 文件管理
             "file_detail": (
                 "file_detail:code",
-                "🔍 查询文件\n\n请输入文件码：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s67')
             ),
             "delete_file": (
                 "delete_file:code",
-                "🗑️ 删除文件\n\n请输入要删除的文件码：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s68')
             ),
             # 中继
             "relay_code": (
                 "relay_code:code",
-                "🔑 提交验证码\n\n请输入 Telegram 发送的 6 位验证码：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s69')
             ),
             "relay_add": (
                 "relay_add:phone",
-                "➕ 添加中继账号\n\n请输入手机号(含区号,如 +8613800138000)：\n\n登录流程:输入手机号 → 收到验证码 → 输入验证码 → 如有二步验证则输入密码 → 成功后写入\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s70')
             ),
             "relay_password": (
                 "relay_password:password",
-                "🔒 提交二步验证密码\n\n请输入该中继账号的二步验证密码：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s71')
             ),
             "relay_remove": (
                 "relay_remove:phone",
-                "➖ 移除中继账号\n\n请输入要移除的中继账号手机号(含区号)：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s72')
             ),
             "collector_wl_add": (
                 "collector_wl_add:user_id",
-                "➕ 添加采集器白名单\n\n请输入 Telegram 用户ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s73')
             ),
             "collector_wl_remove": (
                 "collector_wl_remove:user_id",
-                "➖ 移除采集器白名单\n\n请输入要移除的 Telegram 用户ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s74')
             ),
             "set_access_limit": (
                 "set_access_limit:code",
-                "🔢 设置访问次数限制\n\n请输入文件码：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s75')
             ),
             "cell_add": (
                 "cell_add:slot_id",
-                "➕ 添加频道槽位\n\n请输入槽位ID(如 a3、s3a)：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s76')
             ),
             "cell_remove": (
                 "cell_remove:slot_id",
-                "➖ 移除频道槽位\n\n请输入要移除的槽位ID(如 s3a)：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s77')
             ),
             # 系统配置
             "set_file_prefix": (
                 "set_file_prefix:prefix",
-                "📝 设置文件码前缀\n\n请输入新的文件码前缀（例如：tgwenjian）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s78')
             ),
             "set_force_join": (
                 "set_force_join:channel_id",
-                "🔒 设置强制加群频道\n\n请输入频道ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s79')
             ),
             "set_username": (
                 "set_username:role",
-                "👤 设置机器人用户名\n\n请输入角色（upload / decoder / sender）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s80')
             ),
             "set_quota_default": (
                 "set_quota_default:level",
-                "🎫 设置默认配额\n\n请输入会员等级（1=免费 / 2=基础 / 3=高级）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s81')
             ),
             "set_r2": (
                 "set_r2:account_id",
-                "☁️ 配置 R2 备份\n\n第一步：请输入 R2 账号ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s82')
             ),
             "set_db_backup": (
                 "set_db_backup:interval",
-                "💾 配置 DB 自动备份\n\n请输入备份间隔（分钟）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s83')
             ),
             # 备用池
             "spare_add": (
                 "spare_add:channel_id",
-                "🔄 添加备用频道\n\n请输入频道ID（数字）：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s84')
             ),
             "spare_remove": (
                 "spare_remove:channel_id",
-                "🔄 移除备用频道\n\n请输入要移除的频道ID：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s85')
             ),
             # 轮转配置
             "rotation_set": (
                 "rotation_set:key",
-                "⏳ 设置轮转参数\n\n请选择参数：\n"
-                "  active_window_size — 活跃窗口大小（每组几个活跃频道）\n"
-                "  files_per_slot — 每频道文件数后切换\n"
-                "  time_per_slot — 每频道活跃时间（秒）后切换\n\n"
-                "请输入参数名：\n\n❌ 如需取消请点击下方按钮。"
+                _i18n_t('bot.admin_bot.callback.s86')
             ),
         }
 
@@ -350,7 +339,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             state, prompt = entry
             await _conv_start(update, context, state, prompt)
         else:
-            await query.edit_message_text(f"❌ 未知操作：{action}", reply_markup=back_kb)
+            await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s87', action=action), reply_markup=back_kb)
 
     # ─── 举报处理 ──────────────────────────────────────────────
     elif data.startswith("report:"):
@@ -359,7 +348,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "conv:cancel":
         await _conv_end(context)
         await query.edit_message_text(
-            "❌ 操作已取消。",
+            _i18n_t('bot.admin_bot.callback.s88'),
             reply_markup=back_kb,
         )
 
@@ -383,12 +372,12 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     user = update.effective_user
     if not user or user.id != AUTHORIZED_USER_ID:
-        await query.answer("⛔ 无权限", show_alert=True)
+        await query.answer(_i18n_t('bot.admin_bot.callback.s6'), show_alert=True)
         return
 
     if data == "report:ignore":
         await query.edit_message_text(
-            query.message.text + "\n\n✅ 已忽略",
+            query.message.text + _i18n_t('bot.admin_bot.callback.s20'),
             reply_markup=None,
         )
         return
@@ -406,7 +395,7 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         if action == "report:ban":
             if len(parts) < 2:
-                await query.answer("参数缺失", show_alert=True)
+                await query.answer(_i18n_t('bot.admin_bot.callback.s23'), show_alert=True)
                 return
             uid = int(parts[1])
             await update_user_and_invalidate(uid, {
@@ -425,11 +414,11 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             )
             # 通知举报人
             if reporter_id_str and source_bot:
-                await _notify_reporter(reporter_id_str, source_bot, "您的举报已受理生效，违规用户已被封禁。")
+                await _notify_reporter(reporter_id_str, source_bot, _i18n_t('bot.admin_bot.callback.s24'))
 
         elif action == "report:detach":
             if len(parts) < 2:
-                await query.answer("参数缺失", show_alert=True)
+                await query.answer(_i18n_t('bot.admin_bot.callback.s26'), show_alert=True)
                 return
             file_code = parts[1]
             # PRE-06: 用 update_file_record_and_invalidate 一次性双写 CRDB+SQLite 并失效内存缓存
@@ -451,11 +440,11 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             )
             # 通知举报人
             if reporter_id_str and source_bot:
-                await _notify_reporter(reporter_id_str, source_bot, "您的举报已受理生效，文件已经移除。")
+                await _notify_reporter(reporter_id_str, source_bot, _i18n_t('bot.admin_bot.callback.s27'))
 
         elif action == "report:block":
             if len(parts) < 3:
-                await query.answer("参数缺失", show_alert=True)
+                await query.answer(_i18n_t('bot.admin_bot.callback.s30'), show_alert=True)
                 return
             file_code = parts[1]
             reporter_id = int(parts[2])
@@ -517,29 +506,29 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     user = update.effective_user
     if not user or user.id != AUTHORIZED_USER_ID:
-        await query.answer("⛔ 无权限", show_alert=True)
+        await query.answer(_i18n_t('bot.admin_bot.callback.s7'), show_alert=True)
         return
 
     back_kb = InlineKeyboardMarkup(BACK_BTN)
 
     if data == "restore:cancel":
-        await query.edit_message_text("❌ 恢复操作已取消。", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s8'), reply_markup=back_kb)
         return
 
     # restore:confirm|<seq>|<0或1>|table:xxx,yyy  (merge标志和table部分均可选)
     if not data.startswith("restore:confirm|"):
-        await query.edit_message_text("❌ 未知恢复操作", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s9'), reply_markup=back_kb)
         return
 
     parts = data.split("|")
     if len(parts) < 2:
-        await query.edit_message_text("❌ 参数缺失", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s10'), reply_markup=back_kb)
         return
 
     try:
         seq = int(parts[1])
     except ValueError:
-        await query.edit_message_text("❌ 序号无效", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s21'), reply_markup=back_kb)
         return
 
     # 解析 merge 标志(parts[2],0 或 1)和 table 列表(parts[3],可选)
@@ -552,18 +541,18 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
         tables = [t.strip() for t in parts[3][len("table:"):].split(",") if t.strip()]
 
     # 先给用户一个"正在恢复"的反馈
-    mode_label = "增量补充" if merge else "覆盖恢复"
-    await query.edit_message_text(f"⏳ 正在提交{mode_label}恢复请求,请稍候...")
+    mode_label = _i18n_t('bot.admin_bot.callback.s1') if merge else _i18n_t('bot.admin_bot.callback.s2')
+    await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s3', mode_label=mode_label))
 
     from services.db_backup import list_backups
     try:
         backups = await list_backups()
     except Exception as e:
-        await query.edit_message_text(f"❌ 读取备份列表失败: {e}", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s22', e=e), reply_markup=back_kb)
         return
 
     if not backups or seq < 1 or seq > len(backups):
-        await query.edit_message_text("❌ 备份序号无效", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s11'), reply_markup=back_kb)
         return
 
     key = backups[seq - 1].get("key", "")
@@ -592,11 +581,7 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
     if result.approval_required:
         # 灾备恢复必须审批,告知用户审批 ID
         await query.edit_message_text(
-            f"⏳ {mode_label}恢复已提交审批,审批通过后自动执行\n\n"
-            f"审批 ID: {result.approval_id}\n"
-            f"备份文件: `{key}`\n"
-            f"恢复模式: {mode_label}\n"
-            f"操作者: {user.id}",
+            _i18n_t('bot.admin_bot.callback.s12', mode_label=mode_label, result_approval_id=result.approval_id, key=key, mode_label_4=mode_label, user_id=user.id),
             reply_markup=back_kb,
         )
         return
@@ -604,12 +589,12 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
     if result.success:
         # 不应到达此处(restore_backup 必须审批),但保持健壮性
         await query.edit_message_text(
-            f"✅ 恢复已执行\n\n备份文件: `{key}`",
+            _i18n_t('bot.admin_bot.callback.s13', key=key),
             reply_markup=back_kb,
         )
     else:
         await query.edit_message_text(
-            f"❌ 提交恢复审批失败: {result.error}\n\n备份文件: `{key}`",
+            _i18n_t('bot.admin_bot.callback.s14', result_error=result.error, key=key),
             reply_markup=back_kb,
         )
 
@@ -621,19 +606,19 @@ async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     user = update.effective_user
     if not user or user.id != AUTHORIZED_USER_ID:
-        await query.answer("⛔ 无权限", show_alert=True)
+        await query.answer(_i18n_t('bot.admin_bot.callback.s15'), show_alert=True)
         return
 
     back_kb = InlineKeyboardMarkup(BACK_BTN)
 
     if data.startswith("delfile_cancel|"):
-        await query.edit_message_text("❌ 删除操作已取消。", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s16'), reply_markup=back_kb)
         return
 
     # delfile|{file_code}
     parts = data.split("|", 1)
     if len(parts) < 2:
-        await query.edit_message_text("❌ 参数缺失", reply_markup=back_kb)
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s17'), reply_markup=back_kb)
         return
     file_code = parts[1]
 
@@ -648,14 +633,13 @@ async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAU
 
     if cb_result.approval_required:
         await query.edit_message_text(
-            f"⏳ 文件删除请求已提交审批\n审批 ID: {cb_result.approval_id}\n"
-            f"文件码: {file_code}\n审批通过后自动执行。",
+            _i18n_t('bot.admin_bot.callback.s18', cb_result_approval_id=cb_result.approval_id, file_code=file_code),
             reply_markup=back_kb,
         )
         return
     if not cb_result.success:
         await query.edit_message_text(
-            f"❌ 删除失败: {cb_result.error}",
+            _i18n_t('bot.admin_bot.callback.s19', cb_result_error=cb_result.error),
             reply_markup=back_kb,
         )
         return
@@ -664,4 +648,4 @@ async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAU
         invalidate_file_record(file_code)
     except Exception:
         pass
-    await query.edit_message_text(f"✅ 文件 {file_code} 已删除", reply_markup=back_kb)
+    await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s4', file_code=file_code), reply_markup=back_kb)

@@ -5,17 +5,17 @@
 
 {% block content %}
 <div class="section">
-    <h2>通知列表</h2>
+    <h2>{{ t("ui.admin.notifications.s1") }}</h2>
     <table>
-        <caption>系统通知记录</caption>
+        <caption>{{ t("ui.admin.notifications.s2") }}</caption>
         <thead>
             <tr>
-                <th>通知ID</th>
-                <th>接收用户</th>
-                <th>类型</th>
-                <th>内容</th>
-                <th>已读</th>
-                <th>创建时间</th>
+                <th>{{ t("ui.admin.notifications.s3") }}</th>
+                <th>{{ t("ui.admin.notifications.s4") }}</th>
+                <th>{{ t("ui.admin.notifications.s5") }}</th>
+                <th>{{ t("ui.admin.notifications.s6") }}</th>
+                <th>{{ t("ui.admin.notifications.s7") }}</th>
+                <th>{{ t("ui.admin.notifications.s8") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -27,15 +27,15 @@
                 <td>{{ n.get('payload', '') }}</td>
                 <td>
                     {% if n.get('is_read') %}
-                    <span class="tag tag-blue">已读</span>
+                    <span class="tag tag-blue">{{ t("ui.admin.notifications.s9") }}</span>
                     {% else %}
-                    <span class="tag tag-orange">未读</span>
+                    <span class="tag tag-orange">{{ t("ui.admin.notifications.s10") }}</span>
                     {% endif %}
                 </td>
                 <td>{{ n.get('created_at', 'N/A') }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="6" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="6" class="empty-state">{{ t("ui.admin.notifications.s11") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>

@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from services.i18n import translate as _i18n_t
 
 
 class ReplicationPolicy(str, Enum):
@@ -34,13 +35,13 @@ class ReplicationPolicy(str, Enum):
     """
 
     CRDB = "crdb"
-    """需要同步到 CockroachDB 的权威业务表。"""
+    _i18n_t('services.replication_policy.s1')
 
     LOCAL_ONLY = "local_only"
-    """仅存在于 SQLite 本地,不同步到 CRDB。"""
+    _i18n_t('services.replication_policy.s2')
 
     ARCHIVE_ONLY = "archive_only"
-    """冷归档表,不进 CRDB,由独立 backup job 归档到 R2 / 外部存储。"""
+    _i18n_t('services.replication_policy.s3')
 
 
 # R41 P0-6: 表级复制策略声明表
@@ -335,14 +336,14 @@ def _validate_backup_replication_consistency() -> dict:
     details_parts: list[str] = []
     if no_export_conflicts:
         details_parts.append(
-            f"严重冲突 NO_EXPORT_PLAINTEXT + CRDB: {sorted(no_export_conflicts)}"
+            _i18n_t('services.replication_policy.s4', sorted_no_export_conflicts=sorted(no_export_conflicts))
         )
     if local_only_crdb_conflicts:
         details_parts.append(
-            f"警告 LOCAL_ONLY backup + CRDB: {sorted(local_only_crdb_conflicts)}"
+            _i18n_t('services.replication_policy.s5', sorted_local_only_crdb_conflicts=sorted(local_only_crdb_conflicts))
         )
     if not details_parts:
-        details_parts.append("backup_policy 与 replication_policy 无冲突")
+        details_parts.append(_i18n_t('services.replication_policy.s6'))
 
     result = {
         "is_valid": is_valid,
@@ -354,9 +355,7 @@ def _validate_backup_replication_consistency() -> dict:
     # 严重冲突抛 ValueError(阻止启动 / CI 失败)
     if not is_valid:
         raise ValueError(
-            f"R42 P1-7: backup_policy 与 replication_policy 冲突 — "
-            f"NO_EXPORT_PLAINTEXT 表不能是 CRDB 同步表: "
-            f"{sorted(no_export_conflicts)}"
+            _i18n_t('services.replication_policy.s7', sorted_no_export_conflicts=sorted(no_export_conflicts))
         )
 
     return result

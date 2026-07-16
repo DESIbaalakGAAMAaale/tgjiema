@@ -47,6 +47,7 @@ from services.command_bus import (
     mark_approved_executed,
     mark_approved_failed,
 )
+from services.i18n import translate as _i18n_t
 
 
 # ─── R45 第 16 节: 安全动作白名单 ──────────────────────────────
@@ -64,12 +65,12 @@ SAFE_ACTIONS: frozenset[str] = frozenset({
 
 # 动作描述(用于审计日志和用户提示)
 _ACTION_DESCRIPTIONS: dict[str, str] = {
-    "retry_outbox": "重试 dirty_outbox 记录",
-    "skip_outbox": "跳过 dirty_outbox 记录",
-    "replay_dlq": "重放死信队列消息",
-    "retry_replication": "重试副本复制任务",
-    "repair_relay": "修复 relay 账号状态",
-    "mark_outbox_skipped": "跳过通知投递",
+    "retry_outbox": _i18n_t('services.repair_console.s1'),
+    "skip_outbox": _i18n_t('services.repair_console.s2'),
+    "replay_dlq": _i18n_t('services.repair_console.s3'),
+    "retry_replication": _i18n_t('services.repair_console.s4'),
+    "repair_relay": _i18n_t('services.repair_console.s5'),
+    "mark_outbox_skipped": _i18n_t('services.repair_console.s6'),
 }
 
 # R51 P1-5: 动作风险等级映射
@@ -792,11 +793,11 @@ async def execute_repair(
         await _write_repair_audit(
             principal_id=principal_id,
             action=f"repair_rejected_{action}",
-            details=f"非白名单动作: {action}",
+            details=_i18n_t('services.repair_console.s17', action=action),
             approval_action_id=approval_action_id,
         )
         raise ValueError(
-            f"动作 '{action}' 不在白名单中,禁止执行(安全铁律)"
+            _i18n_t('services.repair_console.s10', action=action)
         )
 
     # 2. R51 P1-5: 风险等级判定 + 高风险强制审批
@@ -811,9 +812,7 @@ async def execute_repair(
                 principal_id=principal_id,
                 action=f"repair_rejected_{action}",
                 details=(
-                    f"高风险动作缺少 approval_action_id; "
-                    f"params_hash={compute_payload_hash(params)}; "
-                    f"expected_request_hash={expected_hash}"
+                    _i18n_t('services.repair_console.s19', compute_payload_hash_params=compute_payload_hash(params), expected_hash=expected_hash)
                 ),
                 approval_action_id="",
             )
@@ -846,8 +845,7 @@ async def execute_repair(
                 principal_id=principal_id,
                 action=f"repair_rejected_{action}",
                 details=(
-                    f"审批未通过: approval_action_id={approval_action_id}; "
-                    f"expected_hash={expected_hash}"
+                    _i18n_t('services.repair_console.s20', approval_action_id=approval_action_id, expected_hash=expected_hash)
                 ),
                 approval_action_id=approval_action_id,
             )
@@ -905,25 +903,25 @@ async def execute_repair(
         if action == "retry_outbox":
             ids = [int(i) for i in params.get("ids", []) if i]
             affected_count = await retry_outbox(ids)
-            message = f"重试 {affected_count} 条 dirty_outbox 记录"
+            message = _i18n_t('services.repair_console.s11', affected_count=affected_count)
         elif action == "skip_outbox":
             ids = [int(i) for i in params.get("ids", []) if i]
             reason = str(params.get("reason", ""))
             affected_count = await skip_outbox(ids, reason=reason)
-            message = f"跳过 {affected_count} 条 dirty_outbox 记录"
+            message = _i18n_t('services.repair_console.s14', affected_count=affected_count)
         elif action == "replay_dlq":
             ids = [int(i) for i in params.get("ids", []) if i]
             affected_count = await replay_dlq(ids)
-            message = f"重放 {affected_count} 条死信消息"
+            message = _i18n_t('services.repair_console.s18', affected_count=affected_count)
         elif action == "retry_replication":
             task_ids = [int(i) for i in params.get("task_ids", []) if i]
             affected_count = await retry_replication(task_ids)
-            message = f"重试 {affected_count} 个副本复制任务"
+            message = _i18n_t('services.repair_console.s21', affected_count=affected_count)
         elif action == "repair_relay":
             account_id = int(params.get("account_id", 0))
             ok = await repair_relay(account_id)
             affected_count = 1 if ok else 0
-            message = f"修复 relay 账号 {account_id}: {'成功' if ok else '失败'}"
+            message = _i18n_t('services.repair_console.s23', account_id=account_id, if_ok_else='成功' if ok else '失败')
         elif action == "mark_outbox_skipped":
             # notification_outbox 跳过(委托给 notifications.py)
             from services import notifications
@@ -931,7 +929,7 @@ async def execute_repair(
             reason = str(params.get("reason", ""))
             ok = await notifications.mark_outbox_skipped(outbox_id, reason=reason)
             affected_count = 1 if ok else 0
-            message = f"跳过 notification_outbox {outbox_id}: {'成功' if ok else '失败'}"
+            message = _i18n_t('services.repair_console.s24', outbox_id=outbox_id, if_ok_else='成功' if ok else '失败')
         else:
             # 理论上不会到达(白名单已校验)
             raise ValueError(f"未实现的动作: {action}")
@@ -957,14 +955,14 @@ async def execute_repair(
         audit_id = await _write_repair_audit(
             principal_id=principal_id,
             action=f"repair_failed_{action}",
-            details=f"动作执行失败: {e}; params_hash={compute_payload_hash(params)}",
+            details=_i18n_t('services.repair_console.s22', e=e, compute_payload_hash_params=compute_payload_hash(params)),
             approval_action_id=approval_action_id,
         )
         return {
             "success": False,
             "action": action,
             "affected_count": 0,
-            "message": f"执行失败: {e}",
+            "message": _i18n_t('services.repair_console.s15', e=e),
             "audit_log_id": audit_id,
             "approval_verified": approval_verified,
         }
@@ -1346,17 +1344,17 @@ def format_causal_chain(chain: dict) -> str:
         多行纯文本(避免 Telegram markdown 解析问题)
     """
     if not chain or not chain.get("events"):
-        return f"trace_id={chain.get('trace_id', '')} 无关联事件"
+        return _i18n_t('services.repair_console.s7', chain_get_trace_id=chain.get('trace_id', ''))
     lines = [
-        f"🔍 因果链追踪 trace_id={chain.get('trace_id', '')}",
-        f"共 {chain.get('total', 0)} 条事件:",
+        _i18n_t('services.repair_console.s8', chain_get_trace_id=chain.get('trace_id', '')),
+        _i18n_t('services.repair_console.s9', chain_get_total_0=chain.get('total', 0)),
         "",
     ]
     for i, event in enumerate(chain["events"], 1):
         lines.append(f"{i}. [{event.get('source', '')}] {event.get('action', '')}")
-        lines.append(f"   时间: {event.get('timestamp', '')}")
-        lines.append(f"   摘要: {event.get('summary', '')}")
+        lines.append(_i18n_t('services.repair_console.s12', event_get_timestamp=event.get('timestamp', '')))
+        lines.append(_i18n_t('services.repair_console.s13', event_get_summary=event.get('summary', '')))
         if event.get("actor_id"):
-            lines.append(f"   操作者: {event.get('actor_id')}")
+            lines.append(_i18n_t('services.repair_console.s16', event_get_actor_id=event.get('actor_id')))
         lines.append("")
     return "\n".join(lines)

@@ -19,6 +19,7 @@ from telethon.errors import SessionPasswordNeededError, FloodWaitError
 from config import settings
 # R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 _SETTLE_WAIT = 1.5
 _INITIAL_SETTLE_WAIT = 3
@@ -493,7 +494,7 @@ class RelayInstance:
             return
         await self._transition_spool_safe(
             code, "UP_DURABLE_ACK",
-            reason=f"Up 返回 upload_id={upload_id}",
+            reason=_i18n_t('services.relay_instance.s27', upload_id=upload_id),
             upload_id=upload_id,
         )
         logger.info(
@@ -537,7 +538,7 @@ class RelayInstance:
                 try:
                     await self._client.sign_in(password=password)
                 except Exception as e:
-                    raise RuntimeError(f"二步验证密码错误或登录失败: {e}")
+                    raise RuntimeError(_i18n_t('services.relay_instance.s40', e=e))
 
         me = await self._client.get_me()
         self._relay_user_id = me.id
@@ -846,7 +847,7 @@ class RelayInstance:
                 f"[RelayInstance:{self.phone}] Up Bot 不可用,文件保留在 spool 中 "
                 f"(code={code}, pending={len(pending)}, downloads={len(downloads)})"
             )
-            await self._transition_spool_safe(code, "BUFFERED", reason="Up Bot 不可用,文件保留")
+            await self._transition_spool_safe(code, "BUFFERED", reason=_i18n_t('services.relay_instance.s29'))
             return
         _code_hex = code.encode('utf-8').hex()
         # 找到第一个非空 orig_caption(pending 和 downloads 都检查)
@@ -868,13 +869,13 @@ class RelayInstance:
                          if item["msg"].media and not isinstance(item["msg"].media, MessageMediaWebPage)]
             if media_list:
                 # R35 P0-4 §25: 推进 spool 状态 FORWARDING(正在转发)
-                await self._transition_spool_safe(code, "FORWARDING", reason="引用批量发送")
-                sent = await self._send_batch_as_album(media_list, first_caption, code, "引用")
+                await self._transition_spool_safe(code, "FORWARDING", reason=_i18n_t('services.relay_instance.s34'))
+                sent = await self._send_batch_as_album(media_list, first_caption, code, _i18n_t('services.relay_instance.s30'))
                 if sent:
                     # H6: Up Bot 接收成功,推进 FORWARDED_TO_UP(不是 ACKED!)
                     # 临时文件不删除,等待 Up 返回 upload_id(UP_DURABLE_ACK)
                     # 和 Idx READY(INDEXED)后由恢复循环清理临时文件
-                    await self._transition_spool_safe(code, "FORWARDED_TO_UP", reason="引用发送成功,等待 Up 持久化确认")
+                    await self._transition_spool_safe(code, "FORWARDED_TO_UP", reason=_i18n_t('services.relay_instance.s41'))
                     # 不删除临时文件! 不弹出 spool_id 映射!
                     return
                 # 引用发送失败(可能是 protected chat),下载所有 pending 到临时文件
@@ -889,12 +890,12 @@ class RelayInstance:
         if downloads:
             path_list = [item["path"] for item in downloads]
             # R35 P0-4 §25: 推进 spool 状态 FORWARDING(正在转发)
-            await self._transition_spool_safe(code, "FORWARDING", reason="临时文件批量发送")
-            await self._send_batch_as_album(path_list, first_caption, code, "临时文件")
+            await self._transition_spool_safe(code, "FORWARDING", reason=_i18n_t('services.relay_instance.s31'))
+            await self._send_batch_as_album(path_list, first_caption, code, _i18n_t('services.relay_instance.s28'))
             # H6: Up Bot 接收成功,推进 FORWARDED_TO_UP(不是 ACKED!)
             # 临时文件不删除,等待 Up 返回 upload_id(UP_DURABLE_ACK)
             # 和 Idx READY(INDEXED)后由恢复循环清理临时文件
-            await self._transition_spool_safe(code, "FORWARDED_TO_UP", reason="临时文件发送成功,等待 Up 持久化确认")
+            await self._transition_spool_safe(code, "FORWARDED_TO_UP", reason=_i18n_t('services.relay_instance.s32'))
             # 不删除临时文件! 不弹出 spool_id 映射!
 
     async def _send_batch_as_album(self, media_list: list, first_caption: str, code: str, mode: str) -> bool:
@@ -995,14 +996,14 @@ class RelayInstance:
         return None
 
     _RATE_LIMIT_PATTERNS = [
-        (re.compile(r"(?:请|等待?|需\s*要?)\s*(\d+)\s*秒"), 1),
-        (re.compile(r"(\d+)\s*秒\s*(?:后|再|之?后)"), 1),
+        (re.compile(_i18n_t('services.relay_instance.s21')), 1),
+        (re.compile(_i18n_t('services.relay_instance.s22')), 1),
         (re.compile(r"wait\s+(\d+)\s*sec(?:ond)?s?", re.IGNORECASE), 1),
         (re.compile(r"try\s+again\s+(?:in|after)\s+(\d+)\s*sec(?:ond)?s?", re.IGNORECASE), 1),
         (re.compile(r"(\d+)\s*sec(?:ond)?s?\s*(?:later|after)", re.IGNORECASE), 1),
-        (re.compile(r"(?:频率|操作)\s*(?:过快|频繁|过于频繁)"), None),
+        (re.compile(_i18n_t('services.relay_instance.s23')), None),
         (re.compile(r"too\s+(?:fast|frequent|many\s+requests)", re.IGNORECASE), None),
-        (re.compile(r"(?:请稍[候后]|稍[候后]再试|请勿频繁)"), None),
+        (re.compile(_i18n_t('services.relay_instance.s24')), None),
         (re.compile(r"flood\s*wait", re.IGNORECASE), None),
     ]
 
@@ -1092,7 +1093,7 @@ class RelayInstance:
                 text = getattr(event.message, "message", None) or ""
                 for code, ev in list(self._ready_events.items()):
                     # 精确匹配：code 作为独立词出现（前后为空格/冒号/行首尾）
-                    if re.search(rf"(?:^|\s|:|：){re.escape(code)}(?:\s|$|，|。)", text) and ("已就绪" in text or "ready" in text.lower()):
+                    if re.search(rf"(?:^|\s|:|：){re.escape(code)}(?:\s|$|，|。)", text) and (_i18n_t('services.relay_instance.s42') in text or "ready" in text.lower()):
                         if not ev.is_set():
                             ev.set()
                             logger.info(f"[RelayInstance:{self.phone}] idx_bot 已确认外部文件就绪: code={code}")
@@ -1358,7 +1359,7 @@ class RelayInstance:
                             try:
                                 await self._client.send_message(
                                     self._decoder_bot_entity,
-                                    f"RELAY_ERROR:{user_id}:{code}:目标Bot连续限速熔断{break_remaining:.0f}s",
+                                    _i18n_t('services.relay_instance.s44', user_id=user_id, code=code, break_remaining=break_remaining),
                                 )
                             except Exception:
                                 pass
@@ -1420,35 +1421,35 @@ class RelayInstance:
                 self._bot_exchange[bot_username]["_ai_running"] = False
 
     def _make_decision(self, exchange: dict) -> dict:
-        _NEXT_KW = ("next", "下一页", "下一頁", "下一组",
+        _NEXT_KW = ("next", _i18n_t('services.relay_instance.s1'), _i18n_t('services.relay_instance.s2'), _i18n_t('services.relay_instance.s3'),
                      "→", "▶", "➡", ">>", "»")
         # "继续发送"类按钮:可重复点击,每次加载更多内容(不受 _clicked_buttons 跳过限制)
         # 靠 stale_clicks >= 3 机制防止死循环(连续3次无新文件则终止)
-        _CONTINUE_KW = ("继续发送", "继续", "更多", "加载更多", "继续接收",
+        _CONTINUE_KW = (_i18n_t('services.relay_instance.s4'), _i18n_t('services.relay_instance.s5'), _i18n_t('services.relay_instance.s6'), _i18n_t('services.relay_instance.s7'), _i18n_t('services.relay_instance.s8'),
                         "continue", "more", "load more", "show more", "send more")
-        _PREV_KW = ("prev", "上一页", "上一頁", "上一组", "上一組", "←", "◀", "⬅", "<<", "«", "back", "返回")
-        _ERROR_KW = ("未找到", "已过期", "已失效",
-                     "不存在", "not found", "expired", "invalid")
-        _FINISH_KW = {"finish", "done", "完成", "结束"}
+        _PREV_KW = ("prev", _i18n_t('services.relay_instance.s9'), _i18n_t('services.relay_instance.s10'), _i18n_t('services.relay_instance.s11'), _i18n_t('services.relay_instance.s12'), "←", "◀", "⬅", "<<", "«", "back", _i18n_t('services.relay_instance.s13'))
+        _ERROR_KW = (_i18n_t('services.relay_instance.s14'), _i18n_t('services.relay_instance.s15'), _i18n_t('services.relay_instance.s16'),
+                     _i18n_t('services.relay_instance.s17'), "not found", "expired", "invalid")
+        _FINISH_KW = {"finish", "done", _i18n_t('services.relay_instance.s18'), _i18n_t('services.relay_instance.s19')}
 
         msg_events = exchange.get("events", [])
         if not msg_events:
             return {"action": "finish", "target_button_row": None, "target_button_col": None,
-                    "target_button_text": None, "reason": "无消息", "wait_seconds": None}
+                    "target_button_text": None, "reason": _i18n_t('services.relay_instance.s25'), "wait_seconds": None}
 
         for ev in msg_events:
             text = (getattr(ev.message, "message", None) or "").lower()
             for ek in _ERROR_KW:
                 if ek in text:
                     return {"action": "error", "target_button_row": None, "target_button_col": None,
-                            "target_button_text": None, "reason": f"检测到错误: {ek}",
+                            "target_button_text": None, "reason": _i18n_t('services.relay_instance.s33', ek=ek),
                             "wait_seconds": None}
 
         wait_sec = self._check_rate_limit(exchange)
         if wait_sec > 0:
             return {"action": "wait", "target_button_row": None, "target_button_col": None,
                     "target_button_text": None,
-                    "reason": "检测到限速", "wait_seconds": wait_sec}
+                    "reason": _i18n_t('services.relay_instance.s26'), "wait_seconds": wait_sec}
 
         clicked = exchange.get("_clicked_buttons") or set()
         for ev in msg_events:
@@ -1464,7 +1465,7 @@ class RelayInstance:
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": col_idx,
                                 "target_button_text": getattr(btn, "text", None) or "",
-                                "reason": f"检测到继续发送按钮: {btn_text}",
+                                "reason": _i18n_t('services.relay_instance.s35', btn_text=btn_text),
                                 "wait_seconds": None}
             # 1. 查找"下一页"按钮(可重复点击,每次加载新页面,不跳过已点击位置)
             # 防死循环靠 stale_clicks >= 3 机制(连续3次翻页无新文件则终止)
@@ -1475,7 +1476,7 @@ class RelayInstance:
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": col_idx,
                                 "target_button_text": getattr(btn, "text", None) or "",
-                                "reason": f"检测到翻页按钮: {btn_text}",
+                                "reason": _i18n_t('services.relay_instance.s36', btn_text=btn_text),
                                 "wait_seconds": None}
             # 2. 数字翻页（需要单行至少3个数字按钮）
             for row_idx, row in enumerate(rows):
@@ -1506,7 +1507,7 @@ class RelayInstance:
                             exchange["_last_clicked_number"] = target
                             return {"action": "click_button", "target_button_row": row_idx,
                                     "target_button_col": col_idx, "target_button_text": t,
-                                    "reason": f"数字翻页第{target}页",
+                                    "reason": _i18n_t('services.relay_instance.s43', target=target),
                                     "wait_seconds": None}
                     break
             # 3. 纯图标按钮（最后一行全空文本）
@@ -1522,7 +1523,7 @@ class RelayInstance:
                             continue
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": len(row.buttons) - 1, "target_button_text": "",
-                                "reason": "纯图标", "wait_seconds": None}
+                                "reason": _i18n_t('services.relay_instance.s37'), "wait_seconds": None}
             # 4. 兜底：点击未点击过的按钮（排除"上一页"和"完成"）
             for row_idx, row in enumerate(rows):
                 for col_idx, btn in enumerate(row.buttons):
@@ -1538,10 +1539,10 @@ class RelayInstance:
                         return {"action": "click_button", "target_button_row": row_idx,
                                 "target_button_col": col_idx,
                                 "target_button_text": getattr(btn, "text", None) or "",
-                                "reason": f"尝试点击: {btn_text}",
+                                "reason": _i18n_t('services.relay_instance.s38', btn_text=btn_text),
                                 "wait_seconds": None}
         return {"action": "finish", "target_button_row": None, "target_button_col": None,
-                "target_button_text": None, "reason": "无翻页按钮",
+                "target_button_text": None, "reason": _i18n_t('services.relay_instance.s20'),
                 "wait_seconds": None}
 
     async def _click_button(self, bot_username: str, row: int, col: int) -> bool:
@@ -1638,7 +1639,7 @@ class RelayInstance:
                 try:
                     await self._client.send_message(
                         self._decoder_bot_entity,
-                        f"RELAY_ERROR:{user_id}:{code}:目标机器人未返回任何文件",
+                        _i18n_t('services.relay_instance.s39', user_id=user_id, code=code),
                     )
                 except Exception as notify_err:
                     logger.warning(

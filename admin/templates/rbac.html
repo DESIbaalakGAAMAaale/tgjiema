@@ -5,16 +5,16 @@
 
 {% block content %}
 <div class="section">
-    <h2>角色列表</h2>
+    <h2>{{ t("ui.admin.rbac.s1") }}</h2>
     <table>
-        <caption>已定义角色及其权限</caption>
+        <caption>{{ t("ui.admin.rbac.s2") }}</caption>
         <thead>
             <tr>
-                <th>角色ID</th>
-                <th>名称</th>
-                <th>描述</th>
-                <th>权限</th>
-                <th>创建时间</th>
+                <th>{{ t("ui.admin.rbac.s3") }}</th>
+                <th>{{ t("ui.admin.rbac.s4") }}</th>
+                <th>{{ t("ui.admin.rbac.s5") }}</th>
+                <th>{{ t("ui.admin.rbac.s6") }}</th>
+                <th>{{ t("ui.admin.rbac.s7") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -27,19 +27,19 @@
                 <td>{{ role.get('created_at', 'N/A') }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="5" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="5" class="empty-state">{{ t("ui.admin.rbac.s8") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>
 </div>
 <div class="section">
-    <h2>权限定义</h2>
+    <h2>{{ t("ui.admin.rbac.s9") }}</h2>
     <table>
-        <caption>系统已注册的权限标识</caption>
+        <caption>{{ t("ui.admin.rbac.s10") }}</caption>
         <thead>
             <tr>
-                <th>权限标识</th>
-                <th>描述</th>
+                <th>{{ t("ui.admin.rbac.s11") }}</th>
+                <th>{{ t("ui.admin.rbac.s12") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -49,7 +49,7 @@
                 <td>{{ perm.get('description', '') if perm is mapping else '' }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="2" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="2" class="empty-state">{{ t("ui.admin.rbac.s13") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>

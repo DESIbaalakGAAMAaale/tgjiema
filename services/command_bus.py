@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 
 # ─── 命令权限标识 ─────────────────────────────────────────────
@@ -221,28 +222,30 @@ async def get_command_status(action_id: str) -> str | None:
 async def claim_execution_approved(
     action_id: str,
     owner: str,
-    request_hash: str | None = None,
+    request_hash: str = "",
     lease_seconds: int = 60,
 ) -> bool:
-    """R52 P0-5: CAS 认领 — 将 status='approved' 转为 'executing'。
+    """R52 P0-5 + R55 P0-2: CAS 认领 — 将 status='approved' 转为 'executing'。
 
     统一高风险动作执行入口,Repair/Maintenance/Restore 共用此函数:
     - 执行前必须验证 approved 状态(避免"执行前已执行"语义冲突)
     - CAS UPDATE 保证只有一个 worker 能进入 executing
     - 失败时由调用方决定是否重试(approved 状态未改变,可再次尝试)
 
+    R55 P0-2 整改:
+    - request_hash 从可选改为**强制必填**(64 位 SHA-256 hex)
+    - 存储 Hash 为空同样拒绝(fail-closed)
+    - 使用 hmac.compare_digest 恒定时间比较(防时序攻击)
+    - request_hash 必须绑定 action_id、command_type、principal、target、
+      resource_version、canonical_params
+
     R53 P0-2: fail-closed 整改
-    - ``store._db`` 不可用(DB 未初始化 / 连接异常 / commit 失败)时
-      **必须**抛 ``AppError(COMMAND_EXECUTION_STORE_UNAVAILABLE)``,禁止降级执行。
-      旧逻辑记录"降级执行"并返回 True,导致 Repair/Maintenance/Restore/Entitlements
-      在 DB 故障时可能在没有审批状态下执行高风险动作,严重违反 fail-closed 原则。
-    - 调用方必须传播异常或返回失败,**不得**捕获后继续执行。
-    - CAS rowcount=0 表示已被其他 worker 抢占或状态非 approved,返回 False(非异常路径)。
+    - ``store._db`` 不可用时**必须**抛 AppError,禁止降级执行。
 
     Args:
         action_id: 命令幂等 ID
         owner: 执行 worker 标识(如 hostname:pid)
-        request_hash: 可选,SHA256(payload),防篡改校验
+        request_hash: **强制必填**,SHA-256(payload),64 位 hex,防篡改校验
         lease_seconds: 租约时长(秒),过期后可被 cleanup_stale_leases 回收
 
     Returns:
@@ -250,8 +253,34 @@ async def claim_execution_approved(
 
     Raises:
         AppError(COMMAND_EXECUTION_STORE_UNAVAILABLE): DB 不可用 / 访问异常 / commit 失败
+        AppError(COMMAND_MUST_USE_APPROVAL_PATH): request_hash 为空或格式非法
     """
     from services.error_codes import AppError, ErrorCodes
+    import hmac as _hmac
+
+    # R55 P0-2: request_hash 强制非空 + 64 位 hex 格式校验
+    if not request_hash or len(request_hash) != 64:
+        logger.error(
+            f"[CommandBus] claim_execution_approved 拒绝: "
+            f"request_hash 为空或非 64 位 hex,action_id={action_id}"
+        )
+        raise AppError(
+            ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH,
+            params={
+                "action_id": action_id,
+                "reason": "request_hash_required_64_hex",
+            },
+        )
+    try:
+        int(request_hash, 16)  # 验证是合法 hex
+    except (ValueError, TypeError):
+        raise AppError(
+            ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH,
+            params={
+                "action_id": action_id,
+                "reason": "request_hash_invalid_hex",
+            },
+        )
 
     store = _get_store()
     if not store._db:
@@ -271,24 +300,39 @@ async def claim_execution_approved(
     lease_until = _lease_until_iso(lease_seconds)
     now = _now_iso()
     try:
-        # 可选校验 request_hash(防篡改)
-        if request_hash:
-            rows = await store._db.execute_fetchall(
-                "SELECT request_hash FROM command_executions WHERE action_id = ?",
-                (action_id,),
+        # R55 P0-2: request_hash 强制校验(不再可选)
+        rows = await store._db.execute_fetchall(
+            "SELECT request_hash FROM command_executions WHERE action_id = ?",
+            (action_id,),
+        )
+        if not rows or not rows[0]:
+            logger.warning(
+                f"[CommandBus] claim_execution_approved: action_id 不存在 "
+                f"action_id={action_id}"
             )
-            if rows and rows[0]:
-                stored_hash = rows[0][0]
-                if stored_hash and stored_hash != request_hash:
-                    logger.warning(
-                        f"[CommandBus] claim_execution_approved hash_mismatch "
-                        f"action_id={action_id} stored={stored_hash} request={request_hash}"
-                    )
-                    return False
+            return False
+        stored_hash = rows[0][0]
+        # R55 P0-2: 存储 Hash 为空直接拒绝(fail-closed)
+        if not stored_hash:
+            logger.error(
+                f"[CommandBus] claim_execution_approved 拒绝: "
+                f"存储 request_hash 为空,action_id={action_id}"
+            )
+            raise AppError(
+                ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH,
+                params={
+                    "action_id": action_id,
+                    "reason": "stored_request_hash_empty",
+                },
+            )
+        # R55 P0-2: 恒定时间比较(防时序攻击)
+        if not _hmac.compare_digest(stored_hash, request_hash):
+            logger.warning(
+                f"[CommandBus] claim_execution_approved hash_mismatch "
+                f"action_id={action_id}"
+            )
+            return False
         # CAS: approved → executing
-        # R53 P1-5: 同步写入 approved_at(now),满足 SQL CHECK 约束
-        # (requires_approval=1 AND status='executing' AND approved_at IS NOT NULL)
-        # approved_at 作为"已审批"标记,即使旧表无 CHECK 约束,应用层逻辑也保持一致。
         cursor = await store._db.execute(
             "UPDATE command_executions "
             "SET status = ?, owner = ?, lease_until = ?, approved_at = COALESCE(approved_at, ?), updated_at = ? "
@@ -1254,7 +1298,7 @@ async def _get_cached_result(action_id: str, request_hash: str) -> "Result | Non
         )
         return Result(
             success=False,
-            error="请求参数与上次执行不一致(防篡改拒绝)",
+            error=_i18n_t('services.command_bus.s2'),
             action_id=action_id,
         )
     # 已执行 → 返回缓存的成功结果
@@ -1275,7 +1319,7 @@ async def _get_cached_result(action_id: str, request_hash: str) -> "Result | Non
             data = json.loads(result_json)
             return Result(
                 success=False,
-                error=data.get("error", "上次执行失败"),
+                error=data.get("error", _i18n_t('services.command_bus.s10')),
                 action_id=action_id,
             )
         except (json.JSONDecodeError, TypeError):
@@ -1283,7 +1327,7 @@ async def _get_cached_result(action_id: str, request_hash: str) -> "Result | Non
     # 正在执行或排队中
     return Result(
         success=False,
-        error=f"操作已存在,当前状态: {status}",
+        error=_i18n_t('services.command_bus.s1', status=status),
         action_id=action_id,
     )
 
@@ -1399,7 +1443,7 @@ class CommandBus:
             )
             return Result(
                 success=False,
-                error=f"权限校验异常(已拒绝执行): {e}",
+                error=_i18n_t('services.command_bus.s11', e=e),
                 action_id=action_id,
             )
 
@@ -1410,7 +1454,7 @@ class CommandBus:
             )
             return Result(
                 success=False,
-                error=f"权限不足: 缺少 {command.required_permission}",
+                error=_i18n_t('services.command_bus.s4', command_required_permission=command.required_permission),
                 action_id=action_id,
             )
 
@@ -1436,14 +1480,14 @@ class CommandBus:
                 )
                 return Result(
                     success=False,
-                    error=f"创建审批失败: {e}",
+                    error=_i18n_t('services.command_bus.s15', e=e),
                     action_id=action_id,
                 )
 
             if approval_id <= 0:
                 return Result(
                     success=False,
-                    error="创建审批失败(返回无效 approval_id)",
+                    error=_i18n_t('services.command_bus.s12'),
                     action_id=action_id,
                 )
 
@@ -1455,7 +1499,7 @@ class CommandBus:
                 success=False,
                 approval_id=approval_id,
                 approval_required=True,
-                error=f"操作需要审批(approval_id={approval_id})",
+                error=_i18n_t('services.command_bus.s5', approval_id=approval_id),
                 action_id=action_id,
             )
 
@@ -1487,12 +1531,12 @@ class CommandBus:
             return Result(success=False, error=f"获取审批记录失败: {e}")
 
         if approval_record is None:
-            return Result(success=False, error=f"审批 {approval_id} 不存在")
+            return Result(success=False, error=_i18n_t('services.command_bus.s6', approval_id=approval_id))
 
         if approval_record.get("status") != approval.APPROVAL_STATUS_APPROVED:
             return Result(
                 success=False,
-                error=f"审批状态非 approved: {approval_record.get('status')}",
+                error=_i18n_t('services.command_bus.s7', approval_record_get_status=approval_record.get('status')),
             )
 
         payload = approval_record.get("payload", {}) or {}
@@ -1513,7 +1557,7 @@ class CommandBus:
         if command is None:
             return Result(
                 success=False,
-                error=f"无法解析命令 handler: {command_action}",
+                error=_i18n_t('services.command_bus.s8', command_action=command_action),
                 action_id=action_id,
             )
 
@@ -1639,7 +1683,7 @@ class CommandBus:
         except Exception as e:
             result = Result(
                 success=False,
-                error=f"执行失败: {e}",
+                error=_i18n_t('services.command_bus.s13', e=e),
                 action_id=action_id,
             )
             logger.error(
@@ -1722,7 +1766,7 @@ class CommandBus:
                 )
                 return Result(
                     success=False,
-                    error=f"执行失败: {e}",
+                    error=_i18n_t('services.command_bus.s16', e=e),
                     action_id=action_id,
                 )
 
@@ -1751,7 +1795,7 @@ class CommandBus:
             )
             return Result(
                 success=False,
-                error="操作已被其他 worker 抢占或状态已变更",
+                error=_i18n_t('services.command_bus.s9'),
                 action_id=action_id,
             )
 
@@ -1798,7 +1842,7 @@ class CommandBus:
         except Exception as e:
             result = Result(
                 success=False,
-                error=f"执行失败: {e}",
+                error=_i18n_t('services.command_bus.s14', e=e),
                 action_id=action_id,
             )
             # 失败也持久化(防止无脑重试,可通过 release_execution 释放后重试)
@@ -2232,7 +2276,7 @@ def make_delete_file_command(file_code: str) -> Command:
             {"$set": {"status": "deleted", "deleted_at": deleted_at}},
         )
         if result.matched_count == 0:
-            raise ValueError(f"文件不存在: {file_code}")
+            raise ValueError(_i18n_t('services.command_bus.s3', file_code=file_code))
         # 写本地 SQLite tombstone + dirty_outbox(保证 CRDB 同步删除事件)
         try:
             await get_cache_store().soft_delete("file_records", file_code, deleted_at)

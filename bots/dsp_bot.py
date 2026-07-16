@@ -36,7 +36,7 @@ from utils.task_utils import create_safe_task
 # R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
 from services.maintenance_mode import require_maintenance_check
 # R41 i18n: 国际化翻译(用户可见文本)
-from services.i18n import get_i18n_manager
+from services.i18n import get_i18n_manager, translate as _i18n_t
 
 
 def _t(user_id: int, key: str, **kwargs) -> str:
@@ -600,7 +600,7 @@ async def _check_channel_degrade(channel_id: int):
 
 async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
     """构建发送给用户的媒体组/文件 caption，包含文件总数、备注、文件码。"""
-    lines = [f"文件获取完毕 文件总数：{total_count}"]
+    lines = [_i18n_t('bot.dsp.s2', total_count=total_count)]
 
     try:
         record = await get_file_record_cached(file_code)
@@ -624,11 +624,11 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
                 if note_raw and not ('"type"' in note_raw and '"external"' in note_raw):
                     note = note_raw
         if note:
-            lines.append(f"备注：{note}")
+            lines.append(_i18n_t('bot.dsp.s6', note=note))
     except Exception:
         pass
 
-    lines.append(f"文件码：{file_code}")
+    lines.append(_i18n_t('bot.dsp.s3', file_code=file_code))
     return "\n".join(lines)
 
 
@@ -712,12 +712,12 @@ def _build_pagination_keyboard(file_code: str, current_page: int, total_pages: i
     keyboard = []
     nav_row = []
     if current_page > 1:
-        nav_row.append(InlineKeyboardButton("⏮ 首页", callback_data=f"pg|{file_code}|1"))
-        nav_row.append(InlineKeyboardButton("◀ 上页", callback_data=f"pg|{file_code}|{current_page - 1}"))
-    nav_row.append(InlineKeyboardButton(f"第{current_page}/{total_pages}页", callback_data="noop"))
+        nav_row.append(InlineKeyboardButton(_i18n_t('bot.dsp.s7'), callback_data=f"pg|{file_code}|1"))
+        nav_row.append(InlineKeyboardButton(_i18n_t('bot.dsp.s8'), callback_data=f"pg|{file_code}|{current_page - 1}"))
+    nav_row.append(InlineKeyboardButton(_i18n_t('bot.dsp.s5', current_page=current_page, total_pages=total_pages), callback_data="noop"))
     if current_page < total_pages:
-        nav_row.append(InlineKeyboardButton("下页 ▶", callback_data=f"pg|{file_code}|{current_page + 1}"))
-        nav_row.append(InlineKeyboardButton("末页 ⏭", callback_data=f"pg|{file_code}|{total_pages}"))
+        nav_row.append(InlineKeyboardButton(_i18n_t('bot.dsp.s9'), callback_data=f"pg|{file_code}|{current_page + 1}"))
+        nav_row.append(InlineKeyboardButton(_i18n_t('bot.dsp.s10'), callback_data=f"pg|{file_code}|{total_pages}"))
     keyboard.append(nav_row)
     if total_pages > 1:
         page_row = _build_page_number_buttons(file_code, current_page, total_pages)
@@ -841,7 +841,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
         new_retry = job.retry_count + 1
         if new_retry >= 3:
             _sent_msg_tracker.pop(job.job_id, None)
-            await store.update_local_job_status(job.job_id, "dead", dead_reason=f"信号量获取超时,已重试{job.retry_count}次")
+            await store.update_local_job_status(job.job_id, "dead", dead_reason=_i18n_t('bot.dsp.s30', job_retry_count=job.retry_count))
         else:
             await store.retry_local_job(job.job_id, new_retry)
             try:
@@ -930,7 +930,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
         new_retry = job.retry_count + 1
         if new_retry >= 3:
             _sent_msg_tracker.pop(job.job_id, None)
-            await store.update_local_job_status(job.job_id, "dead", dead_reason=f"发送失败,已重试{job.retry_count}次: {job.code}")
+            await store.update_local_job_status(job.job_id, "dead", dead_reason=_i18n_t('bot.dsp.s28', job_retry_count=job.retry_count, job_code=job.code))
         else:
             await store.retry_local_job(job.job_id, new_retry)
             # C1: 重试入队后重新投递到 Redis Stream,避免 Redis 模式下重试 job 饥饿
@@ -1086,7 +1086,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
             logger.error(
                 f"[Dsp] R47 P0-5: 检查 delivery_receipt 幂等失败(暂停投递): {e}"
             )
-            raise DeliveryError(f"幂等读取异常: {e}") from e
+            raise DeliveryError(_i18n_t('bot.dsp.s17', e=e)) from e
     # R39 P1-11: PENDING receipt 写失败时暂停 job,不继续 Telegram 副作用
     _receipt_ok = await _upsert_delivery_receipt_safe(
         store, job.job_id, msg_id, job.target_user_id, status="PENDING"
@@ -1804,7 +1804,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
         total_files = len(file_meta_list)
         sent_msg = await safe_send_message(
             bot, chat_id=chat_id,
-            text=f"[{page}/{total_pages} 页] 共{total_files} 个文件",
+            text=_i18n_t('bot.dsp.s18', page=page, total_pages=total_pages, total_files=total_files),
             reply_markup=keyboard,
         )
         async with _get_pg_lock():
@@ -1823,7 +1823,7 @@ async def _send_report_button(bot, chat_id: int, file_code: str):
     """发送成功后追加举报按钮"""
     try:
         keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{file_code}")
+            InlineKeyboardButton(_i18n_t('bot.dsp.s29'), callback_data=f"report_req|{file_code}")
         ]])
         await safe_send_message(bot, chat_id=chat_id, text="文件已送达", reply_markup=keyboard)
     except Exception as e:
@@ -1860,7 +1860,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _report_debounce.pop(k, None)
         _report_debounce_last_gc = now
     if key in _report_debounce and now - _report_debounce[key] < 60:
-        await query.answer("已提交举报，请勿重复操作", show_alert=True)
+        await query.answer(_i18n_t('bot.dsp.s11'), show_alert=True)
         return
     _report_debounce[key] = now
 
@@ -1882,19 +1882,14 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reporter_username = f"@{reporter.username}" if reporter.username else str(reporter.id)
 
     report_text = (
-        f"🚨 文件举报\n\n"
-        f"📁 文件码: {file_code}\n"
-        f"👤 上传者: {uploader_id}\n"
-        f"👤 举报人: {reporter.id} ({reporter_username})\n"
-        f"📋 来源: Dsp Bot\n"
-        f"⏰ 时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        _i18n_t('bot.dsp.s1', file_code=file_code, uploader_id=uploader_id, reporter_id=reporter.id, reporter_username=reporter_username, datetime_datetime_now_strftime_Y_m_d_H_M_S=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔒 封禁上传者", callback_data=f"report:ban|{uploader_id}|{reporter.id}|dsp")],
-        [InlineKeyboardButton("🔗 脱钩文件码", callback_data=f"report:detach|{file_code}|{reporter.id}|dsp")],
-        [InlineKeyboardButton("🚫 限制举报人", callback_data=f"report:block|{file_code}|{reporter.id}")],
-        [InlineKeyboardButton("✅ 忽略", callback_data="report:ignore")],
+        [InlineKeyboardButton(_i18n_t('bot.dsp.s19'), callback_data=f"report:ban|{uploader_id}|{reporter.id}|dsp")],
+        [InlineKeyboardButton(_i18n_t('bot.dsp.s20'), callback_data=f"report:detach|{file_code}|{reporter.id}|dsp")],
+        [InlineKeyboardButton(_i18n_t('bot.dsp.s21'), callback_data=f"report:block|{file_code}|{reporter.id}")],
+        [InlineKeyboardButton(_i18n_t('bot.dsp.s22'), callback_data="report:ignore")],
     ])
 
     # 通过 Admin Bot 发送，确保操作按钮回调能回到 Admin Bot 处理
@@ -1909,7 +1904,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── 命令处理 ───
 
-@require_maintenance_check(action="启动派送机器人")
+@require_maintenance_check(action=_i18n_t('bot.dsp.s4'))
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
@@ -1944,15 +1939,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     await safe_reply_text(update.message,
-        "📥 文件发送机器人使用帮助\n\n"
-        "可用命令：\n"
-        "/start — 启动机器人 / 查看欢迎语\n"
-        "/help — 查看本帮助\n\n"
-        "使用说明：\n"
-        "1. 本机器人自动接收解码后的文件，无需手动操作。\n"
-        "2. 在解码机器人发送文件码后，文件会自动发送到此处。\n"
-        "3. 如遇文件异常，可点击文件下方的「举报」按钮通知管理员处理。\n"
-        "4. 文件较多时支持分页浏览，点击翻页按钮即可查看。"
+        _i18n_t('bot.dsp.s12')
         + common_faq()
     )
 
@@ -1969,7 +1956,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if not await check_force_join(update, context):
-        await query.answer("请先加入频道")
+        await query.answer(_i18n_t('bot.dsp.s13'))
         return
 
     parts = data.split("|")
@@ -1988,14 +1975,14 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with _get_pg_lock():
         state = _pagination_states.get(page_key)
     if not state:
-        await query.answer("会话已过期，请重新发送文件码。", show_alert=True)
+        await query.answer(_i18n_t('bot.dsp.s14'), show_alert=True)
         return
 
     # 检查 TTL
     if time.time() - state.get("created_at", 0) > _PAGE_STATE_TTL:
         async with _get_pg_lock():
             _pagination_states.pop(page_key, None)
-        await query.answer("会话已过期，请重新发送文件码。", show_alert=True)
+        await query.answer(_i18n_t('bot.dsp.s15'), show_alert=True)
         return
 
     file_meta_list = state["batch_file_meta"]
@@ -2003,18 +1990,18 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_code = state.get("file_code", page_key)
 
     if page < 1 or page > total_pages:
-        await query.answer("无效的页码")
+        await query.answer(_i18n_t('bot.dsp.s16'))
         return
 
     # P1-3: 翻页前校验文件状态(detached/offline 则拒绝),避免下架文件借分页继续扩散
     try:
         record = await get_file_record_cached(file_code)
         if not record:
-            await query.answer("文件记录不存在", show_alert=True)
+            await query.answer(_i18n_t('bot.dsp.s23'), show_alert=True)
             return
         status = record.get("status")
         if status in ("detached", "offline"):
-            await query.answer("该文件已下架，无法继续浏览", show_alert=True)
+            await query.answer(_i18n_t('bot.dsp.s24'), show_alert=True)
             # 清理会话,避免后续翻页继续触发
             async with _get_pg_lock():
                 _pagination_states.pop(page_key, None)
@@ -2053,12 +2040,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看投递状态: /status <upload_id>"""
     try:
         if not context.args:
-            await update.message.reply_text("用法:/status <upload_id>")
+            await update.message.reply_text(_i18n_t('bot.dsp.s25'))
             return
         upload_id = context.args[0]
         receipt = await upload_receipt.get_upload_status(upload_id)
         if not receipt:
-            await update.message.reply_text("❌ 未找到该投递记录")
+            await update.message.reply_text(_i18n_t('bot.dsp.s26'))
             return
         text = await upload_receipt.format_receipt(receipt)
         await update.message.reply_text(text)
@@ -2075,7 +2062,7 @@ async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         items = await notifications.list_unread(user.id, limit=20)
         if not items:
-            await update.message.reply_text("📭 暂无未读通知")
+            await update.message.reply_text(_i18n_t('bot.dsp.s27'))
             return
         lines = [await notifications.format_notification(n) for n in items]
         await update.message.reply_text("\n\n".join(lines))

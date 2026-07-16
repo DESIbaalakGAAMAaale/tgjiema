@@ -37,6 +37,7 @@ import os
 import secrets
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -241,7 +242,7 @@ def _unwrap_dek(wrapped_dek_b64: str, kek: bytes) -> bytes:
     aesgcm = AESGCM(kek)
     combined = base64.b64decode(wrapped_dek_b64)
     if len(combined) < _NONCE_SIZE + 1:
-        raise ValueError(f"wrapped DEK 数据过短: {len(combined)} 字节")
+        raise ValueError(_i18n_t('services.backup_crypto.s3', len_combined=len(combined)))
     nonce = combined[:_NONCE_SIZE]
     wrapped = combined[_NONCE_SIZE:]
     dek = aesgcm.decrypt(nonce, wrapped, associated_data=b"dek-wrap")
@@ -383,9 +384,7 @@ def decrypt_payload(
             actual_sha = hashlib.sha256(ciphertext).hexdigest()
             if actual_sha != expected_plaintext_sha256:
                 raise ValueError(
-                    f"R40 P0-6: 明文 checksum 校验失败"
-                    f"(expected={expected_plaintext_sha256[:16]}, "
-                    f"actual={actual_sha[:16]})"
+                    _i18n_t('services.backup_crypto.s9', expected_plaintext_sha256_16=expected_plaintext_sha256[:16], actual_sha_16=actual_sha[:16])
                 )
         return ciphertext
 
@@ -437,9 +436,7 @@ def decrypt_payload(
                     actual_sha = hashlib.sha256(plaintext).hexdigest()
                     if actual_sha != expected_plaintext_sha256:
                         raise ValueError(
-                            f"R40 P0-6: 解密后明文 checksum 校验失败"
-                            f"(expected={expected_plaintext_sha256[:16]}, "
-                            f"actual={actual_sha[:16]})"
+                            _i18n_t('services.backup_crypto.s10', expected_plaintext_sha256_16=expected_plaintext_sha256[:16], actual_sha_16=actual_sha[:16])
                         )
                 return plaintext
             except Exception as e:
@@ -448,8 +445,7 @@ def decrypt_payload(
 
     # 所有候选 KEK + AAD 均失败
     raise ValueError(
-        f"解密失败:所有候选 KEK({len(candidate_keks)}) + AAD({len(aad_candidates)}) "
-        f"组合均无法解密。最后错误: {last_error}"
+        _i18n_t('services.backup_crypto.s1', len_candidate_keks=len(candidate_keks), len_aad_candidates=len(aad_candidates), last_error=last_error)
     )
 
 
@@ -464,32 +460,31 @@ def validate_manifest_on_restore(manifest: dict, expected_schema_version: str | 
         (is_valid, reason): 校验是否通过 + 原因说明
     """
     if not manifest:
-        return False, "manifest 为空"
+        return False, _i18n_t('services.backup_crypto.s4')
 
     # 1. 检查必需字段
     required_fields = ["version", "checksum_sha256", "schema_version"]
     for field in required_fields:
         if field not in manifest:
-            return False, f"manifest 缺少必需字段: {field}"
+            return False, _i18n_t('services.backup_crypto.s8', field=field)
 
     # 2. 检查 schema version
     if expected_schema_version and manifest.get("schema_version") != expected_schema_version:
         return False, (
-            f"schema version 不匹配: 备份={manifest.get('schema_version')}, "
-            f"期望={expected_schema_version}"
+            _i18n_t('services.backup_crypto.s5', manifest_get_schema_version=manifest.get('schema_version'), expected_schema_version=expected_schema_version)
         )
 
     # 3. 检查 version 兼容性
     version = manifest.get("version", "")
     if not version:
-        return False, "manifest version 为空"
+        return False, _i18n_t('services.backup_crypto.s6')
 
     # 4. 检查加密标记(如果有,需要 BACKUP_KEK 才能解密)
     encryption_info = manifest.get("encryption", {})
     if encryption_info.get("encrypted") and not is_encryption_available():
-        return False, "备份已加密但 BACKUP_KEK 未配置,无法解密"
+        return False, _i18n_t('services.backup_crypto.s7')
 
-    return True, "manifest 校验通过"
+    return True, _i18n_t('services.backup_crypto.s2')
 
 
 def verify_checksum(content: bytes, expected_checksum: str) -> bool:

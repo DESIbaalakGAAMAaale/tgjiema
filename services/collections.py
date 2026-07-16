@@ -36,6 +36,7 @@ from services.command_bus import (
     mark_approved_executed,
     mark_approved_failed,
 )
+from services.i18n import translate as _i18n_t
 from services.error_codes import AppError, ErrorCodes
 
 
@@ -527,22 +528,22 @@ async def format_collection_info(collection: dict) -> str:
         多行纯文本(避免 Telegram markdown 解析问题)
     """
     if not collection:
-        return "集合不存在"
+        return _i18n_t('services.collections.s1')
     lines = [
-        f"📦 集合: {collection.get('name', '')}",
-        f"集合码: {collection.get('code', '')}",
-        f"文件数: {collection.get('item_count', 0)}",
-        f"版本: v{collection.get('version', 1)}",
-        f"状态: {collection.get('status', 'active')}",
+        _i18n_t('services.collections.s2', collection_get_name=collection.get('name', '')),
+        _i18n_t('services.collections.s3', collection_get_code=collection.get('code', '')),
+        _i18n_t('services.collections.s4', collection_get_item_count_0=collection.get('item_count', 0)),
+        _i18n_t('services.collections.s5', collection_get_version_1=collection.get('version', 1)),
+        _i18n_t('services.collections.s6', collection_get_status_active=collection.get('status', 'active')),
     ]
     desc = collection.get("description", "")
     if desc:
-        lines.append(f"描述: {desc}")
+        lines.append(_i18n_t('services.collections.s7', desc=desc))
     # 文件列表(若有)
     items = collection.get("items") or []
     if items:
         lines.append("")
-        lines.append("文件列表:")
+        lines.append(_i18n_t('services.collections.s8'))
         # 只展示前 10 个,避免消息过长
         for item in items[:10]:
             if isinstance(item, dict):
@@ -554,7 +555,7 @@ async def format_collection_info(collection: dict) -> str:
             status_tag = f" [{status}]" if status and status != "active" else ""
             lines.append(f"  - {file_code}{status_tag}")
         if len(items) > 10:
-            lines.append(f"  ... 还有 {len(items) - 10} 个文件")
+            lines.append(_i18n_t('services.collections.s14', len_items_10=len(items) - 10))
     return "\n".join(lines)
 
 
@@ -607,7 +608,7 @@ async def resolve_collection(user_id: int, collection_id: int) -> dict:
             "allowed": False, "collection_id": collection_id,
             "collection_code": "", "collection_name": "",
             "owner_id": 0, "items": [], "denied_items": [],
-            "error": "数据库未初始化",
+            "error": _i18n_t('services.collections.s9'),
         }
     try:
         # 查询集合信息(校验所有权)
@@ -622,7 +623,7 @@ async def resolve_collection(user_id: int, collection_id: int) -> dict:
                 "allowed": False, "collection_id": collection_id,
                 "collection_code": "", "collection_name": "",
                 "owner_id": 0, "items": [], "denied_items": [],
-                "error": "集合不存在",
+                "error": _i18n_t('services.collections.s15'),
             }
         coll_id = int(row[0])
         coll_name = row[1] or ""
@@ -691,7 +692,7 @@ async def resolve_collection(user_id: int, collection_id: int) -> dict:
             "owner_id": owner_id,
             "items": items,
             "denied_items": denied_items,
-            "error": "" if allowed else "无访问权限" if coll_status == "active" else "集合已禁用",
+            "error": "" if allowed else _i18n_t('services.collections.s22') if coll_status == "active" else _i18n_t('services.collections.s23'),
         }
     except Exception as e:
         logger.warning(f"[collections] resolve_collection 失败: {e}")
@@ -699,7 +700,7 @@ async def resolve_collection(user_id: int, collection_id: int) -> dict:
             "allowed": False, "collection_id": collection_id,
             "collection_code": "", "collection_name": "",
             "owner_id": 0, "items": [], "denied_items": [],
-            "error": f"解析失败: {e}",
+            "error": _i18n_t('services.collections.s16', e=e),
         }
 
 
@@ -796,7 +797,7 @@ async def update_collection(
                 "success": True, "conflict": False,
                 "new_version": int(row[0] or 1),
                 "current_version": int(row[0] or 1),
-                "message": "无字段需更新",
+                "message": _i18n_t('services.collections.s17'),
             }
         except AppError:
             raise
@@ -874,7 +875,7 @@ async def update_collection(
         return {
             "success": True, "conflict": False,
             "new_version": new_v, "current_version": new_v,
-            "message": "更新成功",
+            "message": _i18n_t('services.collections.s10'),
         }
     except AppError:
         raise
@@ -896,7 +897,7 @@ async def _update_collection_without_cas(
     *,
     principal_id: int = 0,
     request_hash: str = "",
-    target_version: int | None = None,
+    target_version: int = 0,
     approval_action_id: str = "",
     caller: str = "",
 ) -> dict:
@@ -920,8 +921,10 @@ async def _update_collection_without_cas(
         - 任意字符串、他人审批、Hash 不符、重复执行全部拒绝(fail-closed)
 
     安全约束:
-        - 此方法不校验 ``expected_version``(故意跳过 CAS,但可选 ``target_version``
-          作为额外防护,如传入则加入 WHERE 子句)
+        - 此方法不校验 ``expected_version``(故意跳过 CAS)
+        - R55 P0-5: ``target_version`` 必填且 >0,SQL 始终 ``WHERE id=? AND version=?``
+          "bypass CAS" 仅绕过普通用户 CAS,不得绕过审批时资源版本绑定
+        - rowcount=0 进入 conflict/retryable,不执行审计成功
         - ``approval_action_id`` 必须对应 ``command_executions`` 中真实审批记录
         - audit_log 中标记 ``bypass_cas=True`` 便于事后追溯
 
@@ -931,7 +934,7 @@ async def _update_collection_without_cas(
         description: 新描述(None=不修改)
         principal_id: 调用方 principal_id(必须与审批记录匹配)
         request_hash: 请求指纹(必须与审批记录匹配,或前 16 字符匹配)
-        target_version: 可选目标版本号(如传入则额外校验当前 version 匹配)
+        target_version: R55 P0-5 强制必填且 >0(不再可选),始终加入 WHERE 子句
         approval_action_id: 审批 action_id(必填,空则拒绝)
         caller: 调用方标识(如 "migration"/"repair_console",用于审计 + owner)
 
@@ -956,6 +959,19 @@ async def _update_collection_without_cas(
                 "collection_id": collection_id,
                 "approval_action_id": approval_action_id or "",
                 "reason": "approval_action_id_required_for_bypass",
+            },
+        )
+
+    # R55 P0-5: target_version 强制必填且 >0(不再可选)
+    # "bypass CAS" 仅绕过普通用户 CAS,不得绕过审批时资源版本绑定
+    if not target_version or int(target_version) <= 0:
+        raise AppError(
+            ErrorCodes.COLLECTION_APPROVAL_INVALID,
+            params={
+                "collection_id": collection_id,
+                "approval_action_id": approval_action_id,
+                "reason": "target_version_required_and_must_be_positive",
+                "target_version": target_version,
             },
         )
 
@@ -1130,7 +1146,7 @@ async def _update_collection_without_cas(
         claimed = await claim_execution_approved(
             action_id=approval_action_id,
             owner=caller or "collection_bypass",
-            request_hash=request_hash or None,
+            request_hash=request_hash,
         )
     except AppError:
         # DB 故障 → fail-closed,直接传播(不调用 mark_approved_failed,状态未变)
@@ -1213,7 +1229,7 @@ async def _update_collection_without_cas(
             "success": True, "conflict": False,
             "new_version": current_v_no_update,
             "current_version": current_v_no_update,
-            "message": "无字段需更新(bypass,已审计)",
+            "message": _i18n_t('services.collections.s11'),
         }
 
     # 加入 version 递增 + updated_at(bypass 路径仍递增版本号,便于后续 CAS 恢复)
@@ -1221,13 +1237,12 @@ async def _update_collection_without_cas(
     set_clauses.append("updated_at = ?")
     params.append(now)
 
-    # WHERE 条件:id = ?(bypass 不校验 expected_version);
-    # 可选 target_version 额外防护(如传入则加入 WHERE)
-    where_clauses = ["id = ?"]
+    # R55 P0-5: WHERE 条件强制 `id = ? AND version = ?`(不再可选)
+    # "bypass CAS" 仅绕过普通用户 CAS,不得绕过审批时资源版本绑定
+    # target_version 必填且 >0(函数签名已强制),rowcount=0 进入 conflict/retryable
+    where_clauses = ["id = ?", "version = ?"]
     params.append(collection_id)
-    if target_version is not None and int(target_version) > 0:
-        where_clauses.append("version = ?")
-        params.append(int(target_version))
+    params.append(int(target_version))
 
     set_sql = ", ".join(set_clauses)
     where_sql = " AND ".join(where_clauses)
@@ -1300,7 +1315,7 @@ async def _update_collection_without_cas(
         return {
             "success": True, "conflict": False,
             "new_version": new_v, "current_version": new_v,
-            "message": "更新成功(bypass,已审计)",
+            "message": _i18n_t('services.collections.s12'),
         }
     except AppError as e:
         # 事务已回滚(数据修改未生效)→ 回写 failed
@@ -1389,7 +1404,7 @@ async def batch_retrieve(collection_id: int, user_id: int) -> dict:
             "denied_count": 0, "expired_count": 0,
             "deleted_count": 0, "missing_count": 0,
             "total_count": 0, "all_retrievable": False,
-            "error": "数据库未初始化",
+            "error": _i18n_t('services.collections.s13'),
         }
     try:
         # 查询集合信息
@@ -1408,7 +1423,7 @@ async def batch_retrieve(collection_id: int, user_id: int) -> dict:
                 "denied_count": 0, "expired_count": 0,
                 "deleted_count": 0, "missing_count": 0,
                 "total_count": 0, "all_retrievable": False,
-                "error": "集合不存在",
+                "error": _i18n_t('services.collections.s18'),
             }
         coll_id = int(coll_row[0])
         coll_name = coll_row[1] or ""
@@ -1428,7 +1443,7 @@ async def batch_retrieve(collection_id: int, user_id: int) -> dict:
                 "denied_count": 0, "expired_count": 0,
                 "deleted_count": 0, "missing_count": 0,
                 "total_count": 0, "all_retrievable": False,
-                "error": "集合已禁用,无法取件",
+                "error": _i18n_t('services.collections.s19'),
             }
 
         # 查询集合项 + 关联文件状态
@@ -1469,19 +1484,19 @@ async def batch_retrieve(collection_id: int, user_id: int) -> dict:
             # 2. 文件状态判定
             if not file_code or file_status == "missing":
                 retrieval_status = "missing"
-                reason = "文件记录不存在"
+                reason = _i18n_t('services.collections.s20')
                 missing_count += 1
             elif deleted_at or file_status == "deleted":
                 retrieval_status = "deleted"
-                reason = "文件已删除"
+                reason = _i18n_t('services.collections.s24')
                 deleted_count += 1
             elif file_status == "expired" or _is_expired(expire_time):
                 retrieval_status = "expired"
-                reason = "文件已过期"
+                reason = _i18n_t('services.collections.s25')
                 expired_count += 1
             elif not has_access:
                 retrieval_status = "denied"
-                reason = "无访问权限(uploader 不匹配)"
+                reason = _i18n_t('services.collections.s26')
                 denied_count += 1
             elif file_status in ("active", "ready"):
                 retrieval_status = "retrievable"
@@ -1490,7 +1505,7 @@ async def batch_retrieve(collection_id: int, user_id: int) -> dict:
             else:
                 # 其他异常状态(如 corrupted)→ 视为不可取件
                 retrieval_status = "deleted"
-                reason = f"文件状态异常: {file_status}"
+                reason = _i18n_t('services.collections.s27', file_status=file_status)
                 deleted_count += 1
 
             items.append({
@@ -1533,5 +1548,5 @@ async def batch_retrieve(collection_id: int, user_id: int) -> dict:
             "denied_count": 0, "expired_count": 0,
             "deleted_count": 0, "missing_count": 0,
             "total_count": 0, "all_retrievable": False,
-            "error": f"批量取件失败: {e}",
+            "error": _i18n_t('services.collections.s21', e=e),
         }

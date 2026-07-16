@@ -16,6 +16,7 @@ from services.backup_schema import (
     BACKUP_SCHEMA, get_backup_tables, get_conflict_col,
     get_tables_by_source,
 )
+from services.i18n import translate as _i18n_t
 from services.backup_crypto import (
     encrypt_payload,
     is_encryption_available,
@@ -622,14 +623,11 @@ async def _run_backup_loop():
                 _expected_cipher_sha = manifest.get("ciphertext_sha256")
                 if _verify_sha != _expected_cipher_sha:
                     raise RuntimeError(
-                        f"R39 P1-6 + R40 P0-6: 临时 payload 密文 checksum 不匹配"
-                        f"(expected_cipher={str(_expected_cipher_sha)[:16]}, "
-                        f"actual={_verify_sha[:16]})"
+                        _i18n_t('services.db_backup.s1', str_expected_cipher_sha_16=str(_expected_cipher_sha)[:16], verify_sha_16=_verify_sha[:16])
                     )
                 if len(_verify_bytes) != len(upload_content):
                     raise RuntimeError(
-                        f"R39 P1-6: 临时 payload 大小不匹配"
-                        f"(expected={len(upload_content)}, actual={len(_verify_bytes)})"
+                        _i18n_t('services.db_backup.s2', len_upload_content=len(upload_content), len_verify_bytes=len(_verify_bytes))
                     )
                 logger.debug(
                     f"[Backup] R39 P1-6 + R40 P0-6: 临时 payload 密文校验通过"

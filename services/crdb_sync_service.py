@@ -43,6 +43,7 @@ from loguru import logger
 
 # R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 
 # 默认同步间隔(秒)
@@ -1414,7 +1415,7 @@ async def _route_dirty_outbox_to_dlq(
                 dlq_id = await store.insert_dlq_record(
                     message_id=f"dirty_outbox:{r.get('id', '')}",
                     table_name=table_name,
-                    reason=f"crdb_sync dispatch 失败: {error_msg}",
+                    reason=_i18n_t('services.crdb_sync_service.s6', error_msg=error_msg),
                     original=original_payload,
                     max_retries=max_retries,
                     next_retry_at=next_retry_at_str,
@@ -1444,7 +1445,7 @@ async def _route_dirty_outbox_to_dlq(
             for r in records:
                 dead_entry = {
                     "message_id": f"dirty_outbox:{r.get('id', '')}",
-                    "reason": f"crdb_sync dispatch 失败 table={table_name}: {error_msg}",
+                    "reason": _i18n_t('services.crdb_sync_service.s1', table_name=table_name, error_msg=error_msg),
                     "attempts": 1,
                     "max_attempts": max_retries,
                     "failed_at": now_str,
@@ -1538,7 +1539,7 @@ async def _dispatch_dirty_outbox_to_crdb(
             )
             dlq_result = await _route_dirty_outbox_to_dlq(
                 table_name, records,
-                f"CRDB 表缺失 upsert handler(策略={table_name} → CRDB)",
+                _i18n_t('services.crdb_sync_service.s2', table_name=table_name),
             )
             # R51 P0-9: 只有 DLQ 写入成功才标记 processed
             if dlq_result.get("success"):
@@ -1556,7 +1557,7 @@ async def _dispatch_dirty_outbox_to_crdb(
             )
             dlq_result = await _route_dirty_outbox_to_dlq(
                 table_name, records,
-                f"CRDB 表缺失 tombstone handler(策略={table_name} → CRDB)",
+                _i18n_t('services.crdb_sync_service.s3', table_name=table_name),
             )
             # R51 P0-9: 只有 DLQ 写入成功才标记 processed
             if dlq_result.get("success"):
@@ -1582,7 +1583,7 @@ async def _dispatch_dirty_outbox_to_crdb(
             )
             dead_dlq_result = await _route_dirty_outbox_to_dlq(
                 table_name, dead_records,
-                f"未知 operation(合法: upsert/tombstone)",
+                _i18n_t('services.crdb_sync_service.s4'),
             )
             # R51 P0-9: 只有 DLQ 写入成功才将 dead_records 加入 processed 列表
             if not dead_dlq_result.get("success"):
@@ -1748,7 +1749,7 @@ async def _sync_dirty_outbox():
             failed_records = [r for r in records if r.get("id") not in ids]
             if failed_records:
                 failed_dlq_result = await _route_dirty_outbox_to_dlq(
-                    table_name, failed_records, "dispatch 返回未处理 id",
+                    table_name, failed_records, _i18n_t('services.crdb_sync_service.s5'),
                 )
                 # R51 P0-9: DLQ 写入成功 → failed_records 已在 DLQ,无需再 dispatch
                 # DLQ 写入失败 → 保持 dirty pending(不加入 processed,下次重试)

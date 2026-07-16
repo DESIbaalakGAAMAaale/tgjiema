@@ -282,6 +282,28 @@ class ErrorCodes:
     # claim_execution 入口,必须改走 claim_execution_approved 审批路径
     COMMAND_MUST_USE_APPROVAL_PATH = "COMMAND.APPROVAL.MUST_USE_APPROVAL_PATH"
 
+    # ── R55 §18: 统一按钮 Approval Policy 错误码 ──
+    # 高风险按钮缺少统一 Approval Policy 绑定(principal/resource/version/hash/expiry/nonce 任一缺失)
+    BUTTON_POLICY_BINDING_MISSING = "BUTTON.POLICY.BINDING_MISSING"
+    # 按钮 nonce 已被消费或不存在(防重放/双击/并发点击)
+    BUTTON_POLICY_NONCE_CONSUMED = "BUTTON.POLICY.NONCE_CONSUMED"
+    # 按钮 callback 签名校验失败(防篡改)
+    BUTTON_POLICY_SIGNATURE_INVALID = "BUTTON.POLICY.SIGNATURE_INVALID"
+    # 按钮 callback 已过期(expiry_ts 超时)
+    BUTTON_POLICY_EXPIRED = "BUTTON.POLICY.EXPIRED"
+    # 按钮 principal 不匹配(跨用户攻击)
+    BUTTON_POLICY_PRINCIPAL_MISMATCH = "BUTTON.POLICY.PRINCIPAL_MISMATCH"
+    # 按钮 resource_version 不匹配(旧版本按钮操作已更新资源)
+    BUTTON_POLICY_VERSION_MISMATCH = "BUTTON.POLICY.VERSION_MISMATCH"
+    # 按钮 request_hash 不匹配(审批与资源错位)
+    BUTTON_POLICY_HASH_MISMATCH = "BUTTON.POLICY.HASH_MISMATCH"
+    # 高风险按钮要求 MFA 但未验证(MFA 强制门禁)
+    BUTTON_POLICY_MFA_REQUIRED = "BUTTON.POLICY.MFA_REQUIRED"
+    # 极高风险按钮要求双人审批但 approver 缺失或与 principal 相同
+    BUTTON_POLICY_DUAL_APPROVAL_REQUIRED = "BUTTON.POLICY.DUAL_APPROVAL_REQUIRED"
+    # 按钮操作缺少最终确认(final confirm 步骤缺失)
+    BUTTON_POLICY_FINAL_CONFIRM_REQUIRED = "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED"
+
 
 # ════════════════════════════════════════════════════════════════
 # 2. ErrorDefinition 数据类
@@ -551,8 +573,29 @@ class AppError(Exception):
         return self.envelope.severity
 
     def to_dict(self) -> dict:
-        """返回 dict 表示(供 JSON 序列化)。"""
-        return self.envelope.to_dict()
+        """返回统一错误响应格式(供 JSON 序列化)。
+
+        R55 §17: 返回 ``{code, message_key, trace_id, retryable, severity, safe_params}``。
+        原始异常仅记录日志(见 write_audit_log 中的 cause 字段),不暴露给调用方。
+        safe_params 经过 is_safe_param 二次过滤(防止白名单配置失误泄露 token/hash 等)。
+
+        如需完整 envelope(含 i18n message 与 timestamp),请直接访问 ``self.envelope``。
+        """
+        return make_error_response(
+            code=self.code,
+            message_key=self.message_key,
+            trace_id=self.trace_id,
+            retryable=self.retryable,
+            severity=self.severity,
+            safe_params=self.params,
+        )
+
+    def to_response(self) -> dict:
+        """返回统一错误响应格式(与 to_dict() 等价的语义化别名)。
+
+        R55 §17: 推荐调用方使用此方法名,语义更清晰(响应而非内部 dict 表示)。
+        """
+        return self.to_dict()
 
     async def write_audit_log(self) -> bool:
         """异步写入 audit_log 表(记录 trace_id + code + params)。
@@ -606,19 +649,134 @@ class AppError(Exception):
 # ════════════════════════════════════════════════════════════════
 # 6. 辅助函数
 # ════════════════════════════════════════════════════════════════
+# ── R55 §17: 敏感参数过滤 — 统一错误响应 helper ──
+# 禁止出现在 safe_params 中的 key 子串(大小写不敏感匹配)。
+# 覆盖: token / hash / password / secret / payload / phone / mobile / session
+# 注: file_code 是用户面向的文件标识符(非机密),不应被过滤;
+#     若需过滤长 file_code,应通过 _SENSITIVE_VALUE_MAX_LENGTH 控制。
+_SENSITIVE_KEY_PATTERNS: list[str] = [
+    "token",
+    "hash",
+    "password",
+    "secret",
+    "payload",
+    "phone",
+    "mobile",
+    "session",
+]
+
+# safe_params 中字符串值的最大长度(超过则视为敏感,可能是密文/哈希/长 payload)
+_SENSITIVE_VALUE_MAX_LENGTH: int = 100
+
+# 标记为哈希/密文的前缀(出现则视为敏感)
+_SENSITIVE_VALUE_PREFIXES: tuple[str, ...] = ("$argon2", "$pbkdf2")
+
+
+def is_safe_param(key: str, value: Any) -> bool:
+    """判断单个参数是否可安全暴露在错误响应中。
+
+    R55 §17: 统一过滤规则,作为 ErrorDefinition.safe_params 白名单的二次防护。
+    白名单可能因配置失误纳入敏感字段(如 token/hash),本函数提供兜底过滤。
+    注: file_code 是用户面向标识符,已从敏感模式中移除,不会被过滤。
+
+    判定规则(命中任一即返回 False):
+        1. key 包含 _SENSITIVE_KEY_PATTERNS 中任一子串(大小写不敏感)
+        2. value 为字符串且长度 > _SENSITIVE_VALUE_MAX_LENGTH
+        3. value 为字符串且以 $argon2 / $pbkdf2 开头(哈希/密文)
+
+    Args:
+        key: 参数名
+        value: 参数值
+
+    Returns:
+        True 表示可安全暴露;False 表示敏感,必须过滤
+    """
+    # 1. key 子串匹配(大小写不敏感)
+    key_lower = str(key).lower()
+    for pattern in _SENSITIVE_KEY_PATTERNS:
+        if pattern in key_lower:
+            return False
+
+    # 2. value 长度与哈希前缀校验(仅字符串类型)
+    if isinstance(value, str):
+        if len(value) > _SENSITIVE_VALUE_MAX_LENGTH:
+            return False
+        if value.startswith(_SENSITIVE_VALUE_PREFIXES):
+            return False
+
+    return True
+
+
+def make_error_response(
+    code: str,
+    message_key: str,
+    trace_id: str,
+    retryable: bool,
+    severity: str,
+    safe_params: Optional[dict] = None,
+) -> dict:
+    """生成统一错误响应 dict。
+
+    R55 §17: 统一输出格式为::
+        {code, message_key, trace_id, retryable, severity, safe_params}
+
+    设计要点:
+        - 原始异常仅记录日志,不暴露给调用方(本函数不接收 exception 参数)
+        - safe_params 经过 is_safe_param 二次过滤,防止白名单配置失误
+        - 不包含 message/timestamp 等额外字段,保持响应精简
+        - 调用方应使用 ErrorRegistry.create_envelope() 获取完整 envelope(含 i18n message)
+
+    Args:
+        code: 三段式错误码 ``DOMAIN.OPERATION.REASON``
+        message_key: i18n key(供前端/Bot 自行渲染)
+        trace_id: UUID 字符串,贯穿全链路
+        retryable: 是否可重试
+        severity: 严重级别(info/warning/error/critical)
+        safe_params: 可选参数字典(会经 is_safe_param 过滤)
+
+    Returns:
+        统一错误响应 dict
+    """
+    filtered_params: dict = {}
+    if safe_params:
+        for k, v in safe_params.items():
+            if is_safe_param(k, v):
+                filtered_params[k] = v
+            else:
+                logger.debug(
+                    f"[make_error_response] 过滤敏感参数 key={k!r} "
+                    f"code={code} trace_id={trace_id}"
+                )
+    return {
+        "code": code,
+        "message_key": message_key,
+        "trace_id": trace_id,
+        "retryable": retryable,
+        "severity": severity,
+        "safe_params": filtered_params,
+    }
+
+
 def _filter_safe_params(params: dict, safe_params: list[str]) -> dict:
     """按 safe_params 白名单过滤 params(避免敏感信息泄露)。
+
+    R55 §17: 在白名单过滤基础上,额外使用 is_safe_param 二次校验,
+    防止白名单配置失误将敏感字段(token/hash/payload/file_code/phone 等)泄露。
 
     Args:
         params: 原始参数字典
         safe_params: 可安全记录的参数名列表
 
     Returns:
-        过滤后的 dict(仅包含 safe_params 列入的字段)
+        过滤后的 dict(仅包含 safe_params 列入且通过 is_safe_param 的字段)
     """
     if not params or not safe_params:
         return {}
-    return {k: v for k, v in params.items() if k in safe_params}
+    return {
+        k: v
+        for k, v in params.items()
+        if k in safe_params and is_safe_param(k, v)
+    }
 
 
 def _render_i18n_message(
@@ -1617,6 +1775,108 @@ def _register_defaults() -> None:
         safe_params=["action_id", "command_type", "reason"],
     ))
 
+    # ── R55 §18: 统一按钮 Approval Policy 错误定义 ──
+    # 所有高风险按钮统一 Approval Policy,绑定 principal/resource/version/hash/expiry/nonce
+    # 任一绑定缺失 → 400 critical,阻断执行
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_BINDING_MISSING,
+        message_key="errors.button.policy.binding_missing",
+        http_status=400,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "missing_field", "reason"],
+    ))
+    # nonce 已被消费或不存在(防重放/双击/并发点击)
+    # 409 critical — 原子消费失败,可能是重放攻击
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_NONCE_CONSUMED,
+        message_key="errors.button.policy.nonce_consumed",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+    ))
+    # 签名校验失败(防篡改)
+    # 403 critical — callback 可能被篡改
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_SIGNATURE_INVALID,
+        message_key="errors.button.policy.signature_invalid",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+    ))
+    # callback 已过期
+    # 410 warning — 过期按钮需重新生成
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_EXPIRED,
+        message_key="errors.button.policy.expired",
+        http_status=410,
+        retryable=False,
+        severity="warning",
+        safe_params=["action", "reason"],
+    ))
+    # principal 不匹配(跨用户攻击)
+    # 403 critical — callback user_id 与当前 user_id 不一致
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_PRINCIPAL_MISMATCH,
+        message_key="errors.button.policy.principal_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+    ))
+    # resource_version 不匹配(旧版本按钮操作已更新资源)
+    # 409 warning — 资源已被修改,需重新加载
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_VERSION_MISMATCH,
+        message_key="errors.button.policy.version_mismatch",
+        http_status=409,
+        retryable=False,
+        severity="warning",
+        safe_params=["action", "reason"],
+    ))
+    # request_hash 不匹配(审批与资源错位)
+    # 409 critical — 审批与记录不对应
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_HASH_MISMATCH,
+        message_key="errors.button.policy.hash_mismatch",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+    ))
+    # MFA 强制门禁未验证
+    # 403 critical — 高风险按钮必须先验证 MFA
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_MFA_REQUIRED,
+        message_key="errors.button.policy.mfa_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+    ))
+    # 双人审批要求未满足(approver 缺失或与 principal 相同)
+    # 403 critical — 极高风险按钮必须双人审批
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_DUAL_APPROVAL_REQUIRED,
+        message_key="errors.button.policy.dual_approval_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+    ))
+    # 最终确认步骤缺失
+    # 403 warning — 高风险按钮需要最终确认
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_FINAL_CONFIRM_REQUIRED,
+        message_key="errors.button.policy.final_confirm_required",
+        http_status=403,
+        retryable=False,
+        severity="warning",
+        safe_params=["action", "reason"],
+    ))
+
 
 # 模块加载时即注册默认定义(确保任何 import 都触发注册)
 _register_defaults()
@@ -1629,4 +1889,6 @@ __all__ = [
     "ErrorEnvelope",
     "ErrorRegistry",
     "AppError",
+    "make_error_response",
+    "is_safe_param",
 ]

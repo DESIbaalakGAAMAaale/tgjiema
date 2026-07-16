@@ -42,6 +42,7 @@ from typing import Any
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.i18n import translate as _i18n_t
 
 
 # ─── RU 单价估算(基于 CockroachDB Cloud 定价) ────────────────
@@ -386,9 +387,7 @@ async def check_ru_alert() -> dict:
         return {
             "alert_level": "critical",
             "message": (
-                f"RU 使用率已达 {budget['usage_percentage']}% "
-                f"(已用 {budget['current_usage']}/{budget['daily_limit']}),"
-                f"建议立即排查异常服务或临时调高预算"
+                _i18n_t('services.ru_cost_center.s7', budget_usage_percentage=budget['usage_percentage'], budget_current_usage=budget['current_usage'], budget_daily_limit=budget['daily_limit'])
             ),
             "threshold": CRITICAL_THRESHOLD,
         }
@@ -396,9 +395,7 @@ async def check_ru_alert() -> dict:
         return {
             "alert_level": "warning",
             "message": (
-                f"RU 使用率达 {budget['usage_percentage']}% "
-                f"(已用 {budget['current_usage']}/{budget['daily_limit']}),"
-                f"建议关注 RU 消耗趋势"
+                _i18n_t('services.ru_cost_center.s8', budget_usage_percentage=budget['usage_percentage'], budget_current_usage=budget['current_usage'], budget_daily_limit=budget['daily_limit'])
             ),
             "threshold": WARNING_THRESHOLD,
         }
@@ -406,8 +403,7 @@ async def check_ru_alert() -> dict:
         return {
             "alert_level": "normal",
             "message": (
-                f"RU 使用正常 ({budget['usage_percentage']}%, "
-                f"已用 {budget['current_usage']}/{budget['daily_limit']})"
+                _i18n_t('services.ru_cost_center.s9', budget_usage_percentage=budget['usage_percentage'], budget_current_usage=budget['current_usage'], budget_daily_limit=budget['daily_limit'])
             ),
             "threshold": CRITICAL_THRESHOLD,
         }
@@ -429,12 +425,12 @@ async def generate_cost_report(start_date: str, end_date: str) -> str:
 
     lines: list[str] = []
     lines.append("═══════════════════════════════════════════════════════════")
-    lines.append("           RU 成本报告 (R40 §9.3)")
+    lines.append(_i18n_t('services.ru_cost_center.s1'))
     lines.append("═══════════════════════════════════════════════════════════")
-    lines.append(f"日期范围: {start_date} ~ {end_date}")
-    lines.append(f"总 RU 消耗: {grand_total}")
+    lines.append(_i18n_t('services.ru_cost_center.s2', start_date=start_date, end_date=end_date))
+    lines.append(_i18n_t('services.ru_cost_center.s3', grand_total=grand_total))
     lines.append("")
-    lines.append(f"{'服务':<15} {'总 RU':>12} {'日均':>12} {'占比':>8}")
+    lines.append(_i18n_t('services.ru_cost_center.s4', p0='服务', RU='总 RU', p2='日均', p3='占比'))
     lines.append("─" * 50)
     for svc in services:
         lines.append(
@@ -447,11 +443,8 @@ async def generate_cost_report(start_date: str, end_date: str) -> str:
     budget = await get_ru_budget()
     alert = await check_ru_alert()
     lines.append("")
-    lines.append(f"[预算] 日限额={budget['daily_limit']} "
-                f"已用={budget['current_usage']} "
-                f"剩余={budget['remaining']} "
-                f"({budget['usage_percentage']}%)")
-    lines.append(f"[告警] {alert['alert_level'].upper()}: {alert['message']}")
+    lines.append(_i18n_t('services.ru_cost_center.s5', budget_daily_limit=budget['daily_limit'], budget_current_usage=budget['current_usage'], budget_remaining=budget['remaining'], budget_usage_percentage=budget['usage_percentage']))
+    lines.append(_i18n_t('services.ru_cost_center.s6', alert_alert_level_upper=alert['alert_level'].upper(), alert_message=alert['message']))
     lines.append("═══════════════════════════════════════════════════════════")
     return "\n".join(lines)
 

@@ -33,6 +33,7 @@ from services.effect_receipts import (
     compute_effect_request_hash,
     get_receipt_manager,
 )
+from services.i18n import translate as _i18n_t
 
 
 def _is_critical(effect_type: str) -> bool:
@@ -99,8 +100,7 @@ def with_effect_receipt(
             if manager is None:
                 if fail_closed:
                     raise EffectReceiptError(
-                        f"[effect_receipt] manager 不可用,critical 副作用拒绝执行 "
-                        f"{func.__name__}(effect_type={effect_type})"
+                        _i18n_t('services.effect_receipts_integration.s4', func_name=func.__name__, effect_type=effect_type)
                     )
                 # 非关键或 best_effort → fail-open
                 logger.warning(
@@ -139,7 +139,7 @@ def with_effect_receipt(
             # R48 P0-4: critical effect 必须有非空 request_hash
             if is_critical and not request_hash:
                 raise EffectReceiptError(
-                    f"critical effect '{effect_type}' request_hash 为空,拒绝执行"
+                    _i18n_t('services.effect_receipts_integration.s2', effect_type=effect_type)
                 )
 
             # 1. 检查是否已完成 → 跳过(幂等)
@@ -274,7 +274,7 @@ class EffectReceiptContext:
         # R48 P0-4: critical effect 必须有非空 request_hash
         if self.is_critical and not self.request_hash:
             raise EffectReceiptError(
-                f"critical effect '{self.effect_type}' request_hash 为空,拒绝执行"
+                _i18n_t('services.effect_receipts_integration.s1', self_effect_type=self.effect_type)
             )
 
         if not self.action_id:
@@ -291,8 +291,7 @@ class EffectReceiptContext:
         if self.manager is None:
             if self.fail_closed:
                 raise EffectReceiptError(
-                    f"[effect_receipt] manager 不可用,critical 副作用拒绝执行 "
-                    f"action={self.action_id} type={self.effect_type}"
+                    _i18n_t('services.effect_receipts_integration.s3', self_action_id=self.action_id, self_effect_type=self.effect_type)
                 )
             logger.warning(
                 f"[effect_receipt] manager 不可用,直接执行 "

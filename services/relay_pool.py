@@ -15,6 +15,7 @@ from services.relay_instance import RelayInstance
 from database.relay_db import get_relay_db
 # R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 
 def _normalize_phone(phone: str) -> str:
@@ -227,7 +228,7 @@ class RelayPool:
         try:
             api_id = int(api_id)
         except (TypeError, ValueError):
-            raise RuntimeError(f"api_id 必须是数字,当前值: {api_id}")
+            raise RuntimeError(_i18n_t('services.relay_pool.s2', api_id=api_id))
         if not api_hash or not isinstance(api_hash, str):
             # R48 P1: 协议化错误码替代裸字符串 RuntimeError
             raise AppError(ErrorCodes.RELAY_CONFIG_API_HASH_INVALID)
@@ -239,7 +240,7 @@ class RelayPool:
         # 检查是否已存在
         existing = await db.get_active_accounts()
         if any(a["phone"] == phone for a in existing):
-            raise RuntimeError(f"手机号 {phone} 已存在,请勿重复添加")
+            raise RuntimeError(_i18n_t('services.relay_pool.s1', phone=phone))
 
         # 直接写入 DB,不做 Telegram API 验证
         # api_id/api_hash 有效性由 idx_bot 的 instance.start() 在 connect 时验证

@@ -47,7 +47,8 @@ import pytest
 import pytest_asyncio
 
 # R51 P1-6 适配: 全测试统一的 request_hash 值(与 _insert_command_execution 默认值一致)
-_TEST_REQUEST_HASH = "test_hash_001"
+# R55 P0-2: request_hash 强制 64 位 hex(满足 claim_execution_approved 校验)
+_TEST_REQUEST_HASH = "a" * 64
 
 # ── Mock telegram 模块(避免依赖真实 telegram 库) ───────────────
 sys.modules.setdefault("telegram", MagicMock())
@@ -119,7 +120,7 @@ async def _insert_command_execution(
     store,
     action_id: str,
     status: str = "approved",
-    request_hash: str = "test_hash_001",
+    request_hash: str = "a" * 64,  # R55 P0-2: 64 位 hex
     result_json: str = '{"success": true}',
 ):
     """直接插入一条 command_executions 记录(模拟 CommandBus 审批结果)。

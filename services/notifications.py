@@ -31,6 +31,7 @@ from typing import Any
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.i18n import translate as _i18n_t
 
 # 通知类型常量
 NOTIF_TYPE_READY = "ready"                    # 文件就绪
@@ -669,7 +670,7 @@ async def format_notification(notif: dict) -> str:
         多行纯文本(避免 Telegram markdown 解析问题)
     """
     if not notif:
-        return "通知不存在"
+        return _i18n_t('services.notifications.s2')
     ntype = notif.get("type", "") or ""
     icon = _NOTIF_ICONS.get(ntype, "📨")
     payload = notif.get("payload")
@@ -679,64 +680,50 @@ async def format_notification(notif: dict) -> str:
     if ntype == NOTIF_TYPE_READY:
         file_code = payload.get("file_code", "")
         return (
-            f"{icon} 文件就绪\n"
-            f"文件码: {file_code}\n"
-            f"可使用 /get {file_code} 取件"
+            _i18n_t('services.notifications.s3', icon=icon, file_code=file_code, file_code_3=file_code)
         )
     if ntype == NOTIF_TYPE_R100_DELAY:
         delay = payload.get("delay_minutes", 0)
         return (
-            f"{icon} R100 副本延迟\n"
-            f"预计 {delay} 分钟后完成\n"
-            f"请稍后再试"
+            _i18n_t('services.notifications.s4', icon=icon, delay=delay)
         )
     if ntype == NOTIF_TYPE_REPLICA_SHORT:
         ready = payload.get("ready_count", 0)
         total = payload.get("total_count", 0)
         return (
-            f"{icon} 副本不足\n"
-            f"仅 {ready}/{total} 副本就绪\n"
-            f"系统正在补充副本"
+            _i18n_t('services.notifications.s5', icon=icon, ready=ready, total=total)
         )
     if ntype == NOTIF_TYPE_EXPIRY_WARNING:
         file_code = payload.get("file_code", "")
         hours = payload.get("hours_remaining", 24)
         return (
-            f"{icon} 过期前提醒\n"
-            f"文件 {file_code} 将在 {hours} 小时后过期\n"
-            f"如需保留,请及时续期"
+            _i18n_t('services.notifications.s6', icon=icon, file_code=file_code, hours=hours)
         )
     if ntype == NOTIF_TYPE_RECOVERY:
         count = payload.get("recovered_count", 0)
         return (
-            f"{icon} 恢复完成\n"
-            f"{count} 个文件已修复\n"
-            f"可正常使用文件码取件"
+            _i18n_t('services.notifications.s7', icon=icon, count=count)
         )
     if ntype == NOTIF_TYPE_TAKEDOWN:
         target = payload.get("target_code", "")
         reason = payload.get("reason", "")
         if reason:
             return (
-                f"{icon} 内容下架\n"
-                f"文件 {target} 已被下架\n"
-                f"原因: {reason}"
+                _i18n_t('services.notifications.s10', icon=icon, target=target, reason=reason)
             )
         return (
-            f"{icon} 内容下架\n"
-            f"文件 {target} 已被下架"
+            _i18n_t('services.notifications.s8', icon=icon, target=target)
         )
     if ntype == NOTIF_TYPE_BAN:
         reason = payload.get("reason", "")
         if reason:
             return (
-                f"{icon} 账号封禁\n"
-                f"原因: {reason}"
+                _i18n_t('services.notifications.s11', icon=icon, reason=reason)
             )
-        return f"{icon} 您的账号已被封禁"
+        return _i18n_t('services.notifications.s9', icon=icon)
     # 未知类型,展示原始内容(截断避免消息过长)
     payload_str = json.dumps(payload, ensure_ascii=False, default=str)[:200]
-    return f"{icon} 通知\n类型: {ntype}\n内容: {payload_str}"
+    return _i18n_t('services.notifications.s1', icon=icon, ntype=ntype, payload_str=payload_str)
 
 
 # R41 P1-12: 幂等通知投递 — 同一 dedup_key 1 小时内不重复投递

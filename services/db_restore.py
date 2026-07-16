@@ -33,6 +33,7 @@ from services.backup_schema import (
     BACKUP_SCHEMA, get_restore_tables, is_table_allowed, ALLOWED_COLUMNS,
     get_table_source, validate_columns_for_table,
 )
+from services.i18n import translate as _i18n_t
 from services.backup_crypto import (
     decrypt_payload,
     validate_manifest_on_restore,
@@ -62,7 +63,7 @@ def _sanitize_table(name: str) -> str:
     """白名单校验表名,防止 SQL 注入。"""
     clean = name.strip().lower()
     if clean not in _ALLOWED_TABLES:
-        raise ValueError(f"非法表名: {name}")
+        raise ValueError(_i18n_t('services.db_restore.s1', name=name))
     return clean
 
 
@@ -73,7 +74,7 @@ def _sanitize_column(name: str) -> str:
     """
     clean = name.strip().lower()
     if clean not in _ALLOWED_COLUMNS:
-        raise ValueError(f"非法列名: {name}")
+        raise ValueError(_i18n_t('services.db_restore.s2', name=name))
     return clean
 
 
@@ -688,14 +689,14 @@ async def run_restore(table: str = None, dry_run: bool = False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="从 R2 备份恢复数据库")
+    parser = argparse.ArgumentParser(description=_i18n_t('services.db_restore.s3'))
     parser.add_argument(
         "--table", type=str, default=None,
-        help="指定要恢复的表名（默认恢复所有表）",
+        help=_i18n_t('services.db_restore.s4'),
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="预览模式，不实际写入数据",
+        help=_i18n_t('services.db_restore.s5'),
     )
     args = parser.parse_args()
     asyncio.run(run_restore(table=args.table, dry_run=args.dry_run))

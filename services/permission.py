@@ -19,6 +19,7 @@ from database.cache_store import (
     get_user_quota, upsert_user_quota, increment_user_quota_used,
     try_consume_quota, refund_quota,
 )
+from services.i18n import translate as _i18n_t
 from config import settings
 from services.code_generator import extract_bot_username
 
@@ -49,7 +50,7 @@ def check_code_expired(file_record: dict) -> tuple[bool, str]:
     if expire_dt.tzinfo != datetime.timezone.utc:
         expire_dt = expire_dt.astimezone(datetime.timezone.utc)
     if expire_dt < now:
-        return True, "该文件码已过期"
+        return True, _i18n_t('services.permission.s1')
     return False, ""
 
 
@@ -233,9 +234,9 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
     # 从 CRDB 获取用户基础信息（等级/封禁状态）
     user = await get_user_cached(user_id)
     if user is None:
-        return DecodeResult(allowed=False, reason="用户未注册")
+        return DecodeResult(allowed=False, reason=_i18n_t('services.permission.s2'))
     if user.get("is_banned"):
-        return DecodeResult(allowed=False, reason="您的账户已被禁用")
+        return DecodeResult(allowed=False, reason=_i18n_t('services.permission.s3'))
 
     membership_level = user.get("membership_level", "free")
     # 路由匹配的无头码(如40位hash)不含bot名，由调用方传入 bot_username
@@ -243,13 +244,13 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
         bot_username = extract_bot_username(file_code)
     if not is_system_code(file_code):
         if not bot_username:
-            return DecodeResult(allowed=False, reason="无效的文件码格式，无法识别目标机器人。")
+            return DecodeResult(allowed=False, reason=_i18n_t('services.permission.s7'))
 
     # ─── SQLite First 配额 ─────────────────────────────────
     today = datetime.datetime.now(_CHINA_TZ).date()
     q = await _get_quota_sqlite_first(user_id)
     if not q:
-        return DecodeResult(allowed=False, reason="系统繁忙，请稍后重试")
+        return DecodeResult(allowed=False, reason=_i18n_t('services.permission.s4'))
     # 如果等级变了（管理员手动修改），同步到 SQLite,并立即更新配额上限,避免升级后当天仍按旧配额
     if q.get("level") != membership_level:
         q["level"] = membership_level
@@ -267,7 +268,7 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
     if membership_level != "premium" and used >= quota:
         return DecodeResult(
             allowed=False,
-            reason=f"今日解码次数已用完（{quota}次），请明天再试",
+            reason=_i18n_t('services.permission.s5', quota=quota),
             remaining_quota=0,
         )
 
@@ -277,12 +278,12 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
         if ext_quota == 0:
             return DecodeResult(
                 allowed=False,
-                reason="您没有非本系统码的解码权限。升级会员即可解锁此功能。",
+                reason=_i18n_t('services.permission.s8'),
             )
         if ext_quota != -1 and ext_used >= ext_quota:
             return DecodeResult(
                 allowed=False,
-                reason=f"今日非本系统码解码次数已用完（{ext_quota}次），请明天再试",
+                reason=_i18n_t('services.permission.s9', ext_quota=ext_quota),
             )
 
     # 查找文件记录（系统码走 CRDB，外部码不查）
@@ -295,7 +296,7 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
             from database import get_code_entry_cached
             code_entry = await get_code_entry_cached(file_code)
             if code_entry and code_entry.get("status") == "offline":
-                return DecodeResult(allowed=False, reason="文件不存在或已被删除")
+                return DecodeResult(allowed=False, reason=_i18n_t('services.permission.s11'))
             expired, reason = check_code_expired(file_record)
             if expired:
                 return DecodeResult(allowed=False, reason=reason)
@@ -317,9 +318,9 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
                     except ValueError:
                         current_count = 0
                 if current_count >= max_requests:
-                    return DecodeResult(allowed=False, reason=f"该文件码已达访问次数上限（{max_requests}次）")
+                    return DecodeResult(allowed=False, reason=_i18n_t('services.permission.s12', max_requests=max_requests))
         else:
-            return DecodeResult(allowed=False, reason="文件码无效")
+            return DecodeResult(allowed=False, reason=_i18n_t('services.permission.s10'))
 
     # ─── 原子预扣配额(乐观锁),解决 TOCTOU 竞态 ────
     # 并发场景下,若多个请求同时通过上面的"检查",再各自在投递成功后递增,
@@ -331,7 +332,7 @@ async def check_decode_permission(user_id: int, file_code: str, bot_username: st
         # 配额在 check 与 consume 之间被并发请求耗尽
         return DecodeResult(
             allowed=False,
-            reason="今日解码次数已用完，请明天再试",
+            reason=_i18n_t('services.permission.s6'),
         )
 
     # P2: 配额预扣成功后才递增 request_count,避免被拒用户消耗文件码访问次数

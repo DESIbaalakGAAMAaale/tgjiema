@@ -53,7 +53,7 @@ from utils.relay_auth import is_relay_sender_allowed
 # R40 P1-8: 维护模式检查装饰器(应用于高风险入口)
 from services.maintenance_mode import require_maintenance_check
 # R41 i18n: 国际化翻译(用户可见文本)
-from services.i18n import get_i18n_manager
+from services.i18n import get_i18n_manager, translate as _i18n_t
 
 
 def _t(user_id: int, key: str, **kwargs) -> str:
@@ -382,7 +382,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         # 退款: 中继成功发送但第三方解码失败,用户没收到文件,不应扣配额
         from services.permission import refund_user_quota
         await refund_user_quota(target_user_id, is_external=True)
-        await safe_send_message(context.bot, chat_id=target_user_id, text="外部文件码查询失败，该码可能已失效或暂时不可用，请稍后重试。")
+        await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s96'))
         return
 
     if is_renew:
@@ -413,7 +413,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
 
         if context:
             try:
-                await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。")
+                await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s134', code=code, settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME))
             except Exception:
                 pass
         return
@@ -423,7 +423,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     # A2: 走缓存，避免每次直查 CRDB
     record = await get_file_record_cached(code)
     if not record:
-        await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 已处理，请重新发送该码获取文件。")
+        await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s97', code=code))
         return
 
     storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
@@ -442,7 +442,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     try:
-        await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code} 将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。")
+        await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s98', code=code, settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME))
     except Exception:
         pass
 
@@ -480,14 +480,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 if pc["ext_code"]:
                     await safe_send_message(context.bot, chat_id=user.id,
-                        text=f"外部文件 {pc['ext_code']} 已就绪，请重新发送文件码即可查收。")
+                        text=_i18n_t('bot.idx.s142', pc_ext_code=pc['ext_code']))
                 else:
-                    note_line = f"\n备注：{pc['note']}" if pc["note"] and not _is_internal_note(pc["note"]) else ""
+                    note_line = _i18n_t('bot.idx.s122', pc_note=pc['note']) if pc["note"] and not _is_internal_note(pc["note"]) else ""
                     await safe_send_message(context.bot, chat_id=user.id,
-                        text=f"文件码：{pc['file_code']}{note_line}\n\n"
-                             f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
-                             f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
-                             f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
+                        text=_i18n_t('bot.idx.s143', pc_file_code=pc['file_code'], note_line=note_line, settings_UPLOAD_BOT_USERNAME=settings.UPLOAD_BOT_USERNAME, settings_DECODER_BOT_USERNAME=settings.DECODER_BOT_USERNAME, settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME))
                 await store.delete_pending_file_code(pc["id"])
                 sent_count += 1
             except Exception as send_err:
@@ -503,20 +500,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     await safe_reply_text(update.message,
-        "📁 文件解码机器人使用帮助\n\n"
-        "可用命令：\n"
-        "/start — 启动机器人 / 查看欢迎语\n"
-        "/help — 查看本帮助\n"
-        "/status — 查看会员等级与今日剩余解码次数\n"
-        "/my_codes — 查看我的文件码列表（可管理备注、过期时间、访问次数、停用/启用）\n\n"
-        "使用说明：\n"
-        "1. 获取文件：直接发送文件码即可获取对应文件。\n"
-        "2. 上传文件：请使用上传机器人发送文件，上传后会自动收到文件码。\n"
-        "3. 分享文件：将文件码分享给其他用户，对方发送给我即可获取文件。\n\n"
-        "会员权益：\n"
-        f"- 免费用户：每日解码 {settings.FREE_DAILY_QUOTA} 次，仅限本系统文件码\n"
-        f"- 基础会员：每日解码 {settings.BASIC_DAILY_QUOTA} 次，可解码非本系统文件码\n"
-        f"- 高级会员：无限解码，可解码非本系统文件码\n"
+        _i18n_t('bot.idx.s55', settings_FREE_DAILY_QUOTA=settings.FREE_DAILY_QUOTA, settings_BASIC_DAILY_QUOTA=settings.BASIC_DAILY_QUOTA)
         + common_faq()
     )
 
@@ -532,8 +516,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # R41 i18n: 系统繁忙提示走 locale 翻译
         await safe_reply_text(update.message, "⚠️ " + _t(user.id, "bot.system_busy"))
         return
-    level_map = {"free": "免费用户", "basic": "基础会员", "premium": "高级会员"}
-    level_name = level_map.get(db_user.get("membership_level"), "未知")
+    level_map = {"free": _i18n_t('bot.idx.s4'), "basic": _i18n_t('bot.idx.s5'), "premium": _i18n_t('bot.idx.s6')}
+    level_name = level_map.get(db_user.get("membership_level"), _i18n_t('bot.idx.s7'))
 
     # 从本地 SQLite 读取配额（更准确）
     from database.cache_store import get_user_quota
@@ -565,14 +549,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ext_used = db_user.get("external_used_today", 0) if ext_date == today else 0
 
     if db_user.get("membership_level") == "premium":
-        quota_str = "无限"
+        quota_str = _i18n_t('bot.idx.s8')
     else:
         quota_str = f"{max(0, total - used)}/{total}"
 
     if ext_quota == -1:
-        ext_str = "不限"
+        ext_str = _i18n_t('bot.idx.s9')
     elif ext_quota == 0:
-        ext_str = "无权"
+        ext_str = _i18n_t('bot.idx.s31')
     else:
         ext_str = f"{max(0, ext_quota - ext_used)}/{ext_quota}"
 
@@ -679,7 +663,7 @@ async def _generate_unique_code_with_retry(
             logger.warning(f"[Idx][R45] 码冲突检测异常 attempt={attempt+1}: {e}")
 
     raise RuntimeError(
-        f"码生成冲突,已重试 {max_retries} 次仍失败"
+        _i18n_t('bot.idx.s10', max_retries=max_retries)
     )
 
 
@@ -891,7 +875,7 @@ async def _process_one_pending(app: Application, row: dict):
             try:
                 await safe_send_message(
                     app.bot, chat_id=uploader_id,
-                    text="⚠️ 您的文件上传数据处理异常(数据残缺),请重新上传。如问题持续,请联系管理员。"
+                    text=_i18n_t('bot.idx.s135')
                 )
             except Exception as e:
                 logger.warning(f"[Idx] 通知上传者数据残缺失败: {e}")
@@ -1151,11 +1135,8 @@ async def _process_one_pending(app: Application, row: dict):
                 except Exception as send_err:
                     await store.add_pending_file_code(uploader_id, file_code, note, ext_code or "")
         else:
-            note_line = f"\n备注：{note}" if note and not _is_internal_note(note) else ""
-            msg_text = (f"文件码：{file_code}{note_line}\n\n"
-                     f"📤 发送文件 @{settings.UPLOAD_BOT_USERNAME}\n"
-                     f"🔍 收码解码 @{settings.DECODER_BOT_USERNAME}\n"
-                     f"📥 收取文件 @{settings.SENDER_BOT_USERNAME}")
+            note_line = _i18n_t('bot.idx.s56', note=note) if note and not _is_internal_note(note) else ""
+            msg_text = (_i18n_t('bot.idx.s32', file_code=file_code, note_line=note_line, settings_UPLOAD_BOT_USERNAME=settings.UPLOAD_BOT_USERNAME, settings_DECODER_BOT_USERNAME=settings.DECODER_BOT_USERNAME, settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME))
             try:
                 await safe_send_message(app.bot, chat_id=uploader_id, text=msg_text)
                 logger.info(f"[Idx][poll] 文件码已发送给用户 {uploader_id}: {file_code}")
@@ -1259,7 +1240,7 @@ async def _process_pending_uploads(app: Application):
 
 # ─── 内部码解───
 
-@require_maintenance_check(action="解码文件")
+@require_maintenance_check(action=_i18n_t('bot.idx.s11'))
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_force_join(update, context):
@@ -1340,7 +1321,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.quota_consumed:
             from services.permission import refund_user_quota
             await refund_user_quota(user.id, is_external=False)
-        await safe_reply_text(update.message, "文件不存在或已被删除")
+        await safe_reply_text(update.message, _i18n_t('bot.idx.s57'))
         return
     blocked = file_record.get("blocked_users")
     if isinstance(blocked, list) and user.id in blocked:
@@ -1348,7 +1329,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.quota_consumed:
             from services.permission import refund_user_quota
             await refund_user_quota(user.id, is_external=False)
-        await safe_reply_text(update.message, "文件不存在或已被删除")
+        await safe_reply_text(update.message, _i18n_t('bot.idx.s58'))
         return
 
     # ── 合集码:展开后批量派发(合集中的文件码不额外消耗配额) ──
@@ -1356,7 +1337,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 合集中的文件码可能本身也是合集 — 不递归处理,直接按普通码派发。
     if result.is_collection:
         sub_codes = result.collection_codes or []
-        await safe_reply_text(update.message, f"📦 合集包含 {len(sub_codes)} 个文件，正在批量发送...")
+        await safe_reply_text(update.message, _i18n_t('bot.idx.s59', len_sub_codes=len(sub_codes)))
         sub_ok = 0
         sub_fail = 0
         for sub_code in sub_codes:
@@ -1435,7 +1416,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if result.quota_consumed:
                 from services.permission import refund_user_quota
                 await refund_user_quota(user.id, is_external=False)
-            await safe_reply_text(update.message, "文件记录异常，请联系管理员")
+            await safe_reply_text(update.message, _i18n_t('bot.idx.s99'))
             return
         msg_ids = [primary_mid]
 
@@ -1470,7 +1451,7 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📤 " + _t(user.id, "bot.file_send_pending",
                     bot_username=settings.SENDER_BOT_USERNAME),
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{text}")
+            InlineKeyboardButton(_i18n_t('bot.idx.s144'), callback_data=f"report_req|{text}")
         ]])
     )
 
@@ -1505,7 +1486,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for k in stale:
         _report_debounce.pop(k, None)
     if key in _report_debounce and now - _report_debounce[key] < 60:
-        await query.answer("已提交举报，请勿重复操作", show_alert=True)
+        await query.answer(_i18n_t('bot.idx.s60'), show_alert=True)
         return
     _report_debounce[key] = now
 
@@ -1519,7 +1500,7 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if sys_code:
                 file_record = await get_file_record_cached(sys_code)
             if not file_record:
-                await query.answer("文件记录不存在", show_alert=True)
+                await query.answer(_i18n_t('bot.idx.s123'), show_alert=True)
                 return
     except Exception as e:
         logger.error(f"[Idx][report] 查询文件失败: {e}")
@@ -1530,19 +1511,14 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reporter_username = f"@{reporter.username}" if reporter.username else str(reporter.id)
 
     report_text = (
-        f"🚨 文件举报\n\n"
-        f"📁 文件码: {file_code}\n"
-        f"👤 上传者: {uploader_id}\n"
-        f"👤 举报人: {reporter.id} ({reporter_username})\n"
-        f"📋 来源: Idx Bot\n"
-        f"⏰ 时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        _i18n_t('bot.idx.s1', file_code=file_code, uploader_id=uploader_id, reporter_id=reporter.id, reporter_username=reporter_username, datetime_datetime_now_strftime_Y_m_d_H_M_S=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔒 封禁上传者", callback_data=f"report:ban|{uploader_id}|{reporter.id}|idx")],
-        [InlineKeyboardButton("🔗 脱钩文件码", callback_data=f"report:detach|{file_code}|{reporter.id}|idx")],
-        [InlineKeyboardButton("🚫 限制举报人", callback_data=f"report:block|{file_code}|{reporter.id}")],
-        [InlineKeyboardButton("✅ 忽略", callback_data="report:ignore")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s100'), callback_data=f"report:ban|{uploader_id}|{reporter.id}|idx")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s101'), callback_data=f"report:detach|{file_code}|{reporter.id}|idx")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s102'), callback_data=f"report:block|{file_code}|{reporter.id}")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s103'), callback_data="report:ignore")],
     ])
 
     # 通过 Admin Bot 发送，确保操作按钮回调能回到 Admin Bot 处理
@@ -1565,26 +1541,26 @@ def _format_code_status(code_entry: dict) -> str:
     status = code_entry.get("status", "active")
     if status == "offline":
         status_icon = "🚫"
-        status_text = "已下架"
+        status_text = _i18n_t('bot.idx.s12')
     elif status == "expired":
         status_icon = "⏰"
-        status_text = "已过期"
+        status_text = _i18n_t('bot.idx.s33')
     else:
         status_icon = "✅"
-        status_text = "正常"
+        status_text = _i18n_t('bot.idx.s34')
 
     note = code_entry.get("note", "")
     expire_time = code_entry.get("expire_time", "")
 
-    parts = [f"   状态：{status_icon} {status_text}"]
+    parts = [_i18n_t('bot.idx.s13', status_icon=status_icon, status_text=status_text)]
     if note and not _is_internal_note(note):
         # 截断过长的备注
         display_note = note[:20] + ("..." if len(note) > 20 else "")
-        parts.append(f"备注：{display_note}")
+        parts.append(_i18n_t('bot.idx.s35', display_note=display_note))
     if expire_time:
         try:
             exp_dt = datetime.datetime.fromisoformat(expire_time)
-            parts.append(f"到期：{exp_dt.strftime('%Y-%m-%d')}")
+            parts.append(_i18n_t('bot.idx.s61', exp_dt_strftime_Y_m_d=exp_dt.strftime('%Y-%m-%d')))
         except (ValueError, TypeError):
             pass
 
@@ -1614,7 +1590,7 @@ async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         codes_col = get_codes_col()
         total_rows = await codes_col.count_documents({"uploader_id": user.id})
         if total_rows == 0:
-            await safe_reply_text(update.message, "您还没有上传过文件码。")
+            await safe_reply_text(update.message, _i18n_t('bot.idx.s104'))
             return
         # N-M15: 将基线传入 get_user_code_count，确保后续调用使用正确基线
         total_rows = get_user_code_count(user.id, base=total_rows)
@@ -1646,8 +1622,8 @@ async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         detail = _format_code_status(row)
         items.append(f"{i}. {code}\n{detail}")
 
-    header = f"📋 我的文件码（共 {total_rows} 个，显示 {skip + 1}-{min(skip + _PAGE_SIZE, total_rows)}）"
-    page_info = f"\n\n共 {total_pages} 页，当前第 {page} 页"
+    header = _i18n_t('bot.idx.s2', total_rows=total_rows, skip_1=skip + 1, min_skip_PAGE_SIZE_total_rows=min(skip + _PAGE_SIZE, total_rows))
+    page_info = _i18n_t('bot.idx.s3', total_pages=total_pages, page=page)
 
     # 构建内联键盘: 每个文件码一行管理按钮
     kb = []
@@ -1657,9 +1633,9 @@ async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 分页按钮
     page_row = []
     if page > 1:
-        page_row.append(InlineKeyboardButton("⬅ 上一页", callback_data=f"mycode:page|{page - 1}"))
+        page_row.append(InlineKeyboardButton(_i18n_t('bot.idx.s62'), callback_data=f"mycode:page|{page - 1}"))
     if page < total_pages:
-        page_row.append(InlineKeyboardButton("下一页 ➡", callback_data=f"mycode:page|{page + 1}"))
+        page_row.append(InlineKeyboardButton(_i18n_t('bot.idx.s63'), callback_data=f"mycode:page|{page + 1}"))
     if page_row:
         kb.append(page_row)
 
@@ -1712,17 +1688,17 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
         # 静默：不透露该码是否存在
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s64'))
         return
 
     # 构建详情
     status = code_entry.get("status", "active")
     if status == "offline":
-        status_text = "🚫 已下架"
+        status_text = _i18n_t('bot.idx.s14')
     elif status == "expired":
-        status_text = "⏰ 已过期"
+        status_text = _i18n_t('bot.idx.s36')
     else:
-        status_text = "✅ 正常"
+        status_text = _i18n_t('bot.idx.s37')
 
     note = code_entry.get("note", "")
     expire_time = code_entry.get("expire_time", "")
@@ -1733,48 +1709,48 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
     try:
         ft = json.loads(file_types_raw) if isinstance(file_types_raw, str) else file_types_raw
         type_parts = [f"{v}{k}" for k, v in ft.items()] if isinstance(ft, dict) else []
-        type_text = ", ".join(type_parts) if type_parts else "未知"
+        type_text = ", ".join(type_parts) if type_parts else _i18n_t('bot.idx.s38')
     except (json.JSONDecodeError, TypeError):
-        type_text = "未知"
+        type_text = _i18n_t('bot.idx.s39')
 
     detail_lines = [
-        "📋 文件码详情",
+        _i18n_t('bot.idx.s15'),
         "",
-        f"码：{code}",
-        f"状态：{status_text}",
+        _i18n_t('bot.idx.s16', code=code),
+        _i18n_t('bot.idx.s17', status_text=status_text),
     ]
     if note and not _is_internal_note(note):
-        detail_lines.append(f"备注：{note}")
+        detail_lines.append(_i18n_t('bot.idx.s40', note=note))
     if expire_time:
         try:
             exp_dt = datetime.datetime.fromisoformat(expire_time)
-            detail_lines.append(f"有效期：{exp_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            detail_lines.append(_i18n_t('bot.idx.s65', exp_dt_strftime_Y_m_d_H_M_S=exp_dt.strftime('%Y-%m-%d %H:%M:%S')))
         except (ValueError, TypeError):
-            detail_lines.append(f"有效期：{expire_time}")
+            detail_lines.append(_i18n_t('bot.idx.s105', expire_time=expire_time))
     if created_at:
         try:
             cr_dt = datetime.datetime.fromisoformat(created_at)
-            detail_lines.append(f"上传时间：{cr_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            detail_lines.append(_i18n_t('bot.idx.s66', cr_dt_strftime_Y_m_d_H_M_S=cr_dt.strftime('%Y-%m-%d %H:%M:%S')))
         except (ValueError, TypeError):
-            detail_lines.append(f"上传时间：{created_at}")
-    detail_lines.append(f"文件类型：{type_text}")
+            detail_lines.append(_i18n_t('bot.idx.s106', created_at=created_at))
+    detail_lines.append(_i18n_t('bot.idx.s18', type_text=type_text))
 
     # 构建操作按钮
     kb = [
         [
-            InlineKeyboardButton("✏️ 修改备注", callback_data=f"mycode:edit_note|{code}"),
-            InlineKeyboardButton("⏰ 设置有效期", callback_data=f"mycode:set_expiry|{code}"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s67'), callback_data=f"mycode:edit_note|{code}"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s68'), callback_data=f"mycode:set_expiry|{code}"),
         ],
-        [InlineKeyboardButton("📋 设置访问次数", callback_data=f"mycode:set_access_limit|{code}")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s69'), callback_data=f"mycode:set_access_limit|{code}")],
     ]
     if status == "offline":
-        kb.append([InlineKeyboardButton("✅ 恢复上架", callback_data=f"mycode:toggle_status|{code}|active")])
+        kb.append([InlineKeyboardButton(_i18n_t('bot.idx.s107'), callback_data=f"mycode:toggle_status|{code}|active")])
     else:
-        kb.append([InlineKeyboardButton("🚫 立刻下架", callback_data=f"mycode:toggle_status|{code}|offline")])
+        kb.append([InlineKeyboardButton(_i18n_t('bot.idx.s108'), callback_data=f"mycode:toggle_status|{code}|offline")])
 
     kb.extend([
-        [InlineKeyboardButton("📊 查看统计", callback_data=f"mycode:stats|{code}")],
-        [InlineKeyboardButton("🔙 返回列表", callback_data="mycode:list")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s109'), callback_data=f"mycode:stats|{code}")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s110'), callback_data="mycode:list")],
     ])
 
     await query.edit_message_text("\n".join(detail_lines), reply_markup=InlineKeyboardMarkup(kb))
@@ -1812,7 +1788,7 @@ async def my_code_edit_note_callback(update: Update, context: ContextTypes.DEFAU
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s70'))
         return
 
     # 保存当前 code 到用户上下文，等待输入
@@ -1821,9 +1797,7 @@ async def my_code_edit_note_callback(update: Update, context: ContextTypes.DEFAU
 
     old_note = code_entry.get("note", "")
     await query.edit_message_text(
-        f"📝 修改备注\n\n"
-        f"当前备注：{old_note if old_note else '（空）'}\n\n"
-        f"请输入新备注（发送 /cancel 取消）",
+        _i18n_t('bot.idx.s41', old_note_if_old_note_else=old_note if old_note else '（空）'),
     )
 
 
@@ -1848,7 +1822,7 @@ async def my_code_set_expiry_callback(update: Update, context: ContextTypes.DEFA
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s71'))
         return
 
     context.user_data["_manage_code"] = code
@@ -1862,26 +1836,24 @@ async def my_code_set_expiry_callback(update: Update, context: ContextTypes.DEFA
         except (ValueError, TypeError):
             expire_text = expire_time
     else:
-        expire_text = "永久"
+        expire_text = _i18n_t('bot.idx.s19')
 
     kb = [
         [
-            InlineKeyboardButton("1天", callback_data=f"mycode:expiry_pick|{code}|1"),
-            InlineKeyboardButton("7天", callback_data=f"mycode:expiry_pick|{code}|7"),
-            InlineKeyboardButton("30天", callback_data=f"mycode:expiry_pick|{code}|30"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s72'), callback_data=f"mycode:expiry_pick|{code}|1"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s73'), callback_data=f"mycode:expiry_pick|{code}|7"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s74'), callback_data=f"mycode:expiry_pick|{code}|30"),
         ],
         [
-            InlineKeyboardButton("90天", callback_data=f"mycode:expiry_pick|{code}|90"),
-            InlineKeyboardButton("自定义", callback_data=f"mycode:expiry_custom|{code}"),
-            InlineKeyboardButton("永久", callback_data=f"mycode:expiry_pick|{code}|0"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s75'), callback_data=f"mycode:expiry_pick|{code}|90"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s76'), callback_data=f"mycode:expiry_custom|{code}"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s77'), callback_data=f"mycode:expiry_pick|{code}|0"),
         ],
-        [InlineKeyboardButton("🔙 返回", callback_data=f"mycode:detail|{code}")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s78'), callback_data=f"mycode:detail|{code}")],
     ]
 
     await query.edit_message_text(
-        f"⏰ 设置有效期\n\n"
-        f"当前有效期: {expire_text}\n\n"
-        f"请选择新有效期：",
+        _i18n_t('bot.idx.s42', expire_text=expire_text),
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -1909,7 +1881,7 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s79'))
         return
 
     # 计算新过期时间
@@ -1931,8 +1903,7 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     invalidate_user_codes(user.id)
 
     await query.edit_message_text(
-        f"✅ 有效期已设置为 {days} 天后\n\n"
-        f"[{code}]"
+        _i18n_t('bot.idx.s43', days=days, code=code)
     )
 
 
@@ -1951,18 +1922,14 @@ async def my_code_expiry_custom_callback(update: Update, context: ContextTypes.D
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code})
     if not code_entry or code_entry.get("uploader_id") != (update.effective_user and update.effective_user.id):
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s80'))
         return
 
     context.user_data["_manage_code"] = code
     context.user_data["_manage_action"] = "set_expiry_custom"
 
     await query.edit_message_text(
-        "请输入自定义有效期，格式：\n"
-        "1. 天数，如 15（表示 15 天后过期）\n"
-        "2. ISO 时间，如 2026-12-31T23:59:59\n"
-        "3. 0 或 permanent 表示永久有效\n\n"
-        "（发送 /cancel 取消）"
+        _i18n_t('bot.idx.s44')
     )
 
 
@@ -1987,7 +1954,7 @@ async def my_code_set_access_limit_callback(update: Update, context: ContextType
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s81'))
         return
 
     # 读取当前 max_requests（从 file_records 缓存）
@@ -1999,16 +1966,13 @@ async def my_code_set_access_limit_callback(update: Update, context: ContextType
         except (ValueError, TypeError):
             current_limit = 0
 
-    current_text = f"{current_limit} 次" if current_limit > 0 else "不限制"
+    current_text = _i18n_t('bot.idx.s20', current_limit=current_limit) if current_limit > 0 else _i18n_t('bot.idx.s21')
 
     context.user_data["_manage_code"] = code
     context.user_data["_manage_action"] = "set_access_limit"
 
     await query.edit_message_text(
-        f"📋 设置访问次数限制\n\n"
-        f"当前限制：{current_text}\n\n"
-        f"请输入最大访问次数（0=不限制）：\n"
-        f"（发送 /cancel 取消）"
+        _i18n_t('bot.idx.s45', current_text=current_text)
     )
 
 
@@ -2035,24 +1999,21 @@ async def my_code_toggle_status_callback(update: Update, context: ContextTypes.D
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s82'))
         return
 
-    action_text = "下架" if new_status == "offline" else "恢复上架"
+    action_text = _i18n_t('bot.idx.s22') if new_status == "offline" else _i18n_t('bot.idx.s23')
 
     # 二次确认
     kb = [
         [
-            InlineKeyboardButton(f"确认{action_text}", callback_data=f"mycode:confirm_{new_status}|{code}"),
-            InlineKeyboardButton("取消", callback_data=f"mycode:detail|{code}"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s83', action_text=action_text), callback_data=f"mycode:confirm_{new_status}|{code}"),
+            InlineKeyboardButton(_i18n_t('bot.idx.s84'), callback_data=f"mycode:detail|{code}"),
         ]
     ]
 
     await query.edit_message_text(
-        f"⚠️ 确认{action_text}\n\n"
-        f"文件码：{code}\n"
-        f"此操作后其他人将无法解码此文件。\n\n"
-        f"确定要继续吗？",
+        _i18n_t('bot.idx.s46', action_text=action_text, code=code),
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -2078,14 +2039,14 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
     code = parts[1]
 
     if new_status not in ("offline", "active"):
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s85'))
         return
 
     # 权限校验
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s86'))
         return
 
     # 写入缓冲
@@ -2115,8 +2076,8 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
     from database.cache import invalidate_user_codes
     invalidate_user_codes(user.id)
 
-    status_text = "下架" if new_status == "offline" else "恢复上架"
-    await query.edit_message_text(f"✅ 已{status_text}文件码 [{code}]")
+    status_text = _i18n_t('bot.idx.s24') if new_status == "offline" else _i18n_t('bot.idx.s25')
+    await query.edit_message_text(_i18n_t('bot.idx.s47', status_text=status_text, code=code))
 
 
 async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2140,7 +2101,7 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text("操作失败")
+        await query.edit_message_text(_i18n_t('bot.idx.s87'))
         return
 
     # 从 decode_log_buffer 查解码次数（SQLite 本地）
@@ -2171,20 +2132,20 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
         pass
 
     stats_lines = [
-        "📊 文件码统计",
+        _i18n_t('bot.idx.s26'),
         "",
-        f"码：{code}",
-        f"总解码次数：{decode_count}",
+        _i18n_t('bot.idx.s27', code=code),
+        _i18n_t('bot.idx.s28', decode_count=decode_count),
     ]
     if last_decode:
         try:
             dt = datetime.datetime.fromisoformat(last_decode)
-            stats_lines.append(f"最近解码：{dt.strftime('%Y-%m-%d %H:%M:%S')}")
+            stats_lines.append(_i18n_t('bot.idx.s88', dt_strftime_Y_m_d_H_M_S=dt.strftime('%Y-%m-%d %H:%M:%S')))
         except (ValueError, TypeError):
             pass
 
     kb = [
-        [InlineKeyboardButton("🔙 返回详情", callback_data=f"mycode:detail|{code}")],
+        [InlineKeyboardButton(_i18n_t('bot.idx.s89'), callback_data=f"mycode:detail|{code}")],
     ]
 
     await query.edit_message_text("\n".join(stats_lines), reply_markup=InlineKeyboardMarkup(kb))
@@ -2200,7 +2161,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
     if text == "/cancel":
         context.user_data.pop("_manage_code", None)
         context.user_data.pop("_manage_action", None)
-        await update.message.reply_text("操作已取消")
+        await update.message.reply_text(_i18n_t('bot.idx.s90'))
         return
 
     action = context.user_data.get("_manage_action")
@@ -2213,7 +2174,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await update.message.reply_text("操作失败")
+        await update.message.reply_text(_i18n_t('bot.idx.s91'))
         context.user_data.pop("_manage_code", None)
         context.user_data.pop("_manage_action", None)
         return
@@ -2229,7 +2190,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         # E7: 失效用户码列表缓存
         from database.cache import invalidate_user_codes
         invalidate_user_codes(user.id)
-        await update.message.reply_text(f"✅ 备注已更新为：{text}")
+        await update.message.reply_text(_i18n_t('bot.idx.s92', text=text))
 
     elif action == "set_expiry_custom":
         try:
@@ -2246,7 +2207,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
                     exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
                 new_expire = exp_dt.isoformat()
             except ValueError:
-                await update.message.reply_text("格式不正确，请输入天数（如 15）或 ISO 时间（如 2026-12-31T23:59:59）")
+                await update.message.reply_text(_i18n_t('bot.idx.s149'))
                 return
 
         if new_expire:
@@ -2262,7 +2223,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         from database.cache import invalidate_user_codes
         invalidate_user_codes(user.id)
 
-        await update.message.reply_text("✅ 有效期已更新")
+        await update.message.reply_text(_i18n_t('bot.idx.s111'))
 
     elif action == "set_access_limit":
         # 设置访问次数限制（max_requests，0=不限制）
@@ -2271,7 +2232,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
             if max_req < 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("❌ 请输入非负整数（0=不限制）")
+            await update.message.reply_text(_i18n_t('bot.idx.s145'))
             return
 
         # 写入 code_change_buffer（类型 access_limit → 同步到 file_records.max_requests）
@@ -2285,7 +2246,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
             logger.warning(f"[Idx] 同步 max_requests 到本地缓存失败 code={code}: {e}")
 
         limit_text = f"{max_req} 次" if max_req > 0 else "不限制"
-        await update.message.reply_text(f"✅ 访问次数限制已设置为：{limit_text}")
+        await update.message.reply_text(_i18n_t('bot.idx.s124', limit_text=limit_text))
 
     context.user_data.pop("_manage_code", None)
     context.user_data.pop("_manage_action", None)
@@ -2299,7 +2260,7 @@ async def my_code_cancel_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     context.user_data.pop("_manage_code", None)
     context.user_data.pop("_manage_action", None)
-    await query.edit_message_text("操作已取消")
+    await query.edit_message_text(_i18n_t('bot.idx.s48'))
 
 
 # ─── 外部码处───
@@ -2337,9 +2298,9 @@ async def _dispatch_external_from_record(update, user_id, code, file_code, file_
     logger.info(f"[Idx][external] 已映射码直接调度({source}): code={code}, fc={file_code}")
     await safe_reply_text(
         update.message,
-        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+        _i18n_t('bot.idx.s49', settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME),
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+            InlineKeyboardButton(_i18n_t('bot.idx.s146'), callback_data=f"report_req|{code}")
         ]])
     )
     metrics.decode_count += 1
@@ -2384,7 +2345,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             if _cached_rec and _cached_rec.get("file_code"):
                 _cached_fc = _cached_rec["file_code"]
                 await _relay_db.update_mapped_file_code(code, _cached_fc)
-                await _dispatch_external_from_record(update, user_id, code, _cached_fc, _cached_rec, "反查缓存")
+                await _dispatch_external_from_record(update, user_id, code, _cached_fc, _cached_rec, _i18n_t('bot.idx.s125'))
                 return
             # 反查无果：清除脏标记，继续走配额检查 + 中继
             await _relay_db.unmark_code(code)
@@ -2431,9 +2392,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                 # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
                 await safe_reply_text(
                     update.message,
-                    f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+                    _i18n_t('bot.idx.s126', settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME),
                     reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                        InlineKeyboardButton(_i18n_t('bot.idx.s150'), callback_data=f"report_req|{code}")
                     ]])
                 )
                 metrics.decode_count += 1
@@ -2445,7 +2406,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user_id, is_external=True)
-                await safe_reply_text(update.message, "外部文件码发送失败，请稍后重试")
+                await safe_reply_text(update.message, _i18n_t('bot.idx.s136'))
                 return
         else:
             logger.warning(f"[Idx][external] 映射的系统码 {system_code} file_record,回退到外部查")
@@ -2460,9 +2421,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
     remaining_info = ""
     parts = []
     if result and result.remaining_quota >= 0:
-        parts.append(f"总解码剩{result.remaining_quota}")
+        parts.append(_i18n_t('bot.idx.s50', result_remaining_quota=result.remaining_quota))
     if result and result.remaining_external_quota >= 0:
-        parts.append(f"外部码剩{result.remaining_external_quota}")
+        parts.append(_i18n_t('bot.idx.s51', result_remaining_external_quota=result.remaining_external_quota))
     remaining_info = " | ".join(parts)
 
     # 从账号池获取最优中继账负载均衡)
@@ -2484,7 +2445,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         if ok:
             await _enqueue_external(bot_username, user_id, code)
             # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
-            await safe_reply_text(update.message, f"正在查询外部文件，请稍候查收。\n{remaining_info}")
+            await safe_reply_text(update.message, _i18n_t('bot.idx.s112', remaining_info=remaining_info))
             metrics.decode_count += 1
             await metrics.record_processed("idx_bot")
             return
@@ -2507,9 +2468,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                     await _dispatch_to_dsp(user_id, system_code_retry, storage_channel_r, msg_ids_r, batch_file_meta_r, protect_content_r)
                     await safe_reply_text(
                         update.message,
-                        f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+                        _i18n_t('bot.idx.s137', settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME),
                         reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                            InlineKeyboardButton(_i18n_t('bot.idx.s151'), callback_data=f"report_req|{code}")
                         ]])
                     )
                     metrics.decode_count += 1
@@ -2548,9 +2509,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                         logger.info(f"[Idx][external] 从 mapped_codes 直接调度: code={code}, file_code={mapped_fc}")
                         await safe_reply_text(
                             update.message,
-                            f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+                            _i18n_t('bot.idx.s147', settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME),
                             reply_markup=InlineKeyboardMarkup([[
-                                InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                                InlineKeyboardButton(_i18n_t('bot.idx.s152'), callback_data=f"report_req|{code}")
                             ]])
                         )
                         metrics.decode_count += 1
@@ -2582,9 +2543,9 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                         logger.info(f"[Idx][external] 从本地缓存反查到文件，直接调度: code={code}, file_code={cached_fc}")
                         await safe_reply_text(
                             update.message,
-                            f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。",
+                            _i18n_t('bot.idx.s148', settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME),
                             reply_markup=InlineKeyboardMarkup([[
-                                InlineKeyboardButton("⚠️ 举报", callback_data=f"report_req|{code}")
+                                InlineKeyboardButton(_i18n_t('bot.idx.s153'), callback_data=f"report_req|{code}")
                             ]])
                         )
                         metrics.decode_count += 1
@@ -2599,7 +2560,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
                     await refund_user_quota(user_id, is_external=True)
                 await safe_reply_text(
                     update.message,
-                    "文件码已重置，请重新发送该文件码获取文件。"
+                    _i18n_t('bot.idx.s127')
                 )
                 return
         except Exception as e:
@@ -2608,7 +2569,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             if result.quota_consumed:
                 from services.permission import refund_user_quota
                 await refund_user_quota(user_id, is_external=True)
-            await safe_reply_text(update.message, "外部码解码失败，请稍后重试")
+            await safe_reply_text(update.message, _i18n_t('bot.idx.s128'))
             return
 
         # 中继发送失败,继续回退到直接发送;配额暂不回滚(后续路径可能成功)
@@ -2617,7 +2578,7 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
         await safe_send_message(context.bot, chat_id=bot_username, text=code)
         await _enqueue_external(bot_username, user_id, code)
         # 配额已在 check_decode_permission 中预扣,投递成功无需再递增
-        await safe_reply_text(update.message, f"正在查询外部文件，请稍候查收。\n{remaining_info}")
+        await safe_reply_text(update.message, _i18n_t('bot.idx.s93', remaining_info=remaining_info))
         metrics.decode_count += 1
         await metrics.record_processed("idx_bot")
     except Exception as e:
@@ -2629,10 +2590,10 @@ async def handle_external_code(update, context, user_id, code, bot_username, res
             await refund_user_quota(user_id, is_external=True)
         if "chat not found" in err_msg.lower() or "nobody is using" in err_msg.lower():
             await safe_reply_text(update.message,
-                f"机器人 @{bot_username} 未找到，请检查文件码中的机器人用户名是否正确"
+                _i18n_t('bot.idx.s129', bot_username=bot_username)
             )
         else:
-            await safe_reply_text(update.message, "外部码解码功能暂不可用，请联系管理员配置用户中继")
+            await safe_reply_text(update.message, _i18n_t('bot.idx.s130'))
 
 
 async def handle_external_file_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2693,7 +2654,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         record = await get_file_record_cached(code_part)
         if not record:
             try:
-                await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code_part} 发送失败，请稍后重试。")
+                await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s138', code_part=code_part))
             except Exception:
                 pass
             return True
@@ -2727,15 +2688,15 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # 限流与用户初始化(整批只做一次,避免逐码重复消耗限流令牌)
     if not await global_rate_limiter.acquire():
-        await safe_reply_text(update.message, "系统繁忙，请稍后重试")
+        await safe_reply_text(update.message, _i18n_t('bot.idx.s94'))
         return
     if not await user_rate_limiter.acquire(user.id):
-        await safe_reply_text(update.message, "操作过于频繁，请稍后重试")
+        await safe_reply_text(update.message, _i18n_t('bot.idx.s95'))
         return
     await dynamic_rate_limiter.acquire(get_pending_jobs_count_local)
     await get_or_create_user(user.id, username=user.username, first_name=user.first_name)
 
-    await safe_reply_text(update.message, f"🔄 正在处理 {len(codes)} 个文件码，请稍候...")
+    await safe_reply_text(update.message, _i18n_t('bot.idx.s52', len_codes=len(codes)))
 
     success_codes: list[str] = []
     failed_codes: list[tuple[str, str]] = []
@@ -2795,9 +2756,9 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if sub_ok == 0 and result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user.id, is_external=False)
-                    failed_codes.append((code, f"合集内 {sub_fail} 个文件全部失败"))
+                    failed_codes.append((code, _i18n_t('bot.idx.s139', sub_fail=sub_fail)))
                 else:
-                    success_codes.append(f"{code}(合集:{sub_ok}成功/{sub_fail}失败)")
+                    success_codes.append(_i18n_t('bot.idx.s131', code=code, sub_ok=sub_ok, sub_fail=sub_fail))
                 metrics.decode_count += 1
                 continue
 
@@ -2807,14 +2768,14 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user.id, is_external=False)
-                failed_codes.append((code, "文件不存在或已被删除"))
+                failed_codes.append((code, _i18n_t('bot.idx.s132')))
                 continue
             blocked = file_record.get("blocked_users")
             if isinstance(blocked, list) and user.id in blocked:
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user.id, is_external=False)
-                failed_codes.append((code, "文件不存在或已被删除"))
+                failed_codes.append((code, _i18n_t('bot.idx.s133')))
                 continue
 
             storage_channel = file_record.get("primary_channel_id") or await _get_storage_channel()
@@ -2828,7 +2789,7 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
                     if result.quota_consumed:
                         from services.permission import refund_user_quota
                         await refund_user_quota(user.id, is_external=False)
-                    failed_codes.append((code, "文件记录异常"))
+                    failed_codes.append((code, _i18n_t('bot.idx.s140')))
                     continue
                 msg_ids = [primary_mid]
 
@@ -2848,7 +2809,7 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
                 if result.quota_consumed:
                     from services.permission import refund_user_quota
                     await refund_user_quota(user.id, is_external=False)
-                failed_codes.append((code, "发送失败"))
+                failed_codes.append((code, _i18n_t('bot.idx.s141')))
                 continue
 
             success_codes.append(code)
@@ -2858,18 +2819,18 @@ async def _handle_batch_codes(update: Update, context: ContextTypes.DEFAULT_TYPE
             failed_codes.append((code, "处理异常"))
 
     # ── 汇总结果 ──
-    summary_lines = [f"📦 批量取件完成（共 {len(codes)} 个）："]
+    summary_lines = [_i18n_t('bot.idx.s29', len_codes=len(codes))]
     if success_codes:
-        summary_lines.append(f"✅ 成功 {len(success_codes)} 个：{', '.join(success_codes)}")
+        summary_lines.append(_i18n_t('bot.idx.s53', len_success_codes=len(success_codes), join_success_codes=', '.join(success_codes)))
     if failed_codes:
-        summary_lines.append(f"❌ 失败 {len(failed_codes)} 个：")
+        summary_lines.append(_i18n_t('bot.idx.s54', len_failed_codes=len(failed_codes)))
         for fc, reason in failed_codes:
             summary_lines.append(f"  • {fc}：{reason}")
     await safe_reply_text(update.message, "\n".join(summary_lines))
     await metrics.record_processed("idx_bot")
 
 
-@require_maintenance_check(action="解码文件")
+@require_maintenance_check(action=_i18n_t('bot.idx.s30'))
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
 
@@ -2894,7 +2855,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     valid_codes = [t for t in tokens if is_valid_code_format(t)]
     if len(valid_codes) > 1:
         if len(valid_codes) > 10:
-            await safe_reply_text(update.message, f"⚠️ 批量取件最多支持 10 个文件码，您发送了 {len(valid_codes)} 个，将只处理前 10 个")
+            await safe_reply_text(update.message, _i18n_t('bot.idx.s113', len_valid_codes=len(valid_codes)))
             valid_codes = valid_codes[:10]
         await _handle_batch_codes(update, context, valid_codes)
         return
@@ -2986,7 +2947,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """举报文件码: /report <code> <reason>"""
     try:
         if len(context.args) < 2:
-            await update.message.reply_text("用法:/report <文件码> <举报原因>")
+            await update.message.reply_text(_i18n_t('bot.idx.s114'))
             return
         code = context.args[0]
         reason = " ".join(context.args[1:])
@@ -3000,7 +2961,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reason=reason,
         )
         if report_id > 0:
-            await update.message.reply_text(f"✅ 已收到举报,编号 #{report_id},管理员将尽快处理")
+            await update.message.reply_text(_i18n_t('bot.idx.s115', report_id=report_id))
         else:
             await update.message.reply_text("❌ 举报提交失败,请稍后重试")
     except Exception as e:
@@ -3012,7 +2973,7 @@ async def cmd_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """修复文件码索引: /repair <code>"""
     try:
         if not context.args:
-            await update.message.reply_text("用法:/repair <文件码>")
+            await update.message.reply_text(_i18n_t('bot.idx.s116'))
             return
         code = context.args[0]
         user = update.effective_user
@@ -3020,7 +2981,7 @@ async def cmd_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         new_msg_id = await user_repair.reindex_code(code, user.id)
         if new_msg_id > 0:
-            await update.message.reply_text(f"✅ 文件码 {code} 索引已修复,msg_id={new_msg_id}")
+            await update.message.reply_text(_i18n_t('bot.idx.s117', code=code, new_msg_id=new_msg_id))
         else:
             await update.message.reply_text("❌ 修复失败,请检查文件码是否正确")
     except Exception as e:
@@ -3032,7 +2993,7 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """重新生成文件码: /regenerate <code>"""
     try:
         if not context.args:
-            await update.message.reply_text("用法:/regenerate <旧文件码>")
+            await update.message.reply_text(_i18n_t('bot.idx.s118'))
             return
         old_code = context.args[0]
         user = update.effective_user
@@ -3040,7 +3001,7 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         result = await user_repair.regenerate_code(old_code, user.id)
         if not result:
-            await update.message.reply_text("❌ 重新生成失败,请检查文件码是否正确")
+            await update.message.reply_text(_i18n_t('bot.idx.s119'))
             return
         new_code = result.get("new_code") or result.get("code", "")
         await update.message.reply_text(f"✅ 文件码已重新生成\n旧码:{old_code}\n新码:{new_code}")
@@ -3053,12 +3014,12 @@ async def cmd_failure_reason(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """查询解码失败原因: /failure_reason <code>"""
     try:
         if not context.args:
-            await update.message.reply_text("用法:/failure_reason <文件码>")
+            await update.message.reply_text(_i18n_t('bot.idx.s120'))
             return
         code = context.args[0]
         reason = await user_repair.get_failure_reason(code)
         if not reason:
-            await update.message.reply_text(f"❌ 未找到文件码 {code} 的失败记录")
+            await update.message.reply_text(_i18n_t('bot.idx.s121', code=code))
             return
         text = await user_repair.format_failure_reason(reason)
         await update.message.reply_text(text)

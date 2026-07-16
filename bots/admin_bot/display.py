@@ -18,7 +18,7 @@ from utils.shared_counters import status_counters as _status_counters
 import utils.shared_counters as _shared_counters
 from .menus import AUTHORIZED_USER_ID
 
-from services.i18n import get_i18n_manager
+from services.i18n import get_i18n_manager, translate as _i18n_t
 
 def _t(user_id: int, key: str, **kwargs) -> str:
     manager = get_i18n_manager()
@@ -136,9 +136,9 @@ async def _get_status_text() -> str:
             if stale_count:
                 relay_status += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m347", stale_count=stale_count)
         else:
-            relay_status = "✅ 就绪/未配置"
+            relay_status = _i18n_t('bot.admin_bot.display.s12')
     except Exception:
-        relay_status = "✅ 就绪/未配置"
+        relay_status = _i18n_t('bot.admin_bot.display.s13')
     # 从环形拓扑获取当前活跃频道（走 60s 缓存，0 RU）
     active_cells_text = ""
     try:
@@ -148,7 +148,7 @@ async def _get_status_text() -> str:
             slots = [f"{c.get('slot_id')}" for c in active_cells[:5]]
             active_cells_text = ", ".join(slots)
     except Exception:
-        active_cells_text = "读取失败"
+        active_cells_text = _i18n_t('bot.admin_bot.display.s14')
     msg = _t(AUTHORIZED_USER_ID, "bot.admin_bot.m348", var0=_status_counters['total_users'], var1=_status_counters['total_files'], var2=_status_counters['active_files'], var3=_status_counters['today_decodes'], active_cells_text=active_cells_text, relay_status=relay_status)
     from database.cache_store import get_all_bot_heartbeats
     hb_map = await get_all_bot_heartbeats()
@@ -163,7 +163,7 @@ async def _get_status_text() -> str:
 
 
 async def _get_health_text() -> str:
-    msg = "🤖 机器人健康状态\n\n"
+    msg = _i18n_t('bot.admin_bot.display.s1')
     from database.cache_store import get_all_bot_heartbeats
     heartbeats = await get_all_bot_heartbeats()
     now = time.time()
@@ -186,13 +186,13 @@ async def _get_topology_text() -> str:
         logger.warning(f"[Admin] cells缓存查询失败: {e}")
         cells = []
 
-    msg = "🔗 环形冗余拓扑\n\n"
+    msg = _i18n_t('bot.admin_bot.display.s2')
     # 环形架构无主频道概念,显示第一个 active 槽位作为当前活跃频道
     active_cells = [c for c in cells if c.get("status") == "active"]
     if active_cells:
         msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m353", var0=len(active_cells))
     else:
-        msg += "📌 活跃频道数: 0 (系统不可用)\n"
+        msg += _i18n_t('bot.admin_bot.display.s8')
     msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m354", var0=len(cells))
 
     # 统计
@@ -218,12 +218,12 @@ async def _get_topology_text() -> str:
         # 按账号汇总
         by_account = {}
         for c in cells:
-            acc = c.get("account_name") or "未标注"
+            acc = c.get("account_name") or _i18n_t('bot.admin_bot.display.s46')
             if acc not in ("?", ""):
                 by_account.setdefault(acc, []).append(c)
 
         if len(by_account) > 1:
-            msg += "👤 账号分布:\n"
+            msg += _i18n_t('bot.admin_bot.display.s15')
             for acc, acc_cells in sorted(by_account.items()):
                 a_count = len([c for c in acc_cells if c.get("status") == "active"])
                 msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m357", acc=acc, var0=len(acc_cells), a_count=a_count)
@@ -239,7 +239,7 @@ async def _get_topology_text() -> str:
                 parts.append(f"{icon}{c.get('slot_id')}: {c.get('channel_id')}")
             msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m358", gn=gn, var0=' | '.join(parts))
     else:
-        msg += "  (未加载拓扑,请运行 seed_topology.py)\n"
+        msg += _i18n_t('bot.admin_bot.display.s9')
 
     # 轮转配置
     try:
@@ -309,10 +309,10 @@ async def _get_relay_status_text() -> str:
     """从 relay_pool.db 读取 idx_bot 写入的账号状态。"""
     from services.relay_pool import relay_pool
     pool_status = await relay_pool.get_pool_status()
-    msg = "🔐 中继账号池状态\n\n"
+    msg = _i18n_t('bot.admin_bot.display.s3')
     if not pool_status:
-        msg += "⚠️ 无中继账号\n"
-        msg += "请使用下方按钮配置中继账号\n"
+        msg += _i18n_t('bot.admin_bot.display.s10')
+        msg += _i18n_t('bot.admin_bot.display.s11')
         return msg
 
     # 状态图标映射
@@ -392,47 +392,47 @@ def _config_fallback(key: str) -> str:
 
 async def _get_configs_text() -> str:
     cfg_keys = [
-        ("file_code_prefix", "📝 文件码前缀", "⚠️需重启"),
-        ("force_join_channel_id", "🔒 强制加群频道", "✅热更新"),
-        ("force_join_link", "🔗 加群链接", "✅热更新"),
-        ("upload_bot_username", "📤 上传机器人", "✅热更新"),
-        ("decoder_bot_username", "🔓 解码机器人", "✅热更新"),
-        ("sender_bot_username", "📨 发送机器人", "✅热更新"),
+        ("file_code_prefix", _i18n_t('bot.admin_bot.display.s16'), _i18n_t('bot.admin_bot.display.s17')),
+        ("force_join_channel_id", _i18n_t('bot.admin_bot.display.s18'), _i18n_t('bot.admin_bot.display.s19')),
+        ("force_join_link", _i18n_t('bot.admin_bot.display.s20'), _i18n_t('bot.admin_bot.display.s21')),
+        ("upload_bot_username", _i18n_t('bot.admin_bot.display.s22'), _i18n_t('bot.admin_bot.display.s23')),
+        ("decoder_bot_username", _i18n_t('bot.admin_bot.display.s24'), _i18n_t('bot.admin_bot.display.s25')),
+        ("sender_bot_username", _i18n_t('bot.admin_bot.display.s26'), _i18n_t('bot.admin_bot.display.s27')),
     ]
 
     quota_keys = [
-        ("quota_default_free", "🆓 免费用户日配额", "✅热更新"),
-        ("quota_external_free", "🆓 免费外部码配额", "✅热更新"),
-        ("quota_default_basic", "🥇 基础会员日配额", "✅热更新"),
-        ("quota_external_basic", "🥇 基础外部码配额", "✅热更新"),
-        ("quota_default_premium", "👑 高级会员日配额", "✅热更新"),
-        ("quota_external_premium", "👑 高级外部码配额", "✅热更新"),
+        ("quota_default_free", _i18n_t('bot.admin_bot.display.s28'), _i18n_t('bot.admin_bot.display.s29')),
+        ("quota_external_free", _i18n_t('bot.admin_bot.display.s30'), _i18n_t('bot.admin_bot.display.s31')),
+        ("quota_default_basic", _i18n_t('bot.admin_bot.display.s32'), _i18n_t('bot.admin_bot.display.s33')),
+        ("quota_external_basic", _i18n_t('bot.admin_bot.display.s34'), _i18n_t('bot.admin_bot.display.s35')),
+        ("quota_default_premium", _i18n_t('bot.admin_bot.display.s36'), _i18n_t('bot.admin_bot.display.s37')),
+        ("quota_external_premium", _i18n_t('bot.admin_bot.display.s38'), _i18n_t('bot.admin_bot.display.s39')),
     ]
 
     backup_keys = [
-        ("db_backup_interval", "💾 DB备份间隔(分钟)", "✅热更新"),
-        ("db_backup_enabled", "💾 DB备份", "✅热更新"),
+        ("db_backup_interval", _i18n_t('bot.admin_bot.display.s40'), _i18n_t('bot.admin_bot.display.s41')),
+        ("db_backup_enabled", _i18n_t('bot.admin_bot.display.s42'), _i18n_t('bot.admin_bot.display.s43')),
     ]
 
-    msg = "⚙️ 系统配置\n\n"
+    msg = _i18n_t('bot.admin_bot.display.s4')
 
-    msg += "📌 基础配置\n"
+    msg += _i18n_t('bot.admin_bot.display.s5')
     for key, label, indicator in cfg_keys:
         val = await get_config(key)
         if not val:
             val = _config_fallback(key)
-        display = val if val else "❌ 未配置"
+        display = val if val else _i18n_t('bot.admin_bot.display.s44')
         msg += f"  {label}:{display} {indicator}\n"
 
-    msg += "\n🎫 默认配额\n"
+    msg += _i18n_t('bot.admin_bot.display.s6')
     for key, label, indicator in quota_keys:
         val = await get_config(key)
         if not val:
             val = _config_fallback(key)
         try:
-            display = _quota_display(int(val)) if val else "未配置"
+            display = _quota_display(int(val)) if val else _i18n_t('bot.admin_bot.display.s47')
         except (ValueError, TypeError):
-            display = str(val) if val else "未配置"
+            display = str(val) if val else _i18n_t('bot.admin_bot.display.s52')
         msg += f"  {label}:{display} {indicator}\n"
 
     r2_keys_to_check = ["r2_account_id", "r2_access_key", "r2_secret_key"]
@@ -442,16 +442,16 @@ async def _get_configs_text() -> str:
     if not r2_configured:
         r2_check = lambda k: _config_fallback(k) != settings.get_config_default(k)
         r2_configured = any(r2_check(k) for k in r2_keys_to_check)
-    msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m371", var0='✅ 已配置' if r2_configured else '❌ 未配置')
+    msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m371", var0=_i18n_t('bot.admin_bot.display.s48') if r2_configured else _i18n_t('bot.admin_bot.display.s49'))
 
     for key, label, indicator in backup_keys:
         val = await get_config(key)
         if not val:
             val = _config_fallback(key)
-        display = val if val else "未配置"
+        display = val if val else _i18n_t('bot.admin_bot.display.s45')
         if key == "db_backup_enabled":
-            display = "✅ 开启" if display.lower() in ("true", "1", "on") else "❌ 关闭"
+            display = _i18n_t('bot.admin_bot.display.s50') if display.lower() in ("true", "1", "on") else _i18n_t('bot.admin_bot.display.s51')
         msg += f"  {label}:{display} {indicator}\n"
 
-    msg += "\n使用 /set_* 命令修改配置,或点击菜单按钮操作。"
+    msg += _i18n_t('bot.admin_bot.display.s7')
     return msg

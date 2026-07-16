@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 from dataclasses import dataclass, asdict
 from loguru import logger
@@ -27,6 +28,7 @@ from loguru import logger
 from database.cache_store import get_cache_store
 from config import settings
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 
 # ─── 会员等级常量 ──────────────────────────────────────────────
@@ -412,7 +414,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
     if user and user.get("is_banned"):
         return EntitlementResult(
             allowed=False,
-            reason="您的账户已被禁用",
+            reason=_i18n_t('services.entitlements.s3'),
         )
 
     plan = await get_plan(user_id)
@@ -428,7 +430,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
             max_mb = plan.max_file_size // (1024 * 1024)
             return EntitlementResult(
                 allowed=False,
-                reason=f"文件大小超过套餐限制({max_mb}MB),请升级会员",
+                reason=_i18n_t('services.entitlements.s5', max_mb=max_mb),
                 plan=plan_name,
                 quota=quota,
                 limits=limits,
@@ -437,7 +439,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
         if plan.daily_quota != -1 and quota.remaining <= 0:
             return EntitlementResult(
                 allowed=False,
-                reason=f"今日上传次数已用完({plan.daily_quota}次),请明天再试或升级会员",
+                reason=_i18n_t('services.entitlements.s6', plan_daily_quota=plan.daily_quota),
                 plan=plan_name,
                 quota=quota,
                 limits=limits,
@@ -448,7 +450,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
         if plan.daily_quota != -1 and quota.remaining <= 0:
             return EntitlementResult(
                 allowed=False,
-                reason=f"今日解码次数已用完({plan.daily_quota}次),请明天再试或升级会员",
+                reason=_i18n_t('services.entitlements.s7', plan_daily_quota=plan.daily_quota),
                 plan=plan_name,
                 quota=quota,
                 limits=limits,
@@ -459,7 +461,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
         if plan.external_daily_quota == 0:
             return EntitlementResult(
                 allowed=False,
-                reason="您没有非本系统码的解码权限,升级会员即可解锁此功能",
+                reason=_i18n_t('services.entitlements.s8'),
                 plan=plan_name,
                 quota=quota,
                 limits=limits,
@@ -468,7 +470,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
         if plan.external_daily_quota != -1 and quota.external_used >= plan.external_daily_quota:
             return EntitlementResult(
                 allowed=False,
-                reason=f"今日非本系统码解码次数已用完({plan.external_daily_quota}次),请明天再试",
+                reason=_i18n_t('services.entitlements.s9', plan_external_daily_quota=plan.external_daily_quota),
                 plan=plan_name,
                 quota=quota,
                 limits=limits,
@@ -480,7 +482,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
         if file_count > plan.max_collection_items:
             return EntitlementResult(
                 allowed=False,
-                reason=f"合集文件数超过套餐限制({plan.max_collection_items}个),请升级会员",
+                reason=_i18n_t('services.entitlements.s10', plan_max_collection_items=plan.max_collection_items),
                 plan=plan_name,
                 quota=quota,
                 limits=limits,
@@ -493,7 +495,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
         if current_count + new_count > plan.max_collection_items:
             return EntitlementResult(
                 allowed=False,
-                reason=f"合集文件数将超过套餐限制({plan.max_collection_items}个)",
+                reason=_i18n_t('services.entitlements.s12', plan_max_collection_items=plan.max_collection_items),
                 plan=plan_name,
                 quota=quota,
                 limits=limits,
@@ -502,7 +504,7 @@ async def check(user_id: int, action: str, resource: dict | None = None) -> Enti
     else:
         return EntitlementResult(
             allowed=False,
-            reason=f"未知的操作类型: {action}",
+            reason=_i18n_t('services.entitlements.s11', action=action),
         )
 
     return EntitlementResult(
@@ -859,10 +861,27 @@ async def set_user_plan_via_command_bus(
     owner = f"entitlements:{principal_id}:{principal_name}"
 
     # 1. 验证审批已通过 + hash 防篡改
+    # R55 P0-2: request_hash 强制必填(64 位 SHA-256 hex)
+    # 若调用方未提供,从 entitlement 参数计算确定性 hash
+    if not request_hash:
+        _entitlement_payload = {
+            "user_id": user_id,
+            "plan_name": plan_name,
+            "principal_id": principal_id,
+            "action_id": action_id,
+        }
+        request_hash = hashlib.sha256(
+            json.dumps(
+                _entitlement_payload,
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
     claimed = await claim_execution_approved(
         action_id=action_id,
         owner=owner,
-        request_hash=request_hash or None,
+        request_hash=request_hash,
     )
     if not claimed:
         logger.warning(
@@ -946,9 +965,9 @@ async def get_plan_features(plan_name: str) -> dict:
         return {}
     return {
         "name": plan.name,
-        "daily_quota": "无限" if plan.daily_quota == -1 else plan.daily_quota,
-        "external_daily_quota": "不允许" if plan.external_daily_quota == 0 else (
-            "无限" if plan.external_daily_quota == -1 else plan.external_daily_quota
+        "daily_quota": _i18n_t('services.entitlements.s1') if plan.daily_quota == -1 else plan.daily_quota,
+        "external_daily_quota": _i18n_t('services.entitlements.s2') if plan.external_daily_quota == 0 else (
+            _i18n_t('services.entitlements.s4') if plan.external_daily_quota == -1 else plan.external_daily_quota
         ),
         "max_file_size_mb": plan.max_file_size // (1024 * 1024),
         "max_concurrent": plan.max_concurrent,

@@ -9,6 +9,7 @@ from loguru import logger
 
 from config import settings
 from utils.file_utils import MEDIA_TYPE
+from services.i18n import translate as _i18n_t
 
 CODE_ALPHABET = string.ascii_lowercase + string.digits
 # P1-16:媒体类型词表键直接引用 file_utils.MEDIA_TYPE 规范字符串,消除各模块类型字符串漂移。
@@ -186,7 +187,7 @@ def extract_code_and_bot_from_message(text: str) -> tuple[str, str]:
     code = normalized
     for b in all_bots:
         code = code.replace(b, "")
-    for indicator in ("解码器", "解码", "解码Bot:", "解码bot:", "解码器:"):
+    for indicator in (_i18n_t('services.code_generator.s1'), _i18n_t('services.code_generator.s2'), _i18n_t('services.code_generator.s3'), _i18n_t('services.code_generator.s4'), _i18n_t('services.code_generator.s5')):
         code = code.replace(indicator, "")
     code = code.replace("@", "")
     code = code.strip("::\t\n\r -_")

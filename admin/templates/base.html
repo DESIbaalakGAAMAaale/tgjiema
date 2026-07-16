@@ -4,44 +4,44 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}管理后台{% endblock %} - TG文件解码器</title>
+    <title>{{ t("ui.admin.base.s1") }}</title>
     <style nonce="{{ csp_nonce if csp_nonce else '' }}">
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #333; }
         .sidebar { position: fixed; left: 0; top: 0; width: 220px; height: 100vh; background: #001529; padding-top: 20px; overflow-y: auto; }
         .sidebar h2 { color: #fff; text-align: center; font-size: 18px; padding: 0 16px 24px; border-bottom: 1px solid rgba(255,255,255,0.1); }
         .sidebar a { display: block; color: rgba(255,255,255,0.65); padding: 12px 24px; text-decoration: none; font-size: 14px; transition: all 0.2s; }
-        .sidebar a:hover, .sidebar a.active { color: #fff; background: #1890ff; }
-        .sidebar .nav-group { padding: 8px 16px; color: rgba(255,255,255,0.35); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
+        .sidebar a:hover, .sidebar a.active { color: #fff; background: #0066cc; }
+        .sidebar .nav-group { padding: 8px 16px; color: rgba(255,255,255,0.65); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
         .main { margin-left: 220px; padding: 24px; }
         .header { background: #fff; padding: 16px 24px; border-radius: 8px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); display: flex; justify-content: space-between; align-items: center; }
         .header h1 { font-size: 22px; }
-        .header .admin-info { font-size: 13px; color: #8c8c8c; }
+        .header .admin-info { font-size: 13px; color: #595959; }
         .section { background: #fff; border-radius: 8px; padding: 24px; margin-bottom: 24px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
         .section h2 { font-size: 16px; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid #f0f0f0; }
         table { width: 100%; border-collapse: collapse; }
-        caption { caption-side: top; text-align: left; padding: 8px 0; font-size: 13px; color: #8c8c8c; }
+        caption { caption-side: top; text-align: left; padding: 8px 0; font-size: 13px; color: #595959; }
         th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
         th { background: #fafafa; font-weight: 600; }
         .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; background: #f5f5f5; }
-        .tag-green { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
-        .tag-red { background: #fff2f0; color: #ff4d4f; border: 1px solid #ffccc7; }
-        .tag-blue { background: #e6f7ff; color: #1890ff; border: 1px solid #91d5ff; }
-        .tag-orange { background: #fff7e6; color: #fa8c16; border: 1px solid #ffd591; }
-        .tag-gold { background: #fffbe6; color: #faad14; border: 1px solid #ffe58f; }
+        .tag-green { background: #f6ffed; color: #237804; border: 1px solid #b7eb8f; }
+        .tag-red { background: #fff2f0; color: #cf1322; border: 1px solid #ffccc7; }
+        .tag-blue { background: #e6f7ff; color: #0066cc; border: 1px solid #91d5ff; }
+        .tag-orange { background: #fff7e6; color: #ad6800; border: 1px solid #ffd591; }
+        .tag-gold { background: #fffbe6; color: #ad6800; border: 1px solid #ffe58f; }
         .btn { display: inline-block; padding: 6px 16px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 13px; cursor: pointer; text-decoration: none; background: #fff; color: #333; transition: all 0.2s; }
-        .btn-primary { background: #1890ff; color: #fff; border-color: #1890ff; }
-        .btn-danger { color: #ff4d4f; border-color: #ff4d4f; }
+        .btn-primary { background: #0066cc; color: #fff; border-color: #0066cc; }
+        .btn-danger { color: #cf1322; border-color: #cf1322; }
         .btn-warning { color: #faad14; border-color: #faad14; }
         .btn:hover { opacity: 0.85; }
         .pagination { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
         .pagination a { padding: 6px 12px; border: 1px solid #d9d9d9; border-radius: 4px; text-decoration: none; color: #333; font-size: 13px; }
-        .pagination a.active { background: #1890ff; color: #fff; border-color: #1890ff; }
-        .empty-state { text-align: center; padding: 48px 16px; color: #8c8c8c; font-size: 14px; }
+        .pagination a.active { background: #0066cc; color: #fff; border-color: #0066cc; }
+        .empty-state { text-align: center; padding: 48px 16px; color: #595959; font-size: 14px; }
         .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 16px; }
         .metric-card { background: #fff; padding: 16px; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
-        .metric-card .label { font-size: 12px; color: #8c8c8c; margin-bottom: 4px; }
-        .metric-card .value { font-size: 24px; font-weight: 600; color: #1890ff; }
+        .metric-card .label { font-size: 12px; color: #595959; margin-bottom: 4px; }
+        .metric-card .value { font-size: 24px; font-weight: 600; color: #0066cc; }
         .actions { display: flex; gap: 6px; }
         .actions form { display: inline; }
         code { background: #f5f5f5; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
@@ -65,12 +65,12 @@
         }
         .skip-link:focus {
             top: 0;
-            outline: 2px solid #1890ff;
+            outline: 2px solid #0066cc;
             outline-offset: 2px;
         }
         /* 焦点可见性增强(WCAG 2.2 AA 2.4.7 Focus Visible / 2.4.11 Focus Not Obscured) */
         a:focus, button:focus, input:focus, select:focus, textarea:focus {
-            outline: 2px solid #1890ff;
+            outline: 2px solid #0066cc;
             outline-offset: 2px;
         }
         /* R44 6.2: 语言切换器样式 */
@@ -83,16 +83,16 @@
         .locale-switcher a {
             padding: 2px 8px;
             border-radius: 3px;
-            color: #8c8c8c;
+            color: #595959;
             text-decoration: none;
             border: 1px solid transparent;
         }
         .locale-switcher a:hover {
-            color: #1890ff;
+            color: #0066cc;
             border-color: #91d5ff;
         }
         .locale-switcher a.current {
-            color: #1890ff;
+            color: #0066cc;
             background: #e6f7ff;
             border-color: #91d5ff;
             font-weight: 600;
@@ -119,7 +119,7 @@
         .alert-info::before { content: "ℹ"; }
         /* R45 17.3: focus-visible 增强(WCAG 2.2 AA 2.4.11 Focus Not Obscured) */
         :focus-visible {
-            outline: 3px solid #1890ff !important;
+            outline: 3px solid #0066cc !important;
             outline-offset: 2px !important;
         }
     </style>
@@ -127,39 +127,39 @@
 </head>
 <body role="document">
     <!-- R44 6.4: 无障碍 skip-link,键盘用户可跳过导航直奔主内容(WCAG 2.4.1 Bypass Blocks) -->
-    <a href="#main-content" class="skip-link">跳到主要内容</a>
+    <a href="#main-content" class="skip-link">{{ t("ui.admin.base.s2") }}</a>
     <!-- R45 17.3: aria-live 动态消息区 — 屏幕阅读器播报异步状态变化(WCAG 2.2 AA 4.1.3 Status Messages) -->
     <div id="aria-live-region" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
     <nav class="sidebar" aria-label="主导航 / Main navigation">
-        <h2>TG解码器管理</h2>
-        <div class="nav-group">基础</div>
-        <a href="/" aria-label="看板" {% if request.url.path == '/' %}class="active"{% endif %}>看板</a>
-        <a href="/users" aria-label="用户管理" {% if request.url.path == '/users' %}class="active"{% endif %}>用户管理</a>
-        <a href="/files" aria-label="文件管理" {% if request.url.path == '/files' %}class="active"{% endif %}>文件管理</a>
-        <a href="/logs" aria-label="解码日志" {% if request.url.path == '/logs' %}class="active"{% endif %}>解码日志</a>
-        <a href="/health-page" aria-label="系统健康" {% if request.url.path == '/health-page' %}class="active"{% endif %}>系统健康</a>
-        <div class="nav-group">R40 运营</div>
-        <a href="/tasks" aria-label="任务中心" {% if request.url.path == '/tasks' %}class="active"{% endif %}>任务中心</a>
-        <a href="/reports" aria-label="举报管理" {% if request.url.path == '/reports' %}class="active"{% endif %}>举报管理</a>
-        <a href="/collections" aria-label="集合管理" {% if request.url.path == '/collections' %}class="active"{% endif %}>集合管理</a>
-        <a href="/notifications" aria-label="通知中心" {% if request.url.path == '/notifications' %}class="active"{% endif %}>通知中心</a>
-        <a href="/approvals" aria-label="审批管理" {% if request.url.path == '/approvals' %}class="active"{% endif %}>审批管理</a>
+        <h2>{{ t("ui.admin.base.s3") }}</h2>
+        <div class="nav-group">{{ t("ui.admin.base.s4") }}</div>
+        <a href="/" aria-label="看板" {% if request.url.path == '/' %}class="active"{% endif %}>{{ t("ui.admin.base.s5") }}</a>
+        <a href="/users" aria-label="用户管理" {% if request.url.path == '/users' %}class="active"{% endif %}>{{ t("ui.admin.base.s6") }}</a>
+        <a href="/files" aria-label="文件管理" {% if request.url.path == '/files' %}class="active"{% endif %}>{{ t("ui.admin.base.s7") }}</a>
+        <a href="/logs" aria-label="解码日志" {% if request.url.path == '/logs' %}class="active"{% endif %}>{{ t("ui.admin.base.s8") }}</a>
+        <a href="/health-page" aria-label="系统健康" {% if request.url.path == '/health-page' %}class="active"{% endif %}>{{ t("ui.admin.base.s9") }}</a>
+        <div class="nav-group">{{ t("ui.admin.base.s10") }}</div>
+        <a href="/tasks" aria-label="任务中心" {% if request.url.path == '/tasks' %}class="active"{% endif %}>{{ t("ui.admin.base.s11") }}</a>
+        <a href="/reports" aria-label="举报管理" {% if request.url.path == '/reports' %}class="active"{% endif %}>{{ t("ui.admin.base.s12") }}</a>
+        <a href="/collections" aria-label="集合管理" {% if request.url.path == '/collections' %}class="active"{% endif %}>{{ t("ui.admin.base.s13") }}</a>
+        <a href="/notifications" aria-label="通知中心" {% if request.url.path == '/notifications' %}class="active"{% endif %}>{{ t("ui.admin.base.s14") }}</a>
+        <a href="/approvals" aria-label="审批管理" {% if request.url.path == '/approvals' %}class="active"{% endif %}>{{ t("ui.admin.base.s15") }}</a>
         <a href="/rbac" aria-label="RBAC 角色管理" {% if request.url.path == '/rbac' %}class="active"{% endif %}>RBAC</a>
-        <div class="nav-group">运维</div>
-        <a href="/repair-console" aria-label="修复控制台" {% if request.url.path == '/repair-console' %}class="active"{% endif %}>修复控制台</a>
-        <a href="/topology" aria-label="拓扑可视化" {% if request.url.path == '/topology' %}class="active"{% endif %}>拓扑可视化</a>
-        <a href="/ru-cost" aria-label="RU 成本中心" {% if request.url.path == '/ru-cost' %}class="active"{% endif %}>RU成本</a>
-        <a href="/maintenance" aria-label="维护模式" {% if request.url.path == '/maintenance' %}class="active"{% endif %}>维护模式</a>
-        <a href="/disaster-recovery" aria-label="灾备控制台" {% if request.url.path == '/disaster-recovery' %}class="active"{% endif %}>灾备控制台</a>
+        <div class="nav-group">{{ t("ui.admin.base.s16") }}</div>
+        <a href="/repair-console" aria-label="修复控制台" {% if request.url.path == '/repair-console' %}class="active"{% endif %}>{{ t("ui.admin.base.s17") }}</a>
+        <a href="/topology" aria-label="拓扑可视化" {% if request.url.path == '/topology' %}class="active"{% endif %}>{{ t("ui.admin.base.s18") }}</a>
+        <a href="/ru-cost" aria-label="RU 成本中心" {% if request.url.path == '/ru-cost' %}class="active"{% endif %}>{{ t("ui.admin.base.s19") }}</a>
+        <a href="/maintenance" aria-label="维护模式" {% if request.url.path == '/maintenance' %}class="active"{% endif %}>{{ t("ui.admin.base.s20") }}</a>
+        <a href="/disaster-recovery" aria-label="灾备控制台" {% if request.url.path == '/disaster-recovery' %}class="active"{% endif %}>{{ t("ui.admin.base.s21") }}</a>
     </nav>
     <main class="main" id="main-content" role="main">
         <header class="header">
-            <h1>{% block page_title %}管理后台{% endblock %}</h1>
+            <h1>{{ t("ui.admin.base.s22") }}</h1>
             <div class="admin-info">
                 {% if admin %}管理员: {{ admin.username if admin is mapping or admin is not string else admin }}{% endif %}
                 <!-- R44 6.2: 语言切换器 — 调用 /locale?lang=xx 端点持久化 locale -->
                 <span class="locale-switcher" role="group" aria-label="语言切换 / Language switcher">
-                    <a href="/locale?lang=zh-CN" {% if locale | default('zh-CN') == 'zh-CN' %}class="current" aria-current="true"{% endif %}>中文</a>
+                    <a href="/locale?lang=zh-CN" {% if locale | default('zh-CN') == 'zh-CN' %}class="current" aria-current="true"{% endif %}>{{ t("ui.admin.base.s23") }}</a>
                     <a href="/locale?lang=en-US" {% if locale | default('zh-CN') == 'en-US' %}class="current" aria-current="true"{% endif %}>English</a>
                 </span>
             </div>

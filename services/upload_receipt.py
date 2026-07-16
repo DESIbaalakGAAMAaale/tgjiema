@@ -19,6 +19,7 @@ from loguru import logger
 
 from database.cache_store import get_cache_store
 from services.task_center import create_task
+from services.i18n import translate as _i18n_t
 
 
 def _safe_json_loads(val) -> Any:
@@ -268,19 +269,19 @@ async def format_receipt(receipt: dict) -> str:
         多行纯文本(避免 Telegram markdown 解析问题)
     """
     if not receipt:
-        return "上传回执不存在"
+        return _i18n_t('services.upload_receipt.s1')
     lines = [
-        "📤 上传回执",
-        f"上传 ID: {receipt.get('upload_id', '')}",
-        f"文件数: {receipt.get('file_count', 0)}",
-        f"总大小: {_format_size(receipt.get('total_size', 0))}",
-        f"保护期: {receipt.get('ttl_days', 0)} 天",
-        f"主副本状态: {receipt.get('primary_status', 'unknown')}",
+        _i18n_t('services.upload_receipt.s2'),
+        _i18n_t('services.upload_receipt.s3', receipt_get_upload_id=receipt.get('upload_id', '')),
+        _i18n_t('services.upload_receipt.s4', receipt_get_file_count_0=receipt.get('file_count', 0)),
+        _i18n_t('services.upload_receipt.s5', format_size_receipt_get_total_size_0=_format_size(receipt.get('total_size', 0))),
+        _i18n_t('services.upload_receipt.s6', receipt_get_ttl_days_0=receipt.get('ttl_days', 0)),
+        _i18n_t('services.upload_receipt.s7', receipt_get_primary_status_unknown=receipt.get('primary_status', 'unknown')),
     ]
     # 文件码列表(若已生成)
     file_codes = receipt.get("file_codes") or []
     if file_codes:
-        lines.append(f"文件码: {', '.join(file_codes)}")
+        lines.append(_i18n_t('services.upload_receipt.s9', join_file_codes=', '.join(file_codes)))
     lines.append("")
-    lines.append(f"查询状态: /status {receipt.get('upload_id', '')}")
+    lines.append(_i18n_t('services.upload_receipt.s8', receipt_get_upload_id=receipt.get('upload_id', '')))
     return "\n".join(lines)

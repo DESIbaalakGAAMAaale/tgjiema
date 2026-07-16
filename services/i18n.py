@@ -40,6 +40,9 @@ from typing import Any, Optional
 
 from loguru import logger
 
+# Note: _i18n_t is defined as a local alias after translate() is defined below.
+# Do NOT add "from services.i18n import translate as _i18n_t" here (circular import).
+
 # locale 文件目录(项目根目录下 locales/)
 _LOCALES_DIR = Path(__file__).resolve().parent.parent / "locales"
 # 默认 locale
@@ -325,7 +328,7 @@ class I18nManager:
         # 最终兜底:硬编码安全文案(中英文双语)
         if locale and locale.startswith("en"):
             return "An error occurred. Please try again later."
-        return "操作失败,请稍后重试。"
+        return _i18n_t('services.i18n.s1')
 
     def get_missing_key_count(self) -> int:
         """R44 6.2: 返回 missing key 累计计数。
@@ -486,21 +489,21 @@ class I18nManager:
             # 中文格式
             if use_long:
                 # 长格式: 2024年1月15日 星期一 下午 02:30
-                formatted = dt.strftime("%Y年%m月%d日 %A %p %I:%M")
+                formatted = dt.strftime(_i18n_t('services.i18n.s5'))
                 # 中文本地化星期/上下午
                 weekday_map = {
-                    "Monday": "星期一", "Tuesday": "星期二", "Wednesday": "星期三",
-                    "Thursday": "星期四", "Friday": "星期五", "Saturday": "星期六",
-                    "Sunday": "星期日",
+                    "Monday": _i18n_t('services.i18n.s6'), "Tuesday": _i18n_t('services.i18n.s7'), "Wednesday": _i18n_t('services.i18n.s8'),
+                    "Thursday": _i18n_t('services.i18n.s9'), "Friday": _i18n_t('services.i18n.s10'), "Saturday": _i18n_t('services.i18n.s11'),
+                    "Sunday": _i18n_t('services.i18n.s12'),
                 }
                 for en_w, zh_w in weekday_map.items():
                     formatted = formatted.replace(en_w, zh_w)
-                formatted = formatted.replace("AM", "上午").replace("PM", "下午")
+                formatted = formatted.replace("AM", _i18n_t('services.i18n.s17')).replace("PM", _i18n_t('services.i18n.s13'))
             else:
                 # 短格式: 2024年1月15日 14:30
-                formatted = dt.strftime("%Y年%m月%d日 %H:%M")
+                formatted = dt.strftime(_i18n_t('services.i18n.s14'))
             # 去除月/日的前导零(跨平台方案,兼容 Windows 与 Linux)
-            formatted = formatted.replace("年0", "年").replace("月0", "月")
+            formatted = formatted.replace(_i18n_t('services.i18n.s15'), _i18n_t('services.i18n.s16')).replace(_i18n_t('services.i18n.s3'), _i18n_t('services.i18n.s4'))
             return formatted
         elif target_locale.startswith("en"):
             # 英文格式
@@ -799,6 +802,10 @@ def translate(key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
     return manager.translate(key, locale=locale, **kwargs)
 
 
+# Local alias for migrated strings within this module (avoids circular import)
+_i18n_t = translate
+
+
 # ── R42 P1-8: i18n 完整接入 — 错误响应结构 / 用户 locale 写入 /
 #                复数规则 / Admin principal locale ──────────────────
 
@@ -996,7 +1003,7 @@ def set_user_locale(user_id: int, locale: str) -> bool:
     available = manager.get_available_locales()
     if locale not in available:
         raise ValueError(
-            f"不支持的 locale: {locale},当前支持列表: {available}"
+            _i18n_t('services.i18n.s2', locale=locale, available=available)
         )
     # 2. 同步写入 SQLite + dirty_outbox
     try:

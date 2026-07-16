@@ -24,6 +24,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 if TYPE_CHECKING:
     # R43: 仅用于类型注解,避免运行时循环导入(flake8 F821)
@@ -309,14 +310,14 @@ class SessionManager:
         if not session_id:
             raise HTTPException(
                 status_code=401,
-                detail="未登录或会话已过期",
+                detail=_i18n_t('admin.sessions.s1'),
                 headers={"Location": "/login"},
             )
         principal = await self.validate_session(session_id)
         if principal is None:
             raise HTTPException(
                 status_code=401,
-                detail="会话无效或已过期,请重新登录",
+                detail=_i18n_t('admin.sessions.s2'),
                 headers={"Location": "/login"},
             )
         return principal

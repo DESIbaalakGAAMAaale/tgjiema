@@ -1419,9 +1419,10 @@ async def quarantine_repair(
     action: str,
     approval_action_id: str = "",
     new_data: Optional[dict] = None,
-    expected_principal_id: Optional[int] = None,
+    expected_principal_id: int = 0,
+    expected_approver_id: int = 0,
 ) -> dict:
-    """R53 P1-2 + R54 P0-4: 经审批的 quarantined 记录修复/删除流程。
+    """R53 P1-2 + R54 P0-4 + R55 P0-4: 经审批的 quarantined 记录修复/删除流程。
 
     quarantined 记录代表 payload 可能被篡改,不可自动重放。
     必须通过人工审批后才能修复(重新计算 hash 并恢复 pending)或删除。
@@ -1433,25 +1434,40 @@ async def quarantine_repair(
         - 执行成功标记 executed,失败标记 failed
         - 不再依赖外层调用方保证审批校验
 
+    R55 P0-4 整改(强制不可绕过的绑定):
+        - expected_principal_id 改为必填(>0),不再 Optional
+        - 存储 principal 缺失直接 fail-closed(不再跳过校验)
+        - 存储 request_hash 缺失直接 fail-closed(不再跳过比较)
+        - action="delete" 强制双人审批(expected_approver_id > 0)
+        - 先校验 action 合法,再计算 Hash/认领
+        - Hash 绑定: row_id + message_id + action + 旧 Hash + 新 payload Hash
+          + principal + expiry + approver(delete 场景)
+
     支持的 action:
         - ``"rehash"``: 用 new_data 重新计算 hash,将 status 从 quarantined
           恢复为 pending,让下一轮 replay 重新尝试投递。
           必须提供 new_data(否则抛 AppError)。
         - ``"delete"``: 永久删除该 quarantined 记录(物理删除,不可恢复)。
           用于确认 payload 已无效或被恶意篡改需要清除的场景。
+          R55 P0-4: 强制双人审批(expected_approver_id > 0)。
 
     安全约束:
         1. approval_action_id 不可为空(必须经审批)
-        2. R54 P0-4: 函数内部验证 approval 状态/principal/request_hash
-        3. 仅 quarantined 状态可被修复/删除(其他状态拒绝)
-        4. expected_principal_id 用于二次校验审批归属(防越权)
+        2. R55 P0-4: expected_principal_id 必填且 > 0(不再 Optional)
+        3. R54 P0-4: 函数内部验证 approval 状态/principal/request_hash
+        4. R55 P0-4: 存储 principal 缺失直接 fail-closed
+        5. R55 P0-4: 存储 request_hash 缺失直接 fail-closed
+        6. R55 P0-4: delete 强制双人审批(expected_approver_id > 0)
+        7. 仅 quarantined 状态可被修复/删除(其他状态拒绝)
+        8. 审批不可跨请求复用(action_id 唯一消费)
 
     Args:
         row_id: durable_outbox.id(quarantined 记录主键)
         action: 修复动作 ``"rehash"`` 或 ``"delete"``
         approval_action_id: 审批动作 ID(必须经审批,不可为空)
         new_data: action="rehash" 时的新 payload(用于重新计算 hash)
-        expected_principal_id: 审批归属 principal_id(可选,二次校验)
+        expected_principal_id: 审批归属 principal_id(R55 P0-4: 必填且 > 0)
+        expected_approver_id: 第二审批人 ID(R55 P0-4: delete 时必填且 > 0)
 
     Returns:
         操作结果 dict:
@@ -1460,9 +1476,51 @@ async def quarantine_repair(
 
     Raises:
         AppError: approval_action_id 为空 / 审批未通过 / action 非法 /
-            记录非 quarantined / rehash 缺少 new_data / 数据库操作失败
+            expected_principal_id 缺失 / 存储 principal/Hash 缺失 /
+            delete 缺少双人审批 / 记录非 quarantined /
+            rehash 缺少 new_data / 数据库操作失败
     """
     from services.error_codes import AppError, ErrorCodes
+
+    # R55 P0-4: 先校验 action 合法,再计算 Hash/认领(防非法 action 泄露审批状态)
+    if action not in ("rehash", "delete"):
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": f"action(必须为 rehash 或 delete,实际: {action})"},
+        )
+
+    # R55 P0-4: expected_principal_id 必填且 > 0(不再 Optional)
+    if not expected_principal_id or int(expected_principal_id) <= 0:
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={
+                "field": "expected_principal_id",
+                "reason": "required_and_must_be_positive",
+                "action": f"quarantine_repair:{action}",
+            },
+        )
+
+    # R55 P0-4: delete 强制双人审批(expected_approver_id > 0)
+    if action == "delete":
+        if not expected_approver_id or int(expected_approver_id) <= 0:
+            raise AppError(
+                ErrorCodes.APPROVAL_STATE_INVALID,
+                params={
+                    "approval_id": approval_action_id,
+                    "reason": "delete_requires_dual_approval",
+                    "expected_approver_id": expected_approver_id,
+                },
+            )
+        if int(expected_approver_id) == int(expected_principal_id):
+            raise AppError(
+                ErrorCodes.APPROVAL_STATE_INVALID,
+                params={
+                    "approval_id": approval_action_id,
+                    "reason": "dual_approval_requires_distinct_approvers",
+                    "expected_principal_id": expected_principal_id,
+                    "expected_approver_id": expected_approver_id,
+                },
+            )
 
     # 1. 校验 approval_action_id(强制审批)
     if not approval_action_id:
@@ -1470,7 +1528,7 @@ async def quarantine_repair(
             ErrorCodes.REPAIR_CONSOLE_APPROVAL_REQUIRED,
             params={
                 "action": f"quarantine_repair:{action}",
-                "principal_id": expected_principal_id or 0,
+                "principal_id": expected_principal_id,
             },
         )
 
@@ -1486,20 +1544,55 @@ async def quarantine_repair(
                 "method": f"quarantine_repair:{action}",
             },
         )
-    # 计算预期 request_hash(绑定 row_id + action + new_data hash)
+
+    # R55 P0-4: 先拉取 quarantined 记录(绑定 row_id + message_id + 旧 Hash)
+    # 用于绑定到 request_hash(防审批与记录错位)
+    from database.cache_store import get_cache_store as _get_cache_store_for_row
+    _store_for_row = _get_cache_store_for_row()
+    _old_row_hash = ""
+    _old_message_id = ""
+    if _store_for_row and _store_for_row._db:
+        try:
+            _row_check = await _store_for_row._db.execute_fetchall(
+                "SELECT message_id, request_hash FROM durable_outbox WHERE id = ?",
+                (row_id,),
+            )
+            if _row_check and _row_check[0]:
+                _old_message_id = str(_row_check[0][0] or "")
+                _old_row_hash = str(_row_check[0][1] or "")
+        except Exception as _row_err:
+            logger.warning(
+                f"[RedisQueue] R55 P0-4: 拉取 quarantined 记录失败 "
+                f"row_id={row_id}: {_row_err}"
+            )
+
+    # R55 P0-4: 计算预期 request_hash(绑定 row_id + message_id + action +
+    # 旧 Hash + 新 payload Hash + principal + expiry + approver)
     import hashlib as _hashlib
     import hmac as _hmac
+    import time as _time
+    _now_ts = int(_time.time())
+    _expiry_ts = _now_ts + 3600  # 审批有效期 1 小时
     _payload_str = json.dumps(
-        {"row_id": row_id, "action": action,
-         "new_data_hash": _hashlib.sha256(
-             json.dumps(new_data, sort_keys=True, default=str).encode()
-         ).hexdigest() if new_data else ""},
+        {
+            "row_id": row_id,
+            "message_id": _old_message_id,
+            "action": action,
+            "old_hash": _old_row_hash,
+            "new_data_hash": _hashlib.sha256(
+                json.dumps(new_data, sort_keys=True, default=str).encode()
+            ).hexdigest() if new_data else "",
+            "principal_id": int(expected_principal_id),
+            "approver_id": int(expected_approver_id) if action == "delete" else 0,
+            "expiry_ts": _expiry_ts,
+        },
         sort_keys=True, default=str,
     )
     _expected_request_hash = _hashlib.sha256(_payload_str.encode()).hexdigest()
+
     try:
         _rows = await _store._db.execute_fetchall(
-            "SELECT status, principal_id, request_hash "
+            "SELECT status, principal_id, request_hash, command_type "
             "FROM command_executions WHERE action_id = ?",
             (approval_action_id,),
         )
@@ -1520,7 +1613,7 @@ async def quarantine_repair(
                 "reason": "approval_record_not_found",
             },
         )
-    _stored_status, _stored_principal, _stored_hash = _rows[0]
+    _stored_status, _stored_principal, _stored_hash, _stored_cmd_type = _rows[0]
     # status 必须为 approved
     if _stored_status != "approved":
         raise AppError(
@@ -1531,20 +1624,53 @@ async def quarantine_repair(
                 "reason": f"status_not_approved:{_stored_status}",
             },
         )
-    # principal_id 必须一致
-    if expected_principal_id is not None:
-        if int(_stored_principal or 0) != int(expected_principal_id):
-            raise AppError(
-                ErrorCodes.REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH,
-                params={
-                    "action": f"quarantine_repair:{action}",
-                    "approval_action_id": approval_action_id,
-                    "expected_principal_id": expected_principal_id,
-                    "actual_principal_id": int(_stored_principal or 0),
-                },
-            )
+    # R55 P0-4: 验证 command_type 必须是 quarantine_repair(防跨请求复用审批)
+    _expected_cmd_type = "quarantine_repair"
+    if _stored_cmd_type and _stored_cmd_type != _expected_cmd_type:
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "approval_action_id": approval_action_id,
+                "reason": f"command_type_mismatch:{_stored_cmd_type}",
+                "expected_command_type": _expected_cmd_type,
+            },
+        )
+    # R55 P0-4: 存储 principal 缺失直接 fail-closed(不再跳过校验)
+    if not _stored_principal or int(_stored_principal) <= 0:
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "approval_action_id": approval_action_id,
+                "reason": "stored_principal_missing_fail_closed",
+                "expected_principal_id": expected_principal_id,
+                "actual_principal_id": int(_stored_principal or 0),
+            },
+        )
+    # R55 P0-4: principal_id 必须一致(存储 principal 已校验非空)
+    if int(_stored_principal) != int(expected_principal_id):
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_PRINCIPAL_MISMATCH,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "approval_action_id": approval_action_id,
+                "expected_principal_id": expected_principal_id,
+                "actual_principal_id": int(_stored_principal),
+            },
+        )
+    # R55 P0-4: 存储 request_hash 缺失直接 fail-closed(不再跳过比较)
+    if not _stored_hash:
+        raise AppError(
+            ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
+            params={
+                "action": f"quarantine_repair:{action}",
+                "approval_action_id": approval_action_id,
+                "reason": "stored_request_hash_empty_fail_closed",
+            },
+        )
     # request_hash 必须一致(恒定时间比较)
-    if _stored_hash and not _hmac.compare_digest(_stored_hash, _expected_request_hash):
+    if not _hmac.compare_digest(_stored_hash, _expected_request_hash):
         raise AppError(
             ErrorCodes.REPAIR_CONSOLE_APPROVAL_HASH_MISMATCH,
             params={
@@ -1577,11 +1703,7 @@ async def quarantine_repair(
         _cas_claimed = True
     except AppError:
         raise
-    if action not in ("rehash", "delete"):
-        raise AppError(
-            ErrorCodes.VALIDATION_FAILED,
-            params={"field": f"action(必须为 rehash 或 delete,实际: {action})"},
-        )
+    # R55 P0-4: action 合法性已在上方校验(先校验再计算 Hash)
     # 3. rehash 必须提供 new_data
     if action == "rehash" and not isinstance(new_data, dict):
         raise AppError(

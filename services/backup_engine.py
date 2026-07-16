@@ -67,6 +67,7 @@ from loguru import logger
 
 # R50 P1-1: 统一错误码协议化(替代裸字符串 ValueError)
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 # R44 7.2: backup/restore RU 单独统计(record_*_usage 在方法内延迟调用避免循环依赖)
 
@@ -276,7 +277,7 @@ class BackupEngine:
                 await storage.delete(payload_key)
             except Exception:
                 pass
-            raise RuntimeError(f"上传 manifest 失败: {e}") from e
+            raise RuntimeError(_i18n_t('services.backup_engine.s15', e=e)) from e
 
         try:
             # COMPLETE marker 内容为时间戳,便于排查
@@ -291,7 +292,7 @@ class BackupEngine:
                 await storage.delete(manifest_key)
             except Exception:
                 pass
-            raise RuntimeError(f"上传 COMPLETE marker 失败: {e}") from e
+            raise RuntimeError(_i18n_t('services.backup_engine.s16', e=e)) from e
 
         # 7. HEAD 验证三个对象都存在(尝试下载极小内容验证可读)
         try:
@@ -304,7 +305,7 @@ class BackupEngine:
                 await storage.delete(complete_key)
             except Exception:
                 pass
-            raise RuntimeError(f"HEAD 校验失败: {e}") from e
+            raise RuntimeError(_i18n_t('services.backup_engine.s17', e=e)) from e
 
         # 8. 全部成功 → 更新 last_backup_at(复用 manifest.created_at,保证时间戳一致)
         store = self._get_cache_store()
@@ -505,12 +506,12 @@ class BackupEngine:
             if orphan_rows:
                 orphan_codes = [r[0] for r in orphan_rows if r[0]]
                 errors.append(
-                    f"file_records 中有 {len(orphan_codes)} 条记录在 codes 表中无对应取件码"
+                    _i18n_t('services.backup_engine.s18', len_orphan_codes=len(orphan_codes))
                 )
                 violations.append({
                     "type": "file_records_orphan",
                     "table": "file_records",
-                    "detail": f"无对应 codes 的 file_code: {orphan_codes[:5]}",
+                    "detail": _i18n_t('services.backup_engine.s34', orphan_codes_5=orphan_codes[:5]),
                     "count": len(orphan_codes),
                 })
         except Exception as e:
@@ -534,13 +535,12 @@ class BackupEngine:
                     for r in orphan_rows if r[0]
                 ]
                 errors.append(
-                    f"codes 中有 {len(orphan_codes)} 条记录的 uploader_id 在 users 表中不存在"
+                    _i18n_t('services.backup_engine.s19', len_orphan_codes=len(orphan_codes))
                 )
                 violations.append({
                     "type": "codes_uploader_orphan",
                     "table": "codes",
-                    "detail": f"无对应 users 的 codes: "
-                              f"{[o['code'] for o in orphan_codes[:5]]}",
+                    "detail": _i18n_t('services.backup_engine.s35', o_code_for_o_in_orphan_codes_5=[o['code'] for o in orphan_codes[:5]]),
                     "count": len(orphan_codes),
                 })
         except Exception as e:
@@ -569,12 +569,12 @@ class BackupEngine:
                     for r in multi_active_rows
                 ]
                 errors.append(
-                    f"cells 表有 {len(bad_groups)} 组 slot 链 active 数量不等于 1"
+                    _i18n_t('services.backup_engine.s20', len_bad_groups=len(bad_groups))
                 )
                 violations.append({
                     "type": "cells_multi_active",
                     "table": "cells",
-                    "detail": f"违反每组恰好一个 active 约束: {bad_groups[:5]}",
+                    "detail": _i18n_t('services.backup_engine.s36', bad_groups_5=bad_groups[:5]),
                     "count": len(bad_groups),
                 })
         except Exception as e:
@@ -707,9 +707,9 @@ class BackupEngine:
             try:
                 content = await storage.download(key)
                 if content is None:
-                    raise RuntimeError(f"对象 {key} 下载返回 None")
+                    raise RuntimeError(_i18n_t('services.backup_engine.s37', key=key))
             except Exception as e:
-                raise RuntimeError(f"对象 {key} 不存在或不可读: {e}") from e
+                raise RuntimeError(_i18n_t('services.backup_engine.s38', key=key, e=e)) from e
 
     # ─── 2. 列出备份 ────────────────────────────────────────────
 
@@ -791,7 +791,7 @@ class BackupEngine:
         if not backup_id:
             return {
                 "valid": False, "manifest_ok": False, "complete_ok": False,
-                "payload_exists": False, "error": "backup_id 为空",
+                "payload_exists": False, "error": _i18n_t('services.backup_engine.s3'),
             }
 
         storage = self._get_storage()
@@ -815,39 +815,37 @@ class BackupEngine:
             ]
             missing = [f for f in required_fields if f not in manifest]
             if missing:
-                error = f"manifest 缺少字段: {missing}"
+                error = _i18n_t('services.backup_engine.s4', missing=missing)
             else:
                 # 校验 schema_version
                 if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
                     error = (
-                        f"schema_version 不匹配: 备份={manifest.get('schema_version')}, "
-                        f"期望={MANIFEST_SCHEMA_VERSION}"
+                        _i18n_t('services.backup_engine.s21', manifest_get_schema_version=manifest.get('schema_version'), MANIFEST_SCHEMA_VERSION=MANIFEST_SCHEMA_VERSION)
                     )
                 else:
                     # 校验 backup_id 一致
                     if manifest.get("backup_id") != backup_id:
                         error = (
-                            f"backup_id 不匹配: manifest={manifest.get('backup_id')}, "
-                            f"请求={backup_id}"
+                            _i18n_t('services.backup_engine.s39', manifest_get_backup_id=manifest.get('backup_id'), backup_id=backup_id)
                         )
                     else:
                         manifest_ok = True
         except Exception as e:
-            error = f"manifest 下载失败: {e}"
+            error = _i18n_t('services.backup_engine.s5', e=e)
 
         # 2. 校验 complete marker 存在
         try:
             await storage.download(complete_key)
             complete_ok = True
         except Exception as e:
-            error = (error + "; " if error else "") + f"complete marker 缺失: {e}"
+            error = (error + "; " if error else "") + _i18n_t('services.backup_engine.s22', e=e)
 
         # 3. 校验 payload 存在(只下载不校验 checksum,节省带宽由 restore 负责)
         try:
             await storage.download(payload_key)
             payload_exists = True
         except Exception as e:
-            error = (error + "; " if error else "") + f"payload 缺失: {e}"
+            error = (error + "; " if error else "") + _i18n_t('services.backup_engine.s23', e=e)
 
         valid = manifest_ok and complete_ok and payload_exists
         return {
@@ -929,7 +927,7 @@ class BackupEngine:
         if not backup_id:
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
-                "checksum_verified": False, "error": "backup_id 为空",
+                "checksum_verified": False, "error": _i18n_t('services.backup_engine.s6'),
             }
 
         # R42 P1-3: production 恢复必须经过审批验证
@@ -945,8 +943,7 @@ class BackupEngine:
                     "success": False, "restored_tables": 0, "restored_rows": 0,
                     "checksum_verified": False,
                     "error": (
-                        "production 恢复要求 approver_id 非零且需通过审批,"
-                        "请先在 admin 后台发起 restore 审批流获取 approval_action_id"
+                        _i18n_t('services.backup_engine.s24')
                     ),
                 }
             if not approval_action_id:
@@ -973,8 +970,7 @@ class BackupEngine:
                 if not effective_approver_id:
                     # 无法反查 principal → fail-closed(拒绝执行)
                     raise PermissionError(
-                        f"R44 G0-3: 无法从 command_executions 反查 principal_id "
-                        f"(approval_action_id={approval_action_id})"
+                        _i18n_t('services.backup_engine.s40', approval_action_id=approval_action_id)
                     )
             # 校验审批状态 + R44 G0-1 TOCTOU 校验
             await self._validate_production_approval(
@@ -1052,7 +1048,7 @@ class BackupEngine:
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
                 "error": (
-                    f"COMPLETE marker 缺失,无法恢复(backup_id={backup_id}): {e}"
+                    _i18n_t('services.backup_engine.s25', backup_id=backup_id, e=e)
                 ),
             }
 
@@ -1229,8 +1225,7 @@ class BackupEngine:
         if not hasattr(store, "_db") or not store._db:
             # CacheStore 不可用,无法校验审批 → fail-closed
             raise PermissionError(
-                f"R42 P1-3: CacheStore 不可用,无法校验审批状态 "
-                f"(approval_action_id={approval_action_id})"
+                _i18n_t('services.backup_engine.s7', approval_action_id=approval_action_id)
             )
 
         try:
@@ -1244,14 +1239,12 @@ class BackupEngine:
         except Exception as e:
             # 查询失败 → fail-closed(不允许恢复)
             raise PermissionError(
-                f"R42 P1-3: 查询 command_executions 失败 "
-                f"(approval_action_id={approval_action_id}): {e}"
+                _i18n_t('services.backup_engine.s26', approval_action_id=approval_action_id, e=e)
             ) from e
 
         if not row:
             raise PermissionError(
-                f"R42 P1-3: approval_action_id 不存在 "
-                f"(approval_action_id={approval_action_id})"
+                _i18n_t('services.backup_engine.s8', approval_action_id=approval_action_id)
             )
 
         principal_id, status, stored_request_hash = row[0], row[1], row[2]
@@ -1269,8 +1262,7 @@ class BackupEngine:
         if status != "approved":
             # 非 approved 状态(pending/未知)→ fail-closed
             raise PermissionError(
-                f"R42 P1-3: approval_action_id 状态非 approved "
-                f"(approval_action_id={approval_action_id}, status={status})"
+                _i18n_t('services.backup_engine.s9', approval_action_id=approval_action_id, status=status)
             )
 
         # approver_id 必须与 principal_id 一致
@@ -1282,8 +1274,7 @@ class BackupEngine:
 
         if approver_id != principal_id_int:
             raise PermissionError(
-                f"R42 P1-3: approver_id 与 command_executions.principal_id 不一致 "
-                f"(approver_id={approver_id}, principal_id={principal_id_int})"
+                _i18n_t('services.backup_engine.s10', approver_id=approver_id, principal_id_int=principal_id_int)
             )
 
         # R44 G0-1 + R51 P0-8: TOCTOU 防护 — request_hash 比对
@@ -1294,8 +1285,7 @@ class BackupEngine:
             if not stored_request_hash:
                 # command_executions 中无 request_hash → 无法校验, fail-closed
                 raise PermissionError(
-                    f"R44 G0-1: command_executions.request_hash 为空,无法校验 TOCTOU "
-                    f"(approval_action_id={approval_action_id})"
+                    _i18n_t('services.backup_engine.s27', approval_action_id=approval_action_id)
                 )
             if stored_request_hash != expected_request_hash:
                 # R51 P0-8: 协议化为 PRODUCTION_RESTORE_HASH_MISMATCH
@@ -1339,7 +1329,7 @@ class BackupEngine:
         except Exception as e:
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
-                "checksum_verified": False, "error": f"下载 manifest 失败: {e}",
+                "checksum_verified": False, "error": _i18n_t('services.backup_engine.s28', e=e),
             }
 
         if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
@@ -1347,8 +1337,7 @@ class BackupEngine:
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
                 "error": (
-                    f"schema_version 不匹配: 备份={manifest.get('schema_version')}, "
-                    f"期望={MANIFEST_SCHEMA_VERSION}"
+                    _i18n_t('services.backup_engine.s11', manifest_get_schema_version=manifest.get('schema_version'), MANIFEST_SCHEMA_VERSION=MANIFEST_SCHEMA_VERSION)
                 ),
             }
         if manifest.get("backup_id") != backup_id:
@@ -1356,8 +1345,7 @@ class BackupEngine:
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
                 "error": (
-                    f"backup_id 不匹配: manifest={manifest.get('backup_id')}, "
-                    f"请求={backup_id}"
+                    _i18n_t('services.backup_engine.s12', manifest_get_backup_id=manifest.get('backup_id'), backup_id=backup_id)
                 ),
             }
 
@@ -1367,7 +1355,7 @@ class BackupEngine:
         except Exception as e:
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
-                "checksum_verified": False, "error": f"下载 payload 失败: {e}",
+                "checksum_verified": False, "error": _i18n_t('services.backup_engine.s29', e=e),
             }
 
         actual_ct_sha = _compute_sha256(ciphertext)
@@ -1377,8 +1365,7 @@ class BackupEngine:
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
                 "error": (
-                    f"ciphertext_sha256 不匹配: expected={expected_ct_sha[:16]}, "
-                    f"actual={actual_ct_sha[:16]}(数据可能被篡改)"
+                    _i18n_t('services.backup_engine.s13', expected_ct_sha_16=expected_ct_sha[:16], actual_ct_sha_16=actual_ct_sha[:16])
                 ),
             }
 
@@ -1410,24 +1397,18 @@ class BackupEngine:
                         prev_kek = get_previous_kek()
                         if prev_kek is None:
                             hint = (
-                                f"(R41 P1-5 提示:备份使用 key_id={manifest_key_id[:8]}... 加密,"
-                                f"当前 KEK key_id={current_key_id[:8]}... 不匹配,"
-                                f"且 BACKUP_KEK_PREVIOUS 未配置。"
-                                f"请配置 BACKUP_KEK_PREVIOUS 环境变量为旧 KEK 后重试恢复)"
+                                _i18n_t('services.backup_engine.s42', manifest_key_id_8=manifest_key_id[:8], current_key_id_8=current_key_id[:8])
                             )
                         else:
                             hint = (
-                                f"(R41 P1-5 提示:备份使用 key_id={manifest_key_id[:8]}... 加密,"
-                                f"当前 KEK key_id={current_key_id[:8]}... 不匹配,"
-                                f"BACKUP_KEK_PREVIOUS 已配置但仍无法解密,"
-                                f"请检查 BACKUP_KEK_PREVIOUS 是否为正确的旧 KEK)"
+                                _i18n_t('services.backup_engine.s43', manifest_key_id_8=manifest_key_id[:8], current_key_id_8=current_key_id[:8])
                             )
                 except Exception:
                     pass
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
-                "error": f"解密失败: {e}{hint}",
+                "error": _i18n_t('services.backup_engine.s30', e=e, hint=hint),
             }
 
         actual_pt_sha = _compute_sha256(plaintext)
@@ -1437,8 +1418,7 @@ class BackupEngine:
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
                 "error": (
-                    f"plaintext_sha256 不匹配: expected={expected_pt_sha[:16]}, "
-                    f"actual={actual_pt_sha[:16]}(数据可能被篡改)"
+                    _i18n_t('services.backup_engine.s14', expected_pt_sha_16=expected_pt_sha[:16], actual_pt_sha_16=actual_pt_sha[:16])
                 ),
             }
 
@@ -1449,7 +1429,7 @@ class BackupEngine:
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": True,
-                "error": f"解析 plaintext JSON 失败: {e}",
+                "error": _i18n_t('services.backup_engine.s31', e=e),
             }
 
         # R42 P1-7: 根据 backup_policy 决定恢复策略(过滤/脱敏)
@@ -1472,7 +1452,7 @@ class BackupEngine:
                 return {
                     "success": False, "restored_tables": 0, "restored_rows": 0,
                     "checksum_verified": True,
-                    "error": f"生产恢复写入失败: {e}",
+                    "error": _i18n_t('services.backup_engine.s41', e=e),
                 }
 
         # R45 第 15 节: staging/production restore 后跨表不变量验证
@@ -1493,8 +1473,7 @@ class BackupEngine:
                     "restored_rows": restored_rows,
                     "checksum_verified": True,
                     "error": (
-                        f"跨表不变量校验失败: "
-                        f"{'; '.join(invariant_result['errors'][:5])}"
+                        _i18n_t('services.backup_engine.s32', join_invariant_result_errors_5='; '.join(invariant_result['errors'][:5]))
                     ),
                     "invariant_violations": invariant_result["errors"],
                 }
@@ -1592,7 +1571,7 @@ class BackupEngine:
             logger.error(f"[BackupEngine] cleanup_orphans list_objects 失败: {e}")
             return {
                 "scanned": 0, "deleted": 0, "errors": 0,
-                "details": f"list_objects 失败: {e}",
+                "details": _i18n_t('services.backup_engine.s33', e=e),
             }
 
         # 按 backup_id 聚合对象
@@ -1685,8 +1664,7 @@ class BackupEngine:
             logger.debug(f"[BackupEngine] cleanup_orphans audit_log 写入失败: {e}")
 
         details = (
-            f"扫描 {scanned} 个 backup_id,删除 {deleted} 个孤儿对象,"
-            f"{errors} 个删除失败"
+            _i18n_t('services.backup_engine.s1', scanned=scanned, deleted=deleted, errors=errors)
         )
         logger.info(f"[BackupEngine] cleanup_orphans 完成: {details}")
         return {
@@ -1791,7 +1769,6 @@ class BackupEngine:
             "bucket_name": bucket_name,
             "retention_days": retention_days,
             "details": (
-                "Object Lock 占位:实际配置需通过 R2 控制台在 bucket 创建时启用。"
-                "本方法仅作为代码层提醒,确保备份设计考虑 Object Lock 合规要求。"
+                _i18n_t('services.backup_engine.s2')
             ),
         }

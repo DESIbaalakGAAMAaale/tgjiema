@@ -5,18 +5,18 @@
 
 {% block content %}
 <div class="section">
-    <h2>任务列表</h2>
+    <h2>{{ t("ui.admin.tasks.s1") }}</h2>
     <table>
-        <caption>显示最近 100 条任务</caption>
+        <caption>{{ t("ui.admin.tasks.s2") }}</caption>
         <thead>
             <tr>
-                <th>任务ID</th>
-                <th>用户ID</th>
-                <th>类型</th>
-                <th>状态</th>
-                <th>进度</th>
-                <th>预计剩余(秒)</th>
-                <th>创建时间</th>
+                <th>{{ t("ui.admin.tasks.s3") }}</th>
+                <th>{{ t("ui.admin.tasks.s4") }}</th>
+                <th>{{ t("ui.admin.tasks.s5") }}</th>
+                <th>{{ t("ui.admin.tasks.s6") }}</th>
+                <th>{{ t("ui.admin.tasks.s7") }}</th>
+                <th>{{ t("ui.admin.tasks.s8") }}</th>
+                <th>{{ t("ui.admin.tasks.s9") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -28,15 +28,15 @@
                 <td>
                     {% set s = task.get('status', '') %}
                     {% if s == 'completed' %}
-                    <span class="tag tag-green">已完成</span>
+                    <span class="tag tag-green">{{ t("ui.admin.tasks.s10") }}</span>
                     {% elif s == 'running' %}
-                    <span class="tag tag-blue">运行中</span>
+                    <span class="tag tag-blue">{{ t("ui.admin.tasks.s11") }}</span>
                     {% elif s == 'failed' %}
-                    <span class="tag tag-red">失败</span>
+                    <span class="tag tag-red">{{ t("ui.admin.tasks.s12") }}</span>
                     {% elif s == 'cancelled' %}
-                    <span class="tag tag-orange">已取消</span>
+                    <span class="tag tag-orange">{{ t("ui.admin.tasks.s13") }}</span>
                     {% else %}
-                    <span class="tag">待处理</span>
+                    <span class="tag">{{ t("ui.admin.tasks.s14") }}</span>
                     {% endif %}
                 </td>
                 <td>{{ task.get('progress', 0) }}%</td>
@@ -44,7 +44,7 @@
                 <td>{{ task.get('created_at', 'N/A') }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="7" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="7" class="empty-state">{{ t("ui.admin.tasks.s15") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>

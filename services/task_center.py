@@ -27,6 +27,7 @@ from loguru import logger
 from database.cache_store import get_cache_store
 from services.error_codes import AppError, ErrorCodes
 from utils.trace_context import get_trace_id
+from services.i18n import translate as _i18n_t
 
 # 任务状态枚举
 STATUS_PENDING = "pending"
@@ -49,11 +50,11 @@ TASK_TYPES = ("upload", "index", "copy", "delivery", "repair")
 
 # 任务类型中文名
 _TYPE_LABELS = {
-    "upload": "上传",
-    "index": "索引",
-    "copy": "复制",
-    "delivery": "取件",
-    "repair": "修复",
+    "upload": _i18n_t('services.task_center.s1'),
+    "index": _i18n_t('services.task_center.s2'),
+    "copy": _i18n_t('services.task_center.s3'),
+    "delivery": _i18n_t('services.task_center.s4'),
+    "repair": _i18n_t('services.task_center.s5'),
 }
 
 
@@ -563,7 +564,7 @@ async def format_task_status(task: dict) -> str:
         多行文本(纯文本,避免 Telegram markdown 解析问题)
     """
     if not task:
-        return "任务不存在"
+        return _i18n_t('services.task_center.s6')
     status = task.get("status", "") or ""
     icon = _STATUS_ICONS.get(status, "❓")
     progress = max(0, min(100, int(task.get("progress", 0) or 0)))
@@ -573,25 +574,25 @@ async def format_task_status(task: dict) -> str:
     # ETA 格式化(秒 → "X 小时 Y 分钟" / "X 分钟" / "X 秒" / "无预估")
     eta_seconds = int(task.get("eta_seconds", 0) or 0)
     if eta_seconds >= 3600:
-        eta_str = f"{eta_seconds // 3600} 小时 {(eta_seconds % 3600) // 60} 分钟"
+        eta_str = _i18n_t('services.task_center.s7', eta_seconds_3600=eta_seconds // 3600, eta_seconds_3600_60=eta_seconds % 3600 // 60)
     elif eta_seconds >= 60:
-        eta_str = f"{eta_seconds // 60} 分钟"
+        eta_str = _i18n_t('services.task_center.s13', eta_seconds_60=eta_seconds // 60)
     elif eta_seconds > 0:
-        eta_str = f"{eta_seconds} 秒"
+        eta_str = _i18n_t('services.task_center.s15', eta_seconds=eta_seconds)
     else:
-        eta_str = "无预估"
+        eta_str = _i18n_t('services.task_center.s16')
     # 任务类型中文化
     type_name = _TYPE_LABELS.get(task.get("task_type", ""), task.get("task_type", ""))
     lines = [
-        f"{icon} 任务 #{task.get('id', '')} - {type_name}",
-        f"状态: {status} ({progress}%)",
-        f"进度: [{bar}] {progress}%",
-        f"预计剩余: {eta_str}",
-        f"创建时间: {task.get('created_at', '')}",
+        _i18n_t('services.task_center.s8', icon=icon, task_get_id=task.get('id', ''), type_name=type_name),
+        _i18n_t('services.task_center.s9', status=status, progress=progress),
+        _i18n_t('services.task_center.s10', bar=bar, progress=progress),
+        _i18n_t('services.task_center.s11', eta_str=eta_str),
+        _i18n_t('services.task_center.s12', task_get_created_at=task.get('created_at', '')),
     ]
     # 失败时显示错误
     if status == STATUS_FAILED and task.get("error"):
-        lines.append(f"失败原因: {task['error']}")
+        lines.append(_i18n_t('services.task_center.s14', task_error=task['error']))
     # 完成时显示结果(前 3 个键值对)
     if status == STATUS_COMPLETED and task.get("result"):
         result = task["result"]
@@ -698,7 +699,7 @@ async def record_task(
         await complete_task(task_id, result)
         return task_id
     if status == STATUS_FAILED:
-        error_msg = str(metadata.get("error") or "操作失败")
+        error_msg = str(metadata.get("error") or _i18n_t('services.task_center.s17'))
         await fail_task(task_id, error_msg)
         return task_id
     if status == STATUS_CANCELLED:

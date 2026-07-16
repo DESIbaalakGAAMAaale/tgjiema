@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Any
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 
 # ─── 可配置阈值 ──────────────────────────────────────────────
@@ -212,14 +213,13 @@ def _check_file_size(file_meta: FileMeta) -> PolicyResult:
     if file_meta.file_size < 0:
         return PolicyResult(
             allowed=False, policy_name="file_size",
-            reason="文件大小非法(负值)",
+            reason=_i18n_t('services.content_policy.s1'),
             metadata={"file_size": file_meta.file_size},
         )
     if file_meta.file_size > DEFAULT_MAX_FILE_SIZE:
         return PolicyResult(
             allowed=False, policy_name="file_size",
-            reason=f"文件大小 {file_meta.file_size} 字节超过上限 "
-                   f"{DEFAULT_MAX_FILE_SIZE} 字节",
+            reason=_i18n_t('services.content_policy.s2', file_meta_file_size=file_meta.file_size, DEFAULT_MAX_FILE_SIZE=DEFAULT_MAX_FILE_SIZE),
             metadata={
                 "file_size": file_meta.file_size,
                 "max_size": DEFAULT_MAX_FILE_SIZE,
@@ -244,7 +244,7 @@ def _check_file_type(file_meta: FileMeta) -> PolicyResult:
     if ext and ext in blocked_exts:
         return PolicyResult(
             allowed=False, policy_name="file_type",
-            reason=f"文件类型 .{ext} 被禁止上传(高风险可执行/脚本类型)",
+            reason=_i18n_t('services.content_policy.s3', ext=ext),
             metadata={"ext": ext, "blocked_list": sorted(blocked_exts)},
         )
     return PolicyResult(allowed=True, policy_name="file_type")
@@ -264,19 +264,19 @@ def _check_file_name(file_meta: FileMeta) -> PolicyResult:
     if not name:
         return PolicyResult(
             allowed=False, policy_name="file_name",
-            reason="文件名为空",
+            reason=_i18n_t('services.content_policy.s4'),
             metadata={},
         )
     if len(name) > DEFAULT_MAX_FILENAME_LEN:
         return PolicyResult(
             allowed=False, policy_name="file_name",
-            reason=f"文件名长度 {len(name)} 超过上限 {DEFAULT_MAX_FILENAME_LEN}",
+            reason=_i18n_t('services.content_policy.s5', len_name=len(name), DEFAULT_MAX_FILENAME_LEN=DEFAULT_MAX_FILENAME_LEN),
             metadata={"name_len": len(name), "max_len": DEFAULT_MAX_FILENAME_LEN},
         )
     if _PATH_TRAVERSAL_PATTERN.search(name):
         return PolicyResult(
             allowed=False, policy_name="file_name",
-            reason="文件名包含路径遍历序列或非法特殊字符",
+            reason=_i18n_t('services.content_policy.s6'),
             metadata={"file_name": name},
         )
     return PolicyResult(allowed=True, policy_name="file_name")

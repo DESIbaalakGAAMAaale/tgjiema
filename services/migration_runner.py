@@ -36,6 +36,7 @@ import re
 from typing import Any
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 # R44 7.2: 延迟导入避免循环依赖(record_migration_usage 在函数内调用)
 
@@ -226,8 +227,7 @@ async def run_migration(
         if not schema_ok:
             severe_error_occurred = True
             result["errors"].append(
-                "schema 验证失败: information_schema 中未找到关键表/列,"
-                "禁止写 ddl_version"
+                _i18n_t('services.migration_runner.s1')
             )
             logger.error(
                 "[migration_runner] R38 P0-5: schema 验证失败(information_schema),"

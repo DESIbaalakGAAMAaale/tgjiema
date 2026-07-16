@@ -21,6 +21,7 @@ import json
 from typing import Any
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 
 # R42 P1-5: 默认 tombstone 保留期(天)
@@ -249,8 +250,7 @@ async def cleanup_hard_delete(
     await _write_retention_audit_log(
         table_name, pk,
         "retention_hard_delete",
-        f"tombstone 物理删除 table={table_name} pk={pk} "
-        f"(retention_days={retention_days},已备份)",
+        _i18n_t('services.retention_worker.s1', table_name=table_name, pk=pk, retention_days=retention_days),
     )
     logger.info(
         f"[retention_worker] R42 P1-5: tombstone 物理删除成功 "

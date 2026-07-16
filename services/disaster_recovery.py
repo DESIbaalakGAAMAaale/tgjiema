@@ -32,6 +32,7 @@ from database.cache_store import get_cache_store
 
 # R50 P1-1: 统一错误码协议化(替代裸字符串 ValueError)
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 
 # ─── kv_store 键名 ─────────────────────────────────────────────
@@ -215,7 +216,7 @@ async def verify_backup(backup_id: str) -> dict:
     if not backup_id:
         return {
             "valid": False, "manifest_ok": False, "checksum_ok": False,
-            "file_count": 0, "size_bytes": 0, "error": "backup_id 为空",
+            "file_count": 0, "size_bytes": 0, "error": _i18n_t('services.disaster_recovery.s6'),
         }
 
     try:
@@ -255,9 +256,9 @@ async def verify_backup(backup_id: str) -> dict:
 
                 file_count = manifest.get("total_tables", 0)
             except Exception as e:
-                error = f"manifest 校验失败: {e}"
+                error = _i18n_t('services.disaster_recovery.s12', e=e)
         except Exception as e:
-            error = f"payload 下载失败: {e}"
+            error = _i18n_t('services.disaster_recovery.s9', e=e)
 
         valid = manifest_ok and checksum_ok and size_bytes > 0
 
@@ -328,7 +329,7 @@ async def restore(
     if not backup_id:
         return {
             "success": False, "restored_tables": 0,
-            "duration_seconds": 0, "error": "backup_id 为空",
+            "duration_seconds": 0, "error": _i18n_t('services.disaster_recovery.s7'),
         }
 
     # R44 G0-3: 灾备恢复必须通过 ApprovalExecutor 调用,不接受任意 approver_id
@@ -560,7 +561,7 @@ async def run_recovery_drill() -> dict:
             "name": "trigger_backup", "success": ok,
             "duration_seconds": _time.time() - step_start,
             "backup_id": backup_id,
-            "error": "" if ok else "trigger_backup 返回空",
+            "error": "" if ok else _i18n_t('services.disaster_recovery.s13'),
         })
         if not ok:
             overall_success = False
@@ -605,7 +606,7 @@ async def run_recovery_drill() -> dict:
         steps.append({
             "name": "verify_backup", "success": False,
             "duration_seconds": 0,
-            "error": "skip (无 backup_id)",
+            "error": _i18n_t('services.disaster_recovery.s10'),
         })
 
     # 步骤 3: 模拟恢复(R40 P0-7: 通过 BackupEngine.restore staging 模式校验可解密)
@@ -627,7 +628,7 @@ async def run_recovery_drill() -> dict:
                 "tables_count": tables_count,
                 "total_rows": total_rows,
                 "checksum_verified": staging_result.get("checksum_verified", False),
-                "error": staging_result.get("error", "") or ("" if ok else "无表数据"),
+                "error": staging_result.get("error", "") or ("" if ok else _i18n_t('services.disaster_recovery.s14')),
             })
             if not ok:
                 overall_success = False
@@ -642,7 +643,7 @@ async def run_recovery_drill() -> dict:
         steps.append({
             "name": "simulate_restore", "success": False,
             "duration_seconds": 0,
-            "error": "skip (无 backup_id)",
+            "error": _i18n_t('services.disaster_recovery.s11'),
         })
 
     # 步骤 4: 记录演练结果
@@ -761,7 +762,7 @@ async def format_disaster_status(status: dict) -> str:
     """
     lines: list[str] = []
     lines.append("═══════════════════════════════════════════════════════════")
-    lines.append("              灾备状态 (R40 §9.3)")
+    lines.append(_i18n_t('services.disaster_recovery.s1'))
     lines.append("═══════════════════════════════════════════════════════════")
 
     # RPO/RTO
@@ -776,26 +777,20 @@ async def format_disaster_status(status: dict) -> str:
 
     # R40 P1-10: None 时输出"无备份",而非误导性的"0s"
     if last_age is None:
-        last_age_text = "无备份"
+        last_age_text = _i18n_t('services.disaster_recovery.s2')
     else:
         last_age_text = f"{last_age}s"
 
     lines.append("")
-    lines.append(f"[RPO] 目标={rpo}s ({rpo // 3600}h)  "
-                f"最近备份距今={last_age_text}  "
-                f"{'✓ 合规' if rpo_ok else '✗ 违规'}")
-    lines.append(f"[RTO] 目标={rto}s ({rto // 60}min)  "
-                f"估算恢复时间={est_recover}s  "
-                f"{'✓ 合规' if rto_ok else '✗ 违规'}")
+    lines.append(_i18n_t('services.disaster_recovery.s3', rpo=rpo, rpo_3600=rpo // 3600, last_age_text=last_age_text, if_rpo_ok_else='✓ 合规' if rpo_ok else '✗ 违规'))
+    lines.append(_i18n_t('services.disaster_recovery.s4', rto=rto, rto_60=rto // 60, est_recover=est_recover, if_rto_ok_else='✓ 合规' if rto_ok else '✗ 违规'))
 
     # 备份计划
     lines.append("")
-    lines.append(f"[备份计划] 启用={status.get('enabled', False)}  "
-                f"间隔={status.get('interval_minutes', 0)}min  "
-                f"保留={status.get('retention_days', 0)} 天")
+    lines.append(_i18n_t('services.disaster_recovery.s5', status_get_enabled_False=status.get('enabled', False), status_get_interval_minutes_0=status.get('interval_minutes', 0), status_get_retention_days_0=status.get('retention_days', 0)))
     next_at = status.get("next_backup_at")
     if next_at:
-        lines.append(f"[下次备份] {next_at}")
+        lines.append(_i18n_t('services.disaster_recovery.s8', next_at=next_at))
 
     lines.append("═══════════════════════════════════════════════════════════")
     return "\n".join(lines)

@@ -631,6 +631,7 @@ class TestP1_5RemovePublicCasBypass:
                 name="test",
                 principal_id=950,
                 request_hash="hash_001",
+                target_version=1,
                 # 无 approval_action_id
             )
         assert exc_info.value.code == ErrorCodes.COLLECTION_APPROVAL_INVALID, \
@@ -681,9 +682,10 @@ class TestP1_5RemovePublicCasBypass:
         coll_id = coll.get("id", 0)
 
         # R53 P0-4: 插入真实审批记录(status=approved)
+        _rh = "a" * 64  # R55 P0-2: 64 位 hex(满足 claim_execution_approved 校验)
         await _insert_command_execution(
             real_store, "approval_r52_p1_5_001", principal_id=950,
-            status="approved", request_hash="hash_r52_p1_5_001",
+            status="approved", request_hash=_rh,
         )
 
         # 私有方法 + 真实审批 → 成功更新
@@ -691,7 +693,8 @@ class TestP1_5RemovePublicCasBypass:
             collection_id=coll_id,
             name="updated_name",
             principal_id=950,
-            request_hash="hash_r52_p1_5_001",
+            request_hash=_rh,
+            target_version=1,
             approval_action_id="approval_r52_p1_5_001",
             caller="test_migration",
         )

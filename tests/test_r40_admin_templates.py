@@ -160,8 +160,9 @@ def _build_service_mocks():
     mods["services.collections"] = col
 
     # services.notifications
+    # admin 调用 list_all(user_id=..., page_size=...)
     nt = types.ModuleType("services.notifications")
-    nt.list_all_notifications = AsyncMock(return_value={"items": [], "total": 0})
+    nt.list_all = AsyncMock(return_value={"items": [], "total": 0})
     mods["services.notifications"] = nt
 
     # services.approval_workflow

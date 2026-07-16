@@ -243,8 +243,7 @@ async def _transition_upload_session_strict(
     if not upload_id:
         # R38 P0-3: upload_id 为空抛 DurabilityError,不再静默 return
         raise DurabilityError(
-            f"upload_session 状态推进失败: missing upload_id "
-            f"(target_status={new_status})"
+            _i18n_t('bot.up.s4', new_status=new_status)
         )
     try:
         await get_cache_store().transition_upload_session(
@@ -252,8 +251,7 @@ async def _transition_upload_session_strict(
         )
     except Exception as e:
         raise DurabilityError(
-            f"upload_session 状态推进失败 upload_id={upload_id} "
-            f"-> {new_status}: {e}"
+            _i18n_t('bot.up.s17', upload_id=upload_id, new_status=new_status, e=e)
         ) from e
 
 
@@ -704,7 +702,7 @@ async def _register_manifest(channel_id: int, message_id: int, msg, media_type: 
     group_id = _channel_to_group.get(channel_id)
     if group_id is None:
         raise RuntimeError(
-            f"无法解析频道 {channel_id} 的 group_id(可能 _channel_to_group 映射未刷新)"
+            _i18n_t('bot.up.s5', channel_id=channel_id)
         )
     store = get_cache_store()
     await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type, mgid)
@@ -942,9 +940,7 @@ async def _outbox_register_manifest_strict(
         # 保留完整上下文(outbox_id/upload_id/storage_msg_id)供人工修复。
         from utils.exceptions import DurabilityError
         raise DurabilityError(
-            f"manifest event missing file_unique_id "
-            f"(channel={channel_id}, msg_id={message_id}, "
-            f"outbox upload_id 可能丢失 — 请检查 upload_outbox 表"
+            _i18n_t('bot.up.s6', channel_id=channel_id, message_id=message_id)
         )
     media_type = (file_meta or {}).get("type", "") if isinstance(file_meta, dict) else ""
     mgid = (file_meta or {}).get("media_group_id", "") if isinstance(file_meta, dict) else ""
@@ -954,7 +950,7 @@ async def _outbox_register_manifest_strict(
         # 频道未映射到 group,manifest 无法注册
         # 抛异常让 OutboxWorker 重试(可能下次刷新 channel→group 映射后命中)
         raise RuntimeError(
-            f"无法解析频道 {channel_id} 的 group_id(可能 _channel_to_group 映射未刷新)"
+            _i18n_t('bot.up.s7', channel_id=channel_id)
         )
     store = get_cache_store()
     await store.upsert_manifest(group_id, fuid, channel_id, message_id, media_type, mgid)
@@ -1025,29 +1021,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     await safe_reply_text(update.message,
-        "📤 上传机器人使用帮助\n\n"
-        "可用命令：\n"
-        "/start — 启动机器人 / 查看欢迎语\n"
-        "/help — 查看本帮助\n"
-        "/start_upload — 开始批次上传（多文件共用一个文件码）\n"
-        "/end_upload — 结束批次上传并生成文件码\n"
-        "/cancel_upload — 取消当前批次上传\n"
-        "/note 文字 — 为当前批次添加备注\n"
-        "/cancel_note — 跳过备注输入\n"
-        "/new_collection — 开始合集打包（多个文件码打包成一个合集码）\n"
-        "/end_collection — 结束合集打包并生成合集码\n"
-        "/cancel_collection — 取消合集打包\n"
-        "/note_collection 文字 — 为合集添加备注\n\n"
-        "使用说明：\n"
-        "1. 单次上传：直接发送文件，立即生成文件码。\n"
-        "2. 批次上传：/start_upload 开始 → 发送多个文件 → /end_upload 结束生成文件码。\n"
-        "3. 合集打包：/new_collection 开始 → 发送文件码（可多次追加）→ /end_collection 生成合集码。\n"
-        "4. 上传时可设置转发权限，受限文件将无法被他人转发。\n"
+        _i18n_t('bot.up.s18')
         + common_faq()
     )
 
 
-@require_maintenance_check(action="批次上传")
+@require_maintenance_check(action=_i18n_t('bot.up.s1'))
 async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await check_force_join(update, context):
@@ -1077,9 +1056,9 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if "batch" in context.user_data:
         del context.user_data["batch"]
-        await update.message.reply_text("批次上传已取消")
+        await update.message.reply_text(_i18n_t('bot.up.s19'))
     else:
-        await update.message.reply_text("当前没有进行中的批次上传")
+        await update.message.reply_text(_i18n_t('bot.up.s20'))
 
 
 async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1088,17 +1067,17 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = context.user_data.get("batch")
     if batch is None:
-        await update.message.reply_text("当前没有进行中的批次上传，请先使用 /start_upload 开始")
+        await update.message.reply_text(_i18n_t('bot.up.s21'))
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text("用法：/note 备注内容\n例如：/note 这是张三的文件")
+        await update.message.reply_text(_i18n_t('bot.up.s22'))
         return
     batch["note"] = note_text
-    await update.message.reply_text(f"✅ 备注已设置为：{note_text}")
+    await update.message.reply_text(_i18n_t('bot.up.s8', note_text=note_text))
 
 
-@require_maintenance_check(action="合集打包")
+@require_maintenance_check(action=_i18n_t('bot.up.s2'))
 async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """开始合集打包模式:用户后续发送的文件码将被收集进合集。"""
     user = update.effective_user
@@ -1109,7 +1088,7 @@ async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 " + _t(user.id, "bot.upload_banned"))
         return
     if "batch" in context.user_data:
-        await update.message.reply_text("当前正在进行批次上传，请先 /end_upload 或 /cancel_upload")
+        await update.message.reply_text(_i18n_t('bot.up.s23'))
         return
     context.user_data["_collecting_collection"] = {
         "codes": [],
@@ -1128,12 +1107,12 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     coll = context.user_data.pop("_collecting_collection", None)
     if coll is None:
-        await update.message.reply_text("当前没有进行中的合集打包，请先使用 /new_collection 开始")
+        await update.message.reply_text(_i18n_t('bot.up.s24'))
         return
 
     codes = coll.get("codes", [])
     if not codes:
-        await update.message.reply_text("合集为空（未收集到任何文件码），已取消")
+        await update.message.reply_text(_i18n_t('bot.up.s25'))
         return
 
     # 去重并保留顺序
@@ -1222,10 +1201,7 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[Up][collection] codes 表写入失败(code={collection_code}): {e}")
 
     await update.message.reply_text(
-        f"✅ 合集打包完成！\n\n"
-        f"📦 合集码：{collection_code}\n"
-        f"📄 包含 {len(unique_codes)} 个文件码\n"
-        f"💡 将合集码发送给解码机器人即可一次性获取全部文件"
+        _i18n_t('bot.up.s9', collection_code=collection_code, len_unique_codes=len(unique_codes))
     )
 
 
@@ -1235,9 +1211,9 @@ async def cancel_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if "_collecting_collection" in context.user_data:
         del context.user_data["_collecting_collection"]
-        await update.message.reply_text("合集打包已取消")
+        await update.message.reply_text(_i18n_t('bot.up.s26'))
     else:
-        await update.message.reply_text("当前没有进行中的合集打包")
+        await update.message.reply_text(_i18n_t('bot.up.s27'))
 
 
 async def note_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1246,14 +1222,14 @@ async def note_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     coll = context.user_data.get("_collecting_collection")
     if coll is None:
-        await update.message.reply_text("当前没有进行中的合集打包，请先使用 /new_collection 开始")
+        await update.message.reply_text(_i18n_t('bot.up.s28'))
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text("用法：/note_collection 备注内容\n例如：/note_collection 张三的合集")
+        await update.message.reply_text(_i18n_t('bot.up.s29'))
         return
     coll["note"] = note_text
-    await update.message.reply_text(f"✅ 合集备注已设置为：{note_text}")
+    await update.message.reply_text(_i18n_t('bot.up.s10', note_text=note_text))
 
 
 async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1262,7 +1238,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = context.user_data.pop("batch", None)
     if batch is None:
-        await update.message.reply_text("当前没有进行中的批次上传，请先使用 /start_upload 开始")
+        await update.message.reply_text(_i18n_t('bot.up.s30'))
         return
 
     # PRE-13: 仅 flush 当前用户的 media group，避免清掉其他用户正在进行中的批次
@@ -1280,7 +1256,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     src_messages = batch.get("src_messages", [])
     if not src_messages:
-        await update.message.reply_text("没有接收到任何文件，批次已取消")
+        await update.message.reply_text(_i18n_t('bot.up.s31'))
         return
 
     target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
@@ -1431,12 +1407,12 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     await update.message.reply_text(
-        f"📦 {len(channel_msg_ids)} 个文件已接收\n请选择文件有效期：",
+        _i18n_t('bot.up.s11', len_channel_msg_ids=len(channel_msg_ids)),
         reply_markup=_build_ttl_keyboard(),
     )
 
 
-@require_maintenance_check(action="上传文件")
+@require_maintenance_check(action=_i18n_t('bot.up.s3'))
 async def _dispatch_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 外部中继文件优先路由:caption 以 EXTERNAL_RELAY: 开头,或 media_group_id 已登记为外部组
     caption = update.message.caption or ""
@@ -1508,7 +1484,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             "file_meta": file_meta,
             "file_unique_id": _extract_file_unique_id(update.message),
         })
-        await update.message.reply_text(f"✅ 已接收：{file_type}")
+        await update.message.reply_text(_i18n_t('bot.up.s32', file_type=file_type))
 
 
 async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE, batch: dict):
@@ -1530,8 +1506,8 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
             "file_unique_id": _extract_file_unique_id(up.message),
         })
     first = grp["updates"][0]
-    type_desc = " ".join(f"{v}个{k}" for k, v in sorted(file_types.items()))
-    await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=f"✅ 已接收媒体组：{type_desc}（{len(grp['updates'])}个文件）")
+    type_desc = " ".join(_i18n_t('bot.up.s12', v=v, k=k) for k, v in sorted(file_types.items()))
+    await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=_i18n_t('bot.up.s33', type_desc=type_desc, len_grp_updates=len(grp['updates'])))
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1632,11 +1608,11 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     progress_msg = await safe_send_message(
         context.bot, chat_id=user_id,
-        text=f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}"
+        text=_i18n_t('bot.up.s34', total_count=total_count, total_count_2=total_count)
     )
 
     try:
-        await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 0/{total_count}")
+        await progress_msg.edit_text(_i18n_t('bot.up.s35', total_count=total_count, total_count_2=total_count))
     except Exception:
         pass
 
@@ -1716,7 +1692,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                         await _mark_replication_copied_safe(_tid, all_mids[idx])
                         await _mark_replication_committed_safe(_tid)
                 try:
-                    await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
+                    await progress_msg.edit_text(_i18n_t('bot.up.s61', total_count=total_count, total_count_2=total_count, total_count_4=total_count))
                 except Exception:
                     pass
                 # R35 P0-4: 批量 copy 成功,推进 RECEIVED → COPIED_PRIMARY
@@ -1752,7 +1728,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                         await _mark_replication_failed_safe(_mg_task_ids[i], f"mg_single_copy_failed: {e}")
                 if (i + 1) % 3 == 0 or i == total_count - 1:
                     try:
-                        await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {i + 1}/{total_count}")
+                        await progress_msg.edit_text(_i18n_t('bot.up.s63', total_count=total_count, i_1=i + 1, total_count_3=total_count))
                     except Exception:
                         pass
             # R35 P0-4: 逐条回退完成(部分成功),推进 COPIED_PRIMARY
@@ -1782,8 +1758,8 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     # 编辑进度消息为完成状态（最终确认消息由 _finalize_upload 发出）
     try:
-        failed_hint = f"（其中 {failed_count} 个文件处理失败）" if failed_count > 0 else ""
-        await progress_msg.edit_text(f"文件处理完成{failed_hint}")
+        failed_hint = _i18n_t('bot.up.s13', failed_count=failed_count) if failed_count > 0 else ""
+        await progress_msg.edit_text(_i18n_t('bot.up.s36', failed_hint=failed_hint))
     except Exception:
         pass
 
@@ -1814,7 +1790,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text="请选择文件有效期：",
+            text=_i18n_t('bot.up.s50'),
             reply_markup=_build_ttl_keyboard(),
         )
     except Exception as e:
@@ -1923,7 +1899,7 @@ async def _process_upload(
 
     # 第一步：发送有效期选择
     await update.message.reply_text(
-        "请选择文件有效期：",
+        _i18n_t('bot.up.s14'),
         reply_markup=_build_ttl_keyboard(),
     )
 
@@ -1949,19 +1925,19 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
         if ("_pending_batch" in context.user_data
                 and context.user_data["_pending_batch"].get("note")):
             await query.edit_message_text(
-                text="请选择转发权限：",
+                text=_i18n_t('bot.up.s58'),
                 reply_markup=_build_protect_keyboard(),
             )
         else:
             await query.edit_message_text(
-                text="是否需要添加备注？",
+                text=_i18n_t('bot.up.s59'),
                 reply_markup=_build_note_keyboard(),
             )
 
     elif key == "note":
         if value == "skip":
             await query.edit_message_text(
-                text="请选择转发权限：",
+                text=_i18n_t('bot.up.s62'),
                 reply_markup=_build_protect_keyboard(),
             )
         elif value == "add":
@@ -1969,7 +1945,7 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["_note_query_msg_id"] = query.message.message_id
             context.user_data["_note_query_chat_id"] = query.message.chat_id
             await query.edit_message_text(
-                text="📝 请发送备注文字（60秒内有效）\n发送任意文字即可，或发送 /cancel_note 跳过",
+                text=_i18n_t('bot.up.s64'),
                 reply_markup=None,
             )
 
@@ -2109,7 +2085,7 @@ async def _finalize_upload(query, context, user_id: int):
                     last_error="main_channel or channel_msg_id is zero",
                 )
                 try:
-                    await query.edit_message_text(text="文件处理失败：存储频道未就绪，请重新上传")
+                    await query.edit_message_text(text=_i18n_t('bot.up.s65'))
                 except Exception:
                     pass
                 return
@@ -2280,13 +2256,11 @@ async def _handle_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tokens.append(line)
         new_codes = [t for t in tokens if is_valid_code_format(t)]
         if not new_codes:
-            await update.message.reply_text("未识别到有效文件码，请发送格式正确的文件码")
+            await update.message.reply_text(_i18n_t('bot.up.s51'))
             return
         coll["codes"].extend(new_codes)
         await update.message.reply_text(
-            f"✅ 已追加 {len(new_codes)} 个文件码\n"
-            f"📦 当前合集共 {len(coll['codes'])} 个文件码\n"
-            f"继续发送文件码，或 /end_collection 完成"
+            _i18n_t('bot.up.s37', len_new_codes=len(new_codes), len_coll_codes=len(coll['codes']))
         )
         return
 
@@ -2297,20 +2271,20 @@ async def _handle_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if time.time() - note_since > 60:
         del context.user_data["awaiting_note_since"]
-        await update.message.reply_text("⏰ 备注输入已超时，请重新上传文件")
+        await update.message.reply_text(_i18n_t('bot.up.s38'))
         return
 
     # 保存备注
     context.user_data["_note"] = update.message.text
     del context.user_data["awaiting_note_since"]
 
-    await update.message.reply_text(f"✅ 备注已设置：{update.message.text}")
+    await update.message.reply_text(_i18n_t('bot.up.s15', update_message_text=update.message.text))
 
     # 弹出转发权限选择
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text="请选择转发权限：",
+            text=_i18n_t('bot.up.s52'),
             reply_markup=_build_protect_keyboard(),
         )
     except Exception as e:
@@ -2321,11 +2295,11 @@ async def cancel_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """取消/跳过备注输入"""
     if context.user_data.get("awaiting_note_since"):
         del context.user_data["awaiting_note_since"]
-        await update.message.reply_text("已跳过备注")
+        await update.message.reply_text(_i18n_t('bot.up.s39'))
         try:
             await context.bot.send_message(
                 chat_id=update.effective_user.id,
-                text="请选择转发权限：",
+                text=_i18n_t('bot.up.s60'),
                 reply_markup=_build_protect_keyboard(),
             )
         except Exception as e:
@@ -2339,15 +2313,15 @@ def _build_ttl_keyboard():
     keyboard = [
         [
             # P2: 用 -1 哨兵区分「永久(0)」与「默认」
-            InlineKeyboardButton("∞ 永久有效", callback_data="opt|ttl|-1"),
-            InlineKeyboardButton("1天", callback_data="opt|ttl|1"),
+            InlineKeyboardButton(_i18n_t('bot.up.s40'), callback_data="opt|ttl|-1"),
+            InlineKeyboardButton(_i18n_t('bot.up.s41'), callback_data="opt|ttl|1"),
         ],
         [
-            InlineKeyboardButton("7天", callback_data="opt|ttl|7"),
-            InlineKeyboardButton("30天", callback_data="opt|ttl|30"),
+            InlineKeyboardButton(_i18n_t('bot.up.s42'), callback_data="opt|ttl|7"),
+            InlineKeyboardButton(_i18n_t('bot.up.s43'), callback_data="opt|ttl|30"),
         ],
         [
-            InlineKeyboardButton("90天", callback_data="opt|ttl|90"),
+            InlineKeyboardButton(_i18n_t('bot.up.s44'), callback_data="opt|ttl|90"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -2357,8 +2331,8 @@ def _build_protect_keyboard():
     """构建转发权限选择按钮。"""
     keyboard = [
         [
-            InlineKeyboardButton("🔒 禁止转发", callback_data="opt|protect|true"),
-            InlineKeyboardButton("↗️ 允许转发", callback_data="opt|protect|false"),
+            InlineKeyboardButton(_i18n_t('bot.up.s45'), callback_data="opt|protect|true"),
+            InlineKeyboardButton(_i18n_t('bot.up.s46'), callback_data="opt|protect|false"),
         ],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -2367,8 +2341,8 @@ def _build_protect_keyboard():
 def _build_note_keyboard():
     """构建备注选择按钮。"""
     keyboard = [
-        [InlineKeyboardButton("📝 添加备注", callback_data="opt|note|add")],
-        [InlineKeyboardButton("⏭ 跳过", callback_data="opt|note|skip")],
+        [InlineKeyboardButton(_i18n_t('bot.up.s47'), callback_data="opt|note|add")],
+        [InlineKeyboardButton(_i18n_t('bot.up.s48'), callback_data="opt|note|skip")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -2751,12 +2725,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看上传状态: /status <upload_id>"""
     try:
         if not context.args:
-            await update.message.reply_text("用法:/status <upload_id>")
+            await update.message.reply_text(_i18n_t('bot.up.s53'))
             return
         upload_id = context.args[0]
         receipt = await upload_receipt.get_upload_status(upload_id)
         if not receipt:
-            await update.message.reply_text("❌ 未找到该上传记录")
+            await update.message.reply_text(_i18n_t('bot.up.s54'))
             return
         text = await upload_receipt.format_receipt(receipt)
         await update.message.reply_text(text)
@@ -2774,7 +2748,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_filter = context.args[0] if context.args else None
         tasks = await task_center.list_user_tasks(user.id, status=status_filter, limit=20)
         if not tasks:
-            await update.message.reply_text("📭 暂无任务记录")
+            await update.message.reply_text(_i18n_t('bot.up.s55'))
             return
         lines = [await task_center.format_task_status(t) for t in tasks]
         await update.message.reply_text("\n\n".join(lines))
@@ -2798,11 +2772,11 @@ async def cmd_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await collections_svc.list_collections(owner_id=user.id, page=page, page_size=10)
         items = result.get("items", [])
         if not items:
-            await update.message.reply_text("📭 暂无合集")
+            await update.message.reply_text(_i18n_t('bot.up.s56'))
             return
-        lines = [f"📁 合集列表(第 {result.get('page', 1)}/{result.get('total_pages', 1)} 页,共 {result.get('total', 0)} 个)"]
+        lines = [_i18n_t('bot.up.s16', result_get_page_1=result.get('page', 1), result_get_total_pages_1=result.get('total_pages', 1), result_get_total_0=result.get('total', 0))]
         for c in items:
-            lines.append(f"• {c.get('name', '未命名')} (id={c.get('id')})")
+            lines.append(_i18n_t('bot.up.s49', c_get_name=c.get('name', '未命名'), c_get_id=c.get('id')))
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.exception(f"[Up][collections] 查询合集列表失败: {e}")
@@ -2817,7 +2791,7 @@ async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         items = await notifications.list_unread(user.id, limit=20)
         if not items:
-            await update.message.reply_text("📭 暂无未读通知")
+            await update.message.reply_text(_i18n_t('bot.up.s57'))
             return
         lines = [await notifications.format_notification(n) for n in items]
         await update.message.reply_text("\n\n".join(lines))

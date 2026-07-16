@@ -30,7 +30,7 @@ from database.cache_store import get_cache_store
 from services.mon import MonScheduler
 from utils.monitor import metrics
 # R44 6.2: i18n 国际化翻译(管理员可见告警文案)
-from services.i18n import get_i18n_manager
+from services.i18n import get_i18n_manager, translate as _i18n_t
 # R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
 from services.error_codes import AppError, ErrorCodes
 
@@ -229,7 +229,7 @@ class MonBot:
         fallback_fields: dict,
         fallback_mark_dirty: bool = True,
         owner: str = "mon_bot",
-        reason: str = "CAS 失败",
+        reason: str = _i18n_t('bot.mon.s1'),
     ) -> bool:
         """R36 H5: CAS/lease 失败时的统一处理(fail-closed / 维护模式 fallback)。
 
@@ -515,63 +515,63 @@ class MonBot:
             if total_deliveries >= 10:
                 if delivery_rate < 80:
                     alerts_to_check.append(("delivery_rate", "CRITICAL",
-                        f"投递成功率严重偏低: {delivery_rate:.1f}% ({send_success}/{total_deliveries})"))
+                        _i18n_t('bot.mon.s20', delivery_rate=delivery_rate, send_success=send_success, total_deliveries=total_deliveries)))
                 elif delivery_rate < 95:
                     alerts_to_check.append(("delivery_rate", "WARNING",
-                        f"投递成功率偏低: {delivery_rate:.1f}% ({send_success}/{total_deliveries})"))
+                        _i18n_t('bot.mon.s25', delivery_rate=delivery_rate, send_success=send_success, total_deliveries=total_deliveries)))
 
             # 队列积压
             if queue_backlog > 200:
                 alerts_to_check.append(("queue_backlog", "CRITICAL",
-                    f"队列积压严重: {queue_backlog} 个待处理任务"))
+                    _i18n_t('bot.mon.s9', queue_backlog=queue_backlog)))
             elif queue_backlog > 50:
                 alerts_to_check.append(("queue_backlog", "WARNING",
-                    f"队列积压偏高: {queue_backlog} 个待处理任务"))
+                    _i18n_t('bot.mon.s21', queue_backlog=queue_backlog)))
 
             # Writer pending 积压(R33: 使用 pending 数而非 stream 长度)
             if isinstance(writer_queue_len, int) and writer_queue_len >= 0:
                 writer_threshold = settings.WRITER_QUEUE_ALERT_THRESHOLD
                 if writer_queue_len > writer_threshold:
                     alerts_to_check.append(("writer_queue_backlog", "CRITICAL",
-                        f"Writer pending 积压严重: {writer_queue_len} 条(阈值 {writer_threshold})"))
+                        _i18n_t('bot.mon.s22', writer_queue_len=writer_queue_len, writer_threshold=writer_threshold)))
                 elif writer_queue_len > writer_threshold // 2:
                     alerts_to_check.append(("writer_queue_backlog", "WARNING",
-                        f"Writer pending 积压偏高: {writer_queue_len} 条(警告阈值 {writer_threshold // 2}, 严重阈值 {writer_threshold})"))
+                        _i18n_t('bot.mon.s26', writer_queue_len=writer_queue_len, writer_threshold_2=writer_threshold // 2, writer_threshold=writer_threshold)))
             elif writer_queue_len == -1:
                 # P1修复: Redis 不可达时也告警,避免 db_writer 静默故障
                 alerts_to_check.append(("writer_redis_unavailable", "WARNING",
-                    "Writer 队列检查失败(Redis 不可达),db_writer 可能无法消费消息"))
+                    _i18n_t('bot.mon.s23')))
 
             # R33: 死信队列监控
             if dlq_len > 0:
                 alerts_to_check.append(("writer_dlq", "WARNING",
-                    f"Writer 死信队列有 {dlq_len} 条消息,需人工排查"))
+                    _i18n_t('bot.mon.s10', dlq_len=dlq_len)))
 
             # db_writer 服务状态告警(P1修复: 复用 _check_db_writer_status 避免重复代码)
             dw_status, _ = await self._check_db_writer_status()
             if dw_status not in ("active", "unknown"):
                 alerts_to_check.append(("db_writer_down", "CRITICAL",
-                    f"db_writer 服务异常: 状态={dw_status},写操作无法落盘 SQLite"))
+                    _i18n_t('bot.mon.s11', dw_status=dw_status)))
 
             # 账号存活率
             if total > 0:
                 if survival_rate < 50:
                     alerts_to_check.append(("account_survival", "CRITICAL",
-                        f"中继账号存活率严重偏低: {alive}/{total} ({survival_rate:.0f}%)"))
+                        _i18n_t('bot.mon.s24', alive=alive, total=total, survival_rate=survival_rate)))
                 elif survival_rate < 80:
                     alerts_to_check.append(("account_survival", "WARNING",
-                        f"中继账号存活率偏低: {alive}/{total} ({survival_rate:.0f}%)"))
+                        _i18n_t('bot.mon.s27', alive=alive, total=total, survival_rate=survival_rate)))
 
             # A2: 绝对数量告警(即使存活率高,但绝对数量低于安全水位也告警)
             safe_threshold = getattr(settings, "RELAY_SAFE_POOL_SIZE", 2)
             if total > 0 and alive < safe_threshold:
                 alerts_to_check.append(("account_pool_low", "CRITICAL",
-                    f"中继账号池即将耗尽: 仅剩 {alive}/{total} 个可用账号 (安全水位: {safe_threshold})"))
+                    _i18n_t('bot.mon.s12', alive=alive, total=total, safe_threshold=safe_threshold)))
 
             # Bot 离线
             if stale_bots:
                 alerts_to_check.append(("bot_stale", "CRITICAL",
-                    f"以下 Bot 离线超过 5 分钟: {', '.join(stale_bots)}"))
+                    _i18n_t('bot.mon.s13', join_stale_bots=', '.join(stale_bots))))
 
             # ── 发送告警 + 恢复通知 ──
             # 状态追踪只用 severity(不含变化的数值),避免每轮都因数值变化触发重复通知
@@ -594,7 +594,7 @@ class MonBot:
                 if alert_key not in active_keys:
                     prev = self._alert_states.pop(alert_key, "")
                     if prev:
-                        sent = await self._notify_admin(f"✅ [恢复] {alert_key} 已恢复正常")
+                        sent = await self._notify_admin(_i18n_t('bot.mon.s28', alert_key=alert_key))
                         # 通知发送失败时恢复状态,下轮会重试
                         if not sent:
                             self._alert_states[alert_key] = prev
@@ -608,7 +608,7 @@ class MonBot:
         """
         slot_id = cell.get("slot_id", "?")
         channel_id = cell.get("channel_id", 0)
-        account_name = cell.get("account_name", "未知")
+        account_name = cell.get("account_name", _i18n_t('bot.mon.s2'))
         status = cell.get("status", "?")
         store = get_cache_store()
 
@@ -627,11 +627,11 @@ class MonBot:
 
         if account_name and account_name not in ("?", "R100"):
             spare = await get_spare_for_account(account_name)
-            spare_source = f"同账号备用池 ({account_name})"
+            spare_source = _i18n_t('bot.mon.s3', account_name=account_name)
 
         if not spare:
             spare = await get_any_spare()
-            spare_source = "通用备用池"
+            spare_source = _i18n_t('bot.mon.s4')
 
         if spare:
             spare_ch = spare["channel_id"]
@@ -673,7 +673,7 @@ class MonBot:
                             "rotation_started_at": now_iso,
                         },
                         fallback_mark_dirty=True,
-                        reason="封禁替换 CAS 失败",
+                        reason=_i18n_t('bot.mon.s29'),
                     )
             finally:
                 await self._release_cell_lease_safe(slot_id)
@@ -715,7 +715,7 @@ class MonBot:
             await log_rotate(
                 from_slot_id=slot_id, to_slot_id=slot_id,
                 from_status=status, to_status=new_status,
-                reason=f"封禁替换: old={channel_id} → new={spare_ch} ({spare_source})",
+                reason=_i18n_t('bot.mon.s14', channel_id=channel_id, spare_ch=spare_ch, spare_source=spare_source),
                 triggered_by="mon",
             )
             notify_msg += _t(
@@ -810,7 +810,7 @@ class MonBot:
                                 "demoted_to_channel_id": None,
                             },
                             fallback_mark_dirty=True,
-                            reason="lost 恢复 CAS 失败",
+                            reason=_i18n_t('bot.mon.s30'),
                         )
                 finally:
                     await self._release_cell_lease_safe(slot_id)
@@ -1401,7 +1401,7 @@ class MonBot:
         issues: list[str] = []
         store = get_cache_store()
         if store is None:
-            return ["cache_store 不可用"]
+            return [_i18n_t('bot.mon.s5')]
 
         # 获取全量 cells(事务内查询确保一致性快照)
         if tx is not None:
@@ -1418,12 +1418,12 @@ class MonBot:
                     for r in (rows or [])
                 ]
             except Exception as e:
-                return [f"事务内查询 cells_local 失败: {e}"]
+                return [_i18n_t('bot.mon.s15', e=e)]
         else:
             all_cells = await store.get_all_cells_local()
 
         if not all_cells:
-            return ["cells_local 为空(无数据)"]
+            return [_i18n_t('bot.mon.s6')]
 
         # 按组号分组(slot_id 格式: a1/s1/s2/a2/s3/s4/...)
         groups: dict[str, list[dict]] = {}
@@ -1446,13 +1446,12 @@ class MonBot:
                 has_shadow = any(c.get("status") in ("shadow1", "shadow2") for c in cells)
                 if has_shadow:
                     issues.append(
-                        f"组 {gnum} 无 active 频道但有 shadow(可能正在轮转)"
+                        _i18n_t('bot.mon.s16', gnum=gnum)
                     )
             elif len(active_in_group) > 1:
                 slot_ids = [c["slot_id"] for c in active_in_group]
                 issues.append(
-                    f"组 {gnum} 有多个 active 频道: {slot_ids}"
-                    f"(违反每组恰好一个 active 不变量)"
+                    _i18n_t('bot.mon.s17', gnum=gnum, slot_ids=slot_ids)
                 )
 
         # 2. shadow 账号分散(同一 account_name 不重复出现在同一组的多个 shadow 槽位)
@@ -1466,8 +1465,7 @@ class MonBot:
             for acc, slots in account_map.items():
                 if len(slots) > 1:
                     issues.append(
-                        f"组 {gnum} shadow 账号分散违规: account={acc} "
-                        f"出现在多个 shadow 槽位 {slots}"
+                        _i18n_t('bot.mon.s18', gnum=gnum, acc=acc, slots=slots)
                     )
 
         # 3. lost 频道不进入路由(next_active_chat_id 不指向 lost 频道)
@@ -1479,8 +1477,7 @@ class MonBot:
             nxt = c.get("next_active_chat_id")
             if nxt and nxt in lost_channels:
                 issues.append(
-                    f"槽位 {c['slot_id']} 的 next_active_chat_id={nxt} "
-                    f"指向 lost 频道(lost 不应进入路由)"
+                    _i18n_t('bot.mon.s7', c_slot_id=c['slot_id'], nxt=nxt)
                 )
 
         # 4. active 频道的 next_active_chat_id 必须指向另一个 active 频道
@@ -1492,14 +1489,12 @@ class MonBot:
                 # 单个 active 频道时 next 可以为空
                 if len(active_channels) > 1:
                     issues.append(
-                        f"active 槽位 {c['slot_id']} 的 next_active_chat_id 为空"
-                        f"(多 active 场景下必须形成闭环)"
+                        _i18n_t('bot.mon.s19', c_slot_id=c['slot_id'])
                     )
                 continue
             if nxt not in active_channels:
                 issues.append(
-                    f"active 槽位 {c['slot_id']} 的 next_active_chat_id={nxt} "
-                    f"指向非 active 频道(闭环断裂)"
+                    _i18n_t('bot.mon.s8', c_slot_id=c['slot_id'], nxt=nxt)
                 )
 
         return issues

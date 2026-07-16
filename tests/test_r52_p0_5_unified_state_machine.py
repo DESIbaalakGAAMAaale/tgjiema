@@ -190,7 +190,7 @@ async def _insert_command_execution(
     action_id: str,
     status: str = "approved",
     principal_id: int = 100,
-    request_hash: str = "test_hash_001",
+    request_hash: str = "a" * 64,
     command_type: str = "test_command",
     result_json: str = "",
 ):
@@ -330,6 +330,7 @@ class TestClaimExecutionApproved:
 
         claimed = await claim_execution_approved(
             action_id=action_id, owner="test_worker_001",
+            request_hash="a" * 64,
         )
         assert claimed is True, "status='approved' 时 CAS 应成功"
 
@@ -348,6 +349,7 @@ class TestClaimExecutionApproved:
 
         claimed = await claim_execution_approved(
             action_id=action_id, owner="test_worker_002",
+            request_hash="a" * 64,
         )
         assert claimed is False, "status='pending' 时 CAS 应失败"
 
@@ -361,6 +363,7 @@ class TestClaimExecutionApproved:
 
         claimed = await claim_execution_approved(
             action_id=action_id, owner="test_worker_003",
+            request_hash="a" * 64,
         )
         assert claimed is False, "status='executing' 时 CAS 应失败"
 
@@ -374,6 +377,7 @@ class TestClaimExecutionApproved:
 
         claimed = await claim_execution_approved(
             action_id=action_id, owner="test_worker_004",
+            request_hash="a" * 64,
         )
         assert claimed is False, "status='executed' 时 CAS 应失败"
 
@@ -385,12 +389,12 @@ class TestClaimExecutionApproved:
         action_id = "r52_claim_005"
         await _insert_command_execution(
             real_store, action_id, status="approved",
-            request_hash="stored_hash_abc",
+            request_hash="a" * 64,
         )
 
         claimed = await claim_execution_approved(
             action_id=action_id, owner="test_worker_005",
-            request_hash="tampered_hash_xyz",
+            request_hash="b" * 64,
         )
         assert claimed is False, "request_hash 不匹配时 CAS 应失败"
 
@@ -465,13 +469,13 @@ class TestVerifyCommandApproved:
         action_id = "r52_verify_001"
         await _insert_command_execution(
             real_store, action_id, status="approved",
-            principal_id=200, request_hash="hash_200",
+            principal_id=200, request_hash="a" * 64,
         )
 
         result = await verify_command_approved(
             action_id,
             expected_principal_id=200,
-            expected_request_hash="hash_200",
+            expected_request_hash="a" * 64,
         )
         assert result["status"] == "approved"
         assert result["principal_id"] == 200
@@ -533,14 +537,14 @@ class TestVerifyCommandApproved:
         action_id = "r52_verify_005"
         await _insert_command_execution(
             real_store, action_id, status="approved",
-            principal_id=200, request_hash="stored_hash",
+            principal_id=200, request_hash="a" * 64,
         )
 
         with pytest.raises(AppError) as exc_info:
             await verify_command_approved(
                 action_id,
                 expected_principal_id=200,
-                expected_request_hash="tampered_hash",
+                expected_request_hash="b" * 64,
             )
 
         assert exc_info.value.code == ErrorCodes.COMMAND_HASH_MISMATCH, (
@@ -566,12 +570,14 @@ class TestConcurrentCAS:
         # 第一次 CAS 应成功
         claimed_1 = await claim_execution_approved(
             action_id=action_id, owner="worker_A",
+            request_hash="a" * 64,
         )
         assert claimed_1 is True, "第一个 worker 的 CAS 应成功"
 
         # 第二次 CAS 应失败(status 已变为 executing)
         claimed_2 = await claim_execution_approved(
             action_id=action_id, owner="worker_B",
+            request_hash="a" * 64,
         )
         assert claimed_2 is False, "第二个 worker 的 CAS 应失败(已被抢占)"
 
@@ -761,7 +767,7 @@ class TestMaintenanceStateMachine:
         await real_store._db.commit()
 
         action_id = "r52_maint_success_001"
-        request_hash = "r52_hash_001"
+        request_hash = "a" * 64
         await _insert_command_execution(
             real_store, action_id, status="approved",
             principal_id=100, request_hash=request_hash,
@@ -790,7 +796,7 @@ class TestMaintenanceStateMachine:
         await _set_recover_status(real_store, "pending")
 
         action_id = "r52_maint_executed_001"
-        request_hash = "r52_hash_002"
+        request_hash = "a" * 64
         await _insert_command_execution(
             real_store, action_id, status="executed",
             principal_id=100, request_hash=request_hash,
@@ -821,7 +827,7 @@ class TestMaintenanceStateMachine:
         await _set_recover_status(real_store, "pending")
 
         action_id = "r52_maint_pending_001"
-        request_hash = "r52_hash_003"
+        request_hash = "a" * 64
         await _insert_command_execution(
             real_store, action_id, status="pending",
             principal_id=100, request_hash=request_hash,

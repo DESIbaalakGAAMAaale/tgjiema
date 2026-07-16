@@ -28,6 +28,7 @@ R42 P1-7 新增:
 
 from dataclasses import dataclass
 from enum import Enum
+from services.i18n import translate as _i18n_t
 
 
 class BackupPolicy(str, Enum):
@@ -44,16 +45,16 @@ class BackupPolicy(str, Enum):
     """
 
     MUST_RESTORE = "must_restore"
-    """必须完整备份与恢复:核心业务数据,丢失会导致数据损坏。"""
+    _i18n_t('services.backup_schema.s1')
 
     REBUILDABLE = "rebuildable"
-    """可重建:仅备份 schema,数据由系统运行时重建(如任务投影、通知缓存)。"""
+    _i18n_t('services.backup_schema.s2')
 
     NO_EXPORT_PLAINTEXT = "no_export_plaintext"
-    """不得导出明文:仅备份 schema,数据用 <<REDACTED>> 占位(MFA/session secret)。"""
+    _i18n_t('services.backup_schema.s3')
 
     LOCAL_ONLY = "local_only"
-    """纯本地:不备份,瞬时状态(心跳/缓存)。"""
+    _i18n_t('services.backup_schema.s4')
 
 
 @dataclass(frozen=True)
@@ -114,7 +115,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "created_at", "updated_at", "deleted_at",
         ),
         conflict_col="user_id",
-        note="用户表(主键 user_id BIGINT;R37 P1-5 含 deleted_at tombstone)",
+        note=_i18n_t('services.backup_schema.s5'),
     ),
     "file_records": TableSchema(
         name="file_records",
@@ -135,7 +136,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         # 增量 watermark 通过 deleted_at > watermark 捕捉删除事件。
         # 恢复时由业务层根据 deleted_at 决定是否激活。
         where_clause="",
-        note="取件码→频道/消息映射(核心数据;R37 P1-5 含 deleted_at tombstone,备份全部行用于删除追溯)",
+        note=_i18n_t('services.backup_schema.s6'),
     ),
     "codes": TableSchema(
         name="codes",
@@ -147,7 +148,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "note", "updated_at", "deleted_at",
         ),
         conflict_col="code",
-        note="取件码表(主键 code;R37 P1-5 含 deleted_at tombstone)",
+        note=_i18n_t('services.backup_schema.s7'),
     ),
 
     # ─── 频道/槽位/轮转 ───
@@ -162,49 +163,49 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "created_at", "updated_at", "deleted_at",
         ),
         conflict_col="slot_id",
-        note="频道槽位表(主键 slot_id;环形冗余架构;R37 P1-5 含 deleted_at tombstone)",
+        note=_i18n_t('services.backup_schema.s8'),
     ),
     "spare_pool": TableSchema(
         name="spare_pool",
         pk_columns=("channel_id",),
         columns=("channel_id", "account_name", "is_used", "created_at"),
         conflict_col="channel_id",
-        note="备用频道池(主键 channel_id;含 account_name)",
+        note=_i18n_t('services.backup_schema.s9'),
     ),
     "backup_config": TableSchema(
         name="backup_config",
         pk_columns=("config_key",),
         columns=("config_key", "config_value", "updated_at"),
         conflict_col="",
-        note="备份配置表(主键 config_key;CRDB 无 created_at 列)",
+        note=_i18n_t('services.backup_schema.s10'),
     ),
     "rotation_config": TableSchema(
         name="rotation_config",
         pk_columns=("config_key",),
         columns=("config_key", "config_value", "updated_at"),
         conflict_col="",
-        note="轮转配置表(主键 config_key;CRDB 无 created_at 列)",
+        note=_i18n_t('services.backup_schema.s11'),
     ),
     "code_bot_mapping": TableSchema(
         name="code_bot_mapping",
         pk_columns=("code_prefix",),
         columns=("code_prefix", "bot_username", "created_at"),
         conflict_col="",
-        note="取件码前缀→Bot 映射(主键 code_prefix;含 bot_username)",
+        note=_i18n_t('services.backup_schema.s12'),
     ),
     "external_code_mapping": TableSchema(
         name="external_code_mapping",
         pk_columns=("external_code",),
         columns=("external_code", "system_code", "bot_username", "created_at", "updated_at"),
         conflict_col="external_code",
-        note="外部取件码映射(主键 external_code)",
+        note=_i18n_t('services.backup_schema.s13'),
     ),
     "kv_config": TableSchema(
         name="kv_config",
         pk_columns=("config_key",),
         columns=("config_key", "config_value", "created_at", "updated_at"),
         conflict_col="config_key",
-        note="KV 配置表(主键 config_key;部分部署中可能不存在,自动跳过)",
+        note=_i18n_t('services.backup_schema.s14'),
     ),
     "message_backups": TableSchema(
         name="message_backups",
@@ -214,7 +215,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "backed_msg_id", "backed_at",
         ),
         conflict_col="",  # 复合主键,由 restore 逻辑用 ON CONFLICT (col1, col2) 处理
-        note="消息备份表(复合主键 main_msg_id + backup_channel_id)",
+        note=_i18n_t('services.backup_schema.s15'),
     ),
 
     # ─── 中继账号 ───
@@ -226,7 +227,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
             "is_active", "created_at", "last_login_at",
         ),
         conflict_col="phone",  # 主键 id 是 SERIAL,用 phone UNIQUE 做冲突
-        note="中继账号表(主键 id SERIAL,冲突列 phone UNIQUE;CRDB 无 updated_at)",
+        note=_i18n_t('services.backup_schema.s16'),
     ),
 
     # ─── 大表(跳过备份,仅在 db_restore ALL_TABLES 中保留以支持旧备份恢复) ───
@@ -239,7 +240,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         is_large=True,  # 短期流水数据,无需长期备份
-        note="解码日志(大表,跳过备份;短期流水数据)",
+        note=_i18n_t('services.backup_schema.s17'),
     ),
     "jobs": TableSchema(
         name="jobs",
@@ -253,7 +254,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         is_large=True,  # 短期流水数据,无需长期备份
-        note="异步任务表(大表,跳过备份;含死信队列字段)",
+        note=_i18n_t('services.backup_schema.s18'),
     ),
     "rotate_log": TableSchema(
         name="rotate_log",
@@ -264,7 +265,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         is_large=True,  # 审计日志,数据量大但非核心
-        note="轮转审计日志(大表,跳过备份;审计数据;CRDB 无 created_at 列,用 timestamp)",
+        note=_i18n_t('services.backup_schema.s19'),
     ),
     "pending_uploads": TableSchema(
         name="pending_uploads",
@@ -277,7 +278,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         is_large=True,  # 瞬时状态,重启后从频道重放
-        note="待上传队列(大表,跳过备份;瞬时状态;含 claimed_at/note/protect_content/file_ttl_days)",
+        note=_i18n_t('services.backup_schema.s20'),
     ),
 
     # ═══════════════════════════════════════════════════════════
@@ -295,7 +296,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",  # 复合主键,由 restore 逻辑用 ON CONFLICT (col1, col2, col3) 处理
         source="sqlite",
-        note="频道冗余环副本元数据(复合主键;SQLite-only;含 message_id 列)",
+        note=_i18n_t('services.backup_schema.s21'),
     ),
     "writer_inbox": TableSchema(
         name="writer_inbox",
@@ -306,7 +307,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="message_id",
         source="sqlite",
-        note="幂等去重表(主键 message_id;SQLite-only;db_writer 崩溃恢复用)",
+        note=_i18n_t('services.backup_schema.s22'),
     ),
 
     # ─── M1 业务闭环: 5 张新表(均为 SQLite-only) ───
@@ -322,7 +323,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="upload_id",
         source="sqlite",
-        note="上传会话状态机(主键 upload_id TEXT;SQLite-only;含 user_id/media_group_id 等列)",
+        note=_i18n_t('services.backup_schema.s23'),
     ),
     "upload_outbox": TableSchema(
         name="upload_outbox",
@@ -336,7 +337,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="outbox_id",
         source="sqlite",
-        note="事务发件箱(主键 outbox_id TEXT;SQLite-only;含 code/target_user_id 等列)",
+        note=_i18n_t('services.backup_schema.s24'),
     ),
     "quota_ledger": TableSchema(
         name="quota_ledger",
@@ -348,7 +349,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",  # 自增主键,merge 模式退化为普通 INSERT(追加式日志)
         source="sqlite",
-        note="配额变更流水(主键 ledger_id INTEGER 自增;SQLite-only;追加式日志;含 user_id/event_type/reason)",
+        note=_i18n_t('services.backup_schema.s25'),
     ),
     "delivery_receipts": TableSchema(
         name="delivery_receipts",
@@ -361,7 +362,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",  # 自增主键,merge 模式退化为普通 INSERT
         source="sqlite",
-        note="投递回执(主键 receipt_id INTEGER 自增;SQLite-only;含 UNIQUE(job_id, source_msg_id))",
+        note=_i18n_t('services.backup_schema.s26'),
     ),
     "replication_tasks": TableSchema(
         name="replication_tasks",
@@ -376,7 +377,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",  # 自增主键,merge 模式退化为普通 INSERT
         source="sqlite",
-        note="副本复制任务(主键 task_id INTEGER 自增;SQLite-only;含 group_id/file_unique_id 等列)",
+        note=_i18n_t('services.backup_schema.s27'),
     ),
 
     # ─── R40 P1-9: 12 张新业务表(均为 SQLite-only) ───
@@ -392,7 +393,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="sqlite",
-        note="R40 统一任务中心(主键 id 自增;SQLite-only;含 user_id/status/payload 等列)",
+        note=_i18n_t('services.backup_schema.s28'),
     ),
     "collections": TableSchema(
         name="collections",
@@ -404,7 +405,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         conflict_col="",
         source="sqlite",
         backup_order=10,  # R41 P1-6: 父表先恢复(在 collection_items 之前)
-        note="R40 文件集合(主键 id 自增;SQLite-only;UNIQUE code;在 collection_items 之前恢复)",
+        note=_i18n_t('services.backup_schema.s29'),
     ),
     "collection_items": TableSchema(
         name="collection_items",
@@ -413,7 +414,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         conflict_col="",
         source="sqlite",
         backup_order=11,  # R41 P1-6: 子表后恢复(FK collection_id→collections.id)
-        note="R40 集合项目(主键 id 自增;SQLite-only;FK collection_id→collections.id)",
+        note=_i18n_t('services.backup_schema.s30'),
     ),
     "notifications": TableSchema(
         name="notifications",
@@ -424,7 +425,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="sqlite",
-        note="R40 用户通知(主键 id 自增;SQLite-only;含 read_at 已读时间)",
+        note=_i18n_t('services.backup_schema.s31'),
     ),
     "content_reports": TableSchema(
         name="content_reports",
@@ -436,7 +437,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="sqlite",
-        note="R40 内容举报(主键 id 自增;SQLite-only;含 appeal/appealed_at 申诉字段)",
+        note=_i18n_t('services.backup_schema.s32'),
     ),
     "audit_log": TableSchema(
         name="audit_log",
@@ -447,7 +448,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="sqlite",
-        note="R40 审计日志(主键 id 自增;SQLite-only;跨机审计需同步,非 local_only)",
+        note=_i18n_t('services.backup_schema.s33'),
     ),
     "quota_reservations": TableSchema(
         name="quota_reservations",
@@ -458,7 +459,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="id",
         source="sqlite",
-        note="R40 配额预留(主键 id TEXT;SQLite-only;含 status/settled_at/expired_at)",
+        note=_i18n_t('services.backup_schema.s34'),
     ),
     "rbac_roles": TableSchema(
         name="rbac_roles",
@@ -467,7 +468,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         conflict_col="name",
         source="sqlite",
         backup_order=10,  # R41 P1-6: 父表先恢复(在 rbac_user_roles 之前)
-        note="R40 RBAC 角色表(主键 id 自增;SQLite-only;UNIQUE name;在 rbac_user_roles 之前恢复)",
+        note=_i18n_t('services.backup_schema.s35'),
     ),
     "rbac_user_roles": TableSchema(
         name="rbac_user_roles",
@@ -476,7 +477,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         conflict_col="user_id",
         source="sqlite",
         backup_order=11,  # R41 P1-6: 子表后恢复(FK role_id→rbac_roles.id)
-        note="R40 RBAC 用户角色关联(主键 user_id;SQLite-only;FK role_id→rbac_roles.id)",
+        note=_i18n_t('services.backup_schema.s36'),
     ),
     "approvals": TableSchema(
         name="approvals",
@@ -487,7 +488,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="sqlite",
-        note="R40 审批流(主键 id 自增;SQLite-only;含 status/approver_id/resolved_at)",
+        note=_i18n_t('services.backup_schema.s37'),
     ),
     "maintenance_state": TableSchema(
         name="maintenance_state",
@@ -501,7 +502,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         local_only=True,  # R40 P1-9: 纯本地状态,不参与 CRDB 同步
         backup_order=200,  # R41 P1-6: 本地状态最后恢复
         restore_policy="skip",  # R41 P1-6: 不恢复(避免覆盖本机维护状态)
-        note="R40 维护模式状态(主键 id CHECK=1;SQLite-only;local_only=True 不跨机同步;R41 P1-6 restore_policy=skip)",
+        note=_i18n_t('services.backup_schema.s38'),
     ),
     "admin_access_log": TableSchema(
         name="admin_access_log",
@@ -515,7 +516,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         local_only=True,  # R40 P1-9: 本地访问日志,不参与 CRDB 同步
         backup_order=201,  # R41 P1-6: 本地审计日志最后恢复
         restore_policy="insert_if_not_exists",  # R41 P1-6: 追加式恢复(不覆盖现有日志)
-        note="R40 管理员访问日志(主键 id 自增;SQLite-only;local_only=True 不跨机同步;R41 P1-6 insert_if_not_exists)",
+        note=_i18n_t('services.backup_schema.s39'),
     ),
 
     # ─── R41 P1-6: 6 张新业务表(均为 SQLite-only) ───
@@ -536,7 +537,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         source="sqlite",
         backup_order=80,  # R41 P1-6: 在用户表后恢复
         restore_policy="truncate_and_insert",  # R41 P1-6: 覆盖恢复(凭证以备份为准)
-        note="R41 P1-6 MFA TOTP 密钥表(主键 user_id;SQLite-only;需跨实例同步;secret 为加密存储)",
+        note=_i18n_t('services.backup_schema.s40'),
     ),
     "sessions": TableSchema(
         name="sessions",
@@ -551,7 +552,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         local_only=True,  # R41 P1-6: 纯本地状态(session 不可跨实例共享)
         backup_order=210,  # R41 P1-6: 本地状态最后恢复
         restore_policy="skip",  # R41 P1-6: 不恢复(避免过期 session 重新激活)
-        note="R41 P1-6 服务端 session 表(主键 session_id TEXT;SQLite-only;local_only=True;restore_policy=skip)",
+        note=_i18n_t('services.backup_schema.s41'),
     ),
     "command_outbox": TableSchema(
         name="command_outbox",
@@ -565,7 +566,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         source="sqlite",
         backup_order=50,  # R41 P1-6: 命令发件箱先恢复(在 command_executions 之前)
         restore_policy="insert_if_not_exists",  # R41 P1-6: 不覆盖进行中的命令
-        note="R41 P1-6 命令发件箱(主键 id 自增;SQLite-only;事务性发件箱模式;在 command_executions 之前恢复)",
+        note=_i18n_t('services.backup_schema.s42'),
     ),
     "command_executions": TableSchema(
         name="command_executions",
@@ -579,7 +580,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         source="sqlite",
         backup_order=51,  # R41 P1-6: 命令执行记录后恢复(FK outbox_id→command_outbox.id)
         restore_policy="insert_if_not_exists",  # R41 P1-6: 不覆盖执行记录
-        note="R41 P1-6 命令执行记录(主键 id 自增;SQLite-only;FK outbox_id→command_outbox.id)",
+        note=_i18n_t('services.backup_schema.s43'),
     ),
     "dlq_records": TableSchema(
         name="dlq_records",
@@ -593,7 +594,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         source="sqlite",
         backup_order=60,  # R41 P1-6: 死信队列后恢复
         restore_policy="insert_if_not_exists",  # R41 P1-6: 追加式恢复(不覆盖)
-        note="R41 P1-6 死信队列记录(主键 id 自增;SQLite-only;含 resolved/resolved_by 审计字段)",
+        note=_i18n_t('services.backup_schema.s44'),
     ),
     "ban_state": TableSchema(
         name="ban_state",
@@ -606,7 +607,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         source="sqlite",
         backup_order=70,  # R41 P1-6: 用户封禁状态后恢复
         restore_policy="truncate_and_insert",  # R41 P1-6: 覆盖恢复(最新封禁状态以备份为准)
-        note="R41 P1-6 用户封禁状态(主键 user_id;SQLite-only;跨实例一致;含 expires_at/unbanned_at)",
+        note=_i18n_t('services.backup_schema.s45'),
     ),
 
     # ─── SQLite 本地缓存表(热路径零 CRDB,部分需要备份) ───
@@ -616,7 +617,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("key", "value"),
         conflict_col="key",
         source="sqlite",
-        note="KV 键值存储(SQLite-only;缓存 DDL 版本等配置;主键 key)",
+        note=_i18n_t('services.backup_schema.s46'),
     ),
     "user_quota": TableSchema(
         name="user_quota",
@@ -627,7 +628,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="user_id",
         source="sqlite",
-        note="用户配额本地表(SQLite-only;Idx Bot 零 RU 读写;主键 user_id)",
+        note=_i18n_t('services.backup_schema.s47'),
     ),
     "pending_file_codes": TableSchema(
         name="pending_file_codes",
@@ -637,7 +638,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="sqlite",
-        note="待发送文件码(SQLite-only;用户未 /start idx 时暂存;主键 id 自增)",
+        note=_i18n_t('services.backup_schema.s48'),
     ),
     "cache_backup": TableSchema(
         name="cache_backup",
@@ -645,7 +646,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("key", "value", "ts"),
         conflict_col="key",
         source="sqlite",
-        note="内存缓存 SQLite 持久化(SQLite-only;主键 key;含 ts 时间戳)",
+        note=_i18n_t('services.backup_schema.s49'),
     ),
     "heartbeat_local": TableSchema(
         name="heartbeat_local",
@@ -653,7 +654,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("slot_id", "last_ok", "fail_streak"),
         conflict_col="slot_id",
         source="sqlite",
-        note="心跳本地表(SQLite-only;Mon Bot 写入;主键 slot_id;瞬时状态)",
+        note=_i18n_t('services.backup_schema.s50'),
     ),
     "bot_heartbeat": TableSchema(
         name="bot_heartbeat",
@@ -661,7 +662,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("name", "last_ping", "is_running", "total_processed", "total_errors"),
         conflict_col="name",
         source="sqlite",
-        note="Bot 心跳表(SQLite-only;各 Bot 独立进程写入;主键 name;瞬时状态)",
+        note=_i18n_t('services.backup_schema.s51'),
     ),
     "counter_snapshot": TableSchema(
         name="counter_snapshot",
@@ -669,7 +670,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("key", "value", "ts"),
         conflict_col="key",
         source="sqlite",
-        note="启动统计快照(SQLite-only;主键 key;含 ts 时间戳)",
+        note=_i18n_t('services.backup_schema.s52'),
     ),
     "ttl_cache": TableSchema(
         name="ttl_cache",
@@ -677,7 +678,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("key", "value", "updated_at"),
         conflict_col="key",
         source="sqlite",
-        note="通用 TTL 缓存(SQLite-only;跨进程共享;主键 key)",
+        note=_i18n_t('services.backup_schema.s53'),
     ),
     "cells_local": TableSchema(
         name="cells_local",
@@ -692,7 +693,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="slot_id",
         source="sqlite",
-        note="cells 本地逐行存储(SQLite-only;热路径零 CRDB;主键 slot_id;含 CAS/fencing 字段)",
+        note=_i18n_t('services.backup_schema.s54'),
     ),
     "file_records_local": TableSchema(
         name="file_records_local",
@@ -708,7 +709,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="file_code",
         source="sqlite",
-        note="file_records 热路径全表缓存(SQLite-only;启动时从 CRDB 全量加载;主键 file_code)",
+        note=_i18n_t('services.backup_schema.s55'),
     ),
     "codes_local": TableSchema(
         name="codes_local",
@@ -720,7 +721,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="code",
         source="sqlite",
-        note="codes 热路径全表缓存(SQLite-only;主键 code;含 crdb_synced 同步标志)",
+        note=_i18n_t('services.backup_schema.s56'),
     ),
     "users_local": TableSchema(
         name="users_local",
@@ -734,7 +735,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="user_id",
         source="sqlite",
-        note="users 热路径全表缓存(SQLite-only;主键 user_id;含 crdb_synced)",
+        note=_i18n_t('services.backup_schema.s57'),
     ),
     "external_code_mapping_local": TableSchema(
         name="external_code_mapping_local",
@@ -745,7 +746,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="external_code",
         source="sqlite",
-        note="external_code_mapping 热路径缓存(SQLite-only;主键 external_code)",
+        note=_i18n_t('services.backup_schema.s58'),
     ),
 
     # ═══════════════════════════════════════════════════════════
@@ -757,7 +758,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         columns=("code", "file_code", "created_at"),
         conflict_col="code",
         source="relay_sqlite",
-        note="外部码映射缓存(relay_sqlite;避免重复查询 CRDB;主键 code)",
+        note=_i18n_t('services.backup_schema.s59'),
     ),
     "relay_spool": TableSchema(
         name="relay_spool",
@@ -771,7 +772,7 @@ BACKUP_SCHEMA: dict[str, TableSchema] = {
         ),
         conflict_col="",
         source="relay_sqlite",
-        note="中继任务池(relay_sqlite;持久化中继代发任务;主键 spool_id 自增)",
+        note=_i18n_t('services.backup_schema.s60'),
     ),
 }
 
@@ -1113,7 +1114,7 @@ def get_restore_policy(table: str) -> str:
         ValueError: 表名不在 BACKUP_SCHEMA 中
     """
     if table not in BACKUP_SCHEMA:
-        raise ValueError(f"表 {table} 不在 BACKUP_SCHEMA 中")
+        raise ValueError(_i18n_t('services.backup_schema.s61', table=table))
     return BACKUP_SCHEMA[table].restore_policy
 
 
@@ -1136,7 +1137,7 @@ def get_backup_order(table: str) -> int:
         ValueError: 表名不在 BACKUP_SCHEMA 中
     """
     if table not in BACKUP_SCHEMA:
-        raise ValueError(f"表 {table} 不在 BACKUP_SCHEMA 中")
+        raise ValueError(_i18n_t('services.backup_schema.s62', table=table))
     return BACKUP_SCHEMA[table].backup_order
 
 
@@ -1172,7 +1173,7 @@ def validate_columns_for_table(table: str, columns: list[str]) -> list[str]:
         ValueError: 表名不在 BACKUP_SCHEMA 中
     """
     if table not in BACKUP_SCHEMA:
-        raise ValueError(f"表 {table} 不在 BACKUP_SCHEMA 中")
+        raise ValueError(_i18n_t('services.backup_schema.s63', table=table))
     allowed = set(BACKUP_SCHEMA[table].columns) | set(_LEGACY_COLUMNS)
     return [c for c in columns if c in allowed]
 
@@ -1269,15 +1270,15 @@ def validate_schema() -> dict:
 
     details_parts = []
     if missing:
-        details_parts.append(f"缺失 {len(missing)} 张表: {sorted(missing)}")
+        details_parts.append(_i18n_t('services.backup_schema.s64', len_missing=len(missing), sorted_missing=sorted(missing)))
     if extra:
-        details_parts.append(f"多余 {len(extra)} 张表(DDL 中不存在): {sorted(extra)}")
+        details_parts.append(_i18n_t('services.backup_schema.s65', len_extra=len(extra), sorted_extra=sorted(extra)))
     if source_mismatches:
-        details_parts.append(f"source 标记不符: {sorted(source_mismatches)}")
+        details_parts.append(_i18n_t('services.backup_schema.s66', sorted_source_mismatches=sorted(source_mismatches)))
     if empty_columns:
-        details_parts.append(f"columns 为空: {sorted(empty_columns)}")
+        details_parts.append(_i18n_t('services.backup_schema.s67', sorted_empty_columns=sorted(empty_columns)))
     if not details_parts:
-        details_parts.append("所有表和列定义与 DDL 一致")
+        details_parts.append(_i18n_t('services.backup_schema.s68'))
 
     return {
         "is_valid": is_valid,

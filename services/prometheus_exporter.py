@@ -348,12 +348,13 @@ _RU_DATA_FRESH_THRESHOLD = 3600
 
 
 def _compute_crdb_ru_source_label() -> tuple[str, float, int]:
-    """R42 P1-10 + R54 P1-1: 计算 CRDB RU 指标的 source label 与 freshness。
+    """R42 P1-10 + R54 P1-1 + R55 P1-3: 计算 CRDB RU 指标的 source label 与 freshness。
 
-    R54 P1-1 整改: Exporter 只读取显式 source,不得通过 freshness 推断。
-    - 从 kv_store.crdb_ru_source 读取 Collector 写入的不可伪造来源标记
-    - "official_cloud_api" → "official"(仅 crdb_ru_collector.write_ru_to_kv_store 写入)
-    - 空值/其他值 + 数据陈旧 → "unknown"
+    R55 P1-3 整改: 不再信任 kv_store.crdb_ru_source(任何有 CacheStore 写权限
+    的进程都能伪造为 "official_cloud_api")。改为优先查询独立表
+    ``crdb_ru_official`` 验证 source:
+    - 表存在且有记录 + 数据新鲜 → "official"
+    - 表不存在/无记录 → "unknown"(降级,不再回退到 kv_store.crdb_ru_source)
     - 无 RU 值且无时间戳 → "failed"
 
     Returns:
@@ -396,16 +397,25 @@ def _compute_crdb_ru_source_label() -> tuple[str, float, int]:
             except (ValueError, TypeError):
                 freshness_seconds = -1.0
 
-    # R54 P1-1: 读取不可伪造的显式 source(由 crdb_ru_collector 写入)
-    # 估算器使用独立 key,不会写入 "official_cloud_api"
-    explicit_source = _read_kv_value("crdb_ru_source", "").strip()
+    # R55 P1-3: 优先查询 crdb_ru_official 独立表验证官方 source
+    # 不再信任 kv_store.crdb_ru_source(可被任何 CacheStore 写权限进程伪造)
+    official_verified = False
+    try:
+        from services.crdb_ru_collector import verify_ru_source_official
+        official_info = verify_ru_source_official()
+        official_verified = bool(official_info.get("is_official", False))
+    except Exception as e:
+        logger.debug(
+            f"[prometheus_exporter] R55 P1-3: verify_ru_source_official 异常: {e}"
+        )
+        official_verified = False
 
-    # 判定 source:优先使用显式 source,不通过 freshness 推断
+    # 判定 source:基于 official 表验证结果,不通过 freshness 推断
     if ru_value is None and freshness_seconds < 0:
         # 无 RU 值且无时间戳 → failed
         source_label = "failed"
-    elif explicit_source == "official_cloud_api" and freshness_seconds >= 0:
-        # R54 P1-1: 有显式官方来源标记 + 有效时间戳 → official
+    elif official_verified and freshness_seconds >= 0:
+        # R55 P1-3: official 表有记录 + 有效时间戳 → official
         # 但数据陈旧仍降级为 unknown(collector 可能已停止)
         if freshness_seconds >= _RU_DATA_FRESH_THRESHOLD:
             source_label = "unknown"
@@ -415,7 +425,7 @@ def _compute_crdb_ru_source_label() -> tuple[str, float, int]:
         # 有 RU 值但无时间戳 → unknown
         source_label = "unknown"
     else:
-        # 有数据但无显式 official source → unknown(估算值或未知来源)
+        # 有数据但 official 表无记录 → unknown(估算值或未知来源)
         source_label = "unknown"
 
     source_gauge_value = {"unknown": 0, "official": 1, "failed": 2}.get(

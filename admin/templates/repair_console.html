@@ -6,36 +6,36 @@
 {% block content %}
 <div class="metric-grid">
     <div class="metric-card">
-        <div class="label">Outbox 待处理</div>
+        <div class="label">{{ t("ui.admin.repair_console.s1") }}</div>
         <div class="value">{{ overview.get('outbox_pending', 0) if overview else 0 }}</div>
     </div>
     <div class="metric-card">
-        <div class="label">DLQ 死信</div>
+        <div class="label">{{ t("ui.admin.repair_console.s2") }}</div>
         <div class="value">{{ overview.get('dlq_count', 0) if overview else 0 }}</div>
     </div>
     <div class="metric-card">
-        <div class="label">复制失败</div>
+        <div class="label">{{ t("ui.admin.repair_console.s3") }}</div>
         <div class="value">{{ overview.get('replication_failed', 0) if overview else 0 }}</div>
     </div>
     <div class="metric-card">
-        <div class="label">Relay 异常</div>
+        <div class="label">{{ t("ui.admin.repair_console.s4") }}</div>
         <div class="value">{{ overview.get('relay_issues', 0) if overview else 0 }}</div>
     </div>
 </div>
 
 <div class="section">
-    <h2>Outbox 记录</h2>
+    <h2>{{ t("ui.admin.repair_console.s5") }}</h2>
     <table>
-        <caption>dirty_outbox 未处理/死信记录</caption>
+        <caption>{{ t("ui.admin.repair_console.s6") }}</caption>
         <thead>
             <tr>
                 <th>ID</th>
-                <th>表名</th>
-                <th>主键</th>
-                <th>版本</th>
-                <th>操作</th>
-                <th>创建时间</th>
-                <th>已处理</th>
+                <th>{{ t("ui.admin.repair_console.s7") }}</th>
+                <th>{{ t("ui.admin.repair_console.s8") }}</th>
+                <th>{{ t("ui.admin.repair_console.s9") }}</th>
+                <th>{{ t("ui.admin.repair_console.s10") }}</th>
+                <th>{{ t("ui.admin.repair_console.s11") }}</th>
+                <th>{{ t("ui.admin.repair_console.s12") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -50,29 +50,29 @@
                 <td>{{ item.get('created_at', 'N/A') }}</td>
                 <td>
                     {% if item.get('processed') %}
-                    <span class="tag tag-green">是</span>
+                    <span class="tag tag-green">{{ t("ui.admin.repair_console.s13") }}</span>
                     {% else %}
-                    <span class="tag tag-red">否</span>
+                    <span class="tag tag-red">{{ t("ui.admin.repair_console.s14") }}</span>
                     {% endif %}
                 </td>
             </tr>
             {% else %}
-            <tr><td colspan="7" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="7" class="empty-state">{{ t("ui.admin.repair_console.s15") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>
 </div>
 
 <div class="section">
-    <h2>DLQ 死信队列</h2>
+    <h2>{{ t("ui.admin.repair_console.s16") }}</h2>
     <table>
-        <caption>死信记录</caption>
+        <caption>{{ t("ui.admin.repair_console.s17") }}</caption>
         <thead>
             <tr>
                 <th>ID</th>
-                <th>载荷</th>
-                <th>错误</th>
-                <th>重试次数</th>
+                <th>{{ t("ui.admin.repair_console.s18") }}</th>
+                <th>{{ t("ui.admin.repair_console.s19") }}</th>
+                <th>{{ t("ui.admin.repair_console.s20") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -85,23 +85,23 @@
                 <td>{{ item.get('attempts', 0) }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="4" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="4" class="empty-state">{{ t("ui.admin.repair_console.s21") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>
 </div>
 
 <div class="section">
-    <h2>复制失败任务</h2>
+    <h2>{{ t("ui.admin.repair_console.s22") }}</h2>
     <table>
-        <caption>replication_tasks 失败任务</caption>
+        <caption>{{ t("ui.admin.repair_console.s23") }}</caption>
         <thead>
             <tr>
                 <th>ID</th>
-                <th>源</th>
-                <th>目标</th>
-                <th>状态</th>
-                <th>尝试次数</th>
+                <th>{{ t("ui.admin.repair_console.s24") }}</th>
+                <th>{{ t("ui.admin.repair_console.s25") }}</th>
+                <th>{{ t("ui.admin.repair_console.s26") }}</th>
+                <th>{{ t("ui.admin.repair_console.s27") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -115,7 +115,7 @@
                 <td>{{ item.get('attempts', 0) }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="5" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="5" class="empty-state">{{ t("ui.admin.repair_console.s28") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>

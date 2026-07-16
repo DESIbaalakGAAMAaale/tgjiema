@@ -383,12 +383,13 @@ class TestR53P0_5_CommandBusSuccessPath:
         from services import entitlements
 
         action_id = "r53_p0_5_success_001"
+        _rh = "a" * 64  # R55 P0-2: 64 位 hex(满足 claim_execution_approved 校验)
         await _insert_command_execution(
             real_store_with_real_plans,
             action_id=action_id,
             principal_id=950,
             status="approved",
-            request_hash="hash_001",
+            request_hash=_rh,
         )
         await _insert_user(
             real_store_with_real_plans, user_id=32001, level="free", version=1,
@@ -406,7 +407,7 @@ class TestR53P0_5_CommandBusSuccessPath:
             plan_name="basic",
             principal=principal,
             action_id=action_id,
-            request_hash="hash_001",
+            request_hash=_rh,
             expected_version=1,
         )
         assert result == {"success": True}, f"应返回 success,实际: {result}"
@@ -436,12 +437,13 @@ class TestR53P0_5_CommandBusSuccessPath:
         from services import entitlements
 
         action_id = "r53_p0_5_audit_001"
+        _rh = "b" * 64  # R55 P0-2: 64 位 hex(满足 claim_execution_approved 校验)
         await _insert_command_execution(
             real_store_with_real_plans,
             action_id=action_id,
             principal_id=951,
             status="approved",
-            request_hash="hash_audit",
+            request_hash=_rh,
         )
         await _insert_user(
             real_store_with_real_plans, user_id=32002, level="free", version=1,
@@ -456,7 +458,7 @@ class TestR53P0_5_CommandBusSuccessPath:
             plan_name="premium",
             principal=principal,
             action_id=action_id,
-            request_hash="hash_audit",
+            request_hash=_rh,
             expected_version=1,
         )
 

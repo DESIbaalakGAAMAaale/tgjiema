@@ -636,12 +636,13 @@ class TestBareStringScan:
                 assert secret_token not in d_json, (
                     f"to_dict JSON 中不应出现 token 值: {d_json}"
                 )
+                # R55 §17: to_dict 返回精简格式,使用 safe_params(非 params)
                 # params 中不应包含敏感字段
-                assert "password" not in d["params"]
-                assert "token" not in d["params"]
+                assert "password" not in d["safe_params"]
+                assert "token" not in d["safe_params"]
                 # 白名单字段保留
-                assert d["params"].get("action") == "test_action"
-                assert d["params"].get("component") == "test_component"
+                assert d["safe_params"].get("action") == "test_action"
+                assert d["safe_params"].get("component") == "test_component"
 
         # caplog 中不应出现敏感值
         full_log = caplog.text

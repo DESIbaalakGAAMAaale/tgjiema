@@ -23,6 +23,7 @@ import json
 from loguru import logger
 
 from database.cache_store import get_cache_store
+from services.i18n import translate as _i18n_t
 
 
 # ─── 举报状态 ───────────────────────────────────────────────
@@ -587,14 +588,14 @@ async def process_appeal(
     if decision not in ("approve", "reject"):
         return {
             "success": False, "stage": "noop",
-            "restored": False, "error": f"非法 decision: {decision}",
+            "restored": False, "error": _i18n_t('services.content_reports.s9', decision=decision),
         }
 
     store = get_cache_store()
     if not store._db:
         return {
             "success": False, "stage": "noop",
-            "restored": False, "error": "数据库未初始化",
+            "restored": False, "error": _i18n_t('services.content_reports.s10'),
         }
 
     # 获取举报详情
@@ -602,7 +603,7 @@ async def process_appeal(
     if report is None:
         return {
             "success": False, "stage": "noop",
-            "restored": False, "error": "举报不存在",
+            "restored": False, "error": _i18n_t('services.content_reports.s11'),
         }
 
     current_status = report.get("status", "")
@@ -611,7 +612,7 @@ async def process_appeal(
         return {
             "success": False, "stage": "noop",
             "restored": False,
-            "error": f"状态不允许处理(当前: {current_status})",
+            "error": _i18n_t('services.content_reports.s12', current_status=current_status),
         }
 
     target_type = report.get("target_type", "")
@@ -632,7 +633,7 @@ async def process_appeal(
                 if cursor.rowcount == 0:
                     return {
                         "success": False, "stage": "noop",
-                        "restored": False, "error": "更新失败",
+                        "restored": False, "error": _i18n_t('services.content_reports.s20'),
                     }
                 await store.add_dirty_outbox(
                     "content_reports", str(appeal_id), connection=tx,
@@ -705,7 +706,7 @@ async def process_appeal(
             return {
                 "success": False, "stage": "noop",
                 "restored": False,
-                "error": "举报者不能审批自己的申诉",
+                "error": _i18n_t('services.content_reports.s19'),
             }
         try:
             async with store.transaction() as tx:
@@ -718,7 +719,7 @@ async def process_appeal(
                 if cursor.rowcount == 0:
                     return {
                         "success": False, "stage": "noop",
-                        "restored": False, "error": "状态已变更",
+                        "restored": False, "error": _i18n_t('services.content_reports.s21'),
                     }
                 await store.add_dirty_outbox(
                     "content_reports", str(appeal_id), connection=tx,
@@ -755,14 +756,14 @@ async def process_appeal(
         return {
             "success": False, "stage": "noop",
             "restored": False,
-            "error": "同一审批人不能审批两次(需要 2 个不同管理员)",
+            "error": _i18n_t('services.content_reports.s13'),
         }
     # 校验:当前状态必须是 restore_pending
     if current_status != REPORT_STATUS_RESTORE_PENDING:
         return {
             "success": False, "stage": "noop",
             "restored": False,
-            "error": f"状态不允许第二审批(当前: {current_status})",
+            "error": _i18n_t('services.content_reports.s14', current_status=current_status),
         }
     # R51 P0-6: RBAC 权限校验(disaster:restore)— fail-closed,拒绝未授权用户
     try:
@@ -1270,7 +1271,7 @@ async def format_report(report: dict) -> str:
         管理员可读的格式化文本
     """
     if not report:
-        return "(空举报)"
+        return _i18n_t('services.content_reports.s1')
     status_emoji = {
         REPORT_STATUS_PENDING: "⏳",
         REPORT_STATUS_TAKEDOWN: "🔻",
@@ -1279,18 +1280,18 @@ async def format_report(report: dict) -> str:
         REPORT_STATUS_REJECTED: "❌",
     }.get(report.get("status", ""), "❓")
     lines = [
-        f"{status_emoji} 举报 #{report.get('id', '?')}",
-        f"状态: {report.get('status', '')}",
-        f"举报人: {report.get('reporter_id', '')}",
-        f"目标: {report.get('target_type', '')}:{report.get('target_id', '')}",
-        f"原因: {report.get('reason', '')}",
-        f"描述: {report.get('description', '') or '(无)'}",
-        f"创建时间: {report.get('created_at', '')}",
+        _i18n_t('services.content_reports.s2', status_emoji=status_emoji, report_get_id=report.get('id', '?')),
+        _i18n_t('services.content_reports.s3', report_get_status=report.get('status', '')),
+        _i18n_t('services.content_reports.s4', report_get_reporter_id=report.get('reporter_id', '')),
+        _i18n_t('services.content_reports.s5', report_get_target_type=report.get('target_type', ''), report_get_target_id=report.get('target_id', '')),
+        _i18n_t('services.content_reports.s6', report_get_reason=report.get('reason', '')),
+        _i18n_t('services.content_reports.s7', report_get_description_or=report.get('description', '') or '(无)'),
+        _i18n_t('services.content_reports.s8', report_get_created_at=report.get('created_at', '')),
     ]
     if report.get("appeal_text"):
-        lines.append(f"申诉内容: {report['appeal_text']}")
-        lines.append(f"申诉时间: {report.get('appealed_at', '')}")
+        lines.append(_i18n_t('services.content_reports.s15', report_appeal_text=report['appeal_text']))
+        lines.append(_i18n_t('services.content_reports.s16', report_get_appealed_at=report.get('appealed_at', '')))
     if report.get("resolved_by"):
-        lines.append(f"处理人: {report['resolved_by']}")
-        lines.append(f"处理时间: {report.get('resolved_at', '')}")
+        lines.append(_i18n_t('services.content_reports.s17', report_resolved_by=report['resolved_by']))
+        lines.append(_i18n_t('services.content_reports.s18', report_get_resolved_at=report.get('resolved_at', '')))
     return "\n".join(lines)

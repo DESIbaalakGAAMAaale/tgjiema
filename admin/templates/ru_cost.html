@@ -7,40 +7,40 @@
 {% if alert %}
 {% set alert_level = alert.get('level', '') if alert is mapping else '' %}
 {% if alert_level == 'critical' %}
-<div class="alert alert-danger">RU 告警(严重):{{ alert.get('message', '') }}</div>
+<div class="alert alert-danger">{{ t("ui.admin.ru_cost.s1") }}<{ alert.get('message', '') }}</div>
 {% elif alert_level == 'warning' %}
-<div class="alert alert-warning">RU 告警(警告):{{ alert.get('message', '') }}</div>
+<div class="alert alert-warning">{{ t("ui.admin.ru_cost.s2") }}<{ alert.get('message', '') }}</div>
 {% endif %}
 {% endif %}
 
 <div class="metric-grid">
     <div class="metric-card">
-        <div class="label">今日总 RU</div>
+        <div class="label">{{ t("ui.admin.ru_cost.s3") }}</div>
         <div class="value">{{ report.get('total_ru', 0) if report else 0 }}</div>
     </div>
     <div class="metric-card">
-        <div class="label">读取 RU</div>
+        <div class="label">{{ t("ui.admin.ru_cost.s4") }}</div>
         <div class="value">{{ report.get('read_ru', 0) if report else 0 }}</div>
     </div>
     <div class="metric-card">
-        <div class="label">写入 RU</div>
+        <div class="label">{{ t("ui.admin.ru_cost.s5") }}</div>
         <div class="value">{{ report.get('write_ru', 0) if report else 0 }}</div>
     </div>
     <div class="metric-card">
-        <div class="label">RU 预算</div>
+        <div class="label">{{ t("ui.admin.ru_cost.s6") }}</div>
         <div class="value">{{ report.get('budget', 0) if report else 0 }}</div>
     </div>
 </div>
 
 <div class="section">
-    <h2>按服务拆分</h2>
+    <h2>{{ t("ui.admin.ru_cost.s7") }}</h2>
     <table>
-        <caption>各服务 RU 消耗</caption>
+        <caption>{{ t("ui.admin.ru_cost.s8") }}</caption>
         <thead>
             <tr>
-                <th>服务名</th>
-                <th>RU 消耗</th>
-                <th>占比</th>
+                <th>{{ t("ui.admin.ru_cost.s9") }}</th>
+                <th>{{ t("ui.admin.ru_cost.s10") }}</th>
+                <th>{{ t("ui.admin.ru_cost.s11") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -52,20 +52,20 @@
                 <td>{{ ru }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="3" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="3" class="empty-state">{{ t("ui.admin.ru_cost.s12") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>
 </div>
 
 <div class="section">
-    <h2>每千次操作成本</h2>
+    <h2>{{ t("ui.admin.ru_cost.s13") }}</h2>
     <table>
-        <caption>各操作类型每千次 RU 成本</caption>
+        <caption>{{ t("ui.admin.ru_cost.s14") }}</caption>
         <thead>
             <tr>
-                <th>操作类型</th>
-                <th>RU/千次</th>
+                <th>{{ t("ui.admin.ru_cost.s15") }}</th>
+                <th>{{ t("ui.admin.ru_cost.s16") }}</th>
             </tr>
         </thead>
         <tbody>
@@ -76,7 +76,7 @@
                 <td>{{ cost }}</td>
             </tr>
             {% else %}
-            <tr><td colspan="2" class="empty-state">暂无数据</td></tr>
+            <tr><td colspan="2" class="empty-state">{{ t("ui.admin.ru_cost.s17") }}</td></tr>
             {% endfor %}
         </tbody>
     </table>

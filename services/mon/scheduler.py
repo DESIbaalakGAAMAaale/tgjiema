@@ -12,6 +12,7 @@ from loguru import logger
 from database import (
     log_rotate,
 )
+from services.i18n import translate as _i18n_t
 
 
 # ─── R36 B0-3: replication_tasks 安全包装(异常不传播到主流程) ───
@@ -195,7 +196,7 @@ class MonScheduler:
 
             if is_r100 and not self.r100_managed:
                 alerts.append(
-                    f"[R100] {slot_id} 连续失败{fail_streak}次,仅告警不降级"
+                    _i18n_t('services.mon.scheduler.s4', slot_id=slot_id, fail_streak=fail_streak)
                 )
                 await log_rotate(
                     from_slot_id=slot_id,
@@ -211,8 +212,7 @@ class MonScheduler:
             if not cell_suspicious.get(slot_id):
                 cell_suspicious[slot_id] = True
                 alerts.append(
-                    f"[SUSPICIOUS] {slot_id} 连续失败{fail_streak}次,标记疑似,"
-                    f"等待下一轮确认(防误降级)"
+                    _i18n_t('services.mon.scheduler.s5', slot_id=slot_id, fail_streak=fail_streak)
                 )
                 continue
 
@@ -222,10 +222,7 @@ class MonScheduler:
             await self._degrade_group(active_slot, promote_slot, cascade_slot, fail_streak, all_cells)
             cell_suspicious.pop(slot_id, None)  # 降级后清除疑似标记
             alerts.append(
-                f"[DEGRADE] {slot_id}({from_status}→lost) "
-                f"→ {promote_slot['slot_id'] if promote_slot else 'none'}(shadow→active) "
-                f"→ {cascade_slot['slot_id'] if cascade_slot else 'none'}(shadow2→shadow1) "
-                f"连续失败{fail_streak}次(已二次确认)"
+                _i18n_t('services.mon.scheduler.s1', slot_id=slot_id, from_status=from_status, promote_slot_slot_id_if_promote_slot_else_none=promote_slot['slot_id'] if promote_slot else 'none', cascade_slot_slot_id_if_cascade_slot_else_none=cascade_slot['slot_id'] if cascade_slot else 'none', fail_streak=fail_streak)
             )
 
         return alerts, cell_suspicious
@@ -1019,7 +1016,7 @@ class MonScheduler:
         active_cells = [c for c in all_cells if c["status"] == "active"]
 
         if not active_cells:
-            issues.append("[拓扑] 无 Active 槽位,系统不可用")
+            issues.append(_i18n_t('services.mon.scheduler.s2'))
             return issues
 
         active_channels = {c["channel_id"] for c in active_cells}
@@ -1036,7 +1033,7 @@ class MonScheduler:
             nxt = c.get("next_active_chat_id")
             if nxt and nxt not in active_channels:
                 issues.append(
-                    f"[拓扑]{c['slot_id']}的next指向 {nxt},但该频道不是active"
+                    _i18n_t('services.mon.scheduler.s6', c_slot_id=c['slot_id'], nxt=nxt)
                 )
 
         # 2. 重复指针
@@ -1047,7 +1044,7 @@ class MonScheduler:
                     if c["channel_id"] in sources
                 ]
                 issues.append(
-                    f"[拓扑] 多个槽位指向同一个next {nxt}: {slot_names}"
+                    _i18n_t('services.mon.scheduler.s7', nxt=nxt, slot_names=slot_names)
                 )
 
         # 3. 可达性:从第一个 active 出发遍历
@@ -1074,7 +1071,7 @@ class MonScheduler:
                 if c["channel_id"] in unreachable
             ]
             issues.append(
-                f"[拓扑] 不可达的 Active 槽位: {slot_names}"
+                _i18n_t('services.mon.scheduler.s3', slot_names=slot_names)
             )
 
         # 4. 三元组完整性
@@ -1082,14 +1079,14 @@ class MonScheduler:
         for group_key, (a_slot, s1_slot, s2_slot) in groups.items():
             missing = []
             if not a_slot:
-                missing.append("A槽")
+                missing.append(_i18n_t('services.mon.scheduler.s8'))
             if not s1_slot:
                 missing.append("Shadow1")
             if not s2_slot:
                 missing.append("Shadow2")
             if missing:
                 issues.append(
-                    f"[拓扑] 组{group_key}缺失: {', '.join(missing)}"
+                    _i18n_t('services.mon.scheduler.s9', group_key=group_key, join_missing=', '.join(missing))
                 )
 
         return issues

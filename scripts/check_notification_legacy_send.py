@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""R53 P1-1 + R54 P1-3: Notification legacy send() 调用门禁 — 禁止业务代码直接调用 send()。
+"""R53 P1-1 + R54 P1-3 + R55 P1-4: Notification legacy send() 调用门禁 — 禁止业务代码直接调用 send()。
+
+R55 P1-4 整改(完整符号表 + 调用图):
+    - 检测赋值别名(my_send = send / my_send = notifications.send)
+    - 检测动态导入(__import__("...").send / importlib.import_module("...").send)
+    - 检测 getattr 调用(getattr(notifications, "send")(...))
+    - 检测 ImportFrom 任意别名(from services.notifications import send as xyz)
+    - 检测 re-export(__all__ 或模块级赋值包含 legacy send)
+    - 最终目标:删除 legacy send()->int,所有业务调用统一结构化契约
 
 R54 P1-3 整改:
     - 解析 Import/ImportFrom 建立符号表,检测任意别名导入
@@ -129,6 +137,38 @@ def _build_import_symbol_table(tree: ast.AST) -> dict[str, str]:
     return symbols
 
 
+def _build_assignment_symbol_table(tree: ast.AST) -> dict[str, str]:
+    """R55 P1-4: 解析赋值别名建立扩展符号表。
+
+    检测形如:
+        my_send = send                     → {"my_send": "send"}
+        my_send = notifications.send        → {"my_send": "notifications.send"}
+        my_send = notif_svc.send            → {"my_send": "notif_svc.send"}
+        my_send = notifications.send         → {"my_send": "notifications.send"}
+
+    Returns:
+        {local_name: resolved_source} 映射
+    """
+    assignments: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        # 只处理单个目标的简单赋值(my_send = ...)
+        if len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = node.value
+        # 模式 1: my_send = send (Name 赋值)
+        if isinstance(value, ast.Name):
+            assignments[target.id] = value.id
+        # 模式 2: my_send = notifications.send (Attribute 赋值)
+        elif isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name):
+            assignments[target.id] = f"{value.value.id}.{value.attr}"
+    return assignments
+
+
 def _is_notification_alias(alias_name: str, symbol_table: dict[str, str]) -> bool:
     """R54 P1-3: 检查别名是否指向 notifications 模块。
 
@@ -151,19 +191,98 @@ def _is_notification_send_import(local_name: str, symbol_table: dict[str, str]) 
     return resolved.endswith(".notifications.send") or resolved == "notifications.send"
 
 
-def _find_legacy_send_calls(tree: ast.AST) -> list[tuple[int, int, str]]:
-    """R53 P1-1 + R54 P1-3: 在 AST 中查找 legacy send() 调用。
+def _is_notification_send_via_assignment(
+    local_name: str,
+    import_symbols: dict[str, str],
+    assign_symbols: dict[str, str],
+) -> bool:
+    """R55 P1-4: 检查局部名称是否通过赋值别名指向 notifications.send。
 
-    检测三种模式:
+    检测链式赋值别名:
+        my_send = send                    (send 来自 import)
+        my_send = notifications.send      (notifications 来自 import)
+        my_send = notif_svc.send          (notif_svc 是 notifications 别名)
+    """
+    resolved = assign_symbols.get(local_name, "")
+    if not resolved:
+        return False
+    # 模式 1: my_send = send (send 来自 import 符号表)
+    if resolved == "send":
+        return _is_notification_send_import("send", import_symbols)
+    # 模式 2: my_send = <alias>.send (alias 指向 notifications)
+    if "." in resolved:
+        parts = resolved.rsplit(".", 1)
+        if len(parts) == 2 and parts[1] == "send":
+            alias_name = parts[0]
+            return _is_notification_alias(alias_name, import_symbols)
+    return False
+
+
+def _is_dynamic_import_call(node: ast.Call) -> bool:
+    """R55 P1-4: 检测动态导入调用(__import__ / importlib.import_module)。
+
+    检测模式:
+        __import__("services.notifications").send(...)
+        importlib.import_module("notifications").send(...)
+        importlib.import_module("services.notifications").send(...)
+    """
+    func = node.func
+    # 模式: <dynamic_import>(...).send(...)
+    if isinstance(func, ast.Attribute) and func.attr == "send":
+        inner = func.value
+        if isinstance(inner, ast.Call):
+            inner_func = inner.func
+            # __import__(...)
+            if isinstance(inner_func, ast.Name) and inner_func.id == "__import__":
+                return True
+            # importlib.import_module(...)
+            if (isinstance(inner_func, ast.Attribute)
+                and inner_func.attr == "import_module"):
+                return True
+    return False
+
+
+def _is_getattr_send_call(node: ast.Call) -> bool:
+    """R55 P1-4: 检测 getattr(notifications, "send")(...) 调用。
+
+    检测模式:
+        getattr(notifications, "send")(...)
+        getattr(notif_svc, "send")(...)
+    """
+    func = node.func
+    if not isinstance(func, ast.Call):
+        return False
+    inner_func = func.func
+    if not (isinstance(inner_func, ast.Name) and inner_func.id == "getattr"):
+        return False
+    args = func.args
+    if len(args) < 2:
+        return False
+    # 第二个参数必须是字符串常量 "send"
+    second_arg = args[1]
+    if isinstance(second_arg, ast.Constant) and second_arg.value == "send":
+        return True
+    return False
+
+
+def _find_legacy_send_calls(tree: ast.AST) -> list[tuple[int, int, str]]:
+    """R53 P1-1 + R54 P1-3 + R55 P1-4: 在 AST 中查找 legacy send() 调用。
+
+    检测六种模式:
     1. <alias>.send(...) — alias 指向 notifications 模块
     2. send(...) — 直接调用从 notifications 导入的 send
     3. re-export — __all__ 或模块级赋值包含 legacy send
+    4. R55 P1-4: <my_send>(...) — 通过赋值别名调用(my_send = send)
+    5. R55 P1-4: 动态导入 __import__("...").send(...) / importlib.import_module("...").send(...)
+    6. R55 P1-4: getattr(notifications, "send")(...)
 
     Returns:
         [(lineno, col_offset, description), ...]
     """
-    # R54 P1-3: 构建符号表
-    symbol_table = _build_import_symbol_table(tree)
+    # R54 P1-3: 构建导入符号表
+    import_symbols = _build_import_symbol_table(tree)
+    # R55 P1-4: 构建赋值符号表(检测别名赋值)
+    assign_symbols = _build_assignment_symbol_table(tree)
 
     violations: list[tuple[int, int, str]] = []
     for node in ast.walk(tree):
@@ -174,12 +293,33 @@ def _find_legacy_send_calls(tree: ast.AST) -> list[tuple[int, int, str]]:
         if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
             alias_name = func.value.id
             method_name = func.attr
-            if method_name == "send" and _is_notification_alias(alias_name, symbol_table):
+            if method_name == "send" and _is_notification_alias(alias_name, import_symbols):
                 violations.append((node.lineno, node.col_offset, f"{alias_name}.send(...)"))
         # R54 P1-3 模式 2: 直接 send(...) — 从 notifications import send
         elif isinstance(func, ast.Name) and func.id == "send":
-            if _is_notification_send_import("send", symbol_table):
+            if _is_notification_send_import("send", import_symbols):
                 violations.append((node.lineno, node.col_offset, "send(...) [imported]"))
+        # R55 P1-4 模式 4: <my_send>(...) — 通过赋值别名调用
+        elif isinstance(func, ast.Name) and func.id in assign_symbols:
+            if _is_notification_send_via_assignment(
+                func.id, import_symbols, assign_symbols,
+            ):
+                violations.append((
+                    node.lineno, node.col_offset,
+                    f"{func.id}(...) [assignment alias of send]",
+                ))
+        # R55 P1-4 模式 5: 动态导入 __import__("...").send(...)
+        elif _is_dynamic_import_call(node):
+            violations.append((
+                node.lineno, node.col_offset,
+                "dynamic_import().send(...) [__import__ or importlib]",
+            ))
+        # R55 P1-4 模式 6: getattr(notifications, "send")(...)
+        elif _is_getattr_send_call(node):
+            violations.append((
+                node.lineno, node.col_offset,
+                "getattr(<notifications>, 'send')(...) [getattr dispatch]",
+            ))
 
     # R54 P1-3 模式 3: 检测 re-export
     for node in ast.walk(tree):
@@ -194,6 +334,21 @@ def _find_legacy_send_calls(tree: ast.AST) -> list[tuple[int, int, str]]:
                                     node.lineno, node.col_offset,
                                     "__all__ contains 'send' (re-export)"
                                 ))
+    # R55 P1-4: 检测赋值 re-export(my_send = notifications.send)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    value = node.value
+                    # my_send = notifications.send / my_send = notif_svc.send
+                    if (isinstance(value, ast.Attribute)
+                        and isinstance(value.value, ast.Name)
+                        and value.attr == "send"
+                        and _is_notification_alias(value.value.id, import_symbols)):
+                        violations.append((
+                            node.lineno, node.col_offset,
+                            f"{target.id} = {value.value.id}.send (assignment re-export)",
+                        ))
 
     return violations
 

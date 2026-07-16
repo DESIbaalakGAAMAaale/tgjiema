@@ -497,6 +497,14 @@ class TestComputeCrdbRuSourceLabel:
                 return "official_cloud_api"
             return default
         monkeypatch.setattr(pe, "_read_kv_value", _mock_kv)
+        # R55 P1-3: mock verify_ru_source_official 验证独立表(替代 kv_store.crdb_ru_source)
+        from services import crdb_ru_collector as _crc
+        monkeypatch.setattr(
+            _crc, "verify_ru_source_official",
+            lambda: {"is_official": True, "ru_value": 5000.0,
+                     "collector_id": "test", "response_digest": "abc",
+                     "created_at": _make_iso(60)},
+        )
 
         source, freshness, gauge = pe._compute_crdb_ru_source_label()
 
@@ -593,6 +601,17 @@ class TestPrometheusRuMetrics:
             lambda: {"ready": False, "passed": 0, "checks": {}, "details": {},
                      "ru_daily_usage": "unknown", "last_crdb_sync_age": -1,
                      "last_r2_collect_age": -1},
+        )
+        # R55 P1-3: mock verify_ru_source_official 查询独立表
+        # _compute_crdb_ru_source_label 优先调用此函数验证 official source,
+        # 不再信任 kv_store.crdb_ru_source 字符串。默认返回 is_official=True,
+        # 使"新鲜数据"测试能正确判定 source="official"。
+        from services import crdb_ru_collector as _crc
+        monkeypatch.setattr(
+            _crc, "verify_ru_source_official",
+            lambda: {"is_official": True, "ru_value": 5000.0,
+                     "collector_id": "test", "response_digest": "abc",
+                     "created_at": _make_iso(60)},
         )
         return pe
 

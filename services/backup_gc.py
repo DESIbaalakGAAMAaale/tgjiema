@@ -23,6 +23,7 @@ import asyncio
 import sys
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 
 async def run_backup_gc(timeout_seconds: int = 3600) -> dict:
@@ -63,7 +64,7 @@ async def run_backup_gc(timeout_seconds: int = 3600) -> dict:
             "scanned": 0,
             "deleted": 0,
             "errors": 1,
-            "details": f"run_backup_gc 异常: {e}",
+            "details": _i18n_t('services.backup_gc.s1', e=e),
         }
 
 

@@ -64,6 +64,7 @@ def _make_store_with_db_error(
     execute_raises: BaseException | None = None,
     commit_raises: BaseException | None = None,
     rowcount: int = 1,
+    stored_hash: str = "a" * 64,
 ) -> MagicMock:
     """构造 _db 可用但访问/commit 异常的 mock store。
 
@@ -72,16 +73,18 @@ def _make_store_with_db_error(
         execute_raises: 若非 None,execute 抛此异常
         commit_raises: 若非 None,commit 抛此异常
         rowcount: execute 返回 cursor 的 rowcount(默认 1)
+        stored_hash: execute_fetchall 返回的存储 hash(默认 64 位 'a' hex,
+                     与 request_hash='a'*64 匹配,使主路径进入 CAS UPDATE)
     """
     store = MagicMock()
     db = MagicMock()
     store._db = db
 
-    # execute_fetchall 默认返回空列表(不影响主路径)
+    # execute_fetchall 默认返回有效 stored_hash(使主路径通过 hash 校验进入 CAS)
     if fetchall_raises is not None:
         db.execute_fetchall = AsyncMock(side_effect=fetchall_raises)
     else:
-        db.execute_fetchall = AsyncMock(return_value=[])
+        db.execute_fetchall = AsyncMock(return_value=[(stored_hash,)])
 
     # execute 返回 cursor(含 rowcount)
     cursor = MagicMock()
@@ -123,6 +126,7 @@ class TestClaimExecutionApprovedFailClosed:
                 await claim_execution_approved(
                     action_id="r53_p0_2_db_none",
                     owner="test_worker",
+                    request_hash="a" * 64,
                 )
 
         # 校验错误码为 COMMAND_EXECUTION_STORE_UNAVAILABLE
@@ -149,7 +153,7 @@ class TestClaimExecutionApprovedFailClosed:
                 await claim_execution_approved(
                     action_id="r53_p0_2_conn_err",
                     owner="test_worker",
-                    request_hash="hash_001",
+                    request_hash="a" * 64,
                 )
 
         # 校验错误码为 COMMAND_EXECUTION_STORE_UNAVAILABLE
@@ -173,6 +177,7 @@ class TestClaimExecutionApprovedFailClosed:
                 await claim_execution_approved(
                     action_id="r53_p0_2_update_err",
                     owner="test_worker",
+                    request_hash="a" * 64,
                 )
 
         assert exc_info.value.code == ErrorCodes.COMMAND_EXECUTION_STORE_UNAVAILABLE, (
@@ -196,6 +201,7 @@ class TestClaimExecutionApprovedFailClosed:
                 await claim_execution_approved(
                     action_id="r53_p0_2_commit_err",
                     owner="test_worker",
+                    request_hash="a" * 64,
                 )
 
         assert exc_info.value.code == ErrorCodes.COMMAND_EXECUTION_STORE_UNAVAILABLE, (
@@ -217,6 +223,7 @@ class TestClaimExecutionApprovedFailClosed:
             result = await claim_execution_approved(
                 action_id="r53_p0_2_rowcount_zero",
                 owner="test_worker",
+                request_hash="a" * 64,
             )
 
         assert result is False, (
@@ -237,6 +244,7 @@ class TestClaimExecutionApprovedFailClosed:
             result = await claim_execution_approved(
                 action_id="r53_p0_2_claim_ok",
                 owner="test_worker",
+                request_hash="a" * 64,
             )
 
         assert result is True, "rowcount=1 时应返回 True(认领成功)"
@@ -247,11 +255,12 @@ class TestClaimExecutionApprovedFailClosed:
         from services.command_bus import claim_execution_approved
 
         # 模拟 request_hash 不匹配:execute_fetchall 返回存储的 hash 与请求 hash 不一致
+        # 两者均为 64 位 hex 但不同,通过格式校验后在 compare_digest 阶段返回 False
         mock_store = MagicMock()
         db = MagicMock()
         mock_store._db = db
-        # execute_fetchall 返回存储的 hash
-        db.execute_fetchall = AsyncMock(return_value=[("stored_hash_abc",)])
+        # execute_fetchall 返回存储的 hash(64 位 'b' hex)
+        db.execute_fetchall = AsyncMock(return_value=[("b" * 64,)])
         db.execute = AsyncMock(return_value=MagicMock(rowcount=1))
         db.commit = AsyncMock(return_value=None)
 
@@ -259,7 +268,7 @@ class TestClaimExecutionApprovedFailClosed:
             result = await claim_execution_approved(
                 action_id="r53_p0_2_hash_mismatch",
                 owner="test_worker",
-                request_hash="tampered_hash_xyz",
+                request_hash="a" * 64,  # 与存储的 'b'*64 不匹配
             )
 
         assert result is False, "request_hash 不匹配时应返回 False(防篡改)"
@@ -267,6 +276,73 @@ class TestClaimExecutionApprovedFailClosed:
         assert db.execute.call_count == 0, (
             "hash 不匹配时不应执行 CAS UPDATE"
         )
+
+    @pytest.mark.asyncio
+    async def test_raises_when_request_hash_empty(self):
+        """R55 P0-2: request_hash 为空 → raise AppError(COMMAND_MUST_USE_APPROVAL_PATH)。
+
+        空 hash 在参数校验阶段即被拒绝,不访问数据库。
+        """
+        from services.command_bus import claim_execution_approved
+        from services.error_codes import AppError, ErrorCodes
+
+        mock_store = _make_store_with_db_error()
+        with patch("database.cache_store.get_cache_store", return_value=mock_store):
+            with pytest.raises(AppError) as exc_info:
+                await claim_execution_approved(
+                    action_id="r53_p0_2_empty_hash",
+                    owner="test_worker",
+                    request_hash="",
+                )
+
+        assert exc_info.value.code == ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH, (
+            f"空 request_hash 应抛 COMMAND_MUST_USE_APPROVAL_PATH,"
+            f"实际: {exc_info.value.code}"
+        )
+        assert "request_hash_required_64_hex" in exc_info.value.params.get("reason", "")
+
+    @pytest.mark.asyncio
+    async def test_raises_when_request_hash_not_64_hex(self):
+        """R55 P0-2: request_hash 非 64 位 hex → raise AppError(COMMAND_MUST_USE_APPROVAL_PATH)。"""
+        from services.command_bus import claim_execution_approved
+        from services.error_codes import AppError, ErrorCodes
+
+        mock_store = _make_store_with_db_error()
+        with patch("database.cache_store.get_cache_store", return_value=mock_store):
+            with pytest.raises(AppError) as exc_info:
+                await claim_execution_approved(
+                    action_id="r53_p0_2_short_hash",
+                    owner="test_worker",
+                    request_hash="short",
+                )
+
+        assert exc_info.value.code == ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH
+        assert "request_hash_required_64_hex" in exc_info.value.params.get("reason", "")
+
+    @pytest.mark.asyncio
+    async def test_raises_when_stored_hash_empty(self):
+        """R55 P0-2: 存储 request_hash 为空 → raise AppError(COMMAND_MUST_USE_APPROVAL_PATH)。
+
+        fail-closed:存储 hash 为空时拒绝执行(不允许降级)。
+        """
+        from services.command_bus import claim_execution_approved
+        from services.error_codes import AppError, ErrorCodes
+
+        # stored_hash 为空字符串
+        mock_store = _make_store_with_db_error(stored_hash="")
+        with patch("database.cache_store.get_cache_store", return_value=mock_store):
+            with pytest.raises(AppError) as exc_info:
+                await claim_execution_approved(
+                    action_id="r53_p0_2_stored_empty",
+                    owner="test_worker",
+                    request_hash="a" * 64,
+                )
+
+        assert exc_info.value.code == ErrorCodes.COMMAND_MUST_USE_APPROVAL_PATH, (
+            f"存储 hash 为空应抛 COMMAND_MUST_USE_APPROVAL_PATH,"
+            f"实际: {exc_info.value.code}"
+        )
+        assert "stored_request_hash_empty" in exc_info.value.params.get("reason", "")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -304,6 +380,7 @@ class TestNoSideEffectsWhenDbUnavailable:
                 claimed = await claim_execution_approved(
                     action_id="r53_p0_2_side_effect_none",
                     owner="test_worker",
+                    request_hash="a" * 64,
                 )
                 # 不应执行到这里(DB=None 应抛异常)
                 if claimed:
@@ -336,7 +413,7 @@ class TestNoSideEffectsWhenDbUnavailable:
                 claimed = await claim_execution_approved(
                     action_id="r53_p0_2_side_effect_conn_err",
                     owner="test_worker",
-                    request_hash="hash_002",
+                    request_hash="a" * 64,
                 )
                 if claimed:
                     await side_effect_fn()
@@ -364,6 +441,7 @@ class TestNoSideEffectsWhenDbUnavailable:
                 claimed = await claim_execution_approved(
                     action_id="r53_p0_2_side_effect_commit_err",
                     owner="test_worker",
+                    request_hash="a" * 64,
                 )
                 if claimed:
                     await side_effect_fn()
@@ -386,6 +464,7 @@ class TestNoSideEffectsWhenDbUnavailable:
             claimed = await claim_execution_approved(
                 action_id="r53_p0_2_side_effect_rowcount_zero",
                 owner="test_worker",
+                request_hash="a" * 64,
             )
             # 调用方典型模式:claimed=False 时不执行副作用
             if claimed:

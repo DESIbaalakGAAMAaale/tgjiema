@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from loguru import logger
+from services.i18n import translate as _i18n_t
 
 
 class ErrorSeverity(enum.Enum):
@@ -105,167 +106,167 @@ class ErrorCode(str, enum.Enum):
 # 后续接入 i18n 后改为从 locale 文件加载
 _DEFAULT_MESSAGES: dict[ErrorCode, dict[str, str]] = {
     ErrorCode.QUOTA_DECODE_EXCEEDED: {
-        "zh-CN": "今日解码次数已达上限",
+        "zh-CN": _i18n_t('services.errors.s1'),
         "en-US": "Daily decode quota exceeded",
     },
     ErrorCode.QUOTA_UPLOAD_EXCEEDED: {
-        "zh-CN": "今日上传次数已达上限",
+        "zh-CN": _i18n_t('services.errors.s2'),
         "en-US": "Daily upload quota exceeded",
     },
     ErrorCode.QUOTA_EXTERNAL_EXCEEDED: {
-        "zh-CN": "今日外部解码次数已达上限",
+        "zh-CN": _i18n_t('services.errors.s3'),
         "en-US": "Daily external decode quota exceeded",
     },
     ErrorCode.QUOTA_INSUFFICIENT: {
-        "zh-CN": "配额不足",
+        "zh-CN": _i18n_t('services.errors.s4'),
         "en-US": "Insufficient quota",
     },
     ErrorCode.FILE_NOT_FOUND: {
-        "zh-CN": "文件不存在",
+        "zh-CN": _i18n_t('services.errors.s5'),
         "en-US": "File not found",
     },
     ErrorCode.FILE_EXPIRED: {
-        "zh-CN": "文件已过期",
+        "zh-CN": _i18n_t('services.errors.s6'),
         "en-US": "File expired",
     },
     ErrorCode.FILE_DELETED: {
-        "zh-CN": "文件已被删除",
+        "zh-CN": _i18n_t('services.errors.s7'),
         "en-US": "File has been deleted",
     },
     ErrorCode.FILE_TOO_LARGE: {
-        "zh-CN": "文件大小超过限制",
+        "zh-CN": _i18n_t('services.errors.s8'),
         "en-US": "File size exceeds limit",
     },
     ErrorCode.FILE_HASH_MISMATCH: {
-        "zh-CN": "文件哈希校验失败",
+        "zh-CN": _i18n_t('services.errors.s9'),
         "en-US": "File hash mismatch",
     },
     ErrorCode.FILE_CODE_INVALID: {
-        "zh-CN": "文件码无效",
+        "zh-CN": _i18n_t('services.errors.s10'),
         "en-US": "Invalid file code",
     },
     ErrorCode.FILE_CODE_USED: {
-        "zh-CN": "文件码已被使用",
+        "zh-CN": _i18n_t('services.errors.s11'),
         "en-US": "File code already used",
     },
     ErrorCode.USER_NOT_FOUND: {
-        "zh-CN": "用户不存在",
+        "zh-CN": _i18n_t('services.errors.s12'),
         "en-US": "User not found",
     },
     ErrorCode.USER_BANNED: {
-        "zh-CN": "用户已被封禁",
+        "zh-CN": _i18n_t('services.errors.s13'),
         "en-US": "User has been banned",
     },
     ErrorCode.USER_TEMP_BANNED: {
-        "zh-CN": "用户被临时封禁",
+        "zh-CN": _i18n_t('services.errors.s14'),
         "en-US": "User temporarily banned",
     },
     ErrorCode.USER_UNAUTHORIZED: {
-        "zh-CN": "未授权访问",
+        "zh-CN": _i18n_t('services.errors.s15'),
         "en-US": "Unauthorized access",
     },
     ErrorCode.USER_FORBIDDEN: {
-        "zh-CN": "禁止访问",
+        "zh-CN": _i18n_t('services.errors.s16'),
         "en-US": "Forbidden access",
     },
     ErrorCode.APPROVAL_NOT_FOUND: {
-        "zh-CN": "审批记录不存在",
+        "zh-CN": _i18n_t('services.errors.s17'),
         "en-US": "Approval record not found",
     },
     ErrorCode.APPROVAL_REQUIRED: {
-        "zh-CN": "此操作需要审批",
+        "zh-CN": _i18n_t('services.errors.s18'),
         "en-US": "This operation requires approval",
     },
     ErrorCode.APPROVAL_REJECTED: {
-        "zh-CN": "审批已被拒绝",
+        "zh-CN": _i18n_t('services.errors.s19'),
         "en-US": "Approval has been rejected",
     },
     ErrorCode.APPROVAL_EXPIRED: {
-        "zh-CN": "审批已过期",
+        "zh-CN": _i18n_t('services.errors.s20'),
         "en-US": "Approval has expired",
     },
     ErrorCode.INTERNAL_ERROR: {
-        "zh-CN": "内部服务器错误",
+        "zh-CN": _i18n_t('services.errors.s21'),
         "en-US": "Internal server error",
     },
     ErrorCode.SERVICE_UNAVAILABLE: {
-        "zh-CN": "服务暂不可用",
+        "zh-CN": _i18n_t('services.errors.s22'),
         "en-US": "Service unavailable",
     },
     ErrorCode.RATE_LIMITED: {
-        "zh-CN": "请求过于频繁,请稍后再试",
+        "zh-CN": _i18n_t('services.errors.s23'),
         "en-US": "Too many requests, please try again later",
     },
     ErrorCode.MAINTENANCE_MODE: {
-        "zh-CN": "系统维护中,请稍后再试",
+        "zh-CN": _i18n_t('services.errors.s24'),
         "en-US": "System under maintenance, please try again later",
     },
     ErrorCode.STORAGE_R2_FAILED: {
-        "zh-CN": "R2 存储操作失败",
+        "zh-CN": _i18n_t('services.errors.s25'),
         "en-US": "R2 storage operation failed",
     },
     ErrorCode.STORAGE_CRDB_FAILED: {
-        "zh-CN": "CRDB 数据库操作失败",
+        "zh-CN": _i18n_t('services.errors.s26'),
         "en-US": "CRDB database operation failed",
     },
     ErrorCode.STORAGE_REDIS_FAILED: {
-        "zh-CN": "Redis 操作失败",
+        "zh-CN": _i18n_t('services.errors.s27'),
         "en-US": "Redis operation failed",
     },
     ErrorCode.STORAGE_QUOTA_EXCEEDED: {
-        "zh-CN": "存储配额已超限",
+        "zh-CN": _i18n_t('services.errors.s28'),
         "en-US": "Storage quota exceeded",
     },
     ErrorCode.REPLICATION_FAILED: {
-        "zh-CN": "数据复制失败",
+        "zh-CN": _i18n_t('services.errors.s29'),
         "en-US": "Data replication failed",
     },
     ErrorCode.REPLICATION_TIMEOUT: {
-        "zh-CN": "数据复制超时",
+        "zh-CN": _i18n_t('services.errors.s30'),
         "en-US": "Data replication timed out",
     },
     ErrorCode.SYNC_DIRTY_FAILED: {
-        "zh-CN": "脏数据同步失败",
+        "zh-CN": _i18n_t('services.errors.s31'),
         "en-US": "Dirty data sync failed",
     },
     ErrorCode.RELAY_FLOOD_WAIT: {
-        "zh-CN": "Relay 账号触发 FloodWait",
+        "zh-CN": _i18n_t('services.errors.s32'),
         "en-US": "Relay account hit FloodWait",
     },
     ErrorCode.RELAY_BANNED: {
-        "zh-CN": "Relay 账号已被封禁",
+        "zh-CN": _i18n_t('services.errors.s33'),
         "en-US": "Relay account banned",
     },
     ErrorCode.RELAY_RESTRICTED: {
-        "zh-CN": "Relay 账号受限",
+        "zh-CN": _i18n_t('services.errors.s34'),
         "en-US": "Relay account restricted",
     },
     ErrorCode.RELAY_NO_AVAILABLE: {
-        "zh-CN": "无可用 Relay 账号",
+        "zh-CN": _i18n_t('services.errors.s35'),
         "en-US": "No available relay account",
     },
     ErrorCode.DECODE_FAILED: {
-        "zh-CN": "解码失败",
+        "zh-CN": _i18n_t('services.errors.s36'),
         "en-US": "Decode failed",
     },
     ErrorCode.DECODE_TIMEOUT: {
-        "zh-CN": "解码超时",
+        "zh-CN": _i18n_t('services.errors.s37'),
         "en-US": "Decode timed out",
     },
     ErrorCode.DECODE_INVALID_INPUT: {
-        "zh-CN": "解码输入无效",
+        "zh-CN": _i18n_t('services.errors.s38'),
         "en-US": "Invalid decode input",
     },
     ErrorCode.VALIDATION_FAILED: {
-        "zh-CN": "参数校验失败",
+        "zh-CN": _i18n_t('services.errors.s39'),
         "en-US": "Validation failed",
     },
     ErrorCode.VALIDATION_MISSING_FIELD: {
-        "zh-CN": "缺少必填字段",
+        "zh-CN": _i18n_t('services.errors.s40'),
         "en-US": "Missing required field",
     },
     ErrorCode.VALIDATION_INVALID_FORMAT: {
-        "zh-CN": "字段格式无效",
+        "zh-CN": _i18n_t('services.errors.s41'),
         "en-US": "Invalid field format",
     },
 }

@@ -154,7 +154,7 @@ async def _seed_command_executions(
     action_id: str,
     principal_id: int,
     status: str = "executed",
-    request_hash: str = "fake_hash",
+    request_hash: str = "d" * 64,  # R55 P0-2: 64 位 hex 格式
 ) -> None:
     """向 command_executions 表插入一条记录(用于 _validate_production_approval 校验)。"""
     now = "2026-07-13T10:00:00"
@@ -194,7 +194,7 @@ class TestValidateProductionApprovalRequestHash:
         store, engine, _, _ = real_store_with_engine
         approval_action_id = "toctou_action_001"
         principal_id = 999
-        stored_hash = "stored_hash_abc"
+        stored_hash = "5" * 64  # R55 P0-2: 64 位 hex 格式
         # R51 P0-8: status='approved' 表示审批通过等待执行(非 executed)
         await _seed_command_executions(
             store, approval_action_id, principal_id,
@@ -209,11 +209,12 @@ class TestValidateProductionApprovalRequestHash:
         )
 
         # 2. expected_request_hash 与 stored_hash 不一致 → 抛 AppError(TOCTOU, R51 P0-8 协议化)
+        # R55 P0-2: request_hash 必须为 64 位 hex 格式
         with pytest.raises(AppError) as exc_info:
             await engine._validate_production_approval(
                 approver_id=principal_id,
                 approval_action_id=approval_action_id,
-                expected_request_hash="tampered_hash_xyz",
+                expected_request_hash="e" * 64,  # 64 位 hex 但与 stored 不匹配
             )
         assert exc_info.value.code == ErrorCodes.PRODUCTION_RESTORE_HASH_MISMATCH
 
@@ -229,7 +230,7 @@ class TestValidateProductionApprovalRequestHash:
         # R51 P0-8: status='approved' 表示审批通过等待执行
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="approved", request_hash="any_hash",
+            status="approved", request_hash="f" * 64,  # R55 P0-2: 64 位 hex
         )
 
         # 不传 expected_request_hash → 跳过 TOCTOU 校验,应通过
@@ -256,11 +257,12 @@ class TestValidateProductionApprovalRequestHash:
         )
 
         # expected_request_hash 非空,但 stored_hash 为空 → fail-closed
+        # R55 P0-2: expected_request_hash 必须为 64 位 hex 格式
         with pytest.raises(PermissionError, match="request_hash 为空"):
             await engine._validate_production_approval(
                 approver_id=principal_id,
                 approval_action_id=approval_action_id,
-                expected_request_hash="expected_hash_001",
+                expected_request_hash="1" * 64,  # 64 位 hex
             )
 
 
@@ -283,7 +285,7 @@ class TestRestoreRequestHash:
 
         approval_action_id = "restore_match_001"
         principal_id = 123
-        request_hash = "matching_hash_001"
+        request_hash = "a" * 64  # R55 P0-2: 64 位 hex 格式
         # R51 P0-8: status='approved' 表示审批通过等待执行
         await _seed_command_executions(
             store, approval_action_id, principal_id,
@@ -321,7 +323,7 @@ class TestRestoreRequestHash:
 
         approval_action_id = "restore_mismatch_001"
         principal_id = 456
-        stored_hash = "stored_hash_001"
+        stored_hash = "b" * 64  # R55 P0-2: 64 位 hex 格式
         # R51 P0-8: status='approved' 表示审批通过等待执行
         await _seed_command_executions(
             store, approval_action_id, principal_id,
@@ -339,12 +341,13 @@ class TestRestoreRequestHash:
         )
 
         # 传入不匹配的 expected_request_hash → 抛 AppError(R51 P0-8 协议化)
+        # R55 P0-2: request_hash 必须为 64 位 hex 格式
         with pytest.raises(AppError) as exc_info:
             await engine.restore(
                 backup_id, target="production",
                 approver_id=principal_id,
                 approval_action_id=approval_action_id,
-                expected_request_hash="tampered_hash_999",
+                expected_request_hash="c" * 64,  # 64 位 hex 但与 stored_hash 不匹配
             )
         assert exc_info.value.code == ErrorCodes.PRODUCTION_RESTORE_HASH_MISMATCH
 
@@ -365,7 +368,7 @@ class TestRestoreRequestHash:
         principal_id = 789
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="approved", request_hash="any_hash",
+            status="approved", request_hash="2" * 64,  # R55 P0-2: 64 位 hex
         )
 
         # R51 P0-8: 不传 expected_request_hash → 抛 AppError(PRODUCTION_RESTORE_HASH_REQUIRED)
@@ -400,7 +403,7 @@ class TestRestorePrincipalLookup:
         # R51 P0-8: status='approved' + 传 expected_request_hash
         await _seed_command_executions(
             store, approval_action_id, principal_id,
-            status="approved", request_hash="any_hash",
+            status="approved", request_hash="3" * 64,  # R55 P0-2: 64 位 hex
         )
 
         # mock db_restore
@@ -416,7 +419,7 @@ class TestRestorePrincipalLookup:
         result = await engine.restore(
             backup_id, target="production",
             approval_action_id=approval_action_id,
-            expected_request_hash="any_hash",
+            expected_request_hash="3" * 64,  # R55 P0-2: 64 位 hex 与 stored 一致
         )
 
         assert result["success"] is True
@@ -450,7 +453,7 @@ class TestRestorePrincipalLookup:
             await engine.restore(
                 backup_id, target="production",
                 approval_action_id="missing_action_id_001",
-                expected_request_hash="some_hash_for_principal_lookup_test",
+                expected_request_hash="4" * 64,  # R55 P0-2: 64 位 hex
             )
 
 

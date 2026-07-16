@@ -4,16 +4,17 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from config import settings
+from services.i18n import translate as _i18n_t
 
 TOKEN = settings.ADMIN_BOT_TOKEN
 # B7: 确保 AUTHORIZED_USER_ID 为 int，防止 env 中 ADMIN_TELEGRAM_ID 为字符串时
 # 与 from_user.id(int) 恒不等导致装饰器失效（int != str 永远为 True → 恒拒绝合法管理员）
 AUTHORIZED_USER_ID = int(settings.ADMIN_TELEGRAM_ID) if settings.ADMIN_TELEGRAM_ID else 0
 
-MEMBERSHIP_LEVELS = {"free": "免费", "basic": "基础", "premium": "高级"}
+MEMBERSHIP_LEVELS = {"free": _i18n_t('bot.admin_bot.menus.s1'), "basic": _i18n_t('bot.admin_bot.menus.s2'), "premium": _i18n_t('bot.admin_bot.menus.s3')}
 LEVEL_ALIAS = {
     "1": "free", "2": "basic", "3": "premium",
-    "免费": "free", "基础": "basic", "高级": "premium",
+    _i18n_t('bot.admin_bot.menus.s4'): "free", _i18n_t('bot.admin_bot.menus.s5'): "basic", _i18n_t('bot.admin_bot.menus.s6'): "premium",
 }
 
 
@@ -24,7 +25,7 @@ def _auth_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if not user or user.id != AUTHORIZED_USER_ID:
-            await update.message.reply_text("⛔ 您没有权限使用此机器人。")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.menus.s22'))
             return
         return await func(update, context, *args, **kwargs)
     return wrapper
@@ -32,149 +33,143 @@ def _auth_required(func):
 
 def _quota_display(val: int) -> str:
     if val == -1:
-        return "不限"
+        return _i18n_t('bot.admin_bot.menus.s7')
     return str(val)
 
 
-BACK_BTN = [[InlineKeyboardButton("🔙 返回主菜单", callback_data="menu:main")]]
+BACK_BTN = [[InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s20'), callback_data="menu:main")]]
 
 
 def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
     if menu_id == "main":
-        text = "🤖 管理员面板 — 点击按钮操作"
+        text = _i18n_t('bot.admin_bot.menus.s8')
         kb = [
-            [InlineKeyboardButton("📊 系统状态", callback_data="menu:sys"),
-             InlineKeyboardButton("👤 用户管理", callback_data="menu:user")],
-            [InlineKeyboardButton("📁 文件管理", callback_data="menu:file"),
-             InlineKeyboardButton(" 解码日志", callback_data="action:logs")],
-            [InlineKeyboardButton("🔐 用户中继", callback_data="menu:relay"),
-             InlineKeyboardButton("⚙️ 系统配置", callback_data="menu:config")],
-            [InlineKeyboardButton("🗺️ 文件码路由", callback_data="menu:code_route"),
-             InlineKeyboardButton("⏱️ Bot限流", callback_data="menu:bot_limit")],
-            [InlineKeyboardButton("🔗 环形拓扑", callback_data="menu:topology"),
-             InlineKeyboardButton("🔄 备用池", callback_data="menu:spare")],
-            [InlineKeyboardButton("⏳ 轮转配置", callback_data="menu:rotation")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s23'), callback_data="menu:sys"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s24'), callback_data="menu:user")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s25'), callback_data="menu:file"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s26'), callback_data="action:logs")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s27'), callback_data="menu:relay"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s28'), callback_data="menu:config")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s29'), callback_data="menu:code_route"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s30'), callback_data="menu:bot_limit")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s31'), callback_data="menu:topology"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s32'), callback_data="menu:spare")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s33'), callback_data="menu:rotation")],
         ]
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "sys":
-        text = "📊 系统状态"
+        text = _i18n_t('bot.admin_bot.menus.s9')
         kb = [
-            [InlineKeyboardButton("📈 系统概览", callback_data="action:status"),
-             InlineKeyboardButton("❤️ 健康状态", callback_data="action:health")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s34'), callback_data="action:status"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s35'), callback_data="action:health")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "user":
-        text = "👤 用户管理 — 点击按钮操作"
+        text = _i18n_t('bot.admin_bot.menus.s10')
         kb = [
-            [InlineKeyboardButton("📋 用户列表", callback_data="action:users"),
-             InlineKeyboardButton("👤 查询用户", callback_data="interactive:user_detail")],
-            [InlineKeyboardButton("🏅 设置等级", callback_data="interactive:set_level"),
-             InlineKeyboardButton("🔒 封禁用户", callback_data="interactive:ban")],
-            [InlineKeyboardButton("🔓 解封用户", callback_data="interactive:unban"),
-             InlineKeyboardButton("📤 解码配额", callback_data="interactive:set_quota")],
-            [InlineKeyboardButton("🌐 外部码配额", callback_data="interactive:set_external_quota")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s36'), callback_data="action:users"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s37'), callback_data="interactive:user_detail")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s38'), callback_data="interactive:set_level"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s39'), callback_data="interactive:ban")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s40'), callback_data="interactive:unban"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s41'), callback_data="interactive:set_quota")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s42'), callback_data="interactive:set_external_quota")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "file":
-        text = "📁 文件管理 — 点击按钮操作"
+        text = _i18n_t('bot.admin_bot.menus.s11')
         kb = [
-            [InlineKeyboardButton("📂 文件列表", callback_data="action:files"),
-             InlineKeyboardButton("🔍 查询文件", callback_data="interactive:file_detail")],
-            [InlineKeyboardButton("🗑️ 删除文件", callback_data="interactive:delete_file"),
-             InlineKeyboardButton("🔢 访问限制", callback_data="interactive:set_access_limit")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s43'), callback_data="action:files"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s44'), callback_data="interactive:file_detail")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s45'), callback_data="interactive:delete_file"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s46'), callback_data="interactive:set_access_limit")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "relay":
-        text = "🔐 用户中继管理 — 点击按钮操作"
+        text = _i18n_t('bot.admin_bot.menus.s12')
         kb = [
-            [InlineKeyboardButton("📊 查看状态", callback_data="action:relay_status"),
-             InlineKeyboardButton("➕ 添加账号", callback_data="interactive:relay_add")],
-            [InlineKeyboardButton("➖ 移除账号", callback_data="interactive:relay_remove"),
-             InlineKeyboardButton("📋 查看待处理", callback_data="action:relay_pending")],
-            [InlineKeyboardButton("📋 白名单管理", callback_data="menu:whitelist")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s47'), callback_data="action:relay_status"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s48'), callback_data="interactive:relay_add")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s49'), callback_data="interactive:relay_remove"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s50'), callback_data="action:relay_pending")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s51'), callback_data="menu:whitelist")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "whitelist":
-        text = "📋 白名单管理 — 点击按钮操作"
+        text = _i18n_t('bot.admin_bot.menus.s13')
         kb = [
-            [InlineKeyboardButton("🔐 中继白名单", callback_data="action:relay_whitelist"),
-             InlineKeyboardButton("📦 采集器白名单", callback_data="action:collector_whitelist")],
-            [InlineKeyboardButton("➕ 添加采集器", callback_data="interactive:collector_wl_add"),
-             InlineKeyboardButton("➖ 移除采集器", callback_data="interactive:collector_wl_remove")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s52'), callback_data="action:relay_whitelist"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s53'), callback_data="action:collector_whitelist")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s54'), callback_data="interactive:collector_wl_add"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s55'), callback_data="interactive:collector_wl_remove")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "config":
-        text = "⚙️ 系统配置 — 点击按钮操作\n\n⚠️需重启 = 配置需重启所有Bot后生效 | ✅热更新 = 配置即时生效"
+        text = _i18n_t('bot.admin_bot.menus.s14')
         kb = [
-            [InlineKeyboardButton("📋 查看全部配置", callback_data="action:settings")],
-            [InlineKeyboardButton("📝 文件码前缀", callback_data="interactive:set_file_prefix"),
-             InlineKeyboardButton("🔒 强制加群", callback_data="interactive:set_force_join")],
-            [InlineKeyboardButton("👤 机器人用户名", callback_data="interactive:set_username"),
-             InlineKeyboardButton("🎫 默认配额", callback_data="interactive:set_quota_default")],
-            [InlineKeyboardButton("☁️ R2备份配置", callback_data="interactive:set_r2"),
-             InlineKeyboardButton("💾 DB自动备份", callback_data="interactive:set_db_backup")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s56'), callback_data="action:settings")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s57'), callback_data="interactive:set_file_prefix"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s58'), callback_data="interactive:set_force_join")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s59'), callback_data="interactive:set_username"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s60'), callback_data="interactive:set_quota_default")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s61'), callback_data="interactive:set_r2"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s62'), callback_data="interactive:set_db_backup")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "code_route":
         text = (
-            "🗺️ 文件码路由\n\n"
-            "前缀路由：按文件码开头的前缀匹配（如 qqfile 开头）\n"
-            "正则路由：按正则表达式匹配（用于 40位hash / emoji 等非前缀式码）\n\n"
-            "点击下方按钮开始操作："
+            _i18n_t('bot.admin_bot.menus.s15')
         )
         kb = [
-            [InlineKeyboardButton("➕ 新增前缀路由", callback_data="interactive:add_code_route"),
-             InlineKeyboardButton("➖ 删除前缀路由", callback_data="interactive:remove_code_route")],
-            [InlineKeyboardButton("➕ 新增正则路由", callback_data="interactive:add_code_route_regex"),
-             InlineKeyboardButton("➖ 删除正则路由", callback_data="interactive:remove_code_route_regex")],
-            [InlineKeyboardButton("📋 查看路由表", callback_data="action:code_routes")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s63'), callback_data="interactive:add_code_route"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s64'), callback_data="interactive:remove_code_route")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s65'), callback_data="interactive:add_code_route_regex"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s66'), callback_data="interactive:remove_code_route_regex")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s67'), callback_data="action:code_routes")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "bot_limit":
         text = (
-            "⏱️ Bot 解码间隔限流\n\n"
-            "某些机器人限制每个文件码之间的解码间隔时间。\n"
-            "设置后，系统会自动等待满足间隔再发送下一个请求。\n\n"
-            "点击下方按钮开始操作："
+            _i18n_t('bot.admin_bot.menus.s16')
         )
         kb = [
-            [InlineKeyboardButton("➕ 新增限流", callback_data="interactive:set_bot_interval"),
-             InlineKeyboardButton("➖ 删除限流", callback_data="interactive:remove_bot_interval")],
-            [InlineKeyboardButton("📋 查看限流配置", callback_data="action:bot_intervals")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s68'), callback_data="interactive:set_bot_interval"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s69'), callback_data="interactive:remove_bot_interval")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s70'), callback_data="action:bot_intervals")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "topology":
-        text = "🔗 环形冗余拓扑 — 查看与管理槽位"
+        text = _i18n_t('bot.admin_bot.menus.s17')
         kb = [
-            [InlineKeyboardButton("📋 查看拓扑", callback_data="action:topology")],
-            [InlineKeyboardButton("➕ 添加槽位", callback_data="interactive:cell_add"),
-             InlineKeyboardButton("➖ 移除槽位", callback_data="interactive:cell_remove")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s71'), callback_data="action:topology")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s72'), callback_data="interactive:cell_add"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s73'), callback_data="interactive:cell_remove")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "spare":
-        text = "🔄 备用池管理\n\n管理备用频道池，封禁后自动补充空缺。"
+        text = _i18n_t('bot.admin_bot.menus.s18')
         kb = [
-            [InlineKeyboardButton("➕ 添加备用频道", callback_data="interactive:spare_add"),
-             InlineKeyboardButton("➖ 移除备用频道", callback_data="interactive:spare_remove")],
-            [InlineKeyboardButton("📋 查看备用池", callback_data="action:spare_list")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s74'), callback_data="interactive:spare_add"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s75'), callback_data="interactive:spare_remove")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s76'), callback_data="action:spare_list")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
     if menu_id == "rotation":
-        text = "⏳ 轮转配置管理\n\n设置活跃频道轮转参数（文件数/时间）。"
+        text = _i18n_t('bot.admin_bot.menus.s19')
         kb = [
-            [InlineKeyboardButton("📋 查看配置", callback_data="action:rotation_view"),
-             InlineKeyboardButton("⚙️ 修改参数", callback_data="interactive:rotation_set")],
+            [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s77'), callback_data="action:rotation_view"),
+             InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s78'), callback_data="interactive:rotation_set")],
         ] + BACK_BTN
         return text, InlineKeyboardMarkup(kb)
 
@@ -183,5 +178,5 @@ def _build_menu(menu_id: str) -> tuple[str, InlineKeyboardMarkup]:
 
 
 _CONV_CANCEL_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton("❌ 取消操作", callback_data="conv:cancel")],
+    [InlineKeyboardButton(_i18n_t('bot.admin_bot.menus.s21'), callback_data="conv:cancel")],
 ])

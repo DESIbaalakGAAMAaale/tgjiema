@@ -346,7 +346,7 @@ class TestRecoverMaintenanceBindingRequired:
 
         # 插入一条 approved 状态的审批记录
         approval_action_id = "recover_action_r51_003"
-        request_hash = "r51_test_hash_003"
+        request_hash = "a" * 64  # R55 P0-2: 64 位 hex(满足 claim_execution_approved 校验)
         await _insert_command_execution(
             real_store, approval_action_id, status="approved",
             request_hash=request_hash,

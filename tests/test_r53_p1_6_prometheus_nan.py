@@ -346,6 +346,11 @@ class TestRuGoSignalMetric:
                 return "official_cloud_api"
             return default
         pe = _patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
+        # R55 P1-3: mock verify_ru_source_official 返回 official(不再信任 kv_store.crdb_ru_source)
+        monkeypatch.setattr(
+            "services.crdb_ru_collector.verify_ru_source_official",
+            lambda: {"is_official": True, "ru_value": 12345, "collected_at": recent_ts},
+        )
 
         output = pe.collect_metrics()
 
@@ -428,6 +433,11 @@ class TestRuGoSignalMetric:
                 return "official_cloud_api"
             return default
         pe = _patch_pe_basics(monkeypatch, kv_mock=_mock_kv)
+        # R55 P1-3: mock verify_ru_source_official 返回 official(不再信任 kv_store.crdb_ru_source)
+        monkeypatch.setattr(
+            "services.crdb_ru_collector.verify_ru_source_official",
+            lambda: {"is_official": True, "ru_value": 12345, "collected_at": recent_ts},
+        )
 
         output = pe.collect_metrics()
 

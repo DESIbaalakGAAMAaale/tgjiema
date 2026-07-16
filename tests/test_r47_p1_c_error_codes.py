@@ -424,11 +424,28 @@ class TestAppError:
         assert err.trace_id == err.envelope.trace_id
 
     def test_app_error_to_dict(self):
-        """AppError.to_dict 应返回与 envelope.to_dict 相同的 dict。"""
+        """AppError.to_dict 应返回 R55 §17 精简响应格式。
+
+        R55 §17: to_dict 返回 ``{code, message_key, trace_id, retryable,
+        severity, safe_params}``,不含 message/timestamp(原始异常不暴露)。
+        如需完整 envelope(含 i18n message),应直接访问 ``self.envelope``。
+        """
         from services.error_codes import AppError, ErrorCodes
 
         err = AppError(ErrorCodes.ERROR_INTERNAL)
-        assert err.to_dict() == err.envelope.to_dict()
+        d = err.to_dict()
+        # R55 §17 精简响应格式的必需字段
+        assert d["code"] == ErrorCodes.ERROR_INTERNAL
+        assert d["message_key"] == err.envelope.message_key
+        assert d["trace_id"] == err.envelope.trace_id
+        assert d["retryable"] == err.envelope.retryable
+        assert d["severity"] == err.envelope.severity
+        # safe_params 应存在且为 dict(经过 is_safe_param 过滤)
+        assert isinstance(d["safe_params"], dict)
+        # 精简格式不应包含 message/params/timestamp(避免泄露内部细节)
+        assert "message" not in d
+        assert "params" not in d
+        assert "timestamp" not in d
 
     def test_app_error_can_be_raised_and_caught(self):
         """AppError 可被 raise 并被 except 捕获。"""
@@ -659,7 +676,11 @@ class TestEndToEndIntegration:
     """端到端集成测试 — 模拟实际错误返回链路。"""
 
     def test_full_flow_raise_app_error_and_serialize(self):
-        """完整流程:raise AppError → except → to_dict → JSON 序列化。"""
+        """完整流程:raise AppError → except → to_dict → JSON 序列化。
+
+        R55 §17: to_dict 返回精简格式(无 message/params/timestamp),
+        message 渲染通过 err.envelope.message 访问,params 过滤后放入 safe_params。
+        """
         import json
         from services.error_codes import AppError, ErrorCodes
 
@@ -676,14 +697,24 @@ class TestEndToEndIntegration:
             serialized = json.dumps(response_dict, ensure_ascii=False)
             deserialized = json.loads(serialized)
 
-            # 验证字段完整
+            # R55 §17 精简格式字段验证
             assert deserialized["code"] == ErrorCodes.DELIVERY_SEND_FLOOD_WAIT
             assert deserialized["trace_id"] == "trace-e2e-001"
             assert deserialized["retryable"] is True
-            assert "60" in deserialized["message"]  # wait_seconds 渲染
-            # secret 应被过滤
-            assert "secret" not in deserialized["params"]
+            assert deserialized["severity"] == "warning"  # DELIVERY_SEND_FLOOD_WAIT severity
+            assert "message_key" in deserialized
+            assert isinstance(deserialized["safe_params"], dict)
+            # R55 §17: 精简格式不应包含 message/params/timestamp
+            assert "message" not in deserialized
+            assert "params" not in deserialized
+            assert "timestamp" not in deserialized
+            # secret 应被 is_safe_param 过滤(key 匹配 _SENSITIVE_KEY_PATTERNS)
+            assert "secret" not in deserialized["safe_params"]
             assert "leak" not in serialized
+            # wait_seconds 应保留在 safe_params 中(非敏感字段)
+            assert deserialized["safe_params"].get("wait_seconds") == 60
+            # envelope.message 仍可访问完整 i18n 渲染
+            assert "60" in err.envelope.message
 
     @pytest.mark.asyncio
     async def test_full_flow_with_audit_log(self, cache_store_with_audit_log):

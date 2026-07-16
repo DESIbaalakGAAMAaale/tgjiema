@@ -18,6 +18,7 @@
   未安装时通过 sys.modules 注入 mock 跳过(保持测试可在最小依赖下运行)
 """
 import ast
+import json
 import sys
 import types
 from pathlib import Path
@@ -359,7 +360,13 @@ class TestP03StrictDurabilityError:
         assert "DurabilityError" in body
         # 不应在 upload_id 为空时静默 return(原版本)
         # 检查 if not upload_id 分支不再有 return(应有 raise DurabilityError)
-        assert "missing upload_id" in body.lower(), (
+        # R55 i18n: 错误消息已迁移到 locale 文件 bot.up.s4,检查源码或 locale
+        locale_path = PROJECT_ROOT / "locales" / "zh-CN.json"
+        locale_data = json.loads(locale_path.read_text(encoding="utf-8"))
+        locale_msg = locale_data.get("bot", {}).get("up", {}).get("s4", "")
+        assert "missing upload_id" in body.lower() or (
+            "_i18n_t('bot.up.s4'" in body and "missing upload_id" in locale_msg
+        ), (
             "upload_id 为空时应抛 DurabilityError('missing upload_id'),不再静默 return"
         )
 

@@ -113,7 +113,7 @@ async def _insert_collection(store, owner_id: int, name: str = "test_coll") -> i
 
 async def _insert_command_execution(
     store, action_id: str, principal_id: int, status: str = "approved",
-    request_hash: str = "",
+    request_hash: str = "a" * 64,
 ):
     """插入测试 command_executions 记录(用于审批验证)。
 
@@ -181,7 +181,8 @@ class TestR53P0_4CollectionRealApproval:
                 collection_id=coll_id,
                 name="updated",
                 principal_id=1001,
-                request_hash="hash_001",
+                request_hash="a" * 64,
+                target_version=1,
                 approval_action_id="",  # 空字符串
                 caller="test_migration",
             )
@@ -207,7 +208,8 @@ class TestR53P0_4CollectionRealApproval:
                 collection_id=coll_id,
                 name="updated",
                 principal_id=1002,
-                request_hash="hash_002",
+                request_hash="a" * 64,
+                target_version=1,
                 approval_action_id="foo",  # 任意字符串,无对应记录
                 caller="test_migration",
             )
@@ -228,7 +230,7 @@ class TestR53P0_4CollectionRealApproval:
         # 插入 status='pending' 的审批记录
         await _insert_command_execution(
             real_store, "approval_pending_003", principal_id=1003,
-            status="pending", request_hash="hash_003",
+            status="pending", request_hash="a" * 64,
         )
 
         with pytest.raises(AppError) as exc_info:
@@ -236,7 +238,8 @@ class TestR53P0_4CollectionRealApproval:
                 collection_id=coll_id,
                 name="updated",
                 principal_id=1003,
-                request_hash="hash_003",
+                request_hash="a" * 64,
+                target_version=1,
                 approval_action_id="approval_pending_003",
                 caller="test_migration",
             )
@@ -257,7 +260,7 @@ class TestR53P0_4CollectionRealApproval:
         # 审批记录的 principal_id=2004(他人审批)
         await _insert_command_execution(
             real_store, "approval_principal_004", principal_id=2004,
-            status="approved", request_hash="hash_004",
+            status="approved", request_hash="a" * 64,
         )
 
         with pytest.raises(AppError) as exc_info:
@@ -265,7 +268,8 @@ class TestR53P0_4CollectionRealApproval:
                 collection_id=coll_id,
                 name="updated",
                 principal_id=1004,  # 调用方 principal_id=1004,与审批记录 2004 不匹配
-                request_hash="hash_004",
+                request_hash="a" * 64,
+                target_version=1,
                 approval_action_id="approval_principal_004",
                 caller="test_migration",
             )
@@ -285,10 +289,10 @@ class TestR53P0_4CollectionRealApproval:
         from services.error_codes import AppError, ErrorCodes
 
         coll_id = await _insert_collection(real_store, owner_id=1005, name="coll_hash")
-        # 审批记录的 request_hash="stored_hash_005"
+        # 审批记录的 request_hash="a"*64(64 位 hex)
         await _insert_command_execution(
             real_store, "approval_hash_005", principal_id=1005,
-            status="approved", request_hash="stored_hash_005",
+            status="approved", request_hash="a" * 64,
         )
 
         with pytest.raises(AppError) as exc_info:
@@ -296,7 +300,8 @@ class TestR53P0_4CollectionRealApproval:
                 collection_id=coll_id,
                 name="updated",
                 principal_id=1005,
-                request_hash="tampered_hash_999",  # 篡改的 hash,前 16 字符也不匹配
+                request_hash="b" * 64,  # 篡改的 hash,与存储的 'a'*64 完全不同
+                target_version=1,
                 approval_action_id="approval_hash_005",
                 caller="test_migration",
             )
@@ -316,7 +321,7 @@ class TestR53P0_4CollectionRealApproval:
         # 插入 status='executed' 的审批记录(已被执行)
         await _insert_command_execution(
             real_store, "approval_executed_006", principal_id=1006,
-            status="executed", request_hash="hash_006",
+            status="executed", request_hash="a" * 64,
         )
 
         with pytest.raises(AppError) as exc_info:
@@ -324,7 +329,8 @@ class TestR53P0_4CollectionRealApproval:
                 collection_id=coll_id,
                 name="updated",
                 principal_id=1006,
-                request_hash="hash_006",
+                request_hash="a" * 64,
+                target_version=1,
                 approval_action_id="approval_executed_006",
                 caller="test_migration",
             )
@@ -343,7 +349,7 @@ class TestR53P0_4CollectionRealApproval:
         # 插入有效审批记录(status='approved')
         await _insert_command_execution(
             real_store, "approval_valid_007", principal_id=1007,
-            status="approved", request_hash="hash_007_valid",
+            status="approved", request_hash="a" * 64,
         )
 
         # 执行 bypass 更新
@@ -352,7 +358,8 @@ class TestR53P0_4CollectionRealApproval:
             name="updated_name_007",
             description="updated_desc_007",
             principal_id=1007,
-            request_hash="hash_007_valid",
+            request_hash="a" * 64,
+            target_version=1,
             approval_action_id="approval_valid_007",
             caller="test_migration_007",
         )
@@ -391,7 +398,7 @@ class TestR53P0_4CollectionRealApproval:
         # 插入有效审批记录
         await _insert_command_execution(
             real_store, "approval_audit_fail_008", principal_id=1008,
-            status="approved", request_hash="hash_008_audit",
+            status="approved", request_hash="a" * 64,
         )
 
         # 模拟 audit_log INSERT 失败:patch store._db.execute
@@ -409,7 +416,8 @@ class TestR53P0_4CollectionRealApproval:
                     collection_id=coll_id,
                     name="should_not_persist",
                     principal_id=1008,
-                    request_hash="hash_008_audit",
+                    request_hash="a" * 64,
+                    target_version=1,
                     approval_action_id="approval_audit_fail_008",
                     caller="test_migration_008",
                 )
@@ -445,7 +453,7 @@ class TestR53P0_4CollectionRealApproval:
         # 插入审批记录(principal_id=2009,与调用方 1009 不匹配)
         await _insert_command_execution(
             real_store, "approval_no_side_009", principal_id=2009,
-            status="approved", request_hash="hash_009",
+            status="approved", request_hash="a" * 64,
         )
 
         # 调用 bypass(应因 principal_id 不匹配被拒绝)
@@ -455,7 +463,8 @@ class TestR53P0_4CollectionRealApproval:
                 collection_id=coll_id,
                 name="should_not_be_applied",
                 principal_id=1009,  # 与审批记录 2009 不匹配
-                request_hash="hash_009",
+                request_hash="a" * 64,
+                target_version=1,
                 approval_action_id="approval_no_side_009",
                 caller="test_migration_009",
             )

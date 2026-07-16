@@ -33,6 +33,7 @@ from loguru import logger
 
 from database.cache_store import get_cache_store
 from services.rbac import check_permission, PERMISSION_APPROVE_TAKEDOWN
+from services.i18n import translate as _i18n_t
 
 
 # ─── 需要审批的操作 ────────────────────────────────────────────
@@ -72,15 +73,15 @@ _ACTIONS_REQUIRING_APPROVAL = {
 
 # ─── 操作中文描述(用于格式化展示) ─────────────────────────────
 _ACTION_LABELS = {
-    APPROVAL_ACTION_TAKEDOWN: "内容下架",
-    APPROVAL_ACTION_BAN: "封禁用户",
-    APPROVAL_ACTION_RESTORE: "恢复删除",
-    APPROVAL_ACTION_CONFIG_CHANGE: "配置变更",
-    APPROVAL_ACTION_DELETE_DATA: "删除数据",
-    APPROVAL_ACTION_FACTORY_RESET: "恢复出厂设置",
-    APPROVAL_ACTION_MAINTENANCE_ENABLE: "开启维护模式",
-    APPROVAL_ACTION_MAINTENANCE_DISABLE: "关闭维护模式",
-    APPROVAL_ACTION_RBAC_ASSIGN: "分配角色",
+    APPROVAL_ACTION_TAKEDOWN: _i18n_t('services.approval_workflow.s1'),
+    APPROVAL_ACTION_BAN: _i18n_t('services.approval_workflow.s2'),
+    APPROVAL_ACTION_RESTORE: _i18n_t('services.approval_workflow.s3'),
+    APPROVAL_ACTION_CONFIG_CHANGE: _i18n_t('services.approval_workflow.s4'),
+    APPROVAL_ACTION_DELETE_DATA: _i18n_t('services.approval_workflow.s5'),
+    APPROVAL_ACTION_FACTORY_RESET: _i18n_t('services.approval_workflow.s6'),
+    APPROVAL_ACTION_MAINTENANCE_ENABLE: _i18n_t('services.approval_workflow.s7'),
+    APPROVAL_ACTION_MAINTENANCE_DISABLE: _i18n_t('services.approval_workflow.s8'),
+    APPROVAL_ACTION_RBAC_ASSIGN: _i18n_t('services.approval_workflow.s9'),
 }
 
 
@@ -816,9 +817,9 @@ async def format_approval(approval: dict) -> str:
         格式化的审批信息字符串
     """
     approval_id = approval.get("id", "?")
-    action = approval.get("action", "未知")
+    action = approval.get("action", _i18n_t('services.approval_workflow.s10'))
     action_label = _ACTION_LABELS.get(action, action)
-    status = approval.get("status", "未知")
+    status = approval.get("status", _i18n_t('services.approval_workflow.s11'))
     created_by = approval.get("created_by", "?")
     created_at = approval.get("created_at", "?")
     approver_id = approval.get("approver_id")
@@ -828,33 +829,33 @@ async def format_approval(approval: dict) -> str:
 
     # 状态中文映射
     status_labels = {
-        APPROVAL_STATUS_PENDING: "⏳ 待审批",
-        APPROVAL_STATUS_APPROVED: "✅ 已批准",
-        APPROVAL_STATUS_REJECTED: "❌ 已驳回",
-        APPROVAL_STATUS_CANCELLED: "🚫 已取消",
-        APPROVAL_STATUS_EXECUTING: "🔄 执行中",
-        APPROVAL_STATUS_EXECUTED: "✅ 已执行",
-        APPROVAL_STATUS_FAILED: "⚠️ 执行失败",
+        APPROVAL_STATUS_PENDING: _i18n_t('services.approval_workflow.s12'),
+        APPROVAL_STATUS_APPROVED: _i18n_t('services.approval_workflow.s13'),
+        APPROVAL_STATUS_REJECTED: _i18n_t('services.approval_workflow.s14'),
+        APPROVAL_STATUS_CANCELLED: _i18n_t('services.approval_workflow.s15'),
+        APPROVAL_STATUS_EXECUTING: _i18n_t('services.approval_workflow.s16'),
+        APPROVAL_STATUS_EXECUTED: _i18n_t('services.approval_workflow.s17'),
+        APPROVAL_STATUS_FAILED: _i18n_t('services.approval_workflow.s18'),
     }
     status_text = status_labels.get(status, status)
 
     lines = [
-        f"审批 ID: {approval_id}",
-        f"操作类型: {action_label} ({action})",
-        f"状态: {status_text}",
-        f"发起人: {created_by}",
-        f"创建时间: {created_at}",
+        _i18n_t('services.approval_workflow.s19', approval_id=approval_id),
+        _i18n_t('services.approval_workflow.s20', action_label=action_label, action=action),
+        _i18n_t('services.approval_workflow.s21', status_text=status_text),
+        _i18n_t('services.approval_workflow.s22', created_by=created_by),
+        _i18n_t('services.approval_workflow.s23', created_at=created_at),
     ]
 
     if payload:
-        lines.append(f"参数: {json.dumps(payload, ensure_ascii=False, default=str)}")
+        lines.append(_i18n_t('services.approval_workflow.s24', json_dumps_payload_ensure_ascii_False_default_str=json.dumps(payload, ensure_ascii=False, default=str)))
 
     if approver_id is not None:
-        lines.append(f"审批人: {approver_id}")
+        lines.append(_i18n_t('services.approval_workflow.s25', approver_id=approver_id))
     if approver_note:
-        lines.append(f"审批备注: {approver_note}")
+        lines.append(_i18n_t('services.approval_workflow.s26', approver_note=approver_note))
     if resolved_at:
-        lines.append(f"处理时间: {resolved_at}")
+        lines.append(_i18n_t('services.approval_workflow.s27', resolved_at=resolved_at))
 
     return "\n".join(lines)
 
