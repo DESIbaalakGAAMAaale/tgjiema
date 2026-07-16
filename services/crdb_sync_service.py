@@ -613,7 +613,14 @@ async def _sync_loop(name: str, sync_func, get_dirty_func, mark_synced_func):
             logger.warning(f"[crdb_sync] {name} 同步异常: {e}")
             # R37 P0-3: 异常时指数退避(不快速重试)
             backoff = min(backoff * 2, MAX_BACKOFF)
-        await asyncio.sleep(backoff)
+        # R56 §7.2.3: 事件驱动唤醒 — 替代固定 asyncio.sleep
+        # 收到 dirty 信号立即唤醒(毫秒级响应),超时继续退避
+        # Redis 不可用时 fallback 到 asyncio.sleep(保持原 polling 行为)
+        from services.crdb_sync_event_wakeup import wait_dirty_signal
+        signaled = await wait_dirty_signal(backoff)
+        if signaled:
+            # 收到信号:可能有新 dirty,重置退避立即处理
+            backoff = DEFAULT_SYNC_INTERVAL
 
 
 async def _leader_renewal_task():

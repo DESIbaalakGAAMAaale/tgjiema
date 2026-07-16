@@ -427,6 +427,32 @@ class TestP1_1_DataLifecycleStateMachine:
              request_hash, 1, now_iso, now_iso, now_iso, 1),
         )
         await real_store._db.commit()
+        # R56 P0-2: 插入 command_approvals 表 2 条 break_glass 审批记录(双人审批)
+        # 要求:≥2 个不同 approver + mfa_receipt 非空 + 非自审批(≠ principal_id=1)
+        await real_store._db.execute(
+            "CREATE TABLE IF NOT EXISTS command_approvals ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "action_id TEXT NOT NULL, "
+            "approver_id BIGINT NOT NULL, "
+            "approval_type TEXT NOT NULL, "
+            "mfa_receipt TEXT, "
+            "approved_at TEXT NOT NULL, "
+            "metadata_json TEXT, "
+            "UNIQUE(action_id, approver_id))"
+        )
+        await real_store._db.execute(
+            "INSERT INTO command_approvals "
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL)",
+            (approval_action_id, 2, "mfa_receipt_approver_2", now_iso),
+        )
+        await real_store._db.execute(
+            "INSERT INTO command_approvals "
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL)",
+            (approval_action_id, 3, "mfa_receipt_approver_3", now_iso),
+        )
+        await real_store._db.commit()
 
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,

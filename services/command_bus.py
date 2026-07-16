@@ -1983,6 +1983,137 @@ HIGH_RISK_COMMAND_REGISTRY: dict[str, tuple[str, str, bool]] = {
 }
 
 
+# ─── R56 P1-1: CommandSpec registry + 服务端 canonical hash ──────
+# CommandSpec 描述每个命令的规范参数 schema,服务端基于此重算 canonical hash,
+# 防止客户端篡改 request_hash(只信任服务端重算的结果)。
+# canonical_params:参与 hash 计算的参数名列表(其他参数被忽略),
+#                   None 表示全部参数参与(向后兼容)
+
+
+@dataclass
+class CommandSpec:
+    """R56 P1-1: 命令规范定义(用于服务端 canonical hash 重算)。
+
+    Attributes:
+        action: 命令标识(如 "takedown_report")
+        permission: RBAC 权限标识
+        approval_action: 审批 workflow action 名(无审批则为 "")
+        requires_approval: 是否需要审批
+        canonical_params: 参与 canonical hash 计算的参数名列表(None=全部参数)
+    """
+    action: str
+    permission: str
+    approval_action: str
+    requires_approval: bool
+    canonical_params: tuple[str, ...] | None = None
+
+
+# R56 P1-1: CommandSpec registry — 注册所有高风险命令的规范参数 schema
+# 服务端 claim_execution_approved 可基于此重算 canonical hash 并与存储的比较
+COMMAND_SPEC_REGISTRY: dict[str, CommandSpec] = {
+    "takedown_report": CommandSpec(
+        action="takedown_report",
+        permission=PERM_CONTENT_TAKEDOWN,
+        approval_action=APPROVAL_ACTION_TAKEDOWN,
+        requires_approval=True,
+        canonical_params=("target_type", "target_id", "reason"),
+    ),
+    "ban_user": CommandSpec(
+        action="ban_user",
+        permission=PERM_USERS_BAN,
+        approval_action=APPROVAL_ACTION_BAN,
+        requires_approval=True,
+        canonical_params=("user_id", "reason", "duration_days"),
+    ),
+    "restore_backup": CommandSpec(
+        action="restore_backup",
+        permission=PERM_DISASTER_RESTORE,
+        approval_action=APPROVAL_ACTION_RESTORE,
+        requires_approval=True,
+        canonical_params=("backup_id", "tables", "merge"),
+    ),
+    "enable_maintenance": CommandSpec(
+        action="enable_maintenance",
+        permission=PERM_MAINTENANCE_ENABLE,
+        approval_action=APPROVAL_ACTION_MAINTENANCE_ENABLE,
+        requires_approval=True,
+        canonical_params=("reason",),
+    ),
+    "disable_maintenance": CommandSpec(
+        action="disable_maintenance",
+        permission=PERM_MAINTENANCE_DISABLE,
+        approval_action=APPROVAL_ACTION_MAINTENANCE_DISABLE,
+        requires_approval=True,
+        canonical_params=(),
+    ),
+    "purge_data": CommandSpec(
+        action="purge_data",
+        permission=PERM_DATA_PURGE,
+        approval_action=APPROVAL_ACTION_DELETE_DATA,
+        requires_approval=True,
+        canonical_params=("table_names",),
+    ),
+    "assign_role": CommandSpec(
+        action="assign_role",
+        permission=PERM_RBAC_ASSIGN,
+        approval_action=APPROVAL_ACTION_RBAC_ASSIGN,
+        requires_approval=True,
+        canonical_params=("user_id", "role_name"),
+    ),
+    "factory_reset": CommandSpec(
+        action="factory_reset",
+        permission=PERM_DATA_PURGE,
+        approval_action=APPROVAL_ACTION_FACTORY_RESET,
+        requires_approval=True,
+        canonical_params=("tables",),
+    ),
+    "data_lifecycle_break_glass": CommandSpec(
+        action="data_lifecycle_break_glass",
+        permission=PERM_DATA_PURGE,
+        approval_action="",
+        requires_approval=True,
+        canonical_params=("batch_size", "skip_backup_check"),
+    ),
+}
+
+
+def _compute_canonical_request_hash(
+    command_type: str,
+    params: dict,
+    principal_id: int = 0,
+) -> str:
+    """R56 P1-1: 服务端基于 CommandSpec 重算 canonical hash。
+
+    根据 COMMAND_SPEC_REGISTRY 中 command_type 的 canonical_params 过滤参数,
+    仅保留规范参数后计算 SHA256(防篡改)。
+    若 command_type 不在 registry 中,回退到全量参数计算(向后兼容)。
+
+    Args:
+        command_type: 命令类型(对应 command_executions.command_type)
+        params: 命令参数字典
+        principal_id: 操作者 ID(纳入 hash 绑定,防跨 principal 复用)
+
+    Returns:
+        完整 SHA256 hex 字符串(64 字符)
+    """
+    spec = COMMAND_SPEC_REGISTRY.get(command_type)
+    if spec is not None and spec.canonical_params is not None:
+        # 仅保留 canonical_params 中列出的参数(过滤无关字段)
+        filtered = {k: params.get(k) for k in spec.canonical_params if k in params}
+    else:
+        # 未注册命令:回退到全量参数(向后兼容,但会记录 warning)
+        logger.warning(
+            f"[CommandBus] R56 P1-1: command_type='{command_type}' "
+            f"未在 COMMAND_SPEC_REGISTRY 注册,回退到全量参数 hash"
+        )
+        filtered = dict(params)
+    canonical_str = json.dumps(
+        {"command_type": command_type, "params": filtered, "principal_id": principal_id},
+        sort_keys=True, ensure_ascii=False, default=str,
+    )
+    return hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
+
+
 def _resolve_command_for_action(action: str, params: dict) -> Command | None:
     """根据 action 名称通过工厂函数构造 Command 对象(含 handler)。
 

@@ -142,6 +142,42 @@ jobs:
         # exit-zero treats all errors as warnings
         flake8 . --count --exit-zero --max-complexity=20 --max-line-length=120 --statistics --exclude=.git,__pycache__,docs
 
+  # R56 §10: Repository hygiene — 禁止生成产物/审查报告入库
+  repo-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - name: Check for forbidden generated artifacts
+      run: |
+        # R56 §10: 禁止 check_output.txt / classify.txt 等生成产物入库
+        FORBIDDEN_FILES=(
+          "check_output.txt"
+          "classify.txt"
+        )
+        FOUND=""
+        for f in "${FORBIDDEN_FILES[@]}"; do
+          if git ls-files --error-unmatch "$f" 2>/dev/null; then
+            FOUND="$FOUND $f"
+          fi
+        done
+        if [ -n "$FOUND" ]; then
+          echo "ERROR: 以下生成产物已被 git 追踪,必须移除:$FOUND"
+          echo "请执行: git rm --cached <file> 并添加到 .gitignore"
+          exit 1
+        fi
+        echo "PASS: 未发现禁止入库的生成产物"
+    - name: Check for leaked review reports
+      run: |
+        # R56 §10: 审查报告不得上传 GitHub(仅本地参考)
+        LEAKED=$(git ls-files | grep -iE '(审查|终审|评估报告|路线图)' || true)
+        if [ -n "$LEAKED" ]; then
+          echo "ERROR: 以下审查报告已被 git 追踪,必须移除:"
+          echo "$LEAKED"
+          echo "请执行: git rm --cached <file> 并添加到 .gitignore"
+          exit 1
+        fi
+        echo "PASS: 未发现泄露的审查报告"
+
   # R48 P0-1: i18n 校验独立 job,避免 lint job 缺依赖导致 verify_i18n_keys.py ImportError
   # 同时确保 key consistency 失败不跳过 hardcoded scan(独立 job 各自失败不影响)
   i18n-check:
@@ -199,6 +235,14 @@ jobs:
     # Scanner 3: critical effect 必须显式传入 action_id + params
     - name: Check effect receipt coverage (critical effect action_id + params)
       run: python scripts/check_effect_receipt_coverage.py
+    # R56 P0-6 Scanner 4: password 参数安全检查(禁止进入 f-string/print/logger)
+    - name: Check password safety (AST scan, no password in f-string/print/logger)
+      run: python scripts/check_password_safety.py --strict
+    # R56 P1-5 Scanner 5: 错误协议边界检查(禁止 except pass/裸 return/未登记错误码)
+    # 使用 baseline 模式:ratchet 下降 pre-existing fail-open 债务(349 处),
+    # 只允许减少不允许新增。修复后运行 --generate-baseline 下降基线。
+    - name: Check error protocol (AST scan, no except pass/bare return/unregistered codes)
+      run: python scripts/check_error_protocol.py --baseline scripts/error_protocol_baseline.json
 
   # R40 P2-1: 安全扫描(bandit)
   security:

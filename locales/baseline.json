@@ -1,8 +1,8 @@
 {
-  "_description": "R48 P1-c: 模块化 i18n 硬编码字符串 baseline(scope 审批 + delta + classify)",
-  "_note": "由 --generate-baseline / --ratchet 维护;total 只允许非增加(下降或持平)。R48: scope 变化需 --allow-scope-change;CI 用 --delta 比对 base/head;--classify 区分 user_visible(清零目标 0) 与 log_only(鼓励减少)。",
+  "_description": "R48 P1-c / R56 §5.1: 模块化 i18n 硬编码字符串 baseline(scope 审批 + delta + classify + 绝对门禁)",
+  "_note": "R56 §5.1 绝对门禁:user_visible 必须 0(不允许通过更新 baseline 消除失败,必须接入 i18n);log_only 走 ratchet(只允许非增加)。R48: scope 变化需 --allow-scope-change;CI 用 --delta 比对 base/head;--classify 区分 user_visible(清零目标 0) 与 log_only(鼓励减少)。",
   "_original_r44_baseline": 954,
-  "scanner_version": "2.0",
+  "scanner_version": "2.1",
   "included_paths": [
     "bots/up_bot.py",
     "bots/idx_bot.py",
@@ -18,20 +18,20 @@
     "bots/up_bot.py": {
       "baseline": 4,
       "target": 0,
-      "user_visible": 4,
-      "log_only": 0
+      "user_visible": 0,
+      "log_only": 4
     },
     "bots/idx_bot.py": {
       "baseline": 15,
       "target": 0,
-      "user_visible": 15,
-      "log_only": 0
+      "user_visible": 0,
+      "log_only": 15
     },
     "bots/dsp_bot.py": {
       "baseline": 5,
       "target": 0,
-      "user_visible": 5,
-      "log_only": 0
+      "user_visible": 0,
+      "log_only": 5
     },
     "bots/mon_bot.py": {
       "baseline": 0,
@@ -42,14 +42,14 @@
     "bots/admin_bot/": {
       "baseline": 23,
       "target": 0,
-      "user_visible": 23,
-      "log_only": 0
+      "user_visible": 0,
+      "log_only": 23
     },
     "admin/": {
       "baseline": 1,
       "target": 0,
-      "user_visible": 1,
-      "log_only": 0
+      "user_visible": 0,
+      "log_only": 1
     },
     "admin/templates/": {
       "baseline": 0,
@@ -66,16 +66,16 @@
     "services/": {
       "baseline": 24,
       "target": 0,
-      "user_visible": 24,
-      "log_only": 0
+      "user_visible": 0,
+      "log_only": 22
     }
   },
   "total": {
     "baseline": 72,
     "target": 0,
-    "user_visible": 72,
-    "log_only": 0
+    "user_visible": 0,
+    "log_only": 70
   },
   "last_updated": "2026-07-16",
-  "last_updated_by": "R52 P0-5/P1-1/P1-4/P1-5/P1-7/P1-8 整改: 新增 CommandBus 状态机/entitlements/collections/CF Worker 两阶段去重相关日志字符串"
+  "last_updated_by": "R56 §5.1: 绝对门禁改造 — user_visible 必须 0(将 prometheus_exporter healthz 详情 + admin/passwords RuntimeError 消息接入英文);baseline 由 72 拆分为 user_visible=0/log_only=70"
 }

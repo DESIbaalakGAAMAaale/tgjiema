@@ -971,9 +971,14 @@ _DURABLE_LEASE_TIMEOUT_SECONDS = 60.0
 
 def _compute_request_hash(op_type: str, table: str, method_name: str,
                           data: dict, redis_key: str = "") -> str:
-    """R52 P1-1: 计算 producer 请求的 payload hash(SHA256 hex 前 16 字符)。
+    """R52 P1-1: 计算 producer 请求的 payload hash(SHA256 完整 64 hex)。
 
     用于检测同一 message_id 是否携带不同 payload(防篡改/防静默忽略)。
+
+    R56 P1-3 整改:
+        - 返回完整 64 位 SHA256 hex(原返回前 16 字符,碰撞风险高)
+        - 旧 16 字符 hash 通过 ``_hash_matches`` 兼容比较
+        - 新记录存储 request_hash_v2(64 hex),旧字段 request_hash 保留 16 字符兼容
 
     Args:
         op_type: 操作类型
@@ -983,7 +988,7 @@ def _compute_request_hash(op_type: str, table: str, method_name: str,
         redis_key: 关联的 Redis 缓存 key
 
     Returns:
-        SHA256 hex 字符串前 16 字符(短指纹,够用且节省存储)
+        完整 SHA256 hex 字符串(64 字符)
     """
     import hashlib
     canonical = json.dumps({
@@ -993,7 +998,29 @@ def _compute_request_hash(op_type: str, table: str, method_name: str,
         "data": data,
         "redis_key": redis_key or "",
     }, sort_keys=True, default=str, ensure_ascii=False)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _hash_matches(stored_hash: str, recomputed_hash: str) -> bool:
+    """R56 P1-3: 兼容比较 stored_hash 与 recomputed_hash。
+
+    旧记录 stored_hash 为 16 字符前缀,新记录为完整 64 hex。
+    - stored_hash 长度 == 16:比较 recomputed_hash[:16](向后兼容)
+    - stored_hash 长度 == 64:完整比较
+    - 其他长度:完整比较(默认 fail-closed)
+
+    Args:
+        stored_hash: 数据库存储的 hash(16 或 64 字符)
+        recomputed_hash: 重新计算的完整 64 hex hash
+
+    Returns:
+        True 表示匹配;False 表示不匹配
+    """
+    if not stored_hash or not recomputed_hash:
+        return False
+    if len(stored_hash) == 16:
+        return recomputed_hash[:16] == stored_hash
+    return recomputed_hash == stored_hash
 
 
 def _get_durable_init_lock():
@@ -1302,7 +1329,8 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
                     op_type, table_name, method_name, parsed_data,
                     redis_key or "",
                 )
-                if stored_hash and recomputed_hash != stored_hash:
+                # R56 P1-3: 使用 _hash_matches 兼容旧 16 字符 hash
+                if stored_hash and not _hash_matches(stored_hash, recomputed_hash):
                     # R53 P1-2: hash 不匹配 → CAS 标记 quarantined(终止热循环)
                     # 原 continue 保持 pending,下一轮 replay 会再次读取、
                     # 再次校验、再次报错,形成永久日志风暴和 CPU/磁盘消耗
@@ -1501,6 +1529,7 @@ async def quarantine_repair(
         )
 
     # R55 P0-4: delete 强制双人审批(expected_approver_id > 0)
+    # R56 P0-4: 双人审批必须持久化到 command_approvals 表(不再仅靠参数校验)
     if action == "delete":
         if not expected_approver_id or int(expected_approver_id) <= 0:
             raise AppError(
@@ -1544,6 +1573,99 @@ async def quarantine_repair(
                 "method": f"quarantine_repair:{action}",
             },
         )
+
+    # R56 P0-4: delete 场景查询 command_approvals 表验证双人审批持久化证据
+    # 要求 ≥2 个不同 approver,每个有 mfa_receipt,且都不能是 expected_principal_id
+    if action == "delete":
+        try:
+            await _store._db.execute(
+                """CREATE TABLE IF NOT EXISTS command_approvals (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action_id       TEXT NOT NULL,
+                    approver_id     BIGINT NOT NULL,
+                    approval_type   TEXT NOT NULL,
+                    mfa_receipt     TEXT,
+                    approved_at     TEXT NOT NULL,
+                    metadata_json   TEXT,
+                    UNIQUE(action_id, approver_id)
+                )"""
+            )
+            await _store._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_command_approvals_action_id "
+                "ON command_approvals(action_id)"
+            )
+            await _store._db.commit()
+        except Exception as _ct_err:
+            logger.warning(
+                f"[RedisQueue] R56 P0-4: command_approvals 表创建失败(继续查询): {_ct_err}"
+            )
+        try:
+            _appr_rows = await _store._db.execute_fetchall(
+                "SELECT approver_id, mfa_receipt FROM command_approvals "
+                "WHERE action_id = ? AND approval_type = 'quarantine_delete'",
+                (approval_action_id,),
+            )
+        except Exception as _q_err:
+            raise AppError(
+                ErrorCodes.APPROVAL_STATE_INVALID,
+                params={
+                    "approval_id": approval_action_id,
+                    "reason": f"two_person_query_failed: {type(_q_err).__name__}: {_q_err}",
+                },
+            ) from _q_err
+        if not _appr_rows or len(_appr_rows) < 2:
+            raise AppError(
+                ErrorCodes.APPROVAL_STATE_INVALID,
+                params={
+                    "approval_id": approval_action_id,
+                    "reason": "two_person_approval_not_persisted",
+                    "current_approvers": len(_appr_rows) if _appr_rows else 0,
+                    "required": 2,
+                },
+            )
+        _db_approver_ids = set()
+        for _ar in _appr_rows:
+            _db_aid = int(_ar[0] or 0)
+            _mfa = str(_ar[1] or "")
+            if not _mfa:
+                raise AppError(
+                    ErrorCodes.APPROVAL_STATE_INVALID,
+                    params={
+                        "approval_id": approval_action_id,
+                        "reason": "mfa_receipt_missing",
+                        "approver_id": _db_aid,
+                    },
+                )
+            if _db_aid == int(expected_principal_id):
+                raise AppError(
+                    ErrorCodes.APPROVAL_STATE_INVALID,
+                    params={
+                        "approval_id": approval_action_id,
+                        "reason": "self_approval_forbidden",
+                        "principal_id": expected_principal_id,
+                    },
+                )
+            _db_approver_ids.add(_db_aid)
+        if len(_db_approver_ids) < 2:
+            raise AppError(
+                ErrorCodes.APPROVAL_STATE_INVALID,
+                params={
+                    "approval_id": approval_action_id,
+                    "reason": "two_distinct_approvers_required",
+                    "distinct_approvers": len(_db_approver_ids),
+                },
+            )
+        # R56 P0-4: expected_approver_id 必须在持久化的 approver 中
+        if int(expected_approver_id) not in _db_approver_ids:
+            raise AppError(
+                ErrorCodes.APPROVAL_STATE_INVALID,
+                params={
+                    "approval_id": approval_action_id,
+                    "reason": "expected_approver_not_in_persisted_approvers",
+                    "expected_approver_id": expected_approver_id,
+                    "persisted_approvers": list(_db_approver_ids),
+                },
+            )
 
     # R55 P0-4: 先拉取 quarantined 记录(绑定 row_id + message_id + 旧 Hash)
     # 用于绑定到 request_hash(防审批与记录错位)

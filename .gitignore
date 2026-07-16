@@ -61,3 +61,9 @@ tests/e2e/test-results/
 tests/e2e/e2e-results/
 tests/e2e/package-lock.json
 tmp/
+
+# R56 §10: Repository hygiene — 生成产物禁止入库
+check_output.txt
+classify.txt
+*_review_output.txt
+*_classify_output.txt

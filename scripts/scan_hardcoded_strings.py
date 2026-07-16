@@ -63,7 +63,8 @@ from pathlib import Path
 # === 常量 ===
 
 # R48 P1-c: scanner 版本(scope/format 变化时递增)
-SCANNER_VERSION = "2.0"
+# R56 §5.1: 升级到 2.1(新增 user_visible/log_only 分类 + 绝对门禁)
+SCANNER_VERSION = "2.1"
 
 # 中文 Unicode 范围
 CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
@@ -600,13 +601,19 @@ def collect_findings_at_commit(root: Path, commit: str) -> list[tuple[str, int, 
 
 # === 命令实现 ===
 
-def cmd_check(module_counts: dict[str, int], baseline: dict) -> int:
-    """模块化门禁检查:任何模块超标或 total 超标 → 失败(退出码 1)。
+def cmd_check(
+    module_counts: dict[str, int],
+    baseline: dict,
+    findings=None,
+    root: Path | None = None,
+) -> int:
+    """模块化门禁检查 — R56 §5.1 绝对门禁:user_visible 必须 0。
 
-    - 任何模块当前 > baseline → 失败
-    - total 当前 > baseline.total → 失败
-    - 任何模块当前 < baseline → 提示运行 --ratchet 下降 baseline(不失败)
-    - R48: 额外输出距 target (0) 的差距
+    - R56 §5.1: user_visible 绝对门禁 — 任何模块 user_visible > 0 即 fail
+      (不允许通过更新 baseline 消除失败;只允许真正接入 i18n)
+    - log_only 仍走 baseline ratchet(只允许非增加)
+    - 任何模块 log_only 当前 > baseline.log_only → 失败
+    - 任何模块 log_only 当前 < baseline.log_only → 提示运行 --ratchet 下降
     """
     if not baseline:
         print(f"❌ 未找到模块 baseline: {MODULE_BASELINE_FILE}")
@@ -615,61 +622,114 @@ def cmd_check(module_counts: dict[str, int], baseline: dict) -> int:
         print("   并将 locales/baseline.json 提交到 git。")
         return 1
 
-    failed: list[tuple[str, int, int]] = []
-    decreased: list[tuple[str, int, int]] = []
-    for m in MODULE_KEYS:
-        cur = module_counts.get(m, 0)
-        base = _baseline_module_count(baseline, m)
-        if cur > base:
-            failed.append((m, cur, base))
-        elif cur < base:
-            decreased.append((m, cur, base))
+    # R56 §5.1: 基于 classify 计算 user_visible/log_only 计数(绝对门禁依据)
+    if findings is not None and root is not None:
+        classified = classify_findings(findings, root)
+    else:
+        # 兜底:未传 findings 时,从 module_counts 推算(假设全部为 user_visible)
+        classified = {
+            m: {'user_visible': module_counts.get(m, 0), 'log_only': 0}
+            for m in MODULE_KEYS
+        }
 
-    cur_total = sum(module_counts.get(m, 0) for m in MODULE_KEYS)
-    base_total = _baseline_total(baseline)
-    total_failed = cur_total > base_total
-
-    # 模块明细表(R48:含 target 列)
-    print("模块化 i18n 硬编码字符串门禁(--check)")
-    print(f"  {'模块':<22}{'当前':>7}{'baseline':>10}{'target':>8}{'距target':>10}{'状态':>6}")
+    # R56 §5.1 绝对门禁:user_visible 任何模块 > 0 即 fail
+    uv_failed: list[tuple[str, int]] = []
+    uv_total_count = 0
     for m in MODULE_KEYS:
-        cur = module_counts.get(m, 0)
-        base = _baseline_module_count(baseline, m)
-        target = 0  # R48: user_visible 清零目标
-        if cur > base:
-            status = '超标'
-        elif cur < base:
-            status = '已降'
+        uv = classified.get(m, {}).get('user_visible', 0)
+        uv_total_count += uv
+        if uv > 0:
+            uv_failed.append((m, uv))
+
+    # log_only baseline ratchet(允许持平/下降,不允许增加)
+    ll_failed: list[tuple[str, int, int]] = []
+    ll_decreased: list[tuple[str, int, int]] = []
+    for m in MODULE_KEYS:
+        ll = classified.get(m, {}).get('log_only', 0)
+        base_ll = 0
+        try:
+            mod_data = baseline.get("modules", {}).get(m, {})
+            if isinstance(mod_data, dict):
+                base_ll = int(mod_data.get("log_only", 0))
+        except Exception:
+            base_ll = 0
+        if ll > base_ll:
+            ll_failed.append((m, ll, base_ll))
+        elif ll < base_ll:
+            ll_decreased.append((m, ll, base_ll))
+
+    # 明细表(R56: 同时显示 user_visible + log_only + target)
+    print("R56 §5.1 i18n 绝对门禁(--check)")
+    print(f"  {'模块':<22}{'user_vis':>10}{'log_only':>10}"
+          f"{'base_uv':>10}{'base_ll':>10}{'target':>8}{'距target':>10}{'状态':>8}")
+    for m in MODULE_KEYS:
+        uv = classified.get(m, {}).get('user_visible', 0)
+        ll = classified.get(m, {}).get('log_only', 0)
+        try:
+            mod_data = baseline.get("modules", {}).get(m, {})
+            if isinstance(mod_data, dict):
+                base_uv = int(mod_data.get("user_visible", 0))
+                base_ll = int(mod_data.get("log_only", 0))
+                target = int(mod_data.get("target", 0))
+            else:
+                base_uv = int(mod_data) if mod_data else 0
+                base_ll = 0
+                target = 0
+        except Exception:
+            base_uv = 0
+            base_ll = 0
+            target = 0
+        gap_to_target = ll - target  # 距 target(0)的差距
+        if uv > 0:
+            status = 'UV_FAIL'
+        elif ll > base_ll:
+            status = 'LL_FAIL'
+        elif ll < base_ll:
+            status = 'LL_降'
         else:
-            status = '持平'
-        print(f"  {m:<22}{cur:>7}{base:>10}{target:>8}{cur - target:>10}{status:>6}")
-    print(f"  {'total':<22}{cur_total:>7}{base_total:>10}{0:>8}{cur_total:>10}"
-          f"{'超标' if total_failed else 'OK':>6}")
+            status = 'OK'
+        print(f"  {m:<22}{uv:>10}{ll:>10}{base_uv:>10}{base_ll:>10}"
+              f"{target:>8}{gap_to_target:>10}{status:>8}")
+    ll_total = sum(classified.get(m, {}).get('log_only', 0) for m in MODULE_KEYS)
+    total_target = 0
+    total_gap = ll_total - total_target
+    print(f"  {'total':<22}{uv_total_count:>10}{ll_total:>10}"
+          f"{_baseline_total(baseline):>10}{ll_total:>10}"
+          f"{total_target:>8}{total_gap:>10}"
+          f"{'UV_FAIL' if uv_total_count > 0 else 'OK':>8}")
     print(f"  (原 R44 baseline: {ORIGINAL_R44_BASELINE}, 仅覆盖 bots/+admin 范围)")
-    # R48: 显示 scanner_version 和 included_paths
     sv = baseline.get("scanner_version", "unknown")
     ip = baseline.get("included_paths", [])
     if not isinstance(ip, list):
         ip = []
     print(f"  (scanner_version: {sv}, included_paths: {len(ip)} 项)")
+    print(f"  (R56 §5.1 绝对门禁:user_visible 必须 0,不允许通过更新 baseline 消除失败)")
 
-    if failed:
-        print(f"\n❌ {len(failed)} 个模块超过 baseline:")
-        for m, cur, base in failed:
-            print(f"   {m}: {cur} > {base}(+{cur - base})")
-    if total_failed:
-        print(f"\n❌ total 超过 baseline: {cur_total} > {base_total}")
-    if failed or total_failed:
+    # R56 §5.1 绝对门禁判定
+    if uv_failed:
+        print(f"\n❌ R56 §5.1 绝对门禁失败: {len(uv_failed)} 个模块存在 user_visible 违规")
+        for m, uv in uv_failed:
+            print(f"   {m}: user_visible={uv} (必须为 0)")
+        print("\n请将中文文本接入 i18n(translate/format_message + locale 文件),")
+        print("而不是更新 baseline 消除失败。R56 §5.1 绝对门禁不允许此操作。")
+        return 1
+
+    # log_only baseline 检查
+    if ll_failed:
+        print(f"\n❌ {len(ll_failed)} 个模块 log_only 超过 baseline:")
+        for m, cur, base in ll_failed:
+            print(f"   {m}: log_only={cur} > baseline={base}(+{cur - base})")
         print("\n请修复新增的硬编码字符串并接入 i18n,而非扩大基线。")
         return 1
 
-    if decreased:
-        print(f"\n✓ {len(decreased)} 个模块已下降,建议运行 --ratchet 下降 baseline:")
-        for m, cur, base in decreased:
-            print(f"   {m}: {base} → {cur}(-{base - cur}, 距 target {cur})")
+    if ll_decreased:
+        print("\n✓ R56 §5.1 绝对门禁通过:user_visible=0,log_only 未超标。")
+        print(f"\n✓ {len(ll_decreased)} 个模块 log_only 已下降,建议运行 --ratchet 下降 baseline:")
+        for m, cur, base in ll_decreased:
+            print(f"   {m}: log_only {base} → {cur}(-{base - cur})  距target={cur}")
         print("   鼓励每次 PR 至少下降 1 个模块的 baseline,直至清零。")
     else:
-        print("\n✓ 所有模块均未超标(模块化 baseline 门禁通过)。")
+        print("\n✓ R56 §5.1 绝对门禁通过:user_visible=0,log_only 未超标。")
     return 0
 
 
@@ -999,8 +1059,8 @@ def main(argv=None) -> int:
     if args.classify:
         return cmd_classify(findings, root)
 
-    # 默认行为:模块化检查(向后兼容 CI 的 `python scripts/scan_hardcoded_strings.py`)
-    return cmd_check(module_counts, baseline)
+    # 默认行为:R56 §5.1 绝对门禁(向后兼容 CI 的 `python scripts/scan_hardcoded_strings.py`)
+    return cmd_check(module_counts, baseline, findings=findings, root=root)
 
 
 if __name__ == '__main__':

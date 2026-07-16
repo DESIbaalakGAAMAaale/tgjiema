@@ -411,7 +411,7 @@ class TestQuarantineRepair:
         # 验证返回值
         assert result["status"] == "rehashed"
         assert "new_hash" in result
-        assert len(result["new_hash"]) == 16  # 短指纹 16 字符
+        assert len(result["new_hash"]) == 64  # 完整 SHA256 hex 64 字符(R56 P1-3)
 
         # 验证状态恢复为 pending
         status_after = await _get_status_by_message_id(msg_id)
@@ -465,6 +465,32 @@ class TestQuarantineRepair:
             approver_id=2,
             fixed_now_ts=_fixed_now,
         )
+        # R56 P0-4: 插入 command_approvals 表 2 条 quarantine_delete 审批记录(双人审批)
+        # 要求:≥2 个不同 approver + mfa_receipt 非空 + 非自审批 + 含 expected_approver_id
+        await real_cache_store._db.execute(
+            "CREATE TABLE IF NOT EXISTS command_approvals ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "action_id TEXT NOT NULL, "
+            "approver_id BIGINT NOT NULL, "
+            "approval_type TEXT NOT NULL, "
+            "mfa_receipt TEXT, "
+            "approved_at TEXT NOT NULL, "
+            "metadata_json TEXT, "
+            "UNIQUE(action_id, approver_id))"
+        )
+        await real_cache_store._db.execute(
+            "INSERT INTO command_approvals "
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
+            "VALUES (?, ?, 'quarantine_delete', ?, ?, NULL)",
+            ("approval-delete-001", 2, "mfa_receipt_approver_2", "2026-01-01T00:00:00Z"),
+        )
+        await real_cache_store._db.execute(
+            "INSERT INTO command_approvals "
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
+            "VALUES (?, ?, 'quarantine_delete', ?, ?, NULL)",
+            ("approval-delete-001", 3, "mfa_receipt_approver_3", "2026-01-01T00:00:00Z"),
+        )
+        await real_cache_store._db.commit()
         result = await redis_queue.quarantine_repair(
             row_id=row_id,
             action="delete",

@@ -16,8 +16,13 @@ import { test, expect, Page } from '@playwright/test';
  * - 使用更稳健的等待策略替代固定 timeout
  */
 
-// R47 P0-3: 测试用登录密码(与 ADMIN_BOOTSTRAP_PASSWORD 环境变量对应)
-const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD || 'test_bootstrap_pw';
+// R56 §6: 测试用登录密码必须从环境变量获取,缺失则立即失败
+if (!process.env.ADMIN_TEST_PASSWORD) {
+  throw new Error(
+    'ADMIN_TEST_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值)'
+  );
+}
+const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD;
 
 test.describe('Admin Bootstrap', () => {
   test('/readiness 返回 200 表示服务就绪', async ({ request }) => {

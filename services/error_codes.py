@@ -30,6 +30,7 @@ import datetime as _dt
 import json
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Optional
 
 from loguru import logger
@@ -145,6 +146,8 @@ class ErrorCodes:
     CALLBACK_ACTION_NOT_ALLOWED = "CALLBACK.ACTION.NOT_ALLOWED"
     # admin bootstrap 未完成,Web 进程应退出(admin/__init__.py:require_readiness)
     ADMIN_BOOTSTRAP_NOT_VERIFIED = "ADMIN.BOOTSTRAP.NOT_VERIFIED"
+    # R56: migrate_argon2_offline() 已移除(安全原因),应改用 migrate_argon2_offline_safe()
+    ADMIN_PASSWORD_MIGRATE_ARGON2_REMOVED = "ADMIN.PASSWORD.MIGRATE_ARGON2_REMOVED"
     # production 环境必须配置 BOT_TOKEN(services/button_security.py:_check_production_secret)
     PRODUCTION_BOT_TOKEN_MISSING = "PRODUCTION.BOT_TOKEN.MISSING"
     # 灾备恢复必须传 approval_action_id(services/backup_engine.py + services/disaster_recovery.py)
@@ -303,6 +306,64 @@ class ErrorCodes:
     BUTTON_POLICY_DUAL_APPROVAL_REQUIRED = "BUTTON.POLICY.DUAL_APPROVAL_REQUIRED"
     # 按钮操作缺少最终确认(final confirm 步骤缺失)
     BUTTON_POLICY_FINAL_CONFIRM_REQUIRED = "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED"
+
+
+# ════════════════════════════════════════════════════════════════
+# 1b. ErrorEnum — R56 §5.2 Python enum(str + Enum 双继承,保持字符串兼容)
+# ════════════════════════════════════════════════════════════════
+# R56 §5.2: 错误码 registry 唯一来源 — 通过 enum 提供类型安全,
+# 同时保持与 ErrorCodes 字符串常量的兼容(str 子类可直接用作字符串)。
+#
+# 用法:
+#     from services.error_codes import ErrorEnum
+#     raise AppError(ErrorEnum.UPLOAD_COPY_TELEGRAM_TIMEOUT, params={...})
+#     # ErrorEnum.XXX == ErrorCodes.XXX(str 比较)
+#
+# enum 的优势:
+#     - IDE 自动补全 + 类型检查
+#     - 防止拼写错误
+#     - 可枚举所有错误码
+#     - 不可变(运行时不可新增)
+def _build_error_enum() -> type:
+    """R56 §5.2: 使用 Enum functional API 从 ErrorCodes 自动构建 ErrorEnum。
+
+    避免维护两份重复的常量列表,确保 ErrorEnum 与 ErrorCodes 始终一致。
+    CI 测试 ``test_error_codes_enum_sync`` 强制一致性(任何新增常量必须同步到两者)。
+    """
+    members: dict[str, str] = {}
+    for attr_name in dir(ErrorCodes):
+        if not attr_name.isupper() or attr_name.startswith("_"):
+            continue
+        value = getattr(ErrorCodes, attr_name)
+        if not isinstance(value, str) or "." not in value:
+            continue
+        members[attr_name] = value
+    # 使用 functional API 创建 Enum(str 子类,可直接用作字符串)
+    enum_cls = Enum("ErrorEnum", members, type=str)
+    enum_cls.__doc__ = (
+        "R56 §5.2: Python enum 版本错误码(与 ErrorCodes 字符串常量保持一致)。\n\n"
+        "通过 ``str, Enum`` 双继承,ErrorEnum.XXX 等价于字符串 "
+        '"UPLOAD.COPY.TELEGRAM_TIMEOUT",可直接传给需要字符串参数的函数\n'
+        "(如 AppError(ErrorEnum.XXX, params=...)),也可在 if/比较 中与 "
+        "ErrorCodes.XXX 直接比较(均按 str 相等性比较)。\n\n"
+        "成员通过 ``_build_error_enum()`` 自动从 ErrorCodes 同步,无需手动维护。\n"
+        f"Total {len(members)} error code constants."
+    )
+
+    @classmethod
+    def from_code(cls, code: str) -> "ErrorEnum | None":
+        """从字符串 code 反查 ErrorEnum 成员(未匹配返回 None)。"""
+        try:
+            return cls(code)
+        except ValueError:
+            return None
+
+    enum_cls.from_code = from_code
+    return enum_cls
+
+
+# 模块加载时自动构建 ErrorEnum(从 ErrorCodes 同步所有常量)
+ErrorEnum = _build_error_enum()
 
 
 # ════════════════════════════════════════════════════════════════
@@ -480,6 +541,89 @@ class ErrorRegistry:
         """
         cls._definitions.clear()
         cls._initialized = False
+
+    # ── R56 §5.2: 便捷查询方法 + 前端映射导出 ──
+
+    @classmethod
+    def is_retryable(cls, code: str) -> bool:
+        """R56 §5.2: 判断错误码是否可重试(未注册 fallback 到 ERROR_INTERNAL)。"""
+        return cls.get(code).retryable
+
+    @classmethod
+    def get_safe_params(cls, code: str) -> list[str]:
+        """R56 §5.2: 获取错误码的安全参数白名单(未注册返回 [])。"""
+        return list(cls.get(code).safe_params)
+
+    @classmethod
+    def get_http_status(cls, code: str) -> int:
+        """R56 §5.2: 获取错误码对应的 HTTP 状态码。"""
+        return cls.get(code).http_status
+
+    @classmethod
+    def get_severity(cls, code: str) -> str:
+        """R56 §5.2: 获取错误码的严重级别(info/warning/error/critical)。"""
+        return cls.get(code).severity
+
+    @classmethod
+    def to_frontend_mapping(cls) -> dict:
+        """R56 §5.2: 导出前端映射 JSON(供 Admin Web / Bot 加载)。
+
+        生成结构:
+            {
+                "UPLOAD.COPY.TELEGRAM_TIMEOUT": {
+                    "code": "UPLOAD.COPY.TELEGRAM_TIMEOUT",
+                    "message_key": "errors.upload.copy.telegram_timeout",
+                    "http_status": 502,
+                    "retryable": True,
+                    "severity": "error",
+                    "telegram_presentation": "short_hint",
+                    "show_retry_button": True
+                },
+                ...
+            }
+
+        前端可通过此映射:
+            1. 根据 code 查找 message_key + safe_params 渲染本地化消息
+            2. 根据 retryable 决定是否显示"重试"按钮
+            3. 根据 severity 选择 UI 呈现方式(aria-live/badge)
+            4. 根据 http_status 映射 HTTP 响应码
+
+        telegram_presentation 决定 Bot 端展示方式:
+            - "short_hint": 短提示 + "查看详情"按钮(默认)
+            - "inline": 直接展开详情(用于 critical 级别)
+            - "silent": 不向用户展示(用于 internal 级别)
+        """
+        cls._ensure_initialized()
+        mapping: dict[str, dict] = {}
+        for code, definition in cls._definitions.items():
+            # telegram_presentation: 按 severity 推断
+            if definition.severity == "critical":
+                tg_pres = "inline"
+            elif definition.severity == "info":
+                tg_pres = "silent"
+            else:
+                tg_pres = "short_hint"
+            mapping[code] = {
+                "code": definition.code,
+                "message_key": definition.message_key,
+                "http_status": definition.http_status,
+                "retryable": definition.retryable,
+                "severity": definition.severity,
+                "safe_params": list(definition.safe_params),
+                "telegram_presentation": tg_pres,
+                "show_retry_button": definition.retryable,
+            }
+        return mapping
+
+    @classmethod
+    def to_frontend_json(cls, indent: int = 2) -> str:
+        """R56 §5.2: 导出前端映射为 JSON 字符串。"""
+        return json.dumps(
+            cls.to_frontend_mapping(),
+            ensure_ascii=False,
+            indent=indent,
+            sort_keys=True,
+        )
 
     @classmethod
     def _ensure_initialized(cls) -> None:
@@ -1314,6 +1458,15 @@ def _register_defaults() -> None:
         code=ErrorCodes.ADMIN_BOOTSTRAP_NOT_VERIFIED,
         message_key="errors.admin.bootstrap.not_verified",
         http_status=503,
+        retryable=False,
+        severity="critical",
+        safe_params=[],
+    ))
+    # R56: migrate_argon2_offline() 已移除(安全原因)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.ADMIN_PASSWORD_MIGRATE_ARGON2_REMOVED,
+        message_key="errors.admin.password.migrate_argon2_removed",
+        http_status=500,
         retryable=False,
         severity="critical",
         safe_params=[],

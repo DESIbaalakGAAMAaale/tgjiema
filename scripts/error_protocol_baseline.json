@@ -1,0 +1,5 @@
+{
+  "description": "R56 P1-5 error protocol baseline (ratchet 下降,只减不增)",
+  "note": "fail-open/except pass/return 0|False 是 pre-existing 历史债务。修复后重新生成以下降 violation_count。",
+  "violation_count": 349
+}

@@ -103,10 +103,14 @@ def _extract_placeholders(text: Any) -> set[str]:
     "剩余 {count} 次" → {"count"}
     "用户 {user_id} 于 {date} 操作" → {"user_id", "date"}
     "无占位符" → set()
+
+    R56 §5.1: 使用 ASCII-only 标识符模式 [a-zA-Z_][a-zA-Z0-9_]*
+    避免将 ICU MessageFormat 复数规则中的文本值(如中文"无文件")
+    误识别为占位符(Python 3 的 \\w 默认匹配 Unicode 字母)。
     """
     if not isinstance(text, str):
         return set()
-    return set(re.findall(r"\{(\w+)\}", text))
+    return set(re.findall(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}", text))
 
 
 def _check_placeholders(

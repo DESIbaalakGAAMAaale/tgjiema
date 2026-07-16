@@ -2525,6 +2525,13 @@ class CacheStore:
             )
             if not self._in_writer_tx:
                 await self._db.commit()
+            # R56 §7.2.3: 发布事件驱动唤醒信号(让 crdb_sync 立即处理)
+            # Redis 不可用时静默失败,fallback 到 polling(不影响正确性)
+            try:
+                from services.crdb_sync_event_wakeup import publish_dirty_signal
+                await publish_dirty_signal(sqlite_table)
+            except Exception:
+                pass  # 信号失败不影响 dirty_outbox 写入
             logger.info(
                 f"[CacheStore] R39 P1-5: soft_delete 成功"
                 f"(table={table}, pk={pk}, deleted_at={deleted_at})"
@@ -7358,7 +7365,16 @@ class CacheStore:
                         processed_init, local_only_init,
                     ),
                 )
-                return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+                _row_id = int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+                # R56 §7.2.3: 发布事件驱动唤醒信号(让 crdb_sync 立即处理)
+                # 事务由调用方控制,信号在 INSERT 后立即发(即使事务回滚,
+                # sync_loop 醒来查询发现无 dirty 会继续退避,无害)
+                try:
+                    from services.crdb_sync_event_wakeup import publish_dirty_signal
+                    await publish_dirty_signal(table_name)
+                except Exception:
+                    pass  # 信号失败不影响 dirty_outbox 写入
+                return _row_id
             except Exception as _e_insert:
                 _last_err = _e_insert
                 # 检测 UNIQUE 冲突(SQLite ConstraintException 文本含 UNIQUE)

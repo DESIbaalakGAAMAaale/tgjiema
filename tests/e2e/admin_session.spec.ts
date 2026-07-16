@@ -17,8 +17,15 @@ import { test, expect, Page, APIRequestContext } from '@playwright/test';
  * - logout 流程更稳健: 先获取 csrf cookie 再 POST
  */
 
-// R47 P0-3: 测试用登录密码(与 ADMIN_BOOTSTRAP_PASSWORD 环境变量对应)
-const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD || 'test_bootstrap_pw';
+// R56 §6: 测试用登录密码必须从环境变量获取,缺失则立即失败
+// 防止测试环境误用固定凭据(报告 §6 要求)
+if (!process.env.ADMIN_TEST_PASSWORD) {
+  throw new Error(
+    'ADMIN_TEST_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值);' +
+    '本地运行请执行: $env:ADMIN_TEST_PASSWORD="<your_test_password>"'
+  );
+}
+const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD;
 
 /** 登录辅助函数: 填写表单并提交 */
 async function login(page: Page, username = 'admin', password = ADMIN_PASSWORD) {

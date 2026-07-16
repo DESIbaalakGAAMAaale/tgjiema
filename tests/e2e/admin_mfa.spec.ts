@@ -28,10 +28,20 @@ import * as crypto from 'crypto';
  * - waitForStableTimestep: 确保 TOTP 生成时至少已过 3s,避免边界漂移。
  */
 
-// R47 P0-3: 测试用登录密码(与 ADMIN_BOOTSTRAP_PASSWORD 环境变量对应)
-const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD || 'test_bootstrap_pw';
-// break-glass 密码(与 BREAK_GLASS_PASSWORD 环境变量对应)
-const BREAK_GLASS_PASSWORD = process.env.BREAK_GLASS_PASSWORD || 'test_bootstrap_pw';
+// R56 §6: 测试用密码必须从环境变量获取,缺失则立即失败
+// 防止测试环境误用固定凭据(报告 §6 要求)
+if (!process.env.ADMIN_TEST_PASSWORD) {
+  throw new Error(
+    'ADMIN_TEST_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值)'
+  );
+}
+if (!process.env.BREAK_GLASS_PASSWORD) {
+  throw new Error(
+    'BREAK_GLASS_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值)'
+  );
+}
+const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD;
+const BREAK_GLASS_PASSWORD = process.env.BREAK_GLASS_PASSWORD;
 
 // R48 P0-3: 模块级共享变量 — test 2 启用 MFA 时捕获 secret,
 // test 3/4 登录时需要 MFA challenge,用此 secret 生成 TOTP

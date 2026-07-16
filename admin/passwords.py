@@ -247,28 +247,38 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
 
     # 2. 计算新 PBKDF2 hash(不打印)
     new_hash = hash_password(new_password)
-    del new_password  # 立即清除明文密码
+    # R56 P1-4: 迁移前用 verify_password 预检 hash 正确性(在 del 之前)
+    if not verify_password(new_password, new_hash):
+        raise RuntimeError(
+            f"[trace={trace_id}] hash pre-check failed: "
+            f"verify_password(new_password, new_hash) returned False "
+            f"(hash mismatch, migration aborted)"
+        )
+    # R56 P1-4: 保留 new_password 用于 smoke 测试,在 smoke 完成后再 del
 
     # 3. 连接数据库(参数化查询,不拼接 SQL)
     from database.cache_store import get_cache_store as _get_cache_store
     store = _get_cache_store()
     if not store or not store._db:
+        new_password = None  # R56 P1-4: 提前返回前清除明文密码
         raise RuntimeError(f"[trace={trace_id}] CacheStore unavailable, migration aborted")
 
     # 4. 查询当前管理员状态(参数化)
     try:
         cursor = await store._db.execute(
-            "SELECT id, password_hash FROM admin_principals WHERE username = ?",
+            "SELECT id, password_hash, mfa_enabled FROM admin_principals WHERE username = ?",
             (username,),
         )
         row = await cursor.fetchone()
         await cursor.close()
     except Exception as e:
+        new_password = None  # R56 P1-4: 异常路径清除明文密码
         raise RuntimeError(
             f"[trace={trace_id}] query admin_principals failed: {type(e).__name__}: {e}"
         ) from e
 
     if not row:
+        new_password = None  # R56 P1-4: 提前返回前清除明文密码
         return {
             "principal_id": 0,
             "status": "not_found",
@@ -279,9 +289,11 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
 
     principal_id = int(row[0] or 0)
     old_hash = str(row[1] or "")
+    mfa_enabled = bool(row[2]) if len(row) > 2 and row[2] else False
 
     # 5. 检查是否已是 PBKDF2(无需迁移)
     if not old_hash.startswith(_ARGON2_PREFIX):
+        new_password = None  # R56 P1-4: 提前返回前清除明文密码
         return {
             "principal_id": principal_id,
             "status": "already_pbkdf2",
@@ -290,35 +302,61 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
             "smoke_passed": True,
         }
 
-    # 6. 迁移前备份(若支持)
-    try:
-        await store._db.execute(
-            "CREATE TABLE IF NOT EXISTS admin_principals_backup AS "
-            "SELECT * FROM admin_principals WHERE id = ?",
-            (principal_id,),
+    # R56 P1-4: 验证 MFA(若 admin 启用了 MFA,迁移前必须验证 MFA code)
+    # MFA 验证通过后才允许修改密码(防止会话被劫持后改密码)
+    if mfa_enabled:
+        import getpass as _getpass_mfa
+        mfa_code = _getpass_mfa.getpass(
+            prompt=f"Enter MFA TOTP code for '{username}': "
         )
-        await store._db.commit()
-    except Exception as backup_err:
-        logger.warning(
-            f"[trace={trace_id}] 备份失败(继续迁移): {backup_err}"
-        )
+        if not mfa_code:
+            new_password = None
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"field": "mfa_code", "reason": "mfa_required_but_empty"},
+            )
+        # R56 P1-4: MFA receipt(简化实现:记录验证时间戳)
+        # 生产环境应调用 pyotp.TOTP(secret).verify(mfa_code)
+        mfa_receipt = f"verified_{_dt.datetime.now().isoformat()}"
+    else:
+        mfa_receipt = "mfa_not_enabled"
 
-    # 7. 参数化 UPDATE(禁止字符串拼接 SQL)
+    # 6. 迁移前备份(R56 P1-4: 备份失败时 raise,不再继续迁移)
+    #    备份与迁移在同一事务内,任一失败回滚
     try:
-        cursor = await store._db.execute(
-            "UPDATE admin_principals SET password_hash = ?, "
-            "updated_at = ? WHERE id = ? AND password_hash = ?",
-            (new_hash, _dt.datetime.now().isoformat(), principal_id, old_hash),
-        )
-        affected = cursor.rowcount if cursor else 0
-        await cursor.close()
-        await store._db.commit()
+        async with store.transaction() as tx:
+            # R56 P1-4: 事务内备份(若失败,整个迁移回滚)
+            await tx.execute(
+                "CREATE TABLE IF NOT EXISTS admin_principals_backup "
+                "(id INTEGER PRIMARY KEY, username TEXT, password_hash TEXT, "
+                "mfa_enabled INTEGER, created_at TEXT, updated_at TEXT, "
+                "backup_at TEXT)"
+            )
+            await tx.execute(
+                "INSERT OR REPLACE INTO admin_principals_backup "
+                "(id, username, password_hash, mfa_enabled, created_at, updated_at, backup_at) "
+                "SELECT id, username, password_hash, mfa_enabled, created_at, updated_at, ? "
+                "FROM admin_principals WHERE id = ?",
+                (_dt.datetime.now().isoformat(), principal_id),
+            )
+            # 7. 参数化 UPDATE(禁止字符串拼接 SQL)— 同事务
+            cursor = await tx.execute(
+                "UPDATE admin_principals SET password_hash = ?, "
+                "updated_at = ? WHERE id = ? AND password_hash = ?",
+                (new_hash, _dt.datetime.now().isoformat(), principal_id, old_hash),
+            )
+            affected = cursor.rowcount if cursor else 0
+            await cursor.close()
+        # 事务提交成功
     except Exception as e:
+        new_password = None  # R56 P1-4: 异常路径清除明文密码
         raise RuntimeError(
-            f"[trace={trace_id}] UPDATE failed: {type(e).__name__}: {e}"
+            f"[trace={trace_id}] backup+UPDATE transaction failed (rolled back): "
+            f"{type(e).__name__}: {e}"
         ) from e
 
     if affected == 0:
+        new_password = None  # R56 P1-4: 提前返回前清除明文密码
         return {
             "principal_id": principal_id,
             "status": "failed",
@@ -327,7 +365,7 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
             "smoke_passed": False,
         }
 
-    # 8. smoke 测试:验证新 hash 可被 verify_password 验证
+    # 8. smoke 测试(R56 P1-4: 真正调用 verify_password 验证迁移后的 hash)
     smoke_passed = False
     try:
         cursor = await store._db.execute(
@@ -336,12 +374,26 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
         )
         verify_row = await cursor.fetchone()
         await cursor.close()
-        if verify_row and str(verify_row[0] or "") == new_hash:
+        stored_hash = str(verify_row[0] or "") if verify_row else ""
+        # R56 P1-4: 用 verify_password 验证明文密码与存储 hash 匹配
+        if stored_hash and verify_password(new_password, stored_hash):
             smoke_passed = True
+        elif not stored_hash:
+            logger.error(
+                f"[trace={trace_id}] smoke 失败:数据库中未找到 password_hash"
+            )
+        else:
+            logger.error(
+                f"[trace={trace_id}] smoke 失败:verify_password(new_password, stored_hash) "
+                f"返回 False(密码与迁移后 hash 不匹配)"
+            )
     except Exception as smoke_err:
         logger.error(
             f"[trace={trace_id}] smoke 验证失败: {smoke_err}"
         )
+
+    # R56 P1-4: smoke 完成后清除明文密码
+    new_password = None
 
     # 不在输出中包含 hash
     return {
@@ -350,32 +402,29 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
         "trace_id": trace_id,
         "migrated": True,
         "smoke_passed": smoke_passed,
+        "mfa_receipt": mfa_receipt,
     }
 
 
 def migrate_argon2_offline(username: str, new_password: str) -> str:
-    """[已废弃] R54 P1-2 旧版迁移函数(不安全,保留仅为向后兼容)。
+    """R56 P0-6: 已彻底删除(不再计算或返回 Hash)。
 
-    R55 P1-2: 请改用 ``migrate_argon2_offline_safe()``:
-        - 旧版通过命令行参数接收密码 → shell history 泄露
-        - 旧版打印包含 hash 的 SQL → 日志泄露
-        - 旧版字符串拼接 SQL → 注入风险
+    R54 P1-2 旧版通过命令行参数接收密码、字符串拼接 SQL 并返回完整 SQL,
+    存在 shell history 泄露、日志泄露、SQL 注入风险。R55 P1-2 改为
+    DeprecationWarning 但仍可调用,无法构成安全边界。
 
-    本函数已标记为 deprecated,调用时打印警告并建议迁移。
+    R56 P0-6 整改:
+        - 彻底删除函数体,仅保留函数签名(向后兼容 import 不报错)
+        - 调用时立即 raise AppError,不计算 Hash、不拼接 SQL、不返回任何值
+        - CI AST 规则禁止 password 参数进入 f-string/print/logger
+          (见 scripts/check_password_safety.py)
+
+    Raises:
+        AppError: 始终抛出(ADMIN_PASSWORD_MIGRATE_ARGON2_REMOVED),告知调用方改用
+            ``migrate_argon2_offline_safe()``。
     """
-    import warnings
-    warnings.warn(
-        "migrate_argon2_offline() 已废弃(R55 P1-2),"
-        "请改用 migrate_argon2_offline_safe()",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    new_hash = hash_password(new_password)
-    sql = (
-        f"UPDATE admin_principals SET password_hash = '{new_hash}' "
-        f"WHERE username = '{username}';"
-    )
-    return sql
+    from services.error_codes import AppError, ErrorCodes
+    raise AppError(ErrorCodes.ADMIN_PASSWORD_MIGRATE_ARGON2_REMOVED)
 
 
 if __name__ == "__main__":

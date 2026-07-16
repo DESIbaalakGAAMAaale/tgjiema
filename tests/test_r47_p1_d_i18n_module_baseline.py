@@ -27,13 +27,40 @@ def _synthetic_baseline(**overrides) -> dict:
     """返回每模块 baseline=10 的合成 dict;可按需覆盖。
 
     R48: 包含 included_paths 字段,避免 _check_scope_change 误报 scope 变化。
+    R56 §5.1: 使用新格式(modules 子字典 + user_visible=0/log_only=10)。
     """
-    base = {m: 10 for m in scan.MODULE_KEYS}
-    base["_original_r44_baseline"] = 954
-    base["total"] = sum(base[m] for m in scan.MODULE_KEYS)
-    base["included_paths"] = list(scan.INCLUDED_PATHS)  # R48: scope 不变
+    modules = {
+        m: {"baseline": 10, "target": 0, "user_visible": 0, "log_only": 10}
+        for m in scan.MODULE_KEYS
+    }
+    base = {
+        "_original_r44_baseline": 954,
+        "scanner_version": scan.SCANNER_VERSION,
+        "included_paths": list(scan.INCLUDED_PATHS),  # R48: scope 不变
+        "modules": modules,
+        "total": {
+            "baseline": 10 * len(scan.MODULE_KEYS),
+            "target": 0,
+            "user_visible": 0,
+            "log_only": 10 * len(scan.MODULE_KEYS),
+        },
+    }
     base.update(overrides)
     return base
+
+
+def _patch_classify_as_log_only(monkeypatch, counts):
+    """R56 §5.1: 将 counts 全部视为 log_only(非 user_visible),避免绝对门禁误报。
+
+    cmd_check 在未传 findings/root 时,兜底将 counts 当作 user_visible 处理,
+    这会导致非零 counts 触发绝对门禁失败。此 helper 通过 monkeypatch
+    classify_findings 让 counts 走 log_only 通道(允许走 ratchet)。
+    """
+    monkeypatch.setattr(
+        scan, "classify_findings",
+        lambda f, r: {m: {"user_visible": 0, "log_only": counts.get(m, 0)}
+                      for m in scan.MODULE_KEYS},
+    )
 
 
 def _counts_from_baseline(baseline: dict) -> dict[str, int]:
@@ -112,10 +139,11 @@ def test_baseline_is_json_serializable():
 # ---------------------------------------------------------------------------
 # 2. 超过 baseline → 失败
 # ---------------------------------------------------------------------------
-def test_check_passes_when_current_equals_baseline():
+def test_check_passes_when_current_equals_baseline(monkeypatch):
     baseline = _synthetic_baseline()
     counts = _counts_from_baseline(baseline)
-    assert scan.cmd_check(counts, baseline) == 0
+    _patch_classify_as_log_only(monkeypatch, counts)
+    assert scan.cmd_check(counts, baseline, findings=[], root=Path(".")) == 0
 
 
 def test_check_fails_when_single_module_exceeds():
@@ -134,15 +162,17 @@ def test_check_fails_when_total_exceeds_only():
     assert scan.cmd_check(counts, bl) == 1
 
 
-def test_check_hints_ratchet_when_module_decreased(capsys):
+def test_check_hints_ratchet_when_module_decreased(monkeypatch, capsys):
     """模块下降时 --check 不失败,但提示运行 --ratchet。
 
     R48: 输出含 '距target' 列(target=0);R47 的 '距清零' 改为 '距target'。
+    R56 §5.1: 通过 monkeypatch classify_findings 将 counts 视为 log_only。
     """
     baseline = _synthetic_baseline()
     counts = _counts_from_baseline(baseline)
     counts["bots/up_bot.py"] -= 1
-    assert scan.cmd_check(counts, baseline) == 0
+    _patch_classify_as_log_only(monkeypatch, counts)
+    assert scan.cmd_check(counts, baseline, findings=[], root=Path(".")) == 0
     out = capsys.readouterr().out
     assert "--ratchet" in out
     assert "距target" in out  # R48: 输出距 target(0)的差距

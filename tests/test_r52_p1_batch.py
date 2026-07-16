@@ -289,7 +289,7 @@ class TestP1_1DurableOutboxRequestHashLease:
         )
         assert hash1 == hash2, "相同输入应产生相同 hash"
         assert hash1 != hash3, "不同输入应产生不同 hash"
-        assert len(hash1) == 16, f"短指纹应为 16 字符,实际: {len(hash1)}"
+        assert len(hash1) == 64, f"完整 SHA256 hex 应为 64 字符,实际: {len(hash1)}"
 
 
 # ════════════════════════════════════════════════════════════════

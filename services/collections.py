@@ -24,7 +24,7 @@ from __future__ import annotations
 import datetime as _dt
 import hmac
 import json
-from typing import Any
+from typing import Any, NewType
 
 from loguru import logger
 
@@ -38,6 +38,52 @@ from services.command_bus import (
 )
 from services.i18n import translate as _i18n_t
 from services.error_codes import AppError, ErrorCodes
+
+# R56 P1-2: 强类型 NewType — 编译期语义标注,运行时仍为 int/str
+# 调用方必须显式构造,避免传入负数 user_id 或非法 hash
+PositiveInt = NewType("PositiveInt", int)
+Sha256Hex = NewType("Sha256Hex", str)
+ActionId = NewType("ActionId", str)
+CollectionId = NewType("CollectionId", int)
+
+
+def _validate_positive_int(value: int, field_name: str) -> int:
+    """R56 P1-2: 校验 PositiveInt(必须 > 0),失败抛 AppError。"""
+    if not isinstance(value, int) or value <= 0:
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": field_name, "reason": "must_be_positive_int",
+                    "actual": value},
+        )
+    return value
+
+
+def _validate_sha256_hex(value: str, field_name: str) -> str:
+    """R56 P1-2: 校验 Sha256Hex(64 位 hex 字符),失败抛 AppError。"""
+    if not isinstance(value, str) or len(value) != 64:
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": field_name, "reason": "must_be_64_hex",
+                    "actual_len": len(value) if isinstance(value, str) else 0},
+        )
+    try:
+        int(value, 16)
+    except (ValueError, TypeError):
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": field_name, "reason": "invalid_hex"},
+        )
+    return value
+
+
+def _validate_action_id(value: str, field_name: str = "action_id") -> str:
+    """R56 P1-2: 校验 ActionId(非空字符串),失败抛 AppError。"""
+    if not isinstance(value, str) or not value:
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": field_name, "reason": "must_be_non_empty_str"},
+        )
+    return value
 
 
 def _safe_json_loads(val) -> Any:
@@ -71,14 +117,23 @@ def _is_expired(expire_time) -> bool:
 async def create_collection(name: str, owner_id: int, description: str = "") -> dict:
     """创建集合,生成唯一集合码。
 
+    R56 P1-2: owner_id 校验为 PositiveInt(> 0)。
+
     Args:
         name: 集合名称
-        owner_id: 所有者用户 ID
+        owner_id: 所有者用户 ID(必须 > 0)
         description: 集合描述(可选)
 
     Returns:
         {id, code, name, owner_id, description};失败返回 {}
     """
+    # R56 P1-2: 强类型校验 PositiveInt
+    _validate_positive_int(owner_id, "owner_id")
+    if not name or not isinstance(name, str):
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"field": "name", "reason": "must_be_non_empty_str"},
+        )
     store = get_cache_store()
     if not store._db:
         logger.warning("[collections] CacheStore 未初始化")

@@ -441,18 +441,21 @@ class TestR53P1_4_UtcPlus8Timezone:
         """
         from config import settings
         from services import entitlements
+        from zoneinfo import ZoneInfo
 
         # Etc/GMT-8 在 POSIX 中表示 UTC+8
         monkeypatch.setattr(settings, "BILLING_TIMEZONE", "Etc/GMT-8")
         user_id = 10005
         await _insert_user(real_store_with_real_plans, user_id, level="basic")
 
-        # 当前 UTC 时间
-        now_utc = datetime.now(timezone.utc)
-        # 今日 UTC 12:00(= GMT-8 时区 20:00,即今日)
-        today_record_utc = now_utc.replace(
+        # 当前 UTC+8 时间(避免 CI 在 UTC 16:00+ 运行时跨日导致测试失败)
+        tz_gmt_minus_8 = ZoneInfo("Etc/GMT-8")
+        now_local = datetime.now(tz_gmt_minus_8)
+        # 今日 12:00 本地时间(确保在今日范围内,即使 CI 在 UTC 16:00+ 运行)
+        today_noon_local = now_local.replace(
             hour=12, minute=0, second=0, microsecond=0
-        ).isoformat()
+        )
+        today_record_utc = today_noon_local.astimezone(timezone.utc).isoformat()
 
         await _insert_quota_reservation(
             real_store_with_real_plans, user_id, amount=6,

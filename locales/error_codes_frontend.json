@@ -1,0 +1,1347 @@
+{
+  "_meta": {
+    "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
+    "enum_count": 105,
+    "generated_at": "2026-07-16T13:10:34.360525Z",
+    "schema": {
+      "code": "三段式错误码 DOMAIN.OPERATION.REASON",
+      "http_status": "HTTP 状态码",
+      "message_key": "i18n key(在 locales/zh-CN.json 和 en-US.json 中)",
+      "retryable": "是否可重试(True=临时性故障,可显示重试按钮)",
+      "safe_params": "可安全记录的参数名白名单",
+      "severity": "严重级别(info/warning/error/critical)",
+      "show_retry_button": "是否显示重试按钮(= retryable)",
+      "telegram_presentation": "Bot 端展示方式: short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)"
+    },
+    "total_codes": 105,
+    "version": "R56-§5.2"
+  },
+  "codes": {
+    "ADMIN.BOOTSTRAP.NOT_VERIFIED": {
+      "code": "ADMIN.BOOTSTRAP.NOT_VERIFIED",
+      "http_status": 503,
+      "message_key": "errors.admin.bootstrap.not_verified",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "ADMIN.VALIDATION.PASSWORD_EMPTY": {
+      "code": "ADMIN.VALIDATION.PASSWORD_EMPTY",
+      "http_status": 400,
+      "message_key": "errors.admin.validation.password_empty",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "APPROVAL.GATE.REQUIRED": {
+      "code": "APPROVAL.GATE.REQUIRED",
+      "http_status": 202,
+      "message_key": "errors.approval.gate.required",
+      "retryable": false,
+      "safe_params": [
+        "approval_id",
+        "action"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "APPROVAL.STATE.INVALID": {
+      "code": "APPROVAL.STATE.INVALID",
+      "http_status": 409,
+      "message_key": "errors.approval.state.invalid",
+      "retryable": false,
+      "safe_params": [
+        "approval_id",
+        "current_status"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "AUTH.MFA.LOCKED": {
+      "code": "AUTH.MFA.LOCKED",
+      "http_status": 423,
+      "message_key": "errors.auth.mfa.locked",
+      "retryable": false,
+      "safe_params": [
+        "user_id"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "AUTH.MFA.REPLAYED": {
+      "code": "AUTH.MFA.REPLAYED",
+      "http_status": 401,
+      "message_key": "errors.auth.mfa.replayed",
+      "retryable": false,
+      "safe_params": [
+        "user_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "AUTH.RBAC.PERMISSION_DENIED": {
+      "code": "AUTH.RBAC.PERMISSION_DENIED",
+      "http_status": 403,
+      "message_key": "errors.auth.rbac.permission_denied",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "permission"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "AUTH.SESSION.EXPIRED": {
+      "code": "AUTH.SESSION.EXPIRED",
+      "http_status": 401,
+      "message_key": "errors.auth.session.expired",
+      "retryable": false,
+      "safe_params": [
+        "user_id"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "BACKUP.DECRYPT.DEP_MISSING": {
+      "code": "BACKUP.DECRYPT.DEP_MISSING",
+      "http_status": 500,
+      "message_key": "errors.backup.decrypt.dep_missing",
+      "retryable": false,
+      "safe_params": [
+        "dep_name"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.DECRYPT.KEK_MISSING": {
+      "code": "BACKUP.DECRYPT.KEK_MISSING",
+      "http_status": 500,
+      "message_key": "errors.backup.decrypt.kek_missing",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED": {
+      "code": "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.backup.restore.approval_action_id_required",
+      "retryable": false,
+      "safe_params": [
+        "backup_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.APPROVAL_INVALID": {
+      "code": "BACKUP.RESTORE.APPROVAL_INVALID",
+      "http_status": 403,
+      "message_key": "errors.backup.restore.approval_invalid",
+      "retryable": false,
+      "safe_params": [
+        "approval_id",
+        "backup_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.CHECKSUM_MISMATCH": {
+      "code": "BACKUP.RESTORE.CHECKSUM_MISMATCH",
+      "http_status": 500,
+      "message_key": "errors.backup.restore.checksum_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "backup_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.R2_CREDENTIAL_MISSING": {
+      "code": "BACKUP.RESTORE.R2_CREDENTIAL_MISSING",
+      "http_status": 500,
+      "message_key": "errors.backup.restore.r2_credential_missing",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BOT.MON.TOKEN_MISSING": {
+      "code": "BOT.MON.TOKEN_MISSING",
+      "http_status": 500,
+      "message_key": "errors.bot.mon.token_missing",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.BINDING_MISSING": {
+      "code": "BUTTON.POLICY.BINDING_MISSING",
+      "http_status": 400,
+      "message_key": "errors.button.policy.binding_missing",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "missing_field",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.DUAL_APPROVAL_REQUIRED": {
+      "code": "BUTTON.POLICY.DUAL_APPROVAL_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.button.policy.dual_approval_required",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.EXPIRED": {
+      "code": "BUTTON.POLICY.EXPIRED",
+      "http_status": 410,
+      "message_key": "errors.button.policy.expired",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED": {
+      "code": "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.button.policy.final_confirm_required",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "BUTTON.POLICY.HASH_MISMATCH": {
+      "code": "BUTTON.POLICY.HASH_MISMATCH",
+      "http_status": 409,
+      "message_key": "errors.button.policy.hash_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.MFA_REQUIRED": {
+      "code": "BUTTON.POLICY.MFA_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.button.policy.mfa_required",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.NONCE_CONSUMED": {
+      "code": "BUTTON.POLICY.NONCE_CONSUMED",
+      "http_status": 409,
+      "message_key": "errors.button.policy.nonce_consumed",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.PRINCIPAL_MISMATCH": {
+      "code": "BUTTON.POLICY.PRINCIPAL_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.button.policy.principal_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.SIGNATURE_INVALID": {
+      "code": "BUTTON.POLICY.SIGNATURE_INVALID",
+      "http_status": 403,
+      "message_key": "errors.button.policy.signature_invalid",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.VERSION_MISMATCH": {
+      "code": "BUTTON.POLICY.VERSION_MISMATCH",
+      "http_status": 409,
+      "message_key": "errors.button.policy.version_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "CALLBACK.ACTION.NOT_ALLOWED": {
+      "code": "CALLBACK.ACTION.NOT_ALLOWED",
+      "http_status": 403,
+      "message_key": "errors.callback.action.not_allowed",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "high_risk_count",
+        "low_risk_count"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "CF.WORKER.UPDATE_ID_KV_UNCONFIGURED": {
+      "code": "CF.WORKER.UPDATE_ID_KV_UNCONFIGURED",
+      "http_status": 500,
+      "message_key": "errors.cf.worker.update_id_kv_unconfigured",
+      "retryable": false,
+      "safe_params": [
+        "environment"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "COLLECTION.APPROVAL.ALREADY_EXECUTED": {
+      "code": "COLLECTION.APPROVAL.ALREADY_EXECUTED",
+      "http_status": 409,
+      "message_key": "errors.collection.approval.already_executed",
+      "retryable": true,
+      "safe_params": [
+        "collection_id",
+        "approval_action_id"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "COLLECTION.APPROVAL.HASH_MISMATCH": {
+      "code": "COLLECTION.APPROVAL.HASH_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.collection.approval.hash_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "collection_id",
+        "approval_action_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "COLLECTION.APPROVAL.INVALID": {
+      "code": "COLLECTION.APPROVAL.INVALID",
+      "http_status": 403,
+      "message_key": "errors.collection.approval.invalid",
+      "retryable": false,
+      "safe_params": [
+        "collection_id",
+        "approval_action_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "COLLECTION.APPROVAL.PRINCIPAL_MISMATCH": {
+      "code": "COLLECTION.APPROVAL.PRINCIPAL_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.collection.approval.principal_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "collection_id",
+        "approval_action_id",
+        "expected_principal_id",
+        "actual_principal_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "COLLECTION.CAS.BYPASS_NOT_ALLOWED": {
+      "code": "COLLECTION.CAS.BYPASS_NOT_ALLOWED",
+      "http_status": 403,
+      "message_key": "errors.collection.cas.bypass_not_allowed",
+      "retryable": false,
+      "safe_params": [
+        "collection_id",
+        "caller"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "COLLECTION.CAS.CONFLICT": {
+      "code": "COLLECTION.CAS.CONFLICT",
+      "http_status": 409,
+      "message_key": "errors.collection.cas.conflict",
+      "retryable": true,
+      "safe_params": [
+        "collection_id",
+        "expected_version",
+        "current_version"
+      ],
+      "severity": "info",
+      "show_retry_button": true,
+      "telegram_presentation": "silent"
+    },
+    "COLLECTION.CAS.VERSION_REQUIRED": {
+      "code": "COLLECTION.CAS.VERSION_REQUIRED",
+      "http_status": 400,
+      "message_key": "errors.collection.cas.version_required",
+      "retryable": false,
+      "safe_params": [
+        "collection_id"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "COMMAND.APPROVAL.MUST_USE_APPROVAL_PATH": {
+      "code": "COMMAND.APPROVAL.MUST_USE_APPROVAL_PATH",
+      "http_status": 403,
+      "message_key": "errors.command.approval.must_use_approval_path",
+      "retryable": false,
+      "safe_params": [
+        "action_id",
+        "command_type",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "COMMAND.CONCURRENT.CLAIM": {
+      "code": "COMMAND.CONCURRENT.CLAIM",
+      "http_status": 409,
+      "message_key": "errors.command.concurrent.claim",
+      "retryable": true,
+      "safe_params": [
+        "action_id"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "COMMAND.EXECUTE.STORE_UNAVAILABLE": {
+      "code": "COMMAND.EXECUTE.STORE_UNAVAILABLE",
+      "http_status": 503,
+      "message_key": "errors.command.status.store_unavailable",
+      "retryable": true,
+      "safe_params": [
+        "action_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "COMMAND.HASH.MISMATCH": {
+      "code": "COMMAND.HASH.MISMATCH",
+      "http_status": 400,
+      "message_key": "errors.command.hash.mismatch",
+      "retryable": false,
+      "safe_params": [
+        "action_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "COMMAND.STATUS.CONFLICT": {
+      "code": "COMMAND.STATUS.CONFLICT",
+      "http_status": 409,
+      "message_key": "errors.command.status.conflict",
+      "retryable": true,
+      "safe_params": [
+        "action_id",
+        "reason",
+        "current_status",
+        "expected_status",
+        "stored_principal_id",
+        "expected_principal_id"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "COMMAND.STATUS.NOT_APPROVED": {
+      "code": "COMMAND.STATUS.NOT_APPROVED",
+      "http_status": 403,
+      "message_key": "errors.command.status.not_approved",
+      "retryable": false,
+      "safe_params": [
+        "action_id",
+        "reason",
+        "current_status",
+        "expected_status"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "CONTENT.APPEAL.INVALID_STATE": {
+      "code": "CONTENT.APPEAL.INVALID_STATE",
+      "http_status": 409,
+      "message_key": "errors.content.appeal.invalid_state",
+      "retryable": false,
+      "safe_params": [
+        "appeal_id",
+        "current_status"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "CONTENT.APPEAL.RESTORE_FAILED": {
+      "code": "CONTENT.APPEAL.RESTORE_FAILED",
+      "http_status": 500,
+      "message_key": "errors.content.appeal.restore_failed",
+      "retryable": true,
+      "safe_params": [
+        "appeal_id",
+        "target_type",
+        "target_id"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "DATA.LIFECYCLE.BACKUP_MARKER_MISSING": {
+      "code": "DATA.LIFECYCLE.BACKUP_MARKER_MISSING",
+      "http_status": 409,
+      "message_key": "errors.data.lifecycle.backup_marker_missing",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "table_name",
+        "pk"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "DATA.LIFECYCLE.BREAK_GLASS_APPROVAL_REQUIRED": {
+      "code": "DATA.LIFECYCLE.BREAK_GLASS_APPROVAL_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.data.lifecycle.break_glass_approval_required",
+      "retryable": false,
+      "safe_params": [
+        "reason",
+        "approval_action_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "DATA.LIFECYCLE.DELETE_REQUEST_FAILED": {
+      "code": "DATA.LIFECYCLE.DELETE_REQUEST_FAILED",
+      "http_status": 500,
+      "message_key": "errors.data.lifecycle.delete_request_failed",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "request_id",
+        "failed_steps"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "DATA.LIFECYCLE.DELETE_STEP_FAILED": {
+      "code": "DATA.LIFECYCLE.DELETE_STEP_FAILED",
+      "http_status": 500,
+      "message_key": "errors.data.lifecycle.delete_step_failed",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "step",
+        "step_error"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "DB.CACHE.UNAVAILABLE": {
+      "code": "DB.CACHE.UNAVAILABLE",
+      "http_status": 503,
+      "message_key": "errors.db.cache.unavailable",
+      "retryable": true,
+      "safe_params": [
+        "component"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "DB.CRDB.UNAVAILABLE": {
+      "code": "DB.CRDB.UNAVAILABLE",
+      "http_status": 503,
+      "message_key": "errors.db.crdb.unavailable",
+      "retryable": true,
+      "safe_params": [
+        "component"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "DB.REDIS.UNAVAILABLE": {
+      "code": "DB.REDIS.UNAVAILABLE",
+      "http_status": 503,
+      "message_key": "errors.db.redis.unavailable",
+      "retryable": true,
+      "safe_params": [
+        "component"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "DELIVERY.RECEIPT.FAILED": {
+      "code": "DELIVERY.RECEIPT.FAILED",
+      "http_status": 500,
+      "message_key": "errors.delivery.receipt.failed",
+      "retryable": true,
+      "safe_params": [
+        "user_id",
+        "file_code"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "DELIVERY.SEND.FLOOD_WAIT": {
+      "code": "DELIVERY.SEND.FLOOD_WAIT",
+      "http_status": 429,
+      "message_key": "errors.delivery.send.flood_wait",
+      "retryable": true,
+      "safe_params": [
+        "wait_seconds",
+        "user_id"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "DELIVERY.SEND.FORBIDDEN": {
+      "code": "DELIVERY.SEND.FORBIDDEN",
+      "http_status": 403,
+      "message_key": "errors.delivery.send.forbidden",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "channel_id"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "DURABLE.OUTBOX.QUARANTINED": {
+      "code": "DURABLE.OUTBOX.QUARANTINED",
+      "http_status": 409,
+      "message_key": "errors.durable.outbox.quarantined",
+      "retryable": false,
+      "safe_params": [
+        "message_id",
+        "method",
+        "expected_hash",
+        "actual_hash"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "EFFECT.RECEIPT.DB_ERROR": {
+      "code": "EFFECT.RECEIPT.DB_ERROR",
+      "http_status": 500,
+      "message_key": "errors.effect.receipt.db_error",
+      "retryable": true,
+      "safe_params": [
+        "action_id",
+        "effect_type"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "EFFECT.RECEIPT.MANAGER_UNAVAILABLE": {
+      "code": "EFFECT.RECEIPT.MANAGER_UNAVAILABLE",
+      "http_status": 500,
+      "message_key": "errors.effect.receipt.manager_unavailable",
+      "retryable": true,
+      "safe_params": [
+        "action_id",
+        "effect_type"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "ENTITLEMENT.PLAN.DIRECT_MUTATION_FORBIDDEN": {
+      "code": "ENTITLEMENT.PLAN.DIRECT_MUTATION_FORBIDDEN",
+      "http_status": 403,
+      "message_key": "errors.entitlement.plan.direct_mutation_forbidden",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "plan_name",
+        "environment"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "ENTITLEMENT.PLAN.EXPECTED_VERSION_REQUIRED": {
+      "code": "ENTITLEMENT.PLAN.EXPECTED_VERSION_REQUIRED",
+      "http_status": 400,
+      "message_key": "errors.entitlement.plan.expected_version_required",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "plan_name",
+        "environment"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "ENTITLEMENT.PLAN.REQUIRES_COMMAND_BUS": {
+      "code": "ENTITLEMENT.PLAN.REQUIRES_COMMAND_BUS",
+      "http_status": 403,
+      "message_key": "errors.entitlement.plan.requires_command_bus",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "plan_name",
+        "caller"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "ENTITLEMENT.QUOTA.QUERY_FAILED": {
+      "code": "ENTITLEMENT.QUOTA.QUERY_FAILED",
+      "http_status": 503,
+      "message_key": "errors.entitlement.quota.query_failed",
+      "retryable": true,
+      "safe_params": [
+        "user_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "ENTITLEMENT.SET_PLAN.CAS_CONFLICT": {
+      "code": "ENTITLEMENT.SET_PLAN.CAS_CONFLICT",
+      "http_status": 409,
+      "message_key": "errors.entitlement.set_plan.cas_conflict",
+      "retryable": true,
+      "safe_params": [
+        "user_id",
+        "plan_name",
+        "expected_version",
+        "current_version"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "ENTITLEMENT.SET_PLAN.TX_FAILED": {
+      "code": "ENTITLEMENT.SET_PLAN.TX_FAILED",
+      "http_status": 500,
+      "message_key": "errors.entitlement.set_plan.tx_failed",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "plan_name"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "ERROR.INTERNAL.UNEXPECTED": {
+      "code": "ERROR.INTERNAL.UNEXPECTED",
+      "http_status": 500,
+      "message_key": "errors.error.internal.unexpected",
+      "retryable": true,
+      "safe_params": [
+        "action",
+        "component"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "FILE.CODE.INVALID": {
+      "code": "FILE.CODE.INVALID",
+      "http_status": 400,
+      "message_key": "errors.file.code.invalid",
+      "retryable": false,
+      "safe_params": [
+        "code"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "FILE.LOOKUP.EXPIRED": {
+      "code": "FILE.LOOKUP.EXPIRED",
+      "http_status": 410,
+      "message_key": "errors.file.lookup.expired",
+      "retryable": false,
+      "safe_params": [
+        "file_code"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "FILE.LOOKUP.NOT_FOUND": {
+      "code": "FILE.LOOKUP.NOT_FOUND",
+      "http_status": 404,
+      "message_key": "errors.file.lookup.not_found",
+      "retryable": false,
+      "safe_params": [
+        "file_code"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "INDEX.CODE.CONFLICT": {
+      "code": "INDEX.CODE.CONFLICT",
+      "http_status": 409,
+      "message_key": "errors.index.code.conflict",
+      "retryable": false,
+      "safe_params": [
+        "code"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "INDEX.FINALIZE.DB_UNINITIALIZED": {
+      "code": "INDEX.FINALIZE.DB_UNINITIALIZED",
+      "http_status": 503,
+      "message_key": "errors.index.finalize.db_uninitialized",
+      "retryable": true,
+      "safe_params": [
+        "action"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "INDEX.FINALIZE.OUTBOX_FAILED": {
+      "code": "INDEX.FINALIZE.OUTBOX_FAILED",
+      "http_status": 500,
+      "message_key": "errors.index.finalize.outbox_failed",
+      "retryable": true,
+      "safe_params": [
+        "file_code",
+        "code"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "INDEX.GENERATE.DB_UNINITIALIZED": {
+      "code": "INDEX.GENERATE.DB_UNINITIALIZED",
+      "http_status": 503,
+      "message_key": "errors.index.generate.db_uninitialized",
+      "retryable": true,
+      "safe_params": [
+        "action"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "INDEX.STORAGE.NO_CHANNEL": {
+      "code": "INDEX.STORAGE.NO_CHANNEL",
+      "http_status": 503,
+      "message_key": "errors.index.storage.no_channel",
+      "retryable": true,
+      "safe_params": [],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "MAINTENANCE.DISABLE.QUERY_FAILED": {
+      "code": "MAINTENANCE.DISABLE.QUERY_FAILED",
+      "http_status": 500,
+      "message_key": "errors.maintenance.disable.recover_query_failed",
+      "retryable": true,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "MAINTENANCE.RECOVER.BINDING_REQUIRED": {
+      "code": "MAINTENANCE.RECOVER.BINDING_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.maintenance.recover.binding_required",
+      "retryable": false,
+      "safe_params": [
+        "approval_action_id",
+        "principal_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "MAINTENANCE.RECOVER.PERSIST_CRITICAL": {
+      "code": "MAINTENANCE.RECOVER.PERSIST_CRITICAL",
+      "http_status": 500,
+      "message_key": "errors.maintenance.recover.persist_critical",
+      "retryable": false,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "MAINTENANCE.WORKFLOW.PERSIST_FAILED": {
+      "code": "MAINTENANCE.WORKFLOW.PERSIST_FAILED",
+      "http_status": 503,
+      "message_key": "errors.maintenance.workflow.persist_failed",
+      "retryable": true,
+      "safe_params": [
+        "reason",
+        "workflow_step"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "METRICS.COLLECTOR.FAILED": {
+      "code": "METRICS.COLLECTOR.FAILED",
+      "http_status": 503,
+      "message_key": "errors.metrics.collector.failed",
+      "retryable": true,
+      "safe_params": [
+        "collector"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "METRICS.COLLECTOR.OUTPUT_INVALID": {
+      "code": "METRICS.COLLECTOR.OUTPUT_INVALID",
+      "http_status": 500,
+      "message_key": "errors.metrics.collector.output_invalid",
+      "retryable": false,
+      "safe_params": [
+        "collector",
+        "reason"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "METRICS.LABEL.HIGH_CARDINALITY": {
+      "code": "METRICS.LABEL.HIGH_CARDINALITY",
+      "http_status": 500,
+      "message_key": "errors.metrics.label.high_cardinality",
+      "retryable": false,
+      "safe_params": [
+        "label",
+        "metric"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "METRICS.RU.ESTIMATED": {
+      "code": "METRICS.RU.ESTIMATED",
+      "http_status": 200,
+      "message_key": "errors.metrics.ru.estimated",
+      "retryable": false,
+      "safe_params": [
+        "service"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "NOTIFICATION.OUTBOX.DUPLICATE": {
+      "code": "NOTIFICATION.OUTBOX.DUPLICATE",
+      "http_status": 409,
+      "message_key": "errors.notification.outbox.duplicate",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "dedup_key"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "NOTIFICATION.OUTBOX.WRITE_FAILED": {
+      "code": "NOTIFICATION.OUTBOX.WRITE_FAILED",
+      "http_status": 500,
+      "message_key": "errors.notification.outbox.write_failed",
+      "retryable": true,
+      "safe_params": [
+        "user_id",
+        "notif_type"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "PRODUCTION.BOT_TOKEN.MISSING": {
+      "code": "PRODUCTION.BOT_TOKEN.MISSING",
+      "http_status": 500,
+      "message_key": "errors.production.bot_token.missing",
+      "retryable": false,
+      "safe_params": [
+        "environment"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "PRODUCTION.RESTORE.HASH_MISMATCH": {
+      "code": "PRODUCTION.RESTORE.HASH_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.production.restore.hash_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "backup_id",
+        "approval_action_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "PRODUCTION.RESTORE.HASH_REQUIRED": {
+      "code": "PRODUCTION.RESTORE.HASH_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.production.restore.hash_required",
+      "retryable": false,
+      "safe_params": [
+        "backup_id",
+        "target"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "QUOTA.DECODE.EXCEEDED": {
+      "code": "QUOTA.DECODE.EXCEEDED",
+      "http_status": 429,
+      "message_key": "errors.quota.decode.exceeded",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "quota"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "RELAY.AUTH.CODE_FAILED": {
+      "code": "RELAY.AUTH.CODE_FAILED",
+      "http_status": 401,
+      "message_key": "errors.relay.auth.code_failed",
+      "retryable": true,
+      "safe_params": [
+        "phone"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "RELAY.AUTH.PASSWORD_TIMEOUT": {
+      "code": "RELAY.AUTH.PASSWORD_TIMEOUT",
+      "http_status": 401,
+      "message_key": "errors.relay.auth.password_timeout",
+      "retryable": true,
+      "safe_params": [
+        "phone"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "RELAY.CONFIG.API_HASH_INVALID": {
+      "code": "RELAY.CONFIG.API_HASH_INVALID",
+      "http_status": 400,
+      "message_key": "errors.relay.config.api_hash_invalid",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "REPAIR.CONSOLE.APPROVAL_HASH_MISMATCH": {
+      "code": "REPAIR.CONSOLE.APPROVAL_HASH_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.repair.console.approval_hash_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "approval_action_id",
+        "expected_hash",
+        "actual_hash"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "REPAIR.CONSOLE.APPROVAL_PRINCIPAL_MISMATCH": {
+      "code": "REPAIR.CONSOLE.APPROVAL_PRINCIPAL_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.repair.console.approval_principal_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "approval_action_id",
+        "expected_principal",
+        "actual_principal"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "REPAIR.CONSOLE.APPROVAL_REQUIRED": {
+      "code": "REPAIR.CONSOLE.APPROVAL_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.repair.console.approval_required",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "principal_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "RESTORE.EXECUTE.ALREADY_EXECUTED": {
+      "code": "RESTORE.EXECUTE.ALREADY_EXECUTED",
+      "http_status": 409,
+      "message_key": "errors.restore.execute.already_executed",
+      "retryable": false,
+      "safe_params": [
+        "approval_action_id"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "SYSTEM.RATE.LIMITED": {
+      "code": "SYSTEM.RATE.LIMITED",
+      "http_status": 429,
+      "message_key": "errors.system.rate.limited",
+      "retryable": true,
+      "safe_params": [
+        "user_id"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "SYSTEM.STATE.MAINTENANCE": {
+      "code": "SYSTEM.STATE.MAINTENANCE",
+      "http_status": 503,
+      "message_key": "errors.system.state.maintenance",
+      "retryable": true,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "TASK.CENTER.LIST_DB_ERROR": {
+      "code": "TASK.CENTER.LIST_DB_ERROR",
+      "http_status": 500,
+      "message_key": "errors.task.center.list_db_error",
+      "retryable": true,
+      "safe_params": [
+        "scope"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "TASK.CENTER.UNKNOWN_STATUS": {
+      "code": "TASK.CENTER.UNKNOWN_STATUS",
+      "http_status": 400,
+      "message_key": "errors.task.center.unknown_status",
+      "retryable": false,
+      "safe_params": [
+        "status"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "TASK.CENTER.UNKNOWN_TYPE": {
+      "code": "TASK.CENTER.UNKNOWN_TYPE",
+      "http_status": 400,
+      "message_key": "errors.task.center.unknown_type",
+      "retryable": false,
+      "safe_params": [
+        "task_type"
+      ],
+      "severity": "warning",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "TOPOLOGY.LOAD.NO_SLOTS": {
+      "code": "TOPOLOGY.LOAD.NO_SLOTS",
+      "http_status": 500,
+      "message_key": "errors.topology.load.no_slots",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "UPLOAD.COPY.TELEGRAM_FORBIDDEN": {
+      "code": "UPLOAD.COPY.TELEGRAM_FORBIDDEN",
+      "http_status": 403,
+      "message_key": "errors.upload.copy.telegram_forbidden",
+      "retryable": false,
+      "safe_params": [
+        "file_code",
+        "channel_id"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "UPLOAD.COPY.TELEGRAM_TIMEOUT": {
+      "code": "UPLOAD.COPY.TELEGRAM_TIMEOUT",
+      "http_status": 504,
+      "message_key": "errors.upload.copy.telegram_timeout",
+      "retryable": true,
+      "safe_params": [
+        "file_code",
+        "channel_id"
+      ],
+      "severity": "warning",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "UPLOAD.MANIFEST.OUTBOX_FAILED": {
+      "code": "UPLOAD.MANIFEST.OUTBOX_FAILED",
+      "http_status": 500,
+      "message_key": "errors.upload.manifest.outbox_failed",
+      "retryable": true,
+      "safe_params": [
+        "file_code",
+        "batch_id"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "UPLOAD.OUTBOX.BOT_UNINITIALIZED": {
+      "code": "UPLOAD.OUTBOX.BOT_UNINITIALIZED",
+      "http_status": 500,
+      "message_key": "errors.upload.outbox.bot_uninitialized",
+      "retryable": true,
+      "safe_params": [],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "UPLOAD.PENDING.OUTBOX_TX_FAILED": {
+      "code": "UPLOAD.PENDING.OUTBOX_TX_FAILED",
+      "http_status": 500,
+      "message_key": "errors.upload.pending.outbox_tx_failed",
+      "retryable": true,
+      "safe_params": [
+        "file_code",
+        "batch_id"
+      ],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "UPLOAD.SLOT.NONE_ACTIVE": {
+      "code": "UPLOAD.SLOT.NONE_ACTIVE",
+      "http_status": 503,
+      "message_key": "errors.upload.slot.none_active",
+      "retryable": true,
+      "safe_params": [],
+      "severity": "error",
+      "show_retry_button": true,
+      "telegram_presentation": "short_hint"
+    },
+    "USER.STATE.BANNED": {
+      "code": "USER.STATE.BANNED",
+      "http_status": 403,
+      "message_key": "errors.user.state.banned",
+      "retryable": false,
+      "safe_params": [
+        "user_id"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    },
+    "VALIDATION.INPUT.FAILED": {
+      "code": "VALIDATION.INPUT.FAILED",
+      "http_status": 400,
+      "message_key": "errors.validation.input.failed",
+      "retryable": false,
+      "safe_params": [
+        "field"
+      ],
+      "severity": "info",
+      "show_retry_button": false,
+      "telegram_presentation": "silent"
+    }
+  }
+}

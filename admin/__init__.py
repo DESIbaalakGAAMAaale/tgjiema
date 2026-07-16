@@ -1063,7 +1063,7 @@ async def login_page(request: Request):
     # 渲染登录表单(简化:返回内联 HTML,避免新增模板文件)
     csp_nonce = getattr(request.state, "csp_nonce", "") or ""
     csrf_token = _get_csrf_token("__login__")
-    html = _i18n_t('admin.__init__.s1', csp_nonce=csp_nonce, csrf_token=csrf_token)
+    html = _i18n_t('admin.__init__.s1', csp_nonce=csp_nonce, csrf_token=csrf_token, error_message="")
     response = HTMLResponse(content=html)
     response.set_cookie(
         key="csrf_token", value=csrf_token,
@@ -1127,8 +1127,23 @@ async def login_submit(
     if not (correct_username and correct_password):
         _login_failures.setdefault(client_ip, []).append(now)
         _fire_and_forget(_persist_login_failures())
-        # 返回登录页并显示错误信息(简化:返回 401)
-        raise HTTPException(status_code=401, detail=_t(0, "admin.errors.login_failed"))
+        # R56 §6 accessibility: 返回登录页 HTML 并通过 role="alert" 宣告错误
+        # (不再 raise HTTPException 返回 JSON,屏幕阅读器无法感知)
+        csp_nonce = getattr(request.state, "csp_nonce", "") or ""
+        csrf_token_new = _get_csrf_token("__login__")
+        error_msg = _t(0, "admin.errors.login_failed")
+        html = _i18n_t(
+            'admin.__init__.s1',
+            csp_nonce=csp_nonce, csrf_token=csrf_token_new,
+            error_message=error_msg,
+        )
+        response = HTMLResponse(content=html, status_code=401)
+        response.set_cookie(
+            key="csrf_token", value=csrf_token_new,
+            httponly=True, samesite="strict",
+            secure=settings.CSRF_COOKIE_SECURE, max_age=3600,
+        )
+        return response
 
     # 登录成功,清除该 IP 的失败记录
     _login_failures.pop(client_ip, None)

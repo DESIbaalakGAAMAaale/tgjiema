@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -49,6 +50,302 @@ _LOCALES_DIR = Path(__file__).resolve().parent.parent / "locales"
 _DEFAULT_LOCALE = "zh-CN"
 # 备用 locale(找不到 key 时回退)
 _FALLBACK_LOCALE = "en-US"
+
+# R56 §5.1: ICU MessageFormat 子集 — 用于复数/select/ordinal/嵌套插值
+# 匹配 {name, type, ...} 模式(type ∈ plural/select/selectordinal)
+_ICU_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\s*,\s*(plural|select|selectordinal)\s*,")
+
+
+def _icu_select_branch(text: str, locale: str, kwargs: dict) -> str:
+    """R56 §5.1: 解析 ICU MessageFormat 选择子句并展开。
+
+    支持 plural/select/selectordinal 子句:
+        {key, plural, =0 {none} one {# item} other {# items}}
+        {key, select, male {He} female {She} other {They}}
+
+    嵌套:  子句中可嵌套其他 {var} / {var, plural/select, ...}
+    # 占位符: 在 plural/selectordinal 子句中, # 展开为 count 的本地化数字
+
+    Args:
+        text: 待格式化的 ICU 字符串
+        locale: 目标 locale(用于复数规则选择)
+        kwargs: 插值参数
+
+    Returns:
+        格式化后的字符串
+    """
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        # 查找下一个未转义的 {
+        brace_idx = text.find("{", i)
+        if brace_idx == -1:
+            # 处理剩余文本中的转义 \}
+            tail = text[i:].replace("\\}", "}")
+            result.append(tail)
+            break
+        # 检查是否转义(`\{`)
+        if brace_idx > 0 and text[brace_idx - 1] == "\\":
+            # 输出 { 之前的文本(吞掉反斜杠)
+            result.append(text[i:brace_idx - 1])
+            result.append("{")
+            i = brace_idx + 1
+            continue
+        # 输出 { 之前的文本(处理其中的 \} 转义)
+        prefix = text[i:brace_idx].replace("\\}", "}")
+        result.append(prefix)
+        # 解析 {...} 块(支持嵌套)
+        var_name, branch_text, next_idx = _icu_parse_block(text, brace_idx, locale, kwargs)
+        if var_name is None:
+            # 解析失败:原样输出
+            result.append(text[brace_idx:next_idx])
+        else:
+            result.append(branch_text)
+        i = next_idx
+    return "".join(result)
+
+
+def _icu_parse_block(
+    text: str, start: int, locale: str, kwargs: dict
+) -> tuple[Optional[str], str, int]:
+    """R56 §5.1: 解析一个 {...} 块(支持嵌套),返回 (var_name, branch_text, next_idx)。
+
+    若为简单插值 {var},var_name=var, branch_text=kwargs[var], next_idx 为 `}` 后位置
+    若为 plural/select,branch_text 为选定子句展开后的文本
+    若解析失败,var_name=None,branch_text 为原始文本(含 `{}`)
+    """
+    assert text[start] == "{"
+    # 匹配到对应 `}` 的位置(考虑嵌套)
+    depth = 0
+    end = start
+    while end < len(text):
+        c = text[end]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        end += 1
+    if end >= len(text):
+        return None, text[start:], end
+    block_content = text[start + 1: end]  # 不含外层 {}
+    next_idx = end + 1
+
+    # 解析 var_name + ,type + body(若有逗号)
+    m = re.match(
+        r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*,\s*(plural|select|selectordinal)\s*,\s*(.*)$",
+        block_content,
+        re.DOTALL,
+    )
+    if not m:
+        # 简单插值 {var_name} 或 {var_name, format_type}(忽略 format_type)
+        simple_m = re.match(
+            r"^([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*([a-zA-Z_]+))?\s*$",
+            block_content.strip(),
+        )
+        if not simple_m:
+            return None, text[start:next_idx], next_idx
+        var_name = simple_m.group(1)
+        value = kwargs.get(var_name, "")
+        if value is None:
+            value = ""
+        return var_name, str(value), next_idx
+
+    var_name = m.group(1)
+    block_type = m.group(2)
+    body = m.group(3).strip()
+
+    # 提取子句 (=N {..} / one {..} / other {..} 等)
+    branches = _icu_parse_branches(body)
+
+    # 获取变量值
+    raw_value = kwargs.get(var_name, 0)
+    try:
+        count = int(raw_value)
+    except (TypeError, ValueError):
+        count = 0
+
+    # 选择子句
+    selected = _icu_select_branch_by_count(count, block_type, locale, branches)
+
+    # 展开 # 占位符为 count(仅 plural/selectordinal)
+    if block_type in ("plural", "selectordinal"):
+        selected = selected.replace("#", str(count))
+
+    # R56 §5.1: 子句中可能含简单 {var} 占位符(非 ICU),也需展开
+    # 例如 zh-CN: "{count, plural, =0 {无文件} other {{count} 个文件}}"
+    # selected = "{count} 个文件" — 需展开 {count}
+    selected = _icu_expand_simple_placeholders(selected, kwargs)
+
+    # 递归展开嵌套 ICU pattern(如子句中含 {var, plural, ...})
+    if _ICU_PATTERN.search(selected):
+        selected = _icu_select_branch(selected, locale, kwargs)
+
+    return var_name, selected, next_idx
+
+
+def _icu_expand_simple_placeholders(text: str, kwargs: dict) -> str:
+    """R56 §5.1: 展开文本中的简单 {var} 占位符(非 ICU pattern)。
+
+    与 format_message 类似,但:
+    - 不处理 ICU pattern(由 _icu_select_branch 递归处理)
+    - kwargs 中 None 值转为空字符串
+    - 转义的 \\{var} 不展开
+
+    Args:
+        text: 待展开的文本
+        kwargs: 插值参数
+
+    Returns:
+        展开后的文本(简单 {var} 已替换)
+    """
+    if not text or "{" not in text:
+        return text
+    # 按顺序处理:先转义 \\{ ,再展开 {var}
+    parts: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        brace_idx = text.find("{", i)
+        if brace_idx == -1:
+            parts.append(text[i:])
+            break
+        # 转义 \{ :原样输出 { (吞掉反斜杠)
+        if brace_idx > 0 and text[brace_idx - 1] == "\\":
+            parts.append(text[i:brace_idx - 1])
+            parts.append("{")
+            i = brace_idx + 1
+            continue
+        # 转义 \} :原样输出 }
+        # 输出 { 之前的文本
+        parts.append(text[i:brace_idx])
+        # 查找匹配的 }
+        depth = 1
+        j = brace_idx + 1
+        while j < n and depth > 0:
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if j >= n:
+            # 无匹配 },原样输出
+            parts.append(text[brace_idx:])
+            break
+        inner = text[brace_idx + 1: j]
+        # 检查是否为 ICU pattern({var, plural/select/...})
+        if _ICU_PATTERN.search("{" + inner + "}"):
+            # ICU pattern — 不在此展开,留给递归处理
+            parts.append(text[brace_idx: j + 1])
+        else:
+            # 简单 {var} 或 {var, format}(忽略 format)
+            simple_m = re.match(
+                r"^([a-zA-Z_][a-zA-Z0-9_]*)(?:\s*,\s*([a-zA-Z_]+))?\s*$",
+                inner.strip(),
+            )
+            if simple_m:
+                var_name = simple_m.group(1)
+                value = kwargs.get(var_name, "")
+                if value is None:
+                    value = ""
+                parts.append(str(value))
+            else:
+                # 不匹配简单模式,原样输出
+                parts.append(text[brace_idx: j + 1])
+        i = j + 1
+    return "".join(parts)
+
+
+def _icu_parse_branches(body: str) -> dict[str, str]:
+    """R56 §5.1: 解析 plural/select 子句 body,返回 {selector: text} dict。
+
+    body 形如: ``=0 {none} one {# item} other {# items}``
+    返回: ``{"=0": "none", "one": "# item", "other": "# items"}``
+    """
+    branches: dict[str, str] = {}
+    i = 0
+    n = len(body)
+    while i < n:
+        # 跳过空白
+        while i < n and body[i].isspace():
+            i += 1
+        if i >= n:
+            break
+        # 读取 selector(=N / one / other / male / female / ...)
+        selector_start = i
+        while i < n and not body[i].isspace() and body[i] != "{":
+            i += 1
+        selector = body[selector_start:i].strip()
+        if not selector:
+            break
+        # 跳过空白直到 {
+        while i < n and body[i].isspace():
+            i += 1
+        if i >= n or body[i] != "{":
+            break
+        # 读取 {..} 内容(考虑嵌套)
+        depth = 1
+        i += 1
+        text_start = i
+        while i < n and depth > 0:
+            if body[i] == "{":
+                depth += 1
+            elif body[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        branch_text = body[text_start:i]
+        i += 1  # 跳过 }
+        branches[selector] = branch_text
+    return branches
+
+
+def _icu_select_branch_by_count(
+    count: int, block_type: str, locale: str, branches: dict[str, str]
+) -> str:
+    """R56 §5.1: 根据 count + locale 选择合适的子句。
+
+    优先级:
+        1. 精确匹配 =N (如 =0 / =1)
+        2. plural: 按 CLDR 复数规则选择 one/other(简化:en=1 用 one,其他用 other;zh 始终 other)
+        3. select: 按 kwargs 中 var 的字符串值选择对应子句(其他→other)
+        4. 兜底: other
+    """
+    # 精确匹配 =N
+    exact_key = f"={count}"
+    if exact_key in branches:
+        return branches[exact_key]
+    # selectordinal: 简化为 "other"(完整 CLDR ordinal 规则复杂,按需扩展)
+    if block_type == "selectordinal":
+        return branches.get("other", "")
+    # plural: 按 locale 复数规则
+    if block_type == "plural":
+        if locale.startswith("zh"):
+            return branches.get("other", "")
+        # en-*: count == 1 用 one,其他用 other
+        if count == 1 and "one" in branches:
+            return branches["one"]
+        return branches.get("other", "")
+    # select: 按字符串值匹配(此处不直接用 count,留给调用方)
+    return branches.get("other", "")
+
+
+def _icu_format(text: str, locale: str, kwargs: dict) -> str:
+    """R56 §5.1: ICU MessageFormat 子集格式化入口。
+
+    处理顺序:
+        1. 优先展开所有 ICU plural/select 子句(从内向外)
+        2. 简单 {var} 插值
+
+    Returns:
+        格式化后的字符串
+    """
+    return _icu_select_branch(text, locale, kwargs)
 
 # ── R51 P1-9: 用户 locale LRU 缓存配置 ──────────────────────────
 # 缓存 TTL(秒,默认 5 分钟):超过后缓存条目视为过期,下次访问重新加载
@@ -367,6 +664,49 @@ class I18nManager:
 
     # ── R41 i18n 下一阶段: 格式化层(format_message / format_error_code /
     #                                  format_datetime / format_file_size) ──
+
+    def format_message_icu(self, key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
+        """R56 §5.1: ICU MessageFormat 格式化接口。
+
+        支持 ICU MessageFormat 子集语法:
+            - 简单插值:  ``Hello {name}``  →  Hello Alice
+            - plural:    ``{count, plural, =0 {none} one {# item} other {# items}}``
+            - select:    ``{gender, select, male {He} female {She} other {They}}``
+            - # 占位符:  在 plural/select 子句中 ``#`` 展开为 count 的值
+
+        向后兼容:
+            - 若文本不含 `{var,` (非 ICU pattern),回退到 format_message(简单 {var} 插值)
+            - 若 ICU 解析失败,回退到 format_message
+
+        Args:
+            key: 翻译 key(如 "common.files.count_icu")
+            locale: 目标 locale(默认 self.default_locale)
+            **kwargs: 插值参数(如 count=5 → 替换 {count, plural, ...})
+
+        Returns:
+            ICU MessageFormat 格式化后的字符串;失败回退到 format_message
+        """
+        target_locale = locale or self.default_locale
+        if target_locale not in self._translations:
+            if not self.load_locale(target_locale):
+                target_locale = _FALLBACK_LOCALE
+        text = self.translate(key, locale=target_locale)
+        if not text or not kwargs:
+            return text
+        # 若非 ICU pattern,回退到 format_message
+        if "{" not in text:
+            return text
+        # 检测是否含 ICU 语法({var, plural/select/...)
+        is_icu = _ICU_PATTERN.search(text) is not None
+        if not is_icu:
+            # 旧式 {var} 简单插值
+            return self.format_message(key, locale=target_locale, **kwargs)
+        # ICU 解析
+        try:
+            return _icu_format(text, target_locale, kwargs)
+        except Exception as e:
+            logger.debug(f"[i18n] format_message_icu 解析失败 key={key}: {e}")
+            return self.format_message(key, locale=target_locale, **kwargs)
 
     def format_message(self, key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
         """R41/R42/R45: 显式格式化接口 — 翻译 key 并用 {var} 占位符插值。
@@ -1134,3 +1474,108 @@ def parse_accept_language(header: Optional[str]) -> str:
     """
     manager = get_i18n_manager()
     return manager.parse_accept_language(header)
+
+
+# R56 §5.1: Telegram language_code → locale 映射
+# Telegram 传入的 language_code 是 BCP-47 前缀(如 "zh" / "en" / "ru" / "ja"),
+# 需映射到项目支持的标准 locale 标识符(如 "zh-CN" / "en-US")。
+_TELEGRAM_LANG_CODE_MAP: dict[str, str] = {
+    "zh": "zh-CN",
+    "zh-cn": "zh-CN",
+    "zh-hans": "zh-CN",
+    "zh-hant": "zh-CN",
+    "zh-tw": "zh-CN",
+    "zh-hk": "zh-CN",
+    "en": "en-US",
+    "en-us": "en-US",
+    "en-gb": "en-US",
+}
+
+
+def map_telegram_language_code(language_code: Optional[str]) -> str:
+    """R56 §5.1: 将 Telegram language_code 映射到项目支持的 locale。
+
+    Telegram 传入的 language_code 优先级低于用户在数据库中的显式 locale 设置,
+    但高于默认 locale 'zh-CN'。
+
+    locale 优先级链(R56 §5.1):
+        1. 用户在 users_local 表的显式 locale 设置(最高优先级)
+        2. Telegram language_code 映射的结果
+        3. workspace 默认 locale(可通过 set_default_locale 设置)
+        4. _DEFAULT_LOCALE = 'zh-CN'(兜底)
+
+    Args:
+        language_code: Telegram user.language_code(如 "zh" / "en" / "ru")
+
+    Returns:
+        匹配的 locale 标识符(如 "zh-CN" / "en-US");无匹配返回 _DEFAULT_LOCALE
+    """
+    if not language_code:
+        return _DEFAULT_LOCALE
+    # 规范化:小写 + 去除前后空白
+    code = str(language_code).strip().lower()
+    # 1. 精确匹配(如 "zh" / "en")
+    if code in _TELEGRAM_LANG_CODE_MAP:
+        return _TELEGRAM_LANG_CODE_MAP[code]
+    # 2. 前缀匹配(如 "zh-hans" / "en-gb")
+    prefix = code.split("-")[0]
+    if prefix in _TELEGRAM_LANG_CODE_MAP:
+        return _TELEGRAM_LANG_CODE_MAP[prefix]
+    # 3. 无匹配返回默认 locale
+    return _DEFAULT_LOCALE
+
+
+def get_locale_with_telegram_fallback(
+    user_id: int,
+    telegram_language_code: Optional[str] = None,
+) -> str:
+    """R56 §5.1: 带回退的 locale 选择 — 实现完整 locale 优先级链。
+
+    locale 优先级链(从高到低):
+        1. 用户在 users_local 表的显式 locale 设置(最高优先级)
+        2. Telegram language_code 映射的结果(若 user_id 无显式设置)
+        3. workspace 默认 locale
+        4. _DEFAULT_LOCALE = 'zh-CN'(兜底)
+
+    本函数用于 Telegram Bot handler 中:调用方传入 user_id 和 user.language_code,
+    得到最终决定要使用的 locale(用于 translate / format_message / format_message_icu)。
+
+    Args:
+        user_id: Telegram 用户 ID
+        telegram_language_code: Telegram user.language_code(如 "zh" / "en")
+
+    Returns:
+        用户 locale(若显式设置)> Telegram 映射 > workspace 默认 > 'zh-CN'
+    """
+    manager = get_i18n_manager()
+    # 1. 用户显式 locale(从 SQLite,带 LRU 缓存)
+    user_locale = manager.get_user_locale(user_id)
+    if user_locale and user_locale != _DEFAULT_LOCALE:
+        return user_locale
+    # 2. Telegram language_code fallback
+    if telegram_language_code:
+        mapped = map_telegram_language_code(telegram_language_code)
+        if mapped != _DEFAULT_LOCALE:
+            return mapped
+    # 3. workspace 默认 locale
+    if manager.default_locale != _DEFAULT_LOCALE:
+        return manager.default_locale
+    # 4. 兜底
+    return _DEFAULT_LOCALE
+
+
+def format_message_icu(key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
+    """R56 §5.1: 模块级便捷函数 — ICU MessageFormat 格式化。
+
+    等价于 I18nManager.format_message_icu()。
+
+    Args:
+        key: 翻译 key
+        locale: 目标 locale(默认 zh-CN)
+        **kwargs: 插值参数
+
+    Returns:
+        ICU 格式化后的字符串;解析失败回退到 format_message
+    """
+    manager = get_i18n_manager()
+    return manager.format_message_icu(key, locale=locale, **kwargs)

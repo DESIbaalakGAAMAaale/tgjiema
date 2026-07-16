@@ -112,7 +112,7 @@ class RelayInstance:
     def record_flood_wait(self, seconds: int):
         """记录 FloodWait,暂时标记账号不可用。"""
         self._floodwait_until = time.time() + seconds + 5
-        self._spawn(self._report_status("floodwait", f"限制{seconds}秒"))
+        self._spawn(self._report_status("floodwait", f"rate_limited_{seconds}s"))
         logger.warning(
             f"[RelayInstance:{self.phone}] FloodWait {seconds}s, "
             f"暂时不可用"

@@ -21,17 +21,45 @@ import * as crypto from 'crypto';
  * - admin bootstrap 已完成(R49: startup 自动 bootstrap 兜底)
  */
 
-// R49 P0-3: 生成默认 PBKDF2 hash(本地测试用,CI 中由 process.env.ADMIN_PASSWORD 覆盖)
+// R49 P0-3: 生成 PBKDF2 hash(仅由调用方提供 password,不内置默认值)
 // 格式: $pbkdf2-sha256$200000$<salt_hex>$<hash_hex>
 // 与 admin._verify_password / generate_password_hash 兼容
-function generateDefaultPasswordHash(password: string = 'test_bootstrap_pw'): string {
+function generatePasswordHash(password: string): string {
   const salt = crypto.randomBytes(16);
   const hash = crypto.pbkdf2Sync(password, salt, 200000, 32, 'sha256');
   return `$pbkdf2-sha256$200000$${salt.toString('hex')}$${hash.toString('hex')}`;
 }
 
+// R56 §6: 测试凭据必须从环境变量获取,禁止固定默认值
+// 本地运行请先设置以下环境变量:
+//   $env:ADMIN_TEST_PASSWORD="<your_password>"
+//   $env:BREAK_GLASS_PASSWORD="<your_password>"
+//   $env:SECRET_KEY="<your_secret>"
+//   $env:BOT_TOKEN="<your_test_token>"
+if (!process.env.ADMIN_TEST_PASSWORD) {
+  throw new Error(
+    'ADMIN_TEST_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值);' +
+    '本地运行请执行: $env:ADMIN_TEST_PASSWORD="<your_test_password>"'
+  );
+}
+if (!process.env.BREAK_GLASS_PASSWORD) {
+  throw new Error(
+    'BREAK_GLASS_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值)'
+  );
+}
+if (!process.env.SECRET_KEY) {
+  throw new Error(
+    'SECRET_KEY 环境变量必须设置(R56 §6: 禁止固定默认值)'
+  );
+}
+if (!process.env.BOT_TOKEN) {
+  throw new Error(
+    'BOT_TOKEN 环境变量必须设置(R56 §6: 禁止固定默认值)'
+  );
+}
+
 // R48 P0-3: webServer 必须显式继承的关键环境变量
-// R49 P0-3: ADMIN_PASSWORD 若未设置,自动生成 hash(本地测试)
+// R56 §6: 移除所有固定默认密码,缺失即抛错
 const WEB_SERVER_ENV: Record<string, string> = {
   // 数据库路径(必须与 bootstrap 步骤一致)
   DATABASE_URL: process.env.DATABASE_URL || 'sqlite://tmp/e2e_default.db',
@@ -41,17 +69,16 @@ const WEB_SERVER_ENV: Record<string, string> = {
   // Admin 凭证(必须与 bootstrap 步骤一致)
   ADMIN_USERNAME: process.env.ADMIN_USERNAME || 'admin',
   // R49 P0-3: ADMIN_PASSWORD 必须是 PBKDF2 hash 格式
-  // CI 中由 e2e.yml "Generate admin password hash" 步骤注入
-  // 本地无 CI 时自动生成 test_bootstrap_pw 的 hash
-  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || generateDefaultPasswordHash('test_bootstrap_pw'),
+  // R56 §6: 若未提供 hash,则从 ADMIN_TEST_PASSWORD 生成 hash(仍是显式输入,无固定默认)
+  ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || generatePasswordHash(process.env.ADMIN_TEST_PASSWORD),
   ADMIN_PRINCIPAL_ID: process.env.ADMIN_PRINCIPAL_ID || '1',
   ADMIN_PRINCIPAL_USERNAME: process.env.ADMIN_PRINCIPAL_USERNAME || 'admin',
   ADMIN_PRINCIPAL_BOOTSTRAP_ROLES: process.env.ADMIN_PRINCIPAL_BOOTSTRAP_ROLES || 'super_admin',
-  // 安全配置
-  SECRET_KEY: process.env.SECRET_KEY || 'test_secret_key_for_e2e_only',
-  BOT_TOKEN: process.env.BOT_TOKEN || 'test_token',
+  // 安全配置(R56 §6: 必须显式设置)
+  SECRET_KEY: process.env.SECRET_KEY,
+  BOT_TOKEN: process.env.BOT_TOKEN,
   CSRF_COOKIE_SECURE: process.env.CSRF_COOKIE_SECURE || 'false',
-  BREAK_GLASS_PASSWORD: process.env.BREAK_GLASS_PASSWORD || 'test_bootstrap_pw',
+  BREAK_GLASS_PASSWORD: process.env.BREAK_GLASS_PASSWORD,
   // Web 监听地址(必须与 baseURL 端口一致)
   ADMIN_WEB_HOST: process.env.ADMIN_WEB_HOST || '127.0.0.1',
   ADMIN_WEB_PORT: process.env.ADMIN_WEB_PORT || '8080',

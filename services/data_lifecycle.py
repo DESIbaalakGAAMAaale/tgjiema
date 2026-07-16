@@ -101,6 +101,126 @@ async def _ensure_retention_table() -> bool:
         return False
 
 
+async def _ensure_command_approvals_table() -> bool:
+    """R56 P0-2/P0-4: 惰性创建 command_approvals 表(双人审批持久化)。
+
+    表结构:
+        id              INTEGER PRIMARY KEY AUTOINCREMENT
+        action_id       TEXT NOT NULL  (关联 command_executions.action_id)
+        approver_id     BIGINT NOT NULL (审批人 principal_id)
+        approval_type   TEXT NOT NULL  (break_glass / quarantine_delete)
+        mfa_receipt     TEXT           (MFA 验证回执,如 TOTP timestamp)
+        approved_at     TEXT NOT NULL
+        metadata_json   TEXT           (额外元数据)
+
+    一个 action_id 可有多条记录(多人审批)。
+
+    Returns:
+        True 表就绪;False 创建失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        return False
+    try:
+        await store._db.execute(
+            """CREATE TABLE IF NOT EXISTS command_approvals (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id       TEXT NOT NULL,
+                approver_id     BIGINT NOT NULL,
+                approval_type   TEXT NOT NULL,
+                mfa_receipt     TEXT,
+                approved_at     TEXT NOT NULL,
+                metadata_json   TEXT,
+                UNIQUE(action_id, approver_id)
+            )"""
+        )
+        await store._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_command_approvals_action_id "
+            "ON command_approvals(action_id)"
+        )
+        await store._db.commit()
+        return True
+    except Exception as e:
+        logger.warning(f"[DataLifecycle] 创建 command_approvals 表失败: {e}")
+        return False
+
+
+async def _verify_break_glass_two_person_approval(
+    action_id: str,
+    expected_principal_id: int,
+) -> None:
+    """R56 P0-2: 校验 break-glass 双人审批已持久化到 command_approvals 表。
+
+    要求:
+    - command_approvals 表中对该 action_id 至少有 2 个不同的 approver
+    - 其中一个必须是 expected_principal_id(发起人不能自己审批自己)
+    - 每个 approver 必须有 mfa_receipt(非空)
+
+    Args:
+        action_id: 审批动作 ID
+        expected_principal_id: 发起人 principal_id(用于确认非自审批)
+
+    Raises:
+        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): 双人审批不足/MFA 缺失/自审批
+    """
+    store = get_cache_store()
+    if not store._db:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": "store_unavailable_for_two_person_check"},
+        )
+    await _ensure_command_approvals_table()
+    try:
+        rows = await store._db.execute_fetchall(
+            "SELECT approver_id, mfa_receipt FROM command_approvals "
+            "WHERE action_id = ? AND approval_type = 'break_glass'",
+            (action_id,),
+        )
+    except Exception as e:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": f"two_person_query_failed: {type(e).__name__}: {e}"},
+        ) from e
+    if not rows or len(rows) < 2:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={
+                "reason": "two_person_approval_required",
+                "current_approvers": len(rows) if rows else 0,
+                "required": 2,
+            },
+        )
+    approver_ids = set()
+    for r in rows:
+        approver_id = int(r[0] or 0)
+        mfa_receipt = str(r[1] or "")
+        if not mfa_receipt:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "mfa_receipt_missing",
+                    "approver_id": approver_id,
+                },
+            )
+        if approver_id == expected_principal_id:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "self_approval_forbidden",
+                    "principal_id": expected_principal_id,
+                },
+            )
+        approver_ids.add(approver_id)
+    if len(approver_ids) < 2:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={
+                "reason": "two_distinct_approvers_required",
+                "distinct_approvers": len(approver_ids),
+            },
+        )
+
+
 async def export_user_data(user_id: int) -> dict:
     """导出用户所有数据(GDPR/隐私合规)。
 
@@ -1084,24 +1204,53 @@ async def cleanup_expired_data(
                 params={"reason": "principal_id_required"},
             )
         # R55 P0-3: 验证审批 action_type 必须是 data_lifecycle_break_glass
+        # R56 P0-2: 删除 except Exception: pass(fail-closed),
+        #           同时校验 command_executions.principal_id 与传入的 principal_id 一致,
+        #           并校验双人审批已持久化到 command_approvals 表
         try:
             _type_rows = await store._db.execute_fetchall(
-                "SELECT command_type FROM command_executions WHERE action_id = ?",
+                "SELECT command_type, principal_id FROM command_executions "
+                "WHERE action_id = ?",
                 (approval_action_id,),
             )
-            if _type_rows and _type_rows[0]:
-                _cmd_type = _type_rows[0][0]
-                if _cmd_type != "data_lifecycle_break_glass":
-                    raise AppError(
-                        ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                        params={"reason": "invalid_action_type",
-                                "expected": "data_lifecycle_break_glass",
-                                "actual": _cmd_type},
-                    )
+            if not _type_rows or not _type_rows[0]:
+                raise AppError(
+                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                    params={"reason": "approval_record_not_found"},
+                )
+            _cmd_type = _type_rows[0][0]
+            _stored_principal_id = int(_type_rows[0][1] or 0)
+            if _cmd_type != "data_lifecycle_break_glass":
+                raise AppError(
+                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                    params={"reason": "invalid_action_type",
+                            "expected": "data_lifecycle_break_glass",
+                            "actual": _cmd_type},
+                )
+            # R56 P0-2: principal_id 必须与 command_executions 记录一致(防越权)
+            if _stored_principal_id != principal_id:
+                raise AppError(
+                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                    params={
+                        "reason": "principal_id_mismatch",
+                        "stored": _stored_principal_id,
+                        "passed": principal_id,
+                    },
+                )
         except AppError:
             raise
-        except Exception:
-            pass
+        except Exception as e:
+            # R56 P0-2: fail-closed — 不再吞异常,任何查询错误都阻断
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={"reason": f"command_type_verification_failed: "
+                                  f"{type(e).__name__}: {e}"},
+            ) from e
+        # R56 P0-2: 校验双人审批已持久化(≥2 approver + MFA receipt + 非自审批)
+        await _verify_break_glass_two_person_approval(
+            action_id=approval_action_id,
+            expected_principal_id=principal_id,
+        )
         import socket as _socket
         _owner = f"{_socket.gethostname()}:{os.getpid()}"
         try:
@@ -1245,16 +1394,36 @@ async def cleanup_expired_data(
         if total_cleaned >= batch_size:
             break
     # R54 P0-3: break-glass 审批成功后标记 executed
+    # R56 P0-3: committed_delta 模式 — 删除计数作为 result 传给 mark_approved_executed,
+    #           命令状态回写失败必须 raise(不再只 log 后返回 total_cleaned,
+    #           否则会出现"数据已删但命令状态仍 executing"的不一致)
     if _break_glass_claimed and approval_action_id:
         try:
-            await mark_approved_executed(
+            _executed_ok = await mark_approved_executed(
                 action_id=approval_action_id,
                 result={"total_cleaned": total_cleaned},
             )
         except Exception as mark_err:
-            logger.error(
-                f"[DataLifecycle] mark_approved_executed 失败 "
-                f"approval_action_id={approval_action_id}: {mark_err}"
+            # R56 P0-3: mark_approved_executed 抛异常时,删除已提交无法回滚,
+            # 必须向上传播让调用方进入 reconciliation(不可静默返回成功)
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "mark_approved_executed_failed_after_delete",
+                    "action_id": approval_action_id,
+                    "total_cleaned": total_cleaned,
+                    "error": f"{type(mark_err).__name__}: {mark_err}",
+                },
+            ) from mark_err
+        if not _executed_ok:
+            # R56 P0-3: CAS 未命中(状态非 executing)也视为不一致,raise
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "mark_approved_executed_cas_missed",
+                    "action_id": approval_action_id,
+                    "total_cleaned": total_cleaned,
+                },
             )
     logger.info(
         f"[DataLifecycle] cleanup_expired_data 清理 {total_cleaned} 行 "

@@ -57,6 +57,22 @@
             outline: 2px solid #0066cc; outline-offset: 2px;
         }
         :focus-visible { outline: 3px solid #0066cc !important; outline-offset: 2px !important; }
+        /* R56 §6: 320px reflow(WCAG 2.2 AA 1.4.10 Reflow)— 窄屏下 sidebar 改为顶部水平条,main 占满宽度 */
+        @media (max-width: 576px) {
+            .sidebar {
+                position: static; width: 100%; height: auto; padding-top: 8px;
+                display: flex; flex-wrap: wrap; gap: 4px; padding: 8px;
+            }
+            .sidebar h2 { width: 100%; padding: 0 8px 8px; font-size: 16px; }
+            .sidebar a { padding: 8px 12px; font-size: 13px; }
+            .main { margin-left: 0; padding: 12px; }
+            .cards { grid-template-columns: 1fr; gap: 8px; }
+            .card { padding: 12px; }
+            .card .value { font-size: 24px; }
+            .section { padding: 12px; }
+            table { font-size: 12px; }
+            th, td { padding: 6px 8px; }
+        }
     </style>
 </head>
 <body>

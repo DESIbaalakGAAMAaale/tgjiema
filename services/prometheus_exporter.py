@@ -1004,7 +1004,7 @@ def check_readiness() -> dict:
         except Exception as e:
             details["sqlite_readable"] = f"FAIL: {e}"
     else:
-        details["sqlite_readable"] = f"FAIL: 文件不存在 {CACHE_STORE_DB}"
+        details["sqlite_readable"] = f"FAIL: file not found {CACHE_STORE_DB}"
     checks["sqlite_readable"] = sqlite_ok
 
     # 2. 最近采集成功(_last_scrape_ok + data_age 未超阈值)
@@ -1143,8 +1143,8 @@ def check_readiness() -> dict:
     _acl_configured = (not missing_envs)
     checks["acl_configured"] = _acl_configured
     details["acl_configured"] = (
-        "OK: 4 个 REDIS_*_PASSWORD 均配置" if _acl_configured
-        else f"FAIL: 缺失 {missing_envs}"
+        "OK: all 4 REDIS_*_PASSWORD env vars configured" if _acl_configured
+        else f"FAIL: missing {missing_envs}"
     )
 
     # R41 P1-10: RU 采集状态(unknown vs 数字)

@@ -30,8 +30,13 @@ const AXE_RESULTS_DIR = path.join(__dirname, 'e2e-results');
 // R55: WCAG 2.2 A/AA 完整规则标签集
 const WCAG_TAGS = ['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'];
 
-// R47 P0-3: 测试用登录密码(从环境变量读取,与 ADMIN_BOOTSTRAP_PASSWORD 对应)
-const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD || 'test_bootstrap_pw';
+// R56 §6: 测试用登录密码必须从环境变量获取,缺失则立即失败
+if (!process.env.ADMIN_TEST_PASSWORD) {
+  throw new Error(
+    'ADMIN_TEST_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值)'
+  );
+}
+const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD;
 
 // R55: 所有需要认证的 Admin 路由(与 base.html 导航链接 + /mfa/setup 一致)
 const AUTHENTICATED_ROUTES: ReadonlyArray<{ path: string; name: string }> = [
