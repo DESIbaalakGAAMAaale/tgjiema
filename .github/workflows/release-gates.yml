@@ -1362,6 +1362,19 @@ jobs:
         set -euo pipefail
         echo "=== R60 P0-06: Release Gate Aggregate Summary ==="
         echo "Aggregating release gate conclusions..."
+        # R60 §ci-fix: 区分 PR 与 release target(push to master/main)。
+        # sign-image / publish-attestation 的 if: 仅在 push 到 master/main 时运行,
+        # 在 PR 上必然 skipped。若一律要求 success 会让所有 PR 永久失败(过度阻断)。
+        # 正确语义:
+        #   - release target(master/main push): 全部 13 个 job 必须 success
+        #     (sign-image/publish-attestation 此时必须运行且成功,这正是 P0-06 要兜的底)
+        #   - PR: 11 个常驻 job 必须 success;sign-image/publish-attestation
+        #     允许 skipped(其 if: 未满足),但 failure 仍阻断
+        RELEASE_TARGET=false
+        if [ "${GITHUB_EVENT_NAME}" = "push" ] && { [ "${GITHUB_REF}" = "refs/heads/master" ] || [ "${GITHUB_REF}" = "refs/heads/main" ]; }; then
+          RELEASE_TARGET=true
+        fi
+        echo "Release target (master/main push): ${RELEASE_TARGET}"
         FAIL=0
         for entry in \
           "docker-build=${DOCKER_BUILD}" \
@@ -1380,9 +1393,27 @@ jobs:
           job="${entry%%=*}"
           conclusion="${entry##*=}"
           echo "  ${job}: ${conclusion}"
-          if [ "${conclusion}" != "success" ]; then
-            echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
-            FAIL=1
+          # sign-image / publish-attestation: master-only job,PR 上可 skipped
+          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ]; then
+            if [ "${RELEASE_TARGET}" = "true" ]; then
+              # release target: 必须成功(skipped = 供应链断裂,P0-06 必须兜住)
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on release target (got: ${conclusion})"
+                FAIL=1
+              fi
+            else
+              # PR: 允许 skipped(if: 未满足),但 failure/cancelled 仍阻断
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed on PR (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
+          else
+            # 常驻 job: 任何场景都必须 success
+            if [ "${conclusion}" != "success" ]; then
+              echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+              FAIL=1
+            fi
           fi
         done
         if [ "${FAIL}" -ne 0 ]; then
