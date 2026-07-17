@@ -1796,8 +1796,9 @@ async def set_locale_endpoint(
         # 持久化失败不阻断切换(cookie 仍生效),仅记录日志
         from loguru import logger as _logger
         _logger.warning(_i18n_t('admin.__init__.s38', admin_id=admin.id, lang=lang, locale_err=locale_err))
-    # 重定向回来源页或 /dashboard
-    referer = request.headers.get("referer", "") or "/dashboard"
+    # 重定向回来源页或根路由(原 /dashboard 路由不存在会 404,
+    # dashboard 实际挂在根路由 "/",R60 §ci-fix 修正死链)
+    referer = request.headers.get("referer", "") or "/"
     response = RedirectResponse(url=referer, status_code=303)
     # 设置 locale cookie(供 _make_csrf_response 读取)
     response.set_cookie(

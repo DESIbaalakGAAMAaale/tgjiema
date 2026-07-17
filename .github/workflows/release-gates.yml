@@ -1332,9 +1332,10 @@ jobs:
   #     - if: always() — 依赖失败/跳过时仍运行,报告聚合状态
   #     - 任何一个依赖 job 的 conclusion != success 时,本 job exit 1
   #     - 替代 per-job required context(避免 race/ordering 问题)
-  #   注意:GitHub Actions 表达式 ${{ needs.${job}.conclusion }} 不能在 bash
+  #   注意:GitHub Actions 表达式 ${{ needs.${job}.result }} 不能在 bash
   #   循环里用变量插值(表达式在 shell 运行前已静态展开),因此通过 job 级
-  #   env 显式传递每个 needs.<job>.conclusion,再在 shell 中逐项校验。
+  #   env 显式传递每个 needs.<job>.result,再在 shell 中逐项校验。
+  #   (needs 上下文属性为 result,不是 conclusion;conclusion 属于 steps 上下文)
   release-summary:
     runs-on: ubuntu-latest
     if: always()
@@ -1342,19 +1343,19 @@ jobs:
             schema-diff, backup-restore-drill, sbom, pip-audit, trivy,
             sign-image, verify-branch-protection, rc-continuity, publish-attestation]
     env:
-      DOCKER_BUILD: ${{ needs.docker-build.conclusion }}
-      DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.conclusion }}
-      COMPOSE_CONFIG: ${{ needs.compose-config.conclusion }}
-      REDIS_ACL_MATRIX: ${{ needs.redis-acl-matrix.conclusion }}
-      SCHEMA_DIFF: ${{ needs.schema-diff.conclusion }}
-      BACKUP_RESTORE_DRILL: ${{ needs.backup-restore-drill.conclusion }}
-      SBOM: ${{ needs.sbom.conclusion }}
-      PIP_AUDIT: ${{ needs.pip-audit.conclusion }}
-      TRIVY: ${{ needs.trivy.conclusion }}
-      SIGN_IMAGE: ${{ needs.sign-image.conclusion }}
-      VERIFY_BRANCH_PROTECTION: ${{ needs.verify-branch-protection.conclusion }}
-      RC_CONTINUITY: ${{ needs.rc-continuity.conclusion }}
-      PUBLISH_ATTESTATION: ${{ needs.publish-attestation.conclusion }}
+      DOCKER_BUILD: ${{ needs.docker-build.result }}
+      DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.result }}
+      COMPOSE_CONFIG: ${{ needs.compose-config.result }}
+      REDIS_ACL_MATRIX: ${{ needs.redis-acl-matrix.result }}
+      SCHEMA_DIFF: ${{ needs.schema-diff.result }}
+      BACKUP_RESTORE_DRILL: ${{ needs.backup-restore-drill.result }}
+      SBOM: ${{ needs.sbom.result }}
+      PIP_AUDIT: ${{ needs.pip-audit.result }}
+      TRIVY: ${{ needs.trivy.result }}
+      SIGN_IMAGE: ${{ needs.sign-image.result }}
+      VERIFY_BRANCH_PROTECTION: ${{ needs.verify-branch-protection.result }}
+      RC_CONTINUITY: ${{ needs.rc-continuity.result }}
+      PUBLISH_ATTESTATION: ${{ needs.publish-attestation.result }}
     steps:
     - name: Verify all required jobs succeeded
       run: |

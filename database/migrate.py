@@ -208,11 +208,17 @@ async def _apply_single_migration(db: Any, migration_file: Path) -> bool:
     )
     start_ts = time.perf_counter()
     # R60 P0-05: 显式事务 — 单个 migration 的所有 DDL + 版本记录 INSERT 必须原子提交
+    # R60 §ci-fix: except 中不直接 return False(AST 错误协议规则3),
+    # 改用标志位在 except 外返回,保持 bool 契约同时满足 fail-closed
+    begin_failed = False
     try:
         await db.execute("BEGIN IMMEDIATE")
     except Exception as e:
         logger.error(f"[migrate] {version} BEGIN IMMEDIATE 失败: {e}")
+        begin_failed = True
+    if begin_failed:
         return False
+    commit_failed = False
     try:
         for stmt in statements:
             try:
@@ -251,6 +257,8 @@ async def _apply_single_migration(db: Any, migration_file: Path) -> bool:
             await db.execute("ROLLBACK")
         except Exception as rollback_err:
             logger.error(f"[migrate] {version} ROLLBACK 失败: {rollback_err}")
+        commit_failed = True
+    if commit_failed:
         return False
     logger.info(
         f"[migrate] {version} 应用完成(耗时 {duration_ms}ms)"
