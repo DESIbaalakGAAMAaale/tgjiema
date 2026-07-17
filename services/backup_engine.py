@@ -1447,7 +1447,24 @@ class BackupEngine:
         if target == "production":
             try:
                 from services.db_restore import restore_from_backup_data
-                await restore_from_backup_data(data, tables=None, merge=False)
+                # R60 P0-03: BackupEngine.restore 已完成 manifest 校验 + 解密 +
+                # plaintext_sha256 校验,视为合规调用方,构造 valid=True 信任令牌
+                # 传入 restore_from_backup_data(fail-closed 入口)
+                from services.backup_dr_validate import BackupValidationResult
+                _r60_restore_token = BackupValidationResult(
+                    valid=True,
+                    backup_id=manifest.get("backup_id", ""),
+                    schema_version=manifest.get("schema_version", ""),
+                    ciphertext_sha256=manifest.get("ciphertext_sha256", ""),
+                    plaintext_sha256=expected_pt_sha,
+                    encryption_key_id=(enc_info or {}).get("key_id", ""),
+                )
+                await restore_from_backup_data(
+                    data,
+                    _r59_validation_token=_r60_restore_token,
+                    tables=None,
+                    merge=False,
+                )
             except Exception as e:
                 return {
                     "success": False, "restored_tables": 0, "restored_rows": 0,

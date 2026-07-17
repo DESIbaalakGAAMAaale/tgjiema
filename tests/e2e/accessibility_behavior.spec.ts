@@ -1,4 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
+import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -32,9 +33,54 @@ if (!process.env.ADMIN_TEST_PASSWORD) {
 }
 const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD;
 
+/**
+ * R60 §13 无障碍专项: 导航并硬断言页面加载成功。
+ *
+ * 修复假阴性: 原 `page.goto(...).catch(() => {})` 和
+ * `waitForLoadState(...).catch(() => {})` 吞掉 404/500/重定向回登录/超时,
+ * 页面加载失败时 dialog count=0,仍可能与静态 0 一致而产生假 PASS。
+ *
+ * 断言:
+ *   1. response 非空(goto 实际发生且拿到响应)
+ *   2. response.status() < 400(无 4xx/5xx)
+ *   3. 最终 URL 等于目标(无意外重定向)— redirect 端点(如 /locale)跳过
+ *   4. 未回登录页(除非目标本身就是 /login)
+ *   5. 页面存在唯一 heading/landmark(恰好一个 h1 或一个 main/role=main,
+ *      证明加载了真实页面内容,非 404/500/空白)
+ */
+async function navigateAndAssert(
+  page: Page,
+  targetPath: string,
+  options: { expectLogin?: boolean; allowRedirect?: boolean } = {},
+): Promise<void> {
+  const response = await page.goto(targetPath);
+  // (1) response 非空
+  expect(response).not.toBeNull();
+  // (2) status < 400
+  expect(response!.status()).toBeLessThan(400);
+  // (3) 最终 URL 等于目标(无意外重定向);redirect 端点跳过此断言
+  if (!options.allowRedirect) {
+    const expected = targetPath.split('?')[0];
+    if (expected === '/') {
+      expect(page.url()).toMatch(/\/$/);
+    } else {
+      expect(page.url()).toContain(expected);
+    }
+  }
+  // (4) 除非目标本身就是 /login,否则不应被重定向回登录页
+  if (!options.expectLogin) {
+    expect(page.url()).not.toMatch(/\/login/i);
+  }
+  // (5) 唯一 heading/landmark(login 页有 1 个 h1;admin 页 base.html 有 1 h1 + 1 main)
+  const h1Count = await page.locator('h1').count();
+  const mainCount = await page.locator('main, [role="main"]').count();
+  expect(h1Count === 1 || mainCount === 1).toBe(true);
+}
+
 /** 登录辅助 */
 async function login(page: Page): Promise<void> {
-  await page.goto('/login');
+  // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+  await navigateAndAssert(page, '/login', { expectLogin: true });
   await page.fill('input[name="username"]', 'admin');
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
@@ -47,7 +93,8 @@ async function login(page: Page): Promise<void> {
 
 test.describe('R56 §6: 键盘导航行为', () => {
   test('登录页可通过键盘完整流转(Tab/Shift+Tab/Enter)', async ({ page }: { page: Page }) => {
-    await page.goto('/login');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+    await navigateAndAssert(page, '/login', { expectLogin: true });
 
     // 初始焦点在 body(或第一个可聚焦元素)
     await page.keyboard.press('Tab');
@@ -75,7 +122,8 @@ test.describe('R56 §6: 键盘导航行为', () => {
   });
 
   test('登录页 Escape 不应困住焦点(可在文档内自由流转)', async ({ page }: { page: Page }) => {
-    await page.goto('/login');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+    await navigateAndAssert(page, '/login', { expectLogin: true });
     await page.keyboard.press('Tab');
 
     // Escape 不应导致焦点丢失或死锁
@@ -91,7 +139,8 @@ test.describe('R56 §6: 键盘导航行为', () => {
 
   test('dashboard 可通过 Tab 完整流转(无键盘陷阱,焦点顺序无死循环)', async ({ page }: { page: Page }) => {
     await login(page);
-    await page.goto('/');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/重定向回登录/超时)
+    await navigateAndAssert(page, '/');
 
     // R58 P1-7: 连续 Tab 20 次,记录所有焦点,验证:
     //   1. 每次都有可聚焦元素(不陷入死锁)
@@ -241,6 +290,55 @@ function discoverDialogRoutesFromTemplates(): DiscoveryResult {
 const _dialogDiscovery: DiscoveryResult = discoverDialogRoutesFromTemplates();
 const dialogRoutes: DialogRoute[] = _dialogDiscovery.routes;
 
+// ─────────────────────────────────────────────────────────────
+// R60 §13: 路由清单 parity — 从应用路由定义导出 machine-readable inventory
+//
+// 审计报告 §13:"TEMPLATE_TO_ROUTE 仍是人工维护数组,不等同于从 FastAPI/Flask
+// route inventory 自动发现全部路由。""修复:从应用路由清单导出 machine-readable
+// inventory,CI 对比模板和 E2E 覆盖;新增 Admin GET/POST 必须自动进入。"
+//
+// 策略:运行 scripts/export_admin_routes.py(导入 admin.app,枚举 @app.get/@app.post),
+// 输出 JSON inventory。parity 测试对比 TEMPLATE_TO_ROUTE 与 inventory,新增 admin
+// GET 页面路由未进入 TEMPLATE_TO_ROUTE 即失败(禁止静默漏覆盖)。
+// ─────────────────────────────────────────────────────────────
+
+// 非 dialog 发现矩阵目标的 GET 路由(基础设施 / 独立测试覆盖 / 非页面)。
+// 这些路由由其他测试覆盖或本身不是 HTML 页面,故不纳入 TEMPLATE_TO_ROUTE 的 parity 范围。
+const NON_DIALOG_ROUTE_EXCLUSIONS = new Set<string>([
+  '/login',        // 独立 a11y 测试覆盖(accessibility.spec.ts 未认证用例 + 本文件键盘/zoom/reflow)
+  '/mfa/setup',    // 独立 a11y 测试覆盖(accessibility.spec.ts AUTHENTICATED_ROUTES)
+  '/health',       // JSON 健康检查端点(非 HTML 页面)
+  '/readiness',    // JSON readiness 探针(非 HTML 页面)
+  '/locale',       // 重定向端点(303 → referer,非页面)
+  '/docs',         // FastAPI OpenAPI Swagger 文档(非生产路由)
+  '/redoc',        // FastAPI ReDoc 文档(非生产路由)
+  '/openapi.json', // FastAPI OpenAPI schema(非生产路由)
+]);
+
+/** R60 §13: 运行 scripts/export_admin_routes.py 导出 admin 路由 inventory(JSON)。
+ *  失败时抛错(禁止静默跳过)— Python/fastapi 缺失即说明 E2E 环境未正确初始化
+ *  (webServer 依赖 uvicorn + admin 模块,二者必须先 pip install -r requirements.txt)。 */
+function loadAdminRouteInventory(): { path: string; methods: string[] }[] {
+  const repoRoot = path.resolve(__dirname, '..', '..');
+  const scriptPath = path.join(repoRoot, 'scripts', 'export_admin_routes.py');
+  let stdout: string;
+  try {
+    stdout = execSync(`python "${scriptPath}"`, {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      timeout: 30_000,
+      env: process.env,
+    });
+  } catch (err) {
+    throw new Error(
+      `R60 §13 parity: 无法导出 admin 路由 inventory (${scriptPath})。` +
+      `E2E 环境必须先 pip install -r requirements.txt。错误: ` +
+      (err instanceof Error ? err.message : String(err))
+    );
+  }
+  return JSON.parse(stdout);
+}
+
 test.describe('R59 §5.4 P1: dialog 路由自动发现与焦点恢复', () => {
   // ─ 发现测试 1:静态分析覆盖全部模板,矩阵动态生成(禁止静默空矩阵) ─
   test('dialog 路由自动发现:静态解析全部 admin 模板,矩阵动态生成非硬编码 []', () => {
@@ -263,6 +361,26 @@ test.describe('R59 §5.4 P1: dialog 路由自动发现与焦点恢复', () => {
     );
   });
 
+  // ─ R60 §13 parity: TEMPLATE_TO_ROUTE 必须覆盖全部 admin GET 页面路由 ─
+  // 自动发现:新增 Admin GET 页面路由必须自动进入 inventory;未进入 TEMPLATE_TO_ROUTE
+  // (且不在 NON_DIALOG_ROUTE_EXCLUSIONS)即失败 — 禁止人工数组漏覆盖。
+  test('R60 §13 parity: TEMPLATE_TO_ROUTE 覆盖全部 admin GET 页面路由(自动发现,禁止漏覆盖/过期)', () => {
+    const inventory = loadAdminRouteInventory();
+    const inventoryGetPagePaths = inventory
+      .filter(r => r.methods.includes('GET') && !NON_DIALOG_ROUTE_EXCLUSIONS.has(r.path))
+      .map(r => r.path);
+    const templatePaths = new Set(TEMPLATE_TO_ROUTE.map(r => r.path));
+
+    // (a) 漏覆盖:inventory 中有 admin GET 页面路由未进入 TEMPLATE_TO_ROUTE
+    const uncovered = inventoryGetPagePaths.filter(p => !templatePaths.has(p));
+    expect(uncovered).toEqual([]);
+
+    // (b) 过期:TEMPLATE_TO_ROUTE 中有路由不在 inventory(已被删除或改名)
+    const inventoryPaths = new Set(inventory.map(r => r.path));
+    const stale = TEMPLATE_TO_ROUTE.filter(r => !inventoryPaths.has(r.path)).map(r => r.path);
+    expect(stale).toEqual([]);
+  });
+
   // ─ 发现测试 2:运行时爬取全部 admin 路由(zh-CN + en-US),与静态分析一致 ─
   // R59 §5.4 P1 req1:爬取所有 Admin 页面及中英 locale;发现 [role=dialog] 自动纳入矩阵
   test('dialog 运行时发现:爬取全部 admin 路由(zh-CN + en-US locale),与静态分析一致', async ({ page }: { page: Page }) => {
@@ -272,22 +390,25 @@ test.describe('R59 §5.4 P1: dialog 路由自动发现与焦点恢复', () => {
     const runtimeFound: string[] = [];
     for (const entry of TEMPLATE_TO_ROUTE) {
       // zh-CN(默认 locale):访问路由并探测 dialog
-      await page.goto(entry.path).catch(() => {});
-      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
+      // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/重定向回登录/超时 → 假 dialog count=0)
+      await navigateAndAssert(page, entry.path);
+      await page.waitForLoadState('networkidle', { timeout: 5_000 });
       const countZh = await page.locator(DIALOG_RUNTIME_SELECTOR).count();
       // en-US:先调用 /locale?lang=en-US 设置 locale cookie(端点会重定向回来源页),
       //       再访问同一路由,探测 dialog(防止 locale 切换引入/移除 dialog)
-      await page.goto('/locale?lang=en-US').catch(() => {});
-      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
-      await page.goto(entry.path).catch(() => {});
-      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
+      // R60 §13: /locale 是重定向端点,用 allowRedirect 跳过 URL-contains 断言;
+      //          status<400 + heading 断言仍生效,确保重定向目标真实加载。
+      await navigateAndAssert(page, '/locale?lang=en-US', { allowRedirect: true });
+      await page.waitForLoadState('networkidle', { timeout: 5_000 });
+      await navigateAndAssert(page, entry.path);
+      await page.waitForLoadState('networkidle', { timeout: 5_000 });
       const countEn = await page.locator(DIALOG_RUNTIME_SELECTOR).count();
       if (countZh > 0 || countEn > 0) {
         runtimeFound.push(entry.name);
       }
       // 切回 zh-CN,避免影响后续测试的 locale 默认值
-      await page.goto('/locale?lang=zh-CN').catch(() => {});
-      await page.waitForLoadState('networkidle', { timeout: 5_000 }).catch(() => {});
+      await navigateAndAssert(page, '/locale?lang=zh-CN', { allowRedirect: true });
+      await page.waitForLoadState('networkidle', { timeout: 5_000 });
     }
     // 运行时发现的路由集合应与静态分析一致(防止 JS 注入 dialog 漏检或静态分析误判)
     const staticNames = dialogRoutes.map(r => r.name).sort();
@@ -301,7 +422,8 @@ test.describe('R59 §5.4 P1: dialog 路由自动发现与焦点恢复', () => {
   for (const route of dialogRoutes) {
     test(`${route.name}: dialog 打开后焦点在 dialog 内,关闭后返回触发按钮`, async ({ page }: { page: Page }) => {
       await login(page);
-      await page.goto(route.path);
+      // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+      await navigateAndAssert(page, route.path);
 
       // 查找可打开 dialog 的按钮
       const dialogTrigger = page.locator('button[aria-haspopup="dialog"], button[data-bs-toggle="modal"]').first();
@@ -345,7 +467,8 @@ test.describe('R59 §5.4 P1: dialog 路由自动发现与焦点恢复', () => {
 
     test(`${route.name}: dialog 打开后 Tab 仅在 dialog 内流转(焦点陷阱)`, async ({ page }: { page: Page }) => {
       await login(page);
-      await page.goto(route.path);
+      // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+      await navigateAndAssert(page, route.path);
 
       const dialogTrigger = page.locator('button[aria-haspopup="dialog"], button[data-bs-toggle="modal"]').first();
       const hasDialog = await dialogTrigger.count().catch(() => 0);
@@ -379,7 +502,8 @@ test.describe('R59 §5.4 P1: dialog 路由自动发现与焦点恢复', () => {
 test.describe('R56 §6: aria-live 状态宣告', () => {
   test('页面应包含 aria-live 区域用于异步状态宣告', async ({ page }: { page: Page }) => {
     await login(page);
-    await page.goto('/');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/重定向回登录/超时)
+    await navigateAndAssert(page, '/');
 
     // 检查页面中是否存在 aria-live 区域(polite 或 assertive)
     const liveRegions = page.locator('[aria-live="polite"], [aria-live="assertive"], [role="status"], [role="alert"]');
@@ -393,7 +517,8 @@ test.describe('R56 §6: aria-live 状态宣告', () => {
 
   test('错误状态应通过 role="alert" 或 aria-live 宣告', async ({ page }: { page: Page }) => {
     // 登录失败时应通过 aria-live 宣告错误
-    await page.goto('/login');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+    await navigateAndAssert(page, '/login', { expectLogin: true });
     await page.fill('input[name="username"]', 'admin');
     await page.fill('input[name="password"]', 'wrong_password_xyz');
     await page.click('button[type="submit"]');
@@ -410,7 +535,8 @@ test.describe('R56 §6: aria-live 状态宣告', () => {
 
 test.describe('R56 §6: zoom 缩放(200% / 400%)', () => {
   test('登录页 200% zoom 不破坏布局', async ({ page }: { page: Page }) => {
-    await page.goto('/login');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+    await navigateAndAssert(page, '/login', { expectLogin: true });
     await page.setViewportSize({ width: 640, height: 360 });  // 1280/2, 720/2
 
     // 关键元素仍可见可操作
@@ -429,7 +555,8 @@ test.describe('R56 §6: zoom 缩放(200% / 400%)', () => {
   });
 
   test('登录页 400% zoom 不破坏布局', async ({ page }: { page: Page }) => {
-    await page.goto('/login');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+    await navigateAndAssert(page, '/login', { expectLogin: true });
     await page.setViewportSize({ width: 320, height: 180 });  // 1280/4, 720/4
 
     // 400% zoom 下关键元素仍可见(可能需要滚动)
@@ -444,7 +571,8 @@ test.describe('R56 §6: zoom 缩放(200% / 400%)', () => {
 
   test('dashboard 200% zoom 关键元素可见', async ({ page }: { page: Page }) => {
     await login(page);
-    await page.goto('/');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/重定向回登录/超时)
+    await navigateAndAssert(page, '/');
     await page.setViewportSize({ width: 640, height: 360 });
 
     // dashboard 关键内容应可见(可能需要滚动,但不应溢出隐藏)
@@ -469,7 +597,8 @@ test.describe('R56 §6: zoom 缩放(200% / 400%)', () => {
 
 test.describe('R56 §6: 320 CSS px reflow', () => {
   test('登录页 320px reflow 不溢出', async ({ page }: { page: Page }) => {
-    await page.goto('/login');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+    await navigateAndAssert(page, '/login', { expectLogin: true });
     await page.setViewportSize({ width: 320, height: 568 });  // iPhone SE
 
     // 关键元素仍可见
@@ -487,7 +616,8 @@ test.describe('R56 §6: 320 CSS px reflow', () => {
 
   test('dashboard 320px reflow 不破坏关键内容', async ({ page }: { page: Page }) => {
     await login(page);
-    await page.goto('/');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/重定向回登录/超时)
+    await navigateAndAssert(page, '/');
     await page.setViewportSize({ width: 320, height: 568 });
 
     // body 可见
@@ -514,7 +644,8 @@ test.describe('R56 §6: prefers-reduced-motion', () => {
       reducedMotion: 'reduce',
     });
     const page = await context.newPage();
-    await page.goto('/login');
+    // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+    await navigateAndAssert(page, '/login', { expectLogin: true });
 
     // 检查 CSS 中是否有 prefers-reduced-motion 媒体查询
     const hasReducedMotionQuery = await page.evaluate(() => {

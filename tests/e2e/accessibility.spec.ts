@@ -94,20 +94,68 @@ function logViolations(pageName: string, violations: any[]): void {
   }
 }
 
+/**
+ * R60 §13 无障碍专项: 导航并硬断言页面加载成功。
+ *
+ * 修复假阴性: 原 `page.goto(...).catch(() => {})` 和
+ * `waitForLoadState(...).catch(() => {})` 吞掉 404/500/重定向回登录/超时,
+ * 页面加载失败时 axe 扫描的是错误页/登录页而非目标页,仍可能产生假 PASS。
+ *
+ * 断言:
+ *   1. response 非空(goto 实际发生且拿到响应)
+ *   2. response.status() < 400(无 4xx/5xx)
+ *   3. 最终 URL 等于目标(无意外重定向)— redirect 端点(如 /locale)跳过
+ *   4. 未回登录页(除非目标本身就是 /login)
+ *   5. 页面存在唯一 heading/landmark(恰好一个 h1 或一个 main/role=main,
+ *      证明加载了真实页面内容,非 404/500/空白)
+ */
+async function navigateAndAssert(
+  page: Page,
+  targetPath: string,
+  options: { expectLogin?: boolean; allowRedirect?: boolean } = {},
+): Promise<void> {
+  const response = await page.goto(targetPath);
+  // (1) response 非空
+  expect(response).not.toBeNull();
+  // (2) status < 400
+  expect(response!.status()).toBeLessThan(400);
+  // (3) 最终 URL 等于目标(无意外重定向);redirect 端点跳过此断言
+  if (!options.allowRedirect) {
+    const expected = targetPath.split('?')[0];
+    if (expected === '/') {
+      expect(page.url()).toMatch(/\/$/);
+    } else {
+      expect(page.url()).toContain(expected);
+    }
+  }
+  // (4) 除非目标本身就是 /login,否则不应被重定向回登录页
+  if (!options.expectLogin) {
+    expect(page.url()).not.toMatch(/\/login/i);
+  }
+  // (5) 唯一 heading/landmark(login 页有 1 个 h1;admin 页 base.html 有 1 h1 + 1 main)
+  const h1Count = await page.locator('h1').count();
+  const mainCount = await page.locator('main, [role="main"]').count();
+  expect(h1Count === 1 || mainCount === 1).toBe(true);
+}
+
 /** 登录辅助:填写表单并提交,等待重定向离开 /login */
 async function login(page: Page): Promise<void> {
-  await page.goto('/login');
+  // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/超时)
+  await navigateAndAssert(page, '/login', { expectLogin: true });
   await page.fill('input[name="username"]', 'admin');
   await page.fill('input[name="password"]', ADMIN_PASSWORD);
   await page.click('button[type="submit"]');
-  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+  // R60 §13: 移除 .catch(() => {}) — 超时必须暴露而非被吞掉
+  await page.waitForLoadState('networkidle', { timeout: 10_000 });
   await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 10_000 });
 }
 
 /** 对指定路由执行 axe 扫描,保存 artifact,返回结果 */
 async function scanRoute(page: Page, routePath: string, pageName: string): Promise<any> {
-  await page.goto(routePath);
-  await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => {});
+  // R60 §13: goto 断言加载成功(禁止 .catch 吞掉 404/重定向回登录/超时)
+  await navigateAndAssert(page, routePath, { expectLogin: routePath === '/login' });
+  // R60 §13: 移除 .catch(() => {}) — 超时必须暴露而非被吞掉
+  await page.waitForLoadState('networkidle', { timeout: 10_000 });
   const results = await new AxeBuilder({ page })
     .withTags(WCAG_TAGS)
     .analyze();

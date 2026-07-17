@@ -596,7 +596,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         except Exception as e:
             logger.error(f"[Admin] relay_add sign_in 失败: {e}")
-            await update.message.reply_text(f"❌ 登录失败: {e}\n请重新输入验证码,或点击取消。")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s137', error=e))
             return
 
         # 登录成功,写入 DB
@@ -656,7 +656,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await client.sign_in(password=password)
         except Exception as e:
             logger.error(f"[Admin] relay_add password sign_in 失败: {e}")
-            await update.message.reply_text(f"❌ 密码错误或登录失败: {e}\n请重新输入密码,或点击取消。")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s138', error=e))
             return
 
         # 登录成功,写入 DB

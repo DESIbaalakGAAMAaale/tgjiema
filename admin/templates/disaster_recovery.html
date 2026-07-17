@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
-{% block title %}灾备控制台{% endblock %}
-{% block page_title %}灾备控制台{% endblock %}
+{% block title %}{{ t("ui.admin.disaster_recovery.s27") }}{% endblock %}
+{% block page_title %}{{ t("ui.admin.disaster_recovery.s28") }}{% endblock %}
 
 {% block content %}
 {# R40 P1-10: 修复模板字段引用与 None 处理
@@ -23,7 +23,7 @@
         <div class="label">{{ t("ui.admin.disaster_recovery.s3") }}</div>
         <div class="value" style="font-size:14px;">
             {% if rpo_rto and rpo_rto.get('last_backup_age') is not none %}
-            {{ rpo_rto.get('last_backup_age') }} 秒
+            {{ rpo_rto.get('last_backup_age') }} {{ t("ui.admin.disaster_recovery.s29") }}
             {% else %}
             <span style="color:#e53935;">{{ t("ui.admin.disaster_recovery.s4") }}</span>
             {% endif %}

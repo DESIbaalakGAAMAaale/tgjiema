@@ -102,15 +102,48 @@ def get_complete_key(timestamp: str, backup_type: str = "full") -> str:
 # ── COMPLETE 标记内容 ─────────────────────────────────────────
 
 
+def _canonical_marker_signing_payload(
+    backup_id: str,
+    manifest_key: str,
+    manifest_sha256: str,
+    payload_key: str,
+    payload_sha256: str,
+    schema_version: str = "R58-P0-3-signed-three-stage",
+) -> bytes:
+    """R60 P0-04: Versioned canonical JSON signing payload for COMPLETE marker.
+
+    Includes payload_key (R60 fix) and uses sorted-key JSON to avoid colon-delimited
+    field encoding ambiguity.
+
+    R60 P0-04 §7 修复:
+        - 所有"决定下载哪个对象"的字段必须签名(含 payload_key)
+        - 使用 versioned canonical JSON 替代 colon 拼接(避免字段编码歧义)
+        - schema_version 进入签名内容(支持密钥/版本轮换)
+        - marker / manifest / payload 绑定相同 backup_id/schema_version/payload_key/
+          manifest_key/plaintext_sha/ciphertext_sha
+    """
+    payload = {
+        "v": 1,
+        "backup_id": backup_id,
+        "manifest_key": manifest_key,
+        "manifest_sha256": manifest_sha256,
+        "payload_key": payload_key,
+        "payload_sha256": payload_sha256,
+        "schema_version": schema_version,
+    }
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
 def build_complete_marker(
     backup_id: str,
     manifest_key: str,
     manifest_sha256: str,  # R59 P0-04: 强制参数,不再允许 fail-open(原 = "")
     payload_key: str,      # R59 P0-04: 强制参数,不再允许 fail-open(原 = "")
     payload_sha256: str,   # R59 P0-04: 强制参数,不再允许 fail-open(原 = "")
-    signature: str,        # R59 P0-04: 强制参数,不再允许 fail-open(原 = "")
+    signing_key: bytes,    # R60 P0-04: 替代 signature 参数,内部用 canonical JSON 计算签名
+    schema_version: str = "R58-P0-3-signed-three-stage",
 ) -> bytes:
-    """R58 P0-3 / R59 P0-04: 构建 COMPLETE 标记内容(JSON,含强绑定字段)。
+    """R58 P0-3 / R59 P0-04 / R60 P0-04: 构建 COMPLETE 标记内容(JSON,含强绑定字段)。
 
     R58 P0-3 增强(签名 + digest 绑定):
         - backup_id: 备份 ID(timestamp)
@@ -126,17 +159,34 @@ def build_complete_marker(
         - 删除所有安全参数的默认值,生产入口类型上强制必填
         - 合法调用方必须显式传入所有参数
 
+    R60 P0-04 增强(§7,P0-04 — canonical JSON 签名):
+        - 签名内容改用 versioned canonical JSON(含 payload_key,避免 colon 拼接歧义)
+        - 内部用 signing_key 计算 HMAC,移除外部 signature 参数
+        - 输出新增 signature_version=1 字段(支持签名格式轮换)
+        - schema_version 进入签名内容(支持密钥/版本轮换)
+
     Args:
         backup_id: 备份 ID(timestamp)
         manifest_key: 对应 manifest.json 的 R2 key
         manifest_sha256: manifest 内容 SHA-256(64 hex) — R59 P0-04: 必填
         payload_key: payload.enc 的 R2 key — R59 P0-04: 必填
         payload_sha256: 密文 SHA-256(64 hex) — R59 P0-04: 必填
-        signature: HMAC 签名(64 hex) — R59 P0-04: 必填
+        signing_key: HMAC 签名密钥 — R60 P0-04: 必填(替代外部 signature 参数)
+        schema_version: schema 版本字符串(进入签名内容,默认 R58-P0-3-signed-three-stage)
 
     Returns:
         JSON bytes
     """
+    # R60 P0-04: 使用 versioned canonical JSON 计算签名(含 payload_key,避免 colon 拼接歧义)
+    sign_payload = _canonical_marker_signing_payload(
+        backup_id=backup_id,
+        manifest_key=manifest_key,
+        manifest_sha256=manifest_sha256,
+        payload_key=payload_key,
+        payload_sha256=payload_sha256,
+        schema_version=schema_version,
+    )
+    signature = hmac.new(signing_key, sign_payload, hashlib.sha256).hexdigest()
     content = {
         "backup_id": backup_id,
         "manifest_key": manifest_key,
@@ -145,7 +195,8 @@ def build_complete_marker(
         "payload_sha256": payload_sha256,
         "signature": signature,
         "created_at": _dt.datetime.now(timezone_utc()).isoformat(),
-        "schema": "R58-P0-3-signed-three-stage",
+        "schema": schema_version,
+        "signature_version": 1,  # R60 P0-04: versioned canonical JSON 签名
     }
     return json.dumps(content, ensure_ascii=False).encode("utf-8")
 
@@ -169,7 +220,7 @@ async def validate_backup_completeness(
     signing_key: bytes,          # R59 P0-04: 强制参数,不再允许 fail-open(原 = b"")
     expected_backup_id: str,     # R59 P0-04: 新增强制参数,比对 backup_id
 ) -> BackupValidationResult:
-    """R58 P0-3 / R59 P0-04: 验证备份完整性(COMPLETE 标记存在 + 签名 + 严格绑定)。
+    """R58 P0-3 / R59 P0-04 / R60 P0-04: 验证备份完整性(COMPLETE 标记存在 + 签名 + 严格绑定)。
 
     R58 P0-3 增强:
         1. COMPLETE 标记存在
@@ -183,6 +234,14 @@ async def validate_backup_completeness(
         - 新增 expected_backup_id 强制参数,与 marker.backup_id 严格比对
         - 删除"可选跳过验签"路径:signing_key 缺失时直接返回 invalid
         - 合法调用方必须显式传入所有参数
+
+    R60 P0-04 增强(§7 — canonical JSON 签名 + payload_key 强绑定):
+        - 签名内容改用 versioned canonical JSON(_canonical_marker_signing_payload),
+          含 payload_key,替代原 colon 拼接(避免字段编码歧义)
+        - 新增 signature_version 校验(默认 1,要求 >= 1 — history 必须 re-package)
+        - 新增 payload_key 非空校验(fail-closed) — 原签名遗漏该字段,可被替换到任意 payload
+        - marker/manifest/payload 绑定相同 backup_id/schema_version/payload_key/
+          manifest_key/plaintext_sha/ciphertext_sha
 
     验证顺序(固定):
         下载 COMPLETE → 验签 → 比对 backup_id → 比对 manifest_key → 比对 digest
@@ -239,6 +298,9 @@ async def validate_backup_completeness(
         marker_payload_key = str(marker.get("payload_key", ""))
         marker_payload_sha = str(marker.get("payload_sha256", ""))
         marker_signature = str(marker.get("signature", ""))
+        # R60 P0-04: schema 与 signature_version 进入签名内容(支持轮换与版本校验)
+        marker_schema = str(marker.get("schema", "R58-P0-3-signed-three-stage"))
+        marker_signature_version = marker.get("signature_version", 1)
 
         # R58 P0-3: 严格比较 backup_id == 请求 timestamp
         if marker_backup_id != timestamp:
@@ -296,11 +358,35 @@ async def validate_backup_completeness(
                 error_code="BACKUP.RESTORE.COMPLETE_MARKER_INVALID",
                 error_message="COMPLETE marker missing or invalid signature",
             )
-        # 重算签名(排除 signature 字段本身)
-        sign_payload = (
-            f"{marker_backup_id}:{marker_manifest_key}:{marker_manifest_sha}:"
-            f"{marker_payload_sha}"
-        ).encode("utf-8")
+        # R60 P0-04: 校验 signature_version(默认 1,要求 >= 1 — history 必须 re-package)
+        if not isinstance(marker_signature_version, int) or marker_signature_version < 1:
+            return BackupValidationResult(
+                valid=False,
+                backup_id=timestamp,
+                error_code="BACKUP.RESTORE.COMPLETE_MARKER_INVALID",
+                error_message=(
+                    f"R60 P0-04: COMPLETE marker signature_version invalid: "
+                    f"{marker_signature_version!r} (require >= 1)"
+                ),
+            )
+        # R60 P0-04: payload_key 必须非空(fail-closed) — 签名内容必须包含 payload_key,
+        # 否则可被替换到任意 payload 对象(原 colon 拼接签名遗漏该字段)
+        if not marker_payload_key:
+            return BackupValidationResult(
+                valid=False,
+                backup_id=timestamp,
+                error_code="BACKUP.RESTORE.COMPLETE_MARKER_INVALID",
+                error_message="R60 P0-04: COMPLETE marker missing payload_key (fail-closed)",
+            )
+        # R60 P0-04: 使用 versioned canonical JSON 重算签名(含 payload_key,避免 colon 拼接歧义)
+        sign_payload = _canonical_marker_signing_payload(
+            backup_id=marker_backup_id,
+            manifest_key=marker_manifest_key,
+            manifest_sha256=marker_manifest_sha,
+            payload_key=marker_payload_key,
+            payload_sha256=marker_payload_sha,
+            schema_version=marker_schema,
+        )
         expected_sig = hmac.new(signing_key, sign_payload, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected_sig, marker_signature):
             return BackupValidationResult(

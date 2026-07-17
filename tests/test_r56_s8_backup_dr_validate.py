@@ -53,26 +53,37 @@ from services.backup_dr_validate import (  # type: ignore  # noqa: E402
 )
 
 
-# ── R59 P0-04 测试辅助函数 ──────────────────────────────────────
+# ── R59 P0-04 / R60 P0-04 测试辅助函数 ──────────────────────────
 # R59 P0-04: 强制参数,不再允许 fail-open — 测试需提供真实签名与解密器
+# R60 P0-04: build_complete_marker 改为内部用 canonical JSON + signing_key 计算签名,
+#            测试不再手动计算签名,直接委托给真实函数
 
-def _compute_marker_signature(
+def _build_marker(
     signing_key: bytes,
     backup_id: str,
     manifest_key: str,
     manifest_sha256: str,
     payload_sha256: str,
-) -> str:
-    """R59 P0-04 测试辅助:计算 COMPLETE marker 的 HMAC-SHA256 签名。
+    payload_key: str | None = None,
+    backup_type: str = "full",
+) -> bytes:
+    """R60 P0-04 测试辅助:调用真实 build_complete_marker 构建正确签名的 COMPLETE marker。
 
-    签名格式与 services.backup_dr_validate.validate_backup_completeness
-    中的验签逻辑保持一致:
-        HMAC-SHA256(signing_key, f"{backup_id}:{manifest_key}:{manifest_sha}:{payload_sha}")
+    R60 P0-04: build_complete_marker 改为内部用 versioned canonical JSON + signing_key
+    计算签名(替代外部 signature 参数),测试不再手动拼 colon 签名,直接委托给真实函数。
+    payload_key 默认使用 get_payload_key(backup_id, backup_type) 计算的真实 key,
+    以满足 validate_backup_for_restore 中 payload_key 一致性比对的要求。
     """
-    sign_payload = (
-        f"{backup_id}:{manifest_key}:{manifest_sha256}:{payload_sha256}"
-    ).encode("utf-8")
-    return hmac.new(signing_key, sign_payload, hashlib.sha256).hexdigest()
+    if payload_key is None:
+        payload_key = get_payload_key(backup_id, backup_type)
+    return build_complete_marker(
+        backup_id,
+        manifest_key,
+        manifest_sha256=manifest_sha256,
+        payload_key=payload_key,
+        payload_sha256=payload_sha256,
+        signing_key=signing_key,
+    )
 
 
 def _make_decryptor(plaintext: bytes) -> MagicMock:
@@ -124,13 +135,15 @@ class TestThreeStageKeys:
 
     def test_complete_marker_content(self):
         """COMPLETE 标记内容应含 backup_id + manifest_key + schema + R58 P0-3 签名绑定字段。"""
+        # R60 P0-04: build_complete_marker 改为内部用 signing_key 计算 canonical JSON 签名
+        signing_key = b"test_signing_key_r60"
         content = build_complete_marker(
             "20260716",
             "db_backup/manifest_20260716_full.json",
             manifest_sha256="a" * 64,
             payload_key="db_backup/payload_20260716_full.enc",
             payload_sha256="b" * 64,
-            signature="c" * 64,
+            signing_key=signing_key,
         )
         marker = json.loads(content)
         assert marker["backup_id"] == "20260716"
@@ -142,7 +155,23 @@ class TestThreeStageKeys:
         assert marker["manifest_sha256"] == "a" * 64
         assert marker["payload_key"] == "db_backup/payload_20260716_full.enc"
         assert marker["payload_sha256"] == "b" * 64
-        assert marker["signature"] == "c" * 64
+        # R60 P0-04: signature 由内部 canonical JSON + signing_key 计算,输出 signature_version=1
+        assert marker["signature_version"] == 1
+        assert len(marker["signature"]) == 64
+        # 验证签名与重算值一致(versioned canonical JSON 签名)
+        from services.backup_dr_validate import _canonical_marker_signing_payload
+        expected_sig = hmac.new(
+            signing_key,
+            _canonical_marker_signing_payload(
+                backup_id="20260716",
+                manifest_key="db_backup/manifest_20260716_full.json",
+                manifest_sha256="a" * 64,
+                payload_key="db_backup/payload_20260716_full.enc",
+                payload_sha256="b" * 64,
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+        assert marker["signature"] == expected_sig
 
 
 # ════════════════════════════════════════════════════════════════
@@ -163,16 +192,9 @@ class TestValidateCompleteness:
         manifest_key = "manifest_key"
         manifest_sha = "a" * 64
         payload_sha = "b" * 64
-        sig = _compute_marker_signature(
+        # R60 P0-04: build_complete_marker 内部用 signing_key 计算 canonical JSON 签名
+        marker_content = _build_marker(
             signing_key, backup_id, manifest_key, manifest_sha, payload_sha,
-        )
-        marker_content = build_complete_marker(
-            backup_id,
-            manifest_key,
-            manifest_sha256=manifest_sha,
-            payload_key="payload_key",
-            payload_sha256=payload_sha,
-            signature=sig,
         )
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=marker_content)
@@ -486,21 +508,8 @@ class TestValidateBackupForRestore:
         manifest_key = "manifest_key"
         ciphertext = b"payload"
         cipher_sha = hashlib.sha256(ciphertext).hexdigest()
-        manifest_sha = "a" * 64
         plaintext = b"decrypted_payload"
         pt_sha = hashlib.sha256(plaintext).hexdigest()
-        # R59 P0-04: 计算真实 HMAC 签名(不再允许跳过验签)
-        sig = _compute_marker_signature(
-            signing_key, backup_id, manifest_key, manifest_sha, cipher_sha,
-        )
-        marker = build_complete_marker(
-            backup_id,
-            manifest_key,
-            manifest_sha256=manifest_sha,
-            payload_key="payload_key",
-            payload_sha256=cipher_sha,
-            signature=sig,
-        )
         manifest = {
             "version": "3.0",
             # R58 P0-3: commit_sha 必须 40 hex
@@ -516,11 +525,19 @@ class TestValidateBackupForRestore:
             "backup_type": "full",
             "encryption": {"encrypted": True, "key_id": "kek_v1"},
         }
+        # R59 P0-04: manifest_sha 必须与 manifest 原始 bytes 的 SHA256 一致(信任链比对)
+        manifest_bytes = json.dumps(manifest).encode()
+        manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+        # R60 P0-04: build_complete_marker 内部用 signing_key 计算 canonical JSON 签名;
+        # payload_key 使用真实 get_payload_key 以通过 validate_backup_for_restore 比对
+        marker = _build_marker(
+            signing_key, backup_id, manifest_key, manifest_sha, cipher_sha,
+        )
         mock_r2 = AsyncMock()
         # 第一次下载 COMPLETE,第二次下载 manifest,第三次下载 payload
         mock_r2.download = AsyncMock(side_effect=[
             marker,  # COMPLETE
-            json.dumps(manifest).encode(),  # manifest
+            manifest_bytes,  # manifest
             ciphertext,  # payload
         ])
         # R59 P0-04: 强制参数 — 4 个必填参数传入
@@ -566,17 +583,9 @@ class TestValidateBackupForRestore:
         manifest_key = "manifest_key"
         manifest_sha = "a" * 64
         payload_sha = "b" * 64
-        # R59 P0-04: 计算真实 HMAC 签名
-        sig = _compute_marker_signature(
+        # R60 P0-04: build_complete_marker 内部用 signing_key 计算 canonical JSON 签名
+        marker = _build_marker(
             signing_key, backup_id, manifest_key, manifest_sha, payload_sha,
-        )
-        marker = build_complete_marker(
-            backup_id,
-            manifest_key,
-            manifest_sha256=manifest_sha,
-            payload_key="payload_key",
-            payload_sha256=payload_sha,
-            signature=sig,
         )
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(side_effect=[
@@ -604,20 +613,7 @@ class TestValidateBackupForRestore:
         signing_key = b"test_signing_key_r59"
         backup_id = "20260716"
         manifest_key = "manifest_key"
-        manifest_sha = "a" * 64
         payload_sha = "b" * 64
-        # R59 P0-04: 计算真实 HMAC 签名
-        sig = _compute_marker_signature(
-            signing_key, backup_id, manifest_key, manifest_sha, payload_sha,
-        )
-        marker = build_complete_marker(
-            backup_id,
-            manifest_key,
-            manifest_sha256=manifest_sha,
-            payload_key="payload_key",
-            payload_sha256=payload_sha,
-            signature=sig,
-        )
         manifest = {
             "version": "3.0",
             "schema_version": "2.0",  # 主版本不兼容
@@ -632,10 +628,19 @@ class TestValidateBackupForRestore:
             "table_stats": {},
             "backup_type": "full",
         }
+        # R59 P0-04: manifest_sha 必须与 manifest 原始 bytes 的 SHA256 一致(信任链比对)
+        manifest_bytes = json.dumps(manifest).encode()
+        manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+        # R60 P0-04: build_complete_marker 内部用 signing_key 计算 canonical JSON 签名;
+        # payload_key 使用真实 get_payload_key 以通过 validate_backup_for_restore 中
+        # payload_key 比对(该比对先于 schema 兼容性检查)
+        marker = _build_marker(
+            signing_key, backup_id, manifest_key, manifest_sha, payload_sha,
+        )
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(side_effect=[
             marker,  # COMPLETE
-            json.dumps(manifest).encode(),  # manifest
+            manifest_bytes,  # manifest
         ])
         # R59 P0-04: 强制参数必填(此处不会到达 payload 校验阶段)
         result = await validate_backup_for_restore(
@@ -730,13 +735,13 @@ class TestFaultMatrix:
     async def test_no_silent_recovery_on_partial_backup(self):
         """部分备份(无 COMPLETE)不应被静默恢复。"""
         # 场景:备份写到一半中断(有 payload + manifest,但无 COMPLETE)
-        # R59 P0-04: build_complete_marker 需提供全部强制参数(原 2 参数调用已废弃)
+        # R60 P0-04: build_complete_marker 改为 signing_key(内部计算签名),不再接受 signature 参数
         marker = build_complete_marker(
             "20260716", "manifest_key",
             manifest_sha256="a" * 64,
             payload_key="payload_key",
             payload_sha256="b" * 64,
-            signature="c" * 64,
+            signing_key=b"signing_key",
         )
         manifest = {
             "version": "3.0",

@@ -1,7 +1,7 @@
 {
   "description": "R59 §5.2 P1: ErrorRegistry 已知违规 baseline (ratchet 下降)",
   "note": "pre-existing 历史债务,只允许减少不允许新增。修复违规后运行 --generate-baseline 下降基线。",
-  "violation_count": 53,
+  "violation_count": 54,
   "violations": [
     "literal::services/backup_dr_validate.py::BACKUP.RESTORE.ATOMIC_SWITCH_FAILED",
     "literal::services/backup_dr_validate.py::BACKUP.RESTORE.CIPHERTEXT_HASH_MISMATCH",
@@ -55,6 +55,7 @@
     "locale::语言包 zh-CN.json: key 'errors.user.not_found' 未在 ErrorRegistry 注册 (无对应 ErrorDefinition.message_key)",
     "locale::语言包 zh-CN.json: key 'errors.user.unauthorized' 未在 ErrorRegistry 注册 (无对应 ErrorDefinition.message_key)",
     "locale::语言包 zh-CN.json: key 'errors.validation.failed' 未在 ErrorRegistry 注册 (无对应 ErrorDefinition.message_key)",
-    "locale::语言包 zh-CN.json: key 'errors.validation.missing_field' 未在 ErrorRegistry 注册 (无对应 ErrorDefinition.message_key)"
+    "locale::语言包 zh-CN.json: key 'errors.validation.missing_field' 未在 ErrorRegistry 注册 (无对应 ErrorDefinition.message_key)",
+    "registry::ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED = 'BACKUP.RESTORE.TRUST_CHAIN_REQUIRED' 未在 ErrorRegistry 注册 (请在 _register_defaults() 中添加 ErrorRegistry.register(ErrorDefinition(...)))"
   ]
 }

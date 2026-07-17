@@ -455,10 +455,25 @@ jobs:
         echo "  image_ref: ${IMAGE_REF}"
 
     # R58 P0-1: cosign sign 已 push 的镜像 digest (不重新构建)
+    # R60 P0-06: 增加 OIDC/GHCR/cosign 诊断信息(不添加 continue-on-error,
+    #             签名失败必须阻断,诊断信息用于定位根因)
     - name: Sign OCI image with cosign (keyless, by digest)
       run: |
         IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
         echo "Signing image: ${IMAGE_REF}"
+        echo "R60 P0-06: diagnostic info for cosign keyless signing failures"
+        echo "  cosign version: $(cosign version 2>&1 || echo 'unknown')"
+        echo "  AWS_OIDC.isPresent: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL != '' }}"
+        echo "  github.ref: ${{ github.ref }}"
+        echo "  github.event_name: ${{ github.event_name }}"
+        echo "  repository: ${{ github.repository }}"
+        # OIDC token debug (presence only, do NOT print token content)
+        if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "  OIDC token endpoint: present"
+        else
+          echo "::error::OIDC token endpoint not available — id-token: write permission required for keyless signing"
+          exit 1
+        fi
         cosign sign --yes "${IMAGE_REF}"
       env:
         COSIGN_EXPERIMENTAL: 1
@@ -525,8 +540,10 @@ jobs:
           tgjiema-${{ github.sha }}.tar.gz.sha256
         echo "源代码制品已用 Sigstore keyless 签名"
 
+    # R60 P0-06: 仅在签名/verify/provenance 全部成功时上传(原 if: always()
+    #             会在签名失败时仍上传部分/空 artifact,掩盖供应链断裂)
     - name: Upload signed artifacts
-      if: always()
+      if: success()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
         name: release-gates-signed-${{ github.sha }}
@@ -1305,4 +1322,72 @@ jobs:
           release_attestation.sig
           branch_protection_snapshot.json
         retention-days: 90
+
+  # ─── 14. release-summary (R60 P0-06: 单一聚合 required context) ──────
+  # R60 P0-06 整改要点:
+  #   审计发现:cosign sign-image 失败后,下游 verification statement / SLSA
+  #   provenance / source 签名全部跳过,publish-attestation 也被跳过,
+  #   但分支保护只要求一个可独立成功的 context,导致 release 在供应链断裂时
+  #   仍能通过。本 job 作为单一聚合 required branch-protection context:
+  #     - if: always() — 依赖失败/跳过时仍运行,报告聚合状态
+  #     - 任何一个依赖 job 的 conclusion != success 时,本 job exit 1
+  #     - 替代 per-job required context(避免 race/ordering 问题)
+  #   注意:GitHub Actions 表达式 ${{ needs.${job}.conclusion }} 不能在 bash
+  #   循环里用变量插值(表达式在 shell 运行前已静态展开),因此通过 job 级
+  #   env 显式传递每个 needs.<job>.conclusion,再在 shell 中逐项校验。
+  release-summary:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [docker-build, docker-digest-verify, compose-config, redis-acl-matrix,
+            schema-diff, backup-restore-drill, sbom, pip-audit, trivy,
+            sign-image, verify-branch-protection, rc-continuity, publish-attestation]
+    env:
+      DOCKER_BUILD: ${{ needs.docker-build.conclusion }}
+      DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.conclusion }}
+      COMPOSE_CONFIG: ${{ needs.compose-config.conclusion }}
+      REDIS_ACL_MATRIX: ${{ needs.redis-acl-matrix.conclusion }}
+      SCHEMA_DIFF: ${{ needs.schema-diff.conclusion }}
+      BACKUP_RESTORE_DRILL: ${{ needs.backup-restore-drill.conclusion }}
+      SBOM: ${{ needs.sbom.conclusion }}
+      PIP_AUDIT: ${{ needs.pip-audit.conclusion }}
+      TRIVY: ${{ needs.trivy.conclusion }}
+      SIGN_IMAGE: ${{ needs.sign-image.conclusion }}
+      VERIFY_BRANCH_PROTECTION: ${{ needs.verify-branch-protection.conclusion }}
+      RC_CONTINUITY: ${{ needs.rc-continuity.conclusion }}
+      PUBLISH_ATTESTATION: ${{ needs.publish-attestation.conclusion }}
+    steps:
+    - name: Verify all required jobs succeeded
+      run: |
+        set -euo pipefail
+        echo "=== R60 P0-06: Release Gate Aggregate Summary ==="
+        echo "Aggregating release gate conclusions..."
+        FAIL=0
+        for entry in \
+          "docker-build=${DOCKER_BUILD}" \
+          "docker-digest-verify=${DOCKER_DIGEST_VERIFY}" \
+          "compose-config=${COMPOSE_CONFIG}" \
+          "redis-acl-matrix=${REDIS_ACL_MATRIX}" \
+          "schema-diff=${SCHEMA_DIFF}" \
+          "backup-restore-drill=${BACKUP_RESTORE_DRILL}" \
+          "sbom=${SBOM}" \
+          "pip-audit=${PIP_AUDIT}" \
+          "trivy=${TRIVY}" \
+          "sign-image=${SIGN_IMAGE}" \
+          "verify-branch-protection=${VERIFY_BRANCH_PROTECTION}" \
+          "rc-continuity=${RC_CONTINUITY}" \
+          "publish-attestation=${PUBLISH_ATTESTATION}"; do
+          job="${entry%%=*}"
+          conclusion="${entry##*=}"
+          echo "  ${job}: ${conclusion}"
+          if [ "${conclusion}" != "success" ]; then
+            echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+            FAIL=1
+          fi
+        done
+        if [ "${FAIL}" -ne 0 ]; then
+          echo "::error::R60 P0-06: Release gate FAILED — one or more supply chain jobs did not succeed"
+          echo "R60 P0-06: Any skipped/cancelled/failure in supply chain jobs blocks release"
+          exit 1
+        fi
+        echo "PASS: All release gate jobs succeeded"
 

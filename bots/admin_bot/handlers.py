@@ -420,7 +420,7 @@ async def set_access_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"[Admin] set_access_limit 失败 code={file_code}: {e}")
-        await update.message.reply_text(f"❌ 设置失败: {e}")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s277', error=e))
         return
 
     limit_text = _i18n_t('bot.admin_bot.handlers.s21', max_requests=max_requests) if max_requests > 0 else _i18n_t('bot.admin_bot.handlers.s22')
@@ -630,7 +630,7 @@ async def relay_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await get_cache_store().notify_relay_change()
         except Exception as notify_err:
             logger.warning(f"[Admin] notify_relay_change 失败(非致命): {notify_err}")
-        await update.message.reply_text(f"✅ 已移除中继账号: {phone}")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s278', phone=phone))
     else:
         await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s121', phone=phone))
 
@@ -654,7 +654,7 @@ async def settings_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
     except Exception as e:
         logger.error(f"[settings] 获取配置失败: {e}")
-        await update.message.reply_text(f"❌ 获取配置失败: {e}")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s279', error=e))
 
 
 @_auth_required
@@ -1613,7 +1613,7 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n\n".join(lines))
     except Exception as e:
         logger.exception(f"[Admin][reports] 查询举报列表失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
 
 
 @_auth_required
@@ -1655,10 +1655,10 @@ async def cmd_takedown(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s265'))
         else:
-            await update.message.reply_text(f"❌ 下架失败: {result.error}")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s281', error=result.error))
     except Exception as e:
         logger.exception(f"[Admin][takedown] 内容下架失败: {e}")
-        await update.message.reply_text("❌ 操作失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
 
 
 @_auth_required
@@ -1717,10 +1717,10 @@ async def cmd_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s266'))
         else:
-            await update.message.reply_text(f"❌ 封禁失败: {result.error}")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s283', error=result.error))
     except Exception as e:
         logger.exception(f"[Admin][ban_user] 封禁用户失败: {e}")
-        await update.message.reply_text("❌ 操作失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
 
 
 @_auth_required
@@ -1758,10 +1758,10 @@ async def cmd_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s251'))
         else:
-            await update.message.reply_text(f"❌ 解封失败: {result.error}")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s284', error=result.error))
     except Exception as e:
         logger.exception(f"[Admin][unban_user] 解封用户失败: {e}")
-        await update.message.reply_text("❌ 操作失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
 
 
 @_auth_required
@@ -1785,7 +1785,7 @@ async def cmd_pending_approvals(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("\n\n".join(lines))
     except Exception as e:
         logger.exception(f"[Admin][pending_approvals] 查询待审批失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
 
 
 @_auth_required
@@ -1807,10 +1807,10 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s223', approval_id=approval_id))
         else:
-            await update.message.reply_text("❌ 批准失败(权限不足/状态非pending/不能审批自己创建的请求)")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s285'))
     except Exception as e:
         logger.exception(f"[Admin][approve] 批准审批失败: {e}")
-        await update.message.reply_text("❌ 操作失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
 
 
 @_auth_required
@@ -1832,10 +1832,10 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ok:
             await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s225', approval_id=approval_id))
         else:
-            await update.message.reply_text("❌ 驳回失败(权限不足/状态非pending)")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s286'))
     except Exception as e:
         logger.exception(f"[Admin][reject] 驳回审批失败: {e}")
-        await update.message.reply_text("❌ 操作失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
 
 
 @_auth_required
@@ -1853,7 +1853,7 @@ async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.exception(f"[Admin][roles] 查询角色失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
 
 
 @_auth_required
@@ -1895,10 +1895,10 @@ async def cmd_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s268'))
         else:
-            await update.message.reply_text(f"❌ 分配失败: {result.error}")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s287', error=result.error))
     except Exception as e:
         logger.exception(f"[Admin][assign_role] 分配角色失败: {e}")
-        await update.message.reply_text("❌ 操作失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
 
 
 @_auth_required
@@ -1963,10 +1963,10 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             await update.message.reply_text("\n".join(lines))
         else:
-            await update.message.reply_text("❌ 未知操作,使用 on/off/status")
+            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s288'))
     except Exception as e:
         logger.exception(f"[Admin][maintenance] 维护模式操作失败: {e}")
-        await update.message.reply_text("❌ 操作失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
 
 
 @_auth_required
@@ -1985,7 +1985,7 @@ async def cmd_repair_console(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.exception(f"[Admin][repair_console] 查询修复总览失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
 
 
 @_auth_required
@@ -2010,7 +2010,7 @@ async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.exception(f"[Admin][backups] 查询备份失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
 
 
 @_auth_required
@@ -2029,7 +2029,7 @@ async def cmd_ru_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(report)
     except Exception as e:
         logger.exception(f"[Admin][ru_report] 生成 RU 报告失败: {e}")
-        await update.message.reply_text("❌ 生成报告失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s289'))
 
 
 @_auth_required
@@ -2100,4 +2100,4 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.exception(f"[Admin][tasks] 查询任务失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))

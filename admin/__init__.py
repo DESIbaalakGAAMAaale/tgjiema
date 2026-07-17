@@ -1035,7 +1035,7 @@ async def break_glass_login(
     )
     session_id = await manager.create_session(principal, mfa_verified=True)
     if not session_id:
-        raise HTTPException(status_code=503, detail="会话创建失败")
+        raise HTTPException(status_code=503, detail=_i18n_t('admin.__init__.s56'))
     from loguru import logger
     logger.warning(
         f"[Admin] break-glass 登录成功 user={credentials.username} peer={peer_host}"

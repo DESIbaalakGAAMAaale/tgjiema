@@ -402,48 +402,51 @@ class TestClassifyMode:
     """R48 P1-c 要求 5:--classify 模式(user_visible / log_only 分类)。"""
 
     def test_classify_finding_html_is_user_visible(self):
-        """HTML 文件 → user_visible(模板内容对用户可见)。"""
-        assert scan.classify_finding("admin/templates/test.html", "<div>测试</div>", 1) == "user_visible"
+        """HTML 文件 pattern_type 'html_text' / 'html_attr:*' → user_visible(模板内容对用户可见)。"""
+        assert scan.classify_finding("admin/templates/test.html", "html_text") == "user_visible"
+        assert scan.classify_finding("admin/templates/test.html", "html_attr:aria-label") == "user_visible"
+        assert scan.classify_finding("admin/templates/test.html", "html_attr:placeholder") == "user_visible"
 
     def test_classify_finding_python_with_logger_is_log_only(self):
-        """Python 文件行附近有 logger. → log_only。"""
-        content = "import logging\nlogger = logging.getLogger()\nlogger.info('xxx')\n"
-        assert scan.classify_finding("services/test.py", content, 3) == "log_only"
+        """Python 文件 pattern_type 'log:logger.info' → log_only。"""
+        assert scan.classify_finding("services/test.py", "log:logger.info") == "log_only"
 
     def test_classify_finding_python_with_print_is_log_only(self):
-        """Python 文件行附近有 print( → log_only。"""
-        content = "x = 1\nprint('hello')\ny = 2\n"
-        assert scan.classify_finding("services/test.py", content, 2) == "log_only"
+        """Python 文件 pattern_type 'log:print' → log_only。"""
+        assert scan.classify_finding("services/test.py", "log:print") == "log_only"
 
     def test_classify_finding_python_without_logger_is_user_visible(self):
-        """Python 文件行附近无 logger/print → user_visible。"""
-        content = "x = 1\nreply_text('你好')\ny = 2\n"
-        assert scan.classify_finding("services/test.py", content, 2) == "user_visible"
+        """Python 文件 pattern_type 'sink:reply_text' / 'sink:HTTPException.detail' → user_visible。"""
+        assert scan.classify_finding("services/test.py", "sink:reply_text") == "user_visible"
+        assert scan.classify_finding("services/test.py", "sink:HTTPException.detail") == "user_visible"
+        assert scan.classify_finding("services/test.py", "sink:safe_send_message.text") == "user_visible"
 
-    def test_classify_finding_checks_nearby_lines(self):
-        """finding 行 ±2 范围内有 logger → log_only;超出范围 → user_visible。"""
-        content = "a = 1\nlogger.info('log')\nb = 2\nc = 3\nd = 4\n"
-        # line 4 (0-indexed 3): logger on line 2 (offset -2) → log_only
-        assert scan.classify_finding("services/test.py", content, 4) == "log_only"
-        # line 5 (0-indexed 4): logger on line 2 (offset -3, 超出 ±2 范围) → user_visible
-        assert scan.classify_finding("services/test.py", content, 5) == "user_visible"
+    def test_classify_finding_depends_on_pattern_type_only(self):
+        """R60 §10: classify_finding 仅依赖 pattern_type(AST 父调用编码),不做 ±2 行邻行猜测。
+
+        同一 pattern_type 在不同 file_path 均返回同一分类(不再读取文件内容/行号)。
+        """
+        # log:* 前缀无论具体函数名 / file_path → 始终 log_only
+        assert scan.classify_finding("services/test.py", "log:logger.info") == "log_only"
+        assert scan.classify_finding("services/test.py", "log:logging.warning") == "log_only"
+        assert scan.classify_finding("services/test.py", "log:logger.error") == "log_only"
+        assert scan.classify_finding("bots/up_bot.py", "log:print") == "log_only"
+        # sink:*/html_* 前缀无论 file_path → 始终 user_visible(绝对门禁)
+        assert scan.classify_finding("services/test.py", "sink:reply_text") == "user_visible"
+        assert scan.classify_finding("admin/templates/test.html", "html_text") == "user_visible"
+        assert scan.classify_finding("admin/templates/test.html", "html_attr:aria-label") == "user_visible"
+
+    def test_classify_finding_unknown_pattern_defaults_to_user_visible(self):
+        """未知 pattern_type → user_visible(绝对门禁,默认归用户可见)。"""
+        assert scan.classify_finding("services/test.py", "unknown_pattern") == "user_visible"
+        assert scan.classify_finding("services/test.py", "") == "user_visible"
 
     def test_classify_findings_no_double_counting(self, tmp_path):
         """classify_findings 的 user_visible + log_only 之和 == count_by_module(无双重计数)。"""
-        # 创建临时 Python 文件(含 logger 附近和非 logger 附近的 finding)
-        (tmp_path / "services").mkdir(parents=True)
-        (tmp_path / "services" / "test.py").write_text(
-            "x = 1\n"                        # line 1
-            "reply_text('用户可见1')\n"        # line 2: finding,附近无 logger → user_visible
-            "y = 2\n"                         # line 3
-            "z = 3\n"                         # line 4
-            "logger.info('xxx')\n"            # line 5: logger 调用(scanner 跳过)
-            "answer('日志附近')\n"             # line 6: finding,logger 在 line 5 (offset -1) → log_only
-            , encoding="utf-8",
-        )
+        # R60 §10: pattern_type 已编码 AST 父调用信息,无需读取文件内容
         findings = [
-            ("services/test.py", 2, "p", "用户可见1"),
-            ("services/test.py", 6, "p", "日志附近"),
+            ("services/test.py", 2, "sink:reply_text", "用户可见1"),
+            ("services/test.py", 6, "log:logger.info", "日志附近"),
         ]
         classified = scan.classify_findings(findings, tmp_path)
         counts = scan.count_by_module(findings)
@@ -458,23 +461,16 @@ class TestClassifyMode:
         assert classified["services/"]["log_only"] == 1
 
     def test_classify_findings_groups_by_file_content(self, tmp_path):
-        """同一 (file, content) 多行出现只计一次(任一行附近有 logger → log_only)。"""
-        (tmp_path / "services").mkdir(parents=True)
-        (tmp_path / "services" / "test.py").write_text(
-            "reply_text('重复文本')\n"     # line 1: 无 logger 附近
-            "x = 2\n"                      # line 2
-            "logger.info('log')\n"         # line 3: logger
-            "reply_text('重复文本')\n"     # line 4: logger 在 line 3 (offset -1) → log_only
-            , encoding="utf-8",
-        )
+        """同一 (file, content) 多行出现只计一次;任一出现是 user_visible 即归 user_visible。"""
+        # R60 §10: user_visible 优先 — 同 (file, content) 任一出现是 sink:*/html_* 即归 user_visible
         findings = [
-            ("services/test.py", 1, "p", "重复文本"),
-            ("services/test.py", 4, "p", "重复文本"),  # 同 file 同 content
+            ("services/test.py", 1, "sink:reply_text", "重复文本"),
+            ("services/test.py", 4, "log:logger.info", "重复文本"),  # 同 file 同 content
         ]
         classified = scan.classify_findings(findings, tmp_path)
-        # 同 (file, content) 只计一次;因 line 4 附近有 logger → log_only
-        assert classified["services/"]["user_visible"] == 0
-        assert classified["services/"]["log_only"] == 1
+        # 同 (file, content) 只计一次;因 line 1 是 user_visible → 归 user_visible(优先)
+        assert classified["services/"]["user_visible"] == 1
+        assert classified["services/"]["log_only"] == 0
 
     def test_cmd_classify_returns_zero(self, monkeypatch, capsys):
         """cmd_classify 返回 0 并输出分类表。"""
@@ -486,16 +482,10 @@ class TestClassifyMode:
 
     def test_cmd_classify_outputs_correct_counts(self, monkeypatch, tmp_path, capsys):
         """cmd_classify 输出的 user_visible + log_only == total(无双重计数)。"""
-        (tmp_path / "services").mkdir(parents=True)
-        (tmp_path / "services" / "test.py").write_text(
-            "reply_text('可见')\n"          # line 1: user_visible
-            "logger.info('log')\n"          # line 2: logger (scanner skips)
-            "answer('日志附近')\n"           # line 3: log_only (logger nearby)
-            , encoding="utf-8",
-        )
+        # R60 §10: pattern_type 已编码 AST 父调用信息(log:* → log_only,sink:* → user_visible)
         findings = [
-            ("services/test.py", 1, "p", "可见"),
-            ("services/test.py", 3, "p", "日志附近"),
+            ("services/test.py", 1, "sink:reply_text", "可见"),
+            ("services/test.py", 3, "log:logger.info", "日志附近"),
         ]
         rc = scan.cmd_classify(findings, tmp_path)
         assert rc == 0
