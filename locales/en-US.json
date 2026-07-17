@@ -83,6 +83,7 @@
     "auth.rbac.permission_denied": "Permission denied, missing required permission: {permission} (user_id={user_id})",
     "backup.restore.approval_invalid": "Backup restore approval invalid or expired (approval_id={approval_id}, backup_id={backup_id})",
     "backup.restore.checksum_mismatch": "Backup file checksum mismatch, may be corrupted (backup_id={backup_id})",
+    "backup.restore.trust_chain_required": "Backup restore trust-chain token missing or invalid, restore denied (backup_id={backup_id})",
     "effect.receipt.manager_unavailable": "Effect receipt manager unavailable (action_id={action_id}, effect_type={effect_type})",
     "effect.receipt.db_error": "Effect receipt database error (action_id={action_id}, effect_type={effect_type})",
     "approval.gate.required": "Operation requires approval (approval_id={approval_id}, action={action})",
@@ -201,7 +202,9 @@
         "s5": "载荷",
         "s6": "发起人",
         "s7": "发起时间",
-        "s8": "暂无数据"
+        "s8": "暂无数据",
+        "s9": "Approval Management",
+        "s10": "Approval Management"
       },
       "base": {
         "s1": "{% block title %}管理后台{% endblock %} - TG文件解码器",
@@ -246,7 +249,8 @@
         "s40": "Maintenance mode",
         "s41": "Disaster recovery console",
         "s42": "Language switcher",
-        "s43": "English"
+        "s43": "English",
+        "s44": "Administrator:"
       },
       "collections": {
         "s1": "文件集合列表",
@@ -261,7 +265,9 @@
         "s10": "创建时间",
         "s11": "活跃",
         "s12": "已归档",
-        "s13": "暂无数据"
+        "s13": "暂无数据",
+        "s14": "Collection Management",
+        "s15": "Collection Management"
       },
       "dashboard": {
         "s1": "管理后台 - TG文件解码器",
@@ -320,7 +326,10 @@
         "s23": "失败",
         "s24": "已校验",
         "s25": "未校验",
-        "s26": "暂无数据"
+        "s26": "暂无数据",
+        "s27": "Disaster Recovery Console",
+        "s28": "Disaster Recovery Console",
+        "s29": "seconds"
       },
       "files": {
         "s1": "文件管理 - TG文件解码器",
@@ -402,7 +411,9 @@
         "s14": "维护模式操作",
         "s15": "关闭维护模式",
         "s16": "维护原因:",
-        "s17": "启用维护模式"
+        "s17": "启用维护模式",
+        "s18": "Maintenance Mode",
+        "s19": "Maintenance Mode Console"
       },
       "notifications": {
         "s1": "通知列表",
@@ -415,7 +426,9 @@
         "s8": "创建时间",
         "s9": "已读",
         "s10": "未读",
-        "s11": "暂无数据"
+        "s11": "暂无数据",
+        "s12": "Notification Center",
+        "s13": "Notification Center"
       },
       "rbac": {
         "s1": "角色列表",
@@ -430,7 +443,9 @@
         "s10": "系统已注册的权限标识",
         "s11": "权限标识",
         "s12": "描述",
-        "s13": "暂无数据"
+        "s13": "暂无数据",
+        "s14": "RBAC Role Management",
+        "s15": "RBAC Role Management"
       },
       "repair_console": {
         "s1": "Outbox 待处理",
@@ -461,7 +476,9 @@
         "s26": "状态",
         "s27": "尝试次数",
         "s28": "暂无数据",
-        "s29": "ID"
+        "s29": "ID",
+        "s30": "Repair Console",
+        "s31": "Repair Console"
       },
       "reports": {
         "s1": "待处理举报列表",
@@ -475,7 +492,9 @@
         "s9": "创建时间",
         "s10": "操作",
         "s11": "下架",
-        "s12": "暂无数据"
+        "s12": "暂无数据",
+        "s13": "Report Management",
+        "s14": "Report Management"
       },
       "ru_cost": {
         "s1": "RU 告警(严重):",
@@ -494,7 +513,9 @@
         "s14": "各操作类型每千次 RU 成本",
         "s15": "操作类型",
         "s16": "RU/千次",
-        "s17": "暂无数据"
+        "s17": "暂无数据",
+        "s18": "RU Cost",
+        "s19": "RU Cost Center"
       },
       "tasks": {
         "s1": "任务列表",
@@ -511,7 +532,9 @@
         "s12": "失败",
         "s13": "已取消",
         "s14": "待处理",
-        "s15": "暂无数据"
+        "s15": "暂无数据",
+        "s16": "Task Center",
+        "s17": "Task Center"
       },
       "topology": {
         "s1": "账号总数",
@@ -536,7 +559,9 @@
         "s20": "文件数",
         "s21": "健康",
         "s22": "降级",
-        "s23": "暂无数据"
+        "s23": "暂无数据",
+        "s24": "Topology Visualization",
+        "s25": "Topology Visualization"
       },
       "users": {
         "s1": "用户管理 - TG文件解码器",
@@ -758,7 +783,8 @@
         "s85": "🔄 移除备用频道\n\n请输入要移除的频道ID：\n\n❌ 如需取消请点击下方按钮。",
         "s86": "⏳ 设置轮转参数\n\n请选择参数：\n  active_window_size — 活跃窗口大小（每组几个活跃频道）\n  files_per_slot — 每频道文件数后切换\n  time_per_slot — 每频道活跃时间（秒）后切换\n\n请输入参数名：\n\n❌ 如需取消请点击下方按钮。",
         "s87": "❌ 未知操作：{action}",
-        "s88": "❌ 操作已取消。"
+        "s88": "❌ 操作已取消。",
+        "s89": "❌ Failed to submit recovery approval: {error}\n\nBackup file: `{backup_key}`"
       },
       "conversation": {
         "s1": "⏳ 对话已超时(5分钟无响应),请重新点击按钮开始操作。",
@@ -896,7 +922,9 @@
         "s133": "❌ 无效参数: {key}\n有效参数: {join_sorted_valid_keys}\n请重新输入:",
         "s134": "✅ 轮转配置已更新\n  {label_map_get_data_rotation_key_data_rotation_key}: {text}\n\nMon Bot 将在下一轮自动加载新配置。",
         "s135": "⏳ 对话已超时,请重新点击按钮开始操作。",
-        "s136": "❌ 值必须是数字,请重新输入:"
+        "s136": "❌ 值必须是数字,请重新输入:",
+        "s137": "❌ Login failed: {error}\nPlease re-enter the verification code, or click cancel.",
+        "s138": "❌ Password incorrect or login failed: {error}\nPlease re-enter the password, or click cancel."
       },
       "display": {
         "s1": "🤖 机器人健康状态\n\n",
@@ -1228,7 +1256,20 @@
         "s273": "❌ 关闭失败: {result_error}",
         "s274": "用法:/tasks [status] [limit]\nstatus: pending/running/completed/failed/cancelled",
         "s275": "✅ 维护模式已关闭",
-        "s276": "❌ 关闭失败"
+        "s276": "❌ 关闭失败",
+        "s277": "❌ Setup failed: {error}",
+        "s278": "✅ Relay account removed: {phone}",
+        "s279": "❌ Failed to load config: {error}",
+        "s280": "❌ Query failed, please try again later",
+        "s281": "❌ Takedown failed: {error}",
+        "s282": "❌ Operation failed, please try again later",
+        "s283": "❌ Ban failed: {error}",
+        "s284": "❌ Unban failed: {error}",
+        "s285": "❌ Approval failed (insufficient permission / not pending / cannot approve own request)",
+        "s286": "❌ Rejection failed (insufficient permission / not pending)",
+        "s287": "❌ Assignment failed: {error}",
+        "s288": "❌ Unknown action, use on/off/status",
+        "s289": "❌ Failed to generate report, please try again later"
       },
       "menus": {
         "s1": "免费",
@@ -1564,6 +1605,31 @@
       "s63": "正在处理 {total_count} 个文件...\n已完成 {i_1}/{total_count_3}",
       "s64": "📝 请发送备注文字（60秒内有效）\n发送任意文字即可，或发送 /cancel_note 跳过",
       "s65": "文件处理失败：存储频道未就绪，请重新上传"
+    },
+    "dsp_bot": {
+      "s1": "File delivered",
+      "s2": "❌ Query failed, please try again later"
+    },
+    "idx_bot": {
+      "s1": "External file delivery failed, please try again later or contact the administrator.",
+      "s2": "The cache for file {code} has expired. Please resend the code to get the latest file.",
+      "s3": "File delivery failed, please try again later.",
+      "s4": "File processing failed, please try again later or contact the administrator.",
+      "s5": "File processing failed, please try again later",
+      "s6": "The file will be sent to you by @{bot_username}, please check.",
+      "s7": "The file {code} you requested failed to send, please try again later.",
+      "s8": "❌ Report submission failed, please try again later",
+      "s9": "❌ Submission failed, please try again later",
+      "s10": "❌ Repair failed, please check whether the file code is correct",
+      "s11": "❌ Repair failed, please try again later",
+      "s12": "✅ File code regenerated\nOld code: {old_code}\nNew code: {new_code}",
+      "s13": "❌ Regeneration failed, please try again later",
+      "s14": "❌ Query failed, please try again later"
+    },
+    "up_bot": {
+      "s1": "Collection save failed, please try again later",
+      "s2": "No pending note to set",
+      "s3": "❌ Query failed, please try again later"
     }
   },
   "accessibility": {
@@ -1666,7 +1732,8 @@
       "s52": "MFA 会话读取失败",
       "s53": "MFA 会话数据无效",
       "s54": "无效的操作类型",
-      "s55": "MFA 会话创建失败,请重试"
+      "s55": "MFA 会话创建失败,请重试",
+      "s56": "Session creation failed"
     }
   },
   "services": {

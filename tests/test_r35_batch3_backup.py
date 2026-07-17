@@ -473,6 +473,12 @@ class TestRestoreDelegation:
             }
         }
 
+        # R60 P0-03: restore_from_backup_data 强制 _r59_validation_token(fail-closed 守卫)
+        from services.backup_dr_validate import BackupValidationResult
+        _token = BackupValidationResult(
+            valid=True, backup_id=str(backup_data.get("backup_time", "")),
+        )
+
         # Mock _restore_crdb_tables 和 _restore_sqlite_tables_to_db
         mock_crdb = AsyncMock()
         mock_sqlite = AsyncMock()
@@ -480,7 +486,9 @@ class TestRestoreDelegation:
         # 使用 patch 替换内部函数
         with patch("services.db_restore._restore_crdb_tables", mock_crdb), \
              patch("services.db_restore._restore_sqlite_tables_to_db", mock_sqlite):
-            result = await restore_from_backup_data(backup_data, merge=False)
+            result = await restore_from_backup_data(
+                backup_data, merge=False, _r59_validation_token=_token,
+            )
 
         # CRDB 表(users)被传给 _restore_crdb_tables
         assert mock_crdb.called
@@ -505,8 +513,15 @@ class TestRestoreDelegation:
                 "nonexistent_table": [{"id": 1}],
             }
         }
+        # R60 P0-03: restore_from_backup_data 强制 _r59_validation_token(fail-closed 守卫)
+        from services.backup_dr_validate import BackupValidationResult
+        _token = BackupValidationResult(
+            valid=True, backup_id=str(backup_data.get("backup_time", "")),
+        )
 
-        result = await restore_from_backup_data(backup_data, merge=False)
+        result = await restore_from_backup_data(
+            backup_data, merge=False, _r59_validation_token=_token,
+        )
 
         assert "nonexistent_table" in result["skipped"]
         assert result["restored"] == {}

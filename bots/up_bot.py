@@ -1161,7 +1161,7 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
     except Exception as e:
         logger.error(f"[Up][collection] file_records 写入失败 (code={collection_code}): {e}")
-        await update.message.reply_text("合集保存失败，请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.up_bot.s1'))
         return
 
     # 写入 codes 表(支持后续 offline 标记与过期检查)
@@ -2305,7 +2305,7 @@ async def cancel_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.warning(f"[Up] 发送转发权限选择失败: {e}")
     else:
-        await update.message.reply_text("当前没有待设置的备注")
+        await update.message.reply_text(_i18n_t('bot.up_bot.s2'))
 
 
 def _build_ttl_keyboard():
@@ -2736,7 +2736,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
     except Exception as e:
         logger.exception(f"[Up][status] 查询上传状态失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
 
 
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2754,7 +2754,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n\n".join(lines))
     except Exception as e:
         logger.exception(f"[Up][tasks] 查询任务列表失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
 
 
 async def cmd_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2780,7 +2780,7 @@ async def cmd_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n".join(lines))
     except Exception as e:
         logger.exception(f"[Up][collections] 查询合集列表失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
 
 
 async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2797,7 +2797,7 @@ async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n\n".join(lines))
     except Exception as e:
         logger.exception(f"[Up][notifications] 查询通知失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
 
 
 async def _init():

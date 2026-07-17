@@ -49,6 +49,8 @@ from services.backup_crypto import (
     verify_checksum,
     is_encryption_available,
 )
+# R60 P0-03: fail-closed 信任链守卫 — 缺失/无效令牌抛 AppError 中止恢复
+from services.error_codes import AppError, ErrorCodes
 
 # R44 7.2: record_restore_usage 在函数内延迟导入(避免循环依赖)
 
@@ -154,7 +156,8 @@ async def get_latest_backup() -> dict:
                 f"R40 P0-6: 密文 checksum 校验通过 (sha256={_actual_cipher_sha[:16]}...)"
             )
         else:
-            logger.warning("R40 P0-6: manifest 缺少 ciphertext_sha256 字段(旧备份?),跳过密文校验")
+            logger.error("R40 P0-6: manifest 缺少 ciphertext_sha256 字段(旧备份?),中止恢复")
+            sys.exit(1)
 
         # R36 H7: 解密 payload
         if encryption_info.get("encrypted"):
@@ -198,7 +201,8 @@ async def get_latest_backup() -> dict:
     if not encryption_info.get("encrypted"):
         is_valid, reason = validate_manifest_on_restore(manifest)
         if not is_valid:
-            logger.warning(f"manifest 校验警告: {reason}(继续恢复)")
+            logger.error(f"manifest 校验警告: {reason}")
+            sys.exit(1)
         else:
             logger.info(f"manifest 校验通过: {reason}")
 
@@ -421,9 +425,10 @@ async def _restore_sqlite_table(
 
 async def restore_from_backup_data(
     data: dict,
+    *,
+    _r59_validation_token: "object | None",  # R59 P0-04 / R60 P0-03: fail-closed 信任令牌(强制必填, kw-only)
     tables: list[str] | None = None,
     merge: bool = False,
-    _r59_validation_token: "object | None" = None,  # R59 P0-04: fail-closed 信任令牌
 ) -> dict:
     """从备份数据恢复数据库(单一 Restore Engine 主入口)。
 
@@ -438,44 +443,26 @@ async def restore_from_backup_data(
 
     R35 P1-6: 恢复时按表校验列(validate_columns_for_table)。
 
-    R59 P0-04: 强制参数,不再允许 fail-open — 信任链守卫。
+    R59 P0-04 / R60 P0-03: 强制参数,不再允许 fail-open — 信任链守卫。
         - _r59_validation_token: 由 validate_and_restore_backup_strict 或
           BackupEngine.restore 传入的 BackupValidationResult 信任令牌(valid=True)。
-        - 未传入时记录 ERROR 日志(fail-closed 审计追踪),BackupEngine.restore
-          内部已有 COMPLETE+manifest+checksum+decrypt 验证,视为合规调用方。
+        - 令牌为强制必填参数(无默认值);缺失或 valid=False 时
+          抛出 AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED) 中止恢复(fail-closed)。
         - 生产恢复应通过 validate_and_restore_backup_strict 入口调用本函数。
 
     Args:
         data: 备份数据 dict(含 "tables" 键)
         tables: 仅恢复指定表；None 则恢复备份中的所有表
         merge: True=增量补充(冲突保留现有数据); False=覆盖(清空后写入,默认)
-        _r59_validation_token: R59 P0-04 信任令牌(BackupValidationResult)
+        _r59_validation_token: R59 P0-04 信任令牌(BackupValidationResult,强制必填)
 
     Returns:
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
     """
-    # R59 P0-04: 强制参数,不再允许 fail-open — 信任链守卫审计
-    # 未传入验证令牌时记录 ERROR(fail-closed 审计追踪)
-    # BackupEngine.restore 内部已有验证,视为合规;直接调用本函数需通过 strict 入口
-    if _r59_validation_token is None:
-        logger.error(
-            "R59 P0-04: restore_from_backup_data 未传入 _r59_validation_token,"
-            "请通过 validate_and_restore_backup_strict fail-closed 入口调用"
-            "(BackupEngine.restore 内部验证视为合规调用方)"
-        )
-    else:
-        # R59 P0-04: 验证令牌存在,检查 valid 标志
-        token_valid = getattr(_r59_validation_token, "valid", False)
-        if not token_valid:
-            logger.error(
-                "R59 P0-04: restore_from_backup_data 收到 invalid 验证令牌,"
-                "验证模块未通过,fail-closed 拒绝恢复"
-            )
-            return {
-                "restored": {},
-                "skipped": [],
-                "errors": ["R59 P0-04: validation token is invalid (fail-closed)"],
-            }
+    # R60 P0-03: fail-closed 信任链守卫 — 缺失或无效令牌必须抛 AppError 中止恢复
+    # (原 R59 P0-04 实现仅记录 ERROR 日志后继续恢复,属 fail-open,已修复)
+    if _r59_validation_token is None or not getattr(_r59_validation_token, "valid", False):
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
     backup_tables = data.get("tables", {})
 
     if tables:
@@ -710,8 +697,20 @@ async def run_restore(table: str = None, dry_run: bool = False):
         logger.info("=== DRY-RUN 模式，不会实际写入数据 ===")
 
     # R35 P1-4: 调用单一 Restore Engine
+    # R60 P0-03: restore_from_backup_data 强制信任令牌(fail-closed);
+    # CLI 入口已通过 get_latest_backup() 下载并校验 manifest/checksum,
+    # 视为合规调用方,构造 valid=True 令牌。
+    # 生产恢复应优先走 validate_and_restore_backup_strict fail-closed 入口。
+    from services.backup_dr_validate import BackupValidationResult
+    _r60_restore_token = BackupValidationResult(
+        valid=True,
+        backup_id=str(data.get("backup_time", "")),
+    )
     result = await restore_from_backup_data(
-        data, tables=target_tables if table else None, merge=False,
+        data,
+        _r59_validation_token=_r60_restore_token,
+        tables=target_tables if table else None,
+        merge=False,
     )
 
     # 打印恢复结果

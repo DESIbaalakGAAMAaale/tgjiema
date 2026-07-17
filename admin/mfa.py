@@ -46,6 +46,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import time
 import uuid
@@ -523,6 +524,26 @@ _MFA_RECEIPT_TOKEN_PREFIX = "v4.public"
 # 默认有效期 5 分钟(R59 建议 2-5 分钟)
 _MFA_RECEIPT_DEFAULT_TTL = 300
 
+# ─── R60 P0-02: receipt 签发/验证强化校验常量 ─────────────────
+# TTL 上下限(120s-300s, 防止签发超长凭证或过短无效凭证)
+_MFA_RECEIPT_MIN_TTL = 120
+_MFA_RECEIPT_MAX_TTL = 300
+# 允许的 amr 值集合(认证方式参考, 仅限以下四种)
+_ALLOWED_AMR = frozenset({"pwd", "totp", "webauthn", "backup_code"})
+# amr 必须至少包含一个强因子(totp 或 webauthn), 拒绝仅凭密码签发 receipt
+_REQUIRED_AMR_FACTORS = frozenset({"totp", "webauthn"})
+# iat 时间偏移容忍度(秒, 防时钟漂移; iat 须落在 [now-skew, now+skew])
+_MFA_RECEIPT_IAT_SKEW_SECONDS = 60
+# receipt 最大生命期(exp - iat 上限, 秒)
+_MFA_RECEIPT_MAX_LIFETIME = 300
+# jti 合法格式: 32 位 hex(uuid4().hex) 或 36 位带横线 UUID
+_MFA_RECEIPT_JTI_RE = re.compile(
+    r"^[0-9a-f]{32}$"
+    r"|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+# action_hash 合法格式: 小写 64 位 hex(SHA-256)
+_MFA_RECEIPT_ACTION_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 def _get_mfa_receipt_signing_key() -> bytes:
     """R59 P0-03: 从环境变量读取 receipt 签名密钥(fail-closed)。
@@ -607,8 +628,10 @@ def issue_mfa_receipt(
         token 字符串, 格式: v4.public.<payload_b64>.<signature_b64>
 
     Raises:
-        AppError: 签名密钥未配置(reason=signing_key_missing)或参数无效
-                  (reason=invalid_issue_params), 错误码 AUTH.MFA.RECEIPT_INVALID
+        AppError: 签名密钥未配置(reason=signing_key_missing)、参数无效
+                  (reason=invalid_issue_params)、TTL 超出 [120, 300]
+                  (reason=ttl_out_of_range)、amr 策略违规
+                  (reason=amr_policy_violation), 错误码 AUTH.MFA.RECEIPT_INVALID
     """
     if not principal_id or not purpose or not action_hash:
         raise AppError(
@@ -616,6 +639,39 @@ def issue_mfa_receipt(
             params={
                 "user_id": principal_id,
                 "reason": "invalid_issue_params",
+            },
+        )
+    # R60 P0-02: ttl_seconds 必须为 int 且落在 [120, 300] 区间
+    # (防止签发超长凭证 ttl=999999s 或过短无效凭证)
+    if (
+        not isinstance(ttl_seconds, int)
+        or isinstance(ttl_seconds, bool)
+        or ttl_seconds < _MFA_RECEIPT_MIN_TTL
+        or ttl_seconds > _MFA_RECEIPT_MAX_TTL
+    ):
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": principal_id,
+                "reason": "ttl_out_of_range",
+            },
+        )
+    # R60 P0-02: amr 策略校验
+    # - 必须为非空 list/tuple/set
+    # - 元素必须全部在 _ALLOWED_AMR 集合内
+    # - 必须至少包含一个强因子(totp/webauthn), 拒绝仅凭密码签发 receipt
+    if (
+        not amr
+        or not isinstance(amr, (list, tuple, set))
+        or not set(amr)
+        or not set(amr).issubset(_ALLOWED_AMR)
+        or not (set(amr) & _REQUIRED_AMR_FACTORS)
+    ):
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": principal_id,
+                "reason": "amr_policy_violation",
             },
         )
     # fail-closed: 密钥缺失抛 AppError
@@ -652,10 +708,15 @@ def verify_mfa_receipt(
     校验流程:
       1. 解析 token 格式(v4.public.<payload_b64>.<signature_b64>)
       2. 重算 HMAC-SHA256 签名, 常量时间比较(防伪造/时序攻击)
-      3. 解码 payload, 校验 exp 未过期(防伪造时间戳)
-      4. 校验 sub == expected_principal_id(批准人匹配)
-      5. 校验 purpose == expected_purpose(动作用途匹配)
-      6. 校验 action_hash == expected_action_hash(请求摘要匹配)
+      3. 解码 payload
+      4. 校验 jti 格式(R60 P0-02: 32 位 hex 或 36 位带横线 UUID)
+      5. 校验 action_hash 格式(R60 P0-02: 小写 64 位 hex SHA-256)
+      6. 校验 iat 落在 [now-skew, now+skew](R60 P0-02: 防伪造未来时间戳/陈旧 token)
+      7. 校验 exp - iat <= 300(R60 P0-02: 生命期上限 5 分钟)
+      8. 校验 exp 未过期(防伪造时间戳)
+      9. 校验 sub == expected_principal_id(批准人匹配)
+      10. 校验 purpose == expected_purpose(动作用途匹配)
+      11. 校验 action_hash == expected_action_hash(请求摘要匹配)
 
     本函数为纯密码学 + 字段校验, 不写 DB, 不消费 receipt(可多次调用查看)。
     一次性消费由 consume_mfa_receipt(jti) 原子完成。调用方典型流程:
@@ -734,12 +795,79 @@ def verify_mfa_receipt(
                 "reason": "payload_decode_failed",
             },
         )
+    # R60 P0-02: jti 格式校验(32 位 hex 或 36 位带横线 UUID, 防伪造/截断)
+    jti = payload.get("jti")
+    if not isinstance(jti, str) or not _MFA_RECEIPT_JTI_RE.match(jti):
+        logger.warning(
+            f"[admin.mfa] MFA receipt jti 格式非法 "
+            f"expected_principal={expected_principal_id} jti={jti!r}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "jti_invalid",
+            },
+        )
+    # R60 P0-02: action_hash 格式校验(小写 64 位 hex SHA-256, 防伪造/截断)
+    action_hash = payload.get("action_hash")
+    if (
+        not isinstance(action_hash, str)
+        or not _MFA_RECEIPT_ACTION_HASH_RE.match(action_hash)
+    ):
+        logger.warning(
+            f"[admin.mfa] MFA receipt action_hash 格式非法 "
+            f"expected_principal={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "action_hash_invalid",
+            },
+        )
     # 4. 有效期校验(防伪造时间戳: 以服务端当前时间为准)
     now = int(time.time())
     exp = payload.get("exp")
-    if not isinstance(exp, int) or now >= exp:
+    iat = payload.get("iat")
+    # R60 P0-02: iat 校验(须落在 [now-skew, now+skew], 防伪造未来时间戳/陈旧 token)
+    if (
+        not isinstance(iat, int)
+        or isinstance(iat, bool)
+        or iat < now - _MFA_RECEIPT_IAT_SKEW_SECONDS
+        or iat > now + _MFA_RECEIPT_IAT_SKEW_SECONDS
+    ):
         logger.warning(
-            f"[admin.mfa] MFA receipt 已过期 jti={payload.get('jti')} "
+            f"[admin.mfa] MFA receipt iat 非法或在未来 jti={jti} "
+            f"iat={iat} now={now} skew={_MFA_RECEIPT_IAT_SKEW_SECONDS}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "iat_in_future",
+            },
+        )
+    # R60 P0-02: 生命期校验(exp - iat <= 300, 防止签发超长凭证绕过 TTL 上限)
+    if (
+        not isinstance(exp, int)
+        or isinstance(exp, bool)
+        or (exp - iat) > _MFA_RECEIPT_MAX_LIFETIME
+    ):
+        logger.warning(
+            f"[admin.mfa] MFA receipt 生命期超限 jti={jti} "
+            f"iat={iat} exp={exp} lifetime={exp - iat if isinstance(exp, int) and isinstance(iat, int) else 'N/A'}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "lifetime_too_long",
+            },
+        )
+    if now >= exp:
+        logger.warning(
+            f"[admin.mfa] MFA receipt 已过期 jti={jti} "
             f"exp={exp} now={now}"
         )
         raise AppError(

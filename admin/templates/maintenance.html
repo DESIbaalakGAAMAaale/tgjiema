@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 
-{% block title %}维护模式{% endblock %}
-{% block page_title %}维护模式控制台{% endblock %}
+{% block title %}{{ t("ui.admin.maintenance.s18") }}{% endblock %}
+{% block page_title %}{{ t("ui.admin.maintenance.s19") }}{% endblock %}
 
 {% block content %}
 {% if status and status.get('enabled') %}

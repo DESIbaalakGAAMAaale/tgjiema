@@ -1825,7 +1825,7 @@ async def _send_report_button(bot, chat_id: int, file_code: str):
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton(_i18n_t('bot.dsp.s29'), callback_data=f"report_req|{file_code}")
         ]])
-        await safe_send_message(bot, chat_id=chat_id, text="文件已送达", reply_markup=keyboard)
+        await safe_send_message(bot, chat_id=chat_id, text=_i18n_t('bot.dsp_bot.s1'), reply_markup=keyboard)
     except Exception as e:
         logger.warning(f"[Dsp] 发送举报按钮失败: {e}")
 
@@ -2051,7 +2051,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text)
     except Exception as e:
         logger.exception(f"[Dsp][status] 查询投递状态失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.dsp_bot.s2'))
 
 
 async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2068,7 +2068,7 @@ async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("\n\n".join(lines))
     except Exception as e:
         logger.exception(f"[Dsp][notifications] 查询通知失败: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.dsp_bot.s2'))
 
 
 # ─── 运行 ───

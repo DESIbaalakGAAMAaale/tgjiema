@@ -84,6 +84,7 @@ class ErrorCodes:
     # BACKUP
     BACKUP_RESTORE_APPROVAL_INVALID = "BACKUP.RESTORE.APPROVAL_INVALID"
     BACKUP_RESTORE_CHECKSUM_MISMATCH = "BACKUP.RESTORE.CHECKSUM_MISMATCH"
+    BACKUP_RESTORE_TRUST_CHAIN_REQUIRED = "BACKUP.RESTORE.TRUST_CHAIN_REQUIRED"
 
     # EFFECT_RECEIPT
     EFFECT_RECEIPT_MANAGER_UNAVAILABLE = "EFFECT.RECEIPT.MANAGER_UNAVAILABLE"
@@ -397,6 +398,15 @@ class ErrorDefinition:
         severity: 严重级别 ``info`` / ``warning`` / ``error`` / ``critical``
         safe_params: 可安全记录到日志/audit_log 的参数名白名单
             (未列入白名单的参数会被 ErrorEnvelope.params 过滤掉,避免泄露敏感信息)
+        presentation: R60 §11 显式 Telegram 展示策略
+            (``short_hint`` / ``inline`` / ``silent`` / ``dialog`` / ``toast``)。
+            空串=未显式设置,导出时按 severity 过渡性回退(向后兼容)。
+        show_retry_button: R60 §11 显式"是否显示重试按钮"。
+            ``None``=未显式设置,回退到 ``retryable``(向后兼容);可独立于
+            ``retryable`` 覆盖(同一 severity 的错误可需要不同交互)。
+        audit_level: R60 §11 显式审计级别
+            (``info`` / ``warning`` / ``critical`` / ``security``)。
+            空串=未显式设置,导出时按 severity 过渡性回退(向后兼容)。
     """
     code: str
     message_key: str
@@ -404,6 +414,10 @@ class ErrorDefinition:
     retryable: bool
     severity: str
     safe_params: list[str] = field(default_factory=list)
+    # R60 §11: 展示策略显式定义 — 不再由 severity 在导出时推断
+    presentation: str = ""
+    show_retry_button: Optional[bool] = None
+    audit_level: str = ""
 
 
 # ════════════════════════════════════════════════════════════════
@@ -677,6 +691,10 @@ class ErrorRegistry:
     def to_frontend_mapping(cls) -> dict:
         """R56 §5.2: 导出前端映射 JSON(供 Admin Web / Bot 加载)。
 
+        R60 §11: ``telegram_presentation`` / ``show_retry_button`` /
+        ``audit_level`` 改为读取 ``ErrorDefinition`` 显式字段(未显式设置时
+        按 severity / retryable 过渡性回退,向后兼容),不再在导出时推断。
+
         生成结构:
             {
                 "UPLOAD.COPY.TELEGRAM_TIMEOUT": {
@@ -686,7 +704,8 @@ class ErrorRegistry:
                     "retryable": True,
                     "severity": "error",
                     "telegram_presentation": "short_hint",
-                    "show_retry_button": True
+                    "show_retry_button": True,
+                    "audit_level": "warning"
                 },
                 ...
             }
@@ -696,22 +715,41 @@ class ErrorRegistry:
             2. 根据 retryable 决定是否显示"重试"按钮
             3. 根据 severity 选择 UI 呈现方式(aria-live/badge)
             4. 根据 http_status 映射 HTTP 响应码
+            5. 根据 telegram_presentation / show_retry_button / audit_level
+               决定 Bot 端交互与审计级别
 
-        telegram_presentation 决定 Bot 端展示方式:
-            - "short_hint": 短提示 + "查看详情"按钮(默认)
-            - "inline": 直接展开详情(用于 critical 级别)
-            - "silent": 不向用户展示(用于 internal 级别)
+        telegram_presentation 决定 Bot 端展示方式(显式字段,空串时按 severity 回退):
+            - "short_hint": 短提示 + "查看详情"按钮(默认回退值)
+            - "inline": 直接展开详情(critical 回退值)
+            - "silent": 不向用户展示(info 回退值)
         """
         cls._ensure_initialized()
         mapping: dict[str, dict] = {}
         for code, definition in cls._definitions.items():
-            # telegram_presentation: 按 severity 推断
-            if definition.severity == "critical":
+            # R60 §11: telegram_presentation 优先读显式字段,空串时按 severity 过渡性回退
+            if definition.presentation:
+                tg_pres = definition.presentation
+            elif definition.severity == "critical":
                 tg_pres = "inline"
             elif definition.severity == "info":
                 tg_pres = "silent"
             else:
                 tg_pres = "short_hint"
+            # R60 §11: show_retry_button 优先读显式字段,None 时回退到 retryable
+            show_retry = (
+                definition.retryable
+                if definition.show_retry_button is None
+                else definition.show_retry_button
+            )
+            # R60 §11: audit_level 优先读显式字段,空串时按 severity 过渡性回退
+            if definition.audit_level:
+                audit_lvl = definition.audit_level
+            elif definition.severity == "critical":
+                audit_lvl = "critical"
+            elif definition.severity == "info":
+                audit_lvl = "info"
+            else:
+                audit_lvl = "warning"
             mapping[code] = {
                 "code": definition.code,
                 "message_key": definition.message_key,
@@ -720,7 +758,8 @@ class ErrorRegistry:
                 "severity": definition.severity,
                 "safe_params": list(definition.safe_params),
                 "telegram_presentation": tg_pres,
-                "show_retry_button": definition.retryable,
+                "show_retry_button": show_retry,
+                "audit_level": audit_lvl,
             }
         return mapping
 
@@ -1298,6 +1337,15 @@ def _register_defaults() -> None:
         code=ErrorCodes.BACKUP_RESTORE_CHECKSUM_MISMATCH,
         message_key="errors.backup.restore.checksum_mismatch",
         http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["backup_id"],
+    ))
+    # R60 P0-03: 恢复信任链令牌缺失/无效时 fail-closed 拒绝恢复
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+        message_key="errors.backup.restore.trust_chain_required",
+        http_status=403,
         retryable=False,
         severity="critical",
         safe_params=["backup_id"],

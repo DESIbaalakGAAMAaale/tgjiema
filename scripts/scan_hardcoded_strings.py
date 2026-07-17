@@ -29,7 +29,18 @@ R59 §5.1 P1 整改要点:
         * logger.*/logging.*/print() 调用 → log_only(baseline ratchet,只允许非增加)
     - HTML 扫描扩展:检测 placeholder/title/aria-label/alt 等用户可见属性;
       检测 >文本< 模式时不再要求 CJK,所有含字母数字的文本均纳入检测。
-    - 兼容旧测试:logger ±2 行上下文检测保留(用于 log_only 归类)。
+
+R60 §10 整改要点(本次):
+    - 旧版(R59)classify_finding 用"±2 行内出现 logger/print 即归 log_only"的邻行猜测,
+      会把附近真正的用户 sink 错分为 log_only;且同一 (file, content) 任一出现位于日志附近
+      就把全部重复项归 log_only(假阴性,绕过 user_visible 绝对门禁)。
+    - 新版(R60)分类基于 AST call node 的真实父调用(scan_python_content 用 ast.walk 确定):
+        * 字符串字面量的父 Call 是 logger.*/logging.*/print() → log_only(pattern_type 'log:*')
+        * 字符串字面量的父 Call 是 sink(reply_text/send_message/HTTPException/flash 等)→ user_visible('sink:*')
+        * 不再做 ±2 行邻行猜测;logger/print 调用的字面量改为在 scan 阶段直接收集为 log_only
+    - 同一 (file, content) 多次出现:任一出现是 user_visible(sink)即归 user_visible;
+      仅当全部出现都是 log_only 时才归 log_only(user_visible 优先,杜绝假阴性)。
+    - HTML 扫描改用 html.parser.HTMLParser 遍历 DOM(替代纯正则),Jinja {{ }}/{% %} 在回调中剥离。
 
 模块划分(贴合真实目录):
     - bots/up_bot.py            (Up)
@@ -71,12 +82,14 @@ import re
 import subprocess
 import sys
 from datetime import date
+from html.parser import HTMLParser
 from pathlib import Path
 
 # === 常量 ===
 
-# R59 §5.1 P1: scanner 版本(算法变更:不再按 CJK/英文区分,所有 sink 字面量归 user_visible)
-SCANNER_VERSION = "4.0"
+# R60 §10: scanner 版本(分类基于 AST call node 真实父调用,移除 ±2 行邻行猜测;
+# HTML 改用 html.parser 遍历 DOM,不再纯正则)
+SCANNER_VERSION = "5.0"
 
 # 中文 Unicode 范围(仅用于向后兼容旧测试的 CJK 检测;R59 §5.1 P1 后 classify_finding
 # 不再使用此常量做 user_visible/log_only 区分,所有 sink 字面量统一归 user_visible)
@@ -175,12 +188,9 @@ MODULE_KEYS = [
 # 与 MODULE_KEYS 一致,作为 baseline.json 的 included_paths 字段
 INCLUDED_PATHS = list(MODULE_KEYS)
 
-# R48 P1-c: logger 调用模式(用于 --classify 区分 log_only)
-LOGGER_CALL_RE = re.compile(r'\b(?:logger|logging|log)\.[a-zA-Z_]+\s*\(')
-PRINT_CALL_RE = re.compile(r'\bprint\s*\(')
-
 # R59 §5.1 P1: HTML 用户可见属性名(属性值硬编码时必须接入 i18n)
 # 这些属性的值会被屏幕阅读器读出或直接展示给用户(WCAG 2.2 AA)
+# R60 §10: 由 _HardcodedHTMLScanner(HTMLParser)在 start tag 回调中检查
 HTML_VISIBLE_ATTRS = frozenset({
     'placeholder',   # input/textarea 占位符(用户可见提示)
     'title',         # 元素标题(tooltip + 屏幕reader)
@@ -190,32 +200,6 @@ HTML_VISIBLE_ATTRS = frozenset({
     'aria-roledescription',  # 屏幕阅读器角色描述
     'aria-placeholder',  # ARIA 占位符
 })
-
-# R59 §5.1 P1: HTML 标签之间文本的正则(捕获 > 和 < 之间的非空文本)
-_HTML_TEXT_RE = re.compile(r'>([^<>]+)<')
-
-# R59 §5.1 P1: HTML 属性值正则(双引号 + 单引号均支持)
-# 形如 aria-label="看板" 或 aria-label='看板'
-_HTML_ATTR_DOUBLE_RE = re.compile(
-    r'\b(' + '|'.join(sorted(HTML_VISIBLE_ATTRS)) + r')\s*=\s*"([^"]*)"',
-    re.IGNORECASE,
-)
-_HTML_ATTR_SINGLE_RE = re.compile(
-    r'\b(' + '|'.join(sorted(HTML_VISIBLE_ATTRS)) + r')\s*=\s*\'([^\']*)\'',
-    re.IGNORECASE,
-)
-
-# R59 §5.1 P1: <script>/<style> 块整体跳过(CSS/JS 代码不算用户可见文本)
-_SCRIPT_STYLE_BLOCK_RE = re.compile(
-    r'<(script|style)\b[^>]*>.*?</\1>',
-    re.DOTALL | re.IGNORECASE,
-)
-
-# R59 §5.1 P1: HTML 注释整体跳过(可能是跨行注释)
-_HTML_COMMENT_RE = re.compile(
-    r'<!--.*?-->',
-    re.DOTALL,
-)
 
 # R59 §5.1 P1: 内部协议字符串豁免 — bot 间机器通信协议(非用户可见)
 # 这些字符串虽是 send_message 的参数,但实际是 bot 间协议命令,非自然语言文本:
@@ -376,22 +360,27 @@ def _describe_sink(node: ast.Call, kwarg_name: str = '') -> str:
 # === 文件扫描 ===
 
 def scan_python_content(content: str) -> list[tuple[int, str, str]]:
-    """R58 P1-4: AST sink-based 扫描 — 检测 sink 调用中的字符串字面量。
+    """R60 §10: AST sink-based 扫描 — 基于 call node 真实父调用分类字面量。
 
-    替代旧版正则+CJK 过滤;不再依赖字符集,所有 sink 中的字面量都纳入检测:
-        - reply_text("...")/send_message("...")/answer("...")/flash("...") 等
-        - HTTPException(status_code, detail="...")/HTTPException(500, "...")
-        - 任何含 detail=/text=/message=/caption=/description= 关键字的调用
+    R60 §10 整改(移除 ±2 行邻行猜测):
+        字符串字面量的分类由其 AST 父 Call 节点直接决定,不再依赖邻行 logger/print:
+        - 父 Call 是 logger.*/logging.*/print() → 字面量归 log_only(pattern_type 'log:*')
+        - 父 Call 是 sink(reply_text/send_message/HTTPException/flash 等),
+          或含 detail=/text=/message=/caption=/description= 关键字参数
+          → 字面量归 user_visible(pattern_type 'sink:*')
+        - 其他调用(非 sink 非 logger)→ 不收集
 
     豁免(不算违规):
-        - logger.*/logging.*/print() 调用(整体跳过)
         - 字符串字面量来自 translate()/format_message_icu()/AppError/ErrorEnvelope 等
+          (字面量本身是 exempt Call 的参数,_extract_string_literal 对 Call 节点返回 None)
+        - 内部协议字符串(RELAY_ERROR:/ /start 等,bot 间机器通信)
 
     Args:
         content: Python 源代码字符串
 
     Returns:
         [(line_no, pattern_type, content), ...] 字面量内容(截断到 80 字符)
+        pattern_type 形如 'sink:reply_text' / 'sink:HTTPException.detail' / 'log:info'
     """
     findings: list[tuple[int, str, str]] = []
 
@@ -401,20 +390,40 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
     except SyntaxError:
         return findings
 
-    # 遍历所有 Call 节点
+    # 遍历所有 Call 节点(分类依据 = AST 真实父 Call,不做邻行猜测)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
 
-        # 跳过 logger./logging./print() 调用
-        if _is_logger_or_print_call(node):
+        is_logger = _is_logger_or_print_call(node)
+        # logger/print 调用:字面量归 log_only(R60 §10:不再跳过,改为直接收集)
+        # sink 调用:字面量归 user_visible
+        # 其他调用:跳过
+        if not is_logger and not _is_sink_call(node):
             continue
 
-        # 检查是否是 sink 调用
-        if not _is_sink_call(node):
+        if is_logger:
+            # R60 §10: logger.*/logging.*/print() 的字符串字面量参数 → log_only
+            call_name = _get_call_name(node)
+            for arg in node.args:
+                text = _extract_string_literal(arg)
+                if text is None or not text.strip():
+                    continue
+                if _is_internal_protocol(text):
+                    continue
+                findings.append((node.lineno, f'log:{call_name}', text[:80]))
+            for kw in node.keywords:
+                if kw.arg is None:
+                    continue
+                text = _extract_string_literal(kw.value)
+                if text is None or not text.strip():
+                    continue
+                if _is_internal_protocol(text):
+                    continue
+                findings.append((node.lineno, f'log:{call_name}.{kw.arg}', text[:80]))
             continue
 
-        # 检查位置参数中的字符串字面量
+        # sink 调用:user_visible(检查位置参数)
         for arg in node.args:
             # 豁免:参数本身是 translate()/format_message_icu()/AppError/ErrorEnvelope 等调用
             if isinstance(arg, ast.Call) and _is_exempt_call(arg):
@@ -431,7 +440,7 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
                 continue
             findings.append((node.lineno, _describe_sink(node), text[:80]))
 
-        # 检查关键字参数中的字符串字面量(detail="..." 等)
+        # sink 调用:user_visible(检查关键字参数 detail="..." 等)
         for kw in node.keywords:
             # *args/**kwargs 的 kwarg.arg 为 None,跳过
             if kw.arg is None:
@@ -464,20 +473,108 @@ def scan_python_file(path: Path) -> list[tuple[int, str, str]]:
     return scan_python_content(content)
 
 
+class _HardcodedHTMLScanner(HTMLParser):
+    """R60 §10: HTML DOM 遍历扫描器(基于 html.parser.HTMLParser,替代纯正则)。
+
+    遍历 DOM 节点收集:
+        - 标签之间的文本(handle_data):任何含字母数字的文本均纳入检测
+        - 用户可见属性值(placeholder/title/aria-label/alt 等)
+
+    自动跳过 HTML 注释(HTMLParser 路由到 handle_comment,不传入 handle_data)。
+    <script>/<style> 内容在 CDATA 模式下传入 handle_data,本扫描器通过 _in_cdata
+    标记跳过(CSS/JS 代码不算用户文本)。
+    Jinja2 {{ }}/{% %} 表达式在回调中剥离(模板变量已通过 t() 路由到 i18n)。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.findings: list[tuple[int, str, str]] = []
+        self._in_cdata = False  # 是否在 <script>/<style> 内部
+
+    @staticmethod
+    def _strip_jinja(text: str) -> str:
+        """剥离 Jinja2 {{ }} 表达式、{% %} 控制语句、{# #} 注释,以及由 HTML 属性嵌套双引号
+        导致的悬空 Jinja 片段(如 ``{{ t(`` 或 ``,k) }}``)。
+
+        R60 §10 修复(消除 6+ 个 HTML 误报):
+            - 旧版 ``.*?`` 未带 DOTALL,跨行 Jinja 块(尤其是 ``{# ... #}`` 多行注释)
+              无法被剥离 → 多行注释 bleed 到 html_text finding 中。
+            - 旧版只剥离完整 ``{{ ... }}`` / ``{% ... %}``,不处理 HTMLParser 在
+              ``aria-label="{{ t("...") }}"`` 嵌套双引号处截断属性值而残留的悬空
+              ``{{ t(`` 或孤儿 ``,k) }}`` 片段(以及模板里 ``<{`` 笔误导致的孤儿 ``}}``)。
+            - 新版反复剥离:完整块 → 悬空 opener(``{{`` 到结尾)→ 孤儿 closer(开头到 ``}}``),
+              直至稳定。
+        """
+        prev = None
+        while prev != text:
+            prev = text
+            # 完整 Jinja 块(带 DOTALL,可跨行)
+            text = re.sub(r'\{\{.*?\}\}', '', text, flags=re.DOTALL)
+            text = re.sub(r'\{%.*?%\}', '', text, flags=re.DOTALL)
+            text = re.sub(r'\{#.*?#\}', '', text, flags=re.DOTALL)
+            # 悬空 opener(如 ``{{ t(`` — HTMLParser 在嵌套双引号处截断属性值,
+            # 留下未闭合的 Jinja 表达式开头;从 ``{{`` / ``{%`` / ``{#`` 到字符串结尾全部剥离)
+            text = re.sub(r'\{\{.*$', '', text, flags=re.DOTALL)
+            text = re.sub(r'\{%.*$', '', text, flags=re.DOTALL)
+            text = re.sub(r'\{#.*$', '', text, flags=re.DOTALL)
+            # 孤儿 closer(如 ``,k) }}`` 或 ``{ status.get('reason', '未提供') }}`` —
+            # 上一段属性值/文本被截断后(或模板 ``<{`` 笔误)留下的 ``}}`` / ``%}`` 闭合;
+            # 仅当整段文本不含 opener(``{{`` / ``{%`` / ``{#``)时才剥离,避免误伤
+            # 合法静态文本;从字符串开头到第一个 ``}}`` / ``%}`` (含)全部剥离)
+            if '{{' not in text and '{%' not in text and '{#' not in text:
+                text = re.sub(r'^.*?\}\}', '', text, flags=re.DOTALL)
+                text = re.sub(r'^.*?%\}', '', text, flags=re.DOTALL)
+        return text
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style'):
+            self._in_cdata = True
+        # 检查用户可见属性(placeholder/title/aria-label/alt 等)
+        lineno = self.getpos()[0]
+        for name, value in attrs:
+            if value is None:
+                continue
+            name_lower = name.lower()
+            if name_lower not in HTML_VISIBLE_ATTRS:
+                continue
+            cleaned = self._strip_jinja(value).strip()
+            # 跳过纯空白/纯标点(无字母数字)
+            if cleaned and any(c.isalnum() for c in cleaned):
+                self.findings.append((lineno, f'html_attr:{name_lower}', cleaned[:80]))
+
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style'):
+            self._in_cdata = False
+
+    def handle_data(self, data):
+        if self._in_cdata:
+            return  # 跳过 <script>/<style> 内容(CSS/JS 代码不算用户文本)
+        # 剥离 Jinja2 表达式(模板变量已通过 t() 路由到 i18n)
+        cleaned = self._strip_jinja(data)
+        text = cleaned.strip()
+        # 跳过纯空白/纯标点(无字母数字)
+        if text and any(c.isalnum() for c in text):
+            lineno = self.getpos()[0]
+            self.findings.append((lineno, 'html_text', text[:80]))
+
+
 def scan_html_content(content: str) -> list[tuple[int, str, str]]:
-    """R59 §5.1 P1: 扫描 HTML 中的硬编码用户可见文本(不区分中英文)。
+    """R59 §5.1 P1 / R60 §10: 扫描 HTML 中的硬编码用户可见文本(不区分中英文)。
+
+    R60 §10: 改用 html.parser.HTMLParser 遍历 DOM(替代纯正则),
+    Jinja {{ }}/{% %} 在回调中剥离。
 
     检测范围:
-        - HTML 标签之间的文本(`>文本<`):任何含字母数字的文本均纳入检测
+        - HTML 标签之间的文本(>文本<):任何含字母数字的文本均纳入检测
           (旧版 R58 仅检测 CJK;R59 §5.1 P1 扩展到英文 — "英文 sink 绝对零基线")
         - HTML 属性值:`placeholder` / `title` / `aria-label` / `alt` 等
           用户可见属性的硬编码值(无论中英文)
 
     排除:
-        - HTML 注释 `<!-- -->` (整体跳过,可能跨行)
+        - HTML 注释 `<!-- -->` (HTMLParser 自动路由到 handle_comment,不传入 handle_data)
         - Jinja2 表达式 `{{ }}` (模板变量已通过 `t()` 路由到 i18n)
         - Jinja2 控制语句 `{% %}` (条件/循环,非用户文本)
-        - `<script>` / `<style>` 块内容(CSS/JS 代码不算用户文本)
+        - `<script>` / `<style>` 块内容(CSS/JS 代码不算用户文本,通过 _in_cdata 跳过)
         - 纯标点/符号文本(如 `:` `|` `>` 等,无字母数字)
 
     Args:
@@ -487,48 +584,10 @@ def scan_html_content(content: str) -> list[tuple[int, str, str]]:
         [(line_no, pattern_type, content), ...] 字面量内容(截断到 80 字符)
         pattern_type 形如 "html_text" 或 "html_attr:aria-label"
     """
-    findings: list[tuple[int, str, str]] = []
-
-    # 预处理:移除 <script>...</script> 和 <style>...</style> 块
-    # 用换行替换被移除的内容以保留行号(让 finding 行号对齐原始文件)
-    def _preserve_lines(match: re.Match) -> str:
-        return '\n' * match.group(0).count('\n')
-
-    cleaned_content = _SCRIPT_STYLE_BLOCK_RE.sub(_preserve_lines, content)
-    # 移除 HTML 注释(可能跨行),同样保留行号
-    cleaned_content = _HTML_COMMENT_RE.sub(_preserve_lines, cleaned_content)
-
-    for i, line in enumerate(cleaned_content.splitlines(), 1):
-        # 移除 Jinja2 {{ }} 表达式(已通过 t() 路由到 i18n)
-        # 使用非贪婪 .*? 匹配,可处理表达式内含 {} 字典字面量的情况
-        # (如 {{ x.get('y', {}).get('z', 0) }} — 旧版 [^}]* 会提前停止)
-        cleaned = re.sub(r'\{\{.*?\}\}', '', line)
-        # 移除 Jinja2 {% %} 控制语句(条件/循环,非用户文本)
-        cleaned = re.sub(r'\{%.*?%\}', '', cleaned)
-
-        # 检测 >文本< 模式(标签之间的文本)
-        for match in _HTML_TEXT_RE.finditer(cleaned):
-            text = match.group(1).strip()
-            # 跳过纯空白/纯标点(无字母数字)
-            if text and any(c.isalnum() for c in text):
-                findings.append((i, 'html_text', text[:80]))
-
-        # 检测 HTML 属性值(双引号)
-        for match in _HTML_ATTR_DOUBLE_RE.finditer(cleaned):
-            attr_name = match.group(1).lower()
-            attr_value = match.group(2).strip()
-            # 跳过纯空白/纯标点(无字母数字)
-            if attr_value and any(c.isalnum() for c in attr_value):
-                findings.append((i, f'html_attr:{attr_name}', attr_value[:80]))
-
-        # 检测 HTML 属性值(单引号)
-        for match in _HTML_ATTR_SINGLE_RE.finditer(cleaned):
-            attr_name = match.group(1).lower()
-            attr_value = match.group(2).strip()
-            if attr_value and any(c.isalnum() for c in attr_value):
-                findings.append((i, f'html_attr:{attr_name}', attr_value[:80]))
-
-    return findings
+    scanner = _HardcodedHTMLScanner()
+    scanner.feed(content)
+    scanner.close()
+    return scanner.findings
 
 
 def scan_html_file(path: Path) -> list[tuple[int, str, str]]:
@@ -767,89 +826,61 @@ def _check_scope_change(baseline: dict) -> tuple[bool, list[str], list[str]]:
 
 # === R48 P1-c: --classify 分类逻辑 ===
 
-def classify_finding(file_path: str, file_content: str, line_no: int) -> str:
-    """R59 §5.1 P1: 分类单条 finding 为 'user_visible' 或 'log_only'。
+def classify_finding(file_path: str, pattern_type: str) -> str:
+    """R60 §10: 分类单条 finding 为 'user_visible' 或 'log_only'。
 
-    判定规则(R59 §5.1 P1 重构 — 不再按 CJK/英文区分):
-    - HTML 文件:
-        * 所有 HTML finding(标签文本 + 用户可见属性)→ user_visible
-          (旧版 R58 按 CJK 区分;R59 §5.1 P1 改为统一 user_visible,
-          实现"英文 sink 绝对零基线")
-    - Python:
-        * 当前/前后 ±2 行含 logger./logging./print( → log_only(日志记录)
-        * 其他 Python sink 调用(reply_text/send_message/HTTPException/flash 等)
-          → user_visible(绝对门禁,无论中英文)
-        * 默认 → user_visible(保守归类,确保 user_visible 绝对零)
+    分类基于 pattern_type(AST 父调用的直接编码,由 scan_python_content /
+    scan_html_content 产出):
+    - pattern_type 以 'log:' 开头 → log_only
+      (字符串字面量直接是 logger.*/logging.*/print() 调用的参数)
+    - 其他(pattern_type 以 'sink:' / 'html_text' / 'html_attr:' 开头,或未知前缀)
+      → user_visible(绝对门禁,无论中英文)
 
-    说明:
-        - scan_python_content 已通过 AST 跳过 logger./print 调用,
-          本函数的 ±2 行 logger 检测是兜底(用于多行调用上下文)。
-        - R58 旧版按 CJK 区分(user_visible=log_only=英文 sink),导致英文用户文本
-          可绕过门禁走 log_only baseline 吸收;R59 §5.1 P1 修正此问题。
-        - 兼容旧测试 test_classify_finding_checks_nearby_lines:
-          logger ±2 行内的 finding 仍归 log_only,超出范围归 user_visible。
+    R60 §10 整改(移除 ±2 行邻行猜测):
+        - 旧版用"±2 行内出现 logger/print 即归 log_only"的邻行猜测,会把附近真正的
+          用户 sink 错分为 log_only(假阴性,绕过 user_visible 绝对门禁);且同一
+          (file, content) 任一出现位于日志附近就把全部重复项归 log_only。
+        - 新版分类完全基于 AST call node 的真实父调用(scan 阶段已编码到 pattern_type),
+          不再做邻行猜测;logger/print 调用的字面量在 scan 阶段直接收集为 'log:*'。
     """
-    lines = file_content.splitlines() if file_content else []
-
-    # HTML:R59 §5.1 P1 统一归 user_visible(不再按 CJK 区分)
-    if not file_path.endswith('.py'):
-        return 'user_visible'
-
-    # Python:先检查 logger/print 上下文(±2 行)
-    # (保留旧测试 test_classify_finding_checks_nearby_lines 行为)
-    for offset in (-2, -1, 0, 1, 2):
-        i = line_no - 1 + offset
-        if 0 <= i < len(lines):
-            line = lines[i]
-            if LOGGER_CALL_RE.search(line) or PRINT_CALL_RE.search(line):
-                return 'log_only'
-
-    # R59 §5.1 P1: 所有 Python sink 调用(无论中英文)→ user_visible
-    # (旧版 R58 此处按 CJK 区分:中文 → user_visible,英文 sink → log_only;
-    #  R59 §5.1 P1 修正:英文 sink 也归 user_visible,实现绝对零基线)
+    if pattern_type.startswith('log:'):
+        return 'log_only'
     return 'user_visible'
 
 
 def classify_findings(findings, root: Path) -> dict[str, dict[str, int]]:
     """对 findings 分类,返回 {module: {'user_visible': N, 'log_only': M}}。
 
+    R60 §10: 分类基于 pattern_type(AST 父调用的直接编码),不再做 ±2 行邻行猜测。
     使用 file::content 去重(与 count_by_module 一致),确保各模块之和等于全局总数。
-    对于同一 (file, content) 出现多次(不同行号)的情况:
-    若任一出现位置在 logger 上下文 → 归为 log_only;否则归为 user_visible。
+    对于同一 (file, content) 出现多次(不同行号/不同 pattern_type)的情况:
+    任一出现是 user_visible(sink:*/html_*)即归 user_visible;
+    仅当全部出现都是 log_only(log:*)时才归 log_only(user_visible 优先,杜绝假阴性)。
+
+    注意:root 参数保留用于向后兼容(调用方/测试 monkeypatch 仍传入),R60 §10 后
+    分类不再需要读取文件内容(pattern_type 已编码父调用信息)。
     """
-    file_cache: dict[str, str] = {}
-
-    def get_content(rel: str) -> str:
-        if rel not in file_cache:
-            try:
-                file_cache[rel] = (root / rel).read_text(encoding='utf-8')
-            except Exception:
-                file_cache[rel] = ''
-        return file_cache[rel]
-
-    # 按 (file, content) 分组,记录所有出现行号(避免同一内容被双重计数)
-    grouped: dict[tuple[str, str], list[int]] = {}
-    for file, line, _ptype, content in findings:
+    # 按 (file, content) 分组,记录所有出现的 pattern_type
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for file, _line, ptype, content in findings:
         if _module_for_file(file) is None:
             continue
         key = (file, content)
-        grouped.setdefault(key, []).append(line)
+        grouped.setdefault(key, []).append(ptype)
 
     classified: dict[str, dict[str, set[str]]] = {
         m: {'user_visible': set(), 'log_only': set()} for m in MODULE_KEYS
     }
 
-    for (file, content), lines in grouped.items():
+    for (file, content), ptypes in grouped.items():
         m = _module_for_file(file)
         if m is None:
             continue
-        file_content = get_content(file)
-        # 任一行号附近有 logger → log_only(保守归类,避免漏计日志文本)
-        cls = 'user_visible'
-        for line_no in lines:
-            if classify_finding(file, file_content, line_no) == 'log_only':
-                cls = 'log_only'
-                break
+        # R60 §10: user_visible 优先 — 任一出现是 sink:*/html_* 即归 user_visible
+        # (仅当全部出现都是 log:* 时才归 log_only,杜绝"邻行 logger 污染全部重复项")
+        cls = 'log_only' if all(
+            classify_finding(file, p) == 'log_only' for p in ptypes
+        ) else 'user_visible'
         vkey = _violation_key(file, content)
         classified[m][cls].add(vkey)
 

@@ -338,7 +338,7 @@ async def _flush_media_group_buffer(media_group_id: str):
         except Exception as e:
             logger.error(f"[Idx] 中继媒体组处理失(code={code}): {e}")
             try:
-                await safe_send_message(bot, chat_id=user_id, text="外部文件发送失败，请稍后重试或联系管理员。")
+                await safe_send_message(bot, chat_id=user_id, text=_i18n_t('bot.idx_bot.s1'))
             except Exception:
                 pass
         return
@@ -387,7 +387,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
 
     if is_renew:
         logger.info(f"[Idx] 记录已过 {code}")
-        await safe_send_message(context.bot, chat_id=target_user_id, text=f"文件 {code} 的缓存已过期，请重新发送该码以获取最新文件。")
+        await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx_bot.s2', code=code))
         return
 
     if is_batch:
@@ -408,7 +408,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
             await _dispatch_to_dsp(target_user_id, code, storage_channel, list(storage_ids))
         except Exception as e:
             logger.error(f"[Idx] RELAY_BATCH 写入 jobs 失败: {e}")
-            await safe_send_message(context.bot, chat_id=target_user_id, text="文件发送失败，请稍后重试。")
+            await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx_bot.s3'))
             return
 
         if context:
@@ -438,7 +438,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
         await _dispatch_to_dsp(target_user_id, code, storage_channel, msg_ids, record.get("batch_file_meta", ""))
     except Exception as e:
         logger.error(f"[Idx] 中继代发写入 jobs 失败: {e}")
-        await safe_send_message(context.bot, chat_id=target_user_id, text="文件发送失败，请稍后重试。")
+        await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx_bot.s3'))
         return
 
     try:
@@ -892,7 +892,7 @@ async def _process_one_pending(app: Application, row: dict):
     except Exception as e:
         logger.error(f"[Idx][poll] 生成文件码失败(uploader={uploader_id}): {e}")
         try:
-            await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试或联系管理员。")
+            await safe_send_message(app.bot, chat_id=uploader_id, text=_i18n_t('bot.idx_bot.s4'))
         except Exception as e:
             logger.warning(f"[Idx] 通知用户处理失败: {e}")
             pass
@@ -988,7 +988,7 @@ async def _process_one_pending(app: Application, row: dict):
         # 让该记录立即可被下轮重领(无需等待 _CLAIM_TIMEOUT 超时)。
         logger.error(f"[Idx][poll] DB写入失败 (code={file_code}): {e}")
         try:
-            await safe_send_message(app.bot, chat_id=uploader_id, text="文件处理失败，请稍后重试")
+            await safe_send_message(app.bot, chat_id=uploader_id, text=_i18n_t('bot.idx_bot.s5'))
         except Exception:
             pass
         try:
@@ -1123,7 +1123,7 @@ async def _process_one_pending(app: Application, row: dict):
                 logger.info(f"[Idx][poll] 外部码 {ext_code} 已直接调度 dsp 发送给 {uploader_id}")
                 try:
                     await safe_send_message(app.bot, chat_id=uploader_id,
-                        text=f"文件将由 @{settings.SENDER_BOT_USERNAME} 发送给你，请查收。")
+                        text=_i18n_t('bot.idx_bot.s6', bot_username=settings.SENDER_BOT_USERNAME))
                 except Exception as notify_err:
                     logger.warning(f"[Idx][poll] 外部码 {ext_code} 通知用户失败: {notify_err}")
             except Exception as dispatch_err:
@@ -2666,7 +2666,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
     except Exception as e:
         logger.error(f"[Idx][relay_file] 处理失败 (code={code_part}): {e}")
         try:
-            await safe_send_message(context.bot, chat_id=target_user_id, text=f"您请求的文件 {code_part} 发送失败，请稍后重试。")
+            await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx_bot.s7', code=code_part))
         except Exception:
             pass
     return True
@@ -2963,10 +2963,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if report_id > 0:
             await update.message.reply_text(_i18n_t('bot.idx.s115', report_id=report_id))
         else:
-            await update.message.reply_text("❌ 举报提交失败,请稍后重试")
+            await update.message.reply_text(_i18n_t('bot.idx_bot.s8'))
     except Exception as e:
         logger.exception(f"[Idx][report] 提交举报失败: {e}")
-        await update.message.reply_text("❌ 提交失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.idx_bot.s9'))
 
 
 async def cmd_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2983,10 +2983,10 @@ async def cmd_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_msg_id > 0:
             await update.message.reply_text(_i18n_t('bot.idx.s117', code=code, new_msg_id=new_msg_id))
         else:
-            await update.message.reply_text("❌ 修复失败,请检查文件码是否正确")
+            await update.message.reply_text(_i18n_t('bot.idx_bot.s10'))
     except Exception as e:
         logger.exception(f"[Idx][repair] 修复索引失败: {e}")
-        await update.message.reply_text("❌ 修复失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.idx_bot.s11'))
 
 
 async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3004,10 +3004,10 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(_i18n_t('bot.idx.s119'))
             return
         new_code = result.get("new_code") or result.get("code", "")
-        await update.message.reply_text(f"✅ 文件码已重新生成\n旧码:{old_code}\n新码:{new_code}")
+        await update.message.reply_text(_i18n_t('bot.idx_bot.s12', old_code=old_code, new_code=new_code))
     except Exception as e:
         logger.exception(f"[Idx][regenerate] 重新生成文件码失败: {e}")
-        await update.message.reply_text("❌ 重新生成失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.idx_bot.s13'))
 
 
 async def cmd_failure_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3025,7 +3025,7 @@ async def cmd_failure_reason(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(text)
     except Exception as e:
         logger.exception(f"[Idx][failure_reason] 查询失败原因异常: {e}")
-        await update.message.reply_text("❌ 查询失败,请稍后重试")
+        await update.message.reply_text(_i18n_t('bot.idx_bot.s14'))
 
 
 # ─── 运行 ───

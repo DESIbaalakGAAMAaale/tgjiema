@@ -165,7 +165,7 @@
         <header class="header">
             <h1>{{ t("ui.admin.base.s22") }}</h1>
             <div class="admin-info">
-                {% if admin %}管理员: {{ admin.username if admin is mapping or admin is not string else admin }}{% endif %}
+                {% if admin %}{{ t("ui.admin.base.s44") }} {{ admin.username if admin is mapping or admin is not string else admin }}{% endif %}
                 <!-- R44 6.2: 语言切换器 — 调用 /locale?lang=xx 端点持久化 locale -->
                 <span class="locale-switcher" role="group" aria-label="{{ t("ui.admin.base.s42") }}">
                     <a href="/locale?lang=zh-CN" {% if locale | default('zh-CN') == 'zh-CN' %}class="current" aria-current="true"{% endif %}>{{ t("ui.admin.base.s23") }}</a>

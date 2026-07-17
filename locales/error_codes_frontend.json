@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 108,
-    "generated_at": "2026-07-17T10:05:35.828532Z",
+    "enum_count": 109,
+    "generated_at": "2026-07-17T13:55:19.062373Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,11 +13,12 @@
       "show_retry_button": "是否显示重试按钮(= retryable)",
       "telegram_presentation": "Bot 端展示方式: short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)"
     },
-    "total_codes": 108,
+    "total_codes": 109,
     "version": "R56-§5.2"
   },
   "codes": {
     "ADMIN.BOOTSTRAP.NOT_VERIFIED": {
+      "audit_level": "critical",
       "code": "ADMIN.BOOTSTRAP.NOT_VERIFIED",
       "http_status": 503,
       "message_key": "errors.admin.bootstrap.not_verified",
@@ -28,6 +29,7 @@
       "telegram_presentation": "inline"
     },
     "ADMIN.PASSWORD.MIGRATE_ARGON2_REMOVED": {
+      "audit_level": "critical",
       "code": "ADMIN.PASSWORD.MIGRATE_ARGON2_REMOVED",
       "http_status": 500,
       "message_key": "errors.admin.password.migrate_argon2_removed",
@@ -38,6 +40,7 @@
       "telegram_presentation": "inline"
     },
     "ADMIN.VALIDATION.PASSWORD_EMPTY": {
+      "audit_level": "info",
       "code": "ADMIN.VALIDATION.PASSWORD_EMPTY",
       "http_status": 400,
       "message_key": "errors.admin.validation.password_empty",
@@ -48,6 +51,7 @@
       "telegram_presentation": "silent"
     },
     "APPROVAL.GATE.REQUIRED": {
+      "audit_level": "info",
       "code": "APPROVAL.GATE.REQUIRED",
       "http_status": 202,
       "message_key": "errors.approval.gate.required",
@@ -61,6 +65,7 @@
       "telegram_presentation": "silent"
     },
     "APPROVAL.STATE.INVALID": {
+      "audit_level": "warning",
       "code": "APPROVAL.STATE.INVALID",
       "http_status": 409,
       "message_key": "errors.approval.state.invalid",
@@ -74,6 +79,7 @@
       "telegram_presentation": "short_hint"
     },
     "AUTH.MFA.LOCKED": {
+      "audit_level": "warning",
       "code": "AUTH.MFA.LOCKED",
       "http_status": 423,
       "message_key": "errors.auth.mfa.locked",
@@ -86,6 +92,7 @@
       "telegram_presentation": "short_hint"
     },
     "AUTH.MFA.RECEIPT_INVALID": {
+      "audit_level": "critical",
       "code": "AUTH.MFA.RECEIPT_INVALID",
       "http_status": 401,
       "message_key": "errors.auth.mfa.receipt_invalid",
@@ -99,6 +106,7 @@
       "telegram_presentation": "inline"
     },
     "AUTH.MFA.REPLAYED": {
+      "audit_level": "critical",
       "code": "AUTH.MFA.REPLAYED",
       "http_status": 401,
       "message_key": "errors.auth.mfa.replayed",
@@ -111,6 +119,7 @@
       "telegram_presentation": "inline"
     },
     "AUTH.RBAC.PERMISSION_DENIED": {
+      "audit_level": "warning",
       "code": "AUTH.RBAC.PERMISSION_DENIED",
       "http_status": 403,
       "message_key": "errors.auth.rbac.permission_denied",
@@ -124,6 +133,7 @@
       "telegram_presentation": "short_hint"
     },
     "AUTH.SESSION.EXPIRED": {
+      "audit_level": "info",
       "code": "AUTH.SESSION.EXPIRED",
       "http_status": 401,
       "message_key": "errors.auth.session.expired",
@@ -136,6 +146,7 @@
       "telegram_presentation": "silent"
     },
     "BACKUP.DECRYPT.DEP_MISSING": {
+      "audit_level": "critical",
       "code": "BACKUP.DECRYPT.DEP_MISSING",
       "http_status": 500,
       "message_key": "errors.backup.decrypt.dep_missing",
@@ -148,6 +159,7 @@
       "telegram_presentation": "inline"
     },
     "BACKUP.DECRYPT.KEK_MISSING": {
+      "audit_level": "critical",
       "code": "BACKUP.DECRYPT.KEK_MISSING",
       "http_status": 500,
       "message_key": "errors.backup.decrypt.kek_missing",
@@ -158,6 +170,7 @@
       "telegram_presentation": "inline"
     },
     "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED": {
+      "audit_level": "critical",
       "code": "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED",
       "http_status": 403,
       "message_key": "errors.backup.restore.approval_action_id_required",
@@ -170,6 +183,7 @@
       "telegram_presentation": "inline"
     },
     "BACKUP.RESTORE.APPROVAL_INVALID": {
+      "audit_level": "critical",
       "code": "BACKUP.RESTORE.APPROVAL_INVALID",
       "http_status": 403,
       "message_key": "errors.backup.restore.approval_invalid",
@@ -183,6 +197,7 @@
       "telegram_presentation": "inline"
     },
     "BACKUP.RESTORE.CHECKSUM_MISMATCH": {
+      "audit_level": "critical",
       "code": "BACKUP.RESTORE.CHECKSUM_MISMATCH",
       "http_status": 500,
       "message_key": "errors.backup.restore.checksum_mismatch",
@@ -195,6 +210,7 @@
       "telegram_presentation": "inline"
     },
     "BACKUP.RESTORE.R2_CREDENTIAL_MISSING": {
+      "audit_level": "critical",
       "code": "BACKUP.RESTORE.R2_CREDENTIAL_MISSING",
       "http_status": 500,
       "message_key": "errors.backup.restore.r2_credential_missing",
@@ -204,7 +220,21 @@
       "show_retry_button": false,
       "telegram_presentation": "inline"
     },
+    "BACKUP.RESTORE.TRUST_CHAIN_REQUIRED": {
+      "audit_level": "critical",
+      "code": "BACKUP.RESTORE.TRUST_CHAIN_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.backup.restore.trust_chain_required",
+      "retryable": false,
+      "safe_params": [
+        "backup_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "BOT.MON.TOKEN_MISSING": {
+      "audit_level": "critical",
       "code": "BOT.MON.TOKEN_MISSING",
       "http_status": 500,
       "message_key": "errors.bot.mon.token_missing",
@@ -215,6 +245,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.ASYNC_TOKEN_REQUIRED": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.ASYNC_TOKEN_REQUIRED",
       "http_status": 403,
       "message_key": "errors.button.policy.async_token_required",
@@ -229,6 +260,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.BINDING_MISSING": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.BINDING_MISSING",
       "http_status": 400,
       "message_key": "errors.button.policy.binding_missing",
@@ -243,6 +275,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.DUAL_APPROVAL_REQUIRED": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.DUAL_APPROVAL_REQUIRED",
       "http_status": 403,
       "message_key": "errors.button.policy.dual_approval_required",
@@ -256,6 +289,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.EXPIRED": {
+      "audit_level": "warning",
       "code": "BUTTON.POLICY.EXPIRED",
       "http_status": 410,
       "message_key": "errors.button.policy.expired",
@@ -269,6 +303,7 @@
       "telegram_presentation": "short_hint"
     },
     "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED": {
+      "audit_level": "warning",
       "code": "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED",
       "http_status": 403,
       "message_key": "errors.button.policy.final_confirm_required",
@@ -282,6 +317,7 @@
       "telegram_presentation": "short_hint"
     },
     "BUTTON.POLICY.HASH_MISMATCH": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.HASH_MISMATCH",
       "http_status": 409,
       "message_key": "errors.button.policy.hash_mismatch",
@@ -295,6 +331,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.MFA_REQUIRED": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.MFA_REQUIRED",
       "http_status": 403,
       "message_key": "errors.button.policy.mfa_required",
@@ -308,6 +345,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.NONCE_CONSUMED": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.NONCE_CONSUMED",
       "http_status": 409,
       "message_key": "errors.button.policy.nonce_consumed",
@@ -321,6 +359,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.PRINCIPAL_MISMATCH": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.PRINCIPAL_MISMATCH",
       "http_status": 403,
       "message_key": "errors.button.policy.principal_mismatch",
@@ -334,6 +373,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.SIGNATURE_INVALID": {
+      "audit_level": "critical",
       "code": "BUTTON.POLICY.SIGNATURE_INVALID",
       "http_status": 403,
       "message_key": "errors.button.policy.signature_invalid",
@@ -347,6 +387,7 @@
       "telegram_presentation": "inline"
     },
     "BUTTON.POLICY.VERSION_MISMATCH": {
+      "audit_level": "warning",
       "code": "BUTTON.POLICY.VERSION_MISMATCH",
       "http_status": 409,
       "message_key": "errors.button.policy.version_mismatch",
@@ -360,6 +401,7 @@
       "telegram_presentation": "short_hint"
     },
     "CALLBACK.ACTION.NOT_ALLOWED": {
+      "audit_level": "warning",
       "code": "CALLBACK.ACTION.NOT_ALLOWED",
       "http_status": 403,
       "message_key": "errors.callback.action.not_allowed",
@@ -374,6 +416,7 @@
       "telegram_presentation": "short_hint"
     },
     "CF.WORKER.UPDATE_ID_KV_UNCONFIGURED": {
+      "audit_level": "critical",
       "code": "CF.WORKER.UPDATE_ID_KV_UNCONFIGURED",
       "http_status": 500,
       "message_key": "errors.cf.worker.update_id_kv_unconfigured",
@@ -386,6 +429,7 @@
       "telegram_presentation": "inline"
     },
     "COLLECTION.APPROVAL.ALREADY_EXECUTED": {
+      "audit_level": "warning",
       "code": "COLLECTION.APPROVAL.ALREADY_EXECUTED",
       "http_status": 409,
       "message_key": "errors.collection.approval.already_executed",
@@ -399,6 +443,7 @@
       "telegram_presentation": "short_hint"
     },
     "COLLECTION.APPROVAL.HASH_MISMATCH": {
+      "audit_level": "critical",
       "code": "COLLECTION.APPROVAL.HASH_MISMATCH",
       "http_status": 403,
       "message_key": "errors.collection.approval.hash_mismatch",
@@ -412,6 +457,7 @@
       "telegram_presentation": "inline"
     },
     "COLLECTION.APPROVAL.INVALID": {
+      "audit_level": "critical",
       "code": "COLLECTION.APPROVAL.INVALID",
       "http_status": 403,
       "message_key": "errors.collection.approval.invalid",
@@ -426,6 +472,7 @@
       "telegram_presentation": "inline"
     },
     "COLLECTION.APPROVAL.PRINCIPAL_MISMATCH": {
+      "audit_level": "critical",
       "code": "COLLECTION.APPROVAL.PRINCIPAL_MISMATCH",
       "http_status": 403,
       "message_key": "errors.collection.approval.principal_mismatch",
@@ -441,6 +488,7 @@
       "telegram_presentation": "inline"
     },
     "COLLECTION.CAS.BYPASS_NOT_ALLOWED": {
+      "audit_level": "critical",
       "code": "COLLECTION.CAS.BYPASS_NOT_ALLOWED",
       "http_status": 403,
       "message_key": "errors.collection.cas.bypass_not_allowed",
@@ -454,6 +502,7 @@
       "telegram_presentation": "inline"
     },
     "COLLECTION.CAS.CONFLICT": {
+      "audit_level": "info",
       "code": "COLLECTION.CAS.CONFLICT",
       "http_status": 409,
       "message_key": "errors.collection.cas.conflict",
@@ -468,6 +517,7 @@
       "telegram_presentation": "silent"
     },
     "COLLECTION.CAS.VERSION_REQUIRED": {
+      "audit_level": "warning",
       "code": "COLLECTION.CAS.VERSION_REQUIRED",
       "http_status": 400,
       "message_key": "errors.collection.cas.version_required",
@@ -480,6 +530,7 @@
       "telegram_presentation": "short_hint"
     },
     "COMMAND.APPROVAL.MUST_USE_APPROVAL_PATH": {
+      "audit_level": "critical",
       "code": "COMMAND.APPROVAL.MUST_USE_APPROVAL_PATH",
       "http_status": 403,
       "message_key": "errors.command.approval.must_use_approval_path",
@@ -494,6 +545,7 @@
       "telegram_presentation": "inline"
     },
     "COMMAND.CONCURRENT.CLAIM": {
+      "audit_level": "warning",
       "code": "COMMAND.CONCURRENT.CLAIM",
       "http_status": 409,
       "message_key": "errors.command.concurrent.claim",
@@ -506,6 +558,7 @@
       "telegram_presentation": "short_hint"
     },
     "COMMAND.EXECUTE.STORE_UNAVAILABLE": {
+      "audit_level": "critical",
       "code": "COMMAND.EXECUTE.STORE_UNAVAILABLE",
       "http_status": 503,
       "message_key": "errors.command.status.store_unavailable",
@@ -519,6 +572,7 @@
       "telegram_presentation": "inline"
     },
     "COMMAND.HASH.MISMATCH": {
+      "audit_level": "critical",
       "code": "COMMAND.HASH.MISMATCH",
       "http_status": 400,
       "message_key": "errors.command.hash.mismatch",
@@ -531,6 +585,7 @@
       "telegram_presentation": "inline"
     },
     "COMMAND.STATUS.CONFLICT": {
+      "audit_level": "warning",
       "code": "COMMAND.STATUS.CONFLICT",
       "http_status": 409,
       "message_key": "errors.command.status.conflict",
@@ -548,6 +603,7 @@
       "telegram_presentation": "short_hint"
     },
     "COMMAND.STATUS.NOT_APPROVED": {
+      "audit_level": "critical",
       "code": "COMMAND.STATUS.NOT_APPROVED",
       "http_status": 403,
       "message_key": "errors.command.status.not_approved",
@@ -563,6 +619,7 @@
       "telegram_presentation": "inline"
     },
     "CONTENT.APPEAL.INVALID_STATE": {
+      "audit_level": "warning",
       "code": "CONTENT.APPEAL.INVALID_STATE",
       "http_status": 409,
       "message_key": "errors.content.appeal.invalid_state",
@@ -576,6 +633,7 @@
       "telegram_presentation": "short_hint"
     },
     "CONTENT.APPEAL.RESTORE_FAILED": {
+      "audit_level": "warning",
       "code": "CONTENT.APPEAL.RESTORE_FAILED",
       "http_status": 500,
       "message_key": "errors.content.appeal.restore_failed",
@@ -590,6 +648,7 @@
       "telegram_presentation": "short_hint"
     },
     "DATA.LIFECYCLE.BACKUP_MARKER_MISSING": {
+      "audit_level": "critical",
       "code": "DATA.LIFECYCLE.BACKUP_MARKER_MISSING",
       "http_status": 409,
       "message_key": "errors.data.lifecycle.backup_marker_missing",
@@ -604,6 +663,7 @@
       "telegram_presentation": "inline"
     },
     "DATA.LIFECYCLE.BREAK_GLASS_APPROVAL_REQUIRED": {
+      "audit_level": "critical",
       "code": "DATA.LIFECYCLE.BREAK_GLASS_APPROVAL_REQUIRED",
       "http_status": 403,
       "message_key": "errors.data.lifecycle.break_glass_approval_required",
@@ -617,6 +677,7 @@
       "telegram_presentation": "inline"
     },
     "DATA.LIFECYCLE.DELETE_REQUEST_FAILED": {
+      "audit_level": "warning",
       "code": "DATA.LIFECYCLE.DELETE_REQUEST_FAILED",
       "http_status": 500,
       "message_key": "errors.data.lifecycle.delete_request_failed",
@@ -631,6 +692,7 @@
       "telegram_presentation": "short_hint"
     },
     "DATA.LIFECYCLE.DELETE_STEP_FAILED": {
+      "audit_level": "warning",
       "code": "DATA.LIFECYCLE.DELETE_STEP_FAILED",
       "http_status": 500,
       "message_key": "errors.data.lifecycle.delete_step_failed",
@@ -645,6 +707,7 @@
       "telegram_presentation": "short_hint"
     },
     "DB.CACHE.UNAVAILABLE": {
+      "audit_level": "critical",
       "code": "DB.CACHE.UNAVAILABLE",
       "http_status": 503,
       "message_key": "errors.db.cache.unavailable",
@@ -657,6 +720,7 @@
       "telegram_presentation": "inline"
     },
     "DB.CRDB.UNAVAILABLE": {
+      "audit_level": "warning",
       "code": "DB.CRDB.UNAVAILABLE",
       "http_status": 503,
       "message_key": "errors.db.crdb.unavailable",
@@ -669,6 +733,7 @@
       "telegram_presentation": "short_hint"
     },
     "DB.REDIS.UNAVAILABLE": {
+      "audit_level": "warning",
       "code": "DB.REDIS.UNAVAILABLE",
       "http_status": 503,
       "message_key": "errors.db.redis.unavailable",
@@ -681,6 +746,7 @@
       "telegram_presentation": "short_hint"
     },
     "DELIVERY.RECEIPT.FAILED": {
+      "audit_level": "warning",
       "code": "DELIVERY.RECEIPT.FAILED",
       "http_status": 500,
       "message_key": "errors.delivery.receipt.failed",
@@ -694,6 +760,7 @@
       "telegram_presentation": "short_hint"
     },
     "DELIVERY.SEND.FLOOD_WAIT": {
+      "audit_level": "warning",
       "code": "DELIVERY.SEND.FLOOD_WAIT",
       "http_status": 429,
       "message_key": "errors.delivery.send.flood_wait",
@@ -707,6 +774,7 @@
       "telegram_presentation": "short_hint"
     },
     "DELIVERY.SEND.FORBIDDEN": {
+      "audit_level": "warning",
       "code": "DELIVERY.SEND.FORBIDDEN",
       "http_status": 403,
       "message_key": "errors.delivery.send.forbidden",
@@ -720,6 +788,7 @@
       "telegram_presentation": "short_hint"
     },
     "DURABLE.OUTBOX.QUARANTINED": {
+      "audit_level": "critical",
       "code": "DURABLE.OUTBOX.QUARANTINED",
       "http_status": 409,
       "message_key": "errors.durable.outbox.quarantined",
@@ -735,6 +804,7 @@
       "telegram_presentation": "inline"
     },
     "EFFECT.RECEIPT.DB_ERROR": {
+      "audit_level": "warning",
       "code": "EFFECT.RECEIPT.DB_ERROR",
       "http_status": 500,
       "message_key": "errors.effect.receipt.db_error",
@@ -748,6 +818,7 @@
       "telegram_presentation": "short_hint"
     },
     "EFFECT.RECEIPT.MANAGER_UNAVAILABLE": {
+      "audit_level": "warning",
       "code": "EFFECT.RECEIPT.MANAGER_UNAVAILABLE",
       "http_status": 500,
       "message_key": "errors.effect.receipt.manager_unavailable",
@@ -761,6 +832,7 @@
       "telegram_presentation": "short_hint"
     },
     "ENTITLEMENT.PLAN.DIRECT_MUTATION_FORBIDDEN": {
+      "audit_level": "critical",
       "code": "ENTITLEMENT.PLAN.DIRECT_MUTATION_FORBIDDEN",
       "http_status": 403,
       "message_key": "errors.entitlement.plan.direct_mutation_forbidden",
@@ -775,6 +847,7 @@
       "telegram_presentation": "inline"
     },
     "ENTITLEMENT.PLAN.EXPECTED_VERSION_REQUIRED": {
+      "audit_level": "critical",
       "code": "ENTITLEMENT.PLAN.EXPECTED_VERSION_REQUIRED",
       "http_status": 400,
       "message_key": "errors.entitlement.plan.expected_version_required",
@@ -789,6 +862,7 @@
       "telegram_presentation": "inline"
     },
     "ENTITLEMENT.PLAN.REQUIRES_COMMAND_BUS": {
+      "audit_level": "critical",
       "code": "ENTITLEMENT.PLAN.REQUIRES_COMMAND_BUS",
       "http_status": 403,
       "message_key": "errors.entitlement.plan.requires_command_bus",
@@ -803,6 +877,7 @@
       "telegram_presentation": "inline"
     },
     "ENTITLEMENT.QUOTA.QUERY_FAILED": {
+      "audit_level": "critical",
       "code": "ENTITLEMENT.QUOTA.QUERY_FAILED",
       "http_status": 503,
       "message_key": "errors.entitlement.quota.query_failed",
@@ -815,6 +890,7 @@
       "telegram_presentation": "inline"
     },
     "ENTITLEMENT.SET_PLAN.CAS_CONFLICT": {
+      "audit_level": "warning",
       "code": "ENTITLEMENT.SET_PLAN.CAS_CONFLICT",
       "http_status": 409,
       "message_key": "errors.entitlement.set_plan.cas_conflict",
@@ -830,6 +906,7 @@
       "telegram_presentation": "short_hint"
     },
     "ENTITLEMENT.SET_PLAN.TX_FAILED": {
+      "audit_level": "warning",
       "code": "ENTITLEMENT.SET_PLAN.TX_FAILED",
       "http_status": 500,
       "message_key": "errors.entitlement.set_plan.tx_failed",
@@ -843,6 +920,7 @@
       "telegram_presentation": "short_hint"
     },
     "ERROR.INTERNAL.UNEXPECTED": {
+      "audit_level": "warning",
       "code": "ERROR.INTERNAL.UNEXPECTED",
       "http_status": 500,
       "message_key": "errors.error.internal.unexpected",
@@ -856,6 +934,7 @@
       "telegram_presentation": "short_hint"
     },
     "FILE.CODE.INVALID": {
+      "audit_level": "info",
       "code": "FILE.CODE.INVALID",
       "http_status": 400,
       "message_key": "errors.file.code.invalid",
@@ -868,6 +947,7 @@
       "telegram_presentation": "silent"
     },
     "FILE.LOOKUP.EXPIRED": {
+      "audit_level": "info",
       "code": "FILE.LOOKUP.EXPIRED",
       "http_status": 410,
       "message_key": "errors.file.lookup.expired",
@@ -880,6 +960,7 @@
       "telegram_presentation": "silent"
     },
     "FILE.LOOKUP.NOT_FOUND": {
+      "audit_level": "info",
       "code": "FILE.LOOKUP.NOT_FOUND",
       "http_status": 404,
       "message_key": "errors.file.lookup.not_found",
@@ -892,6 +973,7 @@
       "telegram_presentation": "silent"
     },
     "INDEX.CODE.CONFLICT": {
+      "audit_level": "warning",
       "code": "INDEX.CODE.CONFLICT",
       "http_status": 409,
       "message_key": "errors.index.code.conflict",
@@ -904,6 +986,7 @@
       "telegram_presentation": "short_hint"
     },
     "INDEX.FINALIZE.DB_UNINITIALIZED": {
+      "audit_level": "critical",
       "code": "INDEX.FINALIZE.DB_UNINITIALIZED",
       "http_status": 503,
       "message_key": "errors.index.finalize.db_uninitialized",
@@ -916,6 +999,7 @@
       "telegram_presentation": "inline"
     },
     "INDEX.FINALIZE.OUTBOX_FAILED": {
+      "audit_level": "warning",
       "code": "INDEX.FINALIZE.OUTBOX_FAILED",
       "http_status": 500,
       "message_key": "errors.index.finalize.outbox_failed",
@@ -929,6 +1013,7 @@
       "telegram_presentation": "short_hint"
     },
     "INDEX.GENERATE.DB_UNINITIALIZED": {
+      "audit_level": "critical",
       "code": "INDEX.GENERATE.DB_UNINITIALIZED",
       "http_status": 503,
       "message_key": "errors.index.generate.db_uninitialized",
@@ -941,6 +1026,7 @@
       "telegram_presentation": "inline"
     },
     "INDEX.STORAGE.NO_CHANNEL": {
+      "audit_level": "warning",
       "code": "INDEX.STORAGE.NO_CHANNEL",
       "http_status": 503,
       "message_key": "errors.index.storage.no_channel",
@@ -951,6 +1037,7 @@
       "telegram_presentation": "short_hint"
     },
     "MAINTENANCE.DISABLE.QUERY_FAILED": {
+      "audit_level": "critical",
       "code": "MAINTENANCE.DISABLE.QUERY_FAILED",
       "http_status": 500,
       "message_key": "errors.maintenance.disable.recover_query_failed",
@@ -963,6 +1050,7 @@
       "telegram_presentation": "inline"
     },
     "MAINTENANCE.RECOVER.BINDING_REQUIRED": {
+      "audit_level": "critical",
       "code": "MAINTENANCE.RECOVER.BINDING_REQUIRED",
       "http_status": 403,
       "message_key": "errors.maintenance.recover.binding_required",
@@ -976,6 +1064,7 @@
       "telegram_presentation": "inline"
     },
     "MAINTENANCE.RECOVER.PERSIST_CRITICAL": {
+      "audit_level": "critical",
       "code": "MAINTENANCE.RECOVER.PERSIST_CRITICAL",
       "http_status": 500,
       "message_key": "errors.maintenance.recover.persist_critical",
@@ -988,6 +1077,7 @@
       "telegram_presentation": "inline"
     },
     "MAINTENANCE.WORKFLOW.PERSIST_FAILED": {
+      "audit_level": "critical",
       "code": "MAINTENANCE.WORKFLOW.PERSIST_FAILED",
       "http_status": 503,
       "message_key": "errors.maintenance.workflow.persist_failed",
@@ -1001,6 +1091,7 @@
       "telegram_presentation": "inline"
     },
     "METRICS.COLLECTOR.FAILED": {
+      "audit_level": "warning",
       "code": "METRICS.COLLECTOR.FAILED",
       "http_status": 503,
       "message_key": "errors.metrics.collector.failed",
@@ -1013,6 +1104,7 @@
       "telegram_presentation": "short_hint"
     },
     "METRICS.COLLECTOR.OUTPUT_INVALID": {
+      "audit_level": "warning",
       "code": "METRICS.COLLECTOR.OUTPUT_INVALID",
       "http_status": 500,
       "message_key": "errors.metrics.collector.output_invalid",
@@ -1026,6 +1118,7 @@
       "telegram_presentation": "short_hint"
     },
     "METRICS.LABEL.HIGH_CARDINALITY": {
+      "audit_level": "warning",
       "code": "METRICS.LABEL.HIGH_CARDINALITY",
       "http_status": 500,
       "message_key": "errors.metrics.label.high_cardinality",
@@ -1039,6 +1132,7 @@
       "telegram_presentation": "short_hint"
     },
     "METRICS.RU.ESTIMATED": {
+      "audit_level": "info",
       "code": "METRICS.RU.ESTIMATED",
       "http_status": 200,
       "message_key": "errors.metrics.ru.estimated",
@@ -1051,6 +1145,7 @@
       "telegram_presentation": "silent"
     },
     "NOTIFICATION.OUTBOX.DUPLICATE": {
+      "audit_level": "info",
       "code": "NOTIFICATION.OUTBOX.DUPLICATE",
       "http_status": 409,
       "message_key": "errors.notification.outbox.duplicate",
@@ -1064,6 +1159,7 @@
       "telegram_presentation": "silent"
     },
     "NOTIFICATION.OUTBOX.WRITE_FAILED": {
+      "audit_level": "warning",
       "code": "NOTIFICATION.OUTBOX.WRITE_FAILED",
       "http_status": 500,
       "message_key": "errors.notification.outbox.write_failed",
@@ -1077,6 +1173,7 @@
       "telegram_presentation": "short_hint"
     },
     "PRODUCTION.BOT_TOKEN.MISSING": {
+      "audit_level": "critical",
       "code": "PRODUCTION.BOT_TOKEN.MISSING",
       "http_status": 500,
       "message_key": "errors.production.bot_token.missing",
@@ -1089,6 +1186,7 @@
       "telegram_presentation": "inline"
     },
     "PRODUCTION.RESTORE.HASH_MISMATCH": {
+      "audit_level": "critical",
       "code": "PRODUCTION.RESTORE.HASH_MISMATCH",
       "http_status": 403,
       "message_key": "errors.production.restore.hash_mismatch",
@@ -1102,6 +1200,7 @@
       "telegram_presentation": "inline"
     },
     "PRODUCTION.RESTORE.HASH_REQUIRED": {
+      "audit_level": "critical",
       "code": "PRODUCTION.RESTORE.HASH_REQUIRED",
       "http_status": 403,
       "message_key": "errors.production.restore.hash_required",
@@ -1115,6 +1214,7 @@
       "telegram_presentation": "inline"
     },
     "QUOTA.DECODE.EXCEEDED": {
+      "audit_level": "info",
       "code": "QUOTA.DECODE.EXCEEDED",
       "http_status": 429,
       "message_key": "errors.quota.decode.exceeded",
@@ -1128,6 +1228,7 @@
       "telegram_presentation": "silent"
     },
     "RELAY.AUTH.CODE_FAILED": {
+      "audit_level": "warning",
       "code": "RELAY.AUTH.CODE_FAILED",
       "http_status": 401,
       "message_key": "errors.relay.auth.code_failed",
@@ -1140,6 +1241,7 @@
       "telegram_presentation": "short_hint"
     },
     "RELAY.AUTH.PASSWORD_TIMEOUT": {
+      "audit_level": "warning",
       "code": "RELAY.AUTH.PASSWORD_TIMEOUT",
       "http_status": 401,
       "message_key": "errors.relay.auth.password_timeout",
@@ -1152,6 +1254,7 @@
       "telegram_presentation": "short_hint"
     },
     "RELAY.CONFIG.API_HASH_INVALID": {
+      "audit_level": "info",
       "code": "RELAY.CONFIG.API_HASH_INVALID",
       "http_status": 400,
       "message_key": "errors.relay.config.api_hash_invalid",
@@ -1162,6 +1265,7 @@
       "telegram_presentation": "silent"
     },
     "REPAIR.CONSOLE.APPROVAL_HASH_MISMATCH": {
+      "audit_level": "critical",
       "code": "REPAIR.CONSOLE.APPROVAL_HASH_MISMATCH",
       "http_status": 403,
       "message_key": "errors.repair.console.approval_hash_mismatch",
@@ -1176,6 +1280,7 @@
       "telegram_presentation": "inline"
     },
     "REPAIR.CONSOLE.APPROVAL_PRINCIPAL_MISMATCH": {
+      "audit_level": "critical",
       "code": "REPAIR.CONSOLE.APPROVAL_PRINCIPAL_MISMATCH",
       "http_status": 403,
       "message_key": "errors.repair.console.approval_principal_mismatch",
@@ -1190,6 +1295,7 @@
       "telegram_presentation": "inline"
     },
     "REPAIR.CONSOLE.APPROVAL_REQUIRED": {
+      "audit_level": "critical",
       "code": "REPAIR.CONSOLE.APPROVAL_REQUIRED",
       "http_status": 403,
       "message_key": "errors.repair.console.approval_required",
@@ -1203,6 +1309,7 @@
       "telegram_presentation": "inline"
     },
     "RESTORE.EXECUTE.ALREADY_EXECUTED": {
+      "audit_level": "warning",
       "code": "RESTORE.EXECUTE.ALREADY_EXECUTED",
       "http_status": 409,
       "message_key": "errors.restore.execute.already_executed",
@@ -1215,6 +1322,7 @@
       "telegram_presentation": "short_hint"
     },
     "SYSTEM.RATE.LIMITED": {
+      "audit_level": "warning",
       "code": "SYSTEM.RATE.LIMITED",
       "http_status": 429,
       "message_key": "errors.system.rate.limited",
@@ -1227,6 +1335,7 @@
       "telegram_presentation": "short_hint"
     },
     "SYSTEM.STATE.MAINTENANCE": {
+      "audit_level": "warning",
       "code": "SYSTEM.STATE.MAINTENANCE",
       "http_status": 503,
       "message_key": "errors.system.state.maintenance",
@@ -1239,6 +1348,7 @@
       "telegram_presentation": "short_hint"
     },
     "TASK.CENTER.LIST_DB_ERROR": {
+      "audit_level": "warning",
       "code": "TASK.CENTER.LIST_DB_ERROR",
       "http_status": 500,
       "message_key": "errors.task.center.list_db_error",
@@ -1251,6 +1361,7 @@
       "telegram_presentation": "short_hint"
     },
     "TASK.CENTER.UNKNOWN_STATUS": {
+      "audit_level": "warning",
       "code": "TASK.CENTER.UNKNOWN_STATUS",
       "http_status": 400,
       "message_key": "errors.task.center.unknown_status",
@@ -1263,6 +1374,7 @@
       "telegram_presentation": "short_hint"
     },
     "TASK.CENTER.UNKNOWN_TYPE": {
+      "audit_level": "warning",
       "code": "TASK.CENTER.UNKNOWN_TYPE",
       "http_status": 400,
       "message_key": "errors.task.center.unknown_type",
@@ -1275,6 +1387,7 @@
       "telegram_presentation": "short_hint"
     },
     "TOPOLOGY.LOAD.NO_SLOTS": {
+      "audit_level": "warning",
       "code": "TOPOLOGY.LOAD.NO_SLOTS",
       "http_status": 500,
       "message_key": "errors.topology.load.no_slots",
@@ -1285,6 +1398,7 @@
       "telegram_presentation": "short_hint"
     },
     "UPLOAD.COPY.TELEGRAM_FORBIDDEN": {
+      "audit_level": "warning",
       "code": "UPLOAD.COPY.TELEGRAM_FORBIDDEN",
       "http_status": 403,
       "message_key": "errors.upload.copy.telegram_forbidden",
@@ -1298,6 +1412,7 @@
       "telegram_presentation": "short_hint"
     },
     "UPLOAD.COPY.TELEGRAM_TIMEOUT": {
+      "audit_level": "warning",
       "code": "UPLOAD.COPY.TELEGRAM_TIMEOUT",
       "http_status": 504,
       "message_key": "errors.upload.copy.telegram_timeout",
@@ -1311,6 +1426,7 @@
       "telegram_presentation": "short_hint"
     },
     "UPLOAD.MANIFEST.OUTBOX_FAILED": {
+      "audit_level": "warning",
       "code": "UPLOAD.MANIFEST.OUTBOX_FAILED",
       "http_status": 500,
       "message_key": "errors.upload.manifest.outbox_failed",
@@ -1324,6 +1440,7 @@
       "telegram_presentation": "short_hint"
     },
     "UPLOAD.OUTBOX.BOT_UNINITIALIZED": {
+      "audit_level": "warning",
       "code": "UPLOAD.OUTBOX.BOT_UNINITIALIZED",
       "http_status": 500,
       "message_key": "errors.upload.outbox.bot_uninitialized",
@@ -1334,6 +1451,7 @@
       "telegram_presentation": "short_hint"
     },
     "UPLOAD.PENDING.OUTBOX_TX_FAILED": {
+      "audit_level": "warning",
       "code": "UPLOAD.PENDING.OUTBOX_TX_FAILED",
       "http_status": 500,
       "message_key": "errors.upload.pending.outbox_tx_failed",
@@ -1347,6 +1465,7 @@
       "telegram_presentation": "short_hint"
     },
     "UPLOAD.SLOT.NONE_ACTIVE": {
+      "audit_level": "warning",
       "code": "UPLOAD.SLOT.NONE_ACTIVE",
       "http_status": 503,
       "message_key": "errors.upload.slot.none_active",
@@ -1357,6 +1476,7 @@
       "telegram_presentation": "short_hint"
     },
     "USER.STATE.BANNED": {
+      "audit_level": "info",
       "code": "USER.STATE.BANNED",
       "http_status": 403,
       "message_key": "errors.user.state.banned",
@@ -1369,6 +1489,7 @@
       "telegram_presentation": "silent"
     },
     "VALIDATION.INPUT.FAILED": {
+      "audit_level": "info",
       "code": "VALIDATION.INPUT.FAILED",
       "http_status": 400,
       "message_key": "errors.validation.input.failed",

@@ -2,7 +2,7 @@
   "_description": "R48 P1-c: 模块化 i18n 硬编码字符串 baseline(scope 审批 + delta + classify)",
   "_note": "由 --generate-baseline / --ratchet 维护;total 只允许非增加(下降或持平)。R48: scope 变化需 --allow-scope-change;CI 用 --delta 比对 base/head;--classify 区分 user_visible(清零目标 0) 与 log_only(鼓励减少)。",
   "_original_r44_baseline": 954,
-  "scanner_version": "4.0",
+  "scanner_version": "5.0",
   "included_paths": [
     "bots/up_bot.py",
     "bots/idx_bot.py",
@@ -16,40 +16,40 @@
   ],
   "modules": {
     "bots/up_bot.py": {
-      "baseline": 3,
+      "baseline": 103,
       "target": 0,
       "user_visible": 0,
-      "log_only": 3
+      "log_only": 103
     },
     "bots/idx_bot.py": {
-      "baseline": 14,
+      "baseline": 140,
       "target": 0,
       "user_visible": 0,
-      "log_only": 14
+      "log_only": 140
     },
     "bots/dsp_bot.py": {
-      "baseline": 2,
+      "baseline": 105,
       "target": 0,
       "user_visible": 0,
-      "log_only": 2
+      "log_only": 105
     },
     "bots/mon_bot.py": {
-      "baseline": 0,
+      "baseline": 70,
       "target": 0,
       "user_visible": 0,
-      "log_only": 0
+      "log_only": 70
     },
     "bots/admin_bot/": {
-      "baseline": 16,
+      "baseline": 63,
       "target": 0,
       "user_visible": 0,
-      "log_only": 16
+      "log_only": 63
     },
     "admin/": {
-      "baseline": 1,
+      "baseline": 124,
       "target": 0,
       "user_visible": 0,
-      "log_only": 1
+      "log_only": 124
     },
     "admin/templates/": {
       "baseline": 0,
@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 0,
+      "baseline": 1253,
       "target": 0,
       "user_visible": 0,
-      "log_only": 0
+      "log_only": 1253
     }
   },
   "total": {
-    "baseline": 36,
+    "baseline": 1858,
     "target": 0,
     "user_visible": 0,
-    "log_only": 36
+    "log_only": 1858
   },
   "last_updated": "2026-07-17",
-  "last_updated_by": "R59 §5.1 P1: 英文 sink 绝对零基线 + selectordinal CLDR (scanner v4.0; user_visible=0 绝对门禁; services/ log_only 5→0 内部协议豁免; admin/templates/ user_visible 28→0 HTML i18n 接入)"
+  "last_updated_by": "R60 P1 i18n: internationalized all user-visible hardcoded strings"
 }

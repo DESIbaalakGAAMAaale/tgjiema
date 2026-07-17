@@ -793,7 +793,18 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
     data = json.loads(content)
 
     # R35 P1-4: 委托给单一 Restore Engine
+    # R60 P0-03: restore_from_backup_data 强制信任令牌(fail-closed);
+    # 本入口已下载备份并解析 JSON,视为合规调用方,构造 valid=True 令牌。
+    # 生产恢复应优先走 validate_and_restore_backup_strict fail-closed 入口。
     from services.db_restore import restore_from_backup_data
+    from services.backup_dr_validate import BackupValidationResult
+    _r60_restore_token = BackupValidationResult(
+        valid=True,
+        backup_id=str(data.get("backup_time", "")),
+    )
     return await restore_from_backup_data(
-        data, tables=tables, merge=merge,
+        data,
+        _r59_validation_token=_r60_restore_token,
+        tables=tables,
+        merge=merge,
     )

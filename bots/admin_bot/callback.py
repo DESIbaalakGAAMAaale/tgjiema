@@ -573,7 +573,7 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.error(f"[Admin][restore] 提交恢复审批失败: {e}")
         await query.edit_message_text(
-            f"❌ 提交恢复审批失败: {e}\n\n备份文件: `{key}`",
+            _i18n_t('bot.admin_bot.callback.s89', error=e, backup_key=key),
             reply_markup=back_kb,
         )
         return

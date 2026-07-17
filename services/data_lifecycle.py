@@ -210,7 +210,9 @@ async def _verify_break_glass_two_person_approval(
         AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): 双人审批不足/MFA 缺失/自审批/Hash 不匹配/已过期/已撤销/已消费/原子消费失败
     """
     import re as _re_mod
-    from admin.mfa import verify_mfa_receipt, consume_mfa_receipt
+    # R60 P0-01: 不再导入 consume_mfa_receipt(其内部自行 commit,无法纳入单事务)
+    # jti 一次性消费的 CAS 逻辑直接内联到下方 BEGIN IMMEDIATE 事务中
+    from admin.mfa import verify_mfa_receipt
 
     # R59 P0-02: request_hash 严格 lowercase hex 正则
     _REQUEST_HASH_RE = _re_mod.compile(r"^[0-9a-f]{64}$")
@@ -397,6 +399,11 @@ async def _verify_break_glass_two_person_approval(
     # action_hash 必须匹配 request_hash,TTL 2-5 分钟
     canonical_request_hash = next(iter(request_hashes))
     expected_purpose = "break_glass_approval"
+    # R60 P0-01: 先完成所有纯校验(签名/sub/purpose/action_hash/amr/iat/exp),
+    # 仅收集 jti 列表;一次性消费(mfa_receipts + command_approvals)必须在
+    # 同一 SQLite 连接、同一显式事务中原子完成,禁止在循环中调用自行 commit 的
+    # consume_mfa_receipt(否则会出现 receipt 已消费而审批未消费的半消费状态)。
+    jti_list: list[str] = []
     for r in rows:
         approver_id = int(r[0] or 0)
         mfa_receipt = str(r[1] or "")
@@ -407,7 +414,7 @@ async def _verify_break_glass_two_person_approval(
                 expected_purpose=expected_purpose,
                 expected_action_hash=canonical_request_hash,
             )
-            # R59 P0-03: 原子消费 receipt 的 jti(防重放)
+            # R59 P0-03: 提取 jti(防重放原子消费凭据,实际消费在下方统一事务中)
             jti = receipt_payload.get("jti", "")
             if not jti:
                 raise AppError(
@@ -417,16 +424,7 @@ async def _verify_break_glass_two_person_approval(
                         "approver_id": approver_id,
                     },
                 )
-            consumed = await consume_mfa_receipt(jti)
-            if not consumed:
-                raise AppError(
-                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                    params={
-                        "reason": "mfa_receipt_already_consumed_or_consume_failed",
-                        "approver_id": approver_id,
-                        "jti": jti,
-                    },
-                )
+            jti_list.append(jti)
         except AppError:
             raise
         except Exception as e:
@@ -437,10 +435,50 @@ async def _verify_break_glass_two_person_approval(
                     "approver_id": approver_id,
                 },
             ) from e
-    # R59 P0-02: 原子消费 — 在同一事务中 UPDATE consumed_at,受影响行数必须恰好为 2
-    # (使用条件 UPDATE 原子消费,防重放;失败回滚)
+    # R60 P0-01: 原子消费 — mfa_receipts(jti 一次性) + command_approvals(consumed_at)
+    # 必须在同一 SQLite 连接、同一显式事务中完成。
+    # 禁止旧的 "commit → rowcount → rollback" 错误顺序;必须 "rowcount → 条件检查 → commit"。
+    # BEGIN IMMEDIATE 立即获取 RESERVED 锁,串行化并发写者(避免两个写者同时进入临界区)。
     consumed_at_now = now_utc.isoformat()
+    now_unix = int(now_utc.timestamp())
     try:
+        await store._db.execute("BEGIN IMMEDIATE")
+    except Exception as begin_err:
+        # 已处于事务中: 复用现有事务(不重新 BEGIN,也不主动 COMMIT)
+        # (与 cache_store.transaction() 一致的复用语义)
+        logger.debug(
+            f"[DataLifecycle] R60 P0-01: BEGIN IMMEDIATE 失败(复用现有事务): {begin_err}"
+        )
+    try:
+        # 1. 确保 mfa_receipts 表存在(幂等 DDL,与 admin.mfa.consume_mfa_receipt 一致)
+        await store._db.execute(
+            """CREATE TABLE IF NOT EXISTS mfa_receipts (
+                jti          TEXT PRIMARY KEY,
+                sub          BIGINT,
+                purpose      TEXT,
+                action_hash  TEXT,
+                amr          TEXT,
+                iat          INTEGER,
+                exp          INTEGER,
+                used_at      INTEGER,
+                consumed_at  INTEGER
+            )"""
+        )
+        # 2. 对两个 jti 执行条件 INSERT(INSERT OR IGNORE + rowcount)
+        # rowcount=1 → 首次消费成功;rowcount=0 → jti 已存在(重放/已消费)
+        # 两个 jti 的 rowcount 之和必须恰好为 2(均首次消费,任一已消费即重放)
+        receipt_affected = 0
+        for jti in jti_list:
+            cursor = await store._db.execute(
+                "INSERT OR IGNORE INTO mfa_receipts (jti, used_at, consumed_at) "
+                "VALUES (?, ?, ?)",
+                (jti, now_unix, now_unix),
+            )
+            receipt_affected += cursor.rowcount if cursor is not None else 0
+        # 3. 对两条审批行执行条件 UPDATE(CAS: consumed_at IS NULL)
+        # 受影响行数必须恰好为 2(两条审批都被原子消费)
+        # 若 < 2: 验证过程中有记录被并发消费/撤销/过期
+        # 若 > 2: 数据库约束异常(不该发生)
         cursor = await store._db.execute(
             "UPDATE command_approvals "
             "SET consumed_at = ? "
@@ -451,25 +489,35 @@ async def _verify_break_glass_two_person_approval(
             "  AND expires_at > ?",
             (consumed_at_now, action_id, consumed_at_now),
         )
-        await store._db.commit()
-        affected = cursor.rowcount if cursor is not None else 0
-        # R59 P0-02: 受影响行数必须恰好为 2(两条审批都被原子消费)
-        # 若 < 2,说明在验证过程中有记录被并发消费/撤销/过期 → 回滚并拒绝
-        # 若 > 2,说明数据库约束异常(不该发生) → 拒绝
-        if affected != 2:
-            await store._db.rollback()
+        approval_affected = cursor.rowcount if cursor is not None else 0
+        # 4. 检查两侧 rowcount 均恰好为 2,任何不一致 → ROLLBACK 整体事务
+        # receipt_affected != 2: 某 jti 已被消费(重放)或消费失败
+        # approval_affected != 2: 审批被并发消费/撤销/过期
+        if receipt_affected != 2 or approval_affected != 2:
+            try:
+                await store._db.rollback()
+            except Exception as rollback_err:
+                logger.warning(
+                    f"[DataLifecycle] R60 P0-01 rollback 失败 "
+                    f"action_id={action_id}: {rollback_err}"
+                )
             raise AppError(
                 ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
                 params={
                     "reason": "atomic_consume_failed",
-                    "expected_affected": 2,
-                    "actual_affected": affected,
+                    "expected_receipt_affected": 2,
+                    "actual_receipt_affected": receipt_affected,
+                    "expected_approval_affected": 2,
+                    "actual_approval_affected": approval_affected,
                     "action_id": action_id,
                 },
             )
+        # 5. 两侧 CAS 均成功 → COMMIT(唯一提交点,在所有 rowcount 检查之后)
+        await store._db.commit()
         logger.info(
-            f"[DataLifecycle] R59 P0-02: 双人审批原子消费成功 "
-            f"action_id={action_id} affected={affected}"
+            f"[DataLifecycle] R60 P0-01: 双人审批原子消费成功 "
+            f"action_id={action_id} receipt_affected={receipt_affected} "
+            f"approval_affected={approval_affected}"
         )
     except AppError:
         raise
@@ -477,9 +525,9 @@ async def _verify_break_glass_two_person_approval(
         try:
             await store._db.rollback()
         except Exception as rollback_err:
-            # R59 P0-02: rollback 失败不掩盖原异常,仅记录(原异常已在上层抛出)
+            # rollback 失败不掩盖原异常,仅记录(原异常已在上层抛出)
             logger.warning(
-                f"[DataLifecycle] R59 P0-02 rollback 失败 "
+                f"[DataLifecycle] R60 P0-01 rollback 失败 "
                 f"action_id={action_id}: {rollback_err}"
             )
         raise AppError(
