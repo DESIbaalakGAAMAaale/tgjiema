@@ -476,31 +476,46 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             except Exception:
                 pass  # 列已存在(幂等)
         # R58 P0-2: 插入完整字段的审批记录(decision=approved, request_hash=64hex, 未过期/未消费/未撤销)
-        # 注意:expires_at 必须使用与 services/data_lifecycle._verify_break_glass_two_person_approval
-        # 中 now_iso = datetime.datetime.now().isoformat() 相同的时区(本地时间无 tz),
-        # 否则字符串比较会出错(UTC 05:xx < 本地 13:xx 误判为过期)。
+        # R59 P0-02: expires_at 必须是 UTC aware ISO(带 +00:00 后缀),
+        # 因 _parse_iso_utc 将无 tz 后缀的视为 UTC。
+        # R59 P0-03: mfa_receipt 必须是真实签发的 PASETO-like token,
+        # 不能再用占位字符串。
         import datetime as _dt_mod
-        future_iso = (_dt_mod.datetime.now() + _dt_mod.timedelta(hours=1)).isoformat()
-        await real_store._db.execute(
-            "INSERT INTO command_approvals "
-            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
-            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
-            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
-            (action_id, 2, "mfa_receipt_approver_2", now, "a" * 64, future_iso),
+        from admin.mfa import issue_mfa_receipt
+        # 设置 MFA receipt 签名密钥(测试用固定密钥)
+        monkeypatch.setenv("MFA_RECEIPT_SIGNING_KEY", "test_signing_key_for_r59_p0_03_only_32b")
+        future_iso = (_dt_mod.datetime.now(_dt_mod.timezone.utc)
+                      + _dt_mod.timedelta(hours=1)).isoformat()
+        canonical_hash = "a" * 64
+        # R59 P0-03: 为每个 approver 签发真实 MFA receipt
+        receipt_approver_2 = issue_mfa_receipt(
+            principal_id=2, purpose="break_glass_approval",
+            action_hash=canonical_hash, amr=["totp"], ttl_seconds=300,
+        )
+        receipt_approver_3 = issue_mfa_receipt(
+            principal_id=3, purpose="break_glass_approval",
+            action_hash=canonical_hash, amr=["totp"], ttl_seconds=300,
         )
         await real_store._db.execute(
             "INSERT INTO command_approvals "
             "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
             "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
             "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
-            (action_id, 3, "mfa_receipt_approver_3", now, "a" * 64, future_iso),
+            (action_id, 2, receipt_approver_2, now, canonical_hash, future_iso),
+        )
+        await real_store._db.execute(
+            "INSERT INTO command_approvals "
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
+            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
+            (action_id, 3, receipt_approver_3, now, canonical_hash, future_iso),
         )
         await real_store._db.commit()
 
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
             approval_action_id=action_id,
-            request_hash="a" * 64,
+            request_hash=canonical_hash,
             principal_id=1,
         )
         assert cleaned >= 1, "真实审批后应清理至少 1 条记录"
@@ -589,31 +604,42 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             except Exception:
                 pass  # 列已存在(幂等)
         # R58 P0-2: 插入完整字段的审批记录(decision=approved, request_hash=64hex, 未过期/未消费/未撤销)
-        # 注意:expires_at 必须使用与 services/data_lifecycle._verify_break_glass_two_person_approval
-        # 中 now_iso = datetime.datetime.now().isoformat() 相同的时区(本地时间无 tz),
-        # 否则字符串比较会出错(UTC 05:xx < 本地 13:xx 误判为过期)。
+        # R59 P0-02: expires_at 必须是 UTC aware ISO(带 +00:00 后缀)
+        # R59 P0-03: mfa_receipt 必须是真实签发的 PASETO-like token
         import datetime as _dt_mod
-        future_iso = (_dt_mod.datetime.now() + _dt_mod.timedelta(hours=1)).isoformat()
-        await real_store._db.execute(
-            "INSERT INTO command_approvals "
-            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
-            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
-            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
-            (action_id, 2, "mfa_receipt_approver_2", now, "a" * 64, future_iso),
+        from admin.mfa import issue_mfa_receipt
+        monkeypatch.setenv("MFA_RECEIPT_SIGNING_KEY", "test_signing_key_for_r59_p0_03_only_32b")
+        future_iso = (_dt_mod.datetime.now(_dt_mod.timezone.utc)
+                      + _dt_mod.timedelta(hours=1)).isoformat()
+        canonical_hash = "a" * 64
+        receipt_approver_2 = issue_mfa_receipt(
+            principal_id=2, purpose="break_glass_approval",
+            action_hash=canonical_hash, amr=["totp"], ttl_seconds=300,
+        )
+        receipt_approver_3 = issue_mfa_receipt(
+            principal_id=3, purpose="break_glass_approval",
+            action_hash=canonical_hash, amr=["totp"], ttl_seconds=300,
         )
         await real_store._db.execute(
             "INSERT INTO command_approvals "
             "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
             "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
             "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
-            (action_id, 3, "mfa_receipt_approver_3", now, "a" * 64, future_iso),
+            (action_id, 2, receipt_approver_2, now, canonical_hash, future_iso),
+        )
+        await real_store._db.execute(
+            "INSERT INTO command_approvals "
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
+            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
+            (action_id, 3, receipt_approver_3, now, canonical_hash, future_iso),
         )
         await real_store._db.commit()
 
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
             approval_action_id=action_id,
-            request_hash="a" * 64,
+            request_hash=canonical_hash,
             principal_id=1,
         )
         assert cleaned >= 1, "approval_action_id 审批后应清理至少 1 条记录"

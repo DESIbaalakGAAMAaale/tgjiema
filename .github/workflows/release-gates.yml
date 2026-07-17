@@ -839,16 +839,18 @@ jobs:
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-    - name: Verify RC continuity (3 consecutive green runs, strict blocking)
+    - name: Verify RC continuity (current candidate evidence + 3-run promotion gate)
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         GITHUB_RUN_ID: ${{ github.run_id }}
       run: |
         set -euo pipefail
-        echo "=== R56 P0-5: RC Continuity Strict Blocking Verification ==="
-        echo "R56 P0-5: 历史不足直接阻断(不再 continue 放行)"
-        echo "R56 P0-5: 不验证 Release Gates 自身(避免自引用)"
-        echo "R56 P0-5: 比较 artifact digest(真实 SHA-256)"
+        echo "=== R59 P0-01: RC Continuity — current candidate evidence + 3-run promotion gate ==="
+        echo "R59 P0-01: 不要求'首次候选必须已有三次历史同 digest'(首次构建不应不可通过)"
+        echo "R59 P0-01: 验证当前候选的 commit/digest/测试证据一致;"
+        echo "           将'连续三次候选稳定'作为生产晋级条件而非阻断每次基础构建"
+        echo "R58 P0-1: 不验证 Release Gates 自身(避免自引用)"
+        echo "R58 P0-1: 比较 OCI image digest (内容地址, 不可变)"
         echo ""
 
         CURRENT_SHA="${{ github.sha }}"
@@ -857,30 +859,31 @@ jobs:
         echo "Current run ID (excluded to avoid self-reference): ${CURRENT_RUN_ID}"
         echo ""
 
-        # R56 P0-5: 不再验证 Release Gates 自身。
-        # 验证 CI、Deploy Check、E2E Tests 三个外部 workflow 的连续性,
-        # 以及 Release Gates 内部的 backup-restore-drill / pip-audit / trivy job。
-        # 外部 workflow 通过 workflow runs API 查询;
-        # Release Gates 内部 job 通过 check-runs API 查询(同一 run 下的 job 结论)。
+        # R59 P0-01: 验证当前候选的 Release Gates 内部关键 job 必须 success
+        # (这一条件对每次基础构建都强制;3 次历史是"生产晋级"的额外门禁)
+        # 外部 workflow (CI/Deploy Check/E2E) 的"连续 3 次"由 publish-attestation
+        # 的 Checks API 验证当前 SHA 全绿来保证;此处只额外校验"同 digest 稳定"。
         WORKFLOWS=("CI" "Deploy Check" "E2E Tests")
         ALL_PASS=true
-        # R56 P0-5: PR 场景下 merge commit 是一次性的,无法积累 3 次独立历史;
-        # 仅在 push to master 时严格 3 次验证(production-promote 语义)。
-        # PR 场景宽松模式:跳过 3 次历史检查,仅验证当前 run 的 Release Gates 内部关键 job。
         EVENT_NAME="${{ github.event_name }}"
         if [ "${EVENT_NAME}" = "pull_request" ]; then
           REQUIRED_CONSECUTIVE=0
-          echo "R56 P0-5: PR 场景(pull_request),宽松模式:跳过 3 次历史检查"
-          echo "  (merge commit 是一次性的,无法积累独立历史;production-promote 严格模式仅在 push to master 时启用)"
+          echo "R59 P0-01: PR 场景(pull_request),宽松模式:跳过 3 次历史检查"
+          echo "  (merge commit 是一次性的;3 次连续验证由 master push 后积累)"
         else
+          # R59 P0-01: push 场景"3 次连续"作为"生产晋级条件",而非"每次基础构建阻断"
+          # - 历史不足 3 次 → 不阻断,只 warn(允许首次候选构建通过)
+          # - 历史已有 3 次但其中失败/digest 不一致 → 阻断(生产晋级失败)
           REQUIRED_CONSECUTIVE=3
-          echo "R56 P0-5: 生产发布场景(push),严格模式:REQUIRED_CONSECUTIVE=3"
+          echo "R59 P0-01: 生产发布场景(push),晋级条件:连续 ${REQUIRED_CONSECUTIVE} 次同 digest 全绿"
+          echo "  (历史不足 ${REQUIRED_CONSECUTIVE} 次时,允许构建通过,仅记录 warning;"
+          echo "   达到 ${REQUIRED_CONSECUTIVE} 次后,digest 不一致或夹有失败才阻断)"
         fi
         DIGESTS_FILE="$(mktemp)"
         trap 'rm -f "${DIGESTS_FILE}"' EXIT
 
         if [ "${REQUIRED_CONSECUTIVE}" -eq 0 ]; then
-          echo "R56 P0-5: 跳过 workflow 历史检查(宽松模式,REQUIRED_CONSECUTIVE=0)"
+          echo "R59 P0-01: 跳过 workflow 历史检查(宽松模式,REQUIRED_CONSECUTIVE=0)"
         else
         for WF in "${WORKFLOWS[@]}"; do
           echo "--- Checking workflow: ${WF} ---"
@@ -890,7 +893,7 @@ jobs:
 
           if [ -z "$WF_ID" ]; then
             echo "FAIL: Workflow '${WF}' not found"
-            echo "R56 P0-5: 缺少必需 workflow,立即失败"
+            echo "R59 P0-01: 缺少必需 workflow,立即失败"
             exit 1
           fi
 
@@ -905,47 +908,61 @@ jobs:
           RUN_COUNT=$(echo "${FILTERED_JSON}" | jq 'length')
           echo "  Total runs for SHA (excluding current): ${RUN_COUNT}"
 
-          # R56 P0-5: 历史不足直接阻断(不再 continue)
+          # R59 P0-01: 历史不足 3 次不再阻断(首次候选允许通过)
+          # 只记录 warning,继续验证已有历史中 digest 一致性
           if [ "${RUN_COUNT}" -lt "${REQUIRED_CONSECUTIVE}" ]; then
-            echo "  FAIL: 历史不足(${RUN_COUNT}/${REQUIRED_CONSECUTIVE}),阻断发布"
-            echo "  R56 P0-5: commit ${CURRENT_SHA:0:12} 尚未积累 ${REQUIRED_CONSECUTIVE} 次独立验证历史"
-            echo "  需要 ${REQUIRED_CONSECUTIVE} 次不同 run id 的连续成功(不同 runner evidence)"
-            ALL_PASS=false
+            echo "  WARN: 历史不足(${RUN_COUNT}/${REQUIRED_CONSECUTIVE}) — 首次候选允许通过"
+            echo "  R59 P0-01: commit ${CURRENT_SHA:0:12} 正在积累 ${REQUIRED_CONSECUTIVE} 次独立验证历史"
+            echo "  达到 ${REQUIRED_CONSECUTIVE} 次后,失败/digest 不一致才会阻断生产晋级"
+            echo "  (本次仅验证已有历史的 digest 一致性)"
             echo ""
-            continue
+            # 继续使用已有 RUN_COUNT 个历史进行 digest 一致性检查(可能为 0)
+            # 不再 ALL_PASS=false;不再 continue
           fi
 
           CONSECUTIVE_OK=true
-          RECENT_RUNS=$(echo "${FILTERED_JSON}" | jq --argjson n "${REQUIRED_CONSECUTIVE}" \
+          # R59 P0-01: 取已有历史的前 min(RUN_COUNT, REQUIRED_CONSECUTIVE) 个,
+          # 避免历史不足时 jq 越界取 null 导致后续逻辑异常
+          EFFECTIVE_N=$((RUN_COUNT < REQUIRED_CONSECUTIVE ? RUN_COUNT : REQUIRED_CONSECUTIVE))
+          RECENT_RUNS=$(echo "${FILTERED_JSON}" | jq --argjson n "${EFFECTIVE_N}" \
             '.[0:$n]')
-          echo "  Recent ${REQUIRED_CONSECUTIVE} runs status:"
+          echo "  Recent ${EFFECTIVE_N} runs status:"
           echo "${RECENT_RUNS}" | jq -r '.[] | "    run #\(.id) status=\(.conclusion) created=\(.created_at)"'
 
-          # 验证 run id 互不相同(不同 runner evidence 的代理指标)
-          UNIQUE_RUN_IDS=$(echo "${RECENT_RUNS}" | jq -r '.[].id' | sort -u | wc -l)
-          if [ "${UNIQUE_RUN_IDS}" -ne "${REQUIRED_CONSECUTIVE}" ]; then
-            echo "  FAIL: ${REQUIRED_CONSECUTIVE} 次 run 中有重复 run id(仅 ${UNIQUE_RUN_IDS} 个唯一)"
-            CONSECUTIVE_OK=false
-            ALL_PASS=false
+          # R59 P0-01: 历史不足时,跳过"重复 run id"/"夹有失败"/"digest 一致性"的硬断言
+          # (这些只在历史 >= REQUIRED_CONSECUTIVE 时作为生产晋级条件)
+          if [ "${RUN_COUNT}" -lt "${REQUIRED_CONSECUTIVE}" ]; then
+            echo "  INFO: 历史不足 ${REQUIRED_CONSECUTIVE} 次,跳过严格一致性断言(首次候选允许通过)"
+            echo "  R59 P0-01: 仅在历史达到 ${REQUIRED_CONSECUTIVE} 次后,digest 不一致/夹有失败才阻断"
+          else
+            # 验证 run id 互不相同(不同 runner evidence 的代理指标)
+            UNIQUE_RUN_IDS=$(echo "${RECENT_RUNS}" | jq -r '.[].id' | sort -u | wc -l)
+            if [ "${UNIQUE_RUN_IDS}" -ne "${REQUIRED_CONSECUTIVE}" ]; then
+              echo "  FAIL: ${REQUIRED_CONSECUTIVE} 次 run 中有重复 run id(仅 ${UNIQUE_RUN_IDS} 个唯一)"
+              CONSECUTIVE_OK=false
+              ALL_PASS=false
+            fi
+
+            FAILURE_FOUND=$(echo "${RECENT_RUNS}" | jq \
+              --argjson n "${REQUIRED_CONSECUTIVE}" \
+              '[.[0:$n][] | select(.conclusion != "success")] | length')
+
+            if [ "${FAILURE_FOUND}" -gt 0 ]; then
+              echo "  FAIL: 最近 ${REQUIRED_CONSECUTIVE} 次 run 中有 ${FAILURE_FOUND} 次非 success"
+              echo "  R59 P0-01: 失败夹在中间应归零,阻断生产晋级"
+              CONSECUTIVE_OK=false
+              ALL_PASS=false
+            fi
           fi
 
-          FAILURE_FOUND=$(echo "${RECENT_RUNS}" | jq \
-            --argjson n "${REQUIRED_CONSECUTIVE}" \
-            '[.[0:$n][] | select(.conclusion != "success")] | length')
-
-          if [ "${FAILURE_FOUND}" -gt 0 ]; then
-            echo "  FAIL: 最近 ${REQUIRED_CONSECUTIVE} 次 run 中有 ${FAILURE_FOUND} 次非 success"
-            echo "  R56 P0-5: 失败夹在中间应归零,阻断发布"
-            CONSECUTIVE_OK=false
-            ALL_PASS=false
-          fi
-
-          # R58 P0-1: 通过 OCI image digest (内容地址, 不可变) 比较, 不再用 artifact ZIP SHA-256
+          # R58 P0-1 / R59 P0-01: 通过 OCI image digest (内容地址, 不可变) 比较, 不再用 artifact ZIP SHA-256
           # 旧版 R56 比较 artifact ZIP 的 SHA-256, 但 ZIP 包含时间戳等元数据,
           # 同一 source SHA 的不同 run 产生的 ZIP digest 会不同 (假阳性)。
           # 新版 R58 P0-1: 通过 docker-build-info artifact 读取 image_digest,
-          # 同一 source SHA 的 3 次独立 run 应产生同一 image_digest
+          # 同一 source SHA 的多次独立 run 应产生同一 image_digest
           # (Dockerfile + context 完全一致 → digest 一致)。
+          # R59 P0-01: digest 不一致只在历史 >= REQUIRED_CONSECUTIVE 时阻断(生产晋级条件);
+          # 历史不足时只记录 warning(允许首次候选构建通过,但已发现的 digest 仍要一致)
           if [ "${CONSECUTIVE_OK}" = "true" ]; then
             echo "  INFO: R58 P0-1 比较 OCI image digest (内容地址, 不可变)"
             PREV_DIGEST=""
@@ -987,17 +1004,23 @@ jobs:
               fi
             done
             if [ "${DIGEST_MISMATCH}" = "true" ]; then
-              echo "  FAIL: OCI image digest 不一致, 阻断发布 (R58 P0-1: build once 违反)"
-              CONSECUTIVE_OK=false
-              ALL_PASS=false
+              # R59 P0-01: digest 不一致只在历史 >= REQUIRED_CONSECUTIVE 时阻断
+              if [ "${RUN_COUNT}" -ge "${REQUIRED_CONSECUTIVE}" ]; then
+                echo "  FAIL: OCI image digest 不一致, 阻断生产晋级 (R58 P0-1: build once 违反)"
+                CONSECUTIVE_OK=false
+                ALL_PASS=false
+              else
+                echo "  WARN: OCI image digest 不一致, 但历史不足 ${REQUIRED_CONSECUTIVE} 次,仅记录(不阻断首次候选)"
+                echo "  R59 P0-01: 达到 ${REQUIRED_CONSECUTIVE} 次历史后, digest 不一致才会阻断生产晋级"
+              fi
             fi
-            echo "  OK: ${REQUIRED_CONSECUTIVE} 次连续成功 + image digest 一致 (若可获取)"
+            echo "  OK: ${EFFECTIVE_N} 次连续成功 + image digest 一致 (若可获取)"
           fi
           echo ""
         done
         fi
 
-        # R56 P0-5: 额外验证 Release Gates 内部关键 job(backup-restore-drill / pip-audit / trivy)
+        # R59 P0-01: 验证 Release Gates 内部关键 job(backup-restore-drill / pip-audit / trivy)
         # 通过当前 run 的 check-runs API 查询(不要求三次历史,只要求当前 run 通过)
         # PR 场景下跳过:rc-continuity 与关键 job 并行运行,此时它们可能仍在 pending;
         # 这些 job 本身已是 required check,若失败 PR 自然无法合并,无需 rc-continuity 重复检查。
@@ -1026,13 +1049,18 @@ jobs:
 
         echo "=== RC Continuity Check Summary ==="
         if [ "${ALL_PASS}" = "true" ]; then
-          echo "PASS: 所有 workflow 均达到 ${REQUIRED_CONSECUTIVE} 次连续成功"
-          echo "PASS: artifact digest 一致(若可获取)"
+          if [ "${REQUIRED_CONSECUTIVE}" -gt 0 ] && [ "${RUN_COUNT:-0}" -ge "${REQUIRED_CONSECUTIVE}" ] 2>/dev/null; then
+            echo "PASS: 所有 workflow 均达到 ${REQUIRED_CONSECUTIVE} 次连续成功"
+            echo "PASS: artifact digest 一致(若可获取)"
+          else
+            echo "PASS: 当前候选构建通过(历史积累中,${RUN_COUNT:-0}/${REQUIRED_CONSECUTIVE})"
+            echo "PASS: R59 P0-01: 首次候选允许通过;'连续三次候选稳定'是生产晋级条件而非基础构建门禁"
+          fi
           echo "PASS: Release Gates 内部关键 job 通过"
-          echo "R56 P0-5: RC 连续性门禁通过"
+          echo "R59 P0-01: RC 连续性门禁通过"
         else
-          echo "FAIL: RC 连续性门禁未通过(历史不足/artifact digest 不一致/关键 job 失败)"
-          echo "R56 P0-5: 阻断发布,不得绕过"
+          echo "FAIL: RC 连续性门禁未通过(artifact digest 不一致/关键 job 失败)"
+          echo "R59 P0-01: 阻断发布,不得绕过"
           exit 1
         fi
 

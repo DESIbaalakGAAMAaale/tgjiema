@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R48 P1-c / R58 P1-4: 模块化 i18n 硬编码字符串扫描与逐模块下降门禁(AST sink-based)。
+"""R48 P1-c / R58 P1-4 / R59 §5.1 P1: 模块化 i18n 硬编码字符串扫描与逐模块下降门禁(AST sink-based)。
 
 历史:
     R44 6.3:   引入硬编码用户面向中文字符串扫描,baseline 机制(单一数字)。
@@ -14,18 +14,22 @@
     R58 P1-4:  **sink-based AST 扫描**替代正则+CJK 过滤;不依赖字符集;
                `reply_text/send_message/answer/HTTPException/detail` 等 sink
                的字面量无论中英文都必须禁止,除非来自 `translate/ErrorEnvelope`。
-               classify 用 CJK 区分:user_visible(含 CJK 必须清零)/log_only(英文 baseline ratchet)。
+    R59 §5.1 P1: **英文 sink 绝对零基线** — 不再按 CJK/英文区分 user_visible/log_only:
+               - 所有 Python sink 字面量(reply_text/send_message/HTTPException/flash 等)→ user_visible
+               - 所有 HTML 用户可见文本(标签文本 + placeholder/title/aria-label/alt 属性)→ user_visible
+               - 仅 logger.*/logging.*/print() 调用保留 log_only 类别(baseline ratchet)
+               - HTML 扫描扩展:不再只检测 CJK,所有英文字面量也纳入检测(英文 sink 绝对零基线)
 
-R58 P1-4 整改要点:
-    - 旧版只识别 CJK,英文用户文本可绕过门禁 → user_visible=0 不可信。
-    - 新版使用 AST 解析,识别 sink 调用节点,抽取所有字符串字面量(不依赖 CJK)。
-    - 来自 translate()/format_message_icu()/AppError/ErrorEnvelope 等的字面量豁免。
-    - classify_finding 用 CJK 区分:
-        * Python sink 调用 + CJK → user_visible(绝对门禁,必须 0)
-        * Python sink 调用 + 英文 → log_only(baseline ratchet,只允许非增加)
-        * HTML + CJK → user_visible
-        * HTML + 英文 → log_only
-    - logger./logging./print() 调用自然跳过(AST 不视为 sink)。
+R59 §5.1 P1 整改要点:
+    - 旧版(R58)classify 用 CJK 区分 user_visible/log_only,导致英文 sink 可走 log_only baseline 吸收,
+      违反"用户可见 sink 绝对零"原则。
+    - 新版(R59)classify 完全按 sink 类型区分:
+        * Python sink 调用(任意语言) → user_visible(绝对门禁,必须 0)
+        * HTML 用户可见文本/属性(任意语言) → user_visible(绝对门禁,必须 0)
+        * logger.*/logging.*/print() 调用 → log_only(baseline ratchet,只允许非增加)
+    - HTML 扫描扩展:检测 placeholder/title/aria-label/alt 等用户可见属性;
+      检测 >文本< 模式时不再要求 CJK,所有含字母数字的文本均纳入检测。
+    - 兼容旧测试:logger ±2 行上下文检测保留(用于 log_only 归类)。
 
 模块划分(贴合真实目录):
     - bots/up_bot.py            (Up)
@@ -71,10 +75,11 @@ from pathlib import Path
 
 # === 常量 ===
 
-# R58 P1-4: scanner 版本(算法变更:正则+CJK 过滤 → AST sink-based)
-SCANNER_VERSION = "3.0"
+# R59 §5.1 P1: scanner 版本(算法变更:不再按 CJK/英文区分,所有 sink 字面量归 user_visible)
+SCANNER_VERSION = "4.0"
 
-# 中文 Unicode 范围(用于 classify_finding 区分 user_visible 与 log_only)
+# 中文 Unicode 范围(仅用于向后兼容旧测试的 CJK 检测;R59 §5.1 P1 后 classify_finding
+# 不再使用此常量做 user_visible/log_only 区分,所有 sink 字面量统一归 user_visible)
 CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
 
 # R58 P1-4: AST sink-based 扫描 — sink 函数名(Python)
@@ -173,6 +178,78 @@ INCLUDED_PATHS = list(MODULE_KEYS)
 # R48 P1-c: logger 调用模式(用于 --classify 区分 log_only)
 LOGGER_CALL_RE = re.compile(r'\b(?:logger|logging|log)\.[a-zA-Z_]+\s*\(')
 PRINT_CALL_RE = re.compile(r'\bprint\s*\(')
+
+# R59 §5.1 P1: HTML 用户可见属性名(属性值硬编码时必须接入 i18n)
+# 这些属性的值会被屏幕阅读器读出或直接展示给用户(WCAG 2.2 AA)
+HTML_VISIBLE_ATTRS = frozenset({
+    'placeholder',   # input/textarea 占位符(用户可见提示)
+    'title',         # 元素标题(tooltip + 屏幕reader)
+    'aria-label',    # 屏幕阅读器标签(无障碍)
+    'alt',           # img 替代文本(图片不可见时展示)
+    'aria-describedby',  # 屏幕阅读器描述引用
+    'aria-roledescription',  # 屏幕阅读器角色描述
+    'aria-placeholder',  # ARIA 占位符
+})
+
+# R59 §5.1 P1: HTML 标签之间文本的正则(捕获 > 和 < 之间的非空文本)
+_HTML_TEXT_RE = re.compile(r'>([^<>]+)<')
+
+# R59 §5.1 P1: HTML 属性值正则(双引号 + 单引号均支持)
+# 形如 aria-label="看板" 或 aria-label='看板'
+_HTML_ATTR_DOUBLE_RE = re.compile(
+    r'\b(' + '|'.join(sorted(HTML_VISIBLE_ATTRS)) + r')\s*=\s*"([^"]*)"',
+    re.IGNORECASE,
+)
+_HTML_ATTR_SINGLE_RE = re.compile(
+    r'\b(' + '|'.join(sorted(HTML_VISIBLE_ATTRS)) + r')\s*=\s*\'([^\']*)\'',
+    re.IGNORECASE,
+)
+
+# R59 §5.1 P1: <script>/<style> 块整体跳过(CSS/JS 代码不算用户可见文本)
+_SCRIPT_STYLE_BLOCK_RE = re.compile(
+    r'<(script|style)\b[^>]*>.*?</\1>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# R59 §5.1 P1: HTML 注释整体跳过(可能是跨行注释)
+_HTML_COMMENT_RE = re.compile(
+    r'<!--.*?-->',
+    re.DOTALL,
+)
+
+# R59 §5.1 P1: 内部协议字符串豁免 — bot 间机器通信协议(非用户可见)
+# 这些字符串虽是 send_message 的参数,但实际是 bot 间协议命令,非自然语言文本:
+#   - "RELAY_ERROR:user_id:code:reason"  — 中继错误通知(大写协议名 + : 分隔)
+#   - "/start param"                      — Telegram deep link 启动命令
+#   - "EXTERNAL_DONE:user_id:code"        — 外部解码完成通知
+#   - "RELAY_DELIVER:bot:code"            — 中继投递命令
+#   - "RELAY_RENEW:bot:code"              — 中继续期命令
+# 匹配规则:
+#   1. 以大写协议名 + `:` 开头(如 RELAY_ERROR: / EXTERNAL_DONE:)
+#   2. 以 `/` + 小写字母开头(Telegram bot 命令,如 /start /help)
+# 这些字符串无自然语言文本,不应纳入 user_visible 门禁
+_INTERNAL_PROTOCOL_RE = re.compile(
+    r'^(?:[A-Z][A-Z_]+:[^:]*:|/[a-z_]+\s)',
+)
+
+
+def _is_internal_protocol(text: str) -> bool:
+    """R59 §5.1 P1: 检测字符串是否为内部协议命令(非用户可见)。
+
+    匹配模式:
+        - "RELAY_ERROR:123:abc:reason" — 大写协议名 + : 分隔参数
+        - "/start param"               — Telegram bot 命令
+        - "EXTERNAL_DONE:123:abc"      — 同上
+
+    这些是 bot 间机器通信协议,非用户可见文本,应豁免 user_visible 门禁。
+
+    Args:
+        text: 字符串字面量(已展开 f-string 占位符为 {})
+
+    Returns:
+        True 表示是内部协议字符串,应跳过;False 表示需继续检测
+    """
+    return bool(_INTERNAL_PROTOCOL_RE.match(text))
 
 
 # === 工具函数 ===
@@ -348,6 +425,10 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
             # 跳过空/纯空白字符串(非用户可见)
             if not text.strip():
                 continue
+            # R59 §5.1 P1: 跳过内部协议字符串(bot 间机器通信,非用户可见)
+            # 例如 "RELAY_ERROR:{}:{}:{}" / "/start {}" / "EXTERNAL_DONE:{}:{}"
+            if _is_internal_protocol(text):
+                continue
             findings.append((node.lineno, _describe_sink(node), text[:80]))
 
         # 检查关键字参数中的字符串字面量(detail="..." 等)
@@ -366,6 +447,9 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
                 continue
             if not text.strip():
                 continue
+            # R59 §5.1 P1: 跳过内部协议字符串(bot 间机器通信,非用户可见)
+            if _is_internal_protocol(text):
+                continue
             findings.append((node.lineno, _describe_sink(node, kw.arg), text[:80]))
 
     return findings
@@ -381,19 +465,69 @@ def scan_python_file(path: Path) -> list[tuple[int, str, str]]:
 
 
 def scan_html_content(content: str) -> list[tuple[int, str, str]]:
-    """扫描 HTML 内容中的硬编码中文(不在 {{ }} 内的)。"""
-    findings = []
-    for i, line in enumerate(content.splitlines(), 1):
-        # 跳过注释
-        if '<!--' in line and '-->' in line:
-            continue
-        # 跳过 {{ }} 内的内容(Jinja2 模板变量)
-        cleaned = re.sub(r'\{\{[^}]*\}\}', '', line)
-        # 检查 >中文< 模式(标签之间的文本)
-        for match in re.finditer(r'>([^<>]*[\u4e00-\u9fff][^<>]*)<', cleaned):
+    """R59 §5.1 P1: 扫描 HTML 中的硬编码用户可见文本(不区分中英文)。
+
+    检测范围:
+        - HTML 标签之间的文本(`>文本<`):任何含字母数字的文本均纳入检测
+          (旧版 R58 仅检测 CJK;R59 §5.1 P1 扩展到英文 — "英文 sink 绝对零基线")
+        - HTML 属性值:`placeholder` / `title` / `aria-label` / `alt` 等
+          用户可见属性的硬编码值(无论中英文)
+
+    排除:
+        - HTML 注释 `<!-- -->` (整体跳过,可能跨行)
+        - Jinja2 表达式 `{{ }}` (模板变量已通过 `t()` 路由到 i18n)
+        - Jinja2 控制语句 `{% %}` (条件/循环,非用户文本)
+        - `<script>` / `<style>` 块内容(CSS/JS 代码不算用户文本)
+        - 纯标点/符号文本(如 `:` `|` `>` 等,无字母数字)
+
+    Args:
+        content: HTML 源代码字符串
+
+    Returns:
+        [(line_no, pattern_type, content), ...] 字面量内容(截断到 80 字符)
+        pattern_type 形如 "html_text" 或 "html_attr:aria-label"
+    """
+    findings: list[tuple[int, str, str]] = []
+
+    # 预处理:移除 <script>...</script> 和 <style>...</style> 块
+    # 用换行替换被移除的内容以保留行号(让 finding 行号对齐原始文件)
+    def _preserve_lines(match: re.Match) -> str:
+        return '\n' * match.group(0).count('\n')
+
+    cleaned_content = _SCRIPT_STYLE_BLOCK_RE.sub(_preserve_lines, content)
+    # 移除 HTML 注释(可能跨行),同样保留行号
+    cleaned_content = _HTML_COMMENT_RE.sub(_preserve_lines, cleaned_content)
+
+    for i, line in enumerate(cleaned_content.splitlines(), 1):
+        # 移除 Jinja2 {{ }} 表达式(已通过 t() 路由到 i18n)
+        # 使用非贪婪 .*? 匹配,可处理表达式内含 {} 字典字面量的情况
+        # (如 {{ x.get('y', {}).get('z', 0) }} — 旧版 [^}]* 会提前停止)
+        cleaned = re.sub(r'\{\{.*?\}\}', '', line)
+        # 移除 Jinja2 {% %} 控制语句(条件/循环,非用户文本)
+        cleaned = re.sub(r'\{%.*?%\}', '', cleaned)
+
+        # 检测 >文本< 模式(标签之间的文本)
+        for match in _HTML_TEXT_RE.finditer(cleaned):
             text = match.group(1).strip()
-            if text and CJK_PATTERN.search(text):
+            # 跳过纯空白/纯标点(无字母数字)
+            if text and any(c.isalnum() for c in text):
                 findings.append((i, 'html_text', text[:80]))
+
+        # 检测 HTML 属性值(双引号)
+        for match in _HTML_ATTR_DOUBLE_RE.finditer(cleaned):
+            attr_name = match.group(1).lower()
+            attr_value = match.group(2).strip()
+            # 跳过纯空白/纯标点(无字母数字)
+            if attr_value and any(c.isalnum() for c in attr_value):
+                findings.append((i, f'html_attr:{attr_name}', attr_value[:80]))
+
+        # 检测 HTML 属性值(单引号)
+        for match in _HTML_ATTR_SINGLE_RE.finditer(cleaned):
+            attr_name = match.group(1).lower()
+            attr_value = match.group(2).strip()
+            if attr_value and any(c.isalnum() for c in attr_value):
+                findings.append((i, f'html_attr:{attr_name}', attr_value[:80]))
+
     return findings
 
 
@@ -634,33 +768,35 @@ def _check_scope_change(baseline: dict) -> tuple[bool, list[str], list[str]]:
 # === R48 P1-c: --classify 分类逻辑 ===
 
 def classify_finding(file_path: str, file_content: str, line_no: int) -> str:
-    """R58 P1-4: 分类单条 finding 为 'user_visible' 或 'log_only'。
+    """R59 §5.1 P1: 分类单条 finding 为 'user_visible' 或 'log_only'。
 
-    判定规则(refined):
+    判定规则(R59 §5.1 P1 重构 — 不再按 CJK/英文区分):
     - HTML 文件:
-        * 当前行含 CJK → user_visible(模板中文必须 i18n)
-        * 否则 → log_only(英文模板文本走 baseline ratchet)
+        * 所有 HTML finding(标签文本 + 用户可见属性)→ user_visible
+          (旧版 R58 按 CJK 区分;R59 §5.1 P1 改为统一 user_visible,
+          实现"英文 sink 绝对零基线")
     - Python:
-        * 当前/前后 ±2 行含 logger./logging./print( → log_only(间接日志记录)
-        * 当前行含 CJK → user_visible(中文用户文本必须 i18n,R56 §5.1 绝对门禁)
-        * 当前行含 sink 调用(reply_text/send_message/HTTPException/detail= 等)
-          且无 CJK → log_only(英文 sink 字面量走 baseline ratchet)
-        * 其他 → user_visible(保留旧行为:无 sink 上下文的英文 finding 默认 user_visible)
+        * 当前/前后 ±2 行含 logger./logging./print( → log_only(日志记录)
+        * 其他 Python sink 调用(reply_text/send_message/HTTPException/flash 等)
+          → user_visible(绝对门禁,无论中英文)
+        * 默认 → user_visible(保守归类,确保 user_visible 绝对零)
 
-    说明:scan_python_content 已跳过 logger./print 单行/多行调用,
-    sink 调用中的英文字面量由本函数进一步分类为 log_only(允许 baseline 吸收)。
+    说明:
+        - scan_python_content 已通过 AST 跳过 logger./print 调用,
+          本函数的 ±2 行 logger 检测是兜底(用于多行调用上下文)。
+        - R58 旧版按 CJK 区分(user_visible=log_only=英文 sink),导致英文用户文本
+          可绕过门禁走 log_only baseline 吸收;R59 §5.1 P1 修正此问题。
+        - 兼容旧测试 test_classify_finding_checks_nearby_lines:
+          logger ±2 行内的 finding 仍归 log_only,超出范围归 user_visible。
     """
     lines = file_content.splitlines() if file_content else []
 
-    # HTML:基于 CJK 区分
+    # HTML:R59 §5.1 P1 统一归 user_visible(不再按 CJK 区分)
     if not file_path.endswith('.py'):
-        if 1 <= line_no <= len(lines):
-            line = lines[line_no - 1]
-            if CJK_PATTERN.search(line):
-                return 'user_visible'
-        return 'log_only'
+        return 'user_visible'
 
     # Python:先检查 logger/print 上下文(±2 行)
+    # (保留旧测试 test_classify_finding_checks_nearby_lines 行为)
     for offset in (-2, -1, 0, 1, 2):
         i = line_no - 1 + offset
         if 0 <= i < len(lines):
@@ -668,16 +804,9 @@ def classify_finding(file_path: str, file_content: str, line_no: int) -> str:
             if LOGGER_CALL_RE.search(line) or PRINT_CALL_RE.search(line):
                 return 'log_only'
 
-    # 当前行含 CJK → user_visible(R56 §5.1 绝对门禁)
-    if 1 <= line_no <= len(lines):
-        line = lines[line_no - 1]
-        if CJK_PATTERN.search(line):
-            return 'user_visible'
-        # 无 CJK,但行含 sink 调用模式 → log_only(英文 sink baseline ratchet)
-        if SINK_CALL_LINE_RE.search(line) or SINK_KWARG_LINE_RE.search(line):
-            return 'log_only'
-
-    # 默认:user_visible(保留旧测试 test_classify_finding_checks_nearby_lines 行为)
+    # R59 §5.1 P1: 所有 Python sink 调用(无论中英文)→ user_visible
+    # (旧版 R58 此处按 CJK 区分:中文 → user_visible,英文 sink → log_only;
+    #  R59 §5.1 P1 修正:英文 sink 也归 user_visible,实现绝对零基线)
     return 'user_visible'
 
 
@@ -945,13 +1074,15 @@ def cmd_check(
     return 0
 
 
-def cmd_ratchet(module_counts: dict[str, int], baseline: dict) -> int:
+def cmd_ratchet(module_counts: dict[str, int], baseline: dict,
+                findings=None, root: Path | None = None) -> int:
     """下降 baseline:自动更新 baseline.json。
 
-    R48 P1-c 规则:
+    R48 P1-c / R59 §5.1 P1 规则:
     - included_paths 变化 → 拒绝更新(必须用 --generate-baseline --allow-scope-change)
     - total 只允许非增加(new_total ≤ old_total);否则拒绝更新
     - 模块可升降(只要 total 非增加),以便模块间再平衡
+    - R59 §5.1 P1: 写回时保留 user_visible/log_only 分类(不丢失分类信息)
     - 写回后提示提交到 git
     """
     if not baseline:
@@ -979,10 +1110,18 @@ def cmd_ratchet(module_counts: dict[str, int], baseline: dict) -> int:
         print("   请修复新增违规(--check 查看详情),而非扩大基线。")
         return 1
 
+    # R59 §5.1 P1: 计算分类结果(user_visible / log_only),保留分类信息写回 baseline
+    # 避免 --ratchet 把 log_only 错误归为 user_visible(旧版 bug)
+    if findings is not None and root is not None:
+        classify_results = classify_findings(findings, root)
+    else:
+        # 兜底:未传 findings 时,假设全部为 user_visible(保守归类)
+        classify_results = None
+
     # 模块可升降;写回当前计数(仅当 total 非增加)
     # 保留原有 reason(若 baseline 已有 last_updated_by)
     reason = baseline.get("last_updated_by", "ratchet")
-    _save_module_baseline(module_counts, reason=reason)
+    _save_module_baseline(module_counts, reason=reason, classify_results=classify_results)
     print(f"✓ baseline 已更新: {MODULE_BASELINE_FILE.name}")
     print(f"   total: {old_total} → {new_total}({new_total - old_total:+d})")
     print("   模块变化:")
@@ -1064,11 +1203,11 @@ def cmd_report(module_counts: dict[str, int], baseline: dict, findings) -> int:
 
 
 def cmd_classify(findings, root: Path) -> int:
-    """分类模式:统计 user_visible / log_only(R48 P1-c)。"""
+    """分类模式:统计 user_visible / log_only(R59 §5.1 P1)。"""
     classified = classify_findings(findings, root)
 
     print('=' * 78)
-    print('R48 P1-c i18n 硬编码字符串分类报告(--classify)')
+    print('R59 §5.1 P1 i18n 硬编码字符串分类报告(--classify)')
     print('=' * 78)
 
     print(f"\n  {'模块':<22}{'user_visible':>14}{'log_only':>10}{'total':>8}")
@@ -1260,7 +1399,7 @@ def main(argv=None) -> int:
         )
 
     if args.ratchet:
-        return cmd_ratchet(module_counts, baseline)
+        return cmd_ratchet(module_counts, baseline, findings=findings, root=root)
 
     if args.report:
         return cmd_report(module_counts, baseline, findings)

@@ -89,7 +89,7 @@
     <a href="#main-content" class="skip-link">{{ t("ui.admin.dashboard.s2") }}</a>
     <!-- R45 17.3: aria-live 动态消息区 — 屏幕阅读器播报异步状态变化(WCAG 2.2 AA 4.1.3) -->
     <div id="aria-live-region" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>
-    <nav class="sidebar" aria-label="主导航 / Main navigation">
+    <nav class="sidebar" aria-label="{{ t("ui.admin.dashboard.s26") }}">
         <h2>{{ t("ui.admin.dashboard.s3") }}</h2>
         <a href="/" class="active" aria-current="page">{{ t("ui.admin.dashboard.s4") }}</a>
         <a href="/users">{{ t("ui.admin.dashboard.s5") }}</a>
@@ -99,7 +99,7 @@
     </nav>
     <main class="main" id="main-content" role="main">
         <header class="header"><h1>{{ t("ui.admin.dashboard.s9") }}</h1></header>
-        <section class="cards" aria-label="系统概览指标 / System overview metrics">
+        <section class="cards" aria-label="{{ t("ui.admin.dashboard.s27") }}">
             <div class="card">
                 <div class="label">{{ t("ui.admin.dashboard.s10") }}</div>
                 <div class="value">{{ total_users }}</div>
@@ -153,9 +153,9 @@
                         <td>
                             {% if bot.is_running %}
                             <!-- R45 17.3: 状态不仅用颜色,同时提供文字描述(WCAG 1.4.1 Use of Color) -->
-                            <span class="tag tag-green" role="status" aria-label="运行中">{{ t("ui.admin.dashboard.s24") }}</span>
+                            <span class="tag tag-green" role="status" aria-label="{{ t("ui.admin.dashboard.s28") }}">{{ t("ui.admin.dashboard.s24") }}</span>
                             {% else %}
-                            <span class="tag tag-red" role="status" aria-label="已停止">{{ t("ui.admin.dashboard.s25") }}</span>
+                            <span class="tag tag-red" role="status" aria-label="{{ t("ui.admin.dashboard.s29") }}">{{ t("ui.admin.dashboard.s25") }}</span>
                             {% endif %}
                         </td>
                         <td>{{ bot.total_processed }}</td>

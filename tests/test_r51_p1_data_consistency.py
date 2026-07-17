@@ -456,23 +456,43 @@ class TestP1_1_DataLifecycleStateMachine:
             except Exception:
                 pass  # 列已存在(幂等)
         # R58 P0-2: 插入完整字段的审批记录(decision=approved, request_hash=64hex, 未过期/未消费/未撤销)
-        # 注意:expires_at 必须使用与 services/data_lifecycle._verify_break_glass_two_person_approval
-        # 中 now_iso = datetime.datetime.now().isoformat() 相同的时区(本地时间无 tz),
-        # 否则字符串比较会出错(UTC 05:xx < 本地 13:xx 误判为过期)。
-        future_iso = (_dt.datetime.now() + _dt.timedelta(hours=1)).isoformat()
-        await real_store._db.execute(
-            "INSERT INTO command_approvals "
-            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
-            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
-            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
-            (approval_action_id, 2, "mfa_receipt_approver_2", now_iso, "a" * 64, future_iso),
+        # R59 P0-02: expires_at 必须使用 UTC aware datetime(避免 naive 本地时间字符串比较脆弱)
+        # R59 P0-03: mfa_receipt 必须是真实签发的 PASETO-like token(占位字符串会被拒绝)
+        future_iso = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=1)).isoformat()
+        # R59 P0-03: 设置 MFA receipt 签名密钥(仅测试用)
+        monkeypatch.setenv(
+            "MFA_RECEIPT_SIGNING_KEY",
+            "test_signing_key_for_r59_p0_03_only_32b",
+        )
+        from admin.mfa import issue_mfa_receipt
+        canonical_request_hash = "a" * 64  # 与 command_approvals.request_hash 一致
+        receipt_approver_2 = issue_mfa_receipt(
+            principal_id=2,
+            purpose="break_glass_approval",
+            action_hash=canonical_request_hash,
+            amr=["totp"],
+            ttl_seconds=300,
+        )
+        receipt_approver_3 = issue_mfa_receipt(
+            principal_id=3,
+            purpose="break_glass_approval",
+            action_hash=canonical_request_hash,
+            amr=["totp"],
+            ttl_seconds=300,
         )
         await real_store._db.execute(
             "INSERT INTO command_approvals "
             "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
             "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
             "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
-            (approval_action_id, 3, "mfa_receipt_approver_3", now_iso, "a" * 64, future_iso),
+            (approval_action_id, 2, receipt_approver_2, now_iso, canonical_request_hash, future_iso),
+        )
+        await real_store._db.execute(
+            "INSERT INTO command_approvals "
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
+            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
+            (approval_action_id, 3, receipt_approver_3, now_iso, canonical_request_hash, future_iso),
         )
         await real_store._db.commit()
 

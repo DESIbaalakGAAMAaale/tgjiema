@@ -1452,8 +1452,15 @@ async def mfa_disable(
 
     from admin.mfa import get_mfa_manager
     mfa_manager = get_mfa_manager()
-    ok = await mfa_manager.disable_mfa(admin.id)
-    if not ok:
+    try:
+        ok = await mfa_manager.disable_mfa(admin.id)
+        if not ok:
+            raise HTTPException(status_code=500, detail=_i18n_t('admin.__init__.s34'))
+    except HTTPException:
+        raise
+    except Exception as e:
+        from loguru import logger
+        logger.warning(f"[Admin] 禁用 MFA 异常: {e}")
         raise HTTPException(status_code=500, detail=_i18n_t('admin.__init__.s34'))
 
     response = RedirectResponse(url="/", status_code=303)

@@ -11,6 +11,14 @@
     7. get_recovery_history — 恢复历史记录
     8. get_backup_schedule — 备份计划查询
 
+R59 P0-04: 强制参数,不再允许 fail-open — 信任链所有安全参数强制化。
+    - 生产恢复必须通过 services.backup_dr_validate.validate_and_restore_backup_strict
+      fail-closed 入口执行,禁止直接绕过验证模块恢复。
+    - restore() 委托 BackupEngine.restore(),后者内部已有 COMPLETE+manifest+
+      checksum+decrypt 验证,视为合规调用方。
+    - 新接入的恢复路径应直接调用 validate_and_restore_backup_strict,
+      传入 signing_key/decryptor/expected_manifest_key/expected_backup_id。
+
 设计原则:
     - 纯函数式 + async
     - 通过 database.cache_store.get_cache_store() 获取单例
@@ -309,6 +317,14 @@ async def restore(
       BackupEngine._compute_restore_request_hash 计算(绑定 backup_id + target +
       schema_version + requested_by + approval_id)
     - 计算后透传给 BackupEngine.restore 进行 TOCTOU 校验
+
+    R59 P0-04: 强制参数,不再允许 fail-open — 信任链守卫。
+    - 本函数委托 BackupEngine.restore(),后者内部已有 COMPLETE+manifest+
+      checksum+decrypt 验证,视为合规调用方(不绕过验证模块)。
+    - 新接入的恢复路径应直接调用
+      services.backup_dr_validate.validate_and_restore_backup_strict,
+      传入 signing_key/decryptor/expected_manifest_key/expected_backup_id。
+    - 禁止直接绕过验证模块恢复(fail-closed)。
 
     Args:
         backup_id: 备份 ID(R40 P0-7 格式 backup_YYYYMMDD_HHMMSS_xxxxxxxx)

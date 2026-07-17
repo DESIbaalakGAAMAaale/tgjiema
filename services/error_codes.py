@@ -23,6 +23,19 @@ R47 P1-c 整改要点:
 - 所有错误返回必须携带 trace_id(UUID),写入 audit_log 表
 - locales/zh-CN.json + locales/en-US.json 必须包含所有 message_key
 - CI 通过 scripts/check_error_codes.py 静态扫描门禁
+
+R59 §5.2 P1 整改要点(ErrorRegistry 唯一注册源):
+- 后端、前端语言包和 OpenAPI/Telegram 映射均由 ErrorRegistry 生成
+- 未注册错误码在 CI 直接失败;运行时未知异常统一通过
+  ``ErrorRegistry.register_unknown_runtime_error()`` 降级为 INTERNAL_ERROR,
+  原异常进入结构化日志(不暴露给用户消息)
+- ``severity`` / ``retryable`` / HTTP status / 按钮展示策略由 registry 明确定义,
+  不允许展示层通过错误码前缀猜测(见 ``to_frontend_mapping()``)
+- ``safe_params`` 使用 allowlist;禁止把 SQL/路径/token/手机号/
+  Telegram payload/对象存储 key 直接插入用户消息
+- CI 通过 scripts/check_error_registry.py 静态扫描门禁
+  (检查直接字符串错误码、动态拼接错误码、语言包缺 key、
+  重复 code 和错误 HTTP 映射)
 """
 from __future__ import annotations
 
@@ -65,6 +78,7 @@ class ErrorCodes:
     # AUTH
     AUTH_MFA_REPLAYED = "AUTH.MFA.REPLAYED"
     AUTH_MFA_LOCKED = "AUTH.MFA.LOCKED"
+    AUTH_MFA_RECEIPT_INVALID = "AUTH.MFA.RECEIPT_INVALID"
     AUTH_SESSION_EXPIRED = "AUTH.SESSION.EXPIRED"
 
     # BACKUP
@@ -573,6 +587,69 @@ class ErrorRegistry:
         """
         cls._definitions.clear()
         cls._initialized = False
+
+    # ── R59 §5.2 P1: 运行时未知异常统一降级入口 ──
+
+    @classmethod
+    def register_unknown_runtime_error(
+        cls,
+        exc: BaseException,
+        *,
+        action: str = "",
+        component: str = "",
+        trace_id: Optional[str] = None,
+    ) -> str:
+        """R59 §5.2 P1: 处理运行时未知异常 — 统一返回 INTERNAL_ERROR,原异常进入结构化日志。
+
+        设计要点(对照 R59 §5.2 P1 要求 2):
+            - **不**注册新的错误码(运行时禁止动态新增未知码,违反"唯一注册源"原则)
+            - 原始异常(exception type / message / repr / traceback)进入结构化日志,
+              仅供运维/审计检索,不暴露给用户消息
+            - 调用方仅获得 ``ErrorCodes.ERROR_INTERNAL`` code 字符串,
+              传给 ``AppError`` / ``ErrorRegistry.create_envelope`` 后,
+              用户消息只会展示 INTERNAL_ERROR 的 i18n 文案
+            - 重复调用安全(幂等),不会污染 ``_definitions`` 注册表
+
+        典型用法::
+
+            try:
+                await risky_operation()
+            except Exception as exc:
+                # 原异常进入结构化日志,用户只看到 INTERNAL_ERROR
+                code = ErrorRegistry.register_unknown_runtime_error(
+                    exc, action="risky_operation", component="uploader",
+                )
+                raise AppError(code, params={"action": "risky_operation"})
+
+        Args:
+            exc: 原始异常(用于结构化日志记录,不暴露给用户)
+            action: 触发异常的业务动作名(可选,用于日志检索)
+            component: 触发异常的组件名(可选,用于日志检索)
+            trace_id: 可选 trace_id(贯穿全链路,便于审计检索;
+                不传时自动生成 UUID)
+
+        Returns:
+            ``ErrorCodes.ERROR_INTERNAL`` 字符串常量(供 ``AppError`` 使用)
+        """
+        cls._ensure_initialized()
+        # 生成 trace_id(贯穿日志/audit_log,便于关联用户消息与原始异常)
+        if not trace_id:
+            trace_id = str(uuid.uuid4())
+        # R59 §5.2 P1: 结构化日志 — 原始异常细节仅在日志中,不暴露给用户消息
+        # 使用 extra 字段便于 loguru/结构化日志采集器(elasticsearch/loki)按字段索引
+        logger.error(
+            "R59 §5.2 P1: runtime_unknown_error fallback to INTERNAL_ERROR "
+            f"action={action!r} component={component!r} trace_id={trace_id} "
+            f"exc_type={type(exc).__name__} exc_msg={exc!r}"
+        )
+        # 完整堆栈写入 debug 日志(避免 ERROR 级别刷屏,但保留排查线索)
+        logger.debug(
+            f"R59 §5.2 P1: runtime_unknown_error traceback trace_id={trace_id} "
+            f"action={action!r} component={component!r}",
+            exc_info=exc,
+        )
+        # 不注册任何新 code,直接返回已注册的 ERROR_INTERNAL
+        return ErrorCodes.ERROR_INTERNAL
 
     # ── R56 §5.2: 便捷查询方法 + 前端映射导出 ──
 
@@ -1182,6 +1259,14 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["user_id"],
+    ))
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+        message_key="errors.auth.mfa.receipt_invalid",
+        http_status=401,
+        retryable=False,
+        severity="critical",
+        safe_params=["user_id", "reason"],
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.AUTH_SESSION_EXPIRED,

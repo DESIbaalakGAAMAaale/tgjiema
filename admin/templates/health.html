@@ -70,7 +70,7 @@
                             {% if bot.is_running %}
                                 {% set total = bot.total_processed + bot.total_errors %}
                                 {% if total == 0 %}
-                                <span class="tag tag-green">100%</span>
+                                <span class="tag tag-green">{{ t("ui.admin.health.s19") }}</span>
                                 {% else %}
                                 {% set rate = ((bot.total_processed / total) * 100) | int %}
                                 <span class="tag {% if rate > 95 %}tag-green{% else %}tag-red{% endif %}">{{ rate }}%</span>

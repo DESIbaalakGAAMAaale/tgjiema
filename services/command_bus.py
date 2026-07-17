@@ -496,6 +496,10 @@ async def verify_command_approved(
     Repair/Maintenance/Restore 在执行高风险动作前必须调用此函数,
     确保审批已通过(避免"执行前已执行"语义冲突)。
 
+    R59 P0-05: 高风险失败不得降级为继续执行。
+    - DB 未初始化时**必须**抛 AppError,禁止返回 approved 假设放行高风险写操作。
+    - 只读查询可降级到只读 SQLite 快照;创建、删除、退款、导出、密钥变更、恢复等不得降级。
+
     Args:
         action_id: 命令幂等 ID
         expected_principal_id: 期望的 principal_id(防越权,None 跳过校验)
@@ -508,21 +512,26 @@ async def verify_command_approved(
         AppError(COMMAND_NOT_APPROVED): 记录不存在或状态非 approved
         AppError(COMMAND_HASH_MISMATCH): request_hash 不匹配
         AppError(COMMAND_STATUS_CONFLICT): principal_id 不匹配
+        AppError(COMMAND_EXECUTION_STORE_UNAVAILABLE): DB 未初始化(R59 P0-05 fail-closed)
     """
     from services.error_codes import AppError, ErrorCodes
 
     store = _get_store()
     if not store._db:
-        # DB 未初始化(降级模式),返回 approved 假设
-        logger.warning(
-            f"[CommandBus] verify_command_approved DB 未初始化(降级放行)"
-            f"action_id={action_id}"
+        # R59 P0-05: fail-closed — 高风险动作验证不得降级放行
+        # (旧版降级返回 approved 假设,绕过审批状态机,严重安全漏洞)
+        logger.error(
+            f"[CommandBus] verify_command_approved fail-closed: "
+            f"DB 未初始化,拒绝放行 action_id={action_id}"
+            f"(R59 P0-05: 高风险动作不得降级,必须抛 AppError)"
         )
-        return {
-            "status": CMD_STATUS_APPROVED,
-            "principal_id": expected_principal_id or 0,
-            "request_hash": expected_request_hash or "",
-        }
+        raise AppError(
+            ErrorCodes.COMMAND_EXECUTION_STORE_UNAVAILABLE,
+            params={
+                "action_id": action_id,
+                "reason": "db_not_initialized_r59_p0_05_fail_closed",
+            },
+        )
     try:
         rows = await store._db.execute_fetchall(
             "SELECT status, principal_id, request_hash "

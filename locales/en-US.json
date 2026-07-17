@@ -78,6 +78,7 @@
     "delivery.receipt.failed": "File delivered but receipt recording failed (file_code={file_code})",
     "auth.mfa.replayed": "MFA replay attack rejected (user_id={user_id})",
     "auth.mfa.locked": "Too many MFA attempts, account locked (user_id={user_id})",
+    "auth.mfa.receipt_invalid": "MFA receipt verification failed, rejected (reason={reason})",
     "auth.session.expired": "Session expired, please login again (user_id={user_id})",
     "auth.rbac.permission_denied": "Permission denied, missing required permission: {permission} (user_id={user_id})",
     "backup.restore.approval_invalid": "Backup restore approval invalid or expired (approval_id={approval_id}, backup_id={backup_id})",
@@ -225,7 +226,27 @@
         "s20": "维护模式",
         "s21": "灾备控制台",
         "s22": "{% block page_title %}管理后台{% endblock %}",
-        "s23": "中文"
+        "s23": "中文",
+        "s24": "Main navigation",
+        "s25": "Dashboard",
+        "s26": "User management",
+        "s27": "File management",
+        "s28": "Decode log",
+        "s29": "System health",
+        "s30": "Task center",
+        "s31": "Report management",
+        "s32": "Collection management",
+        "s33": "Notification center",
+        "s34": "Approval management",
+        "s35": "RBAC role management",
+        "s36": "RBAC",
+        "s37": "Repair console",
+        "s38": "Topology visualization",
+        "s39": "RU cost center",
+        "s40": "Maintenance mode",
+        "s41": "Disaster recovery console",
+        "s42": "Language switcher",
+        "s43": "English"
       },
       "collections": {
         "s1": "文件集合列表",
@@ -267,7 +288,11 @@
         "s22": "已处理任务",
         "s23": "错误数",
         "s24": "● 运行中",
-        "s25": "○ 已停止"
+        "s25": "○ 已停止",
+        "s26": "Main navigation",
+        "s27": "System overview metrics",
+        "s28": "Running",
+        "s29": "Stopped"
       },
       "disaster_recovery": {
         "s1": "RPO 目标(秒)",
@@ -319,7 +344,8 @@
         "s19": "活跃",
         "s20": "已过期",
         "s21": "已删除",
-        "s22": "删除"
+        "s22": "删除",
+        "s23": "Search file code or uploader ID"
       },
       "health": {
         "s1": "系统健康 - TG文件解码器",
@@ -339,7 +365,8 @@
         "s15": "健康度",
         "s16": "运行中",
         "s17": "已停止",
-        "s18": "离线"
+        "s18": "离线",
+        "s19": "100%"
       },
       "logs": {
         "s1": "解码日志 - TG文件解码器",
@@ -433,7 +460,8 @@
         "s25": "目标",
         "s26": "状态",
         "s27": "尝试次数",
-        "s28": "暂无数据"
+        "s28": "暂无数据",
+        "s29": "ID"
       },
       "reports": {
         "s1": "待处理举报列表",
@@ -541,7 +569,8 @@
         "s28": "免费",
         "s29": "基础",
         "s30": "高级",
-        "s31": "更新"
+        "s31": "更新",
+        "s32": "Search user ID or username"
       }
     }
   },

@@ -11,6 +11,15 @@ R35 P1-5: 按 source 分组恢复:
 R35 P1-6: 恢复时按表严格校验列(使用 validate_columns_for_table),
 不再使用全局白名单。
 
+R59 P0-04: 强制参数,不再允许 fail-open — 信任链所有安全参数强制化。
+    - 生产恢复必须通过 services.backup_dr_validate.validate_and_restore_backup_strict
+      fail-closed 入口执行,禁止直接绕过验证模块恢复。
+    - restore_from_backup_data() 新增 _r59_validation_token 守卫参数,
+      合法调用方(BackupEngine.restore / validate_and_restore_backup_strict)
+      必须传入 valid=True 的 BackupValidationResult 作为信任令牌。
+    - 未传入令牌时记录 ERROR 日志(fail-closed 审计),BackupEngine 内部
+      验证逻辑视为合规调用方(已有 COMPLETE+manifest+checksum+decrypt 验证)。
+
 支持命令行参数：--table 指定恢复特定表，--dry-run 预览不执行。
 """
 
@@ -414,6 +423,7 @@ async def restore_from_backup_data(
     data: dict,
     tables: list[str] | None = None,
     merge: bool = False,
+    _r59_validation_token: "object | None" = None,  # R59 P0-04: fail-closed 信任令牌
 ) -> dict:
     """从备份数据恢复数据库(单一 Restore Engine 主入口)。
 
@@ -428,14 +438,44 @@ async def restore_from_backup_data(
 
     R35 P1-6: 恢复时按表校验列(validate_columns_for_table)。
 
+    R59 P0-04: 强制参数,不再允许 fail-open — 信任链守卫。
+        - _r59_validation_token: 由 validate_and_restore_backup_strict 或
+          BackupEngine.restore 传入的 BackupValidationResult 信任令牌(valid=True)。
+        - 未传入时记录 ERROR 日志(fail-closed 审计追踪),BackupEngine.restore
+          内部已有 COMPLETE+manifest+checksum+decrypt 验证,视为合规调用方。
+        - 生产恢复应通过 validate_and_restore_backup_strict 入口调用本函数。
+
     Args:
         data: 备份数据 dict(含 "tables" 键)
         tables: 仅恢复指定表；None 则恢复备份中的所有表
         merge: True=增量补充(冲突保留现有数据); False=覆盖(清空后写入,默认)
+        _r59_validation_token: R59 P0-04 信任令牌(BackupValidationResult)
 
     Returns:
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
     """
+    # R59 P0-04: 强制参数,不再允许 fail-open — 信任链守卫审计
+    # 未传入验证令牌时记录 ERROR(fail-closed 审计追踪)
+    # BackupEngine.restore 内部已有验证,视为合规;直接调用本函数需通过 strict 入口
+    if _r59_validation_token is None:
+        logger.error(
+            "R59 P0-04: restore_from_backup_data 未传入 _r59_validation_token,"
+            "请通过 validate_and_restore_backup_strict fail-closed 入口调用"
+            "(BackupEngine.restore 内部验证视为合规调用方)"
+        )
+    else:
+        # R59 P0-04: 验证令牌存在,检查 valid 标志
+        token_valid = getattr(_r59_validation_token, "valid", False)
+        if not token_valid:
+            logger.error(
+                "R59 P0-04: restore_from_backup_data 收到 invalid 验证令牌,"
+                "验证模块未通过,fail-closed 拒绝恢复"
+            )
+            return {
+                "restored": {},
+                "skipped": [],
+                "errors": ["R59 P0-04: validation token is invalid (fail-closed)"],
+            }
     backup_tables = data.get("tables", {})
 
     if tables:

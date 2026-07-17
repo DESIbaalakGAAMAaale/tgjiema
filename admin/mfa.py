@@ -41,11 +41,19 @@ R47 P1-b 整改:
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import os
 import secrets
 import time
-from typing import Optional
+import uuid
+from typing import Any, Optional
 
 from loguru import logger
+
+from services.error_codes import AppError, ErrorCodes
 
 # MFA 密钥在 kv_store 中的 key 前缀
 _MFA_SECRET_KEY_PREFIX = "admin:mfa:secret:"
@@ -485,6 +493,373 @@ def reset_mfa_state_for_testing() -> None:
     _mfa_failures.clear()
 
 
+# ─── R59 P0-03: MFA receipt 签发与验证(服务端签名短期 token) ─────────
+# R59 P0-03 要求:
+#   - receipt 为服务端签名的短期 token(PASETO-like, HMAC-SHA256, 无外部依赖)
+#   - payload 字段: jti/sub/purpose/action_hash/amr/iat/exp
+#   - DB 记录字段: jti/sub/purpose/action_hash/amr/iat/exp/used_at/consumed_at
+#   - purpose 必须匹配高风险动作; sub 必须匹配批准人;
+#     action_hash 必须匹配 request_hash(防篡改绑定具体请求)
+#   - TTL 2-5 分钟(默认 300s)
+#   - 以 jti 原子消费(INSERT OR IGNORE + rowcount, 参考 _consume_totp_timestep)
+#   - 签名密钥从 MFA_RECEIPT_SIGNING_KEY 读取, 缺失 fail-closed
+#   - 禁止仅靠前端 TOTP 文本或伪造时间戳
+#
+# 设计说明:
+#   - token 格式 v4.public.<payload_b64>.<signature_b64>(PASETO-like; 签名使用
+#     HMAC-SHA256 对称密钥, 避免引入 pyjwt/paseto 等外部库依赖)。注意:尽管前缀
+#     沿用 PASETO v4.public 格式, 此处为对称签名(HMAC), 非非对称(Ed25519)。
+#   - 签发(issue)不写 DB: token 自包含且服务端签名, 签名即发行凭证。
+#   - 验证(verify)为纯密码学 + 字段校验, 不写 DB, 不消费(可多次调用查看)。
+#   - 消费(consume)用 INSERT OR IGNORE + rowcount 原子记录一次性使用, 与
+#     _consume_totp_timestep 同一模式(jti PRIMARY KEY 保证唯一消费)。
+#   - 与现有 TOTP 机制叠加: receipt 层在 _record_totp_usage/_consume_totp_timestep
+#     之上, 不修改既有 TOTP 函数签名与行为。
+
+# 签名密钥环境变量名(缺失时 fail-closed)
+_MFA_RECEIPT_KEY_ENV = "MFA_RECEIPT_SIGNING_KEY"
+# token 版本前缀(PASETO-like)
+_MFA_RECEIPT_TOKEN_PREFIX = "v4.public"
+# 默认有效期 5 分钟(R59 建议 2-5 分钟)
+_MFA_RECEIPT_DEFAULT_TTL = 300
+
+
+def _get_mfa_receipt_signing_key() -> bytes:
+    """R59 P0-03: 从环境变量读取 receipt 签名密钥(fail-closed)。
+
+    密钥缺失或为空时抛 AppError(AUTH.MFA.RECEIPT_INVALID,
+    reason=signing_key_missing), 拒绝签发/验证(fail-closed, 防止无密钥时
+    绕过签名校验)。
+
+    Returns:
+        签名密钥(bytes, UTF-8 编码)
+
+    Raises:
+        AppError: 环境变量 MFA_RECEIPT_SIGNING_KEY 未设置或为空
+    """
+    raw = os.environ.get(_MFA_RECEIPT_KEY_ENV, "").strip()
+    if not raw:
+        logger.error(
+            f"[admin.mfa] 环境变量 {_MFA_RECEIPT_KEY_ENV} 未设置, "
+            f"receipt 签发/验证 fail-closed"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={"reason": "signing_key_missing"},
+        )
+    return raw.encode("utf-8")
+
+
+def _b64url_encode(data: bytes) -> str:
+    """base64url 编码(去除填充, 符合 PASETO 规范)。"""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    """base64url 解码(自动补齐缺失的填充)。"""
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _sign_receipt_payload(payload_b64: str, key: bytes) -> str:
+    """对 payload_b64 计算 HMAC-SHA256 签名, 返回 base64url 编码的签名。
+
+    签名对象为 token 中的 payload_b64 字符串(ASCII 字节), 而非原始 JSON。
+    这样验证时直接对收到的 payload_b64 重算签名并常量时间比较, 无需关心
+    JSON 序列化是否一致。
+
+    Args:
+        payload_b64: base64url 编码的 payload 字符串
+        key: 签名密钥(bytes)
+
+    Returns:
+        base64url 编码(无填充)的 HMAC-SHA256 签名字符串
+    """
+    sig = hmac.new(key, payload_b64.encode("ascii"), hashlib.sha256).digest()
+    return _b64url_encode(sig)
+
+
+def issue_mfa_receipt(
+    principal_id: int,
+    purpose: str,
+    action_hash: str,
+    amr: list[str],
+    ttl_seconds: int = _MFA_RECEIPT_DEFAULT_TTL,
+) -> str:
+    """R59 P0-03: 签发 MFA receipt(服务端签名短期 token)。
+
+    生成一个 PASETO-like 的短期 receipt token, payload 含 jti/sub/purpose/
+    action_hash/amr/iat/exp 字段, 使用 HMAC-SHA256 签名。receipt 用于证明
+    批准人(principal_id)已通过 MFA 验证, 授权执行特定高风险动作
+    (purpose + action_hash)。
+
+    签发不写 DB: token 自包含且服务端签名, 签名即发行凭证; 一次性消费由
+    consume_mfa_receipt 以 jti 原子记录(INSERT OR IGNORE + rowcount)。
+
+    Args:
+        principal_id: 批准人 principal ID(写入 sub, 必须非空)
+        purpose: 高风险动作用途(如 "approval.execute"/"backup.restore", 必须非空)
+        action_hash: 请求摘要 request_hash(防篡改绑定具体请求, 必须非空)
+        amr: 认证方式参考列表(如 ["totp"]/["totp", "passcode"])
+        ttl_seconds: 有效期(秒), 默认 300(5 分钟), R59 建议 2-5 分钟
+
+    Returns:
+        token 字符串, 格式: v4.public.<payload_b64>.<signature_b64>
+
+    Raises:
+        AppError: 签名密钥未配置(reason=signing_key_missing)或参数无效
+                  (reason=invalid_issue_params), 错误码 AUTH.MFA.RECEIPT_INVALID
+    """
+    if not principal_id or not purpose or not action_hash:
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": principal_id,
+                "reason": "invalid_issue_params",
+            },
+        )
+    # fail-closed: 密钥缺失抛 AppError
+    key = _get_mfa_receipt_signing_key()
+    now = int(time.time())
+    payload = {
+        "jti": uuid.uuid4().hex,
+        "sub": int(principal_id),
+        "purpose": purpose,
+        "action_hash": action_hash,
+        "amr": list(amr) if amr else [],
+        "iat": now,
+        "exp": now + int(ttl_seconds),
+    }
+    # 紧凑 + 排序序列化, 保证 payload 字节确定性(签名实际覆盖 payload_b64)
+    payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    payload_b64 = _b64url_encode(payload_json.encode("utf-8"))
+    signature = _sign_receipt_payload(payload_b64, key)
+    logger.info(
+        f"[admin.mfa] 签发 MFA receipt jti={payload['jti']} "
+        f"sub={principal_id} purpose={purpose} ttl={ttl_seconds}s"
+    )
+    return f"{_MFA_RECEIPT_TOKEN_PREFIX}.{payload_b64}.{signature}"
+
+
+def verify_mfa_receipt(
+    token: str,
+    expected_principal_id: int,
+    expected_purpose: str,
+    expected_action_hash: str,
+) -> dict[str, Any]:
+    """R59 P0-03: 验证 MFA receipt(签名 + 字段 + 有效期)。
+
+    校验流程:
+      1. 解析 token 格式(v4.public.<payload_b64>.<signature_b64>)
+      2. 重算 HMAC-SHA256 签名, 常量时间比较(防伪造/时序攻击)
+      3. 解码 payload, 校验 exp 未过期(防伪造时间戳)
+      4. 校验 sub == expected_principal_id(批准人匹配)
+      5. 校验 purpose == expected_purpose(动作用途匹配)
+      6. 校验 action_hash == expected_action_hash(请求摘要匹配)
+
+    本函数为纯密码学 + 字段校验, 不写 DB, 不消费 receipt(可多次调用查看)。
+    一次性消费由 consume_mfa_receipt(jti) 原子完成。调用方典型流程:
+    verify(token) → 取 payload["jti"] → 在动作事务中 consume(jti)。
+
+    Args:
+        token: receipt token 字符串
+        expected_principal_id: 期望的批准人 principal ID
+        expected_purpose: 期望的动作用途
+        expected_action_hash: 期望的请求摘要(request_hash)
+
+    Returns:
+        解码后的 payload dict(含 jti/sub/purpose/action_hash/amr/iat/exp)
+
+    Raises:
+        AppError: 任何校验失败(格式/签名/过期/sub/purpose/action_hash 不匹配,
+                  或签名密钥未配置), 错误码 AUTH.MFA.RECEIPT_INVALID,
+                  params.reason 标识具体失败原因
+    """
+    if not token or not isinstance(token, str):
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "empty_token",
+            },
+        )
+    # 1. 解析 token 格式: v4.public.<payload_b64>.<signature_b64>
+    #    前缀 "v4.public" 自身含 ".", 因此先校验前缀再分割剩余部分
+    #    (payload_b64 / signature_b64 为 base64url 无填充, 不含 ".")
+    expected_prefix = _MFA_RECEIPT_TOKEN_PREFIX + "."
+    if not token.startswith(expected_prefix):
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "malformed_token",
+            },
+        )
+    rest = token[len(expected_prefix):]
+    rest_parts = rest.split(".")
+    if len(rest_parts) != 2 or not rest_parts[0] or not rest_parts[1]:
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "malformed_token",
+            },
+        )
+    payload_b64, signature = rest_parts
+    # 2. 签名验证(fail-closed: 密钥缺失由 _get_mfa_receipt_signing_key 抛 AppError)
+    key = _get_mfa_receipt_signing_key()
+    expected_sig = _sign_receipt_payload(payload_b64, key)
+    if not hmac.compare_digest(expected_sig, signature):
+        logger.warning(
+            f"[admin.mfa] MFA receipt 签名不匹配 "
+            f"expected_principal={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "signature_mismatch",
+            },
+        )
+    # 3. 解码 payload
+    try:
+        payload_json = _b64url_decode(payload_b64).decode("utf-8")
+        payload = json.loads(payload_json)
+    except Exception as e:
+        logger.warning(f"[admin.mfa] MFA receipt payload 解码失败: {e}")
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "payload_decode_failed",
+            },
+        )
+    # 4. 有效期校验(防伪造时间戳: 以服务端当前时间为准)
+    now = int(time.time())
+    exp = payload.get("exp")
+    if not isinstance(exp, int) or now >= exp:
+        logger.warning(
+            f"[admin.mfa] MFA receipt 已过期 jti={payload.get('jti')} "
+            f"exp={exp} now={now}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "expired",
+            },
+        )
+    # 5. sub 校验(批准人匹配)
+    sub = payload.get("sub")
+    if sub != int(expected_principal_id):
+        logger.warning(
+            f"[admin.mfa] MFA receipt sub 不匹配 "
+            f"expected={expected_principal_id} actual={sub}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "sub_mismatch",
+            },
+        )
+    # 6. purpose 校验(动作用途匹配)
+    if payload.get("purpose") != expected_purpose:
+        logger.warning(
+            f"[admin.mfa] MFA receipt purpose 不匹配 "
+            f"expected={expected_purpose} actual={payload.get('purpose')}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "purpose_mismatch",
+            },
+        )
+    # 7. action_hash 校验(请求摘要匹配)
+    if payload.get("action_hash") != expected_action_hash:
+        logger.warning(
+            f"[admin.mfa] MFA receipt action_hash 不匹配 "
+            f"expected_principal={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "action_hash_mismatch",
+            },
+        )
+    return payload
+
+
+async def consume_mfa_receipt(jti: str) -> bool:
+    """R59 P0-03: 原子消费 MFA receipt(一次性使用, INSERT OR IGNORE + rowcount)。
+
+    参考 _consume_totp_timestep 模式: 使用 jti PRIMARY KEY 作为原子消费原语,
+    消除"先查询再插入"的竞态窗口:
+        - rowcount=1 → 首次消费, 返回 True(消费成功)
+        - rowcount=0 → jti 已存在(重放/已消费), 返回 False
+        - store 不可用或异常 → fail-closed(返回 False, 拒绝执行高风险动作)
+
+    记录 used_at/consumed_at 时间戳供审计追溯。其余元数据(sub/purpose/
+    action_hash/amr/iat/exp)存于签名 token 中, 由调用方在审计时通过 jti 关联。
+
+    R59 P0-03 "在同一事务中以 jti 原子消费": 调用方应将本函数与高风险动作放在
+    同一 DB 事务中执行(同一连接), 以保证"消费成功 ⟺ 动作执行"的原子性。本函数
+    默认 commit(与 _consume_totp_timestep 一致); 如需跨表事务原子性, 调用方
+    可在同一连接上自行管理事务边界(先 consume 再执行动作, 一并 commit/rollback)。
+
+    Args:
+        jti: receipt 唯一 ID(来自 verify_mfa_receipt 返回的 payload["jti"])
+
+    Returns:
+        True=首次消费成功; False=已消费(重放)/store 不可用/异常(fail-closed)
+    """
+    if not jti:
+        return False
+    store = _get_store()
+    if not store or not getattr(store, "_db", None):
+        # store 不可用, fail-closed(视为消费失败, 拒绝执行)
+        logger.warning("[admin.mfa] consume_mfa_receipt: store 不可用, fail-closed")
+        return False
+    now = int(time.time())
+    try:
+        # 幂等确保表存在(与 cache_store.init 建表语句一致, IF NOT EXISTS 安全;
+        # 防止 init 未运行时 consume 失败, 便于隔离测试)
+        await store._db.execute(
+            """CREATE TABLE IF NOT EXISTS mfa_receipts (
+                jti          TEXT PRIMARY KEY,
+                sub          BIGINT,
+                purpose      TEXT,
+                action_hash  TEXT,
+                amr          TEXT,
+                iat          INTEGER,
+                exp          INTEGER,
+                used_at      INTEGER,
+                consumed_at  INTEGER
+            )"""
+        )
+        # 原子消费: jti PRIMARY KEY 唯一约束 + INSERT OR IGNORE
+        cursor = await store._db.execute(
+            "INSERT OR IGNORE INTO mfa_receipts (jti, used_at, consumed_at) "
+            "VALUES (?, ?, ?)",
+            (jti, now, now),
+        )
+        await store._db.commit()
+        # rowcount=1 → 插入成功(首次消费); rowcount=0 → UNIQUE 冲突(重放)
+        rowcount = cursor.rowcount if cursor is not None else 0
+        if rowcount >= 1:
+            logger.info(f"[admin.mfa] MFA receipt 消费成功 jti={jti}")
+            return True
+        logger.warning(f"[admin.mfa] MFA receipt 重放被拒绝(已消费) jti={jti}")
+        return False
+    except Exception as e:
+        logger.warning(
+            f"[admin.mfa] consume_mfa_receipt 原子消费失败, fail-closed: {e}"
+        )
+        return False
+
+
 class MFAManager:
     """R40 P2-5: 多因素认证(MFA)管理器。
 
@@ -696,7 +1071,7 @@ class MFAManager:
             return True
         except Exception as e:
             logger.warning(f"[admin.mfa] 禁用 MFA 失败: {e}")
-            return False
+            raise
 
 
 # 模块级单例

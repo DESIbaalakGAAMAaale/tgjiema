@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 107,
-    "generated_at": "2026-07-17T05:52:30.883433Z",
+    "enum_count": 108,
+    "generated_at": "2026-07-17T10:05:35.828532Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(= retryable)",
       "telegram_presentation": "Bot 端展示方式: short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)"
     },
-    "total_codes": 107,
+    "total_codes": 108,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -84,6 +84,19 @@
       "severity": "error",
       "show_retry_button": false,
       "telegram_presentation": "short_hint"
+    },
+    "AUTH.MFA.RECEIPT_INVALID": {
+      "code": "AUTH.MFA.RECEIPT_INVALID",
+      "http_status": 401,
+      "message_key": "errors.auth.mfa.receipt_invalid",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "AUTH.MFA.REPLAYED": {
       "code": "AUTH.MFA.REPLAYED",

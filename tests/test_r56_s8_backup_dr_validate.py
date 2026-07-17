@@ -19,6 +19,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -49,6 +51,39 @@ from services.backup_dr_validate import (  # type: ignore  # noqa: E402
     validate_backup_for_restore,
     validate_schema_compatibility,
 )
+
+
+# ── R59 P0-04 测试辅助函数 ──────────────────────────────────────
+# R59 P0-04: 强制参数,不再允许 fail-open — 测试需提供真实签名与解密器
+
+def _compute_marker_signature(
+    signing_key: bytes,
+    backup_id: str,
+    manifest_key: str,
+    manifest_sha256: str,
+    payload_sha256: str,
+) -> str:
+    """R59 P0-04 测试辅助:计算 COMPLETE marker 的 HMAC-SHA256 签名。
+
+    签名格式与 services.backup_dr_validate.validate_backup_completeness
+    中的验签逻辑保持一致:
+        HMAC-SHA256(signing_key, f"{backup_id}:{manifest_key}:{manifest_sha}:{payload_sha}")
+    """
+    sign_payload = (
+        f"{backup_id}:{manifest_key}:{manifest_sha256}:{payload_sha256}"
+    ).encode("utf-8")
+    return hmac.new(signing_key, sign_payload, hashlib.sha256).hexdigest()
+
+
+def _make_decryptor(plaintext: bytes) -> MagicMock:
+    """R59 P0-04 测试辅助:构建返回指定明文的 decryptor mock。
+
+    decryptor 需提供 decrypt(ciphertext, aad=...) -> plaintext 方法,
+    与 services.backup_crypto 中的 BackupDecryptor 协议一致。
+    """
+    decryptor = MagicMock()
+    decryptor.decrypt = MagicMock(return_value=plaintext)
+    return decryptor
 
 
 # ════════════════════════════════════════════════════════════════
@@ -120,29 +155,49 @@ class TestValidateCompleteness:
 
     @pytest.mark.asyncio
     async def test_complete_marker_exists(self):
-        """COMPLETE 标记存在且 R58 P0-3 强绑定字段完整时返回 valid=True。"""
-        mock_r2 = AsyncMock()
-        # R58 P0-3: build_complete_marker 需要提供 manifest_sha256/payload_sha256/signature
-        marker_content = build_complete_marker(
-            "20260716",
-            "manifest_key",
-            manifest_sha256="a" * 64,
-            payload_key="payload_key",
-            payload_sha256="b" * 64,
-            signature="c" * 64,
+        """COMPLETE 标记存在且 R59 P0-04 强制参数完整时返回 valid=True。"""
+        # R59 P0-04: 强制参数 — signing_key/expected_manifest_key/expected_backup_id 必填,
+        # 且需提供真实 HMAC 签名(不再允许跳过验签)
+        signing_key = b"test_signing_key_r59"
+        backup_id = "20260716"
+        manifest_key = "manifest_key"
+        manifest_sha = "a" * 64
+        payload_sha = "b" * 64
+        sig = _compute_marker_signature(
+            signing_key, backup_id, manifest_key, manifest_sha, payload_sha,
         )
+        marker_content = build_complete_marker(
+            backup_id,
+            manifest_key,
+            manifest_sha256=manifest_sha,
+            payload_key="payload_key",
+            payload_sha256=payload_sha,
+            signature=sig,
+        )
+        mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=marker_content)
-        # R58 P0-3: 不提供 signing_key 时跳过验签,但仍需校验 manifest_sha256/payload_sha256
-        result = await validate_backup_completeness("20260716", "full", mock_r2)
+        # R59 P0-04: 强制参数,不再允许 fail-open — 验签必填
+        result = await validate_backup_completeness(
+            backup_id, "full", mock_r2,
+            expected_manifest_key=manifest_key,
+            signing_key=signing_key,
+            expected_backup_id=backup_id,
+        )
         assert result.valid is True
-        assert result.backup_id == "20260716"
+        assert result.backup_id == backup_id
 
     @pytest.mark.asyncio
     async def test_complete_marker_missing(self):
         """COMPLETE 标记缺失时返回 COMPLETE_MARKER_MISSING。"""
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=None)
-        result = await validate_backup_completeness("20260716", "full", mock_r2)
+        # R59 P0-04: 强制参数必填(原为可选,现 fail-closed)
+        result = await validate_backup_completeness(
+            "20260716", "full", mock_r2,
+            expected_manifest_key="manifest_key",
+            signing_key=b"signing_key",
+            expected_backup_id="20260716",
+        )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.COMPLETE_MARKER_MISSING"
 
@@ -151,7 +206,13 @@ class TestValidateCompleteness:
         """下载异常时返回 COMPLETE_MARKER_MISSING(不抛异常)。"""
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(side_effect=Exception("R2 403 Forbidden"))
-        result = await validate_backup_completeness("20260716", "full", mock_r2)
+        # R59 P0-04: 强制参数必填(原为可选,现 fail-closed)
+        result = await validate_backup_completeness(
+            "20260716", "full", mock_r2,
+            expected_manifest_key="manifest_key",
+            signing_key=b"signing_key",
+            expected_backup_id="20260716",
+        )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.COMPLETE_MARKER_MISSING"
 
@@ -295,13 +356,17 @@ class TestValidatePayload:
     @pytest.mark.asyncio
     async def test_payload_valid(self):
         """payload 密文校验通过。"""
-        import hashlib
         ciphertext = b"encrypted_payload_content"
         expected_sha = hashlib.sha256(ciphertext).hexdigest()
+        plaintext = b"decrypted_plaintext_content"
+        pt_sha = hashlib.sha256(plaintext).hexdigest()
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=ciphertext)
+        # R59 P0-04: schema_version/decryptor 必填(fail-closed),AAD 绑定 5 字段
         result = await validate_backup_payload(
-            "20260716", "full", expected_sha, "plaintext_sha", mock_r2,
+            "20260716", "full", expected_sha, pt_sha, mock_r2,
+            schema_version="3.0",
+            decryptor=_make_decryptor(plaintext),
         )
         assert result.valid is True
 
@@ -312,8 +377,11 @@ class TestValidatePayload:
         wrong_sha = "0" * 64  # 错误的 sha256
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=ciphertext)
+        # R59 P0-04: schema_version/decryptor 必填(此处不会到达解密阶段)
         result = await validate_backup_payload(
             "20260716", "full", wrong_sha, "plaintext_sha", mock_r2,
+            schema_version="3.0",
+            decryptor=MagicMock(),
         )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.CIPHERTEXT_HASH_MISMATCH"
@@ -323,8 +391,11 @@ class TestValidatePayload:
         """payload.enc 不存在时拒绝。"""
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=None)
+        # R59 P0-04: schema_version/decryptor 必填(此处不会到达解密阶段)
         result = await validate_backup_payload(
             "20260716", "full", "a" * 64, "b" * 64, mock_r2,
+            schema_version="3.0",
+            decryptor=MagicMock(),
         )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.PAYLOAD_MISSING"
@@ -334,8 +405,11 @@ class TestValidatePayload:
         """下载异常时拒绝(不抛异常)。"""
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(side_effect=Exception("R2 403 Forbidden"))
+        # R59 P0-04: schema_version/decryptor 必填(此处不会到达解密阶段)
         result = await validate_backup_payload(
             "20260716", "full", "a" * 64, "b" * 64, mock_r2,
+            schema_version="3.0",
+            decryptor=MagicMock(),
         )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.PAYLOAD_INVALID"
@@ -405,25 +479,36 @@ class TestValidateBackupForRestore:
 
     @pytest.mark.asyncio
     async def test_all_validations_pass(self):
-        """所有验证通过时返回 valid=True(R58 P0-3 强绑定字段完整)。"""
-        import hashlib
-        # R58 P0-3: build_complete_marker 需要完整签名绑定字段
+        """所有验证通过时返回 valid=True(R59 P0-04 强制参数完整)。"""
+        # R59 P0-04: 强制参数 — signing_key/expected_manifest_key/expected_backup_id/decryptor 必填
+        signing_key = b"test_signing_key_r59"
+        backup_id = "20260716"
+        manifest_key = "manifest_key"
+        ciphertext = b"payload"
+        cipher_sha = hashlib.sha256(ciphertext).hexdigest()
+        manifest_sha = "a" * 64
+        plaintext = b"decrypted_payload"
+        pt_sha = hashlib.sha256(plaintext).hexdigest()
+        # R59 P0-04: 计算真实 HMAC 签名(不再允许跳过验签)
+        sig = _compute_marker_signature(
+            signing_key, backup_id, manifest_key, manifest_sha, cipher_sha,
+        )
         marker = build_complete_marker(
-            "20260716",
-            "manifest_key",
-            manifest_sha256="a" * 64,
+            backup_id,
+            manifest_key,
+            manifest_sha256=manifest_sha,
             payload_key="payload_key",
-            payload_sha256=hashlib.sha256(b"payload").hexdigest(),
-            signature="c" * 64,
+            payload_sha256=cipher_sha,
+            signature=sig,
         )
         manifest = {
             "version": "3.0",
             # R58 P0-3: commit_sha 必须 40 hex
             "commit_sha": "abc123def456abcdef1234567890abcdef123456",
             "schema_version": "3.0",
-            "plaintext_sha256": "a" * 64,
-            "ciphertext_sha256": hashlib.sha256(b"payload").hexdigest(),
-            "backup_id": "20260716",  # R58 P0-3: 严格匹配 timestamp
+            "plaintext_sha256": pt_sha,
+            "ciphertext_sha256": cipher_sha,
+            "backup_id": backup_id,  # R58 P0-3: 严格匹配 timestamp
             "content_size_bytes": 100,
             "backup_started_at": "2026-07-16T12:00:00Z",
             "backup_finished_at": "2026-07-16T12:01:00Z",
@@ -436,10 +521,16 @@ class TestValidateBackupForRestore:
         mock_r2.download = AsyncMock(side_effect=[
             marker,  # COMPLETE
             json.dumps(manifest).encode(),  # manifest
-            b"payload",  # payload
+            ciphertext,  # payload
         ])
+        # R59 P0-04: 强制参数 — 4 个必填参数传入
         result = await validate_backup_for_restore(
-            "20260716", "full", mock_r2, "3.0",
+            backup_id, "full", mock_r2, "3.0",
+            expected_manifest_key=manifest_key,
+            signing_key=signing_key,
+            expected_backup_id=backup_id,
+            decryptor=_make_decryptor(plaintext),
+            key_id="kek_v1",
         )
         assert result.valid is True
         assert result.encryption_key_id == "kek_v1"
@@ -449,8 +540,13 @@ class TestValidateBackupForRestore:
         """COMPLETE 缺失时立即返回,不继续验证。"""
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=None)  # COMPLETE 不存在
+        # R59 P0-04: 强制参数必填(原为可选,现 fail-closed)
         result = await validate_backup_for_restore(
             "20260716", "full", mock_r2, "3.0",
+            expected_manifest_key="manifest_key",
+            signing_key=b"signing_key",
+            expected_backup_id="20260716",
+            decryptor=MagicMock(),
         )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.COMPLETE_MARKER_MISSING"
@@ -463,23 +559,37 @@ class TestValidateBackupForRestore:
 
         R58 P0-3: COMPLETE marker 必须包含 manifest_sha256/payload_sha256 强绑定字段,
         否则视为 INVALID 而非 MISSING(防止伪造 COMPLETE 跳过 manifest 校验)。
+        R59 P0-04: 强制参数 — 需提供真实签名才能通过 validate_backup_completeness。
         """
-        # R58 P0-3: 完整签名的 marker 才能通过 validate_backup_completeness
+        signing_key = b"test_signing_key_r59"
+        backup_id = "20260716"
+        manifest_key = "manifest_key"
+        manifest_sha = "a" * 64
+        payload_sha = "b" * 64
+        # R59 P0-04: 计算真实 HMAC 签名
+        sig = _compute_marker_signature(
+            signing_key, backup_id, manifest_key, manifest_sha, payload_sha,
+        )
         marker = build_complete_marker(
-            "20260716",
-            "manifest_key",
-            manifest_sha256="a" * 64,
+            backup_id,
+            manifest_key,
+            manifest_sha256=manifest_sha,
             payload_key="payload_key",
-            payload_sha256="b" * 64,
-            signature="c" * 64,
+            payload_sha256=payload_sha,
+            signature=sig,
         )
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(side_effect=[
             marker,  # COMPLETE 存在且完整
             None,    # manifest 不存在
         ])
+        # R59 P0-04: 强制参数必填
         result = await validate_backup_for_restore(
-            "20260716", "full", mock_r2, "3.0",
+            backup_id, "full", mock_r2, "3.0",
+            expected_manifest_key=manifest_key,
+            signing_key=signing_key,
+            expected_backup_id=backup_id,
+            decryptor=MagicMock(),
         )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.MANIFEST_MISSING"
@@ -489,21 +599,31 @@ class TestValidateBackupForRestore:
         """schema 不兼容时立即返回(不校验 payload)。
 
         R58 P0-3: COMPLETE marker 必须包含强绑定字段才能进入 manifest 校验阶段。
+        R59 P0-04: 强制参数 — 需提供真实签名才能通过 validate_backup_completeness。
         """
+        signing_key = b"test_signing_key_r59"
+        backup_id = "20260716"
+        manifest_key = "manifest_key"
+        manifest_sha = "a" * 64
+        payload_sha = "b" * 64
+        # R59 P0-04: 计算真实 HMAC 签名
+        sig = _compute_marker_signature(
+            signing_key, backup_id, manifest_key, manifest_sha, payload_sha,
+        )
         marker = build_complete_marker(
-            "20260716",
-            "manifest_key",
-            manifest_sha256="a" * 64,
+            backup_id,
+            manifest_key,
+            manifest_sha256=manifest_sha,
             payload_key="payload_key",
-            payload_sha256="b" * 64,
-            signature="c" * 64,
+            payload_sha256=payload_sha,
+            signature=sig,
         )
         manifest = {
             "version": "3.0",
             "schema_version": "2.0",  # 主版本不兼容
             "plaintext_sha256": "a" * 64,
             "ciphertext_sha256": "b" * 64,
-            "backup_id": "20260716",  # R58 P0-3: 严格匹配 timestamp
+            "backup_id": backup_id,  # R58 P0-3: 严格匹配 timestamp
             "encryption": {"encrypted": True, "key_id": "kek_v1"},
             "commit_sha": "abc123def456abcdef1234567890abcdef123456",  # R58 P0-3: 40 hex
             "content_size_bytes": 100,
@@ -517,8 +637,13 @@ class TestValidateBackupForRestore:
             marker,  # COMPLETE
             json.dumps(manifest).encode(),  # manifest
         ])
+        # R59 P0-04: 强制参数必填(此处不会到达 payload 校验阶段)
         result = await validate_backup_for_restore(
-            "20260716", "full", mock_r2, "3.0",  # current=3.0, manifest=2.0
+            backup_id, "full", mock_r2, "3.0",  # current=3.0, manifest=2.0
+            expected_manifest_key=manifest_key,
+            signing_key=signing_key,
+            expected_backup_id=backup_id,
+            decryptor=MagicMock(),
         )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.SCHEMA_INCOMPATIBLE"
@@ -542,7 +667,13 @@ class TestFaultMatrix:
         """R2 403 时恢复失败(不降级执行)。"""
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(side_effect=Exception("403 Forbidden"))
-        result = await validate_backup_completeness("20260716", "full", mock_r2)
+        # R59 P0-04: 强制参数必填(原为可选,现 fail-closed)
+        result = await validate_backup_completeness(
+            "20260716", "full", mock_r2,
+            expected_manifest_key="manifest_key",
+            signing_key=b"signing_key",
+            expected_backup_id="20260716",
+        )
         assert result.valid is False
         assert "403" in result.error_message or "Forbidden" in result.error_message
 
@@ -553,8 +684,11 @@ class TestFaultMatrix:
         # 但实际 payload 的 sha256 不是 "a"*64
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=b"corrupted_payload")
+        # R59 P0-04: schema_version/decryptor 必填(此处不会到达解密阶段)
         result = await validate_backup_payload(
             "20260716", "full", "a" * 64, "b" * 64, mock_r2,
+            schema_version="3.0",
+            decryptor=MagicMock(),
         )
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.CIPHERTEXT_HASH_MISMATCH"
@@ -573,15 +707,22 @@ class TestFaultMatrix:
         """备份对象缺失(payload/manifest/COMPLETE 任一缺失)拒绝恢复。"""
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=None)
-        # COMPLETE 缺失
-        r1 = await validate_backup_completeness("20260716", "full", mock_r2)
+        # COMPLETE 缺失(R59 P0-04: 强制参数必填)
+        r1 = await validate_backup_completeness(
+            "20260716", "full", mock_r2,
+            expected_manifest_key="manifest_key",
+            signing_key=b"signing_key",
+            expected_backup_id="20260716",
+        )
         assert r1.valid is False
         # manifest 缺失
         r2 = await validate_backup_manifest("20260716", "full", mock_r2)
         assert r2.valid is False
-        # payload 缺失
+        # payload 缺失(R59 P0-04: schema_version/decryptor 必填)
         r3 = await validate_backup_payload(
             "20260716", "full", "a" * 64, "b" * 64, mock_r2,
+            schema_version="3.0",
+            decryptor=MagicMock(),
         )
         assert r3.valid is False
 
@@ -589,7 +730,14 @@ class TestFaultMatrix:
     async def test_no_silent_recovery_on_partial_backup(self):
         """部分备份(无 COMPLETE)不应被静默恢复。"""
         # 场景:备份写到一半中断(有 payload + manifest,但无 COMPLETE)
-        marker = build_complete_marker("20260716", "manifest_key")
+        # R59 P0-04: build_complete_marker 需提供全部强制参数(原 2 参数调用已废弃)
+        marker = build_complete_marker(
+            "20260716", "manifest_key",
+            manifest_sha256="a" * 64,
+            payload_key="payload_key",
+            payload_sha256="b" * 64,
+            signature="c" * 64,
+        )
         manifest = {
             "version": "3.0",
             "schema_version": "3.0",
@@ -607,8 +755,13 @@ class TestFaultMatrix:
         # 第一次下载返回 None(COMPLETE 缺失)
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=None)
+        # R59 P0-04: 强制参数必填(原为可选,现 fail-closed)
         result = await validate_backup_for_restore(
             "20260716", "full", mock_r2, "3.0",
+            expected_manifest_key="manifest_key",
+            signing_key=b"signing_key",
+            expected_backup_id="20260716",
+            decryptor=MagicMock(),
         )
         # 应在 COMPLETE 检查阶段就拒绝,不读取 manifest/payload
         assert result.valid is False

@@ -1639,6 +1639,25 @@ class CacheStore:
                 f"[CacheStore] mfa_failures schema 迁移检测失败(可忽略): {_e_mfa_migrate}"
             )
 
+        # ─── R59 P0-03: mfa_receipts 表 — MFA receipt 一次性消费记录(跨进程共享) ───
+        # 存储 jti 原子消费记录(INSERT OR IGNORE + rowcount 判定重放,参考
+        # _consume_totp_timestep 模式)。jti PRIMARY KEY 保证同一 receipt 只能
+        # 被消费一次。其余元数据(sub/purpose/action_hash/amr/iat/exp)存于
+        # 服务端签名的 token 中,由调用方在审计时关联。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS mfa_receipts (
+                jti          TEXT PRIMARY KEY,
+                sub          BIGINT,
+                purpose      TEXT,
+                action_hash  TEXT,
+                amr          TEXT,
+                iat          INTEGER,
+                exp          INTEGER,
+                used_at      INTEGER,
+                consumed_at  INTEGER
+            )"""
+        )
+
         # ─── R46 P0-3: unregistered_copies 表 — 持久化 COPIED_UNREGISTERED 状态 ───
         # Telegram copy 成功但 outbox 写失败时,持久化目标 channel/message_id,
         # 进程重启后可扫描未 reconciled 行,优先补 Manifest 而非重新 copy。

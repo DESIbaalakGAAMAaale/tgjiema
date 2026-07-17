@@ -102,89 +102,79 @@ async def _ensure_retention_table() -> bool:
 
 
 async def _ensure_command_approvals_table() -> bool:
-    """R58 P0-2: 惰性创建 command_approvals 表(双人审批持久化,强绑定)。
+    """R59 P1: 通过版本化 migration 创建/升级 command_approvals 表。
 
-    表结构(R58 P0-2 增强):
+    R59 P1 改造: 移除运行时惰性 DDL(CREATE TABLE + ALTER TABLE 循环),
+    改为调用 ``database.migrate.apply_migrations()`` 应用版本化 SQL 文件。
+    保留本函数作为兼容入口(调用方无需改动),内部委托给 migration 框架。
+
+    表结构(R58 P0-2 增强,定义在 database/migrations/001_initial_schema.sql):
         id              INTEGER PRIMARY KEY AUTOINCREMENT
         action_id       TEXT NOT NULL  (关联 command_executions.action_id)
         approver_id     BIGINT NOT NULL (审批人 principal_id)
         approval_type   TEXT NOT NULL  (break_glass / quarantine_delete)
-        decision        TEXT NOT NULL CHECK(decision IN ('approved','rejected'))
+        decision        TEXT NOT NULL DEFAULT 'approved'
                                     (R58 P0-2: 记录存在 ≠ 批准,必须显式 approved)
-        request_hash    TEXT NOT NULL CHECK(length(request_hash)=64)
+        request_hash    TEXT NOT NULL DEFAULT ''
                                     (R58 P0-2: 两人必须批准同一请求,防参数错位)
-        mfa_receipt     TEXT NOT NULL  (R58 P0-2: 强制非空,绑定 MFA receipt)
-        permission      TEXT NOT NULL  (R58 P0-2: RBAC 权限快照,执行时再授权)
+        mfa_receipt     TEXT           (R58 P0-2: 强制非空,绑定 MFA receipt)
+        permission      TEXT NOT NULL DEFAULT ''
+                                    (R58 P0-2: RBAC 权限快照,执行时再授权)
         approved_at     TEXT NOT NULL
-        expires_at      TEXT NOT NULL  (R58 P0-2: 旧审批不可无限复用)
+        expires_at      TEXT NOT NULL DEFAULT ''
+                                    (R58 P0-2: 旧审批不可无限复用)
         consumed_at     TEXT           (R58 P0-2: 执行时 CAS 消费)
         revoked_at      TEXT           (R58 P0-2: 显式撤销)
         metadata_json   TEXT           (额外元数据)
 
-    一个 action_id 可有多条记录(多人审批)。
+    R59 P1 fail-closed 检查:
+        migration 应用后,若存在 break_glass 审批记录 expires_at 为空(旧 R56 数据
+        经 002 补列后 DEFAULT ''),视为不安全(旧审批可能被无限复用),拒绝继续。
+        调用方 ``_verify_break_glass_two_person_approval`` 应检查返回值并 raise。
 
     Returns:
-        True 表就绪;False 创建失败
+        True 表就绪且 fail-closed 检查通过;False migration 失败或检测到不安全旧数据
     """
     store = get_cache_store()
     if not store._db:
         return False
+    # R59 P1: 调用版本化 migration(替换原运行时 CREATE TABLE + ALTER TABLE 循环)
     try:
-        # R58 P0-2: 先尝试创建新 schema(完整列)
-        # 若表已存在(R56 旧 schema),通过 ALTER TABLE 补列(SQLite ALTER TABLE ADD COLUMN 幂等检查)
-        await store._db.execute(
-            """CREATE TABLE IF NOT EXISTS command_approvals (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                action_id       TEXT NOT NULL,
-                approver_id     BIGINT NOT NULL,
-                approval_type   TEXT NOT NULL,
-                decision        TEXT NOT NULL DEFAULT 'approved',
-                request_hash    TEXT NOT NULL DEFAULT '',
-                mfa_receipt     TEXT,
-                permission      TEXT NOT NULL DEFAULT '',
-                approved_at     TEXT NOT NULL,
-                expires_at      TEXT NOT NULL DEFAULT '',
-                consumed_at     TEXT,
-                revoked_at      TEXT,
-                metadata_json   TEXT,
-                UNIQUE(action_id, approver_id)
-            )"""
-        )
-        # R58 P0-2: 旧表(R56 schema)迁移:补列(SQLite ALTER TABLE ADD COLUMN 幂等,重复报错忽略)
-        # 注意:SQLite 不支持 CHECK 约束回填到旧行,只能在写入时强制
-        for col, col_def in [
-            ("decision", "TEXT NOT NULL DEFAULT 'approved'"),
-            ("request_hash", "TEXT NOT NULL DEFAULT ''"),
-            ("permission", "TEXT NOT NULL DEFAULT ''"),
-            ("expires_at", "TEXT NOT NULL DEFAULT ''"),
-            ("consumed_at", "TEXT"),
-            ("revoked_at", "TEXT"),
-        ]:
-            try:
-                await store._db.execute(
-                    f"ALTER TABLE command_approvals ADD COLUMN {col} {col_def}"
-                )
-            except Exception as e:
-                # R58 P0-5: fail-closed — 仅忽略 SQLite "duplicate column" 幂等错误
-                # (SQLite ALTER TABLE 不支持 IF NOT EXISTS, 重复添加列是预期行为)
-                # 其他异常(如 schema 损坏)必须抛出, 不能伪装成功
-                err_msg = str(e).lower()
-                if "duplicate column" in err_msg or "already exists" in err_msg:
-                    logger.debug(
-                        f"[DataLifecycle] ALTER TABLE ADD COLUMN {col} 已存在(幂等忽略): {e}"
-                    )
-                else:
-                    # R58 P0-5: destructive domain 零容忍, 非幂等错误必须抛出
-                    raise
-        await store._db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_command_approvals_action_id "
-            "ON command_approvals(action_id)"
-        )
-        await store._db.commit()
-        return True
+        from database.migrate import apply_migrations
+        result = await apply_migrations(db=store._db)
+        if result.get("failed"):
+            logger.error(
+                f"[DataLifecycle] R59 P1: command_approvals migration 失败, "
+                f"failed={result['failed']}"
+            )
+            return False
     except Exception as e:
-        logger.warning(f"[DataLifecycle] 创建 command_approvals 表失败: {e}")
+        logger.error(f"[DataLifecycle] R59 P1: command_approvals migration 异常: {e}")
         return False
+    # R59 P1: fail-closed 检查 — 旧 break_glass 数据 expires_at 为空时拒绝
+    # 防止无过期时间的旧审批被无限复用(安全风险)
+    # 仅检查 break_glass 类型(quarantine_delete 由 redis_queue.quarantine_repair 独立校验)
+    try:
+        cursor = await store._db.execute(
+            "SELECT COUNT(*) FROM command_approvals "
+            "WHERE approval_type = 'break_glass' "
+            "AND (expires_at IS NULL OR expires_at = '')"
+        )
+        row = await cursor.fetchone()
+        empty_expiry_count = int(row[0]) if row else 0
+    except Exception as e:
+        # 查询失败视为不安全(fail-closed),不继续验证审批
+        logger.error(
+            f"[DataLifecycle] R59 P1 fail-closed: 检查 expires_at 空值查询失败(视为不安全): {e}"
+        )
+        return False
+    if empty_expiry_count > 0:
+        logger.error(
+            f"[DataLifecycle] R59 P1 fail-closed: 检测到 {empty_expiry_count} 条 "
+            f"break_glass 审批记录 expires_at 为空,拒绝继续(防止旧审批无限复用)"
+        )
+        return False
+    return True
 
 
 async def _verify_break_glass_two_person_approval(
@@ -204,26 +194,48 @@ async def _verify_break_glass_two_person_approval(
     - R58 P0-2: 未撤销(revoked_at IS NULL)
     - R58 P0-2: 未消费(consumed_at IS NULL,防重用)
 
+    R59 P0-02 增强:
+    - request_hash 必须严格匹配 `^[0-9a-f]{64}$`(lowercase hex),不再仅检查长度=64
+    - expires_at 必须非空且能解析为 UTC aware datetime,不允许空值绕过
+    - 时间比较统一使用 `datetime.now(timezone.utc)`(避免 naive 本地时间 ISO 比较脆弱)
+    - 验证通过后在**同一事务**中原子设置 consumed_at(受影响行数必须恰好为 2,否则回滚)
+    - permission 必须非空(R58 已存储,这里强制校验;执行时由 claim_execution_approved 重鉴权)
+
     Args:
         action_id: 审批动作 ID
         expected_principal_id: 发起人 principal_id(用于确认非自审批)
         expected_request_hash: 期望的 request_hash(64 hex),用于验证两人批准同一请求
 
     Raises:
-        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): 双人审批不足/MFA 缺失/自审批/Hash 不匹配/已过期/已撤销/已消费
+        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): 双人审批不足/MFA 缺失/自审批/Hash 不匹配/已过期/已撤销/已消费/原子消费失败
     """
+    import re as _re_mod
+    from admin.mfa import verify_mfa_receipt, consume_mfa_receipt
+
+    # R59 P0-02: request_hash 严格 lowercase hex 正则
+    _REQUEST_HASH_RE = _re_mod.compile(r"^[0-9a-f]{64}$")
+
     store = get_cache_store()
     if not store._db:
         raise AppError(
             ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
             params={"reason": "store_unavailable_for_two_person_check"},
         )
-    await _ensure_command_approvals_table()
+    # R59 P1: 检查 _ensure_command_approvals_table() 返回值
+    # 失败原因包括: migration 应用失败 / fail-closed 检查未通过(旧数据 expires_at 为空)
+    # fail-closed 模式: 检测到不安全旧数据时拒绝继续执行,而不是降级放行
+    if not await _ensure_command_approvals_table():
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={
+                "reason": "command_approvals_migration_or_fail_closed_check_failed"
+            },
+        )
     try:
-        # R58 P0-2: 查询所有新增约束字段
+        # R59 P0-02: 查询时增加 permission 字段(执行时重鉴权准备)
         rows = await store._db.execute_fetchall(
             "SELECT approver_id, mfa_receipt, decision, request_hash, "
-            "expires_at, consumed_at, revoked_at "
+            "expires_at, consumed_at, revoked_at, permission "
             "FROM command_approvals "
             "WHERE action_id = ? AND approval_type = 'break_glass'",
             (action_id,),
@@ -244,15 +256,19 @@ async def _verify_break_glass_two_person_approval(
         )
     approver_ids = set()
     request_hashes = set()
-    now_iso = _dt.datetime.now().isoformat()
+    permissions = set()
+    # R59 P0-02: 时间比较统一使用 UTC aware datetime(避免 naive 本地时间字符串比较脆弱)
+    now_utc = _dt.datetime.now(_dt.timezone.utc)
     for r in rows:
         approver_id = int(r[0] or 0)
         mfa_receipt = str(r[1] or "")
         decision = str(r[2] or "")
         request_hash = str(r[3] or "")
-        expires_at = str(r[4] or "")
+        expires_at_raw = r[4]
+        expires_at_str = str(expires_at_raw) if expires_at_raw is not None else ""
         consumed_at = r[5]
         revoked_at = r[6]
+        permission = str(r[7] or "") if len(r) > 7 else ""
         # R58 P0-2: mfa_receipt 必须非空
         if not mfa_receipt:
             raise AppError(
@@ -260,6 +276,43 @@ async def _verify_break_glass_two_person_approval(
                 params={
                     "reason": "mfa_receipt_missing",
                     "approver_id": approver_id,
+                },
+            )
+        # R59 P0-02: request_hash 必须严格匹配 ^[0-9a-f]{64}$(lowercase hex)
+        # (旧版仅检查长度=64,允许大写 HEX 或非 hex 字符通过,不满足不可伪造契约)
+        if not _REQUEST_HASH_RE.fullmatch(request_hash):
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "request_hash_invalid_lowercase_hex",
+                    "approver_id": approver_id,
+                    "hash_len": len(request_hash),
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+            )
+        # R59 P0-02: expires_at 必须非空且能解析为 UTC aware datetime
+        # (旧版空 expires_at 可绕过过期检查,严重安全漏洞)
+        if not expires_at_str:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "expires_at_missing",
+                    "approver_id": approver_id,
+                },
+            )
+        # R59 P0-02: 解析 expires_at 为 UTC aware datetime(支持带/不带 tz 后缀)
+        # _parse_iso_utc 已抛 AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED),
+        # 这里直接传播(避免 AppError 嵌套)
+        expires_at_dt = _parse_iso_utc(expires_at_str)
+        # R59 P0-02: 使用 UTC aware datetime 比较(避免字符串比较时区漂移)
+        if expires_at_dt <= now_utc:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "approval_expired",
+                    "approver_id": approver_id,
+                    "expires_at": expires_at_str,
+                    "now_utc": now_utc.isoformat(),
                 },
             )
         # R58 P0-2: decision 必须='approved'(记录存在 ≠ 批准)
@@ -270,26 +323,6 @@ async def _verify_break_glass_two_person_approval(
                     "reason": "approval_decision_not_approved",
                     "approver_id": approver_id,
                     "decision": decision,
-                },
-            )
-        # R58 P0-2: request_hash 必须非空且长度=64(两人批准同一请求)
-        if not request_hash or len(request_hash) != 64:
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={
-                    "reason": "request_hash_invalid",
-                    "approver_id": approver_id,
-                    "hash_len": len(request_hash),
-                },
-            )
-        # R58 P0-2: 未过期(expires_at 非空且 > now)
-        if expires_at and expires_at < now_iso:
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={
-                    "reason": "approval_expired",
-                    "approver_id": approver_id,
-                    "expires_at": expires_at,
                 },
             )
         # R58 P0-2: 未撤销(revoked_at IS NULL)
@@ -312,6 +345,15 @@ async def _verify_break_glass_two_person_approval(
                     "consumed_at": str(consumed_at),
                 },
             )
+        # R59 P0-02: permission 必须非空(执行时由 claim_execution_approved 重鉴权)
+        if not permission:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "permission_missing_for_reauth",
+                    "approver_id": approver_id,
+                },
+            )
         if approver_id == expected_principal_id:
             raise AppError(
                 ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
@@ -322,6 +364,7 @@ async def _verify_break_glass_two_person_approval(
             )
         approver_ids.add(approver_id)
         request_hashes.add(request_hash)
+        permissions.add(permission)
     if len(approver_ids) < 2:
         raise AppError(
             ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
@@ -348,6 +391,153 @@ async def _verify_break_glass_two_person_approval(
                 "expected": expected_request_hash,
             },
         )
+    # R59 P0-03: 验证 MFA receipt(真实签发,服务端签名)
+    # 每个 approver 必须有真实 MFA receipt(jti/sub/purpose/action_hash/amr/iat/exp)
+    # receipt 的 purpose 必须与当前高风险动作匹配,sub 必须匹配批准人,
+    # action_hash 必须匹配 request_hash,TTL 2-5 分钟
+    canonical_request_hash = next(iter(request_hashes))
+    expected_purpose = "break_glass_approval"
+    for r in rows:
+        approver_id = int(r[0] or 0)
+        mfa_receipt = str(r[1] or "")
+        try:
+            receipt_payload = verify_mfa_receipt(
+                token=mfa_receipt,
+                expected_principal_id=approver_id,
+                expected_purpose=expected_purpose,
+                expected_action_hash=canonical_request_hash,
+            )
+            # R59 P0-03: 原子消费 receipt 的 jti(防重放)
+            jti = receipt_payload.get("jti", "")
+            if not jti:
+                raise AppError(
+                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                    params={
+                        "reason": "mfa_receipt_jti_missing",
+                        "approver_id": approver_id,
+                    },
+                )
+            consumed = await consume_mfa_receipt(jti)
+            if not consumed:
+                raise AppError(
+                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                    params={
+                        "reason": "mfa_receipt_already_consumed_or_consume_failed",
+                        "approver_id": approver_id,
+                        "jti": jti,
+                    },
+                )
+        except AppError:
+            raise
+        except Exception as e:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": f"mfa_receipt_verify_failed: {type(e).__name__}: {e}",
+                    "approver_id": approver_id,
+                },
+            ) from e
+    # R59 P0-02: 原子消费 — 在同一事务中 UPDATE consumed_at,受影响行数必须恰好为 2
+    # (使用条件 UPDATE 原子消费,防重放;失败回滚)
+    consumed_at_now = now_utc.isoformat()
+    try:
+        cursor = await store._db.execute(
+            "UPDATE command_approvals "
+            "SET consumed_at = ? "
+            "WHERE action_id = ? "
+            "  AND approval_type = 'break_glass' "
+            "  AND consumed_at IS NULL "
+            "  AND revoked_at IS NULL "
+            "  AND expires_at > ?",
+            (consumed_at_now, action_id, consumed_at_now),
+        )
+        await store._db.commit()
+        affected = cursor.rowcount if cursor is not None else 0
+        # R59 P0-02: 受影响行数必须恰好为 2(两条审批都被原子消费)
+        # 若 < 2,说明在验证过程中有记录被并发消费/撤销/过期 → 回滚并拒绝
+        # 若 > 2,说明数据库约束异常(不该发生) → 拒绝
+        if affected != 2:
+            await store._db.rollback()
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "atomic_consume_failed",
+                    "expected_affected": 2,
+                    "actual_affected": affected,
+                    "action_id": action_id,
+                },
+            )
+        logger.info(
+            f"[DataLifecycle] R59 P0-02: 双人审批原子消费成功 "
+            f"action_id={action_id} affected={affected}"
+        )
+    except AppError:
+        raise
+    except Exception as e:
+        try:
+            await store._db.rollback()
+        except Exception as rollback_err:
+            # R59 P0-02: rollback 失败不掩盖原异常,仅记录(原异常已在上层抛出)
+            logger.warning(
+                f"[DataLifecycle] R59 P0-02 rollback 失败 "
+                f"action_id={action_id}: {rollback_err}"
+            )
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={
+                "reason": f"atomic_consume_exception: {type(e).__name__}: {e}",
+                "action_id": action_id,
+            },
+        ) from e
+
+
+def _parse_iso_utc(dt_str: str) -> _dt.datetime:
+    """R59 P0-02: 解析 ISO 8601 字符串为 UTC aware datetime。
+
+    支持以下格式:
+    - "2026-07-17T12:34:56+00:00"(带 tz 后缀)
+    - "2026-07-17T12:34:56Z"(Z 后缀)
+    - "2026-07-17T12:34:56.123456"(无 tz,视为 UTC)
+    - "2026-07-17T12:34:56"(无 tz,视为 UTC)
+
+    Args:
+        dt_str: ISO 8601 时间字符串
+
+    Returns:
+        UTC aware datetime
+
+    Raises:
+        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): 解析失败
+            (使用 AppError 而非裸 ValueError,满足 R47 P1-c 裸字符串门禁)
+    """
+    if not dt_str:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": "expires_at_empty_string"},
+        )
+    s = dt_str.strip()
+    # 替换 Z 后缀为 +00:00
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = _dt.datetime.fromisoformat(s)
+    except ValueError:
+        # 尝试无微秒的格式
+        try:
+            dt = _dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S%z")
+        except ValueError as parse_err:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "expires_at_unparseable_format",
+                    "input": dt_str,
+                    "error_class": type(parse_err).__name__,
+                },
+            ) from parse_err
+    # 若无 tzinfo,视为 UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt.astimezone(_dt.timezone.utc)
 
 
 async def export_user_data(user_id: int) -> dict:
@@ -605,13 +795,11 @@ async def _ensure_deletion_requests_table() -> bool:
             )"""
         )
         # 状态查询索引(按 user_id + status)
-        try:
-            await store._db.execute(
-                f"CREATE INDEX IF NOT EXISTS idx_deletion_requests_user_status "
-                f"ON {_DELETION_REQUESTS_TABLE}(user_id, status)"
-            )
-        except Exception:
-            pass  # 幂等,索引已存在
+        # CREATE INDEX IF NOT EXISTS 本身幂等,无需 try/except 包裹(避免吞掉异常)
+        await store._db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_deletion_requests_user_status "
+            f"ON {_DELETION_REQUESTS_TABLE}(user_id, status)"
+        )
         await store._db.commit()
         return True
     except Exception as e:

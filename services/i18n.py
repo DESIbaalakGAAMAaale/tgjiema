@@ -372,26 +372,100 @@ def _icu_parse_branches(body: str) -> dict[str, str]:
     return branches
 
 
+def _cldr_ordinal_category(n: int, locale: str) -> str:
+    """R59 §5.1 P1: CLDR selectordinal 规则 — 返回序数类别(one/two/few/many/other)。
+
+    实现完整的 CLDR ordinal 复数规则(不依赖第三方库),支持:
+        - 英语(en): one/two/few/other(1st/2nd/3rd/4th...)
+        - 俄语(ru): one/few/many/other(1-й/2-й/5-й...)
+        - 中文(zh): 始终 other(中文不区分序数形式)
+        - 其他 locale: 默认 other(兜底)
+
+    CLDR 规则参考: https://unicode-org.github.io/cldr-staging/charts/latest/supplemental/language_plural_rules.html
+
+    英语(en) ordinal 规则:
+        one:   n mod 10 = 1 and n mod 100 != 11   (1st, 21st, 31st, 101st...)
+        two:   n mod 10 = 2 and n mod 100 != 12   (2nd, 22nd, 32nd, 102nd...)
+        few:   n mod 10 = 3 and n mod 100 != 13   (3rd, 23rd, 33rd, 103rd...)
+        other: 其余                                (4th, 5th, 11th, 12th, 13th...)
+
+    俄语(ru) ordinal 规则(与 cardinal 相同):
+        one:   n mod 10 = 1 and n mod 100 != 11           (1-й, 21-й, 31-й...)
+        few:   n mod 10 in 2..4 and n mod 100 not in 12..14 (2-й, 3-й, 4-й, 22-й...)
+        many:  n mod 10 = 0 or n mod 10 in 5..9 or n mod 100 in 11..14 (5-й, 10-й, 11-й...)
+        other: 其余(分数等,整数场景不会命中)
+
+    Args:
+        n: 序数值(非负整数;负数取绝对值后套用规则)
+        locale: locale 标识符(如 "en-US" / "ru-RU" / "zh-CN")
+
+    Returns:
+        CLDR ordinal 类别字符串:"one" / "two" / "few" / "many" / "other"
+    """
+    # 负数取绝对值(CLDRL 规则对负数取模的处理:实际场景序数非负,兜底取绝对值)
+    if n < 0:
+        n = -n
+    mod10 = n % 10
+    mod100 = n % 100
+
+    # 中文(zh-*): 不区分序数形式,始终 other
+    if locale.startswith("zh"):
+        return "other"
+
+    # 英语(en-*): one/two/few/other
+    if locale.startswith("en"):
+        if mod10 == 1 and mod100 != 11:
+            return "one"
+        if mod10 == 2 and mod100 != 12:
+            return "two"
+        if mod10 == 3 and mod100 != 13:
+            return "few"
+        return "other"
+
+    # 俄语(ru-*): one/few/many/other
+    if locale.startswith("ru"):
+        if mod10 == 1 and mod100 != 11:
+            return "one"
+        if mod10 in (2, 3, 4) and mod100 not in (12, 13, 14):
+            return "few"
+        if mod10 == 0 or mod10 in (5, 6, 7, 8, 9) or mod100 in (11, 12, 13, 14):
+            return "many"
+        return "other"
+
+    # 其他 locale: 兜底 other(暂未实现完整 CLDR ordinal 规则)
+    return "other"
+
+
 def _icu_select_branch_by_count(
     count: int, block_type: str, locale: str, branches: dict[str, str]
 ) -> str:
-    """R58 P1-1: 根据 count + locale 选择合适的子句(仅 plural/selectordinal)。
+    """R58 P1-1 / R59 §5.1 P1: 根据 count + locale 选择合适的子句(仅 plural/selectordinal)。
 
     优先级:
         1. 精确匹配 =N (如 =0 / =1)
         2. plural: 按 CLDR 复数规则选择 one/other(简化:en=1 用 one,其他用 other;zh 始终 other)
-        3. selectordinal: 简化为 "other"(完整 CLDR ordinal 规则复杂,按需扩展)
+        3. selectordinal: 按 CLDR ordinal 规则选择(R59 §5.1 P1 新增)
+           支持英语(one/two/few/other)/俄语(one/few/many/other)/中文(other)
         4. 兜底: other
 
     注意: select 类型不再走此函数,改由 _icu_select_branch_by_value 处理。
+
+    R59 §5.1 P1 变更: selectordinal 不再简化为 "other",而是按 CLDR ordinal 规则
+    选择 one/two/few/many/other 子句。若选中的子句不存在,回退到 other。
     """
     # 精确匹配 =N
     exact_key = f"={count}"
     if exact_key in branches:
         return branches[exact_key]
-    # selectordinal: 简化为 "other"(完整 CLDR ordinal 规则复杂,按需扩展)
+
+    # selectordinal: 按 CLDR ordinal 规则选择(R59 §5.1 P1 完整实现)
     if block_type == "selectordinal":
+        category = _cldr_ordinal_category(count, locale)
+        # 优先返回 CLDR 类别对应的子句;若不存在则回退到 other
+        if category in branches:
+            return branches[category]
         return branches.get("other", "")
+
     # plural: 按 locale 复数规则
     if block_type == "plural":
         if locale.startswith("zh"):
@@ -837,6 +911,53 @@ class I18nManager:
             )
             _incr_metric("i18n_parse_failed_total")
             return self.format_message(key, locale=target_locale, **kwargs)
+
+    def format_selectordinal(
+        self,
+        key: str,
+        locale: Optional[str] = None,
+        count: int = 0,
+        **kwargs: Any,
+    ) -> str:
+        """R59 §5.1 P1: CLDR selectordinal 格式化接口。
+
+        翻译 key 对应的 ICU MessageFormat 文本,使用 selectordinal 子句按 CLDR
+        ordinal 规则选择分支,并展开 # / {var} 占位符。
+
+        ICU 语法示例:
+            "common.rank.ordinal": "{n, selectordinal,
+                one {#st place} two {#nd place} few {#rd place} other {#th place}}"
+
+        调用:
+            manager.format_selectordinal("common.rank.ordinal", locale="en-US", count=3)
+            → "3rd place"
+            manager.format_selectordinal("common.rank.ordinal", locale="en-US", count=11)
+            → "11th place"
+
+        CLDR ordinal 规则支持:
+            - en-*: one/two/few/other
+            - ru-*: one/few/many/other
+            - zh-*: 始终 other
+            - 其他: other(兜底)
+
+        缺失 key / 缺参数 / malformed ICU 的处理与 format_message_icu 一致:
+            - test/staging 环境: fail-fast 抛 AppError(VALIDATION_FAILED)
+            - production: 记录 trace + 失败指标,回退到 format_message
+
+        Args:
+            key: 翻译 key(如 "common.rank.ordinal")
+            locale: 目标 locale(默认 self.default_locale)
+            count: 序数值(用于选择 selectordinal 分支 + 展开 #)
+            **kwargs: 额外插值参数
+
+        Returns:
+            本地化序数字符串;失败时回退到 format_message
+        """
+        # 合并 count 到 kwargs(selectordinal 子句通过 var 名引用 count)
+        # 调用 format_message_icu 完成实际的 ICU 解析 + CLDR ordinal 分支选择
+        # kwargs 中已含 count,ICU pattern 中的 {n, selectordinal, ...} 会读取 kwargs["n"]
+        interp = {"n": count, **kwargs}
+        return self.format_message_icu(key, locale=locale, **interp)
 
     def format_message(self, key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
         """R41/R42/R45: 显式格式化接口 — 翻译 key 并用 {var} 占位符插值。
@@ -1709,3 +1830,39 @@ def format_message_icu(key: str, locale: Optional[str] = None, **kwargs: Any) ->
     """
     manager = get_i18n_manager()
     return manager.format_message_icu(key, locale=locale, **kwargs)
+
+
+def format_selectordinal(
+    key: str,
+    locale: Optional[str] = None,
+    count: int = 0,
+    **kwargs: Any,
+) -> str:
+    """R59 §5.1 P1: 模块级便捷函数 — CLDR selectordinal 格式化。
+
+    等价于 I18nManager.format_selectordinal()。按 CLDR ordinal 规则选择
+    one/two/few/many/other 子句并展开 # / {var} 占位符。
+
+    CLDR ordinal 规则支持:
+        - en-*: one/two/few/other(1st/2nd/3rd/4th...)
+        - ru-*: one/few/many/other(1-й/2-й/5-й...)
+        - zh-*: 始终 other(中文不区分序数形式)
+        - 其他: other(兜底)
+
+    Args:
+        key: 翻译 key(对应 ICU selectordinal 模板)
+        locale: 目标 locale(默认 zh-CN)
+        count: 序数值(用于选择 selectordinal 分支 + 展开 #)
+        **kwargs: 额外插值参数
+
+    Returns:
+        本地化序数字符串;失败时回退到 format_message
+
+    用法:
+        # locale 文件:"common.rank.ordinal": "{n, selectordinal,
+        #   one {#st place} two {#nd place} few {#rd place} other {#th place}}"
+        result = format_selectordinal("common.rank.ordinal", locale="en-US", count=3)
+        # → "3rd place"
+    """
+    manager = get_i18n_manager()
+    return manager.format_selectordinal(key, locale=locale, count=count, **kwargs)

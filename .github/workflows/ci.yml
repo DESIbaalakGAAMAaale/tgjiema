@@ -197,6 +197,10 @@ jobs:
     # R44/R48: i18n 一致性校验,确保所有面向用户的字符串已接入翻译
     - name: Verify i18n key consistency
       run: python scripts/verify_i18n_keys.py
+    # R59 §5.1 P1: zh-CN/en-US key 对称检查(集合/参数/ICU 结构)
+    # fail-fast: 任一 key 集合不对称/参数集不对称/ICU 结构不对称/malformed ICU → 阻断合并
+    - name: Check i18n key symmetry (R59 §5.1 P1)
+      run: python scripts/check_i18n_key_symmetry.py
     # R44/R48: 扫描硬编码用户面向中文字符串,强制走 i18n
     - name: Scan hardcoded user-facing strings
       run: python scripts/scan_hardcoded_strings.py
@@ -243,6 +247,15 @@ jobs:
     # 只允许减少不允许新增。修复后运行 --generate-baseline 下降基线。
     - name: Check error protocol (AST scan, no except pass/bare return/unregistered codes)
       run: python scripts/check_error_protocol.py --baseline scripts/error_protocol_baseline.json
+    # R59 §5.2 P1 Scanner 6: ErrorRegistry 唯一注册源门禁
+    # 检查直接字符串错误码字面量、动态拼接错误码(f-string/BinOp)、
+    # 未知 ErrorCodes 引用、registry 内部一致性(duplicate code/缺失元信息/错误 HTTP 映射)、
+    # ErrorCodes 常量漏注册、locale errors.* key 未注册。
+    # 使用 baseline 模式:ratchet 下降 pre-existing 历史债务(53 处:
+    #   52 处 services/backup_dr_validate.py 字面量 + 38 项 locale errors.* 无主 key),
+    # 只允许减少不允许新增。修复后运行 --generate-baseline 下降基线。
+    - name: Check error registry (R59 §5.2 P1, no dynamic/unknown error codes)
+      run: python scripts/check_error_registry.py --baseline scripts/error_registry_baseline.json
 
   # R40 P2-1: 安全扫描(bandit)
   security:

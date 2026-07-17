@@ -647,8 +647,9 @@ class TestAdminWebLocalization:
         """E14: 关键 aria-label 在 zh-CN/en-US 都有翻译。
 
         验证策略(双重):
-            1. dashboard.html / base.html 中的关键 aria-label 是 bilingual
-               (含中文 + 英文,如 "主导航 / Main navigation")
+            1. dashboard.html / base.html 中的关键 aria-label 通过 i18n key 接入
+               (R59 §5.1 P1: aria-label 使用 ``{{ t("ui.admin.xxx.sN") }}`` 模式,
+               不再硬编码 bilingual 文本;翻译值在 locale 文件中提供)
             2. zh-CN.json / en-US.json 的 accessibility.* 命名空间包含
                无障碍相关翻译(skip_to_content / screen_reader_friendly 等)
                证明 aria-label 文案可在 locale 文件中本地化
@@ -661,32 +662,61 @@ class TestAdminWebLocalization:
         dashboard_text = (ADMIN_TEMPLATES_DIR / "dashboard.html").read_text(encoding="utf-8")
         base_text = (ADMIN_TEMPLATES_DIR / "base.html").read_text(encoding="utf-8")
 
-        aria_labels = re.findall(r'aria-label="([^"]+)"', dashboard_text + base_text)
-        assert len(aria_labels) > 0, "dashboard.html + base.html 应至少有一个 aria-label"
-
-        # 关键 aria-label:主导航应同时包含中文与英文(bilingual)
-        nav_labels = [a for a in aria_labels if "导航" in a or "navigation" in a.lower()]
-        assert len(nav_labels) >= 1, (
-            f"应包含主导航 aria-label,实际所有 aria-label: {aria_labels}"
-        )
-        nav_label = nav_labels[0]
-        # 应同时含中文(导航)和英文(navigation) — bilingual
-        has_chinese = bool(re.search(r"[\u4e00-\u9fff]", nav_label))
-        has_english = bool(re.search(r"[a-zA-Z]", nav_label))
-        assert has_chinese and has_english, (
-            f"主导航 aria-label 应 bilingual(中英),实际: '{nav_label}'"
-        )
-        # 应包含 "/" 分隔符(bilingual 格式约定)
-        assert "/" in nav_label, (
-            f"bilingual aria-label 应用 '/' 分隔,实际: '{nav_label}'"
+        # R59 §5.1 P1: aria-label 现在使用 {{ t("ui.admin.xxx.sN") }} Jinja2 表达式
+        # 正则匹配 aria-label="{{ t("key") }}" 模式,提取 i18n key
+        aria_label_pattern = re.compile(r'aria-label="\{\{\s*t\("([^"]+)"\)\s*\}\}"')
+        aria_keys = aria_label_pattern.findall(dashboard_text + base_text)
+        assert len(aria_keys) > 0, (
+            "dashboard.html + base.html 应至少有一个 i18n 化的 aria-label "
+            "(模式: aria-label=\"{{ t('ui.admin.xxx.sN') }}\")"
         )
 
-        # ── 2. 验证 locale 文件的 accessibility.* 命名空间 ──
+        # ── 2. 验证 i18n key 在 zh-CN/en-US locale 文件中都存在 ──
         zh_path = LOCALES_DIR / "zh-CN.json"
         en_path = LOCALES_DIR / "en-US.json"
         zh_data = json.loads(zh_path.read_text(encoding="utf-8"))
         en_data = json.loads(en_path.read_text(encoding="utf-8"))
 
+        def _lookup_nested(data: dict, dotted_key: str) -> str | None:
+            """按点分路径查找嵌套 dict 中的值(如 ui.admin.base.s24)。"""
+            parts = dotted_key.split(".")
+            cur = data
+            for p in parts:
+                if isinstance(cur, dict) and p in cur:
+                    cur = cur[p]
+                else:
+                    return None
+            return cur if isinstance(cur, str) else None
+
+        # 主导航 aria-label key(ui.admin.base.s24 / ui.admin.dashboard.s26)
+        # 应在 zh-CN 含"导航"、en-US 含"navigation"
+        nav_keys = [
+            k for k in aria_keys
+            if "base.s24" in k or "dashboard.s26" in k
+        ]
+        assert len(nav_keys) >= 1, (
+            f"应包含主导航 aria-label key (ui.admin.base.s24 或 ui.admin.dashboard.s26),"
+            f"实际所有 aria-label keys: {aria_keys}"
+        )
+        for nav_key in nav_keys:
+            zh_val = _lookup_nested(zh_data, nav_key)
+            en_val = _lookup_nested(en_data, nav_key)
+            assert zh_val is not None, (
+                f"zh-CN.json 应包含 aria-label key '{nav_key}' 的翻译"
+            )
+            assert en_val is not None, (
+                f"en-US.json 应包含 aria-label key '{nav_key}' 的翻译"
+            )
+            # zh-CN 应含中文"导航"
+            assert "导航" in zh_val, (
+                f"zh-CN '{nav_key}' 应含'导航',实际: '{zh_val}'"
+            )
+            # en-US 应含英文"navigation"
+            assert "navigation" in en_val.lower(), (
+                f"en-US '{nav_key}' 应含'navigation',实际: '{en_val}'"
+            )
+
+        # ── 3. 验证 locale 文件的 accessibility.* 命名空间 ──
         # 两个 locale 都应有 accessibility 命名空间
         assert "accessibility" in zh_data, "zh-CN.json 应包含 accessibility 命名空间"
         assert "accessibility" in en_data, "en-US.json 应包含 accessibility 命名空间"
