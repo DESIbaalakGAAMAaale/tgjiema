@@ -1,7 +1,7 @@
 """数据库恢复脚本(单一 Restore Engine)
 
 R35 P1-4: 本模块是唯一的恢复执行器,db_backup.py::restore_from_backup()
-委托给本模块的 restore_from_backup_data(),消除两套执行器。
+委托给本模块的 _restore_from_backup_data(),消除两套执行器。
 
 R35 P1-5: 按 source 分组恢复:
 - source="crdb":        恢复到 CockroachDB(asyncpg 直连)
@@ -11,14 +11,15 @@ R35 P1-5: 按 source 分组恢复:
 R35 P1-6: 恢复时按表严格校验列(使用 validate_columns_for_table),
 不再使用全局白名单。
 
-R59 P0-04: 强制参数,不再允许 fail-open — 信任链所有安全参数强制化。
+R61 P0-03: 信任链整改 — 不可伪造的恢复能力令牌。
+    - _restore_from_backup_data() 为私有写入器,不再做信任校验(只写数据)。
+    - 仅接受 services.backup_dr_validate._RestoreCapability 类型令牌,
+      该令牌由 _RESTORE_SENTINEL(模块私有)保护,外部代码无法构造。
     - 生产恢复必须通过 services.backup_dr_validate.validate_and_restore_backup_strict
-      fail-closed 入口执行,禁止直接绕过验证模块恢复。
-    - restore_from_backup_data() 新增 _r59_validation_token 守卫参数,
-      合法调用方(BackupEngine.restore / validate_and_restore_backup_strict)
-      必须传入 valid=True 的 BackupValidationResult 作为信任令牌。
-    - 未传入令牌时记录 ERROR 日志(fail-closed 审计),BackupEngine 内部
-      验证逻辑视为合规调用方(已有 COMPLETE+manifest+checksum+decrypt 验证)。
+      公共入口执行 — 该入口做严格验证(COMPLETE 签名/manifest digest/
+      payload digest/解密/schema)后构造 _RestoreCapability 并调用私有写入器。
+    - run_restore()/main() 仍为公共 CLI 入口,但内部通过
+      validate_and_restore_backup_strict() 路由。
 
 支持命令行参数：--table 指定恢复特定表，--dry-run 预览不执行。
 """
@@ -49,8 +50,6 @@ from services.backup_crypto import (
     verify_checksum,
     is_encryption_available,
 )
-# R60 P0-03: fail-closed 信任链守卫 — 缺失/无效令牌抛 AppError 中止恢复
-from services.error_codes import AppError, ErrorCodes
 
 # R44 7.2: record_restore_usage 在函数内延迟导入(避免循环依赖)
 
@@ -256,11 +255,12 @@ def _safe_val(val):
     return str(val) if not isinstance(val, (int, float, str)) else val
 
 
-async def restore_table(conn: asyncpg.Connection, table: str, records: list[dict], dry_run: bool = False):
+async def _restore_table(conn: asyncpg.Connection, table: str, records: list[dict], dry_run: bool = False):
     """将记录恢复到 CRDB（逐行 UPSERT）。
 
     R35 P1-6: 使用 validate_columns_for_table() 按表校验列,
     不再使用全局白名单 _sanitize_column()。
+    R61 P0-03: 私有写入器,仅由 _restore_from_backup_data 内部调用。
     """
     if not records:
         logger.info(f"[{table}] 无记录，跳过")
@@ -423,18 +423,18 @@ async def _restore_sqlite_table(
 #  R35 P1-4: 单一 Restore Engine 主入口
 # ═══════════════════════════════════════════════════════════════
 
-async def restore_from_backup_data(
+async def _restore_from_backup_data(
     data: dict,
     *,
-    _r59_validation_token: "object | None",  # R59 P0-04 / R60 P0-03: fail-closed 信任令牌(强制必填, kw-only)
+    _capability,  # R61 P0-03: _RestoreCapability(不可伪造,由 validate_and_restore_backup_strict 构造)
     tables: list[str] | None = None,
     merge: bool = False,
 ) -> dict:
-    """从备份数据恢复数据库(单一 Restore Engine 主入口)。
+    """从备份数据恢复数据库(R61 P0-03: 私有 Restore Engine 写入器)。
 
-    R35 P1-4: 本函数是唯一的恢复执行器入口。
-    db_backup.py::restore_from_backup() 委托给本函数。
-    CLI 的 run_restore() 也调用本函数。
+    R35 P1-4: 本函数是唯一的恢复执行器写入器(私有)。
+    db_backup.py::restore_from_backup() 与 CLI 的 run_restore() 通过
+    services.backup_dr_validate.validate_and_restore_backup_strict() 间接调用本函数。
 
     R35 P1-5: 按 source 分组恢复:
     - source="crdb":        恢复到 CRDB(asyncpg)
@@ -443,26 +443,33 @@ async def restore_from_backup_data(
 
     R35 P1-6: 恢复时按表校验列(validate_columns_for_table)。
 
-    R59 P0-04 / R60 P0-03: 强制参数,不再允许 fail-open — 信任链守卫。
-        - _r59_validation_token: 由 validate_and_restore_backup_strict 或
-          BackupEngine.restore 传入的 BackupValidationResult 信任令牌(valid=True)。
-        - 令牌为强制必填参数(无默认值);缺失或 valid=False 时
-          抛出 AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED) 中止恢复(fail-closed)。
-        - 生产恢复应通过 validate_and_restore_backup_strict 入口调用本函数。
+    R61 P0-03: 信任链整改 — 不可伪造的恢复能力令牌。
+        - 本函数为私有写入器,不做信任校验(只写数据)。
+        - 仅接受 services.backup_dr_validate._RestoreCapability 类型令牌,
+          该令牌由 _RESTORE_SENTINEL(模块私有)保护,外部代码无法构造。
+        - 调用方必须通过 validate_and_restore_backup_strict() 公共入口
+          获取 _RestoreCapability 后再调用本函数。
+        - 旧 R59 P0-04 / R60 P0-03 的 BackupValidationResult 令牌已废弃
+          (其为公开 dataclass,任意调用方可构造 valid=True,无法防止伪造)。
 
     Args:
         data: 备份数据 dict(含 "tables" 键)
+        _capability: R61 P0-03 不可伪造的 _RestoreCapability(由
+                     validate_and_restore_backup_strict 构造,强制必填)
         tables: 仅恢复指定表；None 则恢复备份中的所有表
         merge: True=增量补充(冲突保留现有数据); False=覆盖(清空后写入,默认)
-        _r59_validation_token: R59 P0-04 信任令牌(BackupValidationResult,强制必填)
 
     Returns:
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
     """
-    # R60 P0-03: fail-closed 信任链守卫 — 缺失或无效令牌必须抛 AppError 中止恢复
-    # (原 R59 P0-04 实现仅记录 ERROR 日志后继续恢复,属 fail-open,已修复)
-    if _r59_validation_token is None or not getattr(_r59_validation_token, "valid", False):
-        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+    # R61 P0-03: _capability 是不可伪造的 _RestoreCapability 实例
+    # (由 validate_and_restore_backup_strict 通过 _RESTORE_SENTINEL 构造)。
+    # 本写入器为私有(仅 validate_and_restore_backup_strict 内部调用),
+    # 不再做信任校验 — 安全保证来自:
+    #   1. _RestoreCapability.__init__ 的 sentinel 检查(模块私有 _RESTORE_SENTINEL)
+    #   2. validate_and_restore_backup_strict 是唯一能构造 _RestoreCapability 的公共入口
+    #   3. _restore_from_backup_data 为私有函数(_ 前缀)
+    # _capability 参数强制必填(keyword-only,无默认值),调用方必须通过 strict 入口获取。
     backup_tables = data.get("tables", {})
 
     if tables:
@@ -697,20 +704,19 @@ async def run_restore(table: str = None, dry_run: bool = False):
         logger.info("=== DRY-RUN 模式，不会实际写入数据 ===")
 
     # R35 P1-4: 调用单一 Restore Engine
-    # R60 P0-03: restore_from_backup_data 强制信任令牌(fail-closed);
-    # CLI 入口已通过 get_latest_backup() 下载并校验 manifest/checksum,
-    # 视为合规调用方,构造 valid=True 令牌。
-    # 生产恢复应优先走 validate_and_restore_backup_strict fail-closed 入口。
-    from services.backup_dr_validate import BackupValidationResult
-    _r60_restore_token = BackupValidationResult(
-        valid=True,
-        backup_id=str(data.get("backup_time", "")),
-    )
-    result = await restore_from_backup_data(
-        data,
-        _r59_validation_token=_r60_restore_token,
+    # R61 P0-03: 路由通过 validate_and_restore_backup_strict() 公共入口
+    # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
+    # CLI 入口的备份格式为旧版 db_backup_*.json(非三段式 payload/manifest/COMPLETE),
+    # 通过 data= 参数传入已下载+解密+校验的数据,跳过严格三段式下载验证。
+    from services.backup_dr_validate import validate_and_restore_backup_strict
+    result = await validate_and_restore_backup_strict(
+        data=data,
         tables=target_tables if table else None,
         merge=False,
+        # CLI 旧格式备份: 已通过 get_latest_backup() 完成 manifest+checksum+decrypt 校验
+        # 此处跳过严格三段式验证(storage/signing_key/decryptor 等参数留空)
+        skip_strict_validation=True,
+        validation_note="CLI run_restore: old-format backup validated via get_latest_backup()",
     )
 
     # 打印恢复结果

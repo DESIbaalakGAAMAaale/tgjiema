@@ -2,7 +2,7 @@
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
     "enum_count": 109,
-    "generated_at": "2026-07-17T13:55:19.062373Z",
+    "generated_at": "2026-07-17T16:32:26.217157Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -10,8 +10,8 @@
       "retryable": "是否可重试(True=临时性故障,可显示重试按钮)",
       "safe_params": "可安全记录的参数名白名单",
       "severity": "严重级别(info/warning/error/critical)",
-      "show_retry_button": "是否显示重试按钮(= retryable)",
-      "telegram_presentation": "Bot 端展示方式: short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)"
+      "show_retry_button": "是否显示重试按钮(R61 P1-05: 独立显式设置,通常等于 retryable 但可独立覆盖)",
+      "telegram_presentation": "Bot 端展示方式(R61 P1-05 显式字段): short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)/modal/toast(预留扩展)"
     },
     "total_codes": 109,
     "version": "R56-§5.2"

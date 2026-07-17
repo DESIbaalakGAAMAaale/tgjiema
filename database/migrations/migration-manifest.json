@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "release_commit": "65a2fe382749a9202c6c8eca40ff2ef5493ed0eb",
+  "description": "R61 P0-05 signed manifest — trust anchor for backfilling old _migrations_applied rows with empty sha256. Replaces the trust-on-first-use 'trust current disk file' policy (which allowed a tampered disk file to become the trusted baseline). The manifest sha256 is the authoritative baseline; a disk file whose sha256 does not match the manifest is treated as tampered and blocks startup.",
+  "migrations": [
+    {
+      "version": "001_initial_schema.sql",
+      "sha256": "145e224869a9a9ef0fcc0d543771cc6f978bfafda6716de82664fadfcbef331f",
+      "predecessor": null
+    },
+    {
+      "version": "002_r56_command_approvals_backfill.sql",
+      "sha256": "37b2596569f053389cbb205e855c9143fe1de29458bd030be3796faee4f6db49",
+      "predecessor": "001_initial_schema.sql"
+    },
+    {
+      "version": "003_rebuild_command_approvals.sql",
+      "sha256": "e7b8f9ab76a9c2172991fce7a6542c1d96252dcf84e7b7469f54d6aea747bf80",
+      "predecessor": "002_r56_command_approvals_backfill.sql"
+    }
+  ]
+}

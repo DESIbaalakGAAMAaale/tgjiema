@@ -669,7 +669,7 @@ class TestP13ProductionRestoreApproval:
         async def _fake_restore_from_backup_data(*args, **kwargs):
             return {"restored_tables": 2, "restored_rows": 3}
         monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data",
+            "services.db_restore._restore_from_backup_data",
             _fake_restore_from_backup_data,
         )
 

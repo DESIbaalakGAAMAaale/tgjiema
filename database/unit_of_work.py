@@ -55,6 +55,15 @@ class UnitOfWork:
         self._store = store
         self._tx: Any = None  # aiosqlite.Connection
         self._active: bool = False
+        # R61 P0-02: 事务所有权标志。
+        # True=本 UnitOfWork 通过 BEGIN 开启了事务(退出时 COMMIT/ROLLBACK);
+        # False=外层已有事务,本 UnitOfWork 用 SAVEPOINT 隔离(退出时 RELEASE/ROLLBACK TO,
+        #   不擅自提交/回滚调用方事务)。
+        # 旧实现用 catch-all `except Exception` 把所有 BEGIN 失败(锁竞争/连接损坏/I/O 错误)
+        # 误判为"已处于事务中,复用",并随后无条件 COMMIT,会擅自提交调用方事务。
+        self._owns_transaction: bool = False
+        # R61 P0-02: 嵌套事务使用的 savepoint 名称(仅在 _owns_transaction=False 时生效)。
+        self._savepoint_name: str = "uow_sp"
 
     async def __aenter__(self) -> "UnitOfWork":
         # 延迟导入避免循环依赖
@@ -66,13 +75,33 @@ class UnitOfWork:
                 "[UnitOfWork] CacheStore 未初始化,无法开启事务"
             )
         self._tx = self._store._db
-        # 显式 BEGIN: 开启事务(SQLite 默认 autocommit=off,显式 BEGIN 更清晰)
-        try:
-            await self._tx.execute("BEGIN")
-        except Exception as e:
-            # SQLite 在已处于事务中时再 BEGIN 会报 "cannot start a transaction within a transaction"
-            # 这种情况说明上层已有事务,直接复用即可(不重新 BEGIN,也不主动 COMMIT)
-            logger.debug(f"[UnitOfWork] BEGIN 失败(可能已处于事务中,复用现有事务): {e}")
+        # R61 P0-02: 通过 in_transaction 属性精确判断是否已处于外层事务中,
+        # 而非把所有 BEGIN 异常当作"已处于事务中"复用(会误提交调用方事务)。
+        # aiosqlite.Connection.in_transaction 委托到底层 sqlite3.Connection.in_transaction,
+        # 返回 True 表示当前有一个未提交的事务(BEGIN 已发出但未 COMMIT/ROLLBACK)。
+        already_in_tx = bool(getattr(self._tx, "in_transaction", False))
+        if already_in_tx:
+            # 外层已有事务: 不再 BEGIN,改用 SAVEPOINT 隔离本 UnitOfWork 的工作单元。
+            # 退出时仅 RELEASE/ROLLBACK TO savepoint,绝不 COMMIT 调用方事务。
+            self._owns_transaction = False
+            await self._tx.execute(f"SAVEPOINT {self._savepoint_name}")
+        else:
+            # 不在事务中: 显式 BEGIN 开启新事务(本 UnitOfWork 拥有并负责提交/回滚)。
+            # BEGIN 失败(锁竞争/连接损坏/I/O 错误)必须显式抛 AppError,
+            # 不再像旧实现那样 catch-all 后静默"复用现有事务"。
+            self._owns_transaction = True
+            try:
+                await self._tx.execute("BEGIN")
+            except Exception as e:
+                # 延迟导入避免循环依赖
+                from services.error_codes import AppError, ErrorCodes
+                raise AppError(
+                    ErrorCodes.DB_CACHE_UNAVAILABLE,
+                    params={
+                        "component": "unit_of_work",
+                        "reason": f"begin_failed: {type(e).__name__}: {e}",
+                    },
+                ) from e
         self._active = True
         return self
 
@@ -82,21 +111,41 @@ class UnitOfWork:
         self._active = False
         if exc_type is not None:
             # 异常: 回滚
+            # R61 P0-02: 仅当本 UnitOfWork 拥有事务时才 ROLLBACK 整个事务;
+            # 否则只 ROLLBACK TO SAVEPOINT(不结束调用方事务)。
             try:
-                await self._tx.rollback()
+                if self._owns_transaction:
+                    await self._tx.rollback()
+                else:
+                    await self._tx.execute(
+                        f"ROLLBACK TO SAVEPOINT {self._savepoint_name}"
+                    )
                 logger.debug(
-                    f"[UnitOfWork] 事务已回滚(异常={exc_type.__name__}: {exc})"
+                    f"[UnitOfWork] 事务已回滚(owns={self._owns_transaction}, "
+                    f"异常={exc_type.__name__}: {exc})"
                 )
             except Exception as rollback_err:
                 logger.warning(f"[UnitOfWork] rollback 失败: {rollback_err}")
             return
         # 正常退出: 提交
+        # R61 P0-02: 仅当本 UnitOfWork 拥有事务时才 COMMIT;
+        # 否则只 RELEASE SAVEPOINT(保留调用方事务由其自行提交)。
         try:
-            await self._tx.commit()
+            if self._owns_transaction:
+                await self._tx.commit()
+            else:
+                await self._tx.execute(
+                    f"RELEASE SAVEPOINT {self._savepoint_name}"
+                )
         except Exception as commit_err:
             logger.error(f"[UnitOfWork] commit 失败,尝试 rollback: {commit_err}")
             try:
-                await self._tx.rollback()
+                if self._owns_transaction:
+                    await self._tx.rollback()
+                else:
+                    await self._tx.execute(
+                        f"ROLLBACK TO SAVEPOINT {self._savepoint_name}"
+                    )
             except Exception:
                 pass
             raise

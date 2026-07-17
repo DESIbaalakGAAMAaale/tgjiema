@@ -507,9 +507,18 @@ def reset_mfa_state_for_testing() -> None:
 #   - 禁止仅靠前端 TOTP 文本或伪造时间戳
 #
 # 设计说明:
-#   - token 格式 v4.public.<payload_b64>.<signature_b64>(PASETO-like; 签名使用
-#     HMAC-SHA256 对称密钥, 避免引入 pyjwt/paseto 等外部库依赖)。注意:尽管前缀
-#     沿用 PASETO v4.public 格式, 此处为对称签名(HMAC), 非非对称(Ed25519)。
+#   - token 格式 mfa1.<payload_b64>.<signature_b64>(内部版本名 mfa1; 签名使用
+#     HMAC-SHA256 对称密钥, 避免引入 pyjwt/paseto 等外部库依赖)。R61 P1-03:
+#     不再冒用 PASETO v4.public 前缀(真正 v4.public 是 Ed25519 非对称签名,
+#     此处为 HMAC 对称签名, 命名误导)。前缀 mfa1 表明这是 MFA receipt 第 1 版。
+#   - payload 含 kid(Key ID) 字段, 标识签名所用密钥; 密钥环(current + previous)
+#     支持轮换: 当前密钥用于签发 + 验证, 旧密钥仅验证(轮换窗口)。
+#     轮换流程: 1) 生成新密钥 → 2) 旧密钥写入 MFA_RECEIPT_SIGNING_KEY_PREVIOUS
+#     → 3) 新密钥写入 MFA_RECEIPT_SIGNING_KEY → 4) 等待 max TTL(300s)后
+#     → 5) 移除 PREVIOUS 配置完成轮换。
+#     R61 P1-03 轮换期约束: previous 密钥接受窗口必须 < max TTL(300s), 因为
+#     receipt 最大生命期 300s, 超过 300s 旧 token 自然过期, 此时移除 PREVIOUS
+#     不会拒绝任何仍有效的 token。
 #   - 签发(issue)不写 DB: token 自包含且服务端签名, 签名即发行凭证。
 #   - 验证(verify)为纯密码学 + 字段校验, 不写 DB, 不消费(可多次调用查看)。
 #   - 消费(consume)用 INSERT OR IGNORE + rowcount 原子记录一次性使用, 与
@@ -518,9 +527,15 @@ def reset_mfa_state_for_testing() -> None:
 #     之上, 不修改既有 TOTP 函数签名与行为。
 
 # 签名密钥环境变量名(缺失时 fail-closed)
-_MFA_RECEIPT_KEY_ENV = "MFA_RECEIPT_SIGNING_KEY"
-# token 版本前缀(PASETO-like)
-_MFA_RECEIPT_TOKEN_PREFIX = "v4.public"
+# R61 P1-03: 密钥环支持轮换 — current(签发+验证) + previous(仅验证, 轮换窗口)
+_MFA_RECEIPT_KEY_CURRENT_ENV = "MFA_RECEIPT_SIGNING_KEY"
+_MFA_RECEIPT_KEY_PREVIOUS_ENV = "MFA_RECEIPT_SIGNING_KEY_PREVIOUS"
+_MFA_RECEIPT_KEY_ID_ENV = "MFA_RECEIPT_KEY_ID"
+_MFA_RECEIPT_DEFAULT_KID = "current"
+# 向后兼容: 旧别名(仅 _MFA_RECEIPT_KEY_ENV, 保留以避免破坏外部引用)
+_MFA_RECEIPT_KEY_ENV = _MFA_RECEIPT_KEY_CURRENT_ENV
+# token 版本前缀(R61 P1-03: 内部版本名 mfa1, 不再冒用 PASETO v4.public)
+_MFA_RECEIPT_TOKEN_PREFIX = "mfa1"
 # 默认有效期 5 分钟(R59 建议 2-5 分钟)
 _MFA_RECEIPT_DEFAULT_TTL = 300
 
@@ -545,30 +560,85 @@ _MFA_RECEIPT_JTI_RE = re.compile(
 _MFA_RECEIPT_ACTION_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _get_mfa_receipt_signing_key() -> bytes:
-    """R59 P0-03: 从环境变量读取 receipt 签名密钥(fail-closed)。
+def _get_mfa_receipt_keyring() -> dict[str, bytes]:
+    """R61 P1-03: 返回 {kid: key} 密钥环(支持 current + previous 轮换)。
 
-    密钥缺失或为空时抛 AppError(AUTH.MFA.RECEIPT_INVALID,
-    reason=signing_key_missing), 拒绝签发/验证(fail-closed, 防止无密钥时
-    绕过签名校验)。
+    密钥环构造规则:
+        - 当前密钥(来自 MFA_RECEIPT_SIGNING_KEY): 用于签发 + 验证。
+          kid 来自 MFA_RECEIPT_KEY_ID(默认 "current")。
+        - 旧密钥(来自 MFA_RECEIPT_SIGNING_KEY_PREVIOUS, 可选): 仅用于验证
+          (轮换窗口); kid 固定为 "previous", 永不用于签发。
+        - 当前密钥缺失 → fail-closed(抛 AppError, reason=signing_key_missing)。
+        - 仅配置 MFA_RECEIPT_SIGNING_KEY(无 PREVIOUS / KEY_ID)时,
+          密钥环为 {"current": <key>}, 行为与 R59 旧实现完全一致(向后兼容)。
+
+    R61 P1-03 轮换期约束: previous 密钥接受窗口必须 < max TTL(300s)。
+    receipt 最大生命期 300s, 超过 300s 旧 token 自然过期, 此时移除 PREVIOUS
+    不会拒绝任何仍有效的 token。轮换完成后, 直接从 env 移除 PREVIOUS 即可
+    (无需代码变更)。
 
     Returns:
-        签名密钥(bytes, UTF-8 编码)
+        {kid: key_bytes} 映射, 至少包含当前密钥
 
     Raises:
-        AppError: 环境变量 MFA_RECEIPT_SIGNING_KEY 未设置或为空
+        AppError: 当前签名密钥未配置(reason=signing_key_missing)
     """
-    raw = os.environ.get(_MFA_RECEIPT_KEY_ENV, "").strip()
-    if not raw:
+    keyring: dict[str, bytes] = {}
+    current_key = os.environ.get(_MFA_RECEIPT_KEY_CURRENT_ENV, "").strip()
+    if not current_key:
         logger.error(
-            f"[admin.mfa] 环境变量 {_MFA_RECEIPT_KEY_ENV} 未设置, "
+            f"[admin.mfa] 环境变量 {_MFA_RECEIPT_KEY_CURRENT_ENV} 未设置, "
             f"receipt 签发/验证 fail-closed"
         )
         raise AppError(
             ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
             params={"reason": "signing_key_missing"},
         )
-    return raw.encode("utf-8")
+    kid = (
+        os.environ.get(_MFA_RECEIPT_KEY_ID_ENV, _MFA_RECEIPT_DEFAULT_KID).strip()
+        or _MFA_RECEIPT_DEFAULT_KID
+    )
+    keyring[kid] = current_key.encode("utf-8")
+
+    previous_key = os.environ.get(_MFA_RECEIPT_KEY_PREVIOUS_ENV, "").strip()
+    if previous_key:
+        # 旧密钥 kid 固定为 "previous" — 仅验证, 永不签发
+        keyring["previous"] = previous_key.encode("utf-8")
+    return keyring
+
+
+def _get_signing_key_and_kid() -> tuple[bytes, str]:
+    """R61 P1-03: 获取当前签发密钥及其 kid。
+
+    从密钥环中选取非 "previous" 的密钥作为当前签发密钥。
+    若存在多个非 previous 的 kid(异常配置), 选取首个; 正常配置下仅有一个。
+
+    Returns:
+        (key_bytes, kid) 二元组
+
+    Raises:
+        AppError: 密钥环中无当前签发密钥(reason=no_current_signing_key)
+    """
+    keyring = _get_mfa_receipt_keyring()
+    # 第一个非 "previous" 的 kid 即为当前签发密钥
+    for kid, key in keyring.items():
+        if kid != "previous":
+            return key, kid
+    # 理论不可达(_get_mfa_receipt_keyring 保证至少有 current 密钥)
+    raise AppError(
+        ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+        params={"reason": "no_current_signing_key"},
+    )
+
+
+def _get_mfa_receipt_signing_key() -> bytes:
+    """R59 P0-03 / R61 P1-03: 向后兼容包装 — 返回当前签发密钥。
+
+    R61 P1-03 重构后, 签发应使用 _get_signing_key_and_kid()(同时返回 kid);
+    本函数仅保留以避免破坏外部引用, 返回当前签发密钥(忽略 kid)。
+    """
+    key, _kid = _get_signing_key_and_kid()
+    return key
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -625,7 +695,7 @@ def issue_mfa_receipt(
         ttl_seconds: 有效期(秒), 默认 300(5 分钟), R59 建议 2-5 分钟
 
     Returns:
-        token 字符串, 格式: v4.public.<payload_b64>.<signature_b64>
+        token 字符串, 格式: mfa1.<payload_b64>.<signature_b64>
 
     Raises:
         AppError: 签名密钥未配置(reason=signing_key_missing)、参数无效
@@ -675,7 +745,8 @@ def issue_mfa_receipt(
             },
         )
     # fail-closed: 密钥缺失抛 AppError
-    key = _get_mfa_receipt_signing_key()
+    # R61 P1-03: 使用密钥环获取当前签发密钥 + kid
+    key, kid = _get_signing_key_and_kid()
     now = int(time.time())
     payload = {
         "jti": uuid.uuid4().hex,
@@ -685,6 +756,8 @@ def issue_mfa_receipt(
         "amr": list(amr) if amr else [],
         "iat": now,
         "exp": now + int(ttl_seconds),
+        # R61 P1-03: kid 标识签名所用密钥, 验证时按 kid 选密钥(支持轮换)
+        "kid": kid,
     }
     # 紧凑 + 排序序列化, 保证 payload 字节确定性(签名实际覆盖 payload_b64)
     payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
@@ -706,17 +779,23 @@ def verify_mfa_receipt(
     """R59 P0-03: 验证 MFA receipt(签名 + 字段 + 有效期)。
 
     校验流程:
-      1. 解析 token 格式(v4.public.<payload_b64>.<signature_b64>)
-      2. 重算 HMAC-SHA256 签名, 常量时间比较(防伪造/时序攻击)
-      3. 解码 payload
-      4. 校验 jti 格式(R60 P0-02: 32 位 hex 或 36 位带横线 UUID)
-      5. 校验 action_hash 格式(R60 P0-02: 小写 64 位 hex SHA-256)
-      6. 校验 iat 落在 [now-skew, now+skew](R60 P0-02: 防伪造未来时间戳/陈旧 token)
-      7. 校验 exp - iat <= 300(R60 P0-02: 生命期上限 5 分钟)
-      8. 校验 exp 未过期(防伪造时间戳)
-      9. 校验 sub == expected_principal_id(批准人匹配)
-      10. 校验 purpose == expected_purpose(动作用途匹配)
-      11. 校验 action_hash == expected_action_hash(请求摘要匹配)
+      1. 解析 token 格式(mfa1.<payload_b64>.<signature_b64>)
+      2. 解码 payload
+      3. R61 P1-03: 从 payload 提取 kid, 按 kid 从密钥环选取验证密钥
+         (kid 不在密钥环中 → fail-closed, reason=unknown_kid)
+      4. 重算 HMAC-SHA256 签名, 常量时间比较(防伪造/时序攻击)
+      5. 校验 jti 格式(R60 P0-02: 32 位 hex 或 36 位带横线 UUID)
+      6. 校验 action_hash 格式(R60 P0-02: 小写 64 位 hex SHA-256)
+      7. 校验 iat 落在 [now-skew, now+skew](R60 P0-02: 防伪造未来时间戳/陈旧 token)
+      8. 校验 exp - iat <= 300(R60 P0-02: 生命期上限 5 分钟)
+      9. 校验 exp 未过期(防伪造时间戳)
+      10. 校验 sub == expected_principal_id(批准人匹配)
+      11. 校验 purpose == expected_purpose(动作用途匹配)
+      12. 校验 action_hash == expected_action_hash(请求摘要匹配)
+
+    R61 P1-03 密钥轮换: payload 中的 kid 标识签名所用密钥。验证时从密钥环
+    选取对应密钥(当前密钥或旧密钥 "previous")。kid 不在密钥环中 = 潜在攻击
+    或密钥已过期移除 → fail-closed。previous 密钥仅验证, 永不签发(轮换窗口)。
 
     本函数为纯密码学 + 字段校验, 不写 DB, 不消费 receipt(可多次调用查看)。
     一次性消费由 consume_mfa_receipt(jti) 原子完成。调用方典型流程:
@@ -729,11 +808,11 @@ def verify_mfa_receipt(
         expected_action_hash: 期望的请求摘要(request_hash)
 
     Returns:
-        解码后的 payload dict(含 jti/sub/purpose/action_hash/amr/iat/exp)
+        解码后的 payload dict(含 jti/sub/purpose/action_hash/amr/iat/exp/kid)
 
     Raises:
         AppError: 任何校验失败(格式/签名/过期/sub/purpose/action_hash 不匹配,
-                  或签名密钥未配置), 错误码 AUTH.MFA.RECEIPT_INVALID,
+                  kid 未知, 或签名密钥未配置), 错误码 AUTH.MFA.RECEIPT_INVALID,
                   params.reason 标识具体失败原因
     """
     if not token or not isinstance(token, str):
@@ -744,8 +823,8 @@ def verify_mfa_receipt(
                 "reason": "empty_token",
             },
         )
-    # 1. 解析 token 格式: v4.public.<payload_b64>.<signature_b64>
-    #    前缀 "v4.public" 自身含 ".", 因此先校验前缀再分割剩余部分
+    # 1. 解析 token 格式: mfa1.<payload_b64>.<signature_b64>
+    #    前缀 "mfa1" 不含 ".", 因此先校验前缀+"." 再分割剩余部分
     #    (payload_b64 / signature_b64 为 base64url 无填充, 不含 ".")
     expected_prefix = _MFA_RECEIPT_TOKEN_PREFIX + "."
     if not token.startswith(expected_prefix):
@@ -767,22 +846,7 @@ def verify_mfa_receipt(
             },
         )
     payload_b64, signature = rest_parts
-    # 2. 签名验证(fail-closed: 密钥缺失由 _get_mfa_receipt_signing_key 抛 AppError)
-    key = _get_mfa_receipt_signing_key()
-    expected_sig = _sign_receipt_payload(payload_b64, key)
-    if not hmac.compare_digest(expected_sig, signature):
-        logger.warning(
-            f"[admin.mfa] MFA receipt 签名不匹配 "
-            f"expected_principal={expected_principal_id}"
-        )
-        raise AppError(
-            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
-            params={
-                "user_id": expected_principal_id,
-                "reason": "signature_mismatch",
-            },
-        )
-    # 3. 解码 payload
+    # 2. 解码 payload(先解码以提取 kid, 再按 kid 选密钥验证签名)
     try:
         payload_json = _b64url_decode(payload_b64).decode("utf-8")
         payload = json.loads(payload_json)
@@ -793,6 +857,52 @@ def verify_mfa_receipt(
             params={
                 "user_id": expected_principal_id,
                 "reason": "payload_decode_failed",
+            },
+        )
+    # 3. R61 P1-03: 按 payload 中的 kid 从密钥环选取验证密钥
+    #    - 密钥环缺失当前密钥 → fail-closed(_get_mfa_receipt_keyring 抛 AppError)
+    #    - kid 不在密钥环中 → fail-closed(reason=unknown_kid), 潜在攻击或密钥已过期
+    #    - kid="previous" → 用旧密钥验证(轮换窗口, 旧 token 仍有效)
+    kid = payload.get("kid") if isinstance(payload, dict) else None
+    if not isinstance(kid, str) or not kid:
+        # 无 kid 字段(旧版 token 或被篡改)→ fail-closed
+        logger.warning(
+            f"[admin.mfa] MFA receipt 缺少 kid 字段 "
+            f"expected_principal={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "unknown_kid",
+            },
+        )
+    keyring = _get_mfa_receipt_keyring()
+    key = keyring.get(kid)
+    if key is None:
+        logger.warning(
+            f"[admin.mfa] MFA receipt kid={kid!r} 不在密钥环中(已知 kid: "
+            f"{list(keyring.keys())}) expected_principal={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "unknown_kid",
+            },
+        )
+    # 4. 签名验证(常量时间比较, 防时序攻击)
+    expected_sig = _sign_receipt_payload(payload_b64, key)
+    if not hmac.compare_digest(expected_sig, signature):
+        logger.warning(
+            f"[admin.mfa] MFA receipt 签名不匹配 kid={kid} "
+            f"expected_principal={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "signature_mismatch",
             },
         )
     # R60 P0-02: jti 格式校验(32 位 hex 或 36 位带横线 UUID, 防伪造/截断)

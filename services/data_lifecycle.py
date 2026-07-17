@@ -28,6 +28,7 @@ import datetime as _dt
 import json
 import os
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
@@ -441,14 +442,30 @@ async def _verify_break_glass_two_person_approval(
     # BEGIN IMMEDIATE 立即获取 RESERVED 锁,串行化并发写者(避免两个写者同时进入临界区)。
     consumed_at_now = now_utc.isoformat()
     now_unix = int(now_utc.timestamp())
-    try:
-        await store._db.execute("BEGIN IMMEDIATE")
-    except Exception as begin_err:
-        # 已处于事务中: 复用现有事务(不重新 BEGIN,也不主动 COMMIT)
-        # (与 cache_store.transaction() 一致的复用语义)
-        logger.debug(
-            f"[DataLifecycle] R60 P0-01: BEGIN IMMEDIATE 失败(复用现有事务): {begin_err}"
-        )
+    # R61 P0-02: 修复 BEGIN IMMEDIATE catch-all 误"复用现有事务"问题。
+    # 旧实现把所有 BEGIN IMMEDIATE 异常(锁竞争/连接损坏/I/O 错误)当作"已处于事务中,复用",
+    # 随后无条件 COMMIT,会擅自提交调用方事务。
+    # 现改为通过 `store._db.in_transaction` 精确判断:
+    # - 不在事务中 → BEGIN IMMEDIATE(串行化并发写者);失败抛 AppError(不再静默复用)
+    # - 已在外层事务中 → SAVEPOINT approval_consume 隔离(退出时 RELEASE/ROLLBACK TO,不提交调用方事务)
+    owns_transaction = not bool(getattr(store._db, "in_transaction", False))
+    _APPROVAL_SAVEPOINT = "approval_consume"
+    if owns_transaction:
+        try:
+            await store._db.execute("BEGIN IMMEDIATE")
+        except Exception as begin_err:
+            # BEGIN IMMEDIATE 失败(锁竞争/连接损坏/I/O 错误)→ 显式失败,
+            # 不再像旧实现那样静默"复用现有事务"并随后擅自 COMMIT 调用方事务。
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": f"begin_immediate_failed: {type(begin_err).__name__}: {begin_err}",
+                    "action_id": action_id,
+                },
+            ) from begin_err
+    else:
+        # 已在外层事务中: 用 SAVEPOINT 隔离本消费操作,不擅自 COMMIT 调用方事务。
+        await store._db.execute(f"SAVEPOINT {_APPROVAL_SAVEPOINT}")
     try:
         # 1. 确保 mfa_receipts 表存在(幂等 DDL,与 admin.mfa.consume_mfa_receipt 一致)
         await store._db.execute(
@@ -490,12 +507,19 @@ async def _verify_break_glass_two_person_approval(
             (consumed_at_now, action_id, consumed_at_now),
         )
         approval_affected = cursor.rowcount if cursor is not None else 0
-        # 4. 检查两侧 rowcount 均恰好为 2,任何不一致 → ROLLBACK 整体事务
+        # 4. 检查两侧 rowcount 均恰好为 2,任何不一致 → 回滚到事务/savepoint 起点
         # receipt_affected != 2: 某 jti 已被消费(重放)或消费失败
         # approval_affected != 2: 审批被并发消费/撤销/过期
         if receipt_affected != 2 or approval_affected != 2:
+            # R61 P0-02: owns_transaction → ROLLBACK 整个事务;
+            #   否则 ROLLBACK TO SAVEPOINT(保留调用方事务由其自行回滚/提交)
             try:
-                await store._db.rollback()
+                if owns_transaction:
+                    await store._db.rollback()
+                else:
+                    await store._db.execute(
+                        f"ROLLBACK TO SAVEPOINT {_APPROVAL_SAVEPOINT}"
+                    )
             except Exception as rollback_err:
                 logger.warning(
                     f"[DataLifecycle] R60 P0-01 rollback 失败 "
@@ -512,8 +536,13 @@ async def _verify_break_glass_two_person_approval(
                     "action_id": action_id,
                 },
             )
-        # 5. 两侧 CAS 均成功 → COMMIT(唯一提交点,在所有 rowcount 检查之后)
-        await store._db.commit()
+        # 5. 两侧 CAS 均成功 → 提交(唯一提交点,在所有 rowcount 检查之后)
+        # R61 P0-02: owns_transaction=True → COMMIT 整个事务;
+        #   owns_transaction=False → RELEASE SAVEPOINT(不提交调用方事务,仅提交本 savepoint 内的更改)
+        if owns_transaction:
+            await store._db.commit()
+        else:
+            await store._db.execute(f"RELEASE SAVEPOINT {_APPROVAL_SAVEPOINT}")
         logger.info(
             f"[DataLifecycle] R60 P0-01: 双人审批原子消费成功 "
             f"action_id={action_id} receipt_affected={receipt_affected} "
@@ -522,8 +551,15 @@ async def _verify_break_glass_two_person_approval(
     except AppError:
         raise
     except Exception as e:
+        # R61 P0-02: owns_transaction → ROLLBACK 整个事务;
+        #   否则 ROLLBACK TO SAVEPOINT(保留调用方事务)
         try:
-            await store._db.rollback()
+            if owns_transaction:
+                await store._db.rollback()
+            else:
+                await store._db.execute(
+                    f"ROLLBACK TO SAVEPOINT {_APPROVAL_SAVEPOINT}"
+                )
         except Exception as rollback_err:
             # rollback 失败不掩盖原异常,仅记录(原异常已在上层抛出)
             logger.warning(

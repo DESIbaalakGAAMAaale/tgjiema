@@ -8,8 +8,9 @@
     - retryable: 是否可重试(决定是否显示"重试"按钮)
     - severity: 严重级别(info/warning/error/critical)
     - safe_params: 可安全记录的参数名白名单
-    - telegram_presentation: Bot 端展示方式(short_hint/inline/silent)
-    - show_retry_button: 是否显示重试按钮(= retryable)
+    - telegram_presentation: Bot 端展示方式(short_hint/inline/silent/modal/toast)
+    - show_retry_button: 是否显示重试按钮(R61 P1-05: 独立显式设置,
+      通常等于 retryable 但可独立覆盖)
 
 用法:
     python scripts/export_error_codes_frontend.py
@@ -56,10 +57,14 @@ def main() -> int:
                 "severity": "严重级别(info/warning/error/critical)",
                 "safe_params": "可安全记录的参数名白名单",
                 "telegram_presentation": (
-                    "Bot 端展示方式: short_hint(短提示+查看详情)/"
-                    "inline(直接展开,用于 critical)/silent(不展示,用于 info)"
+                    "Bot 端展示方式(R61 P1-05 显式字段): "
+                    "short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/"
+                    "silent(不展示,用于 info)/modal/toast(预留扩展)"
                 ),
-                "show_retry_button": "是否显示重试按钮(= retryable)",
+                "show_retry_button": (
+                    "是否显示重试按钮(R61 P1-05: 独立显式设置,"
+                    "通常等于 retryable 但可独立覆盖)"
+                ),
             },
             "enum_count": len(list(ErrorEnum)),
         },

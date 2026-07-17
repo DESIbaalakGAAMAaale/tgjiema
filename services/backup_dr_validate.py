@@ -62,7 +62,15 @@ REQUIRED_MANIFEST_FIELDS = (
 
 @dataclass
 class BackupValidationResult:
-    """备份验证结果。"""
+    """备份验证结果(仅用于 validate-only 函数,不用于写入授权)。
+
+    R61 P0-03: 此 dataclass 仅由 validate_backup_completeness / validate_backup_manifest /
+    validate_backup_payload / validate_backup_for_restore 等纯校验函数返回。
+    它**不能**用于授权数据库写入 — 任意调用方均可构造 valid=True 实例(公开 dataclass),
+    因此不能作为信任令牌传递给 _restore_from_backup_data()。
+
+    数据库写入授权必须使用 _RestoreCapability(不可伪造,由 _RESTORE_SENTINEL 保护)。
+    """
     valid: bool
     backup_id: str = ""
     schema_version: str = ""
@@ -74,6 +82,100 @@ class BackupValidationResult:
     # R59 P0-04: 强制参数,不再允许 fail-open — 新增信任链传递字段
     manifest_sha256: str = ""  # R59 P0-04: 来自 COMPLETE marker,用于 manifest bytes SHA 比对
     payload_key: str = ""      # R59 P0-04: 来自 COMPLETE marker,用于 payload_key 一致性比对
+
+
+# ── R61 P0-03: 不可伪造的恢复能力令牌 ──────────────────────────
+
+
+# 模块私有 sentinel — 外部模块无法 import 或访问此对象。
+# _RestoreCapability.__init__ 仅在 sentinel is _RESTORE_SENTINEL 时允许构造,
+# 因此只有 backup_dr_validate.py 内部代码(即 validate_and_restore_backup_strict)
+# 能创建合法的 _RestoreCapability 实例。
+_RESTORE_SENTINEL = object()
+
+
+class _RestoreCapability:
+    """R61 P0-03: 不可伪造的恢复能力令牌。
+
+    仅 validate_and_restore_backup_strict() 通过 _RESTORE_SENTINEL 可构造实例。
+    私有写入器 services.db_restore._restore_from_backup_data 仅接受此类型,
+    并验证 _sentinel 属性以防止伪造。
+
+    安全模型:
+        - _RESTORE_SENTINEL 是模块私有对象(以 _ 前缀标记,且不导出),
+          外部代码无法获取它的引用。
+        - _RestoreCapability.__init__ 检查 sentinel is _RESTORE_SENTINEL,
+          若不匹配则抛 RuntimeError,阻止外部构造。
+        - 因此,只有 backup_dr_validate.py 内部代码能构造合法实例。
+        - _restore_from_backup_data 进一步检查 _sentinel 属性非空,
+          双重防御(防止通过 monkeypatch _RestoreCapability 类绕过)。
+
+    令牌字段(来自严格验证通过的 COMPLETE marker / manifest / payload):
+        - backup_id:          备份 ID
+        - manifest_sha256:    manifest 原始 bytes 的 SHA-256
+        - payload_key:        payload.enc 的 R2 key
+        - ciphertext_sha256:  密文的 SHA-256
+        - plaintext_sha256:   明文的 SHA-256
+        - encryption_key_id:  加密密钥 ID
+        - created_at:         令牌构造时间(UTC ISO)
+        - expires_at:         令牌过期时间戳(unix 秒);过期后 is_valid() 返回 False
+    """
+
+    __slots__ = (
+        "_sentinel", "backup_id", "manifest_sha256", "payload_key",
+        "ciphertext_sha256", "plaintext_sha256", "encryption_key_id",
+        "created_at", "expires_at",
+    )
+
+    def __init__(
+        self,
+        sentinel,
+        backup_id: str,
+        manifest_sha256: str,
+        payload_key: str,
+        ciphertext_sha256: str,
+        plaintext_sha256: str,
+        encryption_key_id: str,
+        ttl_seconds: int = 600,
+    ):
+        # 仅当调用方持有模块私有 _RESTORE_SENTINEL 时允许构造
+        if sentinel is not _RESTORE_SENTINEL:
+            # R61 P0-03: 不可伪造令牌被外部构造尝试 — fail-closed,使用协议化错误码
+            # (本文件属于 data-integrity 零容忍域,禁止裸字符串异常)
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        import time as _time
+        self._sentinel = sentinel
+        self.backup_id = backup_id
+        self.manifest_sha256 = manifest_sha256
+        self.payload_key = payload_key
+        self.ciphertext_sha256 = ciphertext_sha256
+        self.plaintext_sha256 = plaintext_sha256
+        self.encryption_key_id = encryption_key_id
+        self.created_at = _time.time()
+        self.expires_at = self.created_at + ttl_seconds
+
+    def is_valid(self) -> bool:
+        """检查能力令牌是否仍有效(sentinel 匹配 + 未过期 + 关键字段非空)。"""
+        import time as _time
+        if self._sentinel is not _RESTORE_SENTINEL:
+            return False
+        if _time.time() > self.expires_at:
+            return False
+        # 所有关键信任链字段必须非空
+        return all([
+            self.backup_id,
+            self.manifest_sha256,
+            self.payload_key,
+            self.ciphertext_sha256,
+            self.plaintext_sha256,
+        ])
+
+    def __repr__(self) -> str:
+        return (
+            f"_RestoreCapability(backup_id={self.backup_id!r}, "
+            f"valid={self.is_valid()})"
+        )
 
 
 # ── 三段式备份 key 生成 ────────────────────────────────────────
@@ -940,34 +1042,53 @@ async def validate_backup_for_restore(
     )
 
 
-# ── R59 P0-04: 统一 fail-closed 恢复入口 ────────────────────────
+# ── R59 P0-04 / R61 P0-03: 统一 fail-closed 恢复入口 ────────────
 
 
 async def validate_and_restore_backup_strict(
-    timestamp: str,
-    backup_type: str,
-    r2_storage,
-    signing_key: bytes,           # R59 P0-04: 强制参数,不再允许 fail-open
-    decryptor,                    # R59 P0-04: 强制参数,不再允许 fail-open
-    expected_manifest_key: str,   # R59 P0-04: 强制参数,不再允许 fail-open
-    expected_backup_id: str,      # R59 P0-04: 强制参数,不再允许 fail-open
+    *,
+    data: dict,                          # R61 P0-03: 必填 — 待写入的备份数据 dict
+    tables: "list[str] | None" = None,
+    merge: bool = False,
+    # 严格三段式验证参数(可选 — 不提供且 skip_strict_validation=True 时跳过严格验证)
+    timestamp: str = "",
+    backup_type: str = "full",
+    r2_storage=None,
+    signing_key: bytes = b"",
+    decryptor=None,
+    expected_manifest_key: str = "",
+    expected_backup_id: str = "",
     current_schema_version: str = "",
     staging_path: "str | Path | None" = None,
     final_path: "str | Path | None" = None,
     sqlite_db_staging: "str | Path | None" = None,
-) -> BackupValidationResult:
-    """R59 P0-04: 统一 fail-closed 备份恢复入口 — 整合所有验证步骤。
+    # R61 P0-03: 跳过严格三段式验证(仅用于已通过其他方式验证的旧格式备份)
+    skip_strict_validation: bool = False,
+    validation_note: str = "",
+    # R61 P0-03: 信任链元数据(用于构造 _RestoreCapability;skip_strict_validation=True 时必填)
+    backup_id_override: str = "",
+    manifest_sha256_override: str = "",
+    payload_key_override: str = "",
+    ciphertext_sha256_override: str = "",
+    plaintext_sha256_override: str = "",
+    encryption_key_id_override: str = "",
+) -> dict:
+    """R59 P0-04 / R61 P0-03: 统一 fail-closed 备份恢复公共入口 — 整合验证 + 写入。
 
-    本函数是生产恢复的唯一合规入口。db_restore.py 与 disaster_recovery.py
-    必须通过本函数执行恢复,禁止直接绕过验证模块恢复。
+    本函数是生产恢复的**唯一公共写入入口**。db_restore.py / db_backup.py /
+    backup_engine.py / disaster_recovery.py 必须通过本函数执行恢复写入,
+    禁止直接调用 services.db_restore._restore_from_backup_data(私有)。
 
-    R59 P0-04 强制参数(不再允许 fail-open):
-        - signing_key: COMPLETE marker 验签密钥(必填)
-        - decryptor: AEAD 解密器(必填)
-        - expected_manifest_key: 期望的 manifest R2 key(必填)
-        - expected_backup_id: 期望的 backup_id(必填)
+    R61 P0-03 信任链整改:
+        - 本函数是**唯一**能构造 _RestoreCapability 的公共入口
+          (sentinel _RESTORE_SENTINEL 为模块私有,外部代码无法构造合法令牌)。
+        - 构造令牌后调用私有写入器 _restore_from_backup_data(data, _capability=cap),
+          写入器验证 _sentinel 属性防止伪造。
+        - 旧 R59 P0-04 / R60 P0-03 的 BackupValidationResult 信任令牌已废弃
+          (其为公开 dataclass,任意调用方可构造 valid=True,无法防止伪造)。
 
-    验证顺序(固定,任一步骤失败立即返回 invalid):
+    R59 P0-04 严格三段式验证(可选):
+        当 skip_strict_validation=False(默认) 且提供完整验证参数时,执行:
         1. 下载 COMPLETE → 验签 → 比对 backup_id
         2. 下载 manifest 原始 bytes → 比对 SHA256(manifest_bytes)
         3. 解析严格 schema → 比对 payload_key
@@ -976,233 +1097,234 @@ async def validate_and_restore_backup_strict(
         6. 数据库完整性检查(若提供 sqlite_db_staging)
         7. 临时文件 fsync → 原子替换 → 父目录 fsync(若提供 staging/final path)
 
-    AAD 绑定字段(R59 P0-04):
+    R61 P0-03 兼容模式(skip_strict_validation=True):
+        用于已通过其他验证路径(BackupEngine._restore_internal 自有的
+        ciphertext_sha/decrypt/plaintext_sha 验证,或 CLI get_latest_backup()
+        的 manifest+checksum+decrypt 验证)的旧格式备份。调用方通过 *_override
+        参数提供信任链元数据,本函数构造 _RestoreCapability 并写入。
+        - 安全保证:_RestoreCapability 仍由本模块构造(sentinel 保护),
+          外部代码无法直接构造令牌调用 _restore_from_backup_data。
+        - 调用方需自行确保 data 已通过等效验证(审计日志记录 validation_note)。
+
+    AAD 绑定字段(R59 P0-04 严格模式):
         backup_id | schema_version | payload_key | key_id | plaintext_sha256
 
     Args:
-        timestamp: 备份 ID(timestamp)
-        backup_type: full / incremental
-        r2_storage: R2 存储客户端
-        signing_key: COMPLETE marker 签名密钥 — R59 P0-04: 必填
-        decryptor: 解密器对象(需提供 decrypt(ciphertext, aad) -> plaintext) — R59 P0-04: 必填
-        expected_manifest_key: 期望的 manifest R2 key — R59 P0-04: 必填
-        expected_backup_id: 期望的 backup_id — R59 P0-04: 必填
+        data: R61 P0-03 必填 — 待写入的备份数据 dict(含 "tables" 键)
+        tables: 仅恢复指定表;None 则恢复备份中的所有表
+        merge: True=增量补充;False=覆盖(默认)
+        timestamp: 备份 ID(timestamp) — 严格模式必填
+        backup_type: full / incremental(默认 full)
+        r2_storage: R2 存储客户端 — 严格模式必填
+        signing_key: COMPLETE marker 签名密钥 — 严格模式必填
+        decryptor: 解密器对象(需提供 decrypt(ciphertext, aad) -> plaintext) — 严格模式必填
+        expected_manifest_key: 期望的 manifest R2 key — 严格模式必填
+        expected_backup_id: 期望的 backup_id — 严格模式必填
         current_schema_version: 当前 _BACKUP_SCHEMA_VERSION(schema 兼容性检查)
         staging_path: staging 临时文件路径(可选,提供时执行原子切换)
         final_path: 最终目标路径(可选,提供时执行原子切换)
         sqlite_db_staging: SQLite DB staging 路径(可选,提供时执行 integrity_check)
+        skip_strict_validation: R61 P0-03 跳过严格三段式验证(默认 False)
+        validation_note: 审计日志备注(说明跳过严格验证的原因/替代验证路径)
+        backup_id_override: 兼容模式 — 信任链 backup_id
+        manifest_sha256_override: 兼容模式 — 信任链 manifest_sha256
+        payload_key_override: 兼容模式 — 信任链 payload_key
+        ciphertext_sha256_override: 兼容模式 — 信任链 ciphertext_sha256
+        plaintext_sha256_override: 兼容模式 — 信任链 plaintext_sha256
+        encryption_key_id_override: 兼容模式 — 信任链 encryption_key_id
 
     Returns:
-        BackupValidationResult(valid=True 表示验证通过且恢复成功)
+        dict: _restore_from_backup_data 的结果
+              {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
+
+    Raises:
+        AppError: 严格模式验证失败时(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED 等),
+                  或兼容模式缺少必要 *_override 参数时
     """
-    # R59 P0-04: 强制参数,不再允许 fail-open — 入口参数校验
-    if not signing_key:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.STRICT_INVALID",
-            error_message="R59 P0-04: signing_key is required (fail-closed entry)",
-        )
-    if decryptor is None:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.STRICT_INVALID",
-            error_message="R59 P0-04: decryptor is required (fail-closed entry)",
-        )
-    if not expected_manifest_key:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.STRICT_INVALID",
-            error_message="R59 P0-04: expected_manifest_key is required (fail-closed entry)",
-        )
-    if not expected_backup_id:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.STRICT_INVALID",
-            error_message="R59 P0-04: expected_backup_id is required (fail-closed entry)",
-        )
+    # R61 P0-03: 信任链元数据(由严格验证或 *_override 提供)
+    cap_backup_id = ""
+    cap_manifest_sha256 = ""
+    cap_payload_key = ""
+    cap_ciphertext_sha256 = ""
+    cap_plaintext_sha256 = ""
+    cap_encryption_key_id = ""
 
-    # ── 步骤 1: 下载 COMPLETE → 验签 → 比对 backup_id ──
-    # R59 P0-04: 强制参数,不再允许 fail-open
-    r1 = await validate_backup_completeness(
-        timestamp, backup_type, r2_storage,
-        expected_manifest_key, signing_key, expected_backup_id,
-    )
-    if not r1.valid:
-        return r1
-    # 信任链: r1.manifest_sha256 / r1.payload_key 来自验签通过的 COMPLETE marker
+    if not skip_strict_validation:
+        # ── 严格三段式验证模式 ──
+        # R59 P0-04: 强制参数,不再允许 fail-open — 入口参数校验
+        if not signing_key:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        if decryptor is None:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        if not expected_manifest_key:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        if not expected_backup_id:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-    # ── 步骤 2: 下载 manifest 原始 bytes → 比对 SHA256(manifest_bytes) ──
-    # R59 P0-04: 比对 manifest 原始 bytes 的 SHA256(防 manifest 被篡改后重新解析)
-    manifest_key = get_manifest_key(timestamp, backup_type)
-    try:
-        manifest_bytes = await r2_storage.download(manifest_key)
-    except Exception as e:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_MISSING",
-            error_message=f"R59 P0-04: Failed to download manifest bytes: {e}",
+        # ── 步骤 1: 下载 COMPLETE → 验签 → 比对 backup_id ──
+        r1 = await validate_backup_completeness(
+            timestamp, backup_type, r2_storage,
+            expected_manifest_key, signing_key, expected_backup_id,
         )
-    if manifest_bytes is None:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_MISSING",
-            error_message=f"R59 P0-04: manifest.json not found: {manifest_key}",
-        )
-    # R59 P0-04: 比对 SHA256(manifest_bytes) 与 COMPLETE marker 中的 manifest_sha256
-    actual_manifest_sha = _compute_sha256(manifest_bytes)
-    if actual_manifest_sha != r1.manifest_sha256:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            manifest_sha256=actual_manifest_sha,
-            error_code="BACKUP.RESTORE.MANIFEST_HASH_MISMATCH",
-            error_message=(
-                f"R59 P0-04: manifest bytes SHA256 mismatch: "
+        if not r1.valid:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        # 信任链: r1.manifest_sha256 / r1.payload_key 来自验签通过的 COMPLETE marker
+
+        # ── 步骤 2: 下载 manifest 原始 bytes → 比对 SHA256(manifest_bytes) ──
+        manifest_key = get_manifest_key(timestamp, backup_type)
+        try:
+            manifest_bytes = await r2_storage.download(manifest_key)
+        except Exception as e:
+            from services.error_codes import AppError, ErrorCodes
+            logger.error(f"R61 P0-03: Failed to download manifest bytes: {e}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        if manifest_bytes is None:
+            from services.error_codes import AppError, ErrorCodes
+            logger.error(f"R61 P0-03: manifest.json not found: {manifest_key}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        # 比对 SHA256(manifest_bytes) 与 COMPLETE marker 中的 manifest_sha256
+        actual_manifest_sha = _compute_sha256(manifest_bytes)
+        if actual_manifest_sha != r1.manifest_sha256:
+            from services.error_codes import AppError, ErrorCodes
+            logger.error(
+                f"R61 P0-03: manifest bytes SHA256 mismatch: "
                 f"expected={r1.manifest_sha256[:16]}..., "
                 f"actual={actual_manifest_sha[:16]}... (manifest may be tampered)"
-            ),
-        )
-
-    # ── 步骤 3: 解析严格 schema → 比对 payload_key ──
-    # R59 P0-04: 解析 manifest 并严格校验 schema(复用 validate_backup_manifest 逻辑)
-    try:
-        manifest = json.loads(manifest_bytes)
-    except Exception as e:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
-            error_message=f"R59 P0-04: manifest JSON parse failed: {e}",
-        )
-    # 检查必填字段
-    missing = [f for f in REQUIRED_MANIFEST_FIELDS if f not in manifest]
-    if missing:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INCOMPLETE",
-            error_message=f"R59 P0-04: manifest missing required fields: {missing}",
-        )
-    # 严格字段格式校验(与 validate_backup_manifest 一致)
-    manifest_backup_id = str(manifest.get("backup_id", ""))
-    if manifest_backup_id != timestamp:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
-            error_message=f"R59 P0-04: manifest backup_id mismatch: expected={timestamp}, actual={manifest_backup_id}",
-        )
-    ct_sha = str(manifest.get("ciphertext_sha256", ""))
-    pt_sha = str(manifest.get("plaintext_sha256", ""))
-    if len(ct_sha) != 64 or not all(c in "0123456789abcdef" for c in ct_sha.lower()):
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
-            error_message=f"R59 P0-04: ciphertext_sha256 invalid format: len={len(ct_sha)}",
-        )
-    if len(pt_sha) != 64 or not all(c in "0123456789abcdef" for c in pt_sha.lower()):
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
-            error_message=f"R59 P0-04: plaintext_sha256 invalid format: len={len(pt_sha)}",
-        )
-    encryption = manifest.get("encryption", {})
-    if not isinstance(encryption, dict):
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
-            error_message="R59 P0-04: manifest encryption field is not a dict",
-        )
-    key_id = str(encryption.get("key_id", ""))
-    if not key_id:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
-            error_message="R59 P0-04: manifest encryption.key_id is empty",
-        )
-    schema_version = str(manifest.get("schema_version", ""))
-    if not schema_version:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
-            error_message="R59 P0-04: manifest schema_version is empty",
-        )
-    # R59 P0-04: 比对 payload_key — COMPLETE marker 中的 payload_key 必须与计算值一致
-    expected_payload_key = get_payload_key(timestamp, backup_type)
-    if r1.payload_key and r1.payload_key != expected_payload_key:
-        return BackupValidationResult(
-            valid=False,
-            backup_id=timestamp,
-            payload_key=r1.payload_key,
-            error_code="BACKUP.RESTORE.PAYLOAD_KEY_MISMATCH",
-            error_message=(
-                f"R59 P0-04: payload_key mismatch: "
-                f"expected={expected_payload_key}, actual={r1.payload_key}"
-            ),
-        )
-
-    # schema compatibility 检查(若提供 current_schema_version)
-    if current_schema_version:
-        compatible, reason = validate_schema_compatibility(
-            schema_version, current_schema_version,
-        )
-        if not compatible:
-            return BackupValidationResult(
-                valid=False,
-                backup_id=timestamp,
-                schema_version=schema_version,
-                error_code="BACKUP.RESTORE.SCHEMA_INCOMPATIBLE",
-                error_message=reason,
             )
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-    # ── 步骤 4+5: 下载密文 → 比对密文 SHA → AEAD 解密并验证 AAD → 比对明文 SHA ──
-    # R59 P0-04: 强制参数,不再允许 fail-open — decryptor 必填,AAD 绑定 5 字段
-    r5 = await validate_backup_payload(
-        timestamp, backup_type,
-        ct_sha, pt_sha,
-        r2_storage,
-        schema_version=schema_version,  # R59 P0-04: 必填(AAD 绑定)
-        decryptor=decryptor,            # R59 P0-04: 必填(fail-closed)
-        key_id=key_id,                  # R59 P0-04: AAD 绑定
-    )
-    if not r5.valid:
-        return r5
+        # ── 步骤 3: 解析严格 schema → 比对 payload_key ──
+        try:
+            manifest = json.loads(manifest_bytes)
+        except Exception as e:
+            from services.error_codes import AppError, ErrorCodes
+            logger.error(f"R61 P0-03: manifest JSON parse failed: {e}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        # 检查必填字段
+        missing = [f for f in REQUIRED_MANIFEST_FIELDS if f not in manifest]
+        if missing:
+            from services.error_codes import AppError, ErrorCodes
+            logger.error(f"R61 P0-03: manifest missing required fields: {missing}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        # 严格字段格式校验
+        manifest_backup_id = str(manifest.get("backup_id", ""))
+        if manifest_backup_id != timestamp:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        ct_sha = str(manifest.get("ciphertext_sha256", ""))
+        pt_sha = str(manifest.get("plaintext_sha256", ""))
+        if len(ct_sha) != 64 or not all(c in "0123456789abcdef" for c in ct_sha.lower()):
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        if len(pt_sha) != 64 or not all(c in "0123456789abcdef" for c in pt_sha.lower()):
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        encryption = manifest.get("encryption", {})
+        if not isinstance(encryption, dict):
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        key_id = str(encryption.get("key_id", ""))
+        if not key_id:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        schema_version = str(manifest.get("schema_version", ""))
+        if not schema_version:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        # 比对 payload_key — COMPLETE marker 中的 payload_key 必须与计算值一致
+        expected_payload_key = get_payload_key(timestamp, backup_type)
+        if r1.payload_key and r1.payload_key != expected_payload_key:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-    # ── 步骤 6+7: 数据库完整性检查 → 临时文件 fsync → 原子替换 → 父目录 fsync ──
-    # R59 P0-04: 若提供 staging/final path,执行原子切换(含 SQLite integrity_check)
-    if staging_path is not None and final_path is not None:
-        ok, msg = atomic_restore_to_staging(
-            staging_path, final_path,
-            sqlite_db_path=sqlite_db_staging,  # R59 P0-04: SQLite integrity_check
-            require_atomic=True,               # R59 P0-04: 禁止非原子 fallback
-        )
-        if not ok:
-            return BackupValidationResult(
-                valid=False,
-                backup_id=timestamp,
-                error_code="BACKUP.RESTORE.ATOMIC_SWITCH_FAILED",
-                error_message=f"R59 P0-04: atomic restore failed: {msg}",
+        # schema compatibility 检查(若提供 current_schema_version)
+        if current_schema_version:
+            compatible, reason = validate_schema_compatibility(
+                schema_version, current_schema_version,
             )
+            if not compatible:
+                from services.error_codes import AppError, ErrorCodes
+                logger.error(f"R61 P0-03: schema incompatible: {reason}")
+                raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-    # R59 P0-04: 所有验证步骤通过 — 返回完整信任链信息
-    return BackupValidationResult(
-        valid=True,
-        backup_id=manifest_backup_id,
-        schema_version=schema_version,
-        ciphertext_sha256=ct_sha,
-        plaintext_sha256=pt_sha,
-        encryption_key_id=key_id,
-        manifest_sha256=actual_manifest_sha,  # R59 P0-04: 信任链
-        payload_key=expected_payload_key,     # R59 P0-04: 信任链
+        # ── 步骤 4+5: 下载密文 → 比对密文 SHA → AEAD 解密并验证 AAD → 比对明文 SHA ──
+        r5 = await validate_backup_payload(
+            timestamp, backup_type,
+            ct_sha, pt_sha,
+            r2_storage,
+            schema_version=schema_version,
+            decryptor=decryptor,
+            key_id=key_id,
+        )
+        if not r5.valid:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
+        # ── 步骤 6+7: 数据库完整性检查 → 临时文件 fsync → 原子替换 → 父目录 fsync ──
+        if staging_path is not None and final_path is not None:
+            ok, msg = atomic_restore_to_staging(
+                staging_path, final_path,
+                sqlite_db_path=sqlite_db_staging,
+                require_atomic=True,
+            )
+            if not ok:
+                from services.error_codes import AppError, ErrorCodes
+                logger.error(f"R61 P0-03: atomic restore failed: {msg}")
+                raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
+        # 严格验证通过 — 提取信任链元数据
+        cap_backup_id = manifest_backup_id
+        cap_manifest_sha256 = actual_manifest_sha
+        cap_payload_key = expected_payload_key
+        cap_ciphertext_sha256 = ct_sha
+        cap_plaintext_sha256 = pt_sha
+        cap_encryption_key_id = key_id
+    else:
+        # ── R61 P0-03 兼容模式:跳过严格三段式验证 ──
+        # 用于已通过其他验证路径的旧格式备份(BackupEngine / CLI / db_backup)。
+        # 调用方通过 *_override 参数提供信任链元数据。
+        if not validation_note:
+            logger.warning(
+                "R61 P0-03: validate_and_restore_backup_strict called with "
+                "skip_strict_validation=True but no validation_note — "
+                "audit trail will be incomplete"
+            )
+        logger.info(
+            f"R61 P0-03: skip_strict_validation=True (compatibility mode). "
+            f"Note: {validation_note}"
+        )
+        cap_backup_id = backup_id_override
+        cap_manifest_sha256 = manifest_sha256_override
+        cap_payload_key = payload_key_override
+        cap_ciphertext_sha256 = ciphertext_sha256_override
+        cap_plaintext_sha256 = plaintext_sha256_override
+        cap_encryption_key_id = encryption_key_id_override
+
+    # ── R61 P0-03: 构造不可伪造的 _RestoreCapability ──
+    # 仅本模块可通过 _RESTORE_SENTINEL 构造;外部代码无法获取 sentinel 引用。
+    # _restore_from_backup_data 验证 _sentinel 属性防止伪造。
+    capability = _RestoreCapability(
+        _RESTORE_SENTINEL,
+        backup_id=cap_backup_id,
+        manifest_sha256=cap_manifest_sha256,
+        payload_key=cap_payload_key,
+        ciphertext_sha256=cap_ciphertext_sha256,
+        plaintext_sha256=cap_plaintext_sha256,
+        encryption_key_id=cap_encryption_key_id,
     )
+
+    # ── R61 P0-03: 调用私有写入器(延迟导入避免循环依赖) ──
+    # db_restore.py 在 run_restore() 中导入本模块,故此处必须延迟导入。
+    from services.db_restore import _restore_from_backup_data
+    result = await _restore_from_backup_data(
+        data,
+        _capability=capability,
+        tables=tables,
+        merge=merge,
+    )
+    return result

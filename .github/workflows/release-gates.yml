@@ -416,10 +416,13 @@ jobs:
     needs: [docker-build]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     # R46 P0-5: 删除 continue-on-error,签名失败必须阻断发布
+    # R61 P0-04: cosign sign 默认把签名推回 GHCR (sha256-<digest>.sig 标签),
+    # 需要 packages: write;actions/attest-build-provenance push-to-registry: true 同理。
+    # 原 packages: read 导致 403 Forbidden,签名推送失败。
     permissions:
       contents: read
       id-token: write
-      packages: read   # R58 P0-1: 仅读取已 push 的镜像 (build 在 docker-build 已完成)
+      packages: write  # R61 P0-04: cosign sign 推送签名 + attest-build-provenance push-to-registry
       # R53: actions/attest-build-provenance 创建 attestation 需要此权限
       attestations: write
     steps:
@@ -431,7 +434,8 @@ jobs:
         cosign-release: 'v2.2.3'
 
     # R58 P0-1: 只需读取 (build 已在 docker-build job 完成, 不重新构建)
-    - name: Login to GHCR (read-only, for cosign verify)
+    # R61 P0-04: cosign sign 推送签名也需要 GHCR write, login 用 GITHUB_TOKEN
+    - name: Login to GHCR (for cosign sign/verify + attestation push)
       uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
       with:
         registry: ghcr.io
@@ -463,7 +467,7 @@ jobs:
         echo "Signing image: ${IMAGE_REF}"
         echo "R60 P0-06: diagnostic info for cosign keyless signing failures"
         echo "  cosign version: $(cosign version 2>&1 || echo 'unknown')"
-        echo "  AWS_OIDC.isPresent: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL != '' }}"
+        echo "  GH_OIDC.isPresent: $( [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo true || echo false )"
         echo "  github.ref: ${{ github.ref }}"
         echo "  github.event_name: ${{ github.event_name }}"
         echo "  repository: ${{ github.repository }}"

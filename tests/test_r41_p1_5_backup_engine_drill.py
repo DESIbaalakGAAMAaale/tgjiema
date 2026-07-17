@@ -427,7 +427,7 @@ class TestScenario8StagingRestoreNoDbWrite:
             return {"restored_tables": 0, "restored_rows": 0}
 
         monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data",
+            "services.db_restore._restore_from_backup_data",
             _spy_restore_from_backup_data,
         )
 
@@ -462,7 +462,7 @@ class TestScenario8StagingRestoreNoDbWrite:
             return {"restored_tables": 2, "restored_rows": 3}
 
         monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data",
+            "services.db_restore._restore_from_backup_data",
             _spy_restore_from_backup_data,
         )
 

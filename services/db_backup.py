@@ -793,18 +793,18 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
     data = json.loads(content)
 
     # R35 P1-4: 委托给单一 Restore Engine
-    # R60 P0-03: restore_from_backup_data 强制信任令牌(fail-closed);
-    # 本入口已下载备份并解析 JSON,视为合规调用方,构造 valid=True 令牌。
-    # 生产恢复应优先走 validate_and_restore_backup_strict fail-closed 入口。
-    from services.db_restore import restore_from_backup_data
-    from services.backup_dr_validate import BackupValidationResult
-    _r60_restore_token = BackupValidationResult(
-        valid=True,
-        backup_id=str(data.get("backup_time", "")),
-    )
-    return await restore_from_backup_data(
-        data,
-        _r59_validation_token=_r60_restore_token,
+    # R61 P0-03: 路由通过 validate_and_restore_backup_strict() 公共入口
+    # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
+    # 本入口已下载备份并解析 JSON,但未做三段式严格验证(旧格式 db_backup_*.json),
+    # 通过 skip_strict_validation=True + *_override 提供信任链元数据。
+    from services.backup_dr_validate import validate_and_restore_backup_strict
+    return await validate_and_restore_backup_strict(
+        data=data,
         tables=tables,
         merge=merge,
+        # 旧格式备份:已通过 r2_storage.download + json.loads 加载
+        # 跳过严格三段式验证(storage/signing_key/decryptor 等参数留空)
+        skip_strict_validation=True,
+        validation_note=f"db_backup.restore_from_backup: legacy key={key}",
+        backup_id_override=str(data.get("backup_time", "")),
     )
