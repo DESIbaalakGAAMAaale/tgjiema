@@ -479,6 +479,122 @@ def _load_baseline_count(baseline_path: Path | None) -> int:
         return 0
 
 
+# ════════════════════════════════════════════════════════════
+# R58 P0-5: Domain-aware baseline 分类
+# ════════════════════════════════════════════════════════════
+
+# domain → path 前缀映射(与 baseline.json domains.*.paths 对应)
+# 文件路径匹配任一 domain.paths 即归入该 domain;未匹配的归入 "observability"
+DOMAIN_PATHS: dict[str, list[str]] = {
+    "security": [
+        "admin/passwords.py", "admin/mfa.py", "admin/auth.py",
+        "services/button_security.py", "services/approval_workflow.py",
+        "services/command_bus.py",
+    ],
+    "destructive": [
+        "services/data_lifecycle.py", "admin/purge.py",
+    ],
+    "data-integrity": [
+        "services/backup_dr_validate.py", "services/backup_crypto.py",
+        "services/crdb_sync_service.py", "services/crdb_sync_event_wakeup.py",
+        "database/redis_queue.py",
+    ],
+    "financial": [
+        "services/quota.py", "services/billing.py",
+    ],
+}
+
+# 零容忍 domain(security/destructive/data-integrity/financial)
+ZERO_TOLERANCE_DOMAINS: frozenset[str] = frozenset({
+    "security", "destructive", "data-integrity", "financial"
+})
+
+
+def _classify_domain(file_path: str) -> str:
+    """R58 P0-5: 根据文件路径分类 domain。
+
+    Args:
+        file_path: 相对路径(POSIX 格式)
+
+    Returns:
+        domain 名称(security/destructive/data-integrity/financial/observability)
+    """
+    for domain, paths in DOMAIN_PATHS.items():
+        for path in paths:
+            if file_path == path or file_path.startswith(path):
+                return domain
+    return "observability"
+
+
+def _check_domain_baseline(
+    findings: list[tuple[str, int, str]],
+    baseline_path: Path | None,
+) -> tuple[bool, str]:
+    """R58 P0-5: 按域名比对 baseline。
+
+    规则:
+        1. security/destructive/data-integrity/financial 域必须为 0(零容忍)
+        2. observability 域允许通过 baseline 放行(但 max_violations 不变)
+        3. 任何域新增违规都失败
+
+    Returns:
+        (passed, message)
+    """
+    if baseline_path is None or not baseline_path.exists():
+        # 无 baseline:所有 domain 违规都视为失败
+        domain_counts: dict[str, int] = {}
+        for file_path, _, _ in findings:
+            domain = _classify_domain(file_path)
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        zero_violations = {d: c for d, c in domain_counts.items() if d in ZERO_TOLERANCE_DOMAINS and c > 0}
+        if zero_violations:
+            return False, f"零容忍域有违规: {zero_violations}"
+        return True, "通过(无零容忍域违规)"
+
+    try:
+        data = json.loads(baseline_path.read_text(encoding="utf-8", errors="ignore"))
+    except (json.JSONDecodeError, OSError):
+        return False, "baseline 文件解析失败"
+
+    domains_cfg = data.get("domains", {})
+    # 分类 findings
+    domain_findings: dict[str, list[tuple[str, int, str]]] = {
+        "security": [], "destructive": [], "data-integrity": [],
+        "financial": [], "observability": [],
+    }
+    for file_path, line_no, detail in findings:
+        domain = _classify_domain(file_path)
+        domain_findings.setdefault(domain, []).append((file_path, line_no, detail))
+
+    # 检查每个 domain
+    failed_domains = []
+    for domain, domain_findings_list in domain_findings.items():
+        count = len(domain_findings_list)
+        domain_cfg = domains_cfg.get(domain, {})
+        max_violations = int(domain_cfg.get("max_violations", 0))
+        if domain in ZERO_TOLERANCE_DOMAINS:
+            # R58 P0-5 零容忍域:ratchet 策略
+            # - max_violations=0 表示目标(零容忍)
+            # - baseline_violations 记录历史快照,允许 current <= baseline_violations
+            # - 任何新增违规(count > baseline_violations)都失败
+            baseline_violations = int(domain_cfg.get("baseline_violations", max_violations))
+            if count > baseline_violations:
+                failed_domains.append(
+                    f"{domain}: {count} > baseline {baseline_violations} "
+                    f"(target=0, ratchet 模式不允许新增违规)"
+                )
+        else:
+            # observability:允许 <= max_violations
+            if count > max_violations:
+                failed_domains.append(
+                    f"{domain}: {count} > {max_violations} (max_violations)"
+                )
+
+    if failed_domains:
+        return False, "; ".join(failed_domains)
+    return True, "通过(所有 domain 在 baseline 范围内)"
+
+
 def _print_fix_suggestions() -> None:
     """打印修复建议。"""
     print()
@@ -552,27 +668,58 @@ def main() -> int:
     # ── 非 strict 模式:与 baseline 比对 ──
     baseline_count = _load_baseline_count(args.baseline)
 
+    # R58 P0-5: 先按 domain 分类检查(零容忍域必须为 0)
+    domain_passed, domain_msg = _check_domain_baseline(findings, args.baseline)
+    if not domain_passed:
+        print(
+            f"[FAIL] R58 P0-5 domain 检查失败: {domain_msg}"
+        )
+        print()
+        # 输出按 domain 分类的违规详情
+        domain_findings: dict[str, list] = {}
+        for file, line, detail in findings:
+            d = _classify_domain(file)
+            domain_findings.setdefault(d, []).append((file, line, detail))
+        for d, d_findings in domain_findings.items():
+            print(f"[{d}] ({len(d_findings)} violations):")
+            for file, line, detail in d_findings:
+                print(f"  {file}:{line}: {detail}")
+        _print_fix_suggestions()
+        print()
+        print("R58 P0-5: security/destructive/data-integrity/financial 域必须为 0")
+        print("修复后才能通过 CI 门禁")
+        return 1
+
     if current_count <= baseline_count:
         # 通过:违规数在 baseline 范围内
         print(
-            f"[OK] R56 P1-5 通过: 当前违规 {current_count} 处 "
+            f"[OK] R58 P0-5 通过: 当前违规 {current_count} 处 "
             f"<= baseline {baseline_count} 处"
         )
+        print(f"  domain 检查: {domain_msg}")
         if findings:
-            print("已有违规(在 baseline 范围内,不阻断):")
+            print("已有违规(在 baseline 范围内,observability 域,不阻断):")
             for file, line, detail in findings:
-                print(f"  {file}:{line}: {detail}")
+                d = _classify_domain(file)
+                print(f"  [{d}] {file}:{line}: {detail}")
         return 0
 
     # 失败:违规数超过 baseline
     print(
-        f"[FAIL] R56 P1-5 失败: 当前违规 {current_count} 处 "
+        f"[FAIL] R58 P0-5 失败: 当前违规 {current_count} 处 "
         f"> baseline {baseline_count} 处 (新增 {current_count - baseline_count} 处)"
     )
+    print(f"  domain 检查: {domain_msg}")
     print()
-    print("所有违规:")
+    print("所有违规(按 domain 分类):")
+    domain_findings2: dict[str, list] = {}
     for file, line, detail in findings:
-        print(f"  {file}:{line}: {detail}")
+        d = _classify_domain(file)
+        domain_findings2.setdefault(d, []).append((file, line, detail))
+    for d, d_findings in domain_findings2.items():
+        print(f"[{d}] ({len(d_findings)} violations):")
+        for file, line, detail in d_findings:
+            print(f"  {file}:{line}: {detail}")
     _print_fix_suggestions()
     print()
     print(

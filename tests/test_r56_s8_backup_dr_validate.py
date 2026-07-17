@@ -88,13 +88,26 @@ class TestThreeStageKeys:
         assert bt in p and bt in m and bt in c
 
     def test_complete_marker_content(self):
-        """COMPLETE 标记内容应含 backup_id + manifest_key + schema。"""
-        content = build_complete_marker("20260716", "db_backup/manifest_20260716_full.json")
+        """COMPLETE 标记内容应含 backup_id + manifest_key + schema + R58 P0-3 签名绑定字段。"""
+        content = build_complete_marker(
+            "20260716",
+            "db_backup/manifest_20260716_full.json",
+            manifest_sha256="a" * 64,
+            payload_key="db_backup/payload_20260716_full.enc",
+            payload_sha256="b" * 64,
+            signature="c" * 64,
+        )
         marker = json.loads(content)
         assert marker["backup_id"] == "20260716"
         assert marker["manifest_key"] == "db_backup/manifest_20260716_full.json"
-        assert marker["schema"] == "R56-§8-three-stage"
+        # R58 P0-3: schema 升级为签名版本
+        assert marker["schema"] == "R58-P0-3-signed-three-stage"
         assert "created_at" in marker
+        # R58 P0-3: 强绑定字段
+        assert marker["manifest_sha256"] == "a" * 64
+        assert marker["payload_key"] == "db_backup/payload_20260716_full.enc"
+        assert marker["payload_sha256"] == "b" * 64
+        assert marker["signature"] == "c" * 64
 
 
 # ════════════════════════════════════════════════════════════════
@@ -107,10 +120,19 @@ class TestValidateCompleteness:
 
     @pytest.mark.asyncio
     async def test_complete_marker_exists(self):
-        """COMPLETE 标记存在时返回 valid=True。"""
+        """COMPLETE 标记存在且 R58 P0-3 强绑定字段完整时返回 valid=True。"""
         mock_r2 = AsyncMock()
-        marker_content = build_complete_marker("20260716", "manifest_key")
+        # R58 P0-3: build_complete_marker 需要提供 manifest_sha256/payload_sha256/signature
+        marker_content = build_complete_marker(
+            "20260716",
+            "manifest_key",
+            manifest_sha256="a" * 64,
+            payload_key="payload_key",
+            payload_sha256="b" * 64,
+            signature="c" * 64,
+        )
         mock_r2.download = AsyncMock(return_value=marker_content)
+        # R58 P0-3: 不提供 signing_key 时跳过验签,但仍需校验 manifest_sha256/payload_sha256
         result = await validate_backup_completeness("20260716", "full", mock_r2)
         assert result.valid is True
         assert result.backup_id == "20260716"
@@ -144,13 +166,15 @@ class TestValidateManifest:
 
     def _build_valid_manifest(self) -> dict:
         """构建一个完整的有效 manifest。"""
+        # R58 P0-3: manifest.backup_id 必须与请求 timestamp 严格匹配
+        # (旧版 "20260716_120000" 与 "20260716" 不匹配,会触发 MANIFEST_INVALID)
         return {
             "version": "3.0",
-            "commit_sha": "abc123def456",
+            "commit_sha": "abc123def456abcdef1234567890abcdef123456",  # R58 P0-3: 40 hex
             "schema_version": "3.0",
             "plaintext_sha256": "a" * 64,
             "ciphertext_sha256": "b" * 64,
-            "backup_id": "20260716_120000",
+            "backup_id": "20260716",
             "content_size_bytes": 1024,
             "backup_started_at": "2026-07-16T12:00:00Z",
             "backup_finished_at": "2026-07-16T12:01:00Z",
@@ -203,14 +227,15 @@ class TestValidateManifest:
 
     @pytest.mark.asyncio
     async def test_manifest_without_encryption_key_id(self):
-        """manifest encryption.key_id 缺失时仍 valid(但 key_id 为空)。"""
+        """R58 P0-3: manifest encryption.key_id 缺失时拒绝恢复(严格校验,不允许空 key_id)。"""
         manifest = self._build_valid_manifest()
         manifest["encryption"] = {"encrypted": False, "algorithm": "none"}
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=json.dumps(manifest).encode())
         result = await validate_backup_manifest("20260716", "full", mock_r2)
-        assert result.valid is True
-        assert result.encryption_key_id == ""
+        assert result.valid is False
+        assert result.error_code == "BACKUP.RESTORE.MANIFEST_INVALID"
+        assert "encryption.key_id" in result.error_message
 
     def test_required_manifest_fields_complete(self):
         """REQUIRED_MANIFEST_FIELDS 应包含所有 §8 要求的字段。"""
@@ -380,17 +405,25 @@ class TestValidateBackupForRestore:
 
     @pytest.mark.asyncio
     async def test_all_validations_pass(self):
-        """所有验证通过时返回 valid=True。"""
+        """所有验证通过时返回 valid=True(R58 P0-3 强绑定字段完整)。"""
         import hashlib
-        # 准备 mock 数据
-        marker = build_complete_marker("20260716", "manifest_key")
+        # R58 P0-3: build_complete_marker 需要完整签名绑定字段
+        marker = build_complete_marker(
+            "20260716",
+            "manifest_key",
+            manifest_sha256="a" * 64,
+            payload_key="payload_key",
+            payload_sha256=hashlib.sha256(b"payload").hexdigest(),
+            signature="c" * 64,
+        )
         manifest = {
             "version": "3.0",
-            "commit_sha": "abc123",
+            # R58 P0-3: commit_sha 必须 40 hex
+            "commit_sha": "abc123def456abcdef1234567890abcdef123456",
             "schema_version": "3.0",
             "plaintext_sha256": "a" * 64,
             "ciphertext_sha256": hashlib.sha256(b"payload").hexdigest(),
-            "backup_id": "20260716",
+            "backup_id": "20260716",  # R58 P0-3: 严格匹配 timestamp
             "content_size_bytes": 100,
             "backup_started_at": "2026-07-16T12:00:00Z",
             "backup_finished_at": "2026-07-16T12:01:00Z",
@@ -426,11 +459,23 @@ class TestValidateBackupForRestore:
 
     @pytest.mark.asyncio
     async def test_short_circuit_on_manifest_missing(self):
-        """manifest 缺失时立即返回(不校验 payload)。"""
-        marker = build_complete_marker("20260716", "manifest_key")
+        """manifest 缺失时立即返回(不校验 payload)。
+
+        R58 P0-3: COMPLETE marker 必须包含 manifest_sha256/payload_sha256 强绑定字段,
+        否则视为 INVALID 而非 MISSING(防止伪造 COMPLETE 跳过 manifest 校验)。
+        """
+        # R58 P0-3: 完整签名的 marker 才能通过 validate_backup_completeness
+        marker = build_complete_marker(
+            "20260716",
+            "manifest_key",
+            manifest_sha256="a" * 64,
+            payload_key="payload_key",
+            payload_sha256="b" * 64,
+            signature="c" * 64,
+        )
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(side_effect=[
-            marker,  # COMPLETE 存在
+            marker,  # COMPLETE 存在且完整
             None,    # manifest 不存在
         ])
         result = await validate_backup_for_restore(
@@ -441,16 +486,26 @@ class TestValidateBackupForRestore:
 
     @pytest.mark.asyncio
     async def test_short_circuit_on_schema_incompatible(self):
-        """schema 不兼容时立即返回(不校验 payload)。"""
-        marker = build_complete_marker("20260716", "manifest_key")
+        """schema 不兼容时立即返回(不校验 payload)。
+
+        R58 P0-3: COMPLETE marker 必须包含强绑定字段才能进入 manifest 校验阶段。
+        """
+        marker = build_complete_marker(
+            "20260716",
+            "manifest_key",
+            manifest_sha256="a" * 64,
+            payload_key="payload_key",
+            payload_sha256="b" * 64,
+            signature="c" * 64,
+        )
         manifest = {
             "version": "3.0",
             "schema_version": "2.0",  # 主版本不兼容
             "plaintext_sha256": "a" * 64,
             "ciphertext_sha256": "b" * 64,
-            "backup_id": "20260716",
+            "backup_id": "20260716",  # R58 P0-3: 严格匹配 timestamp
             "encryption": {"encrypted": True, "key_id": "kek_v1"},
-            "commit_sha": "abc",
+            "commit_sha": "abc123def456abcdef1234567890abcdef123456",  # R58 P0-3: 40 hex
             "content_size_bytes": 100,
             "backup_started_at": "2026-07-16T12:00:00Z",
             "backup_finished_at": "2026-07-16T12:01:00Z",

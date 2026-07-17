@@ -448,6 +448,7 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         await real_store._db.commit()
         # R56 P0-2: 插入 command_approvals 表 2 条 break_glass 审批记录(双人审批)
         # 要求:≥2 个不同 approver + mfa_receipt 非空 + 非自审批(≠ principal_id=1)
+        # R58 P0-2: 新增强制字段 decision/request_hash/expires_at/consumed_at/revoked_at
         await real_store._db.execute(
             "CREATE TABLE IF NOT EXISTS command_approvals ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -459,17 +460,40 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             "metadata_json TEXT, "
             "UNIQUE(action_id, approver_id))"
         )
+        # R58 P0-2: 补列(幂等,重复添加忽略)
+        for col, col_def in [
+            ("decision", "TEXT NOT NULL DEFAULT 'approved'"),
+            ("request_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("permission", "TEXT NOT NULL DEFAULT ''"),
+            ("expires_at", "TEXT NOT NULL DEFAULT ''"),
+            ("consumed_at", "TEXT"),
+            ("revoked_at", "TEXT"),
+        ]:
+            try:
+                await real_store._db.execute(
+                    f"ALTER TABLE command_approvals ADD COLUMN {col} {col_def}"
+                )
+            except Exception:
+                pass  # 列已存在(幂等)
+        # R58 P0-2: 插入完整字段的审批记录(decision=approved, request_hash=64hex, 未过期/未消费/未撤销)
+        # 注意:expires_at 必须使用与 services/data_lifecycle._verify_break_glass_two_person_approval
+        # 中 now_iso = datetime.datetime.now().isoformat() 相同的时区(本地时间无 tz),
+        # 否则字符串比较会出错(UTC 05:xx < 本地 13:xx 误判为过期)。
+        import datetime as _dt_mod
+        future_iso = (_dt_mod.datetime.now() + _dt_mod.timedelta(hours=1)).isoformat()
         await real_store._db.execute(
             "INSERT INTO command_approvals "
-            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
-            "VALUES (?, ?, 'break_glass', ?, ?, NULL)",
-            (action_id, 2, "mfa_receipt_approver_2", now),
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
+            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
+            (action_id, 2, "mfa_receipt_approver_2", now, "a" * 64, future_iso),
         )
         await real_store._db.execute(
             "INSERT INTO command_approvals "
-            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
-            "VALUES (?, ?, 'break_glass', ?, ?, NULL)",
-            (action_id, 3, "mfa_receipt_approver_3", now),
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
+            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
+            (action_id, 3, "mfa_receipt_approver_3", now, "a" * 64, future_iso),
         )
         await real_store._db.commit()
 
@@ -537,6 +561,7 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
         )
         await real_store._db.commit()
         # R56 P0-2: 插入 command_approvals 表 2 条 break_glass 审批记录(双人审批)
+        # R58 P0-2: 新增强制字段 decision/request_hash/expires_at/consumed_at/revoked_at
         await real_store._db.execute(
             "CREATE TABLE IF NOT EXISTS command_approvals ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -548,17 +573,40 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             "metadata_json TEXT, "
             "UNIQUE(action_id, approver_id))"
         )
+        # R58 P0-2: 补列(幂等)
+        for col, col_def in [
+            ("decision", "TEXT NOT NULL DEFAULT 'approved'"),
+            ("request_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("permission", "TEXT NOT NULL DEFAULT ''"),
+            ("expires_at", "TEXT NOT NULL DEFAULT ''"),
+            ("consumed_at", "TEXT"),
+            ("revoked_at", "TEXT"),
+        ]:
+            try:
+                await real_store._db.execute(
+                    f"ALTER TABLE command_approvals ADD COLUMN {col} {col_def}"
+                )
+            except Exception:
+                pass  # 列已存在(幂等)
+        # R58 P0-2: 插入完整字段的审批记录(decision=approved, request_hash=64hex, 未过期/未消费/未撤销)
+        # 注意:expires_at 必须使用与 services/data_lifecycle._verify_break_glass_two_person_approval
+        # 中 now_iso = datetime.datetime.now().isoformat() 相同的时区(本地时间无 tz),
+        # 否则字符串比较会出错(UTC 05:xx < 本地 13:xx 误判为过期)。
+        import datetime as _dt_mod
+        future_iso = (_dt_mod.datetime.now() + _dt_mod.timedelta(hours=1)).isoformat()
         await real_store._db.execute(
             "INSERT INTO command_approvals "
-            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
-            "VALUES (?, ?, 'break_glass', ?, ?, NULL)",
-            (action_id, 2, "mfa_receipt_approver_2", now),
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
+            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
+            (action_id, 2, "mfa_receipt_approver_2", now, "a" * 64, future_iso),
         )
         await real_store._db.execute(
             "INSERT INTO command_approvals "
-            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json) "
-            "VALUES (?, ?, 'break_glass', ?, ?, NULL)",
-            (action_id, 3, "mfa_receipt_approver_3", now),
+            "(action_id, approver_id, approval_type, mfa_receipt, approved_at, metadata_json, "
+            "decision, request_hash, permission, expires_at, consumed_at, revoked_at) "
+            "VALUES (?, ?, 'break_glass', ?, ?, NULL, 'approved', ?, 'break_glass', ?, NULL, NULL)",
+            (action_id, 3, "mfa_receipt_approver_3", now, "a" * 64, future_iso),
         )
         await real_store._db.commit()
 

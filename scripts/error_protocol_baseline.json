@@ -1,5 +1,60 @@
 {
-  "description": "R56 P1-5 error protocol baseline (ratchet 下降,只减不增)",
-  "note": "fail-open/except pass/return 0|False 是 pre-existing 历史债务。修复后重新生成以下降 violation_count。",
-  "violation_count": 349
+  "description": "R58 P0-5 error protocol baseline (按 domain 分类,security/destructive/data-integrity/financial 目标为 0,ratchet 下降)",
+  "note": "R58 P0-5: fail-open/except pass/return 0|False 按 domain 分类管理。零容忍域 (security/destructive/data-integrity/financial) 目标 max_violations=0;采用 ratchet 策略:current <= baseline_violations 即通过,任何新增违规阻断 CI。observability best-effort 允许通过 max_violations 放行。修复后运行 --generate-baseline 下降 baseline_violations。",
+  "version": "R58-P0-5",
+  "ratchet_strategy": "zero-tolerance domains: current_count <= baseline_violations (block new debt); observability: current_count <= max_violations",
+  "domains": {
+    "security": {
+      "description": "认证、授权、MFA、密码、token、签名验证相关",
+      "max_violations": 0,
+      "baseline_violations": 27,
+      "paths": [
+        "admin/passwords.py",
+        "admin/mfa.py",
+        "admin/auth.py",
+        "services/button_security.py",
+        "services/approval_workflow.py",
+        "services/command_bus.py"
+      ]
+    },
+    "destructive": {
+      "description": "删除、清除、purge、reset 等不可逆操作",
+      "max_violations": 0,
+      "baseline_violations": 9,
+      "paths": [
+        "services/data_lifecycle.py",
+        "admin/purge.py"
+      ]
+    },
+    "data-integrity": {
+      "description": "备份、恢复、事务、outbox、数据一致性",
+      "max_violations": 0,
+      "baseline_violations": 35,
+      "paths": [
+        "services/backup_dr_validate.py",
+        "services/backup_crypto.py",
+        "services/crdb_sync_service.py",
+        "services/crdb_sync_event_wakeup.py",
+        "database/redis_queue.py"
+      ]
+    },
+    "financial": {
+      "description": "配额、计费、积分等财务相关",
+      "max_violations": 0,
+      "baseline_violations": 0,
+      "paths": [
+        "services/quota.py",
+        "services/billing.py"
+      ]
+    },
+    "observability": {
+      "description": "日志、metric、trace 等可观测性 best-effort",
+      "max_violations": 305,
+      "allowlist_required": true,
+      "allowlist": []
+    }
+  },
+  "total_max_violations": 305,
+  "violation_count": 349,
+  "previous_violation_count": 349
 }

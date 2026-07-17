@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R48 P1-c: 模块化 i18n 硬编码字符串扫描与逐模块下降门禁(scope 审批 + delta + classify)。
+"""R48 P1-c / R58 P1-4: 模块化 i18n 硬编码字符串扫描与逐模块下降门禁(AST sink-based)。
 
 历史:
     R44 6.3:   引入硬编码用户面向中文字符串扫描,baseline 机制(单一数字)。
@@ -10,14 +10,22 @@
                新增 --delta(CI base/head 比对)和 --classify(user_visible / log_only);
                --generate-baseline 强制 --reason,非 master 分支强制 --force;
                每个 user_visible 模块清零目标 0,log_only 鼓励减少但可保留。
+    R56 §5.1:  绝对门禁改造 — user_visible 必须 0(不允许通过更新 baseline 消除失败)。
+    R58 P1-4:  **sink-based AST 扫描**替代正则+CJK 过滤;不依赖字符集;
+               `reply_text/send_message/answer/HTTPException/detail` 等 sink
+               的字面量无论中英文都必须禁止,除非来自 `translate/ErrorEnvelope`。
+               classify 用 CJK 区分:user_visible(含 CJK 必须清零)/log_only(英文 baseline ratchet)。
 
-R48 P1-c 整改要点:
-    - R47 将 baseline 从 954 变为 1264,数字上升可能来自扫描范围变化,不代表债务下降。
-    - baseline.json 显式记录 scanner_version 与 included_paths,便于审计 scope 变化。
-    - --generate-baseline 模式:scope 变化需 --allow-scope-change,且需 --reason。
-    - --ratchet 模式:scope 变化拒绝更新(必须用 --generate-baseline --allow-scope-change)。
-    - CI 用 --delta 比对 base/head,任何模块 delta > 0 → exit 1。
-    - --classify 区分 user_visible 与 log_only,只对 user_visible 设清零目标。
+R58 P1-4 整改要点:
+    - 旧版只识别 CJK,英文用户文本可绕过门禁 → user_visible=0 不可信。
+    - 新版使用 AST 解析,识别 sink 调用节点,抽取所有字符串字面量(不依赖 CJK)。
+    - 来自 translate()/format_message_icu()/AppError/ErrorEnvelope 等的字面量豁免。
+    - classify_finding 用 CJK 区分:
+        * Python sink 调用 + CJK → user_visible(绝对门禁,必须 0)
+        * Python sink 调用 + 英文 → log_only(baseline ratchet,只允许非增加)
+        * HTML + CJK → user_visible
+        * HTML + 英文 → log_only
+    - logger./logging./print() 调用自然跳过(AST 不视为 sink)。
 
 模块划分(贴合真实目录):
     - bots/up_bot.py            (Up)
@@ -53,6 +61,7 @@ R48 P1-c 整改要点:
     python scripts/scan_hardcoded_strings.py --report
 """
 import argparse
+import ast
 import json
 import re
 import subprocess
@@ -62,20 +71,68 @@ from pathlib import Path
 
 # === 常量 ===
 
-# R48 P1-c: scanner 版本(scope/format 变化时递增)
-# R56 §5.1: 升级到 2.1(新增 user_visible/log_only 分类 + 绝对门禁)
-SCANNER_VERSION = "2.1"
+# R58 P1-4: scanner 版本(算法变更:正则+CJK 过滤 → AST sink-based)
+SCANNER_VERSION = "3.0"
 
-# 中文 Unicode 范围
+# 中文 Unicode 范围(用于 classify_finding 区分 user_visible 与 log_only)
 CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
 
-# 用户面向字符串模式(reply_text/answer/HTTPException/detail/f-string 等)
+# R58 P1-4: AST sink-based 扫描 — sink 函数名(Python)
+# 调用这些方法时,字符串字面量参数被视为用户面向输出
+PYTHON_SINK_FUNCS = frozenset({
+    # Telegram Bot sendMessage 系列
+    'reply_text', 'reply_photo', 'reply_document', 'reply_video', 'reply_audio',
+    'reply_animation', 'reply_media_group', 'reply_voice', 'reply_sticker',
+    'reply_location', 'reply_venue', 'reply_contact', 'reply_poll',
+    'reply_dice', 'reply_chat_action',
+    'send_message', 'send_photo', 'send_document', 'send_video', 'send_audio',
+    'send_animation', 'send_media_group', 'send_voice', 'send_sticker',
+    'send_location', 'send_venue', 'send_contact', 'send_poll',
+    'send_chat_action',
+    # Callback/inline answer
+    'answer_callback_query', 'answer_inline_query',
+    'answer_shipping_query', 'answer_pre_checkout_query',
+    # Edit message
+    'edit_message_text', 'edit_message_caption', 'edit_message_reply_markup',
+    # Web framework flash
+    'flash',
+    # FastAPI HTTPException (with detail= kwarg)
+    'HTTPException',
+})
+
+# R58 P1-4: sink 关键字参数名 — 字符串字面量传入这些关键字时视为用户面向
+PYTHON_SINK_KEYWORDS = frozenset({
+    'detail', 'text', 'message', 'caption', 'description',
+})
+
+# R58 P1-4: 豁免函数名 — 字符串字面量来自这些函数调用时不算违规
+# (说明:字面量已经经过 i18n 查找或结构化错误协议封装)
+PYTHON_EXEMPT_FUNCS = frozenset({
+    # i18n 查找
+    'translate', '_i18n_t', 'format_message_icu', 'format_plural', 'format_error_response',
+    'get_i18n_manager', 't', '_', 'gettext', 'ngettext', 'pgettext',
+    # 结构化错误协议(替代裸字符串)
+    'AppError', 'ErrorEnvelope', 'ValidationError',
+})
+
+# R58 P1-4: logger 属性名 — 这些方法调用整体跳过(日志输出不算 user_visible)
+LOGGER_ATTRS = frozenset({
+    'debug', 'info', 'warning', 'warn', 'error', 'critical', 'exception',
+    'log', 'trace',
+})
+
+# R58 P1-4: 行级 sink 调用检测正则(用于 classify_finding)
+# 匹配 reply_text/send_message/HTTPException 等方法调用
+SINK_CALL_LINE_RE = re.compile(
+    r'\b(?:' + '|'.join(sorted(PYTHON_SINK_FUNCS)) + r')\s*\('
+)
+SINK_KWARG_LINE_RE = re.compile(r'\bdetail\s*=')
+
+# 兼容旧测试引用(已弃用,保留以避免 import error)
 USER_FACING_PATTERNS = [
-    # Python: reply_text("中文") / reply_text(f"中文") / answer("中文") 等
     re.compile(r'(?:reply_text|answer|reply_photo|reply_document|send_message)\s*\(\s*f?["\']([^"\']*)["\']'),
     re.compile(r'detail\s*=\s*f?["\']([^"\']*)["\']'),
     re.compile(r'HTTPException\s*\([^)]*detail\s*=\s*f?["\']([^"\']*)["\']'),
-    # f-string 中的中文(仅匹配 f"..." 包含中文的)
     re.compile(r'f["\']([^"\']*[\u4e00-\u9fff][^"\']*)["\']'),
 ]
 
@@ -87,6 +144,7 @@ SKIP_PATTERNS = [
     '__pycache__',
     '.git/',
     'node_modules/',
+    '.claude/',  # Claude IDE 工作目录(worktrees/sessions),非项目代码
 ]
 
 # 模块基线文件
@@ -134,51 +192,182 @@ def _strip_string_literals(line: str) -> str:
     return re.sub(r'f?["\'][^"\']*["\']', '""', line)
 
 
+# === R58 P1-4: AST sink-based 扫描 ===
+
+def _is_logger_or_print_call(node: ast.Call) -> bool:
+    """检查 Call 节点是否是 logger.*/logging.*/print() 调用(整体跳过)。"""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        if func.attr in LOGGER_ATTRS:
+            # logger.info(...), logging.warning(...)
+            return True
+    if isinstance(func, ast.Name):
+        if func.id == 'print':
+            return True
+    return False
+
+
+def _get_call_name(node: ast.Call) -> str:
+    """获取 Call 节点的函数名(用于 sink/exempt 判定)。
+
+    支持形式:
+        reply_text(...)             → "reply_text"
+        obj.reply_text(...)         → "reply_text"
+        HTTPException(...)          → "HTTPException"
+        module.func(...)            → "func"
+    """
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return ''
+
+
+def _is_sink_call(node: ast.Call) -> bool:
+    """R58 P1-4: 检查 Call 节点是否是用户面向 sink 调用。
+
+    判定规则(按优先级):
+    1. 豁免函数(translate/_i18n_t/AppError/ErrorEnvelope 等)→ 永远不是 sink
+       (即使含 text=/detail= 等 sink 关键字参数,如 _i18n_t('key', text=text))
+    2. logger.*/logging.*/print() → 永远不是 sink
+    3. 函数名 ∈ PYTHON_SINK_FUNCS(reply_text/send_message/HTTPException/flash 等)→ sink
+    4. 含 PYTHON_SINK_KEYWORDS(detail/text/message/...) 关键字参数 → sink
+    """
+    func = node.func
+    name = _get_call_name(node)
+
+    # 豁免函数优先(translate/_i18n_t 等永远不是 sink,即使有 sink kwargs)
+    if name in PYTHON_EXEMPT_FUNCS:
+        return False
+
+    # logger.*/logging.*/print() 整体跳过(永远不是 sink)
+    if _is_logger_or_print_call(node):
+        return False
+
+    # 直接 sink 调用
+    if name in PYTHON_SINK_FUNCS:
+        return True
+
+    # 含 sink 关键字参数(detail="..."/text="..."/message="..."/...)
+    for kw in node.keywords:
+        if kw.arg in PYTHON_SINK_KEYWORDS:
+            return True
+
+    return False
+
+
+def _is_exempt_call(node: ast.Call) -> bool:
+    """R58 P1-4: 检查 Call 节点是否是豁免函数(translate/ErrorEnvelope/AppError 等)。
+
+    字符串字面量来自这些函数调用时不算违规(已经过 i18n 查找或结构化错误封装)。
+    """
+    name = _get_call_name(node)
+    return name in PYTHON_EXEMPT_FUNCS
+
+
+def _extract_string_literal(node: ast.AST) -> str | None:
+    """从 AST 节点抽取字符串字面量(返回 None 表示非字符串)。
+
+    支持:
+        - 普通字符串常量: "hello" → "hello"
+        - f-string: f"hello {name}" → "hello {}"(占位符替换)
+        - f-string 纯字面量: f"hello world" → "hello world"
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):  # f-string
+        parts: list[str] = []
+        for val in node.values:
+            if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                parts.append(val.value)
+            elif isinstance(val, ast.FormattedValue):
+                # f"...{expr}..." 插值占位符
+                parts.append('{}')
+        return ''.join(parts) if parts else None
+    return None
+
+
+def _describe_sink(node: ast.Call, kwarg_name: str = '') -> str:
+    """生成 sink 描述(用于 findings 的 pattern_type 字段)。"""
+    name = _get_call_name(node)
+    if kwarg_name:
+        return f'sink:{name}.{kwarg_name}'
+    return f'sink:{name}'
+
+
 # === 文件扫描 ===
 
 def scan_python_content(content: str) -> list[tuple[int, str, str]]:
-    """扫描 Python 内容,返回 (line_no, pattern_type, content) 列表。
+    """R58 P1-4: AST sink-based 扫描 — 检测 sink 调用中的字符串字面量。
 
-    正确跳过多行 logger./logging./print() 调用中的 f-string。
+    替代旧版正则+CJK 过滤;不再依赖字符集,所有 sink 中的字面量都纳入检测:
+        - reply_text("...")/send_message("...")/answer("...")/flash("...") 等
+        - HTTPException(status_code, detail="...")/HTTPException(500, "...")
+        - 任何含 detail=/text=/message=/caption=/description= 关键字的调用
+
+    豁免(不算违规):
+        - logger.*/logging.*/print() 调用(整体跳过)
+        - 字符串字面量来自 translate()/format_message_icu()/AppError/ErrorEnvelope 等
+
+    Args:
+        content: Python 源代码字符串
+
+    Returns:
+        [(line_no, pattern_type, content), ...] 字面量内容(截断到 80 字符)
     """
-    findings = []
-    lines = content.splitlines()
-    in_logger_call = False
-    paren_depth = 0
+    findings: list[tuple[int, str, str]] = []
 
-    for idx, line in enumerate(lines, 1):
-        stripped = line.lstrip()
-        # 跳过注释行
-        if stripped.startswith('#') or stripped.startswith('"""') or stripped.startswith("'''"):
+    # 解析 AST(语法错误时返回空)
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return findings
+
+    # 遍历所有 Call 节点
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
             continue
 
-        # 用于括号计数的行(移除字符串字面量)
-        code_only = _strip_string_literals(line)
+        # 跳过 logger./logging./print() 调用
+        if _is_logger_or_print_call(node):
+            continue
 
-        if not in_logger_call:
-            # 检查是否是 logger 调用行
-            if 'logger.' in line or 'logging.' in line or 'print(' in line:
-                opens = code_only.count('(')
-                closes = code_only.count(')')
-                if opens > closes:
-                    # 多行 logger 调用开始
-                    in_logger_call = True
-                    paren_depth = opens - closes
-                # 无论单行还是多行,跳过此行
+        # 检查是否是 sink 调用
+        if not _is_sink_call(node):
+            continue
+
+        # 检查位置参数中的字符串字面量
+        for arg in node.args:
+            # 豁免:参数本身是 translate()/format_message_icu()/AppError/ErrorEnvelope 等调用
+            if isinstance(arg, ast.Call) and _is_exempt_call(arg):
                 continue
-        else:
-            # 在多行 logger 调用内部
-            paren_depth += code_only.count('(') - code_only.count(')')
-            if paren_depth <= 0:
-                in_logger_call = False
-            continue
+            text = _extract_string_literal(arg)
+            if text is None:
+                continue
+            # 跳过空/纯空白字符串(非用户可见)
+            if not text.strip():
+                continue
+            findings.append((node.lineno, _describe_sink(node), text[:80]))
 
-        # 正常模式匹配
-        for pattern in USER_FACING_PATTERNS:
-            for match in pattern.finditer(line):
-                matched_text = match.group(1)
-                if CJK_PATTERN.search(matched_text):
-                    findings.append((idx, pattern.pattern[:50], matched_text[:80]))
+        # 检查关键字参数中的字符串字面量(detail="..." 等)
+        for kw in node.keywords:
+            # *args/**kwargs 的 kwarg.arg 为 None,跳过
+            if kw.arg is None:
+                continue
+            # 仅当关键字名 ∈ PYTHON_SINK_KEYWORDS 或函数本身是 sink 时才检查
+            if kw.arg not in PYTHON_SINK_KEYWORDS and _get_call_name(node) not in PYTHON_SINK_FUNCS:
+                continue
+            # 豁免:值是 exempt 调用
+            if isinstance(kw.value, ast.Call) and _is_exempt_call(kw.value):
+                continue
+            text = _extract_string_literal(kw.value)
+            if text is None:
+                continue
+            if not text.strip():
+                continue
+            findings.append((node.lineno, _describe_sink(node, kw.arg), text[:80]))
+
     return findings
 
 
@@ -445,27 +634,50 @@ def _check_scope_change(baseline: dict) -> tuple[bool, list[str], list[str]]:
 # === R48 P1-c: --classify 分类逻辑 ===
 
 def classify_finding(file_path: str, file_content: str, line_no: int) -> str:
-    """分类单条 finding 为 'user_visible' 或 'log_only'。
+    """R58 P1-4: 分类单条 finding 为 'user_visible' 或 'log_only'。
 
-    判定规则:
-    - HTML 文件 → user_visible(HTML 模板内容对用户可见)
-    - Python: 检查当前行及前后 2 行,若包含 logger./logging./print( → log_only
-    - 否则 → user_visible
+    判定规则(refined):
+    - HTML 文件:
+        * 当前行含 CJK → user_visible(模板中文必须 i18n)
+        * 否则 → log_only(英文模板文本走 baseline ratchet)
+    - Python:
+        * 当前/前后 ±2 行含 logger./logging./print( → log_only(间接日志记录)
+        * 当前行含 CJK → user_visible(中文用户文本必须 i18n,R56 §5.1 绝对门禁)
+        * 当前行含 sink 调用(reply_text/send_message/HTTPException/detail= 等)
+          且无 CJK → log_only(英文 sink 字面量走 baseline ratchet)
+        * 其他 → user_visible(保留旧行为:无 sink 上下文的英文 finding 默认 user_visible)
 
-    说明:由于 scan_python_content 已跳过 logger./print 单行/多行调用,
-    大多数 finding 默认归为 user_visible;此处分类用于捕捉间接被日志记录的字符串
-    (如 f-string 先赋值给变量再传给 logger 的场景)。
+    说明:scan_python_content 已跳过 logger./print 单行/多行调用,
+    sink 调用中的英文字面量由本函数进一步分类为 log_only(允许 baseline 吸收)。
     """
-    if not file_path.endswith('.py'):
-        return 'user_visible'
+    lines = file_content.splitlines() if file_content else []
 
-    lines = file_content.splitlines()
+    # HTML:基于 CJK 区分
+    if not file_path.endswith('.py'):
+        if 1 <= line_no <= len(lines):
+            line = lines[line_no - 1]
+            if CJK_PATTERN.search(line):
+                return 'user_visible'
+        return 'log_only'
+
+    # Python:先检查 logger/print 上下文(±2 行)
     for offset in (-2, -1, 0, 1, 2):
         i = line_no - 1 + offset
         if 0 <= i < len(lines):
             line = lines[i]
             if LOGGER_CALL_RE.search(line) or PRINT_CALL_RE.search(line):
                 return 'log_only'
+
+    # 当前行含 CJK → user_visible(R56 §5.1 绝对门禁)
+    if 1 <= line_no <= len(lines):
+        line = lines[line_no - 1]
+        if CJK_PATTERN.search(line):
+            return 'user_visible'
+        # 无 CJK,但行含 sink 调用模式 → log_only(英文 sink baseline ratchet)
+        if SINK_CALL_LINE_RE.search(line) or SINK_KWARG_LINE_RE.search(line):
+            return 'log_only'
+
+    # 默认:user_visible(保留旧测试 test_classify_finding_checks_nearby_lines 行为)
     return 'user_visible'
 
 

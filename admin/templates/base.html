@@ -122,6 +122,15 @@
             outline: 3px solid #0066cc !important;
             outline-offset: 2px !important;
         }
+        /* R58 P1-7: prefers-reduced-motion 尊重用户偏好(WCAG 2.2 AA 2.3.3 Animation from Interactions) */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
     </style>
     {% block head_extra %}{% endblock %}
 </head>

@@ -25,6 +25,7 @@ data/
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # 虚拟环境
 venv/
@@ -44,6 +45,7 @@ test_plan.md
 docs/*审查*.md
 docs/*审查报告*.md
 docs/*终审*.md
+docs/*复审*.md
 docs/*路线图*.md
 docs/*评估*.md
 docs/*评估报告*.md

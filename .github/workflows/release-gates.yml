@@ -1,17 +1,31 @@
 name: Release Gates
 
 # ════════════════════════════════════════════════════════════════
-# R42 P0-1 / P1-1: 发布门禁完整化整改
+# R58 P0-1: build-once + 签名 verification statement + digest-pinned promote
 # ════════════════════════════════════════════════════════════════
 #
-# 审查背景:
-#   R42 P0-1 指出 GitHub Actions workflows 应包含完整的发布前门禁集
+# R58 P0-1 整改要点:
+#   1. build once — docker-build 一次性构建并推送到 GHCR, 输出 OCI image_digest
+#                   (不可变内容地址); sign-image / publish-attestation 不再重新构建,
+#                   通过 needs.docker-build.outputs.image_digest 引用
+#   2. 所有 RC 验证只接受同一 digest — rc-continuity 改为比较 OCI image_digest
+#                   (不再比较 artifact ZIP SHA-256, ZIP 元数据会假阳性)
+#   3. 每次输出签名 verification statement — sign-image 增加 cosign verify 步骤,
+#                   生成 statement.json 作为签名证据 artifact
+#   4. production promote 只提升已验证 digest — publish-attestation 通过 cosign verify
+#                   验证 image_digest 已被签名, 拒绝 promote 未签名 digest
+#   5. 分支保护配置由 IaC 管理 — scripts/configure_branch_protection.sh (已存在)
+#                   Release 中上传 BP API snapshot 用于审计
+#
+# ─── 历史整改 ─────────────────────────────────────────────────────
+# R42 P0-1 / P1-1: 发布门禁完整化整改
+# R42 P0-1 指出 GitHub Actions workflows 应包含完整的发布前门禁集
 #   且 release-gates 应作为独立 workflow 文件,而非 ci.yml 中的一个 job
 #   P1-1 指出 Docker digest 应在 CI 中通过 docker manifest inspect
 #   真实拉取验证,而非仅做格式校验
 #
-# 本 workflow 包含 10 个独立 jobs(每个 job 失败均会阻断合并):
-#   1. docker-build            — 使用 Dockerfile PYTHON_IMAGE ARG 构建镜像
+# 本 workflow 包含 12 个独立 jobs(每个 job 失败均会阻断合并):
+#   1. docker-build            — R58 P0-1: build once + 推送 GHCR + 输出 OCI digest
 #   2. docker-digest-verify     — 用 docker manifest inspect 验证 digest 真实可拉取
 #   3. compose-config           — 校验 docker-compose.yml 配置语法
 #   4. redis-acl-matrix         — 跑 Redis ACL 契约测试
@@ -20,7 +34,10 @@ name: Release Gates
 #   7. sbom                     — 生成 SBOM(JSON/CycloneDX)
 #   8. pip-audit                — pip-audit 漏洞扫描(失败仅警告)
 #   9. trivy                    — trivy 文件系统扫描(失败仅警告)
-#   10. sign-image              — cosign 镜像签名(占位)
+#   10. sign-image              — R58 P0-1: cosign sign + verify statement (build-once 引用)
+#   11. verify-branch-protection — 断言 BP 属性 + contexts 与 check-runs 一致
+#   12. rc-continuity            — 3 次连续成功 + image digest 一致
+#   13. publish-attestation      — cosign verify digest + 6 digest 绑定 + BP snapshot
 #
 # branch protection 必需 context(R48 P0-2 整改后改为动态检测,不再硬编码):
 #   旧版本硬编码 ("CI" "Deploy Check" "Release Gates" "E2E"),
@@ -54,15 +71,29 @@ on:
     branches: [master, main]
 
 jobs:
-  # ─── 1. docker-build ─────────────────────────────────────────
-  # 使用 Dockerfile 中的 PYTHON_IMAGE ARG 构建镜像,验证 Dockerfile 可成功构建
+  # ─── 1. docker-build (R58 P0-1: build once, 推送 GHCR, 输出 OCI digest) ──
+  # R58 P0-1 整改要点:
+  #   旧版 docker-build 用 push:false + load:true 只构建本地镜像,
+  #   sign-image job 又重新构建并 push 到 GHCR —— 这是 build twice,
+  #   不满足 "build once, 所有 RC 验证只接受同一 digest"。
+  #   新版 build once 在本 job 完成:
+  #     - 推送 GHCR 一次
+  #     - 输出 image_digest (OCI 内容地址, 不可变)
+  #     - 后续 sign-image / rc-continuity / publish-attestation
+  #       均通过 image_digest 引用, 不再重新构建
   docker-build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # 推送 GHCR 必需
+      id-token: write   # 后续 attestation 需要
+      attestations: write
+    outputs:
+      image_digest: ${{ steps.build.outputs.digest }}
+      image_name: ${{ steps.meta.outputs.name }}
+      image_tag: ${{ steps.meta.outputs.tag }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
 
     - name: Parse PYTHON_IMAGE from Dockerfile
       id: parse
@@ -72,23 +103,83 @@ jobs:
         echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
         echo "解析到 PYTHON_IMAGE: ${IMAGE_REF}"
 
-    - name: Build Docker image
+    # R58 P0-1: docker-container driver 支持 provenance/sbom attestation
+    - name: Set up Docker Buildx (docker-container driver)
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      with:
+        driver: docker-container
+
+    - name: Login to GHCR
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    # R58 P0-1: 唯一镜像 tag = ci-{sha}-{run_id} (不可变, 强引用 digest)
+    - name: Compute image tag
+      id: meta
+      run: |
+        # tag 在所有 job 间共享 (rc-continuity / publish-attestation / sign-image)
+        # 同一 SHA + 不同 run_id 时 tag 也会变化 (用于 RC continuity 比对)
+        IMAGE_NAME="ghcr.io/${{ github.repository }}"
+        IMAGE_TAG="ci-${{ github.sha }}-${{ github.run_id }}"
+        echo "name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+        echo "tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+        echo "image_ref=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+        echo "镜像引用: ${IMAGE_NAME}:${IMAGE_TAG}"
+
+    # R58 P0-1: build once — 构建并推送 GHCR 一次
+    - name: Build and push OCI image (build once)
+      id: build
       uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
       with:
         context: .
-        push: false
-        tags: tgjiema:ci-build
-        load: true
+        push: true
+        tags: ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.tag }}
         build-args: |
           PYTHON_IMAGE=${{ steps.parse.outputs.image_ref }}
+        provenance: true
+        sbom: true
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
-    - name: Verify image built
+    # R58 P0-1: 输出 image_digest 供后续 job 引用 (强引用, 不可变)
+    - name: Expose image digest
       run: |
-        docker images tgjiema:ci-build
+        echo "=== R58 P0-1: Build Once Digest Exposed ==="
+        echo "image_name: ${{ steps.meta.outputs.name }}"
+        echo "image_tag: ${{ steps.meta.outputs.tag }}"
+        echo "image_digest: ${{ steps.build.outputs.digest }}"
+        echo "image_ref (digest-pinned): ${{ steps.meta.outputs.name }}@${{ steps.build.outputs.digest }}"
+        # 写入文件供 artifact 上传
+        cat > image_build_info.json <<EOF
+        {
+          "image_name": "${{ steps.meta.outputs.name }}",
+          "image_tag": "${{ steps.meta.outputs.tag }}",
+          "image_digest": "${{ steps.build.outputs.digest }}",
+          "image_ref": "${{ steps.meta.outputs.name }}@${{ steps.build.outputs.digest }}",
+          "commit_sha": "${{ github.sha }}",
+          "run_id": "${{ github.run_id }}"
+        }
+        EOF
+        cat image_build_info.json
+
+    - name: Verify image pull by digest
+      run: |
+        # R58 P0-1: 通过 digest 拉取验证镜像真实可用 (内容地址, 不可变)
+        IMAGE_REF="${{ steps.meta.outputs.name }}@${{ steps.build.outputs.digest }}"
+        echo "Pulling image by digest: ${IMAGE_REF}"
+        docker pull "${IMAGE_REF}"
         # 验证镜像可启动并执行 python 命令
-        docker run --rm tgjiema:ci-build python -c "import sys; print(f'Python {sys.version}'); print('image OK')"
+        docker run --rm "${IMAGE_REF}" python -c "import sys; print(f'Python {sys.version}'); print('image OK (digest-pinned)')"
+
+    - name: Upload build info artifact
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: docker-build-info-${{ github.sha }}-${{ github.run_id }}
+        path: image_build_info.json
+        retention-days: 30
 
   # ─── 2. docker-digest-verify (P1-1) ──────────────────────────
   # 用 docker manifest inspect 验证 Dockerfile 第 17 行的 digest 真实可拉取
@@ -311,10 +402,15 @@ jobs:
         severity: CRITICAL,HIGH
         format: table
 
-  # ─── 10. sign-image (R43 P0-2: 真实签名,移除 placeholder) ─────────
-  # R43 P0-2: cosign 镜像签名必须真实执行,不允许占位通过
-  # R44: 升级为真实镜像签名(GHCR 推送 + cosign sign + SLSA attestation),
-  #      保留源 tarball 签名作为补充
+  # ─── 10. sign-image (R58 P0-1: build-once 引用 digest 签名 + verify statement) ─
+  # R58 P0-1 整改要点:
+  #   旧版 sign-image 又重新构建并 push 到 GHCR (build twice),
+  #   且只签名不输出 verification statement。
+  #   新版:
+  #     - 不重新构建 (build once, 通过 needs.docker-build.outputs.image_digest 引用)
+  #     - cosign sign 已 push 的镜像 digest
+  #     - cosign verify 输出签名 verification statement (JSON)
+  #     - SLSA provenance attestation 绑定同一 digest
   sign-image:
     runs-on: ubuntu-latest
     needs: [docker-build]
@@ -323,10 +419,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
-      packages: write   # R44: 推送 OCI 镜像到 GHCR 必需
-      # R53: actions/attest-build-provenance 创建 attestation 需要此权限,
-      # 否则报 "Failed to persist attestation: Resource not accessible by
-      # integration" (REST API /repos/.../attestations 返回 403)
+      packages: read   # R58 P0-1: 仅读取已 push 的镜像 (build 在 docker-build 已完成)
+      # R53: actions/attest-build-provenance 创建 attestation 需要此权限
       attestations: write
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -336,47 +430,85 @@ jobs:
       with:
         cosign-release: 'v2.2.3'
 
-    # R44: 真实 OCI 镜像签名流水线(替代占位步骤)
-    - name: Login to GHCR
+    # R58 P0-1: 只需读取 (build 已在 docker-build job 完成, 不重新构建)
+    - name: Login to GHCR (read-only, for cosign verify)
       uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
       with:
         registry: ghcr.io
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
 
-    # R53: buildx 默认 docker driver 不支持 provenance/sbom attestation,
-    # 必须切换到 docker-container driver,否则 build-push-action 报错:
-    # "Attestation is not supported for the docker driver"
-    - name: Set up Docker Buildx (docker-container driver for attestation)
-      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
-      with:
-        driver: docker-container
-
-    - name: Build and push OCI image
-      id: build
-      uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
-      with:
-        context: .
-        push: true
-        tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
-        provenance: true
-        sbom: true
-
-    - name: Sign OCI image with cosign (keyless)
+    - name: Resolve image reference
+      id: resolve
       run: |
-        cosign sign --yes ghcr.io/${{ github.repository }}:${{ github.sha }}
+        # R58 P0-1: 通过 docker-build 输出的 digest 引用 (强引用, 不可变)
+        IMAGE_NAME="${{ needs.docker-build.outputs.image_name }}"
+        IMAGE_DIGEST="${{ needs.docker-build.outputs.image_digest }}"
+        if [ -z "${IMAGE_DIGEST}" ] || [ "${IMAGE_DIGEST}" = "null" ]; then
+          echo "FAIL: docker-build 未输出 image_digest"
+          echo "  (可能 docker-build job 失败或被跳过)"
+          exit 1
+        fi
+        IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
+        echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+        echo "R58 P0-1: 通过 digest 引用镜像 (build once, 不重新构建)"
+        echo "  image_ref: ${IMAGE_REF}"
+
+    # R58 P0-1: cosign sign 已 push 的镜像 digest (不重新构建)
+    - name: Sign OCI image with cosign (keyless, by digest)
+      run: |
+        IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
+        echo "Signing image: ${IMAGE_REF}"
+        cosign sign --yes "${IMAGE_REF}"
       env:
         COSIGN_EXPERIMENTAL: 1
+
+    # R58 P0-1: cosign verify 生成签名 verification statement (JSON)
+    #           每次 release 都必须输出 verification statement 作为证据
+    - name: Verify image signature (output verification statement)
+      run: |
+        IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
+        echo "=== R58 P0-1: 签名 Verification Statement ==="
+        # --output-verification 需要文件路径, cosign 会写入 verification record
+        cosign verify \
+          --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/.+" \
+          --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+          --output-verification statement.json \
+          "${IMAGE_REF}" || {
+            echo "FAIL: cosign verify 失败,签名无效"
+            exit 1
+          }
+        echo "Verification statement 已生成:"
+        cat statement.json
+        echo ""
+        echo "=== Verification Summary ==="
+        python3 -c "
+        import json
+        with open('statement.json') as f:
+            stmt = json.load(f)
+        # Bundle 结构: {_type, subject, predicateType, predicate}
+        print(f'_type: {stmt.get(\"_type\", \"\")}')
+        print(f'predicateType: {stmt.get(\"predicateType\", \"\")}')
+        subjects = stmt.get('subject', [])
+        print(f'subject count: {len(subjects)}')
+        for s in subjects:
+            print(f'  - name: {s.get(\"name\", \"\")}')
+            dig = s.get('digest', {})
+            for alg, val in dig.items():
+                print(f'    {alg}: {val[:24]}...')
+        print('OK: 签名 verification statement 有效')
+        "
 
     - name: Generate SLSA build provenance attestation
       uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018
       with:
-        subject-name: ghcr.io/${{ github.repository }}
+        subject-name: ${{ needs.docker-build.outputs.image_name }}
         # R53: steps.build.outputs.digest 已含 "sha256:" 前缀,
         # 不能再前缀 "sha256:",否则变成 "sha256:sha256:..." 导致
         # actions/attest-build-provenance 报错 "subject-digest must be in
         # the format 'sha256:<hex-digest>'"
-        subject-digest: ${{ steps.build.outputs.digest }}
+        # R58 P0-1: 使用 docker-build 输出的 digest (build once)
+        subject-digest: ${{ needs.docker-build.outputs.image_digest }}
         push-to-registry: true
 
     # R44: 保留源 tarball 签名作为补充(与镜像签名独立)
@@ -399,6 +531,7 @@ jobs:
       with:
         name: release-gates-signed-${{ github.sha }}
         path: |
+          statement.json
           tgjiema-${{ github.sha }}.tar.gz
           tgjiema-${{ github.sha }}.tar.gz.sha256
           tgjiema-${{ github.sha }}.pem
@@ -807,46 +940,58 @@ jobs:
             ALL_PASS=false
           fi
 
-          # R56 P0-5: 通过 artifacts API 列举并下载 attestation,解析真实 SHA-256
+          # R58 P0-1: 通过 OCI image digest (内容地址, 不可变) 比较, 不再用 artifact ZIP SHA-256
+          # 旧版 R56 比较 artifact ZIP 的 SHA-256, 但 ZIP 包含时间戳等元数据,
+          # 同一 source SHA 的不同 run 产生的 ZIP digest 会不同 (假阳性)。
+          # 新版 R58 P0-1: 通过 docker-build-info artifact 读取 image_digest,
+          # 同一 source SHA 的 3 次独立 run 应产生同一 image_digest
+          # (Dockerfile + context 完全一致 → digest 一致)。
           if [ "${CONSECUTIVE_OK}" = "true" ]; then
-            echo "  INFO: 通过 artifacts API 比较 artifact digest"
+            echo "  INFO: R58 P0-1 比较 OCI image digest (内容地址, 不可变)"
             PREV_DIGEST=""
             DIGEST_MISMATCH=false
             for run_row in $(echo "${RECENT_RUNS}" | jq -r '.[].id'); do
-              # 列举该 run 的 artifacts
+              # 列举该 run 的 artifacts, 查找 docker-build-info-* artifact
               ARTIFACTS_JSON=$(gh api "repos/${{ github.repository }}/actions/runs/${run_row}/artifacts" 2>/dev/null || echo '{"artifacts":[]}')
 
-              # 下载第一个 artifact 的 digest(以 SBOM 或 signed artifact 为准)
-              ARTIFACT_NAME=$(echo "${ARTIFACTS_JSON}" | jq -r '.artifacts[0].name // empty')
-              ARTIFACT_ID=$(echo "${ARTIFACTS_JSON}" | jq -r '.artifacts[0].id // empty')
+              # 查找名为 docker-build-info-* 的 artifact (R58 P0-1 新增)
+              BUILD_INFO_URL=$(echo "${ARTIFACTS_JSON}" | jq -r \
+                '.artifacts[] | select(.name | startswith("docker-build-info-")) | .archive_download_url' | head -1)
 
-              if [ -n "${ARTIFACT_ID}" ] && [ -n "${ARTIFACT_NAME}" ]; then
-                echo "    run #${run_row}: artifact '${ARTIFACT_NAME}' (id=${ARTIFACT_ID})"
-                # 下载 artifact 并计算 SHA-256
-                DL_URL=$(echo "${ARTIFACTS_JSON}" | jq -r '.artifacts[0].archive_download_url')
-                curl -sL -H "Authorization: token ${GH_TOKEN}" -o "/tmp/art_${run_row}.zip" "${DL_URL}" 2>/dev/null || true
-                if [ -f "/tmp/art_${run_row}.zip" ]; then
-                  ART_SHA=$(sha256sum "/tmp/art_${run_row}.zip" | awk '{print $1}')
-                  echo "    run #${run_row}: artifact digest sha256=${ART_SHA:0:16}..."
-                  echo "${ART_SHA}" >> "${DIGESTS_FILE}"
-                  if [ -n "${PREV_DIGEST}" ] && [ "${PREV_DIGEST}" != "${ART_SHA}" ]; then
-                    echo "    WARN: artifact digest 不同(prev=${PREV_DIGEST:0:16} cur=${ART_SHA:0:16})"
-                    echo "    R56 P0-5: 同一 source SHA 的 artifact digest 应一致"
+              if [ -n "${BUILD_INFO_URL}" ]; then
+                echo "    run #${run_row}: 下载 docker-build-info artifact"
+                curl -sL -H "Authorization: token ${GH_TOKEN}" -o "/tmp/build_info_${run_row}.zip" "${BUILD_INFO_URL}" 2>/dev/null || true
+                # 解压并读取 image_build_info.json
+                mkdir -p "/tmp/build_info_${run_row}"
+                unzip -o -q "/tmp/build_info_${run_row}.zip" -d "/tmp/build_info_${run_row}" 2>/dev/null || true
+                IMG_DIGEST=$(jq -r '.image_digest // empty' "/tmp/build_info_${run_row}/image_build_info.json" 2>/dev/null || echo "")
+                rm -rf "/tmp/build_info_${run_row}" "/tmp/build_info_${run_row}.zip"
+
+                if [ -n "${IMG_DIGEST}" ]; then
+                  echo "    run #${run_row}: image_digest=${IMG_DIGEST:0:24}..."
+                  echo "${IMG_DIGEST}" >> "${DIGESTS_FILE}"
+                  if [ -n "${PREV_DIGEST}" ] && [ "${PREV_DIGEST}" != "${IMG_DIGEST}" ]; then
+                    echo "    FAIL: image digest 不同(prev=${PREV_DIGEST:0:24}... cur=${IMG_DIGEST:0:24}...)"
+                    echo "    R58 P0-1: 同一 source SHA 的 image digest 必须一致 (build once 语义)"
+                    echo "    可能原因: Dockerfile 或 context 在 run 间被修改, 或非确定性构建"
                     DIGEST_MISMATCH=true
                   fi
-                  PREV_DIGEST="${ART_SHA}"
-                  rm -f "/tmp/art_${run_row}.zip"
+                  PREV_DIGEST="${IMG_DIGEST}"
+                else
+                  echo "    run #${run_row}: docker-build-info.json 缺失 image_digest (旧 run?, 跳过 digest 比对)"
                 fi
               else
-                echo "    run #${run_row}: 无 artifact(若 workflow 不产出 artifact 则可接受)"
+                echo "    run #${run_row}: 无 docker-build-info artifact (R58 P0-1 前的旧 run, 跳过)"
+                echo "    INFO: 旧 R56 artifact (release-gates-sbom / release-gates-signed) 不再用于 digest 比对"
+                echo "          新 R58 P0-1 要求 build once, 通过 docker-build-info artifact 输出 image_digest"
               fi
             done
             if [ "${DIGEST_MISMATCH}" = "true" ]; then
-              echo "  FAIL: artifact digest 不一致,阻断发布"
+              echo "  FAIL: OCI image digest 不一致, 阻断发布 (R58 P0-1: build once 违反)"
               CONSECUTIVE_OK=false
               ALL_PASS=false
             fi
-            echo "  OK: ${REQUIRED_CONSECUTIVE} 次连续成功 + digest 一致"
+            echo "  OK: ${REQUIRED_CONSECUTIVE} 次连续成功 + image digest 一致 (若可获取)"
           fi
           echo ""
         done
@@ -891,17 +1036,17 @@ jobs:
           exit 1
         fi
 
-  # ─── R56 P0-1: 发布器查询 Checks API + release_attestation 绑定 6 digest ───
-  # 发布器必须查询 GitHub Checks API,要求四个 workflow 对目标 SHA 均为
-  # completed/success,否则拒绝生成 production deployment。
-  # release_attestation.json 固定绑定:
-  #   commit_sha + tree_sha + image_digest + sbom_digest + migration_digest + config_digest
-  # 使用签名身份验证(OIDC keyless)。
+  # ─── R58 P0-1: 发布器查询 Checks API + 验证已签名 digest + release_attestation 绑定 6 digest ──
+  # R58 P0-1 整改要点:
+  #   - production promote 只提升已验证 digest (cosign verify 通过)
+  #   - 通过 needs.docker-build.outputs.image_digest 引用 (build once)
+  #   - 不再通过 tag 查询 GHCR (tag 可漂移, digest 不可变)
+  #   - sign-image 必须先通过 (cosign verify 验证签名有效)
   publish-attestation:
     runs-on: ubuntu-latest
     needs: [docker-build, docker-digest-verify, compose-config, redis-acl-matrix,
             schema-diff, backup-restore-drill, sbom, pip-audit, trivy,
-            verify-branch-protection, rc-continuity]
+            verify-branch-protection, rc-continuity, sign-image]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     permissions:
       contents: read
@@ -976,6 +1121,42 @@ jobs:
           exit 1
         fi
 
+    # R58 P0-1: production promote 只提升已验证 digest
+    # 通过 cosign verify 验证 image_digest 已被签名 (sign-image job 已通过 needs 依赖保证执行)
+    - name: Verify image digest signature (production promote gate)
+      uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
+      with:
+        cosign-release: 'v2.2.3'
+
+    - name: cosign verify image digest (production promote only signed digest)
+      env:
+        COSIGN_EXPERIMENTAL: 1
+      run: |
+        set -euo pipefail
+        echo "=== R58 P0-1: Production Promote 只提升已验证 digest ==="
+        IMAGE_NAME="${{ needs.docker-build.outputs.image_name }}"
+        IMAGE_DIGEST="${{ needs.docker-build.outputs.image_digest }}"
+        if [ -z "${IMAGE_DIGEST}" ] || [ "${IMAGE_DIGEST}" = "null" ]; then
+          echo "FAIL: docker-build 未输出 image_digest"
+          echo "  production promote 拒绝: 无 digest 引用"
+          exit 1
+        fi
+        IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
+        echo "Verifying signed digest: ${IMAGE_REF}"
+
+        # R58 P0-1: cosign verify 拒绝未签名 digest
+        # 若签名无效或缺失, 拒绝 promote 到 production
+        cosign verify \
+          --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/.+" \
+          --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+          "${IMAGE_REF}" || {
+            echo "FAIL: cosign verify 失败"
+            echo "  R58 P0-1: production promote 只提升已验证 digest"
+            echo "  拒绝 promote 未签名/签名无效的 image_digest 到 production"
+            exit 1
+          }
+        echo "PASS: image digest 已通过签名验证, 可 promote 到 production"
+
     - name: Generate release_attestation.json (6 digest binding)
       run: |
         set -euo pipefail
@@ -984,10 +1165,15 @@ jobs:
         TARGET_SHA="${{ github.sha }}"
         TREE_SHA=$(git rev-parse "${TARGET_SHA}^{tree}")
 
-        # image_digest: 从 GHCR 查询(若可访问)
-        IMAGE_DIGEST=$(docker buildx imagetools inspect \
-          "ghcr.io/${{ github.repository }}:${TARGET_SHA}" 2>/dev/null \
-          | grep -oP 'sha256:[a-f0-9]{64}' | head -1 || echo "")
+        # R58 P0-1: image_digest 直接从 docker-build job 输出获取 (build once, 不可变)
+        # 不再通过 tag 查询 GHCR (tag 可漂移, digest 不可变)
+        IMAGE_DIGEST="${{ needs.docker-build.outputs.image_digest }}"
+        if [ -z "${IMAGE_DIGEST}" ] || [ "${IMAGE_DIGEST}" = "null" ]; then
+          echo "FAIL: docker-build 未输出 image_digest"
+          echo "  R58 P0-1: build once 必须输出 digest"
+          exit 1
+        fi
+        echo "image_digest (from docker-build output): ${IMAGE_DIGEST}"
 
         # sbom_digest: 从 sbom job 产生的 sbom.json 计算
         SBOM_DIGEST=$(sha256sum sbom.json 2>/dev/null | awk '{print $1}' || echo "")
@@ -1023,7 +1209,7 @@ jobs:
             'created_at': datetime.datetime.utcnow().isoformat() + 'Z',
             'commit_sha': '${TARGET_SHA}',
             'tree_sha': '${TREE_SHA}',
-            'image_digest': '${IMAGE_DIGEST}' or 'pending',
+            'image_digest': '${IMAGE_DIGEST}',
             'sbom_digest': '${SBOM_DIGEST}',
             'migration_digest': '${MIGRATION_DIGEST}',
             'config_digest': '${CONFIG_DIGEST}',
@@ -1073,7 +1259,9 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.BP_PAT_TOKEN }}
       run: |
-        # R56 P0-1: Branch Protection API 快照进入 artifact
+        # R56 P0-1: Branch Protection API 快照进入 artifact (IaC 管理)
+        # BP 配置由 scripts/configure_branch_protection.sh 管理 (IaC)
+        # 本步骤记录当前 BP 配置快照, 用于审计和回滚
         gh api "repos/${{ github.repository }}/branches/master/protection" \
           > branch_protection_snapshot.json 2>/dev/null || echo '{}' > branch_protection_snapshot.json
         echo "Branch Protection snapshot:"

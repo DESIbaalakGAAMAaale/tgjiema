@@ -504,35 +504,27 @@ class TestButtonSecurity:
     """
 
     def test_generate_signed_callback_warns_for_high_risk(self):
-        """C13: 高风险 action 通过 generate_signed_callback 签名时记录 warning。
+        """C13: 高风险 action 通过 generate_signed_callback 签名时硬拒绝。
 
-        R51 P1-10: generate_signed_callback 为只读操作专用,
-        高风险 action 应改用 sign_button_token_with_nonce。
-        为保持向后兼容,不拒绝但记录 warning 日志。
+        R58 P0-4: generate_signed_callback 为只读操作专用,
+        高风险 action 必须改用 sign_button_token_with_nonce(持久化 nonce + 原子消费)。
+        不再仅 warning,改为抛 AppError(BUTTON_POLICY_ASYNC_TOKEN_REQUIRED)。
         """
         from services.button_security import generate_signed_callback
+        from services.error_codes import AppError, ErrorCodes
 
-        with patch("services.button_security.logger.warning") as mock_warn:
-            result = generate_signed_callback(
+        # R58 P0-4: 高风险 action 应抛 AppError,不再返回签名结果
+        with pytest.raises(AppError) as exc_info:
+            generate_signed_callback(
                 user_id=10001,
                 action="ban",  # 高风险 action
                 data="target_user:20001",
                 ttl=3600,
             )
-
-        # 应记录 warning
-        assert mock_warn.called, (
-            "高风险 action 通过 generate_signed_callback 签名时应记录 warning"
+        # 验证错误码(AppError.code 属性对应 ErrorCodes.code)
+        assert exc_info.value.code == ErrorCodes.BUTTON_POLICY_ASYNC_TOKEN_REQUIRED, (
+            "高风险 action 应抛 BUTTON_POLICY_ASYNC_TOKEN_REQUIRED"
         )
-        warn_msg = mock_warn.call_args[0][0]
-        assert "R51 P1-10" in warn_msg, "warning 消息应包含 R51 P1-10 标识"
-        assert "ban" in warn_msg, "warning 消息应包含 action 名称"
-        assert "sign_button_token_with_nonce" in warn_msg, (
-            "warning 消息应建议改用 sign_button_token_with_nonce"
-        )
-        # 仍应返回签名结果(不拒绝,向后兼容)
-        assert isinstance(result, str)
-        assert len(result) > 0, "应返回签名 callback_data(不拒绝)"
 
     def test_generate_signed_callback_no_warning_for_low_risk(self):
         """C14: 低风险 action 不记录 warning(只读操作允许使用旧 sync API)。"""

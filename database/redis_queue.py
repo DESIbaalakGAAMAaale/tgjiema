@@ -1578,18 +1578,40 @@ async def quarantine_repair(
     # 要求 ≥2 个不同 approver,每个有 mfa_receipt,且都不能是 expected_principal_id
     if action == "delete":
         try:
+            # R58 P0-2: 与 data_lifecycle.py 保持一致,创建完整 schema(含强绑定字段)
             await _store._db.execute(
                 """CREATE TABLE IF NOT EXISTS command_approvals (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     action_id       TEXT NOT NULL,
                     approver_id     BIGINT NOT NULL,
                     approval_type   TEXT NOT NULL,
+                    decision        TEXT NOT NULL DEFAULT 'approved',
+                    request_hash    TEXT NOT NULL DEFAULT '',
                     mfa_receipt     TEXT,
+                    permission      TEXT NOT NULL DEFAULT '',
                     approved_at     TEXT NOT NULL,
+                    expires_at      TEXT NOT NULL DEFAULT '',
+                    consumed_at     TEXT,
+                    revoked_at      TEXT,
                     metadata_json   TEXT,
                     UNIQUE(action_id, approver_id)
                 )"""
             )
+            # R58 P0-2: 旧表迁移补列(幂等)
+            for _col, _col_def in [
+                ("decision", "TEXT NOT NULL DEFAULT 'approved'"),
+                ("request_hash", "TEXT NOT NULL DEFAULT ''"),
+                ("permission", "TEXT NOT NULL DEFAULT ''"),
+                ("expires_at", "TEXT NOT NULL DEFAULT ''"),
+                ("consumed_at", "TEXT"),
+                ("revoked_at", "TEXT"),
+            ]:
+                try:
+                    await _store._db.execute(
+                        f"ALTER TABLE command_approvals ADD COLUMN {_col} {_col_def}"
+                    )
+                except Exception:
+                    pass
             await _store._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_command_approvals_action_id "
                 "ON command_approvals(action_id)"
@@ -1597,7 +1619,7 @@ async def quarantine_repair(
             await _store._db.commit()
         except Exception as _ct_err:
             logger.warning(
-                f"[RedisQueue] R56 P0-4: command_approvals 表创建失败(继续查询): {_ct_err}"
+                f"[RedisQueue] R58 P0-2: command_approvals 表创建失败(继续查询): {_ct_err}"
             )
         try:
             _appr_rows = await _store._db.execute_fetchall(

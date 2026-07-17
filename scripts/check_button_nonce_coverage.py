@@ -102,6 +102,7 @@ SKIP_DIR_PARTS: list[str] = [
     "cf-workers",
     "data",
     ".pytest_cache",
+    ".claude",  # Claude IDE 工作目录(worktrees/sessions),非项目代码
 ]
 
 

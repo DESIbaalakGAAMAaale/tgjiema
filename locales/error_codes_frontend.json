@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 105,
-    "generated_at": "2026-07-16T13:10:34.360525Z",
+    "enum_count": 107,
+    "generated_at": "2026-07-17T05:52:30.883433Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(= retryable)",
       "telegram_presentation": "Bot 端展示方式: short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)"
     },
-    "total_codes": 105,
+    "total_codes": 107,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -21,6 +21,16 @@
       "code": "ADMIN.BOOTSTRAP.NOT_VERIFIED",
       "http_status": 503,
       "message_key": "errors.admin.bootstrap.not_verified",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "ADMIN.PASSWORD.MIGRATE_ARGON2_REMOVED": {
+      "code": "ADMIN.PASSWORD.MIGRATE_ARGON2_REMOVED",
+      "http_status": 500,
+      "message_key": "errors.admin.password.migrate_argon2_removed",
       "retryable": false,
       "safe_params": [],
       "severity": "critical",
@@ -187,6 +197,20 @@
       "message_key": "errors.bot.mon.token_missing",
       "retryable": false,
       "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.ASYNC_TOKEN_REQUIRED": {
+      "code": "BUTTON.POLICY.ASYNC_TOKEN_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.button.policy.async_token_required",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason",
+        "user_id"
+      ],
       "severity": "critical",
       "show_retry_button": false,
       "telegram_presentation": "inline"

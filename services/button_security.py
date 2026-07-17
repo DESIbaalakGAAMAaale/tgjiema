@@ -211,14 +211,17 @@ def generate_signed_callback(
     Returns:
         签名后的 callback_data 字符串(6 段格式)
     """
-    # R51 P1-10: 高风险 action 使用旧 sync API 警告(不拒绝,保持向后兼容)
-    # 新代码应改用 sign_button_token_with_nonce(持久化 nonce + 原子消费)
+    # R58 P0-4: 高风险 action 硬拒绝(不再仅 warning)
+    # 高风险 action 必须使用 sign_button_token_with_nonce(持久化 nonce + 原子消费)
+    # 旧 sync API 生成不持久化 nonce 的 6 段 token,可被重放
     if _is_high_risk_action(action):
-        logger.warning(
-            f"[button_security] R51 P1-10: 高风险 action={action} 通过 "
-            f"generate_signed_callback(只读 API)签名,建议改用 "
-            f"sign_button_token_with_nonce(持久化 nonce + 原子消费防重放)。"
-            f"user_id={user_id}"
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_ASYNC_TOKEN_REQUIRED,
+            params={
+                "action": action,
+                "reason": "high_risk_action_requires_async_token",
+                "user_id": str(user_id),
+            },
         )
     expire_ts = int(time.time()) + ttl
     if not nonce:
@@ -295,6 +298,15 @@ def verify_signed_callback(
             expire_ts = int(parts[-2])
             has_nonce = False
             nonce = ""
+        # R58 P0-4: 高风险 action 一律拒绝(无论 5/6 段)
+        # 高风险 action 必须通过 verify_button_token(异步,原子消费 nonce)处理
+        # 同步 verifier 不消费 nonce,签名正确的 6 段 token 仍可被重放
+        if _is_high_risk_action(action):
+            logger.warning(
+                f"[button_security] R58 P0-4: 高风险 action={action} "
+                f"被同步 verifier 拒绝(必须使用异步 verify_button_token)"
+            )
+            return False, "", ""
         # 验证用户 ID(防止跨用户伪造)
         if user_id != current_user_id:
             logger.debug(

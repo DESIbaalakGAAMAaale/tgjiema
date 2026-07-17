@@ -1,8 +1,8 @@
 {
-  "_description": "R48 P1-c / R56 §5.1: 模块化 i18n 硬编码字符串 baseline(scope 审批 + delta + classify + 绝对门禁)",
-  "_note": "R56 §5.1 绝对门禁:user_visible 必须 0(不允许通过更新 baseline 消除失败,必须接入 i18n);log_only 走 ratchet(只允许非增加)。R48: scope 变化需 --allow-scope-change;CI 用 --delta 比对 base/head;--classify 区分 user_visible(清零目标 0) 与 log_only(鼓励减少)。",
+  "_description": "R48 P1-c: 模块化 i18n 硬编码字符串 baseline(scope 审批 + delta + classify)",
+  "_note": "由 --generate-baseline / --ratchet 维护;total 只允许非增加(下降或持平)。R48: scope 变化需 --allow-scope-change;CI 用 --delta 比对 base/head;--classify 区分 user_visible(清零目标 0) 与 log_only(鼓励减少)。",
   "_original_r44_baseline": 954,
-  "scanner_version": "2.1",
+  "scanner_version": "3.0",
   "included_paths": [
     "bots/up_bot.py",
     "bots/idx_bot.py",
@@ -16,22 +16,22 @@
   ],
   "modules": {
     "bots/up_bot.py": {
-      "baseline": 4,
+      "baseline": 3,
       "target": 0,
       "user_visible": 0,
-      "log_only": 4
+      "log_only": 3
     },
     "bots/idx_bot.py": {
-      "baseline": 15,
+      "baseline": 14,
       "target": 0,
       "user_visible": 0,
-      "log_only": 15
+      "log_only": 14
     },
     "bots/dsp_bot.py": {
-      "baseline": 5,
+      "baseline": 2,
       "target": 0,
       "user_visible": 0,
-      "log_only": 5
+      "log_only": 2
     },
     "bots/mon_bot.py": {
       "baseline": 0,
@@ -40,10 +40,10 @@
       "log_only": 0
     },
     "bots/admin_bot/": {
-      "baseline": 23,
+      "baseline": 16,
       "target": 0,
       "user_visible": 0,
-      "log_only": 23
+      "log_only": 16
     },
     "admin/": {
       "baseline": 1,
@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 24,
+      "baseline": 5,
       "target": 0,
       "user_visible": 0,
-      "log_only": 22
+      "log_only": 5
     }
   },
   "total": {
-    "baseline": 72,
+    "baseline": 41,
     "target": 0,
     "user_visible": 0,
-    "log_only": 70
+    "log_only": 41
   },
-  "last_updated": "2026-07-16",
-  "last_updated_by": "R56 §5.1: 绝对门禁改造 — user_visible 必须 0(将 prometheus_exporter healthz 详情 + admin/passwords RuntimeError 消息接入英文);baseline 由 72 拆分为 user_visible=0/log_only=70"
+  "last_updated": "2026-07-17",
+  "last_updated_by": "R58 P1-4: AST sink-based scanner (regex+CJK filter → AST sink detection; user_visible=0 preserved, log_only recalibrated)"
 }

@@ -55,6 +55,65 @@ _FALLBACK_LOCALE = "en-US"
 # 匹配 {name, type, ...} 模式(type ∈ plural/select/selectordinal)
 _ICU_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\s*,\s*(plural|select|selectordinal)\s*,")
 
+# R58 P1-2: 简单 {var} 占位符(非 ICU pattern)
+_SIMPLE_VAR_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+
+def _get_environment() -> str:
+    """R58 P1-2: 惰性读取 ENVIRONMENT(避免循环导入)。"""
+    try:
+        from config.settings import settings  # type: ignore[import]
+        return getattr(settings, "ENVIRONMENT", "development")
+    except Exception:
+        return "development"
+
+
+# R58 P1-2: i18n 失败指标(进程内计数器,Prometheus exporter 可轮询)
+_i18n_missing_param_total: int = 0
+_i18n_parse_failed_total: int = 0
+
+
+def _incr_metric(metric: str) -> None:
+    """R58 P1-2: 累计 i18n 失败指标。"""
+    global _i18n_missing_param_total, _i18n_parse_failed_total
+    if metric == "i18n_missing_param_total":
+        _i18n_missing_param_total += 1
+    elif metric == "i18n_parse_failed_total":
+        _i18n_parse_failed_total += 1
+
+
+def _collect_missing_params(text: str, kwargs: dict) -> set:
+    """R58 P1-2: 收集文本中引用但 kwargs 中缺失的参数名。
+
+    扫描:
+        - 简单 {var} 占位符
+        - ICU {var, plural/select/...} 中的 var 名
+
+    排除转义的 \\{var}。
+
+    Args:
+        text: ICU 模板文本
+        kwargs: 调用方传入的参数
+
+    Returns:
+        缺失参数名集合(可能为空)
+    """
+    missing: set = set()
+    # ICU pattern 中的 var
+    for m in _ICU_PATTERN.finditer(text):
+        var_name = m.group(1)
+        if var_name not in kwargs:
+            missing.add(var_name)
+    # 简单 {var} 占位符(排除 ICU pattern 已覆盖的)
+    for m in _SIMPLE_VAR_PATTERN.finditer(text):
+        var_name = m.group(1)
+        # 跳过 ICU pattern 内的 var(已上面处理)
+        if var_name not in kwargs:
+            missing.add(var_name)
+    # 移除转义的占位符(\\{var} 不应算缺失)
+    # 简单处理:如果文本中含 \\{var_name},且无对应非转义 {var_name},则不算缺失
+    return missing
+
 
 def _icu_select_branch(text: str, locale: str, kwargs: dict) -> str:
     """R56 §5.1: 解析 ICU MessageFormat 选择子句并展开。
@@ -160,15 +219,23 @@ def _icu_parse_block(
     # 提取子句 (=N {..} / one {..} / other {..} 等)
     branches = _icu_parse_branches(body)
 
-    # 获取变量值
-    raw_value = kwargs.get(var_name, 0)
-    try:
-        count = int(raw_value)
-    except (TypeError, ValueError):
-        count = 0
-
-    # 选择子句
-    selected = _icu_select_branch_by_count(count, block_type, locale, branches)
+    # R58 P1-1: 获取变量值,分 plural/select 处理
+    #   plural/selectordinal: 需要 int(count)
+    #   select: 需要原始字符串值(male/female/...)
+    count: int = 0
+    if block_type == "select":
+        raw_value = kwargs.get(var_name, "other")
+        if raw_value is None:
+            raw_value = "other"
+        selected = _icu_select_branch_by_value(str(raw_value), branches)
+    else:
+        # plural / selectordinal
+        raw_value = kwargs.get(var_name, 0)
+        try:
+            count = int(raw_value)
+        except (TypeError, ValueError):
+            count = 0
+        selected = _icu_select_branch_by_count(count, block_type, locale, branches)
 
     # 展开 # 占位符为 count(仅 plural/selectordinal)
     if block_type in ("plural", "selectordinal"):
@@ -308,13 +375,15 @@ def _icu_parse_branches(body: str) -> dict[str, str]:
 def _icu_select_branch_by_count(
     count: int, block_type: str, locale: str, branches: dict[str, str]
 ) -> str:
-    """R56 §5.1: 根据 count + locale 选择合适的子句。
+    """R58 P1-1: 根据 count + locale 选择合适的子句(仅 plural/selectordinal)。
 
     优先级:
         1. 精确匹配 =N (如 =0 / =1)
         2. plural: 按 CLDR 复数规则选择 one/other(简化:en=1 用 one,其他用 other;zh 始终 other)
-        3. select: 按 kwargs 中 var 的字符串值选择对应子句(其他→other)
+        3. selectordinal: 简化为 "other"(完整 CLDR ordinal 规则复杂,按需扩展)
         4. 兜底: other
+
+    注意: select 类型不再走此函数,改由 _icu_select_branch_by_value 处理。
     """
     # 精确匹配 =N
     exact_key = f"={count}"
@@ -331,7 +400,27 @@ def _icu_select_branch_by_count(
         if count == 1 and "one" in branches:
             return branches["one"]
         return branches.get("other", "")
-    # select: 按字符串值匹配(此处不直接用 count,留给调用方)
+    # 兜底: other
+    return branches.get("other", "")
+
+
+def _icu_select_branch_by_value(value: str, branches: dict[str, str]) -> str:
+    """R58 P1-1: 根据 select 变量的字符串值选择子句。
+
+    ICU select 语义:
+        1. 精确匹配分支 key(如 male / female)
+        2. 无匹配时回退到 other 分支
+        3. 无 other 分支时返回空字符串
+
+    Args:
+        value: select 变量的原始字符串值(如 "male" / "female" / "other")
+        branches: 子句字典(key=selector, value=branch_text)
+
+    Returns:
+        选中的子句文本
+    """
+    if value in branches:
+        return branches[value]
     return branches.get("other", "")
 
 
@@ -701,11 +790,52 @@ class I18nManager:
         if not is_icu:
             # 旧式 {var} 简单插值
             return self.format_message(key, locale=target_locale, **kwargs)
+        # R58 P1-2: 检测缺失参数(staging/test 硬失败,production 记录指标)
+        # 收集文本中所有简单 {var} 与 ICU {var, ...} 的 var 名
+        missing_params = _collect_missing_params(text, kwargs)
+        if missing_params:
+            env = _get_environment()
+            if env in ("test", "staging"):
+                # 惰性导入避免循环依赖
+                from services.app_error import AppError  # type: ignore[import]
+                from services.error_codes import ErrorCodes  # type: ignore[import]
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={
+                        "field": "icu_params",
+                        "reason": "missing_params_in_icu_template",
+                        "key": key,
+                        "missing": ",".join(sorted(missing_params)),
+                    },
+                )
+            # production: 记录指标,回退到 format_message(会用空字符串替换)
+            logger.warning(
+                f"[i18n] R58 P1-2: ICU template missing params key={key} "
+                f"missing={sorted(missing_params)}"
+            )
+            _incr_metric("i18n_missing_param_total")
         # ICU 解析
         try:
             return _icu_format(text, target_locale, kwargs)
         except Exception as e:
-            logger.debug(f"[i18n] format_message_icu 解析失败 key={key}: {e}")
+            env = _get_environment()
+            if env in ("test", "staging"):
+                from services.app_error import AppError  # type: ignore[import]
+                from services.error_codes import ErrorCodes  # type: ignore[import]
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={
+                        "field": "icu_parse",
+                        "reason": "icu_parse_failed",
+                        "key": key,
+                        "error_type": type(e).__name__,
+                    },
+                ) from e
+            # production: 记录指标,回退(避免把原始 ICU 大括号展示给用户)
+            logger.warning(
+                f"[i18n] R58 P1-2: ICU parse failed key={key}: {type(e).__name__}: {e}"
+            )
+            _incr_metric("i18n_parse_failed_total")
             return self.format_message(key, locale=target_locale, **kwargs)
 
     def format_message(self, key: str, locale: Optional[str] = None, **kwargs: Any) -> str:

@@ -302,7 +302,7 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
             "smoke_passed": True,
         }
 
-    # R56 P1-4: 验证 MFA(若 admin 启用了 MFA,迁移前必须验证 MFA code)
+    # R58 P0-2: 验证 MFA(若 admin 启用了 MFA,迁移前必须真实验证 TOTP)
     # MFA 验证通过后才允许修改密码(防止会话被劫持后改密码)
     if mfa_enabled:
         import getpass as _getpass_mfa
@@ -315,9 +315,39 @@ async def migrate_argon2_offline_safe(username: str, db_path: str = "") -> dict:
                 ErrorCodes.VALIDATION_FAILED,
                 params={"field": "mfa_code", "reason": "mfa_required_but_empty"},
             )
-        # R56 P1-4: MFA receipt(简化实现:记录验证时间戳)
-        # 生产环境应调用 pyotp.TOTP(secret).verify(mfa_code)
-        mfa_receipt = f"verified_{_dt.datetime.now().isoformat()}"
+        # R58 P0-2: 真实 TOTP 验证(不再接受任意非空字符串)
+        # 通过统一 MFA service 验证:重放保护、失败锁定、原子消费 timestep
+        from admin.mfa import get_mfa_manager  # type: ignore[import]
+        try:
+            mfa_mgr = get_mfa_manager()
+            totp_valid = await mfa_mgr.verify_totp_code(principal_id, mfa_code)
+        except Exception as mfa_err:
+            new_password = None
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={
+                    "field": "mfa_code",
+                    "reason": "mfa_service_error",
+                    "error_type": type(mfa_err).__name__,
+                },
+            ) from mfa_err
+        if not totp_valid:
+            new_password = None
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={
+                    "field": "mfa_code",
+                    "reason": "totp_verification_failed",
+                    "principal_id": principal_id,
+                },
+            )
+        # R58 P0-2: 生成不可伪造的 MFA receipt(包含验证时间与 principal)
+        # 绑定本次迁移操作,可用于审计回溯
+        mfa_receipt = (
+            f"totp_verified:principal={principal_id}:"
+            f"ts={_dt.datetime.now().isoformat()}:"
+            f"nonce={secrets.token_hex(8)}"
+        )
     else:
         mfa_receipt = "mfa_not_enabled"
 

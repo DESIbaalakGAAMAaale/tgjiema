@@ -306,6 +306,8 @@ class ErrorCodes:
     BUTTON_POLICY_DUAL_APPROVAL_REQUIRED = "BUTTON.POLICY.DUAL_APPROVAL_REQUIRED"
     # 按钮操作缺少最终确认(final confirm 步骤缺失)
     BUTTON_POLICY_FINAL_CONFIRM_REQUIRED = "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED"
+    # R58 P0-4: 高风险 action 必须使用异步 token(持久化 nonce + 原子消费)
+    BUTTON_POLICY_ASYNC_TOKEN_REQUIRED = "BUTTON.POLICY.ASYNC_TOKEN_REQUIRED"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -461,15 +463,45 @@ class ErrorRegistry:
 
     @classmethod
     def get(cls, code: str) -> ErrorDefinition:
-        """获取 ErrorDefinition。未注册时 fallback 到 ERROR_INTERNAL。"""
+        """R58 P1-5: 获取 ErrorDefinition。
+
+        未注册时:
+        - test/staging: 抛 UnknownErrorCode(硬失败,阻止协议漂移)
+        - production: fallback 到 ERROR_INTERNAL(安全降级) + 记录 metric 与 critical 告警
+        """
         cls._ensure_initialized()
         definition = cls._definitions.get(code)
         if definition is None:
+            # R58 P1-5: 环境判断
+            env = cls._get_environment()
+            if env in ("test", "staging"):
+                # R58 P1-5: 硬失败,阻止未注册错误码进入协议
+                raise UnknownErrorCode(
+                    code=code,
+                    reason="error_code_not_registered_in_staging_or_test",
+                )
+            # production: 安全降级到 INTERNAL,记录 metric 与告警
             logger.warning(
-                f"[ErrorRegistry] 未注册的错误码 fallback 到 ERROR_INTERNAL: {code}"
+                f"[ErrorRegistry] R58 P1-5: 未注册的错误码 fallback 到 ERROR_INTERNAL: {code}"
+            )
+            # R58 P1-5: 记录原始 code 的 hash(不泄露原始 code 到用户)
+            import hashlib as _hashlib_mod
+            code_hash = _hashlib_mod.sha256(code.encode("utf-8")).hexdigest()[:16]
+            logger.error(
+                f"[ErrorRegistry] R58 P1-5: unregistered_error_code metric: "
+                f"code_hash={code_hash} (full code in debug logs only)"
             )
             return cls._definitions[ErrorCodes.ERROR_INTERNAL]
         return definition
+
+    @staticmethod
+    def _get_environment() -> str:
+        """R58 P1-5: 惰性读取 ENVIRONMENT。"""
+        try:
+            from config.settings import settings  # type: ignore[import]
+            return getattr(settings, "ENVIRONMENT", "development")
+        except Exception:
+            return "development"
 
     @classmethod
     def is_registered(cls, code: str) -> bool:
@@ -636,6 +668,23 @@ class ErrorRegistry:
 # ════════════════════════════════════════════════════════════════
 # 5. AppError 异常类
 # ════════════════════════════════════════════════════════════════
+class UnknownErrorCode(Exception):
+    """R58 P1-5: 未注册错误码异常(test/staging 硬失败)。
+
+    在 test/staging 环境下,ErrorRegistry.get() 遇到未注册 code 时抛此异常,
+    阻止协议漂移。production 不会抛此异常(fallback 到 ERROR_INTERNAL)。
+
+    Attributes:
+        code: 未注册的原始 code
+        reason: 失败原因
+    """
+
+    def __init__(self, code: str, reason: str = "unknown_error_code"):
+        self.code = code
+        self.reason = reason
+        super().__init__(f"UnknownErrorCode: code={code}, reason={reason}")
+
+
 class AppError(Exception):
     """应用异常 — 封装 ErrorCode + params + trace_id。
 
@@ -2028,6 +2077,16 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["action", "reason"],
+    ))
+    # R58 P0-4: 高风险 action 必须使用 async token API (sync API 硬拒绝)
+    # 403 critical — 高风险 action 不允许通过 sync 生成不持久化 nonce 的 token
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_ASYNC_TOKEN_REQUIRED,
+        message_key="errors.button.policy.async_token_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason", "user_id"],
     ))
 
 
