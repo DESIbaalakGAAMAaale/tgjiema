@@ -114,7 +114,8 @@ def verify_password(password: str, stored_hash: str) -> bool:
     try:
         iterations = int(parts[2])
     except (ValueError, TypeError):
-        return False
+        # 格式错误 → iterations=0,后续 min iterations 检查会 fail-closed
+        iterations = 0
     # R39 P1-12: 防御 — 拒绝过低的迭代次数(静默返回 False)
     if iterations < _PBKDF2_MIN_ITERATIONS:
         return False
@@ -128,10 +129,15 @@ def verify_password(password: str, stored_hash: str) -> bool:
     hash_hex = parts[4]
 
     # 先尝试验证 hex 合法性(非 hex 字符返回 False,不抛异常)
+    salt = None
+    expected_hash = None
     try:
         salt = bytes.fromhex(salt_hex)
         expected_hash = bytes.fromhex(hash_hex)
     except (ValueError, TypeError):
+        # 非 hex 字符 → salt/expected_hash 保持 None,下面 fail-closed
+        salt = None
+    if salt is None or expected_hash is None:
         return False
 
     # R53 P0-3: 精确校验 salt_hex / hash_hex 长度

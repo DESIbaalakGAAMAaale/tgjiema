@@ -166,8 +166,14 @@ def get_previous_kek() -> bytes | None:
                 kek = base64.b64decode(content)
                 if len(kek) == _KEK_SIZE:
                     return kek
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    _i18n_t(
+                        'services.backup_crypto.logger_previous_kek_decode_failed',
+                        prev_file=prev_file,
+                        e=e,
+                    )
+                )
     # 优先级 2: 环境变量
     prev_b64 = os.environ.get("BACKUP_KEK_PREVIOUS", "").strip()
     if not prev_b64:

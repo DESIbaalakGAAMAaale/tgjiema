@@ -21,3 +21,6 @@ redis==5.0.8
 pyotp>=2.9.0
 # R53 P1-4: zoneinfo 在 Windows 上需要 tzdata 包提供 IANA 时区数据(Linux 自带)
 tzdata>=2024.1
+# R61 P1-06: Babel/ICU 标准库 — 提供 CLDR plural/ordinal 规则(不再自维护 CLDR 数据)
+# services/i18n.py 惰性导入,Babel 缺失时回退到自维护的 en/ru/zh 规则
+Babel>=2.12,<3

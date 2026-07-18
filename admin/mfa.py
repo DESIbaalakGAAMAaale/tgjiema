@@ -55,6 +55,7 @@ from typing import Any, Optional
 from loguru import logger
 
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 # MFA 密钥在 kv_store 中的 key 前缀
 _MFA_SECRET_KEY_PREFIX = "admin:mfa:secret:"
@@ -129,10 +130,10 @@ def _verify_totp(secret: str, code: str) -> bool:
     except ImportError:
         # pyotp 未安装时,fail-closed(拒绝验证)
         logger.error("[admin.mfa] pyotp 未安装,MFA 验证失败(fail-closed)")
-        return False
     except Exception as e:
         logger.warning(f"[admin.mfa] TOTP 验证异常: {e}")
-        return False
+    # fail-closed:pyotp 未安装或异常时返回 False,防止绕过 MFA
+    return False
 
 
 def _find_matching_timestep(secret: str, code: str) -> Optional[int]:
@@ -281,7 +282,8 @@ async def _consume_totp_timestep(principal_id: int, timestep: int) -> bool:
         return False
     except Exception as e:
         logger.warning(f"[admin.mfa] _consume_totp_timestep 原子消费失败,fail-closed: {e}")
-        return False
+    # fail-closed:异常时返回 False(拒绝验证,防止通过制造异常绕过重放保护)
+    return False
 
 
 def _record_totp_usage(principal_id: int, code: str) -> None:
@@ -432,7 +434,8 @@ async def _clear_mfa_failures(principal_id: int) -> bool:
         return True
     except Exception as e:
         logger.warning(f"[admin.mfa] _clear_mfa_failures 删除 SQLite 失败: {e}")
-        return False
+    # fail-closed:删除失败时返回 False(调用方应 fail-closed,失败计数残留可能导致误锁定)
+    return False
 
 
 async def cleanup_expired_mfa_records(retention_hours: int = 24) -> dict:
@@ -851,7 +854,7 @@ def verify_mfa_receipt(
         payload_json = _b64url_decode(payload_b64).decode("utf-8")
         payload = json.loads(payload_json)
     except Exception as e:
-        logger.warning(f"[admin.mfa] MFA receipt payload 解码失败: {e}")
+        logger.warning(_i18n_t('admin.mfa.logger_receipt_payload_decode_failed', e=e))
         raise AppError(
             ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
             params={
@@ -867,8 +870,10 @@ def verify_mfa_receipt(
     if not isinstance(kid, str) or not kid:
         # 无 kid 字段(旧版 token 或被篡改)→ fail-closed
         logger.warning(
-            f"[admin.mfa] MFA receipt 缺少 kid 字段 "
-            f"expected_principal={expected_principal_id}"
+            _i18n_t(
+                'admin.mfa.logger_receipt_kid_missing',
+                expected_principal_id=expected_principal_id,
+            )
         )
         raise AppError(
             ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
@@ -881,8 +886,12 @@ def verify_mfa_receipt(
     key = keyring.get(kid)
     if key is None:
         logger.warning(
-            f"[admin.mfa] MFA receipt kid={kid!r} 不在密钥环中(已知 kid: "
-            f"{list(keyring.keys())}) expected_principal={expected_principal_id}"
+            _i18n_t(
+                'admin.mfa.logger_receipt_kid_not_in_keyring',
+                kid=kid,
+                known_kids=list(keyring.keys()),
+                expected_principal_id=expected_principal_id,
+            )
         )
         raise AppError(
             ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
@@ -1095,7 +1104,8 @@ async def consume_mfa_receipt(jti: str) -> bool:
         logger.warning(
             f"[admin.mfa] consume_mfa_receipt 原子消费失败, fail-closed: {e}"
         )
-        return False
+    # fail-closed:异常时返回 False(拒绝执行高风险动作)
+    return False
 
 
 class MFAManager:
@@ -1233,7 +1243,8 @@ class MFAManager:
                 await _record_mfa_failure(user_id)
             except Exception as rec_err:
                 logger.debug(f"[admin.mfa] 异常路径记录失败异常(忽略): {rec_err}")
-            return False
+        # fail-closed:异常时返回 False(防止通过制造异常绕过限流)
+        return False
 
     async def is_mfa_enabled(self, user_id: int) -> bool:
         """判断用户是否已启用 MFA。
@@ -1255,7 +1266,8 @@ class MFAManager:
             return enabled == "1"
         except Exception as e:
             logger.debug(f"[admin.mfa] 查询 MFA 启用状态失败: {e}")
-            return False
+        # fail-closed:查询失败时返回 False(视为未启用,调用方应另行校验)
+        return False
 
     async def enable_mfa(self, user_id: int) -> bool:
         """启用用户的 MFA(在用户首次验证通过后调用)。
@@ -1278,7 +1290,8 @@ class MFAManager:
             return True
         except Exception as e:
             logger.warning(f"[admin.mfa] 启用 MFA 失败: {e}")
-            return False
+        # fail-closed:启用失败时返回 False(调用方应拒绝继续)
+        return False
 
     async def disable_mfa(self, user_id: int) -> bool:
         """禁用用户的 MFA。

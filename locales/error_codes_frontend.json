@@ -2,7 +2,7 @@
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
     "enum_count": 109,
-    "generated_at": "2026-07-17T16:32:26.217157Z",
+    "generated_at": "2026-07-18T04:47:36.556143Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",

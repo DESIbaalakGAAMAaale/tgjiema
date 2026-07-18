@@ -1677,6 +1677,11 @@
       "s1": "未登录或会话已过期",
       "s2": "会话无效或已过期,请重新登录"
     },
+    "mfa": {
+      "logger_receipt_payload_decode_failed": "[admin.mfa] MFA receipt payload decode failed: {e}",
+      "logger_receipt_kid_missing": "[admin.mfa] MFA receipt missing kid field expected_principal={expected_principal_id}",
+      "logger_receipt_kid_not_in_keyring": "[admin.mfa] MFA receipt kid={kid!r} not in keyring (known kids: {known_kids}) expected_principal={expected_principal_id}"
+    },
     "__init__": {
       "s1": "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>登录 - TG解码器管理后台</title>\n<style nonce=\"{csp_nonce}\">\nbody {{ font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n       background: #f5f5f5; margin: 0; padding: 40px 20px; }}\n.login-container {{ max-width: 400px; margin: 60px auto; background: #fff;\n                    padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}\nh1 {{ margin: 0 0 24px 0; font-size: 24px; color: #333; }}\nlabel {{ display: block; margin-bottom: 8px; font-weight: 500; color: #555; }}\ninput[type=\"text\"], input[type=\"password\"] {{ width: 100%; padding: 10px 12px;\n     border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box; }}\ninput[type=\"text\"]:focus, input[type=\"password\"]:focus {{ outline: none;\n     border-color: #1565c0; box-shadow: 0 0 0 3px rgba(21,101,192,0.1); }}\nbutton {{ width: 100%; padding: 12px; background: #1565c0; color: #fff;\n        border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}\nbutton:hover {{ background: #0d47a1; }}\n.error {{ color: #d32f2f; font-size: 13px; margin-top: 12px; min-height: 18px; }}\n@media (prefers-reduced-motion: reduce) {{\n  *, *::before, *::after {{\n    animation-duration: 0.01ms !important;\n    animation-iteration-count: 1 !important;\n    transition-duration: 0.01ms !important;\n    scroll-behavior: auto !important;\n  }}\n}}\n</style>\n</head>\n<body>\n<div class=\"login-container\">\n<h1>管理后台登录</h1>\n<form method=\"POST\" action=\"/login\">\n<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">\n<div>\n<label for=\"username\">用户名</label>\n<input type=\"text\" id=\"username\" name=\"username\" autocomplete=\"username\" required>\n</div>\n<div style=\"margin-top: 16px;\">\n<label for=\"password\">密码</label>\n<input type=\"password\" id=\"password\" name=\"password\" autocomplete=\"current-password\" required>\n</div>\n<button type=\"submit\">登录</button>\n<div class=\"error\" role=\"alert\">{error_message}</div>\n</form>\n</div>\n</body>\n</html>",
       "s2": "<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n<meta charset=\"UTF-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<title>MFA 验证 - TG解码器管理后台</title>\n<style nonce=\"{csp_nonce}\">\nbody {{ font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif;\n       background: #f5f5f5; margin: 0; padding: 40px 20px; }}\n.login-container {{ max-width: 400px; margin: 60px auto; background: #fff;\n                    padding: 32px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}\nh1 {{ margin: 0 0 24px 0; font-size: 24px; color: #333; }}\nlabel {{ display: block; margin-bottom: 8px; font-weight: 500; color: #555; }}\ninput[type=\"text\"] {{ width: 100%; padding: 10px 12px;\n     border: 1px solid #ddd; border-radius: 4px; font-size: 14px; box-sizing: border-box;\n     letter-spacing: 4px; text-align: center; }}\ninput[type=\"text\"]:focus {{ outline: none;\n     border-color: #1565c0; box-shadow: 0 0 0 3px rgba(21,101,192,0.1); }}\nbutton {{ width: 100%; padding: 12px; background: #1565c0; color: #fff;\n        border: none; border-radius: 4px; font-size: 14px; cursor: pointer; margin-top: 16px; }}\nbutton:hover {{ background: #0d47a1; }}\n.hint {{ color: #595959; font-size: 12px; margin-top: 12px; }}\n</style>\n</head>\n<body>\n<div class=\"login-container\">\n<h1>MFA 二步验证</h1>\n<p style=\"color:#555; font-size:14px;\">用户 {username} 已启用 MFA,请输入身份验证器 App 中的 6 位代码</p>\n<form method=\"POST\" action=\"/login/mfa\">\n<input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">\n<input type=\"hidden\" name=\"challenge_token\" value=\"{challenge_token}\">\n<div style=\"margin-top: 16px;\">\n<label for=\"totp_code\">6 位验证码</label>\n<input type=\"text\" id=\"totp_code\" name=\"totp_code\" inputmode=\"numeric\" pattern=\"[0-9]{{6}}\" maxlength=\"6\" required>\n</div>\n<button type=\"submit\">验证</button>\n<div class=\"hint\">验证码每 30 秒更新一次,允许 ±30s 时间漂移</div>\n</form>\n</div>\n</body>\n</html>",
@@ -1781,7 +1786,8 @@
       "s7": "备份已加密但 BACKUP_KEK 未配置,无法解密",
       "s8": "manifest 缺少必需字段: {field}",
       "s9": "R40 P0-6: 明文 checksum 校验失败(expected={expected_plaintext_sha256_16}, actual={actual_sha_16})",
-      "s10": "R40 P0-6: 解密后明文 checksum 校验失败(expected={expected_plaintext_sha256_16}, actual={actual_sha_16})"
+      "s10": "R40 P0-6: 解密后明文 checksum 校验失败(expected={expected_plaintext_sha256_16}, actual={actual_sha_16})",
+      "logger_previous_kek_decode_failed": "[backup_crypto] BACKUP_KEK_PREVIOUS_FILE decode failed {prev_file}: {e}, falling back to BACKUP_KEK_PREVIOUS env var"
     },
     "backup_engine": {
       "s1": "扫描 {scanned} 个 backup_id,删除 {deleted} 个孤儿对象,{errors} 个删除失败",
@@ -2001,7 +2007,9 @@
       "s3": "CRDB 表缺失 tombstone handler(策略={table_name} → CRDB)",
       "s4": "未知 operation(合法: upsert/tombstone)",
       "s5": "dispatch 返回未处理 id",
-      "s6": "crdb_sync dispatch 失败: {error_msg}"
+      "s6": "crdb_sync dispatch 失败: {error_msg}",
+      "logger_read_environment_failed": "[crdb_sync] R39 P1-1: failed to read ENVIRONMENT, treating as development: {e}",
+      "logger_archive_only_check_failed": "[crdb_sync] R41 P0-6: is_archive_only check failed table={table_name}, continuing with CRDB branch: {e}"
     },
     "db_backup": {
       "s1": "R39 P1-6 + R40 P0-6: 临时 payload 密文 checksum 不匹配(expected_cipher={str_expected_cipher_sha_16}, actual={verify_sha_16})",
@@ -2122,7 +2130,9 @@
       "s14": "%Y年%m月%d日 %H:%M",
       "s15": "年0",
       "s16": "年",
-      "s17": "上午"
+      "s17": "上午",
+      "logger_release_mode_read_failed": "[i18n] _get_release_mode failed to read RELEASE_BUILD: {err}",
+      "logger_babel_ordinal_unavailable": "[i18n] Babel ordinal unavailable, falling back to built-in rules: {err}"
     },
     "maintenance_mode": {
       "s1": "数据库未初始化",
@@ -2418,6 +2428,29 @@
         "s8": "A槽",
         "s9": "[拓扑] 组{group_key}缺失: {join_missing}"
       }
+    },
+    "backup_dr_validate": {
+      "logger_staging_cleanup_failed": "[backup_dr_validate] staging cleanup failed (ignored): {cleanup_err}",
+      "logger_manifest_download_failed": "[backup_dr_validate] R61 P0-03: Failed to download manifest bytes: {e}",
+      "logger_manifest_not_found": "[backup_dr_validate] R61 P0-03: manifest.json not found: {manifest_key}",
+      "logger_manifest_sha_mismatch": "[backup_dr_validate] R61 P0-03: manifest bytes SHA256 mismatch: expected={expected}..., actual={actual}... (manifest may be tampered)",
+      "logger_manifest_json_parse_failed": "[backup_dr_validate] R61 P0-03: manifest JSON parse failed: {e}",
+      "logger_manifest_missing_fields": "[backup_dr_validate] R61 P0-03: manifest missing required fields: {missing}",
+      "logger_schema_incompatible": "[backup_dr_validate] R61 P0-03: schema incompatible: {reason}",
+      "logger_atomic_restore_failed": "[backup_dr_validate] R61 P0-03: atomic restore failed: {msg}",
+      "logger_skip_strict_no_note": "[backup_dr_validate] R61 P0-03: validate_and_restore_backup_strict called with skip_strict_validation=True but no validation_note — audit trail will be incomplete",
+      "logger_skip_strict_compat_mode": "[backup_dr_validate] R61 P0-03: skip_strict_validation=True (compatibility mode). Note: {validation_note}"
+    },
+    "error_codes": {
+      "logger_locale_validation_skip": "Locale key validation skipped (file unreadable or parse failed): {err}",
+      "logger_validation_error": "R61 P1-05 validation error: {err}"
+    },
+    "data_lifecycle": {
+      "logger_break_glass_validation_passed": "Break-glass two-person approval validation passed action_id={action_id} approvers={approvers} jti_count={jti_count} permission={permission}",
+      "logger_uow_rollback_failed": "UoW rollback failed action_id={action_id}: {err}"
+    },
+    "crdb_sync_event_wakeup": {
+      "logger_wait_dirty_signal_timeout": "[crdb_sync_event] R56 §7.2.3: wait_dirty_signal timeout (expected)"
     }
   }
 }

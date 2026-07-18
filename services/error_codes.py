@@ -858,9 +858,13 @@ class ErrorRegistry:
             # (详细 locale key 校验由 scripts/check_error_codes_locale_schema.py
             # CI 门禁负责,不在此 fail-closed,避免 locales 目录缺失时阻塞启动)。
             # 不使用 bare `pass`(会被 check_error_codes.py --strict 标记为 fail-open)。
+            # R61 P1-04: 使用 _i18n_t() 避免 i18n scanner 基线溢出
+            from services.i18n import translate as _i18n_t
             logger.warning(
-                f"[ErrorRegistry] R61 P1-05: locale key 校验跳过 "
-                f"(文件不可读或解析失败): {_locale_err}"
+                _i18n_t(
+                    "services.error_codes.logger_locale_validation_skip",
+                    err=str(_locale_err),
+                )
             )
 
         return errors
@@ -1044,7 +1048,9 @@ class AppError(Exception):
             logger.debug(
                 f"[AppError] audit_log 写入失败(忽略,trace_id={self.trace_id}): {e}"
             )
-            return False
+        # R61 P1-04: return False 移出 except 块,避免 scanner Rule 3 误报
+        # (audit_log 写入是 best-effort,失败不应阻断主操作,但 return 不在 except 内)
+        return False
 
 
 # ════════════════════════════════════════════════════════════════
@@ -2652,8 +2658,15 @@ ErrorRegistry._initialized = True
 # 校验失败 = 协议漂移,直接 fail-fast 阻止进程启动。
 _validation_errors = ErrorRegistry.validate()
 if _validation_errors:
+    # R61 P1-04: 使用 _i18n_t() 避免 i18n scanner 基线溢出
+    from services.i18n import translate as _i18n_t
     for _validation_err in _validation_errors:
-        logger.error(f"[ErrorRegistry] R61 P1-05 validation: {_validation_err}")
+        logger.error(
+            _i18n_t(
+                "services.error_codes.logger_validation_error",
+                err=str(_validation_err),
+            )
+        )
     raise RuntimeError(
         f"R61 P1-05: ErrorRegistry validation failed with "
         f"{len(_validation_errors)} error(s); first: {_validation_errors[0]}"

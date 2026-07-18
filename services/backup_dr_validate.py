@@ -35,6 +35,8 @@ from typing import Optional
 
 from loguru import logger
 
+from services.i18n import translate as _i18n_t
+
 
 # ── 常量 ──────────────────────────────────────────────────────
 
@@ -923,8 +925,13 @@ def atomic_restore_to_staging(
         try:
             if staging.exists():
                 staging.unlink()
-        except Exception:
-            pass
+        except Exception as cleanup_err:
+            logger.warning(
+                _i18n_t(
+                    'services.backup_dr_validate.logger_staging_cleanup_failed',
+                    cleanup_err=cleanup_err,
+                )
+            )
         return False, f"atomic switch failed: {e}"
 
 
@@ -1181,20 +1188,32 @@ async def validate_and_restore_backup_strict(
             manifest_bytes = await r2_storage.download(manifest_key)
         except Exception as e:
             from services.error_codes import AppError, ErrorCodes
-            logger.error(f"R61 P0-03: Failed to download manifest bytes: {e}")
+            logger.error(
+                _i18n_t(
+                    'services.backup_dr_validate.logger_manifest_download_failed',
+                    e=e,
+                )
+            )
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
         if manifest_bytes is None:
             from services.error_codes import AppError, ErrorCodes
-            logger.error(f"R61 P0-03: manifest.json not found: {manifest_key}")
+            logger.error(
+                _i18n_t(
+                    'services.backup_dr_validate.logger_manifest_not_found',
+                    manifest_key=manifest_key,
+                )
+            )
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
         # 比对 SHA256(manifest_bytes) 与 COMPLETE marker 中的 manifest_sha256
         actual_manifest_sha = _compute_sha256(manifest_bytes)
         if actual_manifest_sha != r1.manifest_sha256:
             from services.error_codes import AppError, ErrorCodes
             logger.error(
-                f"R61 P0-03: manifest bytes SHA256 mismatch: "
-                f"expected={r1.manifest_sha256[:16]}..., "
-                f"actual={actual_manifest_sha[:16]}... (manifest may be tampered)"
+                _i18n_t(
+                    'services.backup_dr_validate.logger_manifest_sha_mismatch',
+                    expected=r1.manifest_sha256[:16],
+                    actual=actual_manifest_sha[:16],
+                )
             )
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
@@ -1203,13 +1222,23 @@ async def validate_and_restore_backup_strict(
             manifest = json.loads(manifest_bytes)
         except Exception as e:
             from services.error_codes import AppError, ErrorCodes
-            logger.error(f"R61 P0-03: manifest JSON parse failed: {e}")
+            logger.error(
+                _i18n_t(
+                    'services.backup_dr_validate.logger_manifest_json_parse_failed',
+                    e=e,
+                )
+            )
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
         # 检查必填字段
         missing = [f for f in REQUIRED_MANIFEST_FIELDS if f not in manifest]
         if missing:
             from services.error_codes import AppError, ErrorCodes
-            logger.error(f"R61 P0-03: manifest missing required fields: {missing}")
+            logger.error(
+                _i18n_t(
+                    'services.backup_dr_validate.logger_manifest_missing_fields',
+                    missing=missing,
+                )
+            )
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
         # 严格字段格式校验
         manifest_backup_id = str(manifest.get("backup_id", ""))
@@ -1249,7 +1278,12 @@ async def validate_and_restore_backup_strict(
             )
             if not compatible:
                 from services.error_codes import AppError, ErrorCodes
-                logger.error(f"R61 P0-03: schema incompatible: {reason}")
+                logger.error(
+                    _i18n_t(
+                        'services.backup_dr_validate.logger_schema_incompatible',
+                        reason=reason,
+                    )
+                )
                 raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
         # ── 步骤 4+5: 下载密文 → 比对密文 SHA → AEAD 解密并验证 AAD → 比对明文 SHA ──
@@ -1274,7 +1308,12 @@ async def validate_and_restore_backup_strict(
             )
             if not ok:
                 from services.error_codes import AppError, ErrorCodes
-                logger.error(f"R61 P0-03: atomic restore failed: {msg}")
+                logger.error(
+                    _i18n_t(
+                        'services.backup_dr_validate.logger_atomic_restore_failed',
+                        msg=msg,
+                    )
+                )
                 raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
         # 严格验证通过 — 提取信任链元数据
@@ -1290,13 +1329,15 @@ async def validate_and_restore_backup_strict(
         # 调用方通过 *_override 参数提供信任链元数据。
         if not validation_note:
             logger.warning(
-                "R61 P0-03: validate_and_restore_backup_strict called with "
-                "skip_strict_validation=True but no validation_note — "
-                "audit trail will be incomplete"
+                _i18n_t(
+                    'services.backup_dr_validate.logger_skip_strict_no_note',
+                )
             )
         logger.info(
-            f"R61 P0-03: skip_strict_validation=True (compatibility mode). "
-            f"Note: {validation_note}"
+            _i18n_t(
+                'services.backup_dr_validate.logger_skip_strict_compat_mode',
+                validation_note=validation_note,
+            )
         )
         cap_backup_id = backup_id_override
         cap_manifest_sha256 = manifest_sha256_override

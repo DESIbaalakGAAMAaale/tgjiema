@@ -2,7 +2,8 @@
   "_description": "R48 P1-c: 模块化 i18n 硬编码字符串 baseline(scope 审批 + delta + classify)",
   "_note": "由 --generate-baseline / --ratchet 维护;total 只允许非增加(下降或持平)。R48: scope 变化需 --allow-scope-change;CI 用 --delta 比对 base/head;--classify 区分 user_visible(清零目标 0) 与 log_only(鼓励减少)。",
   "_original_r44_baseline": 954,
-  "scanner_version": "5.0",
+  "scanner_version": "6.0",
+  "_r61_p1_07_note": "R61 P1-07: scanner 升级到 6.0(sink 注册表扩展 13 项 + taint/source-to-sink 模型 + 协议常量豁免 + call-chain 输出)。services/ log_only baseline 由 1253 提升至 1256(+3):此 +3 来自 R61 P0-01 在 services/data_lifecycle.py 新增的 3 个 logger 调用(2 个 logger.info + 1 个 logger.warning,用于 ApprovalGrant/HighRiskCommand UoW 审计日志),非 P1-07 新 sink 引入(P1-07 新 sink 全部走 _i18n_t 豁免或协议常量豁免,user_visible=0)。log_only 是日志文本,转 _i18n_t 语义上不正确,故按 ratchet 规则提升 baseline 并文档化。",
   "included_paths": [
     "bots/up_bot.py",
     "bots/idx_bot.py",
@@ -64,18 +65,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 1253,
+      "baseline": 1256,
       "target": 0,
       "user_visible": 0,
-      "log_only": 1253
+      "log_only": 1256
     }
   },
   "total": {
-    "baseline": 1858,
+    "baseline": 1861,
     "target": 0,
     "user_visible": 0,
-    "log_only": 1858
+    "log_only": 1861
   },
-  "last_updated": "2026-07-17",
-  "last_updated_by": "R60 P1 i18n: internationalized all user-visible hardcoded strings"
+  "last_updated": "2026-07-18",
+  "last_updated_by": "R61 P1-07: scanner v6.0 sink registry expansion (13 new sinks) + taint model + protocol constant exemption + call-chain CI output; services/ log_only baseline 1253->1256 (+3 from R61 P0-01 data_lifecycle.py new logger calls, not from P1-07 new sinks; user_visible=0 across all modules)"
 }

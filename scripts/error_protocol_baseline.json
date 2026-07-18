@@ -7,7 +7,7 @@
     "security": {
       "description": "认证、授权、MFA、密码、token、签名验证相关",
       "max_violations": 0,
-      "baseline_violations": 27,
+      "baseline_violations": 0,
       "paths": [
         "admin/passwords.py",
         "admin/mfa.py",
@@ -20,7 +20,7 @@
     "destructive": {
       "description": "删除、清除、purge、reset 等不可逆操作",
       "max_violations": 0,
-      "baseline_violations": 9,
+      "baseline_violations": 0,
       "paths": [
         "services/data_lifecycle.py",
         "admin/purge.py"
@@ -29,7 +29,7 @@
     "data-integrity": {
       "description": "备份、恢复、事务、outbox、数据一致性",
       "max_violations": 0,
-      "baseline_violations": 35,
+      "baseline_violations": 0,
       "paths": [
         "services/backup_dr_validate.py",
         "services/backup_crypto.py",
@@ -55,6 +55,6 @@
     }
   },
   "total_max_violations": 305,
-  "violation_count": 349,
+  "violation_count": 278,
   "previous_violation_count": 349
 }

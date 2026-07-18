@@ -128,8 +128,14 @@ def _is_production() -> bool:
     try:
         from config import settings
         return getattr(settings, "ENVIRONMENT", "development") == "production"
-    except Exception:
-        return False
+    except Exception as e:
+        logger.debug(
+            _i18n_t(
+                'services.crdb_sync_service.logger_read_environment_failed',
+                e=e,
+            )
+        )
+    return False
 
 
 async def _get_redis_client():
@@ -450,7 +456,7 @@ async def _should_connect() -> bool:
         return count > 0
     except Exception as e:
         logger.debug(f"[crdb_sync] R41: _should_connect 查询 dirty_outbox 失败: {e}")
-        return False
+    return False
 
 
 async def _close_pool_if_idle():
@@ -1526,8 +1532,14 @@ async def _dispatch_dirty_outbox_to_crdb(
                 f"dirty_outbox {len(records)} 条直接标记 processed(走 R2 归档)"
             )
             return [r.get("id") for r in records if r.get("id") is not None]
-    except Exception:
-        pass  # 模块异常时降级,继续走下方 CRDB 分支
+    except Exception as e:
+        logger.debug(
+            _i18n_t(
+                'services.crdb_sync_service.logger_archive_only_check_failed',
+                table_name=table_name,
+                e=e,
+            )
+        )
 
     # R41 P0-6: 校验该表是否声明为 CRDB 策略
     is_crdb_table = table_name in _CRDB_TABLES

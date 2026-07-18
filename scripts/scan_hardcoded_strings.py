@@ -89,7 +89,9 @@ from pathlib import Path
 
 # R60 §10: scanner 版本(分类基于 AST call node 真实父调用,移除 ±2 行邻行猜测;
 # HTML 改用 html.parser 遍历 DOM,不再纯正则)
-SCANNER_VERSION = "5.0"
+# R61 P1-07: sink 注册表扩展(render context / Response / JSONResponse / HTMLResponse
+# / 邮件 / 通知)+ 递归 dict/list/tuple 抽取 + 协议常量豁免 + call-chain 输出
+SCANNER_VERSION = "6.0"
 
 # 中文 Unicode 范围(仅用于向后兼容旧测试的 CJK 检测;R59 §5.1 P1 后 classify_finding
 # 不再使用此常量做 user_visible/log_only 区分,所有 sink 字面量统一归 user_visible)
@@ -97,6 +99,12 @@ CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
 
 # R58 P1-4: AST sink-based 扫描 — sink 函数名(Python)
 # 调用这些方法时,字符串字面量参数被视为用户面向输出
+# R61 P1-07: 新增 sink 必须先在此注册,才能被 scan_python_content 识别为 user_visible。
+# 新增覆盖审计要求的用户面向出口:
+#   - render context(TemplateResponse/render/render_template 的 context=)
+#   - Response/JSONResponse/HTMLResponse(content= 携带用户可见文本)
+#   - HTML/JS DOM(HTMLResponse content= 直接内联 HTML)
+#   - email and notification(send_mail/send_email/notify/push_notification)
 PYTHON_SINK_FUNCS = frozenset({
     # Telegram Bot sendMessage 系列
     'reply_text', 'reply_photo', 'reply_document', 'reply_video', 'reply_audio',
@@ -116,11 +124,32 @@ PYTHON_SINK_FUNCS = frozenset({
     'flash',
     # FastAPI HTTPException (with detail= kwarg)
     'HTTPException',
+    # R61 P1-07: Web 框架响应 sink — content/context 携带用户可见文本
+    # JSONResponse(content={"msg": "..."}) / HTMLResponse(content="<html>...")
+    # / Response(content="...") — 注意 RedirectResponse 不在此列(仅携带 URL,非用户文本)
+    'JSONResponse', 'HTMLResponse', 'PlainResponse', 'Response',
+    # render context — TemplateResponse(request, name, context={...}) / render_template
+    'TemplateResponse', 'render', 'render_template',
+    # R61 P1-07: 邮件 / 通知 sink — body/subject/text 携带用户可见文本
+    'send_mail', 'send_email', 'email_message',
+    'notify', 'push_notification', 'send_notification',
 })
 
 # R58 P1-4: sink 关键字参数名 — 字符串字面量传入这些关键字时视为用户面向
+# R61 P1-07: content/context/subject/body 不加入此集合(过于通用,会误伤非 sink 调用);
+# 这些关键字通过所属函数 ∈ PYTHON_SINK_FUNCS 触发检查(JSONResponse/HTMLResponse/
+# TemplateResponse/send_mail 等已注册为 sink func,其全部 kwarg 均被检查)。
 PYTHON_SINK_KEYWORDS = frozenset({
     'detail', 'text', 'message', 'caption', 'description',
+})
+
+# R61 P1-07: 结构性 kwargs — 即使在 sink 调用中也不是用户可见文本
+# (HTTP 头/状态码/cookie/编码 等结构性参数; RedirectResponse 的 url 也属此类,
+#  但 RedirectResponse 已从 PYTHON_SINK_FUNCS 移除,此处保留 url 以防 Response 子类使用)
+# 这些 kwargs 的值(含嵌套 dict/list 字面量)不被扫描
+SINK_STRUCTURAL_KWARGS = frozenset({
+    'status_code', 'headers', 'url', 'content_type', 'media_type',
+    'cookies', 'background', 'charset',
 })
 
 # R58 P1-4: 豁免函数名 — 字符串字面量来自这些函数调用时不算违规
@@ -236,6 +265,63 @@ def _is_internal_protocol(text: str) -> bool:
     return bool(_INTERNAL_PROTOCOL_RE.match(text))
 
 
+# R61 P1-07: 协议常量豁免 — 非用户可见的结构性字符串(允许流入 sink)
+# 审计要求:所有字符串字面量默认可疑,只有协议常量可显式豁免。
+# 仅协议/结构常量(非自然语言文本)可豁免;技术标识符(表名/列名/键前缀)不豁免,
+# 因为它们若流入用户面向 sink 仍可能是用户可见文本。
+PROTOCOL_CONSTANT_EXACT = frozenset({
+    # HTTP / JSON 协议状态值(机器可读,非自然语言)
+    'OK', 'FAIL', 'ok', 'fail', 'not_ready', 'unknown', 'ready', 'passed',
+    'true', 'false', 'null', 'none', 'None', 'True', 'False',
+    # HTTP 状态码
+    '200', '201', '204', '301', '302', '303', '304', '400', '401', '403',
+    '404', '405', '409', '410', '422', '429', '500', '501', '502', '503', '504',
+    # 单字符分隔符 / 标点(结构性,非用户文本)
+    '', ' ', ':', ',', ';', '-', '_', '/', '.', '|', '=', '?', '!', '@', '#',
+    # 格式占位符(str.format / printf / loguru 标记)
+    '{}', '%s', '%d', '%r', '%i', '%f',
+})
+
+# 协议常量正则(匹配上述集合未覆盖的结构性模式)
+_PROTOCOL_CONSTANT_RE = re.compile(
+    r'^(?:'
+    r'\{\}|'                         # {}
+    r'\{[a-zA-Z_][a-zA-Z0-9_]*\}|'   # {key}
+    r'\{[^{}]*\}|'                   # {anything} — loguru format markers / f-string 占位
+    r'%[sdrifo]|'                    # %s %d %r 等
+    r'\d{3}|'                        # HTTP 状态码 200/404
+    r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|'  # UUID
+    r'0x[0-9a-fA-F]+|'              # hex
+    r'\d+|'                          # 纯数字
+    r'[:,\-_/\.|]'                   # 单字符分隔符
+    r')$'
+)
+
+
+def _is_protocol_constant(text: str) -> bool:
+    """R61 P1-07: 检测字符串是否为协议/结构常量(非用户可见,允许流入 sink)。
+
+    协议常量包括:
+        - HTTP/JSON 状态值:"OK" / "FAIL" / "ok" / "not_ready" / "unknown"
+        - HTTP 状态码:"200" / "404" / "503"
+        - 布尔/null 字面量:"true" / "false" / "null" / "none"
+        - 格式占位符:"{}" / "{key}" / "%s" / "%d" / loguru markers
+        - 单字符分隔符:":" / "," / "-" / "_" / "/" / "." / "|"
+        - UUID / hex / 纯数字
+
+    这些是机器可读的结构性字符串,非自然语言文本,允许流入用户面向 sink。
+
+    Args:
+        text: 字符串字面量(已展开 f-string 占位符为 {})
+
+    Returns:
+        True 表示是协议常量,应跳过;False 表示需继续检测
+    """
+    if text in PROTOCOL_CONSTANT_EXACT:
+        return True
+    return bool(_PROTOCOL_CONSTANT_RE.match(text))
+
+
 # === 工具函数 ===
 
 def is_skipped(path: Path) -> bool:
@@ -285,6 +371,29 @@ def _get_call_name(node: ast.Call) -> str:
     return ''
 
 
+def _is_potential_string_arg(node: ast.AST) -> bool:
+    """R61 P1-07: 检查节点是否可能携带字符串字面量(用于 sink 关键字触发判定)。
+
+    用于 _is_sink_call:仅当 sink 关键字(如 text=)的值是字符串型时才识别为 sink,
+    避免 text=True(text=True 是 subprocess.run 的布尔标志,非用户文本)等误触发。
+
+    判定为字符串型的节点:
+        - str 常量(Constant str)
+        - f-string(JoinedStr)
+        - dict/list/tuple/set 字面量(可能嵌套字符串)
+        - IfExp 条件表达式(可能分支含字符串,如 x if cond else "msg")
+    """
+    if isinstance(node, ast.JoinedStr):
+        return True
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, str)
+    if isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set)):
+        return True
+    if isinstance(node, ast.IfExp):
+        return True
+    return False
+
+
 def _is_sink_call(node: ast.Call) -> bool:
     """R58 P1-4: 检查 Call 节点是否是用户面向 sink 调用。
 
@@ -293,7 +402,10 @@ def _is_sink_call(node: ast.Call) -> bool:
        (即使含 text=/detail= 等 sink 关键字参数,如 _i18n_t('key', text=text))
     2. logger.*/logging.*/print() → 永远不是 sink
     3. 函数名 ∈ PYTHON_SINK_FUNCS(reply_text/send_message/HTTPException/flash 等)→ sink
-    4. 含 PYTHON_SINK_KEYWORDS(detail/text/message/...) 关键字参数 → sink
+    4. 含 PYTHON_SINK_KEYWORDS(detail/text/message/...) 关键字参数
+       且该参数值是字符串型(str/f-string/dict/list/tuple)→ sink
+       (R61 P1-07: 限制为字符串型值,避免 text=True/text=False 等布尔标志误触发,
+        如 subprocess.run(..., text=True, [...]) 不应被识别为 sink)
     """
     func = node.func
     name = _get_call_name(node)
@@ -311,8 +423,9 @@ def _is_sink_call(node: ast.Call) -> bool:
         return True
 
     # 含 sink 关键字参数(detail="..."/text="..."/message="..."/...)
+    # R61 P1-07: 仅当值为字符串型时才触发(避免 text=True 布尔标志误触发)
     for kw in node.keywords:
-        if kw.arg in PYTHON_SINK_KEYWORDS:
+        if kw.arg in PYTHON_SINK_KEYWORDS and _is_potential_string_arg(kw.value):
             return True
 
     return False
@@ -357,10 +470,92 @@ def _describe_sink(node: ast.Call, kwarg_name: str = '') -> str:
     return f'sink:{name}'
 
 
+def _describe_sink_chain(node: ast.Call, kwarg_name: str, chain: tuple[str, ...]) -> str:
+    """R61 P1-07: 生成带 call-chain 的 sink 描述。
+
+    call-chain = 从 sink 调用到字面量的路径,用于 CI 输出 file:line:call-chain。
+    例:
+        reply_text("hello")                 → sink:reply_text
+        HTTPException(detail="...")         → sink:HTTPException.detail
+        JSONResponse(content={"msg": "x"})  → sink:JSONResponse.content.dict[msg]
+        send_message(chat_id, [a, "b"])     → sink:send_message.[1]
+
+    Args:
+        node: sink Call 节点
+        kwarg_name: 关键字参数名(位置参数为 '')
+        chain: 嵌套路径元组(如 ('dict[msg]',) / ('[1]',));直接字面量为 ()
+    """
+    name = _get_call_name(node)
+    parts = []
+    if kwarg_name:
+        parts.append(kwarg_name)
+    parts.extend(chain)
+    if parts:
+        return f'sink:{name}.{".".join(parts)}'
+    return f'sink:{name}'
+
+
+def _extract_sink_strings(node: ast.AST, chain: tuple[str, ...] = ()) -> list[tuple[str, tuple[str, ...]]]:
+    """R61 P1-07: 递归从 sink 参数节点抽取字符串字面量(支持 dict/list/tuple 嵌套)。
+
+    taint / source-to-sink 模型的核心:
+        - 字符串字面量(Constant str / f-string)是 source(默认可疑)
+        - 字面量流入 sink(JSONResponse/send_message/HTTPException 等)即 tainted
+        - 字面量若来自 exempt Call(_i18n_t/translate/ErrorEnvelope 等)则不算违规
+          (exempt Call 节点本身不被深入,其内部的 i18n key 字面量不被收集)
+
+    返回 [(text, chain), ...]:
+        - text: 字面量内容(f-string 占位符展开为 {})
+        - chain: 从参数根到字面量的路径(如 ('dict[status]',) / ('[1]',))
+          直接字面量参数 chain 为 ()
+
+    跳过:
+        - exempt Call(_i18n_t('key') 等)— 字面量是 i18n key,非用户可见文本
+        - 非 exempt Call(str.format / str.join 等)— 不深入其参数
+          (避免 .format() 模板字面量被误报;模板已在直接参数处捕获)
+    """
+    results: list[tuple[str, tuple[str, ...]]] = []
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        results.append((node.value, chain))
+    elif isinstance(node, ast.JoinedStr):
+        # f-string: f"hello {name}" → "hello {}"
+        parts: list[str] = []
+        for val in node.values:
+            if isinstance(val, ast.Constant) and isinstance(val.value, str):
+                parts.append(val.value)
+            elif isinstance(val, ast.FormattedValue):
+                parts.append('{}')
+        if parts:
+            results.append((''.join(parts), chain))
+    elif isinstance(node, ast.Call):
+        # exempt 函数(_i18n_t/translate/ErrorEnvelope 等)→ 跳过
+        if _is_exempt_call(node):
+            return results
+        # 非 exempt Call → 不深入(避免误报 .format()/.join() 等模板字面量)
+        return results
+    elif isinstance(node, ast.Dict):
+        for k, v in zip(node.keys, node.values):
+            key_label = '?'
+            if k is not None:
+                kl = _extract_string_literal(k)
+                if kl is not None:
+                    key_label = kl
+            results.extend(_extract_sink_strings(v, chain + (f'dict[{key_label}]',)))
+    elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        for i, elt in enumerate(node.elts):
+            results.extend(_extract_sink_strings(elt, chain + (f'[{i}]',)))
+    elif isinstance(node, ast.IfExp):
+        # R61 P1-07: 条件表达式 x if cond else "msg" — 递归到 body/orelse 两个分支
+        # (覆盖 _i18n_t('ok') if cond else "FAIL: ..." 这类混合写法)
+        results.extend(_extract_sink_strings(node.body, chain))
+        results.extend(_extract_sink_strings(node.orelse, chain))
+    return results
+
+
 # === 文件扫描 ===
 
 def scan_python_content(content: str) -> list[tuple[int, str, str]]:
-    """R60 §10: AST sink-based 扫描 — 基于 call node 真实父调用分类字面量。
+    """R60 §10 / R61 P1-07: AST sink-based 扫描 — 基于 call node 真实父调用分类字面量。
 
     R60 §10 整改(移除 ±2 行邻行猜测):
         字符串字面量的分类由其 AST 父 Call 节点直接决定,不再依赖邻行 logger/print:
@@ -370,17 +565,30 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
           → 字面量归 user_visible(pattern_type 'sink:*')
         - 其他调用(非 sink 非 logger)→ 不收集
 
+    R61 P1-07 扩展(taint / source-to-sink):
+        - sink 注册表扩展:新增 JSONResponse/HTMLResponse/TemplateResponse/
+          send_mail/notify 等用户面向出口(新 sink 必须先在 PYTHON_SINK_FUNCS 注册)
+        - 递归抽取:对 sink 调用的 dict/list/tuple 参数递归收集字面量
+          (覆盖 JSONResponse(content={"msg": "..."}) / TemplateResponse(context={...}))
+        - call-chain:pattern_type 携带从 sink 到字面量的路径
+          (如 sink:JSONResponse.content.dict[msg]),用于 CI 输出 file:line:call-chain
+        - 协议常量豁免:_is_protocol_constant("OK"/"ok"/"200"/"{}" 等)允许流入 sink
+
     豁免(不算违规):
         - 字符串字面量来自 translate()/format_message_icu()/AppError/ErrorEnvelope 等
-          (字面量本身是 exempt Call 的参数,_extract_string_literal 对 Call 节点返回 None)
+          (exempt Call 节点不被深入,其内部 i18n key 字面量不被收集)
         - 内部协议字符串(RELAY_ERROR:/ /start 等,bot 间机器通信)
+        - 协议常量("OK"/"ok"/"200"/"{}"/单字符分隔符等,机器可读结构常量)
 
     Args:
         content: Python 源代码字符串
 
     Returns:
         [(line_no, pattern_type, content), ...] 字面量内容(截断到 80 字符)
-        pattern_type 形如 'sink:reply_text' / 'sink:HTTPException.detail' / 'log:info'
+        pattern_type 形如:
+            'sink:reply_text' / 'sink:HTTPException.detail'
+            'sink:JSONResponse.content.dict[msg]' (R61 P1-07 嵌套 call-chain)
+            'log:info' / 'log:warning.kwarg'
     """
     findings: list[tuple[int, str, str]] = []
 
@@ -423,24 +631,25 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
                 findings.append((node.lineno, f'log:{call_name}.{kw.arg}', text[:80]))
             continue
 
-        # sink 调用:user_visible(检查位置参数)
+        # R61 P1-07: sink 调用 → user_visible,递归抽取字面量(支持 dict/list/tuple 嵌套)
+        # 位置参数:递归收集字面量 + call-chain
         for arg in node.args:
             # 豁免:参数本身是 translate()/format_message_icu()/AppError/ErrorEnvelope 等调用
             if isinstance(arg, ast.Call) and _is_exempt_call(arg):
                 continue
-            text = _extract_string_literal(arg)
-            if text is None:
-                continue
-            # 跳过空/纯空白字符串(非用户可见)
-            if not text.strip():
-                continue
-            # R59 §5.1 P1: 跳过内部协议字符串(bot 间机器通信,非用户可见)
-            # 例如 "RELAY_ERROR:{}:{}:{}" / "/start {}" / "EXTERNAL_DONE:{}:{}"
-            if _is_internal_protocol(text):
-                continue
-            findings.append((node.lineno, _describe_sink(node), text[:80]))
+            for text, chain in _extract_sink_strings(arg, ()):
+                if not text.strip():
+                    continue
+                # R59 §5.1 P1: 跳过内部协议字符串(bot 间机器通信,非用户可见)
+                if _is_internal_protocol(text):
+                    continue
+                # R61 P1-07: 跳过协议常量(机器可读结构常量,非用户可见)
+                if _is_protocol_constant(text):
+                    continue
+                ptype = _describe_sink_chain(node, '', chain)
+                findings.append((node.lineno, ptype, text[:80]))
 
-        # sink 调用:user_visible(检查关键字参数 detail="..." 等)
+        # 关键字参数:递归收集字面量 + call-chain
         for kw in node.keywords:
             # *args/**kwargs 的 kwarg.arg 为 None,跳过
             if kw.arg is None:
@@ -448,18 +657,22 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
             # 仅当关键字名 ∈ PYTHON_SINK_KEYWORDS 或函数本身是 sink 时才检查
             if kw.arg not in PYTHON_SINK_KEYWORDS and _get_call_name(node) not in PYTHON_SINK_FUNCS:
                 continue
+            # R61 P1-07: 跳过结构性 kwargs(HTTP 头/状态码/cookie/URL 等,非用户可见文本)
+            if kw.arg in SINK_STRUCTURAL_KWARGS:
+                continue
             # 豁免:值是 exempt 调用
             if isinstance(kw.value, ast.Call) and _is_exempt_call(kw.value):
                 continue
-            text = _extract_string_literal(kw.value)
-            if text is None:
-                continue
-            if not text.strip():
-                continue
-            # R59 §5.1 P1: 跳过内部协议字符串(bot 间机器通信,非用户可见)
-            if _is_internal_protocol(text):
-                continue
-            findings.append((node.lineno, _describe_sink(node, kw.arg), text[:80]))
+            for text, chain in _extract_sink_strings(kw.value, ()):
+                if not text.strip():
+                    continue
+                if _is_internal_protocol(text):
+                    continue
+                # R61 P1-07: 跳过协议常量(机器可读结构常量,非用户可见)
+                if _is_protocol_constant(text):
+                    continue
+                ptype = _describe_sink_chain(node, kw.arg, chain)
+                findings.append((node.lineno, ptype, text[:80]))
 
     return findings
 
@@ -973,6 +1186,22 @@ def collect_findings_at_commit(root: Path, commit: str) -> list[tuple[str, int, 
 
 # === 命令实现 ===
 
+def _collect_user_visible_findings(findings) -> list[tuple[str, int, str, str]]:
+    """R61 P1-07: 从 findings 中筛选 user_visible 违规(非 log:* 的 sink:*/html_*)。
+
+    用于 --check 失败时输出 file:line:call-chain 明细,辅助定位修复点。
+    返回 [(file, line_no, ptype, content), ...] 按 (file, line_no) 排序。
+    """
+    uv = [
+        (f, ln, pt, ct)
+        for f, ln, pt, ct in findings
+        if _module_for_file(f) is not None
+        and classify_finding(f, pt) == 'user_visible'
+    ]
+    uv.sort(key=lambda x: (x[0], x[1]))
+    return uv
+
+
 def cmd_check(
     module_counts: dict[str, int],
     baseline: dict,
@@ -1082,6 +1311,13 @@ def cmd_check(
         print(f"\n❌ R56 §5.1 绝对门禁失败: {len(uv_failed)} 个模块存在 user_visible 违规")
         for m, uv in uv_failed:
             print(f"   {m}: user_visible={uv} (必须为 0)")
+        # R61 P1-07: 输出每条 user_visible 违规的 file:line:call-chain 明细
+        if findings is not None:
+            uv_findings = _collect_user_visible_findings(findings)
+            if uv_findings:
+                print(f"\n   user_visible 违规明细(file:line: call-chain):")
+                for f, ln, pt, ct in uv_findings:
+                    print(f"     {f}:{ln}: {pt}  <-  \"{ct}\"")
         print("\n请将中文文本接入 i18n(translate/format_message + locale 文件),")
         print("而不是更新 baseline 消除失败。R56 §5.1 绝对门禁不允许此操作。")
         return 1

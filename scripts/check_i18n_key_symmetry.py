@@ -56,6 +56,11 @@ _ICU_PATTERN = re.compile(
 # 简单 {var} 占位符(非 ICU pattern)
 _SIMPLE_VAR_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
+# R61 P1-06: HTML 标签正则 — 检测 i18n 值中的 HTML 上下文不对称(注入风险)
+# 匹配 <tag> / </tag> / <tag attr="..."> / <br/> 等合法 HTML 标签
+# 不匹配 < 3 / a<b / {<var>} 等非 HTML 文本(< 后必须紧跟字母或 /)
+_HTML_TAG_PATTERN = re.compile(r"<([a-zA-Z/][^>]*)>")
+
 
 # ===========================================================================
 # JSON 加载与扁平化
@@ -239,6 +244,43 @@ def _extract_param_set(text: str) -> set[str]:
     return params
 
 
+def _extract_html_tags(text: str) -> set[str]:
+    """R61 P1-06: 提取文本中的 HTML 标签名集合(小写,不含属性,不含尖括号)。
+
+    用于检测两侧 locale 的 HTML 安全上下文不对称:
+        - 一侧含 HTML 标签而另一侧不含 → 不对称(HTML 注入风险)
+        - 两侧都含 HTML 但标签集合不一致 → 不对称(渲染差异 / 注入风险)
+
+    解析规则:
+        ``<b>bold</b>``        → ``{"b"}``
+        ``</b>``               → ``{"b"}``(闭合标签与开标签合并)
+        ``<code class="x">``   → ``{"code"}``(忽略属性)
+        ``<br/>``              → ``{"br"}``(自闭合)
+        ``a < b`` / ``< 3``    → ``{}``(非 HTML,不匹配)
+
+    Args:
+        text: 翻译值字符串
+
+    Returns:
+        标签名集合(小写);无 HTML 标签时返回空集
+    """
+    if not isinstance(text, str):
+        return set()
+    tags: set[str] = set()
+    for m in _HTML_TAG_PATTERN.finditer(text):
+        inner = m.group(1).strip()
+        if not inner:
+            continue
+        # 取第一个 token 作为标签名(忽略后续属性)
+        name = inner.split()[0]
+        # 去掉闭合斜杠 </b> → b 和自闭合斜杠 <br/> → br
+        name = name.lstrip("/").rstrip("/").lower()
+        # 仅保留合法标签名(字母,避免误匹配 <3 / <- 等)
+        if name and re.fullmatch(r"[a-zA-Z][a-zA-Z0-9]*", name):
+            tags.add(name)
+    return tags
+
+
 def _icu_struct_signature(structures: list[dict]) -> frozenset[tuple[str, str, frozenset[str]]]:
     """生成 ICU 结构签名(用于两侧比对)。
 
@@ -264,6 +306,7 @@ def verify() -> int:
         3. 参数集对称(每个 key 的 {var} 集合一致)
         4. ICU 结构对称(每个 ICU 子句的 selector 集合一致)
         5. malformed ICU 检测(未闭合 / 空 selector)
+        6. R61 P1-06: HTML 安全上下文对称(标签集合一致,防 HTML 注入风险)
     """
     zh_path = LOCALES_DIR / "zh-CN.json"
     en_path = LOCALES_DIR / "en-US.json"
@@ -310,6 +353,7 @@ def verify() -> int:
     common_keys = sorted(zh_keys & en_keys)
     param_mismatches: list[str] = []
     icu_mismatches: list[str] = []
+    html_mismatches: list[str] = []
     malformed_zh: list[str] = []
     malformed_en: list[str] = []
 
@@ -362,6 +406,17 @@ def verify() -> int:
                     f"{key}: ICU 结构不对称 {' | '.join(detail_parts)}"
                 )
 
+        # 4e. R61 P1-06: HTML 安全上下文对称
+        # 一侧含 HTML 标签而另一侧不含 → 不对称(HTML 注入风险)
+        # 两侧都含 HTML 但标签集合不一致 → 不对称(渲染差异 / 注入风险)
+        zh_tags = _extract_html_tags(zh_val)
+        en_tags = _extract_html_tags(en_val)
+        if zh_tags != en_tags:
+            html_mismatches.append(
+                f"{key}: zh-CN HTML 标签={sorted(zh_tags)} "
+                f"vs en-US HTML 标签={sorted(en_tags)}"
+            )
+
     # 5. 汇总错误
     if param_mismatches:
         errors.append(
@@ -375,6 +430,14 @@ def verify() -> int:
             f"ICU 结构不对称(共 {len(icu_mismatches)} 个 key 不一致):"
         )
         for m in icu_mismatches:
+            errors.append(f"  - {m}")
+
+    if html_mismatches:
+        errors.append(
+            f"HTML 安全上下文不对称(共 {len(html_mismatches)} 个 key 不一致,"
+            f"R61 P1-06: HTML 注入风险):"
+        )
+        for m in html_mismatches:
             errors.append(f"  - {m}")
 
     if malformed_zh:
@@ -401,7 +464,7 @@ def verify() -> int:
     print(
         f"[OK] R59 §5.1 P1 i18n key 对称检查通过 "
         f"(zh-CN: {len(zh_keys)} keys, en-US: {len(en_keys)} keys, "
-        f"key 集合/参数集/ICU 结构完全对称)"
+        f"key 集合/参数集/ICU 结构/HTML 安全上下文完全对称)"
     )
     return 0
 

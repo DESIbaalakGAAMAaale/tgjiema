@@ -113,8 +113,8 @@ async def get_redis() -> Any:
             if _redis_client is not None:
                 try:
                     await _redis_client.aclose()
-                except Exception:
-                    pass
+                except Exception as close_err:
+                    logger.debug(f"[RedisQueue] 关闭旧 Redis 连接失败(忽略): {close_err}")
             _redis_available = False
             _redis_client = None
     return _redis_client if _redis_available else None
@@ -154,7 +154,7 @@ async def ensure_consumer_group() -> bool:
             logger.debug("[RedisQueue] Consumer Group 已存在,跳过创建")
             return True
         logger.error(f"[RedisQueue] 创建 Consumer Group 失败: {e}")
-        return False
+    return False
 
 
 async def push(op_type: str, table: str, method_name: str, data: dict,
@@ -316,8 +316,8 @@ async def pop(timeout: int = 1, count: int = 10) -> list[dict]:
         if _redis_client is not None:
             try:
                 await _redis_client.aclose()
-            except Exception:
-                pass
+            except Exception as close_err:
+                logger.debug(f"[RedisQueue] pop 后关闭 Redis 连接失败(忽略): {close_err}")
             _redis_client = None
         _redis_available = False
         _consumer_group_ensured = False
@@ -395,7 +395,7 @@ async def ack(message_ids: list[str]) -> int:
         )
     except Exception as e:
         logger.debug(f"[RedisQueue] ack 异常: {e}")
-        return 0
+    return 0
 
 
 async def safe_trim() -> int:
@@ -425,12 +425,12 @@ async def safe_trim() -> int:
     try:
         from config import settings
         # 1. XINFO GROUPS 获取所有 Consumer Group
+        groups = None
         try:
             groups = await redis.xinfo_groups(settings.WRITER_STREAM_KEY)
         except Exception as e:
             # 查询失败:保守不裁剪(避免删掉未消费消息)
             logger.debug(f"[RedisQueue] safe_trim xinfo_groups 失败,不裁剪: {e}")
-            return 0
 
         # groups 为空或 None:无 Consumer Group,保守不裁剪
         if not groups:
@@ -514,7 +514,7 @@ async def safe_trim() -> int:
         return trimmed
     except Exception as e:
         logger.debug(f"[RedisQueue] safe_trim 异常: {e}")
-        return 0
+    return 0
 
 
 def _compute_safe_trim_id(min_pending_id: Optional[str], retention_hours: int = 24) -> str:
@@ -570,7 +570,8 @@ def _stream_id_less(a: str, b: str) -> bool:
         return sa_i < sb_i
     except (ValueError, IndexError):
         # 解析失败:保守认为 a 不小于 b(不更新全局最小)
-        return False
+        pass
+    return False
 
 
 async def trim_stream() -> int:
@@ -599,7 +600,7 @@ async def delete(key: str) -> bool:
         return True
     except Exception as e:
         logger.debug(f"[RedisQueue] delete 异常: {e}")
-        return False
+    return False
 
 
 async def push_dead(msg: dict, reason: str = "", message_id: str = "",
@@ -700,7 +701,7 @@ async def push_dead(msg: dict, reason: str = "", message_id: str = "",
         return True
     except Exception as e:
         logger.error(f"[RedisQueue] push_dead 本地文件也失败(消息已丢失): {e}")
-        return False
+    return False
 
 
 async def get_dead_messages(count: int = 100) -> list[tuple[str, dict]]:
@@ -758,7 +759,7 @@ async def delete_dead_message(msg_id: str) -> bool:
         return True
     except Exception as e:
         logger.debug(f"[RedisQueue] delete_dead_message 异常: {e}")
-        return False
+    return False
 
 
 async def requeue_from_dlq(dead_msg_id: str, msg_data: dict) -> bool:
@@ -805,7 +806,7 @@ async def requeue_from_dlq(dead_msg_id: str, msg_data: dict) -> bool:
         return False
     except Exception as e:
         logger.warning(f"[RedisQueue] requeue_from_dlq 失败: {e}")
-        return False
+    return False
 
 
 async def get_pending_info() -> dict:
@@ -880,8 +881,9 @@ async def health_check() -> bool:
     try:
         await redis.ping()
         return True
-    except Exception:
-        return False
+    except Exception as e:
+        logger.debug(f"[RedisQueue] health_check ping 异常: {e}")
+    return False
 
 
 async def cache_get(key: str) -> Optional[str]:
@@ -911,7 +913,7 @@ async def cache_set(key: str, value: str, ttl: int = 5) -> bool:
         return True
     except Exception as e:
         logger.debug(f"[RedisQueue] cache_set 异常: {e}")
-        return False
+    return False
 
 
 async def cache_delete(key: str) -> bool:
@@ -930,8 +932,8 @@ async def close_redis():
     if _redis_client:
         try:
             await _redis_client.aclose()
-        except Exception:
-            pass
+        except Exception as close_err:
+            logger.debug(f"[RedisQueue] close_redis aclose 失败(忽略): {close_err}")
     _redis_client = None
     _redis_available = False
     _redis_init_attempted = False
@@ -1083,8 +1085,11 @@ async def _get_dedicated_connection() -> Any:
                     await conn.execute(
                         f"ALTER TABLE durable_outbox ADD COLUMN {col_def[0]} {col_def[1]}"
                     )
-                except Exception:
-                    pass  # 列已存在
+                except Exception as alter_err:
+                    # 列已存在(幂等迁移),记录 debug 日志
+                    logger.debug(
+                        f"[RedisQueue] durable_outbox 列 {col_def[0]} 已存在(忽略): {alter_err}"
+                    )
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_durable_outbox_status "
                 "ON durable_outbox(status) WHERE status = 'pending'"
@@ -1227,8 +1232,8 @@ async def write_durable_outbox(
         except Exception:
             try:
                 await conn.execute("ROLLBACK")
-            except Exception:
-                pass
+            except Exception as rb_err:
+                logger.debug(f"[RedisQueue] durable_outbox ROLLBACK 失败(忽略): {rb_err}")
             raise
         return True
     except AppError:
@@ -1426,8 +1431,10 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
                         (row_id,),
                     )
                     await conn.commit()
-                except Exception:
-                    pass
+                except Exception as rollback_err:
+                    logger.debug(
+                        f"[RedisQueue] R45 §13: replay 回滚 row_id={row_id} 到 pending 失败(忽略): {rollback_err}"
+                    )
                 # 单条失败不影响其他消息重放
                 continue
         if replayed > 0 or quarantined_count > 0:
@@ -1439,7 +1446,7 @@ async def replay_durable_outbox(batch_size: int = 100) -> int:
         return replayed
     except Exception as e:
         logger.warning(f"[RedisQueue] R45 §13: replay_durable_outbox 异常: {e}")
-        return 0
+    return 0
 
 
 async def quarantine_repair(
@@ -1610,8 +1617,10 @@ async def quarantine_repair(
                     await _store._db.execute(
                         f"ALTER TABLE command_approvals ADD COLUMN {_col} {_col_def}"
                     )
-                except Exception:
-                    pass
+                except Exception as alter_err:
+                    logger.debug(
+                        f"[RedisQueue] R58 P0-2: command_approvals 列 {_col} 已存在(忽略): {alter_err}"
+                    )
             await _store._db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_command_approvals_action_id "
                 "ON command_approvals(action_id)"
@@ -1914,8 +1923,8 @@ async def quarantine_repair(
             except Exception:
                 try:
                     await conn.execute("ROLLBACK")
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    logger.debug(f"[RedisQueue] quarantine_repair rehash ROLLBACK 失败(忽略): {rb_err}")
                 raise
             logger.info(
                 f"[RedisQueue] R54 P0-4: quarantined 记录已修复(经审批 "
@@ -1951,8 +1960,8 @@ async def quarantine_repair(
             except Exception:
                 try:
                     await conn.execute("ROLLBACK")
-                except Exception:
-                    pass
+                except Exception as rb_err:
+                    logger.debug(f"[RedisQueue] quarantine_repair delete ROLLBACK 失败(忽略): {rb_err}")
                 raise
             logger.info(
                 f"[RedisQueue] R54 P0-4: quarantined 记录已删除(经审批 "
@@ -1980,8 +1989,11 @@ async def quarantine_repair(
                     error=f"quarantine_repair_{action}_failed",
                     retryable=False,
                 )
-            except Exception:
-                pass
+            except Exception as mark_err:
+                logger.debug(
+                    f"[RedisQueue] mark_approved_failed(AppError 路径)失败 "
+                    f"approval_action_id={approval_action_id}: {mark_err}"
+                )
         raise
     except Exception as e:
         logger.error(
@@ -1996,8 +2008,11 @@ async def quarantine_repair(
                     error=f"quarantine_repair_{action}_exception: {e}",
                     retryable=False,
                 )
-            except Exception:
-                pass
+            except Exception as mark_err:
+                logger.debug(
+                    f"[RedisQueue] mark_approved_failed(Exception 路径)失败 "
+                    f"approval_action_id={approval_action_id}: {mark_err}"
+                )
         raise AppError(
             ErrorCodes.DB_CACHE_UNAVAILABLE,
             params={
@@ -2034,6 +2049,6 @@ async def close_durable_outbox():
     if _durable_conn is not None:
         try:
             await _durable_conn.close()
-        except Exception:
-            pass
+        except Exception as close_err:
+            logger.debug(f"[RedisQueue] close_durable_outbox 失败(忽略): {close_err}")
         _durable_conn = None

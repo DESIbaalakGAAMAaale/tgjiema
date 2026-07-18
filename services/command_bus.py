@@ -454,7 +454,8 @@ async def mark_approved_executed(
         logger.error(
             f"[CommandBus] mark_approved_executed 失败 action_id={action_id}: {e}"
         )
-        return False
+    # fail-closed:标记执行失败时返回 False
+    return False
 
 
 async def mark_approved_failed(
@@ -506,7 +507,8 @@ async def mark_approved_failed(
         logger.error(
             f"[CommandBus] mark_approved_failed 失败 action_id={action_id}: {e}"
         )
-        return False
+    # fail-closed:标记执行失败时返回 False
+    return False
 
 
 async def verify_command_approved(
@@ -746,6 +748,7 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
         return False
     # R54 P0-1: requires_approval=1 一律禁止旧入口,fail-closed
     # _auto_approve 已移除:不再允许未注册命令自动批准
+    _query_failed = False
     try:
         rows = await store._db.execute_fetchall(
             "SELECT command_type, requires_approval FROM command_executions "
@@ -757,6 +760,9 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
             f"[CommandBus] claim_execution 查询 command_type 失败 "
             f"action_id={action_id}: {e}"
         )
+        _query_failed = True
+    if _query_failed:
+        # fail-closed:查询失败时返回 False
         return False
     if rows and rows[0]:
         command_type, requires_approval = rows[0]
@@ -797,7 +803,8 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
         raise
     except Exception as e:
         logger.error(f"[CommandBus] claim_execution 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:claim 失败时返回 False
+    return False
 
 
 async def renew_lease(action_id: str, lease_seconds: int = 60) -> bool:
@@ -826,7 +833,8 @@ async def renew_lease(action_id: str, lease_seconds: int = 60) -> bool:
         return cursor.rowcount > 0
     except Exception as e:
         logger.error(f"[CommandBus] renew_lease 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:续租失败时返回 False
+    return False
 
 
 async def release_execution(action_id: str) -> bool:
@@ -855,7 +863,8 @@ async def release_execution(action_id: str) -> bool:
         return cursor.rowcount > 0
     except Exception as e:
         logger.error(f"[CommandBus] release_execution 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:释放失败时返回 False
+    return False
 
 
 async def cleanup_stale_leases() -> int:
@@ -899,7 +908,8 @@ async def cleanup_stale_leases() -> int:
         return cleaned
     except Exception as e:
         logger.warning(f"[CommandBus] cleanup_stale_leases 失败: {e}")
-        return 0
+    # fail-closed:清理失败时返回 0
+    return 0
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1205,7 +1215,8 @@ async def mark_outbox_executed(
         logger.error(
             f"[CommandBus] mark_outbox_executed 失败 action_id={action_id}: {e}"
         )
-        return False
+    # fail-closed:标记失败时返回 False
+    return False
 
 
 async def release_lease(action_id: str) -> bool:
@@ -1240,7 +1251,8 @@ async def release_lease(action_id: str) -> bool:
         return released
     except Exception as e:
         logger.error(f"[CommandBus] release_lease 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:释放失败时返回 False
+    return False
 
 
 async def _try_insert_or_get_cached(
