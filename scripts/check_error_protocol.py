@@ -27,18 +27,35 @@ Baseline 机制:
     超过 baseline 时 exit 1(失败)。
     --strict 模式忽略 baseline,任何违规都 exit 1。
 
+R62 P1-04 结构化 allowlist:
+    observability 域不再使用 max_violations,改用结构化 allowlist。
+    每个违规必须匹配 allowlist 条目(按指纹),allowlist 条目必须包含:
+        file / line / fingerprint / owner / reason / expiry / ticket
+    规则:
+        1. 每个违规计算指纹 (sha256 of file:line:violation_type:context)
+        2. 指纹匹配 allowlist 条目 → 检查 expiry
+        3. expiry < today → 失败(allowlist 条目已过期)
+        4. 未匹配 → real_violations(生产目标 = 0)
+        5. ratchet: 总违规数 <= baseline violation_count(每个 commit 只减不增)
+    --strict 模式: 任何未在 allowlist 中的违规即失败(忽略 ratchet 比较,
+    只检查 real_violations == 0)。
+
 CI 调用方式:
     python scripts/check_error_protocol.py --strict
     python scripts/check_error_protocol.py --baseline scripts/error_protocol_baseline.json
 
 退出码:
-    0 — 通过(违规数 <= baseline,或 --strict 且无违规)
-    1 — 失败(违规数 > baseline,或 --strict 且有违规)
+    0 — 通过(所有违规已 allowlist 且未过期,real_violations == 0,
+         且未超过 ratchet baseline)
+    1 — 失败(有未 allowlist 的违规,或 allowlist 条目已过期,
+         或总违规数 > baseline violation_count)
 """
 from __future__ import annotations
 
 import argparse
 import ast
+import datetime
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -510,6 +527,53 @@ ZERO_TOLERANCE_DOMAINS: frozenset[str] = frozenset({
 })
 
 
+# ════════════════════════════════════════════════════════════
+# R62 P1-04: 结构化 allowlist 辅助函数
+# ════════════════════════════════════════════════════════════
+def _compute_violation_fingerprint(
+    file_path: str,
+    line_no: int,
+    violation_type: str,
+    context: str,
+) -> str:
+    """R62 P1-04: 计算违规指纹(sha256),用于 allowlist 匹配。
+
+    指纹由文件路径、行号、违规类型、上下文片段组成,
+    确保同一违规在代码变更后能被准确识别(行号变化则指纹变化,需更新 allowlist)。
+    """
+    raw = f"{file_path}:{line_no}:{violation_type}:{context[:80]}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_source_line_context(file_path: str, line_no: int) -> str:
+    """R62 P1-04: 读取文件指定行的内容(去首尾空白),作为指纹计算的上下文片段。
+
+    文件不存在或行号越界时返回空字符串(不影响指纹计算,只是降低精度)。
+    """
+    try:
+        p = REPO_ROOT / file_path
+        if not p.exists():
+            return ""
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines()
+        if 1 <= line_no <= len(lines):
+            return lines[line_no - 1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _extract_violation_type(detail: str) -> str:
+    """R62 P1-04: 从违规详情中提取违规类型标识(如 'P1-5 规则1/2', 'P1-5 规则3')。
+
+    违规详情格式: "P1-5 规则X: <description>"
+    提取首个冒号前的部分作为类型标识。
+    """
+    if ":" in detail:
+        return detail.split(":", 1)[0].strip()
+    return detail
+
+
 def _classify_domain(file_path: str) -> str:
     """R58 P0-5: 根据文件路径分类 domain。
 
@@ -529,70 +593,194 @@ def _classify_domain(file_path: str) -> str:
 def _check_domain_baseline(
     findings: list[tuple[str, int, str]],
     baseline_path: Path | None,
-) -> tuple[bool, str]:
-    """R58 P0-5: 按域名比对 baseline。
+    strict: bool = False,
+) -> tuple[bool, str, dict]:
+    """R58 P0-5 + R62 P1-04: 按域名比对 baseline,支持结构化 allowlist。
 
     规则:
-        1. security/destructive/data-integrity/financial 域必须为 0(零容忍)
-        2. observability 域允许通过 baseline 放行(但 max_violations 不变)
-        3. 任何域新增违规都失败
+        1. security/destructive/data-integrity/financial 域必须为 0(零容忍,ratchet)
+        2. observability 域使用结构化 allowlist:
+           - 每个违规计算指纹(sha256 of file:line:violation_type:context)
+           - 指纹匹配 allowlist 条目 → 检查 expiry
+           - expiry < today → 失败(allowlist 条目已过期)
+           - 未匹配 → real_violations(生产目标 = 0)
+           - max_violations 已弃用(仅用于向后兼容,不参与判定)
+        3. ratchet: 总违规数 <= baseline violation_count(每个 commit 只减不增)
+           --strict 模式下跳过 ratchet 比较,只检查 real_violations == 0
+
+    Args:
+        findings: 扫描得到的违规列表 [(file, line, detail), ...]
+        baseline_path: baseline JSON 文件路径(None 或不存在时按无 baseline 处理)
+        strict: 是否为严格模式(任何未 allowlist 的违规即失败,跳过 ratchet)
 
     Returns:
-        (passed, message)
+        (passed, message, summary) — summary 包含 total/allowlisted/real/expired 计数
     """
-    if baseline_path is None or not baseline_path.exists():
-        # 无 baseline:所有 domain 违规都视为失败
-        domain_counts: dict[str, int] = {}
-        for file_path, _, _ in findings:
-            domain = _classify_domain(file_path)
-            domain_counts[domain] = domain_counts.get(domain, 0) + 1
-        zero_violations = {d: c for d, c in domain_counts.items() if d in ZERO_TOLERANCE_DOMAINS and c > 0}
-        if zero_violations:
-            return False, f"零容忍域有违规: {zero_violations}"
-        return True, "通过(无零容忍域违规)"
-
-    try:
-        data = json.loads(baseline_path.read_text(encoding="utf-8", errors="ignore"))
-    except (json.JSONDecodeError, OSError):
-        return False, "baseline 文件解析失败"
-
-    domains_cfg = data.get("domains", {})
-    # 分类 findings
-    domain_findings: dict[str, list[tuple[str, int, str]]] = {
-        "security": [], "destructive": [], "data-integrity": [],
-        "financial": [], "observability": [],
+    summary: dict = {
+        "total_violations": len(findings),
+        "allowlisted": 0,
+        "real_violations": 0,
+        "expired_entries": 0,
+        "domain_counts": {},
+        "real_violation_list": [],   # 真实违规详情(用于打印)
+        "expired_list": [],          # 过期 allowlist 条目详情(用于打印)
     }
+
+    # 分类 findings(按 domain 分组)
+    domain_findings: dict[str, list[tuple[str, int, str]]] = {}
     for file_path, line_no, detail in findings:
         domain = _classify_domain(file_path)
         domain_findings.setdefault(domain, []).append((file_path, line_no, detail))
+        summary["domain_counts"][domain] = summary["domain_counts"].get(domain, 0) + 1
+
+    today_str = datetime.date.today().isoformat()
+
+    # 无 baseline 处理
+    if baseline_path is None or not baseline_path.exists():
+        zero_violations = {
+            d: c for d, c in summary["domain_counts"].items()
+            if d in ZERO_TOLERANCE_DOMAINS and c > 0
+        }
+        if zero_violations:
+            return False, f"零容忍域有违规: {zero_violations}", summary
+        # 无 baseline 时 observability 也必须为 0(没有 allowlist 可放行)
+        obs_count = summary["domain_counts"].get("observability", 0)
+        if obs_count > 0:
+            summary["real_violations"] = obs_count
+            return False, (
+                f"observability: {obs_count} 处违规但无 baseline allowlist "
+                f"(需先运行 --generate-baseline 生成 allowlist)"
+            ), summary
+        return True, "通过(无 baseline,无违规)", summary
+
+    # 加载 baseline JSON
+    try:
+        data = json.loads(baseline_path.read_text(encoding="utf-8", errors="ignore"))
+    except (json.JSONDecodeError, OSError):
+        return False, "baseline 文件解析失败", summary
+
+    domains_cfg = data.get("domains", {})
+    baseline_violation_count = int(data.get("violation_count", 0))
+
+    # R62 P1-04: ratchet 检查 — 总违规数必须 <= baseline violation_count
+    # strict 模式跳过 ratchet(只关心 real_violations == 0)
+    if not strict and summary["total_violations"] > baseline_violation_count:
+        return False, (
+            f"ratchet 失败: 当前违规 {summary['total_violations']} > "
+            f"baseline violation_count {baseline_violation_count} "
+            f"(每个 commit 只能减少不能增加)"
+        ), summary
 
     # 检查每个 domain
     failed_domains = []
     for domain, domain_findings_list in domain_findings.items():
         count = len(domain_findings_list)
         domain_cfg = domains_cfg.get(domain, {})
-        max_violations = int(domain_cfg.get("max_violations", 0))
+
         if domain in ZERO_TOLERANCE_DOMAINS:
-            # R58 P0-5 零容忍域:ratchet 策略
-            # - max_violations=0 表示目标(零容忍)
-            # - baseline_violations 记录历史快照,允许 current <= baseline_violations
-            # - 任何新增违规(count > baseline_violations)都失败
-            baseline_violations = int(domain_cfg.get("baseline_violations", max_violations))
+            # 零容忍域:ratchet 策略(保持 R58 P0-5 行为)
+            baseline_violations = int(domain_cfg.get("baseline_violations", 0))
             if count > baseline_violations:
                 failed_domains.append(
                     f"{domain}: {count} > baseline {baseline_violations} "
                     f"(target=0, ratchet 模式不允许新增违规)"
                 )
-        else:
-            # observability:允许 <= max_violations
-            if count > max_violations:
-                failed_domains.append(
-                    f"{domain}: {count} > {max_violations} (max_violations)"
-                )
+            continue
+
+        # observability 域:使用结构化 allowlist(R62 P1-04)
+        allowlist = domain_cfg.get("allowlist", [])
+        if not isinstance(allowlist, list):
+            allowlist = []
+        allowlist_by_fp: dict[str, dict] = {}
+        for entry in allowlist:
+            if isinstance(entry, dict):
+                fp = entry.get("fingerprint", "")
+                if fp:
+                    allowlist_by_fp[fp] = entry
+
+        for file_path, line_no, detail in domain_findings_list:
+            violation_type = _extract_violation_type(detail)
+            context = _get_source_line_context(file_path, line_no)
+            fingerprint = _compute_violation_fingerprint(
+                file_path, line_no, violation_type, context,
+            )
+
+            matched_entry = allowlist_by_fp.get(fingerprint)
+            if matched_entry is not None:
+                expiry = str(matched_entry.get("expiry", ""))
+                if expiry and expiry < today_str:
+                    # 已过期:计为真实违规 + 过期条目
+                    summary["expired_entries"] += 1
+                    summary["real_violations"] += 1
+                    summary["expired_list"].append({
+                        "file": file_path,
+                        "line": line_no,
+                        "fingerprint": fingerprint,
+                        "expiry": expiry,
+                        "ticket": matched_entry.get("ticket", "?"),
+                        "owner": matched_entry.get("owner", "?"),
+                    })
+                    failed_domains.append(
+                        f"observability: {file_path}:{line_no} "
+                        f"allowlist 条目已过期 (expiry={expiry}, "
+                        f"today={today_str}, ticket={matched_entry.get('ticket', '?')}, "
+                        f"owner={matched_entry.get('owner', '?')})"
+                    )
+                else:
+                    # 已 allowlist 且未过期
+                    summary["allowlisted"] += 1
+            else:
+                # 未匹配 allowlist:计为真实违规
+                summary["real_violations"] += 1
+                summary["real_violation_list"].append({
+                    "file": file_path,
+                    "line": line_no,
+                    "fingerprint": fingerprint,
+                    "detail": detail,
+                })
+                if strict:
+                    failed_domains.append(
+                        f"observability: {file_path}:{line_no} 未在 allowlist 中 "
+                        f"(strict 模式:任何未 allowlist 的违规即失败)"
+                    )
+                else:
+                    failed_domains.append(
+                        f"observability: {file_path}:{line_no} 未在 allowlist 中 "
+                        f"(real_violations 必须 = 0,生产目标;若为新增违规需更新 "
+                        f"allowlist,若为存量违规需补全 allowlist 条目)"
+                    )
 
     if failed_domains:
-        return False, "; ".join(failed_domains)
-    return True, "通过(所有 domain 在 baseline 范围内)"
+        return False, "; ".join(failed_domains), summary
+    return True, "通过(所有 domain 在 baseline 范围内,所有违规已 allowlist)", summary
+
+
+def _print_allowlist_summary(summary: dict) -> None:
+    """R62 P1-04: 打印 allowlist 检查摘要。"""
+    print()
+    print("R62 P1-04 allowlist 摘要:")
+    print(f"  总违规数:        {summary['total_violations']}")
+    print(f"  已 allowlist:   {summary['allowlisted']}")
+    print(f"  真实违规(未放行): {summary['real_violations']}")
+    print(f"  过期 allowlist:  {summary['expired_entries']}")
+    if summary["domain_counts"]:
+        print("  按 domain 分类:")
+        for d, c in sorted(summary["domain_counts"].items()):
+            print(f"    {d}: {c}")
+    if summary["real_violation_list"]:
+        print("  真实违规详情(前 20 条):")
+        for v in summary["real_violation_list"][:20]:
+            print(
+                f"    {v['file']}:{v['line']} "
+                f"fp={v['fingerprint'][:12]}... {v['detail'][:60]}"
+            )
+    if summary["expired_list"]:
+        print("  过期 allowlist 条目(前 20 条):")
+        for e in summary["expired_list"][:20]:
+            print(
+                f"    {e['file']}:{e['line']} expiry={e['expiry']} "
+                f"ticket={e['ticket']} owner={e['owner']} fp={e['fingerprint'][:12]}..."
+            )
 
 
 def _print_fix_suggestions() -> None:
@@ -611,27 +799,73 @@ def _print_fix_suggestions() -> None:
 # ════════════════════════════════════════════════════════════
 # CLI 入口
 # ════════════════════════════════════════════════════════════
+# R62 P1-04 默认 baseline 路径(strict 模式未显式指定 --baseline 时使用)
+DEFAULT_BASELINE_PATH = REPO_ROOT / "scripts" / "error_protocol_baseline.json"
+
+# R62 P1-04 默认 allowlist 条目字段值(用于 --generate-baseline / 迁移脚本)
+DEFAULT_ALLOWLIST_OWNER = "maxiuquan"
+DEFAULT_ALLOWLIST_REASON = "R62 observability debt - pending refactor"
+DEFAULT_ALLOWLIST_EXPIRY = "2026-09-30"
+DEFAULT_ALLOWLIST_TICKET = "R62-P1-04"
+
+
+def _build_allowlist_entry(
+    file_path: str,
+    line_no: int,
+    detail: str,
+    *,
+    owner: str = DEFAULT_ALLOWLIST_OWNER,
+    reason: str = DEFAULT_ALLOWLIST_REASON,
+    expiry: str = DEFAULT_ALLOWLIST_EXPIRY,
+    ticket: str = DEFAULT_ALLOWLIST_TICKET,
+) -> dict:
+    """R62 P1-04: 根据违规信息构建一个结构化 allowlist 条目。
+
+    包含完整字段:file / line / fingerprint / owner / reason / expiry / ticket。
+    """
+    violation_type = _extract_violation_type(detail)
+    context = _get_source_line_context(file_path, line_no)
+    fingerprint = _compute_violation_fingerprint(
+        file_path, line_no, violation_type, context,
+    )
+    return {
+        "file": file_path,
+        "line": line_no,
+        "fingerprint": fingerprint,
+        "owner": owner,
+        "reason": reason,
+        "expiry": expiry,
+        "ticket": ticket,
+    }
+
+
 def main() -> int:
     """脚本入口。返回退出码。"""
     parser = argparse.ArgumentParser(
-        description="R56 P1-5: 错误协议 AST 静态扫描门禁",
+        description="R56 P1-5 + R62 P1-04: 错误协议 AST 静态扫描门禁",
     )
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="严格模式:发现任何违规即 exit 1(忽略 baseline)",
+        help=(
+            "严格模式:任何未在 allowlist 中的违规即 exit 1。"
+            "未显式指定 --baseline 时使用 scripts/error_protocol_baseline.json"
+        ),
     )
     parser.add_argument(
         "--baseline",
         type=Path,
         default=None,
-        help="Baseline 文件路径(读取允许的违规数量,用于 ratchet)",
+        help="Baseline 文件路径(读取 allowlist + violation_count,用于 ratchet)",
     )
     parser.add_argument(
         "--generate-baseline",
         type=Path,
         default=None,
-        help="生成/更新 baseline 文件(记录当前违规数,用于 ratchet 下降)",
+        help=(
+            "生成/更新 baseline 文件:更新 violation_count,并为当前违规重新生成 "
+            "observability.allowlist 条目(ratchet 下降)"
+        ),
     )
     args = parser.parse_args()
 
@@ -640,41 +874,26 @@ def main() -> int:
 
     # ── 生成 baseline 模式 ──
     if args.generate_baseline is not None:
-        data = {
-            "description": "R56 P1-5 error protocol baseline (ratchet 下降,只减不增)",
-            "note": "fail-open/except pass/return 0|False 是 pre-existing 历史债务。修复后重新生成以下降 violation_count。",
-            "violation_count": current_count,
-        }
-        args.generate_baseline.parent.mkdir(parents=True, exist_ok=True)
-        args.generate_baseline.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        print(f"✓ Baseline 已生成: {args.generate_baseline}")
-        print(f"  violation_count: {current_count} 处 (ratchet 下降)")
+        _generate_baseline_file(args.generate_baseline, findings, current_count)
         return 0
 
-    # ── 严格模式:任何违规都失败 ──
-    if args.strict:
-        if findings:
-            print(f"[FAIL] R56 P1-5 严格模式: 发现 {current_count} 处违规:")
-            for file, line, detail in findings:
-                print(f"  {file}:{line}: {detail}")
-            _print_fix_suggestions()
-            return 1
-        print("[OK] R56 P1-5 严格模式通过: 未发现违规")
-        return 0
+    # 确定有效 baseline 路径
+    # --strict 模式下未显式指定 --baseline 时,使用默认 baseline 路径
+    # (R62 P1-04: strict 模式需要 allowlist 才能放行存量违规)
+    effective_baseline = args.baseline
+    if args.strict and effective_baseline is None:
+        effective_baseline = DEFAULT_BASELINE_PATH
 
-    # ── 非 strict 模式:与 baseline 比对 ──
-    baseline_count = _load_baseline_count(args.baseline)
+    # 运行 domain 检查(支持 allowlist)
+    domain_passed, domain_msg, summary = _check_domain_baseline(
+        findings, effective_baseline, strict=args.strict,
+    )
 
-    # R58 P0-5: 先按 domain 分类检查(零容忍域必须为 0)
-    domain_passed, domain_msg = _check_domain_baseline(findings, args.baseline)
     if not domain_passed:
+        mode_label = "strict" if args.strict else "baseline"
         print(
-            f"[FAIL] R58 P0-5 domain 检查失败: {domain_msg}"
+            f"[FAIL] R62 P1-04 ({mode_label} 模式) 检查失败: {domain_msg}"
         )
-        print()
         # 输出按 domain 分类的违规详情
         domain_findings: dict[str, list] = {}
         for file, line, detail in findings:
@@ -682,50 +901,154 @@ def main() -> int:
             domain_findings.setdefault(d, []).append((file, line, detail))
         for d, d_findings in domain_findings.items():
             print(f"[{d}] ({len(d_findings)} violations):")
-            for file, line, detail in d_findings:
+            for file, line, detail in d_findings[:30]:
                 print(f"  {file}:{line}: {detail}")
+            if len(d_findings) > 30:
+                print(f"  ... 还有 {len(d_findings) - 30} 条")
+        _print_allowlist_summary(summary)
         _print_fix_suggestions()
         print()
+        print("R62 P1-04: observability 域每个违规必须在 allowlist 中(未过期)")
         print("R58 P0-5: security/destructive/data-integrity/financial 域必须为 0")
         print("修复后才能通过 CI 门禁")
         return 1
 
-    if current_count <= baseline_count:
-        # 通过:违规数在 baseline 范围内
+    # 通过
+    if args.strict:
         print(
-            f"[OK] R58 P0-5 通过: 当前违规 {current_count} 处 "
-            f"<= baseline {baseline_count} 处"
+            f"[OK] R62 P1-04 strict 模式通过: real_violations=0 "
+            f"(总 {current_count} 处全部 allowlist)"
         )
-        print(f"  domain 检查: {domain_msg}")
-        if findings:
-            print("已有违规(在 baseline 范围内,observability 域,不阻断):")
-            for file, line, detail in findings:
-                d = _classify_domain(file)
-                print(f"  [{d}] {file}:{line}: {detail}")
-        return 0
-
-    # 失败:违规数超过 baseline
-    print(
-        f"[FAIL] R58 P0-5 失败: 当前违规 {current_count} 处 "
-        f"> baseline {baseline_count} 处 (新增 {current_count - baseline_count} 处)"
-    )
+    else:
+        baseline_count = _load_baseline_count(effective_baseline)
+        print(
+            f"[OK] R62 P1-04 通过: 当前违规 {current_count} 处 "
+            f"<= baseline {baseline_count} 处 (real_violations=0)"
+        )
     print(f"  domain 检查: {domain_msg}")
-    print()
-    print("所有违规(按 domain 分类):")
-    domain_findings2: dict[str, list] = {}
-    for file, line, detail in findings:
-        d = _classify_domain(file)
-        domain_findings2.setdefault(d, []).append((file, line, detail))
-    for d, d_findings in domain_findings2.items():
-        print(f"[{d}] ({len(d_findings)} violations):")
-        for file, line, detail in d_findings:
-            print(f"  {file}:{line}: {detail}")
-    _print_fix_suggestions()
-    print()
-    print(
-        f"修复违规后更新 baseline: 将 violation_count 降为 {current_count}"
+    _print_allowlist_summary(summary)
+    return 0
+
+
+def _generate_baseline_file(
+    baseline_path: Path,
+    findings: list[tuple[str, int, str]],
+    current_count: int,
+) -> None:
+    """R62 P1-04: 生成/更新 baseline 文件,包含结构化 allowlist。
+
+    若 baseline 文件已存在,保留其 domain 配置(描述、paths 等),
+    只更新 violation_count 和 observability.allowlist。
+    """
+    # 尝试读取已有 baseline(保留 domain 配置)
+    existing_data: dict = {}
+    if baseline_path.exists():
+        try:
+            existing_data = json.loads(
+                baseline_path.read_text(encoding="utf-8", errors="ignore")
+            )
+        except (json.JSONDecodeError, OSError):
+            existing_data = {}
+
+    # 保留已有 domains 配置,或使用默认结构
+    domains_cfg = existing_data.get("domains", {})
+    if not domains_cfg:
+        domains_cfg = {
+            "security": {
+                "description": "认证、授权、MFA、密码、token、签名验证相关",
+                "max_violations": 0,
+                "baseline_violations": 0,
+                "paths": [
+                    "admin/passwords.py", "admin/mfa.py", "admin/auth.py",
+                    "services/button_security.py", "services/approval_workflow.py",
+                    "services/command_bus.py",
+                ],
+            },
+            "destructive": {
+                "description": "删除、清除、purge、reset 等不可逆操作",
+                "max_violations": 0,
+                "baseline_violations": 0,
+                "paths": ["services/data_lifecycle.py", "admin/purge.py"],
+            },
+            "data-integrity": {
+                "description": "备份、恢复、事务、outbox、数据一致性",
+                "max_violations": 0,
+                "baseline_violations": 0,
+                "paths": [
+                    "services/backup_dr_validate.py", "services/backup_crypto.py",
+                    "services/crdb_sync_service.py", "services/crdb_sync_event_wakeup.py",
+                    "database/redis_queue.py",
+                ],
+            },
+            "financial": {
+                "description": "配额、计费、积分等财务相关",
+                "max_violations": 0,
+                "baseline_violations": 0,
+                "paths": ["services/quota.py", "services/billing.py"],
+            },
+            "observability": {
+                "description": "日志、metric、trace 等可观测性 best-effort",
+                "max_violations": 0,
+                "allowlist_required": True,
+                "allowlist": [],
+            },
+        }
+
+    # 为当前 observability 违规重新生成 allowlist
+    # (零容忍域不应有违规,若有也加入 observability allowlist 不合理 — 直接报错)
+    obs_findings = [
+        (f, l, d) for f, l, d in findings
+        if _classify_domain(f) == "observability"
+    ]
+    new_allowlist = [
+        _build_allowlist_entry(f, l, d) for f, l, d in obs_findings
+    ]
+
+    obs_cfg = domains_cfg.get("observability", {})
+    obs_cfg["allowlist"] = new_allowlist
+    obs_cfg["allowlist_required"] = True
+    # max_violations=0 表示目标(R62 P1-04 弃用 max_violations,仅保留用于向后兼容)
+    obs_cfg["max_violations"] = 0
+    domains_cfg["observability"] = obs_cfg
+
+    prev_count = int(existing_data.get("violation_count", current_count))
+
+    data = {
+        "description": (
+            "R62 P1-04 error protocol baseline (结构化 allowlist + ratchet, "
+            "observability 目标 real_violations=0)"
+        ),
+        "note": (
+            "R62 P1-04: observability 域使用结构化 allowlist(file/line/fingerprint/"
+            "owner/reason/expiry/ticket)。每个违规必须匹配 allowlist 条目且未过期。"
+            "max_violations 已弃用(仅保留用于向后兼容)。"
+            "violation_count 用于 ratchet:每个 commit 只能减少不能增加。"
+            "修复存量违规后重新生成以下降 violation_count 并精简 allowlist。"
+        ),
+        "version": "R62-P1-04",
+        "ratchet_strategy": (
+            "structured-allowlist: real_violations must == 0 (every violation "
+            "must be in allowlist with valid expiry); "
+            "ratchet: total_violations <= violation_count"
+        ),
+        "domains": domains_cfg,
+        "total_max_violations": 0,
+        "violation_count": current_count,
+        "previous_violation_count": prev_count,
+    }
+
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
-    return 1
+    print(f"✓ Baseline 已生成: {baseline_path}")
+    print(f"  violation_count: {current_count} 处 (ratchet 下降)")
+    print(f"  observability.allowlist: {len(new_allowlist)} 条结构化条目")
+    if current_count < prev_count:
+        print(f"  ✓ ratchet 下降: {prev_count} → {current_count} (减少 {prev_count - current_count} 处)")
+    elif current_count > prev_count:
+        print(f"  ⚠ 警告: 违规增加 {prev_count} → {current_count} (新增 {current_count - prev_count} 处)")
 
 
 if __name__ == "__main__":

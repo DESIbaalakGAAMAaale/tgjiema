@@ -91,7 +91,12 @@ from pathlib import Path
 # HTML 改用 html.parser 遍历 DOM,不再纯正则)
 # R61 P1-07: sink 注册表扩展(render context / Response / JSONResponse / HTMLResponse
 # / 邮件 / 通知)+ 递归 dict/list/tuple 抽取 + 协议常量豁免 + call-chain 输出
+# R62 P1-05: cross-function source-to-sink 分析(变量回溯 / 函数返回值传播)
+# + auto-enumerate FastAPI/Telegram/WebSocket/SSE/mail/notification/template sinks
+# + --fail-on-unknown-sink 生产构建门禁(未知 sink 失败关闭)
 SCANNER_VERSION = "6.0"
+# R62 P1-05: cross-function 分析能力标记(独立于 SCANNER_VERSION,避免破坏 baseline 兼容)
+CROSS_FUNCTION_ANALYSIS_VERSION = "7.0-r62-p1-05"
 
 # 中文 Unicode 范围(仅用于向后兼容旧测试的 CJK 检测;R59 §5.1 P1 后 classify_finding
 # 不再使用此常量做 user_visible/log_only 区分,所有 sink 字面量统一归 user_visible)
@@ -105,6 +110,10 @@ CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
 #   - Response/JSONResponse/HTMLResponse(content= 携带用户可见文本)
 #   - HTML/JS DOM(HTMLResponse content= 直接内联 HTML)
 #   - email and notification(send_mail/send_email/notify/push_notification)
+# R62 P1-05: 新增 WebSocket/SSE 用户面向出口 sink(EventSourceResponse);
+#   WebSocket 的 send() 方法因过于通用(可能用于非用户面 sink),通过
+#   _WEBSOCKET_RECEIVER_NAMES 单独检测(websocket.send / ws.send / socket.send),
+#   不直接加入此集合。
 PYTHON_SINK_FUNCS = frozenset({
     # Telegram Bot sendMessage 系列
     'reply_text', 'reply_photo', 'reply_document', 'reply_video', 'reply_audio',
@@ -133,6 +142,39 @@ PYTHON_SINK_FUNCS = frozenset({
     # R61 P1-07: 邮件 / 通知 sink — body/subject/text 携带用户可见文本
     'send_mail', 'send_email', 'email_message',
     'notify', 'push_notification', 'send_notification',
+    # R62 P1-05: SSE (Server-Sent Events) 响应 sink — content= 携带用户可见事件流
+    # EventSourceResponse(content={"event": "...", "data": "..."}) — sse_starlette
+    'EventSourceResponse',
+})
+
+# R62 P1-05: WebSocket receiver 名称 — 这些 receiver 的 .send() / .send_text() /
+# .send_json() 方法被视为用户面向 sink(websocket.send / ws.send / socket.send)。
+# 单独检测以避免通用的 send() 方法误伤(如 queue.send / channel.send 等非用户面调用)。
+_WEBSOCKET_RECEIVER_NAMES = frozenset({
+    'websocket', 'ws', 'socket', 'websockets',
+})
+
+# R62 P1-05: WebSocket send 方法名(receiver ∈ _WEBSOCKET_RECEIVER_NAMES 时触发)
+_WEBSOCKET_SEND_METHODS = frozenset({
+    'send', 'send_text', 'send_json', 'send_bytes',
+})
+
+# R62 P1-05: SSE yield data 前缀正则 — yield f"data: ..." 模式
+# (Server-Sent Events 的标准格式:每行 "data: <payload>\n\n")
+_SSE_YIELD_DATA_RE = re.compile(r'^\s*data\s*:')
+
+# R62 P1-05: cross-function 分析时检查的用户面向 kwargs 集合
+# 仅这些 kwargs 的变量 / Call 来源会被 cross-function 扫描器检查,
+# 避免 reply_markup / parse_mode / disable_notification 等结构性 kwargs 误伤。
+# (PYTHON_SINK_KEYWORDS 已含 detail/text/message/caption/description,
+#  此处补充 content/context/subject/body/data/payload/event 等 sink 函数特有 kwarg)
+_CROSS_FUNCTION_USER_FACING_KWARGS = frozenset({
+    # 来自 PYTHON_SINK_KEYWORDS(detail/text/message/caption/description)
+    'detail', 'text', 'message', 'caption', 'description',
+    # sink 函数特有的用户面向 kwargs(JSONResponse/HTMLResponse/TemplateResponse/send_mail 等)
+    'content', 'context', 'subject', 'body', 'data', 'payload', 'event',
+    # WebSocket send_text / send_json 的常见参数名
+    'text_data', 'json_data',
 })
 
 # R58 P1-4: sink 关键字参数名 — 字符串字面量传入这些关键字时视为用户面向
@@ -154,12 +196,18 @@ SINK_STRUCTURAL_KWARGS = frozenset({
 
 # R58 P1-4: 豁免函数名 — 字符串字面量来自这些函数调用时不算违规
 # (说明:字面量已经经过 i18n 查找或结构化错误协议封装)
+# R62 P1-05: 新增 UserMessage / from_key / from_error — 统一用户面消息类型
+# (UserMessage.render() 经过 i18n 本地化,其 message_key 字面量是 i18n key,非用户文本)
 PYTHON_EXEMPT_FUNCS = frozenset({
     # i18n 查找
     'translate', '_i18n_t', 'format_message_icu', 'format_plural', 'format_error_response',
     'get_i18n_manager', 't', '_', 'gettext', 'ngettext', 'pgettext',
     # 结构化错误协议(替代裸字符串)
     'AppError', 'ErrorEnvelope', 'ValidationError',
+    # R62 P1-05: 统一用户面消息类型(替代裸字符串)
+    # UserMessage(...) / UserMessage.from_key(...) / UserMessage.from_error(...)
+    # — 这些构造器接受 i18n key 字面量,render() 时才转为本地化字符串
+    'UserMessage', 'from_key', 'from_error',
 })
 
 # R58 P1-4: logger 属性名 — 这些方法调用整体跳过(日志输出不算 user_visible)
@@ -398,11 +446,13 @@ def _is_sink_call(node: ast.Call) -> bool:
     """R58 P1-4: 检查 Call 节点是否是用户面向 sink 调用。
 
     判定规则(按优先级):
-    1. 豁免函数(translate/_i18n_t/AppError/ErrorEnvelope 等)→ 永远不是 sink
+    1. 豁免函数(translate/_i18n_t/AppError/ErrorEnvelope/UserMessage 等)→ 永远不是 sink
        (即使含 text=/detail= 等 sink 关键字参数,如 _i18n_t('key', text=text))
     2. logger.*/logging.*/print() → 永远不是 sink
     3. 函数名 ∈ PYTHON_SINK_FUNCS(reply_text/send_message/HTTPException/flash 等)→ sink
-    4. 含 PYTHON_SINK_KEYWORDS(detail/text/message/...) 关键字参数
+    4. R62 P1-05: WebSocket receiver.send(...) — receiver ∈ _WEBSOCKET_RECEIVER_NAMES
+       且方法 ∈ _WEBSOCKET_SEND_METHODS(websocket.send / ws.send_text / socket.send_json)
+    5. 含 PYTHON_SINK_KEYWORDS(detail/text/message/...) 关键字参数
        且该参数值是字符串型(str/f-string/dict/list/tuple)→ sink
        (R61 P1-07: 限制为字符串型值,避免 text=True/text=False 等布尔标志误触发,
         如 subprocess.run(..., text=True, [...]) 不应被识别为 sink)
@@ -422,12 +472,71 @@ def _is_sink_call(node: ast.Call) -> bool:
     if name in PYTHON_SINK_FUNCS:
         return True
 
+    # R62 P1-05: WebSocket receiver.send(...) 模式检测
+    # websocket.send("hello") / ws.send_text("...") / socket.send_json({...})
+    # 通过 receiver 变量名 + 方法名双重匹配,避免通用的 send() 误伤
+    if _is_websocket_send_call(node):
+        return True
+
     # 含 sink 关键字参数(detail="..."/text="..."/message="..."/...)
     # R61 P1-07: 仅当值为字符串型时才触发(避免 text=True 布尔标志误触发)
     for kw in node.keywords:
         if kw.arg in PYTHON_SINK_KEYWORDS and _is_potential_string_arg(kw.value):
             return True
 
+    return False
+
+
+def _is_websocket_send_call(node: ast.Call) -> bool:
+    """R62 P1-05: 检查 Call 节点是否是 WebSocket receiver.send(...) 调用。
+
+    匹配模式:
+        websocket.send("hello")      — receiver="websocket", method="send"
+        ws.send_text("hello")        — receiver="ws", method="send_text"
+        socket.send_json({"k": "v"}) — receiver="socket", method="send_json"
+        websockets.send(...)         — receiver="websockets", method="send"
+
+    通过 receiver 变量名 ∈ _WEBSOCKET_RECEIVER_NAMES 与方法名 ∈
+    _WEBSOCKET_SEND_METHODS 双重匹配,避免通用的 send() 方法误伤
+    (如 queue.send / channel.send 等非用户面调用)。
+    """
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if func.attr not in _WEBSOCKET_SEND_METHODS:
+        return False
+    # receiver 必须是简单 Name 节点(websocket / ws / socket / websockets)
+    if not isinstance(func.value, ast.Name):
+        return False
+    return func.value.id in _WEBSOCKET_RECEIVER_NAMES
+
+
+def _is_sse_yield_data(node: ast.AST) -> bool:
+    """R62 P1-05: 检查 Yield 节点是否是 SSE data: ... 模式。
+
+    匹配模式:
+        yield f"data: {payload}\\n\\n"   — JoinedStr 含 "data:" 前缀
+        yield "data: hello\\n\\n"        — Constant str 含 "data:" 前缀
+
+    SSE (Server-Sent Events) 的标准格式为 "data: <payload>\\n\\n",
+    这些 payload 直接发送到客户端,属用户面向 sink。
+    """
+    if not isinstance(node, ast.Yield):
+        return False
+    if node.value is None:
+        return False
+    val = node.value
+    # 处理 f-string(JoinedStr)— 检查首个字符串部分是否以 "data:" 开头
+    if isinstance(val, ast.JoinedStr):
+        for part in val.values:
+            if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                if _SSE_YIELD_DATA_RE.match(part.value):
+                    return True
+                return False  # 首个字面量部分不匹配,即视为非 SSE
+        return False
+    # 处理普通字符串常量
+    if isinstance(val, ast.Constant) and isinstance(val.value, str):
+        return bool(_SSE_YIELD_DATA_RE.match(val.value))
     return False
 
 
@@ -675,6 +784,379 @@ def scan_python_content(content: str) -> list[tuple[int, str, str]]:
                 findings.append((node.lineno, ptype, text[:80]))
 
     return findings
+
+
+# === R62 P1-05: cross-function source-to-sink 分析 ===
+
+
+def _build_function_var_map(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, ast.AST]:
+    """R62 P1-05: 构建函数内变量名 → 赋值右值 AST 节点映射(单函数作用域)。
+
+    收集 func_node 内所有 ``x = expr`` / ``x: type = expr`` / ``x := expr``
+    形式的赋值,记录最后一次赋值的右值 AST 节点(用于 sink 参数变量回溯)。
+
+    局限性(显式声明,避免误用):
+        - 仅覆盖单函数作用域(不跨函数,不跨模块,不追 import)
+        - 仅记录最后一次赋值(简化模型,不模拟控制流)
+        - 不展开 comprehension / walrus 内的赋值(避免过度复杂)
+        - 仅用于 cross-function 启发式,不替代 mypy/pyright 的真实类型推断
+
+    Args:
+        func_node: ast.FunctionDef / ast.AsyncFunctionDef 节点
+
+    Returns:
+        {变量名: 赋值右值 AST 节点};无赋值时返回空 dict
+    """
+    var_map: dict[str, ast.AST] = {}
+    for node in ast.walk(func_node):
+        # 普通赋值: x = expr / x: type = expr
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    var_map[target.id] = node.value
+        # 注解赋值: x: type = expr (无 value 时跳过)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                var_map[node.target.id] = node.value
+    return var_map
+
+
+def _trace_variable_source(
+    var_name: str,
+    var_map: dict[str, ast.AST],
+    depth: int = 0,
+    _max_depth: int = 3,
+) -> tuple[str | None, tuple[str, ...]]:
+    """R62 P1-05: 回溯变量到其来源(字符串字面量 / 函数调用 / 未知)。
+
+    递归追踪:变量 → 赋值右值 → 若右值仍是变量,继续回溯(最多 _max_depth 层)。
+
+    返回 (source_kind, chain):
+        - source_kind="literal"  : 右值是字符串字面量 / f-string → 需标记(违规)
+        - source_kind="exempt"   : 右值是 exempt 调用(_i18n_t / AppError / UserMessage
+          等)→ 不标记(已 i18n / 结构化)
+        - source_kind="unknown_call": 右值是非 exempt 函数调用 → 需 --fail-on-unknown-sink
+        - source_kind="unknown"  : 右值是其他形式(属性访问 / 子脚本 / 字面量非 str 等)
+        - source_kind=None       : 变量未在 var_map 中找到(参数 / 全局 / 跨函数)
+        - chain: 从 sink 到字面量来源的路径(如 ('var<msg>',) / ('var<msg>.call',)
+    """
+    if depth > _max_depth:
+        return ("unknown", ())
+    value = var_map.get(var_name)
+    if value is None:
+        return (None, ())
+    # 字符串字面量 / f-string → 标记
+    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+        return ("literal", (f"var<{var_name}>",))
+    if isinstance(value, ast.JoinedStr):
+        return ("literal", (f"var<{var_name}>",))
+    # exempt 函数调用(_i18n_t / AppError / UserMessage 等)→ 不标记
+    if isinstance(value, ast.Call) and _is_exempt_call(value):
+        return ("exempt", (f"var<{var_name}>",))
+    # 非 exempt 函数调用 → 未知来源(--fail-on-unknown-sink 时标记)
+    if isinstance(value, ast.Call):
+        return ("unknown_call", (f"var<{var_name}>",))
+    # 右值是另一个变量 → 继续回溯
+    if isinstance(value, ast.Name):
+        sub_kind, sub_chain = _trace_variable_source(
+            value.id, var_map, depth + 1, _max_depth,
+        )
+        return (sub_kind, (f"var<{var_name}>",) + sub_chain)
+    # 其他形式(属性访问 / 子脚本 / 字面量非 str 等)→ 未知
+    return ("unknown", (f"var<{var_name}>",))
+
+
+def _is_user_message_returning_call(node: ast.Call) -> bool:
+    """R62 P1-05: 检查 Call 节点是否返回 UserMessage / ErrorEnvelope / AppError。
+
+    用于 cross-function 分析:当 sink 参数是函数调用时,
+    若该函数返回 UserMessage/ErrorEnvelope(已结构化),则不标记;
+    否则视为未知来源(--fail-on-unknown-sink 时标记)。
+
+    匹配模式(基于 exempt 函数名):
+        - UserMessage(...) / UserMessage.from_key(...) / UserMessage.from_error(...)
+        - AppError(...) / ErrorEnvelope(...)
+        - _i18n_t(...) / translate(...) / format_message_icu(...)
+    """
+    return _is_exempt_call(node)
+
+
+def _follow_var_chain_to_literal(
+    var_name: str,
+    var_map: dict[str, ast.AST],
+    _max_depth: int = 5,
+) -> str | None:
+    """R62 P1-05: 沿变量赋值链回溯,提取最终的字符串字面量。
+
+    当 ``_trace_variable_source`` 返回 ``kind="literal"`` 时,实际字面量可能在
+    链的末尾(如 ``a = b; b = "literal"``),需沿链回溯到 Constant / JoinedStr。
+
+    防御性设计:用 ``seen`` 集合防止循环引用(如 ``a = b; b = a``)导致的死循环。
+
+    Args:
+        var_name: 起点 sink 参数变量名(如 ``msg``)
+        var_map: 函数内变量赋值映射(来自 ``_build_function_var_map``)
+        _max_depth: 最大回溯深度(防御性,避免无限递归)
+
+    Returns:
+        最终的字符串字面量(Constant str);若链中存在非字面量节点则返回 None。
+        f-string(JoinedStr)通过 ``_extract_string_literal`` 抽取首段字面量。
+    """
+    seen: set[str] = set()
+    current = var_name
+    depth = 0
+    while current and current not in seen and depth <= _max_depth:
+        seen.add(current)
+        value = var_map.get(current)
+        if value is None:
+            return None
+        # 字符串字面量 → 直接返回
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            return value.value
+        # f-string → 抽取首段字面量(占位符展开为 {})
+        if isinstance(value, ast.JoinedStr):
+            return _extract_string_literal(value)
+        # 链中下一环节是另一个变量 → 继续回溯
+        if isinstance(value, ast.Name):
+            current = value.id
+            depth += 1
+            continue
+        # 其他形式(Call / Attribute / Subscript 等)→ 不是字面量
+        return None
+    return None
+
+
+def scan_python_content_cross_function(
+    content: str,
+    *,
+    fail_on_unknown_sink: bool = False,
+) -> list[tuple[int, str, str]]:
+    """R62 P1-05: cross-function source-to-sink 分析(增量于 scan_python_content)。
+
+    在 scan_python_content 已有检测之上,新增:
+        1. 变量回溯:当 sink 参数是 ``Name``(变量引用)时,回溯到函数内赋值;
+           若赋值右值是字符串字面量 / f-string → 标记(pattern_type 'sink:<name>.var')
+        2. 函数返回值传播:当 sink 参数是非 exempt 函数调用时,若 --fail-on-unknown-sink
+           开启 → 标记(pattern_type 'sink:<name>.unknown_call')
+        3. SSE yield:f"..." / yield "..." 含 "data:" 前缀 → 标记(pattern_type 'sse:yield')
+        4. FastAPI dict 返回:return {"message": "..."} → 标记(pattern_type 'fastapi:return_dict')
+
+    Args:
+        content: Python 源代码字符串
+        fail_on_unknown_sink: True 时,非 exempt 函数调用作为 sink 参数被标记
+            (生产构建门禁:未知 sink 来源失败关闭)
+
+    Returns:
+        [(line_no, pattern_type, content), ...] 仅包含 cross-function 新增的 findings
+        (不重复 scan_python_content 已检测的直接字面量)
+    """
+    findings: list[tuple[int, str, str]] = []
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return findings
+
+    # 收集所有函数定义(含 async)
+    func_nodes: list[ast.FunctionDef | ast.AsyncFunctionDef] = [
+        n for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    for func in func_nodes:
+        var_map = _build_function_var_map(func)
+        # 遍历函数内所有 Call 节点
+        for node in ast.walk(func):
+            if not isinstance(node, ast.Call):
+                continue
+            if not _is_sink_call(node):
+                continue
+            sink_name = _get_call_name(node)
+            # WebSocket sink 名修正(websocket.send → ws:send)
+            if _is_websocket_send_call(node):
+                sink_name = f"ws:{node.func.attr}"
+            # 检查位置参数 + 关键字参数(变量 / Call 来源)
+            # 位置参数:仅检查 "literal"(字符串字面量回溯),不检查 "unknown_call"
+            #   (位置参数可能是 chat_id 等非用户文本,unknown_call 会误伤)
+            # 关键字参数:仅检查用户面向 kwargs(text/detail/message/content/context/
+            #   subject/body 等),不检查结构性 kwargs(reply_markup/parse_mode 等)
+            for arg in node.args:
+                if isinstance(arg, ast.Name):
+                    kind, chain = _trace_variable_source(arg.id, var_map)
+                    if kind == "literal":
+                        # R62 P1-05: 沿变量赋值链回溯到最终字面量(支持 a=b; b="literal")
+                        # 旧实现仅取 var_map.get(arg.id),无法处理链式赋值,
+                        # 导致 wrapper / 别名漏检(审计 P1-05 明确要求覆盖)。
+                        text = _follow_var_chain_to_literal(arg.id, var_map)
+                        if text and text.strip() and not _is_internal_protocol(text) \
+                                and not _is_protocol_constant(text):
+                            ptype = _describe_sink_chain(node, '', chain)
+                            findings.append((node.lineno, ptype, text[:80]))
+            for kw in node.keywords:
+                if kw.arg is None:
+                    continue
+                if kw.arg in SINK_STRUCTURAL_KWARGS:
+                    continue
+                # R62 P1-05: cross-function 仅检查用户面向 kwargs
+                # (text/detail/message/content/context/subject/body 等),
+                # 跳过结构性 kwargs(reply_markup/parse_mode/disable_notification 等)
+                if kw.arg not in _CROSS_FUNCTION_USER_FACING_KWARGS:
+                    continue
+                arg = kw.value
+                kw_name = kw.arg
+                # 情况 2:变量 → 回溯赋值
+                if isinstance(arg, ast.Name):
+                    kind, chain = _trace_variable_source(arg.id, var_map)
+                    if kind == "literal":
+                        # 变量回溯到字面量 — 标记(避免 wrapper / 别名漏检)
+                        # R62 P1-05: 沿链回溯到最终字面量(支持 a=b; b="literal")
+                        text = _follow_var_chain_to_literal(arg.id, var_map)
+                        if text and text.strip() and not _is_internal_protocol(text) \
+                                and not _is_protocol_constant(text):
+                            ptype = _describe_sink_chain(node, kw_name, chain)
+                            findings.append((node.lineno, ptype, text[:80]))
+                    elif kind == "unknown_call" and fail_on_unknown_sink:
+                        # 变量赋值自非 exempt 函数 → 未知来源(--fail-on-unknown-sink)
+                        ptype = _describe_sink_chain(node, kw_name, chain)
+                        findings.append((node.lineno, f"{ptype}.unknown_call", arg.id[:80]))
+                # 情况 3:非 exempt 函数调用(--fail-on-unknown-sink 时标记)
+                elif isinstance(arg, ast.Call) and fail_on_unknown_sink:
+                    if not _is_exempt_call(arg):
+                        # 非 exempt 函数调用作为 sink 参数 → 未知来源
+                        call_name = _get_call_name(arg)
+                        ptype = _describe_sink_chain(node, kw_name, ())
+                        findings.append(
+                            (node.lineno, f"{ptype}.unknown_call", call_name[:80])
+                        )
+
+    # 检测 SSE yield f"data: ..." 模式
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Yield) and _is_sse_yield_data(node):
+            # 抽取字面量文本
+            val = node.value
+            text = _extract_string_literal(val)
+            if text and text.strip():
+                findings.append((node.lineno, 'sse:yield', text[:80]))
+
+    # 检测 FastAPI dict 返回:return {"message": "..."} / return {"error": "..."}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or node.value is None:
+            continue
+        ret = node.value
+        if not isinstance(ret, ast.Dict):
+            continue
+        # 检查 dict 字面量是否含用户面向 key(message/msg/error/detail/description)
+        user_facing_keys = frozenset({"message", "msg", "error", "detail", "description"})
+        for k, v in zip(ret.keys, ret.values):
+            if not isinstance(k, ast.Constant) or not isinstance(k.value, str):
+                continue
+            if k.value not in user_facing_keys:
+                continue
+            # 抽取 value 字面量
+            text = _extract_string_literal(v)
+            if text and text.strip() and not _is_internal_protocol(text) \
+                    and not _is_protocol_constant(text):
+                ptype = f"fastapi:return_dict.dict[{k.value}]"
+                findings.append((node.lineno, ptype, text[:80]))
+
+    return findings
+
+
+def enumerate_user_facing_sinks(content: str) -> list[tuple[int, str, str]]:
+    """R62 P1-05: 自动枚举用户面向 sink(检测 FastAPI/Telegram/WebSocket/SSE/
+    mail/notification/template 出口)。
+
+    用于审计报告:列出所有 sink 调用点(无论参数是否违规),便于人工确认
+    所有用户面出口已纳入 PYTHON_SINK_FUNCS 注册表(新 sink 必须先注册)。
+
+    与 scan_python_content 的区别:
+        - scan_python_content: 检测违规字面量(命中 sink 即 flag)
+        - enumerate_user_facing_sinks: 列出所有 sink 调用点(用于 sink 清单审计)
+
+    返回 [(line_no, sink_category, sink_repr), ...]:
+        - sink_category: 'fastapi' / 'telegram' / 'websocket' / 'sse' /
+          'mail' / 'notification' / 'template' / 'http_exception' / 'unknown'
+        - sink_repr: sink 函数名 + 关键参数(截断到 80 字符)
+    """
+    sinks: list[tuple[int, str, str]] = []
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return sinks
+
+    for node in ast.walk(tree):
+        # Yield SSE 模式
+        if isinstance(node, ast.Yield) and _is_sse_yield_data(node):
+            sinks.append((node.lineno, 'sse', 'yield data:...'))
+            continue
+        if not isinstance(node, ast.Call):
+            continue
+        name = _get_call_name(node)
+        if not name:
+            continue
+        # 豁免函数(UserMessage / _i18n_t / AppError 等)不算 sink 出口
+        if name in PYTHON_EXEMPT_FUNCS:
+            continue
+        # logger.* 调用不算用户面 sink
+        if _is_logger_or_print_call(node):
+            continue
+
+        category = _classify_sink_category(node, name)
+        if category is None:
+            continue
+        sink_repr = name
+        # WebSocket 用 ws:send / ws:send_text 表示
+        if _is_websocket_send_call(node):
+            sink_repr = f"ws:{node.func.attr}"
+        sinks.append((node.lineno, category, sink_repr[:80]))
+
+    return sinks
+
+
+def _classify_sink_category(node: ast.Call, name: str) -> str | None:
+    """R62 P1-05: 将 sink 调用按出口类型分类(用于 enumerate_user_facing_sinks)。
+
+    返回 None 表示不是用户面 sink(不纳入枚举)。
+    """
+    # FastAPI HTTP 异常 / 响应
+    if name == 'HTTPException':
+        return 'http_exception'
+    if name in {'JSONResponse', 'HTMLResponse', 'PlainResponse',
+                'Response', 'EventSourceResponse'}:
+        return 'fastapi'
+    # 模板渲染
+    if name in {'TemplateResponse', 'render', 'render_template'}:
+        return 'template'
+    # Web framework flash (Flask/Starlette)
+    if name == 'flash':
+        return 'fastapi'
+    # Telegram Bot
+    if name in {'reply_text', 'reply_photo', 'reply_document', 'reply_video',
+                'reply_audio', 'reply_animation', 'reply_media_group',
+                'reply_voice', 'reply_sticker', 'reply_location', 'reply_venue',
+                'reply_contact', 'reply_poll', 'reply_dice', 'reply_chat_action',
+                'send_message', 'send_photo', 'send_document', 'send_video',
+                'send_audio', 'send_animation', 'send_media_group', 'send_voice',
+                'send_sticker', 'send_location', 'send_venue', 'send_contact',
+                'send_poll', 'send_chat_action',
+                'answer_callback_query', 'answer_inline_query',
+                'answer_shipping_query', 'answer_pre_checkout_query',
+                'edit_message_text', 'edit_message_caption',
+                'edit_message_reply_markup'}:
+        return 'telegram'
+    # 邮件
+    if name in {'send_mail', 'send_email', 'email_message'}:
+        return 'mail'
+    # 通知
+    if name in {'notify', 'push_notification', 'send_notification'}:
+        return 'notification'
+    # WebSocket
+    if _is_websocket_send_call(node):
+        return 'websocket'
+    # 含 sink 关键字参数的未知调用(detail= / text= / message=)
+    for kw in node.keywords:
+        if kw.arg in PYTHON_SINK_KEYWORDS and _is_potential_string_arg(kw.value):
+            return 'unknown_sink_kwarg'
+    return None
 
 
 def scan_python_file(path: Path) -> list[tuple[int, str, str]]:
@@ -1627,10 +2109,135 @@ def cmd_generate_baseline(
     return 0
 
 
+# === R62 P1-05: cross-function / --fail-on-unknown-sink 命令 ===
+
+
+def cmd_cross_function(root: Path, *, fail_on_unknown_sink: bool = False) -> int:
+    """R62 P1-05: cross-function source-to-sink 分析命令。
+
+    扫描所有 Python 源文件,执行 cross-function 变量回溯 + 函数返回值传播检测,
+    输出新增 findings(增量于 scan_python_content)。
+
+    Args:
+        root: 项目根目录
+        fail_on_unknown_sink: True 时,非 exempt 函数调用作为 sink 参数被标记
+            (生产构建门禁:未知 sink 来源失败关闭)
+
+    Exit code:
+        0 = 无新增 finding
+        1 = 存在 cross-function finding(变量回溯到字面量 / 未知 sink 来源)
+    """
+    print('=' * 78)
+    print('R62 P1-05 cross-function source-to-sink 分析')
+    print(f"  cross-function 分析版本: {CROSS_FUNCTION_ANALYSIS_VERSION}")
+    print(f"  fail_on_unknown_sink: {fail_on_unknown_sink}")
+    print('=' * 78)
+
+    total_findings = 0
+    by_category: dict[str, int] = {}
+    by_file: dict[str, int] = {}
+
+    for pattern in ['bots/**/*.py', 'admin/**/*.py', 'services/**/*.py']:
+        for path in root.glob(pattern):
+            if is_skipped(path):
+                continue
+            try:
+                content = path.read_text(encoding='utf-8')
+            except Exception:
+                continue
+            rel = str(path.relative_to(root)).replace(chr(92), '/')
+            findings = scan_python_content_cross_function(
+                content, fail_on_unknown_sink=fail_on_unknown_sink,
+            )
+            if not findings:
+                continue
+            for line_no, ptype, text in findings:
+                print(f"  {rel}:{line_no}: {ptype}  <-  \"{text}\"")
+                total_findings += 1
+                # 按类别统计(prefix:)
+                cat = ptype.split('.')[0] if '.' in ptype else ptype
+                by_category[cat] = by_category.get(cat, 0) + 1
+                by_file[rel] = by_file.get(rel, 0) + 1
+
+    print()
+    print(f"  cross-function findings 总计: {total_findings}")
+    if by_category:
+        print("  按类别:")
+        for cat, cnt in sorted(by_category.items(), key=lambda x: (-x[1], x[0])):
+            print(f"    {cat:<24} {cnt:>5}")
+    if by_file:
+        print("  按文件(Top 10):")
+        for f, cnt in sorted(by_file.items(), key=lambda x: (-x[1], x[0]))[:10]:
+            print(f"    {f:<52} {cnt:>5}")
+    print('=' * 78)
+    if total_findings > 0:
+        print("❌ 发现 cross-function findings")
+        print("   请将变量赋值改为直接 _i18n_t() / UserMessage.from_key() 调用,")
+        print("   或使用 UserMessage 结构化对象替代裸字符串变量传播。")
+        return 1
+    print("✓ 无 cross-function findings")
+    return 0
+
+
+def cmd_enumerate_sinks(root: Path) -> int:
+    """R62 P1-05: 自动枚举所有用户面向 sink(审计报告)。
+
+    扫描所有 Python 源文件,列出所有 sink 调用点(无论参数是否违规),
+    按出口类型(fastapi / telegram / websocket / sse / mail / notification /
+    template / http_exception)分类输出。
+
+    用于审计确认:所有用户面出口已纳入 PYTHON_SINK_FUNCS 注册表
+    (新 sink 必须先注册,生产构建未知 sink 失败关闭)。
+
+    Exit code:
+        始终 0(仅生成报告,不做门禁判定)
+    """
+    print('=' * 78)
+    print('R62 P1-05 用户面向 sink 自动枚举报告')
+    print('=' * 78)
+
+    by_category: dict[str, int] = {}
+    by_file_cat: dict[str, dict[str, int]] = {}
+    total_sinks = 0
+
+    for pattern in ['bots/**/*.py', 'admin/**/*.py', 'services/**/*.py']:
+        for path in root.glob(pattern):
+            if is_skipped(path):
+                continue
+            try:
+                content = path.read_text(encoding='utf-8')
+            except Exception:
+                continue
+            rel = str(path.relative_to(root)).replace(chr(92), '/')
+            sinks = enumerate_user_facing_sinks(content)
+            if not sinks:
+                continue
+            by_file_cat.setdefault(rel, {})
+            for _ln, cat, _repr in sinks:
+                by_category[cat] = by_category.get(cat, 0) + 1
+                by_file_cat[rel][cat] = by_file_cat[rel].get(cat, 0) + 1
+                total_sinks += 1
+
+    print(f"\n  sink 总计: {total_sinks}")
+    print("\n【按出口类型】")
+    print(f"  {'类别':<22}{'数量':>8}")
+    for cat, cnt in sorted(by_category.items(), key=lambda x: (-x[1], x[0])):
+        print(f"  {cat:<22}{cnt:>8}")
+    print("\n【按文件 Top 10】")
+    print(f"  {'文件':<42}{'类别':<22}{'数量':>8}")
+    file_totals = [(f, sum(c.values())) for f, c in by_file_cat.items()]
+    for f, _ in sorted(file_totals, key=lambda x: (-x[1], x[0]))[:10]:
+        for cat, cnt in sorted(by_file_cat[f].items(),
+                              key=lambda x: (-x[1], x[0])):
+            print(f"  {f:<42}{cat:<22}{cnt:>8}")
+    print('=' * 78)
+    return 0
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description='R48 P1-c 模块化 i18n 硬编码字符串扫描'
-                    '(scope 审批 + delta + classify)',
+                    '(scope 审批 + delta + classify + R62 cross-function)',
     )
     parser.add_argument('--check', action='store_true',
                         help='模块化门禁检查(默认行为)')
@@ -1650,9 +2257,33 @@ def main(argv=None) -> int:
                         help='允许 scanner scope 变化(included_paths 增删)')
     parser.add_argument('--force', action='store_true',
                         help='非 master 分支强制运行 --generate-baseline')
+    # R62 P1-05: cross-function source-to-sink 分析(变量回溯 / 函数返回值传播)
+    parser.add_argument('--cross-function', action='store_true',
+                        help='R62 P1-05: cross-function source-to-sink 分析'
+                            '(变量回溯到字面量 / 函数返回值传播检测)')
+    # R62 P1-05: 生产构建门禁 — 未知 sink 来源失败关闭
+    parser.add_argument('--fail-on-unknown-sink', action='store_true',
+                        help='R62 P1-05: 生产构建门禁 — 非 exempt 函数调用作为 sink '
+                            '参数时失败(失败关闭,需配合 --cross-function 使用)')
+    # R62 P1-05: 自动枚举用户面向 sink(FastAPI/Telegram/WebSocket/SSE/
+    # mail/notification/template)用于审计确认
+    parser.add_argument('--enumerate-sinks', action='store_true',
+                        help='R62 P1-05: 自动枚举所有用户面向 sink(FastAPI/Telegram/'
+                            'WebSocket/SSE/mail/notification/template)')
     args = parser.parse_args(argv)
 
     root = Path(__file__).parent.parent
+
+    # R62 P1-05: cross-function 分析(独立命令,不加载 baseline)
+    if args.cross_function or args.fail_on_unknown_sink:
+        return cmd_cross_function(
+            root, fail_on_unknown_sink=args.fail_on_unknown_sink,
+        )
+
+    # R62 P1-05: 自动枚举 sink(独立审计命令,不加载 baseline)
+    if args.enumerate_sinks:
+        return cmd_enumerate_sinks(root)
+
     findings = collect_findings(root)
     module_counts = count_by_module(findings)
     baseline = _load_module_baseline()

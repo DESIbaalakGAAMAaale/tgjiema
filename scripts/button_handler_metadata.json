@@ -76,62 +76,21 @@
     },
     "_handle_report_action": {
       "action_type": "report_action",
-      "rbac": "AUTHORIZED_USER_ID (admin bot 操作者, hardcoded 单管理员)",
-      "mfa": "not required (bot 会话无 MFA;TODO: 应接入 CommandBus RBAC)",
-      "two_person_approval": "not required (TODO: report:ban 应走 make_ban_user_command 审批)",
-      "idempotency_key": ["TODO: 当前无幂等键,直接 update_user_and_invalidate; 应改为 action_id+request_hash"],
-      "state_transitions": "TODO: 当前无状态机(直接执行); 应改为 pending->approved->executing->executed",
-      "timeout": "TODO: 当前无超时; 应接入 approval_ttl=86400s + execution_lease=300s",
-      "cancellation": "not supported (TODO: 应支持 report:ignore 之外的审批 reject)",
-      "localization_confirmation": "bot.admin_bot.callback.s6 (未授权) / bot.admin_bot.callback.s20 (忽略) / bot.admin_bot.callback.s23/s26/s30 (参数错误)",
-      "audit_schema": "TODO: 当前仅 logger.warning; 应改为 audit_log(action=ban_user/takedown, actor=user.id, target=user_id/file_code)"
+      "rbac": "AUTHORIZED_USER_ID (admin bot 操作者, hardcoded 单管理员); R62 P0-04 后所有破坏性子动作走 CommandBus(make_ban_user_command / make_detach_file_command / make_block_user_for_file_command)",
+      "mfa": "not required (bot 会话无 MFA;依赖 AUTHORIZED_USER_ID + 签名 token + CommandBus 审批门禁)",
+      "two_person_approval": "ban 子动作 required (make_ban_user_command requires_approval=True, APPROVAL_ACTION_BAN); detach/block 子动作 not required (立即执行)",
+      "idempotency_key": ["action_id", "request_hash", "sub_action_target (uid/file_code/reporter_id)"],
+      "state_transitions": "ban: pending -> approved -> executing -> executed; detach/block: pending -> executing -> executed (无审批,立即执行)",
+      "timeout": "approval_ttl=86400s (ban); execution_lease=300s (detach/block)",
+      "cancellation": "supported via report:ignore (低风险不签名); ban 通过 approval reject (pending -> rejected)",
+      "localization_confirmation": "bot.admin_bot.callback.s6 (未授权) / bot.admin_bot.callback.s20 (忽略) / 签名失败提示文案 (handle 短 ID 模式)",
+      "audit_schema": "command_executions(action_id, command_type=ban_user/detach_file/block_user_for_file, principal_id=user.id, request_hash, status); audit_log(action=ban_user/takedown, actor=user.id, target=user_id/file_code); callback_nonces 表记录 nonce 原子消费(button_tokens 表记录 handle_id -> token 映射)"
     }
   },
   "baseline": {
-    "description": "R61 P1-09: 按钮 handler 门禁 baseline (Rule A/C ratchet 下降;Rule B 无 baseline,必须补全)",
-    "note": "baseline 仅记录 Rule A/C 的现有违规,通过 ratchet 逐步下降。修复违规后运行 --generate-baseline 更新此文件(只减不增)。Rule B(元数据缺失)无 baseline,必须立即补全 sidecar 字段。",
-    "violation_count": 4,
-    "violations": [
-      {
-        "key": "A::bots/admin_bot/callback.py::_handle_report_action::callback_sub_dispatcher",
-        "rule": "A",
-        "violation_type": "RULE_A_DESTRUCTIVE_BYPASS",
-        "file": "bots/admin_bot/callback.py",
-        "handler": "_handle_report_action",
-        "owner": "audit-team",
-        "reason": "report:ban/detach/block 直接调 update_user_and_invalidate/update_file_record_and_invalidate,未走 CommandBus。R61 P1-09 遗留债务,待 R62 迁移至 make_ban_user_command + make_takedown_command + bus.execute。",
-        "expiry": "2026-09-30"
-      },
-      {
-        "key": "C::bots/admin_bot/callback.py::_handle_report_action::callback_sub_dispatcher",
-        "rule": "C",
-        "violation_type": "RULE_C_NO_SIGNED_TOKEN",
-        "file": "bots/admin_bot/callback.py",
-        "handler": "_handle_report_action",
-        "owner": "audit-team",
-        "reason": "高风险 callback handler 使用裸 query.data.split 解析,未用 sign_button_token_with_nonce/verify_button_token 签名绑定。R61 P1-09 遗留债务,待 R62 迁移至 ButtonFlow 6 步流程。",
-        "expiry": "2026-09-30"
-      },
-      {
-        "key": "C::bots/admin_bot/callback.py::_handle_restore_action::callback_sub_dispatcher",
-        "rule": "C",
-        "violation_type": "RULE_C_NO_SIGNED_TOKEN",
-        "file": "bots/admin_bot/callback.py",
-        "handler": "_handle_restore_action",
-        "owner": "audit-team",
-        "reason": "高风险 callback handler 使用裸 query.data.split 解析 restore:confirm|seq|merge|table,未用签名绑定。虽走 CommandBus(Rule A 通过),但 callback_data 可伪造。待 R62 迁移至 sign_button_token_with_nonce。",
-        "expiry": "2026-09-30"
-      },
-      {
-        "key": "C::bots/admin_bot/callback.py::_handle_delete_file_action::callback_sub_dispatcher",
-        "rule": "C",
-        "violation_type": "RULE_C_NO_SIGNED_TOKEN",
-        "file": "bots/admin_bot/callback.py",
-        "handler": "_handle_delete_file_action",
-        "owner": "audit-team",
-        "reason": "高风险 callback handler 使用裸 query.data.split 解析 delfile|file_code,未用签名绑定。虽走 CommandBus(Rule A 通过),但 callback_data 可伪造。待 R62 迁移至 sign_button_token_with_nonce。",
-        "expiry": "2026-09-30"
-      }
-    ]
+    "description": "R62 P0-04: 按钮 handler 门禁 baseline 已清零(Rule A/C ratchet 全部下降到 0;Rule B 元数据已补全)",
+    "note": "R62 P0-04 已修复全部 4 条 baseline 违规(report/restore/delete_file 走签名 token + handle 短 ID 模式 + CommandBus)。baseline.violation_count = 0,violations 列表为空。后续若引入新违规需走 --generate-baseline 重新建立 ratchet。",
+    "violation_count": 0,
+    "violations": []
   }
 }

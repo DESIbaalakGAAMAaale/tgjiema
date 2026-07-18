@@ -119,6 +119,8 @@ class TestGeneratorProducesNonemptyInventory:
             "maintenance_action",
             "_handle_restore_action",
             "_handle_delete_file_action",
+            # R62 P0-04: _handle_report_action 已迁移至 CommandBus
+            "_handle_report_action",
         }
         missing = expected - handler_names
         assert not missing, (
@@ -134,6 +136,8 @@ class TestGeneratorProducesNonemptyInventory:
                 "toggle_ban", "delete_file", "takedown_report",
                 "maintenance_action",
                 "_handle_restore_action", "_handle_delete_file_action",
+                # R62 P0-04: _handle_report_action 已迁移至 CommandBus
+                "_handle_report_action",
             ):
                 assert h["is_high_risk"], (
                     f"{h['handler']} 应为高风险"
@@ -143,8 +147,9 @@ class TestGeneratorProducesNonemptyInventory:
                     f"实际: {h}"
                 )
 
-    def test_report_action_handler_flagged_as_bypass(self):
-        """_handle_report_action 直接调破坏性 API,应标记 bypass_reason。"""
+    def test_report_action_handler_no_longer_flagged_as_bypass(self):
+        """R62 P0-04 修复后: _handle_report_action 走 CommandBus + 签名 token,
+        不再标记 bypass_reason / calls_destructive_api。"""
         inventory = _load_inventory_artifact()
         report_handler = None
         for h in inventory["handlers"]:
@@ -153,13 +158,21 @@ class TestGeneratorProducesNonemptyInventory:
                 break
         assert report_handler is not None, "_handle_report_action 应在 inventory 中"
         assert report_handler["is_high_risk"], (
-            "_handle_report_action 应为高风险(直接调 update_user_and_invalidate)"
+            "_handle_report_action 应为高风险(举报触发封禁/脱钩/限制)"
         )
-        assert report_handler["bypass_reason"] is not None, (
-            "_handle_report_action 应有 bypass_reason(Rule A 违规)"
+        # R62 P0-04 修复: 通过 make_ban_user_command / make_detach_file_command /
+        # make_block_user_for_file_command + bus.execute 路由,不再直接调破坏性 API
+        assert report_handler["bypass_reason"] is None, (
+            "R62 P0-04 修复后 _handle_report_action 不应有 bypass_reason"
         )
-        assert report_handler["calls_destructive_api"], (
-            "_handle_report_action 应标记 calls_destructive_api=True"
+        assert not report_handler["calls_destructive_api"], (
+            "R62 P0-04 修复后 _handle_report_action 不应调用破坏性 API"
+        )
+        assert report_handler["routes_through_command_bus"], (
+            "R62 P0-04 修复后 _handle_report_action 应走 CommandBus"
+        )
+        assert report_handler["uses_signed_token_api"], (
+            "R62 P0-04 修复后 _handle_report_action 应使用签名 token (handle 短 ID 模式)"
         )
 
 
@@ -747,8 +760,13 @@ class TestBaselineRatchetMode:
             f"实际 exit_code={exit_code}, new_violations={new_violations}"
         )
 
-    def test_strict_mode_fails_with_known_violations(self):
-        """真实代码库:strict 模式 exit 1(忽略 baseline)。"""
+    def test_strict_mode_passes_after_r62_p0_04_fix(self):
+        """R62 P0-04 修复后:真实代码库 strict 模式 exit 0(无任何违规)。
+
+        历史背景: R61 时 baseline 有 4 条违规(report/restore/delete_file Rule A/C),
+        strict 模式忽略 baseline 时 exit 1。R62 P0-04 已修复全部 4 条违规,
+        strict 模式现在应 exit 0。
+        """
         gate = _load_gate_module()
         inventory = _load_inventory_artifact()
         metadata = _load_metadata_artifact()
@@ -759,19 +777,58 @@ class TestBaselineRatchetMode:
             strict=True,
         )
 
-        # strict 模式:所有违规都算新增
-        assert exit_code == 1, (
-            f"strict 模式应 exit 1(存在违规),"
-            f"实际 exit_code={exit_code}"
+        # strict 模式: R62 P0-04 修复后无违规,应 exit 0
+        assert exit_code == 0, (
+            f"R62 P0-04 修复后 strict 模式应 exit 0(无违规),"
+            f"实际 exit_code={exit_code}, new_violations={new_violations}"
         )
-        assert len(new_violations) > 0, "strict 模式应有违规"
+        assert len(new_violations) == 0, (
+            f"R62 P0-04 修复后不应有新增违规,实际: {new_violations}"
+        )
 
-    def test_baseline_violations_have_owner_reason_expiry(self):
-        """baseline 中每条违规应包含 owner / reason / expiry 字段。"""
+    def test_baseline_violations_cleared_after_r62_p0_04_fix(self):
+        """R62 P0-04 修复后:baseline.violation_count = 0,violations 列表为空。
+
+        历史背景: R61 时 baseline 有 4 条违规(_handle_report_action Rule A/C、
+        _handle_restore_action Rule C、_handle_delete_file_action Rule C)。
+        R62 P0-04 已修复全部 4 条, baseline 应清零(violation_count=0, violations=[])。
+        """
         metadata = _load_metadata_artifact()
         baseline = metadata.get("baseline", {})
+        assert baseline.get("violation_count") == 0, (
+            f"R62 P0-04 修复后 baseline.violation_count 应为 0,"
+            f"实际: {baseline.get('violation_count')}"
+        )
         violations = baseline.get("violations", [])
-        assert len(violations) > 0, "baseline 应有已知违规(_handle_report_action 等)"
+        assert violations == [], (
+            f"R62 P0-04 修复后 baseline.violations 应为空列表,"
+            f"实际: {violations}"
+        )
+
+    def test_baseline_violations_format_when_present(self):
+        """若 baseline 中存在违规(合成测试),每条应包含 owner / reason / expiry。
+
+        此测试使用合成 baseline 验证字段格式,R62 P0-04 修复后真实 baseline 已清零。
+        """
+        # 合成 baseline(包含一条违规,验证字段格式)
+        synthetic_metadata = {
+            "handlers": {},
+            "baseline": {
+                "violation_count": 1,
+                "violations": [
+                    {
+                        "key": "A::bots/test.py::test_handler::callback",
+                        "rule": "A",
+                        "owner": "test-team",
+                        "reason": "合成测试违规",
+                        "expiry": "2026-12-31",
+                    }
+                ],
+            },
+        }
+        baseline = synthetic_metadata["baseline"]
+        violations = baseline.get("violations", [])
+        assert len(violations) > 0, "合成 baseline 应有违规"
         for v in violations:
             assert "key" in v, f"baseline 违规缺少 key: {v}"
             assert "rule" in v, f"baseline 违规缺少 rule: {v}"

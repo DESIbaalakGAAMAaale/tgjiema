@@ -1,6 +1,5 @@
-// @ts-nocheck
 /**
- * R61 P1-08: 无障碍行为测试 — 自动派生自 generated_a11y_cases.json
+ * R61 P1-08 / R62 P1-06: 无障碍行为测试 — 自动派生自 generated_a11y_cases.json
  *
  * 审计 P1-08 整改要求("无障碍路由仍依赖人工 TEMPLATE_TO_ROUTE"):
  *   1. 不再依赖人工 TEMPLATE_TO_ROUTE 数组,改为从 generated_a11y_cases.json
@@ -12,66 +11,43 @@
  *   4. 每个 a11y_testable 用例(zh-CN + en-US)执行:
  *      axe 扫描、键盘 Tab 流转、focus visible、dialog 焦点陷阱/Escape/恢复、
  *      aria-live、200% zoom、prefers-reduced-motion。
- *   5. 文件可被 tsc 解析;运行时若 @playwright/test 或 @axe-core/playwright 缺失,
- *      所有 test.describe 自动 skip(不阻塞 CI 收集)。
+ *
+ * R62 P1-06 整改要求("依赖缺失自动 skip 是典型假绿条件"):
+ *   5. 移除 @ts-nocheck 与 stub replacement — 依赖缺失必须 HARD FAIL,不允许 skip。
+ *      @playwright/test / @axe-core/playwright 缺失时,import 直接抛错而非静默 stub。
+ *      ADMIN_TEST_PASSWORD 缺失时,文件加载即抛错(playwright.config.ts 同款校验)。
+ *   6. /login en-US 必须独立初始化 locale(Accept-Language header + locale cookie),
+ *      不复用 zh-CN 默认 locale 结果,并断言页面真正渲染为英文。
+ *   7. 文件末尾断言生成的测试用例数 > 0(检测 stub 替换导致的 0 用例假绿)。
+ *   8. 路由元数据完整性检查(每条 a11y_testable 用例必须有 path / route_path / method)。
  *
  * 历史背景:R56 §6 / R59 §5.4 / R60 §13 的存量测试(键盘/zoom/reflow/reduced-motion)
  * 保留,数据源统一改用 generated_a11y_cases.json。
  */
 
-// 优雅跳过:Playwright/axe 未安装时,本文件仍可被 tsc 解析,
-// 测试运行时若依赖缺失则整体 skip(而非 import 失败导致整个 test suite 崩溃)
+// R62 P1-06: 直接 import — 依赖缺失时模块加载即抛错(HARD FAIL),不允许 stub 兜底。
+// 旧实现的 try/catch require + stub replacement 会导致 0 用例 = 绿色 CI(假绿)。
+import { test, expect } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
 import * as fs from 'fs';
 import * as path from 'path';
 import { assertUrlEquals, assertLocaleRedirect } from './helpers/url_assert';
 
-let test: any;
-let expect: any;
-let AxeBuilder: any;
-let playwrightAvailable = false;
-let axeAvailable = false;
-
-try {
-  const pw = require('@playwright/test');
-  test = pw.test;
-  expect = pw.expect;
-  playwrightAvailable = true;
-} catch (_e) {
-  // @playwright/test 缺失:下面用 stub 兜底
+// R62 P1-06: ADMIN_TEST_PASSWORD 缺失必须硬失败(与 playwright.config.ts 同款校验)
+// 旧实现:缺失时整体 skip → 0 用例 = 绿色 CI(假绿)
+const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD;
+if (!ADMIN_PASSWORD) {
+  throw new Error(
+    'R62 P1-06: ADMIN_TEST_PASSWORD 环境变量必须设置(R56 §6: 禁止固定默认值);' +
+    '缺失时 a11y 测试 HARD FAIL,不允许 skip(假绿条件)。' +
+    '本地运行请执行: export ADMIN_TEST_PASSWORD="<your_test_password>"'
+  );
 }
 
-try {
-  AxeBuilder = require('@axe-core/playwright').default;
-  axeAvailable = true;
-} catch (_e) {
-  AxeBuilder = null;
-}
-
-const ADMIN_PASSWORD = process.env.ADMIN_TEST_PASSWORD || '';
-
-const SKIP_REASON = !playwrightAvailable
-  ? '@playwright/test 未安装 — 跳过 a11y 行为测试'
-  : !axeAvailable
-  ? '@axe-core/playwright 未安装 — 跳过 a11y 行为测试'
-  : !ADMIN_PASSWORD
-  ? 'ADMIN_TEST_PASSWORD 环境变量未设置(R56 §6: 禁止固定默认值)'
-  : '';
-
-if (SKIP_REASON) {
-  // 整体 skip:describe 不调用 body → 不注册任何 test → 整体 skip
-  test = {
-    describe: () => {},
-    test: () => {},
-    skip: () => {},
-    beforeEach: () => {},
-    beforeAll: () => {},
-    afterEach: () => {},
-    afterAll: () => {},
-    setTimeout: () => {},
-  };
-  expect = () => ({});
-  // 在 stderr 留痕,便于 CI 日志追溯(禁止静默跳过)
-  console.error(`[R61 P1-08] accessibility_behavior.spec.ts 整体 skip: ${SKIP_REASON}`);
+// R62 P1-06: 辅助函数 — 从环境变量读取 baseURL(与 playwright.config.ts 一致)
+// 用于 /login en-US 测试创建独立 BrowserContext 时复用 baseURL 配置
+function baseURLFromEnv(): string {
+  return process.env.ADMIN_BASE_URL || 'http://127.0.0.1:8080';
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -447,27 +423,68 @@ test.describe('R61 P1-08: 无障碍行为(自动派生自 generated_a11y_cases.j
       await runFullA11yChecks(page, caze);
     });
 
-    // en-US locale:重复完整 a11y 检查
-    test(`${name} (en-US): axe + 键盘 + 焦点 + dialog + aria-live + 200% zoom + reduced-motion`, async ({ page }: any) => {
-      if (requiresLogin) await login(page);
-      // R61 P1-08 修复: /login 是公开页面,无 session → /locale 端点(需 require_session)返回 401。
-      // 对 /login 跳过 /locale 切换,直接执行 a11y 检查(login 页 locale 由默认 locale 决定,
-      // 不依赖 /locale 端点;en-US 路径的 a11y 检查与 zh-CN 一致,locale 不影响 a11y 合规性)。
-      if (caze.path !== '/login') {
+    if (caze.path === '/login') {
+      // R62 P1-06: /login en-US 必须独立初始化 locale,不复用 zh-CN 默认 locale 结果。
+      // 旧实现:对 /login 跳过 /locale 切换 → en-US 与 zh-CN 测试完全相同(假绿)。
+      // 整改:/login 是公开页面,无法调用 /locale 端点(需 require_session)。
+      //   改用 BrowserContext locale 选项(设置 Accept-Language: en-US header)
+      //   + 注入 locale=en-US cookie(与 admin/__init__.py 读取 cookie 的逻辑对齐)
+      //   独立初始化 en-US 渲染,并断言页面真正渲染为英文(<html lang="en-US"> + 无中文)。
+      test(`${name} (en-US): Accept-Language + locale cookie → 独立英文渲染 + a11y 检查`, async ({ browser }: any) => {
+        const context = await browser.newContext({
+          // 设置 Accept-Language: en-US header(浏览器导航时自动附加)
+          locale: 'en-US',
+          extraHTTPHeaders: { 'Accept-Language': 'en-US' },
+          // 复用默认 context 的 baseURL 配置
+          baseURL: baseURLFromEnv(),
+        });
+        // 注入 locale cookie(模拟 /locale?lang=en-US 的效果,但不依赖该端点)
+        // admin/__init__.py 的模板上下文读取 req.cookies.get("locale", "") 决定渲染 locale
+        await context.addCookies([{
+          name: 'locale',
+          value: 'en-US',
+          domain: '127.0.0.1',
+          path: '/',
+        }]);
+        const page = await context.newPage();
+        try {
+          await navigateAndAssert(page, '/login', { expectLogin: true });
+          await page.waitForLoadState('networkidle', { timeout: 10_000 });
+
+          // R62 P1-06: 验证页面真正渲染为英文(非 zh-CN 复用)
+          // (a) <html lang> 属性应为 en-US(非 zh-CN)
+          const htmlLang = await page.getAttribute('html', 'lang');
+          expect(htmlLang).toBe('en-US');
+
+          // (b) 页面 body 文本不应包含 zh-CN 登录页的中文标题/标签
+          //     (admin.__init__.s1 的 zh-CN 版本含 "管理后台登录" / "用户名" / "密码" / "登录")
+          const bodyText = await page.textContent('body') || '';
+          expect(bodyText).not.toContain('管理后台登录');
+          expect(bodyText).not.toContain('用户名');
+          expect(bodyText).not.toContain('密码');
+
+          // 执行完整 a11y 检查(与 zh-CN 一致)
+          await runFullA11yChecks(page, caze);
+        } finally {
+          await context.close();
+        }
+      });
+    } else {
+      // 其他路由 en-US:用 /locale 端点切换(已登录,可调用 require_session 端点)
+      test(`${name} (en-US): axe + 键盘 + 焦点 + dialog + aria-live + 200% zoom + reduced-motion`, async ({ page }: any) => {
+        if (requiresLogin) await login(page);
         // 切到 en-US locale — 用 /locale 路由(此处仅设置 cookie,严格断言由 Section 2 覆盖)
         const localeResp = await page.goto('/locale?lang=en-US');
         expect(localeResp).not.toBeNull();
         expect(localeResp!.status()).toBeLessThan(400);
         await page.waitForLoadState('networkidle', { timeout: 5_000 });
-      }
-      // 执行完整 a11y 检查
-      await runFullA11yChecks(page, caze);
-      // 切回 zh-CN 避免影响后续测试
-      if (caze.path !== '/login') {
+        // 执行完整 a11y 检查
+        await runFullA11yChecks(page, caze);
+        // 切回 zh-CN 避免影响后续测试
         await page.goto('/locale?lang=zh-CN');
         await page.waitForLoadState('networkidle', { timeout: 5_000 });
-      }
-    });
+      });
+    }
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -725,5 +742,57 @@ test.describe('R61 P1-08: 无障碍行为(自动派生自 generated_a11y_cases.j
       expect(hasReducedMotionQuery).toBe(true);
       await context.close();
     });
+  });
+
+  // ─────────────────────────────────────────────────────────────
+  // Section 9: R62 P1-06 — 用例数断言 + 路由元数据完整性检查
+  // 防止 stub 替换导致 0 用例 = 绿色 CI(假绿条件)
+  // ─────────────────────────────────────────────────────────────
+
+  test('R62 P1-06: a11y 测试用例数 > 0(检测 stub 替换导致的假绿)', () => {
+    // A11Y_TESTABLE_CASES 必须非空 — 若为空,说明:
+    //   (a) generated_a11y_cases.json 加载失败(应在上面的 loadGeneratedCases 抛错)
+    //   (b) stub 替换导致 describe body 未执行(本文件已移除 stub,但保留断言作为防御)
+    //   (c) 生成器脚本未运行,JSON 文件为空数组
+    expect(A11Y_TESTABLE_CASES.length).toBeGreaterThan(0);
+    // 每条 a11y_testable 用例必须生成 2 个 locale 测试(zh-CN + en-US)
+    // 加上 Section 2-8 的固定测试,总用例数应 > 2 * a11y_testable 数
+    expect(A11Y_TESTABLE_CASES.length * 2).toBeGreaterThanOrEqual(2);
+    // 在 stderr 留痕,便于 CI 日志追溯(防止静默 0 用例)
+    console.error(
+      `[R62 P1-06] a11y testable cases: ${A11Y_TESTABLE_CASES.length}, ` +
+      `locale redirect cases: ${LOCALE_REDIRECT_CASES.length}`,
+    );
+  });
+
+  test('R62 P1-06: 每条 a11y_testable 用例的路由元数据完整(path / route_path / method)', () => {
+    // R62 P1-06: 路由元数据缺失必须 HARD FAIL(不允许静默跳过)
+    const missing: string[] = [];
+    for (const caze of A11Y_TESTABLE_CASES) {
+      if (!caze.path || typeof caze.path !== 'string') {
+        missing.push(`case missing 'path': ${JSON.stringify(caze).slice(0, 100)}`);
+      }
+      if (!caze.route_path || typeof caze.route_path !== 'string') {
+        missing.push(`case missing 'route_path': path=${caze.path}`);
+      }
+      if (!caze.method || typeof caze.method !== 'string') {
+        missing.push(`case missing 'method': path=${caze.path}`);
+      }
+      // a11y_testable 必须为 true(过滤条件已保证,但显式断言防止过滤逻辑被破坏)
+      if (caze.a11y_testable !== true) {
+        missing.push(`case 'a11y_testable' != true: path=${caze.path}`);
+      }
+      // permission 必须为已知值
+      if (caze.permission !== 'require_session' && caze.permission !== 'public') {
+        missing.push(`case invalid 'permission': path=${caze.path} permission=${caze.permission}`);
+      }
+    }
+    expect(missing).toEqual([]);
+    // 断言 zh-CN + en-US 两个 locale 都有对应的测试用例(通过 case 数 × 2 验证)
+    // 每个 a11y_testable 用例应在 Section 1 生成 zh-CN + en-US 两个测试
+    console.error(
+      `[R62 P1-06] route metadata check passed for ${A11Y_TESTABLE_CASES.length} cases ` +
+      `(expected locales: zh-CN, en-US)`,
+    );
   });
 });

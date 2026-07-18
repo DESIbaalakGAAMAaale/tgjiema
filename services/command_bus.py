@@ -2471,6 +2471,88 @@ def make_delete_file_command(file_code: str) -> Command:
     )
 
 
+def make_detach_file_command(file_code: str, reason: str = "") -> Command:
+    """R62 P0-04: 构造文件脱钩命令(report:detach 子动作,不需审批,可立即执行)。
+
+    与 ``make_delete_file_command`` 的区别:
+        - ``delete_file``: 软删除(status='deleted' + deleted_at + tombstone)
+        - ``detach_file``: 仅脱钩(status='detached',文件记录保留,uploader 解除关联)
+
+    report:detach 操作语义为"管理员将文件从上传者处脱钩",
+    复用 content:takedown 权限门禁,requires_approval=False 立即执行。
+
+    Args:
+        file_code: 文件唯一标识
+        reason: 脱钩原因(如 "report:detach")
+
+    Returns:
+        Command 对象(handler 执行 status='detached' 双写 + 缓存失效)
+    """
+    async def _handler(params: dict) -> dict:
+        # R62 P0-04: 复用 update_file_record_and_invalidate 双写 CRDB+SQLite + 缓存失效
+        # (command_bus.py 在 BUTTON_INFRA_FILES 排除列表中,可调用破坏性 API)
+        from database import update_file_record_and_invalidate
+        import datetime as _dt
+        file_code = params["file_code"]
+        await update_file_record_and_invalidate(file_code, {
+            "$set": {
+                "status": "detached",
+                "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            },
+        })
+        return {"file_code": file_code, "status": "detached"}
+
+    return Command(
+        action="detach_file",
+        required_permission=PERM_CONTENT_TAKEDOWN,
+        handler=_handler,
+        params={"file_code": file_code, "reason": reason},
+        requires_approval=False,
+    )
+
+
+def make_block_user_for_file_command(
+    file_code: str, user_id: int, reason: str = "",
+) -> Command:
+    """R62 P0-04: 构造"限制用户解码该文件"命令(report:block 子动作)。
+
+    report:block 操作语义为"将举报人加入 file_code 的 blocked_users 列表",
+    使其无法再解码该文件。区别于 ban(封禁账号)和 detach(脱钩文件):
+        - block_user_for_file: 仅限制特定 user ↔ 特定 file 的解码权限
+        - ban: 全局封禁用户
+        - detach: 解除文件与上传者关联(影响所有用户)
+
+    复用 content:takedown 权限门禁,requires_approval=False 立即执行。
+
+    Args:
+        file_code: 文件唯一标识
+        user_id: 被限制的用户 ID
+        reason: 限制原因(如 "report:block")
+
+    Returns:
+        Command 对象(handler 执行 $addToSet blocked_users 双写 + 缓存失效)
+    """
+    async def _handler(params: dict) -> dict:
+        # R62 P0-04: 复用 update_file_record_and_invalidate 双写 + 缓存失效
+        # 注:update_file_record_and_invalidate 当前仅支持 $set/$inc/$push 操作符,
+        # $addToSet 走 CRDB 原生语义(SQLite 缓存侧由下次 cache 回填补偿)
+        from database import update_file_record_and_invalidate
+        file_code = params["file_code"]
+        user_id = params["user_id"]
+        await update_file_record_and_invalidate(file_code, {
+            "$addToSet": {"blocked_users": user_id},
+        })
+        return {"file_code": file_code, "blocked_user_id": user_id}
+
+    return Command(
+        action="block_user_for_file",
+        required_permission=PERM_CONTENT_TAKEDOWN,
+        handler=_handler,
+        params={"file_code": file_code, "user_id": user_id, "reason": reason},
+        requires_approval=False,
+    )
+
+
 def make_restore_content_command(
     appeal_id: int,
     target_type: str,

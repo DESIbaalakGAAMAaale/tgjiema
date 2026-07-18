@@ -89,6 +89,11 @@ class ErrorCodes:
     # EFFECT_RECEIPT
     EFFECT_RECEIPT_MANAGER_UNAVAILABLE = "EFFECT.RECEIPT.MANAGER_UNAVAILABLE"
     EFFECT_RECEIPT_DB_ERROR = "EFFECT.RECEIPT.DB_ERROR"
+    # R62 P1-01: 幂等冲突 — 同 (action_id, effect_type, target) 已存在不同 request_hash 的 receipt
+    # 调用方不应盲目重试(payload 已被替换),需走 reconciliation 流程
+    DATA_RECEIPT_IDEMPOTENCY_CONFLICT = "DATA.RECEIPT.IDEMPOTENCY_CONFLICT"
+    # R62 P1-01: 终态保护 — 对已 completed 的 receipt 再次 record_completed 拒绝覆盖
+    DATA_RECEIPT_TERMINAL_STATE = "DATA.RECEIPT.TERMINAL_STATE"
 
     # ── R47 P1-c 新增:覆盖关键场景的通用错误码 ──
     # 通用内部错误(fallback,未注册 code 时使用)
@@ -323,6 +328,12 @@ class ErrorCodes:
     BUTTON_POLICY_FINAL_CONFIRM_REQUIRED = "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED"
     # R58 P0-4: 高风险 action 必须使用异步 token(持久化 nonce + 原子消费)
     BUTTON_POLICY_ASYNC_TOKEN_REQUIRED = "BUTTON.POLICY.ASYNC_TOKEN_REQUIRED"
+
+    # ── R62 P1-07: MFA receipt 年龄校验 + 审批自拒防护 ──
+    # MFA receipt 已过期(签发时间超过高风险动作允许的最大年龄,防陈旧 receipt 绕过二次认证)
+    AUTH_MFA_RECEIPT_EXPIRED = "AUTH.MFA.RECEIPT_EXPIRED"
+    # reject() 不能由创建者自己驳回(防止自拒绕过审计,必须与 approve() 对称强制 requester != approver)
+    APPROVAL_SELF_REJECT_FORBIDDEN = "APPROVAL.SELF_REJECT.FORBIDDEN"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1526,6 +1537,31 @@ def _register_defaults() -> None:
         show_retry_button=True,
         audit_level="warning",
     ))
+    # R62 P1-01: 幂等冲突 — 同 (action_id, effect_type, target) 已存在不同 request_hash 的 receipt
+    # http_status=409 Conflict;retryable=False(调用方不应盲目重试,payload 已被替换)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DATA_RECEIPT_IDEMPOTENCY_CONFLICT,
+        message_key="errors.data.receipt.idempotency_conflict",
+        http_status=409,
+        retryable=False,
+        severity="error",
+        safe_params=["action_id", "effect_type", "target"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
+    ))
+    # R62 P1-01: 终态保护 — 已 completed 的 receipt 再次 record_completed 拒绝覆盖
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.DATA_RECEIPT_TERMINAL_STATE,
+        message_key="errors.data.receipt.terminal_state",
+        http_status=409,
+        retryable=False,
+        severity="error",
+        safe_params=["action_id", "effect_type", "target", "current_status"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
+    ))
 
     # ── APPROVAL ──
     ErrorRegistry.register(ErrorDefinition(
@@ -2642,6 +2678,34 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason", "user_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R62 P1-07: MFA receipt 年龄校验 + 审批自拒防护 ──
+    # MFA receipt 已过期(高风险动作要求 MFA 在近期完成,防陈旧 receipt 绕过二次认证)
+    # 401 critical — 安全攻击向量,直接拒绝执行高风险动作
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.AUTH_MFA_RECEIPT_EXPIRED,
+        message_key="errors.auth.mfa.receipt_expired",
+        http_status=401,
+        retryable=False,
+        severity="critical",
+        safe_params=["user_id", "reason", "action"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # reject() 不能由创建者自己驳回(防止自拒绕过审计,必须与 approve() 对称强制 requester != approver)
+    # 403 critical — 与 approve() 自审批防护对称,审计完整性要求
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.APPROVAL_SELF_REJECT_FORBIDDEN,
+        message_key="errors.approval.self_reject.forbidden",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["approval_id", "approver_id", "created_by"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",

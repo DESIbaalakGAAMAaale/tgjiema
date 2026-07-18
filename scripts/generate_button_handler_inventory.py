@@ -99,6 +99,9 @@ COMMAND_BUS_FACTORY_PREFIXES: frozenset[str] = frozenset({
     "make_factory_reset_command",
     "make_set_r2_command",
     "make_restore_content_command",
+    # R62 P0-04: report:detach/block 子动作命令工厂
+    "make_detach_file_command",
+    "make_block_user_for_file_command",
 })
 
 # CommandBus 路由标记(函数体出现这些调用 = 走 CommandBus)
@@ -156,11 +159,15 @@ HIGH_RISK_ACTION_TYPES: frozenset[str] = frozenset({
 })
 
 # 签名绑定 API(Rule C:高风险 callback handler 必须使用其一)
+# R62 P0-04: 新增 handle 短 ID 模式的签名/验证函数(绕过 Telegram 64 字节限制)
 SIGNED_TOKEN_API_NAMES: frozenset[str] = frozenset({
     "sign_button_token_with_nonce",
     "verify_button_token",
     "consume_token_cas",
     "create_token",
+    # R62 P0-04: handle 短 ID 模式(基于 button_tokens 表 + sign_button_token_with_nonce)
+    "sign_button_token_with_handle",
+    "verify_button_token_by_handle",
 })
 
 

@@ -111,11 +111,24 @@ class ApprovalGrant:
 
 @dataclass
 class HighRiskCommand:
-    """R61 P0-01: 高风险命令描述符,由 ``execute_high_risk_command_uow`` 执行。
+    """R61 P0-01 / R62 P0-05: 高风险命令描述符,由 ``execute_high_risk_command_uow`` 执行。
 
     将"审批消费 + 状态机 + 业务副作用 + effect receipt + outbox + audit"
     封装为单一 Unit of Work,所有 rowcount 检查 / 状态机前置条件 / 唯一键校验
     必须在 COMMIT 前完成,任一失败 → ROLLBACK(审批与 MFA 不被消费)。
+
+    R62 P0-05 整改(事务内外部 I/O 分离):
+    - ``business_action`` 回调 MUST 仅做 DB 状态 transitions(DELETE/UPDATE/
+      INSERT 到 dirty_outbox / audit_log / outbox_events 等本地表),
+      不得在回调内执行任何网络/文件 I/O(Telegram/R2/CRDB/email/文件系统)。
+      原因:SQLite 事务失败时外部 I/O 无法回滚(伪事务),会造成
+      "本地回滚但外部已执行"的不一致。
+    - 外部副作用通过 ``outbox_events`` 字段声明:UoW 在 business_action 之后、
+      COMMIT 之前原子写入 outbox_events 表(与业务变更 + effect_receipts 同事务)。
+      commit 后由 ``OutboxWorker`` 拉取 lease 调用外部系统(provider 各自幂等)。
+    - ``compensation_action`` 可选字段: saga 补偿回调,当 UoW COMMIT 成功后
+      外部 worker 失败且无法重试时,由 reconcile 流程调用以撤销 DB 状态变更
+      (saga 补偿必须显式实现,不依赖伪数据库回滚)。
     """
 
     action_id: str
@@ -130,9 +143,21 @@ class HighRiskCommand:
     # effect_receipts target(如 action_id)
     effect_target: str
     # 异步业务回调: async (tx) -> dict,返回 {"total_cleaned": int, ...}
-    # 回调内负责业务状态变更 + per-row dirty_outbox + per-user audit_log,
+    # R62 P0-05: 回调 MUST 仅做 DB 状态 transitions(无网络/文件 I/O),
     # 全部写入传入的 tx(统一事务),不得自行 commit。
+    # 外部副作用通过 outbox_events 字段声明,UoW 在回调后原子写入 outbox 表,
+    # commit 后由 OutboxWorker 调用外部系统(provider 各自幂等)。
     business_action: Any
+    # R62 P0-05: 可选 saga 补偿回调: async (tx, error_msg) -> None
+    # 当 UoW COMMIT 成功后 OutboxWorker 持续失败且无法重试时,
+    # 由 reconcile 流程在独立事务中调用以撤销 DB 状态变更。
+    # 补偿必须显式实现(不依赖伪数据库回滚),且需幂等(可能被多次调用)。
+    compensation_action: Any = None
+    # R62 P0-05: 外部副作用 outbox 事件列表,每项为 dict 含:
+    #   {effect_type, target, request_hash, payload_json, max_attempts?}
+    # UoW 在 business_action 之后、COMMIT 之前原子写入 outbox_events 表。
+    # commit 后由 OutboxWorker 拉取 lease 调用外部系统。
+    outbox_events: list = field(default_factory=list)
 
 
 @dataclass
@@ -806,38 +831,203 @@ async def execute_high_risk_command_uow(
                 },
             )
 
-        # ── 5. 业务状态变更(delete/restore/isolate)──
-        # business_action 回调内负责 per-row dirty_outbox + per-user audit_log,
-        # 全部写入 store._db(统一事务),不得自行 commit。
+        # ── 5. 业务状态变更(delete/restore/isolate)—— R62 P0-05: DB-only ──
+        # business_action 回调 MUST 仅做 DB 状态 transitions(DELETE/UPDATE/INSERT
+        # 到 dirty_outbox / audit_log 等本地表),不得在回调内执行任何网络/文件 I/O
+        # (Telegram/R2/CRDB/email/文件系统)。
+        # 原因: SQLite 事务失败时外部 I/O 无法回滚(伪事务),会造成
+        # "本地回滚但外部已执行"的不一致(R62 P0-05 audit finding)。
+        # 外部副作用通过 command.outbox_events 声明,在步骤 6b 原子写入 outbox_events 表,
+        # commit 后由 OutboxWorker 拉取 lease 调用外部系统(provider 各自幂等)。
         # 任一异常 → 触发下方 except,统一 ROLLBACK(审批/MFA 不被消费)。
         business_result = await command.business_action(store._db)
         if not isinstance(business_result, dict):
             business_result = {"raw": business_result}
         total_cleaned = int(business_result.get("total_cleaned", 0))
 
-        # ── 6. effect receipt / 幂等键 — 写 effect_receipts(completed)──
-        # effect_receipts 表 PK = (action_id, effect_type, target),INSERT OR IGNORE 幂等;
-        # 随后 UPDATE 置为 completed,绑定 grant.request_hash(防同 action_id 不同 payload 绕过)。
-        # 与 EffectReceiptManager.record_completed 不同,此处直接写 SQL 以纳入统一事务
-        # (record_completed 不支持 tx 参数,会自行 commit 破坏原子性)。
+        # ── 6a. effect receipt / 幂等键 — 写 effect_receipts(pending → completed)──
+        # R62 P1-01 整改: 不再使用 INSERT OR IGNORE + UPDATE 模式(会覆盖 request_hash/
+        # external_id/status,导致同 (a,e,t) 不同 payload 的 receipt 互相覆盖)。
+        # 改为 PRE-SELECT + plain INSERT + UPDATE WHERE status='pending' AND request_hash=?:
+        #   1. SELECT 查是否已存在 receipt
+        #   2. 不存在 → INSERT pending(UNIQUE 冲突时 SELECT 兜底竞态)
+        #   3. 已存在 + 同 hash + pending → 幂等重试(不覆盖)
+        #   4. 已存在 + 不同 hash → raise IDEMPOTENCY_CONFLICT
+        #   5. 已存在 + completed → raise TERMINAL_STATE
+        #   6. UPDATE WHERE status='pending' AND request_hash=? → completed + rowcount 检查
+        # 与 EffectReceiptManager.record_pending/record_completed 不同,此处直接写 SQL
+        # 以纳入统一事务(record_* 不接受 tx 参数会自行 commit 破坏原子性,R62 P1-01 已加 tx
+        # 参数但为保持 UoW 单事务原子性,此处仍直接写 SQL)。
         eff_now = _dt.datetime.now(_dt.timezone.utc).isoformat()
-        await store._db.execute(
-            "INSERT OR IGNORE INTO effect_receipts "
-            "(action_id, effect_type, target, status, external_id, "
-            " created_at, completed_at, request_hash, attempt, "
-            " lease_owner, lease_until, last_error, reconcile_status) "
-            "VALUES (?, ?, ?, 'pending', '', ?, NULL, ?, 1, ?, '', NULL, 'pending')",
-            (grant.action_id, command.effect_type, command.effect_target,
-             eff_now, grant.request_hash, command.owner),
+        cursor = await store._db.execute(
+            "SELECT status, request_hash FROM effect_receipts "
+            "WHERE action_id = ? AND effect_type = ? AND target = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (grant.action_id, command.effect_type, command.effect_target),
         )
-        await store._db.execute(
+        _eff_existing = await cursor.fetchone()
+        if _eff_existing is None:
+            # 不存在 → plain INSERT pending(R62 P1-01: 不再用 INSERT OR IGNORE)
+            try:
+                await store._db.execute(
+                    "INSERT INTO effect_receipts "
+                    "(action_id, effect_type, target, status, external_id, "
+                    " created_at, completed_at, request_hash, attempt, "
+                    " lease_owner, lease_until, last_error, reconcile_status) "
+                    "VALUES (?, ?, ?, 'pending', '', ?, NULL, ?, 1, ?, '', NULL, 'pending')",
+                    (grant.action_id, command.effect_type, command.effect_target,
+                     eff_now, grant.request_hash, command.owner),
+                )
+            except Exception as insert_err:
+                # UNIQUE 冲突(竞态)→ SELECT 兜底,若 completed 则 raise TERMINAL_STATE
+                if "unique" not in str(insert_err).lower() and "constraint" not in str(insert_err).lower():
+                    raise
+                cursor = await store._db.execute(
+                    "SELECT status, request_hash FROM effect_receipts "
+                    "WHERE action_id = ? AND effect_type = ? AND target = ? "
+                    "AND request_hash = ? "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (grant.action_id, command.effect_type, command.effect_target,
+                     grant.request_hash),
+                )
+                _eff_existing = await cursor.fetchone()
+                if _eff_existing is None:
+                    raise insert_err
+                if _eff_existing[0] == "completed":
+                    raise AppError(
+                        ErrorCodes.DATA_RECEIPT_TERMINAL_STATE,
+                        params={
+                            "action_id": grant.action_id,
+                            "effect_type": command.effect_type,
+                            "target": command.effect_target,
+                            "current_status": _eff_existing[0],
+                        },
+                    )
+        else:
+            _eff_existing_status = _eff_existing[0]
+            _eff_existing_hash = _eff_existing[1] or ""
+            # R62 P1-01: 不同 hash → 幂等冲突
+            if (grant.request_hash and _eff_existing_hash
+                    and grant.request_hash != _eff_existing_hash):
+                raise AppError(
+                    ErrorCodes.DATA_RECEIPT_IDEMPOTENCY_CONFLICT,
+                    params={
+                        "action_id": grant.action_id,
+                        "effect_type": command.effect_type,
+                        "target": command.effect_target,
+                    },
+                )
+            # 终态保护: 已 completed → raise
+            if _eff_existing_status == "completed":
+                raise AppError(
+                    ErrorCodes.DATA_RECEIPT_TERMINAL_STATE,
+                    params={
+                        "action_id": grant.action_id,
+                        "effect_type": command.effect_type,
+                        "target": command.effect_target,
+                        "current_status": _eff_existing_status,
+                    },
+                )
+            # pending/failed + 同 hash → 幂等,不 INSERT(下方 UPDATE 转 completed)
+
+        # UPDATE 转 completed,WHERE status='pending' AND request_hash=? 防止误更新
+        # R62 P1-01: 若 pending 行的 request_hash 不匹配(理论上不该发生,因上方已校验),
+        # rowcount=0 → 抛错;若已 completed(竞态),rowcount=0 → 抛 TERMINAL_STATE。
+        # 注意: SET 不再更新 request_hash(R62 P1-01: request_hash 不可变,防止覆盖);
+        # external_id 仍用 command.action_id(与原行为一致,作幂等键供查询)。
+        cursor = await store._db.execute(
             "UPDATE effect_receipts SET status = 'completed', "
             "completed_at = ?, external_id = ?, reconcile_status = 'completed', "
-            "last_error = NULL, request_hash = ? "
-            "WHERE action_id = ? AND effect_type = ? AND target = ?",
-            (eff_now, command.action_id, grant.request_hash,
-             grant.action_id, command.effect_type, command.effect_target),
+            "last_error = NULL "
+            "WHERE action_id = ? AND effect_type = ? AND target = ? "
+            "AND status = 'pending' AND request_hash = ?",
+            (eff_now, command.action_id,
+             grant.action_id, command.effect_type, command.effect_target,
+             grant.request_hash),
         )
+        _eff_affected = cursor.rowcount if cursor is not None else 0
+        if _eff_affected == 0:
+            # rowcount=0 → 可能 failed 状态(pending→failed 由 record_failed)或竞态 completed
+            cursor = await store._db.execute(
+                "SELECT status FROM effect_receipts "
+                "WHERE action_id = ? AND effect_type = ? AND target = ? "
+                "AND request_hash = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (grant.action_id, command.effect_type, command.effect_target,
+                 grant.request_hash),
+            )
+            _eff_row = await cursor.fetchone()
+            if _eff_row and _eff_row[0] == "completed":
+                raise AppError(
+                    ErrorCodes.DATA_RECEIPT_TERMINAL_STATE,
+                    params={
+                        "action_id": grant.action_id,
+                        "effect_type": command.effect_type,
+                        "target": command.effect_target,
+                        "current_status": "completed",
+                    },
+                )
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "uow_effect_receipt_update_rowcount_zero",
+                    "action_id": command.action_id,
+                    "existing_status": _eff_row[0] if _eff_row else "not_found",
+                },
+            )
+
+        # ── 6b. R62 P0-05: 外部副作用 outbox_events — 与业务变更 + effect_receipts 原子提交 ──
+        # 在 business_action 之后、COMMIT 之前写入 outbox_events 表,
+        # commit 后由 OutboxWorker 拉取 lease 调用外部系统(provider 各自幂等)。
+        # UNIQUE(action_id, effect_type, target, request_hash) 保证幂等:
+        # 重复写入(同 a,e,t,rh)抛 UNIQUE 冲突,视为已排队(忽略)。
+        # business_action 必须是 DB-only(无网络/文件 I/O),外部副作用通过本字段声明。
+        _outbox_enqueued = 0
+        for _ev in command.outbox_events:
+            _ev_effect_type = _ev.get("effect_type", "")
+            _ev_target = _ev.get("target", "")
+            _ev_request_hash = _ev.get("request_hash", "")
+            _ev_payload_json = _ev.get("payload_json", "")
+            _ev_max_attempts = int(_ev.get("max_attempts", 3))
+            if not _ev_effect_type or not _ev_target or not _ev_request_hash:
+                raise AppError(
+                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                    params={
+                        "reason": "uow_outbox_event_missing_fields",
+                        "action_id": command.action_id,
+                        "event": str(_ev),
+                    },
+                )
+            try:
+                await store.add_outbox_event(
+                    action_id=command.action_id,
+                    effect_type=_ev_effect_type,
+                    target=_ev_target,
+                    request_hash=_ev_request_hash,
+                    payload_json=_ev_payload_json,
+                    max_attempts=_ev_max_attempts,
+                    tx=store._db,  # R62 P0-05: 纳入统一事务,不自行 commit
+                )
+                _outbox_enqueued += 1
+            except Exception as outbox_err:
+                # UNIQUE 冲突(同 a,e,t,rh 已存在)→ 幂等,视为已排队,忽略
+                if ("unique" in str(outbox_err).lower()
+                        or "constraint" in str(outbox_err).lower()):
+                    logger.debug(
+                        f"[DataLifecycle] R62 P0-05: outbox_event UNIQUE 冲突"
+                        f"(幂等,已排队) action={command.action_id} "
+                        f"type={_ev_effect_type} target={_ev_target}"
+                    )
+                    continue
+                # 其它错误 → 抛错,触发 ROLLBACK
+                raise AppError(
+                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                    params={
+                        "reason": f"uow_outbox_event_insert_failed: "
+                                  f"{type(outbox_err).__name__}: {outbox_err}",
+                        "action_id": command.action_id,
+                    },
+                ) from outbox_err
 
         # ── 7. 状态机 CAS 完成(executing → executed)──
         # R61 P0-01: 传入 connection=store._db 复用统一事务,不自动 commit
@@ -867,10 +1057,10 @@ async def execute_high_risk_command_uow(
         else:
             await store._db.execute(f"RELEASE SAVEPOINT {_UOW_SAVEPOINT}")
         logger.info(
-            f"[DataLifecycle] R61 P0-01: 高风险命令 UoW 提交成功 "
+            f"[DataLifecycle] R61 P0-01 / R62 P0-05: 高风险命令 UoW 提交成功 "
             f"action_id={command.action_id} command_type={command.command_type} "
             f"receipt_affected={receipt_affected} approval_affected={approval_affected} "
-            f"total_cleaned={total_cleaned}"
+            f"total_cleaned={total_cleaned} outbox_enqueued={_outbox_enqueued}"
         )
         return HighRiskCommandResult(
             success=True,
@@ -892,6 +1082,123 @@ async def execute_high_risk_command_uow(
                 "command_type": command.command_type,
             },
         ) from e
+
+
+# ════════════════════════════════════════════════════════════════
+# R62 P0-05: OutboxWorker 桩 — 拉取 outbox_events lease 调用外部系统
+# ════════════════════════════════════════════════════════════════
+
+
+class OutboxWorker:
+    """R62 P0-05: 事务性 outbox worker 桩(stub)。
+
+    设计目标:
+    - ``execute_high_risk_command_uow`` 在事务内将外部副作用写入 outbox_events 表
+      (与业务变更 + effect_receipts 原子提交),commit 后由本 worker 拉取 lease
+      调用外部系统(Telegram/R2/CRDB/email/文件)。
+    - provider 各自幂等(基于 request_hash),worker 失败可安全重试。
+    - 超过 max_attempts 自动转 DLQ(permanent failure,需人工介入)。
+    - saga 补偿由 reconcile 流程在独立事务中调用 HighRiskCommand.compensation_action,
+      不依赖伪数据库回滚(SQLite 事务失败时外部 I/O 无法回滚)。
+
+    本类为 stub 实现,仅提供 lease-based CAS claim + complete/fail 接口,
+    实际 provider 调用由子类注入(provider_registry: {effect_type: callable})。
+    生产部署时需启动独立 worker 进程定时调用 ``run_once`` 拉取并处理事件。
+
+    Lease 机制(分布式 worker 协调):
+    - claim_outbox_events 原子地将 pending 行转为 in_flight 并设置 lease_owner /
+      lease_expires_at,防止多 worker 并发拉取同一行。
+    - lease 过期后由独立 reconcile 流程回收(本 stub 不实现,留给生产子类)。
+    """
+
+    def __init__(
+        self,
+        *,
+        lease_owner: str = "",
+        lease_duration_seconds: int = 60,
+        batch_size: int = 10,
+        provider_registry: Any = None,
+    ):
+        """初始化 OutboxWorker。
+
+        Args:
+            lease_owner: worker 标识(hostname:pid),用于 claim_outbox_events
+            lease_duration_seconds: lease 超时秒数(超时后可被其他 worker 重新 claim)
+            batch_size: 单次 run_once 最多处理的事件数
+            provider_registry: {effect_type: async callable(payload_json) -> external_id}
+                               子类注入实际外部系统调用;None 时 run_once 仅 claim 不调用
+        """
+        import socket as _socket
+        self.lease_owner = lease_owner or f"{_socket.gethostname()}:{os.getpid()}"
+        self.lease_duration_seconds = lease_duration_seconds
+        self.batch_size = batch_size
+        # provider_registry: {effect_type: async (payload_json) -> external_id_str}
+        # None 表示 stub 模式(仅 claim,不调用外部系统,用于测试)
+        self.provider_registry = provider_registry
+
+    async def run_once(self) -> dict:
+        """拉取一批 outbox_events 并调用 provider 处理。
+
+        Stub 行为(provider_registry=None):
+        - 仅 claim 事件,不调用外部 provider,直接 complete_outbox_event
+        - 用于测试 lease 机制 + 状态流转,不产生真实外部副作用
+
+        生产行为(provider_registry 非空):
+        - claim 事件 → 调用 provider(payload_json) → complete/fail
+        - provider 抛异常 → fail_outbox_event,超限自动进 DLQ
+        - provider 返回 external_id → complete_outbox_event
+
+        Returns:
+            {claimed: int, completed: int, failed: int, dlq: int}
+        """
+        store = get_cache_store()
+        if not store._db:
+            return {"claimed": 0, "completed": 0, "failed": 0, "dlq": 0}
+        events = await store.claim_outbox_events(
+            lease_owner=self.lease_owner,
+            lease_duration_seconds=self.lease_duration_seconds,
+            limit=self.batch_size,
+        )
+        if not events:
+            return {"claimed": 0, "completed": 0, "failed": 0, "dlq": 0}
+        completed = 0
+        failed = 0
+        dlq = 0
+        for ev in events:
+            event_id = ev["id"]
+            effect_type = ev["effect_type"]
+            payload_json = ev.get("payload_json", "")
+            # Stub 模式: 无 provider_registry → 直接 complete(用于测试 lease 流转)
+            if self.provider_registry is None:
+                await store.complete_outbox_event(event_id)
+                completed += 1
+                continue
+            provider = self.provider_registry.get(effect_type)
+            if provider is None:
+                # 无对应 provider → 永久失败,直接进 DLQ
+                await store.move_outbox_to_dlq(
+                    event_id, reason=f"no_provider_for_effect_type:{effect_type}",
+                )
+                dlq += 1
+                continue
+            try:
+                _external_id = await provider(payload_json)
+                await store.complete_outbox_event(event_id)
+                completed += 1
+            except Exception as prov_err:
+                result = await store.fail_outbox_event(
+                    event_id, error_msg=str(prov_err),
+                )
+                if result == "dlq":
+                    dlq += 1
+                else:
+                    failed += 1
+        return {
+            "claimed": len(events),
+            "completed": completed,
+            "failed": failed,
+            "dlq": dlq,
+        }
 
 
 async def export_user_data(user_id: int) -> dict:

@@ -364,10 +364,13 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── 举报动作处理 ──────────────────────────────────────────────
 
 async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """处理管理员对举报的操作：封禁/脱钩/限制/忽略"""
-    import datetime as _dt
-    from database import update_user_and_invalidate
+    """处理管理员对举报的操作：封禁/脱钩/限制/忽略。
 
+    R62 P0-04: 迁移 report action 到签名 token + CommandBus,移除直接破坏路径。
+    所有 report:ban/detach/block 操作必须通过签名 token 验证(handle 短 ID 模式,
+    绕过 Telegram 64 字节限制) + CommandBus 路由(make_*_command + bus.execute)。
+    旧格式 report:ban|uid|reporter|source 直接拒绝(无签名,可伪造)。
+    """
     query = update.callback_query
     await query.answer()
     user = update.effective_user
@@ -375,6 +378,7 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer(_i18n_t('bot.admin_bot.callback.s6'), show_alert=True)
         return
 
+    # report:ignore 是低风险(只标记忽略),不需要签名 token
     if data == "report:ignore":
         await query.edit_message_text(
             query.message.text + _i18n_t('bot.admin_bot.callback.s20'),
@@ -382,25 +386,103 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    parts = data.split("|")
-    action = parts[0]  # report:ban, report:detach, report:block
+    # R62 P0-04: 新格式 report:{sub_action}:{handle_id}
+    # 旧格式 report:ban|uid|reporter|source 无签名,直接拒绝(防伪造)
+    parts = data.split(":", 2)  # ["report", sub_action, handle_id]
+    if len(parts) < 3:
+        logger.warning(f"[Admin][report] callback_data 格式无效(缺少 handle_id): {data}")
+        # R62 P0-04: i18n 接入,移除裸字符串
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.expired_or_invalid'),
+            reply_markup=None,
+        )
+        return
 
-    # 解析举报人信息和来源 bot(格式: report:xxx|...|reporter_id|source)
+    sub_action = parts[1]  # ban / detach / block
+    handle_id = parts[2]
+
+    # 验证签名 token(原子消费 nonce,防重放)
+    # verify_button_token_by_handle 内部:
+    #   1. 通过 handle_id 从 button_tokens 表查找完整 token
+    #   2. 调用 verify_button_token 验证签名 + 原子消费 nonce
+    from services.button_security import verify_button_token_by_handle
+    valid, token_action, payload = await verify_button_token_by_handle(
+        handle_id, user.id
+    )
+    if not valid:
+        logger.warning(
+            f"[Admin][report] 签名验证失败: sub_action={sub_action}, "
+            f"handle={handle_id}"
+        )
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.signature_failed_report'),
+            reply_markup=None,
+        )
+        return
+
+    # payload 格式: {sub_action}|{arg1}|{arg2}|...|{reporter_id}|{source_bot}
+    payload_parts = payload.split("|")
+    if len(payload_parts) < 1 or payload_parts[0] != sub_action:
+        logger.warning(
+            f"[Admin][report] sub_action 不匹配: callback={sub_action}, "
+            f"payload={payload}"
+        )
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.payload_mismatch'),
+            reply_markup=None,
+        )
+        return
+
+    # 解析举报人信息和来源 bot(格式: ...|reporter_id|source_bot)
     reporter_id_str = None
     source_bot = None
-    if len(parts) >= 4 and parts[-1] in ("idx", "dsp"):
-        source_bot = parts[-1]
-        reporter_id_str = parts[-2]
+    if len(payload_parts) >= 4 and payload_parts[-1] in ("idx", "dsp"):
+        source_bot = payload_parts[-1]
+        reporter_id_str = payload_parts[-2]
 
     try:
-        if action == "report:ban":
-            if len(parts) < 2:
-                await query.answer(_i18n_t('bot.admin_bot.callback.s23'), show_alert=True)
+        # R62 P0-04: 通过 CommandBus 路由所有破坏性操作(移除直接 update_user_and_invalidate)
+        from services.command_bus import (
+            CommandBus, AdminPrincipal as CBPrincipal,
+            make_ban_user_command, make_detach_file_command,
+            make_block_user_for_file_command,
+        )
+        cb_principal = CBPrincipal(id=user.id, name=user.username or "", source="bot")
+        bus = CommandBus()
+
+        if sub_action == "ban":
+            if len(payload_parts) < 2:
+                await query.edit_message_text(
+                    _i18n_t('admin.callback.button_security.missing_uid'), reply_markup=None,
+                )
                 return
-            uid = int(parts[1])
-            await update_user_and_invalidate(uid, {
-                "$set": {"is_banned": True, "updated_at": _dt.datetime.now(_dt.timezone.utc).isoformat()},
-            })
+            try:
+                uid = int(payload_parts[1])
+            except ValueError:
+                await query.edit_message_text(
+                    _i18n_t('admin.callback.button_security.invalid_uid'), reply_markup=None,
+                )
+                return
+            # 通过 CommandBus 走审批门禁(make_ban_user_command,requires_approval=True)
+            command = make_ban_user_command(user_id=uid, reason="report:ban")
+            result = await bus.execute(command, cb_principal)
+
+            if result.approval_required:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n⏳ 已提交封禁审批(审批 ID: {result.approval_id}),用户 {uid}",
+                    reply_markup=None,
+                )
+            elif result.success:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n✅ 已封禁用户 {uid}",
+                    reply_markup=None,
+                )
+            else:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n❌ 封禁失败: {result.error}",
+                    reply_markup=None,
+                )
+                return
             # 跨进程通知 idx_bot/dsp_bot 失效用户缓存
             try:
                 from database.cache_store import get_cache_store
@@ -408,25 +490,38 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 await store.notify_record_change("user", str(uid))
             except Exception as e:
                 logger.warning(f"[Admin][report:ban] 通知记录变更失败: {e}")
-            await query.edit_message_text(
-                query.message.text + f"\n\n✅ 已封禁用户 {uid}",
-                reply_markup=None,
-            )
             # 通知举报人
             if reporter_id_str and source_bot:
                 await _notify_reporter(reporter_id_str, source_bot, _i18n_t('bot.admin_bot.callback.s24'))
 
-        elif action == "report:detach":
-            if len(parts) < 2:
-                await query.answer(_i18n_t('bot.admin_bot.callback.s26'), show_alert=True)
+        elif sub_action == "detach":
+            if len(payload_parts) < 2:
+                await query.edit_message_text(
+                    _i18n_t('admin.callback.button_security.missing_file_code'), reply_markup=None,
+                )
                 return
-            file_code = parts[1]
-            # PRE-06: 用 update_file_record_and_invalidate 一次性双写 CRDB+SQLite 并失效内存缓存
-            try:
-                await update_file_record_and_invalidate(file_code, {"$set": {"status": "detached"}})
-            except Exception as e:
-                logger.error(f"[Admin][report:detach] 双写失败: {e}")
-                invalidate_file_record(file_code)
+            file_code = payload_parts[1]
+            # R62 P0-04: 通过 CommandBus 走 make_detach_file_command(立即执行,不需审批)
+            command = make_detach_file_command(file_code=file_code, reason="report:detach")
+            result = await bus.execute(command, cb_principal)
+
+            if result.approval_required:
+                # detach_file 命令 requires_approval=False,不应到达此分支
+                await query.edit_message_text(
+                    query.message.text + f"\n\n⏳ 已提交审批(审批 ID: {result.approval_id}),文件码 {file_code}",
+                    reply_markup=None,
+                )
+            elif result.success:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n✅ 已脱钩文件码 {file_code}",
+                    reply_markup=None,
+                )
+            else:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n❌ 脱钩失败: {result.error}",
+                    reply_markup=None,
+                )
+                return
             # 跨进程通知 idx_bot/dsp_bot 失效文件记录缓存
             try:
                 from database.cache_store import get_cache_store
@@ -434,26 +529,47 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 await store.notify_record_change("file", file_code)
             except Exception as e:
                 logger.warning(f"[Admin][report:detach] 通知记录变更失败: {e}")
-            await query.edit_message_text(
-                query.message.text + f"\n\n✅ 已脱钩文件码 {file_code}",
-                reply_markup=None,
-            )
             # 通知举报人
             if reporter_id_str and source_bot:
                 await _notify_reporter(reporter_id_str, source_bot, _i18n_t('bot.admin_bot.callback.s27'))
 
-        elif action == "report:block":
-            if len(parts) < 3:
-                await query.answer(_i18n_t('bot.admin_bot.callback.s30'), show_alert=True)
+        elif sub_action == "block":
+            # report:block 限制举报人解码该文件
+            if len(payload_parts) < 3:
+                await query.edit_message_text(
+                    _i18n_t('admin.callback.button_security.missing_file_code_reporter'), reply_markup=None,
+                )
                 return
-            file_code = parts[1]
-            reporter_id = int(parts[2])
-            # P2-5/F-L4: 用 $addToSet 去重写入,防止同一举报人重复入列
+            file_code = payload_parts[1]
             try:
-                await update_file_record_and_invalidate(file_code, {"$addToSet": {"blocked_users": reporter_id}})
-            except Exception as e:
-                logger.error(f"[Admin][report:block] 双写失败: {e}")
-                invalidate_file_record(file_code)
+                reporter_id = int(payload_parts[2])
+            except ValueError:
+                await query.edit_message_text(
+                    _i18n_t('admin.callback.button_security.invalid_reporter_id'), reply_markup=None,
+                )
+                return
+            # R62 P0-04: 通过 CommandBus 走 make_block_user_for_file_command(立即执行)
+            command = make_block_user_for_file_command(
+                file_code=file_code, user_id=reporter_id, reason="report:block",
+            )
+            result = await bus.execute(command, cb_principal)
+
+            if result.approval_required:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n⏳ 已提交审批(审批 ID: {result.approval_id}),举报人 {reporter_id} ↔ 文件码 {file_code}",
+                    reply_markup=None,
+                )
+            elif result.success:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n✅ 已限制举报人 {reporter_id} 解码 {file_code}",
+                    reply_markup=None,
+                )
+            else:
+                await query.edit_message_text(
+                    query.message.text + f"\n\n❌ 限制失败: {result.error}",
+                    reply_markup=None,
+                )
+                return
             # 跨进程通知 idx_bot/dsp_bot 失效文件记录缓存
             try:
                 from database.cache_store import get_cache_store
@@ -461,11 +577,11 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 await store.notify_record_change("file", file_code)
             except Exception as e:
                 logger.warning(f"[Admin][report:block] 通知记录变更失败: {e}")
+        else:
             await query.edit_message_text(
-                query.message.text + f"\n\n✅ 已限制举报人 {reporter_id} 解码 {file_code}",
+                _i18n_t('admin.callback.button_security.unknown_sub_action', sub_action=sub_action),
                 reply_markup=None,
             )
-
     except Exception as e:
         logger.error(f"[Admin][report] 操作失败: {e}")
         await query.answer(f"操作失败: {e}", show_alert=True)
@@ -502,7 +618,12 @@ async def _notify_reporter(reporter_id_str: str, source_bot: str, message: str):
 # ─── 数据库恢复动作处理 ──────────────────────────────────────────
 
 async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """处理数据库恢复的确认/取消按钮。"""
+    """处理数据库恢复的确认/取消按钮。
+
+    R62 P0-04: restore:confirm 必须通过签名 token 验证(handle 短 ID 模式),
+    防止伪造 callback_data 触发未授权的恢复操作。restore:cancel 是低风险,
+    不需要签名 token。
+    """
     query = update.callback_query
     user = update.effective_user
     if not user or user.id != AUTHORIZED_USER_ID:
@@ -515,30 +636,50 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s8'), reply_markup=back_kb)
         return
 
-    # restore:confirm|<seq>|<0或1>|table:xxx,yyy  (merge标志和table部分均可选)
-    if not data.startswith("restore:confirm|"):
+    # R62 P0-04: 新格式 restore:confirm:{handle_id}
+    # 旧格式 restore:confirm|seq|merge|table:xxx 直接拒绝(无签名,可伪造)
+    if not data.startswith("restore:confirm:"):
         await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s9'), reply_markup=back_kb)
         return
 
-    parts = data.split("|")
-    if len(parts) < 2:
+    # 提取 handle_id(冒号后的部分)
+    handle_id = data[len("restore:confirm:"):]
+
+    # 验证签名 token(原子消费 nonce,防重放)
+    from services.button_security import verify_button_token_by_handle
+    valid, token_action, payload = await verify_button_token_by_handle(
+        handle_id, user.id
+    )
+    if not valid:
+        logger.warning(
+            f"[Admin][restore] 签名验证失败: handle={handle_id}"
+        )
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.signature_failed_restore'),
+            reply_markup=back_kb,
+        )
+        return
+
+    # payload 格式: {seq}|{0或1}|table:xxx,yyy(merge 和 table 部分均可选)
+    parts = payload.split("|")
+    if len(parts) < 1:
         await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s10'), reply_markup=back_kb)
         return
 
     try:
-        seq = int(parts[1])
+        seq = int(parts[0])
     except ValueError:
         await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s21'), reply_markup=back_kb)
         return
 
-    # 解析 merge 标志(parts[2],0 或 1)和 table 列表(parts[3],可选)
+    # 解析 merge 标志(parts[1],0 或 1)和 table 列表(parts[2],可选)
     merge = False
     tables = None
-    if len(parts) >= 3:
-        # parts[2] 是 merge 标志(0/1)
-        merge = parts[2] == "1"
-    if len(parts) >= 4 and parts[3].startswith("table:"):
-        tables = [t.strip() for t in parts[3][len("table:"):].split(",") if t.strip()]
+    if len(parts) >= 2:
+        # parts[1] 是 merge 标志(0/1)
+        merge = parts[1] == "1"
+    if len(parts) >= 3 and parts[2].startswith("table:"):
+        tables = [t.strip() for t in parts[2][len("table:"):].split(",") if t.strip()]
 
     # 先给用户一个"正在恢复"的反馈
     mode_label = _i18n_t('bot.admin_bot.callback.s1') if merge else _i18n_t('bot.admin_bot.callback.s2')
@@ -602,7 +743,12 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
 # ─── 文件删除二次确认处理 ──────────────────────────────────────────
 
 async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
-    """处理文件删除的二次确认/取消按钮(P2-8)。"""
+    """处理文件删除的二次确认/取消按钮(P2-8)。
+
+    R62 P0-04: delfile|{handle_id} 必须通过签名 token 验证(handle 短 ID 模式),
+    防止伪造 callback_data 触发未授权的文件删除。delfile_cancel|{file_code}
+    是低风险取消按钮,不需要签名 token。
+    """
     query = update.callback_query
     user = update.effective_user
     if not user or user.id != AUTHORIZED_USER_ID:
@@ -615,12 +761,34 @@ async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s16'), reply_markup=back_kb)
         return
 
-    # delfile|{file_code}
+    # R62 P0-04: 新格式 delfile|{handle_id}(handle_id 引用签名 token)
+    # 旧格式 delfile|{file_code} 直接拒绝(无签名,可伪造)
     parts = data.split("|", 1)
     if len(parts) < 2:
         await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s17'), reply_markup=back_kb)
         return
-    file_code = parts[1]
+    handle_id = parts[1]
+
+    # 验证签名 token(原子消费 nonce,防重放)
+    from services.button_security import verify_button_token_by_handle
+    valid, token_action, payload = await verify_button_token_by_handle(
+        handle_id, user.id
+    )
+    if not valid:
+        logger.warning(
+            f"[Admin][delete_file] 签名验证失败: handle={handle_id}"
+        )
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.signature_failed_delete'),
+            reply_markup=back_kb,
+        )
+        return
+
+    # payload 格式: {file_code}
+    file_code = payload
+    if not file_code:
+        await query.edit_message_text(_i18n_t('bot.admin_bot.callback.s17'), reply_markup=back_kb)
+        return
 
     # R41 P1-8: 高风险操作必须走 CommandBus(强制 RBAC + 审计 + 幂等)
     from services.command_bus import (

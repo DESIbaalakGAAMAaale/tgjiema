@@ -1462,7 +1462,7 @@ class CacheStore:
                 f"[CacheStore] command_executions schema 检测(可忽略): {_e_cmd_check}"
             )
 
-        # ─── R44 G0-2 / R46 P0-1 / R48 P0-4 / R49 P0-4: effect_receipts 表 — 外部副作用 receipt 持久化 ───
+        # ─── R44 G0-2 / R46 P0-1 / R48 P0-4 / R49 P0-4 / R62 P1-01: effect_receipts 表 — 外部副作用 receipt 持久化 ───
         # R46 P0-1: 增加 request_hash/attempt/lease_owner/lease_until/last_error/reconcile_status
         # 用于幂等控制:action_id + effect_type + target 唯一标识一个外部副作用,
         # 执行前检查 receipt 是否已 completed,避免重复触发外部副作用。
@@ -1473,12 +1473,22 @@ class CacheStore:
         # CHECK 约束改为 `request_hash != ''`(critical effect_type 不能为空字符串,
         # 非 critical 允许空串)。旧表无法加 NOT NULL/CHECK,用 PRAGMA table_info
         # 检测并记录 warning,应用层 record_pending 校验已兜底。
+        # R62 P1-01: 唯一键 MUST 包含 request_hash —— UNIQUE(action_id, effect_type, target, request_hash)
+        # 防止同 (action_id, effect_type, target) 不同 payload 的 receipt 互相覆盖
+        # (旧 schema PRIMARY KEY (action_id, effect_type, target) 不含 request_hash,
+        # INSERT OR IGNORE + UPDATE 会覆盖 request_hash/external_id/status)。
+        # 新建表使用 id AUTOINCREMENT 作物理 PK + UNIQUE(a,e,t,rh) 作逻辑幂等键;
+        # 旧表 schema(无 id 列、PK=(a,e,t))需通过 migration 004 重建,
+        # 应用层 record_pending 通过 PRE-SELECT + plain INSERT 兼容新旧 schema。
+        # 新增 CHECK (status IN ('pending','completed','failed','dlq')) 约束状态枚举值。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS effect_receipts (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                 action_id          TEXT NOT NULL,
                 effect_type        TEXT NOT NULL,
                 target             TEXT NOT NULL,
-                status             TEXT NOT NULL DEFAULT 'pending',
+                status             TEXT NOT NULL DEFAULT 'pending'
+                                   CHECK (status IN ('pending', 'completed', 'failed', 'dlq')),
                 external_id        TEXT,
                 created_at         TEXT NOT NULL,
                 completed_at       TEXT,
@@ -1488,7 +1498,7 @@ class CacheStore:
                 lease_until        TEXT,
                 last_error         TEXT,
                 reconcile_status   TEXT,
-                PRIMARY KEY (action_id, effect_type, target),
+                UNIQUE (action_id, effect_type, target, request_hash),
                 CHECK (request_hash != '' OR effect_type NOT IN
                        ('telegram_send','telegram_copy','r2_put','r2_download',
                         'restore','ban','takedown','purge','crdb_delete'))
@@ -1521,6 +1531,23 @@ class CacheStore:
                     "(旧表 schema),应用层 record_pending 校验已兜底,"
                     "建议重建表以启用 DDL 约束"
                 )
+            # R62 P1-01: 检测旧表 UNIQUE 约束是否包含 request_hash
+            # 旧表 PK=(action_id, effect_type, target) 不含 request_hash,
+            # INSERT OR IGNORE + UPDATE 会覆盖 request_hash/external_id/status。
+            # 应用层 record_pending 通过 PRE-SELECT + plain INSERT 兜底,
+            # 但 DDL 层需 migration 004 重建表以启用 UNIQUE(a,e,t,rh) 约束。
+            if _er_tbl and _er_tbl[0]:
+                _er_sql_upper = _er_tbl[0].upper()
+                _has_rh_unique = (
+                    "UNIQUE" in _er_sql_upper
+                    and "REQUEST_HASH" in _er_sql_upper
+                )
+                if not _has_rh_unique:
+                    logger.warning(
+                        "[CacheStore] effect_receipts 表 UNIQUE 约束未包含 request_hash"
+                        "(旧表 schema,R62 P1-01),应用层 record_pending PRE-SELECT 兜底,"
+                        "建议执行 migration 004_effect_receipts_request_hash_unique.sql 重建表"
+                    )
         except Exception as _e:
             logger.debug(
                 f"[CacheStore] effect_receipts schema 检测(可忽略): {_e}"
@@ -1557,6 +1584,48 @@ class CacheStore:
             "CREATE INDEX IF NOT EXISTS idx_effect_receipts_reconcile "
             "ON effect_receipts(reconcile_status) "
             "WHERE reconcile_status IN ('needs_reconcile', 'hash_mismatch_needs_reconcile')"
+        )
+
+        # ─── R62 P0-05: outbox_events 表 — 外部副作用 outbox(commit 后由 worker 执行)───
+        # 审计背景: execute_high_risk_command_uow 旧实现在 SQLite 事务内调用
+        # business_action 回调执行外部 I/O(Telegram/R2/CRDB/email/文件),
+        # 事务失败时外部 I/O 无法回滚(伪事务),造成"本地回滚但外部已执行"的不一致。
+        # 修复方案: business_action 仅限 DB 状态 transitions(无网络/文件 I/O);
+        # 外部副作用在事务内写入 outbox_events 表(与业务变更原子提交),
+        # commit 后由 OutboxWorker 拉取 lease 并调用外部系统(provider 各自幂等),
+        # 成功 CAS 更新 receipt,失败分类 retryable/permanent,超限进 DLQ。
+        # 补偿必须显式 saga,不依赖伪数据库回滚。
+        # UNIQUE(action_id, effect_type, target, request_hash) 为幂等键 ——
+        # 同 outbox 事件重复写入时 INSERT 失败(由调用方处理冲突)。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS outbox_events (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_id       TEXT NOT NULL,
+                effect_type     TEXT NOT NULL,
+                target          TEXT NOT NULL,
+                request_hash    TEXT NOT NULL,
+                payload_json    TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending', 'in_flight', 'completed', 'failed', 'dlq')),
+                lease_owner     TEXT,
+                lease_expires_at TEXT,
+                attempt_count   INTEGER NOT NULL DEFAULT 0,
+                max_attempts    INTEGER NOT NULL DEFAULT 3,
+                last_error      TEXT,
+                created_at      TEXT NOT NULL,
+                updated_at      TEXT NOT NULL,
+                UNIQUE (action_id, effect_type, target, request_hash)
+            )"""
+        )
+        # partial index: 仅 pending 行参与 lease claim,减少索引扫描成本
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_events_pending "
+            "ON outbox_events(status, lease_expires_at) "
+            "WHERE status = 'pending'"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_events_action "
+            "ON outbox_events(action_id)"
         )
 
         # ─── R46 P1: mfa_used_totp 表 — TOTP 重放防护持久化(跨进程共享) ───
@@ -1658,6 +1727,20 @@ class CacheStore:
             )"""
         )
 
+        # ─── R62 P1-07: mfa_receipt_revocations 表 — MFA receipt 显式吊销 ledger ───
+        # 存储 jti 吊销记录(revocation ledger),verify_mfa_receipt 验证时检查 jti
+        # 是否已吊销。jti PRIMARY KEY 保证同一 receipt 只能被吊销一次(幂等)。
+        # 应用场景:密钥疑似泄露、用户主动撤销、安全事件应急吊销等。
+        # verify_mfa_receipt 在签名/字段校验通过后、返回 payload 前查询本表,
+        # 命中则 fail-closed(reason=revoked)。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS mfa_receipt_revocations (
+                jti          TEXT PRIMARY KEY,
+                reason       TEXT NOT NULL,
+                revoked_at   INTEGER NOT NULL
+            )"""
+        )
+
         # ─── R46 P0-3: unregistered_copies 表 — 持久化 COPIED_UNREGISTERED 状态 ───
         # Telegram copy 成功但 outbox 写失败时,持久化目标 channel/message_id,
         # 进程重启后可扫描未 reconciled 行,优先补 Manifest 而非重新 copy。
@@ -1740,6 +1823,33 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_callback_nonces_expires "
             "ON callback_nonces(expires_at)"
+        )
+
+        # ─── R62 P0-04: button_tokens 表 — 短 handle_id 到签名 token 的映射 ───
+        # Telegram callback_data 有 64 字节限制,而 6 段签名 token
+        # ({principal_id}:{action}:{payload}:{expire_ts}:{nonce}:{signature})
+        # 长度通常 > 100 字符,超出限制。
+        # 服务端持久化完整 token,callback_data 仅携带短 handle_id(~11 字符),
+        # handler 通过 handle_id 查找完整 token 后调用 verify_button_token 验签。
+        # nonce 原子消费仍在 callback_nonces 表(由 verify_button_token 触发),
+        # button_tokens 表仅做 handle → token 映射,可重复读取(无副作用)。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS button_tokens (
+                handle_id      TEXT PRIMARY KEY,
+                token           TEXT NOT NULL,
+                principal_id    INTEGER NOT NULL,
+                action          TEXT NOT NULL,
+                created_at      TEXT NOT NULL,
+                consumed_at     TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_button_tokens_principal "
+            "ON button_tokens(principal_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_button_tokens_action "
+            "ON button_tokens(action)"
         )
 
         await self._db.commit()
@@ -1936,6 +2046,285 @@ class CacheStore:
                 await self._db.commit()
             else:
                 await self._db.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+
+    # ─── R62 P0-05: outbox_events 方法 — 外部副作用 outbox CRUD + lease ───
+    # business_action 仅做 DB 状态 transitions,外部副作用写入 outbox_events
+    # (与业务变更原子提交),commit 后由 OutboxWorker 拉取 lease 调用外部系统。
+    async def add_outbox_event(
+        self,
+        action_id: str,
+        effect_type: str,
+        target: str,
+        request_hash: str,
+        payload_json: str,
+        *,
+        max_attempts: int = 3,
+        connection: Any = None,
+        tx: Any = None,
+    ) -> int:
+        """R62 P0-05: 写入 outbox_events 一条待执行的外部副作用事件。
+
+        在业务事务内调用,与业务状态变更 + effect_receipts 原子提交。
+        commit 后由 OutboxWorker 拉取 lease 并调用外部系统(provider 各自幂等)。
+
+        UNIQUE(action_id, effect_type, target, request_hash) 为幂等键 ——
+        重复写入(同 a,e,t,rh)抛 UNIQUE 冲突异常,由调用方决定是否忽略
+        (例如幂等重试场景下可捕获并视为已排队)。
+
+        Args:
+            action_id: 关联的审批 action_id
+            effect_type: 副作用类型('telegram_message'/'r2_upload'/'crdb_sync'/'email' 等)
+            target: 目标标识(chat_id / bucket / db / email)
+            request_hash: 绑定 action 的 canonical payload hash(幂等键材料)
+            payload_json: 序列化的 effect payload(provider 执行所需全部参数)
+            max_attempts: 最大重试次数,超限进 DLQ(默认 3)
+            connection: 可选事务连接,传入时不自动 commit(与业务表更新原子提交)
+            tx: connection 的别名(优先使用 tx,与 add_dirty_outbox 一致)
+
+        Returns:
+            新插入行 id
+
+        Raises:
+            Exception: INSERT 失败(UNIQUE 冲突 / DB 错误)时透传,由上层事务回滚
+        """
+        # tx 别名优先(与 add_dirty_outbox 一致)
+        if tx is not None:
+            connection = tx
+        if not request_hash:
+            raise ValueError(
+                "[CacheStore] add_outbox_event 失败: request_hash 不能为空"
+                "(R62 P0-05 幂等键必须包含 request_hash)"
+            )
+        db = connection if connection is not None else self._db
+        if db is None:
+            raise RuntimeError(
+                "[CacheStore] add_outbox_event 失败: CacheStore 未初始化(_db is None)"
+            )
+        now = datetime.datetime.utcnow().isoformat()
+        cursor = await db.execute(
+            "INSERT INTO outbox_events "
+            "(action_id, effect_type, target, request_hash, payload_json, "
+            " status, lease_owner, lease_expires_at, attempt_count, "
+            " max_attempts, last_error, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, 0, ?, NULL, ?, ?)",
+            (action_id, effect_type, target, request_hash, payload_json,
+             max_attempts, now, now),
+        )
+        # 仅在无外层事务时自行 commit(与 add_dirty_outbox 一致)
+        if connection is None:
+            await db.commit()
+        return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
+
+    async def claim_outbox_events(
+        self,
+        lease_owner: str,
+        lease_duration_seconds: int = 60,
+        limit: int = 10,
+    ) -> list[dict]:
+        """R62 P0-05: 原子认领 pending outbox_events lease(CAS UPDATE)。
+
+        通过 ``UPDATE ... WHERE status='pending' ... RETURNING`` 原子地将
+        pending 行转为 in_flight 并设置 lease_owner / lease_expires_at,
+        防止多 worker 并发拉取同一行(分布式 lease 语义)。
+
+        Args:
+            lease_owner: worker 标识(hostname:pid)
+            lease_duration_seconds: lease 超时秒数(超时后可被其他 worker 重新 claim)
+            limit: 最多认领的行数
+
+        Returns:
+            认领成功的 outbox 事件列表(含完整字段),空列表表示无可认领事件
+        """
+        if not self._db:
+            return []
+        now = datetime.datetime.utcnow()
+        lease_expires = (
+            now + datetime.timedelta(seconds=lease_duration_seconds)
+        ).isoformat()
+        now_iso = now.isoformat()
+        # SQLite < 3.35 不支持 RETURNING;aiosqlite 通常基于较新 SQLite,
+        # 但为兼容性使用两步:先 UPDATE 再 SELECT by lease_owner。
+        # CAS 条件: status='pending'(未被认领) — 不回收过期 lease
+        # (过期 lease 回收由独立 reconcile 流程处理,避免 claim 路径复杂化)。
+        try:
+            cursor = await self._db.execute(
+                "UPDATE outbox_events "
+                "SET status='in_flight', lease_owner=?, lease_expires_at=?, "
+                "attempt_count=attempt_count+1, updated_at=? "
+                "WHERE id IN ("
+                "  SELECT id FROM outbox_events "
+                "  WHERE status='pending' "
+                "  ORDER BY created_at ASC LIMIT ?"
+                ")",
+                (lease_owner, lease_expires, now_iso, limit),
+            )
+            claimed = cursor.rowcount if cursor is not None else 0
+            if claimed == 0:
+                return []
+            await self._db.commit()
+            # 查询刚认领的行(按 lease_owner + in_flight 过滤)
+            cursor = await self._db.execute(
+                "SELECT id, action_id, effect_type, target, request_hash, "
+                "payload_json, status, lease_owner, lease_expires_at, "
+                "attempt_count, max_attempts, last_error, created_at, updated_at "
+                "FROM outbox_events "
+                "WHERE lease_owner=? AND status='in_flight' "
+                "ORDER BY created_at ASC",
+                (lease_owner,),
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": r[0], "action_id": r[1], "effect_type": r[2],
+                    "target": r[3], "request_hash": r[4], "payload_json": r[5],
+                    "status": r[6], "lease_owner": r[7], "lease_expires_at": r[8],
+                    "attempt_count": r[9], "max_attempts": r[10],
+                    "last_error": r[11], "created_at": r[12], "updated_at": r[13],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.error(f"[CacheStore] claim_outbox_events 失败: {e}")
+            try:
+                await self._db.rollback()
+            except Exception:
+                pass
+            return []
+
+    async def complete_outbox_event(
+        self,
+        event_id: int,
+        *,
+        connection: Any = None,
+        tx: Any = None,
+    ) -> bool:
+        """R62 P0-05: 标记 outbox_event 为 completed(CAS,仅 in_flight 可转 completed)。
+
+        Args:
+            event_id: outbox_events.id
+            connection / tx: 可选事务连接(与 effect_receipts 原子提交)
+
+        Returns:
+            True 表示 CAS 成功;False 表示行不存在或状态非 in_flight
+        """
+        if tx is not None:
+            connection = tx
+        db = connection if connection is not None else self._db
+        if db is None:
+            return False
+        now = datetime.datetime.utcnow().isoformat()
+        cursor = await db.execute(
+            "UPDATE outbox_events "
+            "SET status='completed', last_error=NULL, updated_at=? "
+            "WHERE id=? AND status='in_flight'",
+            (now, event_id),
+        )
+        affected = cursor.rowcount if cursor is not None else 0
+        if connection is None:
+            await db.commit()
+        return affected > 0
+
+    async def fail_outbox_event(
+        self,
+        event_id: int,
+        error_msg: str,
+        *,
+        connection: Any = None,
+        tx: Any = None,
+    ) -> str:
+        """R62 P0-05: 标记 outbox_event 失败,分类 retryable/permanent/over-limit→DLQ。
+
+        CAS 语义:仅 in_flight 可记录失败。失败后:
+        - attempt_count < max_attempts → 转回 'pending' 等待重试(retryable)
+        - attempt_count >= max_attempts → 转 'dlq'(permanent,需人工介入)
+
+        Args:
+            event_id: outbox_events.id
+            error_msg: 错误信息(截断 500 字符)
+            connection / tx: 可选事务连接
+
+        Returns:
+            'retryable' / 'dlq' / 'not_found'(行不存在或状态非 in_flight)
+        """
+        if tx is not None:
+            connection = tx
+        db = connection if connection is not None else self._db
+        if db is None:
+            return "not_found"
+        now = datetime.datetime.utcnow().isoformat()
+        # 先查询当前 attempt_count / max_attempts 判断是否超限
+        cursor = await db.execute(
+            "SELECT attempt_count, max_attempts FROM outbox_events "
+            "WHERE id=? AND status='in_flight'",
+            (event_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return "not_found"
+        attempt_count, max_attempts = row[0], row[1]
+        truncated_err = (error_msg or "")[:500]
+        if attempt_count >= max_attempts:
+            # 超限 → DLQ(permanent,需人工介入)
+            await db.execute(
+                "UPDATE outbox_events "
+                "SET status='dlq', last_error=?, updated_at=? "
+                "WHERE id=? AND status='in_flight'",
+                (truncated_err, now, event_id),
+            )
+            result = "dlq"
+        else:
+            # 未超限 → 转回 pending 等待重试(retryable)
+            await db.execute(
+                "UPDATE outbox_events "
+                "SET status='pending', last_error=?, lease_owner=NULL, "
+                "lease_expires_at=NULL, updated_at=? "
+                "WHERE id=? AND status='in_flight'",
+                (truncated_err, now, event_id),
+            )
+            result = "retryable"
+        if connection is None:
+            await db.commit()
+        return result
+
+    async def move_outbox_to_dlq(
+        self,
+        event_id: int,
+        reason: str = "",
+        *,
+        connection: Any = None,
+        tx: Any = None,
+    ) -> bool:
+        """R62 P0-05: 显式将 outbox_event 移入 DLQ(permanent failure)。
+
+        与 fail_outbox_event 的超限自动 DLQ 不同,本方法用于 provider 判定为
+        permanent failure(如参数非法、权限拒绝、目标不存在等不可重试错误)时
+        直接进 DLQ,不消耗重试次数。
+
+        Args:
+            event_id: outbox_events.id
+            reason: 进 DLQ 的原因(截断 500 字符)
+            connection / tx: 可选事务连接
+
+        Returns:
+            True 表示成功移入 DLQ;False 表示行不存在
+        """
+        if tx is not None:
+            connection = tx
+        db = connection if connection is not None else self._db
+        if db is None:
+            return False
+        now = datetime.datetime.utcnow().isoformat()
+        truncated_reason = (reason or "")[:500]
+        cursor = await db.execute(
+            "UPDATE outbox_events "
+            "SET status='dlq', last_error=?, updated_at=? "
+            "WHERE id=? AND status IN ('pending', 'in_flight')",
+            (truncated_reason, now, event_id),
+        )
+        affected = cursor.rowcount if cursor is not None else 0
+        if connection is None:
+            await db.commit()
+        return affected > 0
 
     async def get_dirty_outbox_batch(self, limit: int = 100) -> list[dict]:
         """R38 P1-2: 拉取一批未处理的 dirty_outbox 记录(processed=0)。
@@ -7773,6 +8162,152 @@ class CacheStore:
         except Exception as e:
             logger.error(f"[CacheStore] callback_nonce_cleanup 失败: {e}")
         return {"deleted_expired": deleted_expired, "deleted_consumed": deleted_consumed}
+
+    # ─── R62 P0-04: button_tokens 表 — 短 handle_id 到签名 token 的映射 ───
+
+    async def button_token_store(
+        self,
+        handle_id: str,
+        token: str,
+        principal_id: int,
+        action: str,
+    ) -> bool:
+        """R62 P0-04: 存储签名 token(以短 handle_id 为键)。
+
+        Telegram callback_data 有 64 字节限制,签名 token 长度超出。
+        服务端持久化完整 token,callback_data 仅携带 handle_id,
+        handler 收到回调后通过 handle_id 查找完整 token 验签。
+
+        Args:
+            handle_id: 短 handle_id(callback_data 中携带)
+            token: 完整签名 token(6 段格式,含 nonce + signature)
+            principal_id: 关联主体 ID(管理员 user_id)
+            action: 关联动作(如 'report'/'restore'/'delete_file')
+
+        Returns:
+            True=创建成功;False=创建失败
+        """
+        if not self._db:
+            return False
+        import datetime as _dt
+        _now = _dt.datetime.now().isoformat()
+        try:
+            await self._db.execute(
+                """INSERT OR REPLACE INTO button_tokens
+                   (handle_id, token, principal_id, action, created_at, consumed_at)
+                   VALUES (?, ?, ?, ?, ?, NULL)""",
+                (handle_id, token, principal_id, action, _now),
+            )
+            await self._db.commit()
+            return True
+        except Exception as e:
+            logger.error(f"[CacheStore] button_token_store 失败: {e}")
+            return False
+
+    async def button_token_lookup(self, handle_id: str) -> str | None:
+        """R62 P0-04: 通过 handle_id 查找完整签名 token(不消费)。
+
+        注:本方法不消费 token。nonce 原子消费由 verify_button_token 调用
+            callback_nonce_consume 完成。本方法仅做 handle → token 映射查询,
+            可重复读取(若 nonce 已消费,verify_button_token 会拒绝重放)。
+
+        Args:
+            handle_id: 短 handle_id
+
+        Returns:
+            完整 token 字符串;不存在时返回 None
+        """
+        if not self._db:
+            return None
+        try:
+            cursor = await self._db.execute(
+                "SELECT token FROM button_tokens WHERE handle_id = ? LIMIT 1",
+                (handle_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return row[0]
+        except Exception as e:
+            logger.error(f"[CacheStore] button_token_lookup 失败: {e}")
+            return None
+
+    async def button_token_mark_consumed(self, handle_id: str) -> bool:
+        """R62 P0-04: 标记 handle_id 已消费(可选,主要用于审计/清理)。
+
+        注:nonce 原子消费已在 verify_button_token 内完成,本方法仅标记
+            button_tokens 表中的 consumed_at 字段,便于后续清理。
+            重复调用是幂等的(UPDATE 同一行)。
+
+        Args:
+            handle_id: 短 handle_id
+
+        Returns:
+            True=标记成功;False=失败或不存在
+        """
+        if not self._db:
+            return False
+        import datetime as _dt
+        _now = _dt.datetime.now().isoformat()
+        try:
+            cursor = await self._db.execute(
+                "UPDATE button_tokens SET consumed_at = ? WHERE handle_id = ?",
+                (_now, handle_id),
+            )
+            _affected = cursor.rowcount or 0
+            await self._db.commit()
+            return _affected > 0
+        except Exception as e:
+            logger.error(f"[CacheStore] button_token_mark_consumed 失败: {e}")
+            return False
+
+    async def button_token_cleanup(
+        self,
+        created_before: str | None = None,
+        consumed_before: str | None = None,
+    ) -> dict:
+        """R62 P0-04: 清理 button_tokens 表中过期/已消费的记录。
+
+        清理策略:
+        1. 删除 created_at < created_before 且 consumed_at IS NOT NULL 的记录
+        2. 删除 consumed_at < consumed_before 的记录
+
+        Args:
+            created_before: ISO 时间字符串,删除 created_at < 此值且已消费的记录
+            consumed_before: ISO 时间字符串,删除 consumed_at < 此值的记录
+
+        Returns:
+            {"deleted_created": int, "deleted_consumed": int}
+        """
+        if not self._db:
+            return {"deleted_created": 0, "deleted_consumed": 0}
+        deleted_created = 0
+        deleted_consumed = 0
+        try:
+            if created_before:
+                cursor = await self._db.execute(
+                    "DELETE FROM button_tokens "
+                    "WHERE created_at < ? AND consumed_at IS NOT NULL",
+                    (created_before,),
+                )
+                deleted_created = cursor.rowcount or 0
+                await self._db.commit()
+            if consumed_before:
+                cursor = await self._db.execute(
+                    "DELETE FROM button_tokens "
+                    "WHERE consumed_at IS NOT NULL AND consumed_at < ?",
+                    (consumed_before,),
+                )
+                deleted_consumed = cursor.rowcount or 0
+                await self._db.commit()
+            if deleted_created > 0 or deleted_consumed > 0:
+                logger.info(
+                    f"[CacheStore] button_token_cleanup: "
+                    f"created={deleted_created}, consumed={deleted_consumed}"
+                )
+        except Exception as e:
+            logger.error(f"[CacheStore] button_token_cleanup 失败: {e}")
+        return {"deleted_created": deleted_created, "deleted_consumed": deleted_consumed}
 
 
 # ─── Decode Logs 缓冲表 ──────────────────────────────────────

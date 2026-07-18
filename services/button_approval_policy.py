@@ -161,6 +161,10 @@ class ButtonApprovalContext:
         - mfa_verified:    MFA 是否已验证(极高风险 action 强制)
         - approver_id:      审批人 ID(双人审批时必须 ≠ principal_id)
         - final_confirm:    最终确认标记(防误点)
+        - mfa_receipt:      R62 P1-07 MFA receipt payload dict(由 verify_mfa_receipt
+                            返回,含 iat 字段);高风险动作会校验其签发年龄,
+                            防止陈旧 receipt 绕过二次认证。None 时仅校验布尔
+                            mfa_verified(向后兼容)。
     """
     action: str
     principal_id: int
@@ -173,6 +177,7 @@ class ButtonApprovalContext:
     mfa_verified: bool = False
     approver_id: int = 0
     final_confirm: bool = False
+    mfa_receipt: Optional[dict] = None
 
     def validate_required_fields(self) -> None:
         """校验所有必填字段非空(fail-closed)。
@@ -333,6 +338,30 @@ async def enforce_button_approval_policy(
                 "reason": "mfa_verification_required",
             },
         )
+
+    # R62 P1-07: 高风险动作验证 MFA age,不只验证布尔 mfa_verified
+    # 高风险动作(requires_mfa=True)且调用方提供了 mfa_receipt(verify_mfa_receipt
+    # 返回的 payload dict)时,额外校验 receipt 签发时间距今不超过 max_age_seconds。
+    # 防止攻击者使用陈旧但仍未过期的 receipt(如刚签发后立刻泄露)绕过二次认证。
+    # mfa_receipt 为 None 时不校验年龄(向后兼容,仅依赖布尔 mfa_verified)。
+    if requires_mfa and ctx.mfa_receipt:
+        # 延迟 import 避免循环依赖
+        from admin.mfa import get_mfa_manager
+        mfa_manager = get_mfa_manager()
+        # 默认 5 分钟内签发的 receipt 才视为"近期完成 MFA"
+        if not mfa_manager.verify_mfa_receipt_age(ctx.mfa_receipt, max_age_seconds=300):
+            logger.warning(
+                f"[ButtonPolicy] R62 P1-07: MFA receipt 已过期(age 超限) "
+                f"action={ctx.action} principal={current_principal_id}"
+            )
+            raise AppError(
+                ErrorCodes.AUTH_MFA_RECEIPT_EXPIRED,
+                params={
+                    "user_id": current_principal_id,
+                    "reason": "mfa_receipt_age_exceeded",
+                    "action": ctx.action,
+                },
+            )
 
     # ── 步骤 7: 双人审批(极高风险 action)──────────────────────
     if requires_dual:

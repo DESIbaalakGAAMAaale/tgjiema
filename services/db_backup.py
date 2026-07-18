@@ -774,6 +774,10 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
     R35 P1-4: 委托给 services/db_restore.py 的 restore_from_backup_data(),
     消除两套恢复执行器。本函数保留向后兼容(admin_bot/callback.py 调用此入口)。
 
+    R62 P0-01: 旧格式备份(db_backup_*.json 单文件)不支持恢复 —
+               必须使用离线导入/迁移工具转换为三段式格式后再走严格验证路径。
+               旧格式 key 命名 db_backup/db_backup_*.json 视为旧格式,直接 FAIL。
+
     Args:
         key: R2 对象 key（如 db_backup/db_backup_20240101_120000.json）
         tables: 仅恢复指定表；None 则恢复备份中的所有表
@@ -781,6 +785,9 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
 
     Returns:
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
+
+    Raises:
+        AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): 旧格式 key 不支持恢复
     """
     # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
     await configure_r2_dynamic()
@@ -788,23 +795,54 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         # R48 P1: 协议化错误码替代裸字符串 RuntimeError
         raise AppError(ErrorCodes.BACKUP_RESTORE_R2_CREDENTIAL_MISSING)
 
+    # R62 P0-01: 检测旧格式 key 并拒绝 — 必须使用离线导入/迁移工具
+    # 旧格式特征:db_backup/db_backup_*.json(单文件 JSON,无三段式 payload/manifest/COMPLETE)
+    # 三段式备份:backups/{backup_id}.enc + {backup_id}.manifest.json + {backup_id}.complete
+    if key.startswith("db_backup/db_backup_") and key.endswith(".json"):
+        logger.error(
+            f"R62 P0-01: 旧格式备份 key={key} 不支持恢复。"
+            f"请使用离线导入/迁移工具将其转换为三段式格式"
+            f"(payload.enc + manifest.json + COMPLETE marker)后再恢复。"
+        )
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
     # 下载备份
     content = await r2_storage.download(key)
     data = json.loads(content)
 
     # R35 P1-4: 委托给单一 Restore Engine
-    # R61 P0-03: 路由通过 validate_and_restore_backup_strict() 公共入口
+    # R61 P0-03 / R62 P0-01: 路由通过 validate_and_restore_backup_strict() 公共入口
     # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
-    # 本入口已下载备份并解析 JSON,但未做三段式严格验证(旧格式 db_backup_*.json),
-    # 通过 skip_strict_validation=True + *_override 提供信任链元数据。
+    # R62 P0-01: 不再支持 skip_strict_validation=True 绕过(已移除该参数)。
+    # 三段式备份需提供完整验证参数(signing_key/decryptor 等)。
     from services.backup_dr_validate import validate_and_restore_backup_strict
     return await validate_and_restore_backup_strict(
         data=data,
         tables=tables,
         merge=merge,
-        # 旧格式备份:已通过 r2_storage.download + json.loads 加载
-        # 跳过严格三段式验证(storage/signing_key/decryptor 等参数留空)
-        skip_strict_validation=True,
-        validation_note=f"db_backup.restore_from_backup: legacy key={key}",
-        backup_id_override=str(data.get("backup_time", "")),
+        # R62 P0-01: 严格三段式验证参数(由调用方注入)
+        timestamp=str(data.get("backup_time", data.get("backup_id", ""))),
+        backup_type="full",
+        r2_storage=r2_storage,
+        signing_key=getattr(settings, "BACKUP_SIGNING_KEY", b"") or b"",
+        decryptor=_build_db_backup_decryptor(),
+        expected_manifest_key=str(data.get("manifest_key", "")),
+        expected_backup_id=str(data.get("backup_id", "")),
+        current_schema_version=str(data.get("schema_version", "")),
     )
+
+
+def _build_db_backup_decryptor():
+    """R62 P0-01: 构建 db_backup.restore_from_backup 用的解密器。
+
+    生产环境应配置 BACKUP_KEK;未配置时无法走严格三段式解密路径,
+    调用方应在调用前检测并提示用户使用离线迁移工具。
+    """
+    try:
+        from services.backup_crypto import is_encryption_available
+        if not is_encryption_available():
+            return None
+        from services.backup_crypto import BackupDecryptor  # type: ignore
+        return BackupDecryptor()
+    except Exception:
+        return None

@@ -424,13 +424,13 @@ async def _restore_sqlite_table(
 # ═══════════════════════════════════════════════════════════════
 
 async def _restore_from_backup_data(
-    data: dict,
+    verified_payload,
     *,
-    _capability,  # R61 P0-03: _RestoreCapability(不可伪造,由 validate_and_restore_backup_strict 构造)
+    _capability,  # R61 P0-03 / R62 P0-02: _RestoreCapability(不可伪造,由 validate_and_restore_backup_strict 构造)
     tables: list[str] | None = None,
     merge: bool = False,
 ) -> dict:
-    """从备份数据恢复数据库(R61 P0-03: 私有 Restore Engine 写入器)。
+    """从已验证的备份 payload 恢复数据库(R61 P0-03 / R62 P0-02: 私有 Restore Engine 写入器)。
 
     R35 P1-4: 本函数是唯一的恢复执行器写入器(私有)。
     db_backup.py::restore_from_backup() 与 CLI 的 run_restore() 通过
@@ -452,25 +452,50 @@ async def _restore_from_backup_data(
         - 旧 R59 P0-04 / R60 P0-03 的 BackupValidationResult 令牌已废弃
           (其为公开 dataclass,任意调用方可构造 valid=True,无法防止伪造)。
 
+    R62 P0-02: 强制 capability 边界(本次审计整改)。
+        - **首条语句必须为 capability.assert_valid(payload_digest, clock, expected_scope)**
+          — 验证令牌有效性(sentinel + 未过期 + payload_digest 一致 + scope 一致) +
+          防重放(nonce 消费)。任一校验失败即抛 AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)。
+        - 参数从 raw data: dict 改为 VerifiedBackupPayload(frozen dataclass),
+          从 verified_payload.tables 读取表数据(不再从 data.get("tables", {}))。
+        - capability.payload_digest 与 verified_payload.payload_digest 必须一致,
+          防止 payload 在验证后、写入前被替换。
+
     Args:
-        data: 备份数据 dict(含 "tables" 键)
-        _capability: R61 P0-03 不可伪造的 _RestoreCapability(由
-                     validate_and_restore_backup_strict 构造,强制必填)
+        verified_payload: R62 P0-02 VerifiedBackupPayload 实例(frozen dataclass)
+                          — 由 validate_and_restore_backup_strict 或
+                          _restore_preverified_payload 构造,含已验证的 tables +
+                          payload_digest + schema_fingerprint
+        _capability: R61 P0-03 / R62 P0-01 不可伪造的 _RestoreCapability(由
+                     validate_and_restore_backup_strict / _restore_preverified_payload
+                     通过 _RESTORE_SENTINEL 构造,强制必填)
         tables: 仅恢复指定表；None 则恢复备份中的所有表
         merge: True=增量补充(冲突保留现有数据); False=覆盖(清空后写入,默认)
 
     Returns:
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
+
+    Raises:
+        AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): capability 校验失败
+            (sentinel 不匹配 / nonce 已消费 / 已过期 / payload_digest 不匹配 /
+             schema_fingerprint 不匹配)
     """
-    # R61 P0-03: _capability 是不可伪造的 _RestoreCapability 实例
-    # (由 validate_and_restore_backup_strict 通过 _RESTORE_SENTINEL 构造)。
-    # 本写入器为私有(仅 validate_and_restore_backup_strict 内部调用),
-    # 不再做信任校验 — 安全保证来自:
-    #   1. _RestoreCapability.__init__ 的 sentinel 检查(模块私有 _RESTORE_SENTINEL)
-    #   2. validate_and_restore_backup_strict 是唯一能构造 _RestoreCapability 的公共入口
-    #   3. _restore_from_backup_data 为私有函数(_ 前缀)
-    # _capability 参数强制必填(keyword-only,无默认值),调用方必须通过 strict 入口获取。
-    backup_tables = data.get("tables", {})
+    # R62 P0-02: 首条语句必须为 capability.assert_valid(...) — 强制 capability 边界
+    # 在读取任何 verified_payload 字段之前校验令牌有效性 + 防重放 +
+    # payload_digest 一致性(verified_payload.payload_digest 与 capability 内嵌
+    # payload_digest 必须一致,防 payload 替换)+ scope 一致性
+    # (verified_payload.schema_fingerprint 与 capability.schema_fingerprint 必须一致)。
+    import time as _time
+    _capability.assert_valid(
+        verified_payload.payload_digest,
+        _time.time(),
+        verified_payload.schema_fingerprint,
+    )
+
+    # R62 P0-02: 从 verified_payload.tables 读取(不再从 data.get("tables", {}))
+    # verified_payload 由 validate_and_restore_backup_strict 在严格验证通过后构造,
+    # tables 字段已通过 validate_backup_payload 解密 + 校验 plaintext_sha256。
+    backup_tables = verified_payload.tables
 
     if tables:
         restore_tables_map = {t: backup_tables[t] for t in tables if t in backup_tables}
@@ -672,6 +697,9 @@ async def run_restore(table: str = None, dry_run: bool = False):
     """执行恢复流程(CLI 入口)。
 
     R35 P1-4: 调用 restore_from_backup_data() 单一 Restore Engine。
+    R62 P0-01: 旧格式备份(db_backup_*.json 单文件)不支持恢复 — 必须使用
+               离线导入/迁移工具将旧备份转换为三段式(payload.enc + manifest.json +
+               COMPLETE marker)格式后再走严格三段式验证路径。
     """
     # 1. 初始化 R2
     if not settings.R2_ACCOUNT_ID:
@@ -691,6 +719,24 @@ async def run_restore(table: str = None, dry_run: bool = False):
     data = await get_latest_backup()
     tables_data = data.get("tables", {})
 
+    # R62 P0-01: 检测旧格式备份并拒绝 — 必须走严格三段式验证路径
+    # 旧格式特征:
+    #   - 单文件 db_backup/db_backup_*.json(无独立 COMPLETE marker)
+    #   - manifest 内嵌在 data 中(data["manifest"]),而非独立 manifest_*.json
+    #   - 无 COMPLETE marker HMAC 签名(仅有 manifest.encryption 元信息)
+    # 严格三段式备份需要:payload_*.enc + manifest_*.json + COMPLETE_*.COMPLETE
+    # 三者分离 + HMAC 签名,旧格式不满足,无法走 validate_and_restore_backup_strict。
+    embedded_manifest = data.get("manifest", {})
+    if embedded_manifest and not _is_three_stage_complete_marker(embedded_manifest):
+        # 旧格式备份 — 必须使用离线导入/迁移工具
+        logger.error(
+            "R62 P0-01: 旧格式备份(db_backup_*.json 单文件)不支持恢复。"
+            "请使用离线导入/迁移工具将其转换为三段式格式"
+            "(payload.enc + manifest.json + COMPLETE marker)后再恢复。"
+        )
+        from services.error_codes import AppError, ErrorCodes
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
     # 3. 确定要恢复的表
     if table:
         if table not in tables_data:
@@ -704,19 +750,25 @@ async def run_restore(table: str = None, dry_run: bool = False):
         logger.info("=== DRY-RUN 模式，不会实际写入数据 ===")
 
     # R35 P1-4: 调用单一 Restore Engine
-    # R61 P0-03: 路由通过 validate_and_restore_backup_strict() 公共入口
+    # R61 P0-03 / R62 P0-01: 路由通过 validate_and_restore_backup_strict() 公共入口
     # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
-    # CLI 入口的备份格式为旧版 db_backup_*.json(非三段式 payload/manifest/COMPLETE),
-    # 通过 data= 参数传入已下载+解密+校验的数据,跳过严格三段式下载验证。
+    # R62 P0-01: 不再支持 skip_strict_validation=True 绕过(已移除该参数)。
+    # 三段式备份需提供完整验证参数(signing_key/decryptor 等),
+    # CLI 当前未实现这些参数的注入(需配置 BACKUP_SIGNING_KEY / BACKUP_KEK 等环境变量)。
     from services.backup_dr_validate import validate_and_restore_backup_strict
     result = await validate_and_restore_backup_strict(
         data=data,
         tables=target_tables if table else None,
         merge=False,
-        # CLI 旧格式备份: 已通过 get_latest_backup() 完成 manifest+checksum+decrypt 校验
-        # 此处跳过严格三段式验证(storage/signing_key/decryptor 等参数留空)
-        skip_strict_validation=True,
-        validation_note="CLI run_restore: old-format backup validated via get_latest_backup()",
+        # R62 P0-01: 严格三段式验证参数(由调用方注入或离线工具提供)
+        timestamp=str(data.get("backup_time", "")),
+        backup_type="full",
+        r2_storage=r2_storage,
+        signing_key=getattr(settings, "BACKUP_SIGNING_KEY", b"") or b"",
+        decryptor=_build_cli_decryptor(),
+        expected_manifest_key=str(data.get("manifest_key", "")),
+        expected_backup_id=str(data.get("backup_id", "")),
+        current_schema_version=str(data.get("schema_version", "")),
     )
 
     # 打印恢复结果
@@ -731,6 +783,57 @@ async def run_restore(table: str = None, dry_run: bool = False):
 
     await r2_storage.close()
     logger.info("数据库恢复完成")
+
+
+def _is_three_stage_complete_marker(manifest: dict) -> bool:
+    """R62 P0-01: 检测 manifest 是否为三段式备份的合法 manifest(含 signature
+    与三段式必需字段)。
+
+    用于区分:
+        - 旧格式备份:单文件 db_backup_*.json,manifest 内嵌,无 COMPLETE marker 签名
+        - 三段式备份:payload.enc + manifest.json + COMPLETE.marker 三对象分离
+
+    Args:
+        manifest: data.get("manifest", {}) 抽取的 manifest dict
+
+    Returns:
+        True = 三段式合法 manifest(含三段式必需字段)
+        False = 旧格式或无效 manifest(必须走离线导入/迁移工具)
+    """
+    if not isinstance(manifest, dict):
+        return False
+    # 三段式 manifest 必须含 schema_version、plaintext_sha256、ciphertext_sha256、
+    # backup_id、encryption.key_id 字段(由 build_complete_marker 验签绑定)
+    required = (
+        "schema_version",
+        "plaintext_sha256",
+        "ciphertext_sha256",
+        "backup_id",
+    )
+    for f in required:
+        if not manifest.get(f):
+            return False
+    encryption = manifest.get("encryption", {})
+    if not isinstance(encryption, dict) or not encryption.get("key_id"):
+        return False
+    return True
+
+
+def _build_cli_decryptor():
+    """R62 P0-01: 构建 CLI 用的解密器(若配置 BACKUP_KEK 则真实解密,否则 None)。
+
+    生产环境应配置 BACKUP_KEK;未配置时 CLI 无法走严格三段式解密路径,
+    调用方应在调用前检测并提示用户使用离线迁移工具。
+    """
+    try:
+        from services.backup_crypto import is_encryption_available
+        if not is_encryption_available():
+            return None
+        # 真实解密器:延迟构造避免循环依赖
+        from services.backup_crypto import BackupDecryptor  # type: ignore
+        return BackupDecryptor()
+    except Exception:
+        return None
 
 
 def main():

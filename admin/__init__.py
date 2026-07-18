@@ -1051,6 +1051,10 @@ async def login_page(request: Request):
 
     无需认证,展示用户名/密码表单。
     若已存在有效 session,重定向到首页。
+
+    R62 P1-06: 读取 ``locale`` cookie 决定渲染 locale(与 base.html 的
+    ``<html lang="{{ locale }}">`` 对齐)。en-US locale 渲染英文登录页
+    (``<html lang="en-US">`` + 英文标签),zh-CN 渲染中文登录页。
     """
     # 检查是否已登录
     session_id = _extract_session_id(request)
@@ -1063,7 +1067,17 @@ async def login_page(request: Request):
     # 渲染登录表单(简化:返回内联 HTML,避免新增模板文件)
     csp_nonce = getattr(request.state, "csp_nonce", "") or ""
     csrf_token = _get_csrf_token("__login__")
-    html = _i18n_t('admin.__init__.s1', csp_nonce=csp_nonce, csrf_token=csrf_token, error_message="")
+    # R62 P1-06: 读取 locale cookie 决定渲染 locale(默认 zh-CN)
+    cookie_locale = request.cookies.get("locale", "") if hasattr(request, "cookies") else ""
+    if cookie_locale not in ("zh-CN", "en-US"):
+        cookie_locale = "zh-CN"
+    html = _i18n_t(
+        'admin.__init__.s1',
+        locale=cookie_locale,
+        csp_nonce=csp_nonce,
+        csrf_token=csrf_token,
+        error_message="",
+    )
     response = HTMLResponse(content=html)
     response.set_cookie(
         key="csrf_token", value=csrf_token,
@@ -1132,8 +1146,13 @@ async def login_submit(
         csp_nonce = getattr(request.state, "csp_nonce", "") or ""
         csrf_token_new = _get_csrf_token("__login__")
         error_msg = _t(0, "admin.errors.login_failed")
+        # R62 P1-06: 读取 locale cookie 决定渲染 locale(与 GET /login 一致)
+        cookie_locale = request.cookies.get("locale", "") if hasattr(request, "cookies") else ""
+        if cookie_locale not in ("zh-CN", "en-US"):
+            cookie_locale = "zh-CN"
         html = _i18n_t(
             'admin.__init__.s1',
+            locale=cookie_locale,
             csp_nonce=csp_nonce, csrf_token=csrf_token_new,
             error_message=error_msg,
         )

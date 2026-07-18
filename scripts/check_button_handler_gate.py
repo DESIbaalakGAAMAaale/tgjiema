@@ -92,6 +92,7 @@ FORBIDDEN_DESTRUCTIVE_APIS: frozenset[str] = frozenset({
 })
 
 # Rule C: 高风险 callback handler 必须使用的签名绑定 API
+# R62 P0-04: 新增 handle 短 ID 模式的签名/验证函数(绕过 Telegram 64 字节限制)
 SIGNED_TOKEN_API_NAMES: frozenset[str] = frozenset({
     "sign_button_token_with_nonce",
     "verify_button_token",
@@ -99,6 +100,9 @@ SIGNED_TOKEN_API_NAMES: frozenset[str] = frozenset({
     "create_token",
     "ButtonFlow",
     "get_button_flow",
+    # R62 P0-04: handle 短 ID 模式(基于 button_tokens 表 + sign_button_token_with_nonce)
+    "sign_button_token_with_handle",
+    "verify_button_token_by_handle",
 })
 
 # 高风险 handler 的 entry_type 集合(门禁检查范围)

@@ -1162,6 +1162,30 @@ class I18nManager:
                 return text
         return text
 
+    # R62 P1-05: 所有用户出口应接受 UserMessage 结构化对象,而非裸字符串
+    def render_user_message(self, msg: Any) -> str:
+        """R62 P1-05: 渲染 UserMessage 结构化对象为本地化字符串。
+
+        所有用户面出口(FastAPI response、Telegram、WebSocket、SSE、邮件、通知、模板)
+        应通过此方法渲染 UserMessage,而非直接接受裸字符串。
+
+        Args:
+            msg: UserMessage 实例(来自 services.user_message)
+                — 通过 TYPE_CHECKING 避免运行时循环依赖
+
+        Returns:
+            本地化字符串(message_key 已翻译,params 已 ICU 插值)
+
+        Note:
+            此方法是 UserMessage.render(self) 的 I18nManager 端入口,
+            便于在不直接依赖 services.user_message 的模块中调用:
+                msg = UserMessage.from_key("bot.upload_banned", locale=locale)
+                text = i18n_manager.render_user_message(msg)
+        """
+        # 延迟导入避免循环依赖(services.user_message 类型注解中引用 AppError)
+        # UserMessage.render 内部调用 self.format_message,本方法仅做转发
+        return msg.render(self)
+
     def format_error_code(self, domain: str, operation: str, reason: str) -> str:
         """R41: 三段式错误码格式化 — domain.operation.reason → "errors.{domain}.{operation}.{reason}"。
 

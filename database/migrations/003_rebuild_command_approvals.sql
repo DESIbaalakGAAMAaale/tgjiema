@@ -19,7 +19,7 @@
 --
 -- 新增约束(R60 P0-05 / R61 P1-01):
 --   - decision        NOT NULL + CHECK IN ('approved','rejected','cancelled')
---   - request_hash    NOT NULL + CHECK (length=64 AND GLOB '[0-9a-f]*' 防御性首字符校验)
+--   - request_hash    NOT NULL + CHECK (length=64 AND NOT GLOB '*[^0-9a-f]*' 完整小写十六进制校验)
 --   - mfa_receipt     NOT NULL + CHECK (length(trim(...)) > 0 防空白绕过)
 --   - permission      NOT NULL + CHECK (length(trim(...)) > 0)
 --   - expires_at      NOT NULL + CHECK (length(trim(...)) > 0)
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS command_approvals_r60_strict (
     approver_id     BIGINT NOT NULL,
     approval_type   TEXT NOT NULL CHECK (approval_type IN ('break_glass','quarantine_delete','collection','maintenance','rbac')),
     decision        TEXT NOT NULL CHECK (decision IN ('approved','rejected','cancelled')) DEFAULT 'approved',
-    request_hash    TEXT NOT NULL CHECK (length(request_hash) = 64 AND request_hash GLOB '[0-9a-f]*'),
+    request_hash    TEXT NOT NULL CHECK (length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'),
     mfa_receipt     TEXT NOT NULL CHECK (length(trim(mfa_receipt)) > 0),
     permission      TEXT NOT NULL CHECK (length(trim(permission)) > 0),
     approved_at     TEXT NOT NULL,
@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS command_approvals_r60_strict (
 --   - mfa_receipt 非空(trim 后非空)
 --   - permission 非空(trim 后非空)
 --   - expires_at 非空(trim 后非空)
---   - request_hash 非空 + length=64 + GLOB '[0-9a-f]*' 防御性首字符校验
+--   - request_hash 非空 + length=64 + NOT GLOB '*[^0-9a-f]*' 完整小写十六进制校验
 --   - decision 为 NULL 或在合法集合内(NULL → 'approved' 默认值,经 CASE 转换)
 --   - approval_type 为 NULL 或在合法集合内(NULL → 'break_glass' 默认值,经 CASE 转换)
 -- 非法行不迁移到 strict 表,而是隔离到 quarantine 表(Step 2b)。
@@ -82,13 +82,16 @@ FROM command_approvals
 WHERE mfa_receipt IS NOT NULL AND length(trim(mfa_receipt)) > 0
   AND permission IS NOT NULL AND length(trim(permission)) > 0
   AND expires_at IS NOT NULL AND length(trim(expires_at)) > 0
-  AND request_hash IS NOT NULL AND length(request_hash) = 64 AND request_hash GLOB '[0-9a-f]*'
+  AND request_hash IS NOT NULL AND length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'
   AND (decision IS NULL OR decision IN ('approved','rejected','cancelled'))
   AND (approval_type IS NULL OR approval_type IN ('break_glass','quarantine_delete','collection','maintenance','rbac'));
 
--- NOTE: request_hash 的格式约束(^[0-9a-f]{64}$)在 SQL 层做防御性首字符校验
--- (length=64 AND GLOB '[0-9a-f]*')。完整 lowercase hex 正则校验由应用层
--- _verify_break_glass_two_person_approval 在运行时执行(参见 services/data_lifecycle.py)。
+-- NOTE: request_hash 的格式约束(^[0-9a-f]{64}$)在 SQL 层做完整十六进制校验
+-- (length=64 AND NOT GLOB '*[^0-9a-f]*'),即字符串中不得包含任何非 [0-9a-f] 字符。
+-- R62 P1-03: 旧实现 GLOB '[0-9a-f]*' 仅校验首字符为十六进制,后 63 字符可任意,
+-- 无法防止 'a$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$' 等非法
+-- hash 通过 CHECK。新实现 NOT GLOB '*[^0-9a-f]*' 保证全部 64 字符均为小写十六进制。
+-- 应用层 _verify_break_glass_two_person_approval 仍做运行时复核(参见 services/data_lifecycle.py)。
 -- R61 P1-01: 不再使用 'r60_invalid_skip' 伪 hash 填充空 hash 行 — 非法行
 -- 直接隔离到 quarantine 表,不混入 strict 表。
 
@@ -128,7 +131,7 @@ SELECT
         WHEN mfa_receipt IS NULL OR length(trim(mfa_receipt)) = 0 THEN 'empty_mfa_receipt'
         WHEN permission IS NULL OR length(trim(permission)) = 0 THEN 'empty_permission'
         WHEN expires_at IS NULL OR length(trim(expires_at)) = 0 THEN 'empty_expires_at'
-        WHEN request_hash IS NULL OR length(request_hash) != 64 OR request_hash NOT GLOB '[0-9a-f]*' THEN 'invalid_request_hash'
+        WHEN request_hash IS NULL OR length(request_hash) != 64 OR request_hash GLOB '*[^0-9a-f]*' THEN 'invalid_request_hash'
         WHEN decision IS NOT NULL AND decision NOT IN ('approved','rejected','cancelled') THEN 'invalid_decision'
         WHEN approval_type IS NOT NULL AND approval_type NOT IN ('break_glass','quarantine_delete','collection','maintenance','rbac') THEN 'invalid_approval_type'
         ELSE 'unknown'
@@ -138,7 +141,7 @@ WHERE NOT (
     mfa_receipt IS NOT NULL AND length(trim(mfa_receipt)) > 0
     AND permission IS NOT NULL AND length(trim(permission)) > 0
     AND expires_at IS NOT NULL AND length(trim(expires_at)) > 0
-    AND request_hash IS NOT NULL AND length(request_hash) = 64 AND request_hash GLOB '[0-9a-f]*'
+    AND request_hash IS NOT NULL AND length(request_hash) = 64 AND request_hash NOT GLOB '*[^0-9a-f]*'
     AND (decision IS NULL OR decision IN ('approved','rejected','cancelled'))
     AND (approval_type IS NULL OR approval_type IN ('break_glass','quarantine_delete','collection','maintenance','rbac'))
 );

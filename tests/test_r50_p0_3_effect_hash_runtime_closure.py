@@ -561,14 +561,16 @@ class TestCrashWindowFaultInjection:
         )
         assert reclaimed is True
 
-        # 验证 attempt 增加(从 1 → 2)
+        # R62 P1-01: 新 record_pending 行为 — pending + 同 hash → 幂等重试,不 increment attempt
+        # 旧代码会在二次 record_pending 时 attempt+1(1→2),新代码保持 attempt=1
+        # (外部副作用重试计数由 outbox_events.attempt_count 负责,不再用 effect_receipts.attempt)
         cursor = await store._db.execute(
             "SELECT attempt FROM effect_receipts "
             "WHERE action_id=? AND effect_type=? AND target=?",
             ("act_crash_tg", "telegram_send", "chat:42"),
         )
         row = await cursor.fetchone()
-        assert row[0] == 2
+        assert row[0] == 1
 
     @pytest.mark.asyncio
     async def test_crash_window_r2_put_kill_before_completed(

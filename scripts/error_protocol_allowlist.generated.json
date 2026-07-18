@@ -1,0 +1,2537 @@
+{
+  "description": "R62 P1-04 generated allowlist (由 generate_error_protocol_allowlist.py 生成)。每条记录对应一处 observability 域违规,包含 file/line/fingerprint/owner/reason/expiry/ticket 字段。复制到 scripts/error_protocol_baseline.json 的 domains.observability.allowlist 字段使用。",
+  "generated_at": "2026-07-18",
+  "total_violations": 281,
+  "allowlist_count": 281,
+  "allowlist": [
+    {
+      "file": "admin/__init__.py",
+      "line": 622,
+      "fingerprint": "f5226ffde97e3bfe6d02ff51a819600cfd236cf0d8841200f00acad8fc994c11",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 971,
+      "fingerprint": "89aab241fe154c8f594bfbc3c2a08952a2c3b03cc8d11b276e00fd805f5c783e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 1303,
+      "fingerprint": "31d4b5f434f6ddd65355b2b8404b854de669425c089e40e6e2d9e568f90e8fe7",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 1525,
+      "fingerprint": "0d4226fad0d11742021ff0da81ecbdf23ca0b51d974906cdfecc9089c45608b9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 453,
+      "fingerprint": "a235a7369c9fc9dfb785421f5df337c9715dbd615caee15a44c8329d3e1cd73b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 604,
+      "fingerprint": "c22acd463fc7d4df31de743aa8b0616954c7f809e393e473ea7ab63cfce36ef9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 178,
+      "fingerprint": "ec6bf769c96e1820523ef72d315ab602c748b38a39f46895adba0a47b3a82d75",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 322,
+      "fingerprint": "6adec0aade1da8fd2456d0cbd77f04961cf805fc67a6e165ad15b657b2765ae0",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/__init__.py",
+      "line": 549,
+      "fingerprint": "f1378c021686399b950fee5fb3c73b2d63855d6530ae47640815b08556a3f7ff",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/sessions.py",
+      "line": 90,
+      "fingerprint": "27360b2fba791e238f7f078679dcd736ef74258282933bba213cf54b14f6e91c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "admin/sessions.py",
+      "line": 505,
+      "fingerprint": "b23ed6a3793b7d37c00139751de47bec08170131b9767668e41b761ecf424235",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/repair_console.py",
+      "line": 292,
+      "fingerprint": "6196edff930add373330c8f0e9a3b9d5bccd518dd357781d3c5fc311620a5a19",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/repair_console.py",
+      "line": 336,
+      "fingerprint": "b6bd209f4cde9158431ef2e53e084a085697b56b3c84351e632cd5e874bc1bc5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/repair_console.py",
+      "line": 576,
+      "fingerprint": "2b62c699d45b228c4ee5fd73a67ea5deb14d3373587b7d63714fc9063c21d287",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/repair_console.py",
+      "line": 660,
+      "fingerprint": "6c2ebc373eed9ca6bba3eebd8283e5edf7952157695bd1a91c790dc11dc7ce03",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/repair_console.py",
+      "line": 1085,
+      "fingerprint": "4916fbcb0d6661d185351c6f860fb2abd67c888b78bf8e0e7c47325dc6b9dd61",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/repair_console.py",
+      "line": 1125,
+      "fingerprint": "02e6fc03250e39178addf5ed4ef7d9c0ed93295295b7a523f2eec4f72d017f8f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/disaster_recovery.py",
+      "line": 508,
+      "fingerprint": "39335fd36a509a26c5a68d20b1c2be8dcebba983d4abafaceb3754eb554d4ced",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/disaster_recovery.py",
+      "line": 520,
+      "fingerprint": "4749da8a495dfba96389413dbd14103f74e85991d9069cd27947276a6d5c1490",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/disaster_recovery.py",
+      "line": 749,
+      "fingerprint": "6d6457810cd0f915055becedb65fa6731666dcffbe5ebe1756ef3fff327327ba",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/disaster_recovery.py",
+      "line": 208,
+      "fingerprint": "ba0eee6e127bdd0321c5adbadba8f6227a4e326acdce748161908132fe12fa60",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/disaster_recovery.py",
+      "line": 879,
+      "fingerprint": "a3a7828e1f8ade5fb069f8a5603a42a69c77955e0c1eedc0c148bbb31139d8ee",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/ru_cost_center.py",
+      "line": 166,
+      "fingerprint": "84514bde9eb0c72d79401a175ec4ca95165c6798f12676051b41f71d4d8b1723",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 97,
+      "fingerprint": "624bd66a4d41dda0dc3da845241e17fc83404b032ac774efea7c9da082c8c1b5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 141,
+      "fingerprint": "21a8245f444b5492c12024614773e71143e48482ad5cde64fb1a089f8d58dc5c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 179,
+      "fingerprint": "5078cadb9a907e0b314c579b35b9bb289070e14d308915634093373ff54d1827",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 279,
+      "fingerprint": "a442c148d35297f69c691f3e0745bc9bcc56ffe89672d89824381e3e3ab06d32",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 346,
+      "fingerprint": "081d87e9db2d4ebe2f6479524a4c8e710c0992544797d64a62a6b36ce8386b51",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 390,
+      "fingerprint": "cd17c26ba790d8e273c17598816780032f3526f47f68c67d76e01b768dab816f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 433,
+      "fingerprint": "c3c92b9d87c64a1bf038c62e707540d6ccb3ebe717a0ddaddfffef95cc1ce718",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 454,
+      "fingerprint": "1545608c2a38a3feaba2b04fa2771d166159a41dfe85e8a840fcbb1775cf9a1f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 548,
+      "fingerprint": "a1853109cd4763ce29b075609fdcffa1a75135d13b217fedf6de1a7b4847817c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 976,
+      "fingerprint": "f506905e3cd1aff566a36b7aad0463e1758736edb6517e0339bff2db5d58a4a7",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/content_reports.py",
+      "line": 1261,
+      "fingerprint": "aa49b923f4c0ab66e16b1deb07e5a4bbe584d687eaf716aa9c1a65e1aec29345",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/migration_runner.py",
+      "line": 596,
+      "fingerprint": "9dbd5401091dfe241e73db7c07783f6b073e52631ab4e07a9777a1cd1855cc73",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/migration_runner.py",
+      "line": 412,
+      "fingerprint": "d23b5e34690dceceda02b042749b5cb7ad0d2ff745530c6c8c0265a9ab2007b2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/migration_runner.py",
+      "line": 444,
+      "fingerprint": "32a9d215d8e3b9c122fae66fccde7a1dc87e23e61628935aca2c68c431c7419b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/task_center.py",
+      "line": 119,
+      "fingerprint": "8ff164e79230698da4a35a7a2629672f8f63ad12821657e694fddbd338aed6e1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/task_center.py",
+      "line": 157,
+      "fingerprint": "ded9d194179edfc59aeac653e847a5441d10a9245a68be8aa1f79e1dbc530a20",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/task_center.py",
+      "line": 192,
+      "fingerprint": "5c6add5bfdfd5fb05c9aa547bc9217743dda81543499f39a0a4fcbcb620378a0",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/task_center.py",
+      "line": 226,
+      "fingerprint": "439cd368afc7f2fe6f15927a35ec9840738132d05ae39cdfd8769db27f584d96",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/task_center.py",
+      "line": 259,
+      "fingerprint": "d2ecac7ef1157b9f9895ccaf75c6a5faa8c511bc2916b4fe7a2ff5defccf46af",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/retention_worker.py",
+      "line": 77,
+      "fingerprint": "e15c64c6fcec796f7121a3d6e23472c5e3623e204d93e5ece214db47118c590e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/retention_worker.py",
+      "line": 142,
+      "fingerprint": "8de8aa7aa5836b8af28c1bad2ac9633d0954674ca669f8fbd7c7dba49db9fd4e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/retention_worker.py",
+      "line": 233,
+      "fingerprint": "ec013df072c98b4da963444b020c74c13e563a327e25d42bad2c85829e49505d",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/i18n.py",
+      "line": 1853,
+      "fingerprint": "38e044f2c876a41eff25d702f2b89e7b473918ae57eae89d8f16cd12887bad66",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/i18n.py",
+      "line": 711,
+      "fingerprint": "ee4e1e0d2a3f98df14e1b36cf7feb1412b542609db51998c4924d1ccec20c5fd",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/i18n.py",
+      "line": 714,
+      "fingerprint": "735e4335299818c4de0a8aac227811574b0e3d36d4c3bfd09ba40837daebf1d8",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 940,
+      "fingerprint": "fff76199c57d8290bb9577f79f358584aadd2273f7837db2f686f5c99dbaa786",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 948,
+      "fingerprint": "f55ae331d51d11c11cb85f543f515258bff1f2cbed3d489df956ddb4547235f4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 957,
+      "fingerprint": "34ef58ad1833cb3e00f8f1e722848f16547dfff969349d3912f2a2c97c153928",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 1313,
+      "fingerprint": "d01af6bcd0df0540c119dc3dead07637902d7bbb101a08d876f57bc63f8119a4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 336,
+      "fingerprint": "4a5a654a4a14b185d3b9169a37fd0743739fbe60c6218d7cca164dcef4f41d59",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 369,
+      "fingerprint": "f327a2e6568fefa47c1b25af7e64d17a9a3a11a6b0c91519466ae8c14b1fba06",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 1473,
+      "fingerprint": "e8b0db45d553e7b23f9ec44ab4d392bea5418019d06b80a6120d5fb60edf096f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 1452,
+      "fingerprint": "d3b38b0219420e7cc9be758661c75f875a4a99ca463381e21d7a68b6d98340ae",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 1465,
+      "fingerprint": "a366598880b93cfb02db73e6e38f331cf0f8ac747be2db8202425a0643fbc5a3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 192,
+      "fingerprint": "1ae5ed592555e70b776fa8e40943214d53ed05c02ab61c6399e51ad2c208da60",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 256,
+      "fingerprint": "adeb457fc4dc8196a513a66d82e2b81054750097e466305a21c4c87622b4934e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/maintenance_mode.py",
+      "line": 531,
+      "fingerprint": "f57f48fbc9c8c4160697975755795fe959e048073ea9c8cbcbcf02e5bb4f3426",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 746,
+      "fingerprint": "880ba11bbde1ccb4053b68387c0b520bb9cdd9eb6606473623ae9264cd75876e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 851,
+      "fingerprint": "a839aee99a0d1a94be58c646c653c2388517b3b7094cca2e1c2dd3d65027b0e4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 181,
+      "fingerprint": "379d9a780b0343d513764fd86b444ccc50b15e10f5d8a3283132a818c8f93d98",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 240,
+      "fingerprint": "496870c893b4717f2f3e03a7eb64d0fb9f016aad8c543e3365b375bfb1880b55",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 287,
+      "fingerprint": "199580a72d123480e03a59877cf812e3f2f00b5313148588cc832040520effb2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 451,
+      "fingerprint": "ca295d0cf23436ec2e63fb582a156b5e0767e010e4ca36dc32305564012ffb50",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 511,
+      "fingerprint": "a741770f1e9c3db88f9e7c47bb7212841c79046cc9dd6d0a454d2770a933536c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/quota_ledger.py",
+      "line": 644,
+      "fingerprint": "a56242dfe53a5a3cfc146d33abc4f6a90b005bf147626970b8cf6607ed3eb229",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/effect_receipts.py",
+      "line": 526,
+      "fingerprint": "10ddf4201e13bebfa3c7fd12173eaaf60723261d081e28d47e77433c13aca334",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/rbac.py",
+      "line": 312,
+      "fingerprint": "78ee1c93326bb37e159698c500ee78c2b47dd02c9cf9d1d79ae5f17e86b50cf1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/rbac.py",
+      "line": 343,
+      "fingerprint": "eefd2b01d1a71d47a665073500cb25b73d25175b4e373b25d5b83724335c565c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/rbac.py",
+      "line": 445,
+      "fingerprint": "ed478f2eb585a54e96d49966b93c4bac0dd5dcc6cd24d12a05dea72dfa4c0777",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/prometheus_exporter.py",
+      "line": 1090,
+      "fingerprint": "40529cc69e4578c26b36801c71c48c5f9030be6abb2c13744bf77a645015dae2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/prometheus_exporter.py",
+      "line": 1119,
+      "fingerprint": "b72e121fa608c045d19bf94dee89ff790bef134dad30f780723bc0aef94f8a95",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/prometheus_exporter.py",
+      "line": 1696,
+      "fingerprint": "aca9b51d94954976f4e1acad824e4a569aa043edf37ffb0d93c7414a268ada9b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/prometheus_exporter.py",
+      "line": 1420,
+      "fingerprint": "a7d9a220f079e2bf26eb05f56b21b4fa2c7c057713714a47b1e3db1cec00c2b2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_restore.py",
+      "line": 564,
+      "fingerprint": "7bed7bba672d29542be93cefd55dc6f315cd59bb1943c284c71327e71eb63964",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_restore.py",
+      "line": 293,
+      "fingerprint": "442920bcbe7dfcf17f7b039416ff1d0da60511af3a238031ab6c9010eb885815",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_restore.py",
+      "line": 376,
+      "fingerprint": "df38842791ef649f6538d895509fc00de43c3d12e226060ce45e0b5c43a85348",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 193,
+      "fingerprint": "2dc3dfcc46332b8f51923971b69242155cb0d23112cb85c9835437fcdfa04539",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 626,
+      "fingerprint": "18877da8e0f8a6541702e165888e1af37666f2f9d5390f588c34e1f7899014d2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 657,
+      "fingerprint": "993927b2c21e9869e1e7a7e44410a6ea43de51a4b61c652917a4f7d600fee1ed",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 172,
+      "fingerprint": "5fa5d3cd4c9a847dc2f24e3a0b6ea56ffd8e7ed78914a22c0db9f1d646bfd5b5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 1364,
+      "fingerprint": "51fd8c04d33d03022bbe4998456db8a1836bb84c23769788b97add8e77cc32f7",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 164,
+      "fingerprint": "79c731477c97480498a59d61317c61083e2728b1c108c02c6d0bdfdaa387267b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 174,
+      "fingerprint": "73c1c1ed3c061be3753251cb2500e269a6a1c2a56ade02e946e5cc533c58e86a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 700,
+      "fingerprint": "f2b0517f7dedb8dc625f9341ea2545f7d76f064879563e39daffbaf3c0cc741b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 705,
+      "fingerprint": "b22f06652c04ee6dc4517904bbc2f4cc3155b268d5c215f8f1042cce9282b7ef",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 1569,
+      "fingerprint": "8587371d3cbcce1d15ec2225b52e194cab93976cde8f8e3cbd86ebdcd2ecb5e1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 1611,
+      "fingerprint": "515de2e726554057a4bead02687c3c15b4d8c225e6e4e3ac92a925a52a1a3581",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 1613,
+      "fingerprint": "4222b29389048836c9fe716ec202b8ce17d0e67e41934f18f1dc7bb92a575c67",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 1789,
+      "fingerprint": "cf33d1a9d6b0d1fe43e10d17be2259ad5dce66c2d2ad9499dd09c0f6db312913",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/relay_instance.py",
+      "line": 1794,
+      "fingerprint": "42871e62771c6dac6c223cb71385e9e713b3c0d803a0e6bf967d648b01666bba",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/crdb_ru_collector.py",
+      "line": 416,
+      "fingerprint": "91fe1f33d1291c9e7efdaaf8119d2cf6be1df243d29b4d1cf6e3e969216d5f04",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/crdb_ru_collector.py",
+      "line": 571,
+      "fingerprint": "b2eee4a5dfa27e3f912e1d19c164b632f672ba979a16dca3171193e84ea9e758",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/crdb_ru_collector.py",
+      "line": 602,
+      "fingerprint": "6286278717b92755ecd09c63cdd97ef659c188ce705968f33694d07173e65c12",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/collections.py",
+      "line": 114,
+      "fingerprint": "dd30693ebac7613e303cba3cc86423cef8c51ea6add07f0b8fa584eaf49d7b37",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/collections.py",
+      "line": 231,
+      "fingerprint": "9389ffdcec8572bcac07be3ed26bb5ef79afa867b4c3ea648ae9d688f2446d22",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/collections.py",
+      "line": 281,
+      "fingerprint": "2299fdb514fe420a57f93af3674c917641b7c0673cf65d0b0b00474d0f567655",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/collections.py",
+      "line": 503,
+      "fingerprint": "a8389a96e6884114451f05e88afb04203077957d4fa7bd29bb46995ba08e074a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/user_repair.py",
+      "line": 69,
+      "fingerprint": "2a5e3689043c1f07fa95dbd087f9fb618a467cb3274fe77671297f01faa6eaf2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/button_flow.py",
+      "line": 252,
+      "fingerprint": "64d29004a2b9582592791c2f9b9c850659ac3da2ce6a8634f3a233f612d7966a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/button_flow.py",
+      "line": 197,
+      "fingerprint": "d2af3b1a3d09d764ec2489bbcdb96653089e5703addefdf0a0e7bbd18806a950",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/button_flow.py",
+      "line": 324,
+      "fingerprint": "1954d77d8679040738dd2799f402bb461b51dab3d9a162a0a6e86f57e126be20",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/button_flow.py",
+      "line": 344,
+      "fingerprint": "65a18670b3e41cb11bad346cf7d7f3d9748aabab5b483385c9dc620e3baf8393",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/button_flow.py",
+      "line": 364,
+      "fingerprint": "598e738562d5f5388a5af2c6025949b95d45293ee367e8866dbf20636804e841",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/button_flow.py",
+      "line": 382,
+      "fingerprint": "81935f77ff70da3c1c3052652bc7c80e243b267681a88c546143a2cd42b31b11",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/notifications.py",
+      "line": 132,
+      "fingerprint": "e2662d171e8fd86f8590d89118d56f5cba9a97a7c5ada50797436b4e5d281f1c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/notifications.py",
+      "line": 171,
+      "fingerprint": "2acc5e90ebcee77a7b84143e374156f8bc04c4d9d0392761b3cfb284357ce82f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/notifications.py",
+      "line": 472,
+      "fingerprint": "35467bc72186d275f789f3c1e0b7a97ca5e627a4b9bc38aac6d19a81d3d73537",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/notifications.py",
+      "line": 509,
+      "fingerprint": "618625e2210530db5c43a55057fbba2ae7349ff0b75c766998bcbcaf54c208f1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/notifications.py",
+      "line": 660,
+      "fingerprint": "8c6977b0baa89789d19acb7246006164e3fb809fd9da7c831ee506c9623e261f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/notifications.py",
+      "line": 917,
+      "fingerprint": "9c58f7220f3471f6ad10fc6ca1679ca38651643eb7eb43b3df603be3b9f5e25c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/notifications.py",
+      "line": 1006,
+      "fingerprint": "747723047c873edb0831647487439076a92ccb17546dd72620f3ca5076273eb9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 336,
+      "fingerprint": "880a45711d86e84befa1b3b38e5def9740e4bbf467124abdf8dd70c3c2b33fb7",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 1514,
+      "fingerprint": "2a633e7c22c659d53aa3238319b545744b8491ab4be6c6f8694bf47e867e549b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 278,
+      "fingerprint": "0d46600708e79b7823b4cc422be588e7b93946b0d5279e92dd9733eccedf0ca1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 293,
+      "fingerprint": "4cf66727e2fb955c36503ae8d3f6e38c3f4aa0314aa75863362a3b8bffbfe5e6",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 306,
+      "fingerprint": "b005968e95e3a197d3c511a8ab12780a13795567150ae663b0ac4d44e9bdb367",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 1406,
+      "fingerprint": "49fe51c1cb59e2609b2408698363f9e24282f4c4997e95fafed052bad9da9c7c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 1132,
+      "fingerprint": "1d738694a3b10130a0eff4ced10908ab2f7ec4d989abb8681e6c18a98b2c006b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/backup_engine.py",
+      "line": 1138,
+      "fingerprint": "8d46743fd2a8d03e2d7cbe2a9bcfb4aeacb46f9d24c710c8eb779a2a1d9065e0",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/entitlements.py",
+      "line": 364,
+      "fingerprint": "07e393a046827071d18b1e20791390db10fa97500a7b92e8e0d0fb886c29f831",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_backup.py",
+      "line": 96,
+      "fingerprint": "25d542e968855d24ec0e8c066356d2ba50f5a563a894f83bc7d4bad407a993a5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_backup.py",
+      "line": 448,
+      "fingerprint": "a9404ffde5515872e54308ad2662745eda1bc192a6b9c488cfe4948b40d2669a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_backup.py",
+      "line": 452,
+      "fingerprint": "1bc43e4c4876b0933edb77b3796a79f2974e52725edbee6b8802cd01349a5cc3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_backup.py",
+      "line": 652,
+      "fingerprint": "aa19f55f56ec40a342b10d66351e3ed197eec2ce2f024067d4a901058e76727d",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/db_backup.py",
+      "line": 643,
+      "fingerprint": "eafa447674b6d38175155cc59fb4ed78c2ef04de802126eda7ded9b3560e185a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/mon/scheduler.py",
+      "line": 42,
+      "fingerprint": "4b622e23feaf09d17b525234c7f75d246008ea29b5b8e20b5d54d9f4a5b92077",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/mon/scheduler.py",
+      "line": 55,
+      "fingerprint": "a54a32a8ec38022bdd37c8826860d8832f78ba9864392f69e8cc67a48568d137",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/mon/scheduler.py",
+      "line": 69,
+      "fingerprint": "c2fc76008ec485da668d76ffb7a5058882a066caabe812e1a55f54300ee7f29c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/mon/scheduler.py",
+      "line": 101,
+      "fingerprint": "6428c28b1f86eb3a98126ba8a7f26a5d7236713db1dff6615f0cf84cbd971519",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/mon/scheduler.py",
+      "line": 492,
+      "fingerprint": "cabe636f6b72dfc4cfe66c8a01fd0228a9d440ac212dd331032cc5658bdc0f11",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/mon/scheduler.py",
+      "line": 762,
+      "fingerprint": "dd96f0c45da0138432b80dd9b89f0cce9efe692802cce4c6649a5ee474ab685c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "services/mon/scheduler.py",
+      "line": 927,
+      "fingerprint": "8edbdb539c1b3a037ec68621f2a20e524755d73bccddc5741d6afca036c2a9ac",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 446,
+      "fingerprint": "733208cf70a2f59757959e6a5ad81f9a8a4c2b91086ce849b7a7be757dd14149",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 2161,
+      "fingerprint": "e4ff53ece93bda4a803b3cdd9479ffd444842e57302c49eec7a9be7d46ef32a5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 2152,
+      "fingerprint": "a3e31c54fb932628e556e9eaab917dba2b3345e2439cd9e2e284bcab04cadc12",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 417,
+      "fingerprint": "77bbc2e2945616a38e38affb62bf4bc9e16d8bba4106716c68eac5c6bbb84380",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 992,
+      "fingerprint": "801b7f4842b9c46d893a461d4cc85b1d48506e83dc09313517f4bd941d81d45f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 2688,
+      "fingerprint": "060f8dcfc636fc5f7de660a64cc53d4fd29d2dcf6ae291ee146bdd30b23440c4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 2700,
+      "fingerprint": "1ea88276d0a388299e7cd6fc0aa09815fa3fced77edfc12da2298a06575dc1d8",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 3189,
+      "fingerprint": "8a10552bf0bc45e5bd29c5b75d802c5bd9b4c123a9320aa87eab5b319c06b7f2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 342,
+      "fingerprint": "1914491514f29ec501307c2fadfbf82ad3fdd372e5485d8e3cda6b7c62b38aa3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 1094,
+      "fingerprint": "d4bbc505c61f983f3ad7c4f484c7c3d48785580f28501983679545c7c607c299",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/idx_bot.py",
+      "line": 2675,
+      "fingerprint": "7ba753b5ad7c21db1807af1d7864c5d77533dcf2e01f35cade82042fd72a68c1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 628,
+      "fingerprint": "47aa355b9e59ce435b0188a6e4023dd9096b1b38ae8ae8bff1d44711efb384f8",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1275,
+      "fingerprint": "e97c2c5c9b1641b9da7e4437d4c7ab71dfa1c26bb3cf9c3a080c7454291b109f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1957,
+      "fingerprint": "b4bcc5290004abd2632ac8107f2af4dfd210b8d1f6469220d481400da61e9967",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 2048,
+      "fingerprint": "2b14a8869eb85e0217543fccdf0206869d6dbea7255356db48bcd742e4cfea82",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 940,
+      "fingerprint": "f2325227b9bf82225fb5c2256e9b1314e7a55946957c9009f04c3773ee7738d8",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 850,
+      "fingerprint": "5049f582ed09d573b04523a9690d2de6b71ce0d8a043c2ab2faeda4f2a35e137",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1756,
+      "fingerprint": "7997e90075b3629abe48494d55a4d36cd0f1e43e2a9efc105343d4b06baf45b5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1791,
+      "fingerprint": "001cea94e13a962b0d9025a95e4ce365f1847b3749d8e2eaa099b43155f2cb47",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1955,
+      "fingerprint": "b23e0b1392198476b33bb02cfc1d220ab24be429694a539c9336ae9ce1d7356c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 476,
+      "fingerprint": "1ae7a2b739388ed36a020dad07e6b4173917bca42a17e65ae06f5502a0e160d1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 2230,
+      "fingerprint": "09d0d5bfcd075741ca656b43747f3f0c1e3fba932f1b941c2c9a745bfe7527eb",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1777,
+      "fingerprint": "9aee5578c4d4ffa1f63cabfe1d31b0d120659ad07b6bf30a5859a1c4f6b32647",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1471,
+      "fingerprint": "7abacd48a8c2b677dfd4a45b350216b259d16d9cf14b008b5a83f25376eab137",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1694,
+      "fingerprint": "c573aed51b48c62cbfe93f7c912f08724eafd1e07b60ebfe91515781b9f8a636",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 203,
+      "fingerprint": "39d9042f3e96b73fdd1dd18bf1f694b3b0e4e18d9b3003cb3c460ec2aaee9363",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 225,
+      "fingerprint": "0d5f90904528cc691f0fef588e96a1b0e9762e058d7d49253075ec0930f0d3e3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 319,
+      "fingerprint": "29f64249bf241a7e54c427c1860375d35f3cd4dd5a8b9e3f751e80fb7ab8eedb",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 693,
+      "fingerprint": "5851e17d8cfe3f6aff3c8e7490d1bc1677f9c9510d39c96186066661dae9894d",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 852,
+      "fingerprint": "b830aceec1c50f48f944359c3e3c4cbab1bcb5ec5d77eaee6299d851f0696fbd",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/dsp_bot.py",
+      "line": 1793,
+      "fingerprint": "2c9ddc6931bbbf53982018dd64aa73aff675790e6340501612a52b82ab6027f9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/mon_bot.py",
+      "line": 452,
+      "fingerprint": "666bb0aef3aa54f5481311c72af9d9d07c302af98afdf45fe6dd44917c85e8ea",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/mon_bot.py",
+      "line": 188,
+      "fingerprint": "21fd16221e9ec30d79319cb11bdba1f3a22dd52e4dba651808e8e1073617d227",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/mon_bot.py",
+      "line": 222,
+      "fingerprint": "017390443770c817cd6209cb85116204a9819766e6ec057d0546865b8c39593f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/mon_bot.py",
+      "line": 308,
+      "fingerprint": "f9f74178f4abe027c71ba233df17e950cf1256512f1ec7b018ebf3d3145ab4f0",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/mon_bot.py",
+      "line": 427,
+      "fingerprint": "cbb7c00a54adc1b1975bf368021d4f56413c8f0cbd633cf3a2aefe6097173341",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/mon_bot.py",
+      "line": 415,
+      "fingerprint": "4f64ae61bfcc17d83e885bf011b08b96d857c4c959bd45b898ae284cb3df20d1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1673,
+      "fingerprint": "64565e44bce975e8a40b6ac2f80914e90c3270d967e00432320781a2a47834f3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1820,
+      "fingerprint": "b581a52208aac13ce017004082f485da50aad4c41b2cce43e5cf82db10777561",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1810,
+      "fingerprint": "4c67674746a353f9a542ad3562315b73f1d887a2cecd9bd143811e07ae89ffb8",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1714,
+      "fingerprint": "a5b3dd9b1b8a2e906921b9d5733cf410aed7574c053bde9fa07b1d0fb5108db2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 2290,
+      "fingerprint": "247b27c3cab621f73cbaf3643bd8ab713a645cd1bd19c7ad377c6d8891b791d4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1217,
+      "fingerprint": "ec928c72b02ff6e38d2b2f2a5c5c2b8560a7dea38624c3ebb73d106d24352306",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1251,
+      "fingerprint": "2cb39c509af26c6d3977e87851bdaca150e72febdc5f1e483c0b5c9515d1fc19",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1753,
+      "fingerprint": "6cc9433c38f8b029e4e2265fe49d3781f317fd114ed446aeafa801ee57d167c8",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 1789,
+      "fingerprint": "63b7283914eb5682e21a9abc03d92901e4636c2b4467ab612dc45252f379cbb3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 2146,
+      "fingerprint": "9fe9d8c47dbd445346917ad03f4b51d1e962fef8eac80ea64f261868d78a1f98",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/up_bot.py",
+      "line": 590,
+      "fingerprint": "0f51ef428c39d56f87daaeab50d56af1cd78f93dfe62a36f6f599acf76bdecfc",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/callback.py",
+      "line": 817,
+      "fingerprint": "4254bf4410f58d8e58032e5f630640e8bf1009886dcacf540dba96aaa22c0d8d",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 64,
+      "fingerprint": "f3b982eab2adfcd6d6af5e7fcf4f4bdc979e43470afd4f339e2015f7cf14a2c7",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 75,
+      "fingerprint": "337108cfe2ff8b514feeaa69047a8c0ec73a47c0fd1350589dcadfaf562b0a0f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 93,
+      "fingerprint": "71e0fbf7dfac71d7a3640747964006a5e8a0e8f9c1066cdd737b4019f71a775c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 387,
+      "fingerprint": "452d29f142c77045410714c13dbbec80d8af79d4437c7d9611ec280d2f7624b0",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 411,
+      "fingerprint": "b73fd52638c9f4a44147c7f7fc9ba20ad6ea5cad56b377149188c1910a71ec7f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 456,
+      "fingerprint": "7ccc4cf74314cb14dffaaeeaeed99a52448d54327d6d9d3b1eecbc74fe9c7983",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 496,
+      "fingerprint": "2f6fdaabeb9347c83743b1303f455d124652c880c50609a4498f12ee045bcb97",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 623,
+      "fingerprint": "a8bd063caeb0bfcbd07f8584e69b56c9fe6acdcf578ee059907a1bcbd852c2dc",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 468,
+      "fingerprint": "28202035172ed1448afbe69651b48a14d149c7298cee4be3c97bffa16fdf5d9a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 520,
+      "fingerprint": "5f1fe158757fede170591a159b8735a38d752901e5da9fa0abb1cdc9bffa0244",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 681,
+      "fingerprint": "4d2419f22bc86bb6cdecb9fc68874c24ea123b58a3837ea2bf93ff5af743679d",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 572,
+      "fingerprint": "412cdec04e42da231496332214dab995234a4f50dbe89c51e7a5cc4432534a0e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 583,
+      "fingerprint": "991a8d45d86bc4c359ed039a0de5780a321b3f902263e473bff884e631f439b5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 592,
+      "fingerprint": "18043b95c480c404e94ca19c6aa30bc015715fc385dfa8bb55984da5882b10c6",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/conversation.py",
+      "line": 710,
+      "fingerprint": "3fb694cbf3b88feb45e23c1a267c25e71ddc41e90b87dd40702a747bd1634417",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/display.py",
+      "line": 251,
+      "fingerprint": "101ee05d99f1e363d4deb19bea83e1d3921c963e8b8f4b3cfba9971a14014a8e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/display.py",
+      "line": 99,
+      "fingerprint": "789b947346089dcb630f3f3ff1f19cf31874eaeaef0e1e819e1ef2c0920c3c7a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "bots/admin_bot/handlers.py",
+      "line": 508,
+      "fingerprint": "fcbe5f830ad7bfe12a3cb592cfdfb39f1f93ece8e153cdfb70e8e0558f9fac2c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache.py",
+      "line": 443,
+      "fingerprint": "aec07c44c07878172c345ec0cc7bf347088df5a67dc683dcac577e06a07b773e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/relay_db.py",
+      "line": 553,
+      "fingerprint": "5b829c22fd06b712a9ebb2a9ce759f095732952ebb8c7171a818af4c74764405",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/dlq_worker.py",
+      "line": 314,
+      "fingerprint": "5a3ec9fda7d48ad8c35ca547a67c02a8ea1d311b9c62bc5481342402ad1d7399",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/unit_of_work.py",
+      "line": 149,
+      "fingerprint": "25a79e9e8f377a128ab91fe2008d8813df6d3db17b4f8157d6e2cb590b1b0e34",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 2334,
+      "fingerprint": "6b67e62aeac689fc0e95212ce426dc3be2a0990c0318aa6c90c72027781c3455",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 2436,
+      "fingerprint": "013630bd0877da0e71295fd7ed6870c7f65e9a5926c4582987e3b196e64b554c",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 2039,
+      "fingerprint": "1b8d050385ec47bffe800d1d3eed7328e2d2fb86c8ca29c276f215349e42a8b1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 2379,
+      "fingerprint": "ab7f56770faa7588d88e9240cba7013ed528d685cb7fa2ff1f49b7ff3a35605b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 1957,
+      "fingerprint": "e635f264fc7344ed630083aaddf4d3609b485aefcd95ce1c52818a7b204f5627",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 2552,
+      "fingerprint": "b35d2e2fe3fcb58c08cbc5a21e3928a8c77b7a4f32665fd1f2493031949baa96",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 2570,
+      "fingerprint": "4d8cb19b6421a23bcc9ff220cadb4296dac178bc7740249f270fc663997f45b6",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 996,
+      "fingerprint": "d40c8f17e6b8823da958711a926cd0a009c968972726c51524627d7dc542ce16",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/session.py",
+      "line": 1043,
+      "fingerprint": "f77afc3c51dd2ffbb5afd7ddf02448b298304165e4aba91121b86b1c2f07f776",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 211,
+      "fingerprint": "e44e385cd9420f69601b81f0949acffd6e6347c00fdf9065a071df0ec0658af9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 889,
+      "fingerprint": "d0cacb6bd9e0d335ec0677391baeaf50079be4f4b4d6c3ad6db3c0577da46d7f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 897,
+      "fingerprint": "df07d54e8d7d2e5291c79c5c26cbd4a1fb2db723671b4b72d7b860deba1c7ce3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 903,
+      "fingerprint": "ad9a7d86da20df05da2600b1109e85902584e7aace41f0e8f5beb6cc062bfaac",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 1917,
+      "fingerprint": "c030b999078b6e1c628ff52aa63a7b6344da72ac2b9907d9a119acc7808a7a68",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 6722,
+      "fingerprint": "4139bae1f427e6a16ac5ab9e9f028cfc6b1d4aa1e2042f936ed9a278bfb86477",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 975,
+      "fingerprint": "bd0109cd099ad7a94d71c2bba0a37f9c3adf13491f5742c3eff4bafa69d2da38",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2978,
+      "fingerprint": "9b3f58da2dbb50ec1578d241f0c203a9d3ee7a45dd9790b35d0050e56f387ce5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 8075,
+      "fingerprint": "9480d8a96cfab6b49bd811afb66e72defa08fb07ee886d06cdac72933990ca87",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 1670,
+      "fingerprint": "a3525e184edccf69fd3180447436131f7a1c62933a9a7ee40cf897ba361e0cb9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 1976,
+      "fingerprint": "e4aaadc9b8388579636e6a288884331395a9f78a1860a8a2ca6000d6ae7c1fad",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2190,
+      "fingerprint": "a476ca5f9f0dbae455c0cea66b9ae556c7ebf38d5463bf1314742522951eeda4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 7820,
+      "fingerprint": "230d93f17232f754b02bc1335c89f41ef04b883924f365b6dcb851650a244e90",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 3099,
+      "fingerprint": "253f0510bdc2b48d5a21fbfe48efccd95f64fa8e6e21b67571f0315e37bcfc51",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2521,
+      "fingerprint": "ec653139eb2a551cfbae8706d925410acc9b8d0f5ffb89511156dfe0c827ce42",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2526,
+      "fingerprint": "46b5944e928ff616edc3aaf3279ad7a0de0900bf9d761ca015df9d21122230ea",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2534,
+      "fingerprint": "d9112eff48ddde8675927bedebdc31638d35693730e83da689311e4f62bae1fd",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2450,
+      "fingerprint": "f5ccc53834fcda9c234feef3e7b56e689c5bcff38ef288a4bdddae1bb0fbf210",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2572,
+      "fingerprint": "fe00dd3ea6c5be60fbcd7d646b97f8a10ff05dd2ae8534f3fcb7f33371feb2d4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2604,
+      "fingerprint": "398dba7ce917d760e18ac12809b35dccfb93f3b810d44162cc3696c4c9dcac2a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2635,
+      "fingerprint": "e1ffa10c07302a90476ca1ffa6bda30d004a972c97f29dcd031cce86c5a11bae",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2658,
+      "fingerprint": "c445fd0dd50ba35adcdc44881a8db1733c37b1f7208d6c8e5786374fee76b815",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2684,
+      "fingerprint": "bbc2611b35be8a1f16b9f80d3ed8a5509f05010beda51a36140502b21f3e2772",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2722,
+      "fingerprint": "5cd1ad07c74d592a72e6252f63c906538dcb38e1ddf63d1ca881f14f8fcda6a7",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2736,
+      "fingerprint": "b20065d4cf94348ec3078411fbd390bc42dbf899ff8897c137cdb9f44570aca7",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2821,
+      "fingerprint": "ba9b5d3359adfe8c26c3294b8e21216f1ab1833afd2c289a9828f44a192455f9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2855,
+      "fingerprint": "81f64021030f22b2f141d60f3385253f34f581721f99b9f0283a16cb47f934b8",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 2987,
+      "fingerprint": "e9c680fcf42390b9121370bdd910a006fedc0183d0ebe5cc06192983383ac164",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 3040,
+      "fingerprint": "93788ee98d01d979ba2ad93a6da154e1747fc04ea201371254775987fd53f8d1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 3250,
+      "fingerprint": "14ff948b8ab63d21549f21f30b6de8f9086b1ecfd673086f5bd40b73beb9f36f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 3297,
+      "fingerprint": "a6ba8861c5b7aa1488eb94939f589e980181df180888f4a1ab15e30ad3937b16",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4569,
+      "fingerprint": "7cbd863a9c917ff1273b1594265daa2588995a42b82408acc6cfcab2a5adfbc2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 5241,
+      "fingerprint": "29a97efb5469ae7cf0c7d0b82b144b3632dcafcd35b1e6daf0cefee01e162214",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 5937,
+      "fingerprint": "644ef4a231aa16f0e9de947710f0b3da4105a1142e0017c342bbcf05f41a2c33",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 6584,
+      "fingerprint": "bc19ca56540004c9ae8fc81878483f306b9172d69b80b91687a5bc91bfb1f98b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 7276,
+      "fingerprint": "a039b4095020973daeb8b45175b9f04afa5fd844967c934d1d2a41a2da974d8a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 7298,
+      "fingerprint": "7beb3d680c44e17650006dde7e5769cee08c080465ad28b5286c458ae727ea74",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 7885,
+      "fingerprint": "fa2ee8f2d079f2052d739c916ecec68a4300685c74d9ce27468948f12349351b",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 8046,
+      "fingerprint": "e75531df86829c108d48e7508c17594b8c70a4b19b0efb93e8c4059ee6bac4ad",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 8088,
+      "fingerprint": "f9e252a18f2a375bfdb3655760a2947320f985e795f866bc125701af9484e321",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 8110,
+      "fingerprint": "452979dbb0f1ceacc2a80fcafa45f5553fa15d35a8904c2f49746f7d25820721",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 8205,
+      "fingerprint": "540acba2b01443defe997f6604746174582f800331b686534e0d7cb08d687f1a",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 8262,
+      "fingerprint": "7b7d38f5b2742b7453b511b8e18219c22166c2cf09676e3abbf92d2ee3ac00f0",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 8363,
+      "fingerprint": "5d5972a30dd635e5a9dff8065449796771dcc4182d9e5642245e8f4c2f618221",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 3706,
+      "fingerprint": "bb7d87ebe44367d308caca36e6c0a7f03fd2c9702dec5f8933c9048b88c7b717",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 3968,
+      "fingerprint": "90ca06ccc28b90058aa0050815154ee6d0c07b610ef40af1677d71abd18abd16",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 3998,
+      "fingerprint": "6a8bb3a8f123edd3366324b7ab53315e28702544551a2915de00a167e206d1cf",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4030,
+      "fingerprint": "a9112ff9c140e11fd09b0c865fe842b491d2bd33344e647da3e71b88cd01392e",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4054,
+      "fingerprint": "bb689d63c0205f755a6c9fb9aa2daf3717f3eec1a05e680dd686f92da9a34d58",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4167,
+      "fingerprint": "5516b99a06feabbb3687df33e71ff1b0dac8b26fceaf809e70c757f59ff53bd1",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4189,
+      "fingerprint": "6d5e985786d42042155b8b6df418bcbd923a8baf4e23a5e1cb252cc00f070018",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4238,
+      "fingerprint": "18f3a788b4ec649797b4fab1cedf6366d47c4f6f372c52adc11580a57af1e307",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4274,
+      "fingerprint": "7d81ac4a13bbfc6bd70c5c22347990c674ccfdc750aed992373f1ffdef7c7259",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4302,
+      "fingerprint": "b2dbd0f6c21c73c73600dfdb7d3e8a6bf07db2a57208d71bdbf5dfe1b7089732",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4346,
+      "fingerprint": "c705d975ad6e26e5de7649422c69f408093466890a61aadd43ecceb1c7072b7f",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4616,
+      "fingerprint": "19bbcea4ceada5de554bd0cd4c23bafffd2a680720909c216b91dbd9bfe807c5",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4640,
+      "fingerprint": "65141f06f1d01fc918ba63e6cb6660d6338c078aec384f48aa888a8ee7f1f825",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4704,
+      "fingerprint": "0d310d4ba0041c1ac79c15d96f5e1310b484136230b885f315f1203fe4690fe4",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4754,
+      "fingerprint": "f2c6a9c1fbba21e37689e38653bc8361c0f52ac73f870237f9c99e541ddddce3",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4777,
+      "fingerprint": "7aa66ef658010dea0ff52b592a97accc32bab438e82579b5aa5ea252a65ab630",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4800,
+      "fingerprint": "21d7d7abacb6a4958af899e388eeb293cba27e7bf403ba0b2e62f972fa795c6d",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4834,
+      "fingerprint": "d07b49a9c1e0b6b824876d83ec287dce71de45d9ad37bab1956fa5756c9f3e15",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 4943,
+      "fingerprint": "24d08c338faecd55a9e8857bbe4829c82f83a9c3f4de5d9f2c825635c35c0de9",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 5035,
+      "fingerprint": "abc45b98b63c55099d12cf8d9f26da3bb9b982c0d1ec09c69d1f3777857d7207",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 5822,
+      "fingerprint": "3a8d1da7344a54da14843e9227e5c956add1587bd8a9586b7b0bbda91e4e6520",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    },
+    {
+      "file": "database/cache_store.py",
+      "line": 5855,
+      "fingerprint": "39e8ef6220145d9b9526c84dfb54a89b791322da0c423de85c275ebd786a8bb2",
+      "owner": "maxiuquan",
+      "reason": "R62 observability debt - pending refactor",
+      "expiry": "2026-09-30",
+      "ticket": "R62-P1-04"
+    }
+  ]
+}

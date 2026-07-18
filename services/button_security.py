@@ -516,3 +516,141 @@ async def verify_button_token(
     except (ValueError, IndexError) as e:
         logger.debug(f"[button_security] callback_data 解析失败: {e}")
         return False, "", ""
+
+
+# ── R62 P0-04: handle 短 ID 模式(绕过 Telegram 64 字节限制)───────
+
+
+# handle_id 字节数(secrets.token_urlsafe(8) → ~11 字符)
+# callback_data 总长度 = "report:" + action + ":" + handle_id ≈ 18~25 字符,
+# 远低于 Telegram 64 字节限制
+HANDLE_ID_BYTES: int = 8
+
+
+async def sign_button_token_with_handle(
+    principal_id: int,
+    action: str,
+    payload: str = "",
+    expires_at: Optional[_dt.datetime] = None,
+    ttl: int = 3600,
+) -> str:
+    """R62 P0-04: 生成签名 token 并以短 handle_id 引用(绕过 64 字节限制)。
+
+    Telegram callback_data 有 64 字节限制,而 6 段签名 token
+    (``{principal_id}:{action}:{payload}:{expire_ts}:{nonce}:{signature}``)
+    长度通常 > 100 字符(尤其 payload 含 file_code/uid 等业务参数时)。
+    本函数:
+        1. 调用 ``sign_button_token_with_nonce`` 生成完整签名 token(持久化 nonce)
+        2. 生成短 handle_id(``secrets.token_urlsafe(8)``,~11 字符)
+        3. 持久化 (handle_id → token) 到 ``button_tokens`` 表
+        4. 返回 handle_id(调用方将其拼入 callback_data,如 ``f"report:{handle_id}"``)
+
+    handler 端调用 ``verify_button_token_by_handle(handle_id, user.id)`` 验签:
+        - 通过 handle_id 查找完整 token
+        - 调用 ``verify_button_token`` 验证签名 + 原子消费 nonce(防重放)
+
+    安全保证:
+        - nonce 仍由 ``callback_nonces`` 表原子消费(一次性)
+        - 即使 handle_id 被多次读取(button_tokens 表无消费语义),
+          verify_button_token 内的 nonce 原子消费保证一次性使用
+        - handle_id 不可伪造(secrets.token_urlsafe 128 bit 熵)
+
+    Args:
+        principal_id: 主体 ID(管理员 user_id)
+        action: 动作标识(如 "report" / "restore" / "delete_file")
+        payload: 附加数据(如 "ban|12345|67890|dsp")
+        expires_at: 显式过期时间(优先于 ttl)
+        ttl: 有效期(秒,默认 1 小时)
+
+    Returns:
+        handle_id 字符串(短,适合作为 callback_data 一部分)
+
+    Raises:
+        RuntimeError: token 生成失败或持久化失败
+    """
+    # 1. 生成完整签名 token(含 nonce + signature,持久化 nonce)
+    token = await sign_button_token_with_nonce(
+        principal_id=principal_id,
+        action=action,
+        payload=payload,
+        expires_at=expires_at,
+        ttl=ttl,
+    )
+
+    # 2. 生成短 handle_id(128 bit 熵)
+    handle_id = secrets.token_urlsafe(HANDLE_ID_BYTES)  # ~11 字符
+
+    # 3. 持久化 (handle_id → token) 映射
+    from database import cache_store as _cs
+    store = _cs.get_cache_store()
+    ok = await store.button_token_store(
+        handle_id=handle_id,
+        token=token,
+        principal_id=principal_id,
+        action=action,
+    )
+    if not ok:
+        raise RuntimeError(
+            _i18n_t('services.button_security.s2', action=action, principal_id=principal_id)
+        )
+
+    # 4. 返回 handle_id(调用方拼接 callback_data)
+    return handle_id
+
+
+async def verify_button_token_by_handle(
+    handle_id: str,
+    current_user_id: int,
+    store=None,
+) -> Tuple[bool, str, str]:
+    """R62 P0-04: 通过 handle_id 查找并验证签名 token + 原子消费 nonce。
+
+    流程:
+        1. 通过 handle_id 从 ``button_tokens`` 表查找完整 token
+        2. 调用 ``verify_button_token`` 验证签名 + 原子消费 nonce
+        3. 返回 (valid, action, payload)
+
+    安全保证:
+        - nonce 原子消费(同一 handle_id 第一次调用成功,后续全部拒绝)
+        - 签名验证(防伪造)
+        - user_id 绑定(防跨用户使用 handle_id)
+        - 过期检查(expire_ts)
+
+    Args:
+        handle_id: 短 handle_id(callback_data 中携带)
+        current_user_id: 当前用户 ID(必须匹配签名时的 principal_id)
+        store: 可选 CacheStore 实例(测试注入)
+
+    Returns:
+        (valid, action, payload): valid=True 时 action/payload 可用;
+        valid=False 时 action/payload 为空字符串
+    """
+    if store is None:
+        from database import cache_store as _cs
+        store = _cs.get_cache_store()
+
+    # 1. 通过 handle_id 查找完整 token
+    token = await store.button_token_lookup(handle_id)
+    if not token:
+        logger.warning(
+            f"[button_security] R62 P0-04: handle_id={handle_id} "
+            f"不存在或已被清理"
+        )
+        return False, "", ""
+
+    # 2. 验证签名 + 原子消费 nonce(防重放)
+    valid, action, payload = await verify_button_token(
+        token, current_user_id, store=store,
+    )
+
+    # 3. 验签成功后标记 handle 已消费(便于审计/清理;失败时不标记,
+    #    允许重试 — 但 nonce 已消费时 verify_button_token 会拒绝)
+    if valid:
+        try:
+            await store.button_token_mark_consumed(handle_id)
+        except Exception as e:
+            logger.debug(
+                f"[button_security] R62 P0-04: 标记 handle 已消费失败(不阻塞): {e}"
+            )
+
+    return valid, action, payload

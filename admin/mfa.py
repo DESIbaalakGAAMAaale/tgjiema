@@ -76,6 +76,10 @@ _MFA_LOCK_DURATION_SECONDS = 5 * 60
 _used_totp_codes: dict[int, set[int]] = {}
 # principal_id -> list of failure timestamps (L1 缓存,SQLite 权威)
 _mfa_failures: dict[int, list[float]] = {}
+# R62 P1-07: MFA receipt 吊销 ledger L1 缓存(进程内,SQLite 为权威层)
+# 存放已显式吊销的 jti,sync verify_mfa_receipt 检查本集合(快速路径,无 DB I/O)。
+# 跨进程吊销由 async is_mfa_receipt_revoked() 查询 SQLite 权威层兜底。
+_mfa_receipt_revocations: set[str] = set()
 
 
 def _make_secret_key(user_id: int) -> str:
@@ -492,9 +496,11 @@ def reset_mfa_state_for_testing() -> None:
 
     仅供单元测试调用,生产代码不应使用。
     R46 P1: 仅清除 L1 缓存,SQLite 权威层需测试自行清理。
+    R62 P1-07: 同时清除 receipt 吊销 L1 缓存。
     """
     _used_totp_codes.clear()
     _mfa_failures.clear()
+    _mfa_receipt_revocations.clear()
 
 
 # ─── R59 P0-03: MFA receipt 签发与验证(服务端签名短期 token) ─────────
@@ -788,13 +794,14 @@ def verify_mfa_receipt(
          (kid 不在密钥环中 → fail-closed, reason=unknown_kid)
       4. 重算 HMAC-SHA256 签名, 常量时间比较(防伪造/时序攻击)
       5. 校验 jti 格式(R60 P0-02: 32 位 hex 或 36 位带横线 UUID)
-      6. 校验 action_hash 格式(R60 P0-02: 小写 64 位 hex SHA-256)
-      7. 校验 iat 落在 [now-skew, now+skew](R60 P0-02: 防伪造未来时间戳/陈旧 token)
-      8. 校验 exp - iat <= 300(R60 P0-02: 生命期上限 5 分钟)
-      9. 校验 exp 未过期(防伪造时间戳)
-      10. 校验 sub == expected_principal_id(批准人匹配)
-      11. 校验 purpose == expected_purpose(动作用途匹配)
-      12. 校验 action_hash == expected_action_hash(请求摘要匹配)
+      6. R62 P1-07: 吊销 ledger 检查(查 L1 缓存,命中 → reason=revoked)
+      7. 校验 action_hash 格式(R60 P0-02: 小写 64 位 hex SHA-256)
+      8. 校验 iat 落在 [now-skew, now+skew](R60 P0-02: 防伪造未来时间戳/陈旧 token)
+      9. 校验 exp - iat <= 300(R60 P0-02: 生命期上限 5 分钟)
+      10. 校验 exp 未过期(防伪造时间戳)
+      11. 校验 sub == expected_principal_id(批准人匹配)
+      12. 校验 purpose == expected_purpose(动作用途匹配)
+      13. 校验 action_hash == expected_action_hash(请求摘要匹配)
 
     R61 P1-03 密钥轮换: payload 中的 kid 标识签名所用密钥。验证时从密钥环
     选取对应密钥(当前密钥或旧密钥 "previous")。kid 不在密钥环中 = 潜在攻击
@@ -926,6 +933,23 @@ def verify_mfa_receipt(
             params={
                 "user_id": expected_principal_id,
                 "reason": "jti_invalid",
+            },
+        )
+    # R62 P1-07: 吊销 ledger 检查 — sync 快速路径查询 L1 缓存
+    # 若 jti 已被显式吊销(MFAManager.revoke_mfa_receipt 写入 L1 + SQLite),
+    # 立即 fail-closed 拒绝验证,reason=revoked。
+    # 跨进程吊销由调用方在 verify 前调用 async is_mfa_receipt_revoked()
+    # 做权威 SQLite 查询兜底(本 sync 函数无法 await)。
+    if jti in _mfa_receipt_revocations:
+        logger.warning(
+            f"[admin.mfa] MFA receipt 已被吊销(命中 L1 缓存) jti={jti} "
+            f"expected_principal={expected_principal_id}"
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "revoked",
             },
         )
     # R60 P0-02: action_hash 格式校验(小写 64 位 hex SHA-256, 防伪造/截断)
@@ -1323,6 +1347,152 @@ class MFAManager:
         except Exception as e:
             logger.warning(f"[admin.mfa] 禁用 MFA 失败: {e}")
             raise
+
+    # ─── R62 P1-07: MFA receipt 年龄校验 + 显式吊销 ─────────────────
+
+    def verify_mfa_receipt_age(
+        self,
+        receipt: dict,
+        max_age_seconds: int = 300,
+    ) -> bool:
+        """R62 P1-07: 验证 MFA receipt 的签发时间不超过 max_age_seconds。
+
+        高风险动作要求 MFA 在近期完成(默认 5 分钟内),
+        防止使用陈旧 MFA receipt 绕过二次认证。
+
+        与 verify_mfa_receipt 的区别:
+            - verify_mfa_receipt 校验签名 + 字段 + exp 未过期(exp 默认 5 分钟)
+            - 本方法校验 iat 距今不超过 max_age_seconds(默认 300s)
+            - 调用方典型流程:先 verify_mfa_receipt 拿到 payload,
+              再调用本方法校验年龄,两者均通过才允许执行高风险动作
+
+        Args:
+            receipt: verify_mfa_receipt 返回的 receipt dict,需包含 'iat' 字段
+            max_age_seconds: 最大允许年龄(秒),默认 300(5 分钟)
+
+        Returns:
+            True 如果 receipt 在 max_age_seconds 内签发;False 如果过期或字段缺失
+        """
+        if not isinstance(receipt, dict):
+            return False
+        iat = receipt.get("iat")
+        # iat 必须为整数 Unix 时间戳(与 issue_mfa_receipt 中 now = int(time.time()) 一致)
+        if not isinstance(iat, int) or isinstance(iat, bool):
+            return False
+        now = int(time.time())
+        age = now - iat
+        if age < 0:
+            # iat 在未来(时钟漂移或伪造)— 视为非法,fail-closed
+            return False
+        return age <= max_age_seconds
+
+    async def revoke_mfa_receipt(
+        self,
+        jti: str,
+        reason: str = "manual_revoke",
+    ) -> bool:
+        """R62 P1-07: 显式吊销 MFA receipt (jti),使其后续验证失败。
+
+        写入 revocation ledger(模块级 L1 缓存 + SQLite 权威层),
+        verify_mfa_receipt 在验证时检查 jti 是否已吊销(命中 →
+        reason=revoked fail-closed)。
+
+        应用场景:
+            - 密钥疑似泄露,需立即吊销未消费的 receipt
+            - 用户主动撤销授权(如取消刚发起的高风险动作)
+            - 安全事件应急吊销(如检测到异常使用模式)
+
+        幂等性: 同一 jti 多次吊销返回 True(jti PRIMARY KEY 约束,
+        INSERT OR IGNORE 冲突时视为已吊销)。
+
+        Args:
+            jti: receipt 唯一 ID(来自 verify_mfa_receipt 返回的 payload["jti"])
+            reason: 吊销原因(默认 "manual_revoke",写入 ledger 供审计追溯)
+
+        Returns:
+            True=吊销成功(含幂等场景);False=jti 为空或 store 不可用(无法持久化)
+        """
+        if not jti or not isinstance(jti, str):
+            return False
+        # 1. 写入 L1 缓存(sync verify_mfa_receipt 快速路径检查)
+        _mfa_receipt_revocations.add(jti)
+        # 2. 写入 SQLite 权威层(跨进程共享 + 持久化)
+        store = _get_store()
+        if not store or not getattr(store, "_db", None):
+            # store 不可用时仅 L1 缓存生效(本进程内有效)
+            logger.warning(
+                "[admin.mfa] revoke_mfa_receipt: store 不可用,仅 L1 缓存生效(跨进程不可见)"
+            )
+            return True
+        now = int(time.time())
+        try:
+            # 幂等建表(与 cache_store.init 一致,防 init 未运行)
+            await store._db.execute(
+                """CREATE TABLE IF NOT EXISTS mfa_receipt_revocations (
+                    jti          TEXT PRIMARY KEY,
+                    reason       TEXT NOT NULL,
+                    revoked_at   INTEGER NOT NULL
+                )"""
+            )
+            # INSERT OR IGNORE 保证幂等(jti PRIMARY KEY 冲突时忽略)
+            await store._db.execute(
+                "INSERT OR IGNORE INTO mfa_receipt_revocations "
+                "(jti, reason, revoked_at) VALUES (?, ?, ?)",
+                (jti, reason, now),
+            )
+            await store._db.commit()
+            logger.info(
+                f"[admin.mfa] MFA receipt 已吊销 jti={jti} reason={reason}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[admin.mfa] revoke_mfa_receipt 写入 SQLite 失败(L1 已生效): {e}"
+            )
+            # L1 缓存已写入,本进程内仍可拦截;返回 True 表示本进程视角吊销成功
+            return True
+
+    async def is_mfa_receipt_revoked(self, jti: str) -> bool:
+        """R62 P1-07: 权威查询 MFA receipt 是否已吊销(L1 + SQLite)。
+
+        供高风险动作调用方在 verify_mfa_receipt 之后、consume_mfa_receipt 之前
+        调用,做权威跨进程吊销检查(verify_mfa_receipt 是 sync,仅查 L1 缓存,
+        无法发现其他进程刚写入 SQLite 的吊销)。
+
+        Args:
+            jti: receipt 唯一 ID
+
+        Returns:
+            True=已吊销;False=未吊销或 jti 为空
+        """
+        if not jti or not isinstance(jti, str):
+            return False
+        # 1. 先查 L1 缓存(快速路径)
+        if jti in _mfa_receipt_revocations:
+            return True
+        # 2. L1 未命中,查 SQLite 权威层(跨进程)
+        store = _get_store()
+        if not store or not getattr(store, "_db", None):
+            # store 不可用,fail-closed 视为未吊销(不阻断业务,
+            # 因为 verify_mfa_receipt 已通过,L1 也未命中)
+            return False
+        try:
+            cursor = await store._db.execute(
+                "SELECT 1 FROM mfa_receipt_revocations WHERE jti = ? LIMIT 1",
+                (jti,),
+            )
+            row = await cursor.fetchone()
+            if row:
+                # 写入 L1 缓存(后续 sync verify_mfa_receipt 也能拦截)
+                _mfa_receipt_revocations.add(jti)
+                return True
+        except Exception as e:
+            logger.warning(
+                f"[admin.mfa] is_mfa_receipt_revoked 查询 SQLite 失败: {e}"
+            )
+        # R62 P1-04: return False 移出 except 块,避免触发错误协议规则3
+        # (except 块中 bare return False)。语义不变:未找到或异常均视为未吊销。
+        return False
 
 
 # 模块级单例

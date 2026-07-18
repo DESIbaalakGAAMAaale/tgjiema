@@ -422,7 +422,7 @@ class TestRestoreDelegation:
 
     @pytest.mark.asyncio
     async def test_restore_delegates_to_db_restore(self, monkeypatch):
-        """restore_from_backup 下载备份后委托给 restore_from_backup_data。"""
+        """restore_from_backup 下载备份后委托给 validate_and_restore_backup_strict。"""
         _ensure_backup_module_importable()
         from services import db_backup
 
@@ -440,25 +440,25 @@ class TestRestoreDelegation:
         monkeypatch.setattr(db_backup, "r2_storage", mock_r2)
         monkeypatch.setattr(db_backup, "configure_r2_dynamic", AsyncMock())
 
-        # Mock restore_from_backup_data(验证委托调用)
+        # R62 P0-01: db_backup.restore_from_backup 现路由通过
+        # validate_and_restore_backup_strict()(严格三段式验证入口)。
+        # 测试 mock 该入口验证委托调用(不再直接 mock _restore_from_backup_data,
+        # 因为严格验证发生在 _restore_from_backup_data 之前,会先失败)。
         mock_restore_result = {"restored": {"users": 1}, "skipped": [], "errors": []}
-        mock_restore_fn = AsyncMock(return_value=mock_restore_result)
+        mock_strict_fn = AsyncMock(return_value=mock_restore_result)
+        monkeypatch.setattr(
+            "services.backup_dr_validate.validate_and_restore_backup_strict",
+            mock_strict_fn,
+        )
 
-        # 在 sys.modules 中注入 mock 的 db_restore 模块
-        # R61 P0-03: db_backup.restore_from_backup 现路由通过 validate_and_restore_backup_strict(),
-        # 后者延迟导入 services.db_restore._restore_from_backup_data(私有写入器)。
-        mock_db_restore = types.ModuleType("services.db_restore")
-        mock_db_restore._restore_from_backup_data = mock_restore_fn
-        monkeypatch.setitem(sys.modules, "services.db_restore", mock_db_restore)
-
-        # 调用 restore_from_backup
+        # 调用 restore_from_backup(用非旧格式 key 避开旧格式检测)
         result = await db_backup.restore_from_backup("db_backup/test.json", merge=False)
 
         # 验证委托被调用
-        assert mock_restore_fn.called
+        assert mock_strict_fn.called
         assert result == mock_restore_result
         # 验证传入的参数
-        call_args = mock_restore_fn.call_args
+        call_args = mock_strict_fn.call_args
         assert call_args.kwargs["merge"] is False
 
     @pytest.mark.asyncio
@@ -475,9 +475,22 @@ class TestRestoreDelegation:
             }
         }
 
-        # R61 P0-03: _restore_from_backup_data 强制 _capability(不可伪造的 _RestoreCapability)。
+        # R61 P0-03 / R62 P0-02: _restore_from_backup_data 强制 _capability
+        # (不可伪造的 _RestoreCapability)且接收 VerifiedBackupPayload(非 raw dict)。
         # 测试通过模块私有 sentinel 构造合法令牌(生产代码无法外部构造)。
-        from services.backup_dr_validate import _RestoreCapability, _RESTORE_SENTINEL
+        from services.backup_dr_validate import (
+            _RestoreCapability,
+            _RESTORE_SENTINEL,
+            VerifiedBackupPayload,
+        )
+        verified_payload = VerifiedBackupPayload(
+            backup_id="test_backup_id",
+            tables=backup_data.get("tables", {}),
+            manifest_sha256="a" * 64,
+            plaintext_sha256="c" * 64,
+            schema_fingerprint="test_schema_v1",
+            payload=backup_data,
+        )
         _cap = _RestoreCapability(
             _RESTORE_SENTINEL,
             backup_id="test_backup_id",
@@ -486,6 +499,9 @@ class TestRestoreDelegation:
             ciphertext_sha256="b" * 64,
             plaintext_sha256="c" * 64,
             encryption_key_id="test_key_id",
+            issuer="test_r35_batch3",
+            schema_fingerprint="test_schema_v1",
+            payload_digest=verified_payload.payload_digest,
         )
 
         # Mock _restore_crdb_tables 和 _restore_sqlite_tables_to_db
@@ -496,7 +512,7 @@ class TestRestoreDelegation:
         with patch("services.db_restore._restore_crdb_tables", mock_crdb), \
              patch("services.db_restore._restore_sqlite_tables_to_db", mock_sqlite):
             result = await _restore_from_backup_data(
-                backup_data, _capability=_cap, merge=False,
+                verified_payload, _capability=_cap, merge=False,
             )
 
         # CRDB 表(users)被传给 _restore_crdb_tables
@@ -522,9 +538,21 @@ class TestRestoreDelegation:
                 "nonexistent_table": [{"id": 1}],
             }
         }
-        # R61 P0-03: _restore_from_backup_data 强制 _capability(不可伪造的 _RestoreCapability)。
-        # 测试通过模块私有 sentinel 构造合法令牌(生产代码无法外部构造)。
-        from services.backup_dr_validate import _RestoreCapability, _RESTORE_SENTINEL
+        # R61 P0-03 / R62 P0-02: _restore_from_backup_data 强制 _capability
+        # (不可伪造的 _RestoreCapability)且接收 VerifiedBackupPayload(非 raw dict)。
+        from services.backup_dr_validate import (
+            _RestoreCapability,
+            _RESTORE_SENTINEL,
+            VerifiedBackupPayload,
+        )
+        verified_payload = VerifiedBackupPayload(
+            backup_id="test_backup_id",
+            tables=backup_data.get("tables", {}),
+            manifest_sha256="a" * 64,
+            plaintext_sha256="c" * 64,
+            schema_fingerprint="test_schema_v1",
+            payload=backup_data,
+        )
         _cap = _RestoreCapability(
             _RESTORE_SENTINEL,
             backup_id="test_backup_id",
@@ -533,10 +561,13 @@ class TestRestoreDelegation:
             ciphertext_sha256="b" * 64,
             plaintext_sha256="c" * 64,
             encryption_key_id="test_key_id",
+            issuer="test_r35_batch3",
+            schema_fingerprint="test_schema_v1",
+            payload_digest=verified_payload.payload_digest,
         )
 
         result = await _restore_from_backup_data(
-            backup_data, _capability=_cap, merge=False,
+            verified_payload, _capability=_cap, merge=False,
         )
 
         assert "nonexistent_table" in result["skipped"]

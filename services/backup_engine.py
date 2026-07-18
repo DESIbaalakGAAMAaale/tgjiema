@@ -1446,28 +1446,28 @@ class BackupEngine:
         # 5. 写入隔离环境(staging 模式仅校验,不写库;production 委托 db_restore)
         if target == "production":
             try:
-                # R61 P0-03: 路由通过 validate_and_restore_backup_strict() 公共入口
-                # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
+                # R61 P0-03 / R62 P0-01: 路由通过 _restore_preverified_payload() 内部辅助
+                # (该入口由 _RESTORE_SENTINEL 保护,构造不可伪造的 _RestoreCapability 并
+                # 调用私有 _restore_from_backup_data)。
                 # BackupEngine._restore_internal 已完成 manifest 校验 + ciphertext_sha256 +
-                # 解密 + plaintext_sha256 校验,通过 skip_strict_validation=True +
-                # *_override 提供信任链元数据(避免重复下载/解密)。
-                from services.backup_dr_validate import validate_and_restore_backup_strict
-                await validate_and_restore_backup_strict(
+                # 解密 + plaintext_sha256 校验,通过 _restore_preverified_payload 复用其
+                # 验证结果(避免重复下载/解密)。
+                # R62 P0-01: 不再使用 skip_strict_validation=True + *_override(已移除);
+                # 改用 _restore_preverified_payload,要求提供 schema_fingerprint + issuer
+                # + 完整信任链元数据(由 capability.assert_valid 校验 payload_digest 一致性)。
+                from services.backup_dr_validate import _restore_preverified_payload
+                await _restore_preverified_payload(
                     data=data,
                     tables=None,
                     merge=False,
-                    skip_strict_validation=True,
-                    validation_note=(
-                        f"BackupEngine._restore_internal: backup_id={backup_id} "
-                        f"target=production (manifest+ciphertext_sha+decrypt+plaintext_sha "
-                        f"verified upstream)"
-                    ),
-                    backup_id_override=manifest.get("backup_id", ""),
-                    manifest_sha256_override=_compute_sha256(manifest_bytes),
-                    payload_key_override=payload_key,
-                    ciphertext_sha256_override=manifest.get("ciphertext_sha256", ""),
-                    plaintext_sha256_override=expected_pt_sha,
-                    encryption_key_id_override=(enc_info or {}).get("key_id", ""),
+                    backup_id=manifest.get("backup_id", backup_id),
+                    manifest_sha256=_compute_sha256(manifest_bytes),
+                    payload_key=payload_key,
+                    ciphertext_sha256=manifest.get("ciphertext_sha256", ""),
+                    plaintext_sha256=expected_pt_sha,
+                    encryption_key_id=(enc_info or {}).get("key_id", ""),
+                    schema_fingerprint=manifest.get("schema_version", MANIFEST_SCHEMA_VERSION),
+                    issuer=f"BackupEngine._restore_internal:{backup_id}",
                 )
             except Exception as e:
                 return {

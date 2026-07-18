@@ -64,6 +64,72 @@ jobs:
           npm install
           npx playwright install --with-deps chromium
 
+      # ════════════════════════════════════════════════════════════
+      # R62 P1-06: a11y 测试预检查 — 在 Playwright 运行前硬失败检测假绿条件
+      #
+      # 审计 P1-06: 旧实现 try/catch require + stub replacement 导致
+      #   依赖缺失时 test.describe 自动 skip → 0 用例 = 绿色 CI(假绿)。
+      # 整改: 以下预检查必须全部通过才允许运行测试,
+      #   任一失败即 exit 1(禁止 continue-on-error: true)。
+      # ════════════════════════════════════════════════════════════
+
+      # R62 P1-06 检查 1/4: 依赖检查 — @playwright/test + @axe-core/playwright 可 require
+      - name: "R62 P1-06: Verify a11y test dependencies"
+        run: |
+          cd tests/e2e
+          echo "[R62 P1-06] 检查 1/4: 验证 @playwright/test + @axe-core/playwright 已安装"
+          node -e "require('@playwright/test') || (console.error('MISSING: @playwright/test'), process.exit(1))"
+          node -e "require('@axe-core/playwright') || (console.error('MISSING: @axe-core/playwright'), process.exit(1))"
+          echo "[R62 P1-06] 依赖检查通过"
+
+      # R62 P1-06 检查 2/4: 用例数检查 — > 0(检测 stub 替换导致的 0 用例假绿)
+      - name: "R62 P1-06: Verify a11y test case count > 0"
+        run: |
+          cd tests/e2e
+          echo "[R62 P1-06] 检查 2/4: 验证 a11y 测试用例数 > 0(检测 stub 替换)"
+          COUNT=$(npx playwright test --list accessibility_behavior.spec.ts 2>/dev/null | grep -c ".*" || echo 0)
+          if [ "$COUNT" -eq 0 ]; then
+            echo "ERROR: 0 a11y test cases found — stub replacement detected"
+            echo "[R62 P1-06] 预检查失败: 用例数为 0(检测到 stub 替换或 spec 文件加载失败)"
+            exit 1
+          fi
+          echo "Found $COUNT a11y test cases"
+          echo "[R62 P1-06] 用例数检查通过($COUNT 个用例)"
+
+      # R62 P1-06 检查 3/4: locale 覆盖检查 — zh-CN + en-US 都必须有对应用例
+      # /login en-US 旧实现复用 zh-CN 结果(跳过 /locale 切换),导致 en-US 实际未执行
+      - name: "R62 P1-06: Verify locale coverage (zh-CN + en-US)"
+        run: |
+          cd tests/e2e
+          echo "[R62 P1-06] 检查 3/4: 验证 zh-CN + en-US locale 都有对应用例"
+          LISTING=$(npx playwright test --list accessibility_behavior.spec.ts 2>/dev/null || echo "")
+          if [ -z "$LISTING" ]; then
+            echo "ERROR: 无法列出测试用例(npx playwright test --list 失败)"
+            exit 1
+          fi
+          ZH_COUNT=$(echo "$LISTING" | grep -c "zh-CN" || echo 0)
+          EN_COUNT=$(echo "$LISTING" | grep -c "en-US" || echo 0)
+          echo "zh-CN 用例数: $ZH_COUNT"
+          echo "en-US 用例数: $EN_COUNT"
+          if [ "$ZH_COUNT" -eq 0 ]; then
+            echo "ERROR: 0 个 zh-CN locale 用例 — zh-CN 未被执行"
+            exit 1
+          fi
+          if [ "$EN_COUNT" -eq 0 ]; then
+            echo "ERROR: 0 个 en-US locale 用例 — en-US 未被执行(可能复用 zh-CN 结果)"
+            exit 1
+          fi
+          echo "[R62 P1-06] locale 覆盖检查通过(zh-CN: $ZH_COUNT, en-US: $EN_COUNT)"
+
+      # R62 P1-06 检查 4/4: 路由元数据完整性 — 每条 a11y_testable 用例必须有 path/route_path/method/permission
+      - name: "R62 P1-06: Verify route metadata completeness"
+        run: |
+          echo "[R62 P1-06] 检查 4/4: 验证路由元数据完整性(path/route_path/method/permission)"
+          python scripts/check_a11y_precheck.py --skip-node-require --skip-playwright || (
+            echo "[R62 P1-06] 预检查失败: 路由元数据不完整或上述检查未通过"
+            exit 1
+          )
+
       # R52 P0-1: 生成 ADMIN_PASSWORD 的 PBKDF2 哈希(与 admin.passwords.verify_password 兼容)
       # 修复根因: 原实现在同一 step 内 printf 写入 $GITHUB_ENV 后立即用 Python 读取
       #   os.environ['ADMIN_PASSWORD'],但 $GITHUB_ENV 只对后续 steps 生效,
@@ -177,11 +243,38 @@ jobs:
       # R47/R48 P0-3: 运行 Playwright E2E 测试
       # webServer(在 playwright.config.ts 中定义)会自动启动 admin 服务并轮询 /readiness
       # R48: playwright.config.ts 显式传递 DATABASE_URL 等 env 给 webServer 子进程
+      # R62 P1-06: 用 tee 捕获输出到 /tmp/playwright_output.log,供 locale 执行验证步骤检查
       - name: Run Playwright E2E tests
         id: playwright
         run: |
           cd tests/e2e
-          npx playwright test
+          set -o pipefail
+          npx playwright test 2>&1 | tee /tmp/playwright_output.log
+
+      # R62 P1-06 后置验证: locale 执行验证 — 检查实际测试输出包含 zh-CN + en-US 标记
+      # (precheck 检查用例列表;本步骤检查实际运行输出,防止用例存在但被 skip)
+      - name: "R62 P1-06: Verify locale execution in test output"
+        if: always() && steps.playwright.outcome != 'skipped'
+        run: |
+          echo "[R62 P1-06] 后置验证: 检查测试输出中的 locale 执行标记"
+          if [ ! -f /tmp/playwright_output.log ]; then
+            echo "ERROR: Playwright 输出日志未找到(/tmp/playwright_output.log)"
+            echo "[R62 P1-06] 无法验证 locale 执行 — 测试输出缺失"
+            exit 1
+          fi
+          ZH_COUNT=$(grep -c "zh-CN" /tmp/playwright_output.log || echo 0)
+          EN_COUNT=$(grep -c "en-US" /tmp/playwright_output.log || echo 0)
+          echo "测试输出中 zh-CN 标记数: $ZH_COUNT"
+          echo "测试输出中 en-US 标记数: $EN_COUNT"
+          if [ "$ZH_COUNT" -eq 0 ]; then
+            echo "ERROR: zh-CN locale 未在实际测试输出中出现(可能被 skip 或用例名为空)"
+            exit 1
+          fi
+          if [ "$EN_COUNT" -eq 0 ]; then
+            echo "ERROR: en-US locale 未在实际测试输出中出现(可能被 skip 或复用 zh-CN 结果)"
+            exit 1
+          fi
+          echo "[R62 P1-06] locale 执行验证通过(zh-CN: $ZH_COUNT 标记, en-US: $EN_COUNT 标记)"
 
       # R48 P0-3: CI 失败排查辅助 — 在 Playwright 步骤失败时输出诊断信息
       - name: Debug - readiness response on failure

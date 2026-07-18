@@ -484,17 +484,29 @@ jobs:
 
     # R58 P0-1: cosign verify 生成签名 verification statement (JSON)
     #           每次 release 都必须输出 verification statement 作为证据
+    # R62 P0-03: 修复证书 identity 钉扎:
+    #   - 旧实现 --certificate-identity-regexp "https://github.com/${repo}/.github/.+"
+    #     存在两个问题:① 正则点未转义(github.com / .github 的 "." 匹配任意字符);
+    #     ② 过于宽泛(匹配 .github/ 下任意路径,不限 workflows/release-gates.yml)。
+    #   - 新实现使用 --certificate-identity(精确匹配,非正则),钉扎到:
+    #     https://github.com/{repo}/.github/workflows/release-gates.yml@{ref}
+    #     确保签名和验证使用同一 identity 语义,防止跨工作流伪造。
     - name: Verify image signature (output verification statement)
       run: |
         IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
+        CERT_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
         echo "=== R58 P0-1: 签名 Verification Statement ==="
+        echo "R62 P0-03: certificate-identity (exact, no regexp): ${CERT_IDENTITY}"
         # --output-verification 需要文件路径, cosign 会写入 verification record
+        # R62 P0-03: fail-fast — cosign verify 失败立即 exit 1,不允许 continue-on-error
         cosign verify \
-          --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/.+" \
+          --certificate-identity "${CERT_IDENTITY}" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
           --output-verification statement.json \
           "${IMAGE_REF}" || {
             echo "FAIL: cosign verify 失败,签名无效"
+            echo "  expected certificate-identity: ${CERT_IDENTITY}"
+            echo "  expected issuer: https://token.actions.githubusercontent.com"
             exit 1
           }
         echo "Verification statement 已生成:"
@@ -544,6 +556,94 @@ jobs:
           tgjiema-${{ github.sha }}.tar.gz.sha256
         echo "源代码制品已用 Sigstore keyless 签名"
 
+    # R62 P1-02: 签名 migration manifest (cosign detached signature)
+    #   manifest 是 migration 完整性的 trust anchor — 必须独立签名,
+    #   防止代码和 manifest 被同步篡改。签名材料与镜像 attestation 绑定同一 release digest。
+    #   验证时钉扎 certificate_identity 到本仓库的 release-gates.yml 工作流 + OIDC issuer。
+    - name: Sign migration manifest with cosign (keyless, detached)
+      run: |
+        set -euo pipefail
+        MANIFEST="database/migrations/migration-manifest.json"
+        if [ ! -f "${MANIFEST}" ]; then
+          echo "FAIL: migration manifest not found: ${MANIFEST}"
+          exit 1
+        fi
+        echo "R62 P1-02: Signing migration manifest (cosign keyless, detached)"
+        echo "  manifest: ${MANIFEST}"
+        echo "  manifest sha256: $(sha256sum "${MANIFEST}" | awk '{print $1}')"
+        cosign sign-blob --yes \
+          --output-certificate migration-manifest.json.pem \
+          --output-signature migration-manifest.json.sig \
+          "${MANIFEST}"
+        echo "Migration manifest signed successfully"
+      env:
+        COSIGN_EXPERIMENTAL: 1
+
+    # R62 P1-02: 验证 migration manifest 签名 (fail-fast)
+    #   钉扎 certificate_identity 到本仓库 release-gates.yml 工作流 + 当前 ref,
+    #   防止跨仓库/跨工作流伪造签名。验证失败立即 exit 1。
+    - name: Verify migration manifest signature
+      run: |
+        set -euo pipefail
+        MANIFEST="database/migrations/migration-manifest.json"
+        CERT_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
+        echo "R62 P1-02: Verifying migration manifest signature"
+        echo "  expected certificate-identity: ${CERT_IDENTITY}"
+        echo "  expected issuer: https://token.actions.githubusercontent.com"
+        cosign verify-blob \
+          --certificate-identity "${CERT_IDENTITY}" \
+          --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+          --certificate migration-manifest.json.pem \
+          --signature migration-manifest.json.sig \
+          "${MANIFEST}" || {
+            echo "FAIL: migration manifest signature verification failed"
+            echo "  R62 P1-02: manifest 签名无效 — 拒绝发布(代码与 manifest 可能被篡改)"
+            exit 1
+          }
+        echo "PASS: migration manifest signature verified"
+
+    # R62 P1-02: 验证 manifest 绑定的 release_commit 是当前 HEAD 的祖先(或当前 HEAD)
+    #   防止 manifest 绑定到过期/无关的 commit
+    - name: Verify migration manifest release_commit binding
+      run: |
+        set -euo pipefail
+        MANIFEST="database/migrations/migration-manifest.json"
+        RELEASE_COMMIT=$(python3 -c "import json; print(json.load(open('${MANIFEST}'))['release_commit'])")
+        HEAD_SHA="${{ github.sha }}"
+        echo "R62 P1-02: Verifying manifest release_commit binding"
+        echo "  manifest release_commit: ${RELEASE_COMMIT}"
+        echo "  current HEAD: ${HEAD_SHA}"
+        # release_commit 必须是当前 HEAD 的祖先(或等于 HEAD)
+        if git merge-base --is-ancestor "${RELEASE_COMMIT}" "${HEAD_SHA}" 2>/dev/null \
+           || [ "${RELEASE_COMMIT}" = "${HEAD_SHA}" ]; then
+          echo "PASS: manifest release_commit is ancestor of (or equal to) HEAD"
+        else
+          echo "FAIL: manifest release_commit ${RELEASE_COMMIT} is not an ancestor of HEAD ${HEAD_SHA}"
+          echo "  R62 P1-02: manifest 绑定的 commit 与当前 HEAD 无关 — 可能是旧 manifest 或篡改"
+          exit 1
+        fi
+        # 验证每个 migration 的 sha256 与磁盘文件一致
+        python3 -c "
+        import json, hashlib, sys
+        from pathlib import Path
+        manifest = json.load(open('${MANIFEST}'))
+        for entry in manifest.get('migrations', []):
+            version = entry['version']
+            expected_sha = entry['sha256']
+            fpath = Path('database/migrations') / version
+            if not fpath.exists():
+                print(f'FAIL: migration file missing: {fpath}')
+                sys.exit(1)
+            actual_sha = hashlib.sha256(fpath.read_bytes()).hexdigest()
+            if actual_sha != expected_sha:
+                print(f'FAIL: {version} sha256 mismatch')
+                print(f'  expected: {expected_sha}')
+                print(f'  actual:   {actual_sha}')
+                sys.exit(1)
+            print(f'  OK: {version} sha256 verified')
+        print('PASS: all migration sha256 verified against manifest')
+        "
+
     # R60 P0-06: 仅在签名/verify/provenance 全部成功时上传(原 if: always()
     #             会在签名失败时仍上传部分/空 artifact,掩盖供应链断裂)
     - name: Upload signed artifacts
@@ -557,6 +657,8 @@ jobs:
           tgjiema-${{ github.sha }}.tar.gz.sha256
           tgjiema-${{ github.sha }}.pem
           tgjiema-${{ github.sha }}.sig
+          migration-manifest.json.pem
+          migration-manifest.json.sig
         retention-days: 90
 
   # ─── R44/R46/R47/R48: branch protection 审计 ─────────────────
@@ -1191,20 +1293,28 @@ jobs:
           exit 1
         fi
         IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
+        # R62 P0-03: 使用精确 certificate-identity(非 regexp),钉扎到本工作流文件 + 当前 ref
+        CERT_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
         echo "Verifying signed digest: ${IMAGE_REF}"
+        echo "R62 P0-03: certificate-identity (exact): ${CERT_IDENTITY}"
 
         # R58 P0-1: cosign verify 拒绝未签名 digest
         # 若签名无效或缺失, 拒绝 promote 到 production
+        # R62 P0-03: 输出 verification statement 作为 production promote 证据
         cosign verify \
-          --certificate-identity-regexp "https://github.com/${{ github.repository }}/.github/.+" \
+          --certificate-identity "${CERT_IDENTITY}" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+          --output-verification production_verify_statement.json \
           "${IMAGE_REF}" || {
             echo "FAIL: cosign verify 失败"
             echo "  R58 P0-1: production promote 只提升已验证 digest"
+            echo "  R62 P0-03: expected certificate-identity: ${CERT_IDENTITY}"
             echo "  拒绝 promote 未签名/签名无效的 image_digest 到 production"
             exit 1
           }
         echo "PASS: image digest 已通过签名验证, 可 promote 到 production"
+        echo "R62 P0-03: production verification statement:"
+        cat production_verify_statement.json
 
     - name: Generate release_attestation.json (6 digest binding)
       run: |
@@ -1325,6 +1435,7 @@ jobs:
           release_attestation.pem
           release_attestation.sig
           branch_protection_snapshot.json
+          production_verify_statement.json
         retention-days: 90
 
   # ─── 14. release-summary (R60 P0-06: 单一聚合 required context) ──────

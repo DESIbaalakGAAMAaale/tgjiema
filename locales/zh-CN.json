@@ -79,6 +79,7 @@
     "auth.mfa.replayed": "MFA 验证重放攻击被拒绝(user_id={user_id})",
     "auth.mfa.locked": "MFA 验证次数过多,账号已锁定(user_id={user_id})",
     "auth.mfa.receipt_invalid": "MFA receipt 验证失败,已拒绝(reason={reason})",
+    "auth.mfa.receipt_expired": "MFA receipt 已过期,高风险动作要求近期完成 MFA 验证(user_id={user_id}, reason={reason}, trace_id={trace_id})",
     "auth.session.expired": "会话已过期,请重新登录(user_id={user_id})",
     "auth.rbac.permission_denied": "权限不足,缺少必要权限:{permission}(user_id={user_id})",
     "backup.restore.approval_invalid": "备份恢复审批无效或已过期(approval_id={approval_id}, backup_id={backup_id})",
@@ -86,8 +87,11 @@
     "backup.restore.trust_chain_required": "备份恢复信任链令牌缺失或无效,已拒绝恢复(backup_id={backup_id})",
     "effect.receipt.manager_unavailable": "副作用回执管理器不可用(action_id={action_id}, effect_type={effect_type})",
     "effect.receipt.db_error": "副作用回执数据库错误(action_id={action_id}, effect_type={effect_type})",
+    "data.receipt.idempotency_conflict": "副作用幂等冲突:同 (action_id, effect_type, target) 已存在不同 request_hash 的 receipt,拒绝覆盖(action_id={action_id}, effect_type={effect_type}, target={target}, trace_id={trace_id})",
+    "data.receipt.terminal_state": "副作用回执已处于终态(completed),禁止覆盖(action_id={action_id}, effect_type={effect_type}, target={target}, current_status={current_status}, trace_id={trace_id})",
     "approval.gate.required": "操作需审批(approval_id={approval_id}, action={action})",
     "approval.state.invalid": "审批状态无效(approval_id={approval_id}, current_status={current_status})",
+    "approval.self_reject.forbidden": "审批创建者不能驳回自己创建的审批(防止自拒绕过审计,approver_id={approver_id}, created_by={created_by}, approval_id={approval_id}, trace_id={trace_id})",
     "command.concurrent.claim": "操作已被其他 worker 抢占或状态已变更(action_id={action_id})",
     "command.hash.mismatch": "请求参数与上次执行不一致(防篡改拒绝,action_id={action_id})",
     "db.cache.unavailable": "SQLite 缓存不可用(component={component})",
@@ -1669,6 +1673,21 @@
     "auth": {
       "legacy_argon2_detected": "检测到 {count} 条旧 Argon2 密码哈希,Argon2 已不再受支持,相关管理员将无法登录,请重新生成 PBKDF2 哈希并迁移",
       "invalid_pbkdf2_iterations": "PBKDF2 迭代次数超出允许范围,请检查哈希配置"
+    },
+    "callback": {
+      "button_security": {
+        "expired_or_invalid": "⚠️ 按钮已过期或格式无效,请重新发起举报查看最新按钮。",
+        "signature_failed_report": "⚠️ 按钮签名验证失败,可能已过期或被使用,请重新发起举报。",
+        "payload_mismatch": "⚠️ 按钮载荷不匹配",
+        "missing_uid": "⚠️ 参数错误: 缺少 uid",
+        "invalid_uid": "⚠️ 参数错误: uid 非法",
+        "missing_file_code": "⚠️ 参数错误: 缺少 file_code",
+        "missing_file_code_reporter": "⚠️ 参数错误: 缺少 file_code/reporter_id",
+        "invalid_reporter_id": "⚠️ 参数错误: reporter_id 非法",
+        "unknown_sub_action": "⚠️ 未知的举报子动作: {sub_action}",
+        "signature_failed_restore": "⚠️ 按钮签名验证失败,可能已过期或被使用,请重新发起恢复操作。",
+        "signature_failed_delete": "⚠️ 按钮签名验证失败,可能已过期或被使用,请重新发起删除操作。"
+      }
     },
     "generic": {
       "fallback": "操作失败,请稍后重试"

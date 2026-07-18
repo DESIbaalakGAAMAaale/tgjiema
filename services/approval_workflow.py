@@ -385,6 +385,8 @@ async def reject(approval_id: int, approver_id: int, reason: str = "") -> bool:
 
     检查:
     - 审批人是否有 PERMISSION_APPROVE_TAKEDOWN 权限
+    - R62 P1-07: 不能驳回自己创建的请求(created_by != approver_id),
+      与 approve() 对称强制 requester != approver,防止自拒绕过审计
     - 审批状态必须为 pending
 
     Args:
@@ -394,6 +396,10 @@ async def reject(approval_id: int, approver_id: int, reason: str = "") -> bool:
 
     Returns:
         True 表示成功
+
+    Raises:
+        AppError: 当 approver_id == created_by 时(ErrorCodes.APPROVAL_SELF_REJECT_FORBIDDEN),
+            由调用方捕获处理。R62 P1-07: reject() 也必须强制 requester != approver。
     """
     approval = await get_approval(approval_id)
     if approval is None:
@@ -409,6 +415,25 @@ async def reject(approval_id: int, approver_id: int, reason: str = "") -> bool:
     if not has_perm:
         logger.warning(f"[Approval] reject 审批人无权限: approver={approver_id} approval={approval_id}")
         return False
+
+    # R62 P1-07: reject() 也必须强制 requester != approver,防止自拒绕过审计
+    # 与 approve() 在 lines 209-211 的自审批防护对称,否则创建者可通过自拒
+    # 规避双人审批留痕,或在审计链中掩盖决策责任。
+    if int(approval["created_by"]) == int(approver_id):
+        logger.warning(
+            f"[Approval] reject 不能驳回自己创建的请求(自拒绕过审计防护): "
+            f"approver={approver_id} created_by={approval['created_by']} approval={approval_id}"
+        )
+        # 引入 AppError 协议化错误,延迟 import 避免循环依赖
+        from services.error_codes import AppError, ErrorCodes
+        raise AppError(
+            ErrorCodes.APPROVAL_SELF_REJECT_FORBIDDEN,
+            params={
+                "approval_id": approval_id,
+                "approver_id": int(approver_id),
+                "created_by": int(approval["created_by"]),
+            },
+        )
 
     store = get_cache_store()
     if not store._db:

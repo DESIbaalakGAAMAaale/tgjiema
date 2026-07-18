@@ -383,8 +383,21 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    # R62 P0-04: 删除按钮必须携带签名 token(handle 短 ID 模式),
+    # 防止伪造 callback_data 触发未授权删除。
+    from services.button_security import sign_button_token_with_handle
+    user = update.effective_user
+    try:
+        delfile_handle = await sign_button_token_with_handle(
+            principal_id=user.id, action="delete_file",
+            payload=file_code,
+        )
+    except Exception as e:
+        logger.error(f"[Admin][delete_file] 生成签名按钮失败 code={file_code}: {e}")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s108', file_code=file_code))
+        return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s182'), callback_data=f"delfile|{file_code}")],
+        [InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s182'), callback_data=f"delfile|{delfile_handle}")],
         [InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s183'), callback_data=f"delfile_cancel|{file_code}")],
     ])
     await update.message.reply_text(
@@ -1516,13 +1529,28 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 构造确认按钮
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    cb_data = f"restore:confirm|{seq}|{'1' if merge else '0'}"
+    # R62 P0-04: 恢复按钮必须携带签名 token(handle 短 ID 模式),
+    # 防止伪造 callback_data 触发未授权的数据库恢复。
+    # payload 格式: {seq}|{0或1}|table:xxx,yyy(merge 和 table 部分均可选)
+    from services.button_security import sign_button_token_with_handle
+    user = update.effective_user
+    payload_parts = [str(seq), "1" if merge else "0"]
     if tables:
-        cb_data += f"|table:{','.join(tables)}"
+        payload_parts.append(f"table:{','.join(tables)}")
+    payload = "|".join(payload_parts)
+    try:
+        restore_handle = await sign_button_token_with_handle(
+            principal_id=user.id, action="restore",
+            payload=payload,
+        )
+    except Exception as e:
+        logger.error(f"[Admin][restore] 生成签名按钮失败 seq={seq}: {e}")
+        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s210', e=e))
+        return
 
     kb = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s211'), callback_data=cb_data),
+            InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s211'), callback_data=f"restore:confirm:{restore_handle}"),
         ],
         [
             InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s212'), callback_data="restore:cancel"),

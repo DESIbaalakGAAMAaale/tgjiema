@@ -1885,10 +1885,40 @@ async def report_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _i18n_t('bot.dsp.s1', file_code=file_code, uploader_id=uploader_id, reporter_id=reporter.id, reporter_username=reporter_username, datetime_datetime_now_strftime_Y_m_d_H_M_S=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     )
 
+    # R62 P0-04: 按钮渲染改为签名 token + handle 短 ID 模式
+    # 由于按钮最终在 admin_bot 进程处理(principal = AUTHORIZED_USER_ID = ADMIN_TELEGRAM_ID),
+    # 此处签名的 principal_id 必须使用 admin 的 telegram user_id,
+    # 否则 admin_bot 端 verify_button_token_by_handle(user.id) 会因 principal 不匹配而拒绝。
+    from config import settings as _settings
+    from services.button_security import sign_button_token_with_handle
+    try:
+        admin_principal_id = int(_settings.ADMIN_TELEGRAM_ID) if _settings.ADMIN_TELEGRAM_ID else 0
+    except (TypeError, ValueError):
+        admin_principal_id = 0
+    # payload 格式: {sub_action}|{arg1}|...|{reporter_id}|{source_bot}
+    # 与 admin_bot/callback.py:_handle_report_action 解析逻辑保持一致
+    try:
+        ban_handle = await sign_button_token_with_handle(
+            principal_id=admin_principal_id, action="report",
+            payload=f"ban|{uploader_id}|{reporter.id}|dsp",
+        )
+        detach_handle = await sign_button_token_with_handle(
+            principal_id=admin_principal_id, action="report",
+            payload=f"detach|{file_code}|{reporter.id}|dsp",
+        )
+        block_handle = await sign_button_token_with_handle(
+            principal_id=admin_principal_id, action="report",
+            payload=f"block|{file_code}|{reporter.id}",
+        )
+    except Exception as e:
+        logger.error(f"[Dsp][report] 生成签名按钮失败: {e}")
+        await query.answer("举报提交失败,请稍后重试", show_alert=True)
+        return
+
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(_i18n_t('bot.dsp.s19'), callback_data=f"report:ban|{uploader_id}|{reporter.id}|dsp")],
-        [InlineKeyboardButton(_i18n_t('bot.dsp.s20'), callback_data=f"report:detach|{file_code}|{reporter.id}|dsp")],
-        [InlineKeyboardButton(_i18n_t('bot.dsp.s21'), callback_data=f"report:block|{file_code}|{reporter.id}")],
+        [InlineKeyboardButton(_i18n_t('bot.dsp.s19'), callback_data=f"report:ban:{ban_handle}")],
+        [InlineKeyboardButton(_i18n_t('bot.dsp.s20'), callback_data=f"report:detach:{detach_handle}")],
+        [InlineKeyboardButton(_i18n_t('bot.dsp.s21'), callback_data=f"report:block:{block_handle}")],
         [InlineKeyboardButton(_i18n_t('bot.dsp.s22'), callback_data="report:ignore")],
     ])
 

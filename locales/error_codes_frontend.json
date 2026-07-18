@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 109,
-    "generated_at": "2026-07-18T04:47:36.556143Z",
+    "enum_count": 113,
+    "generated_at": "2026-07-18T08:50:37.466326Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(R61 P1-05: 独立显式设置,通常等于 retryable 但可独立覆盖)",
       "telegram_presentation": "Bot 端展示方式(R61 P1-05 显式字段): short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)/modal/toast(预留扩展)"
     },
-    "total_codes": 109,
+    "total_codes": 113,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -64,6 +64,21 @@
       "show_retry_button": false,
       "telegram_presentation": "silent"
     },
+    "APPROVAL.SELF_REJECT.FORBIDDEN": {
+      "audit_level": "critical",
+      "code": "APPROVAL.SELF_REJECT.FORBIDDEN",
+      "http_status": 403,
+      "message_key": "errors.approval.self_reject.forbidden",
+      "retryable": false,
+      "safe_params": [
+        "approval_id",
+        "approver_id",
+        "created_by"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "APPROVAL.STATE.INVALID": {
       "audit_level": "warning",
       "code": "APPROVAL.STATE.INVALID",
@@ -90,6 +105,21 @@
       "severity": "error",
       "show_retry_button": false,
       "telegram_presentation": "short_hint"
+    },
+    "AUTH.MFA.RECEIPT_EXPIRED": {
+      "audit_level": "critical",
+      "code": "AUTH.MFA.RECEIPT_EXPIRED",
+      "http_status": 401,
+      "message_key": "errors.auth.mfa.receipt_expired",
+      "retryable": false,
+      "safe_params": [
+        "user_id",
+        "reason",
+        "action"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "AUTH.MFA.RECEIPT_INVALID": {
       "audit_level": "critical",
@@ -701,6 +731,37 @@
         "user_id",
         "step",
         "step_error"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "DATA.RECEIPT.IDEMPOTENCY_CONFLICT": {
+      "audit_level": "warning",
+      "code": "DATA.RECEIPT.IDEMPOTENCY_CONFLICT",
+      "http_status": 409,
+      "message_key": "errors.data.receipt.idempotency_conflict",
+      "retryable": false,
+      "safe_params": [
+        "action_id",
+        "effect_type",
+        "target"
+      ],
+      "severity": "error",
+      "show_retry_button": false,
+      "telegram_presentation": "short_hint"
+    },
+    "DATA.RECEIPT.TERMINAL_STATE": {
+      "audit_level": "warning",
+      "code": "DATA.RECEIPT.TERMINAL_STATE",
+      "http_status": 409,
+      "message_key": "errors.data.receipt.terminal_state",
+      "retryable": false,
+      "safe_params": [
+        "action_id",
+        "effect_type",
+        "target",
+        "current_status"
       ],
       "severity": "error",
       "show_retry_button": false,

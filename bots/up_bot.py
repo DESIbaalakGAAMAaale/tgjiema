@@ -44,6 +44,8 @@ from services.error_codes import AppError, ErrorCodes
 from services.maintenance_mode import require_maintenance_check
 # R41 i18n: 国际化翻译(用户可见文本)
 from services.i18n import translate as _i18n_t, get_i18n_manager
+# R62 P1-05: 统一用户面消息类型 — 所有用户出口应接受 UserMessage 结构化对象,而非裸字符串
+from services.user_message import UserMessage
 
 
 def _t(user_id: int, key: str, **kwargs) -> str:
@@ -60,6 +62,61 @@ def _t(user_id: int, key: str, **kwargs) -> str:
     manager = get_i18n_manager()
     locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
     return manager.format_message(key, locale=locale, **kwargs)
+
+
+# R62 P1-05: 所有用户出口应接受 UserMessage 结构化对象,而非裸字符串。
+# 以下 _build_user_message / _reply_user_message 展示 UserMessage 替代裸字符串的
+# 代表性模式(1-2 个示例,不强制重构所有现有 _t 调用)。
+def _build_user_message(user_id: int, key: str, **kwargs) -> UserMessage:
+    """R62 P1-05: 构造 UserMessage 结构化对象(替代裸 _t() 字符串)。
+
+    与 _t() 的区别:
+        - _t() 直接返回本地化字符串(丢失结构化信息,易在传播中拼接裸字符串)
+        - _build_user_message() 返回 UserMessage 结构化对象,render() 时才转为字符串
+        - UserMessage 携带 message_key / locale / params / trace_id,
+          便于全链路日志关联和前端按协议渲染
+
+    Args:
+        user_id: Telegram 用户 ID(用于查询 locale 偏好)
+        key: 翻译 key(如 "bot.upload_banned")
+        **kwargs: ICU 插值参数(已脱敏,不含 password/secret/token 等敏感字段)
+
+    Returns:
+        UserMessage 实例(可在传播中保持结构化,render() 时才转为本地化字符串)
+    """
+    manager = get_i18n_manager()
+    locale = manager.get_user_locale(user_id) if user_id else "zh-CN"
+    # UserMessage.__post_init__ 会自动过滤敏感 params(password/secret/token 等)
+    return UserMessage.from_key(key, locale=locale, params=kwargs)
+
+
+async def _reply_user_message(message, msg: UserMessage, bot_id: int = 0, **kwargs) -> object:
+    """R62 P1-05: 通过 UserMessage 结构化对象回复消息(替代裸字符串)。
+
+    代表性示例:展示 UserMessage 替代 safe_reply_text(message, "裸字符串") 的模式。
+    UserMessage.render() 时才通过 i18n_manager 转为本地化字符串,
+    避免 wrapper / 别名 / 函数返回值传播过程中的裸字符串泄露。
+
+    用法:
+        # 旧模式(裸字符串,易在 wrapper 中泄露):
+        await safe_reply_text(update.message, _t(user.id, "bot.upload_banned"))
+        # 新模式(结构化 UserMessage):
+        msg = _build_user_message(user.id, "bot.upload_banned")
+        await _reply_user_message(update.message, msg)
+
+    Args:
+        message: Telegram Message 对象(update.message)
+        msg: UserMessage 实例(message_key + locale + params 已结构化)
+        bot_id: bot 账号 ID(用于 FloodWait 退避隔离)
+        **kwargs: 额外 Telegram reply_text 参数(parse_mode 等)
+
+    Returns:
+        Telegram Message 对象(reply_text 调用结果)
+    """
+    # R62 P1-05: 渲染 UserMessage 为本地化字符串(惰性渲染,真正写入用户面前才转字符串)
+    text = msg.render(get_i18n_manager())
+    # 复用现有 safe_reply_text 的 FloodWait 退避机制
+    return await safe_reply_text(message, text, bot_id=bot_id, **kwargs)
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
 

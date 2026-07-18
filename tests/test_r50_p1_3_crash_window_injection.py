@@ -249,21 +249,24 @@ class TestMediaGroupCrashWindow:
             f"文件 2 reconcile_status 应为 'pending',实际 '{row[1]}'"
         )
 
-        # 重启后文件 2 应能继续执行:re-record_pending(attempt+1)
+        # 重启后文件 2 应能继续执行:re-record_pending(幂等返回)
+        # R62 P1-01 整改语义:pending + 同 request_hash → 幂等返回 True,
+        # attempt 不再递增(外部副作用重试计数由 outbox_events.attempt_count 负责,
+        # effect_receipts.attempt 仅在 failed→pending 重试时 +1)。
         ok2_retry = await mgr.record_pending(
             action_id_2, "telegram_send", target_2, request_hash=hash_2,
         )
-        assert ok2_retry is True, "重启后文件 2 应能 re-claim(attempt+1)"
+        assert ok2_retry is True, "重启后文件 2 应能 re-claim(幂等返回 True)"
 
-        # 验证 attempt 递增(从 1 → 2)
+        # 验证 attempt 不变(R62 P1-01: pending+同 hash 幂等,attempt 保持 1)
         cursor = await real_store._db.execute(
             "SELECT attempt FROM effect_receipts "
             "WHERE action_id = ? AND effect_type = ? AND target = ?",
             (action_id_2, "telegram_send", target_2),
         )
         row = await cursor.fetchone()
-        assert int(row[0]) == 2, (
-            f"重启后文件 2 attempt 应为 2(原 1 + 1),实际 {row[0]}"
+        assert int(row[0]) == 1, (
+            f"重启后文件 2 attempt 应保持 1(R62 P1-01 幂等语义),实际 {row[0]}"
         )
 
         # 验证文件 1 不被重复发送(check_receipt 返回 completed → 调用方跳过)
@@ -756,7 +759,9 @@ class TestReceiptConsistency:
             - record_pending 成功 → kill -9 → 重启
             - 断言:check_receipt 返回 None(status='pending',未完成)
             - 断言:DB 中 status='pending', reconcile_status='pending'
-            - 断言:record_pending 再次调用(重启后)应 attempt+1(不是 attempt=1)
+            - 断言:record_pending 再次调用(重启后)应幂等返回 True,
+              attempt 保持不变(R62 P1-01: pending+同 hash 幂等,
+              外部重试计数由 outbox_events.attempt_count 负责)
             - 断言:外部副作用不重复执行(check_receipt 不会返回 completed)
 
         故障注入:模拟 kill -9(在 record_pending 后中断,不调用 record_completed)
@@ -798,7 +803,9 @@ class TestReceiptConsistency:
         assert row[1] == "pending", f"reconcile_status 应为 'pending',实际 '{row[1]}'"
         assert int(row[2]) == 1, f"attempt 应为 1(首次 claim),实际 {row[2]}"
 
-        # 5. 重启后 record_pending 再次调用 → attempt+1(不是 attempt=1)
+        # 5. 重启后 record_pending 再次调用 → 幂等返回 True(R62 P1-01 新语义)
+        # pending + 同 request_hash → 幂等返回,attempt 不再递增
+        # (外部副作用重试计数由 outbox_events.attempt_count 负责)
         ok_retry = await mgr.record_pending(
             action_id, effect_type, target, request_hash=request_hash,
         )
@@ -810,8 +817,8 @@ class TestReceiptConsistency:
             (action_id, effect_type, target),
         )
         row = await cursor.fetchone()
-        assert int(row[0]) == 2, (
-            f"重启后 attempt 应为 2(原 1 + 1),实际 {row[0]}"
+        assert int(row[0]) == 1, (
+            f"重启后 attempt 应保持 1(R62 P1-01 幂等语义),实际 {row[0]}"
         )
         assert row[1] == "pending", "status 仍应为 'pending'"
         assert row[2] == "pending", "reconcile_status 仍应为 'pending'"
@@ -983,17 +990,22 @@ class TestReceiptConsistency:
 
     @pytest.mark.asyncio
     async def test_concurrent_record_completed_idempotent(self, real_store):
-        """用例 12: 同一 action_id 并发调用 record_completed 5 次(幂等 UPDATE)。
+        """用例 12: 同一 action_id 并发调用 record_completed 5 次(终态保护)。
+
+        R62 P1-01 新语义:已 completed 的 receipt 再次 record_completed →
+        raise AppError(DATA_RECEIPT_TERMINAL_STATE)(终态保护,防止重复确认)。
 
         场景:
             - 同一 action_id 并发调用 record_completed 5 次
-            - 断言:全部成功(idempotent UPDATE,无异常)
+            - 断言:仅 1 个 worker 成功(首个将 pending→completed)
+            - 断言:其余 4 个 worker 抛 AppError(TERMINAL_STATE)(已 completed)
             - 断言:DB 中只有 1 行 receipt(status='completed')
 
         故障注入:asyncio.gather 模拟 5 worker 并发 record_completed
         """
         import asyncio
         from services.effect_receipts import EffectReceiptManager
+        from services.error_codes import AppError, ErrorCodes
         mgr = EffectReceiptManager(real_store)
 
         action_id = "act_concurrent_completed_1"
@@ -1007,18 +1019,32 @@ class TestReceiptConsistency:
         )
 
         # 5 worker 并发 record_completed(同 action_id,同 external_id)
+        # R62 P1-01: 首个成功(pending→completed),其余抛 TERMINAL_STATE
         async def _worker():
-            await mgr.record_completed(
-                action_id, effect_type, target, external_id="msg_900",
-            )
-            return True
+            try:
+                await mgr.record_completed(
+                    action_id, effect_type, target, external_id="msg_900",
+                )
+                return True
+            except AppError as e:
+                # R62 P1-01: 已 completed → TERMINAL_STATE(其余 worker)
+                return e.code if e.code == ErrorCodes.DATA_RECEIPT_TERMINAL_STATE else False
 
         results = await asyncio.gather(
             _worker(), _worker(), _worker(), _worker(), _worker(),
         )
 
-        # 全部应成功(无异常)
-        assert all(results), "并发 record_completed 应全部成功(幂等 UPDATE)"
+        # 仅 1 个 worker 成功(返回 True)
+        success_count = sum(1 for r in results if r is True)
+        terminal_count = sum(
+            1 for r in results if r == ErrorCodes.DATA_RECEIPT_TERMINAL_STATE
+        )
+        assert success_count == 1, (
+            f"并发 record_completed 应仅 1 个成功(终态保护),实际 success={success_count}"
+        )
+        assert terminal_count == 4, (
+            f"其余 4 个应抛 TERMINAL_STATE,实际 terminal={terminal_count}"
+        )
 
         # DB 中只有 1 行 receipt(status='completed')
         cursor = await real_store._db.execute(
@@ -1028,7 +1054,7 @@ class TestReceiptConsistency:
         )
         row = await cursor.fetchone()
         assert int(row[0]) == 1, (
-            f"DB 中应仅 1 行 receipt(幂等),实际 {row[0]} 行"
+            f"DB 中应仅 1 行 receipt(终态保护),实际 {row[0]} 行"
         )
         assert row[1] == "completed", f"status 应为 'completed',实际 '{row[1]}'"
 

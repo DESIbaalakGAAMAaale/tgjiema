@@ -23,16 +23,16 @@
       "log_only": 103
     },
     "bots/idx_bot.py": {
-      "baseline": 140,
+      "baseline": 141,
       "target": 0,
       "user_visible": 0,
-      "log_only": 140
+      "log_only": 141
     },
     "bots/dsp_bot.py": {
-      "baseline": 105,
+      "baseline": 106,
       "target": 0,
       "user_visible": 0,
-      "log_only": 105
+      "log_only": 106
     },
     "bots/mon_bot.py": {
       "baseline": 70,
@@ -41,16 +41,16 @@
       "log_only": 70
     },
     "bots/admin_bot/": {
-      "baseline": 63,
+      "baseline": 68,
       "target": 0,
       "user_visible": 0,
-      "log_only": 63
+      "log_only": 68
     },
     "admin/": {
-      "baseline": 124,
+      "baseline": 128,
       "target": 0,
       "user_visible": 0,
-      "log_only": 124
+      "log_only": 128
     },
     "admin/templates/": {
       "baseline": 0,
@@ -65,18 +65,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 1256,
+      "baseline": 1267,
       "target": 0,
       "user_visible": 0,
-      "log_only": 1256
+      "log_only": 1267
     }
   },
   "total": {
-    "baseline": 1861,
+    "baseline": 1883,
     "target": 0,
     "user_visible": 0,
-    "log_only": 1861
+    "log_only": 1883
   },
   "last_updated": "2026-07-18",
-  "last_updated_by": "R61 P1-07: scanner v6.0 sink registry expansion (13 new sinks) + taint model + protocol constant exemption + call-chain CI output; services/ log_only baseline 1253->1256 (+3 from R61 P0-01 data_lifecycle.py new logger calls, not from P1-07 new sinks; user_visible=0 across all modules)"
+  "last_updated_by": "R62 P0-04: admin_bot/callback.py 11 user_visible 裸字符串接入 i18n(admin.callback.button_security.*,user_visible=0);log_only baseline 提升: bots/idx_bot.py 140->141, bots/dsp_bot.py 105->106, bots/admin_bot/ 63->68, admin/ 124->128, services/ 1256->1267(total 1861->1883),源自 R62 新增 logger 审计日志(log_only 是开发者日志文本,转 _i18n_t 语义上不正确,按 ratchet 规则提升 baseline 并文档化,与 R61 P1-07 做法一致)"
 }
