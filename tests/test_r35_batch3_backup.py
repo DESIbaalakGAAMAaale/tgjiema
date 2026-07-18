@@ -467,6 +467,11 @@ class TestRestoreDelegation:
         _ensure_restore_module_importable()
         from services.db_restore import _restore_from_backup_data
 
+        # R63 P1-01: assert_valid 现为 async 且强制 nonce 持久化消费。
+        # 单元测试无初始化 DB store,patch get_cache_store 返回 None 以跳过
+        # nonce 消费(nonce 消费是安全边界,由集成测试覆盖)。
+        monkeypatch.setattr("database.cache_store.get_cache_store", lambda: None)
+
         # 构造含 CRDB + SQLite 表的备份数据
         backup_data = {
             "tables": {
@@ -528,10 +533,15 @@ class TestRestoreDelegation:
         assert "users" not in sqlite_arg
 
     @pytest.mark.asyncio
-    async def test_restore_unknown_table_skipped(self):
+    async def test_restore_unknown_table_skipped(self, monkeypatch):
         """_restore_from_backup_data 跳过不在 BACKUP_SCHEMA 中的表。"""
         _ensure_restore_module_importable()
         from services.db_restore import _restore_from_backup_data
+
+        # R63 P1-01: assert_valid 现为 async 且强制 nonce 持久化消费。
+        # 单元测试无初始化 DB store,patch get_cache_store 返回 None 以跳过
+        # nonce 消费(nonce 消费是安全边界,由集成测试覆盖)。
+        monkeypatch.setattr("database.cache_store.get_cache_store", lambda: None)
 
         backup_data = {
             "tables": {

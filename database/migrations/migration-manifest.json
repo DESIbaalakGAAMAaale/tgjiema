@@ -1,7 +1,7 @@
 {
   "version": 2,
-  "release_commit": "5d3f66549cd9833351eb1d3319e95b7adfdd0eb7",
-  "tree_sha": "b165e11e5bf63bdf832c06a5fed68f1b7bdc78c6",
+  "release_commit": "3513de91224844c83aa3370a8267ce7a6590ed5e",
+  "tree_sha": "bd8337d0f6e710f1dc734c1163eaa40b239924de",
   "tool_version": "DDL_VERSION=11",
   "description": "R62 P1-02 / R63 P0-04: Signed migration manifest — trust anchor for migration integrity. The manifest binds release_commit, tree_sha, per-migration sha256, migration order, and tool version. CI signs the canonical manifest with cosign keyless (Sigstore) and verifies the certificate identity/issuer before any deployment or migration execution. The signature is a detached .sig file alongside the manifest; the manifest itself contains the expected verification policy (certificate_identity + certificate_oidc_issuer). A tampered disk file whose sha256 does not match the manifest blocks startup (fail-closed). R63 P0-04: release_commit/tree_sha regenerated from current HEAD; 004 migration enumerated; manifest must equal the on-disk migration set (no missing/extra entries).",
   "verification": {

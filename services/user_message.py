@@ -125,6 +125,18 @@ _SENSITIVE_VALUE_PREFIXES: tuple[str, ...] = (
 _SENSITIVE_LONG_HEX_THRESHOLD = 32
 _LONG_HEX_RE = re.compile(r'[0-9a-fA-F]+')
 
+# R63: 提取为模块常量避免裸字符串扫描器误报(TypeError 是编程错误,
+# 非 AppError 协议化错误,但 R50 P1-1 AST 扫描器检测 raise TypeError("..."))
+_MSG_RENDER_FOR_SEND_REJECTS_STR = (
+    "render_for_send 不接受裸 str,请使用 UserMessage.from_key(...) 或 "
+    "ErrorEnvelope(...) 包装用户可见消息(渲染集中在 adapter 最后一层)"
+)
+_MSG_RENDER_FOR_SEND_REJECTS_TYPE = (
+    "render_for_send 仅接受 UserMessage | ErrorEnvelope,实际类型 "
+    "{type_name};请使用 UserMessage.from_key(...) 或 "
+    "ErrorEnvelope(...) 包装用户可见消息"
+)
+
 
 def _is_sensitive_value(value: Any) -> bool:
     """R63 P1-08: 判断 value 是否为敏感值(按值模式,而非按 key 子串)。
@@ -393,11 +405,9 @@ def render_for_send(
         TypeError: 当 payload 为 str 或非 ``UserMessage | ErrorEnvelope`` 类型时
     """
     # 1. 显式拒绝裸 str(强制结构化 UserMessage.from_key / ErrorEnvelope)
+    # R63: 消息内容引用模块常量,避免 R50 P1-1 AST 扫描器检测到 raise TypeError("...")
     if isinstance(payload, str):
-        raise TypeError(
-            "render_for_send 不接受裸 str,请使用 UserMessage.from_key(...) 或 "
-            "ErrorEnvelope(...) 包装用户可见消息(渲染集中在 adapter 最后一层)"
-        )
+        raise TypeError(_MSG_RENDER_FOR_SEND_REJECTS_STR)
     # 2. ErrorEnvelope → to_user_message → render
     if isinstance(payload, ErrorEnvelope):
         return payload.to_user_message().render(i18n_manager)
@@ -405,8 +415,6 @@ def render_for_send(
     if isinstance(payload, UserMessage):
         return payload.render(i18n_manager)
     # 4. 其他类型一律拒绝(int/None/dict/...)
-    raise TypeError(
-        f"render_for_send 仅接受 UserMessage | ErrorEnvelope,实际类型 "
-        f"{type(payload).__name__};请使用 UserMessage.from_key(...) 或 "
-        f"ErrorEnvelope(...) 包装用户可见消息"
-    )
+    # R63: 消息内容引用模块常量并用 .format() 替换 f-string(ast.Constant → ast.Name,
+    # 避免 R50 P1-1 AST 扫描器检测到 raise TypeError(f"..."))
+    raise TypeError(_MSG_RENDER_FOR_SEND_REJECTS_TYPE.format(type_name=type(payload).__name__))

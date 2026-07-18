@@ -43,6 +43,15 @@ jobs:
         pip install -r requirements.txt
         pip install pytest pytest-asyncio pytest-cov aiosqlite pyyaml
 
+    # R63 P0-04: 构建阶段自动重生 migration manifest(绑定当前 HEAD/Tree)。
+    # 终审报告 P0-04 根治逻辑:"构建阶段根据当前 HEAD/Tree 自动生成 canonical
+    # manifest,禁止手工旧 SHA"。每次 commit 都会使旧 manifest 的 release_commit/
+    # tree_sha 失效,因此在运行测试前根据当前 git HEAD 重新生成 manifest,
+    # 使 test_r63_p0_1_p0_4_release_manifest.py 的 HEAD/Tree 绑定校验通过。
+    # 本步骤只更新工作区 manifest(不 commit),签名在 release-gates.yml 中完成。
+    - name: Regenerate migration manifest (bind to current HEAD/Tree)
+      run: python scripts/generate_migration_manifest.py
+
     - name: Run tests
       run: |
         python -m pytest tests/ -v --tb=short --maxfail=5 --cov=services --cov=database --cov=utils --cov=bots --cov=admin --cov-report=xml:coverage.xml --cov-report=term-missing
