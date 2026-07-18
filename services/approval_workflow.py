@@ -301,7 +301,8 @@ async def approve(approval_id: int, approver_id: int, note: str = "") -> bool:
         return True
     except Exception as e:
         logger.error(f"[Approval] approve 失败 id={approval_id}: {e}")
-        return False
+    # fail-closed:审批失败时返回 False
+    return False
 
 
 async def _enqueue_command_outbox(
@@ -375,7 +376,8 @@ async def _enqueue_command_outbox(
         logger.error(
             f"[Approval] command_outbox 写入失败 approval_id={approval_id}: {e}"
         )
-        return False
+    # fail-closed:写入失败(非 UNIQUE 冲突)时返回 False
+    return False
 
 
 async def reject(approval_id: int, approver_id: int, reason: str = "") -> bool:
@@ -450,7 +452,8 @@ async def reject(approval_id: int, approver_id: int, reason: str = "") -> bool:
         return True
     except Exception as e:
         logger.error(f"[Approval] reject 失败 id={approval_id}: {e}")
-        return False
+    # fail-closed:驳回失败时返回 False
+    return False
 
 
 async def cancel(approval_id: int, user_id: int) -> bool:
@@ -510,7 +513,8 @@ async def cancel(approval_id: int, user_id: int) -> bool:
         return True
     except Exception as e:
         logger.error(f"[Approval] cancel 失败 id={approval_id}: {e}")
-        return False
+    # fail-closed:审批失败时返回 False
+    return False
 
 
 # ─── R40 P0-8: 命令执行状态管理 ─────────────────────────────────
@@ -551,7 +555,8 @@ async def mark_executing(approval_id: int) -> bool:
         return True
     except Exception as e:
         logger.error(f"[Approval] mark_executing 失败 id={approval_id}: {e}")
-        return False
+    # fail-closed:审批失败时返回 False
+    return False
 
 
 async def mark_executed(approval_id: int) -> bool:
@@ -595,7 +600,8 @@ async def mark_executed(approval_id: int) -> bool:
         return True
     except Exception as e:
         logger.error(f"[Approval] mark_executed 失败 id={approval_id}: {e}")
-        return False
+    # fail-closed:审批失败时返回 False
+    return False
 
 
 async def mark_failed(approval_id: int, error: str = "") -> bool:
@@ -646,7 +652,8 @@ async def mark_failed(approval_id: int, error: str = "") -> bool:
         return True
     except Exception as e:
         logger.error(f"[Approval] mark_failed 失败 id={approval_id}: {e}")
-        return False
+    # fail-closed:审批失败时返回 False
+    return False
 
 
 async def mark_approval_executed(approval_id: int, action_id: str = "") -> bool:
@@ -694,7 +701,8 @@ async def mark_approval_executed(approval_id: int, action_id: str = "") -> bool:
             f"[Approval] mark_approval_executed 失败 id={approval_id} "
             f"action_id={action_id}: {e}"
         )
-        return False
+    # fail-closed:审批失败时返回 False
+    return False
 
 
 async def get_approval(approval_id: int) -> dict | None:

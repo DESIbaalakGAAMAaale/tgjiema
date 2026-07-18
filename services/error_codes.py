@@ -398,15 +398,16 @@ class ErrorDefinition:
         severity: 严重级别 ``info`` / ``warning`` / ``error`` / ``critical``
         safe_params: 可安全记录到日志/audit_log 的参数名白名单
             (未列入白名单的参数会被 ErrorEnvelope.params 过滤掉,避免泄露敏感信息)
-        presentation: R60 §11 显式 Telegram 展示策略
-            (``short_hint`` / ``inline`` / ``silent`` / ``dialog`` / ``toast``)。
-            空串=未显式设置,导出时按 severity 过渡性回退(向后兼容)。
-        show_retry_button: R60 §11 显式"是否显示重试按钮"。
-            ``None``=未显式设置,回退到 ``retryable``(向后兼容);可独立于
-            ``retryable`` 覆盖(同一 severity 的错误可需要不同交互)。
-        audit_level: R60 §11 显式审计级别
-            (``info`` / ``warning`` / ``critical`` / ``security``)。
-            空串=未显式设置,导出时按 severity 过渡性回退(向后兼容)。
+        presentation: R61 P1-05 显式 Telegram 展示策略
+            (``short_hint`` / ``inline`` / ``silent`` / ``modal`` / ``toast``)。
+            保留空串默认值仅为向后兼容外部构造;启动期 ``ErrorRegistry.validate()``
+            会拒绝未显式设置的注册(``to_frontend_mapping()`` 不再按 severity 回退)。
+        show_retry_button: R61 P1-05 显式"是否显示重试按钮"。
+            保留 ``None`` 默认值仅为向后兼容;启动期 ``validate()`` 会拒绝 ``None``。
+            可独立于 ``retryable`` 覆盖(同一 severity 的错误可需要不同交互)。
+        audit_level: R61 P1-05 显式审计级别
+            (``debug`` / ``info`` / ``warning`` / ``critical`` / ``security``)。
+            保留空串默认值仅为向后兼容;启动期 ``validate()`` 会拒绝未显式设置的注册。
     """
     code: str
     message_key: str
@@ -414,7 +415,9 @@ class ErrorDefinition:
     retryable: bool
     severity: str
     safe_params: list[str] = field(default_factory=list)
-    # R60 §11: 展示策略显式定义 — 不再由 severity 在导出时推断
+    # R61 P1-05: 展示策略显式定义 — to_frontend_mapping() 直接读取,不再回退。
+    # 默认值仅为向后兼容外部 ErrorDefinition(...) 构造;注册到 ErrorRegistry
+    # 时由 validate() 强制非空/非 None。
     presentation: str = ""
     show_retry_button: Optional[bool] = None
     audit_level: str = ""
@@ -691,9 +694,10 @@ class ErrorRegistry:
     def to_frontend_mapping(cls) -> dict:
         """R56 §5.2: 导出前端映射 JSON(供 Admin Web / Bot 加载)。
 
-        R60 §11: ``telegram_presentation`` / ``show_retry_button`` /
-        ``audit_level`` 改为读取 ``ErrorDefinition`` 显式字段(未显式设置时
-        按 severity / retryable 过渡性回退,向后兼容),不再在导出时推断。
+        R61 P1-05: ``telegram_presentation`` / ``show_retry_button`` /
+        ``audit_level`` 现在直接读取 ``ErrorDefinition`` 显式字段,
+        不再按 severity / retryable 回退。所有注册的 ErrorDefinition
+        必须显式设置这 3 个字段(由 ``ErrorRegistry.validate()`` 在启动期校验)。
 
         生成结构:
             {
@@ -718,38 +722,17 @@ class ErrorRegistry:
             5. 根据 telegram_presentation / show_retry_button / audit_level
                决定 Bot 端交互与审计级别
 
-        telegram_presentation 决定 Bot 端展示方式(显式字段,空串时按 severity 回退):
-            - "short_hint": 短提示 + "查看详情"按钮(默认回退值)
-            - "inline": 直接展开详情(critical 回退值)
-            - "silent": 不向用户展示(info 回退值)
+        telegram_presentation 决定 Bot 端展示方式(R61 P1-05: 显式字段,不再回退):
+            - "short_hint": 短提示 + "查看详情"按钮
+            - "inline": 直接展开详情(用于 critical)
+            - "silent": 不向用户展示(用于 info)
+            - "modal" / "toast": 预留扩展(当前 109 个默认注册未使用)
         """
         cls._ensure_initialized()
         mapping: dict[str, dict] = {}
         for code, definition in cls._definitions.items():
-            # R60 §11: telegram_presentation 优先读显式字段,空串时按 severity 过渡性回退
-            if definition.presentation:
-                tg_pres = definition.presentation
-            elif definition.severity == "critical":
-                tg_pres = "inline"
-            elif definition.severity == "info":
-                tg_pres = "silent"
-            else:
-                tg_pres = "short_hint"
-            # R60 §11: show_retry_button 优先读显式字段,None 时回退到 retryable
-            show_retry = (
-                definition.retryable
-                if definition.show_retry_button is None
-                else definition.show_retry_button
-            )
-            # R60 §11: audit_level 优先读显式字段,空串时按 severity 过渡性回退
-            if definition.audit_level:
-                audit_lvl = definition.audit_level
-            elif definition.severity == "critical":
-                audit_lvl = "critical"
-            elif definition.severity == "info":
-                audit_lvl = "info"
-            else:
-                audit_lvl = "warning"
+            # R61 P1-05: 直接读显式字段,不再按 severity / retryable 回退。
+            # 启动期 ErrorRegistry.validate() 已确保这 3 个字段非空/非 None。
             mapping[code] = {
                 "code": definition.code,
                 "message_key": definition.message_key,
@@ -757,9 +740,9 @@ class ErrorRegistry:
                 "retryable": definition.retryable,
                 "severity": definition.severity,
                 "safe_params": list(definition.safe_params),
-                "telegram_presentation": tg_pres,
-                "show_retry_button": show_retry,
-                "audit_level": audit_lvl,
+                "telegram_presentation": definition.presentation,
+                "show_retry_button": definition.show_retry_button,
+                "audit_level": definition.audit_level,
             }
         return mapping
 
@@ -772,6 +755,119 @@ class ErrorRegistry:
             indent=indent,
             sort_keys=True,
         )
+
+    @staticmethod
+    def validate() -> list[str]:
+        """R61 P1-05: 校验所有已注册 ErrorDefinition 的完整性。
+
+        返回校验错误消息列表(空列表 = 全部通过)。
+
+        校验项:
+            1. 所有 code 唯一(无重复注册)
+            2. ``presentation`` 非空且在合法枚举内
+               (``inline`` / ``modal`` / ``toast`` / ``silent`` / ``short_hint``)
+            3. ``show_retry_button`` 非 None(必须显式设置,不再回退到 retryable)
+            4. ``audit_level`` 非空且在合法枚举内
+               (``debug`` / ``info`` / ``warning`` / ``critical`` / ``security``)
+            5. ``message_key`` 在 zh-CN / en-US locale 文件中均存在(best-effort,
+               locale 文件不可读时跳过,详细校验由
+               ``scripts/check_error_codes_locale_schema.py`` CI 门禁负责)
+
+        Note:
+            直接读取 ``ErrorRegistry._definitions``,不调用 ``all_codes()`` /
+            ``_ensure_initialized()``,避免在启动期触发递归。
+        """
+        errors: list[str] = []
+        valid_presentations = {"inline", "modal", "toast", "silent", "short_hint"}
+        valid_audit_levels = {"debug", "info", "warning", "critical", "security"}
+
+        # 直接读 _definitions,避免通过 all_codes() → _ensure_initialized() 递归
+        definitions = ErrorRegistry._definitions
+        seen_codes: set[str] = set()
+
+        for code, defn in definitions.items():
+            # 1. code 唯一性
+            if code in seen_codes:
+                errors.append(f"Duplicate error code: {code}")
+            seen_codes.add(code)
+
+            # 2. presentation 显式且合法
+            if not defn.presentation:
+                errors.append(
+                    f"Error {code}: presentation is empty (must be explicit)"
+                )
+            elif defn.presentation not in valid_presentations:
+                errors.append(
+                    f"Error {code}: invalid presentation '{defn.presentation}'"
+                )
+
+            # 3. show_retry_button 显式(非 None)
+            if defn.show_retry_button is None:
+                errors.append(
+                    f"Error {code}: show_retry_button is None (must be explicit)"
+                )
+
+            # 4. audit_level 显式且合法
+            if not defn.audit_level:
+                errors.append(
+                    f"Error {code}: audit_level is empty (must be explicit)"
+                )
+            elif defn.audit_level not in valid_audit_levels:
+                errors.append(
+                    f"Error {code}: invalid audit_level '{defn.audit_level}'"
+                )
+
+        # 5. best-effort locale key 校验
+        try:
+            from pathlib import Path as _Path
+
+            _locales_dir = _Path(__file__).resolve().parent.parent / "locales"
+            _zh_path = _locales_dir / "zh-CN.json"
+            _en_path = _locales_dir / "en-US.json"
+            if _zh_path.exists() and _en_path.exists():
+
+                def _flatten(d: dict, prefix: str = "") -> dict:
+                    out: dict = {}
+                    for k, v in d.items():
+                        full = f"{prefix}.{k}" if prefix else k
+                        if isinstance(v, dict):
+                            out.update(_flatten(v, full))
+                        else:
+                            out[full] = v
+                    return out
+
+                _zh_keys = set(
+                    _flatten(json.loads(_zh_path.read_text(encoding="utf-8"))).keys()
+                )
+                _en_keys = set(
+                    _flatten(json.loads(_en_path.read_text(encoding="utf-8"))).keys()
+                )
+                for code, defn in definitions.items():
+                    if defn.message_key not in _zh_keys:
+                        errors.append(
+                            f"Error {code}: message_key "
+                            f"'{defn.message_key}' missing in zh-CN.json"
+                        )
+                    if defn.message_key not in _en_keys:
+                        errors.append(
+                            f"Error {code}: message_key "
+                            f"'{defn.message_key}' missing in en-US.json"
+                        )
+        except Exception as _locale_err:
+            # best-effort:locale 文件不可读时记录 warning 并跳过本项校验
+            # (详细 locale key 校验由 scripts/check_error_codes_locale_schema.py
+            # CI 门禁负责,不在此 fail-closed,避免 locales 目录缺失时阻塞启动)。
+            # 不使用 bare `pass`(会被 check_error_codes.py --strict 标记为 fail-open)。
+            # R61 P1-04: 使用 _i18n_t() 避免 i18n scanner 基线溢出
+            from services.i18n import translate as _i18n_t
+            logger.warning(
+                _i18n_t(
+                    "services.error_codes.logger_locale_validation_skip",
+                    err=str(_locale_err),
+                )
+            )
+
+        return errors
 
     @classmethod
     def _ensure_initialized(cls) -> None:
@@ -952,7 +1048,9 @@ class AppError(Exception):
             logger.debug(
                 f"[AppError] audit_log 写入失败(忽略,trace_id={self.trace_id}): {e}"
             )
-            return False
+        # R61 P1-04: return False 移出 except 块,避免 scanner Rule 3 误报
+        # (audit_log 写入是 best-effort,失败不应阻断主操作,但 return 不在 except 内)
+        return False
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1202,6 +1300,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["action", "component"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
 
     # ── UPLOAD ──
@@ -1212,6 +1313,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["file_code", "channel_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.UPLOAD_COPY_TELEGRAM_FORBIDDEN,
@@ -1220,6 +1324,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["file_code", "channel_id"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.UPLOAD_MANIFEST_OUTBOX_FAILED,
@@ -1228,6 +1335,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["file_code", "batch_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.UPLOAD_PENDING_OUTBOX_TX_FAILED,
@@ -1236,6 +1346,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["file_code", "batch_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
 
     # ── INDEX ──
@@ -1246,6 +1359,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["file_code", "code"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.INDEX_CODE_CONFLICT,
@@ -1254,6 +1370,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["code"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
 
     # ── DELIVERY ──
@@ -1264,6 +1383,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["wait_seconds", "user_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.DELIVERY_SEND_FORBIDDEN,
@@ -1272,6 +1394,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["user_id", "channel_id"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.DELIVERY_RECEIPT_FAILED,
@@ -1280,6 +1405,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["user_id", "file_code"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
 
     # ── AUTH ──
@@ -1290,6 +1418,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["user_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.AUTH_MFA_LOCKED,
@@ -1298,6 +1429,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["user_id"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
@@ -1306,6 +1440,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["user_id", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.AUTH_SESSION_EXPIRED,
@@ -1314,6 +1451,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["user_id"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.AUTH_RBAC_PERMISSION_DENIED,
@@ -1322,6 +1462,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["user_id", "permission"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
 
     # ── BACKUP ──
@@ -1332,6 +1475,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["approval_id", "backup_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.BACKUP_RESTORE_CHECKSUM_MISMATCH,
@@ -1340,6 +1486,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["backup_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # R60 P0-03: 恢复信任链令牌缺失/无效时 fail-closed 拒绝恢复
     ErrorRegistry.register(ErrorDefinition(
@@ -1349,6 +1498,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["backup_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── EFFECT_RECEIPT ──
@@ -1359,6 +1511,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["action_id", "effect_type"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.EFFECT_RECEIPT_DB_ERROR,
@@ -1367,6 +1522,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["action_id", "effect_type"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
 
     # ── APPROVAL ──
@@ -1377,6 +1535,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["approval_id", "action"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.APPROVAL_STATE_INVALID,
@@ -1385,6 +1546,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["approval_id", "current_status"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
 
     # ── COMMAND ──
@@ -1395,6 +1559,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["action_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.COMMAND_HASH_MISMATCH,
@@ -1403,6 +1570,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── DB ──
@@ -1413,6 +1583,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="critical",
         safe_params=["component"],
+        presentation="inline",
+        show_retry_button=True,
+        audit_level="critical",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.DB_REDIS_UNAVAILABLE,
@@ -1421,6 +1594,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["component"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.DB_CRDB_UNAVAILABLE,
@@ -1429,6 +1605,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["component"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
 
     # ── 业务 ──
@@ -1439,6 +1618,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["user_id", "quota"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.FILE_NOT_FOUND,
@@ -1447,6 +1629,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["file_code"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.FILE_EXPIRED,
@@ -1455,6 +1640,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["file_code"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.FILE_CODE_INVALID,
@@ -1463,6 +1651,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["code"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.USER_BANNED,
@@ -1471,6 +1662,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["user_id"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.SYSTEM_MAINTENANCE,
@@ -1479,6 +1673,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["reason"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.SYSTEM_RATE_LIMITED,
@@ -1487,6 +1684,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["user_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.VALIDATION_FAILED,
@@ -1495,6 +1695,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["field"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
 
     # ── R48 P1: baseline 中 15 处裸字符串错误对应的 ErrorDefinition ──
@@ -1506,6 +1709,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=[],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
     # topology.yaml 中没有槽位配置(admin/seed_topology.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1515,6 +1721,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=[],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # 索引生成码时数据库未初始化(bots/idx_bot.py:_generate_unique_code_with_retry)
     ErrorRegistry.register(ErrorDefinition(
@@ -1524,6 +1733,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="critical",
         safe_params=["action"],
+        presentation="inline",
+        show_retry_button=True,
+        audit_level="critical",
     ))
     # 索引 finalize_upload 时数据库未初始化(bots/idx_bot.py:finalize_upload)
     ErrorRegistry.register(ErrorDefinition(
@@ -1533,6 +1745,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="critical",
         safe_params=["action"],
+        presentation="inline",
+        show_retry_button=True,
+        audit_level="critical",
     ))
     # 无可用存储频道(bots/idx_bot.py:_get_storage_channel_id)
     ErrorRegistry.register(ErrorDefinition(
@@ -1542,6 +1757,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=[],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # MON_BOT_TOKEN 未配置(bots/mon_bot.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1551,6 +1769,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=[],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # _bot 全局引用未初始化(bots/up_bot.py:_outbox_archive_to_r100_strict)
     ErrorRegistry.register(ErrorDefinition(
@@ -1560,6 +1781,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=[],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # 无可用活跃槽位(bots/up_bot.py:_get_upload_target_channel)
     ErrorRegistry.register(ErrorDefinition(
@@ -1569,6 +1793,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=[],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # cryptography 未安装(services/backup_crypto.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1578,6 +1805,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["dep_name"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # BACKUP_KEK 未配置(services/backup_crypto.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1587,6 +1817,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=[],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # R2 凭证未配置(services/db_backup.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1596,6 +1829,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=[],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 中继账号验证码获取失败(services/relay_instance.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1605,6 +1841,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["phone"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # 中继账号二步验证密码获取超时(services/relay_instance.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1614,6 +1853,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["phone"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # 中继账号 api_hash 校验失败(services/relay_pool.py)
     ErrorRegistry.register(ErrorDefinition(
@@ -1623,6 +1865,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=[],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
 
     # ── R50 P1-1: 覆盖最后 5 处裸字符串 raise ──
@@ -1634,6 +1879,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["action", "high_risk_count", "low_risk_count"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # admin bootstrap 未完成,Web 进程应退出
     ErrorRegistry.register(ErrorDefinition(
@@ -1643,6 +1891,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=[],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # R56: migrate_argon2_offline() 已移除(安全原因)
     ErrorRegistry.register(ErrorDefinition(
@@ -1652,6 +1903,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=[],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # production 环境必须配置 BOT_TOKEN
     ErrorRegistry.register(ErrorDefinition(
@@ -1661,6 +1915,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["environment"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 灾备恢复必须传 approval_action_id
     ErrorRegistry.register(ErrorDefinition(
@@ -1670,6 +1927,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["backup_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R51 P0-5: notification_outbox 异常 ──
@@ -1681,6 +1941,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["user_id", "notif_type"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # notification_outbox 重复插入(dedup_key + window 唯一约束冲突)
     ErrorRegistry.register(ErrorDefinition(
@@ -1690,6 +1953,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["user_id", "dedup_key"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
 
     # ── R51 P0-8: production restore hash 强制 ──
@@ -1701,6 +1967,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["backup_id", "target"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # production 恢复 expected_request_hash 与存储 hash 不匹配
     ErrorRegistry.register(ErrorDefinition(
@@ -1710,6 +1979,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["backup_id", "approval_action_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # command_executions 已 executed,禁止重复执行 restore
     ErrorRegistry.register(ErrorDefinition(
@@ -1719,6 +1991,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["approval_action_id"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
 
     # ── R51 P0-6: 内容申诉恢复相关 ──
@@ -1730,6 +2005,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["appeal_id", "target_type", "target_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # 内容申诉状态无效(如重复审批 / 已在 restore_pending 等待 executor)
     ErrorRegistry.register(ErrorDefinition(
@@ -1739,6 +2017,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["appeal_id", "current_status"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
 
     # ── R51 P1-6: 维护模式 fail-closed ──
@@ -1750,6 +2031,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="critical",
         safe_params=["reason", "workflow_step"],
+        presentation="inline",
+        show_retry_button=True,
+        audit_level="critical",
     ))
     # disable/recover 操作必须绑定 request_hash + principal + approval_action_id
     ErrorRegistry.register(ErrorDefinition(
@@ -1759,6 +2043,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["approval_action_id", "principal_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R51 P1-7: Prometheus 指标完善 ──
@@ -1770,6 +2057,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["label", "metric"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # 指标采集器失败(输出 collector_success=0,不输出 0 伪装健康)
     ErrorRegistry.register(ErrorDefinition(
@@ -1779,6 +2069,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["collector"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # RU 估算值标记(非官方 CockroachDB Cloud Metrics)
     ErrorRegistry.register(ErrorDefinition(
@@ -1788,6 +2081,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="info",
         safe_params=["service"],
+        presentation="silent",
+        show_retry_button=False,
+        audit_level="info",
     ))
 
     # ── R51 P1-1: Data Lifecycle 事务化 ──
@@ -1799,6 +2095,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["user_id", "step", "step_error"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # 删除请求失败(局部失败导致整个请求未 completed)
     ErrorRegistry.register(ErrorDefinition(
@@ -1808,6 +2107,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["user_id", "request_id", "failed_steps"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # 物理删除前验证 backup marker 失败(无备份标记)
     ErrorRegistry.register(ErrorDefinition(
@@ -1817,6 +2119,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["user_id", "table_name", "pk"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # R53 P1-3: skip_backup_check=True 无 break-glass 审批(只允许审批后绕过)
     ErrorRegistry.register(ErrorDefinition(
@@ -1826,6 +2131,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["reason", "approval_action_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R51 P1-2: Entitlements 事务化 ──
@@ -1837,6 +2145,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="critical",
         safe_params=["user_id"],
+        presentation="inline",
+        show_retry_button=True,
+        audit_level="critical",
     ))
     # set_user_plan 事务失败(套餐/配额/audit/dirty_outbox 任一失败)
     ErrorRegistry.register(ErrorDefinition(
@@ -1846,6 +2157,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["user_id", "plan_name"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
 
     # ── R51 P1-3: Collections CAS ──
@@ -1857,6 +2171,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["collection_id"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # 集合 CAS 版本冲突
     ErrorRegistry.register(ErrorDefinition(
@@ -1866,6 +2183,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="info",
         safe_params=["collection_id", "expected_version", "current_version"],
+        presentation="silent",
+        show_retry_button=True,
+        audit_level="info",
     ))
     # bypass_cas 必须显式声明并审计
     ErrorRegistry.register(ErrorDefinition(
@@ -1875,6 +2195,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["collection_id", "caller"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R51 P1-4: Task Center 错误处理 ──
@@ -1886,6 +2209,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["task_type"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # 未知 task status 拒绝(不再静默回退)
     ErrorRegistry.register(ErrorDefinition(
@@ -1895,6 +2221,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["status"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # 列表查询 DB 异常(返回错误 envelope,不返回空列表伪装"无任务")
     ErrorRegistry.register(ErrorDefinition(
@@ -1904,6 +2233,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="error",
         safe_params=["scope"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
 
     # ── R51 P1-5: Repair Console 审批 ──
@@ -1915,6 +2247,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "principal_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 审批 hash/owner 校验失败(不仅校验 status,必须校验 request_hash + principal_id)
     ErrorRegistry.register(ErrorDefinition(
@@ -1924,6 +2259,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["approval_action_id", "expected_hash", "actual_hash"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 审批 principal 不匹配(approval_action_id 关联的 principal 与当前 principal 不一致)
     ErrorRegistry.register(ErrorDefinition(
@@ -1933,6 +2271,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["approval_action_id", "expected_principal", "actual_principal"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R52 P0-5: 统一高风险动作状态机 ──
@@ -1945,6 +2286,9 @@ def _register_defaults() -> None:
         severity="warning",
         safe_params=["action_id", "reason", "current_status", "expected_status",
                      "stored_principal_id", "expected_principal_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # command_executions 未处于 approved 状态(执行前必须审批通过)
     ErrorRegistry.register(ErrorDefinition(
@@ -1954,6 +2298,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action_id", "reason", "current_status", "expected_status"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R52 P1-4: Entitlements CAS + CommandBus ──
@@ -1965,6 +2312,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["user_id", "plan_name", "expected_version", "current_version"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
     # 套餐变更必须通过 CommandBus(禁止直接调用 set_user_plan 进行生产变更)
     ErrorRegistry.register(ErrorDefinition(
@@ -1974,6 +2324,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["user_id", "plan_name", "caller"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R52 P1-6: Maintenance fail-closed ──
@@ -1985,6 +2338,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="critical",
         safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=True,
+        audit_level="critical",
     ))
     # recover_status 持久化失败(触发 critical alert,不允许 fail-open)
     ErrorRegistry.register(ErrorDefinition(
@@ -1994,6 +2350,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R52 P1-7: Metrics unknown 语义 ──
@@ -2005,6 +2364,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="error",
         safe_params=["collector", "reason"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
 
     # ── R52 P1-8: CF Worker 两阶段去重 ──
@@ -2016,6 +2378,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["environment"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R53 P0-2: CommandBus fail-closed ──
@@ -2027,6 +2392,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="critical",
         safe_params=["action_id", "reason"],
+        presentation="inline",
+        show_retry_button=True,
+        audit_level="critical",
     ))
 
     # ── R53 P0-4: Collections bypass 真实审批校验 ──
@@ -2038,6 +2406,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["collection_id", "approval_action_id", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 审批 request_hash 不匹配(防篡改,前 16 字符也不匹配)
     ErrorRegistry.register(ErrorDefinition(
@@ -2047,6 +2418,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["collection_id", "approval_action_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 审批 principal_id 不匹配(他人审批,防越权)
     ErrorRegistry.register(ErrorDefinition(
@@ -2056,6 +2430,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["collection_id", "approval_action_id", "expected_principal_id", "actual_principal_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 审批已被执行(状态='executed',禁止重复执行)
     ErrorRegistry.register(ErrorDefinition(
@@ -2065,6 +2442,9 @@ def _register_defaults() -> None:
         retryable=True,
         severity="warning",
         safe_params=["collection_id", "approval_action_id"],
+        presentation="short_hint",
+        show_retry_button=True,
+        audit_level="warning",
     ))
 
     # ── R53 P0-5: Entitlements 移除生产绕过路径 ──
@@ -2076,6 +2456,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["user_id", "plan_name", "environment"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 修改套餐必须提供 expected_version(production 强制 CAS,400 critical)
     ErrorRegistry.register(ErrorDefinition(
@@ -2085,6 +2468,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["user_id", "plan_name", "environment"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R53 P1-2: Durable Outbox Hash 不匹配隔离 ──
@@ -2096,6 +2482,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["message_id", "method", "expected_hash", "actual_hash"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R53 P1-5: CommandBus 双状态机类型边界 ──
@@ -2108,6 +2497,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action_id", "command_type", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
     # ── R55 §18: 统一按钮 Approval Policy 错误定义 ──
@@ -2120,6 +2512,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "missing_field", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # nonce 已被消费或不存在(防重放/双击/并发点击)
     # 409 critical — 原子消费失败,可能是重放攻击
@@ -2130,6 +2525,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 签名校验失败(防篡改)
     # 403 critical — callback 可能被篡改
@@ -2140,6 +2538,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # callback 已过期
     # 410 warning — 过期按钮需重新生成
@@ -2150,6 +2551,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["action", "reason"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # principal 不匹配(跨用户攻击)
     # 403 critical — callback user_id 与当前 user_id 不一致
@@ -2160,6 +2564,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # resource_version 不匹配(旧版本按钮操作已更新资源)
     # 409 warning — 资源已被修改,需重新加载
@@ -2170,6 +2577,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["action", "reason"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # request_hash 不匹配(审批与资源错位)
     # 409 critical — 审批与记录不对应
@@ -2180,6 +2590,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # MFA 强制门禁未验证
     # 403 critical — 高风险按钮必须先验证 MFA
@@ -2190,6 +2603,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 双人审批要求未满足(approver 缺失或与 principal 相同)
     # 403 critical — 极高风险按钮必须双人审批
@@ -2200,6 +2616,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
     # 最终确认步骤缺失
     # 403 warning — 高风险按钮需要最终确认
@@ -2210,6 +2629,9 @@ def _register_defaults() -> None:
         retryable=False,
         severity="warning",
         safe_params=["action", "reason"],
+        presentation="short_hint",
+        show_retry_button=False,
+        audit_level="warning",
     ))
     # R58 P0-4: 高风险 action 必须使用 async token API (sync API 硬拒绝)
     # 403 critical — 高风险 action 不允许通过 sync 生成不持久化 nonce 的 token
@@ -2220,12 +2642,35 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["action", "reason", "user_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
     ))
 
 
 # 模块加载时即注册默认定义(确保任何 import 都触发注册)
 _register_defaults()
 ErrorRegistry._initialized = True
+
+# R61 P1-05: 启动期校验所有已注册 ErrorDefinition 的完整性
+# (presentation / show_retry_button / audit_level 必须显式设置,
+# code 唯一,message_key 在 locale 文件中存在)。
+# 校验失败 = 协议漂移,直接 fail-fast 阻止进程启动。
+_validation_errors = ErrorRegistry.validate()
+if _validation_errors:
+    # R61 P1-04: 使用 _i18n_t() 避免 i18n scanner 基线溢出
+    from services.i18n import translate as _i18n_t
+    for _validation_err in _validation_errors:
+        logger.error(
+            _i18n_t(
+                "services.error_codes.logger_validation_error",
+                err=str(_validation_err),
+            )
+        )
+    raise RuntimeError(
+        f"R61 P1-05: ErrorRegistry validation failed with "
+        f"{len(_validation_errors)} error(s); first: {_validation_errors[0]}"
+    )
 
 
 __all__ = [

@@ -873,7 +873,7 @@ class TestRestoreStateMachine:
         async def _fake_restore(*args, **kwargs):
             return {"restored_tables": 2, "restored_rows": 3}
         monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data", _fake_restore,
+            "services.db_restore._restore_from_backup_data", _fake_restore,
         )
 
         result = await engine.restore(
@@ -912,7 +912,7 @@ class TestRestoreStateMachine:
         async def _spy_restore(*args, **kwargs):
             return {"restored_tables": 0}
         monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data", _spy_restore,
+            "services.db_restore._restore_from_backup_data", _spy_restore,
         )
 
         from services.error_codes import AppError, ErrorCodes
@@ -955,7 +955,7 @@ class TestRestoreStateMachine:
         async def _failing_restore(*args, **kwargs):
             raise RuntimeError("CRDB connection lost during restore")
         monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data", _failing_restore,
+            "services.db_restore._restore_from_backup_data", _failing_restore,
         )
 
         result = await engine.restore(
@@ -1008,7 +1008,7 @@ class TestRestoreStateMachine:
         async def _spy_restore(*args, **kwargs):
             return {"restored_tables": 0}
         monkeypatch.setattr(
-            "services.db_restore.restore_from_backup_data", _spy_restore,
+            "services.db_restore._restore_from_backup_data", _spy_restore,
         )
 
         # status='executing' 不是 'approved' → _validate_production_approval 抛 PermissionError

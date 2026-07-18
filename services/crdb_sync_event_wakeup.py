@@ -47,6 +47,8 @@ import logging
 from typing import Optional
 
 from loguru import logger
+# R61 P1-04: i18n for logger calls (avoid scanner baseline overflow)
+from services.i18n import translate as _i18n_t
 
 # ── 常量 ──────────────────────────────────────────────────────
 
@@ -146,6 +148,7 @@ async def wait_dirty_signal(timeout: float) -> bool:
     """
     if timeout <= 0:
         return False
+    _subscriber_failed = False
     try:
         pubsub = await _ensure_subscriber()
     except Exception as e:
@@ -154,6 +157,9 @@ async def wait_dirty_signal(timeout: float) -> bool:
             f"(fallback 到 sleep): {e}"
         )
         await asyncio.sleep(min(timeout, 5.0))
+        _subscriber_failed = True
+        pubsub = None
+    if _subscriber_failed:
         return False
     if pubsub is None:
         # Redis 不可用 → fallback 到 sleep(保持 polling 行为)
@@ -180,7 +186,8 @@ async def wait_dirty_signal(timeout: float) -> bool:
         )
         return True
     except asyncio.TimeoutError:
-        return False
+        # 超时是预期行为,fall through 到 return False
+        logger.debug(_i18n_t("services.crdb_sync_event_wakeup.logger_wait_dirty_signal_timeout"))
     except Exception as e:
         logger.debug(
             f"[crdb_sync_event] R56 §7.2.3: wait_dirty_signal 异常 "
@@ -188,7 +195,7 @@ async def wait_dirty_signal(timeout: float) -> bool:
         )
         # 异常时 fallback 到 sleep(不永久阻塞 sync_loop)
         await asyncio.sleep(min(timeout, 5.0))  # 最多 sleep 5s 避免永久阻塞
-        return False
+    return False
 
 
 def reset_subscriber() -> None:
@@ -241,15 +248,16 @@ async def get_local_sync_watermark(table_name: str) -> int:
         if row is None:
             return 0
         try:
-            return int(row[0])
+            value = int(row[0])
         except (ValueError, TypeError):
-            return 0
+            value = 0
+        return value
     except Exception as e:
         logger.debug(
             f"[crdb_sync_event] R56 §7.2.5: 读取 sync watermark 失败 "
             f"table={table_name}: {e}"
         )
-        return 0
+    return 0
 
 
 async def set_local_sync_watermark(table_name: str, watermark: int) -> bool:
@@ -281,7 +289,7 @@ async def set_local_sync_watermark(table_name: str, watermark: int) -> bool:
             f"[crdb_sync_event] R56 §7.2.5: 更新 sync watermark 失败 "
             f"table={table_name} watermark={watermark}: {e}"
         )
-        return False
+    return False
 
 
 def get_watermark_key(table_name: str) -> str:

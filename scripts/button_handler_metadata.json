@@ -1,0 +1,137 @@
+{
+  "description": "R61 P1-09: 高风险按钮 handler 元数据 sidecar + 门禁 baseline",
+  "note": "handlers 段为每个已知高风险 handler 声明完整字段集(Rule B);baseline 段记录 Rule A/C 的现有违规(ratchet 下降)。Rule B 无 baseline,必须补全字段。",
+  "handlers": {
+    "toggle_ban": {
+      "action_type": "ban",
+      "rbac": "PERM_USERS_BAN (ban) / PERM_USERS_UNBAN (unban)",
+      "mfa": "required_for_ban (web session mfa_verified=True; ban_user 走审批,审批人需 MFA)",
+      "two_person_approval": "ban_user: required (APPROVAL_ACTION_BAN); unban_user: not required",
+      "idempotency_key": ["action_id", "request_hash", "user_id"],
+      "state_transitions": "pending -> approved -> executing -> executed (ban); pending -> executing -> executed (unban, 无审批)",
+      "timeout": "approval_ttl=86400s (24h); execution_lease=300s",
+      "cancellation": "supported via approval reject (pending -> rejected); executing 阶段不可取消",
+      "localization_confirmation": "admin.__init__.s42 (CSRF 失败) / admin.__init__.s43 (用户不存在) / 审批列表页重定向",
+      "audit_schema": "command_approvals(action_id, command_type=ban_user/unban_user, principal_id, request_hash, status, created_at); audit_log(action=ban_user/unban_user, actor=admin.id, target=user_id)"
+    },
+    "delete_file": {
+      "action_type": "delete",
+      "rbac": "PERM_CONTENT_TAKEDOWN (软删除复用 takedown 权限)",
+      "mfa": "inherited from web session (mfa_verified)",
+      "two_person_approval": "not required (软删除 requires_approval=False, 可立即执行)",
+      "idempotency_key": ["action_id", "request_hash", "file_code"],
+      "state_transitions": "pending -> executing -> executed (无审批,直接执行)",
+      "timeout": "execution_lease=300s",
+      "cancellation": "not supported (软删除立即执行,无 pending 窗口)",
+      "localization_confirmation": "admin.__init__.s44 (CSRF 失败) / admin.__init__.s12 (文件不存在) / admin.__init__.s13 (权限不足)",
+      "audit_schema": "command_executions(action_id, command_type=delete_file, principal_id, request_hash, status, executed_at); audit_log(action=delete_file, actor=admin.id, target=file_code)"
+    },
+    "takedown_report": {
+      "action_type": "takedown",
+      "rbac": "PERM_CONTENT_TAKEDOWN",
+      "mfa": "required (审批人需 MFA; submitter 继承 web session mfa_verified)",
+      "two_person_approval": "required (APPROVAL_ACTION_TAKEDOWN)",
+      "idempotency_key": ["action_id", "request_hash", "target_type", "target_id"],
+      "state_transitions": "pending -> approved -> executing -> executed",
+      "timeout": "approval_ttl=86400s (24h); execution_lease=300s",
+      "cancellation": "supported via approval reject (pending -> rejected)",
+      "localization_confirmation": "admin.__init__.s45 (CSRF 失败) / admin.__init__.s46 (举报不存在) / 审批列表页重定向",
+      "audit_schema": "command_approvals(action_id, command_type=takedown_report, principal_id, request_hash, status); audit_log(action=takedown_report, actor=admin.id, target=target_type:target_id)"
+    },
+    "maintenance_action": {
+      "action_type": "maintenance",
+      "rbac": "PERM_MAINTENANCE_ENABLE (enable) / PERM_MAINTENANCE_DISABLE (disable)",
+      "mfa": "required (审批人需 MFA; submitter 继承 web session mfa_verified)",
+      "two_person_approval": "required (APPROVAL_ACTION_MAINTENANCE_ENABLE / APPROVAL_ACTION_MAINTENANCE_DISABLE)",
+      "idempotency_key": ["action_id", "request_hash", "action"],
+      "state_transitions": "pending -> approved -> executing -> executed",
+      "timeout": "approval_ttl=86400s (24h); execution_lease=300s",
+      "cancellation": "supported via approval reject (pending -> rejected)",
+      "localization_confirmation": "admin.__init__.s47 (CSRF 失败) / admin.__init__.s54 (未知 action) / 审批列表页重定向",
+      "audit_schema": "command_approvals(action_id, command_type=enable_maintenance/disable_maintenance, principal_id, request_hash, status); audit_log(action=maintenance, actor=admin.id, target=action)"
+    },
+    "_handle_restore_action": {
+      "action_type": "restore",
+      "rbac": "PERM_DISASTER_RESTORE",
+      "mfa": "required (审批人需 MFA; submitter 为 AUTHORIZED_USER_ID bot 操作者)",
+      "two_person_approval": "required (APPROVAL_ACTION_RESTORE)",
+      "idempotency_key": ["action_id", "request_hash", "backup_id", "tables", "merge"],
+      "state_transitions": "pending -> approved -> executing -> executed",
+      "timeout": "approval_ttl=86400s (24h); execution_lease=600s (恢复操作较长)",
+      "cancellation": "supported via approval reject (pending -> rejected); restore:cancel 按钮取消确认",
+      "localization_confirmation": "bot.admin_bot.callback.s7 (未授权) / bot.admin_bot.callback.s8 (取消) / bot.admin_bot.callback.s12 (审批中)",
+      "audit_schema": "command_approvals(action_id, command_type=restore_backup, principal_id=user.id, request_hash, status); audit_log(action=restore_backup, actor=user.id, target=backup_id)"
+    },
+    "_handle_delete_file_action": {
+      "action_type": "delete",
+      "rbac": "PERM_CONTENT_TAKEDOWN (软删除复用 takedown 权限)",
+      "mfa": "inherited from bot session (AUTHORIZED_USER_ID)",
+      "two_person_approval": "not required (软删除 requires_approval=False)",
+      "idempotency_key": ["action_id", "request_hash", "file_code"],
+      "state_transitions": "pending -> executing -> executed (无审批,二次确认后立即执行)",
+      "timeout": "execution_lease=300s",
+      "cancellation": "supported via delfile_cancel| button (二次确认阶段取消)",
+      "localization_confirmation": "bot.admin_bot.callback.s15 (未授权) / bot.admin_bot.callback.s16 (取消) / bot.admin_bot.callback.s17 (格式错误)",
+      "audit_schema": "command_executions(action_id, command_type=delete_file, principal_id=user.id, request_hash, status); audit_log(action=delete_file, actor=user.id, target=file_code)"
+    },
+    "_handle_report_action": {
+      "action_type": "report_action",
+      "rbac": "AUTHORIZED_USER_ID (admin bot 操作者, hardcoded 单管理员)",
+      "mfa": "not required (bot 会话无 MFA;TODO: 应接入 CommandBus RBAC)",
+      "two_person_approval": "not required (TODO: report:ban 应走 make_ban_user_command 审批)",
+      "idempotency_key": ["TODO: 当前无幂等键,直接 update_user_and_invalidate; 应改为 action_id+request_hash"],
+      "state_transitions": "TODO: 当前无状态机(直接执行); 应改为 pending->approved->executing->executed",
+      "timeout": "TODO: 当前无超时; 应接入 approval_ttl=86400s + execution_lease=300s",
+      "cancellation": "not supported (TODO: 应支持 report:ignore 之外的审批 reject)",
+      "localization_confirmation": "bot.admin_bot.callback.s6 (未授权) / bot.admin_bot.callback.s20 (忽略) / bot.admin_bot.callback.s23/s26/s30 (参数错误)",
+      "audit_schema": "TODO: 当前仅 logger.warning; 应改为 audit_log(action=ban_user/takedown, actor=user.id, target=user_id/file_code)"
+    }
+  },
+  "baseline": {
+    "description": "R61 P1-09: 按钮 handler 门禁 baseline (Rule A/C ratchet 下降;Rule B 无 baseline,必须补全)",
+    "note": "baseline 仅记录 Rule A/C 的现有违规,通过 ratchet 逐步下降。修复违规后运行 --generate-baseline 更新此文件(只减不增)。Rule B(元数据缺失)无 baseline,必须立即补全 sidecar 字段。",
+    "violation_count": 4,
+    "violations": [
+      {
+        "key": "A::bots/admin_bot/callback.py::_handle_report_action::callback_sub_dispatcher",
+        "rule": "A",
+        "violation_type": "RULE_A_DESTRUCTIVE_BYPASS",
+        "file": "bots/admin_bot/callback.py",
+        "handler": "_handle_report_action",
+        "owner": "audit-team",
+        "reason": "report:ban/detach/block 直接调 update_user_and_invalidate/update_file_record_and_invalidate,未走 CommandBus。R61 P1-09 遗留债务,待 R62 迁移至 make_ban_user_command + make_takedown_command + bus.execute。",
+        "expiry": "2026-09-30"
+      },
+      {
+        "key": "C::bots/admin_bot/callback.py::_handle_report_action::callback_sub_dispatcher",
+        "rule": "C",
+        "violation_type": "RULE_C_NO_SIGNED_TOKEN",
+        "file": "bots/admin_bot/callback.py",
+        "handler": "_handle_report_action",
+        "owner": "audit-team",
+        "reason": "高风险 callback handler 使用裸 query.data.split 解析,未用 sign_button_token_with_nonce/verify_button_token 签名绑定。R61 P1-09 遗留债务,待 R62 迁移至 ButtonFlow 6 步流程。",
+        "expiry": "2026-09-30"
+      },
+      {
+        "key": "C::bots/admin_bot/callback.py::_handle_restore_action::callback_sub_dispatcher",
+        "rule": "C",
+        "violation_type": "RULE_C_NO_SIGNED_TOKEN",
+        "file": "bots/admin_bot/callback.py",
+        "handler": "_handle_restore_action",
+        "owner": "audit-team",
+        "reason": "高风险 callback handler 使用裸 query.data.split 解析 restore:confirm|seq|merge|table,未用签名绑定。虽走 CommandBus(Rule A 通过),但 callback_data 可伪造。待 R62 迁移至 sign_button_token_with_nonce。",
+        "expiry": "2026-09-30"
+      },
+      {
+        "key": "C::bots/admin_bot/callback.py::_handle_delete_file_action::callback_sub_dispatcher",
+        "rule": "C",
+        "violation_type": "RULE_C_NO_SIGNED_TOKEN",
+        "file": "bots/admin_bot/callback.py",
+        "handler": "_handle_delete_file_action",
+        "owner": "audit-team",
+        "reason": "高风险 callback handler 使用裸 query.data.split 解析 delfile|file_code,未用签名绑定。虽走 CommandBus(Rule A 通过),但 callback_data 可伪造。待 R62 迁移至 sign_button_token_with_nonce。",
+        "expiry": "2026-09-30"
+      }
+    ]
+  }
+}

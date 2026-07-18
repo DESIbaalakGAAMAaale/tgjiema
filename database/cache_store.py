@@ -1879,26 +1879,63 @@ class CacheStore:
 
         内部基于 aiosqlite.Connection 的 BEGIN/COMMIT/ROLLBACK。
         业务代码在事务上下文中不得再调用 store._db.commit()(由本管理器统一控制)。
+
+        R61 P0-02 整改:
+          旧实现用 catch-all `except Exception` 把所有 BEGIN 失败(锁竞争/连接损坏/I/O 错误)
+          误判为"已处于事务中,复用",并随后无条件 COMMIT,会擅自提交调用方事务。
+          现改为通过 `self._db.in_transaction` 精确判断:
+          - 已在外层事务中 → 使用 SAVEPOINT 隔离(退出时 RELEASE/ROLLBACK TO,不提交调用方事务)
+          - 不在事务中 → BEGIN 开启新事务;BEGIN 失败抛 AppError(不再静默复用)
         """
         if not self._db:
             raise RuntimeError("[CacheStore] transaction 失败: _db 未初始化")
-        try:
-            await self._db.execute("BEGIN")
-        except Exception as begin_err:
-            # 已处于事务中: 复用现有事务(不重新 BEGIN,也不主动 COMMIT)
-            logger.debug(
-                f"[CacheStore] transaction BEGIN 失败(复用现有事务): {begin_err}"
-            )
+        # R61 P0-02: 通过 in_transaction 属性精确判断,而非 catch-all BEGIN 异常。
+        # aiosqlite.Connection.in_transaction 委托 sqlite3.Connection.in_transaction,
+        # True 表示当前有一个未提交的事务。
+        owns_transaction = not bool(getattr(self._db, "in_transaction", False))
+        # R61 P0-02: savepoint 名称(仅在嵌套场景使用)
+        savepoint_name = "cache_store_tx_sp"
+        if owns_transaction:
+            # 不在事务中: 显式 BEGIN(本上下文拥有并负责提交/回滚)。
+            # BEGIN 失败(锁竞争/连接损坏/I/O 错误)必须显式抛 AppError,
+            # 不再像旧实现那样静默"复用现有事务"。
+            try:
+                await self._db.execute("BEGIN")
+            except Exception as begin_err:
+                # 延迟导入避免循环依赖(cache_store 被 error_codes 间接依赖)
+                from services.error_codes import AppError, ErrorCodes
+                raise AppError(
+                    ErrorCodes.DB_CACHE_UNAVAILABLE,
+                    params={
+                        "component": "cache_store.transaction",
+                        "reason": f"begin_failed: {type(begin_err).__name__}: {begin_err}",
+                    },
+                ) from begin_err
+        else:
+            # 已在外层事务中: 用 SAVEPOINT 隔离,不擅自 COMMIT 调用方事务。
+            await self._db.execute(f"SAVEPOINT {savepoint_name}")
         try:
             yield self._db
         except Exception:
+            # 异常: 回滚
+            # R61 P0-02: owns_transaction=True → ROLLBACK 整个事务;
+            #   owns_transaction=False → ROLLBACK TO SAVEPOINT(保留调用方事务)。
             try:
-                await self._db.rollback()
+                if owns_transaction:
+                    await self._db.rollback()
+                else:
+                    await self._db.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
             except Exception as rollback_err:
                 logger.warning(f"[CacheStore] transaction rollback 失败: {rollback_err}")
             raise
         else:
-            await self._db.commit()
+            # 正常退出: 提交
+            # R61 P0-02: owns_transaction=True → COMMIT;
+            #   owns_transaction=False → RELEASE SAVEPOINT(保留调用方事务由其自行提交)。
+            if owns_transaction:
+                await self._db.commit()
+            else:
+                await self._db.execute(f"RELEASE SAVEPOINT {savepoint_name}")
 
     async def get_dirty_outbox_batch(self, limit: int = 100) -> list[dict]:
         """R38 P1-2: 拉取一批未处理的 dirty_outbox 记录(processed=0)。

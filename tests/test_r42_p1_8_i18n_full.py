@@ -222,9 +222,10 @@ class TestSetUserLocale:
     def test_unsupported_locale_raises_value_error(
         self, i18n_module, temp_db, monkeypatch
     ):
-        """不支持的 locale 抛出 ValueError。"""
+        """不支持的 locale 抛出 AppError(R61 P1-06: 改用协议化错误码,不再 ValueError)。"""
         monkeypatch.setattr("database.cache_store.DB_PATH", temp_db)
-        with pytest.raises(ValueError):
+        from services.error_codes import AppError
+        with pytest.raises(AppError):
             i18n_module.set_user_locale(1001, "fr-FR")
 
     def test_writes_dirty_outbox(self, i18n_module, temp_db, monkeypatch):

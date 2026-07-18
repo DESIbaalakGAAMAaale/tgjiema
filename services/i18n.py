@@ -37,7 +37,7 @@ import re
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from loguru import logger
 
@@ -50,6 +50,10 @@ _LOCALES_DIR = Path(__file__).resolve().parent.parent / "locales"
 _DEFAULT_LOCALE = "zh-CN"
 # 备用 locale(找不到 key 时回退)
 _FALLBACK_LOCALE = "en-US"
+
+# R61 P1-06: 锁定支持的 locale 列表(产品仅支持 zh-CN/en-US)
+# 任何加载/设置/写入不在此列表中的 locale 均被显式拒绝(审计 P1-06:不再宣称完整 CLDR)
+SUPPORTED_LOCALES: frozenset[str] = frozenset({"zh-CN", "en-US"})
 
 # R56 §5.1: ICU MessageFormat 子集 — 用于复数/select/ordinal/嵌套插值
 # 匹配 {name, type, ...} 模式(type ∈ plural/select/selectordinal)
@@ -80,6 +84,81 @@ def _incr_metric(metric: str) -> None:
         _i18n_missing_param_total += 1
     elif metric == "i18n_parse_failed_total":
         _i18n_parse_failed_total += 1
+
+
+# ── R61 P1-06: release 构建严格模式 + 高优先级告警钩子 ──────────
+
+
+def _get_release_mode() -> bool:
+    """R61 P1-06: 是否为 release 构建(任何 i18n 缺陷均 fail-fast)。
+
+    判定优先级:
+        1. 环境变量 ``RELEASE_BUILD=1/true/yes/on`` → release 模式
+        2. ``config.settings.RELEASE_BUILD`` 为真实 ``bool`` True 时 → release 模式
+           (防御:仅当为 ``isinstance(bool)`` 时才采纳,避免 MagicMock 测试 settings
+           误判为 True)
+
+    Returns:
+        True=release 构建(缺 key/缺参/malformed ICU 直接抛 AppError);
+        False=普通模式(生产 fallback 到安全文案 + 触发告警)
+    """
+    import os
+    val = os.environ.get("RELEASE_BUILD", "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    try:
+        from config.settings import settings  # type: ignore[import]
+        flag = getattr(settings, "RELEASE_BUILD", False)
+        # 防御:仅当为真实 bool True 时才认为是 release 模式
+        # (避免 conftest MagicMock settings 把任意属性访问判为 True)
+        if isinstance(flag, bool):
+            return flag
+    except Exception as e:
+        # R61 P1-06: 配置不可用时视为非 release 模式(fail-open 到非严格)
+        logger.debug(_i18n_t("services.i18n.logger_release_mode_read_failed", err=str(e)))
+    return False
+
+
+# R61 P1-06: i18n 高优先级告警回调(生产 fallback 时触发)
+# ops 可通过 set_i18n_alert_callback 注册回调,将告警接入 PagerDuty / 飞书 / 监控等
+_i18n_alert_callback: Optional[Callable[[str, dict], None]] = None
+
+
+def set_i18n_alert_callback(fn: Optional[Callable[[str, dict], None]]) -> None:
+    """R61 P1-06: 注册 i18n 高优先级告警回调。
+
+    回调签名: ``fn(event_type: str, details: dict) -> None``
+    event_type 取值: ``missing_key`` / ``missing_param`` / ``malformed_icu``
+
+    Args:
+        fn: 告警回调函数;传入 None 可注销回调
+    """
+    global _i18n_alert_callback
+    _i18n_alert_callback = fn
+
+
+def _trigger_i18n_alert(event_type: str, details: dict) -> None:
+    """R61 P1-06: 触发 i18n 高优先级告警(生产环境 fallback 时调用)。
+
+    若已注册回调,调用回调(异常吞掉仅记 ERROR,不影响主流程);
+    否则以 ERROR 级别记录日志(高优先级告警,区别于普通 WARNING)。
+
+    Args:
+        event_type: 事件类型(``missing_key`` / ``missing_param`` / ``malformed_icu``)
+        details: 事件详情 dict(含 key / locale / 缺失参数等)
+    """
+    if _i18n_alert_callback is not None:
+        try:
+            _i18n_alert_callback(event_type, details)
+        except Exception as cb_err:
+            logger.error(
+                f"[i18n] R61 P1-06: 告警回调执行失败 event={event_type}: {cb_err}"
+            )
+    else:
+        logger.error(
+            f"[i18n] R61 P1-06: i18n 缺陷 fallback 触发高优先级告警 "
+            f"event={event_type} details={details}"
+        )
 
 
 def _collect_missing_params(text: str, kwargs: dict) -> set:
@@ -381,6 +460,10 @@ def _cldr_ordinal_category(n: int, locale: str) -> str:
         - 中文(zh): 始终 other(中文不区分序数形式)
         - 其他 locale: 默认 other(兜底)
 
+    R61 P1-06 变更:优先委托 Babel 标准 CLDR ordinal 规则(``Locale.ordinal_form``),
+    不再自行维护 CLDR 数据。Babel 不可用 / locale 不支持时,回退到下方自维护的
+    en/ru/zh 规则(已验证正确,保留作为兜底)。
+
     CLDR 规则参考: https://unicode-org.github.io/cldr-staging/charts/latest/supplemental/language_plural_rules.html
 
     英语(en) ordinal 规则:
@@ -402,6 +485,18 @@ def _cldr_ordinal_category(n: int, locale: str) -> str:
     Returns:
         CLDR ordinal 类别字符串:"one" / "two" / "few" / "many" / "other"
     """
+    # R61 P1-06: 优先委托 Babel 标准 CLDR ordinal 规则(不自行维护 CLDR 数据)
+    try:
+        from babel import Locale  # type: ignore[import]
+        if n < 0:
+            n = -n
+        # locale 标识符规范化:zh-CN → zh_CN(Babel 使用下划线)
+        loc = Locale.parse(locale.replace("-", "_"))
+        return str(loc.ordinal_form(n))
+    except Exception as e:
+        # R61 P1-06: Babel 不可用 / locale 不支持:回退到下方自维护规则
+        logger.debug(_i18n_t("services.i18n.logger_babel_ordinal_unavailable", err=str(e)))
+
     # 负数取绝对值(CLDRL 规则对负数取模的处理:实际场景序数非负,兜底取绝对值)
     if n < 0:
         n = -n
@@ -468,6 +563,17 @@ def _icu_select_branch_by_count(
 
     # plural: 按 locale 复数规则
     if block_type == "plural":
+        # R61 P1-06: 优先委托 Babel 标准 CLDR plural 规则(Locale.plural_form)
+        category: Optional[str] = None
+        try:
+            from babel import Locale  # type: ignore[import]
+            loc = Locale.parse(locale.replace("-", "_"))
+            category = str(loc.plural_form(count))
+        except Exception:
+            category = None
+        if category is not None and category in branches:
+            return branches[category]
+        # 回退到自维护的简化规则(Babel 不可用 / 子句缺该类别时)
         if locale.startswith("zh"):
             return branches.get("other", "")
         # en-*: count == 1 用 one,其他用 other
@@ -567,6 +673,13 @@ class I18nManager:
             True=成功;False=失败(文件不存在或解析错误)
         """
         if not locale:
+            return False
+        # R61 P1-06: 锁定支持的 locale(产品仅支持 zh-CN/en-US,拒绝其他 locale)
+        if locale not in SUPPORTED_LOCALES:
+            logger.warning(
+                f"[i18n] R61 P1-06: 拒绝加载不支持的 locale={locale} "
+                f"(SUPPORTED_LOCALES={sorted(SUPPORTED_LOCALES)})"
+            )
             return False
         if locale in self._translations:
             return True  # 已加载
@@ -669,9 +782,30 @@ class I18nManager:
         if text is None:
             # R44 6.2: 找不到翻译时返回安全通用文案,不暴露内部 key
             logger.debug(f"[i18n] 翻译 key 未找到: {key}(locale={target_locale})")
+            # R61 P1-06: release 构建下 missing key 直接 fail-fast(不返回安全文案)
+            if _get_release_mode():
+                from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={
+                        "field": "i18n_key",
+                        "reason": "missing_key_in_release_build",
+                        "key": key,
+                        "locale": target_locale,
+                    },
+                )
             text = self._get_safe_fallback_message(key, target_locale)
             # R44 6.2: 累计 missing key 计数(供 Prometheus 采集)
             self._missing_key_count += 1
+            # R61 P1-06: 生产环境(非 release)missing key 触发高优先级告警
+            _trigger_i18n_alert(
+                "missing_key",
+                {
+                    "key": key,
+                    "locale": target_locale,
+                    "manager_default": self.default_locale,
+                },
+            )
         # 插值(支持 {placeholder} 格式)
         if kwargs and "{" in text and "}" in text:
             try:
@@ -705,6 +839,13 @@ class I18nManager:
             True=成功;False=locale 不可用
         """
         if not locale:
+            return False
+        # R61 P1-06: 锁定支持的 locale(产品仅支持 zh-CN/en-US,拒绝其他 locale)
+        if locale not in SUPPORTED_LOCALES:
+            logger.warning(
+                f"[i18n] R61 P1-06: 拒绝设置不支持的默认 locale={locale} "
+                f"(SUPPORTED_LOCALES={sorted(SUPPORTED_LOCALES)})"
+            )
             return False
         # 确保已加载
         if locale not in self._translations:
@@ -869,10 +1010,9 @@ class I18nManager:
         missing_params = _collect_missing_params(text, kwargs)
         if missing_params:
             env = _get_environment()
-            if env in ("test", "staging"):
-                # 惰性导入避免循环依赖
-                from services.app_error import AppError  # type: ignore[import]
-                from services.error_codes import ErrorCodes  # type: ignore[import]
+            if env in ("test", "staging") or _get_release_mode():
+                # 惰性导入避免循环依赖(R61 P1-06: 修正为 services.error_codes)
+                from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
                 raise AppError(
                     ErrorCodes.VALIDATION_FAILED,
                     params={
@@ -888,14 +1028,22 @@ class I18nManager:
                 f"missing={sorted(missing_params)}"
             )
             _incr_metric("i18n_missing_param_total")
+            # R61 P1-06: 生产 fallback 触发高优先级告警
+            _trigger_i18n_alert(
+                "missing_param",
+                {
+                    "key": key,
+                    "locale": target_locale,
+                    "missing": sorted(missing_params),
+                },
+            )
         # ICU 解析
         try:
             return _icu_format(text, target_locale, kwargs)
         except Exception as e:
             env = _get_environment()
-            if env in ("test", "staging"):
-                from services.app_error import AppError  # type: ignore[import]
-                from services.error_codes import ErrorCodes  # type: ignore[import]
+            if env in ("test", "staging") or _get_release_mode():
+                from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
                 raise AppError(
                     ErrorCodes.VALIDATION_FAILED,
                     params={
@@ -910,6 +1058,16 @@ class I18nManager:
                 f"[i18n] R58 P1-2: ICU parse failed key={key}: {type(e).__name__}: {e}"
             )
             _incr_metric("i18n_parse_failed_total")
+            # R61 P1-06: 生产 fallback 触发高优先级告警
+            _trigger_i18n_alert(
+                "malformed_icu",
+                {
+                    "key": key,
+                    "locale": target_locale,
+                    "error_type": type(e).__name__,
+                    "error": str(e),
+                },
+            )
             return self.format_message(key, locale=target_locale, **kwargs)
 
     def format_selectordinal(
@@ -1589,7 +1747,20 @@ def set_user_locale(user_id: int, locale: str) -> bool:
     """
     if not user_id:
         return False
-    # 1. 验证 locale 在支持列表中
+    # R61 P1-06: 显式拒绝不在 SUPPORTED_LOCALES 中的 locale(产品仅支持 zh-CN/en-US)
+    # 优先于 get_available_locales() 的目录扫描,确保 locale 锁定不可绕过
+    if locale not in SUPPORTED_LOCALES:
+        from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={
+                "field": "locale",
+                "reason": "unsupported_locale",
+                "locale": str(locale),
+                "supported": ",".join(sorted(SUPPORTED_LOCALES)),
+            },
+        )
+    # 1. 验证 locale 在支持列表中(防御性:目录扫描兜底)
     manager = get_i18n_manager()
     available = manager.get_available_locales()
     if locale not in available:
@@ -1615,15 +1786,23 @@ def set_user_locale(user_id: int, locale: str) -> bool:
                 (locale, int(user_id)),
             )
             # 写 dirty_outbox(供 crdb_sync 同步到 CRDB)
+            # R61 P1-06 修复: 使用单调时间戳作为 version(毫秒精度),
+            # 替代硬编码 version=0。原实现导致同一用户多次调用
+            # set_user_locale 时 (table_name, pk, version=0) 触发
+            # UNIQUE 约束冲突,使整个事务(含 users_local UPDATE)回滚,
+            # e2e 中切换 locale 失败。与 _generate_version_from_payload
+            # 的 fallback 模式一致(Unix 时间戳),毫秒精度降低同秒碰撞;
+            # INSERT OR REPLACE 兜底极端情况,保证最新状态被持久化。
+            _version = int(time.time() * 1000)
             conn.execute(
-                """INSERT INTO dirty_outbox
+                """INSERT OR REPLACE INTO dirty_outbox
                    (table_name, pk, version, operation, payload,
                     created_at, processed, local_only)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     "users_local",
                     str(int(user_id)),
-                    0,
+                    _version,
                     "upsert",
                     json.dumps(
                         {"user_id": int(user_id), "locale": locale},

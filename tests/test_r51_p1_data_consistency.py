@@ -495,6 +495,12 @@ class TestP1_1_DataLifecycleStateMachine:
             (approval_action_id, 3, receipt_approver_3, now_iso, canonical_request_hash, future_iso),
         )
         await real_store._db.commit()
+        # R61 P0-01: 新 UoW 路径会调用 check_permission(principal_id, grant.permission)
+        # grant.permission 来自 command_approvals.permission = "break_glass"(占位)。
+        # 需为 principal_id=1 bootstrap super_admin 角色(["*"] 通配)使权限重鉴权通过。
+        await real_store.bootstrap_admin_principal(
+            principal_id=1, username="admin", roles=["super_admin"],
+        )
 
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,

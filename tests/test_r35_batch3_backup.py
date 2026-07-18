@@ -445,8 +445,10 @@ class TestRestoreDelegation:
         mock_restore_fn = AsyncMock(return_value=mock_restore_result)
 
         # 在 sys.modules 中注入 mock 的 db_restore 模块
+        # R61 P0-03: db_backup.restore_from_backup 现路由通过 validate_and_restore_backup_strict(),
+        # 后者延迟导入 services.db_restore._restore_from_backup_data(私有写入器)。
         mock_db_restore = types.ModuleType("services.db_restore")
-        mock_db_restore.restore_from_backup_data = mock_restore_fn
+        mock_db_restore._restore_from_backup_data = mock_restore_fn
         monkeypatch.setitem(sys.modules, "services.db_restore", mock_db_restore)
 
         # 调用 restore_from_backup
@@ -461,9 +463,9 @@ class TestRestoreDelegation:
 
     @pytest.mark.asyncio
     async def test_restore_from_backup_data_groups_by_source(self, monkeypatch):
-        """restore_from_backup_data 按 source 分组恢复(P1-5)。"""
+        """_restore_from_backup_data 按 source 分组恢复(P1-5)。"""
         _ensure_restore_module_importable()
-        from services.db_restore import restore_from_backup_data
+        from services.db_restore import _restore_from_backup_data
 
         # 构造含 CRDB + SQLite 表的备份数据
         backup_data = {
@@ -473,10 +475,17 @@ class TestRestoreDelegation:
             }
         }
 
-        # R60 P0-03: restore_from_backup_data 强制 _r59_validation_token(fail-closed 守卫)
-        from services.backup_dr_validate import BackupValidationResult
-        _token = BackupValidationResult(
-            valid=True, backup_id=str(backup_data.get("backup_time", "")),
+        # R61 P0-03: _restore_from_backup_data 强制 _capability(不可伪造的 _RestoreCapability)。
+        # 测试通过模块私有 sentinel 构造合法令牌(生产代码无法外部构造)。
+        from services.backup_dr_validate import _RestoreCapability, _RESTORE_SENTINEL
+        _cap = _RestoreCapability(
+            _RESTORE_SENTINEL,
+            backup_id="test_backup_id",
+            manifest_sha256="a" * 64,
+            payload_key="test_payload_key",
+            ciphertext_sha256="b" * 64,
+            plaintext_sha256="c" * 64,
+            encryption_key_id="test_key_id",
         )
 
         # Mock _restore_crdb_tables 和 _restore_sqlite_tables_to_db
@@ -486,8 +495,8 @@ class TestRestoreDelegation:
         # 使用 patch 替换内部函数
         with patch("services.db_restore._restore_crdb_tables", mock_crdb), \
              patch("services.db_restore._restore_sqlite_tables_to_db", mock_sqlite):
-            result = await restore_from_backup_data(
-                backup_data, merge=False, _r59_validation_token=_token,
+            result = await _restore_from_backup_data(
+                backup_data, _capability=_cap, merge=False,
             )
 
         # CRDB 表(users)被传给 _restore_crdb_tables
@@ -504,23 +513,30 @@ class TestRestoreDelegation:
 
     @pytest.mark.asyncio
     async def test_restore_unknown_table_skipped(self):
-        """restore_from_backup_data 跳过不在 BACKUP_SCHEMA 中的表。"""
+        """_restore_from_backup_data 跳过不在 BACKUP_SCHEMA 中的表。"""
         _ensure_restore_module_importable()
-        from services.db_restore import restore_from_backup_data
+        from services.db_restore import _restore_from_backup_data
 
         backup_data = {
             "tables": {
                 "nonexistent_table": [{"id": 1}],
             }
         }
-        # R60 P0-03: restore_from_backup_data 强制 _r59_validation_token(fail-closed 守卫)
-        from services.backup_dr_validate import BackupValidationResult
-        _token = BackupValidationResult(
-            valid=True, backup_id=str(backup_data.get("backup_time", "")),
+        # R61 P0-03: _restore_from_backup_data 强制 _capability(不可伪造的 _RestoreCapability)。
+        # 测试通过模块私有 sentinel 构造合法令牌(生产代码无法外部构造)。
+        from services.backup_dr_validate import _RestoreCapability, _RESTORE_SENTINEL
+        _cap = _RestoreCapability(
+            _RESTORE_SENTINEL,
+            backup_id="test_backup_id",
+            manifest_sha256="a" * 64,
+            payload_key="test_payload_key",
+            ciphertext_sha256="b" * 64,
+            plaintext_sha256="c" * 64,
+            encryption_key_id="test_key_id",
         )
 
-        result = await restore_from_backup_data(
-            backup_data, merge=False, _r59_validation_token=_token,
+        result = await _restore_from_backup_data(
+            backup_data, _capability=_cap, merge=False,
         )
 
         assert "nonexistent_table" in result["skipped"]

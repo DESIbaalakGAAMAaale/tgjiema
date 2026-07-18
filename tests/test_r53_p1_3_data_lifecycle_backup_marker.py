@@ -511,6 +511,11 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             (action_id, 3, receipt_approver_3, now, canonical_hash, future_iso),
         )
         await real_store._db.commit()
+        # R61 P0-01: 新 UoW 调用 check_permission(principal_id, grant.permission)
+        # 需为 principal_id=1 bootstrap super_admin(["*"] 通配)使权限重鉴权通过
+        await real_store.bootstrap_admin_principal(
+            principal_id=1, username="admin", roles=["super_admin"],
+        )
 
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,
@@ -635,6 +640,11 @@ class TestSkipBackupCheckWithBreakGlassAllowed:
             (action_id, 3, receipt_approver_3, now, canonical_hash, future_iso),
         )
         await real_store._db.commit()
+        # R61 P0-01: 新 UoW 调用 check_permission(principal_id, grant.permission)
+        # 需为 principal_id=1 bootstrap super_admin(["*"] 通配)使权限重鉴权通过
+        await real_store.bootstrap_admin_principal(
+            principal_id=1, username="admin", roles=["super_admin"],
+        )
 
         cleaned = await data_lifecycle.cleanup_expired_data(
             batch_size=10, skip_backup_check=True,

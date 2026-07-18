@@ -224,6 +224,7 @@ async def claim_execution_approved(
     owner: str,
     request_hash: str = "",
     lease_seconds: int = 60,
+    connection: Any = None,
 ) -> bool:
     """R52 P0-5 + R55 P0-2: CAS 认领 — 将 status='approved' 转为 'executing'。
 
@@ -242,11 +243,17 @@ async def claim_execution_approved(
     R53 P0-2: fail-closed 整改
     - ``store._db`` 不可用时**必须**抛 AppError,禁止降级执行。
 
+    R61 P0-01: 新增 ``connection`` 参数,允许在调用方已开启的事务内执行 CAS
+    认领(不自动 commit),使审批消费 + 认领 + 业务副作用 + 标记 executed 在
+    同一事务内原子提交/回滚。``connection=None``(默认)时行为不变(自动 commit)。
+
     Args:
         action_id: 命令幂等 ID
         owner: 执行 worker 标识(如 hostname:pid)
         request_hash: **强制必填**,SHA-256(payload),64 位 hex,防篡改校验
         lease_seconds: 租约时长(秒),过期后可被 cleanup_stale_leases 回收
+        connection: 可选事务连接,传入时复用该连接且**不自动 commit**
+            (由调用方在同一事务内控制 commit/rollback,确保原子性)
 
     Returns:
         True 表示认领成功;False 表示已被其他 worker 抢占或状态不符(rowcount=0)
@@ -299,9 +306,12 @@ async def claim_execution_approved(
         )
     lease_until = _lease_until_iso(lease_seconds)
     now = _now_iso()
+    # R61 P0-01: connection 传入时复用调用方事务连接(不自动 commit);
+    # connection=None 时使用 store._db 并在 CAS 成功后自动 commit(向后兼容)。
+    _db = connection if connection is not None else store._db
     try:
         # R55 P0-2: request_hash 强制校验(不再可选)
-        rows = await store._db.execute_fetchall(
+        rows = await _db.execute_fetchall(
             "SELECT request_hash FROM command_executions WHERE action_id = ?",
             (action_id,),
         )
@@ -333,14 +343,17 @@ async def claim_execution_approved(
             )
             return False
         # CAS: approved → executing
-        cursor = await store._db.execute(
+        cursor = await _db.execute(
             "UPDATE command_executions "
             "SET status = ?, owner = ?, lease_until = ?, approved_at = COALESCE(approved_at, ?), updated_at = ? "
             "WHERE action_id = ? AND status = ?",
             (CMD_STATUS_EXECUTING, owner, lease_until, now, now,
              action_id, CMD_STATUS_APPROVED),
         )
-        await store._db.commit()
+        # R61 P0-01: 仅在未传入 connection(自管事务)时自动 commit;
+        # 传入 connection 时由调用方统一控制 commit/rollback(原子性保障)。
+        if connection is None:
+            await store._db.commit()
         claimed = cursor.rowcount > 0
         if claimed:
             logger.info(
@@ -375,12 +388,18 @@ async def claim_execution_approved(
 async def mark_approved_executed(
     action_id: str,
     result: Any = None,
+    connection: Any = None,
 ) -> bool:
     """R52 P0-5: 标记执行成功 — 将 status='executing' 转为 'executed'。
+
+    R61 P0-01: 新增 ``connection`` 参数,允许在调用方已开启的事务内执行 CAS
+    标记(不自动 commit),与审批消费/业务副作用同事务原子提交/回滚。
+    ``connection=None``(默认)时行为不变(自动 commit)。
 
     Args:
         action_id: 命令幂等 ID
         result: 执行结果(可选,序列化为 JSON 存储)
+        connection: 可选事务连接,传入时复用该连接且**不自动 commit**
 
     Returns:
         True 成功;False 失败
@@ -388,6 +407,8 @@ async def mark_approved_executed(
     store = _get_store()
     if not store._db:
         return False
+    # R61 P0-01: connection 传入时复用调用方事务连接(不自动 commit)
+    _db = connection if connection is not None else store._db
     now = _now_iso()
     # 序列化 result
     if result is None:
@@ -408,14 +429,16 @@ async def mark_approved_executed(
             ensure_ascii=False, default=str,
         )
     try:
-        cursor = await store._db.execute(
+        cursor = await _db.execute(
             "UPDATE command_executions "
             "SET status = ?, result = ?, owner = NULL, lease_until = NULL, updated_at = ? "
             "WHERE action_id = ? AND status = ?",
             (CMD_STATUS_EXECUTED, result_json, now,
              action_id, CMD_STATUS_EXECUTING),
         )
-        await store._db.commit()
+        # R61 P0-01: 仅在未传入 connection 时自动 commit
+        if connection is None:
+            await store._db.commit()
         success = cursor.rowcount > 0
         if success:
             logger.info(
@@ -431,7 +454,8 @@ async def mark_approved_executed(
         logger.error(
             f"[CommandBus] mark_approved_executed 失败 action_id={action_id}: {e}"
         )
-        return False
+    # fail-closed:标记执行失败时返回 False
+    return False
 
 
 async def mark_approved_failed(
@@ -483,7 +507,8 @@ async def mark_approved_failed(
         logger.error(
             f"[CommandBus] mark_approved_failed 失败 action_id={action_id}: {e}"
         )
-        return False
+    # fail-closed:标记执行失败时返回 False
+    return False
 
 
 async def verify_command_approved(
@@ -723,6 +748,7 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
         return False
     # R54 P0-1: requires_approval=1 一律禁止旧入口,fail-closed
     # _auto_approve 已移除:不再允许未注册命令自动批准
+    _query_failed = False
     try:
         rows = await store._db.execute_fetchall(
             "SELECT command_type, requires_approval FROM command_executions "
@@ -734,6 +760,9 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
             f"[CommandBus] claim_execution 查询 command_type 失败 "
             f"action_id={action_id}: {e}"
         )
+        _query_failed = True
+    if _query_failed:
+        # fail-closed:查询失败时返回 False
         return False
     if rows and rows[0]:
         command_type, requires_approval = rows[0]
@@ -774,7 +803,8 @@ async def claim_execution(action_id: str, owner: str, lease_seconds: int = 60) -
         raise
     except Exception as e:
         logger.error(f"[CommandBus] claim_execution 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:claim 失败时返回 False
+    return False
 
 
 async def renew_lease(action_id: str, lease_seconds: int = 60) -> bool:
@@ -803,7 +833,8 @@ async def renew_lease(action_id: str, lease_seconds: int = 60) -> bool:
         return cursor.rowcount > 0
     except Exception as e:
         logger.error(f"[CommandBus] renew_lease 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:续租失败时返回 False
+    return False
 
 
 async def release_execution(action_id: str) -> bool:
@@ -832,7 +863,8 @@ async def release_execution(action_id: str) -> bool:
         return cursor.rowcount > 0
     except Exception as e:
         logger.error(f"[CommandBus] release_execution 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:释放失败时返回 False
+    return False
 
 
 async def cleanup_stale_leases() -> int:
@@ -876,7 +908,8 @@ async def cleanup_stale_leases() -> int:
         return cleaned
     except Exception as e:
         logger.warning(f"[CommandBus] cleanup_stale_leases 失败: {e}")
-        return 0
+    # fail-closed:清理失败时返回 0
+    return 0
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1182,7 +1215,8 @@ async def mark_outbox_executed(
         logger.error(
             f"[CommandBus] mark_outbox_executed 失败 action_id={action_id}: {e}"
         )
-        return False
+    # fail-closed:标记失败时返回 False
+    return False
 
 
 async def release_lease(action_id: str) -> bool:
@@ -1217,7 +1251,8 @@ async def release_lease(action_id: str) -> bool:
         return released
     except Exception as e:
         logger.error(f"[CommandBus] release_lease 失败 action_id={action_id}: {e}")
-        return False
+    # fail-closed:释放失败时返回 False
+    return False
 
 
 async def _try_insert_or_get_cached(

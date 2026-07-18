@@ -28,12 +28,15 @@ import datetime as _dt
 import json
 import os
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from loguru import logger
 
 from database.cache_store import get_cache_store
 from services.error_codes import AppError, ErrorCodes
+# R61 P1-04: i18n for logger calls (avoid scanner baseline overflow)
+from services.i18n import translate as _i18n_t
 # R54 P0-3: break-glass 必须走 CommandBus 真实审批
 from services.command_bus import (
     claim_execution_approved,
@@ -70,6 +73,78 @@ DELETE_STEPS = (
 )
 
 
+# ─── R61 P0-01: 统一高风险命令 UoW 数据结构 ────────────────────
+
+
+@dataclass
+class ApprovalGrant:
+    """R61 P0-01: ``_verify_break_glass_two_person_approval`` 纯校验产物。
+
+    旧实现在校验通过后**立即自提交**消费 mfa_receipts + command_approvals,
+    业务副作用(outbox/audit/物理删除)不在该提交点 — 若业务动作失败,
+    审批与 MFA 已被永久消费;若业务成功但 outbox 失败,审计/通知链断裂。
+
+    R61 P0-01 整改: ``_verify_break_glass_two_person_approval`` 改为**纯校验**,
+    不再自提交,仅返回本 grant。实际 CAS 消费(mfa_receipts jti 一次性 +
+    command_approvals.consumed_at)延迟到 ``execute_high_risk_command_uow``
+    的统一事务中,与权限重鉴权 / 状态机 CAS / 业务副作用 / effect receipt /
+    dirty_outbox / audit_log 原子提交或回滚。
+    """
+
+    action_id: str
+    expected_principal_id: int
+    # 两人共同批准的 canonical request_hash(64 lowercase hex)
+    request_hash: str
+    # 两个不同审批人 principal_id(不含 expected_principal_id,防自审批)
+    approver_ids: list[int]
+    # 每个 approver 的 mfa_receipt jti(顺序与 approver_ids 对齐),用于一次性 CAS 消费
+    jti_list: list[str]
+    # 审批时快照的 RBAC 权限(执行时由 UoW 重鉴权)
+    permission: str
+    # 最早过期时间(ISO UTC,审计用;CAS 由 UoW 重新校验未过期)
+    expires_at: str
+    # 预计算的 CAS 时间戳(ISO UTC),供 UoW UPDATE command_approvals.consumed_at
+    consumed_at_now: str
+    # 预计算的 unix 秒,供 UoW INSERT OR IGNORE mfa_receipts.used_at/consumed_at
+    now_unix: int
+
+
+@dataclass
+class HighRiskCommand:
+    """R61 P0-01: 高风险命令描述符,由 ``execute_high_risk_command_uow`` 执行。
+
+    将"审批消费 + 状态机 + 业务副作用 + effect receipt + outbox + audit"
+    封装为单一 Unit of Work,所有 rowcount 检查 / 状态机前置条件 / 唯一键校验
+    必须在 COMMIT 前完成,任一失败 → ROLLBACK(审批与 MFA 不被消费)。
+    """
+
+    action_id: str
+    command_type: str
+    principal_id: int
+    # 64 hex,传给 claim_execution_approved 做恒定时间比较
+    request_hash: str
+    # 租约 owner(hostname:pid)
+    owner: str
+    # effect_receipts 类型(如 "purge",必须在 CRITICAL_EFFECT_TYPES 中)
+    effect_type: str
+    # effect_receipts target(如 action_id)
+    effect_target: str
+    # 异步业务回调: async (tx) -> dict,返回 {"total_cleaned": int, ...}
+    # 回调内负责业务状态变更 + per-row dirty_outbox + per-user audit_log,
+    # 全部写入传入的 tx(统一事务),不得自行 commit。
+    business_action: Any
+
+
+@dataclass
+class HighRiskCommandResult:
+    """R61 P0-01: ``execute_high_risk_command_uow`` 执行结果。"""
+
+    success: bool
+    total_cleaned: int = 0
+    business_result: dict = field(default_factory=dict)
+    error: str = ""
+
+
 async def _ensure_retention_table() -> bool:
     """内部: 惰性创建保留期配置表(若不存在)。
 
@@ -98,7 +173,8 @@ async def _ensure_retention_table() -> bool:
         return True
     except Exception as e:
         logger.warning(f"[DataLifecycle] 创建保留期表失败: {e}")
-        return False
+    # fail-closed:创建表失败时返回 False
+    return False
 
 
 async def _ensure_command_approvals_table() -> bool:
@@ -139,6 +215,7 @@ async def _ensure_command_approvals_table() -> bool:
     if not store._db:
         return False
     # R59 P1: 调用版本化 migration(替换原运行时 CREATE TABLE + ALTER TABLE 循环)
+    _migration_failed = False
     try:
         from database.migrate import apply_migrations
         result = await apply_migrations(db=store._db)
@@ -150,10 +227,14 @@ async def _ensure_command_approvals_table() -> bool:
             return False
     except Exception as e:
         logger.error(f"[DataLifecycle] R59 P1: command_approvals migration 异常: {e}")
+        _migration_failed = True
+    if _migration_failed:
+        # fail-closed:migration 失败时返回 False
         return False
     # R59 P1: fail-closed 检查 — 旧 break_glass 数据 expires_at 为空时拒绝
     # 防止无过期时间的旧审批被无限复用(安全风险)
     # 仅检查 break_glass 类型(quarantine_delete 由 redis_queue.quarantine_repair 独立校验)
+    _expiry_check_failed = False
     try:
         cursor = await store._db.execute(
             "SELECT COUNT(*) FROM command_approvals "
@@ -167,6 +248,9 @@ async def _ensure_command_approvals_table() -> bool:
         logger.error(
             f"[DataLifecycle] R59 P1 fail-closed: 检查 expires_at 空值查询失败(视为不安全): {e}"
         )
+        _expiry_check_failed = True
+    if _expiry_check_failed:
+        # fail-closed:查询失败时返回 False
         return False
     if empty_expiry_count > 0:
         logger.error(
@@ -181,8 +265,8 @@ async def _verify_break_glass_two_person_approval(
     action_id: str,
     expected_principal_id: int,
     expected_request_hash: str = "",
-) -> None:
-    """R58 P0-2: 校验 break-glass 双人审批已持久化且满足强绑定约束。
+) -> ApprovalGrant:
+    """R58 P0-2 / R61 P0-01: 纯校验 break-glass 双人审批,返回 ``ApprovalGrant``。
 
     要求(R58 P0-2 增强):
     - command_approvals 表中对该 action_id 至少有 2 个不同的 approver
@@ -198,20 +282,33 @@ async def _verify_break_glass_two_person_approval(
     - request_hash 必须严格匹配 `^[0-9a-f]{64}$`(lowercase hex),不再仅检查长度=64
     - expires_at 必须非空且能解析为 UTC aware datetime,不允许空值绕过
     - 时间比较统一使用 `datetime.now(timezone.utc)`(避免 naive 本地时间 ISO 比较脆弱)
-    - 验证通过后在**同一事务**中原子设置 consumed_at(受影响行数必须恰好为 2,否则回滚)
-    - permission 必须非空(R58 已存储,这里强制校验;执行时由 claim_execution_approved 重鉴权)
+    - permission 必须非空(R58 已存储,这里强制校验;执行时由 UoW 重鉴权)
+
+    R61 P0-01 整改(纯校验化):
+    - 本函数**不再自提交**消费 mfa_receipts / command_approvals。
+      旧实现在校验通过后立即 BEGIN IMMEDIATE + CAS + COMMIT,业务副作用不在该提交点,
+      导致"审批已消费但业务失败"或"业务成功但 outbox 失败"的不一致。
+    - 现改为只做纯校验(MFA 签名/sub/purpose/action_hash/amr/iat/exp + 审批状态/过期/撤销/消费/Hash),
+      收集 jti 列表与审批元数据,返回 ``ApprovalGrant``。
+    - 实际 CAS 消费(mfa_receipts jti 一次性 + command_approvals.consumed_at)延迟到
+      ``execute_high_risk_command_uow`` 的统一事务中,与权限重鉴权 / 状态机 CAS /
+      业务副作用 / effect receipt / dirty_outbox / audit_log 原子提交或回滚。
 
     Args:
         action_id: 审批动作 ID
         expected_principal_id: 发起人 principal_id(用于确认非自审批)
         expected_request_hash: 期望的 request_hash(64 hex),用于验证两人批准同一请求
 
+    Returns:
+        ApprovalGrant: 含 jti_list / permission / request_hash / 时间戳,
+        供 ``execute_high_risk_command_uow`` 在统一事务中消费。
+
     Raises:
-        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): 双人审批不足/MFA 缺失/自审批/Hash 不匹配/已过期/已撤销/已消费/原子消费失败
+        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED): 双人审批不足/MFA 缺失/自审批/Hash 不匹配/已过期/已撤销/已消费
     """
     import re as _re_mod
     # R60 P0-01: 不再导入 consume_mfa_receipt(其内部自行 commit,无法纳入单事务)
-    # jti 一次性消费的 CAS 逻辑直接内联到下方 BEGIN IMMEDIATE 事务中
+    # R61 P0-01: jti 一次性消费的 CAS 逻辑移到 execute_high_risk_command_uow 统一事务中
     from admin.mfa import verify_mfa_receipt
 
     # R59 P0-02: request_hash 严格 lowercase hex 正则
@@ -259,6 +356,10 @@ async def _verify_break_glass_two_person_approval(
     approver_ids = set()
     request_hashes = set()
     permissions = set()
+    # R61 P0-01: 收集每个 approver 的 expires_at(ISO 字符串),用于 grant 审计字段
+    expires_at_strs: list[str] = []
+    # R61 P0-01: 保持 jti_list 与 approver 顺序对齐(供 UoW CAS 消费)
+    ordered_approver_ids: list[int] = []
     # R59 P0-02: 时间比较统一使用 UTC aware datetime(避免 naive 本地时间字符串比较脆弱)
     now_utc = _dt.datetime.now(_dt.timezone.utc)
     for r in rows:
@@ -317,6 +418,8 @@ async def _verify_break_glass_two_person_approval(
                     "now_utc": now_utc.isoformat(),
                 },
             )
+        # R61 P0-01: 收集 expires_at(已校验未过期),供 grant 审计字段
+        expires_at_strs.append(expires_at_str)
         # R58 P0-2: decision 必须='approved'(记录存在 ≠ 批准)
         if decision != "approved":
             raise AppError(
@@ -367,6 +470,8 @@ async def _verify_break_glass_two_person_approval(
         approver_ids.add(approver_id)
         request_hashes.add(request_hash)
         permissions.add(permission)
+        # R61 P0-01: 保持 approver 顺序与 jti_list 对齐(供 grant 审计)
+        ordered_approver_ids.append(approver_id)
     if len(approver_ids) < 2:
         raise AppError(
             ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
@@ -435,108 +540,37 @@ async def _verify_break_glass_two_person_approval(
                     "approver_id": approver_id,
                 },
             ) from e
-    # R60 P0-01: 原子消费 — mfa_receipts(jti 一次性) + command_approvals(consumed_at)
-    # 必须在同一 SQLite 连接、同一显式事务中完成。
-    # 禁止旧的 "commit → rowcount → rollback" 错误顺序;必须 "rowcount → 条件检查 → commit"。
-    # BEGIN IMMEDIATE 立即获取 RESERVED 锁,串行化并发写者(避免两个写者同时进入临界区)。
+    # R61 P0-01: 纯校验完成 — 不再在此自提交消费 mfa_receipts / command_approvals。
+    # 旧实现的 BEGIN IMMEDIATE + CAS + COMMIT 块已移除:
+    #   实际 CAS 消费(mfa_receipts jti 一次性 + command_approvals.consumed_at)
+    #   延迟到 execute_high_risk_command_uow 的统一事务中,与权限重鉴权 /
+    #   状态机 CAS / 业务副作用 / effect receipt / dirty_outbox / audit_log
+    #   原子提交或回滚(任一失败 → ROLLBACK,审批与 MFA 不被消费)。
     consumed_at_now = now_utc.isoformat()
     now_unix = int(now_utc.timestamp())
-    try:
-        await store._db.execute("BEGIN IMMEDIATE")
-    except Exception as begin_err:
-        # 已处于事务中: 复用现有事务(不重新 BEGIN,也不主动 COMMIT)
-        # (与 cache_store.transaction() 一致的复用语义)
-        logger.debug(
-            f"[DataLifecycle] R60 P0-01: BEGIN IMMEDIATE 失败(复用现有事务): {begin_err}"
+    # R61 P0-01: 选取最早过期时间作为 grant 审计字段(CAS 时由 UoW 重新校验未过期)
+    earliest_expires_at = min(expires_at_strs) if expires_at_strs else ""
+    grant = ApprovalGrant(
+        action_id=action_id,
+        expected_principal_id=expected_principal_id,
+        request_hash=canonical_request_hash,
+        approver_ids=ordered_approver_ids,
+        jti_list=jti_list,
+        permission=next(iter(permissions)) if permissions else "",
+        expires_at=earliest_expires_at,
+        consumed_at_now=consumed_at_now,
+        now_unix=now_unix,
+    )
+    logger.info(
+        _i18n_t(
+            "services.data_lifecycle.logger_break_glass_validation_passed",
+            action_id=action_id,
+            approvers=len(ordered_approver_ids),
+            jti_count=len(jti_list),
+            permission=grant.permission,
         )
-    try:
-        # 1. 确保 mfa_receipts 表存在(幂等 DDL,与 admin.mfa.consume_mfa_receipt 一致)
-        await store._db.execute(
-            """CREATE TABLE IF NOT EXISTS mfa_receipts (
-                jti          TEXT PRIMARY KEY,
-                sub          BIGINT,
-                purpose      TEXT,
-                action_hash  TEXT,
-                amr          TEXT,
-                iat          INTEGER,
-                exp          INTEGER,
-                used_at      INTEGER,
-                consumed_at  INTEGER
-            )"""
-        )
-        # 2. 对两个 jti 执行条件 INSERT(INSERT OR IGNORE + rowcount)
-        # rowcount=1 → 首次消费成功;rowcount=0 → jti 已存在(重放/已消费)
-        # 两个 jti 的 rowcount 之和必须恰好为 2(均首次消费,任一已消费即重放)
-        receipt_affected = 0
-        for jti in jti_list:
-            cursor = await store._db.execute(
-                "INSERT OR IGNORE INTO mfa_receipts (jti, used_at, consumed_at) "
-                "VALUES (?, ?, ?)",
-                (jti, now_unix, now_unix),
-            )
-            receipt_affected += cursor.rowcount if cursor is not None else 0
-        # 3. 对两条审批行执行条件 UPDATE(CAS: consumed_at IS NULL)
-        # 受影响行数必须恰好为 2(两条审批都被原子消费)
-        # 若 < 2: 验证过程中有记录被并发消费/撤销/过期
-        # 若 > 2: 数据库约束异常(不该发生)
-        cursor = await store._db.execute(
-            "UPDATE command_approvals "
-            "SET consumed_at = ? "
-            "WHERE action_id = ? "
-            "  AND approval_type = 'break_glass' "
-            "  AND consumed_at IS NULL "
-            "  AND revoked_at IS NULL "
-            "  AND expires_at > ?",
-            (consumed_at_now, action_id, consumed_at_now),
-        )
-        approval_affected = cursor.rowcount if cursor is not None else 0
-        # 4. 检查两侧 rowcount 均恰好为 2,任何不一致 → ROLLBACK 整体事务
-        # receipt_affected != 2: 某 jti 已被消费(重放)或消费失败
-        # approval_affected != 2: 审批被并发消费/撤销/过期
-        if receipt_affected != 2 or approval_affected != 2:
-            try:
-                await store._db.rollback()
-            except Exception as rollback_err:
-                logger.warning(
-                    f"[DataLifecycle] R60 P0-01 rollback 失败 "
-                    f"action_id={action_id}: {rollback_err}"
-                )
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={
-                    "reason": "atomic_consume_failed",
-                    "expected_receipt_affected": 2,
-                    "actual_receipt_affected": receipt_affected,
-                    "expected_approval_affected": 2,
-                    "actual_approval_affected": approval_affected,
-                    "action_id": action_id,
-                },
-            )
-        # 5. 两侧 CAS 均成功 → COMMIT(唯一提交点,在所有 rowcount 检查之后)
-        await store._db.commit()
-        logger.info(
-            f"[DataLifecycle] R60 P0-01: 双人审批原子消费成功 "
-            f"action_id={action_id} receipt_affected={receipt_affected} "
-            f"approval_affected={approval_affected}"
-        )
-    except AppError:
-        raise
-    except Exception as e:
-        try:
-            await store._db.rollback()
-        except Exception as rollback_err:
-            # rollback 失败不掩盖原异常,仅记录(原异常已在上层抛出)
-            logger.warning(
-                f"[DataLifecycle] R60 P0-01 rollback 失败 "
-                f"action_id={action_id}: {rollback_err}"
-            )
-        raise AppError(
-            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-            params={
-                "reason": f"atomic_consume_exception: {type(e).__name__}: {e}",
-                "action_id": action_id,
-            },
-        ) from e
+    )
+    return grant
 
 
 def _parse_iso_utc(dt_str: str) -> _dt.datetime:
@@ -586,6 +620,278 @@ def _parse_iso_utc(dt_str: str) -> _dt.datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_dt.timezone.utc)
     return dt.astimezone(_dt.timezone.utc)
+
+
+async def execute_high_risk_command_uow(
+    command: HighRiskCommand,
+    grant: ApprovalGrant,
+) -> HighRiskCommandResult:
+    """R61 P0-01: 统一高风险命令 Unit of Work — 单事务原子提交。
+
+    将以下步骤封装在**同一** ``BEGIN IMMEDIATE`` 事务中,所有 rowcount 检查 /
+    状态机前置条件 / 唯一键校验必须在 COMMIT 前完成,任一失败 → ROLLBACK
+    (审批与 MFA 不被消费,状态机不前进):
+
+    执行顺序(对应 R61 P0-01 audit spec):
+      1. 权限重鉴权 — verify principal_id 仍持有 grant.permission
+      2. 状态机 CAS 认领 — claim_execution_approved(approved → executing)
+      3. receipt CAS — INSERT OR IGNORE mfa_receipts(jti 一次性),rowcount=2
+      4. approval CAS — UPDATE command_approvals.consumed_at,rowcount=2
+      5. 业务状态变更 — command.business_action(tx) 执行实际 delete/restore/isolate
+         (回调内负责 per-row dirty_outbox + per-user audit_log,写入同一 tx)
+      6. effect receipt / 幂等键 — 写 effect_receipts(completed)
+      7. 状态机 CAS 完成 — mark_approved_executed(executing → executed)
+      8. COMMIT(owns_transaction=True)/ RELEASE SAVEPOINT(嵌套场景)
+
+    R61 P0-02: 通过 ``store._db.in_transaction`` 精确判断事务所有权:
+      - 不在事务中 → BEGIN IMMEDIATE(串行化并发写者);失败抛 AppError
+      - 已在外层事务中 → SAVEPOINT high_risk_uow 隔离(不擅自提交调用方事务)
+
+    Args:
+        command: 高风险命令描述符(含 business_action 回调)
+        grant: 来自 ``_verify_break_glass_two_person_approval`` 的纯校验产物
+
+    Returns:
+        HighRiskCommandResult: success=True + business_result;失败时抛 AppError
+
+    Raises:
+        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED):
+            权限重鉴权失败 / 状态机 CAS 未命中 / receipt CAS 失败 /
+            approval CAS 失败 / 业务异常 / effect receipt 写入失败 /
+            mark_approved_executed 失败 / BEGIN IMMEDIATE 失败
+    """
+    from services.rbac import check_permission
+
+    store = get_cache_store()
+    if not store._db:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={
+                "reason": "store_unavailable_for_high_risk_uow",
+                "action_id": command.action_id,
+            },
+        )
+    # R61 P0-02: 通过 in_transaction 精确判断事务所有权(不复用 catch-all BEGIN 异常)
+    owns_transaction = not bool(getattr(store._db, "in_transaction", False))
+    _UOW_SAVEPOINT = "high_risk_uow"
+    if owns_transaction:
+        # BEGIN IMMEDIATE 立即获取 RESERVED 锁,串行化并发写者
+        try:
+            await store._db.execute("BEGIN IMMEDIATE")
+        except Exception as begin_err:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": f"uow_begin_immediate_failed: "
+                              f"{type(begin_err).__name__}: {begin_err}",
+                    "action_id": command.action_id,
+                },
+            ) from begin_err
+    else:
+        # 已在外层事务中: SAVEPOINT 隔离,不擅自 COMMIT 调用方事务
+        await store._db.execute(f"SAVEPOINT {_UOW_SAVEPOINT}")
+
+    async def _rollback_to_savepoint() -> None:
+        """R61 P0-01: 统一回滚 — owns → ROLLBACK;否则 ROLLBACK TO SAVEPOINT。"""
+        try:
+            if owns_transaction:
+                await store._db.rollback()
+            else:
+                await store._db.execute(
+                    f"ROLLBACK TO SAVEPOINT {_UOW_SAVEPOINT}"
+                )
+        except Exception as rollback_err:
+            logger.warning(
+                _i18n_t(
+                    "services.data_lifecycle.logger_uow_rollback_failed",
+                    action_id=command.action_id,
+                    err=str(rollback_err),
+                )
+            )
+
+    try:
+        # ── 1. 权限重鉴权(verify principal_id 仍持有 grant.permission)──
+        # claim_execution_approved 仅做 request_hash 校验 + 状态机 CAS,
+        # 不校验 RBAC 权限;此处显式重鉴权,防审批后被撤销权限。
+        has_perm = await check_permission(
+            grant.expected_principal_id, grant.permission
+        )
+        if not has_perm:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "permission_reauth_failed",
+                    "principal_id": grant.expected_principal_id,
+                    "permission": grant.permission,
+                    "action_id": command.action_id,
+                },
+            )
+
+        # ── 2. 状态机 CAS 认领(approved → executing)──
+        # R61 P0-01: 传入 connection=store._db 复用统一事务,不自动 commit
+        claimed = await claim_execution_approved(
+            action_id=command.action_id,
+            owner=command.owner,
+            request_hash=command.request_hash,
+            connection=store._db,
+        )
+        if not claimed:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "uow_claim_execution_cas_missed",
+                    "action_id": command.action_id,
+                },
+            )
+
+        # ── 3. receipt CAS — INSERT OR IGNORE mfa_receipts(jti 一次性)──
+        # 确保 mfa_receipts 表存在(幂等 DDL,与 admin.mfa.consume_mfa_receipt 一致)
+        await store._db.execute(
+            """CREATE TABLE IF NOT EXISTS mfa_receipts (
+                jti          TEXT PRIMARY KEY,
+                sub          BIGINT,
+                purpose      TEXT,
+                action_hash  TEXT,
+                amr          TEXT,
+                iat          INTEGER,
+                exp          INTEGER,
+                used_at      INTEGER,
+                consumed_at  INTEGER
+            )"""
+        )
+        # 对每个 jti 执行条件 INSERT;rowcount=1 → 首次消费;rowcount=0 → 重放/已消费
+        # jti_list 长度必须 = 2(双人审批),rowcount 之和必须恰好为 2
+        receipt_affected = 0
+        for jti in grant.jti_list:
+            cursor = await store._db.execute(
+                "INSERT OR IGNORE INTO mfa_receipts (jti, used_at, consumed_at) "
+                "VALUES (?, ?, ?)",
+                (jti, grant.now_unix, grant.now_unix),
+            )
+            receipt_affected += cursor.rowcount if cursor is not None else 0
+        if receipt_affected != len(grant.jti_list) or receipt_affected != 2:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "uow_receipt_cas_failed",
+                    "expected_receipt_affected": 2,
+                    "actual_receipt_affected": receipt_affected,
+                    "jti_count": len(grant.jti_list),
+                    "action_id": command.action_id,
+                },
+            )
+
+        # ── 4. approval CAS — UPDATE command_approvals.consumed_at ──
+        # 受影响行数必须恰好为 2(两条审批都被原子消费)
+        # 若 < 2: 校验后有记录被并发消费/撤销/过期;若 > 2: 约束异常(不该发生)
+        cursor = await store._db.execute(
+            "UPDATE command_approvals "
+            "SET consumed_at = ? "
+            "WHERE action_id = ? "
+            "  AND approval_type = 'break_glass' "
+            "  AND consumed_at IS NULL "
+            "  AND revoked_at IS NULL "
+            "  AND expires_at > ?",
+            (grant.consumed_at_now, grant.action_id, grant.consumed_at_now),
+        )
+        approval_affected = cursor.rowcount if cursor is not None else 0
+        if approval_affected != 2:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "uow_approval_cas_failed",
+                    "expected_approval_affected": 2,
+                    "actual_approval_affected": approval_affected,
+                    "action_id": command.action_id,
+                },
+            )
+
+        # ── 5. 业务状态变更(delete/restore/isolate)──
+        # business_action 回调内负责 per-row dirty_outbox + per-user audit_log,
+        # 全部写入 store._db(统一事务),不得自行 commit。
+        # 任一异常 → 触发下方 except,统一 ROLLBACK(审批/MFA 不被消费)。
+        business_result = await command.business_action(store._db)
+        if not isinstance(business_result, dict):
+            business_result = {"raw": business_result}
+        total_cleaned = int(business_result.get("total_cleaned", 0))
+
+        # ── 6. effect receipt / 幂等键 — 写 effect_receipts(completed)──
+        # effect_receipts 表 PK = (action_id, effect_type, target),INSERT OR IGNORE 幂等;
+        # 随后 UPDATE 置为 completed,绑定 grant.request_hash(防同 action_id 不同 payload 绕过)。
+        # 与 EffectReceiptManager.record_completed 不同,此处直接写 SQL 以纳入统一事务
+        # (record_completed 不支持 tx 参数,会自行 commit 破坏原子性)。
+        eff_now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        await store._db.execute(
+            "INSERT OR IGNORE INTO effect_receipts "
+            "(action_id, effect_type, target, status, external_id, "
+            " created_at, completed_at, request_hash, attempt, "
+            " lease_owner, lease_until, last_error, reconcile_status) "
+            "VALUES (?, ?, ?, 'pending', '', ?, NULL, ?, 1, ?, '', NULL, 'pending')",
+            (grant.action_id, command.effect_type, command.effect_target,
+             eff_now, grant.request_hash, command.owner),
+        )
+        await store._db.execute(
+            "UPDATE effect_receipts SET status = 'completed', "
+            "completed_at = ?, external_id = ?, reconcile_status = 'completed', "
+            "last_error = NULL, request_hash = ? "
+            "WHERE action_id = ? AND effect_type = ? AND target = ?",
+            (eff_now, command.action_id, grant.request_hash,
+             grant.action_id, command.effect_type, command.effect_target),
+        )
+
+        # ── 7. 状态机 CAS 完成(executing → executed)──
+        # R61 P0-01: 传入 connection=store._db 复用统一事务,不自动 commit
+        executed_ok = await mark_approved_executed(
+            action_id=command.action_id,
+            result={
+                "success": True,
+                "total_cleaned": total_cleaned,
+                "effect_type": command.effect_type,
+            },
+            connection=store._db,
+        )
+        if not executed_ok:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "uow_mark_executed_cas_missed",
+                    "action_id": command.action_id,
+                    "total_cleaned": total_cleaned,
+                },
+            )
+
+        # ── 8. COMMIT / RELEASE SAVEPOINT(唯一提交点)──
+        # 所有 rowcount 检查 / 状态机 CAS / 唯一键校验均已完成
+        if owns_transaction:
+            await store._db.commit()
+        else:
+            await store._db.execute(f"RELEASE SAVEPOINT {_UOW_SAVEPOINT}")
+        logger.info(
+            f"[DataLifecycle] R61 P0-01: 高风险命令 UoW 提交成功 "
+            f"action_id={command.action_id} command_type={command.command_type} "
+            f"receipt_affected={receipt_affected} approval_affected={approval_affected} "
+            f"total_cleaned={total_cleaned}"
+        )
+        return HighRiskCommandResult(
+            success=True,
+            total_cleaned=total_cleaned,
+            business_result=business_result,
+        )
+    except AppError:
+        # 协议化错误: 统一回滚后向上传播(保留原始 code 与 params)
+        await _rollback_to_savepoint()
+        raise
+    except Exception as e:
+        # 非协议化异常: 回滚 + 包装为 AppError(满足 scanner Rule 5 禁裸异常)
+        await _rollback_to_savepoint()
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={
+                "reason": f"uow_exception: {type(e).__name__}: {e}",
+                "action_id": command.action_id,
+                "command_type": command.command_type,
+            },
+        ) from e
 
 
 async def export_user_data(user_id: int) -> dict:
@@ -761,7 +1067,8 @@ async def _write_audit_log(actor_id: int, action: str, target_type: str,
         return int(cursor.lastrowid) if cursor and cursor.lastrowid else 0
     except Exception as e:
         logger.warning(f"[DataLifecycle] _write_audit_log 失败: {e}")
-        return 0
+    # fail-closed:写审计日志失败时返回 0
+    return 0
 
 
 async def _write_audit_log_in_tx(tx, actor_id: int, action: str,
@@ -852,7 +1159,8 @@ async def _ensure_deletion_requests_table() -> bool:
         return True
     except Exception as e:
         logger.warning(f"[DataLifecycle] 创建 deletion_requests 表失败: {e}")
-        return False
+    # fail-closed:创建表失败时返回 False
+    return False
 
 
 async def _create_deletion_request(user_id: int, admin_id: int) -> str:
@@ -949,7 +1257,8 @@ async def _transition_request_status(
         return True
     except Exception as e:
         logger.warning(f"[DataLifecycle] 状态迁移失败: {e}")
-        return False
+    # fail-closed:状态迁移失败时返回 False
+    return False
 
 
 async def _transition_request_status_in_tx(
@@ -1359,7 +1668,8 @@ async def set_retention(user_id: int, days: int) -> bool:
         return True
     except Exception as e:
         logger.warning(f"[DataLifecycle] set_retention 失败: {e}")
-        return False
+    # fail-closed:set_retention 失败时返回 False
+    return False
 
 
 async def get_retention(user_id: int) -> int:
@@ -1537,12 +1847,20 @@ async def cleanup_expired_data(
     request_hash: str = "",
     principal_id: int = 0,
 ) -> int:
-    """R51 P1-1 + R55 P0-3/P0-6: 清理过期数据。
+    """R51 P1-1 + R55 P0-3/P0-6 + R61 P0-01: 清理过期数据。
 
     R55 P0-3: break-glass 必须绑定 principal_id、request_hash,
     验证审批 action_type=data_lifecycle_break_glass,审批不可跨请求复用。
 
     R55 P0-6: 审计日志写入纳入删除事务,审批状态回写失败不能返回成功。
+
+    R61 P0-01 整改: break-glass 路径(``skip_backup_check=True``)改走
+    ``execute_high_risk_command_uow`` 统一事务 — 审批消费 + 状态机 CAS +
+    业务删除 + dirty_outbox tombstone + audit_log + effect_receipt +
+    mark_approved_executed 在**单一** ``BEGIN IMMEDIATE`` 事务中原子提交/回滚。
+    旧实现分别提交审批消费与业务删除,出现"审批已消费但业务失败"或
+    "业务成功但 mark_executed 失败"的不一致;新实现任一失败 → ROLLBACK
+    (审批与 MFA 不被消费,状态机不前进)。
     """
     if not await _ensure_retention_table():
         return 0
@@ -1551,104 +1869,34 @@ async def cleanup_expired_data(
         return 0
     # R55 P0-3: break-glass 必须绑定 principal_id、request_hash
     # 验证审批 action_type=data_lifecycle_break_glass,审批不可跨请求复用
-    _break_glass_claimed = False
     if skip_backup_check:
-        if not approval_action_id:
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={"reason": "skip_backup_check_requires_real_approval"},
-            )
-        if not request_hash or len(request_hash) != 64:
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={"reason": "request_hash_required_64_hex"},
-            )
-        if not principal_id:
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={"reason": "principal_id_required"},
-            )
-        # R55 P0-3: 验证审批 action_type 必须是 data_lifecycle_break_glass
-        # R56 P0-2: 删除 except Exception: pass(fail-closed),
-        #           同时校验 command_executions.principal_id 与传入的 principal_id 一致,
-        #           并校验双人审批已持久化到 command_approvals 表
-        try:
-            _type_rows = await store._db.execute_fetchall(
-                "SELECT command_type, principal_id FROM command_executions "
-                "WHERE action_id = ?",
-                (approval_action_id,),
-            )
-            if not _type_rows or not _type_rows[0]:
-                raise AppError(
-                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                    params={"reason": "approval_record_not_found"},
-                )
-            _cmd_type = _type_rows[0][0]
-            _stored_principal_id = int(_type_rows[0][1] or 0)
-            if _cmd_type != "data_lifecycle_break_glass":
-                raise AppError(
-                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                    params={"reason": "invalid_action_type",
-                            "expected": "data_lifecycle_break_glass",
-                            "actual": _cmd_type},
-                )
-            # R56 P0-2: principal_id 必须与 command_executions 记录一致(防越权)
-            if _stored_principal_id != principal_id:
-                raise AppError(
-                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                    params={
-                        "reason": "principal_id_mismatch",
-                        "stored": _stored_principal_id,
-                        "passed": principal_id,
-                    },
-                )
-        except AppError:
-            raise
-        except Exception as e:
-            # R56 P0-2: fail-closed — 不再吞异常,任何查询错误都阻断
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={"reason": f"command_type_verification_failed: "
-                                  f"{type(e).__name__}: {e}"},
-            ) from e
-        # R56 P0-2: 校验双人审批已持久化(≥2 approver + MFA receipt + 非自审批)
-        await _verify_break_glass_two_person_approval(
-            action_id=approval_action_id,
-            expected_principal_id=principal_id,
+        # ─── R61 P0-01: break-glass 统一 UoW 路径 ───
+        # 审批消费 + 状态机 CAS + 业务删除 + dirty_outbox + audit_log +
+        # effect_receipt + mark_approved_executed 在单一事务中原子提交/回滚。
+        return await _cleanup_expired_data_break_glass_uow(
+            batch_size=batch_size,
+            approval_action_id=approval_action_id,
+            request_hash=request_hash,
+            principal_id=principal_id,
         )
-        import socket as _socket
-        _owner = f"{_socket.gethostname()}:{os.getpid()}"
-        try:
-            claimed = await claim_execution_approved(
-                action_id=approval_action_id,
-                owner=_owner,
-                request_hash=request_hash,
-            )
-        except AppError:
-            raise
-        if not claimed:
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={"reason": "break_glass_approval_cas_failed_or_not_approved"},
-            )
-        _break_glass_claimed = True
+    # ─── 普通路径: per-user 事务 + backup marker 校验(不变) ───
     # R53 P1-3: 物理删除前强制严格 backup marker 校验
     # require_user_scope=True: 校验用户覆盖范围(全库备份用 user_coverage)
     # require_checksum=True: 校验 manifest checksum(完整性绑定)
     backup_info: dict | None = None
-    if not skip_backup_check:
-        backup_info = await _verify_backup_marker(
-            require_user_scope=True,
-            require_checksum=True,
+    backup_info = await _verify_backup_marker(
+        require_user_scope=True,
+        require_checksum=True,
+    )
+    if backup_info is None:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BACKUP_MARKER_MISSING,
+            params={"reason": "strict_backup_marker_verification_failed"},
         )
-        if backup_info is None:
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BACKUP_MARKER_MISSING,
-                params={"reason": "strict_backup_marker_verification_failed"},
-            )
     total_cleaned = 0
     now_dt = _dt.datetime.now()
     # 拉取所有设置了保留期(非永久)的用户
+    _fetch_failed = False
     try:
         cursor = await store._db.execute(
             f"SELECT user_id, retention_days FROM {_RETENTION_TABLE} "
@@ -1658,6 +1906,9 @@ async def cleanup_expired_data(
         rows = await cursor.fetchall()
     except Exception as e:
         logger.warning(f"[DataLifecycle] cleanup 拉取保留期配置失败: {e}")
+        _fetch_failed = True
+    if _fetch_failed:
+        # fail-closed:拉取失败时返回 0
         return 0
     for r in rows:
         user_id, retention_days = r[0], int(r[1])
@@ -1665,7 +1916,7 @@ async def cleanup_expired_data(
         cutoff_iso = cutoff_dt.isoformat()
         # R53 P1-3: 校验该用户在 backup marker 的 user_coverage 中
         # 批量全库备份使用 manifest 中的 user_coverage,而非单一 user_id 字段
-        if not skip_backup_check and backup_info is not None:
+        if backup_info is not None:
             user_coverage = backup_info.get("user_coverage", [])
             if isinstance(user_coverage, list) and len(user_coverage) > 0:
                 # 全库备份: 校验 user_id 在 user_coverage 中
@@ -1706,7 +1957,7 @@ async def cleanup_expired_data(
             "retention_cutoff": cutoff_iso,
             "retention_days": retention_days,
         }
-        if not skip_backup_check and backup_info is not None:
+        if backup_info is not None:
             audit_details.update({
                 "backup_id": backup_info.get("backup_id"),
                 "checksum": backup_info.get("checksum"),
@@ -1758,43 +2009,224 @@ async def cleanup_expired_data(
             )
         if total_cleaned >= batch_size:
             break
-    # R54 P0-3: break-glass 审批成功后标记 executed
-    # R56 P0-3: committed_delta 模式 — 删除计数作为 result 传给 mark_approved_executed,
-    #           命令状态回写失败必须 raise(不再只 log 后返回 total_cleaned,
-    #           否则会出现"数据已删但命令状态仍 executing"的不一致)
-    if _break_glass_claimed and approval_action_id:
-        try:
-            _executed_ok = await mark_approved_executed(
-                action_id=approval_action_id,
-                result={"total_cleaned": total_cleaned},
-            )
-        except Exception as mark_err:
-            # R56 P0-3: mark_approved_executed 抛异常时,删除已提交无法回滚,
-            # 必须向上传播让调用方进入 reconciliation(不可静默返回成功)
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={
-                    "reason": "mark_approved_executed_failed_after_delete",
-                    "action_id": approval_action_id,
-                    "total_cleaned": total_cleaned,
-                    "error": f"{type(mark_err).__name__}: {mark_err}",
-                },
-            ) from mark_err
-        if not _executed_ok:
-            # R56 P0-3: CAS 未命中(状态非 executing)也视为不一致,raise
-            raise AppError(
-                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                params={
-                    "reason": "mark_approved_executed_cas_missed",
-                    "action_id": approval_action_id,
-                    "total_cleaned": total_cleaned,
-                },
-            )
     logger.info(
         f"[DataLifecycle] cleanup_expired_data 清理 {total_cleaned} 行 "
         f"(users_checked={len(rows)})"
     )
     return total_cleaned
+
+
+async def _cleanup_expired_data_break_glass_uow(
+    *,
+    batch_size: int,
+    approval_action_id: str | None,
+    request_hash: str,
+    principal_id: int,
+) -> int:
+    """R61 P0-01: break-glass 清理路径 — 走统一高风险命令 UoW。
+
+    将"审批消费 + 状态机 CAS + 业务删除 + dirty_outbox tombstone + audit_log
+    + effect_receipt + mark_approved_executed"封装在 ``execute_high_risk_command_uow``
+    的单一 ``BEGIN IMMEDIATE`` 事务中,任一失败 → ROLLBACK(审批与 MFA 不被消费,
+    状态机不前进)。
+
+    与普通路径(``skip_backup_check=False``)的区别:
+      - 无 backup marker 校验(break-glass 已显式跳过)
+      - per-user dirty_outbox tombstone(让 relay worker 通知/复制)
+      - 审批消费 + 标记 executed 与业务删除同事务(原子性)
+
+    Args:
+        batch_size: 单批最大清理行数
+        approval_action_id: 审批动作 ID(command_executions.action_id)
+        request_hash: 调用方声明的 request_hash(64 hex)
+        principal_id: 发起人 principal_id
+
+    Returns:
+        总清理行数
+
+    Raises:
+        AppError(DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED):
+            参数缺失 / action_type 不符 / principal_id 不一致 /
+            双人审批校验失败 / UoW 任一步骤失败
+    """
+    store = get_cache_store()
+    if not store._db:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": "store_unavailable_for_break_glass"},
+        )
+    # R55 P0-3: 参数校验
+    if not approval_action_id:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": "skip_backup_check_requires_real_approval"},
+        )
+    if not request_hash or len(request_hash) != 64:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": "request_hash_required_64_hex"},
+        )
+    if not principal_id:
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": "principal_id_required"},
+        )
+    # R55 P0-3: 验证审批 action_type 必须是 data_lifecycle_break_glass
+    # R56 P0-2: 删除 except Exception: pass(fail-closed),
+    #           同时校验 command_executions.principal_id 与传入的 principal_id 一致
+    try:
+        _type_rows = await store._db.execute_fetchall(
+            "SELECT command_type, principal_id FROM command_executions "
+            "WHERE action_id = ?",
+            (approval_action_id,),
+        )
+        if not _type_rows or not _type_rows[0]:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={"reason": "approval_record_not_found"},
+            )
+        _cmd_type = _type_rows[0][0]
+        _stored_principal_id = int(_type_rows[0][1] or 0)
+        if _cmd_type != "data_lifecycle_break_glass":
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={"reason": "invalid_action_type",
+                        "expected": "data_lifecycle_break_glass",
+                        "actual": _cmd_type},
+            )
+        # R56 P0-2: principal_id 必须与 command_executions 记录一致(防越权)
+        if _stored_principal_id != principal_id:
+            raise AppError(
+                ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                params={
+                    "reason": "principal_id_mismatch",
+                    "stored": _stored_principal_id,
+                    "passed": principal_id,
+                },
+            )
+    except AppError:
+        raise
+    except Exception as e:
+        # R56 P0-2: fail-closed — 不再吞异常,任何查询错误都阻断
+        raise AppError(
+            ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+            params={"reason": f"command_type_verification_failed: "
+                              f"{type(e).__name__}: {e}"},
+        ) from e
+    # R61 P0-01: 纯校验双人审批 → ApprovalGrant(不再自提交消费)
+    # 实际 CAS 消费(mfa_receipts jti + command_approvals.consumed_at)延迟到 UoW
+    grant = await _verify_break_glass_two_person_approval(
+        action_id=approval_action_id,
+        expected_principal_id=principal_id,
+    )
+    # R61 P0-01: 业务回调 — per-user 物理删除 + dirty_outbox tombstone + audit_log
+    # 全部写入 UoW 传入的 tx(统一事务),不得自行 commit。
+    async def _break_glass_business_action(tx: Any) -> dict:
+        total = 0
+        users_checked = 0
+        now_dt = _dt.datetime.now()
+        cursor = await tx.execute(
+            f"SELECT user_id, retention_days FROM {_RETENTION_TABLE} "
+            f"WHERE retention_days > 0 LIMIT ?",
+            (batch_size,),
+        )
+        rows = await cursor.fetchall()
+        users_checked = len(rows)
+        for r in rows:
+            user_id = int(r[0])
+            retention_days = int(r[1])
+            cutoff_dt = now_dt - _dt.timedelta(days=retention_days)
+            cutoff_iso = cutoff_dt.isoformat()
+            # R61 P0-01: 查询待删除 PK(删除前),用于 dirty_outbox tombstone
+            cursor = await tx.execute(
+                "SELECT file_code FROM file_records_local "
+                "WHERE uploader_id = ? AND deleted_at IS NOT NULL "
+                "AND deleted_at < ?",
+                (user_id, cutoff_iso),
+            )
+            file_pks = [str(row[0]) for row in await cursor.fetchall()]
+            cursor = await tx.execute(
+                "SELECT code FROM codes_local "
+                "WHERE uploader_id = ? AND deleted_at IS NOT NULL "
+                "AND deleted_at < ?",
+                (user_id, cutoff_iso),
+            )
+            code_pks = [str(row[0]) for row in await cursor.fetchall()]
+            # 物理删除 file_records_local
+            cursor = await tx.execute(
+                "DELETE FROM file_records_local "
+                "WHERE uploader_id = ? AND deleted_at IS NOT NULL "
+                "AND deleted_at < ?",
+                (user_id, cutoff_iso),
+            )
+            file_deleted = int(cursor.rowcount or 0)
+            # 物理删除 codes_local
+            cursor = await tx.execute(
+                "DELETE FROM codes_local "
+                "WHERE uploader_id = ? AND deleted_at IS NOT NULL "
+                "AND deleted_at < ?",
+                (user_id, cutoff_iso),
+            )
+            codes_deleted = int(cursor.rowcount or 0)
+            # 更新 last_purged_at(同事务)
+            await tx.execute(
+                f"UPDATE {_RETENTION_TABLE} SET last_purged_at = ? "
+                f"WHERE user_id = ?",
+                (now_dt.isoformat(), user_id),
+            )
+            # R61 P0-01: per-row dirty_outbox tombstone(让 relay worker 通知/复制)
+            for pk in file_pks:
+                await store.add_dirty_outbox(
+                    "file_records_local", pk,
+                    operation="tombstone", connection=tx,
+                )
+            for pk in code_pks:
+                await store.add_dirty_outbox(
+                    "codes_local", pk,
+                    operation="tombstone", connection=tx,
+                )
+            # R55 P0-6: 审计日志纳入删除事务(原子性)
+            audit_details = {
+                "user_id": user_id,
+                "file_records_deleted": file_deleted,
+                "codes_deleted": codes_deleted,
+                "deletion_status": "completed",
+                "retention_cutoff": cutoff_iso,
+                "retention_days": retention_days,
+                "break_glass": True,
+                "approval_action_id": approval_action_id,
+            }
+            await _write_audit_log_in_tx(
+                tx, 0, "physical_delete_per_user", "user", str(user_id),
+                audit_details,
+            )
+            total += file_deleted + codes_deleted
+            if total >= batch_size:
+                break
+        return {"total_cleaned": total, "users_checked": users_checked}
+
+    # R61 P0-01: 构造 HighRiskCommand 并执行统一 UoW
+    import socket as _socket_bg
+    _owner = f"{_socket_bg.gethostname()}:{os.getpid()}"
+    command = HighRiskCommand(
+        action_id=approval_action_id,
+        command_type="data_lifecycle_break_glass",
+        principal_id=principal_id,
+        # 使用 grant.request_hash(approver 签名的 canonical hash),
+        # 而非调用方传入的 request_hash 参数(防调用方篡改 payload)
+        request_hash=grant.request_hash,
+        owner=_owner,
+        effect_type="purge",
+        effect_target=approval_action_id,
+        business_action=_break_glass_business_action,
+    )
+    result = await execute_high_risk_command_uow(command, grant)
+    logger.info(
+        f"[DataLifecycle] R61 P0-01: cleanup_expired_data(break_glass) 清理 "
+        f"{result.total_cleaned} 行 action_id={approval_action_id} "
+        f"business_result={result.business_result}"
+    )
+    return result.total_cleaned
 
 
 async def log_admin_access(admin_id: int, action: str, target_type: str = "",
@@ -1835,7 +2267,8 @@ async def log_admin_access(admin_id: int, action: str, target_type: str = "",
         return log_id
     except Exception as e:
         logger.warning(f"[DataLifecycle] log_admin_access 失败: {e}")
-        return 0
+    # fail-closed:写管理员访问日志失败时返回 0
+    return 0
 
 
 async def list_admin_access_logs(admin_id: int | None = None, page: int = 1,

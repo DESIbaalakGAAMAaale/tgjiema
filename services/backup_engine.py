@@ -1446,24 +1446,28 @@ class BackupEngine:
         # 5. 写入隔离环境(staging 模式仅校验,不写库;production 委托 db_restore)
         if target == "production":
             try:
-                from services.db_restore import restore_from_backup_data
-                # R60 P0-03: BackupEngine.restore 已完成 manifest 校验 + 解密 +
-                # plaintext_sha256 校验,视为合规调用方,构造 valid=True 信任令牌
-                # 传入 restore_from_backup_data(fail-closed 入口)
-                from services.backup_dr_validate import BackupValidationResult
-                _r60_restore_token = BackupValidationResult(
-                    valid=True,
-                    backup_id=manifest.get("backup_id", ""),
-                    schema_version=manifest.get("schema_version", ""),
-                    ciphertext_sha256=manifest.get("ciphertext_sha256", ""),
-                    plaintext_sha256=expected_pt_sha,
-                    encryption_key_id=(enc_info or {}).get("key_id", ""),
-                )
-                await restore_from_backup_data(
-                    data,
-                    _r59_validation_token=_r60_restore_token,
+                # R61 P0-03: 路由通过 validate_and_restore_backup_strict() 公共入口
+                # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
+                # BackupEngine._restore_internal 已完成 manifest 校验 + ciphertext_sha256 +
+                # 解密 + plaintext_sha256 校验,通过 skip_strict_validation=True +
+                # *_override 提供信任链元数据(避免重复下载/解密)。
+                from services.backup_dr_validate import validate_and_restore_backup_strict
+                await validate_and_restore_backup_strict(
+                    data=data,
                     tables=None,
                     merge=False,
+                    skip_strict_validation=True,
+                    validation_note=(
+                        f"BackupEngine._restore_internal: backup_id={backup_id} "
+                        f"target=production (manifest+ciphertext_sha+decrypt+plaintext_sha "
+                        f"verified upstream)"
+                    ),
+                    backup_id_override=manifest.get("backup_id", ""),
+                    manifest_sha256_override=_compute_sha256(manifest_bytes),
+                    payload_key_override=payload_key,
+                    ciphertext_sha256_override=manifest.get("ciphertext_sha256", ""),
+                    plaintext_sha256_override=expected_pt_sha,
+                    encryption_key_id_override=(enc_info or {}).get("key_id", ""),
                 )
             except Exception as e:
                 return {
