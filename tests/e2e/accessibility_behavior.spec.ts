@@ -480,25 +480,18 @@ test.describe('R61 P1-08: 无障碍行为(自动派生自 generated_a11y_cases.j
       await login(page);
       // 先访问 /users,建立 referer 上下文(/locale 重定向回 referer)
       await navigateAndAssert(page, '/users');
-      // R61 P1-08 修复: page.goto() 默认跟随重定向并返回最终 200 响应,
-      // 无法捕获中间的 303 响应。改用 page.on('response') 事件捕获 303 重定向响应,
-      // 同时让 page.goto() 正常跟随重定向,使 page.url() 为最终路径 /users
-      // (供 assertLocaleRedirect 的 finalUrl 参数校验)。
-      let redirectResponse: { status(): number; headers(): Record<string, string> } | null = null;
-      const responseHandler = (resp: any) => {
-        if (resp.status() === 303 && resp.url().includes('/locale')) {
-          redirectResponse = resp;
-        }
-      };
-      page.on('response', responseHandler);
-      try {
-        await page.goto('/locale?lang=en-US');
-        await page.waitForLoadState('networkidle', { timeout: 5_000 });
-      } finally {
-        page.off('response', responseHandler);
-      }
+      // R61 P1-08 修复: page.goto() 的 Response.headers() 不暴露 Set-Cookie
+      // (浏览器 Fetch API 安全限制:Set-Cookie 是 forbidden response header)。
+      // 改用 page.request.get() + maxRedirects: 0 获取原始 303 响应,
+      // APIResponse.headers() 包含 Set-Cookie(不经浏览器过滤)。
+      // page.request 共享 BrowserContext cookie 存储,login() 的 session_id 可用。
+      // 设置 referer 头使 /locale 重定向回 /users(与浏览器导航行为一致)。
+      const response = await page.request.get('/locale?lang=en-US', {
+        maxRedirects: 0,
+        headers: { referer: page.url() },
+      });
       // R61 P1-08: 严格断言 303 + Set-Cookie locale=en-US + Referrer-Policy 安全 + 最终路径 /users
-      assertLocaleRedirect(redirectResponse, page.url(), {
+      assertLocaleRedirect(response, page.url(), {
         expectedPath: '/users',
         expectedLocale: 'en-US',
       });

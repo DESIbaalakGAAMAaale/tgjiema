@@ -604,8 +604,10 @@ class TestBareStringScan:
 
         # ERROR_INTERNAL 的 safe_params = ["action", "component"]
         # password/token 不在白名单 → 被过滤
+        # R61 修复: 使用足够长的 token 值,避免与随机 trace_id UUID 子串碰撞
+        # (原值 "abc" 在 trace_id=a5abc0af-... 中误匹配导致 flaky failure)
         secret_password = "secret123"
-        secret_token = "abc"
+        secret_token = "abc_test_token_DO_NOT_LEAK_xyz789"
 
         with caplog.at_level(logging.DEBUG):
             try:
