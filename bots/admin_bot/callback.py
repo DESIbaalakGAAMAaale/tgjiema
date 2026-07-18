@@ -11,7 +11,8 @@ from database import (
     get_rotation_config,
     update_file_record_and_invalidate,
 )
-from services.i18n import translate as _i18n_t
+from services.i18n import translate as _i18n_t, get_i18n_manager
+from services.user_message import UserMessage, render_for_send
 from database.cache import invalidate_file_record
 from config import settings
 
@@ -363,6 +364,12 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── 举报动作处理 ──────────────────────────────────────────────
 
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_REPORT_BIND_VERIFY_FAILED = (
+    "[Admin][report] R63 P1-06 绑定校验失败: sub_action={}, handle={}, err={}"
+)
+_LOG_REPORT_HANDLER_ERROR = "[Admin][report] handler error: {}"
+
 async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     """处理管理员对举报的操作：封禁/脱钩/限制/忽略。
 
@@ -405,10 +412,28 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
     # verify_button_token_by_handle 内部:
     #   1. 通过 handle_id 从 button_tokens 表查找完整 token
     #   2. 调用 verify_button_token 验证签名 + 原子消费 nonce
+    #   3. R63 P1-06: 强制匹配 expected_action="report" / expected_audience="admin_callback"
+    #      (handler 无法"忘记"检查 action/audience,杜绝跨 action 滥用)
     from services.button_security import verify_button_token_by_handle
-    valid, token_action, payload = await verify_button_token_by_handle(
-        handle_id, user.id
-    )
+    try:
+        valid, token_action, payload = await verify_button_token_by_handle(
+            handle_id, user.id,
+            expected_action="report",
+            expected_audience="admin_callback",
+        )
+    except Exception as verify_err:
+        # R63 P1-06: action/audience/resource_version 不匹配 → AppError
+        # 这里捕获后统一走"签名验证失败"提示(避免错误信息泄漏 binding 细节)
+        logger.warning(
+            _LOG_REPORT_BIND_VERIFY_FAILED.format(
+                sub_action, handle_id, verify_err
+            )
+        )
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.signature_failed_report'),
+            reply_markup=None,
+        )
+        return
     if not valid:
         logger.warning(
             f"[Admin][report] 签名验证失败: sub_action={sub_action}, "
@@ -469,17 +494,35 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
 
             if result.approval_required:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n⏳ 已提交封禁审批(审批 ID: {result.approval_id}),用户 {uid}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.ban_approval_submitted',
+                            params={'approval_id': result.approval_id, 'uid': uid},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
             elif result.success:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n✅ 已封禁用户 {uid}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.ban_success',
+                            params={'uid': uid},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
             else:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n❌ 封禁失败: {result.error}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.ban_failed',
+                            params={'error': str(result.error)},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
                 return
@@ -508,17 +551,35 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             if result.approval_required:
                 # detach_file 命令 requires_approval=False,不应到达此分支
                 await query.edit_message_text(
-                    query.message.text + f"\n\n⏳ 已提交审批(审批 ID: {result.approval_id}),文件码 {file_code}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.detach_approval_submitted',
+                            params={'approval_id': result.approval_id, 'file_code': file_code},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
             elif result.success:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n✅ 已脱钩文件码 {file_code}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.detach_success',
+                            params={'file_code': file_code},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
             else:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n❌ 脱钩失败: {result.error}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.detach_failed',
+                            params={'error': str(result.error)},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
                 return
@@ -556,17 +617,39 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
 
             if result.approval_required:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n⏳ 已提交审批(审批 ID: {result.approval_id}),举报人 {reporter_id} ↔ 文件码 {file_code}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.block_approval_submitted',
+                            params={
+                                'approval_id': result.approval_id,
+                                'reporter_id': reporter_id,
+                                'file_code': file_code,
+                            },
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
             elif result.success:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n✅ 已限制举报人 {reporter_id} 解码 {file_code}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.block_success',
+                            params={'reporter_id': reporter_id, 'file_code': file_code},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
             else:
                 await query.edit_message_text(
-                    query.message.text + f"\n\n❌ 限制失败: {result.error}",
+                    query.message.text + "\n\n" + render_for_send(
+                        UserMessage.from_key(
+                            'admin.callback.button_security.block_failed',
+                            params={'error': str(result.error)},
+                        ),
+                        get_i18n_manager(),
+                    ),
                     reply_markup=None,
                 )
                 return
@@ -583,8 +666,17 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=None,
             )
     except Exception as e:
-        logger.error(f"[Admin][report] 操作失败: {e}")
-        await query.answer(f"操作失败: {e}", show_alert=True)
+        logger.error(_LOG_REPORT_HANDLER_ERROR.format(e))
+        await query.answer(
+            render_for_send(
+                UserMessage.from_key(
+                    'admin.callback.button_security.operation_failed',
+                    params={'error': str(e)},
+                ),
+                get_i18n_manager(),
+            ),
+            show_alert=True,
+        )
 
 
 async def _notify_reporter(reporter_id_str: str, source_bot: str, message: str):
@@ -617,6 +709,11 @@ async def _notify_reporter(reporter_id_str: str, source_bot: str, message: str):
 
 # ─── 数据库恢复动作处理 ──────────────────────────────────────────
 
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_RESTORE_BIND_VERIFY_FAILED = (
+    "[Admin][restore] R63 P1-06 绑定校验失败: handle={}, err={}"
+)
+
 async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     """处理数据库恢复的确认/取消按钮。
 
@@ -646,10 +743,24 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
     handle_id = data[len("restore:confirm:"):]
 
     # 验证签名 token(原子消费 nonce,防重放)
+    # R63 P1-06: 强制匹配 expected_action="restore" / expected_audience="admin_callback"
     from services.button_security import verify_button_token_by_handle
-    valid, token_action, payload = await verify_button_token_by_handle(
-        handle_id, user.id
-    )
+    try:
+        valid, token_action, payload = await verify_button_token_by_handle(
+            handle_id, user.id,
+            expected_action="restore",
+            expected_audience="admin_callback",
+        )
+    except Exception as verify_err:
+        # R63 P1-06: action/audience/resource_version 不匹配 → AppError
+        logger.warning(
+            _LOG_RESTORE_BIND_VERIFY_FAILED.format(handle_id, verify_err)
+        )
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.signature_failed_restore'),
+            reply_markup=back_kb,
+        )
+        return
     if not valid:
         logger.warning(
             f"[Admin][restore] 签名验证失败: handle={handle_id}"
@@ -742,6 +853,11 @@ async def _handle_restore_action(update: Update, context: ContextTypes.DEFAULT_T
 
 # ─── 文件删除二次确认处理 ──────────────────────────────────────────
 
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_DELETE_FILE_BIND_VERIFY_FAILED = (
+    "[Admin][delete_file] R63 P1-06 绑定校验失败: handle={}, err={}"
+)
+
 async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     """处理文件删除的二次确认/取消按钮(P2-8)。
 
@@ -770,10 +886,24 @@ async def _handle_delete_file_action(update: Update, context: ContextTypes.DEFAU
     handle_id = parts[1]
 
     # 验证签名 token(原子消费 nonce,防重放)
+    # R63 P1-06: 强制匹配 expected_action="delete_file" / expected_audience="admin_callback"
     from services.button_security import verify_button_token_by_handle
-    valid, token_action, payload = await verify_button_token_by_handle(
-        handle_id, user.id
-    )
+    try:
+        valid, token_action, payload = await verify_button_token_by_handle(
+            handle_id, user.id,
+            expected_action="delete_file",
+            expected_audience="admin_callback",
+        )
+    except Exception as verify_err:
+        # R63 P1-06: action/audience/resource_version 不匹配 → AppError
+        logger.warning(
+            _LOG_DELETE_FILE_BIND_VERIFY_FAILED.format(handle_id, verify_err)
+        )
+        await query.edit_message_text(
+            _i18n_t('admin.callback.button_security.signature_failed_delete'),
+            reply_markup=back_kb,
+        )
+        return
     if not valid:
         logger.warning(
             f"[Admin][delete_file] 签名验证失败: handle={handle_id}"

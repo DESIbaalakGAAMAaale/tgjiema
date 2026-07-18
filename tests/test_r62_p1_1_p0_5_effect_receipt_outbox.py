@@ -1031,7 +1031,11 @@ class TestOutboxWorkerStub:
     async def test_outbox_worker_run_once_no_events_returns_zero(self, real_store):
         """无 pending 事件 → run_once 返回全 0。"""
         from services.data_lifecycle import OutboxWorker
-        worker = OutboxWorker(lease_owner="worker_test", batch_size=10)
+        # R63 P0-05: provider_registry=None 必须显式 test_mode=True
+        # (生产模式 fail-fast 防止 stub 误启动)
+        worker = OutboxWorker(
+            lease_owner="worker_test", batch_size=10, test_mode=True,
+        )
         result = await worker.run_once()
         assert result["claimed"] == 0
         assert result["completed"] == 0
@@ -1040,7 +1044,7 @@ class TestOutboxWorkerStub:
 
     @pytest.mark.asyncio
     async def test_outbox_worker_run_once_stub_mode_completes(self, real_store):
-        """stub 模式(provider_registry=None)→ claim 后直接 complete。"""
+        """stub 模式(provider_registry=None + test_mode=True)→ claim 后直接 complete。"""
         from services.data_lifecycle import OutboxWorker
         # 准备 3 条 pending 事件
         for i in range(3):
@@ -1051,7 +1055,10 @@ class TestOutboxWorkerStub:
                 request_hash=f"rh_ow_{i}" + "0" * 56,
                 payload_json=json.dumps({"idx": i}),
             )
-        worker = OutboxWorker(lease_owner="worker_stub", batch_size=10)
+        # R63 P0-05: stub 模式必须显式 test_mode=True
+        worker = OutboxWorker(
+            lease_owner="worker_stub", batch_size=10, test_mode=True,
+        )
         result = await worker.run_once()
         assert result["claimed"] == 3
         assert result["completed"] == 3
@@ -1098,7 +1105,8 @@ class TestOutboxWorkerStub:
         """provider 抛异常 → fail_outbox_event(attempt < max → retryable)。"""
         from services.data_lifecycle import OutboxWorker
 
-        async def _failing_provider(payload_json):
+        # R63 P0-05: provider 签名扩展为 (payload_json, request_hash, idempotency_key)
+        async def _failing_provider(payload_json, request_hash, idempotency_key):
             raise RuntimeError("provider boom")
 
         await real_store.add_outbox_event(

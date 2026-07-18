@@ -39,11 +39,16 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from services.error_codes import AppError, ErrorCodes
 
 # migration 文件目录(database/migrations/)
 _MIGRATIONS_DIR: Path = Path(__file__).parent / "migrations"
@@ -52,6 +57,338 @@ _MIGRATIONS_DIR: Path = Path(__file__).parent / "migrations"
 # Used as trust anchor for backfilling old _migrations_applied rows with empty sha256
 # (trust-on-first-use: 篡改的 disk file 不能成为 trusted baseline)。
 _MANIFEST_PATH: Path = _MIGRATIONS_DIR / "migration-manifest.json"
+
+# R63 P0-04: cosign verify-blob 验证所需的常量。
+# CI 在 sign-image job 中通过 cosign sign-blob --keyless 生成 detached signature,
+# 签名材料与 release commit/tree 绑定。部署/迁移启动前必须 cosign verify-blob。
+# 本地无 cosign 二进制或签名密钥时,通过 MIGRATION_MANIFEST_VERIFY=0 禁用验签
+# (会输出 warning,但不阻断 — 仅用于本地开发/测试)。
+_DEFAULT_CERT_ISSUER = "https://token.actions.githubusercontent.com"
+# 仓库根目录(用于 git rev-parse 获取当前 HEAD/Tree SHA)
+_REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+
+
+def _is_manifest_verify_enabled() -> bool:
+    """R63 P0-04: 检查是否启用 migration manifest 验签。
+
+    通过环境变量 ``MIGRATION_MANIFEST_VERIFY`` 控制:
+      - ``1`` / ``true`` / ``yes`` (大小写不敏感): 启用验签(CI 模式,fail-closed)
+      - 未设置 / ``0`` / ``false`` / ``no``: 禁用验签(本地模式,warning 不阻断)
+
+    CI 中应在 workflow 中设置 ``MIGRATION_MANIFEST_VERIFY=1`` 强制验签。
+    本地开发/测试可不设置或显式设为 ``0``,会输出 warning 但不阻断迁移。
+
+    Returns:
+        True 表示启用验签(必须通过 cosign verify-blob + 签名文件存在性检查)
+    """
+    val = os.environ.get("MIGRATION_MANIFEST_VERIFY", "").strip().lower()
+    return val in ("1", "true", "yes")
+
+
+def _git_rev_parse(rev: str) -> str | None:
+    """R63 P0-04: 执行 ``git rev-parse <rev>`` 获取 SHA。
+
+    在仓库根目录执行 git 命令。若 git 不可用或不在 git 仓库中,返回 None
+    (调用方应据此决定是 warn 还是 fail)。
+
+    Args:
+        rev: git revision spec,如 ``HEAD`` 或 ``HEAD^{tree}``
+
+    Returns:
+        40 字符 SHA 字符串,或 None(git 不可用/不在仓库中)
+    """
+    git_bin = shutil.which("git")
+    if git_bin is None:
+        return None
+    try:
+        result = subprocess.run(
+            [git_bin, "rev-parse", rev],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    # 校验为 40 字符十六进制
+    if len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha.lower()):
+        return None
+    return sha
+
+
+def _verify_manifest_head_tree_binding(data: dict[str, Any]) -> None:
+    """R63 P0-04: 验证 manifest 绑定的 release_commit / tree_sha 与当前 git HEAD 一致。
+
+    manifest 是 release artifact,必须绑定到具体的 commit + tree。
+    若 manifest 的 release_commit/tree_sha 与当前 git HEAD/Tree 不一致,
+    说明 manifest 是旧版本或被篡改 — 必须阻断迁移(fail-closed)。
+
+    若 git 不可用或不在 git 仓库中(如解压部署),输出 warning 但不阻断
+    (无法验证 = 无法阻断;此时应通过 MIGRATION_MANIFEST_VERIFY=1 + cosign
+    verify-blob 保证 manifest 真实性)。
+
+    Args:
+        data: 已解析的 manifest JSON dict
+
+    Raises:
+        AppError(MIGRATION_MANIFEST_*): HEAD/Tree SHA 与 manifest 不一致
+    """
+    manifest_commit = str(data.get("release_commit", "")).strip()
+    manifest_tree = str(data.get("tree_sha", "")).strip()
+    if not manifest_commit or not manifest_tree:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_FIELD_MISSING,
+            params={"field": "release_commit/tree_sha", "reason": "empty"},
+        )
+    head_sha = _git_rev_parse("HEAD")
+    tree_sha = _git_rev_parse("HEAD^{tree}")
+    if head_sha is None or tree_sha is None:
+        logger.warning(
+            "[migrate] R63 P0-04: git 不可用或不在 git 仓库中, "
+            "跳过 HEAD/Tree 绑定验证(无法验证 manifest 是否绑定到当前 commit) "
+            "— 部署环境应通过 MIGRATION_MANIFEST_VERIFY=1 + cosign verify-blob 保证真实性"
+        )
+        return
+    if head_sha != manifest_commit:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_BINDING_MISMATCH,
+            params={
+                "field": "release_commit",
+                "expected": manifest_commit[:12],
+                "actual": head_sha[:12],
+            },
+        )
+    if tree_sha != manifest_tree:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_BINDING_MISMATCH,
+            params={
+                "field": "tree_sha",
+                "expected": manifest_tree[:12],
+                "actual": tree_sha[:12],
+            },
+        )
+    logger.info(
+        f"[migrate] R63 P0-04: manifest HEAD/Tree 绑定验证通过 "
+        f"(commit={head_sha[:12]}..., tree={tree_sha[:12]}...)"
+    )
+
+
+def _verify_manifest_migration_set(data: dict[str, Any]) -> None:
+    """R63 P0-04: 验证磁盘上的 migration 文件集合与 manifest 声明集合完全一致。
+
+    要求 "磁盘集合 == manifest 集合",不允许:
+      - 磁盘有但 manifest 没列出的 migration(漏项,可能跳过验签)
+      - manifest 列出但磁盘不存在的 migration(多项,可能引用旧 manifest)
+
+    Args:
+        data: 已解析的 manifest JSON dict
+
+    Raises:
+        AppError(MIGRATION_MANIFEST_SET_MISMATCH): 磁盘集合与 manifest 集合不一致
+    """
+    manifest_versions = {
+        str(entry["version"]) for entry in data.get("migrations", [])
+        if "version" in entry
+    }
+    disk_versions = {
+        f.name for f in _MIGRATIONS_DIR.glob("*.sql")
+    } if _MIGRATIONS_DIR.exists() else set()
+    missing_in_manifest = disk_versions - manifest_versions
+    missing_on_disk = manifest_versions - disk_versions
+    if missing_in_manifest:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_SET_MISMATCH,
+            params={
+                "missing_in_manifest": sorted(missing_in_manifest),
+                "missing_on_disk": [],
+            },
+        )
+    if missing_on_disk:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_SET_MISMATCH,
+            params={
+                "missing_in_manifest": [],
+                "missing_on_disk": sorted(missing_on_disk),
+            },
+        )
+    logger.info(
+        f"[migrate] R63 P0-04: migration 集合一致性验证通过 "
+        f"({len(manifest_versions)} 个 migration)"
+    )
+
+
+def _verify_manifest_cosign_signature(data: dict[str, Any]) -> None:
+    """R63 P0-04: 通过 cosign verify-blob 验证 manifest 的 detached signature。
+
+    要求:
+      1. manifest JSON 中的 ``verification.signature_file`` / ``certificate_file``
+         指向的文件必须存在(detached signature + certificate)
+      2. ``cosign verify-blob`` 必须成功(签名有效 + 证书 identity/issuer 钉扎匹配)
+
+    签名失败、签名文件缺失、证书 identity/issuer 不匹配 → raise AppError(fail-closed)。
+
+    本地无 cosign 二进制或签名密钥时,应通过 ``MIGRATION_MANIFEST_VERIFY=0`` 禁用验签
+    (会输出 warning)。CI 中必须启用。
+
+    Args:
+        data: 已解析的 manifest JSON dict
+
+    Raises:
+        AppError(MIGRATION_MANIFEST_SIGNATURE_INVALID): 签名文件缺失 / cosign 不可用 / 验签失败
+    """
+    verification = data.get("verification", {})
+    if not isinstance(verification, dict):
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_FIELD_MISSING,
+            params={"field": "verification", "reason": "missing_or_not_dict"},
+        )
+    sig_rel = str(verification.get("signature_file", "")).strip()
+    cert_rel = str(verification.get("certificate_file", "")).strip()
+    issuer = str(
+        verification.get("certificate_oidc_issuer", _DEFAULT_CERT_ISSUER)
+    ).strip()
+    if not sig_rel or not cert_rel:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_FIELD_MISSING,
+            params={
+                "field": "signature_file/certificate_file",
+                "reason": "empty",
+            },
+        )
+    sig_path = _MIGRATIONS_DIR / sig_rel
+    cert_path = _MIGRATIONS_DIR / cert_rel
+    if not sig_path.exists():
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_SIGNATURE_INVALID,
+            params={
+                "reason": "signature_file_not_found",
+                "sig_file": sig_rel,
+                "cert_file": cert_rel,
+            },
+        )
+    if not cert_path.exists():
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_SIGNATURE_INVALID,
+            params={
+                "reason": "certificate_file_not_found",
+                "sig_file": sig_rel,
+                "cert_file": cert_rel,
+            },
+        )
+    cosign_bin = shutil.which("cosign")
+    if cosign_bin is None:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_SIGNATURE_INVALID,
+            params={
+                "reason": "cosign_binary_not_in_path",
+                "sig_file": sig_rel,
+                "cert_file": cert_rel,
+            },
+        )
+    # 从 manifest 提取 certificate_identity_prefix,构造精确 identity
+    # (CI 签名时使用的 workflow identity)
+    identity_prefix = str(
+        verification.get("certificate_identity_prefix", "")
+    ).strip()
+    if not identity_prefix:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_FIELD_MISSING,
+            params={
+                "field": "certificate_identity_prefix",
+                "reason": "empty",
+            },
+        )
+    # 通过 git 获取当前 ref,构造完整 identity
+    # (与 CI 签名时使用的 identity 完全一致)
+    head_sha = _git_rev_parse("HEAD")
+    if head_sha is None:
+        # 退化:只用 prefix 做前缀匹配(regexp 模式)
+        identity_regexp = _escape_regexp(identity_prefix) + r".+"
+        cmd = [
+            cosign_bin, "verify-blob",
+            "--certificate-identity-regexp", identity_regexp,
+            "--certificate-oidc-issuer", issuer,
+            "--certificate", str(cert_path),
+            "--signature", str(sig_path),
+            str(_MANIFEST_PATH),
+        ]
+    else:
+        # 精确模式:prefix + 当前 ref(从 git symbolic-ref 获取)
+        git_bin = shutil.which("git")
+        ref_result = subprocess.run(
+            [git_bin, "symbolic-ref", "HEAD"],
+            cwd=str(_REPO_ROOT),
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if ref_result.returncode == 0:
+            current_ref = ref_result.stdout.strip()
+        else:
+            # detached HEAD,退化到 regexp 模式
+            current_ref = None
+        if current_ref:
+            identity = f"{identity_prefix}{current_ref}"
+            cmd = [
+                cosign_bin, "verify-blob",
+                "--certificate-identity", identity,
+                "--certificate-oidc-issuer", issuer,
+                "--certificate", str(cert_path),
+                "--signature", str(sig_path),
+                str(_MANIFEST_PATH),
+            ]
+        else:
+            identity_regexp = _escape_regexp(identity_prefix) + r".+"
+            cmd = [
+                cosign_bin, "verify-blob",
+                "--certificate-identity-regexp", identity_regexp,
+                "--certificate-oidc-issuer", issuer,
+                "--certificate", str(cert_path),
+                "--signature", str(sig_path),
+                str(_MANIFEST_PATH),
+            ]
+    logger.info(
+        f"[migrate] R63 P0-04: cosign verify-blob 验证 manifest 签名 "
+        f"(manifest={_MANIFEST_PATH.name})"
+    )
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_SIGNATURE_INVALID,
+            params={
+                "reason": f"cosign_verify_blob_execution_failed: {e}",
+                "sig_file": sig_rel,
+                "cert_file": cert_rel,
+            },
+        ) from e
+    if result.returncode != 0:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_SIGNATURE_INVALID,
+            params={
+                "reason": f"cosign_verify_blob_failed exit={result.returncode}",
+                "sig_file": sig_rel,
+                "cert_file": cert_rel,
+            },
+        )
+    logger.info("[migrate] R63 P0-04: migration manifest cosign 验签通过")
+
+
+def _escape_regexp(s: str) -> str:
+    """转义字符串中的正则元字符,使其可作为字面量用于 regexp。
+
+    Args:
+        s: 待转义的字符串
+
+    Returns:
+        转义后的字符串(正则元字符已转义)
+    """
+    import re
+    return re.escape(s)
 
 
 def _strip_sql_comments(sql_content: str) -> str:
@@ -177,19 +514,73 @@ async def _assert_migration_fingerprint(db: Any, version: str) -> None:
                 f"missing columns {missing} (actual cols: {sorted(cols)})"
             )
 
+    if version == "004_effect_receipts_request_hash_unique.sql":
+        # R63 P1-03: Post-migration conservation + evidence-completeness assertion.
+        # 防御纵深:004 migration SQL 内已有 CASE WHEN 守恒/证据断言(违反 CHECK →
+        # ROLLBACK),此处再在 Python 层做一次跨表 COUNT 比对(SQLite SQL 内难以
+        # 直接 RAISE 跨表断言,Python 层是最可靠的 fail-closed 位置)。
+        # 守恒等式(rename 后):
+        #   count(effect_receipts)               — strict winner 行(rename 后的新表)
+        #   + count(effect_receipts_r62_quarantine)            — 非法隔离行
+        #   + count(effect_receipts_r62_duplicates WHERE classification='duplicate') — 去重 loser 行
+        #   == count(effect_receipts_invalid_r62)              — 旧表(rename 后保留取证)
+        # 证据完整性:count(effect_receipts_r62_duplicates) == count(effect_receipts_invalid_r62)
+        #   (每条原始 row 都在取证表有一行,不论分类)
+        cursor = await db.execute("SELECT COUNT(*) FROM effect_receipts")
+        strict_count = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM effect_receipts_r62_quarantine"
+        )
+        quarantine_count = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM effect_receipts_r62_duplicates "
+            "WHERE classification = 'duplicate'"
+        )
+        duplicates_count = (await cursor.fetchone())[0]
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM effect_receipts_invalid_r62"
+        )
+        original_count = (await cursor.fetchone())[0]
+        if strict_count + quarantine_count + duplicates_count != original_count:
+            raise RuntimeError(
+                f"Migration {version} conservation assertion failed: "
+                f"strict({strict_count}) + quarantine({quarantine_count}) "
+                f"+ duplicates({duplicates_count}) "
+                f"!= original({original_count}) — rows silently lost"
+            )
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM effect_receipts_r62_duplicates"
+        )
+        evidence_count = (await cursor.fetchone())[0]
+        if evidence_count != original_count:
+            raise RuntimeError(
+                f"Migration {version} evidence completeness failed: "
+                f"duplicates evidence table has {evidence_count} rows, "
+                f"original has {original_count} — not every original row has evidence"
+            )
+
 
 def _load_migration_manifest() -> dict[str, dict[str, Any]]:
-    """R61 P0-05: 加载 migration-manifest.json,返回 {version: entry} 映射。
+    """R61 P0-05 / R63 P0-04: 加载并验证 migration-manifest.json,返回 {version: entry} 映射。
 
     manifest 是签名的 trust anchor,列出每个 migration 文件的预期 SHA-256。
     用于 backfill 旧 ``_migrations_applied`` 行(stored_sha256 为空时),
     替代 R60 的"信任当前 disk file"TOFU(篡改的 disk file 不能成为 baseline)。
 
+    R63 P0-04 整改要点:
+      - 不再把未验签 JSON 称作 signed trust anchor — 加载时强制执行:
+        ① HEAD/Tree 绑定验证(manifest release_commit/tree_sha 必须匹配当前 git)
+        ② 磁盘 migration 集合 == manifest 集合(不允许漏项/多项)
+        ③ 若 ``MIGRATION_MANIFEST_VERIFY=1``: cosign verify-blob 验证 detached signature
+      - 验签失败、签名文件缺失、HEAD/Tree 不匹配、集合不一致 → raise(fail-closed)
+      - 本地无 cosign 时可设 ``MIGRATION_MANIFEST_VERIFY=0`` 跳过 cosign 验签(warning)
+
     Returns:
         {version: {"sha256": str, "predecessor": str|None, ...}} 映射
 
     Raises:
-        RuntimeError: manifest 文件不存在或解析失败(fail-closed)
+        RuntimeError: manifest 文件不存在 / 解析失败 / HEAD/Tree 不匹配 /
+                      集合不一致 / cosign 验签失败(fail-closed)
     """
     import json
     if not _MANIFEST_PATH.exists():
@@ -207,6 +598,18 @@ def _load_migration_manifest() -> dict[str, dict[str, Any]]:
     if not isinstance(migrations, list):
         raise RuntimeError(
             f"R61 P0-05: migration manifest 'migrations' field is not a list"
+        )
+    # R63 P0-04: 加载 manifest 作为 trust anchor 前必须验证完整性
+    # (HEAD/Tree 绑定 + 磁盘集合一致性 + 可选 cosign 验签)
+    _verify_manifest_head_tree_binding(data)
+    _verify_manifest_migration_set(data)
+    if _is_manifest_verify_enabled():
+        _verify_manifest_cosign_signature(data)
+    else:
+        logger.warning(
+            "[migrate] R63 P0-04: MIGRATION_MANIFEST_VERIFY 未启用, "
+            "跳过 cosign verify-blob 验签 — 本地开发/测试模式,不验证 manifest 签名。"
+            "CI 部署/迁移启动前必须设置 MIGRATION_MANIFEST_VERIFY=1 强制验签。"
         )
     return {str(entry["version"]): entry for entry in migrations if "version" in entry}
 

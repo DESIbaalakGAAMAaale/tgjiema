@@ -1612,11 +1612,22 @@ class CacheStore:
                 attempt_count   INTEGER NOT NULL DEFAULT 0,
                 max_attempts    INTEGER NOT NULL DEFAULT 3,
                 last_error      TEXT,
+                external_id     TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
                 UNIQUE (action_id, effect_type, target, request_hash)
             )"""
         )
+        # R63 P0-05: 旧 schema 无 external_id 列,幂等补列(已存在则忽略)
+        try:
+            await self._db.execute(
+                "ALTER TABLE outbox_events ADD COLUMN external_id TEXT"
+            )
+        except Exception as _e_ob_ext_id:
+            # 列已存在(幂等)或其它可忽略错误
+            logger.debug(
+                f"[CacheStore] outbox_events ADD external_id (幂等,可忽略): {_e_ob_ext_id}"
+            )
         # partial index: 仅 pending 行参与 lease claim,减少索引扫描成本
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_outbox_events_pending "
@@ -1626,6 +1637,13 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_outbox_events_action "
             "ON outbox_events(action_id)"
+        )
+        # R63 P0-05: stale lease 回收索引(in_flight + lease_expires_at),
+        # 用于 OutboxWorker.reclaim_stale_leases() 高效扫描过期 lease
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_events_in_flight_lease "
+            "ON outbox_events(status, lease_expires_at) "
+            "WHERE status = 'in_flight'"
         )
 
         # ─── R46 P1: mfa_used_totp 表 — TOTP 重放防护持久化(跨进程共享) ───
@@ -1833,16 +1851,33 @@ class CacheStore:
         # handler 通过 handle_id 查找完整 token 后调用 verify_button_token 验签。
         # nonce 原子消费仍在 callback_nonces 表(由 verify_button_token 触发),
         # button_tokens 表仅做 handle → token 映射,可重复读取(无副作用)。
+        #
+        # ─── R63 P1-06: 增加 audience / resource_version 列 ───
+        # verify_button_token_by_handle 强制匹配 expected_action/expected_audience/
+        # expected_resource_version,库内部一次性完成全部绑定 + nonce 消费,
+        # 杜绝 handler 忘记校验 action/audience/resource_version 的跨 action 滥用。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS button_tokens (
-                handle_id      TEXT PRIMARY KEY,
-                token           TEXT NOT NULL,
-                principal_id    INTEGER NOT NULL,
-                action          TEXT NOT NULL,
-                created_at      TEXT NOT NULL,
-                consumed_at     TEXT
+                handle_id        TEXT PRIMARY KEY,
+                token            TEXT NOT NULL,
+                principal_id     INTEGER NOT NULL,
+                action           TEXT NOT NULL,
+                audience         TEXT,
+                resource_version TEXT,
+                created_at       TEXT NOT NULL,
+                consumed_at      TEXT
             )"""
         )
+        # R63 P1-06: 旧库迁移(已存在的 button_tokens 表无 audience/resource_version 列)
+        # SQLite 不支持 ADD COLUMN IF NOT EXISTS,需要逐列 try/except
+        for _col in ("audience", "resource_version"):
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE button_tokens ADD COLUMN {_col} TEXT"
+                )
+            except Exception:
+                # 列已存在则忽略(aiosqlite OperationalError)
+                pass
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_button_tokens_principal "
             "ON button_tokens(principal_id)"
@@ -1850,6 +1885,29 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_button_tokens_action "
             "ON button_tokens(action)"
+        )
+
+        # ─── R63 P1-01: restore_capability_nonces 表 — 恢复能力令牌 nonce 持久化消费 ───
+        # 替代原进程内 _CONSUMED_NONCES set(R62 P0-01),实现跨进程/重启/worker 切换的
+        # 防重放保护。nonce PRIMARY KEY + INSERT OR IGNORE 实现原子 CAS:
+        #   - consume_capability_nonce(): INSERT OR IGNORE,rowcount==1 表示本调用方赢得竞态
+        #     (nonce 之前未被消费),rowcount==0 表示 nonce 已被消费(重放攻击或竞态失败)
+        #   - is_capability_nonce_consumed(): SELECT 检查不消费(用于预检)
+        # 唯一键绑定: nonce(PK) + backup_id + manifest_sha256 + payload_digest,
+        # 任一字段不匹配的"重放"尝试即使伪造 nonce 也会因绑定字段不一致被审计捕获。
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS restore_capability_nonces (
+                nonce           TEXT PRIMARY KEY,
+                backup_id       TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                payload_digest  TEXT NOT NULL,
+                consumed_at     TEXT NOT NULL,
+                consumed_by     TEXT
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_restore_nonces_backup_id "
+            "ON restore_capability_nonces(backup_id)"
         )
 
         await self._db.commit()
@@ -2195,17 +2253,34 @@ class CacheStore:
         self,
         event_id: int,
         *,
+        external_id: str = "",
+        lease_owner: str = "",
+        request_hash: str = "",
         connection: Any = None,
         tx: Any = None,
     ) -> bool:
-        """R62 P0-05: 标记 outbox_event 为 completed(CAS,仅 in_flight 可转 completed)。
+        """R62 P0-05 + R63 P0-05: 标记 outbox_event 为 completed(CAS 双重校验)。
+
+        R63 P0-05 整改(防止 stub worker 误完成非己事件):
+        - 旧 SQL 仅 ``WHERE id=? AND status='in_flight'``,任何拿到 event_id 的
+          调用方都能 complete,即使该 lease 已被其他 worker 持有或 request_hash
+          不匹配。生产环境中若 stub worker 误启动,会把所有外部副作用标记完成。
+        - 新 SQL 增加 CAS 条件 ``AND lease_owner=? AND request_hash=?``:
+          只有持有 lease 的 worker 才能 complete,且必须知道正确的 request_hash
+          (provider 调用前从 outbox event 读取,非调用方任意传入)。
+        - 同时保存 ``external_id``(provider 返回的外部系统标识,如 telegram
+          message_id / r2 object key),用于事后对账与人工重放。
 
         Args:
             event_id: outbox_events.id
+            external_id: provider 返回的外部系统标识(telegram message_id / r2 key 等)
+            lease_owner: 必须与 claim 时设置的 lease_owner 一致(防越权 complete)
+            request_hash: 必须与 outbox event 的 request_hash 一致(防错配)
             connection / tx: 可选事务连接(与 effect_receipts 原子提交)
 
         Returns:
-            True 表示 CAS 成功;False 表示行不存在或状态非 in_flight
+            True 表示 CAS 成功;False 表示行不存在 / 状态非 in_flight /
+            lease_owner 不匹配 / request_hash 不匹配
         """
         if tx is not None:
             connection = tx
@@ -2213,12 +2288,27 @@ class CacheStore:
         if db is None:
             return False
         now = datetime.datetime.utcnow().isoformat()
-        cursor = await db.execute(
-            "UPDATE outbox_events "
-            "SET status='completed', last_error=NULL, updated_at=? "
-            "WHERE id=? AND status='in_flight'",
-            (now, event_id),
-        )
+        # R63 P0-05: CAS 条件 — status + lease_owner + request_hash 三重校验
+        # lease_owner / request_hash 为空时不参与 CAS(向后兼容旧调用方,
+        # 但生产 worker 必须传入两者,OutboxWorker.run_once 已强制传入)
+        if lease_owner and request_hash:
+            cursor = await db.execute(
+                "UPDATE outbox_events "
+                "SET status='completed', external_id=?, last_error=NULL, "
+                "updated_at=? "
+                "WHERE id=? AND status='in_flight' "
+                "AND lease_owner=? AND request_hash=?",
+                (external_id, now, event_id, lease_owner, request_hash),
+            )
+        else:
+            # 兼容路径:仅 status CAS(旧调用方 / 测试场景)
+            cursor = await db.execute(
+                "UPDATE outbox_events "
+                "SET status='completed', external_id=?, last_error=NULL, "
+                "updated_at=? "
+                "WHERE id=? AND status='in_flight'",
+                (external_id, now, event_id),
+            )
         affected = cursor.rowcount if cursor is not None else 0
         if connection is None:
             await db.commit()
@@ -2325,6 +2415,113 @@ class CacheStore:
         if connection is None:
             await db.commit()
         return affected > 0
+
+    async def reclaim_stale_outbox_leases(
+        self,
+        *,
+        batch_size: int = 100,
+    ) -> int:
+        """R63 P0-05: 回收过期 lease(in_flight + lease_expires_at < now → pending)。
+
+        旧桩未实现 stale lease 回收,导致 worker 崩溃后其 in_flight 行永远
+        卡住(无人 complete 也无人 fail),外部副作用永久悬挂。
+
+        本方法扫描 ``status='in_flight' AND lease_expires_at < now`` 的行,
+        原子地将它们转回 ``pending`` 状态(清空 lease_owner / lease_expires_at),
+        让其它 worker 可重新 claim。``attempt_count`` 不变(失败的尝试仍计入
+        重试上限,防止无限重试)。
+
+        Args:
+            batch_size: 单次最多回收的行数
+
+        Returns:
+            回收的行数(0 表示无过期 lease)
+        """
+        if not self._db:
+            return 0
+        now_iso = datetime.datetime.utcnow().isoformat()
+        affected = 0
+        try:
+            cursor = await self._db.execute(
+                "UPDATE outbox_events "
+                "SET status='pending', lease_owner=NULL, lease_expires_at=NULL, "
+                "last_error=COALESCE(last_error||' | ', '') || "
+                "'lease_reclaimed_at:' || ?, updated_at=? "
+                "WHERE id IN ("
+                "  SELECT id FROM outbox_events "
+                "  WHERE status='in_flight' AND lease_expires_at IS NOT NULL "
+                "  AND lease_expires_at < ? "
+                "  ORDER BY lease_expires_at ASC LIMIT ?"
+                ")",
+                (now_iso, now_iso, now_iso, batch_size),
+            )
+            affected = cursor.rowcount if cursor is not None else 0
+            if affected > 0:
+                logger.info(
+                    f"[CacheStore] reclaim_stale_outbox_leases 回收 {affected} 行"
+                )
+            await self._db.commit()
+        except Exception as e:
+            logger.error(
+                f"[CacheStore] reclaim_stale_outbox_leases 失败: {e}"
+            )
+            try:
+                await self._db.rollback()
+            except Exception as rb_err:
+                logger.debug(f"[CacheStore] rollback 失败: {rb_err}")
+        return affected
+
+    async def renew_outbox_lease(
+        self,
+        event_id: int,
+        *,
+        lease_owner: str,
+        request_hash: str,
+        lease_duration_seconds: int = 60,
+    ) -> bool:
+        """R63 P0-05: 续约 lease(长 provider 调用防超时回收)。
+
+        provider 调用耗时较长(如大文件 R2 上传)时,worker 应周期性续约 lease,
+        防止 lease 超时被其它 worker 回收后造成双重执行。
+
+        CAS 条件: status='in_flight' AND lease_owner=? AND request_hash=?
+        (只有持有 lease 的 worker 才能 renew,防越权续约)。
+
+        Args:
+            event_id: outbox_events.id
+            lease_owner: 必须与 claim 时一致
+            request_hash: 必须与 outbox event 一致
+            lease_duration_seconds: 新的 lease 超时秒数(从当前时刻起)
+
+        Returns:
+            True 续约成功;False 行不存在 / lease 已被回收 / 调用方非 lease 持有者
+        """
+        if not self._db:
+            return False
+        now = datetime.datetime.utcnow()
+        new_expires = (
+            now + datetime.timedelta(seconds=lease_duration_seconds)
+        ).isoformat()
+        now_iso = now.isoformat()
+        renewed = False
+        try:
+            cursor = await self._db.execute(
+                "UPDATE outbox_events "
+                "SET lease_expires_at=?, updated_at=? "
+                "WHERE id=? AND status='in_flight' "
+                "AND lease_owner=? AND request_hash=?",
+                (new_expires, now_iso, event_id, lease_owner, request_hash),
+            )
+            affected = cursor.rowcount if cursor is not None else 0
+            await self._db.commit()
+            renewed = affected > 0
+        except Exception as e:
+            logger.error(f"[CacheStore] renew_outbox_lease 失败: {e}")
+            try:
+                await self._db.rollback()
+            except Exception as rb_err:
+                logger.debug(f"[CacheStore] rollback 失败: {rb_err}")
+        return renewed
 
     async def get_dirty_outbox_batch(self, limit: int = 100) -> list[dict]:
         """R38 P1-2: 拉取一批未处理的 dirty_outbox 记录(processed=0)。
@@ -8163,6 +8360,96 @@ class CacheStore:
             logger.error(f"[CacheStore] callback_nonce_cleanup 失败: {e}")
         return {"deleted_expired": deleted_expired, "deleted_consumed": deleted_consumed}
 
+    # ─── R63 P1-01: restore_capability_nonces 持久化 nonce 消费方法 ────
+    # 替代 services.backup_dr_validate._CONSUMED_NONCES 进程内 set,
+    # 实现跨进程/重启/worker 切换的防重放保护。
+
+    async def consume_capability_nonce(
+        self,
+        nonce: str,
+        backup_id: str,
+        manifest_sha256: str,
+        payload_digest: str,
+        consumed_by: str = "",
+    ) -> bool:
+        """R63 P1-01: 原子消费恢复能力令牌 nonce(INSERT OR IGNORE CAS)。
+
+        替代 R62 P0-01 的进程内 ``_CONSUMED_NONCES`` set,实现跨进程/重启/
+        worker 切换的防重放保护。nonce PRIMARY KEY + INSERT OR IGNORE 实现
+        原子 CAS:
+            - rowcount == 1: 本调用方赢得竞态(nonce 之前未被消费)
+            - rowcount == 0: nonce 已被消费(重放攻击或竞态失败)
+
+        唯一键绑定: nonce(PK) + backup_id + manifest_sha256 + payload_digest。
+        即使攻击者伪造 nonce,绑定字段不一致也会被审计捕获(查询时可关联)。
+
+        多实例/并发安全: SQLite 的 INSERT OR IGNORE 在 PRIMARY KEY 冲突时
+        返回 0 行 affected,天然 CAS 语义;WAL 模式 + busy_timeout 保证
+        多个 CacheStore 实例(不同进程/worker)共享同一 DB 文件时的串行化。
+
+        Args:
+            nonce: 令牌唯一随机数(_RestoreCapability 内嵌的 secrets.token_hex(16))
+            backup_id: 备份 ID(令牌绑定,审计字段)
+            manifest_sha256: manifest 原始 bytes SHA-256(令牌绑定,审计字段)
+            payload_digest: payload canonical JSON SHA-256(令牌绑定,审计字段)
+            consumed_by: 消费者标识(hostname:pid,审计字段)
+
+        Returns:
+            True=消费成功(本调用方赢得竞态,nonce 之前未被消费);
+            False=nonce 已被消费(重放或竞态失败,调用方必须 fail-closed)
+        """
+        if not self._db:
+            return False
+        import datetime as _dt
+        _now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        try:
+            cursor = await self._db.execute(
+                """INSERT OR IGNORE INTO restore_capability_nonces
+                   (nonce, backup_id, manifest_sha256, payload_digest,
+                    consumed_at, consumed_by)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (nonce, backup_id, manifest_sha256, payload_digest,
+                 _now, consumed_by or ""),
+            )
+            _affected = cursor.rowcount or 0
+            await self._db.commit()
+            return _affected == 1
+        except Exception as e:
+            logger.error(
+                f"[CacheStore] consume_capability_nonce 失败: {e}"
+            )
+            return False
+
+    async def is_capability_nonce_consumed(self, nonce: str) -> bool:
+        """R63 P1-01: 检查 nonce 是否已被消费(不消费,仅查询)。
+
+        用于 assert_valid 的预检:在尝试消费前先检查,避免不必要的写入。
+        注意:预检与消费之间存在 TOCTOU 窗口,因此 consume_capability_nonce
+        仍以 INSERT OR IGNORE 的 rowcount 为权威判定;本方法仅用于早期拒绝
+        已被消费的 nonce(优化路径,非安全边界)。
+
+        Args:
+            nonce: 令牌唯一随机数
+
+        Returns:
+            True=nonce 已被消费(调用方应直接 fail-closed);
+            False=nonce 未被消费(调用方仍需调用 consume_capability_nonce 完成原子消费)
+        """
+        if not self._db:
+            return False
+        try:
+            cursor = await self._db.execute(
+                "SELECT 1 FROM restore_capability_nonces WHERE nonce = ? LIMIT 1",
+                (nonce,),
+            )
+            row = await cursor.fetchone()
+            return row is not None
+        except Exception as e:
+            logger.error(
+                f"[CacheStore] is_capability_nonce_consumed 失败: {e}"
+            )
+            return False
+
     # ─── R62 P0-04: button_tokens 表 — 短 handle_id 到签名 token 的映射 ───
 
     async def button_token_store(
@@ -8171,6 +8458,8 @@ class CacheStore:
         token: str,
         principal_id: int,
         action: str,
+        audience: str | None = None,
+        resource_version: str | None = None,
     ) -> bool:
         """R62 P0-04: 存储签名 token(以短 handle_id 为键)。
 
@@ -8178,11 +8467,18 @@ class CacheStore:
         服务端持久化完整 token,callback_data 仅携带 handle_id,
         handler 收到回调后通过 handle_id 查找完整 token 验签。
 
+        R63 P1-06: 增加 audience / resource_version 元数据列,
+        供 verify_button_token_by_handle 在验签后强制匹配:
+            - audience: 接收方标识(如 "admin_callback"),防止跨 handler 滥用
+            - resource_version: 资源版本绑定,防止旧按钮操作已更新资源
+
         Args:
             handle_id: 短 handle_id(callback_data 中携带)
             token: 完整签名 token(6 段格式,含 nonce + signature)
             principal_id: 关联主体 ID(管理员 user_id)
             action: 关联动作(如 'report'/'restore'/'delete_file')
+            audience: 接收方 audience 标识(默认 'admin_callback')
+            resource_version: 资源版本(可选,用于绑定资源版本)
 
         Returns:
             True=创建成功;False=创建失败
@@ -8194,9 +8490,11 @@ class CacheStore:
         try:
             await self._db.execute(
                 """INSERT OR REPLACE INTO button_tokens
-                   (handle_id, token, principal_id, action, created_at, consumed_at)
-                   VALUES (?, ?, ?, ?, ?, NULL)""",
-                (handle_id, token, principal_id, action, _now),
+                   (handle_id, token, principal_id, action, audience,
+                    resource_version, created_at, consumed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, NULL)""",
+                (handle_id, token, principal_id, action,
+                 audience, resource_version, _now),
             )
             await self._db.commit()
             return True
@@ -8230,6 +8528,53 @@ class CacheStore:
             return row[0]
         except Exception as e:
             logger.error(f"[CacheStore] button_token_lookup 失败: {e}")
+            return None
+
+    async def button_token_lookup_with_bindings(
+        self, handle_id: str,
+    ) -> dict | None:
+        """R63 P1-06: 通过 handle_id 查找 token 及其绑定元数据(audience/resource_version)。
+
+        与 button_token_lookup 的区别:本方法返回完整绑定字典,
+        供 verify_button_token_by_handle 校验 expected_audience /
+        expected_resource_version。元数据在 button_token_store 时写入,
+        未经签名,但与 handle_id 一对一绑定(handle_id 不可伪造)。
+
+        Args:
+            handle_id: 短 handle_id
+
+        Returns:
+            dict: {
+                "token": str,                   # 完整签名 token
+                "principal_id": int,            # 主体 ID
+                "action": str,                  # action 字段(token 内亦有,signed)
+                "audience": str | None,         # 接收方 audience
+                "resource_version": str | None,  # 资源版本
+            }
+            不存在时返回 None
+        """
+        if not self._db:
+            return None
+        try:
+            cursor = await self._db.execute(
+                """SELECT token, principal_id, action, audience, resource_version
+                   FROM button_tokens WHERE handle_id = ? LIMIT 1""",
+                (handle_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return {
+                "token": row[0],
+                "principal_id": row[1],
+                "action": row[2],
+                "audience": row[3],
+                "resource_version": row[4],
+            }
+        except Exception as e:
+            logger.error(
+                f"[CacheStore] button_token_lookup_with_bindings 失败: {e}"
+            )
             return None
 
     async def button_token_mark_consumed(self, handle_id: str) -> bool:

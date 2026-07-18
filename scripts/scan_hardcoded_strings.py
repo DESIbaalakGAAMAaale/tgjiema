@@ -98,6 +98,15 @@ SCANNER_VERSION = "6.0"
 # R62 P1-05: cross-function 分析能力标记(独立于 SCANNER_VERSION,避免破坏 baseline 兼容)
 CROSS_FUNCTION_ANALYSIS_VERSION = "7.0-r62-p1-05"
 
+# R63 P1-09: 补充门禁 disclaimer 文本(始终打印到 stdout)
+# 本扫描器是 supplementary gate,非完整 source-to-sink 数据流分析。
+COMPLETENESS_DISCLAIMER = (
+    "R63 P1-09: This scanner is a supplementary gate, NOT a complete "
+    "source-to-sink data flow analysis. Cross-function tracking is a "
+    "best-effort heuristic (max depth 3, function-internal var_map only). "
+    "Use CodeQL / Semgrep / pyright / mypy for complete taint analysis."
+)
+
 # 中文 Unicode 范围(仅用于向后兼容旧测试的 CJK 检测;R59 §5.1 P1 后 classify_finding
 # 不再使用此常量做 user_visible/log_only 区分,所有 sink 字面量统一归 user_visible)
 CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
@@ -932,6 +941,10 @@ def scan_python_content_cross_function(
     fail_on_unknown_sink: bool = False,
 ) -> list[tuple[int, str, str]]:
     """R62 P1-05: cross-function source-to-sink 分析(增量于 scan_python_content)。
+
+    R63 P1-09: 本分析是 best-effort 启发式(补充门禁),非完整 source-to-sink
+    数据流分析。最大回溯深度 3 层,仅维护函数内部 var_map,不做跨函数/跨模块
+    完整 taint 传播。完整 taint 分析请使用 CodeQL / Semgrep / pyright / mypy。
 
     在 scan_python_content 已有检测之上,新增:
         1. 变量回溯:当 sink 参数是 ``Name``(变量引用)时,回溯到函数内赋值;
@@ -2112,8 +2125,21 @@ def cmd_generate_baseline(
 # === R62 P1-05: cross-function / --fail-on-unknown-sink 命令 ===
 
 
+def _print_completeness_disclaimer() -> None:
+    """R63 P1-09: 打印补充门禁 disclaimer(始终输出)。
+
+    提醒用户本扫描器是 supplementary gate,不是完整 source-to-sink 数据流分析。
+    完整 taint 分析应使用 CodeQL / Semgrep / pyright / mypy。
+    """
+    print()
+    print(COMPLETENESS_DISCLAIMER)
+
+
 def cmd_cross_function(root: Path, *, fail_on_unknown_sink: bool = False) -> int:
     """R62 P1-05: cross-function source-to-sink 分析命令。
+
+    R63 P1-09: cross-function 分析已降级为 best-effort 启发式(补充门禁)。
+    完整 source-to-sink 数据流分析请使用 CodeQL / Semgrep / pyright。
 
     扫描所有 Python 源文件,执行 cross-function 变量回溯 + 函数返回值传播检测,
     输出新增 findings(增量于 scan_python_content)。
@@ -2131,6 +2157,7 @@ def cmd_cross_function(root: Path, *, fail_on_unknown_sink: bool = False) -> int
     print('R62 P1-05 cross-function source-to-sink 分析')
     print(f"  cross-function 分析版本: {CROSS_FUNCTION_ANALYSIS_VERSION}")
     print(f"  fail_on_unknown_sink: {fail_on_unknown_sink}")
+    print('  (R63 P1-09: best-effort 启发式,补充门禁,非完整 source-to-sink)')
     print('=' * 78)
 
     total_findings = 0
@@ -2174,8 +2201,10 @@ def cmd_cross_function(root: Path, *, fail_on_unknown_sink: bool = False) -> int
         print("❌ 发现 cross-function findings")
         print("   请将变量赋值改为直接 _i18n_t() / UserMessage.from_key() 调用,")
         print("   或使用 UserMessage 结构化对象替代裸字符串变量传播。")
+        _print_completeness_disclaimer()
         return 1
     print("✓ 无 cross-function findings")
+    _print_completeness_disclaimer()
     return 0
 
 
@@ -2270,9 +2299,17 @@ def main(argv=None) -> int:
     parser.add_argument('--enumerate-sinks', action='store_true',
                         help='R62 P1-05: 自动枚举所有用户面向 sink(FastAPI/Telegram/'
                             'WebSocket/SSE/mail/notification/template)')
+    # R63 P1-09: 补充门禁 disclaimer 标志(disclaimer 默认始终打印,此 flag 仅用于显式确认)
+    parser.add_argument('--completeness-disclaimer', action='store_true',
+                        help='R63 P1-09: 打印补充门禁 disclaimer(默认始终打印,'
+                            '此 flag 用于显式确认 / CI 日志归档)')
     args = parser.parse_args(argv)
 
     root = Path(__file__).parent.parent
+
+    # R63 P1-09: 始终打印补充门禁 disclaimer(降级声明)
+    # 本扫描器是 supplementary gate,非完整 source-to-sink 数据流分析。
+    _print_completeness_disclaimer()
 
     # R62 P1-05: cross-function 分析(独立命令,不加载 baseline)
     if args.cross_function or args.fail_on_unknown_sink:

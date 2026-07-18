@@ -92,6 +92,12 @@
     "approval.gate.required": "Operation requires approval (approval_id={approval_id}, action={action})",
     "approval.state.invalid": "Approval state invalid (approval_id={approval_id}, current_status={current_status})",
     "approval.self_reject.forbidden": "Approval creator cannot reject their own approval (anti-self-reject audit protection, approver_id={approver_id}, created_by={created_by}, approval_id={approval_id}, trace_id={trace_id})",
+    "migration.manifest.field_missing": "Migration manifest missing required field (field={field}, reason={reason}, trace_id={trace_id})",
+    "migration.manifest.binding_mismatch": "Migration manifest SHA binding does not match current HEAD/Tree (field={field}, expected={expected}, actual={actual}, trace_id={trace_id})",
+    "migration.manifest.set_mismatch": "Disk migration file set does not match manifest declaration (missing_in_manifest={missing_in_manifest}, missing_on_disk={missing_on_disk}, trace_id={trace_id})",
+    "migration.manifest.signature_invalid": "Migration manifest signature verification failed (reason={reason}, sig_file={sig_file}, cert_file={cert_file}, trace_id={trace_id})",
+    "outbox.provider_registry.required": "Outbox provider registry not configured, production mode rejects stub startup (reason={reason}, trace_id={trace_id})",
+    "i18n.icu.compile_failed": "i18n ICU message pre-compilation failed (locale={locale}, key={key}, reason={reason}, trace_id={trace_id})",
     "command.concurrent.claim": "Operation claimed by another worker or state changed (action_id={action_id})",
     "command.hash.mismatch": "Request parameters differ from last execution (anti-tamper rejected, action_id={action_id})",
     "db.cache.unavailable": "SQLite cache unavailable (component={component})",
@@ -173,11 +179,13 @@
     "button.policy.principal_mismatch": "Button principal mismatch, possible cross-user attack (action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.version_mismatch": "Button resource version mismatch, resource has been modified, please refresh and retry (action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.hash_mismatch": "Button approval request_hash mismatch, approval and record may be misaligned (action={action}, reason={reason}, trace_id={trace_id})",
+    "button.policy.audience_mismatch": "Button audience mismatch, possible cross-handler abuse attack (action={action}, reason={reason}, expected={expected}, actual={actual}, trace_id={trace_id})",
     "button.policy.mfa_required": "High-risk button requires MFA multi-factor authentication, please complete MFA verification first (action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.dual_approval_required": "Critical-risk button requires dual approval, approver must differ from principal (action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.final_confirm_required": "High-risk button requires final confirmation, please complete confirmation step and retry (action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.async_token_required": "High-risk action must use async persisted token API; sync token API is prohibited (action={action}, reason={reason}, user_id={user_id}, trace_id={trace_id})",
-    "button.policy.unknown": "Unknown button approval error (action={action}, reason={reason}, trace_id={trace_id})"
+    "button.policy.unknown": "Unknown button approval error (action={action}, reason={reason}, trace_id={trace_id})",
+    "locale.validation.failed": "Locale file validation failed at startup, refused to start (reason={reason}, error_count={error_count}, trace_id={trace_id})"
   },
   "ui": {
     "admin_login_title": "Admin Login",
@@ -1686,7 +1694,17 @@
         "invalid_reporter_id": "⚠️ Parameter error: invalid reporter_id",
         "unknown_sub_action": "⚠️ Unknown report sub-action: {sub_action}",
         "signature_failed_restore": "⚠️ Button signature verification failed, it may have expired or been used, please re-initiate the restore operation.",
-        "signature_failed_delete": "⚠️ Button signature verification failed, it may have expired or been used, please re-initiate the delete operation."
+        "signature_failed_delete": "⚠️ Button signature verification failed, it may have expired or been used, please re-initiate the delete operation.",
+        "ban_approval_submitted": "⏳ Ban approval submitted (approval ID: {approval_id}), user {uid}",
+        "ban_success": "✅ User {uid} banned",
+        "ban_failed": "❌ Ban failed: {error}",
+        "detach_approval_submitted": "⏳ Approval submitted (approval ID: {approval_id}), file code {file_code}",
+        "detach_success": "✅ File code {file_code} detached",
+        "detach_failed": "❌ Detach failed: {error}",
+        "block_approval_submitted": "⏳ Approval submitted (approval ID: {approval_id}), reporter {reporter_id} ↔ file code {file_code}",
+        "block_success": "✅ Reporter {reporter_id} blocked from decoding {file_code}",
+        "block_failed": "❌ Block failed: {error}",
+        "operation_failed": "Operation failed: {error}"
       }
     },
     "generic": {
@@ -2151,7 +2169,12 @@
       "s16": "年",
       "s17": "上午",
       "logger_release_mode_read_failed": "[i18n] _get_release_mode failed to read RELEASE_BUILD: {err}",
-      "logger_babel_ordinal_unavailable": "[i18n] Babel ordinal unavailable, falling back to built-in rules: {err}"
+      "logger_babel_ordinal_unavailable": "[i18n] Babel ordinal unavailable, falling back to built-in rules: {err}",
+      "logger_icu_precompile_failed_strict": "[i18n] R63 P1-12: ICU pre-compilation failed (strict mode) locale={locale} failures={failures} first_key={first_key} first_reason={first_reason}",
+      "logger_icu_precompile_failed_loose": "[i18n] R63 P1-12: ICU pre-compilation failed (loose mode, runtime fallback) locale={locale} icu_key={icu_key} reason={reason}",
+      "logger_icu_param_asymmetry_strict": "[i18n] R63 P1-12: ICU parameter set asymmetry (strict mode) asymmetries={asymmetries} first_key={first_key} zh_params={zh_params} en_params={en_params}",
+      "logger_icu_param_asymmetry_loose": "[i18n] R63 P1-12: ICU parameter set asymmetry (loose mode) icu_key={icu_key} zh_params={zh_params} en_params={en_params}",
+      "logger_icu_precompile_runtime_fallback": "[i18n] R63 P1-12: ICU pre-compilation failed, falling back to format_message icu_key={icu_key} locale={locale} reason={reason}"
     },
     "maintenance_mode": {
       "s1": "数据库未初始化",

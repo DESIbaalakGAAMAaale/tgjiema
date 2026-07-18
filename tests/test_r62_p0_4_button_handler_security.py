@@ -70,22 +70,29 @@ async def store():
     2. 直接替换 database.cache_store.DB_PATH
     3. 替换 database.cache_store.get_cache_store 返回测试 store
        (sign_button_token_with_nonce / sign_button_token_with_handle 内部调用)
-    4. 结束后恢复 + close + shutil.rmtree
+    4. 同步替换 database.cache_store._store 单例
+       (rbac.py / data_lifecycle.py 等模块通过 from database.cache_store import
+       get_cache_store 持有原函数引用,只替换 get_cache_store 属性无法影响它们;
+       必须同时替换 _store 单例,否则跨测试文件会发生 DB 污染)
+    5. 结束后恢复 + close + shutil.rmtree
     """
     tmpdir = tempfile.mkdtemp(prefix="r62_p0_4_test_")
     db_path = Path(tmpdir) / "test_r62_p0_4.db"
     original_path = _cs_module.DB_PATH
     original_get_store = _cs_module.get_cache_store
+    original_store = getattr(_cs_module, "_store", None)
     _cs_module.DB_PATH = db_path
     try:
         s = CacheStore()
         await s.init()
         _cs_module.get_cache_store = lambda: s
+        _cs_module._store = s
         yield s
         await s.close()
     finally:
         _cs_module.DB_PATH = original_path
         _cs_module.get_cache_store = original_get_store
+        _cs_module._store = original_store
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -152,7 +159,10 @@ class TestHandleBasedTokenBasics:
             payload="ban|12345|67890|dsp",
         )
         valid, action, payload = await verify_button_token_by_handle(
-            handle_id, current_user_id=1001, store=store,
+            handle_id, current_user_id=1001,
+            expected_action="report",
+            expected_audience="admin_callback",
+            store=store,
         )
         assert valid is True
         assert action == "report"
@@ -171,12 +181,18 @@ class TestHandleBasedTokenBasics:
         )
         # 第一次 verify 成功
         valid1, _, _ = await verify_button_token_by_handle(
-            handle_id, current_user_id=1001, store=store,
+            handle_id, current_user_id=1001,
+            expected_action="report",
+            expected_audience="admin_callback",
+            store=store,
         )
         assert valid1 is True
         # 第二次 verify 应失败(nonce 已被原子消费)
         valid2, _, _ = await verify_button_token_by_handle(
-            handle_id, current_user_id=1001, store=store,
+            handle_id, current_user_id=1001,
+            expected_action="report",
+            expected_audience="admin_callback",
+            store=store,
         )
         assert valid2 is False, "重放应被拒绝(nonce 原子消费)"
 
@@ -193,7 +209,10 @@ class TestHandleBasedTokenBasics:
             ttl=-1,  # 立即过期
         )
         valid, _, _ = await verify_button_token_by_handle(
-            handle_id, current_user_id=1001, store=store,
+            handle_id, current_user_id=1001,
+            expected_action="report",
+            expected_audience="admin_callback",
+            store=store,
         )
         assert valid is False, "过期 token 应被拒绝"
 
@@ -210,6 +229,8 @@ class TestHandleBasedTokenBasics:
         )
         valid, _, _ = await verify_button_token_by_handle(
             handle_id, current_user_id=9999, store=store,  # 不同 user
+            expected_action="report",
+            expected_audience="admin_callback",
         )
         assert valid is False, "跨用户使用 handle_id 应被拒绝"
 
@@ -219,6 +240,8 @@ class TestHandleBasedTokenBasics:
         from services.button_security import verify_button_token_by_handle
         valid, _, _ = await verify_button_token_by_handle(
             "nonexistent_handle_xyz", current_user_id=1001, store=store,
+            expected_action="report",
+            expected_audience="admin_callback",
         )
         assert valid is False, "未知 handle_id 应被拒绝(防伪造)"
 
@@ -260,7 +283,7 @@ class TestHandleReportActionCallbackFormat:
         """
         from bots.admin_bot import callback as cb_module
 
-        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None):
+        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None, **kwargs):
             raise AssertionError("旧格式 report:ban|... 不应进入 verify")
 
         monkeypatch.setattr(
@@ -284,7 +307,7 @@ class TestHandleReportActionCallbackFormat:
         """新格式 report:ban:{handle_id} 但 handle 无效 → 拒绝。"""
         from bots.admin_bot import callback as cb_module
 
-        async def _fake_verify(handle_id, current_user_id, store=None):
+        async def _fake_verify(handle_id, current_user_id, store=None, **kwargs):
             return False, "", ""
 
         monkeypatch.setattr(
@@ -306,7 +329,7 @@ class TestHandleReportActionCallbackFormat:
         """callback sub_action 与 payload 第一段不匹配 → 拒绝。"""
         from bots.admin_bot import callback as cb_module
 
-        async def _fake_verify(handle_id, current_user_id, store=None):
+        async def _fake_verify(handle_id, current_user_id, store=None, **kwargs):
             # 返回的 payload 第一段是 "detach",但 callback 是 "ban"
             return True, "report", "detach|12345|67890|dsp"
 
@@ -330,7 +353,7 @@ class TestHandleReportActionCallbackFormat:
         from bots.admin_bot import callback as cb_module
 
         # 让 verify 失败(若误调,会触发测试失败)
-        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None):
+        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None, **kwargs):
             raise AssertionError("report:ignore 不应调用 verify_button_token_by_handle")
 
         monkeypatch.setattr(
@@ -378,7 +401,7 @@ class TestHandleRestoreAndDeleteCallbackFormat:
         """旧格式 restore:confirm|seq|merge|table 无签名,被拒绝。"""
         from bots.admin_bot import callback as cb_module
 
-        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None):
+        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None, **kwargs):
             raise AssertionError("旧格式 restore 不应进入 verify")
 
         monkeypatch.setattr(
@@ -397,7 +420,7 @@ class TestHandleRestoreAndDeleteCallbackFormat:
         """新格式 restore:confirm:{handle_id} 但 handle 无效 → 拒绝。"""
         from bots.admin_bot import callback as cb_module
 
-        async def _fake_verify(handle_id, current_user_id, store=None):
+        async def _fake_verify(handle_id, current_user_id, store=None, **kwargs):
             return False, "", ""
 
         monkeypatch.setattr(
@@ -423,7 +446,7 @@ class TestHandleRestoreAndDeleteCallbackFormat:
         """
         from bots.admin_bot import callback as cb_module
 
-        async def _fake_verify_fail(handle_id, current_user_id, store=None):
+        async def _fake_verify_fail(handle_id, current_user_id, store=None, **kwargs):
             # 旧格式 file_code 不是合法 handle_id,verify 应返回 False
             return False, "", ""
 
@@ -446,7 +469,7 @@ class TestHandleRestoreAndDeleteCallbackFormat:
         """delfile_cancel|{file_code} 是低风险取消,不需要签名 token。"""
         from bots.admin_bot import callback as cb_module
 
-        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None):
+        async def _fake_verify_should_not_be_called(handle_id, current_user_id, store=None, **kwargs):
             raise AssertionError("delfile_cancel 不应调用 verify_button_token_by_handle")
 
         monkeypatch.setattr(

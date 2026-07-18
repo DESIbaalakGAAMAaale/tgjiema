@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 113,
-    "generated_at": "2026-07-18T08:50:37.466326Z",
+    "enum_count": 121,
+    "generated_at": "2026-07-18T14:46:58.818199Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(R61 P1-05: 独立显式设置,通常等于 retryable 但可独立覆盖)",
       "telegram_presentation": "Bot 端展示方式(R61 P1-05 显式字段): short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)/modal/toast(预留扩展)"
     },
-    "total_codes": 113,
+    "total_codes": 121,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -257,7 +257,8 @@
       "message_key": "errors.backup.restore.trust_chain_required",
       "retryable": false,
       "safe_params": [
-        "backup_id"
+        "backup_id",
+        "reason"
       ],
       "severity": "critical",
       "show_retry_button": false,
@@ -284,6 +285,22 @@
         "action",
         "reason",
         "user_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.POLICY.AUDIENCE_MISMATCH": {
+      "audit_level": "critical",
+      "code": "BUTTON.POLICY.AUDIENCE_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.button.policy.audience_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason",
+        "expected",
+        "actual"
       ],
       "severity": "critical",
       "show_retry_button": false,
@@ -354,7 +371,9 @@
       "retryable": false,
       "safe_params": [
         "action",
-        "reason"
+        "reason",
+        "expected",
+        "actual"
       ],
       "severity": "critical",
       "show_retry_button": false,
@@ -424,7 +443,9 @@
       "retryable": false,
       "safe_params": [
         "action",
-        "reason"
+        "reason",
+        "expected",
+        "actual"
       ],
       "severity": "warning",
       "show_retry_button": false,
@@ -1033,6 +1054,21 @@
       "show_retry_button": false,
       "telegram_presentation": "silent"
     },
+    "I18N.ICU.COMPILE_FAILED": {
+      "audit_level": "critical",
+      "code": "I18N.ICU.COMPILE_FAILED",
+      "http_status": 500,
+      "message_key": "errors.i18n.icu.compile_failed",
+      "retryable": false,
+      "safe_params": [
+        "locale",
+        "key",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "INDEX.CODE.CONFLICT": {
       "audit_level": "warning",
       "code": "INDEX.CODE.CONFLICT",
@@ -1096,6 +1132,20 @@
       "severity": "error",
       "show_retry_button": true,
       "telegram_presentation": "short_hint"
+    },
+    "LOCALE.VALIDATION.FAILED": {
+      "audit_level": "critical",
+      "code": "LOCALE.VALIDATION.FAILED",
+      "http_status": 500,
+      "message_key": "errors.locale.validation.failed",
+      "retryable": false,
+      "safe_params": [
+        "reason",
+        "error_count"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "MAINTENANCE.DISABLE.QUERY_FAILED": {
       "audit_level": "critical",
@@ -1205,6 +1255,64 @@
       "show_retry_button": false,
       "telegram_presentation": "silent"
     },
+    "MIGRATION.MANIFEST.BINDING_MISMATCH": {
+      "audit_level": "critical",
+      "code": "MIGRATION.MANIFEST.BINDING_MISMATCH",
+      "http_status": 500,
+      "message_key": "errors.migration.manifest.binding_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "expected",
+        "actual",
+        "field"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "MIGRATION.MANIFEST.FIELD_MISSING": {
+      "audit_level": "critical",
+      "code": "MIGRATION.MANIFEST.FIELD_MISSING",
+      "http_status": 500,
+      "message_key": "errors.migration.manifest.field_missing",
+      "retryable": false,
+      "safe_params": [
+        "field",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "MIGRATION.MANIFEST.SET_MISMATCH": {
+      "audit_level": "critical",
+      "code": "MIGRATION.MANIFEST.SET_MISMATCH",
+      "http_status": 500,
+      "message_key": "errors.migration.manifest.set_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "missing_in_manifest",
+        "missing_on_disk"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "MIGRATION.MANIFEST.SIGNATURE_INVALID": {
+      "audit_level": "critical",
+      "code": "MIGRATION.MANIFEST.SIGNATURE_INVALID",
+      "http_status": 500,
+      "message_key": "errors.migration.manifest.signature_invalid",
+      "retryable": false,
+      "safe_params": [
+        "reason",
+        "sig_file",
+        "cert_file"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "NOTIFICATION.OUTBOX.DUPLICATE": {
       "audit_level": "info",
       "code": "NOTIFICATION.OUTBOX.DUPLICATE",
@@ -1232,6 +1340,19 @@
       "severity": "error",
       "show_retry_button": true,
       "telegram_presentation": "short_hint"
+    },
+    "OUTBOX.PROVIDER_REGISTRY.REQUIRED": {
+      "audit_level": "critical",
+      "code": "OUTBOX.PROVIDER_REGISTRY.REQUIRED",
+      "http_status": 500,
+      "message_key": "errors.outbox.provider_registry.required",
+      "retryable": false,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "PRODUCTION.BOT_TOKEN.MISSING": {
       "audit_level": "critical",

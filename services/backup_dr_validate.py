@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import copy as _copy
 import datetime as _dt
 import hashlib
 import hmac
@@ -32,7 +33,8 @@ import secrets as _secrets
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from types import MappingProxyType
+from typing import Mapping, Optional
 
 from loguru import logger
 
@@ -85,6 +87,9 @@ class BackupValidationResult:
     # R59 P0-04: 强制参数,不再允许 fail-open — 新增信任链传递字段
     manifest_sha256: str = ""  # R59 P0-04: 来自 COMPLETE marker,用于 manifest bytes SHA 比对
     payload_key: str = ""      # R59 P0-04: 来自 COMPLETE marker,用于 payload_key 一致性比对
+    # R63 P0-06: 解密后的明文 bytes(由 validate_backup_payload 填充,
+    # 供 validate_and_restore_backup_strict 在 data=None 时使用,避免调用方预加载)
+    plaintext_bytes: bytes = b""
 
 
 # ── R61 P0-03 / R62 P0-01: 不可伪造的恢复能力令牌 ──────────────
@@ -97,12 +102,12 @@ class BackupValidationResult:
 _RESTORE_SENTINEL = object()
 
 
-# R62 P0-01: 模块级 nonce 集合 — 防重放保护。
-# 每次 capability.assert_valid() 成功时,其 nonce 被加入此集合。
-# 同一 capability 的二次 assert_valid 调用(同一 nonce)将被拒绝(防重放攻击)。
-# 注意:此集合为进程内状态,跨进程恢复由 R2 COMPLETE marker 的强签名 +
-# manifest_sha256/ciphertext_sha256/plaintext_sha256 三重摘要绑定兜底防重放。
-_CONSUMED_NONCES: set[str] = set()
+# R63 P1-01: nonce 持久化消费(替代 R62 P0-01 的进程内 _CONSUMED_NONCES set)。
+# 原 _CONSUMED_NONCES 为进程内 set,多实例 / 重启 / worker 切换后状态丢失,
+# 无法跨进程防重放。现已改为权威 SQLite/CRDB 表 ``restore_capability_nonces``
+# 原子消费(详见 database.cache_store.CacheStore.consume_capability_nonce)。
+# 审计要求:Python 下划线不是访问控制,真正安全性应来自完整密码/状态验证,
+# 而非"外部无法访问 sentinel"的注释。
 
 
 class _RestoreCapability:
@@ -130,8 +135,9 @@ class _RestoreCapability:
         - 新增 assert_valid(payload_digest, clock, expected_scope) 方法 — 强制断言 API
         - 字段改为只读 property getter(__slots__ 防止新增属性,
           property getter 防止字段被赋值篡改)
-        - nonce 防重放:每次成功 assert_valid() 将 nonce 加入 _CONSUMED_NONCES,
-          二次调用同一 capability 即抛 AppError(防重放攻击)
+        - nonce 防重放:每次成功 assert_valid() 将 nonce 原子消费到权威
+          SQLite/CRDB 表 ``restore_capability_nonces``(R63 P1-01 替代原进程内
+          ``_CONSUMED_NONCES`` set),二次调用同一 capability 即抛 AppError(防重放攻击)
 
     令牌字段(来自严格验证通过的 COMPLETE marker / manifest / payload):
         - backup_id:          备份 ID
@@ -278,13 +284,14 @@ class _RestoreCapability:
     def expires_at(self) -> float:
         return self._expires_at
 
-    def assert_valid(
+    async def assert_valid(
         self,
         payload_digest: str,
         clock: float,
         expected_scope: str,
+        store=None,
     ) -> None:
-        """R62 P0-01: 断言令牌有效 — 失败即抛 AppError(fail-closed)。
+        """R62 P0-01 / R63 P1-01: 断言令牌有效 — 失败即抛 AppError(fail-closed)。
 
         校验维度(全部通过才返回;任一失败即抛 AppError):
             1. sentinel 匹配(令牌由本模块签发,非伪造)
@@ -292,13 +299,21 @@ class _RestoreCapability:
             3. clock <= expires_at(令牌未过期)
             4. payload_digest 与令牌内嵌 digest 一致(防 payload 篡改/替换)
             5. expected_scope 与令牌 schema_fingerprint 一致(防 scope 跨越)
+            6. 原子消费 nonce — INSERT OR IGNORE CAS,失败即抛 AppError
 
-        成功后:nonce 加入 _CONSUMED_NONCES,二次调用同一令牌即抛 AppError。
+        R63 P1-01: nonce 持久化到权威 SQLite/CRDB 表 ``restore_capability_nonces``,
+        替代原进程内 ``_CONSUMED_NONCES`` set。原子消费保证多实例/重启/worker 切换后
+        仍能防重放。绑定字段(nonce + backup_id + manifest_sha256 + payload_digest)
+        作为审计键,即使伪造 nonce 也会因绑定字段不一致被审计捕获。
+
+        成功后:nonce 已被原子消费,二次调用同一令牌即抛 AppError。
 
         Args:
             payload_digest: 调用方计算出的 VerifiedBackupPayload.payload_digest
             clock: 当前时钟(unix 秒,由调用方传入便于测试)
             expected_scope: 期望的 schema_fingerprint(如当前代码 schema 版本)
+            store: 可选 CacheStore 实例(用于测试注入);默认通过
+                   ``database.cache_store.get_cache_store()`` 获取单例
 
         Raises:
             AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): 任一校验失败
@@ -309,9 +324,26 @@ class _RestoreCapability:
         if self._sentinel is not _RESTORE_SENTINEL:
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-        # 2. nonce 防重放(同一令牌只能 assert_valid 一次)
-        if self._nonce in _CONSUMED_NONCES:
-            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        # 2. nonce 防重放预检(早期拒绝已被消费的 nonce,非安全边界,优化路径)
+        # R63 P1-01: 预检与消费之间存在 TOCTOU 窗口,真正的安全边界由
+        # consume_capability_nonce 的 INSERT OR IGNORE CAS 保证。
+        _store = store
+        if _store is None:
+            try:
+                from database.cache_store import get_cache_store
+                _store = get_cache_store()
+            except Exception:
+                _store = None
+        if _store is not None:
+            try:
+                _already = await _store.is_capability_nonce_consumed(self._nonce)
+            except Exception:
+                _already = False
+            if _already:
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                    params={"reason": "nonce_already_consumed"},
+                )
 
         # 3. 时钟过期检查
         if clock > self._expires_at:
@@ -325,8 +357,34 @@ class _RestoreCapability:
         if expected_scope != self._schema_fingerprint:
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-        # 全部通过 — 消费 nonce(防重放:二次调用将被拒绝)
-        _CONSUMED_NONCES.add(self._nonce)
+        # 6. 原子消费 nonce — INSERT OR IGNORE CAS(R63 P1-01)
+        # 多实例/并发安全:rowcount==1 表示本调用方赢得竞态;
+        # rowcount==0 表示 nonce 已被消费(重放攻击或竞态失败)。
+        # consumed_by: hostname:pid 用于审计(追踪哪个 worker 消费了 nonce)。
+        _consumed_by = ""
+        try:
+            import socket as _socket
+            _consumed_by = f"{_socket.gethostname()}:{os.getpid()}"
+        except Exception:
+            _consumed_by = f"pid:{os.getpid()}"
+
+        if _store is not None:
+            try:
+                _won = await _store.consume_capability_nonce(
+                    self._nonce,
+                    self._backup_id,
+                    self._manifest_sha256,
+                    self._payload_digest,
+                    consumed_by=_consumed_by,
+                )
+            except Exception:
+                _won = False
+            if not _won:
+                # 消费失败 — nonce 已被其他调用方消费(重放或竞态失败)
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                    params={"reason": "nonce_already_consumed"},
+                )
 
     def is_valid(self) -> bool:
         """检查能力令牌是否仍有效(向后兼容接口,不消费 nonce)。
@@ -359,32 +417,95 @@ class _RestoreCapability:
         )
 
 
-# ── R62 P0-02: VerifiedBackupPayload(frozen dataclass) ─────────
+# ── R62 P0-02 / R63 P0-02: VerifiedBackupPayload(深冻结 dataclass) ─────────
+
+
+def _deep_freeze(obj):
+    """R63 P0-02: 深拷贝 + 递归冻结 Python 对象。
+
+    将 dict 递归转换为 ``MappingProxyType``(只读映射),将 list 转换为 ``tuple``,
+    标量(str/int/float/bool/None)保持不变。先 ``copy.deepcopy`` 断绝与调用方
+    原 dict/list 的所有引用(含嵌套),再递归冻结,确保调用方无法通过别名引用
+    在验证后、写入前篡改 ``VerifiedBackupPayload.tables`` / ``payload``。
+
+    防护维度:
+        - 嵌套 dict/list:递归冻结到叶节点
+        - 别名引用:deepcopy 断绝共享引用
+        - 顶层替换:object.__setattr__ 由 writer 端重算 digest 兜底
+
+    Args:
+        obj: 任意 Python 对象(通常为 dict/list/标量)
+
+    Returns:
+        冻结后的对象(dict→MappingProxyType, list→tuple, 标量不变)
+    """
+    # 先深拷贝断绝与调用方原对象的引用(含嵌套可变对象)
+    obj = _copy.deepcopy(obj)
+    return _freeze_recursive(obj)
+
+
+def _freeze_recursive(obj):
+    """递归冻结辅助:dict→MappingProxyType, list→tuple, 标量不变。"""
+    if isinstance(obj, dict):
+        return MappingProxyType({k: _freeze_recursive(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return tuple(_freeze_recursive(item) for item in obj)
+    # 标量(str/int/float/bool/None)本身不可变,直接返回
+    return obj
+
+
+def _to_serializable(obj):
+    """R63 P0-02: 将深冻结结构还原为 JSON 可序列化的普通 dict/list。
+
+    ``MappingProxyType`` 与 ``tuple`` 不能被 ``json.dumps`` 直接序列化
+    (mappingproxy 会落入 default=str 退化为字符串),需先转回普通 dict/list
+    再做 canonical JSON 序列化。此函数仅在 digest 计算时调用,不影响
+    ``VerifiedBackupPayload`` 字段的不可变性。
+
+    Args:
+        obj: 深冻结对象(MappingProxyType / tuple / 标量)
+
+    Returns:
+        JSON 可序列化对象(dict / list / 标量)
+    """
+    if isinstance(obj, MappingProxyType):
+        return {k: _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, tuple):
+        return [_to_serializable(item) for item in obj]
+    return obj
 
 
 @dataclass(frozen=True)
 class VerifiedBackupPayload:
-    """R62 P0-02: 已通过严格验证的备份 payload(不可变数据载体)。
+    """R62 P0-02 / R63 P0-02: 已通过严格验证的备份 payload(深冻结不可变数据载体)。
 
     由 validate_and_restore_backup_strict() 或 _restore_preverified_payload()
     在严格三段式验证通过后构造。作为 _restore_from_backup_data() 的输入,
     替代原 raw data: dict 参数。
 
-    安全保证:
-        - frozen=True:字段不可修改(防止在验证后、写入前被篡改)
-        - payload_digest 自动由 __post_init__ 从 payload 计算(canonical JSON sha256),
-          并与 _RestoreCapability.payload_digest 绑定(在 assert_valid 时校验一致性)
-        - tables 字段为已验证的表数据(由 validate_backup_payload 解密 + 校验通过)
+    安全保证(R63 P0-02 增强):
+        - frozen=True:顶层字段不可修改(防止在验证后、写入前被篡改)
+        - **深冻结(R63 P0-02)**: ``tables`` 与 ``payload`` 在 ``__post_init__``
+          中通过 ``_deep_freeze`` 递归转换为 ``MappingProxyType`` + ``tuple``
+          不可变结构,且深拷贝断绝与调用方原 dict 的别名引用。嵌套 dict/list
+          无法被修改,顶层 object.__setattr__ 由 writer 端重算 digest 兜底。
+        - payload_digest 自动由 __post_init__ 从冻结后的 payload 计算(canonical
+          JSON sha256),并与 _RestoreCapability.payload_digest 绑定。
+        - **writer 端重算(R63 P0-02)**: _restore_from_backup_data 首条语句对
+          ``verified_payload.payload`` 实际 canonical bytes 重新计算 SHA-256,
+          与 capability.payload_digest 比对。即使 object.__setattr__ 绕过冻结
+          替换了 payload,重算 digest 也会与 capability 内嵌(构造时)的 digest
+          不匹配 → fail-closed。
 
     字段:
         backup_id:          备份 ID(来自 manifest.backup_id)
-        tables:             表数据 dict(已解密 + 校验 plaintext_sha256 通过)
+        tables:             表数据(深冻结 MappingProxyType,已解密 + 校验通过)
         manifest_sha256:    manifest 原始 bytes 的 SHA-256(来自 COMPLETE marker 验签)
         plaintext_sha256:   解密后明文的 SHA-256(来自 manifest.plaintext_sha256)
         schema_fingerprint: schema 指纹(通常为 manifest.schema_version,用于 scope 校验)
-        payload:            原始 payload dict(向后兼容,只读;新代码应从 tables 读取)
+        payload:            原始 payload(深冻结 MappingProxyType;新代码应从 tables 读取)
         payload_digest:     payload 的 SHA-256 digest(canonical JSON),
-                            由 __post_init__ 从 payload 自动计算(不可由调用方设置)
+                            由 __post_init__ 从冻结后的 payload 自动计算(不可由调用方设置)
     """
     backup_id: str
     tables: dict
@@ -395,32 +516,44 @@ class VerifiedBackupPayload:
     payload_digest: str = ""
 
     def __post_init__(self):
-        # R62 P0-02: 自动从 payload 计算 payload_digest(若调用方未提供)
-        # frozen=True 阻止常规赋值,需用 object.__setattr__ 绕过冻结保护
+        # R63 P0-02: 深冻结 tables 与 payload(深拷贝 + MappingProxyType/tuple)
+        # 断绝与调用方原 dict 的别名引用,递归冻结嵌套结构。
+        # frozen=True 阻止常规赋值,需用 object.__setattr__ 绕过冻结保护。
+        object.__setattr__(self, "tables", _deep_freeze(self.tables))
+        object.__setattr__(self, "payload", _deep_freeze(self.payload))
+        # R62 P0-02: 自动从冻结后的 payload 计算 payload_digest
+        # (若调用方未提供,或即使提供了也从冻结后的实际 bytes 重算,保证一致性)
         if not self.payload_digest:
             object.__setattr__(
                 self, "payload_digest", _compute_payload_digest(self.payload),
             )
 
 
-def _compute_payload_digest(data: dict) -> str:
-    """R62 P0-02: 计算备份数据的 SHA-256 digest(canonical JSON 序列化)。
+def _compute_payload_digest(data) -> str:
+    """R62 P0-02 / R63 P0-02: 计算备份数据的 SHA-256 digest(canonical JSON 序列化)。
 
     使用 sort_keys=True + separators=(",", ":") + ensure_ascii=False,
     保证相同内容不同 key 顺序产生相同 digest(canonical 形式)。
 
+    R63 P0-02: 支持深冻结结构(MappingProxyType / tuple)—— 先通过
+    ``_to_serializable`` 还原为普通 dict/list 再序列化,保证 digest
+    计算与普通 dict 一致。
+
     此 digest 与 _RestoreCapability.payload_digest 绑定,
-    在 _restore_from_backup_data 的首条 assert_valid() 调用中校验一致性,
-    防止 payload 在验证后、写入前被替换。
+    在 _restore_from_backup_data 的首条 assert_valid() 调用中由 writer
+    重新计算实际 bytes 的 SHA-256 并与 capability 内嵌 digest 比对,
+    防止 payload 在验证后、写入前被替换(含 object.__setattr__ 攻击)。
 
     Args:
-        data: 备份数据 dict(通常含 "tables" 键)
+        data: 备份数据(普通 dict 或深冻结 MappingProxyType,通常含 "tables" 键)
 
     Returns:
         64 字符 hex sha256 digest
     """
+    # R63 P0-02: 深冻结结构需还原为普通 dict/list 才能 JSON 序列化
+    serializable = _to_serializable(data) if isinstance(data, (MappingProxyType, tuple)) else data
     canonical = json.dumps(
-        data, sort_keys=True, separators=(",", ":"),
+        serializable, sort_keys=True, separators=(",", ":"),
         ensure_ascii=False, default=str,
     ).encode("utf-8")
     return hashlib.sha256(canonical).hexdigest()
@@ -1055,6 +1188,7 @@ async def validate_backup_payload(
             backup_id=timestamp,
             ciphertext_sha256=actual_cipher_sha,
             plaintext_sha256=actual_pt_sha,  # R59 P0-04: 返回明文 hash 供信任链传递
+            plaintext_bytes=plaintext,  # R63 P0-06: 返回明文 bytes 供 strict 入口使用(data=None 时)
         )
     except Exception as e:
         return BackupValidationResult(
@@ -1300,7 +1434,7 @@ async def validate_backup_for_restore(
 
 async def validate_and_restore_backup_strict(
     *,
-    data: dict,                          # R61 P0-03: 必填 — 待写入的备份数据 dict
+    data: "dict | None" = None,          # R63 P0-06: 可选 — None 时由 strict service 自行解密 payload
     tables: "list[str] | None" = None,
     merge: bool = False,
     # 严格三段式验证参数(全部必填 — R62 P0-01: 移除 skip 模式,无绕过路径)
@@ -1316,7 +1450,7 @@ async def validate_and_restore_backup_strict(
     final_path: "str | Path | None" = None,
     sqlite_db_staging: "str | Path | None" = None,
 ) -> dict:
-    """R59 P0-04 / R61 P0-03 / R62 P0-01: 统一 fail-closed 备份恢复公共入口 — 整合验证 + 写入。
+    """R59 P0-04 / R61 P0-03 / R62 P0-01 / R63 P0-06: 统一 fail-closed 备份恢复公共入口 — 整合验证 + 写入。
 
     本函数是生产恢复的**唯一公共写入入口**(无 skip/override 参数,无绕过路径)。
     db_restore.py / db_backup.py / backup_engine.py / disaster_recovery.py 必须通过
@@ -1339,6 +1473,14 @@ async def validate_and_restore_backup_strict(
           使用新的 _restore_preverified_payload() 内部辅助函数(仍由 sentinel 保护,
           且必须提供 VerifiedBackupPayload + 完整信任链元数据)。
 
+    R63 P0-06 CLI 三段式发现模型:
+        - ``data`` 参数改为可选(默认 None)。当 ``data=None`` 时,本函数从
+          ``validate_backup_payload`` 返回的解密明文 ``plaintext_bytes`` 解析数据,
+          调用方不得预加载/拼装 data。CLI ``run_restore`` 仅传入 backup_id 与
+          三段式验证参数,由本函数自行完成 COMPLETE→manifest→payload 发现与解密。
+        - 当 ``data`` 非空时(向后兼容 R62 测试),使用调用方提供的数据,但仍走
+          完整三段式验证(下载/解密/校验)以保证信任链完整。
+
     严格三段式验证(强制,无 skip 路径):
         1. 下载 COMPLETE → 验签 → 比对 backup_id
         2. 下载 manifest 原始 bytes → 比对 SHA256(manifest_bytes)
@@ -1353,7 +1495,8 @@ async def validate_and_restore_backup_strict(
         backup_id | schema_version | payload_key | key_id | plaintext_sha256
 
     Args:
-        data: R61 P0-03 必填 — 待写入的备份数据 dict(含 "tables" 键)
+        data: R63 P0-06 可选 — 待写入的备份数据 dict(含 "tables" 键)。
+              None 时由本函数从解密明文解析(推荐路径,调用方不预加载)。
         tables: 仅恢复指定表;None 则恢复备份中的所有表
         merge: True=增量补充;False=覆盖(默认)
         timestamp: 备份 ID(timestamp) — 必填
@@ -1555,7 +1698,26 @@ async def validate_and_restore_backup_strict(
     # R62 P0-01: schema_fingerprint 用作 scope(防 schema 跨越攻击)
     cap_schema_fingerprint = schema_version
 
-    # ── R62 P0-02: 构造 VerifiedBackupPayload(frozen,不可篡改) ──
+    # ── R63 P0-06: 当 data=None 时,从解密明文解析备份数据(调用方不预加载) ──
+    # strict service 自行完成 COMPLETE→manifest→payload 发现与解密,
+    # 调用方(CLI run_restore)只传入 backup_id 与三段式验证参数。
+    if data is None:
+        if not r5.plaintext_bytes:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+        try:
+            data = json.loads(r5.plaintext_bytes.decode("utf-8"))
+        except Exception as e:
+            from services.error_codes import AppError, ErrorCodes
+            logger.error(
+                _i18n_t(
+                    'services.backup_dr_validate.logger_manifest_json_parse_failed',
+                    e=e,
+                )
+            )
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
+    # ── R62 P0-02 / R63 P0-02: 构造 VerifiedBackupPayload(深冻结,不可篡改) ──
     verified_payload = VerifiedBackupPayload(
         backup_id=cap_backup_id,
         tables=data.get("tables", {}),

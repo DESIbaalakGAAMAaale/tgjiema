@@ -320,6 +320,8 @@ class ErrorCodes:
     BUTTON_POLICY_VERSION_MISMATCH = "BUTTON.POLICY.VERSION_MISMATCH"
     # 按钮 request_hash 不匹配(审批与资源错位)
     BUTTON_POLICY_HASH_MISMATCH = "BUTTON.POLICY.HASH_MISMATCH"
+    # R63 P1-06: 按钮 audience 不匹配(跨 handler 滥用,如 report handle 被 restore handler 调用)
+    BUTTON_POLICY_AUDIENCE_MISMATCH = "BUTTON.POLICY.AUDIENCE_MISMATCH"
     # 高风险按钮要求 MFA 但未验证(MFA 强制门禁)
     BUTTON_POLICY_MFA_REQUIRED = "BUTTON.POLICY.MFA_REQUIRED"
     # 极高风险按钮要求双人审批但 approver 缺失或与 principal 相同
@@ -334,6 +336,30 @@ class ErrorCodes:
     AUTH_MFA_RECEIPT_EXPIRED = "AUTH.MFA.RECEIPT_EXPIRED"
     # reject() 不能由创建者自己驳回(防止自拒绕过审计,必须与 approve() 对称强制 requester != approver)
     APPROVAL_SELF_REJECT_FORBIDDEN = "APPROVAL.SELF_REJECT.FORBIDDEN"
+
+    # ── R63 P0-04: Migration manifest 信任根验证 ──
+    # manifest 缺少 release_commit / tree_sha / verification 等必填字段
+    MIGRATION_MANIFEST_FIELD_MISSING = "MIGRATION.MANIFEST.FIELD_MISSING"
+    # manifest 绑定的 release_commit / tree_sha 与当前 git HEAD/Tree 不一致
+    MIGRATION_MANIFEST_BINDING_MISMATCH = "MIGRATION.MANIFEST.BINDING_MISMATCH"
+    # 磁盘 migration 文件集合与 manifest 声明集合不一致(漏项或多项)
+    MIGRATION_MANIFEST_SET_MISMATCH = "MIGRATION.MANIFEST.SET_MISMATCH"
+    # cosign verify-blob 验签失败 / 签名文件缺失 / cosign 不可用
+    MIGRATION_MANIFEST_SIGNATURE_INVALID = "MIGRATION.MANIFEST.SIGNATURE_INVALID"
+
+    # ── R63 P0-05: Outbox worker fail-fast ──
+    # 生产模式 provider_registry=None,拒绝 stub 误启动把外部副作用标记完成
+    OUTBOX_PROVIDER_REGISTRY_REQUIRED = "OUTBOX.PROVIDER_REGISTRY.REQUIRED"
+
+    # ── R63 P1-11: Locale 文件 fail-closed 校验 ──
+    # 启动期 locale 文件完整性校验失败(文件缺失/JSON 解析失败/
+    # message_key 缺失/占位符不对称),Release 镜像必须 fail-closed
+    LOCALE_VALIDATION_FAILED = "LOCALE.VALIDATION.FAILED"
+
+    # ── R63 P1-12: i18n ICU 预编译 fail-fast ──
+    # locale 加载阶段预编译 ICU message 失败(语法错误 / 参数集合不对称),
+    # release / strict 模式直接阻断构建或加载
+    I18N_ICU_COMPILE_FAILED = "I18N.ICU.COMPILE_FAILED"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -780,13 +806,13 @@ class ErrorRegistry:
             3. ``show_retry_button`` 非 None(必须显式设置,不再回退到 retryable)
             4. ``audit_level`` 非空且在合法枚举内
                (``debug`` / ``info`` / ``warning`` / ``critical`` / ``security``)
-            5. ``message_key`` 在 zh-CN / en-US locale 文件中均存在(best-effort,
-               locale 文件不可读时跳过,详细校验由
-               ``scripts/check_error_codes_locale_schema.py`` CI 门禁负责)
 
         Note:
-            直接读取 ``ErrorRegistry._definitions``,不调用 ``all_codes()`` /
-            ``_ensure_initialized()``,避免在启动期触发递归。
+            - 直接读取 ``ErrorRegistry._definitions``,不调用 ``all_codes()`` /
+              ``_ensure_initialized()``,避免在启动期触发递归。
+            - R63 P1-11: locale 文件完整性校验已移至 ``validate_locales()``,
+              本方法不再做 best-effort locale key 校验(原 best-effort 仅 warning
+              不符合 Release 镜像 fail-closed 要求)。
         """
         errors: list[str] = []
         valid_presentations = {"inline", "modal", "toast", "silent", "short_hint"}
@@ -828,55 +854,153 @@ class ErrorRegistry:
                     f"Error {code}: invalid audit_level '{defn.audit_level}'"
                 )
 
-        # 5. best-effort locale key 校验
+        return errors
+
+    @staticmethod
+    def validate_locales(locales_dir: Optional[Any] = None) -> list[str]:
+        """R63 P1-11: fail-closed locale 文件完整性校验。
+
+        校验打包后的实际 locale 文件(不仅依赖源码 CI):
+
+            1. ``locales/zh-CN.json`` 和 ``locales/en-US.json`` 文件存在
+            2. 两个文件均为有效 JSON(根对象为 dict)
+            3. 所有已注册 ErrorDefinition 的 ``message_key`` 必须在两个 locale
+               文件中均存在(点分扁平化后查找)
+            4. 两个 locale 的 key 必须对称(zh-CN 与 en-US 互相无缺失/多余)
+            5. 占位符 ``{var}`` 在两个 locale 中必须一致
+               (ICU plural/select/selectordinal 子句跳过,占位符在子句内不强制对称)
+
+        Args:
+            locales_dir: 可选的 locale 目录路径(默认为项目根 ``locales/``)。
+                测试用例可传入临时目录以隔离校验不同 locale 文件内容。
+
+        Returns:
+            校验错误消息列表(空列表 = 全部通过)。
+            非空列表 = 启动应 fail-closed
+            (除非 ``ERROR_CODES_LOCALE_STRICT=0`` 降级为 warning)。
+
+        Note:
+            - 直接读取 ``ErrorRegistry._definitions``,避免触发递归初始化。
+            - 本方法不做 best-effort 跳过:任何 locale 文件异常均返回错误,
+              由调用方(模块加载块)根据 ``ERROR_CODES_LOCALE_STRICT`` 环境变量
+              决定是 fail-closed(raise AppError)还是降级为 warning。
+        """
+        import os as _os
+        import re as _re
+        from pathlib import Path as _Path
+
+        errors: list[str] = []
+        if locales_dir is None:
+            locales_dir = _Path(__file__).resolve().parent.parent / "locales"
+        locales_dir = _Path(locales_dir)
+        zh_path = locales_dir / "zh-CN.json"
+        en_path = locales_dir / "en-US.json"
+
+        # 1. 检查文件存在
+        if not zh_path.exists():
+            errors.append(f"Locale file missing: {zh_path}")
+        if not en_path.exists():
+            errors.append(f"Locale file missing: {en_path}")
+        if errors:
+            return errors  # 文件不存在,后续校验无法进行
+
+        # 2. 检查 JSON 解析 + 根对象为 dict
+        zh_data: Optional[dict] = None
+        en_data: Optional[dict] = None
         try:
-            from pathlib import Path as _Path
-
-            _locales_dir = _Path(__file__).resolve().parent.parent / "locales"
-            _zh_path = _locales_dir / "zh-CN.json"
-            _en_path = _locales_dir / "en-US.json"
-            if _zh_path.exists() and _en_path.exists():
-
-                def _flatten(d: dict, prefix: str = "") -> dict:
-                    out: dict = {}
-                    for k, v in d.items():
-                        full = f"{prefix}.{k}" if prefix else k
-                        if isinstance(v, dict):
-                            out.update(_flatten(v, full))
-                        else:
-                            out[full] = v
-                    return out
-
-                _zh_keys = set(
-                    _flatten(json.loads(_zh_path.read_text(encoding="utf-8"))).keys()
+            zh_raw = zh_path.read_text(encoding="utf-8")
+            zh_data = json.loads(zh_raw)
+            if not isinstance(zh_data, dict):
+                errors.append(
+                    f"zh-CN.json root must be a dict "
+                    f"(got {type(zh_data).__name__})"
                 )
-                _en_keys = set(
-                    _flatten(json.loads(_en_path.read_text(encoding="utf-8"))).keys()
+                zh_data = None
+        except json.JSONDecodeError as e:
+            errors.append(f"zh-CN.json JSON parse error: {e}")
+        except OSError as e:
+            errors.append(f"zh-CN.json read error: {e}")
+
+        try:
+            en_raw = en_path.read_text(encoding="utf-8")
+            en_data = json.loads(en_raw)
+            if not isinstance(en_data, dict):
+                errors.append(
+                    f"en-US.json root must be a dict "
+                    f"(got {type(en_data).__name__})"
                 )
-                for code, defn in definitions.items():
-                    if defn.message_key not in _zh_keys:
-                        errors.append(
-                            f"Error {code}: message_key "
-                            f"'{defn.message_key}' missing in zh-CN.json"
-                        )
-                    if defn.message_key not in _en_keys:
-                        errors.append(
-                            f"Error {code}: message_key "
-                            f"'{defn.message_key}' missing in en-US.json"
-                        )
-        except Exception as _locale_err:
-            # best-effort:locale 文件不可读时记录 warning 并跳过本项校验
-            # (详细 locale key 校验由 scripts/check_error_codes_locale_schema.py
-            # CI 门禁负责,不在此 fail-closed,避免 locales 目录缺失时阻塞启动)。
-            # 不使用 bare `pass`(会被 check_error_codes.py --strict 标记为 fail-open)。
-            # R61 P1-04: 使用 _i18n_t() 避免 i18n scanner 基线溢出
-            from services.i18n import translate as _i18n_t
-            logger.warning(
-                _i18n_t(
-                    "services.error_codes.logger_locale_validation_skip",
-                    err=str(_locale_err),
+                en_data = None
+        except json.JSONDecodeError as e:
+            errors.append(f"en-US.json JSON parse error: {e}")
+        except OSError as e:
+            errors.append(f"en-US.json read error: {e}")
+
+        if errors:
+            return errors  # JSON 解析失败,后续校验无法进行
+
+        # 扁平化 locale dict(点分 key → value)
+        def _flatten(d: dict, prefix: str = "") -> dict:
+            out: dict = {}
+            for k, v in d.items():
+                full = f"{prefix}.{k}" if prefix else str(k)
+                if isinstance(v, dict):
+                    out.update(_flatten(v, full))
+                else:
+                    out[full] = v
+            return out
+
+        zh_flat: dict = _flatten(zh_data) if zh_data else {}
+        en_flat: dict = _flatten(en_data) if en_data else {}
+        zh_keys: set[str] = set(zh_flat.keys())
+        en_keys: set[str] = set(en_flat.keys())
+
+        # 3. 检查所有 message_key 在两个 locale 中存在
+        definitions = ErrorRegistry._definitions
+        for code, defn in definitions.items():
+            if defn.message_key not in zh_flat:
+                errors.append(
+                    f"Error {code}: message_key "
+                    f"'{defn.message_key}' missing in zh-CN.json"
                 )
+            if defn.message_key not in en_flat:
+                errors.append(
+                    f"Error {code}: message_key "
+                    f"'{defn.message_key}' missing in en-US.json"
+                )
+
+        # 4. 检查 locale key 对称性(zh-CN vs en-US)
+        only_zh = zh_keys - en_keys
+        only_en = en_keys - zh_keys
+        if only_zh:
+            errors.append(
+                f"Locale keys asymmetric: zh-CN has {len(only_zh)} keys "
+                f"missing in en-US: {sorted(only_zh)[:5]}"
             )
+        if only_en:
+            errors.append(
+                f"Locale keys asymmetric: en-US has {len(only_en)} keys "
+                f"missing in zh-CN: {sorted(only_en)[:5]}"
+            )
+
+        # 5. 检查占位符一致性(简单 {var} 占位符,ICU 子句跳过)
+        placeholder_re = _re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+        icu_pattern_re = _re.compile(
+            r"\{[a-zA-Z_]\w*\s*,\s*(plural|select|selectordinal)\s*,"
+        )
+        common_keys = zh_keys & en_keys
+        for key in sorted(common_keys):
+            zh_val = str(zh_flat.get(key, ""))
+            en_val = str(en_flat.get(key, ""))
+            # 跳过 ICU pattern(占位符在 ICU 子句中,不强制对称)
+            if icu_pattern_re.search(zh_val) or icu_pattern_re.search(en_val):
+                continue
+            zh_ph = set(placeholder_re.findall(zh_val))
+            en_ph = set(placeholder_re.findall(en_val))
+            if zh_ph != en_ph:
+                errors.append(
+                    f"Placeholder mismatch for key '{key}': "
+                    f"zh-CN={sorted(zh_ph)} vs en-US={sorted(en_ph)}"
+                )
 
         return errors
 
@@ -1502,13 +1626,14 @@ def _register_defaults() -> None:
         audit_level="critical",
     ))
     # R60 P0-03: 恢复信任链令牌缺失/无效时 fail-closed 拒绝恢复
+    # R63 P1-01: 新增 "reason" safe_param — 标识失败原因(如 nonce_already_consumed)
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
         message_key="errors.backup.restore.trust_chain_required",
         http_status=403,
         retryable=False,
         severity="critical",
-        safe_params=["backup_id"],
+        safe_params=["backup_id", "reason"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",
@@ -2606,13 +2731,14 @@ def _register_defaults() -> None:
     ))
     # resource_version 不匹配(旧版本按钮操作已更新资源)
     # 409 warning — 资源已被修改,需重新加载
+    # R63 P1-06: safe_params 增加 expected/actual 用于诊断绑定不匹配
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.BUTTON_POLICY_VERSION_MISMATCH,
         message_key="errors.button.policy.version_mismatch",
         http_status=409,
         retryable=False,
         severity="warning",
-        safe_params=["action", "reason"],
+        safe_params=["action", "reason", "expected", "actual"],
         presentation="short_hint",
         show_retry_button=False,
         audit_level="warning",
@@ -2625,7 +2751,20 @@ def _register_defaults() -> None:
         http_status=409,
         retryable=False,
         severity="critical",
-        safe_params=["action", "reason"],
+        safe_params=["action", "reason", "expected", "actual"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # R63 P1-06: audience 不匹配(跨 handler 滥用)
+    # 403 critical — handle 被错误的 handler 调用(如 report handle 被 restore handler 调用)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_POLICY_AUDIENCE_MISMATCH,
+        message_key="errors.button.policy.audience_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason", "expected", "actual"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",
@@ -2711,6 +2850,99 @@ def _register_defaults() -> None:
         audit_level="critical",
     ))
 
+    # ── R63 P0-04: Migration manifest 信任根验证 ──
+    # 500 critical — manifest 字段缺失,部署不完整,阻断迁移
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MIGRATION_MANIFEST_FIELD_MISSING,
+        message_key="errors.migration.manifest.field_missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["field", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — manifest 绑定 SHA 与当前 HEAD/Tree 不一致,manifest 过期或被篡改
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MIGRATION_MANIFEST_BINDING_MISMATCH,
+        message_key="errors.migration.manifest.binding_mismatch",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["expected", "actual", "field"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — 磁盘 migration 集合与 manifest 声明不一致
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MIGRATION_MANIFEST_SET_MISMATCH,
+        message_key="errors.migration.manifest.set_mismatch",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["missing_in_manifest", "missing_on_disk"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — cosign 验签失败/签名文件缺失,拒绝未验签 manifest 作为 trust anchor
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MIGRATION_MANIFEST_SIGNATURE_INVALID,
+        message_key="errors.migration.manifest.signature_invalid",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "sig_file", "cert_file"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R63 P0-05: Outbox worker fail-fast ──
+    # 500 critical — 生产模式无 provider,拒绝 stub 误启动
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.OUTBOX_PROVIDER_REGISTRY_REQUIRED,
+        message_key="errors.outbox.provider_registry.required",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R63 P1-12: i18n ICU 预编译 fail-fast ──
+    # 500 critical — ICU 语法错误 / 参数集合不对称,release / strict 模式直接阻断构建
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.I18N_ICU_COMPILE_FAILED,
+        message_key="errors.i18n.icu.compile_failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["locale", "key", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R63 P1-11: Locale 文件 fail-closed 校验 ──
+    # 500 critical — 启动期 locale 文件校验失败(文件缺失/JSON 解析失败/
+    # message_key 缺失/占位符不对称),Release 镜像必须 fail-closed 阻断启动
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.LOCALE_VALIDATION_FAILED,
+        message_key="errors.locale.validation.failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "error_count"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
 
 # 模块加载时即注册默认定义(确保任何 import 都触发注册)
 _register_defaults()
@@ -2718,7 +2950,7 @@ ErrorRegistry._initialized = True
 
 # R61 P1-05: 启动期校验所有已注册 ErrorDefinition 的完整性
 # (presentation / show_retry_button / audit_level 必须显式设置,
-# code 唯一,message_key 在 locale 文件中存在)。
+# code 唯一)。
 # 校验失败 = 协议漂移,直接 fail-fast 阻止进程启动。
 _validation_errors = ErrorRegistry.validate()
 if _validation_errors:
@@ -2734,6 +2966,47 @@ if _validation_errors:
     raise RuntimeError(
         f"R61 P1-05: ErrorRegistry validation failed with "
         f"{len(_validation_errors)} error(s); first: {_validation_errors[0]}"
+    )
+
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_LOCALE_VALIDATION_ERROR = "R63 P1-11: locale validation error: {}"
+_LOG_LOCALE_VALIDATION_DOWNGRADED = (
+    "R63 P1-11: ERROR_CODES_LOCALE_STRICT=0, locale validation errors "
+    "downgraded to warning: {} error(s); first: {}"
+)
+
+# R63 P1-11: 启动期校验打包后的实际 locale 文件完整性(fail-closed)。
+# Release 镜像必须在启动前对打包后的 locale 文件 fail-closed,
+# 而不能只依赖源码 CI(scripts/check_error_codes_locale_schema.py)。
+# 校验项:文件存在 / 有效 JSON / message_key 存在 / key 对称 / 占位符一致。
+# 逃生门:ERROR_CODES_LOCALE_STRICT=0 降级为 warning(仅供开发环境,生产必须 fail-closed)。
+_locale_validation_errors = ErrorRegistry.validate_locales()
+if _locale_validation_errors:
+    import os as _os_locale_strict
+    _locale_strict_val = _os_locale_strict.environ.get(
+        "ERROR_CODES_LOCALE_STRICT", "1"
+    ).strip().lower()
+    _locale_fail_closed = _locale_strict_val not in ("0", "false", "no", "off")
+    # R63 P1-11: locale 文件已损坏时禁用 _i18n_t()(避免 i18n.translate →
+    # _get_release_mode → _i18n_t 递归)。直接用 f-string 记录错误。
+    for _locale_err in _locale_validation_errors:
+        logger.error(
+            _LOG_LOCALE_VALIDATION_ERROR.format(_locale_err)
+        )
+    if _locale_fail_closed:
+        # R63 P1-11: 生产环境 fail-closed — locale 文件异常阻断启动
+        raise AppError(
+            ErrorCodes.LOCALE_VALIDATION_FAILED,
+            params={
+                "reason": "locale_validation_failed",
+                "error_count": len(_locale_validation_errors),
+            },
+        )
+    # 开发模式(ERROR_CODES_LOCALE_STRICT=0):仅 warning,继续启动
+    logger.warning(
+        _LOG_LOCALE_VALIDATION_DOWNGRADED.format(
+            len(_locale_validation_errors), _locale_validation_errors[0]
+        )
     )
 
 

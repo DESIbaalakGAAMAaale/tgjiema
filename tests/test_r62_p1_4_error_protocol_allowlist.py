@@ -18,7 +18,8 @@
 
   C. 指纹计算 (2)
      4. test_fingerprint_deterministic: 相同输入 → 相同指纹(确定性)
-     5. test_fingerprint_changes_with_line: 行号变化 → 指纹变化
+     5. test_fingerprint_stable_with_line_change: 行号变化 → 指纹不变
+        (R63 P1-10: 指纹改为 AST 结构指纹,不再包含裸行号)
 
   D. 模式与 ratchet (2)
      6. test_strict_mode_fails_on_non_allowlisted: strict 模式下未 allowlist 即失败
@@ -206,11 +207,16 @@ def test_fingerprint_deterministic():
     int(fp1, 16)  # 若含非 hex 字符会抛 ValueError
 
 
-def test_fingerprint_changes_with_line():
-    """测试 5: 行号变化 → 指纹变化(确保 allowlist 条目随代码移动需更新)。
+def test_fingerprint_stable_with_line_change():
+    """测试 5: 行号变化 → 指纹不变(R63 P1-10: AST 结构指纹稳定性)。
 
-    场景: 同一文件、同一违规类型,但行号不同(100 vs 101)。
-    期望: 两个指纹不同(行号是指纹的一部分)。
+    R62 P1-04 原版:行号是指纹的一部分,行号变化 → 指纹变化。
+    R63 P1-10 修订:指纹改为 AST 结构指纹(file:violation_type:context),
+                  不再包含裸行号,因此行号变化(无结构变化)→ 指纹不变。
+                  这解决了"行号漂移导致 fingerprint 全变"的不稳定性问题。
+
+    场景: 同一文件、同一违规类型、同一 context,但行号不同(100 vs 101)。
+    期望: 两个指纹相同(行号不再参与指纹计算)。
     """
     fp_line_100 = scanner._compute_violation_fingerprint(
         "services/foo.py", 100, "P1-5 规则3", "return False",
@@ -219,7 +225,9 @@ def test_fingerprint_changes_with_line():
         "services/foo.py", 101, "P1-5 规则3", "return False",
     )
 
-    assert fp_line_100 != fp_line_101, "行号变化必须导致指纹变化"
+    assert fp_line_100 == fp_line_101, (
+        "R63 P1-10: 行号变化不应导致指纹变化(AST 结构指纹对行号稳定)"
+    )
     # 验证两个都是合法的 64 字符 sha256
     assert len(fp_line_100) == 64
     assert len(fp_line_101) == 64
@@ -228,7 +236,8 @@ def test_fingerprint_changes_with_line():
 def test_fingerprint_changes_with_other_fields():
     """补充测试: 文件路径、违规类型、上下文变化 → 指纹变化。
 
-    确保指纹包含所有 4 个维度(file/line/violation_type/context),
+    R63 P1-10: 指纹改为 AST 结构指纹,包含 3 个维度
+    (file/violation_type/context),不再包含 line。
     单一维度变化即可导致指纹变化(防止单维度碰撞)。
     """
     base = scanner._compute_violation_fingerprint(
@@ -461,10 +470,17 @@ def test_real_baseline_allowlist_entries_have_all_fields():
         assert isinstance(entry["ticket"], str) and entry["ticket"], f"条目 {i} ticket 无效"
 
 
-def test_real_baseline_allowlist_fingerprints_unique():
-    """补充集成测试: 真实 baseline 的 allowlist 指纹唯一(无重复)。
+def test_real_baseline_allowlist_fingerprints_well_formed():
+    """补充集成测试: 真实 baseline 的 allowlist 指纹格式合法。
 
-    若指纹重复,说明 _build_allowlist_entry 生成的条目无法区分不同违规。
+    R63 P1-10: 指纹改为 AST 结构指纹(file:violation_type:context),
+    不再包含裸行号。结构相同的违规(同文件/同函数/同违规类型/同源行)
+    会共享同一指纹 — 这是有意设计(行号漂移稳定性)。
+
+    本测试验证:
+      1. 每个指纹都是合法的 64 字符 sha256 hex;
+      2. 唯一指纹数 > 0(防退化);
+      3. 唯一指纹数 <= 总条目数(允许结构碰撞)。
     """
     if not REAL_BASELINE.exists():
         pytest.skip(f"真实 baseline 不存在: {REAL_BASELINE}")
@@ -473,19 +489,34 @@ def test_real_baseline_allowlist_fingerprints_unique():
     allowlist = data.get("domains", {}).get("observability", {}).get("allowlist", [])
 
     fingerprints = [entry["fingerprint"] for entry in allowlist]
-    assert len(fingerprints) == len(set(fingerprints)), (
-        f"allowlist 指纹有重复: 总 {len(fingerprints)}, 唯一 {len(set(fingerprints))}"
-    )
+    # 1. 所有指纹均为 64 字符 sha256 hex
+    for i, fp in enumerate(fingerprints):
+        assert len(fp) == 64, f"条目 {i} 指纹长度 != 64: {len(fp)}"
+        int(fp, 16)  # 合法 hex 校验
+    # 2. 唯一指纹数 > 0(防退化)
+    unique_count = len(set(fingerprints))
+    assert unique_count > 0, "不应所有指纹都相同(退化)"
+    # 3. 唯一指纹数 <= 总条目数(允许结构碰撞,这是 AST 指纹的预期行为)
+    assert unique_count <= len(fingerprints), "唯一指纹数不应超过总条目数"
 
 
 def test_build_allowlist_entry_has_all_fields():
-    """补充测试: _build_allowlist_entry 生成的条目包含所有必需字段。"""
+    """补充测试: _build_allowlist_entry 生成的条目包含所有必需字段。
+
+    R63 P1-10: 条目新增 root_cause / plan 字段(按模块分类),ticket 改为
+    按模块自动分类(如 services → R63-P1-10-services)。
+    """
     finding = _make_synthetic_finding()
     entry = scanner._build_allowlist_entry(*finding)
 
-    required_fields = {"file", "line", "fingerprint", "owner", "reason", "expiry", "ticket"}
-    assert set(entry.keys()) == required_fields, (
-        f"条目字段不完整: {set(entry.keys())} vs {required_fields}"
+    # R63 P1-10: 必需字段含 root_cause / plan(按模块分类新增)
+    required_fields = {
+        "file", "line", "fingerprint", "owner", "reason",
+        "expiry", "ticket", "root_cause", "plan",
+    }
+    assert required_fields.issubset(set(entry.keys())), (
+        f"条目缺少必需字段: 缺 {required_fields - set(entry.keys())}, "
+        f"实际字段: {set(entry.keys())}"
     )
 
     # 验证字段值
@@ -495,7 +526,17 @@ def test_build_allowlist_entry_has_all_fields():
     assert entry["owner"] == scanner.DEFAULT_ALLOWLIST_OWNER
     assert entry["reason"] == scanner.DEFAULT_ALLOWLIST_REASON
     assert entry["expiry"] == scanner.DEFAULT_ALLOWLIST_EXPIRY
-    assert entry["ticket"] == scanner.DEFAULT_ALLOWLIST_TICKET
+    # R63 P1-10: ticket 按模块分类(services → R63-P1-10-services)
+    assert entry["ticket"] == "R63-P1-10-services", (
+        f"services 模块 ticket 应为 R63-P1-10-services,实际: {entry['ticket']}"
+    )
+    # root_cause / plan 应为非空字符串
+    assert isinstance(entry["root_cause"], str) and entry["root_cause"], (
+        f"root_cause 应为非空字符串: {entry['root_cause']!r}"
+    )
+    assert isinstance(entry["plan"], str) and entry["plan"], (
+        f"plan 应为非空字符串: {entry['plan']!r}"
+    )
 
 
 def test_extract_violation_type():
