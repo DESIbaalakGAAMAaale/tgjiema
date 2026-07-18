@@ -26,6 +26,16 @@
         .metric-item { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #595959; }
         .dot-green { width: 8px; height: 8px; border-radius: 50%; background: #237804; }
         .dot-red { width: 8px; height: 8px; border-radius: 50%; background: #cf1322; }
+        .section { overflow-x: auto; }
+        /* R58 P1-7: prefers-reduced-motion 尊重用户偏好(WCAG 2.2 AA 2.3.3 Animation from Interactions) */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
     </style>
 </head>
 <body>

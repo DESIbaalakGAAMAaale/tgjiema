@@ -36,6 +36,16 @@
         .actions { display: flex; gap: 6px; }
         .actions form { display: inline; }
         .actions button, .actions select { padding: 4px 10px; border: 1px solid #d9d9d9; border-radius: 4px; font-size: 12px; background: #fff; cursor: pointer; }
+        .section { overflow-x: auto; }
+        /* R58 P1-7: prefers-reduced-motion 尊重用户偏好(WCAG 2.2 AA 2.3.3 Animation from Interactions) */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
     </style>
 </head>
 <body>
