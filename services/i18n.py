@@ -1786,15 +1786,23 @@ def set_user_locale(user_id: int, locale: str) -> bool:
                 (locale, int(user_id)),
             )
             # 写 dirty_outbox(供 crdb_sync 同步到 CRDB)
+            # R61 P1-06 修复: 使用单调时间戳作为 version(毫秒精度),
+            # 替代硬编码 version=0。原实现导致同一用户多次调用
+            # set_user_locale 时 (table_name, pk, version=0) 触发
+            # UNIQUE 约束冲突,使整个事务(含 users_local UPDATE)回滚,
+            # e2e 中切换 locale 失败。与 _generate_version_from_payload
+            # 的 fallback 模式一致(Unix 时间戳),毫秒精度降低同秒碰撞;
+            # INSERT OR REPLACE 兜底极端情况,保证最新状态被持久化。
+            _version = int(time.time() * 1000)
             conn.execute(
-                """INSERT INTO dirty_outbox
+                """INSERT OR REPLACE INTO dirty_outbox
                    (table_name, pk, version, operation, payload,
                     created_at, processed, local_only)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     "users_local",
                     str(int(user_id)),
-                    0,
+                    _version,
                     "upsert",
                     json.dumps(
                         {"user_id": int(user_id), "locale": locale},
