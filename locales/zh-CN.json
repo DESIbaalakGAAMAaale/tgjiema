@@ -92,6 +92,12 @@
     "approval.gate.required": "操作需审批(approval_id={approval_id}, action={action})",
     "approval.state.invalid": "审批状态无效(approval_id={approval_id}, current_status={current_status})",
     "approval.self_reject.forbidden": "审批创建者不能驳回自己创建的审批(防止自拒绕过审计,approver_id={approver_id}, created_by={created_by}, approval_id={approval_id}, trace_id={trace_id})",
+    "migration.manifest.field_missing": "迁移清单缺少必填字段(field={field}, reason={reason}, trace_id={trace_id})",
+    "migration.manifest.binding_mismatch": "迁移清单绑定的 SHA 与当前 HEAD/Tree 不一致(field={field}, expected={expected}, actual={actual}, trace_id={trace_id})",
+    "migration.manifest.set_mismatch": "磁盘迁移文件集合与清单声明不一致(missing_in_manifest={missing_in_manifest}, missing_on_disk={missing_on_disk}, trace_id={trace_id})",
+    "migration.manifest.signature_invalid": "迁移清单签名验证失败(reason={reason}, sig_file={sig_file}, cert_file={cert_file}, trace_id={trace_id})",
+    "outbox.provider_registry.required": "Outbox provider 注册表未配置,生产模式拒绝 stub 启动(reason={reason}, trace_id={trace_id})",
+    "i18n.icu.compile_failed": "i18n ICU 消息预编译失败(locale={locale}, key={key}, reason={reason}, trace_id={trace_id})",
     "command.concurrent.claim": "操作已被其他 worker 抢占或状态已变更(action_id={action_id})",
     "command.hash.mismatch": "请求参数与上次执行不一致(防篡改拒绝,action_id={action_id})",
     "db.cache.unavailable": "SQLite 缓存不可用(component={component})",
@@ -173,11 +179,13 @@
     "button.policy.principal_mismatch": "按钮操作主体不匹配,可能是跨用户攻击(action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.version_mismatch": "按钮资源版本不匹配,资源已被修改,请刷新后重试(action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.hash_mismatch": "按钮审批 request_hash 不匹配,审批与记录可能错位(action={action}, reason={reason}, trace_id={trace_id})",
+    "button.policy.audience_mismatch": "按钮 audience 不匹配,可能为跨 handler 滥用攻击(action={action}, reason={reason}, expected={expected}, actual={actual}, trace_id={trace_id})",
     "button.policy.mfa_required": "高风险按钮要求 MFA 多因素认证,请先完成 MFA 验证(action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.dual_approval_required": "极高风险按钮要求双人审批,审批人必须与操作人不同(action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.final_confirm_required": "高风险按钮要求最终确认,请完成确认步骤后重试(action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.async_token_required": "高风险操作必须使用异步持久化令牌 API,禁止使用同步令牌 API(action={action}, reason={reason}, user_id={user_id}, trace_id={trace_id})",
-    "button.policy.unknown": "未知的按钮审批错误(action={action}, reason={reason}, trace_id={trace_id})"
+    "button.policy.unknown": "未知的按钮审批错误(action={action}, reason={reason}, trace_id={trace_id})",
+    "locale.validation.failed": "启动期 locale 文件校验失败,已拒绝启动(reason={reason}, error_count={error_count}, trace_id={trace_id})"
   },
   "ui": {
     "admin_login_title": "管理后台登录",
@@ -1686,7 +1694,17 @@
         "invalid_reporter_id": "⚠️ 参数错误: reporter_id 非法",
         "unknown_sub_action": "⚠️ 未知的举报子动作: {sub_action}",
         "signature_failed_restore": "⚠️ 按钮签名验证失败,可能已过期或被使用,请重新发起恢复操作。",
-        "signature_failed_delete": "⚠️ 按钮签名验证失败,可能已过期或被使用,请重新发起删除操作。"
+        "signature_failed_delete": "⚠️ 按钮签名验证失败,可能已过期或被使用,请重新发起删除操作。",
+        "ban_approval_submitted": "⏳ 已提交封禁审批(审批 ID: {approval_id}),用户 {uid}",
+        "ban_success": "✅ 已封禁用户 {uid}",
+        "ban_failed": "❌ 封禁失败: {error}",
+        "detach_approval_submitted": "⏳ 已提交审批(审批 ID: {approval_id}),文件码 {file_code}",
+        "detach_success": "✅ 已脱钩文件码 {file_code}",
+        "detach_failed": "❌ 脱钩失败: {error}",
+        "block_approval_submitted": "⏳ 已提交审批(审批 ID: {approval_id}),举报人 {reporter_id} ↔ 文件码 {file_code}",
+        "block_success": "✅ 已限制举报人 {reporter_id} 解码 {file_code}",
+        "block_failed": "❌ 限制失败: {error}",
+        "operation_failed": "操作失败: {error}"
       }
     },
     "generic": {
@@ -2151,7 +2169,12 @@
       "s16": "年",
       "s17": "上午",
       "logger_release_mode_read_failed": "[i18n] _get_release_mode 读取 RELEASE_BUILD 失败: {err}",
-      "logger_babel_ordinal_unavailable": "[i18n] Babel ordinal 不可用,回退自维护规则: {err}"
+      "logger_babel_ordinal_unavailable": "[i18n] Babel ordinal 不可用,回退自维护规则: {err}",
+      "logger_icu_precompile_failed_strict": "[i18n] R63 P1-12: ICU 预编译失败(strict 模式) locale={locale} failures={failures} first_key={first_key} first_reason={first_reason}",
+      "logger_icu_precompile_failed_loose": "[i18n] R63 P1-12: ICU 预编译失败(宽松模式,运行时回退) locale={locale} icu_key={icu_key} reason={reason}",
+      "logger_icu_param_asymmetry_strict": "[i18n] R63 P1-12: ICU 参数集合不对称(strict 模式) asymmetries={asymmetries} first_key={first_key} zh_params={zh_params} en_params={en_params}",
+      "logger_icu_param_asymmetry_loose": "[i18n] R63 P1-12: ICU 参数集合不对称(宽松模式) icu_key={icu_key} zh_params={zh_params} en_params={en_params}",
+      "logger_icu_precompile_runtime_fallback": "[i18n] R63 P1-12: ICU 预编译失败,回退到 format_message icu_key={icu_key} locale={locale} reason={reason}"
     },
     "maintenance_mode": {
       "s1": "数据库未初始化",

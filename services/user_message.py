@@ -1,9 +1,15 @@
-"""R62 P1-05: 统一用户可见消息类型 UserMessage。
+"""R62 P1-05 / R63 P1-08: 统一用户可见消息类型 UserMessage。
 
-审计报告 P1-05 要求:
+审计报告 P1-05 / P1-08 要求:
     > 当前 scanner 对直接 Call 与容器字面量覆盖增强,但"新 sink 必须先注册",
     > 且豁免调用不深入。这会漏掉 wrapper、别名、函数返回值传播、
     > WebSocket/SSE、模板 helper、第三方发送适配器及动态字符串。
+    >
+    > R63 P1-08: UserMessage 并未真正强制,脱敏/不可变性是浅层的。
+    > 整改:adapter 签名接收 ``UserMessage | ErrorEnvelope``,禁止 str;
+    > params 递归冻结(dict → MappingProxyType,list → tuple,
+    > deep copy 后递归转换);按类型/长度验证;
+    > 敏感值过滤增强(API key 前缀 / 长 hex / JWT eyJ 前缀)。
 
 整改方案:
     1. 引入 ``UserMessage`` — 统一用户可见消息类型
@@ -17,6 +23,17 @@
     - ``render(i18n_manager)`` 惰性渲染,在真正写入用户面前才转为字符串
     - ``from_error(AppError)`` 从已结构化的 AppError 转换,保留 trace_id 全链路关联
     - params 在构造时即经过 ``_sanitize_params`` 过滤(防御性拷贝,避免外部修改)
+
+R63 P1-08 增强:
+    - params 递归冻结(``_freeze_params``):dict → MappingProxyType,
+      list → tuple,deep copy 隔离原对象,嵌套对象不可被外部修改
+    - 敏感值过滤增强(``_is_sensitive_value``):不仅按 key 子串,
+      还按 value 模式(API key 前缀 ghp_/sk-/AKIA/xoxb-、长 hex >32 chars、
+      JWT eyJ 前缀)
+    - ``ErrorEnvelope``(frozen dataclass):封装 AppError,提供
+      ``to_user_message(locale) -> UserMessage``
+    - ``render_for_send(payload, i18n_manager)`` 适配器:类型级强制只接受
+      ``UserMessage | ErrorEnvelope``,拒绝裸 str;渲染集中在最后一层
 
 用法示例:
     # 从 i18n key 直接构造
@@ -35,12 +52,17 @@
         msg = UserMessage.from_error(e, locale="zh-CN")
         await safe_reply_text(update.message, msg.render(get_i18n_manager()))
 
-R62 P1-05: 所有用户出口应接受 UserMessage 结构化对象,而非裸字符串。
+    # R63 P1-08: 通过 render_for_send 适配器强制类型(拒绝裸 str)
+    text = render_for_send(UserMessage.from_key("bot.welcome"), manager)
+    text = render_for_send(ErrorEnvelope(app_error), manager)
 """
 from __future__ import annotations
 
+import copy
+import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 if TYPE_CHECKING:
     # 仅类型检查用,运行时不导入以避免循环依赖
@@ -49,7 +71,7 @@ if TYPE_CHECKING:
 
 
 # ════════════════════════════════════════════════════════════════
-# R62 P1-05: 敏感参数过滤
+# R62 P1-05: 敏感参数过滤(key 子串)
 # ════════════════════════════════════════════════════════════════
 # 内联敏感 key 子串(独立于 error_codes._SENSITIVE_KEY_PATTERNS,
 # 避免对 services.error_codes 的强依赖;UserMessage 应可独立构造)
@@ -86,19 +108,64 @@ def _is_sensitive_key(key: str) -> bool:
     return any(pattern in key_lower for pattern in _USER_MESSAGE_SENSITIVE_KEY_PATTERNS)
 
 
+# ════════════════════════════════════════════════════════════════
+# R63 P1-08: 敏感 value 模式过滤(API key 前缀 / 长 hex / JWT 前缀)
+# ════════════════════════════════════════════════════════════════
+# 敏感 value 前缀(对应主流云服务 API key / token 格式)
+_SENSITIVE_VALUE_PREFIXES: tuple[str, ...] = (
+    "ghp_",    # GitHub Personal Access Token
+    "sk-",     # OpenAI / Stripe API key
+    "AKIA",    # AWS access key ID
+    "xoxb-",   # Slack bot token
+    "eyJ",     # JWT header base64 前缀
+)
+
+# 长 hex 字符串阈值 — 超过此长度的纯 hex 字符串视为敏感
+# (32 = MD5 hex 长度,允许通过;>32 视为可能为 token / SHA-256 hash)
+_SENSITIVE_LONG_HEX_THRESHOLD = 32
+_LONG_HEX_RE = re.compile(r'[0-9a-fA-F]+')
+
+
+def _is_sensitive_value(value: Any) -> bool:
+    """R63 P1-08: 判断 value 是否为敏感值(按值模式,而非按 key 子串)。
+
+    判定规则(value 必须为 str;非 str 一律不视为敏感):
+        1. 以 ``_SENSITIVE_VALUE_PREFIXES`` 任一前缀开头(ghp_/sk-/AKIA/xoxb-/eyJ)
+           → 视为敏感(主流云服务 API key / JWT)
+        2. 长度 > 32 且全部为 hex 字符(0-9/a-f/A-F)
+           → 视为敏感(可能是 token / hash / 长 payload)
+
+    Args:
+        value: 待检测值(任意类型)
+
+    Returns:
+        True 表示敏感(应被过滤);False 表示可暴露给用户面消息
+    """
+    if not isinstance(value, str):
+        return False
+    if value.startswith(_SENSITIVE_VALUE_PREFIXES):
+        return True
+    if len(value) > _SENSITIVE_LONG_HEX_THRESHOLD and _LONG_HEX_RE.fullmatch(value):
+        return True
+    return False
+
+
 def _sanitize_params(params: Optional[dict[str, Any]]) -> dict[str, Any]:
-    """R62 P1-05: 过滤 params 中的敏感字段(防御性拷贝)。
+    """R62 P1-05 / R63 P1-08: 过滤 params 中的敏感字段(防御性拷贝)。
 
     过滤规则:
-        1. key 命中 ``_USER_MESSAGE_SENSITIVE_KEY_PATTERNS``(password/secret/token 等)→ 移除
-        2. value 为字符串且长度 > 200 → 视为可能含密文/哈希,移除
-        3. value 为 None → 移除(避免 'None' 字面量泄漏)
+        1. key 命中 ``_USER_MESSAGE_SENSITIVE_KEY_PATTERNS``
+           (password/secret/token 等)→ 移除
+        2. value 为 None → 移除(避免 'None' 字面量泄漏)
+        3. value 为字符串且长度 > 200 → 视为可能含密文/哈希,移除
+        4. R63 P1-08: value 命中 ``_is_sensitive_value``
+           (API key 前缀 / 长 hex / JWT eyJ 前缀)→ 移除
 
     Args:
         params: 原始参数字典(可为 None)
 
     Returns:
-        过滤后的新字典(浅拷贝,不修改原 dict)
+        过滤后的新字典(浅拷贝,不修改原 dict;递归冻结在 ``_freeze_params`` 中完成)
     """
     if not params:
         return {}
@@ -111,8 +178,50 @@ def _sanitize_params(params: Optional[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(value, str) and len(value) > 200:
             # 长字符串可能含密文/哈希/长 payload,过滤
             continue
+        # R63 P1-08: value 模式脱敏(API key 前缀 / 长 hex / JWT)
+        if _is_sensitive_value(value):
+            continue
         sanitized[key] = value
     return sanitized
+
+
+# ════════════════════════════════════════════════════════════════
+# R63 P1-08: params 递归冻结(dict → MappingProxyType, list → tuple)
+# ════════════════════════════════════════════════════════════════
+def _freeze_params(obj: Any) -> Any:
+    """R63 P1-08: 递归冻结 params — dict → MappingProxyType,list → tuple。
+
+    使用 ``copy.deepcopy`` 隔离原对象(防止外部修改传播到 UserMessage),
+    然后递归转换:
+        - dict → ``MappingProxyType``(不可变 dict 视图,mutation raises TypeError)
+        - list → tuple(不可变序列)
+        - tuple → tuple(递归冻结内部元素)
+        - 标量(int/str/bool/...)→ 保持不变
+
+    Args:
+        obj: 任意对象(dict / list / tuple / 标量)
+
+    Returns:
+        递归冻结后的对象(与原对象隔离)
+    """
+    # deep copy 隔离原对象(避免外部修改 nested dict/list 时传播到 UserMessage)
+    isolated = copy.deepcopy(obj)
+    return _freeze_impl(isolated)
+
+
+def _freeze_impl(obj: Any) -> Any:
+    """``_freeze_params`` 的递归实现(内部使用,不导出)。"""
+    if isinstance(obj, dict):
+        # dict → MappingProxyType(递归冻结每个 value)
+        return MappingProxyType({k: _freeze_impl(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        # list → tuple(递归冻结每个元素)
+        return tuple(_freeze_impl(v) for v in obj)
+    if isinstance(obj, tuple):
+        # tuple 本身不可变,但内部元素可能是 mutable → 递归冻结
+        return tuple(_freeze_impl(v) for v in obj)
+    # 标量(int/str/bool/None/...)保持不变
+    return obj
 
 
 # ════════════════════════════════════════════════════════════════
@@ -120,7 +229,7 @@ def _sanitize_params(params: Optional[dict[str, Any]]) -> dict[str, Any]:
 # ════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class UserMessage:
-    """R62 P1-05: 统一用户可见消息类型。
+    """R62 P1-05 / R63 P1-08: 统一用户可见消息类型。
 
     所有用户出口(FastAPI response、Telegram、WebSocket、SSE、邮件、通知、模板)
     只接受 UserMessage 结构化对象,而非裸字符串。这强制所有用户面消息经过
@@ -129,26 +238,30 @@ class UserMessage:
     Attributes:
         message_key: i18n 翻译键(如 "admin.errors.unauthorized")
         locale: 目标语言(如 "zh-CN", "en-US")
-        params: ICU 插值参数(已脱敏,不含敏感字段)
+        params: ICU 插值参数(已脱敏 + 递归冻结;顶层为 MappingProxyType)
         error_code: 关联的错误码(可选,用于协议化错误)
         trace_id: 追踪 ID(用于全链路日志关联)
     """
     message_key: str
     locale: str = "zh-CN"
-    # R62 P1-05: params 在 __post_init__ 中经过 _sanitize_params 过滤(防御性拷贝)
+    # R62 P1-05: params 在 __post_init__ 中经过 _sanitize_params 过滤
+    # R63 P1-08: 之后 _freeze_params 递归冻结(dict → MappingProxyType, list → tuple)
     params: dict[str, Any] = field(default_factory=dict)
     error_code: Optional[str] = None
     trace_id: Optional[str] = None
 
     def __post_init__(self) -> None:
-        """R62 P1-05: 构造时即过滤敏感字段(防御性拷贝,避免外部修改)。
+        """R62 P1-05 / R63 P1-08: 构造时即过滤敏感字段并递归冻结 params。
 
         frozen dataclass 不能直接赋值,通过 object.__setattr__ 绕过冻结保护。
         """
-        # 过滤 params(移除 password/secret/token 等敏感字段)
+        # 1. 过滤 params(移除 password/secret/token 等 key 敏感字段 +
+        #    API key / 长 hex / JWT eyJ 前缀等 value 模式)
         sanitized = _sanitize_params(self.params)
+        # 2. R63 P1-08: 递归冻结(deep copy 隔离 + dict→MappingProxyType + list→tuple)
+        frozen = _freeze_params(sanitized)
         # frozen dataclass 通过 object.__setattr__ 更新字段
-        object.__setattr__(self, "params", sanitized)
+        object.__setattr__(self, "params", frozen)
 
     def render(self, i18n_manager: Any) -> str:
         """通过 i18n manager 渲染为本地化字符串。
@@ -163,7 +276,8 @@ class UserMessage:
             render 是惰性的 — UserMessage 在传播过程中保持结构化,
             仅在真正写入用户面前才转为字符串。
         """
-        # R62 P1-05: params 已在 __post_init__ 中脱敏,可直接展开
+        # R62 P1-05: params 已在 __post_init__ 中脱敏 + 冻结,可直接展开
+        # MappingProxyType 支持 ** 解包,等价于 dict
         return i18n_manager.format_message(
             self.message_key, locale=self.locale, **self.params
         )
@@ -220,3 +334,79 @@ class UserMessage:
             error_code=error_code,
             trace_id=trace_id,
         )
+
+
+# ════════════════════════════════════════════════════════════════
+# R63 P1-08: ErrorEnvelope — 封装 AppError → UserMessage 的 wrapper
+# ════════════════════════════════════════════════════════════════
+@dataclass(frozen=True)
+class ErrorEnvelope:
+    """R63 P1-08: 封装 AppError → UserMessage 的转换 wrapper(frozen dataclass)。
+
+    设计意图:
+        - ``render_for_send`` adapter 签名接收 ``UserMessage | ErrorEnvelope``,
+          禁止裸 str。
+        - 业务层抛出 AppError 后,可通过 ``ErrorEnvelope(app_error)`` 包装,
+          委托给 adapter 渲染为本地化字符串,避免业务层传播字符串。
+        - frozen dataclass 防止 wrapper 在传播过程中被篡改。
+
+    Attributes:
+        app_error: 被封装的 AppError 实例(已包含 envelope + trace_id + params)
+    """
+    app_error: "AppError"
+
+    def to_user_message(self, locale: str = "zh-CN") -> UserMessage:
+        """转换为 UserMessage(委托 ``UserMessage.from_error``)。
+
+        Args:
+            locale: 目标语言(默认 zh-CN)
+
+        Returns:
+            UserMessage 实例(message_key / params / error_code / trace_id
+            全部对齐 AppError,params 已递归冻结)
+        """
+        return UserMessage.from_error(self.app_error, locale=locale)
+
+
+# ════════════════════════════════════════════════════════════════
+# R63 P1-08: render_for_send 适配器 — 类型级强制(拒绝裸 str)
+# ════════════════════════════════════════════════════════════════
+def render_for_send(
+    payload: Union[UserMessage, ErrorEnvelope],
+    i18n_manager: Any,
+) -> str:
+    """R63 P1-08: 适配器 — 类型级强制 ``UserMessage | ErrorEnvelope``,拒绝裸 str。
+
+    adapter 签名接收 ``UserMessage | ErrorEnvelope``,渲染集中在 adapter 最后一层
+    (render 后立即发送,不在业务层传播字符串)。
+
+    Args:
+        payload: ``UserMessage`` 或 ``ErrorEnvelope`` 实例
+            (禁止裸 str — 强制使用 ``UserMessage.from_key(...)`` /
+            ``ErrorEnvelope(...)`` 包装用户可见消息)
+        i18n_manager: I18nManager 实例(用于本地化渲染)
+
+    Returns:
+        本地化字符串(供 sink 直接使用)
+
+    Raises:
+        TypeError: 当 payload 为 str 或非 ``UserMessage | ErrorEnvelope`` 类型时
+    """
+    # 1. 显式拒绝裸 str(强制结构化 UserMessage.from_key / ErrorEnvelope)
+    if isinstance(payload, str):
+        raise TypeError(
+            "render_for_send 不接受裸 str,请使用 UserMessage.from_key(...) 或 "
+            "ErrorEnvelope(...) 包装用户可见消息(渲染集中在 adapter 最后一层)"
+        )
+    # 2. ErrorEnvelope → to_user_message → render
+    if isinstance(payload, ErrorEnvelope):
+        return payload.to_user_message().render(i18n_manager)
+    # 3. UserMessage → render
+    if isinstance(payload, UserMessage):
+        return payload.render(i18n_manager)
+    # 4. 其他类型一律拒绝(int/None/dict/...)
+    raise TypeError(
+        f"render_for_send 仅接受 UserMessage | ErrorEnvelope,实际类型 "
+        f"{type(payload).__name__};请使用 UserMessage.from_key(...) 或 "
+        f"ErrorEnvelope(...) 包装用户可见消息"
+    )

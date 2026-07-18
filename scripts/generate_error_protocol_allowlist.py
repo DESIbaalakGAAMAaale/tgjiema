@@ -72,18 +72,22 @@ DEFAULT_BASELINE_PATH = SCRIPTS_DIR / "error_protocol_baseline.json"
 
 def generate_allowlist(
     *,
-    owner: str = scanner.DEFAULT_ALLOWLIST_OWNER,
+    owner: str | None = None,
     reason: str = scanner.DEFAULT_ALLOWLIST_REASON,
     expiry: str = scanner.DEFAULT_ALLOWLIST_EXPIRY,
-    ticket: str = scanner.DEFAULT_ALLOWLIST_TICKET,
+    ticket: str | None = None,
 ) -> tuple[list[dict], int]:
     """运行 scanner 收集违规,生成结构化 allowlist 条目列表。
 
+    R63 P1-10: owner / ticket 默认 None → 按模块自动分类
+    (见 scanner._get_module_category)。如需全局统一 owner/ticket,
+    显式传入即可覆盖。
+
     Args:
-        owner: allowlist 条目默认 owner
+        owner: allowlist 条目默认 owner(None → 按模块分类自动填充)
         reason: allowlist 条目默认 reason
         expiry: allowlist 条目默认 expiry (ISO 日期字符串 YYYY-MM-DD)
-        ticket: allowlist 条目默认 ticket
+        ticket: allowlist 条目默认 ticket(None → 按模块分类自动填充)
 
     Returns:
         (allowlist_entries, total_count)
@@ -109,6 +113,7 @@ def generate_allowlist(
     for file_path, line_no, detail in findings:
         domain = scanner._classify_domain(file_path)
         if domain == "observability":
+            # R63 P1-10: owner/ticket 传 None → _build_allowlist_entry 按模块自动分类
             entry = scanner._build_allowlist_entry(
                 file_path, line_no, detail,
                 owner=owner, reason=reason, expiry=expiry, ticket=ticket,
@@ -223,8 +228,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--owner",
-        default=scanner.DEFAULT_ALLOWLIST_OWNER,
-        help=f"allowlist 条目默认 owner (默认: {scanner.DEFAULT_ALLOWLIST_OWNER})",
+        default=None,
+        help=(
+            "allowlist 条目默认 owner (默认: None → 按模块自动分类 "
+            f"{scanner.DEFAULT_ALLOWLIST_OWNER})"
+        ),
     )
     parser.add_argument(
         "--reason",
@@ -241,8 +249,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--ticket",
-        default=scanner.DEFAULT_ALLOWLIST_TICKET,
-        help=f"allowlist 条目默认 ticket (默认: {scanner.DEFAULT_ALLOWLIST_TICKET})",
+        default=None,
+        help=(
+            "allowlist 条目默认 ticket (默认: None → 按模块自动分类 "
+            f"{scanner.DEFAULT_ALLOWLIST_TICKET}-<module>)"
+        ),
     )
     parser.add_argument(
         "--update-baseline",

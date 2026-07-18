@@ -132,6 +132,21 @@ def _build_valid_capability(
     )
 
 
+async def _fresh_store():
+    """R63 P1-01: 构造一个真实 CacheStore(临时 DB 文件),用于 nonce 持久化测试。
+
+    替代原 ``mod._CONSUMED_NONCES.clear()`` 的进程内清理 — 现在每次测试用全新
+    DB 文件,天然隔离,且能验证跨"重启"(新建 CacheStore 实例)的持久化。
+    """
+    import tempfile
+    from database.cache_store import CacheStore
+    _tmp_dir = tempfile.mkdtemp(prefix="r63_p1_01_test_")
+    _db_path = str(Path(_tmp_dir) / "test_cache.db")
+    _store = CacheStore(db_path=_db_path)
+    await _store.init()
+    return _store
+
+
 # ═══════════════════════════════════════════════════════════════
 # 1-6: _RestoreCapability 单元测试
 # ═══════════════════════════════════════════════════════════════
@@ -141,95 +156,104 @@ class TestRestoreCapabilityConstruction:
     """R62 P0-01: _RestoreCapability 增强后的构造与边界校验。"""
 
     def setup_method(self):
-        """每个测试前清空 _CONSUMED_NONCES,避免跨用例污染。"""
-        mod = _ensure_backup_dr_validate_importable()
-        mod._CONSUMED_NONCES.clear()
+        """R63 P1-01: nonce 已持久化到 DB,无需进程内清理。"""
+        _ensure_backup_dr_validate_importable()
 
-    def test_valid_capability_passes_assert_valid(self):
+    @pytest.mark.asyncio
+    async def test_valid_capability_passes_assert_valid(self):
         """用例 1: 合法 capability 通过 assert_valid(无异常抛出)。"""
         mod = _ensure_backup_dr_validate_importable()
         cap = _build_valid_capability(mod, payload_digest="d" * 64)
+        store = await _fresh_store()
         # 不应抛出任何异常
-        cap.assert_valid(
+        await cap.assert_valid(
             payload_digest="d" * 64,
             clock=time.time(),
             expected_scope="R62-P0-01-test-fingerprint",
+            store=store,
         )
 
-    def test_expired_capability_raises(self):
+    @pytest.mark.asyncio
+    async def test_expired_capability_raises(self):
         """用例 2: 过期 capability 抛 AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)。"""
         mod = _ensure_backup_dr_validate_importable()
         from services.error_codes import AppError, ErrorCodes
 
+        store = await _fresh_store()
         # ttl_seconds=0 + 略微偏移时钟 → 立即过期
         cap = _build_valid_capability(mod, ttl_seconds=0)
         # 等待过期(时钟前进 1 秒)
-        cap.assert_valid(
-            payload_digest="d" * 64,
-            clock=time.time() + 1,
-            expected_scope="R62-P0-01-test-fingerprint",
-        ) if False else None  # 防止误判:assert_valid 应在过期时抛异常
-
         with pytest.raises(AppError) as exc_info:
-            cap.assert_valid(
+            await cap.assert_valid(
                 payload_digest="d" * 64,
                 clock=time.time() + 1,  # 时钟前进 → 已过期
                 expected_scope="R62-P0-01-test-fingerprint",
+                store=store,
             )
         assert exc_info.value.code == ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED
 
-    def test_replayed_capability_raises(self):
+    @pytest.mark.asyncio
+    async def test_replayed_capability_raises(self):
         """用例 3: 同一 capability 的 nonce 被消费两次后抛 AppError(防重放)。"""
         mod = _ensure_backup_dr_validate_importable()
         from services.error_codes import AppError, ErrorCodes
 
+        store = await _fresh_store()
         cap = _build_valid_capability(mod, payload_digest="d" * 64)
         now = time.time()
-        # 第一次调用 — 成功(nonce 进入 _CONSUMED_NONCES)
-        cap.assert_valid(
+        # 第一次调用 — 成功(nonce 原子消费到 DB)
+        await cap.assert_valid(
             payload_digest="d" * 64,
             clock=now,
             expected_scope="R62-P0-01-test-fingerprint",
+            store=store,
         )
         # 第二次调用同一 capability — 应抛 AppError(防重放)
         with pytest.raises(AppError) as exc_info:
-            cap.assert_valid(
+            await cap.assert_valid(
                 payload_digest="d" * 64,
                 clock=now,
                 expected_scope="R62-P0-01-test-fingerprint",
+                store=store,
             )
         assert exc_info.value.code == ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED
 
-    def test_mismatched_payload_digest_raises(self):
+    @pytest.mark.asyncio
+    async def test_mismatched_payload_digest_raises(self):
         """用例 4: payload_digest 与 capability 内嵌 digest 不匹配抛 AppError。"""
         mod = _ensure_backup_dr_validate_importable()
         from services.error_codes import AppError, ErrorCodes
 
+        store = await _fresh_store()
         # capability 内嵌 digest="d"*64
         cap = _build_valid_capability(mod, payload_digest="d" * 64)
         with pytest.raises(AppError) as exc_info:
             # 调用方传入不同的 digest(说明 payload 被替换/篡改)
-            cap.assert_valid(
+            await cap.assert_valid(
                 payload_digest="e" * 64,  # 不匹配
                 clock=time.time(),
                 expected_scope="R62-P0-01-test-fingerprint",
+                store=store,
             )
         assert exc_info.value.code == ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED
 
-    def test_scope_mismatch_raises(self):
+    @pytest.mark.asyncio
+    async def test_scope_mismatch_raises(self):
         """附加: expected_scope 与 capability.schema_fingerprint 不匹配抛 AppError。"""
         mod = _ensure_backup_dr_validate_importable()
         from services.error_codes import AppError, ErrorCodes
 
+        store = await _fresh_store()
         cap = _build_valid_capability(
             mod, payload_digest="d" * 64,
             schema_fingerprint="correct_scope_v1",
         )
         with pytest.raises(AppError) as exc_info:
-            cap.assert_valid(
+            await cap.assert_valid(
                 payload_digest="d" * 64,
                 clock=time.time(),
                 expected_scope="wrong_scope_v2",  # 不匹配
+                store=store,
             )
         assert exc_info.value.code == ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED
 
@@ -592,8 +616,8 @@ class TestStrictValidationRejectsTampering:
     """用例 7: 篡改 manifest/payload/ciphertext/plaintext/key-id 均在写入前失败。"""
 
     def setup_method(self):
-        mod = _ensure_backup_dr_validate_importable()
-        mod._CONSUMED_NONCES.clear()
+        """R63 P1-01: nonce 已持久化到 DB,无需进程内清理。"""
+        _ensure_backup_dr_validate_importable()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -691,12 +715,18 @@ class TestStrictValidationRejectsTampering:
 
 class TestRunRestoreFailsOnLegacyFormat:
     """用例 8: run_restore() 检测到旧格式备份时直接失败,
-    不再通过 skip_strict_validation 绕过验证。"""
+    不再通过 skip_strict_validation 绕过验证。
+
+    R63 P0-06: run_restore 改为接受 backup_id 参数,从 COMPLETE marker 发现备份。
+    旧格式备份(无 COMPLETE marker)在 strict service 内自然 fail-closed。
+    本测试更新为:传入 backup_id,Mock R2 返回 None(COMPLETE marker 不存在),
+    验证 run_restore 以 AppError 失败且日志指向离线导入/迁移工具。
+    """
 
     @pytest.mark.asyncio
     async def test_run_restore_old_format_fails(self, monkeypatch, caplog):
-        """run_restore() 下载旧格式 db_backup_*.json 后,必须以 AppError 失败,
-        错误消息明确指向离线导入/迁移工具。"""
+        """run_restore(backup_id=...) 在无 COMPLETE marker(旧格式备份特征)时
+        必须以 AppError 失败,错误消息明确指向离线导入/迁移工具。"""
         _ensure_restore_module_importable()
         from services import db_restore
         from services.error_codes import AppError, ErrorCodes
@@ -709,25 +739,15 @@ class TestRunRestoreFailsOnLegacyFormat:
             format="{message}",
         )
 
-        # 旧格式备份:单个 db_backup_*.json 文件,内嵌 manifest(无三段式)
-        legacy_backup = {
-            "backup_time": "2026-07-18T12:00:00Z",
-            "tables": {"users": [{"user_id": 1}]},
-            "manifest": {  # 内嵌 manifest — 旧格式特征
-                "schema_version": "legacy_v1",
-            },
-        }
-
-        # Mock get_latest_backup 返回旧格式备份
-        async def _fake_get_latest():
-            return legacy_backup
-        monkeypatch.setattr(db_restore, "get_latest_backup", _fake_get_latest)
-
-        # Mock R2 配置(configure 同步,connect 异步 → 用 AsyncMock)
+        # R63 P0-06: 不再 mock get_latest_backup(已从 run_restore 移除)
+        # 旧格式备份特征:R2 上无 COMPLETE_{backup_id}_full.COMPLETE marker
+        # Mock R2 配置 + download 返回 None(模拟旧格式备份无 COMPLETE marker)
         mock_r2 = MagicMock()
         mock_r2._access_key = "fake"
         mock_r2.configure = MagicMock(return_value=None)
         mock_r2.connect = AsyncMock(return_value=None)
+        mock_r2.close = AsyncMock(return_value=None)
+        mock_r2.download = AsyncMock(return_value=None)  # COMPLETE marker 不存在
         monkeypatch.setattr(db_restore, "r2_storage", mock_r2)
 
         # Mock settings(已在 conftest 中注入)
@@ -737,10 +757,23 @@ class TestRunRestoreFailsOnLegacyFormat:
         monkeypatch.setattr(_settings, "R2_SECRET_ACCESS_KEY", "fake_sk")
         monkeypatch.setattr(_settings, "R2_BUCKET_NAME", "fake_bucket")
         monkeypatch.setattr(_settings, "R2_ENDPOINT", "")
+        # R63 P0-06: 需配置 BACKUP_SIGNING_KEY 与 BACKUP_KEK 才能进入 strict service
+        monkeypatch.setattr(_settings, "BACKUP_SIGNING_KEY", b"fake_signing_key")
+        monkeypatch.setattr(_settings, "BACKUP_KEK", "fake_kek_for_test")
 
-        # 调用 run_restore — 应抛 AppError
+        # Mock decryptor(避免因 BACKUP_KEK 格式问题失败)
+        from unittest.mock import MagicMock as _MM
+        mock_decryptor = _MM()
+        mock_decryptor.decrypt = lambda ct, aad=None: b'{"tables": {}}'
+        monkeypatch.setattr(db_restore, "_build_cli_decryptor", lambda: mock_decryptor)
+
+        # R63 P0-06: 调用 run_restore 必须传入 backup_id
         with pytest.raises(AppError) as exc_info:
-            await db_restore.run_restore(table=None, dry_run=True)
+            await db_restore.run_restore(
+                backup_id="20260718_120000",
+                table=None,
+                dry_run=True,
+            )
 
         # 错误码:信任链失败(无法在不通过严格验证的情况下恢复)
         assert exc_info.value.code == ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED
@@ -751,6 +784,27 @@ class TestRunRestoreFailsOnLegacyFormat:
         assert (
             "迁移" in log_text or "migration" in log_text.lower() or "离线" in log_text
         ), f"日志应指向离线导入/迁移工具,实际日志: {log_text}"
+
+    @pytest.mark.asyncio
+    async def test_run_restore_without_backup_id_fails(self, monkeypatch):
+        """R63 P0-06: run_restore 不传 backup_id 必须以 AppError 失败。"""
+        _ensure_restore_module_importable()
+        from services import db_restore
+        from services.error_codes import AppError, ErrorCodes
+
+        # Mock R2(不应被调用)
+        mock_r2 = MagicMock()
+        mock_r2.configure = MagicMock(return_value=None)
+        mock_r2.connect = AsyncMock(return_value=None)
+        monkeypatch.setattr(db_restore, "r2_storage", mock_r2)
+
+        from config import settings as _settings
+        monkeypatch.setattr(_settings, "R2_ACCOUNT_ID", "fake_account")
+
+        with pytest.raises(AppError) as exc_info:
+            await db_restore.run_restore(backup_id=None, dry_run=True)
+
+        assert exc_info.value.code == ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED
 
     @pytest.mark.asyncio
     async def test_db_backup_restore_from_backup_old_format_fails(self, monkeypatch):
@@ -789,8 +843,8 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
     不再从 data.get("tables", {}) 读取。"""
 
     def setup_method(self):
-        mod = _ensure_backup_dr_validate_importable()
-        mod._CONSUMED_NONCES.clear()
+        """R63 P1-01: nonce 已持久化到 DB,无需进程内清理。"""
+        _ensure_backup_dr_validate_importable()
 
     @pytest.mark.asyncio
     async def test_reads_from_verified_payload_tables(self, monkeypatch):
@@ -800,6 +854,13 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
         from services.db_restore import _restore_from_backup_data
         mod = _ensure_backup_dr_validate_importable()
         from unittest.mock import patch
+
+        # R63 P1-01: _restore_from_backup_data 内部调用 assert_valid(无 store= 参数),
+        # assert_valid 会通过 get_cache_store() 获取单例。注入真实 CacheStore(临时 DB)
+        # 以完成 nonce 原子消费,否则未初始化的单例会令 consume 返回 False → AppError。
+        store = await _fresh_store()
+        import database.cache_store as _cs_mod
+        monkeypatch.setattr(_cs_mod, "get_cache_store", lambda: store)
 
         # verified_payload.tables 包含真实数据
         # payload(dict) 中的 tables 字段被故意留空,验证写入器不读取 payload
@@ -834,8 +895,11 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
             )
 
         # 验证:users 表(来自 verified_payload.tables)被传给 CRDB 恢复
+        # R63 P0-02: tables 已深冻结(tuple of MappingProxyType),用 _to_serializable 还原后比较
         assert "users" in captured["crdb_tables"]
-        assert captured["crdb_tables"]["users"] == [{"user_id": 1, "username": "test"}]
+        from services.backup_dr_validate import _to_serializable
+        users_data = _to_serializable(captured["crdb_tables"]["users"])
+        assert users_data == [{"user_id": 1, "username": "test"}]
 
     @pytest.mark.asyncio
     async def test_capability_assert_valid_is_first_statement(self, monkeypatch):

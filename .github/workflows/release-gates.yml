@@ -461,6 +461,9 @@ jobs:
     # R58 P0-1: cosign sign 已 push 的镜像 digest (不重新构建)
     # R60 P0-06: 增加 OIDC/GHCR/cosign 诊断信息(不添加 continue-on-error,
     #             签名失败必须阻断,诊断信息用于定位根因)
+    # R63 P0-01: 使用 --output-certificate 保存 Fulcio cert 到本地,
+    #            后续 verify 步骤从 cert 提取实际 SAN (source of truth) 做精确匹配,
+    #            而非依赖 github.ref 拼接字符串(可能与 Fulcio SAN 不一致导致 verify 失败)。
     - name: Sign OCI image with cosign (keyless, by digest)
       run: |
         IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
@@ -478,34 +481,81 @@ jobs:
           echo "::error::OIDC token endpoint not available — id-token: write permission required for keyless signing"
           exit 1
         fi
-        cosign sign --yes "${IMAGE_REF}"
+        # R63 P0-01: --output-certificate 保存 Fulcio cert 到本地文件,
+        # 后续步骤从 cert 提取实际 SAN 作为 verify 的 certificate-identity
+        # (signed-with == verified-with,消除拼接字符串不匹配的根因)
+        cosign sign --yes \
+          --output-certificate image-signing-cert.pem \
+          "${IMAGE_REF}"
+        # 校验 cert 已写入(非空文件)
+        if [ ! -s image-signing-cert.pem ]; then
+          echo "::error::cosign sign 未输出 Fulcio 证书到 image-signing-cert.pem"
+          echo "  R63 P0-01: 无法提取 certificate-identity,拒绝继续"
+          exit 1
+        fi
+        echo "Image signed and Fulcio certificate saved to image-signing-cert.pem"
+        echo "  cert sha256: $(sha256sum image-signing-cert.pem | awk '{print $1}')"
       env:
         COSIGN_EXPERIMENTAL: 1
 
+    # R63 P0-01: 从实际 Fulcio cert 提取 certificate-identity (SAN URI)
+    #   根治 P0-01: 旧实现用 github.ref 拼接 identity 字符串做精确匹配,
+    #   但实际 Fulcio cert SAN 可能与拼接结果存在细微差异(ref 形式/大小写/编码),
+    #   导致 cosign verify 失败 → 后续所有步骤被 skipped (供应链断裂)。
+    #   新实现直接从 cert 读取 SAN,确保 sign 和 verify 使用同一 identity。
+    - name: Extract certificate identity from Fulcio cert (image signing)
+      id: extract_image_identity
+      run: |
+        set -euo pipefail
+        CERT_FILE="image-signing-cert.pem"
+        echo "R63 P0-01: Extracting certificate-identity (SAN URI) from Fulcio cert"
+        # Fulcio cert 的 subjectAltName 扩展包含 URI:https://github.com/<owner>/<repo>/.github/workflows/<wf>@<ref>
+        SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)
+        echo "  cert subjectAltName: ${SAN_LINE}"
+        # 提取 URI:xxx 字段(可能有多个 SAN,取第一个 URI)
+        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://')
+        if [ -z "${CERT_IDENTITY}" ]; then
+          echo "::error::无法从 Fulcio cert 提取 SAN URI (certificate-identity)"
+          echo "  R63 P0-01: 拒绝 fallback 到拼接字符串 — 必须使用实际 cert 中的 identity"
+          echo "  cert file: ${CERT_FILE}"
+          echo "  subjectAltName raw: ${SAN_LINE}"
+          echo "  cert dump (first 80 lines):"
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80
+          exit 1
+        fi
+        echo "  extracted certificate-identity: ${CERT_IDENTITY}"
+        # 校验 identity 形态:必须是本仓库 release-gates.yml 工作流
+        # (防止 cert 被替换为其他工作流的签名)
+        if ! echo "${CERT_IDENTITY}" | grep -qE '^https://github\.com/[^/]+/[^/]+/\.github/workflows/release-gates\.yml@'; then
+          echo "::error::certificate-identity 形态不符合预期(应为 https://github.com/<owner>/<repo>/.github/workflows/release-gates.yml@<ref>)"
+          echo "  extracted: ${CERT_IDENTITY}"
+          echo "  R63 P0-01: 拒绝使用其他工作流的签名 — 跨工作流伪造防护"
+          exit 1
+        fi
+        echo "  PASS: certificate-identity 形态校验通过"
+        echo "certificate_identity=${CERT_IDENTITY}" >> "$GITHUB_OUTPUT"
+
     # R58 P0-1: cosign verify 生成签名 verification statement (JSON)
     #           每次 release 都必须输出 verification statement 作为证据
-    # R62 P0-03: 修复证书 identity 钉扎:
-    #   - 旧实现 --certificate-identity-regexp "https://github.com/${repo}/.github/.+"
-    #     存在两个问题:① 正则点未转义(github.com / .github 的 "." 匹配任意字符);
-    #     ② 过于宽泛(匹配 .github/ 下任意路径,不限 workflows/release-gates.yml)。
-    #   - 新实现使用 --certificate-identity(精确匹配,非正则),钉扎到:
-    #     https://github.com/{repo}/.github/workflows/release-gates.yml@{ref}
-    #     确保签名和验证使用同一 identity 语义,防止跨工作流伪造。
+    # R62 P0-03: 修复证书 identity 钉扎(精确匹配,非正则)
+    # R63 P0-01: 进一步根治 — 从实际 Fulcio cert 提取 SAN 作为 verify 的 identity,
+    #            消除拼接字符串不匹配根因。verification statement 作为后续强依赖输入。
     - name: Verify image signature (output verification statement)
       run: |
         IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
-        CERT_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
+        CERT_IDENTITY="${{ steps.extract_image_identity.outputs.certificate_identity }}"
         echo "=== R58 P0-1: 签名 Verification Statement ==="
-        echo "R62 P0-03: certificate-identity (exact, no regexp): ${CERT_IDENTITY}"
+        echo "R63 P0-01: certificate-identity (extracted from actual Fulcio cert): ${CERT_IDENTITY}"
         # --output-verification 需要文件路径, cosign 会写入 verification record
-        # R62 P0-03: fail-fast — cosign verify 失败立即 exit 1,不允许 continue-on-error
+        # R62 P0-03 / R63 P0-01: fail-fast — cosign verify 失败立即 exit 1,
+        #                       不允许 continue-on-error;后续步骤依赖此 statement
         cosign verify \
           --certificate-identity "${CERT_IDENTITY}" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
           --output-verification statement.json \
           "${IMAGE_REF}" || {
             echo "FAIL: cosign verify 失败,签名无效"
-            echo "  expected certificate-identity: ${CERT_IDENTITY}"
+            echo "  extracted certificate-identity: ${CERT_IDENTITY}"
             echo "  expected issuer: https://token.actions.githubusercontent.com"
             exit 1
           }
@@ -560,6 +610,8 @@ jobs:
     #   manifest 是 migration 完整性的 trust anchor — 必须独立签名,
     #   防止代码和 manifest 被同步篡改。签名材料与镜像 attestation 绑定同一 release digest。
     #   验证时钉扎 certificate_identity 到本仓库的 release-gates.yml 工作流 + OIDC issuer。
+    # R63 P0-04: manifest 必须与当前 release HEAD/Tree 严格绑定(不允许祖先兼容),
+    #            且必须枚举全部 migration(磁盘集合 == manifest 集合)。
     - name: Sign migration manifest with cosign (keyless, detached)
       run: |
         set -euo pipefail
@@ -575,20 +627,65 @@ jobs:
           --output-certificate migration-manifest.json.pem \
           --output-signature migration-manifest.json.sig \
           "${MANIFEST}"
+        # R63 P0-04: 校验签名产物已生成(后续 verify 步骤依赖此文件)
+        if [ ! -s migration-manifest.json.pem ] || [ ! -s migration-manifest.json.sig ]; then
+          echo "::error::cosign sign-blob 未输出 certificate/signature"
+          echo "  R63 P0-04: 拒绝继续 — manifest 签名产物缺失"
+          exit 1
+        fi
         echo "Migration manifest signed successfully"
+        echo "  cert sha256: $(sha256sum migration-manifest.json.pem | awk '{print $1}')"
+        echo "  sig  sha256: $(sha256sum migration-manifest.json.sig | awk '{print $1}')"
       env:
         COSIGN_EXPERIMENTAL: 1
 
+    # R63 P0-01: 从 migration manifest 的 Fulcio cert 提取 certificate-identity (SAN URI)
+    #   与 image signing 一致 — 从实际 cert 读取 SAN,而非 github.ref 拼接,
+    #   消除 verify 失败导致后续步骤被 skipped 的根因。
+    - name: Extract certificate identity from Fulcio cert (manifest signing)
+      id: extract_manifest_identity
+      run: |
+        set -euo pipefail
+        CERT_FILE="migration-manifest.json.pem"
+        if [ ! -s "${CERT_FILE}" ]; then
+          echo "::error::migration manifest cert file missing or empty: ${CERT_FILE}"
+          echo "  R63 P0-01: 无法提取 certificate-identity,拒绝继续"
+          exit 1
+        fi
+        echo "R63 P0-01: Extracting certificate-identity (SAN URI) from manifest Fulcio cert"
+        SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)
+        echo "  cert subjectAltName: ${SAN_LINE}"
+        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://')
+        if [ -z "${CERT_IDENTITY}" ]; then
+          echo "::error::无法从 manifest Fulcio cert 提取 SAN URI"
+          echo "  cert file: ${CERT_FILE}"
+          echo "  subjectAltName raw: ${SAN_LINE}"
+          echo "  cert dump (first 80 lines):"
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80
+          exit 1
+        fi
+        echo "  extracted certificate-identity: ${CERT_IDENTITY}"
+        # 形态校验:必须是本仓库 release-gates.yml 工作流
+        if ! echo "${CERT_IDENTITY}" | grep -qE '^https://github\.com/[^/]+/[^/]+/\.github/workflows/release-gates\.yml@'; then
+          echo "::error::manifest certificate-identity 形态不符合预期"
+          echo "  extracted: ${CERT_IDENTITY}"
+          echo "  R63 P0-01: 拒绝使用其他工作流的签名 — 跨工作流伪造防护"
+          exit 1
+        fi
+        echo "  PASS: certificate-identity 形态校验通过"
+        echo "certificate_identity=${CERT_IDENTITY}" >> "$GITHUB_OUTPUT"
+
     # R62 P1-02: 验证 migration manifest 签名 (fail-fast)
-    #   钉扎 certificate_identity 到本仓库 release-gates.yml 工作流 + 当前 ref,
-    #   防止跨仓库/跨工作流伪造签名。验证失败立即 exit 1。
+    # R63 P0-01: 使用从 Fulcio cert 提取的实际 SAN (而非 github.ref 拼接)
+    #            钉扎 certificate_identity 到本仓库 release-gates.yml 工作流 + OIDC issuer,
+    #            防止跨仓库/跨工作流伪造签名。验证失败立即 exit 1。
     - name: Verify migration manifest signature
       run: |
         set -euo pipefail
         MANIFEST="database/migrations/migration-manifest.json"
-        CERT_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
-        echo "R62 P1-02: Verifying migration manifest signature"
-        echo "  expected certificate-identity: ${CERT_IDENTITY}"
+        CERT_IDENTITY="${{ steps.extract_manifest_identity.outputs.certificate_identity }}"
+        echo "R62 P1-02 / R63 P0-01: Verifying migration manifest signature"
+        echo "  extracted certificate-identity: ${CERT_IDENTITY}"
         echo "  expected issuer: https://token.actions.githubusercontent.com"
         cosign verify-blob \
           --certificate-identity "${CERT_IDENTITY}" \
@@ -597,31 +694,48 @@ jobs:
           --signature migration-manifest.json.sig \
           "${MANIFEST}" || {
             echo "FAIL: migration manifest signature verification failed"
-            echo "  R62 P1-02: manifest 签名无效 — 拒绝发布(代码与 manifest 可能被篡改)"
+            echo "  R62 P1-02 / R63 P0-04: manifest 签名无效 — 拒绝发布(代码与 manifest 可能被篡改)"
             exit 1
           }
         echo "PASS: migration manifest signature verified"
 
-    # R62 P1-02: 验证 manifest 绑定的 release_commit 是当前 HEAD 的祖先(或当前 HEAD)
-    #   防止 manifest 绑定到过期/无关的 commit
+    # R62 P1-02 / R63 P0-04: 验证 manifest 绑定的 release_commit / tree_sha 与当前 HEAD 严格一致
+    #   旧实现只要求 release_commit 是 HEAD 的祖先(允许 manifest 落后于 HEAD),
+    #   但 R63 P0-04 要求 manifest 与当前 release 严格绑定(release_commit == HEAD, tree_sha == HEAD Tree)。
+    #   manifest 落后于 HEAD → 说明 manifest 未随本次 release 重新生成,拒绝发布。
     - name: Verify migration manifest release_commit binding
       run: |
         set -euo pipefail
         MANIFEST="database/migrations/migration-manifest.json"
+        # 从 manifest 提取 release_commit / tree_sha
         RELEASE_COMMIT=$(python3 -c "import json; print(json.load(open('${MANIFEST}'))['release_commit'])")
+        MANIFEST_TREE=$(python3 -c "import json; print(json.load(open('${MANIFEST}'))['tree_sha'])")
         HEAD_SHA="${{ github.sha }}"
-        echo "R62 P1-02: Verifying manifest release_commit binding"
+        # R63 P0-04: 获取当前 HEAD 的 Tree SHA(与 manifest 的 tree_sha 比对)
+        HEAD_TREE=$(git rev-parse "${HEAD_SHA}^{tree}")
+        echo "R62 P1-02 / R63 P0-04: Verifying manifest release_commit + tree_sha binding"
         echo "  manifest release_commit: ${RELEASE_COMMIT}"
-        echo "  current HEAD: ${HEAD_SHA}"
-        # release_commit 必须是当前 HEAD 的祖先(或等于 HEAD)
-        if git merge-base --is-ancestor "${RELEASE_COMMIT}" "${HEAD_SHA}" 2>/dev/null \
-           || [ "${RELEASE_COMMIT}" = "${HEAD_SHA}" ]; then
-          echo "PASS: manifest release_commit is ancestor of (or equal to) HEAD"
-        else
-          echo "FAIL: manifest release_commit ${RELEASE_COMMIT} is not an ancestor of HEAD ${HEAD_SHA}"
-          echo "  R62 P1-02: manifest 绑定的 commit 与当前 HEAD 无关 — 可能是旧 manifest 或篡改"
+        echo "  manifest tree_sha:      ${MANIFEST_TREE}"
+        echo "  current HEAD:           ${HEAD_SHA}"
+        echo "  current HEAD Tree:      ${HEAD_TREE}"
+        # R63 P0-04: release_commit 必须严格等于当前 HEAD (不再允许祖先兼容)
+        if [ "${RELEASE_COMMIT}" != "${HEAD_SHA}" ]; then
+          echo "FAIL: manifest release_commit != HEAD"
+          echo "  manifest: ${RELEASE_COMMIT}"
+          echo "  HEAD:      ${HEAD_SHA}"
+          echo "  R63 P0-04: manifest 与当前 release 不一致 — 必须重新生成 manifest 并重新签名"
           exit 1
         fi
+        echo "  PASS: release_commit == HEAD"
+        # R63 P0-04: tree_sha 必须严格等于当前 HEAD Tree
+        if [ "${MANIFEST_TREE}" != "${HEAD_TREE}" ]; then
+          echo "FAIL: manifest tree_sha != HEAD Tree"
+          echo "  manifest: ${MANIFEST_TREE}"
+          echo "  HEAD Tree: ${HEAD_TREE}"
+          echo "  R63 P0-04: manifest tree_sha 与当前 release 不一致 — 必须重新生成 manifest"
+          exit 1
+        fi
+        echo "  PASS: tree_sha == HEAD Tree"
         # 验证每个 migration 的 sha256 与磁盘文件一致
         python3 -c "
         import json, hashlib, sys
@@ -646,6 +760,8 @@ jobs:
 
     # R60 P0-06: 仅在签名/verify/provenance 全部成功时上传(原 if: always()
     #             会在签名失败时仍上传部分/空 artifact,掩盖供应链断裂)
+    # R63 P0-01: 上传 image-signing-cert.pem — publish-attestation 复用此 cert
+    #            提取实际 SAN 做精确 verify (跨 job 共享 cert,避免重复构造 identity)
     - name: Upload signed artifacts
       if: success()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -653,6 +769,7 @@ jobs:
         name: release-gates-signed-${{ github.sha }}
         path: |
           statement.json
+          image-signing-cert.pem
           tgjiema-${{ github.sha }}.tar.gz
           tgjiema-${{ github.sha }}.tar.gz.sha256
           tgjiema-${{ github.sha }}.pem
@@ -1279,6 +1396,49 @@ jobs:
       with:
         cosign-release: 'v2.2.3'
 
+    # R63 P0-01: 下载 sign-image job 上传的签名制品 (含 image-signing-cert.pem)
+    #   publish-attestation 复用此 cert 提取实际 SAN 做 verify,
+    #   与 sign-image verify 步骤使用同一 identity (signed-with == verified-with)
+    - name: Download signed artifacts (for cert reuse)
+      uses: actions/download-artifact@6b208ae046dbac8e1c0c80b5cfccb6c91f8b72b7
+      with:
+        name: release-gates-signed-${{ github.sha }}
+
+    # R63 P0-01: 从 sign-image 上传的 Fulcio cert 提取 certificate-identity (SAN URI)
+    #   publish-attestation 无 OIDC keyless 上下文,无法直接重新签名;
+    #   复用 sign-image 的 cert (已上传 artifact) 提取 SAN,确保 verify identity 与签名一致
+    - name: Extract certificate identity from Fulcio cert (production promote)
+      id: extract_prod_identity
+      run: |
+        set -euo pipefail
+        CERT_FILE="image-signing-cert.pem"
+        if [ ! -s "${CERT_FILE}" ]; then
+          echo "::error::image-signing-cert.pem 缺失或为空(sign-image artifact 未下载或签名失败)"
+          echo "  R63 P0-01: 拒绝继续 — 无法提取 certificate-identity"
+          exit 1
+        fi
+        echo "R63 P0-01: Extracting certificate-identity (SAN URI) from sign-image Fulcio cert"
+        SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)
+        echo "  cert subjectAltName: ${SAN_LINE}"
+        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://')
+        if [ -z "${CERT_IDENTITY}" ]; then
+          echo "::error::无法从 sign-image Fulcio cert 提取 SAN URI"
+          echo "  cert file: ${CERT_FILE}"
+          echo "  subjectAltName raw: ${SAN_LINE}"
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80
+          exit 1
+        fi
+        echo "  extracted certificate-identity: ${CERT_IDENTITY}"
+        # 形态校验:必须是本仓库 release-gates.yml 工作流
+        if ! echo "${CERT_IDENTITY}" | grep -qE '^https://github\.com/[^/]+/[^/]+/\.github/workflows/release-gates\.yml@'; then
+          echo "::error::production verify certificate-identity 形态不符合预期"
+          echo "  extracted: ${CERT_IDENTITY}"
+          echo "  R63 P0-01: 拒绝使用其他工作流的签名 — 跨工作流伪造防护"
+          exit 1
+        fi
+        echo "  PASS: certificate-identity 形态校验通过"
+        echo "certificate_identity=${CERT_IDENTITY}" >> "$GITHUB_OUTPUT"
+
     - name: cosign verify image digest (production promote only signed digest)
       env:
         COSIGN_EXPERIMENTAL: 1
@@ -1293,14 +1453,15 @@ jobs:
           exit 1
         fi
         IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
-        # R62 P0-03: 使用精确 certificate-identity(非 regexp),钉扎到本工作流文件 + 当前 ref
-        CERT_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
+        # R63 P0-01: 使用从 sign-image Fulcio cert 提取的实际 SAN (而非 github.ref 拼接)
+        #            确保与签名步骤使用同一 identity (signed-with == verified-with)
+        CERT_IDENTITY="${{ steps.extract_prod_identity.outputs.certificate_identity }}"
         echo "Verifying signed digest: ${IMAGE_REF}"
-        echo "R62 P0-03: certificate-identity (exact): ${CERT_IDENTITY}"
+        echo "R63 P0-01: certificate-identity (extracted from sign-image Fulcio cert): ${CERT_IDENTITY}"
 
         # R58 P0-1: cosign verify 拒绝未签名 digest
         # 若签名无效或缺失, 拒绝 promote 到 production
-        # R62 P0-03: 输出 verification statement 作为 production promote 证据
+        # R62 P0-03 / R63 P0-01: 输出 verification statement 作为 production promote 证据
         cosign verify \
           --certificate-identity "${CERT_IDENTITY}" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
@@ -1308,12 +1469,12 @@ jobs:
           "${IMAGE_REF}" || {
             echo "FAIL: cosign verify 失败"
             echo "  R58 P0-1: production promote 只提升已验证 digest"
-            echo "  R62 P0-03: expected certificate-identity: ${CERT_IDENTITY}"
+            echo "  R63 P0-01: extracted certificate-identity: ${CERT_IDENTITY}"
             echo "  拒绝 promote 未签名/签名无效的 image_digest 到 production"
             exit 1
           }
         echo "PASS: image digest 已通过签名验证, 可 promote 到 production"
-        echo "R62 P0-03: production verification statement:"
+        echo "R63 P0-01: production verification statement:"
         cat production_verify_statement.json
 
     - name: Generate release_attestation.json (6 digest binding)

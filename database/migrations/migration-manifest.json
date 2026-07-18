@@ -1,9 +1,9 @@
 {
   "version": 2,
-  "release_commit": "17241a88026aaeca47aae65d917d50bb1c388ebc",
-  "tree_sha": "6c9d98979c16c21e2960d10c0d17df6e4671599e",
+  "release_commit": "5d3f66549cd9833351eb1d3319e95b7adfdd0eb7",
+  "tree_sha": "b165e11e5bf63bdf832c06a5fed68f1b7bdc78c6",
   "tool_version": "DDL_VERSION=11",
-  "description": "R62 P1-02: Signed migration manifest — trust anchor for migration integrity. The manifest binds release_commit, tree_sha, per-migration sha256, migration order, and tool version. CI signs the canonical manifest with cosign keyless (Sigstore) and verifies the certificate identity/issuer before any deployment or migration execution. The signature is a detached .sig file alongside the manifest; the manifest itself contains the expected verification policy (certificate_identity + certificate_oidc_issuer). A tampered disk file whose sha256 does not match the manifest blocks startup (fail-closed).",
+  "description": "R62 P1-02 / R63 P0-04: Signed migration manifest — trust anchor for migration integrity. The manifest binds release_commit, tree_sha, per-migration sha256, migration order, and tool version. CI signs the canonical manifest with cosign keyless (Sigstore) and verifies the certificate identity/issuer before any deployment or migration execution. The signature is a detached .sig file alongside the manifest; the manifest itself contains the expected verification policy (certificate_identity + certificate_oidc_issuer). A tampered disk file whose sha256 does not match the manifest blocks startup (fail-closed). R63 P0-04: release_commit/tree_sha regenerated from current HEAD; 004 migration enumerated; manifest must equal the on-disk migration set (no missing/extra entries).",
   "verification": {
     "certificate_identity_prefix": "https://github.com/maxiuquan/tgjiema/.github/workflows/release-gates.yml@",
     "certificate_oidc_issuer": "https://token.actions.githubusercontent.com",
@@ -36,6 +36,16 @@
       "schema_fingerprint_before": "DDL_VERSION=1",
       "schema_fingerprint_after": "DDL_VERSION=11",
       "r62_p1_03_note": "R62 P1-03: GLOB pattern fixed from '[0-9a-f]*' (first-char only) to NOT GLOB '*[^0-9a-f]*' (full 64-char hex validation). sha256 updated accordingly."
+    },
+    {
+      "order": 4,
+      "version": "004_effect_receipts_request_hash_unique.sql",
+      "sha256": "7bb4770b53518eefb8fb4f232355bf2227cfafcc46418e93c88f5cdccb939b9d",
+      "predecessor": "003_rebuild_command_approvals.sql",
+      "schema_fingerprint_before": "DDL_VERSION=11",
+      "schema_fingerprint_after": "DDL_VERSION=11",
+      "r62_p1_01_note": "R62 P1-01: Rebuild effect_receipts with UNIQUE(action_id, effect_type, target, request_hash) + CHECK (status IN pending/completed/failed/dlq). Quarantine table isolates rows with empty request_hash. Conservation assertion guards against data loss. DDL_VERSION unchanged (table rebuild, no schema version bump).",
+      "r63_p1_03_note": "R63 P1-03: Migration rebuilt with duplicates evidence table (effect_receipts_r62_duplicates) for full audit traceability of all original rows; conservation assertion upgraded to strict equality. sha256 reflects current on-disk content (re-computed after R63 P1-03 changes)."
     }
   ]
 }

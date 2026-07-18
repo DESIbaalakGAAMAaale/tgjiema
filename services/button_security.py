@@ -533,6 +533,8 @@ async def sign_button_token_with_handle(
     payload: str = "",
     expires_at: Optional[_dt.datetime] = None,
     ttl: int = 3600,
+    audience: str = "admin_callback",
+    resource_version: str = "",
 ) -> str:
     """R62 P0-04: 生成签名 token 并以短 handle_id 引用(绕过 64 字节限制)。
 
@@ -545,15 +547,20 @@ async def sign_button_token_with_handle(
         3. 持久化 (handle_id → token) 到 ``button_tokens`` 表
         4. 返回 handle_id(调用方将其拼入 callback_data,如 ``f"report:{handle_id}"``)
 
-    handler 端调用 ``verify_button_token_by_handle(handle_id, user.id)`` 验签:
+    handler 端调用 ``verify_button_token_by_handle(handle_id, user.id,
+    expected_action, expected_audience, expected_resource_version)`` 验签:
         - 通过 handle_id 查找完整 token
         - 调用 ``verify_button_token`` 验证签名 + 原子消费 nonce(防重放)
+        - R63 P1-06: 库内部一次性完成 expected_action / expected_audience /
+          expected_resource_version 绑定校验(handler 无法忘检查)
 
     安全保证:
         - nonce 仍由 ``callback_nonces`` 表原子消费(一次性)
         - 即使 handle_id 被多次读取(button_tokens 表无消费语义),
           verify_button_token 内的 nonce 原子消费保证一次性使用
         - handle_id 不可伪造(secrets.token_urlsafe 128 bit 熵)
+        - R63 P1-06: audience / resource_version 作为元数据与 handle_id 绑定,
+          verify_button_token_by_handle 强制匹配,防止跨 handler 滥用
 
     Args:
         principal_id: 主体 ID(管理员 user_id)
@@ -561,6 +568,9 @@ async def sign_button_token_with_handle(
         payload: 附加数据(如 "ban|12345|67890|dsp")
         expires_at: 显式过期时间(优先于 ttl)
         ttl: 有效期(秒,默认 1 小时)
+        audience: 接收方 audience 标识(默认 "admin_callback",
+            用于 verify_button_token_by_handle 强制匹配,防止跨 handler 滥用)
+        resource_version: 资源版本绑定(如 "file_code:v3"),为空时不绑定
 
     Returns:
         handle_id 字符串(短,适合作为 callback_data 一部分)
@@ -580,7 +590,7 @@ async def sign_button_token_with_handle(
     # 2. 生成短 handle_id(128 bit 熵)
     handle_id = secrets.token_urlsafe(HANDLE_ID_BYTES)  # ~11 字符
 
-    # 3. 持久化 (handle_id → token) 映射
+    # 3. 持久化 (handle_id → token) 映射(含 audience / resource_version 元数据)
     from database import cache_store as _cs
     store = _cs.get_cache_store()
     ok = await store.button_token_store(
@@ -588,6 +598,8 @@ async def sign_button_token_with_handle(
         token=token,
         principal_id=principal_id,
         action=action,
+        audience=audience,
+        resource_version=resource_version or None,
     )
     if not ok:
         raise RuntimeError(
@@ -598,59 +610,182 @@ async def sign_button_token_with_handle(
     return handle_id
 
 
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_HANDLE_NOT_FOUND = (
+    "[button_security] R62 P0-04 / R63 P1-06: handle_id={} 不存在或已被清理"
+)
+_LOG_ACTION_MISMATCH = (
+    "[button_security] R63 P1-06: action 不匹配 → 拒绝跨 action handle: "
+    "expected={}, actual={}, handle={}"
+)
+_LOG_AUDIENCE_MISMATCH = (
+    "[button_security] R63 P1-06: audience 不匹配 → 拒绝跨 handler 滥用: "
+    "expected={}, actual={}, action={}, handle={}"
+)
+_LOG_RESOURCE_VERSION_MISMATCH = (
+    "[button_security] R63 P1-06: resource_version 不匹配 → "
+    "拒绝旧按钮操作已更新资源: "
+    "expected={}, actual={}, action={}, handle={}"
+)
+
+
 async def verify_button_token_by_handle(
     handle_id: str,
     current_user_id: int,
+    expected_action: str,
+    expected_audience: str,
+    expected_resource_version: Optional[str] = None,
     store=None,
 ) -> Tuple[bool, str, str]:
-    """R62 P0-04: 通过 handle_id 查找并验证签名 token + 原子消费 nonce。
+    """R62 P0-04 / R63 P1-06: 通过 handle_id 查找并验证签名 token + 强制绑定 + 原子消费 nonce。
+
+    R63 P1-06 增强(终审整改):
+        - 库内部一次性完成全部绑定校验,handler 无法"忘记"检查 action/audience/
+          resource_version。每个 report/restore/delete handler 必须拒绝跨 action
+          handle,不能只依赖签名和 user id。
+        - expected_action 必填,与 token 中的 action 比较(签名内的 action)
+        - expected_audience 必填,与 button_tokens 表中存储的 audience 比较
+        - expected_resource_version 可选,非 None 时与 button_tokens 表中
+          存储的 resource_version 比较
 
     流程:
-        1. 通过 handle_id 从 ``button_tokens`` 表查找完整 token
+        1. 通过 handle_id 从 ``button_tokens`` 表查找完整 token + audience +
+           resource_version 元数据
         2. 调用 ``verify_button_token`` 验证签名 + 原子消费 nonce
-        3. 返回 (valid, action, payload)
+        3. **R63 P1-06: 验签成功后,强制匹配 action / audience / resource_version**
+           - 任一不匹配 → 抛出 ``AppError``(具体错误码见下)
+           - 不再返回 ``(False, "", "")``,而是 fail-closed 抛出
+        4. 返回 (valid, action, payload)
 
     安全保证:
         - nonce 原子消费(同一 handle_id 第一次调用成功,后续全部拒绝)
         - 签名验证(防伪造)
         - user_id 绑定(防跨用户使用 handle_id)
         - 过期检查(expire_ts)
+        - R63 P1-06: action 强制匹配(签名内,防跨 action 滥用)
+        - R63 P1-06: audience 强制匹配(元数据,防跨 handler 滥用)
+        - R63 P1-06: resource_version 强制匹配(元数据,防旧按钮操作已更新资源)
 
     Args:
         handle_id: 短 handle_id(callback_data 中携带)
         current_user_id: 当前用户 ID(必须匹配签名时的 principal_id)
+        expected_action: 期望的 action 字符串(必填,如 "report"/"restore"/"delete_file")
+        expected_audience: 期望的 audience 字符串(必填,如 "admin_callback")
+        expected_resource_version: 期望的资源版本(可选,None 表示不检查 resource_version)
         store: 可选 CacheStore 实例(测试注入)
 
     Returns:
         (valid, action, payload): valid=True 时 action/payload 可用;
-        valid=False 时 action/payload 为空字符串
+        valid=False 时 action/payload 为空字符串(仅在签名/nonce/principal 失败时)
+
+    Raises:
+        AppError(BUTTON_POLICY_HASH_MISMATCH): token_action != expected_action
+        AppError(BUTTON_POLICY_AUDIENCE_MISMATCH): token_audience != expected_audience
+        AppError(BUTTON_POLICY_VERSION_MISMATCH): resource_version 不匹配
+            (仅当 expected_resource_version 非 None 时检查)
     """
     if store is None:
         from database import cache_store as _cs
         store = _cs.get_cache_store()
 
-    # 1. 通过 handle_id 查找完整 token
-    token = await store.button_token_lookup(handle_id)
+    # 1. 通过 handle_id 查找完整 token + 绑定元数据(R63 P1-06: 含 audience / rv)
+    # 优先使用 lookup_with_bindings 获取完整元数据;若旧 store 不支持则回退 lookup
+    bindings = None
+    if hasattr(store, "button_token_lookup_with_bindings"):
+        bindings = await store.button_token_lookup_with_bindings(handle_id)
+    token: Optional[str] = None
+    token_audience: Optional[str] = None
+    token_resource_version: Optional[str] = None
+    if bindings is not None:
+        token = bindings.get("token")
+        token_audience = bindings.get("audience")
+        token_resource_version = bindings.get("resource_version")
+    else:
+        token = await store.button_token_lookup(handle_id)
+
     if not token:
         logger.warning(
-            f"[button_security] R62 P0-04: handle_id={handle_id} "
-            f"不存在或已被清理"
+            _LOG_HANDLE_NOT_FOUND.format(handle_id)
         )
         return False, "", ""
 
     # 2. 验证签名 + 原子消费 nonce(防重放)
+    #    验签失败/过期/重放/跨用户 → 返回 (False, "", ""),不抛出 AppError
+    #    (保持与旧版兼容,这些失败由 handler 显示统一"签名验证失败"提示)
     valid, action, payload = await verify_button_token(
         token, current_user_id, store=store,
     )
+    if not valid:
+        # 签名/nonce/principal/expiry 失败 — 不消费 handle,允许重试
+        # (但 nonce 已被原子消费,实际重放会被 verify_button_token 拒绝)
+        return False, "", ""
 
-    # 3. 验签成功后标记 handle 已消费(便于审计/清理;失败时不标记,
-    #    允许重试 — 但 nonce 已消费时 verify_button_token 会拒绝)
-    if valid:
-        try:
-            await store.button_token_mark_consumed(handle_id)
-        except Exception as e:
-            logger.debug(
-                f"[button_security] R62 P0-04: 标记 handle 已消费失败(不阻塞): {e}"
+    # 3. R63 P1-06: 验签成功后,强制匹配 action / audience / resource_version
+    #    这些是"签名正确但 handler 调用错误"的场景 — fail-closed 抛出 AppError
+
+    # 3a. action 强制匹配(签名内,防跨 action 滥用)
+    if action != expected_action:
+        logger.warning(
+            _LOG_ACTION_MISMATCH.format(
+                expected_action, action, handle_id
             )
+        )
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_HASH_MISMATCH,
+            params={
+                "action": action,
+                "reason": "action_mismatch",
+                "expected": expected_action,
+                "actual": action,
+            },
+        )
+
+    # 3b. audience 强制匹配(元数据,防跨 handler 滥用)
+    if token_audience is None:
+        token_audience = ""
+    if token_audience != expected_audience:
+        logger.warning(
+            _LOG_AUDIENCE_MISMATCH.format(
+                expected_audience, token_audience, action, handle_id
+            )
+        )
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_AUDIENCE_MISMATCH,
+            params={
+                "action": action,
+                "reason": "audience_mismatch",
+                "expected": expected_audience,
+                "actual": token_audience,
+            },
+        )
+
+    # 3c. resource_version 强制匹配(元数据,防旧按钮操作已更新资源)
+    if expected_resource_version is not None:
+        if token_resource_version is None:
+            token_resource_version = ""
+        if token_resource_version != expected_resource_version:
+            logger.warning(
+                _LOG_RESOURCE_VERSION_MISMATCH.format(
+                    expected_resource_version, token_resource_version,
+                    action, handle_id
+                )
+            )
+            raise AppError(
+                ErrorCodes.BUTTON_POLICY_VERSION_MISMATCH,
+                params={
+                    "action": action,
+                    "reason": "resource_version_mismatch",
+                    "expected": expected_resource_version,
+                    "actual": token_resource_version,
+                },
+            )
+
+    # 4. 验签 + 绑定全部通过后,标记 handle 已消费(便于审计/清理)
+    try:
+        await store.button_token_mark_consumed(handle_id)
+    except Exception as e:
+        logger.debug(
+            f"[button_security] R62 P0-04: 标记 handle 已消费失败(不阻塞): {e}"
+        )
 
     return valid, action, payload

@@ -40,6 +40,23 @@ R62 P1-04 结构化 allowlist:
     --strict 模式: 任何未在 allowlist 中的违规即失败(忽略 ratchet 比较,
     只检查 real_violations == 0)。
 
+R63 P1-10 AST 结构指纹 + 按模块分类:
+    旧版(R62)指纹使用 ``file:line:violation_type:context``,行号变化即导致
+    指纹全变(不稳定),审计投诉"行号变化导致 fingerprint 全变说明当前指纹
+    不稳定,应使用 AST 结构/规则/函数名而非裸行号"。
+    新版(R63)指纹使用 ``file:violation_type:structural_context``,其中
+    structural_context = "{enclosing_function}|{source_line_content}":
+        - 行号不再参与指纹(添加空行 / 上方代码重排 → 指纹不变)
+        - 包含函数名(同文件不同函数的同类违规可区分)
+        - 包含源行内容(同函数内多个同类违规可区分)
+    allowlist 条目新增分类字段(按模块 owner/root_cause/ticket/plan):
+        - owner:       负责人
+        - root_cause:  根因描述(按模块)
+        - ticket:      跟踪 ticket(R63-P1-10-<module>)
+        - plan:        修复计划
+        - expiry:      过期日(R63 默认 2026-08-18,30 天窗口)
+    规则检测逻辑(Rule 1-5)不变,仅指纹计算与 allowlist 结构变化。
+
 CI 调用方式:
     python scripts/check_error_protocol.py --strict
     python scripts/check_error_protocol.py --baseline scripts/error_protocol_baseline.json
@@ -530,19 +547,69 @@ ZERO_TOLERANCE_DOMAINS: frozenset[str] = frozenset({
 # ════════════════════════════════════════════════════════════
 # R62 P1-04: 结构化 allowlist 辅助函数
 # ════════════════════════════════════════════════════════════
-def _compute_violation_fingerprint(
-    file_path: str,
-    line_no: int,
-    violation_type: str,
-    context: str,
-) -> str:
-    """R62 P1-04: 计算违规指纹(sha256),用于 allowlist 匹配。
 
-    指纹由文件路径、行号、违规类型、上下文片段组成,
-    确保同一违规在代码变更后能被准确识别(行号变化则指纹变化,需更新 allowlist)。
+# R63 P1-10: AST 函数行映射缓存(file_path -> {start_line: (end_line, func_name)})
+# 避免对同一文件重复 ast.parse(281 个违规可能集中在数十个文件)。
+_AST_FUNC_CACHE: dict[str, dict[int, tuple[int, str]]] = {}
+
+
+def _build_func_line_map(file_path: str) -> dict[int, tuple[int, str]]:
+    """R63 P1-10: 解析文件 AST,构建 {start_line: (end_line, func_name)} 映射。
+
+    用于通过行号查找包裹该行的函数名(指纹稳定性关键)。
+    方法节点返回 "ClassName.method_name";模块级代码返回 "<module>"(由
+    调用方处理)。文件不存在 / 解析失败时返回空 dict。
     """
-    raw = f"{file_path}:{line_no}:{violation_type}:{context[:80]}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    p = REPO_ROOT / file_path
+    if not p.exists():
+        return {}
+    try:
+        source = p.read_text(encoding="utf-8", errors="ignore")
+        tree = ast.parse(source, filename=file_path)
+    except (OSError, SyntaxError):
+        return {}
+
+    line_map: dict[int, tuple[int, str]] = {}
+
+    def _walk(node: ast.AST, parent_class: str = "") -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                _walk(child, parent_class=child.name)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                end = getattr(child, "end_lineno", child.lineno) or child.lineno
+                if parent_class:
+                    name = f"{parent_class}.{child.name}"
+                else:
+                    name = child.name
+                line_map[child.lineno] = (end, name)
+                # 嵌套函数:类上下文不传递(嵌套函数不属于类方法)
+                _walk(child, parent_class="")
+            else:
+                _walk(child, parent_class=parent_class)
+
+    _walk(tree)
+    return line_map
+
+
+def _get_enclosing_function_name(file_path: str, line_no: int) -> str:
+    """R63 P1-10: 通过 AST 查找包裹违规行的函数名。
+
+    返回最内层包裹该行的函数/方法名;方法返回 "ClassName.method_name"。
+    不在任何函数内时返回 "<module>"。
+
+    这是 R63 P1-10 的核心:行号不再参与指纹,改用 AST 结构(函数名)+
+    源行内容,使指纹在行号变化(添加空行 / 上方重排)时保持稳定。
+    """
+    if file_path not in _AST_FUNC_CACHE:
+        _AST_FUNC_CACHE[file_path] = _build_func_line_map(file_path)
+    line_map = _AST_FUNC_CACHE[file_path]
+    best_name = "<module>"
+    best_start = 0
+    for start, (end, name) in line_map.items():
+        if start <= line_no <= end and start > best_start:
+            best_start = start
+            best_name = name
+    return best_name
 
 
 def _get_source_line_context(file_path: str, line_no: int) -> str:
@@ -561,6 +628,50 @@ def _get_source_line_context(file_path: str, line_no: int) -> str:
     except OSError:
         pass
     return ""
+
+
+def _compute_structural_context(file_path: str, line_no: int) -> str:
+    """R63 P1-10: 计算 AST 结构上下文(用于指纹稳定性)。
+
+    返回 ``"{enclosing_function}|{source_line_content}"``:
+        - enclosing_function: 包裹违规行的函数名(AST 查找,不依赖行号)
+        - source_line_content: 违规所在源行内容(去空白)
+
+    此上下文替代旧版仅用源行内容的做法,加入函数名后:
+        - 同文件不同函数的同类违规可区分
+        - 行号变化(添加空行 / 上方重排)不影响指纹
+        - 函数重命名 / 源行内容变化才更新指纹(符合预期)
+    """
+    func_name = _get_enclosing_function_name(file_path, line_no)
+    source_line = _get_source_line_context(file_path, line_no)
+    return f"{func_name}|{source_line}"
+
+
+def _compute_violation_fingerprint(
+    file_path: str,
+    line_no: int,
+    violation_type: str,
+    context: str,
+) -> str:
+    """R63 P1-10: 计算违规指纹(sha256),用于 allowlist 匹配。
+
+    指纹由 ``file_path`` / ``violation_type`` / ``context`` 组成。
+    **行号(line_no)不再参与指纹**(R63 P1-10 核心整改):
+        - 旧版(R62):``file:line:violation_type:context`` — 行号变化即指纹全变
+        - 新版(R63):``file:violation_type:context`` — 行号变化指纹不变
+
+    ``context`` 应为 ``_compute_structural_context()`` 返回的结构上下文
+    (函数名 + 源行内容),确保同函数内多个同类违规可区分。
+
+    Args:
+        file_path: 相对路径(POSIX)
+        line_no: 违规行号(保留参数以兼容现有调用与测试,但不参与指纹)
+        violation_type: 违规类型(如 "P1-5 规则1/2")
+        context: 结构上下文(func_name|source_line)
+    """
+    # R63 P1-10: 故意不包含 line_no — 指纹必须对行号变化稳定
+    raw = f"{file_path}:{violation_type}:{context[:120]}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _extract_violation_type(detail: str) -> str:
@@ -700,7 +811,8 @@ def _check_domain_baseline(
 
         for file_path, line_no, detail in domain_findings_list:
             violation_type = _extract_violation_type(detail)
-            context = _get_source_line_context(file_path, line_no)
+            # R63 P1-10: 使用 AST 结构上下文(函数名 + 源行内容),不依赖行号
+            context = _compute_structural_context(file_path, line_no)
             fingerprint = _compute_violation_fingerprint(
                 file_path, line_no, violation_type, context,
             )
@@ -802,11 +914,83 @@ def _print_fix_suggestions() -> None:
 # R62 P1-04 默认 baseline 路径(strict 模式未显式指定 --baseline 时使用)
 DEFAULT_BASELINE_PATH = REPO_ROOT / "scripts" / "error_protocol_baseline.json"
 
-# R62 P1-04 默认 allowlist 条目字段值(用于 --generate-baseline / 迁移脚本)
+# R63 P1-10: 默认 allowlist 字段值(30 天窗口,2026-07-18 + 30 天 = 2026-08-18)
+# 旧版 R62 默认 2026-09-30 / R62-P1-04 已替换为 R63 分类默认值
 DEFAULT_ALLOWLIST_OWNER = "maxiuquan"
-DEFAULT_ALLOWLIST_REASON = "R62 observability debt - pending refactor"
-DEFAULT_ALLOWLIST_EXPIRY = "2026-09-30"
-DEFAULT_ALLOWLIST_TICKET = "R62-P1-04"
+DEFAULT_ALLOWLIST_REASON = "R63 P1-10 observability debt - per-module categorization (AST fingerprint)"
+DEFAULT_ALLOWLIST_EXPIRY = "2026-08-18"
+DEFAULT_ALLOWLIST_TICKET = "R63-P1-10"
+DEFAULT_ALLOWLIST_ROOT_CAUSE = "observability debt - except pass / return 0 / bare string / raise with literal (historical)"
+DEFAULT_ALLOWLIST_PLAN = "R64 refactor: migrate to AppError(ErrorCodes.XXX) + ErrorEnvelope structured errors"
+
+# R63 P1-10: 按模块分类(owner/root_cause/ticket/plan)
+# 文件路径按顶级目录前缀匹配到对应模块分类,allowlist 条目自动填充分类字段。
+MODULE_CATEGORIES: dict[str, dict[str, str]] = {
+    "admin": {
+        "owner": "maxiuquan",
+        "root_cause": (
+            "admin 模块历史遗留 except Exception: pass / return 0/False / "
+            "模块边界函数返回裸字符串 / raise ValueError 携带字符串"
+        ),
+        "ticket": "R63-P1-10-admin",
+        "plan": (
+            "R64 重构 admin 错误处理:except 块改用 logger + raise AppError,"
+            "模块边界函数返回 ErrorEnvelope,raise 改用 AppError(ErrorCodes.XXX)"
+        ),
+    },
+    "services": {
+        "owner": "maxiuquan",
+        "root_cause": (
+            "services 层多处 except Exception: pass / return 0/False / "
+            "raise ValueError/RuntimeError/Exception 携带字符串字面量"
+        ),
+        "ticket": "R63-P1-10-services",
+        "plan": (
+            "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),"
+            "except 块记录日志后 reraise 或转 AppError"
+        ),
+    },
+    "bots": {
+        "owner": "maxiuquan",
+        "root_cause": (
+            "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留"
+        ),
+        "ticket": "R63-P1-10-bots",
+        "plan": (
+            "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),"
+            "except 块不再吞异常"
+        ),
+    },
+    "database": {
+        "owner": "maxiuquan",
+        "root_cause": (
+            "database 层 except Exception: pass / return False 历史遗留"
+        ),
+        "ticket": "R63-P1-10-database",
+        "plan": (
+            "R64 重构 database 错误处理:改用 AppError + 结构化错误,"
+            "except 块记录日志后 reraise"
+        ),
+    },
+}
+
+
+def _get_module_category(file_path: str) -> dict[str, str]:
+    """R63 P1-10: 根据文件路径顶级目录返回模块分类字段。
+
+    匹配规则:取 file_path 的第一段(以 / 分隔)作为模块名,
+    在 MODULE_CATEGORIES 中查找。未匹配时返回默认分类(R63-P1-10)。
+    """
+    top = file_path.split("/", 1)[0] if "/" in file_path else file_path
+    return MODULE_CATEGORIES.get(
+        top,
+        {
+            "owner": DEFAULT_ALLOWLIST_OWNER,
+            "root_cause": DEFAULT_ALLOWLIST_ROOT_CAUSE,
+            "ticket": DEFAULT_ALLOWLIST_TICKET,
+            "plan": DEFAULT_ALLOWLIST_PLAN,
+        },
+    )
 
 
 def _build_allowlist_entry(
@@ -814,17 +998,50 @@ def _build_allowlist_entry(
     line_no: int,
     detail: str,
     *,
-    owner: str = DEFAULT_ALLOWLIST_OWNER,
+    owner: str | None = None,
     reason: str = DEFAULT_ALLOWLIST_REASON,
     expiry: str = DEFAULT_ALLOWLIST_EXPIRY,
-    ticket: str = DEFAULT_ALLOWLIST_TICKET,
+    ticket: str | None = None,
+    root_cause: str | None = None,
+    plan: str | None = None,
 ) -> dict:
-    """R62 P1-04: 根据违规信息构建一个结构化 allowlist 条目。
+    """R63 P1-10: 根据违规信息构建一个结构化 allowlist 条目。
 
-    包含完整字段:file / line / fingerprint / owner / reason / expiry / ticket。
+    包含完整字段:
+        file / line / fingerprint / owner / reason / expiry / ticket /
+        root_cause / plan
+
+    R63 P1-10 变更:
+        - 指纹改用 AST 结构上下文(函数名 + 源行内容),不依赖行号
+        - 新增 root_cause / plan 分类字段
+        - owner / ticket / root_cause / plan 默认按模块自动分类
+          (见 _get_module_category);调用方可显式覆盖
+
+    Args:
+        file_path: 相对路径(POSIX)
+        line_no: 违规行号(仅记录在 entry.line,不参与指纹)
+        detail: 违规详情
+        owner: 负责人(None → 按模块分类自动填充)
+        reason: 原因描述
+        expiry: 过期日(ISO 日期 YYYY-MM-DD)
+        ticket: 跟踪 ticket(None → 按模块分类自动填充)
+        root_cause: 根因描述(None → 按模块分类自动填充)
+        plan: 修复计划(None → 按模块分类自动填充)
     """
+    # R63 P1-10: 按模块自动分类 owner/ticket/root_cause/plan
+    category = _get_module_category(file_path)
+    if owner is None:
+        owner = category["owner"]
+    if ticket is None:
+        ticket = category["ticket"]
+    if root_cause is None:
+        root_cause = category["root_cause"]
+    if plan is None:
+        plan = category["plan"]
+
     violation_type = _extract_violation_type(detail)
-    context = _get_source_line_context(file_path, line_no)
+    # R63 P1-10: AST 结构上下文(函数名 + 源行内容),不依赖行号
+    context = _compute_structural_context(file_path, line_no)
     fingerprint = _compute_violation_fingerprint(
         file_path, line_no, violation_type, context,
     )
@@ -836,6 +1053,8 @@ def _build_allowlist_entry(
         "reason": reason,
         "expiry": expiry,
         "ticket": ticket,
+        "root_cause": root_cause,
+        "plan": plan,
     }
 
 
@@ -878,10 +1097,12 @@ def main() -> int:
         return 0
 
     # 确定有效 baseline 路径
-    # --strict 模式下未显式指定 --baseline 时,使用默认 baseline 路径
+    # R63 P1-10: 默认使用 scripts/error_protocol_baseline.json(若存在),
+    # 使 `python scripts/check_error_protocol.py`(无 flag)也能走 allowlist 路径。
+    # --strict 模式下未显式指定 --baseline 时,同样使用默认 baseline 路径。
     # (R62 P1-04: strict 模式需要 allowlist 才能放行存量违规)
     effective_baseline = args.baseline
-    if args.strict and effective_baseline is None:
+    if effective_baseline is None and DEFAULT_BASELINE_PATH.exists():
         effective_baseline = DEFAULT_BASELINE_PATH
 
     # 运行 domain 检查(支持 allowlist)
@@ -1015,21 +1236,26 @@ def _generate_baseline_file(
 
     data = {
         "description": (
-            "R62 P1-04 error protocol baseline (结构化 allowlist + ratchet, "
-            "observability 目标 real_violations=0)"
+            "R63 P1-10 error protocol baseline (AST 结构指纹 + 按模块分类 allowlist + "
+            "ratchet, observability 目标 real_violations=0)"
         ),
         "note": (
-            "R62 P1-04: observability 域使用结构化 allowlist(file/line/fingerprint/"
-            "owner/reason/expiry/ticket)。每个违规必须匹配 allowlist 条目且未过期。"
+            "R63 P1-10: observability 域使用结构化 allowlist(file/line/fingerprint/"
+            "owner/reason/expiry/ticket/root_cause/plan)。每个违规必须匹配 allowlist "
+            "条目且未过期。指纹基于 AST 结构(file + violation_type + "
+            "enclosing_function + source_line),不依赖行号,行号变化指纹不变。"
+            "allowlist 条目按模块自动分类 owner/root_cause/ticket/plan。"
             "max_violations 已弃用(仅保留用于向后兼容)。"
             "violation_count 用于 ratchet:每个 commit 只能减少不能增加。"
             "修复存量违规后重新生成以下降 violation_count 并精简 allowlist。"
         ),
-        "version": "R62-P1-04",
+        "version": "R63-P1-10",
         "ratchet_strategy": (
             "structured-allowlist: real_violations must == 0 (every violation "
             "must be in allowlist with valid expiry); "
-            "ratchet: total_violations <= violation_count"
+            "ratchet: total_violations <= violation_count; "
+            "R63 P1-10: fingerprint = sha256(file:violation_type:func_name|source_line) "
+            "(line-number-independent)"
         ),
         "domains": domains_cfg,
         "total_max_violations": 0,

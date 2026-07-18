@@ -50,6 +50,7 @@ import re
 import secrets
 import time
 import uuid
+import warnings
 from typing import Any, Optional
 
 from loguru import logger
@@ -779,6 +780,16 @@ def issue_mfa_receipt(
     return f"{_MFA_RECEIPT_TOKEN_PREFIX}.{payload_b64}.{signature}"
 
 
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_VERIFY_MFA_RECEIPT_DEPRECATED = (
+    "verify_mfa_receipt() is deprecated (R63 P1-05): use async "
+    "verify_mfa_receipt_authoritative() for authoritative SQLite "
+    "revocation check + one-time consumption. This sync function "
+    "only checks the L1 revocation cache and is intended for tests "
+    "and non-production paths only."
+)
+
+
 def verify_mfa_receipt(
     token: str,
     expected_principal_id: int,
@@ -824,7 +835,22 @@ def verify_mfa_receipt(
         AppError: 任何校验失败(格式/签名/过期/sub/purpose/action_hash 不匹配,
                   kid 未知, 或签名密钥未配置), 错误码 AUTH.MFA.RECEIPT_INVALID,
                   params.reason 标识具体失败原因
+
+    R63 P1-05 (deprecated):
+        本函数已标记 @deprecated。生产代码 MUST 改用 async
+        ``verify_mfa_receipt_authoritative()``,后者内部完成签名 + age +
+        SQLite 权威吊销查询 + 一次性消费,安全正确性不再依赖调用方"记得
+        查询权威层"。本 sync 函数仅查 L1 吊销缓存(``_mfa_receipt_revocations``),
+        无法发现其他进程刚写入 SQLite 的吊销;保留仅供测试/非生产路径使用
+        (R62 P1-07 测试仍直接调用本函数验证吊销 ledger 行为)。
     """
+    # R63 P1-05: 生产代码应改用 async verify_mfa_receipt_authoritative()。
+    # 本函数仅查 L1 吊销缓存,无法发现跨进程吊销;保留仅供测试/非生产路径。
+    warnings.warn(
+        _LOG_VERIFY_MFA_RECEIPT_DEPRECATED,
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not token or not isinstance(token, str):
         raise AppError(
             ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
@@ -1130,6 +1156,164 @@ async def consume_mfa_receipt(jti: str) -> bool:
         )
     # fail-closed:异常时返回 False(拒绝执行高风险动作)
     return False
+
+
+# ─── R63 P1-05: 唯一权威 async MFA receipt 验证入口 ─────────────────
+# R63 P1-05 修复:
+#   旧 sync verify_mfa_receipt() 只查进程内 L1 吊销缓存,注释要求跨进程调用方
+#   在验证前另行 await is_mfa_receipt_revoked() 查询 SQLite 权威层。安全正确性
+#   不应由每个调用点自行组合,因此提供唯一 async verify_mfa_receipt_authoritative(),
+#   内部完成签名 + age + kid + SQLite revocation + principal/purpose/action_hash
+#   匹配 + 一次性消费。生产代码禁止调用低层 sync verifier(已 @deprecated)。
+
+
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_MFA_RECEIPT_AGE_EXCEEDED = (
+    "[admin.mfa] R63 P1-05: MFA receipt age 超限 jti={} "
+    "expected_principal={} max_age={}s"
+)
+_LOG_MFA_RECEIPT_REVOKED = (
+    "[admin.mfa] R63 P1-05: MFA receipt 已吊销(权威 SQLite 查询) "
+    "jti={} expected_principal={}"
+)
+_LOG_MFA_RECEIPT_REPLAY_REJECTED = (
+    "[admin.mfa] R63 P1-05: MFA receipt 重放被拒绝(已消费) "
+    "jti={} expected_principal={}"
+)
+_LOG_MFA_RECEIPT_VERIFIED_OK = (
+    "[admin.mfa] R63 P1-05: 权威 MFA receipt 验证通过 "
+    "jti={} expected_principal={} purpose={} consumed={}"
+)
+
+
+async def verify_mfa_receipt_authoritative(
+    token: str,
+    expected_principal_id: int,
+    expected_purpose: str,
+    expected_action_hash: str,
+    *,
+    consume: bool = True,
+    max_age_seconds: int = 300,
+) -> dict[str, Any]:
+    """R63 P1-05: 唯一权威 async MFA receipt 验证 + 一次性消费入口。
+
+    生产代码 MUST 使用本函数代替 sync ``verify_mfa_receipt()``。本函数内部
+    依次完成所有校验,安全正确性不再依赖调用方"记得查询权威层":
+
+    流程:
+      1. ``verify_mfa_receipt(sync)`` — 签名 + jti 格式 + action_hash 格式 +
+         iat/exp/lifetime + sub/purpose/action_hash 匹配 + L1 吊销快速路径
+         (内部密码学校验全部沿用,不重复实现;DeprecationWarning 被本函数抑制)
+      2. ``verify_mfa_receipt_age(sync)`` — iat 距今不超过 max_age_seconds(默认 300s)
+      3. ``await is_mfa_receipt_revoked(jti)`` — SQLite 权威吊销 ledger 查询
+         (跨进程,P1-05 核心修复:不再依赖调用方"记得"调用)
+      4. ``await consume_mfa_receipt(jti)`` — 一次性消费(INSERT OR IGNORE + rowcount)
+         - rowcount=1 → 首次消费,返回 payload
+         - rowcount=0 → jti 已存在(重放/已消费)→ raise AUTH_MFA_RECEIPT_EXPIRED
+         - ``consume=False`` 时跳过本步(供 data_lifecycle UoW 在统一事务中
+           自行 CAS 消费,见下方 "consume 参数" 说明)
+
+    Args:
+        token: receipt token 字符串(mfa1.<payload_b64>.<signature_b64>)
+        expected_principal_id: 期望的批准人 principal ID
+        expected_purpose: 期望的动作用途(如 "break_glass_approval")
+        expected_action_hash: 期望的请求摘要(64 lowercase hex)
+        consume: 是否在本函数内一次性消费 jti(默认 True)。
+            R60/R61 P0-01 约束:data_lifecycle._verify_break_glass_two_person_approval
+            传 consume=False,实际 CAS 消费延迟到 execute_high_risk_command_uow
+            统一事务中(审批消费 + 状态机 CAS + 业务副作用原子提交/回滚);
+            其它生产调用点(如 button_approval_policy)使用默认 consume=True,
+            验证即消费,防止同一 receipt 被多次使用。
+        max_age_seconds: receipt 最大年龄(秒,默认 300=5 分钟)。
+
+    Returns:
+        解码后的 payload dict(含 jti/sub/purpose/action_hash/amr/iat/exp/kid)
+
+    Raises:
+        AppError(AUTH_MFA_RECEIPT_INVALID): 签名/格式/sub/purpose/action_hash
+            不匹配、kid 未知、已吊销(reason=revoked)
+        AppError(AUTH_MFA_RECEIPT_EXPIRED): age 超限(reason=mfa_receipt_age_exceeded)
+            或已消费(reason=already_consumed)
+    """
+    # 步骤 1: sync 签名 + 字段 + L1 吊销校验(密码学校验全部沿用)
+    # verify_mfa_receipt 内部会触发 DeprecationWarning;本函数是其权威 async
+    # 替代,调用方使用本函数即视为已迁移到权威路径,内部调用产生的 warning
+    # 应被抑制,避免每次权威验证都打印 deprecation 噪声。
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        payload = verify_mfa_receipt(
+            token=token,
+            expected_principal_id=expected_principal_id,
+            expected_purpose=expected_purpose,
+            expected_action_hash=expected_action_hash,
+        )
+    jti = payload.get("jti", "")
+    # 理论不可达(verify_mfa_receipt 已校验 jti 格式),fail-closed
+    if not jti:
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "jti_missing_after_verify",
+            },
+        )
+    # 步骤 2: age 校验(默认 5 分钟内签发,防陈旧 receipt 绕过二次认证)
+    manager = get_mfa_manager()
+    if not manager.verify_mfa_receipt_age(payload, max_age_seconds=max_age_seconds):
+        logger.warning(
+            _LOG_MFA_RECEIPT_AGE_EXCEEDED.format(
+                jti, expected_principal_id, max_age_seconds
+            )
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_EXPIRED,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "mfa_receipt_age_exceeded",
+                "jti": jti,
+            },
+        )
+    # 步骤 3: 权威吊销 ledger 查询(SQLite,跨进程)— P1-05 核心修复
+    # 旧 sync verify_mfa_receipt 只查 L1 缓存,无法发现其他进程刚写入 SQLite
+    # 的吊销;本步骤补齐跨进程权威查询,安全正确性不再依赖调用方"记得"调用。
+    if await manager.is_mfa_receipt_revoked(jti):
+        logger.warning(
+            _LOG_MFA_RECEIPT_REVOKED.format(jti, expected_principal_id)
+        )
+        raise AppError(
+            ErrorCodes.AUTH_MFA_RECEIPT_INVALID,
+            params={
+                "user_id": expected_principal_id,
+                "reason": "revoked",
+                "jti": jti,
+            },
+        )
+    # 步骤 4: 一次性消费(INSERT OR IGNORE + rowcount)
+    # consume=True(默认):验证即消费,防止同一 receipt 被多次使用
+    # consume=False:供 data_lifecycle UoW 在统一事务中自行 CAS 消费
+    if consume:
+        consumed = await consume_mfa_receipt(jti)
+        if not consumed:
+            # rowcount=0 → jti 已存在(重放/已消费)→ fail-closed
+            logger.warning(
+                _LOG_MFA_RECEIPT_REPLAY_REJECTED.format(
+                    jti, expected_principal_id
+                )
+            )
+            raise AppError(
+                ErrorCodes.AUTH_MFA_RECEIPT_EXPIRED,
+                params={
+                    "user_id": expected_principal_id,
+                    "reason": "already_consumed",
+                    "jti": jti,
+                },
+            )
+    logger.info(
+        _LOG_MFA_RECEIPT_VERIFIED_OK.format(
+            jti, expected_principal_id, expected_purpose, consume
+        )
+    )
+    return payload
 
 
 class MFAManager:

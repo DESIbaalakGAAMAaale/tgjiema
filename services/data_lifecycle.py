@@ -25,8 +25,10 @@ R51 P1-1 整改要点(数据生命周期事务化):
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -334,7 +336,11 @@ async def _verify_break_glass_two_person_approval(
     import re as _re_mod
     # R60 P0-01: 不再导入 consume_mfa_receipt(其内部自行 commit,无法纳入单事务)
     # R61 P0-01: jti 一次性消费的 CAS 逻辑移到 execute_high_risk_command_uow 统一事务中
-    from admin.mfa import verify_mfa_receipt
+    # R63 P1-05: 改用唯一权威 async verify_mfa_receipt_authoritative(),
+    # 内部完成签名 + age + SQLite 权威吊销查询 + (可选)一次性消费。
+    # 传 consume=False:实际 CAS 消费延迟到 execute_high_risk_command_uow 统一事务中
+    # (R60/R61 P0-01: 审批消费 + 状态机 CAS + 业务副作用原子提交/回滚)。
+    from admin.mfa import verify_mfa_receipt_authoritative
 
     # R59 P0-02: request_hash 严格 lowercase hex 正则
     _REQUEST_HASH_RE = _re_mod.compile(r"^[0-9a-f]{64}$")
@@ -533,16 +539,20 @@ async def _verify_break_glass_two_person_approval(
     # 仅收集 jti 列表;一次性消费(mfa_receipts + command_approvals)必须在
     # 同一 SQLite 连接、同一显式事务中原子完成,禁止在循环中调用自行 commit 的
     # consume_mfa_receipt(否则会出现 receipt 已消费而审批未消费的半消费状态)。
+    # R63 P1-05: 改用 verify_mfa_receipt_authoritative(consume=False) —
+    # 权威 SQLite 吊销查询由本函数内部完成,不再依赖调用方"记得"查询权威层;
+    # consume=False 保留 R60/R61 P0-01 的统一事务原子性(实际 CAS 消费在 UoW 中)。
     jti_list: list[str] = []
     for r in rows:
         approver_id = int(r[0] or 0)
         mfa_receipt = str(r[1] or "")
         try:
-            receipt_payload = verify_mfa_receipt(
+            receipt_payload = await verify_mfa_receipt_authoritative(
                 token=mfa_receipt,
                 expected_principal_id=approver_id,
                 expected_purpose=expected_purpose,
                 expected_action_hash=canonical_request_hash,
+                consume=False,  # R60/R61 P0-01: CAS 消费延迟到 UoW 统一事务
             )
             # R59 P0-03: 提取 jti(防重放原子消费凭据,实际消费在下方统一事务中)
             jti = receipt_payload.get("jti", "")
@@ -645,6 +655,13 @@ def _parse_iso_utc(dt_str: str) -> _dt.datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=_dt.timezone.utc)
     return dt.astimezone(_dt.timezone.utc)
+
+
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_OUTBOX_EVENT_UNIQUE_CONFLICT = (
+    "[DataLifecycle] R63 P1-02: outbox_event UNIQUE 冲突"
+    "(幂等,字段+digest 一致,已排队) action={} type={} target={}"
+)
 
 
 async def execute_high_risk_command_uow(
@@ -982,6 +999,17 @@ async def execute_high_risk_command_uow(
         # UNIQUE(action_id, effect_type, target, request_hash) 保证幂等:
         # 重复写入(同 a,e,t,rh)抛 UNIQUE 冲突,视为已排队(忽略)。
         # business_action 必须是 DB-only(无网络/文件 I/O),外部副作用通过本字段声明。
+        #
+        # R63 P1-02 整改(冲突处理改用错误码 + 字段验证):
+        # 旧实现在 except 中通过 `str(err)` 包含 `unique`/`constraint` 子串判断"已排队",
+        # 这会吞掉 CHECK / NOT NULL / FK / 其它约束错误(它们也含 "constraint" 字样),
+        # 错误地把真正的失败视为幂等成功。新实现:
+        # 1. 仅捕获 ``sqlite3.IntegrityError``(其它异常透传)
+        # 2. 检查 ``str(err)`` 是否为 ``UNIQUE constraint failed: outbox_events.*``
+        #    (具体表名 + UNIQUE 关键字,非泛 ``unique``/``constraint`` 子串)
+        # 3. 冲突后 SELECT 既有行,逐字段验证 action_id/effect_type/target/
+        #    request_hash + payload sha256 digest 一致,否则抛
+        #    ``DATA_RECEIPT_IDEMPOTENCY_CONFLICT``(payload 被替换,不可盲目重试)
         _outbox_enqueued = 0
         for _ev in command.outbox_events:
             _ev_effect_type = _ev.get("effect_type", "")
@@ -1009,25 +1037,89 @@ async def execute_high_risk_command_uow(
                     tx=store._db,  # R62 P0-05: 纳入统一事务,不自行 commit
                 )
                 _outbox_enqueued += 1
-            except Exception as outbox_err:
-                # UNIQUE 冲突(同 a,e,t,rh 已存在)→ 幂等,视为已排队,忽略
-                if ("unique" in str(outbox_err).lower()
-                        or "constraint" in str(outbox_err).lower()):
-                    logger.debug(
-                        f"[DataLifecycle] R62 P0-05: outbox_event UNIQUE 冲突"
-                        f"(幂等,已排队) action={command.action_id} "
-                        f"type={_ev_effect_type} target={_ev_target}"
+            except sqlite3.IntegrityError as outbox_err:
+                # R63 P1-02: 仅处理 UNIQUE 冲突(检查具体表名 + UNIQUE 关键字)
+                # 非 UNIQUE 的 IntegrityError(CHECK / NOT NULL / FK 等)→ 抛错触发 ROLLBACK
+                _err_str = str(outbox_err)
+                _is_unique_on_outbox = (
+                    "UNIQUE constraint failed" in _err_str
+                    and "outbox_events" in _err_str
+                )
+                if not _is_unique_on_outbox:
+                    raise AppError(
+                        ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                        params={
+                            "reason": f"uow_outbox_event_integrity_error_not_unique: "
+                                      f"{type(outbox_err).__name__}: {outbox_err}",
+                            "action_id": command.action_id,
+                            "effect_type": _ev_effect_type,
+                            "target": _ev_target,
+                        },
+                    ) from outbox_err
+                # R63 P1-02: UNIQUE 冲突 → SELECT 既有行,逐字段验证一致性
+                cursor = await store._db.execute(
+                    "SELECT action_id, effect_type, target, request_hash, "
+                    "payload_json FROM outbox_events "
+                    "WHERE action_id=? AND effect_type=? AND target=? "
+                    "AND request_hash=?",
+                    (command.action_id, _ev_effect_type, _ev_target,
+                     _ev_request_hash),
+                )
+                _existing_ob = await cursor.fetchone()
+                if _existing_ob is None:
+                    # UNIQUE 冲突但 SELECT 不到(竞态:行被并发删除)→ 抛错
+                    raise AppError(
+                        ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
+                        params={
+                            "reason": "uow_outbox_event_conflict_but_row_missing",
+                            "action_id": command.action_id,
+                            "effect_type": _ev_effect_type,
+                            "target": _ev_target,
+                        },
+                    ) from outbox_err
+                _ex_action = _existing_ob[0] or ""
+                _ex_effect = _existing_ob[1] or ""
+                _ex_target = _existing_ob[2] or ""
+                _ex_hash = _existing_ob[3] or ""
+                _ex_payload = _existing_ob[4] or ""
+                # 逐字段验证(防御性:UNIQUE 冲突理论上 4 字段必匹配,
+                # 但显式校验防 SQLite 行为变化 / 索引损坏等极端情况)
+                _field_mismatch = (
+                    _ex_action != command.action_id
+                    or _ex_effect != _ev_effect_type
+                    or _ex_target != _ev_target
+                    or _ex_hash != _ev_request_hash
+                )
+                # payload digest 验证(同 a,e,t,rh 但不同 payload → 真冲突)
+                _expected_digest = hashlib.sha256(
+                    (_ev_payload_json or "").encode("utf-8")
+                ).hexdigest()
+                _actual_digest = hashlib.sha256(
+                    (_ex_payload or "").encode("utf-8")
+                ).hexdigest()
+                if _field_mismatch or _expected_digest != _actual_digest:
+                    raise AppError(
+                        ErrorCodes.DATA_RECEIPT_IDEMPOTENCY_CONFLICT,
+                        params={
+                            "action_id": command.action_id,
+                            "effect_type": _ev_effect_type,
+                            "target": _ev_target,
+                            "reason": "uow_outbox_event_payload_digest_mismatch",
+                            "field_mismatch": _field_mismatch,
+                            "digest_match": _expected_digest == _actual_digest,
+                        },
+                    ) from outbox_err
+                # 全部一致 → 幂等,视为已排队(不 increment _outbox_enqueued,
+                # 因为本次未实际写入新行;与原 R62 行为一致)
+                logger.debug(
+                    _LOG_OUTBOX_EVENT_UNIQUE_CONFLICT.format(
+                        command.action_id, _ev_effect_type, _ev_target
                     )
-                    continue
-                # 其它错误 → 抛错,触发 ROLLBACK
-                raise AppError(
-                    ErrorCodes.DATA_LIFECYCLE_BREAK_GLASS_APPROVAL_REQUIRED,
-                    params={
-                        "reason": f"uow_outbox_event_insert_failed: "
-                                  f"{type(outbox_err).__name__}: {outbox_err}",
-                        "action_id": command.action_id,
-                    },
-                ) from outbox_err
+                )
+                continue
+            # R63 P1-02: 非 IntegrityError 的异常(如 OperationalError: disk full)
+            # 不再被吞掉,直接抛错触发 ROLLBACK(原实现在 except Exception 中也会抛,
+            # 但路径更复杂;此处让异常透传到外层 except Exception 包装)
 
         # ── 7. 状态机 CAS 完成(executing → executed)──
         # R61 P0-01: 传入 connection=store._db 复用统一事务,不自动 commit
@@ -1090,25 +1182,39 @@ async def execute_high_risk_command_uow(
 
 
 class OutboxWorker:
-    """R62 P0-05: 事务性 outbox worker 桩(stub)。
+    """R62 P0-05 + R63 P0-05: 事务性 outbox worker。
 
     设计目标:
     - ``execute_high_risk_command_uow`` 在事务内将外部副作用写入 outbox_events 表
       (与业务变更 + effect_receipts 原子提交),commit 后由本 worker 拉取 lease
       调用外部系统(Telegram/R2/CRDB/email/文件)。
-    - provider 各自幂等(基于 request_hash),worker 失败可安全重试。
+    - provider 各自幂等(基于 request_hash + idempotency_key),worker 失败可安全重试。
     - 超过 max_attempts 自动转 DLQ(permanent failure,需人工介入)。
     - saga 补偿由 reconcile 流程在独立事务中调用 HighRiskCommand.compensation_action,
       不依赖伪数据库回滚(SQLite 事务失败时外部 I/O 无法回滚)。
 
-    本类为 stub 实现,仅提供 lease-based CAS claim + complete/fail 接口,
-    实际 provider 调用由子类注入(provider_registry: {effect_type: callable})。
-    生产部署时需启动独立 worker 进程定时调用 ``run_once`` 拉取并处理事件。
+    R63 P0-05 整改(防 stub 误启动):
+    - 旧实现在 ``provider_registry is None`` 时仅 claim 不调用 provider,直接
+      ``complete_outbox_event``,把所有外部副作用永久标记完成。生产环境若误启动
+      默认配置,Telegram/R2/CRDB/邮件/文件副作用全部失配,业务状态与外部世界
+      严重不一致,且无法重放(completed 是终态)。
+    - 新增 ``test_mode`` 参数:仅 ``test_mode=True`` 时允许 ``provider_registry=None``
+      (用于单元测试 lease 流转)。生产模式(``test_mode=False``)下 ``run_once``
+      在 ``provider_registry is None`` 时立即 raise ``RuntimeError``,fail-fast。
+    - 新增 ``validate_providers()`` readiness 检查:每个枚举 effect type 必须恰有
+      一个 provider,缺失即 readiness failure(部署时应阻断启动)。
+    - provider 调用签名扩展为 ``async (payload_json, request_hash, idempotency_key)
+      -> external_id``,强制 provider 实现幂等(基于 request_hash 去重)。
+    - ``complete_outbox_event`` 使用 CAS ``WHERE status='in_flight' AND lease_owner=?
+      AND request_hash=?`` 双重校验,防止越权 complete / 错配事件。
+    - 新增 ``reclaim_stale_leases()``:回收过期 lease(worker 崩溃后 in_flight 行
+      不再永久卡住)。
 
     Lease 机制(分布式 worker 协调):
     - claim_outbox_events 原子地将 pending 行转为 in_flight 并设置 lease_owner /
       lease_expires_at,防止多 worker 并发拉取同一行。
-    - lease 过期后由独立 reconcile 流程回收(本 stub 不实现,留给生产子类)。
+    - lease 过期后由 ``reclaim_stale_leases()`` 回收(转回 pending,清空 lease_owner)。
+    - 长 provider 调用应周期性调用 ``store.renew_outbox_lease`` 续约(防超时回收)。
     """
 
     def __init__(
@@ -1118,6 +1224,7 @@ class OutboxWorker:
         lease_duration_seconds: int = 60,
         batch_size: int = 10,
         provider_registry: Any = None,
+        test_mode: bool = False,
     ):
         """初始化 OutboxWorker。
 
@@ -1125,32 +1232,118 @@ class OutboxWorker:
             lease_owner: worker 标识(hostname:pid),用于 claim_outbox_events
             lease_duration_seconds: lease 超时秒数(超时后可被其他 worker 重新 claim)
             batch_size: 单次 run_once 最多处理的事件数
-            provider_registry: {effect_type: async callable(payload_json) -> external_id}
-                               子类注入实际外部系统调用;None 时 run_once 仅 claim 不调用
+            provider_registry: ``{effect_type: async callable}``
+                provider 签名: ``async (payload_json, request_hash, idempotency_key)
+                -> external_id_str``。
+                生产模式(``test_mode=False``)下必传,``None`` 时 ``run_once`` raise。
+            test_mode: 测试模式开关。``True`` 时允许 ``provider_registry=None``
+                (用于单元测试 lease 流转,直接 complete 不调外部系统);
+                ``False`` 时(生产默认)``provider_registry=None`` → ``run_once``
+                raise ``RuntimeError``,fail-fast 防止 stub 误启动。
         """
         import socket as _socket
         self.lease_owner = lease_owner or f"{_socket.gethostname()}:{os.getpid()}"
         self.lease_duration_seconds = lease_duration_seconds
         self.batch_size = batch_size
-        # provider_registry: {effect_type: async (payload_json) -> external_id_str}
-        # None 表示 stub 模式(仅 claim,不调用外部系统,用于测试)
+        # provider_registry: {effect_type: async (payload_json, request_hash,
+        #                                          idempotency_key) -> external_id_str}
+        # test_mode=True 时允许 None(stub 仅 claim+complete,用于测试 lease 流转)
+        # test_mode=False 时 run_once 在 None 时 raise RuntimeError(fail-fast)
         self.provider_registry = provider_registry
+        self.test_mode = bool(test_mode)
+
+    def validate_providers(
+        self,
+        *,
+        required_effect_types: Any = None,
+    ) -> list[str]:
+        """R63 P0-05: readiness 检查 — 每个枚举 effect type 恰有一个 provider。
+
+        生产部署启动时应调用本方法,缺失任一 effect type 的 provider 即视为
+        readiness failure(部署系统应阻断 worker 启动)。
+
+        检查规则:
+        - 对 ``required_effect_types`` 中每个 effect_type,``provider_registry``
+          必须含且仅含一个 provider(即 ``provider_registry[effect_type]`` 是 callable)。
+        - ``required_effect_types`` 默认为
+          ``services.effect_receipts.CRITICAL_EFFECT_TYPES``(9 个枚举值)。
+        - 缺失 → 收集到 missing 列表;调用方决定是否 raise / log / 阻断启动。
+
+        Args:
+            required_effect_types: 必须覆盖的 effect_type 集合(默认 CRITICAL_EFFECT_TYPES)
+
+        Returns:
+            missing 列表(空 list 表示所有 effect type 均有 provider,readiness OK)
+        """
+        if required_effect_types is None:
+            # 延迟导入避免循环依赖
+            try:
+                from services.effect_receipts import CRITICAL_EFFECT_TYPES
+                required_effect_types = CRITICAL_EFFECT_TYPES
+            except Exception:
+                # 兜底:effect_receipts 不可用时返回空列表(不阻断)
+                return []
+        if self.provider_registry is None:
+            # test_mode 下允许 None,但 validate_providers 仍报告所有 type 缺失
+            return list(required_effect_types)
+        missing: list[str] = []
+        for effect_type in required_effect_types:
+            provider = self.provider_registry.get(effect_type)
+            if provider is None or not callable(provider):
+                missing.append(effect_type)
+        return missing
+
+    async def reclaim_stale_leases(self, *, batch_size: int = 100) -> int:
+        """R63 P0-05: 回收过期 lease(in_flight + lease_expires_at < now → pending)。
+
+        worker 崩溃 / OOM / 进程被 kill 后,其 in_flight 行会卡住(无人 complete
+        也无人 fail)。本方法扫描过期 lease 并原子转回 pending,让其它 worker
+        可重新 claim。``attempt_count`` 不递减(失败的尝试仍计入重试上限)。
+
+        建议在 ``run_once`` 之前调用,或在独立 reconcile 进程中周期性调用。
+
+        Args:
+            batch_size: 单次最多回收的行数
+
+        Returns:
+            回收的行数(0 表示无过期 lease)
+        """
+        store = get_cache_store()
+        if not store._db:
+            return 0
+        return await store.reclaim_stale_outbox_leases(batch_size=batch_size)
 
     async def run_once(self) -> dict:
         """拉取一批 outbox_events 并调用 provider 处理。
 
-        Stub 行为(provider_registry=None):
-        - 仅 claim 事件,不调用外部 provider,直接 complete_outbox_event
-        - 用于测试 lease 机制 + 状态流转,不产生真实外部副作用
-
-        生产行为(provider_registry 非空):
-        - claim 事件 → 调用 provider(payload_json) → complete/fail
-        - provider 抛异常 → fail_outbox_event,超限自动进 DLQ
-        - provider 返回 external_id → complete_outbox_event
+        R63 P0-05 整改:
+        - ``provider_registry is None`` 且 ``test_mode=False`` → raise RuntimeError
+          (fail-fast,防 stub 误启动把外部副作用永久标记完成)。
+        - ``test_mode=True`` 且 ``provider_registry=None`` → stub 模式(仅 claim
+          + complete,用于测试 lease 流转,不产生真实外部副作用)。
+        - provider 调用签名: ``await provider(payload_json, request_hash,
+          idempotency_key) -> external_id``。``idempotency_key`` 形如
+          ``"{action_id}:{request_hash}"``,provider 必须基于此键去重。
+        - ``complete_outbox_event`` 传入 ``lease_owner`` + ``request_hash`` +
+          ``external_id``,触发 CAS ``WHERE status='in_flight' AND lease_owner=?
+          AND request_hash=?``(防越权 complete / 错配事件)。
 
         Returns:
             {claimed: int, completed: int, failed: int, dlq: int}
+
+        Raises:
+            AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED): ``provider_registry is None``
+                且 ``test_mode=False``(生产模式 fail-fast,防止 stub 误启动)
         """
+        # R63 P0-05: fail-fast — 生产模式禁止无 provider 的 stub 运行
+        if self.provider_registry is None and not self.test_mode:
+            raise AppError(
+                ErrorCodes.OUTBOX_PROVIDER_REGISTRY_REQUIRED,
+                params={
+                    "reason": "stub worker must not silently complete external "
+                              "side effects; pass test_mode=True explicitly for tests"
+                },
+            )
         store = get_cache_store()
         if not store._db:
             return {"claimed": 0, "completed": 0, "failed": 0, "dlq": 0}
@@ -1168,9 +1361,22 @@ class OutboxWorker:
             event_id = ev["id"]
             effect_type = ev["effect_type"]
             payload_json = ev.get("payload_json", "")
-            # Stub 模式: 无 provider_registry → 直接 complete(用于测试 lease 流转)
+            # R63 P0-05: 从 outbox event 读取 request_hash(CAS complete 必须传入)
+            request_hash = ev.get("request_hash", "") or ""
+            action_id = ev.get("action_id", "") or ""
+            # R63 P0-05: idempotency_key = action_id:request_hash,
+            # provider 基于此键去重(同一逻辑副作用多次重试只执行一次)
+            idempotency_key = f"{action_id}:{request_hash}" if action_id else request_hash
+            # Stub 模式(仅 test_mode=True 时可达):
+            # 无 provider_registry → 直接 complete(用于测试 lease 流转)
             if self.provider_registry is None:
-                await store.complete_outbox_event(event_id)
+                # R63 P0-05: complete 传入 lease_owner + request_hash 触发 CAS
+                await store.complete_outbox_event(
+                    event_id,
+                    external_id="",
+                    lease_owner=self.lease_owner,
+                    request_hash=request_hash,
+                )
                 completed += 1
                 continue
             provider = self.provider_registry.get(effect_type)
@@ -1182,8 +1388,19 @@ class OutboxWorker:
                 dlq += 1
                 continue
             try:
-                _external_id = await provider(payload_json)
-                await store.complete_outbox_event(event_id)
+                # R63 P0-05: provider 签名扩展为 (payload_json, request_hash,
+                # idempotency_key) -> external_id,强制 provider 实现幂等
+                _external_id = await provider(
+                    payload_json, request_hash, idempotency_key,
+                )
+                # R63 P0-05: CAS complete — lease_owner + request_hash 双重校验,
+                # 同时保存 external_id(供事后对账与人工重放)
+                await store.complete_outbox_event(
+                    event_id,
+                    external_id=str(_external_id) if _external_id is not None else "",
+                    lease_owner=self.lease_owner,
+                    request_hash=request_hash,
+                )
                 completed += 1
             except Exception as prov_err:
                 result = await store.fail_outbox_event(

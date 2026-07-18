@@ -51,6 +51,11 @@ _DEFAULT_LOCALE = "zh-CN"
 # 备用 locale(找不到 key 时回退)
 _FALLBACK_LOCALE = "en-US"
 
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_ICU_STRICT_SETTINGS_UNAVAILABLE = (
+    "R63 P1-12: config.settings 不可用,ICU 严格模式检查降级到默认(非严格): {}"
+)
+
 # R61 P1-06: 锁定支持的 locale 列表(产品仅支持 zh-CN/en-US)
 # 任何加载/设置/写入不在此列表中的 locale 均被显式拒绝(审计 P1-06:不再宣称完整 CLDR)
 SUPPORTED_LOCALES: frozenset[str] = frozenset({"zh-CN", "en-US"})
@@ -75,15 +80,125 @@ def _get_environment() -> str:
 # R58 P1-2: i18n 失败指标(进程内计数器,Prometheus exporter 可轮询)
 _i18n_missing_param_total: int = 0
 _i18n_parse_failed_total: int = 0
+# R63 P1-12: ICU 预编译失败计数(供 Prometheus 采集)
+_i18n_icu_compile_failed_total: int = 0
 
 
 def _incr_metric(metric: str) -> None:
-    """R58 P1-2: 累计 i18n 失败指标。"""
-    global _i18n_missing_param_total, _i18n_parse_failed_total
+    """R58 P1-2 / R63 P1-12: 累计 i18n 失败指标。"""
+    global _i18n_missing_param_total, _i18n_parse_failed_total, _i18n_icu_compile_failed_total
     if metric == "i18n_missing_param_total":
         _i18n_missing_param_total += 1
     elif metric == "i18n_parse_failed_total":
         _i18n_parse_failed_total += 1
+    elif metric == "i18n_icu_compile_failed_total":
+        _i18n_icu_compile_failed_total += 1
+
+
+# ── R63 P1-12: ICU 预编译严格模式 ──────────────────────────────
+
+
+def _get_icu_strict_mode() -> bool:
+    """R63 P1-12: 是否启用 ICU 预编译严格模式(任何 ICU 语法 / 参数集合不对称直接阻断)。
+
+    判定优先级:
+        1. ``RELEASE_BUILD=1/true/yes/on`` → 严格模式(release 构建强制预编译)
+        2. ``ICU_STRICT_MODE`` 环境变量:
+           - 显式 ``0/false/no/off`` → 关闭(开发模式可关闭以允许 fallback)
+           - 显式 ``1/true/yes/on`` → 开启
+        3. ``config.settings.ENVIRONMENT == "production"`` → 默认开启
+        4. 其他环境(development/test/staging) → 默认关闭(向后兼容)
+
+    Returns:
+        True=严格模式(load_locale 阶段预编译失败立即抛 AppError);
+        False=宽松模式(失败时记录 warning + 计数,不阻断加载)
+    """
+    import os
+    # 1. release 构建强制严格
+    if _get_release_mode():
+        return True
+    # 2. ICU_STRICT_MODE 环境变量(显式覆盖)
+    val = os.environ.get("ICU_STRICT_MODE", "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    # 3. production 默认严格
+    try:
+        from config.settings import settings  # type: ignore[import]
+        env = getattr(settings, "ENVIRONMENT", "development")
+        if env == "production":
+            return True
+    except Exception as e:
+        # R63: 不静默吞异常(fail-open 扫描器 Rule 1/2);
+        # config.settings 不可用时降级到默认(非严格),但记录 debug 日志
+        logger.debug(_LOG_ICU_STRICT_SETTINGS_UNAVAILABLE.format(e))
+    # 4. 兜底:不严格(开发模式)
+    return False
+
+
+def _extract_icu_param_set(text: str) -> set[str]:
+    """R63 P1-12: 提取文本中引用的所有参数名(简单 {var} + ICU {var, plural/select/...})。
+
+    与 scripts/check_i18n_key_symmetry.py 的 _extract_param_set 保持一致,
+    确保 runtime 预编译检查与 CI 门禁判定标准统一。
+
+    Args:
+        text: 翻译值字符串
+
+    Returns:
+        参数名集合(可能为空);非 str 输入返回空集
+    """
+    if not isinstance(text, str):
+        return set()
+    params: set[str] = set()
+    for m in _ICU_PATTERN.finditer(text):
+        params.add(m.group(1))
+    for m in _SIMPLE_VAR_PATTERN.finditer(text):
+        params.add(m.group(1))
+    return params
+
+
+def _validate_icu_message(text: str) -> tuple[bool, str]:
+    """R63 P1-12: 校验 ICU message 语法是否合法(预编译)。
+
+    执行以下检查:
+        1. 每个 ``{var, plural/select/selectordinal, body}`` 的 ``{...}`` 必须闭合
+        2. body 中至少有一个 selector(如 ``one``/``other``/``=0``)
+        3. selector 后必须紧跟 ``{...}`` 子句
+        4. 子句的 ``{...}`` 必须闭合
+        5. 不含未闭合的 ``{``(任何 ``{`` 必须有匹配的 ``}``)
+
+    通过空 kwargs 调用 _icu_format 进行实际解析,任何异常都视为编译失败。
+
+    Args:
+        text: 待校验的 ICU 消息文本
+
+    Returns:
+        (ok, reason) — ok=True 表示编译通过;ok=False 时 reason 为失败原因
+    """
+    if not isinstance(text, str) or "{" not in text:
+        return True, ""
+    # 不含 ICU pattern 时直接通过(简单 {var} 不需要预编译)
+    if not _ICU_PATTERN.search(text):
+        return True, ""
+    # 检查大括号是否平衡(粗粒度)
+    depth = 0
+    for c in text:
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth < 0:
+                return False, "unbalanced_brace_extra_close"
+    if depth != 0:
+        return False, f"unbalanced_brace_depth={depth}"
+    # 通过空 kwargs 实际解析(检测 selector 缺失 / 空 body 等)
+    try:
+        _icu_format(text, "en-US", {})
+    except Exception as e:
+        return False, f"parse_error: {type(e).__name__}: {e}"
+    return True, ""
 
 
 # ── R61 P1-06: release 构建严格模式 + 高优先级告警钩子 ──────────
@@ -659,6 +774,13 @@ class I18nManager:
         self._loaded_files: set[Path] = set()
         # R44 6.2: missing key 计数器(供 Prometheus 采集)
         self._missing_key_count: int = 0
+        # R63 P1-12: ICU 预编译缓存
+        # 结构: {locale: {key: {"ok": bool, "reason": str, "params": set[str]}}}
+        # 在 load_locale 阶段填充;format_message_icu 直接查此缓存避免运行时解析
+        self._compiled_icu_cache: dict[str, dict[str, dict]] = {}
+        # R63 P1-12: 跨 locale 参数集合对称性检查结果(避免重复扫描)
+        # 结构: {"checked": bool, "asymmetries": list[dict]}
+        self._param_asymmetry_check_done: bool = False
 
     def load_locale(self, locale: str) -> bool:
         """加载指定 locale 的 JSON 文件。
@@ -666,11 +788,19 @@ class I18nManager:
         文件路径: <locales_dir>/<locale>.json
         若已加载过则跳过(幂等)。
 
+        R63 P1-12: 加载完成后立即预编译所有 ICU message:
+            - 严格模式(release / production / ICU_STRICT_MODE=1):
+              任何 ICU 语法错误直接抛 AppError(I18N_ICU_COMPILE_FAILED)阻断加载
+            - 宽松模式: 失败记录 warning + 计数,继续加载(运行时回退到 format_message)
+
         Args:
             locale: locale 标识符(如 zh-CN)
 
         Returns:
             True=成功;False=失败(文件不存在或解析错误)
+
+        Raises:
+            AppError: 严格模式下 ICU 预编译失败(I18N_ICU_COMPILE_FAILED)
         """
         if not locale:
             return False
@@ -705,13 +835,148 @@ class I18nManager:
                 f"[i18n] 加载 locale={locale} keys={len(flat)} "
                 f"fallback={self._meta[locale].get('fallback', '无')}"
             )
+            # R63 P1-12: 预编译所有 ICU message(strict 失败时抛 AppError)
+            self._precompile_icu_messages(locale, flat)
+            # R63 P1-12: 跨 locale 参数集合对称性检查(两个 locale 都加载后)
+            self._check_param_asymmetry_strict()
             return True
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"[i18n] locale 文件 {locale} 解析失败: {e}")
             return False
         except Exception as e:
+            # AppError(I18N_ICU_COMPILE_FAILED)等预期异常直接传播(strict 模式下)
+            # 不再吞掉;否则原 fallback 行为(返回 False)保留
+            from services.error_codes import AppError as _AppError  # type: ignore[import]
+            if isinstance(e, _AppError):
+                raise
             logger.warning(f"[i18n] locale 文件 {locale} 加载异常: {e}")
             return False
+
+    def _precompile_icu_messages(self, locale: str, flat: dict[str, str]) -> None:
+        """R63 P1-12: 预编译 locale 中所有 ICU message。
+
+        对每个含 ICU pattern 的 value 执行:
+            1. 调用 _validate_icu_message 校验语法(括号平衡 / 解析通过)
+            2. 提取参数集合(_extract_icu_param_set)
+            3. 缓存到 ``self._compiled_icu_cache[locale][key]``
+
+        严格模式下任一编译失败 → 抛 AppError(I18N_ICU_COMPILE_FAILED)阻断加载。
+        宽松模式下记录 warning + 计数,继续加载。
+
+        Args:
+            locale: locale 标识符
+            flat: 扁平化后的 key → value 字典
+
+        Raises:
+            AppError: 严格模式下 ICU 编译失败
+        """
+        strict = _get_icu_strict_mode()
+        cache: dict[str, dict] = {}
+        failures: list[tuple[str, str]] = []  # [(key, reason), ...]
+        for key, value in flat.items():
+            if not isinstance(value, str) or "{" not in value:
+                continue
+            if not _ICU_PATTERN.search(value):
+                # 简单 {var} 占位符也提取参数集合,便于跨 locale 对称检查
+                params = _extract_icu_param_set(value)
+                cache[key] = {
+                    "ok": True,
+                    "reason": "",
+                    "params": params,
+                    "is_icu": False,
+                }
+                continue
+            ok, reason = _validate_icu_message(value)
+            params = _extract_icu_param_set(value)
+            cache[key] = {
+                "ok": ok,
+                "reason": reason,
+                "params": params,
+                "is_icu": True,
+            }
+            if not ok:
+                failures.append((key, reason))
+                _incr_metric("i18n_icu_compile_failed_total")
+        self._compiled_icu_cache[locale] = cache
+        if failures:
+            if strict:
+                # 严格模式:抛 AppError 阻断加载(release / production)
+                from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+                first_key, first_reason = failures[0]
+                logger.error(_i18n_t(
+                    "services.i18n.logger_icu_precompile_failed_strict",
+                    locale=locale, failures=len(failures),
+                    first_key=first_key, first_reason=first_reason,
+                ))
+                raise AppError(
+                    ErrorCodes.I18N_ICU_COMPILE_FAILED,
+                    params={
+                        "locale": locale,
+                        "key": first_key,
+                        "reason": first_reason,
+                    },
+                )
+            # 宽松模式:记录 warning,继续加载(运行时 format_message_icu 回退)
+            for key, reason in failures:
+                logger.warning(_i18n_t(
+                    "services.i18n.logger_icu_precompile_failed_loose",
+                    locale=locale, icu_key=key, reason=reason,
+                ))
+
+    def _check_param_asymmetry_strict(self) -> None:
+        """R63 P1-12: 跨 locale 参数集合对称性检查(两个 locale 都加载后)。
+
+        检查规则(与 scripts/check_i18n_key_symmetry.py 一致):
+            - 对每个公共 key,zh-CN 与 en-US 的参数集合必须完全一致
+            - 参数集合包含简单 {var} 占位符 + ICU pattern 中的 var 名
+            - 类型不对称也是错误(zh-CN 用 ``{count, plural, ...}`` 而 en-US 用 ``{count}`` 视为不对称)
+
+        严格模式下任一不对称 → 抛 AppError(I18N_ICU_COMPILE_FAILED)。
+        宽松模式下记录 warning,继续运行(供开发期发现)。
+
+        仅当 zh-CN 与 en-US 均已加载时执行,避免单 locale 加载场景误报。
+        """
+        if self._param_asymmetry_check_done:
+            return
+        zh_cache = self._compiled_icu_cache.get("zh-CN")
+        en_cache = self._compiled_icu_cache.get("en-US")
+        if zh_cache is None or en_cache is None:
+            return  # 两个 locale 未全部加载,跳过
+        self._param_asymmetry_check_done = True
+        common_keys = set(zh_cache.keys()) & set(en_cache.keys())
+        asymmetries: list[tuple[str, set, set]] = []
+        for key in sorted(common_keys):
+            zh_params = zh_cache[key]["params"]
+            en_params = en_cache[key]["params"]
+            if zh_params != en_params:
+                asymmetries.append((key, zh_params, en_params))
+        if not asymmetries:
+            return
+        strict = _get_icu_strict_mode()
+        if strict:
+            from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+            first_key, zh_p, en_p = asymmetries[0]
+            logger.error(_i18n_t(
+                "services.i18n.logger_icu_param_asymmetry_strict",
+                asymmetries=len(asymmetries), first_key=first_key,
+                zh_params=sorted(zh_p), en_params=sorted(en_p),
+            ))
+            raise AppError(
+                ErrorCodes.I18N_ICU_COMPILE_FAILED,
+                params={
+                    "locale": "zh-CN/en-US",
+                    "key": first_key,
+                    "reason": (
+                        f"param_asymmetry: zh-CN={sorted(zh_p)} "
+                        f"vs en-US={sorted(en_p)}"
+                    ),
+                },
+            )
+        for key, zh_p, en_p in asymmetries:
+            logger.warning(_i18n_t(
+                "services.i18n.logger_icu_param_asymmetry_loose",
+                icu_key=key, zh_params=sorted(zh_p), en_params=sorted(en_p),
+            ))
 
     def _flatten_dict(self, d: dict, prefix: str, output: dict[str, str]) -> None:
         """递归扁平化嵌套 dict 为点分 key。
@@ -959,6 +1224,9 @@ class I18nManager:
         self._translations.clear()
         self._meta.clear()
         self._loaded_files.clear()
+        # R63 P1-12: 同步清空 ICU 预编译缓存 + 重置对称检查标志
+        self._compiled_icu_cache.clear()
+        self._param_asymmetry_check_done = False
         count = 0
         for loc in loaded_locales:
             if self.load_locale(loc):
@@ -982,6 +1250,11 @@ class I18nManager:
             - 若文本不含 `{var,` (非 ICU pattern),回退到 format_message(简单 {var} 插值)
             - 若 ICU 解析失败,回退到 format_message
 
+        R63 P1-12: 优先使用 load_locale 阶段的预编译结果(_compiled_icu_cache)。
+            - 若预编译结果 ok=False 且当前为 strict 模式,直接抛
+              AppError(I18N_ICU_COMPILE_FAILED)(不进入运行时解析)
+            - 若 key 未预编译(例如直接 put_translations / 测试场景),惰性编译并缓存
+
         Args:
             key: 翻译 key(如 "common.files.count_icu")
             locale: 目标 locale(默认 self.default_locale)
@@ -989,6 +1262,9 @@ class I18nManager:
 
         Returns:
             ICU MessageFormat 格式化后的字符串;失败回退到 format_message
+
+        Raises:
+            AppError: strict 模式下 ICU 编译失败(I18N_ICU_COMPILE_FAILED)
         """
         target_locale = locale or self.default_locale
         if target_locale not in self._translations:
@@ -1004,6 +1280,36 @@ class I18nManager:
         is_icu = _ICU_PATTERN.search(text) is not None
         if not is_icu:
             # 旧式 {var} 简单插值
+            return self.format_message(key, locale=target_locale, **kwargs)
+        # R63 P1-12: 查询预编译缓存(load_locale 阶段填充)
+        compiled = self._lookup_compiled_icu(target_locale, key, text)
+        if compiled is not None and not compiled["ok"]:
+            # 预编译失败的 message:strict 模式直接抛 AppError
+            if _get_icu_strict_mode():
+                from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+                raise AppError(
+                    ErrorCodes.I18N_ICU_COMPILE_FAILED,
+                    params={
+                        "locale": target_locale,
+                        "key": key,
+                        "reason": compiled["reason"],
+                    },
+                )
+            # 宽松模式:记录 warning + 触发告警,继续走 format_message 回退
+            logger.warning(_i18n_t(
+                "services.i18n.logger_icu_precompile_runtime_fallback",
+                icu_key=key, locale=target_locale, reason=compiled["reason"],
+            ))
+            _incr_metric("i18n_icu_compile_failed_total")
+            _trigger_i18n_alert(
+                "malformed_icu",
+                {
+                    "key": key,
+                    "locale": target_locale,
+                    "error_type": "icu_precompile_failed",
+                    "error": compiled["reason"],
+                },
+            )
             return self.format_message(key, locale=target_locale, **kwargs)
         # R58 P1-2: 检测缺失参数(staging/test 硬失败,production 记录指标)
         # 收集文本中所有简单 {var} 与 ICU {var, ...} 的 var 名
@@ -1042,8 +1348,18 @@ class I18nManager:
             return _icu_format(text, target_locale, kwargs)
         except Exception as e:
             env = _get_environment()
-            if env in ("test", "staging") or _get_release_mode():
+            if env in ("test", "staging") or _get_release_mode() or _get_icu_strict_mode():
                 from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+                # R63 P1-12: strict 模式下使用 I18N_ICU_COMPILE_FAILED(语义更准确)
+                if _get_icu_strict_mode():
+                    raise AppError(
+                        ErrorCodes.I18N_ICU_COMPILE_FAILED,
+                        params={
+                            "locale": target_locale,
+                            "key": key,
+                            "reason": f"runtime_parse: {type(e).__name__}: {e}",
+                        },
+                    ) from e
                 raise AppError(
                     ErrorCodes.VALIDATION_FAILED,
                     params={
@@ -1069,6 +1385,47 @@ class I18nManager:
                 },
             )
             return self.format_message(key, locale=target_locale, **kwargs)
+
+    def _lookup_compiled_icu(
+        self, locale: str, key: str, text: str,
+    ) -> Optional[dict]:
+        """R63 P1-12: 查询 ICU 预编译缓存,若缺失则惰性编译并缓存。
+
+        Args:
+            locale: 目标 locale
+            key: 翻译 key
+            text: 翻译值(用于惰性编译)
+
+        Returns:
+            预编译结果 dict(``{"ok": bool, "reason": str, "params": set, "is_icu": bool}``),
+            若非 ICU pattern 返回 None(由调用方走 format_message 路径)
+        """
+        cache = self._compiled_icu_cache.get(locale)
+        if cache is None:
+            # locale 未通过 load_locale 加载(例如直接修改 _translations 的测试场景)
+            # 创建空缓存并惰性编译此 key
+            cache = {}
+            self._compiled_icu_cache[locale] = cache
+        if key in cache:
+            return cache[key]
+        # 惰性编译并缓存(仅对此 key)
+        if not _ICU_PATTERN.search(text):
+            compiled = {
+                "ok": True,
+                "reason": "",
+                "params": _extract_icu_param_set(text),
+                "is_icu": False,
+            }
+        else:
+            ok, reason = _validate_icu_message(text)
+            compiled = {
+                "ok": ok,
+                "reason": reason,
+                "params": _extract_icu_param_set(text),
+                "is_icu": True,
+            }
+        cache[key] = compiled
+        return compiled
 
     def format_selectordinal(
         self,

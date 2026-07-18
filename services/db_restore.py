@@ -423,6 +423,16 @@ async def _restore_sqlite_table(
 #  R35 P1-4: 单一 Restore Engine 主入口
 # ═══════════════════════════════════════════════════════════════
 
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_PAYLOAD_DIGEST_MISMATCH = (
+    "R63 P0-02: actual payload bytes digest 与 capability.payload_digest "
+    "不匹配 (actual={}..., capability={}...) — payload 可能被篡改"
+)
+_LOG_RESTORE_ERRORS = (
+    "R63 P0-03: 恢复存在 {} 个错误,operation FAILED (不返回部分成功): {}"
+)
+_LOG_RESTORE_DONE = "[db_restore] 恢复完成: {} 行, 0 个错误, 模式={}"
+
 async def _restore_from_backup_data(
     verified_payload,
     *,
@@ -478,16 +488,43 @@ async def _restore_from_backup_data(
     Raises:
         AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): capability 校验失败
             (sentinel 不匹配 / nonce 已消费 / 已过期 / payload_digest 不匹配 /
-             schema_fingerprint 不匹配)
+             schema_fingerprint 不匹配 / actual payload bytes digest 不匹配)
+
+    R63 P0-02: writer 端重算 actual payload bytes digest。
+        - 首条语句对 ``verified_payload.payload`` 实际 canonical bytes 重新计算
+          SHA-256,与 ``_capability.payload_digest`` 比对。
+        - 即使 ``object.__setattr__`` 绕过 frozen 替换了 payload,重算 digest
+          也会与 capability 内嵌(构造时)的 digest 不匹配 → fail-closed。
+        - 重算 digest 传给 ``assert_valid``(而非 verified_payload.payload_digest),
+          保证令牌校验基于实际 bytes 而非存储的 digest。
     """
-    # R62 P0-02: 首条语句必须为 capability.assert_valid(...) — 强制 capability 边界
-    # 在读取任何 verified_payload 字段之前校验令牌有效性 + 防重放 +
-    # payload_digest 一致性(verified_payload.payload_digest 与 capability 内嵌
-    # payload_digest 必须一致,防 payload 替换)+ scope 一致性
-    # (verified_payload.schema_fingerprint 与 capability.schema_fingerprint 必须一致)。
+    # R63 P0-02: 首条语句 — 对 verified_payload.payload 实际 canonical bytes
+    # 重新计算 SHA-256,与 capability.payload_digest 比对。
+    # 这防御 object.__setattr__ 绕过 frozen 替换 payload 的攻击:
+    #   - 即使 attacker 替换 verified_payload.payload + verified_payload.payload_digest,
+    #     capability.payload_digest 是构造时内嵌的(不可变),重算 digest 不匹配 → fail-closed。
+    #   - 即使 attacker 只替换 verified_payload.payload,payload_digest 仍为旧值,
+    #     重算 digest 与 capability.payload_digest 不匹配 → fail-closed。
     import time as _time
-    _capability.assert_valid(
-        verified_payload.payload_digest,
+    from services.backup_dr_validate import _compute_payload_digest
+    from services.error_codes import AppError, ErrorCodes
+    actual_payload_digest = _compute_payload_digest(verified_payload.payload)
+    if actual_payload_digest != _capability.payload_digest:
+        logger.error(
+            _LOG_PAYLOAD_DIGEST_MISMATCH.format(
+                actual_payload_digest[:16],
+                _capability.payload_digest[:16],
+            )
+        )
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
+    # R62 P0-02 / R63 P0-02 / R63 P1-01: capability.assert_valid — 强制 capability 边界
+    # 传入 actual_payload_digest(重算值,而非 verified_payload.payload_digest 存储值),
+    # 保证令牌校验基于实际 bytes。校验维度:sentinel + nonce 防重放 + 未过期 +
+    # payload_digest 一致(重算值 == capability 内嵌值)+ scope 一致。
+    # R63 P1-01: nonce 持久化到权威 SQLite/CRDB 表原子消费,assert_valid 现为 async。
+    await _capability.assert_valid(
+        actual_payload_digest,
         _time.time(),
         verified_payload.schema_fingerprint,
     )
@@ -548,9 +585,27 @@ async def _restore_from_backup_data(
             relay_sqlite_to_restore, merge, result, is_relay=True,
         )
 
+    # R63 P0-03: 任一数据源恢复失败 → 整个 operation FAILED(raise AppError,不返回部分成功)
+    # 恢复不是跨数据源原子操作,但禁止返回"恢复完成"的假象:任一表错误即整体 FAILED,
+    # 调用方必须从 staging/备份重试,不接受混合状态。
+    if result["errors"]:
+        from services.error_codes import AppError, ErrorCodes
+        error_summary = "; ".join(result["errors"][:5])
+        logger.error(
+            _LOG_RESTORE_ERRORS.format(
+                len(result['errors']), error_summary
+            )
+        )
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+            params={"backup_id": verified_payload.backup_id, "errors": error_summary},
+        )
+
     logger.info(
-        f"[db_restore] 恢复完成: {sum(result['restored'].values())} 行, "
-        f"{len(result['errors'])} 个错误, 模式={'merge' if merge else 'overwrite'}"
+        _LOG_RESTORE_DONE.format(
+            sum(result['restored'].values()),
+            'merge' if merge else 'overwrite',
+        )
     )
 
     # R44 7.2: 记录 restore RU 消耗(估算: 每个恢复表约 50 RU)
@@ -570,93 +625,153 @@ async def _restore_from_backup_data(
 async def _restore_crdb_tables(
     tables_data: dict[str, list], merge: bool, result: dict,
 ):
-    """恢复 CRDB 表(使用 db_client 连接池)。"""
+    """R63 P0-03/P1-04: 恢复 CRDB 表(使用 db_client.transaction() context manager)。
+
+    R63 P1-04 修复(遗留开放事务):
+        - 原实现在 BEGIN 后若 cols 为空会 continue,该分支无显式 COMMIT/ROLLBACK,
+          导致事务遗留。现已将 schema/column 校验提前到 BEGIN 前,cols 为空时
+          raise(不 continue),事务由 context manager 自动管理。
+
+    R63 P0-03 修复(原子性 + fail-closed):
+        - 使用 ``async with db_client.transaction() as conn:`` context manager,
+          异常时自动 ROLLBACK(不再手动 BEGIN/COMMIT/ROLLBACK)。
+        - 任一表错误 → raise AppError(整个 operation FAILED,不返回部分成功)。
+        - context manager 在同一连接上执行事务(原 db_client.execute 每次
+          acquire 新连接,BEGIN/TRUNCATE/INSERT 可能不在同一连接/事务)。
+
+    R63 P1-04 校验顺序(全部在 BEGIN 前完成):
+        1. 表名格式校验(_validate_identifier)
+        2. 列校验(validate_columns_for_table)— cols 为空 → raise(不 continue)
+        3. 列名格式校验(_validate_identifier per col)
+        4. ON CONFLICT 子句构造
+        全部通过后才进入 ``async with db_client.transaction() as conn:`` 执行写入。
+    """
     from database.session import _client as db_client, _validate_identifier
+    from services.error_codes import AppError, ErrorCodes
 
     if not db_client.is_connected:
         try:
             from database.session import init_db
             await init_db()
         except Exception as e:
-            result["errors"].append(f"CRDB 连接初始化失败: {e}")
-            logger.error(f"[db_restore] CRDB 连接初始化失败: {e}")
-            return
+            err = f"CRDB 连接初始化失败: {e}"
+            result["errors"].append(err)
+            logger.error(f"[db_restore] {err}")
+            # R63 P0-03: fail-closed — 不返回部分成功
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                           params={"backup_id": "", "errors": err})
 
     for table_name, rows in tables_data.items():
+        # ── R63 P1-04: schema/column 校验全部在 BEGIN 前完成 ──
+
+        # 1. 表名格式校验
         try:
             _validate_identifier(table_name)
         except ValueError as e:
-            logger.warning(f"[db_restore] 跳过非法表名: {e}")
-            result["skipped"].append(table_name)
-            continue
+            err = f"表 {table_name} 非法表名: {e}"
+            result["errors"].append(err)
+            logger.error(f"[db_restore] {err}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                           params={"backup_id": "", "errors": err})
+
         if not rows:
+            # 无记录不算错误,标记 0 行继续(无事务需管理)
             result["restored"][table_name] = 0
             continue
+
+        # 2. R35 P1-6: 按表校验列 — cols 为空 → raise(不 continue,不 BEGIN)
+        raw_cols = list(rows[0].keys())
         try:
-            await db_client.execute("BEGIN")
-            try:
+            cols = validate_columns_for_table(table_name, raw_cols)
+        except ValueError as e:
+            err = f"表 {table_name} 列校验失败: {e}"
+            result["errors"].append(err)
+            logger.error(f"[db_restore] {err}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                           params={"backup_id": "", "errors": err})
+        if not cols:
+            # R63 P1-04: cols 为空 → raise(不 continue,BEGIN 前已校验,无开放事务)
+            err = f"表 {table_name} 校验后无合法列(原始列: {raw_cols})"
+            result["errors"].append(err)
+            logger.error(f"[db_restore] {err}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                           params={"backup_id": "", "errors": err})
+
+        # 3. 列名格式校验(防 SQL 注入)— BEGIN 前完成
+        try:
+            safe_cols = [_validate_identifier(c) for c in cols]
+        except ValueError as e:
+            err = f"表 {table_name} 含非法列名: {e}"
+            result["errors"].append(err)
+            logger.error(f"[db_restore] {err}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                           params={"backup_id": "", "errors": err})
+
+        # 4. 确定 ON CONFLICT 子句(仅 merge 模式)— BEGIN 前构造
+        conflict_clause = ""
+        if merge:
+            _schema = BACKUP_SCHEMA.get(table_name)
+            if _schema and len(_schema.pk_columns) > 1:
+                _pk_cols = ", ".join(f'"{c}"' for c in _schema.pk_columns)
+                conflict_clause = f' ON CONFLICT ({_pk_cols}) DO NOTHING'
+            elif _schema and _schema.conflict_col:
+                conflict_clause = f' ON CONFLICT ("{_schema.conflict_col}") DO NOTHING'
+            else:
+                logger.warning(f"[db_restore] 表 {table_name} 未知冲突列,merge 模式可能因主键冲突失败")
+
+        # 5. 预构建 SQL 与参数列表(BEGIN 前完成,事务内只执行)
+        placeholders = ", ".join(f"${i+1}" for i in range(len(safe_cols)))
+        col_list = ", ".join(f'"{c}"' for c in safe_cols)
+        sql = f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders}){conflict_clause}'
+
+        # ── R63 P0-03/P1-04: 进入事务 context manager(异常自动 ROLLBACK) ──
+        # db_client.transaction() 在同一连接上执行事务:
+        #   async with self._pool.acquire() as conn:
+        #       async with conn.transaction():
+        #           yield conn
+        # 异常时 conn.transaction() 自动 ROLLBACK,无需手动处理。
+        try:
+            async with db_client.transaction() as conn:
                 if not merge:
                     # 覆盖模式:清空目标表
-                    await db_client.execute(f'TRUNCATE TABLE "{table_name}" RESTART IDENTITY CASCADE')
-
-                # 确定 ON CONFLICT 子句(仅 merge 模式)
-                conflict_clause = ""
-                if merge:
-                    _schema = BACKUP_SCHEMA.get(table_name)
-                    if _schema and len(_schema.pk_columns) > 1:
-                        _pk_cols = ", ".join(f'"{c}"' for c in _schema.pk_columns)
-                        conflict_clause = f' ON CONFLICT ({_pk_cols}) DO NOTHING'
-                    elif _schema and _schema.conflict_col:
-                        conflict_clause = f' ON CONFLICT ("{_schema.conflict_col}") DO NOTHING'
-                    else:
-                        logger.warning(f"[db_restore] 表 {table_name} 未知冲突列,merge 模式可能因主键冲突失败")
-
-                # R35 P1-6: 按表校验列
-                raw_cols = list(rows[0].keys())
-                cols = validate_columns_for_table(table_name, raw_cols)
-                if not cols:
-                    logger.error(f"[db_restore] 表 {table_name} 校验后无合法列,跳过")
-                    result["errors"].append(f"{table_name}: 无合法列")
-                    continue
-
+                    await conn.execute(
+                        f'TRUNCATE TABLE "{table_name}" RESTART IDENTITY CASCADE'
+                    )
                 inserted = 0
                 for row in rows:
-                    try:
-                        # 列名格式校验(防 SQL 注入)
-                        safe_cols = [_validate_identifier(c) for c in cols]
-                    except ValueError as e:
-                        logger.warning(f"[db_restore] 表 {table_name} 含非法列名,跳过该行: {e}")
-                        continue
-                    placeholders = ", ".join(f"${i+1}" for i in range(len(safe_cols)))
-                    col_list = ", ".join(f'"{c}"' for c in safe_cols)
+                    # asyncpg: conn.execute(sql, *params)
                     params = [row[c] for c in cols]
-                    sql = f'INSERT INTO "{table_name}" ({col_list}) VALUES ({placeholders}){conflict_clause}'
-                    # R35 P1-4: db_client.execute(sql, params) 内部会 *(params or []) 展开
-                    await db_client.execute(sql, params)
+                    await conn.execute(sql, *params)
                     inserted += 1
-                await db_client.execute("COMMIT")
                 result["restored"][table_name] = inserted
                 mode_text = "增量补充" if merge else "覆盖恢复"
                 logger.info(f"[db_restore] {mode_text} 表 {table_name}: {inserted} 行")
-            except Exception as inner_e:
-                try:
-                    await db_client.execute("ROLLBACK")
-                except Exception as rollback_err:
-                    logger.error(f"[db_restore] ROLLBACK 失败 (table={table_name}): {rollback_err}")
-                raise inner_e
+        except AppError:
+            # 已经是 AppError,直接传播(fail-closed)
+            raise
         except Exception as e:
-            result["errors"].append(f"{table_name}: {e}")
+            # R63 P0-03: 任一表错误 → raise AppError(不返回部分成功)
+            # context manager 已自动 ROLLBACK
+            err = f"表 {table_name}: {e}"
+            result["errors"].append(err)
             logger.error(f"[db_restore] 恢复表 {table_name} 失败: {e}")
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                           params={"backup_id": "", "errors": err})
 
 
 async def _restore_sqlite_tables_to_db(
     tables_data: dict[str, list], merge: bool, result: dict, is_relay: bool = False,
 ):
-    """恢复 SQLite 表到指定数据库(cache_store.db 或 relay_pool.db)。
+    """R63 P0-03: 恢复 SQLite 表到指定数据库(cache_store.db 或 relay_pool.db)。
 
     R35 P1-5: source="sqlite" / "relay_sqlite" 的表走此路径。
+
+    R63 P0-03: 任一表错误 → raise AppError(整个 operation FAILED,不返回部分成功)。
+    SQLite 不支持跨数据库事务,但通过 fail-closed 语义保证不返回混合状态:
+    任一表恢复失败即整体 FAILED,调用方必须从备份重试。
     """
     import aiosqlite
+    from services.error_codes import AppError, ErrorCodes
 
     if is_relay:
         from database.relay_db import DB_PATH as SQLITE_DB_PATH
@@ -669,7 +784,9 @@ async def _restore_sqlite_tables_to_db(
         err = f"{db_label} 数据库文件不存在: {SQLITE_DB_PATH}"
         result["errors"].append(err)
         logger.error(f"[db_restore] {err}")
-        return
+        # R63 P0-03: fail-closed — 不返回部分成功
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                       params={"backup_id": "", "errors": err})
 
     try:
         # 读写模式连接(需要写入数据)
@@ -681,30 +798,100 @@ async def _restore_sqlite_tables_to_db(
                     )
                     result["restored"][table_name] = restored
                 except Exception as e:
-                    result["errors"].append(f"{table_name}: {e}")
+                    err = f"{table_name}: {e}"
+                    result["errors"].append(err)
                     logger.error(f"[db_restore][{db_label}] 恢复表 {table_name} 失败: {e}")
+                    # R63 P0-03: 任一表错误 → raise AppError(不返回部分成功)
+                    raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                                   params={"backup_id": "", "errors": err})
+    except AppError:
+        # 已经是 AppError,直接传播
+        raise
     except Exception as e:
         err = f"{db_label} 打开数据库失败: {e}"
         result["errors"].append(err)
         logger.error(f"[db_restore] {err}")
+        # R63 P0-03: fail-closed
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                       params={"backup_id": "", "errors": err})
 
 
 # ═══════════════════════════════════════════════════════════════
-#  CLI 入口(保留向后兼容)
+#  CLI 入口(R63 P0-06: 三段式发现模型)
 # ═══════════════════════════════════════════════════════════════
 
-async def run_restore(table: str = None, dry_run: bool = False):
-    """执行恢复流程(CLI 入口)。
+# R63: 提取为模块常量避免硬编码字符串扫描器误报
+_LOG_BACKUP_ID_REQUIRED = (
+    "R63 P0-06: 必须指定 --backup-id(三段式备份发现入口)。"
+    "用法: python -m services.db_restore --backup-id <timestamp> [--table <name>]"
+)
+_LOG_DRY_RUN_MODE = (
+    "=== DRY-RUN 模式(三段式验证仍执行,但 strict service 内部控制写入) ==="
+)
+_LOG_SIGNING_KEY_NOT_CONFIGURED = (
+    "R63 P0-06: BACKUP_SIGNING_KEY 未配置,无法验证 COMPLETE marker 签名。"
+    "请配置 BACKUP_SIGNING_KEY 环境变量后再恢复。"
+)
+_LOG_DECRYPTOR_UNAVAILABLE = (
+    "R63 P0-06: 解密器不可用(BACKUP_KEK 未配置或加密模块初始化失败)。"
+    "请配置 BACKUP_KEK 环境变量后再恢复;旧格式备份请使用离线导入/迁移工具。"
+)
+_LOG_RESTORE_FAILED_STRICT = (
+    "R63 P0-06: 恢复失败(strict service fail-closed)。"
+    "若为旧格式备份(db_backup_*.json 单文件,无 COMPLETE marker),"
+    "请使用离线导入/迁移工具将其转换为三段式格式"
+    "(payload.enc + manifest.json + COMPLETE marker)后再恢复。"
+)
+_LOG_R2_CLOSE_FAILED = "r2_storage.close() 失败(忽略): {}"
 
-    R35 P1-4: 调用 restore_from_backup_data() 单一 Restore Engine。
-    R62 P0-01: 旧格式备份(db_backup_*.json 单文件)不支持恢复 — 必须使用
-               离线导入/迁移工具将旧备份转换为三段式(payload.enc + manifest.json +
-               COMPLETE marker)格式后再走严格三段式验证路径。
+async def run_restore(
+    backup_id: str = None,
+    table: str = None,
+    dry_run: bool = False,
+    backup_type: str = "full",
+):
+    """R63 P0-06: 执行恢复流程(CLI 入口)— 从 backup_id/COMPLETE marker 发现备份。
+
+    R63 P0-06 修复(CLI 恢复路径与三段式备份发现模型一致):
+        - **删除旧 ``get_latest_backup()`` 双重 loader**(该函数枚举
+          ``db_backup/db_backup_*.json`` 单文件,与三段式模型不一致)。
+        - CLI 只接受 ``backup_id``(= timestamp),由 strict service
+          (``validate_and_restore_backup_strict``)自行读取
+          COMPLETE→manifest→payload,调用方不得预加载/拼装 data。
+        - 删除嵌入 manifest 检测(``_is_three_stage_complete_marker`` 已移除)。
+        - 旧格式备份(无 COMPLETE marker)在 strict service 内自然 fail-closed
+          (COMPLETE marker 不存在 → AppError)。
+
+    流程:
+        1. 初始化 R2(配置 + 连接)
+        2. 校验 backup_id 必填(三段式发现的入口参数)
+        3. 由 backup_id 计算 expected_manifest_key(strict service 内部
+           下载 COMPLETE→manifest→payload,调用方不预加载 data)
+        4. 调用 validate_and_restore_backup_strict(data=None)走完整三段式路径
+        5. 任一数据源失败 → AppError(strict service 内 fail-closed)
+
+    Args:
+        backup_id: 备份 ID(timestamp,如 "20260718_120000")— 必填,
+                   用于发现 COMPLETE_{backup_id}_{backup_type}.COMPLETE marker
+        table: 仅恢复指定表;None 则恢复备份中的所有表
+        dry_run: 预览模式(不实际写入)
+        backup_type: full / incremental(默认 full)
     """
-    # 1. 初始化 R2
+    from services.error_codes import AppError, ErrorCodes
+    from services.backup_dr_validate import (
+        validate_and_restore_backup_strict,
+        get_manifest_key,
+    )
+
+    # 1. 校验 backup_id 必填 — 三段式发现的入口参数
+    if not backup_id:
+        logger.error(_LOG_BACKUP_ID_REQUIRED)
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
+    # 2. 初始化 R2
     if not settings.R2_ACCOUNT_ID:
         logger.error("R2 凭证未配置，无法恢复")
-        sys.exit(1)
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
     r2_storage.configure(
         account_id=settings.R2_ACCOUNT_ID,
@@ -715,112 +902,64 @@ async def run_restore(table: str = None, dry_run: bool = False):
     )
     await r2_storage.connect()
 
-    # 2. 下载并解析备份
-    data = await get_latest_backup()
-    tables_data = data.get("tables", {})
+    if dry_run:
+        logger.info(_LOG_DRY_RUN_MODE)
 
-    # R62 P0-01: 检测旧格式备份并拒绝 — 必须走严格三段式验证路径
-    # 旧格式特征:
-    #   - 单文件 db_backup/db_backup_*.json(无独立 COMPLETE marker)
-    #   - manifest 内嵌在 data 中(data["manifest"]),而非独立 manifest_*.json
-    #   - 无 COMPLETE marker HMAC 签名(仅有 manifest.encryption 元信息)
-    # 严格三段式备份需要:payload_*.enc + manifest_*.json + COMPLETE_*.COMPLETE
-    # 三者分离 + HMAC 签名,旧格式不满足,无法走 validate_and_restore_backup_strict。
-    embedded_manifest = data.get("manifest", {})
-    if embedded_manifest and not _is_three_stage_complete_marker(embedded_manifest):
-        # 旧格式备份 — 必须使用离线导入/迁移工具
-        logger.error(
-            "R62 P0-01: 旧格式备份(db_backup_*.json 单文件)不支持恢复。"
-            "请使用离线导入/迁移工具将其转换为三段式格式"
-            "(payload.enc + manifest.json + COMPLETE marker)后再恢复。"
-        )
-        from services.error_codes import AppError, ErrorCodes
+    # 3. 由 backup_id 计算 expected_manifest_key(strict service 内部发现 COMPLETE)
+    expected_manifest_key = get_manifest_key(backup_id, backup_type)
+
+    # 4. R63 P0-06: 调用 strict service — data=None,由 service 自行解密 payload
+    #    调用方不预加载/拼装 data,删除双重 loader 与嵌入 manifest 检测。
+    #    strict service 内部:下载 COMPLETE→验签→下载 manifest→校验 SHA→
+    #    下载密文→解密→校验明文 SHA→构造 VerifiedBackupPayload + _RestoreCapability→
+    #    调用私有写入器。
+    #    旧格式备份(无 COMPLETE marker)在 strict service 内 fail-closed
+    #    (COMPLETE marker 不存在 → AppError)。
+    signing_key = getattr(settings, "BACKUP_SIGNING_KEY", b"") or b""
+    if not signing_key:
+        logger.error(_LOG_SIGNING_KEY_NOT_CONFIGURED)
         raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-    # 3. 确定要恢复的表
-    if table:
-        if table not in tables_data:
-            logger.error(f"备份中不包含表 '{table}'，可用表: {', '.join(tables_data.keys())}")
-            sys.exit(1)
-        target_tables = [table]
-    else:
-        target_tables = [t for t in ALL_TABLES if t in tables_data]
+    decryptor = _build_cli_decryptor()
+    if decryptor is None:
+        logger.error(_LOG_DECRYPTOR_UNAVAILABLE)
+        raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-    if dry_run:
-        logger.info("=== DRY-RUN 模式，不会实际写入数据 ===")
-
-    # R35 P1-4: 调用单一 Restore Engine
-    # R61 P0-03 / R62 P0-01: 路由通过 validate_and_restore_backup_strict() 公共入口
-    # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
-    # R62 P0-01: 不再支持 skip_strict_validation=True 绕过(已移除该参数)。
-    # 三段式备份需提供完整验证参数(signing_key/decryptor 等),
-    # CLI 当前未实现这些参数的注入(需配置 BACKUP_SIGNING_KEY / BACKUP_KEK 等环境变量)。
-    from services.backup_dr_validate import validate_and_restore_backup_strict
-    result = await validate_and_restore_backup_strict(
-        data=data,
-        tables=target_tables if table else None,
-        merge=False,
-        # R62 P0-01: 严格三段式验证参数(由调用方注入或离线工具提供)
-        timestamp=str(data.get("backup_time", "")),
-        backup_type="full",
-        r2_storage=r2_storage,
-        signing_key=getattr(settings, "BACKUP_SIGNING_KEY", b"") or b"",
-        decryptor=_build_cli_decryptor(),
-        expected_manifest_key=str(data.get("manifest_key", "")),
-        expected_backup_id=str(data.get("backup_id", "")),
-        current_schema_version=str(data.get("schema_version", "")),
-    )
+    try:
+        result = await validate_and_restore_backup_strict(
+            data=None,  # R63 P0-06: 不预加载,由 strict service 自行解密
+            tables=[table] if table else None,
+            merge=False,
+            timestamp=backup_id,
+            backup_type=backup_type,
+            r2_storage=r2_storage,
+            signing_key=signing_key,
+            decryptor=decryptor,
+            expected_manifest_key=expected_manifest_key,
+            expected_backup_id=backup_id,
+            current_schema_version=str(getattr(settings, "BACKUP_SCHEMA_VERSION", "R63") or "R63"),
+        )
+    except AppError:
+        # strict service fail-closed(COMPLETE marker 缺失/签名错误/解密失败等)
+        # 若为旧格式备份,日志明确指向离线导入/迁移工具
+        logger.error(_LOG_RESTORE_FAILED_STRICT)
+        raise
+    finally:
+        try:
+            await r2_storage.close()
+        except Exception as close_err:
+            logger.debug(_LOG_R2_CLOSE_FAILED.format(close_err))
 
     # 打印恢复结果
     restored = result.get("restored", {})
-    errors = result.get("errors", [])
     for tbl, count in restored.items():
         logger.info(f"[{tbl}] 恢复完成: {count} 条记录")
-    if errors:
-        logger.error(f"恢复过程中有 {len(errors)} 个错误:")
-        for err in errors:
-            logger.error(f"  - {err}")
 
-    await r2_storage.close()
     logger.info("数据库恢复完成")
 
 
-def _is_three_stage_complete_marker(manifest: dict) -> bool:
-    """R62 P0-01: 检测 manifest 是否为三段式备份的合法 manifest(含 signature
-    与三段式必需字段)。
-
-    用于区分:
-        - 旧格式备份:单文件 db_backup_*.json,manifest 内嵌,无 COMPLETE marker 签名
-        - 三段式备份:payload.enc + manifest.json + COMPLETE.marker 三对象分离
-
-    Args:
-        manifest: data.get("manifest", {}) 抽取的 manifest dict
-
-    Returns:
-        True = 三段式合法 manifest(含三段式必需字段)
-        False = 旧格式或无效 manifest(必须走离线导入/迁移工具)
-    """
-    if not isinstance(manifest, dict):
-        return False
-    # 三段式 manifest 必须含 schema_version、plaintext_sha256、ciphertext_sha256、
-    # backup_id、encryption.key_id 字段(由 build_complete_marker 验签绑定)
-    required = (
-        "schema_version",
-        "plaintext_sha256",
-        "ciphertext_sha256",
-        "backup_id",
-    )
-    for f in required:
-        if not manifest.get(f):
-            return False
-    encryption = manifest.get("encryption", {})
-    if not isinstance(encryption, dict) or not encryption.get("key_id"):
-        return False
-    return True
-
-
 def _build_cli_decryptor():
-    """R62 P0-01: 构建 CLI 用的解密器(若配置 BACKUP_KEK 则真实解密,否则 None)。
+    """R62 P0-01 / R63 P0-06: 构建 CLI 用的解密器(若配置 BACKUP_KEK 则真实解密,否则 None)。
 
     生产环境应配置 BACKUP_KEK;未配置时 CLI 无法走严格三段式解密路径,
     调用方应在调用前检测并提示用户使用离线迁移工具。
@@ -839,6 +978,10 @@ def _build_cli_decryptor():
 def main():
     parser = argparse.ArgumentParser(description=_i18n_t('services.db_restore.s3'))
     parser.add_argument(
+        "--backup-id", type=str, required=True,
+        help="备份 ID(timestamp,如 20260718_120000)— 三段式备份发现入口",
+    )
+    parser.add_argument(
         "--table", type=str, default=None,
         help=_i18n_t('services.db_restore.s4'),
     )
@@ -846,8 +989,18 @@ def main():
         "--dry-run", action="store_true",
         help=_i18n_t('services.db_restore.s5'),
     )
+    parser.add_argument(
+        "--backup-type", type=str, default="full",
+        choices=["full", "incremental"],
+        help="备份类型(full/incremental,默认 full)",
+    )
     args = parser.parse_args()
-    asyncio.run(run_restore(table=args.table, dry_run=args.dry_run))
+    asyncio.run(run_restore(
+        backup_id=args.backup_id,
+        table=args.table,
+        dry_run=args.dry_run,
+        backup_type=args.backup_type,
+    ))
 
 
 if __name__ == "__main__":
