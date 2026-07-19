@@ -629,18 +629,29 @@ jobs:
         set -euo pipefail
         CERT_FILE="image-signing-cert.pem"
         echo "R63 P0-01: Extracting certificate-identity (SAN URI) from Fulcio cert"
+        # R65 fix: cosign --output-certificate 可能输出 PEM 或 DER 格式,
+        #          openssl x509 默认期望 PEM。尝试 PEM,然后 DER,确保两种格式都能提取 SAN。
         # Fulcio cert 的 subjectAltName 扩展包含 URI:https://github.com/<owner>/<repo>/.github/workflows/<wf>@<ref>
-        SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)
+        SAN_LINE=""
+        for inform in PEM DER; do
+          SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -inform "${inform}" -noout -ext subjectAltName 2>/dev/null || true)
+          if [ -n "${SAN_LINE}" ]; then
+            echo "  cert format: ${inform} (subjectAltName extracted)"
+            break
+          fi
+        done
         echo "  cert subjectAltName: ${SAN_LINE}"
+        # R65 fix: 添加 || true 防止 set -e + pipefail 在 grep 无匹配时
+        #          提前退出(导致 cert dump 诊断输出不打印)。
         # 提取 URI:xxx 字段(可能有多个 SAN,取第一个 URI)
-        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://')
+        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://' || true)
         if [ -z "${CERT_IDENTITY}" ]; then
           echo "::error::无法从 Fulcio cert 提取 SAN URI (certificate-identity)"
           echo "  R63 P0-01: 拒绝 fallback 到拼接字符串 — 必须使用实际 cert 中的 identity"
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
           echo "  cert dump (first 80 lines):"
-          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
@@ -864,15 +875,26 @@ jobs:
           exit 1
         fi
         echo "R63 P0-01: Extracting certificate-identity (SAN URI) from manifest Fulcio cert"
-        SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)
+        # R65 fix: cosign sign-blob --output-certificate 可能输出 DER 格式,
+        #          openssl x509 默认期望 PEM。尝试 PEM,然后 DER。
+        SAN_LINE=""
+        for inform in PEM DER; do
+          SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -inform "${inform}" -noout -ext subjectAltName 2>/dev/null || true)
+          if [ -n "${SAN_LINE}" ]; then
+            echo "  cert format: ${inform} (subjectAltName extracted)"
+            break
+          fi
+        done
         echo "  cert subjectAltName: ${SAN_LINE}"
-        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://')
+        # R65 fix: 添加 || true 防止 set -e + pipefail 在 grep 无匹配时提前退出,
+        #          确保后续 cert dump 诊断输出能打印出来辅助排查。
+        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://' || true)
         if [ -z "${CERT_IDENTITY}" ]; then
           echo "::error::无法从 manifest Fulcio cert 提取 SAN URI"
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
           echo "  cert dump (first 80 lines):"
-          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
@@ -1023,13 +1045,24 @@ jobs:
           exit 1
         fi
         echo "R64 P0-02: Extracting certificate-identity (SAN URI) from release manifest Fulcio cert"
-        SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)
+        # R65 fix: cosign sign-blob --output-certificate 可能输出 DER 格式,尝试 PEM 然后 DER
+        SAN_LINE=""
+        for inform in PEM DER; do
+          SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -inform "${inform}" -noout -ext subjectAltName 2>/dev/null || true)
+          if [ -n "${SAN_LINE}" ]; then
+            echo "  cert format: ${inform} (subjectAltName extracted)"
+            break
+          fi
+        done
         echo "  cert subjectAltName: ${SAN_LINE}"
-        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://')
+        # R65 fix: 添加 || true 防止 set -e + pipefail 在 grep 无匹配时提前退出
+        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://' || true)
         if [ -z "${CERT_IDENTITY}" ]; then
           echo "::error::无法从 release manifest Fulcio cert 提取 SAN URI"
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
+          echo "  cert dump (first 80 lines):"
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
@@ -1572,14 +1605,23 @@ jobs:
           exit 1
         fi
         echo "R63 P0-01: Extracting certificate-identity (SAN URI) from sign-image Fulcio cert"
-        SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -noout -ext subjectAltName 2>/dev/null || true)
+        # R65 fix: cosign --output-certificate 可能输出 PEM 或 DER 格式,尝试 PEM 然后 DER
+        SAN_LINE=""
+        for inform in PEM DER; do
+          SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -inform "${inform}" -noout -ext subjectAltName 2>/dev/null || true)
+          if [ -n "${SAN_LINE}" ]; then
+            echo "  cert format: ${inform} (subjectAltName extracted)"
+            break
+          fi
+        done
         echo "  cert subjectAltName: ${SAN_LINE}"
-        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://')
+        # R65 fix: 添加 || true 防止 set -e + pipefail 在 grep 无匹配时提前退出
+        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://' || true)
         if [ -z "${CERT_IDENTITY}" ]; then
           echo "::error::无法从 sign-image Fulcio cert 提取 SAN URI"
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
-          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
