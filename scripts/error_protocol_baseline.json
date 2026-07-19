@@ -11,10 +11,17 @@
       "paths": [
         "admin/passwords.py",
         "admin/mfa.py",
+        "admin/sessions.py",
         "admin/auth.py",
         "services/button_security.py",
+        "services/button_approval_policy.py",
         "services/approval_workflow.py",
-        "services/command_bus.py"
+        "services/approval_executor.py",
+        "services/command_bus.py",
+        "services/permission.py",
+        "services/rbac.py",
+        "services/high_risk_policy.py",
+        "services/content_policy.py"
       ]
     },
     "destructive": {
@@ -23,7 +30,12 @@
       "baseline_violations": 0,
       "paths": [
         "services/data_lifecycle.py",
-        "admin/purge.py"
+        "admin/purge.py",
+        "services/db_backup.py",
+        "services/db_restore.py",
+        "services/disaster_recovery.py",
+        "services/repair_console.py",
+        "services/replication_policy.py"
       ]
     },
     "data-integrity": {
@@ -33,9 +45,17 @@
       "paths": [
         "services/backup_dr_validate.py",
         "services/backup_crypto.py",
+        "services/backup_engine.py",
+        "services/effect_receipts.py",
         "services/crdb_sync_service.py",
         "services/crdb_sync_event_wakeup.py",
-        "database/redis_queue.py"
+        "database/redis_queue.py",
+        "database/cache_store.py",
+        "database/db_writer.py",
+        "database/dlq_worker.py",
+        "database/migrate.py",
+        "database/unit_of_work.py",
+        "database/write_router.py"
       ]
     },
     "financial": {
@@ -44,7 +64,9 @@
       "baseline_violations": 0,
       "paths": [
         "services/quota.py",
-        "services/billing.py"
+        "services/billing.py",
+        "services/entitlements.py",
+        "services/quota_ledger.py"
       ]
     },
     "observability": {
@@ -152,31 +174,9 @@
           "plan": "R64 重构 admin 错误处理:except 块改用 logger + raise AppError,模块边界函数返回 ErrorEnvelope,raise 改用 AppError(ErrorCodes.XXX)"
         },
         {
-          "file": "admin/sessions.py",
-          "line": 90,
-          "fingerprint": "168ded363e5e54572510ca8bd642009b4041d0f1bfb1d5b79f1b23c7666749f8",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-admin",
-          "root_cause": "admin 模块历史遗留 except Exception: pass / return 0/False / 模块边界函数返回裸字符串 / raise ValueError 携带字符串",
-          "plan": "R64 重构 admin 错误处理:except 块改用 logger + raise AppError,模块边界函数返回 ErrorEnvelope,raise 改用 AppError(ErrorCodes.XXX)"
-        },
-        {
-          "file": "admin/sessions.py",
-          "line": 505,
-          "fingerprint": "7a92b57ad2831518b0113dc3e71b0ea80a10fc73c07faebe95925f97696b44b1",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-admin",
-          "root_cause": "admin 模块历史遗留 except Exception: pass / return 0/False / 模块边界函数返回裸字符串 / raise ValueError 携带字符串",
-          "plan": "R64 重构 admin 错误处理:except 块改用 logger + raise AppError,模块边界函数返回 ErrorEnvelope,raise 改用 AppError(ErrorCodes.XXX)"
-        },
-        {
-          "file": "services/repair_console.py",
-          "line": 292,
-          "fingerprint": "aa2060a01934580f21c160c674bfa0035eb5b40bdf14f69c8a254416cb667a0e",
+          "file": "services/notifications.py",
+          "line": 132,
+          "fingerprint": "bc7dbd2dc79705f96a18468b0b1e9977bb002f67b87d823951b3fa77971636a7",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -185,9 +185,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/repair_console.py",
-          "line": 336,
-          "fingerprint": "5d550d106fe6fb909af010e68df5727894295353041c54ccce36ca771e9adbf2",
+          "file": "services/notifications.py",
+          "line": 171,
+          "fingerprint": "0f34f246d33273e84e45e75bb4716c76a2ec9814bc6744a32ee20a8b6c8f0c87",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -196,9 +196,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/repair_console.py",
-          "line": 576,
-          "fingerprint": "39a6fc02f5aa2b8ed912a193657e006a426f30b1bab6ba7033b6e0e114e11f34",
+          "file": "services/notifications.py",
+          "line": 472,
+          "fingerprint": "f2f432ccca56e9ea6e5af37a906ec7375d8291228bc51066992430a4c341f83c",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -207,9 +207,20 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/repair_console.py",
+          "file": "services/notifications.py",
+          "line": 509,
+          "fingerprint": "a6e3b951bd926af170a1af0794d1b2d5a0cdce599acc67b8b0ea03487ddb58d9",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/notifications.py",
           "line": 660,
-          "fingerprint": "94f677bda1fa4ace0871929c5ca763e6b25da336bb367ec2b5d87461f4ba725d",
+          "fingerprint": "e92a46dcbb59d11612162bc728a14da5c24584a416ce52988e49192e6ddb867b",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -218,9 +229,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/repair_console.py",
-          "line": 1085,
-          "fingerprint": "be79b7b41e7c935a3b634d7b1181794e24b4cf2864bec1d9798ed75ff176ebc2",
+          "file": "services/notifications.py",
+          "line": 917,
+          "fingerprint": "b804a96a25361b6e452783c2e34299ce53907249ad8b72b30076ea000dfb799f",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -229,9 +240,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/repair_console.py",
-          "line": 1125,
-          "fingerprint": "435da4cef5ac09002f37eb5b4d731211d229a9295954c023e78fa1a60a2d4ed8",
+          "file": "services/notifications.py",
+          "line": 1006,
+          "fingerprint": "0c47843331a2c3bd296b9c09df15c33a7843648bc4f17ec221110104d68b5ccf",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -240,53 +251,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/disaster_recovery.py",
-          "line": 508,
-          "fingerprint": "89ed6d446356af6349f200f80984e983207f1a0f16e55787de6c70586880a215",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/disaster_recovery.py",
-          "line": 520,
-          "fingerprint": "89ed6d446356af6349f200f80984e983207f1a0f16e55787de6c70586880a215",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/disaster_recovery.py",
-          "line": 749,
-          "fingerprint": "2000ec69ac89f8f6fb52037de26b47d33df32620cf339483d8ab6f3d3c059400",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/disaster_recovery.py",
-          "line": 208,
-          "fingerprint": "dc7c5f845291a4f29c39f74b3cdf36783fe32f4fe18ef597aeb2d3cc07ca65a7",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/disaster_recovery.py",
-          "line": 879,
-          "fingerprint": "e5754395f02bbe634aa826ed9938120cb5ed3427f314ea413254bd91996708f2",
+          "file": "services/ru_cost_center.py",
+          "line": 609,
+          "fingerprint": "05074d99cc4803229b9eb627f7db42be83367f99babd6eeb5f58682f51484984",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -298,6 +265,105 @@
           "file": "services/ru_cost_center.py",
           "line": 166,
           "fingerprint": "74ad27ca77e30ef0c803bf037799e853bf0205f14916f1eac45d0738e1efdeb0",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/task_center.py",
+          "line": 119,
+          "fingerprint": "24ad3426df937632ef75cbc3a31d07c8607cf261e806723a9ef00b1a0108588a",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/task_center.py",
+          "line": 157,
+          "fingerprint": "56396272ca6b72acbf422dbe20e863dc5ffc25d22789c7e22b0d3b2671bcd246",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/task_center.py",
+          "line": 192,
+          "fingerprint": "57aed812edab46b975052e68ddca247fcd3080f65be4c704655517835c5ffa8f",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/task_center.py",
+          "line": 226,
+          "fingerprint": "aeed2f47e8156050553c118a5397a4fd34e8bd870488f24b2d0a991339b1d38e",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/task_center.py",
+          "line": 259,
+          "fingerprint": "4a04b0daa91783afe4a92e7ede962bcf16c2b213d9bb980a9c00c22ca7e0870c",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/collections.py",
+          "line": 114,
+          "fingerprint": "7b66eab9d07b10b3538db52f100e51b1a50e58e6f5a04602fb99f88261547fba",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/collections.py",
+          "line": 231,
+          "fingerprint": "873d8a45b7696d426ff1806ac9d3848b88ee2b39790407c3d0d8d2fb87386b8e",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/collections.py",
+          "line": 281,
+          "fingerprint": "e71bf7af7e6f27431847bc9d9847f11a950ab8b79d76991da764bd4523b9f172",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/collections.py",
+          "line": 503,
+          "fingerprint": "52421244da30e9c192d5df98e170a22a961489a75b071f0bc4e8737cfb29b779",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -427,9 +493,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/migration_runner.py",
-          "line": 596,
-          "fingerprint": "94400ae6654fc192268095545b7e85958dbafb7cc4705b2e9480a8317983ffaa",
+          "file": "services/crdb_ru_collector.py",
+          "line": 774,
+          "fingerprint": "38dddf8b7cf7b46acc97cb441c71432ae37a06c2d475a683b69a350246c95daa",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -438,9 +504,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/migration_runner.py",
-          "line": 412,
-          "fingerprint": "af6ec91c908682759ee90323b292b94d5939859b8a0ee86f02d91931e8fb2b7d",
+          "file": "services/crdb_ru_collector.py",
+          "line": 417,
+          "fingerprint": "43b399f616749bbc3a825616f898af33ec4e992533fe4ba7d325ca89f4751904",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -449,9 +515,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/migration_runner.py",
-          "line": 444,
-          "fingerprint": "7e3107cc9d295b961c4ab854d3e10016dcd674a7811f4199bca7a3742a33101a",
+          "file": "services/crdb_ru_collector.py",
+          "line": 572,
+          "fingerprint": "675393ad4152b05d03ee6d4d596fe2f6513e8ecc8ca414a72a276049ba63f68c",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -460,9 +526,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/task_center.py",
-          "line": 119,
-          "fingerprint": "24ad3426df937632ef75cbc3a31d07c8607cf261e806723a9ef00b1a0108588a",
+          "file": "services/crdb_ru_collector.py",
+          "line": 603,
+          "fingerprint": "ef95626d7b316fa9e0e008367afe3c7c72cb958a61a72a625470526ad429b8c5",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -471,383 +537,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/task_center.py",
-          "line": 157,
-          "fingerprint": "56396272ca6b72acbf422dbe20e863dc5ffc25d22789c7e22b0d3b2671bcd246",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/task_center.py",
-          "line": 192,
-          "fingerprint": "57aed812edab46b975052e68ddca247fcd3080f65be4c704655517835c5ffa8f",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/task_center.py",
-          "line": 226,
-          "fingerprint": "aeed2f47e8156050553c118a5397a4fd34e8bd870488f24b2d0a991339b1d38e",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/task_center.py",
-          "line": 259,
-          "fingerprint": "4a04b0daa91783afe4a92e7ede962bcf16c2b213d9bb980a9c00c22ca7e0870c",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/retention_worker.py",
-          "line": 77,
-          "fingerprint": "6363fd719676bb45ac42fc6ad4bbd002733ff02afa3435aa49af81ded6626312",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/retention_worker.py",
-          "line": 142,
-          "fingerprint": "47b4df92bb8c15088234faede07905734ca4be2603aced85018da285aa9a367b",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/retention_worker.py",
-          "line": 233,
-          "fingerprint": "41fc8b350343a5ef39311b6470bc38e34864714cc19b75585ee1062637c0846e",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/i18n.py",
-          "line": 127,
-          "fingerprint": "4007ea38fd135fa7addce89ca436de3f9f07c3facc983543cfef92035d39fcb5",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/i18n.py",
-          "line": 2203,
-          "fingerprint": "95f3e36e1639aa2a8f3083dda5deefeea387f53c1ca3299e9dc2e8a125eeae92",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/i18n.py",
-          "line": 838,
-          "fingerprint": "0f6ba961f9a7edfaffe2114f80fbcdadcdb88d391a706f2032c9d5154eb8a3f0",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/i18n.py",
-          "line": 846,
-          "fingerprint": "0f6ba961f9a7edfaffe2114f80fbcdadcdb88d391a706f2032c9d5154eb8a3f0",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 940,
-          "fingerprint": "c7e1bfcefdce4eb46adaadac00b97f294df94383baf90c5fbd6e211977f95014",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 948,
-          "fingerprint": "c7e1bfcefdce4eb46adaadac00b97f294df94383baf90c5fbd6e211977f95014",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 957,
-          "fingerprint": "c7e1bfcefdce4eb46adaadac00b97f294df94383baf90c5fbd6e211977f95014",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 1313,
-          "fingerprint": "390a6a061d6163d6f5a939d4da6a28087afc188ff7ecd0dfc65c175d7e4f626e",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 336,
-          "fingerprint": "ed62da22b9cfaea99fe02706f081bcec62b3573169f9988be2de6c3c13c4cf7b",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 369,
-          "fingerprint": "ed62da22b9cfaea99fe02706f081bcec62b3573169f9988be2de6c3c13c4cf7b",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 1473,
-          "fingerprint": "a4b4c4f38e0f0c73dfc006747b81e07c240e614ba1bbe69963262c64d38f8884",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 1452,
-          "fingerprint": "a4b4c4f38e0f0c73dfc006747b81e07c240e614ba1bbe69963262c64d38f8884",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 1465,
-          "fingerprint": "a4b4c4f38e0f0c73dfc006747b81e07c240e614ba1bbe69963262c64d38f8884",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 192,
-          "fingerprint": "1c3a1665fe49fe6cc507ca2f11ca5a543fb863389b2ca578545235f232f4ba39",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 256,
-          "fingerprint": "7dc0a7d14995ed7b12e844aeef1cacb778594d5398995f2766ea3b5382ceb1ba",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/maintenance_mode.py",
-          "line": 531,
-          "fingerprint": "cff1138a52b15a96241b1db531ec73f5d546d8a2e63f2535cdfed2e0fc8e097e",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 746,
-          "fingerprint": "1761952a6a61bd68c390d87ce59b52b74e21871e88f47e0b2b1f611166b5f4f8",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 851,
-          "fingerprint": "a274b5dbd91ca53204494240160bf770f389efe11280efbec46c844f9f21bf99",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 181,
-          "fingerprint": "c3fa3690f99a6a3c3c497d0d1cbae6c960e3efbbbfd220f74ec1a0faf4c63903",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 240,
-          "fingerprint": "df3a5551a475105e44cc8b82eee50c7b16ef1767f3a74bec60b2212dfca60653",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 287,
-          "fingerprint": "ff294fe787f789392654ca4652b409fabab7b7d7f8e6722737f16800f2b96297",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 451,
-          "fingerprint": "e0b0e387a194cfdf7d6f5b9346321ff764c158d13ae03186474d5059899242fc",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 511,
-          "fingerprint": "b0fe8ec44b54a5b40230dd4803cc0d0c4fb85341cf9451bede5a3cdcecdc2d6f",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/quota_ledger.py",
-          "line": 644,
-          "fingerprint": "40ea2b3b2ae91a0fe7a20800732ec444938b4d7d967bf1a0d7f03603e3703d83",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/effect_receipts.py",
-          "line": 526,
-          "fingerprint": "d79f3ab7a9e30155b9127cc7faa47c4ec4a0ca03d6927acb9fa096ccafdc131a",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/rbac.py",
-          "line": 312,
-          "fingerprint": "8b83fb3e176dbc329c028997980f76a7ed63403c2375bf5c715b81197d6dee38",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/rbac.py",
-          "line": 343,
-          "fingerprint": "51527eb75ecd3b2306edb404638c02cd0a0d4d90aa0428c3c0d3c99ddb1f8a35",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/rbac.py",
-          "line": 445,
-          "fingerprint": "a09d12fc720a0a9fb26ef6a7a0b7da49f880736ce6ad981e3b64b64ee6112f9c",
+          "file": "services/crdb_ru_collector.py",
+          "line": 871,
+          "fingerprint": "7522b3b6b11c6c1c79b8f3ec56a4b9a9c02d332caf0cf59e07d2641ba7e630f1",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -892,39 +584,6 @@
           "file": "services/prometheus_exporter.py",
           "line": 1420,
           "fingerprint": "5f202792bd99fc7362255bd34b5f932026b1aea03159af319547606cf12a1d71",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/db_restore.py",
-          "line": 604,
-          "fingerprint": "f5a6c841525be7b13933fe9a5f8588c02b0622b7d61e2d50591ec04f1b99cadb",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/db_restore.py",
-          "line": 293,
-          "fingerprint": "44134517de81ea93a23bb299af9e190a0aece731bf892843e0a742c26dd9dadd",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/db_restore.py",
-          "line": 376,
-          "fingerprint": "4c7e2892799de918e9a32a46d29957084949a8abe530ca563ce7ba487bd4710c",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1087,94 +746,6 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/crdb_ru_collector.py",
-          "line": 416,
-          "fingerprint": "43b399f616749bbc3a825616f898af33ec4e992533fe4ba7d325ca89f4751904",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/crdb_ru_collector.py",
-          "line": 571,
-          "fingerprint": "675393ad4152b05d03ee6d4d596fe2f6513e8ecc8ca414a72a276049ba63f68c",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/crdb_ru_collector.py",
-          "line": 602,
-          "fingerprint": "ef95626d7b316fa9e0e008367afe3c7c72cb958a61a72a625470526ad429b8c5",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/collections.py",
-          "line": 114,
-          "fingerprint": "7b66eab9d07b10b3538db52f100e51b1a50e58e6f5a04602fb99f88261547fba",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/collections.py",
-          "line": 231,
-          "fingerprint": "873d8a45b7696d426ff1806ac9d3848b88ee2b39790407c3d0d8d2fb87386b8e",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/collections.py",
-          "line": 281,
-          "fingerprint": "e71bf7af7e6f27431847bc9d9847f11a950ab8b79d76991da764bd4523b9f172",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/collections.py",
-          "line": 503,
-          "fingerprint": "52421244da30e9c192d5df98e170a22a961489a75b071f0bc4e8737cfb29b779",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
-          "file": "services/user_repair.py",
-          "line": 69,
-          "fingerprint": "77b3fa9961e89a9af08d44870ebdb8c8d8fa43b54ac89bcff7e9905744f1b269",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-services",
-          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
-          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
-        },
-        {
           "file": "services/button_flow.py",
           "line": 252,
           "fingerprint": "f2bce11c333be7fd84e977a17d81bc53e12861ff5a779c3a759d2c2b7198b8a8",
@@ -1241,9 +812,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/notifications.py",
-          "line": 132,
-          "fingerprint": "bc7dbd2dc79705f96a18468b0b1e9977bb002f67b87d823951b3fa77971636a7",
+          "file": "services/user_repair.py",
+          "line": 69,
+          "fingerprint": "77b3fa9961e89a9af08d44870ebdb8c8d8fa43b54ac89bcff7e9905744f1b269",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1252,9 +823,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/notifications.py",
-          "line": 171,
-          "fingerprint": "0f34f246d33273e84e45e75bb4716c76a2ec9814bc6744a32ee20a8b6c8f0c87",
+          "file": "services/migration_runner.py",
+          "line": 596,
+          "fingerprint": "94400ae6654fc192268095545b7e85958dbafb7cc4705b2e9480a8317983ffaa",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1263,9 +834,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/notifications.py",
-          "line": 472,
-          "fingerprint": "f2f432ccca56e9ea6e5af37a906ec7375d8291228bc51066992430a4c341f83c",
+          "file": "services/migration_runner.py",
+          "line": 412,
+          "fingerprint": "af6ec91c908682759ee90323b292b94d5939859b8a0ee86f02d91931e8fb2b7d",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1274,9 +845,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/notifications.py",
-          "line": 509,
-          "fingerprint": "a6e3b951bd926af170a1af0794d1b2d5a0cdce599acc67b8b0ea03487ddb58d9",
+          "file": "services/migration_runner.py",
+          "line": 444,
+          "fingerprint": "7e3107cc9d295b961c4ab854d3e10016dcd674a7811f4199bca7a3742a33101a",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1285,9 +856,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/notifications.py",
-          "line": 660,
-          "fingerprint": "e92a46dcbb59d11612162bc728a14da5c24584a416ce52988e49192e6ddb867b",
+          "file": "services/maintenance_mode.py",
+          "line": 940,
+          "fingerprint": "c7e1bfcefdce4eb46adaadac00b97f294df94383baf90c5fbd6e211977f95014",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1296,9 +867,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/notifications.py",
-          "line": 917,
-          "fingerprint": "b804a96a25361b6e452783c2e34299ce53907249ad8b72b30076ea000dfb799f",
+          "file": "services/maintenance_mode.py",
+          "line": 948,
+          "fingerprint": "c7e1bfcefdce4eb46adaadac00b97f294df94383baf90c5fbd6e211977f95014",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1307,9 +878,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/notifications.py",
-          "line": 1006,
-          "fingerprint": "0c47843331a2c3bd296b9c09df15c33a7843648bc4f17ec221110104d68b5ccf",
+          "file": "services/maintenance_mode.py",
+          "line": 957,
+          "fingerprint": "c7e1bfcefdce4eb46adaadac00b97f294df94383baf90c5fbd6e211977f95014",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1318,9 +889,20 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
+          "file": "services/maintenance_mode.py",
+          "line": 1313,
+          "fingerprint": "390a6a061d6163d6f5a939d4da6a28087afc188ff7ecd0dfc65c175d7e4f626e",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/maintenance_mode.py",
           "line": 336,
-          "fingerprint": "3854c133500398b5a1dd2f5de2f611814f3c380c9a4c388d574dde9341ebec2c",
+          "fingerprint": "ed62da22b9cfaea99fe02706f081bcec62b3573169f9988be2de6c3c13c4cf7b",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1329,9 +911,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
-          "line": 1514,
-          "fingerprint": "f366b68b25c3c1c897277fdf24a1e371f9a3ebb81a24850d1d0627995e10d705",
+          "file": "services/maintenance_mode.py",
+          "line": 369,
+          "fingerprint": "ed62da22b9cfaea99fe02706f081bcec62b3573169f9988be2de6c3c13c4cf7b",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1340,9 +922,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
-          "line": 278,
-          "fingerprint": "3854c133500398b5a1dd2f5de2f611814f3c380c9a4c388d574dde9341ebec2c",
+          "file": "services/maintenance_mode.py",
+          "line": 1473,
+          "fingerprint": "a4b4c4f38e0f0c73dfc006747b81e07c240e614ba1bbe69963262c64d38f8884",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1351,9 +933,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
-          "line": 293,
-          "fingerprint": "3854c133500398b5a1dd2f5de2f611814f3c380c9a4c388d574dde9341ebec2c",
+          "file": "services/maintenance_mode.py",
+          "line": 1452,
+          "fingerprint": "a4b4c4f38e0f0c73dfc006747b81e07c240e614ba1bbe69963262c64d38f8884",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1362,9 +944,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
-          "line": 306,
-          "fingerprint": "3854c133500398b5a1dd2f5de2f611814f3c380c9a4c388d574dde9341ebec2c",
+          "file": "services/maintenance_mode.py",
+          "line": 1465,
+          "fingerprint": "a4b4c4f38e0f0c73dfc006747b81e07c240e614ba1bbe69963262c64d38f8884",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1373,9 +955,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
-          "line": 1406,
-          "fingerprint": "f366b68b25c3c1c897277fdf24a1e371f9a3ebb81a24850d1d0627995e10d705",
+          "file": "services/maintenance_mode.py",
+          "line": 192,
+          "fingerprint": "1c3a1665fe49fe6cc507ca2f11ca5a543fb863389b2ca578545235f232f4ba39",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1384,9 +966,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
-          "line": 1132,
-          "fingerprint": "82051723e09eb81c9c73310286ce116e3f1410bb60b2b697893e656a90a95e6e",
+          "file": "services/maintenance_mode.py",
+          "line": 256,
+          "fingerprint": "7dc0a7d14995ed7b12e844aeef1cacb778594d5398995f2766ea3b5382ceb1ba",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1395,9 +977,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/backup_engine.py",
-          "line": 1138,
-          "fingerprint": "82051723e09eb81c9c73310286ce116e3f1410bb60b2b697893e656a90a95e6e",
+          "file": "services/maintenance_mode.py",
+          "line": 531,
+          "fingerprint": "cff1138a52b15a96241b1db531ec73f5d546d8a2e63f2535cdfed2e0fc8e097e",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1406,9 +988,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/entitlements.py",
-          "line": 364,
-          "fingerprint": "df9ccfc803545ad7feab89ae247ece0022d46f9068067b9fb4d7010fd8a3df3c",
+          "file": "services/button_ux_policy.py",
+          "line": 236,
+          "fingerprint": "146ce4611b4be607a6bc0f9e69bc5c40f5da4a58d43c0ea60177352805805933",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1417,9 +999,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/db_backup.py",
-          "line": 96,
-          "fingerprint": "a30bb3edafb372a164e7821daf29275f5b5788e766bdfecd5170b0f6c355f313",
+          "file": "services/retention_worker.py",
+          "line": 77,
+          "fingerprint": "6363fd719676bb45ac42fc6ad4bbd002733ff02afa3435aa49af81ded6626312",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1428,9 +1010,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/db_backup.py",
-          "line": 448,
-          "fingerprint": "c310bae9bc95b29762bdef4a1cdcd613b1f5876ea5f01ba93394620137f7e4a3",
+          "file": "services/retention_worker.py",
+          "line": 142,
+          "fingerprint": "47b4df92bb8c15088234faede07905734ca4be2603aced85018da285aa9a367b",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1439,9 +1021,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/db_backup.py",
-          "line": 452,
-          "fingerprint": "c310bae9bc95b29762bdef4a1cdcd613b1f5876ea5f01ba93394620137f7e4a3",
+          "file": "services/retention_worker.py",
+          "line": 233,
+          "fingerprint": "41fc8b350343a5ef39311b6470bc38e34864714cc19b75585ee1062637c0846e",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1450,9 +1032,9 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/db_backup.py",
-          "line": 652,
-          "fingerprint": "1ce019929ab40633b6b1ac2ca7092a048ffd105e3e269ced17f20a8733809f2d",
+          "file": "services/i18n.py",
+          "line": 2210,
+          "fingerprint": "95f3e36e1639aa2a8f3083dda5deefeea387f53c1ca3299e9dc2e8a125eeae92",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1461,9 +1043,20 @@
           "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
         },
         {
-          "file": "services/db_backup.py",
-          "line": 643,
-          "fingerprint": "1ce019929ab40633b6b1ac2ca7092a048ffd105e3e269ced17f20a8733809f2d",
+          "file": "services/i18n.py",
+          "line": 845,
+          "fingerprint": "0f6ba961f9a7edfaffe2114f80fbcdadcdb88d391a706f2032c9d5154eb8a3f0",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-services",
+          "root_cause": "services 层多处 except Exception: pass / return 0/False / raise ValueError/RuntimeError/Exception 携带字符串字面量",
+          "plan": "R64 分批重构 services 错误处理:迁移到 AppError(ErrorCodes.XXX, params={...}),except 块记录日志后 reraise 或转 AppError"
+        },
+        {
+          "file": "services/i18n.py",
+          "line": 853,
+          "fingerprint": "0f6ba961f9a7edfaffe2114f80fbcdadcdb88d391a706f2032c9d5154eb8a3f0",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1662,6 +1255,127 @@
           "file": "bots/idx_bot.py",
           "line": 2675,
           "fingerprint": "e1f4a9f6f8d0ac2ce984eff17843b29e59b5c8d68bb47ba1b23f476b283924e2",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1673,
+          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1820,
+          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1810,
+          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1714,
+          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 2290,
+          "fingerprint": "0aa5855205e04500030f92bf67925def3da32c8042cce939a2c678e69ca28769",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1217,
+          "fingerprint": "394594dc42fbd7fc42b01d64b40939fb39629ca6064660393ea00f50ffabfe51",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1251,
+          "fingerprint": "394594dc42fbd7fc42b01d64b40939fb39629ca6064660393ea00f50ffabfe51",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1753,
+          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 1789,
+          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 2146,
+          "fingerprint": "0aa5855205e04500030f92bf67925def3da32c8042cce939a2c678e69ca28769",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/up_bot.py",
+          "line": 590,
+          "fingerprint": "950bd2b2197827f24d0eed03a4d7267bdeaca23d50fa709d2d934adf8245f949",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -1956,130 +1670,31 @@
           "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
         },
         {
-          "file": "bots/up_bot.py",
-          "line": 1673,
-          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 1820,
-          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 1810,
-          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 1714,
-          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 2290,
-          "fingerprint": "0aa5855205e04500030f92bf67925def3da32c8042cce939a2c678e69ca28769",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 1217,
-          "fingerprint": "394594dc42fbd7fc42b01d64b40939fb39629ca6064660393ea00f50ffabfe51",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 1251,
-          "fingerprint": "394594dc42fbd7fc42b01d64b40939fb39629ca6064660393ea00f50ffabfe51",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 1753,
-          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 1789,
-          "fingerprint": "c2b4923d95b8680badb964c90778bc875d5ae3a0080ffa8374db9d56e425b4de",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 2146,
-          "fingerprint": "0aa5855205e04500030f92bf67925def3da32c8042cce939a2c678e69ca28769",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/up_bot.py",
-          "line": 590,
-          "fingerprint": "950bd2b2197827f24d0eed03a4d7267bdeaca23d50fa709d2d934adf8245f949",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
           "file": "bots/admin_bot/callback.py",
-          "line": 932,
+          "line": 1009,
           "fingerprint": "54faf9224ce0d1a9e9d3e67fe4bef5d9ad54c2ed2e1a7b8226bdd87c79ed1790",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/admin_bot/display.py",
+          "line": 251,
+          "fingerprint": "ec4cf0849d3d7c41aba0220c5c8f10c716dbafd1e0afa30118cc771b09aa2a0e",
+          "owner": "maxiuquan",
+          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
+          "expiry": "2026-08-18",
+          "ticket": "R63-P1-10-bots",
+          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
+          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
+        },
+        {
+          "file": "bots/admin_bot/display.py",
+          "line": 99,
+          "fingerprint": "7587d21634eed61ba51617c618b883012ed0eca6e144171e69223bb6c5a8fc9b",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -2253,28 +1868,6 @@
           "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
         },
         {
-          "file": "bots/admin_bot/display.py",
-          "line": 251,
-          "fingerprint": "ec4cf0849d3d7c41aba0220c5c8f10c716dbafd1e0afa30118cc771b09aa2a0e",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
-          "file": "bots/admin_bot/display.py",
-          "line": 99,
-          "fingerprint": "7587d21634eed61ba51617c618b883012ed0eca6e144171e69223bb6c5a8fc9b",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-bots",
-          "root_cause": "bots 层 except Exception: pass / 模块边界函数返回裸字符串历史遗留",
-          "plan": "R64 重构 bots 错误处理:统一 AppError + 用户消息走 i18n(translate/_i18n_t),except 块不再吞异常"
-        },
-        {
           "file": "bots/admin_bot/handlers.py",
           "line": 508,
           "fingerprint": "a5aec85d287ed87ca17374d85dc31654e8685931dbb74405ba5a423ad7d7a5a5",
@@ -2308,30 +1901,8 @@
           "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
         },
         {
-          "file": "database/dlq_worker.py",
-          "line": 314,
-          "fingerprint": "119611de7a85ba16aa309dd245c43b37c2320df84361f62e50bf03ff8a7f5dc4",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/unit_of_work.py",
-          "line": 149,
-          "fingerprint": "f25b889fccda7d572e3f5163af63ab650512a828275441761c59afa27793df33",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
           "file": "database/session.py",
-          "line": 2334,
+          "line": 2355,
           "fingerprint": "35cfec3d713c80e3437e3476fe9c15f98e4670e993883d1dab56ca7d02d5a9a3",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2342,7 +1913,7 @@
         },
         {
           "file": "database/session.py",
-          "line": 2436,
+          "line": 2457,
           "fingerprint": "ee1faaef7db2e826ef9b00fbbf9b9719dedf32abef08ebe2925099156854fa1b",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2353,7 +1924,7 @@
         },
         {
           "file": "database/session.py",
-          "line": 2039,
+          "line": 2060,
           "fingerprint": "a4774543c07a967ebf0038637b6dee49a07df2843281327980a5bb2b3236e0d1",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2364,7 +1935,7 @@
         },
         {
           "file": "database/session.py",
-          "line": 2379,
+          "line": 2400,
           "fingerprint": "e3fc20a3861b533c4b16f31eb27c476aeb10dd7c470b515663b97f5692cd0648",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2375,7 +1946,7 @@
         },
         {
           "file": "database/session.py",
-          "line": 1957,
+          "line": 1978,
           "fingerprint": "6d4a8bee545619f0e42d2b8e15f04c418157dade1375daee00eb2a3096f49ab6",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2386,7 +1957,7 @@
         },
         {
           "file": "database/session.py",
-          "line": 2552,
+          "line": 2573,
           "fingerprint": "8507d8eaee41849c1ea2953f5a15209a05b389c7444d8d1df6428b80a7a26526",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2397,7 +1968,7 @@
         },
         {
           "file": "database/session.py",
-          "line": 2570,
+          "line": 2591,
           "fingerprint": "480d426e086b04d2a4116dca4d995bdf76bac9de1f4f50ac254c303632e361a7",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2408,7 +1979,7 @@
         },
         {
           "file": "database/session.py",
-          "line": 996,
+          "line": 1017,
           "fingerprint": "2a7973ecf597911655b78de6cb9ac8ff42f190e626a33fdb8c7c1feb065258a5",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
@@ -2419,767 +1990,8 @@
         },
         {
           "file": "database/session.py",
-          "line": 1043,
+          "line": 1064,
           "fingerprint": "68ac9ebe36fd9a02efea14faa3fe2a6ff34b19f45bc50968c4f8dc1a014a0964",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 211,
-          "fingerprint": "33f95fd7107bef4cddd65d3b370d1f239fac34251f1ef118fcb6f8a53620a1cd",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 889,
-          "fingerprint": "d9498bcf40672686c829cc13b8f874b1b1d78bc347dbaaff64ed5f0d6de8bcf4",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 897,
-          "fingerprint": "d9498bcf40672686c829cc13b8f874b1b1d78bc347dbaaff64ed5f0d6de8bcf4",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 903,
-          "fingerprint": "d9498bcf40672686c829cc13b8f874b1b1d78bc347dbaaff64ed5f0d6de8bcf4",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 1975,
-          "fingerprint": "f77408204626106111731e485e70cdd50ed5d4671ca91a074b4171bdf9b9aa58",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 6919,
-          "fingerprint": "c71abe3d72e9a12006e8d59475a8cd6cdbbb4d2cddbc55fcec016e5c926e01b0",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 975,
-          "fingerprint": "d9498bcf40672686c829cc13b8f874b1b1d78bc347dbaaff64ed5f0d6de8bcf4",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 1878,
-          "fingerprint": "d9498bcf40672686c829cc13b8f874b1b1d78bc347dbaaff64ed5f0d6de8bcf4",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3175,
-          "fingerprint": "2d0bada90c0d9ac28827d4e099ee6d91ccaae6e2beae51caa8a9ad709f6e6c0f",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8272,
-          "fingerprint": "2c5e51286da87a7e862880925c255112c6a9799239cd438992a42e33f6a8e82d",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 1688,
-          "fingerprint": "d9498bcf40672686c829cc13b8f874b1b1d78bc347dbaaff64ed5f0d6de8bcf4",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2034,
-          "fingerprint": "f77408204626106111731e485e70cdd50ed5d4671ca91a074b4171bdf9b9aa58",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2248,
-          "fingerprint": "2c4272a9fd95d89239e75be42a6cd0f8f1dbec7742696818c05cc0074f9c03c8",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8017,
-          "fingerprint": "6da31df05dc0f54522f57e1116d13c6dfcc76f81a074970e3854556b3860df1b",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3296,
-          "fingerprint": "2a161394b8b8083c8d1370d22a7693b72c91032915b6b145f76b822e5173f040",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2718,
-          "fingerprint": "826832f18b2047fcf3d41e93c98cc96563d07513e638b7799e16e640fb08f0ca",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2723,
-          "fingerprint": "826832f18b2047fcf3d41e93c98cc96563d07513e638b7799e16e640fb08f0ca",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2731,
-          "fingerprint": "826832f18b2047fcf3d41e93c98cc96563d07513e638b7799e16e640fb08f0ca",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2647,
-          "fingerprint": "3dfddf02e9794f6cbafd85bd14f370e0d1a479a7a3cb781b5532668919fe1b33",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2769,
-          "fingerprint": "7a92fe192fdb7fdaf5f12a45c1d4e03e4839f98f15e8952096096aa1ba6df2bf",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2801,
-          "fingerprint": "f7ec553cf6243b27cf0900dce56d3fbb85f2558516e0c4f29defb7d57f4fa7eb",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2832,
-          "fingerprint": "bbfb9e4d9b088759d75324d4e8dd89c208db6d7d781ccb4f2eb6a127667a6c6e",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2855,
-          "fingerprint": "52a7bad5c3cf29b2dde791e21fa937f5d3675f7ca4206728f392eea2c3d20263",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2881,
-          "fingerprint": "62ec2540dea219c694fcca165a39a41a72c7e256eb4994693eafde09d5dbfae9",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2919,
-          "fingerprint": "2dd9ee78460ecab3e94b2766430c47755f334f00524fa16eb77ac18a3541beb0",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 2933,
-          "fingerprint": "c58c656df0ff35c39159ce942a9aa2cd10b9cdc0649f3b172aa51826e4b9cf4f",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3018,
-          "fingerprint": "476ac0a6f3d4c528d00e820060193547e349aceef6cffca1f4a32e49db5b1355",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3052,
-          "fingerprint": "aae621a10323a00f8d422a94035007053f504aeac74f6306d0b430265815640b",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3184,
-          "fingerprint": "840a134e24c6bb04610f6b2e917e52966c14f07b622d4fe6c02e1ecbbd3e5b47",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3237,
-          "fingerprint": "52987ca0af57abdbda00307041a8e00d6a4c98bedaa0d6a4082abec67966e34f",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3447,
-          "fingerprint": "93c51f594d3d6d47566436f2cd450c32bbe98e6041604605165c0d82c9cd51b1",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3494,
-          "fingerprint": "eda09a36566111568a638c1bfe070947adbfa218957f5fcd52cf3be4221c67d3",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4766,
-          "fingerprint": "d6562aafdd40f742c9268b6c5dc0a86a5974d90d57a444bbbb476200555df7c6",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 5438,
-          "fingerprint": "30695d24b879c1670577f5a8f9285c8fa4384b2548b32d1bde50aa2558b7d100",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 6134,
-          "fingerprint": "dfa111176a038678b7ee4f23827e24bf570f5a9b6c1e89f93b711ed6d2e4aeb8",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 6781,
-          "fingerprint": "10c4f3014eb8d00a4b43e794a073766c83c1a5a7499e4cb724684d7ec8dd531f",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 7473,
-          "fingerprint": "1476e3a88a44c380c1d3e3f42297e4037f1fe28a34c05311a98a3a266c5cb173",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 7495,
-          "fingerprint": "1ec02c12d669db5a1d00536c12de84ccf0e88bc17e82ceabf8e0a16b96ae22d2",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8082,
-          "fingerprint": "1eada052d570f0309ed930be6d122276cf0633bc922685b5232c7767238bcfae",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8243,
-          "fingerprint": "630089a525c8287627b6efad864ca6cabb1ca4b10015b17298659846d5967d13",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8285,
-          "fingerprint": "a01971e0ccee12454f3b143531572f8d1a391e5c589ef160a999dda86bf4b824",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8307,
-          "fingerprint": "034ee9492ceb1824e3c50b80d9dbcb0541d0be6b9d3884a4ffb79fdb54d68854",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8421,
-          "fingerprint": "149c2388123ce2d089b7a27f3ab58cc7de7ef4df3c9779e45500e0d4ed1925b5",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8451,
-          "fingerprint": "48d27a670e34ae536f61a59759bb826c1a04eb9606c7c014e6c56df51dba574d",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8503,
-          "fingerprint": "4b39d4f3e1b0f64b284f942d5032bf8c54f667a655c1e52820f20c80d6f29e57",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8607,
-          "fingerprint": "74d32e3f80224974fb49520d91f27aac6ba37a9199f5be2d9ec6019e3e990fba",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 8708,
-          "fingerprint": "e0c9574edd09000076ff15d3e4750dccedfd2cf7bfae9661a7725e393fdb5d0d",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 3903,
-          "fingerprint": "08357b0bab882fec8b9fc9badfe450dc691164d403e476056a085359c99cc89f",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4165,
-          "fingerprint": "ec55787c031113336786b834a60954ef90149b08e84afb1a059bbd8134b82722",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4195,
-          "fingerprint": "8ed554645d864341f7056bc38fe0f04f463c9709063b1721b2aa09ada98df0f7",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4227,
-          "fingerprint": "9d2b59657313923f3dcd1bfd863b583dd9221ea2827ed42940d3e452876f33b3",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4251,
-          "fingerprint": "694b11187cf8302fc9c75153f1b993ac26947d1332ab6a724bd3d4b4e436bb99",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4364,
-          "fingerprint": "f8ace103de73562f6f290bd1155abcd7a243f031a558601fed1ca7081f6d98f3",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4386,
-          "fingerprint": "8ce228ea4013a72135532d5f120fd5a3a39cc6be083f16bcfdf33d4a43e4b3ae",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4435,
-          "fingerprint": "be08c5dabc362149ca3453e641527a8c682ff27dfa5cec6e047266eefa0dbdb0",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4471,
-          "fingerprint": "6ec211e728d7e66583203b8445ce317efed2cadfa97572aefe9a0282ccbf32d7",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4499,
-          "fingerprint": "9c77d42e54e32f29b4dd5621c18fc2c84445542c8fc01b25d1bd238feec607bd",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4543,
-          "fingerprint": "9dc32936a8f293f1d2b9d28d6087f6a884a0e42ca1b20c175fad46ab582b2855",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4813,
-          "fingerprint": "9e7df41845f44e5452253e8d15f14f9de6619a59f028d217c5acd033a95fba55",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4837,
-          "fingerprint": "dbad407a88773e04162db6cc83642bcc13c6f3beca952c60b138363edde5d03d",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4901,
-          "fingerprint": "4ecfd874e3996199245252a5e03b3c1b9b8027c0410bd8cc1afb7e88b0b68e4c",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4951,
-          "fingerprint": "d27ce41d79bf684577991be3f06b6a88c4fb77201cb1673f048dd471f0d3c78a",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4974,
-          "fingerprint": "8e64dc9d53c33b44e1b131b834631827d4542bc482575bfb98001acdd8eb33d2",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 4997,
-          "fingerprint": "640e957049dfdbf6e02dea6c4fe6d2f26c143c18b7a6dca0dec668a0ea86c252",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 5031,
-          "fingerprint": "36f0575dba71ac38c9be0061aad26db62ba5600ea6d3d15a3e48d70bf5ade1fa",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 5140,
-          "fingerprint": "d8ed44a4f2834a8f196f1c077454dea683017f560609af4cf5d7d0c4a13dcf18",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 5232,
-          "fingerprint": "65389928ec90b32ca0cc2b6c70c6d09ec18a200f1c2eb43ccf0b5f68a0d326bb",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 6019,
-          "fingerprint": "bcbf8846804d7a10f5ac4c07c581340254d33f665b4624eed0f973e0a68ee7ca",
-          "owner": "maxiuquan",
-          "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
-          "expiry": "2026-08-18",
-          "ticket": "R63-P1-10-database",
-          "root_cause": "database 层 except Exception: pass / return False 历史遗留",
-          "plan": "R64 重构 database 错误处理:改用 AppError + 结构化错误,except 块记录日志后 reraise"
-        },
-        {
-          "file": "database/cache_store.py",
-          "line": 6052,
-          "fingerprint": "f519e6e560b3f83985338d42545ab5ae1db4ddab6ffb51bfab8373588c587053",
           "owner": "maxiuquan",
           "reason": "R63 P1-10 observability debt - per-module categorization (AST fingerprint)",
           "expiry": "2026-08-18",
@@ -3191,6 +2003,6 @@
     }
   },
   "total_max_violations": 0,
-  "violation_count": 285,
-  "previous_violation_count": 281
+  "violation_count": 175,
+  "previous_violation_count": 285
 }

@@ -58,6 +58,15 @@ def _install_fake_config() -> None:
     settings.CRDB_POOL_MIN_SIZE = 0  # R36 §6.4.1: 默认 0(空闲时关闭连接)
     settings.CRDB_POOL_MAX_SIZE = 2  # R36 §6.4.1: 默认 2(业务 Bot ≤2)
     settings.CRDB_APPLICATION_NAME_PREFIX = "tgjiema"  # R36 §6.4.2
+    # R64 P1-10: CRDB 空载 RU 整改新增配置(MagicMock 默认返回 MagicMock,
+    # 会导致 int(MagicMock()) 抛 TypeError,必须显式设置)
+    settings.CRDB_POOL_RECYCLE_SECONDS = 60
+    settings.CRDB_POOL_NULL_MODE = False
+    settings.CRDB_RU_DAILY_ALERT_THRESHOLD = 100
+    settings.CRDB_RU_DAILY_BLOCK_THRESHOLD = 500
+    settings.CRDB_RU_DAU_DAY_LIMIT = 250
+    settings.CRDB_RU_MONTHLY_BUDGET = 35_000_000
+    settings.CRDB_RU_BUSINESS_BOT_ROLES = ("up", "idx", "sender", "mon", "admin")
     settings.BACKUP_KEK = ""  # R36 H7: 默认空(未配置加密)
     # R37 P0-3: crdb_sync 独占同步配置
     settings.SYNC_BACK_OFF = 0  # 0=禁用 Bot 直连兜底(生产默认)

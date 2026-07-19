@@ -142,5 +142,49 @@ if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
   echo "  仍输出检测到的 context,但 configure_branch_protection.sh 会要求用户确认。" >&2
 fi
 
+# ─── 7.1 R64 P0-01 / P1-11: 校验 Release Gates 14 个 job + CI / repo-hygiene 覆盖 ───
+# Release Gates workflow 实际 job 名必须与 release-gates.yml 完全一致:
+#   docker-build / docker-digest-verify / compose-config / redis-acl-matrix / schema-diff /
+#   backup-restore-drill / sbom / pip-audit / trivy / sign-image / verify-branch-protection /
+#   rc-continuity / publish-attestation / release-summary
+# CI workflow 必须包含 repo-hygiene(R64 P1-11 required context)。
+# 注意:sign-image / publish-attestation / release-summary 仅在 push 到 master/main 时运行,
+#      PR 触发的 check-runs 中可能缺失,属正常情况(soft WARN)。
+EXPECTED_RG_JOBS=(
+  "docker-build"
+  "docker-digest-verify"
+  "compose-config"
+  "redis-acl-matrix"
+  "schema-diff"
+  "backup-restore-drill"
+  "sbom"
+  "pip-audit"
+  "trivy"
+  "sign-image"
+  "verify-branch-protection"
+  "rc-continuity"
+  "publish-attestation"
+  "release-summary"
+)
+MISSING_RG_JOBS=()
+for rg_job in "${EXPECTED_RG_JOBS[@]}"; do
+  expected_ctx="Release Gates / ${rg_job}"
+  if ! echo "$CONTEXTS_JSON" | jq -e --arg c "$expected_ctx" \
+        'any(.[]; . == $c)' > /dev/null 2>&1; then
+    MISSING_RG_JOBS+=("$expected_ctx")
+  fi
+done
+if [ "${#MISSING_RG_JOBS[@]}" -gt 0 ]; then
+  echo "WARN: 以下 Release Gates job context 未在 check-runs 中找到:" >&2
+  for c in "${MISSING_RG_JOBS[@]}"; do
+    echo "  - $c" >&2
+  done
+  echo "  可能该 job 尚未在 master 上触发过(sign-image/publish-attestation/release-summary 仅 push 触发)。" >&2
+fi
+# CI / repo-hygiene 校验
+if ! echo "$CONTEXTS_JSON" | jq -e 'any(.[]; . == "CI / repo-hygiene")' > /dev/null 2>&1; then
+  echo "WARN: CI / repo-hygiene 未在 check-runs 中找到(R64 P1-11 required context)" >&2
+fi
+
 # ─── 8. stdout 输出 JSON 数组 ───
 echo "$CONTEXTS_JSON"

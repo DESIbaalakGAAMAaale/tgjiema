@@ -59,6 +59,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import socket
 import sys
@@ -713,6 +714,281 @@ def _handle_signal(signum, frame) -> None:
     """R39 P1-9: 信号处理(SIGTERM/SIGINT 优雅退出)。"""
     logger.info(f"[CRDB-RU] R39 P1-9 / R41: 收到信号 {signum},准备退出")
     sys.exit(0)
+
+
+# ════════════════════════════════════════════════════════════════
+#  R64 P1-10: RU 归因(SQL fingerprint / service / job / time bucket)
+# ════════════════════════════════════════════════════════════════
+
+# R64 P1-10: RU 归因 kv_store key 前缀
+# 完整 key 格式: ru_attribution:{YYYYMMDD}:{time_bucket_hour}:{service}:{job}
+# value 为 JSON: {"fingerprint": {fp: ru_amount}, "total": int, "samples": [...]}
+KV_KEY_RU_ATTRIBUTION_PREFIX = "ru_attribution"
+
+# R64 P1-10: 业务 Bot 角色不应产生空载 CRDB RU(由 settings.CRDB_RU_BUSINESS_BOT_ROLES 配置)
+# 此常量用于静态校验,确保 collector 在采集空载 RU 时仅累计业务 Bot
+BUSINESS_BOT_ROLES_DEFAULT = (
+    "up_bot", "idx_bot", "dsp_bot", "mon_bot", "admin_bot",
+)
+
+# R64 P1-10: 允许有 CRDB RU 消耗的非业务角色(运维/同步/迁移等)
+# 这些角色的 RU 消耗不计入"业务空载"门禁
+NON_BUSINESS_CRDB_ROLES = frozenset({
+    "crdb_sync",       # 独占同步(由 dirty 驱动,非空载)
+    "migration",       # DDL 执行(oneshot)
+    "bootstrap",       # 显式人工恢复任务
+    "disaster_recovery",
+    "backup",          # 备份(显式触发)
+    "db_writer",       # 写入路径(由用户操作驱动)
+})
+
+# R64 P1-10: 已审计确认不产生空载 CRDB 命中的服务清单
+# - r40_scheduler: 所有周期任务委托 cache_store(SQLite)/command_bus(SQLite)/Redis
+# - crdb_sync_service: leader 走 Redis SET NX;dirty 检测走 SQLite;CRDB 仅 dirty 驱动懒加载
+# - prometheus_exporter: 所有指标走 SQLite cache_store;/health & /readiness 走 SQLite ping
+# - 任何新增周期任务如需触达 CRDB,必须由 dirty/event 显式驱动,不得空载轮询
+IDLE_CRDB_FREE_SERVICES_AUDITED = frozenset({
+    "r40_scheduler",
+    "crdb_sync_service",
+    "prometheus_exporter",
+    "decode_logs_cleanup",
+    "retention_worker",
+    "backup_gc",
+    "approval_executor",
+})
+
+
+def get_business_bot_roles() -> tuple[str, ...]:
+    """R64 P1-10: 读取业务 Bot 角色列表(从 settings 读取,逗号分隔)。
+
+    Returns:
+        业务 Bot 角色元组(默认 up_bot/idx_bot/dsp_bot/mon_bot/admin_bot)
+    """
+    try:
+        from config import settings
+        raw = getattr(settings, "CRDB_RU_BUSINESS_BOT_ROLES", "")
+        if raw:
+            roles = tuple(r.strip() for r in raw.split(",") if r.strip())
+            if roles:
+                return roles
+    except Exception:
+        pass
+    return BUSINESS_BOT_ROLES_DEFAULT
+
+
+async def record_ru_attribution(
+    service: str,
+    ru_amount: int,
+    fingerprint: str = "",
+    job: str = "",
+    time_bucket: str | None = None,
+    user_id: int = 0,
+) -> bool:
+    """R64 P1-10: 记录 RU 归因(SQL fingerprint / service / job / time bucket)。
+
+    归因维度:
+        - service: 服务角色(如 up_bot / crdb_sync)
+        - fingerprint: SQL fingerprint(MD5/normalize 后的 SQL 模板)
+        - job: 触发 RU 的 job/task 名称(如 sync_jobs / migration_step_3)
+        - time_bucket: 时间桶(YYYYMMDDHH,UTC 小时粒度)
+
+    数据结构(kv_store JSON):
+        {
+            "service": str,
+            "job": str,
+            "time_bucket": str,
+            "total_ru": int,
+            "by_fingerprint": {fp: ru_amount},
+            "samples": [...],  # 最近 N 条样本(限制 50 条)
+        }
+
+    本函数纯走 SQLite kv_store,零 CRDB RU。
+
+    Args:
+        service: 服务角色(若不在已知清单内则归入 "unknown")
+        ru_amount: RU 消耗量(必须 > 0)
+        fingerprint: SQL 指纹(可选,空字符串表示未采集)
+        job: 触发 job 名(可选)
+        time_bucket: 时间桶 YYYYMMDDHH,None 表示当前小时(UTC)
+        user_id: 触发用户(可选)
+
+    Returns:
+        True 记录成功, False 失败
+    """
+    if ru_amount <= 0:
+        return False
+    if not service:
+        service = "unknown"
+    if not job:
+        job = "default"
+    if not fingerprint:
+        fingerprint = "unknown"
+    if time_bucket is None:
+        time_bucket = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        # key 格式: ru_attribution:{YYYYMMDD}:{time_bucket}:{service}:{job}
+        day_str = time_bucket[:8]  # YYYYMMDD
+        key = f"{KV_KEY_RU_ATTRIBUTION_PREFIX}:{day_str}:{time_bucket}:{service}:{job}"
+
+        existing = await store.get_kv(key)
+        if existing:
+            try:
+                data = json.loads(existing)
+            except (json.JSONDecodeError, TypeError):
+                data = {
+                    "service": service, "job": job, "time_bucket": time_bucket,
+                    "total_ru": 0, "by_fingerprint": {}, "samples": [],
+                }
+        else:
+            data = {
+                "service": service, "job": job, "time_bucket": time_bucket,
+                "total_ru": 0, "by_fingerprint": {}, "samples": [],
+            }
+
+        data["total_ru"] = data.get("total_ru", 0) + ru_amount
+        by_fp = data.get("by_fingerprint", {})
+        by_fp[fingerprint] = by_fp.get(fingerprint, 0) + ru_amount
+        data["by_fingerprint"] = by_fp
+
+        samples = data.get("samples", [])
+        samples.append({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "fingerprint": fingerprint,
+            "ru": ru_amount,
+            "user_id": user_id,
+        })
+        if len(samples) > 50:
+            samples = samples[-50:]
+        data["samples"] = samples
+
+        await store.set_kv(key, json.dumps(data, ensure_ascii=False))
+        return True
+    except Exception as e:
+        logger.debug(f"[CRDB-RU] R64 P1-10: record_ru_attribution 失败: {e}")
+        return False
+
+
+async def get_ru_attribution(
+    date_str: str | None = None,
+    service: str | None = None,
+) -> dict:
+    """R64 P1-10: 查询某日的 RU 归因汇总(按 service / job / fingerprint / time_bucket)。
+
+    本函数纯走 SQLite kv_store,零 CRDB RU。
+
+    Args:
+        date_str: 日期 YYYYMMDD,None 表示今天
+        service: 限定服务(可选,None 表示所有服务)
+
+    Returns:
+        {
+            "date": str,
+            "total_ru": int,
+            "by_service": {service: amount},
+            "by_job": {job: amount},
+            "by_fingerprint": {fp: amount},
+            "by_time_bucket": {bucket: amount},
+            "business_bot_ru": int,   # 业务 Bot 空载 RU(应 = 0)
+            "non_business_ru": int,   # 非 Bot 角色(crdb_sync/migration 等)RU
+        }
+    """
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if date_str is None:
+            date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+
+        # 业务 Bot 角色集合(用于区分业务空载 vs 运维)
+        business_roles = set(get_business_bot_roles())
+
+        total_ru = 0
+        by_service: dict[str, int] = {}
+        by_job: dict[str, int] = {}
+        by_fingerprint: dict[str, int] = {}
+        by_time_bucket: dict[str, int] = {}
+        business_bot_ru = 0
+        non_business_ru = 0
+
+        # 遍历可能的 time_bucket(24 小时)
+        for hour in range(24):
+            time_bucket = f"{date_str}{hour:02d}"
+            # kv_store 不支持前缀扫描,需逐个 service/job 组合查询
+            # 已知 services(来自 ru_cost_center.SERVICES)+ 业务角色 + 运维角色
+            from services.ru_cost_center import SERVICES
+            candidate_services = list(SERVICES) + list(business_roles)
+            if service:
+                candidate_services = [s for s in candidate_services if s == service]
+            # 去重
+            seen = set()
+            candidate_services = [
+                s for s in candidate_services
+                if not (s in seen or seen.add(s))
+            ]
+            # 已知 jobs(常见 job 名;实际无 job 字典,尝试常见)
+            candidate_jobs = [
+                "default", "sync_jobs", "sync_cells", "sync_files",
+                "migration", "backup", "restore", "official_metric",
+                "health_check", "leader_renewal",
+            ]
+            for svc in candidate_services:
+                for job in candidate_jobs:
+                    key = (
+                        f"{KV_KEY_RU_ATTRIBUTION_PREFIX}:{date_str}:"
+                        f"{time_bucket}:{svc}:{job}"
+                    )
+                    try:
+                        raw = await store.get_kv(key)
+                        if not raw:
+                            continue
+                        data = json.loads(raw)
+                        ru = int(data.get("total_ru", 0))
+                        if ru <= 0:
+                            continue
+                        total_ru += ru
+                        by_service[svc] = by_service.get(svc, 0) + ru
+                        by_job[job] = by_job.get(job, 0) + ru
+                        by_time_bucket[time_bucket] = (
+                            by_time_bucket.get(time_bucket, 0) + ru
+                        )
+                        for fp, amount in data.get("by_fingerprint", {}).items():
+                            by_fingerprint[fp] = (
+                                by_fingerprint.get(fp, 0) + int(amount)
+                            )
+                        if svc in business_roles:
+                            business_bot_ru += ru
+                        else:
+                            non_business_ru += ru
+                    except Exception:
+                        continue
+
+        return {
+            "date": date_str,
+            "total_ru": total_ru,
+            "by_service": by_service,
+            "by_job": by_job,
+            "by_fingerprint": by_fingerprint,
+            "by_time_bucket": by_time_bucket,
+            "business_bot_ru": business_bot_ru,
+            "non_business_ru": non_business_ru,
+        }
+    except Exception as e:
+        logger.debug(f"[CRDB-RU] R64 P1-10: get_ru_attribution 失败: {e}")
+        return {
+            "date": date_str or "",
+            "total_ru": 0,
+            "by_service": {},
+            "by_job": {},
+            "by_fingerprint": {},
+            "by_time_bucket": {},
+            "business_bot_ru": 0,
+            "non_business_ru": 0,
+        }
+
+
+# R64 P1-10: json 已在文件顶部导入(record_ru_attribution / get_ru_attribution 使用)
 
 
 def main() -> None:

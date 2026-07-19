@@ -673,13 +673,15 @@ class TestCommandFactories:
         assert cmd.params["reason"] == "违规"
         assert cmd.params["duration_days"] == 7
 
-    def test_make_unban_user_command_no_approval(self):
-        """make_unban_user_command 构造正确,不需审批。"""
+    def test_make_unban_user_command_requires_approval(self):
+        """R64 P0-05: make_unban_user_command 构造正确,统一走审批门禁。"""
         cmd = make_unban_user_command(user_id=12345)
         assert cmd.action == "unban_user"
         assert cmd.required_permission == PERM_USERS_UNBAN
-        assert cmd.requires_approval is False  # 解封不需审批
-        assert cmd.approval_action == ""
+        # R64 P0-05: unban_user 改为 requires_approval=True(高风险逆操作)
+        assert cmd.requires_approval is True
+        # 复用 ban 审批 action(逆操作)
+        assert cmd.approval_action == APPROVAL_ACTION_BAN
         assert cmd.params["user_id"] == 12345
 
     def test_make_assign_role_command(self):
@@ -715,14 +717,16 @@ class TestCommandFactories:
         assert cmd.params["tables"] == ["users", "file_records"]
         assert cmd.params["merge"] is True
 
-    def test_make_delete_file_command_no_approval(self):
-        """R40 P0-8: make_delete_file_command 构造正确,不需审批(软删除)。"""
+    def test_make_delete_file_command_requires_approval(self):
+        """R64 P0-05: make_delete_file_command 构造正确,统一走审批门禁。"""
         from services.command_bus import make_delete_file_command
         cmd = make_delete_file_command(file_code="ABC123XYZ")
         assert cmd.action == "delete_file"
         assert cmd.required_permission == PERM_CONTENT_TAKEDOWN
-        assert cmd.requires_approval is False  # 软删除,可立即执行
-        assert cmd.approval_action == ""
+        # R64 P0-05: delete_file 改为 requires_approval=True(集中策略统一)
+        assert cmd.requires_approval is True
+        # 复用 takedown 审批 action
+        assert cmd.approval_action == APPROVAL_ACTION_TAKEDOWN
         assert cmd.params["file_code"] == "ABC123XYZ"
         assert cmd.handler is not None
 
@@ -816,11 +820,13 @@ class TestHighRiskRegistry:
     """R40 P0-8: 高风险命令注册表完整性测试。"""
 
     def test_registry_contains_all_required_commands(self):
-        """注册表应包含所有 9 个高风险命令(含 R40 P0-8 新增 delete_file)。"""
+        """注册表应包含所有 12 个高风险命令(含 R64 P0-05 新增 destructive 子动作)。"""
         expected_actions = {
             "takedown_report", "ban_user", "unban_user", "assign_role",
             "restore_backup", "enable_maintenance", "disable_maintenance",
             "purge_data", "delete_file",
+            # R64 P0-05: 5 个 destructive 子动作统一 requires_approval=True
+            "detach_file", "block_user_for_file", "restore_content",
         }
         assert set(HIGH_RISK_COMMAND_REGISTRY.keys()) == expected_actions
 
@@ -831,12 +837,36 @@ class TestHighRiskRegistry:
         assert approval_action == APPROVAL_ACTION_RESTORE
         assert requires_approval is True
 
-    def test_unban_user_does_not_require_approval(self):
-        """解封用户不需要审批(低风险操作)。"""
+    def test_unban_user_requires_approval_r64_p0_5(self):
+        """R64 P0-05: 解封用户(高风险逆操作)统一走审批门禁。"""
         perm, approval_action, requires_approval = HIGH_RISK_COMMAND_REGISTRY["unban_user"]
         assert perm == PERM_USERS_UNBAN
-        assert requires_approval is False
-        assert approval_action == ""
+        assert requires_approval is True
+        # 复用 ban 审批 action(逆操作)
+        assert approval_action == APPROVAL_ACTION_BAN
+
+    def test_destructive_subactions_require_approval_r64_p0_5(self):
+        """R64 P0-05: delete_file / detach_file / block_user_for_file / restore_content 统一走审批门禁。"""
+        # delete_file
+        perm, approval_action, requires_approval = HIGH_RISK_COMMAND_REGISTRY["delete_file"]
+        assert perm == PERM_CONTENT_TAKEDOWN
+        assert requires_approval is True
+        assert approval_action == APPROVAL_ACTION_TAKEDOWN
+        # detach_file
+        perm, approval_action, requires_approval = HIGH_RISK_COMMAND_REGISTRY["detach_file"]
+        assert perm == PERM_CONTENT_TAKEDOWN
+        assert requires_approval is True
+        assert approval_action == APPROVAL_ACTION_TAKEDOWN
+        # block_user_for_file
+        perm, approval_action, requires_approval = HIGH_RISK_COMMAND_REGISTRY["block_user_for_file"]
+        assert perm == PERM_CONTENT_TAKEDOWN
+        assert requires_approval is True
+        assert approval_action == APPROVAL_ACTION_TAKEDOWN
+        # restore_content
+        perm, approval_action, requires_approval = HIGH_RISK_COMMAND_REGISTRY["restore_content"]
+        assert perm == PERM_DISASTER_RESTORE
+        assert requires_approval is True
+        assert approval_action == APPROVAL_ACTION_RESTORE
 
     def test_all_high_risk_commands_have_correct_permissions(self):
         """所有 requires_approval=True 的命令应有对应的 approval_action。"""

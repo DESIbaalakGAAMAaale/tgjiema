@@ -251,9 +251,26 @@ class Settings(BaseSettings):
     # R36 §6.4.1: min_size=0 允许空闲时关闭所有连接,降低空载 RU 消耗
     CRDB_POOL_MIN_SIZE: int = 0                 # 最小连接数(0=空闲时不保持连接)
     CRDB_POOL_MAX_SIZE: int = 2                 # 最大连接数(业务 Bot ≤2,crdb_sync 可更高)
+    # R64 P1-10: 空闲连接回收(秒),≤0 表示启用 asyncpg 默认行为
+    # 生产建议 60s:连接空闲超过 60s 后自动回收,避免长时间持有可能产生空载心跳的连接
+    CRDB_POOL_RECYCLE_SECONDS: int = 60
+    # R64 P1-10: 是否启用 NullPool 风格(按需创建连接,用完即关,极端空载 RU 控制)
+    # True=每次操作后立即关闭连接(适合 0 RU 空载要求最严苛场景);False=使用 asyncpg 连接池
+    CRDB_POOL_NULL_MODE: bool = False
     # R36 §6.4.2: application_name 用于按服务追踪 RU 消耗
     # 实际值为 f"{CRDB_APPLICATION_NAME_PREFIX}-{SERVICE_ROLE}"(如 tgjiema-up)
     CRDB_APPLICATION_NAME_PREFIX: str = "tgjiema"
+
+    # ── R64 P1-10: CRDB RU 阈值与预算(空载 RU 门禁) ──
+    # 依据审计要求:72 小时空载期 Bot 角色 0 RU/天,集群理想 ≤20 RU/天,
+    # 硬限 ≤100 RU/天;有用户 ≤250 RU/DAU/天;月度预算 ≤35M RU
+    # >ALERT 阈值触发告警(发布门禁告警);>BLOCK 阈值阻断 release
+    CRDB_RU_DAILY_ALERT_THRESHOLD: int = 100    # 日 RU 告警阈值(空载场景)
+    CRDB_RU_DAILY_BLOCK_THRESHOLD: int = 500    # 日 RU 阻断发布阈值
+    CRDB_RU_DAU_DAY_LIMIT: int = 250            # 单 DAU 日均 RU 上限
+    CRDB_RU_MONTHLY_BUDGET: int = 35_000_000    # 月度 RU 预算上限
+    # 业务 Bot 角色(不应有 CRDB 空载 RU);空载 RU 仅这些角色累计才计入"业务空载"
+    CRDB_RU_BUSINESS_BOT_ROLES: str = "up_bot,idx_bot,dsp_bot,mon_bot,admin_bot"
 
     # ── R37 P0-3: crdb_sync 独占同步 + Bot 兜底禁用开关 ──
     # SYNC_BACK_OFF=0 禁用 dsp_bot.sync_back_loop / mon_bot cells 兜底直连 CRDB

@@ -146,7 +146,7 @@ def get_action_policy(action: str) -> tuple[str, bool, bool, bool]:
 
 @dataclass(frozen=True)
 class ButtonApprovalContext:
-    """R55 §18: 统一按钮 Approval Context — 所有高风险按钮必须构建的审批上下文。
+    """R55 §18 + R64 P0-05: 统一按钮 Approval Context — 所有高风险按钮必须构建的审批上下文。
 
     绑定字段(六种攻击向量防护):
         - principal_id:    操作主体 ID(防跨用户攻击)
@@ -165,6 +165,22 @@ class ButtonApprovalContext:
                             返回,含 iat 字段);高风险动作会校验其签发年龄,
                             防止陈旧 receipt 绕过二次认证。None 时仅校验布尔
                             mfa_verified(向后兼容)。
+
+    R64 P0-05 新增字段(由调用方从 HighRiskPolicy 注入):
+        - requires_mfa:        显式标记本 action 是否强制 MFA(优先于
+                               BUTTON_APPROVAL_POLICY 表的推断,True 时强制
+                               mfa_verified + mfa_receipt age 校验)
+        - requires_two_person: 显式标记本 action 是否强制双人审批(优先于
+                               BUTTON_APPROVAL_POLICY 表的 requires_dual 推断,
+                               True 时强制 approver_id ≠ principal_id +
+                               approver_mfa_verified + approver_mfa_receipt age)
+        - approver_mfa_verified: 审批人 MFA 是否已验证(R64 P0-05: 名义双人
+                               审批已被加固 — 仅 approver_id != principal_id
+                               不足以满足 two_person 要求,审批人也必须 MFA)
+        - approver_mfa_receipt:   审批人 MFA receipt payload dict,与
+                               mfa_receipt 同源(verify_mfa_receipt 返回);
+                               requires_two_person=True 时校验签发年龄,
+                               防止陈旧 receipt 绕过二次认证。
     """
     action: str
     principal_id: int
@@ -178,6 +194,12 @@ class ButtonApprovalContext:
     approver_id: int = 0
     final_confirm: bool = False
     mfa_receipt: Optional[dict] = None
+    # R64 P0-05: 显式策略字段(由 HighRiskPolicy 注入)
+    requires_mfa: bool = False
+    requires_two_person: bool = False
+    # R64 P0-05: 双人审批加固 — approver 也必须 MFA
+    approver_mfa_verified: bool = False
+    approver_mfa_receipt: Optional[dict] = None
 
     def validate_required_fields(self) -> None:
         """校验所有必填字段非空(fail-closed)。
@@ -265,9 +287,16 @@ async def enforce_button_approval_policy(
     # ── 步骤 2: 查询 action 的 Approval Policy ──────────────────
     policy_level, requires_mfa, requires_dual, requires_final = get_action_policy(ctx.action)
 
+    # R64 P0-05: 显式策略字段(由调用方从 HighRiskPolicy 注入)优先于
+    # BUTTON_APPROVAL_POLICY 表的推断 — HighRiskPolicy 是单一权威源
+    if ctx.requires_mfa:
+        requires_mfa = True
+    if ctx.requires_two_person:
+        requires_dual = True
+
     # 低风险 action 不需要 Approval Policy(直接放行,但仍需 verify_button_token)
     # 低风险 action 通常不调用本函数,这里保持兼容
-    if policy_level == POLICY_LEVEL_LOW:
+    if policy_level == POLICY_LEVEL_LOW and not (ctx.requires_mfa or ctx.requires_two_person):
         return await verify_button_token(
             callback_data, current_principal_id, store=store,
         )
@@ -364,6 +393,9 @@ async def enforce_button_approval_policy(
             )
 
     # ── 步骤 7: 双人审批(极高风险 action)──────────────────────
+    # R64 P0-05 整改: 此前仅校验 approver_id != principal_id,是"名义双人审批"。
+    # 现在 requires_two_person=True 时,审批人也必须 MFA(approver_mfa_verified=True),
+    # 防止单个管理员账号同时持有 requester/approver 两个角色的会话绕过双人控制。
     if requires_dual:
         if not ctx.approver_id or int(ctx.approver_id) <= 0:
             logger.warning(
@@ -390,6 +422,46 @@ async def enforce_button_approval_policy(
                 },
             )
 
+        # R64 P0-05: requires_two_person=True 时,approver 必须独立完成 MFA
+        # (与 principal 的 MFA 相互独立,避免单会话同时充当两个角色)
+        if ctx.requires_two_person and not ctx.approver_mfa_verified:
+            logger.warning(
+                f"[ButtonPolicy] R64 P0-05: 双人审批 approver 未完成 MFA "
+                f"action={ctx.action} principal={current_principal_id} "
+                f"approver={ctx.approver_id}"
+            )
+            raise AppError(
+                ErrorCodes.BUTTON_POLICY_DUAL_APPROVAL_REQUIRED,
+                params={
+                    "action": ctx.action,
+                    "reason": "approver_mfa_required",
+                    "approver_id": ctx.approver_id,
+                },
+            )
+
+        # R64 P0-05: approver MFA receipt age 校验(与 principal mfa_receipt 对称)
+        # 防止 approver 使用陈旧但仍未过期的 receipt 绕过二次认证
+        if ctx.requires_two_person and ctx.approver_mfa_receipt:
+            # 延迟 import 避免循环依赖
+            from admin.mfa import get_mfa_manager
+            mfa_manager = get_mfa_manager()
+            if not mfa_manager.verify_mfa_receipt_age(
+                ctx.approver_mfa_receipt, max_age_seconds=300,
+            ):
+                logger.warning(
+                    f"[ButtonPolicy] R64 P0-05: approver MFA receipt 已过期(age 超限) "
+                    f"action={ctx.action} principal={current_principal_id} "
+                    f"approver={ctx.approver_id}"
+                )
+                raise AppError(
+                    ErrorCodes.AUTH_MFA_RECEIPT_EXPIRED,
+                    params={
+                        "user_id": ctx.approver_id,
+                        "reason": "approver_mfa_receipt_age_exceeded",
+                        "action": ctx.action,
+                    },
+                )
+
     # ── 步骤 8: 最终确认(防误点)──────────────────────────────
     if requires_final and not ctx.final_confirm:
         logger.warning(
@@ -409,7 +481,11 @@ async def enforce_button_approval_policy(
         f"[ButtonPolicy] R55 §18: 审批通过 "
         f"action={ctx.action} principal={current_principal_id} "
         f"level={policy_level} mfa={ctx.mfa_verified} "
-        f"dual={requires_dual} final={ctx.final_confirm}"
+        f"dual={requires_dual} final={ctx.final_confirm} "
+        f"r64_requires_mfa={ctx.requires_mfa} "
+        f"r64_requires_two_person={ctx.requires_two_person} "
+        f"approver={ctx.approver_id} "
+        f"approver_mfa={ctx.approver_mfa_verified}"
     )
     return True, action, data
 

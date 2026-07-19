@@ -38,6 +38,7 @@ R55 §20 Bot 真实故障注入脚本(production fail-closed)
 可选参数:
   --duration SECONDS  故障持续时间(默认 30 秒)
   --dry-run           只编排不执行真实故障(测试/CI 用)
+  --output-dir DIR    报告输出目录(默认仓库根目录;R64 P1-12 用 production-evidence/)
   -h, --help          显示本帮助
 
 故障场景说明:
@@ -62,6 +63,7 @@ BOT_ARG=""
 SCENARIO_ARG=""
 DURATION=30
 DRY_RUN=0
+OUTPUT_DIR=""
 
 # 早期 --help 检查(在 trap 设置之前,避免触发 report 生成)
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -78,6 +80,8 @@ while [[ $# -gt 0 ]]; do
             DURATION="$2"; shift 2 ;;
         --dry-run)
             DRY_RUN=1; shift ;;
+        --output-dir)
+            OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -137,10 +141,17 @@ done
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
+# R64 P1-12: --output-dir 支持(默认仓库根目录,production-evidence/ 用于审计证据归档)
+if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="$REPO_DIR"
+else
+    mkdir -p "$OUTPUT_DIR"
+fi
+
 START_TIME=$(date +%s)
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 REPORT_TS=$(date +%Y%m%d_%H%M%S)
-CHAOS_REPORT_JSON="$REPO_DIR/chaos_report_${REPORT_TS}.json"
+CHAOS_REPORT_JSON="$OUTPUT_DIR/chaos_report_${REPORT_TS}.json"
 
 # 临时文件:每个 combo 的结果
 COMBO_RESULTS_FILE="$(mktemp)"

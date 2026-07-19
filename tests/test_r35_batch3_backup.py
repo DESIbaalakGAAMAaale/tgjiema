@@ -480,21 +480,22 @@ class TestRestoreDelegation:
             }
         }
 
-        # R61 P0-03 / R62 P0-02: _restore_from_backup_data 强制 _capability
+        # R61 P0-03 / R62 P0-02 / R64 P1-01: _restore_from_backup_data 强制 _capability
         # (不可伪造的 _RestoreCapability)且接收 VerifiedBackupPayload(非 raw dict)。
+        # R64 P1-01: 单一 canonical bytes 来源 — payload/tables 改为 property。
         # 测试通过模块私有 sentinel 构造合法令牌(生产代码无法外部构造)。
         from services.backup_dr_validate import (
             _RestoreCapability,
             _RESTORE_SENTINEL,
             VerifiedBackupPayload,
+            _canonical_json_bytes,
         )
         verified_payload = VerifiedBackupPayload(
             backup_id="test_backup_id",
-            tables=backup_data.get("tables", {}),
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="test_schema_v1",
-            payload=backup_data,
+            canonical_payload_bytes=_canonical_json_bytes(backup_data),
         )
         _cap = _RestoreCapability(
             _RESTORE_SENTINEL,
@@ -548,20 +549,21 @@ class TestRestoreDelegation:
                 "nonexistent_table": [{"id": 1}],
             }
         }
-        # R61 P0-03 / R62 P0-02: _restore_from_backup_data 强制 _capability
+        # R61 P0-03 / R62 P0-02 / R64 P1-01: _restore_from_backup_data 强制 _capability
         # (不可伪造的 _RestoreCapability)且接收 VerifiedBackupPayload(非 raw dict)。
+        # R64 P1-01: 单一 canonical bytes 来源 — payload/tables 改为 property。
         from services.backup_dr_validate import (
             _RestoreCapability,
             _RESTORE_SENTINEL,
             VerifiedBackupPayload,
+            _canonical_json_bytes,
         )
         verified_payload = VerifiedBackupPayload(
             backup_id="test_backup_id",
-            tables=backup_data.get("tables", {}),
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="test_schema_v1",
-            payload=backup_data,
+            canonical_payload_bytes=_canonical_json_bytes(backup_data),
         )
         _cap = _RestoreCapability(
             _RESTORE_SENTINEL,

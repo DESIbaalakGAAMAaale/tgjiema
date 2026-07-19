@@ -149,18 +149,22 @@ def _build_verified_payload(
     schema_fingerprint: str = "R63-P0-02-test-fingerprint",
     backup_id: str = "backup_test_001",
 ):
-    """构造 VerifiedBackupPayload(自动计算 payload_digest)。"""
+    """构造 VerifiedBackupPayload(单一 canonical bytes 来源,自动计算 payload_digest)。
+
+    R64 P1-01: payload/tables 改为从 canonical_payload_bytes 解码的 property,
+    不再是独立字段。tables/payload 参数仅用于决定 canonical bytes 的内容
+    (若同时传入,以 payload 为准,tables 字段应嵌入 payload["tables"])。
+    """
     if tables is None:
         tables = {"users": [{"user_id": 1, "username": "alice"}]}
     if payload is None:
         payload = {"tables": tables}
     return mod.VerifiedBackupPayload(
         backup_id=backup_id,
-        tables=tables,
         manifest_sha256="a" * 64,
         plaintext_sha256="c" * 64,
         schema_fingerprint=schema_fingerprint,
-        payload=payload,
+        canonical_payload_bytes=mod._canonical_json_bytes(payload),
     )
 
 
@@ -347,24 +351,24 @@ class TestVerifiedBackupPayloadDeepFreeze:
 
     def test_alias_reference_protection_original_dict_modified(self):
         """R63 P0-02 验收: 构造 VerifiedBackupPayload 后修改原始 dict,
-        payload.tables 应不受影响(deepcopy 断绝别名引用)。"""
+        payload.tables 应不受影响(canonical bytes 已固定,property 重新解码即可)。"""
         mod = _ensure_backup_dr_validate_importable()
         original_tables = {"users": [{"user_id": 1}]}
         original_payload = {"tables": {"users": [{"user_id": 1}]}}
+        # R64 P1-01: 仅传 canonical_payload_bytes,tables/payload 由 property 解码
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
-            tables=original_tables,
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            payload=original_payload,
+            canonical_payload_bytes=mod._canonical_json_bytes(original_payload),
         )
         # 修改原 dict(模拟攻击者在验证后、写入前篡改)
         original_tables["users"].append({"user_id": 999, "evil": True})
         original_tables["injected"] = "evil"
         original_payload["tables"]["users"].append({"user_id": 888})
         original_payload["tampered"] = True
-        # payload.tables 应保持原值(deepcopy + 深冻结断绝引用)
+        # payload.tables 应保持原值(canonical bytes 不可变,property 每次重新解码)
         assert "injected" not in payload.tables
         assert len(payload.tables["users"]) == 1
         assert payload.tables["users"][0]["user_id"] == 1
@@ -432,11 +436,10 @@ class TestWriterDigestRecompute:
         original_payload = {"tables": {"users": [{"user_id": 1, "username": "alice"}]}}
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="backup_test_001",
-            tables=original_payload["tables"],
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            payload=original_payload,
+            canonical_payload_bytes=mod._canonical_json_bytes(original_payload),
         )
         cap = _build_valid_capability(
             mod,
@@ -444,11 +447,15 @@ class TestWriterDigestRecompute:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
-        # 2. 模拟攻击:用 object.__setattr__ 绕过 frozen,替换 payload
-        tampered_payload = mod._deep_freeze(
-            {"tables": {"users": [{"user_id": 999, "evil": True}]}}
+        # 2. 模拟攻击:用 object.__setattr__ 绕过 frozen,替换 canonical_payload_bytes
+        # R64 P1-01: payload/tables 是 property(从 canonical_payload_bytes 解码),
+        # 攻击向量改为替换 canonical_payload_bytes(底层 bytes 字段)。
+        tampered_payload = {"tables": {"users": [{"user_id": 999, "evil": True}]}}
+        object.__setattr__(
+            verified_payload,
+            "canonical_payload_bytes",
+            mod._canonical_json_bytes(tampered_payload),
         )
-        object.__setattr__(verified_payload, "payload", tampered_payload)
 
         # 3. writer 应在首条语句重算 digest → 不匹配 → AppError
         # mock _restore_crdb_tables 验证未被调用
@@ -475,10 +482,10 @@ class TestWriterDigestRecompute:
     @pytest.mark.asyncio
     async def test_writer_fail_closed_on_object_setattr_tamper_with_digest(self, monkeypatch):
         """R63 P0-02 附加: 即使攻击者同时用 object.__setattr__ 替换
-        verified_payload.payload_digest,writer 仍 fail-closed。
+        verified_payload.canonical_payload_bytes + payload_digest,writer 仍 fail-closed。
 
         writer 不使用 verified_payload.payload_digest,而是重算 actual bytes digest
-        与 _capability.payload_digest 比对(不可伪造)。
+        (sha256(canonical_payload_bytes))与 _capability.payload_digest 比对(不可伪造)。
         """
         _ensure_restore_module_importable()
         from services.db_restore import _restore_from_backup_data
@@ -488,11 +495,10 @@ class TestWriterDigestRecompute:
         original_payload = {"tables": {"users": [{"user_id": 1}]}}
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="backup_test_001",
-            tables=original_payload["tables"],
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            payload=original_payload,
+            canonical_payload_bytes=mod._canonical_json_bytes(original_payload),
         )
         cap = _build_valid_capability(
             mod,
@@ -500,13 +506,18 @@ class TestWriterDigestRecompute:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
-        # 攻击者同时替换 payload 与 payload_digest(试图绕过)
-        tampered_payload = mod._deep_freeze({"tables": {"evil": True}})
-        tampered_digest = mod._compute_payload_digest(tampered_payload)
-        object.__setattr__(verified_payload, "payload", tampered_payload)
+        # 攻击者同时替换 canonical_payload_bytes 与 payload_digest(试图绕过)
+        # R64 P1-01: 攻击向量改为替换 canonical_payload_bytes(底层 bytes 字段)
+        tampered_payload = {"tables": {"evil": True}}
+        tampered_canonical_bytes = mod._canonical_json_bytes(tampered_payload)
+        import hashlib as _hashlib
+        tampered_digest = _hashlib.sha256(tampered_canonical_bytes).hexdigest()
+        object.__setattr__(
+            verified_payload, "canonical_payload_bytes", tampered_canonical_bytes
+        )
         object.__setattr__(verified_payload, "payload_digest", tampered_digest)
 
-        # writer 重算 digest(基于 tampered_payload)→ tampered_digest
+        # writer 重算 digest(基于 tampered canonical_payload_bytes)→ tampered_digest
         # 但 _capability.payload_digest 仍是原始值 → 不匹配 → AppError
         with patch("services.db_restore._restore_crdb_tables", AsyncMock()), \
              patch("services.db_restore._restore_sqlite_tables_to_db", AsyncMock()):
@@ -653,11 +664,12 @@ class TestFailClosedOnDataSourceFailure:
         # 构造一个 SQLite source 的表(通过 mock get_table_source)
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="b001",
-            tables={"sqlite_table": [{"col": 1}]},
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            payload={"tables": {"sqlite_table": [{"col": 1}]}},
+            canonical_payload_bytes=mod._canonical_json_bytes(
+                {"tables": {"sqlite_table": [{"col": 1}]}}
+            ),
         )
         cap = _build_valid_capability(
             mod,
@@ -705,11 +717,12 @@ class TestFailClosedOnDataSourceFailure:
 
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="b001",
-            tables={"relay_table": [{"col": 1}]},
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            payload={"tables": {"relay_table": [{"col": 1}]}},
+            canonical_payload_bytes=mod._canonical_json_bytes(
+                {"tables": {"relay_table": [{"col": 1}]}}
+            ),
         )
         cap = _build_valid_capability(
             mod,

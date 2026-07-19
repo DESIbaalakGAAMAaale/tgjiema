@@ -41,7 +41,81 @@
     "cancel": "取消",
     "retry": "重试",
     "appeal": "申诉",
-    "language_switch": "切换语言"
+    "language_switch": "切换语言",
+    "ux": {
+      "destructive": {
+        "target_display": "操作目标",
+        "impact_scope": "影响范围",
+        "irreversibility_notice": "不可逆性提示",
+        "approval_status": "审批状态",
+        "cancel": "取消",
+        "confirm": "确认执行",
+        "mfa_required_badge": "需要 MFA 二次验证",
+        "delete_file": {
+          "impact_scope": "将软删除该文件,影响所有关联解码记录与历史索引",
+          "irreversibility": "软删除可在 tombstone 窗口内恢复;物理清除后不可逆",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "detach_file": {
+          "impact_scope": "将该文件从索引中脱钩,用户无法通过文件码访问",
+          "irreversibility": "可逆 — 可重新关联文件",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "block_user_for_file": {
+          "impact_scope": "将阻止该用户访问指定文件",
+          "irreversibility": "可逆 — 可解除 block",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "ban_user": {
+          "impact_scope": "将封禁该用户,影响其所有上传 / 解码 / 外部访问权益",
+          "irreversibility": "可逆 — 可通过 unban_user 解封",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "unban_user": {
+          "impact_scope": "将解封该用户,恢复其全部权益",
+          "irreversibility": "可逆 — 可通过 ban_user 重新封禁",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "restore_content": {
+          "impact_scope": "将恢复已下架内容,重新对外可见",
+          "irreversibility": "可逆 — 可通过 takedown 重新下架",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "purge": {
+          "impact_scope": "将物理清除目标数据,不可恢复",
+          "irreversibility": "不可逆 — 物理清除后无 tombstone",
+          "approval_status": "需双人审批 + MFA + 最终确认"
+        },
+        "purge_data": {
+          "impact_scope": "将物理清除指定数据,影响 CRDB + R2 全部副本",
+          "irreversibility": "不可逆 — 物理清除后无 tombstone",
+          "approval_status": "需双人审批 + MFA + 最终确认"
+        },
+        "rotate_keys": {
+          "impact_scope": "将轮换加密密钥,影响所有加密数据的解密路径",
+          "irreversibility": "不可逆 — 旧密钥作废",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "change_permissions": {
+          "impact_scope": "将变更目标权限,影响其可执行的操作集合",
+          "irreversibility": "可逆 — 可重新分配权限",
+          "approval_status": "需双人审批 + MFA"
+        },
+        "assign_role": {
+          "impact_scope": "将为目标用户分配角色,影响其 RBAC 权限集合",
+          "irreversibility": "可逆 — 可重新分配角色",
+          "approval_status": "需双人审批 + MFA"
+        }
+      },
+      "recovery": {
+        "retry": "重试",
+        "cancel": "取消",
+        "resubmit": "重新发起",
+        "reload": "重新加载",
+        "reapply_approval": "重新申请审批",
+        "replay_mfa": "重新 MFA 验证"
+      }
+    }
   },
   "errors": {
     "quota.decode.exceeded": "今日解码次数已达上限",
@@ -85,6 +159,7 @@
     "backup.restore.approval_invalid": "备份恢复审批无效或已过期(approval_id={approval_id}, backup_id={backup_id})",
     "backup.restore.checksum_mismatch": "备份文件校验和不匹配,可能已损坏(backup_id={backup_id})",
     "backup.restore.trust_chain_required": "备份恢复信任链令牌缺失或无效,已拒绝恢复(backup_id={backup_id})",
+    "backup.payload.not_serializable": "备份数据含不可 JSON 序列化类型,已拒绝(fail-closed)(field={field}, type_name={type_name}, trace_id={trace_id})",
     "effect.receipt.manager_unavailable": "副作用回执管理器不可用(action_id={action_id}, effect_type={effect_type})",
     "effect.receipt.db_error": "副作用回执数据库错误(action_id={action_id}, effect_type={effect_type})",
     "data.receipt.idempotency_conflict": "副作用幂等冲突:同 (action_id, effect_type, target) 已存在不同 request_hash 的 receipt,拒绝覆盖(action_id={action_id}, effect_type={effect_type}, target={target}, trace_id={trace_id})",
@@ -96,7 +171,14 @@
     "migration.manifest.binding_mismatch": "迁移清单绑定的 SHA 与当前 HEAD/Tree 不一致(field={field}, expected={expected}, actual={actual}, trace_id={trace_id})",
     "migration.manifest.set_mismatch": "磁盘迁移文件集合与清单声明不一致(missing_in_manifest={missing_in_manifest}, missing_on_disk={missing_on_disk}, trace_id={trace_id})",
     "migration.manifest.signature_invalid": "迁移清单签名验证失败(reason={reason}, sig_file={sig_file}, cert_file={cert_file}, trace_id={trace_id})",
+    "migration.manifest.verify_required": "staging/production 必须启用迁移清单验证(app_env={app_env}, reason={reason}, trace_id={trace_id})",
+    "migration.manifest.release_source_required": "非 git 部署环境必须通过 RELEASE_SOURCE_COMMIT/TREE 注入 source commit/tree(reason={reason}, trace_id={trace_id})",
+    "migration.manifest.release_consistency": "release-manifest.json 与 migration-manifest.json 不一致(reason={reason}, field={field}, expected={expected}, actual={actual}, trace_id={trace_id})",
     "outbox.provider_registry.required": "Outbox provider 注册表未配置,生产模式拒绝 stub 启动(reason={reason}, trace_id={trace_id})",
+    "outbox.provider_registry.load_failed": "Outbox provider 注册表加载失败,readiness 拒绝就绪(reason={reason}, trace_id={trace_id})",
+    "outbox.lease_version.mismatch": "Outbox lease 版本号不匹配,complete/fail/renew 拒绝越权操作(event_id={event_id}, lease_version={lease_version}, trace_id={trace_id})",
+    "outbox.unknown_event_type": "Outbox 未知事件类型,严禁标记成功,已进入 DLQ 等待审批 replay(event_type={event_type}, outbox_id={outbox_id}, trace_id={trace_id})",
+    "outbox.lease_renew.failed": "Outbox lease 续租失败,立即停止提交结果防止双重执行(event_id={event_id}, reason={reason}, trace_id={trace_id})",
     "i18n.icu.compile_failed": "i18n ICU 消息预编译失败(locale={locale}, key={key}, reason={reason}, trace_id={trace_id})",
     "command.concurrent.claim": "操作已被其他 worker 抢占或状态已变更(action_id={action_id})",
     "command.hash.mismatch": "请求参数与上次执行不一致(防篡改拒绝,action_id={action_id})",
@@ -131,6 +213,14 @@
     "production.restore.hash_required": "production 恢复必须传 expected_request_hash(TOCTOU 防护,backup_id={backup_id}, target={target}, trace_id={trace_id})",
     "production.restore.hash_mismatch": "production 恢复 expected_request_hash 与存储 hash 不匹配(TOCTOU 攻击或 payload 被篡改,backup_id={backup_id}, approval_action_id={approval_action_id}, trace_id={trace_id})",
     "restore.execute.already_executed": "command_executions 已 executed,禁止重复执行 restore(approval_action_id={approval_action_id}, trace_id={trace_id})",
+    "restore.staging.provision_failed": "恢复 staging 创建失败,已销毁已分配资源并 fail-closed(operation_id={operation_id}, datasource={datasource}, reason={reason})",
+    "restore.staging.validate_failed": "恢复 staging 验证失败,schema/行数/主外键/业务守恒/hash/演练任一未通过(operation_id={operation_id}, dimension={dimension}, reason={reason})",
+    "restore.approval.required": "蓝绿切换前必须提供有效审批 ID(approval_id 缺失或不匹配,operation_id={operation_id}, reason={reason})",
+    "restore.approval.mfa_required": "蓝绿切换前必须提供有效 MFA receipt(mfa_receipt_id 缺失或不匹配,operation_id={operation_id}, reason={reason})",
+    "restore.switch.failed": "蓝绿切换失败,active 指针未变更,旧版本保持不变(operation_id={operation_id}, reason={reason})",
+    "restore.rollback.failed": "回滚失败,无法恢复至旧版本指针(operation_id={operation_id}, reason={reason})",
+    "restore.nonce.payload_mismatch": "恢复 nonce payload 不一致,禁止换 payload_digest 重试(operation_id={operation_id}, backup_id={backup_id}, reason={reason})",
+    "restore.phase.transition_invalid": "恢复状态机 phase 转换非法,拒绝操作(operation_id={operation_id}, phase_from={phase_from}, phase_to={phase_to}, reason={reason})",
     "notification.outbox.write_failed": "通知投递 outbox 写入失败,事务已回滚(user_id={user_id}, type={notif_type})",
     "notification.outbox.duplicate": "通知投递重复(dedup_key 冲突,user_id={user_id}, dedup_key={dedup_key})",
     "content.appeal.restore_failed": "内容申诉恢复失败,已进入 reconciliation(appeal_id={appeal_id}, target_type={target_type}, target_id={target_id})",
@@ -185,6 +275,8 @@
     "button.policy.final_confirm_required": "高风险按钮要求最终确认,请完成确认步骤后重试(action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.async_token_required": "高风险操作必须使用异步持久化令牌 API,禁止使用同步令牌 API(action={action}, reason={reason}, user_id={user_id}, trace_id={trace_id})",
     "button.policy.unknown": "未知的按钮审批错误(action={action}, reason={reason}, trace_id={trace_id})",
+    "button.ux.action_required": "destructive action UX spec 查询失败:action 不能为空(reason={reason}, trace_id={trace_id})",
+    "button.ux.action_not_high_risk": "action 不在 HIGH_RISK_POLICY 中,非高风险 action 不需要 destructive confirmation 面板(action={action}, reason={reason}, trace_id={trace_id})",
     "locale.validation.failed": "启动期 locale 文件校验失败,已拒绝启动(reason={reason}, error_count={error_count}, trace_id={trace_id})"
   },
   "ui": {
@@ -727,7 +819,7 @@
         "s17": "❌ 参数缺失",
         "s18": "⏳ 文件删除请求已提交审批\n审批 ID: {cb_result_approval_id}\n文件码: {file_code}\n审批通过后自动执行。",
         "s19": "❌ 删除失败: {cb_result_error}",
-        "s20": "\n\n✅ 已忽略",
+        "s20": "✅ 该举报已忽略",
         "s21": "❌ 序号无效",
         "s22": "❌ 读取备份列表失败: {e}",
         "s23": "参数缺失",
@@ -1697,14 +1789,14 @@
         "signature_failed_delete": "⚠️ 按钮签名验证失败,可能已过期或被使用,请重新发起删除操作。",
         "ban_approval_submitted": "⏳ 已提交封禁审批(审批 ID: {approval_id}),用户 {uid}",
         "ban_success": "✅ 已封禁用户 {uid}",
-        "ban_failed": "❌ 封禁失败: {error}",
+        "ban_failed": "❌ 封禁失败(请向管理员出示 trace: {trace_id})",
         "detach_approval_submitted": "⏳ 已提交审批(审批 ID: {approval_id}),文件码 {file_code}",
         "detach_success": "✅ 已脱钩文件码 {file_code}",
-        "detach_failed": "❌ 脱钩失败: {error}",
+        "detach_failed": "❌ 脱钩失败(请向管理员出示 trace: {trace_id})",
         "block_approval_submitted": "⏳ 已提交审批(审批 ID: {approval_id}),举报人 {reporter_id} ↔ 文件码 {file_code}",
         "block_success": "✅ 已限制举报人 {reporter_id} 解码 {file_code}",
-        "block_failed": "❌ 限制失败: {error}",
-        "operation_failed": "操作失败: {error}"
+        "block_failed": "❌ 限制失败(请向管理员出示 trace: {trace_id})",
+        "operation_failed": "操作失败(请向管理员出示 trace: {trace_id})"
       }
     },
     "generic": {

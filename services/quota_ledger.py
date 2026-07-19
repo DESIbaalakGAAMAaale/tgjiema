@@ -177,8 +177,9 @@ async def settle(reservation_id: str, actual_amount: int | None = None) -> bool:
         logger.debug(f"[QuotaLedger] settle 成功 res_id={reservation_id} actual={actual_amount}")
         return True
     except Exception as e:
+        # R64 P1-07: financial 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.error(f"[QuotaLedger] settle 失败 res_id={reservation_id}: {e}")
-        return False
+    return False
 
 
 async def refund(reservation_id: str, reason: str = "") -> bool:
@@ -236,8 +237,9 @@ async def refund(reservation_id: str, reason: str = "") -> bool:
         logger.debug(f"[QuotaLedger] refund 成功 res_id={reservation_id} amount={reserved_amount}")
         return True
     except Exception as e:
+        # R64 P1-07: financial 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.error(f"[QuotaLedger] refund 失败 res_id={reservation_id}: {e}")
-        return False
+    return False
 
 
 async def get_balance(user_id: int) -> int:
@@ -283,8 +285,9 @@ async def get_balance(user_id: int) -> int:
         used_today = int(rows[0][0] or 0) if rows else 0
         return max(0, plan.daily_quota - used_today)
     except Exception as e:
+        # R64 P1-07: financial 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.warning(f"[QuotaLedger] get_balance 失败 user={user_id}: {e}")
-        return 0
+    return 0
 
 
 async def get_reservation(reservation_id: str) -> dict | None:
@@ -447,8 +450,9 @@ async def cleanup_expired_reservations() -> int:
             logger.info(f"[QuotaLedger] cleanup_expired_reservations 清理 {count} 条过期预留")
         return count
     except Exception as e:
+        # R64 P1-07: financial 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.error(f"[QuotaLedger] cleanup_expired_reservations 失败: {e}")
-        return 0
+    return 0
 
 
 async def admin_adjust(user_id: int, amount: int, reason: str, admin_id: int) -> bool:
@@ -507,8 +511,9 @@ async def admin_adjust(user_id: int, amount: int, reason: str, admin_id: int) ->
         logger.info(f"[QuotaLedger] admin_adjust 成功 user={user_id} amount={amount} admin={admin_id}")
         return True
     except Exception as e:
+        # R64 P1-07: financial 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.error(f"[QuotaLedger] admin_adjust 失败 user={user_id} amount={amount}: {e}")
-        return False
+    return False
 
 
 # ════════════════════════════════════════════════════════════════
@@ -638,10 +643,11 @@ async def force_release_quota(action_id: str, reason: str = "") -> bool:
         )
         return True
     except Exception as e:
+        # R64 P1-07: financial 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.error(
             f"[QuotaLedger] force_release_quota 失败 res_id={action_id}: {e}"
         )
-        return False
+    return False
 
 
 # R54 P1-4: naive timestamp 迁移
@@ -743,8 +749,9 @@ async def migrate_naive_timestamps(
     # 写入 schema 版本标记
     try:
         await store.set_kv("quota_timestamp_format_version", "2")
-    except Exception:
-        pass
+    except Exception as e:
+        # R64 P1-07: financial 域禁止 except pass;schema 版本标记写入失败需记录(非致命)
+        logger.warning(f"[QuotaLedger] 写入 quota_timestamp_format_version 失败(非致命): {e}")
 
     return {
         "migrated_tables": migrated_tables,
@@ -848,8 +855,9 @@ async def verify_timestamp_migration_reconciliation(
         if store_v:
             v = await store_v.get_kv("quota_timestamp_format_version")
             schema_version = str(v or "1")
-    except Exception:
-        pass
+    except Exception as e:
+        # R64 P1-07: financial 域禁止 except pass;读取失败保留默认 schema_version="1"(非致命)
+        logger.debug(f"[QuotaLedger] 读取 quota_timestamp_format_version 失败(默认 v1): {e}")
 
     # 边界场景验证(逻辑检查,基于迁移规则)
     # 午夜跨日: UTC+8 2024-01-15 23:59 → UTC 2024-01-15 15:59 (同 UTC 日)

@@ -47,6 +47,15 @@ ENV PATH=/app/venv/bin:$PATH
 # 项目代码
 COPY . .
 
+# R64 P0-02: 生产镜像默认启用 migration manifest 验证 + APP_ENV=production
+#   - MIGRATION_MANIFEST_VERIFY=1: 强制 cosign verify-blob + HEAD/Tree 绑定 + 集合一致性
+#   - APP_ENV=production: _is_manifest_verify_enabled() 检测到 staging/production
+#     且未启用验签时直接 raise AppError 拒绝启动(fail-closed)
+#   - 部署环境必须通过 RELEASE_SOURCE_COMMIT / RELEASE_SOURCE_TREE 环境变量
+#     注入签名 attestation 中的 source commit/tree(非 git 部署 fail-closed)
+ENV MIGRATION_MANIFEST_VERIFY=1
+ENV APP_ENV=production
+
 # 创建非root用户
 RUN useradd -m app
 

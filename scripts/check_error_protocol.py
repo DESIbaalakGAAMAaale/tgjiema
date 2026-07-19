@@ -519,22 +519,37 @@ def _load_baseline_count(baseline_path: Path | None) -> int:
 
 # domain → path 前缀映射(与 baseline.json domains.*.paths 对应)
 # 文件路径匹配任一 domain.paths 即归入该 domain;未匹配的归入 "observability"
+#
+# R64 P1-07: 扩展高风险域覆盖范围 — 将审计报告中列出的全部高风险文件
+# (security/destructive/data-integrity/financial)纳入零容忍域。
+# 这些文件涉及认证授权、不可逆操作、数据一致性和财务记账,
+# 其中的 except pass / return 0/False / 裸异常必须为 0(不允许 allowlist)。
 DOMAIN_PATHS: dict[str, list[str]] = {
     "security": [
-        "admin/passwords.py", "admin/mfa.py", "admin/auth.py",
-        "services/button_security.py", "services/approval_workflow.py",
-        "services/command_bus.py",
+        "admin/passwords.py", "admin/mfa.py", "admin/sessions.py", "admin/auth.py",
+        "services/button_security.py", "services/button_approval_policy.py",
+        "services/approval_workflow.py", "services/approval_executor.py",
+        "services/command_bus.py", "services/permission.py", "services/rbac.py",
+        "services/high_risk_policy.py", "services/content_policy.py",
     ],
     "destructive": [
         "services/data_lifecycle.py", "admin/purge.py",
+        "services/db_backup.py", "services/db_restore.py",
+        "services/disaster_recovery.py", "services/repair_console.py",
+        "services/replication_policy.py",
     ],
     "data-integrity": [
         "services/backup_dr_validate.py", "services/backup_crypto.py",
+        "services/backup_engine.py", "services/effect_receipts.py",
         "services/crdb_sync_service.py", "services/crdb_sync_event_wakeup.py",
-        "database/redis_queue.py",
+        "database/redis_queue.py", "database/cache_store.py",
+        "database/db_writer.py", "database/dlq_worker.py",
+        "database/migrate.py", "database/unit_of_work.py",
+        "database/write_router.py",
     ],
     "financial": [
         "services/quota.py", "services/billing.py",
+        "services/entitlements.py", "services/quota_ledger.py",
     ],
 }
 
@@ -1179,33 +1194,25 @@ def _generate_baseline_file(
                 "description": "认证、授权、MFA、密码、token、签名验证相关",
                 "max_violations": 0,
                 "baseline_violations": 0,
-                "paths": [
-                    "admin/passwords.py", "admin/mfa.py", "admin/auth.py",
-                    "services/button_security.py", "services/approval_workflow.py",
-                    "services/command_bus.py",
-                ],
+                "paths": DOMAIN_PATHS["security"],
             },
             "destructive": {
-                "description": "删除、清除、purge、reset 等不可逆操作",
+                "description": "删除、清除、purge、reset、备份恢复等不可逆操作",
                 "max_violations": 0,
                 "baseline_violations": 0,
-                "paths": ["services/data_lifecycle.py", "admin/purge.py"],
+                "paths": DOMAIN_PATHS["destructive"],
             },
             "data-integrity": {
-                "description": "备份、恢复、事务、outbox、数据一致性",
+                "description": "备份、恢复、事务、outbox、缓存、数据一致性",
                 "max_violations": 0,
                 "baseline_violations": 0,
-                "paths": [
-                    "services/backup_dr_validate.py", "services/backup_crypto.py",
-                    "services/crdb_sync_service.py", "services/crdb_sync_event_wakeup.py",
-                    "database/redis_queue.py",
-                ],
+                "paths": DOMAIN_PATHS["data-integrity"],
             },
             "financial": {
-                "description": "配额、计费、积分等财务相关",
+                "description": "配额、计费、积分、套餐等财务相关",
                 "max_violations": 0,
                 "baseline_violations": 0,
-                "paths": ["services/quota.py", "services/billing.py"],
+                "paths": DOMAIN_PATHS["financial"],
             },
             "observability": {
                 "description": "日志、metric、trace 等可观测性 best-effort",

@@ -41,7 +41,81 @@
     "cancel": "Cancel",
     "retry": "Retry",
     "appeal": "Appeal",
-    "language_switch": "Switch Language"
+    "language_switch": "Switch Language",
+    "ux": {
+      "destructive": {
+        "target_display": "Target",
+        "impact_scope": "Impact scope",
+        "irreversibility_notice": "Irreversibility notice",
+        "approval_status": "Approval status",
+        "cancel": "Cancel",
+        "confirm": "Confirm execution",
+        "mfa_required_badge": "MFA verification required",
+        "delete_file": {
+          "impact_scope": "Soft-deletes the file, affecting all related decode records and historical indices",
+          "irreversibility": "Reversible within tombstone window; irreversible after physical purge",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "detach_file": {
+          "impact_scope": "Detaches the file from the index; users can no longer access it via file code",
+          "irreversibility": "Reversible — file can be reattached",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "block_user_for_file": {
+          "impact_scope": "Blocks the user from accessing the specified file",
+          "irreversibility": "Reversible — block can be lifted",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "ban_user": {
+          "impact_scope": "Bans the user, affecting all upload / decode / external access entitlements",
+          "irreversibility": "Reversible — can be unblocked via unban_user",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "unban_user": {
+          "impact_scope": "Unbans the user, restoring all entitlements",
+          "irreversibility": "Reversible — can be re-banned via ban_user",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "restore_content": {
+          "impact_scope": "Restores the taken-down content, making it visible again",
+          "irreversibility": "Reversible — can be re-taken-down",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "purge": {
+          "impact_scope": "Physically purges the target data, cannot be recovered",
+          "irreversibility": "Irreversible — no tombstone after physical purge",
+          "approval_status": "Two-person approval + MFA + final confirmation required"
+        },
+        "purge_data": {
+          "impact_scope": "Physically purges the specified data across CRDB + R2 replicas",
+          "irreversibility": "Irreversible — no tombstone after physical purge",
+          "approval_status": "Two-person approval + MFA + final confirmation required"
+        },
+        "rotate_keys": {
+          "impact_scope": "Rotates encryption keys, affecting decryption paths of all encrypted data",
+          "irreversibility": "Irreversible — old keys are invalidated",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "change_permissions": {
+          "impact_scope": "Changes target permissions, affecting the set of allowed operations",
+          "irreversibility": "Reversible — permissions can be reassigned",
+          "approval_status": "Two-person approval + MFA required"
+        },
+        "assign_role": {
+          "impact_scope": "Assigns a role to the target user, affecting RBAC permission set",
+          "irreversibility": "Reversible — role can be reassigned",
+          "approval_status": "Two-person approval + MFA required"
+        }
+      },
+      "recovery": {
+        "retry": "Retry",
+        "cancel": "Cancel",
+        "resubmit": "Resubmit",
+        "reload": "Reload",
+        "reapply_approval": "Reapply for approval",
+        "replay_mfa": "Re-verify MFA"
+      }
+    }
   },
   "errors": {
     "quota.decode.exceeded": "Daily decode quota exceeded",
@@ -85,6 +159,7 @@
     "backup.restore.approval_invalid": "Backup restore approval invalid or expired (approval_id={approval_id}, backup_id={backup_id})",
     "backup.restore.checksum_mismatch": "Backup file checksum mismatch, may be corrupted (backup_id={backup_id})",
     "backup.restore.trust_chain_required": "Backup restore trust-chain token missing or invalid, restore denied (backup_id={backup_id})",
+    "backup.payload.not_serializable": "Backup data contains non-JSON-serializable type, rejected (fail-closed) (field={field}, type_name={type_name}, trace_id={trace_id})",
     "effect.receipt.manager_unavailable": "Effect receipt manager unavailable (action_id={action_id}, effect_type={effect_type})",
     "effect.receipt.db_error": "Effect receipt database error (action_id={action_id}, effect_type={effect_type})",
     "data.receipt.idempotency_conflict": "Effect receipt idempotency conflict: a receipt with a different request_hash already exists for the same (action_id, effect_type, target), overwrite refused (action_id={action_id}, effect_type={effect_type}, target={target}, trace_id={trace_id})",
@@ -96,7 +171,14 @@
     "migration.manifest.binding_mismatch": "Migration manifest SHA binding does not match current HEAD/Tree (field={field}, expected={expected}, actual={actual}, trace_id={trace_id})",
     "migration.manifest.set_mismatch": "Disk migration file set does not match manifest declaration (missing_in_manifest={missing_in_manifest}, missing_on_disk={missing_on_disk}, trace_id={trace_id})",
     "migration.manifest.signature_invalid": "Migration manifest signature verification failed (reason={reason}, sig_file={sig_file}, cert_file={cert_file}, trace_id={trace_id})",
+    "migration.manifest.verify_required": "staging/production must enable migration manifest verification (app_env={app_env}, reason={reason}, trace_id={trace_id})",
+    "migration.manifest.release_source_required": "Non-git deployment must inject source commit/tree via RELEASE_SOURCE_COMMIT/TREE (reason={reason}, trace_id={trace_id})",
+    "migration.manifest.release_consistency": "release-manifest.json inconsistent with migration-manifest.json (reason={reason}, field={field}, expected={expected}, actual={actual}, trace_id={trace_id})",
     "outbox.provider_registry.required": "Outbox provider registry not configured, production mode rejects stub startup (reason={reason}, trace_id={trace_id})",
+    "outbox.provider_registry.load_failed": "Outbox provider registry load failed, readiness rejects (reason={reason}, trace_id={trace_id})",
+    "outbox.lease_version.mismatch": "Outbox lease version mismatch, complete/fail/renew rejects unauthorized operation (event_id={event_id}, lease_version={lease_version}, trace_id={trace_id})",
+    "outbox.unknown_event_type": "Outbox unknown event type, must not mark success, moved to DLQ for approvable replay (event_type={event_type}, outbox_id={outbox_id}, trace_id={trace_id})",
+    "outbox.lease_renew.failed": "Outbox lease renew failed, stop committing results to prevent double execution (event_id={event_id}, reason={reason}, trace_id={trace_id})",
     "i18n.icu.compile_failed": "i18n ICU message pre-compilation failed (locale={locale}, key={key}, reason={reason}, trace_id={trace_id})",
     "command.concurrent.claim": "Operation claimed by another worker or state changed (action_id={action_id})",
     "command.hash.mismatch": "Request parameters differ from last execution (anti-tamper rejected, action_id={action_id})",
@@ -131,6 +213,14 @@
     "production.restore.hash_required": "Production restore requires expected_request_hash (TOCTOU protection, backup_id={backup_id}, target={target}, trace_id={trace_id})",
     "production.restore.hash_mismatch": "Production restore expected_request_hash does not match stored hash (TOCTOU attack or payload tampered, backup_id={backup_id}, approval_action_id={approval_action_id}, trace_id={trace_id})",
     "restore.execute.already_executed": "command_executions already executed, duplicate restore rejected (approval_action_id={approval_action_id}, trace_id={trace_id})",
+    "restore.staging.provision_failed": "Restore staging provisioning failed; allocated resources destroyed and fail-closed (operation_id={operation_id}, datasource={datasource}, reason={reason})",
+    "restore.staging.validate_failed": "Restore staging validation failed; schema/row count/foreign keys/business invariant/hash/dry run did not pass (operation_id={operation_id}, dimension={dimension}, reason={reason})",
+    "restore.approval.required": "Blue-green switch requires a valid approval_id; missing or mismatched (operation_id={operation_id}, reason={reason})",
+    "restore.approval.mfa_required": "Blue-green switch requires a valid MFA receipt; missing or mismatched (operation_id={operation_id}, reason={reason})",
+    "restore.switch.failed": "Blue-green switch failed; active pointer unchanged and previous version preserved (operation_id={operation_id}, reason={reason})",
+    "restore.rollback.failed": "Rollback failed; cannot restore previous version pointer (operation_id={operation_id}, reason={reason})",
+    "restore.nonce.payload_mismatch": "Restore nonce payload mismatch; retrying with a different payload_digest is forbidden (operation_id={operation_id}, backup_id={backup_id}, reason={reason})",
+    "restore.phase.transition_invalid": "Restore state machine phase transition is invalid; operation rejected (operation_id={operation_id}, phase_from={phase_from}, phase_to={phase_to}, reason={reason})",
     "notification.outbox.write_failed": "Notification outbox write failed, transaction rolled back (user_id={user_id}, type={notif_type})",
     "notification.outbox.duplicate": "Duplicate notification delivery (dedup_key conflict, user_id={user_id}, dedup_key={dedup_key})",
     "content.appeal.restore_failed": "Content appeal restore failed, entered reconciliation (appeal_id={appeal_id}, target_type={target_type}, target_id={target_id})",
@@ -185,6 +275,8 @@
     "button.policy.final_confirm_required": "High-risk button requires final confirmation, please complete confirmation step and retry (action={action}, reason={reason}, trace_id={trace_id})",
     "button.policy.async_token_required": "High-risk action must use async persisted token API; sync token API is prohibited (action={action}, reason={reason}, user_id={user_id}, trace_id={trace_id})",
     "button.policy.unknown": "Unknown button approval error (action={action}, reason={reason}, trace_id={trace_id})",
+    "button.ux.action_required": "Destructive action UX spec lookup failed: action must not be empty (reason={reason}, trace_id={trace_id})",
+    "button.ux.action_not_high_risk": "Action not in HIGH_RISK_POLICY; non-high-risk action does not need destructive confirmation panel (action={action}, reason={reason}, trace_id={trace_id})",
     "locale.validation.failed": "Locale file validation failed at startup, refused to start (reason={reason}, error_count={error_count}, trace_id={trace_id})"
   },
   "ui": {
@@ -727,7 +819,7 @@
         "s17": "❌ 参数缺失",
         "s18": "⏳ 文件删除请求已提交审批\n审批 ID: {cb_result_approval_id}\n文件码: {file_code}\n审批通过后自动执行。",
         "s19": "❌ 删除失败: {cb_result_error}",
-        "s20": "\n\n✅ 已忽略",
+        "s20": "✅ This report has been ignored",
         "s21": "❌ 序号无效",
         "s22": "❌ 读取备份列表失败: {e}",
         "s23": "参数缺失",
@@ -1697,14 +1789,14 @@
         "signature_failed_delete": "⚠️ Button signature verification failed, it may have expired or been used, please re-initiate the delete operation.",
         "ban_approval_submitted": "⏳ Ban approval submitted (approval ID: {approval_id}), user {uid}",
         "ban_success": "✅ User {uid} banned",
-        "ban_failed": "❌ Ban failed: {error}",
+        "ban_failed": "❌ Ban failed (quote trace to admin: {trace_id})",
         "detach_approval_submitted": "⏳ Approval submitted (approval ID: {approval_id}), file code {file_code}",
         "detach_success": "✅ File code {file_code} detached",
-        "detach_failed": "❌ Detach failed: {error}",
+        "detach_failed": "❌ Detach failed (quote trace to admin: {trace_id})",
         "block_approval_submitted": "⏳ Approval submitted (approval ID: {approval_id}), reporter {reporter_id} ↔ file code {file_code}",
         "block_success": "✅ Reporter {reporter_id} blocked from decoding {file_code}",
-        "block_failed": "❌ Block failed: {error}",
-        "operation_failed": "Operation failed: {error}"
+        "block_failed": "❌ Block failed (quote trace to admin: {trace_id})",
+        "operation_failed": "Operation failed (quote trace to admin: {trace_id})"
       }
     },
     "generic": {

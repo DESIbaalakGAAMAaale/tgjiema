@@ -93,8 +93,9 @@ def _get_commit_sha() -> str:
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()[:12]
-    except Exception:
-        pass
+    except Exception as e:
+        # R64 P1-07: destructive 域禁止 except pass;git 不可用时回退到 "unknown"
+        logger.debug(f"[db_backup] git rev-parse 失败,回退 unknown: {e}")
     return "unknown"
 
 
@@ -445,12 +446,14 @@ async def run_db_backup():
         try:
             from database.session import close_db
             await close_db()
-        except Exception:
-            pass
+        except Exception as close_err:
+            # R64 P1-07: destructive 域禁止 except pass;资源清理失败需记录
+            logger.warning(f"[db_backup] close_db 失败(资源泄漏风险): {close_err}")
         try:
             await r2_storage.close()
-        except Exception:
-            pass
+        except Exception as close_err:
+            # R64 P1-07: destructive 域禁止 except pass;资源清理失败需记录
+            logger.warning(f"[db_backup] r2_storage.close 失败(资源泄漏风险): {close_err}")
         logger.info("[db_backup] 资源已清理,进程退出")
 
 
@@ -640,8 +643,9 @@ async def _run_backup_loop():
                 )
                 try:
                     await r2_storage.delete(_tmp_key)
-                except Exception:
-                    pass
+                except Exception as cleanup_err:
+                    # R64 P1-07: destructive 域禁止 except pass;清理失败需记录(不掩盖原 verify 错误,原错误在下方 raise 传播)
+                    logger.warning(f"[Backup] 清理临时 payload 失败 {_tmp_key}: {cleanup_err}")
                 raise
 
             # 3. 上传到正式 key(覆盖临时 key 内容,或保留临时 key 作为额外副本)
@@ -649,8 +653,9 @@ async def _run_backup_loop():
             # 清理临时 key(正式 key 已上传成功)
             try:
                 await r2_storage.delete(_tmp_key)
-            except Exception:
-                pass
+            except Exception as cleanup_err:
+                # R64 P1-07: destructive 域禁止 except pass;清理临时 key 失败非致命(正式 key 已上传),仅记录
+                logger.warning(f"[Backup] 清理临时 key 失败 {_tmp_key}(非致命): {cleanup_err}")
 
             # 4. 上传 manifest(此时 payload 已确认存在且校验通过)
             manifest_content = json.dumps(manifest, default=str, ensure_ascii=False).encode("utf-8")

@@ -378,29 +378,31 @@ class TestVerifiedBackupPayload:
         mod = _ensure_backup_dr_validate_importable()
         payload = mod.VerifiedBackupPayload(
             backup_id="backup_001",
-            tables={"users": [{"user_id": 1}]},
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R62-fingerprint",
-            payload={"tables": {"users": [{"user_id": 1}]}},
+            canonical_payload_bytes=mod._canonical_json_bytes(
+                {"tables": {"users": [{"user_id": 1}]}}
+            ),
         )
         # frozen=True → 赋值应抛 FrozenInstanceError(AttributeError 子类)
         with pytest.raises(Exception):  # FrozenInstanceError is AttributeError subclass
             payload.backup_id = "tampered"
 
     def test_verified_backup_payload_payload_digest_computed(self):
-        """VerifiedBackupPayload.payload_digest 自动从 payload 计算并保持一致。"""
+        """VerifiedBackupPayload.payload_digest 自动从 canonical_payload_bytes 计算。"""
         mod = _ensure_backup_dr_validate_importable()
         payload_data = {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"}
+        canonical_bytes = mod._canonical_json_bytes(payload_data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
-            tables=payload_data["tables"],
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R62-fingerprint",
-            payload=payload_data,
+            canonical_payload_bytes=canonical_bytes,
         )
-        expected = mod._compute_payload_digest(payload_data)
+        import hashlib as _hashlib
+        expected = _hashlib.sha256(canonical_bytes).hexdigest()
         assert payload.payload_digest == expected
 
 
@@ -863,14 +865,15 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
         monkeypatch.setattr(_cs_mod, "get_cache_store", lambda: store)
 
         # verified_payload.tables 包含真实数据
-        # payload(dict) 中的 tables 字段被故意留空,验证写入器不读取 payload
+        # R64 P1-01: 单一 canonical bytes 来源 — tables/payload 均从 canonical_payload_bytes 解码
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="backup_test_001",
-            tables={"users": [{"user_id": 1, "username": "test"}]},
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R62-P0-01-test-fingerprint",
-            payload={"tables": {}},  # 故意空 — 不应被读取
+            canonical_payload_bytes=mod._canonical_json_bytes(
+                {"tables": {"users": [{"user_id": 1, "username": "test"}]}}
+            ),
         )
         cap = _build_valid_capability(
             mod,
@@ -912,11 +915,12 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
 
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="backup_test_001",
-            tables={"users": [{"user_id": 1}]},
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R62-P0-01-test-fingerprint",
-            payload={"tables": {"users": [{"user_id": 1}]}},
+            canonical_payload_bytes=mod._canonical_json_bytes(
+                {"tables": {"users": [{"user_id": 1}]}}
+            ),
         )
         # 构造一个 capability,但其 payload_digest 与 verified_payload 不匹配
         cap = _build_valid_capability(

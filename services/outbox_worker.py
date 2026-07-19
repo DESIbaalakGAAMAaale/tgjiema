@@ -1,5 +1,20 @@
 """R36 B0-2: Upload Outbox Worker — upload_outbox 表的唯一副作用驱动器。
 
+[DEPRECATED — R64 P0-04] 本模块为 R36 旧 outbox worker,仅处理 upload_outbox
+(注册 manifest / R100 归档 / 上传失败通知)三类事件。R62 P0-05 + R63 P0-05 +
+R64 P0-04 起,事务性 outbox 的统一生产闭环由
+``services.data_lifecycle.OutboxWorker`` 承担(基于 outbox_events 表 + lease
+fencing token CAS + provider registry + DLQ 审计)。
+
+新代码请迁移到 ``services.data_lifecycle.OutboxWorker``:
+    from services.data_lifecycle import OutboxWorker, OutboxEnvelope
+    worker = OutboxWorker(provider_registry={...})
+    await worker.run_once()
+
+本旧 worker 暂保留以兼容 upload_outbox 既有部署,但已对未知 event_type 采取
+fail-closed 策略(进入 DLQ),不再静默视为完成。后续应将 upload_outbox 三类
+事件也迁入 outbox_events 表后删除本模块。
+
 职责:
 - 定期扫描 upload_outbox 表中 status='PENDING' 的条目
 - CAS claim 获取独占执行权(lease_owner + lease_until)
@@ -21,11 +36,23 @@ import os
 import signal
 import socket
 import time
+import warnings
 from typing import Awaitable, Callable, Optional
 
 from loguru import logger
 
 from database.cache_store import CacheStore
+
+# R64 P0-04: 模块加载时发出 DeprecationWarning(仅一次),提示迁移到新 OutboxWorker
+warnings.warn(
+    "services.outbox_worker.OutboxWorker is deprecated (R64 P0-04); "
+    "migrate to services.data_lifecycle.OutboxWorker which provides "
+    "lease fencing token CAS + provider registry + DLQ audit closure. "
+    "Unknown event_type now raises AppError(OUTBOX_EVENT_UNKNOWN) "
+    "instead of being silently treated as completed.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 
 # ─── 默认参数 ───
@@ -249,7 +276,16 @@ class OutboxWorker:
     # ─── 事件分派 ───
 
     async def _dispatch_event(self, event_type: str, entry: dict) -> None:
-        """按 event_type 分派到对应处理器。"""
+        """按 event_type 分派到对应处理器。
+
+        R64 P0-04 整改(未知 event_type fail-closed):
+        - 旧实现遇到未知 event_type 仅 ``logger.warning`` 后视为完成(fail-open),
+          生产环境若出现新 event_type 未及时升级 worker,事件会被静默标记成功,
+          外部副作用丢失且无法重放(completed 是终态)。
+        - 新实现:未知 event_type 必须 ``raise AppError(OUTBOX_EVENT_UNKNOWN)``,
+          由外层 ``_process_entry`` 捕获并调用 ``mark_outbox_failed`` 进入 DLQ
+          (达到 max_attempts 后置 DEAD,人工审批 replay)。
+        """
         if event_type == "REGISTER_MANIFEST":
             await self._dispatch_register_manifest(entry)
         elif event_type == "ARCHIVE_R100":
@@ -257,10 +293,19 @@ class OutboxWorker:
         elif event_type == "UPLOAD_FAILED":
             await self._dispatch_upload_failed(entry)
         else:
-            # 未知事件类型不报错,直接视为完成(避免 DEAD 卡住)
-            logger.warning(
+            # R64 P0-04: 未知 event_type 严禁标记成功,必须进入 DLQ
+            from services.error_codes import AppError, ErrorCodes
+            logger.error(
                 f"[OutboxWorker] 未知 event_type={event_type} "
-                f"(outbox_id={entry.get('outbox_id')}),视为完成"
+                f"(outbox_id={entry.get('outbox_id')}),"
+                f"raise AppError 进入 DLQ(R64 P0-04 fail-closed)"
+            )
+            raise AppError(
+                ErrorCodes.OUTBOX_EVENT_UNKNOWN,
+                params={
+                    "event_type": event_type,
+                    "outbox_id": entry.get("outbox_id", ""),
+                },
             )
 
     async def _dispatch_register_manifest(self, entry: dict) -> None:

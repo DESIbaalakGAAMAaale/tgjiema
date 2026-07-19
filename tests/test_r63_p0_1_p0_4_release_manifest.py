@@ -158,9 +158,12 @@ class TestManifestConsistency:
         )
 
     def test_manifest_lists_all_four_migrations(self):
-        """manifest 必须枚举 001/002/003/004 全部 4 个 migration。
+        """manifest 必须枚举 001/002/003/004/005/006/007 全部 7 个 migration。
 
         P0-04: 旧 manifest 只列 001–003,004 已存在但未列入 manifest。
+        R64 P1-02: 新增 005_restore_capability_nonce_ledger.sql(nonce 状态机)。
+        R64 P0-04: 新增 006_outbox_lease_version.sql(lease fencing token + DLQ 审计)。
+        R64 P0-03: 新增 007_restore_operations_ledger.sql(蓝绿切换 + 操作账本)。
         """
         manifest = _load_manifest()
         versions = [entry["version"] for entry in manifest["migrations"]]
@@ -169,6 +172,9 @@ class TestManifestConsistency:
             "002_r56_command_approvals_backfill.sql",
             "003_rebuild_command_approvals.sql",
             "004_effect_receipts_request_hash_unique.sql",
+            "005_restore_capability_nonce_ledger.sql",
+            "006_outbox_lease_version.sql",
+            "007_restore_operations_ledger.sql",
         ]
         assert versions == expected, (
             f"manifest migrations 列表不匹配 — 期望 {expected},实际 {versions}"
@@ -183,6 +189,18 @@ class TestManifestConsistency:
         versions = {entry["version"] for entry in manifest["migrations"]}
         assert "004_effect_receipts_request_hash_unique.sql" in versions, (
             "P0-04: manifest 缺少 004_effect_receipts_request_hash_unique.sql 条目"
+        )
+
+    def test_005_migration_entry_exists(self):
+        """R64 P1-02: 005 migration 条目必须存在于 manifest 中。
+
+        005_restore_capability_nonce_ledger.sql 为 nonce ledger 状态机迁移
+        (reserved→consumed|failed),manifest 必须枚举。
+        """
+        manifest = _load_manifest()
+        versions = {entry["version"] for entry in manifest["migrations"]}
+        assert "005_restore_capability_nonce_ledger.sql" in versions, (
+            "R64 P1-02: manifest 缺少 005_restore_capability_nonce_ledger.sql 条目"
         )
 
     def test_004_migration_sha256_matches_disk_file(self):
@@ -516,18 +534,25 @@ class TestLoadMigrationManifest:
     """_load_migration_manifest() 集成测试 — 完整加载流程。"""
 
     def test_loads_successfully_when_verify_disabled(self, migrate_module, clean_verify_env):
-        """默认(verify 禁用)应成功加载并返回 4 个 migration 条目。
+        """默认(verify 禁用)应成功加载并返回 7 个 migration 条目。
 
         本地模式: MIGRATION_MANIFEST_VERIFY 未设置 → 跳过 cosign 验签 (warning),
                   但 HEAD/Tree 绑定 + 集合一致性仍强制执行。
+
+        R64 P1-02: 新增 005_restore_capability_nonce_ledger.sql,共 5 个 migration。
+        R64 P0-04: 新增 006_outbox_lease_version.sql,共 6 个 migration。
+        R64 P0-03: 新增 007_restore_operations_ledger.sql,共 7 个 migration。
         """
         result = migrate_module._load_migration_manifest()
         assert isinstance(result, dict)
-        assert len(result) == 4, f"期望 4 个 migration,实际 {len(result)}"
+        assert len(result) == 7, f"期望 7 个 migration,实际 {len(result)}"
         assert "001_initial_schema.sql" in result
         assert "002_r56_command_approvals_backfill.sql" in result
         assert "003_rebuild_command_approvals.sql" in result
         assert "004_effect_receipts_request_hash_unique.sql" in result
+        assert "005_restore_capability_nonce_ledger.sql" in result
+        assert "006_outbox_lease_version.sql" in result
+        assert "007_restore_operations_ledger.sql" in result
 
     def test_raises_when_verify_enabled_and_cosign_unavailable(
         self, migrate_module, monkeypatch

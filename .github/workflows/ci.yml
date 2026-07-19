@@ -265,6 +265,32 @@ jobs:
     # 只允许减少不允许新增。修复后运行 --generate-baseline 下降基线。
     - name: Check error registry (R59 §5.2 P1, no dynamic/unknown error codes)
       run: python scripts/check_error_registry.py --baseline scripts/error_registry_baseline.json
+    # R64 P1-05 Scanner 7: MFA sync verifier 调用门禁
+    # 阻止生产目录(bots/ services/ admin/ 除 mfa.py)直接调用旧 sync
+    # verify_mfa_receipt(...),生产代码必须改用 async
+    # verify_mfa_receipt_authoritative()。用 AST/import graph 静态阻断回归。
+    - name: Check MFA verifier gate (R64 P1-05, no sync verifier in production)
+      run: python scripts/check_mfa_verifier_gate.py
+    # R64 P1-06 Scanner 8: Sink import-boundary AST 门禁
+    # 阻止业务模块(bots/ services/)直接调用第三方 send/edit/response API
+    # (telegram send/edit、fastapi JSONResponse),必须经过 services/sink_adapters/*
+    # typed adapter。使用 baseline 模式:ratchet 下降 100+ 处存量直调,
+    # 只允许减少不允许新增。修复后运行 --generate-baseline 下降基线。
+    - name: "Scanner 8: Sink import boundary gate"
+      run: python scripts/check_sink_import_boundary.py --baseline scripts/sink_import_boundary_baseline.json
+    # R64 P1-09 Scanner 9: a11y 强制矩阵门禁
+    # 验证 tests/e2e/generated_a11y_matrix_cases.json 覆盖
+    # 2 locales × 2 input_modes × 16 states = 64 用例,
+    # expected_count == 实际用例数,矩阵维度完整(缺失任何维度 → fail-closed)。
+    # 可选消费 Playwright JSON 报告验证 executed == expected 且无 skip/xpass。
+    - name: "Scanner 9: a11y matrix enforcement (R64 P1-09, 2x2x16 coverage)"
+      run: python scripts/check_a11y_matrix_enforcement.py
+    # R64 P1-08 Scanner 10: 按钮 UX 完整性门禁
+    # 验证每个高风险 handler 的 action_type 映射到 HIGH_RISK_POLICY action 且有
+    # ButtonUXSpec(Rule D: 目标/影响/不可逆性/审批状态/取消按钮)。
+    # 同时复跑 Rule A(CommandBus 路由)/ Rule B(sidecar 元数据)/ Rule C(签名绑定)。
+    - name: "Scanner 10: Button UX completeness gate (R64 P1-08, destructive action UXSpec)"
+      run: python scripts/check_button_handler_gate.py
 
   # R40 P2-1: 安全扫描(bandit)
   security:

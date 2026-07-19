@@ -26,6 +26,7 @@ import datetime
 import hashlib
 import json
 import os
+import sqlite3
 from typing import Any, Optional
 
 from loguru import logger
@@ -191,6 +192,69 @@ def compute_effect_request_hash(effect_type: str, params: dict) -> str:
     )
     raw = f"{effect_type}|{payload_str}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# R64 P1-04: SQLite UNIQUE 约束的扩展 error code(Python 3.11+ 暴露为
+# sqlite3.SQLITE_CONSTRAINT_UNIQUE;旧版本回退到硬编码值 2067)。
+# 不可用 str(err) 子串匹配 — CHECK(275)/NOT NULL(1299)/FK(787) 错误消息
+# 同样含 "constraint" 字样,会被误判为幂等成功。
+_SQLITE_CONSTRAINT_UNIQUE = getattr(sqlite3, "SQLITE_CONSTRAINT_UNIQUE", 2067)
+
+
+def _is_unique_constraint_violation(exc: Exception) -> bool:
+    """R64 P1-04: 判断异常是否为 UNIQUE 约束冲突(SQLite / CRDB)。
+
+    通过异常类型 + error code / constraint name 精确分类,不依赖错误消息
+    字符串匹配 ``unique``/``constraint`` 子串(反模式:CHECK / NOT NULL / FK
+    的 SQLite 错误消息同样含 ``constraint`` 字样,会被误判为幂等成功)。
+
+    SQLite 主路径(Python 3.11+):
+        ``isinstance(exc, sqlite3.IntegrityError)`` 且
+        ``getattr(exc, 'sqlite_errorcode', None) == SQLITE_CONSTRAINT_UNIQUE (2067)``。
+        真实 SQLite 抛 IntegrityError 时会自动设置 ``sqlite_errorcode`` 扩展属性。
+    SQLite 回退路径(旧 Python,无 ``sqlite_errorcode``):
+        检查 ``str(exc)`` 是否以 ``"UNIQUE constraint failed"`` 开头
+        (SQLite 规范化错误前缀,非泛 ``unique``/``constraint`` 子串)。
+    CRDB / PostgreSQL:
+        ``isinstance(exc, psycopg2.errors.UniqueViolation)``(psycopg2 已按
+        SQLSTATE 23505 细分子类,可直接类型检查);``diag.constraint_name`` 仅用于
+        日志诊断(effect_receipts 表仅有一个 UNIQUE 约束,任何 UniqueViolation
+        均视为幂等冲突)。
+
+    Returns:
+        True 表示该异常是 UNIQUE 约束冲突(可视为幂等成功,不 raise);
+        False 表示其它 IntegrityError(CHECK/FK/NOT NULL)或非 IntegrityError,
+        必须由调用方 raise + 报警。
+    """
+    # ── SQLite: sqlite3.IntegrityError + sqlite_errorcode == SQLITE_CONSTRAINT_UNIQUE ──
+    if isinstance(exc, sqlite3.IntegrityError):
+        err_code = getattr(exc, "sqlite_errorcode", None)
+        if err_code is not None:
+            # 主路径:Python 3.11+ 通过 sqlite_errorcode 精确判断
+            return err_code == _SQLITE_CONSTRAINT_UNIQUE
+        # 回退路径:旧 Python(无 sqlite_errorcode 属性)→ 检查 SQLite
+        # 规范化错误前缀(非泛 "unique"/"constraint" 子串,而是完整的
+        # "UNIQUE constraint failed" 开头,避免误匹配 CHECK/NOT NULL/FK)
+        return str(exc).startswith("UNIQUE constraint failed")
+
+    # ── CRDB/PostgreSQL: psycopg2.errors.UniqueViolation(类型检查)──
+    # psycopg2 是可选依赖(CRDB 模式才需要),延迟导入避免硬依赖。
+    try:
+        from psycopg2 import errors as _pg_errors  # type: ignore
+    except ImportError:
+        _pg_errors = None  # type: ignore
+    if _pg_errors is not None and isinstance(exc, _pg_errors.UniqueViolation):
+        # effect_receipts 表仅有一个 UNIQUE 约束(在 (a,e,t,rh) 上),
+        # 任何 UniqueViolation 均视为幂等冲突;diag.constraint_name 仅用于日志
+        _constraint_name = getattr(getattr(exc, "diag", None), "constraint_name", None)
+        if _constraint_name:
+            logger.debug(
+                f"[effect_receipts] R64 P1-04: CRDB UniqueViolation "
+                f"constraint_name={_constraint_name}"
+            )
+        return True
+
+    return False
 
 
 class EffectReceiptManager:
@@ -476,12 +540,29 @@ class EffectReceiptManager:
                          lease_owner, lease_until),
                     )
                 except Exception as insert_err:
+                    # R64 P1-04: outbox 唯一冲突必须按数据库错误类型分类,
+                    # 不得通过 str(err) 包含 "unique"/"constraint" 子串判断幂等成功
+                    # (反模式:CHECK / NOT NULL / FK 的 SQLite 错误消息同样含
+                    # "constraint" 字样,会被误判为幂等成功,真正的失败被静默吞掉)。
+                    # 新实现通过 _is_unique_constraint_violation() 按 error code /
+                    # exception 类型精确分类:仅 UNIQUE 约束冲突(SQLite error code
+                    # 2067 或 psycopg2.errors.UniqueViolation)才视为幂等成功;
+                    # 其它 IntegrityError(CHECK/FK/NOT NULL)或非 IntegrityError
+                    # (如 OperationalError: disk full)必须 raise + 报警触发回滚。
+                    if not _is_unique_constraint_violation(insert_err):
+                        # 非 UNIQUE 冲突(CHECK/FK/NOT NULL/OperationalError 等):
+                        # 记录 warning(便于运维定位)后透传,由外层 except 决定
+                        # 是否包装为 EffectReceiptError(fail_closed)或返回 False。
+                        logger.warning(
+                            f"[effect_receipts] R64 P1-04: INSERT 非 UNIQUE 错误,"
+                            f"透传不视为幂等 action={action_id} type={effect_type} "
+                            f"target={target} err_type={type(insert_err).__name__} "
+                            f"sqlite_errorcode={getattr(insert_err, 'sqlite_errorcode', None)}"
+                        )
+                        raise
                     # R62 P1-01: UNIQUE 冲突(竞态:另一 worker 同时 INSERT 同 (a,e,t,rh))
                     # SELECT 已存在的行,按幂等重试处理(pending → 无需更新;
                     # completed → raise TERMINAL_STATE;failed → 重新 claim)
-                    _err_msg = str(insert_err).lower()
-                    if "unique" not in _err_msg and "constraint" not in _err_msg:
-                        raise  # 非 UNIQUE 冲突,透传
                     logger.debug(
                         f"[effect_receipts] R62 P1-01: INSERT UNIQUE 冲突(竞态),"
                         f"SELECT 兜底 action={action_id} type={effect_type}"
@@ -523,7 +604,8 @@ class EffectReceiptManager:
             logger.error(f"[effect_receipts] record_pending 失败: {e}")
             if fail_closed:
                 raise EffectReceiptError(f"record_pending DB 错误: {e}") from e
-            return False
+            # R64 P1-07: data-integrity 域禁止 except 块裸 return False;fail_closed=False 时落到函数尾返回
+        return False
 
     async def record_completed(
         self,

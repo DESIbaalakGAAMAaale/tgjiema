@@ -1504,6 +1504,22 @@ class CommandBus:
 
         # 2. 审批门禁(高风险操作)
         if command.requires_approval:
+            # R64 P0-05: 从 HighRiskPolicy 查询具体安全控制(MFA/two_person/version CAS)
+            # 一并写入 approval payload,供 button_approval_policy / ApprovalExecutor 强制
+            from services.high_risk_policy import get_policy as _get_high_risk_policy
+            _policy = _get_high_risk_policy(command.action)
+            _policy_meta = None
+            if _policy is not None:
+                _policy_meta = {
+                    "requires_mfa": _policy.requires_mfa,
+                    "requires_two_person": _policy.requires_two_person,
+                    "requires_reason": _policy.requires_reason,
+                    "requires_resource_version": _policy.requires_resource_version,
+                    "cooldown_seconds": _policy.cooldown_seconds,
+                    "reversible": _policy.reversible,
+                    "outbox_effects": list(_policy.outbox_effects),
+                }
+
             approval = self._get_approval()
             try:
                 approval_id = await approval.create_approval(
@@ -1515,6 +1531,8 @@ class CommandBus:
                         "principal_name": principal.name,
                         "principal_source": principal.source,
                         "action_id": action_id,
+                        # R64 P0-05: 附加 HighRiskPolicy 元数据
+                        "high_risk_policy": _policy_meta,
                     },
                     created_by=principal.id,
                 )
@@ -1537,7 +1555,8 @@ class CommandBus:
 
             logger.info(
                 f"[CommandBus] 命令需审批 action={command.action} "
-                f"principal={principal.id} approval_id={approval_id}"
+                f"principal={principal.id} approval_id={approval_id} "
+                f"policy={_policy_meta}"
             )
             return Result(
                 success=False,
@@ -2016,14 +2035,19 @@ class CommandBus:
 HIGH_RISK_COMMAND_REGISTRY: dict[str, tuple[str, str, bool]] = {
     "takedown_report":       (PERM_CONTENT_TAKEDOWN,      APPROVAL_ACTION_TAKEDOWN,             True),
     "ban_user":              (PERM_USERS_BAN,             APPROVAL_ACTION_BAN,                  True),
-    "unban_user":            (PERM_USERS_UNBAN,           "",                                   False),
+    # R64 P0-05: unban_user 从 False 改为 True(高风险逆操作,统一走审批门禁)
+    "unban_user":            (PERM_USERS_UNBAN,           APPROVAL_ACTION_BAN,                  True),
     "assign_role":           (PERM_RBAC_ASSIGN,           APPROVAL_ACTION_RBAC_ASSIGN,          True),
     "restore_backup":        (PERM_DISASTER_RESTORE,      APPROVAL_ACTION_RESTORE,              True),
     "enable_maintenance":    (PERM_MAINTENANCE_ENABLE,    APPROVAL_ACTION_MAINTENANCE_ENABLE,   True),
     "disable_maintenance":   (PERM_MAINTENANCE_DISABLE,   APPROVAL_ACTION_MAINTENANCE_DISABLE,   True),
     "purge_data":            (PERM_DATA_PURGE,            APPROVAL_ACTION_DELETE_DATA,          True),
-    # R40 P0-8: 文件软删除 — 复用 content:takedown 权限,无需审批(可立即执行)
-    "delete_file":           (PERM_CONTENT_TAKEDOWN,      "",                                   False),
+    # R64 P0-05: delete_file 从 False 改为 True(集中策略统一,高风险操作走审批门禁)
+    "delete_file":           (PERM_CONTENT_TAKEDOWN,      APPROVAL_ACTION_TAKEDOWN,             True),
+    # R64 P0-05: 新增 3 个 destructive 子动作 — 与 make_*_command 一致
+    "detach_file":           (PERM_CONTENT_TAKEDOWN,      APPROVAL_ACTION_TAKEDOWN,             True),
+    "block_user_for_file":   (PERM_CONTENT_TAKEDOWN,      APPROVAL_ACTION_TAKEDOWN,             True),
+    "restore_content":       (PERM_DISASTER_RESTORE,      APPROVAL_ACTION_RESTORE,              True),
 }
 
 
@@ -2215,6 +2239,19 @@ def _resolve_command_for_action(action: str, params: dict) -> Command | None:
         return make_delete_file_command(
             file_code=str(params.get("file_code", "")),
         )
+    if action == "detach_file":
+        # R64 P0-05: 文件脱钩命令(审批通过后重建,此前为 requires_approval=False)
+        return make_detach_file_command(
+            file_code=str(params.get("file_code", "")),
+            reason=params.get("reason", ""),
+        )
+    if action == "block_user_for_file":
+        # R64 P0-05: 限制用户解码文件命令(审批通过后重建,此前为 requires_approval=False)
+        return make_block_user_for_file_command(
+            file_code=str(params.get("file_code", "")),
+            user_id=int(params.get("user_id", 0)),
+            reason=params.get("reason", ""),
+        )
     if action == "restore_content":
         # R51 P0-6: 内容申诉恢复命令(由 ApprovalExecutor 消费 command_outbox 调度)
         return make_restore_content_command(
@@ -2279,7 +2316,14 @@ def make_ban_user_command(user_id: int, reason: str = "", duration_days: int = 0
 
 
 def make_unban_user_command(user_id: int) -> Command:
-    """构造解封用户命令(不需审批)。"""
+    """构造解封用户命令(R64 P0-05: 强制审批 — 解封是高风险逆操作)。
+
+    R64 P0-05 整改: ``unban_user`` 不再 ``requires_approval=False``。
+    风险级别由 ``HighRiskPolicy.is_high_risk("unban_user")`` 决定。
+    """
+    # 延迟 import 避免与 services.command_bus 顶层循环依赖
+    from services.high_risk_policy import is_high_risk as _is_high_risk
+
     async def _handler(params: dict) -> dict:
         from services import content_reports
         ok = await content_reports.unban_user(params["user_id"], admin_id=0)
@@ -2290,7 +2334,8 @@ def make_unban_user_command(user_id: int) -> Command:
         required_permission=PERM_USERS_UNBAN,
         handler=_handler,
         params={"user_id": user_id},
-        requires_approval=False,
+        requires_approval=_is_high_risk("unban_user"),
+        approval_action=APPROVAL_ACTION_BAN,  # 复用 ban 审批(逆操作)
     )
 
 
@@ -2426,10 +2471,10 @@ def make_purge_data_command(table_names: list[str] | None = None) -> Command:
 
 
 def make_delete_file_command(file_code: str) -> Command:
-    """R40 P0-8: 构造文件软删除命令(不需审批,可立即执行)。
+    """R40 P0-8 + R64 P0-05: 构造文件软删除命令(强制审批)。
 
-    复用 content:takedown 权限门禁,但 requires_approval=False:
-    软删除可立即执行,不阻塞用户操作。
+    R64 P0-05 整改: ``delete_file`` 不再 ``requires_approval=False``。
+    风险级别由 ``HighRiskPolicy.is_high_risk("delete_file")`` 决定。
 
     Args:
         file_code: 文件唯一标识
@@ -2437,6 +2482,9 @@ def make_delete_file_command(file_code: str) -> Command:
     Returns:
         Command 对象(handler 执行软删除 + 本地 tombstone)
     """
+    # 延迟 import 避免与 services.command_bus 顶层循环依赖
+    from services.high_risk_policy import is_high_risk as _is_high_risk
+
     async def _handler(params: dict) -> dict:
         # 软删除逻辑:status='deleted' + deleted_at + 本地 tombstone
         import datetime as _dt
@@ -2467,19 +2515,20 @@ def make_delete_file_command(file_code: str) -> Command:
         required_permission=PERM_CONTENT_TAKEDOWN,
         handler=_handler,
         params={"file_code": file_code},
-        requires_approval=False,
+        requires_approval=_is_high_risk("delete_file"),  # R64 P0-05
+        approval_action=APPROVAL_ACTION_TAKEDOWN,  # 复用 takedown 审批
     )
 
 
 def make_detach_file_command(file_code: str, reason: str = "") -> Command:
-    """R62 P0-04: 构造文件脱钩命令(report:detach 子动作,不需审批,可立即执行)。
+    """R62 P0-04 + R64 P0-05: 构造文件脱钩命令(report:detach 子动作,强制审批)。
 
     与 ``make_delete_file_command`` 的区别:
         - ``delete_file``: 软删除(status='deleted' + deleted_at + tombstone)
         - ``detach_file``: 仅脱钩(status='detached',文件记录保留,uploader 解除关联)
 
-    report:detach 操作语义为"管理员将文件从上传者处脱钩",
-    复用 content:takedown 权限门禁,requires_approval=False 立即执行。
+    R64 P0-05 整改: ``detach_file`` 不再 ``requires_approval=False``。
+    风险级别由 ``HighRiskPolicy.is_high_risk("detach_file")`` 决定。
 
     Args:
         file_code: 文件唯一标识
@@ -2488,6 +2537,9 @@ def make_detach_file_command(file_code: str, reason: str = "") -> Command:
     Returns:
         Command 对象(handler 执行 status='detached' 双写 + 缓存失效)
     """
+    # 延迟 import 避免与 services.command_bus 顶层循环依赖
+    from services.high_risk_policy import is_high_risk as _is_high_risk
+
     async def _handler(params: dict) -> dict:
         # R62 P0-04: 复用 update_file_record_and_invalidate 双写 CRDB+SQLite + 缓存失效
         # (command_bus.py 在 BUTTON_INFRA_FILES 排除列表中,可调用破坏性 API)
@@ -2507,14 +2559,15 @@ def make_detach_file_command(file_code: str, reason: str = "") -> Command:
         required_permission=PERM_CONTENT_TAKEDOWN,
         handler=_handler,
         params={"file_code": file_code, "reason": reason},
-        requires_approval=False,
+        requires_approval=_is_high_risk("detach_file"),  # R64 P0-05
+        approval_action=APPROVAL_ACTION_TAKEDOWN,  # 复用 takedown 审批
     )
 
 
 def make_block_user_for_file_command(
     file_code: str, user_id: int, reason: str = "",
 ) -> Command:
-    """R62 P0-04: 构造"限制用户解码该文件"命令(report:block 子动作)。
+    """R62 P0-04 + R64 P0-05: 构造"限制用户解码该文件"命令(report:block 子动作)。
 
     report:block 操作语义为"将举报人加入 file_code 的 blocked_users 列表",
     使其无法再解码该文件。区别于 ban(封禁账号)和 detach(脱钩文件):
@@ -2522,7 +2575,8 @@ def make_block_user_for_file_command(
         - ban: 全局封禁用户
         - detach: 解除文件与上传者关联(影响所有用户)
 
-    复用 content:takedown 权限门禁,requires_approval=False 立即执行。
+    R64 P0-05 整改: ``block_user_for_file`` 不再 ``requires_approval=False``。
+    风险级别由 ``HighRiskPolicy.is_high_risk("block_user_for_file")`` 决定。
 
     Args:
         file_code: 文件唯一标识
@@ -2532,6 +2586,9 @@ def make_block_user_for_file_command(
     Returns:
         Command 对象(handler 执行 $addToSet blocked_users 双写 + 缓存失效)
     """
+    # 延迟 import 避免与 services.command_bus 顶层循环依赖
+    from services.high_risk_policy import is_high_risk as _is_high_risk
+
     async def _handler(params: dict) -> dict:
         # R62 P0-04: 复用 update_file_record_and_invalidate 双写 + 缓存失效
         # 注:update_file_record_and_invalidate 当前仅支持 $set/$inc/$push 操作符,
@@ -2549,7 +2606,8 @@ def make_block_user_for_file_command(
         required_permission=PERM_CONTENT_TAKEDOWN,
         handler=_handler,
         params={"file_code": file_code, "user_id": user_id, "reason": reason},
-        requires_approval=False,
+        requires_approval=_is_high_risk("block_user_for_file"),  # R64 P0-05
+        approval_action=APPROVAL_ACTION_TAKEDOWN,  # 复用 takedown 审批
     )
 
 
@@ -2563,9 +2621,11 @@ def make_restore_content_command(
     first_approver_id: int = 0,
     note: str = "",
 ) -> Command:
-    """R51 P0-6: 构造内容申诉恢复命令(由 ApprovalExecutor 消费 command_outbox 调度)。
+    """R51 P0-6 + R64 P0-05: 构造内容申诉恢复命令(由 ApprovalExecutor 消费 command_outbox 调度)。
 
-    2-person 审批已在 process_appeal 完成,此处 requires_approval=False。
+    R64 P0-05 整改: 此前 ``requires_approval=False`` 依赖调用方先完成 2-person 审批。
+    但单点策略不一致会导致绕过风险。改为 ``HighRiskPolicy.is_high_risk("restore_content")``
+    决定,策略集中可审计;调用方仍可走 ApprovalExecutor 调度,CommandBus 门禁负责兜底。
     handler 执行流程:
     1. 调用 _restore_content_internal() 恢复内容(撤销软删除)
     2. restore 成功 → UPDATE content_reports SET status='resolved' + 通知举报者
@@ -2587,6 +2647,9 @@ def make_restore_content_command(
     Returns:
         Command 对象(由 ApprovalExecutor 调度执行)
     """
+    # 延迟 import 避免与 services.command_bus 顶层循环依赖
+    from services.high_risk_policy import is_high_risk as _is_high_risk
+
     async def _handler(params: dict) -> dict:
         import datetime as _dt_h
         from services import content_reports as _cr_mod
@@ -2763,8 +2826,8 @@ def make_restore_content_command(
             "first_approver_id": first_approver_id,
             "note": note,
         },
-        requires_approval=False,  # 2-person 审批已在 process_appeal 完成
-        approval_action="",
+        requires_approval=_is_high_risk("restore_content"),  # R64 P0-05
+        approval_action=APPROVAL_ACTION_RESTORE,
     )
 
 

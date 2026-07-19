@@ -288,8 +288,9 @@ async def retry_outbox(ids: list[int]) -> int:
         logger.info(f"[RepairConsole] retry_outbox 重置 {affected} 条记录(ids={ids})")
         return affected
     except Exception as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.error(f"[RepairConsole] retry_outbox 失败: {e}")
-        return 0
+    return 0
 
 
 async def skip_outbox(ids: list[int], reason: str = "") -> int:
@@ -332,8 +333,9 @@ async def skip_outbox(ids: list[int], reason: str = "") -> int:
         )
         return affected
     except Exception as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.error(f"[RepairConsole] skip_outbox 失败: {e}")
-        return 0
+    return 0
 
 
 # ─── 2. DLQ 死信队列修复 ────────────────────────────────────────
@@ -572,8 +574,9 @@ async def retry_replication(task_ids: list[int]) -> int:
         )
         return affected
     except Exception as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.error(f"[RepairConsole] retry_replication 失败: {e}")
-        return 0
+    return 0
 
 
 # ─── 4. Relay 账号修复 ──────────────────────────────────────────
@@ -656,8 +659,9 @@ async def repair_relay(account_id: int) -> bool:
             return True
         return False
     except Exception as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.error(f"[RepairConsole] repair_relay 失败(id={account_id}): {e}")
-        return False
+    return False
 
 
 # ─── 5. 总览 ────────────────────────────────────────────────────
@@ -1078,11 +1082,12 @@ async def _verify_approval(
                 return False
         return True
     except Exception as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.warning(
             f"[RepairConsole] _verify_approval 查询失败 "
             f"approval_action_id={approval_action_id}: {e}"
         )
-        return False
+    return False
 
 
 async def _write_repair_audit(
@@ -1121,8 +1126,9 @@ async def _write_repair_audit(
             return audit_id
         return 0
     except Exception as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.warning(f"[RepairConsole] _write_repair_audit 失败: {e}")
-        return 0
+    return 0
 
 
 async def get_causal_chain(trace_id: str, limit: int = 50) -> dict:

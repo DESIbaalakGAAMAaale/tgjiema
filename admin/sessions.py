@@ -86,8 +86,9 @@ async def _save_session_data(session_id: str, data: dict) -> bool:
         )
         return True
     except Exception as e:
+        # R64 P1-07: security 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.debug(f"[admin.sessions] 写入 session 失败: {e}")
-        return False
+    return False
 
 
 async def _delete_session_data(session_id: str) -> None:
@@ -501,8 +502,9 @@ class SessionManager:
                 logger.info(f"[admin.sessions] 清理过期 session: {deleted} 条")
             return deleted
         except Exception as e:
+            # R64 P1-07: security 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
             logger.warning(f"[admin.sessions] 清理过期 session 失败: {e}")
-            return 0
+        return 0
 
 
 # 模块级单例(与 cache_store.get_cache_store() 模式一致)

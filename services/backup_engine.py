@@ -275,8 +275,9 @@ class BackupEngine:
             logger.error(f"[BackupEngine] 上传 manifest 失败 {manifest_key}: {e}")
             try:
                 await storage.delete(payload_key)
-            except Exception:
-                pass
+            except Exception as cleanup_err:
+                # R64 P1-07: data-integrity 域禁止 except pass;清理失败需记录(不掩盖原错误)
+                logger.warning(f"[BackupEngine] 清理 payload 失败 {payload_key}: {cleanup_err}")
             raise RuntimeError(_i18n_t('services.backup_engine.s15', e=e)) from e
 
         try:
@@ -290,8 +291,12 @@ class BackupEngine:
             try:
                 await storage.delete(payload_key)
                 await storage.delete(manifest_key)
-            except Exception:
-                pass
+            except Exception as cleanup_err:
+                # R64 P1-07: data-integrity 域禁止 except pass;清理失败需记录(不掩盖原错误)
+                logger.warning(
+                    f"[BackupEngine] 清理 payload/manifest 失败 "
+                    f"{payload_key}/{manifest_key}: {cleanup_err}"
+                )
             raise RuntimeError(_i18n_t('services.backup_engine.s16', e=e)) from e
 
         # 7. HEAD 验证三个对象都存在(尝试下载极小内容验证可读)
@@ -303,8 +308,12 @@ class BackupEngine:
                 await storage.delete(payload_key)
                 await storage.delete(manifest_key)
                 await storage.delete(complete_key)
-            except Exception:
-                pass
+            except Exception as cleanup_err:
+                # R64 P1-07: data-integrity 域禁止 except pass;清理失败需记录(不掩盖原错误)
+                logger.warning(
+                    f"[BackupEngine] 清理三对象失败 "
+                    f"{payload_key}/{manifest_key}/{complete_key}: {cleanup_err}"
+                )
             raise RuntimeError(_i18n_t('services.backup_engine.s17', e=e)) from e
 
         # 8. 全部成功 → 更新 last_backup_at(复用 manifest.created_at,保证时间戳一致)
@@ -333,8 +342,9 @@ class BackupEngine:
         try:
             from services.ru_cost_center import record_backup_usage
             await record_backup_usage(ru_cost=100, operation="full_backup")
-        except Exception:
-            pass  # 不影响 backup 主流程
+        except Exception as ru_err:
+            # R64 P1-07: data-integrity 域禁止 except pass;RU 记录失败需记录(不影响主流程)
+            logger.warning(f"[BackupEngine] 记录 backup RU 消耗失败(非致命): {ru_err}")
 
         return manifest
 
@@ -1125,17 +1135,24 @@ class BackupEngine:
             )
             row = await cursor.fetchone()
         except Exception as e:
+            # R64 P1-07: data-integrity 域禁止 except 块裸 return 0;
+            # 查询失败时置 row=None,落到下方 "if not row" 统一返回 0
             logger.warning(
                 f"[BackupEngine] _lookup_principal_id 查询失败 "
                 f"approval_action_id={approval_action_id}: {e}"
             )
-            return 0
+            row = None
         if not row:
             return 0
         try:
             return int(row[0]) if row[0] is not None else 0
         except (TypeError, ValueError):
-            return 0
+            # R64 P1-07: data-integrity 域禁止 except 块裸 return 0;解析失败落到函数尾返回
+            logger.debug(
+                f"[BackupEngine] _lookup_principal_id principal 解析失败 "
+                f"approval_action_id={approval_action_id} row0={row[0]!r}"
+            )
+        return 0
 
     @staticmethod
     def _compute_restore_request_hash(
@@ -1403,8 +1420,11 @@ class BackupEngine:
                             hint = (
                                 _i18n_t('services.backup_engine.s43', manifest_key_id_8=manifest_key_id[:8], current_key_id_8=current_key_id[:8])
                             )
-                except Exception:
-                    pass
+                except Exception as hint_err:
+                    # R64 P1-07: data-integrity 域禁止 except pass;KEK 比对失败不影响主错误返回
+                    logger.debug(
+                        f"[BackupEngine] KEK key_id 比对失败(非致命,跳过 hint): {hint_err}"
+                    )
             return {
                 "success": False, "restored_tables": 0, "restored_rows": 0,
                 "checksum_verified": False,
@@ -1511,8 +1531,9 @@ class BackupEngine:
             await record_restore_usage(
                 ru_cost=restored_tables * 50, operation="restore",
             )
-        except Exception:
-            pass  # 不影响 restore 主流程
+        except Exception as ru_err:
+            # R64 P1-07: data-integrity 域禁止 except pass;RU 记录失败需记录(不影响主流程)
+            logger.warning(f"[BackupEngine] 记录 restore RU 消耗失败(非致命): {ru_err}")
 
         # R51 P0-8 + R52 P0-5: 恢复成功后将 command_executions.status 从 'executing' 更新为 'executed'
         # R52 P0-5: 统一状态机使用 mark_approved_executed 辅助函数(CAS: executing → executed)

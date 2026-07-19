@@ -146,8 +146,12 @@ class UnitOfWork:
                     await self._tx.execute(
                         f"ROLLBACK TO SAVEPOINT {self._savepoint_name}"
                     )
-            except Exception:
-                pass
+            except Exception as rollback_err:
+                # R64 P1-07: data-integrity 域禁止 except pass;
+                # rollback 失败需记录(不掩盖原 commit 错误,原错误在下方 raise 传播)
+                logger.warning(
+                    f"[UnitOfWork] rollback 也失败(数据可能不一致): {rollback_err}"
+                )
             raise
 
     async def execute(self, sql: str, params: Any = None):

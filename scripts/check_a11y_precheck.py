@@ -43,9 +43,33 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 E2E_DIR = REPO_ROOT / "tests" / "e2e"
 SPEC_FILE = E2E_DIR / "accessibility_behavior.spec.ts"
 CASES_JSON = E2E_DIR / "generated_a11y_cases.json"
+# R64 P1-09: a11y 强制矩阵用例文件(独立于 R61 路由用例文件)
+# - generated_a11y_cases.json: R61 路由级用例(每条 GET 路由一个 case,list schema)
+# - generated_a11y_matrix_cases.json: R64 矩阵用例(2 locales × 2 input_modes × 16 states = 64 case, dict schema)
+# 两个文件服务于不同测试维度,共存不冲突(路由覆盖 + 状态覆盖)。
+MATRIX_CASES_JSON = E2E_DIR / "generated_a11y_matrix_cases.json"
 
 # R62 P1-06: 预期的 locale 标记(测试用例名应同时包含两者)
 EXPECTED_LOCALES = ("zh-CN", "en-US")
+
+# R64 P1-09: a11y 强制矩阵维度
+# - locales: zh-CN / en-US(2 个)
+# - input_modes: keyboard / screen_reader(2 个)
+# - states: 16 个状态覆盖所有 UI 形态(错误/加载/空/分页/模态框/动态按钮/
+#   权限不足/审批与 MFA 全状态)
+EXPECTED_INPUT_MODES: tuple[str, ...] = ("keyboard", "screen_reader")
+EXPECTED_STATES: tuple[str, ...] = (
+    "error", "loading", "empty", "paginated", "modal", "dynamic_button",
+    "permission_denied",
+    "approval_required", "approval_pending", "approval_approved", "approval_rejected",
+    "mfa_required", "mfa_pending", "mfa_verified",
+    # 兼容性别名(允许 generated_a11y_cases.json 用以下别名替代部分状态)
+    "mfa_expired", "approval_expired",
+)
+# 完整 16 状态集合(用于门禁脚本声明完整矩阵)
+EXPECTED_STATES_FULL_COUNT: int = 16
+# 矩阵规模: 2 locales × 2 input_modes × 16 states = 64 个用例
+EXPECTED_MATRIX_CASE_COUNT: int = len(EXPECTED_LOCALES) * len(EXPECTED_INPUT_MODES) * EXPECTED_STATES_FULL_COUNT
 
 
 def _relpath(p: Path) -> str:
@@ -427,6 +451,262 @@ def check_route_metadata() -> CheckResult:
 
 
 # ════════════════════════════════════════════════════════════════
+# 检查 5: a11y 矩阵完整性检查(R64 P1-09 强制矩阵)
+# ════════════════════════════════════════════════════════════════
+
+
+def check_matrix_completeness(cases_json: Optional[Path] = None) -> CheckResult:
+    """R64 P1-09: 验证 a11y 矩阵用例文件覆盖完整矩阵。
+
+    强制规则:
+        1. expected_count 字段必须存在且为正整数
+        2. expected_count == EXPECTED_MATRIX_CASE_COUNT(2 × 2 × 16 = 64)
+        3. 实际用例数 == expected_count
+        4. 矩阵必须覆盖 EXPECTED_LOCALES × EXPECTED_INPUT_MODES ×
+           16 个 state(error/loading/empty/paginated/modal/dynamic_button/
+           permission_denied/approval_*/mfa_*)
+
+    缺失任何维度 → fail-closed(ok=False)。
+
+    Args:
+        cases_json: 矩阵用例文件路径(默认 MATRIX_CASES_JSON;
+            测试可传入临时路径)。
+
+    Returns:
+        CheckResult: ok=True 表示矩阵完整;details 含
+        {expected_count, actual_count, missing_locales,
+         missing_input_modes, missing_states}
+    """
+    details: dict = {
+        "expected_count": 0,
+        "actual_count": 0,
+        "missing_locales": [],
+        "missing_input_modes": [],
+        "missing_states": [],
+        "matrix_locales": [],
+        "matrix_input_modes": [],
+        "matrix_states": [],
+    }
+
+    json_path = cases_json or MATRIX_CASES_JSON
+    if not json_path.exists():
+        return CheckResult(
+            ok=False,
+            message=f"R64 P1-09: 矩阵用例文件不存在: {_relpath(json_path)}",
+            details=details,
+        )
+
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        return CheckResult(
+            ok=False,
+            message=f"R64 P1-09: 矩阵用例文件解析失败: {e}",
+            details=details,
+        )
+
+    # 兼容两种 schema:
+    #   (a) 顶层为数组(原始 R61 schema,无 expected_count)
+    #   (b) 顶层为对象 {expected_count, cases: [...]}(R64 P1-09 schema)
+    if isinstance(data, list):
+        cases = data
+        expected_count = 0  # 旧 schema 无 expected_count
+    elif isinstance(data, dict):
+        cases = data.get("cases", [])
+        if not isinstance(cases, list):
+            return CheckResult(
+                ok=False,
+                message="R64 P1-09: generated_a11y_cases.json 顶层对象的 cases 字段应为数组",
+                details=details,
+            )
+        expected_count = int(data.get("expected_count") or 0)
+    else:
+        return CheckResult(
+            ok=False,
+            message="R64 P1-09: generated_a11y_cases.json 顶层应为数组或对象",
+            details=details,
+        )
+
+    details["expected_count"] = expected_count
+    details["actual_count"] = len(cases)
+
+    # 收集 cases 中出现的 locales / input_modes / states
+    seen_locales: set[str] = set()
+    seen_input_modes: set[str] = set()
+    seen_states: set[str] = set()
+    for caze in cases:
+        if not isinstance(caze, dict):
+            continue
+        # locale 字段(可能为 "locale" 或 "locales" 数组)
+        loc = caze.get("locale")
+        if isinstance(loc, str) and loc:
+            seen_locales.add(loc)
+        locs = caze.get("locales")
+        if isinstance(locs, list):
+            for l in locs:
+                if isinstance(l, str) and l:
+                    seen_locales.add(l)
+        # input_mode 字段(可能为 "input_mode" 或 "input_modes" 数组)
+        im = caze.get("input_mode")
+        if isinstance(im, str) and im:
+            seen_input_modes.add(im)
+        ims = caze.get("input_modes")
+        if isinstance(ims, list):
+            for m in ims:
+                if isinstance(m, str) and m:
+                    seen_input_modes.add(m)
+        # state 字段(可能为 "state" 或 "states" 数组)
+        st = caze.get("state")
+        if isinstance(st, str) and st:
+            seen_states.add(st)
+        sts = caze.get("states")
+        if isinstance(sts, list):
+            for s in sts:
+                if isinstance(s, str) and s:
+                    seen_states.add(s)
+
+    details["matrix_locales"] = sorted(seen_locales)
+    details["matrix_input_modes"] = sorted(seen_input_modes)
+    details["matrix_states"] = sorted(seen_states)
+
+    # 检查 expected_count 完整性
+    if expected_count <= 0:
+        details["missing_locales"].extend(EXPECTED_LOCALES)
+        details["missing_input_modes"].extend(EXPECTED_INPUT_MODES)
+        details["missing_states"].extend(EXPECTED_STATES)
+        return CheckResult(
+            ok=False,
+            message=(
+                "R64 P1-09: generated_a11y_cases.json 缺少 expected_count 字段"
+                "(R64 P1-09 强制矩阵要求 expected_count == 实际用例数)"
+            ),
+            details=details,
+        )
+
+    if expected_count != EXPECTED_MATRIX_CASE_COUNT:
+        return CheckResult(
+            ok=False,
+            message=(
+                f"R64 P1-09: expected_count={expected_count} 与"
+                f" EXPECTED_MATRIX_CASE_COUNT={EXPECTED_MATRIX_CASE_COUNT}"
+                f"(2 locales × 2 input_modes × 16 states)不一致"
+            ),
+            details=details,
+        )
+
+    # 检查实际用例数 == expected_count
+    if len(cases) != expected_count:
+        return CheckResult(
+            ok=False,
+            message=(
+                f"R64 P1-09: 实际用例数 {len(cases)} != expected_count {expected_count}"
+                f"(expected_count 必须与实际 executed 完全相等,任何偏差视为假绿)"
+            ),
+            details=details,
+        )
+
+    # 检查矩阵覆盖完整性(locale × input_mode × state)
+    missing_locales = [l for l in EXPECTED_LOCALES if l not in seen_locales]
+    missing_input_modes = [m for m in EXPECTED_INPUT_MODES if m not in seen_input_modes]
+    missing_states = [s for s in EXPECTED_STATES if s not in seen_states]
+    details["missing_locales"] = missing_locales
+    details["missing_input_modes"] = missing_input_modes
+    details["missing_states"] = missing_states
+
+    if missing_locales or missing_input_modes or missing_states:
+        missing_summary: list[str] = []
+        if missing_locales:
+            missing_summary.append(f"locales={missing_locales}")
+        if missing_input_modes:
+            missing_summary.append(f"input_modes={missing_input_modes}")
+        if missing_states:
+            missing_summary.append(f"states={missing_states}")
+        return CheckResult(
+            ok=False,
+            message=(
+                "R64 P1-09: a11y 矩阵缺失维度 — "
+                + "; ".join(missing_summary)
+                + "(强制矩阵要求覆盖 2 locales × 2 input_modes × 16 states)"
+            ),
+            details=details,
+        )
+
+    return CheckResult(
+        ok=True,
+        message=(
+            f"R64 P1-09: a11y 矩阵完整性检查通过"
+            f"(expected_count={expected_count}, 实际用例数={len(cases)},"
+            f"locales={sorted(seen_locales)}, input_modes={sorted(seen_input_modes)},"
+            f"states={len(seen_states)} 个)"
+        ),
+        details=details,
+    )
+
+
+def check_expected_count_equals_executed(
+    executed_count: int,
+    *,
+    skip_count: int = 0,
+    xpass_count: int = 0,
+) -> CheckResult:
+    """R64 P1-09: 验证 expected_count == executed_count,且无 skip / xpass。
+
+    审计 P1-09 强制规则:
+        1. expected_test_count 必须等于 executed_test_count
+        2. 任何 skip / xpass 视为失败(exit code != 0)
+
+    Args:
+        executed_count: 实际执行的测试用例数
+        skip_count: skip 数量(必须为 0)
+        xpass_count: xpass 数量(必须为 0)
+
+    Returns:
+        CheckResult: ok=True 表示 expected == executed 且 skip/xpass 均为 0
+    """
+    details: dict = {
+        "expected_count": EXPECTED_MATRIX_CASE_COUNT,
+        "executed_count": executed_count,
+        "skip_count": skip_count,
+        "xpass_count": xpass_count,
+    }
+    if executed_count != EXPECTED_MATRIX_CASE_COUNT:
+        return CheckResult(
+            ok=False,
+            message=(
+                f"R64 P1-09: expected_count({EXPECTED_MATRIX_CASE_COUNT}) != "
+                f"executed_count({executed_count})"
+            ),
+            details=details,
+        )
+    if skip_count > 0:
+        return CheckResult(
+            ok=False,
+            message=(
+                f"R64 P1-09: 检测到 {skip_count} 个 skip 用例"
+                f"(任何 skip 视为失败,不允许跳过矩阵用例)"
+            ),
+            details=details,
+        )
+    if xpass_count > 0:
+        return CheckResult(
+            ok=False,
+            message=(
+                f"R64 P1-09: 检测到 {xpass_count} 个 xpass 用例"
+                f"(任何 xpass 视为失败,不允许 xfail 标记残留)"
+            ),
+            details=details,
+        )
+    return CheckResult(
+        ok=True,
+        message=(
+            f"R64 P1-09: expected == executed({executed_count}),"
+            f"skip=0, xpass=0"
+        ),
+        details=details,
+    )
+
+
+# ════════════════════════════════════════════════════════════════
 # 主入口
 # ════════════════════════════════════════════════════════════════
 
@@ -435,6 +715,8 @@ def run_all_checks(
     skip_node_require: bool = False,
     skip_playwright: bool = False,
     test_output_file: Optional[Path] = None,
+    *,
+    enforce_matrix: bool = False,
 ) -> tuple[list[CheckResult], list[CheckResult]]:
     """运行所有预检查,返回(通过列表, 失败列表)。
 
@@ -442,6 +724,13 @@ def run_all_checks(
         skip_node_require: 跳过 node require 子进程检查
         skip_playwright: 跳过 npx playwright 子进程检查
         test_output_file: 测试输出文件路径(用于 locale 执行验证)
+        enforce_matrix: R64 P1-09 强制矩阵检查开关。
+            True: 额外运行 check_matrix_completeness(),
+                校验 generated_a11y_cases.json 是否覆盖
+                2 locales × 2 input_modes × 16 states = 64 用例。
+            False(默认): 不运行矩阵检查,保持 R62 P1-06
+                向后兼容(legacy list schema 无 expected_count)。
+            CI Scanner 9 通过 check_a11y_matrix_enforcement.py 单独调用。
 
     Returns:
         (passed, failed) — 通过与失败的检查结果列表
@@ -485,6 +774,11 @@ def run_all_checks(
     # 4. 路由元数据检查
     results.append(check_route_metadata())
 
+    # 5. R64 P1-09: a11y 矩阵完整性检查(opt-in,默认关闭以保持向后兼容)
+    #    CI Scanner 9 单独调用 check_a11y_matrix_enforcement.py 强制矩阵。
+    if enforce_matrix:
+        results.append(check_matrix_completeness())
+
     passed = [r for r in results if r.ok]
     failed = [r for r in results if not r.ok]
     return passed, failed
@@ -511,12 +805,19 @@ def main() -> int:
         default=None,
         help="测试输出文件路径(用于 locale 执行验证,检查输出中的 locale 标记)",
     )
+    parser.add_argument(
+        "--enforce-matrix",
+        action="store_true",
+        help="R64 P1-09: 启用 a11y 矩阵完整性检查"
+        "(校验 generated_a11y_cases.json 覆盖 2 locales × 2 input_modes × 16 states)",
+    )
     args = parser.parse_args()
 
     passed, failed = run_all_checks(
         skip_node_require=args.skip_node_require,
         skip_playwright=args.skip_playwright,
         test_output_file=args.test_output,
+        enforce_matrix=args.enforce_matrix,
     )
 
     # 输出结果(通过的用 stdout,失败的用 stderr)

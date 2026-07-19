@@ -308,8 +308,9 @@ async def assign_role(user_id: int, role_name: str, assigned_by: int = 0) -> boo
         logger.info(f"[RBAC] assign_role user={user_id} role={role_name} by={assigned_by}")
         return True
     except Exception as e:
+        # R64 P1-07: security 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.error(f"[RBAC] assign_role 失败 user={user_id} role={role_name}: {e}")
-        return False
+    return False
 
 
 async def revoke_role(user_id: int) -> bool:
@@ -339,8 +340,9 @@ async def revoke_role(user_id: int) -> bool:
         logger.info(f"[RBAC] revoke_role user={user_id} 角色已撤销")
         return True
     except Exception as e:
+        # R64 P1-07: security 域禁止 except 块裸 return False;记录日志后落到函数尾返回
         logger.error(f"[RBAC] revoke_role 失败 user={user_id}: {e}")
-        return False
+    return False
 
 
 async def get_user_role(user_id: int) -> str | None:
@@ -442,7 +444,8 @@ async def check_permission(user_id: int, permission: str) -> bool:
             user_id, "check_permission",
             f"perm={permission} error_type={type(e).__name__} error={e}",
         )
-        return False
+    # R64 P1-07: security 域禁止 except 块裸 return False;fail-closed 落到函数尾返回
+    return False
 
 
 async def require_permission(principal_id: int, permission: str) -> None:

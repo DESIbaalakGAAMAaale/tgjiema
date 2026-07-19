@@ -282,14 +282,16 @@ async def _restore_table(conn: asyncpg.Connection, table: str, records: list[dic
 
     # R35 P1-6: 按表校验列(替代全局 _sanitize_column)
     # 使用 validate_columns_for_table 过滤非法列,而非全局白名单
+    columns = None
     try:
         raw_cols = list(records[0].keys())
         columns = validate_columns_for_table(table, raw_cols)
         if not columns:
             logger.error(f"[{table}] 校验后无合法列(原始列: {raw_cols}),跳过此表")
-            return 0
     except ValueError as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return 0;记录日志后落到下方统一返回
         logger.error(f"[{table}] 列校验失败: {e},跳过此表")
+    if not columns:
         return 0
 
     # B9: 不排除 id 列 — 排除后 ON CONFLICT(id) 永不触发（id 不在 INSERT 列中），
@@ -365,14 +367,16 @@ async def _restore_sqlite_table(
         return 0
 
     # R35 P1-6: 按表校验列
+    columns = None
     try:
         raw_cols = list(records[0].keys())
         columns = validate_columns_for_table(table, raw_cols)
         if not columns:
             logger.error(f"[SQLite][{table}] 校验后无合法列(原始列: {raw_cols}),跳过此表")
-            return 0
     except ValueError as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return 0;记录日志后落到下方统一返回
         logger.error(f"[SQLite][{table}] 列校验失败: {e},跳过此表")
+    if not columns:
         return 0
 
     if dry_run:
@@ -490,25 +494,29 @@ async def _restore_from_backup_data(
             (sentinel 不匹配 / nonce 已消费 / 已过期 / payload_digest 不匹配 /
              schema_fingerprint 不匹配 / actual payload bytes digest 不匹配)
 
-    R63 P0-02: writer 端重算 actual payload bytes digest。
-        - 首条语句对 ``verified_payload.payload`` 实际 canonical bytes 重新计算
+    R63 P0-02 / R64 P1-01: writer 端重算 actual payload bytes digest。
+        - 首条语句对 ``verified_payload.canonical_payload_bytes`` 实际 bytes 重新计算
           SHA-256,与 ``_capability.payload_digest`` 比对。
-        - 即使 ``object.__setattr__`` 绕过 frozen 替换了 payload,重算 digest
-          也会与 capability 内嵌(构造时)的 digest 不匹配 → fail-closed。
+        - 即使 ``object.__setattr__`` 绕过 frozen 替换了 canonical_payload_bytes,
+          重算 digest 也会与 capability 内嵌(构造时)的 digest 不匹配 → fail-closed。
         - 重算 digest 传给 ``assert_valid``(而非 verified_payload.payload_digest),
           保证令牌校验基于实际 bytes 而非存储的 digest。
+        - R64 P1-01: 改为直接对 canonical_payload_bytes 求 sha256,
+          无需经 _compute_payload_digest(已是 canonical bytes,无需再序列化)。
     """
-    # R63 P0-02: 首条语句 — 对 verified_payload.payload 实际 canonical bytes
-    # 重新计算 SHA-256,与 capability.payload_digest 比对。
-    # 这防御 object.__setattr__ 绕过 frozen 替换 payload 的攻击:
-    #   - 即使 attacker 替换 verified_payload.payload + verified_payload.payload_digest,
+    # R63 P0-02 / R64 P1-01: 首条语句 — 对 verified_payload.canonical_payload_bytes
+    # 实际 bytes 重新计算 SHA-256,与 capability.payload_digest 比对。
+    # 这防御 object.__setattr__ 绕过 frozen 替换 canonical_payload_bytes 的攻击:
+    #   - 即使 attacker 替换 verified_payload.canonical_payload_bytes + payload_digest,
     #     capability.payload_digest 是构造时内嵌的(不可变),重算 digest 不匹配 → fail-closed。
-    #   - 即使 attacker 只替换 verified_payload.payload,payload_digest 仍为旧值,
+    #   - 即使 attacker 只替换 canonical_payload_bytes,payload_digest 仍为旧值,
     #     重算 digest 与 capability.payload_digest 不匹配 → fail-closed。
+    import hashlib as _hashlib
     import time as _time
-    from services.backup_dr_validate import _compute_payload_digest
     from services.error_codes import AppError, ErrorCodes
-    actual_payload_digest = _compute_payload_digest(verified_payload.payload)
+    actual_payload_digest = _hashlib.sha256(
+        verified_payload.canonical_payload_bytes
+    ).hexdigest()
     if actual_payload_digest != _capability.payload_digest:
         logger.error(
             _LOG_PAYLOAD_DIGEST_MISMATCH.format(
@@ -613,11 +621,12 @@ async def _restore_from_backup_data(
     try:
         from services.ru_cost_center import record_restore_usage
         await record_restore_usage(
-            ru_cost=len(result["restored"]) * 50,
+            ru_cost=len(result["strored"]) * 50,
             operation="restore_from_backup_data",
         )
-    except Exception:
-        pass  # 不影响 restore 主流程
+    except Exception as ru_err:
+        # R64 P1-07: destructive 域禁止 except pass;RU 统计失败非致命,仅记录
+        logger.debug(f"[Restore] RU 统计失败(非致命): {ru_err}")
 
     return result
 

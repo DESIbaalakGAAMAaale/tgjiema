@@ -69,7 +69,7 @@ _REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 
 
 def _is_manifest_verify_enabled() -> bool:
-    """R63 P0-04: 检查是否启用 migration manifest 验签。
+    """R63 P0-04 / R64 P0-02: 检查是否启用 migration manifest 验签。
 
     通过环境变量 ``MIGRATION_MANIFEST_VERIFY`` 控制:
       - ``1`` / ``true`` / ``yes`` (大小写不敏感): 启用验签(CI 模式,fail-closed)
@@ -78,11 +78,33 @@ def _is_manifest_verify_enabled() -> bool:
     CI 中应在 workflow 中设置 ``MIGRATION_MANIFEST_VERIFY=1`` 强制验签。
     本地开发/测试可不设置或显式设为 ``0``,会输出 warning 但不阻断迁移。
 
+    R64 P0-02 新增 fail-closed 联动:
+      - 若 ``APP_ENV`` 为 ``staging`` / ``production`` 且未启用验签 → raise AppError
+        (拒绝启动,staging/production 必须启用验证)
+      - ``APP_ENV=local`` / ``test`` / 未设置时允许禁用验签
+
     Returns:
         True 表示启用验签(必须通过 cosign verify-blob + 签名文件存在性检查)
+
+    Raises:
+        AppError(MIGRATION_MANIFEST_VERIFY_REQUIRED): staging/production 未启用验签
     """
     val = os.environ.get("MIGRATION_MANIFEST_VERIFY", "").strip().lower()
-    return val in ("1", "true", "yes")
+    enabled = val in ("1", "true", "yes")
+    # R64 P0-02: staging/production 必须 fail-closed
+    app_env = os.environ.get("APP_ENV", "").strip().lower()
+    if not enabled and app_env in ("staging", "production"):
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_VERIFY_REQUIRED,
+            params={
+                "app_env": app_env,
+                "reason": (
+                    "staging/production 必须启用 MIGRATION_MANIFEST_VERIFY=1 "
+                    "(R64 P0-02: 禁用验签拒绝启动)"
+                ),
+            },
+        )
+    return enabled
 
 
 def _git_rev_parse(rev: str) -> str | None:
@@ -121,21 +143,29 @@ def _git_rev_parse(rev: str) -> str | None:
 
 
 def _verify_manifest_head_tree_binding(data: dict[str, Any]) -> None:
-    """R63 P0-04: 验证 manifest 绑定的 release_commit / tree_sha 与当前 git HEAD 一致。
+    """R63 P0-04 / R64 P0-02: 验证 manifest 绑定的 release_commit / tree_sha 与当前 git HEAD 一致。
 
     manifest 是 release artifact,必须绑定到具体的 commit + tree。
     若 manifest 的 release_commit/tree_sha 与当前 git HEAD/Tree 不一致,
     说明 manifest 是旧版本或被篡改 — 必须阻断迁移(fail-closed)。
 
-    若 git 不可用或不在 git 仓库中(如解压部署),输出 warning 但不阻断
-    (无法验证 = 无法阻断;此时应通过 MIGRATION_MANIFEST_VERIFY=1 + cosign
-    verify-blob 保证 manifest 真实性)。
+    R64 P0-02 整改(非 git 部署环境 fail-closed):
+      - 旧实现: git 不可用时只 warning 不阻断(部署环境"裸奔")
+      - 新实现: git 不可用时,从环境变量 ``RELEASE_SOURCE_COMMIT`` /
+        ``RELEASE_SOURCE_TREE`` 读取预期值(由部署环境从签名 attestation
+        或镜像 label 注入);若环境变量也未设置 → raise AppError(fail-closed)
+      - 部署环境(Docker 镜像、K8s pod、解压 tarball)通常无 .git 目录,
+        必须通过环境变量提供 source commit/tree,与 manifest 中的
+        release_commit/tree_sha 强制比对
 
     Args:
         data: 已解析的 manifest JSON dict
 
     Raises:
-        AppError(MIGRATION_MANIFEST_*): HEAD/Tree SHA 与 manifest 不一致
+        AppError(MIGRATION_MANIFEST_FIELD_MISSING): release_commit/tree_sha 字段为空
+        AppError(MIGRATION_MANIFEST_BINDING_MISMATCH): HEAD/Tree SHA 与 manifest 不一致
+        AppError(MIGRATION_MANIFEST_RELEASE_SOURCE_REQUIRED): 非 git 部署环境
+            未通过 RELEASE_SOURCE_COMMIT/TREE 注入 source commit/tree
     """
     manifest_commit = str(data.get("release_commit", "")).strip()
     manifest_tree = str(data.get("tree_sha", "")).strip()
@@ -147,10 +177,44 @@ def _verify_manifest_head_tree_binding(data: dict[str, Any]) -> None:
     head_sha = _git_rev_parse("HEAD")
     tree_sha = _git_rev_parse("HEAD^{tree}")
     if head_sha is None or tree_sha is None:
-        logger.warning(
-            "[migrate] R63 P0-04: git 不可用或不在 git 仓库中, "
-            "跳过 HEAD/Tree 绑定验证(无法验证 manifest 是否绑定到当前 commit) "
-            "— 部署环境应通过 MIGRATION_MANIFEST_VERIFY=1 + cosign verify-blob 保证真实性"
+        # R64 P0-02: 非 git 部署环境 fail-closed
+        # 从环境变量读取 RELEASE_SOURCE_COMMIT / RELEASE_SOURCE_TREE
+        # (部署环境从签名 attestation 或镜像 label 注入)
+        env_commit = os.environ.get("RELEASE_SOURCE_COMMIT", "").strip()
+        env_tree = os.environ.get("RELEASE_SOURCE_TREE", "").strip()
+        if not env_commit or not env_tree:
+            raise AppError(
+                ErrorCodes.MIGRATION_MANIFEST_RELEASE_SOURCE_REQUIRED,
+                params={
+                    "reason": (
+                        "非 git 部署环境必须通过 RELEASE_SOURCE_COMMIT / "
+                        "RELEASE_SOURCE_TREE 环境变量提供 source commit/tree "
+                        "(从签名 attestation 或镜像 label 注入)"
+                    ),
+                },
+            )
+        if env_commit != manifest_commit:
+            raise AppError(
+                ErrorCodes.MIGRATION_MANIFEST_BINDING_MISMATCH,
+                params={
+                    "field": "release_commit",
+                    "expected": manifest_commit[:12],
+                    "actual": env_commit[:12],
+                },
+            )
+        if env_tree != manifest_tree:
+            raise AppError(
+                ErrorCodes.MIGRATION_MANIFEST_BINDING_MISMATCH,
+                params={
+                    "field": "tree_sha",
+                    "expected": manifest_tree[:12],
+                    "actual": env_tree[:12],
+                },
+            )
+        logger.info(
+            f"[migrate] R64 P0-02: manifest HEAD/Tree 绑定验证通过 (非 git 环境) "
+            f"(commit={env_commit[:12]}..., tree={env_tree[:12]}..., "
+            f"source=RELEASE_SOURCE_COMMIT/TREE 环境变量)"
         )
         return
     if head_sha != manifest_commit:
@@ -218,6 +282,127 @@ def _verify_manifest_migration_set(data: dict[str, Any]) -> None:
     logger.info(
         f"[migrate] R63 P0-04: migration 集合一致性验证通过 "
         f"({len(manifest_versions)} 个 migration)"
+    )
+
+
+# R64 P0-02: release artifact manifest 路径(由 generate_release_manifest.py 生成,
+# CI 构建镜像时复制到 /app/release-artifacts/release-manifest.json)。
+# 默认指向镜像内路径;本地开发时若不存在则跳过 release manifest 一致性验证。
+_RELEASE_MANIFEST_PATH: Path = Path(
+    os.environ.get(
+        "RELEASE_MANIFEST_PATH",
+        str(_REPO_ROOT / "release-artifacts" / "release-manifest.json"),
+    )
+)
+
+
+def _verify_release_manifest_consistency(data: dict[str, Any]) -> None:
+    """R64 P0-02: 验证 release-manifest.json 与 migration-manifest.json 一致性。
+
+    release-manifest.json 是独立的 release artifact(不提交到 git,由 CI 在
+    docker build 之后、sign 之前生成),绑定 source_commit + source_tree +
+    image_digest + migration digest 集合。本函数在运行时验证:
+
+      1. release-manifest.json 存在(若 RELEASE_MANIFEST_PATH 指向的文件不存在,
+         输出 warning 并跳过 — 兼容本地开发 / 旧镜像;但 staging/production
+         应通过 _is_manifest_verify_enabled() 的 fail-closed 保证镜像内必有
+         release-manifest.json)
+      2. release-manifest.json.migrations 集合 == migration-manifest.json.migrations 集合
+      3. 每个 migration 的 sha256 一致(release manifest 与 migration manifest)
+      4. release-manifest.json.migration_manifest_digest == 当前 migration-manifest.json
+         实际 sha256(防止 release manifest 引用旧 migration-manifest.json)
+
+    Args:
+        data: 已解析的 migration-manifest.json dict(用于集合/digest 比对)
+
+    Raises:
+        AppError(MIGRATION_MANIFEST_RELEASE_CONSISTENCY): 集合/sha256/digest 不一致
+    """
+    if not _RELEASE_MANIFEST_PATH.exists():
+        # 兼容本地开发 / 旧镜像:无 release-manifest.json 时跳过
+        # (staging/production 应通过 _is_manifest_verify_enabled() 的 fail-closed
+        # 保证镜像内 ENV MIGRATION_MANIFEST_VERIFY=1 + 必有 release-manifest.json;
+        # 此处仅 warning,不阻断 — 真正的强制由 _is_manifest_verify_enabled() + cosign
+        # 验签 + RELEASE_SOURCE_COMMIT/TREE 注入共同保证)
+        logger.warning(
+            f"[migrate] R64 P0-02: release-manifest.json 不存在 "
+            f"({_RELEASE_MANIFEST_PATH}),跳过 release manifest 一致性验证 — "
+            f"staging/production 镜像必须包含 release-manifest.json"
+        )
+        return
+    import json as _json
+    try:
+        release_data = _json.loads(
+            _RELEASE_MANIFEST_PATH.read_text(encoding="utf-8")
+        )
+    except (_json.JSONDecodeError, OSError) as e:
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_RELEASE_CONSISTENCY,
+            params={
+                "reason": f"release-manifest.json 解析失败: {e}",
+                "field": "release-manifest.json",
+            },
+        ) from e
+
+    # 1. 集合一致性
+    migration_versions = {
+        str(entry["version"]): str(entry.get("sha256", ""))
+        for entry in data.get("migrations", [])
+        if "version" in entry
+    }
+    release_versions = {
+        str(entry["version"]): str(entry.get("sha256", ""))
+        for entry in release_data.get("migrations", [])
+        if "version" in entry
+    }
+    if set(migration_versions.keys()) != set(release_versions.keys()):
+        missing_in_release = set(migration_versions.keys()) - set(release_versions.keys())
+        missing_in_migration = set(release_versions.keys()) - set(migration_versions.keys())
+        raise AppError(
+            ErrorCodes.MIGRATION_MANIFEST_RELEASE_CONSISTENCY,
+            params={
+                "reason": "migration 集合不一致",
+                "field": "migrations",
+                "expected": sorted(missing_in_release),
+                "actual": sorted(missing_in_migration),
+            },
+        )
+
+    # 2. 每个 migration 的 sha256 一致
+    for version, expected_sha in migration_versions.items():
+        actual_sha = release_versions.get(version, "")
+        if actual_sha != expected_sha:
+            raise AppError(
+                ErrorCodes.MIGRATION_MANIFEST_RELEASE_CONSISTENCY,
+                params={
+                    "reason": f"{version} sha256 不一致",
+                    "field": version,
+                    "expected": expected_sha[:12],
+                    "actual": actual_sha[:12],
+                },
+            )
+
+    # 3. release-manifest.json.migration_manifest_digest == 当前 migration-manifest.json
+    #    实际 sha256(防止 release manifest 引用旧 migration-manifest.json)
+    expected_mm_digest = str(release_data.get("migration_manifest_digest", "")).strip()
+    if expected_mm_digest:
+        actual_mm_digest = hashlib.sha256(
+            _MANIFEST_PATH.read_bytes()
+        ).hexdigest()
+        if expected_mm_digest != actual_mm_digest:
+            raise AppError(
+                ErrorCodes.MIGRATION_MANIFEST_RELEASE_CONSISTENCY,
+                params={
+                    "reason": "migration_manifest_digest 不一致 — release manifest 引用旧 migration-manifest.json",
+                    "field": "migration_manifest_digest",
+                    "expected": expected_mm_digest[:12],
+                    "actual": actual_mm_digest[:12],
+                },
+            )
+
+    logger.info(
+        f"[migrate] R64 P0-02: release-manifest.json 与 migration-manifest.json "
+        f"一致性验证通过 ({len(migration_versions)} 个 migration)"
     )
 
 
@@ -601,8 +786,10 @@ def _load_migration_manifest() -> dict[str, dict[str, Any]]:
         )
     # R63 P0-04: 加载 manifest 作为 trust anchor 前必须验证完整性
     # (HEAD/Tree 绑定 + 磁盘集合一致性 + 可选 cosign 验签)
+    # R64 P0-02: 新增 release-manifest.json 一致性验证(若文件存在)
     _verify_manifest_head_tree_binding(data)
     _verify_manifest_migration_set(data)
+    _verify_release_manifest_consistency(data)
     if _is_manifest_verify_enabled():
         _verify_manifest_cosign_signature(data)
     else:

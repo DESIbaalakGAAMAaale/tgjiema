@@ -1,0 +1,671 @@
+{
+  "expected_count": 64,
+  "locales": [
+    "zh-CN",
+    "en-US"
+  ],
+  "input_modes": [
+    "keyboard",
+    "screen_reader"
+  ],
+  "states": [
+    "error",
+    "loading",
+    "empty",
+    "paginated",
+    "modal",
+    "dynamic_button",
+    "permission_denied",
+    "approval_required",
+    "approval_pending",
+    "approval_approved",
+    "approval_rejected",
+    "approval_expired",
+    "mfa_required",
+    "mfa_pending",
+    "mfa_verified",
+    "mfa_expired"
+  ],
+  "cases": [
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "error",
+      "path": "/readiness",
+      "template": "readiness.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "error",
+      "path": "/readiness",
+      "template": "readiness.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "error",
+      "path": "/readiness",
+      "template": "readiness.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "error",
+      "path": "/readiness",
+      "template": "readiness.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "loading",
+      "path": "/tasks",
+      "template": "tasks.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "loading",
+      "path": "/tasks",
+      "template": "tasks.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "loading",
+      "path": "/tasks",
+      "template": "tasks.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "loading",
+      "path": "/tasks",
+      "template": "tasks.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "empty",
+      "path": "/notifications",
+      "template": "notifications.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "empty",
+      "path": "/notifications",
+      "template": "notifications.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "empty",
+      "path": "/notifications",
+      "template": "notifications.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "empty",
+      "path": "/notifications",
+      "template": "notifications.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "paginated",
+      "path": "/users",
+      "template": "users.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "paginated",
+      "path": "/users",
+      "template": "users.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "paginated",
+      "path": "/users",
+      "template": "users.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "paginated",
+      "path": "/users",
+      "template": "users.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "modal",
+      "path": "/reports",
+      "template": "reports.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "modal",
+      "path": "/reports",
+      "template": "reports.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "modal",
+      "path": "/reports",
+      "template": "reports.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "modal",
+      "path": "/reports",
+      "template": "reports.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "dynamic_button",
+      "path": "/files",
+      "template": "files.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "dynamic_button",
+      "path": "/files",
+      "template": "files.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "dynamic_button",
+      "path": "/files",
+      "template": "files.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "dynamic_button",
+      "path": "/files",
+      "template": "files.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "permission_denied",
+      "path": "/rbac",
+      "template": "rbac.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "permission_denied",
+      "path": "/rbac",
+      "template": "rbac.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "permission_denied",
+      "path": "/rbac",
+      "template": "rbac.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "permission_denied",
+      "path": "/rbac",
+      "template": "rbac.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "approval_required",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "approval_required",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "approval_required",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "approval_required",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "approval_pending",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "approval_pending",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "approval_pending",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "approval_pending",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "approval_approved",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "approval_approved",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "approval_approved",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "approval_approved",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "approval_rejected",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "approval_rejected",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "approval_rejected",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "approval_rejected",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "approval_expired",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "approval_expired",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "approval_expired",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "approval_expired",
+      "path": "/approvals",
+      "template": "approvals.html",
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "mfa_required",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "mfa_required",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "mfa_required",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "mfa_required",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "mfa_pending",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "mfa_pending",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "mfa_pending",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "mfa_pending",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "mfa_verified",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "mfa_verified",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "mfa_verified",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "mfa_verified",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "keyboard",
+      "state": "mfa_expired",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "zh-CN",
+      "input_mode": "screen_reader",
+      "state": "mfa_expired",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "keyboard",
+      "state": "mfa_expired",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    },
+    {
+      "locale": "en-US",
+      "input_mode": "screen_reader",
+      "state": "mfa_expired",
+      "path": "/mfa/setup",
+      "template": null,
+      "permission": "require_session",
+      "module": "admin",
+      "a11y_testable": true
+    }
+  ]
+}

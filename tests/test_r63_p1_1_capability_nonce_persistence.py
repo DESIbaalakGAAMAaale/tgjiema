@@ -115,13 +115,26 @@ class TestConsumedNoncesSetRemoved:
 
 
 class TestConsumeCapabilityNonceAtomicCAS:
-    """R63 P1-01: CacheStore.consume_capability_nonce 原子消费(INSERT OR IGNORE CAS)。"""
+    """R63 P1-01 / R64 P1-02: CacheStore.consume_capability_nonce 原子消费(CAS reserved→consumed)。
+
+    R64 P1-02: consume 从 INSERT OR IGNORE CAS 改为 UPDATE CAS(WHERE status='reserved'),
+    需先调用 reserve_capability_nonce 将 nonce 置于 'reserved' 状态。
+    """
 
     @pytest.mark.asyncio
     async def test_first_consume_returns_true(self):
-        """首次消费返回 True(本调用方赢得竞态)。"""
+        """reserve → consume 返回 True(CAS reserved→consumed 成功)。"""
         store, _ = await _make_store()
         try:
+            # R64 P1-02: 需先 reserve,consume 为 CAS reserved→consumed
+            await store.reserve_capability_nonce(
+                "nonce_first_001",
+                operation_id="op_first_001",
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                reserved_by="host1:1234",
+            )
             won = await store.consume_capability_nonce(
                 "nonce_first_001",
                 backup_id="backup_001",
@@ -135,9 +148,18 @@ class TestConsumeCapabilityNonceAtomicCAS:
 
     @pytest.mark.asyncio
     async def test_second_consume_returns_false(self):
-        """同一 nonce 二次消费返回 False(已被消费,重放或竞态失败)。"""
+        """reserve → consume(True)→ 二次 consume(False,终态保护,防重放)。"""
         store, _ = await _make_store()
         try:
+            # R64 P1-02: 需先 reserve,consume 为 CAS reserved→consumed
+            await store.reserve_capability_nonce(
+                "nonce_second_001",
+                operation_id="op_second_001",
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                reserved_by="host1:1234",
+            )
             won1 = await store.consume_capability_nonce(
                 "nonce_second_001",
                 backup_id="backup_001",
@@ -146,7 +168,7 @@ class TestConsumeCapabilityNonceAtomicCAS:
                 consumed_by="host1:1234",
             )
             won2 = await store.consume_capability_nonce(
-                "nonce_second_001",  # 同一 nonce
+                "nonce_second_001",  # 同一 nonce,已 consumed
                 backup_id="backup_001",
                 manifest_sha256="a" * 64,
                 payload_digest="d" * 64,
@@ -164,6 +186,15 @@ class TestConsumeCapabilityNonceAtomicCAS:
         try:
             # 消费前 — 未被消费
             assert await store.is_capability_nonce_consumed("nonce_query_001") is False
+            # R64 P1-02: 需先 reserve,consume 为 CAS reserved→consumed
+            await store.reserve_capability_nonce(
+                "nonce_query_001",
+                operation_id="op_query_001",
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                reserved_by="host1:1234",
+            )
             # 消费
             await store.consume_capability_nonce(
                 "nonce_query_001",
@@ -179,9 +210,18 @@ class TestConsumeCapabilityNonceAtomicCAS:
 
     @pytest.mark.asyncio
     async def test_binding_fields_stored_correctly(self):
-        """R63 P1-01: 绑定字段(backup_id + manifest_sha256 + payload_digest)正确存储。"""
+        """R63 P1-01 / R64 P1-02: 绑定字段(backup_id + manifest_sha256 + payload_digest)正确存储。"""
         store, _ = await _make_store()
         try:
+            # R64 P1-02: 需先 reserve,consume 为 CAS reserved→consumed
+            await store.reserve_capability_nonce(
+                "nonce_bind_001",
+                operation_id="op_bind_001",
+                backup_id="backup_bind_001",
+                manifest_sha256="abc123",
+                payload_digest="def456",
+                reserved_by="host_bind:9999",
+            )
             await store.consume_capability_nonce(
                 "nonce_bind_001",
                 backup_id="backup_bind_001",
@@ -221,8 +261,16 @@ class TestPersistenceAcrossRestart:
         _tmp_dir = tempfile.mkdtemp(prefix="r63_p1_01_restart_")
         db_path = str(Path(_tmp_dir) / "restart_test.db")
 
-        # 实例 A:消费 nonce
+        # 实例 A:reserve → consume(R64 P1-02 状态机)
         store_a, _ = await _make_store(db_path)
+        await store_a.reserve_capability_nonce(
+            "nonce_restart_001",
+            operation_id="op_restart_001",
+            backup_id="backup_restart_001",
+            manifest_sha256="a" * 64,
+            payload_digest="d" * 64,
+            reserved_by="host_a:1234",
+        )
         won_a = await store_a.consume_capability_nonce(
             "nonce_restart_001",
             backup_id="backup_restart_001",
@@ -241,7 +289,7 @@ class TestPersistenceAcrossRestart:
             assert is_consumed is True, (
                 "重启后(新 CacheStore 实例)应仍能感知 nonce 已被消费"
             )
-            # 二次消费应失败
+            # 二次消费应失败(已 consumed,CAS reserved→consumed 无 reserved 行)
             won_b = await store_b.consume_capability_nonce(
                 "nonce_restart_001",
                 backup_id="backup_restart_001",
@@ -300,12 +348,20 @@ class TestMultiInstanceConcurrentRace:
 
     @pytest.mark.asyncio
     async def test_two_instances_concurrent_consume_only_one_wins(self):
-        """两个 CacheStore 实例并发 consume 同一 nonce → 仅一个 True。"""
+        """两个 CacheStore 实例并发 consume 同一(已 reserved)nonce → 仅一个 True。"""
         _tmp_dir = tempfile.mkdtemp(prefix="r63_p1_01_race_")
         db_path = str(Path(_tmp_dir) / "race_test.db")
 
-        # 预热:创建 DB schema
+        # 预热:创建 DB schema + reserve nonce(R64 P1-02 状态机)
         store_init, _ = await _make_store(db_path)
+        await store_init.reserve_capability_nonce(
+            "nonce_race_001",
+            operation_id="op_race_001",
+            backup_id="backup_race",
+            manifest_sha256="a" * 64,
+            payload_digest="d" * 64,
+            reserved_by="host_init:0000",
+        )
         await store_init.close()
 
         # 两个独立 CacheStore 实例共享同一 DB 文件
@@ -313,7 +369,7 @@ class TestMultiInstanceConcurrentRace:
         store_b, _ = await _make_store(db_path)
 
         try:
-            # 并发 consume 同一 nonce
+            # 并发 consume 同一(已 reserved)nonce — CAS reserved→consumed,仅一个 True
             results = await asyncio.gather(
                 store_a.consume_capability_nonce(
                     "nonce_race_001",
@@ -341,11 +397,28 @@ class TestMultiInstanceConcurrentRace:
 
     @pytest.mark.asyncio
     async def test_two_instances_distinct_nonces_both_win(self):
-        """两个 CacheStore 实例并发 consume 不同 nonce → 都返回 True。"""
+        """两个 CacheStore 实例并发 consume 不同(已 reserved)nonce → 都返回 True。"""
         _tmp_dir = tempfile.mkdtemp(prefix="r63_p1_01_distinct_")
         db_path = str(Path(_tmp_dir) / "distinct_test.db")
 
+        # 预热:reserve 两个不同 nonce
         store_init, _ = await _make_store(db_path)
+        await store_init.reserve_capability_nonce(
+            "nonce_distinct_a",
+            operation_id="op_distinct_a",
+            backup_id="backup_distinct",
+            manifest_sha256="a" * 64,
+            payload_digest="d" * 64,
+            reserved_by="host_init:0000",
+        )
+        await store_init.reserve_capability_nonce(
+            "nonce_distinct_b",
+            operation_id="op_distinct_b",
+            backup_id="backup_distinct",
+            manifest_sha256="a" * 64,
+            payload_digest="d" * 64,
+            reserved_by="host_init:0000",
+        )
         await store_init.close()
 
         store_a, _ = await _make_store(db_path)
@@ -381,14 +454,23 @@ class TestMultiInstanceConcurrentRace:
         _tmp_dir = tempfile.mkdtemp(prefix="r63_p1_01_sync_")
         db_path = str(Path(_tmp_dir) / "sync_test.db")
 
+        # 预热:reserve nonce(R64 P1-02 状态机)
         store_init, _ = await _make_store(db_path)
+        await store_init.reserve_capability_nonce(
+            "nonce_sync_001",
+            operation_id="op_sync_001",
+            backup_id="backup_sync",
+            manifest_sha256="a" * 64,
+            payload_digest="d" * 64,
+            reserved_by="host_init:0000",
+        )
         await store_init.close()
 
         store_a, _ = await _make_store(db_path)
         store_b, _ = await _make_store(db_path)
 
         try:
-            # 实例 A 消费
+            # 实例 A consume(CAS reserved→consumed)
             won_a = await store_a.consume_capability_nonce(
                 "nonce_sync_001",
                 backup_id="backup_sync",
@@ -398,7 +480,7 @@ class TestMultiInstanceConcurrentRace:
             )
             assert won_a is True
 
-            # 实例 B 立即查询 — 应感知到 nonce 已被消费
+            # 实例 B 立即查询 — 应感知到 nonce 已被消费(WAL 同步)
             is_consumed_b = await store_b.is_capability_nonce_consumed("nonce_sync_001")
             assert is_consumed_b is True, (
                 "WAL 模式下,实例 A 消费后实例 B 应立即感知"
@@ -513,7 +595,12 @@ class TestAssertValidWithStoreInjection:
 
     @pytest.mark.asyncio
     async def test_assert_valid_app_error_carries_reason_param(self):
-        """R63 P1-01: AppError 携带 params={"reason": "nonce_already_consumed"}。"""
+        """R63 P1-01 / R64 P1-02: AppError 携带 params={"reason": "nonce_already_reserved_or_consumed"}。
+
+        R64 P1-02: assert_valid 改为 reserve(非 consume),二次调用同一 capability 时
+        reserve 失败(PRIMARY KEY 冲突,nonce 已 reserved),reason 从 'nonce_already_consumed'
+        变为 'nonce_already_reserved_or_consumed'。
+        """
         mod = _ensure_backup_dr_validate_importable()
         from services.error_codes import AppError
 
@@ -521,14 +608,14 @@ class TestAssertValidWithStoreInjection:
         try:
             cap = _build_valid_capability(mod, payload_digest="d" * 64)
             now = time.time()
-            # 第一次消费
+            # 第一次 reserve(成功)
             await cap.assert_valid(
                 payload_digest="d" * 64,
                 clock=now,
                 expected_scope="R63-P1-01-test-fingerprint",
                 store=store,
             )
-            # 第二次 — 应携带 reason 参数
+            # 第二次 — reserve 失败(nonce 已 reserved),应携带 reason 参数
             with pytest.raises(AppError) as exc_info:
                 await cap.assert_valid(
                     payload_digest="d" * 64,
@@ -536,10 +623,10 @@ class TestAssertValidWithStoreInjection:
                     expected_scope="R63-P1-01-test-fingerprint",
                     store=store,
                 )
-            # AppError 应携带 params={"reason": "nonce_already_consumed"}
+            # AppError 应携带 params={"reason": "nonce_already_reserved_or_consumed"}
             assert exc_info.value.params is not None
-            assert exc_info.value.params.get("reason") == "nonce_already_consumed", (
-                "AppError 应携带 params={'reason': 'nonce_already_consumed'}"
+            assert exc_info.value.params.get("reason") == "nonce_already_reserved_or_consumed", (
+                "AppError 应携带 params={'reason': 'nonce_already_reserved_or_consumed'}"
             )
         finally:
             await store.close()

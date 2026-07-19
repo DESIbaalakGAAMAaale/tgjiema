@@ -1,3 +1,5 @@
+import uuid
+
 from telegram import Update, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from loguru import logger
@@ -15,6 +17,11 @@ from services.i18n import translate as _i18n_t, get_i18n_manager
 from services.user_message import UserMessage, render_for_send
 from database.cache import invalidate_file_record
 from config import settings
+
+# R64 P1-06: typed adapter(safe_send_message / safe_edit_message_text /
+# safe_reply_text)。新代码应通过 adapter 出口,业务模块禁止直接调用第三方
+# send/edit API。存量直调(query.edit_message_text 等)由 baseline 门禁
+# (scripts/check_sink_import_boundary.py)逐步迁移。
 
 from .menus import (
     _build_menu, BACK_BTN,
@@ -369,6 +376,25 @@ _LOG_REPORT_BIND_VERIFY_FAILED = (
     "[Admin][report] R63 P1-06 绑定校验失败: sub_action={}, handle={}, err={}"
 )
 _LOG_REPORT_HANDLER_ERROR = "[Admin][report] handler error: {}"
+# R64 P1-06: 内部异常仅进入结构化日志(不进用户面 params),
+# 用户面消息只携带 trace_id 供引用。每条日志含 trace_id / sub_action / error detail。
+# 注:日志 message 用英文,避免 R63 P1-07 中文裸字符串扫描器误报。
+_LOG_REPORT_BAN_FAILED = (
+    "[Admin][report:ban] R64 P1-06 operation failed "
+    "trace_id={} uid={} error={!r}"
+)
+_LOG_REPORT_DETACH_FAILED = (
+    "[Admin][report:detach] R64 P1-06 operation failed "
+    "trace_id={} file_code={} error={!r}"
+)
+_LOG_REPORT_BLOCK_FAILED = (
+    "[Admin][report:block] R64 P1-06 operation failed "
+    "trace_id={} reporter_id={} file_code={} error={!r}"
+)
+_LOG_REPORT_HANDLER_FAILED = (
+    "[Admin][report] R64 P1-06 handler exception "
+    "trace_id={} error={!r}"
+)
 
 async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TYPE, data: str):
     """处理管理员对举报的操作：封禁/脱钩/限制/忽略。
@@ -387,8 +413,10 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
 
     # report:ignore 是低风险(只标记忽略),不需要签名 token
     if data == "report:ignore":
+        # R64 P1-06: 不再拼接 query.message.text(避免继承旧消息语言),
+        # 直接用新的 i18n 文案替换整个消息。
         await query.edit_message_text(
-            query.message.text + _i18n_t('bot.admin_bot.callback.s20'),
+            _i18n_t('bot.admin_bot.callback.s20'),
             reply_markup=None,
         )
         return
@@ -493,8 +521,10 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             result = await bus.execute(command, cb_principal)
 
             if result.approval_required:
+                # R64 P1-06: 不再拼接 query.message.text(避免继承旧消息语言),
+                # 直接用新的 UserMessage.from_key(...) 替换整个消息。
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.ban_approval_submitted',
                             params={'approval_id': result.approval_id, 'uid': uid},
@@ -504,8 +534,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=None,
                 )
             elif result.success:
+                # R64 P1-06: 同上 — 不拼接 query.message.text。
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.ban_success',
                             params={'uid': uid},
@@ -515,11 +546,18 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=None,
                 )
             else:
+                # R64 P1-06: 内部异常不进用户面 params;仅记录结构化日志,
+                # 用户面只暴露 trace_id 供引用。
+                trace_id = uuid.uuid4().hex
+                logger.error(
+                    _LOG_REPORT_BAN_FAILED.format(trace_id, uid, result.error)
+                )
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.ban_failed',
-                            params={'error': str(result.error)},
+                            params={'trace_id': trace_id},
+                            trace_id=trace_id,
                         ),
                         get_i18n_manager(),
                     ),
@@ -550,8 +588,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
 
             if result.approval_required:
                 # detach_file 命令 requires_approval=False,不应到达此分支
+                # R64 P1-06: 不再拼接 query.message.text(避免继承旧消息语言)。
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.detach_approval_submitted',
                             params={'approval_id': result.approval_id, 'file_code': file_code},
@@ -561,8 +600,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=None,
                 )
             elif result.success:
+                # R64 P1-06: 同上 — 不拼接 query.message.text。
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.detach_success',
                             params={'file_code': file_code},
@@ -572,11 +612,18 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=None,
                 )
             else:
+                # R64 P1-06: 内部异常不进用户面 params;仅记录结构化日志,
+                # 用户面只暴露 trace_id 供引用。
+                trace_id = uuid.uuid4().hex
+                logger.error(
+                    _LOG_REPORT_DETACH_FAILED.format(trace_id, file_code, result.error)
+                )
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.detach_failed',
-                            params={'error': str(result.error)},
+                            params={'trace_id': trace_id},
+                            trace_id=trace_id,
                         ),
                         get_i18n_manager(),
                     ),
@@ -616,8 +663,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
             result = await bus.execute(command, cb_principal)
 
             if result.approval_required:
+                # R64 P1-06: 不再拼接 query.message.text(避免继承旧消息语言)。
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.block_approval_submitted',
                             params={
@@ -631,8 +679,9 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=None,
                 )
             elif result.success:
+                # R64 P1-06: 同上 — 不拼接 query.message.text。
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.block_success',
                             params={'reporter_id': reporter_id, 'file_code': file_code},
@@ -642,11 +691,20 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                     reply_markup=None,
                 )
             else:
+                # R64 P1-06: 内部异常不进用户面 params;仅记录结构化日志,
+                # 用户面只暴露 trace_id 供引用。
+                trace_id = uuid.uuid4().hex
+                logger.error(
+                    _LOG_REPORT_BLOCK_FAILED.format(
+                        trace_id, reporter_id, file_code, result.error,
+                    )
+                )
                 await query.edit_message_text(
-                    query.message.text + "\n\n" + render_for_send(
+                    render_for_send(
                         UserMessage.from_key(
                             'admin.callback.button_security.block_failed',
-                            params={'error': str(result.error)},
+                            params={'trace_id': trace_id},
+                            trace_id=trace_id,
                         ),
                         get_i18n_manager(),
                     ),
@@ -666,12 +724,16 @@ async def _handle_report_action(update: Update, context: ContextTypes.DEFAULT_TY
                 reply_markup=None,
             )
     except Exception as e:
-        logger.error(_LOG_REPORT_HANDLER_ERROR.format(e))
+        # R64 P1-06: 内部异常不进用户面 params;仅记录结构化日志,
+        # 用户面只暴露 trace_id 供引用。
+        trace_id = uuid.uuid4().hex
+        logger.error(_LOG_REPORT_HANDLER_FAILED.format(trace_id, e))
         await query.answer(
             render_for_send(
                 UserMessage.from_key(
                     'admin.callback.button_security.operation_failed',
-                    params={'error': str(e)},
+                    params={'trace_id': trace_id},
+                    trace_id=trace_id,
                 ),
                 get_i18n_manager(),
             ),

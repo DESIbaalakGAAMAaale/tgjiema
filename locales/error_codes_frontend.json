@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 121,
-    "generated_at": "2026-07-18T14:46:58.818199Z",
+    "enum_count": 139,
+    "generated_at": "2026-07-18T18:30:18.513651Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(R61 P1-05: 独立显式设置,通常等于 retryable 但可独立覆盖)",
       "telegram_presentation": "Bot 端展示方式(R61 P1-05 显式字段): short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)/modal/toast(预留扩展)"
     },
-    "total_codes": 121,
+    "total_codes": 139,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -199,6 +199,20 @@
       "show_retry_button": false,
       "telegram_presentation": "inline"
     },
+    "BACKUP.PAYLOAD.NOT_SERIALIZABLE": {
+      "audit_level": "critical",
+      "code": "BACKUP.PAYLOAD.NOT_SERIALIZABLE",
+      "http_status": 500,
+      "message_key": "errors.backup.payload.not_serializable",
+      "retryable": false,
+      "safe_params": [
+        "field",
+        "type_name"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED": {
       "audit_level": "critical",
       "code": "BACKUP.RESTORE.APPROVAL_ACTION_ID_REQUIRED",
@@ -315,7 +329,9 @@
       "safe_params": [
         "action",
         "missing_field",
-        "reason"
+        "reason",
+        "expected",
+        "actual"
       ],
       "severity": "critical",
       "show_retry_button": false,
@@ -450,6 +466,33 @@
       "severity": "warning",
       "show_retry_button": false,
       "telegram_presentation": "short_hint"
+    },
+    "BUTTON.UX.ACTION_NOT_HIGH_RISK": {
+      "audit_level": "critical",
+      "code": "BUTTON.UX.ACTION_NOT_HIGH_RISK",
+      "http_status": 400,
+      "message_key": "errors.button.ux.action_not_high_risk",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BUTTON.UX.ACTION_REQUIRED": {
+      "audit_level": "critical",
+      "code": "BUTTON.UX.ACTION_REQUIRED",
+      "http_status": 400,
+      "message_key": "errors.button.ux.action_required",
+      "retryable": false,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "CALLBACK.ACTION.NOT_ALLOWED": {
       "audit_level": "warning",
@@ -1284,6 +1327,35 @@
       "show_retry_button": false,
       "telegram_presentation": "inline"
     },
+    "MIGRATION.MANIFEST.RELEASE_CONSISTENCY": {
+      "audit_level": "critical",
+      "code": "MIGRATION.MANIFEST.RELEASE_CONSISTENCY",
+      "http_status": 500,
+      "message_key": "errors.migration.manifest.release_consistency",
+      "retryable": false,
+      "safe_params": [
+        "reason",
+        "field",
+        "expected",
+        "actual"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "MIGRATION.MANIFEST.RELEASE_SOURCE_REQUIRED": {
+      "audit_level": "critical",
+      "code": "MIGRATION.MANIFEST.RELEASE_SOURCE_REQUIRED",
+      "http_status": 500,
+      "message_key": "errors.migration.manifest.release_source_required",
+      "retryable": false,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "MIGRATION.MANIFEST.SET_MISMATCH": {
       "audit_level": "critical",
       "code": "MIGRATION.MANIFEST.SET_MISMATCH",
@@ -1308,6 +1380,19 @@
         "reason",
         "sig_file",
         "cert_file"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "MIGRATION.MANIFEST.VERIFY_REQUIRED": {
+      "audit_level": "critical",
+      "code": "MIGRATION.MANIFEST.VERIFY_REQUIRED",
+      "http_status": 500,
+      "message_key": "errors.migration.manifest.verify_required",
+      "retryable": false,
+      "safe_params": [
+        "app_env"
       ],
       "severity": "critical",
       "show_retry_button": false,
@@ -1340,6 +1425,61 @@
       "severity": "error",
       "show_retry_button": true,
       "telegram_presentation": "short_hint"
+    },
+    "OUTBOX.EVENT.UNKNOWN": {
+      "audit_level": "critical",
+      "code": "OUTBOX.EVENT.UNKNOWN",
+      "http_status": 500,
+      "message_key": "errors.outbox.unknown_event_type",
+      "retryable": false,
+      "safe_params": [
+        "event_type",
+        "outbox_id"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "OUTBOX.LEASE_RENEW.FAILED": {
+      "audit_level": "critical",
+      "code": "OUTBOX.LEASE_RENEW.FAILED",
+      "http_status": 500,
+      "message_key": "errors.outbox.lease_renew.failed",
+      "retryable": false,
+      "safe_params": [
+        "event_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "OUTBOX.LEASE_VERSION.MISMATCH": {
+      "audit_level": "critical",
+      "code": "OUTBOX.LEASE_VERSION.MISMATCH",
+      "http_status": 409,
+      "message_key": "errors.outbox.lease_version.mismatch",
+      "retryable": false,
+      "safe_params": [
+        "event_id",
+        "lease_version"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "OUTBOX.PROVIDER_REGISTRY.LOAD_FAILED": {
+      "audit_level": "critical",
+      "code": "OUTBOX.PROVIDER_REGISTRY.LOAD_FAILED",
+      "http_status": 500,
+      "message_key": "errors.outbox.provider_registry.load_failed",
+      "retryable": false,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "OUTBOX.PROVIDER_REGISTRY.REQUIRED": {
       "audit_level": "critical",
@@ -1490,6 +1630,34 @@
       "show_retry_button": false,
       "telegram_presentation": "inline"
     },
+    "RESTORE.APPROVAL.MFA_REQUIRED": {
+      "audit_level": "critical",
+      "code": "RESTORE.APPROVAL.MFA_REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.restore.approval.mfa_required",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "RESTORE.APPROVAL.REQUIRED": {
+      "audit_level": "critical",
+      "code": "RESTORE.APPROVAL.REQUIRED",
+      "http_status": 403,
+      "message_key": "errors.restore.approval.required",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "RESTORE.EXECUTE.ALREADY_EXECUTED": {
       "audit_level": "warning",
       "code": "RESTORE.EXECUTE.ALREADY_EXECUTED",
@@ -1502,6 +1670,95 @@
       "severity": "error",
       "show_retry_button": false,
       "telegram_presentation": "short_hint"
+    },
+    "RESTORE.NONCE.PAYLOAD_MISMATCH": {
+      "audit_level": "critical",
+      "code": "RESTORE.NONCE.PAYLOAD_MISMATCH",
+      "http_status": 403,
+      "message_key": "errors.restore.nonce.payload_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "backup_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "RESTORE.PHASE.TRANSITION_INVALID": {
+      "audit_level": "critical",
+      "code": "RESTORE.PHASE.TRANSITION_INVALID",
+      "http_status": 409,
+      "message_key": "errors.restore.phase.transition_invalid",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "phase_from",
+        "phase_to",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "RESTORE.ROLLBACK.FAILED": {
+      "audit_level": "critical",
+      "code": "RESTORE.ROLLBACK.FAILED",
+      "http_status": 500,
+      "message_key": "errors.restore.rollback.failed",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "RESTORE.STAGING.PROVISION_FAILED": {
+      "audit_level": "critical",
+      "code": "RESTORE.STAGING.PROVISION_FAILED",
+      "http_status": 500,
+      "message_key": "errors.restore.staging.provision_failed",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "datasource",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "RESTORE.STAGING.VALIDATE_FAILED": {
+      "audit_level": "critical",
+      "code": "RESTORE.STAGING.VALIDATE_FAILED",
+      "http_status": 500,
+      "message_key": "errors.restore.staging.validate_failed",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "dimension",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "RESTORE.SWITCH.FAILED": {
+      "audit_level": "critical",
+      "code": "RESTORE.SWITCH.FAILED",
+      "http_status": 500,
+      "message_key": "errors.restore.switch.failed",
+      "retryable": false,
+      "safe_params": [
+        "operation_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "SYSTEM.RATE.LIMITED": {
       "audit_level": "warning",

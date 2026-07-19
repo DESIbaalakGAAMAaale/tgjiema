@@ -789,3 +789,488 @@ async def verify_button_token_by_handle(
         )
 
     return valid, action, payload
+
+
+# ════════════════════════════════════════════════════════════════
+# R64 P0-05: v2 签名 token — 绑定 session_id / locale / sub_action
+# ════════════════════════════════════════════════════════════════
+# 终审整改需求:
+#   callback token 必须绑定 tenant、actor、audience、exact action、sub_action、
+#   resource id、resource version、locale、session id、expiry、nonce。
+#
+# v1 token 格式(6 段,向后兼容):
+#   {principal_id}:{action}:{payload}:{expire_ts}:{nonce}:{signature}
+#   签名 payload: {principal_id}:{action}:{payload}:{expire_ts}:{nonce}
+#
+# v2 token 格式(9 段,新增 sub_action / session_id / locale 进入签名):
+#   {principal_id}:{action}:{sub_action}:{session_id}:{locale}:{payload}:{expire_ts}:{nonce}:{signature}
+#   签名 payload: {principal_id}:{action}:{sub_action}:{session_id}:{locale}:{payload}:{expire_ts}:{nonce}
+#
+# 安全增强:
+#   - sub_action 进入签名 → 防止 report:detach token 被用作 report:block
+#   - session_id 进入签名 → 防止跨会话重放(同一管理员不同会话)
+#   - locale 进入签名 → 防止 locale 切换后旧按钮仍可点击(i18n 一致性)
+#
+# 向后兼容:
+#   - v1 函数(sign_button_token_with_nonce / verify_button_token /
+#     sign_button_token_with_handle / verify_button_token_by_handle)保持不变
+#   - v2 函数为新增,调用方可按需选择
+# ════════════════════════════════════════════════════════════════
+
+# v2 token 段数(principal_id:action:sub_action:session_id:locale:payload:expire_ts:nonce:signature)
+_V2_TOKEN_SEGMENTS: int = 9
+
+
+async def sign_button_token_with_nonce_v2(
+    principal_id: int,
+    action: str,
+    payload: str = "",
+    *,
+    sub_action: str = "",
+    session_id: str = "",
+    locale: str = "",
+    expires_at: Optional[_dt.datetime] = None,
+    ttl: int = 3600,
+) -> str:
+    """R64 P0-05: 生成 v2 签名 button token(含 sub_action / session_id / locale)。
+
+    与 v1 ``sign_button_token_with_nonce`` 的差异:
+        - 签名 payload 扩展为 8 段(新增 sub_action / session_id / locale)
+        - token 格式为 9 段(签名 payload + signature)
+        - sub_action 进入签名 → 防止同 action 不同子动作的 token 混用
+          (如 report:detach token 不能被用作 report:block)
+        - session_id 进入签名 → 防止跨会话重放
+        - locale 进入签名 → 防止 locale 切换后旧按钮仍可点击
+
+    流程:
+        1. 生成 nonce = secrets.token_urlsafe(16)(≥128 bit 熵)
+        2. 计算 expire_ts
+        3. 持久化 nonce 到 callback_nonces 表
+        4. 签名包含 sub_action / session_id / locale(8 段 payload)
+        5. 返回 9 段 token
+
+    Args:
+        principal_id: 主体 ID(管理员 principal_id)
+        action: 动作标识(如 "report" / "restore" / "delete_file")
+        payload: 附加数据(如 file_code,可为空字符串)
+        sub_action: 子动作标识(如 "detach" / "block" / "ban"),进入签名
+        session_id: 会话 ID(防跨会话重放),进入签名
+        locale: 语言代码(如 "zh-CN" / "en-US"),进入签名
+        expires_at: 显式过期时间(优先于 ttl)
+        ttl: 有效期(秒,默认 1 小时)
+
+    Returns:
+        9 段签名字符串
+
+    Raises:
+        RuntimeError: nonce 持久化失败
+    """
+    # 计算过期时间
+    if expires_at is not None:
+        expire_ts = int(expires_at.timestamp())
+        expires_at_dt = expires_at
+    else:
+        expire_ts = int(time.time()) + ttl
+        expires_at_dt = _dt.datetime.fromtimestamp(expire_ts)
+
+    # 生成 nonce(≥128 bit 熵)
+    nonce = secrets.token_urlsafe(NONCE_BYTES)
+
+    # 持久化到 callback_nonces 表
+    from database import cache_store as _cs
+    store = _cs.get_cache_store()
+    expires_at_iso = expires_at_dt.isoformat()
+    ok = await store.callback_nonce_create(
+        nonce=nonce,
+        principal_id=principal_id,
+        action=action,
+        expires_at=expires_at_iso,
+    )
+    if not ok:
+        raise RuntimeError(
+            _i18n_t('services.button_security.s1', action=action, principal_id=principal_id)
+        )
+
+    # v2 签名 payload(8 段): sub_action / session_id / locale 进入签名
+    sig_payload = (
+        f"{principal_id}:{action}:{sub_action}:{session_id}:{locale}:"
+        f"{payload}:{expire_ts}:{nonce}"
+    )
+    signature = _sign(sig_payload)
+    return f"{sig_payload}:{signature}"
+
+
+async def verify_button_token_v2(
+    callback_data: str,
+    current_user_id: int,
+    store=None,
+) -> Tuple[bool, str, str, str, str, str]:
+    """R64 P0-05: 验证 v2 签名 button token + 原子消费 nonce。
+
+    与 v1 ``verify_button_token`` 的差异:
+        - 解析 9 段格式(含 sub_action / session_id / locale)
+        - 返回 6 元组:(valid, action, payload, sub_action, session_id, locale)
+        - 调用方可基于返回的 sub_action / session_id / locale 做绑定校验
+
+    验证流程:
+        1. 解析 callback_data 9 段
+        2. 验证 user_id 与 current_user_id 匹配
+        3. 验证未过期(expire_ts > now)
+        4. 验证签名长度 ≥ 32 hex chars(128 bit)
+        5. 验证签名匹配(常量时间比较)
+        6. 原子消费 nonce(防重放)
+
+    Args:
+        callback_data: 待验证的 v2 token(9 段)
+        current_user_id: 当前用户 ID(必须匹配签名中的 principal_id)
+        store: 可选 CacheStore 实例(测试注入)
+
+    Returns:
+        (valid, action, payload, sub_action, session_id, locale):
+        valid=True 时其余字段可用;valid=False 时均为空字符串
+    """
+    if store is None:
+        from database import cache_store as _cs
+        store = _cs.get_cache_store()
+
+    _empty = (False, "", "", "", "", "")
+    try:
+        parts = callback_data.split(":")
+        if len(parts) != _V2_TOKEN_SEGMENTS:
+            logger.debug(
+                f"[button_security] R64 P0-05: v2 token 段数错误 "
+                f"expected={_V2_TOKEN_SEGMENTS} actual={len(parts)}"
+            )
+            return _empty
+        principal_id_str, action, sub_action, session_id, locale, payload, expire_ts_str, nonce, signature = parts
+
+        # 1. 验证 principal_id 匹配
+        try:
+            principal_id = int(principal_id_str)
+        except ValueError:
+            return _empty
+        if principal_id != current_user_id:
+            logger.debug("[button_security] v2 principal_id 不匹配")
+            return _empty
+
+        # 2. 验证未过期
+        try:
+            expire_ts = int(expire_ts_str)
+        except ValueError:
+            return _empty
+        if expire_ts <= int(time.time()):
+            logger.debug("[button_security] v2 token 已过期")
+            return _empty
+
+        # 3. 验证签名长度
+        if len(signature) < SIGNATURE_LENGTH:
+            logger.debug("[button_security] v2 签名长度不足")
+            return _empty
+
+        # 4. 验证签名匹配(常量时间比较)
+        sig_payload = (
+            f"{principal_id_str}:{action}:{sub_action}:{session_id}:{locale}:"
+            f"{payload}:{expire_ts_str}:{nonce}"
+        )
+        expected_sig = _sign(sig_payload)
+        if not hmac.compare_digest(expected_sig, signature):
+            logger.debug("[button_security] v2 签名不匹配")
+            return _empty
+
+        # 5. 原子消费 nonce(防重放)
+        consumed = await store.callback_nonce_consume(nonce)
+        if not consumed:
+            logger.warning(
+                "[button_security] R64 P0-05: v2 nonce 已消费或不存在(重放攻击?)"
+            )
+            return _empty
+
+        return True, action, payload, sub_action, session_id, locale
+    except (ValueError, IndexError) as e:
+        logger.debug(f"[button_security] v2 callback_data 解析失败: {e}")
+        return _empty
+
+
+async def sign_button_token_with_handle_v2(
+    principal_id: int,
+    action: str,
+    payload: str = "",
+    *,
+    sub_action: str = "",
+    session_id: str = "",
+    locale: str = "",
+    expires_at: Optional[_dt.datetime] = None,
+    ttl: int = 3600,
+    audience: str = "admin_callback",
+    resource_version: str = "",
+) -> str:
+    """R64 P0-05: 生成 v2 签名 token 并以短 handle_id 引用(含 sub_action/session_id/locale)。
+
+    与 v1 ``sign_button_token_with_handle`` 的差异:
+        - 调用 ``sign_button_token_with_nonce_v2`` 生成 9 段签名 token
+        - sub_action / session_id / locale 进入签名(不可篡改)
+        - audience / resource_version 仍作为元数据存储(与 v1 一致)
+
+    Args:
+        principal_id: 主体 ID
+        action: 动作标识(如 "report" / "restore" / "delete_file")
+        payload: 附加数据(如 "ban|12345|67890|dsp")
+        sub_action: 子动作标识(如 "detach" / "block"),进入签名
+        session_id: 会话 ID(防跨会话重放),进入签名
+        locale: 语言代码(如 "zh-CN"),进入签名
+        expires_at: 显式过期时间(优先于 ttl)
+        ttl: 有效期(秒,默认 1 小时)
+        audience: 接收方 audience 标识(默认 "admin_callback")
+        resource_version: 资源版本绑定(如 "file_code:v3"),为空时不绑定
+
+    Returns:
+        handle_id 字符串
+
+    Raises:
+        RuntimeError: token 生成失败或持久化失败
+    """
+    # 1. 生成 v2 完整签名 token(含 sub_action / session_id / locale)
+    token = await sign_button_token_with_nonce_v2(
+        principal_id=principal_id,
+        action=action,
+        payload=payload,
+        sub_action=sub_action,
+        session_id=session_id,
+        locale=locale,
+        expires_at=expires_at,
+        ttl=ttl,
+    )
+
+    # 2. 生成短 handle_id(128 bit 熵)
+    handle_id = secrets.token_urlsafe(HANDLE_ID_BYTES)
+
+    # 3. 持久化 (handle_id → token) 映射(含 audience / resource_version 元数据)
+    from database import cache_store as _cs
+    store = _cs.get_cache_store()
+    ok = await store.button_token_store(
+        handle_id=handle_id,
+        token=token,
+        principal_id=principal_id,
+        action=action,
+        audience=audience,
+        resource_version=resource_version or None,
+    )
+    if not ok:
+        raise RuntimeError(
+            _i18n_t('services.button_security.s2', action=action, principal_id=principal_id)
+        )
+
+    # 4. 返回 handle_id
+    return handle_id
+
+
+_LOG_V2_SUB_ACTION_MISMATCH = (
+    "[button_security] R64 P0-05: v2 sub_action 不匹配 → 拒绝跨子动作 handle: "
+    "expected={}, actual={}, action={}, handle={}"
+)
+_LOG_V2_SESSION_MISMATCH = (
+    "[button_security] R64 P0-05: v2 session_id 不匹配 → 拒绝跨会话 handle: "
+    "expected={}, actual={}, action={}, handle={}"
+)
+_LOG_V2_LOCALE_MISMATCH = (
+    "[button_security] R64 P0-05: v2 locale 不匹配 → 拒绝跨 locale handle: "
+    "expected={}, actual={}, action={}, handle={}"
+)
+
+
+async def verify_button_token_by_handle_v2(
+    handle_id: str,
+    current_user_id: int,
+    expected_action: str,
+    expected_audience: str,
+    *,
+    expected_sub_action: Optional[str] = None,
+    expected_session_id: Optional[str] = None,
+    expected_locale: Optional[str] = None,
+    expected_resource_version: Optional[str] = None,
+    store=None,
+) -> Tuple[bool, str, str]:
+    """R64 P0-05: 通过 handle_id 验证 v2 签名 token + 强制绑定(含 sub_action/session/locale)。
+
+    与 v1 ``verify_button_token_by_handle`` 的差异:
+        - 调用 ``verify_button_token_v2`` 验证 9 段格式 token
+        - 新增 expected_sub_action / expected_session_id / expected_locale 绑定校验
+        - sub_action / session_id / locale 从签名中提取(不可篡改)
+
+    流程:
+        1. 通过 handle_id 查找完整 token + audience / resource_version 元数据
+        2. 调用 ``verify_button_token_v2`` 验证签名 + 原子消费 nonce
+        3. 强制匹配 action / audience / resource_version(与 v1 一致)
+        4. **R64 P0-05 新增**: 强制匹配 sub_action / session_id / locale
+           - expected_sub_action 非 None 时,必须与签名内 sub_action 匹配
+           - expected_session_id 非 None 时,必须与签名内 session_id 匹配
+           - expected_locale 非 None 时,必须与签名内 locale 匹配
+
+    Args:
+        handle_id: 短 handle_id
+        current_user_id: 当前用户 ID
+        expected_action: 期望的 action(必填)
+        expected_audience: 期望的 audience(必填)
+        expected_sub_action: 期望的 sub_action(None=不检查)
+        expected_session_id: 期望的 session_id(None=不检查)
+        expected_locale: 期望的 locale(None=不检查)
+        expected_resource_version: 期望的资源版本(None=不检查)
+        store: 可选 CacheStore 实例(测试注入)
+
+    Returns:
+        (valid, action, payload): valid=True 时 action/payload 可用
+
+    Raises:
+        AppError(BUTTON_POLICY_HASH_MISMATCH): action 或 sub_action 不匹配
+        AppError(BUTTON_POLICY_AUDIENCE_MISMATCH): audience 不匹配
+        AppError(BUTTON_POLICY_VERSION_MISMATCH): resource_version 不匹配
+        AppError(BUTTON_POLICY_BINDING_MISSING): session_id / locale 不匹配
+    """
+    if store is None:
+        from database import cache_store as _cs
+        store = _cs.get_cache_store()
+
+    # 1. 通过 handle_id 查找完整 token + 绑定元数据
+    bindings = None
+    if hasattr(store, "button_token_lookup_with_bindings"):
+        bindings = await store.button_token_lookup_with_bindings(handle_id)
+    token: Optional[str] = None
+    token_audience: Optional[str] = None
+    token_resource_version: Optional[str] = None
+    if bindings is not None:
+        token = bindings.get("token")
+        token_audience = bindings.get("audience")
+        token_resource_version = bindings.get("resource_version")
+    else:
+        token = await store.button_token_lookup(handle_id)
+
+    if not token:
+        logger.warning(_LOG_HANDLE_NOT_FOUND.format(handle_id))
+        return False, "", ""
+
+    # 2. 验证 v2 签名 + 原子消费 nonce
+    valid, action, payload, sub_action, session_id, locale = await verify_button_token_v2(
+        token, current_user_id, store=store,
+    )
+    if not valid:
+        return False, "", ""
+
+    # 3a. action 强制匹配(签名内,防跨 action 滥用)
+    if action != expected_action:
+        logger.warning(
+            _LOG_ACTION_MISMATCH.format(expected_action, action, handle_id)
+        )
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_HASH_MISMATCH,
+            params={
+                "action": action,
+                "reason": "action_mismatch",
+                "expected": expected_action,
+                "actual": action,
+            },
+        )
+
+    # 3b. audience 强制匹配(元数据,防跨 handler 滥用)
+    if token_audience is None:
+        token_audience = ""
+    if token_audience != expected_audience:
+        logger.warning(
+            _LOG_AUDIENCE_MISMATCH.format(
+                expected_audience, token_audience, action, handle_id
+            )
+        )
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_AUDIENCE_MISMATCH,
+            params={
+                "action": action,
+                "reason": "audience_mismatch",
+                "expected": expected_audience,
+                "actual": token_audience,
+            },
+        )
+
+    # 3c. resource_version 强制匹配(元数据,防旧按钮操作已更新资源)
+    if expected_resource_version is not None:
+        if token_resource_version is None:
+            token_resource_version = ""
+        if token_resource_version != expected_resource_version:
+            logger.warning(
+                _LOG_RESOURCE_VERSION_MISMATCH.format(
+                    expected_resource_version, token_resource_version,
+                    action, handle_id,
+                )
+            )
+            raise AppError(
+                ErrorCodes.BUTTON_POLICY_VERSION_MISMATCH,
+                params={
+                    "action": action,
+                    "reason": "resource_version_mismatch",
+                    "expected": expected_resource_version,
+                    "actual": token_resource_version,
+                },
+            )
+
+    # 4. R64 P0-05: sub_action / session_id / locale 强制匹配(签名内)
+
+    # 4a. sub_action 强制匹配(防 report:detach token 被用作 report:block)
+    if expected_sub_action is not None and sub_action != expected_sub_action:
+        logger.warning(
+            _LOG_V2_SUB_ACTION_MISMATCH.format(
+                expected_sub_action, sub_action, action, handle_id
+            )
+        )
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_HASH_MISMATCH,
+            params={
+                "action": action,
+                "reason": "sub_action_mismatch",
+                "expected": expected_sub_action,
+                "actual": sub_action,
+            },
+        )
+
+    # 4b. session_id 强制匹配(防跨会话重放)
+    if expected_session_id is not None and session_id != expected_session_id:
+        logger.warning(
+            _LOG_V2_SESSION_MISMATCH.format(
+                expected_session_id, session_id, action, handle_id
+            )
+        )
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_BINDING_MISSING,
+            params={
+                "action": action,
+                "reason": "session_id_mismatch",
+                "expected": expected_session_id,
+                "actual": session_id,
+                "missing_field": "session_id",
+            },
+        )
+
+    # 4c. locale 强制匹配(防 locale 切换后旧按钮仍可点击)
+    if expected_locale is not None and locale != expected_locale:
+        logger.warning(
+            _LOG_V2_LOCALE_MISMATCH.format(
+                expected_locale, locale, action, handle_id
+            )
+        )
+        raise AppError(
+            ErrorCodes.BUTTON_POLICY_BINDING_MISSING,
+            params={
+                "action": action,
+                "reason": "locale_mismatch",
+                "expected": expected_locale,
+                "actual": locale,
+                "missing_field": "locale",
+            },
+        )
+
+    # 5. 验签 + 绑定全部通过后,标记 handle 已消费
+    try:
+        await store.button_token_mark_consumed(handle_id)
+    except Exception as e:
+        logger.debug(
+            f"[button_security] R64 P0-05: 标记 v2 handle 已消费失败(不阻塞): {e}"
+        )
+
+    return valid, action, payload

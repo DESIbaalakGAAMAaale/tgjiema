@@ -30,6 +30,13 @@ ButtonFlow/CommandBus,而不只是关键路径。本门禁消费
           禁止裸 ``query.data.split`` 解析(无签名验证,可伪造)。
           理想 0 违规;现有违规通过 ``--baseline`` ratchet 下降。
 
+  Rule D(R64 P1-08): 高风险 handler 的 ``action_type`` 必须映射到
+          HIGH_RISK_POLICY 中的 action,且该 action 必须有 ButtonUXSpec
+          (通过 ``services.button_ux_policy.has_ux_spec`` 验证)。
+          R64 P1-08 要求每个 destructive action 必须有 UXSpec:
+          目标 / 影响范围 / 不可逆性 / 审批状态 / 取消按钮。
+          无 baseline,缺失即违规(必须立即补全 UXSpec + i18n key)。
+
 Baseline 机制(``--baseline`` flag):
   - 默认模式:与 baseline 比对,仅新增违规 exit 1(ratchet 下降)
   - ``--strict`` 模式:忽略 baseline,任何违规 exit 1(用于新代码门禁)
@@ -112,6 +119,22 @@ HIGH_RISK_ENTRY_TYPES: frozenset[str] = frozenset({
     "callback_sub_dispatcher",
     "button_flow",
 })
+
+# Rule D: inventory action_type(category)→ HIGH_RISK_POLICY action 名映射
+# R64 P1-08: 每个高风险 handler 的 action_type 必须映射到至少一个
+# HIGH_RISK_POLICY action,且该 action 必须有对应的 ButtonUXSpec
+# (通过 services.button_ux_policy.has_ux_spec 验证)。
+# 映射来源:scripts/button_handler_metadata.json 的 action_type 字段
+# 与 services/high_risk_policy.py 的 HIGH_RISK_POLICY key 对齐。
+ACTION_TYPE_TO_POLICY_ACTIONS: dict[str, tuple[str, ...]] = {
+    "ban": ("ban_user", "unban_user"),
+    "delete": ("delete_file",),
+    "takedown": ("takedown_report",),
+    "maintenance": ("enable_maintenance", "disable_maintenance"),
+    # report_action 包含 ban/detach/block 子动作
+    "report_action": ("ban_user", "detach_file", "block_user_for_file"),
+    "restore": ("restore_backup", "restore_content"),
+}
 
 
 # ════════════════════════════════════════════════════════════════
@@ -325,6 +348,101 @@ def _check_rule_c(handler: dict) -> list[dict]:
     return violations
 
 
+def _check_rule_d(handler: dict) -> list[dict]:
+    """Rule D(R64 P1-08): 高风险 handler 的 action_type 必须有对应 ButtonUXSpec。
+
+    审计 P1-08: 每个 destructive action 必须先显示目标、影响范围、不可逆性、
+    审批状态和取消按钮。本规则验证高风险 handler 的 action_type 能映射到
+    HIGH_RISK_POLICY 中的 action,且该 action 有 ButtonUXSpec
+    (通过 services.button_ux_policy.has_ux_spec 验证)。
+
+    无 baseline,缺失即违规(必须立即补全 UXSpec)。
+
+    Returns:
+        违规列表(每项含 rule/violation_type/file/handler/line/reason)
+    """
+    violations: list[dict] = []
+    if not handler.get("is_high_risk"):
+        return violations
+    if handler.get("is_dispatcher"):
+        return violations
+
+    action_type = handler.get("action_type") or ""
+    if not action_type:
+        violations.append({
+            "rule": "D",
+            "violation_type": "RULE_D_ACTION_TYPE_MISSING",
+            "file": handler["file"],
+            "handler": handler["handler"],
+            "line": handler["line"],
+            "entry_type": handler["entry_type"],
+            "reason": (
+                "高风险 handler 缺少 action_type 字段,"
+                "无法映射到 ButtonUXSpec(R64 P1-08 要求每个 destructive "
+                "action 必须有 UXSpec: 目标/影响/不可逆性/审批状态/取消按钮)"
+            ),
+        })
+        return violations
+
+    # 映射 action_type → HIGH_RISK_POLICY action 名
+    policy_actions = ACTION_TYPE_TO_POLICY_ACTIONS.get(action_type)
+    if not policy_actions:
+        violations.append({
+            "rule": "D",
+            "violation_type": "RULE_D_ACTION_TYPE_UNMAPPED",
+            "file": handler["file"],
+            "handler": handler["handler"],
+            "line": handler["line"],
+            "entry_type": handler["entry_type"],
+            "reason": (
+                f"action_type='{action_type}' 未在 ACTION_TYPE_TO_POLICY_ACTIONS "
+                f"映射表中声明,无法验证 ButtonUXSpec 覆盖。"
+                f"请在 check_button_handler_gate.py 中补全映射。"
+            ),
+        })
+        return violations
+
+    # 懒加载 has_ux_spec(避免模块级 import services 的副作用)
+    try:
+        sys.path.insert(0, str(REPO_ROOT))
+        from services.button_ux_policy import has_ux_spec  # type: ignore
+    except ImportError as e:
+        # import 失败 = fail-closed(无法验证 UXSpec 覆盖)
+        violations.append({
+            "rule": "D",
+            "violation_type": "RULE_D_IMPORT_FAILED",
+            "file": handler["file"],
+            "handler": handler["handler"],
+            "line": handler["line"],
+            "entry_type": handler["entry_type"],
+            "reason": (
+                f"无法导入 services.button_ux_policy.has_ux_spec: {e}. "
+                f"fail-closed: 无法验证 ButtonUXSpec 覆盖"
+            ),
+        })
+        return violations
+
+    # 验证每个映射的 action 都有 UXSpec
+    missing_specs = [a for a in policy_actions if not has_ux_spec(a)]
+    if missing_specs:
+        violations.append({
+            "rule": "D",
+            "violation_type": "RULE_D_UX_SPEC_MISSING",
+            "file": handler["file"],
+            "handler": handler["handler"],
+            "line": handler["line"],
+            "entry_type": handler["entry_type"],
+            "reason": (
+                f"action_type='{action_type}' 映射的 action {missing_specs} "
+                f"在 HIGH_RISK_POLICY 中无对应 ButtonUXSpec。"
+                f"R64 P1-08 要求每个 destructive action 必须有 UXSpec"
+                f"(目标/影响/不可逆性/审批状态/取消按钮)。"
+            ),
+            "missing_actions": missing_specs,
+        })
+    return violations
+
+
 # ════════════════════════════════════════════════════════════════
 # 主检查流程
 # ════════════════════════════════════════════════════════════════
@@ -379,6 +497,8 @@ def check(
         all_violations.extend(_check_rule_b(handler, metadata_handlers))
         # Rule C
         all_violations.extend(_check_rule_c(handler))
+        # Rule D(R64 P1-08: UXSpec 覆盖,无 baseline)
+        all_violations.extend(_check_rule_d(handler))
 
     # 为每个违规生成 baseline 键
     for v in all_violations:
@@ -539,15 +659,18 @@ def main() -> int:
     rule_a = [v for v in all_violations if v["rule"] == "A"]
     rule_b = [v for v in all_violations if v["rule"] == "B"]
     rule_c = [v for v in all_violations if v["rule"] == "C"]
+    rule_d = [v for v in all_violations if v["rule"] == "D"]
     new_a = [v for v in new_violations if v["rule"] == "A"]
     new_b = [v for v in new_violations if v["rule"] == "B"]
     new_c = [v for v in new_violations if v["rule"] == "C"]
+    new_d = [v for v in new_violations if v["rule"] == "D"]
 
     baseline_count = len(all_violations) - len(new_violations)
     print(f"[INFO] 违规统计(全部 / baseline / 新增):")
     print(f"  Rule A (CommandBus 路由): {len(rule_a)} / {len(rule_a) - len(new_a)} / {len(new_a)}")
     print(f"  Rule B (sidecar 元数据): {len(rule_b)} / {len(rule_b) - len(new_b)} / {len(new_b)}")
     print(f"  Rule C (签名绑定):       {len(rule_c)} / {len(rule_c) - len(new_c)} / {len(new_c)}")
+    print(f"  Rule D (UXSpec 覆盖):    {len(rule_d)} / {len(rule_d) - len(new_d)} / {len(new_d)}")
 
     if new_violations:
         _print_violations(new_violations, "新增违规")
@@ -562,6 +685,10 @@ def main() -> int:
         print("  Rule C: 高风险 callback handler 改用 sign_button_token_with_nonce +")
         print("          verify_button_token,或 ButtonFlow(consume_token_cas),")
         print("          签名需绑定 user/action/payload/expiry/nonce。")
+        print("  Rule D: 高风险 handler 的 action_type 必须映射到 HIGH_RISK_POLICY action")
+        print("          且该 action 有 ButtonUXSpec(目标/影响/不可逆性/审批状态/取消按钮)。")
+        print("          在 services/button_ux_policy.py 中补全 per-action i18n key,")
+        print("          并在 ACTION_TYPE_TO_POLICY_ACTIONS 映射表中声明 action_type 映射。")
         print()
         print(f"基线模式: 已知违规可加入 baseline(--generate-baseline),")
         print(f"  但 PR 中新增违规必须修复,不得纳入基线。")

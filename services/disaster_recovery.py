@@ -205,8 +205,9 @@ async def trigger_backup() -> str:
                 "total_rows": 0,
                 "error": str(e),
             })
-        except Exception:
-            pass
+        except Exception as hist_err:
+            # R64 P1-07: destructive 域禁止 except pass;backup_history 写入失败需记录(不掩盖原 trigger_backup 错误)
+            logger.warning(f"[DisasterRecovery] 记录失败 backup_history 失败(非致命): {hist_err}")
         return ""
 
 
@@ -505,8 +506,9 @@ async def get_rpo_rto() -> dict:
         if raw:
             last_dt = _dt.datetime.fromisoformat(raw)
             last_backup_age = int((_dt.datetime.now() - last_dt).total_seconds())
-    except Exception:
-        pass
+    except Exception as age_err:
+        # R64 P1-07: destructive 域禁止 except pass;last_backup_age 解析失败保留 None(非致命)
+        logger.debug(f"[DisasterRecovery] 解析 last_backup_at 失败(保留 None): {age_err}")
 
     # 估算恢复时间(基于历史恢复记录)
     estimated_recovery_time = rto_seconds  # 默认 RTO
@@ -517,8 +519,9 @@ async def get_rpo_rto() -> dict:
                          if h.get("success")]
             if durations:
                 estimated_recovery_time = int(sum(durations) / len(durations))
-    except Exception:
-        pass
+    except Exception as est_err:
+        # R64 P1-07: destructive 域禁止 except pass;恢复时间估算失败保留默认 RTO(非致命)
+        logger.debug(f"[DisasterRecovery] 估算恢复时间失败(保留默认 RTO): {est_err}")
 
     # RPO 合规判定:无备份时返回 False(违规)
     rpo_compliant = (
@@ -746,8 +749,9 @@ async def get_backup_schedule() -> dict:
             last_dt = _dt.datetime.fromisoformat(raw)
             next_dt = last_dt + _dt.timedelta(minutes=interval_minutes)
             next_backup_at = next_dt.isoformat()
-    except Exception:
-        pass
+    except Exception as nba_err:
+        # R64 P1-07: destructive 域禁止 except pass;next_backup_at 计算失败保留 None(非致命)
+        logger.debug(f"[DisasterRecovery] 计算 next_backup_at 失败(保留 None): {nba_err}")
 
     # 保留天数(从 MAX_BACKUP_RETENTION 推算)
     try:
@@ -875,5 +879,6 @@ async def _write_audit_log(actor_id: int, action: str,
             return int(cursor.lastrowid)
         return 0
     except Exception as e:
+        # R64 P1-07: destructive 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.error(f"[DisasterRecovery] _write_audit_log 失败: {e}")
-        return 0
+    return 0

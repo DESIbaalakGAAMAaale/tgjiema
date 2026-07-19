@@ -357,33 +357,39 @@ class _RestoreCapability:
         if expected_scope != self._schema_fingerprint:
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-        # 6. 原子消费 nonce — INSERT OR IGNORE CAS(R63 P1-01)
+        # 6. 原子预留 nonce — INSERT CAS(R63 P1-01 / R64 P1-02)
+        # R64 P1-02: assert_valid 改为 reserve(不再直接 consume)。
+        # nonce 状态机: reserved → consumed | failed
+        #   - assert_valid 调用 reserve_capability_nonce(status='reserved')
+        #   - writer 在 restore 成功后 consume_capability_nonce(reserved→consumed)
+        #   - writer 在 restore 失败后 fail_capability_nonce(reserved→failed)
         # 多实例/并发安全:rowcount==1 表示本调用方赢得竞态;
-        # rowcount==0 表示 nonce 已被消费(重放攻击或竞态失败)。
-        # consumed_by: hostname:pid 用于审计(追踪哪个 worker 消费了 nonce)。
-        _consumed_by = ""
+        # rowcount==0 表示 nonce 已存在(reserved/consumed/failed,重放攻击或竞态失败)。
+        # reserved_by: hostname:pid 用于审计(追踪哪个 worker 预留了 nonce)。
+        _reserved_by = ""
         try:
             import socket as _socket
-            _consumed_by = f"{_socket.gethostname()}:{os.getpid()}"
+            _reserved_by = f"{_socket.gethostname()}:{os.getpid()}"
         except Exception:
-            _consumed_by = f"pid:{os.getpid()}"
+            _reserved_by = f"pid:{os.getpid()}"
 
         if _store is not None:
             try:
-                _won = await _store.consume_capability_nonce(
+                _won = await _store.reserve_capability_nonce(
                     self._nonce,
-                    self._backup_id,
-                    self._manifest_sha256,
-                    self._payload_digest,
-                    consumed_by=_consumed_by,
+                    operation_id=f"{self._backup_id}:{self._issuer}",
+                    backup_id=self._backup_id,
+                    manifest_sha256=self._manifest_sha256,
+                    payload_digest=self._payload_digest,
+                    reserved_by=_reserved_by,
                 )
             except Exception:
                 _won = False
             if not _won:
-                # 消费失败 — nonce 已被其他调用方消费(重放或竞态失败)
+                # 预留失败 — nonce 已存在(重放或竞态失败)
                 raise AppError(
                     ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
-                    params={"reason": "nonce_already_consumed"},
+                    params={"reason": "nonce_already_reserved_or_consumed"},
                 )
 
     def is_valid(self) -> bool:
@@ -477,67 +483,119 @@ def _to_serializable(obj):
 
 @dataclass(frozen=True)
 class VerifiedBackupPayload:
-    """R62 P0-02 / R63 P0-02: 已通过严格验证的备份 payload(深冻结不可变数据载体)。
+    """R62 P0-02 / R63 P0-02 / R64 P1-01: 已通过严格验证的备份 payload(深冻结不可变数据载体)。
 
     由 validate_and_restore_backup_strict() 或 _restore_preverified_payload()
     在严格三段式验证通过后构造。作为 _restore_from_backup_data() 的输入,
     替代原 raw data: dict 参数。
 
-    安全保证(R63 P0-02 增强):
+    安全保证(R64 P1-01 增强):
+        - **单一 canonical bytes 来源(R64 P1-01)**: ``canonical_payload_bytes`` 是
+          已验证的原始明文 canonical JSON bytes。``payload`` 与 ``tables`` 不再是
+          独立字段,而是从同一 ``canonical_payload_bytes`` 解码的只读 view(property),
+          消除 ``tables`` 与 ``payload`` 语义分叉风险。
         - frozen=True:顶层字段不可修改(防止在验证后、写入前被篡改)
-        - **深冻结(R63 P0-02)**: ``tables`` 与 ``payload`` 在 ``__post_init__``
-          中通过 ``_deep_freeze`` 递归转换为 ``MappingProxyType`` + ``tuple``
-          不可变结构,且深拷贝断绝与调用方原 dict 的别名引用。嵌套 dict/list
-          无法被修改,顶层 object.__setattr__ 由 writer 端重算 digest 兜底。
-        - payload_digest 自动由 __post_init__ 从冻结后的 payload 计算(canonical
-          JSON sha256),并与 _RestoreCapability.payload_digest 绑定。
-        - **writer 端重算(R63 P0-02)**: _restore_from_backup_data 首条语句对
-          ``verified_payload.payload`` 实际 canonical bytes 重新计算 SHA-256,
+        - ``payload`` / ``tables`` property 每次从不可变 ``canonical_payload_bytes``
+          (bytes 本身不可变)解码 + ``_deep_freeze`` 返回 ``MappingProxyType`` 只读 view。
+        - payload_digest = sha256(canonical_payload_bytes),由 __post_init__ 自动计算。
+        - **writer 端重算**: _restore_from_backup_data 首条语句对
+          ``verified_payload.canonical_payload_bytes`` 重新计算 SHA-256,
           与 capability.payload_digest 比对。即使 object.__setattr__ 绕过冻结
-          替换了 payload,重算 digest 也会与 capability 内嵌(构造时)的 digest
-          不匹配 → fail-closed。
+          替换了 canonical_payload_bytes,重算 digest 也会与 capability 内嵌(构造时)
+          的 digest 不匹配 → fail-closed。
 
     字段:
-        backup_id:          备份 ID(来自 manifest.backup_id)
-        tables:             表数据(深冻结 MappingProxyType,已解密 + 校验通过)
-        manifest_sha256:    manifest 原始 bytes 的 SHA-256(来自 COMPLETE marker 验签)
-        plaintext_sha256:   解密后明文的 SHA-256(来自 manifest.plaintext_sha256)
-        schema_fingerprint: schema 指纹(通常为 manifest.schema_version,用于 scope 校验)
-        payload:            原始 payload(深冻结 MappingProxyType;新代码应从 tables 读取)
-        payload_digest:     payload 的 SHA-256 digest(canonical JSON),
-                            由 __post_init__ 从冻结后的 payload 自动计算(不可由调用方设置)
+        backup_id:                备份 ID(来自 manifest.backup_id)
+        manifest_sha256:          manifest 原始 bytes 的 SHA-256(来自 COMPLETE marker 验签)
+        plaintext_sha256:         解密后明文的 SHA-256(来自 manifest.plaintext_sha256)
+        schema_fingerprint:       schema 指纹(通常为 manifest.schema_version,用于 scope 校验)
+        canonical_payload_bytes:  已验证的原始明文 canonical JSON bytes(单一来源)
+        payload_digest:           sha256(canonical_payload_bytes),由 __post_init__ 自动计算
+                                  (不可由调用方设置)
     """
     backup_id: str
-    tables: dict
     manifest_sha256: str
     plaintext_sha256: str
     schema_fingerprint: str
-    payload: dict
+    canonical_payload_bytes: bytes
     payload_digest: str = ""
 
     def __post_init__(self):
-        # R63 P0-02: 深冻结 tables 与 payload(深拷贝 + MappingProxyType/tuple)
-        # 断绝与调用方原 dict 的别名引用,递归冻结嵌套结构。
-        # frozen=True 阻止常规赋值,需用 object.__setattr__ 绕过冻结保护。
-        object.__setattr__(self, "tables", _deep_freeze(self.tables))
-        object.__setattr__(self, "payload", _deep_freeze(self.payload))
-        # R62 P0-02: 自动从冻结后的 payload 计算 payload_digest
-        # (若调用方未提供,或即使提供了也从冻结后的实际 bytes 重算,保证一致性)
+        # R64 P1-01: payload_digest 从 canonical_payload_bytes 计算(sha256)
+        # canonical_payload_bytes 是 bytes(不可变),无需深冻结
         if not self.payload_digest:
             object.__setattr__(
-                self, "payload_digest", _compute_payload_digest(self.payload),
+                self, "payload_digest",
+                hashlib.sha256(self.canonical_payload_bytes).hexdigest(),
             )
+
+    @property
+    def payload(self) -> MappingProxyType:
+        """从 canonical_payload_bytes 解码的只读 view(MappingProxyType 深冻结)。
+
+        R64 P1-01: payload 不再是独立字段,而是从 canonical_payload_bytes 解码。
+        每次访问重新解码(无缓存),但 canonical_payload_bytes 不可变,保证一致性。
+        """
+        data = json.loads(self.canonical_payload_bytes.decode("utf-8"))
+        return _deep_freeze(data)
+
+    @property
+    def tables(self) -> MappingProxyType:
+        """从 canonical_payload_bytes 解码的 tables 只读 view(MappingProxyType)。
+
+        R64 P1-01: tables 不再是独立字段,而是从 canonical_payload_bytes 解码。
+        与 payload 从同一 bytes 解码,消除语义分叉风险。
+        """
+        _payload = self.payload
+        return _payload.get("tables", _deep_freeze({}))
+
+
+def _canonical_json_bytes(data) -> bytes:
+    """R64 P1-01: 将数据序列化为 canonical JSON bytes(fail-closed)。
+
+    使用 sort_keys=True + separators=(",", ":") + ensure_ascii=False + allow_nan=False,
+    保证 canonical 形式且拒绝 NaN/Infinity。
+
+    **fail-closed**: 禁止 default 退化为 str 序列化,对不可序列化类型(bytes/NaN/Infinity/
+    自定义对象/set 等)直接 raise ``AppError(BACKUP_PAYLOAD_NOT_SERIALIZABLE)``。
+    只允许 JSON schema 声明类型(str/int/float/bool/None/list/dict)。
+
+    Args:
+        data: 备份数据(普通 dict 或深冻结 MappingProxyType/tuple)
+
+    Returns:
+        canonical JSON bytes(utf-8 编码)
+
+    Raises:
+        AppError(BACKUP_PAYLOAD_NOT_SERIALIZABLE): 数据含不可序列化类型
+    """
+    from services.error_codes import AppError, ErrorCodes
+    # R63 P0-02: 深冻结结构需还原为普通 dict/list 才能 JSON 序列化
+    serializable = _to_serializable(data) if isinstance(data, (MappingProxyType, tuple)) else data
+    try:
+        # R64 P1-01: allow_nan=False 拒绝 NaN/Infinity;无 default=str 拒绝 bytes/自定义对象
+        return json.dumps(
+            serializable, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as e:
+        # TypeError: bytes/自定义对象/set 等不可序列化
+        # ValueError: NaN/Infinity(allow_nan=False)
+        raise AppError(
+            ErrorCodes.BACKUP_PAYLOAD_NOT_SERIALIZABLE,
+            params={"reason": str(e)},
+        )
 
 
 def _compute_payload_digest(data) -> str:
-    """R62 P0-02 / R63 P0-02: 计算备份数据的 SHA-256 digest(canonical JSON 序列化)。
+    """R62 P0-02 / R63 P0-02 / R64 P1-01: 计算备份数据的 SHA-256 digest(canonical JSON,fail-closed)。
 
-    使用 sort_keys=True + separators=(",", ":") + ensure_ascii=False,
+    使用 sort_keys=True + separators=(",", ":") + ensure_ascii=False + allow_nan=False,
     保证相同内容不同 key 顺序产生相同 digest(canonical 形式)。
 
-    R63 P0-02: 支持深冻结结构(MappingProxyType / tuple)—— 先通过
-    ``_to_serializable`` 还原为普通 dict/list 再序列化,保证 digest
-    计算与普通 dict 一致。
+    R64 P1-01 fail-closed: 禁止 default 退化为 str 序列化,对不可序列化类型
+    (bytes/NaN/Infinity/自定义对象)直接 raise ``AppError(BACKUP_PAYLOAD_NOT_SERIALIZABLE)``。
+    只允许 JSON schema 声明类型。
 
     此 digest 与 _RestoreCapability.payload_digest 绑定,
     在 _restore_from_backup_data 的首条 assert_valid() 调用中由 writer
@@ -549,14 +607,11 @@ def _compute_payload_digest(data) -> str:
 
     Returns:
         64 字符 hex sha256 digest
+
+    Raises:
+        AppError(BACKUP_PAYLOAD_NOT_SERIALIZABLE): 数据含不可序列化类型
     """
-    # R63 P0-02: 深冻结结构需还原为普通 dict/list 才能 JSON 序列化
-    serializable = _to_serializable(data) if isinstance(data, (MappingProxyType, tuple)) else data
-    canonical = json.dumps(
-        serializable, sort_keys=True, separators=(",", ":"),
-        ensure_ascii=False, default=str,
-    ).encode("utf-8")
-    return hashlib.sha256(canonical).hexdigest()
+    return hashlib.sha256(_canonical_json_bytes(data)).hexdigest()
 
 
 # ── 三段式备份 key 生成 ────────────────────────────────────────
@@ -1717,14 +1772,15 @@ async def validate_and_restore_backup_strict(
             )
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-    # ── R62 P0-02 / R63 P0-02: 构造 VerifiedBackupPayload(深冻结,不可篡改) ──
+    # ── R62 P0-02 / R63 P0-02 / R64 P1-01: 构造 VerifiedBackupPayload(深冻结,不可篡改) ──
+    # R64 P1-01: 单一 canonical bytes 来源 — payload/tables 改为 property,
+    # 从 canonical_payload_bytes 解码,消除 tables 与 payload 语义分叉风险。
     verified_payload = VerifiedBackupPayload(
         backup_id=cap_backup_id,
-        tables=data.get("tables", {}),
         manifest_sha256=cap_manifest_sha256,
         plaintext_sha256=cap_plaintext_sha256,
         schema_fingerprint=cap_schema_fingerprint,
-        payload=data,
+        canonical_payload_bytes=_canonical_json_bytes(data),
     )
 
     # ── R61 P0-03 / R62 P0-01: 构造不可伪造的 _RestoreCapability ──
@@ -1811,14 +1867,14 @@ async def _restore_preverified_payload(
         AppError: capability 校验失败(过期/重放/digest 不匹配/scope 跨越)时
                   由 _restore_from_backup_data 首条 assert_valid 抛出
     """
-    # R62 P0-02: 构造 VerifiedBackupPayload(自动计算 payload_digest)
+    # R62 P0-02 / R64 P1-01: 构造 VerifiedBackupPayload(单一 canonical bytes 来源)
+    # payload_digest 从 canonical_payload_bytes 自动计算(__post_init__)
     verified_payload = VerifiedBackupPayload(
         backup_id=backup_id,
-        tables=data.get("tables", {}),
         manifest_sha256=manifest_sha256,
         plaintext_sha256=plaintext_sha256,
         schema_fingerprint=schema_fingerprint,
-        payload=data,
+        canonical_payload_bytes=_canonical_json_bytes(data),
     )
 
     # R62 P0-01: 构造不可伪造的 _RestoreCapability

@@ -365,14 +365,37 @@ class CockroachDBClient:
             max_size = min(_settings.CRDB_POOL_MAX_SIZE, 5)  # crdb_sync ≤5
         else:
             max_size = min(_settings.CRDB_POOL_MAX_SIZE, 2)  # 业务 Bot ≤2
-        self._pool = await asyncpg.create_pool(
-            self._url,
-            min_size=min_size,
-            max_size=max_size,
-            statement_cache_size=256,
-            init=_init_conn,
-            server_settings={"application_name": app_name},  # 连接级别也设置
-        )
+        # R64 P1-10: 强制 min_size=0(空载 0 连接),并配置 pool_recycle 空闲回收
+        # 防御性:即使环境变量误设为 >0 也强制归零,确保空载期不保持 CRDB 连接
+        min_size = 0
+        # asyncpg create_pool 不直接支持 pool_recycle,通过 max_inactive_connection_lifetime
+        # 传递(asyncpg 0.27+ 支持),实现空闲连接生命周期管理
+        # 注意:getattr(MagicMock, ...) 返回 MagicMock 而非 default,需显式 isinstance 检查
+        _recycle_raw = getattr(_settings, "CRDB_POOL_RECYCLE_SECONDS", 60)
+        recycle_seconds = int(_recycle_raw) if isinstance(_recycle_raw, (int, float)) else 60
+        _null_raw = getattr(_settings, "CRDB_POOL_NULL_MODE", False)
+        null_mode = bool(_null_raw) if isinstance(_null_raw, bool) else False
+        # NullPool 模式:max_size=1,每次用完即关,适合极端 0 RU 空载场景
+        if null_mode:
+            max_size = 1
+            recycle_seconds = 0  # 立即回收
+        pool_kwargs: dict = {
+            "min_size": min_size,
+            "max_size": max_size,
+            "statement_cache_size": 256,
+            "init": _init_conn,
+            "server_settings": {"application_name": app_name},  # 连接级别也设置
+        }
+        # asyncpg 0.27+ 支持 max_inactive_connection_lifetime(秒)
+        # 旧版本忽略此参数(由 try/except 兜底)
+        if recycle_seconds > 0:
+            pool_kwargs["max_inactive_connection_lifetime"] = float(recycle_seconds)
+        try:
+            self._pool = await asyncpg.create_pool(self._url, **pool_kwargs)
+        except TypeError:
+            # 旧版 asyncpg 不支持 max_inactive_connection_lifetime,降级为标准参数
+            pool_kwargs.pop("max_inactive_connection_lifetime", None)
+            self._pool = await asyncpg.create_pool(self._url, **pool_kwargs)
 
         # ─── SQLite 缓存备份：初始化并恢复内存缓存───
         from .cache_store import get_cache_store
@@ -383,8 +406,9 @@ class CockroachDBClient:
         await load_cache_from_disk()
 
         logger.info(
-            f"[DB] R37 P1-8: runtime_client 已连接(role={role}, "
-            f"pool={min_size}-{max_size}, app_name={app_name})。"
+            f"[DB] R37 P1-8 / R64 P1-10: runtime_client 已连接(role={role}, "
+            f"pool={min_size}-{max_size}, recycle={recycle_seconds}s, null_mode={null_mode}, "
+            f"app_name={app_name})。"
             f"不执行 DDL/bootstrap(由 migration_runner / bootstrap_runner 专属负责)。"
         )
 

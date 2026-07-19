@@ -497,3 +497,319 @@ async def record_restore_usage(ru_cost: int, operation: str = "restore") -> bool
         True 记录成功, False 失败
     """
     return await record_usage("restore", operation, ru_cost)
+
+
+# ════════════════════════════════════════════════════════════════
+#  R64 P1-10: RU 归因数据结构 + 阈值门禁(空载 RU 0/100/500 + 月度预算)
+# ════════════════════════════════════════════════════════════════
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RUAttribution:
+    """R64 P1-10: RU 归因数据结构(单日聚合)。
+
+    Attributes:
+        date: 日期 YYYYMMDD
+        total_ru: 当日总 RU 消耗(含所有角色)
+        business_bot_ru: 业务 Bot 空载 RU(应 = 0;>0 表示有空载 CRDB 命中)
+        non_business_ru: 非 Bot 角色 RU(crdb_sync/migration/backup 等)
+        by_service: 按服务角色聚合 {service: amount}
+        by_job: 按触发的 job 聚合 {job: amount}
+        by_fingerprint: 按 SQL 指纹聚合 {fp: amount}
+        by_time_bucket: 按时间桶(UTC 小时)聚合 {YYYYMMDDHH: amount}
+        dau: 当日活跃用户数(用于 per-DAU 计算,可选)
+    """
+
+    date: str = ""
+    total_ru: int = 0
+    business_bot_ru: int = 0
+    non_business_ru: int = 0
+    by_service: dict[str, int] = field(default_factory=dict)
+    by_job: dict[str, int] = field(default_factory=dict)
+    by_fingerprint: dict[str, int] = field(default_factory=dict)
+    by_time_bucket: dict[str, int] = field(default_factory=dict)
+    dau: int = 0
+
+    def per_dau_ru(self) -> float:
+        """R64 P1-10: 计算 per-DAU RU(无 DAU 时返回 0)。"""
+        if self.dau <= 0:
+            return 0.0
+        return self.total_ru / self.dau
+
+
+# ── R64 P1-10: 阈值常量(与 settings 默认一致,用于 settings 缺失时回退) ──
+RU_IDLE_BOT_PER_DAY_LIMIT = 0       # 业务 Bot 角色 0 RU/天(空载理想)
+RU_IDLE_CLUSTER_IDEAL = 20          # 集群空载理想 ≤20 RU/天
+RU_IDLE_CLUSTER_HARD_LIMIT = 100    # 集群空载硬限 ≤100 RU/天
+RU_IDLE_BLOCK_THRESHOLD = 500       # >500 RU/天阻断 release
+RU_PER_DAU_DAY_LIMIT = 250          # per-DAU 日均 RU 上限
+RU_MONTHLY_BUDGET_LIMIT = 35_000_000  # 月度预算上限
+
+
+def _get_ru_threshold_setting(name: str, default: int) -> int:
+    """R64 P1-10: 从 settings 读取 RU 阈值(失败回退默认值)。"""
+    try:
+        from config import settings
+        return int(getattr(settings, name, default))
+    except Exception:
+        return default
+
+
+async def get_daily_attribution(date_str: str | None = None) -> RUAttribution:
+    """R64 P1-10: 获取某日的 RU 归因聚合(基于 crdb_ru_collector 的归因数据)。
+
+    本函数纯走 SQLite kv_store,零 CRDB RU。
+
+    Args:
+        date_str: 日期 YYYYMMDD,None 表示今天
+
+    Returns:
+        RUAttribution 数据结构
+    """
+    # 委托 crdb_ru_collector.get_ru_attribution 读取归因数据
+    try:
+        from services.crdb_ru_collector import get_ru_attribution
+        raw = await get_ru_attribution(date_str)
+    except Exception as e:
+        logger.debug(f"[RUCostCenter] R64 P1-10: get_ru_attribution 失败: {e}")
+        raw = {
+            "date": date_str or "",
+            "total_ru": 0,
+            "by_service": {},
+            "by_job": {},
+            "by_fingerprint": {},
+            "by_time_bucket": {},
+            "business_bot_ru": 0,
+            "non_business_ru": 0,
+        }
+
+    attr = RUAttribution(
+        date=raw.get("date", date_str or ""),
+        total_ru=int(raw.get("total_ru", 0)),
+        business_bot_ru=int(raw.get("business_bot_ru", 0)),
+        non_business_ru=int(raw.get("non_business_ru", 0)),
+        by_service=dict(raw.get("by_service", {})),
+        by_job=dict(raw.get("by_job", {})),
+        by_fingerprint=dict(raw.get("by_fingerprint", {})),
+        by_time_bucket=dict(raw.get("by_time_bucket", {})),
+    )
+
+    # 读取当日 DAU(从 kv_store.readiness_dau 或 ru_usage:YYYYMMDD:dau)
+    try:
+        store = get_cache_store()
+        date_key = attr.date or _dt.datetime.now().strftime("%Y%m%d")
+        dau_raw = await store.get_kv(f"dau:{date_key}")
+        if dau_raw:
+            try:
+                attr.dau = int(dau_raw)
+            except (TypeError, ValueError):
+                attr.dau = 0
+    except Exception as e:
+        logger.warning(f"[RU] 获取 DAU 失败(非致命,DAU 置 0): {e}")
+
+    return attr
+
+
+async def check_daily_threshold(date_str: str | None = None) -> dict:
+    """R64 P1-10: 检查当日 RU 是否超过告警/阻断阈值。
+
+    阈值(从 settings 读取,默认值见常量):
+        - 业务 Bot 空载 RU:必须 = 0(任何 >0 视为门禁违规)
+        - 集群空载 RU 硬限:≤100 RU/天(>100 告警)
+        - 阻断 release 阈值:>500 RU/天
+        - per-DAU 限制:≤250 RU/DAU/天
+
+    Args:
+        date_str: 日期 YYYYMMDD,None 表示今天
+
+    Returns:
+        {
+            "date": str,
+            "passed": bool,           # True=所有门禁通过, False=有违规
+            "block_release": bool,    # True=阻断 release(>500 RU 或 Bot RU>0)
+            "alert": bool,            # True=告警(>100 RU)
+            "violations": [str],      # 违规描述列表
+            "business_bot_ru": int,
+            "total_ru": int,
+            "per_dau_ru": float,
+            "thresholds": {...},      # 使用的阈值
+        }
+    """
+    attr = await get_daily_attribution(date_str)
+    alert_threshold = _get_ru_threshold_setting(
+        "CRDB_RU_DAILY_ALERT_THRESHOLD", RU_IDLE_CLUSTER_HARD_LIMIT
+    )
+    block_threshold = _get_ru_threshold_setting(
+        "CRDB_RU_DAILY_BLOCK_THRESHOLD", RU_IDLE_BLOCK_THRESHOLD
+    )
+    per_dau_limit = _get_ru_threshold_setting(
+        "CRDB_RU_DAU_DAY_LIMIT", RU_PER_DAU_DAY_LIMIT
+    )
+
+    violations: list[str] = []
+    block_release = False
+    alert = False
+
+    # 1. 业务 Bot 空载 RU 必须为 0
+    if attr.business_bot_ru > 0:
+        violations.append(
+            f"业务 Bot 空载 RU > 0: {attr.business_bot_ru} RU "
+            f"(要求 0 RU/天)"
+        )
+        # 业务 Bot 任何空载 RU 均视为阻断(违反"72 小时 0 RU"要求)
+        block_release = True
+        alert = True
+
+    # 2. 集群空载 RU 硬限
+    if attr.total_ru > block_threshold:
+        violations.append(
+            f"集群日 RU {attr.total_ru} > 阻断阈值 {block_threshold} RU"
+        )
+        block_release = True
+        alert = True
+    elif attr.total_ru > alert_threshold:
+        violations.append(
+            f"集群日 RU {attr.total_ru} > 告警阈值 {alert_threshold} RU"
+        )
+        alert = True
+
+    # 3. per-DAU 限制(仅在有 DAU 数据时检查)
+    if attr.dau > 0:
+        per_dau = attr.per_dau_ru()
+        if per_dau > per_dau_limit:
+            violations.append(
+                f"per-DAU RU {per_dau:.1f} > 限制 {per_dau_limit} RU/DAU/天"
+            )
+            alert = True
+            # per-DAU 超限不阻断 release(只有 Bot 空载 / 集群硬限阻断)
+
+    return {
+        "date": attr.date,
+        "passed": len(violations) == 0,
+        "block_release": block_release,
+        "alert": alert,
+        "violations": violations,
+        "business_bot_ru": attr.business_bot_ru,
+        "total_ru": attr.total_ru,
+        "non_business_ru": attr.non_business_ru,
+        "dau": attr.dau,
+        "per_dau_ru": attr.per_dau_ru() if attr.dau > 0 else 0.0,
+        "thresholds": {
+            "alert": alert_threshold,
+            "block": block_threshold,
+            "per_dau_limit": per_dau_limit,
+            "bot_idle_limit": RU_IDLE_BOT_PER_DAY_LIMIT,
+        },
+    }
+
+
+async def check_monthly_budget(year_month: str | None = None) -> dict:
+    """R64 P1-10: 检查月度 RU 预算(累计当月所有日 RU)。
+
+    阈值:
+        - 月度预算:35,000,000 RU(从 settings.CRDB_RU_MONTHLY_BUDGET 读取)
+        - 超过预算:阻断 release
+
+    Args:
+        year_month: 月份 YYYYMM,None 表示当月
+
+    Returns:
+        {
+            "year_month": str,
+            "passed": bool,
+            "block_release": bool,
+            "monthly_usage": int,
+            "monthly_budget": int,
+            "remaining": int,
+            "usage_percentage": float,
+        }
+    """
+    if year_month is None:
+        year_month = _dt.datetime.now().strftime("%Y%m")
+
+    # 解析月份
+    try:
+        ym_date = _dt.datetime.strptime(year_month, "%Y%m")
+    except ValueError:
+        return {
+            "year_month": year_month,
+            "passed": False,
+            "block_release": True,
+            "monthly_usage": 0,
+            "monthly_budget": _get_ru_threshold_setting(
+                "CRDB_RU_MONTHLY_BUDGET", RU_MONTHLY_BUDGET_LIMIT
+            ),
+            "remaining": 0,
+            "usage_percentage": 0.0,
+            "error": "year_month 格式错误(应为 YYYYMM)",
+        }
+
+    # 累计当月所有日 RU(从 1 日到月末)
+    if ym_date.month == 12:
+        next_month = ym_date.replace(year=ym_date.year + 1, month=1)
+    else:
+        next_month = ym_date.replace(month=ym_date.month + 1)
+    days_in_month = (next_month - ym_date).days
+
+    monthly_usage = 0
+    for day in range(1, days_in_month + 1):
+        date_str = f"{year_month}{day:02d}"
+        report = await get_daily_report(date_str)
+        monthly_usage += report.get("total_ru", 0)
+
+    monthly_budget = _get_ru_threshold_setting(
+        "CRDB_RU_MONTHLY_BUDGET", RU_MONTHLY_BUDGET_LIMIT
+    )
+    remaining = max(0, monthly_budget - monthly_usage)
+    usage_pct = (
+        (monthly_usage / monthly_budget * 100) if monthly_budget > 0 else 0.0
+    )
+    block_release = monthly_usage > monthly_budget
+
+    return {
+        "year_month": year_month,
+        "passed": not block_release,
+        "block_release": block_release,
+        "monthly_usage": monthly_usage,
+        "monthly_budget": monthly_budget,
+        "remaining": remaining,
+        "usage_percentage": round(usage_pct, 2),
+    }
+
+
+def get_idle_crdb_audit_summary() -> dict:
+    """R64 P1-10: 静态审计摘要 — 列出已确认无空载 CRDB 命中的服务。
+
+    本函数用于 CI 门禁与测试断言,确认以下服务已迁移到 SQLite/Redis 事件驱动:
+        - r40_scheduler:周期任务全走 SQLite(cache_store / command_bus)
+        - crdb_sync_service:leader 走 Redis SET NX;dirty 检测走 SQLite;
+                            CRDB 仅 dirty 驱动懒加载,无空载轮询
+        - prometheus_exporter:所有指标走 SQLite;/health & /readiness 走 SQLite ping
+
+    Returns:
+        {
+            "audited_services": list[str],
+            "policy": str,
+            "allowed_crdb_triggers": list[str],
+        }
+    """
+    try:
+        from services.crdb_ru_collector import IDLE_CRDB_FREE_SERVICES_AUDITED
+    except Exception:
+        IDLE_CRDB_FREE_SERVICES_AUDITED = frozenset()  # noqa: F811
+
+    return {
+        "audited_services": sorted(IDLE_CRDB_FREE_SERVICES_AUDITED),
+        "policy": (
+            "业务 Bot 角色不得产生空载 CRDB RU;周期任务必须走 SQLite/Redis/"
+            "事件驱动;CRDB 触达仅由 dirty/event 显式驱动"
+        ),
+        "allowed_crdb_triggers": [
+            "dirty_outbox event(drdb_sync 懒加载)",
+            "user-initiated operation(db_writer)",
+            "explicit oneshot(migration / bootstrap / disaster_recovery)",
+            "explicit backup/restore(manual trigger)",
+        ],
+    }

@@ -85,6 +85,9 @@ class ErrorCodes:
     BACKUP_RESTORE_APPROVAL_INVALID = "BACKUP.RESTORE.APPROVAL_INVALID"
     BACKUP_RESTORE_CHECKSUM_MISMATCH = "BACKUP.RESTORE.CHECKSUM_MISMATCH"
     BACKUP_RESTORE_TRUST_CHAIN_REQUIRED = "BACKUP.RESTORE.TRUST_CHAIN_REQUIRED"
+    # R64 P1-01: payload 含不可序列化类型(bytes/NaN/Infinity/自定义对象)— fail-closed
+    # 禁止 default=str 静默字符串化,只允许 JSON schema 声明类型
+    BACKUP_PAYLOAD_NOT_SERIALIZABLE = "BACKUP.PAYLOAD.NOT_SERIALIZABLE"
 
     # EFFECT_RECEIPT
     EFFECT_RECEIPT_MANAGER_UNAVAILABLE = "EFFECT.RECEIPT.MANAGER_UNAVAILABLE"
@@ -330,6 +333,9 @@ class ErrorCodes:
     BUTTON_POLICY_FINAL_CONFIRM_REQUIRED = "BUTTON.POLICY.FINAL_CONFIRM_REQUIRED"
     # R58 P0-4: 高风险 action 必须使用异步 token(持久化 nonce + 原子消费)
     BUTTON_POLICY_ASYNC_TOKEN_REQUIRED = "BUTTON.POLICY.ASYNC_TOKEN_REQUIRED"
+    # R64 P1-08: destructive action UX spec 查询失败(action 为空或非高风险)
+    BUTTON_UX_ACTION_REQUIRED = "BUTTON.UX.ACTION_REQUIRED"
+    BUTTON_UX_ACTION_NOT_HIGH_RISK = "BUTTON.UX.ACTION_NOT_HIGH_RISK"
 
     # ── R62 P1-07: MFA receipt 年龄校验 + 审批自拒防护 ──
     # MFA receipt 已过期(签发时间超过高风险动作允许的最大年龄,防陈旧 receipt 绕过二次认证)
@@ -347,9 +353,27 @@ class ErrorCodes:
     # cosign verify-blob 验签失败 / 签名文件缺失 / cosign 不可用
     MIGRATION_MANIFEST_SIGNATURE_INVALID = "MIGRATION.MANIFEST.SIGNATURE_INVALID"
 
+    # ── R64 P0-02: Release artifact manifest 强制验证 ──
+    # staging/production 未启用 MIGRATION_MANIFEST_VERIFY=1 — 拒绝启动
+    MIGRATION_MANIFEST_VERIFY_REQUIRED = "MIGRATION.MANIFEST.VERIFY_REQUIRED"
+    # 非 git 部署环境未通过 RELEASE_SOURCE_COMMIT/TREE 注入 source commit/tree
+    MIGRATION_MANIFEST_RELEASE_SOURCE_REQUIRED = "MIGRATION.MANIFEST.RELEASE_SOURCE_REQUIRED"
+    # release-manifest.json 与 migration-manifest.json 集合/digest 不一致
+    MIGRATION_MANIFEST_RELEASE_CONSISTENCY = "MIGRATION.MANIFEST.RELEASE_CONSISTENCY"
+
     # ── R63 P0-05: Outbox worker fail-fast ──
     # 生产模式 provider_registry=None,拒绝 stub 误启动把外部副作用标记完成
     OUTBOX_PROVIDER_REGISTRY_REQUIRED = "OUTBOX.PROVIDER_REGISTRY.REQUIRED"
+    # R64 P0-04: provider registry / schema 加载异常(如 CRITICAL_EFFECT_TYPES
+    # 导入失败)直接 readiness failure,严禁 fail-open 返回空列表
+    OUTBOX_PROVIDER_REGISTRY_LOAD_FAILED = "OUTBOX.PROVIDER_REGISTRY.LOAD_FAILED"
+    # R64 P0-04: lease fencing token(lease_version)CAS 不匹配,complete/fail/
+    # renew 必须携带正确版本号,版本不匹配表示 lease 已被回收或越权操作
+    OUTBOX_LEASE_VERSION_MISMATCH = "OUTBOX.LEASE_VERSION.MISMATCH"
+    # R64 P0-04: 未知 event_type 严禁标记成功,必须进入 DLQ(可审批 replay)
+    OUTBOX_EVENT_UNKNOWN = "OUTBOX.EVENT.UNKNOWN"
+    # R64 P0-04: provider 调用超过租期三分之一时自动续租,续租失败立即停止提交结果
+    OUTBOX_LEASE_RENEW_FAILED = "OUTBOX.LEASE_RENEW.FAILED"
 
     # ── R63 P1-11: Locale 文件 fail-closed 校验 ──
     # 启动期 locale 文件完整性校验失败(文件缺失/JSON 解析失败/
@@ -360,6 +384,24 @@ class ErrorCodes:
     # locale 加载阶段预编译 ICU message 失败(语法错误 / 参数集合不对称),
     # release / strict 模式直接阻断构建或加载
     I18N_ICU_COMPILE_FAILED = "I18N.ICU.COMPILE_FAILED"
+
+    # ── R64 P0-03: 恢复编排状态机 — staging 蓝绿切换 ──
+    # staging provision 失败(为 CRDB/SQLite/relay_sqlite 创建新目标失败)
+    RESTORE_STAGING_PROVISION_FAILED = "RESTORE.STAGING.PROVISION_FAILED"
+    # staging validate 失败(schema/行数/主外键/业务守恒/hash 任一失败)
+    RESTORE_STAGING_VALIDATE_FAILED = "RESTORE.STAGING.VALIDATE_FAILED"
+    # 蓝绿切换前必须审批(approval_id 缺失或与 request_approval 不匹配)
+    RESTORE_APPROVAL_REQUIRED = "RESTORE.APPROVAL.REQUIRED"
+    # 蓝绿切换前必须 MFA receipt(mfa_receipt_id 缺失或与 request_approval 不匹配)
+    RESTORE_MFA_REQUIRED = "RESTORE.APPROVAL.MFA_REQUIRED"
+    # 蓝绿切换失败(CAS 切换 active 指针失败)
+    RESTORE_SWITCH_FAILED = "RESTORE.SWITCH.FAILED"
+    # 回滚失败(状态机错误 / 无 switch_version / 旧版本指针损坏)
+    RESTORE_ROLLBACK_FAILED = "RESTORE.ROLLBACK.FAILED"
+    # nonce payload 不一致(同 operation 重试时禁止换 payload_digest,防篡改)
+    RESTORE_NONCE_PAYLOAD_MISMATCH = "RESTORE.NONCE.PAYLOAD_MISMATCH"
+    # phase 转换非法(状态机不允许的转换,如 INIT → COMPLETED)
+    RESTORE_PHASE_TRANSITION_INVALID = "RESTORE.PHASE.TRANSITION_INVALID"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -2672,7 +2714,7 @@ def _register_defaults() -> None:
         http_status=400,
         retryable=False,
         severity="critical",
-        safe_params=["action", "missing_field", "reason"],
+        safe_params=["action", "missing_field", "reason", "expected", "actual"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",
@@ -2822,6 +2864,32 @@ def _register_defaults() -> None:
         audit_level="critical",
     ))
 
+    # ── R64 P1-08: destructive action UX spec 查询失败 ──
+    # 400 critical — action 为空,无法查询 UX spec(编程错误或调用方未校验)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_UX_ACTION_REQUIRED,
+        message_key="errors.button.ux.action_required",
+        http_status=400,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 400 critical — action 不在 HIGH_RISK_POLICY 中(非高风险 action 不需要 UX 面板)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BUTTON_UX_ACTION_NOT_HIGH_RISK,
+        message_key="errors.button.ux.action_not_high_risk",
+        http_status=400,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
     # ── R62 P1-07: MFA receipt 年龄校验 + 审批自拒防护 ──
     # MFA receipt 已过期(高风险动作要求 MFA 在近期完成,防陈旧 receipt 绕过二次认证)
     # 401 critical — 安全攻击向量,直接拒绝执行高风险动作
@@ -2899,6 +2967,58 @@ def _register_defaults() -> None:
         show_retry_button=False,
         audit_level="critical",
     ))
+    # ── R64 P0-02: Release artifact manifest 强制验证 ──
+    # 500 critical — staging/production 未启用 MIGRATION_MANIFEST_VERIFY=1,拒绝启动
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MIGRATION_MANIFEST_VERIFY_REQUIRED,
+        message_key="errors.migration.manifest.verify_required",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["app_env"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — 非 git 部署环境未通过 RELEASE_SOURCE_COMMIT/TREE 注入 source commit/tree
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MIGRATION_MANIFEST_RELEASE_SOURCE_REQUIRED,
+        message_key="errors.migration.manifest.release_source_required",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — release-manifest.json 与 migration-manifest.json 集合/digest 不一致
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.MIGRATION_MANIFEST_RELEASE_CONSISTENCY,
+        message_key="errors.migration.manifest.release_consistency",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "field", "expected", "actual"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R64 P1-01: Backup payload 不可序列化 fail-closed ──
+    # 500 critical — payload 含 bytes/NaN/Infinity/自定义对象等不可 JSON 序列化类型,
+    # 禁止 default=str 静默字符串化,直接拒绝(fail-closed)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_PAYLOAD_NOT_SERIALIZABLE,
+        message_key="errors.backup.payload.not_serializable",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["field", "type_name"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
 
     # ── R63 P0-05: Outbox worker fail-fast ──
     # 500 critical — 生产模式无 provider,拒绝 stub 误启动
@@ -2909,6 +3029,62 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R64 P0-04: Outbox 生产闭环 — registry 加载异常 fail-closed ──
+    # 500 critical — provider registry / schema 加载异常直接 readiness failure
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.OUTBOX_PROVIDER_REGISTRY_LOAD_FAILED,
+        message_key="errors.outbox.provider_registry.load_failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R64 P0-04: lease fencing token CAS 不匹配 ──
+    # 409 conflict — complete/fail/renew 必须携带正确 lease_version
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.OUTBOX_LEASE_VERSION_MISMATCH,
+        message_key="errors.outbox.lease_version.mismatch",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["event_id", "lease_version"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R64 P0-04: 未知 event_type 严禁标记成功,必须进入 DLQ ──
+    # 500 critical — 未知 event_type 进入 DLQ(可审批 replay)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.OUTBOX_EVENT_UNKNOWN,
+        message_key="errors.outbox.unknown_event_type",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["event_type", "outbox_id"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R64 P0-04: provider 调用超过租期三分之一自动续租,续租失败停止提交 ──
+    # 500 critical — 续租失败立即停止提交结果(防 lease 被回收后双重执行)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.OUTBOX_LEASE_RENEW_FAILED,
+        message_key="errors.outbox.lease_renew.failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["event_id", "reason"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",
@@ -2938,6 +3114,104 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["reason", "error_count"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R64 P0-03: 恢复编排状态机 — staging 蓝绿切换 ──
+    # 500 critical — staging provision 失败(CRDB/SQLite/relay_sqlite 创建新目标失败)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_STAGING_PROVISION_FAILED,
+        message_key="errors.restore.staging.provision_failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "datasource", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — staging validate 失败(schema/行数/主外键/业务守恒/hash 任一失败)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_STAGING_VALIDATE_FAILED,
+        message_key="errors.restore.staging.validate_failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "dimension", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 403 critical — 蓝绿切换前必须审批(approval_id 缺失或不匹配)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_APPROVAL_REQUIRED,
+        message_key="errors.restore.approval.required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 403 critical — 蓝绿切换前必须 MFA receipt(mfa_receipt_id 缺失或不匹配)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_MFA_REQUIRED,
+        message_key="errors.restore.approval.mfa_required",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — 蓝绿切换失败(CAS 切换 active 指针失败)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_SWITCH_FAILED,
+        message_key="errors.restore.switch.failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — 回滚失败(状态机错误 / 无 switch_version / 旧版本指针损坏)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_ROLLBACK_FAILED,
+        message_key="errors.restore.rollback.failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 403 critical — nonce payload 不一致(同 operation 重试时禁止换 payload_digest)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_NONCE_PAYLOAD_MISMATCH,
+        message_key="errors.restore.nonce.payload_mismatch",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "backup_id", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 409 critical — phase 转换非法(状态机不允许的转换)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_PHASE_TRANSITION_INVALID,
+        message_key="errors.restore.phase.transition_invalid",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["operation_id", "phase_from", "phase_to", "reason"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",

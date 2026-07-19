@@ -58,6 +58,7 @@ R55 §22 空白 VPS 恢复测试脚本(production fail-closed)
   --mode MODE                   production/staging(默认 production)
   --rpo-seconds S               RPO 阈值(默认 21600 = 6 小时)
   --rto-seconds S               RTO 阈值(默认 1800 = 30 分钟)
+  --output-dir DIR              报告输出目录(默认仓库根目录;R64 P1-12 用 production-evidence/)
   -h, --help                    显示本帮助
 
 R55 §22 fail-closed 要求:
@@ -83,6 +84,7 @@ ROUNDS=3
 MODE="production"
 RPO_SECONDS=$DEFAULT_RPO_SECONDS
 RTO_SECONDS=$DEFAULT_RTO_SECONDS
+OUTPUT_DIR=""
 
 # 早期 --help 检查(在 trap 设置之前,避免触发 report 生成)
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
@@ -109,6 +111,8 @@ while [[ $# -gt 0 ]]; do
             RPO_SECONDS="$2"; shift 2 ;;
         --rto-seconds)
             RTO_SECONDS="$2"; shift 2 ;;
+        --output-dir)
+            OUTPUT_DIR="$2"; shift 2 ;;
         -h|--help)
             usage; exit 0 ;;
         *)
@@ -167,11 +171,18 @@ fi
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_DIR"
 
+# R64 P1-12: --output-dir 支持(默认仓库根目录,production-evidence/ 用于审计证据归档)
+if [[ -z "$OUTPUT_DIR" ]]; then
+    OUTPUT_DIR="$REPO_DIR"
+else
+    mkdir -p "$OUTPUT_DIR"
+fi
+
 # ─── 报告路径与全局状态 ─────────────────────────────────
 START_TIME=$(date +%s)
 STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 REPORT_TS=$(date +%Y%m%d_%H%M%S)
-TEST_REPORT_JSON="$REPO_DIR/vps_recovery_test_report_${REPORT_TS}.json"
+TEST_REPORT_JSON="$OUTPUT_DIR/vps_recovery_test_report_${REPORT_TS}.json"
 TEST_REPORT_SIG="$TEST_REPORT_JSON.sig"
 
 # 每轮检查状态记录(用于最终报告)

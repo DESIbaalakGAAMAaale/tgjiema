@@ -612,7 +612,13 @@ class TestOutboxWorkerFlow:
 
     @pytest.mark.asyncio
     async def test_worker_unknown_event_type_completes(self, real_store):
-        """未知 event_type 视为完成(避免 DEAD 卡住)。"""
+        """R64 P0-04: 未知 event_type fail-closed → mark_outbox_failed(进入 DLQ 路径)。
+
+        旧 R36 实现未知 event_type 静默视为完成(fail-open,DONE);
+        R64 P0-04 整改:未知 event_type 必须 raise AppError(OUTBOX_EVENT_UNKNOWN),
+        由 _process_entry 捕获后 mark_outbox_failed(attempts+1,重试或 DEAD)。
+        本测试验证未知 event_type 不再被标记 DONE,而是进入失败重试 / DLQ 路径。
+        """
         await real_store.create_outbox_entry(
             "obx-wf-unknown-001", "upload-unknown", "C1", 1001, 2001,
             storage_msg_ids=[5001],
@@ -628,10 +634,17 @@ class TestOutboxWorkerFlow:
         await asyncio.sleep(0.3)
         await worker.stop()
         rows = await real_store._db.execute_fetchall(
-            "SELECT status FROM upload_outbox WHERE outbox_id = ?",
+            "SELECT status, attempts FROM upload_outbox WHERE outbox_id = ?",
             ("obx-wf-unknown-001",),
         )
-        assert rows[0][0] == "DONE"
+        # R64 P0-04: 未知 event_type 严禁标记 DONE,必须进入失败/DLQ 路径
+        # (status 为 PENDING 等待重试 或 DEAD 超过 max_attempts)
+        assert rows[0][0] in ("PENDING", "DEAD"), (
+            f"未知 event_type 不应被标记为 DONE(status={rows[0][0]}); "
+            f"R64 P0-04 要求 fail-closed 进入 DLQ 路径"
+        )
+        # 至少失败过一次(attempts >= 1)
+        assert rows[0][1] >= 1
 
 
 # ════════════════════════════════════════════════════════════════

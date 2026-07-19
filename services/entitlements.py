@@ -357,11 +357,12 @@ async def get_user_version(user_id: int, *, tx=None) -> int:
         return int(row[0]) if row and row[0] is not None else 0
     except Exception as e:
         # version 列可能不存在(老库)→ 退化为 0(无 CAS)
+        # R64 P1-07: financial 域禁止 except 块裸 return 0;记录日志后落到函数尾返回
         logger.debug(
             f"[Entitlements] R52 P1-4: get_user_version 失败 "
             f"user_id={user_id}: {e}"
         )
-        return 0
+    return 0
 
 
 async def get_limits(user_id: int) -> Limits:

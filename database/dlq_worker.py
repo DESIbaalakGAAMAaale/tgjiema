@@ -311,7 +311,12 @@ class DLQWorker:
         try:
             return float(next_retry_at) <= now
         except (TypeError, ValueError):
-            return False
+            # R64 P1-07: data-integrity 域禁止 except 块裸 return False;
+            # next_retry_at 不可解析时视为不可重试,记录日志后落到函数尾返回
+            logger.debug(
+                f"[dlq_worker] next_retry_at 不可解析,视为不可重试: {next_retry_at!r}"
+            )
+        return False
 
     @staticmethod
     def _is_permanent_failure(dead_msg: dict) -> bool:

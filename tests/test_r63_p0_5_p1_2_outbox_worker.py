@@ -287,7 +287,14 @@ class TestOutboxWorkerTestModeGuard:
     async def test_run_once_works_with_test_mode_true_and_no_provider(
         self, real_store,
     ):
-        """test_mode=True + provider_registry=None → stub 模式正常 complete。"""
+        """R64 P0-04: test_mode=True + provider_registry=None → 仍 raise AppError。
+
+        旧 R63 实现 test_mode=True 时 stub 模式正常 complete;
+        R64 P0-04 整改:生产构建从代码层移除 no-provider-complete 分支,
+        不论 test_mode 如何,provider_registry=None 一律 raise
+        AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)。
+        测试应注入独立 fake provider,不依赖 test_mode 绕过。
+        """
         from services.data_lifecycle import OutboxWorker
         await real_store.add_outbox_event(
             action_id="act_p0_5_stub",
@@ -300,20 +307,30 @@ class TestOutboxWorkerTestModeGuard:
             lease_owner="worker_stub", batch_size=10, test_mode=True,
         )
         assert worker.test_mode is True
-        result = await worker.run_once()
-        assert result["claimed"] == 1
-        assert result["completed"] == 1
-        assert result["failed"] == 0
-        assert result["dlq"] == 0
+        # R64 P0-04: test_mode 不再控制 stub 行为,无 provider 一律 raise
+        with pytest.raises(AppError):
+            await worker.run_once()
+        # 事件仍为 pending(fail-fast 在 claim 之前发生)
+        cursor = await real_store._db.execute(
+            "SELECT status FROM outbox_events WHERE action_id=?",
+            ("act_p0_5_stub",),
+        )
+        row = await cursor.fetchone()
+        assert row[0] == "pending"
 
     @pytest.mark.asyncio
     async def test_run_once_works_with_provider_registry_no_test_mode(
         self, real_store,
     ):
-        """有 provider_registry + test_mode=False → 正常调用 provider(生产路径)。"""
-        from services.data_lifecycle import OutboxWorker
+        """有 provider_registry + test_mode=False → 正常调用 provider(生产路径)。
 
-        async def _provider(payload_json, request_hash, idempotency_key):
+        R64 P0-04: provider 签名改为接收 immutable OutboxEnvelope
+        (基于 idempotency_key 去重)。
+        """
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
+
+        async def _provider(envelope: OutboxEnvelope):
+            assert isinstance(envelope, OutboxEnvelope)
             return "ext_id_123"
 
         await real_store.add_outbox_event(
@@ -593,20 +610,20 @@ class TestOutboxWorkerReclaimStaleLeases:
 # ════════════════════════════════════════════════════════════════
 
 class TestOutboxWorkerProviderSignature:
-    """R63 P0-05: provider 签名 (payload_json, request_hash, idempotency_key) -> external_id。"""
+    """R63 P0-05 + R64 P0-04: provider 签名 (OutboxEnvelope) -> external_id。
+
+    R64 P0-04: provider 接收 immutable OutboxEnvelope(基于 idempotency_key 去重),
+    替换 R63 旧签名 (payload_json, request_hash, idempotency_key)。
+    """
 
     @pytest.mark.asyncio
-    async def test_run_once_calls_provider_with_three_args(self, real_store):
-        """provider 被调用时收到 3 个参数:payload_json, request_hash, idempotency_key。"""
-        from services.data_lifecycle import OutboxWorker
+    async def test_run_once_calls_provider_with_envelope(self, real_store):
+        """R64 P0-04: provider 被调用时收到 immutable OutboxEnvelope。"""
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
         captured_calls = []
 
-        async def _capturing_provider(payload_json, request_hash, idempotency_key):
-            captured_calls.append({
-                "payload_json": payload_json,
-                "request_hash": request_hash,
-                "idempotency_key": idempotency_key,
-            })
+        async def _capturing_provider(envelope: OutboxEnvelope):
+            captured_calls.append(envelope)
             return "ext_id"
 
         rh = "rh_signature" + "0" * 51
@@ -623,20 +640,31 @@ class TestOutboxWorkerProviderSignature:
         )
         await worker.run_once()
         assert len(captured_calls) == 1
-        call = captured_calls[0]
-        # payload_json 透传
-        assert json.loads(call["payload_json"])["text"] == "hi"
+        env = captured_calls[0]
+        # R64 P0-04: 信封是 immutable(frozen=True)
+        assert isinstance(env, OutboxEnvelope)
+        # payload 解析为 dict(只读 Mapping)
+        assert env.payload["text"] == "hi"
         # request_hash 从 outbox event 读取
-        assert call["request_hash"] == rh
+        assert env.request_hash == rh
         # idempotency_key = action_id:request_hash
-        assert call["idempotency_key"] == f"act_signature_1:{rh}"
+        assert env.idempotency_key == f"act_signature_1:{rh}"
+        # effect_type / target / event_id 透传
+        assert env.effect_type == "telegram_message"
+        assert env.target == "chat:1"
+        assert isinstance(env.event_id, int)
+        # payload_digest 是 sha256 hex
+        assert len(env.payload_digest) == 64
+        # frozen=True:不可修改字段
+        with pytest.raises(Exception):
+            env.effect_type = "tampered"
 
     @pytest.mark.asyncio
     async def test_run_once_saves_external_id_to_outbox_event(self, real_store):
         """provider 返回的 external_id 被保存到 outbox_events.external_id 列。"""
-        from services.data_lifecycle import OutboxWorker
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
 
-        async def _provider(payload_json, request_hash, idempotency_key):
+        async def _provider(envelope: OutboxEnvelope):
             return "tg_msg_id_98765"
 
         eid = await real_store.add_outbox_event(
@@ -662,9 +690,9 @@ class TestOutboxWorkerProviderSignature:
     @pytest.mark.asyncio
     async def test_run_once_external_id_none_saved_as_empty(self, real_store):
         """provider 返回 None → external_id 保存为空字符串(不报错)。"""
-        from services.data_lifecycle import OutboxWorker
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
 
-        async def _provider(payload_json, request_hash, idempotency_key):
+        async def _provider(envelope: OutboxEnvelope):
             return None  # 部分 provider 可能无 external_id
 
         eid = await real_store.add_outbox_event(
@@ -689,9 +717,9 @@ class TestOutboxWorkerProviderSignature:
     @pytest.mark.asyncio
     async def test_run_once_complete_uses_cas_with_lease_owner(self, real_store):
         """complete 时 CAS 校验 lease_owner(其它 worker 不能 complete 本 worker 的 lease)。"""
-        from services.data_lifecycle import OutboxWorker
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
 
-        async def _provider(payload_json, request_hash, idempotency_key):
+        async def _provider(envelope: OutboxEnvelope):
             return "ext"
 
         eid = await real_store.add_outbox_event(
@@ -724,7 +752,10 @@ class TestOutboxWorkerProviderSignature:
     @pytest.mark.asyncio
     async def test_run_once_complete_uses_cas_with_request_hash(self, real_store):
         """complete 时 CAS 校验 request_hash(错配的 hash 不能 complete)。"""
-        from services.data_lifecycle import OutboxWorker
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
+
+        async def _provider(envelope: OutboxEnvelope):
+            return "ext"
 
         eid = await real_store.add_outbox_event(
             action_id="act_cas_rh",
@@ -753,7 +784,12 @@ class TestOutboxWorkerProviderSignature:
 
     @pytest.mark.asyncio
     async def test_run_once_stub_mode_also_uses_cas(self, real_store):
-        """stub 模式(test_mode=True)complete 也走 CAS 路径(防 stub 误完成非己事件)。"""
+        """R64 P0-04: test_mode=True + 无 provider → 仍 raise AppError(不再 stub complete)。
+
+        旧 R63 实现 stub 模式下 run_once 会先 claim 自己的事件并 complete;
+        R64 P0-04 整改:不论 test_mode,provider_registry=None 一律 raise,
+        不会执行 claim/complete,事件保持原 in_flight 状态(由 worker_X 持有)。
+        """
         from services.data_lifecycle import OutboxWorker
         eid = await real_store.add_outbox_event(
             action_id="act_stub_cas",
@@ -766,15 +802,13 @@ class TestOutboxWorkerProviderSignature:
         await real_store.claim_outbox_events(
             lease_owner="worker_X", lease_duration_seconds=60, limit=1,
         )
-        # 用 worker_Y 的 stub 尝试 complete(worker_Y 不是 lease 持有者)
-        # stub 模式下 run_once 会先 claim 自己的事件(但已被 worker_X claim,无 pending)
+        # worker_Y test_mode=True + 无 provider → R64 P0-04: raise AppError
         worker_Y = OutboxWorker(
             lease_owner="worker_Y", batch_size=10, test_mode=True,
         )
-        result = await worker_Y.run_once()
-        # worker_Y claim 不到任何事件(已被 worker_X claim)
-        assert result["claimed"] == 0
-        # 验证事件仍为 in_flight(worker_X 持有)
+        with pytest.raises(AppError):
+            await worker_Y.run_once()
+        # 验证事件仍为 in_flight(worker_X 持有,worker_Y 未干预)
         cursor = await real_store._db.execute(
             "SELECT status, lease_owner FROM outbox_events WHERE id=?", (eid,),
         )

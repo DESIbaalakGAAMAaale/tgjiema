@@ -142,6 +142,52 @@ if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
   echo ""
 fi
 
+# 3.5 R64 P0-01 / P1-11 软警告:Release Gates 14 个 job + CI / repo-hygiene 覆盖
+# Release Gates workflow 实际 job 名必须与 release-gates.yml 完全一致(14 个 job):
+#   docker-build / docker-digest-verify / compose-config / redis-acl-matrix / schema-diff /
+#   backup-restore-drill / sbom / pip-audit / trivy / sign-image / verify-branch-protection /
+#   rc-continuity / publish-attestation / release-summary
+# CI workflow 必须包含 repo-hygiene(R64 P1-11 required context)。
+# 注意:sign-image / publish-attestation / release-summary 仅在 push 到 master/main 时运行,
+#      PR 场景或未触发过的 master 上可能缺失,属正常情况(soft WARN)。
+EXPECTED_RG_JOBS=(
+  "docker-build"
+  "docker-digest-verify"
+  "compose-config"
+  "redis-acl-matrix"
+  "schema-diff"
+  "backup-restore-drill"
+  "sbom"
+  "pip-audit"
+  "trivy"
+  "sign-image"
+  "verify-branch-protection"
+  "rc-continuity"
+  "publish-attestation"
+  "release-summary"
+)
+MISSING_RG_JOBS=()
+for rg_job in "${EXPECTED_RG_JOBS[@]}"; do
+  expected_ctx="Release Gates / ${rg_job}"
+  if ! echo "$CONTEXTS_JSON" | jq -e --arg c "$expected_ctx" \
+        'any(.[]; . == $c)' > /dev/null 2>&1; then
+    MISSING_RG_JOBS+=("$expected_ctx")
+  fi
+done
+if [ "${#MISSING_RG_JOBS[@]}" -gt 0 ]; then
+  echo "WARN: 以下 Release Gates job context 未在待配置 contexts 中:"
+  for c in "${MISSING_RG_JOBS[@]}"; do
+    echo "  - $c"
+  done
+  echo "  这可能导致对应 job 的失败无法阻断合并(R64 P0-01/P1-11 要求 14 个 job 全覆盖)。"
+  echo "  若为有意为之(如 PR 场景配置子集),可忽略本警告。"
+  echo ""
+fi
+if ! echo "$CONTEXTS_JSON" | jq -e 'any(.[]; . == "CI / repo-hygiene")' > /dev/null 2>&1; then
+  echo "WARN: CI / repo-hygiene 未在待配置 contexts 中(R64 P1-11 required context)"
+  echo ""
+fi
+
 # ─── 4. 构造 PUT /branches/master/protection 的 payload ───
 # 严格包含 R47 P0-2 要求的所有字段:
 #   - required_status_checks.strict = true

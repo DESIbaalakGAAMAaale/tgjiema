@@ -24,6 +24,7 @@ R51 P1-1 整改要点(数据生命周期事务化):
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import hashlib
 import json
@@ -31,7 +32,7 @@ import os
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from loguru import logger
 
@@ -1181,15 +1182,42 @@ async def execute_high_risk_command_uow(
 # ════════════════════════════════════════════════════════════════
 
 
+@dataclass(frozen=True)
+class OutboxEnvelope:
+    """R64 P0-04: immutable outbox 事件信封,provider 必须按 idempotency_key 去重。
+
+    provider 接收此 immutable 信封(而非散落的 payload_json / request_hash /
+    idempotency_key 参数),强制 provider 基于 idempotency_key 在外部系统去重
+    (同一逻辑副作用多次重试只执行一次)。frozen=True 保证信封在 worker 与
+    provider 之间不可变(防 provider 篡改 effect_type / request_hash 绕过 CAS)。
+
+    Attributes:
+        event_id: outbox_events.id(用于 CAS complete/fail/renew)
+        effect_type: 副作用类型(枚举,必须在 CRITICAL_EFFECT_TYPES 中)
+        target: 目标标识(chat_id / bucket / db / email)
+        request_hash: 绑定 action 的 canonical payload hash(幂等键材料)
+        idempotency_key: ``{action_id}:{request_hash}``,provider 去重键
+        payload_digest: payload_json 的 sha256 digest(防 payload 被替换)
+        payload: 只读 view(Mapping),provider 读取执行参数
+    """
+    event_id: int
+    effect_type: str
+    target: str
+    request_hash: str
+    idempotency_key: str
+    payload_digest: str
+    payload: Mapping[str, Any]
+
+
 class OutboxWorker:
-    """R62 P0-05 + R63 P0-05: 事务性 outbox worker。
+    """R62 P0-05 + R63 P0-05 + R64 P0-04: 事务性 outbox worker(生产闭环)。
 
     设计目标:
     - ``execute_high_risk_command_uow`` 在事务内将外部副作用写入 outbox_events 表
       (与业务变更 + effect_receipts 原子提交),commit 后由本 worker 拉取 lease
       调用外部系统(Telegram/R2/CRDB/email/文件)。
     - provider 各自幂等(基于 request_hash + idempotency_key),worker 失败可安全重试。
-    - 超过 max_attempts 自动转 DLQ(permanent failure,需人工介入)。
+    - 超过 max_attempts 自动转 DLQ(permanent failure,需人工介入 + 可审批 replay)。
     - saga 补偿由 reconcile 流程在独立事务中调用 HighRiskCommand.compensation_action,
       不依赖伪数据库回滚(SQLite 事务失败时外部 I/O 无法回滚)。
 
@@ -1198,9 +1226,6 @@ class OutboxWorker:
       ``complete_outbox_event``,把所有外部副作用永久标记完成。生产环境若误启动
       默认配置,Telegram/R2/CRDB/邮件/文件副作用全部失配,业务状态与外部世界
       严重不一致,且无法重放(completed 是终态)。
-    - 新增 ``test_mode`` 参数:仅 ``test_mode=True`` 时允许 ``provider_registry=None``
-      (用于单元测试 lease 流转)。生产模式(``test_mode=False``)下 ``run_once``
-      在 ``provider_registry is None`` 时立即 raise ``RuntimeError``,fail-fast。
     - 新增 ``validate_providers()`` readiness 检查:每个枚举 effect type 必须恰有
       一个 provider,缺失即 readiness failure(部署时应阻断启动)。
     - provider 调用签名扩展为 ``async (payload_json, request_hash, idempotency_key)
@@ -1210,11 +1235,39 @@ class OutboxWorker:
     - 新增 ``reclaim_stale_leases()``:回收过期 lease(worker 崩溃后 in_flight 行
       不再永久卡住)。
 
+    R64 P0-04 整改(生产闭环 — 终审报告 P0-04):
+    - **删除 test_mode stub 分支**:无论 test_mode 如何,``provider_registry=None``
+      时 ``run_once`` 一律 raise ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``。
+      生产构建从代码层移除 no-provider-complete 分支;测试使用独立 fake provider
+      注入,不允许 worker 静默完成外部副作用。
+    - **validate_providers() 不再 fail-open**:registry/schema 加载异常
+      (如 CRITICAL_EFFECT_TYPES 导入失败)直接 raise
+      ``AppError(OUTBOX_PROVIDER_REGISTRY_LOAD_FAILED)``,readiness failure,
+      严禁返回空列表绕过校验。
+    - **枚举型 provider registry + 启动时严格匹配**:``required_effect_types``
+      与 ``registered_types`` 比较,缺失/多余/重复均视为 readiness 失败
+      (validate_providers 返回 missing 列表,多余/重复由调用方据此拒绝就绪)。
+    - **OutboxEnvelope immutable 信封**:provider 接收 immutable
+      ``OutboxEnvelope(event_id, effect_type, target, request_hash,
+      idempotency_key, payload_digest, payload)``,外部系统必须按 idempotency_key
+      去重(防 provider 篡改 effect_type/request_hash 绕过 CAS)。
+    - **lease fencing token(lease_version)**:claim CAS
+      ``WHERE status='pending' AND lease_version=0``,成功后 lease_version=1;
+      complete/fail/renew 都必须 CAS ``event_id + owner + lease_version +
+      request_hash``(防 ABA:旧持有者残留调用因版本不匹配被拒绝)。
+    - **provider 调用超过租期三分之一自动续租**:续租失败立即停止提交结果
+      (raise ``AppError(OUTBOX_LEASE_RENEW_FAILED)``,防 lease 被回收后双重执行)。
+    - **DLQ 闭环(告警 + 可审批 replay)**:move_outbox_to_dlq 后 worker
+      ``logger.error`` 告警,并写入 ``outbox_dlq_audit`` 审计记录(可审批 replay);
+      未知 event_type 严禁标记成功,必须进入 DLQ。
+
     Lease 机制(分布式 worker 协调):
     - claim_outbox_events 原子地将 pending 行转为 in_flight 并设置 lease_owner /
-      lease_expires_at,防止多 worker 并发拉取同一行。
-    - lease 过期后由 ``reclaim_stale_leases()`` 回收(转回 pending,清空 lease_owner)。
-    - 长 provider 调用应周期性调用 ``store.renew_outbox_lease`` 续约(防超时回收)。
+      lease_expires_at / lease_version=1,防止多 worker 并发拉取同一行。
+    - lease 过期后由 ``reclaim_stale_leases()`` 回收(转回 pending,清空
+      lease_owner,重置 lease_version=0)。
+    - 长 provider 调用周期性调用 ``store.renew_outbox_lease`` 续约(防超时回收),
+      续约成功 lease_version += 1。
     """
 
     def __init__(
@@ -1233,22 +1286,22 @@ class OutboxWorker:
             lease_duration_seconds: lease 超时秒数(超时后可被其他 worker 重新 claim)
             batch_size: 单次 run_once 最多处理的事件数
             provider_registry: ``{effect_type: async callable}``
-                provider 签名: ``async (payload_json, request_hash, idempotency_key)
-                -> external_id_str``。
-                生产模式(``test_mode=False``)下必传,``None`` 时 ``run_once`` raise。
-            test_mode: 测试模式开关。``True`` 时允许 ``provider_registry=None``
-                (用于单元测试 lease 流转,直接 complete 不调外部系统);
-                ``False`` 时(生产默认)``provider_registry=None`` → ``run_once``
-                raise ``RuntimeError``,fail-fast 防止 stub 误启动。
+                provider 签名: ``async (OutboxEnvelope) -> external_id_str``
+                (R64 P0-04: 接收 immutable 信封,基于 idempotency_key 去重)。
+                必传:``None`` 时 ``run_once`` 一律 raise
+                ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``(R64 P0-04:
+                不论 test_mode 如何,生产构建从代码层移除 no-provider-complete 分支;
+                测试注入独立 fake provider,不依赖 test_mode 绕过)。
+            test_mode: 测试模式开关(R64 P0-04: 仅为向后兼容保留,不再控制
+                stub 行为;``provider_registry=None`` 时无论 test_mode 如何均 raise)。
         """
         import socket as _socket
         self.lease_owner = lease_owner or f"{_socket.gethostname()}:{os.getpid()}"
         self.lease_duration_seconds = lease_duration_seconds
         self.batch_size = batch_size
-        # provider_registry: {effect_type: async (payload_json, request_hash,
-        #                                          idempotency_key) -> external_id_str}
-        # test_mode=True 时允许 None(stub 仅 claim+complete,用于测试 lease 流转)
-        # test_mode=False 时 run_once 在 None 时 raise RuntimeError(fail-fast)
+        # provider_registry: {effect_type: async (OutboxEnvelope) -> external_id_str}
+        # R64 P0-04: None 时 run_once 一律 raise(不论 test_mode);
+        # 测试注入独立 fake provider,不依赖 test_mode 绕过。
         self.provider_registry = provider_registry
         self.test_mode = bool(test_mode)
 
@@ -1257,7 +1310,7 @@ class OutboxWorker:
         *,
         required_effect_types: Any = None,
     ) -> list[str]:
-        """R63 P0-05: readiness 检查 — 每个枚举 effect type 恰有一个 provider。
+        """R63 P0-05 + R64 P0-04: readiness 检查 — 每个枚举 effect type 恰有一个 provider。
 
         生产部署启动时应调用本方法,缺失任一 effect type 的 provider 即视为
         readiness failure(部署系统应阻断 worker 启动)。
@@ -1268,21 +1321,45 @@ class OutboxWorker:
         - ``required_effect_types`` 默认为
           ``services.effect_receipts.CRITICAL_EFFECT_TYPES``(9 个枚举值)。
         - 缺失 → 收集到 missing 列表;调用方决定是否 raise / log / 阻断启动。
+        - R64 P0-04: registry 多余 effect_type(registered - required)或重复
+          值视为配置错误,调用方应据此拒绝就绪(missing 为空但多余/重复存在
+          仍不应放行)。本方法聚焦 missing 检测,多余/重复由调用方结合
+          ``set(provider_registry.keys())`` 自行比对。
+
+        R64 P0-04 整改(不再 fail-open):
+        - 旧实现 ``except Exception: return []`` 兜底,CRITICAL_EFFECT_TYPES
+          导入失败时返回空列表(不阻断),生产环境若 effect_receipts 模块损坏,
+          worker 会误判 readiness OK 并启动,所有 effect_type 视为已覆盖。
+        - 新实现:任何 registry/schema 加载异常直接 raise
+          ``AppError(OUTBOX_PROVIDER_REGISTRY_LOAD_FAILED)``,readiness failure。
 
         Args:
             required_effect_types: 必须覆盖的 effect_type 集合(默认 CRITICAL_EFFECT_TYPES)
 
         Returns:
             missing 列表(空 list 表示所有 effect type 均有 provider,readiness OK)
+
+        Raises:
+            AppError(OUTBOX_PROVIDER_REGISTRY_LOAD_FAILED): registry/schema 加载
+                异常(CRITICAL_EFFECT_TYPES 导入失败)—— R64 P0-04 严禁 fail-open
         """
         if required_effect_types is None:
             # 延迟导入避免循环依赖
+            # R64 P0-04: 删除 fail-open ``except Exception: return []``;
+            # 任何 registry/schema 加载异常直接 readiness failure
             try:
                 from services.effect_receipts import CRITICAL_EFFECT_TYPES
                 required_effect_types = CRITICAL_EFFECT_TYPES
-            except Exception:
-                # 兜底:effect_receipts 不可用时返回空列表(不阻断)
-                return []
+            except Exception as e:
+                raise AppError(
+                    ErrorCodes.OUTBOX_PROVIDER_REGISTRY_LOAD_FAILED,
+                    params={
+                        "reason": (
+                            f"CRITICAL_EFFECT_TYPES import failed: "
+                            f"{type(e).__name__}: {e}"
+                        ),
+                    },
+                ) from e
         if self.provider_registry is None:
             # test_mode 下允许 None,但 validate_providers 仍报告所有 type 缺失
             return list(required_effect_types)
@@ -1316,32 +1393,40 @@ class OutboxWorker:
     async def run_once(self) -> dict:
         """拉取一批 outbox_events 并调用 provider 处理。
 
-        R63 P0-05 整改:
-        - ``provider_registry is None`` 且 ``test_mode=False`` → raise RuntimeError
-          (fail-fast,防 stub 误启动把外部副作用永久标记完成)。
-        - ``test_mode=True`` 且 ``provider_registry=None`` → stub 模式(仅 claim
-          + complete,用于测试 lease 流转,不产生真实外部副作用)。
-        - provider 调用签名: ``await provider(payload_json, request_hash,
-          idempotency_key) -> external_id``。``idempotency_key`` 形如
-          ``"{action_id}:{request_hash}"``,provider 必须基于此键去重。
+        R64 P0-04 整改(生产闭环):
+        - ``provider_registry is None`` 一律 raise
+          ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``,不论 ``test_mode``
+          如何。生产构建从代码层移除 no-provider-complete 分支;测试注入独立
+          fake provider,不允许 worker 静默完成外部副作用。
+        - provider 调用签名: ``await provider(OutboxEnvelope) -> external_id``。
+          provider 接收 immutable 信封,基于 ``idempotency_key`` 在外部系统去重。
         - ``complete_outbox_event`` 传入 ``lease_owner`` + ``request_hash`` +
-          ``external_id``,触发 CAS ``WHERE status='in_flight' AND lease_owner=?
-          AND request_hash=?``(防越权 complete / 错配事件)。
+          ``lease_version`` + ``external_id``,触发四字段 CAS
+          ``WHERE status='in_flight' AND lease_owner=? AND request_hash=?
+          AND lease_version=?``(防越权 complete / 错配 / ABA)。
+        - provider 调用期间自动续租(lease 剩余 < 1/3 即续租),续租失败立即
+          停止提交结果(raise ``AppError(OUTBOX_LEASE_RENEW_FAILED)``)。
+        - 未知 event_type / 无 provider → DLQ + ``logger.error`` 告警 +
+          ``outbox_dlq_audit`` 审计记录(可审批 replay),严禁标记成功。
 
         Returns:
             {claimed: int, completed: int, failed: int, dlq: int}
 
         Raises:
             AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED): ``provider_registry is None``
-                且 ``test_mode=False``(生产模式 fail-fast,防止 stub 误启动)
+                (不论 test_mode,R64 P0-04 移除 stub 分支)
+            AppError(OUTBOX_LEASE_RENEW_FAILED): 自动续租失败(立即停止提交结果)
         """
-        # R63 P0-05: fail-fast — 生产模式禁止无 provider 的 stub 运行
-        if self.provider_registry is None and not self.test_mode:
+        # R64 P0-04: fail-fast — 不论 test_mode,无 provider 一律拒绝
+        # (生产构建从代码层移除 no-provider-complete 分支;
+        #  测试注入独立 fake provider,不依赖 test_mode 绕过)
+        if self.provider_registry is None:
             raise AppError(
                 ErrorCodes.OUTBOX_PROVIDER_REGISTRY_REQUIRED,
                 params={
                     "reason": "stub worker must not silently complete external "
-                              "side effects; pass test_mode=True explicitly for tests"
+                              "side effects; inject a fake provider for tests "
+                              "(test_mode no longer bypasses provider requirement)"
                 },
             )
         store = get_cache_store()
@@ -1358,64 +1443,260 @@ class OutboxWorker:
         failed = 0
         dlq = 0
         for ev in events:
-            event_id = ev["id"]
-            effect_type = ev["effect_type"]
-            payload_json = ev.get("payload_json", "")
-            # R63 P0-05: 从 outbox event 读取 request_hash(CAS complete 必须传入)
-            request_hash = ev.get("request_hash", "") or ""
-            action_id = ev.get("action_id", "") or ""
-            # R63 P0-05: idempotency_key = action_id:request_hash,
-            # provider 基于此键去重(同一逻辑副作用多次重试只执行一次)
-            idempotency_key = f"{action_id}:{request_hash}" if action_id else request_hash
-            # Stub 模式(仅 test_mode=True 时可达):
-            # 无 provider_registry → 直接 complete(用于测试 lease 流转)
-            if self.provider_registry is None:
-                # R63 P0-05: complete 传入 lease_owner + request_hash 触发 CAS
-                await store.complete_outbox_event(
-                    event_id,
-                    external_id="",
-                    lease_owner=self.lease_owner,
-                    request_hash=request_hash,
-                )
+            outcome = await self.process_event(ev, store)
+            if outcome == "completed":
                 completed += 1
-                continue
-            provider = self.provider_registry.get(effect_type)
-            if provider is None:
-                # 无对应 provider → 永久失败,直接进 DLQ
-                await store.move_outbox_to_dlq(
-                    event_id, reason=f"no_provider_for_effect_type:{effect_type}",
-                )
+            elif outcome == "dlq":
                 dlq += 1
-                continue
-            try:
-                # R63 P0-05: provider 签名扩展为 (payload_json, request_hash,
-                # idempotency_key) -> external_id,强制 provider 实现幂等
-                _external_id = await provider(
-                    payload_json, request_hash, idempotency_key,
-                )
-                # R63 P0-05: CAS complete — lease_owner + request_hash 双重校验,
-                # 同时保存 external_id(供事后对账与人工重放)
-                await store.complete_outbox_event(
-                    event_id,
-                    external_id=str(_external_id) if _external_id is not None else "",
-                    lease_owner=self.lease_owner,
-                    request_hash=request_hash,
-                )
-                completed += 1
-            except Exception as prov_err:
-                result = await store.fail_outbox_event(
-                    event_id, error_msg=str(prov_err),
-                )
-                if result == "dlq":
-                    dlq += 1
-                else:
-                    failed += 1
+            else:
+                failed += 1
         return {
             "claimed": len(events),
             "completed": completed,
             "failed": failed,
             "dlq": dlq,
         }
+
+    async def _maybe_renew_lease(
+        self,
+        store,
+        event_id: int,
+        request_hash: str,
+        lease_version: int,
+        lease_expires_at: str,
+    ) -> tuple[bool, int, str]:
+        """R64 P0-04: 检查 lease 剩余时间,不足 1/3 即自动续租。
+
+        provider 调用超过租期三分之一即自动续租;续租失败立即停止提交结果。
+        续租成功后 lease_version += 1(renew_outbox_lease CAS 递增)。
+
+        Args:
+            store: CacheStore
+            event_id: outbox_events.id
+            request_hash: CAS 必须匹配
+            lease_version: 当前 fencing token(renew CAS 必须匹配)
+            lease_expires_at: 当前 lease 过期时间(ISO 字符串)
+
+        Returns:
+            (renewed, new_lease_version, new_lease_expires_at):
+            renewed=True 表示触发了续租(版本号递增);
+            renewed=False 表示无需续租(剩余时间充足)
+
+        Raises:
+            AppError(OUTBOX_LEASE_RENEW_FAILED): 续租失败(lease 已被回收 /
+                调用方非持有者 / 版本不匹配)→ 立即停止提交结果
+        """
+        if not lease_expires_at:
+            return (False, lease_version, lease_expires_at)
+        try:
+            lease_until = _dt.datetime.fromisoformat(lease_expires_at)
+        except (ValueError, TypeError):
+            return (False, lease_version, lease_expires_at)
+        now = _dt.datetime.utcnow()
+        remaining = (lease_until - now).total_seconds()
+        # R64 P0-04: lease 剩余 < 租期 1/3 即续租
+        if remaining >= self.lease_duration_seconds / 3:
+            return (False, lease_version, lease_expires_at)
+        renewed = await store.renew_outbox_lease(
+            event_id,
+            lease_owner=self.lease_owner,
+            request_hash=request_hash,
+            lease_version=lease_version,
+            lease_duration_seconds=self.lease_duration_seconds,
+        )
+        if not renewed:
+            # 续租失败立即停止提交结果(防 lease 被回收后双重执行)
+            raise AppError(
+                ErrorCodes.OUTBOX_LEASE_RENEW_FAILED,
+                params={
+                    "event_id": event_id,
+                    "reason": (
+                        f"lease renew failed (lease_version={lease_version}, "
+                        f"remaining={remaining:.1f}s < "
+                        f"threshold={self.lease_duration_seconds / 3:.1f}s); "
+                        f"lease may have been reclaimed by another worker"
+                    ),
+                },
+            )
+        # 续租成功:lease_version 递增(renew_outbox_lease 内部 +1),
+        # 新 lease_expires_at = now + lease_duration
+        new_lease_version = lease_version + 1
+        new_lease_expires_at = (
+            _dt.datetime.utcnow()
+            + _dt.timedelta(seconds=self.lease_duration_seconds)
+        ).isoformat()
+        return (True, new_lease_version, new_lease_expires_at)
+
+    async def process_event(self, ev: dict, store) -> str:
+        """R64 P0-04: 处理单个 outbox 事件(claim 后调用 provider)。
+
+        流程:
+        1. 构建 immutable ``OutboxEnvelope``(provider 接收信封,基于
+           idempotency_key 去重)。
+        2. 查找 provider;无 provider / 未知 event_type → DLQ + 告警 +
+           审计记录(严禁标记成功)。
+        3. provider 调用期间并发运行续租 watchdog:lease 剩余 < 1/3 即续租,
+           续租失败立即停止提交结果(raise AppError)。
+        4. provider 成功 → complete(四字段 CAS:owner+version+hash);
+           provider 失败 → fail(四字段 CAS,超限进 DLQ)。
+
+        Args:
+            ev: claim_outbox_events 返回的事件 dict(含 lease_version)
+            store: CacheStore
+
+        Returns:
+            'completed' / 'failed' / 'dlq'
+
+        Raises:
+            AppError(OUTBOX_LEASE_RENEW_FAILED): 续租失败(立即停止提交结果)
+        """
+        event_id = ev["id"]
+        effect_type = ev["effect_type"]
+        payload_json = ev.get("payload_json", "") or ""
+        request_hash = ev.get("request_hash", "") or ""
+        action_id = ev.get("action_id", "") or ""
+        target = ev.get("target", "") or ""
+        # R64 P0-04: 从 claim 结果读取 lease_version(fencing token)
+        lease_version = int(ev.get("lease_version", 0) or 0)
+        lease_expires_at = ev.get("lease_expires_at", "") or ""
+        # idempotency_key = action_id:request_hash(provider 去重键)
+        idempotency_key = (
+            f"{action_id}:{request_hash}" if action_id else request_hash
+        )
+        # R64 P0-04: 构建 immutable OutboxEnvelope
+        try:
+            payload_obj: Mapping[str, Any] = (
+                json.loads(payload_json) if payload_json else {}
+            )
+        except Exception:
+            payload_obj = {}
+        payload_digest = hashlib.sha256(
+            (payload_json or "").encode("utf-8", errors="replace")
+        ).hexdigest()
+        envelope = OutboxEnvelope(
+            event_id=event_id,
+            effect_type=effect_type,
+            target=target,
+            request_hash=request_hash,
+            idempotency_key=idempotency_key,
+            payload_digest=payload_digest,
+            payload=payload_obj,
+        )
+
+        provider = self.provider_registry.get(effect_type)
+        if provider is None:
+            # R64 P0-04: 无 provider / 未知 event_type → DLQ(严禁标记成功)
+            # move_outbox_to_dlq 同步写入 outbox_dlq_audit 审计记录(可审批 replay)
+            reason = f"no_provider_for_effect_type:{effect_type}"
+            await store.move_outbox_to_dlq(event_id, reason=reason)
+            # 告警(DLQ 必须告警 + 可审批 replay)
+            logger.error(
+                f"[OutboxWorker] DLQ event_id={event_id} "
+                f"effect_type={effect_type} reason={reason} "
+                f"(moved to outbox_dlq_audit for approvable replay)"
+            )
+            return "dlq"
+
+        # R64 P0-04: provider 调用期间并发续租 watchdog
+        # lease_version_box / lease_expires_at_box: mutable,watchdog 续租成功后更新
+        lease_version_box = [lease_version]
+        lease_expires_at_box = [lease_expires_at]
+
+        async def _renewal_watchdog():
+            # 续租检查间隔 = lease_duration / 6(在 1/3 阈值前主动检查)
+            interval = max(self.lease_duration_seconds / 6, 0.05)
+            while True:
+                try:
+                    await asyncio.sleep(interval)
+                except asyncio.CancelledError:
+                    return
+                renewed, new_lv, new_exp = await self._maybe_renew_lease(
+                    store, event_id, request_hash,
+                    lease_version_box[0], lease_expires_at_box[0],
+                )
+                if renewed:
+                    lease_version_box[0] = new_lv
+                    lease_expires_at_box[0] = new_exp
+
+        watchdog_task = asyncio.create_task(_renewal_watchdog())
+        external_id: Any = None
+        provider_failed = False
+        prov_err: BaseException = Exception("provider not invoked")
+        try:
+            provider_task = asyncio.create_task(provider(envelope))
+            done, _pending = await asyncio.wait(
+                {provider_task, watchdog_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if watchdog_task in done and not provider_task.done():
+                # watchdog 抛出(续租失败)→ 取消 provider,重新抛出 AppError
+                provider_task.cancel()
+                # watchdog_task.result() 重新抛出 AppError(OUTBOX_LEASE_RENEW_FAILED)
+                await watchdog_task
+                # 若 watchdog 正常返回(不应发生),兜底抛错
+                raise AppError(
+                    ErrorCodes.OUTBOX_LEASE_RENEW_FAILED,
+                    params={
+                        "event_id": event_id,
+                        "reason": "renewal watchdog exited unexpectedly",
+                    },
+                )
+            # provider 完成(正常或异常)
+            external_id = provider_task.result()
+        except AppError:
+            # 续租失败 AppError 透传(立即停止提交结果)
+            if not watchdog_task.done():
+                watchdog_task.cancel()
+            raise
+        except Exception as e:
+            # provider 抛异常 → 标记失败(不停止整批,仅本事件 fail)
+            provider_failed = True
+            prov_err = e
+        finally:
+            if not watchdog_task.done():
+                watchdog_task.cancel()
+                try:
+                    await watchdog_task
+                except asyncio.CancelledError:
+                    logger.debug("[Outbox] watchdog task 已取消(预期行为)")
+                except Exception as e:
+                    logger.debug(f"[Outbox] watchdog 取消时发生异常(可忽略): {e}")
+
+        if provider_failed:
+            # R64 P0-04: fail 使用四字段 CAS(lease_version)
+            result = await store.fail_outbox_event(
+                event_id,
+                error_msg=str(prov_err),
+                lease_owner=self.lease_owner,
+                request_hash=request_hash,
+                lease_version=lease_version_box[0],
+            )
+            if result == "dlq":
+                logger.error(
+                    f"[OutboxWorker] DLQ event_id={event_id} "
+                    f"effect_type={effect_type} reason=provider_failed_over_limit "
+                    f"error={prov_err}"
+                )
+                return "dlq"
+            return "failed"
+
+        # R64 P0-04: complete 使用四字段 CAS(lease_version fencing token)
+        ok = await store.complete_outbox_event(
+            event_id,
+            external_id=str(external_id) if external_id is not None else "",
+            lease_owner=self.lease_owner,
+            request_hash=request_hash,
+            lease_version=lease_version_box[0],
+        )
+        if not ok:
+            # CAS 失败(lease 已被回收 / 版本不匹配)→ 本事件失败,不停止整批
+            logger.error(
+                f"[OutboxWorker] complete CAS failed event_id={event_id} "
+                f"effect_type={effect_type} lease_version={lease_version_box[0]} "
+                f"(lease may have been reclaimed)"
+            )
+            return "failed"
+        return "completed"
 
 
 async def export_user_data(user_id: int) -> dict:

@@ -1025,16 +1025,26 @@ class TestExecuteHighRiskCommandUowOutboxIntegration:
 # ════════════════════════════════════════════════════════════════
 
 class TestOutboxWorkerStub:
-    """R62 P0-05: OutboxWorker 桩 —— run_once 在 stub 模式下 complete 事件。"""
+    """R62 P0-05 + R64 P0-04: OutboxWorker —— run_once 调用 provider complete 事件。
+
+    R64 P0-04: stub 模式已移除,测试注入独立 fake provider(基于 OutboxEnvelope)。
+    """
 
     @pytest.mark.asyncio
     async def test_outbox_worker_run_once_no_events_returns_zero(self, real_store):
-        """无 pending 事件 → run_once 返回全 0。"""
-        from services.data_lifecycle import OutboxWorker
-        # R63 P0-05: provider_registry=None 必须显式 test_mode=True
-        # (生产模式 fail-fast 防止 stub 误启动)
+        """无 pending 事件 → run_once 返回全 0。
+
+        R64 P0-04: provider_registry=None 一律 raise;测试注入 fake provider
+        以通过 fail-fast 检查(无 pending 时不会调用 provider)。
+        """
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
+
+        async def _fake_provider(envelope: OutboxEnvelope):
+            return "ext"
+
         worker = OutboxWorker(
-            lease_owner="worker_test", batch_size=10, test_mode=True,
+            lease_owner="worker_test", batch_size=10,
+            provider_registry={"telegram_message": _fake_provider},
         )
         result = await worker.run_once()
         assert result["claimed"] == 0
@@ -1044,8 +1054,18 @@ class TestOutboxWorkerStub:
 
     @pytest.mark.asyncio
     async def test_outbox_worker_run_once_stub_mode_completes(self, real_store):
-        """stub 模式(provider_registry=None + test_mode=True)→ claim 后直接 complete。"""
-        from services.data_lifecycle import OutboxWorker
+        """R64 P0-04: fake provider 模式 → claim + 调用 provider + complete。
+
+        旧 R63 stub 模式(provider_registry=None + test_mode=True)直接 complete;
+        R64 P0-04 整改:stub 分支删除,测试注入 fake provider 完成事件,
+        provider 接收 immutable OutboxEnvelope。
+        """
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
+
+        async def _fake_provider(envelope: OutboxEnvelope):
+            assert isinstance(envelope, OutboxEnvelope)
+            return f"ext_{envelope.event_id}"
+
         # 准备 3 条 pending 事件
         for i in range(3):
             await real_store.add_outbox_event(
@@ -1055,9 +1075,9 @@ class TestOutboxWorkerStub:
                 request_hash=f"rh_ow_{i}" + "0" * 56,
                 payload_json=json.dumps({"idx": i}),
             )
-        # R63 P0-05: stub 模式必须显式 test_mode=True
         worker = OutboxWorker(
-            lease_owner="worker_stub", batch_size=10, test_mode=True,
+            lease_owner="worker_stub", batch_size=10,
+            provider_registry={"telegram_message": _fake_provider},
         )
         result = await worker.run_once()
         assert result["claimed"] == 3
@@ -1103,10 +1123,10 @@ class TestOutboxWorkerStub:
     @pytest.mark.asyncio
     async def test_outbox_worker_run_once_provider_failure_fail_event(self, real_store):
         """provider 抛异常 → fail_outbox_event(attempt < max → retryable)。"""
-        from services.data_lifecycle import OutboxWorker
+        from services.data_lifecycle import OutboxEnvelope, OutboxWorker
 
-        # R63 P0-05: provider 签名扩展为 (payload_json, request_hash, idempotency_key)
-        async def _failing_provider(payload_json, request_hash, idempotency_key):
+        # R64 P0-04: provider 签名扩展为 (OutboxEnvelope)
+        async def _failing_provider(envelope: OutboxEnvelope):
             raise RuntimeError("provider boom")
 
         await real_store.add_outbox_event(

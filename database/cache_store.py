@@ -208,8 +208,8 @@ def _generate_version_from_payload(table_name: str, payload) -> int:
                         return int(ts_val)
                 except (ValueError, TypeError):
                     pass
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
     # fallback 到当前时间戳(秒)
     return int(time.time())
 
@@ -886,22 +886,22 @@ class CacheStore:
             await self._db.execute(
                 "ALTER TABLE dirty_outbox ADD COLUMN local_only INTEGER DEFAULT 0"
             )
-        except Exception:
-            pass  # 列已存在,忽略
+        except Exception as e:
+            logger.debug(f"[CacheStore] 操作失败(非致命) (列已存在,忽略): {e}")
         # R51 P0-9: 为 dirty_outbox 表添加 last_error + next_retry_at 列(指数退避)
         # DLQ 写入失败时记录错误信息并设置下次重试时间,支持指数退避重试
         try:
             await self._db.execute(
                 "ALTER TABLE dirty_outbox ADD COLUMN last_error TEXT"
             )
-        except Exception:
-            pass  # 列已存在,忽略
+        except Exception as e:
+            logger.debug(f"[CacheStore] 操作失败(非致命) (列已存在,忽略): {e}")
         try:
             await self._db.execute(
                 "ALTER TABLE dirty_outbox ADD COLUMN next_retry_at TEXT"
             )
-        except Exception:
-            pass  # 列已存在,忽略
+        except Exception as e:
+            logger.debug(f"[CacheStore] 操作失败(非致命) (列已存在,忽略): {e}")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_dirty_outbox_unprocessed ON dirty_outbox(processed)"
         )
@@ -972,8 +972,8 @@ class CacheStore:
         ]:
             try:
                 await self._db.execute(_col_ddl_p0_6)
-            except Exception:
-                pass  # 列已存在,忽略
+            except Exception as e:
+                logger.debug(f"[CacheStore] 操作失败(非致命) (列已存在,忽略): {e}")
 
         # ─── R40 P0-4: pending_uploads SQLite 本地权威表 ───
         # Up Bot 双写(CRDB + SQLite local),Idx Bot 仅从 SQLite 读取,
@@ -1613,6 +1613,9 @@ class CacheStore:
                 max_attempts    INTEGER NOT NULL DEFAULT 3,
                 last_error      TEXT,
                 external_id     TEXT,
+                lease_version   INTEGER NOT NULL DEFAULT 0,
+                dlq_reason      TEXT,
+                dlq_at          TEXT,
                 created_at      TEXT NOT NULL,
                 updated_at      TEXT NOT NULL,
                 UNIQUE (action_id, effect_type, target, request_hash)
@@ -1628,6 +1631,67 @@ class CacheStore:
             logger.debug(
                 f"[CacheStore] outbox_events ADD external_id (幂等,可忽略): {_e_ob_ext_id}"
             )
+        # R64 P0-04: 旧 schema 无 lease_version / dlq_reason / dlq_at 列,
+        # 幂等补列(fencing token + DLQ 审计字段;已存在则忽略)
+        # lease_version: fencing token,claim CAS WHERE lease_version=0,
+        #   complete/fail/renew 必须 CAS event_id+owner+lease_version+request_hash
+        for _ob_col, _ob_def in (
+            ("lease_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("dlq_reason", "TEXT"),
+            ("dlq_at", "TEXT"),
+        ):
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE outbox_events ADD COLUMN {_ob_col} {_ob_def}"
+                )
+            except Exception as _e_ob_col:
+                logger.debug(
+                    f"[CacheStore] outbox_events ADD {_ob_col} (幂等,可忽略): {_e_ob_col}"
+                )
+        # R64 P0-04: 回填旧行 lease_version=0(DEFENSIVE — DEFAULT 已覆盖,
+        # 但 ALTER TABLE ADD COLUMN ... NOT NULL DEFAULT 0 在某些 SQLite 版本
+        # 对旧行可能留 NULL,显式 UPDATE 确保非 NULL 以满足 NOT NULL 约束)
+        try:
+            await self._db.execute(
+                "UPDATE outbox_events SET lease_version=0 "
+                "WHERE lease_version IS NULL"
+            )
+        except Exception as _e_ob_lv:
+            logger.debug(
+                f"[CacheStore] outbox_events backfill lease_version (忽略): {_e_ob_lv}"
+            )
+        # R64 P0-04: outbox_dlq_audit 表 — DLQ 可审批 replay 审计记录
+        # 独立于 outbox_events(后者进 DLQ 后状态冻结),审计记录支持人工审批 replay
+        await self._db.execute(
+            """CREATE TABLE IF NOT EXISTS outbox_dlq_audit (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id        INTEGER NOT NULL,
+                action_id       TEXT NOT NULL,
+                effect_type     TEXT NOT NULL,
+                target          TEXT NOT NULL,
+                request_hash    TEXT NOT NULL,
+                payload_json    TEXT NOT NULL,
+                dlq_reason      TEXT NOT NULL,
+                dlq_at          TEXT NOT NULL,
+                lease_owner     TEXT,
+                lease_version   INTEGER,
+                attempt_count   INTEGER,
+                replay_status   TEXT NOT NULL DEFAULT 'pending'
+                                CHECK (replay_status IN ('pending', 'approved', 'rejected', 'replayed')),
+                replayed_at     TEXT,
+                replayed_by     TEXT,
+                replay_note     TEXT,
+                created_at      TEXT NOT NULL
+            )"""
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_dlq_audit_replay_status "
+            "ON outbox_dlq_audit(replay_status)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outbox_dlq_audit_event_id "
+            "ON outbox_dlq_audit(event_id)"
+        )
         # partial index: 仅 pending 行参与 lease claim,减少索引扫描成本
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_outbox_events_pending "
@@ -1685,8 +1749,8 @@ class CacheStore:
                     await self._db.execute(
                         "ALTER TABLE mfa_failures RENAME TO mfa_failures_old"
                     )
-                except Exception:
-                    pass  # mfa_failures_old 已存在或重命名失败,忽略
+                except Exception as e:
+                    logger.debug(f"[CacheStore] 操作失败(非致命) (mfa_failures_old 已存在或重命名失败,忽略): {e}")
                 # 2. 创建新 schema 的 mfa_failures 表
                 await self._db.execute(
                     """CREATE TABLE IF NOT EXISTS mfa_failures (
@@ -1875,9 +1939,9 @@ class CacheStore:
                 await self._db.execute(
                     f"ALTER TABLE button_tokens ADD COLUMN {_col} TEXT"
                 )
-            except Exception:
+            except Exception as e:
                 # 列已存在则忽略(aiosqlite OperationalError)
-                pass
+                logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_button_tokens_principal "
             "ON button_tokens(principal_id)"
@@ -1890,11 +1954,15 @@ class CacheStore:
         # ─── R63 P1-01: restore_capability_nonces 表 — 恢复能力令牌 nonce 持久化消费 ───
         # 替代原进程内 _CONSUMED_NONCES set(R62 P0-01),实现跨进程/重启/worker 切换的
         # 防重放保护。nonce PRIMARY KEY + INSERT OR IGNORE 实现原子 CAS:
-        #   - consume_capability_nonce(): INSERT OR IGNORE,rowcount==1 表示本调用方赢得竞态
-        #     (nonce 之前未被消费),rowcount==0 表示 nonce 已被消费(重放攻击或竞态失败)
-        #   - is_capability_nonce_consumed(): SELECT 检查不消费(用于预检)
-        # 唯一键绑定: nonce(PK) + backup_id + manifest_sha256 + payload_digest,
+        #   - consume_capability_nonce(): CAS UPDATE reserved→consumed,rowcount==1
+        #     表示本调用方赢得竞态;rowcount==0 表示 nonce 不在 reserved 状态
+        #     (已 consumed/failed/不存在)
+        #   - is_capability_nonce_consumed(): SELECT status='consumed' 检查(不消费,仅查询)
+        #   - reserve_capability_nonce(): INSERT status='reserved'(R64 P1-02 状态机)
+        #   - fail_capability_nonce(): CAS UPDATE reserved→failed
+        # 唯一键绑定: nonce(PK) + operation_id + backup_id + manifest_sha256 + payload_digest,
         # 任一字段不匹配的"重放"尝试即使伪造 nonce 也会因绑定字段不一致被审计捕获。
+        # R64 P1-02: nonce 状态机 reserved→consumed|failed,允许 restore 失败后同 operation 重试。
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS restore_capability_nonces (
                 nonce           TEXT PRIMARY KEY,
@@ -1902,12 +1970,57 @@ class CacheStore:
                 manifest_sha256 TEXT NOT NULL,
                 payload_digest  TEXT NOT NULL,
                 consumed_at     TEXT NOT NULL,
-                consumed_by     TEXT
+                consumed_by     TEXT,
+                operation_id    TEXT,
+                status          TEXT NOT NULL DEFAULT 'consumed',
+                reserved_at     TEXT,
+                reserved_by     TEXT,
+                failed_at       TEXT,
+                failure_reason  TEXT
             )"""
         )
+        # R64 P1-02: 旧表(无 operation_id/status/reserved_at/reserved_by/failed_at/failure_reason 列)
+        # 需要 ALTER TABLE 补列(CREATE TABLE IF NOT EXISTS 不会修改已存在的表)
+        # 使用 PRAGMA table_info 检测列是否存在,缺失则 ALTER TABLE ADD COLUMN
+        try:
+            cursor = await self._db.execute(
+                "PRAGMA table_info(restore_capability_nonces)"
+            )
+            existing_cols = {row[1] for row in await cursor.fetchall()}
+            _new_cols = {
+                "operation_id": "TEXT",
+                "status": "TEXT NOT NULL DEFAULT 'consumed'",
+                "reserved_at": "TEXT",
+                "reserved_by": "TEXT",
+                "failed_at": "TEXT",
+                "failure_reason": "TEXT",
+            }
+            for col_name, col_type in _new_cols.items():
+                if col_name not in existing_cols:
+                    await self._db.execute(
+                        f"ALTER TABLE restore_capability_nonces "
+                        f"ADD COLUMN {col_name} {col_type}"
+                    )
+                    logger.debug(
+                        f"[CacheStore] R64 P1-02: restore_capability_nonces "
+                        f"ALTER ADD COLUMN {col_name} {col_type}"
+                    )
+        except Exception as e:
+            logger.debug(
+                f"[CacheStore] restore_capability_nonces ALTER 升级(可忽略): {e}"
+            )
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_restore_nonces_backup_id "
             "ON restore_capability_nonces(backup_id)"
+        )
+        # R64 P1-02: operation_id / status 索引(支持按 operation / 状态查询审计)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_restore_nonces_operation_id "
+            "ON restore_capability_nonces(operation_id)"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_restore_nonces_status "
+            "ON restore_capability_nonces(status)"
         )
 
         await self._db.commit()
@@ -1972,9 +2085,9 @@ class CacheStore:
         try:
             from services.replication_policy import is_local_only as _policy_is_local_only
             _is_local_only_table = _policy_is_local_only(table_name)
-        except Exception:
+        except Exception as e:
             # replication_policy 模块不可用时降级,按普通表处理(不预标记)
-            pass
+            logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
 
         # R41 P0-6: 预设 processed + local_only 列值
         # local_only 表: processed=1, local_only=1(预标记为已处理)
@@ -2031,8 +2144,8 @@ class CacheStore:
             # 自动 commit 模式下失败时回滚并抛出
             try:
                 await self._db.rollback()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
             raise
 
     @asynccontextmanager
@@ -2179,11 +2292,19 @@ class CacheStore:
         lease_duration_seconds: int = 60,
         limit: int = 10,
     ) -> list[dict]:
-        """R62 P0-05: 原子认领 pending outbox_events lease(CAS UPDATE)。
+        """R62 P0-05 + R64 P0-04: 原子认领 pending outbox_events lease(CAS UPDATE)。
 
-        通过 ``UPDATE ... WHERE status='pending' ... RETURNING`` 原子地将
-        pending 行转为 in_flight 并设置 lease_owner / lease_expires_at,
-        防止多 worker 并发拉取同一行(分布式 lease 语义)。
+        通过 ``UPDATE ... WHERE status='pending' AND lease_version=0`` 原子地将
+        pending 行转为 in_flight 并设置 lease_owner / lease_expires_at /
+        lease_version=1(fencing token),防止多 worker 并发拉取同一行
+        (分布式 lease 语义)。
+
+        R64 P0-04 整改(lease fencing token):
+        - 旧 CAS 仅 ``status='pending'``,无版本号,长 provider 调用期间 lease
+          被回收后旧持有者仍可 complete(ABA / 双重执行)。
+        - 新 CAS 增加 ``AND lease_version=0``(pending 行版本号为 0),
+          认领成功后 ``lease_version=1``。后续 complete/fail/renew 必须 CAS
+          携带正确 ``lease_version``,版本不匹配即拒绝(防 ABA)。
 
         Args:
             lease_owner: worker 标识(hostname:pid)
@@ -2191,7 +2312,8 @@ class CacheStore:
             limit: 最多认领的行数
 
         Returns:
-            认领成功的 outbox 事件列表(含完整字段),空列表表示无可认领事件
+            认领成功的 outbox 事件列表(含完整字段 + lease_version),空列表
+            表示无可认领事件
         """
         if not self._db:
             return []
@@ -2202,16 +2324,17 @@ class CacheStore:
         now_iso = now.isoformat()
         # SQLite < 3.35 不支持 RETURNING;aiosqlite 通常基于较新 SQLite,
         # 但为兼容性使用两步:先 UPDATE 再 SELECT by lease_owner。
-        # CAS 条件: status='pending'(未被认领) — 不回收过期 lease
-        # (过期 lease 回收由独立 reconcile 流程处理,避免 claim 路径复杂化)。
+        # R64 P0-04 CAS 条件: status='pending' AND lease_version=0
+        # (lease_version=0 表示未被认领;claim 后递增到 1)。
+        # 过期 lease 回收由独立 reconcile 流程处理,避免 claim 路径复杂化。
         try:
             cursor = await self._db.execute(
                 "UPDATE outbox_events "
                 "SET status='in_flight', lease_owner=?, lease_expires_at=?, "
-                "attempt_count=attempt_count+1, updated_at=? "
+                "attempt_count=attempt_count+1, lease_version=1, updated_at=? "
                 "WHERE id IN ("
                 "  SELECT id FROM outbox_events "
-                "  WHERE status='pending' "
+                "  WHERE status='pending' AND lease_version=0 "
                 "  ORDER BY created_at ASC LIMIT ?"
                 ")",
                 (lease_owner, lease_expires, now_iso, limit),
@@ -2224,7 +2347,8 @@ class CacheStore:
             cursor = await self._db.execute(
                 "SELECT id, action_id, effect_type, target, request_hash, "
                 "payload_json, status, lease_owner, lease_expires_at, "
-                "attempt_count, max_attempts, last_error, created_at, updated_at "
+                "attempt_count, max_attempts, last_error, created_at, updated_at, "
+                "lease_version "
                 "FROM outbox_events "
                 "WHERE lease_owner=? AND status='in_flight' "
                 "ORDER BY created_at ASC",
@@ -2238,6 +2362,7 @@ class CacheStore:
                     "status": r[6], "lease_owner": r[7], "lease_expires_at": r[8],
                     "attempt_count": r[9], "max_attempts": r[10],
                     "last_error": r[11], "created_at": r[12], "updated_at": r[13],
+                    "lease_version": r[14],
                 }
                 for r in rows
             ]
@@ -2245,8 +2370,8 @@ class CacheStore:
             logger.error(f"[CacheStore] claim_outbox_events 失败: {e}")
             try:
                 await self._db.rollback()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
             return []
 
     async def complete_outbox_event(
@@ -2256,10 +2381,11 @@ class CacheStore:
         external_id: str = "",
         lease_owner: str = "",
         request_hash: str = "",
+        lease_version: Any = None,
         connection: Any = None,
         tx: Any = None,
     ) -> bool:
-        """R62 P0-05 + R63 P0-05: 标记 outbox_event 为 completed(CAS 双重校验)。
+        """R62 P0-05 + R63 P0-05 + R64 P0-04: 标记 outbox_event 为 completed(CAS)。
 
         R63 P0-05 整改(防止 stub worker 误完成非己事件):
         - 旧 SQL 仅 ``WHERE id=? AND status='in_flight'``,任何拿到 event_id 的
@@ -2271,16 +2397,26 @@ class CacheStore:
         - 同时保存 ``external_id``(provider 返回的外部系统标识,如 telegram
           message_id / r2 object key),用于事后对账与人工重放。
 
+        R64 P0-04 整改(lease fencing token):
+        - 新增 ``lease_version`` 参数:complete 必须 CAS 携带正确版本号,
+          防御 ABA(worker A 持有 v1 → lease 过期被回收 → worker B claim 升级
+          v2 → worker A 残留调用 complete 仍匹配 owner+hash,误完成 B 的事件)。
+        - ``lease_version is not None`` 时 CAS 增加 ``AND lease_version=?``
+          (生产 worker 必须传入,OutboxWorker.run_once 已强制传入)。
+        - ``lease_version is None`` 时回退到 R63 三字段 CAS(向后兼容旧调用方 /
+          测试场景,但生产路径必须传 lease_version)。
+
         Args:
             event_id: outbox_events.id
             external_id: provider 返回的外部系统标识(telegram message_id / r2 key 等)
             lease_owner: 必须与 claim 时设置的 lease_owner 一致(防越权 complete)
             request_hash: 必须与 outbox event 的 request_hash 一致(防错配)
+            lease_version: 必须与 claim/renew 后的 lease_version 一致(fencing token)
             connection / tx: 可选事务连接(与 effect_receipts 原子提交)
 
         Returns:
             True 表示 CAS 成功;False 表示行不存在 / 状态非 in_flight /
-            lease_owner 不匹配 / request_hash 不匹配
+            lease_owner 不匹配 / request_hash 不匹配 / lease_version 不匹配
         """
         if tx is not None:
             connection = tx
@@ -2288,10 +2424,20 @@ class CacheStore:
         if db is None:
             return False
         now = datetime.datetime.utcnow().isoformat()
-        # R63 P0-05: CAS 条件 — status + lease_owner + request_hash 三重校验
-        # lease_owner / request_hash 为空时不参与 CAS(向后兼容旧调用方,
-        # 但生产 worker 必须传入两者,OutboxWorker.run_once 已强制传入)
-        if lease_owner and request_hash:
+        # R64 P0-04: 优先使用四字段 CAS(status+owner+version+hash),
+        # 防御 ABA;lease_version=None 时回退三字段(向后兼容)。
+        if lease_owner and request_hash and lease_version is not None:
+            cursor = await db.execute(
+                "UPDATE outbox_events "
+                "SET status='completed', external_id=?, last_error=NULL, "
+                "updated_at=? "
+                "WHERE id=? AND status='in_flight' "
+                "AND lease_owner=? AND request_hash=? AND lease_version=?",
+                (external_id, now, event_id, lease_owner,
+                 request_hash, int(lease_version)),
+            )
+        elif lease_owner and request_hash:
+            # R63 P0-05 三字段 CAS(向后兼容:无 lease_version 时降级)
             cursor = await db.execute(
                 "UPDATE outbox_events "
                 "SET status='completed', external_id=?, last_error=NULL, "
@@ -2319,18 +2465,30 @@ class CacheStore:
         event_id: int,
         error_msg: str,
         *,
+        lease_owner: str = "",
+        request_hash: str = "",
+        lease_version: Any = None,
         connection: Any = None,
         tx: Any = None,
     ) -> str:
-        """R62 P0-05: 标记 outbox_event 失败,分类 retryable/permanent/over-limit→DLQ。
+        """R62 P0-05 + R64 P0-04: 标记 outbox_event 失败,分类 retryable/permanent/over-limit→DLQ。
 
         CAS 语义:仅 in_flight 可记录失败。失败后:
-        - attempt_count < max_attempts → 转回 'pending' 等待重试(retryable)
+        - attempt_count < max_attempts → 转回 'pending' 等待重试(retryable),
+          同时重置 lease_version=0(让事件可被重新 claim)
         - attempt_count >= max_attempts → 转 'dlq'(permanent,需人工介入)
+
+        R64 P0-04 整改(lease fencing token):
+        - ``lease_version is not None`` 时 CAS 增加 ``AND lease_version=?``
+          (防越权 fail 非己 lease)。生产 worker 必须传入。
+        - retryable 路径重置 lease_version=0(reclaim 后可重新 claim)。
 
         Args:
             event_id: outbox_events.id
             error_msg: 错误信息(截断 500 字符)
+            lease_owner: 必须与 claim 时一致(防越权 fail)
+            request_hash: 必须与 outbox event 一致(防错配)
+            lease_version: 必须与 claim/renew 后一致(fencing token)
             connection / tx: 可选事务连接
 
         Returns:
@@ -2343,11 +2501,20 @@ class CacheStore:
             return "not_found"
         now = datetime.datetime.utcnow().isoformat()
         # 先查询当前 attempt_count / max_attempts 判断是否超限
-        cursor = await db.execute(
-            "SELECT attempt_count, max_attempts FROM outbox_events "
-            "WHERE id=? AND status='in_flight'",
-            (event_id,),
-        )
+        # R64 P0-04: lease_version CAS 校验(防越权 fail 非己 lease)
+        if lease_owner and request_hash and lease_version is not None:
+            cursor = await db.execute(
+                "SELECT attempt_count, max_attempts FROM outbox_events "
+                "WHERE id=? AND status='in_flight' "
+                "AND lease_owner=? AND request_hash=? AND lease_version=?",
+                (event_id, lease_owner, request_hash, int(lease_version)),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT attempt_count, max_attempts FROM outbox_events "
+                "WHERE id=? AND status='in_flight'",
+                (event_id,),
+            )
         row = await cursor.fetchone()
         if row is None:
             return "not_found"
@@ -2355,19 +2522,22 @@ class CacheStore:
         truncated_err = (error_msg or "")[:500]
         if attempt_count >= max_attempts:
             # 超限 → DLQ(permanent,需人工介入)
+            # R64 P0-04: 写入 dlq_reason / dlq_at 审计字段
             await db.execute(
                 "UPDATE outbox_events "
-                "SET status='dlq', last_error=?, updated_at=? "
+                "SET status='dlq', last_error=?, dlq_reason=?, dlq_at=?, "
+                "updated_at=? "
                 "WHERE id=? AND status='in_flight'",
-                (truncated_err, now, event_id),
+                (truncated_err, truncated_err, now, now, event_id),
             )
             result = "dlq"
         else:
             # 未超限 → 转回 pending 等待重试(retryable)
+            # R64 P0-04: 重置 lease_version=0(让事件可被重新 claim)
             await db.execute(
                 "UPDATE outbox_events "
                 "SET status='pending', last_error=?, lease_owner=NULL, "
-                "lease_expires_at=NULL, updated_at=? "
+                "lease_expires_at=NULL, lease_version=0, updated_at=? "
                 "WHERE id=? AND status='in_flight'",
                 (truncated_err, now, event_id),
             )
@@ -2384,11 +2554,18 @@ class CacheStore:
         connection: Any = None,
         tx: Any = None,
     ) -> bool:
-        """R62 P0-05: 显式将 outbox_event 移入 DLQ(permanent failure)。
+        """R62 P0-05 + R64 P0-04: 显式将 outbox_event 移入 DLQ(permanent failure)。
 
         与 fail_outbox_event 的超限自动 DLQ 不同,本方法用于 provider 判定为
         permanent failure(如参数非法、权限拒绝、目标不存在等不可重试错误)时
         直接进 DLQ,不消耗重试次数。
+
+        R64 P0-04 整改(DLQ 闭环):
+        - 写入 ``dlq_reason`` / ``dlq_at`` 审计字段(记录原因与时间)。
+        - 同步写入 ``outbox_dlq_audit`` 审计记录(可审批 replay):
+          包含完整 replay 上下文(payload/action/target/lease 上下文),
+          人工审批后可 replay 该事件。DLQ 仅更新状态不足以闭环,必须有
+          告警(由 OutboxWorker logger.error 触发)+ 可审批 replay 记录。
 
         Args:
             event_id: outbox_events.id
@@ -2405,17 +2582,138 @@ class CacheStore:
             return False
         now = datetime.datetime.utcnow().isoformat()
         truncated_reason = (reason or "")[:500]
+        # R64 P0-04: 先读取事件完整上下文(用于 DLQ 审计记录的可审批 replay)
+        cursor = await db.execute(
+            "SELECT action_id, effect_type, target, request_hash, payload_json, "
+            "lease_owner, lease_version, attempt_count "
+            "FROM outbox_events WHERE id=?",
+            (event_id,),
+        )
+        ev_row = await cursor.fetchone()
         cursor = await db.execute(
             "UPDATE outbox_events "
-            "SET status='dlq', last_error=?, updated_at=? "
+            "SET status='dlq', last_error=?, dlq_reason=?, dlq_at=?, updated_at=? "
             "WHERE id=? AND status IN ('pending', 'in_flight')",
-            (truncated_reason, now, event_id),
+            (truncated_reason, truncated_reason, now, now, event_id),
         )
         affected = cursor.rowcount if cursor is not None else 0
+        # R64 P0-04: 写入 outbox_dlq_audit 审计记录(可审批 replay)
+        if affected > 0 and ev_row is not None:
+            try:
+                await db.execute(
+                    "INSERT INTO outbox_dlq_audit "
+                    "(event_id, action_id, effect_type, target, request_hash, "
+                    "payload_json, dlq_reason, dlq_at, lease_owner, lease_version, "
+                    "attempt_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (event_id, ev_row[0], ev_row[1], ev_row[2], ev_row[3],
+                     ev_row[4], truncated_reason, now, ev_row[5], ev_row[6],
+                     ev_row[7], now),
+                )
+            except Exception as audit_err:
+                # 审计记录失败不应阻断 DLQ(但需告警)
+                logger.error(
+                    f"[CacheStore] outbox_dlq_audit 写入失败(event_id={event_id}): "
+                    f"{audit_err}"
+                )
         if connection is None:
             await db.commit()
         return affected > 0
 
+    async def get_outbox_dlq_audit(
+        self,
+        *,
+        replay_status: str = "pending",
+        limit: int = 100,
+    ) -> list[dict]:
+        """R64 P0-04: 查询 DLQ 审计记录(可审批 replay)。
+
+        人工审批流程通过本方法拉取 pending replay 记录,审核后调用
+        ``update_outbox_dlq_audit_replay`` 标记 approved/rejected/replayed。
+
+        Args:
+            replay_status: 审计记录状态(pending/approved/rejected/replayed)
+            limit: 单批最大条数
+
+        Returns:
+            [{id, event_id, action_id, effect_type, target, request_hash,
+              payload_json, dlq_reason, dlq_at, lease_owner, lease_version,
+              attempt_count, replay_status, replayed_at, replayed_by,
+              replay_note, created_at}, ...]
+        """
+        if not self._db:
+            return []
+        try:
+            cursor = await self._db.execute(
+                "SELECT id, event_id, action_id, effect_type, target, "
+                "request_hash, payload_json, dlq_reason, dlq_at, lease_owner, "
+                "lease_version, attempt_count, replay_status, replayed_at, "
+                "replayed_by, replay_note, created_at "
+                "FROM outbox_dlq_audit WHERE replay_status=? "
+                "ORDER BY dlq_at ASC LIMIT ?",
+                (replay_status, limit),
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "id": r[0], "event_id": r[1], "action_id": r[2],
+                    "effect_type": r[3], "target": r[4], "request_hash": r[5],
+                    "payload_json": r[6], "dlq_reason": r[7], "dlq_at": r[8],
+                    "lease_owner": r[9], "lease_version": r[10],
+                    "attempt_count": r[11], "replay_status": r[12],
+                    "replayed_at": r[13], "replayed_by": r[14],
+                    "replay_note": r[15], "created_at": r[16],
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"[CacheStore] get_outbox_dlq_audit 失败: {e}")
+            return []
+
+    async def update_outbox_dlq_audit_replay(
+        self,
+        audit_id: int,
+        *,
+        replay_status: str,
+        replayed_by: str = "",
+        replay_note: str = "",
+    ) -> bool:
+        """R64 P0-04: 更新 DLQ 审计记录的 replay 状态(人工审批闭环)。
+
+        Args:
+            audit_id: outbox_dlq_audit.id
+            replay_status: 新状态(approved/rejected/replayed)
+            replayed_by: 审批人标识
+            replay_note: 审批备注
+
+        Returns:
+            True 更新成功;False 行不存在或状态非法
+        """
+        if not self._db:
+            return False
+        if replay_status not in ("approved", "rejected", "replayed"):
+            return False
+        now = datetime.datetime.utcnow().isoformat()
+        try:
+            cursor = await self._db.execute(
+                "UPDATE outbox_dlq_audit "
+                "SET replay_status=?, replayed_at=?, replayed_by=?, "
+                "replay_note=? WHERE id=?",
+                (replay_status, now, replayed_by, replay_note, audit_id),
+            )
+            affected = cursor.rowcount if cursor is not None else 0
+            await self._db.commit()
+            return affected > 0
+        except Exception as e:
+            logger.warning(
+                f"[CacheStore] update_outbox_dlq_audit_replay 失败: {e}"
+            )
+            try:
+                await self._db.rollback()
+            except Exception as e:
+                logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
+
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def reclaim_stale_outbox_leases(
         self,
         *,
@@ -2445,6 +2743,7 @@ class CacheStore:
             cursor = await self._db.execute(
                 "UPDATE outbox_events "
                 "SET status='pending', lease_owner=NULL, lease_expires_at=NULL, "
+                "lease_version=0, "
                 "last_error=COALESCE(last_error||' | ', '') || "
                 "'lease_reclaimed_at:' || ?, updated_at=? "
                 "WHERE id IN ("
@@ -2477,24 +2776,31 @@ class CacheStore:
         *,
         lease_owner: str,
         request_hash: str,
+        lease_version: Any = None,
         lease_duration_seconds: int = 60,
     ) -> bool:
-        """R63 P0-05: 续约 lease(长 provider 调用防超时回收)。
+        """R63 P0-05 + R64 P0-04: 续约 lease(长 provider 调用防超时回收)。
 
         provider 调用耗时较长(如大文件 R2 上传)时,worker 应周期性续约 lease,
         防止 lease 超时被其它 worker 回收后造成双重执行。
 
-        CAS 条件: status='in_flight' AND lease_owner=? AND request_hash=?
-        (只有持有 lease 的 worker 才能 renew,防越权续约)。
+        R64 P0-04 整改(lease fencing token):
+        - CAS 条件升级: status='in_flight' AND lease_owner=? AND request_hash=?
+          AND lease_version=?(四字段 CAS,防越权续约 + 防 ABA)。
+        - 续约成功后 ``lease_version += 1``(每次续约递增版本号,后续 complete
+          /fail/renew 必须使用新版本号,旧持有者残留调用因版本不匹配被拒绝)。
+        - ``lease_version is None`` 时回退到 R63 三字段 CAS(向后兼容)。
 
         Args:
             event_id: outbox_events.id
             lease_owner: 必须与 claim 时一致
             request_hash: 必须与 outbox event 一致
+            lease_version: 必须与当前 lease_version 一致(fencing token)
             lease_duration_seconds: 新的 lease 超时秒数(从当前时刻起)
 
         Returns:
-            True 续约成功;False 行不存在 / lease 已被回收 / 调用方非 lease 持有者
+            True 续约成功;False 行不存在 / lease 已被回收 / 调用方非 lease 持有者 /
+            lease_version 不匹配
         """
         if not self._db:
             return False
@@ -2505,13 +2811,26 @@ class CacheStore:
         now_iso = now.isoformat()
         renewed = False
         try:
-            cursor = await self._db.execute(
-                "UPDATE outbox_events "
-                "SET lease_expires_at=?, updated_at=? "
-                "WHERE id=? AND status='in_flight' "
-                "AND lease_owner=? AND request_hash=?",
-                (new_expires, now_iso, event_id, lease_owner, request_hash),
-            )
+            # R64 P0-04: 四字段 CAS + lease_version 递增(防 ABA)
+            if lease_version is not None:
+                cursor = await self._db.execute(
+                    "UPDATE outbox_events "
+                    "SET lease_expires_at=?, lease_version=lease_version+1, "
+                    "updated_at=? "
+                    "WHERE id=? AND status='in_flight' "
+                    "AND lease_owner=? AND request_hash=? AND lease_version=?",
+                    (new_expires, now_iso, event_id, lease_owner,
+                     request_hash, int(lease_version)),
+                )
+            else:
+                # 向后兼容:R63 三字段 CAS(无 lease_version 递增)
+                cursor = await self._db.execute(
+                    "UPDATE outbox_events "
+                    "SET lease_expires_at=?, updated_at=? "
+                    "WHERE id=? AND status='in_flight' "
+                    "AND lease_owner=? AND request_hash=?",
+                    (new_expires, now_iso, event_id, lease_owner, request_hash),
+                )
             affected = cursor.rowcount if cursor is not None else 0
             await self._db.commit()
             renewed = affected > 0
@@ -2644,8 +2963,8 @@ class CacheStore:
             logger.error(f"[CacheStore] insert_pending_upload_local 失败(事务回滚): {e}")
             if self._in_writer_tx:
                 raise
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def claim_pending_uploads(self, cutoff_ts: float, limit: int = 10) -> list[dict]:
         """R40 P0-4: CAS 认领一批未处理的 pending_uploads 记录。
 
@@ -2715,21 +3034,21 @@ class CacheStore:
                         if row_dict.get("file_types") and isinstance(row_dict["file_types"], str):
                             try:
                                 row_dict["file_types"] = _json_claim.loads(row_dict["file_types"])
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
                         if row_dict.get("batch_file_meta") and isinstance(row_dict["batch_file_meta"], str):
                             try:
                                 row_dict["batch_file_meta"] = _json_claim.loads(row_dict["batch_file_meta"])
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
                         result.append(row_dict)
                     return result
                 except Exception:
                     if own_tx:
                         try:
                             await self._db.execute("ROLLBACK")
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
                     raise
             except Exception as e:
                 if "locked" in str(e).lower() and attempt < 2:
@@ -2766,8 +3085,8 @@ class CacheStore:
             if self._in_writer_tx:
                 raise
             logger.warning(f"[CacheStore] complete_pending_upload 失败 id={upload_id}: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def fail_pending_upload(self, upload_id: int, reason: str = "") -> bool:
         """R40 P0-4: 标记 pending_upload 处理失败,回滚到 processed=0 允许下轮重领。
 
@@ -2798,8 +3117,8 @@ class CacheStore:
             if self._in_writer_tx:
                 raise
             logger.warning(f"[CacheStore] fail_pending_upload 失败 id={upload_id}: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def reset_stale_claims(self, claim_timeout_seconds: float = 300.0) -> int:
         """R40 P0-4: 重置超时的 claimed(processed=2)记录回 pending(processed=0)。
 
@@ -2829,8 +3148,8 @@ class CacheStore:
             if self._in_writer_tx:
                 raise
             logger.warning(f"[CacheStore] reset_stale_claims 失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_dirty_processed(self, ids: list[int]) -> int:
         """R38 P1-2: 标记 dirty_outbox 记录为已处理(processed=1)。
 
@@ -2852,8 +3171,8 @@ class CacheStore:
             return cursor.rowcount if cursor else 0
         except Exception as e:
             logger.warning(f"[CacheStore] mark_dirty_processed 失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_dirty_local_only(self, ids: list[int]) -> int:
         """R40 P0-5: 标记 dirty_outbox 记录为 local_only + processed(跳过 CRDB 同步)。
 
@@ -2878,8 +3197,8 @@ class CacheStore:
             return cursor.rowcount if cursor else 0
         except Exception as e:
             logger.warning(f"[CacheStore] mark_dirty_local_only 失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_dirty_retry(
         self, ids: list[int], error_msg: str,
         next_retry_at: str | None = None,
@@ -2916,8 +3235,8 @@ class CacheStore:
             return cursor.rowcount if cursor else 0
         except Exception as e:
             logger.warning(f"[CacheStore] mark_dirty_retry 失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def count_unprocessed_dirty_outbox(self) -> int:
         """R38 P1-2: 统计未处理的 dirty_outbox 行数(供 crdb_sync 懒加载判断)。"""
         if not self._db:
@@ -2930,8 +3249,8 @@ class CacheStore:
             return int(row[0]) if row and row[0] else 0
         except Exception as e:
             logger.debug(f"[CacheStore] count_unprocessed_dirty_outbox 异常: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     # ─── R41 P0-6: DLQ 死信队列 SQLite 权威存储 ───
     # crdb_sync 处理失败的 dirty_outbox 记录路由到 dlq_records 表,
     # 字段: status / retry_count / max_retries / next_retry_at / last_error /
@@ -3015,8 +3334,8 @@ class CacheStore:
             return new_id
         except Exception as e:
             logger.warning(f"[CacheStore] R41 P0-6: insert_dlq_record 失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def cleanup_dlq(self) -> int:
         """R41 P0-6: 清理 DLQ — 将 retry_count >= max_retries 的记录标记为 permanently_failed。
 
@@ -3049,8 +3368,8 @@ class CacheStore:
             return affected
         except Exception as e:
             logger.warning(f"[CacheStore] R41 P0-6: cleanup_dlq 失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def list_dlq_records(
         self, status: str | None = None, limit: int = 100,
     ) -> list[dict]:
@@ -3172,8 +3491,8 @@ class CacheStore:
             try:
                 from services.crdb_sync_event_wakeup import publish_dirty_signal
                 await publish_dirty_signal(sqlite_table)
-            except Exception:
-                pass  # 信号失败不影响 dirty_outbox 写入
+            except Exception as e:
+                logger.debug(f"[CacheStore] 操作失败(非致命) (信号失败不影响 dirty_outbox 写入): {e}")
             logger.info(
                 f"[CacheStore] R39 P1-5: soft_delete 成功"
                 f"(table={table}, pk={pk}, deleted_at={deleted_at})"
@@ -3181,8 +3500,8 @@ class CacheStore:
             return True
         except Exception as e:
             logger.warning(f"[CacheStore] R39 P1-5: soft_delete 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def dump(self, cache_entries: list[tuple[str, dict, float]]):
         """批量写入 [(key, data, timestamp), ...]"""
         if not self._db or not cache_entries:
@@ -3234,8 +3553,8 @@ class CacheStore:
             return len(rows) > 0
         except Exception as e:
             logger.warning(f"[CacheStore] check_writer_inbox 异常: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def write_writer_inbox(self, message_id: str, method_name: str,
                                   stream_id: str = "") -> None:
         """记录已处理的消息(幂等键写入)。
@@ -3293,8 +3612,8 @@ class CacheStore:
             if hasattr(self, '_original_commit'):
                 try:
                     self._db.commit = self._original_commit
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
             self._in_writer_tx = False
             raise
 
@@ -3443,8 +3762,11 @@ class CacheStore:
             deleted = cursor.rowcount
             await self._db.commit()
             return deleted > 0
-        except Exception:
-            return False
+        except Exception as e:
+            # R64 P1-07: data-integrity 域禁止 except pass;记录日志后落到下方返回
+            logger.debug(f"[CacheStore] clear_pending_notify 失败(非致命): {e}")
+
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
 
     async def wait_for_new_upload(self, timeout: float = 30.0) -> bool:
         """等待上传通知，空闲时使用退避轮询降低 SQLite 空转。"""
@@ -3490,8 +3812,11 @@ class CacheStore:
             deleted = cursor.rowcount
             await self._db.commit()
             return deleted > 0
-        except Exception:
-            return False
+        except Exception as e:
+            # R64 P1-07: data-integrity 域禁止 except pass;记录日志后落到下方返回
+            logger.debug(f"[CacheStore] clear_dsp_notify 失败(非致命): {e}")
+
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
 
     async def wait_for_dsp_job(self, timeout: float = 2.0) -> bool:
         """等待派发通知，避免空队列时高频自旋。"""
@@ -3900,8 +4225,8 @@ class CacheStore:
                 if "locked" in str(e).lower() and attempt < 2:
                     await asyncio.sleep(0.3)
                     continue
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def refund_quota(self, user_id: int, is_external: bool = False):
         """投递失败时回滚配额(递减),与 try_consume_quota 配对使用。
 
@@ -4162,8 +4487,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def lease_upload_session(
         self, upload_id: str, owner: str, lease_seconds: int,
     ) -> bool:
@@ -4192,8 +4517,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def cleanup_expired_upload_sessions(self, ttl_seconds: int) -> int:
         """清理租约过期且未完成的会话(status='EXPIRED')。
 
@@ -4224,8 +4549,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return 0
 
+            return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def delete_upload_session(self, upload_id: str) -> bool:
         """删除会话(仅 READY/ABORTED/EXPIRED 状态可删)。
 
@@ -4248,8 +4573,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     # ─── M1-2: upload_outbox 事务发件箱(6 个方法) ───
 
     async def create_outbox_entry(
@@ -4361,8 +4686,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_outbox_done(self, outbox_id: str) -> bool:
         """标记发条为已完成(status='DONE')。"""
         if not self._db or not outbox_id:
@@ -4383,8 +4708,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_outbox_failed(
         self, outbox_id: str, reason: str, next_retry_at: float,
         max_attempts: int = 0,
@@ -4432,8 +4757,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def claim_outbox_entry(
         self, outbox_id: str, owner: str, lease_seconds: int = 60,
     ) -> bool:
@@ -4468,8 +4793,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_outbox_dead(self, outbox_id: str, reason: str = "") -> bool:
         """R36 B0-2: 标记发条为 DEAD(永久失败,不再重试)。
 
@@ -4496,8 +4821,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def reset_stale_outbox(self, current_owner: str = "") -> int:
         """R36 B0-2: 重置 DISPATCHED 但 lease 已过期的 outbox 条目为 PENDING。
 
@@ -4540,8 +4865,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return 0
 
+            return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def get_dispatched_outbox_by_owner(
         self, owner: str, limit: int = 10,
     ) -> list[dict]:
@@ -4763,8 +5088,8 @@ class CacheStore:
             return row is not None
         except Exception as e:
             logger.warning(f"[CacheStore] is_delivery_already_done 异常: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def get_delivery_receipts_by_job(self, job_id: int) -> list[dict]:
         """查询某 job 的所有投递回执。"""
         if not self._db:
@@ -4810,8 +5135,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_delivery_failed(
         self, job_id: int, source_msg_id: int, reason: str,
     ) -> bool:
@@ -4834,8 +5159,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def get_sent_msg_ids_for_job(self, job_id: int) -> list[int]:
         """查询 job 已成功发送的 sent_msg_id 列表(status IN SENT/CONFIRMED)。
 
@@ -4898,8 +5223,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return 0
 
+            return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def get_pending_replication_tasks(
         self, limit: int = 10, priority_max: int = 10,
     ) -> list[dict]:
@@ -4948,8 +5273,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_replication_copied(self, task_id: int, dst_msg_id: int) -> bool:
         """标记任务为已复制未验证(status='COPIED_UNVERIFIED', dst_msg_id=?)。"""
         if not self._db:
@@ -4971,8 +5296,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_replication_committed(self, task_id: int) -> bool:
         """标记任务为已提交(status='COMMITTED', committed_at=now)。"""
         if not self._db:
@@ -4994,8 +5319,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_replication_failed(
         self, task_id: int, reason: str, max_attempts: int = 3,
     ) -> bool:
@@ -5028,8 +5353,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     # ─── R36 B0-3: replication_tasks task-first 控制面扩展方法 ───
     # 设计目标:
     #   - worker 只扫描非终态(PLANNED/COPYING/COPIED_UNVERIFIED)
@@ -5137,8 +5462,8 @@ class CacheStore:
                     continue
                 if self._in_writer_tx:
                     raise
-                return 0
 
+            return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def commit_replication_transaction(
         self, task_id: int,
         manifest_records: list[dict] | None = None,
@@ -5229,8 +5554,8 @@ class CacheStore:
                     f"[CacheStore] commit_replication_transaction 失败 "
                     f"task_id={task_id}: {e}"
                 )
-                return False
 
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def get_replication_task_by_unique_key(
         self, group_id: int, file_unique_id: str,
         src_channel_id: int, dst_channel_id: int,
@@ -5434,8 +5759,11 @@ class CacheStore:
                 "SELECT COUNT(*) FROM local_job_queue WHERE status = 'pending'"
             )
             return rows[0][0] if rows else 0
-        except Exception:
-            return 0
+        except Exception as e:
+            # R64 P1-07: data-integrity 域禁止 except pass;记录日志后落到下方返回
+            logger.debug(f"[CacheStore] count_pending_local_jobs 失败(非致命): {e}")
+
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
 
     async def mark_local_job_dispatched(self, crdb_id: int) -> bool:
         """标记本地 job 为 dispatched (CAS 语义,防止多 worker 重复认领)。
@@ -6016,7 +6344,8 @@ class CacheStore:
                 if self._in_writer_tx:
                     raise
                 logger.warning(f"[CacheStore] cas_transition_cell 失败: {e}")
-                return False
+
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
         return False
 
     async def acquire_cell_lease(
@@ -6049,7 +6378,8 @@ class CacheStore:
                 if self._in_writer_tx:
                     raise
                 logger.warning(f"[CacheStore] acquire_cell_lease 失败: {e}")
-                return False
+
+            return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
         return False
 
     async def release_cell_lease(self, slot_id: str, owner: str):
@@ -6131,8 +6461,8 @@ class CacheStore:
             return int(rows[0][0])
         except Exception as e:
             logger.warning(f"[CacheStore] get_max_topology_version 失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def delete_cell_local(self, slot_id: str) -> bool:
         """C3: 删除单个 cell 并修复环形链表指针,然后重建快照。
 
@@ -6778,8 +7108,8 @@ class CacheStore:
                 f"[CacheStore] bootstrap_admin_principal 失败 id={principal_id} "
                 f"user={username}: {e}"
             )
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def cache_get(self, key: str, ttl: float):
         """C2: 读取 TTL 缓存。如果缓存不存在或已过期,返回 None。
 
@@ -6916,8 +7246,8 @@ class CacheStore:
         try:
             hex_code = "H:" + ext_code.encode('utf-8').hex()
             candidates.append(hex_code)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
         for cand in candidates:
             rows = await self._db.execute_fetchall(
                 """SELECT file_code, uploader_id, primary_channel_id, primary_channel_msg_id,
@@ -7470,8 +7800,8 @@ class CacheStore:
             return True
         except Exception as e:
             logger.error(f"[CacheStore] insert_unregistered_copy 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def mark_unregistered_copy_reconciled(
         self, upload_id: str, file_unique_id: str, channel_id: int,
         message_id: int,
@@ -7492,8 +7822,8 @@ class CacheStore:
             return bool(cursor and cursor.rowcount > 0)
         except Exception as e:
             logger.error(f"[CacheStore] mark_unregistered_copy_reconciled 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def list_unreconciled_copies(self, limit: int = 100) -> list[dict]:
         """R46 P0-3: 启动时扫描未 reconciled 行,优先补 Manifest。"""
         if not self._db:
@@ -8014,8 +8344,8 @@ class CacheStore:
                 try:
                     from services.crdb_sync_event_wakeup import publish_dirty_signal
                     await publish_dirty_signal(table_name)
-                except Exception:
-                    pass  # 信号失败不影响 dirty_outbox 写入
+                except Exception as e:
+                    logger.debug(f"[CacheStore] 操作失败(非致命) (信号失败不影响 dirty_outbox 写入): {e}")
                 return _row_id
             except Exception as _e_insert:
                 _last_err = _e_insert
@@ -8079,8 +8409,8 @@ class CacheStore:
             return True
         except Exception as e:
             logger.error(f"[CacheStore] delivery_group_receipt_create 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def delivery_group_receipt_confirm_child(
         self, group_id: str, child_msg_id: Any
     ) -> int | None:
@@ -8240,8 +8570,8 @@ class CacheStore:
             return True
         except Exception as e:
             logger.error(f"[CacheStore] callback_nonce_create 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def callback_nonce_consume(self, nonce: str) -> bool:
         """R47 P1-a: 原子消费 nonce(UPDATE WHERE consumed_at IS NULL RETURNING)。
 
@@ -8269,9 +8599,9 @@ class CacheStore:
                 row = await cursor.fetchone()
                 await self._db.commit()
                 return row is not None
-            except Exception:
+            except Exception as e:
                 # RETURNING 不可用,fallback 到 rowcount 检查
-                pass
+                logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
             cursor = await self._db.execute(
                 "UPDATE callback_nonces SET consumed_at = ? "
                 "WHERE nonce = ? AND consumed_at IS NULL",
@@ -8282,8 +8612,8 @@ class CacheStore:
             return _affected > 0
         except Exception as e:
             logger.error(f"[CacheStore] callback_nonce_consume 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def callback_nonce_exists(self, nonce: str) -> bool:
         """R47 P1-a: 检查 nonce 是否存在(无论是否已消费)。
 
@@ -8304,8 +8634,8 @@ class CacheStore:
             return row is not None
         except Exception as e:
             logger.error(f"[CacheStore] callback_nonce_exists 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def callback_nonce_cleanup(
         self,
         expired_before: str | None = None,
@@ -8360,10 +8690,155 @@ class CacheStore:
             logger.error(f"[CacheStore] callback_nonce_cleanup 失败: {e}")
         return {"deleted_expired": deleted_expired, "deleted_consumed": deleted_consumed}
 
-    # ─── R63 P1-01: restore_capability_nonces 持久化 nonce 消费方法 ────
-    # 替代 services.backup_dr_validate._CONSUMED_NONCES 进程内 set,
+    # ─── R63 P1-01 / R64 P1-02: restore_capability_nonces 持久化 nonce 状态机方法 ───
+    # R63 P1-01: 替代 services.backup_dr_validate._CONSUMED_NONCES 进程内 set,
     # 实现跨进程/重启/worker 切换的防重放保护。
+    # R64 P1-02: nonce 状态机迁移到 CRDB security.restore_capability_nonces
+    # (security schema 隔离,跨实例共享)。SQLite 为 fallback(CRDB 不可用时)。
+    # 状态机: reserved → consumed | failed
+    #   - reserve_capability_nonce: INSERT status='reserved'(CAS,PRIMARY KEY=nonce)
+    #   - consume_capability_nonce: CAS UPDATE reserved→consumed
+    #   - fail_capability_nonce:    CAS UPDATE reserved→failed
 
+    def _get_crdb_client(self):
+        """R64 P1-02: 获取 CRDB client(若已连接),否则返回 None。
+
+        从 database.session._client 获取单例,检查 is_connected。
+        未连接 / 不可用 → 返回 None(调用方回退 SQLite)。
+        """
+        try:
+            from database.session import _client
+            if _client is not None and getattr(_client, "is_connected", False):
+                return _client
+        except Exception as e:
+            logger.debug(f"[CacheStore] 操作失败(非致命): {e}")
+        return None
+
+    async def _ensure_crdb_restore_capability_nonces(self) -> None:
+        """R64 P1-02: 在 CRDB 创建 security schema + security.restore_capability_nonces 表。
+
+        幂等:CREATE SCHEMA IF NOT EXISTS + CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS。
+        在首次 reserve/consume/fail 调用时按需触发(惰性创建)。
+        """
+        client = self._get_crdb_client()
+        if client is None:
+            return
+        try:
+            async with client.transaction() as conn:
+                await conn.execute("CREATE SCHEMA IF NOT EXISTS security")
+                await conn.execute(
+                    """CREATE TABLE IF NOT EXISTS security.restore_capability_nonces (
+                        nonce            TEXT PRIMARY KEY,
+                        operation_id     TEXT NOT NULL,
+                        backup_id        TEXT NOT NULL,
+                        manifest_sha256  TEXT NOT NULL,
+                        payload_digest   TEXT NOT NULL,
+                        status           TEXT NOT NULL DEFAULT 'reserved'
+                                         CHECK (status IN ('reserved', 'consumed', 'failed')),
+                        reserved_at      TEXT NOT NULL,
+                        reserved_by      TEXT,
+                        consumed_at      TEXT,
+                        failed_at        TEXT,
+                        consumed_by      TEXT,
+                        failure_reason   TEXT
+                    )"""
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_restore_nonces_op "
+                    "ON security.restore_capability_nonces(operation_id)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_restore_nonces_backup_id_crdb "
+                    "ON security.restore_capability_nonces(backup_id)"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[CacheStore] R64 P1-02: _ensure_crdb_restore_capability_nonces 失败,"
+                f"后续将回退 SQLite: {e}"
+            )
+
+    async def reserve_capability_nonce(
+        self,
+        nonce: str,
+        operation_id: str,
+        backup_id: str,
+        manifest_sha256: str,
+        payload_digest: str,
+        reserved_by: str = "",
+    ) -> bool:
+        """R64 P1-02: 预留 nonce(INSERT status='reserved',CAS)。
+
+        nonce 状态机入口:NEW → reserved。PRIMARY KEY=nonce 实现原子 CAS:
+            - rowcount == 1: 本调用方赢得竞态(nonce 之前不存在)
+            - rowcount == 0: nonce 已存在(reserved/consumed/failed,重放攻击或竞态失败)
+
+        assert_valid 调用本方法(替代 R63 P1-01 的直接 consume),writer 在 restore
+        成功后 consume / 失败后 fail。failed 状态允许同 operation 用新 nonce 重试。
+
+        优先用 CRDB security.restore_capability_nonces(跨实例共享);CRDB 不可用时
+        回退 SQLite(记录 warning,单实例部署仍可用)。
+
+        Args:
+            nonce: 令牌唯一随机数(_RestoreCapability 内嵌的 secrets.token_hex(16))
+            operation_id: 关联恢复操作 ID(审计字段,允许多个 nonce 关联同一 operation)
+            backup_id: 备份 ID(令牌绑定,审计字段)
+            manifest_sha256: manifest 原始 bytes SHA-256(令牌绑定,审计字段)
+            payload_digest: payload canonical JSON SHA-256(令牌绑定,审计字段)
+            reserved_by: 预留者标识(hostname:pid,审计字段)
+
+        Returns:
+            True=预留成功(本调用方赢得竞态,nonce 之前不存在);
+            False=nonce 已存在(重放或竞态失败,调用方必须 fail-closed)
+        """
+        import datetime as _dt
+        _now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        # 1. 优先 CRDB(跨实例共享 nonce ledger)
+        client = self._get_crdb_client()
+        if client is not None:
+            try:
+                await self._ensure_crdb_restore_capability_nonces()
+                # INSERT ... ON CONFLICT DO NOTHING — CRDB CAS,PRIMARY KEY=nonce
+                result = await client.fetch(
+                    """INSERT INTO security.restore_capability_nonces
+                       (nonce, operation_id, backup_id, manifest_sha256,
+                        payload_digest, status, reserved_at, reserved_by)
+                       VALUES ($1, $2, $3, $4, $5, 'reserved', $6, $7)
+                       ON CONFLICT (nonce) DO NOTHING
+                       RETURNING nonce""",
+                    [nonce, operation_id, backup_id, manifest_sha256,
+                     payload_digest, _now, reserved_by or ""],
+                )
+                # RETURNING 返回插入的行;ON CONFLICT 时返回空 → 预留失败
+                return len(result) == 1
+            except Exception as e:
+                logger.warning(
+                    f"[CacheStore] R64 P1-02: CRDB reserve_capability_nonce 失败,"
+                    f"回退 SQLite: {e}"
+                )
+
+        # 2. SQLite fallback(CRDB 不可用或 CRDB 操作失败)
+        if not self._db:
+            return False
+        try:
+            cursor = await self._db.execute(
+                """INSERT OR IGNORE INTO restore_capability_nonces
+                   (nonce, backup_id, manifest_sha256, payload_digest,
+                    consumed_at, consumed_by, operation_id, status,
+                    reserved_at, reserved_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)""",
+                (nonce, backup_id, manifest_sha256, payload_digest,
+                 _now, reserved_by or "", operation_id, _now, reserved_by or ""),
+            )
+            _affected = cursor.rowcount or 0
+            await self._db.commit()
+            return _affected == 1
+        except Exception as e:
+            logger.error(
+                f"[CacheStore] reserve_capability_nonce (SQLite) 失败: {e}"
+            )
+
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def consume_capability_nonce(
         self,
         nonce: str,
@@ -8372,84 +8847,182 @@ class CacheStore:
         payload_digest: str,
         consumed_by: str = "",
     ) -> bool:
-        """R63 P1-01: 原子消费恢复能力令牌 nonce(INSERT OR IGNORE CAS)。
+        """R63 P1-01 / R64 P1-02: 原子消费 nonce(CAS UPDATE reserved→consumed)。
 
-        替代 R62 P0-01 的进程内 ``_CONSUMED_NONCES`` set,实现跨进程/重启/
-        worker 切换的防重放保护。nonce PRIMARY KEY + INSERT OR IGNORE 实现
-        原子 CAS:
-            - rowcount == 1: 本调用方赢得竞态(nonce 之前未被消费)
-            - rowcount == 0: nonce 已被消费(重放攻击或竞态失败)
+        R64 P1-02: 从 R63 的 INSERT OR IGNORE CAS 改为 UPDATE CAS:
+            - UPDATE ... SET status='consumed' WHERE nonce=? AND status='reserved'
+            - rowcount == 1: 成功(reserved→consumed)
+            - rowcount == 0: nonce 不在 reserved 状态(已 consumed/failed/不存在)
 
-        唯一键绑定: nonce(PK) + backup_id + manifest_sha256 + payload_digest。
-        即使攻击者伪造 nonce,绑定字段不一致也会被审计捕获(查询时可关联)。
+        assert_valid 现调用 reserve_capability_nonce(不再直接 consume),
+        writer 在 restore 成功后调用本方法完成 reserved→consumed 转换。
 
-        多实例/并发安全: SQLite 的 INSERT OR IGNORE 在 PRIMARY KEY 冲突时
-        返回 0 行 affected,天然 CAS 语义;WAL 模式 + busy_timeout 保证
-        多个 CacheStore 实例(不同进程/worker)共享同一 DB 文件时的串行化。
+        优先用 CRDB;CRDB 不可用时回退 SQLite(记录 warning)。
 
         Args:
-            nonce: 令牌唯一随机数(_RestoreCapability 内嵌的 secrets.token_hex(16))
+            nonce: 令牌唯一随机数
             backup_id: 备份 ID(令牌绑定,审计字段)
             manifest_sha256: manifest 原始 bytes SHA-256(令牌绑定,审计字段)
             payload_digest: payload canonical JSON SHA-256(令牌绑定,审计字段)
             consumed_by: 消费者标识(hostname:pid,审计字段)
 
         Returns:
-            True=消费成功(本调用方赢得竞态,nonce 之前未被消费);
-            False=nonce 已被消费(重放或竞态失败,调用方必须 fail-closed)
+            True=消费成功(reserved→consumed CAS 成功);
+            False=nonce 不在 reserved 状态(已 consumed/failed/不存在)
         """
-        if not self._db:
-            return False
         import datetime as _dt
         _now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        # 1. 优先 CRDB
+        client = self._get_crdb_client()
+        if client is not None:
+            try:
+                result = await client.fetch(
+                    """UPDATE security.restore_capability_nonces
+                       SET status = 'consumed', consumed_at = $1, consumed_by = $2
+                       WHERE nonce = $3 AND status = 'reserved'
+                       RETURNING nonce""",
+                    [_now, consumed_by or "", nonce],
+                )
+                return len(result) == 1
+            except Exception as e:
+                logger.warning(
+                    f"[CacheStore] R64 P1-02: CRDB consume_capability_nonce 失败,"
+                    f"回退 SQLite: {e}"
+                )
+
+        # 2. SQLite fallback
+        if not self._db:
+            return False
         try:
             cursor = await self._db.execute(
-                """INSERT OR IGNORE INTO restore_capability_nonces
-                   (nonce, backup_id, manifest_sha256, payload_digest,
-                    consumed_at, consumed_by)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (nonce, backup_id, manifest_sha256, payload_digest,
-                 _now, consumed_by or ""),
+                """UPDATE restore_capability_nonces
+                   SET status = 'consumed', consumed_at = ?, consumed_by = ?
+                   WHERE nonce = ? AND status = 'reserved'""",
+                (_now, consumed_by or "", nonce),
             )
             _affected = cursor.rowcount or 0
             await self._db.commit()
             return _affected == 1
         except Exception as e:
             logger.error(
-                f"[CacheStore] consume_capability_nonce 失败: {e}"
+                f"[CacheStore] consume_capability_nonce (SQLite) 失败: {e}"
             )
+
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
+    async def fail_capability_nonce(
+        self,
+        nonce: str,
+        failure_reason: str = "",
+    ) -> bool:
+        """R64 P1-02: 标记 nonce 为 failed(CAS UPDATE reserved→failed)。
+
+        nonce 状态机:reserved → failed。用于 restore 失败后释放 nonce
+        (允许同 operation 用新 nonce 重试)。failed nonce 保留在 DB 中作为审计轨迹。
+
+        CAS 语义:UPDATE ... SET status='failed' WHERE nonce=? AND status='reserved'
+            - rowcount == 1: 成功(reserved→failed)
+            - rowcount == 0: nonce 不在 reserved 状态(已 consumed/failed/不存在)
+
+        Args:
+            nonce: 令牌唯一随机数
+            failure_reason: 失败原因(审计字段,如 'restore_crdb_error')
+
+        Returns:
+            True=标记失败成功(reserved→failed CAS 成功);
+            False=nonce 不在 reserved 状态(已 consumed/failed/不存在)
+        """
+        import datetime as _dt
+        _now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+        # 1. 优先 CRDB
+        client = self._get_crdb_client()
+        if client is not None:
+            try:
+                result = await client.fetch(
+                    """UPDATE security.restore_capability_nonces
+                       SET status = 'failed', failed_at = $1, failure_reason = $2
+                       WHERE nonce = $3 AND status = 'reserved'
+                       RETURNING nonce""",
+                    [_now, failure_reason, nonce],
+                )
+                return len(result) == 1
+            except Exception as e:
+                logger.warning(
+                    f"[CacheStore] R64 P1-02: CRDB fail_capability_nonce 失败,"
+                    f"回退 SQLite: {e}"
+                )
+
+        # 2. SQLite fallback
+        if not self._db:
             return False
+        try:
+            cursor = await self._db.execute(
+                """UPDATE restore_capability_nonces
+                   SET status = 'failed', failed_at = ?, failure_reason = ?
+                   WHERE nonce = ? AND status = 'reserved'""",
+                (_now, failure_reason, nonce),
+            )
+            _affected = cursor.rowcount or 0
+            await self._db.commit()
+            return _affected == 1
+        except Exception as e:
+            logger.error(
+                f"[CacheStore] fail_capability_nonce (SQLite) 失败: {e}"
+            )
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def is_capability_nonce_consumed(self, nonce: str) -> bool:
-        """R63 P1-01: 检查 nonce 是否已被消费(不消费,仅查询)。
+        """R63 P1-01 / R64 P1-02: 检查 nonce 是否已消费(status='consumed')。
 
-        用于 assert_valid 的预检:在尝试消费前先检查,避免不必要的写入。
-        注意:预检与消费之间存在 TOCTOU 窗口,因此 consume_capability_nonce
-        仍以 INSERT OR IGNORE 的 rowcount 为权威判定;本方法仅用于早期拒绝
+        R64 P1-02: 仅 status='consumed' 返回 True;reserved/failed 返回 False
+        (允许后续状态转换 — reserved 可 consume/fail,failed 允许同 operation 重试)。
+
+        用于 assert_valid 的预检:在尝试 reserve 前先检查,避免不必要的写入。
+        注意:预检与 reserve 之间存在 TOCTOU 窗口,因此 reserve_capability_nonce
+        仍以 INSERT CAS 的 rowcount 为权威判定;本方法仅用于早期拒绝
         已被消费的 nonce(优化路径,非安全边界)。
 
         Args:
             nonce: 令牌唯一随机数
 
         Returns:
-            True=nonce 已被消费(调用方应直接 fail-closed);
-            False=nonce 未被消费(调用方仍需调用 consume_capability_nonce 完成原子消费)
+            True=nonce 已消费(status='consumed',调用方应直接 fail-closed);
+            False=nonce 未消费(reserved/failed/不存在,调用方仍需调用 reserve 完成原子预留)
         """
+        # 1. 优先 CRDB
+        client = self._get_crdb_client()
+        if client is not None:
+            try:
+                result = await client.fetch(
+                    "SELECT 1 FROM security.restore_capability_nonces "
+                    "WHERE nonce = $1 AND status = 'consumed' LIMIT 1",
+                    [nonce],
+                )
+                return len(result) > 0
+            except Exception as e:
+                logger.warning(
+                    f"[CacheStore] R64 P1-02: CRDB is_capability_nonce_consumed 失败,"
+                    f"回退 SQLite: {e}"
+                )
+
+        # 2. SQLite fallback
         if not self._db:
             return False
         try:
             cursor = await self._db.execute(
-                "SELECT 1 FROM restore_capability_nonces WHERE nonce = ? LIMIT 1",
+                "SELECT 1 FROM restore_capability_nonces "
+                "WHERE nonce = ? AND status = 'consumed' LIMIT 1",
                 (nonce,),
             )
             row = await cursor.fetchone()
             return row is not None
         except Exception as e:
             logger.error(
-                f"[CacheStore] is_capability_nonce_consumed 失败: {e}"
+                f"[CacheStore] is_capability_nonce_consumed (SQLite) 失败: {e}"
             )
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     # ─── R62 P0-04: button_tokens 表 — 短 handle_id 到签名 token 的映射 ───
 
     async def button_token_store(
@@ -8500,8 +9073,8 @@ class CacheStore:
             return True
         except Exception as e:
             logger.error(f"[CacheStore] button_token_store 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def button_token_lookup(self, handle_id: str) -> str | None:
         """R62 P0-04: 通过 handle_id 查找完整签名 token(不消费)。
 
@@ -8604,8 +9177,8 @@ class CacheStore:
             return _affected > 0
         except Exception as e:
             logger.error(f"[CacheStore] button_token_mark_consumed 失败: {e}")
-            return False
 
+        return False  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     async def button_token_cleanup(
         self,
         created_before: str | None = None,
@@ -8705,8 +9278,8 @@ class DecodeLogBuffer:
             return deleted
         except Exception as e:
             logger.warning(f"[DecodeLog] 本地缓冲清理失败: {e}")
-            return 0
 
+        return 0  # R64 P1-07: data-integrity 域禁止 except 块裸 return;落到 try/except 块外返回
     def __init__(self):
         self._db = None
 
