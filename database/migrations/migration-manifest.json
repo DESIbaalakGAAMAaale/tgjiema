@@ -1,7 +1,7 @@
 {
   "version": 2,
-  "release_commit": "d2c73a6ec98d84727c5ef7b40c249db805e8c71b",
-  "tree_sha": "fc0974773cb6a6e456f6973365531b40408af192",
+  "release_commit": "36faa43548ff33ba13b4d8303bf4cb78f808bfc5",
+  "tree_sha": "c6308b163e5f3a54c6cff7df9dba7836b03ba20c",
   "tool_version": "DDL_VERSION=11",
   "description": "R62 P1-02 / R63 P0-04 / R64 P0-03 / R65 P1-08: Signed migration manifest — trust anchor for migration integrity. The manifest binds release_commit, tree_sha, per-migration sha256, migration order, and tool version. CI signs the canonical manifest with cosign keyless (Sigstore) and verifies the certificate identity/issuer before any deployment or migration execution. The signature is a detached .sig file alongside the manifest; the manifest itself contains the expected verification policy (certificate_identity + certificate_oidc_issuer). A tampered disk file whose sha256 does not match the manifest blocks startup (fail-closed). R63 P0-04: release_commit/tree_sha regenerated from current HEAD; 004 migration enumerated; manifest must equal the on-disk migration set (no missing/extra entries). R64 P0-03: 007_restore_operations_ledger.sql enumerated (restore orchestrator state machine + blue-green switch + rollback targets). R65 P1-08: 每个 migration 条目新增 migration_id / filename / ddl_version / rollback_strategy 字段; predecessor 改为指向 migration_id (如 005.predecessor='004'); 001-007 全集合 + 顺序 + hash + 前驱 + DDL version + 回滚策略纳入签名 release manifest。",
   "verification": {
