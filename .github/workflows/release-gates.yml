@@ -1714,6 +1714,17 @@ jobs:
         echo "R63 P0-01: production verification statement:"
         cat production_verify_statement.json
 
+    # R65 fix: 下载 sbom job 产生的 sbom.json artifact,供 sbom_digest 计算。
+    # 之前 publish-attestation 未下载 sbom artifact,导致 sbom.json 不在 workspace,
+    # sbom_digest 被设为 "pending",verify_supply_chain.py 的 digest_bound:sbom_digest
+    # 检查永远失败(非空且非 pending 才算绑定)。
+    - name: Download SBOM artifact (for sbom_digest computation)
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: release-gates-sbom
+        path: .
+      continue-on-error: true  # 防御性:若 sbom job 异常未上传 artifact,不阻断 publish-attestation
+
     - name: Generate release_attestation.json (6 digest binding)
       run: |
         set -euo pipefail
@@ -1994,11 +2005,42 @@ jobs:
           exit 0
         fi
         # 跳过 cosign 验证(CI 环境无 cosign + cert),只验证 digest 绑定
+        # R65 fix: 捕获 stderr 并在失败时打印 result JSON,便于诊断哪个 digest 检查失败
+        set +e
         python scripts/verify_supply_chain.py \
           --attestation "${ATTESTATION_PATH}" \
           --output-dir ./production-evidence \
           --skip-cosign \
-          --json > ./supply_chain_result.json
+          --json > ./supply_chain_result.json 2> ./supply_chain_stderr.log
+        VERIFY_EXIT=$?
+        set -e
+        if [ "${VERIFY_EXIT}" -ne 0 ]; then
+          echo "::error::verify_supply_chain.py 失败 (exit=${VERIFY_EXIT})"
+          echo "--- stderr ---"
+          cat ./supply_chain_stderr.log 2>/dev/null || true
+          echo "--- result JSON (失败检查项) ---"
+          cat ./supply_chain_result.json 2>/dev/null | python3 -m json.tool 2>/dev/null || cat ./supply_chain_result.json 2>/dev/null || true
+          # 打印失败的检查项摘要
+          python3 -c "
+        import json, sys
+        try:
+            with open('./supply_chain_result.json') as f:
+                data = json.load(f)
+            failed = [c for c in data.get('checks', []) if not c.get('passed')]
+            if failed:
+                print('失败的检查项:')
+                for c in failed:
+                    print(f\"  - {c['name']}: expected={c.get('expected','')[:40]} actual={c.get('actual','')[:40]}\")
+                    print(f\"    {c.get('message','')}\")
+            if data.get('errors'):
+                print('错误:')
+                for e in data['errors']:
+                    print(f'  - {e}')
+        except Exception as e:
+            print(f'(无法解析 result JSON: {e})')
+        " 2>/dev/null || true
+          exit "${VERIFY_EXIT}"
+        fi
         echo "Supply chain verification 完成"
         cat ./supply_chain_result.json | python3 -m json.tool 2>/dev/null || true
 
@@ -2047,6 +2089,7 @@ jobs:
         path: |
           production-evidence/
           supply_chain_result.json
+          supply_chain_stderr.log
         retention-days: 90
       if: always()
 

@@ -103,9 +103,12 @@ def _sha256_files_concat(paths: list[Path]) -> str:
 
 
 def _sha256_dir_tree(glob_pattern: str, base_dir: Path) -> str:
-    """计算匹配 glob 的所有文件的合并 SHA-256(与 release-gates.yml 算法一致)。
+    """计算匹配 glob 的所有文件的合并 SHA-256(仅用于非 migration 场景)。
 
-    算法:sort | sha256sum 逐行 → 再 sha256sum
+    注意:此算法与 release-gates.yml publish-attestation 步骤中 migration_digest 的
+    算法不一致(workflow 用 find . -name '*.sql' -path '*/migrations/*' 匹配所有
+    migrations 子目录,本函数只匹配 base_dir 下直接子文件)。
+    migration_digest 验证请使用 _migration_digest_workflow_algorithm()。
     """
     matches = sorted(base_dir.glob(glob_pattern))
     if not matches:
@@ -116,6 +119,40 @@ def _sha256_dir_tree(glob_pattern: str, base_dir: Path) -> str:
         lines.append(f"{digest}  {m.relative_to(base_dir)}")
     content = "\n".join(lines)
     return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _migration_digest_workflow_algorithm() -> str:
+    """计算 migration_digest,与 release-gates.yml publish-attestation 步骤算法 bit-for-bit 一致。
+
+    R65 fix: workflow 使用 shell 命令计算 migration_digest:
+        find . -name "*.sql" -path "*/migrations/*" -exec sha256sum {} + 2>/dev/null \\
+          | sort | sha256sum | awk '{print $1}'
+
+    该命令:
+      1. 匹配所有路径含 /migrations/ 的 .sql 文件(如 database/migrations/*.sql
+         和 admin/migrations/*.sql),而非仅 database/migrations/ 直接子文件
+      2. sha256sum 输出格式为 "<hash>  ./path/file.sql"(带 ./ 前缀和完整相对路径)
+      3. sort 对 "<hash>  path" 行做字典序排序(先按 hash 排序)
+      4. sha256sum 对排序后的文本(含每行末尾换行符)做最终哈希
+
+    本函数通过 subprocess 调用相同 shell 命令,确保与 workflow 生成端完全一致,
+    避免 Python 重写算法时因路径格式/排序/newline 差异导致永久 mismatch。
+    """
+    try:
+        result = subprocess.run(
+            ["bash", "-c",
+             "find . -name '*.sql' -path '*/migrations/*' -exec sha256sum {} + 2>/dev/null "
+             "| sort | sha256sum | awk '{print $1}'"],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _git_rev_parse(ref: str) -> str:
@@ -291,16 +328,17 @@ def verify_supply_chain(
         })
 
     # 5. 验证 migration_digest 与实际 migration 文件一致
+    # R65 fix: 使用与 release-gates.yml publish-attestation 步骤相同的 shell 算法,
+    # 确保 bit-for-bit 一致(避免 Python glob 与 find 算法差异导致永久 mismatch)。
     attestation_migration = attestation.get("migration_digest", "")
     if attestation_migration and attestation_migration != "pending":
-        migrations_dir = _REPO_ROOT / "database" / "migrations"
-        actual_migration = _sha256_dir_tree("*.sql", migrations_dir) if migrations_dir.exists() else ""
+        actual_migration = _migration_digest_workflow_algorithm()
         passed = bool(actual_migration) and actual_migration == attestation_migration
         checks.append({
             "name": "migration_digest_matches",
             "passed": passed,
             "expected": attestation_migration,
-            "actual": actual_migration or "(migration 目录不存在)",
+            "actual": actual_migration or "(find 命令失败或无 migration 文件)",
             "message": (
                 "migration_digest 与实际文件一致"
                 if passed
