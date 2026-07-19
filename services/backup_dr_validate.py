@@ -481,6 +481,45 @@ def _to_serializable(obj):
     return obj
 
 
+def _is_iso8601(value) -> bool:
+    """R65 P1-06: 判断字符串是否为合法 ISO 8601 时间戳。
+
+    兼容 ISO 8601 标准格式(含 ``Z`` 后缀或时区偏移),
+    使用 ``datetime.fromisoformat`` 解析(Python 3.11+ 已支持 ``Z`` 后缀,
+    但为兼容旧版 Python,手动将 ``Z`` 替换为 ``+00:00``)。
+
+    Args:
+        value: 待校验值(任意类型,非 str 立即返回 False)
+
+    Returns:
+        True 若为合法 ISO 8601 字符串;False 否则
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    candidate = value
+    # 兼容 Z 后缀(UTC 时区)
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    # R65 P1-04: 观测性 — P1-5 规则3 禁止 except 块中裸 return False,
+    # 改用"先尝试解析,失败后由 except 块置 flag,函数末尾统一返回"模式。
+    parsed_ok = False
+    parse_err: Exception | None = None
+    try:
+        _dt.datetime.fromisoformat(candidate)
+        parsed_ok = True
+    except (ValueError, TypeError) as exc:
+        parse_err = exc
+    if not parsed_ok:
+        logger.debug(
+            _i18n_t(
+                "diagnostics.r65.backup_dr_validate.iso8601_check_failed",
+                value=repr(value),
+                reason=parse_err,
+            )
+        )
+    return parsed_ok
+
+
 @dataclass(frozen=True)
 class VerifiedBackupPayload:
     """R62 P0-02 / R63 P0-02 / R64 P1-01: 已通过严格验证的备份 payload(深冻结不可变数据载体)。
@@ -521,12 +560,163 @@ class VerifiedBackupPayload:
     payload_digest: str = ""
 
     def __post_init__(self):
+        # R65 P1-06: 在计算 SHA-256 之前先执行 7 维构造时强校验
+        # 任一校验失败即 raise AppError(BACKUP_PAYLOAD_CANONICAL_INVALID),
+        # 拒绝"任意 JSON bytes"被称为 canonical
+        self._validate_canonical_payload()
         # R64 P1-01: payload_digest 从 canonical_payload_bytes 计算(sha256)
         # canonical_payload_bytes 是 bytes(不可变),无需深冻结
         if not self.payload_digest:
             object.__setattr__(
                 self, "payload_digest",
                 hashlib.sha256(self.canonical_payload_bytes).hexdigest(),
+            )
+
+    def _validate_canonical_payload(self) -> None:
+        """R65 P1-06: VerifiedBackupPayload 构造时 7 维强校验(fail-closed)。
+
+        校验维度(任一失败即 raise AppError,不计算 SHA-256):
+            1. canonical_payload_bytes 必须为 bytes(拒绝 str/int/None/list)
+            2. UTF-8 可解码(拒绝非法 UTF-8 bytes)
+            3. JSON object(拒绝 array/primitive/null)
+            4. 任意层级无重复 key(object_pairs_hook=list 检测)
+            5. schema: version(int≥1) / backup_id(非空 str) /
+               created_at(ISO 8601 str) / tables(dict) 必填且类型正确
+            6. tables 中每个表名对应的值必须为 list
+            7. canonical round-trip bytes 完全相等
+               (sort_keys + separators=(",",":") + ensure_ascii=False + allow_nan=False)
+
+        Raises:
+            AppError(BACKUP_PAYLOAD_CANONICAL_INVALID): 任一校验失败
+        """
+        from services.error_codes import AppError, ErrorCodes
+
+        def _reject(reason: str, field: str = "") -> None:
+            raise AppError(
+                ErrorCodes.BACKUP_PAYLOAD_CANONICAL_INVALID,
+                params={"reason": reason, "field": field},
+            )
+
+        # ── 1. bytes 类型校验(拒绝 str/int/None/list 等) ──
+        if not isinstance(self.canonical_payload_bytes, (bytes, bytearray)):
+            _reject(
+                f"canonical_payload_bytes 必须为 bytes 类型,实际: "
+                f"{type(self.canonical_payload_bytes).__name__}",
+                field="canonical_payload_bytes",
+            )
+
+        raw_bytes = bytes(self.canonical_payload_bytes)
+
+        # ── 2. UTF-8 可解码校验 ──
+        try:
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError as e:
+            _reject(f"canonical_payload_bytes 不是合法 UTF-8: {e}",
+                    field="canonical_payload_bytes")
+
+        # ── 3 & 4. JSON object 校验 + 任意层级无重复 key 校验 ──
+        # object_pairs_hook 保留所有 (key, value) 对(包括重复 key),
+        # 在 hook 内手动检测每个 dict 层级是否有重复 key,有则抛 ValueError。
+        def _detect_duplicate_pairs(pairs):
+            seen = set()
+            for k, _ in pairs:
+                if k in seen:
+                    raise ValueError(f"duplicate key: {k}")
+                seen.add(k)
+            return dict(pairs)
+
+        try:
+            data = json.loads(text, object_pairs_hook=_detect_duplicate_pairs)
+        except ValueError as e:
+            # 重复 key 检测触发(ValueError)
+            _reject(f"JSON 含重复 key: {e}", field="canonical_payload_bytes")
+        except json.JSONDecodeError as e:
+            _reject(f"canonical_payload_bytes 不是合法 JSON: {e}",
+                    field="canonical_payload_bytes")
+
+        # ── 3. JSON object 校验(拒绝 array/primitive/null) ──
+        if not isinstance(data, dict):
+            _reject(
+                f"canonical payload 必须为 JSON object,实际: "
+                f"{type(data).__name__}",
+                field="canonical_payload_bytes",
+            )
+
+        # ── 5. schema 校验:version / backup_id / created_at / tables ──
+        # 5.1 version 必须为 int(≥1),且不能是 bool(Python 中 bool 是 int 子类)
+        if "version" not in data:
+            _reject("缺少必填字段: version", field="version")
+        _version = data["version"]
+        if isinstance(_version, bool) or not isinstance(_version, int):
+            _reject(
+                f"version 必须为 int,实际类型: {type(_version).__name__}",
+                field="version",
+            )
+        if _version < 1:
+            _reject(f"version 必须 ≥ 1,实际: {_version}", field="version")
+
+        # 5.2 backup_id 必须为非空 str
+        if "backup_id" not in data:
+            _reject("缺少必填字段: backup_id", field="backup_id")
+        _backup_id = data["backup_id"]
+        if not isinstance(_backup_id, str):
+            _reject(
+                f"backup_id 必须为 str,实际类型: {type(_backup_id).__name__}",
+                field="backup_id",
+            )
+        if not _backup_id:
+            _reject("backup_id 不能为空字符串", field="backup_id")
+
+        # 5.3 created_at 必须为合法 ISO 8601 字符串
+        if "created_at" not in data:
+            _reject("缺少必填字段: created_at", field="created_at")
+        _created_at = data["created_at"]
+        if not isinstance(_created_at, str):
+            _reject(
+                f"created_at 必须为 ISO 8601 字符串,实际类型: "
+                f"{type(_created_at).__name__}",
+                field="created_at",
+            )
+        if not _is_iso8601(_created_at):
+            _reject(f"created_at 不是合法 ISO 8601 时间戳: {_created_at}",
+                    field="created_at")
+
+        # 5.4 tables 必须为 dict
+        if "tables" not in data:
+            _reject("缺少必填字段: tables", field="tables")
+        _tables = data["tables"]
+        if not isinstance(_tables, dict):
+            _reject(
+                f"tables 必须为 dict,实际类型: {type(_tables).__name__}",
+                field="tables",
+            )
+
+        # ── 6. tables 值类型校验(每个表名对应值必须为 list) ──
+        for table_name, rows in _tables.items():
+            if not isinstance(rows, list):
+                _reject(
+                    f"tables.{table_name} 必须为 list,实际类型: "
+                    f"{type(rows).__name__}",
+                    field=f"tables.{table_name}",
+                )
+
+        # ── 7. canonical round-trip bytes 完全相等校验 ──
+        # 用 _canonical_json_bytes 重新序列化,要求 bytes 完全相等
+        # (sort_keys + separators=(",",":") + ensure_ascii=False + allow_nan=False)
+        try:
+            re_canonical = json.dumps(
+                data, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False, allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as e:
+            _reject(f"canonical round-trip 序列化失败: {e}",
+                    field="canonical_payload_bytes")
+
+        if re_canonical != raw_bytes:
+            _reject(
+                "canonical_payload_bytes 不是 canonical 形式"
+                "(sort_keys + 紧凑分隔符 + ensure_ascii=False + allow_nan=False)",
+                field="canonical_payload_bytes",
             )
 
     @property
@@ -612,6 +802,42 @@ def _compute_payload_digest(data) -> str:
         AppError(BACKUP_PAYLOAD_NOT_SERIALIZABLE): 数据含不可序列化类型
     """
     return hashlib.sha256(_canonical_json_bytes(data)).hexdigest()
+
+
+def _enrich_payload_data(data, *, backup_id: str, created_at: str, version: int = 1):
+    """R65 P1-06: 在构造 VerifiedBackupPayload 前补齐 canonical payload 必填字段。
+
+    生产代码 ``backup_data`` 仅含 ``tables`` / ``backup_time``,但 R65 P1-06 要求
+    canonical payload 必须含 ``version`` / ``backup_id`` / ``created_at`` / ``tables``
+    四个必填字段。本函数在不覆盖已有字段的前提下补齐缺失字段,使构造的
+    ``VerifiedBackupPayload`` 能通过 7 维构造时强校验。
+
+    补齐策略(at-minimum,不覆盖):
+        - ``version``: 默认 1,若 data 已含则保留原值
+        - ``backup_id``: 来自 manifest.backup_id,若 data 已含则保留原值
+        - ``created_at``: 来自 manifest.created_at,若 data 已含则保留原值
+        - ``tables``: 不补齐(由调用方保证存在,否则 VerifiedBackupPayload 校验拒绝)
+
+    Args:
+        data: 原始备份数据(通常为 dict,含 "tables" 键)
+        backup_id: 备份 ID(来自 manifest.backup_id)
+        created_at: 创建时间 ISO 8601 字符串(来自 manifest.created_at)
+        version: canonical payload 版本号(默认 1)
+
+    Returns:
+        新 dict(浅拷贝 + 补齐字段);非 dict 输入原样返回(由
+        VerifiedBackupPayload 校验拒绝)
+    """
+    if not isinstance(data, dict):
+        return data
+    enriched = dict(data)
+    if "version" not in enriched:
+        enriched["version"] = version
+    if "backup_id" not in enriched:
+        enriched["backup_id"] = backup_id
+    if "created_at" not in enriched:
+        enriched["created_at"] = created_at
+    return enriched
 
 
 # ── 三段式备份 key 生成 ────────────────────────────────────────
@@ -1775,12 +2001,18 @@ async def validate_and_restore_backup_strict(
     # ── R62 P0-02 / R63 P0-02 / R64 P1-01: 构造 VerifiedBackupPayload(深冻结,不可篡改) ──
     # R64 P1-01: 单一 canonical bytes 来源 — payload/tables 改为 property,
     # 从 canonical_payload_bytes 解码,消除 tables 与 payload 语义分叉风险。
+    # R65 P1-06: 用 _enrich_payload_data 补齐 canonical payload 必填字段
+    # (version/backup_id/created_at/tables),使构造时强校验通过
+    cap_created_at = str(manifest.get("created_at", "")) if isinstance(manifest, dict) else ""
+    enriched_data = _enrich_payload_data(
+        data, backup_id=cap_backup_id, created_at=cap_created_at,
+    )
     verified_payload = VerifiedBackupPayload(
         backup_id=cap_backup_id,
         manifest_sha256=cap_manifest_sha256,
         plaintext_sha256=cap_plaintext_sha256,
         schema_fingerprint=cap_schema_fingerprint,
-        canonical_payload_bytes=_canonical_json_bytes(data),
+        canonical_payload_bytes=_canonical_json_bytes(enriched_data),
     )
 
     # ── R61 P0-03 / R62 P0-01: 构造不可伪造的 _RestoreCapability ──
@@ -1828,6 +2060,7 @@ async def _restore_preverified_payload(
     issuer: str,
     tables: "list[str] | None" = None,
     merge: bool = False,
+    created_at: str = "",
 ) -> dict:
     """R62 P0-01: 为已通过等效验证的备份(如 BackupEngine._restore_internal
     自有的 manifest/ciphertext_sha/decrypt/plaintext_sha 验证路径)发放
@@ -1869,12 +2102,17 @@ async def _restore_preverified_payload(
     """
     # R62 P0-02 / R64 P1-01: 构造 VerifiedBackupPayload(单一 canonical bytes 来源)
     # payload_digest 从 canonical_payload_bytes 自动计算(__post_init__)
+    # R65 P1-06: 用 _enrich_payload_data 补齐 canonical payload 必填字段
+    # (version/backup_id/created_at/tables),使构造时强校验通过
+    enriched_data = _enrich_payload_data(
+        data, backup_id=backup_id, created_at=created_at,
+    )
     verified_payload = VerifiedBackupPayload(
         backup_id=backup_id,
         manifest_sha256=manifest_sha256,
         plaintext_sha256=plaintext_sha256,
         schema_fingerprint=schema_fingerprint,
-        canonical_payload_bytes=_canonical_json_bytes(data),
+        canonical_payload_bytes=_canonical_json_bytes(enriched_data),
     )
 
     # R62 P0-01: 构造不可伪造的 _RestoreCapability

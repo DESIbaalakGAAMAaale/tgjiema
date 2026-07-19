@@ -21,9 +21,21 @@ def _json_dumps(obj, **kwargs):
         return result.decode()
     return result
 
-from telegram import Update
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from services.sink_adapters.telegram_helpers import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+    InputMediaAudio,
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    CallbackQueryHandler,
+)
 from loguru import logger
 
 from config import settings
@@ -35,7 +47,16 @@ from utils.rate_limiter import global_rate_limiter, user_rate_limiter
 from utils.monitor import metrics
 from utils.task_utils import create_safe_task
 from utils.force_join import check_force_join, three_bot_reminder, common_faq
-from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_message, safe_reply_text, safe_send_media_group
+# R65 P1-01: safe_reply_text / safe_send_message / safe_edit_message_text 改用
+# services.sink_adapters typed adapter(接受 UserMessage | ErrorEnvelope,
+# 拒绝裸 str);safe_copy_message / safe_copy_messages / safe_send_media_group
+# 仍从 utils.flood_waiter 导入(sink_adapters 未提供这些 copy/media_group adapter)。
+from utils.flood_waiter import safe_copy_message, safe_copy_messages, safe_send_media_group
+from services.sink_adapters import (
+    safe_reply_text,
+    safe_send_message,
+    safe_edit_message_text,
+)
 from utils.file_utils import detect_file_type, extract_file_meta
 from utils.relay_auth import is_relay_sender_allowed
 # R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
@@ -115,8 +136,12 @@ async def _reply_user_message(message, msg: UserMessage, bot_id: int = 0, **kwar
     """
     # R62 P1-05: 渲染 UserMessage 为本地化字符串(惰性渲染,真正写入用户面前才转字符串)
     text = msg.render(get_i18n_manager())
-    # 复用现有 safe_reply_text 的 FloodWait 退避机制
-    return await safe_reply_text(message, text, bot_id=bot_id, **kwargs)
+    # R65 P1-01: safe_reply_text 已切换为 typed adapter(接受 UserMessage | ErrorEnvelope),
+    # 用 from_raw_text 将已渲染字符串通过类型边界(过渡期;新代码应使用 from_key)。
+    # 复用 safe_reply_text 的 FloodWait 退避机制(bot_id 透传给底层 flood_waiter)
+    return await safe_reply_text(
+        message, UserMessage.from_raw_text(text), bot_id=bot_id, **kwargs
+    )
 
 TOKEN = settings.UPLOAD_BOT_TOKEN
 
@@ -587,7 +612,7 @@ async def _create_replication_task_safe(
         )
     except Exception as e:
         logger.warning(f"[Up] 创建 replication_task 失败(不影响主流程, fuid={file_unique_id}): {e}")
-        return 0
+        return None
 
 
 async def _mark_replication_copying_safe(task_id: int) -> None:
@@ -1068,9 +1093,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from services.permission import get_or_create_user
     await get_or_create_user(user.id, user.username, user.first_name)
     # R41 i18n: 欢迎语文本走 locale 翻译
+    # R65 P1-01: safe_reply_text typed adapter 要求 UserMessage,用 from_raw_text 包装
     await safe_reply_text(update.message,
-        "📤 " + _t(user.id, "bot.upload_start_welcome")
-        + "\n" + three_bot_reminder()
+        UserMessage.from_raw_text(
+            "📤 " + _t(user.id, "bot.upload_start_welcome")
+            + "\n" + three_bot_reminder()
+        )
     )
 
 
@@ -1078,8 +1106,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_force_join(update, context):
         return
     await safe_reply_text(update.message,
-        _i18n_t('bot.up.s18')
-        + common_faq()
+        UserMessage.from_raw_text(
+            _i18n_t('bot.up.s18')
+            + common_faq()
+        )
     )
 
 
@@ -1090,7 +1120,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await check_upload_permission(user.id):
         # R41 i18n: 上传禁用文本走 locale 翻译
-        await update.message.reply_text("🚫 " + _t(user.id, "bot.upload_banned"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("🚫 " + _t(user.id, "bot.upload_banned")))
         return
 
     target_channel_id = await _get_upload_target_channel()
@@ -1103,9 +1133,7 @@ async def start_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "src_messages": [],
     }
     # R41 i18n: 批次上传模式提示走 locale 翻译
-    await update.message.reply_text(
-        "📦 " + _t(user.id, "bot.batch_upload_started")
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text("📦 " + _t(user.id, "bot.batch_upload_started")))
 
 
 async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1113,9 +1141,9 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if "batch" in context.user_data:
         del context.user_data["batch"]
-        await update.message.reply_text(_i18n_t('bot.up.s19'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s19')))
     else:
-        await update.message.reply_text(_i18n_t('bot.up.s20'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s20')))
 
 
 async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1124,14 +1152,14 @@ async def note_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = context.user_data.get("batch")
     if batch is None:
-        await update.message.reply_text(_i18n_t('bot.up.s21'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s21')))
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text(_i18n_t('bot.up.s22'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s22')))
         return
     batch["note"] = note_text
-    await update.message.reply_text(_i18n_t('bot.up.s8', note_text=note_text))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s8', note_text=note_text)))
 
 
 @require_maintenance_check(action=_i18n_t('bot.up.s2'))
@@ -1142,19 +1170,17 @@ async def new_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await check_upload_permission(user.id):
         # R41 i18n: 上传禁用文本走 locale 翻译
-        await update.message.reply_text("🚫 " + _t(user.id, "bot.upload_banned"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("🚫 " + _t(user.id, "bot.upload_banned")))
         return
     if "batch" in context.user_data:
-        await update.message.reply_text(_i18n_t('bot.up.s23'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s23')))
         return
     context.user_data["_collecting_collection"] = {
         "codes": [],
         "note": "",
     }
     # R41 i18n: 合集打包模式提示走 locale 翻译
-    await update.message.reply_text(
-        "📦 " + _t(user.id, "bot.collection_packing_started")
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text("📦 " + _t(user.id, "bot.collection_packing_started")))
 
 
 async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1164,12 +1190,12 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     coll = context.user_data.pop("_collecting_collection", None)
     if coll is None:
-        await update.message.reply_text(_i18n_t('bot.up.s24'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s24')))
         return
 
     codes = coll.get("codes", [])
     if not codes:
-        await update.message.reply_text(_i18n_t('bot.up.s25'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s25')))
         return
 
     # 去重并保留顺序
@@ -1215,10 +1241,10 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 from database.cache_store import get_cache_store
                 await get_cache_store().upsert_file_record_local(record, mark_dirty=True)
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:end_collection'))
     except Exception as e:
         logger.error(f"[Up][collection] file_records 写入失败 (code={collection_code}): {e}")
-        await update.message.reply_text(_i18n_t('bot.up_bot.s1'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up_bot.s1')))
         return
 
     # 写入 codes 表(支持后续 offline 标记与过期检查)
@@ -1249,7 +1275,7 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 from database.cache_store import get_cache_store
                 await get_cache_store().upsert_code_local(ce, mark_dirty=True)
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:end_collection'))
         from database.cache import get_code_cache
         get_code_cache().set(f"code:{collection_code}", ce)
         from database.cache import clear_negative_file
@@ -1257,9 +1283,7 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[Up][collection] codes 表写入失败(code={collection_code}): {e}")
 
-    await update.message.reply_text(
-        _i18n_t('bot.up.s9', collection_code=collection_code, len_unique_codes=len(unique_codes))
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s9', collection_code=collection_code, len_unique_codes=len(unique_codes))))
 
 
 async def cancel_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1268,9 +1292,9 @@ async def cancel_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if "_collecting_collection" in context.user_data:
         del context.user_data["_collecting_collection"]
-        await update.message.reply_text(_i18n_t('bot.up.s26'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s26')))
     else:
-        await update.message.reply_text(_i18n_t('bot.up.s27'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s27')))
 
 
 async def note_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1279,14 +1303,14 @@ async def note_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     coll = context.user_data.get("_collecting_collection")
     if coll is None:
-        await update.message.reply_text(_i18n_t('bot.up.s28'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s28')))
         return
     note_text = " ".join(context.args) if context.args else ""
     if not note_text:
-        await update.message.reply_text(_i18n_t('bot.up.s29'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s29')))
         return
     coll["note"] = note_text
-    await update.message.reply_text(_i18n_t('bot.up.s10', note_text=note_text))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s10', note_text=note_text)))
 
 
 async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1295,7 +1319,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     batch = context.user_data.pop("batch", None)
     if batch is None:
-        await update.message.reply_text(_i18n_t('bot.up.s30'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s30')))
         return
 
     # PRE-13: 仅 flush 当前用户的 media group，避免清掉其他用户正在进行中的批次
@@ -1313,7 +1337,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     src_messages = batch.get("src_messages", [])
     if not src_messages:
-        await update.message.reply_text(_i18n_t('bot.up.s31'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s31')))
         return
 
     target_ch = batch.get("target_channel_id") or await _get_upload_target_channel()
@@ -1430,7 +1454,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not channel_msg_ids:
         # R41 i18n: 文件处理失败提示走 locale 翻译
-        await update.message.reply_text("⚠️ " + _t(user.id, "bot.file_processing_failed"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user.id, "bot.file_processing_failed")))
         await metrics.record_error("up_bot")
         # R35 P0-4: 批次全部文件复制失败,推进 FAILED_RETRYABLE
         await _transition_upload_session_safe(
@@ -1463,10 +1487,7 @@ async def end_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "upload_id": upload_id,  # R35 P0-4: 关联 upload_session
     }
 
-    await update.message.reply_text(
-        _i18n_t('bot.up.s11', len_channel_msg_ids=len(channel_msg_ids)),
-        reply_markup=_build_ttl_keyboard(),
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s11', len_channel_msg_ids=len(channel_msg_ids))), reply_markup=_build_ttl_keyboard())
 
 
 @require_maintenance_check(action=_i18n_t('bot.up.s3'))
@@ -1541,7 +1562,7 @@ async def _collect_batch_file(update: Update, context: ContextTypes.DEFAULT_TYPE
             "file_meta": file_meta,
             "file_unique_id": _extract_file_unique_id(update.message),
         })
-        await update.message.reply_text(_i18n_t('bot.up.s32', file_type=file_type))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s32', file_type=file_type)))
 
 
 async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE, batch: dict):
@@ -1564,7 +1585,13 @@ async def _flush_batch_media_group(mgid: str, context: ContextTypes.DEFAULT_TYPE
         })
     first = grp["updates"][0]
     type_desc = " ".join(_i18n_t('bot.up.s12', v=v, k=k) for k, v in sorted(file_types.items()))
-    await safe_send_message(context.bot, chat_id=first.effective_chat.id, text=_i18n_t('bot.up.s33', type_desc=type_desc, len_grp_updates=len(grp['updates'])))
+    await safe_send_message(
+        context.bot,
+        chat_id=first.effective_chat.id,
+        payload=UserMessage.from_raw_text(
+            _i18n_t('bot.up.s33', type_desc=type_desc, len_grp_updates=len(grp['updates']))
+        ),
+    )
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1578,15 +1605,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await global_rate_limiter.acquire():
         # R41 i18n: 限速提示走 locale 翻译
-        await update.message.reply_text("⚠️ " + _t(user.id, "bot.system_busy"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user.id, "bot.system_busy")))
         return
     if not await user_rate_limiter.acquire(user.id):
         # R41 i18n: 用户限速提示走 locale 翻译
-        await update.message.reply_text("⚠️ " + _t(user.id, "bot.rate_limited"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user.id, "bot.rate_limited")))
         return
     if not await check_upload_permission(user.id):
         # R41 i18n: 上传权限提示走 locale 翻译
-        await update.message.reply_text("🚫 " + _t(user.id, "bot.no_upload_permission"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("🚫 " + _t(user.id, "bot.no_upload_permission")))
         return
 
     file_type = detect_file_type(update)
@@ -1599,15 +1626,15 @@ async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # P2: 媒体组上传同样需要限速,防止数十文件洪泛
     if not await global_rate_limiter.acquire():
         # R41 i18n: 限速提示走 locale 翻译
-        await update.message.reply_text("⚠️ " + _t(user.id, "bot.system_busy"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user.id, "bot.system_busy")))
         return
     if not await user_rate_limiter.acquire(user.id):
         # R41 i18n: 用户限速提示走 locale 翻译
-        await update.message.reply_text("⚠️ " + _t(user.id, "bot.rate_limited"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user.id, "bot.rate_limited")))
         return
     if not await check_upload_permission(user.id):
         # R41 i18n: 上传权限提示走 locale 翻译
-        await update.message.reply_text("🚫 " + _t(user.id, "bot.no_upload_permission"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("🚫 " + _t(user.id, "bot.no_upload_permission")))
         return
 
     file_type = detect_file_type(update)
@@ -1664,14 +1691,17 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
     )
 
     progress_msg = await safe_send_message(
-        context.bot, chat_id=user_id,
-        text=_i18n_t('bot.up.s34', total_count=total_count, total_count_2=total_count)
+        context.bot,
+        chat_id=user_id,
+        payload=UserMessage.from_raw_text(
+            _i18n_t('bot.up.s34', total_count=total_count, total_count_2=total_count)
+        ),
     )
 
     try:
         await progress_msg.edit_text(_i18n_t('bot.up.s35', total_count=total_count, total_count_2=total_count))
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_flush_media_group'))
 
     # B1 媒体组级秒传去重:整组所有文件都已存在且在同一 channel 才复用
     # (保证 batch_msg_ids 与 primary_channel_id 的一致性)
@@ -1712,7 +1742,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             try:
                 await progress_msg.edit_text(f"正在处理 {total_count} 个文件...\n已完成 {total_count}/{total_count}")
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_flush_media_group'))
             # R35 P0-4: 去重命中,推进 RECEIVED → COPIED_PRIMARY
             await _transition_upload_session_safe(
                 upload_id, "COPIED_PRIMARY", reason="dedup_hit",
@@ -1751,7 +1781,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                 try:
                     await progress_msg.edit_text(_i18n_t('bot.up.s61', total_count=total_count, total_count_2=total_count, total_count_4=total_count))
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_flush_media_group'))
                 # R35 P0-4: 批量 copy 成功,推进 RECEIVED → COPIED_PRIMARY
                 await _transition_upload_session_safe(
                     upload_id, "COPIED_PRIMARY", reason="copy_batch_done",
@@ -1787,7 +1817,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
                     try:
                         await progress_msg.edit_text(_i18n_t('bot.up.s63', total_count=total_count, i_1=i + 1, total_count_3=total_count))
                     except Exception:
-                        pass
+                        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_flush_media_group'))
             # R35 P0-4: 逐条回退完成(部分成功),推进 COPIED_PRIMARY
             if all_mids:
                 await _transition_upload_session_safe(
@@ -1808,7 +1838,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
             # R41 i18n: 文件处理失败提示走 locale 翻译
             await progress_msg.edit_text("⚠️ " + _t(user_id, "bot.file_processing_failed"))
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_flush_media_group'))
         return
 
     note = group["updates"][0].message.caption or ""
@@ -1818,7 +1848,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
         failed_hint = _i18n_t('bot.up.s13', failed_count=failed_count) if failed_count > 0 else ""
         await progress_msg.edit_text(_i18n_t('bot.up.s36', failed_hint=failed_hint))
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_flush_media_group'))
 
     # 暂存媒体组数据，等待用户选择有效期→备注→转发权限
     # R36 B0-1: 为每个 file_meta 注入结构化副本信息(group_id/file_unique_id/media_group_id)
@@ -1845,11 +1875,7 @@ async def _flush_media_group(media_group_id: str, context: ContextTypes.DEFAULT_
 
     # 发送上传选项
     try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=_i18n_t('bot.up.s50'),
-            reply_markup=_build_ttl_keyboard(),
-        )
+        await safe_send_message(context.bot, payload=UserMessage.from_raw_text(_i18n_t('bot.up.s50')), chat_id=user_id, reply_markup=_build_ttl_keyboard())
     except Exception as e:
         logger.warning(f"[Up] 发送TTL选择键盘失败: {e}")
         pass
@@ -1912,7 +1938,7 @@ async def _process_upload(
                 upload_id, "FAILED_RETRYABLE", reason=f"copy_failed: {e}",
                 last_error=str(e),
             )
-            await update.message.reply_text("⚠️ " + _t(user_id, "bot.file_processing_failed"))
+            await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user_id, "bot.file_processing_failed")))
             return
 
         # R36 B0-2: R100 归档改由 OutboxWorker 消费 upload_outbox 表完成(不再 fire-and-forget)
@@ -1955,10 +1981,7 @@ async def _process_upload(
     context.user_data["_upload_id"] = upload_id
 
     # 第一步：发送有效期选择
-    await update.message.reply_text(
-        _i18n_t('bot.up.s14'),
-        reply_markup=_build_ttl_keyboard(),
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s14')), reply_markup=_build_ttl_keyboard())
 
 
 # ─── 上传选项回调 ───
@@ -1981,30 +2004,18 @@ async def upload_option_callback(update: Update, context: ContextTypes.DEFAULT_T
         # 批次已通过 /note 设置备注的，跳过备注步骤
         if ("_pending_batch" in context.user_data
                 and context.user_data["_pending_batch"].get("note")):
-            await query.edit_message_text(
-                text=_i18n_t('bot.up.s58'),
-                reply_markup=_build_protect_keyboard(),
-            )
+            await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.up.s58')), reply_markup=_build_protect_keyboard())
         else:
-            await query.edit_message_text(
-                text=_i18n_t('bot.up.s59'),
-                reply_markup=_build_note_keyboard(),
-            )
+            await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.up.s59')), reply_markup=_build_note_keyboard())
 
     elif key == "note":
         if value == "skip":
-            await query.edit_message_text(
-                text=_i18n_t('bot.up.s62'),
-                reply_markup=_build_protect_keyboard(),
-            )
+            await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.up.s62')), reply_markup=_build_protect_keyboard())
         elif value == "add":
             context.user_data["awaiting_note_since"] = time.time()
             context.user_data["_note_query_msg_id"] = query.message.message_id
             context.user_data["_note_query_chat_id"] = query.message.chat_id
-            await query.edit_message_text(
-                text=_i18n_t('bot.up.s64'),
-                reply_markup=None,
-            )
+            await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.up.s64')), reply_markup=None)
 
     elif key == "protect":
         context.user_data["protect_content"] = value
@@ -2142,9 +2153,9 @@ async def _finalize_upload(query, context, user_id: int):
                     last_error="main_channel or channel_msg_id is zero",
                 )
                 try:
-                    await query.edit_message_text(text=_i18n_t('bot.up.s65'))
+                    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.up.s65')))
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_finalize_upload'))
                 return
 
             await pending_col.insert_one({
@@ -2269,11 +2280,8 @@ async def _finalize_upload(query, context, user_id: int):
 
         # 清除按钮，显示确认消息
         # R41 i18n: 文件接收确认走 locale 翻译
-        await query.edit_message_text(
-            text="📦 " + _t(user_id, "bot.file_received_pending",
-                            bot_username=settings.DECODER_BOT_USERNAME),
-            reply_markup=None,
-        )
+        await safe_edit_message_text(query, UserMessage.from_raw_text("📦 " + _t(user_id, "bot.file_received_pending",
+                            bot_username=settings.DECODER_BOT_USERNAME)), reply_markup=None)
     except Exception as e:
         logger.error(f"[Up] 写入pending_uploads失败: {e}")
         await metrics.record_error("up_bot")
@@ -2284,11 +2292,9 @@ async def _finalize_upload(query, context, user_id: int):
         )
         try:
             # R41 i18n: 文件处理失败提示走 locale 翻译
-            await query.edit_message_text(
-                text="⚠️ " + _t(user_id, "bot.file_processing_failed")
-            )
+            await safe_edit_message_text(query, UserMessage.from_raw_text("⚠️ " + _t(user_id, "bot.file_processing_failed")))
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/up_bot.py:_finalize_upload'))
 
 
 # ─── 备注文字输入处理 ───
@@ -2313,12 +2319,10 @@ async def _handle_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tokens.append(line)
         new_codes = [t for t in tokens if is_valid_code_format(t)]
         if not new_codes:
-            await update.message.reply_text(_i18n_t('bot.up.s51'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s51')))
             return
         coll["codes"].extend(new_codes)
-        await update.message.reply_text(
-            _i18n_t('bot.up.s37', len_new_codes=len(new_codes), len_coll_codes=len(coll['codes']))
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s37', len_new_codes=len(new_codes), len_coll_codes=len(coll['codes']))))
         return
 
     user_id = update.effective_user.id
@@ -2328,22 +2332,18 @@ async def _handle_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if time.time() - note_since > 60:
         del context.user_data["awaiting_note_since"]
-        await update.message.reply_text(_i18n_t('bot.up.s38'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s38')))
         return
 
     # 保存备注
     context.user_data["_note"] = update.message.text
     del context.user_data["awaiting_note_since"]
 
-    await update.message.reply_text(_i18n_t('bot.up.s15', update_message_text=update.message.text))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s15', update_message_text=update.message.text)))
 
     # 弹出转发权限选择
     try:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=_i18n_t('bot.up.s52'),
-            reply_markup=_build_protect_keyboard(),
-        )
+        await safe_send_message(context.bot, payload=UserMessage.from_raw_text(_i18n_t('bot.up.s52')), chat_id=user_id, reply_markup=_build_protect_keyboard())
     except Exception as e:
         logger.warning(f"[Up] 发送转发权限选择失败: {e}")
 
@@ -2352,17 +2352,13 @@ async def cancel_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """取消/跳过备注输入"""
     if context.user_data.get("awaiting_note_since"):
         del context.user_data["awaiting_note_since"]
-        await update.message.reply_text(_i18n_t('bot.up.s39'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s39')))
         try:
-            await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text=_i18n_t('bot.up.s60'),
-                reply_markup=_build_protect_keyboard(),
-            )
+            await safe_send_message(context.bot, payload=UserMessage.from_raw_text(_i18n_t('bot.up.s60')), chat_id=update.effective_user.id, reply_markup=_build_protect_keyboard())
         except Exception as e:
             logger.warning(f"[Up] 发送转发权限选择失败: {e}")
     else:
-        await update.message.reply_text(_i18n_t('bot.up_bot.s2'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up_bot.s2')))
 
 
 def _build_ttl_keyboard():
@@ -2782,18 +2778,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看上传状态: /status <upload_id>"""
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.up.s53'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s53')))
             return
         upload_id = context.args[0]
         receipt = await upload_receipt.get_upload_status(upload_id)
         if not receipt:
-            await update.message.reply_text(_i18n_t('bot.up.s54'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s54')))
             return
         text = await upload_receipt.format_receipt(receipt)
-        await update.message.reply_text(text)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(text))
     except Exception as e:
         logger.exception(f"[Up][status] 查询上传状态失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up_bot.s3')))
 
 
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2805,13 +2801,13 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_filter = context.args[0] if context.args else None
         tasks = await task_center.list_user_tasks(user.id, status=status_filter, limit=20)
         if not tasks:
-            await update.message.reply_text(_i18n_t('bot.up.s55'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s55')))
             return
         lines = [await task_center.format_task_status(t) for t in tasks]
-        await update.message.reply_text("\n\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Up][tasks] 查询任务列表失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up_bot.s3')))
 
 
 async def cmd_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2829,15 +2825,15 @@ async def cmd_collections(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await collections_svc.list_collections(owner_id=user.id, page=page, page_size=10)
         items = result.get("items", [])
         if not items:
-            await update.message.reply_text(_i18n_t('bot.up.s56'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s56')))
             return
         lines = [_i18n_t('bot.up.s16', result_get_page_1=result.get('page', 1), result_get_total_pages_1=result.get('total_pages', 1), result_get_total_0=result.get('total', 0))]
         for c in items:
             lines.append(_i18n_t('bot.up.s49', c_get_name=c.get('name', '未命名'), c_get_id=c.get('id')))
-        await update.message.reply_text("\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Up][collections] 查询合集列表失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up_bot.s3')))
 
 
 async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2848,13 +2844,13 @@ async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         items = await notifications.list_unread(user.id, limit=20)
         if not items:
-            await update.message.reply_text(_i18n_t('bot.up.s57'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up.s57')))
             return
         lines = [await notifications.format_notification(n) for n in items]
-        await update.message.reply_text("\n\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Up][notifications] 查询通知失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.up_bot.s3'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.up_bot.s3')))
 
 
 async def _init():

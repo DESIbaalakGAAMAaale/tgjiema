@@ -66,6 +66,7 @@ def _is_expired(expire_time) -> bool:
             exp = _dt.datetime.fromtimestamp(float(expire_time))
         return _dt.datetime.now() >= exp
     except (ValueError, TypeError):
+        logger.debug(_i18n_t('diagnostics.r65.p1_04.user_repair_is_expired_invalid', expire_time=repr(expire_time)))
         return False
 
 

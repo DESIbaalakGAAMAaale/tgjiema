@@ -14,10 +14,22 @@ handler 不再自行决定风险级别,只能构造命令并交给 policy/Comman
     - 与 button_security.HIGH_RISK_ACTIONS / button_approval_policy 协同:
         * HIGH_RISK_ACTIONS 是底层 effect_type 集合(用于 callback 签名格式门禁)
         * HIGH_RISK_POLICY 是 command 级别的策略表(用于 CommandBus 审批门禁)
+
+R65 P0-05 整改:
+    - 对 destructive namespace 使用 fail-closed:未知 destructive action 抛
+      HIGH_RISK.ACTION.UNREGISTERED,不再返回 None/False
+    - destructive namespace = 显式关键词集合(delete/purge/ban/block/takedown/
+      detach/restore/reset/rotate/assign/revoke/grant/enable/disable/wipe/clear/
+      shutdown/restart/factory_reset/break_glass/force_logout/approve_appeal/
+      reject_appeal/update_config/reload_config) + button_security.HIGH_RISK_ACTIONS
+    - 非 destructive action(view/cancel/refresh/list/get/query/read/search/ping 等)
+      仍返回 None/False(只读/查询类操作)
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from loguru import logger
 
 # 复用 command_bus 中的权限常量,避免重复定义
 from services.command_bus import (
@@ -31,6 +43,8 @@ from services.command_bus import (
     PERM_USERS_BAN,
     PERM_USERS_UNBAN,
 )
+
+from services.i18n import translate as _i18n_t
 
 
 @dataclass(frozen=True)
@@ -241,6 +255,101 @@ HIGH_RISK_POLICY: dict[str, HighRiskRule] = {
 
 
 # ════════════════════════════════════════════════════════════════
+# R65 P0-05: destructive namespace 定义 — fail-closed 关键词集合
+# ════════════════════════════════════════════════════════════════
+# 任何 action 名匹配以下关键词之一,即属于 destructive namespace,
+# 必须在 HIGH_RISK_POLICY 中显式注册(否则 fail-closed 抛
+# HIGH_RISK.ACTION.UNREGISTERED,防止新 destructive action 被误判为低风险)。
+# 关键词来源:
+#   1. HIGH_RISK_POLICY 已注册的 13 个 action 的核心语义
+#   2. button_security.HIGH_RISK_ACTIONS 集合(effect_type 维度)
+#   3. 行业通用 destructive 关键词(delete/purge/drop/wipe 等)
+# 非 destructive action(view/cancel/refresh/list/get/query/read/search/ping/
+# readiness/export_status/health_check 等)不会匹配以下关键词,返回 None/False。
+DESTRUCTIVE_ACTION_KEYWORDS: tuple[str, ...] = (
+    # 删除/清除/销毁
+    "delete", "purge", "drop", "truncate", "destroy", "wipe", "clear", "scrub",
+    # 封禁/屏蔽/踢出
+    "ban", "unban", "block", "kick",
+    # 下架/分离/移除
+    "takedown", "detach", "remove",
+    # 恢复/还原(覆盖生产数据,高风险)
+    "restore", "recover",
+    # 重置/轮换(密钥/配额等敏感操作)
+    "reset", "rotate",
+    # 权限授予/撤销
+    "assign", "revoke", "grant",
+    # 状态变更(维护/启用/禁用,影响可用性)
+    "enable", "disable",
+    # 工厂重置/紧急访问/强制登出
+    "factory_reset", "break_glass", "force_logout",
+    # 申诉审批(影响其他用户权益)
+    "approve_appeal", "reject_appeal",
+    # 配置变更
+    "update_config", "reload_config",
+    # 关闭/重启
+    "shutdown", "restart",
+)
+
+
+def _is_destructive_namespace(action: str) -> bool:
+    """R65 P0-05: 检查 action 是否属于 destructive namespace。
+
+    判定规则:
+        1. action 名(小写)包含 DESTRUCTIVE_ACTION_KEYWORDS 中任一关键词 → True
+        2. action 名精确匹配 button_security.HIGH_RISK_ACTIONS 集合 → True
+        3. 其他 → False(只读/查询类操作)
+
+    Args:
+        action: 命令标识
+
+    Returns:
+        True 表示该 action 属于 destructive namespace,必须在 HIGH_RISK_POLICY 注册
+    """
+    if not action:
+        return False
+    action_lower = action.lower().strip()
+    # 1. 关键词匹配(action 包含 destructive 关键词)
+    for keyword in DESTRUCTIVE_ACTION_KEYWORDS:
+        if keyword in action_lower:
+            return True
+    # 2. 精确匹配 button_security.HIGH_RISK_ACTIONS(effect_type 集合)
+    # 延迟导入避免循环依赖
+    try:
+        from services.button_security import HIGH_RISK_ACTIONS
+        if action_lower in HIGH_RISK_ACTIONS:
+            return True
+    except ImportError as e:
+        # button_security 不可用时,仅依赖关键词匹配(不影响主流程)
+        logger.warning(_i18n_t('diagnostics.r65.p1_04.high_risk_button_security_unavailable', error=e))
+    return False
+
+
+def _raise_unregistered(action: str) -> None:
+    """R65 P0-05: 抛 HIGH_RISK.ACTION.UNREGISTERED 异常(fail-closed)。
+
+    Args:
+        action: 未注册的 destructive action 名
+
+    Raises:
+        AppError: 始终抛出 HIGH_RISK_ACTION_UNREGISTERED
+    """
+    from services.error_codes import AppError, ErrorCodes
+    raise AppError(
+        ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED,
+        params={
+            "action": action,
+            "reason": (
+                "action matches destructive namespace but is not registered in "
+                "HIGH_RISK_POLICY; register it explicitly or rename to avoid "
+                "destructive keywords (delete/purge/ban/block/takedown/detach/"
+                "restore/reset/rotate/assign/revoke/grant/enable/disable/...)"
+            ),
+        },
+    )
+
+
+# ════════════════════════════════════════════════════════════════
 # 查询接口
 # ════════════════════════════════════════════════════════════════
 
@@ -248,13 +357,28 @@ HIGH_RISK_POLICY: dict[str, HighRiskRule] = {
 def get_policy(action: str) -> HighRiskRule | None:
     """查询 action 的高风险策略。
 
+    R65 P0-05: 对 destructive namespace 使用 fail-closed。
+    若 action 属于 destructive namespace 但未在 HIGH_RISK_POLICY 中注册,
+    抛 HIGH_RISK.ACTION.UNREGISTERED 异常(不返回 None)。
+
     Args:
         action: 命令标识(如 "delete_file" / "ban_user")
 
     Returns:
-        HighRiskRule 对象;返回 None 表示非高风险操作
+        HighRiskRule 对象;返回 None 表示非高风险操作(只读/查询类)
+
+    Raises:
+        AppError(HIGH_RISK_ACTION_UNREGISTERED): 当 action 属于 destructive
+            namespace 但未在 HIGH_RISK_POLICY 中注册时
     """
-    return HIGH_RISK_POLICY.get(action)
+    rule = HIGH_RISK_POLICY.get(action)
+    if rule is not None:
+        return rule
+    # action 不在 HIGH_RISK_POLICY 中
+    if _is_destructive_namespace(action):
+        _raise_unregistered(action)
+    # 非 destructive action,返回 None(只读/查询类)
+    return None
 
 
 def is_high_risk(action: str) -> bool:
@@ -263,43 +387,69 @@ def is_high_risk(action: str) -> bool:
     CommandBus 工厂函数用此函数决定 requires_approval:
         requires_approval = HighRiskPolicy.is_high_risk(action)
 
+    R65 P0-05: 对 destructive namespace fail-closed。
+    若 action 属于 destructive namespace 但未在 HIGH_RISK_POLICY 中注册,
+    抛 HIGH_RISK.ACTION.UNREGISTERED 异常(不返回 False)。
+
     Args:
         action: 命令标识
 
     Returns:
         True 表示该 action 在 HIGH_RISK_POLICY 表中(必须走审批门禁)
+
+    Raises:
+        AppError(HIGH_RISK_ACTION_UNREGISTERED): 当 action 属于 destructive
+            namespace 但未在 HIGH_RISK_POLICY 中注册时
     """
-    return action in HIGH_RISK_POLICY
+    if action in HIGH_RISK_POLICY:
+        return True
+    if _is_destructive_namespace(action):
+        _raise_unregistered(action)
+    return False
 
 
 def get_required_role(action: str) -> str | None:
     """查询 action 所需的 RBAC 角色。
+
+    R65 P0-05: 对 destructive namespace fail-closed。
 
     Args:
         action: 命令标识
 
     Returns:
         RBAC 权限标识;非高风险 action 返回 None
+
+    Raises:
+        AppError(HIGH_RISK_ACTION_UNREGISTERED): 当 action 属于 destructive
+            namespace 但未在 HIGH_RISK_POLICY 中注册时
     """
-    rule = HIGH_RISK_POLICY.get(action)
+    rule = get_policy(action)  # 复用 get_policy 的 fail-closed 逻辑
     return rule.required_role if rule else None
 
 
 def requires_mfa(action: str) -> bool:
     """查询 action 是否强制 MFA。
 
+    R65 P0-05: 对 destructive namespace fail-closed。
+
     Args:
         action: 命令标识
 
     Returns:
         True 表示需要 MFA;非高风险 action 返回 False
+
+    Raises:
+        AppError(HIGH_RISK_ACTION_UNREGISTERED): 当 action 属于 destructive
+            namespace 但未在 HIGH_RISK_POLICY 中注册时
     """
-    rule = HIGH_RISK_POLICY.get(action)
+    rule = get_policy(action)  # 复用 get_policy 的 fail-closed 逻辑
     return rule.requires_mfa if rule else False
 
 
 def requires_two_person(action: str) -> bool:
     """查询 action 是否强制双人审批。
+
+    R65 P0-05: 对 destructive namespace fail-closed。
 
     Args:
         action: 命令标识
@@ -307,21 +457,31 @@ def requires_two_person(action: str) -> bool:
     Returns:
         True 表示需要双人审批(requester != approver + approver MFA);
         非高风险 action 返回 False
+
+    Raises:
+        AppError(HIGH_RISK_ACTION_UNREGISTERED): 当 action 属于 destructive
+            namespace 但未在 HIGH_RISK_POLICY 中注册时
     """
-    rule = HIGH_RISK_POLICY.get(action)
+    rule = get_policy(action)  # 复用 get_policy 的 fail-closed 逻辑
     return rule.requires_two_person if rule else False
 
 
 def requires_resource_version(action: str) -> bool:
     """查询 action 是否强制 resource version CAS。
 
+    R65 P0-05: 对 destructive namespace fail-closed。
+
     Args:
         action: 命令标识
 
     Returns:
         True 表示需要 resource version 绑定;非高风险 action 返回 False
+
+    Raises:
+        AppError(HIGH_RISK_ACTION_UNREGISTERED): 当 action 属于 destructive
+            namespace 但未在 HIGH_RISK_POLICY 中注册时
     """
-    rule = HIGH_RISK_POLICY.get(action)
+    rule = get_policy(action)  # 复用 get_policy 的 fail-closed 逻辑
     return rule.requires_resource_version if rule else False
 
 
@@ -332,6 +492,7 @@ def requires_resource_version(action: str) -> bool:
 __all__ = [
     "HighRiskRule",
     "HIGH_RISK_POLICY",
+    "DESTRUCTIVE_ACTION_KEYWORDS",
     "get_policy",
     "is_high_risk",
     "get_required_role",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R64 P1-12: 生产运行证据统一生成入口。
+"""R64 P1-12 / R65 P0-04: 生产运行证据统一生成入口。
 
 本脚本是 P1-12 生产运行证据框架的统一入口,编排以下 5 类证据生成:
     1. soak_test_7day.sh        — 7 天多实例 soak 测试
@@ -13,7 +13,7 @@
 
 使用方法:
     # 生成全部证据(production 模式,需要真实环境)
-    python scripts/generate_production_evidence.py --all
+    python scripts/generate_production_evidence.py --all --production
 
     # 只生成 soak 测试证据(--dry-run 仅编排不执行)
     python scripts/generate_production_evidence.py --soak --dry-run
@@ -21,15 +21,20 @@
     # 指定输出目录
     python scripts/generate_production_evidence.py --all --output-dir /tmp/evidence
 
-    # 跳过某些证据(避免长时间运行)
+    # 跳过某些证据(避免长时间运行)—— 仅 dry_run 模式允许;
+    # production 模式禁止 --skip,违反则报错退出
     python scripts/generate_production_evidence.py --all --skip soak --skip ru_72h
 
     # 列出可用证据类型
     python scripts/generate_production_evidence.py --list
 
+    # 验证 production promotion 证据是否满足严格门禁
+    python scripts/generate_production_evidence.py \
+        --verify-promotion production-evidence/production_evidence_index.json
+
 退出码:
-    0: 所有调用的证据脚本成功完成
-    1: 至少一个证据脚本失败(查看日志详情)
+    0: 所有调用的证据脚本成功完成 / verify-promotion 通过
+    1: 至少一个证据脚本失败 / verify-promotion 失败(查看日志详情)
     2: 参数错误或环境不可用
 
 R64 P1-12 验收标准:
@@ -38,6 +43,18 @@ R64 P1-12 验收标准:
     - 真实 provider outbox 故障注入(28 组合 × 7 cycle = 196 次,RTO ≤ 60s)
     - 72 小时 RU 空载验证(Bot 0 RU/天,集群 ≤100 RU/天)
     - 相同 digest 供应链验证(镜像 digest 与 SBOM/签名一致)
+
+R65 P0-04 整改要点:
+    - 默认 evidence_mode=dry_run,输出文件名含 dry_run,JSON 含
+      evidence_mode="dry_run" + production_promotion_allowed=false,
+      严禁出现 "production passed" 等通过性断言。
+    - production promotion 只接受独立、签名、不可变、未过期的真实证据 artifact。
+    - 每类证据含 environment_id / commit_sha / image_digest / started_at /
+      ended_at / raw_data_digest / executed_by / approved_by / signature。
+    - SOAK_7DAY / RESTORE_3X / OUTBOX_FAULT_INJECTION / RU_72H / SUPPLY_CHAIN
+      任一缺失/过期即阻断;--skip 在 production 模式下被禁止。
+    - verify_production_promotion() 强制校验以上条件,失败抛
+      AppError(ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT)。
 """
 from __future__ import annotations
 
@@ -102,6 +119,62 @@ EVIDENCE_TYPES = {
         "report_glob": "supply_chain_report_*.json",
     },
 }
+
+
+# ─── R65 P0-04: 生产证据 artifact 严格门禁 ──────────────────────
+# 5 类必需的 production artifact 类型(evidence_type → artifact_type 映射)。
+# 任一缺失/过期/dry_run/未签名即阻断 production promotion。
+EVIDENCE_TYPE_TO_ARTIFACT_TYPE = {
+    "soak": "SOAK_7DAY",
+    "vps_recovery": "RESTORE_3X",
+    "chaos": "OUTBOX_FAULT_INJECTION",
+    "ru_72h": "RU_72H",
+    "supply_chain": "SUPPLY_CHAIN",
+}
+
+# production artifact 必需字段(每个 artifact 必须包含全部字段)
+REQUIRED_ARTIFACT_FIELDS = (
+    "artifact_type",
+    "environment_id",
+    "commit_sha",
+    "image_digest",
+    "started_at",
+    "ended_at",
+    "expires_at",
+    "raw_data_digest",
+    "executed_by",
+    "approved_by",
+    "signature",
+)
+
+# 5 类必需 artifact 类型(任一缺失即阻断)
+REQUIRED_ARTIFACT_TYPES = (
+    "SOAK_7DAY",
+    "RESTORE_3X",
+    "OUTBOX_FAULT_INJECTION",
+    "RU_72H",
+    "SUPPLY_CHAIN",
+)
+
+# 默认 artifact 过期时间(天) — production artifact 7 天后过期
+DEFAULT_ARTIFACT_TTL_DAYS = 7
+
+
+def _get_commit_sha() -> str:
+    """获取当前 git HEAD SHA(失败回退到 GITHUB_SHA 环境变量或 unknown)。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(_REPO_ROOT),
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            sha = result.stdout.strip()
+            if sha and len(sha) >= 7:
+                return sha
+    except Exception:
+        pass
+    return os.environ.get("GITHUB_SHA", "unknown")
 
 
 def _now_iso() -> str:
@@ -276,11 +349,43 @@ async def generate_evidence(
     dry_run: bool,
     extra_args_map: dict[str, list[str]],
     timeout_seconds: int = 0,
+    *,
+    evidence_mode: str = "dry_run",
+    skip_types: list[str] | None = None,
 ) -> dict:
-    """生成多个证据,返回汇总报告。"""
+    """生成多个证据,返回汇总报告。
+
+    R65 P0-04: ``evidence_mode`` 默认为 ``dry_run`` — 输出显式标记
+    ``evidence_mode="dry_run"`` + ``production_promotion_allowed=false``,
+    且 dry_run 模式下日志严禁出现 "production passed" 等通过性断言。
+    只有显式传入 ``evidence_mode="production"`` 才能生成可被消费的生产证据,
+    且 production 模式禁止 ``--skip``(``skip_types`` 必须为空)。
+
+    Args:
+        evidence_mode: ``"dry_run"``(默认)或 ``"production"``。
+        skip_types: 通过 ``--skip`` 跳过的证据类型列表(production 模式禁止非空)。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     started_at = _now_iso()
     start_ts = time.time()
+
+    # R65 P0-04: production 模式禁止 --skip
+    skip_types = skip_types or []
+    if evidence_mode == "production" and skip_types:
+        print(
+            "ERROR: production 模式禁止 --skip — production promotion 必须包含"
+            "全部 5 类证据,不得跳过任何一项",
+            file=sys.stderr,
+        )
+        return {
+            "schema_version": "r64_p1_12_v1",
+            "evidence_mode": evidence_mode,
+            "production_promotion_allowed": False,
+            "overall_status": "failed",
+            "error": "production 模式禁止 --skip",
+            "results": [],
+            "flags": {"skip": skip_types, "dry_run": dry_run},
+        }
 
     results = []
     for et in evidence_types:
@@ -304,6 +409,15 @@ async def generate_evidence(
     all_passed = all(r["status"] == "passed" for r in results)
     any_failed = any(r["status"] == "failed" for r in results)
 
+    # R65 P0-04: 计算 production_promotion_allowed
+    # 仅当 evidence_mode=production 且所有证据 passed 且无 --skip 时才允许晋级
+    production_promotion_allowed = (
+        evidence_mode == "production"
+        and all_passed
+        and not skip_types
+        and len(results) == len(EVIDENCE_TYPES)
+    )
+
     summary = {
         "schema_version": "r64_p1_12_v1",
         "generated_at": completed_at,
@@ -313,6 +427,14 @@ async def generate_evidence(
         # 使用 try/except 兼容两种场景(相对路径或绝对路径)
         "output_dir": str(_safe_relative_to(output_dir, _REPO_ROOT)),
         "dry_run": dry_run,
+        # R65 P0-04: evidence_mode 显式标记,禁止 dry_run 输出被消费为 production
+        "evidence_mode": evidence_mode,
+        "production_promotion_allowed": production_promotion_allowed,
+        # R65 P0-04: 记录 CLI flags,production promotion 校验时禁止 --skip
+        "flags": {
+            "skip": list(skip_types),
+            "dry_run": dry_run,
+        },
         "evidence_count": len(results),
         "passed_count": sum(1 for r in results if r["status"] == "passed"),
         "failed_count": sum(1 for r in results if r["status"] == "failed"),
@@ -324,7 +446,7 @@ async def generate_evidence(
         "results": results,
     }
 
-    # 写入索引文件
+    # 写入索引文件(向后兼容 — 现有测试/CI 依赖此文件名)
     index_path = output_dir / "production_evidence_index.json"
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
@@ -332,8 +454,231 @@ async def generate_evidence(
     print(f"证据索引: {index_path}")
     print(f"总状态: {summary['overall_status']} "
           f"(passed={summary['passed_count']}, failed={summary['failed_count']})")
+    # R65 P0-04: dry_run 模式必须显式标记,且日志不得出现 "production passed"
+    if evidence_mode == "dry_run":
+        print(f"evidence_mode: dry_run — 仅用于 schema/dry-run 验证,"
+              f"不可作为 production promotion 证据")
+        print(f"production_promotion_allowed: false (dry_run 模式)")
+        # 同时写入带 dry_run 标记的副本文件,文件名包含 dry_run + commit
+        commit_sha = _get_commit_sha()
+        dry_run_filename = (
+            f"production_evidence_dry_run_{commit_sha}.json"
+        )
+        dry_run_path = output_dir / dry_run_filename
+        with open(dry_run_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"dry_run 证据副本: {dry_run_path}")
+    else:
+        # production 模式: 可作为 production promotion 输入
+        # 注意:此处不输出 "production passed" 字样,而是输出客观状态
+        print(f"evidence_mode: production")
+        print(f"production_promotion_allowed: "
+              f"{summary['production_promotion_allowed']}")
 
     return summary
+
+
+def verify_production_promotion(evidence_path: Path | str) -> dict:
+    """R65 P0-04: 强制校验 production promotion 证据是否满足严格门禁。
+
+    校验项(任一失败即抛 ``AppError(PRODUCTION_EVIDENCE_INSUFFICIENT)``):
+        1. ``evidence_mode == "production"`` (拒绝 dry_run)
+        2. 证据文件已签名(cosign 或 GPG signature verified)
+        3. 证据文件未过期(每个 artifact 有 ``expires_at`` ISO 8601)
+        4. 全部 5 类必需 artifact 类型存在:
+           ``SOAK_7DAY`` / ``RESTORE_3X`` / ``OUTBOX_FAULT_INJECTION`` /
+           ``RU_72H`` / ``SUPPLY_CHAIN``
+        5. 每个 artifact 含全部必需字段:
+           ``environment_id`` / ``commit_sha`` / ``image_digest`` /
+           ``started_at`` / ``ended_at`` / ``expires_at`` /
+           ``raw_data_digest`` / ``executed_by`` / ``approved_by`` / ``signature``
+        6. 未使用 ``--skip`` 标志(记录在 evidence file 的 ``flags.skip``)
+
+    Args:
+        evidence_path: evidence JSON 文件路径。
+
+    Returns:
+        校验通过的 evidence dict(含 ``production_promotion_allowed=True``)。
+
+    Raises:
+        AppError(ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT): 任一校验失败。
+    """
+    # 延迟导入 AppError / ErrorCodes,避免在 import 时触发 services.i18n 链路
+    from services.error_codes import AppError, ErrorCodes
+
+    path = Path(evidence_path)
+    if not path.exists():
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": f"证据文件不存在: {path}",
+                "missing": "ALL",
+            },
+        )
+
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": f"证据文件无法解析: {e}",
+                "missing": "ALL",
+            },
+        ) from e
+
+    if not isinstance(evidence, dict):
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": "证据文件根对象必须为 dict",
+                "missing": "ALL",
+            },
+        )
+
+    missing: list[str] = []
+    reason_parts: list[str] = []
+
+    # 1. evidence_mode 必须为 production(拒绝 dry_run)
+    evidence_mode = evidence.get("evidence_mode")
+    if evidence_mode != "production":
+        reason_parts.append(
+            f"evidence_mode={evidence_mode!r}(必须为 'production',"
+            f"dry_run 证据不可用于 production promotion)"
+        )
+        missing.append("EVIDENCE_MODE_PRODUCTION")
+
+    # 2. 证据文件必须已签名(cosign 或 GPG signature verified)
+    signature = evidence.get("signature")
+    if not isinstance(signature, dict):
+        reason_parts.append("证据文件缺少 signature 块(顶层签名)")
+        missing.append("FILE_SIGNATURE")
+    else:
+        sig_method = signature.get("method")
+        sig_verified = signature.get("verified")
+        if sig_method not in ("cosign", "gpg"):
+            reason_parts.append(
+                f"signature.method={sig_method!r}(必须为 'cosign' 或 'gpg')"
+            )
+            missing.append("FILE_SIGNATURE_METHOD")
+        if sig_verified is not True:
+            reason_parts.append(
+                "signature.verified 不为 true(签名未通过验证)"
+            )
+            missing.append("FILE_SIGNATURE_VERIFIED")
+
+    # 6. 检查 --skip 是否被使用(记录在 flags.skip)
+    flags = evidence.get("flags") or {}
+    skip_list = flags.get("skip") if isinstance(flags, dict) else None
+    if skip_list:
+        reason_parts.append(
+            f"flags.skip={skip_list}(production promotion 禁止使用 --skip)"
+        )
+        missing.append("NO_SKIP_FLAG")
+
+    # 4 + 5. 检查 5 类必需 artifact 是否齐全 + 每个 artifact 字段完整 + 未过期
+    artifacts = evidence.get("artifacts")
+    if not isinstance(artifacts, list):
+        reason_parts.append(
+            "证据文件缺少 artifacts 数组(5 类必需 artifact 缺失)"
+        )
+        missing.extend(REQUIRED_ARTIFACT_TYPES)
+    else:
+        # 按 artifact_type 索引
+        artifact_map: dict[str, dict] = {}
+        for art in artifacts:
+            if isinstance(art, dict):
+                atype = art.get("artifact_type")
+                if atype:
+                    artifact_map[atype] = art
+        # 检查 5 类必需 artifact
+        now_iso = _now_iso()
+        for required_type in REQUIRED_ARTIFACT_TYPES:
+            if required_type not in artifact_map:
+                reason_parts.append(f"缺少必需 artifact: {required_type}")
+                missing.append(required_type)
+                continue
+            art = artifact_map[required_type]
+            # 检查每个 artifact 的必需字段
+            for field in REQUIRED_ARTIFACT_FIELDS:
+                val = art.get(field)
+                if val is None or (isinstance(val, str) and not val):
+                    reason_parts.append(
+                        f"{required_type} 缺少必需字段: {field}"
+                    )
+                    if required_type not in missing:
+                        missing.append(required_type)
+            # 检查 artifact 是否过期
+            expires_at = art.get("expires_at")
+            if expires_at:
+                try:
+                    expires_dt = datetime.fromisoformat(
+                        expires_at.replace("Z", "+00:00")
+                    )
+                    now_dt = datetime.fromisoformat(
+                        now_iso.replace("Z", "+00:00")
+                    )
+                    if expires_dt < now_dt:
+                        reason_parts.append(
+                            f"{required_type} 已过期(expires_at={expires_at})"
+                        )
+                        if required_type not in missing:
+                            missing.append(required_type)
+                except (ValueError, TypeError) as e:
+                    reason_parts.append(
+                        f"{required_type} expires_at 解析失败: {e}"
+                    )
+                    if required_type not in missing:
+                        missing.append(required_type)
+            else:
+                # expires_at 缺失已被字段检查覆盖
+                pass
+            # 检查 artifact 自身的 signature(每个 artifact 必须独立签名)
+            art_sig = art.get("signature")
+            if not art_sig:
+                # 字段检查已覆盖,此处不重复加入 missing
+                pass
+            elif not isinstance(art_sig, str) or not art_sig.strip():
+                reason_parts.append(
+                    f"{required_type} signature 为空字符串(未签名)"
+                )
+                if required_type not in missing:
+                    missing.append(required_type)
+
+    # 任何 missing 即阻断
+    if missing or reason_parts:
+        # R65 P0-04: reason 保持简短(< 100 字符,避免被 safe_params 长度过滤);
+        # 详细原因记录在 reason_parts(供日志/审计),missing 列表给出具体缺失项。
+        # 优先取第一个 reason 作为简短摘要;若 reason_parts 为空(理论不应发生)
+        # 则用通用文案。
+        brief_reason = reason_parts[0] if reason_parts else "证据校验失败"
+        # 截断过长的 brief_reason(safe_params 长度上限 100 字符)
+        if len(brief_reason) > 90:
+            brief_reason = brief_reason[:87] + "..."
+        missing_str = ", ".join(sorted(set(missing))) if missing else "(none)"
+        # 截断过长的 missing_str(同上)
+        if len(missing_str) > 90:
+            missing_str = missing_str[:87] + "..."
+        # 完整诊断信息输出到 stderr(不进入 safe_params,避免被长度过滤)
+        full_reason = "; ".join(reason_parts) if reason_parts else "证据校验失败"
+        print(
+            f"R65 P0-04: production promotion 证据校验失败\n"
+            f"  brief_reason: {brief_reason}\n"
+            f"  missing: {missing_str}\n"
+            f"  full_reason: {full_reason}",
+            file=sys.stderr,
+        )
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": brief_reason,
+                "missing": missing_str,
+            },
+        )
+
+    # 校验通过 — 标记 production_promotion_allowed 并返回
+    evidence["production_promotion_allowed"] = True
+    return evidence
 
 
 def parse_args() -> argparse.Namespace:
@@ -407,6 +752,21 @@ def parse_args() -> argparse.Namespace:
         "--supply-chain-arg", action="append", default=[],
         help="传递给 supply_chain 脚本的额外参数",
     )
+    parser.add_argument(
+        "--production", action="store_true",
+        help=(
+            "R65 P0-04: production 模式 — 输出 evidence_mode=production, "
+            "禁止 --skip / --dry-run, 需要真实环境运行全部 5 类证据"
+        ),
+    )
+    parser.add_argument(
+        "--verify-promotion", metavar="EVIDENCE_PATH",
+        help=(
+            "R65 P0-04: 校验 production promotion 证据是否满足严格门禁 "
+            "(evidence_mode=production / 已签名 / 未过期 / 5 类 artifact 齐全 / "
+            "无 --skip),失败返回退出码 1"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -416,6 +776,51 @@ def main() -> int:
     if args.list:
         _list_evidence_types()
         return 0
+
+    # R65 P0-04: --verify-promotion 模式 — 仅校验,不生成
+    if args.verify_promotion:
+        from services.error_codes import AppError, ErrorCodes
+        evidence_path = Path(args.verify_promotion)
+        if not evidence_path.is_absolute():
+            evidence_path = _REPO_ROOT / evidence_path
+        print(f"R65 P0-04: 校验 production promotion 证据: {evidence_path}")
+        try:
+            evidence = verify_production_promotion(evidence_path)
+        except AppError as e:
+            print(f"FAIL: production promotion 证据校验未通过", file=sys.stderr)
+            print(f"  code: {e.code}", file=sys.stderr)
+            print(f"  reason: {e.params.get('reason', '')}", file=sys.stderr)
+            print(f"  missing: {e.params.get('missing', '')}", file=sys.stderr)
+            return 1
+        print(f"PASS: production promotion 证据校验通过")
+        print(f"  production_promotion_allowed: "
+              f"{evidence.get('production_promotion_allowed')}")
+        return 0
+
+    # R65 P0-04: production 模式禁止 --skip 与 --dry-run
+    if args.production:
+        if args.skip:
+            print(
+                "ERROR: --production 模式禁止 --skip — production promotion 必须"
+                "包含全部 5 类证据,不得跳过任何一项",
+                file=sys.stderr,
+            )
+            return 2
+        if args.dry_run:
+            print(
+                "ERROR: --production 模式禁止 --dry-run — production 证据必须"
+                "在真实环境运行,不允许 dry-run 编排",
+                file=sys.stderr,
+            )
+            return 2
+        # production 模式必须 --all(5 类证据全选)
+        if not args.all:
+            print(
+                "ERROR: --production 模式必须配合 --all — production promotion "
+                "需要全部 5 类证据",
+                file=sys.stderr,
+            )
+            return 2
 
     # 决定要运行的证据类型
     if args.all:
@@ -438,7 +843,7 @@ def main() -> int:
               "--chaos / --ru-72h / --supply-chain)", file=sys.stderr)
         return 2
 
-    # 应用 --skip
+    # 应用 --skip(production 模式已在前置检查中禁止 --skip)
     selected = [s for s in selected if s not in args.skip]
     if not selected:
         print("WARN: 所有证据类型都被 --skip 跳过,无操作", file=sys.stderr)
@@ -457,10 +862,14 @@ def main() -> int:
     if not output_dir.is_absolute():
         output_dir = _REPO_ROOT / output_dir
 
-    print(f"R64 P1-12: 生产运行证据生成")
+    # R65 P0-04: evidence_mode 由 --production 决定,默认 dry_run
+    evidence_mode = "production" if args.production else "dry_run"
+
+    print(f"R64 P1-12 / R65 P0-04: 生产运行证据生成")
     print(f"输出目录: {output_dir}")
     print(f"证据类型: {', '.join(selected)}")
     print(f"Dry-run: {args.dry_run}")
+    print(f"evidence_mode: {evidence_mode}")
 
     summary = asyncio.run(generate_evidence(
         evidence_types=selected,
@@ -468,6 +877,8 @@ def main() -> int:
         dry_run=args.dry_run,
         extra_args_map=extra_args_map,
         timeout_seconds=args.timeout_seconds,
+        evidence_mode=evidence_mode,
+        skip_types=list(args.skip),
     ))
 
     # 退出码:有任何 failed 返回 1

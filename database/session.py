@@ -1016,7 +1016,8 @@ class D1Collection:
             # asyncpg/CRDB 返回 "DELETE N" 格式
             try:
                 return int(str(status).split()[-1]) > 0
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[D1Collection] delete_one 解析 status 失败 status={status!r}: {e}")
                 return False
 
     async def delete_many(self, query: dict, limit: int | None = None) -> int:
@@ -1064,7 +1065,7 @@ class D1Collection:
             try:
                 return int(str(status).split()[-1])
             except Exception:
-                return 0
+                return None
 
     async def count_documents(self, query: dict) -> int:
         params = []
@@ -2061,7 +2062,7 @@ async def get_file_record_cached(file_code: str) -> Optional[dict]:
         try:
             await store.upsert_file_record_local(record, mark_dirty=False)
         except Exception:
-            pass
+            logger.exception("[R65 P1-04] database/session.py:get_file_record_cached except 吞异常已记录(原 except: pass)")
     return record
 
 
@@ -2356,7 +2357,7 @@ async def set_rotation_config(key: str, value: str):
         store = get_cache_store()
         await store.set_kv(f"rotconf:{key}", value)
     except Exception:
-        pass
+        logger.exception("[R65 P1-04] database/session.py:set_rotation_config except 吞异常已记录(原 except: pass)")
 
 
 # ─── H方案: 后台异步同步新 job 到 CRDB ─────────────────────────
@@ -2401,7 +2402,7 @@ async def _sync_new_job_to_crdb(
                 from utils.redis_client import xadd_job
                 await xadd_job(crdb_id)
             except Exception:
-                pass  # 降级:notify_dsp_new_job 已在 enqueue_job 中写入 dsp_notify
+                logger.exception("[R65 P1-04] database/session.py:_sync_new_job_to_crdb except 吞异常已记录(原 except: pass)")  # 降级:notify_dsp_new_job 已在 enqueue_job 中写入 dsp_notify
     except Exception as e:
         logger.debug(f"[H] 后台 CRDB 同步失败 local_id={local_id}: {e}")
 
@@ -2458,7 +2459,7 @@ async def enqueue_job(
         from utils.shared_counters import status_counters
         status_counters["total_files"] = status_counters.get("total_files", 0) + 1
     except Exception:
-        pass
+        logger.exception("[R65 P1-04] database/session.py:enqueue_job except 吞异常已记录(原 except: pass)")
 
     # H方案: CRDB 写入走后台异步(fire-and-forget)，仅用于审计，不阻塞
     task = asyncio.ensure_future(_sync_new_job_to_crdb(

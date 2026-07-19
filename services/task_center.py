@@ -116,7 +116,7 @@ async def create_task(task_type: str, user_id: int, payload: dict, trace_id: str
         return task_id
     except Exception as e:
         logger.warning(f"[task_center] create_task 失败: {e}")
-        return 0
+        return None
 
 
 async def update_progress(task_id: int, progress: int, eta_seconds: int = 0) -> bool:

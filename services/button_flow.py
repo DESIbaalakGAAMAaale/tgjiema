@@ -56,6 +56,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
+from services.i18n import translate as _i18n_t
 from services.button_approval_policy import (
     ACTIONS_REQUIRING_FINAL_CONFIRM,
     CRITICAL_ACTIONS_REQUIRING_DUAL_APPROVAL,
@@ -251,7 +252,7 @@ class ButtonTokenStore:
                 return self._row_to_token(row)
             except Exception:
                 # RETURNING 不可用,fallback 到 SELECT + UPDATE
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/button_flow.py:ButtonTokenStore.consume_token_cas'))
             # Fallback: 先 SELECT 检查,再 UPDATE
             cursor = await self._db.execute(
                 """SELECT nonce, action, principal_id, target,
@@ -379,7 +380,7 @@ class ButtonTokenStore:
             return deleted
         except Exception as e:
             logger.error(f"[ButtonTokenStore] cleanup_expired 失败: {e}")
-            return 0
+            return None
 
     def _row_to_token(self, row) -> ButtonToken:
         """将数据库 row 转为 ButtonToken。"""

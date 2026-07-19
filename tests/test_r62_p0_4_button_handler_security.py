@@ -297,7 +297,7 @@ class TestHandleReportActionCallbackFormat:
         await cb_module._handle_report_action(update, MagicMock(), "report:ban|12345|67890|dsp")
         # 应显示过期/格式无效提示(不再继续走签名验证 / 破坏性 API)
         update.callback_query.edit_message_text.assert_called_once()
-        edited_text = update.callback_query.edit_message_text.call_args[0][0]
+        edited_text = (update.callback_query.edit_message_text.call_args.kwargs.get("text") or (update.callback_query.edit_message_text.call_args[0][0] if update.callback_query.edit_message_text.call_args[0] else ""))
         assert "过期" in edited_text or "格式无效" in edited_text or "签名验证失败" in edited_text, (
             f"旧格式应被拒绝,实际提示: {edited_text}"
         )
@@ -319,7 +319,7 @@ class TestHandleReportActionCallbackFormat:
         update = self._make_update("report:ban:invalid_handle_id")
         await cb_module._handle_report_action(update, MagicMock(), "report:ban:invalid_handle_id")
         update.callback_query.edit_message_text.assert_called_once()
-        edited_text = update.callback_query.edit_message_text.call_args[0][0]
+        edited_text = (update.callback_query.edit_message_text.call_args.kwargs.get("text") or (update.callback_query.edit_message_text.call_args[0][0] if update.callback_query.edit_message_text.call_args[0] else ""))
         assert "签名验证失败" in edited_text, (
             f"无效 handle 应触发签名验证失败提示,实际: {edited_text}"
         )
@@ -342,7 +342,7 @@ class TestHandleReportActionCallbackFormat:
         update = self._make_update("report:ban:valid_handle")
         await cb_module._handle_report_action(update, MagicMock(), "report:ban:valid_handle")
         update.callback_query.edit_message_text.assert_called_once()
-        edited_text = update.callback_query.edit_message_text.call_args[0][0]
+        edited_text = (update.callback_query.edit_message_text.call_args.kwargs.get("text") or (update.callback_query.edit_message_text.call_args[0][0] if update.callback_query.edit_message_text.call_args[0] else ""))
         assert "不匹配" in edited_text, (
             f"sub_action 不匹配应被拒绝,实际: {edited_text}"
         )
@@ -432,7 +432,7 @@ class TestHandleRestoreAndDeleteCallbackFormat:
         update = self._make_update("restore:confirm:invalid_handle")
         await cb_module._handle_restore_action(update, MagicMock(), "restore:confirm:invalid_handle")
         update.callback_query.edit_message_text.assert_called_once()
-        edited_text = update.callback_query.edit_message_text.call_args[0][0]
+        edited_text = (update.callback_query.edit_message_text.call_args.kwargs.get("text") or (update.callback_query.edit_message_text.call_args[0][0] if update.callback_query.edit_message_text.call_args[0] else ""))
         assert "签名验证失败" in edited_text, (
             f"无效 handle 应触发签名验证失败提示,实际: {edited_text}"
         )
@@ -459,7 +459,7 @@ class TestHandleRestoreAndDeleteCallbackFormat:
         update = self._make_update("delfile|file_abc123")
         await cb_module._handle_delete_file_action(update, MagicMock(), "delfile|file_abc123")
         update.callback_query.edit_message_text.assert_called_once()
-        edited_text = update.callback_query.edit_message_text.call_args[0][0]
+        edited_text = (update.callback_query.edit_message_text.call_args.kwargs.get("text") or (update.callback_query.edit_message_text.call_args[0][0] if update.callback_query.edit_message_text.call_args[0] else ""))
         assert "签名验证失败" in edited_text, (
             f"旧格式 file_code 应触发签名验证失败,实际: {edited_text}"
         )

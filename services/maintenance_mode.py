@@ -39,6 +39,12 @@ R45 第 16 节 Maintenance 整改:
     - 中文注释,loguru 日志
 """
 from __future__ import annotations
+from services.sink_adapters.telegram_adapter import (
+    safe_reply_text, safe_send_message, safe_edit_message_text,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope,导入 UserMessage 用于
+# from_raw_text 包装已渲染的 i18n 字符串(过渡期工厂)
+from services.user_message import UserMessage
 
 import asyncio
 import datetime as _dt
@@ -189,7 +195,7 @@ async def _write_audit_log(actor_id: int, action: str,
         return 0
     except Exception as e:
         logger.error(f"[Maintenance] _write_audit_log 失败: {e}")
-        return 0
+        return None
 
 
 # ─── 维护模式核心 API ──────────────────────────────────────────
@@ -334,7 +340,7 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
             )
             await app_err.write_audit_log()
         except Exception:
-            pass  # audit_log 写入失败不影响主流程拒绝
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:disable'))  # audit_log 写入失败不影响主流程拒绝
         raise MaintenancePreconditionError(
             f"R52 P1-6: disable recover_status query failed, fail-closed denying shutdown: {e}"
         )
@@ -367,7 +373,7 @@ async def disable(ended_by: int = 0, force: bool = False, approval_action_id: st
                 )
                 await app_err.write_audit_log()
             except Exception:
-                pass  # audit_log 写入失败不影响主流程拒绝
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:disable'))  # audit_log 写入失败不影响主流程拒绝
             raise MaintenancePreconditionError(
                 _i18n_t('services.maintenance_mode.s13')
             )
@@ -938,7 +944,7 @@ async def check_readiness() -> dict:
             pending_jobs = rows[0][0] if rows else 0
             pending_uploads = pending_jobs  # 简化:pending jobs 视为 pending uploads
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_readiness'))
 
         try:
             rows = await store._db.execute_fetchall(
@@ -946,7 +952,7 @@ async def check_readiness() -> dict:
             )
             unprocessed_outbox = rows[0][0] if rows else 0
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_readiness'))
 
         try:
             rows = await store._db.execute_fetchall(
@@ -955,7 +961,7 @@ async def check_readiness() -> dict:
             )
             active_replication = rows[0][0] if rows else 0
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_readiness'))
 
     # 就绪条件:无 pending jobs + 无未处理 outbox + 无活跃复制任务
     ready = (pending_jobs == 0 and unprocessed_outbox == 0
@@ -1311,7 +1317,7 @@ async def recover_maintenance(
             )
             await app_err.write_audit_log()
         except Exception:
-            pass  # audit_log 写入失败不影响主流程拒绝
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:recover_maintenance'))  # audit_log 写入失败不影响主流程拒绝
         raise PermissionError(
             "R51 P1-6: recover_maintenance requires request_hash"
         )
@@ -1446,11 +1452,9 @@ def require_maintenance_check(action: str = "operation"):
                     f"(check 异常, action={action}): {e}"
                 )
                 try:
-                    await update.message.reply_text(
-                        _i18n_t('services.maintenance_mode.s47')
-                    )
+                    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('services.maintenance_mode.s47')))
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:wrapper'))
                 return
             except Exception as e:
                 # 兜底:其他异常也 fail-closed
@@ -1459,19 +1463,15 @@ def require_maintenance_check(action: str = "operation"):
                     f"(action={action}): {e}"
                 )
                 try:
-                    await update.message.reply_text(
-                        _i18n_t('services.maintenance_mode.s48')
-                    )
+                    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('services.maintenance_mode.s48')))
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:wrapper'))
                 return
             if enabled:
                 try:
-                    await update.message.reply_text(
-                        _i18n_t('services.maintenance_mode.s45', action=action)
-                    )
+                    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('services.maintenance_mode.s45', action=action)))
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:wrapper'))
                 return
             return await func(update, context, *args, **kwargs)
 

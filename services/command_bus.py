@@ -2384,6 +2384,27 @@ def make_restore_backup_command(
         # 让 restore() 通过 approval_action_id 反查 principal_id 并校验审批状态
         approval_action_id = params.get("approval_action_id")
 
+        # R65 P0-07 / P1-07: capability-seal — 旧直接 restore writer 已被封存。
+        # 生产恢复必须改走 RestoreOrchestrator 蓝绿切换路径(staging → active,
+        # 禁止原地覆盖生产数据)。逃生舱:ALLOW_LEGACY_RESTORE=1 仅限 tests/ 与
+        # scripts/ 兼容场景使用,生产部署绝不应配置(应在系统层强制 unset)。
+        from services.error_codes import AppError, ErrorCodes
+        if os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() not in ("1", "true", "yes"):
+            logger.error(
+                _i18n_t(
+                    "diagnostics.r65.p0_07.capability_sealed",
+                    entry_point="make_restore_backup_command handler",
+                    caller="command_bus.make_restore_backup_command",
+                )
+            )
+            raise AppError(
+                ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
+                params={
+                    "caller": "command_bus.make_restore_backup_command",
+                    "reason": "legacy_writer_sealed",
+                },
+            )
+
         # 优先使用 services.db_backup.restore_from_backup(支持 tables/merge 选择性恢复)
         try:
             from services.db_backup import restore_from_backup

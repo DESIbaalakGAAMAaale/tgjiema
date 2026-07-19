@@ -10,13 +10,16 @@
 - ``services.data_lifecycle.OutboxWorker.run_once`` —— 生产构建移除 stub 分支:
     * ``provider_registry is None`` 一律 raise
       ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``
-    * 不论 ``test_mode`` 如何(生产构建从代码层移除 no-provider-complete 分支;
-      测试注入独立 fake provider,不依赖 test_mode 绕过)
+    * R65 P1-05: ``test_mode`` 参数已彻底移除;测试注入独立 fake provider
 - ``database.cache_store.CacheStore`` outbox_events CAS 升级(lease_version fencing):
-    * ``claim_outbox_events`` CAS WHERE status='pending' AND lease_version=0,
-      成功后 lease_version=1
+    * R65 P1-05: ``claim_outbox_events`` CAS WHERE status='pending',
+      成功后 ``lease_version = lease_version + 1``(单调递增,永不重置)
     * ``complete_outbox_event`` / ``fail_outbox_event`` / ``renew_outbox_lease``
       四字段 CAS(event_id + owner + lease_version + request_hash)
+    * R65 P1-05: 严格 CAS 路径冲突 raise
+      ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``
+    * R65 P1-05: ``reclaim_stale_outbox_leases`` / ``fail_outbox_event``
+      retryable 路径不再重置 lease_version=0(保留单调递增)
     * ``renew_outbox_lease`` 成功后 lease_version += 1(防 ABA)
 - ``services.data_lifecycle.OutboxWorker._maybe_renew_lease`` —— 自动续租:
     * lease 剩余 < 1/3 即自动续租
@@ -32,8 +35,9 @@
 测试覆盖(6 项):
 1. OutboxEnvelope immutable(frozen=True,字段不可变 + 完整字段)
 2. validate_providers() 不再 fail-open(CRITICAL_EFFECT_TYPES 导入失败 raise)
-3. run_once test_mode=True + 无 provider 仍 raise(生产构建移除 stub 分支)
-4. lease_version fencing token CAS(claim/complete/fail/renew 四字段 CAS)
+3. run_once 无 provider 仍 raise(生产构建移除 stub 分支;R65: test_mode 已移除)
+4. lease_version fencing token CAS(claim/complete/fail/renew 四字段 CAS;
+   R65: 严格 CAS 冲突 raise OUTBOX_LEASE_VERSION_CONFLICT)
 5. 自动续租(lease 剩余 < 1/3 续租;续租失败 raise AppError 停止提交)
 6. DLQ 闭环(move_outbox_to_dlq 写入 dlq_reason/dlq_at + outbox_dlq_audit 审计记录)
 """
@@ -221,7 +225,8 @@ class TestValidateProvidersNoFailOpen:
         """provider_registry=None → 返回全部 missing(不 raise,正常报告缺失)。"""
         from services.data_lifecycle import OutboxWorker
         from services.effect_receipts import CRITICAL_EFFECT_TYPES
-        worker = OutboxWorker(lease_owner="w", batch_size=1, test_mode=True)
+        # R65 P1-05: test_mode 参数已移除,不再传入
+        worker = OutboxWorker(lease_owner="w", batch_size=1)
         missing = worker.validate_providers()
         # 9 个枚举 effect types 全部 missing
         assert len(missing) == len(CRITICAL_EFFECT_TYPES)
@@ -242,22 +247,23 @@ class TestValidateProvidersNoFailOpen:
 
 
 # ════════════════════════════════════════════════════════════════
-# 3. run_once test_mode=True + 无 provider 仍 raise(生产构建移除 stub 分支)
+# 3. run_once 无 provider 仍 raise(生产构建移除 stub 分支;R65: test_mode 已移除)
 # ════════════════════════════════════════════════════════════════
 
 class TestRunOnceNoStubBranch:
-    """R64 P0-04: 不论 test_mode,provider_registry=None 一律 raise AppError。
+    """R64 P0-04 + R65 P1-05: provider_registry=None 一律 raise AppError。
 
     旧 R63 实现在 test_mode=True 时允许 stub 模式直接 complete;
     R64 P0-04 整改:生产构建从代码层移除 no-provider-complete 分支,
-    测试注入独立 fake provider,不依赖 test_mode 绕过。
+    测试注入独立 fake provider。
+    R65 P1-05 整改:``test_mode`` 参数彻底移除,传入即 TypeError。
     """
 
     @pytest.mark.asyncio
-    async def test_run_once_raises_with_test_mode_true_and_no_provider(
+    async def test_run_once_raises_with_no_provider(
         self, real_store,
     ):
-        """test_mode=True + provider_registry=None → 仍 raise(不再 stub complete)。"""
+        """provider_registry=None → raise(不再 stub complete)。"""
         from services.data_lifecycle import OutboxWorker
         await real_store.add_outbox_event(
             action_id="act_p0_4_no_stub",
@@ -266,10 +272,10 @@ class TestRunOnceNoStubBranch:
             request_hash="rh_p0_4_no_stub" + "0" * 47,
             payload_json="{}",
         )
+        # R65 P1-05: test_mode 参数已移除,不传入
         worker = OutboxWorker(
-            lease_owner="worker_no_stub", batch_size=10, test_mode=True,
+            lease_owner="worker_no_stub", batch_size=10,
         )
-        assert worker.test_mode is True
         with pytest.raises(AppError):
             await worker.run_once()
         # 验证 fail-fast 发生在 claim 之前(事件仍为 pending)
@@ -279,6 +285,14 @@ class TestRunOnceNoStubBranch:
         )
         row = await cursor.fetchone()
         assert row[0] == "pending"
+
+    def test_test_mode_parameter_removed_raises_typeerror(self):
+        """R65 P1-05: ``test_mode`` 参数已彻底移除,传入即 TypeError。"""
+        from services.data_lifecycle import OutboxWorker
+        with pytest.raises(TypeError):
+            OutboxWorker(
+                lease_owner="w", batch_size=1, test_mode=True,
+            )
 
     @pytest.mark.asyncio
     async def test_run_once_with_fake_provider_completes(self, real_store):
@@ -312,10 +326,14 @@ class TestRunOnceNoStubBranch:
 # ════════════════════════════════════════════════════════════════
 
 class TestLeaseVersionFencingCAS:
-    """R64 P0-04: lease fencing token CAS(防 ABA 问题)。
+    """R64 P0-04 + R65 P1-05: lease fencing token CAS(防 ABA 问题)。
 
-    claim CAS WHERE status='pending' AND lease_version=0,成功后 lease_version=1;
+    R65 P1-05: claim CAS WHERE status='pending',成功后
+    ``lease_version = lease_version + 1``(单调递增,永不重置);
     complete/fail/renew 必须 CAS event_id+owner+lease_version+request_hash;
+    严格 CAS 路径冲突 raise ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``,
+    不再静默返回 False/not_found;
+    reclaim/fail retryable 路径不重置 lease_version(保留单调递增);
     renew 成功后 lease_version += 1(后续 complete 必须用新版本号)。
     """
 
@@ -342,7 +360,7 @@ class TestLeaseVersionFencingCAS:
             lease_owner="worker_A", lease_duration_seconds=60, limit=1,
         )
         assert len(events) == 1
-        # R64 P0-04: claim 后 lease_version=1
+        # R64 P0-04 / R65 P1-05: claim 后 lease_version=1(0+1 单调递增)
         assert events[0]["lease_version"] == 1
         cursor = await real_store._db.execute(
             "SELECT lease_version, status, lease_owner FROM outbox_events "
@@ -354,8 +372,8 @@ class TestLeaseVersionFencingCAS:
         assert row[2] == "worker_A"
 
     @pytest.mark.asyncio
-    async def test_complete_with_wrong_lease_version_returns_false(self, real_store):
-        """complete CAS lease_version 不匹配 → False(防 ABA)。"""
+    async def test_complete_with_wrong_lease_version_raises_conflict(self, real_store):
+        """R65 P1-05: complete CAS lease_version 不匹配 → raise AppError(冲突)。"""
         rh = "rh_lv_complete" + "0" * 49
         eid = await real_store.add_outbox_event(
             action_id="act_lv_complete",
@@ -367,13 +385,14 @@ class TestLeaseVersionFencingCAS:
         await real_store.claim_outbox_events(
             lease_owner="worker_A", lease_duration_seconds=60, limit=1,
         )
-        # 用错误的 lease_version(0 而非 1)→ CAS 失败
-        ok = await real_store.complete_outbox_event(
-            eid, external_id="ext",
-            lease_owner="worker_A", request_hash=rh,
-            lease_version=0,  # 错误(应为 1)
-        )
-        assert ok is False
+        # 用错误的 lease_version(0 而非 1)→ CAS 冲突 raise
+        with pytest.raises(AppError) as exc_info:
+            await real_store.complete_outbox_event(
+                eid, external_id="ext",
+                lease_owner="worker_A", request_hash=rh,
+                lease_version=0,  # 错误(应为 1)
+            )
+        assert exc_info.value.code == ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT
         # 用正确的 lease_version=1 → CAS 成功
         ok = await real_store.complete_outbox_event(
             eid, external_id="ext",
@@ -408,12 +427,13 @@ class TestLeaseVersionFencingCAS:
         )
         row = await cursor.fetchone()
         assert row[0] == 2  # 递增
-        # 用旧 lease_version=1 再 renew → 失败(版本过期)
-        ok = await real_store.renew_outbox_lease(
-            eid, lease_owner="worker_long", request_hash=rh,
-            lease_version=1, lease_duration_seconds=300,
-        )
-        assert ok is False
+        # R65 P1-05: 用旧 lease_version=1 再 renew → raise AppError(版本过期)
+        with pytest.raises(AppError) as exc_info:
+            await real_store.renew_outbox_lease(
+                eid, lease_owner="worker_long", request_hash=rh,
+                lease_version=1, lease_duration_seconds=300,
+            )
+        assert exc_info.value.code == ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT
         # 用新 lease_version=2 renew → 成功 + lease_version → 3
         ok = await real_store.renew_outbox_lease(
             eid, lease_owner="worker_long", request_hash=rh,
@@ -428,7 +448,7 @@ class TestLeaseVersionFencingCAS:
 
     @pytest.mark.asyncio
     async def test_complete_after_renew_uses_new_lease_version(self, real_store):
-        """renew 后 complete 必须用新 lease_version(旧版本被拒绝)。"""
+        """renew 后 complete 必须用新 lease_version(旧版本 raise 冲突)。"""
         rh = "rh_lv_after_renew" + "0" * 47
         eid = await real_store.add_outbox_event(
             action_id="act_lv_after_renew",
@@ -445,13 +465,14 @@ class TestLeaseVersionFencingCAS:
             eid, lease_owner="worker_A", request_hash=rh,
             lease_version=1, lease_duration_seconds=300,
         )
-        # 用旧 lease_version=1 complete → 失败(防 ABA)
-        ok = await real_store.complete_outbox_event(
-            eid, external_id="ext",
-            lease_owner="worker_A", request_hash=rh,
-            lease_version=1,  # 旧版本
-        )
-        assert ok is False
+        # R65 P1-05: 用旧 lease_version=1 complete → raise AppError(防 ABA)
+        with pytest.raises(AppError) as exc_info:
+            await real_store.complete_outbox_event(
+                eid, external_id="ext",
+                lease_owner="worker_A", request_hash=rh,
+                lease_version=1,  # 旧版本
+            )
+        assert exc_info.value.code == ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT
         # 用新 lease_version=2 complete → 成功
         ok = await real_store.complete_outbox_event(
             eid, external_id="ext",
@@ -461,8 +482,8 @@ class TestLeaseVersionFencingCAS:
         assert ok is True
 
     @pytest.mark.asyncio
-    async def test_fail_with_wrong_lease_version_returns_not_found(self, real_store):
-        """fail CAS lease_version 不匹配 → not_found(防越权 fail 非己 lease)。"""
+    async def test_fail_with_wrong_lease_version_raises_conflict(self, real_store):
+        """R65 P1-05: fail CAS lease_version 不匹配 → raise AppError(防越权 fail)。"""
         rh = "rh_lv_fail" + "0" * 54
         eid = await real_store.add_outbox_event(
             action_id="act_lv_fail",
@@ -475,13 +496,14 @@ class TestLeaseVersionFencingCAS:
         await real_store.claim_outbox_events(
             lease_owner="worker_A", lease_duration_seconds=60, limit=1,
         )
-        # 用错误的 lease_version=99 → not_found
-        result = await real_store.fail_outbox_event(
-            eid, error_msg="boom",
-            lease_owner="worker_A", request_hash=rh,
-            lease_version=99,
-        )
-        assert result == "not_found"
+        # R65 P1-05: 用错误的 lease_version=99 → raise AppError
+        with pytest.raises(AppError) as exc_info:
+            await real_store.fail_outbox_event(
+                eid, error_msg="boom",
+                lease_owner="worker_A", request_hash=rh,
+                lease_version=99,
+            )
+        assert exc_info.value.code == ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT
         # 用正确的 lease_version=1 → retryable
         result = await real_store.fail_outbox_event(
             eid, error_msg="boom",
@@ -489,12 +511,13 @@ class TestLeaseVersionFencingCAS:
             lease_version=1,
         )
         assert result == "retryable"
-        # 验证 lease_version 被重置为 0(reclaim 后可重新 claim)
+        # R65 P1-05: lease_version 不再重置为 0(保留单调递增,防 ABA)
+        # 当前 lease_version 仍为 1(retryable 路径仅清 owner/status,不重置版本)
         cursor = await real_store._db.execute(
             "SELECT lease_version, status FROM outbox_events WHERE id=?", (eid,),
         )
         row = await cursor.fetchone()
-        assert row[0] == 0
+        assert row[0] == 1  # 保留 lease_version(reclaim/fail 不重置)
         assert row[1] == "pending"
 
 

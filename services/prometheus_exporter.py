@@ -57,6 +57,8 @@ from typing import Any
 
 from loguru import logger
 
+from services.i18n import translate as _i18n_t
+
 
 # ── 路径与配置 ──────────────────────────────────────────
 _DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -1088,7 +1090,7 @@ def check_readiness() -> dict:
                     except (ValueError, TypeError):
                         crdb_sync_age = -1.0
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/prometheus_exporter.py:check_readiness'))
     crdb_sync_fresh = (
         crdb_sync_age >= 0
         and crdb_sync_age < _CRDB_SYNC_FRESH_THRESHOLD
@@ -1117,7 +1119,7 @@ def check_readiness() -> dict:
                     except (ValueError, TypeError):
                         r2_collect_age = -1.0
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/prometheus_exporter.py:check_readiness'))
     r2_collector_fresh = (
         r2_collect_age >= 0
         and r2_collect_age < _R2_COLLECT_FRESH_THRESHOLD
@@ -1418,7 +1420,7 @@ async def collect_r40_metrics() -> None:
             except (TypeError, ValueError):
                 pass
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/prometheus_exporter.py:collect_r40_metrics'))
 
     # 原子更新状态(拷贝替换,避免读取期间部分更新)
     with _r40_state_lock:
@@ -1694,7 +1696,7 @@ def _r40_collector_loop() -> None:
         try:
             loop.close()
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/prometheus_exporter.py:_r40_collector_loop'))
 
 
 def _start_r40_collector() -> None:

@@ -3,6 +3,26 @@
 与原来的 decoder_bot 功能一致,区别是解码后调用 enqueue_job() 而非 queue_manager
 """
 from __future__ import annotations
+from services.sink_adapters.telegram_helpers import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Application,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+    Bot,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope
+from services.user_message import UserMessage
+# R65 P1-01: typed sink adapter(safe_* API)
+from services.sink_adapters.telegram_adapter import (
+    safe_edit_message_text,
+    safe_reply_text,
+    safe_send_message,
+)
 
 import asyncio
 import datetime
@@ -15,8 +35,8 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+
+
 from loguru import logger
 
 from config import settings
@@ -340,7 +360,7 @@ async def _flush_media_group_buffer(media_group_id: str):
             try:
                 await safe_send_message(bot, chat_id=user_id, text=_i18n_t('bot.idx_bot.s1'))
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:_flush_media_group_buffer'))
         return
 
     # 外部媒体组 Bot 间不可达,仅记录日志
@@ -415,7 +435,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
             try:
                 await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s134', code=code, settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME))
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:handle_relay_delivery'))
         return
 
     logger.info(f"[Idx] 中继代发: user {target_user_id}, code {code}")
@@ -444,7 +464,7 @@ async def handle_relay_delivery(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s98', code=code, settings_SENDER_BOT_USERNAME=settings.SENDER_BOT_USERNAME))
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:handle_relay_delivery'))
 
 
 # ─── 命令处理 ───
@@ -990,7 +1010,7 @@ async def _process_one_pending(app: Application, row: dict):
         try:
             await safe_send_message(app.bot, chat_id=uploader_id, text=_i18n_t('bot.idx_bot.s5'))
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:_process_one_pending'))
         try:
             await store.fail_pending_upload(pend_id, f"db_write_failed: {e}")
         except Exception as fail_err:
@@ -1092,7 +1112,7 @@ async def _process_one_pending(app: Application, row: dict):
                                 if k == "code":
                                     _unmark_code = v
                     except Exception:
-                        pass
+                        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:_process_one_pending'))
                 elif isinstance(note, dict):
                     _unmark_code = note.get("code")
                 if _unmark_code:
@@ -1672,7 +1692,7 @@ async def my_codes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = header + "\n\n" + "\n\n".join(items) + page_info
     keyboard = InlineKeyboardMarkup(kb) if kb else None
 
-    await update.message.reply_text(reply, reply_markup=keyboard)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(reply), reply_markup=keyboard)
 
 
 async def my_code_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1718,7 +1738,7 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
         # 静默：不透露该码是否存在
-        await query.edit_message_text(_i18n_t('bot.idx.s64'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s64')))
         return
 
     # 构建详情
@@ -1783,7 +1803,7 @@ async def my_code_detail_callback(update: Update, context: ContextTypes.DEFAULT_
         [InlineKeyboardButton(_i18n_t('bot.idx.s110'), callback_data="mycode:list")],
     ])
 
-    await query.edit_message_text("\n".join(detail_lines), reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message_text(query, UserMessage.from_raw_text("\n".join(detail_lines)), reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def my_code_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1818,7 +1838,7 @@ async def my_code_edit_note_callback(update: Update, context: ContextTypes.DEFAU
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text(_i18n_t('bot.idx.s70'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s70')))
         return
 
     # 保存当前 code 到用户上下文，等待输入
@@ -1826,9 +1846,7 @@ async def my_code_edit_note_callback(update: Update, context: ContextTypes.DEFAU
     context.user_data["_manage_action"] = "edit_note"
 
     old_note = code_entry.get("note", "")
-    await query.edit_message_text(
-        _i18n_t('bot.idx.s41', old_note_if_old_note_else=old_note if old_note else '（空）'),
-    )
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s41', old_note_if_old_note_else=old_note if old_note else '（空）')))
 
 
 async def my_code_set_expiry_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1852,7 +1870,7 @@ async def my_code_set_expiry_callback(update: Update, context: ContextTypes.DEFA
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text(_i18n_t('bot.idx.s71'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s71')))
         return
 
     context.user_data["_manage_code"] = code
@@ -1882,10 +1900,7 @@ async def my_code_set_expiry_callback(update: Update, context: ContextTypes.DEFA
         [InlineKeyboardButton(_i18n_t('bot.idx.s78'), callback_data=f"mycode:detail|{code}")],
     ]
 
-    await query.edit_message_text(
-        _i18n_t('bot.idx.s42', expire_text=expire_text),
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s42', expire_text=expire_text)), reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1911,7 +1926,7 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text(_i18n_t('bot.idx.s79'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s79')))
         return
 
     # 计算新过期时间
@@ -1932,9 +1947,7 @@ async def my_code_expiry_pick_callback(update: Update, context: ContextTypes.DEF
     from database.cache import invalidate_user_codes
     invalidate_user_codes(user.id)
 
-    await query.edit_message_text(
-        _i18n_t('bot.idx.s43', days=days, code=code)
-    )
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s43', days=days, code=code)))
 
 
 async def my_code_expiry_custom_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1952,15 +1965,13 @@ async def my_code_expiry_custom_callback(update: Update, context: ContextTypes.D
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code})
     if not code_entry or code_entry.get("uploader_id") != (update.effective_user and update.effective_user.id):
-        await query.edit_message_text(_i18n_t('bot.idx.s80'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s80')))
         return
 
     context.user_data["_manage_code"] = code
     context.user_data["_manage_action"] = "set_expiry_custom"
 
-    await query.edit_message_text(
-        _i18n_t('bot.idx.s44')
-    )
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s44')))
 
 
 async def my_code_set_access_limit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1984,7 +1995,7 @@ async def my_code_set_access_limit_callback(update: Update, context: ContextType
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text(_i18n_t('bot.idx.s81'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s81')))
         return
 
     # 读取当前 max_requests（从 file_records 缓存）
@@ -2001,9 +2012,7 @@ async def my_code_set_access_limit_callback(update: Update, context: ContextType
     context.user_data["_manage_code"] = code
     context.user_data["_manage_action"] = "set_access_limit"
 
-    await query.edit_message_text(
-        _i18n_t('bot.idx.s45', current_text=current_text)
-    )
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s45', current_text=current_text)))
 
 
 async def my_code_toggle_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2029,7 +2038,7 @@ async def my_code_toggle_status_callback(update: Update, context: ContextTypes.D
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text(_i18n_t('bot.idx.s82'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s82')))
         return
 
     action_text = _i18n_t('bot.idx.s22') if new_status == "offline" else _i18n_t('bot.idx.s23')
@@ -2042,10 +2051,7 @@ async def my_code_toggle_status_callback(update: Update, context: ContextTypes.D
         ]
     ]
 
-    await query.edit_message_text(
-        _i18n_t('bot.idx.s46', action_text=action_text, code=code),
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s46', action_text=action_text, code=code)), reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def my_code_confirm_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2069,14 +2075,14 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
     code = parts[1]
 
     if new_status not in ("offline", "active"):
-        await query.edit_message_text(_i18n_t('bot.idx.s85'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s85')))
         return
 
     # 权限校验
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text(_i18n_t('bot.idx.s86'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s86')))
         return
 
     # 写入缓冲
@@ -2107,7 +2113,7 @@ async def my_code_confirm_status_callback(update: Update, context: ContextTypes.
     invalidate_user_codes(user.id)
 
     status_text = _i18n_t('bot.idx.s24') if new_status == "offline" else _i18n_t('bot.idx.s25')
-    await query.edit_message_text(_i18n_t('bot.idx.s47', status_text=status_text, code=code))
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s47', status_text=status_text, code=code)))
 
 
 async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2131,7 +2137,7 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await query.edit_message_text(_i18n_t('bot.idx.s87'))
+        await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s87')))
         return
 
     # 从 decode_log_buffer 查解码次数（SQLite 本地）
@@ -2150,7 +2156,7 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
                 decode_count = row[0][0] if row[0][0] else 0
                 last_decode = row[0][1] if row[0][1] else ""
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:my_code_stats_callback'))
 
     # 也从 CRDB 查历史 decode_logs
     try:
@@ -2159,7 +2165,7 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
         if cr_count > decode_count:
             decode_count = cr_count
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:my_code_stats_callback'))
 
     stats_lines = [
         _i18n_t('bot.idx.s26'),
@@ -2178,7 +2184,7 @@ async def my_code_stats_callback(update: Update, context: ContextTypes.DEFAULT_T
         [InlineKeyboardButton(_i18n_t('bot.idx.s89'), callback_data=f"mycode:detail|{code}")],
     ]
 
-    await query.edit_message_text("\n".join(stats_lines), reply_markup=InlineKeyboardMarkup(kb))
+    await safe_edit_message_text(query, UserMessage.from_raw_text("\n".join(stats_lines)), reply_markup=InlineKeyboardMarkup(kb))
 
 
 async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2191,7 +2197,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
     if text == "/cancel":
         context.user_data.pop("_manage_code", None)
         context.user_data.pop("_manage_action", None)
-        await update.message.reply_text(_i18n_t('bot.idx.s90'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s90')))
         return
 
     action = context.user_data.get("_manage_action")
@@ -2204,7 +2210,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
     codes_col = get_codes_col()
     code_entry = await codes_col.find_one({"code": code, "uploader_id": user.id})
     if not code_entry:
-        await update.message.reply_text(_i18n_t('bot.idx.s91'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s91')))
         context.user_data.pop("_manage_code", None)
         context.user_data.pop("_manage_action", None)
         return
@@ -2220,7 +2226,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         # E7: 失效用户码列表缓存
         from database.cache import invalidate_user_codes
         invalidate_user_codes(user.id)
-        await update.message.reply_text(_i18n_t('bot.idx.s92', text=text))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s92', text=text)))
 
     elif action == "set_expiry_custom":
         try:
@@ -2237,7 +2243,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
                     exp_dt = exp_dt.replace(tzinfo=datetime.timezone.utc)
                 new_expire = exp_dt.isoformat()
             except ValueError:
-                await update.message.reply_text(_i18n_t('bot.idx.s149'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s149')))
                 return
 
         if new_expire:
@@ -2253,7 +2259,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
         from database.cache import invalidate_user_codes
         invalidate_user_codes(user.id)
 
-        await update.message.reply_text(_i18n_t('bot.idx.s111'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s111')))
 
     elif action == "set_access_limit":
         # 设置访问次数限制（max_requests，0=不限制）
@@ -2262,7 +2268,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
             if max_req < 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.idx.s145'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s145')))
             return
 
         # 写入 code_change_buffer（类型 access_limit → 同步到 file_records.max_requests）
@@ -2276,7 +2282,7 @@ async def my_code_manage_text_handler(update: Update, context: ContextTypes.DEFA
             logger.warning(f"[Idx] 同步 max_requests 到本地缓存失败 code={code}: {e}")
 
         limit_text = f"{max_req} 次" if max_req > 0 else "不限制"
-        await update.message.reply_text(_i18n_t('bot.idx.s124', limit_text=limit_text))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s124', limit_text=limit_text)))
 
     context.user_data.pop("_manage_code", None)
     context.user_data.pop("_manage_action", None)
@@ -2290,7 +2296,7 @@ async def my_code_cancel_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     context.user_data.pop("_manage_code", None)
     context.user_data.pop("_manage_action", None)
-    await query.edit_message_text(_i18n_t('bot.idx.s48'))
+    await safe_edit_message_text(query, UserMessage.from_raw_text(_i18n_t('bot.idx.s48')))
 
 
 # ─── 外部码处───
@@ -2672,6 +2678,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
     try:
         target_user_id = int(rest[:user_end])
     except ValueError:
+        logger.debug(_i18n_t('diagnostics.r65.p1_04.idx_handle_relay_file_media_invalid_user_id', value=rest[:user_end]))
         return False
     code_part = rest[user_end + 1:].split("\n\n", 1)[0].strip()
 
@@ -2686,7 +2693,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
             try:
                 await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx.s138', code_part=code_part))
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:_handle_relay_file_media'))
             return True
 
         storage_channel = record.get("primary_channel_id") or await _get_storage_channel()
@@ -2698,7 +2705,7 @@ async def _handle_relay_file_media(update: Update, context: ContextTypes.DEFAULT
         try:
             await safe_send_message(context.bot, chat_id=target_user_id, text=_i18n_t('bot.idx_bot.s7', code=code_part))
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:_handle_relay_file_media'))
     return True
 
 
@@ -2977,7 +2984,7 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """举报文件码: /report <code> <reason>"""
     try:
         if len(context.args) < 2:
-            await update.message.reply_text(_i18n_t('bot.idx.s114'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s114')))
             return
         code = context.args[0]
         reason = " ".join(context.args[1:])
@@ -2991,19 +2998,19 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reason=reason,
         )
         if report_id > 0:
-            await update.message.reply_text(_i18n_t('bot.idx.s115', report_id=report_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s115', report_id=report_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.idx_bot.s8'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx_bot.s8')))
     except Exception as e:
         logger.exception(f"[Idx][report] 提交举报失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.idx_bot.s9'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx_bot.s9')))
 
 
 async def cmd_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """修复文件码索引: /repair <code>"""
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.idx.s116'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s116')))
             return
         code = context.args[0]
         user = update.effective_user
@@ -3011,19 +3018,19 @@ async def cmd_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         new_msg_id = await user_repair.reindex_code(code, user.id)
         if new_msg_id > 0:
-            await update.message.reply_text(_i18n_t('bot.idx.s117', code=code, new_msg_id=new_msg_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s117', code=code, new_msg_id=new_msg_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.idx_bot.s10'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx_bot.s10')))
     except Exception as e:
         logger.exception(f"[Idx][repair] 修复索引失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.idx_bot.s11'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx_bot.s11')))
 
 
 async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """重新生成文件码: /regenerate <code>"""
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.idx.s118'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s118')))
             return
         old_code = context.args[0]
         user = update.effective_user
@@ -3031,31 +3038,31 @@ async def cmd_regenerate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         result = await user_repair.regenerate_code(old_code, user.id)
         if not result:
-            await update.message.reply_text(_i18n_t('bot.idx.s119'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s119')))
             return
         new_code = result.get("new_code") or result.get("code", "")
-        await update.message.reply_text(_i18n_t('bot.idx_bot.s12', old_code=old_code, new_code=new_code))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx_bot.s12', old_code=old_code, new_code=new_code)))
     except Exception as e:
         logger.exception(f"[Idx][regenerate] 重新生成文件码失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.idx_bot.s13'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx_bot.s13')))
 
 
 async def cmd_failure_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查询解码失败原因: /failure_reason <code>"""
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.idx.s120'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s120')))
             return
         code = context.args[0]
         reason = await user_repair.get_failure_reason(code)
         if not reason:
-            await update.message.reply_text(_i18n_t('bot.idx.s121', code=code))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx.s121', code=code)))
             return
         text = await user_repair.format_failure_reason(reason)
-        await update.message.reply_text(text)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(text))
     except Exception as e:
         logger.exception(f"[Idx][failure_reason] 查询失败原因异常: {e}")
-        await update.message.reply_text(_i18n_t('bot.idx_bot.s14'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.idx_bot.s14')))
 
 
 # ─── 运行 ───
@@ -3187,7 +3194,7 @@ async def _async_main():
                 await metrics.set_counter("relay.alive", alive)
                 await metrics.set_counter("relay.total", total)
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/idx_bot.py:_report_relay_stats'))
             await asyncio.sleep(60)
     create_safe_task(_report_relay_stats(), name="relay-stats")
     # C3: 监听 relay 账号池变更通知(admin_bot /relay_add、/relay_remove 触发)

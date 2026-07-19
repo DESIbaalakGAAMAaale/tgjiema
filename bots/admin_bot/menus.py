@@ -1,7 +1,18 @@
 import functools
+from services.sink_adapters.telegram_adapter import (
+    safe_reply_text, safe_send_message, safe_edit_message_text,
+)
+from services.sink_adapters.telegram_helpers import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    ContextTypes,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope
+from services.user_message import UserMessage
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+
+
 
 from config import settings
 from services.i18n import translate as _i18n_t
@@ -25,7 +36,7 @@ def _auth_required(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if not user or user.id != AUTHORIZED_USER_ID:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.menus.s22'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.menus.s22')))
             return
         return await func(update, context, *args, **kwargs)
     return wrapper

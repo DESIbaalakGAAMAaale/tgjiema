@@ -160,6 +160,7 @@
     "backup.restore.checksum_mismatch": "备份文件校验和不匹配,可能已损坏(backup_id={backup_id})",
     "backup.restore.trust_chain_required": "备份恢复信任链令牌缺失或无效,已拒绝恢复(backup_id={backup_id})",
     "backup.payload.not_serializable": "备份数据含不可 JSON 序列化类型,已拒绝(fail-closed)(field={field}, type_name={type_name}, trace_id={trace_id})",
+    "backup.payload.canonical_invalid": "Canonical payload 构造时强校验失败: {reason}(field: {field})(trace_id={trace_id})",
     "effect.receipt.manager_unavailable": "副作用回执管理器不可用(action_id={action_id}, effect_type={effect_type})",
     "effect.receipt.db_error": "副作用回执数据库错误(action_id={action_id}, effect_type={effect_type})",
     "data.receipt.idempotency_conflict": "副作用幂等冲突:同 (action_id, effect_type, target) 已存在不同 request_hash 的 receipt,拒绝覆盖(action_id={action_id}, effect_type={effect_type}, target={target}, trace_id={trace_id})",
@@ -177,9 +178,13 @@
     "outbox.provider_registry.required": "Outbox provider 注册表未配置,生产模式拒绝 stub 启动(reason={reason}, trace_id={trace_id})",
     "outbox.provider_registry.load_failed": "Outbox provider 注册表加载失败,readiness 拒绝就绪(reason={reason}, trace_id={trace_id})",
     "outbox.lease_version.mismatch": "Outbox lease 版本号不匹配,complete/fail/renew 拒绝越权操作(event_id={event_id}, lease_version={lease_version}, trace_id={trace_id})",
+    "outbox.lease_version.conflict": "Outbox lease 严格 CAS 路径冲突,complete/fail/renew 拒绝操作(lease_version 不匹配或 lease 已被回收,event_id={event_id}, expected_lease_version={expected_lease_version}, operation={operation}, trace_id={trace_id})",
     "outbox.unknown_event_type": "Outbox 未知事件类型,严禁标记成功,已进入 DLQ 等待审批 replay(event_type={event_type}, outbox_id={outbox_id}, trace_id={trace_id})",
     "outbox.lease_renew.failed": "Outbox lease 续租失败,立即停止提交结果防止双重执行(event_id={event_id}, reason={reason}, trace_id={trace_id})",
     "i18n.icu.compile_failed": "i18n ICU 消息预编译失败(locale={locale}, key={key}, reason={reason}, trace_id={trace_id})",
+    "i18n.locale.not_bound": "i18n 出口边界违规:生产代码调用翻译接口未显式绑定 locale(key={key}, caller={caller}, trace_id={trace_id})",
+    "i18n.parse.failed": "i18n 运行时解析失败,已 fail-closed 拒绝向用户暴露原始 ICU 模板(key={key}, locale={locale}, reason={reason}, trace_id={trace_id})",
+    "production.evidence.insufficient": "生产证据不足,无法晋级: {reason} (缺失/过期: {missing})",
     "command.concurrent.claim": "操作已被其他 worker 抢占或状态已变更(action_id={action_id})",
     "command.hash.mismatch": "请求参数与上次执行不一致(防篡改拒绝,action_id={action_id})",
     "db.cache.unavailable": "SQLite 缓存不可用(component={component})",
@@ -221,6 +226,8 @@
     "restore.rollback.failed": "回滚失败,无法恢复至旧版本指针(operation_id={operation_id}, reason={reason})",
     "restore.nonce.payload_mismatch": "恢复 nonce payload 不一致,禁止换 payload_digest 重试(operation_id={operation_id}, backup_id={backup_id}, reason={reason})",
     "restore.phase.transition_invalid": "恢复状态机 phase 转换非法,拒绝操作(operation_id={operation_id}, phase_from={phase_from}, phase_to={phase_to}, reason={reason})",
+    "restore.legacy_writer.sealed": "旧直接 restore 写入器已被 capability-seal,生产入口必须通过 RestoreOrchestrator 蓝绿切换路径(caller={caller}, reason={reason})",
+    "high_risk.action.unregistered": "未知 destructive action 未在 HIGH_RISK_POLICY 中注册,拒绝执行以防绕过审批/MFA/双人审批门禁(action={action}, reason={reason})",
     "notification.outbox.write_failed": "通知投递 outbox 写入失败,事务已回滚(user_id={user_id}, type={notif_type})",
     "notification.outbox.duplicate": "通知投递重复(dedup_key 冲突,user_id={user_id}, dedup_key={dedup_key})",
     "content.appeal.restore_failed": "内容申诉恢复失败,已进入 reconciliation(appeal_id={appeal_id}, target_type={target_type}, target_id={target_id})",
@@ -2585,6 +2592,73 @@
     },
     "crdb_sync_event_wakeup": {
       "logger_wait_dirty_signal_timeout": "[crdb_sync_event] R56 §7.2.3: wait_dirty_signal 超时(预期行为)"
+    }
+  },
+  "diagnostics": {
+    "r65": {
+      "p1_04": {
+        "swallowed_exception": "[R65 P1-04] {file_func} 异常吞没已记录(原为静默吞异常)",
+        "collections_is_expired_invalid": "过期时间无效: expire_time={expire_time}",
+        "crdb_ru_is_data_fresh_exception": "数据新鲜度检查异常: {error}",
+        "relay_click_button_not_found": "按钮不存在(手机:{phone}) 行={row} 列={col}",
+        "relay_click_button_exception": "点击按钮异常(手机:{phone}): {error}",
+        "user_repair_is_expired_invalid": "过期时间无效: expire_time={expire_time}",
+        "high_risk_button_security_unavailable": "[high_risk_policy] button_security 不可用,仅依赖关键词匹配: {error}",
+        "idx_handle_relay_file_media_invalid_user_id": "无效 user_id 片段: {value}",
+        "dsp_should_preserve_caption_exception": "保留字幕检查异常 file_code={file_code}: {error}",
+        "admin_is_trusted_proxy_invalid_ip": "无效 IP 地址: peer_host={peer_host}"
+      },
+      "backup_dr_validate": {
+        "iso8601_check_failed": "[backup_dr_validate._is_iso8601] ISO 8601 校验失败 值={value} 原因={reason}"
+      },
+      "p0_07": {
+        "capability_sealed": "[R65 P0-07] {entry_point} 已被能力封印,生产恢复必须通过恢复编排器蓝绿切换路径执行(调用方={caller}, reason=legacy_writer_sealed)。如需在测试/脚本中调用,设置 ALLOW_LEGACY_RESTORE=1 环境变量。"
+      },
+      "p1_09": {
+        "init_table_failed": "[CRDB-RU] R65 P1-09: 初始化 crdb_ru_attribution 表失败: {error}",
+        "init_table_exception": "[CRDB-RU] R65 P1-09: init_crdb_ru_attribution_table 异常: {error}",
+        "cache_store_write_failed": "[CRDB-RU] R65 P1-09: 经 cache_store 写入归因失败,降级为 sqlite3 直连: {error}",
+        "write_attribution_failed": "[CRDB-RU] R65 P1-09: 写入 crdb_ru_attribution 失败: {error}",
+        "record_row_exception": "[CRDB-RU] R65 P1-09: record_ru_attribution_row 异常: {error}",
+        "query_attribution_failed": "[CRDB-RU] R65 P1-09: 查询 crdb_ru_attribution 失败: {error}",
+        "query_rows_exception": "[CRDB-RU] R65 P1-09: query_ru_attribution_rows 异常: {error}"
+      },
+      "outbox_worker": {
+        "fail_cas_conflict": "[外发箱工作器] 失败 CAS 冲突 event_id={event_id} effect_type={effect_type} expected_lease_version={expected_lease_version} (租约可能已被其他工作器回收/推进)",
+        "complete_cas_conflict": "[外发箱工作器] 完成 CAS 冲突 event_id={event_id} effect_type={effect_type} expected_lease_version={expected_lease_version} (租约可能已被其他工作器回收/推进)",
+        "compensation_failed": "[外发箱工作器] _persist_and_invoke_compensation 失败 event_id={event_id} action_id={action_id} error={error} (补偿意图未持久化;需手动对账)"
+      },
+      "restore_backend": {
+        "compute_schema_fingerprint_failed": "[restore_backend.{datasource}] compute_schema_fingerprint 失败: {error}",
+        "row_insert_failed": "[restore_backend.{datasource}] 行插入失败 table={table}: {error}",
+        "compute_content_hash_failed": "[restore_backend.{datasource}] 计算 {table} 的 content_hash 失败: {error}",
+        "destroyed_staging": "[restore_backend.{datasource}] 已销毁过渡区: {path}",
+        "destroy_failed": "[restore_backend.{datasource}] 销毁失败 (已忽略): {error}",
+        "crdb_compute_schema_fingerprint_failed": "[restore_backend.crdb] compute_schema_fingerprint 失败: {error}",
+        "crdb_row_insert_failed": "[restore_backend.crdb] 行插入失败 table={table}: {error}",
+        "crdb_content_hash_failed": "[restore_backend.crdb] content_hash {table} 失败: {error}",
+        "crdb_commit_switch": "[restore_backend.crdb] commit_switch: {previous} → {new} (operation_id={operation_id}, switch_version={switch_version})",
+        "crdb_rollback_switch": "[restore_backend.crdb] rollback_switch: {current} → {previous} (operation_id={operation_id})",
+        "crdb_destroyed_schema": "[restore_backend.crdb] 已销毁 schema: {schema}",
+        "crdb_destroy_failed": "[restore_backend.crdb] 销毁失败 (已忽略): {error}"
+      },
+      "p0_03": {
+        "approval_cas_consumed": "[restore_capabilities] R65 P0-03 审批权威 CAS 消费成功 approval_id={aid} 审批人={approver_id} action_hash={hash}...",
+        "mfa_cas_consumed": "[restore_capabilities] R65 P0-03 MFA权威 CAS 消费成功 标识={jti}... 持有人={principal} 用途={purpose}"
+      },
+      "p0_02": {
+        "no_backend_registry": "[restore_orchestrator] R65 P0-02: 未提供后端注册表 — 编排器将退回骨架行为(仅状态机,无真实写入/验证/切换)。生产环境必须提供后端参数,否则无法满足 R65 P0-02 整改要求。",
+        "backend_provision": "[restore_orchestrator] R65 P0-02 后端.预置 {datasource} → {target} (operation_id={operation_id})",
+        "backend_load_verified_payload": "[restore_orchestrator] R65 P0-02 后端.load_verified_payload {datasource} 行数={rows} 字节={bytes} (operation_id={operation_id})",
+        "staging_restore_skeleton": "[restore_orchestrator] 过渡区恢复 {datasource} (骨架模式,operation_id={operation_id})",
+        "rollback_after_switch_failed": "[restore_orchestrator] 切换失败后回滚 {datasource} 失败: {error}",
+        "backend_commit_switch": "[restore_orchestrator] R65 P0-02 后端.commit_switch {datasource} {previous} → {new} (operation_id={operation_id})",
+        "backend_commit_switch_uow": "[restore_orchestrator] R65 P0-02 后端.commit_switch (工作单元) {datasource} {previous} → {new} (operation_id={operation_id})",
+        "backend_rollback_switch": "[restore_orchestrator] R65 P0-02 后端.rollback_switch {datasource} {previous} → {new} (operation_id={operation_id})",
+        "rollback_failed": "[restore_orchestrator] 回滚 {datasource} 失败: {error}",
+        "backend_destroy": "[restore_orchestrator] R65 P0-02 后端.销毁 {datasource}: {target}",
+        "backend_destroy_failed_fallback": "[restore_orchestrator] 后端.销毁 {datasource} 失败 (回退到文件删除): {error}"
+      }
     }
   }
 }

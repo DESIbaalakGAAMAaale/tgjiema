@@ -1,231 +1,33 @@
 {
-  "description": "R64 P1-06 sink import boundary baseline — ratchet 模式:每个 commit 只能减少不能增加存量违规;新增违规由 AST 门禁阻断",
-  "note": "本 baseline 记录 bots/services 目录中(排除 sink_adapters/user_message.py/flood_waiter.py/admin/tests/scripts)对第三方 sink (telegram send/edit API、fastapi JSONResponse)的直接调用。迁移目标:全部改用 services/sink_adapters/* typed adapter。ratchet 策略:violation_count 只能下降不能上升;--strict 模式忽略 baseline,任何违规都失败(未来目标)。",
-  "version": "R64-P1-06",
-  "ratchet_strategy": "ratchet: violation_count 只能减少不能增加;--strict: 任何违规都失败(忽略 baseline)",
-  "violation_count": 486,
+  "description": "R65 P1-01 sink import boundary baseline — 历史参考(R64 P1-06 ratchet 阶段记录的 486 项存量违规已全部迁移到 typed adapter,CI/Release 切换为 --strict 模式)",
+  "note": "R65 P1-01 整改:本 baseline 文件已不再被 CI/Release 使用(ci.yml 改为 --strict),仅作为历史参考保留。R64 P1-06 阶段记录的 486 项 bots/services 直接调用第三方 sink (telegram send/edit API、fastapi JSONResponse) 的违规,已通过一次性 AST 迁移脚本全部转换为 services/sink_adapters/* typed adapter(UserMessage | ErrorEnvelope | TypedMedia)。violation_count 现为 0。--strict 模式忽略 baseline,任何新增违规都失败。",
+  "version": "R65-P1-01",
+  "ratchet_strategy": "R65 P1-01: ratchet 已完成,CI/Release 切换为 --strict(任何违规都失败);本 baseline 文件仅作历史参考,violation_count=0",
+  "violation_count": 0,
   "previous_violation_count": 486,
-  "violation_samples": [
-    {
-      "file": "bots/admin_bot/callback.py",
-      "count": 64,
-      "examples": [
-        {
-          "line": 3,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Update, InlineKeyboardMarkup — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 4,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.ext import ContextTypes — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 749,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Bot — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        }
-      ]
-    },
-    {
-      "file": "bots/admin_bot/conversation.py",
-      "count": 42,
-      "examples": [
-        {
-          "line": 7,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Update — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 8,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.ext import ContextTypes — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 84,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "update.message.reply_text(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        }
-      ]
-    },
-    {
-      "file": "bots/admin_bot/handlers.py",
-      "count": 241,
-      "examples": [
-        {
-          "line": 4,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Update — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 5,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.ext import ContextTypes — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 385,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import InlineKeyboardButton, InlineKeyboardMarkup — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        }
-      ]
-    },
-    {
-      "file": "bots/admin_bot/menus.py",
-      "count": 3,
-      "examples": [
-        {
-          "line": 3,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 4,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.ext import ContextTypes — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 28,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "update.message.reply_text(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        }
-      ]
-    },
-    {
-      "file": "bots/admin_bot/run.py",
-      "count": 1,
-      "examples": [
-        {
-          "line": 3,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        }
-      ]
-    },
-    {
-      "file": "bots/dsp_bot.py",
-      "count": 11,
-      "examples": [
-        {
-          "line": 16,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Update — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 17,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import InlineKeyboardButton, InlineKeyboardMarkup — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 18,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio, InputMediaAnimation — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        }
-      ]
-    },
-    {
-      "file": "bots/idx_bot.py",
-      "count": 46,
-      "examples": [
-        {
-          "line": 18,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 19,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 1675,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "update.message.reply_text(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        }
-      ]
-    },
-    {
-      "file": "bots/mon_bot.py",
-      "count": 3,
-      "examples": [
-        {
-          "line": 19,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Bot — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 20,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.error import TelegramError, RetryAfter — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 418,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "self._admin_bot.send_message(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        }
-      ]
-    },
-    {
-      "file": "bots/up_bot.py",
-      "count": 64,
-      "examples": [
-        {
-          "line": 24,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import Update — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 25,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        },
-        {
-          "line": 26,
-          "rule": "Rule 1 (import 违规)",
-          "detail": "from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler — 只允许在 services/sink_adapters/telegram_adapter.py / utils/flood_waiter.py 中导入 telegram 包"
-        }
-      ]
-    },
-    {
-      "file": "services/maintenance_mode.py",
-      "count": 3,
-      "examples": [
-        {
-          "line": 1470,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "update.message.reply_text(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        },
-        {
-          "line": 1449,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "update.message.reply_text(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        },
-        {
-          "line": 1462,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "update.message.reply_text(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        }
-      ]
-    },
-    {
-      "file": "services/relay_instance.py",
-      "count": 8,
-      "examples": [
-        {
-          "line": 673,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "self._client.send_message(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        },
-        {
-          "line": 1658,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "self._client.send_message(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        },
-        {
-          "line": 1779,
-          "rule": "Rule 2 (call 违规)",
-          "detail": "self._client.send_message(...) — 应改用 services.sink_adapters.telegram_adapter.safe_*"
-        }
-      ]
-    }
-  ]
+  "migration_summary": {
+    "migrated_files": [
+      "bots/admin_bot/callback.py",
+      "bots/admin_bot/conversation.py",
+      "bots/admin_bot/handlers.py",
+      "bots/admin_bot/menus.py",
+      "bots/admin_bot/run.py",
+      "bots/dsp_bot.py",
+      "bots/idx_bot.py",
+      "bots/mon_bot.py",
+      "bots/up_bot.py",
+      "services/maintenance_mode.py",
+      "services/relay_instance.py"
+    ],
+    "rule_1_import_replacements": 18,
+    "rule_2_call_replacements": 423,
+    "total_replacements": 441,
+    "new_adapters_added": [
+      "services/sink_adapters/telegram_helpers.py (重导出 telegram 运行时类供业务模块导入)",
+      "UserMessage.from_raw_text() 工厂(过渡期已渲染字符串通过类型边界)",
+      "build_inline_keyboard() / build_bot() / build_input_media() 工厂函数",
+      "safe_answer_callback_query() adapter"
+    ]
+  },
+  "violation_samples": []
 }

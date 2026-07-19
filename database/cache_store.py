@@ -1633,7 +1633,8 @@ class CacheStore:
             )
         # R64 P0-04: 旧 schema 无 lease_version / dlq_reason / dlq_at 列,
         # 幂等补列(fencing token + DLQ 审计字段;已存在则忽略)
-        # lease_version: fencing token,claim CAS WHERE lease_version=0,
+        # lease_version: fencing token,R65 P1-05 claim CAS WHERE status='pending',
+        #   成功后 lease_version=lease_version+1(单调递增,永不重置);
         #   complete/fail/renew 必须 CAS event_id+owner+lease_version+request_hash
         for _ob_col, _ob_def in (
             ("lease_version", "INTEGER NOT NULL DEFAULT 0"),
@@ -2292,19 +2293,28 @@ class CacheStore:
         lease_duration_seconds: int = 60,
         limit: int = 10,
     ) -> list[dict]:
-        """R62 P0-05 + R64 P0-04: 原子认领 pending outbox_events lease(CAS UPDATE)。
+        """R62 P0-05 + R64 P0-04 + R65 P1-05: 原子认领 pending outbox_events lease(CAS UPDATE)。
 
-        通过 ``UPDATE ... WHERE status='pending' AND lease_version=0`` 原子地将
-        pending 行转为 in_flight 并设置 lease_owner / lease_expires_at /
-        lease_version=1(fencing token),防止多 worker 并发拉取同一行
-        (分布式 lease 语义)。
+        通过 ``UPDATE ... WHERE status='pending'`` 原子地将 pending 行转为
+        in_flight 并设置 lease_owner / lease_expires_at /
+        ``lease_version = lease_version + 1``(fencing token,单调递增永不重置),
+        防止多 worker 并发拉取同一行(分布式 lease 语义)。
 
         R64 P0-04 整改(lease fencing token):
         - 旧 CAS 仅 ``status='pending'``,无版本号,长 provider 调用期间 lease
           被回收后旧持有者仍可 complete(ABA / 双重执行)。
-        - 新 CAS 增加 ``AND lease_version=0``(pending 行版本号为 0),
-          认领成功后 ``lease_version=1``。后续 complete/fail/renew 必须 CAS
-          携带正确 ``lease_version``,版本不匹配即拒绝(防 ABA)。
+
+        R65 P1-05 整改(fencing token 单调递增永不重置):
+        - 旧 CAS ``WHERE status='pending' AND lease_version=0`` + 固定
+          ``lease_version=1`` 在 reclaim 后必须重置 lease_version=0 才能
+          重新 claim,导致 ABA 风险(reclaim 重置版本号后旧持有者残留调用
+          仍可匹配 version=0 重新 claim)。
+        - 新 CAS 仅 ``WHERE status='pending'``(不再依赖 lease_version=0),
+          ``lease_version = lease_version + 1``(从当前值单调递增:首次 0+1=1,
+          reclaim 后 1+1=2,reclaim 后 2+1=3...)。fencing token 永不重置,
+          旧持有者残留 complete/fail/renew 调用因版本不匹配被拒绝(防 ABA)。
+        - reclaim/fail retryable 路径不再重置 lease_version=0,保留当前值
+          供下次 claim +1 递增。
 
         Args:
             lease_owner: worker 标识(hostname:pid)
@@ -2324,17 +2334,18 @@ class CacheStore:
         now_iso = now.isoformat()
         # SQLite < 3.35 不支持 RETURNING;aiosqlite 通常基于较新 SQLite,
         # 但为兼容性使用两步:先 UPDATE 再 SELECT by lease_owner。
-        # R64 P0-04 CAS 条件: status='pending' AND lease_version=0
-        # (lease_version=0 表示未被认领;claim 后递增到 1)。
+        # R65 P1-05 CAS 条件: status='pending'(不再 AND lease_version=0),
+        # 成功后 lease_version = lease_version + 1(单调递增,永不重置)。
         # 过期 lease 回收由独立 reconcile 流程处理,避免 claim 路径复杂化。
         try:
             cursor = await self._db.execute(
                 "UPDATE outbox_events "
                 "SET status='in_flight', lease_owner=?, lease_expires_at=?, "
-                "attempt_count=attempt_count+1, lease_version=1, updated_at=? "
+                "attempt_count=attempt_count+1, "
+                "lease_version=lease_version+1, updated_at=? "
                 "WHERE id IN ("
                 "  SELECT id FROM outbox_events "
-                "  WHERE status='pending' AND lease_version=0 "
+                "  WHERE status='pending' "
                 "  ORDER BY created_at ASC LIMIT ?"
                 ")",
                 (lease_owner, lease_expires, now_iso, limit),
@@ -2385,7 +2396,7 @@ class CacheStore:
         connection: Any = None,
         tx: Any = None,
     ) -> bool:
-        """R62 P0-05 + R63 P0-05 + R64 P0-04: 标记 outbox_event 为 completed(CAS)。
+        """R62 P0-05 + R63 P0-05 + R64 P0-04 + R65 P1-05: 标记 outbox_event 为 completed(CAS)。
 
         R63 P0-05 整改(防止 stub worker 误完成非己事件):
         - 旧 SQL 仅 ``WHERE id=? AND status='in_flight'``,任何拿到 event_id 的
@@ -2406,6 +2417,13 @@ class CacheStore:
         - ``lease_version is None`` 时回退到 R63 三字段 CAS(向后兼容旧调用方 /
           测试场景,但生产路径必须传 lease_version)。
 
+        R65 P1-05 整改(严格 CAS 路径冲突 raise):
+        - ``lease_version is not None`` 路径下 CAS 失败(行未找到 / 版本不匹配 /
+          lease_owner 不匹配)一律 raise ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``,
+          不再静默返回 False。生产 worker 必须感知 CAS 冲突并停止提交结果
+          (旧持有者残留调用因版本不匹配被拒绝,防止 ABA 双重执行)。
+        - ``lease_version is None`` 路径仍返回 bool(向后兼容旧调用方 / 测试场景)。
+
         Args:
             event_id: outbox_events.id
             external_id: provider 返回的外部系统标识(telegram message_id / r2 key 等)
@@ -2417,6 +2435,11 @@ class CacheStore:
         Returns:
             True 表示 CAS 成功;False 表示行不存在 / 状态非 in_flight /
             lease_owner 不匹配 / request_hash 不匹配 / lease_version 不匹配
+            (仅 ``lease_version is None`` 向后兼容路径)
+
+        Raises:
+            AppError(OUTBOX_LEASE_VERSION_CONFLICT): 严格 CAS 路径
+                (``lease_version is not None``)下 CAS 失败
         """
         if tx is not None:
             connection = tx
@@ -2426,7 +2449,9 @@ class CacheStore:
         now = datetime.datetime.utcnow().isoformat()
         # R64 P0-04: 优先使用四字段 CAS(status+owner+version+hash),
         # 防御 ABA;lease_version=None 时回退三字段(向后兼容)。
-        if lease_owner and request_hash and lease_version is not None:
+        # R65 P1-05: 严格 CAS 路径冲突 raise(不再静默返回 False)。
+        strict_cas = bool(lease_owner and request_hash and lease_version is not None)
+        if strict_cas:
             cursor = await db.execute(
                 "UPDATE outbox_events "
                 "SET status='completed', external_id=?, last_error=NULL, "
@@ -2458,6 +2483,17 @@ class CacheStore:
         affected = cursor.rowcount if cursor is not None else 0
         if connection is None:
             await db.commit()
+        # R65 P1-05: 严格 CAS 路径冲突 raise(防 ABA 双重执行)
+        if strict_cas and affected == 0:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(
+                ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT,
+                params={
+                    "event_id": event_id,
+                    "expected_lease_version": int(lease_version),
+                    "operation": "complete",
+                },
+            )
         return affected > 0
 
     async def fail_outbox_event(
@@ -2471,17 +2507,24 @@ class CacheStore:
         connection: Any = None,
         tx: Any = None,
     ) -> str:
-        """R62 P0-05 + R64 P0-04: 标记 outbox_event 失败,分类 retryable/permanent/over-limit→DLQ。
+        """R62 P0-05 + R64 P0-04 + R65 P1-05: 标记 outbox_event 失败,分类 retryable/permanent/over-limit→DLQ。
 
         CAS 语义:仅 in_flight 可记录失败。失败后:
-        - attempt_count < max_attempts → 转回 'pending' 等待重试(retryable),
-          同时重置 lease_version=0(让事件可被重新 claim)
+        - attempt_count < max_attempts → 转回 'pending' 等待重试(retryable)
         - attempt_count >= max_attempts → 转 'dlq'(permanent,需人工介入)
 
         R64 P0-04 整改(lease fencing token):
         - ``lease_version is not None`` 时 CAS 增加 ``AND lease_version=?``
           (防越权 fail 非己 lease)。生产 worker 必须传入。
-        - retryable 路径重置 lease_version=0(reclaim 后可重新 claim)。
+
+        R65 P1-05 整改(fencing token 单调递增永不重置 + 严格 CAS 冲突 raise):
+        - retryable 路径不再重置 ``lease_version=0``,仅清空 lease_owner /
+          lease_expires_at,保留当前 lease_version 供下次 claim +1 单调递增
+          (杜绝 ABA:旧持有者残留调用因版本不匹配被拒绝)。
+        - ``lease_version is not None`` 路径下 CAS 失败(行未找到 / 版本不匹配 /
+          lease_owner 不匹配)一律 raise ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``,
+          不再静默返回 not_found。
+        - ``lease_version is None`` 路径仍返回 not_found(向后兼容旧调用方)。
 
         Args:
             event_id: outbox_events.id
@@ -2492,7 +2535,12 @@ class CacheStore:
             connection / tx: 可选事务连接
 
         Returns:
-            'retryable' / 'dlq' / 'not_found'(行不存在或状态非 in_flight)
+            'retryable' / 'dlq' / 'not_found'(行不存在或状态非 in_flight;
+            not_found 仅在 ``lease_version is None`` 向后兼容路径下返回)
+
+        Raises:
+            AppError(OUTBOX_LEASE_VERSION_CONFLICT): 严格 CAS 路径
+                (``lease_version is not None``)下 CAS 失败
         """
         if tx is not None:
             connection = tx
@@ -2502,7 +2550,9 @@ class CacheStore:
         now = datetime.datetime.utcnow().isoformat()
         # 先查询当前 attempt_count / max_attempts 判断是否超限
         # R64 P0-04: lease_version CAS 校验(防越权 fail 非己 lease)
-        if lease_owner and request_hash and lease_version is not None:
+        # R65 P1-05: 严格 CAS 路径冲突 raise(不再静默返回 not_found)
+        strict_cas = bool(lease_owner and request_hash and lease_version is not None)
+        if strict_cas:
             cursor = await db.execute(
                 "SELECT attempt_count, max_attempts FROM outbox_events "
                 "WHERE id=? AND status='in_flight' "
@@ -2517,6 +2567,17 @@ class CacheStore:
             )
         row = await cursor.fetchone()
         if row is None:
+            # R65 P1-05: 严格 CAS 路径冲突 raise
+            if strict_cas:
+                from services.error_codes import AppError, ErrorCodes
+                raise AppError(
+                    ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT,
+                    params={
+                        "event_id": event_id,
+                        "expected_lease_version": int(lease_version),
+                        "operation": "fail",
+                    },
+                )
             return "not_found"
         attempt_count, max_attempts = row[0], row[1]
         truncated_err = (error_msg or "")[:500]
@@ -2533,11 +2594,12 @@ class CacheStore:
             result = "dlq"
         else:
             # 未超限 → 转回 pending 等待重试(retryable)
-            # R64 P0-04: 重置 lease_version=0(让事件可被重新 claim)
+            # R65 P1-05: 不重置 lease_version(保留当前值,下次 claim +1 单调递增)
+            # 仅清空 lease_owner / lease_expires_at(让事件可被重新 claim)
             await db.execute(
                 "UPDATE outbox_events "
                 "SET status='pending', last_error=?, lease_owner=NULL, "
-                "lease_expires_at=NULL, lease_version=0, updated_at=? "
+                "lease_expires_at=NULL, updated_at=? "
                 "WHERE id=? AND status='in_flight'",
                 (truncated_err, now, event_id),
             )
@@ -2719,7 +2781,7 @@ class CacheStore:
         *,
         batch_size: int = 100,
     ) -> int:
-        """R63 P0-05: 回收过期 lease(in_flight + lease_expires_at < now → pending)。
+        """R63 P0-05 + R65 P1-05: 回收过期 lease(in_flight + lease_expires_at < now → pending)。
 
         旧桩未实现 stale lease 回收,导致 worker 崩溃后其 in_flight 行永远
         卡住(无人 complete 也无人 fail),外部副作用永久悬挂。
@@ -2728,6 +2790,14 @@ class CacheStore:
         原子地将它们转回 ``pending`` 状态(清空 lease_owner / lease_expires_at),
         让其它 worker 可重新 claim。``attempt_count`` 不变(失败的尝试仍计入
         重试上限,防止无限重试)。
+
+        R65 P1-05 整改(fencing token 单调递增永不重置):
+        - 旧实现重置 ``lease_version=0`` 后,旧持有者残留 complete/fail/renew
+          调用若携带 lease_version=0 仍可匹配(reclaim 后版本号被重置回 0),
+          造成 ABA 风险(双重 complete / 越权 fail)。
+        - 新实现仅清空 lease_owner / lease_expires_at,保留当前 lease_version;
+          下次 claim 通过 ``lease_version = lease_version + 1`` 单调递增。
+          旧持有者残留调用因版本不匹配被 CAS 拒绝(防 ABA)。
 
         Args:
             batch_size: 单次最多回收的行数
@@ -2743,7 +2813,8 @@ class CacheStore:
             cursor = await self._db.execute(
                 "UPDATE outbox_events "
                 "SET status='pending', lease_owner=NULL, lease_expires_at=NULL, "
-                "lease_version=0, "
+                # R65 P1-05: 不重置 lease_version=0(fencing token 单调递增永不重置),
+                # 保留当前值供下次 claim +1 递增,杜绝 ABA。
                 "last_error=COALESCE(last_error||' | ', '') || "
                 "'lease_reclaimed_at:' || ?, updated_at=? "
                 "WHERE id IN ("
@@ -2779,7 +2850,7 @@ class CacheStore:
         lease_version: Any = None,
         lease_duration_seconds: int = 60,
     ) -> bool:
-        """R63 P0-05 + R64 P0-04: 续约 lease(长 provider 调用防超时回收)。
+        """R63 P0-05 + R64 P0-04 + R65 P1-05: 续约 lease(长 provider 调用防超时回收)。
 
         provider 调用耗时较长(如大文件 R2 上传)时,worker 应周期性续约 lease,
         防止 lease 超时被其它 worker 回收后造成双重执行。
@@ -2791,6 +2862,13 @@ class CacheStore:
           /fail/renew 必须使用新版本号,旧持有者残留调用因版本不匹配被拒绝)。
         - ``lease_version is None`` 时回退到 R63 三字段 CAS(向后兼容)。
 
+        R65 P1-05 整改(严格 CAS 路径冲突 raise):
+        - ``lease_version is not None`` 路径下 CAS 失败(行未找到 / 版本不匹配 /
+          lease_owner 不匹配)一律 raise ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``,
+          不再静默返回 False。调用方(OutboxWorker._maybe_renew_lease)捕获并
+          转换为 OUTBOX_LEASE_RENEW_FAILED 停止提交结果(防 ABA 双重执行)。
+        - ``lease_version is None`` 路径仍返回 bool(向后兼容旧调用方 / 测试场景)。
+
         Args:
             event_id: outbox_events.id
             lease_owner: 必须与 claim 时一致
@@ -2800,7 +2878,11 @@ class CacheStore:
 
         Returns:
             True 续约成功;False 行不存在 / lease 已被回收 / 调用方非 lease 持有者 /
-            lease_version 不匹配
+            lease_version 不匹配(仅在 ``lease_version is None`` 向后兼容路径下)
+
+        Raises:
+            AppError(OUTBOX_LEASE_VERSION_CONFLICT): 严格 CAS 路径
+                (``lease_version is not None``)下 CAS 失败
         """
         if not self._db:
             return False
@@ -2810,9 +2892,11 @@ class CacheStore:
         ).isoformat()
         now_iso = now.isoformat()
         renewed = False
+        # R65 P1-05: 严格 CAS 路径冲突 raise(不再静默返回 False)
+        strict_cas = lease_version is not None
         try:
             # R64 P0-04: 四字段 CAS + lease_version 递增(防 ABA)
-            if lease_version is not None:
+            if strict_cas:
                 cursor = await self._db.execute(
                     "UPDATE outbox_events "
                     "SET lease_expires_at=?, lease_version=lease_version+1, "
@@ -2840,6 +2924,17 @@ class CacheStore:
                 await self._db.rollback()
             except Exception as rb_err:
                 logger.debug(f"[CacheStore] rollback 失败: {rb_err}")
+        # R65 P1-05: 严格 CAS 路径冲突 raise(防 ABA 双重执行)
+        if strict_cas and not renewed:
+            from services.error_codes import AppError, ErrorCodes
+            raise AppError(
+                ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT,
+                params={
+                    "event_id": event_id,
+                    "expected_lease_version": int(lease_version),
+                    "operation": "renew",
+                },
+            )
         return renewed
 
     async def get_dirty_outbox_batch(self, limit: int = 100) -> list[dict]:

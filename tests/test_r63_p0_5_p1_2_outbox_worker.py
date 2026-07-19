@@ -1,9 +1,9 @@
 """R63 P0-05 + P1-02: OutboxWorker stub 静默成功 + 冲突处理异常字符串猜测 整改测试。
 
 被测目标:
-- ``services.data_lifecycle.OutboxWorker`` —— R63 P0-05 整改:
-    * ``__init__`` 新增 ``test_mode: bool = False`` 参数
-    * ``run_once``: ``provider_registry is None`` 且非 ``test_mode`` → raise AppError
+- ``services.data_lifecycle.OutboxWorker`` —— R63 P0-05 整改 + R65 P1-05:
+    * R65 P1-05: ``test_mode`` 参数已彻底移除(传入即 TypeError)
+    * ``run_once``: ``provider_registry is None`` → raise AppError(fail-fast)
     * ``run_once``: provider 调用签名扩展为
       ``async (payload_json, request_hash, idempotency_key) -> external_id``
     * ``run_once``: complete 时使用 CAS ``WHERE status='in_flight' AND lease_owner=?
@@ -23,28 +23,27 @@
 
 测试覆盖:
 P0-05 (OutboxWorker stub 静默成功):
-  1. run_once 无 provider 且非 test_mode → raise AppError(fail-fast)
-  2. run_once 无 provider + test_mode=True → stub 模式正常 complete
-  3. run_once 有 provider_registry → 正常调用 provider
-  4. validate_providers() registry=None → 返回全部 missing
-  5. validate_providers() 部分缺失 → 返回 missing 列表
-  6. validate_providers() 全覆盖 → 返回空 list
-  7. validate_providers() 自定义 required_effect_types
-  8. reclaim_stale_leases() 回收过期 lease
-  9. reclaim_stale_leases() 无过期 → 返回 0
-  10. reclaim_stale_leases() 保留 attempt_count
-  11. run_once 调用 provider 传入 (payload_json, request_hash, idempotency_key)
-  12. run_once 保存 external_id 到 outbox_events
-  13. complete_outbox_event CAS lease_owner + request_hash 双重校验
-  14. complete_outbox_event 错误 lease_owner → False
-  15. complete_outbox_event 错误 request_hash → False
-  16. complete_outbox_event 兼容路径(无 CAS 参数)
-  17. renew_outbox_lease 续约 lease
+  1. run_once 无 provider → raise AppError(fail-fast)(R65: test_mode 已移除)
+  2. run_once 有 provider_registry → 正常调用 provider
+  3. validate_providers() registry=None → 返回全部 missing
+  4. validate_providers() 部分缺失 → 返回 missing 列表
+  5. validate_providers() 全覆盖 → 返回空 list
+  6. validate_providers() 自定义 required_effect_types
+  7. reclaim_stale_leases() 回收过期 lease
+  8. reclaim_stale_leases() 无过期 → 返回 0
+  9. reclaim_stale_leases() 保留 attempt_count
+  10. run_once 调用 provider 传入 (payload_json, request_hash, idempotency_key)
+  11. run_once 保存 external_id 到 outbox_events
+  12. complete_outbox_event CAS lease_owner + request_hash 双重校验
+  13. complete_outbox_event 错误 lease_owner → False(向后兼容路径,无 lease_version)
+  14. complete_outbox_event 错误 request_hash → False(向后兼容路径,无 lease_version)
+  15. complete_outbox_event 兼容路径(无 CAS 参数)
+  16. renew_outbox_lease 续约 lease
 P1-02 (outbox 冲突处理异常字符串猜测):
-  18. UNIQUE 冲突 + 同 payload → 幂等(不抛错)
-  19. UNIQUE 冲突 + 不同 payload → IDEMPOTENCY_CONFLICT
-  20. 非 UNIQUE IntegrityError(CHECK 约束)→ 抛错(不静默视为已排队)
-  21. UNIQUE 冲突后逐字段验证(action/effect/target/hash 一致)
+  17. UNIQUE 冲突 + 同 payload → 幂等(不抛错)
+  18. UNIQUE 冲突 + 不同 payload → IDEMPOTENCY_CONFLICT
+  19. 非 UNIQUE IntegrityError(CHECK 约束)→ 抛错(不静默视为已排队)
+  20. UNIQUE 冲突后逐字段验证(action/effect/target/hash 一致)
 """
 from __future__ import annotations
 
@@ -239,20 +238,25 @@ def _make_grant(action_id: str, canonical_hash: str, future_iso: str, now_iso: s
 
 
 # ════════════════════════════════════════════════════════════════
-# P0-05: OutboxWorker test_mode guard (防 stub 误启动)
+# P0-05: OutboxWorker provider guard (防 stub 误启动;R65: test_mode 已移除)
 # ════════════════════════════════════════════════════════════════
 
-class TestOutboxWorkerTestModeGuard:
-    """R63 P0-05: provider_registry=None + 非 test_mode → run_once raise AppError。"""
+class TestOutboxWorkerProviderGuard:
+    """R63 P0-05 + R65 P1-05: provider_registry=None → run_once raise AppError。
+
+    R65 P1-05: ``test_mode`` 参数已彻底移除,不再有 stub 模式分支;
+    测试必须注入独立 fake provider。
+    """
 
     @pytest.mark.asyncio
-    async def test_run_once_raises_runtime_error_when_no_provider_and_not_test_mode(
+    async def test_run_once_raises_runtime_error_when_no_provider(
         self, real_store,
     ):
-        """生产模式(test_mode=False,默认)下 provider_registry=None → AppError。
+        """provider_registry=None → AppError(fail-fast)。
 
         场景:管理员误启动默认配置的 worker,旧实现会静默 complete 所有外部副作用,
         造成业务状态与外部世界失配。新实现 fail-fast raise AppError。
+        R65 P1-05: test_mode 已移除,生产/测试一致要求注入 provider。
         """
         from services.data_lifecycle import OutboxWorker
         # 准备 pending 事件(确保 fail-fast 在 claim 之前发生)
@@ -263,9 +267,8 @@ class TestOutboxWorkerTestModeGuard:
             request_hash="rh_p0_5_guard" + "0" * 53,
             payload_json="{}",
         )
-        # 默认 test_mode=False,无 provider_registry
+        # R65 P1-05: test_mode 参数已移除,不传入
         worker = OutboxWorker(lease_owner="worker_prod", batch_size=10)
-        assert worker.test_mode is False
         assert worker.provider_registry is None
         # run_once 必须 raise AppError(fail-fast)
         with pytest.raises(AppError) as exc_info:
@@ -284,48 +287,14 @@ class TestOutboxWorkerTestModeGuard:
         assert row[0] == "pending"  # 未被 claim
 
     @pytest.mark.asyncio
-    async def test_run_once_works_with_test_mode_true_and_no_provider(
+    async def test_run_once_works_with_provider_registry(
         self, real_store,
     ):
-        """R64 P0-04: test_mode=True + provider_registry=None → 仍 raise AppError。
-
-        旧 R63 实现 test_mode=True 时 stub 模式正常 complete;
-        R64 P0-04 整改:生产构建从代码层移除 no-provider-complete 分支,
-        不论 test_mode 如何,provider_registry=None 一律 raise
-        AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)。
-        测试应注入独立 fake provider,不依赖 test_mode 绕过。
-        """
-        from services.data_lifecycle import OutboxWorker
-        await real_store.add_outbox_event(
-            action_id="act_p0_5_stub",
-            effect_type="telegram_message",
-            target="chat:1",
-            request_hash="rh_p0_5_stub" + "0" * 53,
-            payload_json="{}",
-        )
-        worker = OutboxWorker(
-            lease_owner="worker_stub", batch_size=10, test_mode=True,
-        )
-        assert worker.test_mode is True
-        # R64 P0-04: test_mode 不再控制 stub 行为,无 provider 一律 raise
-        with pytest.raises(AppError):
-            await worker.run_once()
-        # 事件仍为 pending(fail-fast 在 claim 之前发生)
-        cursor = await real_store._db.execute(
-            "SELECT status FROM outbox_events WHERE action_id=?",
-            ("act_p0_5_stub",),
-        )
-        row = await cursor.fetchone()
-        assert row[0] == "pending"
-
-    @pytest.mark.asyncio
-    async def test_run_once_works_with_provider_registry_no_test_mode(
-        self, real_store,
-    ):
-        """有 provider_registry + test_mode=False → 正常调用 provider(生产路径)。
+        """有 provider_registry → 正常调用 provider(生产路径)。
 
         R64 P0-04: provider 签名改为接收 immutable OutboxEnvelope
         (基于 idempotency_key 去重)。
+        R65 P1-05: test_mode 参数已移除,不再传入。
         """
         from services.data_lifecycle import OutboxEnvelope, OutboxWorker
 
@@ -345,37 +314,23 @@ class TestOutboxWorkerTestModeGuard:
             batch_size=10,
             provider_registry={"telegram_message": _provider},
         )
-        # test_mode 默认 False,但有 provider_registry → 不 raise
-        assert worker.test_mode is False
         result = await worker.run_once()
         assert result["claimed"] == 1
         assert result["completed"] == 1
         assert result["failed"] == 0
         assert result["dlq"] == 0
 
-    @pytest.mark.asyncio
-    async def test_test_mode_default_is_false(self):
-        """OutboxWorker 默认 test_mode=False(生产安全默认)。"""
+    def test_test_mode_parameter_removed_raises_typeerror(self):
+        """R65 P1-05: ``test_mode`` 参数已彻底移除,传入即 TypeError。"""
         from services.data_lifecycle import OutboxWorker
-        worker = OutboxWorker(lease_owner="w", batch_size=1)
-        assert worker.test_mode is False
-
-    @pytest.mark.asyncio
-    async def test_test_mode_explicit_false_raises(self, real_store):
-        """显式 test_mode=False + 无 provider → raise AppError(防显式误配置)。"""
-        from services.data_lifecycle import OutboxWorker
-        await real_store.add_outbox_event(
-            action_id="act_p0_5_explicit_false",
-            effect_type="telegram_message",
-            target="chat:1",
-            request_hash="rh_p0_5_explicit" + "0" * 51,
-            payload_json="{}",
-        )
-        worker = OutboxWorker(
-            lease_owner="w", batch_size=10, test_mode=False,
-        )
-        with pytest.raises(AppError):
-            await worker.run_once()
+        with pytest.raises(TypeError):
+            OutboxWorker(
+                lease_owner="w", batch_size=1, test_mode=False,
+            )
+        with pytest.raises(TypeError):
+            OutboxWorker(
+                lease_owner="w", batch_size=1, test_mode=True,
+            )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -388,8 +343,9 @@ class TestOutboxWorkerValidateProviders:
     def test_validate_providers_returns_all_missing_when_registry_none(self):
         """provider_registry=None → 返回全部 CRITICAL_EFFECT_TYPES(missing)。"""
         from services.data_lifecycle import OutboxWorker
+        # R65 P1-05: test_mode 参数已移除,不传入
         worker = OutboxWorker(
-            lease_owner="w", batch_size=1, test_mode=True,
+            lease_owner="w", batch_size=1,
         )
         missing = worker.validate_providers()
         # CRITICAL_EFFECT_TYPES 有 9 个枚举值
@@ -486,7 +442,7 @@ class TestOutboxWorkerReclaimStaleLeases:
         await real_store._db.commit()
         # reclaim
         worker = OutboxWorker(
-            lease_owner="worker_reclaimer", batch_size=10, test_mode=True,
+            lease_owner="worker_reclaimer", batch_size=10,
         )
         reclaimed = await worker.reclaim_stale_leases()
         assert reclaimed == 1
@@ -524,7 +480,7 @@ class TestOutboxWorkerReclaimStaleLeases:
             lease_owner="worker_active", lease_duration_seconds=60, limit=1,
         )
         worker = OutboxWorker(
-            lease_owner="w", batch_size=10, test_mode=True,
+            lease_owner="w", batch_size=10,
         )
         reclaimed = await worker.reclaim_stale_leases()
         assert reclaimed == 0
@@ -566,7 +522,7 @@ class TestOutboxWorkerReclaimStaleLeases:
         )
         await real_store._db.commit()
         # reclaim
-        worker = OutboxWorker(lease_owner="w", batch_size=10, test_mode=True)
+        worker = OutboxWorker(lease_owner="w", batch_size=10)
         reclaimed = await worker.reclaim_stale_leases()
         assert reclaimed == 1
         # attempt_count 仍为 2(不递减)
@@ -600,7 +556,7 @@ class TestOutboxWorkerReclaimStaleLeases:
         )
         await real_store._db.commit()
         # batch_size=2 → 只回收 2 条
-        worker = OutboxWorker(lease_owner="w", batch_size=10, test_mode=True)
+        worker = OutboxWorker(lease_owner="w", batch_size=10)
         reclaimed = await worker.reclaim_stale_leases(batch_size=2)
         assert reclaimed == 2
 
@@ -783,12 +739,15 @@ class TestOutboxWorkerProviderSignature:
         assert ok is True
 
     @pytest.mark.asyncio
-    async def test_run_once_stub_mode_also_uses_cas(self, real_store):
-        """R64 P0-04: test_mode=True + 无 provider → 仍 raise AppError(不再 stub complete)。
+    async def test_run_once_no_provider_does_not_touch_other_worker_lease(
+        self, real_store,
+    ):
+        """R64 P0-04 + R65 P1-05: 无 provider → raise AppError(不再 stub complete)。
 
         旧 R63 实现 stub 模式下 run_once 会先 claim 自己的事件并 complete;
-        R64 P0-04 整改:不论 test_mode,provider_registry=None 一律 raise,
+        R64 P0-04 整改:provider_registry=None 一律 raise,
         不会执行 claim/complete,事件保持原 in_flight 状态(由 worker_X 持有)。
+        R65 P1-05: test_mode 已移除,不再有 stub 模式。
         """
         from services.data_lifecycle import OutboxWorker
         eid = await real_store.add_outbox_event(
@@ -802,9 +761,9 @@ class TestOutboxWorkerProviderSignature:
         await real_store.claim_outbox_events(
             lease_owner="worker_X", lease_duration_seconds=60, limit=1,
         )
-        # worker_Y test_mode=True + 无 provider → R64 P0-04: raise AppError
+        # worker_Y 无 provider → raise AppError(R65: test_mode 已移除)
         worker_Y = OutboxWorker(
-            lease_owner="worker_Y", batch_size=10, test_mode=True,
+            lease_owner="worker_Y", batch_size=10,
         )
         with pytest.raises(AppError):
             await worker_Y.run_once()

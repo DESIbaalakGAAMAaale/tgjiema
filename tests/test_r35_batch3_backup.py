@@ -489,13 +489,20 @@ class TestRestoreDelegation:
             _RESTORE_SENTINEL,
             VerifiedBackupPayload,
             _canonical_json_bytes,
+            _enrich_payload_data,
         )
         verified_payload = VerifiedBackupPayload(
             backup_id="test_backup_id",
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="test_schema_v1",
-            canonical_payload_bytes=_canonical_json_bytes(backup_data),
+            canonical_payload_bytes=_canonical_json_bytes(
+                # R65 P1-06: 补齐 canonical payload 必填字段
+                _enrich_payload_data(
+                    backup_data, backup_id="test_backup_id",
+                    created_at="2024-01-01T00:00:00Z",
+                )
+            ),
         )
         _cap = _RestoreCapability(
             _RESTORE_SENTINEL,
@@ -557,13 +564,20 @@ class TestRestoreDelegation:
             _RESTORE_SENTINEL,
             VerifiedBackupPayload,
             _canonical_json_bytes,
+            _enrich_payload_data,
         )
         verified_payload = VerifiedBackupPayload(
             backup_id="test_backup_id",
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="test_schema_v1",
-            canonical_payload_bytes=_canonical_json_bytes(backup_data),
+            canonical_payload_bytes=_canonical_json_bytes(
+                # R65 P1-06: 补齐 canonical payload 必填字段
+                _enrich_payload_data(
+                    backup_data, backup_id="test_backup_id",
+                    created_at="2024-01-01T00:00:00Z",
+                )
+            ),
         )
         _cap = _RestoreCapability(
             _RESTORE_SENTINEL,

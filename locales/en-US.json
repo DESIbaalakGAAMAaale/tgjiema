@@ -160,6 +160,7 @@
     "backup.restore.checksum_mismatch": "Backup file checksum mismatch, may be corrupted (backup_id={backup_id})",
     "backup.restore.trust_chain_required": "Backup restore trust-chain token missing or invalid, restore denied (backup_id={backup_id})",
     "backup.payload.not_serializable": "Backup data contains non-JSON-serializable type, rejected (fail-closed) (field={field}, type_name={type_name}, trace_id={trace_id})",
+    "backup.payload.canonical_invalid": "Canonical payload construction-time validation failed: {reason} (field: {field}) (trace_id={trace_id})",
     "effect.receipt.manager_unavailable": "Effect receipt manager unavailable (action_id={action_id}, effect_type={effect_type})",
     "effect.receipt.db_error": "Effect receipt database error (action_id={action_id}, effect_type={effect_type})",
     "data.receipt.idempotency_conflict": "Effect receipt idempotency conflict: a receipt with a different request_hash already exists for the same (action_id, effect_type, target), overwrite refused (action_id={action_id}, effect_type={effect_type}, target={target}, trace_id={trace_id})",
@@ -177,9 +178,13 @@
     "outbox.provider_registry.required": "Outbox provider registry not configured, production mode rejects stub startup (reason={reason}, trace_id={trace_id})",
     "outbox.provider_registry.load_failed": "Outbox provider registry load failed, readiness rejects (reason={reason}, trace_id={trace_id})",
     "outbox.lease_version.mismatch": "Outbox lease version mismatch, complete/fail/renew rejects unauthorized operation (event_id={event_id}, lease_version={lease_version}, trace_id={trace_id})",
+    "outbox.lease_version.conflict": "Outbox lease strict CAS path conflict, complete/fail/renew rejected (lease_version mismatch or lease reclaimed, event_id={event_id}, expected_lease_version={expected_lease_version}, operation={operation}, trace_id={trace_id})",
     "outbox.unknown_event_type": "Outbox unknown event type, must not mark success, moved to DLQ for approvable replay (event_type={event_type}, outbox_id={outbox_id}, trace_id={trace_id})",
     "outbox.lease_renew.failed": "Outbox lease renew failed, stop committing results to prevent double execution (event_id={event_id}, reason={reason}, trace_id={trace_id})",
     "i18n.icu.compile_failed": "i18n ICU message pre-compilation failed (locale={locale}, key={key}, reason={reason}, trace_id={trace_id})",
+    "i18n.locale.not_bound": "i18n export boundary violation: production code called translation API without explicit locale binding (key={key}, caller={caller}, trace_id={trace_id})",
+    "i18n.parse.failed": "i18n runtime parse failed, fail-closed refusing to expose raw ICU template to user (key={key}, locale={locale}, reason={reason}, trace_id={trace_id})",
+    "production.evidence.insufficient": "Production evidence insufficient for promotion: {reason} (missing/expired: {missing})",
     "command.concurrent.claim": "Operation claimed by another worker or state changed (action_id={action_id})",
     "command.hash.mismatch": "Request parameters differ from last execution (anti-tamper rejected, action_id={action_id})",
     "db.cache.unavailable": "SQLite cache unavailable (component={component})",
@@ -221,6 +226,8 @@
     "restore.rollback.failed": "Rollback failed; cannot restore previous version pointer (operation_id={operation_id}, reason={reason})",
     "restore.nonce.payload_mismatch": "Restore nonce payload mismatch; retrying with a different payload_digest is forbidden (operation_id={operation_id}, backup_id={backup_id}, reason={reason})",
     "restore.phase.transition_invalid": "Restore state machine phase transition is invalid; operation rejected (operation_id={operation_id}, phase_from={phase_from}, phase_to={phase_to}, reason={reason})",
+    "restore.legacy_writer.sealed": "Legacy direct restore writer is capability-sealed; production entry must route through RestoreOrchestrator blue-green switch (caller={caller}, reason={reason})",
+    "high_risk.action.unregistered": "Unknown destructive action is not registered in HIGH_RISK_POLICY; execution rejected to prevent bypassing approval/MFA/two-person gate (action={action}, reason={reason})",
     "notification.outbox.write_failed": "Notification outbox write failed, transaction rolled back (user_id={user_id}, type={notif_type})",
     "notification.outbox.duplicate": "Duplicate notification delivery (dedup_key conflict, user_id={user_id}, dedup_key={dedup_key})",
     "content.appeal.restore_failed": "Content appeal restore failed, entered reconciliation (appeal_id={appeal_id}, target_type={target_type}, target_id={target_id})",
@@ -2585,6 +2592,73 @@
     },
     "crdb_sync_event_wakeup": {
       "logger_wait_dirty_signal_timeout": "[crdb_sync_event] R56 §7.2.3: wait_dirty_signal timeout (expected)"
+    }
+  },
+  "diagnostics": {
+    "r65": {
+      "p1_04": {
+        "swallowed_exception": "[R65 P1-04] {file_func} swallowed exception now logged (was: except: pass)",
+        "collections_is_expired_invalid": "[Collections] _is_expired invalid expire_time={expire_time}",
+        "crdb_ru_is_data_fresh_exception": "[CrdbRuCollector] is_data_fresh exception: {error}",
+        "relay_click_button_not_found": "[RelayInstance:{phone}] _click_button button not found row={row} col={col}",
+        "relay_click_button_exception": "[RelayInstance:{phone}] _click_button exception: {error}",
+        "user_repair_is_expired_invalid": "[UserRepair] _is_expired invalid expire_time={expire_time}",
+        "high_risk_button_security_unavailable": "[high_risk_policy] button_security unavailable, falling back to keyword matching only: {error}",
+        "idx_handle_relay_file_media_invalid_user_id": "[Idx] _handle_relay_file_media invalid user_id segment: {value}",
+        "dsp_should_preserve_caption_exception": "[Dsp] _should_preserve_caption exception file_code={file_code}: {error}",
+        "admin_is_trusted_proxy_invalid_ip": "[Admin] _is_trusted_proxy: invalid IP address peer_host={peer_host}"
+      },
+      "backup_dr_validate": {
+        "iso8601_check_failed": "[backup_dr_validate._is_iso8601] ISO 8601 validation failed value={value} reason={reason}"
+      },
+      "p0_07": {
+        "capability_sealed": "[R65 P0-07] {entry_point} has been capability-sealed; production recovery must go through the RestoreOrchestrator blue-green switch path (caller={caller}, reason=legacy_writer_sealed). To call from tests/scripts, set ALLOW_LEGACY_RESTORE=1 environment variable."
+      },
+      "p1_09": {
+        "init_table_failed": "[CRDB-RU] R65 P1-09: init crdb_ru_attribution table failed: {error}",
+        "init_table_exception": "[CRDB-RU] R65 P1-09: init_crdb_ru_attribution_table exception: {error}",
+        "cache_store_write_failed": "[CRDB-RU] R65 P1-09: cache_store attribution write failed, fallback to sqlite3 direct: {error}",
+        "write_attribution_failed": "[CRDB-RU] R65 P1-09: write crdb_ru_attribution failed: {error}",
+        "record_row_exception": "[CRDB-RU] R65 P1-09: record_ru_attribution_row exception: {error}",
+        "query_attribution_failed": "[CRDB-RU] R65 P1-09: query crdb_ru_attribution failed: {error}",
+        "query_rows_exception": "[CRDB-RU] R65 P1-09: query_ru_attribution_rows exception: {error}"
+      },
+      "outbox_worker": {
+        "fail_cas_conflict": "[OutboxWorker] fail CAS conflict event_id={event_id} effect_type={effect_type} expected_lease_version={expected_lease_version} (lease may have been reclaimed/advanced by another worker)",
+        "complete_cas_conflict": "[OutboxWorker] complete CAS conflict event_id={event_id} effect_type={effect_type} expected_lease_version={expected_lease_version} (lease may have been reclaimed/advanced by another worker)",
+        "compensation_failed": "[OutboxWorker] _persist_and_invoke_compensation failed event_id={event_id} action_id={action_id} error={error} (compensation intent NOT persisted; manual reconcile required)"
+      },
+      "restore_backend": {
+        "compute_schema_fingerprint_failed": "[restore_backend.{datasource}] compute_schema_fingerprint failed: {error}",
+        "row_insert_failed": "[restore_backend.{datasource}] row insert failed table={table}: {error}",
+        "compute_content_hash_failed": "[restore_backend.{datasource}] compute content_hash for {table} failed: {error}",
+        "destroyed_staging": "[restore_backend.{datasource}] destroyed staging: {path}",
+        "destroy_failed": "[restore_backend.{datasource}] destroy failed (ignored): {error}",
+        "crdb_compute_schema_fingerprint_failed": "[restore_backend.crdb] compute_schema_fingerprint failed: {error}",
+        "crdb_row_insert_failed": "[restore_backend.crdb] row insert failed table={table}: {error}",
+        "crdb_content_hash_failed": "[restore_backend.crdb] content_hash {table} failed: {error}",
+        "crdb_commit_switch": "[restore_backend.crdb] commit_switch: {previous} -> {new} (operation_id={operation_id}, switch_version={switch_version})",
+        "crdb_rollback_switch": "[restore_backend.crdb] rollback_switch: {current} -> {previous} (operation_id={operation_id})",
+        "crdb_destroyed_schema": "[restore_backend.crdb] destroyed schema: {schema}",
+        "crdb_destroy_failed": "[restore_backend.crdb] destroy failed (ignored): {error}"
+      },
+      "p0_03": {
+        "approval_cas_consumed": "[restore_capabilities] R65 P0-03 ApprovalAuthority CAS consumed approval_id={aid} approver={approver_id} action_hash={hash}...",
+        "mfa_cas_consumed": "[restore_capabilities] R65 P0-03 MFAAuthority CAS consumed jti={jti}... principal={principal} purpose={purpose}"
+      },
+      "p0_02": {
+        "no_backend_registry": "[restore_orchestrator] R65 P0-02: BackendRegistry not provided — orchestrator will fall back to skeleton behavior (state machine only, no real write/verify/switch). Production must provide backends parameter, otherwise R65 P0-02 remediation cannot be satisfied.",
+        "backend_provision": "[restore_orchestrator] R65 P0-02 backend.provision {datasource} -> {target} (operation_id={operation_id})",
+        "backend_load_verified_payload": "[restore_orchestrator] R65 P0-02 backend.load_verified_payload {datasource} rows={rows} bytes={bytes} (operation_id={operation_id})",
+        "staging_restore_skeleton": "[restore_orchestrator] staging restore {datasource} (skeleton mode,operation_id={operation_id})",
+        "rollback_after_switch_failed": "[restore_orchestrator] rollback after switch failure {datasource} failed: {error}",
+        "backend_commit_switch": "[restore_orchestrator] R65 P0-02 backend.commit_switch {datasource} {previous} -> {new} (operation_id={operation_id})",
+        "backend_commit_switch_uow": "[restore_orchestrator] R65 P0-02 backend.commit_switch (UoW) {datasource} {previous} -> {new} (operation_id={operation_id})",
+        "backend_rollback_switch": "[restore_orchestrator] R65 P0-02 backend.rollback_switch {datasource} {previous} -> {new} (operation_id={operation_id})",
+        "rollback_failed": "[restore_orchestrator] rollback {datasource} failed: {error}",
+        "backend_destroy": "[restore_orchestrator] R65 P0-02 backend.destroy {datasource}: {target}",
+        "backend_destroy_failed_fallback": "[restore_orchestrator] backend.destroy {datasource} failed (fallback to unlink): {error}"
+      }
     }
   }
 }

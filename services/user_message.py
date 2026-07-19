@@ -253,6 +253,11 @@ class UserMessage:
         params: ICU 插值参数(已脱敏 + 递归冻结;顶层为 MappingProxyType)
         error_code: 关联的错误码(可选,用于协议化错误)
         trace_id: 追踪 ID(用于全链路日志关联)
+        _raw_text: R65 P1-01 过渡期字段 — 持有已渲染字符串(由
+            ``from_raw_text`` 工厂设置)。render() 优先返回此字段,
+            跳过 i18n_manager.format_message。用于迁移存量已通过 _t() /
+            _i18n_t() 渲染的调用点到 typed sink。新代码应使用
+            ``from_key(...)`` 而非 ``from_raw_text(...)``。
     """
     message_key: str
     locale: str = "zh-CN"
@@ -261,6 +266,8 @@ class UserMessage:
     params: dict[str, Any] = field(default_factory=dict)
     error_code: Optional[str] = None
     trace_id: Optional[str] = None
+    # R65 P1-01: 过渡期已渲染字符串(由 from_raw_text 设置;render 时直接返回)
+    _raw_text: Optional[str] = None
 
     def __post_init__(self) -> None:
         """R62 P1-05 / R63 P1-08: 构造时即过滤敏感字段并递归冻结 params。
@@ -288,10 +295,59 @@ class UserMessage:
             render 是惰性的 — UserMessage 在传播过程中保持结构化,
             仅在真正写入用户面前才转为字符串。
         """
+        # R65 P1-01: 过渡期 — 若 _raw_text 已设置(由 from_raw_text 构造),
+        # 直接返回已渲染字符串,跳过 i18n_manager.format_message。
+        # 用于迁移存量 _t()/_i18n_t() 已渲染的调用点到 typed sink。
+        if self._raw_text is not None:
+            return self._raw_text
         # R62 P1-05: params 已在 __post_init__ 中脱敏 + 冻结,可直接展开
         # MappingProxyType 支持 ** 解包,等价于 dict
         return i18n_manager.format_message(
             self.message_key, locale=self.locale, **self.params
+        )
+
+    @classmethod
+    def from_raw_text(
+        cls,
+        text: str,
+        *,
+        locale: str = "zh-CN",
+        error_code: Optional[str] = None,
+        trace_id: Optional[str] = None,
+    ) -> "UserMessage":
+        """R65 P1-01: 从已渲染字符串构造 UserMessage(过渡期工厂方法)。
+
+        整改背景:
+            R65 P1-01 要求所有 sink 出口接受 ``UserMessage | ErrorEnvelope``,
+            拒绝裸 str。但大量存量调用点已通过 ``_t(user_id, key, **kwargs)`` /
+            ``_i18n_t(key, **kwargs)`` 渲染为本地化字符串,无法在一次性迁移中
+            全部重构为 ``message_key + params`` 模式。本工厂方法允许调用方
+            将已渲染字符串包装为 UserMessage,通过类型边界校验,render() 时
+            直接返回原字符串(不重新翻译)。
+
+        使用建议:
+            - 新代码应优先使用 ``UserMessage.from_key(message_key, params=...)``
+              让 render() 在 sink 最后一层完成本地化
+            - 仅在存量调用点已通过 ``_t()`` / ``_i18n_t()`` 渲染、且无法立即
+              重构为 message_key 时使用 ``from_raw_text`` 作为过渡
+            - ``text`` 应已是本地化字符串(对应目标 locale)
+
+        Args:
+            text: 已渲染的本地化字符串
+            locale: 目标语言(默认 zh-CN,仅作元信息保留)
+            error_code: 关联的错误码(可选)
+            trace_id: 追踪 ID(可选)
+
+        Returns:
+            UserMessage 实例(内部 _raw_text=text,render() 直接返回 text)
+        """
+        return cls(
+            message_key="__raw_passthrough__",
+            locale=locale,
+            params={},
+            error_code=error_code,
+            trace_id=trace_id,
+            _raw_text=text,
         )
 
     @classmethod

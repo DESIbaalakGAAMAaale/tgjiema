@@ -861,6 +861,19 @@ async def run_restore(
 ):
     """R63 P0-06: 执行恢复流程(CLI 入口)— 从 backup_id/COMPLETE marker 发现备份。
 
+    R65 P0-07 / P1-07 整改(capability-seal 旧直接 restore 写入器):
+        - 本 CLI 入口被 capability-seal:生产环境调用 ``run_restore()`` 直接
+          fail-closed,抛 ``AppError(RESTORE_LEGACY_WRITER_SEALED)``。生产恢复
+          必须改走 ``RestoreOrchestrator`` 蓝绿切换路径(staging → active,
+          禁止原地覆盖生产数据)。
+        - 逃生舱:仅当环境变量 ``ALLOW_LEGACY_RESTORE=1`` 时跳过 seal(供
+          ``tests/`` 与 ``scripts/`` 中需要直接调用旧 writer 的兼容场景使用)。
+          生产部署绝不应配置此环境变量(应在系统层强制 unset)。
+        - ``_restore_from_backup_data()`` 已通过 R61 P0-03 / R62 P0-02 的
+          ``_RestoreCapability``(不可伪造 sentinel 令牌)capability-seal,
+          仅由 ``services/backup_dr_validate.validate_and_restore_backup_strict``
+          构造并传入。本 seal 是在 CLI 入口层的额外 fail-closed 防线。
+
     R63 P0-06 修复(CLI 恢复路径与三段式备份发现模型一致):
         - **删除旧 ``get_latest_backup()`` 双重 loader**(该函数枚举
           ``db_backup/db_backup_*.json`` 单文件,与三段式模型不一致)。
@@ -872,12 +885,13 @@ async def run_restore(
           (COMPLETE marker 不存在 → AppError)。
 
     流程:
-        1. 初始化 R2(配置 + 连接)
-        2. 校验 backup_id 必填(三段式发现的入口参数)
-        3. 由 backup_id 计算 expected_manifest_key(strict service 内部
+        1. R65 P0-07: capability-seal 校验(ALLOW_LEGACY_RESTORE 逃生舱)
+        2. 初始化 R2(配置 + 连接)
+        3. 校验 backup_id 必填(三段式发现的入口参数)
+        4. 由 backup_id 计算 expected_manifest_key(strict service 内部
            下载 COMPLETE→manifest→payload,调用方不预加载 data)
-        4. 调用 validate_and_restore_backup_strict(data=None)走完整三段式路径
-        5. 任一数据源失败 → AppError(strict service 内 fail-closed)
+        5. 调用 validate_and_restore_backup_strict(data=None)走完整三段式路径
+        6. 任一数据源失败 → AppError(strict service 内 fail-closed)
 
     Args:
         backup_id: 备份 ID(timestamp,如 "20260718_120000")— 必填,
@@ -891,6 +905,24 @@ async def run_restore(
         validate_and_restore_backup_strict,
         get_manifest_key,
     )
+
+    # R65 P0-07 / P1-07: capability-seal — 旧直接 restore writer 已被封存。
+    # 生产环境调用 run_restore() 必须 fail-closed,改走 RestoreOrchestrator
+    # 蓝绿切换路径(staging → active,禁止原地覆盖)。
+    # 逃生舱:ALLOW_LEGACY_RESTORE=1 仅限 tests/ 与 scripts/ 兼容场景使用,
+    # 生产部署绝不应配置(应在系统层强制 unset)。
+    if os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() not in ("1", "true", "yes"):
+        logger.error(
+            _i18n_t(
+                "diagnostics.r65.p0_07.capability_sealed",
+                entry_point="run_restore()",
+                caller="run_restore",
+            )
+        )
+        raise AppError(
+            ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
+            params={"caller": "run_restore", "reason": "legacy_writer_sealed"},
+        )
 
     # 1. 校验 backup_id 必填 — 三段式发现的入口参数
     if not backup_id:

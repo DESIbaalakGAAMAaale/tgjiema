@@ -594,7 +594,7 @@ async def _check_ddl_version(client) -> tuple[bool, str]:
                         f"已回填 SQLite 缓存(原 SQLite 版本={sqlite_version})"
                     )
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/migration_runner.py:_check_ddl_version'))
             else:
                 logger.info(
                     f"[migration_runner] DDL 版本已是最新(SQLite + CRDB 双确认,版本={DDL_VERSION})"

@@ -413,7 +413,8 @@ async def is_data_fresh(max_age_seconds: int = RU_DATA_FRESH_THRESHOLD) -> bool:
         if fresh is None:
             return False
         return fresh < max_age_seconds
-    except Exception:
+    except Exception as e:
+        logger.warning(_i18n_t('diagnostics.r65.p1_04.crdb_ru_is_data_fresh_exception', error=e))
         return False
 
 
@@ -772,7 +773,7 @@ def get_business_bot_roles() -> tuple[str, ...]:
             if roles:
                 return roles
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/crdb_ru_collector.py:get_business_bot_roles'))
     return BUSINESS_BOT_ROLES_DEFAULT
 
 
@@ -989,6 +990,469 @@ async def get_ru_attribution(
 
 
 # R64 P1-10: json 已在文件顶部导入(record_ru_attribution / get_ru_attribution 使用)
+
+
+# ════════════════════════════════════════════════════════════════
+# R65 P1-09: SQL fingerprint / service / job 归因(SQLite 表)
+# ════════════════════════════════════════════════════════════════
+# 审计发现:CRDB RU 仍只有阈值脚本(check_crdb_ru_threshold.py),
+# 没有 72h 真实数据 + SQL fingerprint 归因。POOL_MIN_SIZE=0 不证明空载 RU。
+# 本节新增 crdb_ru_attribution SQLite 表,记录每个采样窗口的:
+#   - fingerprint_sha256: 归一化 SQL 的 sha256(归并等价 SQL)
+#   - service: 服务角色(bot/admin/api/scheduler/crdb_sync/...)
+#   - job: 触发 job 名(crontab 名 / outbox_worker / migration_step_N)
+#   - ru_consumed: 本窗口 RU 消耗
+#   - sampled_at: ISO 8601 采样时间戳
+#   - sample_window_seconds: 采样窗口(默认 3600 = 1 小时)
+#   - query_text_sample: 代表性 SQL 文本前 200 字符(便于人工排查)
+
+# 表 DDL(惰性创建:首次写入时自动 CREATE TABLE IF NOT EXISTS)
+CRDB_RU_ATTRIBUTION_TABLE_DDL = """CREATE TABLE IF NOT EXISTS crdb_ru_attribution (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint_sha256 TEXT NOT NULL,
+    service TEXT NOT NULL,
+    job TEXT,
+    ru_consumed REAL NOT NULL,
+    sampled_at TEXT NOT NULL,
+    sample_window_seconds INTEGER NOT NULL,
+    query_text_sample TEXT
+)"""
+
+DEFAULT_SAMPLE_WINDOW_SECONDS = 3600
+QUERY_TEXT_SAMPLE_MAX_LEN = 200
+
+
+def normalize_sql(sql: str) -> str:
+    """R65 P1-09: SQL 归一化(用于 fingerprint 计算)。
+
+    归一化规则:
+        1. 去除单行注释(``-- ...``)和多行注释(``/* ... */``)
+        2. 小写化(关键字/标识符)
+        3. 替换数字字面量为 ``?``
+        4. 替换字符串字面量为 ``?``
+        5. 折叠连续空白为单个空格
+        6. 去除首尾空白
+
+    归一化后,等价 SQL 产生相同 fingerprint:
+        SELECT * FROM users WHERE id = 42
+        select * from users where id = 99
+        → 均归一化为 "select * from users where id = ?"
+
+    Args:
+        sql: 原始 SQL 文本
+
+    Returns:
+        归一化后的 SQL 文本
+    """
+    if not sql or not isinstance(sql, str):
+        return ""
+    import re
+    # 1. 去除单行注释(-- 到行尾)
+    result = re.sub(r"--[^\n]*", "", sql)
+    # 2. 去除多行注释(/* ... */)
+    result = re.sub(r"/\*.*?\*/", "", result, flags=re.DOTALL)
+    # 3. 小写化
+    result = result.lower()
+    # 4. 替换字符串字面量('...' 或 "...")为 ?
+    result = re.sub(r"'(?:[^'\\]|\\.)*'", "?", result)
+    result = re.sub(r'"(?:[^"\\]|\\.)*"', "?", result)
+    # 5. 替换数字字面量(整数 / 浮点)为 ?
+    result = re.sub(r"\b\d+(?:\.\d+)?\b", "?", result)
+    # 6. 折叠连续空白
+    result = re.sub(r"\s+", " ", result)
+    # 7. 去除首尾空白
+    return result.strip()
+
+
+def compute_sql_fingerprint(sql: str) -> str:
+    """R65 P1-09: 计算 SQL 的 fingerprint(归一化 SQL 的 sha256)。
+
+    Args:
+        sql: 原始 SQL 文本
+
+    Returns:
+        64 字符的 sha256 hex 字符串(归一化后)
+    """
+    normalized = normalize_sql(sql)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def truncate_query_sample(sql: str) -> str:
+    """R65 P1-09: 截断 query_text_sample 到 ``QUERY_TEXT_SAMPLE_MAX_LEN`` 字符。
+
+    用于写入 SQLite 表时限制字段长度,避免长 SQL 撑爆 DB。
+
+    Args:
+        sql: 原始 SQL 文本
+
+    Returns:
+        截断后的 SQL(最多 QUERY_TEXT_SAMPLE_MAX_LEN 字符)
+    """
+    if not sql or not isinstance(sql, str):
+        return ""
+    if len(sql) <= QUERY_TEXT_SAMPLE_MAX_LEN:
+        return sql
+    return sql[:QUERY_TEXT_SAMPLE_MAX_LEN]
+
+
+def _resolve_cache_db_path(db_path: str | None = None) -> str:
+    """R65 P1-09: 解析 SQLite DB 路径(优先使用参数,其次环境变量,最后默认)。
+
+    Args:
+        db_path: 显式指定的 DB 路径(None 使用环境变量或默认)
+
+    Returns:
+        DB 文件路径字符串
+    """
+    if db_path:
+        return db_path
+    from pathlib import Path
+    _default_data_dir = Path(__file__).resolve().parent.parent / "data"
+    return os.getenv("CACHE_STORE_DB", str(_default_data_dir / "cache_store.db"))
+
+
+def init_crdb_ru_attribution_table(db_path: str | None = None) -> bool:
+    """R65 P1-09: 初始化 ``crdb_ru_attribution`` 表(惰性创建)。
+
+    首次写入前调用本函数,确保表 + 索引存在。
+    本函数纯 SQLite,零 CRDB RU。
+
+    Args:
+        db_path: SQLite DB 路径(None 使用默认)
+
+    Returns:
+        True: 表已存在或创建成功
+        False: 创建失败(权限/磁盘满等)
+    """
+    import sqlite3
+    if db_path is None:
+        db_path = _resolve_cache_db_path()
+    # R65 P1-04: except 块禁止裸 return False(吞错误);用 success 变量记录结果
+    success = False
+    try:
+        from pathlib import Path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        # 文件不存在时 sqlite3.connect 会自动创建空 DB
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            conn.execute(CRDB_RU_ATTRIBUTION_TABLE_DDL)
+            # 创建索引:按 sampled_at 时间范围查询(frequent access pattern)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_crdb_ru_attr_sampled_at "
+                "ON crdb_ru_attribution(sampled_at)"
+            )
+            # 创建索引:按 fingerprint 聚合(Top-N 查询)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_crdb_ru_attr_fingerprint "
+                "ON crdb_ru_attribution(fingerprint_sha256)"
+            )
+            # 创建索引:按 service 聚合(by-service 汇总)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_crdb_ru_attr_service "
+                "ON crdb_ru_attribution(service)"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        success = True
+    except sqlite3.Error as e:
+        logger.debug(
+            _i18n_t("diagnostics.r65.p1_09.init_table_failed", error=e)
+        )
+    except Exception as e:
+        logger.debug(
+            _i18n_t("diagnostics.r65.p1_09.init_table_exception", error=e)
+        )
+    return success
+
+
+async def record_ru_attribution_row(
+    fingerprint_sha256: str,
+    service: str,
+    ru_consumed: float,
+    sampled_at: str | None = None,
+    sample_window_seconds: int = DEFAULT_SAMPLE_WINDOW_SECONDS,
+    job: str | None = None,
+    query_text_sample: str | None = None,
+    db_path: str | None = None,
+) -> bool:
+    """R65 P1-09: 写入一行 RU 归因到 ``crdb_ru_attribution`` 表。
+
+    每个采样窗口闭合时,collector 调用本函数一次,写入:
+        - fingerprint_sha256: 归一化 SQL 的 sha256
+        - service: 服务角色(bot/admin/api/scheduler/crdb_sync/...)
+        - job: 触发 job 名(crontab 名 / outbox_worker / migration_step_N)
+        - ru_consumed: 本窗口 RU 消耗
+        - sampled_at: ISO 8601 采样时间戳
+        - sample_window_seconds: 采样窗口(默认 3600)
+        - query_text_sample: 代表性 SQL 文本前 200 字符
+
+    本函数纯 SQLite,零 CRDB RU。表不存在时惰性创建。
+    优先尝试通过 cache_store 写入(aiosqlite),失败时降级为同步 sqlite3。
+
+    Args:
+        fingerprint_sha256: SQL fingerprint(64 字符 sha256 hex)
+        service: 服务角色名
+        ru_consumed: 本窗口 RU 消耗
+        sampled_at: ISO 8601 采样时间戳(None 使用当前 UTC)
+        sample_window_seconds: 采样窗口秒数(默认 3600)
+        job: 触发 job 名(可选)
+        query_text_sample: 代表性 SQL 文本(自动截断到 200 字符)
+        db_path: SQLite DB 路径(可选)
+
+    Returns:
+        True: 写入成功
+        False: 写入失败(已记录日志,不抛异常)
+    """
+    from datetime import datetime, timezone
+    if sampled_at is None:
+        sampled_at = datetime.now(timezone.utc).isoformat()
+    if query_text_sample:
+        query_text_sample = truncate_query_sample(query_text_sample)
+    else:
+        query_text_sample = ""
+
+    # 优先尝试 cache_store(aiosqlite,与现有 kv_store 共用连接)
+    try:
+        from database.cache_store import get_cache_store
+        store = get_cache_store()
+        if db_path is None:
+            db_path = _resolve_cache_db_path()
+        # 确保 cache_store 的 DB 是目标 DB
+        if hasattr(store, "_db") and store._db is not None:
+            # 惰性创建表(若不存在)
+            await store._db.execute(CRDB_RU_ATTRIBUTION_TABLE_DDL)
+            await store._db.execute(
+                """INSERT INTO crdb_ru_attribution
+                   (fingerprint_sha256, service, job, ru_consumed,
+                    sampled_at, sample_window_seconds, query_text_sample)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fingerprint_sha256,
+                    service,
+                    job,
+                    float(ru_consumed),
+                    sampled_at,
+                    int(sample_window_seconds),
+                    query_text_sample,
+                ),
+            )
+            await store._db.commit()
+            return True
+    except Exception as e:
+        logger.debug(
+            _i18n_t("diagnostics.r65.p1_09.cache_store_write_failed", error=e)
+        )
+
+    # 降级路径:同步 sqlite3 直连
+    import sqlite3
+    if db_path is None:
+        db_path = _resolve_cache_db_path()
+    # R65 P1-04: except 块禁止裸 return False(吞错误);用 success 变量记录结果
+    success = False
+    try:
+        from pathlib import Path
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path, timeout=5)
+        try:
+            conn.execute(CRDB_RU_ATTRIBUTION_TABLE_DDL)
+            conn.execute(
+                """INSERT INTO crdb_ru_attribution
+                   (fingerprint_sha256, service, job, ru_consumed,
+                    sampled_at, sample_window_seconds, query_text_sample)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    fingerprint_sha256,
+                    service,
+                    job,
+                    float(ru_consumed),
+                    sampled_at,
+                    int(sample_window_seconds),
+                    query_text_sample,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        success = True
+    except sqlite3.Error as e:
+        logger.debug(
+            _i18n_t("diagnostics.r65.p1_09.write_attribution_failed", error=e)
+        )
+    except Exception as e:
+        logger.debug(
+            _i18n_t("diagnostics.r65.p1_09.record_row_exception", error=e)
+        )
+    return success
+
+
+def query_ru_attribution_rows(
+    start_time: str | None = None,
+    end_time: str | None = None,
+    service: str | None = None,
+    fingerprint_sha256: str | None = None,
+    db_path: str | None = None,
+) -> list[dict]:
+    """R65 P1-09: 查询 ``crdb_ru_attribution`` 表中的归因行(同步只读)。
+
+    本函数为同步函数(使用 sqlite3 只读连接),便于脚本在同步上下文中调用。
+    支持按时间范围 / service / fingerprint 过滤。
+
+    Args:
+        start_time: ISO 8601 起始时间(包含),None 表示不限制
+        end_time: ISO 8601 结束时间(不包含),None 表示不限制
+        service: 限定服务(可选)
+        fingerprint_sha256: 限定 fingerprint(可选)
+        db_path: SQLite DB 路径(None 使用默认)
+
+    Returns:
+        归因行列表,每行是 dict(字段对齐表 schema)。
+        表不存在或无数据时返回空列表。
+    """
+    import sqlite3
+    if db_path is None:
+        db_path = _resolve_cache_db_path()
+    result: list[dict] = []
+    try:
+        from pathlib import Path
+        if not Path(db_path).exists():
+            return result
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)
+        try:
+            sql = (
+                "SELECT id, fingerprint_sha256, service, job, ru_consumed, "
+                "       sampled_at, sample_window_seconds, query_text_sample "
+                "FROM crdb_ru_attribution WHERE 1=1"
+            )
+            params: list = []
+            if start_time is not None:
+                sql += " AND sampled_at >= ?"
+                params.append(start_time)
+            if end_time is not None:
+                sql += " AND sampled_at < ?"
+                params.append(end_time)
+            if service is not None:
+                sql += " AND service = ?"
+                params.append(service)
+            if fingerprint_sha256 is not None:
+                sql += " AND fingerprint_sha256 = ?"
+                params.append(fingerprint_sha256)
+            sql += " ORDER BY sampled_at ASC, id ASC"
+            cursor = conn.execute(sql, params)
+            for row in cursor.fetchall():
+                result.append({
+                    "id": row[0],
+                    "fingerprint_sha256": row[1],
+                    "service": row[2],
+                    "job": row[3],
+                    "ru_consumed": float(row[4]) if row[4] is not None else 0.0,
+                    "sampled_at": row[5],
+                    "sample_window_seconds": int(row[6]) if row[6] is not None else 0,
+                    "query_text_sample": row[7] if row[7] is not None else "",
+                })
+        finally:
+            conn.close()
+    except sqlite3.Error as e:
+        logger.debug(
+            _i18n_t("diagnostics.r65.p1_09.query_attribution_failed", error=e)
+        )
+    except Exception as e:
+        logger.debug(
+            _i18n_t("diagnostics.r65.p1_09.query_rows_exception", error=e)
+        )
+    return result
+
+
+def aggregate_ru_attribution(
+    start_time: str | None = None,
+    end_time: str | None = None,
+    db_path: str | None = None,
+) -> dict:
+    """R65 P1-09: 聚合 ``crdb_ru_attribution`` 表中的归因数据。
+
+    聚合维度:
+        - total_ru: 总 RU 消耗
+        - by_service: {service: ru}
+        - by_job: {job: ru}
+        - by_fingerprint: {fingerprint: ru}(含 query_text_sample)
+        - by_sample: 每个采样点的 RU(sampled_at → ru)
+        - peak_hourly_ru: 最大单窗口 RU
+        - daily_average_ru: 日均 RU(基于采样窗口总数推算)
+        - top_fingerprints: 按 RU 排序的前 N 个 fingerprint(默认 10)
+
+    Args:
+        start_time: ISO 8601 起始时间(可选)
+        end_time: ISO 8601 结束时间(可选)
+        db_path: SQLite DB 路径(可选)
+
+    Returns:
+        聚合 dict。表不存在或无数据时返回空聚合(各字段为 0 / 空字典)。
+    """
+    rows = query_ru_attribution_rows(
+        start_time=start_time,
+        end_time=end_time,
+        db_path=db_path,
+    )
+    total_ru = 0.0
+    by_service: dict[str, float] = {}
+    by_job: dict[str, float] = {}
+    by_fingerprint: dict[str, dict] = {}
+    by_sample: dict[str, float] = {}
+    peak_hourly_ru = 0.0
+
+    for r in rows:
+        ru = float(r.get("ru_consumed", 0))
+        total_ru += ru
+        svc = r.get("service", "unknown")
+        job = r.get("job") or "default"
+        fp = r.get("fingerprint_sha256", "")
+        sampled_at = r.get("sampled_at", "")
+
+        by_service[svc] = by_service.get(svc, 0.0) + ru
+        by_job[job] = by_job.get(job, 0.0) + ru
+        by_sample[sampled_at] = by_sample.get(sampled_at, 0.0) + ru
+        if ru > peak_hourly_ru:
+            peak_hourly_ru = ru
+
+        if fp not in by_fingerprint:
+            by_fingerprint[fp] = {
+                "fingerprint_sha256": fp,
+                "ru": 0.0,
+                "service": svc,
+                "job": job,
+                "query_text_sample": r.get("query_text_sample", ""),
+                "sample_count": 0,
+            }
+        by_fingerprint[fp]["ru"] += ru
+        by_fingerprint[fp]["sample_count"] += 1
+
+    # 日均 RU(基于采样窗口总数推算)
+    sample_count = len(rows)
+    # 假设每个 sample_window_seconds = 3600(1 小时),日均 = 总 RU / (sample_count / 24)
+    if sample_count > 0:
+        days = sample_count / 24.0
+        daily_average_ru = total_ru / days if days > 0 else 0.0
+    else:
+        daily_average_ru = 0.0
+
+    # Top 10 fingerprint by RU
+    top_fingerprints = sorted(
+        by_fingerprint.values(),
+        key=lambda x: x["ru"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "total_ru": total_ru,
+        "sample_count": sample_count,
+        "by_service": by_service,
+        "by_job": by_job,
+        "by_fingerprint": by_fingerprint,
+        "by_sample": by_sample,
+        "peak_hourly_ru": peak_hourly_ru,
+        "daily_average_ru": daily_average_ru,
+        "top_fingerprints": top_fingerprints,
+    }
 
 
 def main() -> None:

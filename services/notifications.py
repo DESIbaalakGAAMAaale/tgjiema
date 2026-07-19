@@ -130,7 +130,7 @@ async def _ensure_outbox_schema() -> bool:
                 "ALTER TABLE notification_outbox ADD COLUMN window_start TEXT"
             )
         except Exception:
-            pass  # 列已存在,忽略
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/notifications.py:_ensure_outbox_schema'))  # 列已存在,忽略
         await store._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_notif_outbox_status "
             "ON notification_outbox(status, created_at)"
@@ -506,7 +506,7 @@ async def mark_all_read(user_id: int) -> int:
         return count
     except Exception as e:
         logger.warning(f"[notifications] mark_all_read 失败: {e}")
-        return 0
+        return None
 
 
 async def list_unread(user_id: int, limit: int = 20) -> list[dict]:
@@ -657,7 +657,7 @@ async def broadcast(notif_type: str, payload: dict,
         return sent
     except Exception as e:
         logger.warning(f"[notifications] broadcast 失败: {e}")
-        return 0
+        return None
 
 
 async def format_notification(notif: dict) -> str:
@@ -914,7 +914,7 @@ async def record_notification_receipt(
         return receipt_id
     except Exception as e:
         logger.warning(f"[notifications] record_notification_receipt 失败: {e}")
-        return 0
+        return None
 
 
 async def get_pending_outbox(limit: int = 50) -> list[dict]:

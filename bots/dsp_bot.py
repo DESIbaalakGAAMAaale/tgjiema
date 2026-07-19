@@ -3,6 +3,25 @@
 替代: sender_bot,数据源从 send_queue 改为 jobs 表
 """
 from __future__ import annotations
+from services.sink_adapters.telegram_adapter import (
+    safe_reply_text, safe_send_message, safe_edit_message_text,
+)
+from services.sink_adapters.telegram_helpers import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+    InputMediaAudio,
+    InputMediaAnimation,
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope
+from services.user_message import UserMessage
 
 import asyncio
 import datetime
@@ -13,10 +32,10 @@ except ImportError:
     import json
 from typing import Any
 
-from telegram import Update
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio, InputMediaAnimation
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+
+
+
 from loguru import logger
 
 from config import settings
@@ -474,7 +493,7 @@ async def _retry_dead_jobs():
                     try:
                         await xadd_job(dj["crdb_id"])
                     except Exception:
-                        pass  # 降级:notify_dsp_new_job 已写入 dsp_notify
+                        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_retry_dead_jobs'))  # 降级:notify_dsp_new_job 已写入 dsp_notify
                 logger.info(f"[Dsp] 本地死信重试: 重置 {len(dead_jobs)} 个 job")
         except Exception as e:
             logger.error(f"[Dsp] 死信重试异常: {e}")
@@ -626,7 +645,7 @@ async def _build_delivery_caption(file_code: str, total_count: int = 1) -> str:
         if note:
             lines.append(_i18n_t('bot.dsp.s6', note=note))
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_build_delivery_caption'))
 
     lines.append(_i18n_t('bot.dsp.s3', file_code=file_code))
     return "\n".join(lines)
@@ -689,7 +708,8 @@ async def _should_preserve_caption(file_code: str) -> bool:
         if not note or not isinstance(note, str):
             return False
         return '"preserve_caption"' in note and '"true"' in note.lower()
-    except Exception:
+    except Exception as e:
+        logger.warning(_i18n_t('diagnostics.r65.p1_04.dsp_should_preserve_caption_exception', file_code=file_code, error=e))
         return False
 
 
@@ -848,8 +868,8 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
                 from utils.redis_client import xadd_job
                 await xadd_job(job.job_id)
             except Exception:
-                pass
-        return False
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_send_one_job'))
+        return None
 
     send_ok = False
     try:
@@ -938,7 +958,7 @@ async def _send_one_job(bot: Any, job, worker_id: int, store) -> bool:
                 from utils.redis_client import xadd_job
                 await xadd_job(job.job_id)
             except Exception:
-                pass  # 降级:notify_dsp_new_job 已写入 dsp_notify
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_send_one_job'))  # 降级:notify_dsp_new_job 已写入 dsp_notify
             logger.info(f"[Dsp-{worker_id}] 重试入队: job={job.job_id}, code={job.code}, retry={job.retry_count}→{new_retry}")
 
         # Dsp 侧降级检查
@@ -1273,7 +1293,7 @@ async def _process_single_job(bot, job, bot_id: int = 1):
                 text="❌ " + _t(job.target_user_id, "bot.file_send_failed"),
             )
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_process_single_job'))
         # R45: 实际尝试发送但所有频道均不可用 → 不记录 completed(允许下轮重试)
         receipt.mark_no_record()
         return False
@@ -1469,7 +1489,7 @@ async def _fallback_single_send(bot, job, bot_id: int = 1):
                                 try:
                                     await store.delivery_group_receipt_confirm_child(group_id, mid)
                                 except Exception:
-                                    pass
+                                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_fallback_single_send'))
                             continue
                         else:
                             # 核对不一致 → 不跳过,继续发送(re-claim 后发送)
@@ -1692,7 +1712,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                                         try:
                                             await store.delivery_group_receipt_confirm_child(group_id, mid)
                                         except Exception:
-                                            pass
+                                            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_send_page'))
                                     continue
                             else:
                                 continue
@@ -1754,7 +1774,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                         text="❌ " + _t(chat_id, "bot.file_send_failed"),
                     )
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_send_page'))
                 return False
     else:
         # 旧路径：media group 方式（file_id 跨Bot 不可用，仅作兜底）
@@ -1775,7 +1795,7 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                                 group_id, _sent.message_id
                             )
                         except Exception:
-                            pass
+                            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_send_page'))
             await metrics.record_send_success()
             await metrics.record_processed("dsp_bot")
         except Exception as e:
@@ -1789,8 +1809,8 @@ async def _send_page(bot, chat_id, file_code, file_meta_list, page, total_pages,
                     text="❌ " + _t(chat_id, "bot.file_send_failed"),
                 )
             except Exception:
-                pass
-            return False
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:_send_page'))
+            return None
 
     # 第一页发送成功后，给第一条消息编辑 caption（显示文件总数+备注+文件码）
     # R47 P0-5: caption edit 独立 receipt(传入 job_id 时启用)
@@ -1953,9 +1973,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await xadd_job(crdb_id)
                 except Exception:
-                    pass  # 降级:dsp_notify 已写入
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:start'))  # 降级:dsp_notify 已写入
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:start'))
     logger.info(f"[Dsp][start] 用户 {user.id} 已启动，waiting_start jobs 已恢复({len(reactivated_ids)}个)")
 
     # R41 i18n: 欢迎语文本走 locale 翻译
@@ -2046,7 +2066,7 @@ async def pagination_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             await context.bot.delete_message(chat_id=target_chat_id, message_id=old_msg_id)
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:pagination_callback'))
 
     await _send_page(
         context.bot, target_chat_id, file_code,
@@ -2070,18 +2090,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """查看投递状态: /status <upload_id>"""
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.dsp.s25'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.dsp.s25')))
             return
         upload_id = context.args[0]
         receipt = await upload_receipt.get_upload_status(upload_id)
         if not receipt:
-            await update.message.reply_text(_i18n_t('bot.dsp.s26'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.dsp.s26')))
             return
         text = await upload_receipt.format_receipt(receipt)
-        await update.message.reply_text(text)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(text))
     except Exception as e:
         logger.exception(f"[Dsp][status] 查询投递状态失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.dsp_bot.s2'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.dsp_bot.s2')))
 
 
 async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2092,13 +2112,13 @@ async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         items = await notifications.list_unread(user.id, limit=20)
         if not items:
-            await update.message.reply_text(_i18n_t('bot.dsp.s27'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.dsp.s27')))
             return
         lines = [await notifications.format_notification(n) for n in items]
-        await update.message.reply_text("\n\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Dsp][notifications] 查询通知失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.dsp_bot.s2'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.dsp_bot.s2')))
 
 
 # ─── 运行 ───
@@ -2228,7 +2248,7 @@ async def _async_main():
                     try:
                         await xadd_job(crdb_id)
                     except Exception:
-                        pass  # 降级:notify_dsp_new_job 已写入 dsp_notify
+                        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/dsp_bot.py:reclaim_dispatched_loop'))  # 降级:notify_dsp_new_job 已写入 dsp_notify
             except Exception as e:
                 logger.warning(f"[Dsp] 回收 dispatched jobs 异常: {e}")
             await asyncio.sleep(120)

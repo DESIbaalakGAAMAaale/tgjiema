@@ -472,13 +472,19 @@ class TestMissingDimensionFailClosed:
 class TestEnforcementScript:
     """G 节: check_a11y_matrix_enforcement.py 脚本入口正确 exit code。"""
 
-    def test_check_returns_exit_zero_on_valid_matrix(self):
-        """G1: 完整矩阵 + 无测试报告 → check() 返回 exit_code=0。"""
+    def test_check_returns_exit_one_on_missing_test_report(self):
+        """G1: R65 P1-02: 完整矩阵 + 无测试报告 → check() 返回 exit_code=1。
+
+        历史行为(R64 P1-09): 无报告时跳过执行对等检查(ok=True),返回 exit 0。
+        新行为(R65 P1-02): --test-report 必填,无报告即失败,exit_code=1。
+        """
         exit_code, results = enforcement.check()
-        assert exit_code == 0
+        assert exit_code == 1
         assert len(results) >= 2
         # 检查 1(矩阵完整性)必须通过
         assert results[0].ok is True
+        # 检查 2(执行对等)必须失败 — 无 test_report
+        assert results[1].ok is False
 
     def test_check_returns_exit_one_on_missing_matrix_file(self, tmp_path):
         """G2: 矩阵文件不存在 → check() 返回 exit_code=1。"""
@@ -492,10 +498,15 @@ class TestEnforcementScript:
         result = enforcement.enforce_matrix_completeness()
         assert result.ok is True
 
-    def test_enforce_execution_parity_no_report_passes(self):
-        """G4: 无测试报告时 enforce_execution_parity() 返回 ok=True(跳过检查)。"""
+    def test_enforce_execution_parity_no_report_fails(self):
+        """G4: R65 P1-02: 无测试报告 → enforce_execution_parity() 返回 ok=False。
+
+        历史行为(R64 P1-09): 无报告时跳过执行对等检查,返回 ok=True。
+        新行为(R65 P1-02): --test-report 必填,无报告即失败。
+        """
         result = enforcement.enforce_execution_parity(test_report=None)
-        assert result.ok is True
+        assert result.ok is False
+        assert "required" in result.message.lower() or "--test-report" in result.message
 
     def test_enforce_execution_parity_missing_report_fails(self, tmp_path):
         """G5: 测试报告不存在 → enforce_execution_parity() 返回 ok=False。"""
@@ -504,14 +515,23 @@ class TestEnforcementScript:
         assert result.ok is False
 
     def test_enforce_execution_parity_with_valid_report(self, tmp_path):
-        """G6: 有效报告(executed=64, skip=0)→ ok=True。"""
+        """G6: 有效报告(passed=64, skipped=0)→ ok=True。
+
+        R65 P1-02: executed=passed+failed+flaky+timedOut+unexpected(排除 skipped)。
+        R65 P1-02 适配: spec.file 必须包含 'a11y/' 以通过 _is_matrix_spec 过滤
+        (testDir='..' 后,scanner 仅统计 tests/a11y/ 下的矩阵 stub 测试)。
+        """
         report = tmp_path / "report.json"
         report_data = {
-            "stats": {"expected": 64, "skipped": 0},
+            "stats": {
+                "expected": 64, "skipped": 0, "passed": 64,
+                "failed": 0, "flaky": 0, "timedOut": 0, "unexpected": 0,
+            },
             "suites": [
                 {
                     "specs": [
                         {
+                            "file": "a11y/matrix_stub.spec.ts",
                             "tests": [
                                 {"results": [{"status": "passed"}]}
                                 for _ in range(64)
@@ -523,24 +543,26 @@ class TestEnforcementScript:
         }
         report.write_text(json.dumps(report_data), encoding="utf-8")
         result = enforcement.enforce_execution_parity(test_report=report)
-        assert result.ok is True
-        # details 同时含 executed_count(初始 0)与 executed(stats 更新值)
+        assert result.ok is True, f"应通过: {result.message}"
+        # R65 P1-02: executed 字段为 passed+failed+flaky+timedOut+unexpected
         assert result.details["executed"] == 64
+        assert result.details["passed"] == 64
+        assert result.details["skipped"] == 0
 
     def test_enforce_execution_parity_with_skip_fails(self, tmp_path):
-        """G7: 报告含 skip=2 → ok=False。"""
+        """G7: 报告含 skipped=2 → ok=False(R65 P1-02: 不允许任何 skip)。"""
         report = tmp_path / "report.json"
         # 62 passed + 2 skipped
         results_list = [{"status": "passed"}] * 62 + [{"status": "skipped"}] * 2
         report_data = {
             "stats": {"expected": 64, "skipped": 2},
-            "suites": [{"specs": [{"tests": [{"results": [r]} for r in results_list]}]}],
+            "suites": [{"specs": [{"file": "a11y/matrix_stub.spec.ts", "tests": [{"results": [r]} for r in results_list]}]}],
         }
         report.write_text(json.dumps(report_data), encoding="utf-8")
         result = enforcement.enforce_execution_parity(test_report=report)
         assert result.ok is False
-        # details 中 skip 字段(stats 更新)应 >= 2
-        assert result.details["skip"] >= 2
+        # R65 P1-02: details 中 skipped 字段应 >= 2
+        assert result.details["skipped"] >= 2
 
     def test_enforce_execution_parity_with_few_executed_fails(self, tmp_path):
         """G8: 报告 executed=32 < expected=64 → ok=False。"""
@@ -548,7 +570,7 @@ class TestEnforcementScript:
         report_data = {
             "stats": {"expected": 64, "skipped": 0},
             "suites": [
-                {"specs": [{"tests": [{"results": [{"status": "passed"}]}]}]}
+                {"specs": [{"file": "a11y/matrix_stub.spec.ts", "tests": [{"results": [{"status": "passed"}]}]}]}
                 for _ in range(32)
             ],
         }

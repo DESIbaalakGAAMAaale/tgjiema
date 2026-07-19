@@ -94,7 +94,7 @@ async def create_report(reporter_id: int, target_type: str, target_id: str,
         return report_id
     except Exception as e:
         logger.warning(f"[ContentReports] create_report 失败: {e}")
-        return 0
+        return None
 
 
 async def _write_audit_log(actor_id: int, action: str, target_type: str,
@@ -138,7 +138,7 @@ async def _write_audit_log(actor_id: int, action: str, target_type: str,
         return log_id
     except Exception as e:
         logger.warning(f"[ContentReports] _write_audit_log 失败: {e}")
-        return 0
+        return None
 
 
 async def _notify_user(user_id: int, ntype: str, payload: dict, tx=None) -> bool:
@@ -1258,7 +1258,7 @@ async def cleanup_expired_bans() -> int:
         return affected
     except Exception as e:
         logger.warning(f"[ContentReports] cleanup_expired_bans 异常: {e}")
-        return 0
+        return None
 
 
 async def format_report(report: dict) -> str:

@@ -329,24 +329,27 @@ class TestRequireMaintenanceCheckFailClosed:
 
         # Mock update 对象
         mock_update = MagicMock()
-        mock_update.message.reply_text = AsyncMock()
 
+        # R65 P1-01: maintenance_mode 已迁移为 safe_reply_text typed adapter,
+        # mock safe_reply_text 避免依赖真实 telegram(isinstance(Message) 在 mock 下报错)
+        mock_safe_reply = AsyncMock()
         # Mock is_enabled 抛 MaintenanceCheckError
         with patch.object(
             maintenance_mode,
             "is_enabled",
             new=AsyncMock(side_effect=maintenance_mode.MaintenanceCheckError("DB 故障")),
-        ):
+        ), patch.object(maintenance_mode, "safe_reply_text", new=mock_safe_reply):
             result = await test_handler(mock_update, context=None)
 
         # 验证:返回 None(未执行原函数)
         assert result is None, "fail-closed 时应返回 None(不执行原函数)"
 
         # 验证:回复了"服务暂不可用"
-        mock_update.message.reply_text.assert_called_once()
-        call_args = mock_update.message.reply_text.call_args[0][0]
-        assert "服务暂不可用" in call_args, \
-            f"应回复'服务暂不可用',实际: {call_args}"
+        mock_safe_reply.assert_called_once()
+        payload = mock_safe_reply.call_args[0][1]
+        text = payload.render(None)  # from_raw_text 构造,_raw_text 已设置
+        assert "服务暂不可用" in text, \
+            f"应回复'服务暂不可用',实际: {text}"
 
     @pytest.mark.asyncio
     async def test_decorator_rejects_on_generic_exception(self, reset_cache):
@@ -358,15 +361,16 @@ class TestRequireMaintenanceCheckFailClosed:
             return "EXECUTED"
 
         mock_update = MagicMock()
-        mock_update.message.reply_text = AsyncMock()
 
+        # R65 P1-01: maintenance_mode 已迁移为 safe_reply_text typed adapter
+        mock_safe_reply = AsyncMock()
         # Mock is_enabled 抛通用异常
         with patch.object(
             maintenance_mode,
             "is_enabled",
             new=AsyncMock(side_effect=RuntimeError("未知错误")),
-        ):
+        ), patch.object(maintenance_mode, "safe_reply_text", new=mock_safe_reply):
             result = await test_handler(mock_update, context=None)
 
         assert result is None
-        mock_update.message.reply_text.assert_called_once()
+        mock_safe_reply.assert_called_once()

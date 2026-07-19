@@ -46,6 +46,10 @@ sys.modules.setdefault("telegram.ext", MagicMock())
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
+# R65 fix: verify-branch-protection job 的 inline run: 块提取到外部脚本
+# scripts/verify_branch_protection.sh(避免 YAML 21000 字节限制)。
+# WORKFLOW_JOBS 数组现位于该脚本中,测试需读取该文件解析。
+VBP_SCRIPT_PATH = REPO_ROOT / "scripts" / "verify_branch_protection.sh"
 CONFIGURE_BP_SCRIPT = REPO_ROOT / "scripts" / "configure_branch_protection.sh"
 DETECT_BP_SCRIPT = REPO_ROOT / "scripts" / "detect_branch_protection_contexts.sh"
 
@@ -92,8 +96,20 @@ def _read_workflow() -> str:
     return WORKFLOW_PATH.read_text(encoding="utf-8")
 
 
-def _extract_workflow_jobs_rg_list(content: str) -> list[str]:
+def _read_vbp_script() -> str:
+    """读取 scripts/verify_branch_protection.sh 完整内容。
+
+    R65 fix: WORKFLOW_JOBS 数组已从 release-gates.yml 提取到该脚本中,
+    避免 YAML run: 块超过 GitHub Actions 21000 字节限制。
+    """
+    return VBP_SCRIPT_PATH.read_text(encoding="utf-8")
+
+
+def _extract_workflow_jobs_rg_list(content: str | None = None) -> list[str]:
     """从 WORKFLOW_JOBS 数组中提取 Release Gates 的 job 列表。
+
+    R65 fix: WORKFLOW_JOBS 现位于 scripts/verify_branch_protection.sh,
+    若 content 为 None 则从该脚本读取。
 
     WORKFLOW_JOBS 数组格式:
         WORKFLOW_JOBS=(
@@ -103,6 +119,8 @@ def _extract_workflow_jobs_rg_list(content: str) -> list[str]:
           "E2E Tests|playwright-e2e"
         )
     """
+    if content is None:
+        content = _read_vbp_script()
     lines = content.splitlines()
     in_workflow_jobs = False
     rg_jobs: list[str] = []
@@ -125,8 +143,13 @@ def _extract_workflow_jobs_rg_list(content: str) -> list[str]:
     return rg_jobs
 
 
-def _extract_workflow_jobs_ci_list(content: str) -> list[str]:
-    """从 WORKFLOW_JOBS 数组中提取 CI 的 job 列表。"""
+def _extract_workflow_jobs_ci_list(content: str | None = None) -> list[str]:
+    """从 WORKFLOW_JOBS 数组中提取 CI 的 job 列表。
+
+    R65 fix: 若 content 为 None,从 scripts/verify_branch_protection.sh 读取。
+    """
+    if content is None:
+        content = _read_vbp_script()
     lines = content.splitlines()
     in_workflow_jobs = False
     ci_jobs: list[str] = []
@@ -164,12 +187,18 @@ class TestVerifyBranchProtectionWorkflowJobs:
         return _read_workflow()
 
     def test_release_gates_list_contains_all_14_jobs(self, workflow_content):
-        """Release Gates 列表必须包含全部 14 个 job。
+        """Release Gates 列表必须包含全部 14 个 job(允许新增,不允许减少)。
 
         P0-01 失败点 1: 旧版只列了 10 个 job,遗漏了
         sign-image / rc-continuity / publish-attestation / release-summary。
+        R65 P0-04: 新增 production-promotion-gate 等 gate 后列表自然增长,
+        本测试仅校验"至少 14 个 + 全部 EXPECTED_RELEASE_GATES_JOBS 齐全",
+        不限制 workflow 引入新的 required gate。
+        R65 fix: WORKFLOW_JOBS 现位于 scripts/verify_branch_protection.sh
+        (避免 YAML 21000 字节限制),_extract_workflow_jobs_rg_list() 无参
+        时自动从该脚本读取。
         """
-        rg_jobs = _extract_workflow_jobs_rg_list(workflow_content)
+        rg_jobs = _extract_workflow_jobs_rg_list()
         assert rg_jobs, (
             "P0-01: 未找到 WORKFLOW_JOBS 中的 Release Gates 条目 — "
             "WORKFLOW_JOBS 数组解析失败"
@@ -179,35 +208,35 @@ class TestVerifyBranchProtectionWorkflowJobs:
             f"P0-01: Release Gates 列表遗漏 {len(missing)} 个 job: {missing} — "
             f"实际: {rg_jobs}"
         )
-        # 确保恰好 14 个(不多不少)
-        assert len(rg_jobs) == 14, (
-            f"P0-01: Release Gates 列表应有 14 个 job,实际 {len(rg_jobs)} 个: {rg_jobs}"
+        # 确保至少 14 个(允许新增 gate,不允许减少)
+        assert len(rg_jobs) >= 14, (
+            f"P0-01: Release Gates 列表应至少 14 个 job,实际 {len(rg_jobs)} 个: {rg_jobs}"
         )
 
     def test_release_gates_list_includes_sign_image(self, workflow_content):
         """Release Gates 列表必须包含 sign-image(P0-01 失败点 1 遗漏项)。"""
-        rg_jobs = _extract_workflow_jobs_rg_list(workflow_content)
+        rg_jobs = _extract_workflow_jobs_rg_list()
         assert "sign-image" in rg_jobs, (
             "P0-01: Release Gates 列表必须包含 sign-image"
         )
 
     def test_release_gates_list_includes_rc_continuity(self, workflow_content):
         """Release Gates 列表必须包含 rc-continuity(P0-01 失败点 1 遗漏项)。"""
-        rg_jobs = _extract_workflow_jobs_rg_list(workflow_content)
+        rg_jobs = _extract_workflow_jobs_rg_list()
         assert "rc-continuity" in rg_jobs, (
             "P0-01: Release Gates 列表必须包含 rc-continuity"
         )
 
     def test_release_gates_list_includes_publish_attestation(self, workflow_content):
         """Release Gates 列表必须包含 publish-attestation(P0-01 失败点 1 遗漏项)。"""
-        rg_jobs = _extract_workflow_jobs_rg_list(workflow_content)
+        rg_jobs = _extract_workflow_jobs_rg_list()
         assert "publish-attestation" in rg_jobs, (
             "P0-01: Release Gates 列表必须包含 publish-attestation"
         )
 
     def test_release_gates_list_includes_release_summary(self, workflow_content):
         """Release Gates 列表必须包含 release-summary(P0-01 失败点 1 遗漏项)。"""
-        rg_jobs = _extract_workflow_jobs_rg_list(workflow_content)
+        rg_jobs = _extract_workflow_jobs_rg_list()
         assert "release-summary" in rg_jobs, (
             "P0-01: Release Gates 列表必须包含 release-summary"
         )
@@ -216,8 +245,9 @@ class TestVerifyBranchProtectionWorkflowJobs:
         """CI 列表必须包含 repo-hygiene(P1-11 required context)。
 
         P0-01 失败点 1 / P1-11: 旧版 CI 列表遗漏了 repo-hygiene。
+        R65 fix: WORKFLOW_JOBS 现位于 scripts/verify_branch_protection.sh。
         """
-        ci_jobs = _extract_workflow_jobs_ci_list(workflow_content)
+        ci_jobs = _extract_workflow_jobs_ci_list()
         assert ci_jobs, (
             "P0-01: 未找到 WORKFLOW_JOBS 中的 CI 条目 — "
             "WORKFLOW_JOBS 数组解析失败"
@@ -228,7 +258,7 @@ class TestVerifyBranchProtectionWorkflowJobs:
 
     def test_ci_list_contains_all_expected_jobs(self, workflow_content):
         """CI 列表必须包含全部预期 job(含 repo-hygiene)。"""
-        ci_jobs = _extract_workflow_jobs_ci_list(workflow_content)
+        ci_jobs = _extract_workflow_jobs_ci_list()
         missing = [j for j in EXPECTED_CI_JOBS if j not in ci_jobs]
         assert not missing, (
             f"P0-01/P1-11: CI 列表遗漏 {len(missing)} 个 job: {missing} — "
@@ -530,12 +560,17 @@ class TestBranchProtectionScripts:
         """configure 脚本必须要求 PR + 至少一名 reviewer。
 
         P1-11: 要求 PR、至少一名独立 reviewer。
+        R65 P1-12: 提升为至少 2 名独立 reviewer(required_approving_review_count: 2)。
         """
         assert "required_pull_request_reviews" in configure_script, (
             "P1-11: configure 脚本必须配置 required_pull_request_reviews(要求 PR)"
         )
-        assert "required_approving_review_count: 1" in configure_script, (
-            "P1-11: configure 脚本必须要求至少一名 approving reviewer"
+        # R65 P1-12: review_count 从 1 提升到 2(独立 reviewer)
+        assert "required_approving_review_count: 2" in configure_script, (
+            "R65 P1-12: configure 脚本必须要求至少 2 名 approving reviewer"
+        )
+        assert "required_approving_review_count: 1" not in configure_script, (
+            "R65 P1-12: 不应再使用旧的 required_approving_review_count: 1(已提升为 2)"
         )
 
     def test_configure_script_dismiss_stale_reviews(self, configure_script):

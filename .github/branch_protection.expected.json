@@ -1,0 +1,89 @@
+{
+  "_comment": "R65 P1-12: Branch Protection 期望配置(checked-in 基线)。CI 中无 GitHub API 访问权限时,scripts/check_branch_protection_contexts.py 默认读取本文件做一致性校验。本文件由 scripts/configure_branch_protection.sh 在生产环境应用,任何修改都需同步更新本基线。",
+  "_schema": "github_branch_protection_api_response",
+  "_r65_p1_12_requirements": {
+    "enforce_admins": "true — admin 不能 bypass",
+    "allow_force_pushes": "false",
+    "allow_deletions": "false",
+    "required_linear_history": "true — 禁 merge commit,要求 rebase 或 squash",
+    "required_signatures": "true — signed commits 必需(通过 POST /branches/{branch}/protection/required_signatures 单独启用)",
+    "dismiss_stale_reviews": "true — 新提交自动 dismiss 旧 approval",
+    "required_approving_review_count": "2 — 独立 reviewer",
+    "require_code_owner_reviews": "true (当 CODEOWNERS 文件存在时)",
+    "required_conversation_resolution": "true — 所有 conversation 必须解决后才能合并",
+    "required_status_checks.strict": "true — status check 必须针对最新提交"
+  },
+  "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection",
+  "required_status_checks": {
+    "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/required_status_checks",
+    "strict": true,
+    "contexts": [
+      "test (3.10)",
+      "test (3.11)",
+      "test (3.12)",
+      "lint",
+      "repo-hygiene",
+      "i18n-check",
+      "static-gates",
+      "security",
+      "fault-injection",
+      "migration-dry-run",
+      "verify-deploy",
+      "playwright-e2e",
+      "docker-build",
+      "docker-digest-verify",
+      "compose-config",
+      "redis-acl-matrix",
+      "schema-diff",
+      "restore-legacy-seal-gate",
+      "i18n-strict-export-boundary-gate",
+      "migration-manifest-gate",
+      "button-flow-real-ux-gate",
+      "backup-restore-drill",
+      "sbom",
+      "pip-audit",
+      "trivy",
+      "rc-continuity",
+      "crdb-ru-72h-attribution-gate",
+      "release-summary"
+    ],
+    "checks": []
+  },
+  "enforce_admins": {
+    "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/enforce_admins",
+    "enabled": true
+  },
+  "required_pull_request_reviews": {
+    "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/required_pull_request_reviews",
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": false,
+    "required_approving_review_count": 2,
+    "dismissal_restrictions": {
+      "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/dismissal_restrictions",
+      "users": [],
+      "teams": []
+    },
+    "bypass_pull_request_reviews": null
+  },
+  "restrictions": null,
+  "required_linear_history": {
+    "enabled": true
+  },
+  "allow_force_pushes": {
+    "enabled": false
+  },
+  "allow_deletions": {
+    "enabled": false
+  },
+  "block_creations": {
+    "enabled": false
+  },
+  "required_conversation_resolution": {
+    "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/required_conversation_resolution",
+    "enabled": true
+  },
+  "required_signatures": {
+    "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/required_signatures",
+    "enabled": true
+  }
+}

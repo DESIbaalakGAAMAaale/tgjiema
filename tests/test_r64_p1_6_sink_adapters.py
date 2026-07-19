@@ -528,11 +528,18 @@ class TestSinkImportBoundaryScanner:
         )
 
     def test_collect_findings_returns_list(self):
-        """collect_findings 返回 list[dict](每项含 file/line/rule/detail)。"""
+        """collect_findings 返回 list[dict](每项含 file/line/rule/detail)。
+
+        R65 P1-01: 全部 486 项存量违规已迁移到 typed adapter,真实违规数=0。
+        此处只验证返回结构,不强制 > 0(strict 模式下 0 违规是目标状态)。
+        """
         findings = scanner.collect_findings()
         assert isinstance(findings, list)
-        # 真实代码库有大量存量违规(baseline ratchet)
-        assert len(findings) > 0, "存量违规应 > 0(baseline ratchet)"
+        # R65 P1-01: 迁移完成后违规数应为 0(strict 模式门禁)
+        assert len(findings) == 0, (
+            f"R65 P1-01 整改后应无 sink import-boundary 违规,实际 {len(findings)} 项: "
+            f"{[v['file'] for v in findings[:5]]}"
+        )
         for v in findings:
             assert "file" in v
             assert "line" in v
@@ -578,13 +585,19 @@ class TestSinkImportBoundaryBaseline:
         )
 
     def test_baseline_json_valid(self):
-        """baseline 文件是合法 JSON。"""
+        """baseline 文件是合法 JSON。
+
+        R65 P1-01: baseline 文件已更新为 violation_count=0(作为历史参考保留,
+        CI/Release 切换为 --strict 模式,不再使用 baseline)。
+        """
         data = json.loads(REAL_BASELINE.read_text(encoding="utf-8"))
         assert isinstance(data, dict)
         assert "violation_count" in data
         assert isinstance(data["violation_count"], int)
-        assert data["violation_count"] > 0, (
-            "存量违规应 > 0(100+ 直调尚未完全迁移)"
+        # R65 P1-01: 迁移完成后 baseline violation_count 应为 0
+        assert data["violation_count"] == 0, (
+            f"R65 P1-01 整改后 baseline violation_count 应为 0(历史参考),"
+            f"实际 {data['violation_count']}"
         )
 
     def test_baseline_ratchet_passes(self):
@@ -610,8 +623,12 @@ class TestSinkImportBoundaryBaseline:
             f"输出应包含 'R64 P1-06 通过': {output[:300]}"
         )
 
-    def test_strict_mode_fails_with_existing_violations(self):
-        """--strict 模式:有违规时 exit 1(未来目标,目前会失败)。"""
+    def test_strict_mode_passes_with_zero_violations(self):
+        """--strict 模式:0 违规时 exit 0(R65 P1-01 整改目标)。
+
+        R64 P1-06 阶段:strict 模式会因 486 项存量违规而 exit 1(未来目标)。
+        R65 P1-01 整改后:全部违规已迁移到 typed adapter,strict 模式 exit 0。
+        """
         result = subprocess.run(
             [
                 sys.executable,
@@ -623,17 +640,21 @@ class TestSinkImportBoundaryBaseline:
             cwd=str(REPO_ROOT),
             timeout=120,
         )
-        # 当前存量违规 > 0,strict 模式应 exit 1
-        assert result.returncode == 1, (
-            f"--strict 模式应 exit 1(存量违规 > 0)。"
+        # R65 P1-01: 迁移完成后 strict 模式应 exit 0
+        assert result.returncode == 0, (
+            f"--strict 模式应 exit 0(0 违规)。"
             f"\nstdout: {result.stdout[:500]}"
+            f"\nstderr: {result.stderr[:500]}"
         )
-        assert "FAIL" in result.stdout, (
-            f"strict 模式输出应包含 FAIL: {result.stdout[:300]}"
+        assert "strict 模式通过" in result.stdout, (
+            f"strict 模式输出应包含 'strict 模式通过': {result.stdout[:300]}"
         )
 
     def test_generate_baseline_creates_valid_file(self, tmp_path):
-        """--generate-baseline 生成合法 baseline 文件。"""
+        """--generate-baseline 生成合法 baseline 文件。
+
+        R65 P1-01: 迁移完成后生成的 baseline violation_count=0。
+        """
         baseline_path = tmp_path / "test_baseline.json"
         result = subprocess.run(
             [
@@ -654,14 +675,20 @@ class TestSinkImportBoundaryBaseline:
         assert baseline_path.exists(), "baseline 文件应被创建"
         data = json.loads(baseline_path.read_text(encoding="utf-8"))
         assert "violation_count" in data
-        assert data["violation_count"] > 0
+        # R65 P1-01: 迁移完成后 violation_count=0
+        assert data["violation_count"] == 0, (
+            f"R65 P1-01 整改后生成的 baseline violation_count 应为 0,"
+            f"实际 {data['violation_count']}"
+        )
 
-    def test_baseline_ratchet_fails_when_violations_increase(self, tmp_path):
+    def test_baseline_ratchet_fails_when_violations_increase(self, tmp_path, monkeypatch):
         """baseline ratchet:违规数 > baseline 时 exit 1。
 
-        构造一个 baseline.violation_count=0 的小 baseline,
-        实际违规数 > 0,应 exit 1。
+        R65 P1-01: 真实代码库已无违规(current_count=0),无法通过 subprocess
+        触发 ratchet fail。改为直接调用 scanner.main() 并 monkeypatch
+        collect_findings 返回一个伪造违规,验证 ratchet 逻辑仍正确阻断。
         """
+        # 构造一个 baseline.violation_count=0 的小 baseline
         fake_baseline = tmp_path / "fake_baseline.json"
         fake_baseline.write_text(
             json.dumps({
@@ -670,24 +697,29 @@ class TestSinkImportBoundaryBaseline:
             }),
             encoding="utf-8",
         )
-        result = subprocess.run(
+        # monkeypatch collect_findings 返回 1 个伪造违规
+        # (模拟代码库出现 1 项新增违规的场景)
+        fake_findings = [{
+            "file": "bots/fake_bot.py",
+            "line": 1,
+            "rule": "Rule 2 (call 违规)",
+            "detail": "update.message.reply_text(...) — 伪造违规用于测试 ratchet",
+        }]
+        monkeypatch.setattr(scanner, "collect_findings", lambda: fake_findings)
+        # 注入 --baseline argv
+        monkeypatch.setattr(
+            sys, "argv",
             [
-                sys.executable,
-                "scripts/check_sink_import_boundary.py",
+                "check_sink_import_boundary.py",
                 "--baseline",
                 str(fake_baseline),
             ],
-            capture_output=True,
-            text=True,
-            cwd=str(REPO_ROOT),
-            timeout=120,
         )
-        # 当前违规 > 0 > fake_baseline=0,应 exit 1
-        assert result.returncode == 1, (
-            f"ratchet 失败应 exit 1(当前违规 > baseline=0)。\n"
-            f"stdout: {result.stdout[:300]}"
+        # 直接调用 main(),应返回 1(伪造违规 1 > baseline 0)
+        returncode = scanner.main()
+        assert returncode == 1, (
+            f"ratchet 失败应 exit 1(伪造违规 1 > baseline=0)。returncode={returncode}"
         )
-        assert "FAIL" in result.stdout
 
 
 # ════════════════════════════════════════════════════════════════

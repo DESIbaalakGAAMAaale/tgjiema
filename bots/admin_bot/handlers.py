@@ -1,8 +1,19 @@
 import datetime
+from services.sink_adapters.telegram_adapter import (
+    safe_reply_text, safe_send_message, safe_edit_message_text,
+)
+from services.sink_adapters.telegram_helpers import (
+    Update,
+    ContextTypes,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope
+from services.user_message import UserMessage
 
 from loguru import logger
-from telegram import Update
-from telegram.ext import ContextTypes
+
+
 
 from config import settings
 from database import (
@@ -54,17 +65,17 @@ def _t(user_id: int, key: str, **kwargs) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from .menus import _build_menu
     text, markup = _build_menu("main")
-    await update.message.reply_text(text, reply_markup=markup)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(text), reply_markup=markup)
 
 
 @_auth_required
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(await _get_status_text())
+    await safe_reply_text(update.message, UserMessage.from_raw_text(await _get_status_text()))
 
 
 @_auth_required
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(await _get_health_text())
+    await safe_reply_text(update.message, UserMessage.from_raw_text(await _get_health_text()))
 
 
 @_auth_required
@@ -72,13 +83,13 @@ async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         admin_id = update.effective_user.id if update.effective_user else 0
-        await update.message.reply_text(_t(admin_id, "bot.admin_bot.usage_user_command"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.usage_user_command")))
         return
     try:
         user_id = int(args[0])
     except ValueError:
         admin_id = update.effective_user.id if update.effective_user else 0
-        await update.message.reply_text(_t(admin_id, "bot.admin_bot.user_id_must_be_number"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.user_id_must_be_number")))
         return
 
     user = await _ensure_user(user_id)
@@ -87,7 +98,7 @@ async def user_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         _i18n_t('bot.admin_bot.handlers.s1', user_get_user_id=user.get('user_id'), user_get_username_or_N_A=user.get('username') or 'N/A', user_get_first_name_or_N_A=user.get('first_name') or 'N/A', MEMBERSHIP_LEVELS_get_level_level=MEMBERSHIP_LEVELS.get(level, level), if_user_get_is_banned_else='是 ❌' if user.get('is_banned') else '否 ✅', if_user_get_can_upload_else='是 ✅' if user.get('can_upload') else '否 ❌', quota_display_user_get_daily_decode_quota=_quota_display(user.get('daily_decode_quota')), user_get_quota_used_today_0=user.get('quota_used_today', 0), quota_display_user_get_external_decode_quota=_quota_display(user.get('external_decode_quota')), user_get_external_used_today_0=user.get('external_used_today', 0), format_datetime_user_get_created_at=format_datetime(user.get('created_at')), format_datetime_user_get_updated_at=format_datetime(user.get('updated_at')))
     )
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 @_auth_required
@@ -100,23 +111,23 @@ async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = max(1, int(arg))
         else:
             search = arg
-    await update.message.reply_text(await _get_users_page_text(search, page))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(await _get_users_page_text(search, page)))
 
 
 @_auth_required
 async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s97'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s97')))
         return
     try:
         user_id = int(args[0])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s176'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s176')))
         return
     level = LEVEL_ALIAS.get(args[1].lower())
     if not level:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s98'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s98')))
         return
 
     users_col = get_users_col()
@@ -149,7 +160,7 @@ async def set_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 使 SQLite 配额缓存失效，下次解码时从 CRDB 重新加载
     from database.cache_store import invalidate_user_quota_cache
     await invalidate_user_quota_cache(user_id)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s53', user_id=user_id, MEMBERSHIP_LEVELS_level=MEMBERSHIP_LEVELS[level]))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s53', user_id=user_id, MEMBERSHIP_LEVELS_level=MEMBERSHIP_LEVELS[level])))
 
 
 @_auth_required
@@ -160,12 +171,12 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     args = context.args
     if not args:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s99'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s99')))
         return
     try:
         user_id = int(args[0])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s177'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s177')))
         return
     reason = args[1] if len(args) > 1 else ""
 
@@ -183,24 +194,18 @@ async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cb_result = await bus.execute(command, cb_principal)
 
     if cb_result.approval_required:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s100', cb_result_approval_id=cb_result.approval_id, user_id=user_id)
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s100', cb_result_approval_id=cb_result.approval_id, user_id=user_id)))
     elif cb_result.success:
         ok = cb_result.data.get("ban_ok", False) if cb_result.data else False
         if ok:
             admin_id = update.effective_user.id if update.effective_user else 0
-            await update.message.reply_text(
-                _t(admin_id, "bot.admin_bot.ban_success_permanent", user_id=user_id)
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.ban_success_permanent", user_id=user_id)))
         else:
             admin_id = update.effective_user.id if update.effective_user else 0
-            await update.message.reply_text(_t(admin_id, "bot.admin_bot.ban_failed_retry"))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.ban_failed_retry")))
     else:
         admin_id = update.effective_user.id if update.effective_user else 0
-        await update.message.reply_text(
-            _t(admin_id, "bot.admin_bot.ban_failed_with_error", error=cb_result.error)
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.ban_failed_with_error", error=cb_result.error)))
 
 
 @_auth_required
@@ -209,13 +214,13 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         admin_id = update.effective_user.id if update.effective_user else 0
-        await update.message.reply_text(_t(admin_id, "bot.admin_bot.usage_unban_command"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.usage_unban_command")))
         return
     try:
         user_id = int(args[0])
     except ValueError:
         admin_id = update.effective_user.id if update.effective_user else 0
-        await update.message.reply_text(_t(admin_id, "bot.admin_bot.user_id_must_be_number"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.user_id_must_be_number")))
         return
 
     from services.command_bus import (
@@ -232,24 +237,24 @@ async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cb_result.success:
         ok = cb_result.data.get("unban_ok", False) if cb_result.data else False
         if ok:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s178', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s178', user_id=user_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s179'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s179')))
     else:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s101', cb_result_error=cb_result.error))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s101', cb_result_error=cb_result.error)))
 
 
 @_auth_required
 async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s102'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s102')))
         return
     try:
         user_id = int(args[0])
         quota = int(args[1])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s180'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s180')))
         return
 
     users_col = get_users_col()
@@ -261,20 +266,20 @@ async def set_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_user_and_invalidate(user_id)
     from database.cache_store import invalidate_user_quota_cache
     await invalidate_user_quota_cache(user_id)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s54', user_id=user_id, quota_display_quota=_quota_display(quota)))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s54', user_id=user_id, quota_display_quota=_quota_display(quota))))
 
 
 @_auth_required
 async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s103'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s103')))
         return
     try:
         user_id = int(args[0])
         quota = int(args[1])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s181'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s181')))
         return
 
     users_col = get_users_col()
@@ -286,21 +291,21 @@ async def set_external_quota(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update_user_and_invalidate(user_id)
     from database.cache_store import invalidate_user_quota_cache
     await invalidate_user_quota_cache(user_id)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s55', user_id=user_id, quota_display_quota=_quota_display(quota)))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s55', user_id=user_id, quota_display_quota=_quota_display(quota))))
 
 
 @_auth_required
 async def file_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s104'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s104')))
         return
     file_code = args[0]
 
     # A2: 走缓存,避免每次直查 CRDB
     record = await get_file_record_cached(file_code)
     if record is None:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s105', file_code=file_code))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s105', file_code=file_code)))
         return
 
     file_types = record.get("file_types", {})
@@ -320,7 +325,7 @@ async def file_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = record.get("note", "")
     if note:
         msg += _i18n_t('bot.admin_bot.handlers.s17', note=note)
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 @_auth_required
@@ -365,24 +370,24 @@ async def files_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ns = f" {search}" if search else ""
         msg += _i18n_t('bot.admin_bot.handlers.s20', ns=ns, page_1=page + 1)
 
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 @_auth_required
 async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s107'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s107')))
         return
     file_code = args[0]
 
     # P2-8: 二次确认,避免误删。先校验文件存在,再弹出确认按钮,实际删除在 callback 中执行。
     record = await get_file_record_cached(file_code)
     if record is None:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s108', file_code=file_code))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s108', file_code=file_code)))
         return
 
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
     # R62 P0-04: 删除按钮必须携带签名 token(handle 短 ID 模式),
     # 防止伪造 callback_data 触发未授权删除。
     from services.button_security import sign_button_token_with_handle
@@ -394,16 +399,13 @@ async def delete_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"[Admin][delete_file] 生成签名按钮失败 code={file_code}: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s108', file_code=file_code))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s108', file_code=file_code)))
         return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s182'), callback_data=f"delfile|{delfile_handle}")],
         [InlineKeyboardButton(_i18n_t('bot.admin_bot.handlers.s183'), callback_data=f"delfile_cancel|{file_code}")],
     ])
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s56', file_code=file_code, record_get_uploader_id=record.get('uploader_id'), record_get_status_active=record.get('status', 'active')),
-        reply_markup=kb,
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s56', file_code=file_code, record_get_uploader_id=record.get('uploader_id'), record_get_status_active=record.get('status', 'active'))), reply_markup=kb)
 
 
 @_auth_required
@@ -414,7 +416,7 @@ async def set_access_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     args = context.args
     if len(args) != 2:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s109'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s109')))
         return
     file_code = args[0]
     try:
@@ -422,7 +424,7 @@ async def set_access_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if max_requests < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s184'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s184')))
         return
 
     # 同时更新 CRDB 和本地缓存（update_file_record_and_invalidate 双写）
@@ -433,11 +435,11 @@ async def set_access_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"[Admin] set_access_limit 失败 code={file_code}: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s277', error=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s277', error=e)))
         return
 
     limit_text = _i18n_t('bot.admin_bot.handlers.s21', max_requests=max_requests) if max_requests > 0 else _i18n_t('bot.admin_bot.handlers.s22')
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s57', file_code=file_code, limit_text=limit_text))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s57', file_code=file_code, limit_text=limit_text)))
 
 
 @_auth_required
@@ -446,16 +448,14 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page = 1
     if args and args[0].isdigit():
         page = max(1, int(args[0]))
-    await update.message.reply_text(await _get_logs_page_text(page))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(await _get_logs_page_text(page)))
 
 
 @_auth_required
 async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s110')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s110')))
         return
     phone = args[0].strip()
     # 手机号规范化:确保以 + 开头
@@ -463,7 +463,7 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
         phone = "+" + phone
     code = args[1].strip()
     if not code.isdigit() or len(code) not in (5, 6):
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s111'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s111')))
         return
 
     # P1-13:回执中对登录码掩码(复用 _mask_secret),避免明文泄露到聊天记录。
@@ -472,9 +472,7 @@ async def relay_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 必需的跨进程传递方式(详见本次整改报告的设计选择说明)。明文在 relay 实例读取后即被清空
     #(_wait_for_admin_code 读取后立即 set_config(..., "")),滞留窗口仅数秒至至多 5 分钟握手超时。
     await set_config(f"relay_auth_code:{phone}", code)
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s58', phone=phone, mask_secret_code=_mask_secret(code))
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s58', phone=phone, mask_secret_code=_mask_secret(code))))
 
 
 @_auth_required
@@ -487,9 +485,7 @@ async def relay_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     args = context.args
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s112')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s112')))
         return
 
     # 判断是否省略了手机号(只有一个参数=密码,两个参数=手机号+密码)
@@ -506,9 +502,9 @@ async def relay_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         phone = inst.phone
                         break
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/handlers.py:relay_password'))
         if not phone:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s185'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s185')))
             return
     else:
         phone = args[0].strip()
@@ -518,14 +514,12 @@ async def relay_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         password = " ".join(args[1:]).strip()
 
     if not password:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s113'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s113')))
         return
 
     from database import set_config
     await set_config(f"relay_auth_password:{phone}", password)
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s59', phone_3=phone[:3], phone_2_if_len_phone_5_else=phone[-2:] if len(phone) > 5 else '***')
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s59', phone_3=phone[:3], phone_2_if_len_phone_5_else=phone[-2:] if len(phone) > 5 else '***')))
 
 
 @_auth_required
@@ -543,13 +537,9 @@ async def relay_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending_phones.append(phone)
     if pending_phones:
         phones_str = "\n".join(f"  • {p}" for p in pending_phones)
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s114', phones_str=phones_str)
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s114', phones_str=phones_str)))
     else:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s115')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s115')))
 
 
 @_auth_required
@@ -564,9 +554,7 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     pool_status = await relay_pool.get_pool_status()
     if not pool_status:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s116')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s116')))
         return
     msg = _i18n_t('bot.admin_bot.handlers.s4', len_pool_status=len(pool_status))
     STATUS_ICON = {"online": "✅", "banned": "❌", "floodwait": "⏳", "offline": "❌",
@@ -583,7 +571,7 @@ async def relay_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += f" — {info}"
         msg += "\n"
         msg += _i18n_t('bot.admin_bot.handlers.s24', ps_today_requests=ps['today_requests'], ps_total_requests=ps['total_requests'], ps_avg_wait_ms=ps['avg_wait_ms'])
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 @_auth_required
@@ -591,9 +579,7 @@ async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """添加中继账号(命令行方式)"""
     args = context.args
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s117')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s117')))
         return
     phone = args[0].strip()
 
@@ -602,9 +588,7 @@ async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_id = settings.RELAY_API_ID
     api_hash = settings.RELAY_API_HASH
     if not api_id or not api_hash:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s118')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s118')))
         return
 
     try:
@@ -616,11 +600,9 @@ async def relay_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as notify_err:
             logger.warning(f"[Admin] notify_relay_change 失败(非致命): {notify_err}")
         masked = phone[:3] + "****" + phone[-2:] if len(phone) > 5 else "***"
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s119', str_api_id_4=str(api_id)[:4], masked=masked)
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s119', str_api_id_4=str(api_id)[:4], masked=masked)))
     except Exception as e:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s186', e=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s186', e=e)))
 
 
 @_auth_required
@@ -628,9 +610,7 @@ async def relay_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """移除中继账号"""
     args = context.args
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s120')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s120')))
         return
     phone = args[0].strip()
 
@@ -643,9 +623,9 @@ async def relay_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await get_cache_store().notify_relay_change()
         except Exception as notify_err:
             logger.warning(f"[Admin] notify_relay_change 失败(非致命): {notify_err}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s278', phone=phone))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s278', phone=phone)))
     else:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s121', phone=phone))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s121', phone=phone)))
 
 
 @_auth_required
@@ -654,7 +634,7 @@ async def relay_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from database.relay_db import get_relay_db
     db = await get_relay_db()
     await db.reset_usage()
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s60'))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s60')))
 
 
 # ─── 系统配置管理 ────────────────────────────────────────────────
@@ -664,72 +644,72 @@ async def relay_reset_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def settings_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = await _get_configs_text()
-        await update.message.reply_text(text)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(text))
     except Exception as e:
         logger.error(f"[settings] 获取配置失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s279', error=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s279', error=e)))
 
 
 @_auth_required
 async def set_file_prefix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s122'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s122')))
         return
     prefix = args[0].strip()
     await set_config("file_code_prefix", prefix)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s61', prefix=prefix))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s61', prefix=prefix)))
 
 
 @_auth_required
 async def set_force_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s123'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s123')))
         return
     try:
         channel_id = int(args[0])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s187'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s187')))
         return
     await set_config("force_join_channel_id", str(channel_id))
     link = args[1] if len(args) > 1 else ""
     if link:
         await set_config("force_join_link", link)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s188', channel_id=channel_id) + (_i18n_t('bot.admin_bot.handlers.s231', link=link) if link else "") + _i18n_t('bot.admin_bot.handlers.s124'))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s188', channel_id=channel_id) + (_i18n_t('bot.admin_bot.handlers.s231', link=link) if link else "") + _i18n_t('bot.admin_bot.handlers.s124')))
 
 
 @_auth_required
 async def set_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s125'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s125')))
         return
     bot_role = args[0].lower()
     username = args[1].lstrip("@")
     key_map = {"upload": "upload_bot_username", "decoder": "decoder_bot_username", "sender": "sender_bot_username"}
     key = key_map.get(bot_role)
     if not key:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s126'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s126')))
         return
     await set_config(key, username)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s62', bot_role=bot_role, username=username))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s62', bot_role=bot_role, username=username)))
 
 
 @_auth_required
 async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s127'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s127')))
         return
     level = LEVEL_ALIAS.get(args[0].lower())
     if not level:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s128'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s128')))
         return
     try:
         quota = int(args[1])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s189'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s189')))
         return
     await set_config(f"quota_default_{level}", str(quota))
     msg = _i18n_t('bot.admin_bot.handlers.s5', level=level, quota_display_quota=_quota_display(quota))
@@ -738,13 +718,13 @@ async def set_quota_default(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             ext_quota = int(args[2])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s232'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s232')))
             return
         await set_config(f"quota_external_{level}", str(ext_quota))
         msg += _i18n_t('bot.admin_bot.handlers.s25', quota_display_ext_quota=_quota_display(ext_quota))
 
     msg += _i18n_t('bot.admin_bot.handlers.s6')
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 def _mask_secret(secret: str) -> str:
@@ -762,7 +742,7 @@ def _mask_secret(secret: str) -> str:
 async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s129'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s129')))
         return
 
     # R41 P1-8: R2 凭证变更属高风险操作,必须走 CommandBus(强制 RBAC + 审批门禁)
@@ -786,37 +766,31 @@ async def set_r2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cb_result = await bus.execute(command, cb_principal)
 
     if cb_result.approval_required:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s130', cb_result_approval_id=cb_result.approval_id, mask_secret_access_key=_mask_secret(access_key), mask_secret_secret_key=_mask_secret(secret_key))
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s130', cb_result_approval_id=cb_result.approval_id, mask_secret_access_key=_mask_secret(access_key), mask_secret_secret_key=_mask_secret(secret_key))))
         return
     if not cb_result.success:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s131', cb_result_error=cb_result.error))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s131', cb_result_error=cb_result.error)))
         return
 
     # handler 已在审批通过后写入配置,此处仅回显
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s63', mask_secret_access_key=_mask_secret(access_key), mask_secret_secret_key=_mask_secret(secret_key))
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s63', mask_secret_access_key=_mask_secret(access_key), mask_secret_secret_key=_mask_secret(secret_key))))
 
 
 @_auth_required
 async def set_db_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s132'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s132')))
         return
     try:
         interval = int(args[0])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s190'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s190')))
         return
     enabled = args[1].lower() in (_i18n_t('bot.admin_bot.handlers.s64'), "1", "true", "yes", "on")
     await set_config("db_backup_interval", str(interval))
     await set_config("db_backup_enabled", "true" if enabled else "false")
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s65', interval=interval, if_enabled_else='开启' if enabled else '关闭')
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s65', interval=interval, if_enabled_else='开启' if enabled else '关闭')))
 
 
 # ─── 工厂重置 ────────────────────────────────────────────────────
@@ -834,19 +808,15 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s133')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s133')))
         return
 
     if args[0] != "confirm":
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s134'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s134')))
         return
 
     if len(args) < 2 or args[1] != "I_UNDERSTAND":
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s135')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s135')))
         return
 
     # R41 P1-8: 工厂重置属最高风险操作,必须走 CommandBus(强制 RBAC + 审批门禁)
@@ -862,17 +832,13 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cb_result = await bus.execute(command, cb_principal)
 
     if cb_result.approval_required:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s136', cb_result_approval_id=cb_result.approval_id, join_FACTORY_RESET_TABLES=', '.join(_FACTORY_RESET_TABLES))
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s136', cb_result_approval_id=cb_result.approval_id, join_FACTORY_RESET_TABLES=', '.join(_FACTORY_RESET_TABLES))))
         return
     if not cb_result.success:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s137', cb_result_error=cb_result.error)
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s137', cb_result_error=cb_result.error)))
         return
 
-    msg = await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s66'))
+    msg = await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s66')))
 
     from database.session import CockroachDBClient
 
@@ -980,17 +946,15 @@ async def factory_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def purge_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s139'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s139')))
         return
     try:
         channel_id = int(args[0])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s192'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s192')))
         return
 
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s67', channel_id=channel_id)
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s67', channel_id=channel_id)))
 
 
 # ─── 文件码前缀路由管理 ──────────────────────────────────────────
@@ -1000,54 +964,44 @@ async def purge_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s140')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s140')))
         return
     prefix = args[0].strip().lower()
     bot_username = args[1].strip().lower().lstrip("@")
     # 输入验证: 前缀只能包含字母数字和下划线,长度 1-50
     if not prefix or len(prefix) > 50 or not all(c.isalnum() or c == '_' for c in prefix):
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s141')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s141')))
         return
     # bot_username 只能包含字母、数字、下划线和 bot 后缀
     if not bot_username or len(bot_username) > 32 or not all(c.isalnum() or c == '_' for c in bot_username):
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s142')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s142')))
         return
     await set_code_bot_route(prefix, bot_username)
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s68', prefix=prefix, bot_username=bot_username, prefix_3=prefix, bot_username_5=bot_username)
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s68', prefix=prefix, bot_username=bot_username, prefix_3=prefix, bot_username_5=bot_username)))
 
 
 @_auth_required
 async def remove_code_route(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s143')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s143')))
         return
     prefix = args[0].strip().lower()
     await delete_code_bot_route(prefix)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s69', prefix=prefix))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s69', prefix=prefix)))
 
 
 @_auth_required
 async def list_code_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     routes = await get_all_code_bot_routes()
     if not routes:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s144'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s144')))
         return
     msg = _i18n_t('bot.admin_bot.handlers.s7')
     for prefix in sorted(routes.keys()):
         msg += f"  • `{prefix}` → @{routes[prefix]}\n"
     msg += _i18n_t('bot.admin_bot.handlers.s8')
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 # ─── Bot 解码间隔限流管理 ────────────────────────────────────────
@@ -1057,50 +1011,46 @@ async def list_code_routes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_bot_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s145')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s145')))
         return
     bot_username = args[0].strip().lower().lstrip("@")
     try:
         interval = int(args[1])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s193'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s193')))
         return
     if interval < 0:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s146'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s146')))
         return
     await set_bot_decode_interval(bot_username, interval)
     if interval == 0:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s147', bot_username=bot_username))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s147', bot_username=bot_username)))
     else:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s148', bot_username=bot_username, interval=interval))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s148', bot_username=bot_username, interval=interval)))
 
 
 @_auth_required
 async def remove_bot_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s149')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s149')))
         return
     bot_username = args[0].strip().lower().lstrip("@")
     await delete_bot_decode_interval(bot_username)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s70', bot_username=bot_username))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s70', bot_username=bot_username)))
 
 
 @_auth_required
 async def list_bot_intervals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intervals = await get_all_bot_decode_intervals()
     if not intervals:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s150'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s150')))
         return
     msg = _i18n_t('bot.admin_bot.handlers.s9')
     for bot in sorted(intervals.keys()):
         msg += _i18n_t('bot.admin_bot.handlers.s26', bot=bot, intervals_bot=intervals[bot])
     msg += _i18n_t('bot.admin_bot.handlers.s10')
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 # ─── 备用池管理 ──────────────────────────────────────────────────
@@ -1109,41 +1059,39 @@ async def list_bot_intervals(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def spare_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s151')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s151')))
         return
     try:
         channel_id = int(args[0])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s194'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s194')))
         return
     account_name = args[1] if len(args) > 1 else None
     await add_spare_channel(channel_id, account_name)
     acc_info = _i18n_t('bot.admin_bot.handlers.s27', account_name=account_name) if account_name else _i18n_t('bot.admin_bot.handlers.s28')
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s71', channel_id=channel_id, acc_info=acc_info))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s71', channel_id=channel_id, acc_info=acc_info)))
 
 
 @_auth_required
 async def spare_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s152'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s152')))
         return
     try:
         channel_id = int(args[0])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s195'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s195')))
         return
     await remove_spare(channel_id)
-    await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s72', channel_id=channel_id))
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s72', channel_id=channel_id)))
 
 
 @_auth_required
 async def spare_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spares = await list_spare_pool()
     if not spares:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s153'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s153')))
         return
     msg = _i18n_t('bot.admin_bot.handlers.s11')
     for s in spares:
@@ -1151,7 +1099,7 @@ async def spare_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         acc = s.get("account_name") or _i18n_t('bot.admin_bot.handlers.s75')
         msg += f"  {used} {s['channel_id']} — {acc}\n"
     msg += _i18n_t('bot.admin_bot.handlers.s12', len_spares=len(spares))
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 # ─── C3: 频道槽位运行时增减 ──────────────────────────────────
@@ -1161,30 +1109,28 @@ async def cell_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """添加频道槽位到环形拓扑(默认 shadow1 状态,不破坏现有 active 拓扑)"""
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s154')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s154')))
         return
     slot_id = args[0].strip()
     try:
         channel_id = int(args[1])
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s196'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s196')))
         return
     account_name = args[2] if len(args) > 2 else ""
     status = args[3] if len(args) > 3 else "shadow1"
     if status not in ("active", "shadow1", "shadow2", "r100"):
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s155'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s155')))
         return
     from database.cache_store import get_cache_store
     store = get_cache_store()
     # 检查 slot_id 是否已存在
     existing = await store.get_all_cells_local()
     if any(c.get("slot_id") == slot_id for c in existing):
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s156', slot_id=slot_id))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s156', slot_id=slot_id)))
         return
     if any(c.get("channel_id") == channel_id for c in existing):
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s157', channel_id=channel_id))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s157', channel_id=channel_id)))
         return
     # 构造新 cell 记录
     import time as _time
@@ -1213,11 +1159,9 @@ async def cell_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 失效 admin_bot 自己的 cells 缓存
         from bots.admin_bot.display import invalidate_cells_cache
         await invalidate_cells_cache()
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s158', slot_id=slot_id, channel_id=channel_id, account_name_or=account_name or '(无)', status=status)
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s158', slot_id=slot_id, channel_id=channel_id, account_name_or=account_name or '(无)', status=status)))
     except Exception as e:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s197', e=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s197', e=e)))
 
 
 @_auth_required
@@ -1225,9 +1169,7 @@ async def cell_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """移除频道槽位(拒绝移除 active 状态,需先降级)"""
     args = context.args
     if not args:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s159')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s159')))
         return
     slot_id = args[0].strip()
     from database.cache_store import get_cache_store
@@ -1240,12 +1182,10 @@ async def cell_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
             target = c
             break
     if not target:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s160', slot_id=slot_id))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s160', slot_id=slot_id)))
         return
     if target.get("status") == "active":
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s161', slot_id=slot_id)
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s161', slot_id=slot_id)))
         return
     try:
         deleted = await store.delete_cell_local(slot_id)
@@ -1253,13 +1193,11 @@ async def cell_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # 失效 admin_bot 自己的 cells 缓存
             from bots.admin_bot.display import invalidate_cells_cache
             await invalidate_cells_cache()
-            await update.message.reply_text(
-                _i18n_t('bot.admin_bot.handlers.s198', slot_id=slot_id, target_get_channel_id=target.get('channel_id'))
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s198', slot_id=slot_id, target_get_channel_id=target.get('channel_id'))))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s199', slot_id=slot_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s199', slot_id=slot_id)))
     except Exception as e:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s200', e=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s200', e=e)))
 
 
 # ─── 轮转配置管理 ──────────────────────────────────────────────
@@ -1268,20 +1206,18 @@ async def cell_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def rotation_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s162')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s162')))
         return
     key = args[0].strip()
     value = args[1].strip()
     valid_keys = {"active_window_size", "files_per_slot", "time_per_slot"}
     if key not in valid_keys:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s163', key=key, join_sorted_valid_keys=', '.join(sorted(valid_keys))))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s163', key=key, join_sorted_valid_keys=', '.join(sorted(valid_keys)))))
         return
     try:
         int(value)
     except ValueError:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s201'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s201')))
         return
     db_key = f"rotation_{key}"
     await set_rotation_config(db_key, value)
@@ -1290,9 +1226,7 @@ async def rotation_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "files_per_slot": _i18n_t('bot.admin_bot.handlers.s30'),
         "time_per_slot": _i18n_t('bot.admin_bot.handlers.s31'),
     }
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s76', label_map_get_key_key=label_map.get(key, key), value=value)
-    )
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s76', label_map_get_key_key=label_map.get(key, key), value=value)))
 
 
 @_auth_required
@@ -1309,7 +1243,7 @@ async def rotation_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = str(getattr(settings, f"ROTATION_{fallback_key.upper()}", "—"))
         msg += f"  {label}: {val}\n"
     msg += _i18n_t('bot.admin_bot.handlers.s14')
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 # ─── 白名单热管理（中继账号 & 采集器账号） ──────────────────────────
@@ -1330,54 +1264,50 @@ async def relay_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         ids = await get_relay_whitelist()
         if not ids:
-            await update.message.reply_text(
-                _i18n_t('bot.admin_bot.handlers.s202')
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s202')))
             return
         msg = _i18n_t('bot.admin_bot.handlers.s32')
         for uid in sorted(ids):
             msg += f"  • `{uid}`\n"
         msg += _i18n_t('bot.admin_bot.handlers.s33', len_ids=len(ids))
         msg += _i18n_t('bot.admin_bot.handlers.s34')
-        await update.message.reply_text(msg)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
         return
 
     action = args[0].lower()
     if action == "add":
         if len(args) < 2:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s203'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s203')))
             return
         try:
             user_id = int(args[1])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s234'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s234')))
             return
         added = await add_relay_whitelist(user_id)
         if added:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s204', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s204', user_id=user_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s205', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s205', user_id=user_id)))
     elif action == "remove":
         if len(args) < 2:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s235'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s235')))
             return
         try:
             user_id = int(args[1])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s262'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s262')))
             return
         removed = await remove_relay_whitelist(user_id)
         if removed:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s236', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s236', user_id=user_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s237', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s237', user_id=user_id)))
     elif action == "clear":
         await delete_config("relay_account_ids")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s238'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s238')))
     else:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s239')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s239')))
 
 
 @_auth_required
@@ -1396,54 +1326,50 @@ async def collector_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not args:
         ids = await get_collector_whitelist()
         if not ids:
-            await update.message.reply_text(
-                _i18n_t('bot.admin_bot.handlers.s206')
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s206')))
             return
         msg = _i18n_t('bot.admin_bot.handlers.s35')
         for uid in sorted(ids):
             msg += f"  • `{uid}`\n"
         msg += _i18n_t('bot.admin_bot.handlers.s36', len_ids=len(ids))
         msg += _i18n_t('bot.admin_bot.handlers.s37')
-        await update.message.reply_text(msg)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
         return
 
     action = args[0].lower()
     if action == "add":
         if len(args) < 2:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s207'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s207')))
             return
         try:
             user_id = int(args[1])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s240'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s240')))
             return
         added = await add_collector_whitelist(user_id)
         if added:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s208', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s208', user_id=user_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s209', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s209', user_id=user_id)))
     elif action == "remove":
         if len(args) < 2:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s241'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s241')))
             return
         try:
             user_id = int(args[1])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s263'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s263')))
             return
         removed = await remove_collector_whitelist(user_id)
         if removed:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s242', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s242', user_id=user_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s243', user_id=user_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s243', user_id=user_id)))
     elif action == "clear":
         await delete_config("collector_account_ids")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s244'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s244')))
     else:
-        await update.message.reply_text(
-            _i18n_t('bot.admin_bot.handlers.s245')
-        )
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s245')))
 
 
 # ─── 拓扑查看 ──────────────────────────────────────────────────
@@ -1451,16 +1377,16 @@ async def collector_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE
 @_auth_required
 async def topology(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await _get_topology_text()
-    await update.message.reply_text(text)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(text))
 
 
 @_auth_required
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("conv_state"):
         await _conv_end(context)
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s164'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s164')))
     else:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s165'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s165')))
 
 
 # ─── 帮助命令 ──────────────────────────────────────────────────
@@ -1489,7 +1415,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seq = int(args[0])
     except ValueError:
         admin_id = update.effective_user.id if update.effective_user else 0
-        await update.message.reply_text(_t(admin_id, "bot.admin_bot.seq_must_be_number"))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_t(admin_id, "bot.admin_bot.seq_must_be_number")))
         return
 
     # 解析可选参数 table: 和 merge:
@@ -1500,7 +1426,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tables_str = arg[len("table:"):]
             tables = [t.strip() for t in tables_str.split(",") if t.strip()]
             if not tables:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s246'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s246')))
                 return
         elif arg.startswith("merge:"):
             merge_val = arg[len("merge:"):].lower()
@@ -1511,15 +1437,15 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         backups = await list_backups()
     except Exception as e:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s210', e=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s210', e=e)))
         return
 
     if not backups:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s166'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s166')))
         return
 
     if seq < 1 or seq > len(backups):
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s167', len_backups=len(backups)))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s167', len_backups=len(backups))))
         return
 
     target = backups[seq - 1]
@@ -1528,7 +1454,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_mod = target.get("last_modified", "")
 
     # 构造确认按钮
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
     # R62 P0-04: 恢复按钮必须携带签名 token(handle 短 ID 模式),
     # 防止伪造 callback_data 触发未授权的数据库恢复。
     # payload 格式: {seq}|{0或1}|table:xxx,yyy(merge 和 table 部分均可选)
@@ -1545,7 +1471,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"[Admin][restore] 生成签名按钮失败 seq={seq}: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s210', e=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s210', e=e)))
         return
 
     kb = InlineKeyboardMarkup([
@@ -1562,12 +1488,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode_text = _i18n_t('bot.admin_bot.handlers.s40')
     else:
         mode_text = _i18n_t('bot.admin_bot.handlers.s41')
-    await update.message.reply_text(
-        _i18n_t('bot.admin_bot.handlers.s213', key=key, size=size, last_mod=last_mod, scope_text=scope_text, mode_text=mode_text)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s213', key=key, size=size, last_mod=last_mod, scope_text=scope_text, mode_text=mode_text)
         + ("" if merge else _i18n_t('bot.admin_bot.handlers.s247'))
-        + _i18n_t('bot.admin_bot.handlers.s168'),
-        reply_markup=kb,
-    )
+        + _i18n_t('bot.admin_bot.handlers.s168')), reply_markup=kb)
 
 
 async def _restore_list_backups(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1576,11 +1499,11 @@ async def _restore_list_backups(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         backups = await list_backups()
     except Exception as e:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s214', e=e))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s214', e=e)))
         return
 
     if not backups:
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s169'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s169')))
         return
 
     lines = [_i18n_t('bot.admin_bot.handlers.s43', len_backups=len(backups))]
@@ -1606,7 +1529,7 @@ async def _restore_list_backups(update: Update, context: ContextTypes.DEFAULT_TY
     lines.append(_i18n_t('bot.admin_bot.handlers.s48'))
     lines.append(_i18n_t('bot.admin_bot.handlers.s49'))
 
-    await update.message.reply_text("\n".join(lines))
+    await safe_reply_text(update.message, UserMessage.from_raw_text("\n".join(lines)))
 
 
 @_auth_required
@@ -1614,7 +1537,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         _i18n_t('bot.admin_bot.handlers.s15')
     )
-    await update.message.reply_text(msg)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
 
 # ─── R40 新增管理命令(13 条) ──────────────────────────────────
@@ -1633,15 +1556,15 @@ async def cmd_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await content_reports.list_reports(status=status_filter, page=page, page_size=20)
         items = result.get("items", [])
         if not items:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s215'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s215')))
             return
         lines = [_i18n_t('bot.admin_bot.handlers.s81', result_get_page_1=result.get('page', 1), result_get_total_pages_1=result.get('total_pages', 1), result_get_total_0=result.get('total', 0))]
         for r in items:
             lines.append(await content_reports.format_report(r))
-        await update.message.reply_text("\n\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Admin][reports] 查询举报列表失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s280')))
 
 
 @_auth_required
@@ -1652,7 +1575,7 @@ async def cmd_takedown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         if len(context.args) < 2:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s216'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s216')))
             return
         target_type = context.args[0]
         target_id = context.args[1]
@@ -1673,20 +1596,18 @@ async def cmd_takedown(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await bus.execute(command, cb_principal)
 
         if result.approval_required:
-            await update.message.reply_text(
-                _i18n_t('bot.admin_bot.handlers.s217', result_approval_id=result.approval_id, target_type=target_type, target_id=target_id)
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s217', result_approval_id=result.approval_id, target_type=target_type, target_id=target_id)))
         elif result.success:
             ok = result.data.get("takedown_ok", False) if result.data else False
             if ok:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s264', target_type=target_type, target_id=target_id))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s264', target_type=target_type, target_id=target_id)))
             else:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s265'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s265')))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s281', error=result.error))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s281', error=result.error)))
     except Exception as e:
         logger.exception(f"[Admin][takedown] 内容下架失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s282')))
 
 
 @_auth_required
@@ -1697,12 +1618,12 @@ async def cmd_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s218'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s218')))
             return
         try:
             user_id = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s248'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s248')))
             return
         reason = context.args[1] if len(context.args) > 1 else ""
         duration_days = 0
@@ -1727,28 +1648,24 @@ async def cmd_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await bus.execute(command, cb_principal)
 
         if result.approval_required:
-            await update.message.reply_text(
-                _i18n_t('bot.admin_bot.handlers.s219', result_approval_id=result.approval_id, user_id=user_id, duration_days=duration_days)
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s219', result_approval_id=result.approval_id, user_id=user_id, duration_days=duration_days)))
         elif result.success:
             ok = result.data.get("ban_ok", False) if result.data else False
             if ok:
                 admin_id = update.effective_user.id if update.effective_user else 0
-                await update.message.reply_text(
-                    _t(
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_t(
                         admin_id,
                         "bot.admin_bot.ban_success_duration",
                         user_id=user_id,
                         duration_days=duration_days,
-                    )
-                )
+                    )))
             else:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s266'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s266')))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s283', error=result.error))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s283', error=result.error)))
     except Exception as e:
         logger.exception(f"[Admin][ban_user] 封禁用户失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s282')))
 
 
 @_auth_required
@@ -1759,12 +1676,12 @@ async def cmd_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s220'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s220')))
             return
         try:
             user_id = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s249'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s249')))
             return
         admin = update.effective_user
         admin_id = admin.id if admin else 0
@@ -1782,14 +1699,14 @@ async def cmd_unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result.success:
             ok = result.data.get("unban_ok", False) if result.data else False
             if ok:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s250', user_id=user_id))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s250', user_id=user_id)))
             else:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s251'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s251')))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s284', error=result.error))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s284', error=result.error)))
     except Exception as e:
         logger.exception(f"[Admin][unban_user] 解封用户失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s282')))
 
 
 @_auth_required
@@ -1805,15 +1722,15 @@ async def cmd_pending_approvals(update: Update, context: ContextTypes.DEFAULT_TY
         result = await approval_workflow.list_pending(page=page, page_size=20)
         items = result.get("items", [])
         if not items:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s221'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s221')))
             return
         lines = [_i18n_t('bot.admin_bot.handlers.s82', result_get_page_1=result.get('page', 1), result_get_total_pages_1=result.get('total_pages', 1), result_get_total_0=result.get('total', 0))]
         for a in items:
             lines.append(await approval_workflow.format_approval(a))
-        await update.message.reply_text("\n\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Admin][pending_approvals] 查询待审批失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s280')))
 
 
 @_auth_required
@@ -1821,24 +1738,24 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """批准审批: /approve <approval_id> [note]"""
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s222'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s222')))
             return
         try:
             approval_id = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s252'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s252')))
             return
         note = " ".join(context.args[1:]) if len(context.args) > 1 else ""
         admin = update.effective_user
         approver_id = admin.id if admin else 0
         ok = await approval_workflow.approve(approval_id, approver_id, note=note)
         if ok:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s223', approval_id=approval_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s223', approval_id=approval_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s285'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s285')))
     except Exception as e:
         logger.exception(f"[Admin][approve] 批准审批失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s282')))
 
 
 @_auth_required
@@ -1846,24 +1763,24 @@ async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """驳回审批: /reject <approval_id> [reason]"""
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s224'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s224')))
             return
         try:
             approval_id = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s253'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s253')))
             return
         reason = " ".join(context.args[1:]) if len(context.args) > 1 else ""
         admin = update.effective_user
         approver_id = admin.id if admin else 0
         ok = await approval_workflow.reject(approval_id, approver_id, reason=reason)
         if ok:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s225', approval_id=approval_id))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s225', approval_id=approval_id)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s286'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s286')))
     except Exception as e:
         logger.exception(f"[Admin][reject] 驳回审批失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s282')))
 
 
 @_auth_required
@@ -1872,16 +1789,16 @@ async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         roles = await rbac.list_roles()
         if not roles:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s226'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s226')))
             return
         lines = [_i18n_t('bot.admin_bot.handlers.s83')]
         for r in roles:
             lines.append(await rbac.format_role_info(r))
             lines.append("─" * 30)
-        await update.message.reply_text("\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Admin][roles] 查询角色失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s280')))
 
 
 @_auth_required
@@ -1891,12 +1808,12 @@ async def cmd_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         if len(context.args) < 2:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s227'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s227')))
             return
         try:
             user_id = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s254'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s254')))
             return
         role_name = context.args[1]
         admin = update.effective_user
@@ -1913,20 +1830,18 @@ async def cmd_assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await bus.execute(command, cb_principal)
 
         if result.approval_required:
-            await update.message.reply_text(
-                _i18n_t('bot.admin_bot.handlers.s228', result_approval_id=result.approval_id, user_id=user_id, role_name=role_name)
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s228', result_approval_id=result.approval_id, user_id=user_id, role_name=role_name)))
         elif result.success:
             ok = result.data.get("assign_ok", False) if result.data else False
             if ok:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s267', user_id=user_id, role_name=role_name))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s267', user_id=user_id, role_name=role_name)))
             else:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s268'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s268')))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s287', error=result.error))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s287', error=result.error)))
     except Exception as e:
         logger.exception(f"[Admin][assign_role] 分配角色失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s282')))
 
 
 @_auth_required
@@ -1936,7 +1851,7 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     try:
         if not context.args:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s229'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s229')))
             return
         action = context.args[0].lower()
         admin = update.effective_user
@@ -1956,28 +1871,24 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bus = CommandBus()
             result = await bus.execute(command, cb_principal)
             if result.approval_required:
-                await update.message.reply_text(
-                    _i18n_t('bot.admin_bot.handlers.s255', result_approval_id=result.approval_id, reason=reason)
-                )
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s255', result_approval_id=result.approval_id, reason=reason)))
             elif result.success:
                 ok = result.data.get("enable_ok", False) if result.data else False
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s271') if ok else _i18n_t('bot.admin_bot.handlers.s272'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s271') if ok else _i18n_t('bot.admin_bot.handlers.s272')))
             else:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s269', result_error=result.error))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s269', result_error=result.error)))
         elif action == "off":
             cb_principal = CBPrincipal(id=admin_id, name=admin_name, source="bot")
             command = make_disable_maintenance_command()
             bus = CommandBus()
             result = await bus.execute(command, cb_principal)
             if result.approval_required:
-                await update.message.reply_text(
-                    _i18n_t('bot.admin_bot.handlers.s270', result_approval_id=result.approval_id)
-                )
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s270', result_approval_id=result.approval_id)))
             elif result.success:
                 ok = result.data.get("disable_ok", False) if result.data else False
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s275') if ok else _i18n_t('bot.admin_bot.handlers.s276'))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s275') if ok else _i18n_t('bot.admin_bot.handlers.s276')))
             else:
-                await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s273', result_error=result.error))
+                await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s273', result_error=result.error)))
         elif action == "status":
             # status 仅查询,不修改状态,不走 CommandBus
             status = await maintenance_mode.get_status()
@@ -1989,12 +1900,12 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _i18n_t('bot.admin_bot.handlers.s260', status_get_started_at=status.get('started_at', '')),
                 _i18n_t('bot.admin_bot.handlers.s261', status_get_duration_seconds_0=status.get('duration_seconds', 0)),
             ]
-            await update.message.reply_text("\n".join(lines))
+            await safe_reply_text(update.message, UserMessage.from_raw_text("\n".join(lines)))
         else:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s288'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s288')))
     except Exception as e:
         logger.exception(f"[Admin][maintenance] 维护模式操作失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s282'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s282')))
 
 
 @_auth_required
@@ -2010,10 +1921,10 @@ async def cmd_repair_console(update: Update, context: ContextTypes.DEFAULT_TYPE)
             _i18n_t('bot.admin_bot.handlers.s88', overview_get_replication_failed_0=overview.get('replication_failed', 0)),
             _i18n_t('bot.admin_bot.handlers.s89', overview_get_relay_issues_0=overview.get('relay_issues', 0)),
         ]
-        await update.message.reply_text("\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Admin][repair_console] 查询修复总览失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s280')))
 
 
 @_auth_required
@@ -2035,10 +1946,10 @@ async def cmd_backups(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         for b in backups[:10]:
             lines.append(f"  • {b.get('backup_id', '')} ({b.get('created_at', '')})")
-        await update.message.reply_text("\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Admin][backups] 查询备份失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s280')))
 
 
 @_auth_required
@@ -2054,10 +1965,10 @@ async def cmd_ru_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             start_date = today
             end_date = today
         report = await ru_cost_center.generate_cost_report(start_date, end_date)
-        await update.message.reply_text(report)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(report))
     except Exception as e:
         logger.exception(f"[Admin][ru_report] 生成 RU 报告失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s289'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s289')))
 
 
 @_auth_required
@@ -2089,9 +2000,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     limit = max(1, min(100, int(arg)))
                 except ValueError:
-                    await update.message.reply_text(
-                        _i18n_t('bot.admin_bot.handlers.s274')
-                    )
+                    await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s274')))
                     return
         if len(context.args) >= 2:
             try:
@@ -2102,7 +2011,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tasks = await list_all_tasks(limit=limit, offset=0, status_filter=status_filter)
         if not tasks:
             filter_text = f" (status={status_filter})" if status_filter else ""
-            await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s230', filter_text=filter_text))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s230', filter_text=filter_text)))
             return
 
         lines = [
@@ -2125,7 +2034,7 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{icon} #{t.get('id', '')} [{type_name}] user={t.get('user_id', '')} "
                 f"{t.get('status', '')} ({t.get('progress', 0)}%)"
             )
-        await update.message.reply_text("\n".join(lines))
+        await safe_reply_text(update.message, UserMessage.from_raw_text("\n".join(lines)))
     except Exception as e:
         logger.exception(f"[Admin][tasks] 查询任务失败: {e}")
-        await update.message.reply_text(_i18n_t('bot.admin_bot.handlers.s280'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.handlers.s280')))

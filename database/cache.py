@@ -441,7 +441,7 @@ async def _flush_decode_log_buffer_loop():
                         from utils.shared_counters import status_counters
                         status_counters["today_decodes"] = status_counters.get("today_decodes", 0) + flushed_count
                 except Exception:
-                    pass
+                    logger.exception("[R65 P1-04] database/cache.py:_flush_decode_log_buffer_loop except 吞异常已记录(原 except: pass)")
             else:
                 logger.debug("[DecodeLog] flush: no new logs")
 

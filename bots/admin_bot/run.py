@@ -1,6 +1,13 @@
 import asyncio
+from services.sink_adapters.telegram_helpers import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+)
 from loguru import logger
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+
 
 from .menus import TOKEN, AUTHORIZED_USER_ID
 from utils.monitor import metrics

@@ -1236,7 +1236,7 @@ class OutboxWorker:
       不再永久卡住)。
 
     R64 P0-04 整改(生产闭环 — 终审报告 P0-04):
-    - **删除 test_mode stub 分支**:无论 test_mode 如何,``provider_registry=None``
+    - **删除 test_mode stub 分支**:``provider_registry=None``
       时 ``run_once`` 一律 raise ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``。
       生产构建从代码层移除 no-provider-complete 分支;测试使用独立 fake provider
       注入,不允许 worker 静默完成外部副作用。
@@ -1252,7 +1252,7 @@ class OutboxWorker:
       idempotency_key, payload_digest, payload)``,外部系统必须按 idempotency_key
       去重(防 provider 篡改 effect_type/request_hash 绕过 CAS)。
     - **lease fencing token(lease_version)**:claim CAS
-      ``WHERE status='pending' AND lease_version=0``,成功后 lease_version=1;
+      ``WHERE status='pending'``,成功后 ``lease_version = lease_version + 1``;
       complete/fail/renew 都必须 CAS ``event_id + owner + lease_version +
       request_hash``(防 ABA:旧持有者残留调用因版本不匹配被拒绝)。
     - **provider 调用超过租期三分之一自动续租**:续租失败立即停止提交结果
@@ -1261,11 +1261,25 @@ class OutboxWorker:
       ``logger.error`` 告警,并写入 ``outbox_dlq_audit`` 审计记录(可审批 replay);
       未知 event_type 严禁标记成功,必须进入 DLQ。
 
+    R65 P1-05 整改(fencing token 单调递增永不重置 + 严格 CAS 冲突 raise):
+    - **test_mode 参数彻底移除**:`__init__` 不再接受 ``test_mode`` 参数,
+      传入即 TypeError。测试必须注入独立 fake provider,不依赖任何 stub 分支。
+    - **claim 使用 ``lease_version = lease_version + 1``**:首次 claim 0+1=1,
+      reclaim 后 1+1=2,以此类推;fencing token 永不重置,杜绝 ABA。
+    - **reclaim/fail 不重置 lease_version**:仅清 owner/status/lease_expires_at,
+      保留当前 lease_version;新 claimant 通过 +1 单调递增。
+    - **complete/fail/renew 严格 CAS 冲突 raise**:``lease_version is not None``
+      路径下 CAS 失败(行未找到 / 版本不匹配)一律 raise
+      ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``,不再静默返回 False/not_found。
+    - **补偿持久化**:provider 失败且进入 DLQ 时,补偿意图持久化到 audit_log
+      (kind='compensation'),保证 worker 重启后 reconcile 流程仍可重放补偿。
+
     Lease 机制(分布式 worker 协调):
     - claim_outbox_events 原子地将 pending 行转为 in_flight 并设置 lease_owner /
-      lease_expires_at / lease_version=1,防止多 worker 并发拉取同一行。
+      lease_expires_at,``lease_version = lease_version + 1``(单调递增),
+      防止多 worker 并发拉取同一行。
     - lease 过期后由 ``reclaim_stale_leases()`` 回收(转回 pending,清空
-      lease_owner,重置 lease_version=0)。
+      lease_owner,保留 lease_version — 不再重置为 0)。
     - 长 provider 调用周期性调用 ``store.renew_outbox_lease`` 续约(防超时回收),
       续约成功 lease_version += 1。
     """
@@ -1277,9 +1291,12 @@ class OutboxWorker:
         lease_duration_seconds: int = 60,
         batch_size: int = 10,
         provider_registry: Any = None,
-        test_mode: bool = False,
     ):
         """初始化 OutboxWorker。
+
+        R65 P1-05 整改:``test_mode`` 参数彻底移除。传入 ``test_mode`` 即
+        TypeError(Python 自动拒绝未知关键字参数)。测试必须注入独立 fake
+        provider,不依赖任何 stub 分支绕过 provider 要求。
 
         Args:
             lease_owner: worker 标识(hostname:pid),用于 claim_outbox_events
@@ -1289,21 +1306,18 @@ class OutboxWorker:
                 provider 签名: ``async (OutboxEnvelope) -> external_id_str``
                 (R64 P0-04: 接收 immutable 信封,基于 idempotency_key 去重)。
                 必传:``None`` 时 ``run_once`` 一律 raise
-                ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``(R64 P0-04:
-                不论 test_mode 如何,生产构建从代码层移除 no-provider-complete 分支;
-                测试注入独立 fake provider,不依赖 test_mode 绕过)。
-            test_mode: 测试模式开关(R64 P0-04: 仅为向后兼容保留,不再控制
-                stub 行为;``provider_registry=None`` 时无论 test_mode 如何均 raise)。
+                ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``(R64 P0-04 +
+                R65 P1-05: 生产构建从代码层移除 no-provider-complete 分支;
+                测试注入独立 fake provider,不依赖任何 stub 绕过)。
         """
         import socket as _socket
         self.lease_owner = lease_owner or f"{_socket.gethostname()}:{os.getpid()}"
         self.lease_duration_seconds = lease_duration_seconds
         self.batch_size = batch_size
         # provider_registry: {effect_type: async (OutboxEnvelope) -> external_id_str}
-        # R64 P0-04: None 时 run_once 一律 raise(不论 test_mode);
-        # 测试注入独立 fake provider,不依赖 test_mode 绕过。
+        # R64 P0-04 + R65 P1-05: None 时 run_once 一律 raise;
+        # 测试注入独立 fake provider,不依赖 test_mode 绕过(test_mode 已移除)。
         self.provider_registry = provider_registry
-        self.test_mode = bool(test_mode)
 
     def validate_providers(
         self,
@@ -1361,7 +1375,8 @@ class OutboxWorker:
                     },
                 ) from e
         if self.provider_registry is None:
-            # test_mode 下允许 None,但 validate_providers 仍报告所有 type 缺失
+            # R65 P1-05: test_mode 已移除,provider_registry=None 时报告全部缺失
+            # (调用方决定是否 raise / log / 阻断启动)
             return list(required_effect_types)
         missing: list[str] = []
         for effect_type in required_effect_types:
@@ -1395,9 +1410,9 @@ class OutboxWorker:
 
         R64 P0-04 整改(生产闭环):
         - ``provider_registry is None`` 一律 raise
-          ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``,不论 ``test_mode``
-          如何。生产构建从代码层移除 no-provider-complete 分支;测试注入独立
-          fake provider,不允许 worker 静默完成外部副作用。
+          ``AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED)``。生产构建从代码层
+          移除 no-provider-complete 分支;测试注入独立 fake provider,不允许
+          worker 静默完成外部副作用。
         - provider 调用签名: ``await provider(OutboxEnvelope) -> external_id``。
           provider 接收 immutable 信封,基于 ``idempotency_key`` 在外部系统去重。
         - ``complete_outbox_event`` 传入 ``lease_owner`` + ``request_hash`` +
@@ -1409,24 +1424,34 @@ class OutboxWorker:
         - 未知 event_type / 无 provider → DLQ + ``logger.error`` 告警 +
           ``outbox_dlq_audit`` 审计记录(可审批 replay),严禁标记成功。
 
+        R65 P1-05 整改(test_mode 参数彻底移除 + 严格 CAS 冲突处理):
+        - ``test_mode`` 参数已彻底移除,``__init__`` 不再接受该参数(传入即
+          TypeError)。生产/测试一致要求注入 provider,不依赖任何 stub 分支。
+        - ``complete_outbox_event`` / ``fail_outbox_event`` 在严格 CAS 路径下
+          冲突会 raise ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``;本方法在
+          ``process_event`` 中捕获并视为本事件失败(不停止整批,仅本事件 fail)。
+        - DLQ 路径调用 ``_persist_and_invoke_compensation`` 持久化补偿意图到
+          audit_log(kind='compensation'),保证 worker 重启后 reconcile 流程
+          仍可重放补偿(Python callback 仅作为实现,持久化是事实来源)。
+
         Returns:
             {claimed: int, completed: int, failed: int, dlq: int}
 
         Raises:
             AppError(OUTBOX_PROVIDER_REGISTRY_REQUIRED): ``provider_registry is None``
-                (不论 test_mode,R64 P0-04 移除 stub 分支)
+                (R64 P0-04 移除 stub 分支;R65 P1-05 test_mode 已移除)
             AppError(OUTBOX_LEASE_RENEW_FAILED): 自动续租失败(立即停止提交结果)
         """
-        # R64 P0-04: fail-fast — 不论 test_mode,无 provider 一律拒绝
+        # R64 P0-04 + R65 P1-05: fail-fast — 无 provider 一律拒绝
         # (生产构建从代码层移除 no-provider-complete 分支;
-        #  测试注入独立 fake provider,不依赖 test_mode 绕过)
+        #  测试注入独立 fake provider,test_mode 已移除不依赖任何 stub 绕过)
         if self.provider_registry is None:
             raise AppError(
                 ErrorCodes.OUTBOX_PROVIDER_REGISTRY_REQUIRED,
                 params={
                     "reason": "stub worker must not silently complete external "
                               "side effects; inject a fake provider for tests "
-                              "(test_mode no longer bypasses provider requirement)"
+                              "(R65 P1-05: test_mode removed, no stub bypass)"
                 },
             )
         store = get_cache_store()
@@ -1465,10 +1490,18 @@ class OutboxWorker:
         lease_version: int,
         lease_expires_at: str,
     ) -> tuple[bool, int, str]:
-        """R64 P0-04: 检查 lease 剩余时间,不足 1/3 即自动续租。
+        """R64 P0-04 + R65 P1-05: 检查 lease 剩余时间,不足 1/3 即自动续租。
 
         provider 调用超过租期三分之一即自动续租;续租失败立即停止提交结果。
         续租成功后 lease_version += 1(renew_outbox_lease CAS 递增)。
+
+        R65 P1-05 整改(严格 CAS 冲突转换):
+        - renew_outbox_lease 在严格 CAS 路径下冲突(lease_version 不匹配 /
+          行未找到 / lease_owner 不匹配)会 raise
+          ``AppError(OUTBOX_LEASE_VERSION_CONFLICT)``。
+        - 本方法捕获该冲突并转换为 ``AppError(OUTBOX_LEASE_RENEW_FAILED)``,
+          保持调用方(process_event / watchdog)的契约不变:任何续租失败一律
+          视为 OUTBOX_LEASE_RENEW_FAILED(立即停止提交结果)。
 
         Args:
             store: CacheStore
@@ -1497,15 +1530,38 @@ class OutboxWorker:
         # R64 P0-04: lease 剩余 < 租期 1/3 即续租
         if remaining >= self.lease_duration_seconds / 3:
             return (False, lease_version, lease_expires_at)
-        renewed = await store.renew_outbox_lease(
-            event_id,
-            lease_owner=self.lease_owner,
-            request_hash=request_hash,
-            lease_version=lease_version,
-            lease_duration_seconds=self.lease_duration_seconds,
-        )
+        # R65 P1-05: renew_outbox_lease 严格 CAS 冲突 raise
+        # OUTBOX_LEASE_VERSION_CONFLICT;捕获并转换为 OUTBOX_LEASE_RENEW_FAILED
+        # 保持调用方契约(任何续租失败一律视为 RENEW_FAILED 停止提交结果)。
+        try:
+            renewed = await store.renew_outbox_lease(
+                event_id,
+                lease_owner=self.lease_owner,
+                request_hash=request_hash,
+                lease_version=lease_version,
+                lease_duration_seconds=self.lease_duration_seconds,
+            )
+        except AppError as renew_err:
+            if renew_err.code == ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT:
+                # 续租 CAS 冲突 → 转换为 OUTBOX_LEASE_RENEW_FAILED 停止提交
+                raise AppError(
+                    ErrorCodes.OUTBOX_LEASE_RENEW_FAILED,
+                    params={
+                        "event_id": event_id,
+                        "reason": (
+                            f"lease renew CAS conflict "
+                            f"(lease_version={lease_version}, "
+                            f"remaining={remaining:.1f}s < "
+                            f"threshold={self.lease_duration_seconds / 3:.1f}s); "
+                            f"lease may have been reclaimed/advanced by another "
+                            f"worker (fencing token mismatch)"
+                        ),
+                    },
+                ) from renew_err
+            raise
         if not renewed:
             # 续租失败立即停止提交结果(防 lease 被回收后双重执行)
+            # 仅在 lease_version is None 向后兼容路径下可能命中
             raise AppError(
                 ErrorCodes.OUTBOX_LEASE_RENEW_FAILED,
                 params={
@@ -1595,6 +1651,12 @@ class OutboxWorker:
                 f"effect_type={effect_type} reason={reason} "
                 f"(moved to outbox_dlq_audit for approvable replay)"
             )
+            # R65 P1-05: 持久化补偿意图到 audit_log(kind='compensation'),
+            # 保证 worker 重启后 reconcile 流程仍可重放补偿
+            await self._persist_and_invoke_compensation(
+                ev, store,
+                error_msg=f"no_provider_for_effect_type:{effect_type}",
+            )
             return "dlq"
 
         # R64 P0-04: provider 调用期间并发续租 watchdog
@@ -1664,32 +1726,69 @@ class OutboxWorker:
 
         if provider_failed:
             # R64 P0-04: fail 使用四字段 CAS(lease_version)
-            result = await store.fail_outbox_event(
-                event_id,
-                error_msg=str(prov_err),
-                lease_owner=self.lease_owner,
-                request_hash=request_hash,
-                lease_version=lease_version_box[0],
-            )
+            # R65 P1-05: 严格 CAS 路径冲突会 raise OUTBOX_LEASE_VERSION_CONFLICT,
+            # 捕获并视为本事件失败(不停止整批,仅本事件 fail;旧持有者残留调用
+            # 因版本不匹配被拒绝,防 ABA 双重执行)
+            try:
+                result = await store.fail_outbox_event(
+                    event_id,
+                    error_msg=str(prov_err),
+                    lease_owner=self.lease_owner,
+                    request_hash=request_hash,
+                    lease_version=lease_version_box[0],
+                )
+            except AppError as cas_err:
+                if cas_err.code == ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT:
+                    logger.error(
+                        _i18n_t(
+                            "diagnostics.r65.outbox_worker.fail_cas_conflict",
+                            event_id=event_id,
+                            effect_type=effect_type,
+                            expected_lease_version=lease_version_box[0],
+                        )
+                    )
+                    return "failed"
+                raise
             if result == "dlq":
                 logger.error(
                     f"[OutboxWorker] DLQ event_id={event_id} "
                     f"effect_type={effect_type} reason=provider_failed_over_limit "
                     f"error={prov_err}"
                 )
+                # R65 P1-05: 持久化补偿意图到 audit_log(kind='compensation'),
+                # 保证 worker 重启后 reconcile 流程仍可重放补偿
+                await self._persist_and_invoke_compensation(
+                    ev, store,
+                    error_msg=f"provider_failed_over_limit: {prov_err}",
+                )
                 return "dlq"
             return "failed"
 
         # R64 P0-04: complete 使用四字段 CAS(lease_version fencing token)
-        ok = await store.complete_outbox_event(
-            event_id,
-            external_id=str(external_id) if external_id is not None else "",
-            lease_owner=self.lease_owner,
-            request_hash=request_hash,
-            lease_version=lease_version_box[0],
-        )
+        # R65 P1-05: 严格 CAS 路径冲突会 raise OUTBOX_LEASE_VERSION_CONFLICT,
+        # 捕获并视为本事件失败(不停止整批,仅本事件 fail;防 ABA 双重执行)
+        try:
+            ok = await store.complete_outbox_event(
+                event_id,
+                external_id=str(external_id) if external_id is not None else "",
+                lease_owner=self.lease_owner,
+                request_hash=request_hash,
+                lease_version=lease_version_box[0],
+            )
+        except AppError as cas_err:
+            if cas_err.code == ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT:
+                logger.error(
+                    _i18n_t(
+                        "diagnostics.r65.outbox_worker.complete_cas_conflict",
+                        event_id=event_id,
+                        effect_type=effect_type,
+                        expected_lease_version=lease_version_box[0],
+                    )
+                )
+                return "failed"
+            raise
         if not ok:
-            # CAS 失败(lease 已被回收 / 版本不匹配)→ 本事件失败,不停止整批
+            # CAS 失败(lease_version is None 向后兼容路径)→ 本事件失败,不停止整批
             logger.error(
                 f"[OutboxWorker] complete CAS failed event_id={event_id} "
                 f"effect_type={effect_type} lease_version={lease_version_box[0]} "
@@ -1697,6 +1796,81 @@ class OutboxWorker:
             )
             return "failed"
         return "completed"
+
+    async def _persist_and_invoke_compensation(
+        self,
+        ev: dict,
+        store,
+        *,
+        error_msg: str,
+    ) -> None:
+        """R65 P1-05: 持久化补偿意图到 audit_log(kind='compensation')。
+
+        provider 失败且进入 DLQ 时,补偿意图必须持久化到 audit_log,保证
+        worker 重启后 reconcile 流程仍可重放补偿。Python callback 仅作为
+        补偿的实现细节(可选),持久化是事实来源(source of truth)。
+
+        Saga 补偿模式:
+        - 持久化补偿意图(event_id / action_id / effect_type / target /
+          request_hash / payload_digest / error_msg)到 audit_log,
+          kind='compensation' 标记。
+        - worker 重启后 reconcile 流程扫描 audit_log kind='compensation'
+          未完成记录,调用注册的 compensation callback 重放补偿。
+        - compensation callback 可选(``self.compensation_registry``);
+          若未注册则仅持久化,reconcile 流程后续按需注册 callback 重放。
+
+        Args:
+            ev: claim_outbox_events 返回的事件 dict
+            store: CacheStore
+            error_msg: 补偿触发原因(如 provider_failed_over_limit)
+        """
+        event_id = ev.get("id", 0)
+        action_id = ev.get("action_id", "") or ""
+        effect_type = ev.get("effect_type", "") or ""
+        target = ev.get("target", "") or ""
+        request_hash = ev.get("request_hash", "") or ""
+        payload_json = ev.get("payload_json", "") or ""
+        try:
+            payload_digest = hashlib.sha256(
+                (payload_json or "").encode("utf-8", errors="replace")
+            ).hexdigest()
+        except Exception:
+            payload_digest = ""
+        # 写入 audit_log(kind='compensation')作为持久化补偿意图
+        # audit_log 表结构: (id, actor_id, action, target_type, target_id,
+        #   details_json, created_at)
+        # kind 字段放在 details_json 中(audit_log 表无独立 kind 列)
+        details = {
+            "event_id": event_id,
+            "action_id": action_id,
+            "effect_type": effect_type,
+            "target": target,
+            "request_hash": request_hash,
+            "payload_digest": payload_digest,
+            "error_msg": (error_msg or "")[:500],
+            "kind": "compensation",
+            "lease_owner": self.lease_owner,
+            "status": "pending_compensation",
+        }
+        try:
+            await _write_audit_log(
+                actor_id=0,
+                action="outbox_compensation_persisted",
+                target_type="outbox_event",
+                target_id=str(event_id),
+                details=details,
+            )
+        except Exception as e:
+            # 补偿持久化失败不阻塞 DLQ 流程(已 move_outbox_to_dlq),
+            # 但必须 logger.error 告警(运维需感知补偿意图未持久化)
+            logger.error(
+                _i18n_t(
+                    "diagnostics.r65.outbox_worker.compensation_failed",
+                    event_id=event_id,
+                    action_id=action_id,
+                    error=e,
+                )
+            )
 
 
 async def export_user_data(user_id: int) -> dict:

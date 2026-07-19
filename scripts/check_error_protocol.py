@@ -119,6 +119,13 @@ BANNED_RAISE_EXCEPTIONS: frozenset[str] = frozenset({
 # Rule 4: 模块边界函数返回裸字符串的最小长度(过滤短字符串,减少误报)
 MIN_BARE_STRING_LEN = 5
 
+# R65 P1-04: logger 方法名集合(用于 Rule 3 判断 except 块内是否已有日志调用)
+# 包含 loguru / logging 标准库的常用方法名
+LOGGER_METHODS: frozenset[str] = frozenset({
+    "debug", "info", "warning", "warn", "error", "exception",
+    "critical", "fatal", "log", "trace",
+})
+
 
 # ════════════════════════════════════════════════════════════
 # 路径工具函数
@@ -416,13 +423,26 @@ def scan_file(path: Path) -> list[tuple[int, str]]:
             ))
 
     # ── Rule 3: 检查 except 块中的 bare return 0 / return False ──
+    # R65 P1-04 增强:若 except 块内已含 logger 调用(logger.error/warning/exception 等),
+    # 则 return False 不视为"吞掉错误"(已有日志记录,满足"log or reraise"语义)。
+    # 仅当 except 块内无任何 logger 调用且直接 return 0/False 时才判违规。
     for node in ast.walk(tree):
         if not isinstance(node, ast.ExceptHandler):
             continue
+        # 检查 except 块内是否含 logger 调用(属性调用,func 为 Attribute 且 attr 在 LOGGER_METHODS 中)
+        has_logger_call = False
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+                if sub.func.attr in LOGGER_METHODS:
+                    has_logger_call = True
+                    break
         for stmt in node.body:
             # 直接 return 0 / return False
             if isinstance(stmt, ast.Return) and stmt.value is not None:
                 if _is_bare_zero_or_false(stmt.value):
+                    if has_logger_call:
+                        # 已有 logger 调用,return False 满足"log or reraise"语义,不判违规
+                        continue
                     findings.append((
                         stmt.lineno,
                         "P1-5 规则3: except 块中 return 0/False "
@@ -1076,13 +1096,18 @@ def _build_allowlist_entry(
 def main() -> int:
     """脚本入口。返回退出码。"""
     parser = argparse.ArgumentParser(
-        description="R56 P1-5 + R62 P1-04: 错误协议 AST 静态扫描门禁",
+        description="R56 P1-5 + R62 P1-04 + R65 P1-04: 错误协议 AST 静态扫描门禁",
     )
+    # R65 P1-04: 默认 strict 模式 — observability allowlist 已清空(175 → 0),
+    # 不再容忍任何未 allowlist 违规。历史 baseline ratchet 模式仅作向后兼容保留,
+    # 通过 --no-strict 切换(仅在生成新 baseline 时使用)。
     parser.add_argument(
         "--strict",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "严格模式:任何未在 allowlist 中的违规即 exit 1。"
+            "R65 P1-04 默认启用 strict 模式:任何未在 allowlist 中的违规即 exit 1。"
+            "使用 --no-strict 切换到 baseline ratchet 模式(仅用于历史 baseline 兼容)。"
             "未显式指定 --baseline 时使用 scripts/error_protocol_baseline.json"
         ),
     )

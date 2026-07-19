@@ -540,13 +540,25 @@ class TestP1_10_RealBaselineIntegration:
     """R63 P1-10: 真实 baseline 集成验证(AST 指纹 + 按模块分类)。"""
 
     def test_real_baseline_uses_ast_fingerprints(self):
-        """真实 baseline 所有条目指纹为 64 字符 sha256,且 expiry=2026-08-18。"""
+        """真实 baseline 所有条目指纹为 64 字符 sha256,且 expiry=2026-08-18。
+
+        R65 P1-04: observability allowlist 已清空(175 → 0),所有违规已修复。
+        allowlist 为空时,本测试验证空状态合规(无条目需校验)。
+        """
         if not REAL_BASELINE.exists():
             pytest.skip(f"真实 baseline 不存在: {REAL_BASELINE}")
 
         data = json.loads(REAL_BASELINE.read_text(encoding="utf-8"))
         allowlist = data.get("domains", {}).get("observability", {}).get("allowlist", [])
-        assert len(allowlist) > 0, "allowlist 不应为空"
+
+        # R65 P1-04: allowlist 已清空(175 → 0) — 空状态为合规终态
+        if len(allowlist) == 0:
+            # 验证 violation_count 也为 0(allowlist 与 violation_count 应一致)
+            assert data.get("violation_count", -1) == 0, (
+                "R65 P1-04: allowlist 为空时 violation_count 应为 0,"
+                f"实际: {data.get('violation_count')}"
+            )
+            return
 
         for i, entry in enumerate(allowlist):
             fp = entry.get("fingerprint", "")
@@ -563,13 +575,24 @@ class TestP1_10_RealBaselineIntegration:
             )
 
     def test_real_baseline_has_per_module_categorization(self):
-        """真实 baseline allowlist 条目按模块分类(ticket 字段非统一值)。"""
+        """真实 baseline allowlist 条目按模块分类(ticket 字段非统一值)。
+
+        R65 P1-04: observability allowlist 已清空(175 → 0),所有违规已修复。
+        allowlist 为空时,本测试验证空状态合规(无条目需分类)。
+        """
         if not REAL_BASELINE.exists():
             pytest.skip(f"真实 baseline 不存在: {REAL_BASELINE}")
 
         data = json.loads(REAL_BASELINE.read_text(encoding="utf-8"))
         allowlist = data.get("domains", {}).get("observability", {}).get("allowlist", [])
-        assert len(allowlist) > 0
+
+        # R65 P1-04: allowlist 已清空(175 → 0) — 空状态为合规终态
+        if len(allowlist) == 0:
+            assert data.get("violation_count", -1) == 0, (
+                "R65 P1-04: allowlist 为空时 violation_count 应为 0,"
+                f"实际: {data.get('violation_count')}"
+            )
+            return
 
         tickets = set()
         for entry in allowlist:
@@ -597,13 +620,28 @@ class TestP1_10_RealBaselineIntegration:
         )
 
     def test_real_baseline_passes_strict_check(self):
-        """真实 baseline 通过 strict 检查(所有违规已 allowlist 且未过期)。"""
+        """真实 baseline 通过 strict 检查(所有违规已 allowlist 且未过期)。
+
+        R65 P1-04: observability allowlist 已清空(175 → 0),所有违规已修复。
+        findings 为空时(全部修复),strict 检查平凡通过(real_violations=0)。
+        """
         if not REAL_BASELINE.exists():
             pytest.skip(f"真实 baseline 不存在: {REAL_BASELINE}")
 
         _clear_ast_cache()
         findings = scanner.collect_findings()
-        assert findings, "scanner 应能找到违规(否则测试无意义)"
+
+        # R65 P1-04: 所有违规已修复,findings 为空 — strict 检查平凡通过
+        if not findings:
+            passed, msg, summary = scanner._check_domain_baseline(
+                findings, REAL_BASELINE, strict=True,
+            )
+            assert passed, (
+                f"R65 P1-04: findings 为空时 strict 检查应平凡通过: {msg}"
+            )
+            assert summary["real_violations"] == 0
+            assert summary["expired_entries"] == 0
+            return
 
         passed, msg, summary = scanner._check_domain_baseline(
             findings, REAL_BASELINE, strict=True,

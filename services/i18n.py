@@ -137,6 +137,108 @@ def _get_icu_strict_mode() -> bool:
     return False
 
 
+# ── R65 P1-03: i18n 严格出口边界 fail-closed ───────────────────
+
+
+# R65 P1-03: 模块级 cache,避免每次 translate 调用都重新读取环境变量
+# (translate 是热路径,每条用户消息都会调用)。环境变量在进程启动后基本不变,
+# 仅测试场景会通过 monkeypatchenv 主动切换,因此使用 _reset_i18n_fallback_cache()
+# 在 fixture setup/teardown 时显式重置。
+_i18n_allow_fallback_cache: Optional[bool] = None
+
+
+def _reset_i18n_fallback_cache() -> None:
+    """R65 P1-03: 重置 fallback 模式缓存(测试 fixture 调用)。
+
+    测试场景需要在不同用例间切换 I18N_ALLOW_FALLBACK / ENVIRONMENT,
+    调用此函数清空缓存,使下次 _get_i18n_allow_fallback() 重新读取环境。
+    """
+    global _i18n_allow_fallback_cache
+    _i18n_allow_fallback_cache = None
+
+
+def _get_i18n_allow_fallback() -> bool:
+    """R65 P1-03: 检测是否允许 i18n locale fallback(测试逃生舱)。
+
+    严格 fail-closed 模式判定(优先级从高到低):
+        1. ``RELEASE_BUILD=1/true/yes/on`` → 严格模式(release 构建强制 fail-closed)
+        2. ``I18N_ALLOW_FALLBACK`` 环境变量:
+           - 显式 ``1/true/yes/on`` → 允许 fallback(测试逃生舱)
+           - 显式 ``0/false/no/off`` → 严格 fail-closed
+        3. ``config.settings.ENVIRONMENT in ("production", "staging")`` → 默认严格
+        4. 其他环境(development/test) → 默认允许 fallback(向后兼容)
+
+    严格 fail-closed 含义:
+        - ``translate()`` / ``format_message()`` / ``format_message_icu()``
+          在 locale 为 None/empty 时抛 ``AppError(I18N_LOCALE_NOT_BOUND)``(不静默 fallback)
+        - ``format_message_icu()`` 运行时 ICU 解析失败抛
+          ``AppError(I18N_PARSE_FAILED)``(不向用户暴露原始 ICU 大括号)
+
+    Returns:
+        True=允许 fallback(向后兼容旧行为);False=严格 fail-closed(强制 locale 绑定)
+    """
+    global _i18n_allow_fallback_cache
+    if _i18n_allow_fallback_cache is not None:
+        return _i18n_allow_fallback_cache
+    import os
+    # 1. release 构建强制严格(任何缺陷 fail-closed)
+    if _get_release_mode():
+        _i18n_allow_fallback_cache = False
+        return False
+    # 2. I18N_ALLOW_FALLBACK 环境变量(显式覆盖,测试逃生舱)
+    val = os.environ.get("I18N_ALLOW_FALLBACK", "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        _i18n_allow_fallback_cache = True
+        return True
+    if val in ("0", "false", "no", "off"):
+        _i18n_allow_fallback_cache = False
+        return False
+    # 3. production/staging 默认严格 fail-closed
+    env = _get_environment()
+    if env in ("production", "staging"):
+        _i18n_allow_fallback_cache = False
+        return False
+    # 4. development/test 默认允许 fallback(向后兼容)
+    _i18n_allow_fallback_cache = True
+    return True
+
+
+def _raise_locale_not_bound(key: str, caller: str) -> None:
+    """R65 P1-03: locale 未绑定时抛 AppError(I18N_LOCALE_NOT_BOUND)。
+
+    Args:
+        key: 调用的翻译 key(用于诊断,非用户敏感信息)
+        caller: 调用方标识(如 "translate" / "format_message" / "format_message_icu")
+    """
+    from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+    raise AppError(
+        ErrorCodes.I18N_LOCALE_NOT_BOUND,
+        params={
+            "key": key or "",
+            "caller": caller,
+        },
+    )
+
+
+def _raise_icu_parse_failed(key: str, locale: str, reason: str) -> None:
+    """R65 P1-03: ICU 运行时解析失败时抛 AppError(I18N_PARSE_FAILED)。
+
+    Args:
+        key: 调用的翻译 key(用于诊断)
+        locale: 目标 locale(用于诊断)
+        reason: 失败原因(异常类型 + 消息)
+    """
+    from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
+    raise AppError(
+        ErrorCodes.I18N_PARSE_FAILED,
+        params={
+            "key": key or "",
+            "locale": locale or "",
+            "reason": reason,
+        },
+    )
+
+
 def _extract_icu_param_set(text: str) -> set[str]:
     """R63 P1-12: 提取文本中引用的所有参数名(简单 {var} + ICU {var, plural/select/...})。
 
@@ -1023,6 +1125,11 @@ class I18nManager:
         """
         if not key:
             return ""
+        # R65 P1-03: 严格 fail-closed 模式下,生产路径必须显式绑定 locale
+        # (禁止依赖 self.default_locale 兜底,避免 locale 与用户/session 错配)
+        # 测试逃生舱:I18N_ALLOW_FALLBACK=1 或 development 环境保留旧行为
+        if not locale and not _get_i18n_allow_fallback():
+            _raise_locale_not_bound(key, "translate")
         target_locale = locale or self.default_locale
         # 确保目标 locale 已加载
         if target_locale not in self._translations:
@@ -1266,6 +1373,10 @@ class I18nManager:
         Raises:
             AppError: strict 模式下 ICU 编译失败(I18N_ICU_COMPILE_FAILED)
         """
+        # R65 P1-03: 严格 fail-closed 模式下,生产路径必须显式绑定 locale
+        # (format_message_icu 是显式 ICU 格式化接口,调用方必须知道目标 locale)
+        if not locale and not _get_i18n_allow_fallback():
+            _raise_locale_not_bound(key, "format_message_icu")
         target_locale = locale or self.default_locale
         if target_locale not in self._translations:
             if not self.load_locale(target_locale):
@@ -1347,6 +1458,15 @@ class I18nManager:
         try:
             return _icu_format(text, target_locale, kwargs)
         except Exception as e:
+            # R65 P1-03: 严格 fail-closed 模式下,ICU 运行时解析失败必须抛
+            # AppError(I18N_PARSE_FAILED)(禁止向用户暴露原始 ICU 大括号)
+            # 覆盖所有生产路径(staging/production/release/strict);
+            # 测试逃生舱 I18N_ALLOW_FALLBACK=1 保留旧的 fallback 行为(向后兼容)
+            if not _get_i18n_allow_fallback():
+                _raise_icu_parse_failed(
+                    key, target_locale,
+                    f"runtime_parse: {type(e).__name__}: {e}",
+                )
             env = _get_environment()
             if env in ("test", "staging") or _get_release_mode() or _get_icu_strict_mode():
                 from services.error_codes import AppError, ErrorCodes  # type: ignore[import]
@@ -1498,6 +1618,10 @@ class I18nManager:
         Returns:
             格式化后的字符串(占位符已替换);缺失 key 时返回安全通用文案
         """
+        # R65 P1-03: 严格 fail-closed 模式下,生产路径必须显式绑定 locale
+        # (format_message 是显式格式化接口,调用方必须知道目标 locale)
+        if not locale and not _get_i18n_allow_fallback():
+            _raise_locale_not_bound(key, "format_message")
         # R42 P1-8: 若 locale 不存在(文件未加载且加载失败),直接 fallback 到 en-US
         target_locale = locale or self.default_locale
         if target_locale not in self._translations:
@@ -1932,8 +2056,28 @@ def translate(key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
     return manager.translate(key, locale=locale, **kwargs)
 
 
-# Local alias for migrated strings within this module (avoids circular import)
-_i18n_t = translate
+# R65 P1-03: 模块内部 i18n 调用辅助函数(默认 locale=_DEFAULT_LOCALE)。
+# i18n.py 模块内部的日志/格式化文案调用(如 logger.error(_i18n_t(...)))默认使用
+# _DEFAULT_LOCALE,避免在严格 fail-closed 模式下因 locale=None 触发
+# I18N_LOCALE_NOT_BOUND(模块内部文案不属于用户面出口,无需绑定 user/session locale)。
+# 旧实现 ``_i18n_t = translate`` 在严格模式下会破坏 logger 调用,故改为显式函数。
+# 兼容性:保留 locale 参数(部分内部调用显式传入 locale,如 _i18n_t(..., locale=locale)),
+# 避免与 kwargs 中的 locale 键冲突。
+def _i18n_t(key: str, locale: Optional[str] = None, **kwargs: Any) -> str:
+    """R65 P1-03: 模块内部 i18n 调用辅助(默认 locale=_DEFAULT_LOCALE)。
+
+    语义与 ``translate(key, locale=locale or _DEFAULT_LOCALE, **kwargs)`` 等价,
+    专用于 i18n.py 模块内部的日志/格式化文案(非用户面出口)。
+
+    Args:
+        key: 翻译 key
+        locale: 可选 locale(默认 _DEFAULT_LOCALE,避免严格模式 fail-closed)
+        **kwargs: 插值参数
+
+    Returns:
+        翻译后的字符串
+    """
+    return translate(key, locale=locale or _DEFAULT_LOCALE, **kwargs)
 
 
 # ── R42 P1-8: i18n 完整接入 — 错误响应结构 / 用户 locale 写入 /

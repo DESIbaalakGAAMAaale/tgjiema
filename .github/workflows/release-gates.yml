@@ -67,6 +67,9 @@ name: Release Gates
 on:
   push:
     branches: [master, main]
+    # R65 P0-04: release tag (v*.*.*) 触发 production-promotion-gate,
+    # 强制要求真实、签名、未过期、5 类齐全的 production 证据才能晋级
+    tags: ['v*.*.*']
   pull_request:
     branches: [master, main]
 
@@ -289,6 +292,123 @@ jobs:
           echo "schema check placeholder"
           echo "WARN: scripts/check_schema.py 不存在,跳过 schema 校验"
         fi
+
+  # ─── 5b. restore-legacy-seal-gate (R65 P0-07 / P1-07) ───────
+  # capability-seal 静态门禁 — 阻止生产代码直接调用旧 restore writer
+  # (_restore_from_backup_data / _restore_crdb_tables /
+  # _restore_sqlite_tables_to_db / run_restore)。生产恢复必须改走
+  # RestoreOrchestrator 蓝绿切换路径(staging → active,禁止原地覆盖)。
+  # 默认模式与 ci.yml Scanner 11 一致;--strict 模式留作未来全量迁移后启用。
+  restore-legacy-seal-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Restore legacy writer capability-seal gate
+      run: python scripts/check_restore_no_legacy_writer.py
+
+  # ─── 5c. i18n-strict-export-boundary-gate (R65 P1-03) ────────
+  # i18n 严格出口边界 7 维门禁 — 与 ci.yml i18n-check job 中的 gate 一致,
+  # 在 release pipeline 中作为独立 required job 重新执行,确保 release artifact
+  # 不引入新的 i18n 出口边界违规。
+  # 校验维度:
+  #   1. zh-CN ↔ en-US key 集合对等(无孤儿 key)
+  #   2. ICU AST 结构等价(selector 集合 + 占位符数量/类型一致)
+  #   3. 参数名一致(`{count}` 不能变成 `{n}`)
+  #   4. en-US 禁止 CJK 占位副本(防止混合语言)
+  #   5. zh-CN 禁止英文业务文案泄漏(技术术语白名单)
+  #   6. 内部异常禁止经 UserMessage/ErrorEnvelope 泄漏(AST 扫描生产代码)
+  #   7. 生产代码 translate/format_message/format_message_icu 必须显式绑定 locale
+  # baseline ratchet 模式:结构性(dims 1-3)+ AST(dims 6-7)硬违规必须 0,
+  #                       文案违规(dims 4-5)允许 baseline 渐进式清零。
+  i18n-strict-export-boundary-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # check_i18n_strict_export_boundary.py 需 import services.error_codes(依赖 loguru)
+        pip install -r requirements.txt
+        pip install pyyaml
+
+    - name: i18n strict export boundary gate (R65 P1-03, 7-dim strict)
+      run: python scripts/check_i18n_strict_export_boundary.py --strict
+
+  # ─── 5d. migration-manifest-gate (R65 P1-08) ────────────────
+  # migration manifest 001-007 完整性 + 签名绑定严格校验。
+  # R65 P1-08: 005/006/007 新增迁移必须纳入签名 release manifest,本 gate
+  # 在 release pipeline 中作为独立 required job 严格校验:
+  #   1. 001-007 全集合存在(migration_id 不漏项)
+  #   2. predecessor 链完整(001 ← 002 ← ... ← 007)
+  #   3. 每个 SQL 文件 SHA-256 与 manifest 一致(fail-closed on tampering)
+  #   4. ddl_version 单调非递减(允许同值,不允许下降)
+  #   5. rollback_strategy 非空(每个 migration 必须有回滚策略)
+  #   6. manifest 已签名(或属于 release-manifest.json 一部分)
+  #      — 本地无签名文件时 WARN 不阻断;CI 中 sign-image job 已签名,
+  #        通过 cosign verify-blob 验证,本 gate 报告签名状态。
+  # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
+  migration-manifest-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Migration manifest strict gate (R65 P1-08)
+      run: python scripts/check_migration_manifest.py --strict
+
+  # ─── 5e. button-flow-real-ux-gate (R65 P1-11) ──────────────
+  # 按钮式流程真实 UX 落地门禁 — 与 ci.yml static-gates Scanner 12 一致,
+  # 在 release pipeline 中作为独立 required job 重新执行,确保 release artifact
+  # 不引入新的按钮 UX 违规。
+  # 审计 P1-11: 按钮式流程要从 policy 表落到真实 UX。ButtonUXSpec 需要在真实
+  # Telegram/Web handler 上验证:目标、影响、不可逆性、审批状态、MFA 状态、
+  # resource version、确认、取消、过期恢复、重试和返回按钮均真实渲染;
+  # 不能只检查 sidecar metadata。
+  # 5 条规则(strict 默认,任何违规 exit 1):
+  #   Rule E: 真实 handler 存在(HIGH_RISK_POLICY action 在 inventory 中有高风险 handler;
+  #           policy-only action 如 purge_data/assign_role/rotate_keys 跳过)
+  #   Rule F: handler 渲染实际按钮(Telegram: InlineKeyboardButton + callback_data,
+  #           含 sibling .py 扫描;Web: RedirectResponse / HTMLResponse)
+  #   Rule G: 5 生命周期路径(confirm/cancel/expire/retry/return)全部通过
+  #           services.button_flow_lifecycle.verify_all_lifecycle_paths
+  #   Rule H: 双语翻译(zh-CN + en-US)在 locales/{locale}.json 中存在
+  #   Rule I: UserMessage.from_* + locale 绑定(Telegram);仅 locale 绑定(Web)
+  # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
+  button-flow-real-ux-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # check_button_flow_real_ux.py 需 import services.button_flow_lifecycle(依赖 loguru / aiosqlite)
+        pip install -r requirements.txt
+        pip install pyyaml
+
+    - name: Button flow real UX gate (R65 P1-11, strict 5-rule enforcement)
+      run: python scripts/check_button_flow_real_ux.py --strict
 
   # ─── 6. backup-restore-drill ────────────────────────────────
   # 跑 backup 恢复演练测试(由其他 agent 创建)
@@ -557,18 +677,19 @@ jobs:
         echo "=== R58 P0-1: 签名 Verification Statement ==="
         echo "R64 P0-01: EXPECTED_IDENTITY (pinned to ref, used for verify): ${EXPECTED_IDENTITY}"
         echo "R63 P0-01: EXTRACTED_IDENTITY (from Fulcio cert, defense in depth): ${EXTRACTED_IDENTITY}"
-        # --output-verification 需要文件路径, cosign 会写入 verification record
-        # R62 P0-03 / R63 P0-01 / R64 P0-01: fail-fast — cosign verify 失败立即 exit 1,
+        # R65 P0-01: cosign v2.2.3 无 --output-verification flag (旧 R64 实现错误)。
+        #            cosign verify 默认输出 JSON 数组到 stdout, 用 stdout 重定向写入 statement.json。
+        # R62 P0-03 / R63 P0-01 / R64 P0-01 / R65 P0-01: fail-fast — cosign verify 失败立即 exit 1,
         #                       不允许 continue-on-error;后续步骤依赖此 statement
         cosign verify \
           --certificate-identity "${EXPECTED_IDENTITY}" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-          --output-verification statement.json \
-          "${IMAGE_REF}" || {
+          "${IMAGE_REF}" > statement.json || {
             echo "FAIL: cosign verify 失败,签名无效"
             echo "  EXPECTED_IDENTITY (pinned, used for verify): ${EXPECTED_IDENTITY}"
             echo "  EXTRACTED_IDENTITY (from cert, defense in depth): ${EXTRACTED_IDENTITY}"
             echo "  expected issuer: https://token.actions.githubusercontent.com"
+            rm -f statement.json
             exit 1
           }
         echo "Verification statement 已生成:"
@@ -1031,267 +1152,12 @@ jobs:
     - name: Verify branch protection is configured
       env:
         GH_TOKEN: ${{ secrets.BP_PAT_TOKEN }}
-      run: |
-        # R47/R48 P0-2: 严格断言所有 Branch Protection 属性,任何失败必须阻断
-        set -euo pipefail
-
-        # R53: GitHub Actions check-run 的 name 字段就是 job 名(无 "CI /" 前缀),
-        # 不是 "{workflow_name} / {job_name}"。原 REQUIRED_PREFIXES=("CI /" ...)
-        # 永远匹配不到实际 context(如 "test (3.11)"),导致 Assert B 永远失败。
-        # 改为按 workflow 分组列出代表 job,检查 BP 至少包含每组中一个 job。
-        # 格式: "workflow_name|job1,job2,job3"
-        # R64 P0-01 / P1-11: Release Gates 列表必须与 workflow 实际 job 名完全一致
-        # (14 个 job:docker-build/docker-digest-verify/compose-config/redis-acl-matrix/
-        #  schema-diff/backup-restore-drill/sbom/pip-audit/trivy/sign-image/
-        #  verify-branch-protection/rc-continuity/publish-attestation/release-summary);
-        # CI 列表必须包含 repo-hygiene(R64 P1-11 required context)。
-        WORKFLOW_JOBS=(
-          "CI|test (3.10),test (3.11),test (3.12),lint,repo-hygiene,i18n-check,static-gates,security,fault-injection,migration-dry-run"
-          "Deploy Check|verify-deploy"
-          "Release Gates|docker-build,docker-digest-verify,compose-config,redis-acl-matrix,schema-diff,backup-restore-drill,sbom,pip-audit,trivy,sign-image,verify-branch-protection,rc-continuity,publish-attestation,release-summary"
-          "E2E Tests|playwright-e2e"
-        )
-
-        # 工具函数:任意失败时输出完整诊断后退出
-        # 用法: fail_diag "错误消息"
-        fail_diag() {
-          local msg="$1"
-          echo "::error::${msg}"
-          echo ""
-          echo "================ 诊断信息 ================"
-          echo ""
-          echo "----- 当前 Branch Protection 配置(BP JSON)-----"
-          if [ -n "${BP_JSON:-}" ]; then
-            echo "$BP_JSON" | jq '.' 2>/dev/null || echo "$BP_JSON"
-          else
-            echo "(未获取到 BP_JSON)"
-          fi
-          echo ""
-          echo "----- 最新 master commit 的实际 check-runs 名称 -----"
-          if [ -n "${ACTUAL_CONTEXTS_JSON:-}" ]; then
-            echo "$ACTUAL_CONTEXTS_JSON" | jq '.' 2>/dev/null || echo "$ACTUAL_CONTEXTS_JSON"
-          else
-            echo "(未获取到 check-runs)"
-          fi
-          echo ""
-          echo "----- BP contexts vs 实际 check-runs 差异 -----"
-          if [ -n "${DIFF_JSON:-}" ]; then
-            echo "$DIFF_JSON" | jq '.' 2>/dev/null || echo "$DIFF_JSON"
-          else
-            echo "(未生成差异)"
-          fi
-          echo ""
-          echo "================ 修复建议 ================"
-          echo "1. 自动检测当前实际 check-runs 并配置 BP:"
-          echo "     bash scripts/detect_branch_protection_contexts.sh > contexts.json"
-          echo "     bash scripts/configure_branch_protection.sh"
-          echo "2. 或手动指定 contexts(JSON 数组):"
-          echo "     CONTEXTS_JSON='[\"CI / test (3.11)\",\"Deploy Check / verify-deploy\",\\"
-          echo "                     \"Release Gates / verify-branch-protection\",\\"
-          echo "                     \"E2E Tests / playwright-e2e\"]' \\"
-          echo "       bash scripts/configure_branch_protection.sh"
-          echo "3. 注意:context 名称格式为 '{workflow_name} / {job_name}',"
-          echo "   矩阵 job 还会带 ' ({matrix_label})' 后缀。"
-          echo "   需先在 master 分支触发过相关 workflow 才能检测到 check-runs。"
-          exit 1
-        }
-
-        # 1. 拉取 branch protection 配置(gh api 失败立即捕获,不吞错误)
-        if ! RESPONSE=$(gh api "repos/${{ github.repository }}/branches/master/protection" 2>&1); then
-          echo "::error::无法获取 branch protection 配置(可能未配置或 token 权限不足)"
-          echo "::error::gh api 输出: $RESPONSE"
-          echo ""
-          echo "Branch Protection 未正确配置,请运行:"
-          echo "  bash scripts/detect_branch_protection_contexts.sh > contexts.json"
-          echo "  bash scripts/configure_branch_protection.sh"
-          exit 1
-        fi
-
-        # 2. 检查是否未配置(Branch not protected 错误响应)
-        if echo "$RESPONSE" | grep -q "Branch not protected"; then
-          echo "::error::Branch protection 未配置"
-          echo ""
-          echo "请运行:"
-          echo "  bash scripts/detect_branch_protection_contexts.sh > contexts.json"
-          echo "  bash scripts/configure_branch_protection.sh"
-          exit 1
-        fi
-
-        BP_JSON="$RESPONSE"
-
-        # 3. 输出当前 BP 配置供调试
-        echo "=== 当前 Branch Protection 配置 ==="
-        echo "$BP_JSON" | jq '.'
-        echo "==================================="
-
-        # 4. R47 P0-2: 严格断言所有必需属性
-        # 4.1 strict=true (status check 必须针对最新提交)
-        echo "Assert: required_status_checks.strict == true"
-        echo "$BP_JSON" | jq -e '.required_status_checks.strict == true' > /dev/null \
-          || fail_diag "required_status_checks.strict != true"
-
-        # 4.2 enforce_admins=true (管理员也受规则约束)
-        echo "Assert: enforce_admins.enabled == true"
-        echo "$BP_JSON" | jq -e '.enforce_admins.enabled == true' > /dev/null \
-          || fail_diag "enforce_admins.enabled != true"
-
-        # 4.3 至少 1 个 approving review (R47 P0-2: 必须 >= 1)
-        echo "Assert: required_approving_review_count >= 1"
-        echo "$BP_JSON" | jq -e '.required_pull_request_reviews.required_approving_review_count >= 1' > /dev/null \
-          || fail_diag "required_approving_review_count < 1"
-
-        # 4.4 allow_force_pushes=false (禁止 force push)
-        echo "Assert: allow_force_pushes.enabled == false"
-        echo "$BP_JSON" | jq -e '.allow_force_pushes.enabled == false' > /dev/null \
-          || fail_diag "allow_force_pushes.enabled != false"
-
-        # 4.5 allow_deletions=false (禁止删除分支)
-        echo "Assert: allow_deletions.enabled == false"
-        echo "$BP_JSON" | jq -e '.allow_deletions.enabled == false' > /dev/null \
-          || fail_diag "allow_deletions.enabled != false"
-
-        # ════════════════════════════════════════════════════════════════
-        # 5. R48 P0-2: 动态读取实际 check-runs,与 BP contexts 比对
-        # ════════════════════════════════════════════════════════════════
-
-        # 5.1 获取最新 master commit SHA(注意:此处用 github.repository 上下文)
-        echo ""
-        echo "=== R48 P0-2: 动态读取实际 check-runs ==="
-        LATEST_SHA=$(gh api "repos/${{ github.repository }}/commits/master" --jq '.sha')
-        if [ -z "$LATEST_SHA" ] || [ "$LATEST_SHA" = "null" ]; then
-          fail_diag "无法获取 master 最新 commit SHA"
-        fi
-        echo "最新 master commit: ${LATEST_SHA}"
-
-        # 5.2 拉取该 commit 的 check-runs
-        #     R56 P0-1 修复:check-runs 可能尚未创建(4 个 workflow 同时启动时
-        #     时序竞争),添加 retry/wait 逻辑(最多等待 5 分钟)
-        CHECK_RUNS_JSON=""
-        CHECK_RUNS_TOTAL=0
-        MAX_ATTEMPTS=30
-        SLEEP_SECONDS=10
-        ATTEMPT=0
-        while [ "${ATTEMPT}" -lt "${MAX_ATTEMPTS}" ]; do
-          ATTEMPT=$((ATTEMPT + 1))
-          echo "拉取 check-runs(尝试 ${ATTEMPT}/${MAX_ATTEMPTS})..."
-          CHECK_RUNS_JSON=$(gh api "repos/${{ github.repository }}/commits/${LATEST_SHA}/check-runs")
-          CHECK_RUNS_TOTAL=$(echo "$CHECK_RUNS_JSON" | jq -r '.total_count // 0')
-          echo "check-runs 总数: ${CHECK_RUNS_TOTAL}"
-          if [ "${CHECK_RUNS_TOTAL}" -gt 0 ]; then
-            break
-          fi
-          echo "  check-runs 尚未创建,等待 ${SLEEP_SECONDS}s 后重试..."
-          sleep "${SLEEP_SECONDS}"
-        done
-
-        if [ "$CHECK_RUNS_TOTAL" -eq 0 ]; then
-          fail_diag "等待 $((MAX_ATTEMPTS * SLEEP_SECONDS))s 后仍无 check-runs,可能 BP 配置错误或 workflow 未触发"
-        fi
-
-        # 5.3 提取实际 check-runs 名称(去重 + 排序,输出 JSON 数组)
-        #     check run 的 name 字段就是 BP 中的 context 名称
-        ACTUAL_CONTEXTS_JSON=$(echo "$CHECK_RUNS_JSON" \
-          | jq -r '.check_runs[].name' \
-          | sort -u \
-          | jq -R . | jq -s .)
-
-        echo ""
-        echo "----- 实际 check-runs 名称(去重) -----"
-        echo "$ACTUAL_CONTEXTS_JSON" | jq -r '.[]' | sed 's/^/  - /'
-        echo "---------------------------------------"
-
-        # 5.4 提取 BP 中配置的 contexts
-        BP_CONTEXTS_JSON=$(echo "$BP_JSON" \
-          | jq -c '.required_status_checks.contexts // []')
-
-        echo ""
-        echo "----- BP required_status_checks.contexts -----"
-        echo "$BP_CONTEXTS_JSON" | jq -r '.[]' | sed 's/^/  - /'
-        echo "---------------------------------------------"
-
-        # 5.5 R48 P0-2 核心断言 A:BP 中的每个 context 必须在实际 check-runs 中存在
-        #     (允许 BP 是 check-runs 的子集,但 BP 中的 context 不能是凭空捏造的)
-        echo ""
-        echo "Assert A: BP contexts 中每一项都必须在实际 check-runs 中存在"
-        ORPHAN_CONTEXTS=$(jq -n \
-          --argjson bp "$BP_CONTEXTS_JSON" \
-          --argjson actual "$ACTUAL_CONTEXTS_JSON" \
-          '($bp - $actual)')
-        ORPHAN_COUNT=$(echo "$ORPHAN_CONTEXTS" | jq 'length')
-        if [ "$ORPHAN_COUNT" -gt 0 ]; then
-          DIFF_JSON=$(jq -n \
-            --argjson bp "$BP_CONTEXTS_JSON" \
-            --argjson actual "$ACTUAL_CONTEXTS_JSON" \
-            '{bp_contexts: $bp, actual_check_runs: $actual, only_in_bp_orphan: ($bp - $actual), only_in_actual: ($actual - $bp)}')
-          fail_diag "BP 中存在 ${ORPHAN_COUNT} 个 context 在实际 check-runs 中找不到(可能 context 名称错配,如把 'CI / test (3.11)' 误写为 'CI')"
-        fi
-        echo "  ✓ BP contexts 全部在实际 check-runs 中存在"
-
-        # 5.6 R53: 核心断言 B — 四个核心 workflow 各至少有一个代表 job 在 BP contexts 中
-        #     (CI / Deploy Check / Release Gates / E2E Tests)
-        #     原实现用 "CI /" 前缀匹配,但实际 check-run name 就是 job 名(无前缀),
-        #     永远匹配不到。改为直接按 job 名检查。
-        echo ""
-        echo "Assert B: 四个核心 workflow 各至少有一个 job 在 BP contexts 中覆盖"
-        MISSING_COVERAGE=()
-        for entry in "${WORKFLOW_JOBS[@]}"; do
-          workflow="${entry%%|*}"
-          jobs_csv="${entry##*|}"
-          IFS=',' read -ra jobs <<< "$jobs_csv"
-          covered_job=""
-          for job in "${jobs[@]}"; do
-            if echo "$BP_CONTEXTS_JSON" | jq -e --arg j "$job" \
-                  'any(.[]; . == $j)' > /dev/null 2>&1; then
-              covered_job="$job"
-              break
-            fi
-          done
-          if [ -n "$covered_job" ]; then
-            echo "  ✓ ${workflow}: ${covered_job}"
-          else
-            echo "  ✗ ${workflow}: 缺失(候选: ${jobs[*]})"
-            MISSING_COVERAGE+=("$workflow")
-          fi
-        done
-        if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
-          DIFF_JSON=$(jq -n \
-            --argjson bp "$BP_CONTEXTS_JSON" \
-            --argjson actual "$ACTUAL_CONTEXTS_JSON" \
-            --arg missing "${MISSING_COVERAGE[*]}" \
-            '{bp_contexts: $bp, actual_check_runs: $actual, missing_workflows: ($missing | split(" "))}')
-          fail_diag "BP contexts 未覆盖以下 workflow: ${MISSING_COVERAGE[*]}"
-        fi
-
-        # 5.7 R48 P0-2 核心断言 C:BP contexts 集合应与实际 check-runs 集合一致
-        #     (推荐完全一致,避免遗漏任何 job 的状态检查)
-        #     注意:verify-branch-protection 自身在 PR 触发时可能尚未完成,
-        #     因此允许 "Release Gates / verify-branch-protection" 不在 BP 中
-        #     (这是合理的,因为 BP 不能要求自身阻断自己)
-        echo ""
-        echo "Assert C: BP contexts 集合应与实际 check-runs 集合一致"
-        DIFF_JSON=$(jq -n \
-          --argjson bp "$BP_CONTEXTS_JSON" \
-          --argjson actual "$ACTUAL_CONTEXTS_JSON" \
-          '{only_in_bp_orphan: ($bp - $actual),
-            only_in_actual_missing_in_bp: ($actual - $bp)}')
-
-        ONLY_IN_ACTUAL=$(echo "$DIFF_JSON" | jq -c '.only_in_actual_missing_in_bp')
-        ONLY_IN_ACTUAL_COUNT=$(echo "$DIFF_JSON" | jq '.only_in_actual_missing_in_bp | length')
-
-        if [ "$ONLY_IN_ACTUAL_COUNT" -gt 0 ]; then
-          echo "  WARN: 以下实际 check-runs 未在 BP contexts 中(仅警告,不阻断):"
-          echo "$ONLY_IN_ACTUAL" | jq -r '.[]' | sed 's/^/    - /'
-          echo "  这些 job 的失败不会阻断合并。如需启用,请重新运行配置脚本。"
-          echo "  (此为软警告,BP 允许是 check-runs 的子集)"
-        fi
-
-        echo ""
-        echo "✓ Branch protection 验证通过,所有 R47/R48 P0-2 断言均满足"
-        echo "  - 所有 BP 属性(strict / enforce_admins / review>=1 /"
-        echo "    allow_force_pushes=false / allow_deletions=false)正确"
-        echo "  - BP contexts 全部在实际 check-runs 中存在(无错配)"
-        echo "  - 四个核心 workflow 前缀(CI / / Deploy Check / /"
-        echo "    Release Gates / / E2E Tests /)均已覆盖"
+      # R65 fix: 脚本提取到 scripts/verify_branch_protection.sh 以避免
+      # YAML run: 块超过 GitHub Actions 21000 字节限制(中文注释 UTF-8
+      # 编码后字节数显著膨胀,inline 块在 ~21.5KB 时触发 parse error)。
+      # GITHUB_REPOSITORY / GITHUB_EVENT_NAME / GITHUB_REF 由 GitHub Actions
+      # 自动注入,脚本内通过 $GITHUB_REPOSITORY 引用(替代 ${{ github.repository }})。
+      run: bash scripts/verify_branch_protection.sh
 
   # ─── R56 P0-5: RC 连续性真正阻断门禁(重写) ────────────────
   # R56 P0-5 整改要点:
@@ -1568,8 +1434,11 @@ jobs:
   publish-attestation:
     runs-on: ubuntu-latest
     needs: [docker-build, docker-digest-verify, compose-config, redis-acl-matrix,
-            schema-diff, backup-restore-drill, sbom, pip-audit, trivy,
-            verify-branch-protection, rc-continuity, sign-image]
+            schema-diff, restore-legacy-seal-gate, i18n-strict-export-boundary-gate,
+            migration-manifest-gate,
+            backup-restore-drill, sbom, pip-audit, trivy,
+            verify-branch-protection, rc-continuity, sign-image,
+            crdb-ru-72h-attribution-gate]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     permissions:
       contents: read
@@ -1717,15 +1586,16 @@ jobs:
         # R58 P0-1: cosign verify 拒绝未签名 digest
         # 若签名无效或缺失, 拒绝 promote 到 production
         # R62 P0-03 / R63 P0-01: 输出 verification statement 作为 production promote 证据
+        # R65 P0-01: cosign v2.2.3 无 --output-verification flag, 用 stdout 重定向
         cosign verify \
           --certificate-identity "${CERT_IDENTITY}" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-          --output-verification production_verify_statement.json \
-          "${IMAGE_REF}" || {
+          "${IMAGE_REF}" > production_verify_statement.json || {
             echo "FAIL: cosign verify 失败"
             echo "  R58 P0-1: production promote 只提升已验证 digest"
             echo "  R63 P0-01: extracted certificate-identity: ${CERT_IDENTITY}"
             echo "  拒绝 promote 未签名/签名无效的 image_digest 到 production"
+            rm -f production_verify_statement.json
             exit 1
           }
         echo "PASS: image digest 已通过签名验证, 可 promote 到 production"
@@ -1854,6 +1724,96 @@ jobs:
           production_verify_statement.json
         retention-days: 90
 
+  # ─── 13b. crdb-ru-72h-attribution-gate (R65 P1-09) ───────────
+  # R65 P1-09 整改要点:
+  #   审计发现 CRDB RU 仍只有阈值脚本(check_crdb_ru_threshold.py),
+  #   没有 72h 真实账单/metrics,且未按 SQL fingerprint / service / job 归因。
+  #   本 job 作为 required context 强制要求 release 时提供运维签名的真实 72h 数据文件
+  #   (ru_72h_data.json,cosign 或 GPG 签名),并按 6 项门禁阈值校验:
+  #     1. bot role        : 0 RU/day       (FAIL if > 0)
+  #     2. cluster ideal   : ≤ 20 RU/day    (WARN if > 20, FAIL if > 100)
+  #     3. hard cap        : ≤ 100 RU/day   (FAIL if > 100, BLOCK if > 500)
+  #     4. active period    : ≤ 250 RU/DAU/day
+  #     5. monthly         : ≤ 35,000,000 RU
+  #   PR / push 场景:仅运行 --dry-run(无需真实数据文件,验证脚本自洽性);
+  #   release tag 场景:运行 --strict --data ru_72h_data.json
+  #   (要求运维通过 artifact 上传签名的真实数据文件)。
+  #   注意:本 job 必须为 required context,确保未提供真实 72h 数据的 release
+  #   无法合并。数据文件无法在 CI 内合成,必须由生产环境采集后签名上传。
+  crdb-ru-72h-attribution-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio aiosqlite pyyaml
+
+    # 优先尝试下载运维上传的 ru_72h_data.json artifact(由 release manager 在
+    # workflow_dispatch 时上传);若未提供(普通 PR / push 场景),仅运行 dry-run。
+    - name: Download ru_72h_data artifact (if uploaded by release manager)
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: ru-72h-data-${{ github.sha }}
+        path: ./ru-72h-data
+      continue-on-error: true  # PR 场景无 artifact,允许跳过
+
+    - name: CRDB RU 72h attribution gate
+      run: |
+        set -euo pipefail
+        echo "=== R65 P1-09: CRDB RU 72h Attribution Gate ==="
+        # 判断场景:PR / push → dry-run;release tag → strict + real data
+        IS_RELEASE_TAG=false
+        DATA_FILE=""
+        if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          IS_RELEASE_TAG=true
+          echo "  场景: release tag(${GITHUB_REF}),要求严格校验 + 真实 72h 数据"
+        else
+          echo "  场景: PR / push(${GITHUB_REF}),仅 dry-run 校验脚本自洽性"
+        fi
+
+        # 查找运维上传的 ru_72h_data.json artifact
+        if [[ "${IS_RELEASE_TAG}" == "true" ]]; then
+          if [[ -f "./ru-72h-data/ru_72h_data.json" ]]; then
+            DATA_FILE="./ru-72h-data/ru_72h_data.json"
+            echo "  使用 artifact ru_72h_data.json: ${DATA_FILE}"
+          elif [[ -f "./ru_72h_data.json" ]]; then
+            DATA_FILE="./ru_72h_data.json"
+            echo "  使用 workspace ru_72h_data.json: ${DATA_FILE}"
+          else
+            echo "FAIL: release tag 场景要求 ru_72h_data.json artifact"
+            echo "  R65 P1-09: 运维必须通过 workflow_dispatch 上传签名的真实 72h 数据文件"
+            echo "  上传方式: 在 workflow_dispatch 触发时通过 artifact upload 提供"
+            echo "            名称为 ru-72h-data-{sha} 的 artifact"
+            exit 1
+          fi
+        fi
+
+        # 执行校验
+        if [[ "${IS_RELEASE_TAG}" == "true" ]]; then
+          # release tag:严格模式 + 真实数据
+          python scripts/check_crdb_ru_72h_attribution.py \
+            --strict --data "${DATA_FILE}" --json
+        else
+          # PR / push:dry-run 模式
+          python scripts/check_crdb_ru_72h_attribution.py --dry-run
+        fi
+
+    - name: Upload 72h attribution gate result (if data file exists)
+      if: always() && hashFiles('./ru-72h-data/ru_72h_data.json') != ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: ru-72h-attribution-result-${{ github.sha }}
+        path: ./ru-72h-data/
+        retention-days: 90
+
   # ─── 14. production-evidence (R64 P1-12: 生产运行证据框架) ──────
   # R64 P1-12 整改要点:
   #   审计发现生产运行证据缺失:7 天 soak / 3 轮 VPS 恢复 / 真实 provider
@@ -1978,6 +1938,116 @@ jobs:
         retention-days: 90
       if: always()
 
+  # ─── 14b. production-promotion-gate (R65 P0-04: 严格 production 晋级门禁) ──
+  # R65 P0-04 整改要点:
+  #   审计发现 production-evidence job 是 dry-run,且不阻断晋级。即使生成了
+  #   evidence 文件,也仅是 schema/dry-run 校验,不足以证明真实生产证据已采集。
+  #   本 job 作为 release tag (v*.*.*) 上的 strict promotion gate,强制要求:
+  #     1. 证据文件 evidence_mode == "production" (拒绝 dry_run)
+  #     2. 已签名 (cosign 或 GPG signature.verified=true)
+  #     3. 未过期 (每个 artifact expires_at ISO 8601 未到期)
+  #     4. 5 类必需 artifact 齐全:
+  #        SOAK_7DAY / RESTORE_3X / OUTBOX_FAULT_INJECTION / RU_72H / SUPPLY_CHAIN
+  #     5. 每个 artifact 含全部必需字段 (environment_id / commit_sha /
+  #        image_digest / started_at / ended_at / raw_data_digest /
+  #        executed_by / approved_by / signature)
+  #     6. 未使用 --skip 标志 (记录在 evidence file flags.skip)
+  #   本 job 仅在 v*.*.* tag push 时运行;不可跳过,失败立即阻断 release。
+  #   PR / branch push 场景下本 job 为 skipped(不阻断开发流程)。
+  #   注意:production_evidence.json 必须由运维通过 workflow_dispatch 上传签名的
+  #   artifact(production-evidence-{sha}-{run_id}),CI 不自动合成真实证据。
+  production-promotion-gate:
+    runs-on: ubuntu-latest
+    # R65 P0-04: 仅 release tag (v*.*.*) 触发,PR / branch push 自动 skipped
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [production-evidence]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio aiosqlite pyyaml
+
+    # 下载 production-evidence job 上传的 artifact(含 production_evidence_index.json);
+    # 注意:CI 自动生成的是 dry_run 模式,release tag 场景需运维通过单独的
+    # workflow_dispatch 上传 production_evidence.json 真实证据 artifact。
+    - name: Download production-evidence artifact
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: production-evidence-${{ github.sha }}-${{ github.run_id }}
+        path: ./production-evidence
+      continue-on-error: true  # artifact 可能不存在(由运维单独上传真实证据)
+
+    # 运维通过单独 workflow_dispatch 上传的签名的真实 production 证据 artifact
+    - name: Download signed production_evidence.json (uploaded by release manager)
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: signed-production-evidence-${{ github.sha }}
+        path: ./signed-evidence
+      continue-on-error: true  # 若运维未上传,后续步骤会因找不到证据文件而 FAIL
+
+    - name: "R65 P0-04: Verify production promotion evidence (strict, no skip)"
+      run: |
+        set -euo pipefail
+        echo "=== R65 P0-04: Production Promotion Gate (strict) ==="
+        echo "  release tag: ${GITHUB_REF}"
+        echo "  本 job 不可跳过 — 任一校验失败立即阻断 release"
+        echo ""
+        # 定位真实 production 证据文件(运维必须通过 workflow_dispatch 上传)
+        EVIDENCE_FILE=""
+        for candidate in \
+          "./signed-evidence/production_evidence.json" \
+          "./signed-evidence/production_evidence_index.json" \
+          "./production-evidence/production_evidence.json" \
+          "./production_evidence.json" \
+          "./production-evidence/production_evidence_index.json"; do
+          if [ -f "${candidate}" ]; then
+            EVIDENCE_FILE="${candidate}"
+            break
+          fi
+        done
+        if [ -z "${EVIDENCE_FILE}" ]; then
+          echo "FAIL: 未找到 production evidence 文件"
+          echo "  R65 P0-04: release tag 必须提供 production 真实证据 artifact"
+          echo "  运维需通过 workflow_dispatch 上传签名的 production_evidence.json artifact"
+          echo "  (artifact 名称: signed-production-evidence-{sha})"
+          echo "  证据文件需含 5 类 artifact:SOAK_7DAY/RESTORE_3X/OUTBOX_FAULT_INJECTION/RU_72H/SUPPLY_CHAIN"
+          echo "  + 顶层 signature 块(cosign 或 gpg, verified=true)"
+          echo "  + 每个 artifact 含 expires_at(ISO 8601,未过期)"
+          echo "  + flags.skip 为空(未使用 --skip)"
+          exit 1
+        fi
+        echo "校验证据文件: ${EVIDENCE_FILE}"
+        echo ""
+        # 调用 verify_production_promotion — 不可跳过,失败立即 exit 1
+        # 校验项:evidence_mode / signature / expires_at / 5 类 artifact / 字段完整性 / --skip
+        python3 scripts/generate_production_evidence.py \
+          --verify-promotion "${EVIDENCE_FILE}"
+        echo ""
+        echo "PASS: R65 P0-04 production promotion 证据校验通过"
+        # 输出 production_promotion_allowed 标记(供 release-summary 读取)
+        python3 -c "
+        import json
+        with open('${EVIDENCE_FILE}') as f:
+            data = json.load(f)
+        allowed = data.get('production_promotion_allowed', False)
+        print(f'production_promotion_allowed: {allowed}')
+        # 二次断言:必须为 True(verify_production_promotion 通过后已设为 True)
+        assert allowed is True, 'production_promotion_allowed 必须为 True'
+        "
+
   # ─── 15. release-summary (R60 P0-06: 单一聚合 required context) ──────
   # R60 P0-06 整改要点:
   #   审计发现:cosign sign-image 失败后,下游 verification statement / SLSA
@@ -1995,15 +2065,23 @@ jobs:
     runs-on: ubuntu-latest
     if: always()
     needs: [docker-build, docker-digest-verify, compose-config, redis-acl-matrix,
-            schema-diff, backup-restore-drill, sbom, pip-audit, trivy,
+            schema-diff, restore-legacy-seal-gate, i18n-strict-export-boundary-gate,
+            migration-manifest-gate,
+            button-flow-real-ux-gate,
+            backup-restore-drill, sbom, pip-audit, trivy,
             sign-image, verify-branch-protection, rc-continuity, publish-attestation,
-            production-evidence]
+            crdb-ru-72h-attribution-gate, production-evidence,
+            production-promotion-gate]
     env:
       DOCKER_BUILD: ${{ needs.docker-build.result }}
       DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.result }}
       COMPOSE_CONFIG: ${{ needs.compose-config.result }}
       REDIS_ACL_MATRIX: ${{ needs.redis-acl-matrix.result }}
       SCHEMA_DIFF: ${{ needs.schema-diff.result }}
+      RESTORE_LEGACY_SEAL_GATE: ${{ needs.restore-legacy-seal-gate.result }}
+      I18N_STRICT_EXPORT_BOUNDARY_GATE: ${{ needs.i18n-strict-export-boundary-gate.result }}
+      MIGRATION_MANIFEST_GATE: ${{ needs.migration-manifest-gate.result }}
+      BUTTON_FLOW_REAL_UX_GATE: ${{ needs.button-flow-real-ux-gate.result }}
       BACKUP_RESTORE_DRILL: ${{ needs.backup-restore-drill.result }}
       SBOM: ${{ needs.sbom.result }}
       PIP_AUDIT: ${{ needs.pip-audit.result }}
@@ -2012,7 +2090,9 @@ jobs:
       VERIFY_BRANCH_PROTECTION: ${{ needs.verify-branch-protection.result }}
       RC_CONTINUITY: ${{ needs.rc-continuity.result }}
       PUBLISH_ATTESTATION: ${{ needs.publish-attestation.result }}
+      CRDB_RU_72H_ATTRIBUTION_GATE: ${{ needs.crdb-ru-72h-attribution-gate.result }}
       PRODUCTION_EVIDENCE: ${{ needs.production-evidence.result }}
+      PRODUCTION_PROMOTION_GATE: ${{ needs.production-promotion-gate.result }}
     steps:
     - name: Verify all required jobs succeeded
       run: |
@@ -2023,15 +2103,22 @@ jobs:
         # sign-image / publish-attestation 的 if: 仅在 push 到 master/main 时运行,
         # 在 PR 上必然 skipped。若一律要求 success 会让所有 PR 永久失败(过度阻断)。
         # 正确语义:
-        #   - release target(master/main push): 全部 13 个 job 必须 success
+        #   - release target(master/main push): 全部 14 个 job 必须 success
         #     (sign-image/publish-attestation 此时必须运行且成功,这正是 P0-06 要兜的底)
-        #   - PR: 11 个常驻 job 必须 success;sign-image/publish-attestation
+        #   - PR: 12 个常驻 job 必须 success;sign-image/publish-attestation
         #     允许 skipped(其 if: 未满足),但 failure 仍阻断
         RELEASE_TARGET=false
         if [ "${GITHUB_EVENT_NAME}" = "push" ] && { [ "${GITHUB_REF}" = "refs/heads/master" ] || [ "${GITHUB_REF}" = "refs/heads/main" ]; }; then
           RELEASE_TARGET=true
         fi
+        # R65 P0-04: release tag (v*.*.*) 触发 production-promotion-gate,
+        # 必须严格阻断;PR / branch push 场景该 job 为 skipped(允许)
+        RELEASE_TAG=false
+        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          RELEASE_TAG=true
+        fi
         echo "Release target (master/main push): ${RELEASE_TARGET}"
+        echo "Release tag (v*.*.*): ${RELEASE_TAG}"
         FAIL=0
         for entry in \
           "docker-build=${DOCKER_BUILD}" \
@@ -2039,6 +2126,10 @@ jobs:
           "compose-config=${COMPOSE_CONFIG}" \
           "redis-acl-matrix=${REDIS_ACL_MATRIX}" \
           "schema-diff=${SCHEMA_DIFF}" \
+          "restore-legacy-seal-gate=${RESTORE_LEGACY_SEAL_GATE}" \
+          "i18n-strict-export-boundary-gate=${I18N_STRICT_EXPORT_BOUNDARY_GATE}" \
+          "migration-manifest-gate=${MIGRATION_MANIFEST_GATE}" \
+          "button-flow-real-ux-gate=${BUTTON_FLOW_REAL_UX_GATE}" \
           "backup-restore-drill=${BACKUP_RESTORE_DRILL}" \
           "sbom=${SBOM}" \
           "pip-audit=${PIP_AUDIT}" \
@@ -2047,7 +2138,9 @@ jobs:
           "verify-branch-protection=${VERIFY_BRANCH_PROTECTION}" \
           "rc-continuity=${RC_CONTINUITY}" \
           "publish-attestation=${PUBLISH_ATTESTATION}" \
-          "production-evidence=${PRODUCTION_EVIDENCE}"; do
+          "crdb-ru-72h-attribution-gate=${CRDB_RU_72H_ATTRIBUTION_GATE}" \
+          "production-evidence=${PRODUCTION_EVIDENCE}" \
+          "production-promotion-gate=${PRODUCTION_PROMOTION_GATE}"; do
           job="${entry%%=*}"
           conclusion="${entry##*=}"
           echo "  ${job}: ${conclusion}"
@@ -2073,6 +2166,22 @@ jobs:
             if [ "${conclusion}" != "success" ]; then
               echo "::warning::Job '${job}' did not succeed (got: ${conclusion}) — non-blocking (R64 P1-12)"
             fi
+          elif [ "${job}" = "production-promotion-gate" ]; then
+            # R65 P0-04: release tag (v*.*.*) 上的严格 production 晋级门禁
+            # - release tag: 必须 success(失败立即阻断 release)
+            # - PR / branch push: 允许 skipped(本 job 仅在 tag 上运行)
+            if [ "${RELEASE_TAG}" = "true" ]; then
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on release tag (got: ${conclusion})"
+                echo "R65 P0-04: production promotion 证据不足,无法晋级"
+                FAIL=1
+              fi
+            else
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
           else
             # 常驻 job: 任何场景都必须 success
             if [ "${conclusion}" != "success" ]; then
@@ -2087,4 +2196,16 @@ jobs:
           exit 1
         fi
         echo "PASS: All release gate jobs succeeded"
+        # R65 P0-04: 最终汇总报告 production_promotion_allowed 标记
+        # - release tag 且 production-promotion-gate success → true
+        # - 其他场景(PR / branch push / gate 未运行)→ false
+        PRODUCTION_PROMOTION_ALLOWED=false
+        if [ "${RELEASE_TAG}" = "true" ] && [ "${PRODUCTION_PROMOTION_GATE}" = "success" ]; then
+          PRODUCTION_PROMOTION_ALLOWED=true
+        fi
+        echo ""
+        echo "=== R65 P0-04: Production Promotion Summary ==="
+        echo "production_promotion_allowed: ${PRODUCTION_PROMOTION_ALLOWED}"
+        echo "  release_tag: ${RELEASE_TAG}"
+        echo "  production-promotion-gate: ${PRODUCTION_PROMOTION_GATE}"
 

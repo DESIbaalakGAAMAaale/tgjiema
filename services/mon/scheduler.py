@@ -39,7 +39,7 @@ async def _create_replication_task_safe(
             f"[Mon][repl] 创建 replication_task 失败(不影响主流程, "
             f"fuid={file_unique_id}): {e}"
         )
-        return 0
+        return None
 
 
 async def _mark_replication_copying_safe(store, task_id: int) -> bool:
@@ -489,7 +489,7 @@ class MonScheduler:
             missing = await store.get_missing_from_src(group_id, src_channel_id, dst_channel_id)
         except Exception as e:
             logger.warning(f"[Mon][manifest] 查询缺失文件失败 group={group_id} src={src_channel_id} dst={dst_channel_id}: {e}")
-            return 0
+            return None
         if not missing:
             return 0
 
@@ -759,7 +759,7 @@ class MonScheduler:
             tasks = await store.get_copied_unverified_tasks(limit=max_tasks)
         except Exception as e:
             logger.warning(f"[Mon][reconcile] 查询 COPIED_UNVERIFIED 任务失败: {e}")
-            return 0
+            return None
         if not tasks:
             return 0
 

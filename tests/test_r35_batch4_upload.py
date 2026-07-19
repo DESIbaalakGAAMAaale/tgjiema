@@ -515,10 +515,14 @@ class TestUpBotProcessUploadWiring:
         mock_forwarded.message_id = 22001
 
         # Patch 依赖
+        # R65 P1-01: safe_reply_text 已迁移为 typed adapter(经 utils.flood_waiter
+        # 调用 telegram.Message.isinstance),测试环境 telegram 被 mock 会导致
+        # isinstance() 报错,故一并 mock safe_reply_text
         with patch.object(up_bot_module, 'get_cache_store', return_value=real_store), \
              patch.object(up_bot_module, '_get_upload_target_channel', new=AsyncMock(return_value=-1001234567800)), \
              patch.object(up_bot_module, '_check_dedup', new=AsyncMock(return_value=None)), \
              patch.object(up_bot_module, 'safe_copy_message', new=AsyncMock(return_value=mock_forwarded)), \
+             patch.object(up_bot_module, 'safe_reply_text', new=AsyncMock()), \
              patch.object(up_bot_module, '_register_manifest', new=AsyncMock()), \
              patch.object(up_bot_module, '_forward_to_r100', new=AsyncMock()), \
              patch.object(up_bot_module, 'extract_file_meta', return_value={"type": "photo", "file_id": "fid"}), \
@@ -574,6 +578,7 @@ class TestUpBotProcessUploadWiring:
         with patch.object(up_bot_module, 'get_cache_store', return_value=real_store), \
              patch.object(up_bot_module, '_get_upload_target_channel', new=AsyncMock(return_value=-1001234567801)), \
              patch.object(up_bot_module, '_check_dedup', new=AsyncMock(return_value=dedup_result)), \
+             patch.object(up_bot_module, 'safe_reply_text', new=AsyncMock()), \
              patch.object(up_bot_module, '_register_manifest', new=AsyncMock()), \
              patch.object(up_bot_module, '_forward_to_r100', new=AsyncMock()), \
              patch.object(up_bot_module, 'extract_file_meta', return_value={"type": "photo"}), \
@@ -614,6 +619,7 @@ class TestUpBotProcessUploadWiring:
              patch.object(up_bot_module, '_get_upload_target_channel', new=AsyncMock(return_value=-1001234567802)), \
              patch.object(up_bot_module, '_check_dedup', new=AsyncMock(return_value=None)), \
              patch.object(up_bot_module, 'safe_copy_message', new=AsyncMock(side_effect=RuntimeError("Telegram error"))), \
+             patch.object(up_bot_module, 'safe_reply_text', new=AsyncMock()), \
              patch.object(up_bot_module, '_register_manifest', new=AsyncMock()), \
              patch.object(up_bot_module, '_forward_to_r100', new=AsyncMock()), \
              patch.object(up_bot_module, 'extract_file_meta', return_value={"type": "photo"}), \

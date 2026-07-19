@@ -218,14 +218,19 @@ class TestBaselineIntegrity:
     """验证 baseline 文件的完整性和 ratchet 机制。"""
 
     def test_baseline_ratchet_decreased(self):
-        """violation_count 从前值下降(285 → 175),ratchet 只减不增。"""
+        """violation_count 从前值下降(285 → 175 → 0),ratchet 只减不增。
+
+        R65 P1-04: observability allowlist 已清空(175 → 0),所有异常归一到
+        logger.exception / return None,不再依赖 allowlist 容忍存量债务。
+        """
         data = json.loads(REAL_BASELINE.read_text(encoding="utf-8"))
         current = data.get("violation_count", 0)
         previous = data.get("previous_violation_count", 0)
         assert current <= previous, (
             f"ratchet 违规: violation_count={current} > previous={previous}"
         )
-        assert current == 175, f"期望 violation_count=175,实际={current}"
+        # R65 P1-04: observability allowlist 清空,violation_count 降为 0
+        assert current == 0, f"期望 violation_count=0,实际={current}"
 
     def test_baseline_high_risk_domains_zero(self):
         """baseline 中四个高风险域的 baseline_violations 均为 0。"""

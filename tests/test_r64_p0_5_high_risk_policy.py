@@ -186,6 +186,164 @@ class TestHighRiskPolicyTable:
         assert is_high_risk("cancel") is False
         assert is_high_risk("") is False
 
+    # ════════════════════════════════════════════════════════════
+    # R65 P0-05: destructive namespace fail-closed 测试
+    # ════════════════════════════════════════════════════════════
+
+    def test_r65_get_policy_fails_closed_for_unregistered_destructive(self):
+        """R65 P0-05: get_policy 对未注册的 destructive action 抛
+        HIGH_RISK_ACTION_UNREGISTERED(fail-closed)。
+
+        覆盖各种 destructive 关键词:delete/purge/ban/block/takedown/detach/
+        restore/reset/rotate/assign/revoke/grant/enable/disable/wipe/clear/
+        shutdown/restart/factory_reset/break_glass/force_logout 等。
+        """
+        import pytest
+        from services.high_risk_policy import get_policy
+        from services.error_codes import AppError, ErrorCodes
+
+        # 各种未注册但属于 destructive namespace 的 action
+        unregistered_destructive = [
+            "delete_widget",          # delete 关键词
+            "purge_logs",             # purge 关键词
+            "ban_ip",                 # ban 关键词
+            "block_account",          # block 关键词
+            "takedown_user",          # takedown 关键词
+            "detach_relation",        # detach 关键词
+            "restore_snapshot",       # restore 关键词
+            "reset_password",         # reset 关键词
+            "rotate_credentials",     # rotate 关键词
+            "assign_permission",      # assign 关键词
+            "revoke_token",           # revoke 关键词
+            "grant_role",             # grant 关键词
+            "enable_feature",         # enable 关键词
+            "disable_service",        # disable 关键词
+            "wipe_disk",              # wipe 关键词
+            "clear_cache_permanent",  # clear 关键词
+            "shutdown_node",          # shutdown 关键词
+            "restart_service",        # restart 关键词
+            "factory_reset_node",     # factory_reset 关键词
+            "break_glass_mode",       # break_glass 关键词
+            "force_logout_user",      # force_logout 关键词
+            "approve_appeal_x",       # approve_appeal 关键词
+            "reject_appeal_y",        # reject_appeal 关键词
+            "update_config_db",       # update_config 关键词
+            "reload_config_now",      # reload_config 关键词
+            "drop_table_x",           # drop 关键词
+            "truncate_logs",          # truncate 关键词
+            "destroy_evidence",       # destroy 关键词
+            "scrub_data",             # scrub 关键词
+            "kick_user",              # kick 关键词
+            "remove_member",          # remove 关键词
+            "recover_lost",           # recover 关键词
+        ]
+        for action in unregistered_destructive:
+            with pytest.raises(AppError) as exc_info:
+                get_policy(action)
+            assert exc_info.value.code == ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED, (
+                f"action={action} 应抛 HIGH_RISK_ACTION_UNREGISTERED, "
+                f"实际抛出 code={exc_info.value.code}"
+            )
+
+    def test_r65_is_high_risk_fails_closed_for_unregistered_destructive(self):
+        """R65 P0-05: is_high_risk 对未注册的 destructive action 抛
+        HIGH_RISK_ACTION_UNREGISTERED(fail-closed)。"""
+        import pytest
+        from services.high_risk_policy import is_high_risk
+        from services.error_codes import AppError, ErrorCodes
+
+        for action in ("delete_widget", "purge_logs", "ban_ip", "reset_password"):
+            with pytest.raises(AppError) as exc_info:
+                is_high_risk(action)
+            assert exc_info.value.code == ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED
+
+    def test_r65_requires_mfa_fails_closed_for_unregistered_destructive(self):
+        """R65 P0-05: requires_mfa 对未注册的 destructive action fail-closed。"""
+        import pytest
+        from services.high_risk_policy import requires_mfa
+        from services.error_codes import AppError, ErrorCodes
+
+        with pytest.raises(AppError) as exc_info:
+            requires_mfa("delete_widget")
+        assert exc_info.value.code == ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED
+
+    def test_r65_requires_two_person_fails_closed_for_unregistered_destructive(self):
+        """R65 P0-05: requires_two_person 对未注册的 destructive action fail-closed。"""
+        import pytest
+        from services.high_risk_policy import requires_two_person
+        from services.error_codes import AppError, ErrorCodes
+
+        with pytest.raises(AppError) as exc_info:
+            requires_two_person("purge_logs")
+        assert exc_info.value.code == ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED
+
+    def test_r65_requires_resource_version_fails_closed_for_unregistered_destructive(self):
+        """R65 P0-05: requires_resource_version 对未注册的 destructive action fail-closed。"""
+        import pytest
+        from services.high_risk_policy import requires_resource_version
+        from services.error_codes import AppError, ErrorCodes
+
+        with pytest.raises(AppError) as exc_info:
+            requires_resource_version("ban_ip")
+        assert exc_info.value.code == ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED
+
+    def test_r65_get_required_role_fails_closed_for_unregistered_destructive(self):
+        """R65 P0-05: get_required_role 对未注册的 destructive action fail-closed。"""
+        import pytest
+        from services.high_risk_policy import get_required_role
+        from services.error_codes import AppError, ErrorCodes
+
+        with pytest.raises(AppError) as exc_info:
+            get_required_role("reset_password")
+        assert exc_info.value.code == ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED
+
+    def test_r65_get_policy_returns_none_for_safe_actions(self):
+        """R65 P0-05: 非 destructive action 仍返回 None(只读/查询类操作)。"""
+        from services.high_risk_policy import get_policy
+
+        # 各种只读/查询类 action,不应触发 fail-closed
+        safe_actions = [
+            "view", "cancel", "refresh", "list", "get", "query", "read",
+            "search", "ping", "readiness", "health_check", "export_status",
+            "status", "info", "describe", "show", "low_risk_action", "",
+            "get_user", "list_files", "search_posts", "view_settings",
+            "describe_cluster", "show_config",
+        ]
+        for action in safe_actions:
+            assert get_policy(action) is None, (
+                f"action={action} 是非 destructive action,应返回 None"
+            )
+
+    def test_r65_is_high_risk_returns_false_for_safe_actions(self):
+        """R65 P0-05: 非 destructive action 仍返回 False(只读/查询类操作)。"""
+        from services.high_risk_policy import is_high_risk
+
+        for action in ("view", "cancel", "refresh", "list", "get", "query", ""):
+            assert is_high_risk(action) is False, (
+                f"action={action} 是非 destructive action,应返回 False"
+            )
+
+    def test_r65_destructive_keywords_complete(self):
+        """R65 P0-05: DESTRUCTIVE_ACTION_KEYWORDS 覆盖所有预期的关键词。"""
+        from services.high_risk_policy import DESTRUCTIVE_ACTION_KEYWORDS
+
+        expected_keywords = {
+            "delete", "purge", "drop", "truncate", "destroy", "wipe", "clear", "scrub",
+            "ban", "unban", "block", "kick",
+            "takedown", "detach", "remove",
+            "restore", "recover",
+            "reset", "rotate",
+            "assign", "revoke", "grant",
+            "enable", "disable",
+            "factory_reset", "break_glass", "force_logout",
+            "approve_appeal", "reject_appeal",
+            "update_config", "reload_config",
+            "shutdown", "restart",
+        }
+        actual_keywords = set(DESTRUCTIVE_ACTION_KEYWORDS)
+        missing = expected_keywords - actual_keywords
+        assert not missing, f"DESTRUCTIVE_ACTION_KEYWORDS 缺少: {missing}"
+
     def test_requires_mfa_query_function(self):
         """requires_mfa 查询接口正确性。"""
         from services.high_risk_policy import requires_mfa

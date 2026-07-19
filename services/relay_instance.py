@@ -4,6 +4,11 @@
 - session 文件持久化，VPS 重启后自动恢复
 """
 from __future__ import annotations
+from services.sink_adapters.telegram_adapter import (
+    safe_reply_text, safe_send_message, safe_edit_message_text,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope
+from services.user_message import UserMessage
 
 import asyncio
 import re
@@ -170,8 +175,8 @@ class RelayInstance:
                 try:
                     await self._report_status("banned", str(e)[:200])
                 except Exception:
-                    pass
-            return False
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/relay_instance.py:RelayInstance.check_health'))
+            return None
         return False
 
     @property
@@ -191,7 +196,7 @@ class RelayInstance:
             db = await get_relay_db()
             await db.update_account_status(self.phone, status, info)
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/relay_instance.py:RelayInstance._report_status'))
 
     # ── B1: 指数退避 + 熔断 ──
 
@@ -624,7 +629,7 @@ class RelayInstance:
                 logger.info(f"[RelayInstance:{self.phone}] 码已映射（本地缓存），跳过发送: code={code}")
                 return False
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/relay_instance.py:RelayInstance.send_external_code'))
         async with self._lock:
             if self.is_busy:
                 logger.warning(f"[RelayInstance:{self.phone}] 账号正忙，拒绝新请求")
@@ -655,7 +660,7 @@ class RelayInstance:
                         bot_username = ov["bot_username"]
                         break
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/relay_instance.py:RelayInstance._do_send_external_code'))
 
             entity = await self._client.get_entity(bot_username)
             logger.info(
@@ -670,7 +675,7 @@ class RelayInstance:
                     f"拒绝新请求 (user={user_id}, code={code})"
                 )
                 return False
-            await self._client.send_message(entity, code)
+            await safe_send_message(self._client, chat_id=entity, payload=UserMessage.from_raw_text(code))
             now = asyncio.get_running_loop().time()
             self._bot_exchange[bot_username.lower()] = {
                 "user_id": user_id,
@@ -1322,10 +1327,7 @@ class RelayInstance:
                         user_id = exchange_data.get("user_id", 0)
                         code = exchange_data.get("code", "")
                         try:
-                            await self._client.send_message(
-                                self._decoder_bot_entity,
-                                f"RELAY_ERROR:{user_id}:{code}:{reason}",
-                            )
+                            await safe_send_message(self._client, chat_id=self._decoder_bot_entity, payload=UserMessage.from_raw_text(f"RELAY_ERROR:{user_id}:{code}:{reason}"))
                         except Exception as notify_err:
                             logger.warning(
                                 f"[Relay] RELAY_ERROR 通知失败 user={user_id} code={code} "
@@ -1357,12 +1359,9 @@ class RelayInstance:
                             user_id = exchange_data.get("user_id", 0)
                             code = exchange_data.get("code", "")
                             try:
-                                await self._client.send_message(
-                                    self._decoder_bot_entity,
-                                    _i18n_t('services.relay_instance.s44', user_id=user_id, code=code, break_remaining=break_remaining),
-                                )
+                                await safe_send_message(self._client, chat_id=self._decoder_bot_entity, payload=UserMessage.from_raw_text(_i18n_t('services.relay_instance.s44', user_id=user_id, code=code, break_remaining=break_remaining)))
                             except Exception:
-                                pass
+                                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/relay_instance.py:RelayInstance._message_loop'))
                         await self._cleanup_exchange(bot_username)
                         break
                     await asyncio.sleep(wait_sec)
@@ -1566,6 +1565,7 @@ class RelayInstance:
             target_row = reply_markup.rows[row]
             target_btn = target_row.buttons[col]
         except (IndexError, AttributeError):
+            logger.debug(_i18n_t('diagnostics.r65.p1_04.relay_click_button_not_found', phone=self.phone, row=row, col=col))
             return False
         try:
             if hasattr(target_btn, "data") and target_btn.data:
@@ -1588,7 +1588,7 @@ class RelayInstance:
                     start_param = params.get("start", [None])[0]
                     if start_param:
                         entity = await self._client.get_entity(parsed.path.strip("/"))
-                        await self._client.send_message(entity, f"/start {start_param}")
+                        await safe_send_message(self._client, chat_id=entity, payload=UserMessage.from_raw_text(f"/start {start_param}"))
                         return True
                 return False
             return False
@@ -1609,7 +1609,8 @@ class RelayInstance:
             except Exception as click_err:
                 logger.debug(f"[Relay] FloodWait 后按钮点击失败: {click_err}")
             return False
-        except Exception:
+        except Exception as e:
+            logger.warning(_i18n_t('diagnostics.r65.p1_04.relay_click_button_exception', phone=self.phone, error=e))
             return False
 
     async def _process_all_collected(self, bot_username: str):
@@ -1637,10 +1638,7 @@ class RelayInstance:
         if not all_events:
             if self._decoder_bot_entity:
                 try:
-                    await self._client.send_message(
-                        self._decoder_bot_entity,
-                        _i18n_t('services.relay_instance.s39', user_id=user_id, code=code),
-                    )
+                    await safe_send_message(self._client, chat_id=self._decoder_bot_entity, payload=UserMessage.from_raw_text(_i18n_t('services.relay_instance.s39', user_id=user_id, code=code)))
                 except Exception as notify_err:
                     logger.warning(
                         f"[Relay] RELAY_ERROR 通知失败(目标机器人无文件) "
@@ -1655,10 +1653,7 @@ class RelayInstance:
                 # P4: 不再等待 idx_bot 确认(原 120s 超时是最大延迟瓶颈)
                 # up_bot 收到 EXTERNAL_DONE 后会 flush 并通知 idx_bot 处理
                 # idx_bot 处理完直接调度 dsp 发送给用户(P2),无需中继等待
-                await self._client.send_message(
-                    self._up_bot_entity,
-                    f"EXTERNAL_DONE:{user_id}:{code}",
-                )
+                await safe_send_message(self._client, chat_id=self._up_bot_entity, payload=UserMessage.from_raw_text(f"EXTERNAL_DONE:{user_id}:{code}"))
                 logger.info(f"[RelayInstance:{self.phone}] 已通知 Up Bot 完成外部文件收集: code={code}")
                 # 直接标记为已映射(下次该外部码可直接走本地缓存)
                 await self._mark_code_mapped(code)
@@ -1756,10 +1751,7 @@ class RelayInstance:
                             f"不发送 RELAY_DELIVER,触发上层重试"
                         )
                         return False
-                    await self._client.send_message(
-                        self._decoder_bot_entity,
-                        f"RELAY_DELIVER:{user_id}:{code}",
-                    )
+                    await safe_send_message(self._client, chat_id=self._decoder_bot_entity, payload=UserMessage.from_raw_text(f"RELAY_DELIVER:{user_id}:{code}"))
                     if failed_ids:
                         # 部分失败:记录日志,decoder_bot 可据此提示用户部分文件缺失
                         logger.warning(
@@ -1776,10 +1768,7 @@ class RelayInstance:
             from database.cache import get_file_record_cache
             get_file_record_cache().invalidate(f"file:{code}")
             if self._decoder_bot_entity:
-                await self._client.send_message(
-                    self._decoder_bot_entity,
-                    f"RELAY_RENEW:{user_id}:{code}",
-                )
+                await safe_send_message(self._client, chat_id=self._decoder_bot_entity, payload=UserMessage.from_raw_text(f"RELAY_RENEW:{user_id}:{code}"))
             return False
         except FloodWaitError as e:
             self.record_flood_wait(e.seconds)

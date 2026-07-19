@@ -1,11 +1,22 @@
 import os
+from services.sink_adapters.telegram_adapter import (
+    safe_reply_text, safe_send_message, safe_edit_message_text,
+)
+from services.sink_adapters.telegram_helpers import (
+    Update,
+    ContextTypes,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope
+from services.user_message import UserMessage
+# R65 P1-04: 模块级 logger(observability allowlist 清零后,except 块需 logger.exception)
+from loguru import logger
 import re
 import time
 import datetime
 from pathlib import Path
 
-from telegram import Update
-from telegram.ext import ContextTypes
+
+
 
 from config import settings
 from database import (
@@ -62,7 +73,7 @@ def _cleanup_auth_session(auth_path: str):
             if p.exists():
                 p.unlink()
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:_cleanup_auth_session'))
 
 
 async def _conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
@@ -71,17 +82,17 @@ async def _conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE, state:
     context.user_data["conv_started_at"] = time.time()
     query = update.callback_query
     try:
-        await query.edit_message_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+        await safe_edit_message_text(query, UserMessage.from_raw_text(prompt), reply_markup=_CONV_CANCEL_KEYBOARD)
     except Exception:
         # 忽略 Message is not modified 错误(用户重复点击相同按钮)
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:_conv_start'))
 
 
 async def _conv_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str, prompt: str):
     context.user_data["conv_state"] = state
     context.user_data["conv_started_at"] = time.time()
     context.user_data.setdefault("conv_data", {})
-    await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+    await safe_reply_text(update.message, UserMessage.from_raw_text(prompt), reply_markup=_CONV_CANCEL_KEYBOARD)
 
 
 async def _conv_end(context: ContextTypes.DEFAULT_TYPE):
@@ -91,7 +102,7 @@ async def _conv_end(context: ContextTypes.DEFAULT_TYPE):
         try:
             await client.disconnect()
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:_conv_end'))
     # H-2: 清理临时 session 文件(对话取消/超时时)
     auth_path = context.user_data.pop("_relay_auth_session_path", None)
     if auth_path:
@@ -113,7 +124,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     started_at = context.user_data.get("conv_started_at", 0)
     if time.time() - started_at > _CONV_TIMEOUT_SECONDS:
         await _conv_end(context)
-        await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s1'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s1')))
         return
 
     text = update.message.text.strip()
@@ -122,7 +133,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # ─── Helper: execute and end ─────────────────────────────────
     async def _end(msg: str):
         await _conv_end(context)
-        await update.message.reply_text(msg)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(msg))
 
     async def _ask(next_state: str, prompt: str, extra_data: dict | None = None):
         if extra_data:
@@ -130,7 +141,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data["conv_state"] = next_state
         # 刷新超时计时器,确保多轮对话不被误判超时
         context.user_data["conv_started_at"] = time.time()
-        await update.message.reply_text(prompt, reply_markup=_CONV_CANCEL_KEYBOARD)
+        await safe_reply_text(update.message, UserMessage.from_raw_text(prompt), reply_markup=_CONV_CANCEL_KEYBOARD)
 
     # ─── 文件码前缀路由 ──────────────────────────────────────────
     if state == "add_code_route:prefix":
@@ -153,16 +164,16 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         pattern = text
         # P2-7: 正则路由 ReDoS 防护 —— 校验长度、嵌套量词、可编译性
         if len(pattern) > 200:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s6'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s6')))
             return
         # 基础 ReDoS 检测:嵌套量词,如 (.*+)+、(.+)+
         if re.search(r'\([^)]*[+*?][^)]*\)[+*?]', pattern) or re.search(r'(.+.*|.*.+){2,}', pattern):
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s7'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s7')))
             return
         try:
             re.compile(pattern)
         except re.error as e:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s8', e=e))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s8', e=e)))
             return
         await _ask("add_code_route_regex:bot",
                     _i18n_t('bot.admin_bot.conversation.s5', pattern=pattern),
@@ -199,10 +210,10 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             interval = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s19'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s19')))
             return
         if interval < 0:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s17'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s17')))
             return
         await set_bot_decode_interval(data["bot"], interval)
         msg = _i18n_t('bot.admin_bot.conversation.s14', data_bot=data['bot']) if interval == 0 else _i18n_t('bot.admin_bot.conversation.s15', data_bot=data['bot'], interval=interval)
@@ -217,7 +228,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             user_id = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s22'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s22')))
             return
         users_col = get_users_col()
         user = await _ensure_user(user_id)
@@ -230,7 +241,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s24'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s24')))
             return
         await _ask("set_level:level",
                     _i18n_t('bot.admin_bot.conversation.s21', text=text),
@@ -239,7 +250,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif state == "set_level:level":
         level = LEVEL_ALIAS.get(text.strip())
         if not level:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s25'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s25')))
             return
         user_id = data["user_id"]
         users_col = get_users_col()
@@ -270,7 +281,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             user_id = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s28'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s28')))
             return
         users_col = get_users_col()
         await _ensure_user(user_id)
@@ -282,7 +293,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             user_id = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s30'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s30')))
             return
         users_col = get_users_col()
         await _ensure_user(user_id)
@@ -294,7 +305,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s32'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s32')))
             return
         await _ask("set_quota:quota",
                     _i18n_t('bot.admin_bot.conversation.s29', text=text),
@@ -304,7 +315,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             quota = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s34'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s34')))
             return
         users_col = get_users_col()
         await _ensure_user(data["user_id"])
@@ -318,7 +329,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s37'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s37')))
             return
         await _ask("set_external_quota:quota",
                     _i18n_t('bot.admin_bot.conversation.s33', text=text),
@@ -328,7 +339,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             quota = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s38'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s38')))
             return
         users_col = get_users_col()
         await _ensure_user(data["user_id"])
@@ -385,7 +396,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                             phone = inst.phone
                             break
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
         if not phone:
             await _end(_i18n_t('bot.admin_bot.conversation.s46'))
             return
@@ -409,7 +420,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                             phone = inst.phone
                             break
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
         if not phone:
             await _end(_i18n_t('bot.admin_bot.conversation.s49'))
             return
@@ -454,7 +465,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             if p.exists():
                 p.unlink()
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
         client = TelegramClient(auth_session_path, api_id_int, api_hash)
         # H-2: 保存临时 session 路径到 user_data,供 _conv_end 清理
         context.user_data["_relay_auth_session_path"] = auth_session_path
@@ -466,7 +477,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 await client.disconnect()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
             await _end(
                 _i18n_t('bot.admin_bot.conversation.s56', e=e)
             )
@@ -494,7 +505,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 from database.cache_store import get_cache_store
                 await get_cache_store().notify_relay_change()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
             # 自动将该账号 user_id 加入中继白名单,免手动配置
             if me:
                 try:
@@ -518,7 +529,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 await client.disconnect()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
             await _end(_i18n_t('bot.admin_bot.conversation.s57', e=e))
             return
 
@@ -545,7 +556,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         code = text.strip()
         if not code.isdigit() or len(code) not in (5, 6):
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s58'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s58')))
             return
 
         client = context.user_data.get("_relay_temp_client")
@@ -570,18 +581,18 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 await client.disconnect()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
             context.user_data.pop("_relay_temp_client", None)
             await _end(_i18n_t('bot.admin_bot.conversation.s62'))
             return
         except PhoneCodeInvalidError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s63'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s63')))
             return
         except PhoneNumberBannedError:
             try:
                 await client.disconnect()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
             context.user_data.pop("_relay_temp_client", None)
             await _end(_i18n_t('bot.admin_bot.conversation.s64'))
             return
@@ -590,13 +601,13 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 await client.disconnect()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
             context.user_data.pop("_relay_temp_client", None)
             await _end(_i18n_t('bot.admin_bot.conversation.s65'))
             return
         except Exception as e:
             logger.error(f"[Admin] relay_add sign_in 失败: {e}")
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s137', error=e))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s137', error=e)))
             return
 
         # 登录成功,写入 DB
@@ -621,7 +632,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             from database.cache_store import get_cache_store
             await get_cache_store().notify_relay_change()
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
         # 自动将该账号 user_id 加入中继白名单,免手动配置
         try:
             await db.update_relay_user_id(phone, me.id)
@@ -642,7 +653,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         password = text.strip()
         if not password:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s66'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s66')))
             return
 
         client = context.user_data.get("_relay_temp_client")
@@ -656,7 +667,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             await client.sign_in(password=password)
         except Exception as e:
             logger.error(f"[Admin] relay_add password sign_in 失败: {e}")
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s138', error=e))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s138', error=e)))
             return
 
         # 登录成功,写入 DB
@@ -679,7 +690,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             from database.cache_store import get_cache_store
             await get_cache_store().notify_relay_change()
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
         # 自动将该账号 user_id 加入中继白名单,免手动配置
         try:
             await db.update_relay_user_id(phone, me.id)
@@ -708,7 +719,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 from database.cache_store import get_cache_store
                 await get_cache_store().notify_relay_change()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/conversation.py:handle_conversation'))
             # 自动从白名单移除该账号的 user_id
             if relay_user_id:
                 try:
@@ -726,7 +737,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             user_id = int(text.strip())
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s71'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s71')))
             return
         added = await add_collector_whitelist(user_id)
         if added:
@@ -739,7 +750,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             user_id = int(text.strip())
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s77'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s77')))
             return
         removed = await remove_collector_whitelist(user_id)
         if removed:
@@ -759,7 +770,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
             if max_requests < 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s80'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s80')))
             return
         from database import update_file_record_and_invalidate
         try:
@@ -782,7 +793,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             channel_id = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s84'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s84')))
             return
         await _ask("cell_add:account_name",
                    _i18n_t('bot.admin_bot.conversation.s82', channel_id=channel_id),
@@ -801,7 +812,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         if status == "0":
             status = "shadow1"
         if status not in ("active", "shadow1", "shadow2", "r100"):
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s85'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s85')))
             return
         from database.cache_store import get_cache_store
         store = get_cache_store()
@@ -879,7 +890,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s97'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s97')))
             return
         await _ask("set_force_join:link",
                     _i18n_t('bot.admin_bot.conversation.s96', text=text),
@@ -897,7 +908,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif state == "set_username:role":
         role = text.lower()
         if role not in ("upload", "decoder", "sender"):
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s101'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s101')))
             return
         await _ask("set_username:name",
                     _i18n_t('bot.admin_bot.conversation.s99', role=role),
@@ -913,7 +924,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif state == "set_quota_default:level":
         level = LEVEL_ALIAS.get(text.strip())
         if not level:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s107'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s107')))
             return
         await _ask("set_quota_default:quota",
                     _i18n_t('bot.admin_bot.conversation.s104', text=text),
@@ -923,7 +934,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             quota = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s110'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s110')))
             return
         await set_config(f"quota_default_{data['level']}", str(quota))
         await _ask("set_quota_default:ext_quota",
@@ -975,7 +986,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             interval = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s117'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s117')))
             return
         await _ask("set_db_backup:enabled",
                     _i18n_t('bot.admin_bot.conversation.s115', interval=interval),
@@ -984,7 +995,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif state == "set_db_backup:enabled":
         on_off = text.strip().lower()
         if on_off not in ("on", "off"):
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s118'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s118')))
             return
         await set_config("db_backup_interval", str(data["interval"]))
         await set_config("db_backup_enabled", "true" if on_off == "on" else "false")
@@ -995,7 +1006,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             channel_id = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s123'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s123')))
             return
         await _ask("spare_add:account_name",
                     _i18n_t('bot.admin_bot.conversation.s119', channel_id=channel_id),
@@ -1013,7 +1024,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             channel_id = int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s132'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s132')))
             return
         await remove_spare(channel_id)
         await _end(_i18n_t('bot.admin_bot.conversation.s124', channel_id=channel_id))
@@ -1023,9 +1034,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         key = text.strip().lower()
         valid_keys = {"active_window_size", "files_per_slot", "time_per_slot"}
         if key not in valid_keys:
-            await update.message.reply_text(
-                _i18n_t('bot.admin_bot.conversation.s133', key=key, join_sorted_valid_keys=', '.join(sorted(valid_keys)))
-            )
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s133', key=key, join_sorted_valid_keys=', '.join(sorted(valid_keys)))))
             return
         labels = {
             "active_window_size": _i18n_t('bot.admin_bot.conversation.s125'),
@@ -1040,7 +1049,7 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             int(text)
         except ValueError:
-            await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s136'))
+            await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s136')))
             return
         db_key = f"rotation_{data['rotation_key']}"
         await set_rotation_config(db_key, text)
@@ -1056,4 +1065,4 @@ async def handle_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # 未知状态 → 清理
     else:
         await _conv_end(context)
-        await update.message.reply_text(_i18n_t('bot.admin_bot.conversation.s135'))
+        await safe_reply_text(update.message, UserMessage.from_raw_text(_i18n_t('bot.admin_bot.conversation.s135')))

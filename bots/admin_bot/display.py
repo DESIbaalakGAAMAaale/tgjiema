@@ -97,7 +97,7 @@ async def _ensure_user(user_id: int) -> dict:
             from database.cache import get_user_cache
             get_user_cache().set(f"user:{user_id}", user)
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/display.py:_ensure_user'))
     return user
 
 
@@ -249,7 +249,7 @@ async def _get_topology_text() -> str:
         tps = await get_rotation_config("rotation_time_per_slot") or "3600"
         msg += _t(AUTHORIZED_USER_ID, "bot.admin_bot.m359", aws=aws, fps=fps, tps=tps)
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/admin_bot/display.py:_get_topology_text'))
 
     return msg
 

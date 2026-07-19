@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 139,
-    "generated_at": "2026-07-18T18:30:18.513651Z",
+    "enum_count": 146,
+    "generated_at": "2026-07-19T11:21:45.922763Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(R61 P1-05: 独立显式设置,通常等于 retryable 但可独立覆盖)",
       "telegram_presentation": "Bot 端展示方式(R61 P1-05 显式字段): short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)/modal/toast(预留扩展)"
     },
-    "total_codes": 139,
+    "total_codes": 146,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -195,6 +195,20 @@
       "message_key": "errors.backup.decrypt.kek_missing",
       "retryable": false,
       "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.PAYLOAD.CANONICAL_INVALID": {
+      "audit_level": "critical",
+      "code": "BACKUP.PAYLOAD.CANONICAL_INVALID",
+      "http_status": 500,
+      "message_key": "errors.backup.payload.canonical_invalid",
+      "retryable": false,
+      "safe_params": [
+        "reason",
+        "field"
+      ],
       "severity": "critical",
       "show_retry_button": false,
       "telegram_presentation": "inline"
@@ -1097,6 +1111,20 @@
       "show_retry_button": false,
       "telegram_presentation": "silent"
     },
+    "HIGH_RISK.ACTION.UNREGISTERED": {
+      "audit_level": "critical",
+      "code": "HIGH_RISK.ACTION.UNREGISTERED",
+      "http_status": 403,
+      "message_key": "errors.high_risk.action.unregistered",
+      "retryable": false,
+      "safe_params": [
+        "action",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "I18N.ICU.COMPILE_FAILED": {
       "audit_level": "critical",
       "code": "I18N.ICU.COMPILE_FAILED",
@@ -1106,6 +1134,35 @@
       "safe_params": [
         "locale",
         "key",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "I18N.LOCALE.NOT_BOUND": {
+      "audit_level": "critical",
+      "code": "I18N.LOCALE.NOT_BOUND",
+      "http_status": 500,
+      "message_key": "errors.i18n.locale.not_bound",
+      "retryable": false,
+      "safe_params": [
+        "key",
+        "caller"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "I18N.PARSE.FAILED": {
+      "audit_level": "critical",
+      "code": "I18N.PARSE.FAILED",
+      "http_status": 500,
+      "message_key": "errors.i18n.parse.failed",
+      "retryable": false,
+      "safe_params": [
+        "key",
+        "locale",
         "reason"
       ],
       "severity": "critical",
@@ -1454,6 +1511,21 @@
       "show_retry_button": false,
       "telegram_presentation": "inline"
     },
+    "OUTBOX.LEASE_VERSION.CONFLICT": {
+      "audit_level": "critical",
+      "code": "OUTBOX.LEASE_VERSION.CONFLICT",
+      "http_status": 409,
+      "message_key": "errors.outbox.lease_version.conflict",
+      "retryable": false,
+      "safe_params": [
+        "event_id",
+        "expected_lease_version",
+        "operation"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "OUTBOX.LEASE_VERSION.MISMATCH": {
       "audit_level": "critical",
       "code": "OUTBOX.LEASE_VERSION.MISMATCH",
@@ -1502,6 +1574,20 @@
       "retryable": false,
       "safe_params": [
         "environment"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "PRODUCTION.EVIDENCE.INSUFFICIENT": {
+      "audit_level": "critical",
+      "code": "PRODUCTION.EVIDENCE.INSUFFICIENT",
+      "http_status": 412,
+      "message_key": "errors.production.evidence.insufficient",
+      "retryable": false,
+      "safe_params": [
+        "reason",
+        "missing"
       ],
       "severity": "critical",
       "show_retry_button": false,
@@ -1670,6 +1756,20 @@
       "severity": "error",
       "show_retry_button": false,
       "telegram_presentation": "short_hint"
+    },
+    "RESTORE.LEGACY_WRITER.SEALED": {
+      "audit_level": "critical",
+      "code": "RESTORE.LEGACY_WRITER.SEALED",
+      "http_status": 403,
+      "message_key": "errors.restore.legacy_writer.sealed",
+      "retryable": false,
+      "safe_params": [
+        "caller",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
     },
     "RESTORE.NONCE.PAYLOAD_MISMATCH": {
       "audit_level": "critical",

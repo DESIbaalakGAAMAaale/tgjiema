@@ -111,6 +111,7 @@ def _is_expired(expire_time) -> bool:
             exp = _dt.datetime.fromtimestamp(float(expire_time))
         return _dt.datetime.now() >= exp
     except (ValueError, TypeError):
+        logger.debug(_i18n_t('diagnostics.r65.p1_04.collections_is_expired_invalid', expire_time=repr(expire_time)))
         return False
 
 
@@ -228,7 +229,7 @@ async def add_files(collection_id: int, file_codes: list[str]) -> int:
         return added
     except Exception as e:
         logger.warning(f"[collections] add_files 失败: {e}")
-        return 0
+        return None
 
 
 async def remove_files(collection_id: int, file_codes: list[str]) -> int:
@@ -278,7 +279,7 @@ async def remove_files(collection_id: int, file_codes: list[str]) -> int:
         return removed
     except Exception as e:
         logger.warning(f"[collections] remove_files 失败: {e}")
-        return 0
+        return None
 
 
 async def get_collection(code: str) -> dict | None:
@@ -500,7 +501,7 @@ async def update_version(collection_id: int) -> int:
         return new_version
     except Exception as e:
         logger.warning(f"[collections] update_version 失败: {e}")
-        return 0
+        return None
 
 
 async def check_items_status(collection_id: int) -> dict:

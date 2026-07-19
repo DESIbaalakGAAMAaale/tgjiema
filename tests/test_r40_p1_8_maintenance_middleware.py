@@ -59,26 +59,30 @@ class TestRequireMaintenanceCheckDecorator:
 
         # Mock update 对象
         mock_update = MagicMock()
-        mock_update.message.reply_text = AsyncMock()
 
+        # R65 P1-01: maintenance_mode 已迁移为 safe_reply_text typed adapter,
+        # mock safe_reply_text 避免依赖真实 telegram(isinstance(Message) 在 mock 下报错)
+        mock_safe_reply = AsyncMock()
         # Mock is_enabled 返回 True(维护中)
         with patch.object(
             maintenance_mode,
             "is_enabled",
             new=AsyncMock(return_value=True),
-        ):
+        ), patch.object(maintenance_mode, "safe_reply_text", new=mock_safe_reply):
             result = await test_handler(mock_update, context=None)
 
         # 验证:未执行原函数
         assert result is None, "维护模式开启时不应执行原函数"
 
         # 验证:回复了"系统维护中"
-        mock_update.message.reply_text.assert_called_once()
-        call_args = mock_update.message.reply_text.call_args[0][0]
-        assert "系统维护中" in call_args, \
-            f"应回复'系统维护中',实际: {call_args}"
-        assert "上传文件" in call_args, \
-            f"应包含 action 描述'上传文件',实际: {call_args}"
+        mock_safe_reply.assert_called_once()
+        # safe_reply_text(update.message, UserMessage) — 第二个位置参数是 UserMessage
+        payload = mock_safe_reply.call_args[0][1]
+        text = payload.render(None)  # from_raw_text 构造,_raw_text 已设置
+        assert "系统维护中" in text, \
+            f"应回复'系统维护中',实际: {text}"
+        assert "上传文件" in text, \
+            f"应包含 action 描述'上传文件',实际: {text}"
 
     @pytest.mark.asyncio
     async def test_executes_when_maintenance_disabled(self):
@@ -90,21 +94,22 @@ class TestRequireMaintenanceCheckDecorator:
             return "DECODED_OK"
 
         mock_update = MagicMock()
-        mock_update.message.reply_text = AsyncMock()
 
+        # R65 P1-01: maintenance_mode 已迁移为 safe_reply_text typed adapter
+        mock_safe_reply = AsyncMock()
         # Mock is_enabled 返回 False(非维护中)
         with patch.object(
             maintenance_mode,
             "is_enabled",
             new=AsyncMock(return_value=False),
-        ):
+        ), patch.object(maintenance_mode, "safe_reply_text", new=mock_safe_reply):
             result = await test_handler(mock_update, context=None)
 
         # 验证:执行了原函数
         assert result == "DECODED_OK", "维护模式关闭时应执行原函数"
 
         # 验证:未回复任何消息(无维护提示)
-        mock_update.message.reply_text.assert_not_called()
+        mock_safe_reply.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_fail_closed_on_maintenance_check_error(self):
@@ -116,8 +121,9 @@ class TestRequireMaintenanceCheckDecorator:
             return "RESTORED"
 
         mock_update = MagicMock()
-        mock_update.message.reply_text = AsyncMock()
 
+        # R65 P1-01: maintenance_mode 已迁移为 safe_reply_text typed adapter
+        mock_safe_reply = AsyncMock()
         # Mock is_enabled 抛异常
         with patch.object(
             maintenance_mode,
@@ -125,17 +131,18 @@ class TestRequireMaintenanceCheckDecorator:
             new=AsyncMock(
                 side_effect=maintenance_mode.MaintenanceCheckError("DB 故障")
             ),
-        ):
+        ), patch.object(maintenance_mode, "safe_reply_text", new=mock_safe_reply):
             result = await test_handler(mock_update, context=None)
 
         # 验证:未执行原函数(fail-closed)
         assert result is None, "异常时应 fail-closed 不执行原函数"
 
         # 验证:回复了"服务暂不可用"
-        mock_update.message.reply_text.assert_called_once()
-        call_args = mock_update.message.reply_text.call_args[0][0]
-        assert "服务暂不可用" in call_args, \
-            f"应回复'服务暂不可用',实际: {call_args}"
+        mock_safe_reply.assert_called_once()
+        payload = mock_safe_reply.call_args[0][1]
+        text = payload.render(None)  # from_raw_text 构造,_raw_text 已设置
+        assert "服务暂不可用" in text, \
+            f"应回复'服务暂不可用',实际: {text}"
 
     @pytest.mark.asyncio
     async def test_decorator_preserves_function_metadata(self):
@@ -168,22 +175,22 @@ class TestRequireMaintenanceCheckDecorator:
         async def test_handler(update, context):
             return "EXECUTED"
 
-        # Mock update: reply_text 抛异常(Telegram API 不可用)
+        # Mock update 对象
         mock_update = MagicMock()
-        mock_update.message.reply_text = AsyncMock(
-            side_effect=Exception("Telegram API 超时")
-        )
+
+        # R65 P1-01: safe_reply_text 抛异常(Telegram API 不可用)时装饰器不崩溃
+        mock_safe_reply = AsyncMock(side_effect=Exception("Telegram API 超时"))
 
         # Mock is_enabled 返回 True(维护中)
         with patch.object(
             maintenance_mode,
             "is_enabled",
             new=AsyncMock(return_value=True),
-        ):
-            # 不应抛异常(reply_text 失败被捕获)
+        ), patch.object(maintenance_mode, "safe_reply_text", new=mock_safe_reply):
+            # 不应抛异常(safe_reply_text 失败被捕获)
             result = await test_handler(mock_update, context=None)
 
-        assert result is None, "reply_text 异常时仍应返回 None(不执行原函数)"
+        assert result is None, "safe_reply_text 异常时仍应返回 None(不执行原函数)"
 
 
 # ════════════════════════════════════════════════════════════════

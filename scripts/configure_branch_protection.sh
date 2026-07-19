@@ -189,28 +189,62 @@ if ! echo "$CONTEXTS_JSON" | jq -e 'any(.[]; . == "CI / repo-hygiene")' > /dev/n
 fi
 
 # ─── 4. 构造 PUT /branches/master/protection 的 payload ───
-# 严格包含 R47 P0-2 要求的所有字段:
+# 严格包含 R47/R48/R64/R65 P1-12 要求的所有字段:
 #   - required_status_checks.strict = true
-#   - enforce_admins = true
-#   - required_pull_request_reviews.required_approving_review_count >= 1
-#   - allow_force_pushes = false
-#   - allow_deletions = false
-PAYLOAD=$(jq -n --argjson contexts "$CONTEXTS_JSON" '{
+#   - enforce_admins = true                (R65 P1-12: admin 不能 bypass)
+#   - required_pull_request_reviews:
+#       * required_approving_review_count = 2     (R65 P1-12: 独立 reviewer)
+#       * dismiss_stale_reviews = true            (R65 P1-12: 新提交 dismiss 旧 approval)
+#       * require_code_owner_reviews = (CODEOWNERS 存在时 true)
+#       * dismissal_restrictions = { users: [], teams: [] }  (任何人可 dismiss)
+#   - restrictions = null
+#   - allow_force_pushes = false           (R65 P1-12: 禁 force push)
+#   - allow_deletions = false              (R65 P1-12: 禁分支删除)
+#   - required_linear_history = true       (R65 P1-12: 禁 merge commit)
+#   - block_creations = false
+#   - required_conversation_resolution = true  (R65 P1-12: 所有 conversation 必须解决)
+#
+# 注意:required_signatures(签名 commit)不在 PUT payload 中,
+#       需通过单独的 POST /branches/{branch}/protection/required_signatures API 启用,
+#       在第 5 步 PUT 之后调用(见 step 5.1)。
+#
+# R65 P1-12: require_code_owner_reviews 仅在 CODEOWNERS 文件存在时设为 true
+#   (无 CODEOWNERS 时设为 false,GitHub 会忽略 code owner 评审要求)。
+CODEOWNERS_EXISTS=false
+if [ -f "CODEOWNERS" ] || [ -f ".github/CODEOWNERS" ] || [ -f "docs/CODEOWNERS" ]; then
+  CODEOWNERS_EXISTS=true
+fi
+if [ "$CODEOWNERS_EXISTS" = "true" ]; then
+  REQUIRE_CODE_OWNER_REVIEWS=true
+  echo "[INFO] CODEOWNERS 文件存在 — require_code_owner_reviews=true"
+else
+  REQUIRE_CODE_OWNER_REVIEWS=false
+  echo "[INFO] CODEOWNERS 文件不存在 — require_code_owner_reviews=false (R65 P1-12: 仅在 CODEOWNERS 存在时启用)"
+fi
+
+PAYLOAD=$(jq -n \
+  --argjson contexts "$CONTEXTS_JSON" \
+  --argjson code_owner_reviews "$REQUIRE_CODE_OWNER_REVIEWS" '{
   required_status_checks: {
     strict: true,
     contexts: $contexts
   },
   enforce_admins: true,
   required_pull_request_reviews: {
-    required_approving_review_count: 1,
+    required_approving_review_count: 2,
     dismiss_stale_reviews: true,
-    require_code_owner_reviews: false
+    require_code_owner_reviews: $code_owner_reviews,
+    dismissal_restrictions: {
+      users: [],
+      teams: []
+    }
   },
   restrictions: null,
   allow_force_pushes: false,
   allow_deletions: false,
-  required_linear_history: false,
-  block_creations: false
+  required_linear_history: true,
+  block_creations: false,
+  required_conversation_resolution: true
 }')
 
 # ─── 5. 调用 GitHub API 配置 branch protection ───
@@ -235,31 +269,102 @@ if ! echo "$RESPONSE" | jq -e '.url' > /dev/null 2>&1; then
 fi
 echo "✓ Branch protection 配置成功"
 
-# ─── 6. 配置后立即运行验证(复用 verify-branch-protection job 的断言逻辑) ───
-# R47 P0-2 要求:配置后必须自检,任何属性不满足则失败
+# ─── 5.1 R65 P1-12: 启用 required_signatures (signed commits 必需) ───
+# required_signatures 不在 PUT /branches/{branch}/protection 的 payload 中,
+# 需通过单独的 POST /branches/{branch}/protection/required_signatures API 启用。
+# 参考: https://docs.github.com/rest/branches/branch-protection#create-commit-signature-protection
 echo ""
-echo "=== 验证配置(复用 verify-branch-protection 断言) ==="
+echo "=== R65 P1-12: 启用 required_signatures (signed commits 必需) ==="
+SIG_RESPONSE=""
+if [ "$USE_GH_CLI" = "true" ]; then
+  SIG_RESPONSE=$(gh api "repos/${OWNER}/${REPO}/branches/master/protection/required_signatures" \
+                  -X POST 2>&1 || true)
+else
+  SIG_RESPONSE=$(curl -sS -X POST \
+    -H "Authorization: token ${TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/${OWNER}/${REPO}/branches/master/protection/required_signatures" 2>&1 || true)
+fi
+# required_signatures 启用成功响应: {"enabled":true,...}
+# 已启用时响应: 409 "Body failed schema validation" 或 422 — 我们检查 enabled=true 即可
+SIG_CURRENT=""
+if echo "$SIG_RESPONSE" | jq -e '.enabled == true' > /dev/null 2>&1; then
+  echo "✓ required_signatures 已启用 (signed commits 必需)"
+  SIG_CURRENT="$SIG_RESPONSE"
+else
+  # 可能已启用,GitHub 返回 409/422 — 拉取当前状态确认
+  if [ "$USE_GH_CLI" = "true" ]; then
+    SIG_CURRENT=$(gh api "repos/${OWNER}/${REPO}/branches/master/protection/required_signatures" 2>&1 || true)
+  else
+    SIG_CURRENT=$(curl -sS \
+      -H "Authorization: token ${TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      -H "X-GitHub-Api-Version: 2022-11-28" \
+      "https://api.github.com/repos/${OWNER}/${REPO}/branches/master/protection/required_signatures" 2>&1 || true)
+  fi
+  if echo "$SIG_CURRENT" | jq -e '.enabled == true' > /dev/null 2>&1; then
+    echo "✓ required_signatures 已启用(此前已配置)"
+  else
+    echo "ERROR: required_signatures 启用失败"
+    echo "  POST 响应: $SIG_RESPONSE"
+    echo "  GET 当前状态: $SIG_CURRENT"
+    echo "  R65 P1-12: signed commits 必需 — 启用失败必须阻断"
+    exit 1
+  fi
+fi
+
+# ─── 6. 配置后立即运行验证(复用 verify-branch-protection job 的断言逻辑) ───
+# R47/R48/R64/R65 P1-12 要求:配置后必须自检,任何属性不满足则失败
+echo ""
+echo "=== 验证配置(复用 verify-branch-protection 断言 + R65 P1-12 严格化) ==="
 BP_JSON="$RESPONSE"
 
 echo "Assert: required_status_checks.strict == true"
 echo "$BP_JSON" | jq -e '.required_status_checks.strict == true' > /dev/null \
   || { echo "ERROR: required_status_checks.strict != true"; exit 1; }
 
-echo "Assert: enforce_admins.enabled == true"
+echo "Assert: enforce_admins.enabled == true (R65 P1-12: admin 不能 bypass)"
 echo "$BP_JSON" | jq -e '.enforce_admins.enabled == true' > /dev/null \
   || { echo "ERROR: enforce_admins.enabled != true"; exit 1; }
 
-echo "Assert: required_approving_review_count >= 1"
-echo "$BP_JSON" | jq -e '.required_pull_request_reviews.required_approving_review_count >= 1' > /dev/null \
-  || { echo "ERROR: required_approving_review_count < 1"; exit 1; }
+echo "Assert: required_approving_review_count >= 2 (R65 P1-12: 独立 reviewer)"
+echo "$BP_JSON" | jq -e '.required_pull_request_reviews.required_approving_review_count >= 2' > /dev/null \
+  || { echo "ERROR: required_approving_review_count < 2 (R65 P1-12 要求 >= 2)"; exit 1; }
 
-echo "Assert: allow_force_pushes.enabled == false"
+echo "Assert: dismiss_stale_reviews == true (R65 P1-12: 新提交 dismiss 旧 approval)"
+echo "$BP_JSON" | jq -e '.required_pull_request_reviews.dismiss_stale_reviews == true' > /dev/null \
+  || { echo "ERROR: dismiss_stale_reviews != true"; exit 1; }
+
+echo "Assert: require_code_owner_reviews 与 CODEOWNERS 存在性一致 (R65 P1-12)"
+echo "$BP_JSON" | jq -e \
+  --argjson expected "$REQUIRE_CODE_OWNER_REVIEWS" \
+  '.required_pull_request_reviews.require_code_owner_reviews == $expected' > /dev/null \
+  || { echo "ERROR: require_code_owner_reviews 与 CODEOWNERS 存在性不一致 (期望: $REQUIRE_CODE_OWNER_REVIEWS)"; exit 1; }
+
+echo "Assert: dismissal_restrictions 存在 (R65 P1-12)"
+echo "$BP_JSON" | jq -e '.required_pull_request_reviews.dismissal_restrictions != null' > /dev/null \
+  || { echo "ERROR: dismissal_restrictions 为 null"; exit 1; }
+
+echo "Assert: allow_force_pushes.enabled == false (R65 P1-12)"
 echo "$BP_JSON" | jq -e '.allow_force_pushes.enabled == false' > /dev/null \
   || { echo "ERROR: allow_force_pushes.enabled != false"; exit 1; }
 
-echo "Assert: allow_deletions.enabled == false"
+echo "Assert: allow_deletions.enabled == false (R65 P1-12)"
 echo "$BP_JSON" | jq -e '.allow_deletions.enabled == false' > /dev/null \
   || { echo "ERROR: allow_deletions.enabled != false"; exit 1; }
+
+echo "Assert: required_linear_history.enabled == true (R65 P1-12: 禁 merge commit)"
+echo "$BP_JSON" | jq -e '.required_linear_history.enabled == true' > /dev/null \
+  || { echo "ERROR: required_linear_history.enabled != true (R65 P1-12: 必须禁用 merge commit)"; exit 1; }
+
+echo "Assert: required_conversation_resolution.enabled == true (R65 P1-12)"
+echo "$BP_JSON" | jq -e '.required_conversation_resolution.enabled == true' > /dev/null \
+  || { echo "ERROR: required_conversation_resolution.enabled != true (R65 P1-12: 所有 conversation 必须解决)"; exit 1; }
+
+echo "Assert: required_signatures.enabled == true (R65 P1-12: signed commits 必需)"
+echo "$SIG_CURRENT" | jq -e '.enabled == true' > /dev/null \
+  || { echo "ERROR: required_signatures.enabled != true (R65 P1-12: signed commits 必需)"; exit 1; }
 
 # R48 P0-2: 验证 BP 中实际配置的 contexts 与传入的 contexts 完全一致(集合相等)
 # 旧版只断言"必需 context 存在",但 GitHub 可能保留历史 context,导致脏配置。
@@ -280,8 +385,26 @@ if [ "$ONLY_IN_BP" -gt 0 ] || [ "$ONLY_IN_EXP" -gt 0 ]; then
   exit 1
 fi
 
+# ─── 7. R65 P1-12: 动态 context 一致性检查 ───
+# 调用 scripts/check_branch_protection_contexts.py,从 .github/workflows/*.yml
+# 提取实际 job 名(含矩阵展开、push-only/tag-only 过滤),与 BP required contexts
+# 双向比对。任何孤儿/缺失 context 都必须阻断。
 echo ""
-echo "✓ 所有 R47/R48 P0-2 断言通过"
+echo "=== R65 P1-12: 动态 context 一致性检查 ==="
+BP_CONFIG_FILE=$(mktemp)
+echo "$BP_JSON" > "$BP_CONFIG_FILE"
+if ! python "${SCRIPT_DIR}/check_branch_protection_contexts.py" \
+      --bp-config "$BP_CONFIG_FILE"; then
+  rm -f "$BP_CONFIG_FILE"
+  echo "ERROR: R65 P1-12 动态 context 一致性检查失败"
+  echo "  BP required contexts 与 .github/workflows/*.yml 中的 job 名不一致"
+  echo "  修复:更新 contexts 或 workflow job 名后重跑本脚本"
+  exit 1
+fi
+rm -f "$BP_CONFIG_FILE"
+
+echo ""
+echo "✓ 所有 R47/R48/R64/R65 P1-12 断言通过"
 echo ""
 echo "最终配置(关键字段):"
-echo "$BP_JSON" | jq '.required_status_checks, .enforce_admins, .required_pull_request_reviews, .allow_force_pushes, .allow_deletions'
+echo "$BP_JSON" | jq '.required_status_checks, .enforce_admins, .required_pull_request_reviews, .allow_force_pushes, .allow_deletions, .required_linear_history, .required_conversation_resolution'

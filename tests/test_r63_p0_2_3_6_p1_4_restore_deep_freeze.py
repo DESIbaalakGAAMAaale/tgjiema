@@ -154,17 +154,25 @@ def _build_verified_payload(
     R64 P1-01: payload/tables 改为从 canonical_payload_bytes 解码的 property,
     不再是独立字段。tables/payload 参数仅用于决定 canonical bytes 的内容
     (若同时传入,以 payload 为准,tables 字段应嵌入 payload["tables"])。
+
+    R65 P1-06: VerifiedBackupPayload.__post_init__ 添加 7 维构造时强校验,
+    要求 canonical payload 含 version/backup_id/created_at/tables 必填字段。
+    本函数用 _enrich_payload_data 自动补齐缺失字段(已有字段保留原值)。
     """
     if tables is None:
         tables = {"users": [{"user_id": 1, "username": "alice"}]}
     if payload is None:
         payload = {"tables": tables}
+    # R65 P1-06: 补齐 version/backup_id/created_at 必填字段
+    enriched = mod._enrich_payload_data(
+        payload, backup_id=backup_id, created_at="2024-01-01T00:00:00Z",
+    )
     return mod.VerifiedBackupPayload(
         backup_id=backup_id,
         manifest_sha256="a" * 64,
         plaintext_sha256="c" * 64,
         schema_fingerprint=schema_fingerprint,
-        canonical_payload_bytes=mod._canonical_json_bytes(payload),
+        canonical_payload_bytes=mod._canonical_json_bytes(enriched),
     )
 
 
@@ -355,13 +363,17 @@ class TestVerifiedBackupPayloadDeepFreeze:
         mod = _ensure_backup_dr_validate_importable()
         original_tables = {"users": [{"user_id": 1}]}
         original_payload = {"tables": {"users": [{"user_id": 1}]}}
+        # R65 P1-06: 补齐必填字段,通过 7 维构造时强校验
+        enriched = mod._enrich_payload_data(
+            original_payload, backup_id="b001", created_at="2024-01-01T00:00:00Z",
+        )
         # R64 P1-01: 仅传 canonical_payload_bytes,tables/payload 由 property 解码
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            canonical_payload_bytes=mod._canonical_json_bytes(original_payload),
+            canonical_payload_bytes=mod._canonical_json_bytes(enriched),
         )
         # 修改原 dict(模拟攻击者在验证后、写入前篡改)
         original_tables["users"].append({"user_id": 999, "evil": True})
@@ -381,9 +393,14 @@ class TestVerifiedBackupPayloadDeepFreeze:
         mod = _ensure_backup_dr_validate_importable()
         original = {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"}
         payload = _build_verified_payload(mod, payload=original)
-        # payload_digest 应等于对原始 dict 的 canonical digest
-        # (因 _to_serializable 还原后 JSON 序列化与原始 dict 一致)
-        expected = mod._compute_payload_digest(original)
+        # payload_digest 应等于对 enriched payload 的 canonical digest
+        # (R65 P1-06: _build_verified_payload 内部用 _enrich_payload_data 补齐
+        # version/created_at,故 expected 也需基于 enriched 数据计算)
+        enriched = mod._enrich_payload_data(
+            original, backup_id="backup_test_001",
+            created_at="2024-01-01T00:00:00Z",
+        )
+        expected = mod._compute_payload_digest(enriched)
         assert payload.payload_digest == expected
         assert len(payload.payload_digest) == 64
 
@@ -434,12 +451,17 @@ class TestWriterDigestRecompute:
 
         # 1. 构造合法的 VerifiedBackupPayload + _RestoreCapability
         original_payload = {"tables": {"users": [{"user_id": 1, "username": "alice"}]}}
+        # R65 P1-06: 补齐必填字段,通过 7 维构造时强校验
+        enriched = mod._enrich_payload_data(
+            original_payload, backup_id="backup_test_001",
+            created_at="2024-01-01T00:00:00Z",
+        )
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="backup_test_001",
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            canonical_payload_bytes=mod._canonical_json_bytes(original_payload),
+            canonical_payload_bytes=mod._canonical_json_bytes(enriched),
         )
         cap = _build_valid_capability(
             mod,
@@ -493,12 +515,17 @@ class TestWriterDigestRecompute:
         mod = _ensure_backup_dr_validate_importable()
 
         original_payload = {"tables": {"users": [{"user_id": 1}]}}
+        # R65 P1-06: 补齐必填字段,通过 7 维构造时强校验
+        enriched = mod._enrich_payload_data(
+            original_payload, backup_id="backup_test_001",
+            created_at="2024-01-01T00:00:00Z",
+        )
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="backup_test_001",
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
-            canonical_payload_bytes=mod._canonical_json_bytes(original_payload),
+            canonical_payload_bytes=mod._canonical_json_bytes(enriched),
         )
         cap = _build_valid_capability(
             mod,
@@ -668,7 +695,10 @@ class TestFailClosedOnDataSourceFailure:
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
             canonical_payload_bytes=mod._canonical_json_bytes(
-                {"tables": {"sqlite_table": [{"col": 1}]}}
+                mod._enrich_payload_data(
+                    {"tables": {"sqlite_table": [{"col": 1}]}},
+                    backup_id="b001", created_at="2024-01-01T00:00:00Z",
+                )
             ),
         )
         cap = _build_valid_capability(
@@ -721,7 +751,10 @@ class TestFailClosedOnDataSourceFailure:
             plaintext_sha256="c" * 64,
             schema_fingerprint="R63-P0-02-test-fingerprint",
             canonical_payload_bytes=mod._canonical_json_bytes(
-                {"tables": {"relay_table": [{"col": 1}]}}
+                mod._enrich_payload_data(
+                    {"tables": {"relay_table": [{"col": 1}]}},
+                    backup_id="b001", created_at="2024-01-01T00:00:00Z",
+                )
             ),
         )
         cap = _build_valid_capability(

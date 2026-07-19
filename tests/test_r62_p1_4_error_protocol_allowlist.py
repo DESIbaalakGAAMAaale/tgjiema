@@ -390,13 +390,27 @@ def test_real_baseline_passes_strict():
 
     集成测试: 加载 scripts/error_protocol_baseline.json,运行 scanner 收集
     真实违规,验证所有违规都在 allowlist 中且未过期(real_violations=0)。
+
+    R65 P1-04: observability allowlist 已清空(175 → 0),所有违规已修复。
+    findings 为空时(全部修复),strict 检查平凡通过(real_violations=0)。
     """
     if not REAL_BASELINE.exists():
         pytest.skip(f"真实 baseline 不存在: {REAL_BASELINE}")
 
     # 收集真实违规
     findings = scanner.collect_findings()
-    assert findings, "scanner 应该能找到至少一个违规(否则测试无意义)"
+
+    # R65 P1-04: 所有违规已修复,findings 为空 — strict 检查平凡通过
+    if not findings:
+        passed, msg, summary = scanner._check_domain_baseline(
+            findings, REAL_BASELINE, strict=True,
+        )
+        assert passed, (
+            f"R65 P1-04: findings 为空时 strict 检查应平凡通过: {msg}"
+        )
+        assert summary["real_violations"] == 0, "real_violations 必须为 0"
+        assert summary["expired_entries"] == 0, "不应有过期条目"
+        return
 
     # 用真实 baseline 运行 strict 检查
     passed, msg, summary = scanner._check_domain_baseline(
@@ -440,6 +454,9 @@ def test_real_baseline_allowlist_entries_have_all_fields():
     """补充集成测试: 真实 baseline 的所有 allowlist 条目都有完整字段。
 
     验证每个条目包含: file/line/fingerprint/owner/reason/expiry/ticket。
+
+    R65 P1-04: observability allowlist 已清空(175 → 0),所有违规已修复。
+    allowlist 为空时,本测试验证空状态合规(无条目需校验)。
     """
     if not REAL_BASELINE.exists():
         pytest.skip(f"真实 baseline 不存在: {REAL_BASELINE}")
@@ -448,7 +465,14 @@ def test_real_baseline_allowlist_entries_have_all_fields():
     allowlist = data.get("domains", {}).get("observability", {}).get("allowlist", [])
 
     required_fields = {"file", "line", "fingerprint", "owner", "reason", "expiry", "ticket"}
-    assert len(allowlist) > 0, "allowlist 不应为空(应有 278 条存量违规)"
+
+    # R65 P1-04: allowlist 已清空(175 → 0) — 空状态为合规终态
+    if len(allowlist) == 0:
+        assert data.get("violation_count", -1) == 0, (
+            "R65 P1-04: allowlist 为空时 violation_count 应为 0,"
+            f"实际: {data.get('violation_count')}"
+        )
+        return
 
     for i, entry in enumerate(allowlist):
         missing = required_fields - set(entry.keys())
@@ -481,12 +505,23 @@ def test_real_baseline_allowlist_fingerprints_well_formed():
       1. 每个指纹都是合法的 64 字符 sha256 hex;
       2. 唯一指纹数 > 0(防退化);
       3. 唯一指纹数 <= 总条目数(允许结构碰撞)。
+
+    R65 P1-04: observability allowlist 已清空(175 → 0),所有违规已修复。
+    allowlist 为空时,本测试验证空状态合规(无指纹需校验)。
     """
     if not REAL_BASELINE.exists():
         pytest.skip(f"真实 baseline 不存在: {REAL_BASELINE}")
 
     data = json.loads(REAL_BASELINE.read_text(encoding="utf-8"))
     allowlist = data.get("domains", {}).get("observability", {}).get("allowlist", [])
+
+    # R65 P1-04: allowlist 已清空(175 → 0) — 空状态为合规终态
+    if len(allowlist) == 0:
+        assert data.get("violation_count", -1) == 0, (
+            "R65 P1-04: allowlist 为空时 violation_count 应为 0,"
+            f"实际: {data.get('violation_count')}"
+        )
+        return
 
     fingerprints = [entry["fingerprint"] for entry in allowlist]
     # 1. 所有指纹均为 64 字符 sha256 hex

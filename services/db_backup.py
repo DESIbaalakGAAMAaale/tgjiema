@@ -783,6 +783,12 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
                必须使用离线导入/迁移工具转换为三段式格式后再走严格验证路径。
                旧格式 key 命名 db_backup/db_backup_*.json 视为旧格式,直接 FAIL。
 
+    R65 P0-07 / P1-07: capability-seal — 本生产入口被 capability-seal。
+               生产恢复必须改走 ``RestoreOrchestrator`` 蓝绿切换路径(staging →
+               active,禁止原地覆盖生产数据)。逃生舱:仅当环境变量
+               ``ALLOW_LEGACY_RESTORE=1`` 时跳过 seal(供 tests/ 与 scripts/ 中
+               需要直接调用旧 writer 的兼容场景使用)。生产部署绝不应配置此环境变量。
+
     Args:
         key: R2 对象 key（如 db_backup/db_backup_20240101_120000.json）
         tables: 仅恢复指定表；None 则恢复备份中的所有表
@@ -792,8 +798,30 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         {"restored": {table: rows}, "skipped": [tables], "errors": [msgs]}
 
     Raises:
+        AppError(RESTORE_LEGACY_WRITER_SEALED): 生产环境直接调用本入口(capability-seal)
         AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): 旧格式 key 不支持恢复
     """
+    # R65 P0-07 / P1-07: capability-seal — 旧直接 restore writer 已被封存。
+    # 生产环境调用 restore_from_backup() 必须 fail-closed,改走 RestoreOrchestrator
+    # 蓝绿切换路径(staging → active,禁止原地覆盖)。
+    # 逃生舱:ALLOW_LEGACY_RESTORE=1 仅限 tests/ 与 scripts/ 兼容场景使用,
+    # 生产部署绝不应配置(应在系统层强制 unset)。
+    if os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() not in ("1", "true", "yes"):
+        logger.error(
+            _i18n_t(
+                "diagnostics.r65.p0_07.capability_sealed",
+                entry_point="db_backup.restore_from_backup()",
+                caller="db_backup.restore_from_backup",
+            )
+        )
+        raise AppError(
+            ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
+            params={
+                "caller": "db_backup.restore_from_backup",
+                "reason": "legacy_writer_sealed",
+            },
+        )
+
     # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
     await configure_r2_dynamic()
     if not r2_storage._access_key:

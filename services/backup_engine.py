@@ -1488,6 +1488,9 @@ class BackupEngine:
                     encryption_key_id=(enc_info or {}).get("key_id", ""),
                     schema_fingerprint=manifest.get("schema_version", MANIFEST_SCHEMA_VERSION),
                     issuer=f"BackupEngine._restore_internal:{backup_id}",
+                    # R65 P1-06: 传递 created_at 用于 _enrich_payload_data 补齐
+                    # canonical payload 必填字段
+                    created_at=manifest.get("created_at", ""),
                 )
             except Exception as e:
                 return {

@@ -49,6 +49,23 @@ def _canonical_bytes(mod, data: dict) -> bytes:
     return mod._canonical_json_bytes(data)
 
 
+def _valid_payload(data: dict) -> dict:
+    """R65 P1-06: 补齐 canonical payload 必填字段(version/backup_id/created_at/tables)。
+
+    R65 P1-06 在 VerifiedBackupPayload.__post_init__ 中添加了 7 维构造时强校验,
+    存量 R64 P1-01 测试使用的 data dict 仅含 tables/backup_id,需补齐为完整
+    canonical payload 才能通过新校验。已有字段保留原值,不覆盖。
+    """
+    base = {
+        "version": 1,
+        "backup_id": "b001",
+        "created_at": "2024-01-01T00:00:00Z",
+        "tables": {},
+    }
+    base.update(data)
+    return base
+
+
 # ═══════════════════════════════════════════════════════════════
 # 1. VerifiedBackupPayload 构造 API:只接受 canonical_payload_bytes
 # ═══════════════════════════════════════════════════════════════
@@ -60,7 +77,7 @@ class TestVerifiedBackupPayloadConstructorAPI:
     def test_accepts_canonical_payload_bytes(self):
         """构造时接受 canonical_payload_bytes 参数。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"}
+        data = _valid_payload({"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -111,7 +128,7 @@ class TestPayloadTablesAreProperties:
     def test_payload_is_mapping_proxy(self):
         """payload property 返回 MappingProxyType(只读 view)。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"}
+        data = _valid_payload({"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -125,7 +142,7 @@ class TestPayloadTablesAreProperties:
     def test_tables_is_mapping_proxy(self):
         """tables property 返回 MappingProxyType(只读 view)。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"tables": {"users": [{"user_id": 1}]}}
+        data = _valid_payload({"tables": {"users": [{"user_id": 1}]}})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -139,7 +156,7 @@ class TestPayloadTablesAreProperties:
     def test_payload_decoded_from_canonical_bytes(self):
         """payload 内容与 canonical_payload_bytes 解码一致。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"tables": {"users": [{"user_id": 1, "name": "alice"}]}, "backup_id": "b001"}
+        data = _valid_payload({"tables": {"users": [{"user_id": 1, "name": "alice"}]}, "backup_id": "b001"})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -155,7 +172,7 @@ class TestPayloadTablesAreProperties:
     def test_tables_decoded_from_canonical_bytes(self):
         """tables 内容从 canonical_payload_bytes 解码(单一来源)。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"tables": {"users": [{"user_id": 1}], "posts": [{"id": 10}]}}
+        data = _valid_payload({"tables": {"users": [{"user_id": 1}], "posts": [{"id": 10}]}})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -169,10 +186,10 @@ class TestPayloadTablesAreProperties:
         assert payload.tables["users"][0]["user_id"] == 1
         assert payload.tables["posts"][0]["id"] == 10
 
-    def test_tables_empty_when_no_tables_key(self):
-        """canonical_payload_bytes 不含 tables 键时,tables 返回空 view。"""
+    def test_tables_empty_when_tables_is_empty_dict(self):
+        """R65 P1-06 适配:tables 必填,但可为空 dict(无表)→ tables 返回空 view。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"backup_id": "b001"}
+        data = _valid_payload({"tables": {}})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -196,7 +213,7 @@ class TestPayloadDigestFromCanonicalBytes:
     def test_digest_equals_sha256_of_canonical_bytes(self):
         """payload_digest == sha256(canonical_payload_bytes).hexdigest()。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"}
+        data = _valid_payload({"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -212,8 +229,8 @@ class TestPayloadDigestFromCanonicalBytes:
     def test_digest_changes_with_different_bytes(self):
         """不同 canonical_payload_bytes 产生不同 digest。"""
         mod = _ensure_backup_dr_validate_importable()
-        cb1 = _canonical_bytes(mod, {"tables": {"users": [{"user_id": 1}]}})
-        cb2 = _canonical_bytes(mod, {"tables": {"users": [{"user_id": 2}]}})
+        cb1 = _canonical_bytes(mod, _valid_payload({"tables": {"users": [{"user_id": 1}]}}))
+        cb2 = _canonical_bytes(mod, _valid_payload({"tables": {"users": [{"user_id": 2}]}}))
         p1 = mod.VerifiedBackupPayload(
             backup_id="b1", manifest_sha256="a" * 64, plaintext_sha256="c" * 64,
             schema_fingerprint="fp", canonical_payload_bytes=cb1,
@@ -227,7 +244,7 @@ class TestPayloadDigestFromCanonicalBytes:
     def test_digest_stable_across_repeated_payload_access(self):
         """多次访问 payload property 不改变 digest(基于不可变 bytes)。"""
         mod = _ensure_backup_dr_validate_importable()
-        cb = _canonical_bytes(mod, {"tables": {"users": [{"user_id": 1}]}})
+        cb = _canonical_bytes(mod, _valid_payload({"tables": {"users": [{"user_id": 1}]}}))
         payload = mod.VerifiedBackupPayload(
             backup_id="b001", manifest_sha256="a" * 64, plaintext_sha256="c" * 64,
             schema_fingerprint="fp", canonical_payload_bytes=cb,
@@ -250,7 +267,7 @@ class TestSingleCanonicalSource:
     def test_tables_consistent_with_payload(self):
         """payload.tables 与 tables property 一致(同一 bytes 解码)。"""
         mod = _ensure_backup_dr_validate_importable()
-        data = {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"}
+        data = _valid_payload({"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"})
         cb = _canonical_bytes(mod, data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001", manifest_sha256="a" * 64, plaintext_sha256="c" * 64,

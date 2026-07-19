@@ -213,6 +213,19 @@ jobs:
     # R44/R48: 扫描硬编码用户面向中文字符串,强制走 i18n
     - name: Scan hardcoded user-facing strings
       run: python scripts/scan_hardcoded_strings.py
+    # R65 P1-03: i18n 严格出口边界 7 维门禁(strict export boundary gate)。
+    # 校验维度:
+    #   1. zh-CN ↔ en-US key 集合对等(无孤儿 key)
+    #   2. ICU AST 结构等价(selector 集合 + 占位符数量/类型一致)
+    #   3. 参数名一致(`{count}` 不能变成 `{n}`)
+    #   4. en-US 禁止 CJK 占位副本(防止混合语言)
+    #   5. zh-CN 禁止英文业务文案泄漏(技术术语白名单)
+    #   6. 内部异常禁止经 UserMessage/ErrorEnvelope 泄漏(AST 扫描生产代码)
+    #   7. 生产代码 translate/format_message/format_message_icu 必须显式绑定 locale
+    # baseline ratchet 模式:结构性(dims 1-3)+ AST(dims 6-7)硬违规必须 0,
+    #                       文案违规(dims 4-5)允许 baseline 渐进式清零。
+    - name: Check i18n strict export boundary (R65 P1-03, 7-dim strict gate)
+      run: python scripts/check_i18n_strict_export_boundary.py --strict
 
   # ─── R49 终审整改: 启用所有已存在但未在 CI 中调用的静态 scanner 为 required gate ────
   # 背景: 以下 scanner 此前代码层已完成但门禁未实际启用(R49 终审报告核心整改:
@@ -252,10 +265,10 @@ jobs:
     - name: Check password safety (AST scan, no password in f-string/print/logger)
       run: python scripts/check_password_safety.py --strict
     # R56 P1-5 Scanner 5: 错误协议边界检查(禁止 except pass/裸 return/未登记错误码)
-    # 使用 baseline 模式:ratchet 下降 pre-existing fail-open 债务(349 处),
-    # 只允许减少不允许新增。修复后运行 --generate-baseline 下降基线。
+    # R65 P1-04: 切换为 --strict 模式 — observability allowlist 已清空(175 → 0),
+    # 任何未 allowlist 违规即阻断合并。scanner 默认即为 strict,此处显式标注。
     - name: Check error protocol (AST scan, no except pass/bare return/unregistered codes)
-      run: python scripts/check_error_protocol.py --baseline scripts/error_protocol_baseline.json
+      run: python scripts/check_error_protocol.py --strict
     # R59 §5.2 P1 Scanner 6: ErrorRegistry 唯一注册源门禁
     # 检查直接字符串错误码字面量、动态拼接错误码(f-string/BinOp)、
     # 未知 ErrorCodes 引用、registry 内部一致性(duplicate code/缺失元信息/错误 HTTP 映射)、
@@ -271,26 +284,59 @@ jobs:
     # verify_mfa_receipt_authoritative()。用 AST/import graph 静态阻断回归。
     - name: Check MFA verifier gate (R64 P1-05, no sync verifier in production)
       run: python scripts/check_mfa_verifier_gate.py
-    # R64 P1-06 Scanner 8: Sink import-boundary AST 门禁
+    # R64 P1-06 / R65 P1-01 Scanner 8: Sink import-boundary AST 门禁
     # 阻止业务模块(bots/ services/)直接调用第三方 send/edit/response API
     # (telegram send/edit、fastapi JSONResponse),必须经过 services/sink_adapters/*
-    # typed adapter。使用 baseline 模式:ratchet 下降 100+ 处存量直调,
-    # 只允许减少不允许新增。修复后运行 --generate-baseline 下降基线。
-    - name: "Scanner 8: Sink import boundary gate"
-      run: python scripts/check_sink_import_boundary.py --baseline scripts/sink_import_boundary_baseline.json
-    # R64 P1-09 Scanner 9: a11y 强制矩阵门禁
-    # 验证 tests/e2e/generated_a11y_matrix_cases.json 覆盖
-    # 2 locales × 2 input_modes × 16 states = 64 用例,
-    # expected_count == 实际用例数,矩阵维度完整(缺失任何维度 → fail-closed)。
-    # 可选消费 Playwright JSON 报告验证 executed == expected 且无 skip/xpass。
-    - name: "Scanner 9: a11y matrix enforcement (R64 P1-09, 2x2x16 coverage)"
-      run: python scripts/check_a11y_matrix_enforcement.py
+    # typed adapter。R65 P1-01 已将全部 486 项存量违规迁移到 typed adapter,
+    # CI/Release 由 baseline ratchet 切换为 --strict(任何违规都失败)。
+    - name: "Scanner 8: Sink import boundary gate (R65 P1-01 strict mode)"
+      run: python scripts/check_sink_import_boundary.py --strict
+    # R65 P1-02 Scanner 9: a11y 矩阵真实执行对等门禁
+    # 审计 R65 P1-02: "A11y 64 矩阵是清单,不是 64 个已执行测试。"
+    # 整改: scanner 的 --test-report 改为强制必填(无报告即失败)。
+    # - 矩阵完整性 + 执行对等 + case→test 映射 三项检查全部依赖 Playwright JSON report。
+    # - ci.yml static-gates job 不运行 Playwright(无 browser/webServer),无法提供 report。
+    # - 因此 scanner 从 ci.yml 移除,统一在 e2e.yml 中 Playwright 运行后强制执行:
+    #     python scripts/check_a11y_matrix_enforcement.py \
+    #         --test-report tests/e2e/test-results/a11y-report.json
+    # - e2e.yml 中无 continue-on-error,任一失败即阻断合并。
+    # - 严格规则: executed==64 && passed==64 && skipped==0;
+    #   failed/flaky/timedOut/unexpected 任一 > 0 即失败。
+    # - 历史背景(R64 P1-09): 矩阵覆盖 2 locales × 2 input_modes × 16 states = 64 用例。
     # R64 P1-08 Scanner 10: 按钮 UX 完整性门禁
     # 验证每个高风险 handler 的 action_type 映射到 HIGH_RISK_POLICY action 且有
     # ButtonUXSpec(Rule D: 目标/影响/不可逆性/审批状态/取消按钮)。
     # 同时复跑 Rule A(CommandBus 路由)/ Rule B(sidecar 元数据)/ Rule C(签名绑定)。
     - name: "Scanner 10: Button UX completeness gate (R64 P1-08, destructive action UXSpec)"
       run: python scripts/check_button_handler_gate.py
+    # R65 P0-07 / P1-07 Scanner 11: 旧 restore writer capability-seal 门禁
+    # 阻止生产代码(bots/ services/ admin/ run_all.py 等)直接调用旧直接
+    # restore writer(_restore_from_backup_data / _restore_crdb_tables /
+    # _restore_sqlite_tables_to_db / run_restore)。生产恢复必须改走
+    # RestoreOrchestrator 蓝绿切换路径(staging → active,禁止原地覆盖)。
+    # 默认模式:扫描直接调用私有 writer 与 CLI 入口的违规。
+    # --strict 模式(在 release-gates.yml 中启用)额外覆盖 strict service 与
+    # backup wrapper 公共入口调用。
+    - name: "Scanner 11: Restore legacy writer capability-seal gate (R65 P0-07/P1-07)"
+      run: python scripts/check_restore_no_legacy_writer.py
+    # R65 P1-11 Scanner 12: 按钮式流程真实 UX 落地门禁
+    # 审计 P1-11: 按钮式流程要从 policy 表落到真实 UX。ButtonUXSpec 需要在真实
+    # Telegram/Web handler 上验证:目标、影响、不可逆性、审批状态、MFA 状态、
+    # resource version、确认、取消、过期恢复、重试和返回按钮均真实渲染;
+    # 不能只检查 sidecar metadata。
+    # 5 条规则(strict 默认,任何违规 exit 1):
+    #   Rule E: HIGH_RISK_POLICY action 在 ACTION_TYPE_TO_POLICY_ACTIONS 映射中时
+    #           必须在 inventory 中存在至少一个高风险 handler(policy-only action 跳过)
+    #   Rule F: 高风险 handler 文件(含 Telegram sibling .py)必须 AST 扫描到
+    #           InlineKeyboardButton(... callback_data=...)(Telegram)
+    #           或 RedirectResponse / HTMLResponse(Web)
+    #   Rule G: 每个 HIGH_RISK_POLICY action × {zh-CN, en-US} 必须通过
+    #           verify_all_lifecycle_paths 5 条路径(confirm/cancel/expire/retry/return)
+    #   Rule H: 所有 spec 引用的 i18n key 在 zh-CN.json 与 en-US.json 中都有非空值
+    #   Rule I: Telegram handler 必须用 UserMessage.from_* + locale 绑定;
+    #           Web handler 仅要求 locale 绑定(HTML 模板渲染,UserMessage 不直接适用)
+    - name: "Scanner 12: Button flow real UX gate (R65 P1-11, real handler + 5 lifecycle paths)"
+      run: python scripts/check_button_flow_real_ux.py --strict
 
   # R40 P2-1: 安全扫描(bandit)
   security:

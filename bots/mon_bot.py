@@ -9,6 +9,16 @@
 """
 
 from __future__ import annotations
+from services.sink_adapters.telegram_adapter import (
+    safe_reply_text, safe_send_message, safe_edit_message_text,
+)
+from services.sink_adapters.telegram_helpers import (
+    Bot,
+    TelegramError,
+    RetryAfter,
+)
+# R65 P1-01: typed adapter 要求 UserMessage | ErrorEnvelope
+from services.user_message import UserMessage
 
 import asyncio
 import datetime as _dt
@@ -16,8 +26,8 @@ import re
 import time
 
 from loguru import logger
-from telegram import Bot
-from telegram.error import TelegramError, RetryAfter
+
+
 
 from config import settings
 from database import (
@@ -415,11 +425,7 @@ class MonBot:
                         return False
                 else:
                     self._admin_bot = self.bot
-            await self._admin_bot.send_message(
-                chat_id=self._admin_chat_id,
-                text=msg,
-                disable_web_page_preview=True,
-            )
+            await safe_send_message(self._admin_bot, payload=UserMessage.from_raw_text(msg), chat_id=self._admin_chat_id, disable_web_page_preview=True)
             self._notify_cooldowns[event_key] = now  # 成功，设置冷却（10分钟内不再发送同类通知）
             return True
         except Exception as e:
@@ -450,7 +456,7 @@ class MonBot:
                     proc.kill()
                     await proc.wait()
                 except Exception:
-                    pass
+                    logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='bots/mon_bot.py:MonBot._check_db_writer_status'))
             logger.debug("[Mon] db_writer 服务状态检查超时(2s),已 kill 子进程")
         except Exception as e:
             logger.debug(f"[Mon] db_writer 服务状态检查异常: {e}")

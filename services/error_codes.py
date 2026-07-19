@@ -88,6 +88,9 @@ class ErrorCodes:
     # R64 P1-01: payload 含不可序列化类型(bytes/NaN/Infinity/自定义对象)— fail-closed
     # 禁止 default=str 静默字符串化,只允许 JSON schema 声明类型
     BACKUP_PAYLOAD_NOT_SERIALIZABLE = "BACKUP.PAYLOAD.NOT_SERIALIZABLE"
+    # R65 P1-06: canonical payload 构造时强校验失败 — 7 维校验任一未通过即 fail-closed
+    # 拒绝"任意 JSON bytes"被称为 canonical,强制调用方传入合法 canonical bytes
+    BACKUP_PAYLOAD_CANONICAL_INVALID = "BACKUP.PAYLOAD.CANONICAL_INVALID"
 
     # EFFECT_RECEIPT
     EFFECT_RECEIPT_MANAGER_UNAVAILABLE = "EFFECT.RECEIPT.MANAGER_UNAVAILABLE"
@@ -370,6 +373,11 @@ class ErrorCodes:
     # R64 P0-04: lease fencing token(lease_version)CAS 不匹配,complete/fail/
     # renew 必须携带正确版本号,版本不匹配表示 lease 已被回收或越权操作
     OUTBOX_LEASE_VERSION_MISMATCH = "OUTBOX.LEASE_VERSION.MISMATCH"
+    # R65 P1-05: 严格 CAS 路径冲突(lease_version is not None 且 CAS 失败)raise。
+    # complete/fail/renew 在严格 CAS 路径下,若 lease_version 不匹配 / 行未找到 /
+    # lease_owner 不匹配,一律 raise 本错误,不再静默返回 False/not_found。
+    # params: event_id / expected_lease_version / operation
+    OUTBOX_LEASE_VERSION_CONFLICT = "OUTBOX.LEASE_VERSION.CONFLICT"
     # R64 P0-04: 未知 event_type 严禁标记成功,必须进入 DLQ(可审批 replay)
     OUTBOX_EVENT_UNKNOWN = "OUTBOX.EVENT.UNKNOWN"
     # R64 P0-04: provider 调用超过租期三分之一时自动续租,续租失败立即停止提交结果
@@ -402,6 +410,39 @@ class ErrorCodes:
     RESTORE_NONCE_PAYLOAD_MISMATCH = "RESTORE.NONCE.PAYLOAD_MISMATCH"
     # phase 转换非法(状态机不允许的转换,如 INIT → COMPLETED)
     RESTORE_PHASE_TRANSITION_INVALID = "RESTORE.PHASE.TRANSITION_INVALID"
+    # R65 P0-07 / P1-07: 旧直接 restore 写入器已被 capability-seal,
+    # 生产入口不能回退到原地覆盖;仅测试 / scripts / orchestrator backend 可调用。
+    # 生产代码若直接调用 db_restore.run_restore() /
+    # _restore_from_backup_data() / _restore_crdb_tables() /
+    # _restore_sqlite_tables_to_db() / validate_and_restore_backup_strict()
+    # (绕过 orchestrator 蓝绿切换)→ 抛此错误 fail-closed。
+    RESTORE_LEGACY_WRITER_SEALED = "RESTORE.LEGACY_WRITER.SEALED"
+
+    # ── R65 P0-05: HighRiskPolicy 未知 destructive action fail-closed ──
+    # action 属于 destructive namespace(匹配 delete/purge/ban/block/takedown/
+    # detach/restore/reset/rotate/assign/revoke/grant/enable/disable/wipe/clear/
+    # shutdown/restart/factory_reset/break_glass/force_logout 等关键词)
+    # 但未在 HIGH_RISK_POLICY 中注册 — 拒绝执行,防止新 destructive action
+    # 被误判为低风险绕过审批/MFA/双人审批门禁
+    HIGH_RISK_ACTION_UNREGISTERED = "HIGH_RISK.ACTION.UNREGISTERED"
+
+    # ── R65 P1-03: i18n 严格出口边界 fail-closed ──
+    # 生产代码(services/ / bots/ / admin/)调用 translate / format_message /
+    # format_message_icu 时未显式传入 locale(依赖全局 _DEFAULT_LOCALE 兜底),
+    # staging/production 必须 fail-closed 抛此错误,禁止 silent fallback。
+    # 测试环境可通过 I18N_ALLOW_FALLBACK=1 逃生舱保留旧行为(向后兼容)。
+    I18N_LOCALE_NOT_BOUND = "I18N.LOCALE.NOT_BOUND"
+    # ICU 运行时解析失败(占位符缺失 / 括号不平衡 / selector 缺失等),
+    # staging/production 必须 fail-closed 抛此错误,禁止把原始 ICU 大括号
+    # 展示给用户(I18N_ICU_COMPILE_FAILED 仅覆盖 load_locale 阶段预编译失败,
+    # 本错误码覆盖运行时 format_message_icu 路径的解析失败)。
+    I18N_PARSE_FAILED = "I18N.PARSE.FAILED"
+
+    # ── R65 P0-04: 生产证据严格门禁 ──
+    # production promotion 必须基于独立、签名、不可变、未过期的真实证据 artifact。
+    # 任一必需证据缺失/过期/dry_run/未签名/--skip 使用,均阻断晋级并抛此错误。
+    # params: reason (主因) / missing (缺失或过期的证据类型列表,逗号分隔)
+    PRODUCTION_EVIDENCE_INSUFFICIENT = "PRODUCTION.EVIDENCE.INSUFFICIENT"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -3020,6 +3061,22 @@ def _register_defaults() -> None:
         audit_level="critical",
     ))
 
+    # ── R65 P1-06: Backup canonical payload 构造时强校验 ──
+    # 500 critical — VerifiedBackupPayload.__post_init__ 在计算 SHA-256 之前先执行
+    # 7 维构造时校验(bytes/UTF-8/JSON object/无重复 key/schema/tables 类型/canonical round-trip),
+    # 任一未通过即 fail-closed,拒绝"任意 JSON bytes"被称为 canonical
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_PAYLOAD_CANONICAL_INVALID,
+        message_key="errors.backup.payload.canonical_invalid",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "field"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
     # ── R63 P0-05: Outbox worker fail-fast ──
     # 500 critical — 生产模式无 provider,拒绝 stub 误启动
     ErrorRegistry.register(ErrorDefinition(
@@ -3057,6 +3114,21 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["event_id", "lease_version"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+
+    # ── R65 P1-05: 严格 CAS 路径冲突(lease_version is not None 且 CAS 失败)raise ──
+    # 409 conflict — complete/fail/renew 严格 CAS 路径下 lease_version 不匹配 /
+    # 行未找到 / lease_owner 不匹配,一律 raise(不再静默返回 False/not_found)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.OUTBOX_LEASE_VERSION_CONFLICT,
+        message_key="errors.outbox.lease_version.conflict",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["event_id", "expected_lease_version", "operation"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",
@@ -3212,6 +3284,82 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["operation_id", "phase_from", "phase_to", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 403 critical — R65 P0-07 / P1-07: 旧直接 restore 写入器已被 capability-seal
+    # 生产代码不能回退到原地覆盖;仅测试 / scripts / orchestrator backend 可调用。
+    # 调用 db_restore.run_restore / _restore_from_backup_data / _restore_crdb_tables /
+    # _restore_sqlite_tables_to_db / validate_and_restore_backup_strict(绕过 orchestrator)
+    # 时 fail-closed,需通过 RestoreOrchestrator 蓝绿切换路径执行恢复。
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
+        message_key="errors.restore.legacy_writer.sealed",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["caller", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 403 critical — R65 P0-05: 未知 destructive action fail-closed
+    # action 匹配 destructive namespace 但未在 HIGH_RISK_POLICY 中注册,
+    # 拒绝执行(防止新 destructive action 被误判为低风险绕过审批门禁)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.HIGH_RISK_ACTION_UNREGISTERED,
+        message_key="errors.high_risk.action.unregistered",
+        http_status=403,
+        retryable=False,
+        severity="critical",
+        safe_params=["action", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # ── R65 P1-03: i18n 严格出口边界 fail-closed ──
+    # 500 critical — 生产代码调用 translate/format_message/format_message_icu
+    # 时未显式传入 locale(依赖全局 _DEFAULT_LOCALE 兜底),
+    # staging/production 必须 fail-closed 抛此错误。
+    # safe_params 仅含 key 与 caller(无敏感信息);locale 字段为缺失项,
+    # 仅作诊断用(无用户敏感数据)。
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.I18N_LOCALE_NOT_BOUND,
+        message_key="errors.i18n.locale.not_bound",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["key", "caller"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — ICU 运行时解析失败(占位符缺失 / 括号不平衡 / selector 缺失等),
+    # staging/production 必须 fail-closed 抛此错误,禁止把原始 ICU 大括号
+    # 展示给用户。safe_params 仅含 key / locale / reason(均无敏感信息)。
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.I18N_PARSE_FAILED,
+        message_key="errors.i18n.parse.failed",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["key", "locale", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 412 critical — R65 P0-04: 生产证据不足,无法晋级
+    # production promotion 只接受独立、签名、不可变、未过期的真实证据 artifact。
+    # 任一必需证据缺失/过期/dry_run/未签名/--skip 使用,均阻断晋级。
+    # safe_params 仅含 reason / missing(无敏感信息,仅证据类型名)。
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+        message_key="errors.production.evidence.insufficient",
+        http_status=412,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "missing"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",

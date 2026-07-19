@@ -236,6 +236,22 @@ def reset_redis_queue_state():
     yield
 
 
+@pytest.fixture(autouse=True)
+def allow_legacy_restore_writer(monkeypatch):
+    """R65 P0-07 / P1-07: 测试环境逃生舱 — 设置 ALLOW_LEGACY_RESTORE=1。
+
+    生产环境绝不应配置此环境变量(应在系统层强制 unset)。该 fixture 仅用于
+    让历史向后兼容测试(如 R62 / R63 直接调用 ``run_restore()`` /
+    ``_restore_from_backup_data()``)继续工作,无需在每个用例中手动设置。
+
+    需要测试 ``ALLOW_LEGACY_RESTORE`` 未设置时 ``run_restore()`` 抛
+    ``AppError(RESTORE_LEGACY_WRITER_SEALED)`` 的用例可在用例内显式调用
+    ``monkeypatch.delenv("ALLOW_LEGACY_RESTORE", raising=False)`` 覆盖本 fixture。
+    """
+    monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
+    yield
+
+
 @pytest.fixture
 def mock_settings():
     """返回共享的模拟 settings 对象。

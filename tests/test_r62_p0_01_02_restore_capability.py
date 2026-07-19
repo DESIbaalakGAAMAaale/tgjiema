@@ -382,7 +382,10 @@ class TestVerifiedBackupPayload:
             plaintext_sha256="c" * 64,
             schema_fingerprint="R62-fingerprint",
             canonical_payload_bytes=mod._canonical_json_bytes(
-                {"tables": {"users": [{"user_id": 1}]}}
+                mod._enrich_payload_data(
+                    {"tables": {"users": [{"user_id": 1}]}},
+                    backup_id="backup_001", created_at="2024-01-01T00:00:00Z",
+                )
             ),
         )
         # frozen=True → 赋值应抛 FrozenInstanceError(AttributeError 子类)
@@ -392,7 +395,10 @@ class TestVerifiedBackupPayload:
     def test_verified_backup_payload_payload_digest_computed(self):
         """VerifiedBackupPayload.payload_digest 自动从 canonical_payload_bytes 计算。"""
         mod = _ensure_backup_dr_validate_importable()
-        payload_data = {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"}
+        payload_data = mod._enrich_payload_data(
+            {"tables": {"users": [{"user_id": 1}]}, "backup_id": "b001"},
+            backup_id="b001", created_at="2024-01-01T00:00:00Z",
+        )
         canonical_bytes = mod._canonical_json_bytes(payload_data)
         payload = mod.VerifiedBackupPayload(
             backup_id="b001",
@@ -510,6 +516,8 @@ def _build_three_stage_backup(
         "plaintext_sha256": plaintext_sha,
         "ciphertext_sha256": original_ciphertext_sha,  # 原始密文的 sha
         "backup_id": backup_id,
+        # R65 P1-06: created_at 用于 _enrich_payload_data 补齐 canonical payload 必填字段
+        "created_at": "2026-07-18T12:00:00Z",
         "content_size_bytes": len(plaintext),
         "backup_started_at": "2026-07-18T12:00:00",
         "backup_finished_at": "2026-07-18T12:00:01",
@@ -866,13 +874,17 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
 
         # verified_payload.tables 包含真实数据
         # R64 P1-01: 单一 canonical bytes 来源 — tables/payload 均从 canonical_payload_bytes 解码
+        # R65 P1-06: 用 _enrich_payload_data 补齐 canonical payload 必填字段
         verified_payload = mod.VerifiedBackupPayload(
             backup_id="backup_test_001",
             manifest_sha256="a" * 64,
             plaintext_sha256="c" * 64,
             schema_fingerprint="R62-P0-01-test-fingerprint",
             canonical_payload_bytes=mod._canonical_json_bytes(
-                {"tables": {"users": [{"user_id": 1, "username": "test"}]}}
+                mod._enrich_payload_data(
+                    {"tables": {"users": [{"user_id": 1, "username": "test"}]}},
+                    backup_id="backup_test_001", created_at="2024-01-01T00:00:00Z",
+                )
             ),
         )
         cap = _build_valid_capability(
@@ -919,7 +931,10 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
             plaintext_sha256="c" * 64,
             schema_fingerprint="R62-P0-01-test-fingerprint",
             canonical_payload_bytes=mod._canonical_json_bytes(
-                {"tables": {"users": [{"user_id": 1}]}}
+                mod._enrich_payload_data(
+                    {"tables": {"users": [{"user_id": 1}]}},
+                    backup_id="backup_test_001", created_at="2024-01-01T00:00:00Z",
+                )
             ),
         )
         # 构造一个 capability,但其 payload_digest 与 verified_payload 不匹配

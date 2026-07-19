@@ -23,6 +23,8 @@ from config import settings
 from services.i18n import get_i18n_manager, set_user_locale as _i18n_set_user_locale, translate as _i18n_t
 # R48 P1: 统一错误码协议化(替代裸字符串 ValueError/RuntimeError)
 from services.error_codes import AppError, ErrorCodes
+# R65 P1-04: 模块级 logger(observability allowlist 清零后,except 块需 logger.exception)
+from loguru import logger
 
 app = FastAPI(title=_i18n_t('admin.__init__.s4'))
 security = HTTPBasic()
@@ -451,7 +453,7 @@ def _warn_if_plaintext_password() -> None:
                     "在修复前所有登录尝试将返回 401。"
                 )
         except Exception:
-            pass
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='admin/__init__.py:_warn_if_plaintext_password'))
 
 
 def generate_password_hash(password: str, iterations: int = _PBKDF2_ITERATIONS) -> str:
@@ -546,6 +548,7 @@ def _is_trusted_proxy(peer_host: str) -> bool:
     try:
         ip = _ipaddr.ip_address(peer_host)
     except ValueError:
+        logger.warning(_i18n_t('diagnostics.r65.p1_04.admin_is_trusted_proxy_invalid_ip', peer_host=peer_host))
         return False
     return any(ip in net for net in _TRUSTED_PROXY_NETWORKS)
 
@@ -602,7 +605,7 @@ async def startup():
                 from database import close_db
                 await close_db()
             except Exception:
-                pass
+                logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='admin/__init__.py:startup'))
             sys.exit(1)
     # R45 §7.1: 强制 readiness 检查 — 未 bootstrap 时退出非零
     # 放在 init_db 之后、_load_state_from_cache 之前,确保 DB 已就绪再校验
@@ -620,7 +623,7 @@ async def shutdown():
         from database import close_db
         await close_db()
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='admin/__init__.py:shutdown'))
 
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -970,7 +973,7 @@ async def _mfa_enforcement_middleware(request: Request, call_next):
             return RedirectResponse(url="/login/mfa", status_code=302)
     except Exception:
         # 读取异常时放行,由 require_session 依赖处理
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='admin/__init__.py:_mfa_enforcement_middleware'))
     return await call_next(request)
 
 
@@ -1301,7 +1304,7 @@ async def login_mfa_verify(
         )
         await store._db.commit()
     except Exception:
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='admin/__init__.py:login_mfa_verify'))
 
     # 创建 session
     # R41 P1-2: MFA 验证通过后 mfa_verified=True
@@ -1524,7 +1527,7 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
                 locale_value = principal_locale
     except Exception:
         # 出错时保持默认 zh-CN,避免影响模板渲染
-        pass
+        logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='admin/__init__.py:_make_csrf_response'))
     context["locale"] = locale_value
     # R55 i18n: 注入 locale-aware t() 到模板上下文(覆盖 Jinja2 global)
     def _ctx_t(key: str, **kwargs) -> str:

@@ -27,6 +27,10 @@ from services.sink_adapters.telegram_adapter import (
     safe_reply_text,
     safe_send_message,
     safe_edit_message_text,
+    safe_answer_callback_query,
+    build_inline_keyboard,
+    build_bot,
+    build_input_media,
 )
 from services.sink_adapters.web_adapter import json_response
 
@@ -34,5 +38,9 @@ __all__ = [
     "safe_reply_text",
     "safe_send_message",
     "safe_edit_message_text",
+    "safe_answer_callback_query",
+    "build_inline_keyboard",
+    "build_bot",
+    "build_input_media",
     "json_response",
 ]

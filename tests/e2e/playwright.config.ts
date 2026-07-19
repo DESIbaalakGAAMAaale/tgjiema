@@ -85,15 +85,24 @@ const WEB_SERVER_ENV: Record<string, string> = {
 };
 
 export default defineConfig({
-  testDir: '.',
+  // R65 P1-02: testDir 设为 '..'(tests/ 目录),同时包含:
+  //   - tests/e2e/*.spec.ts(admin/session/mfa/a11y 行为测试)
+  //   - tests/a11y/*.spec.ts(64 个矩阵 stub 测试,确保 executed==64)
+  // check_a11y_matrix_enforcement.py 通过 file 路径过滤只计 tests/a11y/ 的测试。
+  testDir: '..',
   fullyParallel: false,  // Admin 测试需要串行,避免 session 冲突
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: 1,  // 单 worker,串行执行
   // R47 P0-3: 测试结果输出目录(trace/video/screenshot/axe JSON)
   outputDir: './test-results',
+  // R65 P1-02: 启用 JSON reporter 输出固定 artifact
+  // - tests/e2e/test-results/a11y-report.json(相对于 playwright.config.ts)
+  // - check_a11y_matrix_enforcement.py --test-report 消费此文件做执行对等校验
+  // - CI 中 Scanner 9 在 Playwright 运行后强制校验 executed==64, passed==64, skipped==0
   reporter: [
     ['html'],
+    ['json', { outputFile: 'test-results/a11y-report.json' }],
     ['list'],
   ],
   use: {

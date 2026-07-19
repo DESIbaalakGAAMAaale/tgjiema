@@ -63,6 +63,14 @@ jobs:
           cd tests/e2e
           npm install
           npx playwright install --with-deps chromium
+          # R65 P1-02: testDir='..' 同时运行 tests/e2e/ + tests/a11y/ 测试。
+          # tests/a11y/*.spec.ts 需要解析 @playwright/test,但 npm install 在
+          # tests/e2e/ 完成,node_modules 仅在 tests/e2e/node_modules/。
+          # Node 模块解析从文件位置向上查找:tests/a11y/ → tests/ → /。
+          # 创建 tests/a11y/node_modules 符号链接指向 tests/e2e/node_modules,
+          # 使 tests/a11y/*.spec.ts 能解析 @playwright/test / @axe-core/playwright。
+          ln -sfn "$PWD/node_modules" ../a11y/node_modules
+          ls -la ../a11y/node_modules | head -1
 
       # ════════════════════════════════════════════════════════════
       # R62 P1-06: a11y 测试预检查 — 在 Playwright 运行前硬失败检测假绿条件
@@ -275,6 +283,45 @@ jobs:
             exit 1
           fi
           echo "[R62 P1-06] locale 执行验证通过(zh-CN: $ZH_COUNT 标记, en-US: $EN_COUNT 标记)"
+
+      # ════════════════════════════════════════════════════════════
+      # R65 P1-02: a11y 64 矩阵真实执行对等门禁(强制门禁)
+      #
+      # 审计 R65 P1-02: "A11y 64 矩阵是清单,不是 64 个已执行测试。"
+      # scanner 默认调用不带 --test-report;代码明确在无报告时返回 ok=True
+      # 并输出"跳过执行对等检查"。因此 CI 中 Scanner 9 只验证 generated JSON
+      # 的笛卡尔积,不验证 Playwright 实际执行数、skip 或失败。
+      #
+      # 整改:
+      #   1. Playwright config 启用 JSON reporter (输出 test-results/a11y-report.json)
+      #   2. E2E 后强制运行 check_a11y_matrix_enforcement.py --test-report <report>
+      #   3. 无报告、解析失败、executed ≠ 64、任何 skip/flaky/timedOut/unexpected 均失败
+      #   4. failed/flaky/timedOut 不计合格 executed;要求 64 个最终状态全部 passed
+      #   5. generated case 必须真正映射到测试函数与 route/state fixture
+      #
+      # 注意: 此步骤无 continue-on-error — 任一失败即阻断合并。
+      # 矩阵 case → tests/a11y/*.spec.ts 的映射校验也在本步骤执行。
+      # ════════════════════════════════════════════════════════════
+      - name: "R65 P1-02: a11y matrix real execution parity gate"
+        if: always() && steps.playwright.outcome != 'skipped'
+        run: |
+          echo "[R65 P1-02] 强制校验 Playwright JSON 报告(executed==64, passed==64, skipped==0)"
+          REPORT_PATH="tests/e2e/test-results/a11y-report.json"
+          if [ ! -f "$REPORT_PATH" ]; then
+            echo "ERROR: Playwright JSON report 未生成: $REPORT_PATH"
+            echo "[R65 P1-02] 无报告即失败 — 必须启用 JSON reporter (playwright.config.ts)"
+            exit 1
+          fi
+          echo "[R65 P1-02] 报告路径: $REPORT_PATH"
+          python scripts/check_a11y_matrix_enforcement.py --test-report "$REPORT_PATH"
+
+      - name: Upload a11y matrix report
+        if: always() && steps.playwright.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: a11y-matrix-report
+          path: tests/e2e/test-results/a11y-report.json
+          if-no-files-found: error
 
       # R48 P0-3: CI 失败排查辅助 — 在 Playwright 步骤失败时输出诊断信息
       - name: Debug - readiness response on failure
