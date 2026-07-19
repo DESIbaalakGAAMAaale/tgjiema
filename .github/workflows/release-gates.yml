@@ -651,7 +651,7 @@ jobs:
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
           echo "  cert dump (first 80 lines):"
-          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80 || true
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
@@ -845,18 +845,32 @@ jobs:
         echo "R62 P1-02: Signing migration manifest (cosign keyless, detached)"
         echo "  manifest: ${MANIFEST}"
         echo "  manifest sha256: $(sha256sum "${MANIFEST}" | awk '{print $1}')"
+        # R65 fix: cosign sign-blob --output-certificate 写入的文件格式 openssl 可能无法解析
+        #          (cosign sign-blob 与 cosign sign 的 --output-certificate 输出格式不同)。
+        #          cosign 始终将有效 PEM cert 打印到 stdout,因此捕获 stdout 并提取 PEM 块,
+        #          保存为独立的 .cert.pem 文件供 openssl 解析 SAN。
+        #          原始 migration-manifest.json.pem 仍保留供 cosign verify-blob 使用。
         cosign sign-blob --yes \
           --output-certificate migration-manifest.json.pem \
           --output-signature migration-manifest.json.sig \
-          "${MANIFEST}"
+          "${MANIFEST}" 2>&1 | tee cosign-sign-manifest.log
         # R63 P0-04: 校验签名产物已生成(后续 verify 步骤依赖此文件)
         if [ ! -s migration-manifest.json.pem ] || [ ! -s migration-manifest.json.sig ]; then
           echo "::error::cosign sign-blob 未输出 certificate/signature"
           echo "  R63 P0-04: 拒绝继续 — manifest 签名产物缺失"
           exit 1
         fi
+        # R65 fix: 从 stdout 日志提取 PEM cert (cosign 打印的有效 PEM 块)
+        awk '/-----BEGIN CERTIFICATE-----/{flag=1} flag{print} /-----END CERTIFICATE-----/{if(flag){exit}}' \
+          cosign-sign-manifest.log > migration-manifest-cert.pem
+        if [ ! -s migration-manifest-cert.pem ]; then
+          echo "::error::无法从 cosign sign-blob stdout 提取 PEM cert"
+          echo "  R65 fix: stdout 日志中未找到 PEM cert 块"
+          exit 1
+        fi
         echo "Migration manifest signed successfully"
         echo "  cert sha256: $(sha256sum migration-manifest.json.pem | awk '{print $1}')"
+        echo "  extracted PEM cert sha256: $(sha256sum migration-manifest-cert.pem | awk '{print $1}')"
         echo "  sig  sha256: $(sha256sum migration-manifest.json.sig | awk '{print $1}')"
       env:
         COSIGN_EXPERIMENTAL: 1
@@ -864,19 +878,21 @@ jobs:
     # R63 P0-01: 从 migration manifest 的 Fulcio cert 提取 certificate-identity (SAN URI)
     #   与 image signing 一致 — 从实际 cert 读取 SAN,而非 github.ref 拼接,
     #   消除 verify 失败导致后续步骤被 skipped 的根因。
+    # R65 fix: 使用从 cosign stdout 提取的 PEM cert 文件 (migration-manifest-cert.pem),
+    #          而非 --output-certificate 直接写入的文件 (openssl 可能无法解析后者格式)。
     - name: Extract certificate identity from Fulcio cert (manifest signing)
       id: extract_manifest_identity
       run: |
         set -euo pipefail
-        CERT_FILE="migration-manifest.json.pem"
+        CERT_FILE="migration-manifest-cert.pem"
         if [ ! -s "${CERT_FILE}" ]; then
           echo "::error::migration manifest cert file missing or empty: ${CERT_FILE}"
           echo "  R63 P0-01: 无法提取 certificate-identity,拒绝继续"
           exit 1
         fi
         echo "R63 P0-01: Extracting certificate-identity (SAN URI) from manifest Fulcio cert"
-        # R65 fix: cosign sign-blob --output-certificate 可能输出 DER 格式,
-        #          openssl x509 默认期望 PEM。尝试 PEM,然后 DER。
+        # R65 fix: 使用从 cosign stdout 提取的 PEM cert,openssl 可直接解析。
+        #          保留 PEM/DER fallback 以增强健壮性。
         SAN_LINE=""
         for inform in PEM DER; do
           SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -inform "${inform}" -noout -ext subjectAltName 2>/dev/null || true)
@@ -894,7 +910,7 @@ jobs:
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
           echo "  cert dump (first 80 lines):"
-          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80 || true
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
@@ -1017,35 +1033,48 @@ jobs:
         echo "R64 P0-02: Signing release manifest (cosign keyless, detached)"
         echo "  release manifest: ${RELEASE_MANIFEST}"
         echo "  release manifest sha256: $(sha256sum "${RELEASE_MANIFEST}" | awk '{print $1}')"
+        # R65 fix: 同 manifest signing — cosign sign-blob --output-certificate 文件格式
+        #          openssl 可能无法解析,捕获 stdout 提取 PEM cert 到独立文件。
         cosign sign-blob --yes \
           --output-certificate release-manifest.json.pem \
           --output-signature release-manifest.json.sig \
-          "${RELEASE_MANIFEST}"
+          "${RELEASE_MANIFEST}" 2>&1 | tee cosign-sign-release-manifest.log
         if [ ! -s release-manifest.json.pem ] || [ ! -s release-manifest.json.sig ]; then
           echo "::error::cosign sign-blob 未输出 certificate/signature (release manifest)"
           echo "  R64 P0-02: 拒绝继续 — release manifest 签名产物缺失"
           exit 1
         fi
+        # R65 fix: 从 stdout 日志提取 PEM cert
+        awk '/-----BEGIN CERTIFICATE-----/{flag=1} flag{print} /-----END CERTIFICATE-----/{if(flag){exit}}' \
+          cosign-sign-release-manifest.log > release-manifest-cert.pem
+        if [ ! -s release-manifest-cert.pem ]; then
+          echo "::error::无法从 cosign sign-blob stdout 提取 PEM cert (release manifest)"
+          echo "  R65 fix: stdout 日志中未找到 PEM cert 块"
+          exit 1
+        fi
         echo "Release manifest signed successfully"
         echo "  cert sha256: $(sha256sum release-manifest.json.pem | awk '{print $1}')"
+        echo "  extracted PEM cert sha256: $(sha256sum release-manifest-cert.pem | awk '{print $1}')"
         echo "  sig  sha256: $(sha256sum release-manifest.json.sig | awk '{print $1}')"
       env:
         COSIGN_EXPERIMENTAL: 1
 
     # R64 P0-02: 从 release manifest 的 Fulcio cert 提取 certificate-identity (SAN URI),
     #   与 image / migration manifest 签名一致 — 都来自本仓库 release-gates.yml 工作流。
+    # R65 fix: 使用从 cosign stdout 提取的 PEM cert 文件 (release-manifest-cert.pem)。
     - name: Extract certificate identity from Fulcio cert (release manifest signing)
       id: extract_release_manifest_identity
       run: |
         set -euo pipefail
-        CERT_FILE="release-manifest.json.pem"
+        CERT_FILE="release-manifest-cert.pem"
         if [ ! -s "${CERT_FILE}" ]; then
           echo "::error::release manifest cert file missing or empty: ${CERT_FILE}"
           echo "  R64 P0-02: 无法提取 certificate-identity,拒绝继续"
           exit 1
         fi
         echo "R64 P0-02: Extracting certificate-identity (SAN URI) from release manifest Fulcio cert"
-        # R65 fix: cosign sign-blob --output-certificate 可能输出 DER 格式,尝试 PEM 然后 DER
+        # R65 fix: 使用从 cosign stdout 提取的 PEM cert,openssl 可直接解析。
+        #          保留 PEM/DER fallback 以增强健壮性。
         SAN_LINE=""
         for inform in PEM DER; do
           SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -inform "${inform}" -noout -ext subjectAltName 2>/dev/null || true)
@@ -1062,7 +1091,7 @@ jobs:
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
           echo "  cert dump (first 80 lines):"
-          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80 || true
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
@@ -1621,7 +1650,8 @@ jobs:
           echo "::error::无法从 sign-image Fulcio cert 提取 SAN URI"
           echo "  cert file: ${CERT_FILE}"
           echo "  subjectAltName raw: ${SAN_LINE}"
-          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80
+          echo "  cert dump (first 80 lines):"
+          openssl x509 -in "${CERT_FILE}" -noout -text 2>&1 | head -80 || openssl x509 -in "${CERT_FILE}" -inform DER -noout -text 2>&1 | head -80 || true
           exit 1
         fi
         echo "  extracted certificate-identity: ${CERT_IDENTITY}"
