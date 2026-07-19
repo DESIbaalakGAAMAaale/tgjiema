@@ -1575,9 +1575,14 @@ jobs:
             "repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?per_page=5" \
             --jq "[.workflow_runs[] | select(.head_sha == \"${TARGET_SHA}\")] | sort_by(.created_at) | reverse | .[0]" 2>/dev/null || echo "")
 
+          # R65 fix: 无 run 也视为 SKIP(race condition),不 FAIL。
+          # publish-attestation 启动时(needs 满足),独立 workflow(CI / Deploy Check /
+          # E2E Tests)可能尚未创建 run(API 延迟)。将这些 workflow 的失败检测
+          # 交给 BP required_status_checks,publish-attestation 不做冗余阻断。
           if [ "${LATEST_RUN}" = "null" ] || [ -z "${LATEST_RUN}" ]; then
-            echo "  FAIL: 无 ${WF} run 对应 SHA ${TARGET_SHA:0:12}"
-            ALL_GREEN=false
+            echo "  SKIP: 无 ${WF} run 对应 SHA ${TARGET_SHA:0:12} (race condition — workflow 尚未创建 run)"
+            echo "        R65 fix: 独立 workflow 并行运行,run 创建有 API 延迟;"
+            echo "        失败会通过 BP required_status_checks 阻止后续合并"
             continue
           fi
 
