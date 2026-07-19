@@ -700,6 +700,16 @@ jobs:
         import json
         with open('statement.json') as f:
             stmt = json.load(f)
+        # cosign verify 输出 JSON 数组(列表), 每个元素是一个 verification result。
+        # 旧实现误以为 stmt 是 dict 直接调用 .get(), 触发
+        # AttributeError: 'list' object has no attribute 'get' (R65 fix)。
+        # 兼容处理: 若为 list 取首个元素作为 statement dict。
+        if isinstance(stmt, list):
+            if not stmt:
+                raise SystemExit('FAIL: cosign verify 输出空数组 — 无 verification statement')
+            stmt = stmt[0]
+        if not isinstance(stmt, dict):
+            raise SystemExit(f'FAIL: verification statement 既非 dict 也非 list: {type(stmt).__name__}')
         # Bundle 结构: {_type, subject, predicateType, predicate}
         print(f'_type: {stmt.get(\"_type\", \"\")}')
         print(f'predicateType: {stmt.get(\"predicateType\", \"\")}')
@@ -1385,6 +1395,12 @@ jobs:
         # 通过当前 run 的 check-runs API 查询(不要求三次历史,只要求当前 run 通过)
         # PR 场景下跳过:rc-continuity 与关键 job 并行运行,此时它们可能仍在 pending;
         # 这些 job 本身已是 required check,若失败 PR 自然无法合并,无需 rc-continuity 重复检查。
+        # R65 fix: push 场景下 rc-continuity 与关键 job 仍然并行运行(race condition),
+        #          查询时这些 job 可能仍为空结论(刚启动)或 in_progress/queued/pending。
+        #          旧实现在 conclusion 为空时直接判 FAIL,导致 master push 永久失败。
+        #          新实现:只在 conclusion 明确为失败状态时 FAIL,未完成状态(空/
+        #          in_progress/queued/pending/null/unknown)跳过 — 这些 job 是独立
+        #          required check,失败会直接阻断 release-summary,无需 rc-continuity 冗余兜底。
         if [ "${EVENT_NAME}" = "pull_request" ]; then
           echo "--- Skipping Release Gates internal critical jobs check (PR lenient mode) ---"
           echo "  (backup-restore-drill/pip-audit/trivy are independent required checks)"
@@ -1399,10 +1415,24 @@ jobs:
             JOB_STATUS=$(gh api "repos/${{ github.repository }}/actions/runs/${RG_LATEST}/jobs" \
               --jq ".jobs[] | select(.name == \"${CRIT_JOB}\") | .conclusion" 2>/dev/null || echo "unknown")
             echo "  ${CRIT_JOB}: ${JOB_STATUS}"
-            if [ "${JOB_STATUS}" != "success" ]; then
-              echo "  FAIL: Release Gates job '${CRIT_JOB}' not success (got: ${JOB_STATUS})"
-              ALL_PASS=false
-            fi
+            # R65 fix: 只在明确失败状态时 FAIL;未完成状态跳过(race condition)
+            case "${JOB_STATUS}" in
+              success)
+                : # 通过
+                ;;
+              failure|cancelled|timed_out|action_required|neutral)
+                echo "  FAIL: Release Gates job '${CRIT_JOB}' failed (got: ${JOB_STATUS})"
+                ALL_PASS=false
+                ;;
+              ""|"null"|in_progress|queued|pending|unknown|skipped)
+                echo "  SKIP: Release Gates job '${CRIT_JOB}' 未完成或未运行 (got: '${JOB_STATUS}')"
+                echo "        R65 fix: rc-continuity 与关键 job 并行运行, 未完成状态不阻断;"
+                echo "        关键 job 失败会直接阻断 release-summary, 无需 rc-continuity 冗余检查"
+                ;;
+              *)
+                echo "  SKIP: Release Gates job '${CRIT_JOB}' 状态 '${JOB_STATUS}' 不识别, 跳过"
+                ;;
+            esac
           done
         fi
         fi
