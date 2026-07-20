@@ -1789,6 +1789,21 @@ jobs:
 
         for WF in "${REQUIRED_WORKFLOWS[@]}"; do
           echo "--- Checking workflow: ${WF} ---"
+
+          # R66 P0-04 fix: Release Gates 自身检查是自引用死锁。
+          # publish-attestation 是 Release Gates workflow 的一部分,
+          # 当前 run 在 publish-attestation 运行期间永远是 in_progress,
+          # 轮询 Release Gates 的 completed:success 会永远不满足 (deadlock)。
+          # publish-attestation 的 needs: 依赖已确保所有前置 Release Gates job 通过,
+          # 因此跳过 Release Gates 自身检查。
+          if [ "${WF}" = "Release Gates" ]; then
+            echo "  SKIP: ${WF} 是当前 workflow (publish-attestation 是其一部分)"
+            echo "    R66 P0-04: needs: 依赖已确保所有前置 Release Gates job 通过"
+            echo "    R66 P0-04: 跳过自引用检查以避免死锁 (当前 run 无法在 publish-attestation 运行时完成)"
+            WF_FINAL_STATE["${WF}"]="success (self-skipped, needs satisfied)"
+            continue
+          fi
+
           WF_ID=$(gh api "repos/${{ github.repository }}/actions/workflows" \
             --jq ".workflows[] | select(.name == \"${WF}\") | .id" 2>/dev/null || echo "")
           if [ -z "$WF_ID" ]; then
