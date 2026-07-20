@@ -2153,6 +2153,13 @@ jobs:
       with:
         python-version: '3.11'
 
+    # R66 P1-10: verify_attestation_semantics.py 导入 loguru(来自 services 模块依赖),
+    # 需安装 requirements.txt,否则 ModuleNotFoundError: No module named 'loguru'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
     # 下载 publish-attestation 上传的 attestation artifact(含 production_verify_statement.json)
     - name: Download release-attestation artifact
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
