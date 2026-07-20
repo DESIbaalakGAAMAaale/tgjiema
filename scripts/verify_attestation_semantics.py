@@ -256,6 +256,135 @@ def _safe_get(statement: dict, *keys: str, default: Any = None) -> Any:
 
 
 # ════════════════════════════════════════════════════════════════
+# SLSA Provenance 版本检测与字段归一化
+# ════════════════════════════════════════════════════════════════
+
+def _get_slsa_version(statement: dict) -> str:
+    """检测 SLSA Provenance 版本(依据 predicateType)。
+
+    Returns:
+        "v1"     — predicateType == "https://slsa.dev/provenance/v1"
+        "v0.2"   — predicateType == "https://slsa.dev/provenance/v0.2"
+        "unknown" — 其它 predicateType(如 cosign sigstore attestation v1)
+    """
+    predicate_type = str(statement.get("predicateType", "") or "")
+    if predicate_type == "https://slsa.dev/provenance/v1":
+        return "v1"
+    if predicate_type == "https://slsa.dev/provenance/v0.2":
+        return "v0.2"
+    return "unknown"
+
+
+def _find_git_dep_v1(predicate: dict) -> dict:
+    """在 v1 resolvedDependencies 中查找 uri 以 git+https:// 开头的条目。
+
+    Returns:
+        匹配的依赖 dict,未找到返回空 dict
+    """
+    deps = _safe_get(predicate, "buildDefinition", "resolvedDependencies", default=[]) or []
+    if not isinstance(deps, list):
+        return {}
+    for dep in deps:
+        if not isinstance(dep, dict):
+            continue
+        uri = str(dep.get("uri", "") or "")
+        if uri.startswith("git+https://"):
+            return dep
+    return {}
+
+
+def _get_builder_id(predicate: dict, version: str) -> str:
+    """提取 builder.id,兼容 v0.2 与 v1。
+
+    v0.2: predicate.builder.id
+    v1:   predicate.runDetails.builder.id
+
+    若主版本路径缺失,回退到另一版本路径(用于兼容 predicateType 与 body
+    结构不一致的边界场景)。
+    """
+    if version == "v1":
+        primary = str(_safe_get(predicate, "runDetails", "builder", "id", default="") or "")
+        if primary:
+            return primary
+        # 回退到 v0.2 路径
+        return str(_safe_get(predicate, "builder", "id", default="") or "")
+    # v0.2 或 unknown:使用 v0.2 路径
+    return str(_safe_get(predicate, "builder", "id", default="") or "")
+
+
+def _get_build_type(predicate: dict, version: str) -> str:
+    """提取 buildType,兼容 v0.2 与 v1。
+
+    v0.2: predicate.buildType
+    v1:   predicate.buildDefinition.buildType
+    """
+    if version == "v1":
+        primary = str(_safe_get(predicate, "buildDefinition", "buildType", default="") or "")
+        if primary:
+            return primary
+        # 回退到 v0.2 路径
+        return str(predicate.get("buildType", "") or "")
+    return str(predicate.get("buildType", "") or "")
+
+
+def _get_config_source_uri(predicate: dict, version: str) -> str:
+    """提取 configSource.uri,兼容 v0.2 与 v1。
+
+    v0.2: predicate.invocation.configSource.uri
+    v1:   predicate.buildDefinition.resolvedDependencies[] 中
+          uri 以 git+https:// 开头的条目
+    """
+    if version == "v1":
+        dep = _find_git_dep_v1(predicate)
+        if dep:
+            return str(dep.get("uri", "") or "")
+        # 回退到 v0.2 路径
+        return str(_safe_get(predicate, "invocation", "configSource", "uri", default="") or "")
+    return str(_safe_get(predicate, "invocation", "configSource", "uri", default="") or "")
+
+
+def _get_config_source_digest_sha1(predicate: dict, version: str) -> str:
+    """提取 configSource 的 sha1 digest,兼容 v0.2 与 v1。
+
+    v0.2: predicate.invocation.configSource.digest.sha1
+    v1:   predicate.buildDefinition.resolvedDependencies[] 中
+          git+https:// 条目的 digest.sha1
+    """
+    if version == "v1":
+        dep = _find_git_dep_v1(predicate)
+        if dep:
+            digests = dep.get("digest") or {}
+            if isinstance(digests, dict):
+                return str(digests.get("sha1", "") or "")
+        # 回退到 v0.2 路径
+        return str(
+            _safe_get(predicate, "invocation", "configSource", "digest", "sha1", default="") or ""
+        )
+    return str(
+        _safe_get(predicate, "invocation", "configSource", "digest", "sha1", default="") or ""
+    )
+
+
+def _get_materials(predicate: dict, version: str) -> list:
+    """提取 materials 列表,兼容 v0.2 与 v1。
+
+    v0.2: predicate.materials[]
+    v1:   predicate.buildDefinition.resolvedDependencies[]
+    """
+    if version == "v1":
+        primary = _safe_get(
+            predicate, "buildDefinition", "resolvedDependencies", default=[]
+        ) or []
+        if isinstance(primary, list) and primary:
+            return primary
+        # 回退到 v0.2 路径
+        materials = predicate.get("materials") or []
+        return materials if isinstance(materials, list) else []
+    materials = predicate.get("materials") or []
+    return materials if isinstance(materials, list) else []
+
+
+# ════════════════════════════════════════════════════════════════
 # 单项断言检查
 # ════════════════════════════════════════════════════════════════
 
@@ -375,10 +504,9 @@ def _check_subject_name(statement: dict, manifest: dict) -> dict:
     )
 
 
-def _check_predicate_builder_id(predicate: dict) -> dict:
+def _check_predicate_builder_id(predicate: dict, version: str = "v0.2") -> dict:
     """(e1) predicate.builder.id 非空。"""
-    builder = predicate.get("builder") or {}
-    builder_id = str(builder.get("id", "") or "") if isinstance(builder, dict) else ""
+    builder_id = _get_builder_id(predicate, version)
     passed = bool(builder_id)
     return _make_check(
         "predicate_builder_id",
@@ -393,9 +521,9 @@ def _check_predicate_builder_id(predicate: dict) -> dict:
     )
 
 
-def _check_predicate_build_type(predicate: dict) -> dict:
+def _check_predicate_build_type(predicate: dict, version: str = "v0.2") -> dict:
     """(e2) predicate.buildType 非空。"""
-    build_type = str(predicate.get("buildType", "") or "")
+    build_type = _get_build_type(predicate, version)
     passed = bool(build_type)
     return _make_check(
         "predicate_build_type",
@@ -410,11 +538,13 @@ def _check_predicate_build_type(predicate: dict) -> dict:
     )
 
 
-def _check_predicate_config_source_uri(predicate: dict, manifest: dict) -> dict:
-    """(e3) predicate.invocation.configSource.uri 包含 github.com/<owner>/<repo>。"""
-    uri = str(
-        _safe_get(predicate, "invocation", "configSource", "uri", default="") or ""
-    )
+def _check_predicate_config_source_uri(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
+    """(e3) configSource.uri 包含 github.com/<owner>/<repo>。
+
+    v1 URI 形如 git+https://github.com/owner/repo@refs/heads/master,
+    剥离 git+ 前缀与 @... 后缀后再做子串匹配。
+    """
+    uri = _get_config_source_uri(predicate, version)
     source_repo = str(manifest.get("source_repository", "") or "")
     if not source_repo:
         return _make_check(
@@ -425,12 +555,19 @@ def _check_predicate_config_source_uri(predicate: dict, manifest: dict) -> dict:
             message="release manifest 缺 source_repository 字段,无法验证 configSource.uri",
             severity="warning",
         )
+    # 剥离 git+ 前缀与 @... 后缀,便于子串匹配(v1 URI 形如
+    # git+https://github.com/owner/repo@refs/heads/master)
+    check_uri = uri
+    if check_uri.startswith("git+"):
+        check_uri = check_uri[len("git+"):]
+    if "@" in check_uri:
+        check_uri = check_uri.split("@", 1)[0]
     # 期望子串:若 source_repo 已含 github.com/ 前缀则原样使用,否则补全
     if source_repo.startswith("github.com/"):
         expected_substring = source_repo
     else:
         expected_substring = "github.com/" + source_repo
-    passed = expected_substring in uri
+    passed = expected_substring in check_uri
     return _make_check(
         "predicate_config_source_uri",
         passed=passed,
@@ -444,14 +581,12 @@ def _check_predicate_config_source_uri(predicate: dict, manifest: dict) -> dict:
     )
 
 
-def _check_predicate_config_source_digest(predicate: dict, manifest: dict) -> dict:
-    """(e4) predicate.invocation.configSource.digest.sha1 == release_manifest.source_commit。
+def _check_predicate_config_source_digest(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
+    """(e4) configSource.digest.sha1 == release_manifest.source_commit。
 
     兼容 source_commit_sha 字段别名。
     """
-    actual_sha1 = str(
-        _safe_get(predicate, "invocation", "configSource", "digest", "sha1", default="") or ""
-    )
+    actual_sha1 = _get_config_source_digest_sha1(predicate, version)
     expected_commit = str(
         manifest.get("source_commit") or manifest.get("source_commit_sha") or ""
     )
@@ -479,9 +614,9 @@ def _check_predicate_config_source_digest(predicate: dict, manifest: dict) -> di
     )
 
 
-def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict) -> dict:
-    """(e5) predicate.materials[] 含 digest.sha256 == release_manifest.source_tree_sha 条目。"""
-    materials = predicate.get("materials") or []
+def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
+    """(e5) materials[] 含 digest.sha256 == release_manifest.source_tree_sha 条目。"""
+    materials = _get_materials(predicate, version)
     expected_tree = str(manifest.get("source_tree_sha", "") or "")
     if not expected_tree:
         return _make_check(
@@ -517,7 +652,7 @@ def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict) -> dict
     )
 
 
-def _check_predicate_materials_migration(predicate: dict, manifest: dict) -> dict:
+def _check_predicate_materials_migration(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
     """(e6) 若 release_manifest.migration_manifest_digest 存在,materials[] 须含对应条目。"""
     expected_mig = str(manifest.get("migration_manifest_digest", "") or "")
     if not expected_mig:
@@ -531,7 +666,7 @@ def _check_predicate_materials_migration(predicate: dict, manifest: dict) -> dic
             severity="warning",
         )
     expected_mig_norm = _strip_sha_prefix(expected_mig)
-    materials = predicate.get("materials") or []
+    materials = _get_materials(predicate, version)
     found = False
     for m in materials:
         if not isinstance(m, dict):
@@ -800,12 +935,13 @@ def verify_attestation_semantics(
     # (e) 若 predicate 存在,执行 SLSA provenance 子检查
     predicate = statement.get("predicate")
     if isinstance(predicate, dict) and predicate:
-        checks.append(_check_predicate_builder_id(predicate))
-        checks.append(_check_predicate_build_type(predicate))
-        checks.append(_check_predicate_config_source_uri(predicate, manifest))
-        checks.append(_check_predicate_config_source_digest(predicate, manifest))
-        checks.append(_check_predicate_materials_tree_sha(predicate, manifest))
-        checks.append(_check_predicate_materials_migration(predicate, manifest))
+        slsa_version = _get_slsa_version(statement)
+        checks.append(_check_predicate_builder_id(predicate, slsa_version))
+        checks.append(_check_predicate_build_type(predicate, slsa_version))
+        checks.append(_check_predicate_config_source_uri(predicate, manifest, slsa_version))
+        checks.append(_check_predicate_config_source_digest(predicate, manifest, slsa_version))
+        checks.append(_check_predicate_materials_tree_sha(predicate, manifest, slsa_version))
+        checks.append(_check_predicate_materials_migration(predicate, manifest, slsa_version))
     else:
         # predicate 缺失 — 非 strict 模式下为 warning
         msg = "statement.predicate 缺失或为空,跳过 SLSA provenance 子检查(builder/materials)"

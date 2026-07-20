@@ -30,8 +30,11 @@
       "type": "release_artifact",
       "source_commit": "<git rev-parse HEAD>",
       "source_tree": "<git rev-parse HEAD^{tree}>",
+      "source_tree_sha": "<git rev-parse HEAD^{tree}> (R66 P1-10 别名,供 verify_attestation_semantics.py 使用)",
+      "source_repository": "<owner/repo,如 maxiuquan/tgjiema>",
       "image_digest": "sha256:...",
       "image_name": "ghcr.io/maxiuquan/tgjiema",
+      "image_ref": "ghcr.io/maxiuquan/tgjiema (R66 P1-10 别名,供 verify_attestation_semantics.py 使用)",
       "migrations": [{"version": "...", "sha256": "..."}, ...],
       "migration_manifest_digest": "<sha256 of database/migrations/migration-manifest.json>",
       "generated_at": "<ISO8601 UTC>",
@@ -48,6 +51,7 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -141,19 +145,24 @@ def _normalize_image_digest(image_digest: str) -> str:
     return digest
 
 
-def _load_migration_manifest_entries() -> list[dict]:
+def _load_migration_manifest_entries(manifest_path: Path | None = None) -> list[dict]:
     """加载 migration-manifest.json,返回 [{version, sha256}, ...] 列表。
 
     R64 P0-02: release manifest 的 migrations 字段只保留 version + sha256
     (不复制 schema_fingerprint_* / predecessor / *_note 等运行时不需要的字段,
     保持 release manifest 精简且稳定)。
+
+    Args:
+        manifest_path: migration-manifest.json 路径。None 时使用模块级
+            ``MIGRATION_MANIFEST_PATH`` 默认值。
     """
-    if not MIGRATION_MANIFEST_PATH.exists():
+    path = manifest_path if manifest_path is not None else MIGRATION_MANIFEST_PATH
+    if not path.exists():
         raise RuntimeError(
-            f"migration-manifest.json 不存在: {MIGRATION_MANIFEST_PATH} "
+            f"migration-manifest.json 不存在: {path} "
             f"(必须先运行 scripts/generate_migration_manifest.py 重生)"
         )
-    data = json.loads(MIGRATION_MANIFEST_PATH.read_text(encoding="utf-8"))
+    data = json.loads(path.read_text(encoding="utf-8"))
     migrations = data.get("migrations", [])
     if not isinstance(migrations, list):
         raise RuntimeError("migration-manifest.json 'migrations' 字段不是 list")
@@ -176,6 +185,10 @@ def generate_release_manifest(
     image_name: str = DEFAULT_IMAGE_NAME,
     output_path: Path | None = None,
     verbose: bool = True,
+    source_repository: str | None = None,
+    source_commit: str | None = None,
+    source_tree_sha: str | None = None,
+    migration_manifest_path: Path | None = None,
 ) -> dict:
     """生成 canonical release artifact manifest。
 
@@ -184,6 +197,16 @@ def generate_release_manifest(
         image_name: 镜像仓库地址(默认 ``ghcr.io/maxiuquan/tgjiema``)
         output_path: 输出文件路径(None 表示不写文件,仅返回 dict)
         verbose: 是否打印详细日志
+        source_repository: GitHub 仓库 ``owner/repo``(如 ``maxiuquan/tgjiema``)。
+            None 时取 ``GITHUB_REPOSITORY`` 环境变量,仍未设置则为空串。
+            供 verify_attestation_semantics.py 校验 configSource.uri 使用。
+        source_commit: git commit SHA(HEAD)。None 时优先取 ``GITHUB_SHA``
+            环境变量,仍未设置则 ``git rev-parse HEAD``。
+        source_tree_sha: git tree SHA(HEAD^{tree})。None 时取
+            ``git rev-parse HEAD^{tree}``。同时写入 ``source_tree`` 与
+            ``source_tree_sha`` 两个字段(后者供 verify_attestation_semantics.py 使用)。
+        migration_manifest_path: migration-manifest.json 路径。None 时使用
+            默认 ``database/migrations/migration-manifest.json``(相对 REPO_ROOT)。
 
     Returns:
         canonical release manifest dict
@@ -191,12 +214,38 @@ def generate_release_manifest(
     Raises:
         RuntimeError: git 不可用 / migration-manifest.json 缺失 / image_digest 非法
     """
-    # 1. 获取当前 source commit + source tree
-    source_commit = _git_rev_parse("HEAD")
-    source_tree = _git_rev_parse("HEAD^{tree}")
+    # 1. 获取当前 source commit + source tree(R66 P1-10: 兼容 GITHUB_SHA 环境变量)
+    if source_commit:
+        pass  # 显式 CLI 参数优先
+    else:
+        github_sha = os.environ.get("GITHUB_SHA", "").strip()
+        if github_sha:
+            source_commit = github_sha
+        else:
+            source_commit = _git_rev_parse("HEAD")
+    if source_tree_sha:
+        pass  # 显式 CLI 参数优先
+    else:
+        source_tree_sha = _git_rev_parse("HEAD^{tree}")
+    # source_tree 字段保持与 source_tree_sha 一致(向后兼容)
+    source_tree = source_tree_sha
     if verbose:
         print(f"[release_manifest] source_commit = {source_commit}")
         print(f"[release_manifest] source_tree   = {source_tree}")
+
+    # 1b. 解析 source_repository(R66 P1-10: GITHUB_REPOSITORY 环境变量回退)
+    if source_repository is None:
+        source_repository = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if verbose:
+        print(f"[release_manifest] source_repository = {source_repository or '(unset)'}")
+
+    # 1c. 解析 migration_manifest_path(允许 CLI 覆盖默认路径)
+    if migration_manifest_path is None:
+        migration_manifest_path_resolved = MIGRATION_MANIFEST_PATH
+    else:
+        migration_manifest_path_resolved = Path(migration_manifest_path)
+        if not migration_manifest_path_resolved.is_absolute():
+            migration_manifest_path_resolved = REPO_ROOT / migration_manifest_path_resolved
 
     # 2. 规范化 image_digest
     image_digest_norm = _normalize_image_digest(image_digest)
@@ -205,12 +254,12 @@ def generate_release_manifest(
         print(f"[release_manifest] image_name    = {image_name}")
 
     # 3. 加载 migration-manifest.json 的 migration 集合
-    migrations = _load_migration_manifest_entries()
+    migrations = _load_migration_manifest_entries(migration_manifest_path_resolved)
     if verbose:
         print(f"[release_manifest] migrations    = {len(migrations)} 个")
 
     # 4. 计算 migration-manifest.json 的 digest(用于绑定原始 trust anchor)
-    migration_manifest_digest = _file_sha256(MIGRATION_MANIFEST_PATH)
+    migration_manifest_digest = _file_sha256(migration_manifest_path_resolved)
     if verbose:
         print(
             f"[release_manifest] migration_manifest_digest = "
@@ -223,13 +272,18 @@ def generate_release_manifest(
         print(f"[release_manifest] generated_at  = {generated_at}")
 
     # 6. 构造 canonical manifest(字段顺序固定,便于 cosign 签名可复现)
+    #    R66 P1-10: 新增 image_ref / source_repository / source_tree_sha 字段,
+    #    供 verify_attestation_semantics.py 语义验证使用(不删除任何既有字段)。
     manifest = {
         "version": RELEASE_MANIFEST_VERSION,
         "type": "release_artifact",
         "source_commit": source_commit,
         "source_tree": source_tree,
+        "source_tree_sha": source_tree_sha,
+        "source_repository": source_repository,
         "image_digest": image_digest_norm,
         "image_name": image_name,
+        "image_ref": image_name,
         "migrations": migrations,
         "migration_manifest_digest": migration_manifest_digest,
         "generated_at": generated_at,
@@ -269,6 +323,40 @@ def _parse_args() -> argparse.Namespace:
         help="输出路径(默认 release-artifacts/release-manifest.json)",
     )
     parser.add_argument(
+        "--source-repository",
+        default=None,
+        help=(
+            "GitHub 仓库 owner/repo(如 maxiuquan/tgjiema)。"
+            "未指定时取 GITHUB_REPOSITORY 环境变量。"
+            "R66 P1-10: 写入 release-manifest.json.source_repository 字段,"
+            "供 verify_attestation_semantics.py 校验 configSource.uri 使用。"
+        ),
+    )
+    parser.add_argument(
+        "--source-commit",
+        default=None,
+        help=(
+            "源代码 commit SHA。未指定时优先取 GITHUB_SHA 环境变量,"
+            "仍未设置则取 git rev-parse HEAD。"
+        ),
+    )
+    parser.add_argument(
+        "--source-tree-sha",
+        default=None,
+        help=(
+            "源代码 git tree SHA(HEAD^{tree})。未指定时取 "
+            "git rev-parse HEAD^{tree}。"
+        ),
+    )
+    parser.add_argument(
+        "--migration-manifest",
+        default=None,
+        help=(
+            "migration-manifest.json 路径(默认 database/migrations/"
+            "migration-manifest.json,相对仓库根)。"
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="减少日志输出",
@@ -284,6 +372,10 @@ def main() -> int:
             image_name=args.image_name,
             output_path=Path(args.output),
             verbose=not args.quiet,
+            source_repository=args.source_repository,
+            source_commit=args.source_commit,
+            source_tree_sha=args.source_tree_sha,
+            migration_manifest_path=Path(args.migration_manifest) if args.migration_manifest else None,
         )
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
