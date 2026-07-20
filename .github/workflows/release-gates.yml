@@ -2173,113 +2173,96 @@ jobs:
         name: release-gates-signed-${{ github.sha }}
 
     # R66 P1-10 fix: cosign verify 输出的是签名 payload (list),不是 in-toto Statement (dict)。
-    # verify_attestation_semantics.py 期望 in-toto Statement,需通过 cosign verify-attestation
-    # 下载 DSSE envelope,解码 payload 获取真正的 in-toto Statement。
-    - name: Install cosign
-      uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
-      with:
-        cosign-release: 'v2.2.3'
-
-    - name: Login to GHCR (for attestation download)
-      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Download attestation statement (cosign verify-attestation)
+    # verify_attestation_semantics.py 期望 in-toto Statement (dict),需通过 GitHub
+    # Attestations API 下载 sigstore bundle,解码 DSSE envelope payload 获取真正的
+    # in-toto Statement。
+    #
+    # R66 P1-10 fix (迭代 3): cosign verify-attestation 无法在 OCI registry 中找到
+    # actions/attest-build-provenance@v1 生成的 attestation (该 action 将 attestation
+    # 存储在 GitHub Attestations API 而非 OCI registry)。改用 GitHub Attestations API
+    # (gh api /repos/{owner}/{repo}/attestations/{digest}) 直接获取 sigstore bundle。
+    - name: Download attestation statement (GitHub Attestations API)
       env:
-        COSIGN_EXPERIMENTAL: 1
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
-        echo "=== R66 P1-10: Download attestation statement via cosign verify-attestation ==="
-        IMAGE_NAME="${{ needs.docker-build.outputs.image_name }}"
+        echo "=== R66 P1-10: Download attestation statement via GitHub Attestations API ==="
         IMAGE_DIGEST="${{ needs.docker-build.outputs.image_digest }}"
-        IMAGE_REF="${IMAGE_NAME}@${IMAGE_DIGEST}"
-        echo "Image ref: ${IMAGE_REF}"
+        echo "Image digest: ${IMAGE_DIGEST}"
 
-        # R63 P0-01: 从 sign-image Fulcio cert 提取 certificate-identity (SAN URI)
-        CERT_FILE="image-signing-cert.pem"
-        if [ ! -s "${CERT_FILE}" ]; then
-          echo "ERROR: ${CERT_FILE} 缺失或为空 (sign-image artifact 未下载)"
+        # R66 P1-10: 通过 GitHub Attestations API 获取 attestation bundle
+        # API: GET /repos/{owner}/{repo}/attestations/{subject_digest}
+        # subject_digest 格式: sha256:<hex>
+        echo "Fetching attestation from GitHub Attestations API..."
+        ATTESTATION_RESPONSE=$(gh api \
+          -H "Accept: application/vnd.github+json" \
+          "/repos/${{ github.repository }}/attestations/${IMAGE_DIGEST}")
+
+        # 检查是否有 attestation
+        ATTESTATION_COUNT=$(echo "${ATTESTATION_RESPONSE}" | jq -r '.attestations | length')
+        echo "Attestation count: ${ATTESTATION_COUNT}"
+        if [ "${ATTESTATION_COUNT}" -eq 0 ] || [ "${ATTESTATION_COUNT}" = "null" ]; then
+          echo "ERROR: 无 attestation — sign-image job 的 actions/attest-build-provenance 步骤可能未生成 attestation"
           exit 1
         fi
-        SAN_LINE=""
-        for inform in PEM DER; do
-          SAN_LINE=$(openssl x509 -in "${CERT_FILE}" -inform "${inform}" -noout -ext subjectAltName 2>/dev/null || true)
-          if [ -n "${SAN_LINE}" ]; then
-            echo "  cert format: ${inform}"
-            break
-          fi
-        done
-        CERT_IDENTITY=$(echo "${SAN_LINE}" | grep -oE 'URI:[^,[:space:]]+' | head -n1 | sed 's/^URI://' || true)
-        if [ -z "${CERT_IDENTITY}" ]; then
-          echo "ERROR: 无法从 Fulcio cert 提取 SAN URI"
-          exit 1
-        fi
-        echo "  certificate-identity: ${CERT_IDENTITY}"
 
-        # cosign verify-attestation 输出 DSSE envelope 数组 (JSON)
-        # 每个 envelope 的 payload 字段是 base64 编码的 in-toto Statement
-        # R66 P1-10 fix: 不使用 --type 过滤 — cosign 的 --type slsaprovenance 仅匹配
-        # v0.2 (https://slsa.dev/provenance/v0.2),而 actions/attest-build-provenance@v1
-        # 生成 v1 (https://slsa.dev/provenance/v1),导致 "no matching attestations"。
-        # 改为下载所有 attestation,在 Python 中按 predicateType 筛选 SLSA provenance。
-        echo "Running cosign verify-attestation (no type filter)..."
-        cosign verify-attestation \
-          --certificate-identity "${CERT_IDENTITY}" \
-          --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-          "${IMAGE_REF}" > dsse_envelopes.json || {
-            echo "ERROR: cosign verify-attestation 失败 — 无 attestation"
-            echo "  sign-image job 的 actions/attest-build-provenance 步骤可能未生成 attestation"
-            exit 1
-          }
-
-        ENVELOPE_COUNT=$(python3 -c 'import json; print(len(json.load(open("dsse_envelopes.json"))))')
-        echo "DSSE envelopes downloaded. Count: ${ENVELOPE_COUNT}"
+        # 提取所有 attestation bundle 并解码
+        echo "${ATTESTATION_RESPONSE}" | jq -c '.attestations[].bundle' > attestation_bundles.jsonl
+        echo "Saved ${ATTESTATION_COUNT} attestation bundle(s) to attestation_bundles.jsonl"
         echo ""
 
-        # 解码 DSSE envelope payload → in-toto Statement
-        # 优先选择 predicateType 为 https://slsa.dev/provenance/* 的 envelope,
-        # 兼容 v0.2 与 v1;若无 SLSA provenance,回退到第一个 envelope。
+        # 解码所有 sigstore bundle 中的 DSSE envelope payload → in-toto Statement
+        # 优先选择 predicateType 为 https://slsa.dev/provenance/* 的 statement,
+        # 兼容 v0.2 与 v1;若无 SLSA provenance,回退到第一个 statement。
         python3 -c "
         import json, base64, sys
-        with open('dsse_envelopes.json') as f:
-            envelopes = json.load(f)
-        if not envelopes:
-            print('ERROR: 无 attestation envelope — sign-image 可能未生成 attestation', file=sys.stderr)
-            sys.exit(1)
 
-        # 解码所有 envelope,寻找 SLSA provenance statement
         statements = []
-        for i, env in enumerate(envelopes):
-            payload_b64 = env.get('payload', '')
-            if not payload_b64:
-                continue
-            try:
-                payload_bytes = base64.b64decode(payload_b64)
-                stmt = json.loads(payload_bytes)
-                statements.append((i, stmt))
-            except Exception as e:
-                print(f'WARN: envelope[{i}] payload 解码失败: {e}', file=sys.stderr)
+        with open('attestation_bundles.jsonl') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    bundle = json.loads(line)
+                except Exception as e:
+                    print(f'WARN: bundle[{line_num}] JSON 解析失败: {e}', file=sys.stderr)
+                    continue
+
+                # Sigstore bundle 结构:
+                # { mediaType, verificationMaterial, dsseEnvelope: { payload, payloadType, signatures } }
+                dsse_env = bundle.get('dsseEnvelope', {})
+                payload_b64 = dsse_env.get('payload', '')
+                if not payload_b64:
+                    print(f'WARN: bundle[{line_num}] DSSE envelope payload 为空', file=sys.stderr)
+                    continue
+
+                try:
+                    payload_bytes = base64.b64decode(payload_b64)
+                    stmt = json.loads(payload_bytes)
+                    statements.append((line_num, stmt))
+                    pt = stmt.get('predicateType', '(missing)')
+                    print(f'  bundle[{line_num}] predicateType: {pt}')
+                except Exception as e:
+                    print(f'WARN: bundle[{line_num}] payload 解码失败: {e}', file=sys.stderr)
 
         if not statements:
-            print('ERROR: 所有 envelope payload 解码失败', file=sys.stderr)
+            print('ERROR: 所有 bundle payload 解码失败或为空', file=sys.stderr)
             sys.exit(1)
 
         # 优先选择 SLSA provenance statement (v0.2 或 v1)
         chosen = None
-        for i, stmt in statements:
+        for idx, stmt in statements:
             pt = stmt.get('predicateType', '')
             if pt.startswith('https://slsa.dev/provenance/'):
                 chosen = stmt
-                print(f'Selected envelope[{i}] with predicateType: {pt}')
+                print(f'Selected bundle[{idx}] with predicateType: {pt}')
                 break
 
         # 回退:无 SLSA provenance,使用第一个 statement
         if chosen is None:
             chosen = statements[0][1]
-            print(f'WARN: 无 SLSA provenance envelope,使用第一个 statement', file=sys.stderr)
+            print(f'WARN: 无 SLSA provenance bundle,使用第一个 statement', file=sys.stderr)
             print(f'  predicateType: {chosen.get(\"predicateType\", \"(missing)\")}')
 
         statement = chosen
