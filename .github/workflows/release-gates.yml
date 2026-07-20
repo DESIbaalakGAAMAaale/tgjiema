@@ -218,9 +218,30 @@ jobs:
     - name: Verify image pull by digest
       run: |
         # R58 P0-1: 通过 digest 拉取验证镜像真实可用 (内容地址, 不可变)
+        # R66 P0-04 修复: GHCR 在 docker buildx build --push 后存在短暂的传播延迟,
+        # 立即 docker pull @digest 可能返回 "manifest unknown"。
+        # 加入指数退避重试机制(最多 6 次,累计最长 ~63s),覆盖 GHCR 传播窗口。
         IMAGE_REF="${{ steps.meta.outputs.name }}@${{ steps.build.outputs.digest }}"
         echo "Pulling image by digest: ${IMAGE_REF}"
-        docker pull "${IMAGE_REF}"
+        MAX_ATTEMPTS=6
+        WAIT=2
+        for attempt in $(seq 1 ${MAX_ATTEMPTS}); do
+          echo "--- Pull attempt ${attempt}/${MAX_ATTEMPTS} (wait=${WAIT}s) ---"
+          if docker pull "${IMAGE_REF}" >/tmp/docker_pull.log 2>&1; then
+            echo "Pull succeeded on attempt ${attempt}"
+            break
+          fi
+          echo "Pull failed on attempt ${attempt}, tail of log:"
+          tail -n 10 /tmp/docker_pull.log || true
+          if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
+            echo "FAIL: docker pull failed after ${MAX_ATTEMPTS} attempts"
+            cat /tmp/docker_pull.log
+            exit 1
+          fi
+          echo "Sleeping ${WAIT}s before retry..."
+          sleep "${WAIT}"
+          WAIT=$((WAIT * 2))
+        done
         # 验证镜像可启动并执行 python 命令
         docker run --rm "${IMAGE_REF}" python -c "import sys; print(f'Python {sys.version}'); print('image OK (digest-pinned)')"
 
