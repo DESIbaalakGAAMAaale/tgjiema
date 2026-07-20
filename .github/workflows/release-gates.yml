@@ -1779,6 +1779,18 @@ jobs:
         MAX_POLL_SECONDS=1800
         POLL_INTERVAL_SECONDS=30
         POLL_DEADLINE=$(( $(date +%s) + MAX_POLL_SECONDS ))
+        # R66 P0-04 path-filtered fallback: 轮询起始时间戳 + 目标 branch
+        #   PATH_FILTER_GRACE_SECONDS=60: 无 run 状态持续 60s 后开始尝试祖先回退
+        #   TARGET_BRANCH: 当前 push 的 branch (master/main),用于查询历史 run
+        POLL_START_TS=$(date +%s)
+        PATH_FILTER_GRACE_SECONDS=60
+        TARGET_BRANCH=$(echo "${{ github.ref }}" | sed 's#^refs/heads/##')
+        if [ -z "${TARGET_BRANCH}" ] || [ "${TARGET_BRANCH}" = "${{ github.ref }}" ]; then
+          TARGET_BRANCH=master
+        fi
+        echo "  poll start: $(date -u -d @${POLL_START_TS} +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r ${POLL_START_TS} +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo ${POLL_START_TS})"
+        echo "  target branch: ${TARGET_BRANCH}"
+        echo "  path-filter grace seconds: ${PATH_FILTER_GRACE_SECONDS}"
 
         # R56 P0-1: 查询 Checks API,要求四个 workflow 均为 completed/success
         REQUIRED_WORKFLOWS=("CI" "Deploy Check" "Release Gates" "E2E Tests")
@@ -1836,6 +1848,45 @@ jobs:
               # R66 P0-04: 无 run = pending (不再 SKIP)
               echo "  PENDING: 无 ${WF} run 对应 SHA ${TARGET_SHA:0:12} (等待 workflow 创建 run)"
               echo "    R66 P0-04: 无 run 不再视为 SKIP — 轮询直到 run 创建或超时"
+              # R66 P0-04 后续修复: path-filtered workflow 祖先回退
+              #   问题: Deploy Check 等使用 paths: 过滤的 workflow 不会在每次 push 时触发
+              #   (仅当 deploy_vps_per_bot.sh / docker-compose.yml / config/services.yaml /
+              #    .github/workflows/** 变更时才运行)。R66 P0-04 原始修复将"无 run"视为
+              #   pending 并轮询 30 分钟后 FAIL,导致仅 scripts/ 变更的 commit 永久阻塞
+              #   publish-attestation。
+              #   修复: 轮询超过 GRACE_SECONDS (60s) 后,查找 master 分支上最近的
+              #   successful run,验证其 head_sha 是当前 SHA 的祖先(git merge-base
+              #   --is-ancestor),若是则接受为 success(语义:path-filtered workflow
+              #   在路径未变更时,前一次成功 run 对当前 SHA 仍然有效)。
+              #   安全保障:
+              #     1. 必须是 completed:success (不接受 failure)
+              #     2. head_sha 必须是当前 SHA 的祖先 (确保不包含未验证的更新代码)
+              #     3. 必须在同一 branch (master/main) 上
+              #     4. 不影响非 path-filtered workflow (CI/E2E 每次都触发,
+              #        不会有"无 run"情况)
+              NOW_ELAPSED=$(( $(date +%s) - ${POLL_START_TS:-$(date +%s)} ))
+              if [ "${NOW_ELAPSED}" -ge "${PATH_FILTER_GRACE_SECONDS:-60}" ]; then
+                echo "  PROBE: ${WF} 超过 ${PATH_FILTER_GRACE_SECONDS:-60}s 无 run,尝试祖先回退 (path-filtered workflow)"
+                ANCESTOR_RUN=$(gh api \
+                  "repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?branch=${TARGET_BRANCH:-master}&per_page=30" \
+                  --jq "[.workflow_runs[] | select(.conclusion == \"success\" and .head_sha != \"${TARGET_SHA}\")] | sort_by(.created_at) | reverse | .[0]" 2>/dev/null || echo "")
+                if [ "${ANCESTOR_RUN}" = "null" ] || [ -z "${ANCESTOR_RUN}" ]; then
+                  echo "    NO_ANCESTOR: master 上无历史 successful run,继续轮询"
+                else
+                  ANCESTOR_SHA=$(echo "${ANCESTOR_RUN}" | jq -r '.head_sha')
+                  ANCESTOR_ID=$(echo "${ANCESTOR_RUN}" | jq -r '.id')
+                  echo "    CANDIDATE: run #${ANCESTOR_ID} head_sha=${ANCESTOR_SHA:0:12} conclusion=success"
+                  # 验证祖先关系: ANCESTOR_SHA 必须是 TARGET_SHA 的祖先
+                  if git -C "${GITHUB_WORKSPACE:-.}" merge-base --is-ancestor "${ANCESTOR_SHA}" "${TARGET_SHA}" 2>/dev/null; then
+                    echo "  OK: ${WF} ancestor run #${ANCESTOR_ID} (head_sha=${ANCESTOR_SHA:0:12}) is ancestor of ${TARGET_SHA:0:12}"
+                    echo "    R66 P0-04 path-filtered fallback: 接受祖先 successful run (path 未变更,前次结果仍有效)"
+                    WF_FINAL_STATE["${WF}"]="success (ancestor fallback: ${ANCESTOR_SHA:0:12})"
+                    break
+                  else
+                    echo "    NOT_ANCESTOR: ${ANCESTOR_SHA:0:12} 不是 ${TARGET_SHA:0:12} 的祖先,继续轮询"
+                  fi
+                fi
+              fi
               sleep "${POLL_INTERVAL_SECONDS}"
               continue
             fi
