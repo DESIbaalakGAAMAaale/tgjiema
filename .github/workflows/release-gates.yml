@@ -2221,21 +2221,27 @@ jobs:
 
         # cosign verify-attestation 输出 DSSE envelope 数组 (JSON)
         # 每个 envelope 的 payload 字段是 base64 编码的 in-toto Statement
-        echo "Running cosign verify-attestation..."
+        # R66 P1-10 fix: 不使用 --type 过滤 — cosign 的 --type slsaprovenance 仅匹配
+        # v0.2 (https://slsa.dev/provenance/v0.2),而 actions/attest-build-provenance@v1
+        # 生成 v1 (https://slsa.dev/provenance/v1),导致 "no matching attestations"。
+        # 改为下载所有 attestation,在 Python 中按 predicateType 筛选 SLSA provenance。
+        echo "Running cosign verify-attestation (no type filter)..."
         cosign verify-attestation \
           --certificate-identity "${CERT_IDENTITY}" \
           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-          --type slsaprovenance \
           "${IMAGE_REF}" > dsse_envelopes.json || {
-            echo "ERROR: cosign verify-attestation 失败 — 无 SLSA provenance attestation"
+            echo "ERROR: cosign verify-attestation 失败 — 无 attestation"
             echo "  sign-image job 的 actions/attest-build-provenance 步骤可能未生成 attestation"
             exit 1
           }
 
-        echo "DSSE envelopes downloaded. Count: $(python3 -c 'import json; print(len(json.load(open("dsse_envelopes.json"))))')"
+        ENVELOPE_COUNT=$(python3 -c 'import json; print(len(json.load(open("dsse_envelopes.json"))))')
+        echo "DSSE envelopes downloaded. Count: ${ENVELOPE_COUNT}"
         echo ""
 
         # 解码 DSSE envelope payload → in-toto Statement
+        # 优先选择 predicateType 为 https://slsa.dev/provenance/* 的 envelope,
+        # 兼容 v0.2 与 v1;若无 SLSA provenance,回退到第一个 envelope。
         python3 -c "
         import json, base64, sys
         with open('dsse_envelopes.json') as f:
@@ -2243,13 +2249,40 @@ jobs:
         if not envelopes:
             print('ERROR: 无 attestation envelope — sign-image 可能未生成 attestation', file=sys.stderr)
             sys.exit(1)
-        # 取第一个 envelope 的 payload (base64 编码的 in-toto Statement)
-        payload_b64 = envelopes[0].get('payload', '')
-        if not payload_b64:
-            print('ERROR: DSSE envelope payload 为空', file=sys.stderr)
+
+        # 解码所有 envelope,寻找 SLSA provenance statement
+        statements = []
+        for i, env in enumerate(envelopes):
+            payload_b64 = env.get('payload', '')
+            if not payload_b64:
+                continue
+            try:
+                payload_bytes = base64.b64decode(payload_b64)
+                stmt = json.loads(payload_bytes)
+                statements.append((i, stmt))
+            except Exception as e:
+                print(f'WARN: envelope[{i}] payload 解码失败: {e}', file=sys.stderr)
+
+        if not statements:
+            print('ERROR: 所有 envelope payload 解码失败', file=sys.stderr)
             sys.exit(1)
-        payload_bytes = base64.b64decode(payload_b64)
-        statement = json.loads(payload_bytes)
+
+        # 优先选择 SLSA provenance statement (v0.2 或 v1)
+        chosen = None
+        for i, stmt in statements:
+            pt = stmt.get('predicateType', '')
+            if pt.startswith('https://slsa.dev/provenance/'):
+                chosen = stmt
+                print(f'Selected envelope[{i}] with predicateType: {pt}')
+                break
+
+        # 回退:无 SLSA provenance,使用第一个 statement
+        if chosen is None:
+            chosen = statements[0][1]
+            print(f'WARN: 无 SLSA provenance envelope,使用第一个 statement', file=sys.stderr)
+            print(f'  predicateType: {chosen.get(\"predicateType\", \"(missing)\")}')
+
+        statement = chosen
         with open('attestation_statement.json', 'w', encoding='utf-8') as f:
             json.dump(statement, f, ensure_ascii=False, indent=2)
         print(f'Extracted in-toto Statement:')
