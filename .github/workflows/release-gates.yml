@@ -2202,10 +2202,11 @@ jobs:
     # R66 P1-11: tag ruleset 校验仅在 release tag 时严格阻断;
     # PR / branch push 时仅做 dry-run(允许 ruleset 未配置,但 warn)。
     if: github.event_name == 'push'
+    # R66 P1-11 注:administration 不是 GitHub Actions permissions 有效 scope,
+    # ruleset API 读取依赖默认 GITHUB_TOKEN(contents: read)或 PAT(通过 secrets)。
     permissions:
       contents: read
       actions: read
-      administration: read
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
