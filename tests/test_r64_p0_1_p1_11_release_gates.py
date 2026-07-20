@@ -16,17 +16,17 @@
     approvals、conversation resolved、signed commits;用于检查配置的 token 仅有读取权限。
 
 整改:
-  P0-01 失败点 1: WORKFLOW_JOBS 扩展为 14 个 Release Gates job + CI 的 repo-hygiene。
+  P0-01 失败点 1: WORKFLOW_JOBS 扩展为 17 个 Release Gates job + CI 的 repo-hygiene。
   P0-01 失败点 2: rc-continuity PR 场景宽松通过(REQUIRED_CONSECUTIVE=0),
                   push 时严格 3 次连续;首次 release 无历史 digest 时跳过,不阻断。
   P0-01 失败点 3: cosign verify 使用 EXPECTED_IDENTITY (钉扎 github.repository +
                   workflow 路径 + 当前 ref),不再从待验证证书提取 identity 作为验证条件;
                   保留 SAN 形态校验作为 defense in depth。
   P1-11: detect_branch_protection_contexts.sh / configure_branch_protection.sh
-         校验 14 个 Release Gates job + CI / repo-hygiene 覆盖。
+         校验 17 个 Release Gates job + CI / repo-hygiene 覆盖。
 
 测试覆盖矩阵:
-  A. verify-branch-protection WORKFLOW_JOBS 列表完整(14 个 Release Gates job + repo-hygiene)
+  A. verify-branch-protection WORKFLOW_JOBS 列表完整(17 个 Release Gates job + repo-hygiene)
   B. cosign verify 步骤使用 EXPECTED_IDENTITY 而非从证书提取的 SAN
   C. rc-continuity 宽严策略(PR 宽松 / push 严格 / 首次 release 不阻断)
   D. configure_branch_protection.sh / detect_branch_protection_contexts.sh 包含完整 contexts
@@ -54,7 +54,11 @@ CONFIGURE_BP_SCRIPT = REPO_ROOT / "scripts" / "configure_branch_protection.sh"
 DETECT_BP_SCRIPT = REPO_ROOT / "scripts" / "detect_branch_protection_contexts.sh"
 
 
-# R64 P0-01 失败点 1: 14 个 Release Gates job + CI 的 repo-hygiene
+# R64 P0-01 失败点 1: 17 个 Release Gates job + CI 的 repo-hygiene
+# R66 P1-02: 新增 migration-binding-gate(15 个 Release Gates job)
+# R66 P1-10: 新增 attestation-semantics-verify(16 个 Release Gates job)
+# R66 P1-11: 新增 tag-ruleset-verify(17 个 Release Gates job)
+# R66 P1-09: 新增 CI skip-inventory job
 EXPECTED_RELEASE_GATES_JOBS = [
     "docker-build",
     "docker-digest-verify",
@@ -69,6 +73,9 @@ EXPECTED_RELEASE_GATES_JOBS = [
     "verify-branch-protection",
     "rc-continuity",
     "publish-attestation",
+    "attestation-semantics-verify",
+    "tag-ruleset-verify",
+    "migration-binding-gate",
     "release-summary",
 ]
 
@@ -83,6 +90,7 @@ EXPECTED_CI_JOBS = [
     "security",
     "fault-injection",
     "migration-dry-run",
+    "skip-inventory",
 ]
 
 
@@ -178,7 +186,7 @@ def _extract_workflow_jobs_ci_list(content: str | None = None) -> list[str]:
 class TestVerifyBranchProtectionWorkflowJobs:
     """verify-branch-protection job 的 WORKFLOW_JOBS 列表完整性校验。
 
-    P0-01 失败点 1 整改:Release Gates 列表必须包含全部 14 个 job,
+    P0-01 失败点 1 整改:Release Gates 列表必须包含全部 17 个 job,
     CI 列表必须包含 repo-hygiene。
     """
 
@@ -186,14 +194,17 @@ class TestVerifyBranchProtectionWorkflowJobs:
     def workflow_content(self):
         return _read_workflow()
 
-    def test_release_gates_list_contains_all_14_jobs(self, workflow_content):
-        """Release Gates 列表必须包含全部 14 个 job(允许新增,不允许减少)。
+    def test_release_gates_list_contains_all_17_jobs(self, workflow_content):
+        """Release Gates 列表必须包含全部 17 个 job(允许新增,不允许减少)。
 
         P0-01 失败点 1: 旧版只列了 10 个 job,遗漏了
         sign-image / rc-continuity / publish-attestation / release-summary。
         R65 P0-04: 新增 production-promotion-gate 等 gate 后列表自然增长,
-        本测试仅校验"至少 14 个 + 全部 EXPECTED_RELEASE_GATES_JOBS 齐全",
+        本测试仅校验"至少 17 个 + 全部 EXPECTED_RELEASE_GATES_JOBS 齐全",
         不限制 workflow 引入新的 required gate。
+        R66 P1-02: 新增 migration-binding-gate(15 个 Release Gates job)。
+        R66 P1-10: 新增 attestation-semantics-verify(16 个)。
+        R66 P1-11: 新增 tag-ruleset-verify(17 个)。
         R65 fix: WORKFLOW_JOBS 现位于 scripts/verify_branch_protection.sh
         (避免 YAML 21000 字节限制),_extract_workflow_jobs_rg_list() 无参
         时自动从该脚本读取。
@@ -208,9 +219,9 @@ class TestVerifyBranchProtectionWorkflowJobs:
             f"P0-01: Release Gates 列表遗漏 {len(missing)} 个 job: {missing} — "
             f"实际: {rg_jobs}"
         )
-        # 确保至少 14 个(允许新增 gate,不允许减少)
-        assert len(rg_jobs) >= 14, (
-            f"P0-01: Release Gates 列表应至少 14 个 job,实际 {len(rg_jobs)} 个: {rg_jobs}"
+        # 确保至少 17 个(允许新增 gate,不允许减少)
+        assert len(rg_jobs) >= 17, (
+            f"P0-01: Release Gates 列表应至少 17 个 job,实际 {len(rg_jobs)} 个: {rg_jobs}"
         )
 
     def test_release_gates_list_includes_sign_image(self, workflow_content):
@@ -290,23 +301,41 @@ class TestCosignVerifyUsesExpectedIdentity:
 
         P0-01 失败点 3: 旧版用从证书提取的 SAN 做 verify(signed-with == verified-with),
         新版用 EXPECTED_IDENTITY 钉扎 ref。
+
+        R66 P0-03 整改: EXPECTED_IDENTITY 必须用 ${{ github.ref }}(完整 ref,如
+        refs/heads/master 或 refs/tags/v1.0.0),而非 refs/heads/${{ github.ref_name }}
+        (tag push 时 ref_name 为 tag 名,拼成 refs/heads/<tag> 错误)。
         """
         # 找到 Verify image signature 步骤的 cosign verify 命令
         assert "Verify image signature (output verification statement)" in workflow_content, (
             "P0-01: 必须有 Verify image signature 步骤"
         )
-        # EXPECTED_IDENTITY 必须用 github.repository + workflow 路径 + ref_name 构造
+        # EXPECTED_IDENTITY 必须用 github.repository + workflow 路径 + github.ref 构造
         assert "EXPECTED_IDENTITY=" in workflow_content, (
             "P0-01 失败点 3: cosign verify 必须用 EXPECTED_IDENTITY 钉扎 ref"
         )
         assert "github.repository" in workflow_content, (
             "P0-01 失败点 3: EXPECTED_IDENTITY 必须包含 github.repository"
         )
-        assert "release-gates.yml@refs/heads/" in workflow_content, (
-            "P0-01 失败点 3: EXPECTED_IDENTITY 必须钉扎 refs/heads/<ref_name>"
+        # R66 P0-03: 必须用 ${{ github.ref }}(完整 ref,正确处理 branch 与 tag)
+        assert 'release-gates.yml@${{ github.ref }}' in workflow_content, (
+            "R66 P0-03: EXPECTED_IDENTITY 必须用 ${{ github.ref }} 钉扎完整 ref "
+            "(branch: refs/heads/master,tag: refs/tags/v1.0.0)"
         )
-        assert "github.ref_name" in workflow_content, (
-            "P0-01 失败点 3: EXPECTED_IDENTITY 必须用 github.ref_name 钉扎当前 ref"
+        # R66 P0-03: 禁止 EXPECTED_IDENTITY 行使用 refs/heads/${{ github.ref_name }}
+        # (tag push 时拼成 refs/heads/<tag> 错误,应为 refs/tags/<tag>)
+        # 注: 仅检查非注释行(注释行可能引用旧模式作为说明)
+        bad_lines = []
+        for i, line in enumerate(workflow_content.splitlines()):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if "EXPECTED_IDENTITY=" in line and "refs/heads/${{ github.ref_name }}" in line:
+                bad_lines.append((i + 1, line.strip()))
+        assert not bad_lines, (
+            "R66 P0-03: EXPECTED_IDENTITY 行禁止用 refs/heads/${{ github.ref_name }} "
+            "(tag push 时拼成 refs/heads/<tag> 错误,应为 refs/tags/<tag>)— "
+            f"发现 {len(bad_lines)} 处: {bad_lines[:3]}"
         )
 
     def test_image_verify_cosign_uses_expected_identity_not_extracted(self, workflow_content):
@@ -411,12 +440,16 @@ class TestCosignVerifyUsesExpectedIdentity:
             "P0-01 失败点 3: release manifest 不应再用 CERT_IDENTITY 做 cosign verify"
         )
 
-    def test_no_github_ref_hardcoded_in_expected_identity(self, workflow_content):
-        """EXPECTED_IDENTITY 不应用 ${{ github.ref }} 拼接(应用 github.ref_name)。
+    def test_no_github_ref_name_hardcoded_in_expected_identity(self, workflow_content):
+        """EXPECTED_IDENTITY 不应用 refs/heads/${{ github.ref_name }} 拼接。
 
-        P0-01 失败点 3: github.ref 是完整 ref(如 refs/heads/master),
-        拼接到 EXPECTED_IDENTITY 会导致双 refs/heads/ 前缀。
-        正确写法:github.ref_name(分支名,如 master)。
+        R66 P0-03 整改:
+          - 旧实现: refs/heads/${{ github.ref_name }}
+            缺陷: tag push 时 ref_name 为 tag 名(如 v1.0.0),
+                  拼成 refs/heads/v1.0.0 错误(应为 refs/tags/v1.0.0)。
+          - 新实现: ${{ github.ref }}
+            优势: github.ref 已是完整 ref(branch: refs/heads/master,
+                  tag: refs/tags/v1.0.0),无需拼接,正确处理 branch 与 tag。
         """
         lines = workflow_content.splitlines()
         bad_lines = []
@@ -424,15 +457,24 @@ class TestCosignVerifyUsesExpectedIdentity:
             stripped = line.lstrip()
             if stripped.startswith("#"):
                 continue
-            # 检测 EXPECTED_IDENTITY=...${{ github.ref }}(非 ref_name)的硬编码模式
-            if "EXPECTED_IDENTITY=" in line and "${{ github.ref }}" in line:
-                # 排除 ${{ github.ref_name }}(正确写法)
-                if "${{ github.ref_name }}" not in line:
-                    bad_lines.append((i + 1, line.strip()))
+            # R66 P0-03: 检测 EXPECTED_IDENTITY=...refs/heads/${{ github.ref_name }}(错误模式)
+            if "EXPECTED_IDENTITY=" in line and "refs/heads/${{ github.ref_name }}" in line:
+                bad_lines.append((i + 1, line.strip()))
         assert not bad_lines, (
-            "P0-01 失败点 3: EXPECTED_IDENTITY 不应用 ${{ github.ref }} 拼接 "
-            "(应用 github.ref_name 钉扎分支名)— "
+            "R66 P0-03: EXPECTED_IDENTITY 禁止用 refs/heads/${{ github.ref_name }} "
+            "(tag push 时拼成 refs/heads/<tag> 错误,应改用 ${{ github.ref }})— "
             f"发现 {len(bad_lines)} 处: {bad_lines[:3]}"
+        )
+        # R66 P0-03: 验证至少有一处使用 ${{ github.ref }}(正确写法)
+        ref_count = sum(
+            1 for line in workflow_content.splitlines()
+            if "EXPECTED_IDENTITY=" in line
+            and "${{ github.ref }}" in line
+            and not line.lstrip().startswith("#")
+        )
+        assert ref_count >= 3, (
+            f"R66 P0-03: EXPECTED_IDENTITY 应至少 3 处使用 ${{ github.ref }} "
+            f"(image / migration manifest / release manifest),实际 {ref_count} 处"
         )
 
 
@@ -494,7 +536,7 @@ class TestRcContinuityPolicy:
             "P0-01 失败点 2: rc-continuity 必须用 PREV_DIGEST 跟踪历史 digest"
         )
         # 检查首次 release 的注释/处理(PREV_DIGEST 为空时不阻断)
-        assert 'DIGEST_MISMATCH=false' in workflow_content or 'DIGEST_MISMATCH=false' in workflow_content, (
+        assert 'DIGEST_MISMATCH=false' in workflow_content, (
             "P0-01 失败点 2: rc-continuity 必须初始化 DIGEST_MISMATCH=false(首次 release 不阻断)"
         )
 
@@ -519,7 +561,7 @@ class TestRcContinuityPolicy:
 
 class TestBranchProtectionScripts:
     """configure_branch_protection.sh / detect_branch_protection_contexts.sh
-    必须包含完整 contexts 列表(14 个 Release Gates job + CI / repo-hygiene)。
+    必须包含完整 contexts 列表(17 个 Release Gates job + CI / repo-hygiene)。
 
     P1-11 整改:BP contexts 必须与实际 workflow job 名完全一致。
     """
@@ -592,15 +634,15 @@ class TestBranchProtectionScripts:
         )
 
     def test_configure_script_has_rg_jobs_check(self, configure_script):
-        """configure 脚本必须校验 14 个 Release Gates job 覆盖。
+        """configure 脚本必须校验 17 个 Release Gates job 覆盖。
 
-        P0-01 失败点 1 / P1-11: configure 脚本应校验 Release Gates 14 个 job
+        P0-01 失败点 1 / P1-11: configure 脚本应校验 Release Gates 17 个 job
         是否在待配置 contexts 中(soft WARN)。
         """
         assert "EXPECTED_RG_JOBS" in configure_script, (
             "P0-01/P1-11: configure 脚本必须有 EXPECTED_RG_JOBS 校验列表"
         )
-        # 检查所有 14 个 Release Gates job 都在 EXPECTED_RG_JOBS 中
+        # 检查所有 17 个 Release Gates job 都在 EXPECTED_RG_JOBS 中
         for rg_job in EXPECTED_RELEASE_GATES_JOBS:
             assert rg_job in configure_script, (
                 f"P0-01/P1-11: configure 脚本的 EXPECTED_RG_JOBS 必须包含 '{rg_job}'"
@@ -619,9 +661,9 @@ class TestBranchProtectionScripts:
         )
 
     def test_detect_script_has_rg_jobs_check(self, detect_script):
-        """detect 脚本必须校验 14 个 Release Gates job 覆盖。
+        """detect 脚本必须校验 17 个 Release Gates job 覆盖。
 
-        P0-01 失败点 1 / P1-11: detect 脚本应校验 Release Gates 14 个 job
+        P0-01 失败点 1 / P1-11: detect 脚本应校验 Release Gates 17 个 job
         是否在检测到的 contexts 中(soft WARN)。
         """
         assert "EXPECTED_RG_JOBS" in detect_script, (
@@ -690,28 +732,28 @@ class TestWorkflowYamlIntegrity:
             pytest.fail(f"release-gates.yml YAML 语法错误: {e}")
 
     def test_workflow_has_14_release_gates_jobs(self, workflow_yaml):
-        """Release Gates workflow 必须包含 14 个 job。
+        """Release Gates workflow 必须包含 17 个 job。
 
-        P0-01 失败点 1: workflow 实际 job 数必须与 WORKFLOW_JOBS 列表一致(14 个)。
+        P0-01 失败点 1: workflow 实际 job 数必须与 WORKFLOW_JOBS 列表一致(17 个)。
         """
         jobs = workflow_yaml.get("jobs", {})
-        # 预期 14 个 Release Gates job
+        # 预期 17 个 Release Gates job
         for job_name in EXPECTED_RELEASE_GATES_JOBS:
             assert job_name in jobs, (
                 f"P0-01: release-gates.yml 必须包含 job '{job_name}'"
             )
 
     def test_release_summary_needs_all_jobs(self, workflow_yaml):
-        """release-summary 必须依赖所有 14 个 Release Gates job。
+        """release-summary 必须依赖所有 17 个 Release Gates job。
 
         P0-01 失败点 1: release-summary 作为聚合 required context,
-        必须依赖全部 14 个 job(包括 sign-image/rc-continuity/publish-attestation)。
+        必须依赖全部 17 个 job(包括 sign-image/rc-continuity/publish-attestation)。
         """
         release_summary = workflow_yaml["jobs"].get("release-summary", {})
         needs = release_summary.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        # release-summary 应依赖所有 14 个 job(除自身)
+        # release-summary 应依赖所有 17 个 job(除自身)
         expected_deps = [j for j in EXPECTED_RELEASE_GATES_JOBS if j != "release-summary"]
         missing_deps = [j for j in expected_deps if j not in needs]
         assert not missing_deps, (

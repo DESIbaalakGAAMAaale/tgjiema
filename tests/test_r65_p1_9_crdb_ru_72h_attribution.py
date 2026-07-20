@@ -1370,18 +1370,84 @@ class TestCIWorkflowIntegration:
         assert "--strict" in content
         assert "--data" in content
 
-    def test_publish_attestation_depends_on_gate(self):
-        """publish-attestation 应依赖 crdb-ru-72h-attribution-gate。"""
+    def test_publish_attestation_does_not_depend_on_gate(self):
+        """R66 P0-05: publish-attestation (master-only code-release gate)
+        不应依赖 crdb-ru-72h-attribution-gate(该 job 在 push 场景为 dry-run,
+        evidence_status=not_applicable,不应计入 code-release 的 production evidence)。
+
+        production-promotion-gate (tag-only) 才依赖 crdb-ru-72h-attribution-gate
+        且要求 evidence_status=production。
+        """
         wf_path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = wf_path.read_text(encoding="utf-8")
-        # publish-attestation 的 needs 列表应包含 crdb-ru-72h-attribution-gate
         # 找到 publish-attestation 段落
         pa_start = content.find("publish-attestation:")
         assert pa_start != -1
-        # 在 publish-attestation 段落内查找 needs
-        pa_section = content[pa_start:pa_start + 2000]
-        assert "crdb-ru-72h-attribution-gate" in pa_section, (
-            "publish-attestation needs 应包含 crdb-ru-72h-attribution-gate"
+        # 截取 publish-attestation 段落(到下一个顶级 job 之前)
+        next_job_idx = content.find("\n  #", pa_start + 100)
+        if next_job_idx < 0:
+            next_job_idx = pa_start + 5000
+        # 找到下一个顶级 job(以两空格 + 字母开头,且非 publish-attestation 段内)
+        # 简化:取 needs 行后的范围
+        pa_section = content[pa_start:pa_start + 3000]
+        # 找到 needs 行
+        needs_line_start = pa_section.find("needs:")
+        assert needs_line_start != -1, "publish-attestation 必须有 needs"
+        # 取 needs 行后到下一个非缩进字段
+        needs_section = pa_section[needs_line_start:needs_line_start + 800]
+        assert "crdb-ru-72h-attribution-gate" not in needs_section, (
+            "R66 P0-05: publish-attestation (master-only) 不应依赖 "
+            "crdb-ru-72h-attribution-gate (push 场景为 not_applicable,不应计入 code-release)"
+        )
+
+    def test_production_promotion_gate_depends_on_gate_and_requires_evidence(self):
+        """R66 P0-05: production-promotion-gate (tag-only) 必须依赖
+        crdb-ru-72h-attribution-gate 且要求 evidence_status=production。
+        """
+        wf_path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
+        content = wf_path.read_text(encoding="utf-8")
+        # 找到 production-promotion-gate 段落
+        ppg_start = content.find("production-promotion-gate:")
+        assert ppg_start != -1
+        ppg_section = content[ppg_start:ppg_start + 5000]
+        # needs 必须包含 crdb-ru-72h-attribution-gate
+        assert "crdb-ru-72h-attribution-gate" in ppg_section, (
+            "R66 P0-05: production-promotion-gate needs 必须包含 crdb-ru-72h-attribution-gate"
+        )
+        # 必须有校验 evidence_status=production 的步骤
+        assert "evidence_status" in ppg_section, (
+            "R66 P0-05: production-promotion-gate 必须校验 evidence_status"
+        )
+        assert "production" in ppg_section, (
+            "R66 P0-05: production-promotion-gate 必须要求 evidence_status=production"
+        )
+
+    def test_gate_job_outputs_evidence_status(self):
+        """R66 P0-05: crdb-ru-72h-attribution-gate job 必须输出 evidence_status。"""
+        wf_path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
+        content = wf_path.read_text(encoding="utf-8")
+        # 找到 crdb-ru-72h-attribution-gate 段落
+        gate_start = content.find("crdb-ru-72h-attribution-gate:")
+        assert gate_start != -1
+        gate_section = content[gate_start:gate_start + 3000]
+        # 必须有 outputs 段
+        assert "outputs:" in gate_section, (
+            "R66 P0-05: crdb-ru-72h-attribution-gate 必须有 outputs 段"
+        )
+        # 必须输出 evidence_status
+        assert "evidence_status:" in gate_section, (
+            "R66 P0-05: crdb-ru-72h-attribution-gate 必须输出 evidence_status"
+        )
+        # 必须输出 evidence_mode
+        assert "evidence_mode:" in gate_section, (
+            "R66 P0-05: crdb-ru-72h-attribution-gate 必须输出 evidence_mode"
+        )
+        # 必须区分 not_applicable 与 production
+        assert "not_applicable" in gate_section, (
+            "R66 P0-05: crdb-ru-72h-attribution-gate 必须输出 not_applicable (PR/push)"
+        )
+        assert "production" in gate_section, (
+            "R66 P0-05: crdb-ru-72h-attribution-gate 必须输出 production (release tag)"
         )
 
     def test_release_summary_includes_gate(self):

@@ -126,15 +126,48 @@ async def _make_store_with_restore_tables(db_path: str | None = None):
 
 
 def _make_orchestrator(store, *, staging_root=None, backends=None, fault_hooks=None):
-    """构造 RestoreOrchestrator(注入 store + 可选 backends)。"""
-    from services.restore_orchestrator import RestoreOrchestrator
+    """构造 RestoreOrchestrator(真实 backends)或 SkeletonFake(backends=None)。
+
+    R66 P0-06: 生产类 RestoreOrchestrator 已删除所有 Optional 降级骨架,
+    backends / approval_authority / mfa_authority 均为必需参数。
+    - 提供 backends 时:构造真实 RestoreOrchestrator(注入 AsyncMock authorities,
+      verify_and_consume 返回 mock capability 供 audit event 使用)
+    - backends=None 时:使用 tests-only fake 保留旧骨架行为
+    """
     if staging_root is None:
         staging_root = tempfile.mkdtemp(prefix="r65_p0_2_staging_")
+    if backends is None:
+        # R66 P0-06: backends=None 时使用 tests-only fake(骨架行为)
+        from tests._restore_skeleton_fake import RestoreOrchestratorSkeletonFake
+        return RestoreOrchestratorSkeletonFake(
+            store,
+            staging_root=staging_root,
+            fault_hooks=fault_hooks or {},
+        )
+    # 真实 backends:构造生产类 RestoreOrchestrator(注入 AsyncMock authorities)
+    # verify_and_consume 返回 mock capability(approval_cap/mfa_cap)供 audit event 使用
+    from services.restore_orchestrator import RestoreOrchestrator
+    from unittest.mock import AsyncMock, MagicMock
+
+    approval_cap = MagicMock()
+    approval_cap.approval_id = "mock_approval_id"
+    approval_cap.approver_id = 0
+    mfa_cap = MagicMock()
+    mfa_cap.jti = "mock_jti"
+    mfa_cap.principal_id = 0
+
+    approval_authority = MagicMock()
+    approval_authority.verify_and_consume = AsyncMock(return_value=approval_cap)
+    mfa_authority = MagicMock()
+    mfa_authority.verify_and_consume = AsyncMock(return_value=mfa_cap)
+
     return RestoreOrchestrator(
         store,
         staging_root=staging_root,
         fault_hooks=fault_hooks or {},
         backends=backends,
+        approval_authority=approval_authority,
+        mfa_authority=mfa_authority,
     )
 
 
@@ -544,11 +577,12 @@ class TestOrchestratorBackendIntegration:
         assert targets["crdb"].startswith("staging_restore_")
 
         # 验证:provision_result 保存在 datasource_states
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.datasource_states["sqlite"]["provision_result"]["target_type"] == "sqlite_file"
         assert op.datasource_states["relay_sqlite"]["provision_result"]["target_type"] == "sqlite_file"
-        # crdb 走骨架路径
-        assert op.datasource_states["crdb"]["provision_result"]["target_type"] == "skeleton"
+        # R66 P0-06: crdb 未注册 — 生产类不再走骨架 touch 空文件路径,
+        # 仅记录占位符 target_type="unregistered"(启动期 check_startup_readiness 应拦截)
+        assert op.datasource_states["crdb"]["provision_result"]["target_type"] == "unregistered"
 
         await store.close()
         shutil.rmtree(staging_root, ignore_errors=True)
@@ -588,7 +622,7 @@ class TestOrchestratorBackendIntegration:
             operation_id, "sqlite", tables_data={"t1": records},
         )
 
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         rr = op.datasource_states["sqlite"]["restore_result"]
         assert rr["rows_restored"]["t1"] == 5
         assert len(rr["content_hash"]["t1"]) == 64
@@ -689,7 +723,7 @@ class TestOrchestratorBackendIntegration:
             )
 
         # operation 应已 fail → staging 已销毁
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase == RestorePhase.FAILED
 
         await store.close()
@@ -726,7 +760,7 @@ class TestOrchestratorBackendIntegration:
         operation_id = await orch.start_operation(
             backup_id="backup_test",
             manifest_digest="a" * 64,
-            requested_by="tester",
+            requested_by="12345",  # R66 P0-06: 生产类 _execute_switch_with_authorities 调用 int(created_by)
             payload_digest="d" * 64,
             nonce="n_" + uuid.uuid4().hex[:16],
         )
@@ -757,7 +791,7 @@ class TestOrchestratorBackendIntegration:
             assert await cursor.fetchone() is None
 
         # switch_result 持久化在 datasource_states
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase == RestorePhase.COMPLETED
         assert op.switch_version == switch_version
         sr = op.datasource_states["sqlite"]["switch_result"]
@@ -797,7 +831,7 @@ class TestOrchestratorBackendIntegration:
         operation_id = await orch.start_operation(
             backup_id="backup_test",
             manifest_digest="a" * 64,
-            requested_by="tester",
+            requested_by="12345",  # R66 P0-06: 生产类 _execute_switch_with_authorities 调用 int(created_by)
             payload_digest="d" * 64,
             nonce="n_" + uuid.uuid4().hex[:16],
         )
@@ -816,7 +850,7 @@ class TestOrchestratorBackendIntegration:
 
         # 回滚
         await orch.rollback_operation(operation_id, reason="test_rollback")
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase == RestorePhase.ROLLED_BACK
         # active 恢复为旧内容(old_t 回来了)
         async with aiosqlite.connect(str(active_cache)) as conn:
@@ -870,7 +904,7 @@ class TestOrchestratorBackendIntegration:
 
         # fail_operation 应已销毁 staging
         assert not staging_path.exists()
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase == RestorePhase.FAILED
 
         await store.close()
@@ -903,7 +937,7 @@ class TestBackwardCompatibilitySkeleton:
         assert Path(targets["relay_sqlite"]).exists()
         assert Path(targets["relay_sqlite"]).stat().st_size == 0
         # provision_result.target_type == "skeleton"
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.datasource_states["sqlite"]["provision_result"]["target_type"] == "skeleton"
         await store.close()
         shutil.rmtree(staging_root, ignore_errors=True)
@@ -923,7 +957,7 @@ class TestBackwardCompatibilitySkeleton:
         # 不传 tables_data → 骨架行为
         result = await orch.restore_to_staging(operation_id, "sqlite")
         assert result is True
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.datasource_states["sqlite"]["status"] == "restored"
         # 无 restore_result(骨架未写入)
         assert "restore_result" not in op.datasource_states["sqlite"]

@@ -97,12 +97,18 @@ def _make_orchestrator(
     fault_hooks=None,
     rollback_ttl_seconds: int = 86400,
 ):
-    """构造 RestoreOrchestrator(注入 store + 可选 fault_hooks)。"""
-    from services.restore_orchestrator import RestoreOrchestrator
+    """构造 RestoreOrchestratorSkeletonFake(注入 store + 可选 fault_hooks)。
+
+    R66 P0-06: 生产类 RestoreOrchestrator 已删除所有 Optional 降级骨架,
+    backends / approval_authority / mfa_authority 均为必需参数。
+    本测试文件覆盖 R64 状态机 / 持久化 / nonce ledger 等行为,不依赖真实
+    backend / authority,故使用 tests-only fake 保留旧骨架行为。
+    """
+    from tests._restore_skeleton_fake import RestoreOrchestratorSkeletonFake
     if staging_root is None:
         _tmp_dir = tempfile.mkdtemp(prefix="r64_p0_3_staging_")
         staging_root = _tmp_dir
-    return RestoreOrchestrator(
+    return RestoreOrchestratorSkeletonFake(
         store,
         staging_root=staging_root,
         fault_hooks=fault_hooks or {},
@@ -267,7 +273,7 @@ class TestStartOperation:
             payload_digest="d" * 64,
             nonce="nonce_test_002",
         )
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.datasource_states["crdb"]["status"] == "pending"
         assert op.datasource_states["sqlite"]["status"] == "pending"
         assert op.datasource_states["relay_sqlite"]["status"] == "pending"
@@ -414,7 +420,7 @@ class TestProvisionStaging:
             await orch.provision_staging(operation_id)
         assert exc_info.value.code == ErrorCodes.RESTORE_STAGING_PROVISION_FAILED
         # operation 应已进入 FAILED 终态
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "failed"
 
     @pytest.mark.asyncio
@@ -489,7 +495,7 @@ class TestRestoreToStaging:
         await orch.provision_staging(operation_id)
         result = await orch.restore_to_staging(operation_id, "crdb")
         assert result is True
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.datasource_states["crdb"]["status"] == "restored"
 
     @pytest.mark.asyncio
@@ -507,7 +513,7 @@ class TestRestoreToStaging:
         await orch.provision_staging(operation_id)
         result = await orch.restore_to_staging(operation_id, "sqlite")
         assert result is True
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.datasource_states["sqlite"]["status"] == "restored"
 
     @pytest.mark.asyncio
@@ -525,7 +531,7 @@ class TestRestoreToStaging:
         await orch.provision_staging(operation_id)
         result = await orch.restore_to_staging(operation_id, "relay_sqlite")
         assert result is True
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.datasource_states["relay_sqlite"]["status"] == "restored"
 
     @pytest.mark.asyncio
@@ -692,7 +698,7 @@ class TestApprovalAndMFA:
             await orch.restore_to_staging(operation_id, ds)
         await orch.validate_staging(operation_id)
         await orch.request_approval(operation_id, "approval_001", "mfa_001")
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "await_approval"
         assert op.approval_id == "approval_001"
         assert op.mfa_receipt_id == "mfa_001"
@@ -867,7 +873,7 @@ class TestBlueGreenSwitch:
             )
         assert exc_info.value.code == ErrorCodes.RESTORE_SWITCH_FAILED
         # operation 应进入 FAILED 终态
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "failed"
 
 
@@ -889,7 +895,7 @@ class TestRollback:
             operation_id, reason="post_switch_anomaly_detected"
         )
         assert rollback_version == switch_version
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "rolled_back"
 
     @pytest.mark.asyncio
@@ -992,11 +998,11 @@ class TestFailOperation:
         await orch.provision_staging(operation_id)
         # 第一次 fail
         await orch.fail_operation(operation_id, reason="first_failure")
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "failed"
         # 第二次 fail(幂等,不抛异常)
         await orch.fail_operation(operation_id, reason="second_failure")
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "failed"  # 仍是 failed
 
 
@@ -1101,7 +1107,7 @@ class TestThreeFullRecoveries:
         store, _ = await _make_store_with_restore_tables()
         orch = _make_orchestrator(store)
         operation_id, switch_version = await _run_full_happy_path(orch)
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "completed"
         # 验证 active 指针保留(rollback target 存在)
         targets = await orch.list_rollback_targets(operation_id)
@@ -1141,7 +1147,7 @@ class TestThreeFullRecoveries:
         targets = await orch.list_rollback_targets(operation_id)
         assert len(targets) == 0
         # operation 进入 FAILED
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "failed"
 
     @pytest.mark.asyncio
@@ -1168,7 +1174,7 @@ class TestThreeFullRecoveries:
         # 验证 active 未受影响
         targets = await orch.list_rollback_targets(operation_id)
         assert len(targets) == 0
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "failed"
 
     @pytest.mark.asyncio
@@ -1182,7 +1188,7 @@ class TestThreeFullRecoveries:
                 orch, payload_digest=f"payload_{i}" + "0" * 56
             )
             operation_ids.append(operation_id)
-            op = orch.get_operation(operation_id)
+            op = await orch.get_operation(operation_id)
             assert op.phase.value == "completed"
         # 验证三次 operation_id 互不相同
         assert len(set(operation_ids)) == 3

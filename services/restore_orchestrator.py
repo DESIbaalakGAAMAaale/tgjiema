@@ -272,29 +272,62 @@ class RestoreOrchestrator:
         rollback_ttl_seconds: int = 86400,
         clock: Optional[Callable[[], float]] = None,
         fault_hooks: Optional[dict[str, FaultHook]] = None,
-        backends: Optional[BackendRegistry] = None,
-        approval_authority: Any = None,
-        mfa_authority: Any = None,
+        backends: BackendRegistry,
+        approval_authority: Any,
+        mfa_authority: Any,
     ) -> None:
-        """R65 P0-03: 接受 ApprovalAuthority/MFAAuthority 以启用 UoW CAS 消费。
+        """R66 P0-06: 删除所有 Optional 降级骨架 — 必需依赖缺失立即 raise。
+
+        R65 P0-02/P0-03 整改时,``backends`` / ``approval_authority`` /
+        ``mfa_authority`` 均为 Optional,允许 None 时退回骨架行为
+        (touch 空文件 / 占位符 switch / 旧 ID 比较)。但 "生产应提供"
+        仅是注释,不是可执行安全边界 — 状态机可产生 "已恢复、已验证"
+        审计记录但未真实恢复,approval_id/mfa_receipt_id 可任意伪造。
+
+        R66 P0-06 整改:
+            - ``backends`` / ``approval_authority`` / ``mfa_authority`` /
+              ``store`` 任一为 None → 构造时立即 raise AppError(fail-closed)
+            - 兼容骨架行为迁移到 tests-only fake
+              (``RestoreOrchestratorSkeletonFake``),不在生产模块中保留
+            - 生产类不得存在任何 ``if X is None: <fallback>`` 降级分支
 
         Args:
-            store: CacheStore 实例(提供 _db / nonce ledger 方法)
+            store: CacheStore 实例(提供 _db / nonce ledger 方法),必需
             staging_root: staging 文件根目录(默认系统临时目录)
             rollback_ttl_seconds: 回滚点保留时长(默认 24 小时)
             clock: 时间源(默认 time.time,测试可注入)
             fault_hooks: 故障注入钩子(测试用)
-            backends: R65 P0-02 BackendRegistry(crdb/sqlite/relay_sqlite)。
-                若提供,orchestrator 调用 backend 真实方法(provision/load/
-                validate/prepare_switch/commit_switch/rollback_switch/destroy)。
-                若为 None,保留旧骨架行为(向后兼容已有测试,但不应在生产使用)。
-            approval_authority: R65 P0-03 ApprovalAuthority 实例。若提供,
+            backends: R65 P0-02 BackendRegistry(crdb/sqlite/relay_sqlite),必需。
+                orchestrator 调用 backend 真实方法(provision/load/validate/
+                prepare_switch/commit_switch/rollback_switch/destroy)。
+            approval_authority: R65 P0-03 ApprovalAuthority 实例,必需。
                 execute_blue_green_switch 在同一 UnitOfWork 中调用其
                 verify_and_consume CAS 消费 approval(不可伪造 capability)。
-                若为 None,保留旧 ID 比较路径(向后兼容 R64 测试,生产应提供)。
-            mfa_authority: R65 P0-03 MFAAuthority 实例。若提供,在同一 UoW 中
-                CAS 消费 MFA receipt(不可伪造 capability)。若为 None,旧路径。
+            mfa_authority: R65 P0-03 MFAAuthority 实例,必需。在同一 UoW 中
+                CAS 消费 MFA receipt(不可伪造 capability)。
+
+        Raises:
+            AppError(RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING):
+                任一必需依赖为 None
         """
+        # R66 P0-06: 必需依赖校验 — fail-closed(不允许降级到骨架路径)
+        missing: list[str] = []
+        if store is None:
+            missing.append("store")
+        if backends is None:
+            missing.append("backends")
+        if approval_authority is None:
+            missing.append("approval_authority")
+        if mfa_authority is None:
+            missing.append("mfa_authority")
+        if missing:
+            raise AppError(
+                ErrorCodes.RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING,
+                params={
+                    "reason": "constructor_required_dependency_missing",
+                    "missing": ",".join(missing),
+                },
+            )
         self._store = store
         # staging_root 优先参数,其次环境变量 RESTORE_STAGING_ROOT,最后系统临时目录
         self._staging_root: Path = Path(
@@ -306,19 +339,103 @@ class RestoreOrchestrator:
         self._clock = clock or _dt.datetime.now
         # fault_hooks 仅用于测试故障注入(production 应为空 dict)
         self._fault_hooks: dict[str, FaultHook] = dict(fault_hooks or {})
-        # 内存中的操作状态缓存(持久化层在 restore_operations 表)
+        # R66 P0-06: 内存缓存仅作版本化快照(_meta 等非持久化字段);
+        # phase 决策权威源在持久化层,get_operation 每次从 store reload
         self._operations: dict[str, RestoreOperation] = {}
-        # R65 P0-02: 真实恢复数据面 backend 注册表
-        self._backends: Optional[BackendRegistry] = backends
-        if backends is None:
-            logger.warning(
-                _i18n_t("diagnostics.r65.p0_02.no_backend_registry")
-            )
-        # R65 P0-03: 审批/MFA 权威(可选)
-        # 若提供,execute_blue_green_switch 走 UoW+CAS 路径(不可伪造 capability)
-        # 若为 None,保留旧 ID 比较路径(向后兼容 R64 测试)
+        # R65 P0-02: 真实恢复数据面 backend 注册表(R66 P0-06: 必需,不再 Optional)
+        self._backends: BackendRegistry = backends
+        # R65 P0-03: 审批/MFA 权威(R66 P0-06: 必需,不再 Optional)
+        # execute_blue_green_switch 始终走 UoW+CAS 路径(不可伪造 capability)
         self._approval_authority = approval_authority
         self._mfa_authority = mfa_authority
+
+    # ─── R66 P0-06: 启动就绪检查 ──────────────────────────────
+
+    @classmethod
+    async def check_startup_readiness(
+        cls,
+        *,
+        store: Any,
+        backends: BackendRegistry,
+        approval_authority: Any,
+        mfa_authority: Any,
+    ) -> None:
+        """R66 P0-06: 启动就绪检查 — 验证所有必需依赖可用。
+
+        在构造 RestoreOrchestrator 之前调用,确保:
+          1. store 可用(含 _db 连接)
+          2. backends 已注册所有三个 datasource(crdb / sqlite / relay_sqlite)
+          3. approval_authority 可用(非 None)
+          4. mfa_authority 可用(非 None)
+          5. nonce ledger 方法可用(reserve/consume/fail_capability_nonce)
+          6. active pointer / fencing store 可用(restore_rollback_targets 表)
+
+        任一不可用 → raise AppError(RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING)。
+
+        Args:
+            store: CacheStore 实例
+            backends: BackendRegistry(crdb/sqlite/relay_sqlite)
+            approval_authority: ApprovalAuthority 实例
+            mfa_authority: MFAAuthority 实例
+
+        Raises:
+            AppError(RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING):
+                任一依赖不可用
+        """
+        missing: list[str] = []
+
+        # 1. store 可用 + _db 连接
+        if store is None or getattr(store, "_db", None) is None:
+            missing.append("store._db")
+
+        # 2. approval_authority / mfa_authority 可用
+        if approval_authority is None:
+            missing.append("approval_authority")
+        if mfa_authority is None:
+            missing.append("mfa_authority")
+
+        # 3. backends 已注册所有三个 datasource
+        if backends is None:
+            missing.append("backends")
+        else:
+            for ds in _DATASOURCE_ORDER:
+                if ds not in backends:
+                    missing.append(f"backends.{ds}")
+
+        # 4. nonce ledger 方法可用(store 提供 reserve/consume/fail)
+        if store is not None:
+            for method_name in (
+                "reserve_capability_nonce",
+                "consume_capability_nonce",
+                "fail_capability_nonce",
+            ):
+                if getattr(store, method_name, None) is None:
+                    missing.append(f"store.{method_name}")
+
+        # 5. active pointer / fencing store(restore_rollback_targets 表)
+        if store is not None and getattr(store, "_db", None) is not None:
+            try:
+                cursor = await store._db.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='restore_rollback_targets'"
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    missing.append("restore_rollback_targets_table")
+            except Exception:
+                # R66 P0-06: fail-closed — 查询失败即视为缺失,append 到 missing
+                # 列表后由下方 AppError 统一抛出(不单独 logger.warning 以避免
+                # 扩大 services/ log_only baseline,符合 R56 §5.1 绝对门禁策略)。
+                missing.append("restore_rollback_targets_table")
+
+        if missing:
+            raise AppError(
+                ErrorCodes.RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING,
+                params={
+                    "reason": "startup_readiness_check_failed",
+                    "missing": ",".join(missing),
+                },
+            )
 
     # ─── 公共属性 ──────────────────────────────────────────
 
@@ -661,8 +778,64 @@ class RestoreOrchestrator:
             # 查询失败不阻塞(向后兼容无表的场景),仅记录
             logger.debug(f"[restore_orchestrator] payload consistency 查询失败(忽略): {e}")
 
-    def get_operation(self, operation_id: str) -> RestoreOperation:
-        """获取操作状态(优先内存缓存,其次持久化层)。"""
+    async def get_operation(self, operation_id: str) -> RestoreOperation:
+        """R66 P0-06: 获取操作状态 — 每次从权威 store 重载,缓存仅作版本化快照。
+
+        生产环境可能存在多个 orchestrator 实例(分布式部署),内存缓存
+        可能与其他实例的写入不一致。因此 get_operation 每次都从持久化层
+        reload,内存缓存仅用于保留非持久化字段(如 ``_meta.nonce`` /
+        ``_meta.payload_digest``)。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            RestoreOperation(从持久化层 reload,合并 _meta 快照)
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): operation 不存在
+        """
+        # R66 P0-06: 从权威 store reload(若 store 可用)
+        if self._store is not None and getattr(self._store, "_db", None) is not None:
+            persisted = await self.get_persisted_operation(operation_id)
+            if persisted is None:
+                raise AppError(
+                    ErrorCodes.RESTORE_PHASE_TRANSITION_INVALID,
+                    params={
+                        "operation_id": operation_id,
+                        "phase_from": "",
+                        "phase_to": "",
+                        "reason": "operation_not_found",
+                    },
+                )
+            # 从持久化数据重建 RestoreOperation
+            operation = RestoreOperation(
+                operation_id=persisted["operation_id"],
+                backup_id=persisted["backup_id"],
+                manifest_digest=persisted["manifest_digest"],
+                phase=RestorePhase(persisted["phase"]),
+                datasource_states=persisted["datasource_states"],
+                validation_summary=persisted["validation_summary"],
+                approval_id=persisted["approval_id"],
+                mfa_receipt_id=persisted["mfa_receipt_id"],
+                switch_version=persisted["switch_version"],
+                previous_version=persisted["previous_version"],
+                created_at=persisted["created_at"],
+                updated_at=persisted["updated_at"],
+                created_by=persisted["created_by"],
+            )
+            # 合并 _meta(仅在内存缓存中,不持久化 — nonce / payload_digest)
+            cached = self._operations.get(operation_id)
+            if cached and "_meta" in cached.datasource_states:
+                new_ds_states = {
+                    **operation.datasource_states,
+                    "_meta": cached.datasource_states["_meta"],
+                }
+                operation = replace(operation, datasource_states=new_ds_states)
+            # 更新缓存为最新快照
+            self._operations[operation_id] = operation
+            return operation
+        # 无 store(仅测试场景)— 退回内存缓存
         if operation_id in self._operations:
             return self._operations[operation_id]
         raise AppError(
@@ -684,10 +857,12 @@ class RestoreOrchestrator:
         - cache SQLite: 返回新文件路径(不接触 cache_store.db)
         - relay SQLite: 返回新文件路径(不接触 relay_pool.db)
 
-        R65 P0-02: 若提供 BackendRegistry,调用 backend.provision() 真实创建
-        staging 目标(CRDB schema / SQLite 文件 + schema 初始化),
+        R65 P0-02: 调用 backend.provision() 真实创建 staging 目标
+        (CRDB schema / SQLite 文件 + schema 初始化),
         并保存 StagingProvisionResult 到 datasource_states[ds].provision_result。
-        若 backends=None,保留旧骨架行为(仅 touch 空文件,向后兼容)。
+
+        R66 P0-06: backends 必需(构造时已校验),不再有 None 降级骨架路径。
+        未注册的 datasource 仍视为错误(应由调用方在 check_startup_readiness 校验)。
 
         任何数据源 provision 失败 → fail_operation(销毁已创建的 staging)。
 
@@ -695,13 +870,14 @@ class RestoreOrchestrator:
             {crdb: "staging_schema_xxx", sqlite: "/path/staging_cache.db",
              relay_sqlite: "/path/staging_relay.db"}
         """
-        operation = self.get_operation(operation_id)
+        operation = await self.get_operation(operation_id)
         self._assert_legal_transition(operation, RestorePhase.STAGING_PROVISION)
         # 触发故障注入(测试用)
         self._maybe_inject_fault("staging_provision", operation_id, None)
 
         staging_targets: dict[str, str] = {}
-        # 骨架默认目标(向后兼容 backends=None 场景)
+        # R66 P0-06: 默认目标仅作为 fallback 占位符(backend.provision 会覆盖);
+        # 生产环境 backends 必需,所有 datasource 都会经 backend.provision() 真实创建
         staging_targets["crdb"] = f"staging_restore_{operation_id.replace('-', '')[:16]}"
         staging_targets["sqlite"] = str(
             self._staging_root / f"staging_cache_{operation_id}.db"
@@ -712,14 +888,16 @@ class RestoreOrchestrator:
         # 确保 staging_root 存在
         self._staging_root.mkdir(parents=True, exist_ok=True)
 
-        # R65 P0-02: 真实 provision — 仅调用注册的 backend,未注册的保留骨架目标
+        # R65 P0-02: 真实 provision — 调用已注册的 backend
+        # R66 P0-06: backends 必需(不再有 None 降级路径);未注册的 datasource
+        # 由 check_startup_readiness 在启动期校验,运行期仍兜底跳过
         provision_results: dict[str, dict[str, Any]] = {}
         for datasource in _DATASOURCE_ORDER:
             try:
                 self._maybe_inject_fault(
                     f"staging_provision.{datasource}", operation_id, datasource
                 )
-                if self._backends is not None and datasource in self._backends:
+                if datasource in self._backends:
                     # R65 P0-02: 真实调用 backend.provision()
                     backend = self._backends.get(datasource)
                     result = await backend.provision(operation_id, self._staging_root)
@@ -739,12 +917,11 @@ class RestoreOrchestrator:
                         )
                     )
                 else:
-                    # 骨架行为:仅 touch 空文件(SQLite)或仅记录 schema 名(CRDB)
-                    if datasource in ("sqlite", "relay_sqlite"):
-                        Path(staging_targets[datasource]).touch(exist_ok=True)
+                    # R66 P0-06: 未注册的 datasource — 不再走骨架 touch 空文件路径,
+                    # 仅记录占位符(运行期兜底;启动期 check_startup_readiness 应拦截)
                     provision_results[datasource] = {
                         "target": staging_targets[datasource],
-                        "target_type": "skeleton",
+                        "target_type": "unregistered",
                     }
             except Exception as e:
                 # 任一数据源 provision 失败 → fail_operation
@@ -812,10 +989,11 @@ class RestoreOrchestrator:
     ) -> bool:
         """按 datasource 顺序执行 restore 到 staging。
 
-        R65 P0-02: 若提供 BackendRegistry + tables_data,调用
-        backend.load_verified_payload() 真实写入 staging,
+        R65 P0-02: 调用 backend.load_verified_payload() 真实写入 staging,
         保存 StagingRestoreResult(rows_restored / content_hash / schema_fingerprint)。
-        若 backends=None 或 tables_data=None,保留骨架行为(仅状态变更,向后兼容)。
+
+        R66 P0-06: backends 必需(构造时已校验),不再有 None 降级骨架路径。
+        tables_data=None 时仅记录状态变更(无真实写入),用于无数据表的 datasource。
 
         失败时调用 fail_operation 销毁 staging。
 
@@ -823,7 +1001,7 @@ class RestoreOrchestrator:
             operation_id: 操作 ID
             datasource: "crdb" / "sqlite" / "relay_sqlite"
             tables_data: {table_name: rows}(仅属于本 datasource 的表)。
-                R65 P0-02: 提供且 backends 已注册时执行真实写入。
+                提供且 backends 已注册时执行真实写入。
             merge: True=增量补充,False=覆盖(默认)
 
         Returns:
@@ -833,7 +1011,7 @@ class RestoreOrchestrator:
         Raises:
             AppError(RESTORE.STAGING_PROVISION_FAILED): restore 失败
         """
-        operation = self.get_operation(operation_id)
+        operation = await self.get_operation(operation_id)
         if datasource not in _DATASOURCE_ORDER:
             raise AppError(
                 ErrorCodes.RESTORE_STAGING_PROVISION_FAILED,
@@ -855,11 +1033,8 @@ class RestoreOrchestrator:
             ds_state["status"] = "restored"
 
             # R65 P0-02: 真实写入 — backend.load_verified_payload()
-            if (
-                self._backends is not None
-                and datasource in self._backends
-                and tables_data is not None
-            ):
+            # R66 P0-06: backends 必需;tables_data=None 时跳过真实写入(无数据表场景)
+            if datasource in self._backends and tables_data is not None:
                 backend = self._backends.get(datasource)
                 # 从 ds_state.provision_result 重建 StagingProvisionResult
                 provision_dict = ds_state.get("provision_result", {})
@@ -892,10 +1067,11 @@ class RestoreOrchestrator:
                     )
                 )
             else:
-                # 骨架行为:仅状态变更(向后兼容 backends=None 或 tables_data=None)
+                # R66 P0-06: tables_data=None 或 datasource 未注册 — 仅记录状态变更
+                # (无数据表场景 / 启动期 check_startup_readiness 应拦截未注册情况)
                 logger.debug(
                     _i18n_t(
-                        "diagnostics.r65.p0_02.staging_restore_skeleton",
+                        "diagnostics.r65.p0_02.staging_restore_no_data",
                         datasource=datasource,
                         operation_id=operation_id,
                     )
@@ -943,29 +1119,30 @@ class RestoreOrchestrator:
     ) -> ValidationSummary:
         """对每个 datasource 检查 schema / 行数 / 主外键 / 业务守恒 / hash / 演练。
 
-        R65 P0-02: 若提供 BackendRegistry + expected_tables,调用
-        backend.validate() 执行真实 6 维度验证。任一维度非 ok(fail/skipped/
-        pending/unknown)即整体失败,不能默认 ok。
-        若 backends=None,保留骨架行为(按维度故障注入,默认 ok,向后兼容)。
+        R65 P0-02: 调用 backend.validate() 执行真实 6 维度验证。
+        任一维度非 ok(fail/skipped/pending/unknown)即整体失败,不能默认 ok。
+
+        R66 P0-06: backends 必需(构造时已校验),不再有 None 降级骨架路径。
+        expected_tables=None 时仍按维度执行故障注入,但默认 ok
+        (用于无数据表 / 仅状态机推进的场景)。
 
         Args:
             operation_id: 操作 ID
             expected_tables: {datasource: {table_name: rows}} 用于行数/hash 比对。
-                R65 P0-02: 提供且 backends 已注册时执行真实验证。
+                提供且 backends 已注册时执行真实验证。
 
         任一失败 → fail_operation(销毁 staging)。
 
         Returns:
             ValidationSummary(各维度 ok / fail / skipped + 详情)
         """
-        operation = self.get_operation(operation_id)
+        operation = await self.get_operation(operation_id)
         self._assert_legal_transition(operation, RestorePhase.STAGING_VALIDATE)
 
         # R65 P0-02: 真实验证 — backend.validate()
-        if (
-            self._backends is not None
-            and expected_tables is not None
-        ):
+        # R66 P0-06: backends 必需(不再有 None 降级路径);
+        # expected_tables=None 时仍允许(无数据表场景),仅按维度故障注入
+        if expected_tables is not None:
             # 收集所有 datasource 的验证结果,合并到整体 summary
             merged_status: dict[str, str] = {
                 "schema": "ok",
@@ -1070,7 +1247,8 @@ class RestoreOrchestrator:
                     },
                 )
         else:
-            # 骨架行为:按维度故障注入,默认 ok(向后兼容 backends=None)
+            # R66 P0-06: expected_tables=None — 无数据表 / 仅状态机推进场景
+            # 按维度故障注入(测试用),默认 ok(无数据可校验)
             dimensions = ["schema", "row_count", "foreign_keys",
                           "business_invariant", "hash_check", "dry_run"]
             results: dict[str, str] = {}
@@ -1148,7 +1326,7 @@ class RestoreOrchestrator:
             AppError(RESTORE.APPROVAL_REQUIRED): approval_id 为空
             AppError(RESTORE.MFA_REQUIRED): mfa_receipt_id 为空
         """
-        operation = self.get_operation(operation_id)
+        operation = await self.get_operation(operation_id)
         self._assert_legal_transition(operation, RestorePhase.AWAIT_APPROVAL)
         if not approval_id:
             raise AppError(
@@ -1183,21 +1361,21 @@ class RestoreOrchestrator:
     ) -> str:
         """CAS 切换 active 指针;保留旧版本作为 rollback target;nonce state=consumed。
 
-        R65 P0-02: 若提供 BackendRegistry,调用 backend.prepare_switch() +
-        backend.commit_switch() 执行真实蓝绿切换:
+        R65 P0-02: 调用 backend.prepare_switch() + backend.commit_switch()
+        执行真实蓝绿切换:
         - SQLite: 原子 rename(active → backup, staging → active)
         - CRDB: schema 指针切换(逻辑层 routing 切换)
         switch_version 来自 backend(SwitchResult.switch_version,UUID),
         previous_target 持久化为 rollback target。
-        若 backends=None,保留骨架行为(仅记录 switch_version,向后兼容)。
 
-        R65 P0-03: 若提供 ApprovalAuthority + MFAAuthority,走 UoW+CAS 路径:
+        R65 P0-03: 始终走 UoW+CAS 路径(approval_authority/mfa_authority 必需):
         - 在同一 UnitOfWork 中 CAS 消费 approval(consumed_at)、MFA(jti)、
           operation phase(await_approval → blue_green_switch)、rollback_target、
           audit event — 任一失败 UoW 回滚 → approval/MFA 未消费(replay-safe)
-        - 旧 ID 比较路径仅在 authorities=None 时使用(向后兼容 R64 测试,
-          生产环境必须提供 authorities,否则 approval_id/mfa_receipt_id 仅是
-          调用方传入的不透明字符串,可被任意伪造)
+
+        R66 P0-06: backends / approval_authority / mfa_authority 均为必需
+        (构造时已校验),不再有 None 降级骨架路径。旧 ID 比较路径
+        (opaque string comparison)已迁移到 tests-only fake。
 
         Args:
             operation_id: 操作 ID
@@ -1214,181 +1392,14 @@ class RestoreOrchestrator:
             AppError(RESTORE.MFA_REQUIRED): mfa_receipt_id 为空/不匹配/CAS 失败
             AppError(RESTORE.SWITCH_FAILED): 切换失败
         """
-        operation = self.get_operation(operation_id)
+        operation = await self.get_operation(operation_id)
         self._assert_legal_transition(operation, RestorePhase.BLUE_GREEN_SWITCH)
 
-        # R65 P0-03: 提供两个 authority 时走 UoW+CAS 路径(不可伪造 capability)
-        # 否则保留旧 ID 比较路径(向后兼容 R64 测试,生产应提供 authorities)
-        if (
-            self._approval_authority is not None
-            and self._mfa_authority is not None
-        ):
-            return await self._execute_switch_with_authorities(
-                operation, operation_id, approval_id, mfa_receipt_id,
-            )
-
-        # 旧 ID 比较路径(向后兼容 R64 测试 — opaque string comparison)
-        # 校验 approval + MFA 与 request_approval 阶段一致
-        if not approval_id or approval_id != operation.approval_id:
-            raise AppError(
-                ErrorCodes.RESTORE_APPROVAL_REQUIRED,
-                params={
-                    "operation_id": operation_id,
-                    "reason": "approval_id_mismatch_or_empty",
-                },
-            )
-        if not mfa_receipt_id or mfa_receipt_id != operation.mfa_receipt_id:
-            raise AppError(
-                ErrorCodes.RESTORE_MFA_REQUIRED,
-                params={
-                    "operation_id": operation_id,
-                    "reason": "mfa_receipt_id_mismatch_or_empty",
-                },
-            )
-
-        # 触发故障注入(测试用)
-        try:
-            self._maybe_inject_fault("blue_green_switch", operation_id, None)
-        except AppError:
-            raise
-        except Exception as e:
-            await self.fail_operation(
-                operation_id, reason=f"switch_failed:{e}"
-            )
-            raise AppError(
-                ErrorCodes.RESTORE_SWITCH_FAILED,
-                params={"operation_id": operation_id, "reason": str(e)},
-            )
-
-        # R65 P0-02: 真实蓝绿切换 — backend.prepare_switch() + backend.commit_switch()
-        active_pointer: dict[str, Any] = {}
-        switch_results: dict[str, dict[str, Any]] = {}
-        switch_version = str(uuid.uuid4())  # 默认值(backends=None 时使用)
-        previous_version = f"v_prev_{operation.backup_id}"
-
-        if self._backends is not None:
-            for datasource in _DATASOURCE_ORDER:
-                if datasource not in self._backends:
-                    continue
-                backend = self._backends.get(datasource)
-                ds_state = operation.datasource_states.get(datasource, {})
-                provision_dict = ds_state.get("provision_result", {})
-                provision_result = StagingProvisionResult(
-                    target=provision_dict.get("target", ds_state.get("target", "")),
-                    target_type=provision_dict.get("target_type", ""),
-                    created_at=provision_dict.get("created_at", ""),
-                    schema_fingerprint=provision_dict.get("schema_fingerprint", ""),
-                )
-                try:
-                    prepare_result = await backend.prepare_switch(
-                        operation_id=operation_id,
-                        provision_result=provision_result,
-                    )
-                    switch_result = await backend.commit_switch(
-                        operation_id=operation_id,
-                        provision_result=provision_result,
-                        prepare_result=prepare_result,
-                    )
-                except AppError:
-                    # 切换失败 — 已成功的 datasource 应当回滚
-                    # 简化处理:已 commit 的 datasource 调用 rollback_switch
-                    for ds_done, sr_done in switch_results.items():
-                        try:
-                            await self._backends.get(ds_done).rollback_switch(
-                                operation_id=operation_id,
-                                switch_result=SwitchResult(**sr_done),
-                            )
-                        except Exception as rollback_err:
-                            logger.critical(
-                                _i18n_t(
-                                    "diagnostics.r65.p0_02.rollback_after_switch_failed",
-                                    datasource=ds_done,
-                                    error=rollback_err,
-                                )
-                            )
-                    await self.fail_operation(
-                        operation_id, reason=f"switch_failed:{datasource}"
-                    )
-                    raise
-                except Exception as e:
-                    await self.fail_operation(
-                        operation_id, reason=f"switch_failed:{datasource}:{e}"
-                    )
-                    raise AppError(
-                        ErrorCodes.RESTORE_SWITCH_FAILED,
-                        params={
-                            "operation_id": operation_id,
-                            "datasource": datasource,
-                            "reason": str(e),
-                        },
-                    )
-                switch_results[datasource] = {
-                    "switch_version": switch_result.switch_version,
-                    "previous_target": switch_result.previous_target,
-                    "new_target": switch_result.new_target,
-                    "switched_at": switch_result.switched_at,
-                }
-                active_pointer[datasource] = {
-                    "previous_target": switch_result.previous_target,
-                    "new_target": switch_result.new_target,
-                    "switched_at": switch_result.switched_at,
-                }
-                # 使用第一个 datasource 的 switch_version 作为整体版本
-                if datasource == _DATASOURCE_ORDER[0]:
-                    switch_version = switch_result.switch_version
-                    previous_version = switch_result.previous_target or previous_version
-                logger.info(
-                    _i18n_t(
-                        "diagnostics.r65.p0_02.backend_commit_switch",
-                        datasource=datasource,
-                        previous=switch_result.previous_target,
-                        new=switch_result.new_target,
-                        operation_id=operation_id,
-                    )
-                )
-        else:
-            # 骨架行为:仅记录占位符(向后兼容 backends=None)
-            active_pointer = {
-                "crdb": {"database": "active_crdb"},
-                "sqlite": {"path": "active_cache_store.db"},
-                "relay_sqlite": {"path": "active_relay_pool.db"},
-            }
-
-        # 切换后保留旧版本作为限时回滚点
-        await self._persist_rollback_target(
-            operation_id=operation_id,
-            switch_version=switch_version,
-            active_pointer=active_pointer,
+        # R66 P0-06: 始终走 UoW+CAS 路径(approval_authority/mfa_authority 必需)
+        # 旧 ID 比较路径(opaque string comparison)已迁移到 tests-only fake
+        return await self._execute_switch_with_authorities(
+            operation, operation_id, approval_id, mfa_receipt_id,
         )
-
-        # 更新 operation 状态(包含 switch_results 用于回滚)
-        new_ds_states = dict(operation.datasource_states)
-        for ds, sr in switch_results.items():
-            ds_state = dict(new_ds_states.get(ds, {}))
-            ds_state["switch_result"] = sr
-            new_ds_states[ds] = ds_state
-        op = replace(
-            operation,
-            phase=RestorePhase.BLUE_GREEN_SWITCH,
-            switch_version=switch_version,
-            previous_version=previous_version,
-            datasource_states=new_ds_states,
-            updated_at=self._now_iso(),
-        )
-        await self._persist_operation(op)
-        await self._write_event(
-            op, "switched", operation.phase, RestorePhase.BLUE_GREEN_SWITCH,
-            payload={"switch_version": switch_version,
-                     "previous_version": previous_version,
-                     "switch_results": switch_results},
-        )
-
-        # consume nonce(reserved → consumed)
-        await self._consume_nonce(operation_id, op)
-
-        # 切换成功后进入 COMPLETED 终态
-        await self._transition_to_completed(operation_id, op)
-        return switch_version
 
     async def _execute_switch_with_authorities(
         self,
@@ -1468,96 +1479,90 @@ class RestoreOrchestrator:
 
             # 4. R65 P0-02: 真实蓝绿切换 — backend.prepare_switch + commit_switch
             #    在 UoW 内执行,失败 → UoW 回滚(approval/MFA CAS 也回滚)
+            #    R66 P0-06: backends 必需(构造时校验),无骨架降级分支
             active_pointer: dict[str, Any] = {}
             switch_results: dict[str, dict[str, Any]] = {}
-            switch_version = str(uuid.uuid4())  # 默认值(backends=None 时使用)
+            # 默认值;首个 datasource(crdb)切换成功后用 backend 返回的版本覆盖
+            switch_version = str(uuid.uuid4())
             previous_version = f"v_prev_{operation.backup_id}"
 
-            if self._backends is not None:
-                for datasource in _DATASOURCE_ORDER:
-                    if datasource not in self._backends:
-                        continue
-                    backend = self._backends.get(datasource)
-                    ds_state = operation.datasource_states.get(datasource, {})
-                    provision_dict = ds_state.get("provision_result", {})
-                    provision_result = StagingProvisionResult(
-                        target=provision_dict.get(
-                            "target", ds_state.get("target", "")),
-                        target_type=provision_dict.get("target_type", ""),
-                        created_at=provision_dict.get("created_at", ""),
-                        schema_fingerprint=provision_dict.get(
-                            "schema_fingerprint", ""),
+            for datasource in _DATASOURCE_ORDER:
+                if datasource not in self._backends:
+                    continue
+                backend = self._backends.get(datasource)
+                ds_state = operation.datasource_states.get(datasource, {})
+                provision_dict = ds_state.get("provision_result", {})
+                provision_result = StagingProvisionResult(
+                    target=provision_dict.get(
+                        "target", ds_state.get("target", "")),
+                    target_type=provision_dict.get("target_type", ""),
+                    created_at=provision_dict.get("created_at", ""),
+                    schema_fingerprint=provision_dict.get(
+                        "schema_fingerprint", ""),
+                )
+                try:
+                    prepare_result = await backend.prepare_switch(
+                        operation_id=operation_id,
+                        provision_result=provision_result,
                     )
-                    try:
-                        prepare_result = await backend.prepare_switch(
-                            operation_id=operation_id,
-                            provision_result=provision_result,
-                        )
-                        switch_result = await backend.commit_switch(
-                            operation_id=operation_id,
-                            provision_result=provision_result,
-                            prepare_result=prepare_result,
-                        )
-                    except AppError:
-                        # 切换失败 — 已 commit 的 datasource 调用 rollback_switch
-                        # (backend 操作,非 DB 写入,可在 UoW 内安全调用)
-                        for ds_done, sr_done in switch_results.items():
-                            try:
-                                await self._backends.get(ds_done).rollback_switch(
-                                    operation_id=operation_id,
-                                    switch_result=SwitchResult(**sr_done),
-                                )
-                            except Exception as rollback_err:
-                                logger.critical(
-                                    _i18n_t(
-                                        "diagnostics.r65.p0_02.rollback_after_switch_failed",
-                                        datasource=ds_done,
-                                        error=rollback_err,
-                                    )
-                                )
-                        # UoW 回滚 approval/MFA CAS;不在此调用 fail_operation
-                        # (fail_operation 独立 commit 会破坏 UoW 事务边界)
-                        raise
-                    except Exception as e:
-                        raise AppError(
-                            ErrorCodes.RESTORE_SWITCH_FAILED,
-                            params={
-                                "operation_id": operation_id,
-                                "datasource": datasource,
-                                "reason": str(e),
-                            },
-                        )
-                    switch_results[datasource] = {
-                        "switch_version": switch_result.switch_version,
-                        "previous_target": switch_result.previous_target,
-                        "new_target": switch_result.new_target,
-                        "switched_at": switch_result.switched_at,
-                    }
-                    active_pointer[datasource] = {
-                        "previous_target": switch_result.previous_target,
-                        "new_target": switch_result.new_target,
-                        "switched_at": switch_result.switched_at,
-                    }
-                    if datasource == _DATASOURCE_ORDER[0]:
-                        switch_version = switch_result.switch_version
-                        previous_version = (
-                            switch_result.previous_target or previous_version)
-                    logger.info(
-                        _i18n_t(
-                            "diagnostics.r65.p0_02.backend_commit_switch_uow",
-                            datasource=datasource,
-                            previous=switch_result.previous_target,
-                            new=switch_result.new_target,
-                            operation_id=operation_id,
-                        )
+                    switch_result = await backend.commit_switch(
+                        operation_id=operation_id,
+                        provision_result=provision_result,
+                        prepare_result=prepare_result,
                     )
-            else:
-                # 骨架行为:仅记录占位符(向后兼容 backends=None)
-                active_pointer = {
-                    "crdb": {"database": "active_crdb"},
-                    "sqlite": {"path": "active_cache_store.db"},
-                    "relay_sqlite": {"path": "active_relay_pool.db"},
+                except AppError:
+                    # 切换失败 — 已 commit 的 datasource 调用 rollback_switch
+                    # (backend 操作,非 DB 写入,可在 UoW 内安全调用)
+                    for ds_done, sr_done in switch_results.items():
+                        try:
+                            await self._backends.get(ds_done).rollback_switch(
+                                operation_id=operation_id,
+                                switch_result=SwitchResult(**sr_done),
+                            )
+                        except Exception as rollback_err:
+                            logger.critical(
+                                _i18n_t(
+                                    "diagnostics.r65.p0_02.rollback_after_switch_failed",
+                                    datasource=ds_done,
+                                    error=rollback_err,
+                                )
+                            )
+                    # UoW 回滚 approval/MFA CAS;不在此调用 fail_operation
+                    # (fail_operation 独立 commit 会破坏 UoW 事务边界)
+                    raise
+                except Exception as e:
+                    raise AppError(
+                        ErrorCodes.RESTORE_SWITCH_FAILED,
+                        params={
+                            "operation_id": operation_id,
+                            "datasource": datasource,
+                            "reason": str(e),
+                        },
+                    )
+                switch_results[datasource] = {
+                    "switch_version": switch_result.switch_version,
+                    "previous_target": switch_result.previous_target,
+                    "new_target": switch_result.new_target,
+                    "switched_at": switch_result.switched_at,
                 }
+                active_pointer[datasource] = {
+                    "previous_target": switch_result.previous_target,
+                    "new_target": switch_result.new_target,
+                    "switched_at": switch_result.switched_at,
+                }
+                if datasource == _DATASOURCE_ORDER[0]:
+                    switch_version = switch_result.switch_version
+                    previous_version = (
+                        switch_result.previous_target or previous_version)
+                logger.info(
+                    _i18n_t(
+                        "diagnostics.r65.p0_02.backend_commit_switch_uow",
+                        datasource=datasource,
+                        previous=switch_result.previous_target,
+                        new=switch_result.new_target,
+                        operation_id=operation_id,
+                    )
+                )
 
             # 5. INSERT rollback_target(via uow — 与 CAS 原子提交)
             await self._persist_rollback_target_uow(
@@ -1737,7 +1742,7 @@ class RestoreOrchestrator:
         Returns:
             rollback_version (与 switch_version 相同,即回滚到的旧版本指针)
         """
-        operation = self.get_operation(operation_id)
+        operation = await self.get_operation(operation_id)
         self._assert_legal_transition(operation, RestorePhase.ROLLED_BACK)
         switch_version = operation.switch_version
         if not switch_version:
@@ -1764,61 +1769,61 @@ class RestoreOrchestrator:
         rollback_pointer = await self._load_rollback_target(switch_version)
 
         # R65 P0-02: 真实回滚 — backend.rollback_switch()
+        # R66 P0-06: backends 必需(构造时校验),无骨架降级分支
         rollback_results: dict[str, dict[str, Any]] = {}
-        if self._backends is not None:
-            for datasource in _DATASOURCE_ORDER:
-                if datasource not in self._backends:
-                    continue
-                ds_state = operation.datasource_states.get(datasource, {})
-                switch_dict = ds_state.get("switch_result", {})
-                if not switch_dict:
-                    # 该 datasource 未切换(可能未注册或骨架行为)
-                    continue
-                try:
-                    switch_result = SwitchResult(
-                        switch_version=switch_dict.get("switch_version", ""),
-                        previous_target=switch_dict.get("previous_target", ""),
-                        new_target=switch_dict.get("new_target", ""),
-                        switched_at=switch_dict.get("switched_at", ""),
-                    )
-                    backend = self._backends.get(datasource)
-                    rb_result = await backend.rollback_switch(
+        for datasource in _DATASOURCE_ORDER:
+            if datasource not in self._backends:
+                continue
+            ds_state = operation.datasource_states.get(datasource, {})
+            switch_dict = ds_state.get("switch_result", {})
+            if not switch_dict:
+                # 该 datasource 未切换(未注册或无 switch_result)
+                continue
+            try:
+                switch_result = SwitchResult(
+                    switch_version=switch_dict.get("switch_version", ""),
+                    previous_target=switch_dict.get("previous_target", ""),
+                    new_target=switch_dict.get("new_target", ""),
+                    switched_at=switch_dict.get("switched_at", ""),
+                )
+                backend = self._backends.get(datasource)
+                rb_result = await backend.rollback_switch(
+                    operation_id=operation_id,
+                    switch_result=switch_result,
+                )
+                rollback_results[datasource] = {
+                    "switch_version": rb_result.switch_version,
+                    "previous_target": rb_result.previous_target,
+                    "new_target": rb_result.new_target,
+                    "switched_at": rb_result.switched_at,
+                }
+                logger.info(
+                    _i18n_t(
+                        "diagnostics.r65.p0_02.backend_rollback_switch",
+                        datasource=datasource,
+                        previous=rb_result.previous_target,
+                        new=rb_result.new_target,
                         operation_id=operation_id,
-                        switch_result=switch_result,
                     )
-                    rollback_results[datasource] = {
-                        "switch_version": rb_result.switch_version,
-                        "previous_target": rb_result.previous_target,
-                        "new_target": rb_result.new_target,
-                        "switched_at": rb_result.switched_at,
-                    }
-                    logger.info(
-                        _i18n_t(
-                            "diagnostics.r65.p0_02.backend_rollback_switch",
-                            datasource=datasource,
-                            previous=rb_result.previous_target,
-                            new=rb_result.new_target,
-                            operation_id=operation_id,
-                        )
+                )
+            except AppError:
+                raise
+            except Exception as e:
+                logger.error(
+                    _i18n_t(
+                        "diagnostics.r65.p0_02.rollback_failed",
+                        datasource=datasource,
+                        error=e,
                     )
-                except AppError:
-                    raise
-                except Exception as e:
-                    logger.error(
-                        _i18n_t(
-                            "diagnostics.r65.p0_02.rollback_failed",
-                            datasource=datasource,
-                            error=e,
-                        )
-                    )
-                    raise AppError(
-                        ErrorCodes.RESTORE_ROLLBACK_FAILED,
-                        params={
-                            "operation_id": operation_id,
-                            "datasource": datasource,
-                            "reason": str(e),
-                        },
-                    )
+                )
+                raise AppError(
+                    ErrorCodes.RESTORE_ROLLBACK_FAILED,
+                    params={
+                        "operation_id": operation_id,
+                        "datasource": datasource,
+                        "reason": str(e),
+                    },
+                )
 
         op = replace(
             operation, phase=RestorePhase.ROLLED_BACK, updated_at=self._now_iso()
@@ -1866,7 +1871,7 @@ class RestoreOrchestrator:
 
         幂等:若 operation 已处于 FAILED/ROLLED_BACK 终态,直接返回(不重复销毁)。
         """
-        operation = self.get_operation(operation_id)
+        operation = await self.get_operation(operation_id)
         if operation.phase in (RestorePhase.FAILED, RestorePhase.ROLLED_BACK):
             return  # 幂等:已终态
         # 销毁 staging 资源(SQLite 文件删除,CRDB schema drop 由实际 client 完成)
@@ -1886,17 +1891,18 @@ class RestoreOrchestrator:
     async def _destroy_staging(self, operation: RestoreOperation) -> None:
         """销毁所有 staging 资源。
 
-        R65 P0-02: 若提供 BackendRegistry,调用 backend.destroy() 真实销毁
+        R65 P0-02: 调用 backend.destroy() 真实销毁
         (SQLite unlink / CRDB DROP SCHEMA CASCADE)。
-        未注册的 datasource 退回骨架行为(直接 unlink SQLite 文件)。
+        R66 P0-06: backends 必需(构造时校验);若 backend.destroy() 失败,
+        仍兜底 unlink SQLite 文件作为防御性清理(非骨架降级)。
         """
         for ds in _DATASOURCE_ORDER:
             ds_state = operation.datasource_states.get(ds, {})
             target = ds_state.get("target", "")
             if not target:
                 continue
-            # R65 P0-02: 优先调用 backend.destroy()
-            if self._backends is not None and ds in self._backends:
+            # R65 P0-02: 调用 backend.destroy()(R66 P0-06: backends 必需)
+            if ds in self._backends:
                 provision_dict = ds_state.get("provision_result", {})
                 provision_result = StagingProvisionResult(
                     target=provision_dict.get("target", target),
@@ -1926,8 +1932,7 @@ class RestoreOrchestrator:
                             error=e,
                         )
                     )
-                    # 回退到骨架 unlink(若为 SQLite)
-            # 骨架行为:直接 unlink(SQLite 文件)
+                    # 防御性兜底:若为 SQLite 文件则尝试 unlink(非骨架降级)
             if ds in ("sqlite", "relay_sqlite") and Path(target).exists():
                 try:
                     Path(target).unlink()

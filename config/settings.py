@@ -1,4 +1,5 @@
 import base64
+import os
 import re
 from typing import Optional
 
@@ -419,6 +420,39 @@ class Settings(BaseSettings):
                 f"跳过必填字段校验(ENVIRONMENT={self.ENVIRONMENT},非 production 仅 warning)"
             )
 
+        return self
+
+    @model_validator(mode='after')
+    def validate_no_legacy_restore_in_production(self):
+        """R66 P0-07: 生产环境禁止配置 ALLOW_LEGACY_RESTORE(启动失败)。
+
+        旧直接 restore writer(_restore_from_backup_data / run_restore /
+        validate_and_restore_backup_strict / restore_from_backup)已被
+        capability-seal。生产恢复必须通过 RestoreOrchestrator 蓝绿切换路径
+        执行(staging → active,禁止原地覆盖)。
+
+        ALLOW_LEGACY_RESTORE=1/true/yes 是 tests/ 与 scripts/ 的逃生舱,
+        生产部署绝不应配置此环境变量(应在系统层强制 unset)。
+        若生产环境检测到此变量,Settings 加载失败 → 进程启动失败(fail-closed)。
+
+        注意:本 validator 也兼容 APP_ENV=production(Dockerfile 设置的别名)
+        与 ENVIRONMENT=production(Settings 字段)两种生产标识。
+        """
+        is_production = self.ENVIRONMENT == "production"
+        # 兼容 Dockerfile 中的 APP_ENV=production(与 database/migrate.py 一致)
+        if not is_production:
+            app_env = os.environ.get("APP_ENV", "").strip().lower()
+            is_production = app_env == "production"
+
+        if is_production:
+            allow_legacy = os.environ.get("ALLOW_LEGACY_RESTORE", "").lower()
+            if allow_legacy in ("1", "true", "yes"):
+                raise ValueError(
+                    "[Settings] R66 P0-07: ENVIRONMENT=production (或 APP_ENV=production) "
+                    "时禁止配置 ALLOW_LEGACY_RESTORE=1/true/yes"
+                    "(旧 restore writer 已被封存,生产恢复必须通过 RestoreOrchestrator "
+                    "蓝绿切换路径执行)。如需在测试/脚本中使用,请在非生产环境设置此变量。"
+                )
         return self
 
     def _validate_all_fields(self):

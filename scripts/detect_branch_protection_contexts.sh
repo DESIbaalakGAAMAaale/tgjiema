@@ -142,13 +142,18 @@ if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
   echo "  仍输出检测到的 context,但 configure_branch_protection.sh 会要求用户确认。" >&2
 fi
 
-# ─── 7.1 R64 P0-01 / P1-11: 校验 Release Gates 14 个 job + CI / repo-hygiene 覆盖 ───
-# Release Gates workflow 实际 job 名必须与 release-gates.yml 完全一致:
+# ─── 7.1 R64 P0-01 / P1-11: 校验 Release Gates 17 个 job + CI / repo-hygiene 覆盖 ───
+# Release Gates workflow 实际 job 名必须与 release-gates.yml 完全一致(17 个 job,
+# R66 P1-10 新增 attestation-semantics-verify,R66 P1-11 新增 tag-ruleset-verify,
+# R66 P1-02 新增 migration-binding-gate):
 #   docker-build / docker-digest-verify / compose-config / redis-acl-matrix / schema-diff /
 #   backup-restore-drill / sbom / pip-audit / trivy / sign-image / verify-branch-protection /
-#   rc-continuity / publish-attestation / release-summary
-# CI workflow 必须包含 repo-hygiene(R64 P1-11 required context)。
-# 注意:sign-image / publish-attestation / release-summary 仅在 push 到 master/main 时运行,
+#   rc-continuity / publish-attestation / attestation-semantics-verify / tag-ruleset-verify /
+#   migration-binding-gate / release-summary
+# CI workflow 必须包含 repo-hygiene + skip-inventory(R64 P1-11 / R66 P1-09 required context)。
+# 注意:sign-image / publish-attestation / attestation-semantics-verify / migration-binding-gate /
+#       tag-ruleset-verify / release-summary
+#      仅在 push 到 master/main 或 release tag 时运行,
 #      PR 触发的 check-runs 中可能缺失,属正常情况(soft WARN)。
 EXPECTED_RG_JOBS=(
   "docker-build"
@@ -164,6 +169,9 @@ EXPECTED_RG_JOBS=(
   "verify-branch-protection"
   "rc-continuity"
   "publish-attestation"
+  "attestation-semantics-verify"
+  "tag-ruleset-verify"
+  "migration-binding-gate"
   "release-summary"
 )
 MISSING_RG_JOBS=()
@@ -179,7 +187,7 @@ if [ "${#MISSING_RG_JOBS[@]}" -gt 0 ]; then
   for c in "${MISSING_RG_JOBS[@]}"; do
     echo "  - $c" >&2
   done
-  echo "  可能该 job 尚未在 master 上触发过(sign-image/publish-attestation/release-summary 仅 push 触发)。" >&2
+  echo "  可能该 job 尚未在 master 上触发过(sign-image/publish-attestation/attestation-semantics-verify/tag-ruleset-verify/migration-binding-gate/release-summary 仅 push 触发)。" >&2
 fi
 # CI / repo-hygiene 校验
 if ! echo "$CONTEXTS_JSON" | jq -e 'any(.[]; . == "CI / repo-hygiene")' > /dev/null 2>&1; then

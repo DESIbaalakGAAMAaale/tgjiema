@@ -1,0 +1,37 @@
+{
+  "_comment": "R66 P1-11: Tag Ruleset 期望配置(checked-in 基线)。本文件由 scripts/configure_tag_ruleset.sh 在生产环境应用,任何修改都需同步更新本基线。审计要求:为 tags 配置不可变、禁止删除/移动的 ruleset;生产 environment 需要独立审批、最小权限和 digest-pinned deploy。禁止用 master 的 required checks 推导 tag 已满足相同条件。",
+  "_schema": "github_repository_ruleset_api_response",
+  "_r66_p1_11_requirements": {
+    "target": "tags — ruleset 针对 tag 引用",
+    "source_type": "Repository — 仓库级 ruleset",
+    "enforcement": "active — 规则强制执行(非 evaluate / disabled)",
+    "conditions.ref_name.include": "[\"refs/tags/*\"] — 覆盖所有 tag",
+    "creation": "限制 tag 创建(仅 bypass_actors 可创建)",
+    "deletion": "false — 禁止删除 tag(规则存在即表示禁用)",
+    "non_fast_forward": "false — 禁止移动 / 更新 tag(不可变)",
+    "update": "false — 禁止更新 tag",
+    "required_signatures": "true — tag 所指向 commit 必须经过 GPG 签名验证",
+    "bypass_actors": "仅 RepositoryRole(admin) 可 bypass creation 规则"
+  },
+  "description": "R66 P1-11: 标签不可变 ruleset — 禁止删除/移动/更新,创建限制 + 强制 GPG 签名。生产环境需独立审批、最小权限和 digest-pinned deploy;禁止用 master required checks 推导 tag 已满足相同条件。",
+  "name": "R66 P1-11 Tag Immutability Ruleset",
+  "target": "tags",
+  "source_type": "Repository",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/tags/*"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {"type": "creation"},
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {"type": "update"},
+    {"type": "required_signatures"}
+  ],
+  "bypass_actors": [
+    {"actor_id": 1, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+  ]
+}

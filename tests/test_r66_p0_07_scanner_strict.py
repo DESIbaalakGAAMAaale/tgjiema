@@ -1,0 +1,820 @@
+"""R66 P0-07: scanner 严格化整改测试 — 精确白名单 + 解析失败 fail + wrapper 再导出检测。
+
+审计背景(R66 终审报告 P0-07):
+    R65 的 scanner ``scripts/check_restore_no_legacy_writer.py`` 存在两个问题:
+    1. 宽白名单:整个文件级白名单恰好覆盖最危险的旧入口与适配层
+       (db_restore.py / backup_dr_validate.py / restore_backends.py /
+        restore_orchestrator.py)
+    2. 解析失败放行:AST 解析失败时 skip 文件,而非 fail,可能让语法/编码
+       异常让扫描器漏检违规。
+
+R66 P0-07 整改:
+    1. 白名单从"整个文件"改为精确函数+行范围+AST 调用关系:
+       - db_restore.py: 仅 _restore_from_backup_data / run_restore / main
+         三个函数在指定行范围内可调用指定 callee
+       - backup_dr_validate.py: 仅 validate_and_restore_backup_strict /
+         _restore_preverified_payload 可调用 _restore_from_backup_data
+       - restore_orchestrator.py / restore_backends.py: 移出白名单
+       - error_codes.py: 仍完全跳过(仅引用错误码字符串)
+    2. 解析失败必须 fail(不再 skip)
+    3. 禁止 wrapper 再导出 legacy writer(__all__ / from ... import ... as ...)
+    4. 增加运行时门禁:生产环境(ENVIRONMENT=production 或 APP_ENV=production)
+       配置 ALLOW_LEGACY_RESTORE=1/true/yes 时,Settings 加载失败 → 启动失败
+
+测试覆盖矩阵:
+    A. 解析失败 fail
+       - SyntaxError 文件 → scanner exit 1(不再 skip)
+    B. 精确白名单(函数+行范围)
+       - PRECISE_WHITELIST 条目结构:file / function / line_start / line_end / allowed_callees
+       - restore_orchestrator.py 不在白名单
+       - restore_backends.py 不在白名单
+       - db_restore.py / backup_dr_validate.py 在精确白名单(但不再 whole-file skip)
+    C. wrapper 再导出检测
+       - __all__ 包含 legacy writer → 违规
+       - from X import legacy_writer as alias → 违规
+    D. 运行时门禁(Settings validator)
+       - ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=1 → ValueError
+       - APP_ENV=production + ALLOW_LEGACY_RESTORE=1 → ValueError
+       - ENVIRONMENT=development + ALLOW_LEGACY_RESTORE=1 → 通过(测试逃生舱)
+"""
+from __future__ import annotations
+
+import ast
+import importlib.util
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+# 测试环境兼容(conftest 在收集阶段已注入 config/telegram mock)
+sys.modules.setdefault("telegram", MagicMock())
+sys.modules.setdefault("telegram.ext", MagicMock())
+
+
+# ════════════════════════════════════════════════════════════════
+# 测试辅助
+# ════════════════════════════════════════════════════════════════
+
+
+def _import_gate_mod():
+    """导入 scanner 模块(每次重新导入以避免状态污染)。"""
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import check_restore_no_legacy_writer as gate_mod
+        return gate_mod
+    finally:
+        sys.path.pop(0)
+
+
+def _run_gate(strict: bool = False) -> tuple[int, str]:
+    """运行 AST gate 脚本,返回 (exit_code, stdout+stderr)。"""
+    cmd = [sys.executable, "scripts/check_restore_no_legacy_writer.py"]
+    if strict:
+        cmd.append("--strict")
+    result = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result.returncode, result.stdout + result.stderr
+
+
+def _load_real_settings_class():
+    """直接从 config/settings.py 文件加载真实 Settings 类。
+
+    conftest 在收集阶段将 ``config`` 替换为 MagicMock 模块(仅含 ``settings`` 属性,
+    不是 package),因此 ``import config.settings`` 会失败。本函数使用
+    ``importlib.util.spec_from_file_location`` 绕过 ``sys.modules['config']``,
+    从文件路径直接加载真实 ``Settings`` 类,以测试 R66 P0-07 的 model_validator。
+
+    每次调用都重新加载,确保 validator 在新环境变量下重新执行。
+    """
+    settings_path = REPO_ROOT / "config" / "settings.py"
+    spec = importlib.util.spec_from_file_location(
+        "_r66_p0_07_real_settings", settings_path
+    )
+    assert spec is not None and spec.loader is not None, (
+        f"无法加载 config/settings.py: {settings_path}"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Settings
+
+
+# ════════════════════════════════════════════════════════════════
+# A. 解析失败必须 fail(R66 P0-07)
+# ════════════════════════════════════════════════════════════════
+
+
+class TestParseErrorFails:
+    """R66 P0-07: scanner 解析失败必须 fail(不再 skip)。"""
+
+    def test_parse_error_fails(self, tmp_path, monkeypatch):
+        """SyntaxError 文件 → scanner exit 1(不再 skip)。
+
+        通过 monkey-patch _iter_python_files 注入一个含 SyntaxError 的临时文件,
+        验证 scanner 返回 exit_code=1 而非 0(不再 skip 解析失败的文件)。
+        """
+        gate_mod = _import_gate_mod()
+
+        # 创建一个含 SyntaxError 的临时 .py 文件
+        bad_file = tmp_path / "bad_syntax.py"
+        bad_file.write_text(
+            "def broken(:\n"  # SyntaxError: 括号未闭合
+            "    pass\n",
+            encoding="utf-8",
+        )
+
+        # monkey-patch _iter_python_files 仅返回这个坏文件
+        monkeypatch.setattr(
+            gate_mod, "_iter_python_files", lambda: iter([bad_file])
+        )
+        # monkey-patch _rel_posix 让坏文件路径可被识别
+        monkeypatch.setattr(
+            gate_mod, "_rel_posix",
+            lambda p: "tmp/bad_syntax.py" if p == bad_file else str(p),
+        )
+
+        exit_code, violations = gate_mod.check(strict=False)
+        assert exit_code == 1, (
+            "R66 P0-07: 解析失败必须 fail(exit_code=1),不应 skip 后返回 0"
+        )
+        # 违规列表可能为空(解析错误不算违规),但 exit_code 必须为 1
+        # (parse_errors 单独检查,在 check() 内部直接返回 1)
+
+    def test_parse_error_message_contains_file_and_error(self, tmp_path, monkeypatch):
+        """解析失败时输出包含文件名与错误类型(便于定位)。"""
+        gate_mod = _import_gate_mod()
+
+        bad_file = tmp_path / "broken.py"
+        bad_file.write_text(
+            "import os\n"
+            "def f(:\n"  # SyntaxError
+            "    pass\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            gate_mod, "_iter_python_files", lambda: iter([bad_file])
+        )
+        monkeypatch.setattr(
+            gate_mod, "_rel_posix",
+            lambda p: "tmp/broken.py" if p == bad_file else str(p),
+        )
+
+        # 捕获 stdout
+        import io
+        from contextlib import redirect_stdout
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            exit_code, _ = gate_mod.check(strict=False)
+
+        output = captured.getvalue()
+        assert exit_code == 1
+        assert "tmp/broken.py" in output, "输出应包含解析失败的文件路径"
+        assert "SyntaxError" in output, "输出应包含错误类型(SyntaxError)"
+        assert "R66 P0-07" in output, "输出应标注 R66 P0-07 整改说明"
+
+    def test_parse_error_does_not_skip_file_silently(self, tmp_path, monkeypatch):
+        """解析失败不再静默 skip — 必须在输出中明确报告。
+
+        旧实现:except (SyntaxError, ...): continue  # 静默 skip
+        新实现:记录 parse_errors,check() 末尾若 parse_errors 非空则 exit 1
+        """
+        gate_mod = _import_gate_mod()
+
+        bad_file = tmp_path / "silent.py"
+        bad_file.write_text("def f(:\n    pass\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            gate_mod, "_iter_python_files", lambda: iter([bad_file])
+        )
+        monkeypatch.setattr(
+            gate_mod, "_rel_posix",
+            lambda p: "tmp/silent.py" if p == bad_file else str(p),
+        )
+
+        import io
+        from contextlib import redirect_stdout
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            exit_code, _ = gate_mod.check(strict=False)
+
+        output = captured.getvalue()
+        # 不应出现 "[OK]" — 解析失败必须 fail
+        assert "[OK]" not in output, (
+            "解析失败时不应输出 [OK](必须 fail,不再静默 skip)"
+        )
+        assert "[FAIL]" in output, "解析失败时应输出 [FAIL]"
+
+
+# ════════════════════════════════════════════════════════════════
+# B. 精确白名单(函数+行范围)— R66 P0-07
+# ════════════════════════════════════════════════════════════════
+
+
+class TestPreciseWhitelist:
+    """R66 P0-07: 白名单从"整个文件"改为精确函数+行范围+AST 调用关系。"""
+
+    def test_whitelist_is_precise_not_whole_file(self):
+        """白名单条目必须指定 function + line_start + line_end + allowed_callees。
+
+        每个 PRECISE_WHITELIST 条目必须包含:
+            - file: 文件路径
+            - function: 函数名(非空字符串)
+            - line_start: 起始行(正整数)
+            - line_end: 结束行(>= line_start)
+            - allowed_callees: 允许调用的 callee 集合(非空 frozenset)
+        """
+        gate_mod = _import_gate_mod()
+
+        assert len(gate_mod.PRECISE_WHITELIST) > 0, "精确白名单不应为空"
+
+        for entry in gate_mod.PRECISE_WHITELIST:
+            # 必须包含所有必需字段
+            assert "file" in entry, f"白名单条目缺少 file 字段: {entry}"
+            assert "function" in entry, f"白名单条目缺少 function 字段: {entry}"
+            assert "line_start" in entry, f"白名单条目缺少 line_start 字段: {entry}"
+            assert "line_end" in entry, f"白名单条目缺少 line_end 字段: {entry}"
+            assert "allowed_callees" in entry, f"白名单条目缺少 allowed_callees 字段: {entry}"
+
+            # function 必须是非空字符串(不是 None 或 "")
+            assert isinstance(entry["function"], str) and entry["function"], (
+                f"function 必须是非空字符串: {entry}"
+            )
+
+            # line_start / line_end 必须是正整数,且 line_end >= line_start
+            assert isinstance(entry["line_start"], int) and entry["line_start"] > 0, (
+                f"line_start 必须是正整数: {entry}"
+            )
+            assert isinstance(entry["line_end"], int) and entry["line_end"] >= entry["line_start"], (
+                f"line_end 必须 >= line_start: {entry}"
+            )
+
+            # allowed_callees 必须是非空 frozenset
+            assert isinstance(entry["allowed_callees"], frozenset) and entry["allowed_callees"], (
+                f"allowed_callees 必须是非空 frozenset: {entry}"
+            )
+
+    def test_restore_orchestrator_not_in_whitelist(self):
+        """restore_orchestrator.py 不在白名单(新生产路径,禁止调用 legacy writer)。
+
+        R66 P0-07: restore_orchestrator.py 是新生产路径(RestoreOrchestrator 蓝绿切换),
+        不应直接调用 legacy writer,故不在精确白名单中。
+        """
+        gate_mod = _import_gate_mod()
+
+        # 不在完全跳过的白名单文件中
+        ro_path = REPO_ROOT / "services" / "restore_orchestrator.py"
+        assert not gate_mod._is_whitelisted(ro_path), (
+            "services/restore_orchestrator.py 不应在完全跳过白名单中"
+        )
+
+        # 不在精确白名单中
+        precise_files = {entry["file"] for entry in gate_mod.PRECISE_WHITELIST}
+        assert "services/restore_orchestrator.py" not in precise_files, (
+            "services/restore_orchestrator.py 不应在精确白名单中(R66 P0-07: 新生产路径)"
+        )
+
+    def test_restore_backends_not_in_whitelist(self):
+        """restore_backends.py 不在白名单(新 backend 适配层,禁止调用 legacy writer)。
+
+        R66 P0-07: restore_backends.py 是新 backend 适配层,
+        不应直接调用 legacy writer,故不在精确白名单中。
+        """
+        gate_mod = _import_gate_mod()
+
+        # 不在完全跳过的白名单文件中
+        rb_path = REPO_ROOT / "services" / "restore_backends.py"
+        assert not gate_mod._is_whitelisted(rb_path), (
+            "services/restore_backends.py 不应在完全跳过白名单中"
+        )
+
+        # 不在精确白名单中
+        precise_files = {entry["file"] for entry in gate_mod.PRECISE_WHITELIST}
+        assert "services/restore_backends.py" not in precise_files, (
+            "services/restore_backends.py 不应在精确白名单中(R66 P0-07: 新 backend 适配层)"
+        )
+
+    def test_db_restore_in_precise_whitelist(self):
+        """db_restore.py 在精确白名单(但不再 whole-file skip)。
+
+        R66 P0-07: db_restore.py 不再完全跳过,改为精确函数级白名单。
+        仅 _restore_from_backup_data / run_restore / main 三个函数在指定行范围内
+        可调用指定的 callee。
+        """
+        gate_mod = _import_gate_mod()
+
+        # 不在完全跳过的白名单中
+        db_restore_path = REPO_ROOT / "services" / "db_restore.py"
+        assert not gate_mod._is_whitelisted(db_restore_path), (
+            "services/db_restore.py 不应完全跳过(R66 P0-07: 改为精确函数级白名单)"
+        )
+
+        # 在精确白名单中
+        precise_files = {entry["file"] for entry in gate_mod.PRECISE_WHITELIST}
+        assert "services/db_restore.py" in precise_files
+
+        # 检查具体函数条目
+        db_restore_entries = [
+            entry for entry in gate_mod.PRECISE_WHITELIST
+            if entry["file"] == "services/db_restore.py"
+        ]
+        functions = {entry["function"] for entry in db_restore_entries}
+        assert "_restore_from_backup_data" in functions, (
+            "db_restore.py 的 _restore_from_backup_data 应在精确白名单"
+        )
+        assert "run_restore" in functions, (
+            "db_restore.py 的 run_restore 应在精确白名单"
+        )
+
+    def test_backup_dr_validate_in_precise_whitelist(self):
+        """backup_dr_validate.py 在精确白名单(但不再 whole-file skip)。"""
+        gate_mod = _import_gate_mod()
+
+        bdv_path = REPO_ROOT / "services" / "backup_dr_validate.py"
+        assert not gate_mod._is_whitelisted(bdv_path), (
+            "services/backup_dr_validate.py 不应完全跳过(R66 P0-07: 改为精确函数级白名单)"
+        )
+
+        precise_files = {entry["file"] for entry in gate_mod.PRECISE_WHITELIST}
+        assert "services/backup_dr_validate.py" in precise_files
+
+        bdv_entries = [
+            entry for entry in gate_mod.PRECISE_WHITELIST
+            if entry["file"] == "services/backup_dr_validate.py"
+        ]
+        functions = {entry["function"] for entry in bdv_entries}
+        assert "validate_and_restore_backup_strict" in functions
+        assert "_restore_preverified_payload" in functions
+
+    def test_is_call_allowed_precise_check(self):
+        """_is_call_allowed 基于 (file, function, callee, line) 精确匹配。"""
+        gate_mod = _import_gate_mod()
+
+        # db_restore.py: _restore_from_backup_data 在 440-631 行内调用 _restore_crdb_tables → 允许
+        assert gate_mod._is_call_allowed(
+            "services/db_restore.py", "_restore_from_backup_data",
+            "_restore_crdb_tables", 584,
+        ), "_restore_from_backup_data 在行范围内调用 _restore_crdb_tables 应允许"
+
+        # db_restore.py: _restore_from_backup_data 调用 run_restore → 不允许(不在 allowed_callees)
+        assert not gate_mod._is_call_allowed(
+            "services/db_restore.py", "_restore_from_backup_data",
+            "run_restore", 500,
+        ), "_restore_from_backup_data 不允许调用 run_restore(不在 allowed_callees)"
+
+        # db_restore.py: 其他函数调用 _restore_crdb_tables → 不允许(函数名不匹配)
+        assert not gate_mod._is_call_allowed(
+            "services/db_restore.py", "some_other_function",
+            "_restore_crdb_tables", 500,
+        ), "非白名单函数不允许调用 _restore_crdb_tables"
+
+        # db_restore.py: _restore_from_backup_data 但行号超出范围 → 不允许
+        assert not gate_mod._is_call_allowed(
+            "services/db_restore.py", "_restore_from_backup_data",
+            "_restore_crdb_tables", 700,  # 超出 440-631 范围
+        ), "行号超出白名单范围应不允许(防止代码漂移静默通过)"
+
+        # 模块级调用(None enclosing)→ 不允许
+        assert not gate_mod._is_call_allowed(
+            "services/db_restore.py", None,
+            "_restore_crdb_tables", 500,
+        ), "模块级调用 legacy writer 不允许"
+
+        # 其他文件 → 不允许(即使函数名匹配)
+        assert not gate_mod._is_call_allowed(
+            "services/other.py", "_restore_from_backup_data",
+            "_restore_crdb_tables", 500,
+        ), "非白名单文件不允许(即使函数名匹配)"
+
+    def test_default_mode_still_passes(self):
+        """默认模式:无违规(精确白名单正确覆盖所有合法调用)。"""
+        exit_code, output = _run_gate(strict=False)
+        assert exit_code == 0, (
+            f"默认模式应通过(精确白名单覆盖所有合法调用),实际输出:\n{output}"
+        )
+        assert "[OK]" in output
+
+    def test_strict_mode_sealed_callers_whitelisted(self):
+        """--strict 模式:已知 sealed 调用方已被精确白名单覆盖(db_backup / command_bus)。
+
+        R66 P0-07 整改后:db_backup.py:restore_from_backup 与
+        command_bus.py:_handler 是已 capability-sealed 的调用方
+        (运行时由 ALLOW_LEGACY_RESTORE env var + RESTORE_LEGACY_WRITER_SEALED
+        错误码防护)。这些 sealed 调用方已加入 PRECISE_WHITELIST
+        (精确函数+行范围),因此 --strict 模式应通过(无违规)。
+
+        本测试验证:
+          1. sealed 调用方在 PRECISE_WHITELIST 中(精确白名单已覆盖)
+          2. --strict 模式 exit_code=0(无违规)
+        """
+        gate_mod = _import_gate_mod()
+
+        # 验证 sealed 调用方在 PRECISE_WHITELIST 中(精确白名单已覆盖)
+        precise_files_functions = {
+            (entry["file"], entry["function"])
+            for entry in gate_mod.PRECISE_WHITELIST
+        }
+        assert ("services/db_backup.py", "restore_from_backup") in precise_files_functions, (
+            "services/db_backup.py:restore_from_backup 应在 PRECISE_WHITELIST 中"
+            "(已 capability-sealed,精确白名单覆盖)"
+        )
+        assert ("services/command_bus.py", "_handler") in precise_files_functions, (
+            "services/command_bus.py:_handler 应在 PRECISE_WHITELIST 中"
+            "(已 capability-sealed,精确白名单覆盖)"
+        )
+
+        # 验证 sealed 调用方的白名单条目结构完整(file/function/line range/allowed_callees)
+        db_backup_entry = next(
+            entry for entry in gate_mod.PRECISE_WHITELIST
+            if entry["file"] == "services/db_backup.py"
+            and entry["function"] == "restore_from_backup"
+        )
+        assert db_backup_entry["allowed_callees"] == frozenset({"validate_and_restore_backup_strict"}), (
+            f"restore_from_backup 仅允许调用 validate_and_restore_backup_strict, "
+            f"实际: {db_backup_entry['allowed_callees']}"
+        )
+        assert db_backup_entry["line_start"] > 0
+        assert db_backup_entry["line_end"] >= db_backup_entry["line_start"]
+
+        command_bus_entry = next(
+            entry for entry in gate_mod.PRECISE_WHITELIST
+            if entry["file"] == "services/command_bus.py"
+            and entry["function"] == "_handler"
+        )
+        assert command_bus_entry["allowed_callees"] == frozenset({"restore_from_backup"}), (
+            f"_handler 仅允许调用 restore_from_backup, "
+            f"实际: {command_bus_entry['allowed_callees']}"
+        )
+
+        # --strict 模式应通过(sealed 调用方已被白名单覆盖)
+        exit_code, output = _run_gate(strict=True)
+        assert exit_code == 0, (
+            f"--strict 模式应通过(sealed 调用方已被精确白名单覆盖),"
+            f"实际输出:\n{output}"
+        )
+        assert "[OK]" in output
+        # 不应出现 [FAIL](sealed 调用方已白名单覆盖,无违规)
+        assert "[FAIL]" not in output
+
+
+# ════════════════════════════════════════════════════════════════
+# C. wrapper 再导出检测(R66 P0-07)
+# ════════════════════════════════════════════════════════════════
+
+
+class TestWrapperReexportDetected:
+    """R66 P0-07: 禁止 wrapper 再导出 legacy writer(__all__ / from ... import ... as ...)。"""
+
+    def test_wrapper_reexport_detected_all(self):
+        """__all__ 包含 legacy writer 名 → 检测为违规。"""
+        gate_mod = _import_gate_mod()
+
+        # 合成源码:__all__ 包含 _restore_from_backup_data
+        source = """
+__all__ = ["_restore_from_backup_data", "other_func"]
+"""
+        tree = ast.parse(source, filename="<test>")
+        violations = gate_mod._find_reexport_violations(
+            tree, gate_mod.LEGACY_WRITER_FUNDS_DEFAULT
+        )
+        assert len(violations) == 1, (
+            f"应检测到 1 处 __all__ 再导出违规,实际: {violations}"
+        )
+        assert violations[0]["func"] == "_restore_from_backup_data"
+        assert violations[0]["enclosing"] == "__all__"
+
+    def test_wrapper_reexport_detected_strict_mode(self):
+        """--strict 模式下 __all__ 包含 validate_and_restore_backup_strict → 检测为违规。"""
+        gate_mod = _import_gate_mod()
+
+        source = """
+__all__ = ["validate_and_restore_backup_strict", "restore_from_backup"]
+"""
+        tree = ast.parse(source, filename="<test>")
+        strict_funds = (
+            gate_mod.LEGACY_WRITER_FUNDS_DEFAULT
+            | gate_mod.LEGACY_WRITER_FUNDS_STRICT_EXTRA
+        )
+        violations = gate_mod._find_reexport_violations(tree, strict_funds)
+        assert len(violations) == 2, (
+            f"--strict 模式应检测到 2 处 __all__ 再导出违规,实际: {violations}"
+        )
+        funcs = {v["func"] for v in violations}
+        assert "validate_and_restore_backup_strict" in funcs
+        assert "restore_from_backup" in funcs
+
+    def test_wrapper_reexport_detected_import_as(self):
+        """from X import legacy_writer as alias → 检测为违规(别名再导出)。"""
+        gate_mod = _import_gate_mod()
+
+        source = """
+from services.db_restore import _restore_from_backup_data as legacy_writer
+"""
+        tree = ast.parse(source, filename="<test>")
+        violations = gate_mod._find_reexport_violations(
+            tree, gate_mod.LEGACY_WRITER_FUNDS_DEFAULT
+        )
+        assert len(violations) == 1, (
+            f"应检测到 1 处 import as 别名再导出违规,实际: {violations}"
+        )
+        assert violations[0]["func"] == "_restore_from_backup_data"
+        assert "import_as_legacy_writer" in violations[0]["enclosing"]
+
+    def test_import_without_alias_not_flagged(self):
+        """from X import legacy_writer(无 as 别名)→ 不算再导出(正常使用)。
+
+        注意:backup_dr_validate.py 中
+        ``from services.db_restore import _restore_from_backup_data``
+        是正常使用(在函数内延迟导入后调用),不算再导出。
+        """
+        gate_mod = _import_gate_mod()
+
+        source = """
+from services.db_restore import _restore_from_backup_data
+from services.db_restore import run_restore
+"""
+        tree = ast.parse(source, filename="<test>")
+        violations = gate_mod._find_reexport_violations(
+            tree, gate_mod.LEGACY_WRITER_FUNDS_DEFAULT
+        )
+        assert len(violations) == 0, (
+            f"无 as 别名的 import 不应被检测为再导出违规,实际: {violations}"
+        )
+
+    def test_all_without_legacy_writer_not_flagged(self):
+        """__all__ 不含 legacy writer → 不算违规(正常导出其他符号)。"""
+        gate_mod = _import_gate_mod()
+
+        source = """
+__all__ = ["Settings", "settings", "ErrorCodes"]
+"""
+        tree = ast.parse(source, filename="<test>")
+        violations = gate_mod._find_reexport_violations(
+            tree, gate_mod.LEGACY_WRITER_FUNDS_DEFAULT
+        )
+        assert len(violations) == 0
+
+    def test_reexport_violation_in_check_flow(self, tmp_path, monkeypatch):
+        """合成文件含 __all__ 再导出 → check() 检测为违规。"""
+        gate_mod = _import_gate_mod()
+
+        # 合成文件:__all__ 包含 legacy writer
+        bad_file = tmp_path / "reexport.py"
+        bad_file.write_text(
+            "from services.db_restore import _restore_from_backup_data\n"
+            "__all__ = ['_restore_from_backup_data']\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            gate_mod, "_iter_python_files", lambda: iter([bad_file])
+        )
+        monkeypatch.setattr(
+            gate_mod, "_rel_posix",
+            lambda p: "tmp/reexport.py" if p == bad_file else str(p),
+        )
+
+        exit_code, violations = gate_mod.check(strict=False)
+        assert exit_code == 1, (
+            "含 __all__ 再导出的文件应被检测为违规(exit_code=1)"
+        )
+        # 应有至少 1 处违规(__all__ 再导出)
+        reexport_violations = [
+            v for v in violations if v.get("enclosing") == "__all__"
+        ]
+        assert len(reexport_violations) >= 1, (
+            f"应检测到 __all__ 再导出违规,实际 violations: {violations}"
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+# D. 运行时门禁:ALLOW_LEGACY_RESTORE 在生产配置中出现即启动失败
+# ════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def allow_legacy_restore_writer():
+    """覆盖 conftest 的 autouse fixture — 本测试类需要自行控制 ALLOW_LEGACY_RESTORE。
+
+    conftest.py 中的 ``allow_legacy_restore_writer`` autouse fixture 会强制设置
+    ``ALLOW_LEGACY_RESTORE=1``(测试逃生舱),与本测试类的目标冲突。
+    此处定义同名 fixture 覆盖之(在 pytest 中,测试类内同名 fixture 优先于
+    conftest 的 autouse fixture),让本测试类的每个用例自行设置环境变量。
+    """
+    yield
+
+
+class TestAllowLegacyRestoreInProductionFails:
+    """R66 P0-07: 生产环境配置 ALLOW_LEGACY_RESTORE → Settings 启动失败。
+
+    注意:本测试类通过 ``_load_real_settings_class()`` 直接从
+    ``config/settings.py`` 文件路径加载真实 Settings 类(绕过 conftest
+    注入的 MagicMock config 模块),以测试 R66 P0-07 的 model_validator。
+
+    ``config/settings.py`` 在模块末尾有 ``settings = Settings()`` 单例构造,
+    会在模块加载时立即触发 model_validator。因此:
+      - "fails" 用例:``_load_real_settings_class()`` 本身抛 ValueError
+        (pydantic ValidationError 是 ValueError 子类)
+      - "passes" 用例:``_load_real_settings_class()`` 成功加载(无 R66 P0-07 错误)
+
+    所有用例均设置 ``SERVICE_ROLE=prometheus_exporter`` 以绕过
+    ``validate_required_fields`` 的其他必填字段校验(如 Bot Token / CRDB URL),
+    让 R66 P0-07 的 validator 成为唯一可能失败的校验器。
+    """
+
+    def test_allow_legacy_restore_in_production_fails(self, monkeypatch):
+        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=1 → ValueError。
+
+        生产环境(ENVIRONMENT=production)配置 ALLOW_LEGACY_RESTORE=1/true/yes
+        时,Settings 加载应失败(raise ValueError),阻止进程启动。
+        """
+        # 模拟生产环境
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
+        # 清除其他可能干扰的环境变量
+        monkeypatch.delenv("APP_ENV", raising=False)
+        # 设置 SERVICE_ROLE=prometheus_exporter(无 secrets 依赖,避免其他 validator 失败)
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        # 模块加载时 settings = Settings() 会触发 validator
+        # pydantic ValidationError 是 ValueError 子类,pytest.raises(ValueError) 可捕获
+        with pytest.raises(ValueError) as exc_info:
+            _load_real_settings_class()
+
+        error_msg = str(exc_info.value)
+        assert "R66 P0-07" in error_msg, (
+            f"错误消息应包含 R66 P0-07 标识: {error_msg}"
+        )
+        assert "ALLOW_LEGACY_RESTORE" in error_msg
+        assert "production" in error_msg.lower()
+
+    def test_allow_legacy_restore_true_in_production_fails(self, monkeypatch):
+        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=true → ValueError。"""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "true")
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        with pytest.raises(ValueError):
+            _load_real_settings_class()
+
+    def test_allow_legacy_restore_with_app_env_production_fails(self, monkeypatch):
+        """APP_ENV=production + ALLOW_LEGACY_RESTORE=1 → ValueError。
+
+        Dockerfile 设置 APP_ENV=production(与 database/migrate.py 一致),
+        即使 ENVIRONMENT 不是 production,也应触发 fail-closed。
+        """
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        with pytest.raises(ValueError) as exc_info:
+            _load_real_settings_class()
+
+        assert "R66 P0-07" in str(exc_info.value)
+
+    def test_allow_legacy_restore_yes_in_production_fails(self, monkeypatch):
+        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=yes → ValueError。"""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "yes")
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        with pytest.raises(ValueError):
+            _load_real_settings_class()
+
+    def test_allow_legacy_restore_in_development_passes(self, monkeypatch):
+        """ENVIRONMENT=development + ALLOW_LEGACY_RESTORE=1 → 通过(测试逃生舱)。
+
+        非生产环境(development / staging 之外的测试环境)允许配置
+        ALLOW_LEGACY_RESTORE=1 作为测试逃生舱。
+        """
+        monkeypatch.setenv("ENVIRONMENT", "development")
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        # 不应 raise — 开发环境允许 ALLOW_LEGACY_RESTORE
+        try:
+            _load_real_settings_class()
+        except ValueError as e:
+            pytest.fail(
+                f"开发环境不应因 ALLOW_LEGACY_RESTORE=1 失败: {e}"
+            )
+
+    def test_no_allow_legacy_restore_in_production_passes(self, monkeypatch):
+        """ENVIRONMENT=production + 无 ALLOW_LEGACY_RESTORE → 通过(不触发 validator)。
+
+        生产环境不配置 ALLOW_LEGACY_RESTORE 时,validator 不应阻止启动
+        (其他必填字段校验可能失败,但不应是 R66 P0-07 validator 触发的)。
+        """
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.delenv("ALLOW_LEGACY_RESTORE", raising=False)
+        monkeypatch.delenv("APP_ENV", raising=False)
+        # 设置 SERVICE_ROLE=prometheus_exporter(无 secrets 依赖,避免其他 validator 失败)
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        try:
+            _load_real_settings_class()
+        except ValueError as e:
+            # 不应是 R66 P0-07 validator 触发的
+            assert "R66 P0-07" not in str(e), (
+                f"未配置 ALLOW_LEGACY_RESTORE 时不应触发 R66 P0-07 validator: {e}"
+            )
+
+    def test_allow_legacy_restore_empty_in_production_passes(self, monkeypatch):
+        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=''(空值)→ 通过。
+
+        空值等价于未配置,不应触发 validator。
+        """
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "")
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        try:
+            _load_real_settings_class()
+        except ValueError as e:
+            assert "R66 P0-07" not in str(e), (
+                f"ALLOW_LEGACY_RESTORE='' 时不应触发 R66 P0-07 validator: {e}"
+            )
+
+    def test_allow_legacy_restore_invalid_in_production_passes(self, monkeypatch):
+        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=invalid → 通过。
+
+        非 1/true/yes 的值视为未启用,不应触发 validator。
+        (与 db_restore.run_restore 的 seal 语义一致:invalid 视为生产模式)
+        """
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "invalid")
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
+
+        try:
+            _load_real_settings_class()
+        except ValueError as e:
+            assert "R66 P0-07" not in str(e), (
+                f"ALLOW_LEGACY_RESTORE=invalid 时不应触发 R66 P0-07 validator: {e}"
+            )
+
+
+# ════════════════════════════════════════════════════════════════
+# E. 完整 scanner 执行验证(R66 P0-07)
+# ════════════════════════════════════════════════════════════════
+
+
+class TestScannerExecution:
+    """R66 P0-07: 完整 scanner 执行验证(子进程方式)。"""
+
+    def test_default_mode_passes(self):
+        """默认模式:scanner 通过(无违规)。
+
+        验证精确白名单正确覆盖所有合法调用,无新违规。
+        """
+        exit_code, output = _run_gate(strict=False)
+        assert exit_code == 0, (
+            f"默认模式应通过(精确白名单覆盖所有合法调用),实际输出:\n{output}"
+        )
+        assert "[OK]" in output
+        assert "R66 P0-07" in output
+
+    def test_strict_mode_passes_with_sealed_callers_whitelisted(self):
+        """--strict 模式:sealed 调用方已被精确白名单覆盖,scanner 通过。
+
+        R66 P0-07 整改后:db_backup.py:restore_from_backup 与
+        command_bus.py:_handler 是已 capability-sealed 的调用方,
+        已加入 PRECISE_WHITELIST。--strict 模式应通过(无违规),
+        不报告 [FAIL]。
+        """
+        exit_code, output = _run_gate(strict=True)
+        assert exit_code == 0, (
+            f"--strict 模式应通过(sealed 调用方已被精确白名单覆盖),"
+            f"实际输出:\n{output}"
+        )
+        assert "[OK]" in output
+        assert "R66 P0-07" in output
+        # 不应出现 [FAIL](sealed 调用方已白名单覆盖,无违规)
+        assert "[FAIL]" not in output
+
+    def test_scanner_output_contains_r66_p0_07_marker(self):
+        """scanner 输出包含 R66 P0-07 整改标记(便于审计)。"""
+        # strict 模式应通过,但仍包含 R66 P0-07 整改说明
+        exit_code, output = _run_gate(strict=True)
+        assert exit_code == 0
+        # 输出应包含 R66 P0-07 整改标记
+        assert "R66 P0-07" in output or "R65 P0-07" in output
+        # 输出应包含扫描统计信息
+        assert "扫描" in output
+        assert "白名单跳过" in output

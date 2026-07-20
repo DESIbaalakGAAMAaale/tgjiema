@@ -28,6 +28,7 @@
       "security",
       "fault-injection",
       "migration-dry-run",
+      "skip-inventory",
       "verify-deploy",
       "playwright-e2e",
       "docker-build",

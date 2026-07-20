@@ -346,10 +346,10 @@ class ErrorCodes:
     # reject() 不能由创建者自己驳回(防止自拒绕过审计,必须与 approve() 对称强制 requester != approver)
     APPROVAL_SELF_REJECT_FORBIDDEN = "APPROVAL.SELF_REJECT.FORBIDDEN"
 
-    # ── R63 P0-04: Migration manifest 信任根验证 ──
-    # manifest 缺少 release_commit / tree_sha / verification 等必填字段
+    # ── R63 P0-04 / R66 P0-01: Migration manifest 信任根验证 ──
+    # R66 P0-01: catalog 缺少 verification 等必填字段,或包含禁止的 release_commit/tree_sha 字段
     MIGRATION_MANIFEST_FIELD_MISSING = "MIGRATION.MANIFEST.FIELD_MISSING"
-    # manifest 绑定的 release_commit / tree_sha 与当前 git HEAD/Tree 不一致
+    # R66 P0-01: release-manifest.json 的 source_commit/source_tree 与当前 git HEAD/Tree 不一致
     MIGRATION_MANIFEST_BINDING_MISMATCH = "MIGRATION.MANIFEST.BINDING_MISMATCH"
     # 磁盘 migration 文件集合与 manifest 声明集合不一致(漏项或多项)
     MIGRATION_MANIFEST_SET_MISMATCH = "MIGRATION.MANIFEST.SET_MISMATCH"
@@ -417,6 +417,14 @@ class ErrorCodes:
     # _restore_sqlite_tables_to_db() / validate_and_restore_backup_strict()
     # (绕过 orchestrator 蓝绿切换)→ 抛此错误 fail-closed。
     RESTORE_LEGACY_WRITER_SEALED = "RESTORE.LEGACY_WRITER.SEALED"
+    # R66 P0-06: RestoreOrchestrator 必需依赖缺失 — 生产类已删除所有 Optional 降级分支,
+    # 构造时 backends / approval_authority / mfa_authority / store 任一为 None,
+    # 或 check_startup_readiness 校验三个 backend / authority / nonce ledger /
+    # active pointer / fencing store 任一不可用 → 抛此错误 fail-closed。
+    # params: reason (主因) / missing (缺失依赖列表,逗号分隔)
+    RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING = (
+        "RESTORE.ORCHESTRATOR.REQUIRED_DEPENDENCY_MISSING"
+    )
 
     # ── R65 P0-05: HighRiskPolicy 未知 destructive action fail-closed ──
     # action 属于 destructive namespace(匹配 delete/purge/ban/block/takedown/
@@ -3300,6 +3308,22 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["caller", "reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — R66 P0-06: RestoreOrchestrator 必需依赖缺失
+    # 生产类已删除所有 Optional 降级分支,构造时 backends / approval_authority /
+    # mfa_authority / store 任一为 None,或 check_startup_readiness 校验三个 backend /
+    # authority / nonce ledger / active pointer / fencing store 任一不可用,
+    # 均 fail-closed 抛此错误(禁止生产环境降级到骨架路径)。
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING,
+        message_key="errors.restore.orchestrator.required_dependency_missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "missing"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",

@@ -11,7 +11,7 @@
        镜像内是同一份已签名 manifest。
     4. Dockerfile ``COPY . .`` 复制提交树版本(无 ``.sig``/``.pem``),运行时
        ``MIGRATION_MANIFEST_VERIFY`` 默认禁用。
-    5. ``_verify_manifest_head_tree_binding`` 在 git 不可用时只 warning 不阻断。
+    5. ``_verify_release_manifest_consistency`` 在 git 不可用时只 warning 不阻断(R66 P0-01 后改为 fail-closed)。
 
   整改:
     1. 生成独立 release artifact manifest(不提交到 git),绑定 source commit、
@@ -29,9 +29,9 @@
   B. _is_manifest_verify_enabled() 在 APP_ENV=production 且未启用时 raise(fail-closed)
   C. _is_manifest_verify_enabled() 在 APP_ENV=local 且 MIGRATION_MANIFEST_VERIFY=0
      时不 raise
-  D. _verify_manifest_head_tree_binding 在 git 不可用且 RELEASE_SOURCE_COMMIT 未设置时
-     raise(fail-closed)
-  E. _verify_manifest_head_tree_binding 在 git 不可用且 RELEASE_SOURCE_COMMIT 设置时
+  D. _verify_release_manifest_consistency 在 git 不可用且 RELEASE_SOURCE_COMMIT 未设置时
+     raise(fail-closed) — R66 P0-01 后从 catalog HEAD/Tree 绑定改为 release-manifest.json 绑定
+  E. _verify_release_manifest_consistency 在 git 不可用且 RELEASE_SOURCE_COMMIT 设置时
      正常验证
   F. _verify_release_manifest_consistency 一致性 / 不一致场景
 """
@@ -292,77 +292,172 @@ class TestIsManifestVerifyEnabledFailClosed:
 
 
 # ════════════════════════════════════════════════════════════════
-# D/E. _verify_manifest_head_tree_binding 非 git 环境 fail-closed
+# D/E. _verify_release_manifest_consistency HEAD/Tree 绑定非 git 环境 fail-closed
+#     (R66 P0-01: HEAD 绑定从 catalog 移到 release-manifest.json)
 # ════════════════════════════════════════════════════════════════
 
 
-class TestVerifyManifestHeadTreeBindingNonGit:
-    """_verify_manifest_head_tree_binding 在非 git 部署环境的行为。"""
+class TestVerifyReleaseManifestHeadTreeBindingNonGit:
+    """_verify_release_manifest_consistency 在非 git 部署环境的行为 (R66 P0-01)。
+
+    R66 P0-01: HEAD/Tree 绑定从 migration-manifest.json(catalog)移到
+    release-manifest.json(CI 产物)。catalog 不再保存 release_commit/tree_sha。
+    """
 
     def test_raises_when_git_unavailable_and_release_source_unset(
-        self, migrate_module, monkeypatch
+        self, migrate_module, monkeypatch, tmp_path
     ):
         """git 不可用且 RELEASE_SOURCE_COMMIT/TREE 未设置 → raise(fail-closed)。
 
-        R64 P0-02 核心整改:不再 warning 后继续,改为 fail-closed。
+        R64 P0-02 / R66 P0-01 核心整改:不再 warning 后继续,改为 fail-closed。
         """
         data = _load_manifest()
+        # 构造 release-manifest.json(含 source_commit/source_tree)
+        release_manifest = {
+            "version": 3,
+            "type": "release_artifact",
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "image_digest": "sha256:" + "a" * 64,
+            "image_name": "ghcr.io/maxiuquan/tgjiema",
+            "migrations": [
+                {"version": e["version"], "sha256": e["sha256"]}
+                for e in data["migrations"]
+            ],
+            "migration_manifest_digest": _file_sha256(MANIFEST_PATH),
+            "generated_at": "2026-07-18T00:00:00Z",
+            "tool_version": "R64-P0-02",
+        }
+        rm_path = tmp_path / "release-manifest.json"
+        rm_path.write_text(json.dumps(release_manifest), encoding="utf-8")
+        monkeypatch.setattr(migrate_module, "_RELEASE_MANIFEST_PATH", rm_path)
         # 模拟 git 不可用(返回 None)
         monkeypatch.setattr(migrate_module, "_git_rev_parse", lambda rev: None)
         # 清除 RELEASE_SOURCE_COMMIT/TREE 环境变量
         monkeypatch.delenv("RELEASE_SOURCE_COMMIT", raising=False)
         monkeypatch.delenv("RELEASE_SOURCE_TREE", raising=False)
         with pytest.raises(AppError) as exc_info:
-            migrate_module._verify_manifest_head_tree_binding(data)
+            migrate_module._verify_release_manifest_consistency(data)
         assert exc_info.value.code == ErrorCodes.MIGRATION_MANIFEST_RELEASE_SOURCE_REQUIRED
 
-    def test_passes_when_release_source_env_matches_manifest(
-        self, migrate_module, monkeypatch
+    def test_passes_when_release_source_env_matches_release_manifest(
+        self, migrate_module, monkeypatch, tmp_path
     ):
-        """git 不可用但 RELEASE_SOURCE_COMMIT/TREE 与 manifest 一致 → 通过。"""
+        """git 不可用但 RELEASE_SOURCE_COMMIT/TREE 与 release-manifest.json 一致 → 通过。"""
         data = _load_manifest()
-        # 模拟 git 不可用
+        rm_commit = "a" * 40
+        rm_tree = "b" * 40
+        release_manifest = {
+            "version": 3,
+            "type": "release_artifact",
+            "source_commit": rm_commit,
+            "source_tree": rm_tree,
+            "image_digest": "sha256:" + "a" * 64,
+            "image_name": "ghcr.io/maxiuquan/tgjiema",
+            "migrations": [
+                {"version": e["version"], "sha256": e["sha256"]}
+                for e in data["migrations"]
+            ],
+            "migration_manifest_digest": _file_sha256(MANIFEST_PATH),
+            "generated_at": "2026-07-18T00:00:00Z",
+            "tool_version": "R64-P0-02",
+        }
+        rm_path = tmp_path / "release-manifest.json"
+        rm_path.write_text(json.dumps(release_manifest), encoding="utf-8")
+        monkeypatch.setattr(migrate_module, "_RELEASE_MANIFEST_PATH", rm_path)
         monkeypatch.setattr(migrate_module, "_git_rev_parse", lambda rev: None)
-        # 通过环境变量注入与 manifest 一致的 source commit/tree
-        monkeypatch.setenv("RELEASE_SOURCE_COMMIT", data["release_commit"])
-        monkeypatch.setenv("RELEASE_SOURCE_TREE", data["tree_sha"])
-        # 不抛异常即通过
-        migrate_module._verify_manifest_head_tree_binding(data)
+        monkeypatch.setenv("RELEASE_SOURCE_COMMIT", rm_commit)
+        monkeypatch.setenv("RELEASE_SOURCE_TREE", rm_tree)
+        migrate_module._verify_release_manifest_consistency(data)
 
-    def test_raises_when_release_source_commit_mismatches_manifest(
-        self, migrate_module, monkeypatch
+    def test_raises_when_release_source_commit_mismatches_release_manifest(
+        self, migrate_module, monkeypatch, tmp_path
     ):
-        """git 不可用且 RELEASE_SOURCE_COMMIT 与 manifest 不一致 → raise。"""
+        """git 不可用且 RELEASE_SOURCE_COMMIT 与 release-manifest 不一致 → raise。"""
         data = _load_manifest()
+        release_manifest = {
+            "version": 3,
+            "type": "release_artifact",
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "image_digest": "sha256:" + "a" * 64,
+            "image_name": "ghcr.io/maxiuquan/tgjiema",
+            "migrations": [
+                {"version": e["version"], "sha256": e["sha256"]}
+                for e in data["migrations"]
+            ],
+            "migration_manifest_digest": _file_sha256(MANIFEST_PATH),
+            "generated_at": "2026-07-18T00:00:00Z",
+            "tool_version": "R64-P0-02",
+        }
+        rm_path = tmp_path / "release-manifest.json"
+        rm_path.write_text(json.dumps(release_manifest), encoding="utf-8")
+        monkeypatch.setattr(migrate_module, "_RELEASE_MANIFEST_PATH", rm_path)
         monkeypatch.setattr(migrate_module, "_git_rev_parse", lambda rev: None)
         monkeypatch.setenv("RELEASE_SOURCE_COMMIT", "0" * 40)
-        monkeypatch.setenv("RELEASE_SOURCE_TREE", data["tree_sha"])
+        monkeypatch.setenv("RELEASE_SOURCE_TREE", "b" * 40)
         with pytest.raises(AppError) as exc_info:
-            migrate_module._verify_manifest_head_tree_binding(data)
+            migrate_module._verify_release_manifest_consistency(data)
         assert exc_info.value.code == ErrorCodes.MIGRATION_MANIFEST_BINDING_MISMATCH
 
-    def test_raises_when_release_source_tree_mismatches_manifest(
-        self, migrate_module, monkeypatch
+    def test_raises_when_release_source_tree_mismatches_release_manifest(
+        self, migrate_module, monkeypatch, tmp_path
     ):
-        """git 不可用且 RELEASE_SOURCE_TREE 与 manifest 不一致 → raise。"""
+        """git 不可用且 RELEASE_SOURCE_TREE 与 release-manifest 不一致 → raise。"""
         data = _load_manifest()
+        release_manifest = {
+            "version": 3,
+            "type": "release_artifact",
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "image_digest": "sha256:" + "a" * 64,
+            "image_name": "ghcr.io/maxiuquan/tgjiema",
+            "migrations": [
+                {"version": e["version"], "sha256": e["sha256"]}
+                for e in data["migrations"]
+            ],
+            "migration_manifest_digest": _file_sha256(MANIFEST_PATH),
+            "generated_at": "2026-07-18T00:00:00Z",
+            "tool_version": "R64-P0-02",
+        }
+        rm_path = tmp_path / "release-manifest.json"
+        rm_path.write_text(json.dumps(release_manifest), encoding="utf-8")
+        monkeypatch.setattr(migrate_module, "_RELEASE_MANIFEST_PATH", rm_path)
         monkeypatch.setattr(migrate_module, "_git_rev_parse", lambda rev: None)
-        monkeypatch.setenv("RELEASE_SOURCE_COMMIT", data["release_commit"])
+        monkeypatch.setenv("RELEASE_SOURCE_COMMIT", "a" * 40)
         monkeypatch.setenv("RELEASE_SOURCE_TREE", "0" * 40)
         with pytest.raises(AppError) as exc_info:
-            migrate_module._verify_manifest_head_tree_binding(data)
+            migrate_module._verify_release_manifest_consistency(data)
         assert exc_info.value.code == ErrorCodes.MIGRATION_MANIFEST_BINDING_MISMATCH
 
     def test_raises_when_only_release_source_commit_set(
-        self, migrate_module, monkeypatch
+        self, migrate_module, monkeypatch, tmp_path
     ):
         """git 不可用且只设置 RELEASE_SOURCE_COMMIT 未设置 RELEASE_SOURCE_TREE → raise。"""
         data = _load_manifest()
+        release_manifest = {
+            "version": 3,
+            "type": "release_artifact",
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "image_digest": "sha256:" + "a" * 64,
+            "image_name": "ghcr.io/maxiuquan/tgjiema",
+            "migrations": [
+                {"version": e["version"], "sha256": e["sha256"]}
+                for e in data["migrations"]
+            ],
+            "migration_manifest_digest": _file_sha256(MANIFEST_PATH),
+            "generated_at": "2026-07-18T00:00:00Z",
+            "tool_version": "R64-P0-02",
+        }
+        rm_path = tmp_path / "release-manifest.json"
+        rm_path.write_text(json.dumps(release_manifest), encoding="utf-8")
+        monkeypatch.setattr(migrate_module, "_RELEASE_MANIFEST_PATH", rm_path)
         monkeypatch.setattr(migrate_module, "_git_rev_parse", lambda rev: None)
-        monkeypatch.setenv("RELEASE_SOURCE_COMMIT", data["release_commit"])
+        monkeypatch.setenv("RELEASE_SOURCE_COMMIT", "a" * 40)
         monkeypatch.delenv("RELEASE_SOURCE_TREE", raising=False)
         with pytest.raises(AppError) as exc_info:
-            migrate_module._verify_manifest_head_tree_binding(data)
+            migrate_module._verify_release_manifest_consistency(data)
         assert exc_info.value.code == ErrorCodes.MIGRATION_MANIFEST_RELEASE_SOURCE_REQUIRED
 
 
@@ -392,13 +487,21 @@ class TestVerifyReleaseManifestConsistency:
     ):
         """release-manifest.json 与 migration-manifest.json 集合/digest 一致 → 通过。"""
         data = _load_manifest()
+        # R66 P0-01: source_commit/source_tree 必须与 git HEAD/Tree 一致
+        # 用 monkeypatch 固定 _git_rev_parse 返回值,使测试不依赖真实 git 状态
+        test_commit = "a" * 40
+        test_tree = "b" * 40
+        monkeypatch.setattr(
+            migrate_module, "_git_rev_parse",
+            lambda rev: test_commit if rev == "HEAD" else test_tree
+        )
         # 构造一致的 release manifest
         mm_digest = _file_sha256(MANIFEST_PATH)
         release_manifest = {
             "version": 3,
             "type": "release_artifact",
-            "source_commit": data["release_commit"],
-            "source_tree": data["tree_sha"],
+            "source_commit": test_commit,
+            "source_tree": test_tree,
             "image_digest": "sha256:" + "a" * 64,
             "image_name": "ghcr.io/maxiuquan/tgjiema",
             "migrations": [
@@ -420,12 +523,19 @@ class TestVerifyReleaseManifestConsistency:
     ):
         """release-manifest.json.migrations 集合与 migration-manifest.json 不一致 → raise。"""
         data = _load_manifest()
+        # R66 P0-01: source_commit/source_tree 必须与 git HEAD/Tree 一致
+        test_commit = "a" * 40
+        test_tree = "b" * 40
+        monkeypatch.setattr(
+            migrate_module, "_git_rev_parse",
+            lambda rev: test_commit if rev == "HEAD" else test_tree
+        )
         # 构造不一致的 release manifest:多一个不存在的 migration
         release_manifest = {
             "version": 3,
             "type": "release_artifact",
-            "source_commit": data["release_commit"],
-            "source_tree": data["tree_sha"],
+            "source_commit": test_commit,
+            "source_tree": test_tree,
             "image_digest": "sha256:" + "a" * 64,
             "image_name": "ghcr.io/maxiuquan/tgjiema",
             "migrations": [
@@ -450,6 +560,13 @@ class TestVerifyReleaseManifestConsistency:
     ):
         """release-manifest.json 中某 migration 的 sha256 与 migration-manifest.json 不一致 → raise。"""
         data = _load_manifest()
+        # R66 P0-01: source_commit/source_tree 必须与 git HEAD/Tree 一致
+        test_commit = "a" * 40
+        test_tree = "b" * 40
+        monkeypatch.setattr(
+            migrate_module, "_git_rev_parse",
+            lambda rev: test_commit if rev == "HEAD" else test_tree
+        )
         # 修改第一个 migration 的 sha256
         modified_migrations = [
             {"version": e["version"], "sha256": e["sha256"]}
@@ -459,8 +576,8 @@ class TestVerifyReleaseManifestConsistency:
         release_manifest = {
             "version": 3,
             "type": "release_artifact",
-            "source_commit": data["release_commit"],
-            "source_tree": data["tree_sha"],
+            "source_commit": test_commit,
+            "source_tree": test_tree,
             "image_digest": "sha256:" + "a" * 64,
             "image_name": "ghcr.io/maxiuquan/tgjiema",
             "migrations": modified_migrations,
@@ -480,11 +597,18 @@ class TestVerifyReleaseManifestConsistency:
     ):
         """release-manifest.json.migration_manifest_digest 与当前 migration-manifest.json 实际 sha256 不一致 → raise。"""
         data = _load_manifest()
+        # R66 P0-01: source_commit/source_tree 必须与 git HEAD/Tree 一致
+        test_commit = "a" * 40
+        test_tree = "b" * 40
+        monkeypatch.setattr(
+            migrate_module, "_git_rev_parse",
+            lambda rev: test_commit if rev == "HEAD" else test_tree
+        )
         release_manifest = {
             "version": 3,
             "type": "release_artifact",
-            "source_commit": data["release_commit"],
-            "source_tree": data["tree_sha"],
+            "source_commit": test_commit,
+            "source_tree": test_tree,
             "image_digest": "sha256:" + "a" * 64,
             "image_name": "ghcr.io/maxiuquan/tgjiema",
             "migrations": [
@@ -526,11 +650,20 @@ class TestDockerfileAndWorkflowStructure:
         )
 
     def test_workflow_has_regenerate_migration_manifest_step(self):
-        """release-gates.yml 必须有 'Regenerate migration manifest' 步骤。"""
+        """release-gates.yml 必须有 'Regenerate migration manifest' 步骤。
+
+        R66 P0-01: 步骤名从 'Regenerate migration manifest (bind to current HEAD/Tree)'
+        改为 'Regenerate migration manifest (catalog-only, no HEAD/Tree binding)'
+        (catalog-only 模型,不再绑定 HEAD/Tree)。
+        R66 P0-02: 步骤从 sign-image job(build 之后)移到 docker-build job
+        (build 之前),确保镜像内 catalog 与签名对象一致。步骤名改为
+        'Regenerate migration manifest (catalog-only, before docker build)'。
+        """
         content = WORKFLOW_PATH.read_text(encoding="utf-8")
-        assert "Regenerate migration manifest (bind to current HEAD/Tree)" in content, (
-            "R64 P0-02: release-gates.yml 必须在 Sign migration manifest 之前 "
-            "新增 Regenerate migration manifest 步骤"
+        # R66 P0-02: 新步骤名(在 docker-build job 中, build 之前)
+        assert "Regenerate migration manifest (catalog-only, before docker build)" in content, (
+            "R66 P0-02: release-gates.yml 必须在 docker-build job 的 build 步骤之前 "
+            "新增 Regenerate migration manifest (catalog-only, before docker build) 步骤"
         )
 
     def test_workflow_has_generate_release_manifest_step(self):
@@ -582,47 +715,255 @@ class TestDockerfileAndWorkflowStructure:
 
 
 # ════════════════════════════════════════════════════════════════
+# G2. R66 P0-02: build-once 后才重生 manifest 整改校验
+# ════════════════════════════════════════════════════════════════
+
+
+class TestR66P0_02BuildOnceManifestFrozen:
+    """R66 P0-02: build-once 后才重生 manifest, 签名对象不在已构建镜像内 — 整改校验。
+
+    审计背景(R66 P0-02):
+      旧实现: sign-image job 在 docker-build 完成后才执行 'Regenerate migration
+      manifest' 步骤, 仅修改 runner 工作区文件, 已 push 的 OCI image 仍含
+      checkout 时的旧 manifest。签名对象(新 manifest)与镜像内实际内容
+      (旧 manifest)不一致 — 签名材料无法证明镜像内 catalog 完整性。
+
+    整改:
+      1. catalog 重生移到 docker-build job (build 之前), 确保镜像内 catalog
+         与 runner 工作区一致。
+      2. docker-build job 输出 catalog_digest (build 前冻结的 catalog sha256)。
+      3. sign-image job 不再重生 catalog (禁止 build 后修改任何声称位于镜像内
+         的发布输入)。
+      4. sign-image job 新增 'Verify image catalog digest matches source' 步骤,
+         从镜像内读取 /app/database/migrations/migration-manifest.json 计算
+         sha256, 与 docker-build 输出的 catalog_digest + runner 工作区 source
+         catalog sha256 双重比对。
+    """
+
+    @pytest.fixture
+    def workflow_yaml(self):
+        """解析 release-gates.yml 为 dict。"""
+        import yaml
+        return yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
+
+    @pytest.fixture
+    def workflow_content(self):
+        """读取 release-gates.yml 完整内容。"""
+        return WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    def test_docker_build_has_regenerate_step_before_build(self, workflow_yaml):
+        """docker-build job 必须在 build 步骤之前重生 catalog。
+
+        R66 P0-02: 'Regenerate migration manifest (catalog-only, before docker build)'
+        步骤必须出现在 'Build and push OCI image (build once)' 步骤之前。
+        """
+        docker_build_steps = workflow_yaml["jobs"]["docker-build"]["steps"]
+        regenerate_idx = None
+        build_idx = None
+        for i, step in enumerate(docker_build_steps):
+            name = step.get("name", "")
+            if "Regenerate migration manifest" in name and "before docker build" in name:
+                regenerate_idx = i
+            if "Build and push OCI image" in name:
+                build_idx = i
+        assert regenerate_idx is not None, (
+            "R66 P0-02: docker-build job 必须有 'Regenerate migration manifest "
+            "(catalog-only, before docker build)' 步骤"
+        )
+        assert build_idx is not None, (
+            "R66 P0-02: docker-build job 必须有 'Build and push OCI image' 步骤"
+        )
+        assert regenerate_idx < build_idx, (
+            f"R66 P0-02: Regenerate 步骤 (index={regenerate_idx}) 必须在 "
+            f"Build 步骤 (index={build_idx}) 之前 — manifest 在 docker build "
+            f"前已冻结, build 后禁止修改"
+        )
+
+    def test_docker_build_outputs_catalog_digest(self, workflow_yaml):
+        """docker-build job 必须输出 catalog_digest (build 前冻结的 catalog sha256)。
+
+        R66 P0-02: catalog_digest 作为 sign-image job 校验镜像内 catalog 的 baseline。
+        """
+        docker_build_outputs = workflow_yaml["jobs"]["docker-build"].get("outputs", {})
+        assert "catalog_digest" in docker_build_outputs, (
+            "R66 P0-02: docker-build job 必须输出 catalog_digest "
+            "(build 前冻结的 catalog sha256, 供 sign-image job 校验镜像内 catalog)"
+        )
+
+    def test_sign_image_does_not_regenerate_manifest(self, workflow_yaml):
+        """sign-image job 不得包含 'Regenerate migration manifest' 步骤。
+
+        R66 P0-02: 禁止 build 后修改任何声称位于镜像内的发布输入。
+        catalog 重生已移到 docker-build job (build 之前), sign-image job
+        只能校验镜像内 catalog digest, 不得重生 catalog。
+        """
+        sign_image_steps = workflow_yaml["jobs"]["sign-image"]["steps"]
+        regenerate_steps = [
+            s for s in sign_image_steps
+            if "Regenerate migration manifest" in s.get("name", "")
+        ]
+        assert not regenerate_steps, (
+            "R66 P0-02: sign-image job 不得包含 'Regenerate migration manifest' 步骤 "
+            "(禁止 build 后修改任何声称位于镜像内的发布输入) — "
+            f"发现 {len(regenerate_steps)} 个: {[s.get('name') for s in regenerate_steps]}"
+        )
+
+    def test_sign_image_does_not_call_generate_migration_manifest_script(
+        self, workflow_yaml
+    ):
+        """sign-image job 不得调用 scripts/generate_migration_manifest.py。
+
+        R66 P0-02: sign-image job 禁止重生 catalog (build 后修改声称位于镜像内的
+        发布输入)。generate_migration_manifest.py 只能在 docker-build job
+        (build 之前) 或 ci.yml (测试之前) 中调用。
+        """
+        sign_image_steps = workflow_yaml["jobs"]["sign-image"]["steps"]
+        for step in sign_image_steps:
+            run_script = step.get("run", "")
+            assert "generate_migration_manifest.py" not in run_script, (
+                f"R66 P0-02: sign-image job 的步骤 '{step.get('name', '?')}' "
+                f"不得调用 generate_migration_manifest.py (禁止 build 后重生 catalog)"
+            )
+
+    def test_sign_image_has_image_catalog_digest_verification_step(self, workflow_yaml):
+        """sign-image job 必须有 'Verify image catalog digest matches source' 步骤。
+
+        R66 P0-02: 镜像内 catalog digest 校验(image catalog digest verification)。
+        从已 push 的 OCI image 中读取 /app/database/migrations/migration-manifest.json,
+        计算 sha256, 与 docker-build 输出的 catalog_digest + runner 工作区 source
+        catalog sha256 双重比对。
+        """
+        sign_image_steps = workflow_yaml["jobs"]["sign-image"]["steps"]
+        verify_step = next(
+            (s for s in sign_image_steps
+             if "Verify image catalog digest" in s.get("name", "")),
+            None,
+        )
+        assert verify_step is not None, (
+            "R66 P0-02: sign-image job 必须有 'Verify image catalog digest matches source' 步骤"
+        )
+
+    def test_image_catalog_digest_verification_runs_image(self, workflow_yaml):
+        """Verify image catalog digest 步骤必须 docker run 镜像读取 catalog 文件。
+
+        R66 P0-02: 通过 docker run --rm --entrypoint cat <image> 读取镜像内
+        /app/database/migrations/migration-manifest.json, 确保校验的是镜像内
+        实际内容(而非 runner 工作区内容)。
+        """
+        sign_image_steps = workflow_yaml["jobs"]["sign-image"]["steps"]
+        verify_step = next(
+            (s for s in sign_image_steps
+             if "Verify image catalog digest" in s.get("name", "")),
+            None,
+        )
+        assert verify_step is not None, (
+            "R66 P0-02: sign-image job 必须有 'Verify image catalog digest' 步骤"
+        )
+        run_script = verify_step.get("run", "")
+        assert "docker run" in run_script, (
+            "R66 P0-02: Verify image catalog digest 步骤必须 docker run 镜像读取 catalog"
+        )
+        assert "migration-manifest.json" in run_script, (
+            "R66 P0-02: Verify image catalog digest 步骤必须读取 /app/database/migrations/"
+            "migration-manifest.json"
+        )
+
+    def test_image_catalog_digest_verification_uses_docker_build_output(
+        self, workflow_yaml
+    ):
+        """Verify image catalog digest 步骤必须引用 docker-build 输出的 catalog_digest。
+
+        R66 P0-02: catalog_digest 是 build 前冻结的 catalog sha256, 作为校验
+        镜像内 catalog 的 baseline (禁止 build 后修改)。
+        """
+        sign_image_steps = workflow_yaml["jobs"]["sign-image"]["steps"]
+        verify_step = next(
+            (s for s in sign_image_steps
+             if "Verify image catalog digest" in s.get("name", "")),
+            None,
+        )
+        assert verify_step is not None
+        run_script = verify_step.get("run", "")
+        assert "needs.docker-build.outputs.catalog_digest" in run_script, (
+            "R66 P0-02: Verify image catalog digest 步骤必须引用 "
+            "needs.docker-build.outputs.catalog_digest (build 前冻结的 baseline)"
+        )
+
+    def test_image_catalog_digest_verification_before_sign(self, workflow_yaml):
+        """Verify image catalog digest 步骤必须在 Sign OCI image 步骤之前。
+
+        R66 P0-02: 先校验镜像内 catalog digest, 再签名镜像 — 若镜像内 catalog
+        与 baseline 不一致, 拒绝签名 (fail-fast, 不浪费 cosign sign 调用)。
+        """
+        sign_image_steps = workflow_yaml["jobs"]["sign-image"]["steps"]
+        verify_idx = None
+        sign_idx = None
+        for i, step in enumerate(sign_image_steps):
+            name = step.get("name", "")
+            if "Verify image catalog digest" in name:
+                verify_idx = i
+            if "Sign OCI image" in name:
+                sign_idx = i
+        assert verify_idx is not None, (
+            "R66 P0-02: sign-image job 必须有 'Verify image catalog digest' 步骤"
+        )
+        assert sign_idx is not None, (
+            "R66 P0-02: sign-image job 必须有 'Sign OCI image' 步骤"
+        )
+        assert verify_idx < sign_idx, (
+            f"R66 P0-02: Verify image catalog digest (index={verify_idx}) "
+            f"必须在 Sign OCI image (index={sign_idx}) 之前 — 先校验镜像内 catalog, 再签名"
+        )
+
+    def test_workflow_has_r66_p0_02_comment(self, workflow_content):
+        """release-gates.yml 必须包含 R66 P0-02 整改说明注释。
+
+        R66 P0-02: 'manifest 在 docker build 前已冻结, build 后禁止修改'
+        注释必须出现在 workflow 中, 解释为何 catalog 重生移到 build 之前。
+        """
+        assert "R66 P0-02" in workflow_content, (
+            "R66 P0-02: release-gates.yml 必须包含 R66 P0-02 整改说明注释"
+        )
+        assert "manifest 在 docker build 前已冻结" in workflow_content, (
+            "R66 P0-02: release-gates.yml 必须包含 'manifest 在 docker build 前已冻结' 注释"
+        )
+        assert "build 后禁止修改" in workflow_content, (
+            "R66 P0-02: release-gates.yml 必须包含 'build 后禁止修改' 注释"
+        )
+
+
+# ════════════════════════════════════════════════════════════════
 # H. migration-manifest.json 已绑定到当前 HEAD(回归校验)
 # ════════════════════════════════════════════════════════════════
 
 
-class TestMigrationManifestBoundToCurrentHead:
-    """重生后的 migration-manifest.json 必须严格绑定到当前 R64 HEAD/Tree。"""
+class TestCatalogDoesNotBindToHead:
+    """R66 P0-01: catalog(migration-manifest.json)不再绑定到 HEAD/Tree。
 
-    def test_release_commit_matches_current_head(self):
-        """manifest.release_commit 必须等于当前 git HEAD。"""
+    R66 P0-01 整改:catalog 不再包含 release_commit/tree_sha 字段。
+    HEAD/Tree 绑定由 release-manifest.json(CI 产物,不提交 git)承担。
+    """
+
+    def test_catalog_does_not_contain_release_commit(self):
+        """R66 P0-01: catalog 不得包含 release_commit 字段(自引用循环根因)。"""
         manifest = _load_manifest()
-        head_sha = _git_rev_parse("HEAD")
-        if head_sha is None:
-            pytest.skip("git 不可用")
-        assert manifest["release_commit"] == head_sha, (
-            f"manifest release_commit ({manifest['release_commit'][:12]}...) "
-            f"与当前 HEAD ({head_sha[:12]}...) 不一致 — R64 P0-02: manifest 必须重生"
+        assert "release_commit" not in manifest, (
+            "R66 P0-01: catalog 禁止包含 release_commit 字段 "
+            "(自引用循环根因 — HEAD 绑定移至 release-manifest.json)"
         )
 
-    def test_tree_sha_matches_current_head_tree(self):
-        """manifest.tree_sha 必须等于当前 git HEAD^{tree}。"""
+    def test_catalog_does_not_contain_tree_sha(self):
+        """R66 P0-01: catalog 不得包含 tree_sha 字段(自引用循环根因)。"""
         manifest = _load_manifest()
-        tree_sha = _git_rev_parse("HEAD^{tree}")
-        if tree_sha is None:
-            pytest.skip("git 不可用")
-        assert manifest["tree_sha"] == tree_sha, (
-            f"manifest tree_sha ({manifest['tree_sha'][:12]}...) "
-            f"与当前 HEAD Tree ({tree_sha[:12]}...) 不一致 — R64 P0-02: manifest 必须重生"
+        assert "tree_sha" not in manifest, (
+            "R66 P0-01: catalog 禁止包含 tree_sha 字段 "
+            "(自引用循环根因 — Tree 绑定移至 release-manifest.json)"
         )
 
-    def test_release_commit_not_stale_r63_value(self):
-        """manifest.release_commit 不应是旧 R63 值 3513de9...。"""
+    def test_catalog_version_is_at_least_3(self):
+        """R66 P0-01: catalog version 必须 >= 3(catalog-only 模型版本)。"""
         manifest = _load_manifest()
-        stale_commit = "3513de91224844c83aa3370a8267ce7a6590ed5e"
-        assert manifest["release_commit"] != stale_commit, (
-            "R64 P0-02: manifest release_commit 仍是旧 R63 值 3513de9... — 必须重生为当前 HEAD"
-        )
-
-    def test_tree_sha_not_stale_r63_value(self):
-        """manifest.tree_sha 不应是旧 R63 值 bd8337d...。"""
-        manifest = _load_manifest()
-        stale_tree = "bd8337d0f6e710f1dc734c1163eaa40b239924de"
-        assert manifest["tree_sha"] != stale_tree, (
-            "R64 P0-02: manifest tree_sha 仍是旧 R63 值 bd8337d... — 必须重生为当前 Tree"
+        assert manifest.get("version", 0) >= 3, (
+            f"R66 P0-01: catalog version 必须 >= 3(catalog-only 模型),"
+            f"实际为 {manifest.get('version')}"
         )

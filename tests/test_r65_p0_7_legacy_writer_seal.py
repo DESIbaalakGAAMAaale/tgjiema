@@ -407,24 +407,49 @@ class TestAstGate:
             f"默认模式应通过(无直接调用私有 writer 的违规),实际输出:\n{output}"
         )
         assert "[OK]" in output
-        assert "R65 P0-07 / P1-07 capability-seal 门禁检查通过" in output
+        assert "capability-seal 门禁检查通过" in output
 
-    def test_strict_mode_flags_pre_existing_sealed_callers(self):
-        """--strict 模式:已知 sealed 调用方被检测(db_backup / command_bus)。
+    def test_strict_mode_sealed_callers_whitelisted(self):
+        """--strict 模式:已知 sealed 调用方已被精确白名单覆盖(db_backup / command_bus)。
 
-        --strict 模式额外检测 validate_and_restore_backup_strict 与
-        restore_from_backup 公共入口调用。db_backup.py:restore_from_backup
-        与 command_bus.py:_handler 是已 sealed 的调用方(运行时由
-        ALLOW_LEGACY_RESTORE env var 防护),但静态调用仍存在。
+        R66 P0-07 整改后:db_backup.py:restore_from_backup 与
+        command_bus.py:_handler 是已 capability-sealed 的调用方(运行时由
+        ALLOW_LEGACY_RESTORE env var + RESTORE_LEGACY_WRITER_SEALED 错误码
+        防护)。这些 sealed 调用方已加入 PRECISE_WHITELIST(精确函数+行范围),
+        因此 --strict 模式应通过(无违规),不报告 [FAIL]。
+
+        本测试验证白名单正确覆盖:sealed 调用方在 PRECISE_WHITELIST 中,
+        且 --strict 模式 exit_code=0。
         """
-        exit_code, output = _run_gate(strict=True)
-        # --strict 模式应检测到至少 2 处违规(db_backup + command_bus)
-        assert exit_code == 1, (
-            f"--strict 模式应检测到 pre-existing sealed 调用方,实际输出:\n{output}"
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        try:
+            import check_restore_no_legacy_writer as gate_mod
+        finally:
+            sys.path.pop(0)
+
+        # 验证 sealed 调用方在 PRECISE_WHITELIST 中(精确白名单已覆盖)
+        precise_files_functions = {
+            (entry["file"], entry["function"])
+            for entry in gate_mod.PRECISE_WHITELIST
+        }
+        assert ("services/db_backup.py", "restore_from_backup") in precise_files_functions, (
+            "services/db_backup.py:restore_from_backup 应在 PRECISE_WHITELIST 中"
+            "(已 capability-sealed,精确白名单覆盖)"
         )
-        assert "[FAIL]" in output
-        assert "validate_and_restore_backup_strict" in output
-        assert "restore_from_backup" in output
+        assert ("services/command_bus.py", "_handler") in precise_files_functions, (
+            "services/command_bus.py:_handler 应在 PRECISE_WHITELIST 中"
+            "(已 capability-sealed,精确白名单覆盖)"
+        )
+
+        # --strict 模式应通过(sealed 调用方已被白名单覆盖)
+        exit_code, output = _run_gate(strict=True)
+        assert exit_code == 0, (
+            f"--strict 模式应通过(sealed 调用方已被精确白名单覆盖),"
+            f"实际输出:\n{output}"
+        )
+        assert "[OK]" in output
+        # 不应出现 [FAIL](sealed 调用方已白名单覆盖,无违规)
+        assert "[FAIL]" not in output
 
     def test_synthetic_violation_detected(self, tmp_path, monkeypatch):
         """合成违规文件:直接调用 _restore_from_backup_data 被检测。
@@ -509,36 +534,60 @@ async def bad_caller():
         assert violations_strict[0][2] == "validate_and_restore_backup_strict"
 
     def test_whitelist_files_skipped(self):
-        """白名单文件被跳过(services/db_restore.py / backup_dr_validate.py 等)。"""
+        """R66 P0-07: 仅 error_codes.py 完全跳过;db_restore.py / backup_dr_validate.py
+        改为精确函数级白名单(PRECISE_WHITELIST);restore_backends.py /
+        restore_orchestrator.py 移出白名单。"""
         sys.path.insert(0, str(REPO_ROOT / "scripts"))
         try:
             import check_restore_no_legacy_writer as gate_mod
         finally:
             sys.path.pop(0)
 
-        # services/db_restore.py 应在白名单中
-        db_restore_path = REPO_ROOT / "services" / "db_restore.py"
-        assert gate_mod._is_whitelisted(db_restore_path), (
-            "services/db_restore.py 应在白名单中(允许直接调用 legacy writer)"
-        )
-
-        # services/backup_dr_validate.py 应在白名单中
-        bdv_path = REPO_ROOT / "services" / "backup_dr_validate.py"
-        assert gate_mod._is_whitelisted(bdv_path), (
-            "services/backup_dr_validate.py 应在白名单中(strict service 合法调用)"
-        )
-
-        # services/restore_backends.py 应在白名单中
-        rb_path = REPO_ROOT / "services" / "restore_backends.py"
-        assert gate_mod._is_whitelisted(rb_path)
-
-        # services/restore_orchestrator.py 应在白名单中
-        ro_path = REPO_ROOT / "services" / "restore_orchestrator.py"
-        assert gate_mod._is_whitelisted(ro_path)
-
-        # services/error_codes.py 应在白名单中(仅引用错误码字符串)
+        # services/error_codes.py 仍完全跳过(仅引用错误码字符串,非调用)
         ec_path = REPO_ROOT / "services" / "error_codes.py"
-        assert gate_mod._is_whitelisted(ec_path)
+        assert gate_mod._is_whitelisted(ec_path), (
+            "services/error_codes.py 应完全跳过(仅引用错误码字符串)"
+        )
+
+        # R66 P0-07: db_restore.py 不再完全跳过,改为精确函数级白名单
+        db_restore_path = REPO_ROOT / "services" / "db_restore.py"
+        assert not gate_mod._is_whitelisted(db_restore_path), (
+            "services/db_restore.py 不应完全跳过(R66 P0-07: 改为精确函数级白名单)"
+        )
+
+        # R66 P0-07: backup_dr_validate.py 不再完全跳过,改为精确函数级白名单
+        bdv_path = REPO_ROOT / "services" / "backup_dr_validate.py"
+        assert not gate_mod._is_whitelisted(bdv_path), (
+            "services/backup_dr_validate.py 不应完全跳过(R66 P0-07: 改为精确函数级白名单)"
+        )
+
+        # R66 P0-07: restore_backends.py 移出白名单(新生产路径,禁止调用 legacy writer)
+        rb_path = REPO_ROOT / "services" / "restore_backends.py"
+        assert not gate_mod._is_whitelisted(rb_path), (
+            "services/restore_backends.py 不应在白名单中(R66 P0-07: 新生产路径,禁止调用)"
+        )
+
+        # R66 P0-07: restore_orchestrator.py 移出白名单(新生产路径,禁止调用 legacy writer)
+        ro_path = REPO_ROOT / "services" / "restore_orchestrator.py"
+        assert not gate_mod._is_whitelisted(ro_path), (
+            "services/restore_orchestrator.py 不应在白名单中(R66 P0-07: 新生产路径,禁止调用)"
+        )
+
+        # 验证精确白名单中存在 db_restore.py / backup_dr_validate.py 的条目
+        precise_files = {entry["file"] for entry in gate_mod.PRECISE_WHITELIST}
+        assert "services/db_restore.py" in precise_files, (
+            "精确白名单应包含 services/db_restore.py 的函数级条目"
+        )
+        assert "services/backup_dr_validate.py" in precise_files, (
+            "精确白名单应包含 services/backup_dr_validate.py 的函数级条目"
+        )
+        # restore_backends.py / restore_orchestrator.py 不应在精确白名单中
+        assert "services/restore_backends.py" not in precise_files, (
+            "精确白名单不应包含 services/restore_backends.py"
+        )
+        assert "services/restore_orchestrator.py" not in precise_files, (
+            "精确白名单不应包含 services/restore_orchestrator.py"
+        )
 
     def test_whitelist_dirs_skipped(self):
         """白名单目录被跳过(tests/ 与 scripts/)。"""

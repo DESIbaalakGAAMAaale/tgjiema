@@ -133,17 +133,35 @@ def _make_orchestrator(
     approval_authority=None,
     mfa_authority=None,
 ):
-    """构造 RestoreOrchestrator(注入 store + 可选 authorities)。"""
-    from services.restore_orchestrator import RestoreOrchestrator
+    """构造 RestoreOrchestrator(真实 authorities)或 SkeletonFake(authorities=None)。
 
+    R66 P0-06: 生产类 RestoreOrchestrator 已删除所有 Optional 降级骨架,
+    backends / approval_authority / mfa_authority 均为必需参数。
+    - 提供 approval_authority / mfa_authority 时:构造真实 RestoreOrchestrator
+      (注入 mock backends)
+    - authorities=None 时:使用 tests-only fake 保留旧 ID 比较路径
+    """
     if staging_root is None:
         _tmp_dir = tempfile.mkdtemp(prefix="r65_p0_3_staging_")
         staging_root = _tmp_dir
+    if approval_authority is None and mfa_authority is None:
+        # R66 P0-06: authorities=None 时使用 tests-only fake(旧 ID 比较路径)
+        from tests._restore_skeleton_fake import RestoreOrchestratorSkeletonFake
+        return RestoreOrchestratorSkeletonFake(
+            store,
+            staging_root=staging_root,
+            fault_hooks=fault_hooks or {},
+            rollback_ttl_seconds=rollback_ttl_seconds,
+        )
+    # 真实 authorities:构造生产类 RestoreOrchestrator(注入 mock backends)
+    from services.restore_orchestrator import RestoreOrchestrator
+    from services.restore_backends import BackendRegistry
     return RestoreOrchestrator(
         store,
         staging_root=staging_root,
         fault_hooks=fault_hooks or {},
         rollback_ttl_seconds=rollback_ttl_seconds,
+        backends=BackendRegistry(),
         approval_authority=approval_authority,
         mfa_authority=mfa_authority,
     )
@@ -787,7 +805,7 @@ class TestExecuteBlueGreenSwitchWithAuthorities:
         uuid.UUID(switch_version)  # UUID 格式
 
         # operation 进入 COMPLETED 终态
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "completed"
 
         # approval 已消费
@@ -868,7 +886,7 @@ class TestExecuteBlueGreenSwitchWithAuthorities:
             "UoW 回滚后 approval consumed_at 必须为 NULL(未消费,replay-safe)"
 
         # operation phase 仍为 await_approval(未切换)
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "await_approval", \
             "UoW 回滚后 phase 应仍为 await_approval"
 
@@ -931,7 +949,7 @@ class TestExecuteBlueGreenSwitchWithAuthorities:
             "UoW 回滚后 approval consumed_at 必须为 NULL(尽管 approval CAS 已执行)"
 
         # operation phase 仍为 await_approval
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "await_approval"
 
         # nonce 仍为 reserved(未消费)
@@ -977,7 +995,7 @@ class TestBackwardCompatNoAuthorities:
             operation_id, approval_id, mfa_receipt_id
         )
         uuid.UUID(switch_version)
-        op = orch.get_operation(operation_id)
+        op = await orch.get_operation(operation_id)
         assert op.phase.value == "completed"
 
     @pytest.mark.asyncio

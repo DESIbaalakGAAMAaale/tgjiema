@@ -227,6 +227,7 @@
     "restore.nonce.payload_mismatch": "Restore nonce payload mismatch; retrying with a different payload_digest is forbidden (operation_id={operation_id}, backup_id={backup_id}, reason={reason})",
     "restore.phase.transition_invalid": "Restore state machine phase transition is invalid; operation rejected (operation_id={operation_id}, phase_from={phase_from}, phase_to={phase_to}, reason={reason})",
     "restore.legacy_writer.sealed": "Legacy direct restore writer is capability-sealed; production entry must route through RestoreOrchestrator blue-green switch (caller={caller}, reason={reason})",
+    "restore.orchestrator.required_dependency_missing": "RestoreOrchestrator required dependency is missing; production must not degrade to skeleton path (reason={reason}, missing={missing})",
     "high_risk.action.unregistered": "Unknown destructive action is not registered in HIGH_RISK_POLICY; execution rejected to prevent bypassing approval/MFA/two-person gate (action={action}, reason={reason})",
     "notification.outbox.write_failed": "Notification outbox write failed, transaction rolled back (user_id={user_id}, type={notif_type})",
     "notification.outbox.duplicate": "Duplicate notification delivery (dedup_key conflict, user_id={user_id}, dedup_key={dedup_key})",

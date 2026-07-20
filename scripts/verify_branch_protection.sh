@@ -27,9 +27,9 @@ set -euo pipefail
 # R65 P1-09: 新增 crdb-ru-72h-attribution-gate 作为 required context。
 # R65 P0-04: 新增 production-promotion-gate(release tag 严格门禁)。
 WORKFLOW_JOBS=(
-  "CI|test (3.10),test (3.11),test (3.12),lint,repo-hygiene,i18n-check,static-gates,security,fault-injection,migration-dry-run"
+  "CI|test (3.10),test (3.11),test (3.12),lint,repo-hygiene,i18n-check,static-gates,security,fault-injection,migration-dry-run,skip-inventory"
   "Deploy Check|verify-deploy"
-  "Release Gates|docker-build,docker-digest-verify,compose-config,redis-acl-matrix,schema-diff,restore-legacy-seal-gate,i18n-strict-export-boundary-gate,migration-manifest-gate,backup-restore-drill,sbom,pip-audit,trivy,sign-image,verify-branch-protection,rc-continuity,crdb-ru-72h-attribution-gate,publish-attestation,production-promotion-gate,release-summary"
+  "Release Gates|docker-build,docker-digest-verify,compose-config,redis-acl-matrix,schema-diff,restore-legacy-seal-gate,i18n-strict-export-boundary-gate,migration-manifest-gate,migration-binding-gate,backup-restore-drill,sbom,pip-audit,trivy,sign-image,verify-branch-protection,rc-continuity,crdb-ru-72h-attribution-gate,publish-attestation,attestation-semantics-verify,tag-ruleset-verify,production-promotion-gate,release-summary"
   "E2E Tests|playwright-e2e"
 )
 

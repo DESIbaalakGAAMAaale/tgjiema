@@ -142,13 +142,18 @@ if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
   echo ""
 fi
 
-# 3.5 R64 P0-01 / P1-11 软警告:Release Gates 14 个 job + CI / repo-hygiene 覆盖
-# Release Gates workflow 实际 job 名必须与 release-gates.yml 完全一致(14 个 job):
+# 3.5 R64 P0-01 / P1-11 软警告:Release Gates 17 个 job + CI / repo-hygiene 覆盖
+# Release Gates workflow 实际 job 名必须与 release-gates.yml 完全一致(17 个 job,
+# R66 P1-10 新增 attestation-semantics-verify,R66 P1-11 新增 tag-ruleset-verify,
+# R66 P1-02 新增 migration-binding-gate):
 #   docker-build / docker-digest-verify / compose-config / redis-acl-matrix / schema-diff /
 #   backup-restore-drill / sbom / pip-audit / trivy / sign-image / verify-branch-protection /
-#   rc-continuity / publish-attestation / release-summary
-# CI workflow 必须包含 repo-hygiene(R64 P1-11 required context)。
-# 注意:sign-image / publish-attestation / release-summary 仅在 push 到 master/main 时运行,
+#   rc-continuity / publish-attestation / attestation-semantics-verify / tag-ruleset-verify /
+#   migration-binding-gate / release-summary
+# CI workflow 必须包含 repo-hygiene + skip-inventory(R64 P1-11 / R66 P1-09 required context)。
+# 注意:sign-image / publish-attestation / attestation-semantics-verify / migration-binding-gate /
+#       tag-ruleset-verify / release-summary
+#      仅在 push 到 master/main 或 release tag 时运行,
 #      PR 场景或未触发过的 master 上可能缺失,属正常情况(soft WARN)。
 EXPECTED_RG_JOBS=(
   "docker-build"
@@ -164,6 +169,9 @@ EXPECTED_RG_JOBS=(
   "verify-branch-protection"
   "rc-continuity"
   "publish-attestation"
+  "attestation-semantics-verify"
+  "tag-ruleset-verify"
+  "migration-binding-gate"
   "release-summary"
 )
 MISSING_RG_JOBS=()
@@ -179,7 +187,7 @@ if [ "${#MISSING_RG_JOBS[@]}" -gt 0 ]; then
   for c in "${MISSING_RG_JOBS[@]}"; do
     echo "  - $c"
   done
-  echo "  这可能导致对应 job 的失败无法阻断合并(R64 P0-01/P1-11 要求 14 个 job 全覆盖)。"
+  echo "  这可能导致对应 job 的失败无法阻断合并(R64 P0-01/P1-11 + R66 P1-02/P1-10/P1-11 要求 17 个 job 全覆盖)。"
   echo "  若为有意为之(如 PR 场景配置子集),可忽略本警告。"
   echo ""
 fi

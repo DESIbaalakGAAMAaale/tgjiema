@@ -1,39 +1,37 @@
 #!/usr/bin/env python3
-"""R63 P0-04: 构建阶段自动生成 canonical migration manifest。
+"""R66 P0-01: migration catalog sha256 重算工具(catalog-only 模型)。
 
-终审报告 P0-04 根治逻辑:
-    "构建阶段根据当前 HEAD/Tree 自动生成 canonical manifest,禁止手工旧 SHA。"
+R66 P0-01 根治逻辑:
+    旧版 generate_migration_manifest.py 重生 ``release_commit`` / ``tree_sha``
+    字段以绑定当前 HEAD/Tree —— 但 catalog 本身被提交到 Git,任何 commit 都使
+    catalog 自身的 tree_sha 失效,形成"自引用循环"且不存在稳态。
 
-本脚本在 CI 构建阶段(运行测试之前)执行,根据当前 git HEAD/Tree 重新生成
-``database/migrations/migration-manifest.json`` 的 ``release_commit`` /
-``tree_sha`` 字段,并重算每个 migration 文件的 sha256。
+    R66 P0-01 整改后:
+      - Git 中 ``migration-manifest.json`` 只是 **catalog**(migration 集合 +
+        顺序 + sha256 + DDL version + rollback strategy),不再绑定 commit/tree。
+      - HEAD/Tree 绑定由 CI artifact ``release-artifacts/release-manifest.json``
+        承担(不提交到 Git),绑定 source_commit + source_tree + catalog digest +
+        image_digest(via OCI attestation)。
+      - 本脚本只重算每个 migration 文件的 sha256(因 SQL 文件内容可能变化),
+        不再写 release_commit / tree_sha 字段。
 
 设计要点:
-  - manifest 是 release artifact,必须绑定到具体的 commit + tree
-  - 禁止手工维护旧 SHA — 任何 commit 都会使旧 manifest 失效
-  - CI 在运行测试前调用本脚本,确保 manifest 与当前 HEAD 严格绑定
-  - 本地开发时也可手动运行 ``python scripts/generate_migration_manifest.py``
-    以更新 manifest(运行测试前)
-
-保留字段(不重生成):
-  - version, tool_version, description, verification
-  - 每个 migration 的 order, version, predecessor,
+  - catalog 只描述"migration 集合 + 每个文件的 sha256",不描述"当前 release"
+  - 任何 commit 都不会使 catalog 失效(只要 SQL 文件内容未变)
+  - 保留字段:version, tool_version, description, verification
+  - 保留每个 migration 的:order, migration_id, version, filename, predecessor,
+    predecessor_filename, ddl_version, rollback_strategy,
     schema_fingerprint_before, schema_fingerprint_after, *_note
-
-重生成字段:
-  - release_commit  → git rev-parse HEAD
-  - tree_sha        → git rev-parse HEAD^{tree}
-  - migrations[*].sha256 → 重新计算磁盘文件 sha256
+  - 重生成字段:migrations[*].sha256 → 重新计算磁盘文件 sha256
 
 退出码:
   0 — 成功
-  1 — 失败(git 不可用 / manifest 不存在 / 解析失败 / 写入失败)
+  1 — 失败(manifest 不存在 / 解析失败 / 写入失败)
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -42,68 +40,42 @@ MANIFEST_PATH = REPO_ROOT / "database" / "migrations" / "migration-manifest.json
 MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
 
 
-def _git_rev_parse(rev: str) -> str:
-    """执行 git rev-parse,失败则 raise。"""
-    result = subprocess.run(
-        ["git", "rev-parse", rev],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"git rev-parse {rev} 失败 (exit={result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
-    sha = result.stdout.strip()
-    if len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha.lower()):
-        raise RuntimeError(f"git rev-parse {rev} 返回非法 SHA: {sha!r}")
-    return sha
-
-
 def _file_sha256(path: Path) -> str:
     """计算文件内容的 sha256(十六进制小写)。"""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def regenerate_manifest(verbose: bool = True) -> None:
-    """重新生成 manifest 的 release_commit / tree_sha / 各 migration sha256。
+    """重算每个 migration 的 sha256(catalog-only,不写 release_commit/tree_sha)。
+
+    R66 P0-01: 移除 release_commit / tree_sha 字段生成逻辑。
+    若 manifest 仍包含旧字段,本函数会将其删除(向后兼容迁移)。
 
     Args:
         verbose: 是否打印详细日志
     """
     if not MANIFEST_PATH.exists():
-        raise RuntimeError(f"migration manifest 不存在: {MANIFEST_PATH}")
+        raise RuntimeError(f"migration catalog 不存在: {MANIFEST_PATH}")
 
-    # 1. 获取当前 HEAD / Tree SHA
-    head_sha = _git_rev_parse("HEAD")
-    tree_sha = _git_rev_parse("HEAD^{tree}")
-    if verbose:
-        print(f"[generate_manifest] HEAD   = {head_sha}")
-        print(f"[generate_manifest] Tree   = {tree_sha}")
-
-    # 2. 加载现有 manifest(保留结构)
+    # 1. 加载现有 catalog(保留结构)
     data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
-        raise RuntimeError("manifest 顶层不是 JSON object")
+        raise RuntimeError("catalog 顶层不是 JSON object")
     migrations = data.get("migrations", [])
     if not isinstance(migrations, list):
-        raise RuntimeError("manifest 'migrations' 字段不是 list")
+        raise RuntimeError("catalog 'migrations' 字段不是 list")
 
-    # 3. 更新 release_commit / tree_sha
-    old_commit = data.get("release_commit", "")
-    old_tree = data.get("tree_sha", "")
-    data["release_commit"] = head_sha
-    data["tree_sha"] = tree_sha
-    if verbose and old_commit != head_sha:
-        print(f"[generate_manifest] release_commit: {old_commit[:12]}... → {head_sha[:12]}...")
-    if verbose and old_tree != tree_sha:
-        print(f"[generate_manifest] tree_sha:        {old_tree[:12]}... → {tree_sha[:12]}...")
+    # 2. R66 P0-01: 移除 release_commit / tree_sha 字段(若残留)
+    removed_fields = []
+    for field in ("release_commit", "tree_sha"):
+        if field in data:
+            old_val = data.pop(field)
+            removed_fields.append((field, old_val))
+            if verbose:
+                print(f"[generate_manifest] R66 P0-01: 移除自引用字段 {field} (旧值: {str(old_val)[:12]}...)")
 
-    # 4. 重算每个 migration 的 sha256(按 manifest 中已有顺序)
-    #    同时校验 manifest 集合 == 磁盘集合(R63 P0-04: 不允许漏项/多项)
+    # 3. 重算每个 migration 的 sha256(按 catalog 中已有顺序)
+    #    同时校验 catalog 集合 == 磁盘集合(不允许漏项/多项)
     manifest_versions = [str(e.get("version", "")) for e in migrations]
     disk_files = sorted(MIGRATIONS_DIR.glob("*.sql")) if MIGRATIONS_DIR.exists() else []
     disk_versions = {f.name for f in disk_files}
@@ -113,11 +85,11 @@ def regenerate_manifest(verbose: bool = True) -> None:
     missing_on_disk = manifest_set - disk_versions
     if missing_in_manifest:
         raise RuntimeError(
-            f"磁盘存在但 manifest 未列出的 migration: {sorted(missing_in_manifest)}"
+            f"磁盘存在但 catalog 未列出的 migration: {sorted(missing_in_manifest)}"
         )
     if missing_on_disk:
         raise RuntimeError(
-            f"manifest 列出但磁盘不存在的 migration: {sorted(missing_on_disk)}"
+            f"catalog 列出但磁盘不存在的 migration: {sorted(missing_on_disk)}"
         )
 
     # 构建 {version: Path} 映射
@@ -135,14 +107,18 @@ def regenerate_manifest(verbose: bool = True) -> None:
         if verbose and old_sha != new_sha:
             print(f"[generate_manifest] {version} sha256: {old_sha[:12]}... → {new_sha[:12]}...")
 
-    # 5. 写回 manifest(保持 2-space 缩进,ensure_ascii=False 以保留中文)
+    # 4. 写回 catalog(保持 2-space 缩进,ensure_ascii=False 以保留中文)
     MANIFEST_PATH.write_text(
         json.dumps(data, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     if verbose:
-        print(f"[generate_manifest] manifest 已重写: {MANIFEST_PATH}")
+        print(f"[generate_manifest] catalog 已重写: {MANIFEST_PATH}")
         print(f"[generate_manifest] migrations: {len(migrations)} 个")
+        if removed_fields:
+            print(f"[generate_manifest] R66 P0-01: 已移除自引用字段 {[f for f, _ in removed_fields]}")
+        else:
+            print("[generate_manifest] R66 P0-01: catalog 已是 catalog-only 模型(无 release_commit/tree_sha)")
         print("[generate_manifest] DONE")
 
 

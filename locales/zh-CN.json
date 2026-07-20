@@ -227,6 +227,7 @@
     "restore.nonce.payload_mismatch": "恢复 nonce payload 不一致,禁止换 payload_digest 重试(operation_id={operation_id}, backup_id={backup_id}, reason={reason})",
     "restore.phase.transition_invalid": "恢复状态机 phase 转换非法,拒绝操作(operation_id={operation_id}, phase_from={phase_from}, phase_to={phase_to}, reason={reason})",
     "restore.legacy_writer.sealed": "旧直接 restore 写入器已被 capability-seal,生产入口必须通过 RestoreOrchestrator 蓝绿切换路径(caller={caller}, reason={reason})",
+    "restore.orchestrator.required_dependency_missing": "恢复编排器必需依赖缺失,生产环境禁止降级到骨架路径(原因={reason}, 缺失={missing})",
     "high_risk.action.unregistered": "未知 destructive action 未在 HIGH_RISK_POLICY 中注册,拒绝执行以防绕过审批/MFA/双人审批门禁(action={action}, reason={reason})",
     "notification.outbox.write_failed": "通知投递 outbox 写入失败,事务已回滚(user_id={user_id}, type={notif_type})",
     "notification.outbox.duplicate": "通知投递重复(dedup_key 冲突,user_id={user_id}, dedup_key={dedup_key})",

@@ -1,0 +1,60 @@
+{
+  "description": "R66 P1-09: skip inventory baseline — 当前允许的 skip 类别与策略",
+  "last_updated": "2026-07-20",
+  "policy": "All skips must have owner + due_date. Critical path skips (production_impact=high) must have remediation plan.",
+  "categories": [
+    "telethon_dependency",
+    "crdb_dependency",
+    "dependency_missing",
+    "temporarily_disabled",
+    "historical_legacy",
+    "uncategorized"
+  ],
+  "allowed_no_due_date_categories": [
+    "dependency_missing"
+  ],
+  "category_descriptions": {
+    "telethon_dependency": "Telegram 主链相关 skip(Telethon / telegram 依赖)。R66 P1-09 严格要求此类 skip 不得归为无关历史问题,必须有 owner + due_date + remediation plan。",
+    "crdb_dependency": "CockroachDB / CRDB 依赖相关 skip。涉及数据库主链,必须有 owner + due_date。",
+    "dependency_missing": "其它可选依赖缺失(aiosqlite / asyncpg / pyotp / cryptography 等)。允许无固定到期日(allowed_no_due_date_categories),但必须有 owner。",
+    "temporarily_disabled": "临时禁用(含 TODO / FIXME / disabled 标记)。必须跟进,必须有 owner + due_date。",
+    "historical_legacy": "历史遗留 / legacy / deprecated / abandoned。需要明确退役计划或恢复计划,必须有 owner + due_date。",
+    "uncategorized": "未分类。需要人工 review 后归类,不应长期保持 uncategorized。"
+  },
+  "production_impact_levels": {
+    "high": "关键路径:bots/ / services/restore* / services/backup* / services/db_backup / services/db_restore / services/command_bus / services/approval* / services/mfa* / database/migrate / scripts/check_* / .github/workflows*",
+    "medium": "services/ 或 database/ 下其它路径",
+    "low": "其它路径(utils/ / config/ / docs/ 等)"
+  },
+  "owner_routing": {
+    "bots/": "bot-team",
+    "services/restore*": "restore-team",
+    "services/backup*": "backup-team",
+    "services/db_restore": "restore-team",
+    "services/command_bus": "commandbus-team",
+    "services/approval*": "approval-team",
+    "services/mfa*": "mfa-team",
+    "database/migrate": "db-team",
+    "database/": "db-team",
+    "admin/mfa*": "mfa-team",
+    "admin/passwords": "auth-team",
+    "admin/sessions": "auth-team",
+    "admin/": "admin-team",
+    "scripts/check_*": "platform-team",
+    ".github/workflows*": "platform-team",
+    "其它": "unassigned"
+  },
+  "r66_p1_09_requirement": {
+    "source": "R66 终审报告 P1-09",
+    "requirement": "自审报告称全量 6037 passed, 142 skipped,并排除 Telethon 依赖测试。上线前必须生成 skip inventory:原因、owner、到期日、生产影响。涉及 Telegram 主链、恢复、密钥、部署的 skip 不得归为无关历史问题。",
+    "category_priority_order": [
+      "telethon_dependency",
+      "crdb_dependency",
+      "temporarily_disabled",
+      "historical_legacy",
+      "dependency_missing",
+      "uncategorized"
+    ],
+    "note": "telethon_dependency 优先级最高,确保 Telegram 主链 skip 即便 reason 含 'legacy' 字样也归为 telethon_dependency,不被误判为无关历史问题。"
+  }
+}

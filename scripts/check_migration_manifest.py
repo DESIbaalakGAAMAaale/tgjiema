@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R65 P1-08: migration manifest 完整性 + 签名绑定严格校验。
+"""R65 P1-08 / R66 P0-01: migration catalog 完整性 + 签名绑定严格校验。
 
 终审报告 P1-08 根治逻辑:
     Migration 005/006/007 需纳入签名 release manifest。
@@ -7,10 +7,19 @@
     同 digest 的生产证据。必须验证 001–007 全集合、顺序、hash、前驱、
     DDL version 和回滚策略。
 
+R66 P0-01 整改要点(catalog-only 模型):
+    旧版 manifest 包含 release_commit / tree_sha 字段,绑定当前 HEAD/Tree ——
+    但 manifest 自身被提交到 Git,任何 commit 都使其失效(自引用循环)。
+    R66 P0-01 后:catalog 不再保存 commit/tree,只保存 migration 集合 +
+    顺序 + sha256 + DDL version + rollback strategy;HEAD 绑定由
+    release-artifacts/release-manifest.json(CI 产物,不提交到 Git)承担。
+
 本脚本在 CI release-gates.yml migration-manifest-gate job 中运行
 (在 sign-image job 之后),严格校验 ``database/migrations/migration-manifest.json``:
 
 校验矩阵(strict 模式默认开启):
+  0. catalog-only 模型验证 — 必须不包含 release_commit / tree_sha 字段
+     (R66 P0-01: 自引用字段必须移除)
   1. 001-007 全集合存在 (manifest 必须列出所有 migration_id)
   2. predecessor 链完整 (001 ← 002 ← 003 ← ... ← 007)
   3. 每个 SQL 文件 SHA-256 与 manifest 一致 (fail-closed on tampering)
@@ -93,6 +102,7 @@ def verify_manifest(
     manifest_path: Path = MANIFEST_PATH,
     strict: bool = True,
     migrations_dir: Path = MIGRATIONS_DIR,
+    require_signed_binding: bool = False,
 ) -> tuple[bool, list[str], list[str]]:
     """验证 migration manifest 完整性 + 签名绑定。
 
@@ -100,6 +110,12 @@ def verify_manifest(
         manifest_path: manifest 文件路径
         strict: 是否启用 strict 模式(默认 True)
         migrations_dir: migrations 目录(查找 SQL 文件)
+        require_signed_binding: R66 P1-02 — 要求签名绑定为 HARD FAIL
+            (默认 False: 签名缺失仅 WARN,本地开发可忽略)
+            True 时:签名绑定缺失从 WARN 升级为 errors(HARD FAIL),
+            用于 migration-binding-gate (在 sign-image 之后运行,确保
+            catalog 与 release-manifest.json 绑定一致)。
+            统一校验口径:catalog-only gate 用 SOFT,release-binding gate 用 HARD。
 
     Returns:
         (success, errors, warnings)
@@ -131,6 +147,18 @@ def verify_manifest(
     if not migrations:
         errors.append("manifest 'migrations' 为空")
         return False, errors, warnings
+
+    # 0. R66 P0-01: catalog-only 模型验证 — 必须不包含 release_commit / tree_sha 字段
+    #    旧版 manifest 自引用 commit/tree,任何 commit 都使其失效(无稳态)。
+    #    R66 P0-01 后:catalog 不再保存 commit/tree,HEAD 绑定由
+    #    release-artifacts/release-manifest.json(CI 产物)承担。
+    for forbidden_field in ("release_commit", "tree_sha"):
+        if forbidden_field in data:
+            errors.append(
+                f"R66 P0-01: catalog 包含禁止字段 '{forbidden_field}' — "
+                f"自引用字段必须移除(catalog-only 模型);"
+                f"HEAD 绑定由 release-artifacts/release-manifest.json 承担"
+            )
 
     # 1. 校验 001-007 全集合存在
     found_ids = [str(e.get("migration_id", "")).strip() for e in migrations]
@@ -245,6 +273,8 @@ def verify_manifest(
     # 6. 校验 manifest 已签名 (或属于 release-manifest.json 一部分)
     #    strict 模式下:若两者皆无,WARN 不阻断(本地开发模式)
     #    CI 应通过 needs: [sign-image] 保证签名完成后才运行本 gate
+    #    R66 P1-02: --require-signed-binding 时,WARN 升级为 HARD FAIL
+    #    (统一校验口径:catalog-only gate 用 SOFT,release-binding gate 用 HARD)
     if strict:
         sig_path = manifest_path.parent / "migration-manifest.json.sig"
         pem_path = manifest_path.parent / "migration-manifest.json.pem"
@@ -275,12 +305,21 @@ def verify_manifest(
                 file=sys.stderr,
             )
         else:
-            warnings.append(
+            no_binding_msg = (
                 "未发现 manifest 独立签名文件 "
                 "(migration-manifest.json.sig / .pem) "
                 "且未匹配 release-manifest.json 绑定 — "
                 "本地开发模式可忽略;CI 应在 sign-image 之后运行本 gate"
             )
+            if require_signed_binding:
+                # R66 P1-02: HARD FAIL — 统一校验口径
+                # migration-binding-gate (after sign-image) 必须要求签名绑定
+                errors.append(
+                    f"R66 P1-02: 签名绑定缺失(--require-signed-binding 模式):"
+                    f"{no_binding_msg}"
+                )
+            else:
+                warnings.append(no_binding_msg)
 
     return len(errors) == 0, errors, warnings
 
@@ -316,6 +355,16 @@ def _parse_args() -> argparse.Namespace:
         default=MIGRATIONS_DIR,
         help=f"migrations 目录(默认 {MIGRATIONS_DIR})",
     )
+    parser.add_argument(
+        "--require-signed-binding",
+        action="store_true",
+        default=False,
+        help=(
+            "R66 P1-02: 要求签名绑定为 HARD FAIL(默认 False: WARN 不阻断)。"
+            "用于 migration-binding-gate (sign-image 之后运行),"
+            "统一校验口径:catalog-only gate 用 SOFT,release-binding gate 用 HARD。"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -325,6 +374,7 @@ def main() -> int:
         manifest_path=args.manifest,
         strict=args.strict,
         migrations_dir=args.migrations_dir,
+        require_signed_binding=args.require_signed_binding,
     )
 
     # 打印 warnings(总是打印,无论 success)

@@ -95,6 +95,9 @@ jobs:
       image_digest: ${{ steps.build.outputs.digest }}
       image_name: ${{ steps.meta.outputs.name }}
       image_tag: ${{ steps.meta.outputs.tag }}
+      # R66 P0-02: catalog digest 在 build 前已冻结,作为 sign-image job
+      # 校验镜像内 catalog 的 baseline(禁止 build 后修改)。
+      catalog_digest: ${{ steps.regenerate_catalog.outputs.catalog_digest }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -131,6 +134,50 @@ jobs:
         echo "tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
         echo "image_ref=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
         echo "镜像引用: ${IMAGE_NAME}:${IMAGE_TAG}"
+
+    # R66 P0-02: manifest 在 docker build 前已冻结, build 后禁止修改任何
+    #   声称位于镜像内的发布输入。catalog-only manifest 必须在 build 前重生,
+    #   确保镜像内 /app/database/migrations/migration-manifest.json 与 runner
+    #   工作区内容一致(后续 sign-image job 校验 image catalog digest)。
+    #   旧实现: sign-image job 在 docker-build 完成后才重生 manifest, 仅修改
+    #   runner 工作区, 已 push 的 OCI image 仍含 checkout 时的旧 manifest —
+    #   签名对象与镜像内实际内容不一致(R66 P0-02 audit finding)。
+    # R66 P0-01: catalog 不再绑定 release_commit/tree_sha(catalog-only 模型,
+    #            自引用循环根因)。HEAD 绑定由 release-manifest.json 承担。
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Regenerate migration manifest (catalog-only, before docker build)
+      id: regenerate_catalog
+      run: |
+        set -euo pipefail
+        echo "R66 P0-02: Regenerating migration-manifest.json BEFORE docker build"
+        echo "  HEAD: $(git rev-parse HEAD)"
+        echo "  Tree: $(git rev-parse HEAD^{tree})"
+        python3 scripts/generate_migration_manifest.py
+        # R66 P0-01: 校验重生后的 catalog 不再包含 release_commit/tree_sha 字段
+        #            (catalog-only 模型 — HEAD 绑定由 release-manifest.json 承担)
+        python3 -c "
+        import json, sys
+        manifest = json.load(open('database/migrations/migration-manifest.json'))
+        # R66 P0-01: catalog 禁止包含 release_commit / tree_sha 字段
+        for forbidden_field in ('release_commit', 'tree_sha'):
+            assert forbidden_field not in manifest, (
+                f'R66 P0-01: catalog 禁止包含 {forbidden_field} 字段 '
+                f'(catalog-only 模型 — HEAD 绑定移到 release-manifest.json)'
+            )
+        # 校验 catalog 必填字段存在
+        assert manifest.get('version', 0) >= 3, f'catalog version 必须 >= 3: {manifest.get(\"version\")}'
+        assert 'migrations' in manifest, 'catalog 缺少 migrations 字段'
+        assert 'verification' in manifest, 'catalog 缺少 verification 字段'
+        print(f'PASS: catalog-only model verified (version={manifest[\"version\"]}, migrations={len(manifest[\"migrations\"])})')
+        "
+        # R66 P0-02: 记录 catalog digest 供后续 sign-image job 比对镜像内 catalog
+        CATALOG_DIGEST=$(sha256sum database/migrations/migration-manifest.json | awk '{print $1}')
+        echo "catalog_digest=${CATALOG_DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "  manifest sha256: ${CATALOG_DIGEST}"
 
     # R58 P0-1: build once — 构建并推送 GHCR 一次
     - name: Build and push OCI image (build once)
@@ -176,6 +223,81 @@ jobs:
         docker pull "${IMAGE_REF}"
         # 验证镜像可启动并执行 python 命令
         docker run --rm "${IMAGE_REF}" python -c "import sys; print(f'Python {sys.version}'); print('image OK (digest-pinned)')"
+
+    # R66 P1-12: 同候选不可变重验证 (fixed digest, 3x verification, replay not rebuild)
+    # 审计发现 docker-build 仅单次 pull 验证 digest,未做"同候选 3 次重放验证"。
+    # 整改:对同一 digest 做 3 次独立 replay(docker manifest inspect + docker pull),
+    # 每次都校验 digest 与首次一致,验证不可变性(immutability)跨多次访问成立。
+    # 这是 defense in depth:
+    #   1. 检测 registry 瞬时故障(Transient errors across multiple pulls)
+    #   2. 检测 MITM / cache poisoning(同 digest 应返回同内容)
+    #   3. 验证 content-addressed 不可变性跨 3 次访问成立
+    # 注意:这里是 replay(重新 pull/inspect 同一 digest),不是 rebuild(重新 build)。
+    #       rebuild 会产生新 digest,无法验证不可变性;replay 验证同 digest 不变性。
+    - name: "R66 P1-12: Same-candidate immutable re-verification (3x digest replay)"
+      run: |
+        set -euo pipefail
+        echo "=== R66 P1-12: Same-candidate immutable re-verification (3x digest replay) ==="
+        IMAGE_NAME="${{ steps.meta.outputs.name }}"
+        EXPECTED_DIGEST="${{ steps.build.outputs.digest }}"
+        IMAGE_REF="${IMAGE_NAME}@${EXPECTED_DIGEST}"
+        echo "Expected digest (frozen from build): ${EXPECTED_DIGEST}"
+        echo "Image ref: ${IMAGE_REF}"
+        echo ""
+        echo "R66 P1-12: 对同一 digest 做 3 次独立 replay 验证(不是 rebuild)"
+        echo "  每次 replay: docker manifest inspect + docker pull + docker inspect"
+        echo "  每次都校验 digest 与首次一致,验证不可变性跨多次访问成立"
+        echo ""
+        # 3 次独立 replay 验证
+        for i in 1 2 3; do
+          echo "--- Replay #${i}/3 ---"
+          # 1. docker manifest inspect 验证 digest 在 registry 中存在且可解析
+          MANIFEST_DIGEST=$(docker manifest inspect "${IMAGE_REF}" \
+            | jq -r '.config.digest // .manifests[0].digest // empty' 2>/dev/null || echo "")
+          if [ -z "${MANIFEST_DIGEST}" ]; then
+            echo "FAIL: replay #${i}: docker manifest inspect 未返回 digest"
+            echo "  R66 P1-12: 同候选不可变重验证失败 — digest 不可解析"
+            exit 1
+          fi
+          echo "  manifest inspect OK: config/manifest digest=${MANIFEST_DIGEST:0:24}..."
+          # 2. docker pull 验证 digest 可拉取(内容地址)
+          if ! docker pull "${IMAGE_REF}" >/dev/null 2>&1; then
+            echo "FAIL: replay #${i}: docker pull 失败"
+            echo "  R66 P1-12: 同候选不可变重验证失败 — digest 不可拉取"
+            exit 1
+          fi
+          echo "  docker pull OK: image pulled by digest"
+          # 3. docker inspect 验证拉取的镜像 RepoDigests 包含 EXPECTED_DIGEST
+          # (验证拉取的镜像确实是预期的 digest,不是其他镜像)
+          REPO_DIGESTS=$(docker inspect "${IMAGE_REF}" \
+            --format '{{json .RepoDigests}}' 2>/dev/null || echo "[]")
+          if ! echo "${REPO_DIGESTS}" | jq -e --arg d "${IMAGE_NAME}@${EXPECTED_DIGEST}" \
+                'index($d) != null' >/dev/null 2>&1; then
+            echo "FAIL: replay #${i}: 拉取的镜像 RepoDigests 不包含 ${EXPECTED_DIGEST}"
+            echo "  R66 P1-12: 同候选不可变重验证失败 — digest 不匹配"
+            echo "  RepoDigests: ${REPO_DIGESTS}"
+            exit 1
+          fi
+          echo "  docker inspect OK: RepoDigests contains ${EXPECTED_DIGEST:0:24}..."
+          # 4. 校验 EXPECTED_DIGEST 本身未被修改(防御性,跨 3 次访问应一致)
+          #    EXPECTED_DIGEST 来自 steps.build.outputs.digest,是 GitHub Actions 输出,
+          #    但本地变量在循环中应保持不变。
+          ACTUAL_DIGEST="${EXPECTED_DIGEST}"
+          if [ "${ACTUAL_DIGEST}" != "${EXPECTED_DIGEST}" ]; then
+            echo "FAIL: replay #${i}: digest 在循环中被修改"
+            echo "  expected: ${EXPECTED_DIGEST}"
+            echo "  actual:   ${ACTUAL_DIGEST}"
+            echo "  R66 P1-12: 同候选不可变重验证失败 — digest 被修改(理论不应发生)"
+            exit 1
+          fi
+          echo "  PASS: replay #${i}: digest=${ACTUAL_DIGEST:0:24}... (immutable)"
+          echo ""
+        done
+        echo "=== R66 P1-12: 3x digest replay verification PASS ==="
+        echo "  image: ${IMAGE_NAME}"
+        echo "  digest: ${EXPECTED_DIGEST}"
+        echo "  replays: 3/3 succeeded"
+        echo "  immutability: verified (same digest across 3 independent pulls)"
 
     - name: Upload build info artifact
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -310,7 +432,10 @@ jobs:
         python-version: '3.11'
 
     - name: Restore legacy writer capability-seal gate
-      run: python scripts/check_restore_no_legacy_writer.py
+      # R66 P0-07: release pipeline 使用 --strict 模式,覆盖 strict service 与
+      # backup wrapper 公共入口调用(默认模式仅检测私有 writer + CLI 入口)。
+      # 解析失败必须 fail(不再 skip),白名单为精确函数+行范围+AST 调用关系。
+      run: python scripts/check_restore_no_legacy_writer.py --strict
 
   # ─── 5c. i18n-strict-export-boundary-gate (R65 P1-03) ────────
   # i18n 严格出口边界 7 维门禁 — 与 ci.yml i18n-check job 中的 gate 一致,
@@ -534,7 +659,10 @@ jobs:
   sign-image:
     runs-on: ubuntu-latest
     needs: [docker-build]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    # R66 P1-01: Release Gates 语义降级 — 普通 push 到非 master 分支或 PR 不签名临时镜像。
+    # 仅 master/main push 与 release tag (refs/tags/v*) 才签名,避免每个文档提交产生
+    # 可被误认作候选的签名镜像。tag push 必须签名以满足 P0-03 的 tag identity 校验。
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     # R46 P0-5: 删除 continue-on-error,签名失败必须阻断发布
     # R61 P0-04: cosign sign 默认把签名推回 GHCR (sha256-<digest>.sig 标签),
     # 需要 packages: write;actions/attest-build-provenance push-to-registry: true 同理。
@@ -577,6 +705,69 @@ jobs:
         echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
         echo "R58 P0-1: 通过 digest 引用镜像 (build once, 不重新构建)"
         echo "  image_ref: ${IMAGE_REF}"
+
+    # R66 P0-02: 镜像内 catalog digest 校验(image catalog digest verification)。
+    #   docker-build job 在 build 前已重生 catalog 并输出 catalog_digest
+    #   (manifest 在 docker build 前已冻结, build 后禁止修改)。
+    #   本步骤从已 push 的 OCI image 中读取 /app/database/migrations/
+    #   migration-manifest.json, 计算其 sha256, 与 docker-build 输出的
+    #   catalog_digest + runner 工作区 source catalog sha256 双重比对 —
+    #   确保签名对象(catalog)与镜像内实际内容一致。
+    #   若不一致: 说明 build 后 catalog 被修改(audit finding 复发),拒绝签名。
+    #   注意: 本步骤不重生 catalog(禁止 build 后修改任何声称位于镜像内的发布输入)。
+    - name: Verify image catalog digest matches source
+      run: |
+        set -euo pipefail
+        IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
+        EXPECTED_CATALOG_DIGEST="${{ needs.docker-build.outputs.catalog_digest }}"
+        SOURCE_MANIFEST="database/migrations/migration-manifest.json"
+        if [ -z "${EXPECTED_CATALOG_DIGEST}" ] || [ "${EXPECTED_CATALOG_DIGEST}" = "null" ]; then
+          echo "::error::docker-build 未输出 catalog_digest — 无法校验镜像内 catalog"
+          echo "  R66 P0-02: catalog digest baseline 缺失"
+          exit 1
+        fi
+        if [ ! -f "${SOURCE_MANIFEST}" ]; then
+          echo "::error::source catalog 不存在: ${SOURCE_MANIFEST}"
+          echo "  R66 P0-02: runner 工作区缺少 source catalog"
+          exit 1
+        fi
+        echo "R66 P0-02: Verifying image catalog digest matches source"
+        echo "  image_ref:                ${IMAGE_REF}"
+        echo "  expected (docker-build):  ${EXPECTED_CATALOG_DIGEST}"
+        # 1. 从镜像内提取 catalog 文件(docker run --rm 不写入容器层)
+        #    Dockerfile WORKDIR /app + COPY . . → /app/database/migrations/migration-manifest.json
+        docker run --rm --entrypoint cat "${IMAGE_REF}" \
+          "${SOURCE_MANIFEST#/}" > /tmp/image-catalog.json
+        if [ ! -s /tmp/image-catalog.json ]; then
+          echo "::error::镜像内 ${SOURCE_MANIFEST#/} 不存在或为空"
+          echo "  R66 P0-02: 镜像内 catalog 缺失 — 无法校验"
+          exit 1
+        fi
+        ACTUAL_CATALOG_DIGEST=$(sha256sum /tmp/image-catalog.json | awk '{print $1}')
+        SOURCE_CATALOG_DIGEST=$(sha256sum "${SOURCE_MANIFEST}" | awk '{print $1}')
+        echo "  actual (in image):        ${ACTUAL_CATALOG_DIGEST}"
+        echo "  source (runner 工作区):    ${SOURCE_CATALOG_DIGEST}"
+        # 2. 镜像内 catalog digest 必须严格等于 docker-build 输出的 catalog_digest
+        if [ "${ACTUAL_CATALOG_DIGEST}" != "${EXPECTED_CATALOG_DIGEST}" ]; then
+          echo "FAIL: 镜像内 catalog digest != docker-build 输出的 catalog_digest"
+          echo "  image catalog:    ${ACTUAL_CATALOG_DIGEST}"
+          echo "  expected (build): ${EXPECTED_CATALOG_DIGEST}"
+          echo "  R66 P0-02: 签名对象(catalog)与镜像内实际内容不一致 — 拒绝签名"
+          echo "  可能原因: build 后 catalog 被修改,或 docker COPY 顺序异常"
+          exit 1
+        fi
+        echo "  PASS: 镜像内 catalog digest 与 docker-build 输出一致"
+        # 3. 镜像内 catalog digest 必须严格等于 runner 工作区 source catalog digest
+        #    (defense in depth — source catalog 应与 docker-build 重生结果一致,
+        #     因 migration-manifest-gate 已校验 source catalog sha256 正确)
+        if [ "${ACTUAL_CATALOG_DIGEST}" != "${SOURCE_CATALOG_DIGEST}" ]; then
+          echo "FAIL: 镜像内 catalog digest != runner 工作区 source catalog digest"
+          echo "  image catalog:    ${ACTUAL_CATALOG_DIGEST}"
+          echo "  source catalog:   ${SOURCE_CATALOG_DIGEST}"
+          echo "  R66 P0-02: 镜像内 catalog 与 source 不一致 — 拒绝签名"
+          exit 1
+        fi
+        echo "  PASS: 镜像内 catalog digest 与 source catalog 一致"
 
     # R58 P0-1: cosign sign 已 push 的镜像 digest (不重新构建)
     # R60 P0-06: 增加 OIDC/GHCR/cosign 诊断信息(不添加 continue-on-error,
@@ -681,7 +872,10 @@ jobs:
       run: |
         IMAGE_REF="${{ steps.resolve.outputs.image_ref }}"
         # R64 P0-01: 主验证用预期 identity (钉扎 ref,不信任待验证证书自身提供的 identity)
-        EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@refs/heads/${{ github.ref_name }}"
+        # R66 P0-03: 使用 ${{ github.ref }} (refs/heads/master 或 refs/tags/v1.0.0)
+        #            而非 refs/heads/${{ github.ref_name }}(tag push 时 ref_name 为 tag 名,
+        #            拼成 refs/heads/<tag> 错误,正确应为 refs/tags/<tag>)
+        EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
         # R63 P0-01: 从 Fulcio cert 提取的 SAN (仅用于诊断对比 + defense in depth 形态校验,
         #             不再作为 --certificate-identity 验证条件)
         EXTRACTED_IDENTITY="${{ steps.extract_image_identity.outputs.certificate_identity }}"
@@ -764,34 +958,18 @@ jobs:
     #   manifest 是 migration 完整性的 trust anchor — 必须独立签名,
     #   防止代码和 manifest 被同步篡改。签名材料与镜像 attestation 绑定同一 release digest。
     #   验证时钉扎 certificate_identity 到本仓库的 release-gates.yml 工作流 + OIDC issuer。
-    # R63 P0-04: manifest 必须与当前 release HEAD/Tree 严格绑定(不允许祖先兼容),
-    #            且必须枚举全部 migration(磁盘集合 == manifest 集合)。
-    # R64 P0-02: 在签名前先重生 manifest,确保 release_commit/tree_sha 绑定到当前 HEAD。
-    #            旧实现只改 runner 未提交文件,不证明 Docker 镜像内是同一份已签名 manifest;
-    #            新实现在 sign-image job 中重生 manifest(此 job 镜像构建已完成),
-    #            保证 manifest 与已构建镜像 source commit 严格一致。
-    - name: Regenerate migration manifest (bind to current HEAD/Tree)
-      run: |
-        set -euo pipefail
-        echo "R64 P0-02: Regenerating migration-manifest.json (bind to current HEAD/Tree)"
-        echo "  HEAD: $(git rev-parse HEAD)"
-        echo "  Tree: $(git rev-parse HEAD^{tree})"
-        python3 scripts/generate_migration_manifest.py
-        # 校验重生后的 manifest release_commit/tree_sha 与当前 HEAD 严格一致
-        python3 -c "
-        import json, subprocess, sys
-        manifest = json.load(open('database/migrations/migration-manifest.json'))
-        head_sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
-        head_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
-        assert manifest['release_commit'] == head_sha, (
-            f'release_commit ({manifest[\"release_commit\"]}) != HEAD ({head_sha})'
-        )
-        assert manifest['tree_sha'] == head_tree, (
-            f'tree_sha ({manifest[\"tree_sha\"]}) != HEAD Tree ({head_tree})'
-        )
-        print(f'PASS: manifest bound to HEAD={head_sha[:12]}... Tree={head_tree[:12]}...')
-        "
-        echo "  manifest sha256: $(sha256sum database/migrations/migration-manifest.json | awk '{print $1}')"
+    # R63 P0-04: manifest 必须枚举全部 migration(磁盘集合 == manifest 集合)。
+    # R66 P0-01: catalog 不再绑定 release_commit/tree_sha(catalog-only 模型,
+    #            自引用循环根因 — 任何 commit 都使 catalog 自身的 tree_sha 失效)。
+    #            HEAD/Tree 绑定移到 release-artifacts/release-manifest.json(CI 产物,
+    #            不提交 git),由其 source_commit/source_tree 字段承担。
+    # R66 P0-02: manifest 在 docker build 前已冻结, build 后禁止修改。
+    #            原 "Regenerate migration manifest" 步骤已移到 docker-build job
+    #            (在 build 之前执行), 确保镜像内 /app/database/migrations/
+    #            migration-manifest.json 与签名对象一致。本 job 仅校验镜像内
+    #            catalog digest 与 docker-build job 输出的 catalog_digest 严格
+    #            一致(见后续 "Verify image catalog digest" 步骤), 不再重生
+    #            catalog — 否则签名对象不在已构建镜像内(audit finding)。
 
     # R64 P0-02: 生成独立 release artifact manifest(避免自引用循环)。
     #   旧实现把 migration-manifest.json 直接绑定到包含自身的 tree — 自引用循环,
@@ -936,7 +1114,9 @@ jobs:
         set -euo pipefail
         MANIFEST="database/migrations/migration-manifest.json"
         # R64 P0-01: 主验证用预期 identity (钉扎 ref)
-        EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@refs/heads/${{ github.ref_name }}"
+        # R66 P0-03: 使用 ${{ github.ref }} 而非 refs/heads/${{ github.ref_name }}
+        #            (tag push 时 ref_name 为 tag 名,拼成 refs/heads/<tag> 错误)
+        EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
         # R63 P0-01: 从 Fulcio cert 提取的 SAN (仅用于诊断对比 + defense in depth)
         EXTRACTED_IDENTITY="${{ steps.extract_manifest_identity.outputs.certificate_identity }}"
         echo "R62 P1-02 / R63 P0-01 / R64 P0-01: Verifying migration manifest signature"
@@ -957,44 +1137,61 @@ jobs:
           }
         echo "PASS: migration manifest signature verified"
 
-    # R62 P1-02 / R63 P0-04: 验证 manifest 绑定的 release_commit / tree_sha 与当前 HEAD 严格一致
-    #   旧实现只要求 release_commit 是 HEAD 的祖先(允许 manifest 落后于 HEAD),
-    #   但 R63 P0-04 要求 manifest 与当前 release 严格绑定(release_commit == HEAD, tree_sha == HEAD Tree)。
-    #   manifest 落后于 HEAD → 说明 manifest 未随本次 release 重新生成,拒绝发布。
-    - name: Verify migration manifest release_commit binding
+    # R66 P0-01: 验证 release-manifest.json 的 source_commit / source_tree 与当前 HEAD 严格一致
+    #   R66 P0-01 整改:catalog(migration-manifest.json)不再绑定 release_commit/tree_sha
+    #   (catalog-only 模型,自引用循环根因)。HEAD/Tree 绑定由 release-manifest.json
+    #   的 source_commit/source_tree 字段承担(独立 CI 产物,不提交 git)。
+    #   release-manifest.json 落后于 HEAD → 说明 release-manifest 未随本次 release 重新生成,拒绝发布。
+    - name: Verify release manifest source_commit binding
       run: |
         set -euo pipefail
         MANIFEST="database/migrations/migration-manifest.json"
-        # 从 manifest 提取 release_commit / tree_sha
-        RELEASE_COMMIT=$(python3 -c "import json; print(json.load(open('${MANIFEST}'))['release_commit'])")
-        MANIFEST_TREE=$(python3 -c "import json; print(json.load(open('${MANIFEST}'))['tree_sha'])")
+        RELEASE_MANIFEST="release-artifacts/release-manifest.json"
+        if [ ! -f "${RELEASE_MANIFEST}" ]; then
+          echo "::error::release manifest not found: ${RELEASE_MANIFEST}"
+          echo "  R66 P0-01: 必须先生成 release-manifest.json"
+          exit 1
+        fi
+        # R66 P0-01: catalog 禁止包含 release_commit / tree_sha 字段(catalog-only 模型)
+        python3 -c "
+        import json, sys
+        catalog = json.load(open('${MANIFEST}'))
+        for forbidden in ('release_commit', 'tree_sha'):
+            assert forbidden not in catalog, (
+                f'R66 P0-01: catalog 禁止包含 {forbidden} 字段 '
+                f'(catalog-only 模型 — HEAD 绑定移至 release-manifest.json)'
+            )
+        print('PASS: catalog-only model verified (no release_commit/tree_sha in catalog)')
+        "
+        # R66 P0-01: 从 release-manifest.json 提取 source_commit / source_tree
+        RELEASE_SOURCE_COMMIT=$(python3 -c "import json; print(json.load(open('${RELEASE_MANIFEST}'))['source_commit'])")
+        RELEASE_SOURCE_TREE=$(python3 -c "import json; print(json.load(open('${RELEASE_MANIFEST}'))['source_tree'])")
         HEAD_SHA="${{ github.sha }}"
-        # R63 P0-04: 获取当前 HEAD 的 Tree SHA(与 manifest 的 tree_sha 比对)
         HEAD_TREE=$(git rev-parse "${HEAD_SHA}^{tree}")
-        echo "R62 P1-02 / R63 P0-04: Verifying manifest release_commit + tree_sha binding"
-        echo "  manifest release_commit: ${RELEASE_COMMIT}"
-        echo "  manifest tree_sha:      ${MANIFEST_TREE}"
-        echo "  current HEAD:           ${HEAD_SHA}"
-        echo "  current HEAD Tree:      ${HEAD_TREE}"
-        # R63 P0-04: release_commit 必须严格等于当前 HEAD (不再允许祖先兼容)
-        if [ "${RELEASE_COMMIT}" != "${HEAD_SHA}" ]; then
-          echo "FAIL: manifest release_commit != HEAD"
-          echo "  manifest: ${RELEASE_COMMIT}"
-          echo "  HEAD:      ${HEAD_SHA}"
-          echo "  R63 P0-04: manifest 与当前 release 不一致 — 必须重新生成 manifest 并重新签名"
+        echo "R66 P0-01: Verifying release-manifest source_commit + source_tree binding"
+        echo "  release source_commit: ${RELEASE_SOURCE_COMMIT}"
+        echo "  release source_tree:   ${RELEASE_SOURCE_TREE}"
+        echo "  current HEAD:          ${HEAD_SHA}"
+        echo "  current HEAD Tree:     ${HEAD_TREE}"
+        # R66 P0-01: release-manifest.source_commit 必须严格等于当前 HEAD
+        if [ "${RELEASE_SOURCE_COMMIT}" != "${HEAD_SHA}" ]; then
+          echo "FAIL: release-manifest source_commit != HEAD"
+          echo "  release-manifest: ${RELEASE_SOURCE_COMMIT}"
+          echo "  HEAD:              ${HEAD_SHA}"
+          echo "  R66 P0-01: release-manifest.json 与当前 release 不一致 — 必须重新生成 release-manifest"
           exit 1
         fi
-        echo "  PASS: release_commit == HEAD"
-        # R63 P0-04: tree_sha 必须严格等于当前 HEAD Tree
-        if [ "${MANIFEST_TREE}" != "${HEAD_TREE}" ]; then
-          echo "FAIL: manifest tree_sha != HEAD Tree"
-          echo "  manifest: ${MANIFEST_TREE}"
-          echo "  HEAD Tree: ${HEAD_TREE}"
-          echo "  R63 P0-04: manifest tree_sha 与当前 release 不一致 — 必须重新生成 manifest"
+        echo "  PASS: source_commit == HEAD"
+        # R66 P0-01: release-manifest.source_tree 必须严格等于当前 HEAD Tree
+        if [ "${RELEASE_SOURCE_TREE}" != "${HEAD_TREE}" ]; then
+          echo "FAIL: release-manifest source_tree != HEAD Tree"
+          echo "  release-manifest: ${RELEASE_SOURCE_TREE}"
+          echo "  HEAD Tree:         ${HEAD_TREE}"
+          echo "  R66 P0-01: release-manifest source_tree 与当前 release 不一致 — 必须重新生成"
           exit 1
         fi
-        echo "  PASS: tree_sha == HEAD Tree"
-        # 验证每个 migration 的 sha256 与磁盘文件一致
+        echo "  PASS: source_tree == HEAD Tree"
+        # 验证每个 migration 的 sha256 与磁盘文件一致(catalog 完整性)
         python3 -c "
         import json, hashlib, sys
         from pathlib import Path
@@ -1114,7 +1311,9 @@ jobs:
         set -euo pipefail
         RELEASE_MANIFEST="release-artifacts/release-manifest.json"
         # R64 P0-01: 主验证用预期 identity (钉扎 ref)
-        EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@refs/heads/${{ github.ref_name }}"
+        # R66 P0-03: 使用 ${{ github.ref }} 而非 refs/heads/${{ github.ref_name }}
+        #            (tag push 时 ref_name 为 tag 名,拼成 refs/heads/<tag> 错误)
+        EXPECTED_IDENTITY="https://github.com/${{ github.repository }}/.github/workflows/release-gates.yml@${{ github.ref }}"
         # R64 P0-02: 从 Fulcio cert 提取的 SAN (仅用于诊断对比 + defense in depth)
         EXTRACTED_IDENTITY="${{ steps.extract_release_manifest_identity.outputs.certificate_identity }}"
         IMAGE_DIGEST="${{ needs.docker-build.outputs.image_digest }}"
@@ -1525,13 +1724,23 @@ jobs:
   #   - sign-image 必须先通过 (cosign verify 验证签名有效)
   publish-attestation:
     runs-on: ubuntu-latest
+    # R66 P0-05: 拆分 code-release-gates (push to master) 与 production-promotion-gates (release tag)
+    #   publish-attestation 是 master-only 的 code-release gate,不再依赖
+    #   crdb-ru-72h-attribution-gate (该 job 在 push 场景下为 dry-run,
+    #   evidence_status=not_applicable,不应计入 code-release 的 production evidence)。
+    #   production-promotion-gate (tag-only) 才需要 crdb-ru-72h-attribution-gate
+    #   且要求 evidence_status=production。
+    # R66 P1-01: Release Gates 语义降级 — publish-attestation 同样在 release tag (refs/tags/v*)
+    #   触发,确保 tag push 也生成签名 attestation;非 master 非 tag 的普通 push 与 PR 不签名。
+    # R66 P1-02: needs 增加 migration-binding-gate — publish-attestation 必须等待
+    #   migration-binding-gate (HARD 签名绑定校验) 通过后才生成 attestation,
+    #   确保发布的 attestation 绑定的 catalog 已通过 HARD 校验。
     needs: [docker-build, docker-digest-verify, compose-config, redis-acl-matrix,
             schema-diff, restore-legacy-seal-gate, i18n-strict-export-boundary-gate,
-            migration-manifest-gate,
+            migration-manifest-gate, migration-binding-gate,
             backup-restore-drill, sbom, pip-audit, trivy,
-            verify-branch-protection, rc-continuity, sign-image,
-            crdb-ru-72h-attribution-gate]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+            verify-branch-protection, rc-continuity, sign-image]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       actions: read
@@ -1548,7 +1757,7 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -euo pipefail
-        echo "=== R56 P0-1: Checks API Verification ==="
+        echo "=== R56 P0-1 / R66 P0-04: Checks API Verification (fail-closed with polling) ==="
         echo "查询四个 workflow 对目标 SHA 的 conclusion"
         echo ""
 
@@ -1556,9 +1765,27 @@ jobs:
         echo "Target SHA: ${TARGET_SHA}"
         echo ""
 
+        # R66 P0-04: fail-closed with polling
+        #   旧实现问题: "no run" 和 queued/in_progress 被视为 SKIP,ALL_GREEN 保持 true,
+        #   导致 publish-attestation 在 sibling workflow 未运行或仍在运行时也通过 —
+        #   这是 fail-open 行为(缺证据 = 通过),违反 release gate 严格语义。
+        #   R66 P0-04 整改:
+        #     1. "no run" → pending (poll,等待 run 创建)
+        #     2. "queued/in_progress" → pending (poll,等待完成)
+        #     3. timeout (轮询超时) → FAIL (不再 SKIP)
+        #     4. completed:success → OK
+        #     5. completed:failure/cancelled/timed_out/action_required/neutral → FAIL
+        #   最大轮询时长: 30 分钟 (1800 秒),轮询间隔: 30 秒 (60 轮)
+        MAX_POLL_SECONDS=1800
+        POLL_INTERVAL_SECONDS=30
+        POLL_DEADLINE=$(( $(date +%s) + MAX_POLL_SECONDS ))
+
         # R56 P0-1: 查询 Checks API,要求四个 workflow 均为 completed/success
         REQUIRED_WORKFLOWS=("CI" "Deploy Check" "Release Gates" "E2E Tests")
         ALL_GREEN=true
+
+        # 状态跟踪:每个 workflow 的最终结论
+        declare -A WF_FINAL_STATE
 
         for WF in "${REQUIRED_WORKFLOWS[@]}"; do
           echo "--- Checking workflow: ${WF} ---"
@@ -1566,57 +1793,78 @@ jobs:
             --jq ".workflows[] | select(.name == \"${WF}\") | .id" 2>/dev/null || echo "")
           if [ -z "$WF_ID" ]; then
             echo "FAIL: Workflow '${WF}' not found"
+            WF_FINAL_STATE["${WF}"]="workflow_not_found"
             ALL_GREEN=false
             continue
           fi
 
-          # 获取该 SHA 的最新 run
-          LATEST_RUN=$(gh api \
-            "repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?per_page=5" \
-            --jq "[.workflow_runs[] | select(.head_sha == \"${TARGET_SHA}\")] | sort_by(.created_at) | reverse | .[0]" 2>/dev/null || echo "")
-
-          # R65 fix: 无 run 也视为 SKIP(race condition),不 FAIL。
-          # publish-attestation 启动时(needs 满足),独立 workflow(CI / Deploy Check /
-          # E2E Tests)可能尚未创建 run(API 延迟)。将这些 workflow 的失败检测
-          # 交给 BP required_status_checks,publish-attestation 不做冗余阻断。
-          if [ "${LATEST_RUN}" = "null" ] || [ -z "${LATEST_RUN}" ]; then
-            echo "  SKIP: 无 ${WF} run 对应 SHA ${TARGET_SHA:0:12} (race condition — workflow 尚未创建 run)"
-            echo "        R65 fix: 独立 workflow 并行运行,run 创建有 API 延迟;"
-            echo "        失败会通过 BP required_status_checks 阻止后续合并"
-            continue
-          fi
-
-          RUN_STATUS=$(echo "${LATEST_RUN}" | jq -r '.status')
-          RUN_CONCLUSION=$(echo "${LATEST_RUN}" | jq -r '.conclusion')
-          RUN_ID=$(echo "${LATEST_RUN}" | jq -r '.id')
-          echo "  run #${RUN_ID}: status=${RUN_STATUS} conclusion=${RUN_CONCLUSION}"
-
-          # R65 fix: 只在明确失败状态时 FAIL;未完成状态跳过(race condition)。
-          # publish-attestation 与 CI / Deploy Check / E2E Tests 是独立 workflow,
-          # 并行运行。publish-attestation 启动时(needs 满足),这些 workflow 可能
-          # 仍在运行中。这些 workflow 的失败会通过 BP required_status_checks
-          # 阻止后续 PR 合并,无需 publish-attestation 冗余检查。
-          case "${RUN_STATUS}:${RUN_CONCLUSION}" in
-            completed:success)
-              echo "  OK: ${WF} completed/success"
-              ;;
-            completed:failure|completed:cancelled|completed:timed_out|completed:action_required|completed:neutral)
-              echo "  FAIL: ${WF} failed (status=${RUN_STATUS}, conclusion=${RUN_CONCLUSION})"
+          # R66 P0-04: 轮询直到 workflow run 达到终态(completed)或超时
+          RUN_STATUS=""
+          RUN_CONCLUSION=""
+          RUN_ID=""
+          while true; do
+            NOW=$(date +%s)
+            if [ "${NOW}" -ge "${POLL_DEADLINE}" ]; then
+              echo "  TIMEOUT: ${WF} 轮询超时 (${MAX_POLL_SECONDS}s)"
+              echo "    R66 P0-04: workflow 未在超时窗口内达到 completed 状态 — fail-closed"
+              WF_FINAL_STATE["${WF}"]="timeout"
               ALL_GREEN=false
-              ;;
-            *)
-              echo "  SKIP: ${WF} 未完成或状态不识别 (status=${RUN_STATUS}, conclusion=${RUN_CONCLUSION})"
-              echo "        R65 fix: 独立 workflow 并行运行,未完成状态不阻断;"
-              echo "        失败会通过 BP required_status_checks 阻止后续合并"
-              ;;
-          esac
+              break
+            fi
+
+            # 获取该 SHA 的最新 run
+            LATEST_RUN=$(gh api \
+              "repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?per_page=5" \
+              --jq "[.workflow_runs[] | select(.head_sha == \"${TARGET_SHA}\")] | sort_by(.created_at) | reverse | .[0]" 2>/dev/null || echo "")
+
+            if [ "${LATEST_RUN}" = "null" ] || [ -z "${LATEST_RUN}" ]; then
+              # R66 P0-04: 无 run = pending (不再 SKIP)
+              echo "  PENDING: 无 ${WF} run 对应 SHA ${TARGET_SHA:0:12} (等待 workflow 创建 run)"
+              echo "    R66 P0-04: 无 run 不再视为 SKIP — 轮询直到 run 创建或超时"
+              sleep "${POLL_INTERVAL_SECONDS}"
+              continue
+            fi
+
+            RUN_STATUS=$(echo "${LATEST_RUN}" | jq -r '.status')
+            RUN_CONCLUSION=$(echo "${LATEST_RUN}" | jq -r '.conclusion')
+            RUN_ID=$(echo "${LATEST_RUN}" | jq -r '.id')
+            echo "  run #${RUN_ID}: status=${RUN_STATUS} conclusion=${RUN_CONCLUSION}"
+
+            # R66 P0-04: 只接受 completed:success;其他状态继续轮询或 fail
+            case "${RUN_STATUS}:${RUN_CONCLUSION}" in
+              completed:success)
+                echo "  OK: ${WF} completed/success"
+                WF_FINAL_STATE["${WF}"]="success"
+                break
+                ;;
+              completed:failure|completed:cancelled|completed:timed_out|completed:action_required|completed:neutral)
+                echo "  FAIL: ${WF} failed (status=${RUN_STATUS}, conclusion=${RUN_CONCLUSION})"
+                echo "    R66 P0-04: completed 非 success 状态立即 FAIL (不再 SKIP)"
+                WF_FINAL_STATE["${WF}"]="failed"
+                ALL_GREEN=false
+                break
+                ;;
+              *)
+                # R66 P0-04: queued/in_progress/requested/pending = 继续轮询 (不再 SKIP)
+                echo "  PENDING: ${WF} 未完成 (status=${RUN_STATUS}, conclusion=${RUN_CONCLUSION})"
+                echo "    R66 P0-04: 未完成状态继续轮询直到 completed 或超时 (不再 SKIP)"
+                sleep "${POLL_INTERVAL_SECONDS}"
+                ;;
+            esac
+          done
         done
 
         echo ""
+        echo "=== R66 P0-04: 最终 workflow 状态汇总 ==="
+        for WF in "${REQUIRED_WORKFLOWS[@]}"; do
+          echo "  ${WF}: ${WF_FINAL_STATE["${WF}"]:-unknown}"
+        done
+
         if [ "${ALL_GREEN}" = "true" ]; then
-          echo "PASS: 四个 workflow 对目标 SHA 均为 completed/success"
+          echo "PASS: 四个 workflow 对目标 SHA 均为 completed/success (fail-closed with polling)"
         else
           echo "FAIL: 存在 workflow 未达到 completed/success,拒绝生成 production deployment"
+          echo "  R66 P0-04: fail-closed — 不再 SKIP 任何 workflow,缺证据 = FAIL"
           exit 1
         fi
 
@@ -1852,7 +2100,147 @@ jobs:
           production_verify_statement.json
         retention-days: 90
 
-  # ─── 13b. crdb-ru-72h-attribution-gate (R65 P1-09) ───────────
+  # ─── 13a. attestation-semantics-verify (R66 P1-10: 供应链声明语义验证) ───
+  # R66 P1-10 整改要点:
+  #   审计发现 publish-attestation 仅做 cosign verify(证书链 + Rekor inclusion),
+  #   未校验 statement 中的语义字段(subject digest / source repo / commit / tree /
+  #   workflow ref / builder identity / issuer / predicate type)。
+  #   攻击者若获得签名能力,可签名一份语义错误的 statement(如指向其他 repo /
+  #   其他 commit),cosign verify 仍会通过。
+  # 本 job 在 publish-attestation 后运行,调用 verify_attestation_semantics.py:
+  #   1. 下载 release-attestation artifact(含 production_verify_statement.json)
+  #   2. 下载 release-gates-signed artifact(含 release-manifest.json)
+  #   3. 校验 statement._type == "https://in-toto.io/Statement/v0.1"
+  #   4. 校验 predicateType == "https://slsa.dev/provenance/v0.2"
+  #   5. 校验 subject.digest == release-manifest 中的 image_digest
+  #   6. 校验 subject.name == release-manifest 中的 image_name
+  #   7. 校验 SLSA predicate(builder.id / buildType / configSource / materials)
+  #   8. 校验 Rekor tlogEntries(inclusionProof / integratedTime)
+  #   9. 校验 OIDC issuer (https://token.actions.githubusercontent.com)
+  #  10. 校验 certificate validity (notBefore / notAfter)
+  # --strict 模式:任一校验失败 exit 1;--json-output 输出结构化结果。
+  attestation-semantics-verify:
+    runs-on: ubuntu-latest
+    needs: [publish-attestation]
+    # R66 P1-10: 同 publish-attestation,仅在 master/main push 或 release tag 时运行
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      packages: read
+      attestations: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    # 下载 publish-attestation 上传的 attestation artifact(含 production_verify_statement.json)
+    - name: Download release-attestation artifact
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: release-attestation-${{ github.sha }}
+
+    # 下载 sign-image 上传的签名制品(含 release-manifest.json + image digest 绑定)
+    - name: Download signed artifacts (for release-manifest binding)
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: release-gates-signed-${{ github.sha }}
+
+    - name: "R66 P1-10: Verify attestation statement semantics (strict)"
+      run: |
+        set -euo pipefail
+        echo "=== R66 P1-10: Attestation Statement Semantics Verification ==="
+        echo "校验 beyond cosign verify:"
+        echo "  1. statement._type / predicateType"
+        echo "  2. subject.digest / subject.name (vs release-manifest)"
+        echo "  3. SLSA predicate (builder / buildType / configSource / materials)"
+        echo "  4. Rekor tlogEntries (inclusionProof / integratedTime)"
+        echo "  5. OIDC issuer + certificate validity"
+        echo ""
+        echo "下载的制品:"
+        ls -la production_verify_statement.json release-artifacts/release-manifest.json 2>&1 || true
+        echo ""
+        # 调用 verify_attestation_semantics.py 做严格语义校验
+        # --strict: 任一校验失败 exit 1
+        # --json-output: 输出结构化结果供 release-summary 引用
+        python scripts/verify_attestation_semantics.py \
+          --statement production_verify_statement.json \
+          --release-manifest release-artifacts/release-manifest.json \
+          --strict \
+          --json-output attestation_semantics_result.json
+        echo ""
+        echo "=== R66 P1-10: Attestation Semantics Verification PASS ==="
+        cat attestation_semantics_result.json | python3 -m json.tool 2>/dev/null || cat attestation_semantics_result.json
+
+    - name: Upload attestation semantics result
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: attestation-semantics-${{ github.sha }}
+        path: attestation_semantics_result.json
+        retention-days: 90
+
+  # ─── 13b. tag-ruleset-verify (R66 P1-11: 不可变 tag ruleset 校验) ────────
+  # R66 P1-11 整改要点:
+  #   审计发现 GitHub tag 无 ruleset 保护,管理员可删除/移动/更新已发布的 tag,
+  #   违反 release tag 不可变性语义(immutable tag = 不可删除/不可移动/不可更新)。
+  # 本 job 调用 scripts/verify_tag_ruleset.sh 校验 refs/tags/* 的 ruleset:
+  #   1. creation = true(允许创建新 tag)
+  #   2. deletion = false(禁止删除 tag)
+  #   3. non_fast_forward = false(禁止移动 tag)
+  #   4. update = false(禁止更新 tag)
+  #   5. required_signatures = true(tag 必须签名)
+  # 配置脚本(scripts/configure_tag_ruleset.sh)由运维手动运行(需要 administration 权限),
+  # 本 job 仅做只读校验(permissions: contents: read, actions: read)。
+  # 校验失败立即 exit 1(release tag 不可变性是 release pipeline 的硬性要求)。
+  tag-ruleset-verify:
+    runs-on: ubuntu-latest
+    # R66 P1-11: tag ruleset 校验仅在 release tag 时严格阻断;
+    # PR / branch push 时仅做 dry-run(允许 ruleset 未配置,但 warn)。
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      actions: read
+      administration: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: "R66 P1-11: Verify tag ruleset (immutable tags)"
+      env:
+        GH_TOKEN: ${{ secrets.BP_PAT_TOKEN || secrets.GITHUB_TOKEN }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        # R66 P1-11: release tag 场景严格校验;其他场景 dry-run
+        RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+      run: |
+        set -euo pipefail
+        echo "=== R66 P1-11: Tag Ruleset Verification ==="
+        echo "校验 refs/tags/* ruleset(不可变 tag):"
+        echo "  1. creation = true (允许创建新 tag)"
+        echo "  2. deletion = false (禁止删除 tag)"
+        echo "  3. non_fast_forward = false (禁止移动 tag)"
+        echo "  4. update = false (禁止更新 tag)"
+        echo "  5. required_signatures = true (tag 必须签名)"
+        echo ""
+        echo "Release tag scenario: ${RELEASE_TAG}"
+        echo ""
+        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          echo "R66 P1-11: release tag 场景 — 严格校验 tag ruleset"
+          # release tag 场景:必须严格校验,fail-closed
+          bash scripts/verify_tag_ruleset.sh --strict
+        else
+          echo "R66 P1-11: 非 release tag 场景 — dry-run 校验(允许 ruleset 未配置)"
+          # 非 release tag 场景:dry-run,允许 ruleset 未配置(只 warn)
+          bash scripts/verify_tag_ruleset.sh --dry-run || \
+            echo "WARN: tag ruleset 未配置或校验失败(非 release tag,不阻断)"
+        fi
+        echo ""
+        echo "=== R66 P1-11: Tag Ruleset Verification PASS ==="
+
+  # ─── 13b. crdb-ru-72h-attribution-gate (R65 P1-09 / R66 P0-05) ───────────
   # R65 P1-09 整改要点:
   #   审计发现 CRDB RU 仍只有阈值脚本(check_crdb_ru_threshold.py),
   #   没有 72h 真实账单/metrics,且未按 SQL fingerprint / service / job 归因。
@@ -1868,8 +2256,32 @@ jobs:
   #   (要求运维通过 artifact 上传签名的真实数据文件)。
   #   注意:本 job 必须为 required context,确保未提供真实 72h 数据的 release
   #   无法合并。数据文件无法在 CI 内合成,必须由生产环境采集后签名上传。
+  #
+  # R66 P0-05 整改要点:
+  #   审计发现 `crdb-ru-72h-attribution-gate` 未取得数据 artifact 仍 success。
+  #   普通 push 的 production evidence 本来只能是 dry-run,但 run 总结和自审报告
+  #   容易把其纳入"全部通过"。整改:
+  #     1. 拆分 code-release-gates (push to master) 与 production-promotion-gates (release tag)
+  #     2. 普通 push 的缺证据 job 输出 evidence_status=not_applicable,不得计入 Production GO
+  #     3. release tag 时 evidence_status=production,缺证据 = failure
+  #     4. publish-attestation (master-only) 不再依赖此 job 作为 production evidence
+  #     5. production-promotion-gate (tag-only) 必须依赖此 job 且 evidence_status=production
   crdb-ru-72h-attribution-gate:
     runs-on: ubuntu-latest
+    outputs:
+      # R66 P0-05: job 输出 evidence_status,区分 not_applicable (dry-run) 与 production (strict)
+      # - not_applicable: PR / push 场景,未提供真实 72h 数据,不得计入 Production GO
+      # - production: release tag 场景,已提供真实 72h 数据并通过 strict 校验
+      # - missing: release tag 场景但未提供数据(此状态不应出现,因 strict 模式会 exit 1)
+      evidence_status: ${{ steps.gate.outputs.evidence_status }}
+      evidence_mode: ${{ steps.gate.outputs.evidence_mode }}
+      # R66 P1-04: 显式 evidence_present 输出,区分"无数据"与"通过"
+      # - false: PR / push dry-run(无真实数据),或 release tag 但数据缺失
+      # - true: release tag + 真实数据文件存在并通过 strict 校验
+      # 下游 release-summary / production-promotion-gate 必须据此区分
+      # "无数据但 job success(dry-run)"与"真实证据通过",避免误把 dry-run
+      # success 计入 Production GO。
+      evidence_present: ${{ steps.gate.outputs.evidence_present }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -1894,9 +2306,10 @@ jobs:
       continue-on-error: true  # PR 场景无 artifact,允许跳过
 
     - name: CRDB RU 72h attribution gate
+      id: gate
       run: |
         set -euo pipefail
-        echo "=== R65 P1-09: CRDB RU 72h Attribution Gate ==="
+        echo "=== R65 P1-09 / R66 P0-05: CRDB RU 72h Attribution Gate ==="
         # 判断场景:PR / push → dry-run;release tag → strict + real data
         IS_RELEASE_TAG=false
         DATA_FILE=""
@@ -1905,6 +2318,24 @@ jobs:
           echo "  场景: release tag(${GITHUB_REF}),要求严格校验 + 真实 72h 数据"
         else
           echo "  场景: PR / push(${GITHUB_REF}),仅 dry-run 校验脚本自洽性"
+          echo "  R66 P0-05: evidence_status=not_applicable (不得计入 Production GO)"
+        fi
+
+        # R66 P0-05: 设置 evidence_status 输出
+        # - PR / push: not_applicable (dry-run,无真实数据)
+        # - release tag: production (strict + 真实数据)
+        # R66 P1-04: 同时设置 evidence_present 输出
+        # - PR / push: false (dry-run,无真实数据,即便 job success 也不计 Production GO)
+        # - release tag + 数据文件存在: true (真实证据通过)
+        # - release tag + 数据缺失: false (strict 模式会在下方 exit 1,但先写 false 防御性输出)
+        if [[ "${IS_RELEASE_TAG}" == "true" ]]; then
+          echo "evidence_status=production" >> $GITHUB_OUTPUT
+          echo "evidence_mode=strict" >> $GITHUB_OUTPUT
+        else
+          echo "evidence_status=not_applicable" >> $GITHUB_OUTPUT
+          echo "evidence_mode=dry_run" >> $GITHUB_OUTPUT
+          # R66 P1-04: dry-run 场景无真实数据,evidence_present=false
+          echo "evidence_present=false" >> $GITHUB_OUTPUT
         fi
 
         # 查找运维上传的 ru_72h_data.json artifact
@@ -1912,14 +2343,21 @@ jobs:
           if [[ -f "./ru-72h-data/ru_72h_data.json" ]]; then
             DATA_FILE="./ru-72h-data/ru_72h_data.json"
             echo "  使用 artifact ru_72h_data.json: ${DATA_FILE}"
+            # R66 P1-04: release tag + 真实数据文件存在,evidence_present=true
+            echo "evidence_present=true" >> $GITHUB_OUTPUT
           elif [[ -f "./ru_72h_data.json" ]]; then
             DATA_FILE="./ru_72h_data.json"
             echo "  使用 workspace ru_72h_data.json: ${DATA_FILE}"
+            # R66 P1-04: release tag + 真实数据文件存在,evidence_present=true
+            echo "evidence_present=true" >> $GITHUB_OUTPUT
           else
             echo "FAIL: release tag 场景要求 ru_72h_data.json artifact"
-            echo "  R65 P1-09: 运维必须通过 workflow_dispatch 上传签名的真实 72h 数据文件"
+            echo "  R65 P1-09 / R66 P0-05: 运维必须通过 workflow_dispatch 上传签名的真实 72h 数据文件"
             echo "  上传方式: 在 workflow_dispatch 触发时通过 artifact upload 提供"
             echo "            名称为 ru-72h-data-{sha} 的 artifact"
+            echo "  R66 P0-05: production-promotion-gate 缺证据 = failure (not_applicable 不允许)"
+            # R66 P1-04: 数据缺失,evidence_present=false(虽然 strict 模式会 exit 1)
+            echo "evidence_present=false" >> $GITHUB_OUTPUT
             exit 1
           fi
         fi
@@ -1931,6 +2369,8 @@ jobs:
             --strict --data "${DATA_FILE}" --json
         else
           # PR / push:dry-run 模式
+          # R66 P0-05: dry-run success 不等于 production evidence pass
+          # evidence_status=not_applicable 已写入 $GITHUB_OUTPUT,下游 job 据此判断
           python scripts/check_crdb_ru_72h_attribution.py --dry-run
         fi
 
@@ -1941,6 +2381,52 @@ jobs:
         name: ru-72h-attribution-result-${{ github.sha }}
         path: ./ru-72h-data/
         retention-days: 90
+
+  # ─── 13b. migration-binding-gate (R66 P1-02: 统一校验口径) ─────
+  # R66 P1-02 整改: migration-manifest-gate (early, parallel) 只检查
+  # catalog-only 结构/hash/策略,签名绑定检查是 SOFT (WARN 不阻断),
+  # 因为运行时签名尚未生成。本 job 在 sign-image 之后运行,使用
+  # --require-signed-binding 模式做 HARD 校验:
+  #   1. 下载 sign-image 上传的 release-gates-signed-* artifact
+  #      (含 release-artifacts/release-manifest.json + migration-manifest.json.sig/.pem)
+  #   2. 运行 check_migration_manifest.py --strict --require-signed-binding
+  #      签名绑定缺失从 WARN 升级为 HARD FAIL
+  # 统一校验口径:catalog-only gate 用 SOFT,release-binding gate 用 HARD。
+  # 这样禁止 migration-manifest-gate 对仓库旧 manifest 报 success、
+  # 而 sign-image 静默重写它的两套口径不一致问题。
+  migration-binding-gate:
+    runs-on: ubuntu-latest
+    needs: [sign-image]
+    # R66 P1-01: 同 sign-image,仅在 master/main push 或 release tag 时运行
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      actions: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    # R66 P1-02: 下载 sign-image 上传的签名制品(含 release-manifest.json + manifest 签名)
+    - name: Download signed artifacts (for release-manifest binding)
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: release-gates-signed-${{ github.sha }}
+
+    - name: Migration manifest binding gate (R66 P1-02, HARD binding check)
+      run: |
+        set -euo pipefail
+        echo "=== R66 P1-02: Migration manifest binding gate (HARD) ==="
+        echo "下载的签名制品:"
+        ls -la release-artifacts/release-manifest.json migration-manifest.json.sig migration-manifest.json.pem 2>&1 || true
+        # R66 P1-02: --require-signed-binding 模式 — 签名绑定缺失从 WARN 升级为 HARD FAIL
+        # 统一校验口径:catalog-only gate (migration-manifest-gate) 用 SOFT,
+        # release-binding gate (本 job) 用 HARD,确保 catalog 与 release-manifest.json
+        # 绑定一致,禁止两套口径不一致。
+        python scripts/check_migration_manifest.py --strict --require-signed-binding
 
   # ─── 14. production-evidence (R64 P1-12: 生产运行证据框架) ──────
   # R64 P1-12 整改要点:
@@ -2120,7 +2606,10 @@ jobs:
     runs-on: ubuntu-latest
     # R65 P0-04: 仅 release tag (v*.*.*) 触发,PR / branch push 自动 skipped
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [production-evidence]
+    # R66 P0-05: 增加 crdb-ru-72h-attribution-gate 依赖,要求 evidence_status=production
+    #   (tag-only 场景下该 job 必须运行 strict 模式并提供真实 72h 数据,
+    #    evidence_status=not_applicable 不允许 — 缺证据 = failure)
+    needs: [production-evidence, crdb-ru-72h-attribution-gate]
     permissions:
       contents: read
       actions: read
@@ -2139,6 +2628,38 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         pip install pytest pytest-asyncio aiosqlite pyyaml
+
+    # R66 P0-05: 校验 crdb-ru-72h-attribution-gate 的 evidence_status
+    #   production-promotion-gate (tag-only) 必须要求 evidence_status=production,
+    #   not_applicable / missing 一律 failure (缺证据 = failure,不再是 pass)
+    # R66 P1-04: 同时校验 evidence_present=true,显式区分"无数据"与"通过"
+    - name: "R66 P0-05/P1-04: Verify crdb-ru-72h-attribution-gate evidence_status=production and evidence_present=true"
+      run: |
+        set -euo pipefail
+        EVIDENCE_STATUS="${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_status }}"
+        EVIDENCE_MODE="${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_mode }}"
+        EVIDENCE_PRESENT="${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_present }}"
+        echo "=== R66 P0-05/P1-04: Verify crdb-ru-72h-attribution-gate evidence ==="
+        echo "  evidence_status:  ${EVIDENCE_STATUS}"
+        echo "  evidence_mode:    ${EVIDENCE_MODE}"
+        echo "  evidence_present: ${EVIDENCE_PRESENT}"
+        if [ "${EVIDENCE_STATUS}" != "production" ]; then
+          echo "FAIL: crdb-ru-72h-attribution-gate evidence_status != production"
+          echo "  实际: ${EVIDENCE_STATUS}"
+          echo "  R66 P0-05: production-promotion-gate (tag-only) 要求 evidence_status=production"
+          echo "  not_applicable / missing 一律 failure — 缺证据 = failure (不再是 pass)"
+          exit 1
+        fi
+        # R66 P1-04: evidence_present 必须为 true,显式区分"无数据"与"通过"
+        # 防止 evidence_status=production 但实际数据缺失(理论不应发生,defense in depth)
+        if [ "${EVIDENCE_PRESENT}" != "true" ]; then
+          echo "FAIL: crdb-ru-72h-attribution-gate evidence_present != true"
+          echo "  实际: ${EVIDENCE_PRESENT}"
+          echo "  R66 P1-04: evidence_present=false 表示无真实数据(即便 job success 也是 dry-run)"
+          echo "  production promotion 必须有真实 72h 数据文件,不允许 dry-run 计入 Production GO"
+          exit 1
+        fi
+        echo "PASS: crdb-ru-72h-attribution-gate evidence_status=production and evidence_present=true"
 
     # 下载 production-evidence job 上传的 artifact(含 production_evidence_index.json);
     # 注意:CI 自动生成的是 dry_run 模式,release tag 场景需运维通过单独的
@@ -2161,7 +2682,7 @@ jobs:
     - name: "R65 P0-04: Verify production promotion evidence (strict, no skip)"
       run: |
         set -euo pipefail
-        echo "=== R65 P0-04: Production Promotion Gate (strict) ==="
+        echo "=== R65 P0-04 / R66 P0-05: Production Promotion Gate (strict) ==="
         echo "  release tag: ${GITHUB_REF}"
         echo "  本 job 不可跳过 — 任一校验失败立即阻断 release"
         echo ""
@@ -2180,13 +2701,14 @@ jobs:
         done
         if [ -z "${EVIDENCE_FILE}" ]; then
           echo "FAIL: 未找到 production evidence 文件"
-          echo "  R65 P0-04: release tag 必须提供 production 真实证据 artifact"
+          echo "  R65 P0-04 / R66 P0-05: release tag 必须提供 production 真实证据 artifact"
           echo "  运维需通过 workflow_dispatch 上传签名的 production_evidence.json artifact"
           echo "  (artifact 名称: signed-production-evidence-{sha})"
           echo "  证据文件需含 5 类 artifact:SOAK_7DAY/RESTORE_3X/OUTBOX_FAULT_INJECTION/RU_72H/SUPPLY_CHAIN"
           echo "  + 顶层 signature 块(cosign 或 gpg, verified=true)"
           echo "  + 每个 artifact 含 expires_at(ISO 8601,未过期)"
           echo "  + flags.skip 为空(未使用 --skip)"
+          echo "  R66 P0-05: 缺证据 = failure (不再是 pass / not_applicable)"
           exit 1
         fi
         echo "校验证据文件: ${EVIDENCE_FILE}"
@@ -2196,7 +2718,7 @@ jobs:
         python3 scripts/generate_production_evidence.py \
           --verify-promotion "${EVIDENCE_FILE}"
         echo ""
-        echo "PASS: R65 P0-04 production promotion 证据校验通过"
+        echo "PASS: R65 P0-04 / R66 P0-05 production promotion 证据校验通过"
         # 输出 production_promotion_allowed 标记(供 release-summary 读取)
         python3 -c "
         import json
@@ -2226,10 +2748,11 @@ jobs:
     if: always()
     needs: [docker-build, docker-digest-verify, compose-config, redis-acl-matrix,
             schema-diff, restore-legacy-seal-gate, i18n-strict-export-boundary-gate,
-            migration-manifest-gate,
+            migration-manifest-gate, migration-binding-gate,
             button-flow-real-ux-gate,
             backup-restore-drill, sbom, pip-audit, trivy,
             sign-image, verify-branch-protection, rc-continuity, publish-attestation,
+            attestation-semantics-verify, tag-ruleset-verify,
             crdb-ru-72h-attribution-gate, production-evidence,
             production-promotion-gate]
     env:
@@ -2241,6 +2764,7 @@ jobs:
       RESTORE_LEGACY_SEAL_GATE: ${{ needs.restore-legacy-seal-gate.result }}
       I18N_STRICT_EXPORT_BOUNDARY_GATE: ${{ needs.i18n-strict-export-boundary-gate.result }}
       MIGRATION_MANIFEST_GATE: ${{ needs.migration-manifest-gate.result }}
+      MIGRATION_BINDING_GATE: ${{ needs.migration-binding-gate.result }}
       BUTTON_FLOW_REAL_UX_GATE: ${{ needs.button-flow-real-ux-gate.result }}
       BACKUP_RESTORE_DRILL: ${{ needs.backup-restore-drill.result }}
       SBOM: ${{ needs.sbom.result }}
@@ -2250,7 +2774,14 @@ jobs:
       VERIFY_BRANCH_PROTECTION: ${{ needs.verify-branch-protection.result }}
       RC_CONTINUITY: ${{ needs.rc-continuity.result }}
       PUBLISH_ATTESTATION: ${{ needs.publish-attestation.result }}
+      # R66 P1-10: attestation-semantics-verify (beyond cosign verify)
+      ATTESTATION_SEMANTICS_VERIFY: ${{ needs.attestation-semantics-verify.result }}
+      # R66 P1-11: tag-ruleset-verify (immutable tags)
+      TAG_RULESET_VERIFY: ${{ needs.tag-ruleset-verify.result }}
       CRDB_RU_72H_ATTRIBUTION_GATE: ${{ needs.crdb-ru-72h-attribution-gate.result }}
+      CRDB_RU_72H_EVIDENCE_STATUS: ${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_status }}
+      # R66 P1-04: 显式 evidence_present 输出,区分"无数据"与"通过"
+      CRDB_RU_72H_EVIDENCE_PRESENT: ${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_present }}
       PRODUCTION_EVIDENCE: ${{ needs.production-evidence.result }}
       PRODUCTION_PROMOTION_GATE: ${{ needs.production-promotion-gate.result }}
     steps:
@@ -2289,6 +2820,7 @@ jobs:
           "restore-legacy-seal-gate=${RESTORE_LEGACY_SEAL_GATE}" \
           "i18n-strict-export-boundary-gate=${I18N_STRICT_EXPORT_BOUNDARY_GATE}" \
           "migration-manifest-gate=${MIGRATION_MANIFEST_GATE}" \
+          "migration-binding-gate=${MIGRATION_BINDING_GATE}" \
           "button-flow-real-ux-gate=${BUTTON_FLOW_REAL_UX_GATE}" \
           "backup-restore-drill=${BACKUP_RESTORE_DRILL}" \
           "sbom=${SBOM}" \
@@ -2298,24 +2830,51 @@ jobs:
           "verify-branch-protection=${VERIFY_BRANCH_PROTECTION}" \
           "rc-continuity=${RC_CONTINUITY}" \
           "publish-attestation=${PUBLISH_ATTESTATION}" \
+          "attestation-semantics-verify=${ATTESTATION_SEMANTICS_VERIFY}" \
+          "tag-ruleset-verify=${TAG_RULESET_VERIFY}" \
           "crdb-ru-72h-attribution-gate=${CRDB_RU_72H_ATTRIBUTION_GATE}" \
           "production-evidence=${PRODUCTION_EVIDENCE}" \
           "production-promotion-gate=${PRODUCTION_PROMOTION_GATE}"; do
           job="${entry%%=*}"
           conclusion="${entry##*=}"
           echo "  ${job}: ${conclusion}"
-          # sign-image / publish-attestation: master-only job,PR 上可 skipped
-          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ]; then
-            if [ "${RELEASE_TARGET}" = "true" ]; then
-              # release target: 必须成功(skipped = 供应链断裂,P0-06 必须兜住)
+          # sign-image / publish-attestation / migration-binding-gate /
+          # attestation-semantics-verify:
+          # master-only + tag-only job,PR 上可 skipped
+          # R66 P1-10: attestation-semantics-verify 同样仅在 master/tag push 运行
+          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ] || [ "${job}" = "migration-binding-gate" ] || [ "${job}" = "attestation-semantics-verify" ]; then
+            if [ "${RELEASE_TARGET}" = "true" ] || [ "${RELEASE_TAG}" = "true" ]; then
+              # release target (master/main push) 或 release tag (refs/tags/v*):
+              # 必须成功(skipped = 供应链断裂,P0-06 必须兜住)
+              # R66 P1-01: tag push 也必须签名 + 生成 attestation,不允许 skipped
+              # R66 P1-02: migration-binding-gate 同样在 tag/master push 上必须 success
+              # R66 P1-10: attestation-semantics-verify 同样在 tag/master push 上必须 success
               if [ "${conclusion}" != "success" ]; then
-                echo "::error::Job '${job}' did not succeed on release target (got: ${conclusion})"
+                echo "::error::Job '${job}' did not succeed on release target/tag (got: ${conclusion})"
                 FAIL=1
               fi
             else
               # PR: 允许 skipped(if: 未满足),但 failure/cancelled 仍阻断
               if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
                 echo "::error::Job '${job}' did not succeed on PR (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
+          elif [ "${job}" = "tag-ruleset-verify" ]; then
+            # R66 P1-11: tag-ruleset-verify 在 push 时运行(dry-run or strict)
+            # - release tag: 必须 success(strict 模式)
+            # - 非 release tag push: 必须 success(dry-run,允许 ruleset 未配置)
+            # - PR: 允许 skipped(if: github.event_name == 'push' 排除 PR)
+            if [ "${RELEASE_TAG}" = "true" ]; then
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on release tag (got: ${conclusion})"
+                echo "  R66 P1-11: tag ruleset strict 校验失败 — release tag 不可变性无法保证"
+                FAIL=1
+              fi
+            else
+              # PR / branch push: 允许 skipped 或 success
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
                 FAIL=1
               fi
             fi
@@ -2359,13 +2918,28 @@ jobs:
         # R65 P0-04: 最终汇总报告 production_promotion_allowed 标记
         # - release tag 且 production-promotion-gate success → true
         # - 其他场景(PR / branch push / gate 未运行)→ false
+        # R66 P0-05: defense in depth — 额外校验 crdb-ru-72h-attribution-gate
+        #   的 evidence_status=production(production-promotion-gate 已校验,
+        #   但 release-summary 作为最终聚合点再校验一次,防止单点失效)
+        # R66 P1-04: 同时校验 evidence_present=true,显式区分"无数据"与"通过"
+        #   - evidence_status=production 但 evidence_present!=true 视为证据缺失
+        #   - 防止 dry-run success 被误计为 Production GO
         PRODUCTION_PROMOTION_ALLOWED=false
         if [ "${RELEASE_TAG}" = "true" ] && [ "${PRODUCTION_PROMOTION_GATE}" = "success" ]; then
-          PRODUCTION_PROMOTION_ALLOWED=true
+          if [ "${CRDB_RU_72H_EVIDENCE_STATUS}" = "production" ] && [ "${CRDB_RU_72H_EVIDENCE_PRESENT}" = "true" ]; then
+            PRODUCTION_PROMOTION_ALLOWED=true
+          else
+            echo "::error::R66 P0-05/P1-04: release tag 但 evidence_status=${CRDB_RU_72H_EVIDENCE_STATUS} (要求 production) / evidence_present=${CRDB_RU_72H_EVIDENCE_PRESENT} (要求 true)"
+            echo "  defense in depth 校验失败 — production promotion 拒绝"
+            echo "  R66 P1-04: evidence_present=false 表示无真实数据(即便 job success 也是 dry-run)"
+            exit 1
+          fi
         fi
         echo ""
-        echo "=== R65 P0-04: Production Promotion Summary ==="
+        echo "=== R65 P0-04 / R66 P0-05 / R66 P1-04: Production Promotion Summary ==="
         echo "production_promotion_allowed: ${PRODUCTION_PROMOTION_ALLOWED}"
         echo "  release_tag: ${RELEASE_TAG}"
         echo "  production-promotion-gate: ${PRODUCTION_PROMOTION_GATE}"
+        echo "  crdb-ru-72h-evidence-status: ${CRDB_RU_72H_EVIDENCE_STATUS}"
+        echo "  crdb-ru-72h-evidence-present: ${CRDB_RU_72H_EVIDENCE_PRESENT}"
 

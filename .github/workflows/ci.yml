@@ -43,13 +43,13 @@ jobs:
         pip install -r requirements.txt
         pip install pytest pytest-asyncio pytest-cov aiosqlite pyyaml
 
-    # R63 P0-04: 构建阶段自动重生 migration manifest(绑定当前 HEAD/Tree)。
-    # 终审报告 P0-04 根治逻辑:"构建阶段根据当前 HEAD/Tree 自动生成 canonical
-    # manifest,禁止手工旧 SHA"。每次 commit 都会使旧 manifest 的 release_commit/
-    # tree_sha 失效,因此在运行测试前根据当前 git HEAD 重新生成 manifest,
-    # 使 test_r63_p0_1_p0_4_release_manifest.py 的 HEAD/Tree 绑定校验通过。
+    # R66 P0-01: 构建阶段自动重生 migration manifest(catalog-only 模型)。
+    # R66 P0-01 整改:catalog 不再绑定 release_commit/tree_sha(自引用循环根因)。
+    # 重生 catalog 仅更新每个 migration 的 sha256(从磁盘文件计算),不写入
+    # HEAD/Tree 绑定字段。HEAD/Tree 绑定由 release-artifacts/release-manifest.json
+    # (CI 产物,不提交 git)的 source_commit/source_tree 字段承担。
     # 本步骤只更新工作区 manifest(不 commit),签名在 release-gates.yml 中完成。
-    - name: Regenerate migration manifest (bind to current HEAD/Tree)
+    - name: Regenerate migration manifest (catalog-only, no HEAD/Tree binding)
       run: python scripts/generate_migration_manifest.py
 
     - name: Run tests
@@ -509,4 +509,106 @@ jobs:
           sbom-${{ github.sha }}.json.sha256
           sbom-${{ github.sha }}.pem
           sbom-${{ github.sha }}.sig
+        retention-days: 90
+
+  # ─── R66 P1-09: skip inventory 收集与分类 ───────────────────
+  # 审计发现 tests/ 中存在大量 pytest skip 标记(441 个),无统一清单与
+  # 分类归属(owner / category / production_impact / due_date)。
+  # 本 job 通过 AST 解析收集所有 skip 标记,输出 JSON 制品 + 控制台报告,
+  # 用于:
+  #   1. 量化技术债(441 个 skip → 哪些是 dependency_missing,哪些是
+  #      uncategorized,哪些已逾期)
+  #   2. 阻止新增 uncategorized skip(baseline ratchet)
+  #   3. 为 release-evidence 提供 skip 透明度(production release 必须显式
+  #      声明已知 skip 的 production_impact)
+  # 本 job 不阻断 PR(skip 是已知技术债),但 skip 数量增长会在报告中体现。
+  # baseline 文件: docs/skip_inventory_baseline.json
+  skip-inventory:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # R66 P1-09: collect_skip_inventory.py 依赖 loguru(从 services 模块导入)
+        pip install -r requirements.txt
+
+    - name: "R66 P1-09: Collect pytest skip inventory (AST-based)"
+      run: |
+        set -euo pipefail
+        echo "=== R66 P1-09: Skip Inventory Collection ==="
+        # AST 解析收集 tests/ 中所有 pytest skip 标记
+        # 输出 JSON: file_path / test_name / reason / category / production_impact / owner / due_date
+        python scripts/collect_skip_inventory.py \
+          --tests-dir tests \
+          --output skip_inventory_${{ github.sha }}.json
+        echo ""
+        echo "=== R66 P1-09: Skip Inventory Summary ==="
+        # 输出分类统计
+        python -c "
+        import json
+        with open('skip_inventory_${{ github.sha }}.json') as f:
+            data = json.load(f)
+        skips = data.get('skips', [])
+        from collections import Counter
+        cats = Counter(s.get('category', 'uncategorized') for s in skips)
+        print(f'Total skips: {len(skips)}')
+        print('By category:')
+        for cat, n in cats.most_common():
+            print(f'  {cat}: {n}')
+        # R66 P1-09: uncategorized 比例过高时 WARN(不阻断 PR)
+        uncategorized = cats.get('uncategorized', 0)
+        if uncategorized > 0:
+            pct = uncategorized * 100 // max(len(skips), 1)
+            print(f'WARN: {uncategorized} skips ({pct}%) are uncategorized')
+            print('  R66 P1-09: 新增 skip 必须标注 category/owner/production_impact')
+        "
+
+    - name: Compare with baseline (ratchet check)
+      run: |
+        set -euo pipefail
+        echo "=== R66 P1-09: Baseline Ratchet Check ==="
+        # 与 docs/skip_inventory_baseline.json 比较
+        # 允许 skip 数量减少(技术债清零),禁止显著增加(>10% 增长 WARN)
+        python -c "
+        import json
+        import os
+        current_path = 'skip_inventory_${{ github.sha }}.json'
+        baseline_path = 'docs/skip_inventory_baseline.json'
+        if not os.path.exists(baseline_path):
+            print('WARN: docs/skip_inventory_baseline.json 不存在(首次运行?)')
+            print('  R66 P1-09: 应将首次输出存为 baseline')
+        else:
+            with open(current_path) as f:
+                current = json.load(f)
+            with open(baseline_path) as f:
+                baseline = json.load(f)
+            current_count = len(current.get('skips', []))
+            baseline_count = len(baseline.get('skips', []))
+            print(f'Baseline skips: {baseline_count}')
+            print(f'Current skips:  {current_count}')
+            delta = current_count - baseline_count
+            if delta > 0:
+                pct = delta * 100 / max(baseline_count, 1)
+                print(f'WARN: skip count increased by {delta} (+{pct:.1f}%)')
+                print('  R66 P1-09: 新增 skip 需更新 docs/skip_inventory_baseline.json')
+                print('  并在 PR 中说明 category/owner/production_impact')
+            elif delta < 0:
+                print(f'PASS: skip count decreased by {-delta} (技术债清零)')
+            else:
+                print('PASS: skip count unchanged')
+        "
+
+    - name: Upload skip inventory artifact
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: skip-inventory-${{ github.sha }}
+        path: skip_inventory_${{ github.sha }}.json
         retention-days: 90

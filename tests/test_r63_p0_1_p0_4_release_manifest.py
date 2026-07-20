@@ -15,21 +15,24 @@
       - verification statement 作为后续强依赖输入
 
   P0-04 — migration manifest 与当前发布不一致:
-    manifest release_commit 仍为旧值(非当前 HEAD);
-    tree_sha 仍为旧值(非当前 Tree);
+    R66 P0-01 整改后:catalog 不再绑定 commit/tree(catalog-only 模型);
+    HEAD 绑定由 release-artifacts/release-manifest.json 承担。
     004 migration 已存在但 manifest 只列 001–003;
     manifest 声称存在 .sig/.pem 但树中未见;
     ``_load_migration_manifest()`` 只解析 JSON 没有验签。
 
-    整改:
-      - manifest release_commit / tree_sha 重新生成为当前 HEAD / Tree
+    整改(R66 P0-01 后):
+      - catalog 只保存 migration 集合/顺序/sha256/DDL version/rollback strategy
+      - catalog 不再保存 release_commit/tree_sha(自引用循环根因)
+      - HEAD 绑定由 release-manifest.json (CI 产物)的 source_commit/source_tree 承担
       - 004 migration 加入 manifest 并记录 sha256
-      - ``_load_migration_manifest()`` 增加 HEAD/Tree 绑定 + 磁盘集合一致性 + cosign 验签
+      - ``_load_migration_manifest()`` 增加 catalog-only 验证 + 磁盘集合一致性 +
+        release-manifest 一致性 + cosign 验签
       - 验签 fail-closed, 本地通过 ``MIGRATION_MANIFEST_VERIFY=0`` 跳过(warning)
 
 测试覆盖矩阵:
-  A. manifest 一致性 (P0-04) — release_commit/tree_sha/004 条目/sha256 全量校验
-  B. migrate.py 验签逻辑 (P0-04) — _is_manifest_verify_enabled / _verify_manifest_*
+  A. manifest 一致性 (P0-04) — catalog-only 模型/004 条目/sha256 全量校验
+  B. migrate.py 验签逻辑 (P0-04) — _is_manifest_verify_enabled / _verify_catalog_only_model
   C. release-gates.yml 结构 (P0-01) — cert 提取步骤 / 精确 identity / 上传 image-signing-cert.pem
   D. 跨步骤依赖 (P0-01) — sign-image / publish-attestation 使用同一 identity
 """
@@ -126,35 +129,34 @@ def _file_sha256(path: Path) -> str:
 
 
 class TestManifestConsistency:
-    """manifest 与当前 release HEAD/Tree 的一致性校验。"""
+    """manifest 与当前 release HEAD/Tree 的一致性校验。
 
-    def test_release_commit_matches_current_head(self):
-        """manifest.release_commit 必须严格等于当前 git HEAD。
+    R66 P0-01: catalog 不再绑定 HEAD/Tree(catalog-only 模型)。
+    HEAD 绑定移到 release-artifacts/release-manifest.json(CI 产物)。
+    """
 
-        P0-04: 旧 manifest release_commit 为 17241a8...(过期),必须更新为当前 HEAD。
+    def test_catalog_does_not_contain_release_commit(self):
+        """R66 P0-01: catalog 不得包含 release_commit 字段(自引用循环根因)。
+
+        旧版 catalog 含 release_commit 字段,但 catalog 自身被提交到 git,
+        任何 commit 都使其失效(无稳态)。R66 P0-01 后移除该字段。
         """
         manifest = _load_manifest()
-        head_sha = _git_rev_parse("HEAD")
-        # 若 git 不可用(CI 解压部署场景),skip — 此处假设测试环境有 git
-        if head_sha is None:
-            pytest.skip("git 不可用,无法验证 HEAD 绑定")
-        assert manifest["release_commit"] == head_sha, (
-            f"manifest release_commit ({manifest['release_commit'][:12]}...) "
-            f"与当前 HEAD ({head_sha[:12]}...) 不一致 — P0-04: manifest 必须与当前 release 绑定"
+        assert "release_commit" not in manifest, (
+            "R66 P0-01: catalog 禁止包含 release_commit 字段 "
+            "(自引用循环根因 — HEAD 绑定移至 release-manifest.json)"
         )
 
-    def test_tree_sha_matches_current_head_tree(self):
-        """manifest.tree_sha 必须严格等于当前 git HEAD^{tree}。
+    def test_catalog_does_not_contain_tree_sha(self):
+        """R66 P0-01: catalog 不得包含 tree_sha 字段(自引用循环根因)。
 
-        P0-04: 旧 manifest tree_sha 为 6c9d989...(过期),必须更新为当前 Tree。
+        旧版 catalog 含 tree_sha 字段,但 catalog 自身被提交到 git tree,
+        修改 catalog 使 tree 失效,自引用循环。R66 P0-01 后移除该字段。
         """
         manifest = _load_manifest()
-        tree_sha = _git_rev_parse("HEAD^{tree}")
-        if tree_sha is None:
-            pytest.skip("git 不可用,无法验证 Tree 绑定")
-        assert manifest["tree_sha"] == tree_sha, (
-            f"manifest tree_sha ({manifest['tree_sha'][:12]}...) "
-            f"与当前 HEAD Tree ({tree_sha[:12]}...) 不一致 — P0-04: manifest 必须与当前 release 绑定"
+        assert "tree_sha" not in manifest, (
+            "R66 P0-01: catalog 禁止包含 tree_sha 字段 "
+            "(自引用循环根因 — Tree 绑定移至 release-manifest.json)"
         )
 
     def test_manifest_lists_all_four_migrations(self):
@@ -286,28 +288,16 @@ class TestManifestConsistency:
             "用于构造精确 certificate-identity (prefix + ref)"
         )
 
-    def test_manifest_release_commit_is_not_stale(self):
-        """manifest.release_commit 不应是 R62 之前的旧值 17241a8...。
+    def test_catalog_version_is_at_least_3(self):
+        """R66 P0-01: catalog version 必须 >= 3(catalog-only 模型版本)。
 
-        P0-04: 旧 manifest release_commit 为 17241a88026aaeca47aae65d917d50bb1c388ebc
-              (R61 HEAD),必须更新为 R63 当前 HEAD。
+        旧版 catalog version=2 含 release_commit/tree_sha;
+        R66 P0-01 后 version=3 移除自引用字段(catalog-only)。
         """
         manifest = _load_manifest()
-        stale_commit = "17241a88026aaeca47aae65d917d50bb1c388ebc"
-        assert manifest["release_commit"] != stale_commit, (
-            "P0-04: manifest release_commit 仍是旧值 17241a8... — 必须更新为当前 R63 HEAD"
-        )
-
-    def test_manifest_tree_sha_is_not_stale(self):
-        """manifest.tree_sha 不应是 R62 之前的旧值 6c9d989...。
-
-        P0-04: 旧 manifest tree_sha 为 6c9d98979c16c21e2960d10c0d17df6e4671599e
-              (R61 Tree),必须更新为 R63 当前 Tree。
-        """
-        manifest = _load_manifest()
-        stale_tree = "6c9d98979c16c21e2960d10c0d17df6e4671599e"
-        assert manifest["tree_sha"] != stale_tree, (
-            "P0-04: manifest tree_sha 仍是旧值 6c9d989... — 必须更新为当前 R63 Tree"
+        assert manifest.get("version", 0) >= 3, (
+            f"R66 P0-01: catalog version 必须 >= 3(catalog-only 模型),"
+            f"实际为 {manifest.get('version')} — version 2 含自引用字段已废弃"
         )
 
 
@@ -350,49 +340,46 @@ class TestManifestVerifyEnabled:
         assert migrate_module._is_manifest_verify_enabled() is False
 
 
-class TestVerifyManifestHeadTreeBinding:
-    """_verify_manifest_head_tree_binding() 的 HEAD/Tree 绑定校验。"""
+class TestVerifyCatalogOnlyModel:
+    """_verify_catalog_only_model() 的 catalog-only 模型校验 (R66 P0-01)。
 
-    def test_passes_with_current_manifest(self, migrate_module, clean_verify_env):
-        """使用当前 manifest(已绑定到 HEAD/Tree)应通过。"""
+    R66 P0-01: catalog 不得包含 release_commit / tree_sha 字段
+    (自引用循环根因 — 任何 commit 都使 catalog 自身的 tree_sha 失效)。
+    HEAD 绑定由 release-artifacts/release-manifest.json 承担。
+    """
+
+    def test_passes_with_catalog_only_manifest(self, migrate_module, clean_verify_env):
+        """使用当前 catalog(无 release_commit/tree_sha)应通过。"""
         data = _load_manifest()
         # 不抛异常即通过
-        migrate_module._verify_manifest_head_tree_binding(data)
+        migrate_module._verify_catalog_only_model(data)
 
-    def test_raises_when_release_commit_mismatch(self, migrate_module, clean_verify_env):
-        """release_commit 与 HEAD 不匹配 → AppError (fail-closed)。"""
+    def test_raises_when_release_commit_present(self, migrate_module, clean_verify_env):
+        """catalog 包含 release_commit 字段 → AppError (fail-closed)。"""
         data = _load_manifest()
-        data["release_commit"] = "0" * 40  # 显然不匹配的 SHA
-        with pytest.raises(AppError, match="release_commit"):
-            migrate_module._verify_manifest_head_tree_binding(data)
+        data["release_commit"] = "0" * 40  # 旧版字段不应再存在
+        with pytest.raises(AppError) as exc_info:
+            migrate_module._verify_catalog_only_model(data)
+        assert exc_info.value.code == ErrorCodes.MIGRATION_MANIFEST_FIELD_MISSING
+        # R66 P0-01: params 应包含 forbidden field 名(release_commit)
+        assert exc_info.value.params.get("field") == "release_commit"
 
-    def test_raises_when_tree_sha_mismatch(self, migrate_module, clean_verify_env):
-        """tree_sha 与 HEAD Tree 不匹配 → AppError (fail-closed)。"""
+    def test_raises_when_tree_sha_present(self, migrate_module, clean_verify_env):
+        """catalog 包含 tree_sha 字段 → AppError (fail-closed)。"""
         data = _load_manifest()
-        data["tree_sha"] = "0" * 40
-        with pytest.raises(AppError, match="tree_sha"):
-            migrate_module._verify_manifest_head_tree_binding(data)
+        data["tree_sha"] = "0" * 40  # 旧版字段不应再存在
+        with pytest.raises(AppError) as exc_info:
+            migrate_module._verify_catalog_only_model(data)
+        assert exc_info.value.code == ErrorCodes.MIGRATION_MANIFEST_FIELD_MISSING
+        # R66 P0-01: params 应包含 forbidden field 名(tree_sha)
+        assert exc_info.value.params.get("field") == "tree_sha"
 
-    def test_raises_when_release_commit_missing(self, migrate_module, clean_verify_env):
-        """release_commit 字段缺失 → AppError。"""
+    def test_passes_when_both_fields_absent(self, migrate_module, clean_verify_env):
+        """catalog 既无 release_commit 也无 tree_sha → 通过(R66 P0-01 默认状态)。"""
         data = _load_manifest()
-        del data["release_commit"]
-        with pytest.raises(AppError, match="release_commit/tree_sha"):
-            migrate_module._verify_manifest_head_tree_binding(data)
-
-    def test_raises_when_tree_sha_missing(self, migrate_module, clean_verify_env):
-        """tree_sha 字段缺失 → AppError。"""
-        data = _load_manifest()
-        del data["tree_sha"]
-        with pytest.raises(AppError, match="release_commit/tree_sha"):
-            migrate_module._verify_manifest_head_tree_binding(data)
-
-    def test_raises_when_release_commit_empty(self, migrate_module, clean_verify_env):
-        """release_commit 为空字符串 → AppError。"""
-        data = _load_manifest()
-        data["release_commit"] = "   "
-        with pytest.raises(AppError, match="release_commit/tree_sha"):
-            migrate_module._verify_manifest_head_tree_binding(data)
+        data.pop("release_commit", None)
+        data.pop("tree_sha", None)
+        migrate_module._verify_catalog_only_model(data)
 
 
 class TestVerifyManifestMigrationSet:
@@ -692,34 +679,31 @@ class TestReleaseGatesWorkflow:
             "P0-01: download-artifact 必须下载 release-gates-signed-${{ github.sha }} 制品"
         )
 
-    def test_release_commit_binding_is_strict_not_ancestor(self, workflow_content):
-        """Verify migration manifest release_commit binding 必须严格匹配 HEAD(非祖先兼容)。
+    def test_workflow_does_not_verify_release_commit_binding(self, workflow_content):
+        """R66 P0-01: release-gates.yml 必须移除 catalog 的 release_commit/tree_sha 绑定校验。
 
-        P0-04: 旧实现允许 release_commit 是 HEAD 的祖先(允许 manifest 落后于 HEAD),
-              R63 要求严格匹配(release_commit == HEAD, tree_sha == HEAD Tree)。
+        R66 P0-01: catalog 不再包含 release_commit/tree_sha 字段(catalog-only 模型),
+        workflow 不应再验证 catalog 的 release_commit binding。HEAD 绑定由
+        release-manifest.json 的 source_commit/source_tree 字段验证。
         """
-        # 检查不再用 git merge-base --is-ancestor(祖先兼容)
-        # 旧: if git merge-base --is-ancestor "${RELEASE_COMMIT}" "${HEAD_SHA}" 2>/dev/null \
-        #     || [ "${RELEASE_COMMIT}" = "${HEAD_SHA}" ]; then
-        # 新: if [ "${RELEASE_COMMIT}" != "${HEAD_SHA}" ]; then ... exit 1; fi
-        assert "manifest release_commit != HEAD" in workflow_content or \
-               'RELEASE_COMMIT}" != "${HEAD_SHA' in workflow_content, (
-            "P0-04: release_commit binding 必须严格匹配 HEAD(==),不允许祖先兼容"
+        # 移除"Verify migration manifest release_commit binding"步骤
+        assert "Verify migration manifest release_commit binding" not in workflow_content, (
+            "R66 P0-01: release-gates.yml 必须移除 'Verify migration manifest "
+            "release_commit binding' 步骤(catalog 不再包含 release_commit 字段)"
         )
 
-    def test_tree_sha_binding_checked(self, workflow_content):
-        """Verify migration manifest binding 必须校验 tree_sha(新增)。
+    def test_workflow_verifies_release_manifest_source_binding(self, workflow_content):
+        """R66 P0-01: workflow 必须验证 release-manifest.json 的 source_commit/source_tree。
 
-        P0-04: 旧实现只校验 release_commit,R63 新增 tree_sha 校验。
+        HEAD/Tree 绑定从 catalog 移到 release-manifest.json(R66 P0-01)。
+        workflow 应验证 release-manifest.json 的 source_commit == 当前 HEAD。
         """
-        assert "manifest tree_sha" in workflow_content and \
-               "HEAD Tree" in workflow_content, (
-            "P0-04: release_commit binding 步骤必须同时校验 tree_sha 与 HEAD Tree"
+        # 必须有验证 release-manifest.json source_commit 的步骤
+        assert "source_commit" in workflow_content, (
+            "R66 P0-01: release-gates.yml 必须验证 release-manifest.json 的 source_commit 字段"
         )
-        # 必须用 git rev-parse HEAD^{tree} 获取当前 Tree SHA
-        assert 'git rev-parse "${HEAD_SHA}^{tree}"' in workflow_content or \
-               "git rev-parse" in workflow_content, (
-            "P0-04: 必须用 git rev-parse HEAD^{tree} 获取当前 Tree SHA 与 manifest tree_sha 比对"
+        assert "source_tree" in workflow_content, (
+            "R66 P0-01: release-gates.yml 必须验证 release-manifest.json 的 source_tree 字段"
         )
 
     def test_identity_form_check_enforced(self, workflow_content):
