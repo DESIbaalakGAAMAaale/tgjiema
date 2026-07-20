@@ -2265,10 +2265,13 @@ jobs:
         # 解码所有 sigstore bundle 中的 DSSE envelope payload → in-toto Statement
         # 优先选择 predicateType 为 https://slsa.dev/provenance/* 的 statement,
         # 兼容 v0.2 与 v1;若无 SLSA provenance,回退到第一个 statement。
+        # 同时保存选中的 sigstore bundle 供 verify_attestation_semantics.py
+        # 做 Rekor inclusion / 证书有效期检查 (--bundle 参数)。
         python3 -c "
         import json, base64, sys
 
         statements = []
+        bundles = []
         with open('attestation_bundles.jsonl') as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
@@ -2292,6 +2295,7 @@ jobs:
                     payload_bytes = base64.b64decode(payload_b64)
                     stmt = json.loads(payload_bytes)
                     statements.append((line_num, stmt))
+                    bundles.append((line_num, bundle))
                     pt = stmt.get('predicateType', '(missing)')
                     print(f'  bundle[{line_num}] predicateType: {pt}')
                 except Exception as e:
@@ -2303,22 +2307,44 @@ jobs:
 
         # 优先选择 SLSA provenance statement (v0.2 或 v1)
         chosen = None
+        chosen_bundle = None
         for idx, stmt in statements:
             pt = stmt.get('predicateType', '')
             if pt.startswith('https://slsa.dev/provenance/'):
                 chosen = stmt
+                # 找到对应的 bundle
+                for bidx, b in bundles:
+                    if bidx == idx:
+                        chosen_bundle = b
+                        break
                 print(f'Selected bundle[{idx}] with predicateType: {pt}')
                 break
 
         # 回退:无 SLSA provenance,使用第一个 statement
         if chosen is None:
             chosen = statements[0][1]
+            chosen_bundle = bundles[0][1] if bundles else None
             print(f'WARN: 无 SLSA provenance bundle,使用第一个 statement', file=sys.stderr)
             print(f'  predicateType: {chosen.get(\"predicateType\", \"(missing)\")}')
 
         statement = chosen
         with open('attestation_statement.json', 'w', encoding='utf-8') as f:
             json.dump(statement, f, ensure_ascii=False, indent=2)
+        # 保存选中的 sigstore bundle 供 verify_attestation_semantics.py --bundle 使用
+        if chosen_bundle is not None:
+            with open('attestation_bundle.json', 'w', encoding='utf-8') as f:
+                json.dump(chosen_bundle, f, ensure_ascii=False, indent=2)
+            print(f'Saved sigstore bundle to attestation_bundle.json')
+            # 输出 bundle 关键信息供调试
+            vm = chosen_bundle.get('verificationMaterial', {}) or {}
+            tlog = vm.get('tlogEntries', []) or []
+            print(f'  verificationMaterial.tlogEntries: {len(tlog)} entries')
+            if tlog:
+                e0 = tlog[0] if isinstance(tlog[0], dict) else {}
+                print(f'  tlogEntries[0].logIndex: {e0.get(\"logIndex\", \"(missing)\")}')
+                print(f'  tlogEntries[0].integratedTime: {e0.get(\"integratedTime\", \"(missing)\")}')
+        else:
+            print('WARN: 无 sigstore bundle 可保存', file=sys.stderr)
         print(f'Extracted in-toto Statement:')
         print(f'  _type: {statement.get(\"_type\", \"(missing)\")}')
         print(f'  predicateType: {statement.get(\"predicateType\", \"(missing)\")}')
@@ -2341,16 +2367,26 @@ jobs:
         echo "  5. OIDC issuer + certificate validity"
         echo ""
         echo "下载的制品:"
-        ls -la attestation_statement.json release-artifacts/release-manifest.json 2>&1 || true
+        ls -la attestation_statement.json attestation_bundle.json release-artifacts/release-manifest.json 2>&1 || true
         echo ""
         # 调用 verify_attestation_semantics.py 做严格语义校验
-        # --statement: in-toto Statement (从 cosign verify-attestation DSSE envelope 解码)
+        # --statement: in-toto Statement (从 GitHub Attestations API DSSE envelope 解码)
+        # --bundle: sigstore bundle (含 verificationMaterial.tlogEntries + 证书链,
+        #           从同一 Attestations API 响应提取)
         # --release-manifest: release-manifest.json (从 sign-image artifact 下载)
         # --strict: 任一校验失败 exit 1
         # --json-output: 输出结构化结果供 release-summary 引用
+        BUNDLE_ARG=""
+        if [ -f attestation_bundle.json ]; then
+          BUNDLE_ARG="--bundle attestation_bundle.json"
+          echo "使用 sigstore bundle: attestation_bundle.json"
+        else
+          echo "WARN: attestation_bundle.json 不存在,跳过 Rekor/证书检查 (strict 模式会 FAIL)"
+        fi
         python scripts/verify_attestation_semantics.py \
           --statement attestation_statement.json \
           --release-manifest release-artifacts/release-manifest.json \
+          ${BUNDLE_ARG} \
           --strict \
           --json-output attestation_semantics_result.json
         echo ""

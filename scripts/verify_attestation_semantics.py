@@ -344,18 +344,24 @@ def _get_config_source_uri(predicate: dict, version: str) -> str:
 
 
 def _get_config_source_digest_sha1(predicate: dict, version: str) -> str:
-    """提取 configSource 的 sha1 digest,兼容 v0.2 与 v1。
+    """提取 configSource 的 commit digest,兼容 v0.2 与 v1。
 
     v0.2: predicate.invocation.configSource.digest.sha1
     v1:   predicate.buildDefinition.resolvedDependencies[] 中
-          git+https:// 条目的 digest.sha1
+          git+https:// 条目的 digest.gitCommit (GitHub attest-build-provenance
+          使用 "gitCommit" 作为 algorithm 名,而非 "sha1")
     """
     if version == "v1":
         dep = _find_git_dep_v1(predicate)
         if dep:
             digests = dep.get("digest") or {}
             if isinstance(digests, dict):
-                return str(digests.get("sha1", "") or "")
+                # R66 P1-10: GitHub attest-build-provenance v1 使用 "gitCommit" 键,
+                # 标准 SLSA v1 spec 也允许 "sha1"。优先 gitCommit,回退 sha1。
+                for key in ("gitCommit", "sha1"):
+                    val = str(digests.get(key, "") or "")
+                    if val:
+                        return val
         # 回退到 v0.2 路径
         return str(
             _safe_get(predicate, "invocation", "configSource", "digest", "sha1", default="") or ""
@@ -615,45 +621,107 @@ def _check_predicate_config_source_digest(predicate: dict, manifest: dict, versi
 
 
 def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
-    """(e5) materials[] 含 digest.sha256 == release_manifest.source_tree_sha 条目。"""
+    """(e5) materials/resolvedDependencies 含 git source,其 commit digest 与 source_commit 一致。
+
+    R66 P1-10 语义校正:
+      原 v0.2 检查期望 materials[] 含 digest.sha256 == source_tree_sha 条目,
+      但标准 SLSA provenance(actions/attest-build-provenance)不会单独列出
+      git tree SHA — git source 条目只携带 commit SHA(v0.2: digest.sha1;
+      v1: digest.gitCommit)。git tree SHA 是 commit 的确定性派生量,验证 commit
+      即隐式验证 tree。
+
+      新语义:
+        - v1: resolvedDependencies[] 中 git+https:// 条目的 digest.gitCommit
+              (或 sha1) == release_manifest.source_commit
+        - v0.2: materials[] 中 git source 条目的 digest.sha1
+                == release_manifest.source_commit
+        - 若 source_commit 缺失,回退到 source_tree_sha 直接匹配(向后兼容)
+    """
     materials = _get_materials(predicate, version)
+    expected_commit = str(
+        manifest.get("source_commit") or manifest.get("source_commit_sha") or ""
+    )
     expected_tree = str(manifest.get("source_tree_sha", "") or "")
-    if not expected_tree:
+    if not expected_commit and not expected_tree:
         return _make_check(
             "predicate_materials_source_tree_sha",
             passed=False,
-            expected="release_manifest.source_tree_sha",
+            expected="release_manifest.source_commit 或 source_tree_sha",
             actual="(manifest 缺失该字段)",
-            message="release manifest 缺 source_tree_sha 字段,无法验证 materials 中的 git tree sha",
+            message="release manifest 缺 source_commit/source_tree_sha 字段,无法验证 materials 中的 git source",
             severity="warning",
         )
-    expected_tree_norm = _strip_sha_prefix(expected_tree)
-    found = False
-    for m in materials:
-        if not isinstance(m, dict):
-            continue
-        digests = m.get("digest") or {}
-        if not isinstance(digests, dict):
-            continue
-        candidate = _strip_sha_prefix(str(digests.get("sha256", "") or ""))
-        if candidate and candidate == expected_tree_norm:
-            found = True
-            break
+    # 优先验证 commit SHA(attestation 实际携带的字段)
+    if expected_commit:
+        expected_norm = _strip_sha_prefix(expected_commit)
+        # v1: gitCommit / sha1;v0.2: sha1。遍历所有 digest 键以提高兼容性。
+        digest_keys = ("gitCommit", "sha1") if version == "v1" else ("sha1", "gitCommit")
+        for m in materials:
+            if not isinstance(m, dict):
+                continue
+            digests = m.get("digest") or {}
+            if not isinstance(digests, dict):
+                continue
+            for key in digest_keys:
+                candidate = _strip_sha_prefix(str(digests.get(key, "") or ""))
+                if candidate and candidate == expected_norm:
+                    return _make_check(
+                        "predicate_materials_source_tree_sha",
+                        passed=True,
+                        expected=f"source_commit={expected_commit}",
+                        actual=f"materials git source {key}={candidate}",
+                        message=(
+                            f"materials 含 git source 条目,commit digest ({key}) "
+                            f"与 source_commit 一致: {candidate} (tree SHA 隐式验证)"
+                        ),
+                        severity="error",
+                    )
+    # 回退: 直接匹配 source_tree_sha (向后兼容,attestation 极少直接携带 tree SHA)
+    if expected_tree:
+        expected_tree_norm = _strip_sha_prefix(expected_tree)
+        for m in materials:
+            if not isinstance(m, dict):
+                continue
+            digests = m.get("digest") or {}
+            if not isinstance(digests, dict):
+                continue
+            for algo in ("sha256", "sha1", "gitCommit"):
+                candidate = _strip_sha_prefix(str(digests.get(algo, "") or ""))
+                if candidate and candidate == expected_tree_norm:
+                    return _make_check(
+                        "predicate_materials_source_tree_sha",
+                        passed=True,
+                        expected=f"source_tree_sha={expected_tree}",
+                        actual=f"materials {algo}={candidate}",
+                        message=f"materials 含 source_tree_sha 条目: {expected_tree}",
+                        severity="error",
+                    )
     return _make_check(
         "predicate_materials_source_tree_sha",
-        passed=found,
-        expected=expected_tree,
-        actual="found" if found else "not found",
+        passed=False,
+        expected=f"source_commit={expected_commit!r} 或 source_tree_sha={expected_tree!r}",
+        actual="not found in materials",
         message=(
-            f"materials 含 source_tree_sha 条目: {expected_tree}" if found
-            else f"materials 未含 source_tree_sha 条目: 期望 {expected_tree!r}"
+            f"materials 未含 git source commit/tree 条目: "
+            f"期望 source_commit={expected_commit!r}"
+            + (f" 或 source_tree_sha={expected_tree!r}" if expected_tree else "")
         ),
         severity="error",
     )
 
 
 def _check_predicate_materials_migration(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
-    """(e6) 若 release_manifest.migration_manifest_digest 存在,materials[] 须含对应条目。"""
+    """(e6) 若 release_manifest.migration_manifest_digest 存在,检查 materials[] 是否含对应条目。
+
+    R66 P1-10 语义校正:
+      标准 SLSA provenance(actions/attest-build-provenance)不会将 repo 内部文件
+      (如 migration-manifest.json)作为独立 material 列出 — git source 条目已
+      通过 commit SHA 绑定整个 repo 内容(含 migration-manifest.json)。
+      因此本检查降级为 warning:
+        - 若 attestation 含匹配条目(自定义 attestation 场景) → PASS
+        - 若不含(标准 attestation 场景) → WARN(不阻断),依赖 git source
+          commit SHA 间接绑定
+    """
     expected_mig = str(manifest.get("migration_manifest_digest", "") or "")
     if not expected_mig:
         # manifest 未提供该字段,本检查不适用 — 跳过(passed=True, severity=info)
@@ -674,24 +742,36 @@ def _check_predicate_materials_migration(predicate: dict, manifest: dict, versio
         digests = m.get("digest") or {}
         if not isinstance(digests, dict):
             continue
-        # 检查 sha256 / sha1 / 任意算法值是否匹配
-        for algo in ("sha256", "sha1", "sha512"):
+        # 检查 sha256 / sha1 / gitCommit / 任意算法值是否匹配
+        for algo in ("sha256", "sha1", "sha512", "gitCommit"):
             candidate = _strip_sha_prefix(str(digests.get(algo, "") or ""))
             if candidate and candidate == expected_mig_norm:
                 found = True
                 break
         if found:
             break
+    if found:
+        return _make_check(
+            "predicate_materials_migration_manifest",
+            passed=True,
+            expected=expected_mig,
+            actual="found",
+            message=f"materials 含 migration_manifest_digest 条目: {expected_mig}",
+            severity="error",
+        )
+    # 标准 attestation 不含 migration_manifest 作为独立 material — 降级为 warning
+    # (migration_manifest 通过 git source commit SHA 间接绑定)
     return _make_check(
         "predicate_materials_migration_manifest",
-        passed=found,
+        passed=True,  # 不阻断(soft warning)
         expected=expected_mig,
-        actual="found" if found else "not found",
+        actual="not found in materials (standard attestation)",
         message=(
-            f"materials 含 migration_manifest_digest 条目: {expected_mig}" if found
-            else f"materials 未含 migration_manifest_digest 条目: 期望 {expected_mig!r}"
+            f"materials 未含 migration_manifest_digest 条目: 期望 {expected_mig!r}"
+            f" — 标准 SLSA attestation 不单独列出 repo 内部文件,"
+            f"migration_manifest 通过 git source commit SHA 间接绑定"
         ),
-        severity="error",
+        severity="warning",
     )
 
 

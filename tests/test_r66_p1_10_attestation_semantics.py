@@ -619,7 +619,15 @@ class TestSlsaProvenancePredicate:
         assert check["passed"]
 
     def test_predicate_materials_missing_migration_manifest_fails(self):
-        """manifest 提供 migration_manifest_digest 但 materials 缺该条目应失败。"""
+        """manifest 提供 migration_manifest_digest 但 materials 缺该条目应通过(warning)。
+
+        R66 P1-10 语义校正:
+          标准 SLSA provenance(actions/attest-build-provenance)不会将 repo 内部文件
+          (如 migration-manifest.json)作为独立 material 列出 — git source 条目已
+          通过 commit SHA 绑定整个 repo 内容。因此本检查降级为 warning(不阻断):
+            - 若 attestation 含匹配条目(自定义 attestation 场景) → PASS (error severity)
+            - 若不含(标准 attestation 场景) → PASS (warning severity,不阻断)
+        """
         statement = _make_valid_statement()
         # 移除 migration material
         statement["predicate"]["materials"] = [
@@ -629,8 +637,11 @@ class TestSlsaProvenancePredicate:
             statement, _make_valid_manifest(),
         )
         check = _check_named(result, "predicate_materials_migration_manifest")
-        assert not check["passed"]
-        assert not result["overall_passed"]
+        # 标准 attestation 不含 migration material — passed=True, severity=warning
+        assert check["passed"]
+        assert check["severity"] == "warning"
+        # warning 不应阻断 overall_passed
+        assert result["overall_passed"]
 
     def test_predicate_materials_migration_skipped_when_manifest_missing_field(self):
         """manifest 未提供 migration_manifest_digest 时应跳过(通过,warning 严重级)。"""
