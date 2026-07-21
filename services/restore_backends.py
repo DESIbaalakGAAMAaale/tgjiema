@@ -1223,7 +1223,7 @@ class CRDBRestoreBackend:
         backend 不做 BACKUP_SCHEMA 列校验。PK 来自 BACKUP_SCHEMA(若表已注册)
         或回退为首列(用于 ON CONFLICT 子句)。
         """
-        from services.db_restore import _safe_val, TABLE_PK
+        from services.restore_writer import _safe_val, TABLE_PK
 
         start = _dt.datetime.now(_dt.timezone.utc)
         staging_schema = provision_result.target
@@ -1444,7 +1444,7 @@ class CRDBRestoreBackend:
                         hash_ok = False
                         continue
                     try:
-                        from services.db_restore import TABLE_PK
+                        from services.restore_writer import TABLE_PK
                         pk = TABLE_PK.get(table_name, "id")
                         cursor = await conn.execute(
                             f'SELECT * FROM "{staging_schema}".{table_name} '

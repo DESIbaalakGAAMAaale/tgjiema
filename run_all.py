@@ -378,18 +378,38 @@ def main():
 
     args = sys.argv[1:]
 
+    # R69 P0-1: APP_ENV 是单一权威源(Dockerfile/Compose/Settings/_production_guard 统一)
     # R38 P2-1: 多进程模式仅用于本地开发,生产环境必须用 systemd + --standalone
     # 多进程模式共享信号处理/资源限制,单 Bot 崩溃影响其他 Bot,且 Telegram Bot API
     # 要求每个 token 独占 getUpdates 连接,多进程模式信号传播不完善可能导致 polling 残留
+    # R69 P0-3: 生产镜像默认 CMD 必须是 fail-closed — 未指定 --standalone 时
+    # 在 APP_ENV=production/staging 下直接 exit 1(不再允许 ENVIRONMENT 缺省时
+    # 误进入多进程模式)
     is_standalone = bool(args and args[0] == "--standalone")
     if not is_standalone:
-        env = os.environ.get("ENVIRONMENT", "development").strip().lower()
-        if env == "production":
+        # R69 P0-1: 优先读取 APP_ENV,降级读取 ENVIRONMENT(向后兼容)
+        app_env = os.environ.get("APP_ENV", "").strip().lower()
+        if not app_env:
+            app_env = os.environ.get("ENVIRONMENT", "development").strip().lower()
+        # R69 P0-1: APP_ENV 显式枚举校验(production 镜像中未知值 fail-closed)
+        _ALLOWED_ENVS = frozenset({
+            "development", "test", "staging", "production",
+        })
+        if app_env and app_env not in _ALLOWED_ENVS:
             logger.error(
-                "[R38-P2-1] 拒绝在 ENVIRONMENT=production 下启动多进程模式。"
+                f"[R69-P0-1] APP_ENV='{app_env}' 不在允许枚举内"
+                f"({sorted(_ALLOWED_ENVS)})。"
+                f"缺值/未知值/拼写错误在 production 镜像中拒绝启动(fail-closed)。"
+            )
+            sys.exit(1)
+        if app_env in ("production", "staging", "prod", "stg"):
+            logger.error(
+                f"[R38-P2-1/R69-P0-3] 拒绝在 APP_ENV={app_env} 下启动多进程模式。"
                 "生产环境必须使用 systemd + --standalone 模式运行各 Bot,"
                 "例如: python run_all.py --standalone up。"
                 "多进程模式仅用于本地开发(共享信号/GIL,单 Bot 崩溃影响其他 Bot)。"
+                "R69 P0-3: 生产镜像默认 CMD 必须显式指定 --standalone <role>,"
+                "未指定时 fail-closed(禁止隐式降级到多进程模式)。"
             )
             sys.exit(1)
         logger.warning(

@@ -327,13 +327,35 @@ class TestR68P0_09ComposeSecurityHardFail:
     """R68 P0-09: Compose 安全属性必须 hard fail(不是 WARN-only)."""
 
     def test_compose_smoke_script_is_hard_fail(self):
-        """check_compose_runtime_smoke.py 是 hard fail(exit 1 on violation)."""
-        script = REPO_ROOT / "scripts" / "check_compose_runtime_smoke.py"
-        content = script.read_text(encoding="utf-8")
+        """check_compose_static_rules.py 是 hard fail(exit 1 on violation).
+
+        R69 Wave 7: 原 check_compose_runtime_smoke.py 已重命名为
+        check_compose_static_rules.py,以反映其真实能力(静态规则门禁,
+        非运行态 smoke)。真实运行态 smoke 由 runtime_smoke_compose.py 提供。
+        """
+        # R69 Wave 7: 优先检查新文件名
+        new_script = REPO_ROOT / "scripts" / "check_compose_static_rules.py"
+        # 旧文件名不应再存在(R69 Wave 7 重命名后)
+        old_script = REPO_ROOT / "scripts" / "check_compose_runtime_smoke.py"
+        assert new_script.exists(), (
+            f"check_compose_static_rules.py 不存在 — R69 Wave 7 重命名要求: "
+            f"静态 lint 不得命名为 runtime smoke"
+        )
+        assert not old_script.exists(), (
+            f"check_compose_runtime_smoke.py 仍存在 — R69 Wave 7: "
+            f"应已重命名为 check_compose_static_rules.py(消除命名误导)"
+        )
+        content = new_script.read_text(encoding="utf-8")
 
         # 不应包含 WARN-only 语义
         assert "WARN-only" not in content, (
-            "check_compose_runtime_smoke.py 不应是 WARN-only — R68 P0-09"
+            "check_compose_static_rules.py 不应是 WARN-only — R68 P0-09"
+        )
+
+        # R69 Wave 7: docstring 必须诚实声明是静态规则门禁,不是运行态 smoke
+        assert "静态规则门禁" in content, (
+            "check_compose_static_rules.py 必须在 docstring 中诚实声明为 "
+            "静态规则门禁(R69 Wave 7)"
         )
 
     def test_compose_has_security_constraints(self):

@@ -793,16 +793,15 @@ class TestAllowLegacyRestoreInProductionFails:
     """
 
     def test_allow_legacy_restore_in_production_fails(self, monkeypatch):
-        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=1 → ValueError。
+        """APP_ENV=production + ALLOW_LEGACY_RESTORE=1 → ValueError。
 
-        生产环境(ENVIRONMENT=production)配置 ALLOW_LEGACY_RESTORE=1/true/yes
-        时,Settings 加载应失败(raise ValueError),阻止进程启动。
+        生产环境(APP_ENV=production,R69 P0-1 单一权威源)配置
+        ALLOW_LEGACY_RESTORE=1/true/yes 时,Settings 加载应失败(raise ValueError),
+        阻止进程启动。
         """
-        # 模拟生产环境
-        monkeypatch.setenv("ENVIRONMENT", "production")
+        # 模拟生产环境 — R69 P0-1: APP_ENV 是唯一权威源,ENVIRONMENT 由其派生
+        monkeypatch.setenv("APP_ENV", "production")
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
-        # 清除其他可能干扰的环境变量
-        monkeypatch.delenv("APP_ENV", raising=False)
         # 设置 SERVICE_ROLE=prometheus_exporter(无 secrets 依赖,避免其他 validator 失败)
         monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
 
@@ -819,10 +818,9 @@ class TestAllowLegacyRestoreInProductionFails:
         assert "production" in error_msg.lower()
 
     def test_allow_legacy_restore_true_in_production_fails(self, monkeypatch):
-        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=true → ValueError。"""
-        monkeypatch.setenv("ENVIRONMENT", "production")
+        """APP_ENV=production + ALLOW_LEGACY_RESTORE=true → ValueError。"""
+        monkeypatch.setenv("APP_ENV", "production")
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "true")
-        monkeypatch.delenv("APP_ENV", raising=False)
         monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
 
         with pytest.raises(ValueError):
@@ -845,10 +843,9 @@ class TestAllowLegacyRestoreInProductionFails:
         assert "R66 P0-07" in str(exc_info.value)
 
     def test_allow_legacy_restore_yes_in_production_fails(self, monkeypatch):
-        """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=yes → ValueError。"""
-        monkeypatch.setenv("ENVIRONMENT", "production")
+        """APP_ENV=production + ALLOW_LEGACY_RESTORE=yes → ValueError。"""
+        monkeypatch.setenv("APP_ENV", "production")
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "yes")
-        monkeypatch.delenv("APP_ENV", raising=False)
         monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
 
         with pytest.raises(ValueError):

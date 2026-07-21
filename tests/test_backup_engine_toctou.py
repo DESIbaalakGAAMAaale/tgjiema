@@ -293,10 +293,16 @@ class TestRestoreRequestHash:
         )
 
         # mock db_restore 避免真实写库
+        # R69 Wave 2: backup_dr_validate 现在从 services.restore_writer 导入,
+        # 因此需要同时 patch 两个位置(restore_writer 为生产路径,db_restore 为 CLI/兼容路径)
         async def _fake_restore_from_backup_data(*args, **kwargs):
             return {"restored_tables": 2, "restored_rows": 3}
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data",
+            _fake_restore_from_backup_data,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
             _fake_restore_from_backup_data,
         )
 
@@ -337,6 +343,10 @@ class TestRestoreRequestHash:
             return {"restored_tables": 0}
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data",
+            _spy_restore,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
             _spy_restore,
         )
 
@@ -411,6 +421,10 @@ class TestRestorePrincipalLookup:
             return {"restored_tables": 1, "restored_rows": 1}
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data",
+            _fake_restore,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
             _fake_restore,
         )
 

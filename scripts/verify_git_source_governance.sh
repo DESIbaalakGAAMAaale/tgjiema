@@ -59,29 +59,46 @@ echo ""
 
 # ════════════════════════════════════════════════════════════════
 # 1. 当前 commit 签名验证 — git verify-commit
+# R69 P0-8: 正确区分 %G? 状态语义(G/U/X 不能混为一谈)
+#   G: good signature (签名有效且公钥在本地信任网)
+#   B: bad signature (签名无效)
+#   U: good signature with unknown validity (签名有效,但公钥不在本地信任网)
+#      → GitHub API 持有公钥,可作为权威源验证
+#   X: no signature (commit 完全无签名)
+#      → 只有 GitHub web-flow / squash commit (GitHub 用自己密钥签名) 才可接受
+#   Y: expired key but valid signature (密钥过期但签名有效)
+#   R: revoked key (密钥已撤销)
+#   E: expired key (密钥过期)
 # ════════════════════════════════════════════════════════════════
 echo "--- 检查 1: git verify-commit ${GITHUB_SHA:0:12} ---"
 COMMIT_SIG_STATUS=$(git log --pretty='%G?' -1 "${GITHUB_SHA}" 2>/dev/null || echo "X")
 case "$COMMIT_SIG_STATUS" in
-  G) echo "  ✓ commit 已签名且验证通过(G)" ;;
+  G) echo "  ✓ commit 已签名且验证通过(G — good signature)" ;;
   B) fail "commit 签名验证失败(B — bad signature)" ;;
-  U) echo "  ⚠ commit 签名未知(U — unknown validity,无公钥)— 将以 GitHub API 验证为准" ;;
-  X) echo "  ⚠ commit 无签名(X)— 将以 GitHub API 验证为准" ;;
-  Y) echo "  ✓ commit 已签名且验证通过(Y)" ;;
+  U) echo "  ⚠ commit 签名有效但公钥不在本地信任网(U — good signature with unknown validity)" ;;
+  X) echo "  ⚠ commit 无签名(X — no signature,本地未检测到任何 GPG 签名)" ;;
+  Y) echo "  ✓ commit 已签名且验证通过(Y — expired key but valid signature)" ;;
   R) fail "commit 签名已撤销(R — revoked)" ;;
   E) fail "commit 签名无法验证(E — expired key)" ;;
   *) fail "commit 签名状态未知: ${COMMIT_SIG_STATUS}" ;;
 esac
 
-# git verify-commit 显式调用(G/B/R/E 状态才视为硬失败,U/X 留给 GitHub API 裁决)
+# git verify-commit 显式调用
+#   - G/Y: 应该通过(本地有公钥且签名有效)
+#   - U: 签名本身有效,但本地缺公钥 → 不视为硬失败,由 GitHub API 裁决
+#   - X: 无签名,git verify-commit 必然失败 → 不视为硬失败,由 GitHub API + reason 裁决
+#   - B/R/E: 硬失败(签名无效/撤销/过期)
 case "$COMMIT_SIG_STATUS" in
-  G|Y|U|X)
-    # U/X:本地无公钥,不视为硬失败,由检查 2 的 GitHub API 验证裁决
+  G|Y)
     if git verify-commit "${GITHUB_SHA}" >/dev/null 2>&1; then
-      echo "  ✓ git verify-commit 显式验证通过"
+      echo "  ✓ git verify-commit 显式验证通过(本地信任的 GPG 公钥)"
     else
-      echo "  ⚠ git verify-commit 本地验证失败(可能缺 GPG 公钥)— 将以 GitHub API 验证为准"
+      fail "git verify-commit ${GITHUB_SHA} 失败(G/Y 状态但 verify-commit 未通过)"
     fi
+    ;;
+  U|X)
+    # U: 签名有效但缺公钥 / X: 无签名 — 由 GitHub API + reason 裁决
+    echo "  [INFO] ${COMMIT_SIG_STATUS} 状态 — 将由 GitHub API verification.reason 裁决"
     ;;
   *)
     fail "git verify-commit ${GITHUB_SHA} 失败(签名状态=${COMMIT_SIG_STATUS})"
@@ -90,6 +107,10 @@ esac
 
 # ════════════════════════════════════════════════════════════════
 # 2. GitHub API commit verification 双重确认
+# R69 P0-8: 区分 U / X 的 GitHub API fallback 语义
+#   - U (签名有效,缺公钥): GitHub API verified=true 即可接受(签名本身有效)
+#   - X (无签名): 必须检查 reason — 只有明确的 GitHub web-flow / squash
+#     签名类型才可接受;普通 unsigned commit 即使 API verified=true 也必须失败
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "--- 检查 2: GitHub API commit verification ---"
@@ -106,12 +127,46 @@ else
   SIGNATURE=$(echo "$API_RESPONSE" | jq -r '.commit.verification.signature // "(none)"')
   if [ "$VERIFIED" = "true" ]; then
     echo "  ✓ GitHub API verification.verified=true (reason=${REASON})"
-    # R68 P0-05: 当本地 git verify-commit 因缺 GPG 公钥失败(U/X),
-    # GitHub API verification.verified=true 即为权威源(GitHub 持有公钥)。
-    # 这不是 fail-open — GitHub API 是签名验证的权威源。
-    if [ "$COMMIT_SIG_STATUS" = "U" ] || [ "$COMMIT_SIG_STATUS" = "X" ]; then
-      echo "  ✓ 本地无 GPG 公钥(U/X),但 GitHub API 验证通过 — 视为签名有效"
-    fi
+    # R69 P0-8: 根据 %G? 状态分流处理
+    case "$COMMIT_SIG_STATUS" in
+      G|Y)
+        # 本地已验证通过,API 双重确认 — 签名有效
+        echo "  ✓ 双重验证通过(本地 G/Y + GitHub API verified=true)"
+        ;;
+      U)
+        # R69 P0-8: U 状态 — 签名本身有效,但本地缺公钥
+        # GitHub API 持有公钥,verified=true 即为权威源(签名确实有效)
+        echo "  ✓ U 状态(签名有效,公钥不在本地信任网)— GitHub API 验证通过"
+        echo "    签名本身有效,GitHub 持有公钥,verified=true 即为权威源"
+        ;;
+      X)
+        # R69 P0-8: X 状态 — commit 无签名,API verified=true 必须有明确原因
+        # 只接受 GitHub web-flow / squash 签名(这些是 GitHub 用自己密钥签名的)
+        # 普通 unsigned commit 即使 API verified=true 也必须失败
+        case "$REASON" in
+          *web-flow*|*web_flow*|*squash*|*merged*|*pseudo*)
+            echo "  ✓ X 状态 — GitHub ${REASON} 签名(GitHub 用自己密钥签名,合法)"
+            ;;
+          *unsigned*|*none*|*"")
+            fail "X 状态 + GitHub API reason=${REASON}(无签名/unknown)— 普通 unsigned commit 不得通过"
+            echo "    R69 P0-8: 普通 unsigned commit 不得仅凭泛化 API 结果通过"
+            echo "    签名: ${SIGNATURE:0:60}..."
+            ;;
+          *)
+            # 其他 reason(如 valid_signature / signed)— 可能是 GitHub 验证了
+            # 某种签名类型,但本地 git %G?=X 表示本地未检测到 GPG 签名
+            # 这种情况需要额外检查 signature 字段是否存在
+            if [ "$SIGNATURE" != "(none)" ] && [ -n "$SIGNATURE" ]; then
+              echo "  ✓ X 状态 — GitHub API 检测到签名(reason=${REASON},signature 存在)"
+              echo "    本地 git 未检测到 GPG 签名,但 GitHub API 持有签名数据"
+            else
+              fail "X 状态 + GitHub API reason=${REASON}(无 signature 数据)— 无法证明签名存在"
+              echo "    R69 P0-8: 无签名的 commit 必须有明确的 GitHub 签名类型(web-flow/squash)"
+            fi
+            ;;
+        esac
+        ;;
+    esac
   else
     fail "GitHub API verification.verified=false (reason=${REASON})"
     echo "    签名: ${SIGNATURE:0:60}..."

@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 1303,
+      "baseline": 1328,
       "target": 0,
       "user_visible": 0,
-      "log_only": 1303
+      "log_only": 1328
     }
   },
   "total": {
-    "baseline": 1918,
+    "baseline": 1943,
     "target": 0,
     "user_visible": 0,
-    "log_only": 1918
+    "log_only": 1943
   },
-  "last_updated": "2026-07-20",
-  "last_updated_by": "R64 audit remediation: new files (restore_orchestrator, button_ux_policy, button_ux_renderer, high_risk_policy, sink_adapters, ru_cost_center additions, crdb_ru_collector additions) add 37 log_only strings; user_visible remains 0"
+  "last_updated": "2026-07-21",
+  "last_updated_by": "R69 Wave 2: extract _restore_from_backup_data from db_restore.py to restore_writer.py (strings moved, not added)"
 }

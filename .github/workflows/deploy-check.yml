@@ -325,14 +325,17 @@ jobs:
         print('Compose 安全与排序约束校验通过')
         "
 
-    # R67 P0-02 / P1-09: 最小运行态 smoke(可选,通过 profile 触发)
-    #   不启动完整生产 stack(避免需要真实 secrets);
-    #   只验证 docker compose config 输出可被 docker compose 解析,
-    #   healthcheck / restart policy / migration ordering 由上面的 Python 校验保证。
-    - name: Minimal runtime smoke (config validation only)
+    # R67 P0-02 / P1-09 / R69 Wave 7: 最小静态配置校验
+    #   R69 Wave 7: 原 "Minimal runtime smoke" 命名误导(此步骤只做 config 解析,
+    #   不启动任何容器,不验证真实运行时行为)。重命名为 "Minimal compose config
+    #   validation" 以反映其真实能力。真实运行态 smoke 由 release-gates.yml
+    #   的 runtime-smoke-compose job 执行(scripts/runtime_smoke_compose.py)。
+    - name: Minimal compose config validation (static, not runtime smoke)
       run: |
         set -euo pipefail
-        echo "=== R67 P0-02 / P1-09: 最小运行态 smoke ==="
+        echo "=== R67 P0-02 / P1-09 / R69 Wave 7: 最小 compose config 静态校验 ==="
+        echo "(R69 Wave 7: 此步骤是静态 config 校验,不是运行态 smoke;"
+        echo " 真实运行态 smoke 由 runtime_smoke_compose.py 在 release-gates.yml 执行)"
         # 验证 rendered-compose.yml 可被 docker compose 解析
         docker compose -f rendered-compose.yml --env-file .env.deploy-check config --quiet
         echo "✓ Rendered compose 可被 docker compose 解析"

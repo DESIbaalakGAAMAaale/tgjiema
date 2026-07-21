@@ -59,6 +59,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIGRATION_MANIFEST_PATH = REPO_ROOT / "database" / "migrations" / "migration-manifest.json"
 MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
+# R69 Wave 5: runtime allowlist 路径(用于计算 digest 并绑定到 candidate manifest)
+RUNTIME_ALLOWLIST_PATH = REPO_ROOT / "scripts" / "runtime_allowlist.py"
 
 # R64 P0-02: 默认 image_name 与 release-gates.yml 中 docker-build 输出一致
 DEFAULT_IMAGE_NAME = "ghcr.io/maxiuquan/tgjiema"
@@ -266,6 +268,25 @@ def generate_release_manifest(
             f"{migration_manifest_digest[:12]}..."
         )
 
+    # 4b. R69 Wave 5: 计算 runtime_allowlist.py 的 digest(用于绑定 OCI allowlist)
+    #     candidate manifest 必须绑定 runtime_allowlist_digest,使得:
+    #     - 镜像构建时使用的 allowlist 与源码一致
+    #     - 部署环境可验证 allowlist 未被篡改
+    #     - OCI verify_oci_allowlist.py 使用同一 allowlist
+    if RUNTIME_ALLOWLIST_PATH.exists():
+        runtime_allowlist_digest = _file_sha256(RUNTIME_ALLOWLIST_PATH)
+        if verbose:
+            print(
+                f"[release_manifest] runtime_allowlist_digest = "
+                f"{runtime_allowlist_digest[:12]}..."
+            )
+    else:
+        # R69 Wave 5: runtime_allowlist.py 不存在是 P0 错误(fail-closed)
+        raise RuntimeError(
+            f"R69 Wave 5: runtime_allowlist.py 不存在: {RUNTIME_ALLOWLIST_PATH}"
+            " — candidate manifest 必须绑定 runtime_allowlist_digest"
+        )
+
     # 5. 生成时间(commit 时间,保证可复现)
     generated_at = _git_commit_iso8601(source_commit)
     if verbose:
@@ -274,6 +295,7 @@ def generate_release_manifest(
     # 6. 构造 canonical manifest(字段顺序固定,便于 cosign 签名可复现)
     #    R66 P1-10: 新增 image_ref / source_repository / source_tree_sha 字段,
     #    供 verify_attestation_semantics.py 语义验证使用(不删除任何既有字段)。
+    #    R69 Wave 5: 新增 runtime_allowlist_digest 字段,绑定 OCI allowlist 配置。
     manifest = {
         "version": RELEASE_MANIFEST_VERSION,
         "type": "release_artifact",
@@ -286,6 +308,7 @@ def generate_release_manifest(
         "image_ref": image_name,
         "migrations": migrations,
         "migration_manifest_digest": migration_manifest_digest,
+        "runtime_allowlist_digest": runtime_allowlist_digest,
         "generated_at": generated_at,
         "tool_version": TOOL_VERSION,
     }

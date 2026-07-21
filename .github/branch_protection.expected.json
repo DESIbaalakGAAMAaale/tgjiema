@@ -47,7 +47,9 @@
       "verify-branch-ruleset",
       "rc-continuity",
       "crdb-ru-72h-attribution-gate",
-      "release-summary"
+      "release-summary",
+      "oci-allowlist-verify",
+      "runtime-smoke-compose"
     ],
     "checks": []
   },

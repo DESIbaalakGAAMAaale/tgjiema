@@ -430,6 +430,10 @@ class TestScenario8StagingRestoreNoDbWrite:
             "services.db_restore._restore_from_backup_data",
             _spy_restore_from_backup_data,
         )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
+            _spy_restore_from_backup_data,
+        )
 
         # staging 模式恢复
         result = await engine.restore(backup_id, target="staging", approver_id=0)
@@ -463,6 +467,10 @@ class TestScenario8StagingRestoreNoDbWrite:
 
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data",
+            _spy_restore_from_backup_data,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
             _spy_restore_from_backup_data,
         )
 

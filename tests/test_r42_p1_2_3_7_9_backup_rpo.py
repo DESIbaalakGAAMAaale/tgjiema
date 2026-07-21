@@ -672,6 +672,10 @@ class TestP13ProductionRestoreApproval:
             "services.db_restore._restore_from_backup_data",
             _fake_restore_from_backup_data,
         )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
+            _fake_restore_from_backup_data,
+        )
 
         # R52 P0-5: mock claim_execution_approved 通过(CAS approved→executing)
         # _FakeDB 不支持 cursor.rowcount 和 execute_fetchall,需 mock CAS 绕过

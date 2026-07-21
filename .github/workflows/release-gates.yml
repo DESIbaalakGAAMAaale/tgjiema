@@ -389,6 +389,99 @@ jobs:
         path: image_build_info.json
         retention-days: 30
 
+  # ─── R69 Wave 3: oci-allowlist-verify ──────────────────────────
+  # 验证最终 OCI 镜像 filesystem 符合 runtime allowlist:
+  #   1. blocklist 验证:无 services/db_restore.py、tests/、scripts/、docs/ 等禁止文件
+  #   2. allowlist 验证:生产入口依赖文件存在
+  #   3. import smoke:关键模块在镜像内可 import
+  # R69 P0-5: 不得依靠 .dockerignore 单点排除敏感文件 — 此 job 是第三道防线
+  oci-allowlist-verify:
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    permissions:
+      contents: read
+      packages: read   # 拉取 GHCR 镜像必需
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image by digest
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          echo "Pulling image by digest for allowlist verification: ${IMAGE_REF}"
+          docker pull "${IMAGE_REF}"
+
+      - name: Verify OCI allowlist (blocklist + allowlist + import smoke)
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          echo "=== R69 Wave 3: OCI Runtime Allowlist Verification ==="
+          echo "Image: ${IMAGE_REF}"
+          echo "SHA: ${{ github.sha }}"
+          python scripts/verify_oci_allowlist.py --image "${IMAGE_REF}"
+
+  # ─── R69 Wave 7: runtime-smoke-compose ──────────────────────────
+  # 真实运行态 smoke:启动容器 + 健康探针 + SIGTERM 优雅关闭 + restart 验证
+  # R69 Wave 7 要求:静态 lint 不得命名为 runtime smoke,
+  # 真实运行态 smoke 必须实际启动容器验证 SIGTERM 处理与日志扫描
+  # 依赖 docker-build(image digest),验证同一不可变候选的真实运行时行为
+  runtime-smoke-compose:
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    permissions:
+      contents: read
+      packages: read   # 拉取 GHCR 镜像必需
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image by digest
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          echo "Pulling image by digest for runtime smoke: ${IMAGE_REF}"
+          docker pull "${IMAGE_REF}"
+
+      - name: Run real runtime smoke (SIGTERM + restart + log scan)
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          echo "=== R69 Wave 7: Real Runtime Compose Smoke ==="
+          echo "Image: ${IMAGE_REF}"
+          echo "SHA: ${{ github.sha }}"
+          # R69 Wave 7: 真实运行态 smoke — 启动容器,验证模块 import + SIGTERM 处理 +
+          # restart 恢复 + 日志扫描(发现 ImportError/ModuleNotFoundError/unhandled exception)
+          # 失败立即阻断 release(不允许 skip/warning 通过)
+          python scripts/runtime_smoke_compose.py \
+            --image "${IMAGE_REF}" \
+            --smoke-timeout 30 \
+            --stop-timeout 25
+
   # ─── 2. docker-digest-verify (P1-1) ──────────────────────────
   # 用 docker manifest inspect 验证 Dockerfile 第 17 行的 digest 真实可拉取
   docker-digest-verify:
@@ -1451,11 +1544,25 @@ jobs:
             f'migration_manifest_digest ({rm[\"migration_manifest_digest\"]}) != '
             f'actual ({actual_mm_digest})'
         )
+        # 6. R69 Wave 5: runtime_allowlist_digest == 当前 scripts/runtime_allowlist.py 实际 sha256
+        #    candidate manifest 必须绑定 OCI allowlist 配置,确保镜像构建时使用的
+        #    allowlist 与源码一致,部署环境可验证 allowlist 未被篡改。
+        runtime_allowlist_path = Path('scripts/runtime_allowlist.py')
+        assert runtime_allowlist_path.exists(), (
+            'R69 Wave 5: scripts/runtime_allowlist.py 不存在 — '
+            'candidate manifest 必须绑定 runtime_allowlist_digest'
+        )
+        actual_ra_digest = hashlib.sha256(runtime_allowlist_path.read_bytes()).hexdigest()
+        assert rm['runtime_allowlist_digest'] == actual_ra_digest, (
+            f'runtime_allowlist_digest ({rm[\"runtime_allowlist_digest\"]}) != '
+            f'actual ({actual_ra_digest})'
+        )
         print(f'PASS: release manifest binding verified')
         print(f'  source_commit: {rm[\"source_commit\"][:12]}...')
         print(f'  source_tree:   {rm[\"source_tree\"][:12]}...')
         print(f'  image_digest:  {rm[\"image_digest\"][:20]}...')
         print(f'  migrations:    {len(rm[\"migrations\"])} 个')
+        print(f'  runtime_allowlist_digest: {rm[\"runtime_allowlist_digest\"][:12]}...')
         "
 
     # R60 P0-06: 仅在签名/verify/provenance 全部成功时上传(原 if: always()
@@ -3233,10 +3340,14 @@ jobs:
             rc-continuity, publish-attestation,
             attestation-semantics-verify, verify-only-3x, tag-ruleset-verify,
             crdb-ru-72h-attribution-gate, production-evidence,
-            production-promotion-gate]
+            production-promotion-gate,
+            oci-allowlist-verify,
+            runtime-smoke-compose]
     env:
       DOCKER_BUILD: ${{ needs.docker-build.result }}
       DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.result }}
+      OCI_ALLOWLIST_VERIFY: ${{ needs.oci-allowlist-verify.result }}
+      RUNTIME_SMOKE_COMPOSE: ${{ needs.runtime-smoke-compose.result }}
       COMPOSE_CONFIG: ${{ needs.compose-config.result }}
       REDIS_ACL_MATRIX: ${{ needs.redis-acl-matrix.result }}
       SCHEMA_DIFF: ${{ needs.schema-diff.result }}
@@ -3298,6 +3409,8 @@ jobs:
         for entry in \
           "docker-build=${DOCKER_BUILD}" \
           "docker-digest-verify=${DOCKER_DIGEST_VERIFY}" \
+          "oci-allowlist-verify=${OCI_ALLOWLIST_VERIFY}" \
+          "runtime-smoke-compose=${RUNTIME_SMOKE_COMPOSE}" \
           "compose-config=${COMPOSE_CONFIG}" \
           "redis-acl-matrix=${REDIS_ACL_MATRIX}" \
           "schema-diff=${SCHEMA_DIFF}" \

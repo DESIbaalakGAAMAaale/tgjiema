@@ -43,12 +43,16 @@ _PRODUCTION_ENVS = frozenset({"production", "staging", "prod", "stg"})
 def _detect_production_environment() -> tuple[bool, str]:
     """检测当前是否为生产/staging 环境。
 
+    R69 P0-1: APP_ENV 是单一权威源,Dockerfile/Compose/run_all.py/Settings
+    全部以 APP_ENV 为事实源。ENVIRONMENT / DEPLOY_ENV 作为历史兼容降级读取
+    (旧部署可能未迁移到 APP_ENV),但 APP_ENV 优先级最高。
+
     直接读取环境变量,不依赖 Settings 实例化(R67 P0-06 关键设计)。
 
     检查顺序:
-        1. ``APP_ENV``(Dockerfile 设置的别名,与 database/migrate.py 一致)
-        2. ``ENVIRONMENT``(Settings 字段对应的 env var)
-        3. ``DEPLOY_ENV``(常见部署工具标识)
+        1. ``APP_ENV``(R69 P0-1 单一权威源,Dockerfile 设置的 ENV APP_ENV=production)
+        2. ``ENVIRONMENT``(历史兼容,Settings 字段对应的 env var)
+        3. ``DEPLOY_ENV``(常见部署工具标识,历史兼容)
 
     Returns:
         (is_production, source_env_var):若为生产环境,返回 (True, env_var_name);

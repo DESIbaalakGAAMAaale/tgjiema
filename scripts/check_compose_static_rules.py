@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-"""R67 P1-09: Compose 运行态 smoke 校验 — rendered compose 静态规则门禁。
+"""R67 P1-09 / R69 Wave 7: Compose 静态规则门禁(已重命名以反映实际能力)。
 
-整改背景(R67 终审报告 P1-09):
-    在 rendered compose 上启动最小 profile,检查非 root、read-only filesystem、
-    healthcheck、secrets mount、网络隔离、restart policy、graceful shutdown
-    和 migration ordering。
+整改背景(R67 终审报告 P1-09 + R69 Wave 7):
+    R69 Wave 7 要求:静态 lint 不得命名为 "runtime smoke"。
+    本脚本原名 check_compose_runtime_smoke.py,但实际只做静态规则校验,
+    不会启动任何容器。为消除命名误导,R69 Wave 7 重命名为
+    check_compose_static_rules.py,文件能力与 docstring 描述保持一致。
+
+    真正的运行态 smoke 由 scripts/runtime_smoke_compose.py 提供
+    (执行 docker compose up + 健康探针 + SIGTERM/restart 验证 + 日志扫描)。
 
 本脚本的范围与边界(诚实声明):
     1. 本脚本是**静态规则门禁**,不是运行态 smoke。
-       真正的运行态 smoke 需要 `docker compose up` + 健康探针 + 流量回放,
-       由 scripts/full_machine_recovery.sh 与 scripts/soak_test_7day.sh 在
-       生产环境执行,本脚本不替代它们。
+       本脚本只解析 docker-compose.yml,验证可静态判定的运行态契约,
+       不会启动任何容器,不验证真实运行时行为。
 
     2. 本脚本通过解析 docker-compose.yml(并可选校验渲染后产物),验证以下
        可静态判定的运行态契约:
@@ -34,7 +37,7 @@
              service_completed_successfully)
 
     3. CI 调用方式:
-         python scripts/check_compose_runtime_smoke.py [--compose docker-compose.yml]
+         python scripts/check_compose_static_rules.py [--compose docker-compose.yml]
 
 退出码:
     0 — 所有静态规则通过

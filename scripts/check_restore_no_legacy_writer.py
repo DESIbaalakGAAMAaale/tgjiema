@@ -4,10 +4,17 @@
 使用 Python ast 模块解析全仓 .py 文件,检测违规调用以下"旧 restore writer"函数:
 
 默认模式(legacy writer 私有/CLI 入口):
-    - _restore_from_backup_data     (services/db_restore.py 私有写入器)
-    - _restore_crdb_tables          (services/db_restore.py 私有 CRDB 子写入器)
-    - _restore_sqlite_tables_to_db  (services/db_restore.py 私有 SQLite 子写入器)
+    - _restore_from_backup_data     (services/db_restore.py + services/restore_writer.py 私有写入器)
+    - _restore_crdb_tables          (services/db_restore.py + services/restore_writer.py 私有 CRDB 子写入器)
+    - _restore_sqlite_tables_to_db  (services/db_restore.py + services/restore_writer.py 私有 SQLite 子写入器)
     - run_restore                   (services/db_restore.py CLI 入口,已被 capability-seal)
+
+R69 Wave 2 整改说明:
+    - services/restore_writer.py 是从 services/db_restore.py 提取出的生产 runtime 写入器模块
+      (.dockerignore 不排除,生产镜像可用)。
+    - services/db_restore.py 保留作为 CLI/tests 入口,生产镜像通过 .dockerignore 排除。
+    - 生产路径:backup_dr_validate.validate_and_restore_backup_strict → restore_writer._restore_from_backup_data
+    - 旧 db_restore.py 中的 _restore_from_backup_data 仍可被 tests 直接调用(向后兼容)。
 
 --strict 模式(额外检测 strict service / backup wrapper 公共入口):
     - validate_and_restore_backup_strict  (services/backup_dr_validate.py 公共入口)
@@ -142,22 +149,39 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
         "reason": "CLI argparse 入口委托:main → run_restore(运行时由 run_restore 的 seal 防护)",
     },
     # backup_dr_validate.py: validate_and_restore_backup_strict 构造 capability 后调用私有写入器
+    # R69 Wave 2: 延迟 import 改为 from services.restore_writer(不再 import services.db_restore),
+    # source_digest 随之更新。allowed_callees 仍为 _restore_from_backup_data(restore_writer.py 中)。
     {
         "file": "services/backup_dr_validate.py",
         "function": "validate_and_restore_backup_strict",
-        "ast_signature": "59f2327778e53de6724c766ca95ba0d43c01b8db3b33f32560171f4561deb72a",
-        "source_digest": "834e59672c722ebd510136938c02a985f1c88beb5eca62a0d2d2ce8662a068b2",
+        "ast_signature": "b5542cdc9e9173653bd91693238d7e897bfab06afd1eb1b22b7c1aebe4fdca5e",
+        "source_digest": "4f51443ba979d72d30a2ffe7337ae903b2bd4c43b8a11d26affa9e4c6cd77273",
         "allowed_callees": frozenset({"_restore_from_backup_data"}),
-        "reason": "strict service 构造 capability 后调用私有写入器",
+        "reason": "strict service 构造 capability 后调用私有写入器(R69 Wave 2: import 改为 services.restore_writer)",
     },
     # backup_dr_validate.py: _restore_preverified_payload 内部委托给 _restore_from_backup_data
+    # R69 Wave 2: 延迟 import 改为 from services.restore_writer,source_digest 随之更新。
     {
         "file": "services/backup_dr_validate.py",
         "function": "_restore_preverified_payload",
-        "ast_signature": "d28c319c525a59d21babdf07a8286f9f76a84deffd71ae667e0926ced11f06c5",
-        "source_digest": "14861f1a66da8bae26838457bdf5a64baae4ae44d20f930f6e95144698388edb",
+        "ast_signature": "7076e586fde43d12790d4f568dc40ad6b47b510e43527203abbb207a3c0a41f3",
+        "source_digest": "a60051021ac2397dcf4bfebabe94831f2d71352e9daa60e0e72c2cc01ed9b933",
         "allowed_callees": frozenset({"_restore_from_backup_data"}),
-        "reason": "preverified payload 路径委托给私有写入器",
+        "reason": "preverified payload 路径委托给私有写入器(R69 Wave 2: import 改为 services.restore_writer)",
+    },
+    # R69 Wave 2: services/restore_writer.py 是从 services/db_restore.py 提取出的
+    # 生产 runtime 写入器模块(.dockerignore 不排除本文件,生产镜像可用)。
+    # _restore_from_backup_data 内部委托给同模块子写入器(_restore_crdb_tables /
+    # _restore_sqlite_tables_to_db),与 db_restore.py 中的旧实现保持语义一致。
+    # 生产路径:backup_dr_validate.validate_and_restore_backup_strict → restore_writer._restore_from_backup_data
+    # 旧 db_restore.py 保留作为 CLI/tests 入口,生产镜像通过 .dockerignore 排除。
+    {
+        "file": "services/restore_writer.py",
+        "function": "_restore_from_backup_data",
+        "ast_signature": "65ff17d599a0afebc23b6d8946976f6588cb34190045e1b1632a5e97935a3410",
+        "source_digest": "cba917d40bf23f9ad855aff7ce340da46604f2b5eae030a6fe7eec1526ba60e7",
+        "allowed_callees": frozenset({"_restore_crdb_tables", "_restore_sqlite_tables_to_db"}),
+        "reason": "R69 Wave 2: restore_writer 同模块私有委托(从 db_restore.py 提取,生产镜像可用)",
     },
     # R66 P0-07: 已 sealed 的生产入口(带 ALLOW_LEGACY_RESTORE capability-seal 检查)
     # R67 P0-06: 在 capability-seal 之前增加 _production_guard 硬守卫。

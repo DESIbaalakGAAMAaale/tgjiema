@@ -2032,9 +2032,13 @@ async def validate_and_restore_backup_strict(
         payload_digest=verified_payload.payload_digest,
     )
 
-    # ── R61 P0-03: 调用私有写入器(延迟导入避免循环依赖) ──
-    # db_restore.py 在 run_restore() 中导入本模块,故此处必须延迟导入。
-    from services.db_restore import _restore_from_backup_data
+    # ── R61 P0-03: 调用私有写入器(R69 Wave 2: 从 services.restore_writer 导入) ──
+    # R69 P0-4 (Wave 2): 写入器逻辑已从 services/db_restore.py 提取到
+    # services/restore_writer.py,消除生产镜像对 services/db_restore.py 的延迟 import 依赖
+    # (.dockerignore 排除 services/db_restore.py 作为 CLI-only 入口)。
+    # services/restore_writer.py 不被 .dockerignore 排除,在生产镜像中可用。
+    # 保持延迟导入以避免循环依赖(restore_writer 间接依赖本模块的 VerifiedBackupPayload)。
+    from services.restore_writer import _restore_from_backup_data
     result = await _restore_from_backup_data(
         verified_payload,
         _capability=capability,
@@ -2131,8 +2135,8 @@ async def _restore_preverified_payload(
         payload_digest=verified_payload.payload_digest,
     )
 
-    # 调用私有写入器(延迟导入避免循环依赖)
-    from services.db_restore import _restore_from_backup_data
+    # 调用私有写入器(R69 Wave 2: 从 services.restore_writer 延迟导入)
+    from services.restore_writer import _restore_from_backup_data
     return await _restore_from_backup_data(
         verified_payload,
         _capability=capability,

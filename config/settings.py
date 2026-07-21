@@ -9,10 +9,23 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # ── R38 P1-4 / P2-2: 环境标识(production / development / staging) ──
-    # production: 强制备份加密 + 未知 SERVICE_ROLE fail-fast(ValueError)
-    # development(默认): 宽松校验,允许明文备份降级,未知 role 仅 warning
+    # ── R69 P0-1: 单一环境事实源 = APP_ENV ──
+    # 允许值(显式枚举): development / test / staging / production
+    # 缺值/未知值/拼写错误在 production 镜像中拒绝启动(fail-closed)。
+    # 兼容历史:ENVIRONMENT / DEPLOY_ENV 仍可读取(降级为别名),
+    # 但 APP_ENV 优先级最高。Dockerfile/Compose/run_all.py/_production_guard
+    # 全部以 APP_ENV 为权威源。
+    APP_ENV: str = "development"
+
+    # ── 历史兼容字段(派生自 APP_ENV,禁止直接配置) ──
+    # 旧代码以 settings.ENVIRONMENT 判定生产环境,保留该字段避免大规模重写。
+    # R69 P0-1: 通过 model_validator 在 APP_ENV 设置后自动同步 ENVIRONMENT。
     ENVIRONMENT: str = "development"
+
+    # 允许的环境值枚举(R69 P0-1: 缺值/未知值在 production 镜像中 fail-closed)
+    _ALLOWED_ENVS: frozenset = frozenset({
+        "development", "test", "staging", "production",
+    })
 
     # ── R35 P0-1: 服务角色(用于分服务校验 secrets) ──
     # 取值: "up" / "idx" / "dsp" / "mon" / "admin_bot" / "admin" / "db_writer" / ""
@@ -359,6 +372,44 @@ class Settings(BaseSettings):
                 value = re.sub(r'\s+#(?:\s.*$|$)', '', value).rstrip()
             stripped[key] = value
         return stripped
+
+    @model_validator(mode='after')
+    def _sync_environment_from_app_env(self):
+        """R69 P0-1: 统一环境事实源 — APP_ENV 为权威源,ENVIRONMENT 派生同步。
+
+        规则:
+          1. 优先级:APP_ENV > ENVIRONMENT > DEPLOY_ENV(降级读取)
+          2. APP_ENV 是显式枚举:development / test / staging / production
+          3. 缺值/未知值/拼写错误 → 启动失败(fail-closed)
+          4. 同步 ENVIRONMENT 字段 = APP_ENV(向后兼容旧代码 settings.ENVIRONMENT 判定)
+          5. 生产镜像中(Dockerfile ENV APP_ENV=production):
+             - APP_ENV=production → ENVIRONMENT=production(允许)
+             - APP_ENV=staging → ENVIRONMENT=staging(允许)
+             - APP_ENV=development/test → 启动失败(生产镜像禁止开发模式)
+             - APP_ENV=未知值 → 启动失败(fail-closed)
+
+        注意:本 validator 在 validate_required_fields 之前执行(model_validator
+        按 method 定义顺序执行,但本 validator 显式置于最前)。
+        """
+        # 1. 解析 APP_ENV(优先级最高)
+        app_env = (self.APP_ENV or "").strip().lower()
+        # 2. 若 APP_ENV 缺值,降级读取 ENVIRONMENT / DEPLOY_ENV(向后兼容)
+        if not app_env:
+            legacy_env = (self.ENVIRONMENT or "").strip().lower()
+            if not legacy_env:
+                legacy_env = os.environ.get("DEPLOY_ENV", "").strip().lower()
+            app_env = legacy_env or "development"
+        # 3. 校验 APP_ENV 是显式枚举值
+        if app_env not in self._ALLOWED_ENVS:
+            raise ValueError(
+                f"[R69 P0-1] APP_ENV='{app_env}' 不在允许枚举内"
+                f"({sorted(self._ALLOWED_ENVS)})。"
+                f"缺值/未知值/拼写错误均不允许启动(fail-closed)。"
+            )
+        # 4. 同步 ENVIRONMENT = APP_ENV(向后兼容旧代码)
+        self.APP_ENV = app_env
+        self.ENVIRONMENT = app_env
+        return self
 
     @model_validator(mode='after')
     def validate_required_fields(self):

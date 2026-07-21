@@ -29,7 +29,8 @@
 /Dockerfile                                @maxiuquan
 /.dockerignore                             @maxiuquan
 /docker-compose.yml                        @maxiuquan
-/scripts/check_compose_runtime_smoke.py    @maxiuquan
+/scripts/check_compose_static_rules.py     @maxiuquan
+/scripts/runtime_smoke_compose.py          @maxiuquan
 
 # ─── Restore / Backup / Production guard ───
 /services/db_restore.py                    @maxiuquan

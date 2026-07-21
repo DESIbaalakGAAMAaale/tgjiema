@@ -270,6 +270,10 @@ class TestProductionRestoreHashMismatch:
             "services.db_restore._restore_from_backup_data",
             _spy_restore,
         )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
+            _spy_restore,
+        )
 
         # 传入不匹配的 hash → raise AppError(PRODUCTION_RESTORE_HASH_MISMATCH)
         with pytest.raises(AppError) as exc_info:
@@ -320,6 +324,10 @@ class TestProductionRestoreHashMatch:
             "services.db_restore._restore_from_backup_data",
             _fake_restore,
         )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
+            _fake_restore,
+        )
 
         # 传入匹配的 hash → 应成功
         result = await engine.restore(
@@ -366,6 +374,10 @@ class TestRestoreAlreadyExecuted:
             return {"restored_tables": 0}
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data",
+            _spy_restore,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
             _spy_restore,
         )
 
@@ -418,6 +430,10 @@ class TestRestoreUpdatesStatusToExecuted:
             "services.db_restore._restore_from_backup_data",
             _fake_restore,
         )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
+            _fake_restore,
+        )
 
         # 执行 restore(应成功)
         result = await engine.restore(
@@ -462,6 +478,10 @@ class TestNonProductionHashOptional:
             return {"restored_tables": 0, "restored_rows": 0}
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data",
+            _fake_restore,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data",
             _fake_restore,
         )
 

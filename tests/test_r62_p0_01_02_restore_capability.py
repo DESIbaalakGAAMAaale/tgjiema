@@ -653,10 +653,16 @@ class TestStrictValidationRejectsTampering:
         bundle = _build_three_stage_backup(mod, **tamper_kwargs)
 
         # Mock _restore_from_backup_data — 应 NOT 被调用
+        # R69 Wave 2: _restore_from_backup_data 已从 services.db_restore 迁移到
+        # services.restore_writer,backup_dr_validate.py 通过函数内 import 调用,
+        # 因此需要同时 mock 两个模块路径(sys.modules 替换)。
         mock_writer = AsyncMock(return_value={"restored": {}, "skipped": [], "errors": []})
         mock_db_restore = types.ModuleType("services.db_restore")
         mock_db_restore._restore_from_backup_data = mock_writer
         monkeypatch.setitem(sys.modules, "services.db_restore", mock_db_restore)
+        mock_restore_writer = types.ModuleType("services.restore_writer")
+        mock_restore_writer._restore_from_backup_data = mock_writer
+        monkeypatch.setitem(sys.modules, "services.restore_writer", mock_restore_writer)
 
         with pytest.raises(AppError):
             await mod.validate_and_restore_backup_strict(
@@ -697,6 +703,11 @@ class TestStrictValidationRejectsTampering:
         mock_db_restore = types.ModuleType("services.db_restore")
         mock_db_restore._restore_from_backup_data = _fake_writer
         monkeypatch.setitem(sys.modules, "services.db_restore", mock_db_restore)
+        # R69 Wave 2: backup_dr_validate.py 从 services.restore_writer import
+        # _restore_from_backup_data(函数内 import),必须同时 mock 此路径
+        mock_restore_writer = types.ModuleType("services.restore_writer")
+        mock_restore_writer._restore_from_backup_data = _fake_writer
+        monkeypatch.setitem(sys.modules, "services.restore_writer", mock_restore_writer)
 
         await mod.validate_and_restore_backup_strict(
             data=bundle["data"],

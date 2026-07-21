@@ -607,7 +607,7 @@ class ConfigRegistry:
         self.register(ConfigMetadata(
             key="BACKUP_KEK",
             category=ConfigCategory.BACKUP,
-            reload_policy=ReloadPolicy.COLD_RELOAD,
+            reload_policy=ReloadPolicy.RESTART_REQUIRED,
             sensitivity=SensitivityLevel.SECRET,
             description="R36 H7: 备份 AES-256-GCM 信封加密 KEK(base64, 32 字节);空则降级为明文",
             default_value="",

@@ -875,6 +875,9 @@ class TestRestoreStateMachine:
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data", _fake_restore,
         )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data", _fake_restore,
+        )
 
         result = await engine.restore(
             backup_id, target="production",
@@ -913,6 +916,9 @@ class TestRestoreStateMachine:
             return {"restored_tables": 0}
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data", _spy_restore,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data", _spy_restore,
         )
 
         from services.error_codes import AppError, ErrorCodes
@@ -956,6 +962,9 @@ class TestRestoreStateMachine:
             raise RuntimeError("CRDB connection lost during restore")
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data", _failing_restore,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data", _failing_restore,
         )
 
         result = await engine.restore(
@@ -1009,6 +1018,9 @@ class TestRestoreStateMachine:
             return {"restored_tables": 0}
         monkeypatch.setattr(
             "services.db_restore._restore_from_backup_data", _spy_restore,
+        )
+        monkeypatch.setattr(
+            "services.restore_writer._restore_from_backup_data", _spy_restore,
         )
 
         # status='executing' 不是 'approved' → _validate_production_approval 抛 PermissionError
