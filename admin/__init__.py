@@ -1561,15 +1561,44 @@ def _make_csrf_response(template_name: str, context: dict, username: str = "") -
 async def health_check(response: Response):
     """健康检查端点(无需认证),供 Docker healthcheck 和负载均衡器使用。
 
-    R41 P1-10: 增强 — 不再只检查 Bot 心跳,同时报告真实依赖状态:
-      - SQLite schema readiness(关键业务表存在)
-      - last collection success(crdb_sync 上次成功同步时间)
-      - R2/CRDB collector freshness(上次指标采集时间)
-      - ACL 配置完整性(REDIS_*_PASSWORD 4 个变量)
-      - RU 当日使用量(采集失败显示 "unknown",不显示 0)
+    R71 Wave 1: 改用 services.health.check_readiness("admin") 执行
+    角色级 fail-closed readiness 检查,取代旧版 prometheus_exporter.check_readiness
+    (旧版仅检查 SQLite 文件存在性,不区分角色,不验证 Redis/CRDB 真实连接)。
+
+    新版行为:
+      - 调用 services.health.check_readiness("admin") 执行全部检查项
+      - 任一 critical 检查失败 → 503 Service Unavailable
+      - 响应包含 HealthResult.to_dict() 结构(healthy/role/checks/timestamp/version)
+      - 保留 Bot 心跳字段(向后兼容运维监控)
 
     任一关键检查失败时返回 503 Service Unavailable。
     """
+    # R71 Wave 1: 使用 services.health.check_readiness 获取角色化依赖状态
+    try:
+        from services.health import check_readiness as _check_dep
+        dep_result = await _check_dep("admin")
+        dep = dep_result.to_dict()
+        # 从 checks 列表提取 {name: healthy} dict(向后兼容旧响应格式)
+        dep_checks = {
+            c["name"]: c["healthy"] for c in dep.get("checks", [])
+        }
+        dep_details = {
+            c["name"]: (c.get("error") or "OK")
+            for c in dep.get("checks", [])
+        }
+        deps_ready = dep_result.healthy
+        dep_role = dep.get("role", "admin")
+        dep_version = dep.get("version", "")
+    except Exception as e:
+        # readiness 模块不可用时降级:仅依赖 Bot 心跳,但记录错误
+        dep = {"healthy": False, "checks": [], "error": str(e)}
+        dep_checks = {}
+        dep_details = {"readiness_error": str(e)}
+        deps_ready = False
+        dep_role = "admin"
+        dep_version = ""
+
+    # 保留 Bot 心跳检查(向后兼容,运维依赖此字段)
     from database.cache_store import get_all_bot_heartbeats
     required_bots = {"up", "idx", "dsp", "mon", "admin_bot"}
     beats = await get_all_bot_heartbeats()
@@ -1579,26 +1608,7 @@ async def health_check(response: Response):
     }
     bots_healthy = all(bot_status.values())
 
-    # R41 P1-10: 复用 prometheus_exporter.check_readiness 获取依赖状态
-    # 避免 admin 与 exporter 各自实现一套 schema/crdb_sync/r2 检查逻辑
-    try:
-        from services.prometheus_exporter import check_readiness as _check_dep
-        dep = _check_dep()
-        dep_checks = dep.get("checks", {})
-        dep_details = dep.get("details", {})
-        ru_daily_usage = dep.get("ru_daily_usage", "unknown")
-        last_crdb_sync_age = dep.get("last_crdb_sync_age", -1.0)
-        last_r2_collect_age = dep.get("last_r2_collect_age", -1.0)
-    except Exception as e:
-        # exporter 不可用时降级:仅依赖 Bot 心跳,但记录错误
-        dep_checks = {}
-        dep_details = {"exporter_error": str(e)}
-        ru_daily_usage = "unknown"
-        last_crdb_sync_age = -1.0
-        last_r2_collect_age = -1.0
-
-    # 整体就绪 = Bot 心跳 + 依赖检查(若 exporter 返回了检查项)
-    deps_ready = all(dep_checks.values()) if dep_checks else True
+    # 整体就绪 = Bot 心跳 + 角色化依赖检查(critical 全通过)
     ready = bots_healthy and deps_ready
 
     if not ready:
@@ -1609,9 +1619,9 @@ async def health_check(response: Response):
         "dependencies": {
             "checks": dep_checks,
             "details": dep_details,
-            "ru_daily_usage": ru_daily_usage,
-            "last_crdb_sync_age_seconds": last_crdb_sync_age,
-            "last_r2_collect_age_seconds": last_r2_collect_age,
+            "healthy": deps_ready,
+            "role": dep_role,
+            "version": dep_version,
         },
     }
 
@@ -1706,7 +1716,7 @@ async def readiness_check():
             },
         )
 
-    # 非测试模式: 完整检查(Bot 心跳 + Prometheus 依赖)
+    # 非测试模式: 完整检查(Bot 心跳 + R71 Wave 1 角色化依赖检查)
     from database.cache_store import get_all_bot_heartbeats
     required_bots = {"up", "idx", "dsp", "mon", "admin_bot"}
     beats = await get_all_bot_heartbeats()
@@ -1715,27 +1725,33 @@ async def readiness_check():
         for name in required_bots
     }
 
-    # 复用 prometheus_exporter.check_readiness 获取依赖状态
+    # R71 Wave 1: 使用 services.health.check_readiness("admin") 获取角色化依赖状态
+    # 取代旧版 prometheus_exporter.check_readiness(SQLite-only,不区分角色)
     try:
-        from services.prometheus_exporter import check_readiness as _check_dep
-        dep = _check_dep()
-    except Exception as e:
-        dep = {
-            "ready": False,
-            "passed": 0,
-            "checks": {"exporter_error": False},
-            "details": {"exporter_error": str(e)},
-            "ru_daily_usage": "unknown",
-            "last_crdb_sync_age": -1.0,
-            "last_r2_collect_age": -1.0,
+        from services.health import check_readiness as _check_dep
+        dep_result = await _check_dep("admin")
+        dep = dep_result.to_dict()
+        # 从 checks 列表提取 {name: healthy} dict(向后兼容旧响应格式)
+        dep_checks = {
+            c["name"]: c["healthy"] for c in dep.get("checks", [])
         }
+        dep_details = {
+            c["name"]: (c.get("error") or "OK")
+            for c in dep.get("checks", [])
+        }
+        dep_ready = dep_result.healthy
+    except Exception as e:
+        dep = {"healthy": False, "checks": [], "error": str(e)}
+        dep_checks = {"readiness_error": False}
+        dep_details = {"readiness_error": str(e)}
+        dep_ready = False
 
     # 合并 Bot 心跳检查到 readiness 报告
-    all_checks = dict(dep.get("checks", {}))
+    all_checks = dict(dep_checks)
     all_checks["bots_running"] = all(bot_status.values())
     all_checks["db_initialized"] = db_initialized
     all_checks["admin_bootstrap"] = bootstrap_ok
-    all_details = dict(dep.get("details", {}))
+    all_details = dict(dep_details)
     all_details["bots_running"] = (
         f"OK: {sum(bot_status.values())}/{len(bot_status)} bots running"
         if all(bot_status.values())
@@ -1744,7 +1760,7 @@ async def readiness_check():
     all_details["db_initialized"] = "OK" if db_initialized else "FAIL"
     all_details["admin_bootstrap"] = "OK" if bootstrap_ok else "FAIL"
 
-    ready = dep.get("ready", False) and all(bot_status.values()) and db_initialized and bootstrap_ok
+    ready = dep_ready and all(bot_status.values()) and db_initialized and bootstrap_ok
     passed = sum(1 for v in all_checks.values() if v)
 
     # R48 P0-3: 显式 JSONResponse,确保 HTTP status 与业务 JSON 一致
@@ -1769,9 +1785,7 @@ async def readiness_check():
             "checks": all_checks,
             "details": all_details,
             "bots": bot_status,
-            "ru_daily_usage": dep.get("ru_daily_usage", "unknown"),
-            "last_crdb_sync_age": dep.get("last_crdb_sync_age", -1.0),
-            "last_r2_collect_age": dep.get("last_r2_collect_age", -1.0),
+            "health_result": dep,
         },
     )
 
@@ -2376,9 +2390,10 @@ async def ru_cost_page(request: Request, admin: AdminPrincipal = Depends(require
 @app.get("/maintenance", response_class=HTMLResponse)
 async def maintenance_page(request: Request, admin: AdminPrincipal = Depends(require_session)):
     """R40: 维护模式控制台"""
-    from services.maintenance_mode import get_status, check_readiness
+    # R71 Wave 1: 使用 check_maintenance_safe()(原 check_readiness 已重命名)
+    from services.maintenance_mode import get_status, check_maintenance_safe
     status = await get_status()
-    readiness = await check_readiness()
+    readiness = await check_maintenance_safe()
     return _make_csrf_response(
         "maintenance.html",
         {"request": request, "admin": admin, "status": status, "readiness": readiness},

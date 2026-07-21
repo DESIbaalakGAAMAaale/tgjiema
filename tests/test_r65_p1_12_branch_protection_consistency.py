@@ -741,7 +741,18 @@ class TestCheckScriptExits0OnConsistent:
         )
 
     def test_exit_0_on_real_repo_default_config(self):
-        """场景 9c: 默认 checked-in 配置 + 真实 workflows → exit 0。"""
+        """场景 9c: 默认 checked-in 配置 + 真实 PR-gate workflows → exit 0。
+
+        R71 P1-02 整改说明:
+            原 R65 P1-12 默认行为会把 push-only/tag-only/self-excluded/
+            non-blocking job 从期望集合中排除,这与 R71 P1-02 要求
+            "BP 必须覆盖所有真实 release-gates.yml job 名" 冲突。
+            现在使用 ``--include-all-jobs`` 禁用 R65 P1-12 过滤逻辑,
+            并通过 ``--workflow-files`` 限定只校验 PR-gate workflows
+            (ci.yml / release-gates.yml / e2e.yml / deploy-check.yml),
+            排除 promote-rc.yml(production 晋级 workflow,非 PR gate,
+            其 job 不应作为 BP required context)。
+        """
         assert DEFAULT_BP_CONFIG.exists(), (
             ".github/branch_protection.expected.json 必须存在 "
             "(checked-in BP 配置基线)"
@@ -749,9 +760,15 @@ class TestCheckScriptExits0OnConsistent:
         exit_code, stdout, stderr = _run_check_script(
             "--bp-config", str(DEFAULT_BP_CONFIG),
             "--workflows-dir", str(REPO_ROOT / ".github" / "workflows"),
+            # R71 P1-02: 只校验 PR-gate workflows,排除 promote-rc.yml
+            # (production 晋级 workflow,非 PR gate)
+            "--workflow-files", "release-gates.yml,ci.yml,e2e.yml,deploy-check.yml",
+            # R71 P1-02: 禁用 R65 P1-12 过滤(push-only/tag-only/
+            # self-excluded/non-blocking),BP 必须覆盖所有真实 job 名
+            "--include-all-jobs",
         )
         assert exit_code == 0, (
-            f"默认 checked-in 配置与真实 workflows 应一致,exit 0,实际 {exit_code}\n"
+            f"默认 checked-in 配置与真实 PR-gate workflows 应一致,exit 0,实际 {exit_code}\n"
             f"stdout:\n{stdout}\nstderr:\n{stderr}"
         )
 

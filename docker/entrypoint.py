@@ -143,6 +143,77 @@ def _assert_no_test_escape_hatches() -> None:
         sys.exit(3)
 
 
+def _run_readiness_gate(app_env: str, service_role: str) -> None:
+    """R71 Wave 1: 启动前 readiness gate — production/staging 强制。
+
+    在 exec 业务进程前,调用 services.health.check_readiness(role) 执行
+    真实依赖检查。任一 critical 检查失败 → sys.exit(4)(fail-closed)。
+
+    production/staging 强制执行;development/test 跳过(本地开发兼容)。
+
+    退出码:
+        0: 通过(隐式,函数返回)
+        4: 未通过(critical 检查失败或 readiness 模块崩溃)
+
+    Args:
+        app_env: 已解析的 APP_ENV(production/staging/development/test)
+        service_role: 规范化后的 SERVICE_ROLE(如 "up_bot" / "db_writer")
+    """
+    if app_env not in ("production", "staging"):
+        # development/test 跳过 readiness gate(本地开发兼容)
+        return
+
+    _log_info(
+        f"R71 Wave 1: 启动前 readiness gate(app_env={app_env}, "
+        f"role={service_role})"
+    )
+
+    try:
+        import asyncio
+
+        from services.health import check_readiness
+    except ImportError as e:
+        # readiness 模块本身不可用 → fail-closed
+        # 不允许跳过(pretend healthy),否则容器会以不健康状态启动
+        _log_error(
+            f"R71 readiness gate 失败: 无法导入 services.health 模块: {e}"
+        )
+        sys.exit(4)
+
+    try:
+        result = asyncio.run(check_readiness(service_role))
+    except Exception as e:
+        # check_readiness 崩溃 → fail-closed(不允许跳过)
+        _log_error(
+            f"R71 readiness gate 崩溃: {type(e).__name__}: {e}"
+        )
+        sys.exit(4)
+
+    if not result.healthy:
+        # critical 检查失败 → fail-closed
+        # 列出所有失败项,便于运维排查
+        failed_critical = [
+            chk for chk in result.checks
+            if chk.critical and not chk.healthy
+        ]
+        failed_names = ", ".join(
+            f"{chk.name}({chk.error})" for chk in failed_critical
+        )
+        _log_error(
+            f"R71 readiness gate 未通过: role={result.role} "
+            f"有 {len(failed_critical)} 个 critical 检查失败: {failed_names}"
+        )
+        sys.exit(4)
+
+    # 通过 → 记录通过信息(包含通过项数,便于审计)
+    passed_count = sum(1 for chk in result.checks if chk.healthy)
+    total_count = len(result.checks)
+    _log_info(
+        f"R71 readiness gate 通过: role={result.role} "
+        f"({passed_count}/{total_count} 项健康)"
+    )
+
+
 def main() -> None:
     """R70 Wave 2: 容器入口主逻辑。"""
     # 1. 解析 APP_ENV(fail-closed,错误立即退出)
@@ -185,6 +256,12 @@ def main() -> None:
     # 4. 构造启动命令
     cmd = _build_command(service_role)
     _log_info(f"SERVICE_ROLE={service_role}, exec: {' '.join(cmd)}")
+
+    # 4b. R71 Wave 1: 启动前 readiness gate(production/staging 强制,
+    # development/test 跳过)。任一 critical 检查失败 → exit 4(fail-closed)。
+    # 注意:此处传入的 service_role 是 entrypoint 别名(如 "up"/"idx"),
+    # services.health._canonicalize_role 会自动规范化为 "up_bot" 等。
+    _run_readiness_gate(app_env, service_role)
 
     # 5. exec 替换进程映像 — PID 1 直接是业务进程,SIGTERM 直达
     # sys.argv[1:] 透传给业务进程(如 prometheus_exporter 的 --port 等)

@@ -1,5 +1,5 @@
 {
-  "_comment": "R65 P1-12: Branch Protection 期望配置(checked-in 基线)。CI 中无 GitHub API 访问权限时,scripts/check_branch_protection_contexts.py 默认读取本文件做一致性校验。本文件由 scripts/configure_branch_protection.sh 在生产环境应用,任何修改都需同步更新本基线。",
+  "_comment": "R65 P1-12 / R71 P1-01/02/03: Branch Protection 期望配置(checked-in 基线)。CI 中无 GitHub API 访问权限时,scripts/check_branch_protection_contexts.py 默认读取本文件做一致性校验。本文件由 scripts/configure_branch_protection.sh 在生产环境应用,任何修改都需同步更新本基线。R71 Wave 6: solo-founder 模式 — required_approving_review_count=0(无审批死锁),strict=true(current-SHA),contexts 覆盖所有真实 release-gates.yml job 名。",
   "_schema": "github_branch_protection_api_response",
   "_r65_p1_12_requirements": {
     "enforce_admins": "true — admin 不能 bypass",
@@ -8,10 +8,10 @@
     "required_linear_history": "true — 禁 merge commit,要求 rebase 或 squash",
     "required_signatures": "true — signed commits 必需(通过 POST /branches/{branch}/protection/required_signatures 单独启用)",
     "dismiss_stale_reviews": "true — 新提交自动 dismiss 旧 approval",
-    "required_approving_review_count": "2 — 独立 reviewer",
-    "require_code_owner_reviews": "true (当 CODEOWNERS 文件存在时)",
+    "required_approving_review_count": "0 — R71 P1-01 solo founder(@maxiuquan 是唯一开发者,无审批死锁)",
+    "require_code_owner_reviews": "false — R71 P1-01 solo founder(CODEOWNERS 保留但不阻断)",
     "required_conversation_resolution": "true — 所有 conversation 必须解决后才能合并",
-    "required_status_checks.strict": "true — status check 必须针对最新提交"
+    "required_status_checks.strict": "true — R71 P1-03 status check 必须针对最新提交(current-SHA,不允许 stale parent commit)"
   },
   "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection",
   "required_status_checks": {
@@ -39,17 +39,32 @@
       "restore-legacy-seal-gate",
       "i18n-strict-export-boundary-gate",
       "migration-manifest-gate",
+      "migration-binding-gate",
       "button-flow-real-ux-gate",
       "backup-restore-drill",
       "sbom",
       "pip-audit",
       "trivy",
+      "sign-image",
+      "sign-artifacts",
+      "verify-branch-protection",
       "verify-branch-ruleset",
+      "verify-git-source-governance",
       "rc-continuity",
+      "publish-attestation",
+      "attestation-semantics-verify",
+      "verify-only-3x",
+      "tag-ruleset-verify",
       "crdb-ru-72h-attribution-gate",
-      "release-summary",
+      "production-evidence",
+      "production-promotion-gate",
       "oci-allowlist-verify",
-      "runtime-smoke-compose"
+      "validate-oci-rootfs",
+      "runtime-smoke-compose",
+      "compose-runtime-e2e",
+      "verify-rc-identity",
+      "bind-runtime-config",
+      "release-summary"
     ],
     "checks": []
   },
@@ -61,7 +76,7 @@
     "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/required_pull_request_reviews",
     "dismiss_stale_reviews": true,
     "require_code_owner_reviews": false,
-    "required_approving_review_count": 2,
+    "required_approving_review_count": 0,
     "dismissal_restrictions": {
       "url": "https://api.github.com/repos/maxiuquan/tgjiema/branches/master/protection/dismissal_restrictions",
       "users": [],

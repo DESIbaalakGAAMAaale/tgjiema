@@ -175,11 +175,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os,time; f='/app/data/cache_store.db'; exit(0 if os.path.exists(f) and (time.time()-os.path.getmtime(f))<600 else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ── crdb_sync (单一 CRDB 同步服务) ──
   crdb_sync:
@@ -221,11 +221,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'crdb_sync' in cmd else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ── up (上传接收 Bot) ──
   up:
@@ -271,11 +271,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone up' in cmd else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ── idx (解码索引 Bot) ──
   idx:
@@ -321,11 +321,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone idx' in cmd else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ── dsp (派送分发 Bot) ──
   dsp:
@@ -371,11 +371,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone dsp' in cmd else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ── mon (监控管理 Bot) ──
   mon:
@@ -421,11 +421,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone mon' in cmd else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ── admin_bot (管理员 Bot) ──
   admin_bot:
@@ -471,11 +471,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone admin_bot' in cmd else 1)\" || exit 1"]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
   # ── admin (Web 管理后台) ──
   admin:
@@ -574,11 +574,11 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone db_backup' in cmd else 1)\" || exit 1"]
-      interval: 60s
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      start_period: 90s
 
   # ── prometheus_exporter (指标导出) ──
   prometheus_exporter:

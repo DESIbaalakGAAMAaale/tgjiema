@@ -920,8 +920,12 @@ async def drain_queues(timeout_seconds: int = 300) -> dict:
     }
 
 
-async def check_readiness() -> dict:
-    """检查维护前就绪状态。
+async def check_maintenance_safe() -> dict:
+    """R71 Wave 1: 检查维护前就绪状态(原 check_readiness 重命名)。
+
+    R71 Wave 1 重命名:check_readiness → check_maintenance_safe
+    (语义更准确:本函数检查系统是否可以安全进入维护模式,
+    不应与 services.health.check_readiness 角色级 readiness 检查混淆)。
 
     检查系统是否可以安全进入维护模式(无关键任务在执行)。
 
@@ -944,7 +948,7 @@ async def check_readiness() -> dict:
             pending_jobs = rows[0][0] if rows else 0
             pending_uploads = pending_jobs  # 简化:pending jobs 视为 pending uploads
         except Exception:
-            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_readiness'))
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_maintenance_safe'))
 
         try:
             rows = await store._db.execute_fetchall(
@@ -952,7 +956,7 @@ async def check_readiness() -> dict:
             )
             unprocessed_outbox = rows[0][0] if rows else 0
         except Exception:
-            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_readiness'))
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_maintenance_safe'))
 
         try:
             rows = await store._db.execute_fetchall(
@@ -961,7 +965,7 @@ async def check_readiness() -> dict:
             )
             active_replication = rows[0][0] if rows else 0
         except Exception:
-            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_readiness'))
+            logger.exception(_i18n_t('diagnostics.r65.p1_04.swallowed_exception', file_func='services/maintenance_mode.py:check_maintenance_safe'))
 
     # 就绪条件:无 pending jobs + 无未处理 outbox + 无活跃复制任务
     ready = (pending_jobs == 0 and unprocessed_outbox == 0
@@ -974,6 +978,26 @@ async def check_readiness() -> dict:
         "unprocessed_outbox": unprocessed_outbox,
         "active_replication": active_replication,
     }
+
+
+async def check_readiness() -> dict:
+    """R71 Wave 1: 已弃用 — 请改用 check_maintenance_safe()。
+
+    保留此 wrapper 仅为向后兼容,旧调用方不需修改即可继续工作。
+    新代码应直接调用 check_maintenance_safe(),或对于角色级 readiness 检查
+    使用 services.health.check_readiness(role)。
+
+    Deprecated since:
+        R71 Wave 1
+
+    Migration:
+        - maintenance_mode 内部调用 → check_maintenance_safe()
+        - 角色级 readiness 检查 → services.health.check_readiness(role)
+
+    Returns:
+        与 check_maintenance_safe() 相同的 dict
+    """
+    return await check_maintenance_safe()
 
 
 # ─── 完整维护工作流 ────────────────────────────────────────────
@@ -1105,7 +1129,8 @@ async def execute_maintenance_workflow(reason: str,
     if overall_success:
         step_start = _time.time()
         try:
-            readiness = await check_readiness()
+            # R71 Wave 1: 使用 check_maintenance_safe()(原 check_readiness 已重命名)
+            readiness = await check_maintenance_safe()
             ok = readiness.get("ready", False)
             steps.append({
                 "name": "verify", "success": ok,

@@ -80,7 +80,41 @@ on:
     branches: [master, main]
   # R70 P0-10: production 部署可通过 workflow_dispatch 手动触发
   # (例如运维上传 production evidence artifact 后手动触发 production-promotion-gate)
+  # R71 P0-11: workflow_dispatch 必须提供 RC 身份完整核验输入 — 不允许无身份
+  #   核验就触发 production promotion。verify-rc-identity job 会:
+  #     1. 用 rc_run_id 下载对应 RC run 的 4 类 evidence artifact
+  #        (candidate-manifest / oci-file-manifest / release-attestation / sbom)
+  #     2. 校验 rc_tag / source_sha / candidate_manifest_digest / image_digest
+  #        全部与下载的 artifact 一致
+  #     3. 校验 typed_confirmation == "PROMOTE-RC-TO-PRODUCTION"
+  #   任何字段不匹配 → verify-rc-identity failure → production-promotion-gate
+  #   无法运行 → production 部署被阻断(fail-closed)。
   workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: 'RC tag to promote (e.g., rc-v1.0.0)'
+        required: true
+        type: string
+      rc_run_id:
+        description: 'RC workflow run ID (numeric)'
+        required: true
+        type: string
+      source_sha:
+        description: 'Source commit SHA the RC was built from (40-char hex)'
+        required: true
+        type: string
+      candidate_manifest_digest:
+        description: 'Candidate manifest digest (sha256:<64-hex>)'
+        required: true
+        type: string
+      image_digest:
+        description: 'RC image digest (sha256:<64-hex>)'
+        required: true
+        type: string
+      typed_confirmation:
+        description: 'Type "PROMOTE-RC-TO-PRODUCTION" to confirm'
+        required: true
+        type: string
 
 jobs:
   # ─── 1. docker-build (R58 P0-1: build once, 推送 GHCR, 输出 OCI digest) ──
@@ -95,6 +129,13 @@ jobs:
   #       均通过 image_digest 引用, 不再重新构建
   docker-build:
     runs-on: ubuntu-latest
+    # R71 P0-09: production-v* tag must NOT trigger docker-build.
+    # Production deploys the RC's existing RepoDigest — no rebuild allowed.
+    # docker-build runs only on: pull_request / master/main push (staging)
+    # and rc-v* tags (RC candidate). production-v* tags skip this job entirely.
+    # Defense in depth: a fail-closed guard step below also exits 1 if a
+    # production-v* tag ever reaches this job (e.g. via a bypassed `if:`).
+    if: github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/production-v')
     # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
     # production-v*=production。docker-build 在 master push 与 RC tag 都运行,
     # 因此使用动态 environment 表达式根据 ref 选择环境。
@@ -113,6 +154,20 @@ jobs:
       catalog_digest: ${{ steps.regenerate_catalog.outputs.catalog_digest }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+    # R71 P0-09: fail-closed guard — defense in depth. If a production-v* tag
+    # ever reaches this job (e.g. via a bypassed `if:`), exit 1 immediately.
+    # Production must deploy the RC's existing RepoDigest, never rebuild.
+    - name: "R71 P0-09: Fail-closed guard — reject production-v* tags"
+      run: |
+        set -euo pipefail
+        if [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
+          echo "::error::FAIL: docker-build must not run on production-v* tags (R71 P0-09)"
+          echo "  Production deploys the RC's existing RepoDigest — no rebuild allowed."
+          echo "  GITHUB_REF=${GITHUB_REF}"
+          exit 1
+        fi
+        echo "PASS: not a production-v* tag — docker-build may proceed."
 
     - name: Parse PYTHON_IMAGE from Dockerfile
       id: parse
@@ -139,29 +194,46 @@ jobs:
     # R67 P1-14: 仅 release candidate/tag 流程推送可晋级镜像到生产命名空间;
     #            普通 push/PR 使用临时命名空间(<repo>-ci)与短 retention。
     # R70 P0-10: namespace 完全分离 — 使用 rc-v* / production-v* 替代旧的 v*.*.* tag
+    # R71 P0-10: master push → staging 命名空间 ONLY(不再进入生产命名空间)
+    #            只有 rc-v* tag 产生 production-eligible 镜像。
+    #            production-v* tag 不触发 docker-build(P0-09 if 守卫 + fail-closed 步骤)。
     - name: Compute image tag
       id: meta
       run: |
         # tag 在所有 job 间共享 (rc-continuity / publish-attestation / sign-image)
         # 同一 SHA + 不同 run_id 时 tag 也会变化 (用于 RC continuity 比对)
-        # R67 P1-14 / R70 P0-10: 命名空间选择
-        #   - 生产命名空间 ghcr.io/${{ github.repository }}:仅 release candidate tag
-        #     (rc-v*) 或 production tag (production-v*) 或 master/main push 可推送(可晋级镜像)
+        # R67 P1-14 / R70 P0-10 / R71 P0-10: 命名空间选择
+        #   - 生产命名空间 ghcr.io/${{ github.repository }}:仅 rc-v* tag 可推送(可晋级镜像)
+        #   - Staging 命名空间 ghcr.io/${{ github.repository }}-staging:master/main push
+        #     (CI/staging 用,NOT eligible for production promotion)
         #   - 临时命名空间 ghcr.io/${{ github.repository }}-ci:PR 与非 master 分支 push
         #     使用短 retention(由 cleanup-ci-images job 自动清理)
+        #   - production-v* tag:理论上不会到达此步骤(R71 P0-09 在 job-if 层 + fail-closed
+        #     guard step 双重拦截)。即便到达,也走 rc-v* 同款 production namespace 分支,
+        #     但 P0-09 守卫已保证此情形不会发生 — 保留分支仅作为 defense-in-depth 文档。
         REPO="${{ github.repository }}"
         GITHUB_REF="${{ github.ref }}"
         GITHUB_EVENT="${{ github.event_name }}"
-        if [[ "${GITHUB_REF}" == refs/tags/rc-v* ]] || [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
-          # RC tag (rc-v*) 或 production tag (production-v*) → 生产命名空间
+        if [[ "${GITHUB_REF}" == refs/tags/rc-v* ]]; then
+          # RC tag (rc-v*) → 生产命名空间(可晋级候选)
+          IMAGE_NAME="ghcr.io/${REPO}"
+          IS_PRODUCTION_NAMESPACE="true"
+          RETENTION_DAYS="permanent"
+        elif [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
+          # R71 P0-09: production-v* tag 不应到达此步骤(job-if + fail-closed guard
+          #   已双重拦截)。本分支为 defense-in-depth 文档化保留 — 若实际执行,
+          #   上方 fail-closed guard step 已 exit 1,此赋值不会被使用。
+          #   保留生产命名空间赋值以保持向后兼容(且符合"production 不重建"语义)。
           IMAGE_NAME="ghcr.io/${REPO}"
           IS_PRODUCTION_NAMESPACE="true"
           RETENTION_DAYS="permanent"
         elif [[ "${GITHUB_REF}" == "refs/heads/master" || "${GITHUB_REF}" == "refs/heads/main" ]]; then
-          # master/main push → 生产命名空间(候选可晋级)
-          IMAGE_NAME="ghcr.io/${REPO}"
-          IS_PRODUCTION_NAMESPACE="true"
-          RETENTION_DAYS="permanent"
+          # R71 P0-10: master/main push → staging 命名空间 ONLY
+          #   只有 rc-v* tag 产生 production-eligible 镜像。
+          #   master 镜像仅用于 CI/staging — NOT eligible for production promotion。
+          IMAGE_NAME="ghcr.io/${REPO}-staging"
+          IS_PRODUCTION_NAMESPACE="false"
+          RETENTION_DAYS="30"  # staging retention, not permanent
         else
           # PR 或非 master 分支 push → 临时命名空间 + 短 retention
           IMAGE_NAME="ghcr.io/${REPO}-ci"
@@ -175,7 +247,7 @@ jobs:
         echo "is_production_namespace=${IS_PRODUCTION_NAMESPACE}" >> "$GITHUB_OUTPUT"
         echo "retention_days=${RETENTION_DAYS}" >> "$GITHUB_OUTPUT"
         echo "镜像引用: ${IMAGE_NAME}:${IMAGE_TAG}"
-        echo "命名空间类型: $([ "${IS_PRODUCTION_NAMESPACE}" = "true" ] && echo '生产(可晋级)' || echo '临时(短 retention)')"
+        echo "命名空间类型: $([ "${IS_PRODUCTION_NAMESPACE}" = "true" ] && echo '生产(可晋级)' || echo '临时/staging(短 retention)')"
         echo "Retention: ${RETENTION_DAYS}"
 
     # R66 P0-02: manifest 在 docker build 前已冻结, build 后禁止修改任何
@@ -450,6 +522,102 @@ jobs:
           echo "SHA: ${{ github.sha }}"
           python scripts/verify_oci_allowlist.py --image "${IMAGE_REF}"
 
+  # ─── R71 Wave 4: validate-oci-rootfs ─────────────────────────────
+  # 验证最终 OCI rootfs 与绑定的 manifest 一致性(P0-12):
+  #   1. 拉取 image by digest(不可变引用)
+  #   2. docker save 到 tar, 解包提取 rootfs(组合所有 layer.tar)
+  #   3. 对比 manifest 中每个预期文件: path/type/mode/uid/gid/size/sha256
+  #   4. 区分 base image 文件与 app 文件(对比 base image rootfs)
+  #   5. fail-closed: 缺失/未声明/异常权限/越界 symlink 全部 FAIL
+  #   6. 输出 oci-file-manifest.json(绑定 source_sha + image_digest + base_image_digest)
+  # R71 P0-12: 不再依赖 .dockerignore 单点排除,CI 直接验证最终 rootfs
+  # 依赖 docker-build(image digest)+ oci-allowlist-verify(已 pull image)
+  validate-oci-rootfs:
+    runs-on: ubuntu-latest
+    needs: [docker-build, oci-allowlist-verify]
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。validate-oci-rootfs 在 master push 与 RC tag 都运行。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
+    permissions:
+      contents: read
+      packages: read   # 拉取 GHCR 镜像必需
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Install loguru (validate_oci_rootfs.py 依赖)
+        run: |
+          python -m pip install --upgrade pip
+          pip install loguru
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull app image by digest
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          echo "Pulling app image by digest for rootfs validation: ${IMAGE_REF}"
+          docker pull "${IMAGE_REF}"
+
+      - name: Parse base image digest from Dockerfile
+        id: parse-base
+        run: |
+          set -euo pipefail
+          # 从 Dockerfile ARG PYTHON_IMAGE=... 解析基础镜像(含 digest pinning)
+          BASE_IMAGE=$(grep '^ARG PYTHON_IMAGE=' Dockerfile | sed 's/^ARG PYTHON_IMAGE=//')
+          if [ -z "${BASE_IMAGE}" ]; then
+            echo "::error::无法从 Dockerfile 解析 PYTHON_IMAGE ARG"
+            exit 1
+          fi
+          if [[ "${BASE_IMAGE}" != *@sha256:* ]]; then
+            echo "::error::基础镜像未 pin digest: ${BASE_IMAGE}"
+            echo "  R38 P0-1 要求:基础镜像必须使用 digest pinning"
+            exit 1
+          fi
+          echo "base_image=${BASE_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Parsed base image: ${BASE_IMAGE}"
+
+      - name: Pull base image by digest
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="${{ steps.parse-base.outputs.base_image }}"
+          echo "Pulling base image by digest: ${BASE_IMAGE}"
+          docker pull "${BASE_IMAGE}"
+
+      - name: Validate OCI rootfs against bound manifest (R71 P0-12)
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          BASE_IMAGE="${{ steps.parse-base.outputs.base_image }}"
+          echo "=== R71 Wave 4 P0-12: OCI Rootfs Validation ==="
+          echo "App image: ${IMAGE_REF}"
+          echo "Base image: ${BASE_IMAGE}"
+          echo "Source SHA: ${{ github.sha }}"
+          python scripts/validate_oci_rootfs.py \
+            --image "${IMAGE_REF}" \
+            --source-sha "${{ github.sha }}" \
+            --base-image "${BASE_IMAGE}" \
+            --output oci-file-manifest.json
+          echo "Validation passed. Manifest written to oci-file-manifest.json"
+
+      - name: Upload oci-file-manifest artifact (immutable)
+        if: always()
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: oci-file-manifest-${{ github.sha }}
+          path: oci-file-manifest.json
+          if-no-files-found: error  # fail-closed: 验证失败时 manifest 不存在则 FAIL
+
   # ─── R69 Wave 7: runtime-smoke-compose ──────────────────────────
   # 真实运行态 smoke:启动容器 + 健康探针 + SIGTERM 优雅关闭 + restart 验证
   # R69 Wave 7 要求:静态 lint 不得命名为 runtime smoke,
@@ -501,6 +669,93 @@ jobs:
             --image "${IMAGE_REF}" \
             --smoke-timeout 30 \
             --stop-timeout 25
+
+  # ─── R71 Wave 2: compose-runtime-e2e (P0-05/06/07) ──────────
+  # R71 P0-05: compose_runtime_e2e.py 必须成为 Release Gates required job
+  # R71 P0-06: business_smoke 改为合成交易(不再用 /healthz 代替业务交易)
+  # R71 P0-07: backup_restore 改为结构化数据校验(不再用日志关键词判断恢复成功)
+  # 仅在 rc-v* tag 触发(需要真实 Docker Compose + .env + 不可变 image digest)
+  compose-runtime-e2e:
+    runs-on: ubuntu-latest
+    needs: [docker-build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v-')
+    environment: rc-candidate
+    permissions:
+      contents: read
+      packages: read   # 拉取 GHCR 镜像必需
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image by digest
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          echo "Pulling image by digest for compose runtime E2E: ${IMAGE_REF}"
+          docker pull "${IMAGE_REF}"
+
+      - name: Prepare .env for Compose Runtime E2E
+        run: |
+          set -euo pipefail
+          # 生成最小 .env 占位,让 compose_runtime_e2e.py preflight 通过
+          # (compose_runtime_e2e.py 检查 REDIS_*_PASSWORD 非空 + TGJIEMA_IMAGE@sha256:)
+          IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
+          cat > .env <<EOF
+          REDIS_HEALTH_PASSWORD=ci-placeholder-health
+          REDIS_WRITER_PASSWORD=ci-placeholder-writer
+          REDIS_READER_PASSWORD=ci-placeholder-reader
+          REDIS_ADMIN_PASSWORD=ci-placeholder-admin
+          TGJIEMA_IMAGE=${IMAGE_REF}
+          EOF
+          echo ".env 已生成(含 TGJIEMA_IMAGE digest)"
+
+      - name: Generate minimal secrets placeholders
+        run: |
+          set -euo pipefail
+          # 与 compose-config job 一致:生成 .env.secrets.<service> 占位
+          for svc in migration db_writer crdb_sync up idx dsp mon admin_bot admin db_backup prometheus_exporter; do
+            touch ".env.secrets.${svc}"
+          done
+          touch .env.shared
+
+      - name: Run Compose Runtime E2E (11 phases, fail-closed)
+        run: |
+          set -euo pipefail
+          echo "=== R71 Wave 2: Compose Runtime E2E (11 phases) ==="
+          echo "Phase list: preflight / start_core / start_bots / migration_check /"
+          echo "            health_check / redis_acl_check / business_smoke /"
+          echo "            backup_restore / sigterm / restart / teardown"
+          echo ""
+          echo "R71 P0-06: business_smoke 通过合成交易验证完整业务链路"
+          echo "           (Redis XADD → db_writer → SQLite → 幂等 → DLQ → 清理)"
+          echo "R71 P0-07: backup_restore 通过结构化数据校验验证恢复完整性"
+          echo "           (write-marker → snapshot → backup → restore → verify → cleanup)"
+          echo ""
+          python scripts/compose_runtime_e2e.py \
+            --timeout 600 \
+            --output runtime-e2e-evidence.json
+          echo "=== R71 Wave 2: Compose Runtime E2E 通过 ==="
+
+      - name: Upload runtime-e2e-evidence.json artifact
+        if: always()
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        with:
+          name: runtime-e2e-evidence
+          path: runtime-e2e-evidence.json
+          if-no-files-found: error
+          retention-days: 30
 
   # ─── 2. docker-digest-verify (P1-1) ──────────────────────────
   # 用 docker manifest inspect 验证 Dockerfile 第 17 行的 digest 真实可拉取
@@ -3248,6 +3503,267 @@ jobs:
         retention-days: 90
       if: always()
 
+  # ─── 14a. verify-rc-identity (R71 P0-11: RC 身份完整核验,无重建) ─────
+  # R71 P0-11 整改要点:
+  #   审计发现 workflow_dispatch 没有 RC 身份输入 — 运维可在不验证哪个 RC 被
+  #   晋级的情况下触发 production promotion。本 job 在 production promotion
+  #   前强制核验 RC 身份,确保 production 部署的是已验证的 RC 的 exact signed
+  #   RepoDigest(不重建)。
+  #
+  #   核验流程:
+  #     1. 从 workflow_dispatch inputs 或 production-v* tag annotation 读取 RC 身份
+  #        (rc_tag / rc_run_id / source_sha / candidate_manifest_digest / image_digest)
+  #     2. 用 rc_run_id 下载对应 RC run 的 4 类 evidence artifact
+  #        (candidate-manifest / oci-file-manifest / release-attestation / sbom)
+  #     3. 调用 scripts/verify_rc_identity.py 校验:
+  #        - 输入格式合法(rc_tag 匹配 rc-v*;run_id 数字;source_sha 40-hex;digest sha256:<64-hex>)
+  #        - typed_confirmation == "PROMOTE-RC-TO-PRODUCTION"(workflow_dispatch only)
+  #        - candidate-manifest.json sha256 == --candidate-manifest-digest
+  #        - oci-file-manifest.json image_digest == --image-digest
+  #        - release-attestation.json image_digest == --image-digest
+  #        - sbom.spdx.json 存在且引用同一 image_digest
+  #        - 所有 artifact 交叉核验 source_sha / image_digest / candidate_manifest_digest 一致
+  #     4. 输出 rc_verified=true/false(production-promotion-gate 必须要求 true)
+  #
+  #   本 job 不依赖 docker-build(production-v* tag 跳过 docker-build,P0-09)。
+  #   失败立即阻断 production-promotion-gate(fail-closed,无 continue-on-error)。
+  verify-rc-identity:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v')
+    permissions:
+      contents: read
+      actions: read   # 读取其他 workflow run 的 artifacts (RC run_id)
+    outputs:
+      rc_verified: ${{ steps.verify.outputs.rc_verified }}
+      rc_tag: ${{ steps.resolve.outputs.rc_tag }}
+      rc_run_id: ${{ steps.resolve.outputs.rc_run_id }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      candidate_manifest_digest: ${{ steps.resolve.outputs.candidate_manifest_digest }}
+      image_digest: ${{ steps.resolve.outputs.image_digest }}
+      image_repo_digest: ${{ steps.verify.outputs.image_repo_digest }}
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        fetch-depth: 0  # 需要完整历史以读取 production-v* tag annotation
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install loguru (verify_rc_identity.py 依赖)
+      run: |
+        python -m pip install --upgrade pip
+        pip install loguru
+
+    # R71 P0-11: 解析 RC 身份输入
+    #   - workflow_dispatch: 从 inputs 读取(用户必须填写 6 个字段)
+    #   - production-v* tag: 从 annotated tag 的 annotation message 读取
+    #     (格式: key: value 行,每行一个字段)
+    #   任何字段缺失 → fail-closed (exit 1)
+    - name: "R71 P0-11: Resolve RC identity inputs (workflow_dispatch or production-v* tag annotation)"
+      id: resolve
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -euo pipefail
+        echo "=== R71 P0-11: Resolve RC identity inputs ==="
+        echo "  event_name: ${GITHUB_EVENT_NAME}"
+        echo "  ref: ${GITHUB_REF}"
+        if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+          # workflow_dispatch: 从 inputs 读取
+          RC_TAG="${{ inputs.rc_tag }}"
+          RC_RUN_ID="${{ inputs.rc_run_id }}"
+          SOURCE_SHA="${{ inputs.source_sha }}"
+          CANDIDATE_MANIFEST_DIGEST="${{ inputs.candidate_manifest_digest }}"
+          IMAGE_DIGEST="${{ inputs.image_digest }}"
+          TYPED_CONFIRMATION="${{ inputs.typed_confirmation }}"
+          echo "  source: workflow_dispatch inputs"
+        else
+          # production-v* tag: 从 annotated tag 的 annotation message 读取
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          echo "  source: tag annotation for ${TAG_NAME}"
+          TAG_MSG=$(git tag -l --format='%(contents)' "${TAG_NAME}" 2>/dev/null || echo "")
+          if [ -z "${TAG_MSG}" ]; then
+            echo "::error::FAIL: production-v* tag '${TAG_NAME}' 没有 annotation message"
+            echo "  R71 P0-11: production-v* tag 必须在 annotation 中提供 RC 身份信息"
+            echo "  格式(key: value 行,每行一个字段):"
+            echo "    rc-tag: rc-v1.0.0"
+            echo "    rc-run-id: 1234567890"
+            echo "    source-sha: <40-char hex>"
+            echo "    candidate-manifest-digest: sha256:<64-hex>"
+            echo "    image-digest: sha256:<64-hex>"
+            exit 1
+          fi
+          # 解析 key: value 行(大小写不敏感,允许 : 后空格)
+          RC_TAG=$(echo "${TAG_MSG}" | grep -iE '^rc-tag:' | sed -E 's/^[^:]+:[[:space:]]*//' | tr -d '[:space:]' || echo "")
+          RC_RUN_ID=$(echo "${TAG_MSG}" | grep -iE '^rc-run-id:' | sed -E 's/^[^:]+:[[:space:]]*//' | tr -d '[:space:]' || echo "")
+          SOURCE_SHA=$(echo "${TAG_MSG}" | grep -iE '^source-sha:' | sed -E 's/^[^:]+:[[:space:]]*//' | tr -d '[:space:]' || echo "")
+          CANDIDATE_MANIFEST_DIGEST=$(echo "${TAG_MSG}" | grep -iE '^candidate-manifest-digest:' | sed -E 's/^[^:]+:[[:space:]]*//' | tr -d '[:space:]' || echo "")
+          IMAGE_DIGEST=$(echo "${TAG_MSG}" | grep -iE '^image-digest:' | sed -E 's/^[^:]+:[[:space:]]*//' | tr -d '[:space:]' || echo "")
+          # tag 触发不需要 typed_confirmation(只有 workflow_dispatch 需要,defense in depth)
+          TYPED_CONFIRMATION="PROMOTE-RC-TO-PRODUCTION"
+        fi
+        # 校验所有字段非空(fail-closed)
+        for field in RC_TAG RC_RUN_ID SOURCE_SHA CANDIDATE_MANIFEST_DIGEST IMAGE_DIGEST; do
+          val="${!field}"
+          if [ -z "${val}" ]; then
+            echo "::error::FAIL: RC identity field ${field} is empty"
+            echo "  R71 P0-11: 所有 RC 身份字段必须提供(fail-closed)"
+            exit 1
+          fi
+        done
+        echo "  rc_tag: ${RC_TAG}"
+        echo "  rc_run_id: ${RC_RUN_ID}"
+        echo "  source_sha: ${SOURCE_SHA}"
+        echo "  candidate_manifest_digest: ${CANDIDATE_MANIFEST_DIGEST}"
+        echo "  image_digest: ${IMAGE_DIGEST}"
+        echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
+        echo "rc_run_id=${RC_RUN_ID}" >> "$GITHUB_OUTPUT"
+        echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+        echo "candidate_manifest_digest=${CANDIDATE_MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "typed_confirmation=${TYPED_CONFIRMATION}" >> "$GITHUB_OUTPUT"
+
+    # R71 P0-11: 下载 RC run 的所有 artifacts
+    #   actions/download-artifact@v3 支持 run-id 参数下载其他 workflow run 的 artifacts
+    #   每个 artifact 解压到 ./rc-evidence/<artifact-name>/ 子目录
+    - name: "R71 P0-11: Download RC evidence artifacts from rc_run_id"
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        run-id: ${{ steps.resolve.outputs.rc_run_id }}
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        path: ./rc-evidence
+
+    # R71 P0-11: 将 4 类 evidence 文件聚集到 ./rc-evidence-staged/(verify_rc_identity.py 读取此目录)
+    #   - candidate-manifest.json (来自 candidate-manifest-<sha> artifact,若不存在则从输入合成)
+    #   - oci-file-manifest.json (来自 oci-file-manifest-<sha> artifact)
+    #   - release-attestation.json (来自 release-attestation-<sha> artifact)
+    #   - sbom.spdx.json (来自 release-gates-sbom artifact)
+    #   任一必需 artifact 缺失 → fail-closed (exit 1)
+    - name: "R71 P0-11: Stage RC evidence files for verify_rc_identity.py"
+      run: |
+        set -euo pipefail
+        echo "=== R71 P0-11: Stage RC evidence files ==="
+        mkdir -p ./rc-evidence-staged
+        echo "Downloaded artifacts (from rc_run_id=${{ steps.resolve.outputs.rc_run_id }}):"
+        ls -la ./rc-evidence/ || true
+        # 1. candidate-manifest.json
+        CANDIDATE_MANIFEST_PATH=""
+        for d in ./rc-evidence/candidate-manifest-*; do
+          if [ -f "${d}/candidate-manifest.json" ]; then
+            CANDIDATE_MANIFEST_PATH="${d}/candidate-manifest.json"
+            break
+          fi
+        done
+        if [ -n "${CANDIDATE_MANIFEST_PATH}" ]; then
+          cp "${CANDIDATE_MANIFEST_PATH}" ./rc-evidence-staged/candidate-manifest.json
+          echo "  staged candidate-manifest.json from ${CANDIDATE_MANIFEST_PATH}"
+        else
+          # R71 P0-11: candidate-manifest artifact 可能未单独上传(取决于 RC pipeline 配置)。
+          # 若未上传,从 RC 身份输入合成一份 — verify_rc_identity.py 会校验其 sha256
+          # 与 --candidate-manifest-digest 一致(若不一致则 FAIL)。
+          echo "  candidate-manifest artifact 未找到,从 RC 身份输入合成(fail-closed 校验 digest)"
+          python3 -c "
+          import json
+          manifest = {
+            'schema_version': '1.0',
+            'rc_tag': '${{ steps.resolve.outputs.rc_tag }}',
+            'source_sha': '${{ steps.resolve.outputs.source_sha }}',
+            'image_digest': '${{ steps.resolve.outputs.image_digest }}',
+            'candidate_manifest_digest': '${{ steps.resolve.outputs.candidate_manifest_digest }}',
+            'rc_run_id': '${{ steps.resolve.outputs.rc_run_id }}'
+          }
+          with open('./rc-evidence-staged/candidate-manifest.json', 'w', encoding='utf-8') as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+          "
+          echo "  synthesized candidate-manifest.json (digest will be verified by verify_rc_identity.py)"
+        fi
+        # 2. oci-file-manifest.json (来自 oci-file-manifest-<sha> artifact)
+        OCI_MANIFEST_PATH=""
+        for d in ./rc-evidence/oci-file-manifest-*; do
+          if [ -f "${d}/oci-file-manifest.json" ]; then
+            OCI_MANIFEST_PATH="${d}/oci-file-manifest.json"
+            break
+          fi
+        done
+        if [ -n "${OCI_MANIFEST_PATH}" ]; then
+          cp "${OCI_MANIFEST_PATH}" ./rc-evidence-staged/oci-file-manifest.json
+          echo "  staged oci-file-manifest.json from ${OCI_MANIFEST_PATH}"
+        else
+          echo "::error::FAIL: oci-file-manifest artifact 未找到"
+          echo "  R71 P0-11: RC run ${{ steps.resolve.outputs.rc_run_id }} 必须上传 oci-file-manifest artifact"
+          exit 1
+        fi
+        # 3. release-attestation.json (来自 release-attestation-<sha> artifact)
+        ATTESTATION_PATH=""
+        for d in ./rc-evidence/release-attestation-*; do
+          if [ -f "${d}/release_attestation.json" ]; then
+            ATTESTATION_PATH="${d}/release_attestation.json"
+            break
+          fi
+          if [ -f "${d}/release-attestation.json" ]; then
+            ATTESTATION_PATH="${d}/release-attestation.json"
+            break
+          fi
+        done
+        if [ -n "${ATTESTATION_PATH}" ]; then
+          cp "${ATTESTATION_PATH}" ./rc-evidence-staged/release-attestation.json
+          echo "  staged release-attestation.json from ${ATTESTATION_PATH}"
+        else
+          echo "::error::FAIL: release-attestation artifact 未找到"
+          echo "  R71 P0-11: RC run ${{ steps.resolve.outputs.rc_run_id }} 必须上传 release-attestation artifact"
+          exit 1
+        fi
+        # 4. sbom.spdx.json (来自 release-gates-sbom artifact,文件名为 sbom.json)
+        SBOM_PATH=""
+        if [ -f "./rc-evidence/release-gates-sbom/sbom.json" ]; then
+          SBOM_PATH="./rc-evidence/release-gates-sbom/sbom.json"
+        fi
+        if [ -n "${SBOM_PATH}" ]; then
+          cp "${SBOM_PATH}" ./rc-evidence-staged/sbom.spdx.json
+          echo "  staged sbom.spdx.json from ${SBOM_PATH}"
+        else
+          echo "::error::FAIL: sbom artifact 未找到"
+          echo "  R71 P0-11: RC run ${{ steps.resolve.outputs.rc_run_id }} 必须上传 release-gates-sbom artifact"
+          exit 1
+        fi
+        echo ""
+        echo "Staged RC evidence files:"
+        ls -la ./rc-evidence-staged/
+
+    # R71 P0-11: 调用 verify_rc_identity.py 校验所有 RC 身份字段与 evidence artifact 一致
+    #   任何字段不匹配 → exit 1(fail-closed,production promotion 被阻断)
+    - name: "R71 P0-11: Verify RC identity (fail-closed, promote exact signed RC digest)"
+      id: verify
+      run: |
+        set -euo pipefail
+        echo "=== R71 P0-11: Verify RC identity (promote exact signed RC digest, no rebuild) ==="
+        python3 scripts/verify_rc_identity.py \
+          --rc-tag "${{ steps.resolve.outputs.rc_tag }}" \
+          --rc-run-id "${{ steps.resolve.outputs.rc_run_id }}" \
+          --source-sha "${{ steps.resolve.outputs.source_sha }}" \
+          --candidate-manifest-digest "${{ steps.resolve.outputs.candidate_manifest_digest }}" \
+          --image-digest "${{ steps.resolve.outputs.image_digest }}" \
+          --rc-evidence-dir ./rc-evidence-staged \
+          --typed-confirmation "${{ steps.resolve.outputs.typed_confirmation }}" \
+          --output rc-identity-verification.json
+        # 读取 verification 结果(verify_rc_identity.py exit 0 = overall_passed=true)
+        RC_VERIFIED=$(python3 -c "import json; print(str(json.load(open('rc-identity-verification.json'))['overall_passed']).lower())")
+        IMAGE_REPO_DIGEST=$(python3 -c "import json; print(json.load(open('rc-identity-verification.json')).get('image_repo_digest', ''))")
+        echo "rc_verified=${RC_VERIFIED}" >> "$GITHUB_OUTPUT"
+        echo "image_repo_digest=${IMAGE_REPO_DIGEST}" >> "$GITHUB_OUTPUT"
+        echo "PASS: RC identity verified — production promotes exact signed RC digest (no rebuild)"
+        echo "  image_repo_digest: ${IMAGE_REPO_DIGEST}"
+
+    - name: Upload RC identity verification artifact (immutable)
+      if: always()
+      uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+      with:
+        name: rc-identity-verification-${{ github.sha }}-${{ github.run_id }}
+        path: rc-identity-verification.json
+        if-no-files-found: error  # fail-closed: 验证失败时 verification 文件不存在则 FAIL
+
   # ─── 14b. production-promotion-gate (R65 P0-04: 严格 production 晋级门禁) ──
   # R65 P0-04 整改要点:
   #   审计发现 production-evidence job 是 dry-run,且不阻断晋级。即使生成了
@@ -3282,7 +3798,7 @@ jobs:
     # R67 P0-05: 增加 verify-only-3x 作为代码门禁 vs 生产证据门禁分离的一部分
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v')
     environment: production
-    needs: [production-evidence, crdb-ru-72h-attribution-gate, verify-only-3x]
+    needs: [production-evidence, crdb-ru-72h-attribution-gate, verify-only-3x, verify-rc-identity]
     permissions:
       contents: read
       actions: read
@@ -3355,6 +3871,50 @@ jobs:
           exit 1
         fi
         echo "PASS: verify-only-3x job succeeded (3x verify-only verification passed)"
+
+    # R71 P0-11: 校验 verify-rc-identity job 必须 success 且 rc_verified=true
+    #   production-promotion-gate (production-v* tag 或 workflow_dispatch) 必须要求
+    #   RC 身份已完整核验 — 否则 production 部署可能 promote 错误的/未签名的 digest。
+    #   verify-rc-identity 独立运行(不依赖 docker-build),核验 RC run 的 4 类
+    #   evidence artifact (candidate-manifest / oci-file-manifest /
+    #   release-attestation / sbom) 全部与 RC 身份输入一致。
+    - name: "R71 P0-11: Verify verify-rc-identity job succeeded and rc_verified=true"
+      run: |
+        set -euo pipefail
+        VERIFY_RC_IDENTITY_RESULT="${{ needs.verify-rc-identity.result }}"
+        RC_VERIFIED="${{ needs.verify-rc-identity.outputs.rc_verified }}"
+        RC_TAG="${{ needs.verify-rc-identity.outputs.rc_tag }}"
+        RC_RUN_ID="${{ needs.verify-rc-identity.outputs.rc_run_id }}"
+        SOURCE_SHA="${{ needs.verify-rc-identity.outputs.source_sha }}"
+        IMAGE_DIGEST="${{ needs.verify-rc-identity.outputs.image_digest }}"
+        IMAGE_REPO_DIGEST="${{ needs.verify-rc-identity.outputs.image_repo_digest }}"
+        echo "=== R71 P0-11: Verify verify-rc-identity job result ==="
+        echo "  verify-rc-identity result: ${VERIFY_RC_IDENTITY_RESULT}"
+        echo "  rc_verified:               ${RC_VERIFIED}"
+        echo "  rc_tag:                    ${RC_TAG}"
+        echo "  rc_run_id:                 ${RC_RUN_ID}"
+        echo "  source_sha:                ${SOURCE_SHA}"
+        echo "  image_digest:              ${IMAGE_DIGEST}"
+        echo "  image_repo_digest:         ${IMAGE_REPO_DIGEST}"
+        if [ "${VERIFY_RC_IDENTITY_RESULT}" != "success" ]; then
+          echo "FAIL: verify-rc-identity job did not succeed (got: ${VERIFY_RC_IDENTITY_RESULT})"
+          echo "  R71 P0-11: RC 身份核验失败 — production promotion 被阻断(fail-closed)"
+          echo "  必须确认 rc_run_id=${RC_RUN_ID} 对应的 RC run 上传了完整的 evidence artifacts"
+          exit 1
+        fi
+        if [ "${RC_VERIFIED}" != "true" ]; then
+          echo "FAIL: verify-rc-identity outputs rc_verified=${RC_VERIFIED} (要求 true)"
+          echo "  R71 P0-11: RC 身份字段与 evidence artifact 不一致 — 无法确认 production"
+          echo "  部署的是已验证的 RC 的 exact signed RepoDigest"
+          exit 1
+        fi
+        if [ -z "${IMAGE_REPO_DIGEST}" ]; then
+          echo "FAIL: verify-rc-identity outputs image_repo_digest 为空"
+          echo "  R71 P0-11: production 必须部署具体的 RepoDigest(不可变内容地址)"
+          exit 1
+        fi
+        echo "PASS: verify-rc-identity succeeded — production promotes exact signed RC digest"
+        echo "  image_repo_digest: ${IMAGE_REPO_DIGEST}"
 
     # 下载 production-evidence job 上传的 artifact(含 production_evidence_index.json);
     # 注意:CI 自动生成的是 dry_run 模式,release tag 场景需运维通过单独的
@@ -3438,6 +3998,129 @@ jobs:
   #   循环里用变量插值(表达式在 shell 运行前已静态展开),因此通过 job 级
   #   env 显式传递每个 needs.<job>.result,再在 shell 中逐项校验。
   #   (needs 上下文属性为 result,不是 conclusion;conclusion 属于 steps 上下文)
+  #
+  # ─── R71 Wave 7: bind-runtime-config (P1-04 / P1-05 / P0-13) ──────
+  # R71 P1-04: 严格校验 TGJIEMA_IMAGE 使用完整正则
+  #   (仅允许预期 registry/repository@sha256:<64-hex>,拒绝 tag / 短 hash /
+  #    其他仓库 / 多余字符);pull 后读取真实 RepoDigest,与 candidate
+  #   manifest 精确比较(不只检查字符串中是否包含 @sha256:)
+  # R71 P1-05: 对 config/groups.yaml + config/topology.yaml 等会影响
+  #   运行行为的 host 配置计算 sha256,写入 deployment manifest /
+  #   E2E evidence / promotion evidence / rollback record;部署前后都
+  #   验证配置 digest,漂移时立即阻断
+  # R71 P0-13: 当前 SHA 证据绑定 — 所有 evidence 必须记录 GITHUB_SHA /
+  #   GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT,禁止使用"最近一次成功"或
+  #   父提交/PR head/旧 run 替代当前候选 SHA
+  # 本 job 作为 required check,失败立即阻断 release-summary(fail-closed)
+  bind-runtime-config:
+    runs-on: ubuntu-latest
+    # 仅在 master/main push + rc-v* tag + production-v* tag + workflow_dispatch 时运行
+    # PR 场景:允许 skipped(TGJIEMA_IMAGE 在 PR 阶段可能未配置不可变 digest)
+    if: >-
+      (github.event_name == 'push' &&
+        (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')) ||
+      startsWith(github.ref, 'refs/tags/rc-v') ||
+      startsWith(github.ref, 'refs/tags/production-v') ||
+      github.event_name == 'workflow_dispatch'
+    needs: [docker-build]
+    permissions:
+      contents: read
+      packages: read   # 拉取 GHCR 镜像以读取真实 RepoDigest
+    outputs:
+      image_valid: ${{ steps.validate.outputs.image_valid }}
+      image_repo_digest: ${{ steps.validate.outputs.image_repo_digest }}
+      host_config_digest: ${{ steps.validate.outputs.host_config_digest }}
+      source_sha: ${{ steps.validate.outputs.source_sha }}
+      workflow_run_id: ${{ steps.validate.outputs.workflow_run_id }}
+      workflow_run_attempt: ${{ steps.validate.outputs.workflow_run_attempt }}
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install loguru (validate_runtime_config_binding.py 依赖)
+      run: |
+        python -m pip install --upgrade pip
+        pip install loguru
+
+    - name: Login to GHCR
+      if: env.TGJIEMA_IMAGE != ''
+      uses: docker/login-action@97847b5c3934084447a3b5046736c3ae1c5c0b6f
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    # R71 P1-04 / P1-05 / P0-13: 运行统一身份绑定校验(full-evidence 模式)
+    # - 严格校验 TGJIEMA_IMAGE 格式(完整正则)
+    # - pull 后读取真实 RepoDigest,与 candidate manifest 精确比较
+    # - 计算 host config(groups.yaml + topology.yaml)sha256 combined digest
+    # - 注入 GITHUB_SHA / GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT(当前候选绑定)
+    - name: R71 P1-04/P1-05/P0-13 — Validate runtime config + artifacts binding
+      id: validate
+      env:
+        TGJIEMA_IMAGE: ${{ env.TGJIEMA_IMAGE }}
+        GITHUB_SHA: ${{ github.sha }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      run: |
+        set -euo pipefail
+        echo "=== R71 Wave 7: Runtime Config + Artifacts Binding ==="
+        echo "  source_sha: ${GITHUB_SHA}"
+        echo "  workflow_run_id: ${GITHUB_RUN_ID}"
+        echo "  workflow_run_attempt: ${GITHUB_RUN_ATTEMPT}"
+        if [ -z "${TGJIEMA_IMAGE:-}" ]; then
+          echo "::error::TGJIEMA_IMAGE 环境变量未设置 — 无法进行身份绑定校验"
+          echo "  R71 P1-04: 必须使用预期 registry/repository@sha256:<64-hex>"
+          exit 1
+        fi
+        echo "  TGJIEMA_IMAGE: ${TGJIEMA_IMAGE}"
+        python scripts/validate_runtime_config_binding.py \
+          --mode full-evidence \
+          --image "${TGJIEMA_IMAGE}" \
+          --repo-root "${PWD}" \
+          --output runtime-config-binding.json
+        # R71 P0-13: 注入 GITHUB_SHA / GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT 到 evidence
+        # (build_runtime_config_binding 自动从 env 读取,这里显式 export 确保可见)
+        export GITHUB_SHA GITHUB_RUN_ID GITHUB_RUN_ATTEMPT
+        # 解析输出并设置 step outputs(写入 $GITHUB_OUTPUT 文件)
+        # 使用 jq 解析 JSON(ubuntu-latest 预装 jq,避免 YAML 块缩进问题)
+        IMAGE_REF=$(jq -r '.image_reference // ""' runtime-config-binding.json)
+        if [ -n "${IMAGE_REF}" ]; then
+          IMAGE_VALID="true"
+        else
+          IMAGE_VALID="false"
+        fi
+        IMAGE_REPO_DIGEST=$(jq -r '.image_repo_digest // ""' runtime-config-binding.json)
+        HOST_CONFIG_DIGEST=$(jq -r '.combined_host_config_digest // ""' runtime-config-binding.json)
+        SOURCE_SHA=$(jq -r '.source_sha // ""' runtime-config-binding.json)
+        WORKFLOW_RUN_ID=$(jq -r '.workflow_run_id // ""' runtime-config-binding.json)
+        WORKFLOW_RUN_ATTEMPT=$(jq -r '.workflow_run_attempt // ""' runtime-config-binding.json)
+        {
+          echo "image_valid=${IMAGE_VALID}"
+          echo "image_repo_digest=${IMAGE_REPO_DIGEST}"
+          echo "host_config_digest=${HOST_CONFIG_DIGEST}"
+          echo "source_sha=${SOURCE_SHA}"
+          echo "workflow_run_id=${WORKFLOW_RUN_ID}"
+          echo "workflow_run_attempt=${WORKFLOW_RUN_ATTEMPT}"
+        } >> "$GITHUB_OUTPUT"
+        echo "image_valid=${IMAGE_VALID}"
+        echo "source_sha=${SOURCE_SHA}"
+        echo "host_config_digest=${HOST_CONFIG_DIGEST}"
+
+    - name: Upload runtime-config-binding artifact (immutable)
+      if: always()
+      uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+      with:
+        name: runtime-config-binding-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: runtime-config-binding.json
+        if-no-files-found: error  # fail-closed: 校验失败时 binding 文件不存在则 FAIL
+
   release-summary:
     runs-on: ubuntu-latest
     if: always()
@@ -3453,12 +4136,18 @@ jobs:
             crdb-ru-72h-attribution-gate, production-evidence,
             production-promotion-gate,
             oci-allowlist-verify,
-            runtime-smoke-compose]
+            validate-oci-rootfs,
+            runtime-smoke-compose,
+            compose-runtime-e2e,
+            verify-rc-identity,
+            bind-runtime-config]
     env:
       DOCKER_BUILD: ${{ needs.docker-build.result }}
       DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.result }}
       OCI_ALLOWLIST_VERIFY: ${{ needs.oci-allowlist-verify.result }}
+      VALIDATE_OCI_ROOTFS: ${{ needs.validate-oci-rootfs.result }}
       RUNTIME_SMOKE_COMPOSE: ${{ needs.runtime-smoke-compose.result }}
+      COMPOSE_RUNTIME_E2E: ${{ needs.compose-runtime-e2e.result }}
       COMPOSE_CONFIG: ${{ needs.compose-config.result }}
       REDIS_ACL_MATRIX: ${{ needs.redis-acl-matrix.result }}
       SCHEMA_DIFF: ${{ needs.schema-diff.result }}
@@ -3490,6 +4179,18 @@ jobs:
       CRDB_RU_72H_EVIDENCE_PRESENT: ${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_present }}
       PRODUCTION_EVIDENCE: ${{ needs.production-evidence.result }}
       PRODUCTION_PROMOTION_GATE: ${{ needs.production-promotion-gate.result }}
+      # R71 P0-11: verify-rc-identity (RC 身份完整核验,无重建)
+      VERIFY_RC_IDENTITY: ${{ needs.verify-rc-identity.result }}
+      VERIFY_RC_IDENTITY_RC_VERIFIED: ${{ needs.verify-rc-identity.outputs.rc_verified }}
+      VERIFY_RC_IDENTITY_RC_TAG: ${{ needs.verify-rc-identity.outputs.rc_tag }}
+      VERIFY_RC_IDENTITY_IMAGE_DIGEST: ${{ needs.verify-rc-identity.outputs.image_digest }}
+      VERIFY_RC_IDENTITY_IMAGE_REPO_DIGEST: ${{ needs.verify-rc-identity.outputs.image_repo_digest }}
+      # R71 Wave 7: bind-runtime-config (运行配置 + artifacts 身份绑定)
+      BIND_RUNTIME_CONFIG: ${{ needs.bind-runtime-config.result }}
+      BIND_RUNTIME_CONFIG_IMAGE_VALID: ${{ needs.bind-runtime-config.outputs.image_valid }}
+      BIND_RUNTIME_CONFIG_HOST_CONFIG_DIGEST: ${{ needs.bind-runtime-config.outputs.host_config_digest }}
+      BIND_RUNTIME_CONFIG_SOURCE_SHA: ${{ needs.bind-runtime-config.outputs.source_sha }}
+      BIND_RUNTIME_CONFIG_WORKFLOW_RUN_ID: ${{ needs.bind-runtime-config.outputs.workflow_run_id }}
     steps:
     - name: Verify all required jobs succeeded
       run: |
@@ -3538,7 +4239,9 @@ jobs:
           "docker-build=${DOCKER_BUILD}" \
           "docker-digest-verify=${DOCKER_DIGEST_VERIFY}" \
           "oci-allowlist-verify=${OCI_ALLOWLIST_VERIFY}" \
+          "validate-oci-rootfs=${VALIDATE_OCI_ROOTFS}" \
           "runtime-smoke-compose=${RUNTIME_SMOKE_COMPOSE}" \
+          "compose-runtime-e2e=${COMPOSE_RUNTIME_E2E}" \
           "compose-config=${COMPOSE_CONFIG}" \
           "redis-acl-matrix=${REDIS_ACL_MATRIX}" \
           "schema-diff=${SCHEMA_DIFF}" \
@@ -3562,7 +4265,9 @@ jobs:
           "tag-ruleset-verify=${TAG_RULESET_VERIFY}" \
           "crdb-ru-72h-attribution-gate=${CRDB_RU_72H_ATTRIBUTION_GATE}" \
           "production-evidence=${PRODUCTION_EVIDENCE}" \
-          "production-promotion-gate=${PRODUCTION_PROMOTION_GATE}"; do
+          "production-promotion-gate=${PRODUCTION_PROMOTION_GATE}" \
+          "verify-rc-identity=${VERIFY_RC_IDENTITY}" \
+          "bind-runtime-config=${BIND_RUNTIME_CONFIG}"; do
           job="${entry%%=*}"
           conclusion="${entry##*=}"
           echo "  ${job}: ${conclusion}"
@@ -3590,6 +4295,25 @@ jobs:
               fi
             else
               # master push / production-v* tag / PR: 允许 skipped,failure/cancelled 仍阻断
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
+          elif [ "${job}" = "compose-runtime-e2e" ]; then
+            # R71 Wave 2: compose-runtime-e2e 仅在 rc-v* tag 触发
+            # (需要真实 Docker Compose + .env + 不可变 image digest)
+            # - rc-v* tag (RC_TAG=true): 必须 success (RC candidate 必须通过 11 阶段 E2E)
+            # - master push / production-v* tag / PR: 允许 skipped
+            # R71 P0-05: compose_runtime_e2e.py 必须成为 Release Gates required job
+            if [ "${RC_TAG}" = "true" ]; then
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on RC tag (got: ${conclusion})"
+                echo "  R71 P0-05/06/07: Compose Runtime E2E 必须通过(11 阶段 fail-closed)"
+                FAIL=1
+              fi
+            else
+              # 非 RC tag: 允许 skipped,failure/cancelled 仍阻断
               if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
                 echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
                 FAIL=1
@@ -3654,6 +4378,65 @@ jobs:
                 FAIL=1
               fi
             fi
+          elif [ "${job}" = "verify-rc-identity" ]; then
+            # R71 P0-11: verify-rc-identity 仅在 production-v* tag 或 workflow_dispatch 触发
+            # - production-v* tag (PRODUCTION_TAG=true): 必须 success 且 rc_verified=true
+            #   (RC 身份核验失败 → production promotion 被阻断,无法 promote 未验证 digest)
+            # - workflow_dispatch: 必须 success 且 rc_verified=true
+            # - master push / rc-v* tag / PR: 允许 skipped(verify-rc-identity 仅在
+            #   production 晋级场景运行,RC/master/PR 不需要核验 RC 身份)
+            if [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on production tag/dispatch (got: ${conclusion})"
+                echo "  R71 P0-11: RC 身份核验失败 — production promotion 被阻断(fail-closed)"
+                FAIL=1
+              else
+                # job success 但 rc_verified 必须 = true(defense in depth)
+                if [ "${VERIFY_RC_IDENTITY_RC_VERIFIED}" != "true" ]; then
+                  echo "::error::Job '${job}' succeeded but rc_verified=${VERIFY_RC_IDENTITY_RC_VERIFIED} (要求 true)"
+                  echo "  R71 P0-11: RC 身份字段与 evidence artifact 不一致"
+                  FAIL=1
+                fi
+              fi
+            else
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
+          elif [ "${job}" = "bind-runtime-config" ]; then
+            # R71 Wave 7: bind-runtime-config 在 master/main push + rc-v* tag +
+            #   production-v* tag + workflow_dispatch 时运行,PR 场景 skipped
+            # - master/main push (RELEASE_TARGET=true): 必须 success
+            # - rc-v* tag (RC_TAG=true): 必须 success(RC candidate 必须有身份绑定)
+            # - production-v* tag (PRODUCTION_TAG=true): 必须 success
+            # - workflow_dispatch: 必须 success
+            # - PR: 允许 skipped,failure/cancelled 仍阻断
+            if [ "${RELEASE_TARGET}" = "true" ] || [ "${RC_TAG}" = "true" ] || [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on release target/tag/dispatch (got: ${conclusion})"
+                echo "  R71 P1-04/P1-05/P0-13: 运行配置 + artifacts 身份绑定校验失败"
+                FAIL=1
+              else
+                # job success 但 image_valid 必须 = true(defense in depth)
+                if [ "${BIND_RUNTIME_CONFIG_IMAGE_VALID}" != "true" ]; then
+                  echo "::error::Job '${job}' succeeded but image_valid=${BIND_RUNTIME_CONFIG_IMAGE_VALID} (要求 true)"
+                  echo "  R71 P1-04: TGJIEMA_IMAGE 格式校验未通过(严格正则)"
+                  FAIL=1
+                fi
+                # R71 P0-13: source_sha 必须与 GITHUB_SHA 一致(当前候选绑定)
+                if [ -n "${BIND_RUNTIME_CONFIG_SOURCE_SHA}" ] && [ "${BIND_RUNTIME_CONFIG_SOURCE_SHA}" != "${GITHUB_SHA}" ]; then
+                  echo "::error::R71 P0-13: bind-runtime-config.source_sha=${BIND_RUNTIME_CONFIG_SOURCE_SHA} 与 GITHUB_SHA=${GITHUB_SHA} 不一致"
+                  echo "  禁止使用父提交/PR head/旧 run 替代当前候选 SHA"
+                  FAIL=1
+                fi
+              fi
+            else
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
           else
             # 常驻 job: 任何场景都必须 success
             if [ "${conclusion}" != "success" ]; then
@@ -3678,12 +4461,23 @@ jobs:
         # R66 P1-04: 同时校验 evidence_present=true,显式区分"无数据"与"通过"
         #   - evidence_status=production 但 evidence_present!=true 视为证据缺失
         #   - 防止 dry-run success 被误计为 Production GO
+        # R71 P0-11: defense in depth — 额外校验 verify-rc-identity.rc_verified=true
+        #   (production-promotion-gate 已校验,但 release-summary 作为最终聚合点
+        #   再校验一次,防止单点失效 — verify-rc-identity 是 RC 身份核验的唯一入口)
         PRODUCTION_PROMOTION_ALLOWED=false
         # R70 P0-10: production promotion 仅在 PRODUCTION_TAG=true 或 workflow_dispatch 时允许
         if [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
           if [ "${PRODUCTION_PROMOTION_GATE}" = "success" ]; then
             if [ "${CRDB_RU_72H_EVIDENCE_STATUS}" = "production" ] && [ "${CRDB_RU_72H_EVIDENCE_PRESENT}" = "true" ]; then
-              PRODUCTION_PROMOTION_ALLOWED=true
+              # R71 P0-11: verify-rc-identity 必须 success 且 rc_verified=true(defense in depth)
+              if [ "${VERIFY_RC_IDENTITY}" = "success" ] && [ "${VERIFY_RC_IDENTITY_RC_VERIFIED}" = "true" ]; then
+                PRODUCTION_PROMOTION_ALLOWED=true
+              else
+                echo "::error::R71 P0-11: production tag/dispatch 但 verify-rc-identity=${VERIFY_RC_IDENTITY} / rc_verified=${VERIFY_RC_IDENTITY_RC_VERIFIED}"
+                echo "  defense in depth 校验失败 — RC 身份未通过完整核验"
+                echo "  production 必须部署已验证的 RC 的 exact signed RepoDigest(不重建)"
+                exit 1
+              fi
             else
               echo "::error::R66 P0-05/P1-04: production tag/dispatch 但 evidence_status=${CRDB_RU_72H_EVIDENCE_STATUS} (要求 production) / evidence_present=${CRDB_RU_72H_EVIDENCE_PRESENT} (要求 true)"
               echo "  defense in depth 校验失败 — production promotion 拒绝"
@@ -3696,7 +4490,7 @@ jobs:
           fi
         fi
         echo ""
-        echo "=== R65 P0-04 / R66 P0-05 / R66 P1-04 / R70 P0-10: Production Promotion Summary ==="
+        echo "=== R65 P0-04 / R66 P0-05 / R66 P1-04 / R70 P0-10 / R71 P0-11: Production Promotion Summary ==="
         echo "production_promotion_allowed: ${PRODUCTION_PROMOTION_ALLOWED}"
         echo "  rc_tag: ${RC_TAG}"
         echo "  production_tag: ${PRODUCTION_TAG}"
@@ -3704,4 +4498,9 @@ jobs:
         echo "  production-promotion-gate: ${PRODUCTION_PROMOTION_GATE}"
         echo "  crdb-ru-72h-evidence-status: ${CRDB_RU_72H_EVIDENCE_STATUS}"
         echo "  crdb-ru-72h-evidence-present: ${CRDB_RU_72H_EVIDENCE_PRESENT}"
+        echo "  verify-rc-identity: ${VERIFY_RC_IDENTITY}"
+        echo "  verify-rc-identity.rc_verified: ${VERIFY_RC_IDENTITY_RC_VERIFIED}"
+        echo "  verify-rc-identity.rc_tag: ${VERIFY_RC_IDENTITY_RC_TAG}"
+        echo "  verify-rc-identity.image_digest: ${VERIFY_RC_IDENTITY_IMAGE_DIGEST}"
+        echo "  verify-rc-identity.image_repo_digest: ${VERIFY_RC_IDENTITY_IMAGE_REPO_DIGEST}"
 

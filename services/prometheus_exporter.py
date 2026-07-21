@@ -894,7 +894,8 @@ def collect_metrics() -> str:
     lines.append(f"data_age_seconds {data_age}")
 
     # readiness_checks: readiness 检查项数(0=未通过,1+=通过的检查项)
-    readiness = check_readiness()
+    # R71 Wave 1: 使用 collect_dependency_status()(原 check_readiness 已重命名)
+    readiness = collect_dependency_status()
     lines.append("# HELP readiness_checks Number of readiness checks passed")
     lines.append("# TYPE readiness_checks gauge")
     lines.append(f"readiness_checks {readiness['passed']}")
@@ -963,8 +964,12 @@ def collect_metrics() -> str:
     return "\n".join(lines) + "\n"
 
 
-def check_readiness() -> dict:
-    """R39 P1-8 + R41 P1-10: readiness 检查 — 报告真实依赖状态。
+def collect_dependency_status() -> dict:
+    """R39 P1-8 + R41 P1-10 + R71 Wave 1: 依赖状态采集 — 报告真实依赖状态。
+
+    R71 Wave 1 重命名:check_readiness → collect_dependency_status
+    (语义更准确:本函数采集 prometheus_exporter 自身的依赖状态指标,
+    不应与 services.health.check_readiness 角色级 readiness 检查混淆)。
 
     检查项:
       1. sqlite_readable — cache_store.db 存在且可查询
@@ -975,7 +980,8 @@ def check_readiness() -> dict:
       6. r2_collector_fresh — R2 指标采集最近成功(kv_store.r2_last_collect_time)
       7. acl_configured — REDIS_*_PASSWORD 4 个变量均存在(R41 P1-10)
 
-    供 /health 与 /readiness 端点调用,不满足时返回 503 Service Unavailable。
+    供 prometheus_exporter 自身 /health 与 /readiness 端点调用。
+    admin Web 服务的 /health 与 /readiness 已改用 services.health.check_readiness。
 
     Returns:
         {
@@ -1174,6 +1180,26 @@ def check_readiness() -> dict:
         "last_crdb_sync_age": crdb_sync_age,
         "last_r2_collect_age": r2_collect_age,
     }
+
+
+def check_readiness() -> dict:
+    """R71 Wave 1: 已弃用 — 请改用 collect_dependency_status()。
+
+    保留此 wrapper 仅为向后兼容,旧调用方(如外部监控脚本)不需修改即可继续工作。
+    新代码应直接调用 collect_dependency_status(),或对于角色级 readiness 检查
+    使用 services.health.check_readiness(role)。
+
+    Deprecated since:
+        R71 Wave 1
+
+    Migration:
+        - prometheus_exporter 内部调用 → collect_dependency_status()
+        - admin / docker healthcheck → services.health.check_readiness(role)
+
+    Returns:
+        与 collect_dependency_status() 相同的 dict
+    """
+    return collect_dependency_status()
 
 
 # ── R40: 新增指标采集 ────────────────────────────────────
@@ -1747,7 +1773,8 @@ class MetricsHTTPRequestHandler(BaseHTTPRequestHandler):
             # R39 P1-8: readiness 增强 — 不再永远返回 OK
             # R41 P1-10: /health 仍为 liveness 端点(快速检查),
             # 详细依赖状态请见 /readiness
-            readiness = check_readiness()
+            # R71 Wave 1: 使用 collect_dependency_status()(原 check_readiness 已重命名)
+            readiness = collect_dependency_status()
             if readiness["ready"]:
                 body = b"OK"
                 self.send_response(200)
@@ -1765,7 +1792,8 @@ class MetricsHTTPRequestHandler(BaseHTTPRequestHandler):
         elif self.path == "/readiness":
             # R41 P1-10: 详细依赖状态报告(200 if all ready, 503 if any not ready)
             # 返回 JSON 包含:checks / details / ru_daily_usage / last_*_age
-            readiness = check_readiness()
+            # R71 Wave 1: 使用 collect_dependency_status()(原 check_readiness 已重命名)
+            readiness = collect_dependency_status()
             import json as _json_mod
             body = _json_mod.dumps(readiness, ensure_ascii=False).encode("utf-8")
             if readiness["ready"]:

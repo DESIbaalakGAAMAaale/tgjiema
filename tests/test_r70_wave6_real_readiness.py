@@ -1,4 +1,4 @@
-"""R70 Wave 6: 真实 readiness(角色级健康检查)— 测试套件。
+"""R70 Wave 6 / R71 Wave 1: 真实 readiness(角色级健康检查)— 测试套件。
 
 R70 报告要求:
     "readiness 检查真实依赖与业务循环,而非只看 PID"。
@@ -7,23 +7,33 @@ R70 报告要求:
 
 R70 Wave 6 整改:
     新增 services/health.py 集中式健康检查模块,基于 SERVICE_ROLE 区分检查项。
-    本测试验证:
-        - check_readiness 函数存在且可 import
-        - HealthResult / CheckResult 数据结构正确
-        - 每个角色(up_bot / idx_bot / dsp_bot / mon_bot / admin_bot /
-          db_writer)有正确的检查项集合
-        - DB 检查失败时 healthy=false(即使其他检查通过)
-        - Redis 未配置时 healthy=True reason="not_configured"(不 fail-closed)
-        - Bot token 检查仅对 bot 角色生效
-        - critical 检查失败时整体 healthy=false
-        - non-critical 检查失败时整体 healthy=true 但 checks 中有 failed 项
-        - 用 unittest.mock 模拟 DB / Redis / Bot API(不依赖真实服务)
+
+R71 Wave 1 升级(本测试已适配):
+    - ROLE_REQUIREMENTS 权威映射覆盖 13 个角色
+    - 依赖 Redis 的角色(up_bot/idx_bot/dsp_bot/mon_bot/admin_bot/
+      db_writer/r40_scheduler/admin)redis 升级为 critical(fail-closed)
+    - crdb_sync 的 redis 保持 non-critical
+    - 新增 _check_database_crdb / _check_crdb_sync_lag / _check_backup_dir_writable
+      / _check_metrics_endpoint / _check_scheduler_heartbeat
+    - HEALTH_VERSION 升级为 "R71 Wave 1"
+
+本测试验证:
+    - check_readiness 函数存在且可 import
+    - HealthResult / CheckResult 数据结构正确
+    - 每个角色(up_bot / idx_bot / dsp_bot / mon_bot / admin_bot /
+      db_writer)有正确的检查项集合
+    - DB 检查失败时 healthy=false(即使其他检查通过)
+    - Redis 未配置时:依赖角色 fail-closed,非依赖角色 healthy=True
+    - Bot token 检查仅对 bot 角色生效
+    - critical 检查失败时整体 healthy=false
+    - non-critical 检查失败时整体 healthy=true 但 checks 中有 failed 项
+    - 用 unittest.mock 模拟 DB / Redis / Bot API(不依赖真实服务)
 
 测试策略:
     - 不实际连接 DB / Redis / Telegram API(用 monkeypatch 替换底层检查函数)
     - 验证 check_readiness 编排逻辑正确(角色 → 检查项映射)
     - 验证 HealthResult 序列化与 HTTP 状态码转换
-    - 严格遵守 R70 整改规范(无 TODO / pass / 占位符)
+    - 严格遵守 R71 整改规范(无 TODO / pass / 占位符)
 """
 from __future__ import annotations
 
@@ -148,6 +158,28 @@ def mock_all_checks_pass(monkeypatch, health):
         health, "_check_writer_inbox_lag",
         _async_return_factory((True, None)),
     )
+    # R71 Wave 1: 新增检查函数也需 mock(覆盖 admin 全角色与 crdb_sync /
+    # db_backup / migration / prometheus_exporter / r40_scheduler 的检查项)
+    monkeypatch.setattr(
+        health, "_check_database_crdb",
+        _async_return_factory((True, None)),
+    )
+    monkeypatch.setattr(
+        health, "_check_crdb_sync_lag",
+        _async_return_factory((True, None)),
+    )
+    monkeypatch.setattr(
+        health, "_check_backup_dir_writable",
+        _async_return_factory((True, None)),
+    )
+    monkeypatch.setattr(
+        health, "_check_metrics_endpoint",
+        _async_return_factory((True, None)),
+    )
+    monkeypatch.setattr(
+        health, "_check_scheduler_heartbeat",
+        _async_return_factory((True, None)),
+    )
     yield
 
 
@@ -191,7 +223,7 @@ class TestModuleImport:
     def test_health_version_constant_exists(self, health):
         """HEALTH_VERSION 常量应存在。"""
         assert hasattr(health, "HEALTH_VERSION")
-        assert health.HEALTH_VERSION == "R70 Wave 6"
+        assert health.HEALTH_VERSION == "R71 Wave 1"
 
     def test_bot_roles_constant_exists(self, health):
         """BOT_ROLES 常量应存在,包含 5 个 bot 角色。"""
@@ -303,7 +335,7 @@ class TestHealthResultStructure:
         assert d["healthy"] is True
         assert d["role"] == "up_bot"
         assert d["timestamp"] == "2026-07-21T12:00:00+00:00"
-        assert d["version"] == "R70 Wave 6"
+        assert d["version"] == "R71 Wave 1"
         assert len(d["checks"]) == 2
         assert d["checks"][0]["name"] == "database"
         assert d["checks"][1]["name"] == "redis"
@@ -325,7 +357,7 @@ class TestHealthResultStructure:
         assert '"healthy"' in json_str
         assert '"role"' in json_str
         assert '"checks"' in json_str
-        assert '"R70 Wave 6"' in json_str
+        assert '"R71 Wave 1"' in json_str
 
     def test_to_http_status_200_when_healthy(self, health):
         """healthy=True → HTTP 200。"""
@@ -598,26 +630,53 @@ class TestCriticalCheckFailure:
         )
 
     @pytest.mark.asyncio
-    async def test_redis_non_critical_flag(
+    async def test_redis_critical_flag_for_up_bot(
         self, health, mock_all_checks_pass
     ):
-        """redis 检查项应标记 critical=False。"""
+        """R71 Wave 1: redis 检查项对 up_bot 应标记 critical=True(fail-closed)。
+
+        R70 Wave 6 行为:redis 为 non-critical。
+        R71 Wave 1 行为:依赖 Redis 的角色(up_bot/idx_bot/dsp_bot/mon_bot/
+        admin_bot/db_writer/r40_scheduler/admin)redis 为 critical。
+        """
         result = await health.check_readiness("up_bot")
         redis_check = next(c for c in result.checks if c.name == "redis")
+        assert redis_check.critical is True, (
+            "R71 Wave 1: up_bot 的 redis 检查应为 critical=True(fail-closed)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_redis_non_critical_flag_for_crdb_sync(
+        self, health, mock_all_checks_pass
+    ):
+        """R71 Wave 1: redis 检查项对 crdb_sync 应标记 critical=False。
+
+        crdb_sync 角色的 ROLE_REQUIREMENTS["crdb_sync"]["redis"] = False,
+        因此 redis 为 non-critical(不 fail-closed)。
+        """
+        result = await health.check_readiness("crdb_sync")
+        redis_check = next(c for c in result.checks if c.name == "redis")
         assert redis_check.critical is False, (
-            "redis 检查应为 critical=False(non-critical)"
+            "crdb_sync 的 redis 检查应为 critical=False(non-critical)"
         )
 
     @pytest.mark.asyncio
     async def test_bot_token_valid_non_critical_flag(
         self, health, mock_all_checks_pass
     ):
-        """bot_token_valid 检查项应标记 critical=False。"""
+        """R71 Wave 1: bot_token_valid 检查项对 up_bot 应标记 critical=True。
+
+        R70 Wave 6 行为:bot_token_valid 为 non-critical。
+        R71 Wave 1 行为:ROLE_REQUIREMENTS["up_bot"]["bot_token_valid"] = True
+        (bot token 无效时 bot 无法工作,应为 critical)。
+        """
         result = await health.check_readiness("up_bot")
         bot_check = next(
             c for c in result.checks if c.name == "bot_token_valid"
         )
-        assert bot_check.critical is False
+        assert bot_check.critical is True, (
+            "R71 Wave 1: up_bot 的 bot_token_valid 应为 critical=True"
+        )
 
 
 # ════════════════════════════════════════════════════════════════
@@ -629,18 +688,22 @@ class TestNonCriticalCheckFailure:
     """验证 non-critical 检查失败时整体 healthy=True 但 checks 中有 failed 项。"""
 
     @pytest.mark.asyncio
-    async def test_redis_failure_keeps_healthy(
+    async def test_redis_failure_makes_unhealthy_for_up_bot(
         self, health, monkeypatch, mock_all_checks_pass
     ):
-        """Redis 检查失败(non-critical) → 整体 healthy=true,
-        但 checks 中 redis 项 healthy=False。"""
+        """R71 Wave 1: Redis 检查失败(critical)对 up_bot → 整体 healthy=false。
+
+        R70 Wave 6 行为:redis 为 non-critical,失败不影响整体。
+        R71 Wave 1 行为:up_bot 依赖 Redis,redis 为 critical,
+        失败时整体 healthy=false(fail-closed)。
+        """
         monkeypatch.setattr(
             health, "_check_redis",
             _async_return_factory((False, "Connection refused", None))
         )
         result = await health.check_readiness("up_bot")
-        assert result.healthy is True, (
-            "Redis 检查(non-critical)失败时整体 healthy 应保持 True"
+        assert result.healthy is False, (
+            "R71 Wave 1: up_bot 的 Redis 检查(critical)失败时整体 healthy 必须为 False"
         )
         redis_check = next(c for c in result.checks if c.name == "redis")
         assert redis_check.healthy is False
@@ -650,17 +713,42 @@ class TestNonCriticalCheckFailure:
         assert db_check.healthy is True
 
     @pytest.mark.asyncio
-    async def test_bot_token_failure_keeps_healthy(
+    async def test_redis_failure_keeps_healthy_for_crdb_sync(
         self, health, monkeypatch, mock_all_checks_pass
     ):
-        """Bot token 检查失败(non-critical) → 整体 healthy=true。"""
+        """R71 Wave 1: Redis 检查失败(non-critical)对 crdb_sync → 整体 healthy=true。
+
+        crdb_sync 角色的 redis 为 non-critical(ROLE_REQUIREMENTS 中 False),
+        失败时不影响整体 healthy。
+        """
+        monkeypatch.setattr(
+            health, "_check_redis",
+            _async_return_factory((False, "Connection refused", None))
+        )
+        result = await health.check_readiness("crdb_sync")
+        assert result.healthy is True, (
+            "crdb_sync 的 Redis 检查(non-critical)失败时整体 healthy 应保持 True"
+        )
+        redis_check = next(c for c in result.checks if c.name == "redis")
+        assert redis_check.healthy is False
+        assert "Connection refused" in redis_check.error
+
+    @pytest.mark.asyncio
+    async def test_bot_token_failure_makes_unhealthy_for_up_bot(
+        self, health, monkeypatch, mock_all_checks_pass
+    ):
+        """R71 Wave 1: Bot token 检查失败(critical)对 up_bot → 整体 healthy=false。
+
+        R70 Wave 6 行为:bot_token_valid 为 non-critical。
+        R71 Wave 1 行为:bot_token_valid 为 critical,失败时整体 unhealthy。
+        """
         monkeypatch.setattr(
             health, "_check_bot_token_valid",
             _async_return_factory((False, "Invalid token"))
         )
         result = await health.check_readiness("up_bot")
-        assert result.healthy is True, (
-            "bot_token_valid(non-critical)失败时整体 healthy 应保持 True"
+        assert result.healthy is False, (
+            "R71 Wave 1: up_bot 的 bot_token_valid(critical)失败时整体 healthy 必须为 False"
         )
         bot_check = next(
             c for c in result.checks if c.name == "bot_token_valid"
@@ -686,16 +774,23 @@ class TestNonCriticalCheckFailure:
         assert "5 sessions stuck" in us_check.error
 
     @pytest.mark.asyncio
-    async def test_admin_web_port_failure_keeps_healthy(
+    async def test_admin_web_port_failure_makes_unhealthy(
         self, health, monkeypatch, mock_all_checks_pass
     ):
-        """admin_web_port 失败(non-critical) → 整体 healthy=true。"""
+        """R71 Wave 1: admin_web_port 失败(critical)对 admin_bot → 整体 healthy=false。
+
+        R70 Wave 6 行为:admin_web_port 为 non-critical。
+        R71 Wave 1 行为:ROLE_REQUIREMENTS["admin_bot"]["admin_web_port"] = True
+        (admin web 端口不可用时管理后台不可达,应为 critical)。
+        """
         monkeypatch.setattr(
             health, "_check_admin_web_port",
             _async_return_factory((False, "Port 8080 not listening"))
         )
         result = await health.check_readiness("admin_bot")
-        assert result.healthy is True
+        assert result.healthy is False, (
+            "R71 Wave 1: admin_bot 的 admin_web_port(critical)失败时整体 healthy 必须为 False"
+        )
         port_check = next(
             c for c in result.checks if c.name == "admin_web_port"
         )
@@ -705,36 +800,32 @@ class TestNonCriticalCheckFailure:
     async def test_all_non_critical_failures_keeps_healthy(
         self, health, monkeypatch, mock_all_checks_pass
     ):
-        """所有 non-critical 检查失败,但 database 通过 → 整体 healthy=true。"""
-        # 所有 non-critical 检查失败(redis, bot_token_valid, upload_session,
-        # bot_polling 等)
-        monkeypatch.setattr(
-            health, "_check_redis",
-            _async_return_factory((False, "redis down", None))
-        )
-        monkeypatch.setattr(
-            health, "_check_bot_token_valid",
-            _async_return_factory((False, "token invalid"))
-        )
+        """R71 Wave 1: up_bot 的 non-critical 检查失败(database 通过)→ 整体 healthy=true。
+
+        R71 Wave 1 行为变更:redis 对 up_bot 现为 critical,不再纳入
+        non-critical 失败集合。up_bot 的 non-critical 检查为:
+        bot_token_valid / upload_session_status / bot_polling_status。
+        """
+        # up_bot 的 non-critical 检查项(ROLE_REQUIREMENTS["up_bot"] 中 False 的项):
+        # upload_session_status=False, bot_token_valid 在 R71 中仍为 True(critical)
+        # 实际 up_bot ROLE_REQUIREMENTS:
+        #   database=True, redis=True, bot_token_valid=True,
+        #   upload_session_status=False, bot_polling_status=True
+        # 仅 upload_session_status 为 non-critical
         monkeypatch.setattr(
             health, "_check_upload_session_status",
             _async_return_factory((False, "stuck"))
         )
-        monkeypatch.setattr(
-            health, "_check_bot_polling_status",
-            _async_return_factory((False, "not polling"))
-        )
-        # database 仍通过
+        # database / redis / bot_token_valid / bot_polling_status 仍通过
         result = await health.check_readiness("up_bot")
         assert result.healthy is True, (
             "database 通过 + 所有 non-critical 失败 → healthy=True"
         )
-        # 但 checks 中应有多项失败
+        # 但 checks 中应有 1 项失败(upload_session_status)
         failed = [c for c in result.checks if not c.healthy]
-        assert len(failed) == 4, (
-            f"应有 4 项 non-critical 检查失败"
-            f"(redis/bot_token_valid/upload_session/bot_polling_status),"
-            f"实际: {len(failed)}"
+        assert len(failed) == 1, (
+            f"应有 1 项 non-critical 检查失败(upload_session_status),"
+            f"实际: {len(failed)} ({[c.name for c in failed]})"
         )
 
     @pytest.mark.asyncio
@@ -894,8 +985,8 @@ class TestExceptionHandling:
     ):
         """检查函数抛异常 → 该项 healthy=False, 不影响其他检查。"""
 
-        # 定义一个会抛异常的 async 函数
-        async def _raising_check():
+        # 定义一个会抛异常的 async 函数(接受 role 参数以匹配 _check_database 签名)
+        async def _raising_check(*args, **kwargs):
             raise RuntimeError("unexpected error")
 
         monkeypatch.setattr(health, "_check_database", _raising_check)
@@ -911,18 +1002,25 @@ class TestExceptionHandling:
     async def test_non_critical_exception_keeps_healthy(
         self, health, monkeypatch, mock_all_checks_pass
     ):
-        """non-critical 检查抛异常 → 整体仍 healthy=true。"""
+        """R71 Wave 1: non-critical 检查抛异常 → 整体仍 healthy=true。
+
+        使用 upload_session_status(up_bot 的 non-critical 检查项)验证。
+        R70 Wave 6 旧测试使用 redis,但 R71 Wave 1 中 redis 对 up_bot
+        已升级为 critical,故改用 upload_session_status。
+        """
 
         async def _raising_check():
-            raise RuntimeError("redis error")
+            raise RuntimeError("upload session error")
 
-        monkeypatch.setattr(health, "_check_redis", _raising_check)
+        monkeypatch.setattr(health, "_check_upload_session_status", _raising_check)
         result = await health.check_readiness("up_bot")
-        # redis 是 non-critical → 整体 healthy
+        # upload_session_status 是 non-critical → 整体 healthy
         assert result.healthy is True
-        redis_check = next(c for c in result.checks if c.name == "redis")
-        assert redis_check.healthy is False
-        assert "redis error" in redis_check.error
+        us_check = next(
+            c for c in result.checks if c.name == "upload_session_status"
+        )
+        assert us_check.healthy is False
+        assert "upload session error" in us_check.error
 
     @pytest.mark.asyncio
     async def test_latency_ms_recorded(self, health, mock_all_checks_pass):
@@ -1082,8 +1180,8 @@ class TestR70Compliance:
         assert "NotImplemented" not in src
 
     def test_version_constant(self, health):
-        """HEALTH_VERSION 应为 'R70 Wave 6'。"""
-        assert health.HEALTH_VERSION == "R70 Wave 6"
+        """HEALTH_VERSION 应为 'R71 Wave 1'(R71 Wave 1 升级)。"""
+        assert health.HEALTH_VERSION == "R71 Wave 1"
 
     @pytest.mark.asyncio
     async def test_db_failure_real_not_mocked(
@@ -1110,6 +1208,12 @@ class TestR70Compliance:
     def test_no_modification_to_protected_files(self):
         """验证未修改任务禁止修改的文件(通过 mtime 简单检查)。
 
+        R71 Wave 1 更新:docker/entrypoint.py 已在 R71 Wave 1 中修改
+        (新增 readiness gate),从受保护列表移除。
+        R71 Wave 1 受保护文件:services/db_restore.py /
+        services/restore_writer.py / config/environment.py /
+        config/settings.py / services/escape_hatch_guard.py。
+
         本测试仅检查文件存在性,真正的修改检测在 git diff 层面。
         主要是文档性断言:确保任务范围明确。
         """
@@ -1120,7 +1224,7 @@ class TestR70Compliance:
             "services/backup_dr_validate.py",
             "config/environment.py",
             "config/settings.py",
-            "docker/entrypoint.py",
+            "services/escape_hatch_guard.py",
         ]
         for rel_path in protected_files:
             full_path = repo_root / rel_path

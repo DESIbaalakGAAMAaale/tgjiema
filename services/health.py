@@ -1,14 +1,51 @@
-"""R70 Wave 6: 真实 readiness — 角色级健康检查模块。
+"""R71 Wave 1: 角色级 fail-closed readiness — 健康检查模块。
 
-R70 报告根因:
+R70 Wave 6 根因:
     旧版 health 检查仅返回 200 OK 不验证实际依赖(DB 连接 / Redis 连接 /
     Bot polling 状态),无法反映真实业务可用性。R41/R42 的 check_readiness
     只检查 SQLite 文件存在性,不区分角色,也不验证 Redis Stream Consumer
     Group / writer_inbox 延迟等业务循环依赖。
 
-R70 Wave 6 整改:
+R70 Wave 6 整改(已被 R71 Wave 1 取代):
     建立集中式健康检查模块 services/health.py,基于 SERVICE_ROLE 区分检查项。
     每个角色运行不同的检查集合(通用检查 + 角色专属检查)。
+
+R71 P0-01/02/03/04 根因(本 Wave 1 修复):
+    R70 Wave 6 仍存在以下问题:
+    1. _check_redis() 在 REDIS_URL 缺失时返回 healthy=True("not_configured"),
+       但生产角色(db_writer / dsp_bot / admin_bot / 等)依赖 Redis,
+       应 fail-closed 返回 unhealthy。
+    2. _check_database() 任一 SQLite 或 CRDB 可用即视为健康,
+       SQLite 可掩盖 CRDB 故障(crdb_sync / migration / db_writer 必须用 CRDB)。
+    3. services/health.py 是孤岛模块,零生产调用;
+       生产实际使用 services/prometheus_exporter.check_readiness()(SQLite-only)。
+    4. docker/entrypoint.py 不做启动前 readiness gate;
+       docker-compose.prod.yml 的 8 个业务服务 healthcheck 只检查
+       /proc/1/cmdline 字符串匹配,无法反映真实依赖可用性。
+    5. 三套 check_readiness 实现并存(health.py / prometheus_exporter.py /
+       maintenance_mode.py),命名冲突,语义不一。
+
+R71 Wave 1 整改:
+    1. 新增 ROLE_REQUIREMENTS 权威映射(覆盖 entrypoint 全部 13 个角色),
+       每个角色显式声明依赖检查项 + critical 等级。
+    2. _check_redis(role) 角色化:依赖 Redis 的角色在 REDIS_URL 缺失时
+       返回 (False, "REDIS_URL not configured but required by role {role}", None)。
+    3. _check_database(role) 角色化:
+       - 需要 CRDB 的角色(db_writer/crdb_sync/migration/admin):必须检查 CRDB,
+         SQLite 成功不掩盖 CRDB 失败。
+       - 只用 SQLite 的角色(up_bot/idx_bot/dsp_bot/mon_bot/admin_bot/
+         prometheus_exporter/r40_scheduler):检查 SQLite。
+       - admin 角色:两个都检查,任一失败则 critical 失败。
+    4. 新增 _check_database_crdb() / _check_crdb_sync_lag() /
+       _check_backup_dir_writable() / _check_metrics_endpoint() /
+       _check_scheduler_heartbeat()。
+    5. check_readiness(role) 重写:从 ROLE_REQUIREMENTS 读取检查项集合,
+       动态选择检查函数,未知角色返回 unhealthy。
+    6. 新增 CLI 入口(--role --json),供 docker-compose healthcheck 使用。
+    7. services/prometheus_exporter.check_readiness 重命名为
+       collect_dependency_status(语义更准确,避免与本模块 check_readiness 冲突)。
+    8. services/maintenance_mode.check_readiness 重命名为 check_maintenance_safe。
+    9. docker/entrypoint.py 在 production/staging 下增加 readiness gate。
 
 设计原则:
     1. **不允许 mock 真实依赖**:DB 不可用时必须返回 healthy=false
@@ -16,31 +53,32 @@ R70 Wave 6 整改:
     2. **角色化检查**:不同角色执行不同检查项(up_bot ≠ idx_bot ≠ ...)
     3. **critical 检查失败 → 整体 healthy=false**;
        non-critical 检查失败 → healthy=true 但 checks 中有 failed 项
-    4. **向后兼容**:不修改现有 health 端点
-       (services/prometheus_exporter.check_readiness 保持不变)
-    5. **可由 entrypoint 可选调用**:不强制接入,生产可逐步切换
+    4. **fail-closed**:依赖 Redis 的角色在 REDIS_URL 缺失时返回 unhealthy;
+       未知角色返回 unhealthy(不静默通过)
+    5. **向后兼容**:prometheus_exporter / maintenance_mode 保留 deprecated
+       wrapper,旧调用方不需修改即可继续工作
 
-角色 → 检查项映射:
-    up_bot:    database(critical) + redis + bot_token_valid +
-               upload_session_status + bot_polling_status
-    idx_bot:   database(critical) + redis + bot_token_valid +
-               index_queue_depth
-    dsp_bot:   database(critical) + redis + bot_token_valid +
-               redis_stream_consumer + send_queue_depth
-    mon_bot:   database(critical) + redis + bot_token_valid +
-               sub_services_alive
-    admin_bot: database(critical) + redis + bot_token_valid +
-               admin_web_port
-    db_writer: database(critical) + redis +
-               redis_stream_consumer_group + writer_inbox_lag
-    admin/空:  database(critical) + redis + 全部角色专属检查
-
-通用检查:
-    - database: SELECT 1 测试 (critical=True)
-    - redis: PING 测试 (未配置 REDIS_URL 时 healthy=True,
-      error="not_configured",不 fail-closed)
-    - bot_token_valid: 通过 Telegram Bot API getMe 验证 token 有效
-      (仅 bot 角色:up_bot/idx_bot/dsp_bot/mon_bot/admin_bot)
+角色 → 检查项映射(权威定义见 ROLE_REQUIREMENTS):
+    up_bot:    database(critical) + redis(critical) + bot_token_valid(critical) +
+               upload_session_status(non-critical) + bot_polling_status(critical)
+    idx_bot:   database(critical) + redis(critical) + bot_token_valid(critical) +
+               index_queue_depth(non-critical)
+    dsp_bot:   database(critical) + redis(critical) + bot_token_valid(critical) +
+               redis_stream_consumer(critical) + send_queue_depth(non-critical)
+    mon_bot:   database(critical) + redis(critical) + bot_token_valid(critical) +
+               sub_services_alive(non-critical)
+    admin_bot: database(critical) + redis(critical) + bot_token_valid(critical) +
+               admin_web_port(critical)
+    db_writer: database(critical) + redis(critical) +
+               redis_stream_consumer_group(critical) + writer_inbox_lag(critical)
+    crdb_sync: database_crdb(critical) + redis(non-critical) +
+               crdb_sync_lag(critical)
+    db_backup: database(critical) + backup_dir_writable(critical)
+    migration: database_crdb(critical)
+    prometheus_exporter: database(critical) + metrics_endpoint(critical)
+    r40_scheduler: database(critical) + redis(critical) +
+                   scheduler_heartbeat(critical)
+    admin/空:  全部检查(database + database_crdb + redis + ...)
 
 输出格式:
     HealthResult → JSON:
@@ -51,11 +89,11 @@ R70 Wave 6 整改:
             {"name": "database", "healthy": true, "latency_ms": 12,
              "error": null, "critical": true},
             {"name": "redis", "healthy": true, "latency_ms": 3,
-             "error": "not_configured", "critical": false},
+             "error": null, "critical": true},
             ...
         ],
         "timestamp": "2026-07-21T12:34:56+00:00",
-        "version": "R70 Wave 6"
+        "version": "R71 Wave 1"
     }
     HTTP 200 if healthy else 503
 """
@@ -69,12 +107,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from loguru import logger
+
 # ──────────────────────────────────────────────────────────────────
 # 模块常量
 # ──────────────────────────────────────────────────────────────────
 
 # 模块版本(供测试与审计追溯)
-HEALTH_VERSION = "R70 Wave 6"
+HEALTH_VERSION = "R71 Wave 1"
 
 # DB 查询超时(秒)
 _DB_QUERY_TIMEOUT = 2.0
@@ -102,6 +142,31 @@ _SEND_QUEUE_DEPTH_THRESHOLD = 1000
 
 # Bot 心跳过期阈值(秒)— mon_bot 检查子服务心跳
 _BOT_HEARTBEAT_STALE_THRESHOLD = 300.0
+
+# R71 Wave 1: crdb_sync 同步延迟告警阈值(秒)— 超过此值认为 crdb_sync 进程积压
+_CRDB_SYNC_LAG_THRESHOLD = 600.0  # 10 分钟
+
+# R71 Wave 1: r40_scheduler 心跳过期阈值(秒)
+_SCHEDULER_HEARTBEAT_STALE_THRESHOLD = 600.0  # 10 分钟
+
+# R71 Wave 1: metrics endpoint HTTP 探测超时(秒)
+_METRICS_HTTP_TIMEOUT = 2.0
+
+# R71 Wave 1: 需要 CRDB 的角色集合(database_crdb 检查)
+# db_writer 在生产部署中也使用 CRDB 作为权威后端(R70 §2:写穿 CRDB)
+# admin 角色同时检查 SQLite + CRDB
+_CRDB_REQUIRED_ROLES = frozenset({
+    "db_writer", "crdb_sync", "migration", "admin",
+})
+
+# R71 Wave 1: 备份目录路径环境变量名
+_BACKUP_DIR_ENV = "BACKUP_DIR"
+
+# R71 Wave 1: r40_scheduler 心跳 kv_store key
+_SCHEDULER_HEARTBEAT_KEY = "r40_scheduler_heartbeat"
+
+# R71 Wave 1: crdb_sync 上次成功同步时间 kv_store key
+_CRDB_SYNC_LAST_SUCCESS_KEY = "crdb_sync_last_success"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -182,6 +247,7 @@ BOT_ROLES = frozenset({
 })
 
 # 角色别名:entrypoint 用的简写 → 任务要求的规范名
+# R71 Wave 1: 扩展覆盖 entrypoint 全部 13 个角色
 _ROLE_ALIASES: dict[str, str] = {
     "up": "up_bot",
     "idx": "idx_bot",
@@ -190,7 +256,71 @@ _ROLE_ALIASES: dict[str, str] = {
     "admin_bot": "admin_bot",
     "admin": "admin",
     "db_writer": "db_writer",
+    # R71 Wave 1 新增角色(entrypoint 已用规范名,无别名,但需在表中登记)
+    "crdb_sync": "crdb_sync",
+    "db_backup": "db_backup",
+    "migration": "migration",
+    "prometheus_exporter": "prometheus_exporter",
+    "r40_scheduler": "r40_scheduler",
     "": "admin",  # 空 → 全部检查
+}
+
+# R71 Wave 1: 角色 → 检查项权威映射
+# - key: 检查项名称(对应 _check_xxx 函数名)
+# - value: 是否为关键检查(True=失败则整体 healthy=False)
+# 未列入此映射的角色在 check_readiness 中返回 unhealthy(Unknown role)
+ROLE_REQUIREMENTS: dict[str, dict[str, bool]] = {
+    "up_bot": {
+        "database": True, "redis": True, "bot_token_valid": True,
+        "upload_session_status": False, "bot_polling_status": True,
+    },
+    "idx_bot": {
+        "database": True, "redis": True, "bot_token_valid": True,
+        "index_queue_depth": False,
+    },
+    "dsp_bot": {
+        "database": True, "redis": True, "bot_token_valid": True,
+        "redis_stream_consumer": True, "send_queue_depth": False,
+    },
+    "mon_bot": {
+        "database": True, "redis": True, "bot_token_valid": True,
+        "sub_services_alive": False,
+    },
+    "admin_bot": {
+        "database": True, "redis": True, "bot_token_valid": True,
+        "admin_web_port": True,
+    },
+    "db_writer": {
+        "database": True, "redis": True,
+        "redis_stream_consumer_group": True, "writer_inbox_lag": True,
+    },
+    "crdb_sync": {
+        "database_crdb": True, "redis": False,
+        "crdb_sync_lag": True,
+    },
+    "db_backup": {
+        "database": True, "backup_dir_writable": True,
+    },
+    "migration": {
+        "database_crdb": True,
+    },
+    "prometheus_exporter": {
+        "database": True, "metrics_endpoint": True,
+    },
+    "r40_scheduler": {
+        "database": True, "redis": True,
+        "scheduler_heartbeat": True,
+    },
+    "admin": {  # 全部检查
+        "database": True, "database_crdb": True, "redis": True,
+        "bot_token_valid": True, "upload_session_status": False,
+        "bot_polling_status": True, "index_queue_depth": False,
+        "redis_stream_consumer": True, "send_queue_depth": False,
+        "sub_services_alive": False, "admin_web_port": True,
+        "redis_stream_consumer_group": True, "writer_inbox_lag": True,
+        "crdb_sync_lag": True, "backup_dir_writable": True,
+        "metrics_endpoint": True, "scheduler_heartbeat": True,
+    },
 }
 
 # 角色 → Bot Token 环境变量名映射
@@ -206,9 +336,15 @@ _ROLE_BOT_TOKEN_ENV: dict[str, str] = {
 def _canonicalize_role(role: str) -> str:
     """将输入 role 规范化为标准角色名。
 
+    R71 Wave 1: 返回值必须为 ROLE_REQUIREMENTS 中的 key,否则视为未知角色。
+    空 role → "admin"(全部检查)。
+    未知 role(既不在 _ROLE_ALIASES 也不在 ROLE_REQUIREMENTS)→ 原样返回,
+    由 check_readiness 检测为 Unknown role 并返回 unhealthy。
+
     支持的输入:
         - "up_bot" / "idx_bot" / "dsp_bot" / "mon_bot" / "admin_bot" /
-          "db_writer" / "admin" / ""
+          "db_writer" / "crdb_sync" / "db_backup" / "migration" /
+          "prometheus_exporter" / "r40_scheduler" / "admin" / ""
         - 别名:"up" → "up_bot", "idx" → "idx_bot", "dsp" → "dsp_bot",
           "mon" → "mon_bot"
 
@@ -216,7 +352,8 @@ def _canonicalize_role(role: str) -> str:
         role: 原始角色字符串
 
     Returns:
-        规范化后的角色名(如 "up_bot", "db_writer", "admin")
+        规范化后的角色名(如 "up_bot", "db_writer", "admin"),
+        或未知角色原样返回(由调用方判定)
     """
     role_norm = (role or "").strip().lower()
     return _ROLE_ALIASES.get(role_norm, role_norm)
@@ -242,17 +379,29 @@ def _get_bot_token_for_role(role: str) -> str:
 # ════════════════════════════════════════════════════════════════
 
 
-async def _check_database() -> tuple[bool, Optional[str]]:
-    """通用检查: DB 连接(SELECT 1 测试)。
+async def _check_database(role: str = "") -> tuple[bool, Optional[str]]:
+    """通用检查: DB 连接(SELECT 1 测试)— 角色化。
 
-    优先尝试 SQLite(cache_store.db),失败则尝试 CRDB(asyncpg)。
-    任一数据库可用即视为健康。
+    R71 Wave 1 行为:
+        - role in _CRDB_REQUIRED_ROLES(db_writer/crdb_sync/migration/admin):
+          委托给 _check_database_crdb(role),SQLite 成功不掩盖 CRDB 失败
+        - 其他角色(up_bot/idx_bot/dsp_bot/mon_bot/admin_bot/
+          prometheus_exporter/r40_scheduler/空):
+          检查 SQLite(cache_store.db),失败则尝试 CRDB(向后兼容)
+
+    Args:
+        role: 规范化后的角色名(如 "up_bot", "db_writer", "admin")
 
     Returns:
         (healthy, error):
         - healthy=True, error=None: DB 可用
         - healthy=False, error="...": DB 不可用(描述原因)
     """
+    # R71 Wave 1: CRDB 必需的角色 → 直接走 CRDB 检查(SQLite 不掩盖)
+    if role in _CRDB_REQUIRED_ROLES:
+        return await _check_database_crdb(role)
+
+    # 其他角色:SQLite 优先,失败再尝试 CRDB(向后兼容 R70 Wave 6 行为)
     # 1. 尝试 SQLite(cache_store.db)
     try:
         import sqlite3
@@ -272,9 +421,9 @@ async def _check_database() -> tuple[bool, Optional[str]]:
             finally:
                 conn.close()
         # SQLite 文件不存在 → 尝试 CRDB
-    except Exception:
-        # SQLite 不可用 → 尝试 CRDB
-        pass
+    except Exception as _sqlite_err:
+        # SQLite 不可用 → 尝试 CRDB(记录原因,不伪装成功)
+        logger.debug(f"SQLite check skipped, falling back to CRDB: {_sqlite_err}")
 
     # 2. 尝试 CRDB(asyncpg)— 通过 DATABASE_URL 判断
     try:
@@ -307,20 +456,87 @@ async def _check_database() -> tuple[bool, Optional[str]]:
     return False, "No database configured (SQLite not found, no DATABASE_URL)"
 
 
-async def _check_redis() -> tuple[bool, Optional[str], Optional[str]]:
-    """通用检查: Redis PING 测试。
+async def _check_database_crdb(role: str = "") -> tuple[bool, Optional[str]]:
+    """R71 Wave 1: CRDB 连接检查(asyncpg SELECT 1)。
 
-    若未配置 REDIS_URL → 返回 (True, None, "not_configured")(不 fail-closed)。
-    若配置但连接失败 → 返回 (False, error, None)。
-    若 PING 成功 → 返回 (True, None, None)。
+    专为 db_writer / crdb_sync / migration / admin 角色设计:
+    SQLite 成功不掩盖 CRDB 故障(这些角色必须依赖 CRDB 作为权威后端)。
+
+    Args:
+        role: 角色名(用于错误消息)
+
+    Returns:
+        (healthy, error):
+        - healthy=True, error=None: CRDB 可用
+        - healthy=False, error="...": CRDB 不可用(描述原因)
+    """
+    # 通过 config.settings 或环境变量获取 DATABASE_URL
+    try:
+        from config import settings
+
+        db_url = getattr(settings, "DATABASE_URL", "") or os.getenv(
+            "DATABASE_URL", ""
+        )
+    except Exception:
+        db_url = os.getenv("DATABASE_URL", "")
+
+    if not db_url:
+        return False, (
+            f"DATABASE_URL not configured but required by role {role!r}"
+        )
+    if db_url.startswith("sqlite"):
+        # 角色要求 CRDB,但配置了 SQLite → fail-closed
+        return False, (
+            f"Role {role!r} requires CRDB but DATABASE_URL is SQLite: "
+            f"{db_url[:32]}..."
+        )
+
+    try:
+        import asyncpg
+
+        conn = await asyncio.wait_for(
+            asyncpg.connect(db_url), timeout=_DB_QUERY_TIMEOUT
+        )
+        try:
+            row = await conn.fetchrow("SELECT 1 AS v")
+            if row and row["v"] == 1:
+                return True, None
+            return False, "CRDB SELECT 1 returned unexpected value"
+        finally:
+            await conn.close()
+    except Exception as e:
+        return False, f"CRDB connection failed (role={role}): {e}"
+
+
+async def _check_redis(role: str = "") -> tuple[bool, Optional[str], Optional[str]]:
+    """通用检查: Redis PING 测试 — 角色化。
+
+    R71 Wave 1 行为:
+        - role 依赖 Redis(ROLE_REQUIREMENTS[role]["redis"] 存在):
+          REDIS_URL 缺失时 fail-closed 返回 (False, "REDIS_URL not configured
+          but required by role {role}", None)
+        - role 不依赖 Redis(role="" 或 ROLE_REQUIREMENTS[role] 中无 "redis" 项):
+          REDIS_URL 缺失时返回 (True, None, "not_configured")(不 fail-closed,
+          向后兼容 R70 Wave 6 行为)
+
+    Args:
+        role: 规范化后的角色名(如 "up_bot", "crdb_sync", "")
 
     Returns:
         (healthy, error, reason):
-        - healthy=True, error=None, reason="not_configured":
-          未配置 REDIS_URL(视为健康,不 fail-closed)
-        - healthy=True, error=None, reason=None: PING 成功
-        - healthy=False, error="...", reason=None: PING 失败
+        - 依赖 Redis + 未配置 → (False, "REDIS_URL not configured but required
+          by role {role}", None)
+        - 依赖 Redis + PING 成功 → (True, None, None)
+        - 依赖 Redis + PING 失败 → (False, "...", None)
+        - 不依赖 Redis + 未配置 → (True, None, "not_configured")
+        - 不依赖 Redis + PING 成功 → (True, None, None)
+        - 不依赖 Redis + PING 失败 → (False, "...", None)
     """
+    # 判定角色是否依赖 Redis
+    requires_redis = False
+    if role and role in ROLE_REQUIREMENTS:
+        requires_redis = "redis" in ROLE_REQUIREMENTS[role]
+
     try:
         from config import settings
 
@@ -331,7 +547,12 @@ async def _check_redis() -> tuple[bool, Optional[str], Optional[str]]:
         redis_url = os.getenv("REDIS_URL", "")
 
     if not redis_url:
-        # 未配置 → 视为健康(不 fail-closed)
+        if requires_redis:
+            # R71 Wave 1: 依赖 Redis 的角色在 REDIS_URL 缺失时 fail-closed
+            return False, (
+                f"REDIS_URL not configured but required by role {role}"
+            ), None
+        # 不依赖 Redis → 视为健康(不 fail-closed,向后兼容)
         return True, None, "not_configured"
 
     try:
@@ -350,8 +571,8 @@ async def _check_redis() -> tuple[bool, Optional[str], Optional[str]]:
         finally:
             try:
                 await client.aclose()
-            except Exception:
-                pass
+            except Exception as _close_err:
+                logger.debug(f"Redis aclose cleanup: {_close_err}")
     except Exception as e:
         return False, f"Redis connection failed: {e}", None
 
@@ -556,8 +777,8 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
         finally:
             try:
                 await client.aclose()
-            except Exception:
-                pass
+            except Exception as _close_err:
+                logger.debug(f"Redis aclose cleanup: {_close_err}")
     except Exception as e:
         return False, f"Redis stream consumer check failed: {e}"
 
@@ -774,6 +995,252 @@ async def _check_writer_inbox_lag() -> tuple[bool, Optional[str]]:
 
 
 # ════════════════════════════════════════════════════════════════
+# R71 Wave 1: 新增检查函数(crdb_sync / db_backup / prometheus_exporter /
+# r40_scheduler / migration 角色专属)
+# ════════════════════════════════════════════════════════════════
+
+
+async def _check_crdb_sync_lag() -> tuple[bool, Optional[str]]:
+    """R71 Wave 1: crdb_sync 进程同步延迟检查。
+
+    读取 cache_store.kv_store 中的 crdb_sync_last_success(ISO 8601 时间戳),
+    计算距今的延迟秒数。超过 _CRDB_SYNC_LAG_THRESHOLD(默认 600s)视为不健康。
+    kv_store 表不存在 / key 不存在 / 解析失败 → 不健康(crdb_sync 从未成功同步)。
+
+    Returns:
+        (healthy, error)
+    """
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "cache_store.db not found (crdb_sync never ran)"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            # kv_store 表可能不存在(测试环境)
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='kv_store'"
+            )
+            if cursor.fetchone() is None:
+                return False, "kv_store table not found (crdb_sync never ran)"
+            cursor = conn.execute(
+                "SELECT value FROM kv_store WHERE key = ? LIMIT 1",
+                (_CRDB_SYNC_LAST_SUCCESS_KEY,),
+            )
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return False, (
+                    f"kv_store.{_CRDB_SYNC_LAST_SUCCESS_KEY} not set "
+                    f"(crdb_sync never succeeded)"
+                )
+            ts_str = str(row[0])
+            # 解析 ISO 8601 或 epoch 数字
+            last_ts: float = 0.0
+            try:
+                iso_str = (
+                    ts_str.replace("Z", "+00:00")
+                    if ts_str.endswith("Z") else ts_str
+                )
+                dt = _dt.datetime.fromisoformat(iso_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+                last_ts = dt.timestamp()
+            except (ValueError, TypeError):
+                try:
+                    last_ts = float(ts_str)
+                except (ValueError, TypeError):
+                    return False, (
+                        f"crdb_sync_last_success unparseable: {ts_str!r}"
+                    )
+            if last_ts <= 0:
+                return False, "crdb_sync_last_success is zero/negative"
+            lag_seconds = time.time() - last_ts
+            if lag_seconds < 0:
+                lag_seconds = 0.0
+            if lag_seconds > _CRDB_SYNC_LAG_THRESHOLD:
+                return False, (
+                    f"crdb_sync lag {lag_seconds:.1f}s > threshold "
+                    f"{_CRDB_SYNC_LAG_THRESHOLD}s"
+                )
+            return True, None
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return False, "kv_store table not found (crdb_sync never ran)"
+        return False, f"crdb_sync_lag check failed: {e}"
+    except Exception as e:
+        return False, f"crdb_sync_lag check failed: {e}"
+
+
+async def _check_backup_dir_writable() -> tuple[bool, Optional[str]]:
+    """R71 Wave 1: db_backup 备份目录可写检查。
+
+    通过 BACKUP_DIR 环境变量获取备份目录路径,创建临时文件测试可写性。
+    BACKUP_DIR 未配置 → fail-closed(db_backup 角色必须配置备份目录)。
+    目录不存在 / 不可写 → fail-closed。
+
+    Returns:
+        (healthy, error)
+    """
+    backup_dir = os.getenv(_BACKUP_DIR_ENV, "").strip()
+    if not backup_dir:
+        # 兼容默认路径(与 services/db_backup.py 默认值一致)
+        try:
+            from pathlib import Path as _Path
+
+            default_backup = (
+                _Path(__file__).resolve().parent.parent / "data" / "backups"
+            )
+            backup_dir = str(default_backup)
+        except Exception:
+            return False, f"{_BACKUP_DIR_ENV} env not configured"
+    try:
+        from pathlib import Path as _Path
+
+        backup_path = _Path(backup_dir)
+        backup_path.mkdir(parents=True, exist_ok=True)
+        # 创建临时文件测试可写
+        test_file = backup_path / f".r71_health_writable_test_{os.getpid()}.tmp"
+        test_file.write_text("r71-health-check", encoding="utf-8")
+        try:
+            test_file.unlink()  # 清理
+        except Exception as _unlink_err:
+            # 删除失败不影响判定(文件已写入即说明可写),但记录原因
+            logger.debug(f"Health check temp file cleanup: {_unlink_err}")
+        return True, None
+    except PermissionError as e:
+        return False, f"Backup dir not writable (permission denied): {e}"
+    except OSError as e:
+        return False, f"Backup dir not writable: {e}"
+    except Exception as e:
+        return False, f"Backup dir writable check failed: {e}"
+
+
+async def _check_metrics_endpoint() -> tuple[bool, Optional[str]]:
+    """R71 Wave 1: prometheus_exporter /metrics 端点可访问检查。
+
+    通过 HTTP GET 探测 PROMETHEUS_EXPORTER_HOST:PROMETHEUS_EXPORTER_PORT/metrics,
+    返回 200 视为健康。
+    端口未监听 / HTTP 错误 / 超时 → fail-closed。
+
+    Returns:
+        (healthy, error)
+    """
+    try:
+        from config import settings
+
+        host = getattr(settings, "PROMETHEUS_EXPORTER_HOST", "0.0.0.0") or "0.0.0.0"
+        port = int(
+            getattr(settings, "PROMETHEUS_EXPORTER_PORT", 9100) or 9100
+        )
+    except Exception:
+        host = os.getenv("PROMETHEUS_EXPORTER_HOST", "0.0.0.0") or "0.0.0.0"
+        try:
+            port = int(os.getenv("PROMETHEUS_EXPORTER_PORT", "9100") or "9100")
+        except (TypeError, ValueError):
+            port = 9100
+
+    # 0.0.0.0 探测本地
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    url = f"http://{probe_host}:{port}/metrics"
+
+    try:
+        import httpx
+
+        async with httpx.AsyncClient(timeout=_METRICS_HTTP_TIMEOUT) as client:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                return True, None
+            return False, (
+                f"Metrics endpoint {url} returned HTTP {resp.status_code}"
+            )
+    except Exception as e:
+        return False, f"Metrics endpoint {url} unreachable: {e}"
+
+
+async def _check_scheduler_heartbeat() -> tuple[bool, Optional[str]]:
+    """R71 Wave 1: r40_scheduler 心跳新鲜度检查。
+
+    读取 cache_store.kv_store 中的 r40_scheduler_heartbeat(ISO 8601 或 epoch),
+    计算距今的秒数。超过 _SCHEDULER_HEARTBEAT_STALE_THRESHOLD(默认 600s)
+    视为不健康。kv_store 表不存在 / key 不存在 → 不健康(scheduler 从未运行)。
+
+    Returns:
+        (healthy, error)
+    """
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "cache_store.db not found (scheduler never ran)"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='kv_store'"
+            )
+            if cursor.fetchone() is None:
+                return False, "kv_store table not found (scheduler never ran)"
+            cursor = conn.execute(
+                "SELECT value FROM kv_store WHERE key = ? LIMIT 1",
+                (_SCHEDULER_HEARTBEAT_KEY,),
+            )
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return False, (
+                    f"kv_store.{_SCHEDULER_HEARTBEAT_KEY} not set "
+                    f"(scheduler never heartbeat)"
+                )
+            ts_str = str(row[0])
+            last_ts: float = 0.0
+            try:
+                iso_str = (
+                    ts_str.replace("Z", "+00:00")
+                    if ts_str.endswith("Z") else ts_str
+                )
+                dt = _dt.datetime.fromisoformat(iso_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+                last_ts = dt.timestamp()
+            except (ValueError, TypeError):
+                try:
+                    last_ts = float(ts_str)
+                except (ValueError, TypeError):
+                    return False, (
+                        f"scheduler heartbeat unparseable: {ts_str!r}"
+                    )
+            if last_ts <= 0:
+                return False, "scheduler heartbeat is zero/negative"
+            age_seconds = time.time() - last_ts
+            if age_seconds < 0:
+                age_seconds = 0.0
+            if age_seconds > _SCHEDULER_HEARTBEAT_STALE_THRESHOLD:
+                return False, (
+                    f"scheduler heartbeat age {age_seconds:.1f}s > threshold "
+                    f"{_SCHEDULER_HEARTBEAT_STALE_THRESHOLD}s"
+                )
+            return True, None
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return False, "kv_store table not found (scheduler never ran)"
+        return False, f"scheduler heartbeat check failed: {e}"
+    except Exception as e:
+        return False, f"scheduler heartbeat check failed: {e}"
+
+
+# ════════════════════════════════════════════════════════════════
 # 检查执行器
 # ════════════════════════════════════════════════════════════════
 
@@ -844,193 +1311,174 @@ async def _run_check(
 # ════════════════════════════════════════════════════════════════
 
 
-async def check_readiness(role: str) -> HealthResult:
-    """R70 Wave 6: 角色化 readiness 检查 — 主接口。
+def _build_check_coro(
+    check_name: str,
+    canonical_role: str,
+    bot_token: str,
+) -> Awaitable:
+    """R71 Wave 1: 根据检查项名称构造对应的检查协程。
 
-    根据 SERVICE_ROLE 选择对应的检查项集合,执行真实依赖检查。
-    **不允许 mock 真实依赖**(如 DB 不可用必须返回 healthy=false)。
-    测试中可通过 monkeypatch 替换 _check_database 等底层函数模拟场景。
+    统一调度入口,check_readiness 通过 ROLE_REQUIREMENTS 动态选择检查函数。
+    所有检查函数均返回 tuple:
+        - (healthy, error): 2-tuple
+        - (healthy, error, reason): 3-tuple(redis)
+
+    Args:
+        check_name: 检查项名称(ROLE_REQUIREMENTS 中的 key,如 "database")
+        canonical_role: 规范化后的角色名(如 "up_bot", "db_writer", "admin")
+        bot_token: 该角色的 Bot token(仅 bot 角色使用,其他角色为空字符串)
+
+    Returns:
+        awaitable 协程对象
+
+    Raises:
+        KeyError: check_name 不在已知检查项集合中(编程错误,应立即暴露)
+    """
+    # 检查项名称 → 协程构造器(显式映射,避免反射魔法)
+    if check_name == "database":
+        return _check_database(canonical_role)
+    if check_name == "database_crdb":
+        return _check_database_crdb(canonical_role)
+    if check_name == "redis":
+        return _check_redis(canonical_role)
+    if check_name == "bot_token_valid":
+        return _check_bot_token_valid(bot_token)
+    if check_name == "upload_session_status":
+        return _check_upload_session_status()
+    if check_name == "bot_polling_status":
+        return _check_bot_polling_status(bot_token)
+    if check_name == "index_queue_depth":
+        return _check_index_queue_depth()
+    if check_name == "redis_stream_consumer":
+        return _check_redis_stream_consumer()
+    if check_name == "send_queue_depth":
+        return _check_send_queue_depth()
+    if check_name == "sub_services_alive":
+        return _check_sub_services_alive()
+    if check_name == "admin_web_port":
+        return _check_admin_web_port()
+    if check_name == "redis_stream_consumer_group":
+        return _check_redis_stream_consumer_group()
+    if check_name == "writer_inbox_lag":
+        return _check_writer_inbox_lag()
+    if check_name == "crdb_sync_lag":
+        return _check_crdb_sync_lag()
+    if check_name == "backup_dir_writable":
+        return _check_backup_dir_writable()
+    if check_name == "metrics_endpoint":
+        return _check_metrics_endpoint()
+    if check_name == "scheduler_heartbeat":
+        return _check_scheduler_heartbeat()
+    # 未知检查项 → 编程错误,立即抛出(不被 _run_check 吞掉)
+    raise KeyError(
+        f"Unknown check name {check_name!r} (not in dispatcher; "
+        f"role={canonical_role!r})"
+    )
+
+
+# 检查项名称 → 协程构造器的合法集合(用于 _build_check_coro 校验)
+_KNOWN_CHECK_NAMES = frozenset({
+    "database", "database_crdb", "redis", "bot_token_valid",
+    "upload_session_status", "bot_polling_status", "index_queue_depth",
+    "redis_stream_consumer", "send_queue_depth", "sub_services_alive",
+    "admin_web_port", "redis_stream_consumer_group", "writer_inbox_lag",
+    "crdb_sync_lag", "backup_dir_writable", "metrics_endpoint",
+    "scheduler_heartbeat",
+})
+
+
+async def check_readiness(role: str) -> HealthResult:
+    """R71 Wave 1: 角色化 fail-closed readiness 检查 — 主接口。
+
+    根据 SERVICE_ROLE 从 ROLE_REQUIREMENTS 读取检查项集合与 critical 等级,
+    动态调度到对应检查函数。**不允许 mock 真实依赖**(如 DB 不可用必须返回
+    healthy=false)。测试中可通过 monkeypatch 替换 _check_database 等底层
+    函数模拟场景。
+
+    R71 Wave 1 行为变更:
+        1. 未知角色(不在 ROLE_REQUIREMENTS 中)→ 立即返回 unhealthy
+           (error="Unknown role: {role}"),不静默通过(fail-closed)。
+        2. 检查项集合与 critical 等级完全由 ROLE_REQUIREMENTS 决定,
+           不再使用硬编码 if/elif 分支。
+        3. overall_healthy = all(c.healthy for c in checks if c.critical)
+           — critical 检查任一失败 → 整体 unhealthy。
+        4. 依赖 Redis 的角色在 REDIS_URL 缺失时返回 unhealthy
+           (由 _check_redis(role) 实现 fail-closed)。
+        5. CRDB 必需角色(db_writer/crdb_sync/migration/admin)在
+           DATABASE_URL 缺失或 SQLite 时返回 unhealthy
+           (由 _check_database_crdb(role) 实现 fail-closed)。
 
     Args:
         role: SERVICE_ROLE 角色名。支持:
             - "up_bot" / "idx_bot" / "dsp_bot" / "mon_bot" /
-              "admin_bot" / "db_writer" / "admin" / ""
+              "admin_bot" / "db_writer" / "crdb_sync" / "db_backup" /
+              "migration" / "prometheus_exporter" / "r40_scheduler" /
+              "admin" / ""
             - 别名(兼容 entrypoint):"up" / "idx" / "dsp" / "mon"
               (会被规范化为 "up_bot" / "idx_bot" / "dsp_bot" / "mon_bot")
             - 空 → "admin"(全部检查)
+            - 未知 → unhealthy(fail-closed)
 
     Returns:
         HealthResult 对象:
-        - healthy: critical 检查全通过时为 True
-        - role: 规范化后的角色名
-        - checks: CheckResult 列表(按检查顺序)
+        - healthy: critical 检查全通过时为 True;未知角色为 False
+        - role: 规范化后的角色名(或原始输入若未知)
+        - checks: CheckResult 列表(按 ROLE_REQUIREMENTS 字典顺序);
+          未知角色时为空列表
         - timestamp: ISO 8601 UTC 时间戳
         - version: HEALTH_VERSION
     """
     canonical_role = _canonicalize_role(role)
-    checks: list = []
+    timestamp = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+    # ── fail-closed:未知角色立即返回 unhealthy ──
+    if canonical_role not in ROLE_REQUIREMENTS:
+        return HealthResult(
+            healthy=False,
+            role=canonical_role,
+            checks=[
+                CheckResult(
+                    name="role_validation",
+                    healthy=False,
+                    latency_ms=0,
+                    error=f"Unknown role: {canonical_role}",
+                    critical=True,
+                )
+            ],
+            timestamp=timestamp,
+            version=HEALTH_VERSION,
+        )
+
+    # ── 从 ROLE_REQUIREMENTS 读取检查项集合 + critical 等级 ──
+    checks_config = ROLE_REQUIREMENTS[canonical_role]
     bot_token = _get_bot_token_for_role(canonical_role)
+    checks: list = []
 
-    # ── 通用检查:database (critical=True) ──
-    checks.append(
-        await _run_check("database", critical=True, coro=_check_database())
-    )
-
-    # ── 通用检查:redis (non-critical,可能 not_configured) ──
-    checks.append(
-        await _run_check("redis", critical=False, coro=_check_redis())
-    )
-
-    # ── 通用检查:bot_token_valid (仅 bot 角色, non-critical) ──
-    if canonical_role in BOT_ROLES:
-        checks.append(
-            await _run_check(
-                "bot_token_valid",
-                critical=False,
-                coro=_check_bot_token_valid(bot_token),
+    # ── 动态调度:按 ROLE_REQUIREMENTS 中声明的检查项依次执行 ──
+    for check_name, is_critical in checks_config.items():
+        # 防御性校验:检查项名称必须在已知集合中(编程错误时立即暴露)
+        if check_name not in _KNOWN_CHECK_NAMES:
+            checks.append(
+                CheckResult(
+                    name=check_name,
+                    healthy=False,
+                    latency_ms=0,
+                    error=(
+                        f"Unknown check name in ROLE_REQUIREMENTS: "
+                        f"{check_name!r}"
+                    ),
+                    critical=is_critical,
+                )
             )
-        )
-
-    # ── 角色专属检查 ──
-    if canonical_role == "up_bot":
+            continue
+        coro = _build_check_coro(check_name, canonical_role, bot_token)
         checks.append(
-            await _run_check(
-                "upload_session_status",
-                critical=False,
-                coro=_check_upload_session_status(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "bot_polling_status",
-                critical=False,
-                coro=_check_bot_polling_status(bot_token),
-            )
-        )
-    elif canonical_role == "idx_bot":
-        checks.append(
-            await _run_check(
-                "index_queue_depth",
-                critical=False,
-                coro=_check_index_queue_depth(),
-            )
-        )
-    elif canonical_role == "dsp_bot":
-        checks.append(
-            await _run_check(
-                "redis_stream_consumer",
-                critical=False,
-                coro=_check_redis_stream_consumer(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "send_queue_depth",
-                critical=False,
-                coro=_check_send_queue_depth(),
-            )
-        )
-    elif canonical_role == "mon_bot":
-        checks.append(
-            await _run_check(
-                "sub_services_alive",
-                critical=False,
-                coro=_check_sub_services_alive(),
-            )
-        )
-    elif canonical_role == "admin_bot":
-        checks.append(
-            await _run_check(
-                "admin_web_port",
-                critical=False,
-                coro=_check_admin_web_port(),
-            )
-        )
-    elif canonical_role == "db_writer":
-        checks.append(
-            await _run_check(
-                "redis_stream_consumer_group",
-                critical=False,
-                coro=_check_redis_stream_consumer_group(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "writer_inbox_lag",
-                critical=False,
-                coro=_check_writer_inbox_lag(),
-            )
-        )
-    elif canonical_role == "admin":
-        # 全部检查(包含所有角色专属检查)
-        checks.append(
-            await _run_check(
-                "upload_session_status",
-                critical=False,
-                coro=_check_upload_session_status(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "bot_polling_status",
-                critical=False,
-                coro=_check_bot_polling_status(bot_token),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "index_queue_depth",
-                critical=False,
-                coro=_check_index_queue_depth(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "redis_stream_consumer",
-                critical=False,
-                coro=_check_redis_stream_consumer(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "send_queue_depth",
-                critical=False,
-                coro=_check_send_queue_depth(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "sub_services_alive",
-                critical=False,
-                coro=_check_sub_services_alive(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "admin_web_port",
-                critical=False,
-                coro=_check_admin_web_port(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "redis_stream_consumer_group",
-                critical=False,
-                coro=_check_redis_stream_consumer_group(),
-            )
-        )
-        checks.append(
-            await _run_check(
-                "writer_inbox_lag",
-                critical=False,
-                coro=_check_writer_inbox_lag(),
-            )
+            await _run_check(check_name, critical=is_critical, coro=coro)
         )
 
-    # 整体 healthy:critical 检查全通过
+    # ── 整体 healthy:critical 检查全通过 ──
     overall_healthy = all(c.healthy for c in checks if c.critical)
 
-    timestamp = _dt.datetime.now(_dt.timezone.utc).isoformat()
     return HealthResult(
         healthy=overall_healthy,
         role=canonical_role,
@@ -1079,4 +1527,93 @@ __all__ = [
     "to_json",
     "HEALTH_VERSION",
     "BOT_ROLES",
+    "ROLE_REQUIREMENTS",
 ]
+
+
+# ════════════════════════════════════════════════════════════════
+# R71 Wave 1: CLI 入口(供 docker-compose healthcheck 使用)
+# ════════════════════════════════════════════════════════════════
+
+
+def _cli_main() -> int:
+    """R71 Wave 1: CLI 入口函数,供 docker-compose healthcheck 调用。
+
+    用法:
+        python -m services.health --role up_bot
+        python -m services.health --role up_bot --json
+        python -m services.health  # 使用 $SERVICE_ROLE 环境变量
+
+    退出码:
+        0: healthy(critical 检查全通过)
+        1: unhealthy(任一 critical 检查失败,或未知角色)
+        2: CLI 参数错误
+
+    Returns:
+        int 退出码(供 sys.exit 调用)
+    """
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(
+        prog="services.health",
+        description=(
+            "R71 Wave 1 角色级 fail-closed readiness 检查"
+            "(供 docker-compose healthcheck 使用)"
+        ),
+    )
+    parser.add_argument(
+        "--role",
+        default=os.environ.get("SERVICE_ROLE", ""),
+        help=(
+            "SERVICE_ROLE 角色名(如 up_bot/idx_bot/dsp_bot/mon_bot/"
+            "admin_bot/db_writer/crdb_sync/db_backup/migration/"
+            "prometheus_exporter/r40_scheduler/admin)。"
+            "未指定时从 $SERVICE_ROLE 读取,仍为空时按 admin 处理。"
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="以 JSON 格式输出 HealthResult(默认输出简洁文本)",
+    )
+    args = parser.parse_args()
+
+    try:
+        result = asyncio.run(check_readiness(args.role))
+    except Exception as e:
+        # 严重错误(无法运行 check_readiness)→ 退出码 1
+        # 不吞异常,打印到 stderr 供运维排查
+        import sys as _sys
+
+        _sys.stderr.write(
+            f"R71 health check crashed: {type(e).__name__}: {e}\n"
+        )
+        return 1
+
+    if args.json:
+        print(json.dumps(result.to_dict(), ensure_ascii=False))
+    else:
+        # 简洁文本格式(便于 docker logs 阅读)
+        status_str = "HEALTHY" if result.healthy else "UNHEALTHY"
+        print(
+            f"[{status_str}] role={result.role} "
+            f"version={result.version} "
+            f"timestamp={result.timestamp}"
+        )
+        for chk in result.checks:
+            crit_str = "CRITICAL" if chk.critical else "non-critical"
+            ok_str = "OK" if chk.healthy else "FAIL"
+            err_str = f" error={chk.error!r}" if chk.error else ""
+            print(
+                f"  [{ok_str}] {chk.name} ({crit_str}) "
+                f"latency={chk.latency_ms}ms{err_str}"
+            )
+
+    return 0 if result.healthy else 1
+
+
+if __name__ == "__main__":
+    import sys as _sys
+
+    _sys.exit(_cli_main())

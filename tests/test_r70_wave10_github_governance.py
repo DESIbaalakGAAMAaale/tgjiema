@@ -1,23 +1,32 @@
 """R70 Wave 10: GitHub 治理(CODEOWNERS + branch protection ruleset)— 测试套件。
 
-R70 Wave 10 P0-01 治理止血要求:
+R71 Wave 6 P1-01/02/03 整改说明:
+    R71 Wave 6 用单一 "R71 Solo Founder Branch Ruleset" 替换 R67/R70 两个旧
+    ruleset。solo founder(@maxiuquan 是唯一开发者)模式:
+        - required_reviewers: 0(无审批死锁)
+        - require_code_owner_review: false(CODEOWNERS 保留但不阻断)
+        - strict_merge: true(current-SHA,不允许 stale parent commit)
+        - bypass_actors: [](无 admin/app bypass;紧急情况通过 record_break_glass.py)
+        - 35 个 required_status_checks(覆盖所有真实 release-gates.yml job 名)
+    本测试文件已同步更新,反映 solo-founder 语义。原 R70/R67 双 ruleset 测试
+    类已替换为 R71 Solo Founder 单 ruleset 验证类。
+
+R70 Wave 10 P0-01 治理止血要求(保留部分):
     1. .github/CODEOWNERS 补齐关键信任链路径的 owner
-    2. scripts/configure_branch_ruleset.sh 配置 R70 governance-master-protect
-       Ruleset(idempotent,与 R67 P0-01 互补)
-    3. scripts/configure_branch_protection.sh 兼容模式
+    2. scripts/configure_branch_protection.sh 兼容模式
        (已配置则打印 + 警告迁移,未配置则 legacy API 创建)
-    4. 两个脚本均支持 --dry-run(不调用 gh api)
-    5. 严格 set -euo pipefail;禁止 TODO/pass/占位符;禁止 skip/warn/吞异常
+    3. 两个脚本均支持 --dry-run(不调用 gh api)
+    4. 严格 set -euo pipefail;禁止 TODO/pass/占位符;禁止 skip/warn/吞异常
 
 被测对象:
     - .github/CODEOWNERS
-    - scripts/configure_branch_ruleset.sh(R67 P0-01 + R70 Wave 10)
+    - scripts/configure_branch_ruleset.sh(R71 Wave 6 Solo Founder)
     - scripts/configure_branch_protection.sh(R48/R65 P1-12 + R70 Wave 10 兼容模式)
 
 测试覆盖矩阵:
     A. CODEOWNERS 完整性 — R70 Wave 10 关键路径 owner 评审(11 个)
-    B. configure_branch_ruleset.sh — R70 ruleset 静态检查(8 个)
-    C. configure_branch_ruleset.sh — 保留 R67 P0-01 逻辑(5 个)
+    B. configure_branch_ruleset.sh — R71 Solo Founder ruleset 静态检查(8 个)
+    C. configure_branch_ruleset.sh — R71 Solo Founder 关键约束(5 个)
     D. configure_branch_ruleset.sh — --dry-run / --help 支持(4 个)
     E. configure_branch_protection.sh — R70 Wave 10 兼容模式(6 个)
     F. configure_branch_protection.sh — 保留 R65 P1-12 严格化(5 个)
@@ -207,13 +216,13 @@ class TestCodeownersR70Wave10:
 
 
 # ════════════════════════════════════════════════════════════════
-# B. configure_branch_ruleset.sh — R70 governance-master-protect ruleset 静态检查
+# B. configure_branch_ruleset.sh — R71 Solo Founder ruleset 静态检查
 # ════════════════════════════════════════════════════════════════
 
 
-class TestConfigureBranchRulesetR70:
-    """R70 Wave 10: configure_branch_ruleset.sh 包含 R70 governance-master-protect
-    ruleset 配置。
+class TestConfigureBranchRulesetR71SoloFounder:
+    """R71 Wave 6: configure_branch_ruleset.sh 包含 R71 Solo Founder
+    Branch Ruleset 配置(单一 ruleset,无审批死锁)。
     """
 
     @pytest.fixture(scope="class")
@@ -223,15 +232,15 @@ class TestConfigureBranchRulesetR70:
         )
         return CONFIGURE_RULESET_SH.read_text(encoding="utf-8")
 
-    def test_r70_ruleset_name_present(self, script_content: str):
-        """R70 ruleset 名称 'r70-governance-master-protect' 必须出现。"""
-        assert "r70-governance-master-protect" in script_content, (
-            "configure_branch_ruleset.sh 缺少 R70 ruleset 名称 "
-            "'r70-governance-master-protect'"
+    def test_r71_ruleset_name_present(self, script_content: str):
+        """R71 Solo Founder ruleset 名称必须出现。"""
+        assert "R71 Solo Founder Branch Ruleset" in script_content, (
+            "configure_branch_ruleset.sh 缺少 R71 Solo Founder ruleset 名称"
         )
 
-    def test_r70_required_status_checks_present(self, script_content: str):
-        """R70 ruleset 必须包含 5 个必需 status check。"""
+    def test_r71_required_status_checks_present(self, script_content: str):
+        """R71 ruleset 必须包含 5 个核心 status check(lint/static-gates/test/
+        verify-branch-ruleset/verify-branch-protection)。"""
         required_checks = [
             "lint",
             "static-gates",
@@ -241,116 +250,129 @@ class TestConfigureBranchRulesetR70:
         ]
         for check in required_checks:
             assert check in script_content, (
-                f"configure_branch_ruleset.sh 缺少 R70 required status check: {check}"
+                f"configure_branch_ruleset.sh 缺少 R71 required status check: {check}"
             )
 
-    def test_r70_required_status_checks_as_default(self, script_content: str):
-        """R70 默认 REQUIRED_STATUS_CHECKS 必须为 5 项数组字面值。"""
-        # 默认值必须是包含全部 5 个 check 的 JSON 数组
-        expected_default = (
-            '["lint","static-gates","test",'
-            '"verify-branch-ruleset","verify-branch-protection"]'
-        )
-        # 允许空格差异,只要 5 个 check 都在同一数组字面值内
+    def test_r71_required_status_checks_35_count(self, script_content: str):
+        """R71 P1-02: 必须包含至少 35 个 required status check(覆盖所有
+        真实 release-gates.yml job 名)。"""
         assert "REQUIRED_STATUS_CHECKS" in script_content, (
             "configure_branch_ruleset.sh 应有 REQUIRED_STATUS_CHECKS 变量"
         )
-        # 验证默认值字面值存在(允许空格变体)
-        assert (
-            expected_default in script_content
-            or '["lint", "static-gates", "test", '
-            '"verify-branch-ruleset", "verify-branch-protection"]' in script_content
-        ), (
-            "configure_branch_ruleset.sh 缺少 R70 REQUIRED_STATUS_CHECKS 默认值"
+        # 必须有 -lt 35 校验
+        assert "-lt 35" in script_content, (
+            "R71 P1-02: configure_branch_ruleset.sh 必须校验 REQUIRED_STATUS_CHECKS "
+            "至少 35 项(-lt 35)"
         )
+        # R71 Wave 2/4/5 新增的 context 必须在默认值中
+        for ctx in ("compose-runtime-e2e", "validate-oci-rootfs", "verify-rc-identity"):
+            assert ctx in script_content, (
+                f"R71 P1-02: configure_branch_ruleset.sh 缺少 R71 新增 context: {ctx}"
+            )
 
-    def test_r70_pull_request_rule_present(self, script_content: str):
-        """R70 ruleset 必须包含 pull_request 规则(1 approving review)。"""
-        # R70 pull_request 规则应含 required_reviewers: 1
+    def test_r71_pull_request_rule_present(self, script_content: str):
+        """R71 P1-01: pull_request 规则 required_reviewers 必须为 0
+        (solo founder,无审批死锁)。
+
+        旧 R70 要求 1 reviewer + R67 要求 2 reviewers,造成 solo founder
+        审批死锁。R71 Wave 6 改为 0。
+        """
         assert "required_reviewers" in script_content
-        assert "required_reviewers\": 1" in script_content or \
-               "required_reviewers\":1" in script_content, (
-            "R70 ruleset pull_request.required_reviewers 必须为 1"
+        # payload 中 required_reviewers 必须为 0(变量插值后)
+        # 脚本中默认值字面值:-0
+        assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-0}"' in script_content, (
+            "R71 P1-01: configure_branch_ruleset.sh 应默认 REQUIRED_REVIEWERS=0 "
+            "(solo founder,无审批死锁)"
+        )
+        # 不应保留旧的 :-2 或 :-1 默认值
+        assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-2}"' not in script_content, (
+            "R71 P1-01: 不应保留 R67 旧默认值 :-2"
+        )
+        assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-1}"' not in script_content, (
+            "R71 P1-01: 不应保留 R70 旧默认值 :-1"
         )
 
-    def test_r70_require_code_owner_review_true(self, script_content: str):
-        """R70 ruleset pull_request.require_code_owner_review 必须为 true。"""
-        # 必须出现 require_code_owner_review: true(在 R70 payload 中)
+    def test_r71_require_code_owner_review_false(self, script_content: str):
+        """R71 P1-01: pull_request.require_code_owner_review 必须为 false
+        (CODEOWNERS 保留但不阻断)。
+
+        旧 R70 要求 true,造成 solo founder 审批死锁。R71 Wave 6 改为 false。
+        """
         assert "require_code_owner_review" in script_content
-        # R70 段必须有 true(CODEOWNERS 强制 owner 评审)
-        assert "require_code_owner_review\": true" in script_content or \
-               "require_code_owner_review\":true" in script_content, (
-            "R70 ruleset pull_request.require_code_owner_review 必须为 true "
-            "(强制 CODEOWNERS owner 评审)"
+        # payload 中 require_code_owner_review 必须为 false
+        assert "require_code_owner_review\": false" in script_content or \
+               "require_code_owner_review\":false" in script_content, (
+            "R71 P1-01: pull_request.require_code_owner_review 必须为 false "
+            "(solo founder,CODEOWNERS 保留但不阻断)"
+        )
+        # 不应保留旧的 true 设置
+        assert "require_code_owner_review\": true" not in script_content, (
+            "R71 P1-01: 不应保留 R70 旧设置 require_code_owner_review: true"
         )
 
-    def test_r70_dismiss_stale_reviews_true(self, script_content: str):
-        """R70 ruleset pull_request.dismiss_stale_reviews_on_push 必须为 true。"""
+    def test_r71_strict_merge_true(self, script_content: str):
+        """R71 P1-03: required_status_checks.strict_merge 必须为 true
+        (current-SHA,不允许 stale parent commit)。"""
+        assert "strict_merge" in script_content
+        assert "strict_merge\": true" in script_content or \
+               "strict_merge\":true" in script_content, (
+            "R71 P1-03: required_status_checks.strict_merge 必须为 true "
+            "(current-SHA,不允许 stale parent commit)"
+        )
+
+    def test_r71_dismiss_stale_reviews_true(self, script_content: str):
+        """R71 ruleset pull_request.dismiss_stale_reviews_on_push 必须为 true。"""
         assert "dismiss_stale_reviews_on_push" in script_content
         assert "dismiss_stale_reviews_on_push\": true" in script_content or \
                "dismiss_stale_reviews_on_push\":true" in script_content, (
-            "R70 ruleset pull_request.dismiss_stale_reviews_on_push 必须为 true"
+            "R71 ruleset pull_request.dismiss_stale_reviews_on_push 必须为 true"
         )
 
-    def test_r70_non_fast_forward_present(self, script_content: str):
-        """R70 ruleset 必须包含 non_fast_forward 规则(禁 force push)。"""
-        # non_fast_forward 在 R67 与 R70 均出现
+    def test_r71_non_fast_forward_present(self, script_content: str):
+        """R71 ruleset 必须包含 non_fast_forward 规则(禁 force push)。"""
         assert '"type": "non_fast_forward"' in script_content or \
                '"type":"non_fast_forward"' in script_content, (
             "configure_branch_ruleset.sh 缺少 non_fast_forward 规则"
         )
 
-    def test_r70_bypass_actors_empty(self, script_content: str):
-        """R70 ruleset bypass_actors 必须为空(admin/app 不可绕过)。
+    def test_r71_bypass_actors_empty(self, script_content: str):
+        """R71 P1-01: ruleset bypass_actors 必须为空(admin/app 不可绕过)。
 
-        注:R67 P0-01 与 R70 Wave 10 共享此约束。脚本中 bypass_actors: []
-        至少出现一次(两个 ruleset 各一次)。
+        紧急情况通过 scripts/record_break_glass.py 审计日志,而非 admin bypass。
         """
         assert "bypass_actors: []" in script_content, (
             "configure_branch_ruleset.sh bypass_actors 必须为空数组 "
-            "(R70 Wave 10: admin/app 不可绕过)"
+            "(R71 P1-01: admin/app 不可绕过;紧急情况用 record_break_glass.py)"
         )
 
-    def test_r70_ruleset_targets_master_main(self, script_content: str):
-        """R70 ruleset 必须针对 refs/heads/master 与 refs/heads/main。"""
+    def test_r71_ruleset_targets_master_main(self, script_content: str):
+        """R71 ruleset 必须针对 refs/heads/master 与 refs/heads/main。"""
         assert "refs/heads/master" in script_content
         assert "refs/heads/main" in script_content
 
 
 # ════════════════════════════════════════════════════════════════
-# C. configure_branch_ruleset.sh — 保留 R67 P0-01 逻辑
+# C. configure_branch_ruleset.sh — R71 Solo Founder 关键约束
 # ════════════════════════════════════════════════════════════════
 
 
-class TestConfigureBranchRulesetR67Preserved:
-    """R70 Wave 10 整改保留 R67 P0-01 Branch Immutability Ruleset 逻辑。
+class TestConfigureBranchRulesetR71KeyConstraints:
+    """R71 Wave 6: configure_branch_ruleset.sh 保留 R67/R70 关键不变性约束
+    (被 R71 Solo Founder 单 ruleset 继承):
 
-    test_r67_p0_01_git_source_governance.py 已断言以下字符串,本类做交叉验证。
+        - 幂等性(EXISTING_RULESET_ID + PUT + POST)
+        - 必需规则类型(deletion/non_fast_forward/update/required_signatures/pull_request)
+        - bypass_actors 为空(禁止 admin bypass)
+        - 不应保留 R67/R70 旧 ruleset 名称(已替换为 R71 Solo Founder)
     """
 
     @pytest.fixture(scope="class")
     def script_content(self) -> str:
         return CONFIGURE_RULESET_SH.read_text(encoding="utf-8")
 
-    def test_r67_ruleset_name_present(self, script_content: str):
-        """R67 P0-01 Branch Immutability Ruleset 名称保留。"""
-        assert "R67 P0-01 Branch Immutability Ruleset" in script_content, (
-            "configure_branch_ruleset.sh 应保留 R67 P0-01 ruleset 名称"
-        )
-
-    def test_r67_required_reviewers_default_2(self, script_content: str):
-        """R67 P0-01 REQUIRED_REVIEWERS 默认值 2 保留。
-
-        test_r67_p0_01_git_source_governance.py 断言此字面值。
-        """
-        assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-2}"' in script_content, (
-            "configure_branch_ruleset.sh 应保留 "
-            "REQUIRED_REVIEWERS=\"${REQUIRED_REVIEWERS:-2}\" "
-            "(R67 P0-01 + test_r67_p0_01 断言)"
-        )
-
-    def test_r67_idempotency_check_present(self, script_content: str):
-        """R67 P0-01 幂等性检查逻辑保留(EXISTING_RULESET_ID + PUT + POST)。
+    def test_r71_idempotency_check_present(self, script_content: str):
+        """R71 Solo Founder 保留 R67/R70 幂等性检查逻辑
+        (EXISTING_RULESET_ID + PUT + POST)。
 
         test_r67_p0_01_git_source_governance.py 断言这些字符串。
         """
@@ -361,9 +383,9 @@ class TestConfigureBranchRulesetR67Preserved:
             "configure_branch_ruleset.sh 应保留 PUT/POST 幂等性逻辑"
         )
 
-    def test_r67_required_rules_present(self, script_content: str):
-        """R67 P0-01 必需规则类型保留(deletion/non_fast_forward/update/
-        required_signatures/pull_request)。
+    def test_r71_required_rules_present(self, script_content: str):
+        """R71 Solo Founder 保留 R67/R70 必需规则类型
+        (deletion/non_fast_forward/update/required_signatures/pull_request)。
 
         test_r67_p0_01_git_source_governance.py 断言这些字符串。
         """
@@ -375,15 +397,39 @@ class TestConfigureBranchRulesetR67Preserved:
             "pull_request",
         ):
             assert f'"type": "{rule}"' in script_content, (
-                f"configure_branch_ruleset.sh 缺少 R67 规则类型: {rule}"
+                f"configure_branch_ruleset.sh 缺少 R71 规则类型: {rule}"
             )
 
-    def test_r67_bypass_actors_empty(self, script_content: str):
-        """R67 P0-01 bypass_actors 为空(禁止 admin bypass)。
+    def test_r71_bypass_actors_empty(self, script_content: str):
+        """R71 P1-01: bypass_actors 为空(禁止 admin bypass)。
 
         test_r67_p0_01_git_source_governance.py 断言此字符串。
         """
         assert "bypass_actors: []" in script_content
+
+    def test_no_legacy_r67_ruleset_name_as_default(self, script_content: str):
+        """R71 Wave 6: 不应保留 R67 P0-01 Branch Immutability Ruleset 名称
+        作为 RULESET_NAME 默认值(已被 R71 Solo Founder Branch Ruleset 替换)。
+
+        旧 R67 ruleset 名称只在脚本注释中作为历史说明出现是允许的,
+        但作为 RULESET_NAME 默认值出现则是回归。
+        """
+        # 不应作为 RULESET_NAME 默认值出现
+        assert 'RULESET_NAME="${RULESET_NAME:-R67 P0-01' not in script_content, (
+            "R71 P1-01: 不应保留 R67 P0-01 作为 RULESET_NAME 默认值"
+        )
+
+    def test_no_legacy_r70_ruleset_name_as_default(self, script_content: str):
+        """R71 Wave 6: 不应保留 r70-governance-master-protect 名称
+        作为 RULESET_NAME 默认值(已被 R71 Solo Founder Branch Ruleset 替换)。
+
+        旧 R70 ruleset 名称只在脚本注释中作为历史说明出现是允许的,
+        但作为 RULESET_NAME 默认值出现则是回归。
+        """
+        # 不应作为 RULESET_NAME 默认值出现
+        assert 'RULESET_NAME="${RULESET_NAME:-r70-governance-master-protect' not in script_content, (
+            "R71 P1-01: 不应保留 r70-governance-master-protect 作为 RULESET_NAME 默认值"
+        )
 
 
 # ════════════════════════════════════════════════════════════════

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# R67 P0-01: 验证 GitHub Repository Ruleset 配置(master/main 分支不可变性)
+# R71 P1-01/02/03 (Wave 6): 验证 GitHub Repository Ruleset 配置
+# (Solo Founder 模式 — 0 reviewers / strict_merge=true / 36 contexts / no bypass)
 #
 # 本脚本在 CI 中运行,验证仓库实际配置的 branch ruleset 与
-# .github/branch_ruleset.expected.json 期望配置一致。
+# .github/branch_ruleset.expected.json 期望配置一致(solo-founder 语义)。
 # 任意属性不匹配即 fail-closed 退出 1。
 #
-# 整改要求(R67 P0-01):
+# 整改要求(R71 P1-01/02/03 — Solo Founder):
 #   - target == branch
 #   - enforcement == active
 #   - conditions.ref_name.include 包含 refs/heads/master 与 refs/heads/main
@@ -13,10 +14,16 @@
 #   - rules 包含 non_fast_forward (non_fast_forward=false, 禁止 force push)
 #   - rules 包含 update (update=false, 禁止直接 update)
 #   - rules 包含 required_signatures (强制 GPG 签名验证)
-#   - rules 包含 pull_request (required_reviewers >= 2,
-#     dismiss_stale_reviews_on_push == true,
-#     required_review_thread_resolution == true)
-#   - bypass_actors 为空(禁止任何角色 bypass,包括 admin)
+#   - rules 包含 pull_request (R71 P1-01 solo-founder 语义):
+#       * required_reviewers == 0 (solo founder, 无审批死锁)
+#       * require_code_owner_review == false (CODEOWNERS 保留但不阻断)
+#       * dismiss_stale_reviews_on_push == true
+#       * required_review_thread_resolution == true
+#   - rules 包含 required_status_checks (R71 P1-02/03):
+#       * strict_merge == true (current-SHA, 不允许 stale parent commit)
+#       * required_checks 包含 36 个 context (覆盖所有真实 release-gates.yml job 名)
+#       * 必含 R71 Wave 2/4/5/7 新增: compose-runtime-e2e / validate-oci-rootfs / verify-rc-identity / bind-runtime-config
+#   - bypass_actors 为空(禁止任何角色 bypass,包括 admin;紧急情况通过 record_break_glass.py)
 #
 # 使用方法:
 #   OWNER=maxiuquan REPO=tgjiema ./scripts/verify_branch_ruleset.sh
@@ -27,14 +34,57 @@
 #   1  任意断言失败或 API 错误
 set -euo pipefail
 
-RULESET_NAME="${RULESET_NAME:-R67 P0-01 Branch Immutability Ruleset}"
+RULESET_NAME="${RULESET_NAME:-R71 Solo Founder Branch Ruleset}"
+
+# R71 P1-02: 必需 status checks 列表(36 项,覆盖所有真实 release-gates.yml job 名)
+# 与 .github/branch_ruleset.expected.json / scripts/configure_branch_ruleset.sh 保持一致
+EXPECTED_REQUIRED_CHECKS=(
+  "lint"
+  "static-gates"
+  "test"
+  "docker-build"
+  "docker-digest-verify"
+  "compose-config"
+  "redis-acl-matrix"
+  "schema-diff"
+  "restore-legacy-seal-gate"
+  "i18n-strict-export-boundary-gate"
+  "migration-manifest-gate"
+  "migration-binding-gate"
+  "button-flow-real-ux-gate"
+  "backup-restore-drill"
+  "sbom"
+  "pip-audit"
+  "trivy"
+  "sign-image"
+  "sign-artifacts"
+  "verify-branch-protection"
+  "verify-branch-ruleset"
+  "verify-git-source-governance"
+  "rc-continuity"
+  "publish-attestation"
+  "attestation-semantics-verify"
+  "verify-only-3x"
+  "tag-ruleset-verify"
+  "crdb-ru-72h-attribution-gate"
+  "production-evidence"
+  "production-promotion-gate"
+  "oci-allowlist-verify"
+  "validate-oci-rootfs"
+  "runtime-smoke-compose"
+  "compose-runtime-e2e"
+  "verify-rc-identity"
+  "bind-runtime-config"
+  "release-summary"
+)
 
 # ─── 帮助信息 ───
 print_help() {
   cat <<EOF
 用法: $0 [OWNER] [REPO]
 
-R67 P0-01: 验证 master/main branch Repository Ruleset 配置。
+R71 P1-01/02/03 (Wave 6): 验证 master/main branch Repository Ruleset 配置
+(Solo Founder 模式 — 0 reviewers / strict_merge=true / 36 contexts / no bypass)。
 
 参数(可选):
   OWNER  仓库 owner(默认从 gh repo view / git remote 推断)
@@ -88,7 +138,7 @@ if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
 fi
 
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
-  echo "ERROR: [R67 P0-01] 无法确定 OWNER / REPO"
+  echo "ERROR: [R71 Wave 6] 无法确定 OWNER / REPO"
   exit 1
 fi
 
@@ -99,7 +149,7 @@ if [ -n "$TOKEN" ]; then
   USE_GH_CLI=false
 else
   if ! gh auth status >/dev/null 2>&1; then
-    echo "ERROR: [R67 P0-01] 需要 GH_TOKEN / GITHUB_TOKEN 环境变量,或先执行 gh auth login"
+    echo "ERROR: [R71 Wave 6] 需要 GH_TOKEN / GITHUB_TOKEN 环境变量,或先执行 gh auth login"
     exit 1
   fi
 fi
@@ -116,7 +166,7 @@ else
 fi
 
 if ! echo "$LIST_RESPONSE" | jq -e 'type == "array"' > /dev/null 2>&1; then
-  echo "ERROR: [R67 P0-01] 列出 rulesets 失败,GitHub API 响应:"
+  echo "ERROR: [R71 Wave 6] 列出 rulesets 失败,GitHub API 响应:"
   echo "$LIST_RESPONSE"
   exit 1
 fi
@@ -153,7 +203,7 @@ if [ -z "$RULESET_ID" ]; then
   exit 1
 fi
 
-echo "[INFO] 找到 branch ruleset id=${RULESET_NAME},获取详细配置..."
+echo "[INFO] 找到 branch ruleset id=${RULESET_ID},获取详细配置..."
 
 # ─── 5. 获取 ruleset 详细配置 ───
 if [ "$USE_GH_CLI" = "true" ]; then
@@ -167,7 +217,7 @@ else
 fi
 
 if ! echo "$RULESET_JSON" | jq -e '.id' > /dev/null 2>&1; then
-  echo "ERROR: [R67 P0-01] 获取 ruleset 详情失败,GitHub API 响应:"
+  echo "ERROR: [R71 Wave 6] 获取 ruleset 详情失败,GitHub API 响应:"
   echo "$RULESET_JSON"
   exit 1
 fi
@@ -195,8 +245,20 @@ assert_contains() {
   fi
 }
 
+# assert_contains_ctx: 同 assert_contains,但接受额外的 jq --arg 参数
+# 用法: assert_contains_ctx "name" "$json" "jq_expr" "arg_name" "arg_value"
+assert_contains_ctx() {
+  local name="$1" json="$2" jq_expr="$3" arg_name="$4" arg_value="$5"
+  if echo "$json" | jq -e --arg "$arg_name" "$arg_value" "$jq_expr" > /dev/null 2>&1; then
+    echo "  ✓ $name"
+  else
+    echo "  ✗ $name"
+    FAIL=1
+  fi
+}
+
 echo ""
-echo "=== R67 P0-01: Branch Ruleset 断言检查 ==="
+echo "=== R71 P1-01/02/03: Solo Founder Branch Ruleset 断言检查 ==="
 
 TARGET=$(echo "$RULESET_JSON" | jq -r '.target')
 assert_eq "target" "branch" "$TARGET"
@@ -232,9 +294,15 @@ assert_contains "rules 含 pull_request (PR-only 流程)" \
   "$RULESET_JSON" \
   '[.rules[].type] | any(. == "pull_request")'
 
-assert_contains "pull_request.required_reviewers >= 2" \
+# R71 P1-01: Solo Founder — required_reviewers == 0 (无审批死锁)
+assert_contains "R71 P1-01: pull_request.required_reviewers == 0 (solo founder, 无审批死锁)" \
   "$RULESET_JSON" \
-  '[.rules[] | select(.type == "pull_request") | .parameters.required_reviewers] | add >= 2'
+  '[.rules[] | select(.type == "pull_request") | .parameters.required_reviewers] | add == 0'
+
+# R71 P1-01: Solo Founder — require_code_owner_review == false (CODEOWNERS 保留但不阻断)
+assert_contains "R71 P1-01: pull_request.require_code_owner_review == false (CODEOWNERS 保留但不阻断)" \
+  "$RULESET_JSON" \
+  '[.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review] | add == false'
 
 assert_contains "pull_request.dismiss_stale_reviews_on_push == true" \
   "$RULESET_JSON" \
@@ -244,19 +312,54 @@ assert_contains "pull_request.required_review_thread_resolution == true" \
   "$RULESET_JSON" \
   '[.rules[] | select(.type == "pull_request") | .parameters.required_review_thread_resolution] | add == true'
 
-# bypass_actors 必须为空(禁止任何角色 bypass,包括 admin)
-assert_contains "bypass_actors 为空(禁止 admin bypass)" \
+# R71 P1-02: required_status_checks 必须存在,且包含全部 36 个 context
+assert_contains "rules 含 required_status_checks (R71 P1-02)" \
+  "$RULESET_JSON" \
+  '[.rules[].type] | any(. == "required_status_checks")'
+
+# R71 P1-03: strict_merge == true (current-SHA, 不允许 stale parent commit)
+assert_contains "R71 P1-03: required_status_checks.strict_merge == true (current-SHA)" \
+  "$RULESET_JSON" \
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.strict_merge] | add == true'
+
+# R71 P1-02: 每个 expected context 都必须在 required_status_checks 中
+for ctx in "${EXPECTED_REQUIRED_CHECKS[@]}"; do
+  assert_contains_ctx "R71 P1-02: required_status_checks 含 '${ctx}'" \
+    "$RULESET_JSON" \
+    '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == ($c))' \
+    "c" "$ctx"
+done
+
+# R71 P1-02: 特别验证 R71 Wave 2/4/5/7 新增的 context
+assert_contains "R71 Wave 2: required_status_checks 含 'compose-runtime-e2e'" \
+  "$RULESET_JSON" \
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "compose-runtime-e2e")'
+
+assert_contains "R71 Wave 4: required_status_checks 含 'validate-oci-rootfs'" \
+  "$RULESET_JSON" \
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "validate-oci-rootfs")'
+
+assert_contains "R71 Wave 5: required_status_checks 含 'verify-rc-identity'" \
+  "$RULESET_JSON" \
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "verify-rc-identity")'
+
+assert_contains "R71 Wave 7: required_status_checks 含 'bind-runtime-config'" \
+  "$RULESET_JSON" \
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "bind-runtime-config")'
+
+# bypass_actors 必须为空(禁止任何角色 bypass,包括 admin;紧急情况通过 record_break_glass.py)
+assert_contains "R71 P1-01: bypass_actors 为空 (禁止 admin bypass; 紧急情况用 record_break_glass.py)" \
   "$RULESET_JSON" \
   '(.bypass_actors // []) | length == 0'
 
 echo ""
 if [ "$FAIL" -ne 0 ]; then
-  echo "FAIL: [R67 P0-01] Branch Ruleset 断言失败"
+  echo "FAIL: [R71 P1-01/02/03] Solo Founder Branch Ruleset 断言失败"
   echo ""
   echo "实际配置:"
   echo "$RULESET_JSON" | jq '{id, name, target, enforcement, conditions, rules, bypass_actors}'
   exit 1
 fi
 
-echo "PASS: [R67 P0-01] Branch Ruleset 所有断言通过"
+echo "PASS: [R71 P1-01/02/03] Solo Founder Branch Ruleset 所有断言通过"
 exit 0

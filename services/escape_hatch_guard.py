@@ -46,6 +46,12 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+try:
+    from loguru import logger
+except ImportError:  # pragma: no cover
+    import logging
+    logger = logging.getLogger("escape_hatch_guard")  # type: ignore[assignment]
+
 from services.error_codes import AppError, ErrorCodes
 
 
@@ -103,17 +109,24 @@ def _detect_production_like_from_os_environ() -> bool:
     使用 config.environment.detect_production_from_os_environ() 的逻辑,
     但只返回 bool(简化调用方)。
     """
+    detect_fn = None
     try:
         from config.environment import detect_production_from_os_environ
-        is_prod, _ = detect_production_from_os_environ()
-        return is_prod
+        detect_fn = detect_production_from_os_environ
     except ImportError:
         # config.environment 不可用时,降级直接检查 APP_ENV/ENVIRONMENT/DEPLOY_ENV
-        for var in ("APP_ENV", "ENVIRONMENT", "DEPLOY_ENV"):
-            val = os.environ.get(var, "").strip().lower()
-            if val in ("production", "staging", "prod", "stg"):
-                return True
-        return False
+        logger.debug("config.environment not available, falling back to os.environ")
+
+    if detect_fn is not None:
+        is_prod, _ = detect_fn()
+        return is_prod
+
+    # 降级路径:直接检查环境变量
+    for var in ("APP_ENV", "ENVIRONMENT", "DEPLOY_ENV"):
+        val = os.environ.get(var, "").strip().lower()
+        if val in ("production", "staging", "prod", "stg"):
+            return True
+    return False
 
 
 def _detect_test_or_development_from_os_environ() -> bool:

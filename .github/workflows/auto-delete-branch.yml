@@ -1,0 +1,75 @@
+# R71 P1-06: PR 合并后自动删除 head 分支
+#
+# 单人项目治理基线: 残留分支会增加误构建风险(例如 CI 意外触发旧分支)。
+# 本工作流在 PR 合并后自动删除 head 分支,避免人工遗忘。
+#
+# 触发条件: pull_request closed + merged == true
+# 不触发: PR 关闭但未合并(保留分支供继续工作)
+# 保护: master / main 分支永远不会被删除(它们是 base,不是 head)
+#
+# GitHub 仓库设置也可启用 "Automatically delete head branches",
+# 但本工作流提供额外的审计日志和可控性。
+
+name: Auto Delete Merged Branch
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: auto-delete-${{ github.event.pull_request.head.ref }}
+  cancel-in-progress: false
+
+jobs:
+  delete-head-branch:
+    name: Delete merged head branch
+    runs-on: ubuntu-latest
+    # 只在 PR 被合并(而非仅关闭)时执行
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: Checkout base
+        uses: actions/checkout@v4
+        with:
+          # 使用 GITHUB_TOKEN 删除分支需要 write 权限
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+
+      - name: Validate branch is not protected
+        id: validate
+        run: |
+          HEAD_BRANCH="${{ github.event.pull_request.head.ref }}"
+          # 永远不删除 master / main / release/*
+          if [ "$HEAD_BRANCH" = "master" ] || [ "$HEAD_BRANCH" = "main" ]; then
+            echo "::error::Refusing to delete protected branch: $HEAD_BRANCH"
+            exit 1
+          fi
+          if [[ "$HEAD_BRANCH" == release/* ]]; then
+            echo "::error::Refusing to delete release branch: $HEAD_BRANCH"
+            exit 1
+          fi
+          echo "branch=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "::notice::Will delete merged branch: $HEAD_BRANCH (PR #${{ github.event.pull_request.number }})"
+
+      - name: Delete head branch via git push
+        run: |
+          HEAD_BRANCH="${{ steps.validate.outputs.branch }}"
+          REPO="${{ github.repository }}"
+          # 使用 GitHub REST API 删除 ref(比 git push 更可靠)
+          curl -sS -X DELETE \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/git/refs/heads/${HEAD_BRANCH}"
+          echo "::notice::Deleted branch: ${HEAD_BRANCH}"
+
+      - name: Record audit trail
+        run: |
+          echo "R71 P1-06: auto-delete-branch completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "- PR: #${{ github.event.pull_request.number }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Merged commit: ${{ github.event.pull_request.merge_commit_sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Deleted branch: ${{ steps.validate.outputs.branch }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Base: ${{ github.event.pull_request.base.ref }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Actor: ${{ github.actor }}" >> "$GITHUB_STEP_SUMMARY"

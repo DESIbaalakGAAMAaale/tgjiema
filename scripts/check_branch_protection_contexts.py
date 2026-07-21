@@ -239,8 +239,21 @@ def _cartesian_expand(
         current.pop()
 
 
-def parse_workflow_file(path: Path) -> WorkflowInfo:
-    """解析单个 workflow YAML 文件,返回 WorkflowInfo。"""
+def parse_workflow_file(
+    path: Path,
+    include_all_jobs: bool = False,
+) -> WorkflowInfo:
+    """解析单个 workflow YAML 文件,返回 WorkflowInfo。
+
+    Args:
+        path: workflow YAML 文件路径
+        include_all_jobs: 若为 True,禁用 R65 P1-12 的过滤逻辑
+            (push-only / tag-only / self-excluded / non-blocking),
+            所有 job 都加入 ``jobs`` 集合(用于 R71 P1-02 校验)。
+            R71 P1-02 要求: required_status_checks 必须覆盖所有真实
+            release-gates.yml job 名,不做过滤。
+            默认 False (R65 P1-12 行为,向后兼容)。
+    """
     if yaml is None:
         raise RuntimeError(
             "PyYAML 未安装 — check_branch_protection_contexts.py 需要 PyYAML "
@@ -261,6 +274,12 @@ def parse_workflow_file(path: Path) -> WorkflowInfo:
             jobs.append(str(job_id))
             continue
         expanded = _expand_matrix_jobs(str(job_id), job_def)
+        # R71 P1-02 模式 (include_all_jobs=True): 跳过所有过滤,
+        # 所有 workflow job 都加入 jobs 集合(用于校验 BP 包含全部
+        # release-gates.yml job 名)。
+        if include_all_jobs:
+            jobs.extend(expanded)
+            continue
         # R65 P1-12: 自排除 job(BP 不能要求自身,循环依赖)
         # verify-branch-protection 验证 BP 配置,若 BP 要求此 context 通过
         # 才能合并,则此 job 的 PR 永远无法合并(循环依赖)。
@@ -290,16 +309,40 @@ def parse_workflow_file(path: Path) -> WorkflowInfo:
     )
 
 
-def parse_workflows_dir(workflows_dir: Path) -> list[WorkflowInfo]:
-    """解析 workflows 目录下所有 .yml/.yaml 文件。"""
+def parse_workflows_dir(
+    workflows_dir: Path,
+    include_all_jobs: bool = False,
+    workflow_files: list[str] | None = None,
+) -> list[WorkflowInfo]:
+    """解析 workflows 目录下的 .yml/.yaml 文件。
+
+    Args:
+        workflows_dir: workflows 目录路径
+        include_all_jobs: 透传给 parse_workflow_file (R71 P1-02 模式)
+        workflow_files: 若指定,只解析文件名匹配的 workflow 文件
+            (如 ``["release-gates.yml"]`` 只解析 release-gates.yml)。
+            默认 None — 解析目录下所有 .yml/.yaml 文件。
+    """
     if not workflows_dir.exists():
         raise FileNotFoundError(f"workflows 目录不存在: {workflows_dir}")
 
     workflows: list[WorkflowInfo] = []
+    if workflow_files:
+        # 仅解析指定的 workflow 文件 (R71 P1-02: 只校验 release-gates.yml)
+        for fname in workflow_files:
+            for ext in (".yml", ".yaml", ""):
+                candidate = workflows_dir / (fname if fname.endswith(ext) else fname + ext)
+                if candidate.exists():
+                    workflows.append(
+                        parse_workflow_file(candidate, include_all_jobs=include_all_jobs)
+                    )
+                    break
+        return workflows
+
     for path in sorted(workflows_dir.glob("*.yml")):
-        workflows.append(parse_workflow_file(path))
+        workflows.append(parse_workflow_file(path, include_all_jobs=include_all_jobs))
     for path in sorted(workflows_dir.glob("*.yaml")):
-        workflows.append(parse_workflow_file(path))
+        workflows.append(parse_workflow_file(path, include_all_jobs=include_all_jobs))
     return workflows
 
 
@@ -584,6 +627,27 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"workflow YAML 目录(默认 {DEFAULT_WORKFLOWS_DIR})",
     )
     parser.add_argument(
+        "--workflow-files",
+        type=str,
+        default=None,
+        help=(
+            "逗号分隔的 workflow 文件名列表,只解析这些文件(如 "
+            "'release-gates.yml')。默认 None — 解析目录下所有 .yml/.yaml。"
+            "R71 P1-02: 校验 BP contexts 时应限定 release-gates.yml,"
+            "避免其他 workflow(如 promote-rc.yml)的 job 被误判为 missing。"
+        ),
+    )
+    parser.add_argument(
+        "--include-all-jobs",
+        action="store_true",
+        help=(
+            "R71 P1-02 模式: 禁用 R65 P1-12 的过滤逻辑"
+            "(push-only / tag-only / self-excluded / non-blocking)。"
+            "所有 workflow job 都加入期望集合(用于校验 BP 包含全部 "
+            "release-gates.yml job 名)。默认 False — 保持 R65 P1-12 行为。"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="以 JSON 格式输出报告(便于 CI 解析)",
@@ -595,9 +659,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # R71 P1-02 模式: --workflow-files 逗号分隔 → list
+    workflow_files: list[str] | None = None
+    if args.workflow_files:
+        workflow_files = [s.strip() for s in args.workflow_files.split(",") if s.strip()]
+
     # 解析 workflows
     try:
-        workflows = parse_workflows_dir(args.workflows_dir)
+        workflows = parse_workflows_dir(
+            args.workflows_dir,
+            include_all_jobs=args.include_all_jobs,
+            workflow_files=workflow_files,
+        )
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

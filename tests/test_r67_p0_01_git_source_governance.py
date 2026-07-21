@@ -1,5 +1,14 @@
 """R67 P0-01: Git source governance 测试。
 
+R71 Wave 6 P1-01/02/03 整改说明:
+    R71 Wave 6 用单一 "R71 Solo Founder Branch Ruleset" 替换 R67/R70 两个旧
+    ruleset。solo founder(@maxiuquan 是唯一开发者)模式:
+        - required_reviewers: 0(无审批死锁)
+        - require_code_owner_review: false(CODEOWNERS 保留但不阻断)
+        - strict_merge: true(current-SHA,不允许 stale parent commit)
+        - bypass_actors: [](无 admin/app bypass;紧急情况通过 record_break_glass.py)
+    本测试文件已同步更新,反映 solo-founder 语义。
+
 测试覆盖矩阵:
     A. branch_ruleset.expected.json schema 与内容(8 个)
     B. configure_branch_ruleset.sh 脚本静态检查(6 个)
@@ -64,13 +73,40 @@ class TestBranchRulesetExpectedJson:
         assert "non_fast_forward" in rule_types
         assert "update" in rule_types
 
-    def test_rules_contain_pull_request_with_2_reviewers(self, expected):
+    def test_rules_contain_pull_request_with_zero_reviewers(self, expected):
+        """R71 Wave 6 P1-01: solo founder — required_reviewers == 0(无审批死锁)。
+
+        旧 R67 P0-01 要求 >= 2 reviewers,但对 solo founder(@maxiuquan 是唯一
+        开发者)造成审批死锁。R71 Wave 6 改为 0。
+        """
         pr_rules = [r for r in expected["rules"] if r["type"] == "pull_request"]
         assert len(pr_rules) == 1, "应有 1 个 pull_request 规则"
         params = pr_rules[0]["parameters"]
-        assert params["required_reviewers"] >= 2
+        assert params["required_reviewers"] == 0, (
+            "R71 P1-01: solo founder 模式 required_reviewers 必须为 0"
+        )
         assert params["dismiss_stale_reviews_on_push"] is True
         assert params["required_review_thread_resolution"] is True
+        # R71 P1-01: require_code_owner_review 必须为 false
+        assert params.get("require_code_owner_review") is False, (
+            "R71 P1-01: solo founder 模式 require_code_owner_review 必须为 false "
+            "(CODEOWNERS 保留但不阻断)"
+        )
+
+    def test_rules_contain_required_status_checks_with_strict_merge(self, expected):
+        """R71 Wave 6 P1-02/03: required_status_checks 必须存在且 strict_merge=true。"""
+        rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
+        assert len(rsc_rules) == 1, "应有 1 个 required_status_checks 规则"
+        params = rsc_rules[0]["parameters"]
+        assert params.get("strict_merge") is True, (
+            "R71 P1-03: strict_merge 必须为 true(current-SHA,不允许 stale parent commit)"
+        )
+        # R71 P1-02: 必须包含 R71 Wave 2/4/5 新增的 context
+        contexts = [c["context"] for c in params.get("required_checks", [])]
+        for ctx in ("compose-runtime-e2e", "validate-oci-rootfs", "verify-rc-identity"):
+            assert ctx in contexts, (
+                f"R71 P1-02: required_status_checks 必须包含 R71 新增 context: {ctx}"
+            )
 
     def test_bypass_actors_is_empty(self, expected):
         """R67 P0-01: 禁止 admin bypass — bypass_actors 必须为空。"""
@@ -108,10 +144,22 @@ class TestConfigureBranchRulesetScript:
         # bypass_actors 必须为空
         assert "bypass_actors: []" in content, "bypass_actors 应为空数组"
 
-    def test_script_required_reviewers_at_least_2(self):
+    def test_script_required_reviewers_default_zero(self):
+        """R71 Wave 6 P1-01: solo founder — REQUIRED_REVIEWERS 默认 0(无审批死锁)。
+
+        旧 R67 P0-01 默认 2 reviewers,但对 solo founder 造成审批死锁。
+        R71 Wave 6 改为 0。
+        """
         content = CONFIGURE_SH.read_text(encoding="utf-8")
         assert "required_reviewers" in content
-        assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-2}"' in content
+        assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-0}"' in content, (
+            "R71 P1-01: configure_branch_ruleset.sh 应默认 REQUIRED_REVIEWERS=0 "
+            "(solo founder,无审批死锁)"
+        )
+        # 不应保留旧的 :-2 默认值
+        assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-2}"' not in content, (
+            "R71 P1-01: 不应保留 R67 旧默认值 :-2(solo founder 应为 :-0)"
+        )
 
     def test_script_has_idempotency_check(self):
         content = CONFIGURE_SH.read_text(encoding="utf-8")
